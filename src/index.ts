@@ -20,6 +20,15 @@ import reservationRoutes from "./routes/reservation";
 import marketplaceRoutes from "./routes/marketplace";
 import { seedData } from "./seed";
 import { seedOsloRealData } from "./seed-oslo-real";
+import { seedMarketplace } from "./seed-marketplace";
+import { seedNorwayExpansion } from "./seed-norway-expansion";
+import { seedExpansionV2 } from "./seed-expansion-v2";
+import { seedExpansionV3 } from "./seed-expansion-v3";
+import { seedExpansionV4 } from "./seed-expansion-v4";
+import { seedExpansionV5 } from "./seed-expansion-v5";
+import { seedExpansionV6 } from "./seed-expansion-v6";
+import { seedExpansionV7 } from "./seed-expansion-v7";
+import { seedExpansionV8 } from "./seed-expansion-v8";
 import { discoveryService } from "./services/discovery-service";
 
 const app = express();
@@ -72,6 +81,15 @@ console.log("\n💾 Initializing SQLite database...");
 getDb();
 seedData();
 seedOsloRealData();
+seedMarketplace();
+seedNorwayExpansion();
+seedExpansionV2();
+seedExpansionV3();
+seedExpansionV4();
+seedExpansionV5();
+seedExpansionV6();
+seedExpansionV7();
+seedExpansionV8();
 
 // ─── Start ───────────────────────────────────────────────────
 const BASE_URL = process.env.BASE_URL || `http://localhost:${PORT}`;
