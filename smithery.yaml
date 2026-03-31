@@ -1,0 +1,21 @@
+# Smithery.ai MCP Server Configuration
+# This file tells Smithery how to run and list the Lokal MCP server.
+
+startCommand:
+  type: stdio
+  configSchema:
+    type: object
+    properties:
+      LOKAL_API_URL:
+        type: string
+        default: "https://lokal.fly.dev"
+        description: "URL of the Lokal API server"
+    required: []
+  commandFunction: |-
+    (config) => ({
+      command: 'npx',
+      args: ['tsx', 'src/mcp/server.ts'],
+      env: {
+        LOKAL_API_URL: config.LOKAL_API_URL || 'https://lokal.fly.dev'
+      }
+    })
