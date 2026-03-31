@@ -1,0 +1,120 @@
+import { z } from "zod";
+export declare const ProductCategorySchema: z.ZodEnum<{
+    vegetables: "vegetables";
+    fruits: "fruits";
+    berries: "berries";
+    herbs: "herbs";
+    eggs: "eggs";
+    dairy: "dairy";
+    bread: "bread";
+    meat: "meat";
+    fish: "fish";
+    honey: "honey";
+    preserves: "preserves";
+    flowers: "flowers";
+    other: "other";
+}>;
+export declare const ProductSchema: z.ZodObject<{
+    id: z.ZodString;
+    producerId: z.ZodString;
+    name: z.ZodString;
+    category: z.ZodEnum<{
+        vegetables: "vegetables";
+        fruits: "fruits";
+        berries: "berries";
+        herbs: "herbs";
+        eggs: "eggs";
+        dairy: "dairy";
+        bread: "bread";
+        meat: "meat";
+        fish: "fish";
+        honey: "honey";
+        preserves: "preserves";
+        flowers: "flowers";
+        other: "other";
+    }>;
+    description: z.ZodOptional<z.ZodString>;
+    unit: z.ZodEnum<{
+        kg: "kg";
+        g: "g";
+        piece: "piece";
+        bunch: "bunch";
+        liter: "liter";
+        box: "box";
+        bag: "bag";
+    }>;
+    variety: z.ZodOptional<z.ZodString>;
+    parentProduct: z.ZodOptional<z.ZodString>;
+    isOrganic: z.ZodDefault<z.ZodBoolean>;
+    isSeasonal: z.ZodDefault<z.ZodBoolean>;
+    isLocallyGrown: z.ZodDefault<z.ZodBoolean>;
+    growingMethod: z.ZodOptional<z.ZodString>;
+    imageUrl: z.ZodOptional<z.ZodString>;
+    detectedFromScan: z.ZodDefault<z.ZodBoolean>;
+    scanConfidence: z.ZodOptional<z.ZodNumber>;
+}, z.core.$strip>;
+export declare const InventoryEntrySchema: z.ZodObject<{
+    id: z.ZodString;
+    productId: z.ZodString;
+    producerId: z.ZodString;
+    quantityAvailable: z.ZodNumber;
+    unit: z.ZodEnum<{
+        kg: "kg";
+        g: "g";
+        piece: "piece";
+        bunch: "bunch";
+        liter: "liter";
+        box: "box";
+        bag: "bag";
+    }>;
+    pricePerUnit: z.ZodNumber;
+    currency: z.ZodDefault<z.ZodString>;
+    harvestedAt: z.ZodOptional<z.ZodString>;
+    availableFrom: z.ZodString;
+    availableUntil: z.ZodString;
+    status: z.ZodEnum<{
+        available: "available";
+        "low-stock": "low-stock";
+        reserved: "reserved";
+        "sold-out": "sold-out";
+    }>;
+    updatedAt: z.ZodString;
+}, z.core.$strip>;
+export declare const ChainPriceSchema: z.ZodObject<{
+    productName: z.ZodString;
+    category: z.ZodEnum<{
+        vegetables: "vegetables";
+        fruits: "fruits";
+        berries: "berries";
+        herbs: "herbs";
+        eggs: "eggs";
+        dairy: "dairy";
+        bread: "bread";
+        meat: "meat";
+        fish: "fish";
+        honey: "honey";
+        preserves: "preserves";
+        flowers: "flowers";
+        other: "other";
+    }>;
+    chain: z.ZodString;
+    pricePerUnit: z.ZodNumber;
+    unit: z.ZodEnum<{
+        kg: "kg";
+        g: "g";
+        piece: "piece";
+        bunch: "bunch";
+        liter: "liter";
+        box: "box";
+        bag: "bag";
+    }>;
+    currency: z.ZodDefault<z.ZodString>;
+    isOrganic: z.ZodDefault<z.ZodBoolean>;
+    scrapedAt: z.ZodString;
+    source: z.ZodOptional<z.ZodString>;
+}, z.core.$strip>;
+export type Product = z.infer<typeof ProductSchema>;
+export type InventoryEntry = z.infer<typeof InventoryEntrySchema>;
+export type ChainPrice = z.infer<typeof ChainPriceSchema>;
+export type ProductCategory = z.infer<typeof ProductCategorySchema>;
+//# sourceMappingURL=product.d.ts.map

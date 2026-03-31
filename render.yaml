@@ -1,0 +1,24 @@
+# ─── Render.com Blueprint ─────────────────────────────────────
+# Deploy with: connect GitHub repo → Render auto-detects this file
+# Free tier works fine for MVP traffic.
+
+services:
+  - type: web
+    name: lokal-api
+    runtime: node
+    buildCommand: npm install
+    startCommand: npx tsx src/index.ts
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: DB_PATH
+        value: /opt/render/project/data/lokal.db
+      - key: PORT
+        value: "3000"
+      - key: BASE_URL
+        sync: false  # Set manually after deploy
+    disk:
+      name: lokal-data
+      mountPath: /opt/render/project/data
+      sizeGB: 1  # Plenty for SQLite
+    healthCheckPath: /health

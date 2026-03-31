@@ -1,0 +1,10 @@
+node_modules
+dist
+data
+*.db
+*.db-wal
+*.db-shm
+.git
+.env
+*.log
+test-agent-simulation.ps1

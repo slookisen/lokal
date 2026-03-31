@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "lokal": {
+      "command": "npx",
+      "args": ["tsx", "src/mcp/server.ts"],
+      "cwd": "C:\\Users\\dafre\\OneDrive\\Documents\\Claude\\Projects\\A2A\\lokal",
+      "env": {
+        "LOKAL_API_URL": "http://localhost:3000"
+      }
+    }
+  }
+}
