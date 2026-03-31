@@ -27,6 +27,7 @@ declare class MarketplaceRegistry {
     getAgentByName(name: string): RegisteredAgent | undefined;
     private generateApiKey;
     private incrementDiscovery;
+    recalculateTrustScore(agentId: string): number;
     private rowToAgent;
     private calculateRelevance;
 }

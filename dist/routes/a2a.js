@@ -4,6 +4,9 @@ const express_1 = require("express");
 const services_1 = require("../services");
 const marketplace_registry_1 = require("../services/marketplace-registry");
 const marketplace_1 = require("../models/marketplace");
+const interaction_logger_1 = require("../services/interaction-logger");
+const conversation_service_1 = require("../services/conversation-service");
+const discovery_service_1 = require("../services/discovery-service");
 // ─── A2A Routes ──────────────────────────────────────────────
 // Two protocols served here:
 //   1. REST endpoints (for humans/dashboards)
@@ -101,6 +104,7 @@ function handleMessageSend(params, id, req, res) {
         discoveryQuery = params;
     }
     // Execute discovery
+    const startTime = Date.now();
     try {
         const query = marketplace_1.DiscoveryQuerySchema.parse({
             ...discoveryQuery,
@@ -108,11 +112,27 @@ function handleMessageSend(params, id, req, res) {
             offset: discoveryQuery.offset || 0,
         });
         const results = marketplace_registry_1.marketplaceRegistry.discover(query);
+        const durationMs = Date.now() - startTime;
         // Complete the task with results
         const completedTask = marketplace_registry_1.marketplaceRegistry.updateTask(task.id, "completed", {
             type: "discovery",
             count: results.length,
             agents: results,
+        });
+        // Log the interaction (this powers the live dashboard)
+        const queryText = message.text || message || JSON.stringify(discoveryQuery);
+        interaction_logger_1.interactionLogger.log("search", {
+            agentId: params?.agentId,
+            query: typeof queryText === "string" ? queryText : JSON.stringify(queryText),
+            resultCount: results.length,
+            matchedAgentIds: results.map(r => r.agent.id),
+            metadata: {
+                taskId: task.id,
+                parsedQuery: message.text ? marketplace_registry_1.marketplaceRegistry.parseNaturalQuery(message.text) : discoveryQuery,
+                method: "message/send",
+            },
+            ipAddress: req.ip,
+            durationMs,
         });
         // A2A response format
         res.json({
@@ -237,6 +257,144 @@ router.get("/api/stats", (_req, res) => {
             registry: registryStats,
         },
     });
+});
+// GET /api/discovery — Discovery status and metadata
+router.get("/api/discovery", (_req, res) => {
+    res.json({
+        success: true,
+        data: {
+            agentCardUrl: `${BASE_URL}/.well-known/agent.json`,
+            a2aEndpoint: `${BASE_URL}/a2a`,
+            registries: discovery_service_1.discoveryService.getRegistryStatus(),
+            metadata: discovery_service_1.discoveryService.getDiscoveryMetadata(),
+        },
+    });
+});
+// ═══════════════════════════════════════════════════════════════
+// SSE LIVE FEED — Real-time interaction stream
+// Connect with EventSource("/api/live") in the dashboard
+// ═══════════════════════════════════════════════════════════════
+const sseClients = new Set();
+router.get("/api/live", (req, res) => {
+    res.writeHead(200, {
+        "Content-Type": "text/event-stream",
+        "Cache-Control": "no-cache",
+        "Connection": "keep-alive",
+        "X-Accel-Buffering": "no",
+    });
+    // Send initial connection event
+    res.write(`data: ${JSON.stringify({ type: "connected", timestamp: new Date().toISOString() })}\n\n`);
+    sseClients.add(res);
+    req.on("close", () => sseClients.delete(res));
+});
+// Forward interactions and messages to SSE clients
+interaction_logger_1.interactionLogger.on("interaction", (event) => {
+    const data = JSON.stringify({ type: "interaction", ...event });
+    for (const client of sseClients) {
+        try {
+            client.write(`data: ${data}\n\n`);
+        }
+        catch {
+            sseClients.delete(client);
+        }
+    }
+});
+interaction_logger_1.interactionLogger.on("message", (msg) => {
+    const data = JSON.stringify({ type: "conversation_message", ...msg });
+    for (const client of sseClients) {
+        try {
+            client.write(`data: ${data}\n\n`);
+        }
+        catch {
+            sseClients.delete(client);
+        }
+    }
+});
+// ═══════════════════════════════════════════════════════════════
+// INTERACTION & CONVERSATION API
+// ═══════════════════════════════════════════════════════════════
+// GET /api/interactions — Recent interactions
+router.get("/api/interactions", (req, res) => {
+    const limit = parseInt(req.query.limit) || 50;
+    const interactions = interaction_logger_1.interactionLogger.getRecent(limit);
+    res.json({ success: true, data: interactions, count: interactions.length });
+});
+// GET /api/interactions/stats — Interaction statistics
+router.get("/api/interactions/stats", (_req, res) => {
+    const stats = interaction_logger_1.interactionLogger.getStats();
+    res.json({ success: true, data: stats });
+});
+// POST /api/conversations — Start a new conversation
+router.post("/api/conversations", (req, res) => {
+    const { buyerAgentId, sellerAgentId, queryText } = req.body;
+    if (!sellerAgentId) {
+        res.status(400).json({ success: false, error: "sellerAgentId required" });
+        return;
+    }
+    const conversation = conversation_service_1.conversationService.startConversation({
+        buyerAgentId, sellerAgentId, queryText,
+    });
+    res.json({ success: true, data: conversation });
+});
+// GET /api/conversations — List conversations
+router.get("/api/conversations", (req, res) => {
+    const conversations = conversation_service_1.conversationService.listConversations({
+        limit: parseInt(req.query.limit) || 50,
+        status: req.query.status,
+        agentId: req.query.agentId,
+    });
+    res.json({ success: true, data: conversations, count: conversations.length });
+});
+// GET /api/conversations/:id — Get single conversation with messages
+router.get("/api/conversations/:id", (req, res) => {
+    const conversation = conversation_service_1.conversationService.getConversation(req.params.id);
+    if (!conversation) {
+        res.status(404).json({ success: false, error: "Conversation not found" });
+        return;
+    }
+    res.json({ success: true, data: conversation });
+});
+// POST /api/conversations/:id/messages — Add message to conversation
+router.post("/api/conversations/:id/messages", (req, res) => {
+    const { senderRole, senderAgentId, content, messageType, metadata } = req.body;
+    if (!content || !senderRole) {
+        res.status(400).json({ success: false, error: "content and senderRole required" });
+        return;
+    }
+    const message = conversation_service_1.conversationService.addMessage({
+        conversationId: req.params.id,
+        senderRole, senderAgentId, content,
+        messageType: messageType || "text",
+        metadata: metadata || {},
+    });
+    res.json({ success: true, data: message });
+});
+// POST /api/conversations/:id/complete — Mark transaction as completed
+router.post("/api/conversations/:id/complete", (req, res) => {
+    try {
+        const conversation = conversation_service_1.conversationService.completeTransaction(req.params.id, {
+            totalAmountNok: req.body.totalAmountNok,
+            products: req.body.products,
+        });
+        res.json({ success: true, data: conversation });
+    }
+    catch (err) {
+        res.status(400).json({ success: false, error: err.message });
+    }
+});
+// ═══════════════════════════════════════════════════════════════
+// SELLER METRICS & SOCIAL PROOF
+// ═══════════════════════════════════════════════════════════════
+// GET /api/agents/:id/metrics — Seller dashboard data
+router.get("/api/agents/:id/metrics", (req, res) => {
+    const metrics = conversation_service_1.conversationService.getAgentMetrics(req.params.id);
+    res.json({ success: true, data: metrics });
+});
+// GET /api/leaderboard — Top sellers (social proof)
+router.get("/api/leaderboard", (req, res) => {
+    const limit = parseInt(req.query.limit) || 10;
+    const leaderboard = conversation_service_1.conversationService.getLeaderboard(limit);
+    res.json({ success: true, data: leaderboard });
 });
 exports.default = router;
 //# sourceMappingURL=a2a.js.map

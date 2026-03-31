@@ -4,4 +4,5 @@ export { matchingEngine, MatchingEngine } from "./matching-engine";
 export { agentCardService, AgentCardService } from "./agent-card";
 export { visionScanner, VisionScannerService } from "./vision-scanner";
 export { reservationService, ReservationService } from "./reservation-service";
+export { discoveryService } from "./discovery-service";
 //# sourceMappingURL=index.d.ts.map

@@ -3,6 +3,7 @@ Object.defineProperty(exports, "__esModule", { value: true });
 const express_1 = require("express");
 const marketplace_registry_1 = require("../services/marketplace-registry");
 const marketplace_1 = require("../models/marketplace");
+const interaction_logger_1 = require("../services/interaction-logger");
 // ─── Marketplace Routes ───────────────────────────────────────
 // These are the OPEN endpoints that make Lokal a marketplace.
 // Any agent in the world can:
@@ -25,6 +26,11 @@ router.post("/register", (req, res) => {
     try {
         const registration = marketplace_1.AgentRegistrationSchema.parse(req.body);
         const agent = marketplace_registry_1.marketplaceRegistry.register(registration);
+        interaction_logger_1.interactionLogger.log("register", {
+            agentId: agent.id,
+            metadata: { name: agent.name, role: agent.role, city: agent.location?.city },
+            ipAddress: req.ip,
+        });
         res.status(201).json({
             success: true,
             message: "Agent registrert i Lokal-markedsplassen",
@@ -56,9 +62,18 @@ router.post("/register", (req, res) => {
 // Body: { categories: ["vegetables"], tags: ["organic"],
 //         location: { lat: 59.92, lng: 10.75 }, maxDistanceKm: 5 }
 router.post("/discover", (req, res) => {
+    const startTime = Date.now();
     try {
         const query = marketplace_1.DiscoveryQuerySchema.parse(req.body);
         const results = marketplace_registry_1.marketplaceRegistry.discover(query);
+        interaction_logger_1.interactionLogger.log("discover", {
+            query: JSON.stringify({ categories: query.categories, tags: query.tags }),
+            resultCount: results.length,
+            matchedAgentIds: results.map(r => r.agent.id),
+            metadata: { query },
+            ipAddress: req.ip,
+            durationMs: Date.now() - startTime,
+        });
         res.json({
             success: true,
             count: results.length,
@@ -98,7 +113,16 @@ router.get("/search", (req, res) => {
         limit: parseInt(req.query.limit) || 20,
         offset: parseInt(req.query.offset) || 0,
     });
+    const startTime = Date.now();
     const results = marketplace_registry_1.marketplaceRegistry.discover(query);
+    interaction_logger_1.interactionLogger.log("search", {
+        query: q,
+        resultCount: results.length,
+        matchedAgentIds: results.map(r => r.agent.id),
+        metadata: { parsed },
+        ipAddress: req.ip,
+        durationMs: Date.now() - startTime,
+    });
     res.json({
         success: true,
         query: q,

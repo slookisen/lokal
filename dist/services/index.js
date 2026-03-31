@@ -1,6 +1,6 @@
 "use strict";
 Object.defineProperty(exports, "__esModule", { value: true });
-exports.ReservationService = exports.reservationService = exports.VisionScannerService = exports.visionScanner = exports.AgentCardService = exports.agentCardService = exports.MatchingEngine = exports.matchingEngine = exports.ProducerAgentService = exports.producerAgent = exports.store = void 0;
+exports.discoveryService = exports.ReservationService = exports.reservationService = exports.VisionScannerService = exports.visionScanner = exports.AgentCardService = exports.agentCardService = exports.MatchingEngine = exports.matchingEngine = exports.ProducerAgentService = exports.producerAgent = exports.store = void 0;
 var store_1 = require("./store");
 Object.defineProperty(exports, "store", { enumerable: true, get: function () { return store_1.store; } });
 var producer_agent_1 = require("./producer-agent");
@@ -18,4 +18,6 @@ Object.defineProperty(exports, "VisionScannerService", { enumerable: true, get: 
 var reservation_service_1 = require("./reservation-service");
 Object.defineProperty(exports, "reservationService", { enumerable: true, get: function () { return reservation_service_1.reservationService; } });
 Object.defineProperty(exports, "ReservationService", { enumerable: true, get: function () { return reservation_service_1.ReservationService; } });
+var discovery_service_1 = require("./discovery-service");
+Object.defineProperty(exports, "discoveryService", { enumerable: true, get: function () { return discovery_service_1.discoveryService; } });
 //# sourceMappingURL=index.js.map

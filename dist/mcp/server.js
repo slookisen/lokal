@@ -19,21 +19,27 @@
 Object.defineProperty(exports, "__esModule", { value: true });
 const mcp_js_1 = require("@modelcontextprotocol/sdk/server/mcp.js");
 const stdio_js_1 = require("@modelcontextprotocol/sdk/server/stdio.js");
-const zod_1 = require("zod");
+const v3_1 = require("zod/v3");
 const API_BASE = process.env.LOKAL_API_URL || "http://localhost:3000";
 // ─── Create MCP Server ──────────────────────────────────────
 const server = new mcp_js_1.McpServer({
     name: "lokal",
-    version: "0.3.0",
+    version: "0.11.0",
+    description: "Local food marketplace for Norway — search 350+ farms, shops and producers. " +
+        "Find fresh vegetables, organic produce, meat, fish, dairy, honey, bread and more. " +
+        "A2A-compatible agent marketplace. Lokal mat-markedsplass for Norge.",
 });
 // ─── Tool 1: Search (Natural Language) ──────────────────────
 // The most important tool. Users say things like:
 //   "finn ferske grønnsaker nær Grünerløkka"
 //   "økologisk honning i Oslo"
 //   "hvor kan jeg kjøpe egg lokalt?"
-server.tool("lokal_search", "Søk etter lokal mat i Oslo og omegn med naturlig språk. Støtter norsk og engelsk. Eksempel: 'ferske grønnsaker nær Grünerløkka', 'organic honey oslo', 'egg fra lokale bønder'.", {
-    query: zod_1.z.string().describe("Naturlig språk søk etter lokal mat (norsk eller engelsk)"),
-    limit: zod_1.z.number().min(1).max(50).default(10).describe("Maks antall resultater"),
+server.tool("lokal_search", "Search for local food in Norway using natural language. Supports Norwegian and English. " +
+    "Find fresh vegetables, organic produce, meat, fish, dairy, honey, bread, berries, eggs, and herbs " +
+    "from 350+ local farms and producers across Oslo, Bergen, Trondheim, and more. " +
+    "Examples: 'fresh vegetables near Grünerløkka', 'organic honey Oslo', 'local eggs'.", {
+    query: v3_1.z.string().describe("Naturlig språk søk etter lokal mat (norsk eller engelsk)"),
+    limit: v3_1.z.number().min(1).max(50).default(10).describe("Maks antall resultater"),
 }, async ({ query, limit }) => {
     try {
         const url = `${API_BASE}/api/marketplace/search?q=${encodeURIComponent(query)}&limit=${limit}`;
@@ -71,14 +77,17 @@ server.tool("lokal_search", "Søk etter lokal mat i Oslo og omegn med naturlig s
 // ─── Tool 2: Discover (Structured Query) ────────────────────
 // For when Claude needs precise filtering:
 //   categories, tags, geo-location, role
-server.tool("lokal_discover", "Strukturert søk i Lokal-registeret. Filtrer på kategorier (vegetables, fruit, honey, etc.), tags (organic, fresh, local), rolle (producer/logistics/quality), og avstand fra koordinater.", {
-    categories: zod_1.z.array(zod_1.z.string()).optional().describe("Kategorier: vegetables, fruit, berries, dairy, eggs, meat, fish, bread, honey, herbs"),
-    tags: zod_1.z.array(zod_1.z.string()).optional().describe("Tags: organic, seasonal, budget, local, fresh"),
-    role: zod_1.z.enum(["producer", "consumer", "logistics", "quality", "price-intel"]).default("producer").describe("Agentrolle"),
-    lat: zod_1.z.number().optional().describe("Breddegrad for avstandsfilter"),
-    lng: zod_1.z.number().optional().describe("Lengdegrad for avstandsfilter"),
-    maxDistanceKm: zod_1.z.number().optional().describe("Maks avstand i km"),
-    limit: zod_1.z.number().min(1).max(50).default(10).describe("Maks resultater"),
+server.tool("lokal_discover", "Structured search in the Lokal food agent registry. Filter by food categories " +
+    "(vegetables, fruit, honey, dairy, eggs, meat, fish, bread, berries, herbs), " +
+    "tags (organic, seasonal, fresh, local, budget), agent role, and geographic distance. " +
+    "Returns ranked agents with trust scores and A2A endpoints.", {
+    categories: v3_1.z.array(v3_1.z.string()).optional().describe("Kategorier: vegetables, fruit, berries, dairy, eggs, meat, fish, bread, honey, herbs"),
+    tags: v3_1.z.array(v3_1.z.string()).optional().describe("Tags: organic, seasonal, budget, local, fresh"),
+    role: v3_1.z.enum(["producer", "consumer", "logistics", "quality", "price-intel"]).default("producer").describe("Agentrolle"),
+    lat: v3_1.z.number().optional().describe("Breddegrad for avstandsfilter"),
+    lng: v3_1.z.number().optional().describe("Lengdegrad for avstandsfilter"),
+    maxDistanceKm: v3_1.z.number().optional().describe("Maks avstand i km"),
+    limit: v3_1.z.number().min(1).max(50).default(10).describe("Maks resultater"),
 }, async ({ categories, tags, role, lat, lng, maxDistanceKm, limit }) => {
     try {
         const body = { role, limit };
@@ -115,18 +124,20 @@ server.tool("lokal_discover", "Strukturert søk i Lokal-registeret. Filtrer på 
 });
 // ─── Tool 3: Register Agent ─────────────────────────────────
 // Let producers register directly from Claude
-server.tool("lokal_register", "Registrer en ny produsent/tjenesteagent i Lokal-markedsplassen. Returnerer API-nøkkel for fremtidige oppdateringer.", {
-    name: zod_1.z.string().describe("Agentens navn"),
-    description: zod_1.z.string().min(10).describe("Beskrivelse av hva agenten tilbyr"),
-    provider: zod_1.z.string().describe("Organisasjon bak agenten"),
-    contactEmail: zod_1.z.string().email().describe("Kontakt-epost"),
-    url: zod_1.z.string().url().describe("Agentens URL/endepunkt"),
-    role: zod_1.z.enum(["producer", "consumer", "logistics", "quality", "price-intel"]).describe("Agentrolle"),
-    categories: zod_1.z.array(zod_1.z.string()).describe("Kategorier: vegetables, fruit, honey, etc."),
-    tags: zod_1.z.array(zod_1.z.string()).describe("Tags: organic, local, fresh, etc."),
-    city: zod_1.z.string().default("Oslo").describe("By"),
-    lat: zod_1.z.number().optional().describe("Breddegrad"),
-    lng: zod_1.z.number().optional().describe("Lengdegrad"),
+server.tool("lokal_register", "Register a new food producer, farm, shop, or cooperative as an agent in the Lokal marketplace. " +
+    "Returns an API key for future updates. Once registered, the agent becomes discoverable " +
+    "by consumer agents and can participate in A2A negotiations.", {
+    name: v3_1.z.string().describe("Agentens navn"),
+    description: v3_1.z.string().min(10).describe("Beskrivelse av hva agenten tilbyr"),
+    provider: v3_1.z.string().describe("Organisasjon bak agenten"),
+    contactEmail: v3_1.z.string().email().describe("Kontakt-epost"),
+    url: v3_1.z.string().url().describe("Agentens URL/endepunkt"),
+    role: v3_1.z.enum(["producer", "consumer", "logistics", "quality", "price-intel"]).describe("Agentrolle"),
+    categories: v3_1.z.array(v3_1.z.string()).describe("Kategorier: vegetables, fruit, honey, etc."),
+    tags: v3_1.z.array(v3_1.z.string()).describe("Tags: organic, local, fresh, etc."),
+    city: v3_1.z.string().default("Oslo").describe("By"),
+    lat: v3_1.z.number().optional().describe("Breddegrad"),
+    lng: v3_1.z.number().optional().describe("Lengdegrad"),
 }, async ({ name, description, provider, contactEmail, url, role, categories, tags, city, lat, lng }) => {
     try {
         const body = {
@@ -157,7 +168,8 @@ server.tool("lokal_register", "Registrer en ny produsent/tjenesteagent i Lokal-m
 });
 // ─── Tool 4: Platform Info ──────────────────────────────────
 // Quick overview of the registry
-server.tool("lokal_info", "Hent statistikk og info om Lokal-plattformen: antall agenter, produsenter, byer, og helsetilstand.", {}, async () => {
+server.tool("lokal_info", "Get Lokal platform statistics: total agents, active producers, cities covered, " +
+    "health status, and A2A endpoint info. Use to verify the platform is running.", {}, async () => {
     try {
         const [statsRes, healthRes] = await Promise.all([
             fetch(`${API_BASE}/api/marketplace/stats`),
@@ -182,9 +194,10 @@ server.tool("lokal_info", "Hent statistikk og info om Lokal-plattformen: antall 
 });
 // ─── Tool 5: A2A JSON-RPC (raw) ────────────────────────────
 // For power users / other agent frameworks
-server.tool("lokal_jsonrpc", "Send en rå JSON-RPC 2.0 forespørsel til Lokal A2A-endepunktet. For avansert bruk og agent-til-agent kommunikasjon.", {
-    method: zod_1.z.string().describe("JSON-RPC metode: message/send, tasks/get, tasks/list"),
-    params: zod_1.z.record(zod_1.z.any()).describe("Metode-parametere som JSON objekt"),
+server.tool("lokal_jsonrpc", "Send a raw JSON-RPC 2.0 request to the Lokal A2A endpoint. " +
+    "For advanced agent-to-agent communication using the A2A protocol standard.", {
+    method: v3_1.z.string().describe("JSON-RPC metode: message/send, tasks/get, tasks/list"),
+    params: v3_1.z.record(v3_1.z.any()).describe("Metode-parametere som JSON objekt"),
 }, async ({ method, params }) => {
     try {
         const response = await fetch(`${API_BASE}/a2a`, {

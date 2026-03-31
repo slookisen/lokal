@@ -149,6 +149,69 @@ function initSchema(db) {
     );
 
     -- ════════════════════════════════════════════════════════════
+    -- INTERACTIONS: Every time an agent touches Lokal
+    -- This is the foundation for analytics, billing, and trust
+    -- ════════════════════════════════════════════════════════════
+    CREATE TABLE IF NOT EXISTS interactions (
+      id TEXT PRIMARY KEY,
+      type TEXT NOT NULL CHECK(type IN ('search','discover','register','view','message','transaction')),
+      agent_id TEXT,                          -- who initiated (null = anonymous)
+      query TEXT,                             -- what they asked for
+      result_count INTEGER DEFAULT 0,        -- how many results returned
+      matched_agent_ids TEXT DEFAULT '[]',    -- JSON array of matched agent IDs
+      metadata TEXT DEFAULT '{}',            -- extra context (parsed query, filters, etc.)
+      ip_hash TEXT,                           -- privacy-safe requester fingerprint
+      duration_ms INTEGER,                   -- how long the request took
+      created_at TEXT DEFAULT (datetime('now'))
+    );
+
+    -- ════════════════════════════════════════════════════════════
+    -- CONVERSATIONS: Agent-to-agent dialogue sessions
+    -- Lokal is the operator — we broker the conversation
+    -- ════════════════════════════════════════════════════════════
+    CREATE TABLE IF NOT EXISTS conversations (
+      id TEXT PRIMARY KEY,
+      buyer_agent_id TEXT,                   -- who's looking to buy (or NULL for anonymous)
+      seller_agent_id TEXT REFERENCES agents(id),
+      status TEXT DEFAULT 'open' CHECK(status IN ('open','negotiating','accepted','completed','expired','cancelled')),
+      query_text TEXT,                       -- original search that started this
+      task_id TEXT REFERENCES tasks(id),     -- linked A2A task
+      created_at TEXT DEFAULT (datetime('now')),
+      updated_at TEXT DEFAULT (datetime('now'))
+    );
+
+    -- ════════════════════════════════════════════════════════════
+    -- MESSAGES: Individual messages within a conversation
+    -- The "chat log" between buyer and seller agents
+    -- ════════════════════════════════════════════════════════════
+    CREATE TABLE IF NOT EXISTS messages (
+      id TEXT PRIMARY KEY,
+      conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+      sender_role TEXT NOT NULL CHECK(sender_role IN ('buyer','seller','system')),
+      sender_agent_id TEXT,
+      content TEXT NOT NULL,                 -- the actual message
+      message_type TEXT DEFAULT 'text' CHECK(message_type IN ('text','offer','accept','reject','info')),
+      metadata TEXT DEFAULT '{}',            -- price info, product details, etc.
+      created_at TEXT DEFAULT (datetime('now'))
+    );
+
+    -- ════════════════════════════════════════════════════════════
+    -- AGENT_METRICS: Aggregated performance per agent
+    -- Powers seller dashboards and social proof
+    -- ════════════════════════════════════════════════════════════
+    CREATE TABLE IF NOT EXISTS agent_metrics (
+      agent_id TEXT PRIMARY KEY REFERENCES agents(id) ON DELETE CASCADE,
+      times_discovered INTEGER DEFAULT 0,    -- shown in search results
+      times_contacted INTEGER DEFAULT 0,     -- conversation started
+      times_chosen INTEGER DEFAULT 0,        -- deal completed
+      total_revenue_nok REAL DEFAULT 0,      -- sum of completed transactions
+      avg_response_time_ms REAL,
+      repeat_buyer_count INTEGER DEFAULT 0,  -- unique buyers who came back
+      last_interaction_at TEXT,
+      updated_at TEXT DEFAULT (datetime('now'))
+    );
+
+    -- ════════════════════════════════════════════════════════════
     -- INDEXES: Geo bounding-box + common lookups
     -- These make discovery fast without PostGIS
     -- ════════════════════════════════════════════════════════════
@@ -160,6 +223,15 @@ function initSchema(db) {
     CREATE INDEX IF NOT EXISTS idx_listings_category ON listings(category);
     CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status);
     CREATE INDEX IF NOT EXISTS idx_tasks_consumer ON tasks(consumer_agent_id);
+
+    -- Interaction indexes
+    CREATE INDEX IF NOT EXISTS idx_interactions_type ON interactions(type);
+    CREATE INDEX IF NOT EXISTS idx_interactions_agent ON interactions(agent_id);
+    CREATE INDEX IF NOT EXISTS idx_interactions_created ON interactions(created_at);
+    CREATE INDEX IF NOT EXISTS idx_conversations_buyer ON conversations(buyer_agent_id);
+    CREATE INDEX IF NOT EXISTS idx_conversations_seller ON conversations(seller_agent_id);
+    CREATE INDEX IF NOT EXISTS idx_conversations_status ON conversations(status);
+    CREATE INDEX IF NOT EXISTS idx_messages_conversation ON messages(conversation_id);
   `);
 }
 function closeDb() {

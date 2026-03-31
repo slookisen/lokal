@@ -16,6 +16,7 @@ const reservation_1 = __importDefault(require("./routes/reservation"));
 const marketplace_1 = __importDefault(require("./routes/marketplace"));
 const seed_1 = require("./seed");
 const seed_oslo_real_1 = require("./seed-oslo-real");
+const seed_marketplace_1 = require("./seed-marketplace");
 const seed_norway_expansion_1 = require("./seed-norway-expansion");
 const seed_expansion_v2_1 = require("./seed-expansion-v2");
 const seed_expansion_v3_1 = require("./seed-expansion-v3");
@@ -24,6 +25,7 @@ const seed_expansion_v5_1 = require("./seed-expansion-v5");
 const seed_expansion_v6_1 = require("./seed-expansion-v6");
 const seed_expansion_v7_1 = require("./seed-expansion-v7");
 const seed_expansion_v8_1 = require("./seed-expansion-v8");
+const discovery_service_1 = require("./services/discovery-service");
 const app = (0, express_1.default)();
 const PORT = process.env.PORT || 3000;
 // ─── Security Layer ──────────────────────────────────────────
@@ -57,7 +59,7 @@ app.get("/health", (_req, res) => {
     res.json({
         status: "ok",
         service: "lokal",
-        version: "0.11.0",
+        version: "0.3.0",
         database: "sqlite",
         agents: stats.totalAgents,
         uptime: Math.floor(process.uptime()),
@@ -68,6 +70,7 @@ console.log("\n💾 Initializing SQLite database...");
 (0, init_1.getDb)();
 (0, seed_1.seedData)();
 (0, seed_oslo_real_1.seedOsloRealData)();
+(0, seed_marketplace_1.seedMarketplace)();
 (0, seed_norway_expansion_1.seedNorwayExpansion)();
 (0, seed_expansion_v2_1.seedExpansionV2)();
 (0, seed_expansion_v3_1.seedExpansionV3)();
@@ -77,21 +80,26 @@ console.log("\n💾 Initializing SQLite database...");
 (0, seed_expansion_v7_1.seedExpansionV7)();
 (0, seed_expansion_v8_1.seedExpansionV8)();
 // ─── Start ───────────────────────────────────────────────────
-app.listen(PORT, () => {
-    console.log(`\n🥬 Lokal API v0.11.0 running at http://localhost:${PORT}`);
+const BASE_URL = process.env.BASE_URL || `http://localhost:${PORT}`;
+app.listen(PORT, async () => {
+    console.log(`\n🥬 Lokal API v0.11.0 running at ${BASE_URL}`);
     console.log(`   💾 Database: SQLite (persistent)`);
     console.log(`   🔒 Security: Helmet + Rate limiting + Input sanitization`);
     console.log(`\n   ── A2A Protocol ──────────────────────────────`);
-    console.log(`   JSON-RPC:      POST http://localhost:${PORT}/a2a`);
-    console.log(`   Agent Card:    GET  http://localhost:${PORT}/.well-known/agent.json`);
+    console.log(`   JSON-RPC:      POST ${BASE_URL}/a2a`);
+    console.log(`   Agent Card:    GET  ${BASE_URL}/.well-known/agent.json`);
     console.log(`\n   ── Marketplace ──────────────────────────────`);
-    console.log(`   Register:      POST http://localhost:${PORT}/api/marketplace/register`);
-    console.log(`   Discover:      POST http://localhost:${PORT}/api/marketplace/discover`);
-    console.log(`   NL Search:     GET  http://localhost:${PORT}/api/marketplace/search?q=...`);
-    console.log(`   MCP Server:    npx lokal-mcp (for Claude Desktop)\n`);
+    console.log(`   Register:      POST ${BASE_URL}/api/marketplace/register`);
+    console.log(`   Discover:      POST ${BASE_URL}/api/marketplace/discover`);
+    console.log(`   NL Search:     GET  ${BASE_URL}/api/marketplace/search?q=...`);
+    console.log(`   MCP Server:    npx lokal-mcp (for Claude Desktop)`);
+    console.log(`\n   ── Discovery ────────────────────────────────`);
+    // Initialize discovery service (registers with A2A registries if public URL)
+    await discovery_service_1.discoveryService.initialize(BASE_URL);
+    console.log("");
 });
 // ─── Graceful shutdown ───────────────────────────────────────
-process.on("SIGTERM", () => { (0, init_1.closeDb)(); process.exit(0); });
-process.on("SIGINT", () => { (0, init_1.closeDb)(); process.exit(0); });
+process.on("SIGTERM", () => { discovery_service_1.discoveryService.shutdown(); (0, init_1.closeDb)(); process.exit(0); });
+process.on("SIGINT", () => { discovery_service_1.discoveryService.shutdown(); (0, init_1.closeDb)(); process.exit(0); });
 exports.default = app;
 //# sourceMappingURL=index.js.map
