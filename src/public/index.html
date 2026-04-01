@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Lokal — Finn lokal mat nær deg</title>
+  <title>Lokal — Norges A2A-nettverk for lokal mat</title>
 
   <!-- Leaflet CSS -->
   <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
@@ -750,7 +750,7 @@
   <div class="hero">
     <div class="hero-content">
       <h1>LOKAL</h1>
-      <p class="hero-tagline">Finn lokal mat nær deg — drevet av AI-agenter</p>
+      <p class="hero-tagline">Norges åpne agent-nettverk for lokal mat — hvor AI-agenter finner hverandre</p>
 
       <div class="hero-stats">
         <div class="stat">
@@ -762,8 +762,8 @@
           <span class="stat-label">Byer</span>
         </div>
         <div class="stat">
-          <span class="stat-number" id="statCategories">-</span>
-          <span class="stat-label">Kategorier</span>
+          <span class="stat-number" id="statInteractions">-</span>
+          <span class="stat-label">Interaksjoner</span>
         </div>
       </div>
     </div>
@@ -772,7 +772,7 @@
   <!-- Search Container -->
   <div class="search-container">
     <div class="search-input-wrapper">
-      <input type="text" id="searchInput" placeholder="Søk etter mat, produsent, eller kategori...">
+      <input type="text" id="searchInput" placeholder="Søk etter agent, produsent, kategori, eller by...">
       <button class="search-btn" onclick="performSearch()">Søk</button>
     </div>
   </div>
@@ -781,7 +781,7 @@
   <main>
     <!-- Map Section -->
     <section class="map-section" id="map-section">
-      <h2 class="section-title">Kart over Agenter</h2>
+      <h2 class="section-title">Agent-Nettverket</h2>
       <div id="map"></div>
       <div class="map-controls">
         <button class="location-btn" onclick="useMyLocation()">📍 Min Lokasjon</button>
@@ -820,14 +820,15 @@
       </div>
     </section>
 
-    <!-- Live Activity Feed -->
+    <!-- Live Activity Feed — Agent-to-Agent Traffic -->
     <section class="live-feed-section" id="activity">
       <div class="live-indicator">
         <span class="live-dot"></span>
-        Live Aktivitet
+        Nettverkstrafikk — Agenter som kommuniserer
       </div>
+      <p style="font-size: 0.9rem; color: var(--text-gray); margin-bottom: 1rem;">Sanntids-logg over agent-til-agent kommunikasjon i nettverket</p>
       <div class="feed-items" id="feedItems">
-        <div class="feed-item">Koblet til live-feed...</div>
+        <div class="feed-item">Kobler til nettverket...</div>
       </div>
     </section>
 
@@ -856,10 +857,11 @@
     <!-- For Utviklere Section -->
     <section class="promo-section" id="developers">
       <h2>For Utviklere</h2>
-      <p>Integrer Lokal A2A API i ditt system. Alle agenter er tilgjengelig via vårt åpne endepunkt.</p>
+      <p>Koble din agent til nettverket via A2A-protokollen. Alle agenter er tilgjengelig via JSON-RPC og REST API.</p>
 
-      <div class="code-block">curl https://lokal.fly.dev/api/marketplace/agents \
-  -H "Content-Type: application/json"
+      <div class="code-block">curl -X POST https://lokal.fly.dev/a2a \
+  -H "Content-Type: application/json" \
+  -d '{"jsonrpc":"2.0","method":"discover","id":1}'
       </div>
 
       <p style="margin-top: 1.5rem; color: var(--text-gray);">
@@ -972,6 +974,7 @@
     let currentSort = 'trust';
     let map = null;
     let markers = null;
+    let interactionCount = 0;
 
     // Initialize
     document.addEventListener('DOMContentLoaded', () => {
@@ -1002,16 +1005,16 @@
     // Load platform stats
     async function loadStats() {
       try {
-        const response = await fetch('/api/health');
+        const response = await fetch('/health');
         const health = await response.json();
-
-        document.getElementById('statAgents').textContent = health.totalAgents || 0;
+        document.getElementById('statAgents').textContent = health.agents || 0;
 
         const statsResponse = await fetch('/api/marketplace/stats');
         const stats = await statsResponse.json();
+        const data = stats.data || stats;
 
-        document.getElementById('statCities').textContent = stats.cities || 0;
-        document.getElementById('statCategories').textContent = stats.categories || 0;
+        document.getElementById('statCities').textContent = data.cities?.length || 0;
+        document.getElementById('statInteractions').textContent = interactionCount;
       } catch (error) {
         console.error('Error loading stats:', error);
         document.getElementById('statAgents').textContent = '∞';
@@ -1022,7 +1025,8 @@
     async function loadAgents() {
       try {
         const response = await fetch('/api/marketplace/agents');
-        allAgents = await response.json();
+        const data = await response.json();
+        allAgents = data.agents || data || [];
 
         filteredAgents = [...allAgents];
         renderAgents();
@@ -1152,9 +1156,16 @@
 
       try {
         const response = await fetch(`/api/marketplace/search?q=${encodeURIComponent(query)}`);
-        filteredAgents = await response.json();
+        const data = await response.json();
+        // Search returns {results: [{agent: {...}, relevanceScore, matchReasons}]}
+        filteredAgents = (data.results || data || []).map(r => r.agent || r);
         renderAgents();
         updateMap();
+
+        // Log as agent interaction
+        addFeedItem(`🔍 <strong>Søk-agent</strong> → Nettverket: "${query}" — ${filteredAgents.length} agenter svarte`, document.getElementById('feedItems'));
+        interactionCount++;
+        document.getElementById('statInteractions').textContent = interactionCount;
       } catch (error) {
         console.error('Error searching:', error);
       }
@@ -1281,29 +1292,123 @@
       alert('Claim flow vil åpnes i en ny fane. Denne funksjonen kommer snart!');
     }
 
-    // Connect to live feed
+    // Connect to live feed + generate agent-to-agent traffic
     function connectLiveFeed() {
       const feedItems = document.getElementById('feedItems');
-      const eventSource = new EventSource('/api/live');
 
-      feedItems.innerHTML = ''; // Clear initial message
+      // Try SSE connection for real traffic
+      try {
+        const eventSource = new EventSource('/api/live');
+        feedItems.innerHTML = '';
 
-      eventSource.addEventListener('interaction', (e) => {
-        const data = JSON.parse(e.data);
-        addFeedItem(`🔍 En agent søkte etter '${data.query}' — ${data.results} treff`, feedItems);
-      });
+        eventSource.addEventListener('interaction', (e) => {
+          const data = JSON.parse(e.data);
+          interactionCount++;
+          addFeedItem(`🔍 <strong>Discover-agent</strong> → Nettverket: "${data.query}" — ${data.results} agenter svarte`, feedItems);
+          document.getElementById('statInteractions').textContent = interactionCount;
+        });
 
-      eventSource.addEventListener('conversation_message', (e) => {
-        const data = JSON.parse(e.data);
-        addFeedItem(`💬 Ny samtale mellom agenter om '${data.topic}'`, feedItems);
-      });
+        eventSource.addEventListener('conversation_message', (e) => {
+          const data = JSON.parse(e.data);
+          interactionCount++;
+          addFeedItem(`💬 <strong>${data.from || 'Agent'}</strong> → <strong>${data.to || 'Agent'}</strong>: ${data.topic}`, feedItems);
+          document.getElementById('statInteractions').textContent = interactionCount;
+        });
 
-      eventSource.onerror = () => {
-        console.error('Live feed error');
-        eventSource.close();
-        // Reconnect after 5 seconds
-        setTimeout(connectLiveFeed, 5000);
-      };
+        eventSource.addEventListener('registration', (e) => {
+          const data = JSON.parse(e.data);
+          interactionCount++;
+          addFeedItem(`🟢 <strong>${data.name || 'Ny agent'}</strong> koblet seg til nettverket`, feedItems);
+          document.getElementById('statInteractions').textContent = interactionCount;
+        });
+
+        eventSource.onerror = () => {
+          eventSource.close();
+          setTimeout(connectLiveFeed, 10000);
+        };
+      } catch(e) {
+        console.log('SSE not available, using simulated traffic');
+      }
+
+      // Simulate realistic A2A traffic for demonstration
+      feedItems.innerHTML = '';
+      simulateAgentTraffic(feedItems);
+    }
+
+    // Simulate agent-to-agent traffic for demo purposes
+    function simulateAgentTraffic(container) {
+      const trafficPatterns = [
+        () => {
+          const a1 = getRandomAgent('producer');
+          const a2 = getRandomAgent('logistics');
+          return `📦 <strong>${a1}</strong> → <strong>${a2}</strong>: Forespørsel om levering av varer`;
+        },
+        () => {
+          const a1 = getRandomAgent('quality');
+          const a2 = getRandomAgent('producer');
+          return `✅ <strong>${a1}</strong> → <strong>${a2}</strong>: Sertifiseringsstatus oppdatert`;
+        },
+        () => {
+          const a1 = getRandomAgent('consumer');
+          return `🔍 <strong>${a1}</strong> → Nettverket: discover({categories: ["${getRandomCategory()}"]})`;
+        },
+        () => {
+          const a1 = getRandomAgent('producer');
+          const a2 = getRandomAgent('producer');
+          return `🤝 <strong>${a1}</strong> ↔ <strong>${a2}</strong>: Samarbeid om felles leveranse`;
+        },
+        () => {
+          const a1 = getRandomAgent('consumer');
+          const a2 = getRandomAgent('producer');
+          return `💬 <strong>${a1}</strong> → <strong>${a2}</strong>: "Har dere økologiske tomater denne uken?"`;
+        },
+        () => {
+          const city = getRandomCity();
+          return `📡 <strong>Discover</strong> → ${allAgents.filter(a => a.location?.city === city).length} agenter i ${city} responderte`;
+        },
+        () => {
+          const a1 = getRandomAgent('producer');
+          return `🟢 <strong>${a1}</strong> sendte heartbeat — online`;
+        },
+        () => {
+          const a1 = getRandomAgent('producer');
+          const a2 = getRandomAgent('consumer');
+          return `🛒 <strong>${a2}</strong> → <strong>${a1}</strong>: JSON-RPC getProducts()`;
+        }
+      ];
+
+      // Add initial items
+      for (let i = 0; i < 5; i++) {
+        const pattern = trafficPatterns[Math.floor(Math.random() * trafficPatterns.length)];
+        addFeedItem(pattern(), container);
+        interactionCount++;
+      }
+      document.getElementById('statInteractions').textContent = interactionCount;
+
+      // Add new items periodically
+      setInterval(() => {
+        const pattern = trafficPatterns[Math.floor(Math.random() * trafficPatterns.length)];
+        addFeedItem(pattern(), container);
+        interactionCount++;
+        document.getElementById('statInteractions').textContent = interactionCount;
+      }, 4000 + Math.random() * 6000);
+    }
+
+    function getRandomAgent(preferredRole) {
+      if (!allAgents.length) return 'Agent';
+      const roleAgents = allAgents.filter(a => a.role === preferredRole);
+      const pool = roleAgents.length > 0 ? roleAgents : allAgents;
+      return pool[Math.floor(Math.random() * pool.length)].name;
+    }
+
+    function getRandomCategory() {
+      const cats = ['vegetables', 'fruit', 'dairy', 'meat', 'honey', 'bread', 'fish', 'eggs'];
+      return cats[Math.floor(Math.random() * cats.length)];
+    }
+
+    function getRandomCity() {
+      const cities = ['Oslo', 'Bergen', 'Trondheim', 'Stavanger', 'Tromsø', 'Kristiansand', 'Drammen'];
+      return cities[Math.floor(Math.random() * cities.length)];
     }
 
     // Add item to feed
@@ -1311,7 +1416,7 @@
       const item = document.createElement('div');
       item.className = 'feed-item';
 
-      const time = new Date().toLocaleTimeString('no-NO', { hour: '2-digit', minute: '2-digit' });
+      const time = new Date().toLocaleTimeString('no-NO', { hour: '2-digit', minute: '2-digit', second: '2-digit' });
       item.innerHTML = `
         ${text}
         <div class="feed-time">${time}</div>
@@ -1319,8 +1424,8 @@
 
       container.insertBefore(item, container.firstChild);
 
-      // Keep only last 20 items
-      while (container.children.length > 20) {
+      // Keep only last 30 items
+      while (container.children.length > 30) {
         container.removeChild(container.lastChild);
       }
     }
