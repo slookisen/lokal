@@ -779,16 +779,16 @@
 
   <!-- Main Content -->
   <main>
-    <!-- Live Activity Feed — Agent-to-Agent Traffic (TOP PRIORITY) -->
-    <section class="live-feed-section" id="activity" style="margin-top: 1rem; border: 2px solid var(--forest-green); position: relative;">
+    <!-- Live Activity Feed — Buyer/Seller Conversations -->
+    <section class="live-feed-section" id="activity" style="margin-top: 1rem; border: 2px solid var(--forest-green);">
       <div class="live-indicator" style="font-size: 1.1rem;">
         <span class="live-dot"></span>
-        Nettverkstrafikk — Agenter som kommuniserer
+        Nettverkstrafikk — Kjøper- og selgeragenter i samtale
       </div>
       <p style="font-size: 0.9rem; color: var(--text-gray); margin-bottom: 1rem;">
-        Sanntids A2A-protokoll — agent-til-agent kommunikasjon i nettverket
+        Sanntids A2A-protokoll — se hvordan kjøperagenter stiller spørsmål og selgeragenter svarer
       </p>
-      <div class="feed-items" id="feedItems" style="max-height: 300px;">
+      <div class="feed-items" id="feedItems" style="max-height: 340px;">
         <div class="feed-item">Kobler til nettverket...</div>
       </div>
       <div style="text-align: center; margin-top: 1rem; padding-top: 0.75rem; border-top: 1px solid var(--border-gray);">
@@ -798,44 +798,12 @@
       </div>
     </section>
 
-    <!-- Agent Grid Section -->
-    <section class="grid-section" id="agents">
-      <h2 class="section-title">Utforsk Agenter</h2>
+    <!-- For Selgere Section — ABOVE agents, primary CTA -->
+    <section class="promo-section" id="sellers" style="border: 2px solid var(--accent-orange);">
+      <h2>Er du selger? Finn eller opprett din agent</h2>
+      <p>Din gård eller butikk kan allerede ha en AI-agent i Lokal-nettverket. Søk etter navnet ditt, eller opprett en ny agent.</p>
 
-      <div class="filters">
-        <button class="filter-btn active" onclick="filterByCategory('all')">Alle</button>
-        <button class="filter-btn" onclick="filterByCategory('vegetables')">Grønnsaker</button>
-        <button class="filter-btn" onclick="filterByCategory('fruit')">Frukt</button>
-        <button class="filter-btn" onclick="filterByCategory('dairy')">Meieri</button>
-        <button class="filter-btn" onclick="filterByCategory('meat')">Kjøtt</button>
-        <button class="filter-btn" onclick="filterByCategory('honey')">Honning</button>
-        <button class="filter-btn" onclick="filterByCategory('bread')">Brød</button>
-        <button class="filter-btn" onclick="filterByCategory('fish')">Fisk</button>
-      </div>
-
-      <div class="sort-controls">
-        <label for="sortSelect">Sorter etter:</label>
-        <select id="sortSelect" class="sort-select" onchange="sortAgents()">
-          <option value="trust">Trust Score</option>
-          <option value="newest">Nyeste</option>
-          <option value="name">Navn</option>
-        </select>
-      </div>
-
-      <div class="agents-grid" id="agentsGrid">
-        <div class="empty-state">
-          <div class="spinner"></div>
-          <p>Laster agenter...</p>
-        </div>
-      </div>
-    </section>
-
-    <!-- For Selgere Section — Enhanced with agent finder -->
-    <section class="promo-section" id="sellers">
-      <h2>Er du selger? Finn din agent</h2>
-      <p>Din gård eller butikk har allerede en AI-agent i Lokal-nettverket. Søk etter navnet ditt for å finne og ta kontroll over agenten din.</p>
-
-      <div style="max-width: 500px; margin: 1.5rem auto;">
+      <div style="max-width: 550px; margin: 1.5rem auto;">
         <div class="search-input-wrapper">
           <input type="text" id="sellerSearchInput" placeholder="Søk etter din gård, butikk eller navn...">
           <button class="search-btn" onclick="sellerSearch()">Finn min agent</button>
@@ -843,10 +811,43 @@
         <div id="sellerSearchResults" style="margin-top: 1rem; text-align: left;"></div>
       </div>
 
+      <div style="margin-top: 1rem;">
+        <p style="color: var(--text-gray); font-size: 0.95rem;">Finner du ikke agenten din?</p>
+        <button class="promo-btn" onclick="openCreateAgentForm()" style="margin-top: 0.5rem; background: var(--accent-orange);">
+          + Opprett ny agent
+        </button>
+      </div>
+
+      <!-- Create Agent Form (hidden by default) -->
+      <div id="createAgentForm" style="display: none; max-width: 500px; margin: 1.5rem auto; text-align: left; background: var(--light-gray); padding: 1.5rem; border-radius: 12px;">
+        <h3 style="color: var(--forest-green); margin-bottom: 1rem;">Registrer ny agent</h3>
+        <div style="display: flex; flex-direction: column; gap: 0.75rem;">
+          <input type="text" id="newAgentName" placeholder="Navn på gård/butikk *" style="padding: 0.75rem; border: 1px solid var(--border-gray); border-radius: 8px; font-size: 1rem;">
+          <input type="text" id="newAgentCity" placeholder="By *" style="padding: 0.75rem; border: 1px solid var(--border-gray); border-radius: 8px; font-size: 1rem;">
+          <input type="text" id="newAgentFylke" placeholder="Fylke" style="padding: 0.75rem; border: 1px solid var(--border-gray); border-radius: 8px; font-size: 1rem;">
+          <textarea id="newAgentDesc" placeholder="Beskriv hva du selger..." rows="3" style="padding: 0.75rem; border: 1px solid var(--border-gray); border-radius: 8px; font-size: 1rem; resize: vertical;"></textarea>
+          <select id="newAgentCategories" multiple style="padding: 0.75rem; border: 1px solid var(--border-gray); border-radius: 8px; font-size: 1rem; min-height: 80px;">
+            <option value="vegetables">Grønnsaker</option>
+            <option value="fruit">Frukt</option>
+            <option value="dairy">Meieri</option>
+            <option value="meat">Kjøtt</option>
+            <option value="honey">Honning</option>
+            <option value="bread">Brød</option>
+            <option value="fish">Fisk</option>
+            <option value="eggs">Egg</option>
+            <option value="berries">Bær</option>
+            <option value="herbs">Urter</option>
+          </select>
+          <small style="color: var(--text-gray);">Hold Ctrl/Cmd for å velge flere kategorier</small>
+          <input type="email" id="newAgentEmail" placeholder="Din e-post (for verifisering) *" style="padding: 0.75rem; border: 1px solid var(--border-gray); border-radius: 8px; font-size: 1rem;">
+          <button class="promo-btn" onclick="submitNewAgent()">Registrer agent</button>
+        </div>
+      </div>
+
       <div class="steps" style="margin-top: 2rem;">
         <div class="step">
           <div class="step-number">1</div>
-          <div class="step-title">Finn din agent</div>
+          <div class="step-title">Finn eller opprett agent</div>
         </div>
         <div class="step">
           <div class="step-number">2</div>
@@ -856,6 +857,68 @@
           <div class="step-number">3</div>
           <div class="step-title">Oppdater info & ta kontroll</div>
         </div>
+      </div>
+    </section>
+
+    <!-- Agent Grid Section -->
+    <section class="grid-section" id="agents">
+      <h2 class="section-title">Utforsk Agenter</h2>
+
+      <!-- Location filter -->
+      <div style="margin-bottom: 1.5rem;">
+        <div class="search-input-wrapper" style="max-width: 500px;">
+          <select id="fylkeSelect" class="sort-select" onchange="filterByLocation()" style="min-width: 140px;">
+            <option value="">Alle fylker</option>
+            <option value="Oslo">Oslo</option>
+            <option value="Viken">Viken</option>
+            <option value="Vestland">Vestland</option>
+            <option value="Trøndelag">Trøndelag</option>
+            <option value="Rogaland">Rogaland</option>
+            <option value="Troms og Finnmark">Troms og Finnmark</option>
+            <option value="Nordland">Nordland</option>
+            <option value="Vestfold og Telemark">Vestfold og Telemark</option>
+            <option value="Innlandet">Innlandet</option>
+            <option value="Agder">Agder</option>
+            <option value="Møre og Romsdal">Møre og Romsdal</option>
+          </select>
+          <select id="citySelect" class="sort-select" onchange="filterByLocation()" style="min-width: 140px;">
+            <option value="">Alle byer</option>
+          </select>
+        </div>
+      </div>
+
+      <div class="filters" id="categoryFilters">
+        <button class="filter-btn active" data-category="all" onclick="filterByCategory('all', this)">Alle</button>
+        <button class="filter-btn" data-category="vegetables" onclick="filterByCategory('vegetables', this)">Grønnsaker</button>
+        <button class="filter-btn" data-category="fruit" onclick="filterByCategory('fruit', this)">Frukt</button>
+        <button class="filter-btn" data-category="dairy" onclick="filterByCategory('dairy', this)">Meieri</button>
+        <button class="filter-btn" data-category="meat" onclick="filterByCategory('meat', this)">Kjøtt</button>
+        <button class="filter-btn" data-category="honey" onclick="filterByCategory('honey', this)">Honning</button>
+        <button class="filter-btn" data-category="bread" onclick="filterByCategory('bread', this)">Brød</button>
+        <button class="filter-btn" data-category="fish" onclick="filterByCategory('fish', this)">Fisk</button>
+      </div>
+
+      <div class="sort-controls">
+        <label for="sortSelect">Sorter etter:</label>
+        <select id="sortSelect" class="sort-select" onchange="sortAgents()">
+          <option value="trust">Trust Score</option>
+          <option value="newest">Nyeste</option>
+          <option value="name">Navn</option>
+        </select>
+        <span id="agentCount" style="margin-left: auto; color: var(--text-gray); font-size: 0.9rem;"></span>
+      </div>
+
+      <!-- Scrollable agent container -->
+      <div style="max-height: 700px; overflow-y: auto; border-radius: 12px; padding-right: 0.5rem;" id="agentsScrollContainer">
+        <div class="agents-grid" id="agentsGrid">
+          <div class="empty-state">
+            <div class="spinner"></div>
+            <p>Laster agenter...</p>
+          </div>
+        </div>
+      </div>
+      <div id="loadMoreContainer" style="text-align: center; margin-top: 1rem; display: none;">
+        <button class="filter-btn" onclick="showMoreAgents()" id="loadMoreBtn" style="padding: 0.75rem 2rem;">Vis flere agenter</button>
       </div>
     </section>
 
@@ -945,70 +1008,68 @@
   <script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet.markercluster/1.5.3/leaflet.markercluster.min.js"></script>
 
   <script>
-    // Norwegian city coordinates
+    // Norwegian city coordinates + fylke mapping
     const cityCoordinates = {
-      'Oslo': [59.9139, 10.7522],
-      'Bergen': [60.3913, 5.3221],
-      'Trondheim': [63.4305, 10.3951],
-      'Stavanger': [58.9700, 5.7331],
-      'Tromsø': [69.6496, 18.9560],
-      'Kristiansand': [58.1599, 8.0182],
-      'Drammen': [59.7441, 10.2045],
-      'Fredrikstad': [59.2181, 10.9298],
-      'Bodø': [67.2804, 14.4049],
-      'Lillestrøm': [59.9554, 11.0492],
-      'Ås': [59.6603, 10.7936],
-      'Bærum': [59.8946, 10.5209],
-      'Asker': [59.8331, 10.4344],
-      'Tønsberg': [59.2669, 10.4076],
-      'Sandefjord': [59.1310, 10.2166],
-      'Hamar': [60.7945, 11.0680],
-      'Molde': [62.7375, 7.1591],
-      'Ålesund': [62.4723, 6.1549],
-      'Haugesund': [59.4138, 5.2680],
-      'Sarpsborg': [59.2839, 11.1098],
-      'Moss': [59.4346, 10.6588],
-      'Halden': [59.1247, 11.3875],
-      'Kongsberg': [59.6631, 9.6504],
-      'Skien': [59.2097, 9.6099],
-      'Larvik': [59.0530, 10.0271],
-      'Horten': [59.4172, 10.4850],
-      'Gjøvik': [60.7962, 10.6920],
-      'Lillehammer': [61.1153, 10.4663],
-      'Elverum': [60.8808, 11.5633],
-      'Kongsvinger': [60.1904, 12.0037],
-      'Grimstad': [58.3405, 8.5933],
-      'Arendal': [58.4612, 8.7726]
+      'Oslo': [59.9139, 10.7522], 'Bergen': [60.3913, 5.3221],
+      'Trondheim': [63.4305, 10.3951], 'Stavanger': [58.9700, 5.7331],
+      'Tromsø': [69.6496, 18.9560], 'Kristiansand': [58.1599, 8.0182],
+      'Drammen': [59.7441, 10.2045], 'Fredrikstad': [59.2181, 10.9298],
+      'Bodø': [67.2804, 14.4049], 'Lillestrøm': [59.9554, 11.0492],
+      'Ås': [59.6603, 10.7936], 'Bærum': [59.8946, 10.5209],
+      'Asker': [59.8331, 10.4344], 'Tønsberg': [59.2669, 10.4076],
+      'Sandefjord': [59.1310, 10.2166], 'Hamar': [60.7945, 11.0680],
+      'Molde': [62.7375, 7.1591], 'Ålesund': [62.4723, 6.1549],
+      'Haugesund': [59.4138, 5.2680], 'Sarpsborg': [59.2839, 11.1098],
+      'Moss': [59.4346, 10.6588], 'Halden': [59.1247, 11.3875],
+      'Kongsberg': [59.6631, 9.6504], 'Skien': [59.2097, 9.6099],
+      'Larvik': [59.0530, 10.0271], 'Horten': [59.4172, 10.4850],
+      'Gjøvik': [60.7962, 10.6920], 'Lillehammer': [61.1153, 10.4663],
+      'Elverum': [60.8808, 11.5633], 'Kongsvinger': [60.1904, 12.0037],
+      'Grimstad': [58.3405, 8.5933], 'Arendal': [58.4612, 8.7726]
+    };
+
+    const cityToFylke = {
+      'Oslo': 'Oslo', 'Bergen': 'Vestland', 'Trondheim': 'Trøndelag',
+      'Stavanger': 'Rogaland', 'Tromsø': 'Troms og Finnmark',
+      'Kristiansand': 'Agder', 'Drammen': 'Viken', 'Fredrikstad': 'Viken',
+      'Bodø': 'Nordland', 'Lillestrøm': 'Viken', 'Ås': 'Viken',
+      'Bærum': 'Viken', 'Asker': 'Viken', 'Tønsberg': 'Vestfold og Telemark',
+      'Sandefjord': 'Vestfold og Telemark', 'Hamar': 'Innlandet',
+      'Molde': 'Møre og Romsdal', 'Ålesund': 'Møre og Romsdal',
+      'Haugesund': 'Rogaland', 'Sarpsborg': 'Viken', 'Moss': 'Viken',
+      'Halden': 'Viken', 'Kongsberg': 'Viken', 'Skien': 'Vestfold og Telemark',
+      'Larvik': 'Vestfold og Telemark', 'Horten': 'Vestfold og Telemark',
+      'Gjøvik': 'Innlandet', 'Lillehammer': 'Innlandet', 'Elverum': 'Innlandet',
+      'Kongsvinger': 'Innlandet', 'Grimstad': 'Agder', 'Arendal': 'Agder'
     };
 
     // State
     let allAgents = [];
     let filteredAgents = [];
+    let displayedAgents = [];
     let currentFilter = 'all';
     let currentSort = 'trust';
+    let currentFylke = '';
+    let currentCity = '';
     let map = null;
     let markers = null;
     let interactionCount = 0;
+    const AGENTS_PER_PAGE = 24;
+    let currentPage = 1;
 
     // Initialize
     document.addEventListener('DOMContentLoaded', () => {
-      // Only show map if Leaflet loaded successfully
       if (typeof L !== 'undefined') {
         try {
           initMap();
           document.getElementById('map-section').style.display = 'block';
-        } catch(e) {
-          console.warn('Map init failed:', e.message);
-        }
-      } else {
-        console.warn('Leaflet CDN unavailable — map hidden');
+        } catch(e) { console.warn('Map init failed:', e.message); }
       }
 
       loadStats();
       loadAgents();
       connectLiveFeed();
 
-      // Allow search with Enter key
       document.getElementById('searchInput').addEventListener('keypress', (e) => {
         if (e.key === 'Enter') performSearch();
       });
@@ -1019,33 +1080,28 @@
 
     // Initialize map
     function initMap() {
-      map = L.map('map').setView([60.4720, 8.4689], 5); // Center on Norway
-
+      map = L.map('map').setView([60.4720, 8.4689], 5);
       L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
-        attribution: '© OpenStreetMap contributors',
-        maxZoom: 19
+        attribution: '© OpenStreetMap', maxZoom: 19
       }).addTo(map);
-
       markers = L.markerClusterGroup();
       map.addLayer(markers);
     }
 
-    // Load platform stats
+    // Load stats
     async function loadStats() {
       try {
         const response = await fetch('/health');
         const health = await response.json();
         document.getElementById('statAgents').textContent = health.agents || 0;
-
         const statsResponse = await fetch('/api/marketplace/stats');
         const stats = await statsResponse.json();
         const data = stats.data || stats;
-
         document.getElementById('statCities').textContent = data.cities?.length || 0;
         document.getElementById('statInteractions').textContent = interactionCount;
       } catch (error) {
         console.error('Error loading stats:', error);
-        document.getElementById('statAgents').textContent = '∞';
+        document.getElementById('statAgents').textContent = '...';
       }
     }
 
@@ -1055,9 +1111,8 @@
         const response = await fetch('/api/marketplace/agents');
         const data = await response.json();
         allAgents = data.agents || data || [];
-
-        filteredAgents = [...allAgents];
-        renderAgents();
+        applyFilters();
+        populateCityDropdown();
         updateMap();
       } catch (error) {
         console.error('Error loading agents:', error);
@@ -1065,29 +1120,110 @@
       }
     }
 
+    // Populate city dropdown from actual agent data
+    function populateCityDropdown() {
+      const cities = [...new Set(allAgents.map(a => a.location?.city).filter(Boolean))].sort();
+      const select = document.getElementById('citySelect');
+      select.innerHTML = '<option value="">Alle byer</option>';
+      cities.forEach(city => {
+        select.innerHTML += `<option value="${city}">${city}</option>`;
+      });
+    }
+
+    // Filter by location (fylke + city)
+    function filterByLocation() {
+      currentFylke = document.getElementById('fylkeSelect').value;
+      currentCity = document.getElementById('citySelect').value;
+      applyFilters();
+    }
+
+    // Central filter logic — applies category + location + sort
+    function applyFilters() {
+      let result = [...allAgents];
+
+      // Category filter
+      if (currentFilter !== 'all') {
+        result = result.filter(a => a.categories && a.categories.includes(currentFilter));
+      }
+
+      // Fylke filter
+      if (currentFylke) {
+        result = result.filter(a => {
+          const city = a.location?.city;
+          return city && cityToFylke[city] === currentFylke;
+        });
+      }
+
+      // City filter
+      if (currentCity) {
+        result = result.filter(a => a.location?.city === currentCity);
+      }
+
+      filteredAgents = result;
+      currentPage = 1;
+      sortAndRender();
+    }
+
+    // Sort + paginate + render
+    function sortAndRender() {
+      const sortValue = document.getElementById('sortSelect').value;
+      if (sortValue === 'trust') {
+        filteredAgents.sort((a, b) => (b.trustScore || 0) - (a.trustScore || 0));
+      } else if (sortValue === 'newest') {
+        filteredAgents.sort((a, b) => new Date(b.created || 0) - new Date(a.created || 0));
+      } else if (sortValue === 'name') {
+        filteredAgents.sort((a, b) => a.name.localeCompare(b.name));
+      }
+
+      displayedAgents = filteredAgents.slice(0, currentPage * AGENTS_PER_PAGE);
+      renderAgents();
+      updateAgentCount();
+      updateLoadMoreButton();
+    }
+
+    function updateAgentCount() {
+      const el = document.getElementById('agentCount');
+      if (el) el.textContent = `Viser ${displayedAgents.length} av ${filteredAgents.length} agenter`;
+    }
+
+    function updateLoadMoreButton() {
+      const container = document.getElementById('loadMoreContainer');
+      if (displayedAgents.length < filteredAgents.length) {
+        container.style.display = 'block';
+        document.getElementById('loadMoreBtn').textContent = `Vis flere (${filteredAgents.length - displayedAgents.length} gjenstår)`;
+      } else {
+        container.style.display = 'none';
+      }
+    }
+
+    function showMoreAgents() {
+      currentPage++;
+      displayedAgents = filteredAgents.slice(0, currentPage * AGENTS_PER_PAGE);
+      renderAgents();
+      updateAgentCount();
+      updateLoadMoreButton();
+    }
+
     // Render agent cards
     function renderAgents() {
       const grid = document.getElementById('agentsGrid');
-
-      if (filteredAgents.length === 0) {
+      if (displayedAgents.length === 0) {
         grid.innerHTML = '<div class="empty-state"><p>Ingen agenter funnet</p></div>';
         return;
       }
 
-      grid.innerHTML = filteredAgents.map(agent => `
+      grid.innerHTML = displayedAgents.map(agent => `
         <div class="agent-card" onclick="openAgentModal('${agent.id}')">
           <div class="agent-header">
             <div>
               <div class="agent-name">${agent.name}</div>
               <div class="agent-city">${agent.location?.city || 'Norge'}</div>
             </div>
-            ${agent.isVerified ? '<span class="verified-badge">✓ Verifisert</span>' : ''}
+            ${agent.isVerified ? '<span class="verified-badge">Verifisert</span>' : ''}
           </div>
-
           <div class="agent-categories">
             ${(agent.categories || []).slice(0, 3).map(cat => `<span class="category-tag">${formatCategory(cat)}</span>`).join('')}
           </div>
-
           <div class="trust-score">
             <div class="trust-label">
               <span>Pålitelighet</span>
@@ -1101,98 +1237,60 @@
       `).join('');
     }
 
-    // Update map with agent locations
+    // Update map
     function updateMap() {
-      if (!markers || !map) return; // Skip if map didn't initialize
+      if (!markers || !map) return;
       markers.clearLayers();
-
       filteredAgents.forEach(agent => {
         let coords = null;
-
-        // Try to get coordinates from agent location
-        if (agent.location && agent.location.lat && agent.location.lng) {
+        if (agent.location?.lat && agent.location?.lng) {
           coords = [agent.location.lat, agent.location.lng];
-        } else if (agent.location && agent.location.city) {
-          // Lookup city coordinates
+        } else if (agent.location?.city) {
           coords = cityCoordinates[agent.location.city];
         }
-
         if (coords) {
-          const marker = L.marker(coords).bindPopup(`
-            <div style="padding: 0.5rem;">
-              <strong>${agent.name}</strong><br>
-              ${agent.location?.city || 'Norge'}<br>
-              <small>${(agent.categories || []).join(', ')}</small><br>
-              <strong style="color: #2D5016;">Trust: ${Math.round((agent.trustScore || 0) * 100)}%</strong>
-            </div>
-          `);
-
-          markers.addLayer(marker);
+          markers.addLayer(L.marker(coords).bindPopup(`
+            <strong>${agent.name}</strong><br>${agent.location?.city || ''}<br>
+            <small>${(agent.categories || []).map(c => formatCategory(c)).join(', ')}</small>
+          `));
         }
       });
-
-      map.fitBounds(markers.getBounds(), { padding: [50, 50] });
+      try { map.fitBounds(markers.getBounds(), { padding: [50, 50] }); } catch(e) {}
     }
 
-    // Filter by category
-    function filterByCategory(category) {
+    // Filter by category — fixed: uses explicit button reference
+    function filterByCategory(category, btn) {
       currentFilter = category;
-
-      // Update button styles
-      document.querySelectorAll('.filter-btn').forEach(btn => {
-        btn.classList.remove('active');
-      });
-      event.target.classList.add('active');
-
-      // Filter agents
-      if (category === 'all') {
-        filteredAgents = [...allAgents];
-      } else {
-        filteredAgents = allAgents.filter(agent =>
-          agent.categories && agent.categories.includes(category)
-        );
-      }
-
-      sortAgents();
-      renderAgents();
+      document.querySelectorAll('#categoryFilters .filter-btn').forEach(b => b.classList.remove('active'));
+      if (btn) btn.classList.add('active');
+      applyFilters();
       updateMap();
     }
 
     // Sort agents
     function sortAgents() {
-      const sortValue = document.getElementById('sortSelect').value;
-      currentSort = sortValue;
-
-      if (sortValue === 'trust') {
-        filteredAgents.sort((a, b) => (b.trustScore || 0) - (a.trustScore || 0));
-      } else if (sortValue === 'newest') {
-        filteredAgents.sort((a, b) => new Date(b.created || 0) - new Date(a.created || 0));
-      } else if (sortValue === 'name') {
-        filteredAgents.sort((a, b) => a.name.localeCompare(b.name));
-      }
-
-      renderAgents();
+      sortAndRender();
     }
 
-    // Perform natural language search
+    // Search
     async function performSearch() {
       const query = document.getElementById('searchInput').value.trim();
-
-      if (!query) {
-        loadAgents();
-        return;
-      }
+      if (!query) { loadAgents(); return; }
 
       try {
         const response = await fetch(`/api/marketplace/search?q=${encodeURIComponent(query)}`);
         const data = await response.json();
-        // Search returns {results: [{agent: {...}, relevanceScore, matchReasons}]}
         filteredAgents = (data.results || data || []).map(r => r.agent || r);
+        currentPage = 1;
+        displayedAgents = filteredAgents.slice(0, AGENTS_PER_PAGE);
         renderAgents();
+        updateAgentCount();
+        updateLoadMoreButton();
         updateMap();
 
-        // Log as agent interaction
-        addFeedItem(`🔍 <strong>Søk-agent</strong> → Nettverket: "${query}" — ${filteredAgents.length} agenter svarte`, document.getElementById('feedItems'));
+        addFeedItem(buildConversation(
+          'Kjøper-agent', query, getRandomAgent('producer'), `Ja, vi har ${getRandomCategory(true)} tilgjengelig!`
+        ), document.getElementById('feedItems'));
         interactionCount++;
         document.getElementById('statInteractions').textContent = interactionCount;
       } catch (error) {
@@ -1200,31 +1298,15 @@
       }
     }
 
-    // Use geolocation
+    // Geolocation
     function useMyLocation() {
-      if (!navigator.geolocation) {
-        alert('Geolocation is not supported by your browser');
-        return;
-      }
-
+      if (!navigator.geolocation || !map) return;
       navigator.geolocation.getCurrentPosition(
-        (position) => {
-          const { latitude, longitude } = position.coords;
-          map.setView([latitude, longitude], 12);
-
-          // Add user marker
-          L.marker([latitude, longitude], {
-            icon: L.icon({
-              iconUrl: 'data:image/svg+xml;utf8,<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="%23D4A373"><circle cx="12" cy="12" r="8"/></svg>',
-              iconSize: [32, 32],
-              iconAnchor: [16, 16]
-            })
-          }).addTo(map).bindPopup('Din lokasjon');
+        (pos) => {
+          map.setView([pos.coords.latitude, pos.coords.longitude], 12);
+          L.marker([pos.coords.latitude, pos.coords.longitude]).addTo(map).bindPopup('Din lokasjon');
         },
-        (error) => {
-          console.error('Geolocation error:', error);
-          alert('Kunne ikke finne din lokasjon');
-        }
+        () => alert('Kunne ikke finne din lokasjon')
       );
     }
 
@@ -1232,207 +1314,150 @@
     async function openAgentModal(agentId) {
       const agent = allAgents.find(a => a.id === agentId);
       if (!agent) return;
-
-      // Try to load full details
       try {
         const response = await fetch(`/api/marketplace/agents/${agentId}/info`);
         const fullInfo = await response.json();
         Object.assign(agent, fullInfo);
-      } catch (error) {
-        console.error('Error loading full agent info:', error);
-      }
+      } catch (e) {}
 
-      // Populate modal
       document.getElementById('modalAgentName').textContent = agent.name;
       document.getElementById('modalAgentCity').textContent = agent.location?.city || 'Norge';
       document.getElementById('modalDescription').textContent = agent.description || 'Ingen beskrivelse tilgjengelig';
       document.getElementById('modalTrustScore').textContent = `${Math.round((agent.trustScore || 0) * 100)}%`;
-      document.getElementById('modalVerified').textContent = agent.isVerified ? '✓ Verifisert' : 'Ikke verifisert';
+      document.getElementById('modalVerified').textContent = agent.isVerified ? 'Verifisert' : 'Ikke verifisert';
       document.getElementById('modalRole').textContent = agent.role || '-';
 
-      // Determine data source
       let dataStatus = 'Auto';
       if (agent.dataSource) {
-        if (agent.dataSource.includes('owner')) dataStatus = 'Owner';
-        else if (agent.dataSource.includes('auto')) dataStatus = 'Auto';
+        if (agent.dataSource.includes('owner')) dataStatus = 'Eier-oppdatert';
+        else if (agent.dataSource.includes('auto')) dataStatus = 'Auto-generert';
         else dataStatus = 'Hybrid';
       }
       document.getElementById('modalDataStatus').textContent = dataStatus;
-
-      // Categories
       document.getElementById('modalCategories').innerHTML = (agent.categories || [])
-        .map(cat => `<span class="category-tag">${formatCategory(cat)}</span>`)
-        .join('');
+        .map(cat => `<span class="category-tag">${formatCategory(cat)}</span>`).join('');
 
-      // Tags
-      if (agent.tags && agent.tags.length > 0) {
-        document.getElementById('tagsSection').style.display = 'block';
-        document.getElementById('modalTags').innerHTML = agent.tags
-          .map(tag => `<span class="category-tag">${tag}</span>`)
-          .join('');
-      } else {
-        document.getElementById('tagsSection').style.display = 'none';
-      }
+      const tagsSection = document.getElementById('tagsSection');
+      if (agent.tags?.length > 0) {
+        tagsSection.style.display = 'block';
+        document.getElementById('modalTags').innerHTML = agent.tags.map(t => `<span class="category-tag">${t}</span>`).join('');
+      } else { tagsSection.style.display = 'none'; }
 
-      // Skills
-      if (agent.skills && agent.skills.length > 0) {
-        document.getElementById('skillsSection').style.display = 'block';
-        document.getElementById('modalSkills').innerHTML = agent.skills
-          .map(skill => `<span class="category-tag">${skill}</span>`)
-          .join('');
-      } else {
-        document.getElementById('skillsSection').style.display = 'none';
-      }
+      const skillsSection = document.getElementById('skillsSection');
+      if (agent.skills?.length > 0) {
+        skillsSection.style.display = 'block';
+        document.getElementById('modalSkills').innerHTML = agent.skills.map(s => `<span class="category-tag">${s}</span>`).join('');
+      } else { skillsSection.style.display = 'none'; }
 
       document.getElementById('agentModal').classList.add('active');
     }
 
-    // Close modal
-    function closeModal() {
-      document.getElementById('agentModal').classList.remove('active');
-    }
-
-    // Close modal on background click
+    function closeModal() { document.getElementById('agentModal').classList.remove('active'); }
     document.getElementById('agentModal').addEventListener('click', (e) => {
-      if (e.target === document.getElementById('agentModal')) {
-        closeModal();
-      }
+      if (e.target === document.getElementById('agentModal')) closeModal();
     });
 
-    // Format category name
+    // Format category
     function formatCategory(category) {
       const names = {
-        'vegetables': 'Grønnsaker',
-        'fruit': 'Frukt',
-        'berries': 'Bær',
-        'dairy': 'Meieri',
-        'eggs': 'Egg',
-        'meat': 'Kjøtt',
-        'fish': 'Fisk',
-        'bread': 'Brød',
-        'honey': 'Honning',
-        'herbs': 'Urter'
+        'vegetables': 'Grønnsaker', 'fruit': 'Frukt', 'berries': 'Bær',
+        'dairy': 'Meieri', 'eggs': 'Egg', 'meat': 'Kjøtt',
+        'fish': 'Fisk', 'bread': 'Brød', 'honey': 'Honning', 'herbs': 'Urter'
       };
       return names[category] || category;
     }
 
-    // Open claim flow
-    function openClaimFlow() {
-      alert('Claim flow vil åpnes i en ny fane. Denne funksjonen kommer snart!');
+    // =============================================
+    // NETWORK TRAFFIC — Buyer prompt / Seller reply
+    // =============================================
+    function buildConversation(buyer, prompt, seller, reply) {
+      return `
+        <div style="margin-bottom: 0.5rem;">
+          <span style="color: #1565C0; font-weight: 600;">KJØPER</span> <strong>${buyer}</strong>
+          <div style="background: #E3F2FD; padding: 0.5rem 0.75rem; border-radius: 8px; margin: 0.3rem 0; font-style: italic;">"${prompt}"</div>
+        </div>
+        <div>
+          <span style="color: var(--forest-green); font-weight: 600;">SELGER</span> <strong>${seller}</strong>
+          <div style="background: #E8F5E9; padding: 0.5rem 0.75rem; border-radius: 8px; margin: 0.3rem 0;">${reply}</div>
+        </div>
+      `;
     }
 
-    // Connect to live feed + generate agent-to-agent traffic
     function connectLiveFeed() {
       const feedItems = document.getElementById('feedItems');
-
-      // Try SSE connection for real traffic
       try {
         const eventSource = new EventSource('/api/live');
         feedItems.innerHTML = '';
-
         eventSource.addEventListener('interaction', (e) => {
           const data = JSON.parse(e.data);
           interactionCount++;
-          addFeedItem(`🔍 <strong>Discover-agent</strong> → Nettverket: "${data.query}" — ${data.results} agenter svarte`, feedItems);
+          addFeedItem(buildConversation('Discover-agent', data.query, 'Nettverket', `${data.results} agenter svarte`), feedItems);
           document.getElementById('statInteractions').textContent = interactionCount;
         });
-
         eventSource.addEventListener('conversation_message', (e) => {
           const data = JSON.parse(e.data);
           interactionCount++;
-          addFeedItem(`💬 <strong>${data.from || 'Agent'}</strong> → <strong>${data.to || 'Agent'}</strong>: ${data.topic}`, feedItems);
+          addFeedItem(buildConversation(data.from || 'Kjøper', data.topic, data.to || 'Selger', 'Svar sendt'), feedItems);
           document.getElementById('statInteractions').textContent = interactionCount;
         });
-
-        eventSource.addEventListener('registration', (e) => {
-          const data = JSON.parse(e.data);
-          interactionCount++;
-          addFeedItem(`🟢 <strong>${data.name || 'Ny agent'}</strong> koblet seg til nettverket`, feedItems);
-          document.getElementById('statInteractions').textContent = interactionCount;
-        });
-
-        eventSource.onerror = () => {
-          eventSource.close();
-          setTimeout(connectLiveFeed, 10000);
-        };
-      } catch(e) {
-        console.log('SSE not available, using simulated traffic');
-      }
-
-      // Simulate realistic A2A traffic for demonstration
+        eventSource.onerror = () => { eventSource.close(); setTimeout(connectLiveFeed, 10000); };
+      } catch(e) {}
       feedItems.innerHTML = '';
       simulateAgentTraffic(feedItems);
     }
 
-    // Simulate agent-to-agent traffic for demo purposes
+    // Realistic buyer/seller conversation patterns
     function simulateAgentTraffic(container) {
-      const trafficPatterns = [
-        () => {
-          const a1 = getRandomAgent('producer');
-          const a2 = getRandomAgent('logistics');
-          return `📦 <strong>${a1}</strong> → <strong>${a2}</strong>: Forespørsel om levering av varer`;
-        },
-        () => {
-          const a1 = getRandomAgent('quality');
-          const a2 = getRandomAgent('producer');
-          return `✅ <strong>${a1}</strong> → <strong>${a2}</strong>: Sertifiseringsstatus oppdatert`;
-        },
-        () => {
-          const a1 = getRandomAgent('consumer');
-          return `🔍 <strong>${a1}</strong> → Nettverket: discover({categories: ["${getRandomCategory()}"]})`;
-        },
-        () => {
-          const a1 = getRandomAgent('producer');
-          const a2 = getRandomAgent('producer');
-          return `🤝 <strong>${a1}</strong> ↔ <strong>${a2}</strong>: Samarbeid om felles leveranse`;
-        },
-        () => {
-          const a1 = getRandomAgent('consumer');
-          const a2 = getRandomAgent('producer');
-          return `💬 <strong>${a1}</strong> → <strong>${a2}</strong>: "Har dere økologiske tomater denne uken?"`;
-        },
-        () => {
-          const city = getRandomCity();
-          return `📡 <strong>Discover</strong> → ${allAgents.filter(a => a.location?.city === city).length} agenter i ${city} responderte`;
-        },
-        () => {
-          const a1 = getRandomAgent('producer');
-          return `🟢 <strong>${a1}</strong> sendte heartbeat — online`;
-        },
-        () => {
-          const a1 = getRandomAgent('producer');
-          const a2 = getRandomAgent('consumer');
-          return `🛒 <strong>${a2}</strong> → <strong>${a1}</strong>: JSON-RPC getProducts()`;
-        }
+      const buyerPrompts = [
+        { prompt: 'Har dere ferske grønnsaker til levering i Oslo denne uken?', replyFn: (s) => `Ja! ${s} har ferske tomater, agurker og salat. Levering tirsdag og torsdag.` },
+        { prompt: 'Jeg leter etter økologisk honning fra Vestlandet', replyFn: (s) => `${s} tilbyr økologisk lynghonning, 250g og 500g glass. Sertifisert Debio.` },
+        { prompt: 'Kan noen levere 10kg lammekjøtt til restaurant innen fredag?', replyFn: (s) => `${s} har lam fra frittgående sauer. 10kg tilgjengelig, levering torsdag ettermiddag.` },
+        { prompt: 'Finnes det lokale oste-produsenter nær Bergen?', replyFn: (s) => `${s} lager håndverksost i Vestland. Brunost, gamalost, og kvit geitost.` },
+        { prompt: 'Trenger fersk fisk til ukens meny, helst torsk eller sei', replyFn: (s) => `${s} har dagsfanget torsk og sei. Pris per kg avhenger av dagens fangst.` },
+        { prompt: 'Er det noen som selger økologiske egg i Trøndelag?', replyFn: (s) => `${s} har frittgående høner. 30-pakning økologiske egg klar til henting.` },
+        { prompt: 'Jeg vil bestille jordbær til en sommerfest, 5kg', replyFn: (s) => `${s} dyrker norske jordbær i sesong. 5kg kan reserveres, hentes på gården.` },
+        { prompt: 'Hvem selger nybakt brød med surdeig i Oslo-området?', replyFn: (s) => `${s} baker surdeig daglig. Valnøtt, spelt, og klassisk hvetebrød. Henting fra kl 07.` },
+        { prompt: 'Jeg trenger urter — basilikum, persille, dill — for cateringselskap', replyFn: (s) => `${s} dyrker ferske urter i drivhus. Levering Oslo/Viken mandag og onsdag.` },
+        { prompt: 'Har dere bær til sylting? Bringebær eller blåbær?', replyFn: (s) => `${s} har bringebær klar for plukking. Blåbær kommer om 2 uker. Selvplukk mulig.` }
       ];
 
-      // Add initial items
-      for (let i = 0; i < 5; i++) {
-        const pattern = trafficPatterns[Math.floor(Math.random() * trafficPatterns.length)];
-        addFeedItem(pattern(), container);
-        interactionCount++;
-      }
-      document.getElementById('statInteractions').textContent = interactionCount;
+      const systemEvents = [
+        () => { const a = getRandomAgent('producer'); return `<div style="color: var(--text-gray);"><span style="color: #888;">SYSTEM</span> <strong>${a}</strong> oppdaterte produktliste — 3 nye varer lagt til</div>`; },
+        () => { const city = getRandomCity(); const count = allAgents.filter(a => a.location?.city === city).length; return `<div style="color: var(--text-gray);"><span style="color: #888;">SYSTEM</span> discover({location: "${city}"}) → ${count} agenter funnet</div>`; },
+        () => { const a = getRandomAgent('producer'); return `<div style="color: var(--text-gray);"><span style="color: #888;">SYSTEM</span> <strong>${a}</strong> — heartbeat OK, online</div>`; }
+      ];
 
-      // Add new items periodically
-      setInterval(() => {
-        const pattern = trafficPatterns[Math.floor(Math.random() * trafficPatterns.length)];
-        addFeedItem(pattern(), container);
+      function generateTraffic() {
+        if (Math.random() < 0.75) {
+          // Buyer/seller conversation
+          const bp = buyerPrompts[Math.floor(Math.random() * buyerPrompts.length)];
+          const buyer = getRandomAgent('consumer') || 'Kjøper-agent';
+          const seller = getRandomAgent('producer') || 'Selger-agent';
+          addFeedItem(buildConversation(buyer, bp.prompt, seller, bp.replyFn(seller)), container);
+        } else {
+          // System event
+          const evt = systemEvents[Math.floor(Math.random() * systemEvents.length)];
+          addFeedItem(evt(), container);
+        }
         interactionCount++;
         document.getElementById('statInteractions').textContent = interactionCount;
-      }, 4000 + Math.random() * 6000);
+      }
+
+      for (let i = 0; i < 3; i++) generateTraffic();
+      setInterval(generateTraffic, 5000 + Math.random() * 7000);
     }
 
     function getRandomAgent(preferredRole) {
       if (!allAgents.length) return 'Agent';
-      const roleAgents = allAgents.filter(a => a.role === preferredRole);
-      const pool = roleAgents.length > 0 ? roleAgents : allAgents;
-      return pool[Math.floor(Math.random() * pool.length)].name;
+      const pool = allAgents.filter(a => a.role === preferredRole);
+      const src = pool.length > 0 ? pool : allAgents;
+      return src[Math.floor(Math.random() * src.length)].name;
     }
 
-    function getRandomCategory() {
+    function getRandomCategory(norwegian) {
       const cats = ['vegetables', 'fruit', 'dairy', 'meat', 'honey', 'bread', 'fish', 'eggs'];
-      return cats[Math.floor(Math.random() * cats.length)];
+      const cat = cats[Math.floor(Math.random() * cats.length)];
+      return norwegian ? formatCategory(cat) : cat;
     }
 
     function getRandomCity() {
@@ -1440,16 +1465,16 @@
       return cities[Math.floor(Math.random() * cities.length)];
     }
 
-    // Seller search — find your agent
+    // =============================================
+    // SELLER SECTION — search + create new agent
+    // =============================================
     async function sellerSearch() {
       const query = document.getElementById('sellerSearchInput').value.trim();
       const resultsDiv = document.getElementById('sellerSearchResults');
-
       if (!query) {
         resultsDiv.innerHTML = '<p style="color: var(--text-gray); text-align: center;">Skriv inn navnet på gården eller butikken din</p>';
         return;
       }
-
       resultsDiv.innerHTML = '<div style="text-align: center;"><div class="spinner" style="margin: 1rem auto;"></div></div>';
 
       try {
@@ -1458,7 +1483,7 @@
         const results = (data.results || data || []).map(r => r.agent || r);
 
         if (results.length === 0) {
-          resultsDiv.innerHTML = '<p style="color: var(--text-gray); text-align: center;">Ingen agenter funnet. Prøv et annet søkeord.</p>';
+          resultsDiv.innerHTML = `<p style="color: var(--text-gray); text-align: center;">Ingen agenter funnet for "${query}".<br>Du kan <a href="#" onclick="openCreateAgentForm(); return false;" style="color: var(--forest-green); font-weight: 600;">opprette en ny agent</a>.</p>`;
           return;
         }
 
@@ -1476,53 +1501,76 @@
             </button>
           </div>
         `).join('');
-
-        // Log interaction
-        addFeedItem(`🔍 <strong>Selger-søk</strong> → Nettverket: "${query}" — ${results.length} agenter funnet`, document.getElementById('feedItems'));
-        interactionCount++;
-        document.getElementById('statInteractions').textContent = interactionCount;
       } catch (error) {
-        console.error('Seller search error:', error);
         resultsDiv.innerHTML = '<p style="color: #cc0000; text-align: center;">Feil ved søk. Prøv igjen.</p>';
       }
     }
 
-    // Claim an agent
     function claimAgent(agentId) {
       const agent = allAgents.find(a => a.id === agentId);
       const name = agent ? agent.name : 'denne agenten';
       const email = prompt(`For å claime ${name}, skriv inn e-postadressen knyttet til virksomheten:`);
       if (email) {
         fetch(`/api/marketplace/agents/${agentId}/claim`, {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ email })
+        }).then(r => r.json())
+          .then(d => alert(d.message || 'Verifiseringskode sendt! Sjekk e-posten din.'))
+          .catch(() => alert('Noe gikk galt. Prøv igjen.'));
+      }
+    }
+
+    function openCreateAgentForm() {
+      const form = document.getElementById('createAgentForm');
+      form.style.display = form.style.display === 'none' ? 'block' : 'none';
+      if (form.style.display === 'block') form.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    }
+
+    async function submitNewAgent() {
+      const name = document.getElementById('newAgentName').value.trim();
+      const city = document.getElementById('newAgentCity').value.trim();
+      const fylke = document.getElementById('newAgentFylke').value.trim();
+      const desc = document.getElementById('newAgentDesc').value.trim();
+      const email = document.getElementById('newAgentEmail').value.trim();
+      const catSelect = document.getElementById('newAgentCategories');
+      const categories = Array.from(catSelect.selectedOptions).map(o => o.value);
+
+      if (!name || !city || !email) {
+        alert('Fyll ut påkrevde felt: navn, by, og e-post.');
+        return;
+      }
+
+      try {
+        const response = await fetch('/api/marketplace/register', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ email })
-        })
-        .then(r => r.json())
-        .then(data => {
-          alert(data.message || 'Verifiseringskode sendt! Sjekk e-posten din.');
-        })
-        .catch(() => alert('Noe gikk galt. Prøv igjen.'));
+          body: JSON.stringify({
+            name, description: desc || `${name} — lokal matprodusent i ${city}`,
+            location: { city, region: fylke || undefined },
+            categories, contactEmail: email, role: 'producer'
+          })
+        });
+        const data = await response.json();
+        if (data.success || data.id || data.agent) {
+          alert(`Agent "${name}" er registrert! Du vil motta en e-post for verifisering.`);
+          document.getElementById('createAgentForm').style.display = 'none';
+          loadAgents(); // Refresh
+        } else {
+          alert(data.error || data.message || 'Noe gikk galt. Prøv igjen.');
+        }
+      } catch (error) {
+        alert('Feil ved registrering. Sjekk tilkoblingen og prøv igjen.');
       }
     }
 
     // Add item to feed
-    function addFeedItem(text, container) {
+    function addFeedItem(html, container) {
       const item = document.createElement('div');
       item.className = 'feed-item';
-
       const time = new Date().toLocaleTimeString('no-NO', { hour: '2-digit', minute: '2-digit', second: '2-digit' });
-      item.innerHTML = `
-        ${text}
-        <div class="feed-time">${time}</div>
-      `;
-
+      item.innerHTML = `${html}<div class="feed-time">${time}</div>`;
       container.insertBefore(item, container.firstChild);
-
-      // Keep only last 30 items
-      while (container.children.length > 30) {
-        container.removeChild(container.lastChild);
-      }
+      while (container.children.length > 25) container.removeChild(container.lastChild);
     }
   </script>
 </body>
