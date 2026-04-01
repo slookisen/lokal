@@ -29,13 +29,25 @@ import { seedExpansionV5 } from "./seed-expansion-v5";
 import { seedExpansionV6 } from "./seed-expansion-v6";
 import { seedExpansionV7 } from "./seed-expansion-v7";
 import { seedExpansionV8 } from "./seed-expansion-v8";
-import { seedKnowledge } from "./seed-knowledge";
 import { discoveryService } from "./services/discovery-service";
+
+// Dynamic import - seed-knowledge is a late addition and may not be
+// present in every Docker layer during rolling deploys. Graceful
+// fallback prevents the entire process from crashing.
+let seedKnowledge: (() => void) | undefined;
+try {
+  seedKnowledge = require("./seed-knowledge").seedKnowledge;
+} catch {
+  console.warn("seed-knowledge module not found - skipping knowledge enrichment");
+}
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// ─── Security Layer ──────────────────────────────────────────
+// Proxy trust - Fly.io terminates TLS via reverse proxy
+app.set("trust proxy", true);
+
+// Security Layer
 app.use(securityHeaders);
 app.use(cors(corsOptions));
 app.use(express.json({ limit: MAX_REQUEST_SIZE }));
@@ -44,18 +56,14 @@ app.use(sanitizeInput);
 // Serve the marketplace dashboard
 app.use(express.static(path.join(__dirname, "public")));
 
-// ─── Rate-limited routes ─────────────────────────────────────
-// JSON-RPC gets its own limiter (agents are chatty)
+// Rate-limited routes
 app.use("/a2a", jsonRpcLimiter);
-// Registration is heavily limited (anti-spam)
 app.use("/api/marketplace/register", registrationLimiter);
-// Search has its own tier
 app.use("/api/marketplace/search", searchLimiter);
 app.use("/api/marketplace/discover", searchLimiter);
-// Everything else gets the general limiter
 app.use("/api", generalLimiter);
 
-// ─── Routes ──────────────────────────────────────────────────
+// Routes
 app.use("/api/producers", producerRoutes);
 app.use("/api/producers", scanRoutes);
 app.use("/api/products", scanRoutes);
@@ -64,60 +72,109 @@ app.use("/api/reservations", reservationRoutes);
 app.use("/api/marketplace", marketplaceRoutes);
 app.use("/", a2aRoutes);
 
-// ─── Health check ────────────────────────────────────────────
+// Health check
 app.get("/health", (_req, res) => {
   const stats = require("./services/marketplace-registry").marketplaceRegistry.getStats();
   res.json({
     status: "ok",
     service: "lokal",
-    version: "0.3.0",
+    version: "0.4.0",
     database: "sqlite",
     agents: stats.totalAgents,
     uptime: Math.floor(process.uptime()),
   });
 });
 
-// ─── Database + Seed ─────────────────────────────────────────
-console.log("\n💾 Initializing SQLite database...");
-getDb();
-seedData();
-seedOsloRealData();
-seedMarketplace();
-seedNorwayExpansion();
-seedExpansionV2();
-seedExpansionV3();
-seedExpansionV4();
-seedExpansionV5();
-seedExpansionV6();
-seedExpansionV7();
-seedExpansionV8();
-seedKnowledge();
+// Database + Seed (with idempotency guard)
+// FIX: Seeds were running on every restart, causing duplicate agents.
+// Fly.io restarts the app on deploy, autoscale, and idle-wakeup.
+// Solution: Check if agents already exist before seeding.
 
-// ─── Start ───────────────────────────────────────────────────
+console.log("\nInitializing SQLite database...");
+const db = getDb();
+
+const existingAgentCount = (db.prepare("SELECT COUNT(*) as c FROM agents").get() as any).c;
+
+if (existingAgentCount === 0) {
+  console.log("Empty database detected - running initial seed...");
+  seedData();
+  seedOsloRealData();
+  seedMarketplace();
+  seedNorwayExpansion();
+  seedExpansionV2();
+  seedExpansionV3();
+  seedExpansionV4();
+  seedExpansionV5();
+  seedExpansionV6();
+  seedExpansionV7();
+  seedExpansionV8();
+  if (seedKnowledge) seedKnowledge();
+
+  // Deduplicate: remove duplicate agents (keep oldest by created_at)
+  const dupeCount = (db.prepare(`
+    SELECT COUNT(*) as c FROM agents WHERE id NOT IN (
+      SELECT MIN(id) FROM agents GROUP BY name, city
+    )
+  `).get() as any).c;
+
+  if (dupeCount > 0) {
+    db.prepare(`
+      DELETE FROM agents WHERE id NOT IN (
+        SELECT MIN(id) FROM agents GROUP BY name, city
+      )
+    `).run();
+    console.log(`Removed ${dupeCount} duplicate agents after seeding`);
+  }
+
+  const finalCount = (db.prepare("SELECT COUNT(*) as c FROM agents").get() as any).c;
+  console.log(`Seeded ${finalCount} unique agents`);
+} else {
+  console.log(`Database already has ${existingAgentCount} agents - skipping seed`);
+
+  // Run deduplication on existing data (one-time cleanup)
+  const dupeCount = (db.prepare(`
+    SELECT COUNT(*) as c FROM agents WHERE id NOT IN (
+      SELECT MIN(id) FROM agents GROUP BY name, city
+    )
+  `).get() as any).c;
+
+  if (dupeCount > 0) {
+    db.prepare(`
+      DELETE FROM agents WHERE id NOT IN (
+        SELECT MIN(id) FROM agents GROUP BY name, city
+      )
+    `).run();
+    console.log(`Cleaned up ${dupeCount} duplicate agents from previous restarts`);
+  }
+
+  // Enrich knowledge if not already done
+  if (seedKnowledge) {
+    const knowledgeCount = (db.prepare("SELECT COUNT(*) as c FROM agent_knowledge").get() as any).c;
+    if (knowledgeCount === 0) {
+      console.log("Running knowledge enrichment...");
+      seedKnowledge();
+    }
+  }
+}
+
+// Start
 const BASE_URL = process.env.BASE_URL || `http://localhost:${PORT}`;
-
-// Bind to 0.0.0.0 — required for Docker/Fly.io (localhost won't work in containers)
 const HOST = process.env.HOST || "0.0.0.0";
 app.listen(Number(PORT), HOST, async () => {
-  console.log(`\n🥬 Lokal API v0.11.0 running at ${BASE_URL}`);
-  console.log(`   💾 Database: SQLite (persistent)`);
-  console.log(`   🔒 Security: Helmet + Rate limiting + Input sanitization`);
-  console.log(`\n   ── A2A Protocol ──────────────────────────────`);
-  console.log(`   JSON-RPC:      POST ${BASE_URL}/a2a`);
-  console.log(`   Agent Card:    GET  ${BASE_URL}/.well-known/agent-card.json`);
-  console.log(`\n   ── Marketplace ──────────────────────────────`);
-  console.log(`   Register:      POST ${BASE_URL}/api/marketplace/register`);
-  console.log(`   Discover:      POST ${BASE_URL}/api/marketplace/discover`);
-  console.log(`   NL Search:     GET  ${BASE_URL}/api/marketplace/search?q=...`);
-  console.log(`   MCP Server:    npx lokal-mcp (for Claude Desktop)`);
-  console.log(`\n   ── Discovery ────────────────────────────────`);
+  console.log(`\nLokal API v0.4.0 running at ${BASE_URL}`);
+  console.log(`  Database: SQLite (persistent)`);
+  console.log(`  Security: Helmet + Rate limiting + Input sanitization`);
+  console.log(`  JSON-RPC: POST ${BASE_URL}/a2a`);
+  console.log(`  Agent Card: GET ${BASE_URL}/.well-known/agent-card.json`);
+  console.log(`  Register: POST ${BASE_URL}/api/marketplace/register`);
+  console.log(`  Discover: POST ${BASE_URL}/api/marketplace/discover`);
+  console.log(`  NL Search: GET ${BASE_URL}/api/marketplace/search?q=...`);
 
-  // Initialize discovery service (registers with A2A registries if public URL)
   await discoveryService.initialize(BASE_URL);
   console.log("");
 });
 
-// ─── Graceful shutdown ───────────────────────────────────────
+// Graceful shutdown
 process.on("SIGTERM", () => { discoveryService.shutdown(); closeDb(); process.exit(0); });
 process.on("SIGINT", () => { discoveryService.shutdown(); closeDb(); process.exit(0); });
 
