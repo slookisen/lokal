@@ -346,7 +346,7 @@ router.get("/api/discovery", (_req: Request, res: Response) => {
   res.json({
     success: true,
     data: {
-      agentCardUrl: `${BASE_URL}/.well-known/agent.json`,
+      agentCardUrl: `${BASE_URL}/.well-known/agent-card.json`,
       a2aEndpoint: `${BASE_URL}/a2a`,
       registries: discoveryService.getRegistryStatus(),
       metadata: discoveryService.getDiscoveryMetadata(),
