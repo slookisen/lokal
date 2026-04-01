@@ -1,10 +1,10 @@
 import nodemailer, { Transporter } from 'nodemailer';
 
-// Simple logger â replace with winston/pino in production
+// Simple logger — replace with winston/pino in production
 const logger = {
   info: (msg: string, meta?: any) => console.log(`[Email] ${msg}`, meta ? JSON.stringify(meta) : ""),
-  warn: (msg: string, meta?: any) => console.warn(`[Email] â ï¸  ${msg}`, meta ? JSON.stringify(meta) : ""),
-  error: (msg: string, meta?: any) => console.error(`[Email] â ${msg}`, meta ? JSON.stringify(meta) : ""),
+  warn: (msg: string, meta?: any) => console.warn(`[Email] ⚠️  ${msg}`, meta ? JSON.stringify(meta) : ""),
+  error: (msg: string, meta?: any) => console.error(`[Email] ✗ ${msg}`, meta ? JSON.stringify(meta) : ""),
 };
 
 export interface EmailOptions {
@@ -62,7 +62,7 @@ export class EmailService {
       const unsubscribeLink = `${process.env.APP_URL || 'https://lokal.fly.dev'}/unsubscribe?email=${encodeURIComponent(sellerEmail)}&agent=${agentId}`;
       const claimUrl = `${process.env.APP_URL || 'https://lokal.fly.dev'}/agent/${agentId}/claim`;
 
-      const subject = `Lokal â Vi har funnet deg og dine produkter!`;
+      const subject = `Lokal — Vi har funnet deg og dine produkter!`;
 
       const htmlContent = this.generateClaimInvitationHtml(
         sellerName,
@@ -106,7 +106,7 @@ export class EmailService {
     agentName: string
   ): Promise<{ success: boolean; messageId?: string; error?: string }> {
     try {
-      const subject = `Din bekreftelseskode for ${agentName} pÃ¥ Lokal`;
+      const subject = `Din bekreftelseskode for ${agentName} på Lokal`;
 
       const htmlContent = this.generateVerificationCodeHtml(code, agentName);
       const textContent = this.generateVerificationCodeText(code, agentName);
@@ -137,7 +137,7 @@ export class EmailService {
     dashboardUrl: string
   ): Promise<{ success: boolean; messageId?: string; error?: string }> {
     try {
-      const subject = `Gratulerer! ${agentName} er nÃ¥ ditt pÃ¥ Lokal`;
+      const subject = `Gratulerer! ${agentName} er nå ditt på Lokal`;
 
       const htmlContent = this.generateClaimConfirmationHtml(agentName, dashboardUrl);
       const textContent = this.generateClaimConfirmationText(agentName, dashboardUrl);
@@ -294,32 +294,32 @@ export class EmailService {
 <body>
   <div class="container">
     <div class="header">
-      <div class="logo">ð¾ Lokal</div>
+      <div class="logo">🌾 Lokal</div>
     </div>
 
     <h1>Hei ${this.escapeHtml(sellerName)}!</h1>
 
-    <p>Vi bygger et nettverk for lokale matprodusenter â hvor dine produkter mÃ¸ter mennesker som leter etter akkurat det du har.</p>
+    <p>Vi bygger et nettverk for lokale matprodusenter — hvor dine produkter møter mennesker som leter etter akkurat det du har.</p>
 
-    <p><strong>Vi har funnet deg og dine produkter pÃ¥ Lokal, og vi Ã¸nsker at du skal eie din egen agent her.</strong></p>
+    <p><strong>Vi har funnet deg og dine produkter på Lokal, og vi ønsker at du skal eie din egen agent her.</strong></p>
 
     <div class="info-box">
       <strong>Vi har registrert:</strong>
       <p>${this.escapeHtml(agentName)}</p>
-      <p><a href="${this.escapeHtml(agentPageUrl)}" class="agent-link">Se hva som stÃ¥r om deg her â</a></p>
+      <p><a href="${this.escapeHtml(agentPageUrl)}" class="agent-link">Se hva som står om deg her →</a></p>
     </div>
 
-    <h2 style="font-size: 16px; margin-top: 25px;">Hva betyr det Ã¥ "eie" din agent?</h2>
-    <p>Du fÃ¥r kontroll over informasjonen som vises â Ã¥pningstider, produkter, kontaktdetaljer, og mer. Din agent blir ogsÃ¥ smartere: over tid lÃ¦rer den mer om dine produkter og kundenes preferanser, slik at den kan hjelpe deg med Ã¥ nÃ¥ riktige folk.</p>
+    <h2 style="font-size: 16px; margin-top: 25px;">Hva betyr det å "eie" din agent?</h2>
+    <p>Du får kontroll over informasjonen som vises — åpningstider, produkter, kontaktdetaljer, og mer. Din agent blir også smartere: over tid lærer den mer om dine produkter og kundenes preferanser, slik at den kan hjelpe deg med å nå riktige folk.</p>
 
     <p style="font-weight: bold; margin-top: 20px;">Det tar mindre enn 5 minutter. Klikk her:</p>
 
-    <a href="${this.escapeHtml(claimUrl)}" class="cta-button">Krav din agent pÃ¥ Lokal</a>
+    <a href="${this.escapeHtml(claimUrl)}" class="cta-button">Krav din agent på Lokal</a>
 
-    <p style="font-size: 14px; color: #666; margin-top: 25px;">Har du spÃ¸rsmÃ¥l? Svar pÃ¥ denne e-posten eller kontakt oss pÃ¥ <a href="mailto:hallo@lokal.farm" class="footer-link">hallo@lokal.farm</a>.</p>
+    <p style="font-size: 14px; color: #666; margin-top: 25px;">Har du spørsmål? Svar på denne e-posten eller kontakt oss på <a href="mailto:hallo@lokal.farm" class="footer-link">hallo@lokal.farm</a>.</p>
 
     <div class="footer">
-      <p>Lokal bygger nettverk hvor norske matprodusenter mÃ¸ter mennesker som verdsetter lokal og god mat.</p>
+      <p>Lokal bygger nettverk hvor norske matprodusenter møter mennesker som verdsetter lokal og god mat.</p>
       <p>
         <a href="${this.escapeHtml(unsubscribeLink)}" class="footer-link">Avslutt abonnement</a>
       </p>
@@ -340,30 +340,30 @@ export class EmailService {
     return `
 Hei ${sellerName}!
 
-Vi bygger et nettverk for lokale matprodusenter â hvor dine produkter mÃ¸ter mennesker som leter etter akkurat det du har.
+Vi bygger et nettverk for lokale matprodusenter — hvor dine produkter møter mennesker som leter etter akkurat det du har.
 
-Vi har funnet deg og dine produkter pÃ¥ Lokal, og vi Ã¸nsker at du skal eie din egen agent her.
+Vi har funnet deg og dine produkter på Lokal, og vi ønsker at du skal eie din egen agent her.
 
 VI HAR REGISTRERT:
 ${agentName}
 
-Se hva som stÃ¥r om deg her:
+Se hva som står om deg her:
 ${agentPageUrl}
 
-HVA BETYR DET Ã "EIE" DIN AGENT?
+HVA BETYR DET Å "EIE" DIN AGENT?
 
-Du fÃ¥r kontroll over informasjonen som vises â Ã¥pningstider, produkter, kontaktdetaljer, og mer. Din agent blir ogsÃ¥ smartere: over tid lÃ¦rer den mer om dine produkter og kundenes preferanser, slik at den kan hjelpe deg med Ã¥ nÃ¥ riktige folk.
+Du får kontroll over informasjonen som vises — åpningstider, produkter, kontaktdetaljer, og mer. Din agent blir også smartere: over tid lærer den mer om dine produkter og kundenes preferanser, slik at den kan hjelpe deg med å nå riktige folk.
 
 Det tar mindre enn 5 minutter. Klikk her:
 
 ${claimUrl}
 
-SPÃRSMÃL?
+SPØRSMÅL?
 
-Svar pÃ¥ denne e-posten eller kontakt oss pÃ¥ hallo@lokal.farm
+Svar på denne e-posten eller kontakt oss på hallo@lokal.farm
 
 ---
-Lokal bygger nettverk hvor norske matprodusenter mÃ¸ter mennesker som verdsetter lokal og god mat.
+Lokal bygger nettverk hvor norske matprodusenter møter mennesker som verdsetter lokal og god mat.
     `;
   }
 
@@ -409,9 +409,9 @@ Lokal bygger nettverk hvor norske matprodusenter mÃ¸ter mennesker som verdsett
 </head>
 <body>
   <div class="container">
-    <div class="logo">ð¾ Lokal</div>
+    <div class="logo">🌾 Lokal</div>
     <h1>Din bekreftelseskode</h1>
-    <p>Du ba om Ã¥ bekrefte at du eier <strong>${this.escapeHtml(agentName)}</strong> pÃ¥ Lokal.</p>
+    <p>Du ba om å bekrefte at du eier <strong>${this.escapeHtml(agentName)}</strong> på Lokal.</p>
     <p>Din bekreftelseskode er:</p>
     <div class="code-box">
       <div class="code">${code}</div>
@@ -428,7 +428,7 @@ Lokal bygger nettverk hvor norske matprodusenter mÃ¸ter mennesker som verdsett
     return `
 Din bekreftelseskode
 
-Du ba om Ã¥ bekrefte at du eier ${agentName} pÃ¥ Lokal.
+Du ba om å bekrefte at du eier ${agentName} på Lokal.
 
 Din bekreftelseskode er:
 
@@ -484,18 +484,18 @@ Hvis du ikke ba om denne koden, kan du ignorere denne e-posten.
 </head>
 <body>
   <div class="container">
-    <div class="logo">ð¾ Lokal</div>
+    <div class="logo">🌾 Lokal</div>
     <h1>Gratulerer!</h1>
     <div class="success-box">
-      <p><strong>${this.escapeHtml(agentName)}</strong> er nÃ¥ ditt pÃ¥ Lokal.</p>
+      <p><strong>${this.escapeHtml(agentName)}</strong> er nå ditt på Lokal.</p>
     </div>
-    <p>Din agent er klar. Du kan nÃ¥:</p>
+    <p>Din agent er klar. Du kan nå:</p>
     <ul>
-      <li>Oppdatere informasjon om produkter og Ã¥pningstider</li>
+      <li>Oppdatere informasjon om produkter og åpningstider</li>
       <li>Se hvor dine produkter blir funnet av kundene</li>
-      <li>FÃ¸lge med pÃ¥ interaksjoner og preferanser</li>
+      <li>Følge med på interaksjoner og preferanser</li>
     </ul>
-    <a href="${this.escapeHtml(dashboardUrl)}" class="cta-button">GÃ¥ til dashboarden din</a>
+    <a href="${this.escapeHtml(dashboardUrl)}" class="cta-button">Gå til dashboarden din</a>
     <p>Lykke til!</p>
   </div>
 </body>
@@ -507,14 +507,14 @@ Hvis du ikke ba om denne koden, kan du ignorere denne e-posten.
     return `
 Gratulerer!
 
-${agentName} er nÃ¥ ditt pÃ¥ Lokal.
+${agentName} er nå ditt på Lokal.
 
-Din agent er klar. Du kan nÃ¥:
-- Oppdatere informasjon om produkter og Ã¥pningstider
+Din agent er klar. Du kan nå:
+- Oppdatere informasjon om produkter og åpningstider
 - Se hvor dine produkter blir funnet av kundene
-- FÃ¸lge med pÃ¥ interaksjoner og preferanser
+- Følge med på interaksjoner og preferanser
 
-GÃ¥ til dashboarden din:
+Gå til dashboarden din:
 ${dashboardUrl}
 
 Lykke til!
