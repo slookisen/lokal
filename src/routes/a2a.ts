@@ -5,6 +5,7 @@ import { DiscoveryQuerySchema } from "../models/marketplace";
 import { interactionLogger, InteractionEvent } from "../services/interaction-logger";
 import { conversationService } from "../services/conversation-service";
 import { discoveryService } from "../services/discovery-service";
+import { knowledgeService } from "../services/knowledge-service";
 
 // ─── A2A Routes ──────────────────────────────────────────────
 // Two protocols served here:
@@ -55,6 +56,9 @@ router.post("/a2a", (req: Request, res: Response) => {
         break;
       case "agent/authenticatedExtendedCard":
         handleExtendedCard(params, id, req, res);
+        break;
+      case "agent/info":
+        handleAgentInfo(params, id, res);
         break;
       default:
         res.json({
@@ -240,12 +244,60 @@ function handleExtendedCard(params: any, id: any, req: Request, res: Response) {
   });
 }
 
+// ─── agent/info ──────────────────────────────────────────────
+// Buyer agent asks: "tell me about this seller"
+// Returns structured knowledge — address, products, hours, etc.
+// This is the core of the dummy-agent system: every seller has
+// an agent that can answer based on what we know about them.
+
+function handleAgentInfo(params: any, id: any, res: Response) {
+  const agentId = params?.agentId;
+  if (!agentId) {
+    res.json({
+      jsonrpc: "2.0",
+      error: { code: -32602, message: "Invalid params: 'agentId' required" },
+      id,
+    });
+    return;
+  }
+
+  const info = knowledgeService.getAgentInfo(agentId);
+  if (!info) {
+    res.json({
+      jsonrpc: "2.0",
+      error: { code: -32602, message: `Agent not found: ${agentId}` },
+      id,
+    });
+    return;
+  }
+
+  // Log the interaction
+  interactionLogger.log("view", {
+    agentId,
+    metadata: { type: "a2a_agent_info", buyerAgent: params?.buyerAgentId },
+  });
+
+  res.json({
+    jsonrpc: "2.0",
+    result: {
+      task: { id: `info-${agentId}`, status: "completed" },
+      artifacts: [{
+        type: "application/json",
+        data: info,
+      }],
+    },
+    id,
+  });
+}
+
 // ═══════════════════════════════════════════════════════════════
 // REST ENDPOINTS (backward compat + human use)
 // ═══════════════════════════════════════════════════════════════
 
-// GET /.well-known/agent.json — A2A Agent Card discovery
-router.get("/.well-known/agent.json", (_req: Request, res: Response) => {
+// GET /.well-known/agent-card.json — A2A Agent Card discovery (spec v1.0.0 compliant)
+// The official A2A spec requires agent-card.json, not agent.json.
+// We serve both paths: the correct one and the legacy one for backward compat.
+function serveAgentCard(_req: Request, res: Response) {
   const registryCard = marketplaceRegistry.getRegistryCard(BASE_URL);
   const legacyProducers = agentCardService.generateRegistry(BASE_URL);
 
@@ -260,7 +312,10 @@ router.get("/.well-known/agent.json", (_req: Request, res: Response) => {
       agents: `${BASE_URL}/api/marketplace/agents`,
     },
   });
-});
+}
+
+router.get("/.well-known/agent-card.json", serveAgentCard); // A2A spec v1.0.0
+router.get("/.well-known/agent.json", serveAgentCard);       // Legacy compat
 
 // GET /agents/:id/agent.json — Individual producer Agent Card
 router.get("/agents/:id/agent.json", (req: Request, res: Response) => {

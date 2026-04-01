@@ -211,6 +211,76 @@ function initSchema(db: Database.Database): void {
     );
 
     -- ════════════════════════════════════════════════════════════
+    -- AGENT_KNOWLEDGE: Enriched public info for each agent
+    -- "Google My Business" for food agents — auto-populated from
+    -- public sources, upgraded when sellers claim their agent.
+    -- ════════════════════════════════════════════════════════════
+    CREATE TABLE IF NOT EXISTS agent_knowledge (
+      agent_id TEXT PRIMARY KEY REFERENCES agents(id) ON DELETE CASCADE,
+
+      -- Basic public info
+      address TEXT,                        -- Street address
+      postal_code TEXT,
+      website TEXT,                         -- Official website
+      phone TEXT,
+      email TEXT,                           -- Public contact email
+
+      -- Opening hours (JSON: [{day:"mon",open:"09:00",close:"17:00"},...])
+      opening_hours TEXT DEFAULT '[]',
+
+      -- What they sell (JSON: [{name:"Tomater",category:"vegetables",seasonal:true,months:[6,7,8,9]},...])
+      products TEXT DEFAULT '[]',
+
+      -- Rich description from public sources
+      about TEXT,                           -- Long-form description
+      specialties TEXT DEFAULT '[]',        -- JSON array: ["Økologiske grønnsaker", "Gårdsost"]
+      certifications TEXT DEFAULT '[]',     -- JSON array: ["Debio", "Nyt Norge"]
+      payment_methods TEXT DEFAULT '[]',    -- JSON array: ["Vipps", "Kontant", "Kort"]
+      delivery_options TEXT DEFAULT '[]',   -- JSON array: ["Henting på gård", "REKO-ring"]
+
+      -- Social proof from public sources
+      google_rating REAL,                  -- Google Maps rating (1-5)
+      google_review_count INTEGER,
+      tripadvisor_rating REAL,
+      external_reviews TEXT DEFAULT '[]',  -- JSON: [{source:"Google",text:"...",rating:5}]
+
+      -- Images (JSON array of URLs — empty until seller uploads)
+      images TEXT DEFAULT '[]',
+
+      -- Data provenance
+      data_source TEXT DEFAULT 'auto',     -- 'auto' | 'owner' | 'hybrid'
+      auto_sources TEXT DEFAULT '[]',      -- JSON: ["google_maps","bondensmarked.no","rekonorge.no"]
+      last_enriched_at TEXT,               -- When auto-enrichment last ran
+      owner_updated_at TEXT,               -- When owner last made changes
+
+      -- Future: seller preferences (v2 — NL responses, target groups)
+      preferences TEXT DEFAULT '{}',       -- JSON: reserved for seller customization
+
+      created_at TEXT DEFAULT (datetime('now')),
+      updated_at TEXT DEFAULT (datetime('now'))
+    );
+
+    -- ════════════════════════════════════════════════════════════
+    -- AGENT_CLAIMS: Seller ownership of their agent
+    -- Flow: request → verify (email/phone) → approved → owner
+    -- ════════════════════════════════════════════════════════════
+    CREATE TABLE IF NOT EXISTS agent_claims (
+      id TEXT PRIMARY KEY,
+      agent_id TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+      claimant_name TEXT NOT NULL,
+      claimant_email TEXT NOT NULL,
+      claimant_phone TEXT,
+      verification_method TEXT DEFAULT 'email',  -- 'email' | 'phone' | 'manual'
+      verification_code TEXT,                     -- 6-digit code sent to verify
+      status TEXT DEFAULT 'pending' CHECK(status IN ('pending','code_sent','verified','rejected','expired')),
+      claim_token TEXT,                           -- Token for managing agent after claim
+      notes TEXT,                                 -- Admin notes
+      created_at TEXT DEFAULT (datetime('now')),
+      verified_at TEXT,
+      expires_at TEXT                             -- Claims expire after 7 days if unverified
+    );
+
+    -- ════════════════════════════════════════════════════════════
     -- INDEXES: Geo bounding-box + common lookups
     -- These make discovery fast without PostGIS
     -- ════════════════════════════════════════════════════════════
@@ -231,6 +301,11 @@ function initSchema(db: Database.Database): void {
     CREATE INDEX IF NOT EXISTS idx_conversations_seller ON conversations(seller_agent_id);
     CREATE INDEX IF NOT EXISTS idx_conversations_status ON conversations(status);
     CREATE INDEX IF NOT EXISTS idx_messages_conversation ON messages(conversation_id);
+
+    -- Knowledge & claims indexes
+    CREATE INDEX IF NOT EXISTS idx_agent_claims_agent ON agent_claims(agent_id);
+    CREATE INDEX IF NOT EXISTS idx_agent_claims_status ON agent_claims(status);
+    CREATE INDEX IF NOT EXISTS idx_agent_claims_email ON agent_claims(claimant_email);
   `);
 }
 

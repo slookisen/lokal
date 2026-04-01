@@ -2,6 +2,7 @@ import { Router, Request, Response } from "express";
 import { marketplaceRegistry } from "../services/marketplace-registry";
 import { AgentRegistrationSchema, DiscoveryQuerySchema } from "../models/marketplace";
 import { interactionLogger } from "../services/interaction-logger";
+import { knowledgeService } from "../services/knowledge-service";
 
 // ─── Marketplace Routes ───────────────────────────────────────
 // These are the OPEN endpoints that make Lokal a marketplace.
@@ -222,6 +223,161 @@ router.get("/agents", (_req: Request, res: Response) => {
       skills: a.skills.map(s => ({ id: s.id, name: s.name, tags: s.tags })),
     })),
   });
+});
+
+// ═══════════════════════════════════════════════════════════════
+// AGENT KNOWLEDGE — "Tell me about this seller"
+// The core of the dummy-agent system. Buyer agents call this
+// to get everything we know about a seller: address, products,
+// hours, ratings, etc. Honest about data provenance.
+// ═══════════════════════════════════════════════════════════════
+
+// ─── GET /agents/:id/info — Structured seller info ──────────
+// This is what buyer agents call. Returns everything we know
+// about this seller in a clean, parseable format.
+//
+// Example response:
+//   { agent: { name, city, trustScore, isClaimed },
+//     knowledge: { address, products, openingHours, ... },
+//     meta: { dataSource: "auto", disclaimer: "..." } }
+
+router.get("/agents/:id/info", (req: Request, res: Response) => {
+  const info = knowledgeService.getAgentInfo(req.params.id);
+  if (!info) {
+    res.status(404).json({ success: false, error: "Agent ikke funnet" });
+    return;
+  }
+
+  // Log the view
+  interactionLogger.log("view", {
+    agentId: req.params.id,
+    metadata: { type: "agent_info_request", buyerAgent: req.headers["x-agent-id"] as string },
+    ipAddress: req.ip,
+  });
+
+  res.json({ success: true, data: info });
+});
+
+// ─── GET /agents/:id/knowledge — Raw knowledge data ─────────
+// For admin/debugging. Returns the raw knowledge record.
+
+router.get("/agents/:id/knowledge", (req: Request, res: Response) => {
+  const knowledge = knowledgeService.getKnowledge(req.params.id);
+  if (!knowledge) {
+    res.status(404).json({ success: false, error: "Ingen kunnskapsdata for denne agenten" });
+    return;
+  }
+  res.json({ success: true, data: knowledge });
+});
+
+// ─── GET /knowledge/stats — Knowledge layer statistics ──────
+
+router.get("/knowledge/stats", (_req: Request, res: Response) => {
+  const stats = knowledgeService.getKnowledgeStats();
+  res.json({ success: true, data: stats });
+});
+
+// ═══════════════════════════════════════════════════════════════
+// CLAIM SYSTEM — Sellers take ownership of their agent
+// Flow:
+//   1. POST /agents/:id/claim         → Request claim (get verification code)
+//   2. POST /agents/:id/claim/verify  → Submit code → get claim token
+//   3. PUT  /agents/:id/knowledge     → Update info (with claim token)
+// ═══════════════════════════════════════════════════════════════
+
+// ─── POST /agents/:id/claim — Request to claim an agent ─────
+
+router.post("/agents/:id/claim", (req: Request, res: Response) => {
+  const { name, email, phone } = req.body;
+  if (!name || !email) {
+    res.status(400).json({ success: false, error: "Navn og e-post er påkrevd" });
+    return;
+  }
+
+  try {
+    const result = knowledgeService.requestClaim(req.params.id, {
+      claimantName: name,
+      claimantEmail: email,
+      claimantPhone: phone,
+    });
+
+    // In production: send verification code via email
+    // For now: return it in the response (development mode)
+    res.json({
+      success: true,
+      message: "Verifiseringskode sendt. Bruk /claim/verify for å fullføre.",
+      data: {
+        claimId: result.claimId,
+        // DEV ONLY — remove in production:
+        verificationCode: process.env.NODE_ENV === "production" ? undefined : result.verificationCode,
+      },
+    });
+  } catch (err: any) {
+    res.status(400).json({ success: false, error: err.message });
+  }
+});
+
+// ─── POST /agents/:id/claim/verify — Verify claim ──────────
+
+router.post("/agents/:id/claim/verify", (req: Request, res: Response) => {
+  const { claimId, code } = req.body;
+  if (!claimId || !code) {
+    res.status(400).json({ success: false, error: "claimId og code er påkrevd" });
+    return;
+  }
+
+  const result = knowledgeService.verifyClaim(claimId, code);
+  if (!result.success) {
+    res.status(400).json({ success: false, error: result.error });
+    return;
+  }
+
+  res.json({
+    success: true,
+    message: "Agenten er nå din! Bruk claim-token for å oppdatere informasjon.",
+    data: {
+      claimToken: result.claimToken,
+      agentId: req.params.id,
+    },
+  });
+});
+
+// ─── PUT /agents/:id/knowledge — Owner updates knowledge ────
+// Authenticated via claim token or API key.
+
+router.put("/agents/:id/knowledge", (req: Request, res: Response) => {
+  // Auth: accept either claim token or API key
+  const claimToken = (req.headers["x-claim-token"] as string) || "";
+  const apiKey = (req.headers["x-api-key"] as string) || "";
+
+  let authorized = false;
+
+  if (claimToken) {
+    const claim = knowledgeService.getClaimByToken(claimToken);
+    if (claim && claim.agentId === req.params.id) authorized = true;
+  }
+
+  if (!authorized && apiKey) {
+    const agent = marketplaceRegistry.getAgentByApiKey(apiKey);
+    if (agent && agent.id === req.params.id) authorized = true;
+  }
+
+  if (!authorized) {
+    res.status(403).json({ success: false, error: "Ikke autorisert. Bruk X-Claim-Token eller X-API-Key header." });
+    return;
+  }
+
+  try {
+    knowledgeService.ownerUpdate(req.params.id, req.body);
+    const updated = knowledgeService.getAgentInfo(req.params.id);
+    res.json({
+      success: true,
+      message: "Kunnskapsdata oppdatert",
+      data: updated,
+    });
+  } catch (err: any) {
+    res.status(400).json({ success: false, error: err.message });
+  }
 });
 
 // ─── Helper ──────────────────────────────────────────────────

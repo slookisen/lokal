@@ -29,6 +29,7 @@ import { seedExpansionV5 } from "./seed-expansion-v5";
 import { seedExpansionV6 } from "./seed-expansion-v6";
 import { seedExpansionV7 } from "./seed-expansion-v7";
 import { seedExpansionV8 } from "./seed-expansion-v8";
+import { seedKnowledge } from "./seed-knowledge";
 import { discoveryService } from "./services/discovery-service";
 
 const app = express();
@@ -90,17 +91,20 @@ seedExpansionV5();
 seedExpansionV6();
 seedExpansionV7();
 seedExpansionV8();
+seedKnowledge();
 
 // ─── Start ───────────────────────────────────────────────────
 const BASE_URL = process.env.BASE_URL || `http://localhost:${PORT}`;
 
-app.listen(PORT, async () => {
+// Bind to 0.0.0.0 — required for Docker/Fly.io (localhost won't work in containers)
+const HOST = process.env.HOST || "0.0.0.0";
+app.listen(Number(PORT), HOST, async () => {
   console.log(`\n🥬 Lokal API v0.11.0 running at ${BASE_URL}`);
   console.log(`   💾 Database: SQLite (persistent)`);
   console.log(`   🔒 Security: Helmet + Rate limiting + Input sanitization`);
   console.log(`\n   ── A2A Protocol ──────────────────────────────`);
   console.log(`   JSON-RPC:      POST ${BASE_URL}/a2a`);
-  console.log(`   Agent Card:    GET  ${BASE_URL}/.well-known/agent.json`);
+  console.log(`   Agent Card:    GET  ${BASE_URL}/.well-known/agent-card.json`);
   console.log(`\n   ── Marketplace ──────────────────────────────`);
   console.log(`   Register:      POST ${BASE_URL}/api/marketplace/register`);
   console.log(`   Discover:      POST ${BASE_URL}/api/marketplace/discover`);
