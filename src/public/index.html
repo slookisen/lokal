@@ -5,10 +5,10 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Lokal — Norges A2A-nettverk for lokal mat</title>
 
-  <!-- Leaflet CSS -->
-  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
-  <link rel="stylesheet" href="https://unpkg.com/leaflet.markercluster@1.5.3/dist/MarkerCluster.css" />
-  <link rel="stylesheet" href="https://unpkg.com/leaflet.markercluster@1.5.3/dist/MarkerCluster.Default.css" />
+  <!-- Leaflet CSS (cdnjs — reliable fallback) -->
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.css" />
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet.markercluster/1.5.3/MarkerCluster.css" />
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet.markercluster/1.5.3/MarkerCluster.Default.css" />
 
   <style>
     * {
@@ -926,9 +926,9 @@
     </div>
   </div>
 
-  <!-- Leaflet JS -->
-  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
-  <script src="https://unpkg.com/leaflet.markercluster@1.5.3/dist/leaflet.markercluster.js"></script>
+  <!-- Leaflet JS (cdnjs — reliable fallback) -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet.markercluster/1.5.3/leaflet.markercluster.min.js"></script>
 
   <script>
     // Norwegian city coordinates
@@ -978,7 +978,7 @@
 
     // Initialize
     document.addEventListener('DOMContentLoaded', () => {
-      initMap();
+      try { initMap(); } catch(e) { console.warn('Map init failed (CDN down?):', e.message); }
       loadStats();
       loadAgents();
       connectLiveFeed();
@@ -1075,6 +1075,7 @@
 
     // Update map with agent locations
     function updateMap() {
+      if (!markers || !map) return; // Skip if map didn't initialize
       markers.clearLayers();
 
       filteredAgents.forEach(agent => {
