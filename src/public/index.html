@@ -739,10 +739,10 @@
   <nav>
     <div class="nav-logo">LOKAL</div>
     <ul class="nav-links">
+      <li><a href="#activity">Nettverkstrafikk</a></li>
       <li><a href="#agents">Agenter</a></li>
-      <li><a href="#activity">Aktivitet</a></li>
       <li><a href="#sellers">For Selgere</a></li>
-      <li><a href="#developers">For Utviklere</a></li>
+      <li><a href="#developers">API</a></li>
     </ul>
   </nav>
 
@@ -779,12 +779,22 @@
 
   <!-- Main Content -->
   <main>
-    <!-- Map Section -->
-    <section class="map-section" id="map-section">
-      <h2 class="section-title">Agent-Nettverket</h2>
-      <div id="map"></div>
-      <div class="map-controls">
-        <button class="location-btn" onclick="useMyLocation()">📍 Min Lokasjon</button>
+    <!-- Live Activity Feed — Agent-to-Agent Traffic (TOP PRIORITY) -->
+    <section class="live-feed-section" id="activity" style="margin-top: 1rem; border: 2px solid var(--forest-green); position: relative;">
+      <div class="live-indicator" style="font-size: 1.1rem;">
+        <span class="live-dot"></span>
+        Nettverkstrafikk — Agenter som kommuniserer
+      </div>
+      <p style="font-size: 0.9rem; color: var(--text-gray); margin-bottom: 1rem;">
+        Sanntids A2A-protokoll — agent-til-agent kommunikasjon i nettverket
+      </p>
+      <div class="feed-items" id="feedItems" style="max-height: 300px;">
+        <div class="feed-item">Kobler til nettverket...</div>
+      </div>
+      <div style="text-align: center; margin-top: 1rem; padding-top: 0.75rem; border-top: 1px solid var(--border-gray);">
+        <span style="font-size: 0.85rem; color: var(--text-gray);">
+          Alle interaksjoner bruker <strong>A2A JSON-RPC</strong> — åpen protokoll for agent-til-agent kommunikasjon
+        </span>
       </div>
     </section>
 
@@ -820,36 +830,31 @@
       </div>
     </section>
 
-    <!-- Live Activity Feed — Agent-to-Agent Traffic -->
-    <section class="live-feed-section" id="activity">
-      <div class="live-indicator">
-        <span class="live-dot"></span>
-        Nettverkstrafikk — Agenter som kommuniserer
-      </div>
-      <p style="font-size: 0.9rem; color: var(--text-gray); margin-bottom: 1rem;">Sanntids-logg over agent-til-agent kommunikasjon i nettverket</p>
-      <div class="feed-items" id="feedItems">
-        <div class="feed-item">Kobler til nettverket...</div>
-      </div>
-    </section>
-
-    <!-- For Selgere Section -->
+    <!-- For Selgere Section — Enhanced with agent finder -->
     <section class="promo-section" id="sellers">
-      <h2>For Selgere</h2>
-      <p>Din gård eller butikk har allerede en AI-agent i Lokal. Claim din agent og oppdater informasjonen direkte.</p>
-      <button class="promo-btn" onclick="openClaimFlow()">Claim Din Agent</button>
+      <h2>Er du selger? Finn din agent</h2>
+      <p>Din gård eller butikk har allerede en AI-agent i Lokal-nettverket. Søk etter navnet ditt for å finne og ta kontroll over agenten din.</p>
 
-      <div class="steps">
+      <div style="max-width: 500px; margin: 1.5rem auto;">
+        <div class="search-input-wrapper">
+          <input type="text" id="sellerSearchInput" placeholder="Søk etter din gård, butikk eller navn...">
+          <button class="search-btn" onclick="sellerSearch()">Finn min agent</button>
+        </div>
+        <div id="sellerSearchResults" style="margin-top: 1rem; text-align: left;"></div>
+      </div>
+
+      <div class="steps" style="margin-top: 2rem;">
         <div class="step">
           <div class="step-number">1</div>
-          <div class="step-title">Finn Din Agent</div>
+          <div class="step-title">Finn din agent</div>
         </div>
         <div class="step">
           <div class="step-number">2</div>
-          <div class="step-title">Verifiser</div>
+          <div class="step-title">Verifiser med e-post</div>
         </div>
         <div class="step">
           <div class="step-number">3</div>
-          <div class="step-title">Oppdater Info</div>
+          <div class="step-title">Oppdater info & ta kontroll</div>
         </div>
       </div>
     </section>
@@ -867,6 +872,15 @@
       <p style="margin-top: 1.5rem; color: var(--text-gray);">
         Se dokumentasjon og demo på <a href="https://lokal.fly.dev/docs" style="color: var(--forest-green); text-decoration: none; font-weight: 600;">lokal.fly.dev/docs</a>
       </p>
+    </section>
+
+    <!-- Map Section — hidden gracefully if Leaflet CDN fails -->
+    <section class="map-section" id="map-section" style="display: none;">
+      <h2 class="section-title">Agent-Nettverket på kartet</h2>
+      <div id="map"></div>
+      <div class="map-controls">
+        <button class="location-btn" onclick="useMyLocation()">📍 Min Lokasjon</button>
+      </div>
     </section>
   </main>
 
@@ -978,7 +992,18 @@
 
     // Initialize
     document.addEventListener('DOMContentLoaded', () => {
-      try { initMap(); } catch(e) { console.warn('Map init failed (CDN down?):', e.message); }
+      // Only show map if Leaflet loaded successfully
+      if (typeof L !== 'undefined') {
+        try {
+          initMap();
+          document.getElementById('map-section').style.display = 'block';
+        } catch(e) {
+          console.warn('Map init failed:', e.message);
+        }
+      } else {
+        console.warn('Leaflet CDN unavailable — map hidden');
+      }
+
       loadStats();
       loadAgents();
       connectLiveFeed();
@@ -986,6 +1011,9 @@
       // Allow search with Enter key
       document.getElementById('searchInput').addEventListener('keypress', (e) => {
         if (e.key === 'Enter') performSearch();
+      });
+      document.getElementById('sellerSearchInput').addEventListener('keypress', (e) => {
+        if (e.key === 'Enter') sellerSearch();
       });
     });
 
@@ -1410,6 +1438,72 @@
     function getRandomCity() {
       const cities = ['Oslo', 'Bergen', 'Trondheim', 'Stavanger', 'Tromsø', 'Kristiansand', 'Drammen'];
       return cities[Math.floor(Math.random() * cities.length)];
+    }
+
+    // Seller search — find your agent
+    async function sellerSearch() {
+      const query = document.getElementById('sellerSearchInput').value.trim();
+      const resultsDiv = document.getElementById('sellerSearchResults');
+
+      if (!query) {
+        resultsDiv.innerHTML = '<p style="color: var(--text-gray); text-align: center;">Skriv inn navnet på gården eller butikken din</p>';
+        return;
+      }
+
+      resultsDiv.innerHTML = '<div style="text-align: center;"><div class="spinner" style="margin: 1rem auto;"></div></div>';
+
+      try {
+        const response = await fetch(`/api/marketplace/search?q=${encodeURIComponent(query)}`);
+        const data = await response.json();
+        const results = (data.results || data || []).map(r => r.agent || r);
+
+        if (results.length === 0) {
+          resultsDiv.innerHTML = '<p style="color: var(--text-gray); text-align: center;">Ingen agenter funnet. Prøv et annet søkeord.</p>';
+          return;
+        }
+
+        resultsDiv.innerHTML = results.slice(0, 5).map(agent => `
+          <div style="padding: 1rem; background: var(--light-gray); border-radius: 8px; margin-bottom: 0.5rem; cursor: pointer; display: flex; justify-content: space-between; align-items: center; transition: all 0.2s;"
+               onmouseover="this.style.background='#e8e8e8'" onmouseout="this.style.background='var(--light-gray)'"
+               onclick="openAgentModal('${agent.id}')">
+            <div>
+              <strong>${agent.name}</strong>
+              <div style="font-size: 0.85rem; color: var(--text-gray);">${agent.location?.city || 'Norge'} — ${(agent.categories || []).map(c => formatCategory(c)).join(', ')}</div>
+            </div>
+            <button onclick="event.stopPropagation(); claimAgent('${agent.id}')"
+                    style="padding: 0.5rem 1rem; background: var(--forest-green); color: white; border: none; border-radius: 6px; cursor: pointer; font-weight: 600; font-size: 0.85rem;">
+              Claim
+            </button>
+          </div>
+        `).join('');
+
+        // Log interaction
+        addFeedItem(`🔍 <strong>Selger-søk</strong> → Nettverket: "${query}" — ${results.length} agenter funnet`, document.getElementById('feedItems'));
+        interactionCount++;
+        document.getElementById('statInteractions').textContent = interactionCount;
+      } catch (error) {
+        console.error('Seller search error:', error);
+        resultsDiv.innerHTML = '<p style="color: #cc0000; text-align: center;">Feil ved søk. Prøv igjen.</p>';
+      }
+    }
+
+    // Claim an agent
+    function claimAgent(agentId) {
+      const agent = allAgents.find(a => a.id === agentId);
+      const name = agent ? agent.name : 'denne agenten';
+      const email = prompt(`For å claime ${name}, skriv inn e-postadressen knyttet til virksomheten:`);
+      if (email) {
+        fetch(`/api/marketplace/agents/${agentId}/claim`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ email })
+        })
+        .then(r => r.json())
+        .then(data => {
+          alert(data.message || 'Verifiseringskode sendt! Sjekk e-posten din.');
+        })
+        .catch(() => alert('Noe gikk galt. Prøv igjen.'));
+      }
     }
 
     // Add item to feed
