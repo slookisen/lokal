@@ -1,0 +1,79 @@
+﻿openapi: 3.1.0
+info:
+  title: Lokal Local Food Agent API
+  description: Discover local food producers across Norway. 400+ farms, markets, shops.
+  version: 0.11.0
+servers:
+  - url: https://lokal.fly.dev
+paths:
+  /api/marketplace/search:
+    get:
+      operationId: searchFood
+      summary: Natural language food search
+      parameters:
+        - name: q
+          in: query
+          required: true
+          schema:
+            type: string
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            default: 20
+      responses:
+        '200':
+          description: Search results
+          content:
+            application/json:
+              schema:
+                type: object
+  /api/marketplace/discover:
+    post:
+      operationId: discoverProducers
+      summary: Structured producer discovery
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                categories:
+                  type: array
+                  items:
+                    type: string
+                tags:
+                  type: array
+                  items:
+                    type: string
+                lat:
+                  type: number
+                lng:
+                  type: number
+                maxDistanceKm:
+                  type: number
+                limit:
+                  type: integer
+      responses:
+        '200':
+          description: Matched producers
+  /api/marketplace/agents/{agentId}/info:
+    get:
+      operationId: getProducerInfo
+      summary: Get detailed producer information
+      parameters:
+        - name: agentId
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Producer details
+  /api/stats:
+    get:
+      operationId: getPlatformStats
+      summary: Platform statistics
+      responses:
+        '200':
+          description: Stats

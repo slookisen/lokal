@@ -1,4 +1,4 @@
-# ─── Lokal: A2A Food Marketplace ─────────────────────────────
+﻿# â”€â”€â”€ Lokal: A2A Food Marketplace â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 # Uses tsx for TypeScript execution (same as dev).
 # SQLite data persists via a mounted volume at /app/data.
 
@@ -15,6 +15,7 @@ RUN npm ci && apk del python3 make g++
 # Copy source + public assets
 COPY src/ ./src/
 COPY tsconfig.json ./
+COPY openapi.yaml ./
 
 # SQLite data directory (mount a volume here for persistence)
 RUN mkdir -p /app/data
