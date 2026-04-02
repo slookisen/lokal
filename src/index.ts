@@ -74,7 +74,7 @@ app.use("/", a2aRoutes);
 
 // --- OpenAPI spec ---
 app.get("/openapi.yaml", (_req, res) => {
-  res.sendFile(path.join(__dirname, "..\", "openapi.yaml"));
+  res.sendFile(path.join(__dirname, "..", "openapi.yaml"));
 });
 
 // Health check
