@@ -72,6 +72,11 @@ app.use("/api/reservations", reservationRoutes);
 app.use("/api/marketplace", marketplaceRoutes);
 app.use("/", a2aRoutes);
 
+// --- OpenAPI spec ---
+app.get("/openapi.yaml", (_req, res) => {
+  res.sendFile(path.join(__dirname, "..\", "openapi.yaml"));
+});
+
 // Health check
 app.get("/health", (_req, res) => {
   const stats = require("./services/marketplace-registry").marketplaceRegistry.getStats();
