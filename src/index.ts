@@ -54,6 +54,11 @@ app.use(express.json({ limit: MAX_REQUEST_SIZE }));
 app.use(sanitizeInput);
 
 // Serve the marketplace dashboard
+// Serve seller dashboard at clean URL
+app.get("/selger", (_req, res) => {
+  res.sendFile(path.join(__dirname, "public", "selger.html"));
+});
+
 app.use(express.static(path.join(__dirname, "public")));
 
 // Rate-limited routes
@@ -71,6 +76,20 @@ app.use("/api", consumerRoutes);
 app.use("/api/reservations", reservationRoutes);
 app.use("/api/marketplace", marketplaceRoutes);
 app.use("/", a2aRoutes);
+
+
+// --- Privacy Policy ---
+app.get("/privacy", (_req, res) => {
+  res.send(`<!DOCTYPE html><html><head><title>Lokal Privacy Policy</title></head><body style="font-family:sans-serif;max-width:600px;margin:40px auto;padding:0 20px">
+<h1>Privacy Policy</h1>
+<p><strong>Lokal</strong> is a local food discovery platform for Norway.</p>
+<p>We do not collect, store, or share any personal data from users of our API or Custom GPT integration.</p>
+<p>All searches are anonymous and stateless. No cookies, no tracking, no user accounts required.</p>
+<p>The API returns publicly available information about food producers in Norway.</p>
+<p>Contact: da.fredriksen@gmail.com</p>
+<p>Last updated: April 2026</p>
+</body></html>`);
+});
 
 // --- OpenAPI spec ---
 app.get("/openapi.yaml", (_req, res) => {
@@ -184,3 +203,5 @@ process.on("SIGTERM", () => { discoveryService.shutdown(); closeDb(); process.ex
 process.on("SIGINT", () => { discoveryService.shutdown(); closeDb(); process.exit(0); });
 
 export default app;
+
+

@@ -1,4 +1,4 @@
-<!DOCTYPE html>
+﻿<!DOCTYPE html>
 <html lang="no">
 <head>
   <meta charset="UTF-8">
@@ -1406,7 +1406,7 @@
       } catch(e) { rd.innerHTML = '<p style="color:#cc0000;text-align:center;">Feil. Prøv igjen.</p>'; }
     }
 
-    function claimAgent(id) {
+    function claimAgent(id) { window.location.href = '/selger.html?agent=' + encodeURIComponent(id); return; window.location.href = '/selger.html?agent=' + encodeURIComponent(id); return;
       var a = allAgents.find(function(x){return x.id===id;});
       var email = prompt('For å claime '+(a?a.name:'agenten')+', skriv inn e-post:');
       if (email) fetch('/api/marketplace/agents/'+id+'/claim',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({email:email})}).then(function(r){return r.json();}).then(function(d){alert(d.message||'Kode sendt!');}).catch(function(){alert('Feil.');});
@@ -1440,3 +1440,5 @@
   </script>
 </body>
 </html>
+
+
