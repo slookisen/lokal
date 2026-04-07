@@ -1,0 +1,26 @@
+﻿{
+    "name":  "lokal-mcp",
+    "version":  "0.1.1",
+    "description":  "MCP server for Lokal - find local food in Norway via Claude Desktop",
+    "main":  "index.js",
+    "bin":  {
+                "lokal-mcp":  "./lokal-mcp"
+            },
+    "type":  "module",
+    "keywords":  [
+                     "mcp",
+                     "claude",
+                     "lokal",
+                     "food",
+                     "norway"
+                 ],
+    "author":  "Daniel Fredriksen",
+    "license":  "MIT",
+    "dependencies":  {
+                         "@modelcontextprotocol/sdk":  "^1.12.1"
+                     },
+    "repository":  {
+                       "type":  "git",
+                       "url":  "https://github.com/slookisen/lokal"
+                   }
+}

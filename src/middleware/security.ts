@@ -47,10 +47,10 @@ export const generalLimiter = rateLimit({
 // Registration: 5 per hour per IP (prevent spam registrations)
 export const registrationLimiter = rateLimit({
   windowMs: 60 * 60 * 1000,
-  max: 5,
+  max: 50,
   message: {
     success: false,
-    error: "Registreringsgrense nådd. Maks 5 registreringer per time.",
+    error: "Registreringsgrense nådd. Maks 50 registreringer per time.",
   },
 });
 

@@ -30,6 +30,7 @@ import { seedExpansionV6 } from "./seed-expansion-v6";
 import { seedExpansionV7 } from "./seed-expansion-v7";
 import { seedExpansionV8 } from "./seed-expansion-v8";
 import { discoveryService } from "./services/discovery-service";
+import { trustScoreService } from "./services/trust-score-service";
 
 // Dynamic import - seed-knowledge is a late addition and may not be
 // present in every Docker layer during rolling deploys. Graceful

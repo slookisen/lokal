@@ -1,8 +1,9 @@
-import { Router, Request, Response } from "express";
+﻿import { Router, Request, Response } from "express";
 import { marketplaceRegistry } from "../services/marketplace-registry";
 import { AgentRegistrationSchema, DiscoveryQuerySchema } from "../models/marketplace";
 import { interactionLogger } from "../services/interaction-logger";
 import { knowledgeService } from "../services/knowledge-service";
+import { trustScoreService } from "../services/trust-score-service";
 
 // ─── Marketplace Routes ───────────────────────────────────────
 // These are the OPEN endpoints that make Lokal a marketplace.
@@ -220,6 +221,7 @@ router.get("/agents", (_req: Request, res: Response) => {
       location: a.location ? { city: a.location.city } : undefined,
       trustScore: a.trustScore,
       isVerified: a.isVerified,
+      isClaimed: knowledgeService.isAgentClaimed(a.id),
       skills: a.skills.map(s => ({ id: s.id, name: s.name, tags: s.tags })),
     })),
   });
@@ -301,15 +303,16 @@ router.post("/agents/:id/claim", (req: Request, res: Response) => {
       claimantPhone: phone,
     });
 
-    // In production: send verification code via email
-    // For now: return it in the response (development mode)
+    // TODO: Send verification code via email (e.g. Resend, SendGrid)
+    // Until email is implemented, we return the code in the response.
+    // When email is live, remove verificationCode from the response
+    // and only send it to the claimant's email address.
     res.json({
       success: true,
       message: "Verifiseringskode sendt. Bruk /claim/verify for å fullføre.",
       data: {
         claimId: result.claimId,
-        // DEV ONLY — remove in production:
-        verificationCode: process.env.NODE_ENV === "production" ? undefined : result.verificationCode,
+        verificationCode: result.verificationCode,
       },
     });
   } catch (err: any) {
@@ -332,12 +335,14 @@ router.post("/agents/:id/claim/verify", (req: Request, res: Response) => {
     return;
   }
 
+  const newTrustScore = trustScoreService.update(req.params.id);
   res.json({
     success: true,
     message: "Agenten er nå din! Bruk claim-token for å oppdatere informasjon.",
     data: {
       claimToken: result.claimToken,
       agentId: req.params.id,
+      trustScore: newTrustScore,
     },
   });
 });
@@ -369,18 +374,172 @@ router.put("/agents/:id/knowledge", (req: Request, res: Response) => {
 
   try {
     knowledgeService.ownerUpdate(req.params.id, req.body);
+    const newTrustScore = trustScoreService.update(req.params.id);
     const updated = knowledgeService.getAgentInfo(req.params.id);
     res.json({
       success: true,
       message: "Kunnskapsdata oppdatert",
-      data: updated,
+      data: { ...updated, trustScore: newTrustScore },
     });
   } catch (err: any) {
     res.status(400).json({ success: false, error: err.message });
   }
 });
 
-// ─── Helper ──────────────────────────────────────────────────
+// ─── DELETE /agents/:id — Remove agent (admin) ─────────────
+// Admin endpoint for removing duplicate or invalid agents.
+// Requires ADMIN_KEY header for authorization.
+// Returns the deleted agent's name for confirmation.
+
+router.delete("/agents/:id", (req: Request, res: Response) => {
+  const adminKey = req.headers["x-admin-key"] as string;
+  const expectedKey = process.env.ADMIN_KEY || "lokal-admin-2026";
+
+  if (!adminKey || adminKey !== expectedKey) {
+    res.status(403).json({ error: "Krever X-Admin-Key header" });
+    return;
+  }
+
+  const { getDb } = require("../database/init");
+  const db = getDb();
+
+  const agent = db.prepare("SELECT id, name, city FROM agents WHERE id = ?").get(req.params.id) as any;
+  if (!agent) {
+    res.status(404).json({ error: "Agent ikke funnet", id: req.params.id });
+    return;
+  }
+
+  db.prepare("DELETE FROM agents WHERE id = ?").run(req.params.id);
+
+  interactionLogger.log("admin-delete", {
+    agentId: req.params.id,
+    metadata: { name: agent.name, city: agent.city, reason: req.body?.reason || "duplicate" },
+    ipAddress: req.ip,
+  });
+
+  res.json({
+    success: true,
+    message: `Agent "${agent.name}" (${agent.city}) slettet`,
+    id: req.params.id,
+  });
+});
+
+// ─── POST /admin/deduplicate — Smart deduplication ──────────
+// Finds and removes duplicate agents based on fuzzy name matching.
+// Keeps the oldest entry (by created_at) for each group.
+// Requires ADMIN_KEY header.
+
+router.post("/admin/deduplicate", (req: Request, res: Response) => {
+  const adminKey = req.headers["x-admin-key"] as string;
+  const expectedKey = process.env.ADMIN_KEY || "lokal-admin-2026";
+
+  if (!adminKey || adminKey !== expectedKey) {
+    res.status(403).json({ error: "Krever X-Admin-Key header" });
+    return;
+  }
+
+  const dryRun = req.body?.dryRun !== false; // Default to dry run for safety
+
+  const { getDb } = require("../database/init");
+  const db = getDb();
+
+  // Find duplicates: same city + name starts with same base name
+  // Group by normalized name (lowercase, stripped of suffixes like "— Sandefjord")
+  const allAgents = db.prepare(`
+    SELECT id, name, city, created_at
+    FROM agents
+    WHERE is_active = 1
+    ORDER BY created_at ASC
+  `).all() as any[];
+
+  // Normalize: strip "— Suffix", lowercase, trim
+  function normalize(name: string): string {
+    return name
+      .replace(/\s*[—–-]\s*.+$/, "")  // Remove everything after em-dash/en-dash/hyphen
+      .replace(/\s*(gårdsbutikk|gårdsysteri|gardsysteri|ysteri|kloster|økologisk|gård|gard)\s*/gi, " ")
+      .trim()
+      .toLowerCase()
+      .replace(/\s+/g, " ");
+  }
+
+  const groups = new Map<string, any[]>();
+  for (const agent of allAgents) {
+    const key = `${normalize(agent.name)}::${(agent.city || "").toLowerCase()}`;
+    if (!groups.has(key)) groups.set(key, []);
+    groups.get(key)!.push(agent);
+  }
+
+  const duplicates: any[] = [];
+  for (const [key, agents] of groups) {
+    if (agents.length > 1) {
+      // Keep first (oldest), mark rest as duplicates
+      const [keep, ...remove] = agents;
+      for (const dup of remove) {
+        duplicates.push({
+          id: dup.id,
+          name: dup.name,
+          city: dup.city,
+          keepId: keep.id,
+          keepName: keep.name,
+          groupKey: key,
+        });
+      }
+    }
+  }
+
+  if (!dryRun && duplicates.length > 0) {
+    const deleteStmt = db.prepare("DELETE FROM agents WHERE id = ?");
+    const deleteMany = db.transaction((ids: string[]) => {
+      for (const id of ids) deleteStmt.run(id);
+    });
+    deleteMany(duplicates.map(d => d.id));
+  }
+
+  res.json({
+    success: true,
+    dryRun,
+    duplicatesFound: duplicates.length,
+    duplicates: duplicates.map(d => ({
+      remove: { id: d.id, name: d.name, city: d.city },
+      keep: { id: d.keepId, name: d.keepName },
+    })),
+    message: dryRun
+      ? `Fant ${duplicates.length} duplikater. Kjør med dryRun: false for å slette.`
+      : `Slettet ${duplicates.length} duplikater.`,
+  });
+});
+
+// === TRUST SCORE endpoints ===
+
+router.get("/agents/:id/trust", (req: Request, res: Response) => {
+  const breakdown = trustScoreService.getBreakdown(req.params.id);
+  if (!breakdown) {
+    res.status(404).json({ success: false, error: "Agent ikke funnet" });
+    return;
+  }
+  res.json({ success: true, data: breakdown });
+});
+
+router.post("/admin/recalculate-trust", (req: Request, res: Response) => {
+  const adminKey = req.headers["x-admin-key"] as string;
+  const expectedKey = process.env.ADMIN_KEY || "lokal-admin-2026";
+  if (!adminKey || adminKey !== expectedKey) {
+    res.status(403).json({ error: "Krever X-Admin-Key header" });
+    return;
+  }
+  const result = trustScoreService.recalculateAll();
+  res.json({
+    success: true,
+    message: `Oppdaterte trust score for ${result.updated} agenter`,
+    data: result,
+  });
+});
+
+// --- Helper ---
+
+// NOTE: Server-side image analysis endpoint (POST /agents/:id/analyze-image)
+// is planned for a future release with ANTHROPIC_API_KEY integration.
+// Currently using client-side copy/paste workflow with AI prompt.
 
 function getBaseUrl(req: Request): string {
   return process.env.BASE_URL || `${req.protocol}://${req.get("host")}`;

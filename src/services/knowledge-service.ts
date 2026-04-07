@@ -305,13 +305,11 @@ class KnowledgeService {
       throw new Error("This agent has already been claimed");
     }
 
-    // Check for pending claims
-    const pending = db.prepare(
-      "SELECT COUNT(*) as c FROM agent_claims WHERE agent_id = ? AND status IN ('pending','code_sent')"
-    ).get(agentId) as any;
-    if (pending.c > 0) {
-      throw new Error("A claim is already pending for this agent");
-    }
+    // Clear any stale pending claims (since email isn't implemented yet,
+    // users can't complete old claims — let them try again)
+    db.prepare(
+      "DELETE FROM agent_claims WHERE agent_id = ? AND status IN ('pending','code_sent')"
+    ).run(agentId);
 
     db.prepare(`
       INSERT INTO agent_claims (id, agent_id, claimant_name, claimant_email, claimant_phone, verification_code, status, expires_at, created_at)
