@@ -1,9 +1,4 @@
-{
+﻿{
   "$schema": "https://glama.ai/mcp/schemas/server.json",
-  "maintainers": ["slookisen"],
-  "tags": [
-    "food", "marketplace", "local-food", "norway", "a2a",
-    "agent-to-agent", "organic", "farm", "produce",
-    "vegetables", "oslo", "mcp"
-  ]
+  "maintainers": ["slookisen"]
 }
