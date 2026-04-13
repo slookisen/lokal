@@ -1,0 +1,133 @@
+export interface AgentKnowledge {
+    agentId: string;
+    address?: string;
+    postalCode?: string;
+    website?: string;
+    phone?: string;
+    email?: string;
+    openingHours: OpeningHour[];
+    products: ProductInfo[];
+    about?: string;
+    specialties: string[];
+    certifications: string[];
+    paymentMethods: string[];
+    deliveryOptions: string[];
+    googleRating?: number;
+    googleReviewCount?: number;
+    tripadvisorRating?: number;
+    externalReviews: ExternalReview[];
+    images: string[];
+    dataSource: "auto" | "owner" | "hybrid";
+    autoSources: string[];
+    lastEnrichedAt?: string;
+    ownerUpdatedAt?: string;
+    preferences: Record<string, any>;
+}
+export interface OpeningHour {
+    day: string;
+    open: string;
+    close: string;
+    note?: string;
+}
+export interface ProductInfo {
+    name: string;
+    category: string;
+    seasonal: boolean;
+    months?: number[];
+    organic?: boolean;
+    note?: string;
+}
+export interface ExternalReview {
+    source: string;
+    text: string;
+    rating?: number;
+    date?: string;
+}
+export interface AgentInfoResponse {
+    agent: {
+        id: string;
+        name: string;
+        role: string;
+        city?: string;
+        trustScore: number;
+        isVerified: boolean;
+        isClaimed: boolean;
+    };
+    knowledge: {
+        address?: string;
+        postalCode?: string;
+        website?: string;
+        phone?: string;
+        email?: string;
+        openingHours: OpeningHour[];
+        products: ProductInfo[];
+        about?: string;
+        specialties: string[];
+        certifications: string[];
+        paymentMethods: string[];
+        deliveryOptions: string[];
+        ratings?: {
+            google?: {
+                score: number;
+                reviews: number;
+            };
+            tripadvisor?: {
+                score: number;
+            };
+        };
+    };
+    meta: {
+        dataSource: "auto" | "owner" | "hybrid";
+        autoSources: string[];
+        lastUpdated: string;
+        disclaimer: string;
+    };
+}
+declare class KnowledgeService {
+    getKnowledge(agentId: string): AgentKnowledge | null;
+    getAgentInfo(agentId: string): AgentInfoResponse | null;
+    upsertKnowledge(agentId: string, data: Partial<AgentKnowledge>): void;
+    ownerUpdate(agentId: string, data: Partial<AgentKnowledge>): void;
+    bulkEnrich(enrichments: Array<{
+        agentId: string;
+        data: Partial<AgentKnowledge>;
+    }>): number;
+    isAgentClaimed(agentId: string): boolean;
+    requestClaim(agentId: string, opts: {
+        claimantName: string;
+        claimantEmail: string;
+        claimantPhone?: string;
+    }): {
+        claimId: string;
+        verificationCode: string;
+    };
+    verifyClaim(claimId: string, code: string): {
+        success: boolean;
+        claimToken?: string;
+        error?: string;
+    };
+    getClaimByToken(token: string): {
+        agentId: string;
+        claimantName: string;
+        claimantEmail: string;
+    } | null;
+    resendClaimToken(agentId: string, email: string): {
+        success: boolean;
+        claimToken?: string;
+        error?: string;
+    };
+    getKnowledgeStats(): {
+        total: number;
+        enriched: number;
+        claimed: number;
+        autoOnly: number;
+        ownerOrHybrid: number;
+    };
+    private generateVerificationCode;
+    private mergeKnowledge;
+    private buildRatings;
+    private rowToKnowledge;
+}
+export declare const knowledgeService: KnowledgeService;
+export {};
+//# sourceMappingURL=knowledge-service.d.ts.map

@@ -202,18 +202,57 @@
         <p>Registrer deg i Lokal, og kunder som spør ChatGPT, Claude eller Siri om lokal mat finner deg automatisk. Det tar under 2 minutter.</p>
       </div>
 
-      <!-- ── PRIMARY: Register new ── -->
-      <div class="card" id="registerSection" style="border: 2px solid var(--forest);">
-        <h2 style="color: var(--forest); font-size: 1.2rem;">Kom i gang</h2>
-        <p style="color: var(--gray-500); font-size: 0.9rem; margin-bottom: 1.25rem;">Fyll ut litt om hva du selger, så setter vi opp alt for deg.</p>
+      <!-- ══════ STEP 1: FIND YOUR BUSINESS ══════ -->
+      <div class="card" id="findSection" style="border: 2px solid var(--forest);">
+        <div class="steps" style="margin-bottom: 1.25rem;">
+          <div class="step active"><span class="step-num">1</span> <span>Finn butikken</span></div>
+          <div class="step"><span class="step-num">2</span> <span>Registrer / ta eierskap</span></div>
+          <div class="step"><span class="step-num">3</span> <span>Dashboard</span></div>
+        </div>
+        <h2 style="color: var(--forest); font-size: 1.2rem;">Finn butikken din</h2>
+        <p style="color: var(--gray-500); font-size: 0.9rem; margin-bottom: 1.25rem;">Vi sjekker om butikken din allerede finnes i registeret. Da kan du ta eierskap med en gang, i stedet for å opprette en duplikat.</p>
+
+        <div class="form-row">
+          <div class="form-group" style="flex: 2;">
+            <label>Butikknavn, g&aring;rd eller bedrift</label>
+            <input type="text" id="findName" placeholder="F.eks. Aker G&aring;rd, Kaffehagen, Bakeriutsalget..." autocomplete="off" />
+          </div>
+          <div class="form-group" style="flex: 1;">
+            <label>By / sted <span style="color:var(--gray-400);font-weight:normal;font-size:0.8rem;">(valgfritt)</span></label>
+            <input type="text" id="findCity" placeholder="Valgfritt" autocomplete="off" />
+          </div>
+        </div>
+        <button class="btn btn-primary" id="btnFind" style="width: 100%; justify-content: center; padding: 0.8rem; font-size: 1rem;">Sjekk registeret</button>
+        <div id="findAlert"></div>
+
+        <!-- Match results appear here -->
+        <div id="findResults" class="hidden" style="margin-top: 1.25rem;">
+          <div id="findMatchList"></div>
+          <div id="findNoMatch" class="hidden" style="text-align: center; padding: 1.5rem; background: var(--gray-50); border-radius: 12px; margin-top: 0.75rem;">
+            <p style="font-size: 1.1rem; font-weight: 600; color: var(--forest); margin-bottom: 0.5rem;">Butikken din er ikke registrert enn&aring;</p>
+            <p style="color: var(--gray-500); font-size: 0.9rem; margin-bottom: 1rem;">Opprett en ny agent &mdash; det tar under 2 minutter.</p>
+            <button class="btn btn-primary" id="btnShowRegForm">Registrer ny agent</button>
+          </div>
+        </div>
+      </div>
+
+      <!-- ══════ STEP 2A: REGISTER NEW (hidden until "no match") ══════ -->
+      <div class="card hidden" id="registerSection" style="border: 2px solid var(--forest); margin-top: 1rem;">
+        <div class="steps" style="margin-bottom: 1.25rem;">
+          <div class="step done"><span class="step-num">1</span> <span>Sjekket</span></div>
+          <div class="step active"><span class="step-num">2</span> <span>Registrer</span></div>
+          <div class="step"><span class="step-num">3</span> <span>Dashboard</span></div>
+        </div>
+        <h2 style="color: var(--forest); font-size: 1.2rem;">Registrer ny agent</h2>
+        <p style="color: var(--gray-500); font-size: 0.9rem; margin-bottom: 1.25rem;">Fyll ut litt om hva du selger, s&aring; setter vi opp alt for deg.</p>
 
         <div class="form-group">
-          <label>Navn på butikk, gård eller bedrift</label>
-          <input type="text" id="regName" placeholder="F.eks. Aker Gård, Bakeriutsalget, Olas Honning..." />
+          <label>Navn p&aring; butikk, g&aring;rd eller bedrift</label>
+          <input type="text" id="regName" placeholder="F.eks. Aker G&aring;rd, Bakeriutsalget, Olas Honning..." />
         </div>
         <div class="form-group">
-          <label>Kort beskrivelse — hva tilbyr du?</label>
-          <textarea id="regDescription" rows="2" placeholder="F.eks. Vi selger økologiske grønnsaker og urter fra gården vår i Ås..."></textarea>
+          <label>Kort beskrivelse &mdash; hva tilbyr du?</label>
+          <textarea id="regDescription" rows="2" placeholder="F.eks. Vi selger &oslash;kologiske gr&oslash;nnsaker og urter fra g&aring;rden v&aring;r i &Aring;s..."></textarea>
         </div>
         <div class="form-row">
           <div class="form-group">
@@ -227,30 +266,30 @@
           </div>
         </div>
         <div class="form-group">
-          <label>Hva selger du? (velg minst én)</label>
+          <label>Hva selger du? (velg minst &eacute;n)</label>
           <div style="display: flex; flex-wrap: wrap; gap: 6px;" id="regCategories">
-            <label style="display:flex;align-items:center;gap:4px;background:var(--gray-100);padding:6px 12px;border-radius:20px;font-size:0.88rem;cursor:pointer;"><input type="checkbox" value="vegetables" style="width:auto;"> Grønnsaker</label>
+            <label style="display:flex;align-items:center;gap:4px;background:var(--gray-100);padding:6px 12px;border-radius:20px;font-size:0.88rem;cursor:pointer;"><input type="checkbox" value="vegetables" style="width:auto;"> Gr&oslash;nnsaker</label>
             <label style="display:flex;align-items:center;gap:4px;background:var(--gray-100);padding:6px 12px;border-radius:20px;font-size:0.88rem;cursor:pointer;"><input type="checkbox" value="fruit" style="width:auto;"> Frukt</label>
             <label style="display:flex;align-items:center;gap:4px;background:var(--gray-100);padding:6px 12px;border-radius:20px;font-size:0.88rem;cursor:pointer;"><input type="checkbox" value="dairy" style="width:auto;"> Meieri</label>
-            <label style="display:flex;align-items:center;gap:4px;background:var(--gray-100);padding:6px 12px;border-radius:20px;font-size:0.88rem;cursor:pointer;"><input type="checkbox" value="meat" style="width:auto;"> Kjøtt</label>
+            <label style="display:flex;align-items:center;gap:4px;background:var(--gray-100);padding:6px 12px;border-radius:20px;font-size:0.88rem;cursor:pointer;"><input type="checkbox" value="meat" style="width:auto;"> Kj&oslash;tt</label>
             <label style="display:flex;align-items:center;gap:4px;background:var(--gray-100);padding:6px 12px;border-radius:20px;font-size:0.88rem;cursor:pointer;"><input type="checkbox" value="fish" style="width:auto;"> Fisk</label>
-            <label style="display:flex;align-items:center;gap:4px;background:var(--gray-100);padding:6px 12px;border-radius:20px;font-size:0.88rem;cursor:pointer;"><input type="checkbox" value="bread" style="width:auto;"> Brød</label>
+            <label style="display:flex;align-items:center;gap:4px;background:var(--gray-100);padding:6px 12px;border-radius:20px;font-size:0.88rem;cursor:pointer;"><input type="checkbox" value="bread" style="width:auto;"> Br&oslash;d</label>
             <label style="display:flex;align-items:center;gap:4px;background:var(--gray-100);padding:6px 12px;border-radius:20px;font-size:0.88rem;cursor:pointer;"><input type="checkbox" value="honey" style="width:auto;"> Honning</label>
             <label style="display:flex;align-items:center;gap:4px;background:var(--gray-100);padding:6px 12px;border-radius:20px;font-size:0.88rem;cursor:pointer;"><input type="checkbox" value="eggs" style="width:auto;"> Egg</label>
             <label style="display:flex;align-items:center;gap:4px;background:var(--gray-100);padding:6px 12px;border-radius:20px;font-size:0.88rem;cursor:pointer;"><input type="checkbox" value="herbs" style="width:auto;"> Urter</label>
-            <label style="display:flex;align-items:center;gap:4px;background:var(--gray-100);padding:6px 12px;border-radius:20px;font-size:0.88rem;cursor:pointer;"><input type="checkbox" value="berries" style="width:auto;"> Bær</label>
+            <label style="display:flex;align-items:center;gap:4px;background:var(--gray-100);padding:6px 12px;border-radius:20px;font-size:0.88rem;cursor:pointer;"><input type="checkbox" value="berries" style="width:auto;"> B&aelig;r</label>
           </div>
         </div>
         <div class="form-group">
           <label>Stikkord (valgfritt)</label>
-          <input type="text" id="regTags" placeholder="økologisk, gårdsbutikk, sesong..." />
-          <p class="form-hint">Hjelper AI-assistenter å forstå hva som gjør deg spesiell.</p>
+          <input type="text" id="regTags" placeholder="&oslash;kologisk, g&aring;rdsbutikk, sesong..." />
+          <p class="form-hint">Hjelper AI-assistenter &aring; forst&aring; hva som gj&oslash;r deg spesiell.</p>
         </div>
         <div id="regAlert"></div>
         <button class="btn btn-primary" id="btnRegister" style="width: 100%; justify-content: center; padding: 0.8rem; font-size: 1rem;">Registrer gratis</button>
       </div>
 
-      <!-- ── SECONDARY: Already registered / claim existing ── -->
+      <!-- ══════ LOGIN: Already registered ══════ -->
       <div class="card" style="margin-top: 1rem; background: var(--gray-50);">
         <h3 style="margin-bottom: 0.5rem;">Allerede registrert?</h3>
         <p style="color: var(--gray-500); font-size: 0.85rem; margin-bottom: 0.75rem;">Logg inn med tokenet du fikk ved registrering.</p>
@@ -264,20 +303,8 @@
         </div>
       </div>
 
-      <!-- ── TERTIARY: Claim an existing agent from the registry ── -->
-      <div class="card hidden" id="claimExistingSection" style="margin-top: 1rem;">
-        <h3 style="margin-bottom: 0.5rem;">Ta eierskap over eksisterende oppføring</h3>
-        <p style="color: var(--gray-500); font-size: 0.85rem; margin-bottom: 0.75rem;">Finnes butikken din allerede i registeret? Søk den opp og ta kontroll.</p>
-        <div class="search-box" style="max-width: 100%; margin: 0;">
-          <input type="text" id="claimSearch" placeholder="Søk etter butikknavn..." style="background: white; color: var(--charcoal); border-color: var(--gray-300);" />
-        </div>
-        <div id="claimSearchResults" class="search-results" style="margin-top: 0.75rem;"></div>
-      </div>
-
-      <!-- Link to show claim section -->
-      <p style="text-align: center; margin-top: 1rem; font-size: 0.88rem; color: var(--gray-500);">
-        Finnes butikken din allerede i registeret? <a href="#" id="showClaimLink" style="color: var(--forest); font-weight: 600;">Søk og ta eierskap</a>
-      </p>
+      <!-- (claimExistingSection is now replaced by the find-match flow above) -->
+      <div class="hidden" id="claimExistingSection"></div>
 
       <!-- Step 2: Request claim (hidden until needed) -->
       <div id="claimStep2" class="card hidden">
@@ -882,17 +909,22 @@
     }
 
     // ═══════════ CLAIM FLOW ═══════════
+    // (Legacy claim search — only attach if element exists,
+    //  since find-or-create flow replaced the old claimSearch input)
 
     var searchTimeout;
-    document.getElementById('claimSearch').addEventListener('input', function() {
-      clearTimeout(searchTimeout);
-      var q = this.value.trim();
-      if (q.length < 2) {
-        document.getElementById('claimSearchResults').innerHTML = '';
-        return;
-      }
-      searchTimeout = setTimeout(function() { searchAgents(q); }, 300);
-    });
+    var claimSearchEl = document.getElementById('claimSearch');
+    if (claimSearchEl) {
+      claimSearchEl.addEventListener('input', function() {
+        clearTimeout(searchTimeout);
+        var q = this.value.trim();
+        if (q.length < 2) {
+          document.getElementById('claimSearchResults').innerHTML = '';
+          return;
+        }
+        searchTimeout = setTimeout(function() { searchAgents(q); }, 300);
+      });
+    }
 
     async function searchAgents(q) {
       var container = document.getElementById('claimSearchResults');
@@ -1925,6 +1957,118 @@
       applyLang();
     });
 
+    // ═══════════ FIND-OR-CREATE FLOW ═══════════
+
+    var findDebounce = null;
+    document.getElementById('btnFind').addEventListener('click', async function() {
+      var name = document.getElementById('findName').value.trim();
+      var city = document.getElementById('findCity').value.trim();
+
+      if (!name || name.length < 2) {
+        showAlert('findAlert', 'Skriv inn butikknavnet ditt (minst 2 tegn).', 'error');
+        return;
+      }
+
+      this.disabled = true;
+      this.textContent = 'Søker...';
+
+      try {
+        var resp = await fetch(API + '/find-match?name=' + encodeURIComponent(name) + '&city=' + encodeURIComponent(city));
+        var data = await resp.json();
+
+        var resultsDiv = document.getElementById('findResults');
+        var matchList = document.getElementById('findMatchList');
+        var noMatch = document.getElementById('findNoMatch');
+        resultsDiv.classList.remove('hidden');
+
+        if (data.matches && data.matches.length > 0) {
+          matchList.innerHTML = '<p style="font-weight:600;margin-bottom:0.75rem;color:var(--forest);">Vi fant ' + data.matches.length + ' mulige treff:</p>';
+          noMatch.classList.add('hidden');
+
+          data.matches.forEach(function(m) {
+            var cats = (m.categories || []).join(', ');
+            var badge = m.isClaimed ? '<span style="background:#e74c3c;color:white;padding:2px 8px;border-radius:12px;font-size:0.75rem;">Eid</span>' :
+                        m.isVerified ? '<span style="background:var(--forest);color:white;padding:2px 8px;border-radius:12px;font-size:0.75rem;">Verifisert</span>' :
+                        '<span style="background:var(--accent);color:white;padding:2px 8px;border-radius:12px;font-size:0.75rem;">' + m.similarity + '% match</span>';
+            var claimBtn = m.isClaimed
+              ? '<span style="color:var(--gray-500);font-size:0.85rem;">Denne er allerede eid av noen</span>'
+              : '<button class="btn btn-primary" style="padding:6px 16px;font-size:0.85rem;" data-claim-id="' + m.id + '" data-claim-name="' + (m.name || '').replace(/"/g, '&quot;') + '">Dette er min butikk</button>';
+
+            matchList.innerHTML += '<div style="display:flex;align-items:center;justify-content:space-between;padding:1rem;background:var(--gray-50);border-radius:12px;margin-bottom:0.5rem;border:1px solid var(--gray-200);">'
+              + '<div><strong>' + m.name + '</strong> ' + badge + '<br><span style="color:var(--gray-500);font-size:0.85rem;">' + (m.city || '') + (cats ? ' — ' + cats : '') + '</span>'
+              + (m.description ? '<br><span style="color:var(--gray-400);font-size:0.8rem;">' + m.description + '</span>' : '')
+              + '</div>'
+              + '<div style="flex-shrink:0;margin-left:1rem;">' + claimBtn + '</div>'
+              + '</div>';
+          });
+
+          // Also show "Not here? Register new" at the bottom
+          matchList.innerHTML += '<div style="text-align:center;margin-top:1rem;padding:1rem;background:var(--gray-50);border-radius:12px;border:1px dashed var(--gray-300);">'
+            + '<p style="color:var(--gray-500);font-size:0.9rem;margin-bottom:0.5rem;">Finner du ikke butikken din?</p>'
+            + '<button class="btn btn-secondary" id="btnShowRegFormFromMatches" style="font-size:0.9rem;">Registrer ny agent</button>'
+            + '</div>';
+
+          // Claim button handlers (using addEventListener, not onclick)
+          matchList.querySelectorAll('[data-claim-id]').forEach(function(btn) {
+            btn.addEventListener('click', function() {
+              var agentId = this.getAttribute('data-claim-id');
+              var agentName = this.getAttribute('data-claim-name');
+              startClaimFlow(agentId, agentName);
+            });
+          });
+
+          // "Register new" from matches view
+          var regFromMatches = document.getElementById('btnShowRegFormFromMatches');
+          if (regFromMatches) {
+            regFromMatches.addEventListener('click', function() {
+              showRegisterForm(name, city);
+            });
+          }
+
+        } else {
+          matchList.innerHTML = '';
+          noMatch.classList.remove('hidden');
+        }
+
+      } catch(err) {
+        showAlert('findAlert', 'Feil ved søk: ' + err.message, 'error');
+      } finally {
+        this.disabled = false;
+        this.textContent = 'Sjekk registeret';
+      }
+    });
+
+    // Show register form (pre-filled from find step)
+    document.getElementById('btnShowRegForm').addEventListener('click', function() {
+      var name = document.getElementById('findName').value.trim();
+      var city = document.getElementById('findCity').value.trim();
+      showRegisterForm(name, city);
+    });
+
+    function showRegisterForm(name, city) {
+      document.getElementById('registerSection').classList.remove('hidden');
+      document.getElementById('regName').value = name || '';
+      document.getElementById('regCity').value = city || '';
+      document.getElementById('registerSection').scrollIntoView({ behavior: 'smooth', block: 'start' });
+    }
+
+    // Start claim flow for a matched agent
+    function startClaimFlow(agentId, agentName) {
+      document.getElementById('findSection').classList.add('hidden');
+      document.getElementById('claimStep2').classList.remove('hidden');
+      document.getElementById('claimAgentName').textContent = agentName;
+      document.getElementById('claimAgentDesc').textContent = 'Bekreft at du eier denne butikken for å ta kontroll over agenten.';
+      state.agentId = agentId;
+      document.getElementById('claimStep2').scrollIntoView({ behavior: 'smooth', block: 'start' });
+    }
+
+    // Also handle Enter key in find fields
+    ['findName', 'findCity'].forEach(function(id) {
+      document.getElementById(id).addEventListener('keydown', function(e) {
+        if (e.key === 'Enter') { e.preventDefault(); document.getElementById('btnFind').click(); }
+      });
+    });
+
     // ═══════════ REGISTER NEW AGENT ═══════════
 
     document.getElementById('btnRegister').addEventListener('click', async function() {
@@ -2055,8 +2199,9 @@
           document.getElementById('regTags').value = '';
           document.querySelectorAll('#regCategories input[type="checkbox"]').forEach(function(cb) { cb.checked = false; });
 
-          document.getElementById('claimSearch').value = name;
-          setTimeout(function() { searchAgents(name); }, 800);
+          // Legacy: populate claim search if element exists
+          var cs = document.getElementById('claimSearch');
+          if (cs) { cs.value = name; setTimeout(function() { searchAgents(name); }, 800); }
         } else {
           showAlert('regAlert', data.error || 'Registrering feilet. Prøv igjen.', 'error');
         }
@@ -2127,14 +2272,7 @@
     buildMonthCheckboxes();
     buildHoursGrid();
 
-    // "Søk og ta eierskap" link — shows the claim section
-    document.getElementById('showClaimLink').addEventListener('click', function(e) {
-      e.preventDefault();
-      var section = document.getElementById('claimExistingSection');
-      section.classList.remove('hidden');
-      section.scrollIntoView({ behavior: 'smooth', block: 'center' });
-      document.getElementById('claimSearch').focus();
-    });
+    // Legacy showClaimLink removed — replaced by find-or-create flow
 
     // Handle URL parameters and auto-login
     (function() {
@@ -2143,12 +2281,20 @@
       // ?agent=NAME → show claim section and pre-fill search
       var agentParam = params.get('agent');
       if (agentParam) {
-        document.getElementById('claimExistingSection').classList.remove('hidden');
-        document.getElementById('claimSearch').value = agentParam;
-        searchAgents(agentParam);
-        setTimeout(function() {
-          document.getElementById('claimExistingSection').scrollIntoView({ behavior: 'smooth', block: 'center' });
-        }, 300);
+        // If new find-or-create flow exists, pre-fill that instead
+        var findNameEl = document.getElementById('findName');
+        var claimSearchEl2 = document.getElementById('claimSearch');
+        if (findNameEl) {
+          findNameEl.value = agentParam;
+          document.getElementById('btnFind').click();
+        } else if (claimSearchEl2) {
+          document.getElementById('claimExistingSection').classList.remove('hidden');
+          claimSearchEl2.value = agentParam;
+          searchAgents(agentParam);
+          setTimeout(function() {
+            document.getElementById('claimExistingSection').scrollIntoView({ behavior: 'smooth', block: 'center' });
+          }, 300);
+        }
         return;
       }
 

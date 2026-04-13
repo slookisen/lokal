@@ -2,7 +2,7 @@
 // ─── Discovery Service ─────────────────────────────────────
 // HOW AGENTS FIND LOKAL — the three discovery channels:
 //
-// 1. A2A Agent Card at /.well-known/agent.json
+// 1. A2A Agent Card at /.well-known/agent-card.json
 //    → Any agent that knows our URL can read our capabilities.
 //    → This is passive discovery: they come to us.
 //
@@ -72,7 +72,7 @@ class DiscoveryService {
             console.log("[Discovery] Set BASE_URL to a public URL to enable agent discovery.");
         }
         // Always log the agent card URL
-        console.log(`[Discovery] Agent Card: ${baseUrl}/.well-known/agent.json`);
+        console.log(`[Discovery] Agent Card: ${baseUrl}/.well-known/agent-card.json`);
         console.log(`[Discovery] A2A Endpoint: ${baseUrl}/a2a`);
     }
     // ─── Register with all enabled registries ──────────────────
@@ -103,7 +103,7 @@ class DiscoveryService {
             },
             body: JSON.stringify({
                 agentCard: card,
-                wellKnownUrl: `${this.baseUrl}/.well-known/agent.json`,
+                wellKnownUrl: `${this.baseUrl}/.well-known/agent-card.json`,
                 a2aEndpoint: `${this.baseUrl}/a2a`,
                 categories: ["food", "marketplace", "local-commerce", "norway"],
             }),
@@ -144,7 +144,7 @@ class DiscoveryService {
     // For when we add web-based discovery channels.
     getDiscoveryMetadata() {
         return {
-            "a2a-agent-card": `${this.baseUrl}/.well-known/agent.json`,
+            "a2a-agent-card": `${this.baseUrl}/.well-known/agent-card.json`,
             "a2a-endpoint": `${this.baseUrl}/a2a`,
             "mcp-server": `${this.baseUrl}/mcp`,
             "service-type": "food-marketplace",
@@ -159,7 +159,7 @@ class DiscoveryService {
                 serviceType: "_a2a._tcp",
                 serviceName: "Lokal Food Marketplace",
                 txtRecords: {
-                    "path": "/.well-known/agent.json",
+                    "path": "/.well-known/agent-card.json",
                     "type": "food-marketplace",
                     "region": "NO",
                 },

@@ -1,0 +1,226 @@
+﻿/**
+ * MCP Streamable HTTP Transport — Remote MCP endpoint for ChatGPT & other AI platforms
+ *
+ * Endpoint: POST https://lokal.fly.dev/mcp
+ *           GET  https://lokal.fly.dev/mcp  (SSE stream for notifications)
+ *           DELETE https://lokal.fly.dev/mcp (session cleanup)
+ *
+ * ChatGPT Developer Mode: paste https://lokal.fly.dev/mcp as the MCP URL.
+ */
+
+import { Router, Request, Response } from "express";
+import { randomUUID } from "crypto";
+import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
+import { z } from "zod";
+import { marketplaceRegistry } from "../services/marketplace-registry";
+import { knowledgeService } from "../services/knowledge-service";
+
+const router = Router();
+
+function registerTools(server: McpServer) {
+  server.tool(
+    "lokal_search",
+    "Search for local food producers in Norway using natural language. Supports Norwegian and English. Returns ranked producers with contact info. Examples: 'fresh vegetables near Grunerloekka', 'organic honey Oslo', 'ost Trondheim'.",
+    {
+      query: z.string().describe("Natural language search query (Norwegian or English)"),
+      limit: z.number().min(1).max(50).default(10).describe("Max results"),
+    },
+    async ({ query, limit }) => {
+      const parsed = marketplaceRegistry.parseNaturalQuery(query);
+      const results = marketplaceRegistry.discover({ ...parsed, limit: limit || 10 });
+      if (!results?.length) {
+        return { content: [{ type: "text" as const, text: `Ingen resultater for "${query}". Proev et bredere soek.` }] };
+      }
+      const header = `**Lokal mat-soek: "${query}"** - fant ${results.length} produsenter:\n`;
+      const lines = results.map((r: any, i: number) => {
+        const dist = r.distanceKm ? ` - ${r.distanceKm.toFixed(1)} km unna` : "";
+        return formatAgentCompact(r.agent, i + 1, r.contact) + dist;
+      });
+      return { content: [{ type: "text" as const, text: header + "\n" + lines.join("\n\n") }] };
+    }
+  );
+
+  server.tool(
+    "lokal_discover",
+    "Structured search in the Lokal food producer registry. Filter by food categories, tags, and geographic distance.",
+    {
+      categories: z.array(z.string()).optional().describe("Categories: vegetables, fruit, berries, dairy, eggs, meat, fish, bread, honey, herbs"),
+      tags: z.array(z.string()).optional().describe("Tags: organic, seasonal, budget, local, fresh"),
+      lat: z.number().optional().describe("Latitude for distance filtering"),
+      lng: z.number().optional().describe("Longitude for distance filtering"),
+      maxDistanceKm: z.number().optional().describe("Max distance in km"),
+      limit: z.number().min(1).max(50).default(10).describe("Max results"),
+    },
+    async ({ categories, tags, lat, lng, maxDistanceKm, limit }) => {
+      const body: any = { categories, tags, lat, lng, maxDistanceKm, limit: limit || 10, role: "producer" };
+      const results = marketplaceRegistry.discover(body);
+      if (!results?.length) {
+        return { content: [{ type: "text" as const, text: "Ingen produsenter funnet med disse filtrene." }] };
+      }
+      const header = `**Strukturert soek** - ${results.length} resultater:\n`;
+      const lines = results.map((r: any, i: number) => {
+        const dist = r.distanceKm ? ` (${r.distanceKm.toFixed(1)} km)` : "";
+        return formatAgentCompact(r.agent, i + 1, r.contact) + dist;
+      });
+      return { content: [{ type: "text" as const, text: header + "\n" + lines.join("\n\n") }] };
+    }
+  );
+
+  server.tool(
+    "lokal_info",
+    "Get detailed information about a specific Lokal producer - address, products, opening hours, certifications, and contact info.",
+    {
+      agentId: z.string().describe("The producer's agent ID (UUID)"),
+    },
+    async ({ agentId }) => {
+      const info = knowledgeService.getAgentInfo(agentId);
+      if (!info) {
+        return { content: [{ type: "text" as const, text: `Fant ingen produsent med ID ${agentId}.` }] };
+      }
+      const { agent, knowledge: k = {} as any, meta = {} as any } = info;
+      const BASE_URL = process.env.BASE_URL || "https://lokal.fly.dev";
+      const sections: string[] = [`# ${agent.name}`];
+      if (agent.city) {
+        sections.push(`${agent.city}${agent.trustScore ? ` - Trust ${Math.round(agent.trustScore * 100)}%` : ""}${agent.isVerified ? " - Verifisert" : ""}`);
+      }
+      if (k.about) sections.push(`\n${k.about}`);
+      const contact: string[] = [];
+      if (k.address) contact.push(`${k.address}${k.postalCode ? `, ${k.postalCode}` : ""}`);
+      if (k.phone) contact.push(`Tel: ${k.phone}`);
+      if (k.email) contact.push(`E-post: ${k.email}`);
+      if (k.website) contact.push(`Web: ${k.website}`);
+      if (contact.length) sections.push(`\n## Kontakt\n${contact.join("\n")}`);
+      sections.push(`\n[Last ned kontaktkort (vCard)](${BASE_URL}/api/marketplace/agents/${agent.id}/vcard)`);
+      if (k.openingHours?.length) {
+        const dayNames: Record<string, string> = { mon: "Man", tue: "Tir", wed: "Ons", thu: "Tor", fri: "Fre", sat: "Lor", sun: "Son" };
+        const hours = k.openingHours.map((h: any) => `${dayNames[h.day] || h.day} ${h.open}-${h.close}`).join(", ");
+        sections.push(`\n## Aapningstider\n${hours}`);
+      }
+      if (k.products?.length) {
+        const productLines = k.products.map((p: any) => {
+          const seasonal = p.seasonal && p.months?.length ? ` (sesong: mnd ${p.months.join(", ")})` : "";
+          return `- ${p.name}${p.category ? ` - ${p.category}` : ""}${seasonal}`;
+        });
+        sections.push(`\n## Produkter\n${productLines.join("\n")}`);
+      }
+      if (k.specialties?.length) sections.push(`\n## Spesialiteter\n${k.specialties.map((s: string) => `- ${s}`).join("\n")}`);
+      if (k.certifications?.length) sections.push(`\n## Sertifiseringer\n${k.certifications.map((c: string) => `- ${c}`).join("\n")}`);
+      if (k.paymentMethods?.length) sections.push(`\nBetaling: ${k.paymentMethods.join(", ")}`);
+      if (k.deliveryOptions?.length) sections.push(`Levering: ${k.deliveryOptions.join(", ")}`);
+      if (meta.disclaimer) {
+        const src = meta.autoSources?.length ? ` (kilder: ${meta.autoSources.join(", ")})` : "";
+        sections.push(`\n---\n${meta.disclaimer}${src}`);
+      }
+      return { content: [{ type: "text" as const, text: sections.join("\n") }] };
+    }
+  );
+
+  server.tool(
+    "lokal_stats",
+    "Get Lokal platform statistics - total agents, cities covered.",
+    {},
+    async () => {
+      const stats = marketplaceRegistry.getStats();
+      const text = [
+        "**Lokal - Plattformstatistikk**",
+        `Totalt agenter: ${stats.totalAgents || "?"}`,
+        `Byer: ${stats.cities || "?"}`,
+      ].join("\n");
+      return { content: [{ type: "text" as const, text }] };
+    }
+  );
+}
+
+function formatAgentCompact(agent: any, idx: number, contact?: any): string {
+  const lines = [`**${idx}. ${agent.name}**`];
+  if (agent.description) lines.push(`   ${agent.description}`);
+  const meta: string[] = [];
+  if (agent.location?.city) meta.push(agent.location.city);
+  if (agent.categories?.length) meta.push(agent.categories.join(", "));
+  if (agent.trustScore) meta.push(`Trust ${Math.round(agent.trustScore * 100)}%`);
+  if (meta.length) lines.push(`   ${meta.join(" | ")}`);
+  if (contact) {
+    const cl: string[] = [];
+    if (contact.address) cl.push(contact.address);
+    if (contact.phone) cl.push(contact.phone);
+    if (contact.email) cl.push(contact.email);
+    if (contact.website) cl.push(contact.website);
+    if (cl.length) lines.push(`   ${cl.join(" | ")}`);
+  }
+  return lines.join("\n");
+}
+
+interface McpSession {
+  transport: StreamableHTTPServerTransport;
+  server: McpServer;
+  lastActivity: number;
+}
+
+const sessions = new Map<string, McpSession>();
+const SESSION_TTL_MS = 30 * 60 * 1000;
+
+setInterval(() => {
+  const now = Date.now();
+  for (const [id, session] of sessions) {
+    if (now - session.lastActivity > SESSION_TTL_MS) {
+      session.transport.close?.();
+      sessions.delete(id);
+    }
+  }
+}, 5 * 60 * 1000);
+
+async function getOrCreateSession(sessionId?: string): Promise<{ id: string; session: McpSession }> {
+  if (sessionId && sessions.has(sessionId)) {
+    const session = sessions.get(sessionId)!;
+    session.lastActivity = Date.now();
+    return { id: sessionId, session };
+  }
+  const id = sessionId || randomUUID();
+  const server = new McpServer({ name: "lokal", version: "0.3.0" });
+  registerTools(server);
+  const transport = new StreamableHTTPServerTransport({
+    sessionIdGenerator: () => id,
+  });
+  await server.connect(transport);
+  const session: McpSession = { transport, server, lastActivity: Date.now() };
+  sessions.set(id, session);
+  return { id, session };
+}
+
+router.post("/", async (req: Request, res: Response) => {
+  try {
+    const sessionId = req.headers["mcp-session-id"] as string | undefined;
+    const { session } = await getOrCreateSession(sessionId);
+    await session.transport.handleRequest(req, res, req.body);
+  } catch (err: any) {
+    console.error("MCP POST error:", err.message);
+    if (!res.headersSent) {
+      res.status(500).json({ error: "MCP transport error" });
+    }
+  }
+});
+
+router.get("/", async (req: Request, res: Response) => {
+  const sessionId = req.headers["mcp-session-id"] as string | undefined;
+  if (!sessionId || !sessions.has(sessionId)) {
+    res.status(400).json({ error: "Missing or invalid mcp-session-id header" });
+    return;
+  }
+  const session = sessions.get(sessionId)!;
+  session.lastActivity = Date.now();
+  await session.transport.handleRequest(req, res, req.body);
+});
+
+router.delete("/", async (req: Request, res: Response) => {
+  const sessionId = req.headers["mcp-session-id"] as string | undefined;
+  if (sessionId && sessions.has(sessionId)) {
+    const session = sessions.get(sessionId)!;
+    session.transport.close?.();
+    sessions.delete(sessionId);
+  }
+  res.status(200).json({ ok: true });
+});
+
+export default router;
+

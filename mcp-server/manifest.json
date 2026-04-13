@@ -1,0 +1,68 @@
+{
+  "manifest_version": "0.3",
+  "name": "lokal-mcp",
+  "display_name": "Lokal - Finn lokal mat i Norge",
+  "version": "0.2.0",
+  "description": "Find local food producers in Norway. Search for farms, markets and shops by name, category or location. Get contact info and add producers to your contacts with one click.",
+  "long_description": "Lokal connects you to 1000+ local food producers across Norway. Search by natural language in Norwegian or English, filter by category (vegetables, honey, dairy, meat, fish, bread), discover farms near you, and get full contact details including opening hours, payment methods, and delivery options. Every result includes a vCard link so you can add the producer to your phone contacts instantly.\n\nExamples:\n- \"Hvor finner jeg fersk honning i Oslo?\"\n- \"organic vegetables near Grunerloekka\"\n- \"ost Trondheim\"\n- \"gaardsbutikker i Lofoten\"",
+  "author": {
+    "name": "Daniel Fredriksen",
+    "email": "da.fredriksen@gmail.com",
+    "url": "https://github.com/slookisen"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/slookisen/lokal.git"
+  },
+  "homepage": "https://lokal.fly.dev",
+  "support": "https://github.com/slookisen/lokal/issues",
+  "server": {
+    "type": "node",
+    "entry_point": "index.js",
+    "mcp_config": {
+      "command": "node",
+      "args": ["${__dirname}/index.js"],
+      "env": {}
+    }
+  },
+  "tools": [
+    {
+      "name": "lokal_search",
+      "description": "Search for local food producers in Norway using natural language. Supports Norwegian and English. Returns ranked producers with contact info and vCard links."
+    },
+    {
+      "name": "lokal_discover",
+      "description": "Structured search by food category, tags, and geographic distance. Filter by vegetables, fruit, dairy, eggs, meat, fish, bread, honey, herbs."
+    },
+    {
+      "name": "lokal_info",
+      "description": "Get detailed information about a specific producer - address, products, opening hours, certifications, and a vCard contact link."
+    },
+    {
+      "name": "lokal_stats",
+      "description": "Get Lokal platform statistics - total agents, cities covered, interactions."
+    }
+  ],
+  "keywords": [
+    "food",
+    "local",
+    "norway",
+    "farm",
+    "organic",
+    "producers",
+    "vcard",
+    "norsk mat",
+    "bondens marked",
+    "gardsbutikk"
+  ],
+  "license": "MIT",
+  "privacy_policies": [
+    "https://lokal.fly.dev/privacy"
+  ],
+  "compatibility": {
+    "platforms": ["darwin", "win32", "linux"],
+    "runtimes": {
+      "node": ">=18.0.0"
+    }
+  }
+}

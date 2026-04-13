@@ -1,4 +1,4 @@
-﻿import express from "express";
+import express from "express";
 import cors from "cors";
 import path from "path";
 import { getDb, closeDb } from "./database/init";
@@ -18,6 +18,8 @@ import scanRoutes from "./routes/scan";
 import a2aRoutes from "./routes/a2a";
 import reservationRoutes from "./routes/reservation";
 import marketplaceRoutes from "./routes/marketplace";
+import mcpRoutes from "./routes/mcp";
+import seoRoutes from "./routes/seo";
 import { seedData } from "./seed";
 import { seedOsloRealData } from "./seed-oslo-real";
 import { seedMarketplace } from "./seed-marketplace";
@@ -32,96 +34,97 @@ import { seedExpansionV8 } from "./seed-expansion-v8";
 import { discoveryService } from "./services/discovery-service";
 import { trustScoreService } from "./services/trust-score-service";
 
-// Dynamic import - seed-knowledge is a late addition and may not be
-// present in every Docker layer during rolling deploys. Graceful
+// Dynamic import — seed-knowledge is a late addition and may not be
+// present in every Docker layer during rolling deploys.  Graceful
 // fallback prevents the entire process from crashing.
 let seedKnowledge: (() => void) | undefined;
 try {
   seedKnowledge = require("./seed-knowledge").seedKnowledge;
 } catch {
-  console.warn("seed-knowledge module not found - skipping knowledge enrichment");
+  console.warn("⚠️  seed-knowledge module not found — skipping knowledge enrichment (will retry next deploy)");
 }
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// Proxy trust - Fly.io terminates TLS via reverse proxy
+// ─── Proxy trust ─────────────────────────────────────────────
+// Fly.io (and most PaaS) terminates TLS and forwards requests
+// via a reverse proxy that sets X-Forwarded-For.  Without this
+// setting Express ignores that header, which:
+//   1. Breaks express-rate-limit (ERR_ERL_UNEXPECTED_X_FORWARDED_FOR)
+//   2. Makes req.ip return the internal proxy IP, not the client
+//   3. Breaks req.protocol (always "http" instead of "https")
+// "true" = trust the first proxy hop, which is Fly's edge.
 app.set("trust proxy", true);
 
-// Security Layer
+// ─── Security Layer ──────────────────────────────────────────
 app.use(securityHeaders);
 app.use(cors(corsOptions));
 app.use(express.json({ limit: MAX_REQUEST_SIZE }));
 app.use(sanitizeInput);
 
 // Serve the marketplace dashboard
-// Serve seller dashboard at clean URL
-app.get("/selger", (_req, res) => {
-  res.sendFile(path.join(__dirname, "public", "selger.html"));
-});
-
 app.use(express.static(path.join(__dirname, "public")));
 
-// Rate-limited routes
+// ─── Rate-limited routes ─────────────────────────────────────
+// JSON-RPC gets its own limiter (agents are chatty)
 app.use("/a2a", jsonRpcLimiter);
+// Registration is heavily limited (anti-spam)
 app.use("/api/marketplace/register", registrationLimiter);
+// Search has its own tier
 app.use("/api/marketplace/search", searchLimiter);
 app.use("/api/marketplace/discover", searchLimiter);
+// Everything else gets the general limiter
 app.use("/api", generalLimiter);
 
-// Routes
+// ─── Routes ──────────────────────────────────────────────────
 app.use("/api/producers", producerRoutes);
 app.use("/api/producers", scanRoutes);
 app.use("/api/products", scanRoutes);
 app.use("/api", consumerRoutes);
 app.use("/api/reservations", reservationRoutes);
 app.use("/api/marketplace", marketplaceRoutes);
+app.use("/mcp", mcpRoutes);
 app.use("/", a2aRoutes);
 
-
-// --- Privacy Policy ---
-app.get("/privacy", (_req, res) => {
-  res.send(`<!DOCTYPE html><html><head><title>Lokal Privacy Policy</title></head><body style="font-family:sans-serif;max-width:600px;margin:40px auto;padding:0 20px">
-<h1>Privacy Policy</h1>
-<p><strong>Lokal</strong> is a local food discovery platform for Norway.</p>
-<p>We do not collect, store, or share any personal data from users of our API or Custom GPT integration.</p>
-<p>All searches are anonymous and stateless. No cookies, no tracking, no user accounts required.</p>
-<p>The API returns publicly available information about food producers in Norway.</p>
-<p>Contact: da.fredriksen@gmail.com</p>
-<p>Last updated: April 2026</p>
-</body></html>`);
-});
-
-// --- OpenAPI spec ---
+// ─── OpenAPI spec (for Custom GPTs and developer docs) ──────
 app.get("/openapi.yaml", (_req, res) => {
   res.sendFile(path.join(__dirname, "..", "openapi.yaml"));
 });
 
-// Health check
+// ─── Health check ────────────────────────────────────────────
 app.get("/health", (_req, res) => {
   const stats = require("./services/marketplace-registry").marketplaceRegistry.getStats();
   res.json({
     status: "ok",
     service: "lokal",
-    version: "0.4.0",
+    version: "0.3.0",
     database: "sqlite",
     agents: stats.totalAgents,
     uptime: Math.floor(process.uptime()),
   });
 });
 
-// Database + Seed (with idempotency guard)
+// SEO pages LAST — /:city is a catch-all wildcard
+app.use("/", seoRoutes);
+
+// ─── Database + Seed (with idempotency guard) ───────────────
 // FIX: Seeds were running on every restart, causing duplicate agents.
 // Fly.io restarts the app on deploy, autoscale, and idle-wakeup.
+// Each restart re-ran all 11 seed functions, adding duplicates with
+// new UUIDs but identical names/cities.
+//
 // Solution: Check if agents already exist before seeding.
+// If the DB already has agents, skip seeding entirely.
+// Seeds are only for initial population — not for every boot.
 
-console.log("\nInitializing SQLite database...");
+console.log("\n💾 Initializing SQLite database...");
 const db = getDb();
 
 const existingAgentCount = (db.prepare("SELECT COUNT(*) as c FROM agents").get() as any).c;
 
 if (existingAgentCount === 0) {
-  console.log("Empty database detected - running initial seed...");
+  console.log("🌱 Empty database detected — running initial seed...");
   seedData();
   seedOsloRealData();
   seedMarketplace();
@@ -148,15 +151,15 @@ if (existingAgentCount === 0) {
         SELECT MIN(id) FROM agents GROUP BY name, city
       )
     `).run();
-    console.log(`Removed ${dupeCount} duplicate agents after seeding`);
+    console.log(`🧹 Removed ${dupeCount} duplicate agents after seeding`);
   }
 
   const finalCount = (db.prepare("SELECT COUNT(*) as c FROM agents").get() as any).c;
-  console.log(`Seeded ${finalCount} unique agents`);
+  console.log(`✅ Seeded ${finalCount} unique agents`);
 } else {
-  console.log(`Database already has ${existingAgentCount} agents - skipping seed`);
+  console.log(`✅ Database already has ${existingAgentCount} agents — skipping seed`);
 
-  // Run deduplication on existing data (one-time cleanup)
+  // Run deduplication on existing data (one-time cleanup for the 429→370 issue)
   const dupeCount = (db.prepare(`
     SELECT COUNT(*) as c FROM agents WHERE id NOT IN (
       SELECT MIN(id) FROM agents GROUP BY name, city
@@ -169,40 +172,53 @@ if (existingAgentCount === 0) {
         SELECT MIN(id) FROM agents GROUP BY name, city
       )
     `).run();
-    console.log(`Cleaned up ${dupeCount} duplicate agents from previous restarts`);
+    console.log(`🧹 Cleaned up ${dupeCount} duplicate agents from previous restarts`);
   }
 
   // Enrich knowledge if not already done
   if (seedKnowledge) {
     const knowledgeCount = (db.prepare("SELECT COUNT(*) as c FROM agent_knowledge").get() as any).c;
     if (knowledgeCount === 0) {
-      console.log("Running knowledge enrichment...");
+      console.log("📚 Running knowledge enrichment...");
       seedKnowledge();
     }
   }
 }
 
-// Start
+// ─── Recalculate trust scores on boot ────────────────────────
+// Every deploy gets fresh scores reflecting current data.
+// This replaces the static 0.5 default with real calculations.
+console.log("📊 Recalculating trust scores...");
+const trustResult = trustScoreService.recalculateAll();
+console.log(`   ✅ Updated ${trustResult.updated} agents (avg: ${Math.round(trustResult.avgScore * 100)}%)`);
+
+// ─── Start ───────────────────────────────────────────────────
 const BASE_URL = process.env.BASE_URL || `http://localhost:${PORT}`;
+
+// Bind to 0.0.0.0 — required for Docker/Fly.io (localhost won't work in containers)
 const HOST = process.env.HOST || "0.0.0.0";
 app.listen(Number(PORT), HOST, async () => {
-  console.log(`\nLokal API v0.4.0 running at ${BASE_URL}`);
-  console.log(`  Database: SQLite (persistent)`);
-  console.log(`  Security: Helmet + Rate limiting + Input sanitization`);
-  console.log(`  JSON-RPC: POST ${BASE_URL}/a2a`);
-  console.log(`  Agent Card: GET ${BASE_URL}/.well-known/agent-card.json`);
-  console.log(`  Register: POST ${BASE_URL}/api/marketplace/register`);
-  console.log(`  Discover: POST ${BASE_URL}/api/marketplace/discover`);
-  console.log(`  NL Search: GET ${BASE_URL}/api/marketplace/search?q=...`);
+  console.log(`\n🥬 Lokal API v0.11.0 running at ${BASE_URL}`);
+  console.log(`   💾 Database: SQLite (persistent)`);
+  console.log(`   🔒 Security: Helmet + Rate limiting + Input sanitization`);
+  console.log(`\n   ── A2A Protocol ──────────────────────────────`);
+  console.log(`   JSON-RPC:      POST ${BASE_URL}/a2a`);
+  console.log(`   Agent Card:    GET  ${BASE_URL}/.well-known/agent-card.json`);
+  console.log(`\n   ── Marketplace ──────────────────────────────`);
+  console.log(`   Register:      POST ${BASE_URL}/api/marketplace/register`);
+  console.log(`   Discover:      POST ${BASE_URL}/api/marketplace/discover`);
+  console.log(`   NL Search:     GET  ${BASE_URL}/api/marketplace/search?q=...`);
+  console.log(`   MCP Server:    npx lokal-mcp (for Claude Desktop)`);
+  console.log(`   MCP HTTP:      POST ${BASE_URL}/mcp (for ChatGPT & remote clients)`);
+  console.log(`\n   ── Discovery ────────────────────────────────`);
 
+  // Initialize discovery service (registers with A2A registries if public URL)
   await discoveryService.initialize(BASE_URL);
   console.log("");
 });
 
-// Graceful shutdown
+// ─── Graceful shutdown ───────────────────────────────────────
 process.on("SIGTERM", () => { discoveryService.shutdown(); closeDb(); process.exit(0); });
 process.on("SIGINT", () => { discoveryService.shutdown(); closeDb(); process.exit(0); });
 
 export default app;
-
-

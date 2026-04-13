@@ -1,0 +1,9 @@
+# Development files
+*.test.js
+*.spec.js
+.npmrc
+.env*
+
+# Don't need these in the bundle
+CHANGELOG.md
+.git/

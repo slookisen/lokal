@@ -1,11 +1,11 @@
-import { v4 as uuid } from "uuid";
+﻿import { v4 as uuid } from "uuid";
 import crypto from "crypto";
 import { getDb } from "../database/init";
 
-// ─── Agent Knowledge Service ──────────────────────────────────
+// --- Agent Knowledge Service ------------------------------
 // The "Google My Business" layer for food agents.
 //
-// Every agent gets a knowledge profile — auto-populated from
+// Every agent gets a knowledge profile - auto-populated from
 // public sources at registration, enriched over time.
 //
 // When a buyer agent asks about a seller, this service returns
@@ -46,17 +46,17 @@ export interface AgentKnowledge {
 }
 
 export interface OpeningHour {
-  day: string;       // "mon", "tue", etc. or "saturday" for markets
-  open: string;      // "09:00"
-  close: string;     // "17:00"
-  note?: string;     // "Kun i sesong (juni-september)"
+  day: string;
+  open: string;
+  close: string;
+  note?: string;
 }
 
 export interface ProductInfo {
   name: string;
   category: string;
   seasonal: boolean;
-  months?: number[];  // [6,7,8,9] = June-September
+  months?: number[];
   organic?: boolean;
   note?: string;
 }
@@ -67,10 +67,6 @@ export interface ExternalReview {
   rating?: number;
   date?: string;
 }
-
-// ─── Structured response for buyer agents ───────────────────
-// This is what a buyer agent gets when asking about a seller.
-// Clean, parseable, honest about data provenance.
 
 export interface AgentInfoResponse {
   agent: {
@@ -110,7 +106,6 @@ export interface AgentInfoResponse {
 
 class KnowledgeService {
 
-  // ─── Get knowledge for an agent ──────────────────────────
   getKnowledge(agentId: string): AgentKnowledge | null {
     const db = getDb();
     const row = db.prepare("SELECT * FROM agent_knowledge WHERE agent_id = ?").get(agentId) as any;
@@ -118,8 +113,6 @@ class KnowledgeService {
     return this.rowToKnowledge(row);
   }
 
-  // ─── Get structured info response for buyer agents ────────
-  // This is the main endpoint buyers use: "tell me about this seller"
   getAgentInfo(agentId: string): AgentInfoResponse | null {
     const db = getDb();
     const agent = db.prepare("SELECT * FROM agents WHERE id = ?").get(agentId) as any;
@@ -162,12 +155,11 @@ class KnowledgeService {
         lastUpdated,
         disclaimer: dataSource === "owner"
           ? "Denne informasjonen er verifisert av eieren."
-          : "Denne informasjonen er basert på offentlig tilgjengelige kilder og kan være utdatert. Kontakt selger direkte for oppdatert informasjon.",
+          : "Denne informasjonen er basert p\u00e5 offentlig tilgjengelige kilder og kan v\u00e6re utdatert. Kontakt selger direkte for oppdatert informasjon.",
       },
     };
   }
 
-  // ─── Set/update knowledge (used by enrichment + owner) ────
   upsertKnowledge(agentId: string, data: Partial<AgentKnowledge>): void {
     const db = getDb();
     const existing = this.getKnowledge(agentId);
@@ -209,7 +201,6 @@ class KnowledgeService {
         now, now,
       );
     } else {
-      // Merge: owner data takes precedence over auto data
       const merged = this.mergeKnowledge(existing, data);
       const isOwnerUpdate = data.dataSource === "owner";
 
@@ -256,12 +247,10 @@ class KnowledgeService {
     }
   }
 
-  // ─── Owner update (after claiming) ──────────────────────
   ownerUpdate(agentId: string, data: Partial<AgentKnowledge>): void {
     this.upsertKnowledge(agentId, { ...data, dataSource: "owner" });
   }
 
-  // ─── Bulk enrich from auto sources ─────────────────────
   bulkEnrich(enrichments: Array<{ agentId: string; data: Partial<AgentKnowledge> }>): number {
     const db = getDb();
     let count = 0;
@@ -278,8 +267,6 @@ class KnowledgeService {
     transaction();
     return count;
   }
-
-  // ─── Claim system ──────────────────────────────────────
 
   isAgentClaimed(agentId: string): boolean {
     const db = getDb();
@@ -298,15 +285,12 @@ class KnowledgeService {
     const id = uuid();
     const code = this.generateVerificationCode();
     const now = new Date().toISOString();
-    const expiresAt = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString(); // 7 days
+    const expiresAt = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString();
 
-    // Check if already claimed
     if (this.isAgentClaimed(agentId)) {
       throw new Error("This agent has already been claimed");
     }
 
-    // Clear any stale pending claims (since email isn't implemented yet,
-    // users can't complete old claims — let them try again)
     db.prepare(
       "DELETE FROM agent_claims WHERE agent_id = ? AND status IN ('pending','code_sent')"
     ).run(agentId);
@@ -329,18 +313,15 @@ class KnowledgeService {
       return { success: false, error: `Claim is ${claim.status}` };
     }
 
-    // Check expiry
     if (new Date(claim.expires_at) < new Date()) {
       db.prepare("UPDATE agent_claims SET status = 'expired' WHERE id = ?").run(claimId);
       return { success: false, error: "Claim has expired" };
     }
 
-    // Verify code
     if (claim.verification_code !== code) {
       return { success: false, error: "Invalid verification code" };
     }
 
-    // Success — generate claim token for future management
     const claimToken = `claim_${crypto.randomBytes(32).toString("hex")}`;
     const now = new Date().toISOString();
 
@@ -349,10 +330,8 @@ class KnowledgeService {
       WHERE id = ?
     `).run(claimToken, now, claimId);
 
-    // Mark agent as verified
     db.prepare("UPDATE agents SET is_verified = 1 WHERE id = ?").run(claim.agent_id);
 
-    // Update knowledge data_source
     const knowledge = this.getKnowledge(claim.agent_id);
     if (knowledge) {
       db.prepare("UPDATE agent_knowledge SET data_source = 'hybrid' WHERE agent_id = ? AND data_source = 'auto'")
@@ -370,7 +349,20 @@ class KnowledgeService {
     return row ? { agentId: row.agent_id, claimantName: row.claimant_name, claimantEmail: row.claimant_email } : null;
   }
 
-  // ─── Stats ────────────────────────────────────────────
+  resendClaimToken(agentId: string, email: string): { success: boolean; claimToken?: string; error?: string } {
+    const db = getDb();
+    const claim = db.prepare(
+      "SELECT * FROM agent_claims WHERE agent_id = ? AND status = 'verified' AND claimant_email = ?"
+    ).get(agentId, email) as any;
+
+    if (!claim) {
+      return { success: false, error: "Ingen verifisert krav funnet for denne e-postadressen" };
+    }
+
+    const newToken = `claim_${crypto.randomBytes(32).toString("hex")}`;
+    db.prepare("UPDATE agent_claims SET claim_token = ? WHERE id = ?").run(newToken, claim.id);
+    return { success: true, claimToken: newToken };
+  }
 
   getKnowledgeStats(): { total: number; enriched: number; claimed: number; autoOnly: number; ownerOrHybrid: number } {
     const db = getDb();
@@ -383,14 +375,11 @@ class KnowledgeService {
     return { total, enriched, claimed, autoOnly, ownerOrHybrid };
   }
 
-  // ─── Private helpers ─────────────────────────────────────
-
   private generateVerificationCode(): string {
     return Math.floor(100000 + Math.random() * 900000).toString();
   }
 
   private mergeKnowledge(existing: AgentKnowledge, update: Partial<AgentKnowledge>): AgentKnowledge {
-    // Owner data always wins over auto data
     return {
       agentId: existing.agentId,
       address: update.address ?? existing.address,
