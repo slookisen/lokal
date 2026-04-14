@@ -21,7 +21,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
 
-const BASE_URL = process.env.LOKAL_URL || "https://lokal.fly.dev";
+const BASE_URL = process.env.LOKAL_URL || "https://rettfrabonden.com";
 
 // ── Helpers ──────────────────────────────────────────────────
 

@@ -1,6 +1,6 @@
 {
   "name": "lokal-mcp",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "MCP server for Lokal - find local food producers in Norway via Claude Desktop. Returns ranked producers with contact info and vCard links.",
   "main": "index.js",
   "bin": {

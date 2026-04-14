@@ -8,7 +8,7 @@ startCommand:
     properties:
       LOKAL_API_URL:
         type: string
-        default: "https://lokal.fly.dev"
+        default: "https://rettfrabonden.com"
         description: "URL of the Lokal API server"
     required: []
   commandFunction: |-
@@ -16,6 +16,6 @@ startCommand:
       command: 'npx',
       args: ['tsx', 'src/mcp/server.ts'],
       env: {
-        LOKAL_API_URL: config.LOKAL_API_URL || 'https://lokal.fly.dev'
+        LOKAL_API_URL: config.LOKAL_API_URL || 'https://rettfrabonden.com'
       }
     })
