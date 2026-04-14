@@ -1,23 +1,22 @@
 {
-  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-07-09/server.schema.json",
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
   "name": "io.github.slookisen/lokal-mcp",
-  "description": "Find local food producers in Norway. Search 1000+ farms, markets and shops by name, category or location. Get contact info and vCard links.",
-  "status": "active",
+  "description": "Find local food producers in Norway. Search 1000+ farms and shops by location.",
   "repository": {
     "url": "https://github.com/slookisen/lokal",
-    "source": "github"
+    "source": "github",
+    "subfolder": "mcp-server"
   },
-  "version": "0.3.0",
+  "version": "0.3.1",
   "packages": [
     {
-      "registry_type": "npm",
-      "registry_base_url": "https://registry.npmjs.org",
+      "registryType": "npm",
       "identifier": "lokal-mcp",
-      "version": "0.3.0",
+      "version": "0.3.1",
       "transport": {
         "type": "stdio"
       },
-      "environment_variables": []
+      "environmentVariables": []
     }
   ]
 }
