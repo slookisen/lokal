@@ -97,6 +97,11 @@ app.use("/api/marketplace", marketplaceRoutes);
 app.use("/mcp", mcpRoutes);
 app.use("/", a2aRoutes);
 
+// ─── SPA dashboard (renamed from index.html to let SEO routes handle /) ──
+app.get("/app", (_req, res) => {
+  res.sendFile(path.join(__dirname, "public", "app.html"));
+});
+
 // ─── OpenAPI spec (for Custom GPTs and developer docs) ──────
 app.get("/openapi.yaml", (_req, res) => {
   res.sendFile(path.join(__dirname, "..", "openapi.yaml"));
