@@ -340,14 +340,15 @@ class KnowledgeService {
       return { success: false, error: "Invalid verification code" };
     }
 
-    // Success — generate claim token for future management
+    // Success — generate claim token for future management (expires in 30 days)
     const claimToken = `claim_${crypto.randomBytes(32).toString("hex")}`;
     const now = new Date().toISOString();
+    const tokenExpiry = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString();
 
     db.prepare(`
-      UPDATE agent_claims SET status = 'verified', claim_token = ?, verified_at = ?
+      UPDATE agent_claims SET status = 'verified', claim_token = ?, claim_token_expires_at = ?, verified_at = ?
       WHERE id = ?
-    `).run(claimToken, now, claimId);
+    `).run(claimToken, tokenExpiry, now, claimId);
 
     // Mark agent as verified
     db.prepare("UPDATE agents SET is_verified = 1 WHERE id = ?").run(claim.agent_id);
@@ -365,9 +366,17 @@ class KnowledgeService {
   getClaimByToken(token: string): { agentId: string; claimantName: string; claimantEmail: string } | null {
     const db = getDb();
     const row = db.prepare(
-      "SELECT agent_id, claimant_name, claimant_email FROM agent_claims WHERE claim_token = ? AND status = 'verified'"
+      `SELECT agent_id, claimant_name, claimant_email, claim_token_expires_at
+       FROM agent_claims WHERE claim_token = ? AND status = 'verified'`
     ).get(token) as any;
-    return row ? { agentId: row.agent_id, claimantName: row.claimant_name, claimantEmail: row.claimant_email } : null;
+    if (!row) return null;
+
+    // Reject expired tokens (null expires_at = legacy token, allow for now)
+    if (row.claim_token_expires_at && new Date(row.claim_token_expires_at) < new Date()) {
+      return null;
+    }
+
+    return { agentId: row.agent_id, claimantName: row.claimant_name, claimantEmail: row.claimant_email };
   }
 
   // ─── Resend claim token (lost login) ─────────────
@@ -382,7 +391,8 @@ class KnowledgeService {
     }
 
     const newToken = `claim_${crypto.randomBytes(32).toString("hex")}`;
-    db.prepare("UPDATE agent_claims SET claim_token = ? WHERE id = ?").run(newToken, claim.id);
+    const tokenExpiry = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString();
+    db.prepare("UPDATE agent_claims SET claim_token = ?, claim_token_expires_at = ? WHERE id = ?").run(newToken, tokenExpiry, claim.id);
     return { success: true, claimToken: newToken };
   }
 

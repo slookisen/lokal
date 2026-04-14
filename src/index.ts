@@ -11,6 +11,7 @@ import {
   sanitizeInput,
   corsOptions,
   MAX_REQUEST_SIZE,
+  adminLimiter,
 } from "./middleware/security";
 import producerRoutes from "./routes/producer";
 import consumerRoutes from "./routes/consumer";
@@ -89,6 +90,10 @@ app.use("/api/marketplace/register", registrationLimiter);
 // Search has its own tier
 app.use("/api/marketplace/search", searchLimiter);
 app.use("/api/marketplace/discover", searchLimiter);
+// Admin/destructive endpoints get a strict limiter (10/hour)
+app.use("/api/marketplace/admin", adminLimiter);
+app.delete("/api/marketplace/agents/:id", adminLimiter);
+app.post("/admin/analytics/prune", adminLimiter);
 // Everything else gets the general limiter
 app.use("/api", generalLimiter);
 

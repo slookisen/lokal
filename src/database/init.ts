@@ -274,6 +274,7 @@ function initSchema(db: Database.Database): void {
       verification_code TEXT,                     -- 6-digit code sent to verify
       status TEXT DEFAULT 'pending' CHECK(status IN ('pending','code_sent','verified','rejected','expired')),
       claim_token TEXT,                           -- Token for managing agent after claim
+      claim_token_expires_at TEXT,                -- Token expires 30 days after issue
       notes TEXT,                                 -- Admin notes
       created_at TEXT DEFAULT (datetime('now')),
       verified_at TEXT,
@@ -360,6 +361,15 @@ function initSchema(db: Database.Database): void {
     CREATE INDEX IF NOT EXISTS idx_analytics_agent_views_created ON analytics_agent_views(created_at);
     CREATE INDEX IF NOT EXISTS idx_analytics_agent_views_agent ON analytics_agent_views(agent_id);
   `);
+
+  // ─── Safe migrations for existing databases ─────────────────
+  // SQLite doesn't support ADD COLUMN IF NOT EXISTS, so we catch
+  // the "duplicate column" error and ignore it.
+  try {
+    db.exec(`ALTER TABLE agent_claims ADD COLUMN claim_token_expires_at TEXT`);
+  } catch {
+    // Column already exists — expected after first migration
+  }
 }
 
 export function closeDb(): void {

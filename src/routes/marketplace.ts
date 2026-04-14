@@ -532,7 +532,7 @@ router.put("/agents/:id/knowledge", (req: Request, res: Response) => {
   const claimToken = (req.headers["x-claim-token"] as string) || "";
   const apiKey = (req.headers["x-api-key"] as string) || "";
   const adminKeyHeader = (req.headers["x-admin-key"] as string) || "";
-  const expectedAdminKey = process.env.ADMIN_KEY || "lokal-admin-2026";
+  const expectedAdminKey = process.env.ADMIN_KEY || "";
 
   let authorized = false;
   let isAdmin = false;
@@ -593,7 +593,7 @@ router.put("/agents/:id/knowledge", (req: Request, res: Response) => {
 
 router.post("/admin/bulk-enrich", (req: Request, res: Response) => {
   const adminKey = req.headers["x-admin-key"] as string;
-  const expectedKey = process.env.ADMIN_KEY || "lokal-admin-2026";
+  const expectedKey = process.env.ADMIN_KEY || "";
 
   if (!adminKey || adminKey !== expectedKey) {
     res.status(403).json({ error: "Krever X-Admin-Key header" });
@@ -640,7 +640,7 @@ router.post("/admin/bulk-enrich", (req: Request, res: Response) => {
 
 router.delete("/agents/:id", (req: Request, res: Response) => {
   const adminKey = req.headers["x-admin-key"] as string;
-  const expectedKey = process.env.ADMIN_KEY || "lokal-admin-2026";
+  const expectedKey = process.env.ADMIN_KEY || "";
 
   if (!adminKey || adminKey !== expectedKey) {
     res.status(403).json({ error: "Krever X-Admin-Key header" });
@@ -678,7 +678,7 @@ router.delete("/agents/:id", (req: Request, res: Response) => {
 
 router.post("/admin/deduplicate", (req: Request, res: Response) => {
   const adminKey = req.headers["x-admin-key"] as string;
-  const expectedKey = process.env.ADMIN_KEY || "lokal-admin-2026";
+  const expectedKey = process.env.ADMIN_KEY || "";
 
   if (!adminKey || adminKey !== expectedKey) {
     res.status(403).json({ error: "Krever X-Admin-Key header" });
@@ -781,7 +781,7 @@ router.get("/agents/:id/trust", (req: Request, res: Response) => {
 
 router.post("/admin/recalculate-trust", (req: Request, res: Response) => {
   const adminKey = req.headers["x-admin-key"] as string;
-  const expectedKey = process.env.ADMIN_KEY || "lokal-admin-2026";
+  const expectedKey = process.env.ADMIN_KEY || "";
 
   if (!adminKey || adminKey !== expectedKey) {
     res.status(403).json({ error: "Krever X-Admin-Key header" });

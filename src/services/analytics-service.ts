@@ -476,7 +476,13 @@ export class AnalyticsService {
   } {
     try {
       const db = getDb();
-      const tableName = `analytics_${table === "page_views" ? "page_views" : table === "queries" ? "queries" : "agent_views"}`;
+      const tableMap: Record<string, string> = {
+        page_views: "analytics_page_views",
+        queries: "analytics_queries",
+        agent_views: "analytics_agent_views",
+      };
+      const tableName = tableMap[table];
+      if (!tableName) throw new Error("Invalid analytics table");
 
       const countResult = db.prepare(`SELECT COUNT(*) as count FROM ${tableName}`).get() as any;
       const total = countResult.count;
