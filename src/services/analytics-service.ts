@@ -141,17 +141,18 @@ export class AnalyticsService {
    * Place early in middleware stack (after security/CORS but before routes)
    */
   middleware() {
+    const self = this;
     return (req: Request, res: Response, next: NextFunction) => {
       const startTime = Date.now();
 
       // Skip health checks and internal endpoints
-      if (this.options.skipPaths?.some(p => req.path.startsWith(p))) {
+      if (self.options.skipPaths?.some(p => req.path.startsWith(p))) {
         return next();
       }
 
       // Track page views for human visitors (GET requests to main frontend routes)
-      if (this.options.trackPageViews && req.method === "GET") {
-        this.trackPageView(req);
+      if (self.options.trackPageViews && req.method === "GET") {
+        self.trackPageView(req);
       }
 
       // Intercept response to track timing
@@ -160,7 +161,7 @@ export class AnalyticsService {
         const duration = Date.now() - startTime;
 
         // Track API usage and queries
-        if (this.options.trackSearchQueries && req.path.includes("/search")) {
+        if (self.options.trackSearchQueries && req.path.includes("/search")) {
           analyticsService.trackSearchQuery(req, duration);
         }
 
