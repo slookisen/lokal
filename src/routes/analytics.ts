@@ -21,7 +21,7 @@ const router = Router();
 // In production, replace with proper JWT or session auth
 function requireAdminAuth(req: Request, res: Response, next: Function): void {
   const apiKey = req.get("X-Admin-Key") || req.query.key;
-  const expectedKey = process.env.ADMIN_API_KEY || "lokal-admin-default";
+  const expectedKey = process.env.ANALYTICS_ADMIN_KEY || process.env.ADMIN_API_KEY || "lokal-admin-default";
 
   if (!apiKey || apiKey !== expectedKey) {
     res.status(401).json({ error: "Unauthorized: missing or invalid X-Admin-Key header" });
