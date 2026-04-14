@@ -126,7 +126,7 @@ class OutreachService {
 
       for (const agent of batch) {
         try {
-          const baseUrl = process.env.BASE_URL || "https://lokal.fly.dev";
+          const baseUrl = process.env.BASE_URL || "https://rettfrabonden.com";
           const agentPageUrl = `${baseUrl}/api/marketplace/agents/${agent.id}/info`;
           const sellerName = this.extractFriendlyName(agent.name);
 

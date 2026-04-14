@@ -3,6 +3,8 @@ import { marketplaceRegistry } from "../services/marketplace-registry";
 import { AgentRegistrationSchema, DiscoveryQuerySchema } from "../models/marketplace";
 import { interactionLogger } from "../services/interaction-logger";
 import { knowledgeService } from "../services/knowledge-service";
+import { getDb } from "../database/init";
+import { emailService } from "../services/email-service";
 import { trustScoreService } from "../services/trust-score-service";
 
 // ─── Marketplace Routes ───────────────────────────────────────
@@ -16,6 +18,49 @@ import { trustScoreService } from "../services/trust-score-service";
 // AI agents (ChatGPT, Claude, Gemini plugins) will call.
 
 const router = Router();
+
+// ─── Ensure agent exists in SQLite for FK constraints ───────
+// The marketplace registry keeps agents in-memory (loaded from seed/discovery).
+// But agent_claims has a FOREIGN KEY to agents(id). If the agent only exists
+// in the registry but not in SQLite, the claim INSERT fails.
+// This function ensures the agent row exists before any FK-dependent operation.
+function ensureAgentInDb(agentId: string): boolean {
+  const db = getDb();
+  const exists = db.prepare("SELECT 1 FROM agents WHERE id = ?").get(agentId);
+  if (exists) return true;
+
+  // Try to get from registry and insert
+  const agents = marketplaceRegistry.getActiveAgents();
+  const agent = agents.find((a: any) => a.id === agentId);
+  if (!agent) return false;
+
+  try {
+    db.prepare(`
+      INSERT OR IGNORE INTO agents (id, name, description, provider, contact_email, url, role, api_key, lat, lng, city, categories, trust_score, is_active, is_verified)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?)
+    `).run(
+      agent.id,
+      agent.name,
+      agent.description || "",
+      agent.provider || "auto-discovered",
+      agent.contactEmail || agent.contact_email || "ukjent@rettfrabonden.com",
+      agent.url || `https://rettfrabonden.com/produsent/${agent.id}`,
+      agent.role || "producer",
+      agent.apiKey || agent.api_key || `auto_${agent.id}`,
+      agent.location?.lat || agent.lat || null,
+      agent.location?.lng || agent.lng || null,
+      agent.city || agent.location?.city || null,
+      JSON.stringify(agent.categories || []),
+      agent.trustScore || agent.trust_score || 0.5,
+      agent.isVerified || agent.is_verified || 0
+    );
+    console.log(`[claim] Synced agent ${agent.id} (${agent.name}) to SQLite for FK`);
+    return true;
+  } catch (err) {
+    console.error(`[claim] Failed to sync agent ${agentId} to SQLite:`, err);
+    return false;
+  }
+}
 
 // ─── Helpers: contact block + vCard ──────────────────────────
 // Used by /search, /discover (via enrichment) and /vcard endpoint.
@@ -401,10 +446,16 @@ router.get("/knowledge/stats", (_req: Request, res: Response) => {
 
 // ─── POST /agents/:id/claim — Request to claim an agent ─────
 
-router.post("/agents/:id/claim", (req: Request, res: Response) => {
+router.post("/agents/:id/claim", async (req: Request, res: Response) => {
   const { name, email, phone } = req.body;
   if (!name || !email) {
     res.status(400).json({ success: false, error: "Navn og e-post er påkrevd" });
+    return;
+  }
+
+  // Ensure the agent exists in SQLite before creating a claim (FK constraint)
+  if (!ensureAgentInDb(req.params.id)) {
+    res.status(404).json({ success: false, error: "Agent ikke funnet" });
     return;
   }
 
@@ -415,17 +466,28 @@ router.post("/agents/:id/claim", (req: Request, res: Response) => {
       claimantPhone: phone,
     });
 
-    // TODO: Send verification code via email (e.g. Resend, SendGrid)
-    // Until email is implemented, we return the code in the response.
-    // When email is live, remove verificationCode from the response
-    // and only send it to the claimant's email address.
+    // Get agent name for the email
+    const agents = marketplaceRegistry.getActiveAgents();
+    const agent = agents.find((a: any) => a.id === req.params.id);
+    const agentName = agent?.name || "Ukjent produsent";
+
+    // Send verification code via email (graceful fallback if SMTP not configured)
+    const emailResult = await emailService.sendVerificationCode(email, result.verificationCode, agentName);
+
+    // Build response — include code in dev/dry-run mode, hide in production
+    const responseData: any = { claimId: result.claimId };
+    if (emailResult.messageId === "DRY_RUN") {
+      // SMTP not configured — return code in response so dev/testing still works
+      responseData.verificationCode = result.verificationCode;
+      responseData._note = "E-post ikke konfigurert. Koden vises kun i testmodus.";
+    }
+
     res.json({
       success: true,
-      message: "Verifiseringskode sendt. Bruk /claim/verify for å fullføre.",
-      data: {
-        claimId: result.claimId,
-        verificationCode: result.verificationCode,
-      },
+      message: emailResult.messageId === "DRY_RUN"
+        ? "Verifiseringskode generert (e-post ikke aktiv ennå)."
+        : `Verifiseringskode sendt til ${email}.`,
+      data: responseData,
     });
   } catch (err: any) {
     res.status(400).json({ success: false, error: err.message });

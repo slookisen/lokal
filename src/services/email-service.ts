@@ -59,8 +59,8 @@ export class EmailService {
     agentPageUrl: string
   ): Promise<{ success: boolean; messageId?: string; error?: string }> {
     try {
-      const unsubscribeLink = `${process.env.APP_URL || 'https://lokal.fly.dev'}/unsubscribe?email=${encodeURIComponent(sellerEmail)}&agent=${agentId}`;
-      const claimUrl = `${process.env.APP_URL || 'https://lokal.fly.dev'}/agent/${agentId}/claim`;
+      const unsubscribeLink = `${process.env.APP_URL || 'https://rettfrabonden.com'}/unsubscribe?email=${encodeURIComponent(sellerEmail)}&agent=${agentId}`;
+      const claimUrl = `${process.env.APP_URL || 'https://rettfrabonden.com'}/agent/${agentId}/claim`;
 
       const subject = `Lokal — Vi har funnet deg og dine produkter!`;
 

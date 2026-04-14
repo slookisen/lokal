@@ -57,8 +57,9 @@ const PORT = process.env.PORT || 3000;
 // "true" = trust the first proxy hop, which is Fly's edge.
 app.set("trust proxy", true);
 
-// --- www ? apex redirect ------------------------------------
+// ─── www → apex redirect ────────────────────────────────────
 // Canonical domain is rettfrabonden.com (no www).
+// Redirect early, before any other processing.
 app.use((req, res, next) => {
   if (req.hostname === "www.rettfrabonden.com") {
     return res.redirect(301, `https://rettfrabonden.com${req.originalUrl}`);
