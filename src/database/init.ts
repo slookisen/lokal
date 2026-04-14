@@ -281,6 +281,49 @@ function initSchema(db: Database.Database): void {
     );
 
     -- ════════════════════════════════════════════════════════════
+    -- ANALYTICS: Human visitor tracking (privacy-first)
+    -- Tracks page views with referrer source inference
+    -- ════════════════════════════════════════════════════════════
+    CREATE TABLE IF NOT EXISTS analytics_page_views (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      path TEXT NOT NULL,                          -- /sok, /oslo, /produsent/xyz
+      referrer TEXT,                               -- HTTP referrer (full URL)
+      source TEXT DEFAULT 'unknown',               -- 'direct','organic','search','social','referral'
+      user_agent_hash TEXT,                        -- Hashed UA (privacy-safe, no full UA)
+      session_id TEXT,                             -- Cookies-based session tracking
+      created_at TEXT DEFAULT (datetime('now'))
+    );
+
+    -- ════════════════════════════════════════════════════════════
+    -- ANALYTICS: AI agent queries (A2A, MCP, API, search)
+    -- Every query by ChatGPT, Claude, or API clients
+    -- ════════════════════════════════════════════════════════════
+    CREATE TABLE IF NOT EXISTS analytics_queries (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      protocol TEXT NOT NULL,                      -- 'a2a', 'mcp', 'api', 'search'
+      query TEXT NOT NULL,                         -- What they searched for
+      categories TEXT,                             -- JSON array: ["vegetables","eggs"]
+      city TEXT,                                   -- Geographic filter
+      result_count INTEGER DEFAULT 0,              -- How many results returned
+      response_time_ms INTEGER,                    -- Request latency
+      agent_id TEXT,                               -- Which agent (ChatGPT, Claude, etc.)
+      client_ip_hash TEXT,                         -- Hashed IP (privacy-safe)
+      created_at TEXT DEFAULT (datetime('now'))
+    );
+
+    -- ════════════════════════════════════════════════════════════
+    -- ANALYTICS: Agent profile views (which producers are popular)
+    -- ════════════════════════════════════════════════════════════
+    CREATE TABLE IF NOT EXISTS analytics_agent_views (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      agent_id TEXT NOT NULL,                      -- Producer UUID
+      agent_name TEXT NOT NULL,                    -- Producer name
+      city TEXT,                                   -- Producer's city
+      view_source TEXT DEFAULT 'unknown',          -- 'search','direct','discovery','seo'
+      created_at TEXT DEFAULT (datetime('now'))
+    );
+
+    -- ════════════════════════════════════════════════════════════
     -- INDEXES: Geo bounding-box + common lookups
     -- These make discovery fast without PostGIS
     -- ════════════════════════════════════════════════════════════
@@ -306,6 +349,16 @@ function initSchema(db: Database.Database): void {
     CREATE INDEX IF NOT EXISTS idx_agent_claims_agent ON agent_claims(agent_id);
     CREATE INDEX IF NOT EXISTS idx_agent_claims_status ON agent_claims(status);
     CREATE INDEX IF NOT EXISTS idx_agent_claims_email ON agent_claims(claimant_email);
+
+    -- Analytics indexes (for fast aggregation)
+    CREATE INDEX IF NOT EXISTS idx_analytics_page_views_created ON analytics_page_views(created_at);
+    CREATE INDEX IF NOT EXISTS idx_analytics_page_views_source ON analytics_page_views(source);
+    CREATE INDEX IF NOT EXISTS idx_analytics_page_views_path ON analytics_page_views(path);
+    CREATE INDEX IF NOT EXISTS idx_analytics_queries_created ON analytics_queries(created_at);
+    CREATE INDEX IF NOT EXISTS idx_analytics_queries_protocol ON analytics_queries(protocol);
+    CREATE INDEX IF NOT EXISTS idx_analytics_queries_agent ON analytics_queries(agent_id);
+    CREATE INDEX IF NOT EXISTS idx_analytics_agent_views_created ON analytics_agent_views(created_at);
+    CREATE INDEX IF NOT EXISTS idx_analytics_agent_views_agent ON analytics_agent_views(agent_id);
   `);
 }
 
