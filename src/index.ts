@@ -20,6 +20,8 @@ import reservationRoutes from "./routes/reservation";
 import marketplaceRoutes from "./routes/marketplace";
 import mcpRoutes from "./routes/mcp";
 import seoRoutes from "./routes/seo";
+import { analyticsService } from "./services/analytics-service";
+import analyticsRoutes from "./routes/analytics";
 import { seedData } from "./seed";
 import { seedOsloRealData } from "./seed-oslo-real";
 import { seedMarketplace } from "./seed-marketplace";
@@ -73,6 +75,9 @@ app.use(cors(corsOptions));
 app.use(express.json({ limit: MAX_REQUEST_SIZE }));
 app.use(sanitizeInput);
 
+// Analytics middleware (before routes, after security)
+app.use(analyticsService.middleware());
+
 // Serve the marketplace dashboard
 app.use(express.static(path.join(__dirname, "public")));
 
@@ -119,6 +124,9 @@ app.get("/health", (_req, res) => {
     uptime: Math.floor(process.uptime()),
   });
 });
+
+// Analytics admin endpoints
+app.use("/admin/analytics", analyticsRoutes);
 
 // SEO pages LAST — /:city is a catch-all wildcard
 app.use("/", seoRoutes);
