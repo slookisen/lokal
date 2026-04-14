@@ -488,9 +488,8 @@ router.get("/", (_req: Request, res: Response) => {
           <p>Sp\u00f8r ChatGPT eller Claude \u00abhvor finner jeg ferske gr\u00f8nnsaker i Oslo?\u00bb \u2014 de finner svaret her. Velg din plattform:</p>
           <div class="ai-logos">
             <a href="https://chatgpt.com/g/g-69dbf8593c1c81919050f8da98cd327d-lokal-norsk-matfinner" target="_blank" rel="noopener" class="ai-logo" title="\u00c5pne Lokal Norsk Matfinner i ChatGPT">&#128172; ChatGPT</a>
-            <a href="https://smithery.ai/server/@slookisen/lokal" target="_blank" rel="noopener" class="ai-logo" title="Installer Lokal MCP-server for Claude Desktop">&#128268; Claude MCP</a>
-            <a href="${BASE_URL}/mcp" target="_blank" rel="noopener" class="ai-logo" title="MCP HTTP-endepunkt for alle AI-klienter">&#127760; MCP API</a>
-            <a href="${BASE_URL}/.well-known/agent-card.json" target="_blank" rel="noopener" class="ai-logo" title="A2A Agent Card for agent-til-agent-kommunikasjon">&#129302; A2A</a>
+            <a href="https://www.npmjs.com/package/lokal-mcp" target="_blank" rel="noopener" class="ai-logo" title="Installer lokal-mcp for Claude Desktop">&#128268; Claude MCP</a>
+            <a href="https://github.com/slookisen/lokal" target="_blank" rel="noopener" class="ai-logo" title="Se kildekoden p\u00e5 GitHub">\u2B50 GitHub</a>
           </div>
         </div>
       </div>
