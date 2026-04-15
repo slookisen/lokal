@@ -565,8 +565,8 @@
           </p>
           <ol style="font-size: 0.9rem; color: var(--gray-600); margin: 0 0 1rem 1.25rem; line-height: 1.8;">
             <li>&Aring;pne <a href="https://claude.ai" target="_blank" rel="noopener" style="color: var(--green); font-weight: 600;">Claude</a> eller <a href="https://chat.openai.com" target="_blank" rel="noopener" style="color: var(--green); font-weight: 600;">ChatGPT</a></li>
-            <li>Last opp bildet ditt og skriv: <em>&laquo;List opp alle produkter med priser fra dette bildet&raquo;</em></li>
-            <li>G&aring; til <strong>Produkter</strong>-fanen og legg dem inn</li>
+            <li>Last opp bildet ditt og skriv: <em>&laquo;List alle produkter med priser. Format: Navn | Kategori | Pris | Sesong&raquo;</em></li>
+            <li>Kopier svaret og lim inn i <strong>Produkter</strong>-fanen under &laquo;Lim inn mange produkter samtidig&raquo;</li>
           </ol>
           <p style="font-size: 0.8rem; color: var(--gray-500);">
             Produktene du legger til blir synlige for AI-assistenter som anbefaler deg til kunder.
@@ -591,12 +591,28 @@
           </div>
           <p style="font-size: 0.85rem; color: var(--gray-500); margin-bottom: 1rem;">
             Produktene dine blir synlige for AI-assistenter som hjelper kunder med &aring; finne lokal mat.
-            Jo flere detaljer (pris, sesong, &oslash;kologisk), jo bedre kan agenten din svare.
-            <strong>Tips:</strong> G&aring; til Bilder-fanen for &aring; laste opp bilde av pristavlen &mdash; da legger vi til produkter automatisk.
+            Jo flere detaljer (pris, sesong), jo bedre kan agenten din svare.
           </p>
           <ul class="product-list" id="productList">
             <li style="text-align: center; color: var(--gray-500); padding: 2rem;" data-i18n="no_products">Ingen produkter lagt til enn&aring;</li>
           </ul>
+        </div>
+
+        <!-- Bulk paste from AI -->
+        <div class="card" style="margin-top: 1rem; background: var(--cream);">
+          <h3 style="margin-bottom: 0.5rem;">Lim inn mange produkter samtidig</h3>
+          <p style="font-size: 0.85rem; color: var(--gray-600); margin-bottom: 0.75rem;">
+            Kopier produktlisten fra <a href="https://claude.ai" target="_blank" rel="noopener" style="color: var(--green); font-weight: 600;">Claude</a> eller <a href="https://chat.openai.com" target="_blank" rel="noopener" style="color: var(--green); font-weight: 600;">ChatGPT</a> og lim inn under. &Eacute;tt produkt per linje.
+          </p>
+          <div style="font-size: 0.8rem; color: var(--gray-500); margin-bottom: 0.75rem; padding: 0.5rem 0.75rem; background: var(--white); border-radius: var(--radius); border: 1px dashed var(--gray-300);">
+            <strong>Format:</strong> Produktnavn | Kategori | Pris | Sesong<br>
+            <span style="color: var(--gray-400);">Eksempel: Gulr&oslash;tter | Gr&oslash;nnsaker | 35kr/kg | Jun-Okt</span>
+          </div>
+          <textarea id="bulkProductInput" rows="6" placeholder="Gulr&oslash;tter | Gr&oslash;nnsaker | 35kr/kg | Jun-Okt&#10;Honning 500g | Honning | 120kr | &Aring;ret rundt&#10;Jordb&aelig;r | B&aelig;r | 60kr/kurv | Jun-Jul" style="width: 100%; font-size: 0.9rem; font-family: monospace; line-height: 1.6;"></textarea>
+          <div style="margin-top: 0.75rem; display: flex; gap: 0.5rem; align-items: center;">
+            <button class="btn btn-primary btn-small" id="btnParseBulk">Legg til alle produkter</button>
+            <span id="bulkResult" style="font-size: 0.85rem; color: var(--green);"></span>
+          </div>
         </div>
       </div>
 
@@ -1609,6 +1625,138 @@
         showAlert('dashAlert', err.message, 'error');
       }
     }
+
+    // ── Bulk product paste parser ──
+    var categoryMap = {
+      'grønnsaker': 'vegetables', 'grønnsak': 'vegetables', 'gronn': 'vegetables',
+      'frukt': 'fruit', 'bær': 'berries', 'baer': 'berries',
+      'honning': 'honey', 'kjøtt': 'meat', 'kjott': 'meat',
+      'fisk': 'fish', 'sjømat': 'fish', 'sjomat': 'fish',
+      'meieri': 'dairy', 'melk': 'dairy', 'ost': 'dairy', 'smør': 'dairy',
+      'egg': 'eggs', 'bakst': 'bakery', 'brød': 'bakery', 'brod': 'bakery',
+      'urter': 'herbs', 'krydder': 'herbs',
+      'syltetøy': 'preserves', 'syltetoy': 'preserves', 'safting': 'preserves', 'saft': 'preserves',
+      'drikke': 'beverages', 'juice': 'beverages', 'cider': 'beverages',
+      'annet': 'other'
+    };
+
+    function guessCategory(text) {
+      var lower = text.toLowerCase();
+      for (var key in categoryMap) {
+        if (lower.indexOf(key) >= 0) return categoryMap[key];
+      }
+      return 'other';
+    }
+
+    function parseMonthRange(text) {
+      if (!text) return [];
+      var monthNames = { 'jan': 1, 'feb': 2, 'mar': 3, 'apr': 4, 'mai': 5, 'jun': 6,
+                         'jul': 7, 'aug': 8, 'sep': 9, 'okt': 10, 'nov': 11, 'des': 12,
+                         'hele året': 0, 'året rundt': 0, 'year round': 0, 'all year': 0 };
+      var lower = text.toLowerCase().trim();
+      if (lower === 'hele året' || lower === 'året rundt' || lower === 'year round' || lower === 'all year') {
+        return [1,2,3,4,5,6,7,8,9,10,11,12];
+      }
+      var months = [];
+      var parts = lower.split(/[-–]/);
+      if (parts.length === 2) {
+        var start = 0, end = 0;
+        for (var mn in monthNames) {
+          if (parts[0].trim().indexOf(mn) >= 0) start = monthNames[mn];
+          if (parts[1].trim().indexOf(mn) >= 0) end = monthNames[mn];
+        }
+        if (start && end) {
+          for (var m = start; m !== ((end % 12) + 1); m = (m % 12) + 1) {
+            months.push(m);
+            if (months.length > 12) break;
+          }
+          months.push(end);
+        }
+      }
+      // Deduplicate
+      return months.filter(function(v, i, a) { return a.indexOf(v) === i; });
+    }
+
+    document.getElementById('btnParseBulk').addEventListener('click', function() {
+      var input = document.getElementById('bulkProductInput').value.trim();
+      if (!input) return;
+
+      var lines = input.split('\n').filter(function(l) { return l.trim().length > 0; });
+      var added = 0;
+
+      lines.forEach(function(line) {
+        // Support multiple formats:
+        // "Name | Category | Price | Season"
+        // "Name - Price"
+        // "Name (price)"
+        // Just "Name"
+        var parts = line.split(/\s*\|\s*/);
+        var name, category, price, season;
+
+        if (parts.length >= 2) {
+          // Pipe-delimited
+          name = parts[0].trim();
+          category = parts.length >= 2 ? parts[1].trim() : '';
+          price = parts.length >= 3 ? parts[2].trim() : '';
+          season = parts.length >= 4 ? parts[3].trim() : '';
+        } else {
+          // Try "Name - Price" or "Name (price)" or just name
+          var dashMatch = line.match(/^(.+?)\s*[-–]\s*(\d[\d\s]*(?:kr|,-|nok)[^|]*?)(?:\s*[-–]\s*(.+))?$/i);
+          var parenMatch = line.match(/^(.+?)\s*\(([^)]+)\)/);
+          if (dashMatch) {
+            name = dashMatch[1].trim();
+            price = dashMatch[2].trim();
+            season = dashMatch[3] ? dashMatch[3].trim() : '';
+          } else if (parenMatch) {
+            name = parenMatch[1].trim();
+            price = parenMatch[2].trim();
+          } else {
+            name = line.trim();
+          }
+          category = '';
+        }
+
+        if (!name) return;
+
+        // Remove leading bullets, numbers, dashes
+        name = name.replace(/^[\s\-\*\•\d\.]+\s*/, '');
+        if (!name) return;
+
+        // Guess category from name or explicit category text
+        var catKey = guessCategory(category || name);
+
+        // Check for duplicates
+        var exists = state.products.some(function(p) {
+          return p.name.toLowerCase() === name.toLowerCase();
+        });
+        if (exists) return;
+
+        state.products.push({
+          name: name,
+          category: catKey,
+          price: price || '',
+          priceUnit: 'kr',
+          organic: false,
+          seasonal: parseMonthRange(season).length > 0 && parseMonthRange(season).length < 12,
+          seasonMonths: parseMonthRange(season)
+        });
+        added++;
+      });
+
+      if (added > 0) {
+        saveProducts();
+        document.getElementById('bulkProductInput').value = '';
+        document.getElementById('bulkResult').textContent = added + ' produkt' + (added > 1 ? 'er' : '') + ' lagt til!';
+        setTimeout(function() { document.getElementById('bulkResult').textContent = ''; }, 4000);
+      } else {
+        document.getElementById('bulkResult').textContent = 'Ingen nye produkter funnet. Sjekk formatet.';
+        document.getElementById('bulkResult').style.color = 'var(--red, #b91c1c)';
+        setTimeout(function() {
+          document.getElementById('bulkResult').textContent = '';
+          document.getElementById('bulkResult').style.color = 'var(--green)';
+        }, 4000);
+      }
+    });
 
     function buildMonthCheckboxes(selected) {
       var container = document.getElementById('prodMonths');
