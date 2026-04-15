@@ -80,7 +80,7 @@ app.use(sanitizeInput);
 app.use(analyticsService.middleware());
 
 // Serve the marketplace dashboard
-app.use(express.static(path.join(__dirname, "public")));
+app.use(express.static(path.join(__dirname, "public"), { extensions: ["html"] }));
 
 // ─── Rate-limited routes ─────────────────────────────────────
 // JSON-RPC gets its own limiter (agents are chatty)
