@@ -208,10 +208,9 @@ function shell(title: string, description: string, content: string, extra?: { ca
   <nav class="nav">
     <a href="/" class="nav-logo"><div class="nav-icon">&#127793;</div> Rett fra Bonden</a>
     <div class="nav-links">
-      <a href="/oslo">Oslo</a>
-      <a href="/bergen">Bergen</a>
-      <a href="/trondheim">Trondheim</a>
-      <a href="/stavanger">Stavanger</a>
+      <a href="/sok">S\u00f8k</a>
+      <a href="/teknologi">Hvordan det fungerer</a>
+      <a href="/om">Om oss</a>
       <a href="/selger" class="nav-cta">For produsenter</a>
     </div>
   </nav>
@@ -220,19 +219,19 @@ function shell(title: string, description: string, content: string, extra?: { ca
     <div class="ft-inner">
       <div>
         <div class="ft-brand">Rett fra Bonden</div>
-        <div class="ft-desc">Norges st\u00f8rste katalog for lokal mat. Vi kobler matprodusenter med kunder \u2014 direkte, uten mellomledd.</div>
+        <div class="ft-desc">Norges f\u00f8rste agent-til-agent (A2A) nettverk for lokal mat. Vi gj\u00f8r matprodusenter synlige for AI-assistenter \u2014 s\u00e5 kundene finner deg n\u00e5r de sp\u00f8r.</div>
       </div>
       <div class="ft-col">
-        <h4>Utforsk</h4>
-        <a href="/oslo">Oslo</a><a href="/bergen">Bergen</a><a href="/trondheim">Trondheim</a><a href="/stavanger">Stavanger</a>
+        <h4>Plattformen</h4>
+        <a href="/sok">S\u00f8k produsenter</a><a href="/teknologi">Hvordan det fungerer</a><a href="/om">Om Rett fra Bonden</a>
       </div>
       <div class="ft-col">
         <h4>For produsenter</h4>
-        <a href="/selger">Registrer deg</a><a href="/selger">Logg inn</a><a href="/api/marketplace/search?q=mat">API</a>
+        <a href="/selger">Registrer deg</a><a href="/selger">Logg inn</a>
       </div>
       <div class="ft-col">
-        <h4>Om oss</h4>
-        <a href="/om">V\u00e5r historie</a><a href="/teknologi">Hvordan det fungerer</a><a href="https://github.com/slookisen/lokal">GitHub</a>
+        <h4>For utviklere</h4>
+        <a href="/api/marketplace/search?q=mat">API</a><a href="https://github.com/slookisen/lokal">GitHub</a><a href="https://smithery.ai/servers/slookisen/lokal">MCP Server</a>
       </div>
     </div>
     <div class="ft-bottom">Rett fra Bonden &copy; ${new Date().getFullYear()}. Gj\u00f8r matprodusenter synlige i hele Norge.</div>
@@ -888,6 +887,7 @@ const PROFILE_CSS = `
   .prod-item { display: flex; align-items: center; justify-content: space-between; padding: 10px 14px; background: var(--g100); border-radius: var(--r-md); transition: background 0.2s; }
   .prod-item:hover { background: var(--green-50); }
   .prod-name { font-weight: 600; font-size: 0.88rem; }
+  .prod-price { font-size: 0.8rem; color: #2d5f2e; font-weight: 600; white-space: nowrap; }
   .prod-meta { display: flex; align-items: center; gap: 5px; }
   .prod-season { font-size: 0.7rem; color: var(--g500); background: var(--white); padding: 2px 7px; border-radius: 10px; }
   .prod-org { font-size: 0.66rem; font-weight: 700; color: var(--green-700); background: var(--green-100); padding: 2px 7px; border-radius: 10px; }
@@ -963,10 +963,12 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
     // Products
     const productsHtml = k.products?.length
       ? k.products.map((p: any) => {
-          const seasonal = p.seasonal && p.months?.length
-            ? `<span class="prod-season">${p.months.map((m: number) => MONTH_NAMES[m] || m).join("\u2013")}</span>` : "";
+          const months = p.months || p.seasonMonths || [];
+          const seasonal = p.seasonal && months.length
+            ? `<span class="prod-season">${months.map((m: number) => MONTH_NAMES[m] || m).join("\u2013")}</span>` : "";
           const org = p.organic ? `<span class="prod-org">&#127793; \u00d8ko</span>` : "";
-          return `<div class="prod-item"><span class="prod-name">${escapeHtml(p.name)}</span><div class="prod-meta">${seasonal}${org}</div></div>`;
+          const price = p.price ? `<span class="prod-price">${escapeHtml(String(p.price))}${p.priceUnit && p.priceUnit !== 'kr' ? ' ' + escapeHtml(p.priceUnit) : ''}</span>` : "";
+          return `<div class="prod-item"><span class="prod-name">${escapeHtml(p.name)}</span>${price}<div class="prod-meta">${seasonal}${org}</div></div>`;
         }).join("") : "";
 
     // Opening hours
