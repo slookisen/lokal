@@ -227,29 +227,138 @@ class MarketplaceRegistry {
     }
     if (detectedTags.length > 0) parsed.tags = detectedTags;
 
-    const districts: Record<string, { lat: number; lng: number }> = {
-      "grÃ¼nerlÃ¸kka": { lat: 59.9225, lng: 10.7584 },
-      "grÃ¸nland": { lat: 59.9127, lng: 10.7600 },
-      "majorstuen": { lat: 59.9288, lng: 10.7136 },
-      "frogner": { lat: 59.9201, lng: 10.7004 },
-      "bygdÃ¸y": { lat: 59.9033, lng: 10.6850 },
-      "storo": { lat: 59.9466, lng: 10.7718 },
-      "sagene": { lat: 59.9375, lng: 10.7517 },
-      "torshov": { lat: 59.9375, lng: 10.7600 },
-      "oslo sentrum": { lat: 59.9139, lng: 10.7522 },
-      "oslo": { lat: 59.9139, lng: 10.7522 },
-      "vulkan": { lat: 59.9225, lng: 10.7515 },
-      "mathallen": { lat: 59.9225, lng: 10.7515 },
-      "tÃ¸yen": { lat: 59.9165, lng: 10.7720 },
-      "vÃ¥lerenga": { lat: 59.9073, lng: 10.7820 },
-      "skÃ¸yen": { lat: 59.9208, lng: 10.6797 },
+    // Norwegian cities & regions (radius in km) + Oslo districts (tighter radius)
+    const locations: Record<string, { lat: number; lng: number; radius: number }> = {
+      // ── Major cities ──
+      "oslo": { lat: 59.9139, lng: 10.7522, radius: 25 },
+      "bergen": { lat: 60.3913, lng: 5.3221, radius: 30 },
+      "trondheim": { lat: 63.4305, lng: 10.3951, radius: 30 },
+      "stavanger": { lat: 58.9700, lng: 5.7331, radius: 30 },
+      "tromsø": { lat: 69.6496, lng: 18.9560, radius: 30 },
+      "kristiansand": { lat: 58.1599, lng: 8.0182, radius: 30 },
+      "drammen": { lat: 59.7441, lng: 10.2045, radius: 25 },
+      "fredrikstad": { lat: 59.2181, lng: 10.9298, radius: 25 },
+      "sandnes": { lat: 58.8524, lng: 5.7352, radius: 25 },
+      "bodø": { lat: 67.2804, lng: 14.4049, radius: 40 },
+      "bodo": { lat: 67.2804, lng: 14.4049, radius: 40 },
+      "ålesund": { lat: 62.4722, lng: 6.1495, radius: 30 },
+      "alesund": { lat: 62.4722, lng: 6.1495, radius: 30 },
+      "tønsberg": { lat: 59.2675, lng: 10.4076, radius: 25 },
+      "tonsberg": { lat: 59.2675, lng: 10.4076, radius: 25 },
+      "haugesund": { lat: 59.4138, lng: 5.2680, radius: 25 },
+      "sandefjord": { lat: 59.1314, lng: 10.2166, radius: 25 },
+      "moss": { lat: 59.4346, lng: 10.6588, radius: 20 },
+      "arendal": { lat: 58.4616, lng: 8.7724, radius: 25 },
+      "porsgrunn": { lat: 59.1405, lng: 9.6562, radius: 20 },
+      "skien": { lat: 59.2099, lng: 9.6089, radius: 25 },
+      "sarpsborg": { lat: 59.2839, lng: 11.1096, radius: 25 },
+      "molde": { lat: 62.7375, lng: 7.1591, radius: 30 },
+      "harstad": { lat: 68.7984, lng: 16.5415, radius: 30 },
+      "larvik": { lat: 59.0530, lng: 10.0271, radius: 25 },
+      "halden": { lat: 59.1229, lng: 11.3875, radius: 25 },
+      "kongsberg": { lat: 59.6630, lng: 9.6501, radius: 25 },
+      "lillehammer": { lat: 61.1153, lng: 10.4662, radius: 30 },
+      "gjøvik": { lat: 60.7957, lng: 10.6915, radius: 25 },
+      "gjovik": { lat: 60.7957, lng: 10.6915, radius: 25 },
+      "hamar": { lat: 60.7945, lng: 11.0680, radius: 25 },
+      "kristiansund": { lat: 63.1103, lng: 7.7279, radius: 25 },
+      "hønefoss": { lat: 60.1686, lng: 10.2564, radius: 25 },
+      "honefoss": { lat: 60.1686, lng: 10.2564, radius: 25 },
+      "narvik": { lat: 68.4385, lng: 17.4273, radius: 30 },
+      "alta": { lat: 69.9689, lng: 23.2716, radius: 40 },
+      "hammerfest": { lat: 70.6634, lng: 23.6821, radius: 40 },
+      "mo i rana": { lat: 66.3167, lng: 14.1667, radius: 30 },
+      "elverum": { lat: 60.8831, lng: 11.5615, radius: 25 },
+      "steinkjer": { lat: 64.0149, lng: 11.4955, radius: 25 },
+      "namsos": { lat: 64.4666, lng: 11.4945, radius: 25 },
+      "voss": { lat: 60.6298, lng: 6.4123, radius: 25 },
+      "sogndal": { lat: 61.2297, lng: 7.1037, radius: 30 },
+      "førde": { lat: 61.4519, lng: 5.8571, radius: 30 },
+      "forde": { lat: 61.4519, lng: 5.8571, radius: 30 },
+      "lillestrom": { lat: 59.9550, lng: 11.0493, radius: 20 },
+      "lillestrøm": { lat: 59.9550, lng: 11.0493, radius: 20 },
+      "jessheim": { lat: 60.1467, lng: 11.1760, radius: 20 },
+      "asker": { lat: 59.8371, lng: 10.4348, radius: 20 },
+      "bærum": { lat: 59.8945, lng: 10.5213, radius: 20 },
+      "baerum": { lat: 59.8945, lng: 10.5213, radius: 20 },
+      "ski": { lat: 59.7193, lng: 10.8348, radius: 20 },
+      "røros": { lat: 62.5748, lng: 11.3845, radius: 30 },
+      "roros": { lat: 62.5748, lng: 11.3845, radius: 30 },
+      "lofoten": { lat: 68.2094, lng: 14.5630, radius: 50 },
+      "lier": { lat: 59.7925, lng: 10.2458, radius: 20 },
+      "eidsvoll": { lat: 60.3275, lng: 11.2614, radius: 20 },
+      "geilo": { lat: 60.5345, lng: 8.2060, radius: 25 },
+      "oppdal": { lat: 62.5930, lng: 9.6910, radius: 25 },
+      "lom": { lat: 61.8374, lng: 8.5673, radius: 25 },
+      "grimstad": { lat: 58.3405, lng: 8.5934, radius: 25 },
+      "mandal": { lat: 58.0293, lng: 7.4614, radius: 25 },
+      "flekkefjord": { lat: 58.2970, lng: 6.6630, radius: 25 },
+      "stord": { lat: 59.7792, lng: 5.5000, radius: 25 },
+      "odda": { lat: 60.0688, lng: 6.5455, radius: 25 },
+      "levanger": { lat: 63.7462, lng: 11.2997, radius: 20 },
+      "stjørdal": { lat: 63.4695, lng: 10.9119, radius: 20 },
+      "verdal": { lat: 63.7923, lng: 11.4844, radius: 20 },
+      "svolvær": { lat: 68.2339, lng: 14.5681, radius: 25 },
+      "sortland": { lat: 68.6919, lng: 15.4138, radius: 25 },
+      "finnsnes": { lat: 69.2340, lng: 17.9851, radius: 25 },
+      "kirkenes": { lat: 69.7271, lng: 30.0459, radius: 40 },
+      "honningsvåg": { lat: 70.9813, lng: 25.9706, radius: 30 },
+      "kautokeino": { lat: 69.0118, lng: 23.0406, radius: 40 },
+      "horten": { lat: 59.4167, lng: 10.4833, radius: 20 },
+      "notodden": { lat: 59.5650, lng: 9.2592, radius: 25 },
+      "jæren": { lat: 58.7500, lng: 5.6000, radius: 30 },
+      "hardanger": { lat: 60.3200, lng: 6.8400, radius: 40 },
+      "rogaland": { lat: 58.8000, lng: 5.8000, radius: 50 },
+      "nordland": { lat: 67.0000, lng: 15.0000, radius: 80 },
+      "vestfold": { lat: 59.2000, lng: 10.2000, radius: 40 },
+      "telemark": { lat: 59.2000, lng: 9.0000, radius: 50 },
+      "hedmark": { lat: 61.0000, lng: 11.5000, radius: 60 },
+      "innlandet": { lat: 61.0000, lng: 10.0000, radius: 70 },
+      "vestland": { lat: 60.5000, lng: 6.0000, radius: 60 },
+      "viken": { lat: 59.8000, lng: 10.5000, radius: 40 },
+      "trøndelag": { lat: 63.5000, lng: 10.5000, radius: 70 },
+      "agder": { lat: 58.2000, lng: 8.0000, radius: 50 },
+      // ── Oslo districts (tighter radius) ──
+      "grünerløkka": { lat: 59.9225, lng: 10.7584, radius: 5 },
+      "grunerlokka": { lat: 59.9225, lng: 10.7584, radius: 5 },
+      "grønland": { lat: 59.9127, lng: 10.7600, radius: 5 },
+      "majorstuen": { lat: 59.9288, lng: 10.7136, radius: 5 },
+      "frogner": { lat: 59.9201, lng: 10.7004, radius: 5 },
+      "bygdøy": { lat: 59.9033, lng: 10.6850, radius: 5 },
+      "storo": { lat: 59.9466, lng: 10.7718, radius: 5 },
+      "sagene": { lat: 59.9375, lng: 10.7517, radius: 5 },
+      "torshov": { lat: 59.9375, lng: 10.7600, radius: 5 },
+      "oslo sentrum": { lat: 59.9139, lng: 10.7522, radius: 5 },
+      "vulkan": { lat: 59.9225, lng: 10.7515, radius: 5 },
+      "mathallen": { lat: 59.9225, lng: 10.7515, radius: 5 },
+      "tøyen": { lat: 59.9165, lng: 10.7720, radius: 5 },
+      "vålerenga": { lat: 59.9073, lng: 10.7820, radius: 5 },
+      "skøyen": { lat: 59.9208, lng: 10.6797, radius: 5 },
     };
 
-    for (const [district, coords] of Object.entries(districts)) {
-      if (q.includes(district)) {
-        parsed.location = coords;
-        parsed.maxDistanceKm = 10;
+    // Match longest location name first (e.g. "oslo sentrum" before "oslo")
+    const sortedLocations = Object.entries(locations).sort((a, b) => b[0].length - a[0].length);
+    for (const [name, data] of sortedLocations) {
+      if (q.includes(name)) {
+        parsed.location = { lat: data.lat, lng: data.lng };
+        parsed.maxDistanceKm = data.radius;
         break;
+      }
+    }
+
+    // Fallback: if no location matched from map, check if query matches a city in the database
+    if (!parsed.location) {
+      const db = getDb();
+      const words = q.split(/\s+/).filter(w => w.length >= 2);
+      for (const word of words) {
+        const match = db.prepare(
+          "SELECT lat, lng, city FROM agents WHERE LOWER(city) = ? AND lat IS NOT NULL AND lng IS NOT NULL LIMIT 1"
+        ).get(word) as { lat: number; lng: number; city: string } | undefined;
+        if (match) {
+          parsed.location = { lat: match.lat, lng: match.lng };
+          parsed.maxDistanceKm = 30;
+          break;
+        }
       }
     }
 
