@@ -537,8 +537,8 @@
         <div class="card">
           <h2>Bilder av butikk og produkter</h2>
           <p style="color: var(--gray-500); font-size: 0.9rem; margin-bottom: 1rem;">
-            Last opp bilder av prislistetavler, menyer, produkthyller eller emballasje.
-            <strong>Vi analyserer bildene automatisk</strong> og henter ut produkter med priser &mdash; du slipper &aring; taste alt manuelt.
+            Last opp bilder av butikken din, produkter eller prislistetavler.
+            Bildene vises p&aring; profilen din og hjelper kunder &aring; kjenne deg igjen.
           </p>
 
           <div class="upload-zone" id="imageUploadZone">
@@ -550,36 +550,35 @@
             <input type="file" id="imageFileInput" multiple accept="image/*" style="display: none;" />
           </div>
 
-          <!-- Example hint -->
-          <div style="margin-top: 0.75rem; padding: 0.75rem; background: var(--cream); border-radius: var(--radius); font-size: 0.85rem; color: var(--gray-700);">
-            <strong>Eksempler p&aring; gode bilder:</strong> Pristavle med tekst, meny, produkthylle med prislapper, innpakket produkt med etikett. Jo tydeligere teksten er, jo bedre blir resultatet.
-          </div>
-
           <div class="image-grid" id="imageGrid"></div>
-
-          <div class="hidden" id="imageScanBar" style="margin-top: 0.75rem;">
-            <div style="display: flex; gap: 0.5rem; align-items: center; padding: 0.75rem; background: var(--blue-light); border-radius: var(--radius);">
-              <p style="font-size: 0.85rem; color: var(--blue); flex: 1;">
-                <strong>Har du pristavle eller meny p&aring; bildet?</strong> Vi kan hjelpe deg &aring; hente ut produkter og priser.
-              </p>
-              <button class="btn btn-primary btn-small" id="btnScanImages">Hent produktinfo</button>
-            </div>
-          </div>
 
           <div style="margin-top: 1rem;">
             <button class="btn btn-primary" id="btnSaveImages">Lagre bilder</button>
           </div>
         </div>
 
-        <!-- Extracted products preview -->
-        <div class="card hidden" id="extractedProductsCard">
-          <h2>Produkter funnet i bilder</h2>
-          <p style="color: var(--gray-500); font-size: 0.9rem; margin-bottom: 1rem;">Vi fant disse produktene. Velg hvilke du vil legge til i produktkatalogen din.</p>
+        <!-- AI product extraction guide -->
+        <div class="card" style="margin-top: 1rem; background: var(--cream);">
+          <h3 style="margin-bottom: 0.5rem;">Legg til produkter raskt med AI</h3>
+          <p style="font-size: 0.9rem; color: var(--gray-600); margin-bottom: 1rem;">
+            Har du bilde av pristavle, meny eller produkthylle? La en AI lese ut produktene for deg:
+          </p>
+          <ol style="font-size: 0.9rem; color: var(--gray-600); margin: 0 0 1rem 1.25rem; line-height: 1.8;">
+            <li>&Aring;pne <a href="https://claude.ai" target="_blank" rel="noopener" style="color: var(--green); font-weight: 600;">Claude</a> eller <a href="https://chat.openai.com" target="_blank" rel="noopener" style="color: var(--green); font-weight: 600;">ChatGPT</a></li>
+            <li>Last opp bildet ditt og skriv: <em>&laquo;List opp alle produkter med priser fra dette bildet&raquo;</em></li>
+            <li>G&aring; til <strong>Produkter</strong>-fanen og legg dem inn</li>
+          </ol>
+          <p style="font-size: 0.8rem; color: var(--gray-500);">
+            Produktene du legger til blir synlige for AI-assistenter som anbefaler deg til kunder.
+          </p>
+        </div>
+        <!-- Hidden elements for backward compatibility -->
+        <div class="hidden" id="imageScanBar"></div>
+        <div class="hidden" id="extractedProductsCard">
           <div id="extractedProductsList"></div>
-          <div style="margin-top: 1rem; display: flex; gap: 0.5rem;">
-            <button class="btn btn-primary btn-small" id="btnAddExtracted">Legg til valgte produkter</button>
-            <button class="btn btn-secondary btn-small" id="btnDismissExtracted">Avbryt</button>
-          </div>
+          <button class="hidden" id="btnScanImages"></button>
+          <button class="hidden" id="btnAddExtracted"></button>
+          <button class="hidden" id="btnDismissExtracted"></button>
         </div>
       </div>
 
@@ -620,23 +619,50 @@
       <div class="tab-panel" id="panel-settings">
         <div class="card">
           <h2 data-i18n="settings_title">Innstillinger</h2>
+
           <div class="form-group">
-            <label data-i18n="claim_token_label">Ditt claim-token (lagre dette!)</label>
-            <input type="text" id="settingsToken" readonly style="background: var(--gray-100); font-family: monospace; font-size: 0.8rem;" />
-            <p class="form-hint" data-i18n="token_hint">Du trenger dette tokenet for å logge inn igjen. Kopier og lagre det trygt.</p>
+            <label>Innlogging</label>
+            <p style="font-size: 0.9rem; color: var(--gray-600);">Du logger inn med e-postlenke. Trykk "Logg inn" på selger-siden og skriv inn e-posten din.</p>
           </div>
+
           <div class="form-group">
             <label data-i18n="agent_id_label">Agent ID</label>
             <input type="text" id="settingsAgentId" readonly style="background: var(--gray-100); font-family: monospace; font-size: 0.8rem;" />
           </div>
+
           <div class="form-group">
-            <label data-i18n="api_url_label">API-endepunkter</label>
+            <label data-i18n="api_url_label">API-endepunkter (for utviklere)</label>
             <div style="background: var(--gray-100); padding: 0.75rem; border-radius: var(--radius); font-family: monospace; font-size: 0.75rem; line-height: 1.8; word-break: break-all;">
               <div>GET <span id="settingsInfoUrl"></span></div>
               <div>PUT <span id="settingsKnowledgeUrl"></span></div>
             </div>
           </div>
         </div>
+
+        <!-- Danger zone -->
+        <div class="card" style="margin-top: 1rem; border: 1px solid #e8c4c4;">
+          <h3 style="color: #b91c1c; margin-bottom: 0.5rem;">Farlig sone</h3>
+          <p style="font-size: 0.85rem; color: var(--gray-600); margin-bottom: 1rem;">
+            Disse handlingene kan ikke angres.
+          </p>
+          <div style="display: flex; flex-direction: column; gap: 0.75rem;">
+            <div style="display: flex; justify-content: space-between; align-items: center; padding: 0.75rem; background: var(--gray-50); border-radius: var(--radius);">
+              <div>
+                <strong style="font-size: 0.9rem;">Frasig eierskap</strong>
+                <p style="font-size: 0.8rem; color: var(--gray-500); margin: 0;">Agenten blir tilgjengelig for andre å gjøre krav på.</p>
+              </div>
+              <button class="btn btn-secondary btn-small" id="btnUnclaim" style="border-color: #b91c1c; color: #b91c1c; white-space: nowrap;">Frasig eierskap</button>
+            </div>
+            <div style="display: flex; justify-content: space-between; align-items: center; padding: 0.75rem; background: var(--gray-50); border-radius: var(--radius);">
+              <div>
+                <strong style="font-size: 0.9rem;">Meld butikk som nedlagt</strong>
+                <p style="font-size: 0.8rem; color: var(--gray-500); margin: 0;">Agenten merkes som inaktiv og fjernes fra søkeresultater.</p>
+              </div>
+              <button class="btn btn-secondary btn-small" id="btnDeactivate" style="border-color: #b91c1c; color: #b91c1c; white-space: nowrap;">Meld nedlagt</button>
+            </div>
+          </div>
+        </div>
+        <input type="hidden" id="settingsToken" />
       </div>
     </div>
   </div>
@@ -1169,6 +1195,52 @@
       hide('btnLogout');
     });
 
+    // ── Unclaim (give up ownership) ──
+    document.getElementById('btnUnclaim').addEventListener('click', async function() {
+      if (!confirm('Er du sikker på at du vil frasige deg eierskapet til denne agenten? Handlingen kan ikke angres.')) return;
+      this.disabled = true;
+      try {
+        var res = await fetch(API + '/agents/' + state.agentId + '/unclaim', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', 'X-Claim-Token': state.claimToken }
+        });
+        var data = await res.json();
+        if (data.success) {
+          clearSession();
+          state.claimToken = null;
+          state.agentId = null;
+          show('viewClaim');
+          hide('viewDashboard');
+          hide('btnLogout');
+          showAlert('claimAlert', 'Eierskap frasagt. Agenten er nå tilgjengelig for andre.', 'info');
+        } else {
+          alert(data.error || 'Noe gikk galt');
+        }
+      } catch (err) { alert('Feil: ' + err.message); }
+      this.disabled = false;
+    });
+
+    // ── Deactivate (mark business as closed) ──
+    document.getElementById('btnDeactivate').addEventListener('click', async function() {
+      if (!confirm('Er du sikker på at du vil melde butikken som nedlagt? Agenten fjernes fra søkeresultater.')) return;
+      this.disabled = true;
+      try {
+        var res = await fetch(API + '/agents/' + state.agentId + '/knowledge', {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json', 'X-Claim-Token': state.claimToken },
+          body: JSON.stringify({ status: 'inactive', about: (state.knowledge && state.knowledge.about ? state.knowledge.about : '') + ' [Nedlagt]' })
+        });
+        var data = await res.json();
+        if (data.success) {
+          showAlert('claimAlert', 'Butikken er meldt som nedlagt.', 'info');
+          loadDashboard();
+        } else {
+          alert(data.error || 'Noe gikk galt');
+        }
+      } catch (err) { alert('Feil: ' + err.message); }
+      this.disabled = false;
+    });
+
     // ═══════════ DASHBOARD ═══════════
 
     async function loadDashboard() {
@@ -1219,7 +1291,9 @@
 
       document.getElementById('dashAgentName').textContent = agent.name;
       document.getElementById('dashAgentCity').textContent = agent.city || '';
-      document.getElementById('dashDataSource').textContent = knowledge ? 'Data: ' + (state.knowledge.dataSource || 'auto') : '';
+      var dsLabels = { 'auto': 'Automatisk innhentet', 'hybrid': 'Verifisert av eier', 'owner': 'Eierstyrt' };
+      var ds = state.knowledge ? (state.knowledge.dataSource || 'auto') : '';
+      document.getElementById('dashDataSource').textContent = dsLabels[ds] || ds;
 
       // Fill profile form
       if (knowledge) {

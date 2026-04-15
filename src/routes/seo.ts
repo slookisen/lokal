@@ -364,15 +364,15 @@ router.get("/", (_req: Request, res: Response) => {
     const topCities = Object.entries(cityCounts).sort((a, b) => b[1] - a[1]).slice(0, 8);
     const cityIcons = ["&#127968;", "&#127963;", "&#9875;", "&#127750;", "&#127748;", "&#9981;", "&#9973;", "&#127793;"];
 
-    // Featured producers (highest trust, verified first)
+    // Featured producers — verified first, then highest trust. Show more to fill section.
     const featured = agents
-      .filter((a: any) => a.trustScore >= 0.7)
+      .filter((a: any) => a.trustScore >= 0.35)
       .sort((a: any, b: any) => {
         if (a.isVerified && !b.isVerified) return -1;
         if (!a.isVerified && b.isVerified) return 1;
         return (b.trustScore || 0) - (a.trustScore || 0);
       })
-      .slice(0, 6);
+      .slice(0, 8);
 
     // Category cards
     const catCards = Object.entries(CATEGORY_MAP)
@@ -454,9 +454,9 @@ router.get("/", (_req: Request, res: Response) => {
 
     <section class="sec" style="background:var(--white);">
       <div class="sh">
-        <div class="sh-label">Anbefalt</div>
-        <div class="sh-title">Utvalgte produsenter</div>
-        <div class="sh-sub">Produsenter med h\u00f8y tillit</div>
+        <div class="sh-label">Oppdag</div>
+        <div class="sh-title">Produsenter</div>
+        <div class="sh-sub">Norske matprodusenter i nettverket</div>
       </div>
       <div class="feat-grid">${featuredCards}</div>
     </section>
@@ -1081,8 +1081,8 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
         </div>` : ""}
 
         <div class="data-src">
-          <span class="data-dot ${k.dataSource === "owner" ? "owner" : "auto"}"></span>
-          ${k.dataSource === "owner" ? "Verifisert av eier" : "Automatisk innhentet data"}${k.lastEnrichedAt ? ` \u2014 Sist oppdatert ${new Date(k.lastEnrichedAt).toLocaleDateString("nb-NO")}` : ""}
+          <span class="data-dot ${k.dataSource === "auto" ? "auto" : "owner"}"></span>
+          ${k.dataSource === "auto" ? "Automatisk innhentet data" : k.dataSource === "hybrid" ? "Verifisert av eier" : "Eierstyrt"}${k.lastEnrichedAt ? ` \u2014 Sist oppdatert ${new Date(k.lastEnrichedAt).toLocaleDateString("nb-NO")}` : ""}
         </div>
 
         ${meta.disclaimer ? `<p style="margin-top:8px;font-size:0.75rem;color:var(--g500);">${escapeHtml(meta.disclaimer)}</p>` : ""}

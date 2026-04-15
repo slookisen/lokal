@@ -123,8 +123,22 @@ function buildVCard(agentId: string): string | null {
     const postal = k.postalCode ? escapeVCard(k.postalCode) : "";
     lines.push(`ADR;TYPE=WORK:;;${street};${city};;${postal};Norway`);
   }
+  // Products as NOTE appendix (visible in most contact apps)
+  if (k.products && Array.isArray(k.products) && k.products.length > 0) {
+    const productList = k.products.map((p: any) => {
+      let item = p.name || p.product || "Ukjent";
+      if (p.price) item += ` (${p.price})`;
+      if (p.season) item += ` [${p.season}]`;
+      return item;
+    }).join(", ");
+    const notePrefix = k.about ? escapeVCard(k.about) + "\\n\\nProdukter: " : "Produkter: ";
+    // Override NOTE with about + products combined
+    const noteIdx = lines.findIndex(l => l.startsWith("NOTE:"));
+    if (noteIdx >= 0) lines[noteIdx] = `NOTE:${notePrefix}${escapeVCard(productList)}`;
+    else lines.push(`NOTE:Produkter: ${escapeVCard(productList)}`);
+  }
   // Category tag helps contact apps group these
-  lines.push("CATEGORIES:Lokal,Norsk mat,Produsent");
+  lines.push("CATEGORIES:Rett fra Bonden,Norsk mat,Produsent");
   lines.push(`X-LOKAL-AGENT-ID:${agent.id}`);
   if (agent.trustScore !== undefined && agent.trustScore !== null) {
     lines.push(`X-LOKAL-TRUST-SCORE:${Math.round(agent.trustScore * 100)}`);
@@ -602,6 +616,36 @@ router.get("/auth/magic-verify", (req: Request, res: Response) => {
       claimantName: result.claimantName,
     },
   });
+});
+
+// ─── POST /agents/:id/unclaim — Give up ownership ──────────
+
+router.post("/agents/:id/unclaim", (req: Request, res: Response) => {
+  const claimToken = (req.headers["x-claim-token"] as string) || "";
+  if (!claimToken) {
+    res.status(401).json({ success: false, error: "Claim token påkrevd" });
+    return;
+  }
+
+  const claim = knowledgeService.getClaimByToken(claimToken);
+  if (!claim || claim.agentId !== req.params.id) {
+    res.status(403).json({ success: false, error: "Ikke autorisert for denne agenten" });
+    return;
+  }
+
+  try {
+    const db = getDb();
+    // Remove the claim — agent becomes unclaimed
+    db.prepare("DELETE FROM agent_claims WHERE agent_id = ? AND claim_token = ?").run(req.params.id, claimToken);
+    // Reset data source to auto
+    db.prepare("UPDATE agent_knowledge SET data_source = 'auto' WHERE agent_id = ?").run(req.params.id);
+    // Update trust score (will drop without verification)
+    trustScoreService.update(req.params.id);
+
+    res.json({ success: true, message: "Eierskap frasagt" });
+  } catch (err: any) {
+    res.status(500).json({ success: false, error: err.message });
+  }
 });
 
 // ─── PUT /agents/:id/knowledge — Update knowledge ───────────
