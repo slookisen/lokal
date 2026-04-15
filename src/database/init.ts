@@ -351,6 +351,21 @@ function initSchema(db: Database.Database): void {
     CREATE INDEX IF NOT EXISTS idx_agent_claims_status ON agent_claims(status);
     CREATE INDEX IF NOT EXISTS idx_agent_claims_email ON agent_claims(claimant_email);
 
+    -- ════════════════════════════════════════════════════════════
+    -- MAGIC LINKS: Passwordless login tokens
+    -- ════════════════════════════════════════════════════════════
+    CREATE TABLE IF NOT EXISTS magic_links (
+      id TEXT PRIMARY KEY,
+      email TEXT NOT NULL,
+      token TEXT NOT NULL UNIQUE,
+      agent_id TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+      used INTEGER DEFAULT 0,
+      created_at TEXT DEFAULT (datetime('now')),
+      expires_at TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_magic_links_token ON magic_links(token);
+    CREATE INDEX IF NOT EXISTS idx_magic_links_email ON magic_links(email);
+
     -- Analytics indexes (for fast aggregation)
     CREATE INDEX IF NOT EXISTS idx_analytics_page_views_created ON analytics_page_views(created_at);
     CREATE INDEX IF NOT EXISTS idx_analytics_page_views_source ON analytics_page_views(source);

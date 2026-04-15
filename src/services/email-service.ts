@@ -521,6 +521,103 @@ Lykke til!
     `;
   }
 
+  async sendMagicLink(
+    email: string,
+    magicUrl: string,
+    agentName: string
+  ): Promise<{ success: boolean; messageId?: string; error?: string }> {
+    try {
+      const subject = `Logg inn på Rett fra Bonden`;
+
+      const htmlContent = `
+<!DOCTYPE html>
+<html lang="no">
+<head>
+  <meta charset="UTF-8">
+  <style>
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Helvetica Neue', sans-serif;
+      color: #333;
+      max-width: 500px;
+      margin: 0 auto;
+    }
+    .container {
+      background: #ffffff;
+      padding: 40px 20px;
+    }
+    .logo {
+      font-size: 20px;
+      font-weight: bold;
+      color: #2d5f2e;
+      margin-bottom: 20px;
+    }
+    .cta-button {
+      display: inline-block;
+      background: #2d5f2e;
+      color: white;
+      padding: 14px 32px;
+      text-decoration: none;
+      border-radius: 6px;
+      font-weight: bold;
+      margin: 25px 0;
+      text-align: center;
+    }
+    .footer {
+      margin-top: 30px;
+      padding-top: 15px;
+      border-top: 1px solid #eee;
+      font-size: 13px;
+      color: #999;
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <div class="logo">\u{1F33E} Rett fra Bonden</div>
+    <h1 style="font-size: 20px;">Logg inn</h1>
+    <p>Du ba om å logge inn for å administrere <strong>${this.escapeHtml(agentName)}</strong>.</p>
+    <p>Klikk knappen under for å logge inn. Lenken er gyldig i 15 minutter.</p>
+    <a href="${this.escapeHtml(magicUrl)}" class="cta-button">Logg inn n\u00e5</a>
+    <p style="font-size: 13px; color: #666;">Eller kopier denne lenken:</p>
+    <p style="font-size: 12px; color: #999; word-break: break-all;">${this.escapeHtml(magicUrl)}</p>
+    <div class="footer">
+      <p>Hvis du ikke ba om denne lenken, kan du trygt ignorere denne e-posten.</p>
+      <p>Rett fra Bonden | rettfrabonden.com</p>
+    </div>
+  </div>
+</body>
+</html>`;
+
+      const textContent = `Logg inn på Rett fra Bonden
+
+Du ba om å logge inn for å administrere ${agentName}.
+
+Klikk her for å logge inn (gyldig i 15 minutter):
+${magicUrl}
+
+Hvis du ikke ba om denne lenken, kan du trygt ignorere denne e-posten.
+
+Rett fra Bonden | rettfrabonden.com`;
+
+      return await this.sendEmail({
+        to: email,
+        subject,
+        htmlContent,
+        textContent,
+        replyTo: 'kontakt@rettfrabonden.com',
+      });
+    } catch (error) {
+      logger.error('Error sending magic link', {
+        email,
+        error: error instanceof Error ? error.message : String(error),
+      });
+      return {
+        success: false,
+        error: error instanceof Error ? error.message : 'Unknown error',
+      };
+    }
+  }
+
   private escapeHtml(text: string): string {
     const map: { [key: string]: string } = {
       '&': '&amp;',

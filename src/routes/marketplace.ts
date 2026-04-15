@@ -548,6 +548,62 @@ router.post("/auth/login", (req: Request, res: Response) => {
   });
 });
 
+// ─── POST /auth/magic-link — Request magic link login ──────────
+
+router.post("/auth/magic-link", async (req: Request, res: Response) => {
+  const { email } = req.body;
+  if (!email) {
+    res.status(400).json({ success: false, error: "E-post er påkrevd" });
+    return;
+  }
+
+  try {
+    const result = knowledgeService.createMagicLink(email.toLowerCase().trim());
+    if (!result.success) {
+      // Don't reveal whether email exists — always show success to prevent enumeration
+      res.json({ success: true, message: "Hvis e-posten er registrert, vil du motta en innloggingslenke." });
+      return;
+    }
+
+    const baseUrl = process.env.APP_URL || "https://rettfrabonden.com";
+    const magicUrl = `${baseUrl}/selger?magic=${result.token}`;
+
+    await emailService.sendMagicLink(email, magicUrl, result.agentName || "din agent");
+
+    res.json({
+      success: true,
+      message: "Hvis e-posten er registrert, vil du motta en innloggingslenke.",
+    });
+  } catch (err: any) {
+    res.status(500).json({ success: false, error: "Kunne ikke sende innloggingslenke" });
+  }
+});
+
+// ─── GET /auth/magic-verify — Verify magic link token ──────────
+
+router.get("/auth/magic-verify", (req: Request, res: Response) => {
+  const token = req.query.token as string;
+  if (!token) {
+    res.status(400).json({ success: false, error: "Token mangler" });
+    return;
+  }
+
+  const result = knowledgeService.verifyMagicLink(token);
+  if (!result.success) {
+    res.status(401).json({ success: false, error: result.error });
+    return;
+  }
+
+  res.json({
+    success: true,
+    data: {
+      agentId: result.agentId,
+      claimToken: result.claimToken,
+      claimantName: result.claimantName,
+    },
+  });
+});
+
 // ─── PUT /agents/:id/knowledge — Update knowledge ───────────
 // Authenticated via claim token, API key, OR admin key.
 // Admin key uses upsertKnowledge (dataSource: "auto") for enrichment.

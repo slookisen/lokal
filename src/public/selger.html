@@ -289,19 +289,22 @@
         <button class="btn btn-primary" id="btnRegister" style="width: 100%; justify-content: center; padding: 0.8rem; font-size: 1rem;">Registrer gratis</button>
       </div>
 
-      <!-- ══════ LOGIN: Already registered ══════ -->
+      <!-- ══════ LOGIN: Magic link ══════ -->
       <div class="card" style="margin-top: 1rem; background: var(--gray-50);">
         <h3 style="margin-bottom: 0.5rem;">Allerede registrert?</h3>
-        <p style="color: var(--gray-500); font-size: 0.85rem; margin-bottom: 0.75rem;">Logg inn med tokenet du fikk ved registrering.</p>
+        <p style="color: var(--gray-500); font-size: 0.85rem; margin-bottom: 0.75rem;">Skriv inn e-posten din, så sender vi deg en innloggingslenke.</p>
         <div class="form-row">
           <div class="form-group" style="margin-bottom: 0;">
-            <input type="text" id="loginToken" placeholder="Lim inn ditt tilgangstoken..." style="font-family: monospace; font-size: 0.85rem;" />
+            <input type="email" id="loginEmail" placeholder="din@epost.no" style="font-size: 0.95rem;" />
           </div>
           <div>
-            <button class="btn btn-secondary" id="btnLogin">Logg inn</button>
+            <button class="btn btn-secondary" id="btnMagicLink">Send innloggingslenke</button>
           </div>
         </div>
+        <div id="magicLinkAlert" style="margin-top: 0.5rem;"></div>
       </div>
+      <!-- Hidden legacy token field for programmatic use -->
+      <input type="hidden" id="loginToken" />
 
       <!-- (claimExistingSection is now replaced by the find-match flow above) -->
       <div class="hidden" id="claimExistingSection"></div>
@@ -1095,6 +1098,7 @@
         if (res.success) {
           state.claimToken = res.data.claimToken;
           state.agentId = res.data.agentId || claimAgentId;
+          saveSession();
           showAlert('verifyAlert', t('claim_success'), 'success');
           setTimeout(function() { loadDashboard(); }, 1000);
         } else {
@@ -1106,33 +1110,51 @@
       this.disabled = false;
     });
 
-    // ── Login with token (single server-side lookup) ──
-    document.getElementById('btnLogin').addEventListener('click', async function() {
-      var token = document.getElementById('loginToken').value.trim();
-      if (!token) return;
+    // ── Magic link: request login link via email ──
+    document.getElementById('btnMagicLink').addEventListener('click', async function() {
+      var email = document.getElementById('loginEmail').value.trim();
+      if (!email) return;
       this.disabled = true;
+      this.textContent = 'Sender...';
       try {
-        var res = await fetch(API + '/auth/login', {
+        var res = await fetch(API + '/auth/magic-link', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ token: token })
+          body: JSON.stringify({ email: email })
         });
         var data = await res.json();
-        if (data.success && data.data && data.data.agentId) {
-          state.claimToken = token;
-          state.agentId = data.data.agentId;
-          saveSession(data.data.agentId, token);
-          loadDashboard();
-        } else {
-          showAlert('dashAlert', data.error || t('login_error'), 'error');
-          state.claimToken = null;
-        }
+        showAlert('magicLinkAlert', 'Sjekk innboksen din! Vi har sendt en innloggingslenke til ' + email + '.', 'success');
       } catch (err) {
-        showAlert('dashAlert', t('login_error'), 'error');
-        state.claimToken = null;
+        showAlert('magicLinkAlert', 'Kunne ikke sende lenke. Prøv igjen.', 'error');
       }
       this.disabled = false;
+      this.textContent = 'Send innloggingslenke';
     });
+
+    // ── Magic link: handle ?magic= URL parameter on page load ──
+    (async function checkMagicLink() {
+      var params = new URLSearchParams(window.location.search);
+      var magicToken = params.get('magic');
+      if (!magicToken) return;
+
+      // Clean URL so token isn't visible / bookmarkable
+      window.history.replaceState({}, '', '/selger');
+
+      try {
+        var res = await fetch(API + '/auth/magic-verify?token=' + encodeURIComponent(magicToken));
+        var data = await res.json();
+        if (data.success && data.data) {
+          state.claimToken = data.data.claimToken;
+          state.agentId = data.data.agentId;
+          saveSession();
+          loadDashboard();
+        } else {
+          showAlert('magicLinkAlert', data.error || 'Innloggingslenken er ugyldig eller utløpt. Be om en ny.', 'error');
+        }
+      } catch (err) {
+        showAlert('magicLinkAlert', 'Noe gikk galt. Prøv å be om en ny lenke.', 'error');
+      }
+    })();
 
     // ── Logout ──
     document.getElementById('btnLogout').addEventListener('click', function() {

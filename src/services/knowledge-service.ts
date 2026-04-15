@@ -396,6 +396,68 @@ class KnowledgeService {
     return { success: true, claimToken: newToken };
   }
 
+  // ─── Magic Link Login ─────────────────────────────────
+
+  createMagicLink(email: string): { success: boolean; token?: string; agentId?: string; agentName?: string; error?: string } {
+    const db = getDb();
+
+    // Find verified claim for this email
+    const claim = db.prepare(
+      `SELECT ac.agent_id, ac.claim_token, a.name as agent_name
+       FROM agent_claims ac
+       JOIN agents a ON a.id = ac.agent_id
+       WHERE ac.claimant_email = ? AND ac.status = 'verified'
+       ORDER BY ac.verified_at DESC LIMIT 1`
+    ).get(email) as any;
+
+    if (!claim) {
+      return { success: false, error: "Ingen registrert agent funnet for denne e-postadressen" };
+    }
+
+    // Generate a secure magic link token (valid 15 min)
+    const token = crypto.randomBytes(32).toString("hex");
+    const expiresAt = new Date(Date.now() + 15 * 60 * 1000).toISOString();
+    const id = uuid();
+
+    db.prepare(
+      `INSERT INTO magic_links (id, email, token, agent_id, expires_at) VALUES (?, ?, ?, ?, ?)`
+    ).run(id, email, token, claim.agent_id, expiresAt);
+
+    return { success: true, token, agentId: claim.agent_id, agentName: claim.agent_name };
+  }
+
+  verifyMagicLink(token: string): { success: boolean; agentId?: string; claimToken?: string; claimantName?: string; error?: string } {
+    const db = getDb();
+
+    const link = db.prepare(
+      `SELECT ml.*, ac.claim_token, ac.claimant_name
+       FROM magic_links ml
+       JOIN agent_claims ac ON ac.agent_id = ml.agent_id AND ac.claimant_email = ml.email AND ac.status = 'verified'
+       WHERE ml.token = ? AND ml.used = 0`
+    ).get(token) as any;
+
+    if (!link) {
+      return { success: false, error: "Ugyldig eller brukt lenke" };
+    }
+
+    if (new Date(link.expires_at) < new Date()) {
+      return { success: false, error: "Lenken har utløpt. Be om en ny." };
+    }
+
+    // Mark as used
+    db.prepare(`UPDATE magic_links SET used = 1 WHERE token = ?`).run(token);
+
+    // Clean up old magic links (older than 1 hour)
+    db.prepare(`DELETE FROM magic_links WHERE expires_at < datetime('now', '-1 hour')`).run();
+
+    return {
+      success: true,
+      agentId: link.agent_id,
+      claimToken: link.claim_token,
+      claimantName: link.claimant_name,
+    };
+  }
+
   // ─── Stats ────────────────────────────────────────────
 
   getKnowledgeStats(): { total: number; enriched: number; claimed: number; autoOnly: number; ownerOrHybrid: number } {
