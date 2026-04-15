@@ -112,6 +112,11 @@ app.get("/app", (_req, res) => {
   res.sendFile(path.join(__dirname, "public", "app.html"));
 });
 
+// ─── Analytics dashboard ────────────────────────────────────
+app.get("/admin/dashboard", (_req, res) => {
+  res.sendFile(path.join(__dirname, "public", "admin-dashboard.html"));
+});
+
 // ─── OpenAPI spec (for Custom GPTs and developer docs) ──────
 app.get("/openapi.yaml", (_req, res) => {
   res.sendFile(path.join(__dirname, "..", "openapi.yaml"));
