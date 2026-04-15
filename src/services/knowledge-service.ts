@@ -300,9 +300,12 @@ class KnowledgeService {
     const now = new Date().toISOString();
     const expiresAt = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString(); // 7 days
 
-    // Check if already claimed
-    if (this.isAgentClaimed(agentId)) {
-      throw new Error("This agent has already been claimed");
+    // Check if this specific email already has a verified claim on this agent
+    const existingClaim = db.prepare(
+      "SELECT COUNT(*) as c FROM agent_claims WHERE agent_id = ? AND claimant_email = ? AND status = 'verified'"
+    ).get(agentId, opts.claimantEmail) as any;
+    if (existingClaim.c > 0) {
+      throw new Error("Du har allerede gjort krav på denne agenten. Bruk innlogging med e-post.");
     }
 
     // Clear any stale pending claims (since email isn't implemented yet,

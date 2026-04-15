@@ -1073,14 +1073,13 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
           </div>
         </div>` : ""}
 
-        ${!agent.isVerified ? `
         <div class="claim-bar">
           <div>
-            <h3>Er du eieren av ${escapeHtml(agent.name)}?</h3>
-            <p>Gj\u00f8r krav p\u00e5 profilen for \u00e5 oppdatere informasjon og bli synlig for flere.</p>
+            <h3>${agent.isVerified ? "Jobber du ogs\u00e5 her?" : "Er du eieren av " + escapeHtml(agent.name) + "?"}</h3>
+            <p>${agent.isVerified ? "Flere personer kan administrere denne profilen." : "Gj\u00f8r krav p\u00e5 profilen for \u00e5 oppdatere informasjon og bli synlig for flere."}</p>
           </div>
-          <a href="/selger" class="claim-btn">Gj\u00f8r krav</a>
-        </div>` : ""}
+          <a href="/selger" class="claim-btn">${agent.isVerified ? "F\u00e5 tilgang" : "Gj\u00f8r krav"}</a>
+        </div>
 
         <div class="data-src">
           <span class="data-dot ${k.dataSource === "auto" ? "auto" : "owner"}"></span>

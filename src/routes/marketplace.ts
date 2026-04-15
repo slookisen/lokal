@@ -635,14 +635,45 @@ router.post("/agents/:id/unclaim", (req: Request, res: Response) => {
 
   try {
     const db = getDb();
-    // Remove the claim — agent becomes unclaimed
+    // Remove this specific claim
     db.prepare("DELETE FROM agent_claims WHERE agent_id = ? AND claim_token = ?").run(req.params.id, claimToken);
-    // Reset data source to auto
-    db.prepare("UPDATE agent_knowledge SET data_source = 'auto' WHERE agent_id = ?").run(req.params.id);
-    // Update trust score (will drop without verification)
+
+    // Check if any other verified claims remain for this agent
+    const remainingClaims = db.prepare(
+      "SELECT COUNT(*) as c FROM agent_claims WHERE agent_id = ? AND status = 'verified'"
+    ).get(req.params.id) as any;
+
+    if (remainingClaims.c === 0) {
+      // No owners left — reset verified status and data source
+      db.prepare("UPDATE agents SET is_verified = 0 WHERE id = ?").run(req.params.id);
+      db.prepare("UPDATE agent_knowledge SET data_source = 'auto' WHERE agent_id = ?").run(req.params.id);
+    }
+
+    // Recalculate trust score
     trustScoreService.update(req.params.id);
 
     res.json({ success: true, message: "Eierskap frasagt" });
+  } catch (err: any) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// ─── POST /admin/agents/:id/reset-claim — Admin: reset verified/claim status ──
+
+router.post("/admin/agents/:id/reset-claim", (req: Request, res: Response) => {
+  const adminKey = (req.headers["x-admin-key"] as string) || req.query.key as string || "";
+  if (adminKey !== (process.env.ADMIN_KEY || "")) {
+    res.status(403).json({ success: false, error: "Admin key required" });
+    return;
+  }
+
+  try {
+    const db = getDb();
+    db.prepare("UPDATE agents SET is_verified = 0 WHERE id = ?").run(req.params.id);
+    db.prepare("DELETE FROM agent_claims WHERE agent_id = ?").run(req.params.id);
+    db.prepare("UPDATE agent_knowledge SET data_source = 'auto' WHERE agent_id = ?").run(req.params.id);
+    trustScoreService.update(req.params.id);
+    res.json({ success: true, message: "Claim and verification reset" });
   } catch (err: any) {
     res.status(500).json({ success: false, error: err.message });
   }
