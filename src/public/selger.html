@@ -729,6 +729,7 @@
       knowledge: null,
       metrics: null,
       products: [],
+      images: [],
       editingProductIndex: -1,
     };
 
@@ -900,9 +901,16 @@
     // ── UI helpers ──
     function show(id) { document.getElementById(id).classList.remove('hidden'); }
     function hide(id) { document.getElementById(id).classList.add('hidden'); }
+    function escHtml(s) {
+      var d = document.createElement('div');
+      d.textContent = s || '';
+      return d.innerHTML;
+    }
+
     function showAlert(containerId, msg, type, persistent) {
       var el = document.getElementById(containerId);
-      el.innerHTML = '<div class="alert alert-' + type + '">' + msg + '</div>';
+      var safeType = (type || 'info').replace(/[^a-z]/gi, '');
+      el.innerHTML = '<div class="alert alert-' + safeType + '">' + msg + '</div>';
       if (!persistent) {
         setTimeout(function() { el.innerHTML = ''; }, 5000);
       }
@@ -1004,7 +1012,7 @@
           container.appendChild(div);
         });
       } catch (err) {
-        container.innerHTML = '<p style="text-align:center;color:var(--red);">Error: ' + err.message + '</p>';
+        container.innerHTML = '<p style="text-align:center;color:var(--red);">Error: ' + escHtml(err.message) + '</p>';
       }
     }
 
@@ -1160,6 +1168,11 @@
     // ═══════════ DASHBOARD ═══════════
 
     async function loadDashboard() {
+      if (!state.agentId) {
+        showAlert('claimAlert', 'Ingen agent valgt. Prøv å logge inn på nytt.', 'error');
+        return;
+      }
+
       hide('viewClaim');
       show('viewDashboard');
       show('btnLogout');
@@ -1172,9 +1185,18 @@
           state.knowledge = info.data.knowledge;
           saveSession();
           renderDashboard();
+        } else if (info.error && info.error.toLowerCase().includes('unauthorized')) {
+          // Token expired or invalid — clear session and go back to login
+          clearSession();
+          state.claimToken = null;
+          state.agentId = null;
+          hide('viewDashboard');
+          show('viewClaim');
+          showAlert('claimAlert', 'Innloggingen din har utløpt. Vennligst logg inn på nytt.', 'error');
+          return;
         }
       } catch (err) {
-        showAlert('dashAlert', 'Error loading agent: ' + err.message, 'error');
+        showAlert('dashAlert', 'Error loading agent: ' + escHtml(err.message), 'error');
       }
 
       // Load metrics
@@ -1669,7 +1691,7 @@
       Array.from(files).forEach(function(file) {
         if (!file.type.startsWith('image/')) return;
         if (file.size > 5 * 1024 * 1024) {
-          showAlert('dashAlert', 'Bildet «' + file.name + '» er for stort (maks 5 MB).', 'error');
+          showAlert('dashAlert', 'Bildet «' + escHtml(file.name) + '» er for stort (maks 5 MB).', 'error');
           return;
         }
         var reader = new FileReader();
@@ -1986,17 +2008,17 @@
           noMatch.classList.add('hidden');
 
           data.matches.forEach(function(m) {
-            var cats = (m.categories || []).join(', ');
+            var cats = escHtml((m.categories || []).join(', '));
             var badge = m.isClaimed ? '<span style="background:#e74c3c;color:white;padding:2px 8px;border-radius:12px;font-size:0.75rem;">Eid</span>' :
                         m.isVerified ? '<span style="background:var(--forest);color:white;padding:2px 8px;border-radius:12px;font-size:0.75rem;">Verifisert</span>' :
-                        '<span style="background:var(--accent);color:white;padding:2px 8px;border-radius:12px;font-size:0.75rem;">' + m.similarity + '% match</span>';
+                        '<span style="background:var(--accent);color:white;padding:2px 8px;border-radius:12px;font-size:0.75rem;">' + escHtml(String(m.similarity)) + '% match</span>';
             var claimBtn = m.isClaimed
               ? '<span style="color:var(--gray-500);font-size:0.85rem;">Denne er allerede eid av noen</span>'
-              : '<button class="btn btn-primary" style="padding:6px 16px;font-size:0.85rem;" data-claim-id="' + m.id + '" data-claim-name="' + (m.name || '').replace(/"/g, '&quot;') + '">Dette er min butikk</button>';
+              : '<button class="btn btn-primary" style="padding:6px 16px;font-size:0.85rem;" data-claim-id="' + escHtml(m.id) + '" data-claim-name="' + escHtml(m.name || '') + '">Dette er min butikk</button>';
 
             matchList.innerHTML += '<div style="display:flex;align-items:center;justify-content:space-between;padding:1rem;background:var(--gray-50);border-radius:12px;margin-bottom:0.5rem;border:1px solid var(--gray-200);">'
-              + '<div><strong>' + m.name + '</strong> ' + badge + '<br><span style="color:var(--gray-500);font-size:0.85rem;">' + (m.city || '') + (cats ? ' — ' + cats : '') + '</span>'
-              + (m.description ? '<br><span style="color:var(--gray-400);font-size:0.8rem;">' + m.description + '</span>' : '')
+              + '<div><strong>' + escHtml(m.name) + '</strong> ' + badge + '<br><span style="color:var(--gray-500);font-size:0.85rem;">' + escHtml(m.city || '') + (cats ? ' — ' + cats : '') + '</span>'
+              + (m.description ? '<br><span style="color:var(--gray-400);font-size:0.8rem;">' + escHtml(m.description) + '</span>' : '')
               + '</div>'
               + '<div style="flex-shrink:0;margin-left:1rem;">' + claimBtn + '</div>'
               + '</div>';
@@ -2031,7 +2053,7 @@
         }
 
       } catch(err) {
-        showAlert('findAlert', 'Feil ved søk: ' + err.message, 'error');
+        showAlert('findAlert', 'Feil ved søk: ' + escHtml(err.message), 'error');
       } finally {
         this.disabled = false;
         this.textContent = 'Sjekk registeret';
@@ -2129,7 +2151,7 @@
 
           // Show progress
           showAlert('regAlert',
-            '<strong>Agenten «' + name + '» er registrert!</strong><br>Setter opp eierskap automatisk...',
+            '<strong>Agenten «' + escHtml(name) + '» er registrert!</strong><br>Setter opp eierskap automatisk...',
             'info', true);
 
           // Auto-claim: step 1 — request claim
@@ -2157,8 +2179,8 @@
 
                   showAlert('regAlert',
                     '<strong style="font-size:1.1rem;">Din agent er klar!</strong>' +
-                    '<br><br>Du er nå verifisert eier av «' + name + '». Dashboard lastes...' +
-                    '<br><br><strong>API-nøkkel</strong> (brukes av agenten din):<br><code style="background:#e8f5e9;padding:4px 8px;border-radius:4px;font-size:0.8rem;word-break:break-all;">' + apiKey + '</code>',
+                    '<br><br>Du er nå verifisert eier av «' + escHtml(name) + '». Dashboard lastes...' +
+                    '<br><br><strong>API-nøkkel</strong> (brukes av agenten din):<br><code style="background:#e8f5e9;padding:4px 8px;border-radius:4px;font-size:0.8rem;word-break:break-all;">' + escHtml(apiKey) + '</code>',
                     'success', true);
 
                   document.getElementById('regAlert').scrollIntoView({ behavior: 'smooth', block: 'center' });
@@ -2186,9 +2208,9 @@
 
           // Fallback: if auto-claim failed, show manual instructions
           showAlert('regAlert',
-            '<strong style="font-size:1.1rem;">Agenten «' + name + '» er registrert!</strong>' +
-            '<br><br><strong>Neste steg:</strong> Søk opp «' + name + '» i feltet øverst og trykk «Gjør krav» for å få tilgang.' +
-            '<br><br><strong>API-nøkkel</strong> (lagre denne):<br><code style="background:#e8f5e9;padding:4px 8px;border-radius:4px;font-size:0.8rem;word-break:break-all;">' + apiKey + '</code>',
+            '<strong style="font-size:1.1rem;">Agenten «' + escHtml(name) + '» er registrert!</strong>' +
+            '<br><br><strong>Neste steg:</strong> Søk opp «' + escHtml(name) + '» i feltet øverst og trykk «Gjør krav» for å få tilgang.' +
+            '<br><br><strong>API-nøkkel</strong> (lagre denne):<br><code style="background:#e8f5e9;padding:4px 8px;border-radius:4px;font-size:0.8rem;word-break:break-all;">' + escHtml(apiKey) + '</code>',
             'success', true);
 
           document.getElementById('regAlert').scrollIntoView({ behavior: 'smooth', block: 'center' });
@@ -2207,7 +2229,7 @@
           showAlert('regAlert', data.error || 'Registrering feilet. Prøv igjen.', 'error');
         }
       } catch (err) {
-        showAlert('regAlert', 'Feil: ' + err.message, 'error');
+        showAlert('regAlert', 'Feil: ' + escHtml(err.message), 'error');
       }
       this.disabled = false;
     });
