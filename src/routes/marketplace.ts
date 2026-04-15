@@ -282,9 +282,11 @@ router.get("/search", (req: Request, res: Response) => {
     contact: buildContactBlock(r.agent.id),
   }));
 
+  // Sanitize query echo to prevent reflected XSS if rendered by consumers
+  const safeQuery = q.replace(/<[^>]*>/g, "").replace(/javascript:/gi, "");
   res.json({
     success: true,
-    query: q,
+    query: safeQuery,
     parsed, // Show what we understood (transparency)
     count: enrichedResults.length,
     results: enrichedResults,
@@ -661,8 +663,13 @@ router.post("/agents/:id/unclaim", (req: Request, res: Response) => {
 // ─── POST /admin/agents/:id/reset-claim — Admin: reset verified/claim status ──
 
 router.post("/admin/agents/:id/reset-claim", (req: Request, res: Response) => {
-  const adminKey = (req.headers["x-admin-key"] as string) || req.query.key as string || "";
-  if (adminKey !== (process.env.ADMIN_KEY || "")) {
+  const expectedKey = process.env.ADMIN_KEY;
+  if (!expectedKey) {
+    res.status(503).json({ success: false, error: "Admin not configured" });
+    return;
+  }
+  const adminKey = req.headers["x-admin-key"] as string;
+  if (!adminKey || adminKey !== expectedKey) {
     res.status(403).json({ success: false, error: "Admin key required" });
     return;
   }
@@ -694,7 +701,7 @@ router.put("/agents/:id/knowledge", (req: Request, res: Response) => {
   let isAdmin = false;
 
   // 1. Admin key — for automated enrichment (dataSource: "auto")
-  if (adminKeyHeader && adminKeyHeader === expectedAdminKey) {
+  if (expectedAdminKey && adminKeyHeader && adminKeyHeader === expectedAdminKey) {
     authorized = true;
     isAdmin = true;
   }
@@ -748,8 +755,9 @@ router.put("/agents/:id/knowledge", (req: Request, res: Response) => {
 // Requires ADMIN_KEY header.
 
 router.post("/admin/bulk-enrich", (req: Request, res: Response) => {
+  const expectedKey = process.env.ADMIN_KEY;
+  if (!expectedKey) { res.status(503).json({ error: "Admin not configured" }); return; }
   const adminKey = req.headers["x-admin-key"] as string;
-  const expectedKey = process.env.ADMIN_KEY || "";
 
   if (!adminKey || adminKey !== expectedKey) {
     res.status(403).json({ error: "Krever X-Admin-Key header" });
@@ -796,7 +804,8 @@ router.post("/admin/bulk-enrich", (req: Request, res: Response) => {
 
 router.delete("/agents/:id", (req: Request, res: Response) => {
   const adminKey = req.headers["x-admin-key"] as string;
-  const expectedKey = process.env.ADMIN_KEY || "";
+  const expectedKey = process.env.ADMIN_KEY;
+  if (!expectedKey) { res.status(503).json({ error: "Admin not configured" }); return; }
 
   if (!adminKey || adminKey !== expectedKey) {
     res.status(403).json({ error: "Krever X-Admin-Key header" });
@@ -936,8 +945,9 @@ router.get("/agents/:id/trust", (req: Request, res: Response) => {
 // current data. Requires ADMIN_KEY header.
 
 router.post("/admin/recalculate-trust", (req: Request, res: Response) => {
+  const expectedKey = process.env.ADMIN_KEY;
+  if (!expectedKey) { res.status(503).json({ error: "Admin not configured" }); return; }
   const adminKey = req.headers["x-admin-key"] as string;
-  const expectedKey = process.env.ADMIN_KEY || "";
 
   if (!adminKey || adminKey !== expectedKey) {
     res.status(403).json({ error: "Krever X-Admin-Key header" });

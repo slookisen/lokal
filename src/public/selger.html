@@ -382,10 +382,17 @@
           <div class="stat-number" id="statChosen">0</div>
           <div class="stat-label" data-i18n="stat_chosen">Valgt</div>
         </div>
-        <div class="stat-card">
+        <div class="stat-card" id="trustScoreCard" style="cursor:pointer" title="Klikk for detaljer">
           <div class="stat-number" id="statTrust">0%</div>
           <div class="stat-label" data-i18n="stat_trust">Trust Score</div>
         </div>
+      </div>
+
+      <!-- Trust Score Breakdown (hidden by default, toggled by clicking trust card) -->
+      <div class="card" id="trustBreakdown" style="display:none;">
+        <h2>🎯 <span data-i18n="trust_title">Veien til 100% Trust Score</span></h2>
+        <div id="trustSignals" style="display:grid;gap:0.75rem;"></div>
+        <div id="trustTips" style="margin-top:1rem;"></div>
       </div>
 
       <!-- Tabs -->
@@ -1427,7 +1434,69 @@
       document.getElementById('statChosen').textContent = m.times_chosen || m.timesChosen || 0;
       var trust = state.agent ? Math.round((state.agent.trustScore || 0) * 100) : 0;
       document.getElementById('statTrust').textContent = trust + '%';
+      // Load trust breakdown
+      if (state.agentId) loadTrustBreakdown();
     }
+
+    // ── Trust Score Breakdown ──
+    function loadTrustBreakdown() {
+      fetch(API + '/agents/' + state.agentId + '/trust')
+        .then(function(r) { return r.json(); })
+        .then(function(res) {
+          if (!res.success) return;
+          var d = res.data;
+          var signals = d.signals;
+          var signalNames = {
+            verification: { no: 'Verifisering', en: 'Verification', icon: '🔒' },
+            completeness: { no: 'Profil-komplettering', en: 'Profile completeness', icon: '📝' },
+            freshness: { no: 'Aktivitet/ferskhet', en: 'Activity/freshness', icon: '⚡' },
+            interaction: { no: 'Interaksjoner', en: 'Interactions', icon: '👥' },
+            community: { no: 'Fellesskap', en: 'Community', icon: '⭐' }
+          };
+          var lang = state.lang || 'no';
+          var html = '';
+          var keys = ['verification', 'completeness', 'freshness', 'interaction', 'community'];
+          for (var i = 0; i < keys.length; i++) {
+            var key = keys[i];
+            var s = signals[key];
+            var meta = signalNames[key];
+            var pct = Math.round(s.value * 100);
+            var weightPct = Math.round(s.weight * 100);
+            var barColor = pct >= 80 ? 'var(--green)' : pct >= 50 ? 'var(--orange)' : 'var(--red)';
+            html += '<div style="background:var(--gray-50);border-radius:var(--radius);padding:0.75rem;">';
+            html += '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:4px;">';
+            html += '<span style="font-weight:500;">' + meta.icon + ' ' + meta[lang] + ' <span style="color:var(--gray-500);font-size:0.8rem;">(' + weightPct + '% vekt)</span></span>';
+            html += '<span style="font-weight:700;color:' + barColor + ';">' + pct + '%</span>';
+            html += '</div>';
+            html += '<div style="background:var(--gray-200);border-radius:99px;height:8px;overflow:hidden;">';
+            html += '<div style="background:' + barColor + ';height:100%;width:' + pct + '%;border-radius:99px;transition:width 0.5s;"></div>';
+            html += '</div>';
+            html += '<div style="font-size:0.75rem;color:var(--gray-500);margin-top:2px;">' + s.detail + '</div>';
+            html += '</div>';
+          }
+          document.getElementById('trustSignals').innerHTML = html;
+
+          // Render tips
+          if (d.tips && d.tips.length > 0) {
+            var tipsHtml = '<div style="background:var(--blue-light);border:1px solid #bfdbfe;border-radius:var(--radius);padding:0.75rem;">';
+            tipsHtml += '<div style="font-weight:600;margin-bottom:0.5rem;">💡 ' + (lang === 'no' ? 'Tips for å øke din score:' : 'Tips to improve your score:') + '</div>';
+            for (var t = 0; t < d.tips.length; t++) {
+              tipsHtml += '<div style="font-size:0.85rem;padding:2px 0;">• ' + d.tips[t] + '</div>';
+            }
+            tipsHtml += '</div>';
+            document.getElementById('trustTips').innerHTML = tipsHtml;
+          } else {
+            document.getElementById('trustTips').innerHTML = '<div style="background:var(--green-light);border:1px solid #bbf7d0;border-radius:var(--radius);padding:0.75rem;font-weight:500;">🎉 ' + (lang === 'no' ? 'Flott! Profilen din ser komplett ut.' : 'Great! Your profile looks complete.') + '</div>';
+          }
+        })
+        .catch(function(err) { console.error('Trust breakdown load failed:', err); });
+    }
+
+    // Toggle trust breakdown visibility
+    document.getElementById('trustScoreCard').addEventListener('click', function() {
+      var el = document.getElementById('trustBreakdown');
+      el.style.display = el.style.display === 'none' ? 'block' : 'none';
+    });
 
     function renderSettings() {
       document.getElementById('settingsToken').value = state.claimToken || '';
