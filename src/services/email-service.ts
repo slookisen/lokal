@@ -62,7 +62,7 @@ export class EmailService {
       const unsubscribeLink = `${process.env.APP_URL || 'https://rettfrabonden.com'}/unsubscribe?email=${encodeURIComponent(sellerEmail)}&agent=${agentId}`;
       const claimUrl = `${process.env.APP_URL || 'https://rettfrabonden.com'}/agent/${agentId}/claim`;
 
-      const subject = `Lokal — Vi har funnet deg og dine produkter!`;
+      const subject = `Rett fra Bonden — Vi har funnet deg og dine produkter!`;
 
       const htmlContent = this.generateClaimInvitationHtml(
         sellerName,
@@ -106,7 +106,7 @@ export class EmailService {
     agentName: string
   ): Promise<{ success: boolean; messageId?: string; error?: string }> {
     try {
-      const subject = `Din bekreftelseskode for ${agentName} på Lokal`;
+      const subject = `Din bekreftelseskode for ${agentName} på Rett fra Bonden`;
 
       const htmlContent = this.generateVerificationCodeHtml(code, agentName);
       const textContent = this.generateVerificationCodeText(code, agentName);
@@ -137,7 +137,7 @@ export class EmailService {
     dashboardUrl: string
   ): Promise<{ success: boolean; messageId?: string; error?: string }> {
     try {
-      const subject = `Gratulerer! ${agentName} er nå ditt på Lokal`;
+      const subject = `Gratulerer! ${agentName} er nå ditt på Rett fra Bonden`;
 
       const htmlContent = this.generateClaimConfirmationHtml(agentName, dashboardUrl);
       const textContent = this.generateClaimConfirmationText(agentName, dashboardUrl);
@@ -294,14 +294,14 @@ export class EmailService {
 <body>
   <div class="container">
     <div class="header">
-      <div class="logo">🌾 Lokal</div>
+      <div class="logo">🌾 Rett fra Bonden</div>
     </div>
 
     <h1>Hei ${this.escapeHtml(sellerName)}!</h1>
 
     <p>Vi bygger et nettverk for lokale matprodusenter — hvor dine produkter møter mennesker som leter etter akkurat det du har.</p>
 
-    <p><strong>Vi har funnet deg og dine produkter på Lokal, og vi ønsker at du skal eie din egen agent her.</strong></p>
+    <p><strong>Vi har funnet deg og dine produkter på Rett fra Bonden, og vi ønsker at du skal eie din egen agent her.</strong></p>
 
     <div class="info-box">
       <strong>Vi har registrert:</strong>
@@ -314,7 +314,7 @@ export class EmailService {
 
     <p style="font-weight: bold; margin-top: 20px;">Det tar mindre enn 5 minutter. Klikk her:</p>
 
-    <a href="${this.escapeHtml(claimUrl)}" class="cta-button">Krav din agent på Lokal</a>
+    <a href="${this.escapeHtml(claimUrl)}" class="cta-button">Krav din agent på Rett fra Bonden</a>
 
     <p style="font-size: 14px; color: #666; margin-top: 25px;">Har du spørsmål? Svar på denne e-posten eller kontakt oss på <a href="mailto:kontakt@rettfrabonden.com" class="footer-link">kontakt@rettfrabonden.com</a>.</p>
 
@@ -342,7 +342,7 @@ Hei ${sellerName}!
 
 Vi bygger et nettverk for lokale matprodusenter — hvor dine produkter møter mennesker som leter etter akkurat det du har.
 
-Vi har funnet deg og dine produkter på Lokal, og vi ønsker at du skal eie din egen agent her.
+Vi har funnet deg og dine produkter på Rett fra Bonden, og vi ønsker at du skal eie din egen agent her.
 
 VI HAR REGISTRERT:
 ${agentName}
@@ -409,9 +409,9 @@ Rett fra Bonden bygger nettverk hvor norske matprodusenter møter mennesker som 
 </head>
 <body>
   <div class="container">
-    <div class="logo">🌾 Lokal</div>
+    <div class="logo">🌾 Rett fra Bonden</div>
     <h1>Din bekreftelseskode</h1>
-    <p>Du ba om å bekrefte at du eier <strong>${this.escapeHtml(agentName)}</strong> på Lokal.</p>
+    <p>Du ba om å bekrefte at du eier <strong>${this.escapeHtml(agentName)}</strong> på Rett fra Bonden.</p>
     <p>Din bekreftelseskode er:</p>
     <div class="code-box">
       <div class="code">${code}</div>
@@ -428,7 +428,7 @@ Rett fra Bonden bygger nettverk hvor norske matprodusenter møter mennesker som 
     return `
 Din bekreftelseskode
 
-Du ba om å bekrefte at du eier ${agentName} på Lokal.
+Du ba om å bekrefte at du eier ${agentName} på Rett fra Bonden.
 
 Din bekreftelseskode er:
 
@@ -484,10 +484,10 @@ Hvis du ikke ba om denne koden, kan du ignorere denne e-posten.
 </head>
 <body>
   <div class="container">
-    <div class="logo">🌾 Lokal</div>
+    <div class="logo">🌾 Rett fra Bonden</div>
     <h1>Gratulerer!</h1>
     <div class="success-box">
-      <p><strong>${this.escapeHtml(agentName)}</strong> er nå ditt på Lokal.</p>
+      <p><strong>${this.escapeHtml(agentName)}</strong> er nå ditt på Rett fra Bonden.</p>
     </div>
     <p>Din agent er klar. Du kan nå:</p>
     <ul>
@@ -507,7 +507,7 @@ Hvis du ikke ba om denne koden, kan du ignorere denne e-posten.
     return `
 Gratulerer!
 
-${agentName} er nå ditt på Lokal.
+${agentName} er nå ditt på Rett fra Bonden.
 
 Din agent er klar. Du kan nå:
 - Oppdatere informasjon om produkter og åpningstider
