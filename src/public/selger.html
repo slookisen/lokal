@@ -2058,6 +2058,7 @@
       document.getElementById('claimStep2').classList.remove('hidden');
       document.getElementById('claimAgentName').textContent = agentName;
       document.getElementById('claimAgentDesc').textContent = 'Bekreft at du eier denne butikken for å ta kontroll over agenten.';
+      claimAgentId = agentId;  // Critical: set the module-level var used by btnRequestClaim
       state.agentId = agentId;
       document.getElementById('claimStep2').scrollIntoView({ behavior: 'smooth', block: 'start' });
     }
