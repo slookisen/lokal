@@ -389,7 +389,7 @@
       <h1>Rett fra Bonden</h1>
       <p class="subtitle">Analytics Dashboard</p>
       <input type="password" id="keyInput" placeholder="Lim inn din ANALYTICS_ADMIN_KEY" autocomplete="off">
-      <button id="loginBtn" onclick="doLogin()">Logg inn</button>
+      <button id="loginBtn">Logg inn</button>
       <p class="login-error" id="loginError">Feil nøkkel. Bruk verdien du satte som ANALYTICS_ADMIN_KEY på Fly.</p>
     </div>
   </div>
@@ -399,7 +399,7 @@
     <div class="topbar">
       <h1>&#127793; Rett fra Bonden — Analytics</h1>
       <div class="topbar-actions">
-        <select class="time-select" id="timeSelect" onchange="loadDashboard()">
+        <select class="time-select" id="timeSelect">
           <option value="1">Siste time</option>
           <option value="6">Siste 6 timer</option>
           <option value="24" selected>Siste 24 timer</option>
@@ -407,8 +407,8 @@
           <option value="168">Siste uke</option>
           <option value="720">Siste 30 dager</option>
         </select>
-        <button class="btn-sm" onclick="loadDashboard()">&#8635; Oppdater</button>
-        <button class="btn-logout" onclick="doLogout()">Logg ut</button>
+        <button class="btn-sm" id="refreshBtn">&#8635; Oppdater</button>
+        <button class="btn-logout" id="logoutBtn">Logg ut</button>
       </div>
     </div>
 
@@ -518,18 +518,23 @@
       document.getElementById("loginError").style.display = "none";
     }
 
-    // Auto-login from session
-    (function() {
-      const saved = sessionStorage.getItem("rfb_key");
+    // ─── Event listeners (no inline handlers — CSP safe) ──
+    document.addEventListener("DOMContentLoaded", function() {
+      document.getElementById("loginBtn").addEventListener("click", doLogin);
+      document.getElementById("keyInput").addEventListener("keydown", function(e) {
+        if (e.key === "Enter") doLogin();
+      });
+      document.getElementById("timeSelect").addEventListener("change", loadDashboard);
+      document.getElementById("refreshBtn").addEventListener("click", loadDashboard);
+      document.getElementById("logoutBtn").addEventListener("click", doLogout);
+
+      // Auto-login from session
+      var saved = sessionStorage.getItem("rfb_key");
       if (saved) {
         document.getElementById("keyInput").value = saved;
         doLogin();
       }
-      // Enter key on input
-      document.getElementById("keyInput").addEventListener("keydown", e => {
-        if (e.key === "Enter") doLogin();
-      });
-    })();
+    });
 
     // ─── API helper ────────────────────────────────────
     function api(path) {
