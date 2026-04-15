@@ -22,7 +22,7 @@ export class EmailService {
   private isConfigured: boolean;
 
   constructor() {
-    this.fromAddress = process.env.SMTP_FROM || 'hei@lokal.farm';
+    this.fromAddress = process.env.SMTP_FROM || 'kontakt@rettfrabonden.com';
     this.isConfigured = this.setupTransporter();
   }
 
@@ -84,7 +84,7 @@ export class EmailService {
         subject,
         htmlContent,
         textContent,
-        replyTo: 'hallo@lokal.farm',
+        replyTo: 'kontakt@rettfrabonden.com',
         listUnsubscribe: `<${unsubscribeLink}>`,
       });
     } catch (error) {
@@ -116,7 +116,7 @@ export class EmailService {
         subject,
         htmlContent,
         textContent,
-        replyTo: 'hallo@lokal.farm',
+        replyTo: 'kontakt@rettfrabonden.com',
       });
     } catch (error) {
       logger.error('Error sending verification code', {
@@ -147,7 +147,7 @@ export class EmailService {
         subject,
         htmlContent,
         textContent,
-        replyTo: 'hallo@lokal.farm',
+        replyTo: 'kontakt@rettfrabonden.com',
       });
     } catch (error) {
       logger.error('Error sending claim confirmation', {
@@ -316,14 +316,14 @@ export class EmailService {
 
     <a href="${this.escapeHtml(claimUrl)}" class="cta-button">Krav din agent på Lokal</a>
 
-    <p style="font-size: 14px; color: #666; margin-top: 25px;">Har du spørsmål? Svar på denne e-posten eller kontakt oss på <a href="mailto:hallo@lokal.farm" class="footer-link">hallo@lokal.farm</a>.</p>
+    <p style="font-size: 14px; color: #666; margin-top: 25px;">Har du spørsmål? Svar på denne e-posten eller kontakt oss på <a href="mailto:kontakt@rettfrabonden.com" class="footer-link">kontakt@rettfrabonden.com</a>.</p>
 
     <div class="footer">
-      <p>Lokal bygger nettverk hvor norske matprodusenter møter mennesker som verdsetter lokal og god mat.</p>
+      <p>Rett fra Bonden bygger nettverk hvor norske matprodusenter møter mennesker som verdsetter lokal og god mat.</p>
       <p>
         <a href="${this.escapeHtml(unsubscribeLink)}" class="footer-link">Avslutt abonnement</a>
       </p>
-      <p style="margin-top: 15px; color: #999;">Lokal | Det lokale matnettet</p>
+      <p style="margin-top: 15px; color: #999;">Rett fra Bonden | rettfrabonden.com</p>
     </div>
   </div>
 </body>
@@ -360,10 +360,10 @@ ${claimUrl}
 
 SPØRSMÅL?
 
-Svar på denne e-posten eller kontakt oss på hallo@lokal.farm
+Svar på denne e-posten eller kontakt oss på kontakt@rettfrabonden.com
 
 ---
-Lokal bygger nettverk hvor norske matprodusenter møter mennesker som verdsetter lokal og god mat.
+Rett fra Bonden bygger nettverk hvor norske matprodusenter møter mennesker som verdsetter lokal og god mat.
     `;
   }
 
