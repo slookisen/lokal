@@ -523,6 +523,31 @@ router.post("/agents/:id/claim/verify", (req: Request, res: Response) => {
   });
 });
 
+// ─── POST /auth/login — Token-based login (single DB lookup) ──────────
+
+router.post("/auth/login", (req: Request, res: Response) => {
+  const { token } = req.body;
+  if (!token) {
+    res.status(400).json({ success: false, error: "Token er påkrevd" });
+    return;
+  }
+
+  const claim = knowledgeService.getClaimByToken(token);
+  if (!claim) {
+    res.status(401).json({ success: false, error: "Ugyldig eller utløpt token" });
+    return;
+  }
+
+  // Return the agent ID so the client can go straight to dashboard
+  res.json({
+    success: true,
+    data: {
+      agentId: claim.agentId,
+      claimantName: claim.claimantName,
+    },
+  });
+});
+
 // ─── PUT /agents/:id/knowledge — Update knowledge ───────────
 // Authenticated via claim token, API key, OR admin key.
 // Admin key uses upsertKnowledge (dataSource: "auto") for enrichment.

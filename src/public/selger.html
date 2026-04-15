@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Lokal — Registrer din butikk</title>
+  <title>Rett fra Bonden — Registrer din butikk</title>
   <style>
     * { margin: 0; padding: 0; box-sizing: border-box; }
     :root {
@@ -186,7 +186,7 @@
 <body>
   <!-- ═══════════ TOP BAR ═══════════ -->
   <div class="topbar">
-    <a href="/" class="topbar-logo">Lokal<span>.</span></a>
+    <a href="/" class="topbar-logo">Rett fra Bonden<span>.</span></a>
     <div class="topbar-right">
       <button class="lang-toggle" id="langToggle">EN</button>
       <button class="btn-logout hidden" id="btnLogout" data-i18n="logout">Logg ut</button>
@@ -199,7 +199,7 @@
       <!-- Welcome hero -->
       <div class="claim-hero">
         <h1>Gjør butikken din synlig for AI</h1>
-        <p>Registrer deg i Lokal, og kunder som spør ChatGPT, Claude eller Siri om lokal mat finner deg automatisk. Det tar under 2 minutter.</p>
+        <p>Registrer deg på Rett fra Bonden, og kunder som spør ChatGPT, Claude eller Siri om lokal mat finner deg automatisk. Det tar under 2 minutter.</p>
       </div>
 
       <!-- ══════ STEP 1: FIND YOUR BUSINESS ══════ -->
@@ -712,7 +712,7 @@
 
   <script>
     // ═══════════════════════════════════════════════════════════════
-    // Lokal Seller Dashboard — Full client-side app
+    // Rett fra Bonden Seller Dashboard — Full client-side app
     // Architecture: Token-based auth, all state in memory,
     // communicates with rettfrabonden.com REST API.
     // ═══════════════════════════════════════════════════════════════
@@ -737,7 +737,7 @@
     const i18n = {
       no: {
         claim_title: 'Eier du en lokal matbutikk?',
-        claim_subtitle: 'Finn din agent i Lokal-registeret og ta kontroll. Oppdater info, legg til produkter, og bli synlig for kj\u00f8peragenter.',
+        claim_subtitle: 'Finn din agent i Rett fra Bonden-registeret og ta kontroll. Oppdater info, legg til produkter, og bli synlig for kj\u00f8peragenter.',
         claim_search_placeholder: 'S\u00f8k etter butikknavn eller by...',
         step_find: 'Finn agent', step_verify: 'Verifiser', step_manage: 'Administrer',
         your_name: 'Ditt navn', your_email: 'Din e-post', your_phone: 'Telefon (valgfritt)',
@@ -805,7 +805,7 @@
       },
       en: {
         claim_title: 'Own a local food shop?',
-        claim_subtitle: 'Find your agent in the Lokal registry and take control. Update info, add products, and become visible to buyer agents.',
+        claim_subtitle: 'Find your agent in the Rett fra Bonden registry and take control. Update info, add products, and become visible to buyer agents.',
         claim_search_placeholder: 'Search by shop name or city...',
         step_find: 'Find agent', step_verify: 'Verify', step_manage: 'Manage',
         your_name: 'Your name', your_email: 'Your email', your_phone: 'Phone (optional)',
@@ -1106,44 +1106,26 @@
       this.disabled = false;
     });
 
-    // ── Login with token ──
+    // ── Login with token (single server-side lookup) ──
     document.getElementById('btnLogin').addEventListener('click', async function() {
       var token = document.getElementById('loginToken').value.trim();
       if (!token) return;
       this.disabled = true;
-      // Try to validate the token by fetching agents
-      state.claimToken = token;
       try {
-        // We'll try to find which agent this token belongs to
-        // by querying all agents and checking claim status
-        var agents = await api('/agents');
-        if (agents.success && agents.agents) {
-          // Try each agent's info endpoint with the token
-          var found = false;
-          for (var ag of agents.agents) {
-            try {
-              var info = await api('/agents/' + ag.id + '/info');
-              if (info.success && info.data && info.data.agent && info.data.agent.isClaimed) {
-                // Try to update knowledge to verify token works
-                var test = await fetch(API + '/agents/' + ag.id + '/knowledge', {
-                  method: 'PUT',
-                  headers: { 'Content-Type': 'application/json', 'X-Claim-Token': token },
-                  body: JSON.stringify({})
-                });
-                var testRes = await test.json();
-                if (testRes.success) {
-                  state.agentId = ag.id;
-                  found = true;
-                  loadDashboard();
-                  break;
-                }
-              }
-            } catch(e) { /* skip */ }
-          }
-          if (!found) {
-            showAlert('dashAlert', t('login_error'), 'error');
-            state.claimToken = null;
-          }
+        var res = await fetch(API + '/auth/login', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ token: token })
+        });
+        var data = await res.json();
+        if (data.success && data.data && data.data.agentId) {
+          state.claimToken = token;
+          state.agentId = data.data.agentId;
+          saveSession(data.data.agentId, token);
+          loadDashboard();
+        } else {
+          showAlert('dashAlert', data.error || t('login_error'), 'error');
+          state.claimToken = null;
         }
       } catch (err) {
         showAlert('dashAlert', t('login_error'), 'error');

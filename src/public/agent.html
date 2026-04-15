@@ -3,14 +3,14 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <meta property="og:title" content="Lokal Agent">
+    <meta property="og:title" content="Rett fra Bonden Agent">
     <meta property="og:description" content="Finn lokal mat og matprodusenter i Norge">
     <meta property="og:url" content="">
     <meta property="og:type" content="website">
-    <meta property="og:site_name" content="Lokal">
+    <meta property="og:site_name" content="Rett fra Bonden">
     <meta name="description" content="Finn lokal mat og matprodusenter i Norge">
     <link rel="canonical" href="">
-    <title>Lokal</title>
+    <title>Rett fra Bonden</title>
     <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
     <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
     <style>
@@ -120,16 +120,16 @@
         var desc=k.about||'';
 
         // Update page meta
-        document.title=name+' | Lokal';
-        document.querySelector('meta[property="og:title"]').setAttribute('content',name+' — Lokal');
-        document.querySelector('meta[property="og:description"]').setAttribute('content',desc?desc.substring(0,160):'Finn '+name+' paa Lokal');
+        document.title=name+' | Rett fra Bonden';
+        document.querySelector('meta[property="og:title"]').setAttribute('content',name+' — Rett fra Bonden');
+        document.querySelector('meta[property="og:description"]').setAttribute('content',desc?desc.substring(0,160):'Finn '+name+' paa Rett fra Bonden');
         document.querySelector('meta[property="og:url"]').setAttribute('content',window.location.href);
-        document.querySelector('meta[name="description"]').setAttribute('content',desc?desc.substring(0,160):'Finn '+name+' paa Lokal');
+        document.querySelector('meta[name="description"]').setAttribute('content',desc?desc.substring(0,160):'Finn '+name+' paa Rett fra Bonden');
         document.querySelector('link[rel="canonical"]').setAttribute('href',window.location.href);
 
         var html='';
         // Nav
-        html+='<nav><div class="container"><a href="/">Lokal</a><a href="/" class="back">Alle agenter</a></div></nav>';
+        html+='<nav><div class="container"><a href="/">Rett fra Bonden</a><a href="/" class="back">Alle agenter</a></div></nav>';
         // Header
         html+='<header><div class="container">';
         html+='<div class="hero-title"><h1>'+name+'</h1>';
