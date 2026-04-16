@@ -162,7 +162,7 @@ export class EmailService {
     }
   }
 
-  private async sendEmail(options: EmailOptions): Promise<{ success: boolean; messageId?: string; error?: string }> {
+  async sendEmail(options: EmailOptions): Promise<{ success: boolean; messageId?: string; error?: string }> {
     if (!this.isConfigured) {
       logger.info('DRY RUN: Would send email', {
         to: options.to,

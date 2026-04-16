@@ -1210,6 +1210,46 @@ router.get("/admin/claims", (req: Request, res: Response) => {
   });
 });
 
+// ═══════════════════════════════════════════════════════════════
+// INBOUND EMAIL WEBHOOK
+// Resend sends a POST here when someone emails *@rettfrabonden.com
+// We forward it to the admin's Gmail so nothing gets lost.
+// ═══════════════════════════════════════════════════════════════
+
+router.post("/webhooks/inbound-email", async (req: Request, res: Response) => {
+  try {
+    const payload = req.body;
+    const from = payload.from || "unknown";
+    const to = payload.to || [];
+    const subject = payload.subject || "(ingen emne)";
+    const text = payload.text || "";
+    const html = payload.html || "";
+
+    console.log(`[Inbound] Email from ${from} to ${JSON.stringify(to)} — "${subject}"`);
+
+    // Forward to admin Gmail
+    const forwardTo = process.env.ADMIN_EMAIL || "da.fredriksen@gmail.com";
+    const forwarded = await emailService.sendEmail({
+      to: forwardTo,
+      subject: `[Innkommende] ${subject} (fra ${from})`,
+      htmlContent: html || `<pre>${text}</pre>`,
+      textContent: `Videresent fra: ${from}\nTil: ${JSON.stringify(to)}\n\n${text}`,
+      replyTo: typeof from === "string" ? from : undefined,
+    });
+
+    if (forwarded) {
+      console.log(`[Inbound] Forwarded to ${forwardTo}`);
+    } else {
+      console.warn(`[Inbound] Forward failed — email service not configured or send failed`);
+    }
+
+    res.status(200).json({ received: true });
+  } catch (err) {
+    console.error("[Inbound] Webhook error:", err);
+    res.status(200).json({ received: true }); // Always 200 so Resend doesn't retry
+  }
+});
+
 function getBaseUrl(req: Request): string {
   return process.env.BASE_URL || `${req.protocol}://${req.get("host")}`;
 }
