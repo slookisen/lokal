@@ -1091,8 +1091,8 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
         </div>
 
         <div class="data-src">
-          <span class="data-dot ${k.dataSource === "auto" ? "auto" : "owner"}"></span>
-          ${k.dataSource === "auto" ? "Automatisk innhentet data" : k.dataSource === "hybrid" ? "Verifisert av eier" : "Eierstyrt"}${k.lastEnrichedAt ? ` \u2014 Sist oppdatert ${new Date(k.lastEnrichedAt).toLocaleDateString("nb-NO")}` : ""}
+          <span class="data-dot ${(!k.dataSource || k.dataSource === "auto") ? "auto" : "owner"}"></span>
+          ${(!k.dataSource || k.dataSource === "auto") ? "Automatisk innhentet data" : k.dataSource === "hybrid" ? "Verifisert av eier" : "Eierstyrt"}${k.lastEnrichedAt ? ` \u2014 Sist oppdatert ${new Date(k.lastEnrichedAt).toLocaleDateString("nb-NO")}` : ""}
         </div>
 
         ${meta.disclaimer ? `<p style="margin-top:8px;font-size:0.75rem;color:var(--g500);">${escapeHtml(meta.disclaimer)}</p>` : ""}
