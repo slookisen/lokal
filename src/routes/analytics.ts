@@ -69,6 +69,84 @@ router.get("/mark-owner", (req: Request, res: Response) => {
 router.use(requireAdminAuth);
 
 /**
+ * POST /admin/analytics/tag-owner
+ * Retroactively tag historical traffic as owner based on known fingerprints.
+ * Body: { userAgentHashes: string[], ipHashes: string[], dryRun?: boolean }
+ */
+router.post("/tag-owner", (req: Request, res: Response) => {
+  try {
+    const db = getDb();
+    const { userAgentHashes = [], ipHashes = [], dryRun = false } = req.body;
+
+    if (userAgentHashes.length === 0 && ipHashes.length === 0) {
+      res.status(400).json({ error: "Oppgi userAgentHashes og/eller ipHashes" });
+      return;
+    }
+
+    const results: Record<string, number> = {};
+
+    // Tag page views by user_agent_hash
+    if (userAgentHashes.length > 0) {
+      const placeholders = userAgentHashes.map(() => "?").join(",");
+
+      if (dryRun) {
+        const count = db.prepare(
+          `SELECT COUNT(*) as count FROM analytics_page_views WHERE user_agent_hash IN (${placeholders}) AND (is_owner IS NULL OR is_owner = 0)`
+        ).get(...userAgentHashes) as any;
+        results.pageViewsByUAHash = count.count;
+      } else {
+        const r = db.prepare(
+          `UPDATE analytics_page_views SET is_owner = 1 WHERE user_agent_hash IN (${placeholders}) AND (is_owner IS NULL OR is_owner = 0)`
+        ).run(...userAgentHashes);
+        results.pageViewsByUAHash = r.changes;
+      }
+    }
+
+    // Tag page views by session IP (session_id starts with ip_hash:)
+    if (ipHashes.length > 0) {
+      let pvByIp = 0;
+      for (const ip of ipHashes) {
+        if (dryRun) {
+          const count = db.prepare(
+            `SELECT COUNT(*) as count FROM analytics_page_views WHERE session_id LIKE ? AND (is_owner IS NULL OR is_owner = 0)`
+          ).get(ip + ":%") as any;
+          pvByIp += count.count;
+        } else {
+          const r = db.prepare(
+            `UPDATE analytics_page_views SET is_owner = 1 WHERE session_id LIKE ? AND (is_owner IS NULL OR is_owner = 0)`
+          ).run(ip + ":%");
+          pvByIp += r.changes;
+        }
+      }
+      results.pageViewsByIP = pvByIp;
+
+      // Tag queries by client_ip_hash
+      const qPlaceholders = ipHashes.map(() => "?").join(",");
+      if (dryRun) {
+        const count = db.prepare(
+          `SELECT COUNT(*) as count FROM analytics_queries WHERE client_ip_hash IN (${qPlaceholders}) AND (is_owner IS NULL OR is_owner = 0)`
+        ).get(...ipHashes) as any;
+        results.queriesByIP = count.count;
+      } else {
+        const r = db.prepare(
+          `UPDATE analytics_queries SET is_owner = 1 WHERE client_ip_hash IN (${qPlaceholders}) AND (is_owner IS NULL OR is_owner = 0)`
+        ).run(...ipHashes);
+        results.queriesByIP = r.changes;
+      }
+    }
+
+    res.json({
+      success: true,
+      dryRun,
+      tagged: results,
+      message: dryRun ? "Tørkjøring — ingen data endret" : "Historisk trafikk tagget som eier",
+    });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+/**
  * GET /admin/analytics/summary
  * High-level analytics for the last 24 hours
  */
