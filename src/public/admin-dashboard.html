@@ -150,8 +150,11 @@
 
     <div class="content">
         <div id="lastUpdated" class="last-updated"></div>
+        <div id="ownerCookieBanner" style="display:none; background:#fef3c7; border:1px solid #f59e0b; border-radius:8px; padding:10px 16px; margin-bottom:16px; font-size:0.85rem; color:#92400e;">
+            <strong>Eier-modus aktiv</strong> — din trafikk ekskluderes fra tallene. <a href="#" id="ownerCookieRemove" style="color:#b45309;">Fjern</a>
+        </div>
 
-        <!-- Stat Cards (6 now) -->
+        <!-- Stat Cards (7 now) -->
         <div class="stat-grid">
             <div class="stat-card">
                 <div class="stat-label">Sidevisninger</div>
@@ -178,6 +181,11 @@
                 <div class="stat-label">Bot-trafikk</div>
                 <div id="statBots" class="stat-value red">—</div>
                 <div id="statBotsPct" class="stat-sub"></div>
+            </div>
+            <div class="stat-card" style="border-left: 3px solid #f59e0b;">
+                <div class="stat-label">Eier-trafikk (deg)</div>
+                <div id="statOwner" class="stat-value" style="color:#f59e0b;">—</div>
+                <div id="statOwnerSub" class="stat-sub"></div>
             </div>
         </div>
 
@@ -285,6 +293,19 @@
             try { sessionStorage.setItem("rfb_key", key); } catch(e) {}
             document.getElementById("loginScreen").style.display = "none";
             document.getElementById("dashboard").style.display = "block";
+
+            // Check if owner cookie is set
+            var hasOwnerCookie = document.cookie.split(";").some(function(c) { return c.trim() === "_rfb_owner=1"; });
+            if (hasOwnerCookie) {
+                document.getElementById("ownerCookieBanner").style.display = "block";
+            }
+            document.getElementById("ownerCookieRemove").addEventListener("click", function(e) {
+                e.preventDefault();
+                document.cookie = "_rfb_owner=0; Path=/; Max-Age=0; SameSite=Lax";
+                document.getElementById("ownerCookieBanner").style.display = "none";
+                alert("Cookie fjernet. Trafikken din telles som vanlig fra nå av.");
+            });
+
             loadDashboard();
         })
         .catch(function() {
@@ -400,6 +421,15 @@
         document.getElementById("statHumansPct").textContent = Math.round(humanViews / totalViews * 100) + "% av visninger";
         document.getElementById("statBots").textContent = fmtNum(botViews);
         document.getElementById("statBotsPct").textContent = Math.round(botViews / totalViews * 100) + "% av visninger";
+
+        // Owner stats
+        var ownerStats = s.ownerStats || { pageViews: 0, queries: 0 };
+        var ownerEl = document.getElementById("statOwner");
+        var ownerSubEl = document.getElementById("statOwnerSub");
+        if (ownerEl) {
+            ownerEl.textContent = fmtNum(ownerStats.pageViews);
+            ownerSubEl.textContent = ownerStats.queries + " søk ekskludert";
+        }
     }
 
     // ─── Hourly Traffic Chart (SVG area chart) ──────

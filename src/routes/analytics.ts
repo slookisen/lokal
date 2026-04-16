@@ -43,6 +43,28 @@ function requireAdminAuth(req: Request, res: Response, next: Function): void {
   next();
 }
 
+// ─── Owner cookie (set before auth middleware) ─────────────────
+// Visit /admin/analytics/mark-owner?key=ADMIN_KEY to tag your browser.
+// All subsequent page views and searches will be marked as owner traffic.
+router.get("/mark-owner", (req: Request, res: Response) => {
+  const expectedKey = process.env.ANALYTICS_ADMIN_KEY || process.env.ADMIN_API_KEY || "";
+  const key = req.query.key as string;
+  if (!expectedKey || key !== expectedKey) {
+    res.status(401).json({ error: "Ugyldig nøkkel" });
+    return;
+  }
+
+  const remove = req.query.remove === "1";
+  if (remove) {
+    res.setHeader("Set-Cookie", "_rfb_owner=0; Path=/; Max-Age=0; SameSite=Lax");
+    res.json({ success: true, message: "Eier-cookie fjernet. Trafikken din telles som vanlig nå." });
+  } else {
+    // Cookie lasts 1 year
+    res.setHeader("Set-Cookie", "_rfb_owner=1; Path=/; Max-Age=31536000; SameSite=Lax");
+    res.json({ success: true, message: "Eier-cookie satt. All din trafikk merkes nå som 'eier' i analytics." });
+  }
+});
+
 // Apply auth to all analytics routes
 router.use(requireAdminAuth);
 

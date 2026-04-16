@@ -24,6 +24,12 @@ function sqliteDatetime(date: Date): string {
   return date.toISOString().replace("T", " ").replace(/\.\d{3}Z$/, "");
 }
 
+// ─── Helper: Check owner cookie from raw header ─────────────
+function isOwnerRequest(req: Request): boolean {
+  const cookieHeader = req.headers.cookie || "";
+  return cookieHeader.split(";").some(c => c.trim() === "_rfb_owner=1");
+}
+
 // ─── Helper: Privacy-safe IP hashing ─────────────────────────
 function hashIP(ip: string): string {
   return crypto.createHash("sha256").update(ip).digest("hex").slice(0, 16);
@@ -139,7 +145,7 @@ export class AnalyticsService {
       trackPageViews: true,
       trackSearchQueries: true,
       trackAgentViews: true,
-      skipPaths: ["/health", "/openapi.yaml", "/.well-known/"],
+      skipPaths: ["/health", "/openapi.yaml", "/.well-known/", "/admin/"],
       ...options,
     };
   }
@@ -158,9 +164,11 @@ export class AnalyticsService {
         return next();
       }
 
-      // Track page views for human visitors (GET requests to main frontend routes)
-      if (self.options.trackPageViews && req.method === "GET") {
-        self.trackPageView(req);
+      // Track page views for human visitors (GET requests to frontend pages only)
+      // Exclude API endpoints — only track actual page loads
+      if (self.options.trackPageViews && req.method === "GET" && !req.path.startsWith("/api/")) {
+        const isOwner = isOwnerRequest(req);
+        self.trackPageView(req, isOwner);
       }
 
       // Intercept response to track timing
@@ -170,7 +178,8 @@ export class AnalyticsService {
 
         // Track API usage and queries
         if (self.options.trackSearchQueries && req.path.includes("/search")) {
-          analyticsService.trackSearchQuery(req, duration);
+          const isOwner = isOwnerRequest(req);
+          analyticsService.trackSearchQuery(req, duration, undefined, isOwner);
         }
 
         return originalSend.call(this, data);
@@ -183,7 +192,7 @@ export class AnalyticsService {
   /**
    * Track page view for human visitors
    */
-  trackPageView(req: Request): void {
+  trackPageView(req: Request, isOwner: boolean = false): void {
     try {
       const db = getDb();
       const path = req.path;
@@ -197,9 +206,9 @@ export class AnalyticsService {
       const sessionId = sessionManager.getOrCreate(ipHash, userAgent);
 
       db.prepare(`
-        INSERT INTO analytics_page_views (path, referrer, source, user_agent_hash, session_id)
-        VALUES (?, ?, ?, ?, ?)
-      `).run(path, referrer || null, source, userAgentHash, sessionId);
+        INSERT INTO analytics_page_views (path, referrer, source, user_agent_hash, session_id, is_owner)
+        VALUES (?, ?, ?, ?, ?, ?)
+      `).run(path, referrer || null, source, userAgentHash, sessionId, isOwner ? 1 : 0);
     } catch (err) {
       console.error("[analytics] Failed to track page view:", err);
     }
@@ -215,7 +224,7 @@ export class AnalyticsService {
     city?: string;
     resultCount?: number;
     agentId?: string;
-  }): void {
+  }, isOwner: boolean = false): void {
     try {
       const db = getDb();
       const userAgent = req.get("user-agent") || "";
@@ -234,8 +243,8 @@ export class AnalyticsService {
       const ipHash = hashIP(clientIp);
 
       db.prepare(`
-        INSERT INTO analytics_queries (protocol, query, categories, city, result_count, response_time_ms, agent_id, client_ip_hash)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO analytics_queries (protocol, query, categories, city, result_count, response_time_ms, agent_id, client_ip_hash, is_owner)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
       `).run(
         protocol,
         String(query),
@@ -244,7 +253,8 @@ export class AnalyticsService {
         resultCount,
         responseTimeMs,
         uaParse.clientName || null,
-        ipHash
+        ipHash,
+        isOwner ? 1 : 0
       );
     } catch (err) {
       console.error("[analytics] Failed to track search query:", err);
@@ -307,26 +317,33 @@ export class AnalyticsService {
     topSearchTerms: Array<{ query: string; count: number }>;
     trafficBySource: Record<string, number>;
     agentTraffic: { chatgpt: number; claude: number; other: number };
+    ownerStats: { pageViews: number; queries: number };
   } {
     try {
       const db = getDb();
       const cutoff = sqliteDatetime(new Date(Date.now() - hoursBack * 60 * 60 * 1000));
 
-      // Page views
+      // Page views (excluding owner)
       const pvResult = db.prepare(`
-        SELECT COUNT(*) as count FROM analytics_page_views WHERE created_at > ?
+        SELECT COUNT(*) as count FROM analytics_page_views WHERE created_at > ? AND (is_owner IS NULL OR is_owner = 0)
       `).get(cutoff) as any;
       const pageViews = pvResult.count;
 
-      // Unique visitors
+      // Owner page views
+      const ownerPvResult = db.prepare(`
+        SELECT COUNT(*) as count FROM analytics_page_views WHERE created_at > ? AND is_owner = 1
+      `).get(cutoff) as any;
+      const ownerPageViews = ownerPvResult.count;
+
+      // Unique visitors (excluding owner)
       const uvResult = db.prepare(`
-        SELECT COUNT(DISTINCT session_id) as count FROM analytics_page_views WHERE created_at > ?
+        SELECT COUNT(DISTINCT session_id) as count FROM analytics_page_views WHERE created_at > ? AND (is_owner IS NULL OR is_owner = 0)
       `).get(cutoff) as any;
       const uniqueVisitors = uvResult.count;
 
-      // Traffic by source
+      // Traffic by source (excluding owner)
       const sourceResult = db.prepare(`
-        SELECT source, COUNT(*) as count FROM analytics_page_views WHERE created_at > ?
+        SELECT source, COUNT(*) as count FROM analytics_page_views WHERE created_at > ? AND (is_owner IS NULL OR is_owner = 0)
         GROUP BY source
       `).all(cutoff) as any[];
       const trafficBySource: Record<string, number> = {};
@@ -334,16 +351,22 @@ export class AnalyticsService {
         trafficBySource[row.source] = row.count;
       });
 
-      // Total queries
+      // Total queries (excluding owner)
       const qResult = db.prepare(`
-        SELECT COUNT(*) as count FROM analytics_queries WHERE created_at > ?
+        SELECT COUNT(*) as count FROM analytics_queries WHERE created_at > ? AND (is_owner IS NULL OR is_owner = 0)
       `).get(cutoff) as any;
       const totalQueries = qResult.count;
 
-      // Top search terms
+      // Owner queries
+      const ownerQResult = db.prepare(`
+        SELECT COUNT(*) as count FROM analytics_queries WHERE created_at > ? AND is_owner = 1
+      `).get(cutoff) as any;
+      const ownerQueries = ownerQResult.count;
+
+      // Top search terms (excluding owner)
       const topQueriesResult = db.prepare(`
         SELECT query, COUNT(*) as count FROM analytics_queries
-        WHERE created_at > ? AND query IS NOT NULL AND query != ''
+        WHERE created_at > ? AND query IS NOT NULL AND query != '' AND (is_owner IS NULL OR is_owner = 0)
         GROUP BY query
         ORDER BY count DESC
         LIMIT 10
@@ -371,6 +394,7 @@ export class AnalyticsService {
         topSearchTerms,
         trafficBySource,
         agentTraffic,
+        ownerStats: { pageViews: ownerPageViews, queries: ownerQueries },
       };
     } catch (err) {
       console.error("[analytics] Failed to get summary:", err);
@@ -382,6 +406,7 @@ export class AnalyticsService {
         topSearchTerms: [],
         trafficBySource: {},
         agentTraffic: { chatgpt: 0, claude: 0, other: 0 },
+        ownerStats: { pageViews: 0, queries: 0 },
       };
     }
   }

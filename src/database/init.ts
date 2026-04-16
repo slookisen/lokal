@@ -402,6 +402,16 @@ function initSchema(db: Database.Database): void {
     // Column already exists — expected after first migration
   }
 
+  // ─── Add is_owner column to analytics tables ─────────────────
+  // Allows filtering out owner/developer traffic in dashboard
+  for (const table of ["analytics_page_views", "analytics_queries", "analytics_agent_views"]) {
+    try {
+      db.exec(`ALTER TABLE ${table} ADD COLUMN is_owner INTEGER DEFAULT 0`);
+    } catch {
+      // Column already exists
+    }
+  }
+
   // ─── One-time cleanup: reset all test verifications ──────────
   // No real sellers have claimed yet — all is_verified=1 entries
   // are from development/testing. Reset them to 0 and clean claims.
