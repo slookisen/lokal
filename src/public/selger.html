@@ -1276,6 +1276,38 @@
         return;
       }
 
+      // Validate claim token against backend BEFORE showing dashboard
+      if (state.claimToken) {
+        try {
+          var authCheck = await api('/auth/login', {
+            method: 'POST',
+            body: JSON.stringify({ token: state.claimToken })
+          });
+          if (!authCheck.success || authCheck.data.agentId !== state.agentId) {
+            // Token expired, invalid, or belongs to a different agent
+            var staleToken = state.claimToken;
+            var staleAgentId = state.agentId;
+            clearSession();
+            state.claimToken = null;
+            state.agentId = null;
+            // Also remove from saved agents list
+            try {
+              var saved = getSavedAgents().filter(function(a) {
+                return a.token !== staleToken && a.agentId !== staleAgentId;
+              });
+              localStorage.setItem('lokal_agents', JSON.stringify(saved));
+            } catch(e) {}
+            show('viewClaim');
+            hide('viewDashboard');
+            showAlert('claimAlert', 'Innloggingen din har utløpt. Vennligst logg inn på nytt.', 'error');
+            return;
+          }
+        } catch(e) {
+          // Network error — don't block, but warn
+          console.warn('Could not verify session:', e);
+        }
+      }
+
       hide('viewClaim');
       show('viewDashboard');
       show('btnLogout');
