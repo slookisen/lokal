@@ -333,7 +333,7 @@ router.get("/.well-known/agent.json", serveAgentCard);       // Legacy compat
 
 // GET /agents/:id/agent.json — Individual producer Agent Card
 router.get("/agents/:id/agent.json", (req: Request, res: Response) => {
-  const card = agentCardService.generateCard(req.params.id, BASE_URL);
+  const card = agentCardService.generateCard(req.params.id as string, BASE_URL);
   if (!card) {
     res.status(404).json({ error: "Agent not found" });
     return;
@@ -392,7 +392,7 @@ router.get("/api/live", (req: Request, res: Response) => {
 
 // Forward interactions and messages to SSE clients
 interactionLogger.on("interaction", (event: InteractionEvent) => {
-  const data = JSON.stringify({ type: "interaction", ...event });
+  const data = JSON.stringify({ eventType: "interaction", ...event });
   for (const client of sseClients) {
     try { client.write(`data: ${data}\n\n`); } catch { sseClients.delete(client); }
   }
@@ -439,15 +439,15 @@ router.post("/api/conversations", (req: Request, res: Response) => {
 router.get("/api/conversations", (req: Request, res: Response) => {
   const conversations = conversationService.listConversations({
     limit: parseInt(req.query.limit as string) || 50,
-    status: req.query.status as string,
-    agentId: req.query.agentId as string,
+    status: (req.query.status as string) || undefined,
+    agentId: (req.query.agentId as string) || undefined,
   });
   res.json({ success: true, data: conversations, count: conversations.length });
 });
 
 // GET /api/conversations/:id — Get single conversation with messages
 router.get("/api/conversations/:id", (req: Request, res: Response) => {
-  const conversation = conversationService.getConversation(req.params.id);
+  const conversation = conversationService.getConversation(req.params.id as string);
   if (!conversation) {
     res.status(404).json({ success: false, error: "Conversation not found" });
     return;
@@ -463,7 +463,7 @@ router.post("/api/conversations/:id/messages", (req: Request, res: Response) => 
     return;
   }
   const message = conversationService.addMessage({
-    conversationId: req.params.id,
+    conversationId: req.params.id as string,
     senderRole, senderAgentId, content,
     messageType: messageType || "text",
     metadata: metadata || {},
@@ -474,7 +474,7 @@ router.post("/api/conversations/:id/messages", (req: Request, res: Response) => 
 // POST /api/conversations/:id/complete — Mark transaction as completed
 router.post("/api/conversations/:id/complete", (req: Request, res: Response) => {
   try {
-    const conversation = conversationService.completeTransaction(req.params.id, {
+    const conversation = conversationService.completeTransaction(req.params.id as string, {
       totalAmountNok: req.body.totalAmountNok,
       products: req.body.products,
     });
@@ -490,7 +490,7 @@ router.post("/api/conversations/:id/complete", (req: Request, res: Response) => 
 
 // GET /api/agents/:id/metrics — Seller dashboard data
 router.get("/api/agents/:id/metrics", (req: Request, res: Response) => {
-  const metrics = conversationService.getAgentMetrics(req.params.id);
+  const metrics = conversationService.getAgentMetrics(req.params.id as string);
   res.json({ success: true, data: metrics });
 });
 

@@ -495,7 +495,7 @@ router.get("/sok", (req, res) => {
     }
     try {
         const parsed = marketplace_registry_1.marketplaceRegistry.parseNaturalQuery(q);
-        const results = marketplace_registry_1.marketplaceRegistry.discover({ ...parsed, limit: 30 });
+        const results = marketplace_registry_1.marketplaceRegistry.discover({ ...parsed, limit: 30, offset: 0 });
         const resultCards = results.map((r) => producerCard(r.agent)).join("");
         const content = `
     <section class="search-hero">

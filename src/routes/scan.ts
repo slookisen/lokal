@@ -47,9 +47,10 @@ router.post("/:id/scan", upload.array("images", 10), async (req: Request, res: R
 
     // ── MODE 1: Real image upload → Vision Provider ──────────
     if (hasFiles) {
+      const producerId = req.params.id as string;
       const imagePaths = files!.map((f) => f.path);
       const mimeTypes = files!.map((f) => f.mimetype);
-      const producer = store.getProducer(req.params.id);
+      const producer = store.getProducer(producerId);
 
       // Get the best available vision provider
       const provider = visionProviders.getProvider();
@@ -74,17 +75,18 @@ router.post("/:id/scan", upload.array("images", 10), async (req: Request, res: R
       const detectedItems = analysis.detections.map((d) => ({
         productName: d.productName,
         variety: d.variety,
-        category: d.category,
+        category: d.category as any,
         confidence: d.confidence,
         estimatedQuantity: d.estimatedQuantity,
         estimatedUnit: unitMap[d.estimatedUnit] || "kg",
         qualityScore: d.qualityScore,
         looksOrganic: d.looksOrganic,
         suggestedPricePerUnit: d.detectedPrice,
+        suggestedUnit: unitMap[d.estimatedUnit] || "kg",
       }));
 
       const result = await visionScanner.scanAndUpdate({
-        producerId: req.params.id,
+        producerId: producerId,
         detectedItems,
         frames: imagePaths,
         source: files!.some((f) => f.mimetype.startsWith("video/")) ? "video" : "multi-photo",
@@ -106,8 +108,9 @@ router.post("/:id/scan", upload.array("images", 10), async (req: Request, res: R
     }
 
     // ── MODE 2 & 3: JSON body (description or detectedItems) ──
+    const producerId = req.params.id as string;
     const scanInput: any = {
-      producerId: req.params.id,
+      producerId: producerId,
       source: req.body.source || "photo",
     };
 
@@ -133,6 +136,7 @@ router.post("/:id/scan", upload.array("images", 10), async (req: Request, res: R
 // Simpler than full scan — just updates prices for existing products
 router.post("/:id/quick-price", async (req: Request, res: Response) => {
   try {
+    const producerId = req.params.id as string;
     const { updates } = req.body;
     // Expects: [{ productName: "Tomater (Cherry)", newPrice: 28 }, ...]
     if (!Array.isArray(updates) || updates.length === 0) {
@@ -140,7 +144,7 @@ router.post("/:id/quick-price", async (req: Request, res: Response) => {
       return;
     }
 
-    const result = await visionScanner.quickPriceUpdate(req.params.id, updates);
+    const result = await visionScanner.quickPriceUpdate(producerId, updates);
     res.json({ success: true, data: result });
   } catch (err: any) {
     res.status(400).json({ success: false, error: err.message });
@@ -149,8 +153,9 @@ router.post("/:id/quick-price", async (req: Request, res: Response) => {
 
 // GET /api/products/varieties/:product
 router.get("/varieties/:product", (req: Request, res: Response) => {
-  const varieties = visionScanner.getKnownVarieties(req.params.product);
-  res.json({ success: true, product: req.params.product, varieties, count: varieties.length });
+  const product = req.params.product as string;
+  const varieties = visionScanner.getKnownVarieties(product);
+  res.json({ success: true, product: product, varieties, count: varieties.length });
 });
 
 // GET /api/products/known

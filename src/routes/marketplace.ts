@@ -43,16 +43,16 @@ function ensureAgentInDb(agentId: string): boolean {
       agent.name,
       agent.description || "",
       agent.provider || "auto-discovered",
-      agent.contactEmail || agent.contact_email || "ukjent@rettfrabonden.com",
+      agent.contactEmail || "ukjent@rettfrabonden.com",
       agent.url || `https://rettfrabonden.com/produsent/${agent.id}`,
       agent.role || "producer",
-      agent.apiKey || agent.api_key || `auto_${agent.id}`,
-      agent.location?.lat || agent.lat || null,
-      agent.location?.lng || agent.lng || null,
-      agent.city || agent.location?.city || null,
+      agent.apiKey || `auto_${agent.id}`,
+      agent.location?.lat || null,
+      agent.location?.lng || null,
+      agent.location?.city || null,
       JSON.stringify(agent.categories || []),
-      agent.trustScore || agent.trust_score || 0.5,
-      agent.isVerified || agent.is_verified || 0
+      agent.trustScore || 0.5,
+      agent.isVerified || 0
     );
     console.log(`[claim] Synced agent ${agent.id} (${agent.name}) to SQLite for FK`);
     return true;
@@ -298,16 +298,17 @@ router.get("/search", (req: Request, res: Response) => {
 // tap "add to contacts" straight from a chat answer.
 
 router.get("/agents/:id/vcard", (req: Request, res: Response) => {
-  const vcard = buildVCard(req.params.id);
+  const agentId = req.params.id as string;
+  const vcard = buildVCard(agentId);
   if (!vcard) {
     res.status(404).json({ success: false, error: "Agent ikke funnet" });
     return;
   }
-  const info = knowledgeService.getAgentInfo(req.params.id);
+  const info = knowledgeService.getAgentInfo(agentId);
   const filename = safeFileName(info?.agent.name || "agent") + ".vcf";
 
   interactionLogger.log("view", {
-    agentId: req.params.id,
+    agentId: agentId,
     metadata: { type: "vcard_download", buyerAgent: req.headers["x-agent-id"] as string },
     ipAddress: req.ip,
   });
@@ -321,7 +322,8 @@ router.get("/agents/:id/vcard", (req: Request, res: Response) => {
 // Standard A2A agent card for a registered agent
 
 router.get("/agents/:id/card", (req: Request, res: Response) => {
-  const card = marketplaceRegistry.getAgentCard(req.params.id);
+  const agentId = req.params.id as string;
+  const card = marketplaceRegistry.getAgentCard(agentId);
   if (!card) {
     res.status(404).json({ error: "Agent ikke funnet" });
     return;
@@ -334,18 +336,19 @@ router.get("/agents/:id/card", (req: Request, res: Response) => {
 
 router.put("/agents/:id", (req: Request, res: Response) => {
   const apiKey = req.headers["x-api-key"] as string;
+  const agentId = req.params.id as string;
   if (!apiKey) {
     res.status(401).json({ error: "Mangler X-API-Key header" });
     return;
   }
 
   const agent = marketplaceRegistry.getAgentByApiKey(apiKey);
-  if (!agent || agent.id !== req.params.id) {
+  if (!agent || agent.id !== agentId) {
     res.status(403).json({ error: "Ikke autorisert" });
     return;
   }
 
-  const updated = marketplaceRegistry.updateAgent(req.params.id, req.body);
+  const updated = marketplaceRegistry.updateAgent(agentId, req.body);
   if (!updated) {
     res.status(404).json({ error: "Agent ikke funnet" });
     return;
@@ -359,12 +362,13 @@ router.put("/agents/:id", (req: Request, res: Response) => {
 
 router.post("/agents/:id/heartbeat", (req: Request, res: Response) => {
   const apiKey = req.headers["x-api-key"] as string;
+  const agentId = req.params.id as string;
   const agent = marketplaceRegistry.getAgentByApiKey(apiKey);
-  if (!agent || agent.id !== req.params.id) {
+  if (!agent || agent.id !== agentId) {
     res.status(403).json({ error: "Ikke autorisert" });
     return;
   }
-  marketplaceRegistry.heartbeat(req.params.id);
+  marketplaceRegistry.heartbeat(agentId);
   res.json({ success: true, lastSeenAt: new Date().toISOString() });
 });
 
@@ -417,7 +421,8 @@ router.get("/agents", (_req: Request, res: Response) => {
 //     meta: { dataSource: "auto", disclaimer: "..." } }
 
 router.get("/agents/:id/info", (req: Request, res: Response) => {
-  const info = knowledgeService.getAgentInfo(req.params.id);
+  const agentId = req.params.id as string;
+  const info = knowledgeService.getAgentInfo(agentId);
   if (!info) {
     res.status(404).json({ success: false, error: "Agent ikke funnet" });
     return;
@@ -425,7 +430,7 @@ router.get("/agents/:id/info", (req: Request, res: Response) => {
 
   // Log the view
   interactionLogger.log("view", {
-    agentId: req.params.id,
+    agentId: agentId,
     metadata: { type: "agent_info_request", buyerAgent: req.headers["x-agent-id"] as string },
     ipAddress: req.ip,
   });
@@ -437,7 +442,8 @@ router.get("/agents/:id/info", (req: Request, res: Response) => {
 // For admin/debugging. Returns the raw knowledge record.
 
 router.get("/agents/:id/knowledge", (req: Request, res: Response) => {
-  const knowledge = knowledgeService.getKnowledge(req.params.id);
+  const agentId = req.params.id as string;
+  const knowledge = knowledgeService.getKnowledge(agentId);
   if (!knowledge) {
     res.status(404).json({ success: false, error: "Ingen kunnskapsdata for denne agenten" });
     return;
@@ -464,19 +470,20 @@ router.get("/knowledge/stats", (_req: Request, res: Response) => {
 
 router.post("/agents/:id/claim", async (req: Request, res: Response) => {
   const { name, email, phone } = req.body;
+  const agentId = req.params.id as string;
   if (!name || !email) {
     res.status(400).json({ success: false, error: "Navn og e-post er påkrevd" });
     return;
   }
 
   // Ensure the agent exists in SQLite before creating a claim (FK constraint)
-  if (!ensureAgentInDb(req.params.id)) {
+  if (!ensureAgentInDb(agentId)) {
     res.status(404).json({ success: false, error: "Agent ikke funnet" });
     return;
   }
 
   try {
-    const result = knowledgeService.requestClaim(req.params.id, {
+    const result = knowledgeService.requestClaim(agentId, {
       claimantName: name,
       claimantEmail: email,
       claimantPhone: phone,
@@ -484,7 +491,7 @@ router.post("/agents/:id/claim", async (req: Request, res: Response) => {
 
     // Get agent name for the email
     const agents = marketplaceRegistry.getActiveAgents();
-    const agent = agents.find((a: any) => a.id === req.params.id);
+    const agent = agents.find((a: any) => a.id === agentId);
     const agentName = agent?.name || "Ukjent produsent";
 
     // Send verification code via email (graceful fallback if SMTP not configured)
@@ -514,6 +521,7 @@ router.post("/agents/:id/claim", async (req: Request, res: Response) => {
 
 router.post("/agents/:id/claim/verify", (req: Request, res: Response) => {
   const { claimId, code } = req.body;
+  const agentId = req.params.id as string;
   if (!claimId || !code) {
     res.status(400).json({ success: false, error: "claimId og code er påkrevd" });
     return;
@@ -526,14 +534,14 @@ router.post("/agents/:id/claim/verify", (req: Request, res: Response) => {
   }
 
   // Recalculate trust score now that the agent is verified
-  const newTrustScore = trustScoreService.update(req.params.id);
+  const newTrustScore = trustScoreService.update(agentId);
 
   res.json({
     success: true,
     message: "Agenten er nå din! Bruk claim-token for å oppdatere informasjon.",
     data: {
       claimToken: result.claimToken,
-      agentId: req.params.id,
+      agentId: agentId,
       trustScore: newTrustScore,
     },
   });
@@ -624,13 +632,14 @@ router.get("/auth/magic-verify", (req: Request, res: Response) => {
 
 router.post("/agents/:id/unclaim", (req: Request, res: Response) => {
   const claimToken = (req.headers["x-claim-token"] as string) || "";
+  const agentId = req.params.id as string;
   if (!claimToken) {
     res.status(401).json({ success: false, error: "Claim token påkrevd" });
     return;
   }
 
   const claim = knowledgeService.getClaimByToken(claimToken);
-  if (!claim || claim.agentId !== req.params.id) {
+  if (!claim || claim.agentId !== agentId) {
     res.status(403).json({ success: false, error: "Ikke autorisert for denne agenten" });
     return;
   }
@@ -638,21 +647,21 @@ router.post("/agents/:id/unclaim", (req: Request, res: Response) => {
   try {
     const db = getDb();
     // Remove this specific claim
-    db.prepare("DELETE FROM agent_claims WHERE agent_id = ? AND claim_token = ?").run(req.params.id, claimToken);
+    db.prepare("DELETE FROM agent_claims WHERE agent_id = ? AND claim_token = ?").run(agentId, claimToken);
 
     // Check if any other verified claims remain for this agent
     const remainingClaims = db.prepare(
       "SELECT COUNT(*) as c FROM agent_claims WHERE agent_id = ? AND status = 'verified'"
-    ).get(req.params.id) as any;
+    ).get(agentId) as any;
 
     if (remainingClaims.c === 0) {
       // No owners left — reset verified status and data source
-      db.prepare("UPDATE agents SET is_verified = 0 WHERE id = ?").run(req.params.id);
-      db.prepare("UPDATE agent_knowledge SET data_source = 'auto' WHERE agent_id = ?").run(req.params.id);
+      db.prepare("UPDATE agents SET is_verified = 0 WHERE id = ?").run(agentId);
+      db.prepare("UPDATE agent_knowledge SET data_source = 'auto' WHERE agent_id = ?").run(agentId);
     }
 
     // Recalculate trust score
-    trustScoreService.update(req.params.id);
+    trustScoreService.update(agentId);
 
     res.json({ success: true, message: "Eierskap frasagt" });
   } catch (err: any) {
@@ -664,6 +673,7 @@ router.post("/agents/:id/unclaim", (req: Request, res: Response) => {
 
 router.post("/admin/agents/:id/reset-claim", (req: Request, res: Response) => {
   const expectedKey = process.env.ADMIN_KEY;
+  const agentId = req.params.id as string;
   if (!expectedKey) {
     res.status(503).json({ success: false, error: "Admin not configured" });
     return;
@@ -676,10 +686,10 @@ router.post("/admin/agents/:id/reset-claim", (req: Request, res: Response) => {
 
   try {
     const db = getDb();
-    db.prepare("UPDATE agents SET is_verified = 0 WHERE id = ?").run(req.params.id);
-    db.prepare("DELETE FROM agent_claims WHERE agent_id = ?").run(req.params.id);
-    db.prepare("UPDATE agent_knowledge SET data_source = 'auto' WHERE agent_id = ?").run(req.params.id);
-    trustScoreService.update(req.params.id);
+    db.prepare("UPDATE agents SET is_verified = 0 WHERE id = ?").run(agentId);
+    db.prepare("DELETE FROM agent_claims WHERE agent_id = ?").run(agentId);
+    db.prepare("UPDATE agent_knowledge SET data_source = 'auto' WHERE agent_id = ?").run(agentId);
+    trustScoreService.update(agentId);
     res.json({ success: true, message: "Claim and verification reset" });
   } catch (err: any) {
     res.status(500).json({ success: false, error: err.message });
@@ -696,6 +706,7 @@ router.put("/agents/:id/knowledge", (req: Request, res: Response) => {
   const apiKey = (req.headers["x-api-key"] as string) || "";
   const adminKeyHeader = (req.headers["x-admin-key"] as string) || "";
   const expectedAdminKey = process.env.ADMIN_KEY || "";
+  const agentId = req.params.id as string;
 
   let authorized = false;
   let isAdmin = false;
@@ -709,13 +720,13 @@ router.put("/agents/:id/knowledge", (req: Request, res: Response) => {
   // 2. Claim token — seller who has claimed their agent
   if (!authorized && claimToken) {
     const claim = knowledgeService.getClaimByToken(claimToken);
-    if (claim && claim.agentId === req.params.id) authorized = true;
+    if (claim && claim.agentId === agentId) authorized = true;
   }
 
   // 3. API key — agent's own key from registration
   if (!authorized && apiKey) {
     const agent = marketplaceRegistry.getAgentByApiKey(apiKey);
-    if (agent && agent.id === req.params.id) authorized = true;
+    if (agent && agent.id === agentId) authorized = true;
   }
 
   if (!authorized) {
@@ -726,19 +737,19 @@ router.put("/agents/:id/knowledge", (req: Request, res: Response) => {
   try {
     if (isAdmin) {
       // Admin enrichment — preserve dataSource as "auto" (or what's in body)
-      knowledgeService.upsertKnowledge(req.params.id, {
+      knowledgeService.upsertKnowledge(agentId, {
         ...req.body,
         dataSource: req.body.dataSource || "auto",
       });
     } else {
       // Owner update — sets dataSource to "owner"
-      knowledgeService.ownerUpdate(req.params.id, req.body);
+      knowledgeService.ownerUpdate(agentId, req.body);
     }
 
     // Recalculate trust score — completeness signal changes with every update
-    const newTrustScore = trustScoreService.update(req.params.id);
+    const newTrustScore = trustScoreService.update(agentId);
 
-    const updated = knowledgeService.getAgentInfo(req.params.id);
+    const updated = knowledgeService.getAgentInfo(agentId);
     res.json({
       success: true,
       message: isAdmin ? "Kunnskapsdata beriket (auto)" : "Kunnskapsdata oppdatert",
@@ -805,6 +816,7 @@ router.post("/admin/bulk-enrich", (req: Request, res: Response) => {
 router.delete("/agents/:id", (req: Request, res: Response) => {
   const adminKey = req.headers["x-admin-key"] as string;
   const expectedKey = process.env.ADMIN_KEY;
+  const agentId = req.params.id as string;
   if (!expectedKey) { res.status(503).json({ error: "Admin not configured" }); return; }
 
   if (!adminKey || adminKey !== expectedKey) {
@@ -815,24 +827,24 @@ router.delete("/agents/:id", (req: Request, res: Response) => {
   const { getDb } = require("../database/init");
   const db = getDb();
 
-  const agent = db.prepare("SELECT id, name, city FROM agents WHERE id = ?").get(req.params.id) as any;
+  const agent = db.prepare("SELECT id, name, city FROM agents WHERE id = ?").get(agentId) as any;
   if (!agent) {
-    res.status(404).json({ error: "Agent ikke funnet", id: req.params.id });
+    res.status(404).json({ error: "Agent ikke funnet", id: agentId });
     return;
   }
 
-  db.prepare("DELETE FROM agents WHERE id = ?").run(req.params.id);
+  db.prepare("DELETE FROM agents WHERE id = ?").run(agentId);
 
-  interactionLogger.log("admin-delete", {
-    agentId: req.params.id,
-    metadata: { name: agent.name, city: agent.city, reason: req.body?.reason || "duplicate" },
+  interactionLogger.log("message", {
+    agentId: agentId,
+    metadata: { name: agent.name, city: agent.city, reason: req.body?.reason || "duplicate", action: "admin-delete" },
     ipAddress: req.ip,
   });
 
   res.json({
     success: true,
     message: `Agent "${agent.name}" (${agent.city}) slettet`,
-    id: req.params.id,
+    id: agentId,
   });
 });
 
@@ -932,7 +944,8 @@ router.post("/admin/deduplicate", (req: Request, res: Response) => {
 // they can do to improve it. This is the incentive dashboard.
 
 router.get("/agents/:id/trust", (req: Request, res: Response) => {
-  const breakdown = trustScoreService.getBreakdown(req.params.id);
+  const agentId = req.params.id as string;
+  const breakdown = trustScoreService.getBreakdown(agentId);
   if (!breakdown) {
     res.status(404).json({ success: false, error: "Agent ikke funnet" });
     return;
@@ -1038,12 +1051,12 @@ router.get("/find-match", (req: Request, res: Response) => {
 
   for (const agent of allAgents) {
     const normalizedAgent = normalizeName(agent.name);
-    const agentWords = normalizedAgent.split(/\s+/).filter(w => w.length >= 2);
+    const agentWords = normalizedAgent.split(/\s+/).filter((w: string) => w.length >= 2);
 
     // Also keep the raw lowercased name for matching common suffix words
     // (e.g. "gård" gets stripped by normalizeName but exists in raw name)
     const rawAgent = (agent.name || "").toLowerCase().trim();
-    const rawAgentWords = rawAgent.split(/[\s—–\-,]+/).filter(w => w.length >= 2);
+    const rawAgentWords = rawAgent.split(/[\s—–\-,]+/).filter((w: string) => w.length >= 2);
 
     // ── Score components ──
     // 1. Full Levenshtein similarity (normalized)

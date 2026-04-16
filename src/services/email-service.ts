@@ -17,7 +17,7 @@ export interface EmailOptions {
 }
 
 export class EmailService {
-  private transporter: Transporter;
+  private transporter!: Transporter;
   private fromAddress: string;
   private isConfigured: boolean;
 
@@ -172,6 +172,13 @@ export class EmailService {
     }
 
     try {
+      const headers: Record<string, string> = {
+        'X-Lokal-Agent': 'outreach-system/v1',
+      };
+      if (options.listUnsubscribe) {
+        headers['List-Unsubscribe'] = options.listUnsubscribe;
+      }
+
       const mailOptions = {
         from: this.fromAddress,
         to: options.to,
@@ -179,10 +186,7 @@ export class EmailService {
         html: options.htmlContent,
         text: options.textContent,
         replyTo: options.replyTo,
-        headers: {
-          'List-Unsubscribe': options.listUnsubscribe,
-          'X-Lokal-Agent': 'outreach-system/v1',
-        },
+        headers,
       };
 
       const info = await this.transporter.sendMail(mailOptions);
@@ -190,10 +194,10 @@ export class EmailService {
       logger.info('Email sent successfully', {
         to: options.to,
         subject: options.subject,
-        messageId: info.messageId,
+        messageId: info.messageId as string,
       });
 
-      return { success: true, messageId: info.messageId };
+      return { success: true, messageId: info.messageId as string };
     } catch (error) {
       logger.error('Failed to send email', {
         to: options.to,

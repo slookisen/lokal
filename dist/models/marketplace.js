@@ -26,7 +26,7 @@ exports.AgentRegistrationSchema = zod_1.z.object({
         streaming: zod_1.z.boolean().default(false),
         pushNotifications: zod_1.z.boolean().default(false),
         stateTransitionHistory: zod_1.z.boolean().default(false),
-    }).default({}),
+    }).default({ streaming: false, pushNotifications: false, stateTransitionHistory: false }),
     // What can this agent do?
     skills: zod_1.z.array(zod_1.z.object({
         id: zod_1.z.string(),

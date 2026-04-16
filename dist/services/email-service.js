@@ -127,6 +127,12 @@ class EmailService {
             return { success: true, messageId: 'DRY_RUN' };
         }
         try {
+            const headers = {
+                'X-Lokal-Agent': 'outreach-system/v1',
+            };
+            if (options.listUnsubscribe) {
+                headers['List-Unsubscribe'] = options.listUnsubscribe;
+            }
             const mailOptions = {
                 from: this.fromAddress,
                 to: options.to,
@@ -134,10 +140,7 @@ class EmailService {
                 html: options.htmlContent,
                 text: options.textContent,
                 replyTo: options.replyTo,
-                headers: {
-                    'List-Unsubscribe': options.listUnsubscribe,
-                    'X-Lokal-Agent': 'outreach-system/v1',
-                },
+                headers,
             };
             const info = await this.transporter.sendMail(mailOptions);
             logger.info('Email sent successfully', {

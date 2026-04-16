@@ -27,7 +27,7 @@ export const AgentRegistrationSchema = z.object({
     streaming: z.boolean().default(false),
     pushNotifications: z.boolean().default(false),
     stateTransitionHistory: z.boolean().default(false),
-  }).default({}),
+  }).default({ streaming: false, pushNotifications: false, stateTransitionHistory: false }),
 
   // What can this agent do?
   skills: z.array(z.object({
@@ -37,7 +37,7 @@ export const AgentRegistrationSchema = z.object({
     tags: z.array(z.string()), // Searchable tags: ["vegetables", "organic", "delivery"]
     inputModes: z.array(z.string()).default(["application/json"]),
     outputModes: z.array(z.string()).default(["application/json"]),
-  })).min(1),
+  })).min(1 as const),
 
   // What role does this agent play?
   role: z.enum([

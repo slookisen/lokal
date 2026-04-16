@@ -50,7 +50,8 @@ router.post("/:id/inventory", (req, res) => {
 // GET /api/producers/:id — Get producer with inventory
 router.get("/:id", (req, res) => {
     try {
-        const data = services_1.producerAgent.getMyInventory(req.params.id);
+        const producerId = req.params.id;
+        const data = services_1.producerAgent.getMyInventory(producerId);
         if (!data.producer) {
             res.status(404).json({ success: false, error: "Produsent ikke funnet" });
             return;
@@ -64,7 +65,9 @@ router.get("/:id", (req, res) => {
 // POST /api/producers/:id/sold-out/:productId — Mark product as sold out
 router.post("/:id/sold-out/:productId", (req, res) => {
     try {
-        services_1.producerAgent.markSoldOut(req.params.productId, req.params.id);
+        const productId = req.params.productId;
+        const producerId = req.params.id;
+        services_1.producerAgent.markSoldOut(productId, producerId);
         res.json({ success: true, message: "Merket som utsolgt" });
     }
     catch (err) {

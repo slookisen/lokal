@@ -19,28 +19,15 @@ const seo_1 = __importDefault(require("./routes/seo"));
 const analytics_service_1 = require("./services/analytics-service");
 const analytics_1 = __importDefault(require("./routes/analytics"));
 const seed_1 = require("./seed");
-const seed_oslo_real_1 = require("./seed-oslo-real");
-const seed_marketplace_1 = require("./seed-marketplace");
-const seed_norway_expansion_1 = require("./seed-norway-expansion");
-const seed_expansion_v2_1 = require("./seed-expansion-v2");
-const seed_expansion_v3_1 = require("./seed-expansion-v3");
-const seed_expansion_v4_1 = require("./seed-expansion-v4");
-const seed_expansion_v5_1 = require("./seed-expansion-v5");
-const seed_expansion_v6_1 = require("./seed-expansion-v6");
-const seed_expansion_v7_1 = require("./seed-expansion-v7");
-const seed_expansion_v8_1 = require("./seed-expansion-v8");
+// Seed files moved to src/_seeds/ — only loaded if DB is empty (see below).
 const discovery_service_1 = require("./services/discovery-service");
 const trust_score_service_1 = require("./services/trust-score-service");
-// Dynamic import — seed-knowledge is a late addition and may not be
-// present in every Docker layer during rolling deploys.  Graceful
-// fallback prevents the entire process from crashing.
+// Seed-knowledge loaded dynamically — only used if DB is empty
 let seedKnowledge;
 try {
-    seedKnowledge = require("./seed-knowledge").seedKnowledge;
+    seedKnowledge = require("./_seeds/seed-knowledge").seedKnowledge;
 }
-catch {
-    console.warn("⚠️  seed-knowledge module not found — skipping knowledge enrichment (will retry next deploy)");
-}
+catch { /* ok */ }
 const app = (0, express_1.default)();
 const PORT = process.env.PORT || 3000;
 // ─── Proxy trust ─────────────────────────────────────────────
@@ -136,16 +123,25 @@ const existingAgentCount = db.prepare("SELECT COUNT(*) as c FROM agents").get().
 if (existingAgentCount === 0) {
     console.log("🌱 Empty database detected — running initial seed...");
     (0, seed_1.seedData)();
-    (0, seed_oslo_real_1.seedOsloRealData)();
-    (0, seed_marketplace_1.seedMarketplace)();
-    (0, seed_norway_expansion_1.seedNorwayExpansion)();
-    (0, seed_expansion_v2_1.seedExpansionV2)();
-    (0, seed_expansion_v3_1.seedExpansionV3)();
-    (0, seed_expansion_v4_1.seedExpansionV4)();
-    (0, seed_expansion_v5_1.seedExpansionV5)();
-    (0, seed_expansion_v6_1.seedExpansionV6)();
-    (0, seed_expansion_v7_1.seedExpansionV7)();
-    (0, seed_expansion_v8_1.seedExpansionV8)();
+    // Dynamic require for seed files (moved to _seeds/ to keep build clean)
+    try {
+        const seedFns = [
+            "./_seeds/seed-oslo-real", "./_seeds/seed-marketplace", "./_seeds/seed-norway-expansion",
+            "./_seeds/seed-expansion-v2", "./_seeds/seed-expansion-v3", "./_seeds/seed-expansion-v4",
+            "./_seeds/seed-expansion-v5", "./_seeds/seed-expansion-v6", "./_seeds/seed-expansion-v7",
+            "./_seeds/seed-expansion-v8"
+        ];
+        for (const mod of seedFns) {
+            try {
+                const m = require(mod);
+                const fn = Object.values(m)[0];
+                if (typeof fn === "function")
+                    fn();
+            }
+            catch { /* seed file may not exist in Docker layer — ok */ }
+        }
+    }
+    catch { /* seed loading failed — non-fatal */ }
     if (seedKnowledge)
         seedKnowledge();
     // Deduplicate: remove duplicate agents (keep oldest by created_at)

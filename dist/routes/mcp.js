@@ -31,7 +31,7 @@ function registerTools(server) {
         limit: zod_1.z.number().min(1).max(50).default(10).describe("Max results"),
     }, async ({ query, limit }) => {
         const parsed = marketplace_registry_1.marketplaceRegistry.parseNaturalQuery(query);
-        const results = marketplace_registry_1.marketplaceRegistry.discover({ ...parsed, limit: limit || 10 });
+        const results = marketplace_registry_1.marketplaceRegistry.discover({ ...parsed, limit: limit || 10, offset: 0 });
         if (!results?.length) {
             return { content: [{ type: "text", text: `Ingen resultater for "${query}". Prøv et bredere søk.` }] };
         }

@@ -21,7 +21,8 @@ router.post("/", (req: Request, res: Response) => {
 
 // GET /api/reservations/:id — Get reservation status
 router.get("/:id", (req: Request, res: Response) => {
-  const reservation = reservationService.get(req.params.id);
+  const reservationId = req.params.id as string;
+  const reservation = reservationService.get(reservationId);
   if (!reservation) {
     res.status(404).json({ success: false, error: "Reservasjon ikke funnet" });
     return;
@@ -32,7 +33,8 @@ router.get("/:id", (req: Request, res: Response) => {
 // POST /api/reservations/:id/confirm — Producer confirms
 router.post("/:id/confirm", (req: Request, res: Response) => {
   try {
-    const reservation = reservationService.confirm(req.params.id, req.body.note);
+    const reservationId = req.params.id as string;
+    const reservation = reservationService.confirm(reservationId, req.body.note);
     res.json({ success: true, data: reservation, message: "Reservasjon bekreftet!" });
   } catch (err: any) {
     res.status(400).json({ success: false, error: err.message });
@@ -42,7 +44,8 @@ router.post("/:id/confirm", (req: Request, res: Response) => {
 // POST /api/reservations/:id/ready — Producer marks ready
 router.post("/:id/ready", (req: Request, res: Response) => {
   try {
-    const reservation = reservationService.markReady(req.params.id, req.body.note);
+    const reservationId = req.params.id as string;
+    const reservation = reservationService.markReady(reservationId, req.body.note);
     res.json({ success: true, data: reservation, message: "Ordren er klar for henting!" });
   } catch (err: any) {
     res.status(400).json({ success: false, error: err.message });
@@ -52,7 +55,8 @@ router.post("/:id/ready", (req: Request, res: Response) => {
 // POST /api/reservations/:id/complete — Mark as completed
 router.post("/:id/complete", (req: Request, res: Response) => {
   try {
-    const reservation = reservationService.complete(req.params.id);
+    const reservationId = req.params.id as string;
+    const reservation = reservationService.complete(reservationId);
     res.json({ success: true, data: reservation, message: "Ferdig! Takk for at du handler lokalt." });
   } catch (err: any) {
     res.status(400).json({ success: false, error: err.message });
@@ -62,7 +66,8 @@ router.post("/:id/complete", (req: Request, res: Response) => {
 // POST /api/reservations/:id/cancel — Cancel reservation
 router.post("/:id/cancel", (req: Request, res: Response) => {
   try {
-    const reservation = reservationService.cancel(req.params.id, req.body.reason);
+    const reservationId = req.params.id as string;
+    const reservation = reservationService.cancel(reservationId, req.body.reason);
     res.json({ success: true, data: reservation, message: "Reservasjon avbrutt." });
   } catch (err: any) {
     res.status(400).json({ success: false, error: err.message });
@@ -71,13 +76,15 @@ router.post("/:id/cancel", (req: Request, res: Response) => {
 
 // GET /api/reservations/producer/:id — Producer's reservations
 router.get("/producer/:id", (req: Request, res: Response) => {
-  const reservations = reservationService.getByProducer(req.params.id);
+  const producerId = req.params.id as string;
+  const reservations = reservationService.getByProducer(producerId);
   res.json({ success: true, count: reservations.length, data: reservations });
 });
 
 // GET /api/reservations/consumer/:id — Consumer's reservations
 router.get("/consumer/:id", (req: Request, res: Response) => {
-  const reservations = reservationService.getByConsumer(req.params.id);
+  const consumerId = req.params.id as string;
+  const reservations = reservationService.getByConsumer(consumerId);
   res.json({ success: true, count: reservations.length, data: reservations });
 });
 

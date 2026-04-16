@@ -58,7 +58,8 @@ router.get("/summary", (_req: Request, res: Response) => {
  * High-level analytics for the last N hours
  */
 router.get("/summary/:hours", (req: Request, res: Response) => {
-  const hours = Math.max(1, Math.min(720, parseInt(req.params.hours) || 24));
+  const hoursParam = req.params.hours as string;
+  const hours = Math.max(1, Math.min(720, parseInt(hoursParam) || 24));
   const summary = analyticsService.getSummary(hours);
   res.json({
     timeframe: `last ${hours} hours`,

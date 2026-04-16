@@ -53,7 +53,7 @@ server.tool(
     try {
       const url = `${API_BASE}/api/marketplace/search?q=${encodeURIComponent(query)}&limit=${limit}`;
       const response = await fetch(url);
-      const data = await response.json();
+      const data = (await response.json()) as any;
 
       if (!data.success) {
         return { content: [{ type: "text", text: `Søk feilet: ${data.error}` }] };
@@ -118,7 +118,7 @@ server.tool(
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(body),
       });
-      const data = await response.json();
+      const data = (await response.json()) as any;
 
       let text = `🔍 **Strukturert søk**\n`;
       text += `Filter: ${JSON.stringify({ categories, tags, role, maxDistanceKm })}\n`;
@@ -173,7 +173,7 @@ server.tool(
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(body),
       });
-      const data = await response.json();
+      const data = (await response.json()) as any;
 
       if (data.success) {
         return {
@@ -204,8 +204,8 @@ server.tool(
         fetch(`${API_BASE}/api/marketplace/stats`),
         fetch(`${API_BASE}/health`),
       ]);
-      const stats = await statsRes.json();
-      const health = await healthRes.json();
+      const stats = (await statsRes.json()) as any;
+      const health = (await healthRes.json()) as any;
 
       const s = stats.data;
       let text = `📊 **Lokal Platform Info**\n`;
@@ -242,7 +242,7 @@ server.tool(
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ jsonrpc: "2.0", method, params, id: Date.now().toString() }),
       });
-      const data = await response.json();
+      const data = (await response.json()) as any;
 
       return {
         content: [{ type: "text", text: `JSON-RPC Response:\n\`\`\`json\n${JSON.stringify(data, null, 2)}\n\`\`\`` }],

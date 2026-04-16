@@ -521,6 +521,113 @@ export class AnalyticsService {
       return 0;
     }
   }
+
+  /**
+   * Helper: Get or create session ID from request/response
+   * Used by middleware for backward compatibility
+   */
+  getOrCreateSessionId(req: Request, _res: Response): string {
+    const userAgent = req.get("user-agent") || "";
+    const clientIp = req.ip || "unknown";
+    const ipHash = hashIP(clientIp);
+    return sessionManager.getOrCreate(ipHash, userAgent);
+  }
+
+  /**
+   * Helper: Extract user agent string from request
+   * Used by middleware for backward compatibility
+   */
+  getUserAgent(req: Request): string {
+    return req.get("user-agent") || "";
+  }
+
+  /**
+   * Helper: Extract client IP from request
+   * Used by middleware for backward compatibility
+   */
+  getClientIp(req: Request): string {
+    return req.ip || "unknown";
+  }
+
+  /**
+   * Record a page view (middleware wrapper for trackPageView)
+   * Used by middleware for backward compatibility
+   */
+  recordPageView(data: {
+    path: string;
+    referrer: string | undefined;
+    userAgent: string;
+    sessionId: string;
+  }): void {
+    try {
+      const db = getDb();
+      const source = inferReferrerSource(data.referrer);
+      const userAgentHash = hashUserAgent(data.userAgent);
+
+      db.prepare(`
+        INSERT INTO analytics_page_views (path, referrer, source, user_agent_hash, session_id)
+        VALUES (?, ?, ?, ?, ?)
+      `).run(data.path, data.referrer || null, source, userAgentHash, data.sessionId);
+    } catch (err) {
+      console.error("[analytics] Failed to record page view:", err);
+    }
+  }
+
+  /**
+   * Record a query (middleware wrapper for trackSearchQuery)
+   * Used by middleware for backward compatibility
+   */
+  recordQuery(data: {
+    protocol: "a2a" | "mcp" | "api" | "search";
+    query: string;
+    categories?: string[];
+    city: string;
+    resultCount: number;
+    responseTimeMs: number;
+    clientIp: string;
+  }): void {
+    try {
+      const db = getDb();
+      const categories = data.categories ? JSON.stringify(data.categories) : null;
+      const ipHash = hashIP(data.clientIp);
+
+      db.prepare(`
+        INSERT INTO analytics_queries (protocol, query, categories, city, result_count, response_time_ms, client_ip_hash)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+      `).run(
+        data.protocol,
+        data.query,
+        categories,
+        data.city || null,
+        data.resultCount,
+        data.responseTimeMs,
+        ipHash
+      );
+    } catch (err) {
+      console.error("[analytics] Failed to record query:", err);
+    }
+  }
+
+  /**
+   * Record an agent view (middleware wrapper for trackAgentView)
+   * Used by middleware for backward compatibility
+   */
+  recordAgentView(data: {
+    agentId: string;
+    agentName: string;
+    city: string | undefined;
+    viewSource: "search" | "direct" | "discovery" | "seo" | "unknown";
+  }): void {
+    try {
+      const db = getDb();
+      db.prepare(`
+        INSERT INTO analytics_agent_views (agent_id, agent_name, city, view_source)
+        VALUES (?, ?, ?, ?)
+      `).run(data.agentId, data.agentName, data.city || null, data.viewSource);
+    } catch (err) {
+      console.error("[analytics] Failed to record agent view:", err);
+    }
+  }
 }
 
 // ─── Singleton instance ──────────────────────────────────────────

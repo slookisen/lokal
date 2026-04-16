@@ -353,7 +353,7 @@ router.get("/api/live", (req, res) => {
 });
 // Forward interactions and messages to SSE clients
 interaction_logger_1.interactionLogger.on("interaction", (event) => {
-    const data = JSON.stringify({ type: "interaction", ...event });
+    const data = JSON.stringify({ eventType: "interaction", ...event });
     for (const client of sseClients) {
         try {
             client.write(`data: ${data}\n\n`);
@@ -404,8 +404,8 @@ router.post("/api/conversations", (req, res) => {
 router.get("/api/conversations", (req, res) => {
     const conversations = conversation_service_1.conversationService.listConversations({
         limit: parseInt(req.query.limit) || 50,
-        status: req.query.status,
-        agentId: req.query.agentId,
+        status: req.query.status || undefined,
+        agentId: req.query.agentId || undefined,
     });
     res.json({ success: true, data: conversations, count: conversations.length });
 });

@@ -61,8 +61,8 @@ export declare function inferReferrerSource(req: Request, res: Response, next: N
  *   console.log(`User from ${userInfo.city}, ${userInfo.country} via ${userInfo.source}`);
  */
 export declare function extractUserInfo(req: Request): {
-    ip: any;
-    userAgent: any;
+    ip: string;
+    userAgent: string;
     referrer: string;
     city: string;
 };

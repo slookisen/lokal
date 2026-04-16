@@ -529,7 +529,7 @@ router.get("/sok", (req: Request, res: Response) => {
 
   try {
     const parsed = marketplaceRegistry.parseNaturalQuery(q);
-    const results = marketplaceRegistry.discover({ ...parsed, limit: 30 });
+    const results = marketplaceRegistry.discover({ ...parsed, limit: 30, offset: 0 });
 
     const resultCards = results.map((r: any) => producerCard(r.agent)).join("");
 
@@ -785,7 +785,7 @@ const CITY_CSS = `
 `;
 
 router.get("/:city", (req: Request, res: Response, next: any) => {
-  const citySlug = req.params.city.toLowerCase();
+  const citySlug = (req.params.city as string).toLowerCase();
 
   if (citySlug.startsWith("api") || citySlug.startsWith(".") || citySlug === "health"
       || citySlug === "a2a" || citySlug === "mcp" || citySlug === "sok"
@@ -813,7 +813,7 @@ router.get("/:city", (req: Request, res: Response, next: any) => {
       ));
     }
 
-    const cityName = cityAgents[0].city || cityAgents[0].location?.city || citySlug;
+    const cityName = (cityAgents[0] as any).city || (cityAgents[0] as any).location?.city || citySlug;
 
     // Track city page view for analytics dashboard (one entry per city visit)
     // Use the first agent as representative — getCityStats groups by city
@@ -930,7 +930,7 @@ const PROFILE_CSS = `
 `;
 
 router.get("/produsent/:slug", (req: Request, res: Response) => {
-  const slug = req.params.slug.toLowerCase();
+  const slug = (req.params.slug as string).toLowerCase();
 
   try {
     const agents = marketplaceRegistry.getActiveAgents();
@@ -947,7 +947,7 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
     }
 
     // Track producer page view for analytics dashboard
-    const cityName = agent.city || agent.location?.city || "";
+    const cityName = (agent as any).city || (agent as any).location?.city || "";
     analyticsService.trackAgentView(agent.id, agent.name, cityName, "seo");
 
     const info = knowledgeService.getAgentInfo(agent.id);

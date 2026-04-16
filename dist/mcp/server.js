@@ -44,7 +44,7 @@ server.tool("lokal_search", "Search for local food in Norway using natural langu
     try {
         const url = `${API_BASE}/api/marketplace/search?q=${encodeURIComponent(query)}&limit=${limit}`;
         const response = await fetch(url);
-        const data = await response.json();
+        const data = (await response.json());
         if (!data.success) {
             return { content: [{ type: "text", text: `Søk feilet: ${data.error}` }] };
         }
@@ -104,7 +104,7 @@ server.tool("lokal_discover", "Structured search in the Lokal food agent registr
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify(body),
         });
-        const data = await response.json();
+        const data = (await response.json());
         let text = `🔍 **Strukturert søk**\n`;
         text += `Filter: ${JSON.stringify({ categories, tags, role, maxDistanceKm })}\n`;
         text += `Fant ${data.count} agenter:\n\n`;
@@ -151,7 +151,7 @@ server.tool("lokal_register", "Register a new food producer, farm, shop, or coop
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify(body),
         });
-        const data = await response.json();
+        const data = (await response.json());
         if (data.success) {
             return {
                 content: [{
@@ -175,8 +175,8 @@ server.tool("lokal_info", "Get Lokal platform statistics: total agents, active p
             fetch(`${API_BASE}/api/marketplace/stats`),
             fetch(`${API_BASE}/health`),
         ]);
-        const stats = await statsRes.json();
-        const health = await healthRes.json();
+        const stats = (await statsRes.json());
+        const health = (await healthRes.json());
         const s = stats.data;
         let text = `📊 **Lokal Platform Info**\n`;
         text += `Status: ${health.status} | Versjon: ${health.version} | DB: ${health.database}\n`;
@@ -205,7 +205,7 @@ server.tool("lokal_jsonrpc", "Send a raw JSON-RPC 2.0 request to the Lokal A2A e
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({ jsonrpc: "2.0", method, params, id: Date.now().toString() }),
         });
-        const data = await response.json();
+        const data = (await response.json());
         return {
             content: [{ type: "text", text: `JSON-RPC Response:\n\`\`\`json\n${JSON.stringify(data, null, 2)}\n\`\`\`` }],
         };

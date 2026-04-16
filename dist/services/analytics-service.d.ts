@@ -91,6 +91,54 @@ export declare class AnalyticsService {
      * Useful for privacy compliance and storage management
      */
     pruneOldData(olderThanDays: number): number;
+    /**
+     * Helper: Get or create session ID from request/response
+     * Used by middleware for backward compatibility
+     */
+    getOrCreateSessionId(req: Request, _res: Response): string;
+    /**
+     * Helper: Extract user agent string from request
+     * Used by middleware for backward compatibility
+     */
+    getUserAgent(req: Request): string;
+    /**
+     * Helper: Extract client IP from request
+     * Used by middleware for backward compatibility
+     */
+    getClientIp(req: Request): string;
+    /**
+     * Record a page view (middleware wrapper for trackPageView)
+     * Used by middleware for backward compatibility
+     */
+    recordPageView(data: {
+        path: string;
+        referrer: string | undefined;
+        userAgent: string;
+        sessionId: string;
+    }): void;
+    /**
+     * Record a query (middleware wrapper for trackSearchQuery)
+     * Used by middleware for backward compatibility
+     */
+    recordQuery(data: {
+        protocol: "a2a" | "mcp" | "api" | "search";
+        query: string;
+        categories?: string[];
+        city: string;
+        resultCount: number;
+        responseTimeMs: number;
+        clientIp: string;
+    }): void;
+    /**
+     * Record an agent view (middleware wrapper for trackAgentView)
+     * Used by middleware for backward compatibility
+     */
+    recordAgentView(data: {
+        agentId: string;
+        agentName: string;
+        city: string | undefined;
+        viewSource: "search" | "direct" | "discovery" | "seo" | "unknown";
+    }): void;
 }
 export declare const analyticsService: AnalyticsService;
 export default analyticsService;

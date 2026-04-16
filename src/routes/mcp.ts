@@ -37,7 +37,7 @@ function registerTools(server: McpServer) {
     },
     async ({ query, limit }) => {
       const parsed = marketplaceRegistry.parseNaturalQuery(query);
-      const results = marketplaceRegistry.discover({ ...parsed, limit: limit || 10 });
+      const results = marketplaceRegistry.discover({ ...parsed, limit: limit || 10, offset: 0 });
 
       if (!results?.length) {
         return { content: [{ type: "text" as const, text: `Ingen resultater for "${query}". Prøv et bredere søk.` }] };

@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Lokal — Registrer din butikk</title>
+  <title>Rett fra Bonden — Registrer din butikk</title>
   <style>
     * { margin: 0; padding: 0; box-sizing: border-box; }
     :root {
@@ -186,7 +186,7 @@
 <body>
   <!-- ═══════════ TOP BAR ═══════════ -->
   <div class="topbar">
-    <a href="/" class="topbar-logo">Lokal<span>.</span></a>
+    <a href="/" class="topbar-logo">Rett fra Bonden<span>.</span></a>
     <div class="topbar-right">
       <button class="lang-toggle" id="langToggle">EN</button>
       <button class="btn-logout hidden" id="btnLogout" data-i18n="logout">Logg ut</button>
@@ -199,7 +199,22 @@
       <!-- Welcome hero -->
       <div class="claim-hero">
         <h1>Gjør butikken din synlig for AI</h1>
-        <p>Registrer deg i Lokal, og kunder som spør ChatGPT, Claude eller Siri om lokal mat finner deg automatisk. Det tar under 2 minutter.</p>
+        <p>Registrer deg på Rett fra Bonden, og kunder som spør ChatGPT, Claude eller Siri om lokal mat finner deg automatisk. Det tar under 2 minutter.</p>
+      </div>
+
+      <!-- ══════ LOGIN BANNER — prominent, above everything ══════ -->
+      <div class="card" id="loginBanner" style="background: linear-gradient(135deg, #f0fdf4 0%, #eff6ff 100%); border: 1px solid #bbf7d0; margin-bottom: 1rem;">
+        <div style="display: flex; align-items: center; gap: 1rem; flex-wrap: wrap;">
+          <div style="flex: 1; min-width: 200px;">
+            <h3 style="margin-bottom: 0.25rem; font-size: 1rem; color: var(--forest);">Allerede registrert?</h3>
+            <p style="color: var(--gray-500); font-size: 0.85rem; margin: 0;">Logg inn med e-posten du registrerte med — vi sender en innloggingslenke.</p>
+          </div>
+          <div style="display: flex; gap: 0.5rem; align-items: center; flex-wrap: wrap;">
+            <input type="email" id="loginEmail" placeholder="din@epost.no" style="padding: 0.55rem 0.75rem; border: 1px solid var(--gray-300); border-radius: var(--radius); font-size: 0.9rem; width: 200px;" />
+            <button class="btn btn-primary" id="btnMagicLink" style="white-space: nowrap;">Logg inn</button>
+          </div>
+        </div>
+        <div id="magicLinkAlert" style="margin-top: 0.5rem;"></div>
       </div>
 
       <!-- ══════ STEP 1: FIND YOUR BUSINESS ══════ -->
@@ -289,19 +304,10 @@
         <button class="btn btn-primary" id="btnRegister" style="width: 100%; justify-content: center; padding: 0.8rem; font-size: 1rem;">Registrer gratis</button>
       </div>
 
-      <!-- ══════ LOGIN: Already registered ══════ -->
-      <div class="card" style="margin-top: 1rem; background: var(--gray-50);">
-        <h3 style="margin-bottom: 0.5rem;">Allerede registrert?</h3>
-        <p style="color: var(--gray-500); font-size: 0.85rem; margin-bottom: 0.75rem;">Logg inn med tokenet du fikk ved registrering.</p>
-        <div class="form-row">
-          <div class="form-group" style="margin-bottom: 0;">
-            <input type="text" id="loginToken" placeholder="Lim inn ditt tilgangstoken..." style="font-family: monospace; font-size: 0.85rem;" />
-          </div>
-          <div>
-            <button class="btn btn-secondary" id="btnLogin">Logg inn</button>
-          </div>
-        </div>
-      </div>
+      <!-- ══════ LOGIN: Magic link (HIDDEN - replaced by top banner) ══════ -->
+      <div class="hidden" id="legacyMagicLink"></div>
+      <!-- Hidden legacy token field for programmatic use -->
+      <input type="hidden" id="loginToken" />
 
       <!-- (claimExistingSection is now replaced by the find-match flow above) -->
       <div class="hidden" id="claimExistingSection"></div>
@@ -379,10 +385,17 @@
           <div class="stat-number" id="statChosen">0</div>
           <div class="stat-label" data-i18n="stat_chosen">Valgt</div>
         </div>
-        <div class="stat-card">
+        <div class="stat-card" id="trustScoreCard" style="cursor:pointer" title="Klikk for detaljer">
           <div class="stat-number" id="statTrust">0%</div>
           <div class="stat-label" data-i18n="stat_trust">Trust Score</div>
         </div>
+      </div>
+
+      <!-- Trust Score Breakdown (hidden by default, toggled by clicking trust card) -->
+      <div class="card" id="trustBreakdown" style="display:none;">
+        <h2>🎯 <span data-i18n="trust_title">Veien til 100% Trust Score</span></h2>
+        <div id="trustSignals" style="display:grid;gap:0.75rem;"></div>
+        <div id="trustTips" style="margin-top:1rem;"></div>
       </div>
 
       <!-- Tabs -->
@@ -534,8 +547,8 @@
         <div class="card">
           <h2>Bilder av butikk og produkter</h2>
           <p style="color: var(--gray-500); font-size: 0.9rem; margin-bottom: 1rem;">
-            Last opp bilder av prislistetavler, menyer, produkthyller eller emballasje.
-            <strong>Vi analyserer bildene automatisk</strong> og henter ut produkter med priser &mdash; du slipper &aring; taste alt manuelt.
+            Last opp bilder av butikken din, produkter eller prislistetavler.
+            Bildene vises p&aring; profilen din og hjelper kunder &aring; kjenne deg igjen.
           </p>
 
           <div class="upload-zone" id="imageUploadZone">
@@ -547,36 +560,35 @@
             <input type="file" id="imageFileInput" multiple accept="image/*" style="display: none;" />
           </div>
 
-          <!-- Example hint -->
-          <div style="margin-top: 0.75rem; padding: 0.75rem; background: var(--cream); border-radius: var(--radius); font-size: 0.85rem; color: var(--gray-700);">
-            <strong>Eksempler p&aring; gode bilder:</strong> Pristavle med tekst, meny, produkthylle med prislapper, innpakket produkt med etikett. Jo tydeligere teksten er, jo bedre blir resultatet.
-          </div>
-
           <div class="image-grid" id="imageGrid"></div>
-
-          <div class="hidden" id="imageScanBar" style="margin-top: 0.75rem;">
-            <div style="display: flex; gap: 0.5rem; align-items: center; padding: 0.75rem; background: var(--blue-light); border-radius: var(--radius);">
-              <p style="font-size: 0.85rem; color: var(--blue); flex: 1;">
-                <strong>Har du pristavle eller meny p&aring; bildet?</strong> Vi kan hjelpe deg &aring; hente ut produkter og priser.
-              </p>
-              <button class="btn btn-primary btn-small" id="btnScanImages">Hent produktinfo</button>
-            </div>
-          </div>
 
           <div style="margin-top: 1rem;">
             <button class="btn btn-primary" id="btnSaveImages">Lagre bilder</button>
           </div>
         </div>
 
-        <!-- Extracted products preview -->
-        <div class="card hidden" id="extractedProductsCard">
-          <h2>Produkter funnet i bilder</h2>
-          <p style="color: var(--gray-500); font-size: 0.9rem; margin-bottom: 1rem;">Vi fant disse produktene. Velg hvilke du vil legge til i produktkatalogen din.</p>
+        <!-- AI product extraction guide -->
+        <div class="card" style="margin-top: 1rem; background: var(--cream);">
+          <h3 style="margin-bottom: 0.5rem;">Legg til produkter raskt med AI</h3>
+          <p style="font-size: 0.9rem; color: var(--gray-600); margin-bottom: 1rem;">
+            Har du bilde av pristavle, meny eller produkthylle? La en AI lese ut produktene for deg:
+          </p>
+          <ol style="font-size: 0.9rem; color: var(--gray-600); margin: 0 0 1rem 1.25rem; line-height: 1.8;">
+            <li>&Aring;pne <a href="https://claude.ai" target="_blank" rel="noopener" style="color: var(--green); font-weight: 600;">Claude</a> eller <a href="https://chat.openai.com" target="_blank" rel="noopener" style="color: var(--green); font-weight: 600;">ChatGPT</a></li>
+            <li>Last opp bildet ditt og skriv: <em>&laquo;List alle produkter med priser. Format: Navn | Kategori | Pris | Sesong&raquo;</em></li>
+            <li>Kopier svaret og lim inn i <strong>Produkter</strong>-fanen under &laquo;Lim inn mange produkter samtidig&raquo;</li>
+          </ol>
+          <p style="font-size: 0.8rem; color: var(--gray-500);">
+            Produktene du legger til blir synlige for AI-assistenter som anbefaler deg til kunder.
+          </p>
+        </div>
+        <!-- Hidden elements for backward compatibility -->
+        <div class="hidden" id="imageScanBar"></div>
+        <div class="hidden" id="extractedProductsCard">
           <div id="extractedProductsList"></div>
-          <div style="margin-top: 1rem; display: flex; gap: 0.5rem;">
-            <button class="btn btn-primary btn-small" id="btnAddExtracted">Legg til valgte produkter</button>
-            <button class="btn btn-secondary btn-small" id="btnDismissExtracted">Avbryt</button>
-          </div>
+          <button class="hidden" id="btnScanImages"></button>
+          <button class="hidden" id="btnAddExtracted"></button>
+          <button class="hidden" id="btnDismissExtracted"></button>
         </div>
       </div>
 
@@ -589,12 +601,28 @@
           </div>
           <p style="font-size: 0.85rem; color: var(--gray-500); margin-bottom: 1rem;">
             Produktene dine blir synlige for AI-assistenter som hjelper kunder med &aring; finne lokal mat.
-            Jo flere detaljer (pris, sesong, &oslash;kologisk), jo bedre kan agenten din svare.
-            <strong>Tips:</strong> G&aring; til Bilder-fanen for &aring; laste opp bilde av pristavlen &mdash; da legger vi til produkter automatisk.
+            Jo flere detaljer (pris, sesong), jo bedre kan agenten din svare.
           </p>
           <ul class="product-list" id="productList">
             <li style="text-align: center; color: var(--gray-500); padding: 2rem;" data-i18n="no_products">Ingen produkter lagt til enn&aring;</li>
           </ul>
+        </div>
+
+        <!-- Bulk paste from AI -->
+        <div class="card" style="margin-top: 1rem; background: var(--cream);">
+          <h3 style="margin-bottom: 0.5rem;">Lim inn mange produkter samtidig</h3>
+          <p style="font-size: 0.85rem; color: var(--gray-600); margin-bottom: 0.75rem;">
+            Kopier produktlisten fra <a href="https://claude.ai" target="_blank" rel="noopener" style="color: var(--green); font-weight: 600;">Claude</a> eller <a href="https://chat.openai.com" target="_blank" rel="noopener" style="color: var(--green); font-weight: 600;">ChatGPT</a> og lim inn under. &Eacute;tt produkt per linje.
+          </p>
+          <div style="font-size: 0.8rem; color: var(--gray-500); margin-bottom: 0.75rem; padding: 0.5rem 0.75rem; background: var(--white); border-radius: var(--radius); border: 1px dashed var(--gray-300);">
+            <strong>Format:</strong> Produktnavn | Kategori | Pris | Sesong<br>
+            <span style="color: var(--gray-400);">Eksempel: Gulr&oslash;tter | Gr&oslash;nnsaker | 35kr/kg | Jun-Okt</span>
+          </div>
+          <textarea id="bulkProductInput" rows="6" placeholder="Gulr&oslash;tter | Gr&oslash;nnsaker | 35kr/kg | Jun-Okt&#10;Honning 500g | Honning | 120kr | &Aring;ret rundt&#10;Jordb&aelig;r | B&aelig;r | 60kr/kurv | Jun-Jul" style="width: 100%; font-size: 0.9rem; font-family: monospace; line-height: 1.6;"></textarea>
+          <div style="margin-top: 0.75rem; display: flex; gap: 0.5rem; align-items: center;">
+            <button class="btn btn-primary btn-small" id="btnParseBulk">Legg til alle produkter</button>
+            <span id="bulkResult" style="font-size: 0.85rem; color: var(--green);"></span>
+          </div>
         </div>
       </div>
 
@@ -617,23 +645,50 @@
       <div class="tab-panel" id="panel-settings">
         <div class="card">
           <h2 data-i18n="settings_title">Innstillinger</h2>
+
           <div class="form-group">
-            <label data-i18n="claim_token_label">Ditt claim-token (lagre dette!)</label>
-            <input type="text" id="settingsToken" readonly style="background: var(--gray-100); font-family: monospace; font-size: 0.8rem;" />
-            <p class="form-hint" data-i18n="token_hint">Du trenger dette tokenet for å logge inn igjen. Kopier og lagre det trygt.</p>
+            <label>Innlogging</label>
+            <p style="font-size: 0.9rem; color: var(--gray-600);">Du logger inn med e-postlenke. Trykk "Logg inn" på selger-siden og skriv inn e-posten din.</p>
           </div>
+
           <div class="form-group">
             <label data-i18n="agent_id_label">Agent ID</label>
             <input type="text" id="settingsAgentId" readonly style="background: var(--gray-100); font-family: monospace; font-size: 0.8rem;" />
           </div>
+
           <div class="form-group">
-            <label data-i18n="api_url_label">API-endepunkter</label>
+            <label data-i18n="api_url_label">API-endepunkter (for utviklere)</label>
             <div style="background: var(--gray-100); padding: 0.75rem; border-radius: var(--radius); font-family: monospace; font-size: 0.75rem; line-height: 1.8; word-break: break-all;">
               <div>GET <span id="settingsInfoUrl"></span></div>
               <div>PUT <span id="settingsKnowledgeUrl"></span></div>
             </div>
           </div>
         </div>
+
+        <!-- Danger zone -->
+        <div class="card" style="margin-top: 1rem; border: 1px solid #e8c4c4;">
+          <h3 style="color: #b91c1c; margin-bottom: 0.5rem;">Farlig sone</h3>
+          <p style="font-size: 0.85rem; color: var(--gray-600); margin-bottom: 1rem;">
+            Disse handlingene kan ikke angres.
+          </p>
+          <div style="display: flex; flex-direction: column; gap: 0.75rem;">
+            <div style="display: flex; justify-content: space-between; align-items: center; padding: 0.75rem; background: var(--gray-50); border-radius: var(--radius);">
+              <div>
+                <strong style="font-size: 0.9rem;">Frasig eierskap</strong>
+                <p style="font-size: 0.8rem; color: var(--gray-500); margin: 0;">Agenten blir tilgjengelig for andre å gjøre krav på.</p>
+              </div>
+              <button class="btn btn-secondary btn-small" id="btnUnclaim" style="border-color: #b91c1c; color: #b91c1c; white-space: nowrap;">Frasig eierskap</button>
+            </div>
+            <div style="display: flex; justify-content: space-between; align-items: center; padding: 0.75rem; background: var(--gray-50); border-radius: var(--radius);">
+              <div>
+                <strong style="font-size: 0.9rem;">Meld butikk som nedlagt</strong>
+                <p style="font-size: 0.8rem; color: var(--gray-500); margin: 0;">Agenten merkes som inaktiv og fjernes fra søkeresultater.</p>
+              </div>
+              <button class="btn btn-secondary btn-small" id="btnDeactivate" style="border-color: #b91c1c; color: #b91c1c; white-space: nowrap;">Meld nedlagt</button>
+            </div>
+          </div>
+        </div>
+        <input type="hidden" id="settingsToken" />
       </div>
     </div>
   </div>
@@ -712,7 +767,7 @@
 
   <script>
     // ═══════════════════════════════════════════════════════════════
-    // Lokal Seller Dashboard — Full client-side app
+    // Rett fra Bonden Seller Dashboard — Full client-side app
     // Architecture: Token-based auth, all state in memory,
     // communicates with rettfrabonden.com REST API.
     // ═══════════════════════════════════════════════════════════════
@@ -729,6 +784,7 @@
       knowledge: null,
       metrics: null,
       products: [],
+      images: [],
       editingProductIndex: -1,
     };
 
@@ -736,7 +792,7 @@
     const i18n = {
       no: {
         claim_title: 'Eier du en lokal matbutikk?',
-        claim_subtitle: 'Finn din agent i Lokal-registeret og ta kontroll. Oppdater info, legg til produkter, og bli synlig for kj\u00f8peragenter.',
+        claim_subtitle: 'Finn din agent i Rett fra Bonden-registeret og ta kontroll. Oppdater info, legg til produkter, og bli synlig for kj\u00f8peragenter.',
         claim_search_placeholder: 'S\u00f8k etter butikknavn eller by...',
         step_find: 'Finn agent', step_verify: 'Verifiser', step_manage: 'Administrer',
         your_name: 'Ditt navn', your_email: 'Din e-post', your_phone: 'Telefon (valgfritt)',
@@ -804,7 +860,7 @@
       },
       en: {
         claim_title: 'Own a local food shop?',
-        claim_subtitle: 'Find your agent in the Lokal registry and take control. Update info, add products, and become visible to buyer agents.',
+        claim_subtitle: 'Find your agent in the Rett fra Bonden registry and take control. Update info, add products, and become visible to buyer agents.',
         claim_search_placeholder: 'Search by shop name or city...',
         step_find: 'Find agent', step_verify: 'Verify', step_manage: 'Manage',
         your_name: 'Your name', your_email: 'Your email', your_phone: 'Phone (optional)',
@@ -900,9 +956,16 @@
     // ── UI helpers ──
     function show(id) { document.getElementById(id).classList.remove('hidden'); }
     function hide(id) { document.getElementById(id).classList.add('hidden'); }
+    function escHtml(s) {
+      var d = document.createElement('div');
+      d.textContent = s || '';
+      return d.innerHTML;
+    }
+
     function showAlert(containerId, msg, type, persistent) {
       var el = document.getElementById(containerId);
-      el.innerHTML = '<div class="alert alert-' + type + '">' + msg + '</div>';
+      var safeType = (type || 'info').replace(/[^a-z]/gi, '');
+      el.innerHTML = '<div class="alert alert-' + safeType + '">' + msg + '</div>';
       if (!persistent) {
         setTimeout(function() { el.innerHTML = ''; }, 5000);
       }
@@ -1004,7 +1067,7 @@
           container.appendChild(div);
         });
       } catch (err) {
-        container.innerHTML = '<p style="text-align:center;color:var(--red);">Error: ' + err.message + '</p>';
+        container.innerHTML = '<p style="text-align:center;color:var(--red);">Error: ' + escHtml(err.message) + '</p>';
       }
     }
 
@@ -1087,6 +1150,7 @@
         if (res.success) {
           state.claimToken = res.data.claimToken;
           state.agentId = res.data.agentId || claimAgentId;
+          saveSession();
           showAlert('verifyAlert', t('claim_success'), 'success');
           setTimeout(function() { loadDashboard(); }, 1000);
         } else {
@@ -1098,51 +1162,51 @@
       this.disabled = false;
     });
 
-    // ── Login with token ──
-    document.getElementById('btnLogin').addEventListener('click', async function() {
-      var token = document.getElementById('loginToken').value.trim();
-      if (!token) return;
+    // ── Magic link: request login link via email ──
+    document.getElementById('btnMagicLink').addEventListener('click', async function() {
+      var email = document.getElementById('loginEmail').value.trim();
+      if (!email) return;
       this.disabled = true;
-      // Try to validate the token by fetching agents
-      state.claimToken = token;
+      this.textContent = 'Sender...';
       try {
-        // We'll try to find which agent this token belongs to
-        // by querying all agents and checking claim status
-        var agents = await api('/agents');
-        if (agents.success && agents.agents) {
-          // Try each agent's info endpoint with the token
-          var found = false;
-          for (var ag of agents.agents) {
-            try {
-              var info = await api('/agents/' + ag.id + '/info');
-              if (info.success && info.data && info.data.agent && info.data.agent.isClaimed) {
-                // Try to update knowledge to verify token works
-                var test = await fetch(API + '/agents/' + ag.id + '/knowledge', {
-                  method: 'PUT',
-                  headers: { 'Content-Type': 'application/json', 'X-Claim-Token': token },
-                  body: JSON.stringify({})
-                });
-                var testRes = await test.json();
-                if (testRes.success) {
-                  state.agentId = ag.id;
-                  found = true;
-                  loadDashboard();
-                  break;
-                }
-              }
-            } catch(e) { /* skip */ }
-          }
-          if (!found) {
-            showAlert('dashAlert', t('login_error'), 'error');
-            state.claimToken = null;
-          }
-        }
+        var res = await fetch(API + '/auth/magic-link', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ email: email })
+        });
+        var data = await res.json();
+        showAlert('magicLinkAlert', 'Sjekk innboksen din! Vi har sendt en innloggingslenke til ' + email + '.', 'success');
       } catch (err) {
-        showAlert('dashAlert', t('login_error'), 'error');
-        state.claimToken = null;
+        showAlert('magicLinkAlert', 'Kunne ikke sende lenke. Prøv igjen.', 'error');
       }
       this.disabled = false;
+      this.textContent = 'Send innloggingslenke';
     });
+
+    // ── Magic link: handle ?magic= URL parameter on page load ──
+    (async function checkMagicLink() {
+      var params = new URLSearchParams(window.location.search);
+      var magicToken = params.get('magic');
+      if (!magicToken) return;
+
+      // Clean URL so token isn't visible / bookmarkable
+      window.history.replaceState({}, '', '/selger');
+
+      try {
+        var res = await fetch(API + '/auth/magic-verify?token=' + encodeURIComponent(magicToken));
+        var data = await res.json();
+        if (data.success && data.data) {
+          state.claimToken = data.data.claimToken;
+          state.agentId = data.data.agentId;
+          saveSession();
+          loadDashboard();
+        } else {
+          showAlert('magicLinkAlert', data.error || 'Innloggingslenken er ugyldig eller utløpt. Be om en ny.', 'error');
+        }
+      } catch (err) {
+        showAlert('magicLinkAlert', 'Noe gikk galt. Prøv å be om en ny lenke.', 'error');
+      }
+    })();
 
     // ── Logout ──
     document.getElementById('btnLogout').addEventListener('click', function() {
@@ -1157,9 +1221,60 @@
       hide('btnLogout');
     });
 
+    // ── Unclaim (give up ownership) ──
+    document.getElementById('btnUnclaim').addEventListener('click', async function() {
+      if (!confirm('Er du sikker på at du vil frasige deg eierskapet til denne agenten? Handlingen kan ikke angres.')) return;
+      this.disabled = true;
+      try {
+        var res = await fetch(API + '/agents/' + state.agentId + '/unclaim', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', 'X-Claim-Token': state.claimToken }
+        });
+        var data = await res.json();
+        if (data.success) {
+          clearSession();
+          state.claimToken = null;
+          state.agentId = null;
+          show('viewClaim');
+          hide('viewDashboard');
+          hide('btnLogout');
+          showAlert('claimAlert', 'Eierskap frasagt. Agenten er nå tilgjengelig for andre.', 'info');
+        } else {
+          alert(data.error || 'Noe gikk galt');
+        }
+      } catch (err) { alert('Feil: ' + err.message); }
+      this.disabled = false;
+    });
+
+    // ── Deactivate (mark business as closed) ──
+    document.getElementById('btnDeactivate').addEventListener('click', async function() {
+      if (!confirm('Er du sikker på at du vil melde butikken som nedlagt? Agenten fjernes fra søkeresultater.')) return;
+      this.disabled = true;
+      try {
+        var res = await fetch(API + '/agents/' + state.agentId + '/knowledge', {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json', 'X-Claim-Token': state.claimToken },
+          body: JSON.stringify({ status: 'inactive', about: (state.knowledge && state.knowledge.about ? state.knowledge.about : '') + ' [Nedlagt]' })
+        });
+        var data = await res.json();
+        if (data.success) {
+          showAlert('claimAlert', 'Butikken er meldt som nedlagt.', 'info');
+          loadDashboard();
+        } else {
+          alert(data.error || 'Noe gikk galt');
+        }
+      } catch (err) { alert('Feil: ' + err.message); }
+      this.disabled = false;
+    });
+
     // ═══════════ DASHBOARD ═══════════
 
     async function loadDashboard() {
+      if (!state.agentId) {
+        showAlert('claimAlert', 'Ingen agent valgt. Prøv å logge inn på nytt.', 'error');
+        return;
+      }
+
       hide('viewClaim');
       show('viewDashboard');
       show('btnLogout');
@@ -1172,9 +1287,18 @@
           state.knowledge = info.data.knowledge;
           saveSession();
           renderDashboard();
+        } else if (info.error && info.error.toLowerCase().includes('unauthorized')) {
+          // Token expired or invalid — clear session and go back to login
+          clearSession();
+          state.claimToken = null;
+          state.agentId = null;
+          hide('viewDashboard');
+          show('viewClaim');
+          showAlert('claimAlert', 'Innloggingen din har utløpt. Vennligst logg inn på nytt.', 'error');
+          return;
         }
       } catch (err) {
-        showAlert('dashAlert', 'Error loading agent: ' + err.message, 'error');
+        showAlert('dashAlert', 'Error loading agent: ' + escHtml(err.message), 'error');
       }
 
       // Load metrics
@@ -1193,7 +1317,9 @@
 
       document.getElementById('dashAgentName').textContent = agent.name;
       document.getElementById('dashAgentCity').textContent = agent.city || '';
-      document.getElementById('dashDataSource').textContent = knowledge ? 'Data: ' + (state.knowledge.dataSource || 'auto') : '';
+      var dsLabels = { 'auto': 'Automatisk innhentet', 'hybrid': 'Verifisert av eier', 'owner': 'Eierstyrt' };
+      var ds = state.knowledge ? (state.knowledge.dataSource || 'auto') : '';
+      document.getElementById('dashDataSource').textContent = dsLabels[ds] || ds;
 
       // Fill profile form
       if (knowledge) {
@@ -1311,7 +1437,69 @@
       document.getElementById('statChosen').textContent = m.times_chosen || m.timesChosen || 0;
       var trust = state.agent ? Math.round((state.agent.trustScore || 0) * 100) : 0;
       document.getElementById('statTrust').textContent = trust + '%';
+      // Load trust breakdown
+      if (state.agentId) loadTrustBreakdown();
     }
+
+    // ── Trust Score Breakdown ──
+    function loadTrustBreakdown() {
+      fetch(API + '/agents/' + state.agentId + '/trust')
+        .then(function(r) { return r.json(); })
+        .then(function(res) {
+          if (!res.success) return;
+          var d = res.data;
+          var signals = d.signals;
+          var signalNames = {
+            verification: { no: 'Verifisering', en: 'Verification', icon: '🔒' },
+            completeness: { no: 'Profil-komplettering', en: 'Profile completeness', icon: '📝' },
+            freshness: { no: 'Aktivitet/ferskhet', en: 'Activity/freshness', icon: '⚡' },
+            interaction: { no: 'Interaksjoner', en: 'Interactions', icon: '👥' },
+            community: { no: 'Fellesskap', en: 'Community', icon: '⭐' }
+          };
+          var lang = state.lang || 'no';
+          var html = '';
+          var keys = ['verification', 'completeness', 'freshness', 'interaction', 'community'];
+          for (var i = 0; i < keys.length; i++) {
+            var key = keys[i];
+            var s = signals[key];
+            var meta = signalNames[key];
+            var pct = Math.round(s.value * 100);
+            var weightPct = Math.round(s.weight * 100);
+            var barColor = pct >= 80 ? 'var(--green)' : pct >= 50 ? 'var(--orange)' : 'var(--red)';
+            html += '<div style="background:var(--gray-50);border-radius:var(--radius);padding:0.75rem;">';
+            html += '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:4px;">';
+            html += '<span style="font-weight:500;">' + meta.icon + ' ' + meta[lang] + ' <span style="color:var(--gray-500);font-size:0.8rem;">(' + weightPct + '% vekt)</span></span>';
+            html += '<span style="font-weight:700;color:' + barColor + ';">' + pct + '%</span>';
+            html += '</div>';
+            html += '<div style="background:var(--gray-200);border-radius:99px;height:8px;overflow:hidden;">';
+            html += '<div style="background:' + barColor + ';height:100%;width:' + pct + '%;border-radius:99px;transition:width 0.5s;"></div>';
+            html += '</div>';
+            html += '<div style="font-size:0.75rem;color:var(--gray-500);margin-top:2px;">' + s.detail + '</div>';
+            html += '</div>';
+          }
+          document.getElementById('trustSignals').innerHTML = html;
+
+          // Render tips
+          if (d.tips && d.tips.length > 0) {
+            var tipsHtml = '<div style="background:var(--blue-light);border:1px solid #bfdbfe;border-radius:var(--radius);padding:0.75rem;">';
+            tipsHtml += '<div style="font-weight:600;margin-bottom:0.5rem;">💡 ' + (lang === 'no' ? 'Tips for å øke din score:' : 'Tips to improve your score:') + '</div>';
+            for (var t = 0; t < d.tips.length; t++) {
+              tipsHtml += '<div style="font-size:0.85rem;padding:2px 0;">• ' + d.tips[t] + '</div>';
+            }
+            tipsHtml += '</div>';
+            document.getElementById('trustTips').innerHTML = tipsHtml;
+          } else {
+            document.getElementById('trustTips').innerHTML = '<div style="background:var(--green-light);border:1px solid #bbf7d0;border-radius:var(--radius);padding:0.75rem;font-weight:500;">🎉 ' + (lang === 'no' ? 'Flott! Profilen din ser komplett ut.' : 'Great! Your profile looks complete.') + '</div>';
+          }
+        })
+        .catch(function(err) { console.error('Trust breakdown load failed:', err); });
+    }
+
+    // Toggle trust breakdown visibility
+    document.getElementById('trustScoreCard').addEventListener('click', function() {
+      var el = document.getElementById('trustBreakdown');
+      el.style.display = el.style.display === 'none' ? 'block' : 'none';
+    });
 
     function renderSettings() {
       document.getElementById('settingsToken').value = state.claimToken || '';
@@ -1510,6 +1698,138 @@
       }
     }
 
+    // ── Bulk product paste parser ──
+    var categoryMap = {
+      'grønnsaker': 'vegetables', 'grønnsak': 'vegetables', 'gronn': 'vegetables',
+      'frukt': 'fruit', 'bær': 'berries', 'baer': 'berries',
+      'honning': 'honey', 'kjøtt': 'meat', 'kjott': 'meat',
+      'fisk': 'fish', 'sjømat': 'fish', 'sjomat': 'fish',
+      'meieri': 'dairy', 'melk': 'dairy', 'ost': 'dairy', 'smør': 'dairy',
+      'egg': 'eggs', 'bakst': 'bakery', 'brød': 'bakery', 'brod': 'bakery',
+      'urter': 'herbs', 'krydder': 'herbs',
+      'syltetøy': 'preserves', 'syltetoy': 'preserves', 'safting': 'preserves', 'saft': 'preserves',
+      'drikke': 'beverages', 'juice': 'beverages', 'cider': 'beverages',
+      'annet': 'other'
+    };
+
+    function guessCategory(text) {
+      var lower = text.toLowerCase();
+      for (var key in categoryMap) {
+        if (lower.indexOf(key) >= 0) return categoryMap[key];
+      }
+      return 'other';
+    }
+
+    function parseMonthRange(text) {
+      if (!text) return [];
+      var monthNames = { 'jan': 1, 'feb': 2, 'mar': 3, 'apr': 4, 'mai': 5, 'jun': 6,
+                         'jul': 7, 'aug': 8, 'sep': 9, 'okt': 10, 'nov': 11, 'des': 12,
+                         'hele året': 0, 'året rundt': 0, 'year round': 0, 'all year': 0 };
+      var lower = text.toLowerCase().trim();
+      if (lower === 'hele året' || lower === 'året rundt' || lower === 'year round' || lower === 'all year') {
+        return [1,2,3,4,5,6,7,8,9,10,11,12];
+      }
+      var months = [];
+      var parts = lower.split(/[-–]/);
+      if (parts.length === 2) {
+        var start = 0, end = 0;
+        for (var mn in monthNames) {
+          if (parts[0].trim().indexOf(mn) >= 0) start = monthNames[mn];
+          if (parts[1].trim().indexOf(mn) >= 0) end = monthNames[mn];
+        }
+        if (start && end) {
+          for (var m = start; m !== ((end % 12) + 1); m = (m % 12) + 1) {
+            months.push(m);
+            if (months.length > 12) break;
+          }
+          months.push(end);
+        }
+      }
+      // Deduplicate
+      return months.filter(function(v, i, a) { return a.indexOf(v) === i; });
+    }
+
+    document.getElementById('btnParseBulk').addEventListener('click', function() {
+      var input = document.getElementById('bulkProductInput').value.trim();
+      if (!input) return;
+
+      var lines = input.split('\n').filter(function(l) { return l.trim().length > 0; });
+      var added = 0;
+
+      lines.forEach(function(line) {
+        // Support multiple formats:
+        // "Name | Category | Price | Season"
+        // "Name - Price"
+        // "Name (price)"
+        // Just "Name"
+        var parts = line.split(/\s*\|\s*/);
+        var name, category, price, season;
+
+        if (parts.length >= 2) {
+          // Pipe-delimited
+          name = parts[0].trim();
+          category = parts.length >= 2 ? parts[1].trim() : '';
+          price = parts.length >= 3 ? parts[2].trim() : '';
+          season = parts.length >= 4 ? parts[3].trim() : '';
+        } else {
+          // Try "Name - Price" or "Name (price)" or just name
+          var dashMatch = line.match(/^(.+?)\s*[-–]\s*(\d[\d\s]*(?:kr|,-|nok)[^|]*?)(?:\s*[-–]\s*(.+))?$/i);
+          var parenMatch = line.match(/^(.+?)\s*\(([^)]+)\)/);
+          if (dashMatch) {
+            name = dashMatch[1].trim();
+            price = dashMatch[2].trim();
+            season = dashMatch[3] ? dashMatch[3].trim() : '';
+          } else if (parenMatch) {
+            name = parenMatch[1].trim();
+            price = parenMatch[2].trim();
+          } else {
+            name = line.trim();
+          }
+          category = '';
+        }
+
+        if (!name) return;
+
+        // Remove leading bullets, numbers, dashes
+        name = name.replace(/^[\s\-\*\•\d\.]+\s*/, '');
+        if (!name) return;
+
+        // Guess category from name or explicit category text
+        var catKey = guessCategory(category || name);
+
+        // Check for duplicates
+        var exists = state.products.some(function(p) {
+          return p.name.toLowerCase() === name.toLowerCase();
+        });
+        if (exists) return;
+
+        state.products.push({
+          name: name,
+          category: catKey,
+          price: price || '',
+          priceUnit: 'kr',
+          organic: false,
+          seasonal: parseMonthRange(season).length > 0 && parseMonthRange(season).length < 12,
+          seasonMonths: parseMonthRange(season)
+        });
+        added++;
+      });
+
+      if (added > 0) {
+        saveProducts();
+        document.getElementById('bulkProductInput').value = '';
+        document.getElementById('bulkResult').textContent = added + ' produkt' + (added > 1 ? 'er' : '') + ' lagt til!';
+        setTimeout(function() { document.getElementById('bulkResult').textContent = ''; }, 4000);
+      } else {
+        document.getElementById('bulkResult').textContent = 'Ingen nye produkter funnet. Sjekk formatet.';
+        document.getElementById('bulkResult').style.color = 'var(--red, #b91c1c)';
+        setTimeout(function() {
+          document.getElementById('bulkResult').textContent = '';
+          document.getElementById('bulkResult').style.color = 'var(--green)';
+        }, 4000);
+      }
+    });
+
     function buildMonthCheckboxes(selected) {
       var container = document.getElementById('prodMonths');
       container.innerHTML = '';
@@ -1669,7 +1989,7 @@
       Array.from(files).forEach(function(file) {
         if (!file.type.startsWith('image/')) return;
         if (file.size > 5 * 1024 * 1024) {
-          showAlert('dashAlert', 'Bildet «' + file.name + '» er for stort (maks 5 MB).', 'error');
+          showAlert('dashAlert', 'Bildet «' + escHtml(file.name) + '» er for stort (maks 5 MB).', 'error');
           return;
         }
         var reader = new FileReader();
@@ -1986,17 +2306,17 @@
           noMatch.classList.add('hidden');
 
           data.matches.forEach(function(m) {
-            var cats = (m.categories || []).join(', ');
+            var cats = escHtml((m.categories || []).join(', '));
             var badge = m.isClaimed ? '<span style="background:#e74c3c;color:white;padding:2px 8px;border-radius:12px;font-size:0.75rem;">Eid</span>' :
                         m.isVerified ? '<span style="background:var(--forest);color:white;padding:2px 8px;border-radius:12px;font-size:0.75rem;">Verifisert</span>' :
-                        '<span style="background:var(--accent);color:white;padding:2px 8px;border-radius:12px;font-size:0.75rem;">' + m.similarity + '% match</span>';
+                        '<span style="background:var(--accent);color:white;padding:2px 8px;border-radius:12px;font-size:0.75rem;">' + escHtml(String(m.similarity)) + '% match</span>';
             var claimBtn = m.isClaimed
               ? '<span style="color:var(--gray-500);font-size:0.85rem;">Denne er allerede eid av noen</span>'
-              : '<button class="btn btn-primary" style="padding:6px 16px;font-size:0.85rem;" data-claim-id="' + m.id + '" data-claim-name="' + (m.name || '').replace(/"/g, '&quot;') + '">Dette er min butikk</button>';
+              : '<button class="btn btn-primary" style="padding:6px 16px;font-size:0.85rem;" data-claim-id="' + escHtml(m.id) + '" data-claim-name="' + escHtml(m.name || '') + '">Dette er min butikk</button>';
 
             matchList.innerHTML += '<div style="display:flex;align-items:center;justify-content:space-between;padding:1rem;background:var(--gray-50);border-radius:12px;margin-bottom:0.5rem;border:1px solid var(--gray-200);">'
-              + '<div><strong>' + m.name + '</strong> ' + badge + '<br><span style="color:var(--gray-500);font-size:0.85rem;">' + (m.city || '') + (cats ? ' — ' + cats : '') + '</span>'
-              + (m.description ? '<br><span style="color:var(--gray-400);font-size:0.8rem;">' + m.description + '</span>' : '')
+              + '<div><strong>' + escHtml(m.name) + '</strong> ' + badge + '<br><span style="color:var(--gray-500);font-size:0.85rem;">' + escHtml(m.city || '') + (cats ? ' — ' + cats : '') + '</span>'
+              + (m.description ? '<br><span style="color:var(--gray-400);font-size:0.8rem;">' + escHtml(m.description) + '</span>' : '')
               + '</div>'
               + '<div style="flex-shrink:0;margin-left:1rem;">' + claimBtn + '</div>'
               + '</div>';
@@ -2031,7 +2351,7 @@
         }
 
       } catch(err) {
-        showAlert('findAlert', 'Feil ved søk: ' + err.message, 'error');
+        showAlert('findAlert', 'Feil ved søk: ' + escHtml(err.message), 'error');
       } finally {
         this.disabled = false;
         this.textContent = 'Sjekk registeret';
@@ -2058,6 +2378,7 @@
       document.getElementById('claimStep2').classList.remove('hidden');
       document.getElementById('claimAgentName').textContent = agentName;
       document.getElementById('claimAgentDesc').textContent = 'Bekreft at du eier denne butikken for å ta kontroll over agenten.';
+      claimAgentId = agentId;  // Critical: set the module-level var used by btnRequestClaim
       state.agentId = agentId;
       document.getElementById('claimStep2').scrollIntoView({ behavior: 'smooth', block: 'start' });
     }
@@ -2128,7 +2449,7 @@
 
           // Show progress
           showAlert('regAlert',
-            '<strong>Agenten «' + name + '» er registrert!</strong><br>Setter opp eierskap automatisk...',
+            '<strong>Agenten «' + escHtml(name) + '» er registrert!</strong><br>Setter opp eierskap automatisk...',
             'info', true);
 
           // Auto-claim: step 1 — request claim
@@ -2156,8 +2477,8 @@
 
                   showAlert('regAlert',
                     '<strong style="font-size:1.1rem;">Din agent er klar!</strong>' +
-                    '<br><br>Du er nå verifisert eier av «' + name + '». Dashboard lastes...' +
-                    '<br><br><strong>API-nøkkel</strong> (brukes av agenten din):<br><code style="background:#e8f5e9;padding:4px 8px;border-radius:4px;font-size:0.8rem;word-break:break-all;">' + apiKey + '</code>',
+                    '<br><br>Du er nå verifisert eier av «' + escHtml(name) + '». Dashboard lastes...' +
+                    '<br><br><strong>API-nøkkel</strong> (brukes av agenten din):<br><code style="background:#e8f5e9;padding:4px 8px;border-radius:4px;font-size:0.8rem;word-break:break-all;">' + escHtml(apiKey) + '</code>',
                     'success', true);
 
                   document.getElementById('regAlert').scrollIntoView({ behavior: 'smooth', block: 'center' });
@@ -2185,9 +2506,9 @@
 
           // Fallback: if auto-claim failed, show manual instructions
           showAlert('regAlert',
-            '<strong style="font-size:1.1rem;">Agenten «' + name + '» er registrert!</strong>' +
-            '<br><br><strong>Neste steg:</strong> Søk opp «' + name + '» i feltet øverst og trykk «Gjør krav» for å få tilgang.' +
-            '<br><br><strong>API-nøkkel</strong> (lagre denne):<br><code style="background:#e8f5e9;padding:4px 8px;border-radius:4px;font-size:0.8rem;word-break:break-all;">' + apiKey + '</code>',
+            '<strong style="font-size:1.1rem;">Agenten «' + escHtml(name) + '» er registrert!</strong>' +
+            '<br><br><strong>Neste steg:</strong> Søk opp «' + escHtml(name) + '» i feltet øverst og trykk «Gjør krav» for å få tilgang.' +
+            '<br><br><strong>API-nøkkel</strong> (lagre denne):<br><code style="background:#e8f5e9;padding:4px 8px;border-radius:4px;font-size:0.8rem;word-break:break-all;">' + escHtml(apiKey) + '</code>',
             'success', true);
 
           document.getElementById('regAlert').scrollIntoView({ behavior: 'smooth', block: 'center' });
@@ -2206,7 +2527,7 @@
           showAlert('regAlert', data.error || 'Registrering feilet. Prøv igjen.', 'error');
         }
       } catch (err) {
-        showAlert('regAlert', 'Feil: ' + err.message, 'error');
+        showAlert('regAlert', 'Feil: ' + escHtml(err.message), 'error');
       }
       this.disabled = false;
     });
