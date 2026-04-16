@@ -1220,12 +1220,15 @@ router.post("/webhooks/inbound-email", async (req: Request, res: Response) => {
   try {
     const payload = req.body;
 
+    // Log full payload to debug Resend's format
+    console.log(`[Inbound] Raw payload: ${JSON.stringify(payload).substring(0, 2000)}`);
+
     // Resend wraps inbound data in { type, created_at, data: { ... } }
     const data = payload.data || payload; // fallback for direct test calls
-    const from = data.from || "unknown";
-    const to = data.to || [];
-    const subject = data.subject || "(ingen emne)";
-    const emailId = data.email_id;
+    const from = data.from || payload.from || "unknown";
+    const to = data.to || payload.to || [];
+    const subject = data.subject || payload.subject || "(ingen emne)";
+    const emailId = data.email_id || payload.email_id;
 
     console.log(`[Inbound] Event: ${payload.type || "unknown"}, email_id: ${emailId}, from: ${from}, subject: "${subject}"`);
 
