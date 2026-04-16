@@ -230,7 +230,6 @@
     .search-input-wrapper {
       display: flex;
       gap: 0.5rem;
-      position: relative;
     }
 
     .search-input-wrapper input {
@@ -262,125 +261,6 @@
     .search-btn:hover {
       background: #1a3d0a;
       transform: translateY(-2px);
-    }
-
-    #nearbyBtn {
-      padding: 0.75rem 1rem;
-      font-size: 1.1rem;
-      min-width: auto;
-    }
-
-    #nearbyBtn.active {
-      background: var(--accent-orange);
-      box-shadow: 0 0 0 3px rgba(212, 163, 115, 0.3);
-    }
-
-    /* Autocomplete suggestions */
-    .search-suggestions {
-      display: none;
-      position: absolute;
-      top: 100%;
-      left: 0;
-      right: 0;
-      background: white;
-      border: 1px solid var(--border-gray);
-      border-top: none;
-      border-radius: 0 0 8px 8px;
-      box-shadow: 0 8px 16px rgba(0,0,0,0.1);
-      z-index: 100;
-      max-height: 300px;
-      overflow-y: auto;
-    }
-
-    .search-suggestions.visible {
-      display: block;
-    }
-
-    .suggestion-item {
-      padding: 0.6rem 1rem;
-      cursor: pointer;
-      font-size: 0.9rem;
-      display: flex;
-      align-items: center;
-      gap: 0.5rem;
-      border-bottom: 1px solid var(--border-gray);
-    }
-
-    .suggestion-item:last-child {
-      border-bottom: none;
-    }
-
-    .suggestion-item:hover, .suggestion-item.highlighted {
-      background: #f0fdf4;
-    }
-
-    .suggestion-type {
-      font-size: 0.7rem;
-      padding: 1px 6px;
-      border-radius: 4px;
-      font-weight: 600;
-      flex-shrink: 0;
-    }
-
-    .suggestion-type.cat { background: #dcfce7; color: #166534; }
-    .suggestion-type.city { background: #dbeafe; color: #1e40af; }
-    .suggestion-type.agent { background: #fef3c7; color: #92400e; }
-
-    /* Quick category chips under search */
-    .search-quick-chips {
-      display: flex;
-      flex-wrap: wrap;
-      gap: 0.5rem;
-      margin-top: 0.75rem;
-      justify-content: center;
-    }
-
-    .quick-chip {
-      padding: 0.3rem 0.75rem;
-      border: 1px solid var(--border-gray);
-      border-radius: 20px;
-      font-size: 0.8rem;
-      cursor: pointer;
-      background: white;
-      color: var(--text-gray);
-      transition: all 0.2s;
-      white-space: nowrap;
-    }
-
-    .quick-chip:hover {
-      border-color: var(--forest-green);
-      color: var(--forest-green);
-      background: #f0fdf4;
-    }
-
-    .quick-chip .chip-icon {
-      margin-right: 3px;
-    }
-
-    .nearby-banner {
-      background: #f0fdf4;
-      border: 1px solid #bbf7d0;
-      padding: 0.5rem 1rem;
-      border-radius: 8px;
-      margin-top: 0.75rem;
-      font-size: 0.85rem;
-      color: #166534;
-      display: none;
-      align-items: center;
-      gap: 0.5rem;
-    }
-
-    .nearby-banner.visible {
-      display: flex;
-    }
-
-    .nearby-banner button {
-      background: none;
-      border: none;
-      cursor: pointer;
-      font-size: 1rem;
-      margin-left: auto;
-      color: #166534;
     }
 
     /* Main Container */
@@ -888,38 +768,6 @@
       text-decoration: underline;
     }
 
-    .modal-links-list {
-      display: flex;
-      flex-direction: column;
-      gap: 0.5rem;
-    }
-
-    .modal-link-item {
-      display: flex;
-      align-items: center;
-      gap: 0.5rem;
-      padding: 0.5rem 0.75rem;
-      background: var(--light-gray);
-      border-radius: 6px;
-      text-decoration: none;
-      color: var(--dark-charcoal);
-      transition: background 0.2s;
-      font-size: 0.9rem;
-    }
-
-    .modal-link-item:hover {
-      background: #e8f5e9;
-    }
-
-    .modal-link-icon {
-      font-size: 1.1rem;
-      flex-shrink: 0;
-    }
-
-    .modal-link-label {
-      flex: 1;
-    }
-
     .modal-data-source {
       display: inline-flex;
       align-items: center;
@@ -1236,6 +1084,11 @@
       opacity: 0.8;
     }
 
+    footer a:hover {
+      opacity: 1 !important;
+      text-decoration: underline !important;
+    }
+
     /* Loading spinner */
     .spinner {
       border: 3px solid var(--border-gray);
@@ -1388,26 +1241,10 @@
 
   <!-- Search Container -->
   <div class="search-container">
-    <div class="search-hint" id="searchHint">Prøv: &laquo;honning i Oslo&raquo;, &laquo;økologiske grønnsaker&raquo; eller &laquo;Aker Gårdsbutikk&raquo;</div>
+    <div class="search-hint">Prøv: &laquo;Hvor finner jeg ferske grønnsaker i Oslo?&raquo;</div>
     <div class="search-input-wrapper">
-      <input type="text" id="searchInput" placeholder="Søk etter mat, sted eller produsent..." autocomplete="off">
-      <button class="search-btn" id="nearbyBtn" title="Vis i nærheten">📍</button>
+      <input type="text" id="searchInput" placeholder="Spør som en AI-agent ville gjort...">
       <button class="search-btn" id="searchBtn">Søk</button>
-      <div class="search-suggestions" id="searchSuggestions"></div>
-    </div>
-    <div class="search-quick-chips" id="quickChips">
-      <span class="quick-chip" data-query="grønnsaker"><span class="chip-icon">🥬</span>Grønnsaker</span>
-      <span class="quick-chip" data-query="frukt og bær"><span class="chip-icon">🍎</span>Frukt</span>
-      <span class="quick-chip" data-query="honning"><span class="chip-icon">🍯</span>Honning</span>
-      <span class="quick-chip" data-query="kjøtt"><span class="chip-icon">🥩</span>Kjøtt</span>
-      <span class="quick-chip" data-query="meieri"><span class="chip-icon">🧀</span>Meieri</span>
-      <span class="quick-chip" data-query="egg"><span class="chip-icon">🥚</span>Egg</span>
-      <span class="quick-chip" data-query="brød og bakst"><span class="chip-icon">🍞</span>Brød</span>
-      <span class="quick-chip" data-query="fisk"><span class="chip-icon">🐟</span>Fisk</span>
-    </div>
-    <div class="nearby-banner" id="nearbyBanner">
-      <span>📍 Viser resultater i nærheten av deg</span>
-      <button id="clearNearby" title="Fjern stedsfilter">&times;</button>
     </div>
   </div>
 
@@ -1564,9 +1401,24 @@ curl -X POST https://rettfrabonden.com/api/marketplace/register \
     </div>
   </div>
 
-  <footer>
-    <p>LOKAL &mdash; Agent-registeret for norsk mat &middot; A2A Protocol</p>
-    <p style="margin-top: 0.5rem; font-size: 0.85rem; opacity: 0.6;">Gjør matprodusenter synlige for morgendagens AI-assistenter</p>
+  <footer style="padding:2.5rem 2rem;">
+    <div style="max-width:800px;margin:0 auto;">
+      <p style="font-size:1.1rem;font-weight:700;margin-bottom:1rem;">RETT FRA BONDEN</p>
+      <p style="opacity:0.8;margin-bottom:1.5rem;">Gjør lokale matprodusenter synlige for AI-assistenter i hele Norge</p>
+      <div style="display:flex;justify-content:center;gap:1.5rem;flex-wrap:wrap;margin-bottom:1.5rem;">
+        <a href="/om" style="color:#a3e635;text-decoration:none;">Om oss</a>
+        <a href="/teknologi" style="color:#a3e635;text-decoration:none;">Slik fungerer det</a>
+        <a href="/selger" style="color:#a3e635;text-decoration:none;">For produsenter</a>
+        <a href="https://github.com/slookisen/lokal" target="_blank" rel="noopener" style="color:#a3e635;text-decoration:none;">GitHub</a>
+      </div>
+      <div style="display:flex;justify-content:center;gap:1rem;flex-wrap:wrap;margin-bottom:1rem;">
+        <a href="https://chatgpt.com/g/g-69dbf8593c1c81919050f8da98cd327d-lokal-norsk-matfinner" target="_blank" rel="noopener" style="color:white;opacity:0.7;text-decoration:none;font-size:0.85rem;">ChatGPT</a>
+        <a href="https://smithery.ai/server/@slookisen/lokal" target="_blank" rel="noopener" style="color:white;opacity:0.7;text-decoration:none;font-size:0.85rem;">Claude MCP</a>
+        <a href="/mcp" style="color:white;opacity:0.7;text-decoration:none;font-size:0.85rem;">MCP API</a>
+        <a href="/.well-known/agent-card.json" style="color:white;opacity:0.7;text-decoration:none;font-size:0.85rem;">A2A</a>
+      </div>
+      <p style="font-size:0.8rem;opacity:0.4;">&copy; 2026 Rett fra Bonden. Åpen kildekode.</p>
+    </div>
   </footer>
 
   <script>
@@ -1629,39 +1481,6 @@ curl -X POST https://rettfrabonden.com/api/marketplace/register \
       if (searchBtn) {
         searchBtn.addEventListener('click', function() { performSearch(); });
       }
-
-      // Autocomplete on input
-      if (searchInput) {
-        var suggestTimeout = null;
-        searchInput.addEventListener('input', function() {
-          clearTimeout(suggestTimeout);
-          var val = searchInput.value.trim();
-          if (val.length < 2) { hideSuggestions(); return; }
-          suggestTimeout = setTimeout(function() { showSuggestions(val); }, 200);
-        });
-        searchInput.addEventListener('blur', function() {
-          setTimeout(hideSuggestions, 200);
-        });
-      }
-
-      // Nearby button
-      var nearbyBtn = document.getElementById('nearbyBtn');
-      if (nearbyBtn) {
-        nearbyBtn.addEventListener('click', requestNearby);
-      }
-      var clearNearbyBtn = document.getElementById('clearNearby');
-      if (clearNearbyBtn) {
-        clearNearbyBtn.addEventListener('click', clearNearbyFilter);
-      }
-
-      // Quick chips
-      document.querySelectorAll('.quick-chip').forEach(function(chip) {
-        chip.addEventListener('click', function() {
-          var q = chip.getAttribute('data-query');
-          document.getElementById('searchInput').value = q;
-          performSearch();
-        });
-      });
 
       // Filters
       var filterBtns = document.querySelectorAll('.filter-btn');
@@ -1745,9 +1564,7 @@ curl -X POST https://rettfrabonden.com/api/marketplace/register \
           '<div class="agent-header">' +
             '<div>' +
               '<div class="agent-name">' + agent.name + '</div>' +
-              '<div class="agent-city">' + (agent.location && agent.location.city ? agent.location.city : 'Norge') +
-                (agent._distanceKm && agent._distanceKm < 99999 ? ' &middot; ' + (agent._distanceKm < 1 ? (agent._distanceKm * 1000).toFixed(0) + ' m' : agent._distanceKm.toFixed(1) + ' km') : '') +
-              '</div>' +
+              '<div class="agent-city">' + (agent.location && agent.location.city ? agent.location.city : 'Norge') + '</div>' +
             '</div>' +
             (agent.isVerified ? '<span class="verified-badge">Verifisert</span>' : '') +
           '</div>' +
@@ -1783,167 +1600,6 @@ curl -X POST https://rettfrabonden.com/api/marketplace/register \
           renderAgents();
         });
       }
-    }
-
-    // ── Geolocation state ──
-    var userLat = null, userLng = null;
-
-    // ── Autocomplete ──
-    var knownCategories = [
-      { label: 'Grønnsaker', query: 'grønnsaker', icon: '🥬' },
-      { label: 'Frukt og bær', query: 'frukt', icon: '🍎' },
-      { label: 'Honning', query: 'honning', icon: '🍯' },
-      { label: 'Kjøtt', query: 'kjøtt', icon: '🥩' },
-      { label: 'Meieri og ost', query: 'meieri', icon: '🧀' },
-      { label: 'Egg', query: 'egg', icon: '🥚' },
-      { label: 'Brød og bakst', query: 'brød', icon: '🍞' },
-      { label: 'Fisk og sjømat', query: 'fisk', icon: '🐟' },
-      { label: 'Urter og krydder', query: 'urter', icon: '🌿' },
-      { label: 'Preserves og syltetøy', query: 'preserves', icon: '🫙' },
-      { label: 'Økologisk', query: 'økologisk', icon: '🌱' }
-    ];
-
-    function showSuggestions(query) {
-      var container = document.getElementById('searchSuggestions');
-      if (!container) return;
-      var q = query.toLowerCase();
-      var items = [];
-
-      // Match categories
-      knownCategories.forEach(function(cat) {
-        if (cat.label.toLowerCase().indexOf(q) !== -1 || cat.query.toLowerCase().indexOf(q) !== -1) {
-          items.push({ type: 'cat', label: cat.icon + ' ' + cat.label, query: cat.query });
-        }
-      });
-
-      // Match cities from loaded agents
-      var cities = {};
-      allAgents.forEach(function(a) {
-        if (a.location && a.location.city) {
-          var c = a.location.city;
-          if (c.toLowerCase().indexOf(q) !== -1 && !cities[c]) {
-            cities[c] = true;
-            items.push({ type: 'city', label: '📍 ' + c, query: c });
-          }
-        }
-      });
-
-      // Match agent names
-      allAgents.forEach(function(a) {
-        if (a.name.toLowerCase().indexOf(q) !== -1) {
-          items.push({ type: 'agent', label: a.name, query: a.name, id: a.id });
-        }
-      });
-
-      if (items.length === 0) { hideSuggestions(); return; }
-
-      container.innerHTML = items.slice(0, 8).map(function(item) {
-        var typeLabel = item.type === 'cat' ? 'Kategori' : item.type === 'city' ? 'Sted' : 'Produsent';
-        var typeClass = item.type;
-        return '<div class="suggestion-item" data-query="' + item.query.replace(/"/g, '&quot;') + '"' +
-          (item.id ? ' data-id="' + item.id + '"' : '') +
-          '><span>' + item.label + '</span>' +
-          '<span class="suggestion-type ' + typeClass + '">' + typeLabel + '</span></div>';
-      }).join('');
-
-      container.querySelectorAll('.suggestion-item').forEach(function(el) {
-        el.addEventListener('mousedown', function(e) {
-          e.preventDefault();
-          var id = el.getAttribute('data-id');
-          if (id) {
-            openAgentModal(id);
-          } else {
-            document.getElementById('searchInput').value = el.getAttribute('data-query');
-            performSearch();
-          }
-          hideSuggestions();
-        });
-      });
-
-      container.classList.add('visible');
-    }
-
-    function hideSuggestions() {
-      var container = document.getElementById('searchSuggestions');
-      if (container) container.classList.remove('visible');
-    }
-
-    // ── Geolocation ──
-    function requestNearby() {
-      var btn = document.getElementById('nearbyBtn');
-      if (userLat && userLng) {
-        // Already have location — toggle off
-        clearNearbyFilter();
-        return;
-      }
-      if (!navigator.geolocation) {
-        alert('Nettleseren din støtter ikke posisjonering.');
-        return;
-      }
-      btn.textContent = '⏳';
-      navigator.geolocation.getCurrentPosition(
-        function(pos) {
-          userLat = pos.coords.latitude;
-          userLng = pos.coords.longitude;
-          btn.textContent = '📍';
-          btn.classList.add('active');
-          document.getElementById('nearbyBanner').classList.add('visible');
-          sortByDistance();
-        },
-        function(err) {
-          btn.textContent = '📍';
-          if (err.code === 1) {
-            alert('Du avslo posisjonsdeling. Du kan søke på stedsnavn i stedet.');
-          } else {
-            alert('Kunne ikke hente posisjon. Prøv å søke på stedsnavn.');
-          }
-        },
-        { enableHighAccuracy: false, timeout: 8000 }
-      );
-    }
-
-    function clearNearbyFilter() {
-      userLat = null;
-      userLng = null;
-      document.getElementById('nearbyBtn').classList.remove('active');
-      document.getElementById('nearbyBanner').classList.remove('visible');
-      filteredAgents = allAgents.slice();
-      displayCount = AGENTS_PER_PAGE;
-      var titleEl = document.getElementById('agentsSectionTitle');
-      if (titleEl) titleEl.textContent = 'Utforsk agenter i registeret';
-      renderAgents();
-    }
-
-    function haversineKm(lat1, lng1, lat2, lng2) {
-      var R = 6371;
-      var dLat = (lat2 - lat1) * Math.PI / 180;
-      var dLng = (lng2 - lng1) * Math.PI / 180;
-      var a = Math.sin(dLat/2) * Math.sin(dLat/2) +
-        Math.cos(lat1 * Math.PI / 180) * Math.cos(lat2 * Math.PI / 180) *
-        Math.sin(dLng/2) * Math.sin(dLng/2);
-      return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
-    }
-
-    function sortByDistance() {
-      if (!userLat || !userLng) return;
-      // Add distance to all agents
-      allAgents.forEach(function(a) {
-        if (a.location && a.location.lat && a.location.lng) {
-          a._distanceKm = haversineKm(userLat, userLng, a.location.lat, a.location.lng);
-        } else {
-          a._distanceKm = 99999;
-        }
-      });
-      // Sort by distance, show closest first
-      filteredAgents = allAgents.slice().sort(function(a, b) {
-        return (a._distanceKm || 99999) - (b._distanceKm || 99999);
-      });
-      displayCount = AGENTS_PER_PAGE;
-      var titleEl = document.getElementById('agentsSectionTitle');
-      if (titleEl) titleEl.textContent = 'Nærmest deg (' + filteredAgents.filter(function(a) { return a._distanceKm < 50; }).length + ' innen 50 km)';
-      renderAgents();
-      var agentsSection = document.getElementById('agents');
-      if (agentsSection) agentsSection.scrollIntoView({ behavior: 'smooth', block: 'start' });
     }
 
     // ── Search ──
@@ -2151,21 +1807,6 @@ curl -X POST https://rettfrabonden.com/api/marketplace/register \
         html += '</div></div>';
       });
 
-      // External links (REKO-ringer, Bondens marked, Facebook etc.)
-      if (knowledge.externalLinks && knowledge.externalLinks.length > 0) {
-        html += '<div class="modal-section">' +
-          '<div class="modal-section-title">Nyttige lenker</div>' +
-          '<div class="modal-links-list">';
-        knowledge.externalLinks.forEach(function(link) {
-          var icon = link.type === 'facebook' ? '📘' : link.type === 'info' ? 'ℹ️' : link.type === 'schedule' ? '📅' : '🔗';
-          html += '<a class="modal-link-item" href="' + link.url + '" target="_blank" rel="noopener">' +
-            '<span class="modal-link-icon">' + icon + '</span>' +
-            '<span class="modal-link-label">' + link.label + '</span>' +
-          '</a>';
-        });
-        html += '</div></div>';
-      }
-
       // Skills (A2A capabilities)
       if (agent.skills && agent.skills.length > 0) {
         html += '<div class="modal-section">' +
@@ -2265,10 +1906,8 @@ curl -X POST https://rettfrabonden.com/api/marketplace/register \
     // ── 3D Western Flyover Scene (embedded) ──
     function initWesternScene() {
       var scr = document.createElement('script');
-      scr.src = '/three.min.js';
-      scr.crossOrigin = 'anonymous';
+      scr.src = 'https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js';
       scr.onload = function() { buildScene(); };
-      scr.onerror = function() { console.error('Three.js failed to load'); };
       document.head.appendChild(scr);
     }
 

@@ -254,6 +254,9 @@ function initSchema(db) {
       last_enriched_at TEXT,               -- When auto-enrichment last ran
       owner_updated_at TEXT,               -- When owner last made changes
 
+      -- External links (JSON: [{label:"Facebook",url:"https://...",type:"facebook"},{label:"Neste marked",url:"...",type:"info"}])
+      external_links TEXT DEFAULT '[]',
+
       -- Future: seller preferences (v2 — NL responses, target groups)
       preferences TEXT DEFAULT '{}',       -- JSON: reserved for seller customization
 
@@ -385,6 +388,31 @@ function initSchema(db) {
     }
     catch {
         // Column already exists — expected after first migration
+    }
+    try {
+        db.exec(`ALTER TABLE agent_knowledge ADD COLUMN external_links TEXT DEFAULT '[]'`);
+    }
+    catch {
+        // Column already exists
+    }
+    // ─── One-time cleanup: reset all test verifications ──────────
+    // No real sellers have claimed yet — all is_verified=1 entries
+    // are from development/testing. Reset them to 0 and clean claims.
+    // Uses a migration flag so this only runs once.
+    try {
+        db.exec(`CREATE TABLE IF NOT EXISTS migrations (name TEXT PRIMARY KEY, applied_at TEXT DEFAULT (datetime('now')))`);
+        const alreadyRan = db.prepare("SELECT 1 FROM migrations WHERE name = 'reset_test_verifications_v1'").get();
+        if (!alreadyRan) {
+            const resetCount = db.prepare("UPDATE agents SET is_verified = 0 WHERE is_verified = 1").run().changes;
+            db.prepare("DELETE FROM agent_claims").run();
+            db.prepare("INSERT INTO migrations (name) VALUES ('reset_test_verifications_v1')").run();
+            if (resetCount > 0) {
+                console.log(`🧹 Migration: reset ${resetCount} test verifications and cleared all claims`);
+            }
+        }
+    }
+    catch (err) {
+        console.error("Migration reset_test_verifications failed:", err);
     }
 }
 function closeDb() {

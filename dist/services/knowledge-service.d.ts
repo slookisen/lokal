@@ -16,6 +16,7 @@ export interface AgentKnowledge {
     googleReviewCount?: number;
     tripadvisorRating?: number;
     externalReviews: ExternalReview[];
+    externalLinks: ExternalLink[];
     images: string[];
     dataSource: "auto" | "owner" | "hybrid";
     autoSources: string[];
@@ -42,6 +43,11 @@ export interface ExternalReview {
     text: string;
     rating?: number;
     date?: string;
+}
+export interface ExternalLink {
+    label: string;
+    url: string;
+    type: string;
 }
 export interface AgentInfoResponse {
     agent: {

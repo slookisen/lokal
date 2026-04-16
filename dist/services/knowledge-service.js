@@ -73,11 +73,11 @@ class KnowledgeService {
           agent_id, address, postal_code, website, phone, email,
           opening_hours, products, about, specialties, certifications,
           payment_methods, delivery_options, google_rating, google_review_count,
-          tripadvisor_rating, external_reviews, images,
+          tripadvisor_rating, external_reviews, external_links, images,
           data_source, auto_sources, last_enriched_at, preferences,
           created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-      `).run(agentId, data.address || null, data.postalCode || null, data.website || null, data.phone || null, data.email || null, JSON.stringify(data.openingHours || []), JSON.stringify(data.products || []), data.about || null, JSON.stringify(data.specialties || []), JSON.stringify(data.certifications || []), JSON.stringify(data.paymentMethods || []), JSON.stringify(data.deliveryOptions || []), data.googleRating || null, data.googleReviewCount || null, data.tripadvisorRating || null, JSON.stringify(data.externalReviews || []), JSON.stringify(data.images || []), data.dataSource || "auto", JSON.stringify(data.autoSources || []), now, JSON.stringify(data.preferences || {}), now, now);
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `).run(agentId, data.address || null, data.postalCode || null, data.website || null, data.phone || null, data.email || null, JSON.stringify(data.openingHours || []), JSON.stringify(data.products || []), data.about || null, JSON.stringify(data.specialties || []), JSON.stringify(data.certifications || []), JSON.stringify(data.paymentMethods || []), JSON.stringify(data.deliveryOptions || []), data.googleRating || null, data.googleReviewCount || null, data.tripadvisorRating || null, JSON.stringify(data.externalReviews || []), JSON.stringify(data.externalLinks || []), JSON.stringify(data.images || []), data.dataSource || "auto", JSON.stringify(data.autoSources || []), now, JSON.stringify(data.preferences || {}), now, now);
         }
         else {
             // Merge: owner data takes precedence over auto data
@@ -89,7 +89,7 @@ class KnowledgeService {
           opening_hours = ?, products = ?, about = ?, specialties = ?,
           certifications = ?, payment_methods = ?, delivery_options = ?,
           google_rating = ?, google_review_count = ?, tripadvisor_rating = ?,
-          external_reviews = ?, images = ?,
+          external_reviews = ?, external_links = ?, images = ?,
           data_source = ?,
           auto_sources = ?,
           last_enriched_at = CASE WHEN ? = 'auto' THEN ? ELSE last_enriched_at END,
@@ -97,7 +97,7 @@ class KnowledgeService {
           preferences = ?,
           updated_at = ?
         WHERE agent_id = ?
-      `).run(merged.address || null, merged.postalCode || null, merged.website || null, merged.phone || null, merged.email || null, JSON.stringify(merged.openingHours || []), JSON.stringify(merged.products || []), merged.about || null, JSON.stringify(merged.specialties || []), JSON.stringify(merged.certifications || []), JSON.stringify(merged.paymentMethods || []), JSON.stringify(merged.deliveryOptions || []), merged.googleRating || null, merged.googleReviewCount || null, merged.tripadvisorRating || null, JSON.stringify(merged.externalReviews || []), JSON.stringify(merged.images || []), isOwnerUpdate ? (existing.dataSource === "auto" ? "hybrid" : "owner") : merged.dataSource, JSON.stringify(merged.autoSources || []), data.dataSource || "auto", now, data.dataSource || "auto", now, JSON.stringify(merged.preferences || {}), now, agentId);
+      `).run(merged.address || null, merged.postalCode || null, merged.website || null, merged.phone || null, merged.email || null, JSON.stringify(merged.openingHours || []), JSON.stringify(merged.products || []), merged.about || null, JSON.stringify(merged.specialties || []), JSON.stringify(merged.certifications || []), JSON.stringify(merged.paymentMethods || []), JSON.stringify(merged.deliveryOptions || []), merged.googleRating || null, merged.googleReviewCount || null, merged.tripadvisorRating || null, JSON.stringify(merged.externalReviews || []), JSON.stringify(merged.externalLinks || []), JSON.stringify(merged.images || []), isOwnerUpdate ? (existing.dataSource === "auto" ? "hybrid" : "owner") : merged.dataSource, JSON.stringify(merged.autoSources || []), data.dataSource || "auto", now, data.dataSource || "auto", now, JSON.stringify(merged.preferences || {}), now, agentId);
         }
     }
     // ─── Owner update (after claiming) ──────────────────────
@@ -244,10 +244,15 @@ class KnowledgeService {
         db.prepare(`UPDATE magic_links SET used = 1 WHERE token = ?`).run(token);
         // Clean up old magic links (older than 1 hour)
         db.prepare(`DELETE FROM magic_links WHERE expires_at < datetime('now', '-1 hour')`).run();
+        // Refresh the claim token — extend expiry by 30 days on each successful login
+        const crypto = require("crypto");
+        const newToken = `claim_${crypto.randomBytes(32).toString("hex")}`;
+        const newExpiry = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString();
+        db.prepare(`UPDATE agent_claims SET claim_token = ?, claim_token_expires_at = ? WHERE agent_id = ? AND claimant_email = ? AND status = 'verified'`).run(newToken, newExpiry, link.agent_id, link.email);
         return {
             success: true,
             agentId: link.agent_id,
-            claimToken: link.claim_token,
+            claimToken: newToken,
             claimantName: link.claimant_name,
         };
     }
@@ -285,6 +290,7 @@ class KnowledgeService {
             googleReviewCount: update.googleReviewCount ?? existing.googleReviewCount,
             tripadvisorRating: update.tripadvisorRating ?? existing.tripadvisorRating,
             externalReviews: update.externalReviews?.length ? update.externalReviews : existing.externalReviews,
+            externalLinks: update.externalLinks?.length ? update.externalLinks : existing.externalLinks,
             images: update.images?.length ? update.images : existing.images,
             dataSource: update.dataSource || existing.dataSource,
             autoSources: [...new Set([...(existing.autoSources || []), ...(update.autoSources || [])])],
@@ -324,6 +330,7 @@ class KnowledgeService {
             googleReviewCount: row.google_review_count,
             tripadvisorRating: row.tripadvisor_rating,
             externalReviews: row.external_reviews ? JSON.parse(row.external_reviews) : [],
+            externalLinks: row.external_links ? JSON.parse(row.external_links) : [],
             images: row.images ? JSON.parse(row.images) : [],
             dataSource: row.data_source || "auto",
             autoSources: row.auto_sources ? JSON.parse(row.auto_sources) : [],
