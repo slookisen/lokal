@@ -727,9 +727,13 @@ router.delete("/agents/:id", (req, res) => {
             return;
         }
         // Delete agent and all related data in one transaction
+        // Must clear all FK references before deleting the agent itself.
+        // conversations.seller_agent_id lacks ON DELETE CASCADE, so we clean manually.
         const deleteAll = db.transaction(() => {
             db.prepare("DELETE FROM agent_knowledge WHERE agent_id = ?").run(agentId);
             db.prepare("DELETE FROM agent_claims WHERE agent_id = ?").run(agentId);
+            db.prepare("UPDATE conversations SET seller_agent_id = NULL WHERE seller_agent_id = ?").run(agentId);
+            db.prepare("DELETE FROM analytics_agent_views WHERE agent_id = ?").run(agentId);
             db.prepare("DELETE FROM agents WHERE id = ?").run(agentId);
         });
         deleteAll();
