@@ -315,4 +315,136 @@ router.get("/devices", (req: Request, res: Response) => {
   }
 });
 
+/**
+ * GET /admin/analytics/traffic-classification
+ * Classifies visitors into: human, bot, dev, scanner
+ * This is the key endpoint for understanding real vs artificial traffic
+ */
+router.get("/traffic-classification", (req: Request, res: Response) => {
+  const hours = Math.max(1, Math.min(720, parseInt(req.query.hours as string) || 24));
+
+  try {
+    const db = getDb();
+    const cutoff = new Date(Date.now() - hours * 60 * 60 * 1000).toISOString();
+
+    const visitors = db.prepare(`
+      SELECT
+        session_id,
+        COUNT(*) as views,
+        COUNT(DISTINCT path) as unique_pages,
+        MIN(created_at) as first_seen,
+        MAX(created_at) as last_seen
+      FROM analytics_page_views
+      WHERE created_at > ?
+      GROUP BY session_id
+    `).all(cutoff) as any[];
+
+    // Classification patterns
+    const botPatterns = ['bot', 'Bot', 'spider', 'crawl', 'serpstat', 'GPTBot', 'ClaudeBot', 'Chiark', 'Go-http-client', 'Dataprovider', 'NotHumanSearch', 'DuckDuck', 'Googlebot', 'GoogleOther', 'Bytespider', 'Applebot', 'YandexBot', 'BingPreview', 'facebookexternal', 'Twitterbot'];
+    const devPatterns = ['curl/', 'Python/', 'aiohttp', 'Lokal/', 'Lokal-Enricher', 'Claude-User', 'Python-urllib', 'node-fetch', 'axios/'];
+    const scannerPatterns = ['Chrome/78.0', 'Chrome/89.0', 'Chrome/95.0', 'Chrome/58.0', 'Chrome/102.0'];
+    const scannerPaths = ['wp-admin', 'wp-login', 'xmlrpc', 'wlwmanifest', '.env', '.git', 'wp-includes'];
+
+    // Also get scanner paths
+    const scannerHits = db.prepare(`
+      SELECT session_id FROM analytics_page_views
+      WHERE created_at > ? AND (${scannerPaths.map(() => 'path LIKE ?').join(' OR ')})
+      GROUP BY session_id
+    `).all(cutoff, ...scannerPaths.map(p => `%${p}%`)) as any[];
+    const scannerSessionIds = new Set(scannerHits.map((r: any) => r.session_id));
+
+    const classification = { human: { views: 0, sessions: 0 }, bot: { views: 0, sessions: 0 }, dev: { views: 0, sessions: 0 }, scanner: { views: 0, sessions: 0 } };
+    const botDetails: Record<string, { name: string; views: number }> = {};
+    const humanSessions: any[] = [];
+
+    for (const v of visitors) {
+      const ua = v.session_id.includes(':') ? v.session_id.split(':').slice(1).join(':') : '';
+      const isBot = botPatterns.some(p => ua.includes(p));
+      const isDev = devPatterns.some(p => ua.includes(p));
+      const isScanner = scannerPatterns.some(p => ua.includes(p)) || scannerSessionIds.has(v.session_id);
+
+      let type: string;
+      if (isBot) {
+        type = 'bot';
+        // Extract bot name
+        const botMatch = ua.match(/(ClaudeBot|GPTBot|MJ12bot|serpstatbot|Googlebot|GoogleOther|DuckDuckBot|Applebot|Chiark|Dataprovider|NotHumanSearch|BingPreview|facebookexternal|Twitterbot|YandexBot|Bytespider)/i);
+        const botName = botMatch ? botMatch[1] : 'other';
+        if (!botDetails[botName]) botDetails[botName] = { name: botName, views: 0 };
+        botDetails[botName].views += v.views;
+      } else if (isDev) {
+        type = 'dev';
+      } else if (isScanner) {
+        type = 'scanner';
+      } else {
+        type = 'human';
+        humanSessions.push({
+          ua: ua.substring(0, 80),
+          views: v.views,
+          uniquePages: v.unique_pages,
+          firstSeen: v.first_seen,
+          lastSeen: v.last_seen,
+        });
+      }
+
+      (classification as any)[type].views += v.views;
+      (classification as any)[type].sessions += 1;
+    }
+
+    // Sort human sessions by views
+    humanSessions.sort((a, b) => b.views - a.views);
+
+    // Bot breakdown sorted by views
+    const bots = Object.values(botDetails).sort((a, b) => b.views - a.views);
+
+    res.json({
+      timeframe: `last ${hours} hours`,
+      timestamp: new Date().toISOString(),
+      totalViews: visitors.reduce((s, v) => s + v.views, 0),
+      totalSessions: visitors.length,
+      classification,
+      bots,
+      humanSessions: humanSessions.slice(0, 30),
+    });
+  } catch (err) {
+    console.error("[analytics] traffic-classification error:", err);
+    res.status(500).json({ error: String(err) });
+  }
+});
+
+/**
+ * GET /admin/analytics/referrers
+ * Shows actual referrer URLs for non-direct traffic
+ */
+router.get("/referrers", (req: Request, res: Response) => {
+  const hours = Math.max(1, Math.min(720, parseInt(req.query.hours as string) || 24));
+
+  try {
+    const db = getDb();
+    const cutoff = new Date(Date.now() - hours * 60 * 60 * 1000).toISOString();
+
+    const referrers = db.prepare(`
+      SELECT
+        referrer,
+        source,
+        COUNT(*) as visits,
+        COUNT(DISTINCT session_id) as unique_visitors,
+        GROUP_CONCAT(DISTINCT path) as paths
+      FROM analytics_page_views
+      WHERE created_at > ? AND referrer IS NOT NULL AND referrer != ''
+      GROUP BY referrer
+      ORDER BY visits DESC
+      LIMIT 30
+    `).all(cutoff) as any[];
+
+    res.json({
+      timeframe: `last ${hours} hours`,
+      timestamp: new Date().toISOString(),
+      referrers,
+    });
+  } catch (err) {
+    console.error("[analytics] referrers error:", err);
+    res.json({ referrers: [] });
+  }
+});
+
 export default router;

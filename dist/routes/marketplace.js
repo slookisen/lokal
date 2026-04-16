@@ -708,35 +708,52 @@ router.post("/admin/bulk-enrich", (req, res) => {
 // Requires ADMIN_KEY header for authorization.
 // Returns the deleted agent's name for confirmation.
 router.delete("/agents/:id", (req, res) => {
-    const adminKey = req.headers["x-admin-key"];
-    const expectedKey = process.env.ADMIN_KEY;
-    const agentId = req.params.id;
-    if (!expectedKey) {
-        res.status(503).json({ error: "Admin not configured" });
-        return;
+    try {
+        const adminKey = req.headers["x-admin-key"];
+        const expectedKey = process.env.ADMIN_KEY;
+        const agentId = req.params.id;
+        if (!expectedKey) {
+            res.status(503).json({ error: "Admin not configured" });
+            return;
+        }
+        if (!adminKey || adminKey !== expectedKey) {
+            res.status(403).json({ error: "Krever X-Admin-Key header" });
+            return;
+        }
+        const db = (0, init_1.getDb)();
+        const agent = db.prepare("SELECT id, name, city FROM agents WHERE id = ?").get(agentId);
+        if (!agent) {
+            res.status(404).json({ error: "Agent ikke funnet", id: agentId });
+            return;
+        }
+        // Delete agent and all related data in one transaction
+        const deleteAll = db.transaction(() => {
+            db.prepare("DELETE FROM agent_knowledge WHERE agent_id = ?").run(agentId);
+            db.prepare("DELETE FROM agent_claims WHERE agent_id = ?").run(agentId);
+            db.prepare("DELETE FROM agents WHERE id = ?").run(agentId);
+        });
+        deleteAll();
+        // Log (non-critical — wrapped so logging failure doesn't crash the response)
+        try {
+            interaction_logger_1.interactionLogger.log("message", {
+                agentId: agentId,
+                metadata: { name: agent.name, city: agent.city, reason: req.body?.reason || "cleanup", action: "admin-delete" },
+                ipAddress: req.ip || "unknown",
+            });
+        }
+        catch (logErr) {
+            console.error("[delete] Interaction log failed (non-critical):", logErr);
+        }
+        res.json({
+            success: true,
+            message: `Agent "${agent.name}" (${agent.city}) slettet`,
+            id: agentId,
+        });
     }
-    if (!adminKey || adminKey !== expectedKey) {
-        res.status(403).json({ error: "Krever X-Admin-Key header" });
-        return;
+    catch (err) {
+        console.error("[delete] Agent delete failed:", err);
+        res.status(500).json({ error: "Sletting feilet", detail: String(err) });
     }
-    const { getDb } = require("../database/init");
-    const db = getDb();
-    const agent = db.prepare("SELECT id, name, city FROM agents WHERE id = ?").get(agentId);
-    if (!agent) {
-        res.status(404).json({ error: "Agent ikke funnet", id: agentId });
-        return;
-    }
-    db.prepare("DELETE FROM agents WHERE id = ?").run(agentId);
-    interaction_logger_1.interactionLogger.log("message", {
-        agentId: agentId,
-        metadata: { name: agent.name, city: agent.city, reason: req.body?.reason || "duplicate", action: "admin-delete" },
-        ipAddress: req.ip,
-    });
-    res.json({
-        success: true,
-        message: `Agent "${agent.name}" (${agent.city}) slettet`,
-        id: agentId,
-    });
 });
 // ─── POST /admin/deduplicate — Smart deduplication ──────────
 // Finds and removes duplicate agents based on fuzzy name matching.

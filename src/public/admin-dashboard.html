@@ -170,12 +170,14 @@
                 <div id="statAgentTraffic" class="stat-value yellow">—</div>
             </div>
             <div class="stat-card">
-                <div class="stat-label">Snitt sider/besøk</div>
-                <div id="statPagesPerVisit" class="stat-value cyan">—</div>
+                <div class="stat-label">Ekte mennesker</div>
+                <div id="statHumans" class="stat-value green">—</div>
+                <div id="statHumansPct" class="stat-sub"></div>
             </div>
             <div class="stat-card">
-                <div class="stat-label">Mobil-andel</div>
-                <div id="statMobileShare" class="stat-value red">—</div>
+                <div class="stat-label">Bot-trafikk</div>
+                <div id="statBots" class="stat-value red">—</div>
+                <div id="statBotsPct" class="stat-sub"></div>
             </div>
         </div>
 
@@ -189,15 +191,35 @@
             </div>
         </div>
 
+        <!-- Traffic Classification (NEW) -->
+        <div class="panel-grid">
+            <div class="panel">
+                <div class="panel-title">🔬 Trafikktype</div>
+                <div id="trafficClassification"><div class="loading"><div class="spinner"></div>Laster...</div></div>
+            </div>
+            <div class="panel">
+                <div class="panel-title">🤖 Bot-fordeling</div>
+                <div id="botBreakdown"><div class="loading"><div class="spinner"></div>Laster...</div></div>
+            </div>
+        </div>
+
+        <!-- Referrers + AI agents -->
+        <div class="panel-grid">
+            <div class="panel">
+                <div class="panel-title">🔗 Referansekilder</div>
+                <div id="referrerList"><div class="loading"><div class="spinner"></div>Laster...</div></div>
+            </div>
+            <div class="panel">
+                <div class="panel-title">🤖 AI-agent trafikk</div>
+                <div id="agentDonut"><div class="loading"><div class="spinner"></div>Laster...</div></div>
+            </div>
+        </div>
+
         <!-- Main panels -->
         <div class="panel-grid">
             <div class="panel">
-                <div class="panel-title">📊 Trafikkilder</div>
+                <div class="panel-title">📊 Trafikkilder (rå)</div>
                 <div id="trafficSourceChart"><div class="loading"><div class="spinner"></div>Laster...</div></div>
-            </div>
-            <div class="panel">
-                <div class="panel-title">🤖 AI-agent fordeling</div>
-                <div id="agentDonut"><div class="loading"><div class="spinner"></div>Laster...</div></div>
             </div>
             <div class="panel">
                 <div class="panel-title">🔍 Topp søkeord</div>
@@ -207,17 +229,21 @@
                 <div class="panel-title">🏙 Byer</div>
                 <div id="cityStats"><div class="loading"><div class="spinner"></div>Laster...</div></div>
             </div>
+            <div class="panel">
+                <div class="panel-title">📄 Topp sider</div>
+                <div id="topPages"><div class="loading"><div class="spinner"></div>Laster...</div></div>
+            </div>
         </div>
 
-        <!-- Devices + Top Pages -->
+        <!-- Devices -->
         <div class="panel-grid">
             <div class="panel">
                 <div class="panel-title">📱 Enheter</div>
                 <div id="deviceStats"><div class="loading"><div class="spinner"></div>Laster...</div></div>
             </div>
             <div class="panel">
-                <div class="panel-title">📄 Topp sider</div>
-                <div id="topPages"><div class="loading"><div class="spinner"></div>Laster...</div></div>
+                <div class="panel-title">👤 Ekte besøkende</div>
+                <div id="humanVisitors"><div class="loading"><div class="spinner"></div>Laster...</div></div>
             </div>
         </div>
 
@@ -318,6 +344,8 @@
             api("/hourly?hours=" + hours),
             api("/pages?hours=" + hours),
             api("/devices?hours=" + hours),
+            api("/traffic-classification?hours=" + hours),
+            api("/referrers?hours=" + hours),
         ])
         .then(function(results) {
             var summary = results[0];
@@ -327,20 +355,26 @@
             var hourly = results[4];
             var pages = results[5];
             var devices = results[6];
+            var classification = results[7];
+            var referrers = results[8];
 
             document.getElementById("lastUpdated").textContent =
                 "Sist oppdatert: " + new Date().toLocaleString("no-NO") + " — " + summary.timeframe;
 
-            renderStats(summary, devices);
+            renderStats(summary, classification);
             renderHourlyChart(hourly.hourly || []);
-            renderTrafficSources(summary.trafficBySource);
+            renderTrafficClassification(classification);
+            renderBotBreakdown(classification);
+            renderReferrers(referrers.referrers || []);
             renderAgentDonut(summary.agentTraffic);
+            renderTrafficSources(summary.trafficBySource);
             renderSearchTerms(summary.topSearchTerms);
             renderCities(cities.cities || []);
             renderDevices(devices.devices || []);
             renderTopPages(pages.pages || []);
             renderProducers(producers.producers || []);
             renderVisitors(visitors.visitors || []);
+            renderHumanVisitors(classification);
         })
         .catch(function(err) {
             console.error("Dashboard load failed:", err);
@@ -348,23 +382,24 @@
     }
 
     // ─── Stat Cards ──────────────────────────────────
-    function renderStats(s, devData) {
+    function renderStats(s, classData) {
         document.getElementById("statPageViews").textContent = fmtNum(s.pageViews);
         document.getElementById("statVisitors").textContent = fmtNum(s.uniqueVisitors);
         document.getElementById("statQueries").textContent = fmtNum(s.totalQueries);
         var agentTotal = (s.agentTraffic.chatgpt || 0) + (s.agentTraffic.claude || 0) + (s.agentTraffic.other || 0);
         document.getElementById("statAgentTraffic").textContent = fmtNum(agentTotal);
 
-        // Pages per visit
-        var ppv = s.uniqueVisitors > 0 ? (s.pageViews / s.uniqueVisitors).toFixed(1) : "—";
-        document.getElementById("statPagesPerVisit").textContent = ppv;
+        // Human/bot stats from classification
+        var cl = classData.classification || {};
+        var humanViews = (cl.human || {}).views || 0;
+        var humanSessions = (cl.human || {}).sessions || 0;
+        var botViews = ((cl.bot || {}).views || 0) + ((cl.scanner || {}).views || 0);
+        var totalViews = classData.totalViews || s.pageViews || 1;
 
-        // Mobile share
-        var devices = devData.devices || [];
-        var totalDev = devices.reduce(function(a, d) { return a + d.count; }, 0);
-        var mobile = devices.find(function(d) { return d.device === "mobile"; });
-        var mobileCount = mobile ? mobile.count : 0;
-        document.getElementById("statMobileShare").textContent = totalDev > 0 ? Math.round(mobileCount / totalDev * 100) + "%" : "—";
+        document.getElementById("statHumans").textContent = fmtNum(humanSessions);
+        document.getElementById("statHumansPct").textContent = Math.round(humanViews / totalViews * 100) + "% av visninger";
+        document.getElementById("statBots").textContent = fmtNum(botViews);
+        document.getElementById("statBotsPct").textContent = Math.round(botViews / totalViews * 100) + "% av visninger";
     }
 
     // ─── Hourly Traffic Chart (SVG area chart) ──────
@@ -527,6 +562,88 @@
             return '<tr><td>' + v.ipHash.slice(0, 8) + '…</td><td>' + v.pageViews + ' sider</td><td>' + v.uniquePages + ' unike</td><td>' + deviceBadge + ' ' + sourceBadge + aiTag + '</td><td title="' + escHtml(v.lastSeen) + '">' + timeAgo + '</td></tr>';
         }).join("");
         el.innerHTML = '<table class="data-table"><thead><tr><th>Besøkende</th><th>Visninger</th><th>Sider</th><th>Info</th><th>Sist aktiv</th></tr></thead><tbody>' + rows + '</tbody></table>';
+    }
+
+    // ─── Traffic Classification Donut ─────────────────
+    function renderTrafficClassification(data) {
+        var el = document.getElementById("trafficClassification");
+        var cl = data.classification || {};
+        var items = [
+            { label: "Mennesker", value: (cl.human || {}).views || 0, sessions: (cl.human || {}).sessions || 0, color: "#4ade80" },
+            { label: "Bots/crawlere", value: (cl.bot || {}).views || 0, sessions: (cl.bot || {}).sessions || 0, color: "#f87171" },
+            { label: "Utvikling/test", value: (cl.dev || {}).views || 0, sessions: (cl.dev || {}).sessions || 0, color: "#fbbf24" },
+            { label: "Skannere", value: (cl.scanner || {}).views || 0, sessions: (cl.scanner || {}).sessions || 0, color: "#a78bfa" },
+        ].filter(function(d) { return d.value > 0; });
+
+        var total = items.reduce(function(s, d) { return s + d.value; }, 0);
+        if (total === 0) { el.innerHTML = '<div class="empty-state">Ingen data enda</div>'; return; }
+
+        var size = 130, cx = 65, cy = 65, r = 50, stroke = 20;
+        var circumference = 2 * Math.PI * r;
+        var offset = 0;
+        var arcs = items.map(function(d) {
+            var pct = d.value / total;
+            var dashLen = pct * circumference;
+            var html = '<circle cx="' + cx + '" cy="' + cy + '" r="' + r + '" fill="none" stroke="' + d.color + '" stroke-width="' + stroke + '" stroke-dasharray="' + dashLen + ' ' + (circumference - dashLen) + '" stroke-dashoffset="' + (-offset) + '" transform="rotate(-90 ' + cx + ' ' + cy + ')" />';
+            offset += dashLen;
+            return html;
+        }).join("");
+
+        var legend = items.map(function(d) {
+            var pct = (d.value / total * 100).toFixed(0);
+            return '<div class="legend-item"><span class="legend-dot" style="background:' + d.color + '"></span><span>' + d.label + ': <strong>' + fmtNum(d.value) + '</strong> (' + pct + '%) — ' + d.sessions + ' sessions</span></div>';
+        }).join("");
+
+        el.innerHTML = '<div class="donut-container"><svg width="' + size + '" height="' + size + '" viewBox="0 0 ' + size + ' ' + size + '"><circle cx="' + cx + '" cy="' + cy + '" r="' + r + '" fill="none" stroke="var(--bg)" stroke-width="' + stroke + '" />' + arcs + '<text x="' + cx + '" y="' + (cy - 6) + '" text-anchor="middle" fill="var(--text)" font-size="16" font-weight="700">' + fmtNum(total) + '</text><text x="' + cx + '" y="' + (cy + 12) + '" text-anchor="middle" fill="var(--text-dim)" font-size="10">visninger</text></svg><div class="donut-legend">' + legend + '</div></div>';
+    }
+
+    // ─── Bot Breakdown ──────────────────────────────
+    function renderBotBreakdown(data) {
+        var el = document.getElementById("botBreakdown");
+        var bots = data.bots || [];
+        if (bots.length === 0) { el.innerHTML = '<div class="empty-state">Ingen bots oppdaget</div>'; return; }
+
+        var max = bots[0].views;
+        var botColors = { "ClaudeBot": "purple", "GPTBot": "green", "Googlebot": "cyan", "GoogleOther": "cyan", "MJ12bot": "yellow", "serpstatbot": "red", "DuckDuckBot": "green" };
+        el.innerHTML = bots.slice(0, 10).map(function(b) {
+            var color = botColors[b.name] || "yellow";
+            return '<div class="bar-row"><span class="bar-label">' + escHtml(b.name) + '</span><div class="bar-track"><div class="bar-fill ' + color + '" style="width: ' + (b.views / max * 100).toFixed(1) + '%"></div></div><span class="bar-count">' + fmtNum(b.views) + '</span></div>';
+        }).join("");
+    }
+
+    // ─── Referrers ──────────────────────────────────
+    function renderReferrers(referrers) {
+        var el = document.getElementById("referrerList");
+        if (!referrers || referrers.length === 0) { el.innerHTML = '<div class="empty-state">Ingen referanser enda — all trafikk er direkte</div>'; return; }
+
+        var rows = referrers.slice(0, 10).map(function(r) {
+            var domain = "—";
+            try { domain = new URL(r.referrer).hostname; } catch(e) { domain = r.referrer; }
+            var sourceBadge = '<span class="badge badge-' + (r.source === "search" ? "chatgpt" : "web") + '">' + escHtml(sourceLabel(r.source)) + '</span>';
+            return '<tr><td title="' + escHtml(r.referrer) + '">' + escHtml(domain) + '</td><td>' + sourceBadge + '</td><td>' + r.visits + '</td><td>' + r.unique_visitors + '</td></tr>';
+        }).join("");
+        el.innerHTML = '<table class="data-table"><thead><tr><th>Kilde</th><th>Type</th><th>Besøk</th><th>Unike</th></tr></thead><tbody>' + rows + '</tbody></table>';
+    }
+
+    // ─── Human Visitors Detail ──────────────────────
+    function renderHumanVisitors(data) {
+        var el = document.getElementById("humanVisitors");
+        var humans = data.humanSessions || [];
+        if (humans.length === 0) { el.innerHTML = '<div class="empty-state">Ingen ekte besøkende enda</div>'; return; }
+
+        var rows = humans.slice(0, 10).map(function(h) {
+            var isMobile = h.ua.toLowerCase().indexOf("mobile") >= 0 || h.ua.toLowerCase().indexOf("iphone") >= 0;
+            var device = isMobile ? "Mobil" : "Desktop";
+            var browser = "Ukjent";
+            if (h.ua.indexOf("Chrome/") >= 0) browser = "Chrome";
+            else if (h.ua.indexOf("Safari/") >= 0 && h.ua.indexOf("Chrome") < 0) browser = "Safari";
+            else if (h.ua.indexOf("Firefox/") >= 0) browser = "Firefox";
+            else if (h.ua.indexOf("OPR/") >= 0 || h.ua.indexOf("Opera") >= 0) browser = "Opera";
+            else if (h.ua.indexOf("Snapchat") >= 0) browser = "Snapchat";
+            var timeAgo = formatTimeAgo(h.lastSeen);
+            return '<tr><td>' + browser + '</td><td>' + device + '</td><td>' + h.views + '</td><td>' + h.uniquePages + '</td><td title="' + escHtml(h.lastSeen) + '">' + timeAgo + '</td></tr>';
+        }).join("");
+        el.innerHTML = '<table class="data-table"><thead><tr><th>Nettleser</th><th>Enhet</th><th>Visninger</th><th>Sider</th><th>Sist aktiv</th></tr></thead><tbody>' + rows + '</tbody></table>';
     }
 
     // ─── Helpers ─────────────────────────────────────
