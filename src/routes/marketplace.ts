@@ -1219,22 +1219,64 @@ router.get("/admin/claims", (req: Request, res: Response) => {
 router.post("/webhooks/inbound-email", async (req: Request, res: Response) => {
   try {
     const payload = req.body;
-    const from = payload.from || "unknown";
-    const to = payload.to || [];
-    const subject = payload.subject || "(ingen emne)";
-    const text = payload.text || "";
-    const html = payload.html || "";
 
-    console.log(`[Inbound] Email from ${from} to ${JSON.stringify(to)} — "${subject}"`);
+    // Resend wraps inbound data in { type, created_at, data: { ... } }
+    const data = payload.data || payload; // fallback for direct test calls
+    const from = data.from || "unknown";
+    const to = data.to || [];
+    const subject = data.subject || "(ingen emne)";
+    const emailId = data.email_id;
+
+    console.log(`[Inbound] Event: ${payload.type || "unknown"}, email_id: ${emailId}, from: ${from}, subject: "${subject}"`);
+
+    // Resend inbound webhooks don't include body — fetch it via API
+    let html = "";
+    let text = "";
+    const resendKey = process.env.RESEND_API_KEY;
+
+    if (emailId && resendKey) {
+      try {
+        const emailRes = await fetch(`https://api.resend.com/emails/${emailId}`, {
+          headers: { Authorization: `Bearer ${resendKey}` },
+        });
+        if (emailRes.ok) {
+          const emailData = await emailRes.json();
+          html = emailData.html || "";
+          text = emailData.text || "";
+          console.log(`[Inbound] Fetched body for ${emailId} (${html.length} chars HTML, ${text.length} chars text)`);
+        } else {
+          console.warn(`[Inbound] Could not fetch email body: ${emailRes.status} ${emailRes.statusText}`);
+        }
+      } catch (fetchErr) {
+        console.warn(`[Inbound] Error fetching email body:`, fetchErr);
+      }
+    } else if (!resendKey) {
+      console.warn(`[Inbound] RESEND_API_KEY not set — cannot fetch email body`);
+    }
+
+    // Extract sender email for reply-to (format: "Name <email@domain.com>")
+    const senderEmail = typeof from === "string"
+      ? (from.match(/<([^>]+)>/)?.[1] || from)
+      : undefined;
 
     // Forward to admin Gmail
     const forwardTo = process.env.ADMIN_EMAIL || "da.fredriksen@gmail.com";
+    const bodyHtml = html || (text ? `<pre>${text}</pre>` : `<p><em>Ingen innhold i eposten.</em></p>`);
+    const bodyText = text || "(ingen tekstinnhold)";
+
     const forwarded = await emailService.sendEmail({
       to: forwardTo,
       subject: `[Innkommende] ${subject} (fra ${from})`,
-      htmlContent: html || `<pre>${text}</pre>`,
-      textContent: `Videresent fra: ${from}\nTil: ${JSON.stringify(to)}\n\n${text}`,
-      replyTo: typeof from === "string" ? from : undefined,
+      htmlContent: `
+        <div style="border-bottom:1px solid #ccc;padding-bottom:8px;margin-bottom:16px;color:#666;font-size:13px;">
+          <strong>Fra:</strong> ${from}<br>
+          <strong>Til:</strong> ${Array.isArray(to) ? to.join(", ") : to}<br>
+          <strong>Emne:</strong> ${subject}
+        </div>
+        ${bodyHtml}
+      `,
+      textContent: `Videresent fra: ${from}\nTil: ${Array.isArray(to) ? to.join(", ") : to}\nEmne: ${subject}\n\n${bodyText}`,
+      replyTo: senderEmail,
     });
 
     if (forwarded) {
