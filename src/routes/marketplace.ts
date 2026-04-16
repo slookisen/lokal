@@ -1239,7 +1239,7 @@ router.post("/webhooks/inbound-email", async (req: Request, res: Response) => {
 
     if (emailId && resendKey) {
       try {
-        const emailRes = await fetch(`https://api.resend.com/emails/${emailId}`, {
+        const emailRes = await fetch(`https://api.resend.com/emails/receiving/${emailId}`, {
           headers: { Authorization: `Bearer ${resendKey}` },
         });
         if (emailRes.ok) {
