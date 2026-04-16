@@ -94,10 +94,25 @@ function handleMessageSend(params, id, req, res) {
     // Create a task for lifecycle tracking
     const task = marketplace_registry_1.marketplaceRegistry.createTask("message/send", params, params?.agentId);
     let discoveryQuery;
-    // Mode 1: Natural language search
-    if (message.text || typeof message === "string") {
-        const text = message.text || message;
-        discoveryQuery = marketplace_registry_1.marketplaceRegistry.parseNaturalQuery(text);
+    // Extract text from various A2A message formats
+    // The A2A spec uses { role, parts: [{ type: "text", text: "..." }] }
+    // but agents may also send { text: "..." } or just a string.
+    const extractText = (msg) => {
+        if (typeof msg === "string")
+            return msg;
+        if (msg.text)
+            return msg.text;
+        if (msg.parts && Array.isArray(msg.parts)) {
+            const textPart = msg.parts.find((p) => p.type === "text" && p.text);
+            if (textPart)
+                return textPart.text;
+        }
+        return null;
+    };
+    const messageText = extractText(message);
+    // Mode 1: Natural language search (flat text, parts array, or string)
+    if (messageText) {
+        discoveryQuery = marketplace_registry_1.marketplaceRegistry.parseNaturalQuery(messageText);
     }
     // Mode 2: Structured discovery query
     else if (message.data) {
@@ -124,7 +139,7 @@ function handleMessageSend(params, id, req, res) {
             agents: results,
         });
         // Log the interaction (this powers the live dashboard)
-        const queryText = message.text || message || JSON.stringify(discoveryQuery);
+        const queryText = messageText || JSON.stringify(discoveryQuery);
         interaction_logger_1.interactionLogger.log("search", {
             agentId: params?.agentId,
             query: typeof queryText === "string" ? queryText : JSON.stringify(queryText),
@@ -132,7 +147,7 @@ function handleMessageSend(params, id, req, res) {
             matchedAgentIds: results.map(r => r.agent.id),
             metadata: {
                 taskId: task.id,
-                parsedQuery: message.text ? marketplace_registry_1.marketplaceRegistry.parseNaturalQuery(message.text) : discoveryQuery,
+                parsedQuery: messageText ? marketplace_registry_1.marketplaceRegistry.parseNaturalQuery(messageText) : discoveryQuery,
                 method: "message/send",
             },
             ipAddress: req.ip,
@@ -152,7 +167,7 @@ function handleMessageSend(params, id, req, res) {
                         data: {
                             count: results.length,
                             agents: results,
-                            parsedQuery: message.text ? marketplace_registry_1.marketplaceRegistry.parseNaturalQuery(message.text) : discoveryQuery,
+                            parsedQuery: messageText ? marketplace_registry_1.marketplaceRegistry.parseNaturalQuery(messageText) : discoveryQuery,
                         },
                     },
                 ],

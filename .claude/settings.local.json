@@ -1,0 +1,19 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(gh repo:*)",
+      "Read(//c/tmp/**)",
+      "Bash(rm -rf a2a-registry)",
+      "Bash(gh pr create --repo prassanna-ravishankar/a2a-registry --title 'Add Lokal — A2A food marketplace for Norway' --body ':*)",
+      "Bash(gh pr create --repo prassanna-ravishankar/a2a-registry --head slookisen:add-lokal --title 'Add Lokal — A2A food marketplace for Norway' --body ':*)",
+      "Bash(gh pr:*)",
+      "Bash(npx tsc:*)",
+      "Bash(npm run:*)",
+      "Bash(fly deploy:*)",
+      "Bash(netstat -ano)",
+      "Bash(taskkill:*)",
+      "Bash(cmd:*)",
+      "Bash(python dashboard/server.py)"
+    ]
+  }
+}

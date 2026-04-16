@@ -34,6 +34,11 @@ export declare class EmailService {
     private generateVerificationCodeText;
     private generateClaimConfirmationHtml;
     private generateClaimConfirmationText;
+    sendMagicLink(email: string, magicUrl: string, agentName: string): Promise<{
+        success: boolean;
+        messageId?: string;
+        error?: string;
+    }>;
     private escapeHtml;
 }
 export declare const emailService: EmailService;

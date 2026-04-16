@@ -116,6 +116,20 @@ declare class KnowledgeService {
         claimToken?: string;
         error?: string;
     };
+    createMagicLink(email: string): {
+        success: boolean;
+        token?: string;
+        agentId?: string;
+        agentName?: string;
+        error?: string;
+    };
+    verifyMagicLink(token: string): {
+        success: boolean;
+        agentId?: string;
+        claimToken?: string;
+        claimantName?: string;
+        error?: string;
+    };
     getKnowledgeStats(): {
         total: number;
         enriched: number;

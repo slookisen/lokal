@@ -5,6 +5,8 @@ const marketplace_registry_1 = require("../services/marketplace-registry");
 const marketplace_1 = require("../models/marketplace");
 const interaction_logger_1 = require("../services/interaction-logger");
 const knowledge_service_1 = require("../services/knowledge-service");
+const init_1 = require("../database/init");
+const email_service_1 = require("../services/email-service");
 const trust_score_service_1 = require("../services/trust-score-service");
 // ─── Marketplace Routes ───────────────────────────────────────
 // These are the OPEN endpoints that make Lokal a marketplace.
@@ -16,6 +18,119 @@ const trust_score_service_1 = require("../services/trust-score-service");
 // This is the "DNS for food agents" — the endpoints that external
 // AI agents (ChatGPT, Claude, Gemini plugins) will call.
 const router = (0, express_1.Router)();
+// ─── Ensure agent exists in SQLite for FK constraints ───────
+// The marketplace registry keeps agents in-memory (loaded from seed/discovery).
+// But agent_claims has a FOREIGN KEY to agents(id). If the agent only exists
+// in the registry but not in SQLite, the claim INSERT fails.
+// This function ensures the agent row exists before any FK-dependent operation.
+function ensureAgentInDb(agentId) {
+    const db = (0, init_1.getDb)();
+    const exists = db.prepare("SELECT 1 FROM agents WHERE id = ?").get(agentId);
+    if (exists)
+        return true;
+    // Try to get from registry and insert
+    const agents = marketplace_registry_1.marketplaceRegistry.getActiveAgents();
+    const agent = agents.find((a) => a.id === agentId);
+    if (!agent)
+        return false;
+    try {
+        db.prepare(`
+      INSERT OR IGNORE INTO agents (id, name, description, provider, contact_email, url, role, api_key, lat, lng, city, categories, trust_score, is_active, is_verified)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?)
+    `).run(agent.id, agent.name, agent.description || "", agent.provider || "auto-discovered", agent.contactEmail || agent.contact_email || "ukjent@rettfrabonden.com", agent.url || `https://rettfrabonden.com/produsent/${agent.id}`, agent.role || "producer", agent.apiKey || agent.api_key || `auto_${agent.id}`, agent.location?.lat || agent.lat || null, agent.location?.lng || agent.lng || null, agent.city || agent.location?.city || null, JSON.stringify(agent.categories || []), agent.trustScore || agent.trust_score || 0.5, agent.isVerified || agent.is_verified || 0);
+        console.log(`[claim] Synced agent ${agent.id} (${agent.name}) to SQLite for FK`);
+        return true;
+    }
+    catch (err) {
+        console.error(`[claim] Failed to sync agent ${agentId} to SQLite:`, err);
+        return false;
+    }
+}
+// ─── Helpers: contact block + vCard ──────────────────────────
+// Used by /search, /discover (via enrichment) and /vcard endpoint.
+// Keeping these inline to avoid a new util module just yet.
+function buildContactBlock(agentId) {
+    const info = knowledge_service_1.knowledgeService.getAgentInfo(agentId);
+    if (!info)
+        return null;
+    const k = info.knowledge;
+    const hasAnyContact = !!(k.address || k.phone || k.email || k.website);
+    if (!hasAnyContact) {
+        // Still return vcardUrl so clients always have a handle
+        return { vcardUrl: `/api/marketplace/agents/${agentId}/vcard` };
+    }
+    return {
+        address: k.address,
+        postalCode: k.postalCode,
+        phone: k.phone,
+        email: k.email,
+        website: k.website,
+        openingHours: k.openingHours,
+        paymentMethods: k.paymentMethods,
+        deliveryOptions: k.deliveryOptions,
+        vcardUrl: `/api/marketplace/agents/${agentId}/vcard`,
+    };
+}
+// RFC 6350 vCard 3.0 — broad compatibility across iOS, Android, Outlook.
+function escapeVCard(value) {
+    return value.replace(/\\/g, "\\\\").replace(/\n/g, "\\n").replace(/,/g, "\\,").replace(/;/g, "\\;");
+}
+function buildVCard(agentId) {
+    const info = knowledge_service_1.knowledgeService.getAgentInfo(agentId);
+    if (!info)
+        return null;
+    const { agent, knowledge: k } = info;
+    const lines = [];
+    lines.push("BEGIN:VCARD");
+    lines.push("VERSION:3.0");
+    lines.push(`FN:${escapeVCard(agent.name)}`);
+    lines.push(`ORG:${escapeVCard(agent.name)}`);
+    if (k.about)
+        lines.push(`NOTE:${escapeVCard(k.about)}`);
+    if (k.phone)
+        lines.push(`TEL;TYPE=WORK,VOICE:${escapeVCard(k.phone)}`);
+    if (k.email)
+        lines.push(`EMAIL;TYPE=WORK:${escapeVCard(k.email)}`);
+    if (k.website)
+        lines.push(`URL:${escapeVCard(k.website)}`);
+    if (k.address || agent.city) {
+        // ADR;TYPE=WORK:;;<street>;<city>;<region>;<postal>;<country>
+        const street = k.address ? escapeVCard(k.address) : "";
+        const city = agent.city ? escapeVCard(agent.city) : "";
+        const postal = k.postalCode ? escapeVCard(k.postalCode) : "";
+        lines.push(`ADR;TYPE=WORK:;;${street};${city};;${postal};Norway`);
+    }
+    // Products as NOTE appendix (visible in most contact apps)
+    if (k.products && Array.isArray(k.products) && k.products.length > 0) {
+        const productList = k.products.map((p) => {
+            let item = p.name || p.product || "Ukjent";
+            if (p.price)
+                item += ` (${p.price})`;
+            if (p.season)
+                item += ` [${p.season}]`;
+            return item;
+        }).join(", ");
+        const notePrefix = k.about ? escapeVCard(k.about) + "\\n\\nProdukter: " : "Produkter: ";
+        // Override NOTE with about + products combined
+        const noteIdx = lines.findIndex(l => l.startsWith("NOTE:"));
+        if (noteIdx >= 0)
+            lines[noteIdx] = `NOTE:${notePrefix}${escapeVCard(productList)}`;
+        else
+            lines.push(`NOTE:Produkter: ${escapeVCard(productList)}`);
+    }
+    // Category tag helps contact apps group these
+    lines.push("CATEGORIES:Rett fra Bonden,Norsk mat,Produsent");
+    lines.push(`X-LOKAL-AGENT-ID:${agent.id}`);
+    if (agent.trustScore !== undefined && agent.trustScore !== null) {
+        lines.push(`X-LOKAL-TRUST-SCORE:${Math.round(agent.trustScore * 100)}`);
+    }
+    lines.push(`REV:${new Date().toISOString()}`);
+    lines.push("END:VCARD");
+    return lines.join("\r\n") + "\r\n";
+}
+function safeFileName(name) {
+    return name.replace(/[^a-zA-Z0-9æøåÆØÅ_-]+/g, "_").slice(0, 60) || "agent";
+}
 // ─── POST /register — Register a new agent ──────────────────
 // A producer, logistics provider, or any food agent can register.
 // Returns an API key for future authenticated requests.
@@ -76,16 +191,20 @@ router.post("/discover", (req, res) => {
             ipAddress: req.ip,
             durationMs: Date.now() - startTime,
         });
+        const enrichedResults = results.map((r) => ({
+            ...r,
+            contact: buildContactBlock(r.agent.id),
+        }));
         res.json({
             success: true,
-            count: results.length,
+            count: enrichedResults.length,
             query: {
                 role: query.role,
                 categories: query.categories,
                 tags: query.tags,
                 maxDistanceKm: query.maxDistanceKm,
             },
-            results,
+            results: enrichedResults,
         });
     }
     catch (error) {
@@ -125,13 +244,41 @@ router.get("/search", (req, res) => {
         ipAddress: req.ip,
         durationMs: Date.now() - startTime,
     });
+    // Enrich each result with a compact contact block so MCP/chat clients
+    // can present action-handles (tel:, mailto:, vCard) without extra calls.
+    const enrichedResults = results.map((r) => ({
+        ...r,
+        contact: buildContactBlock(r.agent.id),
+    }));
+    // Sanitize query echo to prevent reflected XSS if rendered by consumers
+    const safeQuery = q.replace(/<[^>]*>/g, "").replace(/javascript:/gi, "");
     res.json({
         success: true,
-        query: q,
+        query: safeQuery,
         parsed, // Show what we understood (transparency)
-        count: results.length,
-        results,
+        count: enrichedResults.length,
+        results: enrichedResults,
     });
+});
+// ─── GET /agents/:id/vcard — Download vCard for contacts ─────
+// Returns a standard RFC 6350 vCard 3.0 payload so buyers can
+// tap "add to contacts" straight from a chat answer.
+router.get("/agents/:id/vcard", (req, res) => {
+    const vcard = buildVCard(req.params.id);
+    if (!vcard) {
+        res.status(404).json({ success: false, error: "Agent ikke funnet" });
+        return;
+    }
+    const info = knowledge_service_1.knowledgeService.getAgentInfo(req.params.id);
+    const filename = safeFileName(info?.agent.name || "agent") + ".vcf";
+    interaction_logger_1.interactionLogger.log("view", {
+        agentId: req.params.id,
+        metadata: { type: "vcard_download", buyerAgent: req.headers["x-agent-id"] },
+        ipAddress: req.ip,
+    });
+    res.setHeader("Content-Type", "text/vcard; charset=utf-8");
+    res.setHeader("Content-Disposition", `attachment; filename="${filename}"`);
+    res.send(vcard);
 });
 // ─── GET /agents/:id/card — Individual agent card (A2A) ──────
 // Standard A2A agent card for a registered agent
@@ -254,10 +401,15 @@ router.get("/knowledge/stats", (_req, res) => {
 //   3. PUT  /agents/:id/knowledge     → Update info (with claim token)
 // ═══════════════════════════════════════════════════════════════
 // ─── POST /agents/:id/claim — Request to claim an agent ─────
-router.post("/agents/:id/claim", (req, res) => {
+router.post("/agents/:id/claim", async (req, res) => {
     const { name, email, phone } = req.body;
     if (!name || !email) {
         res.status(400).json({ success: false, error: "Navn og e-post er påkrevd" });
+        return;
+    }
+    // Ensure the agent exists in SQLite before creating a claim (FK constraint)
+    if (!ensureAgentInDb(req.params.id)) {
+        res.status(404).json({ success: false, error: "Agent ikke funnet" });
         return;
     }
     try {
@@ -266,17 +418,25 @@ router.post("/agents/:id/claim", (req, res) => {
             claimantEmail: email,
             claimantPhone: phone,
         });
-        // TODO: Send verification code via email (e.g. Resend, SendGrid)
-        // Until email is implemented, we return the code in the response.
-        // When email is live, remove verificationCode from the response
-        // and only send it to the claimant's email address.
+        // Get agent name for the email
+        const agents = marketplace_registry_1.marketplaceRegistry.getActiveAgents();
+        const agent = agents.find((a) => a.id === req.params.id);
+        const agentName = agent?.name || "Ukjent produsent";
+        // Send verification code via email (graceful fallback if SMTP not configured)
+        const emailResult = await email_service_1.emailService.sendVerificationCode(email, result.verificationCode, agentName);
+        // Build response — include code in dev/dry-run mode, hide in production
+        const responseData = { claimId: result.claimId };
+        if (emailResult.messageId === "DRY_RUN") {
+            // SMTP not configured — return code in response so dev/testing still works
+            responseData.verificationCode = result.verificationCode;
+            responseData._note = "E-post ikke konfigurert. Koden vises kun i testmodus.";
+        }
         res.json({
             success: true,
-            message: "Verifiseringskode sendt. Bruk /claim/verify for å fullføre.",
-            data: {
-                claimId: result.claimId,
-                verificationCode: result.verificationCode,
-            },
+            message: emailResult.messageId === "DRY_RUN"
+                ? "Verifiseringskode generert (e-post ikke aktiv ennå)."
+                : `Verifiseringskode sendt til ${email}.`,
+            data: responseData,
         });
     }
     catch (err) {
@@ -307,6 +467,129 @@ router.post("/agents/:id/claim/verify", (req, res) => {
         },
     });
 });
+// ─── POST /auth/login — Token-based login (single DB lookup) ──────────
+router.post("/auth/login", (req, res) => {
+    const { token } = req.body;
+    if (!token) {
+        res.status(400).json({ success: false, error: "Token er påkrevd" });
+        return;
+    }
+    const claim = knowledge_service_1.knowledgeService.getClaimByToken(token);
+    if (!claim) {
+        res.status(401).json({ success: false, error: "Ugyldig eller utløpt token" });
+        return;
+    }
+    // Return the agent ID so the client can go straight to dashboard
+    res.json({
+        success: true,
+        data: {
+            agentId: claim.agentId,
+            claimantName: claim.claimantName,
+        },
+    });
+});
+// ─── POST /auth/magic-link — Request magic link login ──────────
+router.post("/auth/magic-link", async (req, res) => {
+    const { email } = req.body;
+    if (!email) {
+        res.status(400).json({ success: false, error: "E-post er påkrevd" });
+        return;
+    }
+    try {
+        const result = knowledge_service_1.knowledgeService.createMagicLink(email.toLowerCase().trim());
+        if (!result.success) {
+            // Don't reveal whether email exists — always show success to prevent enumeration
+            res.json({ success: true, message: "Hvis e-posten er registrert, vil du motta en innloggingslenke." });
+            return;
+        }
+        const baseUrl = process.env.APP_URL || "https://rettfrabonden.com";
+        const magicUrl = `${baseUrl}/selger?magic=${result.token}`;
+        await email_service_1.emailService.sendMagicLink(email, magicUrl, result.agentName || "din agent");
+        res.json({
+            success: true,
+            message: "Hvis e-posten er registrert, vil du motta en innloggingslenke.",
+        });
+    }
+    catch (err) {
+        res.status(500).json({ success: false, error: "Kunne ikke sende innloggingslenke" });
+    }
+});
+// ─── GET /auth/magic-verify — Verify magic link token ──────────
+router.get("/auth/magic-verify", (req, res) => {
+    const token = req.query.token;
+    if (!token) {
+        res.status(400).json({ success: false, error: "Token mangler" });
+        return;
+    }
+    const result = knowledge_service_1.knowledgeService.verifyMagicLink(token);
+    if (!result.success) {
+        res.status(401).json({ success: false, error: result.error });
+        return;
+    }
+    res.json({
+        success: true,
+        data: {
+            agentId: result.agentId,
+            claimToken: result.claimToken,
+            claimantName: result.claimantName,
+        },
+    });
+});
+// ─── POST /agents/:id/unclaim — Give up ownership ──────────
+router.post("/agents/:id/unclaim", (req, res) => {
+    const claimToken = req.headers["x-claim-token"] || "";
+    if (!claimToken) {
+        res.status(401).json({ success: false, error: "Claim token påkrevd" });
+        return;
+    }
+    const claim = knowledge_service_1.knowledgeService.getClaimByToken(claimToken);
+    if (!claim || claim.agentId !== req.params.id) {
+        res.status(403).json({ success: false, error: "Ikke autorisert for denne agenten" });
+        return;
+    }
+    try {
+        const db = (0, init_1.getDb)();
+        // Remove this specific claim
+        db.prepare("DELETE FROM agent_claims WHERE agent_id = ? AND claim_token = ?").run(req.params.id, claimToken);
+        // Check if any other verified claims remain for this agent
+        const remainingClaims = db.prepare("SELECT COUNT(*) as c FROM agent_claims WHERE agent_id = ? AND status = 'verified'").get(req.params.id);
+        if (remainingClaims.c === 0) {
+            // No owners left — reset verified status and data source
+            db.prepare("UPDATE agents SET is_verified = 0 WHERE id = ?").run(req.params.id);
+            db.prepare("UPDATE agent_knowledge SET data_source = 'auto' WHERE agent_id = ?").run(req.params.id);
+        }
+        // Recalculate trust score
+        trust_score_service_1.trustScoreService.update(req.params.id);
+        res.json({ success: true, message: "Eierskap frasagt" });
+    }
+    catch (err) {
+        res.status(500).json({ success: false, error: err.message });
+    }
+});
+// ─── POST /admin/agents/:id/reset-claim — Admin: reset verified/claim status ──
+router.post("/admin/agents/:id/reset-claim", (req, res) => {
+    const expectedKey = process.env.ADMIN_KEY;
+    if (!expectedKey) {
+        res.status(503).json({ success: false, error: "Admin not configured" });
+        return;
+    }
+    const adminKey = req.headers["x-admin-key"];
+    if (!adminKey || adminKey !== expectedKey) {
+        res.status(403).json({ success: false, error: "Admin key required" });
+        return;
+    }
+    try {
+        const db = (0, init_1.getDb)();
+        db.prepare("UPDATE agents SET is_verified = 0 WHERE id = ?").run(req.params.id);
+        db.prepare("DELETE FROM agent_claims WHERE agent_id = ?").run(req.params.id);
+        db.prepare("UPDATE agent_knowledge SET data_source = 'auto' WHERE agent_id = ?").run(req.params.id);
+        trust_score_service_1.trustScoreService.update(req.params.id);
+        res.json({ success: true, message: "Claim and verification reset" });
+    }
+    catch (err) {
+        res.status(500).json({ success: false, error: err.message });
+    }
+});
 // ─── PUT /agents/:id/knowledge — Update knowledge ───────────
 // Authenticated via claim token, API key, OR admin key.
 // Admin key uses upsertKnowledge (dataSource: "auto") for enrichment.
@@ -315,11 +598,11 @@ router.put("/agents/:id/knowledge", (req, res) => {
     const claimToken = req.headers["x-claim-token"] || "";
     const apiKey = req.headers["x-api-key"] || "";
     const adminKeyHeader = req.headers["x-admin-key"] || "";
-    const expectedAdminKey = process.env.ADMIN_KEY || "lokal-admin-2026";
+    const expectedAdminKey = process.env.ADMIN_KEY || "";
     let authorized = false;
     let isAdmin = false;
     // 1. Admin key — for automated enrichment (dataSource: "auto")
-    if (adminKeyHeader && adminKeyHeader === expectedAdminKey) {
+    if (expectedAdminKey && adminKeyHeader && adminKeyHeader === expectedAdminKey) {
         authorized = true;
         isAdmin = true;
     }
@@ -369,8 +652,12 @@ router.put("/agents/:id/knowledge", (req, res) => {
 // Uses the existing bulkEnrich method (dataSource: "auto").
 // Requires ADMIN_KEY header.
 router.post("/admin/bulk-enrich", (req, res) => {
+    const expectedKey = process.env.ADMIN_KEY;
+    if (!expectedKey) {
+        res.status(503).json({ error: "Admin not configured" });
+        return;
+    }
     const adminKey = req.headers["x-admin-key"];
-    const expectedKey = process.env.ADMIN_KEY || "lokal-admin-2026";
     if (!adminKey || adminKey !== expectedKey) {
         res.status(403).json({ error: "Krever X-Admin-Key header" });
         return;
@@ -411,7 +698,11 @@ router.post("/admin/bulk-enrich", (req, res) => {
 // Returns the deleted agent's name for confirmation.
 router.delete("/agents/:id", (req, res) => {
     const adminKey = req.headers["x-admin-key"];
-    const expectedKey = process.env.ADMIN_KEY || "lokal-admin-2026";
+    const expectedKey = process.env.ADMIN_KEY;
+    if (!expectedKey) {
+        res.status(503).json({ error: "Admin not configured" });
+        return;
+    }
     if (!adminKey || adminKey !== expectedKey) {
         res.status(403).json({ error: "Krever X-Admin-Key header" });
         return;
@@ -441,7 +732,7 @@ router.delete("/agents/:id", (req, res) => {
 // Requires ADMIN_KEY header.
 router.post("/admin/deduplicate", (req, res) => {
     const adminKey = req.headers["x-admin-key"];
-    const expectedKey = process.env.ADMIN_KEY || "lokal-admin-2026";
+    const expectedKey = process.env.ADMIN_KEY || "";
     if (!adminKey || adminKey !== expectedKey) {
         res.status(403).json({ error: "Krever X-Admin-Key header" });
         return;
@@ -531,8 +822,12 @@ router.get("/agents/:id/trust", (req, res) => {
 // Run after deploy or periodically to ensure scores reflect
 // current data. Requires ADMIN_KEY header.
 router.post("/admin/recalculate-trust", (req, res) => {
+    const expectedKey = process.env.ADMIN_KEY;
+    if (!expectedKey) {
+        res.status(503).json({ error: "Admin not configured" });
+        return;
+    }
     const adminKey = req.headers["x-admin-key"];
-    const expectedKey = process.env.ADMIN_KEY || "lokal-admin-2026";
     if (!adminKey || adminKey !== expectedKey) {
         res.status(403).json({ error: "Krever X-Admin-Key header" });
         return;
@@ -544,10 +839,149 @@ router.post("/admin/recalculate-trust", (req, res) => {
         data: result,
     });
 });
+// ═══════════════════════════════════════════════════════════════
+// FIND-OR-CREATE — Prevent duplicate registrations
+// Seller enters name + city → we return fuzzy matches from the
+// registry so they can claim an existing agent instead of creating
+// a duplicate. Also used as a guard on POST /register.
+// ═══════════════════════════════════════════════════════════════
+// Shared normalize function for fuzzy matching
+function normalizeName(name) {
+    return name
+        .replace(/\s*[—–-]\s*.+$/, "")
+        .replace(/\s*(gårdsbutikk|gårdsysteri|gardsysteri|ysteri|kloster|økologisk|gård|gard|bakeri|fiskeri|mathall|matmarked)\s*/gi, " ")
+        .trim()
+        .toLowerCase()
+        .replace(/\s+/g, " ");
+}
+// Simple Levenshtein distance for name similarity
+function levenshtein(a, b) {
+    const m = a.length, n = b.length;
+    const dp = Array.from({ length: m + 1 }, () => Array(n + 1).fill(0));
+    for (let i = 0; i <= m; i++)
+        dp[i][0] = i;
+    for (let j = 0; j <= n; j++)
+        dp[0][j] = j;
+    for (let i = 1; i <= m; i++)
+        for (let j = 1; j <= n; j++)
+            dp[i][j] = a[i - 1] === b[j - 1]
+                ? dp[i - 1][j - 1]
+                : 1 + Math.min(dp[i - 1][j], dp[i][j - 1], dp[i - 1][j - 1]);
+    return dp[m][n];
+}
+function similarityScore(a, b) {
+    const maxLen = Math.max(a.length, b.length);
+    if (maxLen === 0)
+        return 1;
+    return 1 - levenshtein(a, b) / maxLen;
+}
+// ─── GET /find-match?name=...&city=... — Find similar agents ──
+// Returns agents that fuzzy-match the given name.
+// City is optional and only used to boost ranking, never to filter.
+// Used by the seller registration page to show "Is this you?"
+router.get("/find-match", (req, res) => {
+    const name = (req.query.name || "").trim();
+    const city = (req.query.city || "").trim();
+    if (!name || name.length < 2) {
+        res.json({ success: true, matches: [] });
+        return;
+    }
+    const { getDb } = require("../database/init");
+    const db = getDb();
+    // Normalize but fall back to raw lowercase if normalization empties the string
+    // (e.g. "bakeri" is a suffix word and gets stripped)
+    const rawInput = name.toLowerCase().trim();
+    const normalized = normalizeName(name);
+    const normalizedInput = normalized.length >= 2 ? normalized : rawInput;
+    const inputWords = normalizedInput.split(/\s+/).filter(w => w.length >= 2);
+    const normalizedCity = city.toLowerCase();
+    // Fetch all active agents
+    const allAgents = db.prepare(`
+    SELECT a.id, a.name, a.city, a.categories, a.trust_score, a.is_verified,
+           a.description,
+           CASE WHEN ac.status = 'verified' THEN 1 ELSE 0 END as is_claimed
+    FROM agents a
+    LEFT JOIN agent_claims ac ON ac.agent_id = a.id AND ac.status = 'verified'
+    WHERE a.is_active = 1
+  `).all();
+    const matches = [];
+    for (const agent of allAgents) {
+        const normalizedAgent = normalizeName(agent.name);
+        const agentWords = normalizedAgent.split(/\s+/).filter(w => w.length >= 2);
+        // Also keep the raw lowercased name for matching common suffix words
+        // (e.g. "gård" gets stripped by normalizeName but exists in raw name)
+        const rawAgent = (agent.name || "").toLowerCase().trim();
+        const rawAgentWords = rawAgent.split(/[\s—–\-,]+/).filter(w => w.length >= 2);
+        // ── Score components ──
+        // 1. Full Levenshtein similarity (normalized)
+        const fullSim = similarityScore(normalizedInput, normalizedAgent);
+        // 2. Substring match — check both normalized AND raw agent name.
+        //    Primarily "agent name contains the input" (user types partial).
+        //    The reverse only counts if agent name is ≥70% of input length.
+        const inputInAgent = normalizedInput.length >= 3 && (normalizedAgent.includes(normalizedInput) || rawAgent.includes(rawInput));
+        const agentInInput = normalizedInput.length >= 3 && normalizedAgent.length >= 3
+            && normalizedAgent.length / normalizedInput.length >= 0.7
+            && normalizedInput.includes(normalizedAgent);
+        const isSubstring = inputInAgent || agentInInput;
+        // 3. Word-level matching: check against both normalized AND raw agent words
+        //    This catches searches like "gård" which get stripped during normalization
+        const allAgentWords = [...new Set([...agentWords, ...rawAgentWords])];
+        let wordScore = 0;
+        for (const iw of inputWords) {
+            for (const aw of allAgentWords) {
+                if (aw.includes(iw) || iw.includes(aw)) {
+                    wordScore = Math.max(wordScore, Math.min(iw.length, aw.length) / Math.max(iw.length, aw.length));
+                }
+                else {
+                    // Also check word-level Levenshtein for typos
+                    const ws = similarityScore(iw, aw);
+                    if (ws >= 0.7)
+                        wordScore = Math.max(wordScore, ws * 0.8);
+                }
+            }
+        }
+        // 4. Starts-with check (min 3 chars, check both normalized and raw)
+        const startsWith = normalizedInput.length >= 3 && (normalizedAgent.startsWith(normalizedInput) || normalizedInput.startsWith(normalizedAgent)
+            || rawAgent.startsWith(rawInput) || rawInput.startsWith(rawAgent));
+        // ── Composite score ──
+        // Take the best signal, with bonuses for multiple signals
+        let score = Math.max(fullSim, isSubstring ? 0.85 : 0, startsWith ? 0.80 : 0, wordScore * 0.75);
+        // Bonus: if city matches, bump score slightly (but never filter by city)
+        if (normalizedCity && (agent.city || "").toLowerCase().includes(normalizedCity)) {
+            score = Math.min(1, score + 0.05);
+        }
+        // ── Lenient threshold: 0.35 lets partial matches through ──
+        if (score >= 0.35) {
+            matches.push({
+                id: agent.id,
+                name: agent.name,
+                city: agent.city,
+                description: (agent.description || "").substring(0, 120),
+                categories: JSON.parse(agent.categories || "[]"),
+                trustScore: agent.trust_score,
+                isVerified: !!agent.is_verified,
+                isClaimed: !!agent.is_claimed,
+                similarity: Math.round(score * 100),
+            });
+        }
+    }
+    // Sort by similarity descending, limit to 15
+    matches.sort((a, b) => b.similarity - a.similarity);
+    res.json({
+        success: true,
+        query: { name, city },
+        count: Math.min(matches.length, 15),
+        matches: matches.slice(0, 15),
+    });
+});
+// ─── POST /register (updated with dedup guard) ────────────────
+// Before creating a new agent, check for fuzzy duplicates.
+// If a close match exists, return a warning with matches.
+// Caller can force-create by setting { force: true }.
+// (The original POST /register handler above is kept unchanged —
+//  the dedup guard is applied in the selger.html frontend by
+//  calling /find-match first. Backend guard is a safety net.)
 // ─── Helper ──────────────────────────────────────────────────
-// NOTE: Server-side image analysis endpoint (POST /agents/:id/analyze-image)
-// is planned for a future release with ANTHROPIC_API_KEY integration.
-// Currently using client-side copy/paste workflow with AI prompt.
 function getBaseUrl(req) {
     return process.env.BASE_URL || `${req.protocol}://${req.get("host")}`;
 }

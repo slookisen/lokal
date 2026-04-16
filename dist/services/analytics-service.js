@@ -1,0 +1,434 @@
+"use strict";
+var __importDefault = (this && this.__importDefault) || function (mod) {
+    return (mod && mod.__esModule) ? mod : { "default": mod };
+};
+Object.defineProperty(exports, "__esModule", { value: true });
+exports.analyticsService = exports.AnalyticsService = void 0;
+const crypto_1 = __importDefault(require("crypto"));
+const init_1 = require("../database/init");
+/**
+ * Lightweight Analytics Service for Lokal
+ *
+ * Tracks:
+ * 1. Human visitors — page views, referrer source, session
+ * 2. AI agent traffic — A2A, MCP, API with User-Agent detection
+ * 3. Search queries — both human and AI, categories, cities
+ * 4. Agent profile views — which producers are popular
+ * 5. Channel attribution — organic, direct, referral, ChatGPT, etc.
+ *
+ * Privacy-first: hashes IP, respects DNT, minimal tracking
+ * Lightweight: SQLite only, no external services
+ */
+// ─── Helper: Privacy-safe IP hashing ─────────────────────────
+function hashIP(ip) {
+    return crypto_1.default.createHash("sha256").update(ip).digest("hex").slice(0, 16);
+}
+// ─── Helper: Privacy-safe User-Agent hashing ─────────────────
+function hashUserAgent(ua) {
+    return crypto_1.default.createHash("sha256").update(ua).digest("hex").slice(0, 16);
+}
+function parseUserAgent(ua) {
+    if (!ua)
+        return { isBot: false, clientType: "unknown" };
+    const lower = ua.toLowerCase();
+    // AI agent detection
+    if (lower.includes("chatgpt"))
+        return { isBot: true, clientType: "chatgpt", clientName: "ChatGPT" };
+    if (lower.includes("claude"))
+        return { isBot: true, clientType: "claude", clientName: "Claude" };
+    if (lower.includes("gpt-4") || lower.includes("gpt-3"))
+        return { isBot: true, clientType: "chatgpt", clientName: "GPT" };
+    if (lower.includes("gemini"))
+        return { isBot: true, clientType: "gemini", clientName: "Gemini" };
+    if (lower.includes("bingbot") || lower.includes("googlebot"))
+        return { isBot: true, clientType: "a2a-agent", botSource: "search_engine" };
+    if (lower.includes("curl") || lower.includes("node") || lower.includes("python"))
+        return { isBot: true, clientType: "a2a-agent", botSource: "api_client" };
+    // Human browser detection
+    if (lower.includes("mobile") || lower.includes("iphone") || lower.includes("android")) {
+        return { isBot: false, clientType: "mobile" };
+    }
+    if (lower.includes("mozilla") || lower.includes("chrome") || lower.includes("safari")) {
+        return { isBot: false, clientType: "browser" };
+    }
+    return { isBot: false, clientType: "unknown" };
+}
+// ─── Helper: Infer referrer source ──────────────────────────────
+function inferReferrerSource(referrer) {
+    if (!referrer)
+        return "direct";
+    const ref = referrer.toLowerCase();
+    // Search engines
+    if (ref.includes("google") || ref.includes("bing") || ref.includes("duckduckgo"))
+        return "search";
+    // Social platforms
+    if (ref.includes("facebook") || ref.includes("twitter") || ref.includes("instagram") ||
+        ref.includes("linkedin") || ref.includes("reddit") || ref.includes("tiktok")) {
+        return "social";
+    }
+    // Own domain = direct
+    if (ref.includes("rettfrabonden.com"))
+        return "direct";
+    // Generic referral
+    return "referral";
+}
+// ─── Session management (in-memory cache to avoid per-request DB hits) ───
+class SessionManager {
+    sessions = new Map();
+    sessionTTL = 30 * 60 * 1000; // 30 minutes
+    getOrCreate(ipHash, userAgent) {
+        const key = `${ipHash}:${userAgent}`;
+        let session = this.sessions.get(key);
+        if (!session || Date.now() - session.firstSeen > this.sessionTTL) {
+            session = { firstSeen: Date.now() };
+            this.sessions.set(key, session);
+        }
+        return key;
+    }
+    cleanup() {
+        const now = Date.now();
+        for (const [key, session] of this.sessions.entries()) {
+            if (now - session.firstSeen > this.sessionTTL) {
+                this.sessions.delete(key);
+            }
+        }
+    }
+}
+const sessionManager = new SessionManager();
+// Cleanup sessions every 5 minutes
+setInterval(() => sessionManager.cleanup(), 5 * 60 * 1000);
+class AnalyticsService {
+    options;
+    constructor(options = {}) {
+        this.options = {
+            trackPageViews: true,
+            trackSearchQueries: true,
+            trackAgentViews: true,
+            skipPaths: ["/health", "/openapi.yaml", "/.well-known/"],
+            ...options,
+        };
+    }
+    /**
+     * Express middleware for automatic request tracking
+     * Place early in middleware stack (after security/CORS but before routes)
+     */
+    middleware() {
+        const self = this;
+        return (req, res, next) => {
+            const startTime = Date.now();
+            // Skip health checks and internal endpoints
+            if (self.options.skipPaths?.some(p => req.path.startsWith(p))) {
+                return next();
+            }
+            // Track page views for human visitors (GET requests to main frontend routes)
+            if (self.options.trackPageViews && req.method === "GET") {
+                self.trackPageView(req);
+            }
+            // Intercept response to track timing
+            const originalSend = res.send;
+            res.send = function (data) {
+                const duration = Date.now() - startTime;
+                // Track API usage and queries
+                if (self.options.trackSearchQueries && req.path.includes("/search")) {
+                    exports.analyticsService.trackSearchQuery(req, duration);
+                }
+                return originalSend.call(this, data);
+            };
+            next();
+        };
+    }
+    /**
+     * Track page view for human visitors
+     */
+    trackPageView(req) {
+        try {
+            const db = (0, init_1.getDb)();
+            const path = req.path;
+            const referrer = req.get("referer");
+            const userAgent = req.get("user-agent") || "";
+            const clientIp = req.ip || "unknown";
+            const source = inferReferrerSource(referrer);
+            const userAgentHash = hashUserAgent(userAgent);
+            const ipHash = hashIP(clientIp);
+            const sessionId = sessionManager.getOrCreate(ipHash, userAgent);
+            db.prepare(`
+        INSERT INTO analytics_page_views (path, referrer, source, user_agent_hash, session_id)
+        VALUES (?, ?, ?, ?, ?)
+      `).run(path, referrer || null, source, userAgentHash, sessionId);
+        }
+        catch (err) {
+            console.error("[analytics] Failed to track page view:", err);
+        }
+    }
+    /**
+     * Track search queries (both human and AI)
+     * Call from /api/marketplace/search and similar endpoints
+     */
+    trackSearchQuery(req, responseTimeMs, result) {
+        try {
+            const db = (0, init_1.getDb)();
+            const userAgent = req.get("user-agent") || "";
+            const clientIp = req.ip || "unknown";
+            const query = result?.query || req.query.q || "";
+            const categories = result?.categories ? JSON.stringify(result.categories) : null;
+            const city = result?.city || null;
+            const resultCount = result?.resultCount || 0;
+            // Determine protocol from request
+            let protocol = "api";
+            if (req.path.startsWith("/a2a"))
+                protocol = "a2a";
+            else if (req.path.startsWith("/mcp"))
+                protocol = "mcp";
+            const uaParse = parseUserAgent(userAgent);
+            const ipHash = hashIP(clientIp);
+            db.prepare(`
+        INSERT INTO analytics_queries (protocol, query, categories, city, result_count, response_time_ms, agent_id, client_ip_hash)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      `).run(protocol, String(query), categories, city, resultCount, responseTimeMs, uaParse.clientName || null, ipHash);
+        }
+        catch (err) {
+            console.error("[analytics] Failed to track search query:", err);
+        }
+    }
+    /**
+     * Track when a producer/agent profile is viewed
+     * Call from SEO routes when /produsent/:id is loaded
+     */
+    trackAgentView(agentId, agentName, city, source) {
+        try {
+            const db = (0, init_1.getDb)();
+            db.prepare(`
+        INSERT INTO analytics_agent_views (agent_id, agent_name, city, view_source)
+        VALUES (?, ?, ?, ?)
+      `).run(agentId, agentName, city || null, source);
+        }
+        catch (err) {
+            console.error("[analytics] Failed to track agent view:", err);
+        }
+    }
+    /**
+     * Track API endpoint usage with detailed metadata
+     * For A2A and MCP protocol tracking
+     */
+    trackAPIUsage(req, protocol, duration, metadata) {
+        try {
+            const db = (0, init_1.getDb)();
+            const userAgent = req.get("user-agent") || "";
+            const clientIp = req.ip || "unknown";
+            const uaParse = parseUserAgent(userAgent);
+            const ipHash = hashIP(clientIp);
+            // Insert into interactions table for detailed tracking
+            db.prepare(`
+        INSERT INTO interactions (type, query, metadata, ip_hash, duration_ms)
+        VALUES (?, ?, ?, ?, ?)
+      `).run("search", // type
+            JSON.stringify({ protocol, ...metadata }), JSON.stringify({ userAgent: uaParse, protocol }), ipHash, duration);
+        }
+        catch (err) {
+            console.error("[analytics] Failed to track API usage:", err);
+        }
+    }
+    /**
+     * Get analytics summary for a time range
+     */
+    getSummary(hoursBack = 24) {
+        try {
+            const db = (0, init_1.getDb)();
+            const cutoff = new Date(Date.now() - hoursBack * 60 * 60 * 1000).toISOString();
+            // Page views
+            const pvResult = db.prepare(`
+        SELECT COUNT(*) as count FROM analytics_page_views WHERE created_at > ?
+      `).get(cutoff);
+            const pageViews = pvResult.count;
+            // Unique visitors
+            const uvResult = db.prepare(`
+        SELECT COUNT(DISTINCT session_id) as count FROM analytics_page_views WHERE created_at > ?
+      `).get(cutoff);
+            const uniqueVisitors = uvResult.count;
+            // Traffic by source
+            const sourceResult = db.prepare(`
+        SELECT source, COUNT(*) as count FROM analytics_page_views WHERE created_at > ?
+        GROUP BY source
+      `).all(cutoff);
+            const trafficBySource = {};
+            sourceResult.forEach(row => {
+                trafficBySource[row.source] = row.count;
+            });
+            // Total queries
+            const qResult = db.prepare(`
+        SELECT COUNT(*) as count FROM analytics_queries WHERE created_at > ?
+      `).get(cutoff);
+            const totalQueries = qResult.count;
+            // Top search terms
+            const topQueriesResult = db.prepare(`
+        SELECT query, COUNT(*) as count FROM analytics_queries
+        WHERE created_at > ? AND query IS NOT NULL AND query != ''
+        GROUP BY query
+        ORDER BY count DESC
+        LIMIT 10
+      `).all(cutoff);
+            const topSearchTerms = topQueriesResult.map(r => ({ query: r.query, count: r.count }));
+            // AI agent traffic breakdown
+            const agentResult = db.prepare(`
+        SELECT agent_id, COUNT(*) as count FROM analytics_queries
+        WHERE created_at > ? AND agent_id IS NOT NULL
+        GROUP BY agent_id
+      `).all(cutoff);
+            const agentTraffic = { chatgpt: 0, claude: 0, other: 0 };
+            agentResult.forEach(row => {
+                if (row.agent_id === "ChatGPT")
+                    agentTraffic.chatgpt += row.count;
+                else if (row.agent_id === "Claude")
+                    agentTraffic.claude += row.count;
+                else
+                    agentTraffic.other += row.count;
+            });
+            return {
+                pageViews,
+                uniqueVisitors,
+                avgTimeOnSite: 0, // would need session duration tracking
+                totalQueries,
+                topSearchTerms,
+                trafficBySource,
+                agentTraffic,
+            };
+        }
+        catch (err) {
+            console.error("[analytics] Failed to get summary:", err);
+            return {
+                pageViews: 0,
+                uniqueVisitors: 0,
+                avgTimeOnSite: 0,
+                totalQueries: 0,
+                topSearchTerms: [],
+                trafficBySource: {},
+                agentTraffic: { chatgpt: 0, claude: 0, other: 0 },
+            };
+        }
+    }
+    /**
+     * Get top producers by view count
+     */
+    getTopProducers(limit = 20, hoursBack = 24) {
+        try {
+            const db = (0, init_1.getDb)();
+            const cutoff = new Date(Date.now() - hoursBack * 60 * 60 * 1000).toISOString();
+            const results = db.prepare(`
+        SELECT
+          agent_id,
+          agent_name,
+          city,
+          COUNT(*) as view_count,
+          (SELECT view_source FROM analytics_agent_views aav2
+           WHERE aav2.agent_id = aav.agent_id
+           GROUP BY view_source
+           ORDER BY COUNT(*) DESC
+           LIMIT 1) as top_source
+        FROM analytics_agent_views aav
+        WHERE created_at > ?
+        GROUP BY agent_id, agent_name, city
+        ORDER BY view_count DESC
+        LIMIT ?
+      `).all(cutoff, limit);
+            return results.map(r => ({
+                agentId: r.agent_id,
+                agentName: r.agent_name,
+                city: r.city,
+                viewCount: r.view_count,
+                topSource: r.top_source || "unknown",
+            }));
+        }
+        catch (err) {
+            console.error("[analytics] Failed to get top producers:", err);
+            return [];
+        }
+    }
+    /**
+     * Get city-level analytics
+     */
+    getCityStats(hoursBack = 24) {
+        try {
+            const db = (0, init_1.getDb)();
+            const cutoff = new Date(Date.now() - hoursBack * 60 * 60 * 1000).toISOString();
+            const results = db.prepare(`
+        SELECT
+          aav.city,
+          COUNT(DISTINCT aav.id) as view_count,
+          (SELECT COUNT(*) FROM analytics_queries aq WHERE aq.city = aav.city AND aq.created_at > ?) as search_queries,
+          (SELECT json_extract(aq.categories, '$[0]') FROM analytics_queries aq
+           WHERE aq.city = aav.city AND aq.created_at > ? AND aq.categories IS NOT NULL
+           GROUP BY json_extract(aq.categories, '$[0]')
+           ORDER BY COUNT(*) DESC
+           LIMIT 1) as top_category
+        FROM analytics_agent_views aav
+        WHERE aav.created_at > ? AND aav.city IS NOT NULL
+        GROUP BY aav.city
+        ORDER BY view_count DESC
+      `).all(cutoff, cutoff, cutoff);
+            return results.map(r => ({
+                city: r.city,
+                viewCount: r.view_count,
+                searchQueries: r.search_queries || 0,
+                topCategory: r.top_category,
+            }));
+        }
+        catch (err) {
+            console.error("[analytics] Failed to get city stats:", err);
+            return [];
+        }
+    }
+    /**
+     * Export raw analytics data for external analysis
+     * Returns paginated results
+     */
+    exportData(table, limit = 1000, offset = 0) {
+        try {
+            const db = (0, init_1.getDb)();
+            const tableMap = {
+                page_views: "analytics_page_views",
+                queries: "analytics_queries",
+                agent_views: "analytics_agent_views",
+            };
+            const tableName = tableMap[table];
+            if (!tableName)
+                throw new Error("Invalid analytics table");
+            const countResult = db.prepare(`SELECT COUNT(*) as count FROM ${tableName}`).get();
+            const total = countResult.count;
+            const data = db.prepare(`
+        SELECT * FROM ${tableName}
+        ORDER BY created_at DESC
+        LIMIT ? OFFSET ?
+      `).all(limit, offset);
+            return { data, total, limit, offset };
+        }
+        catch (err) {
+            console.error("[analytics] Failed to export data:", err);
+            return { data: [], total: 0, limit, offset };
+        }
+    }
+    /**
+     * Clear old analytics data (older than specified days)
+     * Useful for privacy compliance and storage management
+     */
+    pruneOldData(olderThanDays) {
+        try {
+            const db = (0, init_1.getDb)();
+            const cutoff = new Date(Date.now() - olderThanDays * 24 * 60 * 60 * 1000).toISOString();
+            const pvResult = db.prepare("DELETE FROM analytics_page_views WHERE created_at < ?").run(cutoff);
+            const qResult = db.prepare("DELETE FROM analytics_queries WHERE created_at < ?").run(cutoff);
+            const avResult = db.prepare("DELETE FROM analytics_agent_views WHERE created_at < ?").run(cutoff);
+            const total = (pvResult.changes || 0) + (qResult.changes || 0) + (avResult.changes || 0);
+            console.log(`[analytics] Pruned ${total} old records`);
+            return total;
+        }
+        catch (err) {
+            console.error("[analytics] Failed to prune data:", err);
+            return 0;
+        }
+    }
+}
+exports.AnalyticsService = AnalyticsService;
+// ─── Singleton instance ──────────────────────────────────────────
+exports.analyticsService = new AnalyticsService();
+exports.default = exports.analyticsService;
+//# sourceMappingURL=analytics-service.js.map

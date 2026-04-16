@@ -8,6 +8,7 @@ const uuid_1 = require("uuid");
 const crypto_1 = __importDefault(require("crypto"));
 const init_1 = require("../database/init");
 class KnowledgeService {
+    // ─── Get knowledge for an agent ──────────────────────────
     getKnowledge(agentId) {
         const db = (0, init_1.getDb)();
         const row = db.prepare("SELECT * FROM agent_knowledge WHERE agent_id = ?").get(agentId);
@@ -15,6 +16,8 @@ class KnowledgeService {
             return null;
         return this.rowToKnowledge(row);
     }
+    // ─── Get structured info response for buyer agents ────────
+    // This is the main endpoint buyers use: "tell me about this seller"
     getAgentInfo(agentId) {
         const db = (0, init_1.getDb)();
         const agent = db.prepare("SELECT * FROM agents WHERE id = ?").get(agentId);
@@ -55,10 +58,11 @@ class KnowledgeService {
                 lastUpdated,
                 disclaimer: dataSource === "owner"
                     ? "Denne informasjonen er verifisert av eieren."
-                    : "Denne informasjonen er basert p\u00e5 offentlig tilgjengelige kilder og kan v\u00e6re utdatert. Kontakt selger direkte for oppdatert informasjon.",
+                    : "Denne informasjonen er basert på offentlig tilgjengelige kilder og kan være utdatert. Kontakt selger direkte for oppdatert informasjon.",
             },
         };
     }
+    // ─── Set/update knowledge (used by enrichment + owner) ────
     upsertKnowledge(agentId, data) {
         const db = (0, init_1.getDb)();
         const existing = this.getKnowledge(agentId);
@@ -76,6 +80,7 @@ class KnowledgeService {
       `).run(agentId, data.address || null, data.postalCode || null, data.website || null, data.phone || null, data.email || null, JSON.stringify(data.openingHours || []), JSON.stringify(data.products || []), data.about || null, JSON.stringify(data.specialties || []), JSON.stringify(data.certifications || []), JSON.stringify(data.paymentMethods || []), JSON.stringify(data.deliveryOptions || []), data.googleRating || null, data.googleReviewCount || null, data.tripadvisorRating || null, JSON.stringify(data.externalReviews || []), JSON.stringify(data.images || []), data.dataSource || "auto", JSON.stringify(data.autoSources || []), now, JSON.stringify(data.preferences || {}), now, now);
         }
         else {
+            // Merge: owner data takes precedence over auto data
             const merged = this.mergeKnowledge(existing, data);
             const isOwnerUpdate = data.dataSource === "owner";
             db.prepare(`
@@ -95,9 +100,11 @@ class KnowledgeService {
       `).run(merged.address || null, merged.postalCode || null, merged.website || null, merged.phone || null, merged.email || null, JSON.stringify(merged.openingHours || []), JSON.stringify(merged.products || []), merged.about || null, JSON.stringify(merged.specialties || []), JSON.stringify(merged.certifications || []), JSON.stringify(merged.paymentMethods || []), JSON.stringify(merged.deliveryOptions || []), merged.googleRating || null, merged.googleReviewCount || null, merged.tripadvisorRating || null, JSON.stringify(merged.externalReviews || []), JSON.stringify(merged.images || []), isOwnerUpdate ? (existing.dataSource === "auto" ? "hybrid" : "owner") : merged.dataSource, JSON.stringify(merged.autoSources || []), data.dataSource || "auto", now, data.dataSource || "auto", now, JSON.stringify(merged.preferences || {}), now, agentId);
         }
     }
+    // ─── Owner update (after claiming) ──────────────────────
     ownerUpdate(agentId, data) {
         this.upsertKnowledge(agentId, { ...data, dataSource: "owner" });
     }
+    // ─── Bulk enrich from auto sources ─────────────────────
     bulkEnrich(enrichments) {
         const db = (0, init_1.getDb)();
         let count = 0;
@@ -115,6 +122,7 @@ class KnowledgeService {
         transaction();
         return count;
     }
+    // ─── Claim system ──────────────────────────────────────
     isAgentClaimed(agentId) {
         const db = (0, init_1.getDb)();
         const row = db.prepare("SELECT COUNT(*) as c FROM agent_claims WHERE agent_id = ? AND status = 'verified'").get(agentId);
@@ -125,10 +133,14 @@ class KnowledgeService {
         const id = (0, uuid_1.v4)();
         const code = this.generateVerificationCode();
         const now = new Date().toISOString();
-        const expiresAt = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString();
-        if (this.isAgentClaimed(agentId)) {
-            throw new Error("This agent has already been claimed");
+        const expiresAt = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString(); // 7 days
+        // Check if this specific email already has a verified claim on this agent
+        const existingClaim = db.prepare("SELECT COUNT(*) as c FROM agent_claims WHERE agent_id = ? AND claimant_email = ? AND status = 'verified'").get(agentId, opts.claimantEmail);
+        if (existingClaim.c > 0) {
+            throw new Error("Du har allerede gjort krav på denne agenten. Bruk innlogging med e-post.");
         }
+        // Clear any stale pending claims (since email isn't implemented yet,
+        // users can't complete old claims — let them try again)
         db.prepare("DELETE FROM agent_claims WHERE agent_id = ? AND status IN ('pending','code_sent')").run(agentId);
         db.prepare(`
       INSERT INTO agent_claims (id, agent_id, claimant_name, claimant_email, claimant_phone, verification_code, status, expires_at, created_at)
@@ -146,20 +158,26 @@ class KnowledgeService {
         if (claim.status === "expired" || claim.status === "rejected") {
             return { success: false, error: `Claim is ${claim.status}` };
         }
+        // Check expiry
         if (new Date(claim.expires_at) < new Date()) {
             db.prepare("UPDATE agent_claims SET status = 'expired' WHERE id = ?").run(claimId);
             return { success: false, error: "Claim has expired" };
         }
+        // Verify code
         if (claim.verification_code !== code) {
             return { success: false, error: "Invalid verification code" };
         }
+        // Success — generate claim token for future management (expires in 30 days)
         const claimToken = `claim_${crypto_1.default.randomBytes(32).toString("hex")}`;
         const now = new Date().toISOString();
+        const tokenExpiry = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString();
         db.prepare(`
-      UPDATE agent_claims SET status = 'verified', claim_token = ?, verified_at = ?
+      UPDATE agent_claims SET status = 'verified', claim_token = ?, claim_token_expires_at = ?, verified_at = ?
       WHERE id = ?
-    `).run(claimToken, now, claimId);
+    `).run(claimToken, tokenExpiry, now, claimId);
+        // Mark agent as verified
         db.prepare("UPDATE agents SET is_verified = 1 WHERE id = ?").run(claim.agent_id);
+        // Update knowledge data_source
         const knowledge = this.getKnowledge(claim.agent_id);
         if (knowledge) {
             db.prepare("UPDATE agent_knowledge SET data_source = 'hybrid' WHERE agent_id = ? AND data_source = 'auto'")
@@ -169,9 +187,17 @@ class KnowledgeService {
     }
     getClaimByToken(token) {
         const db = (0, init_1.getDb)();
-        const row = db.prepare("SELECT agent_id, claimant_name, claimant_email FROM agent_claims WHERE claim_token = ? AND status = 'verified'").get(token);
-        return row ? { agentId: row.agent_id, claimantName: row.claimant_name, claimantEmail: row.claimant_email } : null;
+        const row = db.prepare(`SELECT agent_id, claimant_name, claimant_email, claim_token_expires_at
+       FROM agent_claims WHERE claim_token = ? AND status = 'verified'`).get(token);
+        if (!row)
+            return null;
+        // Reject expired tokens (null expires_at = legacy token, allow for now)
+        if (row.claim_token_expires_at && new Date(row.claim_token_expires_at) < new Date()) {
+            return null;
+        }
+        return { agentId: row.agent_id, claimantName: row.claimant_name, claimantEmail: row.claimant_email };
     }
+    // ─── Resend claim token (lost login) ─────────────
     resendClaimToken(agentId, email) {
         const db = (0, init_1.getDb)();
         const claim = db.prepare("SELECT * FROM agent_claims WHERE agent_id = ? AND status = 'verified' AND claimant_email = ?").get(agentId, email);
@@ -179,9 +205,53 @@ class KnowledgeService {
             return { success: false, error: "Ingen verifisert krav funnet for denne e-postadressen" };
         }
         const newToken = `claim_${crypto_1.default.randomBytes(32).toString("hex")}`;
-        db.prepare("UPDATE agent_claims SET claim_token = ? WHERE id = ?").run(newToken, claim.id);
+        const tokenExpiry = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString();
+        db.prepare("UPDATE agent_claims SET claim_token = ?, claim_token_expires_at = ? WHERE id = ?").run(newToken, tokenExpiry, claim.id);
         return { success: true, claimToken: newToken };
     }
+    // ─── Magic Link Login ─────────────────────────────────
+    createMagicLink(email) {
+        const db = (0, init_1.getDb)();
+        // Find verified claim for this email
+        const claim = db.prepare(`SELECT ac.agent_id, ac.claim_token, a.name as agent_name
+       FROM agent_claims ac
+       JOIN agents a ON a.id = ac.agent_id
+       WHERE ac.claimant_email = ? AND ac.status = 'verified'
+       ORDER BY ac.verified_at DESC LIMIT 1`).get(email);
+        if (!claim) {
+            return { success: false, error: "Ingen registrert agent funnet for denne e-postadressen" };
+        }
+        // Generate a secure magic link token (valid 15 min)
+        const token = crypto_1.default.randomBytes(32).toString("hex");
+        const expiresAt = new Date(Date.now() + 15 * 60 * 1000).toISOString();
+        const id = (0, uuid_1.v4)();
+        db.prepare(`INSERT INTO magic_links (id, email, token, agent_id, expires_at) VALUES (?, ?, ?, ?, ?)`).run(id, email, token, claim.agent_id, expiresAt);
+        return { success: true, token, agentId: claim.agent_id, agentName: claim.agent_name };
+    }
+    verifyMagicLink(token) {
+        const db = (0, init_1.getDb)();
+        const link = db.prepare(`SELECT ml.*, ac.claim_token, ac.claimant_name
+       FROM magic_links ml
+       JOIN agent_claims ac ON ac.agent_id = ml.agent_id AND ac.claimant_email = ml.email AND ac.status = 'verified'
+       WHERE ml.token = ? AND ml.used = 0`).get(token);
+        if (!link) {
+            return { success: false, error: "Ugyldig eller brukt lenke" };
+        }
+        if (new Date(link.expires_at) < new Date()) {
+            return { success: false, error: "Lenken har utløpt. Be om en ny." };
+        }
+        // Mark as used
+        db.prepare(`UPDATE magic_links SET used = 1 WHERE token = ?`).run(token);
+        // Clean up old magic links (older than 1 hour)
+        db.prepare(`DELETE FROM magic_links WHERE expires_at < datetime('now', '-1 hour')`).run();
+        return {
+            success: true,
+            agentId: link.agent_id,
+            claimToken: link.claim_token,
+            claimantName: link.claimant_name,
+        };
+    }
+    // ─── Stats ────────────────────────────────────────────
     getKnowledgeStats() {
         const db = (0, init_1.getDb)();
         const total = db.prepare("SELECT COUNT(*) as c FROM agents").get().c;
@@ -191,10 +261,12 @@ class KnowledgeService {
         const ownerOrHybrid = db.prepare("SELECT COUNT(*) as c FROM agent_knowledge WHERE data_source IN ('owner','hybrid')").get().c;
         return { total, enriched, claimed, autoOnly, ownerOrHybrid };
     }
+    // ─── Private helpers ─────────────────────────────────────
     generateVerificationCode() {
         return Math.floor(100000 + Math.random() * 900000).toString();
     }
     mergeKnowledge(existing, update) {
+        // Owner data always wins over auto data
         return {
             agentId: existing.agentId,
             address: update.address ?? existing.address,
