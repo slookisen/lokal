@@ -473,9 +473,9 @@ export class AnalyticsService {
         SELECT
           aav.city,
           COUNT(DISTINCT aav.id) as view_count,
-          (SELECT COUNT(*) FROM analytics_queries aq WHERE aq.city = aav.city AND aq.created_at > ?) as search_queries,
+          (SELECT COUNT(*) FROM analytics_queries aq WHERE aq.city = aav.city AND aq.created_at > ? AND (aq.is_owner IS NULL OR aq.is_owner = 0)) as search_queries,
           (SELECT json_extract(aq.categories, '$[0]') FROM analytics_queries aq
-           WHERE aq.city = aav.city AND aq.created_at > ? AND aq.categories IS NOT NULL
+           WHERE aq.city = aav.city AND aq.created_at > ? AND aq.categories IS NOT NULL AND (aq.is_owner IS NULL OR aq.is_owner = 0)
            GROUP BY json_extract(aq.categories, '$[0]')
            ORDER BY COUNT(*) DESC
            LIMIT 1) as top_category

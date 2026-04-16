@@ -9,6 +9,9 @@ function sqliteDatetime(date: Date): string {
   return date.toISOString().replace("T", " ").replace(/\.\d{3}Z$/, "");
 }
 
+// Reusable SQL fragment: exclude owner traffic from analytics
+const NOT_OWNER = "(is_owner IS NULL OR is_owner = 0)";
+
 /**
  * Analytics Admin Routes
  *
@@ -315,7 +318,7 @@ router.get("/visitors", (req: Request, res: Response) => {
           ELSE 'desktop'
         END as device
       FROM analytics_page_views
-      WHERE created_at > ?
+      WHERE created_at > ? AND ${NOT_OWNER}
       GROUP BY session_id
       ORDER BY pageViews DESC
       LIMIT ?
@@ -345,7 +348,7 @@ router.get("/hourly", (req: Request, res: Response) => {
         COUNT(*) as views,
         COUNT(DISTINCT session_id) as visitors
       FROM analytics_page_views
-      WHERE created_at > ?
+      WHERE created_at > ? AND ${NOT_OWNER}
       GROUP BY hour
       ORDER BY hour ASC
     `).all(cutoff) as any[];
@@ -375,7 +378,7 @@ router.get("/pages", (req: Request, res: Response) => {
         COUNT(*) as views,
         COUNT(DISTINCT session_id) as visitors
       FROM analytics_page_views
-      WHERE created_at > ?
+      WHERE created_at > ? AND ${NOT_OWNER}
       GROUP BY path
       ORDER BY views DESC
       LIMIT ?
@@ -408,7 +411,7 @@ router.get("/devices", (req: Request, res: Response) => {
         COUNT(*) as count,
         COUNT(DISTINCT session_id) as visitors
       FROM analytics_page_views
-      WHERE created_at > ?
+      WHERE created_at > ? AND ${NOT_OWNER}
       GROUP BY source
       ORDER BY count DESC
     `).all(cutoff) as any[];
@@ -441,7 +444,7 @@ router.get("/traffic-classification", (req: Request, res: Response) => {
         MIN(created_at) as first_seen,
         MAX(created_at) as last_seen
       FROM analytics_page_views
-      WHERE created_at > ?
+      WHERE created_at > ? AND ${NOT_OWNER}
       GROUP BY session_id
     `).all(cutoff) as any[];
 
@@ -454,7 +457,7 @@ router.get("/traffic-classification", (req: Request, res: Response) => {
     // Also get scanner paths
     const scannerHits = db.prepare(`
       SELECT session_id FROM analytics_page_views
-      WHERE created_at > ? AND (${scannerPaths.map(() => 'path LIKE ?').join(' OR ')})
+      WHERE created_at > ? AND ${NOT_OWNER} AND (${scannerPaths.map(() => 'path LIKE ?').join(' OR ')})
       GROUP BY session_id
     `).all(cutoff, ...scannerPaths.map(p => `%${p}%`)) as any[];
     const scannerSessionIds = new Set(scannerHits.map((r: any) => r.session_id));
@@ -536,7 +539,7 @@ router.get("/referrers", (req: Request, res: Response) => {
         COUNT(DISTINCT session_id) as unique_visitors,
         GROUP_CONCAT(DISTINCT path) as paths
       FROM analytics_page_views
-      WHERE created_at > ? AND referrer IS NOT NULL AND referrer != ''
+      WHERE created_at > ? AND ${NOT_OWNER} AND referrer IS NOT NULL AND referrer != ''
       GROUP BY referrer
       ORDER BY visits DESC
       LIMIT 30
