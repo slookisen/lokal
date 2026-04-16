@@ -1,25 +1,25 @@
 openapi: 3.1.0
 info:
-  title: Lokal Local Food Agent API
-  description: Discover local food producers across Norway. 400+ farms, markets, and shops.
-  version: 0.11.0
+  title: Rett fra Bonden — Lokal Mat API
+  description: Finn lokale matprodusenter i Norge. Søk blant 1 100+ gårdsbutikker, markeder og REKO-ringer etter kategori, sted og sesong.
+  version: 1.0.0
 servers:
-  - url: https://lokal.fly.dev
+  - url: https://rettfrabonden.com
     description: Production
 paths:
   /api/marketplace/search:
     get:
       operationId: searchFood
       summary: Natural language food search
-      description: Search for local food using natural language in Norwegian or English.
+      description: Search for local food using natural language in Norwegian or English. Returns producers ranked by relevance, with distance if coordinates are provided.
       parameters:
         - name: q
           in: query
           required: true
-          description: Natural language search query
+          description: Natural language search query (Norwegian or English)
           schema:
             type: string
-          example: "ost n�r Bergen"
+          example: "økologisk ost nær Bergen"
         - name: limit
           in: query
           required: false
@@ -84,7 +84,7 @@ paths:
     post:
       operationId: discoverProducers
       summary: Structured producer discovery
-      description: Find producers by category, tags, and location.
+      description: Find producers by category, tags, and location. Use this for precise filtering when the user specifies exact criteria.
       requestBody:
         required: true
         content:
@@ -96,6 +96,7 @@ paths:
                   type: array
                   items:
                     type: string
+                  description: "Food categories, e.g. ['Gårdsbutikk', 'Honning', 'Økologisk']"
                 tags:
                   type: array
                   items:
@@ -158,7 +159,8 @@ paths:
   /api/marketplace/agents/{agentId}/info:
     get:
       operationId: getProducerInfo
-      summary: Get producer details
+      summary: Get full producer details
+      description: Returns complete information about a producer including address, products, opening hours, certifications, and trust score.
       parameters:
         - name: agentId
           in: path
@@ -167,7 +169,7 @@ paths:
             type: string
       responses:
         "200":
-          description: Producer details
+          description: Producer details with knowledge data
           content:
             application/json:
               schema:
@@ -198,13 +200,28 @@ paths:
                               type: string
                           openingHours:
                             type: string
+                          about:
+                            type: string
+                          certifications:
+                            type: array
+                            items:
+                              type: string
+                          paymentMethods:
+                            type: array
+                            items:
+                              type: string
+                          deliveryOptions:
+                            type: array
+                            items:
+                              type: string
   /api/stats:
     get:
       operationId: getPlatformStats
       summary: Platform statistics
+      description: Returns current platform metrics — total producers, cities covered, and interaction count.
       responses:
         "200":
-          description: Stats
+          description: Platform stats
           content:
             application/json:
               schema:
