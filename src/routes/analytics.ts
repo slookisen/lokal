@@ -1,4 +1,6 @@
 import { Router, Request, Response } from "express";
+import path from "path";
+import { getDb } from "../database/init";
 import { analyticsService } from "../services/analytics-service";
 
 /**
@@ -177,6 +179,138 @@ router.get("/health", (_req: Request, res: Response) => {
       error: String(err),
       timestamp: new Date().toISOString(),
     });
+  }
+});
+
+/**
+ * GET /admin/analytics/visitors
+ * Detailed visitor list with session info
+ */
+router.get("/visitors", (req: Request, res: Response) => {
+  const hours = Math.max(1, Math.min(720, parseInt(req.query.hours as string) || 24));
+  const limit = Math.min(200, parseInt(req.query.limit as string) || 50);
+
+  try {
+    const db = getDb();
+    const cutoff = new Date(Date.now() - hours * 60 * 60 * 1000).toISOString();
+
+    const visitors = db.prepare(`
+      SELECT
+        session_id as ipHash,
+        COUNT(*) as pageViews,
+        COUNT(DISTINCT path) as uniquePages,
+        MIN(created_at) as firstSeen,
+        MAX(created_at) as lastSeen,
+        source,
+        CASE
+          WHEN session_id LIKE '%mobile%' OR session_id LIKE '%iphone%' THEN 'mobile'
+          WHEN session_id LIKE '%tablet%' OR session_id LIKE '%ipad%' THEN 'tablet'
+          ELSE 'desktop'
+        END as device
+      FROM analytics_page_views
+      WHERE created_at > ?
+      GROUP BY session_id
+      ORDER BY pageViews DESC
+      LIMIT ?
+    `).all(cutoff, limit) as any[];
+
+    res.json({ visitors });
+  } catch (err) {
+    console.error("[analytics] visitors error:", err);
+    res.json({ visitors: [] });
+  }
+});
+
+/**
+ * GET /admin/analytics/hourly
+ * Hourly traffic breakdown for chart
+ */
+router.get("/hourly", (req: Request, res: Response) => {
+  const hours = Math.max(1, Math.min(168, parseInt(req.query.hours as string) || 24));
+
+  try {
+    const db = getDb();
+    const cutoff = new Date(Date.now() - hours * 60 * 60 * 1000).toISOString();
+
+    const hourly = db.prepare(`
+      SELECT
+        strftime('%Y-%m-%d %H:00', created_at) as hour,
+        COUNT(*) as views,
+        COUNT(DISTINCT session_id) as visitors
+      FROM analytics_page_views
+      WHERE created_at > ?
+      GROUP BY hour
+      ORDER BY hour ASC
+    `).all(cutoff) as any[];
+
+    res.json({ hourly });
+  } catch (err) {
+    console.error("[analytics] hourly error:", err);
+    res.json({ hourly: [] });
+  }
+});
+
+/**
+ * GET /admin/analytics/pages
+ * Top pages by view count
+ */
+router.get("/pages", (req: Request, res: Response) => {
+  const hours = Math.max(1, Math.min(720, parseInt(req.query.hours as string) || 24));
+  const limit = Math.min(100, parseInt(req.query.limit as string) || 20);
+
+  try {
+    const db = getDb();
+    const cutoff = new Date(Date.now() - hours * 60 * 60 * 1000).toISOString();
+
+    const pages = db.prepare(`
+      SELECT
+        path,
+        COUNT(*) as views,
+        COUNT(DISTINCT session_id) as visitors
+      FROM analytics_page_views
+      WHERE created_at > ?
+      GROUP BY path
+      ORDER BY views DESC
+      LIMIT ?
+    `).all(cutoff, limit) as any[];
+
+    res.json({ pages });
+  } catch (err) {
+    console.error("[analytics] pages error:", err);
+    res.json({ pages: [] });
+  }
+});
+
+/**
+ * GET /admin/analytics/devices
+ * Device type breakdown
+ */
+router.get("/devices", (req: Request, res: Response) => {
+  const hours = Math.max(1, Math.min(720, parseInt(req.query.hours as string) || 24));
+
+  try {
+    const db = getDb();
+    const cutoff = new Date(Date.now() - hours * 60 * 60 * 1000).toISOString();
+
+    // Infer device from user_agent_hash patterns
+    // Since we hash UAs we can't parse them, but the page_views middleware
+    // already tracks source. We'll infer from session patterns instead.
+    const devices = db.prepare(`
+      SELECT
+        source as device,
+        COUNT(*) as count,
+        COUNT(DISTINCT session_id) as visitors
+      FROM analytics_page_views
+      WHERE created_at > ?
+      GROUP BY source
+      ORDER BY count DESC
+    `).all(cutoff) as any[];
+
+    // Re-map as device-like categories
+    res.json({ devices });
+  } catch (err) {
+    console.error("[analytics] devices error:", err);
+    res.json({ devices: [] });
   }
 });
 

@@ -17,6 +17,7 @@
 import { Router, Request, Response } from "express";
 import { marketplaceRegistry } from "../services/marketplace-registry";
 import { knowledgeService } from "../services/knowledge-service";
+import { analyticsService } from "../services/analytics-service";
 
 const router = Router();
 
@@ -813,6 +814,11 @@ router.get("/:city", (req: Request, res: Response, next: any) => {
     }
 
     const cityName = cityAgents[0].city || cityAgents[0].location?.city || citySlug;
+
+    // Track city page view for analytics dashboard (one entry per city visit)
+    // Use the first agent as representative — getCityStats groups by city
+    analyticsService.trackAgentView(cityAgents[0].id, cityAgents[0].name, cityName, "seo");
+
     const producerCards = cityAgents.map((a: any) => producerCard(a)).join("");
 
     // Schema.org
@@ -940,10 +946,13 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
       ));
     }
 
+    // Track producer page view for analytics dashboard
+    const cityName = agent.city || agent.location?.city || "";
+    analyticsService.trackAgentView(agent.id, agent.name, cityName, "seo");
+
     const info = knowledgeService.getAgentInfo(agent.id);
     const k = (info?.knowledge || {}) as any;
     const meta = (info?.meta || {}) as any;
-    const cityName = agent.city || agent.location?.city || "";
     const trustPct = Math.round((agent.trustScore || 0) * 100);
 
     // Badges
