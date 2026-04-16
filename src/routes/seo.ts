@@ -10,6 +10,7 @@
  *   GET /sok?q=...            → Search results page
  *   GET /:city                → City page with all producers in that city
  *   GET /produsent/:slug      → Individual producer profile page
+ *   GET /personvern            → Privacy policy (GDPR)
  *   GET /sitemap.xml          → Dynamic sitemap for Google
  *   GET /robots.txt           → Crawl instructions
  */
@@ -224,7 +225,7 @@ function shell(title: string, description: string, content: string, extra?: { ca
       </div>
       <div class="ft-col">
         <h4>Plattformen</h4>
-        <a href="/sok">S\u00f8k produsenter</a><a href="/teknologi">Hvordan det fungerer</a><a href="/om">Om Rett fra Bonden</a>
+        <a href="/sok">S\u00f8k produsenter</a><a href="/teknologi">Hvordan det fungerer</a><a href="/om">Om Rett fra Bonden</a><a href="/personvern">Personvern</a>
       </div>
       <div class="ft-col">
         <h4>For produsenter</h4>
@@ -773,6 +774,165 @@ router.get("/teknologi", (_req: Request, res: Response) => {
 
 
 // ═══════════════════════════════════════════════════════════════
+// GET /personvern — Privacy policy (GDPR-compliant, factual)
+// ═══════════════════════════════════════════════════════════════
+
+const PERSONVERN_CSS = `
+  .pv-hero { background: linear-gradient(135deg, #f8f9fa 0%, #f0f4f3 100%); padding: 64px 24px 48px; text-align: center; }
+  .pv-hero h1 { font-size: 2.2rem; font-weight: 800; color: var(--charcoal); letter-spacing: -1px; margin-bottom: 12px; }
+  .pv-hero p { font-size: 1.05rem; color: var(--g500); max-width: 600px; margin: 0 auto; line-height: 1.7; }
+  .pv-sec { max-width: 760px; margin: 0 auto; padding: 48px 24px; }
+  .pv-sec h2 { font-size: 1.4rem; font-weight: 800; color: var(--charcoal); margin-top: 36px; margin-bottom: 12px; }
+  .pv-sec h3 { font-size: 1.1rem; font-weight: 700; color: var(--charcoal); margin-top: 24px; margin-bottom: 8px; }
+  .pv-sec p { font-size: 0.95rem; color: var(--g700); line-height: 1.8; margin-bottom: 12px; }
+  .pv-sec ul { margin: 8px 0 16px 20px; }
+  .pv-sec li { font-size: 0.95rem; color: var(--g700); line-height: 1.7; margin-bottom: 4px; }
+  .pv-table { width: 100%; border-collapse: collapse; margin: 16px 0 24px; font-size: 0.9rem; }
+  .pv-table th { text-align: left; padding: 10px 12px; background: var(--green-50); border-bottom: 2px solid var(--g200); font-weight: 700; color: var(--charcoal); }
+  .pv-table td { padding: 10px 12px; border-bottom: 1px solid var(--g100); color: var(--g700); }
+  .pv-updated { font-size: 0.85rem; color: var(--g400); margin-top: 48px; padding-top: 16px; border-top: 1px solid var(--g100); }
+  @media (max-width: 768px) {
+    .pv-hero h1 { font-size: 1.6rem; }
+    .pv-table { font-size: 0.8rem; }
+    .pv-table th, .pv-table td { padding: 8px 6px; }
+  }
+`;
+
+router.get("/personvern", (_req: Request, res: Response) => {
+  const content = `
+  <section class="pv-hero">
+    <h1>Personvern</h1>
+    <p>Hvordan Rett fra Bonden behandler data \u2014 ærlig og uten fyllord.</p>
+  </section>
+
+  <section class="pv-sec">
+    <h2>Hvem vi er</h2>
+    <p>Rett fra Bonden er en åpen katalog over lokale matprodusenter i Norge, tilgjengelig på rettfrabonden.com. Tjenesten drives som et uavhengig prosjekt. Kontakt: kontakt@rettfrabonden.com.</p>
+
+    <h2>Hva vi samler inn</h2>
+    <p>Vi samler inn forskjellige typer data avhengig av hvordan du bruker tjenesten. Her er en fullstendig oversikt:</p>
+
+    <h3>Besøkende på nettsiden (alle)</h3>
+    <p>Når du besøker rettfrabonden.com registrerer vi:</p>
+    <ul>
+      <li>Hvilken side du besøker (URL-sti)</li>
+      <li>Referanse-URL (hvor du kom fra)</li>
+      <li>En anonymisert hash av IP-adresse og nettleser-type (SHA-256, forkortet \u2014 vi lagrer ikke fullstendig IP-adresse eller nettleser-streng)</li>
+      <li>Tidspunkt for besøket</li>
+    </ul>
+    <p>Vi bruker ingen informasjonskapsler (cookies). Vi bruker ingen tredjepartsanalyseverktøy som Google Analytics. All analyse skjer i vår egen database.</p>
+
+    <h3>Søk og AI-spørringer</h3>
+    <p>Når du søker etter produsenter \u2014 enten via nettsiden, ChatGPT, Claude MCP eller API-et \u2014 lagrer vi:</p>
+    <ul>
+      <li>Søketeksten du skrev</li>
+      <li>Valgt kategori og by</li>
+      <li>Antall resultater returnert</li>
+      <li>Hvilken protokoll som ble brukt (API, MCP, A2A)</li>
+      <li>Anonymisert IP-hash (samme metode som for sidebesøk)</li>
+    </ul>
+    <p>Vi lagrer dette for å forstå hvilke søk som gir gode resultater, og for å forbedre tjenesten.</p>
+
+    <h3>Selgere som registrerer seg (claim)</h3>
+    <p>Når du som matprodusent registrerer deg for å administrere din profil, samler vi inn:</p>
+    <ul>
+      <li>Navn, e-postadresse og eventuelt telefonnummer</li>
+      <li>En 6-sifret verifiseringskode sendt til din e-post</li>
+      <li>Claim-token (kryptografisk nøkkel for pålogging, utløper etter 30 dager)</li>
+    </ul>
+    <p>Etter verifisering kan du selv legge inn og redigere: adresse, åpningstider, produkter, sertifiseringer, beskrivelse, bilder og kontaktinfo. Alt du legger inn er synlig på din offentlige profilside.</p>
+
+    <h3>Innlogging</h3>
+    <p>Vi bruker ikke passord. Innlogging skjer via magisk lenke sendt til din e-post. Lenken er gyldig i 15 minutter og kan bare brukes én gang. Vi lagrer ikke passord fordi vi ikke har noen.</p>
+
+    <h3>Bilder</h3>
+    <p>Selgere kan laste opp profilbilder og produktbilder. Disse lagres på serveren. Hvis bildeskanning er aktivert, kan bildet sendes til en ekstern AI-tjeneste (Anthropic Claude eller OpenAI) for automatisk produktgjenkjenning.</p>
+
+    <h3>Samtaler mellom agenter</h3>
+    <p>Rett fra Bonden støtter A2A-protokollen (agent-til-agent). Når en AI-agent kontakter en produsent-agent, lagres samtaletekst, status og eventuell transaksjonsinfo i databasen.</p>
+
+    <h2>Hva vi ikke samler inn</h2>
+    <ul>
+      <li>Vi bruker ingen informasjonskapsler (cookies)</li>
+      <li>Vi har ingen tredjepartssporing (ingen Google Analytics, Facebook Pixel, etc.)</li>
+      <li>Vi lagrer ikke fullstendige IP-adresser \u2014 kun en forkortet hash</li>
+      <li>Vi lagrer ikke passord (passwordless innlogging)</li>
+      <li>Vi samler ikke inn betalingsinformasjon</li>
+      <li>Vi selger aldri data til tredjeparter</li>
+    </ul>
+
+    <h2>Rettslig grunnlag</h2>
+    <p>Vi behandler persondata basert på:</p>
+    <table class="pv-table">
+      <thead><tr><th>Datatype</th><th>Grunnlag</th><th>Forklaring</th></tr></thead>
+      <tbody>
+        <tr><td>Analytikk (sidebesøk, søk)</td><td>Berettiget interesse</td><td>For å forbedre tjenesten. Dataen er anonymisert (hashet IP/UA).</td></tr>
+        <tr><td>Selgerregistrering</td><td>Samtykke</td><td>Du gir aktivt data når du registrerer deg. Du kan trekke tilbake samtykket.</td></tr>
+        <tr><td>Selgerprofil (offentlig info)</td><td>Samtykke</td><td>Du velger selv hva du legger inn. Alt er synlig på din profilside.</td></tr>
+        <tr><td>Bildeoppasting</td><td>Samtykke</td><td>Du laster selv opp bilder. Bildeskanning er valgfritt.</td></tr>
+      </tbody>
+    </table>
+
+    <h2>Hvor data lagres</h2>
+    <p>All data lagres i en SQLite-database på en server hostet av Fly.io i Stockholm-regionen (ARN). Data overføres ikke til land utenfor EU/EØS, med unntak av:</p>
+    <ul>
+      <li>E-post sendes via SMTP-tjeneste for å levere verifiseringskoder og magiske lenker</li>
+      <li>Hvis bildeskanning er aktivert, kan bilder sendes til Anthropic (USA) eller OpenAI (USA) for analyse</li>
+    </ul>
+    <p>Kildekoden er åpen og tilgjengelig på <a href="https://github.com/slookisen/lokal" style="color:var(--green-700);">GitHub</a>.</p>
+
+    <h2>Hvor lenge vi lagrer data</h2>
+    <table class="pv-table">
+      <thead><tr><th>Datatype</th><th>Oppbevaring</th></tr></thead>
+      <tbody>
+        <tr><td>Sidebesøk-analytikk</td><td>Kan slettes via admin. Ingen automatisk utløp er satt per i dag.</td></tr>
+        <tr><td>Søkelogger</td><td>Samme som analytikk.</td></tr>
+        <tr><td>Verifiseringskoder</td><td>Uverifiserte claims utløper etter 7 dager.</td></tr>
+        <tr><td>Magiske lenker</td><td>Utløper etter 15 minutter. Brukte lenker eldre enn 1 time slettes automatisk.</td></tr>
+        <tr><td>Claim-token (innlogging)</td><td>Utløper etter 30 dager. Fornyes ved ny innlogging.</td></tr>
+        <tr><td>Selgerprofil</td><td>Så lenge du ønsker å være registrert.</td></tr>
+        <tr><td>Opplastede bilder</td><td>Lagres til de slettes manuelt.</td></tr>
+      </tbody>
+    </table>
+
+    <h2>Dine rettigheter</h2>
+    <p>Etter personopplysningsloven og GDPR har du rett til å:</p>
+    <ul>
+      <li><strong>Be om innsyn</strong> \u2014 vi kan fortelle deg hva vi har lagret om deg</li>
+      <li><strong>Rette feil</strong> \u2014 selgere kan oppdatere sin profil direkte via dashboardet</li>
+      <li><strong>Slette data</strong> \u2014 kontakt oss for å få fjernet din profil og tilknyttet data</li>
+      <li><strong>Trekke tilbake samtykke</strong> \u2014 du kan når som helst be om å bli fjernet</li>
+      <li><strong>Klage</strong> \u2014 du kan klage til Datatilsynet (datatilsynet.no) hvis du mener vi bryter reglene</li>
+    </ul>
+    <p>For alle henvendelser: <a href="mailto:kontakt@rettfrabonden.com" style="color:var(--green-700);">kontakt@rettfrabonden.com</a></p>
+
+    <h2>Sikkerhet</h2>
+    <p>Vi bruker følgende tiltak for å beskytte data:</p>
+    <ul>
+      <li>All trafikk er kryptert med HTTPS/TLS</li>
+      <li>Admin-tilgang er beskyttet med API-nøkler i miljøvariabler</li>
+      <li>Content Security Policy (CSP) og andre sikkerhetsheadere er aktive</li>
+      <li>Alle databasespørringer er parameterisert (beskyttelse mot SQL-injeksjon)</li>
+      <li>IP-adresser og nettleserinfo lagres kun som hasher (ikke-reversibel anonymisering)</li>
+      <li>Rate limiting på sensitive endepunkter</li>
+    </ul>
+
+    <h2>Endringer i denne policyen</h2>
+    <p>Hvis vi endrer hvordan vi behandler data, oppdaterer vi denne siden. Vi har ingen nyhetsbrev eller popup-varsler \u2014 sjekk denne siden hvis du lurer.</p>
+
+    <p class="pv-updated">Sist oppdatert: 16. april 2026</p>
+  </section>`;
+
+  res.send(shell(
+    "Personvern \u2014 Rett fra Bonden",
+    "Hvordan Rett fra Bonden behandler persondata. Ingen cookies, ingen tredjepartssporing, åpen kildekode.",
+    content,
+    { canonical: `${BASE_URL}/personvern`, extraCss: PERSONVERN_CSS }
+  ));
+});
+
+
+// ═══════════════════════════════════════════════════════════════
 // GET /:city — City page
 // ═══════════════════════════════════════════════════════════════
 
@@ -1137,7 +1297,8 @@ router.get("/sitemap.xml", (_req: Request, res: Response) => {
 <urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
   <url><loc>${BASE_URL}/</loc><changefreq>daily</changefreq><priority>1.0</priority><lastmod>${today}</lastmod></url>
   <url><loc>${BASE_URL}/om</loc><changefreq>monthly</changefreq><priority>0.7</priority><lastmod>${today}</lastmod></url>
-  <url><loc>${BASE_URL}/teknologi</loc><changefreq>monthly</changefreq><priority>0.7</priority><lastmod>${today}</lastmod></url>`;
+  <url><loc>${BASE_URL}/teknologi</loc><changefreq>monthly</changefreq><priority>0.7</priority><lastmod>${today}</lastmod></url>
+  <url><loc>${BASE_URL}/personvern</loc><changefreq>monthly</changefreq><priority>0.5</priority><lastmod>${today}</lastmod></url>`;
 
     for (const city of cities) {
       xml += `\n  <url><loc>${BASE_URL}/${city}</loc><changefreq>weekly</changefreq><priority>0.8</priority><lastmod>${today}</lastmod></url>`;
