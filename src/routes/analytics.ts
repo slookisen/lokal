@@ -3,6 +3,12 @@ import path from "path";
 import { getDb } from "../database/init";
 import { analyticsService } from "../services/analytics-service";
 
+// SQLite stores datetimes as "YYYY-MM-DD HH:MM:SS" (space-separated).
+// JS .toISOString() uses "T" separator which breaks SQLite string comparison.
+function sqliteDatetime(date: Date): string {
+  return date.toISOString().replace("T", " ").replace(/\.\d{3}Z$/, "");
+}
+
 /**
  * Analytics Admin Routes
  *
@@ -193,7 +199,7 @@ router.get("/visitors", (req: Request, res: Response) => {
 
   try {
     const db = getDb();
-    const cutoff = new Date(Date.now() - hours * 60 * 60 * 1000).toISOString();
+    const cutoff = sqliteDatetime(new Date(Date.now() - hours * 60 * 60 * 1000));
 
     const visitors = db.prepare(`
       SELECT
@@ -231,7 +237,7 @@ router.get("/hourly", (req: Request, res: Response) => {
 
   try {
     const db = getDb();
-    const cutoff = new Date(Date.now() - hours * 60 * 60 * 1000).toISOString();
+    const cutoff = sqliteDatetime(new Date(Date.now() - hours * 60 * 60 * 1000));
 
     const hourly = db.prepare(`
       SELECT
@@ -261,7 +267,7 @@ router.get("/pages", (req: Request, res: Response) => {
 
   try {
     const db = getDb();
-    const cutoff = new Date(Date.now() - hours * 60 * 60 * 1000).toISOString();
+    const cutoff = sqliteDatetime(new Date(Date.now() - hours * 60 * 60 * 1000));
 
     const pages = db.prepare(`
       SELECT
@@ -291,7 +297,7 @@ router.get("/devices", (req: Request, res: Response) => {
 
   try {
     const db = getDb();
-    const cutoff = new Date(Date.now() - hours * 60 * 60 * 1000).toISOString();
+    const cutoff = sqliteDatetime(new Date(Date.now() - hours * 60 * 60 * 1000));
 
     // Infer device from user_agent_hash patterns
     // Since we hash UAs we can't parse them, but the page_views middleware
@@ -325,7 +331,7 @@ router.get("/traffic-classification", (req: Request, res: Response) => {
 
   try {
     const db = getDb();
-    const cutoff = new Date(Date.now() - hours * 60 * 60 * 1000).toISOString();
+    const cutoff = sqliteDatetime(new Date(Date.now() - hours * 60 * 60 * 1000));
 
     const visitors = db.prepare(`
       SELECT
@@ -420,7 +426,7 @@ router.get("/referrers", (req: Request, res: Response) => {
 
   try {
     const db = getDb();
-    const cutoff = new Date(Date.now() - hours * 60 * 60 * 1000).toISOString();
+    const cutoff = sqliteDatetime(new Date(Date.now() - hours * 60 * 60 * 1000));
 
     const referrers = db.prepare(`
       SELECT

@@ -16,6 +16,14 @@ import { getDb } from "../database/init";
  * Lightweight: SQLite only, no external services
  */
 
+// ─── Helper: SQLite-compatible UTC datetime string ──────────
+// SQLite stores datetimes as "YYYY-MM-DD HH:MM:SS" (space, no T/Z).
+// JS .toISOString() returns "YYYY-MM-DDTHH:MM:SS.000Z" which breaks
+// string comparison because 'T' (0x54) > ' ' (0x20) in ASCII.
+function sqliteDatetime(date: Date): string {
+  return date.toISOString().replace("T", " ").replace(/\.\d{3}Z$/, "");
+}
+
 // ─── Helper: Privacy-safe IP hashing ─────────────────────────
 function hashIP(ip: string): string {
   return crypto.createHash("sha256").update(ip).digest("hex").slice(0, 16);
@@ -302,7 +310,7 @@ export class AnalyticsService {
   } {
     try {
       const db = getDb();
-      const cutoff = new Date(Date.now() - hoursBack * 60 * 60 * 1000).toISOString();
+      const cutoff = sqliteDatetime(new Date(Date.now() - hoursBack * 60 * 60 * 1000));
 
       // Page views
       const pvResult = db.prepare(`
@@ -390,7 +398,7 @@ export class AnalyticsService {
   }> {
     try {
       const db = getDb();
-      const cutoff = new Date(Date.now() - hoursBack * 60 * 60 * 1000).toISOString();
+      const cutoff = sqliteDatetime(new Date(Date.now() - hoursBack * 60 * 60 * 1000));
 
       const results = db.prepare(`
         SELECT
@@ -434,7 +442,7 @@ export class AnalyticsService {
   }> {
     try {
       const db = getDb();
-      const cutoff = new Date(Date.now() - hoursBack * 60 * 60 * 1000).toISOString();
+      const cutoff = sqliteDatetime(new Date(Date.now() - hoursBack * 60 * 60 * 1000));
 
       const results = db.prepare(`
         SELECT
@@ -507,7 +515,7 @@ export class AnalyticsService {
   pruneOldData(olderThanDays: number): number {
     try {
       const db = getDb();
-      const cutoff = new Date(Date.now() - olderThanDays * 24 * 60 * 60 * 1000).toISOString();
+      const cutoff = sqliteDatetime(new Date(Date.now() - olderThanDays * 24 * 60 * 60 * 1000));
 
       const pvResult = db.prepare("DELETE FROM analytics_page_views WHERE created_at < ?").run(cutoff);
       const qResult = db.prepare("DELETE FROM analytics_queries WHERE created_at < ?").run(cutoff);

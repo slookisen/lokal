@@ -3,6 +3,11 @@ Object.defineProperty(exports, "__esModule", { value: true });
 const express_1 = require("express");
 const init_1 = require("../database/init");
 const analytics_service_1 = require("../services/analytics-service");
+// SQLite stores datetimes as "YYYY-MM-DD HH:MM:SS" (space-separated).
+// JS .toISOString() uses "T" separator which breaks SQLite string comparison.
+function sqliteDatetime(date) {
+    return date.toISOString().replace("T", " ").replace(/\.\d{3}Z$/, "");
+}
 /**
  * Analytics Admin Routes
  *
@@ -173,7 +178,7 @@ router.get("/visitors", (req, res) => {
     const limit = Math.min(200, parseInt(req.query.limit) || 50);
     try {
         const db = (0, init_1.getDb)();
-        const cutoff = new Date(Date.now() - hours * 60 * 60 * 1000).toISOString();
+        const cutoff = sqliteDatetime(new Date(Date.now() - hours * 60 * 60 * 1000));
         const visitors = db.prepare(`
       SELECT
         session_id as ipHash,
@@ -208,7 +213,7 @@ router.get("/hourly", (req, res) => {
     const hours = Math.max(1, Math.min(168, parseInt(req.query.hours) || 24));
     try {
         const db = (0, init_1.getDb)();
-        const cutoff = new Date(Date.now() - hours * 60 * 60 * 1000).toISOString();
+        const cutoff = sqliteDatetime(new Date(Date.now() - hours * 60 * 60 * 1000));
         const hourly = db.prepare(`
       SELECT
         strftime('%Y-%m-%d %H:00', created_at) as hour,
@@ -235,7 +240,7 @@ router.get("/pages", (req, res) => {
     const limit = Math.min(100, parseInt(req.query.limit) || 20);
     try {
         const db = (0, init_1.getDb)();
-        const cutoff = new Date(Date.now() - hours * 60 * 60 * 1000).toISOString();
+        const cutoff = sqliteDatetime(new Date(Date.now() - hours * 60 * 60 * 1000));
         const pages = db.prepare(`
       SELECT
         path,
@@ -262,7 +267,7 @@ router.get("/devices", (req, res) => {
     const hours = Math.max(1, Math.min(720, parseInt(req.query.hours) || 24));
     try {
         const db = (0, init_1.getDb)();
-        const cutoff = new Date(Date.now() - hours * 60 * 60 * 1000).toISOString();
+        const cutoff = sqliteDatetime(new Date(Date.now() - hours * 60 * 60 * 1000));
         // Infer device from user_agent_hash patterns
         // Since we hash UAs we can't parse them, but the page_views middleware
         // already tracks source. We'll infer from session patterns instead.
@@ -293,7 +298,7 @@ router.get("/traffic-classification", (req, res) => {
     const hours = Math.max(1, Math.min(720, parseInt(req.query.hours) || 24));
     try {
         const db = (0, init_1.getDb)();
-        const cutoff = new Date(Date.now() - hours * 60 * 60 * 1000).toISOString();
+        const cutoff = sqliteDatetime(new Date(Date.now() - hours * 60 * 60 * 1000));
         const visitors = db.prepare(`
       SELECT
         session_id,
@@ -381,7 +386,7 @@ router.get("/referrers", (req, res) => {
     const hours = Math.max(1, Math.min(720, parseInt(req.query.hours) || 24));
     try {
         const db = (0, init_1.getDb)();
-        const cutoff = new Date(Date.now() - hours * 60 * 60 * 1000).toISOString();
+        const cutoff = sqliteDatetime(new Date(Date.now() - hours * 60 * 60 * 1000));
         const referrers = db.prepare(`
       SELECT
         referrer,
