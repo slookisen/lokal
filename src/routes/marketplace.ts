@@ -469,7 +469,7 @@ router.get("/knowledge/stats", (_req: Request, res: Response) => {
 // ─── POST /agents/:id/claim — Request to claim an agent ─────
 
 router.post("/agents/:id/claim", async (req: Request, res: Response) => {
-  const { name, email, phone } = req.body;
+  const { name, email, phone, source } = req.body;
   const agentId = req.params.id as string;
   if (!name || !email) {
     res.status(400).json({ success: false, error: "Navn og e-post er påkrevd" });
@@ -487,6 +487,7 @@ router.post("/agents/:id/claim", async (req: Request, res: Response) => {
       claimantName: name,
       claimantEmail: email,
       claimantPhone: phone,
+      source: source || 'organic',
     });
 
     // Get agent name for the email
@@ -1165,6 +1166,49 @@ router.get("/find-match", (req: Request, res: Response) => {
 //  calling /find-match first. Backend guard is a safety net.)
 
 // ─── Helper ──────────────────────────────────────────────────
+
+// ─── GET /admin/claims — Campaign tracking overview ───────────
+// Shows all claims grouped by source, so you can track which
+// outreach campaigns are converting.
+
+router.get("/admin/claims", (req: Request, res: Response) => {
+  const expectedKey = process.env.ADMIN_KEY;
+  if (!expectedKey) { res.status(503).json({ error: "Admin not configured" }); return; }
+  const adminKey = (req.headers["x-admin-key"] as string) || (req.query.key as string);
+  if (!adminKey || adminKey !== expectedKey) {
+    res.status(403).json({ error: "Krever admin-nøkkel" });
+    return;
+  }
+
+  const db = getDb();
+
+  // All claims with source info
+  const claims = db.prepare(`
+    SELECT ac.id, ac.agent_id, ac.claimant_name, ac.claimant_email, ac.status,
+           ac.source, ac.created_at, ac.verified_at, a.name as agent_name
+    FROM agent_claims ac
+    LEFT JOIN agents a ON a.id = ac.agent_id
+    ORDER BY ac.created_at DESC
+  `).all();
+
+  // Summary by source
+  const byCampaign = db.prepare(`
+    SELECT source, status, COUNT(*) as count
+    FROM agent_claims
+    GROUP BY source, status
+    ORDER BY source, status
+  `).all();
+
+  res.json({
+    success: true,
+    data: {
+      claims,
+      byCampaign,
+      total: claims.length,
+      verified: (claims as any[]).filter((c: any) => c.status === 'verified').length,
+    }
+  });
+});
 
 function getBaseUrl(req: Request): string {
   return process.env.BASE_URL || `${req.protocol}://${req.get("host")}`;

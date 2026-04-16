@@ -302,6 +302,7 @@ class KnowledgeService {
     claimantName: string;
     claimantEmail: string;
     claimantPhone?: string;
+    source?: string;
   }): { claimId: string; verificationCode: string } {
     const db = getDb();
     const id = uuid();
@@ -324,9 +325,9 @@ class KnowledgeService {
     ).run(agentId);
 
     db.prepare(`
-      INSERT INTO agent_claims (id, agent_id, claimant_name, claimant_email, claimant_phone, verification_code, status, expires_at, created_at)
-      VALUES (?, ?, ?, ?, ?, ?, 'code_sent', ?, ?)
-    `).run(id, agentId, opts.claimantName, opts.claimantEmail, opts.claimantPhone || null, code, expiresAt, now);
+      INSERT INTO agent_claims (id, agent_id, claimant_name, claimant_email, claimant_phone, verification_code, status, source, expires_at, created_at)
+      VALUES (?, ?, ?, ?, ?, ?, 'code_sent', ?, ?, ?)
+    `).run(id, agentId, opts.claimantName, opts.claimantEmail, opts.claimantPhone || null, code, opts.source || 'organic', expiresAt, now);
 
     return { claimId: id, verificationCode: code };
   }

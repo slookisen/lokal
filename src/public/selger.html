@@ -1074,6 +1074,7 @@
     var claimAgentId = null;
     var claimId = null;
     var devVerificationCode = null;
+    var claimSource = (new URLSearchParams(window.location.search)).get('ref') || 'organic';
 
     function startClaim(agent) {
       claimAgentId = agent.id;
@@ -1095,7 +1096,7 @@
       try {
         var res = await api('/agents/' + claimAgentId + '/claim', {
           method: 'POST',
-          body: JSON.stringify({ name: name, email: email, phone: phone || undefined })
+          body: JSON.stringify({ name: name, email: email, phone: phone || undefined, source: claimSource })
         });
         if (res.success) {
           claimId = res.data.claimId;

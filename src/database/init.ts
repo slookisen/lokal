@@ -279,6 +279,7 @@ function initSchema(db: Database.Database): void {
       claim_token TEXT,                           -- Token for managing agent after claim
       claim_token_expires_at TEXT,                -- Token expires 30 days after issue
       notes TEXT,                                 -- Admin notes
+      source TEXT DEFAULT 'organic',              -- 'organic' | 'email-apr26' | 'test' | campaign tag
       created_at TEXT DEFAULT (datetime('now')),
       verified_at TEXT,
       expires_at TEXT                             -- Claims expire after 7 days if unverified
@@ -393,6 +394,12 @@ function initSchema(db: Database.Database): void {
     db.exec(`ALTER TABLE agent_knowledge ADD COLUMN external_links TEXT DEFAULT '[]'`);
   } catch {
     // Column already exists
+  }
+
+  try {
+    db.exec(`ALTER TABLE agent_claims ADD COLUMN source TEXT DEFAULT 'organic'`);
+  } catch {
+    // Column already exists — expected after first migration
   }
 
   // ─── One-time cleanup: reset all test verifications ──────────
