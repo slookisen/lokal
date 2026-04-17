@@ -109,15 +109,94 @@ app.get("/openapi.yaml", (_req, res) => {
 
 // ─── Health check ────────────────────────────────────────────
 app.get("/health", (_req, res) => {
-  const stats = require("./services/marketplace-registry").marketplaceRegistry.getStats();
-  res.json({
-    status: "ok",
-    service: "lokal",
-    version: "0.3.0",
-    database: "sqlite",
-    agents: stats.totalAgents,
-    uptime: Math.floor(process.uptime()),
-  });
+  const startMs = Date.now();
+  try {
+    const { marketplaceRegistry } = require("./services/marketplace-registry");
+    const { getDb } = require("./database/init");
+    const db = getDb();
+
+    // DB responsiveness — timed simple query
+    const dbStart = Date.now();
+    const stats = marketplaceRegistry.getStats();
+    const dbLatencyMs = Date.now() - dbStart;
+
+    // Memory usage
+    const mem = process.memoryUsage();
+    const memUsedMb = Math.round(mem.rss / 1024 / 1024);
+    const heapUsedMb = Math.round(mem.heapUsed / 1024 / 1024);
+    const heapTotalMb = Math.round(mem.heapTotal / 1024 / 1024);
+
+    // Database file sizes
+    const fs = require("fs");
+    const dbPath = process.env.DB_PATH || "./data/lokal.db";
+    let dbSizeMb = 0;
+    try { dbSizeMb = Math.round(fs.statSync(dbPath).size / 1024 / 1024 * 10) / 10; } catch {}
+
+    // Row counts for key tables
+    const agentCount = (db.prepare("SELECT COUNT(*) as c FROM agents WHERE is_active = 1").get() as any).c;
+    const pvCount = (db.prepare("SELECT COUNT(*) as c FROM analytics_page_views").get() as any).c;
+    const queryCount = (db.prepare("SELECT COUNT(*) as c FROM analytics_queries").get() as any).c;
+
+    // Recent activity (last hour)
+    const oneHourAgo = new Date(Date.now() - 3600000).toISOString().replace("T", " ").replace(/\.\d{3}Z$/, "");
+    const recentPv = (db.prepare("SELECT COUNT(*) as c FROM analytics_page_views WHERE created_at > ?").get(oneHourAgo) as any).c;
+
+    // Uptime
+    const uptimeSec = Math.floor(process.uptime());
+
+    // Overall status based on thresholds
+    let status: "healthy" | "warning" | "critical" = "healthy";
+    const warnings: string[] = [];
+
+    if (memUsedMb > 420) { status = "critical"; warnings.push(`Memory critical: ${memUsedMb}MB / 512MB`); }
+    else if (memUsedMb > 350) { status = "warning"; warnings.push(`Memory high: ${memUsedMb}MB / 512MB`); }
+
+    if (dbLatencyMs > 3000) { status = "critical"; warnings.push(`DB slow: ${dbLatencyMs}ms`); }
+    else if (dbLatencyMs > 1000) { if (status !== "critical") status = "warning"; warnings.push(`DB latency elevated: ${dbLatencyMs}ms`); }
+
+    if (dbSizeMb > 200) { if (status !== "critical") status = "warning"; warnings.push(`DB large: ${dbSizeMb}MB`); }
+
+    if (pvCount > 500000) { warnings.push(`analytics_page_views has ${pvCount} rows — consider pruning`); }
+
+    const responseMs = Date.now() - startMs;
+
+    res.json({
+      status,
+      warnings,
+      service: "rettfrabonden",
+      version: "1.0.0",
+      uptime: uptimeSec,
+      uptimeHuman: `${Math.floor(uptimeSec / 3600)}h ${Math.floor((uptimeSec % 3600) / 60)}m`,
+      timestamp: new Date().toISOString(),
+      memory: {
+        rssMb: memUsedMb,
+        heapUsedMb,
+        heapTotalMb,
+        limitMb: 512,
+        pct: Math.round(memUsedMb / 512 * 100),
+      },
+      database: {
+        latencyMs: dbLatencyMs,
+        sizeMb: dbSizeMb,
+        agents: agentCount,
+        pageViews: pvCount,
+        queries: queryCount,
+      },
+      traffic: {
+        lastHourPageViews: recentPv,
+        totalAgents: stats.totalAgents,
+        activeCities: stats.cities.length,
+      },
+      responseMs,
+    });
+  } catch (err) {
+    res.status(500).json({
+      status: "critical",
+      warnings: [`Health check failed: ${err}`],
+      timestamp: new Date().toISOString(),
+      responseMs: Date.now() - startMs,
+    });
+  }
 });
 
 // Analytics admin endpoints
