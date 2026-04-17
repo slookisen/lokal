@@ -263,6 +263,42 @@
       transform: translateY(-2px);
     }
 
+    .geo-btn {
+      padding: 0.75rem 1rem;
+      background: var(--accent-orange);
+      color: white;
+      border: none;
+      border-radius: 8px;
+      cursor: pointer;
+      font-weight: 600;
+      font-size: 0.9rem;
+      transition: background 0.3s, transform 0.2s;
+      white-space: nowrap;
+      display: flex;
+      align-items: center;
+      gap: 0.3rem;
+    }
+
+    .geo-btn:hover {
+      background: #c49363;
+      transform: translateY(-2px);
+    }
+
+    .geo-btn.active {
+      background: var(--forest-green);
+    }
+
+    .geo-btn:disabled {
+      opacity: 0.6;
+      cursor: wait;
+    }
+
+    .geo-status {
+      font-size: 0.75rem;
+      color: var(--text-gray);
+      margin-top: 0.4rem;
+    }
+
     /* Main Container */
     main {
       max-width: 1400px;
@@ -1244,8 +1280,10 @@
     <div class="search-hint">Prøv: &laquo;Hvor finner jeg ferske grønnsaker i Oslo?&raquo;</div>
     <div class="search-input-wrapper">
       <input type="text" id="searchInput" placeholder="Spør som en AI-agent ville gjort...">
+      <button class="geo-btn" id="geoBtn" title="Bruk min posisjon">&#x1F4CD; Nær meg</button>
       <button class="search-btn" id="searchBtn">Søk</button>
     </div>
+    <div class="geo-status" id="geoStatus"></div>
   </div>
 
   <!-- Main Content -->
@@ -1453,6 +1491,10 @@ curl -X POST https://rettfrabonden.com/api/marketplace/register \
 
     var monthNames = ['', 'Jan', 'Feb', 'Mar', 'Apr', 'Mai', 'Jun', 'Jul', 'Aug', 'Sep', 'Okt', 'Nov', 'Des'];
 
+    // Geolocation state
+    var userLat = null;
+    var userLng = null;
+
     function formatCategory(cat) {
       return categoryNames[cat] || cat;
     }
@@ -1481,6 +1523,48 @@ curl -X POST https://rettfrabonden.com/api/marketplace/register \
       }
       if (searchBtn) {
         searchBtn.addEventListener('click', function() { performSearch(); });
+      }
+
+      // Geolocation "Nær meg" button
+      var geoBtn = document.getElementById('geoBtn');
+      var geoStatus = document.getElementById('geoStatus');
+      if (geoBtn) {
+        geoBtn.addEventListener('click', function() {
+          if (userLat && userLng) {
+            // Toggle off
+            userLat = null;
+            userLng = null;
+            geoBtn.classList.remove('active');
+            geoBtn.innerHTML = '&#x1F4CD; Nær meg';
+            if (geoStatus) geoStatus.textContent = '';
+            return;
+          }
+          if (!navigator.geolocation) {
+            if (geoStatus) geoStatus.textContent = 'Nettleseren din støtter ikke posisjon.';
+            return;
+          }
+          geoBtn.disabled = true;
+          geoBtn.innerHTML = '&#x23F3; Henter...';
+          navigator.geolocation.getCurrentPosition(
+            function(pos) {
+              userLat = pos.coords.latitude;
+              userLng = pos.coords.longitude;
+              geoBtn.disabled = false;
+              geoBtn.classList.add('active');
+              geoBtn.innerHTML = '&#x2705; Posisjon aktiv';
+              if (geoStatus) geoStatus.textContent = 'Søk viser resultater nær deg. Klikk igjen for å slå av.';
+            },
+            function(err) {
+              geoBtn.disabled = false;
+              geoBtn.innerHTML = '&#x1F4CD; Nær meg';
+              if (geoStatus) {
+                if (err.code === 1) geoStatus.textContent = 'Du blokkerte tilgang til posisjon. Tillat i nettleseren for å bruke denne funksjonen.';
+                else geoStatus.textContent = 'Kunne ikke hente posisjon. Prøv igjen.';
+              }
+            },
+            { enableHighAccuracy: false, timeout: 10000 }
+          );
+        });
       }
 
       // Filters
@@ -1616,7 +1700,11 @@ curl -X POST https://rettfrabonden.com/api/marketplace/register \
       }
 
       try {
-        var response = await fetch('/api/marketplace/search?q=' + encodeURIComponent(query) + '&limit=50');
+        var searchUrl = '/api/marketplace/search?q=' + encodeURIComponent(query) + '&limit=50';
+        if (userLat && userLng) {
+          searchUrl += '&lat=' + userLat + '&lng=' + userLng + '&radius=25';
+        }
+        var response = await fetch(searchUrl);
         var body = await response.json();
 
         if (body.results && body.results.length > 0) {

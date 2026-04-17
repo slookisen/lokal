@@ -257,11 +257,24 @@ router.get("/search", (req: Request, res: Response) => {
 
   // Parse natural language into structured query
   const parsed = marketplaceRegistry.parseNaturalQuery(q);
+
+  // Support frontend geolocation: ?lat=59.91&lng=10.75
+  const frontendLat = parseFloat(req.query.lat as string);
+  const frontendLng = parseFloat(req.query.lng as string);
+  if (!isNaN(frontendLat) && !isNaN(frontendLng) && !parsed.location) {
+    parsed.location = { lat: frontendLat, lng: frontendLng };
+    parsed.maxDistanceKm = parseFloat(req.query.radius as string) || 25;
+  }
+
+  // Preserve _productTerms through schema parsing (Zod strips unknown fields)
+  const productTerms = parsed._productTerms;
   const query = DiscoveryQuerySchema.parse({
     ...parsed,
     limit: parseInt(req.query.limit as string) || 20,
     offset: parseInt(req.query.offset as string) || 0,
   });
+  // Re-attach product terms for product-level filtering in discover()
+  if (productTerms) (query as any)._productTerms = productTerms;
 
   const startTime = Date.now();
   const results = marketplaceRegistry.discover(query);

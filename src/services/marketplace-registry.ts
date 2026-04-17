@@ -158,9 +158,56 @@ class MarketplaceRegistry {
       });
     }
 
+    // 6b. Product-level filtering — if user searched for specific products (e.g. "tomat"),
+    // load each candidate's products from knowledge and check for matches.
+    // This prevents a meat shop from appearing when someone searches for tomatoes.
+    const productTerms = (query as any)._productTerms as string[] | undefined;
+    let productMatchMap: Map<string, string[]> = new Map(); // agentId → matched product names
+
+    if (productTerms && productTerms.length > 0) {
+      const candidateIds = candidates.map(c => c.id);
+      if (candidateIds.length > 0) {
+        // Bulk-load products for all candidates in one query
+        const placeholders = candidateIds.map(() => "?").join(",");
+        const rows = db.prepare(
+          `SELECT agent_id, products FROM agent_knowledge WHERE agent_id IN (${placeholders})`
+        ).all(...candidateIds) as { agent_id: string; products: string }[];
+
+        for (const row of rows) {
+          try {
+            const products = typeof row.products === "string" ? JSON.parse(row.products) : row.products;
+            if (!Array.isArray(products)) continue;
+
+            const matchedNames: string[] = [];
+            for (const p of products) {
+              const pName = (typeof p === "string" ? p : p?.name || "").toLowerCase();
+              for (const term of productTerms) {
+                if (pName.includes(term) || new RegExp(`\\b${term}\\b`).test(pName)) {
+                  matchedNames.push(typeof p === "string" ? p : p?.name || pName);
+                  break;
+                }
+              }
+            }
+            if (matchedNames.length > 0) {
+              productMatchMap.set(row.agent_id, matchedNames);
+            }
+          } catch { /* skip malformed JSON */ }
+        }
+
+        // Filter: keep only agents that have matching products OR agents without knowledge
+        // (we don't want to exclude agents that simply haven't been enriched yet)
+        candidates = candidates.filter(a => {
+          if (productMatchMap.has(a.id)) return true;
+          // Check if this agent has knowledge at all — if not, keep them (benefit of doubt)
+          const hasKnowledge = rows.some(r => r.agent_id === a.id);
+          return !hasKnowledge;
+        });
+      }
+    }
+
     // 7. Score and rank
     const results: DiscoveryResult[] = candidates.map(agent => {
-      const { score, reasons } = this.calculateRelevance(agent, query);
+      const { score, reasons } = this.calculateRelevance(agent, query, productTerms, productMatchMap);
 
       // Track discovery stats (async-safe â€” fire and forget)
       this.incrementDiscovery(agent.id);
@@ -202,37 +249,77 @@ class MarketplaceRegistry {
 
   // â”€â”€â”€ Natural language query parsing â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
-  parseNaturalQuery(query: string): Partial<DiscoveryQuery> {
-    const q = query.toLowerCase();
-    const parsed: Partial<DiscoveryQuery> = {};
+  parseNaturalQuery(query: string): Partial<DiscoveryQuery> & { _productTerms?: string[] } {
+    const q = query.toLowerCase().replace(/[?!.,]/g, "");
+    const parsed: Partial<DiscoveryQuery> & { _productTerms?: string[] } = {};
 
+    // ── Product→Category mapping (expanded with Norwegian food terms) ──
+    // Each keyword maps to a category AND is stored as a product search term
+    // so we can match at product-level, not just category-level.
     const categoryMap: Record<string, string[]> = {
-      "vegetables": ["grÃ¸nnsaker", "grÃ¸nt", "vegetables", "poteter", "gulrÃ¸tter", "lÃ¸k", "kÃ¥l", "tomat"],
-      "fruit": ["frukt", "fruit", "epler", "pÃ¦rer", "plommer"],
-      "berries": ["bÃ¦r", "berries", "jordbÃ¦r", "blÃ¥bÃ¦r", "bringebÃ¦r"],
-      "dairy": ["meieri", "dairy", "melk", "ost", "smÃ¸r", "yoghurt"],
-      "eggs": ["egg", "eggs"],
-      "meat": ["kjÃ¸tt", "meat", "lam", "svin", "storfe", "kylling"],
-      "fish": ["fisk", "fish", "laks", "torsk", "reker"],
-      "bread": ["brÃ¸d", "bread", "bakervarer"],
-      "honey": ["honning", "honey"],
-      "herbs": ["urter", "herbs", "krydder"],
+      "vegetables": [
+        "grønnsaker", "grønt", "vegetables", "poteter", "potet", "gulrøtter", "gulrot",
+        "løk", "kål", "tomat", "tomater", "agurk", "brokkoli", "blomkål", "squash",
+        "paprika", "selleri", "purre", "spinat", "salat", "reddik", "gresskar",
+        "mais", "erter", "bønner", "rødbeter", "nepe", "pastinakk",
+      ],
+      "fruit": [
+        "frukt", "fruit", "epler", "eple", "pærer", "pære", "plommer", "plomme",
+        "kirsebær", "moreller", "rips", "stikkelsbær", "druer",
+      ],
+      "berries": [
+        "bær", "berries", "jordbær", "blåbær", "bringebær", "tyttebær",
+        "solbær", "multe", "multer", "markjordbær",
+      ],
+      "dairy": [
+        "meieri", "dairy", "melk", "ost", "smør", "yoghurt", "fløte", "rømme",
+        "brunost", "hvitost", "geitost", "pultost", "gamalost", "smøreost",
+      ],
+      "eggs": ["egg", "eggs", "frittgående", "økologiske egg"],
+      "meat": [
+        "kjøtt", "meat", "lam", "lammekjøtt", "svin", "svinekjøtt", "storfe",
+        "storfekjøtt", "kylling", "and", "vilt", "elg", "hjort", "rein",
+        "reinsdyr", "pølser", "spekemat", "fenalår", "ribbe", "pinnekjøtt",
+      ],
+      "fish": [
+        "fisk", "fish", "sjømat", "laks", "torsk", "reker", "krabbe", "blåskjell",
+        "ørret", "røye", "sei", "hyse", "kveite", "steinbit", "tørrfisk",
+        "klippfisk", "lutefisk", "rakfisk", "gravlaks",
+      ],
+      "bread": [
+        "brød", "bread", "bakervarer", "lefse", "flatbrød", "rundstykker",
+        "boller", "kanelboller", "surdeig", "grovbrød",
+      ],
+      "honey": ["honning", "honey", "birøkt"],
+      "herbs": ["urter", "herbs", "krydder", "dill", "persille", "basilikum", "timian"],
     };
 
     const detectedCategories: string[] = [];
+    const productTerms: string[] = [];
     for (const [category, keywords] of Object.entries(categoryMap)) {
-      if (keywords.some(kw => q.includes(kw))) {
-        detectedCategories.push(category);
+      for (const kw of keywords) {
+        // Use word-boundary matching to avoid partial matches ("ost" in "Tromsø kosten")
+        const regex = new RegExp(`\\b${kw}\\b`);
+        if (regex.test(q)) {
+          if (!detectedCategories.includes(category)) detectedCategories.push(category);
+          // Store the specific product term (not the category keyword like "vegetables")
+          if (!["grønnsaker", "grønt", "vegetables", "frukt", "fruit", "bær", "berries",
+                "meieri", "dairy", "kjøtt", "meat", "fisk", "fish", "sjømat", "brød", "bread",
+                "bakervarer", "urter", "herbs", "egg", "eggs"].includes(kw)) {
+            productTerms.push(kw);
+          }
+        }
       }
     }
     if (detectedCategories.length > 0) parsed.categories = detectedCategories;
+    if (productTerms.length > 0) parsed._productTerms = productTerms;
 
     const tagMap: Record<string, string[]> = {
-      "organic": ["Ã¸kologisk", "organic", "Ã¸ko", "debio"],
+      "organic": ["økologisk", "organic", "øko", "debio"],
       "seasonal": ["sesong", "seasonal", "i sesong"],
       "budget": ["billig", "rimelig", "budget", "cheap"],
-      "local": ["lokal", "local", "nÃ¦rme", "kort reisevei"],
-      "fresh": ["fersk", "fresh", "nyhÃ¸stet"],
+      "local": ["lokal", "local", "nærme", "kort reisevei"],
+      "fresh": ["fersk", "fresh", "nyhøstet"],
     };
 
     const detectedTags: string[] = [];
@@ -894,43 +981,60 @@ class MarketplaceRegistry {
 
   private calculateRelevance(
     agent: RegisteredAgent,
-    query: DiscoveryQuery
+    query: DiscoveryQuery,
+    productTerms?: string[],
+    productMatchMap?: Map<string, string[]>,
   ): { score: number; reasons: string[] } {
     let score = 0;
     const reasons: string[] = [];
 
+    // Category match (base relevance)
     if (query.categories && query.categories.length > 0) {
       const matches = query.categories.filter(cat =>
         agent.categories.some(ac => ac.toLowerCase().includes(cat.toLowerCase()))
       );
       if (matches.length > 0) {
-        score += 0.3 * (matches.length / query.categories.length);
+        score += 0.25 * (matches.length / query.categories.length);
         reasons.push(`Kategorier: ${matches.join(", ")}`);
       }
     } else {
-      score += 0.15;
+      score += 0.1;
     }
 
+    // Product-level match bonus — agents carrying the exact product rank much higher.
+    // "tomat" → tomato sellers first, not just any vegetable shop.
+    if (productTerms && productTerms.length > 0 && productMatchMap) {
+      const matchedProducts = productMatchMap.get(agent.id);
+      if (matchedProducts && matchedProducts.length > 0) {
+        const productScore = Math.min(1, matchedProducts.length / productTerms.length);
+        score += 0.25 * productScore;
+        reasons.push(`Produkter: ${matchedProducts.slice(0, 3).join(", ")}`);
+      }
+    }
+
+    // Tag match
     if (query.tags && query.tags.length > 0) {
       const matches = query.tags.filter(tag =>
         agent.tags.some(at => at.toLowerCase().includes(tag.toLowerCase()))
       );
       if (matches.length > 0) {
-        score += 0.2 * (matches.length / query.tags.length);
+        score += 0.15 * (matches.length / query.tags.length);
         reasons.push(`Tags: ${matches.join(", ")}`);
       }
     }
 
+    // Skills match
     if (query.skills && query.skills.length > 0) {
       const matches = query.skills.filter(skillId =>
         agent.skills.some(s => s.id === skillId || s.tags.some(t => t.includes(skillId)))
       );
       if (matches.length > 0) {
-        score += 0.15 * (matches.length / query.skills.length);
+        score += 0.1 * (matches.length / query.skills.length);
         reasons.push(`Skills: ${matches.join(", ")}`);
       }
     }
 
+    // Geo proximity — closer agents rank higher
     if (query.location && agent.location) {
       const dist = haversine(
         query.location.lat, query.location.lng,
@@ -938,11 +1042,11 @@ class MarketplaceRegistry {
       );
       const maxDist = query.maxDistanceKm || 20;
       const distScore = Math.max(0, 1 - dist / maxDist);
-      score += 0.2 * distScore;
+      score += 0.15 * distScore;
       if (dist < 5) reasons.push(`${dist.toFixed(1)} km unna`);
     }
 
-    score += 0.1 * agent.trustScore;
+    score += 0.05 * agent.trustScore;
     if (agent.trustScore > 0.8) reasons.push("HÃ¸y tillitsscore");
 
     if (agent.isVerified) {
