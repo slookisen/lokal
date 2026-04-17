@@ -33,7 +33,8 @@ function slugify(text: string): string {
 }
 
 function escapeHtml(text: string): string {
-  return text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
+  if (!text) return "";
+  return String(text).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
     .replace(/"/g, "&quot;").replace(/'/g, "&#39;");
 }
 
@@ -1254,17 +1255,20 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
     if (k.email) contactItems.push(`<div class="ct-item"><div class="ct-icon">&#9993;</div><div><div class="ct-label">E-post</div><div class="ct-val"><a href="mailto:${k.email}">${escapeHtml(k.email)}</a></div></div></div>`);
     if (k.website) contactItems.push(`<div class="ct-item"><div class="ct-icon">&#127760;</div><div><div class="ct-label">Nettside</div><div class="ct-val"><a href="${escapeHtml(k.website)}" target="_blank" rel="noopener">${escapeHtml(k.website.replace(/^https?:\/\//, ""))}</a></div></div></div>`);
 
-    // Products — guard against string data (some agents have free-text instead of array)
+    // Products — guard against string data (some agents have free-text or plain string arrays)
     const productsList = Array.isArray(k.products) ? k.products : [];
     const productsHtml = productsList.length
       ? productsList.map((p: any) => {
-          const months = p.months || p.seasonMonths || [];
-          const seasonal = p.seasonal && months.length
+          // Handle both object products ({name, category, price}) and plain strings ("brød")
+          const name = typeof p === "string" ? p : (p.name || "");
+          if (!name) return "";
+          const months = (typeof p === "object" && (p.months || p.seasonMonths)) || [];
+          const seasonal = typeof p === "object" && p.seasonal && months.length
             ? `<span class="prod-season">${months.map((m: number) => MONTH_NAMES[m] || m).join("\u2013")}</span>` : "";
-          const org = p.organic ? `<span class="prod-org">&#127793; \u00d8ko</span>` : "";
-          const price = p.price ? `<span class="prod-price">${escapeHtml(String(p.price))}${p.priceUnit && p.priceUnit !== 'kr' ? ' ' + escapeHtml(p.priceUnit) : ''}</span>` : "";
-          return `<div class="prod-item"><span class="prod-name">${escapeHtml(p.name)}</span>${price}<div class="prod-meta">${seasonal}${org}</div></div>`;
-        }).join("") : "";
+          const org = typeof p === "object" && p.organic ? `<span class="prod-org">&#127793; \u00d8ko</span>` : "";
+          const price = typeof p === "object" && p.price ? `<span class="prod-price">${escapeHtml(String(p.price))}${p.priceUnit && p.priceUnit !== 'kr' ? ' ' + escapeHtml(p.priceUnit) : ''}</span>` : "";
+          return `<div class="prod-item"><span class="prod-name">${escapeHtml(name)}</span>${price}<div class="prod-meta">${seasonal}${org}</div></div>`;
+        }).filter(Boolean).join("") : "";
 
     // Opening hours — guard against string data (some agents have free-text like "Man-Fre 10-17")
     const today = new Date().toLocaleDateString("en-US", { weekday: "long" }).toLowerCase();
