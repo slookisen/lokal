@@ -154,20 +154,6 @@
     .profile-section h3 { font-size: 0.95rem; color: var(--forest); margin-bottom: 0.25rem; }
     .profile-section .section-hint { font-size: 0.8rem; color: var(--gray-500); margin-bottom: 0.75rem; }
 
-    /* ── Image upload ── */
-    .upload-zone { border: 2px dashed var(--gray-300); border-radius: var(--radius); padding: 2rem; text-align: center; cursor: pointer; transition: all 0.2s; background: var(--gray-50); }
-    .upload-zone:hover, .upload-zone.drag-over { border-color: var(--forest); background: var(--green-light); }
-    .upload-zone-icon { font-size: 2rem; margin-bottom: 0.5rem; }
-    .upload-zone-text { font-size: 0.9rem; color: var(--gray-500); }
-    .upload-zone-text strong { color: var(--forest); }
-    .image-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(140px, 1fr)); gap: 0.75rem; margin-top: 1rem; }
-    .image-card { position: relative; border-radius: var(--radius); overflow: hidden; border: 1px solid var(--gray-200); background: white; }
-    .image-card img { width: 100%; height: 120px; object-fit: cover; display: block; }
-    .image-card .image-remove { position: absolute; top: 4px; right: 4px; background: rgba(0,0,0,0.6); color: white; border: none; border-radius: 50%; width: 24px; height: 24px; font-size: 0.7rem; cursor: pointer; display: flex; align-items: center; justify-content: center; }
-    .image-card .image-remove:hover { background: var(--red); }
-    .image-card .image-label { padding: 6px 8px; font-size: 0.75rem; color: var(--gray-500); }
-    .image-scan-bar { display: flex; gap: 0.5rem; align-items: center; margin-top: 0.75rem; padding: 0.75rem; background: var(--blue-light); border-radius: var(--radius); }
-    .image-scan-bar p { font-size: 0.85rem; color: var(--blue); flex: 1; }
 
     /* ── Quick-fill wizard ── */
     .quickfill-card { background: linear-gradient(135deg, #f0fdf4 0%, #eff6ff 100%); border: 1px solid #bbf7d0; border-radius: var(--radius); padding: 1.25rem; margin-bottom: 1rem; }
@@ -401,7 +387,6 @@
       <!-- Tabs -->
       <div class="tabs" id="dashTabs">
         <button class="tab active" data-tab="profile" data-i18n="tab_profile">Profil</button>
-        <button class="tab" data-tab="images" data-i18n="tab_images">Bilder</button>
         <button class="tab" data-tab="products" data-i18n="tab_products">Produkter</button>
         <button class="tab" data-tab="hours" data-i18n="tab_hours">Åpningstider</button>
         <button class="tab" data-tab="settings" data-i18n="tab_settings">Innstillinger</button>
@@ -542,56 +527,6 @@
         </div>
       </div>
 
-      <!-- ── Tab: Images ── -->
-      <div class="tab-panel" id="panel-images">
-        <div class="card">
-          <h2>Bilder av butikk og produkter</h2>
-          <p style="color: var(--gray-500); font-size: 0.9rem; margin-bottom: 1rem;">
-            Last opp bilder av butikken din, produkter eller prislistetavler.
-            Bildene vises p&aring; profilen din og hjelper kunder &aring; kjenne deg igjen.
-          </p>
-
-          <div class="upload-zone" id="imageUploadZone">
-            <div class="upload-zone-icon">&#128247;</div>
-            <div class="upload-zone-text">
-              <strong>Trykk her</strong> eller dra bilder hit<br>
-              <span style="font-size: 0.8rem;">JPG, PNG &mdash; maks 5 MB per bilde</span>
-            </div>
-            <input type="file" id="imageFileInput" multiple accept="image/*" style="display: none;" />
-          </div>
-
-          <div class="image-grid" id="imageGrid"></div>
-
-          <div style="margin-top: 1rem;">
-            <button class="btn btn-primary" id="btnSaveImages">Lagre bilder</button>
-          </div>
-        </div>
-
-        <!-- AI product extraction guide -->
-        <div class="card" style="margin-top: 1rem; background: var(--cream);">
-          <h3 style="margin-bottom: 0.5rem;">Legg til produkter raskt med AI</h3>
-          <p style="font-size: 0.9rem; color: var(--gray-600); margin-bottom: 1rem;">
-            Har du bilde av pristavle, meny eller produkthylle? La en AI lese ut produktene for deg:
-          </p>
-          <ol style="font-size: 0.9rem; color: var(--gray-600); margin: 0 0 1rem 1.25rem; line-height: 1.8;">
-            <li>&Aring;pne <a href="https://claude.ai" target="_blank" rel="noopener" style="color: var(--green); font-weight: 600;">Claude</a> eller <a href="https://chat.openai.com" target="_blank" rel="noopener" style="color: var(--green); font-weight: 600;">ChatGPT</a></li>
-            <li>Last opp bildet ditt og skriv: <em>&laquo;List alle produkter med priser. Format: Navn | Kategori | Pris | Sesong&raquo;</em></li>
-            <li>Kopier svaret og lim inn i <strong>Produkter</strong>-fanen under &laquo;Lim inn mange produkter samtidig&raquo;</li>
-          </ol>
-          <p style="font-size: 0.8rem; color: var(--gray-500);">
-            Produktene du legger til blir synlige for AI-assistenter som anbefaler deg til kunder.
-          </p>
-        </div>
-        <!-- Hidden elements for backward compatibility -->
-        <div class="hidden" id="imageScanBar"></div>
-        <div class="hidden" id="extractedProductsCard">
-          <div id="extractedProductsList"></div>
-          <button class="hidden" id="btnScanImages"></button>
-          <button class="hidden" id="btnAddExtracted"></button>
-          <button class="hidden" id="btnDismissExtracted"></button>
-        </div>
-      </div>
-
       <!-- ── Tab: Products ── -->
       <div class="tab-panel" id="panel-products">
         <div class="card">
@@ -606,6 +541,22 @@
           <ul class="product-list" id="productList">
             <li style="text-align: center; color: var(--gray-500); padding: 2rem;" data-i18n="no_products">Ingen produkter lagt til enn&aring;</li>
           </ul>
+        </div>
+
+        <!-- AI product tip -->
+        <div class="card" style="margin-top: 1rem; background: var(--cream); border-color: var(--orange-light);">
+          <h3 style="margin-bottom: 0.5rem; color: var(--forest);">Legg til produkter raskt med AI</h3>
+          <p style="font-size: 0.9rem; color: var(--gray-700); margin-bottom: 1rem;">
+            Har du bilde av pristavle, meny eller produkthylle? La en AI lese ut produktene for deg:
+          </p>
+          <ol style="font-size: 0.85rem; color: var(--gray-700); padding-left: 1.25rem; margin-bottom: 1rem; line-height: 1.8;">
+            <li>&Aring;pne <a href="https://claude.ai" target="_blank" rel="noopener" style="color: var(--forest); font-weight: 600;">Claude</a> eller <a href="https://chatgpt.com" target="_blank" rel="noopener" style="color: var(--forest); font-weight: 600;">ChatGPT</a></li>
+            <li>Last opp bildet ditt og skriv: &laquo;<em>List alle produkter med priser. Format: Navn | Kategori | Pris | Sesong</em>&raquo;</li>
+            <li>Kopier svaret og lim inn under i &laquo;<strong>Lim inn mange produkter samtidig</strong>&raquo;</li>
+          </ol>
+          <p style="font-size: 0.8rem; color: var(--gray-500);">
+            Produktene du legger til blir synlige for AI-assistenter som anbefaler deg til kunder.
+          </p>
         </div>
 
         <!-- Bulk paste from AI -->
@@ -1216,7 +1167,6 @@
       state.agentId = null;
       state.agent = null;
       state.knowledge = null;
-      state.images = [];
       show('viewClaim');
       hide('viewDashboard');
       hide('btnLogout');
@@ -1369,10 +1319,6 @@
         setCheckboxGroup('profilePayment', knowledge.paymentMethods || []);
         setCheckboxGroup('profileDelivery', knowledge.deliveryOptions || []);
 
-        // Load images
-        state.images = knowledge.images || [];
-        renderImages();
-
         state.products = knowledge.products || [];
         renderProducts();
         renderHours(knowledge.openingHours || []);
@@ -1453,9 +1399,6 @@
       groups.forEach(function(gid) { fields++; if (getCheckboxValues(gid).length > 0) filled++; });
       // Products
       fields++; if (state.products && state.products.length > 0) filled++;
-      // Images
-      fields++; if (state.images && state.images.length > 0) filled++;
-
       var pct = Math.round((filled / fields) * 100);
       var fillEl = document.getElementById('completionFill');
       var pctEl = document.getElementById('completionPercent');
@@ -1997,240 +1940,6 @@
           }
         }
       });
-    });
-
-    // ═══════════ IMAGE UPLOAD ═══════════
-    if (!state.images) state.images = [];
-
-    var uploadZone = document.getElementById('imageUploadZone');
-    var fileInput = document.getElementById('imageFileInput');
-
-    uploadZone.addEventListener('click', function() { fileInput.click(); });
-    uploadZone.addEventListener('dragover', function(e) { e.preventDefault(); this.classList.add('drag-over'); });
-    uploadZone.addEventListener('dragleave', function() { this.classList.remove('drag-over'); });
-    uploadZone.addEventListener('drop', function(e) {
-      e.preventDefault();
-      this.classList.remove('drag-over');
-      handleImageFiles(e.dataTransfer.files);
-    });
-    fileInput.addEventListener('change', function() {
-      handleImageFiles(this.files);
-      this.value = '';
-    });
-
-    function handleImageFiles(files) {
-      Array.from(files).forEach(function(file) {
-        if (!file.type.startsWith('image/')) return;
-        if (file.size > 5 * 1024 * 1024) {
-          showAlert('dashAlert', 'Bildet «' + escHtml(file.name) + '» er for stort (maks 5 MB).', 'error');
-          return;
-        }
-        var reader = new FileReader();
-        reader.onload = function(e) {
-          state.images.push({
-            data: e.target.result,
-            name: file.name,
-            addedAt: new Date().toISOString()
-          });
-          renderImages();
-          updateCompletion();
-        };
-        reader.readAsDataURL(file);
-      });
-    }
-
-    function renderImages() {
-      var grid = document.getElementById('imageGrid');
-      var scanBar = document.getElementById('imageScanBar');
-      if (!grid) return;
-      grid.innerHTML = '';
-
-      if (state.images.length === 0) {
-        if (scanBar) scanBar.classList.add('hidden');
-        return;
-      }
-
-      if (scanBar) scanBar.classList.remove('hidden');
-
-      state.images.forEach(function(img, i) {
-        var card = document.createElement('div');
-        card.className = 'image-card';
-
-        var imgEl = document.createElement('img');
-        imgEl.src = typeof img === 'string' ? img : img.data;
-        imgEl.alt = typeof img === 'string' ? 'Bilde ' + (i + 1) : (img.name || 'Bilde ' + (i + 1));
-
-        var removeBtn = document.createElement('button');
-        removeBtn.className = 'image-remove';
-        removeBtn.textContent = '\u2715';
-        removeBtn.addEventListener('click', function() {
-          state.images.splice(i, 1);
-          renderImages();
-          updateCompletion();
-        });
-
-        var label = document.createElement('div');
-        label.className = 'image-label';
-        label.textContent = typeof img === 'string' ? 'Bilde ' + (i + 1) : (img.name || 'Bilde ' + (i + 1));
-
-        card.appendChild(imgEl);
-        card.appendChild(removeBtn);
-        card.appendChild(label);
-        grid.appendChild(card);
-      });
-    }
-
-    // Save images
-    document.getElementById('btnSaveImages').addEventListener('click', async function() {
-      this.disabled = true;
-      // Convert image objects to data URLs for storage
-      var imageUrls = state.images.map(function(img) {
-        return typeof img === 'string' ? img : img.data;
-      });
-      try {
-        var res = await api('/agents/' + state.agentId + '/knowledge', {
-          method: 'PUT',
-          body: JSON.stringify({ images: imageUrls })
-        });
-        if (res.success) {
-          state.knowledge = Object.assign(state.knowledge || {}, { images: imageUrls });
-          var iBtn = document.getElementById('btnSaveImages');
-          var iOrig = iBtn.textContent;
-          iBtn.textContent = '\u2705 Lagret!';
-          iBtn.style.background = 'var(--green)';
-          setTimeout(function() { iBtn.textContent = iOrig; iBtn.style.background = ''; }, 2500);
-          showAlert('dashAlert', 'Bilder lagret!', 'success');
-        } else {
-          showAlert('dashAlert', res.error || 'Feil ved lagring', 'error');
-        }
-      } catch (err) {
-        showAlert('dashAlert', err.message, 'error');
-      }
-      this.disabled = false;
-    });
-
-    // Scan images for product info (client-side heuristic + prompt generator)
-    // Scan images — copy/paste workflow with AI prompt
-    document.getElementById('btnScanImages').addEventListener('click', function() {
-      if (state.images.length === 0) return;
-      var extractCard = document.getElementById('extractedProductsCard');
-      var listEl = document.getElementById('extractedProductsList');
-
-      var promptText = 'Se p\u00e5 dette bildet fra en norsk matbutikk/g\u00e5rd. List opp ALLE produkter du ser med priser.\n\n' +
-        'Svar i dette formatet, \u00e9n per linje:\n' +
-        'Produktnavn | Kategori | Pris (hvis synlig)\n\n' +
-        'Gyldige kategorier: vegetables, fruit, berries, dairy, eggs, meat, fish, bread, honey, herbs, other\n\n' +
-        'Eksempel:\n' +
-        'Gulr\u00f8tter | vegetables | 35kr/kg\n' +
-        'Honning 500g | honey | 120kr\n' +
-        'Sm\u00f8rbrukost | dairy | 89kr';
-
-      listEl.innerHTML =
-        '<div style="margin-bottom:1.25rem; padding:1rem; background:var(--cream); border-radius:var(--radius);">' +
-          '<p style="font-size:0.9rem;color:var(--gray-700);margin-bottom:0.75rem;"><strong>Steg 1:</strong> Kopier teksten under. \u00c5pne <a href="https://claude.ai" target="_blank" style="color:var(--forest);font-weight:600;">Claude</a> eller <a href="https://chatgpt.com" target="_blank" style="color:var(--forest);font-weight:600;">ChatGPT</a>, last opp bildene dine der, og lim inn teksten.</p>' +
-          '<textarea id="scanPromptText" style="width:100%;padding:0.6rem;border:1px solid var(--gray-300);border-radius:var(--radius);font-size:0.85rem;min-height:70px;font-family:inherit;background:white;" readonly>' + promptText + '</textarea>' +
-          '<button class="btn btn-secondary btn-small" style="margin-top:0.5rem;" id="btnCopyPrompt">Kopier tekst</button>' +
-        '</div>' +
-        '<div>' +
-          '<p style="font-size:0.9rem;color:var(--gray-700);margin-bottom:0.5rem;"><strong>Steg 2:</strong> Lim inn svaret du fikk tilbake her:</p>' +
-          '<textarea id="scanResultText" style="width:100%;padding:0.6rem;border:1px solid var(--gray-300);border-radius:var(--radius);font-size:0.85rem;min-height:80px;font-family:inherit;" placeholder="Lim inn svaret fra AI-en her..."></textarea>' +
-          '<button class="btn btn-primary btn-small" style="margin-top:0.5rem;" id="btnParseResult">Hent produkter fra tekst</button>' +
-        '</div>';
-
-      extractCard.classList.remove('hidden');
-      extractCard.scrollIntoView({ behavior: 'smooth', block: 'center' });
-
-      document.getElementById('btnCopyPrompt').addEventListener('click', function() {
-        var ta = document.getElementById('scanPromptText');
-        ta.select();
-        document.execCommand('copy');
-        this.textContent = 'Kopiert!';
-        var self = this;
-        setTimeout(function() { self.textContent = 'Kopier tekst'; }, 2000);
-      });
-
-      document.getElementById('btnParseResult').addEventListener('click', function() {
-        var text = document.getElementById('scanResultText').value.trim();
-        if (!text) return;
-        // Parse pipe-delimited format
-        var lines = text.split('\n').filter(function(l) { return l.trim() && l.indexOf('|') >= 0; });
-        var products = [];
-        lines.forEach(function(line) {
-          var parts = line.split('|').map(function(p) { return p.trim(); });
-          if (parts.length >= 2) {
-            var name = parts[0].replace(/^[-*\d.)\s]+/, '').trim();
-            if (!name || name.toLowerCase() === 'produktnavn') return; // Skip header
-            var cat = (parts[1] || 'other').toLowerCase().trim();
-            var priceRaw = parts[2] ? parts[2].trim() : '';
-            var validCats = ['vegetables','fruit','berries','dairy','eggs','meat','fish','bread','honey','herbs','other'];
-            if (validCats.indexOf(cat) < 0) cat = 'other';
-            products.push({ name: name, category: cat, price: priceRaw || null, unit: null });
-          }
-        });
-        if (products.length > 0) {
-          showExtractedProducts(products);
-        } else {
-          showAlert('dashAlert', 'Kunne ikke finne produkter i teksten. S\u00f8rg for at formatet har | mellom feltene.', 'error');
-        }
-      });
-    });
-
-    function showExtractedProducts(products) {
-      var extractCard = document.getElementById('extractedProductsCard');
-      var listEl = document.getElementById('extractedProductsList');
-      listEl.innerHTML = '<div style="margin-bottom:1rem;">' +
-        '<p style="font-size:0.9rem;color:var(--green);font-weight:500;">Fant ' + products.length + ' produkter!</p>' +
-        '</div>';
-
-      state.extractedProducts = products;
-
-      products.forEach(function(p, i) {
-        var div = document.createElement('div');
-        div.style.cssText = 'display:flex;align-items:center;gap:8px;padding:8px 0;border-bottom:1px solid var(--gray-100);';
-        var priceText = p.price ? p.price + (p.unit ? '/' + p.unit : '') : '';
-        div.innerHTML =
-          '<label style="display:flex;align-items:center;gap:6px;flex:1;cursor:pointer;">' +
-            '<input type="checkbox" checked data-extracted-idx="' + i + '" style="width:auto;"> ' +
-            '<span style="font-weight:500;">' + (p.name || '') + '</span>' +
-            '<span style="font-size:0.8rem;color:var(--gray-500);"> \u2022 ' + (p.category || 'other') + '</span>' +
-            (priceText ? '<span style="font-size:0.8rem;color:var(--forest);font-weight:500;margin-left:auto;">' + priceText + '</span>' : '') +
-          '</label>';
-        listEl.appendChild(div);
-      });
-
-      extractCard.classList.remove('hidden');
-      extractCard.scrollIntoView({ behavior: 'smooth', block: 'center' });
-    }
-
-    document.getElementById('btnAddExtracted').addEventListener('click', function() {
-      if (!state.extractedProducts) return;
-      var added = 0;
-      state.extractedProducts.forEach(function(p, i) {
-        var cb = document.querySelector('[data-extracted-idx="' + i + '"]');
-        if (cb && cb.checked) {
-          var product = {
-            name: p.name,
-            category: p.category || 'other',
-            price: p.price || undefined,
-            priceUnit: p.unit ? 'kr/' + p.unit : 'kr',
-          };
-          state.products.push(product);
-          added++;
-        }
-      });
-      if (added > 0) {
-        saveProducts();
-        showAlert('dashAlert', added + ' produkt(er) lagt til i katalogen!', 'success');
-        // Switch to products tab
-        document.querySelector('[data-tab="products"]').click();
-      }
-      document.getElementById('extractedProductsCard').classList.add('hidden');
-      state.extractedProducts = null;
-    });
-
-    document.getElementById('btnDismissExtracted').addEventListener('click', function() {
-      document.getElementById('extractedProductsCard').classList.add('hidden');
-      state.extractedProducts = null;
     });
 
     // ═══════════ QUICK-FILL ═══════════

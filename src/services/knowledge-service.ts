@@ -120,7 +120,11 @@ class KnowledgeService {
   // ─── Get knowledge for an agent ──────────────────────────
   getKnowledge(agentId: string): AgentKnowledge | null {
     const db = getDb();
-    const row = db.prepare("SELECT * FROM agent_knowledge WHERE agent_id = ?").get(agentId) as any;
+    const row = db.prepare(`SELECT agent_id, address, postal_code, website, phone, email,
+      opening_hours, products, about, specialties, certifications, payment_methods,
+      delivery_options, google_rating, google_review_count, tripadvisor_rating,
+      external_reviews, external_links, data_source, auto_sources, last_enriched_at,
+      owner_updated_at, preferences FROM agent_knowledge WHERE agent_id = ?`).get(agentId) as any;
     if (!row) return null;
     return this.rowToKnowledge(row);
   }
