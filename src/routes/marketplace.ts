@@ -1243,7 +1243,7 @@ router.post("/webhooks/inbound-email", async (req: Request, res: Response) => {
           headers: { Authorization: `Bearer ${resendKey}` },
         });
         if (emailRes.ok) {
-          const emailData = await emailRes.json();
+          const emailData = await emailRes.json() as { html?: string; text?: string };
           html = emailData.html || "";
           text = emailData.text || "";
           console.log(`[Inbound] Fetched body for ${emailId} (${html.length} chars HTML, ${text.length} chars text)`);
