@@ -564,55 +564,72 @@ router.get("/", (_req: Request, res: Response) => {
           <div class="sh-title">Lokal i tall</div>
           <div class="sh-sub">Ekte besøk og AI-spørringer \u2014 ingen annonserte tall</div>
         </div>
-        <div class="traffic-grid">
+        <div class="traffic-grid" id="traffic-grid">
           <div class="traffic-card">
             <div class="traffic-card-label">Siden lansering</div>
             <div class="traffic-row">
               <span class="traffic-row-label"><span class="traffic-dot traffic-dot-human"></span> Mennesker</span>
-              <span class="traffic-val">${traffic.humanTotal.toLocaleString("nb-NO")}</span>
+              <span class="traffic-val" id="ts-human-total">${traffic.humanTotal.toLocaleString("nb-NO")}</span>
             </div>
             <div class="traffic-row">
               <span class="traffic-row-label"><span class="traffic-dot traffic-dot-ai"></span> AI-sp\u00f8rringer</span>
-              <span class="traffic-val">${traffic.aiTotal.toLocaleString("nb-NO")}</span>
+              <span class="traffic-val" id="ts-ai-total">${traffic.aiTotal.toLocaleString("nb-NO")}</span>
             </div>
             <div class="traffic-total">
               <span class="traffic-total-label">Totalt</span>
-              <span class="traffic-total-val">${(traffic.humanTotal + traffic.aiTotal).toLocaleString("nb-NO")}</span>
+              <span class="traffic-total-val" id="ts-combined-total">${(traffic.humanTotal + traffic.aiTotal).toLocaleString("nb-NO")}</span>
             </div>
           </div>
           <div class="traffic-card">
             <div class="traffic-card-label">Siste 7 dager</div>
             <div class="traffic-row">
               <span class="traffic-row-label"><span class="traffic-dot traffic-dot-human"></span> Mennesker</span>
-              <span class="traffic-val">${traffic.humanWeek.toLocaleString("nb-NO")}</span>
+              <span class="traffic-val" id="ts-human-week">${traffic.humanWeek.toLocaleString("nb-NO")}</span>
             </div>
             <div class="traffic-row">
               <span class="traffic-row-label"><span class="traffic-dot traffic-dot-ai"></span> AI-sp\u00f8rringer</span>
-              <span class="traffic-val">${traffic.aiWeek.toLocaleString("nb-NO")}</span>
+              <span class="traffic-val" id="ts-ai-week">${traffic.aiWeek.toLocaleString("nb-NO")}</span>
             </div>
             <div class="traffic-total">
               <span class="traffic-total-label">Totalt</span>
-              <span class="traffic-total-val">${(traffic.humanWeek + traffic.aiWeek).toLocaleString("nb-NO")}</span>
+              <span class="traffic-total-val" id="ts-combined-week">${(traffic.humanWeek + traffic.aiWeek).toLocaleString("nb-NO")}</span>
             </div>
           </div>
           <div class="traffic-card">
             <div class="traffic-card-label">Siste 24 timer</div>
             <div class="traffic-row">
               <span class="traffic-row-label"><span class="traffic-dot traffic-dot-human"></span> Mennesker</span>
-              <span class="traffic-val">${traffic.humanDay.toLocaleString("nb-NO")}</span>
+              <span class="traffic-val" id="ts-human-day">${traffic.humanDay.toLocaleString("nb-NO")}</span>
             </div>
             <div class="traffic-row">
               <span class="traffic-row-label"><span class="traffic-dot traffic-dot-ai"></span> AI-sp\u00f8rringer</span>
-              <span class="traffic-val">${traffic.aiDay.toLocaleString("nb-NO")}</span>
+              <span class="traffic-val" id="ts-ai-day">${traffic.aiDay.toLocaleString("nb-NO")}</span>
             </div>
             <div class="traffic-total">
               <span class="traffic-total-label">Totalt</span>
-              <span class="traffic-total-val">${(traffic.humanDay + traffic.aiDay).toLocaleString("nb-NO")}</span>
+              <span class="traffic-total-val" id="ts-combined-day">${(traffic.humanDay + traffic.aiDay).toLocaleString("nb-NO")}</span>
             </div>
           </div>
         </div>
       </div>
     </section>
+    <script>
+      (function() {
+        function fmt(n) { return n.toLocaleString("nb-NO"); }
+        fetch("/api/traffic-stats").then(function(r) { return r.json(); }).then(function(d) {
+          var set = function(id, v) { var el = document.getElementById(id); if (el) el.textContent = fmt(v); };
+          set("ts-human-total", d.human.total);
+          set("ts-ai-total", d.ai.total);
+          set("ts-combined-total", d.combined.total);
+          set("ts-human-week", d.human.last7days);
+          set("ts-ai-week", d.ai.last7days);
+          set("ts-combined-week", d.combined.last7days);
+          set("ts-human-day", d.human.last24hours);
+          set("ts-ai-day", d.ai.last24hours);
+          set("ts-combined-day", d.combined.last24hours);
+        }).catch(function() {});
+      })();
+    </script>
 
     <section class="seller-cta">
       <h2>Er du matprodusent?</h2>
