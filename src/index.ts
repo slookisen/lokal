@@ -108,6 +108,8 @@ app.get("/openapi.yaml", (_req, res) => {
 });
 
 // ─── Health check ────────────────────────────────────────────
+const BOOT_TIME = new Date().toISOString();
+
 app.get("/health", (_req, res) => {
   const startMs = Date.now();
   try {
@@ -167,6 +169,7 @@ app.get("/health", (_req, res) => {
       version: "1.0.0",
       uptime: uptimeSec,
       uptimeHuman: `${Math.floor(uptimeSec / 3600)}h ${Math.floor((uptimeSec % 3600) / 60)}m`,
+      bootedAt: BOOT_TIME,
       timestamp: new Date().toISOString(),
       memory: {
         rssMb: memUsedMb,
