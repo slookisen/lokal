@@ -285,7 +285,15 @@ interface TrafficStats {
   aiDay: number;
 }
 
+let _trafficCache: TrafficStats | null = null;
+let _trafficCacheTime = 0;
+const TRAFFIC_CACHE_TTL = 120_000; // 2 minutes
+
 function getTrafficStats(): TrafficStats {
+  const now = Date.now();
+  if (_trafficCache && (now - _trafficCacheTime) < TRAFFIC_CACHE_TTL) {
+    return _trafficCache;
+  }
   try {
     const db = getDb();
     const now = new Date();
@@ -301,7 +309,9 @@ function getTrafficStats(): TrafficStats {
     const aiWeek = (db.prepare(`SELECT COUNT(*) as n FROM analytics_queries WHERE ${notOwner} AND created_at >= ?`).get(ago7d) as any)?.n ?? 0;
     const aiDay = (db.prepare(`SELECT COUNT(*) as n FROM analytics_queries WHERE ${notOwner} AND created_at >= ?`).get(ago24h) as any)?.n ?? 0;
 
-    return { humanTotal, humanWeek, humanDay, aiTotal, aiWeek, aiDay };
+    _trafficCache = { humanTotal, humanWeek, humanDay, aiTotal, aiWeek, aiDay };
+    _trafficCacheTime = Date.now();
+    return _trafficCache;
   } catch {
     return { humanTotal: 0, humanWeek: 0, humanDay: 0, aiTotal: 0, aiWeek: 0, aiDay: 0 };
   }

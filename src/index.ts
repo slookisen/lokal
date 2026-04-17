@@ -180,21 +180,8 @@ if (existingAgentCount === 0) {
 } else {
   console.log(`✅ Database already has ${existingAgentCount} agents — skipping seed`);
 
-  // Run deduplication on existing data (one-time cleanup for the 429→370 issue)
-  const dupeCount = (db.prepare(`
-    SELECT COUNT(*) as c FROM agents WHERE id NOT IN (
-      SELECT MIN(id) FROM agents GROUP BY name, city
-    )
-  `).get() as any).c;
-
-  if (dupeCount > 0) {
-    db.prepare(`
-      DELETE FROM agents WHERE id NOT IN (
-        SELECT MIN(id) FROM agents GROUP BY name, city
-      )
-    `).run();
-    console.log(`🧹 Cleaned up ${dupeCount} duplicate agents from previous restarts`);
-  }
+  // Deduplication removed — data is already clean after initial cleanup.
+  // Keeping the seed-path dedup for fresh databases only.
 
   // Enrich knowledge if not already done
   if (seedKnowledge) {
@@ -206,13 +193,9 @@ if (existingAgentCount === 0) {
   }
 }
 
-// ─── Recalculate trust scores on boot ────────────────────────
-// Every deploy gets fresh scores reflecting current data.
-// This replaces the static 0.5 default with real calculations.
-console.log("📊 Recalculating trust scores...");
-const trustResult = trustScoreService.recalculateAll();
-console.log(`   ✅ Updated ${trustResult.updated} agents (avg: ${Math.round(trustResult.avgScore * 100)}%)`);
-
+// ─── Recalculate trust scores AFTER server starts ────────────
+// Deferred to avoid blocking startup. Existing scores remain valid
+// until recalc completes (typically a few seconds after boot).
 // ─── Start ───────────────────────────────────────────────────
 const BASE_URL = process.env.BASE_URL || `http://localhost:${PORT}`;
 
@@ -233,9 +216,26 @@ app.listen(Number(PORT), HOST, async () => {
   console.log(`   MCP HTTP:      POST ${BASE_URL}/mcp (for ChatGPT & remote clients)`);
   console.log(`\n   ── Discovery ────────────────────────────────`);
 
-  // Initialize discovery service (registers with A2A registries if public URL)
-  await discoveryService.initialize(BASE_URL);
+  // Initialize discovery service in background (non-blocking)
+  // Registry registration involves network calls that can be slow/timeout
+  discoveryService.initialize(BASE_URL).then(() => {
+    console.log("[Discovery] Initialization complete");
+  }).catch((err) => {
+    console.warn("[Discovery] Initialization failed (non-fatal):", err);
+  });
   console.log("");
+
+  // Recalculate trust scores in background (non-blocking)
+  // Uses setTimeout(0) so the event loop can handle incoming requests first.
+  setTimeout(() => {
+    try {
+      console.log("📊 Recalculating trust scores (background)...");
+      const trustResult = trustScoreService.recalculateAll();
+      console.log(`   ✅ Updated ${trustResult.updated} agents (avg: ${Math.round(trustResult.avgScore * 100)}%)`);
+    } catch (err) {
+      console.error("Trust recalc failed (non-fatal):", err);
+    }
+  }, 2000); // 2 second delay — let health checks pass first
 });
 
 // ─── Graceful shutdown ───────────────────────────────────────

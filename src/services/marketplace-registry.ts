@@ -21,6 +21,20 @@ import {
 //   - Prepared statements for performance
 
 class MarketplaceRegistry {
+  // ─── In-memory cache ──────────────────────────────────────────
+  // Avoids re-querying + JSON.parse() on 1100+ agents per request.
+  // Cache invalidated on register/update/deactivate. TTL as fallback.
+  private _agentsCache: RegisteredAgent[] | null = null;
+  private _agentsCacheTime = 0;
+  private _statsCache: { totalAgents: number; activeProducers: number; cities: string[]; totalListings: number } | null = null;
+  private _statsCacheTime = 0;
+  private static CACHE_TTL = 60_000; // 60 seconds
+
+  private invalidateCache() {
+    this._agentsCache = null;
+    this._statsCache = null;
+  }
+
   // â”€â”€â”€ Registration â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
   register(registration: AgentRegistration): RegisteredAgent {
@@ -70,6 +84,7 @@ class MarketplaceRegistry {
       now,
     );
 
+    this.invalidateCache();
     return this.rowToAgent(db.prepare("SELECT * FROM agents WHERE id = ?").get(id) as any)!;
   }
 
@@ -619,6 +634,7 @@ class MarketplaceRegistry {
 
     values.push(id);
     db.prepare(`UPDATE agents SET ${setClauses.join(", ")} WHERE id = ?`).run(...values);
+    this.invalidateCache();
     return this.getAgent(id);
   }
 
@@ -630,6 +646,7 @@ class MarketplaceRegistry {
   deactivate(id: string): boolean {
     const db = getDb();
     const result = db.prepare("UPDATE agents SET is_active = 0 WHERE id = ?").run(id);
+    this.invalidateCache();
     return result.changes > 0;
   }
 
@@ -640,24 +657,36 @@ class MarketplaceRegistry {
   }
 
   getActiveAgents(): RegisteredAgent[] {
+    const now = Date.now();
+    if (this._agentsCache && (now - this._agentsCacheTime) < MarketplaceRegistry.CACHE_TTL) {
+      return this._agentsCache;
+    }
     const db = getDb();
     const rows = db.prepare("SELECT * FROM agents WHERE is_active = 1 ORDER BY trust_score DESC, created_at DESC").all() as any[];
-    return rows.map(r => this.rowToAgent(r)!);
+    this._agentsCache = rows.map(r => this.rowToAgent(r)!);
+    this._agentsCacheTime = now;
+    return this._agentsCache;
   }
 
   getStats(): { totalAgents: number; activeProducers: number; cities: string[]; totalListings: number } {
+    const now = Date.now();
+    if (this._statsCache && (now - this._statsCacheTime) < MarketplaceRegistry.CACHE_TTL) {
+      return this._statsCache;
+    }
     const db = getDb();
     const total = (db.prepare("SELECT COUNT(*) as c FROM agents").get() as any).c;
     const activeProducers = (db.prepare("SELECT COUNT(*) as c FROM agents WHERE role = 'producer' AND is_active = 1").get() as any).c;
     const citiesRows = db.prepare("SELECT DISTINCT city FROM agents WHERE city IS NOT NULL").all() as any[];
     const totalListings = (db.prepare("SELECT COUNT(*) as c FROM listings").get() as any).c;
 
-    return {
+    this._statsCache = {
       totalAgents: total,
       activeProducers,
       cities: citiesRows.map(r => r.city),
       totalListings,
     };
+    this._statsCacheTime = now;
+    return this._statsCache;
   }
 
   // â”€â”€â”€ Task lifecycle (A2A Gap 7 fix) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€

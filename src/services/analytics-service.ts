@@ -306,8 +306,12 @@ export class AnalyticsService {
     }
   }
 
+  // ─── Summary cache ───────────────────────────────────────────
+  private _summaryCache: Map<number, { data: any; time: number }> = new Map();
+  private static SUMMARY_CACHE_TTL = 120_000; // 2 minutes
+
   /**
-   * Get analytics summary for a time range
+   * Get analytics summary for a time range (cached 2 min)
    */
   getSummary(hoursBack: number = 24): {
     pageViews: number;
@@ -319,6 +323,11 @@ export class AnalyticsService {
     agentTraffic: { chatgpt: number; claude: number; other: number };
     ownerStats: { pageViews: number; queries: number };
   } {
+    // Check cache first
+    const cached = this._summaryCache.get(hoursBack);
+    if (cached && (Date.now() - cached.time) < AnalyticsService.SUMMARY_CACHE_TTL) {
+      return cached.data;
+    }
     try {
       const db = getDb();
       const cutoff = sqliteDatetime(new Date(Date.now() - hoursBack * 60 * 60 * 1000));
@@ -386,7 +395,7 @@ export class AnalyticsService {
         else agentTraffic.other += row.count;
       });
 
-      return {
+      const result = {
         pageViews,
         uniqueVisitors,
         avgTimeOnSite: 0, // would need session duration tracking
@@ -396,6 +405,8 @@ export class AnalyticsService {
         agentTraffic,
         ownerStats: { pageViews: ownerPageViews, queries: ownerQueries },
       };
+      this._summaryCache.set(hoursBack, { data: result, time: Date.now() });
+      return result;
     } catch (err) {
       console.error("[analytics] Failed to get summary:", err);
       return {
