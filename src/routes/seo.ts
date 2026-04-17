@@ -404,22 +404,6 @@ const LANDING_CSS = `
   .seller-btn { display: inline-block; padding: 14px 36px; background: var(--white); color: var(--green-700); border-radius: 12px; font-weight: 700; font-size: 1rem; border: none; cursor: pointer; transition: all 0.2s; text-decoration: none; }
   .seller-btn:hover { transform: translateY(-2px); box-shadow: 0 8px 20px rgba(0,0,0,0.2); text-decoration: none; }
   .seller-note { display: block; margin-top: 10px; font-size: 0.8rem; opacity: 0.65; }
-  .live-sec { background: var(--g50); padding: 48px 32px; }
-  .live-inner { max-width: 900px; margin: 0 auto; }
-  .live-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 16px; margin-bottom: 24px; }
-  .live-card { background: var(--white); border-radius: var(--r-lg); padding: 22px 18px; text-align: center; border: 1px solid var(--g100); }
-  .live-val { font-size: 1.6rem; font-weight: 800; color: var(--green-700); letter-spacing: -0.5px; line-height: 1; }
-  .live-lbl { font-size: 0.75rem; color: var(--g500); margin-top: 5px; font-weight: 500; }
-  .live-icon { font-size: 1.1rem; margin-bottom: 6px; display: block; }
-  .live-sources { display: flex; justify-content: center; gap: 20px; flex-wrap: wrap; }
-  .live-source { display: flex; align-items: center; gap: 6px; font-size: 0.8rem; color: var(--g500); }
-  .live-dot-green { width: 7px; height: 7px; border-radius: 50%; background: #22c55e; animation: pulse 2s infinite; }
-  .live-dot-blue { width: 7px; height: 7px; border-radius: 50%; background: #3b82f6; }
-  .live-dot-purple { width: 7px; height: 7px; border-radius: 50%; background: #8b5cf6; }
-  .live-dot-orange { width: 7px; height: 7px; border-radius: 50%; background: #f59e0b; }
-  @media (max-width: 768px) {
-    .live-grid { grid-template-columns: repeat(2, 1fr); }
-  }
   .ai-sec { padding: 40px 32px; }
   .ai-banner { max-width: 780px; margin: 0 auto; background: linear-gradient(135deg, #f8f4ff 0%, #f0e8ff 100%); border-radius: var(--r-xl); padding: 32px 36px; display: flex; align-items: center; gap: 28px; border: 1px solid #e8dff5; }
   .ai-icon { width: 56px; height: 56px; border-radius: 14px; background: linear-gradient(135deg, #7c3aed, #4f46e5); display: flex; align-items: center; justify-content: center; font-size: 1.6rem; flex-shrink: 0; }
@@ -496,13 +480,6 @@ router.get("/", (_req: Request, res: Response) => {
 
     const uniqueCities = Object.keys(cityCounts).length;
 
-    // Live traffic stats for social proof (last 7 days, excluding owner)
-    let liveStats = { pageViews: 0, uniqueVisitors: 0, totalQueries: 0, agentTraffic: { chatgpt: 0, claude: 0, other: 0 } };
-    try {
-      liveStats = analyticsService.getSummary(168); // 7 days
-    } catch { /* analytics may not be ready yet */ }
-    const aiQueries = liveStats.agentTraffic.chatgpt + liveStats.agentTraffic.claude + liveStats.agentTraffic.other;
-
     const jsonLd = {
       "@context": "https://schema.org",
       "@type": "WebSite",
@@ -550,42 +527,12 @@ router.get("/", (_req: Request, res: Response) => {
       <div class="cats-grid">${catCards}</div>
     </section>
 
-    <section class="sec">
-      <div class="sh">
-        <div class="sh-label">Utforsk</div>
-        <div class="sh-title">Popul\u00e6re byer</div>
-        <div class="sh-sub">Finn produsenter i n\u00e6rheten av deg</div>
-      </div>
-      <div class="cities-grid">${cityCards}</div>
-    </section>
-
-    <section class="sec" style="background:var(--white);">
-      <div class="sh">
-        <div class="sh-label">Oppdag</div>
-        <div class="sh-title">Produsenter</div>
-        <div class="sh-sub">Norske matprodusenter i nettverket</div>
-      </div>
-      <div class="feat-grid">${featuredCards}</div>
-    </section>
-
-    <section class="sec how-sec">
-      <div class="sh">
-        <div class="sh-label">Slik fungerer det</div>
-        <div class="sh-title">Fra s\u00f8k til g\u00e5rdsbes\u00f8k</div>
-      </div>
-      <div class="how-grid">
-        <div class="how-step"><div class="how-num">1</div><h3>S\u00f8k etter det du vil ha</h3><p>Skriv inn hva du leter etter \u2014 \u00abgrønnsaker i Oslo\u00bb eller \u00ab\u00f8kologisk kj\u00f8tt\u00bb.</p></div>
-        <div class="how-step"><div class="how-num">2</div><h3>Utforsk produsenter</h3><p>Se produkter, \u00e5pningstider, sertifiseringer og kontaktinfo.</p></div>
-        <div class="how-step"><div class="how-num">3</div><h3>Kj\u00f8p direkte</h3><p>Bes\u00f8k g\u00e5rdsbutikken, ring direkte, eller la AI-assistenten din finne det automatisk.</p></div>
-      </div>
-    </section>
-
     <section class="traffic-sec">
       <div class="traffic-inner">
         <div class="sh">
           <div class="sh-label">Plattformaktivitet</div>
-          <div class="sh-title">Lokal i tall</div>
-          <div class="sh-sub">Ekte besøk og AI-spørringer \u2014 ingen annonserte tall</div>
+          <div class="sh-title">Mennesker og AI finner mat her</div>
+          <div class="sh-sub">Ekte bes\u00f8k og AI-sp\u00f8rringer \u2014 ingen oppbl\u00e5ste tall</div>
         </div>
         <div class="traffic-grid" id="traffic-grid">
           <div class="traffic-card">
@@ -654,48 +601,41 @@ router.get("/", (_req: Request, res: Response) => {
       })();
     </script>
 
+    <section class="sec">
+      <div class="sh">
+        <div class="sh-label">Utforsk</div>
+        <div class="sh-title">Popul\u00e6re byer</div>
+        <div class="sh-sub">Finn produsenter i n\u00e6rheten av deg</div>
+      </div>
+      <div class="cities-grid">${cityCards}</div>
+    </section>
+
+    <section class="sec" style="background:var(--white);">
+      <div class="sh">
+        <div class="sh-label">Oppdag</div>
+        <div class="sh-title">Produsenter</div>
+        <div class="sh-sub">Norske matprodusenter i nettverket</div>
+      </div>
+      <div class="feat-grid">${featuredCards}</div>
+    </section>
+
+    <section class="sec how-sec">
+      <div class="sh">
+        <div class="sh-label">Slik fungerer det</div>
+        <div class="sh-title">Fra s\u00f8k til g\u00e5rdsbes\u00f8k</div>
+      </div>
+      <div class="how-grid">
+        <div class="how-step"><div class="how-num">1</div><h3>S\u00f8k etter det du vil ha</h3><p>Skriv inn hva du leter etter \u2014 \u00abgrønnsaker i Oslo\u00bb eller \u00ab\u00f8kologisk kj\u00f8tt\u00bb.</p></div>
+        <div class="how-step"><div class="how-num">2</div><h3>Utforsk produsenter</h3><p>Se produkter, \u00e5pningstider, sertifiseringer og kontaktinfo.</p></div>
+        <div class="how-step"><div class="how-num">3</div><h3>Kj\u00f8p direkte</h3><p>Bes\u00f8k g\u00e5rdsbutikken, ring direkte, eller la AI-assistenten din finne det automatisk.</p></div>
+      </div>
+    </section>
+
     <section class="seller-cta">
       <h2>Er du matprodusent?</h2>
       <p>Registrer deg gratis og bli synlig for tusenvis av kunder \u2014 og AI-assistentene deres.</p>
       <a href="/selger" class="seller-btn">Registrer gratis</a>
       <span class="seller-note">Under 2 minutter. Ingen kredittkort.</span>
-    </section>
-
-    <section class="live-sec">
-      <div class="live-inner">
-        <div class="sh" style="margin-bottom:24px;">
-          <div class="sh-label">Plattformen akkurat n\u00e5</div>
-          <div class="sh-title">Ekte trafikk \u2014 siste 7 dager</div>
-        </div>
-        <div class="live-grid">
-          <div class="live-card">
-            <span class="live-icon">&#128065;</span>
-            <div class="live-val">${liveStats.pageViews.toLocaleString("nb-NO")}</div>
-            <div class="live-lbl">Sidevisninger</div>
-          </div>
-          <div class="live-card">
-            <span class="live-icon">&#128100;</span>
-            <div class="live-val">${liveStats.uniqueVisitors.toLocaleString("nb-NO")}</div>
-            <div class="live-lbl">Unike bes\u00f8kende</div>
-          </div>
-          <div class="live-card">
-            <span class="live-icon">&#128269;</span>
-            <div class="live-val">${liveStats.totalQueries.toLocaleString("nb-NO")}</div>
-            <div class="live-lbl">S\u00f8k utf\u00f8rt</div>
-          </div>
-          <div class="live-card">
-            <span class="live-icon">&#129302;</span>
-            <div class="live-val">${aiQueries.toLocaleString("nb-NO")}</div>
-            <div class="live-lbl">AI-agent sp\u00f8rringer</div>
-          </div>
-        </div>
-        <div class="live-sources">
-          <div class="live-source"><span class="live-dot-green"></span> Google</div>
-          <div class="live-source"><span class="live-dot-blue"></span> Bing</div>
-          <div class="live-source"><span class="live-dot-purple"></span> ChatGPT</div>
-          <div class="live-source"><span class="live-dot-orange"></span> Claude MCP</div>
-        </div>
-      </div>
     </section>
 
     <section class="ai-sec">
