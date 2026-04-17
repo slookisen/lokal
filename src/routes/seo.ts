@@ -19,6 +19,7 @@ import { Router, Request, Response } from "express";
 import { marketplaceRegistry } from "../services/marketplace-registry";
 import { knowledgeService } from "../services/knowledge-service";
 import { analyticsService } from "../services/analytics-service";
+import { getDb } from "../database/init";
 
 const router = Router();
 
@@ -269,6 +270,68 @@ function producerCard(a: any): string {
   </a>`;
 }
 
+// ─── Traffic stats helper ───────────────────────────────────────
+
+function sqlDate(date: Date): string {
+  return date.toISOString().replace("T", " ").replace(/\.\d{3}Z$/, "");
+}
+
+interface TrafficStats {
+  humanTotal: number;
+  humanWeek: number;
+  humanDay: number;
+  aiTotal: number;
+  aiWeek: number;
+  aiDay: number;
+}
+
+function getTrafficStats(): TrafficStats {
+  try {
+    const db = getDb();
+    const now = new Date();
+    const ago7d = sqlDate(new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000));
+    const ago24h = sqlDate(new Date(now.getTime() - 24 * 60 * 60 * 1000));
+    const notOwner = "(is_owner IS NULL OR is_owner = 0)";
+
+    const humanTotal = (db.prepare(`SELECT COUNT(*) as n FROM analytics_page_views WHERE ${notOwner}`).get() as any)?.n ?? 0;
+    const humanWeek = (db.prepare(`SELECT COUNT(*) as n FROM analytics_page_views WHERE ${notOwner} AND created_at >= ?`).get(ago7d) as any)?.n ?? 0;
+    const humanDay = (db.prepare(`SELECT COUNT(*) as n FROM analytics_page_views WHERE ${notOwner} AND created_at >= ?`).get(ago24h) as any)?.n ?? 0;
+
+    const aiTotal = (db.prepare(`SELECT COUNT(*) as n FROM analytics_queries WHERE ${notOwner}`).get() as any)?.n ?? 0;
+    const aiWeek = (db.prepare(`SELECT COUNT(*) as n FROM analytics_queries WHERE ${notOwner} AND created_at >= ?`).get(ago7d) as any)?.n ?? 0;
+    const aiDay = (db.prepare(`SELECT COUNT(*) as n FROM analytics_queries WHERE ${notOwner} AND created_at >= ?`).get(ago24h) as any)?.n ?? 0;
+
+    return { humanTotal, humanWeek, humanDay, aiTotal, aiWeek, aiDay };
+  } catch {
+    return { humanTotal: 0, humanWeek: 0, humanDay: 0, aiTotal: 0, aiWeek: 0, aiDay: 0 };
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════
+// GET /api/traffic-stats — Public traffic stats
+// ═══════════════════════════════════════════════════════════════
+
+router.get("/api/traffic-stats", (_req: Request, res: Response) => {
+  const stats = getTrafficStats();
+  res.json({
+    human: {
+      total: stats.humanTotal,
+      last7days: stats.humanWeek,
+      last24hours: stats.humanDay,
+    },
+    ai: {
+      total: stats.aiTotal,
+      last7days: stats.aiWeek,
+      last24hours: stats.aiDay,
+    },
+    combined: {
+      total: stats.humanTotal + stats.aiTotal,
+      last7days: stats.humanWeek + stats.aiWeek,
+      last24hours: stats.humanDay + stats.aiDay,
+    },
+  });
+});
+
 // ═══════════════════════════════════════════════════════════════
 // GET / — Landing page
 // ═══════════════════════════════════════════════════════════════
@@ -316,6 +379,25 @@ const LANDING_CSS = `
   .how-num { width: 44px; height: 44px; border-radius: 50%; background: var(--green-700); color: var(--white); display: flex; align-items: center; justify-content: center; font-weight: 800; font-size: 1rem; margin: 0 auto 14px; }
   .how-step h3 { font-size: 1rem; font-weight: 700; margin-bottom: 6px; }
   .how-step p { font-size: 0.85rem; color: var(--g500); line-height: 1.5; }
+  .traffic-sec { padding: 56px 32px; background: var(--white); }
+  .traffic-inner { max-width: 1100px; margin: 0 auto; }
+  .traffic-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 18px; margin-top: 32px; }
+  .traffic-card { border-radius: var(--r-lg); border: 1px solid var(--g100); padding: 24px 22px; background: var(--white); }
+  .traffic-card-label { font-size: 0.72rem; font-weight: 700; text-transform: uppercase; letter-spacing: 0.8px; color: var(--g500); margin-bottom: 12px; }
+  .traffic-row { display: flex; justify-content: space-between; align-items: center; padding: 6px 0; border-bottom: 1px solid var(--g100); }
+  .traffic-row:last-child { border-bottom: none; }
+  .traffic-row-label { display: flex; align-items: center; gap: 6px; font-size: 0.82rem; color: var(--g700); }
+  .traffic-dot { width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0; }
+  .traffic-dot-human { background: var(--green-700); }
+  .traffic-dot-ai { background: #7c3aed; }
+  .traffic-val { font-size: 1rem; font-weight: 700; color: var(--charcoal); }
+  .traffic-total { margin-top: 14px; padding-top: 12px; border-top: 2px solid var(--g100); display: flex; justify-content: space-between; align-items: baseline; }
+  .traffic-total-label { font-size: 0.78rem; font-weight: 600; color: var(--g500); }
+  .traffic-total-val { font-size: 1.4rem; font-weight: 800; color: var(--green-700); }
+  @media (max-width: 768px) {
+    .traffic-grid { grid-template-columns: 1fr; }
+    .traffic-sec { padding: 40px 16px; }
+  }
   .seller-cta { padding: 72px 32px; background: linear-gradient(135deg, var(--green-700) 0%, var(--green-900) 100%); color: var(--white); text-align: center; }
   .seller-cta h2 { font-size: 2rem; font-weight: 800; margin-bottom: 10px; }
   .seller-cta p { font-size: 1rem; opacity: 0.85; margin-bottom: 28px; max-width: 500px; margin-left: auto; margin-right: auto; }
@@ -350,6 +432,7 @@ router.get("/", (_req: Request, res: Response) => {
     const stats = marketplaceRegistry.getStats();
     const agents = marketplaceRegistry.getActiveAgents();
     const totalAgents = stats.totalAgents || agents.length;
+    const traffic = getTrafficStats();
 
     // City counts
     const cityCounts: Record<string, number> = {};
@@ -471,6 +554,63 @@ router.get("/", (_req: Request, res: Response) => {
         <div class="how-step"><div class="how-num">1</div><h3>S\u00f8k etter det du vil ha</h3><p>Skriv inn hva du leter etter \u2014 \u00abgrønnsaker i Oslo\u00bb eller \u00ab\u00f8kologisk kj\u00f8tt\u00bb.</p></div>
         <div class="how-step"><div class="how-num">2</div><h3>Utforsk produsenter</h3><p>Se produkter, \u00e5pningstider, sertifiseringer og kontaktinfo.</p></div>
         <div class="how-step"><div class="how-num">3</div><h3>Kj\u00f8p direkte</h3><p>Bes\u00f8k g\u00e5rdsbutikken, ring direkte, eller la AI-assistenten din finne det automatisk.</p></div>
+      </div>
+    </section>
+
+    <section class="traffic-sec">
+      <div class="traffic-inner">
+        <div class="sh">
+          <div class="sh-label">Plattformaktivitet</div>
+          <div class="sh-title">Lokal i tall</div>
+          <div class="sh-sub">Ekte besøk og AI-spørringer \u2014 ingen annonserte tall</div>
+        </div>
+        <div class="traffic-grid">
+          <div class="traffic-card">
+            <div class="traffic-card-label">Siden lansering</div>
+            <div class="traffic-row">
+              <span class="traffic-row-label"><span class="traffic-dot traffic-dot-human"></span> Mennesker</span>
+              <span class="traffic-val">${traffic.humanTotal.toLocaleString("nb-NO")}</span>
+            </div>
+            <div class="traffic-row">
+              <span class="traffic-row-label"><span class="traffic-dot traffic-dot-ai"></span> AI-sp\u00f8rringer</span>
+              <span class="traffic-val">${traffic.aiTotal.toLocaleString("nb-NO")}</span>
+            </div>
+            <div class="traffic-total">
+              <span class="traffic-total-label">Totalt</span>
+              <span class="traffic-total-val">${(traffic.humanTotal + traffic.aiTotal).toLocaleString("nb-NO")}</span>
+            </div>
+          </div>
+          <div class="traffic-card">
+            <div class="traffic-card-label">Siste 7 dager</div>
+            <div class="traffic-row">
+              <span class="traffic-row-label"><span class="traffic-dot traffic-dot-human"></span> Mennesker</span>
+              <span class="traffic-val">${traffic.humanWeek.toLocaleString("nb-NO")}</span>
+            </div>
+            <div class="traffic-row">
+              <span class="traffic-row-label"><span class="traffic-dot traffic-dot-ai"></span> AI-sp\u00f8rringer</span>
+              <span class="traffic-val">${traffic.aiWeek.toLocaleString("nb-NO")}</span>
+            </div>
+            <div class="traffic-total">
+              <span class="traffic-total-label">Totalt</span>
+              <span class="traffic-total-val">${(traffic.humanWeek + traffic.aiWeek).toLocaleString("nb-NO")}</span>
+            </div>
+          </div>
+          <div class="traffic-card">
+            <div class="traffic-card-label">Siste 24 timer</div>
+            <div class="traffic-row">
+              <span class="traffic-row-label"><span class="traffic-dot traffic-dot-human"></span> Mennesker</span>
+              <span class="traffic-val">${traffic.humanDay.toLocaleString("nb-NO")}</span>
+            </div>
+            <div class="traffic-row">
+              <span class="traffic-row-label"><span class="traffic-dot traffic-dot-ai"></span> AI-sp\u00f8rringer</span>
+              <span class="traffic-val">${traffic.aiDay.toLocaleString("nb-NO")}</span>
+            </div>
+            <div class="traffic-total">
+              <span class="traffic-total-label">Totalt</span>
+              <span class="traffic-total-val">${(traffic.humanDay + traffic.aiDay).toLocaleString("nb-NO")}</span>
+            </div>
+          </div>
+        </div>
       </div>
     </section>
 
