@@ -277,13 +277,16 @@ function sqlDate(date: Date): string {
 }
 
 interface TrafficStats {
-  humanTotal: number;
-  humanWeek: number;
-  humanDay: number;
-  aiTotal: number;
-  aiWeek: number;
-  aiDay: number;
+  pageViews: number;
+  uniqueVisitors: number;
+  realHumans: number;
+  botAndAi: number;
+  aiQueries: number;
 }
+
+// Bot detection patterns (same as analytics.ts traffic-classification)
+const BOT_PATTERNS = ['bot', 'Bot', 'spider', 'crawl', 'serpstat', 'GPTBot', 'ClaudeBot', 'Chiark', 'Go-http-client', 'Dataprovider', 'NotHumanSearch', 'DuckDuck', 'Googlebot', 'GoogleOther', 'Bytespider', 'Applebot', 'YandexBot', 'BingPreview', 'facebookexternal', 'Twitterbot'];
+const DEV_PATTERNS = ['curl/', 'Python/', 'aiohttp', 'Lokal/', 'Lokal-Enricher', 'Claude-User', 'Python-urllib', 'node-fetch', 'axios/'];
 
 let _trafficCache: TrafficStats | null = null;
 let _trafficCacheTime = 0;
@@ -296,24 +299,46 @@ function getTrafficStats(): TrafficStats {
   }
   try {
     const db = getDb();
-    const now = new Date();
-    const ago7d = sqlDate(new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000));
-    const ago24h = sqlDate(new Date(now.getTime() - 24 * 60 * 60 * 1000));
     const notOwner = "(is_owner IS NULL OR is_owner = 0)";
 
-    const humanTotal = (db.prepare(`SELECT COUNT(*) as n FROM analytics_page_views WHERE ${notOwner}`).get() as any)?.n ?? 0;
-    const humanWeek = (db.prepare(`SELECT COUNT(*) as n FROM analytics_page_views WHERE ${notOwner} AND created_at >= ?`).get(ago7d) as any)?.n ?? 0;
-    const humanDay = (db.prepare(`SELECT COUNT(*) as n FROM analytics_page_views WHERE ${notOwner} AND created_at >= ?`).get(ago24h) as any)?.n ?? 0;
+    // Total page views (excluding owner)
+    const pageViews = (db.prepare(`SELECT COUNT(*) as n FROM analytics_page_views WHERE ${notOwner}`).get() as any)?.n ?? 0;
 
-    const aiTotal = (db.prepare(`SELECT COUNT(*) as n FROM analytics_queries WHERE ${notOwner}`).get() as any)?.n ?? 0;
-    const aiWeek = (db.prepare(`SELECT COUNT(*) as n FROM analytics_queries WHERE ${notOwner} AND created_at >= ?`).get(ago7d) as any)?.n ?? 0;
-    const aiDay = (db.prepare(`SELECT COUNT(*) as n FROM analytics_queries WHERE ${notOwner} AND created_at >= ?`).get(ago24h) as any)?.n ?? 0;
+    // Session-based classification: group by session_id, check UA for bots
+    const sessions = db.prepare(`
+      SELECT session_id, COUNT(*) as views
+      FROM analytics_page_views
+      WHERE ${notOwner}
+      GROUP BY session_id
+    `).all() as any[];
 
-    _trafficCache = { humanTotal, humanWeek, humanDay, aiTotal, aiWeek, aiDay };
+    let realHumans = 0;
+    let botViews = 0;
+    for (const s of sessions) {
+      const ua = s.session_id.includes(':') ? s.session_id.split(':').slice(1).join(':') : '';
+      const isBot = BOT_PATTERNS.some(p => ua.includes(p));
+      const isDev = DEV_PATTERNS.some(p => ua.includes(p));
+      if (isBot || isDev) {
+        botViews += s.views;
+      } else {
+        realHumans += s.views;
+      }
+    }
+
+    // AI queries from analytics_queries
+    const aiQueries = (db.prepare(`SELECT COUNT(*) as n FROM analytics_queries WHERE ${notOwner}`).get() as any)?.n ?? 0;
+
+    _trafficCache = {
+      pageViews,
+      uniqueVisitors: sessions.length,
+      realHumans,
+      botAndAi: botViews + aiQueries,
+      aiQueries,
+    };
     _trafficCacheTime = Date.now();
     return _trafficCache;
   } catch {
-    return { humanTotal: 0, humanWeek: 0, humanDay: 0, aiTotal: 0, aiWeek: 0, aiDay: 0 };
+    return { pageViews: 0, uniqueVisitors: 0, realHumans: 0, botAndAi: 0, aiQueries: 0 };
   }
 }
 
@@ -322,23 +347,13 @@ function getTrafficStats(): TrafficStats {
 // ═══════════════════════════════════════════════════════════════
 
 router.get("/api/traffic-stats", (_req: Request, res: Response) => {
-  const stats = getTrafficStats();
+  const s = getTrafficStats();
   res.json({
-    human: {
-      total: stats.humanTotal,
-      last7days: stats.humanWeek,
-      last24hours: stats.humanDay,
-    },
-    ai: {
-      total: stats.aiTotal,
-      last7days: stats.aiWeek,
-      last24hours: stats.aiDay,
-    },
-    combined: {
-      total: stats.humanTotal + stats.aiTotal,
-      last7days: stats.humanWeek + stats.aiWeek,
-      last24hours: stats.humanDay + stats.aiDay,
-    },
+    pageViews: s.pageViews,
+    uniqueVisitors: s.uniqueVisitors,
+    realHumans: s.realHumans,
+    botAndAi: s.botAndAi,
+    aiQueries: s.aiQueries,
   });
 });
 
@@ -389,24 +404,17 @@ const LANDING_CSS = `
   .how-num { width: 44px; height: 44px; border-radius: 50%; background: var(--green-700); color: var(--white); display: flex; align-items: center; justify-content: center; font-weight: 800; font-size: 1rem; margin: 0 auto 14px; }
   .how-step h3 { font-size: 1rem; font-weight: 700; margin-bottom: 6px; }
   .how-step p { font-size: 0.85rem; color: var(--g500); line-height: 1.5; }
-  .traffic-sec { padding: 56px 32px; background: var(--white); }
-  .traffic-inner { max-width: 1100px; margin: 0 auto; }
-  .traffic-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 18px; margin-top: 32px; }
-  .traffic-card { border-radius: var(--r-lg); border: 1px solid var(--g100); padding: 24px 22px; background: var(--white); }
-  .traffic-card-label { font-size: 0.72rem; font-weight: 700; text-transform: uppercase; letter-spacing: 0.8px; color: var(--g500); margin-bottom: 12px; }
-  .traffic-row { display: flex; justify-content: space-between; align-items: center; padding: 6px 0; border-bottom: 1px solid var(--g100); }
-  .traffic-row:last-child { border-bottom: none; }
-  .traffic-row-label { display: flex; align-items: center; gap: 6px; font-size: 0.82rem; color: var(--g700); }
-  .traffic-dot { width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0; }
-  .traffic-dot-human { background: var(--green-700); }
-  .traffic-dot-ai { background: #7c3aed; }
-  .traffic-val { font-size: 1rem; font-weight: 700; color: var(--charcoal); }
-  .traffic-total { margin-top: 14px; padding-top: 12px; border-top: 2px solid var(--g100); display: flex; justify-content: space-between; align-items: baseline; }
-  .traffic-total-label { font-size: 0.78rem; font-weight: 600; color: var(--g500); }
-  .traffic-total-val { font-size: 1.4rem; font-weight: 800; color: var(--green-700); }
-  @media (max-width: 768px) {
-    .traffic-grid { grid-template-columns: 1fr; }
-    .traffic-sec { padding: 40px 16px; }
+  .proof-bar { background: var(--white); border-top: 1px solid var(--g100); border-bottom: 1px solid var(--g100); padding: 18px 24px; }
+  .proof-inner { max-width: 900px; margin: 0 auto; display: flex; justify-content: center; align-items: center; gap: 32px; flex-wrap: wrap; }
+  .proof-item { text-align: center; }
+  .proof-val { font-size: 1.3rem; font-weight: 800; color: var(--green-700); letter-spacing: -0.5px; line-height: 1; }
+  .proof-val-purple { color: #7c3aed; }
+  .proof-lbl { font-size: 0.68rem; color: var(--g500); margin-top: 3px; font-weight: 500; text-transform: uppercase; letter-spacing: 0.5px; }
+  .proof-sep { width: 1px; height: 28px; background: var(--g200); }
+  @media (max-width: 600px) {
+    .proof-inner { gap: 18px; }
+    .proof-val { font-size: 1.1rem; }
+    .proof-sep { display: none; }
   }
   .seller-cta { padding: 72px 32px; background: linear-gradient(135deg, var(--green-700) 0%, var(--green-900) 100%); color: var(--white); text-align: center; }
   .seller-cta h2 { font-size: 2rem; font-weight: 800; margin-bottom: 10px; }
@@ -529,6 +537,30 @@ router.get("/", (_req: Request, res: Response) => {
       </div>
     </section>
 
+    <div class="proof-bar">
+      <div class="proof-inner">
+        <div class="proof-item">
+          <div class="proof-val">${traffic.pageViews.toLocaleString("nb-NO")}</div>
+          <div class="proof-lbl">Sidevisninger</div>
+        </div>
+        <div class="proof-sep"></div>
+        <div class="proof-item">
+          <div class="proof-val">${traffic.uniqueVisitors.toLocaleString("nb-NO")}</div>
+          <div class="proof-lbl">Unike bes\u00f8kende</div>
+        </div>
+        <div class="proof-sep"></div>
+        <div class="proof-item">
+          <div class="proof-val">${traffic.realHumans.toLocaleString("nb-NO")}</div>
+          <div class="proof-lbl">Ekte mennesker</div>
+        </div>
+        <div class="proof-sep"></div>
+        <div class="proof-item">
+          <div class="proof-val proof-val-purple">${traffic.botAndAi.toLocaleString("nb-NO")}</div>
+          <div class="proof-lbl">Bot &amp; AI-trafikk</div>
+        </div>
+      </div>
+    </div>
+
     <section class="cats-section">
       <div class="sh" style="max-width:1100px;margin:0 auto 28px;">
         <div class="sh-label">Kategorier</div>
@@ -536,80 +568,6 @@ router.get("/", (_req: Request, res: Response) => {
       </div>
       <div class="cats-grid">${catCards}</div>
     </section>
-
-    <section class="traffic-sec">
-      <div class="traffic-inner">
-        <div class="sh">
-          <div class="sh-label">Plattformaktivitet</div>
-          <div class="sh-title">Mennesker og AI finner mat her</div>
-          <div class="sh-sub">Ekte bes\u00f8k og AI-sp\u00f8rringer \u2014 ingen oppbl\u00e5ste tall</div>
-        </div>
-        <div class="traffic-grid" id="traffic-grid">
-          <div class="traffic-card">
-            <div class="traffic-card-label">Siden lansering</div>
-            <div class="traffic-row">
-              <span class="traffic-row-label"><span class="traffic-dot traffic-dot-human"></span> Mennesker</span>
-              <span class="traffic-val" id="ts-human-total">${traffic.humanTotal.toLocaleString("nb-NO")}</span>
-            </div>
-            <div class="traffic-row">
-              <span class="traffic-row-label"><span class="traffic-dot traffic-dot-ai"></span> AI-sp\u00f8rringer</span>
-              <span class="traffic-val" id="ts-ai-total">${traffic.aiTotal.toLocaleString("nb-NO")}</span>
-            </div>
-            <div class="traffic-total">
-              <span class="traffic-total-label">Totalt</span>
-              <span class="traffic-total-val" id="ts-combined-total">${(traffic.humanTotal + traffic.aiTotal).toLocaleString("nb-NO")}</span>
-            </div>
-          </div>
-          <div class="traffic-card">
-            <div class="traffic-card-label">Siste 7 dager</div>
-            <div class="traffic-row">
-              <span class="traffic-row-label"><span class="traffic-dot traffic-dot-human"></span> Mennesker</span>
-              <span class="traffic-val" id="ts-human-week">${traffic.humanWeek.toLocaleString("nb-NO")}</span>
-            </div>
-            <div class="traffic-row">
-              <span class="traffic-row-label"><span class="traffic-dot traffic-dot-ai"></span> AI-sp\u00f8rringer</span>
-              <span class="traffic-val" id="ts-ai-week">${traffic.aiWeek.toLocaleString("nb-NO")}</span>
-            </div>
-            <div class="traffic-total">
-              <span class="traffic-total-label">Totalt</span>
-              <span class="traffic-total-val" id="ts-combined-week">${(traffic.humanWeek + traffic.aiWeek).toLocaleString("nb-NO")}</span>
-            </div>
-          </div>
-          <div class="traffic-card">
-            <div class="traffic-card-label">Siste 24 timer</div>
-            <div class="traffic-row">
-              <span class="traffic-row-label"><span class="traffic-dot traffic-dot-human"></span> Mennesker</span>
-              <span class="traffic-val" id="ts-human-day">${traffic.humanDay.toLocaleString("nb-NO")}</span>
-            </div>
-            <div class="traffic-row">
-              <span class="traffic-row-label"><span class="traffic-dot traffic-dot-ai"></span> AI-sp\u00f8rringer</span>
-              <span class="traffic-val" id="ts-ai-day">${traffic.aiDay.toLocaleString("nb-NO")}</span>
-            </div>
-            <div class="traffic-total">
-              <span class="traffic-total-label">Totalt</span>
-              <span class="traffic-total-val" id="ts-combined-day">${(traffic.humanDay + traffic.aiDay).toLocaleString("nb-NO")}</span>
-            </div>
-          </div>
-        </div>
-      </div>
-    </section>
-    <script>
-      (function() {
-        function fmt(n) { return n.toLocaleString("nb-NO"); }
-        fetch("/api/traffic-stats").then(function(r) { return r.json(); }).then(function(d) {
-          var set = function(id, v) { var el = document.getElementById(id); if (el) el.textContent = fmt(v); };
-          set("ts-human-total", d.human.total);
-          set("ts-ai-total", d.ai.total);
-          set("ts-combined-total", d.combined.total);
-          set("ts-human-week", d.human.last7days);
-          set("ts-ai-week", d.ai.last7days);
-          set("ts-combined-week", d.combined.last7days);
-          set("ts-human-day", d.human.last24hours);
-          set("ts-ai-day", d.ai.last24hours);
-          set("ts-combined-day", d.combined.last24hours);
-        }).catch(function() {});
-      })();
-    </script>
 
     <section class="sec">
       <div class="sh">
