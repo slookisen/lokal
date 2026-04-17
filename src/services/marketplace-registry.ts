@@ -24,10 +24,11 @@ class MarketplaceRegistry {
   // ─── In-memory cache ──────────────────────────────────────────
   // Avoids re-querying + JSON.parse() on 1100+ agents per request.
   // Cache invalidated on register/update/deactivate. TTL as fallback.
-  private _agentsCache: RegisteredAgent[] | null = null;
-  private _agentsCacheTime = 0;
-  private _statsCache: { totalAgents: number; activeProducers: number; cities: string[]; totalListings: number } | null = null;
-  private _statsCacheTime = 0;
+  // Public so ops agent can clear them via /ops/clear-cache.
+  _agentsCache: RegisteredAgent[] | null = null;
+  _agentsCacheTime = 0;
+  _statsCache: { totalAgents: number; activeProducers: number; cities: string[]; totalListings: number } | null = null;
+  _statsCacheTime = 0;
   private static CACHE_TTL = 60_000; // 60 seconds
 
   private invalidateCache() {

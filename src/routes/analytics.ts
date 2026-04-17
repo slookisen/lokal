@@ -556,4 +556,213 @@ router.get("/referrers", (req: Request, res: Response) => {
   }
 });
 
+// ═══════════════════════════════════════════════════════════════
+// OPS AGENT ENDPOINTS — automated remediation actions
+// These are called by the rfb-ops-agent scheduled task when
+// issues are detected. All require X-Admin-Key auth.
+// ═══════════════════════════════════════════════════════════════
+
+/**
+ * POST /admin/analytics/ops/clear-cache
+ * Clears all in-memory caches (marketplace, analytics, traffic stats).
+ * Use when: memory is high, or data seems stale.
+ */
+router.post("/ops/clear-cache", (_req: Request, res: Response) => {
+  try {
+    const { marketplaceRegistry } = require("../services/marketplace-registry");
+    // Invalidate marketplace cache
+    marketplaceRegistry._agentsCache = null;
+    marketplaceRegistry._statsCache = null;
+    marketplaceRegistry._agentsCacheTime = 0;
+    marketplaceRegistry._statsCacheTime = 0;
+
+    // Invalidate analytics summary cache
+    if (analyticsService._summaryCache) {
+      analyticsService._summaryCache.clear();
+    }
+
+    // Force garbage collection if available
+    if (global.gc) global.gc();
+
+    const mem = process.memoryUsage();
+    res.json({
+      success: true,
+      action: "clear-cache",
+      message: "All caches cleared",
+      memoryAfter: {
+        rssMb: Math.round(mem.rss / 1024 / 1024),
+        heapUsedMb: Math.round(mem.heapUsed / 1024 / 1024),
+      },
+    });
+  } catch (err) {
+    res.status(500).json({ success: false, error: String(err) });
+  }
+});
+
+/**
+ * POST /admin/analytics/ops/prune
+ * Delete analytics data older than N days. Default: 30 days.
+ * Use when: DB size is large, or analytics tables have too many rows.
+ * Body: { daysToKeep?: number }
+ */
+router.post("/ops/prune", (req: Request, res: Response) => {
+  try {
+    const db = getDb();
+    const daysToKeep = Math.max(7, parseInt(req.body.daysToKeep) || 30);
+    const cutoff = sqliteDatetime(new Date(Date.now() - daysToKeep * 24 * 60 * 60 * 1000));
+
+    const pvBefore = (db.prepare("SELECT COUNT(*) as c FROM analytics_page_views").get() as any).c;
+    const qBefore = (db.prepare("SELECT COUNT(*) as c FROM analytics_queries").get() as any).c;
+    const avBefore = (db.prepare("SELECT COUNT(*) as c FROM analytics_agent_views").get() as any).c;
+
+    db.prepare("DELETE FROM analytics_page_views WHERE created_at < ?").run(cutoff);
+    db.prepare("DELETE FROM analytics_queries WHERE created_at < ?").run(cutoff);
+    db.prepare("DELETE FROM analytics_agent_views WHERE created_at < ?").run(cutoff);
+
+    const pvAfter = (db.prepare("SELECT COUNT(*) as c FROM analytics_page_views").get() as any).c;
+    const qAfter = (db.prepare("SELECT COUNT(*) as c FROM analytics_queries").get() as any).c;
+    const avAfter = (db.prepare("SELECT COUNT(*) as c FROM analytics_agent_views").get() as any).c;
+
+    // Reclaim disk space
+    db.pragma("wal_checkpoint(TRUNCATE)");
+
+    res.json({
+      success: true,
+      action: "prune",
+      daysKept: daysToKeep,
+      cutoff,
+      deleted: {
+        pageViews: pvBefore - pvAfter,
+        queries: qBefore - qAfter,
+        agentViews: avBefore - avAfter,
+      },
+      remaining: {
+        pageViews: pvAfter,
+        queries: qAfter,
+        agentViews: avAfter,
+      },
+    });
+  } catch (err) {
+    res.status(500).json({ success: false, error: String(err) });
+  }
+});
+
+/**
+ * POST /admin/analytics/ops/vacuum
+ * Run SQLite VACUUM to reclaim disk space and defragment.
+ * Use when: DB size seems large relative to row counts (fragmentation).
+ * WARNING: This locks the DB briefly — don't run during peak traffic.
+ */
+router.post("/ops/vacuum", (_req: Request, res: Response) => {
+  try {
+    const db = getDb();
+    const fs = require("fs");
+    const dbPath = process.env.DB_PATH || "./data/lokal.db";
+
+    let sizeBefore = 0;
+    try { sizeBefore = fs.statSync(dbPath).size; } catch {}
+
+    db.pragma("wal_checkpoint(TRUNCATE)");
+    db.exec("VACUUM");
+
+    let sizeAfter = 0;
+    try { sizeAfter = fs.statSync(dbPath).size; } catch {}
+
+    res.json({
+      success: true,
+      action: "vacuum",
+      sizeBefore: `${(sizeBefore / 1024 / 1024).toFixed(1)}MB`,
+      sizeAfter: `${(sizeAfter / 1024 / 1024).toFixed(1)}MB`,
+      freedMb: ((sizeBefore - sizeAfter) / 1024 / 1024).toFixed(1),
+    });
+  } catch (err) {
+    res.status(500).json({ success: false, error: String(err) });
+  }
+});
+
+/**
+ * GET /admin/analytics/ops/diagnostics
+ * Comprehensive system diagnostics for the ops agent.
+ * Returns everything needed to make remediation decisions.
+ */
+router.get("/ops/diagnostics", (_req: Request, res: Response) => {
+  try {
+    const db = getDb();
+    const fs = require("fs");
+    const dbPath = process.env.DB_PATH || "./data/lokal.db";
+
+    const mem = process.memoryUsage();
+
+    // Table row counts
+    const pvCount = (db.prepare("SELECT COUNT(*) as c FROM analytics_page_views").get() as any).c;
+    const qCount = (db.prepare("SELECT COUNT(*) as c FROM analytics_queries").get() as any).c;
+    const avCount = (db.prepare("SELECT COUNT(*) as c FROM analytics_agent_views").get() as any).c;
+    const agentCount = (db.prepare("SELECT COUNT(*) as c FROM agents WHERE is_active = 1").get() as any).c;
+
+    // Oldest analytics record
+    const oldestPv = (db.prepare("SELECT MIN(created_at) as d FROM analytics_page_views").get() as any)?.d;
+    const oldestQ = (db.prepare("SELECT MIN(created_at) as d FROM analytics_queries").get() as any)?.d;
+
+    // DB file size
+    let dbSizeMb = 0;
+    try { dbSizeMb = Math.round(fs.statSync(dbPath).size / 1024 / 1024 * 10) / 10; } catch {}
+
+    // Recent error rate (requests in last hour with high latency or errors)
+    const oneHourAgo = sqliteDatetime(new Date(Date.now() - 3600000));
+    const recentPv = (db.prepare("SELECT COUNT(*) as c FROM analytics_page_views WHERE created_at > ?").get(oneHourAgo) as any).c;
+
+    // Bot ratio last hour
+    const sessions = db.prepare(`
+      SELECT session_id, COUNT(*) as views
+      FROM analytics_page_views
+      WHERE created_at > ? AND ${NOT_OWNER}
+      GROUP BY session_id
+    `).all(oneHourAgo) as any[];
+
+    const botPatterns = ['bot', 'Bot', 'spider', 'crawl', 'GPTBot', 'ClaudeBot', 'Googlebot', 'Bytespider', 'Applebot', 'YandexBot', 'BingPreview', 'Go-http-client', 'Python/', 'curl/'];
+    let botViews = 0;
+    let humanViews = 0;
+    for (const s of sessions) {
+      const ua = s.session_id.includes(':') ? s.session_id.split(':').slice(1).join(':') : '';
+      if (botPatterns.some(p => ua.includes(p))) {
+        botViews += s.views;
+      } else {
+        humanViews += s.views;
+      }
+    }
+
+    res.json({
+      timestamp: new Date().toISOString(),
+      uptime: Math.floor(process.uptime()),
+      memory: {
+        rssMb: Math.round(mem.rss / 1024 / 1024),
+        heapUsedMb: Math.round(mem.heapUsed / 1024 / 1024),
+        heapTotalMb: Math.round(mem.heapTotal / 1024 / 1024),
+        pct: Math.round(mem.rss / 1024 / 1024 / 512 * 100),
+      },
+      database: {
+        sizeMb: dbSizeMb,
+        tables: {
+          pageViews: pvCount,
+          queries: qCount,
+          agentViews: avCount,
+          agents: agentCount,
+        },
+        oldest: {
+          pageView: oldestPv,
+          query: oldestQ,
+        },
+      },
+      lastHour: {
+        totalViews: recentPv,
+        botViews,
+        humanViews,
+        botRatio: recentPv > 0 ? Math.round(botViews / (botViews + humanViews) * 100) : 0,
+      },
+    });
+  } catch (err) {
+    res.status(500).json({ error: String(err) });
+  }
+});
+
 export default router;

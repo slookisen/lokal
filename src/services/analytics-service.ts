@@ -307,7 +307,8 @@ export class AnalyticsService {
   }
 
   // ─── Summary cache ───────────────────────────────────────────
-  private _summaryCache: Map<number, { data: any; time: number }> = new Map();
+  // Public so ops agent can clear it via /ops/clear-cache.
+  _summaryCache: Map<number, { data: any; time: number }> = new Map();
   private static SUMMARY_CACHE_TTL = 120_000; // 2 minutes
 
   /**
