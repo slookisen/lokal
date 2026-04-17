@@ -1254,9 +1254,10 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
     if (k.email) contactItems.push(`<div class="ct-item"><div class="ct-icon">&#9993;</div><div><div class="ct-label">E-post</div><div class="ct-val"><a href="mailto:${k.email}">${escapeHtml(k.email)}</a></div></div></div>`);
     if (k.website) contactItems.push(`<div class="ct-item"><div class="ct-icon">&#127760;</div><div><div class="ct-label">Nettside</div><div class="ct-val"><a href="${escapeHtml(k.website)}" target="_blank" rel="noopener">${escapeHtml(k.website.replace(/^https?:\/\//, ""))}</a></div></div></div>`);
 
-    // Products
-    const productsHtml = k.products?.length
-      ? k.products.map((p: any) => {
+    // Products — guard against string data (some agents have free-text instead of array)
+    const productsList = Array.isArray(k.products) ? k.products : [];
+    const productsHtml = productsList.length
+      ? productsList.map((p: any) => {
           const months = p.months || p.seasonMonths || [];
           const seasonal = p.seasonal && months.length
             ? `<span class="prod-season">${months.map((m: number) => MONTH_NAMES[m] || m).join("\u2013")}</span>` : "";
@@ -1265,15 +1266,18 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
           return `<div class="prod-item"><span class="prod-name">${escapeHtml(p.name)}</span>${price}<div class="prod-meta">${seasonal}${org}</div></div>`;
         }).join("") : "";
 
-    // Opening hours
+    // Opening hours — guard against string data (some agents have free-text like "Man-Fre 10-17")
     const today = new Date().toLocaleDateString("en-US", { weekday: "long" }).toLowerCase();
     const todayShort = today.slice(0, 3);
-    const hoursHtml = k.openingHours?.length
-      ? k.openingHours.map((h: any) => {
+    const hoursList = Array.isArray(k.openingHours) ? k.openingHours : [];
+    const hoursText = !Array.isArray(k.openingHours) && typeof k.openingHours === "string" && k.openingHours ? k.openingHours : "";
+    const hoursHtml = hoursList.length
+      ? hoursList.map((h: any) => {
           const isToday = h.day === todayShort || h.day === today;
           const cls = isToday ? " hrs-today" : "";
           return `<div class="hrs-day${cls}">${DAY_NAMES[h.day] || h.day}${isToday ? '<span class="hrs-open"><span class="hrs-dot"></span> I dag</span>' : ""}</div><div class="hrs-time${cls}">${h.open} \u2013 ${h.close}${h.note ? ` (${escapeHtml(h.note)})` : ""}</div>`;
-        }).join("") : "";
+        }).join("")
+      : hoursText ? `<div class="hrs-day">${escapeHtml(hoursText)}</div>` : "";
 
     // Certifications
     const certsHtml = certs.length
@@ -1308,9 +1312,9 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
     if (k.email) jsonLd.email = k.email;
     if (k.website) jsonLd.sameAs = k.website;
     if (agent.location?.lat && agent.location?.lng) jsonLd.geo = { "@type": "GeoCoordinates", "latitude": agent.location.lat, "longitude": agent.location.lng };
-    if (k.openingHours?.length) {
+    if (hoursList.length) {
       const dayMap: Record<string, string> = { mon: "Mo", tue: "Tu", wed: "We", thu: "Th", fri: "Fr", sat: "Sa", sun: "Su" };
-      jsonLd.openingHoursSpecification = k.openingHours.map((h: any) => ({
+      jsonLd.openingHoursSpecification = hoursList.map((h: any) => ({
         "@type": "OpeningHoursSpecification",
         "dayOfWeek": dayMap[h.day] || h.day,
         "opens": h.open, "closes": h.close,
@@ -1347,7 +1351,7 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
       <div class="pf-main">
         ${productsHtml ? `
         <div class="card">
-          <div class="card-head"><span>&#127813;</span><h3>Produkter (${k.products.length})</h3></div>
+          <div class="card-head"><span>&#127813;</span><h3>Produkter (${productsList.length})</h3></div>
           <div class="card-body"><div class="prod-grid">${productsHtml}</div></div>
         </div>` : ""}
 
