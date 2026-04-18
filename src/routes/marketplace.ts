@@ -3,6 +3,7 @@ import { marketplaceRegistry } from "../services/marketplace-registry";
 import { AgentRegistrationSchema, DiscoveryQuerySchema } from "../models/marketplace";
 import { interactionLogger } from "../services/interaction-logger";
 import { knowledgeService } from "../services/knowledge-service";
+import { geocodingService } from "../services/geocoding-service";
 import { getDb } from "../database/init";
 import { emailService } from "../services/email-service";
 import { trustScoreService } from "../services/trust-score-service";
@@ -248,59 +249,111 @@ router.post("/discover", (req: Request, res: Response) => {
 //
 // Example: GET /search?q=ferske+økologiske+grønnsaker+nær+Grünerløkka
 
-router.get("/search", (req: Request, res: Response) => {
+router.get("/search", async (req: Request, res: Response) => {
   const q = req.query.q as string;
   if (!q) {
     res.status(400).json({ success: false, error: "Mangler ?q= parameter" });
     return;
   }
 
-  // Parse natural language into structured query
+  // Parse natural language into structured query (categories, tags, product terms)
   const parsed = marketplaceRegistry.parseNaturalQuery(q);
 
-  // Support frontend geolocation: ?lat=59.91&lng=10.75
+  // ── Location resolution (priority order) ──
+  // 1. Frontend geolocation (user clicked "Nær meg")
+  // 2. Location extracted from query text via geocoding ("tomat i Nesbyen")
+  // 3. No location → results from whole country
+
   const frontendLat = parseFloat(req.query.lat as string);
   const frontendLng = parseFloat(req.query.lng as string);
-  if (!isNaN(frontendLat) && !isNaN(frontendLng) && !parsed.location) {
-    parsed.location = { lat: frontendLat, lng: frontendLng };
-    parsed.maxDistanceKm = parseFloat(req.query.radius as string) || 25;
+  const heleNorge = req.query.heleNorge === "true"; // explicit opt-out of geo filter
+
+  let geoSource = "none";
+
+  if (!heleNorge) {
+    if (!isNaN(frontendLat) && !isNaN(frontendLng)) {
+      // User's browser geolocation
+      parsed.location = { lat: frontendLat, lng: frontendLng };
+      parsed.maxDistanceKm = parseFloat(req.query.radius as string) || 30;
+      geoSource = "browser";
+    } else if (!parsed.location) {
+      // Try to extract place name from query and geocode it
+      const geoResult = await geocodingService.extractAndGeocode(q);
+      if (geoResult) {
+        parsed.location = { lat: geoResult.lat, lng: geoResult.lng };
+        parsed.maxDistanceKm = geoResult.radiusKm;
+        geoSource = geoResult.source;
+      }
+    }
   }
 
   // Preserve _productTerms through schema parsing (Zod strips unknown fields)
   const productTerms = parsed._productTerms;
+  const requestedLimit = parseInt(req.query.limit as string) || 20;
   const query = DiscoveryQuerySchema.parse({
     ...parsed,
-    limit: parseInt(req.query.limit as string) || 20,
+    limit: requestedLimit,
     offset: parseInt(req.query.offset as string) || 0,
   });
-  // Re-attach product terms for product-level filtering in discover()
   if (productTerms) (query as any)._productTerms = productTerms;
 
   const startTime = Date.now();
-  const results = marketplaceRegistry.discover(query);
+  let results = marketplaceRegistry.discover(query);
+
+  // ── Auto-expanding radius ──
+  // If geo-filtered and too few results, widen the search automatically.
+  // This handles rural areas where 30km might only have 1-2 sellers.
+  const MIN_RESULTS = 3;
+  const RADIUS_STEPS = [50, 100, 200]; // km
+
+  if (parsed.location && results.length < MIN_RESULTS && !heleNorge) {
+    for (const expandedRadius of RADIUS_STEPS) {
+      if (results.length >= MIN_RESULTS) break;
+      const expandedQuery = DiscoveryQuerySchema.parse({
+        ...parsed,
+        maxDistanceKm: expandedRadius,
+        limit: requestedLimit,
+        offset: 0,
+      });
+      if (productTerms) (expandedQuery as any)._productTerms = productTerms;
+      results = marketplaceRegistry.discover(expandedQuery);
+    }
+
+    // Last resort: no geo filter at all (show whole country)
+    if (results.length < MIN_RESULTS) {
+      const noGeoQuery = DiscoveryQuerySchema.parse({
+        ...parsed,
+        location: undefined,
+        maxDistanceKm: undefined,
+        limit: requestedLimit,
+        offset: 0,
+      });
+      if (productTerms) (noGeoQuery as any)._productTerms = productTerms;
+      results = marketplaceRegistry.discover(noGeoQuery);
+    }
+  }
 
   interactionLogger.log("search", {
     query: q,
     resultCount: results.length,
     matchedAgentIds: results.map(r => r.agent.id),
-    metadata: { parsed },
+    metadata: { parsed, geoSource },
     ipAddress: req.ip,
     durationMs: Date.now() - startTime,
   });
 
-  // Enrich each result with a compact contact block so MCP/chat clients
-  // can present action-handles (tel:, mailto:, vCard) without extra calls.
   const enrichedResults = results.map((r: any) => ({
     ...r,
     contact: buildContactBlock(r.agent.id),
   }));
 
-  // Sanitize query echo to prevent reflected XSS if rendered by consumers
   const safeQuery = q.replace(/<[^>]*>/g, "").replace(/javascript:/gi, "");
   res.json({
     success: true,
     query: safeQuery,
-    parsed, // Show what we understood (transparency)
+    parsed,
+    geoFiltered: !!parsed.location && !heleNorge,  // tells frontend if results were geo-limited
+    geoSource,                                       // "browser", "kartverket", "database", "hardcoded", "none"
     count: enrichedResults.length,
     results: enrichedResults,
   });
