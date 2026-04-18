@@ -708,7 +708,7 @@ router.get("/sok", async (req: Request, res: Response) => {
     const resultCards = results.map((r: any) => producerCard(r.agent, r.matchReasons)).join("");
 
     const heleNorgeLink = geoFiltered
-      ? `<a href="/sok?q=${encodeURIComponent(q)}&heleNorge=true" style="display:inline-block;margin-top:12px;padding:8px 20px;background:var(--orange-400,#D4A373);color:white;border-radius:8px;text-decoration:none;font-weight:600;font-size:0.9rem;">&#127758; Vis hele Norge</a>`
+      ? `<a href="/sok?q=${encodeURIComponent(q)}&heleNorge=true" style="display:inline-block;margin-top:12px;padding:7px 18px;background:var(--green-100,#e8f0e0);color:var(--green-700,#2D5016);border:1.5px solid var(--green-700,#2D5016);border-radius:8px;text-decoration:none;font-weight:600;font-size:0.85rem;">&#127758; Vis hele Norge</a>`
       : "";
 
     const geoNote = geoFiltered
@@ -722,7 +722,7 @@ router.get("/sok", async (req: Request, res: Response) => {
         <h1>S\u00f8keresultater for \u201c${escapeHtml(q)}\u201d \u2014 ${results.length} treff</h1>
         <form class="search-form" action="/sok" method="GET">
           <input type="text" name="q" value="${escapeHtml(q)}" aria-label="S\u00f8k">
-          <button type="button" id="geoBtn" style="padding:12px 16px;background:var(--orange-400,#D4A373);color:white;border:2px solid var(--orange-400,#D4A373);border-left:none;font-weight:700;font-size:0.85rem;cursor:pointer;white-space:nowrap;">&#128205; N\u00e6r meg</button>
+          <button type="button" id="geoBtn" style="padding:12px 16px;background:var(--green-100,#e8f0e0);color:var(--green-700,#2D5016);border:2px solid var(--green-700,#2D5016);border-left:none;font-weight:700;font-size:0.85rem;cursor:pointer;white-space:nowrap;">&#128205; N\u00e6r meg</button>
           <button type="submit">S\u00f8k</button>
         </form>
         ${geoNote}

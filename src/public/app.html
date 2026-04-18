@@ -265,9 +265,9 @@
 
     .geo-btn {
       padding: 0.75rem 1rem;
-      background: var(--accent-orange);
-      color: white;
-      border: none;
+      background: #e8f0e0;
+      color: var(--forest-green);
+      border: 1.5px solid var(--forest-green);
       border-radius: 8px;
       cursor: pointer;
       font-weight: 600;
@@ -280,12 +280,14 @@
     }
 
     .geo-btn:hover {
-      background: #c49363;
+      background: var(--forest-green);
+      color: white;
       transform: translateY(-2px);
     }
 
     .geo-btn.active {
       background: var(--forest-green);
+      color: white;
     }
 
     .geo-btn:disabled {
@@ -1795,7 +1797,7 @@ curl -X POST https://rettfrabonden.com/api/marketplace/register \
       var btn = document.createElement('button');
       btn.id = 'heleNorgeBtn';
       btn.className = 'filter-btn';
-      btn.style.cssText = 'background: var(--accent-orange); color: white; border: none; margin-left: auto;';
+      btn.style.cssText = 'background: #e8f0e0; color: var(--forest-green); border: 1.5px solid var(--forest-green); margin-left: auto; font-weight: 600;';
       btn.innerHTML = '&#x1F30D; Vis hele Norge';
       btn.addEventListener('click', function() {
         performSearch(true);
