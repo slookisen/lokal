@@ -78,7 +78,7 @@ export const AdminRegistrationSchema = z.object({
   name: z.string().min(1),
   description: z.string().default(""),
   provider: z.string().default("auto-discovery"),
-  contactEmail: z.string().optional(),
+  contactEmail: z.string().default(""),
 
   url: z.string().default("https://rettfrabonden.com"),
   version: z.string().default("1.0.0"),

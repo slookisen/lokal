@@ -881,7 +881,8 @@ router.post("/admin/register", (req: Request, res: Response) => {
         details: error.errors,
       });
     } else {
-      res.status(500).json({ success: false, error: "Intern feil" });
+      console.error("[admin/register] Error:", error);
+      res.status(500).json({ success: false, error: error.message || "Intern feil" });
     }
   }
 });
