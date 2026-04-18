@@ -1,6 +1,6 @@
 import { Router, Request, Response } from "express";
 import { marketplaceRegistry } from "../services/marketplace-registry";
-import { AgentRegistrationSchema, DiscoveryQuerySchema } from "../models/marketplace";
+import { AgentRegistrationSchema, AdminRegistrationSchema, DiscoveryQuerySchema } from "../models/marketplace";
 import { interactionLogger } from "../services/interaction-logger";
 import { knowledgeService } from "../services/knowledge-service";
 import { geocodingService } from "../services/geocoding-service";
@@ -824,6 +824,58 @@ router.put("/agents/:id/knowledge", (req: Request, res: Response) => {
     });
   } catch (err: any) {
     res.status(400).json({ success: false, error: err.message });
+  }
+});
+
+// ─── POST /admin/register — Relaxed registration for auto-discovery ──
+// Only requires name — everything else gets sensible defaults.
+// Agents registered this way get lower trust scores until enriched,
+// because the completeness signal penalizes missing fields automatically.
+// The PUBLIC /register keeps strict requirements — producers who
+// self-register MUST provide email, URL, etc. for verification.
+
+router.post("/admin/register", (req: Request, res: Response) => {
+  const expectedKey = process.env.ADMIN_KEY;
+  if (!expectedKey) { res.status(503).json({ error: "Admin not configured" }); return; }
+  const adminKey = req.headers["x-admin-key"] as string;
+
+  if (!adminKey || adminKey !== expectedKey) {
+    res.status(403).json({ error: "Krever X-Admin-Key header" });
+    return;
+  }
+
+  try {
+    const registration = AdminRegistrationSchema.parse(req.body);
+    // Cast needed: AdminRegistration has optional contactEmail and flexible capabilities,
+    // but after Zod parsing all defaults are filled. The DB insert handles both shapes.
+    const agent = marketplaceRegistry.register(registration as any);
+
+    interactionLogger.log("register", {
+      agentId: agent.id,
+      metadata: { name: agent.name, role: agent.role, city: agent.location?.city, source: "admin" },
+      ipAddress: req.ip,
+    });
+
+    res.status(201).json({
+      success: true,
+      message: "Agent registrert via admin (relaxed schema)",
+      data: {
+        id: agent.id,
+        apiKey: agent.apiKey,
+        agentCardUrl: `${getBaseUrl(req)}/api/marketplace/agents/${agent.id}/card`,
+        registeredAt: agent.registeredAt,
+      },
+    });
+  } catch (error: any) {
+    if (error.name === "ZodError") {
+      res.status(400).json({
+        success: false,
+        error: "Ugyldig registrering",
+        details: error.errors,
+      });
+    } else {
+      res.status(500).json({ success: false, error: "Intern feil" });
+    }
   }
 });
 

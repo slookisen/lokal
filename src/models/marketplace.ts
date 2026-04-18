@@ -64,6 +64,58 @@ export const AgentRegistrationSchema = z.object({
 
 export type AgentRegistration = z.infer<typeof AgentRegistrationSchema>;
 
+// ─── Admin Agent Registration (relaxed) ──────────────────────
+// Used by auto-discovery pipeline via POST /admin/register with X-Admin-Key.
+// Only requires name — everything else has sensible defaults.
+// Agents registered this way get lower trust scores until enriched,
+// because the completeness signal in trust-score-service penalizes
+// missing fields automatically.
+//
+// The PUBLIC /register keeps strict requirements above — producers
+// who self-register MUST provide email, URL, etc. for verification.
+
+export const AdminRegistrationSchema = z.object({
+  name: z.string().min(1),
+  description: z.string().default(""),
+  provider: z.string().default("auto-discovery"),
+  contactEmail: z.string().optional(),
+
+  url: z.string().default("https://rettfrabonden.com"),
+  version: z.string().default("1.0.0"),
+  capabilities: z.record(z.string(), z.any()).default({}),
+
+  skills: z.array(z.object({
+    id: z.string().default("default"),
+    name: z.string().default("Lokal matprodusent"),
+    description: z.string().default("Selger lokalprodusert mat"),
+    tags: z.array(z.string()).default([]),
+    inputModes: z.array(z.string()).default(["application/json"]),
+    outputModes: z.array(z.string()).default(["application/json"]),
+  })).default([{
+    id: "default",
+    name: "Lokal matprodusent",
+    description: "Selger lokalprodusert mat",
+    tags: [],
+    inputModes: ["application/json"],
+    outputModes: ["application/json"],
+  }]),
+
+  role: z.enum(["producer", "consumer", "logistics", "quality", "price-intel"]).default("producer"),
+
+  location: z.object({
+    lat: z.number().min(-90).max(90),
+    lng: z.number().min(-180).max(180),
+    city: z.string(),
+    radiusKm: z.number().optional(),
+  }).optional(),
+
+  categories: z.array(z.string()).default([]),
+  tags: z.array(z.string()).default([]),
+  languages: z.array(z.string()).default(["no"]),
+});
+
+export type AdminRegistration = z.infer<typeof AdminRegistrationSchema>;
+
 // ─── Registered Agent (stored in registry) ────────────────────
 
 export const RegisteredAgentSchema = AgentRegistrationSchema.extend({
