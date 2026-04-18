@@ -1331,6 +1331,15 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
     if (k.email) contactItems.push(`<div class="ct-item"><div class="ct-icon">&#9993;</div><div><div class="ct-label">E-post</div><div class="ct-val"><a href="mailto:${k.email}">${escapeHtml(k.email)}</a></div></div></div>`);
     if (k.website) contactItems.push(`<div class="ct-item"><div class="ct-icon">&#127760;</div><div><div class="ct-label">Nettside</div><div class="ct-val"><a href="${escapeHtml(k.website)}" target="_blank" rel="noopener">${escapeHtml(k.website.replace(/^https?:\/\//, ""))}</a></div></div></div>`);
 
+    // Google Maps link — use coordinates if available, otherwise search by name+city
+    const mapsQuery = agent.location?.lat && agent.location?.lng && agent.location.lat !== 0
+      ? `${agent.location.lat},${agent.location.lng}`
+      : encodeURIComponent(`${agent.name}${cityName ? ` ${cityName}` : ""} Norge`);
+    const mapsUrl = agent.location?.lat && agent.location?.lng && agent.location.lat !== 0
+      ? `https://www.google.com/maps?q=${mapsQuery}`
+      : `https://www.google.com/maps/search/${mapsQuery}`;
+    contactItems.push(`<div class="ct-item"><div class="ct-icon">&#128506;</div><div><div class="ct-label">Kart</div><div class="ct-val"><a href="${mapsUrl}" target="_blank" rel="noopener">Vis på Google Maps</a></div></div></div>`);
+
     // Products — guard against string data (some agents have free-text or plain string arrays)
     const productsList = Array.isArray(k.products) ? k.products : [];
     const productsHtml = productsList.length
@@ -1422,6 +1431,7 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
         ${contactItems.join("") || `<p style="color:var(--g500);font-size:0.88rem;">Ingen kontaktinfo tilgjengelig enn\u00e5.</p>`}
         <div class="ct-actions">
           ${k.website ? `<a href="${escapeHtml(k.website)}" class="btn-p" target="_blank" rel="noopener">&#127760; Bes\u00f8k nettside</a>` : ""}
+          <a href="${mapsUrl}" class="btn-s" target="_blank" rel="noopener">&#128506; Vis p\u00e5 kart</a>
           <a href="${BASE_URL}/api/marketplace/agents/${agent.id}/vcard" class="btn-s">&#128195; Last ned kontaktkort</a>
         </div>
       </div>

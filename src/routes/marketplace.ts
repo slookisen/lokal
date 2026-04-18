@@ -430,6 +430,40 @@ router.put("/agents/:id", (req: Request, res: Response) => {
   res.json({ success: true, data: { id: updated.id, name: updated.name, lastSeenAt: updated.lastSeenAt } });
 });
 
+// ─── PATCH /agents/:id — Admin update agent fields ──────────
+// Allows admin to update description, categories, tags, etc.
+// Requires X-Admin-Key header.
+
+router.patch("/agents/:id", (req: Request, res: Response) => {
+  const expectedKey = getAdminKey();
+  if (!expectedKey) { res.status(503).json({ error: "Admin not configured" }); return; }
+
+  const adminKey = req.headers["x-admin-key"] as string;
+  const apiKey = req.headers["x-api-key"] as string;
+  const agentId = req.params.id as string;
+
+  // Accept either admin key or the agent's own API key
+  let authorized = false;
+  if (expectedKey && adminKey && adminKey === expectedKey) authorized = true;
+  if (!authorized && apiKey) {
+    const agent = marketplaceRegistry.getAgentByApiKey(apiKey);
+    if (agent && agent.id === agentId) authorized = true;
+  }
+
+  if (!authorized) {
+    res.status(403).json({ error: "Krever X-Admin-Key eller X-API-Key header" });
+    return;
+  }
+
+  const updated = marketplaceRegistry.updateAgent(agentId, req.body);
+  if (!updated) {
+    res.status(404).json({ error: "Agent ikke funnet" });
+    return;
+  }
+
+  res.json({ success: true, data: { id: updated.id, name: updated.name, description: updated.description } });
+});
+
 // ─── POST /agents/:id/heartbeat — Keep agent alive ───────────
 // Agents should ping this periodically so we know they're active
 
