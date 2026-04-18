@@ -18,7 +18,9 @@
 import { Router, Request, Response } from "express";
 import { marketplaceRegistry } from "../services/marketplace-registry";
 import { knowledgeService } from "../services/knowledge-service";
+import { geocodingService } from "../services/geocoding-service";
 import { analyticsService } from "../services/analytics-service";
+import { DiscoveryQuerySchema } from "../models/marketplace";
 import { getDb } from "../database/init";
 
 const router = Router();
@@ -246,8 +248,12 @@ function shell(title: string, description: string, content: string, extra?: { ca
 
 // ─── Producer card HTML (reused across pages) ───────────────
 
-function producerCard(a: any): string {
+function producerCard(a: any, matchReasons?: string[]): string {
   const city = a.city || a.location?.city || "";
+  const distKm = a.location?.distanceKm;
+  const cityText = distKm != null
+    ? `${escapeHtml(city)} &middot; ${distKm < 1 ? (distKm * 1000).toFixed(0) + " m" : distKm.toFixed(1) + " km"}`
+    : escapeHtml(city);
   const slug = slugify(a.name);
   const cats = (a.categories || []).slice(0, 3).map((c: string) => `<span class="tag">${catEmoji(c)} ${escapeHtml(formatCat(c))}</span>`).join("");
   const trustPct = Math.round((a.trustScore || 0) * 100);
@@ -258,7 +264,7 @@ function producerCard(a: any): string {
     <div class="pc-top">
       <div>
         <div class="pc-name">${escapeHtml(a.name)}</div>
-        <div class="pc-city">${escapeHtml(city)}</div>
+        <div class="pc-city">${cityText}</div>
       </div>
       ${verified}
     </div>
@@ -650,15 +656,64 @@ const SEARCH_CSS = `
   @media (max-width: 768px) { .results-grid { grid-template-columns: 1fr; } }
 `;
 
-router.get("/sok", (req: Request, res: Response) => {
+router.get("/sok", async (req: Request, res: Response) => {
   const q = req.query.q as string;
   if (!q) { res.redirect("/"); return; }
 
   try {
     const parsed = marketplaceRegistry.parseNaturalQuery(q);
-    const results = marketplaceRegistry.discover({ ...parsed, limit: 30, offset: 0 });
+    const heleNorge = req.query.heleNorge === "true";
 
-    const resultCards = results.map((r: any) => producerCard(r.agent)).join("");
+    // Geocode location from query text (e.g. "honning bergen" → Bergen coords)
+    if (!heleNorge && !parsed.location) {
+      const frontendLat = parseFloat(req.query.lat as string);
+      const frontendLng = parseFloat(req.query.lng as string);
+      if (!isNaN(frontendLat) && !isNaN(frontendLng)) {
+        parsed.location = { lat: frontendLat, lng: frontendLng };
+        parsed.maxDistanceKm = parseFloat(req.query.radius as string) || 30;
+      } else {
+        const geoResult = await geocodingService.extractAndGeocode(q);
+        if (geoResult) {
+          parsed.location = { lat: geoResult.lat, lng: geoResult.lng };
+          parsed.maxDistanceKm = geoResult.radiusKm;
+        }
+      }
+    }
+
+    // Preserve product terms through Zod parsing
+    const productTerms = parsed._productTerms;
+    const query = DiscoveryQuerySchema.parse({ ...parsed, limit: 30, offset: 0 });
+    if (productTerms) (query as any)._productTerms = productTerms;
+
+    let results = marketplaceRegistry.discover(query);
+
+    // Auto-expanding radius if too few results
+    const MIN_RESULTS = 3;
+    if (parsed.location && results.length < MIN_RESULTS && !heleNorge) {
+      for (const radius of [50, 100, 200]) {
+        if (results.length >= MIN_RESULTS) break;
+        const expanded = DiscoveryQuerySchema.parse({ ...parsed, maxDistanceKm: radius, limit: 30, offset: 0 });
+        if (productTerms) (expanded as any)._productTerms = productTerms;
+        results = marketplaceRegistry.discover(expanded);
+      }
+      if (results.length < MIN_RESULTS) {
+        const noGeo = DiscoveryQuerySchema.parse({ ...parsed, location: undefined, maxDistanceKm: undefined, limit: 30, offset: 0 });
+        if (productTerms) (noGeo as any)._productTerms = productTerms;
+        results = marketplaceRegistry.discover(noGeo);
+      }
+    }
+
+    const geoFiltered = !!parsed.location && !heleNorge;
+
+    const resultCards = results.map((r: any) => producerCard(r.agent, r.matchReasons)).join("");
+
+    const heleNorgeLink = geoFiltered
+      ? `<a href="/sok?q=${encodeURIComponent(q)}&heleNorge=true" style="display:inline-block;margin-top:12px;padding:8px 20px;background:var(--orange-400,#D4A373);color:white;border-radius:8px;text-decoration:none;font-weight:600;font-size:0.9rem;">&#127758; Vis hele Norge</a>`
+      : "";
+
+    const geoNote = geoFiltered
+      ? `<p style="color:var(--g500,#666);font-size:0.85rem;margin-top:8px;">Resultater filtrert etter sted. ${heleNorgeLink}</p>`
+      : "";
 
     const content = `
     <section class="search-hero">
@@ -667,8 +722,10 @@ router.get("/sok", (req: Request, res: Response) => {
         <h1>S\u00f8keresultater for \u201c${escapeHtml(q)}\u201d \u2014 ${results.length} treff</h1>
         <form class="search-form" action="/sok" method="GET">
           <input type="text" name="q" value="${escapeHtml(q)}" aria-label="S\u00f8k">
+          <button type="button" id="geoBtn" style="padding:12px 16px;background:var(--orange-400,#D4A373);color:white;border:2px solid var(--orange-400,#D4A373);border-left:none;font-weight:700;font-size:0.85rem;cursor:pointer;white-space:nowrap;">&#128205; N\u00e6r meg</button>
           <button type="submit">S\u00f8k</button>
         </form>
+        ${geoNote}
       </div>
     </section>
     <section class="sec">
@@ -679,7 +736,26 @@ router.get("/sok", (req: Request, res: Response) => {
             <p style="margin-top:8px;"><a href="/">Pr\u00f8v et annet s\u00f8k</a></p>
           </div>`
       }
-    </section>`;
+    </section>
+    <script>
+    (function() {
+      var geoBtn = document.getElementById('geoBtn');
+      if (!geoBtn || !navigator.geolocation) { if(geoBtn) geoBtn.style.display='none'; return; }
+      geoBtn.addEventListener('click', function() {
+        geoBtn.textContent = '\u23F3 Henter...';
+        geoBtn.disabled = true;
+        navigator.geolocation.getCurrentPosition(function(pos) {
+          var form = geoBtn.closest('form');
+          var q = form.querySelector('input[name=q]').value;
+          window.location.href = '/sok?q=' + encodeURIComponent(q) + '&lat=' + pos.coords.latitude + '&lng=' + pos.coords.longitude + '&radius=30';
+        }, function() {
+          geoBtn.textContent = '\\u274C Avsl\u00e5tt';
+          geoBtn.disabled = false;
+          setTimeout(function() { geoBtn.innerHTML = '&#128205; N\u00e6r meg'; }, 2000);
+        }, { enableHighAccuracy: false, timeout: 8000 });
+      });
+    })();
+    </script>`;
 
     res.send(shell(
       `${q} \u2014 S\u00f8k i Rett fra Bonden`,
