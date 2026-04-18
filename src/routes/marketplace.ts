@@ -20,6 +20,13 @@ import { trustScoreService } from "../services/trust-score-service";
 
 const router = Router();
 
+// ─── Admin key helper ────────────────────────────────────────
+// Accepts ADMIN_KEY or ANALYTICS_ADMIN_KEY so the enrichment
+// pipeline can authenticate with the same key used for the dashboard.
+function getAdminKey(): string {
+  return process.env.ADMIN_KEY || process.env.ANALYTICS_ADMIN_KEY || "";
+}
+
 // ─── Ensure agent exists in SQLite for FK constraints ───────
 // The marketplace registry keeps agents in-memory (loaded from seed/discovery).
 // But agent_claims has a FOREIGN KEY to agents(id). If the agent only exists
@@ -739,7 +746,7 @@ router.post("/agents/:id/unclaim", (req: Request, res: Response) => {
 // ─── POST /admin/agents/:id/reset-claim — Admin: reset verified/claim status ──
 
 router.post("/admin/agents/:id/reset-claim", (req: Request, res: Response) => {
-  const expectedKey = process.env.ADMIN_KEY;
+  const expectedKey = getAdminKey();
   const agentId = req.params.id as string;
   if (!expectedKey) {
     res.status(503).json({ success: false, error: "Admin not configured" });
@@ -772,7 +779,7 @@ router.put("/agents/:id/knowledge", (req: Request, res: Response) => {
   const claimToken = (req.headers["x-claim-token"] as string) || "";
   const apiKey = (req.headers["x-api-key"] as string) || "";
   const adminKeyHeader = (req.headers["x-admin-key"] as string) || "";
-  const expectedAdminKey = process.env.ADMIN_KEY || "";
+  const expectedAdminKey = getAdminKey();
   const agentId = req.params.id as string;
 
   let authorized = false;
@@ -835,7 +842,7 @@ router.put("/agents/:id/knowledge", (req: Request, res: Response) => {
 // self-register MUST provide email, URL, etc. for verification.
 
 router.post("/admin/register", (req: Request, res: Response) => {
-  const expectedKey = process.env.ADMIN_KEY;
+  const expectedKey = getAdminKey();
   if (!expectedKey) { res.status(503).json({ error: "Admin not configured" }); return; }
   const adminKey = req.headers["x-admin-key"] as string;
 
@@ -885,7 +892,7 @@ router.post("/admin/register", (req: Request, res: Response) => {
 // Requires ADMIN_KEY header.
 
 router.post("/admin/bulk-enrich", (req: Request, res: Response) => {
-  const expectedKey = process.env.ADMIN_KEY;
+  const expectedKey = getAdminKey();
   if (!expectedKey) { res.status(503).json({ error: "Admin not configured" }); return; }
   const adminKey = req.headers["x-admin-key"] as string;
 
@@ -935,7 +942,7 @@ router.post("/admin/bulk-enrich", (req: Request, res: Response) => {
 router.delete("/agents/:id", (req: Request, res: Response) => {
   try {
     const adminKey = req.headers["x-admin-key"] as string;
-    const expectedKey = process.env.ADMIN_KEY;
+    const expectedKey = getAdminKey();
     const agentId = req.params.id as string;
     if (!expectedKey) { res.status(503).json({ error: "Admin not configured" }); return; }
 
@@ -993,7 +1000,7 @@ router.delete("/agents/:id", (req: Request, res: Response) => {
 
 router.post("/admin/deduplicate", (req: Request, res: Response) => {
   const adminKey = req.headers["x-admin-key"] as string;
-  const expectedKey = process.env.ADMIN_KEY || "";
+  const expectedKey = getAdminKey();
 
   if (!adminKey || adminKey !== expectedKey) {
     res.status(403).json({ error: "Krever X-Admin-Key header" });
@@ -1096,7 +1103,7 @@ router.get("/agents/:id/trust", (req: Request, res: Response) => {
 // current data. Requires ADMIN_KEY header.
 
 router.post("/admin/recalculate-trust", (req: Request, res: Response) => {
-  const expectedKey = process.env.ADMIN_KEY;
+  const expectedKey = getAdminKey();
   if (!expectedKey) { res.status(503).json({ error: "Admin not configured" }); return; }
   const adminKey = req.headers["x-admin-key"] as string;
 
@@ -1290,7 +1297,7 @@ router.get("/find-match", (req: Request, res: Response) => {
 // outreach campaigns are converting.
 
 router.get("/admin/claims", (req: Request, res: Response) => {
-  const expectedKey = process.env.ADMIN_KEY;
+  const expectedKey = getAdminKey();
   if (!expectedKey) { res.status(503).json({ error: "Admin not configured" }); return; }
   const adminKey = (req.headers["x-admin-key"] as string) || (req.query.key as string);
   if (!adminKey || adminKey !== expectedKey) {
