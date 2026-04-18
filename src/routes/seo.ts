@@ -1331,14 +1331,15 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
     if (k.email) contactItems.push(`<div class="ct-item"><div class="ct-icon">&#9993;</div><div><div class="ct-label">E-post</div><div class="ct-val"><a href="mailto:${k.email}">${escapeHtml(k.email)}</a></div></div></div>`);
     if (k.website) contactItems.push(`<div class="ct-item"><div class="ct-icon">&#127760;</div><div><div class="ct-label">Nettside</div><div class="ct-val"><a href="${escapeHtml(k.website)}" target="_blank" rel="noopener">${escapeHtml(k.website.replace(/^https?:\/\//, ""))}</a></div></div></div>`);
 
-    // Google Maps link — use coordinates if available, otherwise search by name+city
-    const mapsQuery = agent.location?.lat && agent.location?.lng && agent.location.lat !== 0
-      ? `${agent.location.lat},${agent.location.lng}`
-      : encodeURIComponent(`${agent.name}${cityName ? ` ${cityName}` : ""} Norge`);
-    const mapsUrl = agent.location?.lat && agent.location?.lng && agent.location.lat !== 0
-      ? `https://www.google.com/maps?q=${mapsQuery}`
-      : `https://www.google.com/maps/search/${mapsQuery}`;
-    contactItems.push(`<div class="ct-item"><div class="ct-icon">&#128506;</div><div><div class="ct-label">Kart</div><div class="ct-val"><a href="${mapsUrl}" target="_blank" rel="noopener">Vis på Google Maps</a></div></div></div>`);
+    // Google Maps link — ALWAYS search by business name, never raw coordinates.
+    // Our lat/lng are often just city-center approximations, not actual business
+    // locations. Google Maps search finds the real registered business listing.
+    const mapsSearchParts = [agent.name];
+    if (k.address) mapsSearchParts.push(k.address);
+    if (cityName) mapsSearchParts.push(cityName);
+    mapsSearchParts.push("Norge");
+    const mapsUrl = `https://www.google.com/maps/search/${encodeURIComponent(mapsSearchParts.join(", "))}`;
+    contactItems.push(`<div class="ct-item"><div class="ct-icon">&#128506;</div><div><div class="ct-label">Kart</div><div class="ct-val"><a href="${mapsUrl}" target="_blank" rel="noopener">Vis p\u00e5 Google Maps</a></div></div></div>`);
 
     // Products — guard against string data (some agents have free-text or plain string arrays)
     const productsList = Array.isArray(k.products) ? k.products : [];

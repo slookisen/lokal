@@ -114,7 +114,8 @@ function escapeVCard(value: string): string {
 function buildVCard(agentId: string): string | null {
   const info = knowledgeService.getAgentInfo(agentId);
   if (!info) return null;
-  const { agent, knowledge: k } = info;
+  const { agent: _agent, knowledge: k } = info;
+  const agent = _agent as any; // Cast for flexibility — agent shape varies
   const lines: string[] = [];
   lines.push("BEGIN:VCARD");
   lines.push("VERSION:3.0");
@@ -133,20 +134,41 @@ function buildVCard(agentId: string): string | null {
   }
   // Products as NOTE appendix (visible in most contact apps)
   if (k.products && Array.isArray(k.products) && k.products.length > 0) {
-    const productList = k.products.map((p: any) => {
-      let item = p.name || p.product || "Ukjent";
-      if (p.price) item += ` (${p.price})`;
-      if (p.season) item += ` [${p.season}]`;
-      return item;
-    }).join(", ");
-    const notePrefix = k.about ? escapeVCard(k.about) + "\\n\\nProdukter: " : "Produkter: ";
-    // Override NOTE with about + products combined
-    const noteIdx = lines.findIndex(l => l.startsWith("NOTE:"));
-    if (noteIdx >= 0) lines[noteIdx] = `NOTE:${notePrefix}${escapeVCard(productList)}`;
-    else lines.push(`NOTE:Produkter: ${escapeVCard(productList)}`);
+    const productList = k.products
+      .map((p: any) => {
+        // Handle object products and plain strings; skip empty/unknown
+        const name = typeof p === "string" ? p : (p.name || p.product || "");
+        if (!name || name.toLowerCase() === "ukjent") return null;
+        let item = name;
+        if (p.price) item += ` (${p.price})`;
+        if (p.seasonal && p.months?.length) item += ` [sesong]`;
+        return item;
+      })
+      .filter(Boolean)
+      .join(", ");
+    if (productList) {
+      const notePrefix = k.about ? escapeVCard(k.about) + "\\n\\nProdukter: " : "Produkter: ";
+      const noteIdx = lines.findIndex(l => l.startsWith("NOTE:"));
+      if (noteIdx >= 0) lines[noteIdx] = `NOTE:${notePrefix}${escapeVCard(productList)}`;
+      else lines.push(`NOTE:Produkter: ${escapeVCard(productList)}`);
+    }
   }
+  // GEO field — helps contact apps show location
+  if (agent.location?.lat && agent.location?.lng && agent.location.lat !== 0) {
+    lines.push(`GEO:${agent.location.lat};${agent.location.lng}`);
+  }
+  // Google Maps search URL as custom field — AI agents and contact apps can use this
+  const mapsParts = [agent.name];
+  if (k.address) mapsParts.push(k.address);
+  if (agent.city) mapsParts.push(agent.city);
+  mapsParts.push("Norge");
+  lines.push(`X-LOKAL-MAPS:https://www.google.com/maps/search/${encodeURIComponent(mapsParts.join(", "))}`);
   // Category tag helps contact apps group these
-  lines.push("CATEGORIES:Rett fra Bonden,Norsk mat,Produsent");
+  const catNames = (agent.categories || []).map((c: string) => c.charAt(0).toUpperCase() + c.slice(1));
+  lines.push(`CATEGORIES:Rett fra Bonden,${catNames.length ? catNames.join(",") : "Norsk mat"},Produsent`);
+  // Producer page URL
+  const profileSlug = agent.name.toLowerCase().replace(/[^a-zæøå0-9]+/g, "-").replace(/-+/g, "-").replace(/^-|-$/g, "");
+  lines.push(`X-LOKAL-PROFILE:https://rettfrabonden.com/produsent/${profileSlug}`);
   lines.push(`X-LOKAL-AGENT-ID:${agent.id}`);
   if (agent.trustScore !== undefined && agent.trustScore !== null) {
     lines.push(`X-LOKAL-TRUST-SCORE:${Math.round(agent.trustScore * 100)}`);
@@ -392,15 +414,84 @@ router.get("/agents/:id/vcard", (req: Request, res: Response) => {
 });
 
 // ─── GET /agents/:id/card — Individual agent card (A2A) ──────
-// Standard A2A agent card for a registered agent
+// Standard A2A agent card enriched with knowledge data.
+// This is the main endpoint AI agents use to learn about a producer,
+// so it must include everything: contact, products, hours, certs, links.
 
 router.get("/agents/:id/card", (req: Request, res: Response) => {
   const agentId = req.params.id as string;
-  const card = marketplaceRegistry.getAgentCard(agentId);
+  const card = marketplaceRegistry.getAgentCard(agentId) as any;
   if (!card) {
     res.status(404).json({ error: "Agent ikke funnet" });
     return;
   }
+
+  // Enrich with knowledge data so AI agents get the full picture
+  const info = knowledgeService.getAgentInfo(agentId);
+  if (info) {
+    const k = info.knowledge as any;
+    const agent = info.agent as any;
+    const cityName = agent.city || agent.location?.city || "";
+
+    // Contact info block — critical for AI agents recommending businesses
+    const contact: any = {};
+    if (k.address) contact.address = k.address;
+    if (k.postalCode) contact.postalCode = k.postalCode;
+    if (cityName) contact.city = cityName;
+    contact.country = "Norway";
+    if (k.phone) contact.phone = k.phone;
+    if (k.email) contact.email = k.email;
+    if (k.website) contact.website = k.website;
+    if (Object.keys(contact).length > 1) card.contact = contact;
+
+    // Products — the core of what this producer offers
+    if (k.products && Array.isArray(k.products) && k.products.length > 0) {
+      card.products = k.products
+        .map((p: any) => {
+          if (typeof p === "string") return { name: p };
+          const item: any = {};
+          if (p.name) item.name = p.name;
+          if (p.category) item.category = p.category;
+          if (p.price) item.price = p.price;
+          if (p.seasonal) item.seasonal = p.seasonal;
+          if (p.months) item.availableMonths = p.months;
+          if (p.organic) item.organic = true;
+          return Object.keys(item).length > 0 ? item : null;
+        })
+        .filter(Boolean);
+    }
+
+    // Opening hours
+    if (k.openingHours && Array.isArray(k.openingHours) && k.openingHours.length > 0) {
+      card.openingHours = k.openingHours;
+    } else if (typeof k.openingHours === "string" && k.openingHours) {
+      card.openingHours = k.openingHours;
+    }
+
+    // Certifications, specialties, payment, delivery
+    if (k.certifications?.length) card.certifications = k.certifications;
+    if (k.specialties?.length) card.specialties = k.specialties;
+    if (k.paymentMethods?.length) card.paymentMethods = k.paymentMethods;
+    if (k.deliveryOptions?.length) card.deliveryOptions = k.deliveryOptions;
+
+    // About text (richer than description)
+    if (k.about) card["x-lokal"].about = k.about;
+
+    // Useful links for AI agents and consumers
+    const slug = agent.name.toLowerCase().replace(/[^a-zæøå0-9]+/g, "-").replace(/-+/g, "-").replace(/^-|-$/g, "");
+    const mapsParts = [agent.name];
+    if (k.address) mapsParts.push(k.address);
+    if (cityName) mapsParts.push(cityName);
+    mapsParts.push("Norge");
+
+    card.links = {
+      profile: `https://rettfrabonden.com/produsent/${slug}`,
+      googleMaps: `https://www.google.com/maps/search/${encodeURIComponent(mapsParts.join(", "))}`,
+      vcard: `${getBaseUrl(req)}/api/marketplace/agents/${agentId}/vcard`,
+    };
+    if (k.website) card.links.website = k.website;
+  }
+
   res.json(card);
 });
 
