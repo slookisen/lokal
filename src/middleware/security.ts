@@ -78,10 +78,10 @@ const sharedValidate = { trustProxy: false } as const;
 
 // ─── Rate Limiters ───────────────────────────────────────────
 
-// General API limiter
+// General API limiter — raised to 300/15min for enrichment runs (200 agents × ~2 req each)
 export const generalLimiter = rateLimit({
   windowMs: 15 * 60 * 1000, // 15 minutes
-  max: 100,
+  max: 300,
   standardHeaders: true,
   legacyHeaders: false,
   validate: sharedValidate,
@@ -122,7 +122,7 @@ export const searchLimiter = rateLimit({
 // Fix #6: Strict rate limiter for destructive admin endpoints
 export const adminLimiter = rateLimit({
   windowMs: 60 * 60 * 1000, // 1 hour
-  max: 100, // Raised from 10 — admin endpoints require X-Admin-Key anyway
+  max: 500, // Raised from 100 — admin endpoints require X-Admin-Key anyway, need room for 200-agent enrichment runs
   standardHeaders: true,
   legacyHeaders: false,
   validate: sharedValidate,
