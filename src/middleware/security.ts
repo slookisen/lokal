@@ -122,9 +122,9 @@ export const searchLimiter = rateLimit({
 // Fix #6: Strict rate limiter for destructive admin endpoints
 export const adminLimiter = rateLimit({
   windowMs: 60 * 60 * 1000, // 1 hour
-  max: 10,
+  max: 100, // Raised from 10 — admin endpoints require X-Admin-Key anyway
   standardHeaders: true,
   legacyHeaders: false,
   validate: sharedValidate,
-  message: { success: false, error: "Admin rate limit nådd. Maks 10 admin-operasjoner per time." },
+  message: { success: false, error: "Admin rate limit nådd. Maks 100 admin-operasjoner per time." },
 });
