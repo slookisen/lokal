@@ -42,7 +42,7 @@
 ---
 
 ## Tier 2: Ny Funksjonalitet i Plattformen
-**Status: ⬜ Not Started**
+**Status: ✅ Code Complete (2026-04-19) — awaiting deploy + data population**
 **Goal:** Add new fields and features that differentiate us from a simple directory.
 
 ### 2.1 Bilder / Logo
