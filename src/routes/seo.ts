@@ -1103,14 +1103,19 @@ router.get("/teknologi", (_req: Request, res: Response) => {
     </div>
 
     <div id="claude-mcp" class="setup-guide">
-      <h3>&#129520; Claude Desktop</h3>
-      <p style="background:#fef3c7;padding:10px 14px;border-radius:8px;font-size:0.82rem;color:#92400e;margin-bottom:12px;">&#9888;&#65039; <strong>Krever litt teknisk oppsett.</strong> Hvis du vil komme i gang raskt, pr\u00f8v ChatGPT-metoden over \u2014 den tar 30 sekunder uten installasjon.</p>
-      <p>Claude Desktop bruker en lokal MCP-server som kj\u00f8rer p\u00e5 din maskin. Du trenger <a href="https://nodejs.org" target="_blank">Node.js</a> installert (gratis).</p>
+      <h3>&#129520; Claude Desktop (Pro/Max/Team/Enterprise)</h3>
+      <p><strong>Metode 1 \u2014 Remote MCP (anbefalt, ingen installasjon):</strong></p>
       <div class="setup-steps">
-        <div class="setup-step"><span class="step-n">1</span><div><strong>Installer Node.js:</strong> G\u00e5 til <a href="https://nodejs.org" target="_blank">nodejs.org</a> og last ned LTS-versjonen. Kj\u00f8r installasjonsprogrammet med standard-innstillinger.</div></div>
-        <div class="setup-step"><span class="step-n">2</span><div><strong>Finn config-filen:</strong> \u00c5pne Claude Desktop &rarr; klikk tannhjulet (\u2699\ufe0f) &rarr; <strong>Developer</strong> &rarr; <strong>Edit Config</strong>. Dette \u00e5pner en tekstfil i Notepad.</div></div>
-        <div class="setup-step"><span class="step-n">3</span><div><strong>Lim inn denne teksten</strong> (erstatt alt som st\u00e5r der fra f\u00f8r):
-          <div class="tech-code" style="margin:8px 0 0;font-size:0.8rem;position:relative;">
+        <div class="setup-step"><span class="step-n">1</span><div>\u00c5pne Claude Desktop &rarr; <strong>Settings</strong> &rarr; <strong>Integrations</strong></div></div>
+        <div class="setup-step"><span class="step-n">2</span><div>Klikk <strong>&laquo;Add custom connector&raquo;</strong></div></div>
+        <div class="setup-step"><span class="step-n">3</span><div>Lim inn: <code>https://rettfrabonden.com/mcp</code></div></div>
+        <div class="setup-step"><span class="step-n">4</span><div>Ferdig! Sp\u00f8r f.eks. <em>&laquo;Finn \u00f8kologisk kj\u00f8tt i Trondheim&raquo;</em></div></div>
+      </div>
+      <p style="font-size:0.82rem;color:var(--g500);margin-top:14px;"><strong>Metode 2 \u2014 Lokal npm-pakke</strong> (for utviklere, Claude Code, eller Claude Desktop uten Pro):</p>
+      <div class="setup-steps">
+        <div class="setup-step"><span class="step-n">1</span><div>Installer <a href="https://nodejs.org" target="_blank">Node.js</a> &rarr; \u00c5pne Claude Desktop &rarr; Settings &rarr; Developer &rarr; <strong>Edit Config</strong></div></div>
+        <div class="setup-step"><span class="step-n">2</span><div>Legg til:
+          <div class="tech-code" style="margin:8px 0 0;font-size:0.8rem;">
 {<br>
 &nbsp;&nbsp;<span class="key">"mcpServers"</span>: {<br>
 &nbsp;&nbsp;&nbsp;&nbsp;<span class="key">"lokal"</span>: {<br>
@@ -1121,10 +1126,8 @@ router.get("/teknologi", (_req: Request, res: Response) => {
 }
           </div>
         </div></div>
-        <div class="setup-step"><span class="step-n">4</span><div><strong>Lagre og start p\u00e5 nytt:</strong> Trykk Ctrl+S for \u00e5 lagre filen, lukk Claude Desktop helt, og \u00e5pne det igjen. Du vil se et &#128295;-ikon \u2014 trykk p\u00e5 det for \u00e5 bekrefte at &laquo;lokal&raquo; er tilgjengelig.</div></div>
-        <div class="setup-step"><span class="step-n">5</span><div><strong>Test det:</strong> Skriv f.eks. <em>&laquo;Finn lokal honning i Bergen&raquo;</em>. Claude vil automatisk bruke Lokal-verkt\u00f8yet.</div></div>
+        <div class="setup-step"><span class="step-n">3</span><div>Lagre (Ctrl+S) og start Claude Desktop p\u00e5 nytt.</div></div>
       </div>
-      <p style="font-size:0.8rem;color:var(--g400);margin-top:12px;"><strong>Kommer snart:</strong> Anthropic jobber med remote MCP-st\u00f8tte. N\u00e5r det lanseres vil Claude fungere like enkelt som ChatGPT \u2014 bare lim inn en URL.</p>
     </div>
 
     <div class="setup-guide">

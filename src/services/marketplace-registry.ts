@@ -8,7 +8,7 @@ import {
   DiscoveryResult,
 } from "../models/marketplace";
 
-// â”€â”€â”€ Marketplace Registry Service (SQLite-backed) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// â"€â"€â"€ Marketplace Registry Service (SQLite-backed) â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€
 // This is the CORE of what makes Lokal unique: the agent registry.
 //
 // v2: Now persistent with SQLite. Data survives restart.
@@ -36,7 +36,7 @@ class MarketplaceRegistry {
     this._statsCache = null;
   }
 
-  // â”€â”€â”€ Registration â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+  // â"€â"€â"€ Registration â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€
 
   register(registration: AgentRegistration): RegisteredAgent {
     const db = getDb();
@@ -89,7 +89,7 @@ class MarketplaceRegistry {
     return this.rowToAgent(db.prepare("SELECT * FROM agents WHERE id = ?").get(id) as any)!;
   }
 
-  // â”€â”€â”€ Discovery (the money endpoint) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+  // â"€â"€â"€ Discovery (the money endpoint) â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€
   // Consumer agents call this to find producers.
   // Uses bounding-box pre-filter for geo (Gap 6 fix).
 
@@ -122,7 +122,7 @@ class MarketplaceRegistry {
     const rows = db.prepare(sql).all(...params) as any[];
     let candidates = rows.map(r => this.rowToAgent(r)!);
 
-    // 3. Filter by categories (in-app â€” JSON array matching)
+    // 3. Filter by categories (in-app â€" JSON array matching)
     if (query.categories && query.categories.length > 0) {
       candidates = candidates.filter(a =>
         query.categories!.some(cat =>
@@ -209,7 +209,7 @@ class MarketplaceRegistry {
     const results: DiscoveryResult[] = candidates.map(agent => {
       const { score, reasons } = this.calculateRelevance(agent, query, productTerms, productMatchMap);
 
-      // Track discovery stats (async-safe â€” fire and forget)
+      // Track discovery stats (async-safe â€" fire and forget)
       this.incrementDiscovery(agent.id);
 
       return {
@@ -247,7 +247,7 @@ class MarketplaceRegistry {
     return results.slice(query.offset || 0, (query.offset || 0) + (query.limit || 20));
   }
 
-  // â”€â”€â”€ Natural language query parsing â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+  // â"€â"€â"€ Natural language query parsing â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€
 
   parseNaturalQuery(query: string): Partial<DiscoveryQuery> & { _productTerms?: string[] } {
     const q = query.toLowerCase().replace(/[?!.,]/g, "");
@@ -338,7 +338,7 @@ class MarketplaceRegistry {
     return parsed;
   }
 
-  // â”€â”€â”€ Agent Card Generation (A2A standard) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+  // â"€â"€â"€ Agent Card Generation (A2A standard) â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€
 
   getAgentCard(agentId: string): object | null {
     const agent = this.getAgent(agentId);
@@ -370,27 +370,27 @@ class MarketplaceRegistry {
     };
   }
 
-  // â”€â”€â”€ Registry-level Agent Card (Lokal itself) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+  // â"€â"€â"€ Registry-level Agent Card (Lokal itself) â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€
 
   getRegistryCard(baseUrl: string): object {
     const stats = this.getStats();
     return {
-      // â”€â”€â”€ A2A spec-compliant fields â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+      // â"€â"€â"€ A2A spec-compliant fields â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€
       // WHY bilingual: Consumer agents (Claude, GPT, Gemini, etc.)
       // search in English. Norwegian producers search in Norwegian.
       // Both need to find us. Bilingual descriptions = 2x discovery surface.
       name: "Lokal",
       description: "A2A marketplace for local food in Norway. " +
-        "Connect AI agents with 350+ local farms, shops, and producers. " +
+        `Connect AI agents with ${stats.totalAgents || 1400}+ local farms, shops, and producers. ` +
         "Search fresh produce, organic vegetables, meat, fish, dairy, honey, bread, and more. " +
-        "Agent-markedsplass for lokal mat i Norge â€” ferske grÃ¸nnsaker, frukt, kjÃ¸tt, fisk, meieri, honning, brÃ¸d og mer.",
+        "Agent-markedsplass for lokal mat i Norge - ferske gronnsaker, frukt, kjott, fisk, meieri, honning, brod og mer.",
       url: baseUrl,
       provider: {
         organization: "Lokal",
         url: baseUrl,
         contactUrl: `${baseUrl}/docs`,
         description: "Open agent-to-agent food marketplace operator. " +
-          "Norges fÃ¸rste A2A-markedsplass for lokal mat.",
+          "Norges f\u00f8rste A2A-markedsplass for lokal mat.",
       },
       version: "1.0.0",
       documentationUrl: `${baseUrl}/docs`,
@@ -399,20 +399,20 @@ class MarketplaceRegistry {
 
 
 
-      // â”€â”€â”€ Protocol capabilities â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+      // â"€â"€â"€ Protocol capabilities â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€
       capabilities: {
         streaming: false,
         pushNotifications: false,
         stateTransitionHistory: true,
       },
 
-      // â”€â”€â”€ Authentication â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+      // â"€â"€â"€ Authentication â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€
       authentication: {
         schemes: ["apiKey"],
         credentials: null, // Open for reads, key for writes
       },
 
-      // â”€â”€â”€ A2A interfaces â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+      // â"€â"€â"€ A2A interfaces â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€
       interfaces: [
         {
           type: "json-rpc",
@@ -427,19 +427,19 @@ class MarketplaceRegistry {
         },
       ],
 
-      // â”€â”€â”€ Skills (what agents can DO through us) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+      // â"€â"€â"€ Skills (what agents can DO through us) â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€
       // Each skill is a capability an external agent can invoke.
       // Rich descriptions + tags = higher match probability.
       skills: [
         {
           id: "discover-local-food-agents",
           name: "Discover Local Food Agents / Finn lokale matagenter",
-          description: "Search a registry of 350+ verified local food producers in Norway. " +
+          description: `Search a registry of ${stats.totalAgents || 1400}+ verified local food producers in Norway. ` +
             "Filter by category (vegetables, fruit, meat, fish, dairy, eggs, honey, herbs, bread, berries), " +
-            "location (Oslo, Bergen, Trondheim, Stavanger, TromsÃ¸, and rural districts), " +
+            "location (Oslo, Bergen, Trondheim, Stavanger, Troms\u00f8, and rural districts), " +
             "certifications (organic, Debio, farm-direct), delivery options (pickup, local delivery), " +
             "and trust score. Returns ranked results with contact info and A2A endpoints. " +
-            "SÃ¸k blant 350+ verifiserte lokale matprodusenter i Norge.",
+            `Søk blant ${stats.totalAgents || 1400}+ verifiserte lokale matprodusenter i Norge.`,
           tags: [
             // English discovery keywords (what agents actually search for)
             "local food", "fresh produce", "organic", "farm direct", "vegetables", "fruit",
@@ -447,12 +447,12 @@ class MarketplaceRegistry {
             "food marketplace", "food supplier", "grocery", "farm to table", "sustainable food",
             "food delivery", "food procurement", "wholesale food", "restaurant supply",
             // Norwegian keywords (for Nordic agents)
-            "lokal mat", "ferske grÃ¸nnsaker", "Ã¸kologisk", "gÃ¥rdsutsalg", "frukt",
-            "kjÃ¸tt", "fisk", "sjÃ¸mat", "meieri", "egg", "honning", "urter", "brÃ¸d", "bÃ¦r",
+            "lokal mat", "ferske gr\u00f8nnsaker", "\u00f8kologisk", "g\u00e5rdsutsalg", "frukt",
+            "kj\u00f8tt", "fisk", "sj\u00f8mat", "meieri", "egg", "honning", "urter", "br\u00f8d", "b\u00e6r",
             "matmarked", "matleveranse", "kortreist mat", "sesongvarer",
             // Geographic (city-level discovery)
-            "Norway", "Norge", "Oslo", "Bergen", "Trondheim", "Stavanger", "TromsÃ¸",
-            "Kristiansand", "Drammen", "Fredrikstad", "BodÃ¸",
+            "Norway", "Norge", "Oslo", "Bergen", "Trondheim", "Stavanger", "Troms\u00f8",
+            "Kristiansand", "Drammen", "Fredrikstad", "Bod\u00f8",
           ],
           inputModes: ["text/plain", "application/json"],
           outputModes: ["application/json"],
@@ -471,7 +471,7 @@ class MarketplaceRegistry {
             "Registrer en ny matprodusent som agent i Lokal-markedsplassen.",
           tags: [
             "register", "onboard", "producer", "farm", "shop", "cooperative",
-            "registrering", "produsent", "gÃ¥rd", "butikk", "andelslag",
+            "registrering", "produsent", "g\u00e5rd", "butikk", "andelslag",
           ],
           inputModes: ["application/json"],
           outputModes: ["application/json"],
@@ -482,14 +482,14 @@ class MarketplaceRegistry {
         },
         {
           id: "search-compare-food",
-          name: "Search & Compare Local Food / SÃ¸k og sammenlign",
+          name: "Search & Compare Local Food / S\u00f8k og sammenlign",
           description: "Natural language search across all producers. Compare prices, delivery options, " +
             "organic certifications, and availability. Supports both English and Norwegian queries. " +
             "Agents can negotiate directly with matched producers via the conversation system. " +
-            "SÃ¸k, sammenlign priser, leveringsalternativer og tilgjengelighet.",
+            "S\u00f8k, sammenlign priser, leveringsalternativer og tilgjengelighet.",
           tags: [
             "search", "compare", "price", "delivery", "availability", "negotiate",
-            "sÃ¸k", "sammenlign", "pris", "levering", "tilgjengelighet",
+            "s\u00f8k", "sammenlign", "pris", "levering", "tilgjengelighet",
           ],
           inputModes: ["text/plain", "application/json"],
           outputModes: ["application/json"],
@@ -504,10 +504,10 @@ class MarketplaceRegistry {
           description: "Initiate a buyer-seller conversation between agents. " +
             "Supports offer/accept/reject message flow with full transaction tracking. " +
             "Consumer agents can negotiate prices, quantities, and delivery terms. " +
-            "Start en kjÃ¸per-selger samtale mellom agenter med tilbud og forhandling.",
+            "Start en kj\u00f8per-selger samtale mellom agenter med tilbud og forhandling.",
           tags: [
             "negotiate", "conversation", "order", "buy", "transaction",
-            "forhandling", "samtale", "bestilling", "kjÃ¸p", "handel",
+            "forhandling", "samtale", "bestilling", "kj\u00f8p", "handel",
           ],
           inputModes: ["application/json"],
           outputModes: ["application/json"],
@@ -518,7 +518,7 @@ class MarketplaceRegistry {
         },
       ],
 
-      // â”€â”€â”€ Security â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+      // â"€â"€â"€ Security â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€
       securitySchemes: {
         apiKey: {
           type: "apiKey",
@@ -526,11 +526,11 @@ class MarketplaceRegistry {
           name: "X-API-Key",
           description: "API key received upon registration. Required for write operations. " +
             "Read/search operations are open. " +
-            "API-nÃ¸kkel mottatt ved registrering. Kreves for skriveoperasjoner.",
+            "API-n\u00f8kkel mottatt ved registrering. Kreves for skriveoperasjoner.",
         },
       },
 
-      // â”€â”€â”€ Lokal-specific metadata â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+      // â"€â"€â"€ Lokal-specific metadata â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€
       "x-lokal": {
         type: "registry",
         region: "Norway",
@@ -549,7 +549,7 @@ class MarketplaceRegistry {
     };
   }
 
-  // â”€â”€â”€ CRUD helpers â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+  // â"€â"€â"€ CRUD helpers â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€
 
   getAgent(id: string): RegisteredAgent | undefined {
     const db = getDb();
@@ -646,7 +646,7 @@ class MarketplaceRegistry {
     return this._statsCache;
   }
 
-  // â”€â”€â”€ Task lifecycle (A2A Gap 7 fix) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+  // â"€â"€â"€ Task lifecycle (A2A Gap 7 fix) â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€
 
   createTask(method: string, params: any, consumerAgentId?: string): any {
     const db = getDb();
@@ -713,7 +713,7 @@ class MarketplaceRegistry {
     }));
   }
 
-  // â”€â”€â”€ Listing CRUD â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+  // â"€â"€â"€ Listing CRUD â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€
 
   addListing(agentId: string, listing: any): any {
     const db = getDb();
@@ -741,7 +741,7 @@ class MarketplaceRegistry {
     return db.prepare("SELECT * FROM listings WHERE agent_id = ? ORDER BY created_at DESC").all(agentId) as any[];
   }
 
-  // â”€â”€â”€ Check if agent exists by name (for idempotent seeding) â”€
+  // â"€â"€â"€ Check if agent exists by name (for idempotent seeding) â"€
 
   getAgentByName(name: string): RegisteredAgent | undefined {
     const db = getDb();
@@ -749,7 +749,7 @@ class MarketplaceRegistry {
     return row ? this.rowToAgent(row) : undefined;
   }
 
-  // â”€â”€â”€ Private helpers â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+  // â"€â"€â"€ Private helpers â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€
 
   private generateApiKey(): string {
     return `lok_${crypto.randomBytes(32).toString("hex")}`;
@@ -765,7 +765,7 @@ class MarketplaceRegistry {
     } catch { /* non-critical */ }
   }
 
-  // â”€â”€â”€ Reputation Engine â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+  // â"€â"€â"€ Reputation Engine â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€
   // Recalculates trust score based on real behavior, not just defaults.
   // Called after transactions complete.
   //
@@ -792,7 +792,7 @@ class MarketplaceRegistry {
     // Verification bonus
     if (agent.is_verified) score += 0.15;
 
-    // Completion rate (contacted â†’ chosen)
+    // Completion rate (contacted â†' chosen)
     if (m.times_contacted > 0) {
       const completionRate = Math.min(1, m.times_chosen / m.times_contacted);
       score += 0.15 * completionRate;
@@ -916,7 +916,7 @@ class MarketplaceRegistry {
     }
 
     score += 0.05 * agent.trustScore;
-    if (agent.trustScore > 0.8) reasons.push("HÃ¸y tillitsscore");
+    if (agent.trustScore > 0.8) reasons.push("H\u00f8y tillitsscore");
 
     if (agent.isVerified) {
       score += 0.05;
@@ -927,7 +927,7 @@ class MarketplaceRegistry {
   }
 }
 
-// â”€â”€â”€ Haversine distance â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// â"€â"€â"€ Haversine distance â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€
 
 function haversine(lat1: number, lng1: number, lat2: number, lng2: number): number {
   const R = 6371;
