@@ -1420,7 +1420,7 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
         <div class="pf-badges">${badges.join("")}</div>
         <h1 class="pf-name">${escapeHtml(agent.name)}</h1>
         ${cityName ? `<div class="pf-loc">&#128205; ${escapeHtml(k.address || cityName)}${k.postalCode ? `, ${escapeHtml(k.postalCode)}` : ""}</div>` : ""}
-        ${k.about || agent.description ? `<p class="pf-desc">${escapeHtml(k.about || agent.description || "")}</p>` : ""}
+        ${agent.description || k.about ? `<p class="pf-desc">${escapeHtml((agent.description && k.about ? (agent.description.length >= k.about.length ? agent.description : k.about) : agent.description || k.about) || "")}</p>` : ""}
         <div class="pf-stats">
           <div class="pf-stat"><div class="pf-stat-icon t">&#9733;</div><div><strong>${trustPct}%</strong><small>Trust Score</small></div></div>
           ${k.googleRating ? `<div class="pf-stat"><div class="pf-stat-icon r">&#11088;</div><div><strong>${k.googleRating} / 5</strong><small>${k.googleReviewCount || 0} anmeldelser</small></div></div>` : ""}
