@@ -1767,12 +1767,21 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
       jsonLd.makesOffer = productsList.slice(0, 20).map((p: any) => {
         const name = typeof p === "string" ? p : (p.name || "");
         if (!name) return null;
+        const product: any = {
+          "@type": "Product",
+          "name": name,
+          "offers": {
+            "@type": "Offer",
+            "availability": "https://schema.org/InStock",
+          },
+        };
+        if (typeof p === "object" && p.price) {
+          product.offers.price = p.price;
+          product.offers.priceCurrency = "NOK";
+        }
         const offer: any = {
           "@type": "Offer",
-          "itemOffered": {
-            "@type": "Product",
-            "name": name,
-          },
+          "itemOffered": product,
         };
         if (typeof p === "object" && p.price) {
           offer.price = p.price;
