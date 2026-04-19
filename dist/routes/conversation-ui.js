@@ -311,7 +311,7 @@ router.get("/samtaler", (_req, res) => {
           </a>`;
                 }).join("\n");
                 return `<div class="query-group">
-          <div class="query-header" onclick="var r=document.getElementById('${groupId}');r.classList.toggle('open');this.querySelector('.query-chevron').style.transform=r.classList.contains('open')?'rotate(180deg)':''">
+          <div class="query-header" data-toggle="${groupId}">
             <div class="query-left">
               <div class="query-icon">&#128269;</div>
               <div>
@@ -341,6 +341,17 @@ router.get("/samtaler", (_req, res) => {
         </div>
         ${listHtml}
       </div>
+      <script>
+        document.querySelectorAll("[data-toggle]").forEach(function(header) {
+          header.addEventListener("click", function() {
+            var r = document.getElementById(header.getAttribute("data-toggle"));
+            if (!r) return;
+            r.classList.toggle("open");
+            var chev = header.querySelector(".query-chevron");
+            if (chev) chev.style.transform = r.classList.contains("open") ? "rotate(180deg)" : "";
+          });
+        });
+      </script>
     `);
         res.send(html);
     }

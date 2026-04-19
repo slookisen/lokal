@@ -210,6 +210,7 @@ function shell(title, description, content, extra) {
   <nav class="nav">
     <a href="/" class="nav-logo"><div class="nav-icon">&#127793;</div> Rett fra Bonden</a>
     <div class="nav-links">
+      <a href="/samtaler">Samtaler</a>
       <a href="/sok">S\u00f8k</a>
       <a href="/teknologi">Hvordan det fungerer</a>
       <a href="/om">Om oss</a>
@@ -429,6 +430,20 @@ const LANDING_CSS = `
   .hero-chips { display: flex; justify-content: center; gap: 7px; flex-wrap: wrap; margin-bottom: 8px; }
   .chip { padding: 5px 13px; background: var(--white); border: 1px solid var(--g200); border-radius: 20px; font-size: 0.78rem; color: var(--g500); text-decoration: none; transition: all 0.2s; }
   .chip:hover { border-color: var(--green-700); color: var(--green-700); background: var(--green-50); text-decoration: none; }
+
+  .ai-assist { margin-top: 18px; text-align: center; }
+  .ai-assist-label { font-size: 0.8rem; color: var(--g500); margin-bottom: 10px; font-weight: 500; }
+  .ai-assist-btns { display: flex; justify-content: center; gap: 10px; margin-bottom: 8px; }
+  .ai-btn { display: inline-flex; align-items: center; gap: 8px; padding: 10px 22px; border-radius: 10px; font-size: 0.85rem; font-weight: 600; text-decoration: none; transition: all 0.2s; border: 1.5px solid; }
+  .ai-btn:hover { transform: translateY(-1px); text-decoration: none; }
+  .ai-chatgpt { background: #10a37f12; border-color: #10a37f40; color: #10a37f; }
+  .ai-chatgpt:hover { background: #10a37f22; border-color: #10a37f; color: #10a37f; }
+  .ai-claude { background: #d4785012; border-color: #d4785040; color: #d47850; }
+  .ai-claude:hover { background: #d4785022; border-color: #d47850; color: #d47850; }
+  .ai-assist-hint { font-size: 0.72rem; color: var(--g400); }
+  .ai-assist-hint a { color: var(--green-700); text-decoration: none; }
+  .ai-assist-hint a:hover { text-decoration: underline; }
+
   .stats-bar { display: flex; justify-content: center; gap: 44px; padding: 28px 0; }
   .stat-n { font-size: 1.9rem; font-weight: 800; color: var(--green-700); letter-spacing: -1px; line-height: 1; }
   .stat-l { font-size: 0.78rem; color: var(--g500); margin-top: 3px; font-weight: 500; }
@@ -581,6 +596,20 @@ router.get("/", (_req, res) => {
           <a href="/sok?q=honning+bergen" class="chip">&#127855; Honning i Bergen</a>
           <a href="/sok?q=%C3%B8kologisk+kj%C3%B8tt" class="chip">&#129385; \u00d8kologisk kj\u00f8tt</a>
           <a href="/sok?q=g%C3%A5rdsbutikk" class="chip">&#127793; G\u00e5rdsbutikker</a>
+        </div>
+        <div class="ai-assist">
+          <p class="ai-assist-label">Eller sp\u00f8r din AI-assistent:</p>
+          <div class="ai-assist-btns">
+            <a href="https://chatgpt.com/?hints=search&q=S%C3%B8k+etter+lokal+mat+i+Norge+via+Rett+fra+Bonden" target="_blank" rel="noopener" class="ai-btn ai-chatgpt">
+              <svg viewBox="0 0 24 24" width="18" height="18" fill="currentColor"><path d="M22.282 9.821a5.985 5.985 0 0 0-.516-4.91 6.046 6.046 0 0 0-6.51-2.9A6.065 6.065 0 0 0 4.981 4.18a5.998 5.998 0 0 0-3.998 2.9 6.042 6.042 0 0 0 .743 7.097 5.98 5.98 0 0 0 .51 4.911 6.051 6.051 0 0 0 6.515 2.9A5.985 5.985 0 0 0 13.26 24a6.056 6.056 0 0 0 5.772-4.206 5.99 5.99 0 0 0 3.997-2.9 6.056 6.056 0 0 0-.747-7.073zM13.26 22.43a4.476 4.476 0 0 1-2.876-1.04l.141-.081 4.779-2.758a.795.795 0 0 0 .392-.681v-6.737l2.02 1.168a.071.071 0 0 1 .038.052v5.583a4.504 4.504 0 0 1-4.494 4.494zM3.6 18.304a4.47 4.47 0 0 1-.535-3.014l.142.085 4.783 2.759a.771.771 0 0 0 .78 0l5.843-3.369v2.332a.08.08 0 0 1-.033.062L9.74 19.95a4.5 4.5 0 0 1-6.14-1.646zM2.34 7.896a4.485 4.485 0 0 1 2.366-1.973V11.6a.766.766 0 0 0 .388.676l5.815 3.355-2.02 1.168a.076.076 0 0 1-.071 0l-4.83-2.786A4.504 4.504 0 0 1 2.34 7.872zm16.597 3.855l-5.833-3.387L15.119 7.2a.076.076 0 0 1 .071 0l4.83 2.791a4.494 4.494 0 0 1-.676 8.105v-5.678a.79.79 0 0 0-.407-.667zm2.01-3.023l-.141-.085-4.774-2.782a.776.776 0 0 0-.785 0L9.409 9.23V6.897a.066.066 0 0 1 .028-.061l4.83-2.787a4.5 4.5 0 0 1 6.68 4.66zm-12.64 4.135l-2.02-1.164a.08.08 0 0 1-.038-.057V6.075a4.5 4.5 0 0 1 7.375-3.453l-.142.08L8.704 5.46a.795.795 0 0 0-.393.681zm1.097-2.365l2.602-1.5 2.607 1.5v2.999l-2.597 1.5-2.607-1.5z"/></svg>
+              ChatGPT
+            </a>
+            <a href="/teknologi#claude-mcp" class="ai-btn ai-claude">
+              <svg viewBox="0 0 24 24" width="18" height="18" fill="currentColor"><path d="M4.709 15.955l4.397-2.553-.209-.12-4.478 2.488.29.185zm7.737-4.48L8.051 8.97l-.209.12 4.394 2.505.21-.12zm-4.187-2.384L12.656 6.6l-.21-.12-4.397 2.553.21.058zm8.375-.12l-4.188 2.43.21.12 4.187-2.43-.21-.12zM12 2C6.477 2 2 6.477 2 12s4.477 10 10 10 10-4.477 10-10S17.523 2 12 2z"/></svg>
+              Claude
+            </a>
+          </div>
+          <p class="ai-assist-hint">Bruk MCP for \u00e5 la AI-en din s\u00f8ke direkte i v\u00e5r database. <a href="/teknologi#mcp-oppsett">Se oppsettguide &rarr;</a></p>
         </div>
         <div class="stats-bar">
           <div style="text-align:center"><div class="stat-n">${totalAgents}</div><div class="stat-l">Produsenter</div></div>
@@ -901,6 +930,15 @@ const TECH_CSS = `
   .tech-code .comment { color: #64748b; }
   .tech-code .key { color: #7dd3fc; }
   .tech-code .val { color: #86efac; }
+  .setup-guide { background: var(--white); border: 1px solid var(--g100); border-radius: var(--r-lg); padding: 28px; margin: 24px 0; }
+  .setup-guide h3 { font-size: 1.1rem; font-weight: 700; margin-bottom: 12px; }
+  .setup-guide p { font-size: 0.9rem; }
+  .setup-guide code { background: #f1f5f9; padding: 2px 8px; border-radius: 4px; font-size: 0.85rem; font-family: "SF Mono", "Fira Code", monospace; color: var(--green-700); }
+  .setup-steps { display: flex; flex-direction: column; gap: 12px; }
+  .setup-step { display: flex; gap: 14px; align-items: flex-start; }
+  .step-n { width: 28px; height: 28px; background: var(--green-700); color: white; border-radius: 50%; display: flex; align-items: center; justify-content: center; font-size: 0.82rem; font-weight: 700; flex-shrink: 0; }
+  .setup-step div { font-size: 0.9rem; color: var(--g700); line-height: 1.6; }
+  .setup-step a { color: var(--green-700); }
   @media (max-width: 768px) {
     .tech-hero h1 { font-size: 1.7rem; }
     .tech-compare { grid-template-columns: 1fr; }
@@ -979,6 +1017,47 @@ router.get("/teknologi", (_req, res) => {
     </div>
 
     <p>Alt skjer automatisk. Produsenten trenger ikke gj\u00f8re noe \u2014 vi samler data fra offentlige kilder, verifiserer det, og gj\u00f8r det tilgjengelig for alle AI-plattformer.</p>
+
+    <h2 id="mcp-oppsett">Sett opp MCP &mdash; s\u00f8k fra din AI</h2>
+    <p>MCP (Model Context Protocol) lar AI-assistenten din s\u00f8ke direkte i v\u00e5r database med 1400+ matprodusenter. Her er hvordan du setter det opp:</p>
+
+    <div id="chatgpt-mcp" class="setup-guide">
+      <h3>&#128154; ChatGPT (enklest)</h3>
+      <div class="setup-steps">
+        <div class="setup-step"><span class="step-n">1</span><div>G\u00e5 til <a href="https://chatgpt.com" target="_blank">chatgpt.com</a> og \u00e5pne en ny samtale</div></div>
+        <div class="setup-step"><span class="step-n">2</span><div>Klikk p\u00e5 verkt\u00f8y-ikonet (&#128295;) i meldingsfeltet og velg <strong>&laquo;Add an MCP Server&raquo;</strong></div></div>
+        <div class="setup-step"><span class="step-n">3</span><div>Lim inn denne URL-en: <code>https://rettfrabonden.com/mcp</code></div></div>
+        <div class="setup-step"><span class="step-n">4</span><div>Ferdig! Sp\u00f8r f.eks. <em>&laquo;Finn \u00f8kologisk honning i Bergen&raquo;</em></div></div>
+      </div>
+    </div>
+
+    <div id="claude-mcp" class="setup-guide">
+      <h3>&#129520; Claude Desktop</h3>
+      <p>Claude bruker en lokal MCP-server via npm-pakken <code>lokal-mcp</code>. Pakken kj\u00f8rer p\u00e5 din maskin og snakker med v\u00e5r API.</p>
+      <div class="setup-steps">
+        <div class="setup-step"><span class="step-n">1</span><div>Installer <a href="https://nodejs.org" target="_blank">Node.js</a> hvis du ikke har det</div></div>
+        <div class="setup-step"><span class="step-n">2</span><div>\u00c5pne Claude Desktop &rarr; Settings &rarr; Developer &rarr; <strong>Edit Config</strong></div></div>
+        <div class="setup-step"><span class="step-n">3</span><div>Legg til dette i config-filen:
+          <div class="tech-code" style="margin:8px 0 0;font-size:0.8rem;">
+{<br>
+&nbsp;&nbsp;<span class="key">"mcpServers"</span>: {<br>
+&nbsp;&nbsp;&nbsp;&nbsp;<span class="key">"lokal"</span>: {<br>
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;<span class="key">"command"</span>: <span class="val">"npx"</span>,<br>
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;<span class="key">"args"</span>: [<span class="val">"lokal-mcp"</span>]<br>
+&nbsp;&nbsp;&nbsp;&nbsp;}<br>
+&nbsp;&nbsp;}<br>
+}
+          </div>
+        </div></div>
+        <div class="setup-step"><span class="step-n">4</span><div>Start Claude Desktop p\u00e5 nytt. Du vil se et &#128295;-ikon med Lokal-verkt\u00f8y tilgjengelig.</div></div>
+      </div>
+    </div>
+
+    <div class="setup-guide">
+      <h3>&#9881;&#65039; Andre AI-plattformer</h3>
+      <p>Alle plattformer som st\u00f8tter MCP Streamable HTTP kan koble seg til: <code>https://rettfrabonden.com/mcp</code></p>
+      <p>For REST-baserte integrasjoner, se v\u00e5r <a href="/openapi.json">OpenAPI-spesifikasjon</a>.</p>
+    </div>
 
     <h2>\u00c5pen kildekode</h2>
     <p>Hele prosjektet er \u00e5pen kildekode. Vi tror at infrastruktur for matsynlighet b\u00f8r v\u00e6re et fellesgode, ikke et kommersielt produkt.</p>
