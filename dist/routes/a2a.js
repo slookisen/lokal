@@ -153,7 +153,34 @@ function handleMessageSend(params, id, req, res) {
             ipAddress: req.ip,
             durationMs,
         });
-        // A2A response format
+        // ─── Auto-start conversations with top matches ────────────
+        // When an A2A agent searches, we create conversations with
+        // the best matches so seller agents can auto-respond.
+        // This makes the system "alive" — every search creates dialog.
+        const conversations = [];
+        const topResults = results.slice(0, 3); // Top 3 matches get conversations
+        for (const r of topResults) {
+            try {
+                const conv = conversation_service_1.conversationService.startConversation({
+                    buyerAgentId: params?.agentId || undefined,
+                    sellerAgentId: r.agent.id,
+                    queryText: typeof queryText === "string" ? queryText : JSON.stringify(queryText),
+                    taskId: task.id,
+                    source: "a2a",
+                    autoRespond: true, // Seller agent auto-replies
+                });
+                conversations.push({
+                    conversationId: conv.id,
+                    sellerAgentId: r.agent.id,
+                    sellerAgentName: conv.sellerAgentName,
+                    status: conv.status,
+                    messageCount: conv.messages.length,
+                    viewUrl: `${BASE_URL}/samtale/${conv.id}`,
+                });
+            }
+            catch { /* non-critical — don't break search if conv fails */ }
+        }
+        // A2A response format — now includes conversation links
         res.json({
             jsonrpc: "2.0",
             result: {
@@ -167,6 +194,7 @@ function handleMessageSend(params, id, req, res) {
                         data: {
                             count: results.length,
                             agents: results,
+                            conversations,
                             parsedQuery: messageText ? marketplace_registry_1.marketplaceRegistry.parseNaturalQuery(messageText) : discoveryQuery,
                         },
                     },
@@ -287,7 +315,7 @@ function handleAgentInfo(params, id, res) {
 function serveAgentCard(_req, res) {
     const registryCard = marketplace_registry_1.marketplaceRegistry.getRegistryCard(BASE_URL);
     const legacyProducers = services_1.agentCardService.generateRegistry(BASE_URL);
-    res.json({
+    const card = {
         ...registryCard,
         producers: legacyProducers,
         endpoints: {
@@ -296,18 +324,64 @@ function serveAgentCard(_req, res) {
             search: `${BASE_URL}/api/marketplace/search`,
             register: `${BASE_URL}/api/marketplace/register`,
             agents: `${BASE_URL}/api/marketplace/agents`,
+            mcp: `${BASE_URL}/mcp`,
+            llms: `${BASE_URL}/llms.txt`,
+            openapi: `${BASE_URL}/openapi.json`,
         },
-    });
+    };
+    // A2A spec recommends caching headers: Cache-Control + ETag
+    const etag = `"v1-${Date.now().toString(36)}"`;
+    res.header("Cache-Control", "public, max-age=3600");
+    res.header("ETag", etag);
+    res.json(card);
 }
 router.get("/.well-known/agent-card.json", serveAgentCard); // A2A spec v1.0.0
 router.get("/.well-known/agent.json", serveAgentCard); // Legacy compat
-// GET /agents/:id/agent.json — Individual producer Agent Card
+// GET /agents/:id/agent.json — Individual producer Agent Card (enriched with knowledge)
 router.get("/agents/:id/agent.json", (req, res) => {
     const card = services_1.agentCardService.generateCard(req.params.id, BASE_URL);
     if (!card) {
         res.status(404).json({ error: "Agent not found" });
         return;
     }
+    // Enrich with knowledge data so buyer-agents get the full picture
+    const knowledge = knowledge_service_1.knowledgeService.getKnowledge(req.params.id);
+    if (knowledge) {
+        const enriched = { ...card };
+        enriched["x-knowledge"] = {
+            address: knowledge.address,
+            postalCode: knowledge.postalCode,
+            phone: knowledge.phone,
+            email: knowledge.email,
+            website: knowledge.website,
+            openingHours: knowledge.openingHours,
+            products: knowledge.products?.map((p) => ({
+                name: p.name, category: p.category, seasonal: p.seasonal, months: p.months, organic: p.organic,
+            })),
+            specialties: knowledge.specialties,
+            certifications: knowledge.certifications,
+            paymentMethods: knowledge.paymentMethods,
+            deliveryOptions: knowledge.deliveryOptions,
+            deliveryRadius: knowledge.deliveryRadius,
+            googleRating: knowledge.googleRating,
+            googleReviewCount: knowledge.googleReviewCount,
+            externalLinks: knowledge.externalLinks,
+            seasonality: knowledge.seasonality,
+            about: knowledge.about,
+            dataSource: knowledge.dataSource,
+            lastEnrichedAt: knowledge.lastEnrichedAt,
+        };
+        // Remove undefined values
+        const xk = enriched["x-knowledge"];
+        for (const key of Object.keys(xk)) {
+            if (xk[key] === undefined || xk[key] === null)
+                delete xk[key];
+        }
+        res.header("Cache-Control", "public, max-age=1800");
+        res.json(enriched);
+        return;
+    }
+    res.header("Cache-Control", "public, max-age=1800");
     res.json(card);
 });
 // GET /api/stats — Platform stats (combined)

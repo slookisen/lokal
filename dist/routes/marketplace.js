@@ -9,6 +9,7 @@ const geocoding_service_1 = require("../services/geocoding-service");
 const init_1 = require("../database/init");
 const email_service_1 = require("../services/email-service");
 const trust_score_service_1 = require("../services/trust-score-service");
+const conversation_service_1 = require("../services/conversation-service");
 // ─── Marketplace Routes ───────────────────────────────────────
 // These are the OPEN endpoints that make Lokal a marketplace.
 // Any agent in the world can:
@@ -227,6 +228,23 @@ router.post("/discover", (req, res) => {
             ...r,
             contact: buildContactBlock(r.agent.id),
         }));
+        // Auto-start conversations with top matches
+        const conversations = [];
+        if (results.length > 0) {
+            const queryDesc = [query.categories?.join(", "), query.tags?.join(", ")].filter(Boolean).join(" — ") || "strukturert søk";
+            for (const r of results.slice(0, 2)) {
+                try {
+                    const conv = conversation_service_1.conversationService.startConversation({
+                        sellerAgentId: r.agent.id,
+                        queryText: queryDesc,
+                        source: "api",
+                        autoRespond: true,
+                    });
+                    conversations.push({ conversationId: conv.id, sellerAgentId: r.agent.id });
+                }
+                catch { /* non-critical */ }
+            }
+        }
         res.json({
             success: true,
             count: enrichedResults.length,
@@ -237,6 +255,7 @@ router.post("/discover", (req, res) => {
                 maxDistanceKm: query.maxDistanceKm,
             },
             results: enrichedResults,
+            conversations,
         });
     }
     catch (error) {
@@ -343,15 +362,46 @@ router.get("/search", async (req, res) => {
         ...r,
         contact: buildContactBlock(r.agent.id),
     }));
+    // ─── Auto-start conversations with top matches ────────────
+    // Only for bot/agent traffic — not for humans browsing the site.
+    // ChatGPT Custom GPT, OpenAI agents, etc. have identifiable UA strings.
+    // Humans use the /sok frontend which calls discover() directly.
+    const ua = (req.headers["user-agent"] || "").toLowerCase();
+    const acceptHeader = (req.headers["accept"] || "").toLowerCase();
+    const isAgent = ua.includes("gpt") || ua.includes("openai") || ua.includes("claude")
+        || ua.includes("bot") || ua.includes("agent") || ua.includes("python")
+        || ua.includes("node-fetch") || ua.includes("axios") || ua.includes("httpie")
+        || acceptHeader.includes("application/json") && !acceptHeader.includes("text/html");
+    const conversations = [];
+    if (isAgent && results.length > 0) {
+        for (const r of results.slice(0, 2)) {
+            try {
+                const conv = conversation_service_1.conversationService.startConversation({
+                    sellerAgentId: r.agent.id,
+                    queryText: q,
+                    source: "api",
+                    autoRespond: true,
+                });
+                conversations.push({
+                    conversationId: conv.id,
+                    sellerAgentId: r.agent.id,
+                    sellerAgentName: conv.sellerAgentName,
+                    messageCount: conv.messages.length,
+                });
+            }
+            catch { /* non-critical */ }
+        }
+    }
     const safeQuery = q.replace(/<[^>]*>/g, "").replace(/javascript:/gi, "");
     res.json({
         success: true,
         query: safeQuery,
         parsed,
-        geoFiltered: !!parsed.location && !heleNorge, // tells frontend if results were geo-limited
-        geoSource, // "browser", "kartverket", "database", "hardcoded", "none"
+        geoFiltered: !!parsed.location && !heleNorge,
+        geoSource,
         count: enrichedResults.length,
         results: enrichedResults,
+        conversations,
     });
 });
 // ─── GET /agents/:id/vcard — Download vCard for contacts ─────

@@ -23,6 +23,7 @@ const geocoding_service_1 = require("../services/geocoding-service");
 const analytics_service_1 = require("../services/analytics-service");
 const marketplace_1 = require("../models/marketplace");
 const init_1 = require("../database/init");
+const conversation_service_1 = require("../services/conversation-service");
 const router = (0, express_1.Router)();
 // ─── Helpers ────────────────────────────────────────────────
 function slugify(text) {
@@ -193,6 +194,14 @@ function shell(title, description, content, extra) {
   <meta property="og:url" content="${canonicalUrl}">
   <meta property="og:type" content="website">
   <meta property="og:locale" content="nb_NO">
+  <meta property="og:site_name" content="Rett fra Bonden">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="${escapeHtml(title)}">
+  <meta name="twitter:description" content="${escapeHtml(description)}">
+  <meta name="robots" content="index, follow, max-snippet:-1, max-image-preview:large">
+  <link rel="alternate" hreflang="nb" href="${canonicalUrl}">
+  <link rel="alternate" hreflang="en" href="${canonicalUrl}">
+  <link rel="alternate" hreflang="x-default" href="${canonicalUrl}">
   ${jsonLdScript}
   ${CSS}
   ${extra?.extraCss ? `<style>${extra.extraCss}</style>` : ""}
@@ -316,6 +325,75 @@ function getTrafficStats() {
         return { pageViews: 0, uniqueVisitors: 0, realHumans: 0, botAndAi: 0, aiQueries: 0 };
     }
 }
+// ─── Live conversation showcase for landing page ────────────
+function buildConversationShowcase() {
+    try {
+        const convs = conversation_service_1.conversationService.listConversations({ limit: 3 });
+        if (convs.length === 0)
+            return "";
+        const sourceLabels = {
+            a2a: "A2A-protokoll", mcp: "MCP-verkt\u00f8y", web: "Nettside", api: "API",
+        };
+        const sourceColors = {
+            a2a: "#2D5016", mcp: "#7c3aed", web: "#0369a1", api: "#6b7280",
+        };
+        const convCards = convs.map(conv => {
+            const buyer = escapeHtml(conv.buyerAgentName || "AI-agent");
+            const seller = escapeHtml(conv.sellerAgentName || "Produsent");
+            const lastMsg = conv.messages.length > 1
+                ? escapeHtml(conv.messages[conv.messages.length - 1].content).slice(0, 100) + (conv.messages[conv.messages.length - 1].content.length > 100 ? "..." : "")
+                : "";
+            const source = conv.source || "api";
+            const srcLabel = sourceLabels[source] || source;
+            const srcColor = sourceColors[source] || "#6b7280";
+            const statusEmoji = conv.status === "negotiating" ? "&#128992;" : conv.status === "completed" ? "&#9989;" : "&#128994;";
+            return `<a href="/samtale/${conv.id}" class="cv-card">
+        <div class="cv-top">
+          <div class="cv-agents">${buyer} <span class="cv-arrow">&harr;</span> ${seller}</div>
+          <span class="cv-src" style="background:${srcColor}15;color:${srcColor}">${srcLabel}</span>
+        </div>
+        ${lastMsg ? `<div class="cv-preview">${lastMsg}</div>` : ""}
+        <div class="cv-foot">
+          <span>${statusEmoji} ${conv.messages.length} meldinger</span>
+          <span class="cv-time">${formatConvTime(conv.updatedAt)}</span>
+        </div>
+      </a>`;
+        }).join("");
+        return `<section class="sec conv-showcase">
+      <div class="sh">
+        <div class="sh-label">Sanntid</div>
+        <div class="sh-title">&#128172; AI-agenter i samtale</div>
+        <div class="sh-sub">Se hva som skjer n\u00e5r AI finner lokal mat for deg</div>
+      </div>
+      <div class="cv-grid">${convCards}</div>
+      <div style="text-align:center;margin-top:20px">
+        <a href="/samtaler" class="btn-s">Se alle samtaler &rarr;</a>
+      </div>
+    </section>`;
+    }
+    catch {
+        return "";
+    }
+}
+function formatConvTime(iso) {
+    try {
+        const d = new Date(iso);
+        const now = new Date();
+        const diffMs = now.getTime() - d.getTime();
+        const diffMin = Math.floor(diffMs / 60000);
+        if (diffMin < 1)
+            return "akkurat n\u00e5";
+        if (diffMin < 60)
+            return `${diffMin} min siden`;
+        const diffHrs = Math.floor(diffMin / 60);
+        if (diffHrs < 24)
+            return `${diffHrs}t siden`;
+        return d.toLocaleDateString("nb-NO", { day: "numeric", month: "short" });
+    }
+    catch {
+        return "";
+    }
+}
 // ═══════════════════════════════════════════════════════════════
 // GET /api/traffic-stats — Public traffic stats
 // ═══════════════════════════════════════════════════════════════
@@ -413,7 +491,20 @@ const LANDING_CSS = `
     .ai-banner { flex-direction: column; text-align: center; padding: 22px; }
     .ai-logos { justify-content: center; }
     .seller-cta h2 { font-size: 1.5rem; }
+    .cv-grid { grid-template-columns: 1fr; }
   }
+  /* Conversation showcase */
+  .conv-showcase { background: var(--g50); }
+  .cv-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 14px; max-width: 1100px; margin: 0 auto; padding: 0 24px; }
+  .cv-card { background: var(--white); border-radius: var(--r-lg); border: 1px solid var(--g100); padding: 16px 20px; display: block; text-decoration: none; color: var(--charcoal); transition: all 0.2s; }
+  .cv-card:hover { transform: translateY(-2px); box-shadow: var(--shadow-md); border-color: var(--green-100); text-decoration: none; }
+  .cv-top { display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px; }
+  .cv-agents { font-weight: 700; font-size: 0.88rem; }
+  .cv-arrow { color: var(--g300); margin: 0 4px; }
+  .cv-src { display: inline-block; padding: 2px 8px; border-radius: 10px; font-size: 0.68rem; font-weight: 600; }
+  .cv-preview { font-size: 0.8rem; color: var(--g500); line-height: 1.4; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; margin-bottom: 8px; }
+  .cv-foot { display: flex; justify-content: space-between; font-size: 0.72rem; color: var(--g500); }
+  .cv-time { color: var(--g300); }
 `;
 router.get("/", (_req, res) => {
     try {
@@ -567,6 +658,8 @@ router.get("/", (_req, res) => {
       <a href="/selger" class="seller-btn">Registrer gratis</a>
       <span class="seller-note">Under 2 minutter. Ingen kredittkort.</span>
     </section>
+
+    ${buildConversationShowcase()}
 
     <section class="ai-sec">
       <div class="ai-banner">
@@ -1057,8 +1150,10 @@ router.get("/:city", (req, res, next) => {
     if (citySlug.startsWith("api") || citySlug.startsWith(".") || citySlug === "health"
         || citySlug === "a2a" || citySlug === "mcp" || citySlug === "sok"
         || citySlug === "produsent" || citySlug === "sitemap.xml" || citySlug === "robots.txt"
-        || citySlug === "openapi.yaml" || citySlug === "favicon.ico"
+        || citySlug === "openapi.json" || citySlug === "openapi.yaml" || citySlug === "favicon.ico"
         || citySlug === "selger" || citySlug === "admin" || citySlug === "om" || citySlug === "teknologi"
+        || citySlug === "personvern" || citySlug === "llms.txt" || citySlug === "llms-full.txt"
+        || citySlug === "agents" || citySlug === "docs" || citySlug === "samtaler" || citySlug === "samtale"
         || citySlug.includes(".")) {
         return next();
     }
@@ -1199,6 +1294,11 @@ const PROFILE_CSS = `
   /* Tier 2: Languages */
   .lang-row { display: flex; gap: 6px; flex-wrap: wrap; }
   .lang-tag { padding: 5px 12px; background: var(--g100); border-radius: 20px; font-size: 0.8rem; font-weight: 600; color: var(--g700); }
+  .reviews-grid { display: flex; flex-direction: column; gap: 14px; }
+  .review-item { padding: 14px; background: var(--g50, #f9fafb); border-radius: 10px; border-left: 3px solid var(--green-200, #bbf7d0); }
+  .review-stars { font-size: 0.85rem; margin-bottom: 4px; }
+  .review-text { font-size: 0.9rem; color: var(--g700); line-height: 1.6; margin: 0; font-style: italic; }
+  .review-author { font-size: 0.78rem; color: var(--g500); margin-top: 6px; }
   @media (max-width: 840px) {
     .pf-header { grid-template-columns: 1fr; }
     .pf-content { grid-template-columns: 1fr; }
@@ -1428,7 +1528,7 @@ router.get("/produsent/:slug", (req, res) => {
                 "reviewCount": k.googleReviewCount || 1,
             };
         }
-        // Reviews from external sources
+        // Reviews from external sources (JSON-LD + visible HTML)
         const reviewsList = Array.isArray(k.externalReviews) ? k.externalReviews : [];
         if (reviewsList.length) {
             jsonLd.review = reviewsList.slice(0, 5).map((r) => ({
@@ -1443,6 +1543,20 @@ router.get("/produsent/:slug", (req, res) => {
                 ...(r.date ? { "datePublished": r.date } : {}),
             }));
         }
+        // Build visible reviews HTML
+        const reviewsHtml = reviewsList.length
+            ? reviewsList.slice(0, 5).map((r) => {
+                const stars = r.rating ? "&#11088;".repeat(Math.min(Math.round(r.rating), 5)) : "";
+                const author = r.author || "Kunde";
+                const source = r.source ? ` — ${escapeHtml(r.source)}` : "";
+                const date = r.date ? ` (${new Date(r.date).toLocaleDateString("nb-NO")})` : "";
+                return `<div class="review-item">
+            ${stars ? `<div class="review-stars">${stars}</div>` : ""}
+            <p class="review-text">\u201c${escapeHtml(r.text || "")}\u201d</p>
+            <div class="review-author">${escapeHtml(author)}${source}${date}</div>
+          </div>`;
+            }).join("")
+            : "";
         // Products as makesOffer
         if (productsList.length) {
             jsonLd.makesOffer = productsList.slice(0, 20).map((p) => {
@@ -1582,6 +1696,12 @@ router.get("/produsent/:slug", (req, res) => {
           <div class="card-body">${langsHtml}</div>
         </div>` : ""}
 
+        ${reviewsHtml ? `
+        <div class="card">
+          <div class="card-head"><span>&#128172;</span><h3>Kundeanmeldelser</h3></div>
+          <div class="card-body"><div class="reviews-grid">${reviewsHtml}</div></div>
+        </div>` : ""}
+
         <div class="claim-bar">
           <div>
             <h3>${agent.isVerified ? "Jobber du ogs\u00e5 her?" : "Er du eieren av " + escapeHtml(agent.name) + "?"}</h3>
@@ -1649,11 +1769,106 @@ router.get("/sitemap.xml", (_req, res) => {
 });
 // ─── GET /robots.txt ────────────────────────────────────────
 router.get("/robots.txt", (_req, res) => {
-    res.header("Content-Type", "text/plain");
-    res.send(`User-agent: *
+    res.header("Content-Type", "text/plain; charset=utf-8");
+    // Explicit AI bot allow-list + Content Signals (Cloudflare spec).
+    // We WANT AI agents to discover, search, and cite our data — that is the
+    // entire point of an A2A marketplace. We do NOT want our content used
+    // for training large language models without compensation, so ai-train=no.
+    res.send(`# Lokal / rettfrabonden.com — robots.txt
+# A2A marketplace for local food in Norway.
+# AI agents are explicitly welcome to discover, read, and cite our data.
+
+User-agent: *
+Allow: /
+Content-Signal: search=yes, ai-input=yes, ai-train=no
+
+# ─── AI / agent crawlers (explicit allow) ───────────────────
+User-agent: GPTBot
+Allow: /
+Content-Signal: search=yes, ai-input=yes, ai-train=no
+
+User-agent: OAI-SearchBot
+Allow: /
+Content-Signal: search=yes, ai-input=yes, ai-train=no
+
+User-agent: ChatGPT-User
+Allow: /
+Content-Signal: search=yes, ai-input=yes, ai-train=no
+
+User-agent: ClaudeBot
+Allow: /
+Content-Signal: search=yes, ai-input=yes, ai-train=no
+
+User-agent: Claude-Web
+Allow: /
+Content-Signal: search=yes, ai-input=yes, ai-train=no
+
+User-agent: anthropic-ai
+Allow: /
+Content-Signal: search=yes, ai-input=yes, ai-train=no
+
+User-agent: PerplexityBot
+Allow: /
+Content-Signal: search=yes, ai-input=yes, ai-train=no
+
+User-agent: Perplexity-User
+Allow: /
+Content-Signal: search=yes, ai-input=yes, ai-train=no
+
+User-agent: Google-Extended
+Allow: /
+Content-Signal: search=yes, ai-input=yes, ai-train=no
+
+User-agent: Googlebot
 Allow: /
 
+User-agent: Bingbot
+Allow: /
+
+User-agent: Applebot
+Allow: /
+
+User-agent: Applebot-Extended
+Allow: /
+Content-Signal: search=yes, ai-input=yes, ai-train=no
+
+User-agent: Amazonbot
+Allow: /
+
+User-agent: Bytespider
+Allow: /
+Content-Signal: search=yes, ai-input=yes, ai-train=no
+
+User-agent: CCBot
+Disallow: /
+
+User-agent: FacebookBot
+Allow: /
+
+User-agent: meta-externalagent
+Allow: /
+Content-Signal: search=yes, ai-input=yes, ai-train=no
+
+User-agent: Diffbot
+Allow: /
+
+User-agent: cohere-ai
+Allow: /
+Content-Signal: search=yes, ai-input=yes, ai-train=no
+
+User-agent: Omgilibot
+Disallow: /
+
 Sitemap: ${BASE_URL}/sitemap.xml
+
+# ─── AI discovery endpoints ──────────────────────────────────
+# LLM-friendly overview:    ${BASE_URL}/llms.txt
+# Full producer data:       ${BASE_URL}/llms-full.txt
+# A2A Agent Card:           ${BASE_URL}/.well-known/agent-card.json
+# MCP Server Card:          ${BASE_URL}/.well-known/mcp/server-card.json
+# MCP Manifest:             ${BASE_URL}/.well-known/mcp
+# Agent Discovery:          ${BASE_URL}/.well-known/agents.txt
+# OpenAPI Spec:             ${BASE_URL}/openapi.json
 `);
 });
 exports.default = router;

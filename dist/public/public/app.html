@@ -263,6 +263,44 @@
       transform: translateY(-2px);
     }
 
+    .geo-btn {
+      padding: 0.75rem 1rem;
+      background: #e8f0e0;
+      color: var(--forest-green);
+      border: 1.5px solid var(--forest-green);
+      border-radius: 8px;
+      cursor: pointer;
+      font-weight: 600;
+      font-size: 0.9rem;
+      transition: background 0.3s, transform 0.2s;
+      white-space: nowrap;
+      display: flex;
+      align-items: center;
+      gap: 0.3rem;
+    }
+
+    .geo-btn:hover {
+      background: var(--forest-green);
+      color: white;
+      transform: translateY(-2px);
+    }
+
+    .geo-btn.active {
+      background: var(--forest-green);
+      color: white;
+    }
+
+    .geo-btn:disabled {
+      opacity: 0.6;
+      cursor: wait;
+    }
+
+    .geo-status {
+      font-size: 0.75rem;
+      color: var(--text-gray);
+      margin-top: 0.4rem;
+    }
+
     /* Main Container */
     main {
       max-width: 1400px;
@@ -1241,11 +1279,13 @@
 
   <!-- Search Container -->
   <div class="search-container">
-    <div class="search-hint">Prøv: &laquo;Hvor finner jeg ferske grønnsaker i Oslo?&raquo;</div>
+    <div class="search-hint">Prøv: &laquo;Tomater&raquo;, &laquo;Honning i Bergen&raquo; eller &laquo;Økologisk kjøtt&raquo;</div>
     <div class="search-input-wrapper">
       <input type="text" id="searchInput" placeholder="Spør som en AI-agent ville gjort...">
+      <button class="geo-btn" id="geoBtn" title="Bruk min posisjon">&#x1F4CD; Nær meg</button>
       <button class="search-btn" id="searchBtn">Søk</button>
     </div>
+    <div class="geo-status" id="geoStatus"></div>
   </div>
 
   <!-- Main Content -->
@@ -1410,6 +1450,7 @@ curl -X POST https://rettfrabonden.com/api/marketplace/register \
         <a href="/teknologi" style="color:#a3e635;text-decoration:none;">Slik fungerer det</a>
         <a href="/selger" style="color:#a3e635;text-decoration:none;">For produsenter</a>
         <a href="https://github.com/slookisen/lokal" target="_blank" rel="noopener" style="color:#a3e635;text-decoration:none;">GitHub</a>
+        <a href="/personvern" style="color:#a3e635;text-decoration:none;">Personvern</a>
       </div>
       <div style="display:flex;justify-content:center;gap:1rem;flex-wrap:wrap;margin-bottom:1rem;">
         <a href="https://chatgpt.com/g/g-69dbf8593c1c81919050f8da98cd327d-lokal-norsk-matfinner" target="_blank" rel="noopener" style="color:white;opacity:0.7;text-decoration:none;font-size:0.85rem;">ChatGPT</a>
@@ -1452,6 +1493,10 @@ curl -X POST https://rettfrabonden.com/api/marketplace/register \
 
     var monthNames = ['', 'Jan', 'Feb', 'Mar', 'Apr', 'Mai', 'Jun', 'Jul', 'Aug', 'Sep', 'Okt', 'Nov', 'Des'];
 
+    // Geolocation state
+    var userLat = null;
+    var userLng = null;
+
     function formatCategory(cat) {
       return categoryNames[cat] || cat;
     }
@@ -1480,6 +1525,55 @@ curl -X POST https://rettfrabonden.com/api/marketplace/register \
       }
       if (searchBtn) {
         searchBtn.addEventListener('click', function() { performSearch(); });
+      }
+
+      // Geolocation "Nær meg" button — manual toggle
+      var geoBtn = document.getElementById('geoBtn');
+      var geoStatus = document.getElementById('geoStatus');
+      if (geoBtn) {
+        geoBtn.addEventListener('click', function() {
+          if (userLat && userLng) {
+            // Toggle off — re-search without geo
+            userLat = null;
+            userLng = null;
+            geoBtn.classList.remove('active');
+            geoBtn.innerHTML = '&#x1F4CD; Nær meg';
+            if (geoStatus) geoStatus.textContent = '';
+            var q = document.getElementById('searchInput').value.trim();
+            if (q) performSearch(false);
+            return;
+          }
+          if (!navigator.geolocation) {
+            if (geoStatus) geoStatus.textContent = 'Nettleseren din støtter ikke posisjon.';
+            return;
+          }
+          geoBtn.disabled = true;
+          geoBtn.innerHTML = '&#x23F3; Henter...';
+          navigator.geolocation.getCurrentPosition(
+            function(pos) {
+              userLat = pos.coords.latitude;
+              userLng = pos.coords.longitude;
+              geoBtn.disabled = false;
+              geoBtn.classList.add('active');
+              geoBtn.innerHTML = '&#x2705; Posisjon aktiv';
+              if (geoStatus) geoStatus.textContent = 'Viser resultater nær deg.';
+              geoPermissionAsked = true;
+              // Re-search with new location
+              var q = document.getElementById('searchInput').value.trim();
+              if (q) performSearch(false);
+            },
+            function(err) {
+              geoBtn.disabled = false;
+              geoBtn.innerHTML = '&#x1F4CD; Nær meg';
+              geoPermissionAsked = true;
+              if (geoStatus) {
+                if (err.code === 1) geoStatus.textContent = 'Tillat posisjon i nettleseren for å bruke denne funksjonen.';
+                else geoStatus.textContent = 'Kunne ikke hente posisjon. Prøv igjen.';
+              }
+            },
+            { enableHighAccuracy: false, timeout: 8000 }
+          );
+        });
       }
 
       // Filters
@@ -1560,11 +1654,18 @@ curl -X POST https://rettfrabonden.com/api/marketplace/register \
 
         var trustPct = Math.round((agent.trustScore || 0) * 100);
 
+        var cityText = agent.location && agent.location.city ? agent.location.city : 'Norge';
+        if (agent.location && agent.location.distanceKm != null) {
+          cityText += ' · ' + (agent.location.distanceKm < 1
+            ? (agent.location.distanceKm * 1000).toFixed(0) + ' m'
+            : agent.location.distanceKm.toFixed(1) + ' km');
+        }
+
         return '<div class="agent-card" data-id="' + agent.id + '">' +
           '<div class="agent-header">' +
             '<div>' +
               '<div class="agent-name">' + agent.name + '</div>' +
-              '<div class="agent-city">' + (agent.location && agent.location.city ? agent.location.city : 'Norge') + '</div>' +
+              '<div class="agent-city">' + cityText + '</div>' +
             '</div>' +
             (agent.isVerified ? '<span class="verified-badge">Verifisert</span>' : '') +
           '</div>' +
@@ -1603,25 +1704,59 @@ curl -X POST https://rettfrabonden.com/api/marketplace/register \
     }
 
     // ── Search ──
-    async function performSearch() {
+    var lastSearchWasGeoFiltered = false;
+    var geoPermissionAsked = false; // only auto-ask once per session
+
+    async function performSearch(forceHeleNorge) {
       var query = document.getElementById('searchInput').value.trim();
       var titleEl = document.getElementById('agentsSectionTitle');
       if (!query) {
         filteredAgents = allAgents.slice();
         displayCount = AGENTS_PER_PAGE;
         if (titleEl) titleEl.textContent = 'Utforsk agenter i registeret';
+        lastSearchWasGeoFiltered = false;
         renderAgents();
         return;
       }
 
+      // Auto-prompt geolocation on first search if we don't have coords
+      // and user hasn't denied permission yet
+      if (!userLat && !userLng && !geoPermissionAsked && !forceHeleNorge && navigator.geolocation) {
+        geoPermissionAsked = true;
+        var geoBtn = document.getElementById('geoBtn');
+        var geoStatus = document.getElementById('geoStatus');
+
+        // Try to get position — if user allows, re-run search with coords
+        try {
+          var pos = await new Promise(function(resolve, reject) {
+            if (geoBtn) { geoBtn.disabled = true; geoBtn.innerHTML = '&#x23F3; Henter...'; }
+            navigator.geolocation.getCurrentPosition(resolve, reject, { enableHighAccuracy: false, timeout: 8000 });
+          });
+          userLat = pos.coords.latitude;
+          userLng = pos.coords.longitude;
+          if (geoBtn) { geoBtn.classList.add('active'); geoBtn.innerHTML = '&#x2705; Posisjon aktiv'; geoBtn.disabled = false; }
+          if (geoStatus) geoStatus.textContent = 'Viser resultater nær deg.';
+        } catch (err) {
+          // User denied or timeout — proceed without location, backend geocodes from query text
+          if (geoBtn) { geoBtn.disabled = false; geoBtn.innerHTML = '&#x1F4CD; Nær meg'; }
+          if (geoStatus && err.code === 1) geoStatus.textContent = 'Posisjon ikke delt — søker basert på stedsnavn.';
+        }
+      }
+
       try {
-        var response = await fetch('/api/marketplace/search?q=' + encodeURIComponent(query) + '&limit=50');
+        var searchUrl = '/api/marketplace/search?q=' + encodeURIComponent(query) + '&limit=50';
+        if (userLat && userLng && !forceHeleNorge) {
+          searchUrl += '&lat=' + userLat + '&lng=' + userLng + '&radius=30';
+        }
+        if (forceHeleNorge) {
+          searchUrl += '&heleNorge=true';
+        }
+        var response = await fetch(searchUrl);
         var body = await response.json();
 
         if (body.results && body.results.length > 0) {
           filteredAgents = body.results.map(function(r) { return r.agent; });
         } else {
-          // Fallback to name matching
           var qLower = query.toLowerCase();
           filteredAgents = allAgents.filter(function(a) {
             return a.name.toLowerCase().indexOf(qLower) !== -1 ||
@@ -1630,11 +1765,17 @@ curl -X POST https://rettfrabonden.com/api/marketplace/register \
           });
         }
 
+        lastSearchWasGeoFiltered = body.geoFiltered && !forceHeleNorge;
         displayCount = AGENTS_PER_PAGE;
-        if (titleEl) titleEl.textContent = 'Søkeresultater for «' + query + '» (' + filteredAgents.length + ' treff)';
+
+        var titleText = 'Søkeresultater for «' + query + '» (' + filteredAgents.length + ' treff)';
+        if (titleEl) titleEl.textContent = titleText;
+
         renderAgents();
 
-        // Scroll to results so user sees them
+        // Show/hide "Vis hele Norge" button
+        updateHeleNorgeButton(query);
+
         var agentsSection = document.getElementById('agents');
         if (agentsSection) {
           agentsSection.scrollIntoView({ behavior: 'smooth', block: 'start' });
@@ -1642,6 +1783,27 @@ curl -X POST https://rettfrabonden.com/api/marketplace/register \
       } catch (error) {
         console.error('Search error:', error);
       }
+    }
+
+    function updateHeleNorgeButton(query) {
+      var existing = document.getElementById('heleNorgeBtn');
+      if (existing) existing.remove();
+
+      if (!lastSearchWasGeoFiltered) return;
+
+      var container = document.getElementById('filterContainer');
+      if (!container) return;
+
+      var btn = document.createElement('button');
+      btn.id = 'heleNorgeBtn';
+      btn.className = 'filter-btn';
+      btn.style.cssText = 'background: #e8f0e0; color: var(--forest-green); border: 1.5px solid var(--forest-green); margin-left: auto; font-weight: 600;';
+      btn.innerHTML = '&#x1F30D; Vis hele Norge';
+      btn.addEventListener('click', function() {
+        performSearch(true);
+        btn.remove();
+      });
+      container.appendChild(btn);
     }
 
     // ── Filter ──

@@ -16,6 +16,10 @@ const reservation_1 = __importDefault(require("./routes/reservation"));
 const marketplace_1 = __importDefault(require("./routes/marketplace"));
 const mcp_1 = __importDefault(require("./routes/mcp"));
 const seo_1 = __importDefault(require("./routes/seo"));
+const discovery_1 = __importDefault(require("./routes/discovery"));
+const conversation_ui_1 = __importDefault(require("./routes/conversation-ui"));
+const agent_readiness_1 = __importDefault(require("./routes/agent-readiness"));
+const agent_discovery_1 = require("./middleware/agent-discovery");
 const analytics_service_1 = require("./services/analytics-service");
 const analytics_1 = __importDefault(require("./routes/analytics"));
 const seed_1 = require("./seed");
@@ -55,6 +59,18 @@ app.use(express_1.default.json({ limit: security_1.MAX_REQUEST_SIZE }));
 app.use(security_1.sanitizeInput);
 // Analytics middleware (before routes, after security)
 app.use(analytics_service_1.analyticsService.middleware());
+// ─── Agent discovery ────────────────────────────────────────
+// Link headers (RFC 8288) on every response — cheap, helps agents
+// auto-discover our well-known endpoints without poking around.
+app.use(agent_discovery_1.linkHeaders);
+// Markdown content negotiation — when an agent sends
+// `Accept: text/markdown` on a content route, return markdown
+// instead of HTML. Saves tokens, improves agent comprehension.
+app.use(agent_discovery_1.markdownNegotiation);
+// Well-known discovery endpoints (MCP Server Card, Agent Skills,
+// API Catalog, OAuth Protected Resource). Mounted BEFORE static
+// so the .well-known/* paths are served dynamically, not from disk.
+app.use("/", agent_readiness_1.default);
 // Serve the marketplace dashboard
 app.use(express_1.default.static(path_1.default.join(__dirname, "public"), { extensions: ["html"] }));
 // ─── Rate-limited routes ─────────────────────────────────────
@@ -197,7 +213,10 @@ app.get("/health", (_req, res) => {
 });
 // Analytics admin endpoints
 app.use("/admin/analytics", analytics_1.default);
+// Conversation UI — /samtaler and /samtale/:id (before SEO catch-all)
+app.use("/", conversation_ui_1.default);
 // SEO pages LAST — /:city is a catch-all wildcard
+app.use("/", discovery_1.default); // llms.txt, MCP server-card, agents.txt, openapi.json
 app.use("/", seo_1.default);
 // ─── Database + Seed (with idempotency guard) ───────────────
 // FIX: Seeds were running on every restart, causing duplicate agents.

@@ -21,6 +21,7 @@ const streamableHttp_js_1 = require("@modelcontextprotocol/sdk/server/streamable
 const zod_1 = require("zod");
 const marketplace_registry_1 = require("../services/marketplace-registry");
 const knowledge_service_1 = require("../services/knowledge-service");
+const conversation_service_1 = require("../services/conversation-service");
 const router = (0, express_1.Router)();
 // ─── Tool definitions (shared logic) ────────────────────────
 // These mirror the stdio MCP server tools but call services directly.
@@ -35,13 +36,31 @@ function registerTools(server) {
         if (!results?.length) {
             return { content: [{ type: "text", text: `Ingen resultater for "${query}". Prøv et bredere søk.` }] };
         }
+        // Auto-start conversations with top match so seller agent responds
+        const BASE = process.env.BASE_URL || "https://rettfrabonden.com";
+        const convLinks = [];
+        for (const r of results.slice(0, 2)) {
+            try {
+                const conv = conversation_service_1.conversationService.startConversation({
+                    sellerAgentId: r.agent.id,
+                    queryText: query,
+                    source: "mcp",
+                    autoRespond: true,
+                });
+                convLinks.push(`💬 [Samtale med ${conv.sellerAgentName}](${BASE}/samtale/${conv.id})`);
+            }
+            catch { /* non-critical */ }
+        }
         const header = `🥬 **Lokal mat-søk: "${query}"** — fant ${results.length} produsenter:\n`;
         const lines = results.map((r, i) => {
             const agent = r.agent;
             const dist = r.distanceKm ? ` — ${r.distanceKm.toFixed(1)} km unna` : "";
             return formatAgentCompact(agent, i + 1, r.contact) + dist;
         });
-        return { content: [{ type: "text", text: header + "\n" + lines.join("\n\n") }] };
+        const convSection = convLinks.length
+            ? `\n\n---\n**Samtaler startet automatisk:**\n${convLinks.join("\n")}`
+            : "";
+        return { content: [{ type: "text", text: header + "\n" + lines.join("\n\n") + convSection }] };
     });
     // Tool 2: Structured discovery
     server.tool("lokal_discover", "Structured search in the Lokal food producer registry. Filter by food categories, tags, and geographic distance.", {
@@ -57,12 +76,31 @@ function registerTools(server) {
         if (!results?.length) {
             return { content: [{ type: "text", text: "Ingen produsenter funnet med disse filtrene." }] };
         }
+        // Auto-start conversation with top match
+        const BASE = process.env.BASE_URL || "https://rettfrabonden.com";
+        const convLinks = [];
+        const queryDesc = [categories?.join(", "), tags?.join(", ")].filter(Boolean).join(" — ") || "strukturert søk";
+        for (const r of results.slice(0, 2)) {
+            try {
+                const conv = conversation_service_1.conversationService.startConversation({
+                    sellerAgentId: r.agent.id,
+                    queryText: queryDesc,
+                    source: "mcp",
+                    autoRespond: true,
+                });
+                convLinks.push(`💬 [Samtale med ${conv.sellerAgentName}](${BASE}/samtale/${conv.id})`);
+            }
+            catch { /* non-critical */ }
+        }
         const header = `🔍 **Strukturert søk** — ${results.length} resultater:\n`;
         const lines = results.map((r, i) => {
             const dist = r.distanceKm ? ` (${r.distanceKm.toFixed(1)} km)` : "";
             return formatAgentCompact(r.agent, i + 1, r.contact) + dist;
         });
-        return { content: [{ type: "text", text: header + "\n" + lines.join("\n\n") }] };
+        const convSection = convLinks.length
+            ? `\n\n---\n**Samtaler startet automatisk:**\n${convLinks.join("\n")}`
+            : "";
+        return { content: [{ type: "text", text: header + "\n" + lines.join("\n\n") + convSection }] };
     });
     // Tool 3: Producer details
     server.tool("lokal_info", "Get detailed information about a specific Lokal producer — address, products, opening hours, certifications, and contact info.", {
@@ -132,6 +170,33 @@ function registerTools(server) {
         ].join("\n");
         return { content: [{ type: "text", text }] };
     });
+    // ─── MCP Resources ──────────────────────────────────────────
+    // Resources let agents READ data directly (vs tools which are actions).
+    // This is the MCP equivalent of a database view.
+    server.resource("producers-overview", "lokal://producers/overview", { description: "Overview of all local food producers — count, cities, and categories", mimeType: "text/plain" }, async () => {
+        const agents = marketplace_registry_1.marketplaceRegistry.getActiveAgents();
+        const cities = new Map();
+        for (const a of agents) {
+            const city = a.city || a.location?.city || "Ukjent";
+            cities.set(city, (cities.get(city) || 0) + 1);
+        }
+        const topCities = [...cities.entries()].sort((a, b) => b[1] - a[1]).slice(0, 20);
+        const text = [
+            `# Rett fra Bonden — ${agents.length} lokale matprodusenter i Norge`,
+            ``,
+            `## Byer:`,
+            ...topCities.map(([city, count]) => `- ${city}: ${count} produsenter`),
+        ].join("\n");
+        return { contents: [{ uri: "lokal://producers/overview", text, mimeType: "text/plain" }] };
+    });
+    server.resource("producer-detail", "lokal://producers/{agentId}", { description: "Detailed info about a specific food producer", mimeType: "application/json" }, async (uri) => {
+        const agentId = uri.pathname?.split("/").pop() || "";
+        const info = knowledge_service_1.knowledgeService.getAgentInfo(agentId);
+        if (!info) {
+            return { contents: [{ uri: uri.href, text: "Producer not found", mimeType: "text/plain" }] };
+        }
+        return { contents: [{ uri: uri.href, text: JSON.stringify(info, null, 2), mimeType: "application/json" }] };
+    });
 }
 // ─── Compact agent formatter ────────────────────────────────
 function formatAgentCompact(agent, idx, contact) {
@@ -139,8 +204,8 @@ function formatAgentCompact(agent, idx, contact) {
     if (agent.description)
         lines.push(`   ${agent.description}`);
     const meta = [];
-    if (agent.location?.city)
-        meta.push(`📍 ${agent.location.city}`);
+    if (agent.city || agent.location?.city)
+        meta.push(`📍 ${agent.city || agent.location?.city}`);
     if (agent.categories?.length)
         meta.push(`🏷️ ${agent.categories.join(", ")}`);
     if (agent.trustScore)

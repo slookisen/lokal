@@ -1,3 +1,4 @@
+"use strict";
 /**
  * Conversation UI Routes — Human-readable A2A conversation views
  *
@@ -12,74 +13,70 @@
  * Real-time: The chat view connects to /api/live SSE for live
  * message updates — new bubbles appear without page refresh.
  */
-
-import { Router, Request, Response } from "express";
-import { randomUUID } from "crypto";
-import { conversationService } from "../services/conversation-service";
-import { interactionLogger } from "../services/interaction-logger";
-
-const router = Router();
-
+Object.defineProperty(exports, "__esModule", { value: true });
+const express_1 = require("express");
+const crypto_1 = require("crypto");
+const conversation_service_1 = require("../services/conversation-service");
+const interaction_logger_1 = require("../services/interaction-logger");
+const router = (0, express_1.Router)();
 const BASE_URL = process.env.BASE_URL || "https://rettfrabonden.com";
-
 // ─── Helpers ────────────────────────────────────────────────
-
-function escapeHtml(text: string): string {
-  if (!text) return "";
-  return String(text).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
-    .replace(/"/g, "&quot;").replace(/'/g, "&#39;");
+function escapeHtml(text) {
+    if (!text)
+        return "";
+    return String(text).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
+        .replace(/"/g, "&quot;").replace(/'/g, "&#39;");
 }
-
-function formatTime(isoDate: string): string {
-  try {
-    const d = new Date(isoDate);
-    return d.toLocaleString("nb-NO", { day: "numeric", month: "short", hour: "2-digit", minute: "2-digit" });
-  } catch { return isoDate; }
+function formatTime(isoDate) {
+    try {
+        const d = new Date(isoDate);
+        return d.toLocaleString("nb-NO", { day: "numeric", month: "short", hour: "2-digit", minute: "2-digit" });
+    }
+    catch {
+        return isoDate;
+    }
 }
-
-function formatTimeShort(isoDate: string): string {
-  try {
-    const d = new Date(isoDate);
-    return d.toLocaleTimeString("nb-NO", { hour: "2-digit", minute: "2-digit" });
-  } catch { return ""; }
+function formatTimeShort(isoDate) {
+    try {
+        const d = new Date(isoDate);
+        return d.toLocaleTimeString("nb-NO", { hour: "2-digit", minute: "2-digit" });
+    }
+    catch {
+        return "";
+    }
 }
-
-function statusBadge(status: string): string {
-  const map: Record<string, { label: string; cls: string }> = {
-    open: { label: "&#128994; Åpen", cls: "st-open" },
-    negotiating: { label: "&#128992; Forhandling", cls: "st-neg" },
-    accepted: { label: "&#9989; Akseptert", cls: "st-ok" },
-    completed: { label: "&#127881; Fullført", cls: "st-done" },
-    expired: { label: "&#9203; Utløpt", cls: "st-exp" },
-    cancelled: { label: "&#10060; Avbrutt", cls: "st-can" },
-  };
-  const s = map[status] || { label: status, cls: "" };
-  return `<span class="conv-status ${s.cls}">${s.label}</span>`;
+function statusBadge(status) {
+    const map = {
+        open: { label: "&#128994; Åpen", cls: "st-open" },
+        negotiating: { label: "&#128992; Forhandling", cls: "st-neg" },
+        accepted: { label: "&#9989; Akseptert", cls: "st-ok" },
+        completed: { label: "&#127881; Fullført", cls: "st-done" },
+        expired: { label: "&#9203; Utløpt", cls: "st-exp" },
+        cancelled: { label: "&#10060; Avbrutt", cls: "st-can" },
+    };
+    const s = map[status] || { label: status, cls: "" };
+    return `<span class="conv-status ${s.cls}">${s.label}</span>`;
 }
-
-function sourceBadge(source: string): string {
-  const map: Record<string, { label: string; bg: string; color: string }> = {
-    a2a: { label: "A2A", bg: "#e8f5e0", color: "#2D5016" },
-    mcp: { label: "MCP", bg: "#ede9fe", color: "#7c3aed" },
-    web: { label: "Web", bg: "#e0f2fe", color: "#0369a1" },
-    api: { label: "API", bg: "#f3f4f6", color: "#6b7280" },
-  };
-  const s = map[source] || map.api!;
-  return `<span class="conv-status" style="background:${s.bg};color:${s.color}">${s.label}</span>`;
+function sourceBadge(source) {
+    const map = {
+        a2a: { label: "A2A", bg: "#e8f5e0", color: "#2D5016" },
+        mcp: { label: "MCP", bg: "#ede9fe", color: "#7c3aed" },
+        web: { label: "Web", bg: "#e0f2fe", color: "#0369a1" },
+        api: { label: "API", bg: "#f3f4f6", color: "#6b7280" },
+    };
+    const s = map[source] || map.api;
+    return `<span class="conv-status" style="background:${s.bg};color:${s.color}">${s.label}</span>`;
 }
-
-function messageTypeIcon(type: string): string {
-  switch (type) {
-    case "offer": return "&#128176;";
-    case "accept": return "&#9989;";
-    case "reject": return "&#10060;";
-    case "info": return "&#8505;&#65039;";
-    default: return "";
-  }
+function messageTypeIcon(type) {
+    switch (type) {
+        case "offer": return "&#128176;";
+        case "accept": return "&#9989;";
+        case "reject": return "&#10060;";
+        case "info": return "&#8505;&#65039;";
+        default: return "";
+    }
 }
-
 // ─── Shared CSS + page shell ────────────────────────────────
-
 const CHAT_CSS = `
 <style>
   * { margin: 0; padding: 0; box-sizing: border-box; }
@@ -228,9 +225,8 @@ const CHAT_CSS = `
     .chat-participants { flex-direction: column; gap: 10px; }
   }
 </style>`;
-
-function chatShell(title: string, description: string, content: string): string {
-  return `<!DOCTYPE html>
+function chatShell(title, description, content) {
+    return `<!DOCTYPE html>
 <html lang="nb">
 <head>
   <meta charset="UTF-8">
@@ -259,55 +255,50 @@ function chatShell(title: string, description: string, content: string): string 
 </body>
 </html>`;
 }
-
 // ═══════════════════════════════════════════════════════════════
 // GET /samtaler — Conversation list
 // ═══════════════════════════════════════════════════════════════
-
-router.get("/samtaler", (_req: Request, res: Response) => {
-  try {
-    const conversations = conversationService.listConversations({ limit: 100 });
-
-    let listHtml = "";
-
-    if (conversations.length === 0) {
-      listHtml = `
+router.get("/samtaler", (_req, res) => {
+    try {
+        const conversations = conversation_service_1.conversationService.listConversations({ limit: 100 });
+        let listHtml = "";
+        if (conversations.length === 0) {
+            listHtml = `
         <div class="empty-state">
           <div class="icon">&#128172;</div>
           <p>Ingen samtaler enn&aring;. N&aring;r AI-agenter begynner &aring; snakke med hverandre, dukker samtalene opp her.</p>
         </div>`;
-    } else {
-      // ─── Group conversations by query text ──────────────────
-      // Each search becomes one accordion card showing all responding agents.
-      const groups = new Map<string, typeof conversations>();
-      for (const conv of conversations) {
-        const key = (conv.queryText || "").trim().toLowerCase() || conv.id;
-        if (!groups.has(key)) groups.set(key, []);
-        groups.get(key)!.push(conv);
-      }
-
-      let groupIdx = 0;
-      listHtml = [...groups.entries()].map(([_key, convs]) => {
-        groupIdx++;
-        const first = convs[0];
-        const queryDisplay = first.queryText ? escapeHtml(first.queryText) : "Direkte samtale";
-        const source = first.source || "api";
-        const srcBadge = sourceBadge(source);
-        const totalMsgs = convs.reduce((s, c) => s + c.messages.length, 0);
-        const agentCount = convs.length;
-        const mostRecent = convs.reduce((a, b) => a.updatedAt > b.updatedAt ? a : b);
-        const groupId = `grp-${groupIdx}`;
-
-        // Agent sub-cards (inside accordion)
-        const agentCards = convs.map(conv => {
-          const sellerName = escapeHtml(conv.sellerAgentName || "Ukjent selger");
-          // Get the seller's auto-response (last non-system message)
-          const sellerMsg = [...conv.messages].reverse().find(m => m.senderRole === "seller");
-          const preview = sellerMsg
-            ? escapeHtml(sellerMsg.content).slice(0, 150) + (sellerMsg.content.length > 150 ? "..." : "")
-            : "";
-
-          return `<a href="/samtale/${conv.id}" class="agent-reply">
+        }
+        else {
+            // ─── Group conversations by query text ──────────────────
+            // Each search becomes one accordion card showing all responding agents.
+            const groups = new Map();
+            for (const conv of conversations) {
+                const key = (conv.queryText || "").trim().toLowerCase() || conv.id;
+                if (!groups.has(key))
+                    groups.set(key, []);
+                groups.get(key).push(conv);
+            }
+            let groupIdx = 0;
+            listHtml = [...groups.entries()].map(([_key, convs]) => {
+                groupIdx++;
+                const first = convs[0];
+                const queryDisplay = first.queryText ? escapeHtml(first.queryText) : "Direkte samtale";
+                const source = first.source || "api";
+                const srcBadge = sourceBadge(source);
+                const totalMsgs = convs.reduce((s, c) => s + c.messages.length, 0);
+                const agentCount = convs.length;
+                const mostRecent = convs.reduce((a, b) => a.updatedAt > b.updatedAt ? a : b);
+                const groupId = `grp-${groupIdx}`;
+                // Agent sub-cards (inside accordion)
+                const agentCards = convs.map(conv => {
+                    const sellerName = escapeHtml(conv.sellerAgentName || "Ukjent selger");
+                    // Get the seller's auto-response (last non-system message)
+                    const sellerMsg = [...conv.messages].reverse().find(m => m.senderRole === "seller");
+                    const preview = sellerMsg
+                        ? escapeHtml(sellerMsg.content).slice(0, 150) + (sellerMsg.content.length > 150 ? "..." : "")
+                        : "";
+                    return `<a href="/samtale/${conv.id}" class="agent-reply">
             <div class="agent-reply-top">
               <div class="agent-reply-name">${sellerName}</div>
               ${statusBadge(conv.status)}
@@ -318,9 +309,8 @@ router.get("/samtaler", (_req: Request, res: Response) => {
               <span class="cv-time">${formatTime(conv.updatedAt)}</span>
             </div>
           </a>`;
-        }).join("\n");
-
-        return `<div class="query-group">
+                }).join("\n");
+                return `<div class="query-group">
           <div class="query-header" onclick="var r=document.getElementById('${groupId}');r.classList.toggle('open');this.querySelector('.query-chevron').style.transform=r.classList.contains('open')?'rotate(180deg)':''">
             <div class="query-left">
               <div class="query-icon">&#128269;</div>
@@ -338,13 +328,11 @@ router.get("/samtaler", (_req: Request, res: Response) => {
             ${agentCards}
           </div>
         </div>`;
-      }).join("\n");
-    }
-
-    const totalConvs = conversations.length;
-    const totalQueries = new Set(conversations.map(c => (c.queryText || "").trim().toLowerCase())).size;
-
-    const html = chatShell("A2A Samtaler", "Se hvordan AI-agenter snakker sammen for å finne lokal mat", `
+            }).join("\n");
+        }
+        const totalConvs = conversations.length;
+        const totalQueries = new Set(conversations.map(c => (c.queryText || "").trim().toLowerCase())).size;
+        const html = chatShell("A2A Samtaler", "Se hvordan AI-agenter snakker sammen for å finne lokal mat", `
       <div class="container">
         <div class="conv-list-header">
           <h1>&#128172; Agent-til-Agent Samtaler</h1>
@@ -354,23 +342,21 @@ router.get("/samtaler", (_req: Request, res: Response) => {
         ${listHtml}
       </div>
     `);
-
-    res.send(html);
-  } catch (err: any) {
-    console.error("Error rendering /samtaler:", err);
-    res.status(500).send("Feil ved lasting av samtaler.");
-  }
+        res.send(html);
+    }
+    catch (err) {
+        console.error("Error rendering /samtaler:", err);
+        res.status(500).send("Feil ved lasting av samtaler.");
+    }
 });
-
 // ═══════════════════════════════════════════════════════════════
 // GET /samtale/:id — Single conversation as chat dialog
 // ═══════════════════════════════════════════════════════════════
-
-router.get("/samtale/:id", (req: Request, res: Response) => {
-  try {
-    const conv = conversationService.getConversation(req.params.id as string);
-    if (!conv) {
-      res.status(404).send(chatShell("Ikke funnet", "Samtalen finnes ikke", `
+router.get("/samtale/:id", (req, res) => {
+    try {
+        const conv = conversation_service_1.conversationService.getConversation(req.params.id);
+        if (!conv) {
+            res.status(404).send(chatShell("Ikke funnet", "Samtalen finnes ikke", `
         <div class="container">
           <div class="empty-state">
             <div class="icon">&#128533;</div>
@@ -379,39 +365,34 @@ router.get("/samtale/:id", (req: Request, res: Response) => {
           </div>
         </div>
       `));
-      return;
-    }
-
-    const buyerName = conv.buyerAgentName || "Anonym kjøper";
-    const sellerName = conv.sellerAgentName || "Ukjent selger";
-
-    // Build chat bubbles
-    let lastDate = "";
-    const bubblesHtml = conv.messages.map(msg => {
-      const role = msg.senderRole;
-      const msgDate = msg.createdAt.split("T")[0];
-      let dateSep = "";
-      if (msgDate !== lastDate) {
-        lastDate = msgDate;
-        dateSep = `<div class="chat-date-sep"><span>${formatTime(msg.createdAt).split(",")[0] || msgDate}</span></div>`;
-      }
-
-      if (role === "system") {
-        return `${dateSep}<div class="msg msg-system msg-${msg.messageType}">
+            return;
+        }
+        const buyerName = conv.buyerAgentName || "Anonym kjøper";
+        const sellerName = conv.sellerAgentName || "Ukjent selger";
+        // Build chat bubbles
+        let lastDate = "";
+        const bubblesHtml = conv.messages.map(msg => {
+            const role = msg.senderRole;
+            const msgDate = msg.createdAt.split("T")[0];
+            let dateSep = "";
+            if (msgDate !== lastDate) {
+                lastDate = msgDate;
+                dateSep = `<div class="chat-date-sep"><span>${formatTime(msg.createdAt).split(",")[0] || msgDate}</span></div>`;
+            }
+            if (role === "system") {
+                return `${dateSep}<div class="msg msg-system msg-${msg.messageType}">
           <div class="bubble bubble-system">
             ${messageTypeIcon(msg.messageType)} ${escapeHtml(msg.content)}
             <div class="bubble-footer"><span class="bubble-time">${formatTimeShort(msg.createdAt)}</span></div>
           </div>
         </div>`;
-      }
-
-      const isBuyer = role === "buyer";
-      const bubbleCls = isBuyer ? "bubble-buyer" : "bubble-seller";
-      const msgCls = isBuyer ? "msg-buyer" : "msg-seller";
-      const name = msg.senderAgentName || (isBuyer ? buyerName : sellerName);
-      const typeIcon = messageTypeIcon(msg.messageType);
-
-      return `${dateSep}<div class="msg ${msgCls} msg-${msg.messageType}">
+            }
+            const isBuyer = role === "buyer";
+            const bubbleCls = isBuyer ? "bubble-buyer" : "bubble-seller";
+            const msgCls = isBuyer ? "msg-buyer" : "msg-seller";
+            const name = msg.senderAgentName || (isBuyer ? buyerName : sellerName);
+            const typeIcon = messageTypeIcon(msg.messageType);
+            return `${dateSep}<div class="msg ${msgCls} msg-${msg.messageType}">
         <div class="bubble ${bubbleCls}">
           <div class="bubble-name">${escapeHtml(name)}</div>
           <div class="bubble-content">${typeIcon ? typeIcon + " " : ""}${escapeHtml(msg.content)}</div>
@@ -421,16 +402,11 @@ router.get("/samtale/:id", (req: Request, res: Response) => {
           </div>
         </div>
       </div>`;
-    }).join("\n");
-
-    // Participant cards
-    const buyerInitial = buyerName.charAt(0).toUpperCase();
-    const sellerInitial = sellerName.charAt(0).toUpperCase();
-
-    const html = chatShell(
-      `${buyerName} ↔ ${sellerName}`,
-      `A2A-samtale: ${conv.queryText || "agent-dialog"}`,
-      `
+        }).join("\n");
+        // Participant cards
+        const buyerInitial = buyerName.charAt(0).toUpperCase();
+        const sellerInitial = sellerName.charAt(0).toUpperCase();
+        const html = chatShell(`${buyerName} ↔ ${sellerName}`, `A2A-samtale: ${conv.queryText || "agent-dialog"}`, `
       <div class="container">
         <div class="bc">
           <a href="/">Hjem</a><span>/</span><a href="/samtaler">Samtaler</a><span>/</span>${escapeHtml(sellerName)}
@@ -532,14 +508,13 @@ router.get("/samtale/:id", (req: Request, res: Response) => {
         })();
       </script>
     `);
-
-    res.send(html);
-  } catch (err: any) {
-    console.error("Error rendering /samtale/:id:", err);
-    res.status(500).send("Feil ved lasting av samtale.");
-  }
+        res.send(html);
+    }
+    catch (err) {
+        console.error("Error rendering /samtale/:id:", err);
+        res.status(500).send("Feil ved lasting av samtale.");
+    }
 });
-
 // ═══════════════════════════════════════════════════════════════
 // AG-UI PROTOCOL — Real-time conversation streaming
 // ═══════════════════════════════════════════════════════════════
@@ -558,229 +533,216 @@ router.get("/samtale/:id", (req: Request, res: Response) => {
 // Event types used:
 //   RunStarted, RunFinished, TextMessageStart, TextMessageContent,
 //   TextMessageEnd, StateSnapshot, Custom
-
 // ─── AG-UI SSE clients per conversation ─────────────────────
-const agUiClients = new Map<string, Set<Response>>();
-
-function sendAgUiEvent(conversationId: string, event: object) {
-  const clients = agUiClients.get(conversationId);
-  if (!clients?.size) return;
-  const data = JSON.stringify(event);
-  for (const client of clients) {
-    try { client.write(`data: ${data}\n\n`); } catch { clients.delete(client); }
-  }
+const agUiClients = new Map();
+function sendAgUiEvent(conversationId, event) {
+    const clients = agUiClients.get(conversationId);
+    if (!clients?.size)
+        return;
+    const data = JSON.stringify(event);
+    for (const client of clients) {
+        try {
+            client.write(`data: ${data}\n\n`);
+        }
+        catch {
+            clients.delete(client);
+        }
+    }
 }
-
 // Forward conversation messages to AG-UI clients in real-time
-interactionLogger.on("message", (msg: any) => {
-  if (!msg.conversationId) return;
-  const clients = agUiClients.get(msg.conversationId);
-  if (!clients?.size) return;
-
-  const messageId = msg.id || randomUUID();
-  const role = msg.senderRole === "buyer" ? "user" : msg.senderRole === "seller" ? "assistant" : "system";
-
-  // Emit AG-UI text message sequence: Start → Content → End
-  sendAgUiEvent(msg.conversationId, {
-    type: "TextMessageStart",
-    messageId,
-    role,
-    timestamp: new Date().toISOString(),
-  });
-
-  sendAgUiEvent(msg.conversationId, {
-    type: "TextMessageContent",
-    messageId,
-    delta: msg.content,
-    timestamp: new Date().toISOString(),
-  });
-
-  sendAgUiEvent(msg.conversationId, {
-    type: "TextMessageEnd",
-    messageId,
-    timestamp: new Date().toISOString(),
-  });
-
-  // Also emit custom event with A2A-specific metadata
-  if (msg.messageType && msg.messageType !== "text") {
+interaction_logger_1.interactionLogger.on("message", (msg) => {
+    if (!msg.conversationId)
+        return;
+    const clients = agUiClients.get(msg.conversationId);
+    if (!clients?.size)
+        return;
+    const messageId = msg.id || (0, crypto_1.randomUUID)();
+    const role = msg.senderRole === "buyer" ? "user" : msg.senderRole === "seller" ? "assistant" : "system";
+    // Emit AG-UI text message sequence: Start → Content → End
     sendAgUiEvent(msg.conversationId, {
-      type: "Custom",
-      name: "a2a.message_type",
-      value: {
-        messageType: msg.messageType,
-        senderRole: msg.senderRole,
-        senderAgentName: msg.senderAgentName,
-        metadata: msg.metadata,
-      },
-      timestamp: new Date().toISOString(),
+        type: "TextMessageStart",
+        messageId,
+        role,
+        timestamp: new Date().toISOString(),
     });
-  }
+    sendAgUiEvent(msg.conversationId, {
+        type: "TextMessageContent",
+        messageId,
+        delta: msg.content,
+        timestamp: new Date().toISOString(),
+    });
+    sendAgUiEvent(msg.conversationId, {
+        type: "TextMessageEnd",
+        messageId,
+        timestamp: new Date().toISOString(),
+    });
+    // Also emit custom event with A2A-specific metadata
+    if (msg.messageType && msg.messageType !== "text") {
+        sendAgUiEvent(msg.conversationId, {
+            type: "Custom",
+            name: "a2a.message_type",
+            value: {
+                messageType: msg.messageType,
+                senderRole: msg.senderRole,
+                senderAgentName: msg.senderAgentName,
+                metadata: msg.metadata,
+            },
+            timestamp: new Date().toISOString(),
+        });
+    }
 });
-
 // ─── GET /api/ag-ui/conversations — List active streams ─────
-
-router.get("/api/ag-ui/conversations", (_req: Request, res: Response) => {
-  const conversations = conversationService.listConversations({ limit: 50 });
-  res.json({
-    conversations: conversations.map(c => ({
-      id: c.id,
-      buyerAgent: c.buyerAgentName,
-      sellerAgent: c.sellerAgentName,
-      status: c.status,
-      messageCount: c.messages.length,
-      streamUrl: `${BASE_URL}/api/ag-ui/conversation/${c.id}`,
-      updatedAt: c.updatedAt,
-    })),
-  });
+router.get("/api/ag-ui/conversations", (_req, res) => {
+    const conversations = conversation_service_1.conversationService.listConversations({ limit: 50 });
+    res.json({
+        conversations: conversations.map(c => ({
+            id: c.id,
+            buyerAgent: c.buyerAgentName,
+            sellerAgent: c.sellerAgentName,
+            status: c.status,
+            messageCount: c.messages.length,
+            streamUrl: `${BASE_URL}/api/ag-ui/conversation/${c.id}`,
+            updatedAt: c.updatedAt,
+        })),
+    });
 });
-
 // ─── POST /api/ag-ui/conversation/:id/run — Start AG-UI run ─
 // This replays the full conversation as AG-UI events, then keeps
 // the connection open for live updates. This is how AG-UI clients
 // "join" a conversation.
-
-router.post("/api/ag-ui/conversation/:id/run", (req: Request, res: Response) => {
-  const conv = conversationService.getConversation(req.params.id as string);
-  if (!conv) {
-    res.status(404).json({ type: "RunError", message: "Conversation not found", code: "NOT_FOUND" });
-    return;
-  }
-
-  // Set up SSE
-  res.writeHead(200, {
-    "Content-Type": "text/event-stream",
-    "Cache-Control": "no-cache",
-    "Connection": "keep-alive",
-    "X-Accel-Buffering": "no",
-  });
-
-  const runId = randomUUID();
-  const threadId = conv.id;
-
-  // Register this client for live updates
-  if (!agUiClients.has(threadId)) agUiClients.set(threadId, new Set());
-  agUiClients.get(threadId)!.add(res);
-  req.on("close", () => {
-    agUiClients.get(threadId)?.delete(res);
-    if (agUiClients.get(threadId)?.size === 0) agUiClients.delete(threadId);
-  });
-
-  // 1. RunStarted
-  res.write(`data: ${JSON.stringify({
-    type: "RunStarted",
-    threadId,
-    runId,
-    timestamp: new Date().toISOString(),
-  })}\n\n`);
-
-  // 2. StateSnapshot — full conversation state
-  res.write(`data: ${JSON.stringify({
-    type: "StateSnapshot",
-    snapshot: {
-      conversationId: conv.id,
-      status: conv.status,
-      buyerAgent: { id: conv.buyerAgentId, name: conv.buyerAgentName },
-      sellerAgent: { id: conv.sellerAgentId, name: conv.sellerAgentName },
-      queryText: conv.queryText,
-      messageCount: conv.messages.length,
-      createdAt: conv.createdAt,
-    },
-    timestamp: new Date().toISOString(),
-  })}\n\n`);
-
-  // 3. Replay all existing messages as AG-UI TextMessage events
-  for (const msg of conv.messages) {
-    const messageId = msg.id;
-    const role = msg.senderRole === "buyer" ? "user" : msg.senderRole === "seller" ? "assistant" : "system";
-
-    res.write(`data: ${JSON.stringify({
-      type: "TextMessageStart",
-      messageId,
-      role,
-      timestamp: msg.createdAt,
-    })}\n\n`);
-
-    res.write(`data: ${JSON.stringify({
-      type: "TextMessageContent",
-      messageId,
-      delta: msg.content,
-      timestamp: msg.createdAt,
-    })}\n\n`);
-
-    res.write(`data: ${JSON.stringify({
-      type: "TextMessageEnd",
-      messageId,
-      timestamp: msg.createdAt,
-    })}\n\n`);
-
-    // Emit custom metadata for non-text messages
-    if (msg.messageType !== "text") {
-      res.write(`data: ${JSON.stringify({
-        type: "Custom",
-        name: "a2a.message_type",
-        value: {
-          messageType: msg.messageType,
-          senderRole: msg.senderRole,
-          senderAgentName: msg.senderAgentName,
-        },
-        timestamp: msg.createdAt,
-      })}\n\n`);
+router.post("/api/ag-ui/conversation/:id/run", (req, res) => {
+    const conv = conversation_service_1.conversationService.getConversation(req.params.id);
+    if (!conv) {
+        res.status(404).json({ type: "RunError", message: "Conversation not found", code: "NOT_FOUND" });
+        return;
     }
-  }
-
-  // 4. If conversation is already completed, send RunFinished
-  if (["completed", "cancelled", "expired"].includes(conv.status)) {
+    // Set up SSE
+    res.writeHead(200, {
+        "Content-Type": "text/event-stream",
+        "Cache-Control": "no-cache",
+        "Connection": "keep-alive",
+        "X-Accel-Buffering": "no",
+    });
+    const runId = (0, crypto_1.randomUUID)();
+    const threadId = conv.id;
+    // Register this client for live updates
+    if (!agUiClients.has(threadId))
+        agUiClients.set(threadId, new Set());
+    agUiClients.get(threadId).add(res);
+    req.on("close", () => {
+        agUiClients.get(threadId)?.delete(res);
+        if (agUiClients.get(threadId)?.size === 0)
+            agUiClients.delete(threadId);
+    });
+    // 1. RunStarted
     res.write(`data: ${JSON.stringify({
-      type: "RunFinished",
-      threadId,
-      runId,
-      result: { status: conv.status },
-      timestamp: new Date().toISOString(),
+        type: "RunStarted",
+        threadId,
+        runId,
+        timestamp: new Date().toISOString(),
     })}\n\n`);
-    // Keep connection open briefly for any late events, then close
-    setTimeout(() => { try { res.end(); } catch {} }, 1000);
-  }
-  // Otherwise, connection stays open for live updates via the interactionLogger listener
+    // 2. StateSnapshot — full conversation state
+    res.write(`data: ${JSON.stringify({
+        type: "StateSnapshot",
+        snapshot: {
+            conversationId: conv.id,
+            status: conv.status,
+            buyerAgent: { id: conv.buyerAgentId, name: conv.buyerAgentName },
+            sellerAgent: { id: conv.sellerAgentId, name: conv.sellerAgentName },
+            queryText: conv.queryText,
+            messageCount: conv.messages.length,
+            createdAt: conv.createdAt,
+        },
+        timestamp: new Date().toISOString(),
+    })}\n\n`);
+    // 3. Replay all existing messages as AG-UI TextMessage events
+    for (const msg of conv.messages) {
+        const messageId = msg.id;
+        const role = msg.senderRole === "buyer" ? "user" : msg.senderRole === "seller" ? "assistant" : "system";
+        res.write(`data: ${JSON.stringify({
+            type: "TextMessageStart",
+            messageId,
+            role,
+            timestamp: msg.createdAt,
+        })}\n\n`);
+        res.write(`data: ${JSON.stringify({
+            type: "TextMessageContent",
+            messageId,
+            delta: msg.content,
+            timestamp: msg.createdAt,
+        })}\n\n`);
+        res.write(`data: ${JSON.stringify({
+            type: "TextMessageEnd",
+            messageId,
+            timestamp: msg.createdAt,
+        })}\n\n`);
+        // Emit custom metadata for non-text messages
+        if (msg.messageType !== "text") {
+            res.write(`data: ${JSON.stringify({
+                type: "Custom",
+                name: "a2a.message_type",
+                value: {
+                    messageType: msg.messageType,
+                    senderRole: msg.senderRole,
+                    senderAgentName: msg.senderAgentName,
+                },
+                timestamp: msg.createdAt,
+            })}\n\n`);
+        }
+    }
+    // 4. If conversation is already completed, send RunFinished
+    if (["completed", "cancelled", "expired"].includes(conv.status)) {
+        res.write(`data: ${JSON.stringify({
+            type: "RunFinished",
+            threadId,
+            runId,
+            result: { status: conv.status },
+            timestamp: new Date().toISOString(),
+        })}\n\n`);
+        // Keep connection open briefly for any late events, then close
+        setTimeout(() => { try {
+            res.end();
+        }
+        catch { } }, 1000);
+    }
+    // Otherwise, connection stays open for live updates via the interactionLogger listener
 });
-
 // ─── GET /api/ag-ui/conversation/:id — Simple SSE stream ────
 // Lighter alternative: just streams new messages, no replay.
-
-router.get("/api/ag-ui/conversation/:id", (req: Request, res: Response) => {
-  const convId = req.params.id as string;
-  const conv = conversationService.getConversation(convId);
-  if (!conv) {
-    res.status(404).json({ error: "Conversation not found" });
-    return;
-  }
-
-  res.writeHead(200, {
-    "Content-Type": "text/event-stream",
-    "Cache-Control": "no-cache",
-    "Connection": "keep-alive",
-    "X-Accel-Buffering": "no",
-  });
-
-  // Send connection event
-  res.write(`data: ${JSON.stringify({
-    type: "Custom",
-    name: "a2a.connected",
-    value: {
-      conversationId: convId,
-      status: conv.status,
-      buyerAgent: conv.buyerAgentName,
-      sellerAgent: conv.sellerAgentName,
-    },
-    timestamp: new Date().toISOString(),
-  })}\n\n`);
-
-  // Register for live updates
-  if (!agUiClients.has(convId)) agUiClients.set(convId, new Set());
-  agUiClients.get(convId)!.add(res);
-  req.on("close", () => {
-    agUiClients.get(convId)?.delete(res);
-    if (agUiClients.get(convId)?.size === 0) agUiClients.delete(convId);
-  });
+router.get("/api/ag-ui/conversation/:id", (req, res) => {
+    const convId = req.params.id;
+    const conv = conversation_service_1.conversationService.getConversation(convId);
+    if (!conv) {
+        res.status(404).json({ error: "Conversation not found" });
+        return;
+    }
+    res.writeHead(200, {
+        "Content-Type": "text/event-stream",
+        "Cache-Control": "no-cache",
+        "Connection": "keep-alive",
+        "X-Accel-Buffering": "no",
+    });
+    // Send connection event
+    res.write(`data: ${JSON.stringify({
+        type: "Custom",
+        name: "a2a.connected",
+        value: {
+            conversationId: convId,
+            status: conv.status,
+            buyerAgent: conv.buyerAgentName,
+            sellerAgent: conv.sellerAgentName,
+        },
+        timestamp: new Date().toISOString(),
+    })}\n\n`);
+    // Register for live updates
+    if (!agUiClients.has(convId))
+        agUiClients.set(convId, new Set());
+    agUiClients.get(convId).add(res);
+    req.on("close", () => {
+        agUiClients.get(convId)?.delete(res);
+        if (agUiClients.get(convId)?.size === 0)
+            agUiClients.delete(convId);
+    });
 });
-
-export default router;
+exports.default = router;
+//# sourceMappingURL=conversation-ui.js.map

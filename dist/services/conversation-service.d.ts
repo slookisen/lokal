@@ -1,6 +1,7 @@
 export type ConversationStatus = "open" | "negotiating" | "accepted" | "completed" | "expired" | "cancelled";
 export type MessageType = "text" | "offer" | "accept" | "reject" | "info";
 export type SenderRole = "buyer" | "seller" | "system";
+export type ConversationSource = "a2a" | "mcp" | "web" | "api";
 export interface Conversation {
     id: string;
     buyerAgentId?: string;
@@ -10,6 +11,7 @@ export interface Conversation {
     status: ConversationStatus;
     queryText?: string;
     taskId?: string;
+    source: ConversationSource;
     messages: ConversationMessage[];
     createdAt: string;
     updatedAt: string;
@@ -31,7 +33,14 @@ declare class ConversationService {
         sellerAgentId: string;
         queryText?: string;
         taskId?: string;
+        source?: "a2a" | "mcp" | "web" | "api";
+        autoRespond?: boolean;
     }): Conversation;
+    generateSellerResponse(sellerAgentId: string, queryText?: string): {
+        text: string;
+        type: MessageType;
+        metadata: Record<string, any>;
+    } | null;
     addMessage(opts: {
         conversationId: string;
         senderRole: SenderRole;
