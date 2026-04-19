@@ -41,6 +41,8 @@ class KnowledgeService {
                 isVerified: agent.is_verified === 1,
                 isClaimed,
                 languages: agent.languages ? JSON.parse(agent.languages) : ["no"],
+                schemaVersion: agent.schema_version || "urn:a2a:1.0",
+                agentVersion: agent.agent_version || 1,
             },
             knowledge: {
                 address: knowledge?.address,
@@ -110,6 +112,13 @@ class KnowledgeService {
           updated_at = ?
         WHERE agent_id = ?
       `).run(merged.address || null, merged.postalCode || null, merged.website || null, merged.phone || null, merged.email || null, JSON.stringify(merged.openingHours || []), JSON.stringify(merged.products || []), merged.about || null, JSON.stringify(merged.specialties || []), JSON.stringify(merged.certifications || []), JSON.stringify(merged.paymentMethods || []), JSON.stringify(merged.deliveryOptions || []), merged.googleRating || null, merged.googleReviewCount || null, merged.tripadvisorRating || null, JSON.stringify(merged.externalReviews || []), JSON.stringify(merged.externalLinks || []), JSON.stringify(merged.images || []), JSON.stringify(merged.seasonality || []), merged.deliveryRadius || null, merged.minOrderValue || null, isOwnerUpdate ? (existing.dataSource === "auto" ? "hybrid" : "owner") : merged.dataSource, JSON.stringify(merged.autoSources || []), data.dataSource || "auto", now, data.dataSource || "auto", now, JSON.stringify(merged.preferences || {}), now, agentId);
+        }
+        // Auto-increment agent_version on every knowledge change (A2A spec compliance)
+        try {
+            db.prepare(`UPDATE agents SET agent_version = COALESCE(agent_version, 0) + 1 WHERE id = ?`).run(agentId);
+        }
+        catch {
+            // Column may not exist yet on older DBs — safe to skip
         }
     }
     // ─── Owner update (after claiming) ──────────────────────

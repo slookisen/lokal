@@ -1358,32 +1358,131 @@ router.get("/produsent/:slug", (req, res) => {
                 return `<a href="${escapeHtml(l.url)}" class="ext-link" target="_blank" rel="noopener">${icon} ${escapeHtml(l.label || "Lenke")}</a>`;
             }).join("")
             : "";
-        // Schema.org
+        // Schema.org JSON-LD — Rich LocalBusiness structured data for Google Rich Results
         const jsonLd = {
-            "@context": "https://schema.org", "@type": "LocalBusiness",
-            "name": agent.name, "description": agent.description || k.about || "",
+            "@context": "https://schema.org",
+            "@type": "LocalBusiness",
+            "@id": `${BASE_URL}/produsent/${slug}#business`,
+            "name": agent.name,
+            "description": agent.description || k.about || "",
             "url": `${BASE_URL}/produsent/${slug}`,
         };
-        if (k.address)
-            jsonLd.address = { "@type": "PostalAddress", "streetAddress": k.address, "postalCode": k.postalCode || "", "addressLocality": cityName, "addressCountry": "NO" };
+        // Address
+        if (k.address) {
+            jsonLd.address = {
+                "@type": "PostalAddress",
+                "streetAddress": k.address,
+                "postalCode": k.postalCode || "",
+                "addressLocality": cityName,
+                "addressRegion": cityName,
+                "addressCountry": "NO",
+            };
+        }
+        // Contact
         if (k.phone)
             jsonLd.telephone = k.phone;
         if (k.email)
             jsonLd.email = k.email;
         if (k.website)
-            jsonLd.sameAs = k.website;
-        if (agent.location?.lat && agent.location?.lng)
-            jsonLd.geo = { "@type": "GeoCoordinates", "latitude": agent.location.lat, "longitude": agent.location.lng };
+            jsonLd.url = k.website;
+        // Geo coordinates
+        if (agent.location?.lat && agent.location?.lng) {
+            jsonLd.geo = {
+                "@type": "GeoCoordinates",
+                "latitude": agent.location.lat,
+                "longitude": agent.location.lng,
+            };
+        }
+        // Images — first image as primary, rest in array
+        if (imagesList.length) {
+            jsonLd.image = imagesList.length === 1 ? imagesList[0] : imagesList;
+        }
+        // sameAs — website + all social/external links
+        const sameAsUrls = [];
+        if (k.website)
+            sameAsUrls.push(k.website);
+        linksList.forEach((l) => { if (l.url)
+            sameAsUrls.push(l.url); });
+        if (sameAsUrls.length)
+            jsonLd.sameAs = sameAsUrls.length === 1 ? sameAsUrls[0] : sameAsUrls;
+        // Opening hours — Schema.org format
         if (hoursList.length) {
-            const dayMap = { mon: "Mo", tue: "Tu", wed: "We", thu: "Th", fri: "Fr", sat: "Sa", sun: "Su" };
+            const dayMap = {
+                mon: "Monday", tue: "Tuesday", wed: "Wednesday", thu: "Thursday",
+                fri: "Friday", sat: "Saturday", sun: "Sunday",
+            };
             jsonLd.openingHoursSpecification = hoursList.map((h) => ({
                 "@type": "OpeningHoursSpecification",
-                "dayOfWeek": dayMap[h.day] || h.day,
-                "opens": h.open, "closes": h.close,
+                "dayOfWeek": `https://schema.org/${dayMap[h.day] || h.day}`,
+                "opens": h.open,
+                "closes": h.close,
             }));
         }
-        if (k.googleRating)
-            jsonLd.aggregateRating = { "@type": "AggregateRating", "ratingValue": k.googleRating, "reviewCount": k.googleReviewCount || 1 };
+        // Aggregate rating from Google
+        if (k.googleRating) {
+            jsonLd.aggregateRating = {
+                "@type": "AggregateRating",
+                "ratingValue": k.googleRating,
+                "bestRating": 5,
+                "worstRating": 1,
+                "reviewCount": k.googleReviewCount || 1,
+            };
+        }
+        // Reviews from external sources
+        const reviewsList = Array.isArray(k.externalReviews) ? k.externalReviews : [];
+        if (reviewsList.length) {
+            jsonLd.review = reviewsList.slice(0, 5).map((r) => ({
+                "@type": "Review",
+                "reviewBody": r.text || "",
+                "reviewRating": r.rating ? {
+                    "@type": "Rating",
+                    "ratingValue": r.rating,
+                    "bestRating": 5,
+                } : undefined,
+                "author": { "@type": "Person", "name": r.author || "Kunde" },
+                ...(r.date ? { "datePublished": r.date } : {}),
+            }));
+        }
+        // Products as makesOffer
+        if (productsList.length) {
+            jsonLd.makesOffer = productsList.slice(0, 20).map((p) => {
+                const name = typeof p === "string" ? p : (p.name || "");
+                if (!name)
+                    return null;
+                const offer = {
+                    "@type": "Offer",
+                    "itemOffered": {
+                        "@type": "Product",
+                        "name": name,
+                    },
+                };
+                if (typeof p === "object" && p.price) {
+                    offer.price = p.price;
+                    offer.priceCurrency = "NOK";
+                }
+                return offer;
+            }).filter(Boolean);
+        }
+        // Certifications as hasCredential / keywords
+        if (certs.length) {
+            jsonLd.keywords = certs.join(", ");
+        }
+        // Payment methods
+        if ((k.paymentMethods || []).length) {
+            jsonLd.paymentAccepted = k.paymentMethods.join(", ");
+        }
+        // Categories as additionalType
+        if ((agent.categories || []).length) {
+            jsonLd.additionalType = agent.categories.map((c) => formatCat(c)).join(", ");
+        }
+        // A2A protocol versioning (custom extension in JSON-LD)
+        const agentInfo = info?.agent;
+        if (agentInfo?.schemaVersion || agentInfo?.agentVersion) {
+            jsonLd["x-a2a"] = {
+                "schemaVersion": agentInfo?.schemaVersion || "urn:a2a:1.0",
+                "agentVersion": agentInfo?.agentVersion || 1,
+            };
+        }
         const content = `
     <div class="bc"><a href="/">Hjem</a>${cityName ? `<span>/</span><a href="/${slugify(cityName)}">${escapeHtml(cityName)}</a>` : ""}<span>/</span>${escapeHtml(agent.name)}</div>
 

@@ -67,6 +67,8 @@ export interface AgentInfoResponse {
         isVerified: boolean;
         isClaimed: boolean;
         languages: string[];
+        schemaVersion: string;
+        agentVersion: number;
     };
     knowledge: {
         address?: string;

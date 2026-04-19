@@ -419,6 +419,18 @@ function initSchema(db: Database.Database): void {
     // Column already exists
   }
 
+  // ─── Tier 3: A2A protocol versioning fields ─────────────────
+  try {
+    db.exec(`ALTER TABLE agents ADD COLUMN schema_version TEXT DEFAULT 'urn:a2a:1.0'`);
+  } catch {
+    // Column already exists
+  }
+  try {
+    db.exec(`ALTER TABLE agents ADD COLUMN agent_version INTEGER DEFAULT 1`);
+  } catch {
+    // Column already exists
+  }
+
   // ─── Add is_owner column to analytics tables ─────────────────
   // Allows filtering out owner/developer traffic in dashboard
   for (const table of ["analytics_page_views", "analytics_queries", "analytics_agent_views"]) {

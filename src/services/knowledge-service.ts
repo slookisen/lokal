@@ -99,6 +99,8 @@ export interface AgentInfoResponse {
     isVerified: boolean;
     isClaimed: boolean;
     languages: string[];
+    schemaVersion: string;
+    agentVersion: number;
   };
   knowledge: {
     address?: string;
@@ -168,6 +170,8 @@ class KnowledgeService {
         isVerified: agent.is_verified === 1,
         isClaimed,
         languages: agent.languages ? JSON.parse(agent.languages) : ["no"],
+        schemaVersion: agent.schema_version || "urn:a2a:1.0",
+        agentVersion: agent.agent_version || 1,
       },
       knowledge: {
         address: knowledge?.address,
@@ -296,6 +300,13 @@ class KnowledgeService {
         now,
         agentId,
       );
+    }
+
+    // Auto-increment agent_version on every knowledge change (A2A spec compliance)
+    try {
+      db.prepare(`UPDATE agents SET agent_version = COALESCE(agent_version, 0) + 1 WHERE id = ?`).run(agentId);
+    } catch {
+      // Column may not exist yet on older DBs — safe to skip
     }
   }
 

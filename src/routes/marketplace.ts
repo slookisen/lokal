@@ -474,8 +474,24 @@ router.get("/agents/:id/card", (req: Request, res: Response) => {
     if (k.paymentMethods?.length) card.paymentMethods = k.paymentMethods;
     if (k.deliveryOptions?.length) card.deliveryOptions = k.deliveryOptions;
 
+    // Tier 2: seasonality, images, delivery details
+    if (k.seasonality?.length) card.seasonality = k.seasonality;
+    if (k.images?.length) card.images = k.images;
+    if (k.deliveryRadius != null) card.deliveryRadius = k.deliveryRadius;
+    if (k.minOrderValue != null) card.minOrderValue = k.minOrderValue;
+
+    // Google rating
+    if (k.ratings?.google?.rating) {
+      card.googleRating = k.ratings.google.rating;
+      card.googleReviewCount = k.ratings.google.reviewCount || 0;
+    }
+
     // About text (richer than description)
     if (k.about) card["x-lokal"].about = k.about;
+
+    // A2A protocol versioning
+    card.schemaVersion = agent.schemaVersion || "urn:a2a:1.0";
+    card.agentVersion = agent.agentVersion || 1;
 
     // Useful links for AI agents and consumers
     const slug = agent.name.toLowerCase().replace(/[^a-zæøå0-9]+/g, "-").replace(/-+/g, "-").replace(/^-|-$/g, "");
