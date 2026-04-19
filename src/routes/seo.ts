@@ -22,6 +22,7 @@ import { geocodingService } from "../services/geocoding-service";
 import { analyticsService } from "../services/analytics-service";
 import { DiscoveryQuerySchema } from "../models/marketplace";
 import { getDb } from "../database/init";
+import { conversationService } from "../services/conversation-service";
 
 const router = Router();
 
@@ -357,6 +358,72 @@ function getTrafficStats(): TrafficStats {
   }
 }
 
+// ─── Live conversation showcase for landing page ────────────
+
+function buildConversationShowcase(): string {
+  try {
+    const convs = conversationService.listConversations({ limit: 3 });
+    if (convs.length === 0) return "";
+
+    const sourceLabels: Record<string, string> = {
+      a2a: "A2A-protokoll", mcp: "MCP-verkt\u00f8y", web: "Nettside", api: "API",
+    };
+    const sourceColors: Record<string, string> = {
+      a2a: "#2D5016", mcp: "#7c3aed", web: "#0369a1", api: "#6b7280",
+    };
+
+    const convCards = convs.map(conv => {
+      const buyer = escapeHtml(conv.buyerAgentName || "AI-agent");
+      const seller = escapeHtml(conv.sellerAgentName || "Produsent");
+      const lastMsg = conv.messages.length > 1
+        ? escapeHtml(conv.messages[conv.messages.length - 1].content).slice(0, 100) + (conv.messages[conv.messages.length - 1].content.length > 100 ? "..." : "")
+        : "";
+      const source = conv.source || "api";
+      const srcLabel = sourceLabels[source] || source;
+      const srcColor = sourceColors[source] || "#6b7280";
+      const statusEmoji = conv.status === "negotiating" ? "&#128992;" : conv.status === "completed" ? "&#9989;" : "&#128994;";
+
+      return `<a href="/samtale/${conv.id}" class="cv-card">
+        <div class="cv-top">
+          <div class="cv-agents">${buyer} <span class="cv-arrow">&harr;</span> ${seller}</div>
+          <span class="cv-src" style="background:${srcColor}15;color:${srcColor}">${srcLabel}</span>
+        </div>
+        ${lastMsg ? `<div class="cv-preview">${lastMsg}</div>` : ""}
+        <div class="cv-foot">
+          <span>${statusEmoji} ${conv.messages.length} meldinger</span>
+          <span class="cv-time">${formatConvTime(conv.updatedAt)}</span>
+        </div>
+      </a>`;
+    }).join("");
+
+    return `<section class="sec conv-showcase">
+      <div class="sh">
+        <div class="sh-label">Sanntid</div>
+        <div class="sh-title">&#128172; AI-agenter i samtale</div>
+        <div class="sh-sub">Se hva som skjer n\u00e5r AI finner lokal mat for deg</div>
+      </div>
+      <div class="cv-grid">${convCards}</div>
+      <div style="text-align:center;margin-top:20px">
+        <a href="/samtaler" class="btn-s">Se alle samtaler &rarr;</a>
+      </div>
+    </section>`;
+  } catch { return ""; }
+}
+
+function formatConvTime(iso: string): string {
+  try {
+    const d = new Date(iso);
+    const now = new Date();
+    const diffMs = now.getTime() - d.getTime();
+    const diffMin = Math.floor(diffMs / 60000);
+    if (diffMin < 1) return "akkurat n\u00e5";
+    if (diffMin < 60) return `${diffMin} min siden`;
+    const diffHrs = Math.floor(diffMin / 60);
+    if (diffHrs < 24) return `${diffHrs}t siden`;
+    return d.toLocaleDateString("nb-NO", { day: "numeric", month: "short" });
+  } catch { return ""; }
+}
+
 // ═══════════════════════════════════════════════════════════════
 // GET /api/traffic-stats — Public traffic stats
 // ═══════════════════════════════════════════════════════════════
@@ -457,7 +524,20 @@ const LANDING_CSS = `
     .ai-banner { flex-direction: column; text-align: center; padding: 22px; }
     .ai-logos { justify-content: center; }
     .seller-cta h2 { font-size: 1.5rem; }
+    .cv-grid { grid-template-columns: 1fr; }
   }
+  /* Conversation showcase */
+  .conv-showcase { background: var(--g50); }
+  .cv-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 14px; max-width: 1100px; margin: 0 auto; padding: 0 24px; }
+  .cv-card { background: var(--white); border-radius: var(--r-lg); border: 1px solid var(--g100); padding: 16px 20px; display: block; text-decoration: none; color: var(--charcoal); transition: all 0.2s; }
+  .cv-card:hover { transform: translateY(-2px); box-shadow: var(--shadow-md); border-color: var(--green-100); text-decoration: none; }
+  .cv-top { display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px; }
+  .cv-agents { font-weight: 700; font-size: 0.88rem; }
+  .cv-arrow { color: var(--g300); margin: 0 4px; }
+  .cv-src { display: inline-block; padding: 2px 8px; border-radius: 10px; font-size: 0.68rem; font-weight: 600; }
+  .cv-preview { font-size: 0.8rem; color: var(--g500); line-height: 1.4; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; margin-bottom: 8px; }
+  .cv-foot { display: flex; justify-content: space-between; font-size: 0.72rem; color: var(--g500); }
+  .cv-time { color: var(--g300); }
 `;
 
 router.get("/", (_req: Request, res: Response) => {
@@ -620,6 +700,8 @@ router.get("/", (_req: Request, res: Response) => {
       <a href="/selger" class="seller-btn">Registrer gratis</a>
       <span class="seller-note">Under 2 minutter. Ingen kredittkort.</span>
     </section>
+
+    ${buildConversationShowcase()}
 
     <section class="ai-sec">
       <div class="ai-banner">

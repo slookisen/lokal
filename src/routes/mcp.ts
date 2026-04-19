@@ -20,6 +20,7 @@ import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/
 import { z } from "zod";
 import { marketplaceRegistry } from "../services/marketplace-registry";
 import { knowledgeService } from "../services/knowledge-service";
+import { conversationService } from "../services/conversation-service";
 
 const router = Router();
 
@@ -43,6 +44,21 @@ function registerTools(server: McpServer) {
         return { content: [{ type: "text" as const, text: `Ingen resultater for "${query}". Prøv et bredere søk.` }] };
       }
 
+      // Auto-start conversations with top match so seller agent responds
+      const BASE = process.env.BASE_URL || "https://rettfrabonden.com";
+      const convLinks: string[] = [];
+      for (const r of results.slice(0, 2)) {
+        try {
+          const conv = conversationService.startConversation({
+            sellerAgentId: r.agent.id,
+            queryText: query,
+            source: "mcp",
+            autoRespond: true,
+          });
+          convLinks.push(`💬 [Samtale med ${conv.sellerAgentName}](${BASE}/samtale/${conv.id})`);
+        } catch { /* non-critical */ }
+      }
+
       const header = `🥬 **Lokal mat-søk: "${query}"** — fant ${results.length} produsenter:\n`;
       const lines = results.map((r: any, i: number) => {
         const agent = r.agent;
@@ -50,7 +66,11 @@ function registerTools(server: McpServer) {
         return formatAgentCompact(agent, i + 1, r.contact) + dist;
       });
 
-      return { content: [{ type: "text" as const, text: header + "\n" + lines.join("\n\n") }] };
+      const convSection = convLinks.length
+        ? `\n\n---\n**Samtaler startet automatisk:**\n${convLinks.join("\n")}`
+        : "";
+
+      return { content: [{ type: "text" as const, text: header + "\n" + lines.join("\n\n") + convSection }] };
     }
   );
 
@@ -74,13 +94,33 @@ function registerTools(server: McpServer) {
         return { content: [{ type: "text" as const, text: "Ingen produsenter funnet med disse filtrene." }] };
       }
 
+      // Auto-start conversation with top match
+      const BASE = process.env.BASE_URL || "https://rettfrabonden.com";
+      const convLinks: string[] = [];
+      const queryDesc = [categories?.join(", "), tags?.join(", ")].filter(Boolean).join(" — ") || "strukturert søk";
+      for (const r of results.slice(0, 2)) {
+        try {
+          const conv = conversationService.startConversation({
+            sellerAgentId: r.agent.id,
+            queryText: queryDesc,
+            source: "mcp",
+            autoRespond: true,
+          });
+          convLinks.push(`💬 [Samtale med ${conv.sellerAgentName}](${BASE}/samtale/${conv.id})`);
+        } catch { /* non-critical */ }
+      }
+
       const header = `🔍 **Strukturert søk** — ${results.length} resultater:\n`;
       const lines = results.map((r: any, i: number) => {
         const dist = r.distanceKm ? ` (${r.distanceKm.toFixed(1)} km)` : "";
         return formatAgentCompact(r.agent, i + 1, r.contact) + dist;
       });
 
-      return { content: [{ type: "text" as const, text: header + "\n" + lines.join("\n\n") }] };
+      const convSection = convLinks.length
+        ? `\n\n---\n**Samtaler startet automatisk:**\n${convLinks.join("\n")}`
+        : "";
+
+      return { content: [{ type: "text" as const, text: header + "\n" + lines.join("\n\n") + convSection }] };
     }
   );
 

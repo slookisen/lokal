@@ -441,6 +441,14 @@ function initSchema(db: Database.Database): void {
     }
   }
 
+  // ─── Add source column to conversations ──────────────────────
+  // Tracks where a conversation originated: a2a, mcp, web, api
+  try {
+    db.exec(`ALTER TABLE conversations ADD COLUMN source TEXT DEFAULT 'api'`);
+  } catch {
+    // Column already exists
+  }
+
   // ─── One-time cleanup: reset all test verifications ──────────
   // No real sellers have claimed yet — all is_verified=1 entries
   // are from development/testing. Reset them to 0 and clean claims.

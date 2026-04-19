@@ -165,7 +165,34 @@ function handleMessageSend(params: any, id: any, req: Request, res: Response) {
       durationMs,
     });
 
-    // A2A response format
+    // ─── Auto-start conversations with top matches ────────────
+    // When an A2A agent searches, we create conversations with
+    // the best matches so seller agents can auto-respond.
+    // This makes the system "alive" — every search creates dialog.
+    const conversations: any[] = [];
+    const topResults = results.slice(0, 3); // Top 3 matches get conversations
+    for (const r of topResults) {
+      try {
+        const conv = conversationService.startConversation({
+          buyerAgentId: params?.agentId || undefined,
+          sellerAgentId: r.agent.id,
+          queryText: typeof queryText === "string" ? queryText : JSON.stringify(queryText),
+          taskId: task.id,
+          source: "a2a",
+          autoRespond: true, // Seller agent auto-replies
+        });
+        conversations.push({
+          conversationId: conv.id,
+          sellerAgentId: r.agent.id,
+          sellerAgentName: conv.sellerAgentName,
+          status: conv.status,
+          messageCount: conv.messages.length,
+          viewUrl: `${BASE_URL}/samtale/${conv.id}`,
+        });
+      } catch { /* non-critical — don't break search if conv fails */ }
+    }
+
+    // A2A response format — now includes conversation links
     res.json({
       jsonrpc: "2.0",
       result: {
@@ -179,6 +206,7 @@ function handleMessageSend(params: any, id: any, req: Request, res: Response) {
             data: {
               count: results.length,
               agents: results,
+              conversations,
               parsedQuery: messageText ? marketplaceRegistry.parseNaturalQuery(messageText) : discoveryQuery,
             },
           },

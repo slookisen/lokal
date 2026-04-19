@@ -57,6 +57,17 @@ function statusBadge(status: string): string {
   return `<span class="conv-status ${s.cls}">${s.label}</span>`;
 }
 
+function sourceBadge(source: string): string {
+  const map: Record<string, { label: string; bg: string; color: string }> = {
+    a2a: { label: "A2A", bg: "#e8f5e0", color: "#2D5016" },
+    mcp: { label: "MCP", bg: "#ede9fe", color: "#7c3aed" },
+    web: { label: "Web", bg: "#e0f2fe", color: "#0369a1" },
+    api: { label: "API", bg: "#f3f4f6", color: "#6b7280" },
+  };
+  const s = map[source] || map.api!;
+  return `<span class="conv-status" style="background:${s.bg};color:${s.color}">${s.label}</span>`;
+}
+
 function messageTypeIcon(type: string): string {
   switch (type) {
     case "offer": return "&#128176;";
@@ -252,10 +263,13 @@ router.get("/samtaler", (_req: Request, res: Response) => {
           ? `<div class="conv-query">&laquo;${escapeHtml(conv.queryText)}&raquo;</div>`
           : "";
 
+        const source = conv.source || "api";
+        const srcBadge = sourceBadge(source);
+
         return `<a href="/samtale/${conv.id}" class="conv-item">
           <div class="conv-top">
             <div class="conv-agents">${buyerName} <span class="arrow">&harr;</span> ${sellerName}</div>
-            ${statusBadge(conv.status)}
+            <div style="display:flex;gap:6px;align-items:center">${srcBadge}${statusBadge(conv.status)}</div>
           </div>
           ${queryHtml}
           ${lastMsg ? `<div class="conv-preview">${lastMsg}</div>` : ""}
