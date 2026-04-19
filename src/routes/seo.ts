@@ -1671,9 +1671,95 @@ router.get("/sitemap.xml", (_req: Request, res: Response) => {
 // ─── GET /robots.txt ────────────────────────────────────────
 
 router.get("/robots.txt", (_req: Request, res: Response) => {
-  res.header("Content-Type", "text/plain");
-  res.send(`User-agent: *
+  res.header("Content-Type", "text/plain; charset=utf-8");
+  // Explicit AI bot allow-list + Content Signals (Cloudflare spec).
+  // We WANT AI agents to discover, search, and cite our data — that is the
+  // entire point of an A2A marketplace. We do NOT want our content used
+  // for training large language models without compensation, so ai-train=no.
+  res.send(`# Lokal / rettfrabonden.com — robots.txt
+# A2A marketplace for local food in Norway.
+# AI agents are explicitly welcome to discover, read, and cite our data.
+
+User-agent: *
 Allow: /
+Content-Signal: search=yes, ai-input=yes, ai-train=no
+
+# ─── AI / agent crawlers (explicit allow) ───────────────────
+User-agent: GPTBot
+Allow: /
+Content-Signal: search=yes, ai-input=yes, ai-train=no
+
+User-agent: OAI-SearchBot
+Allow: /
+Content-Signal: search=yes, ai-input=yes, ai-train=no
+
+User-agent: ChatGPT-User
+Allow: /
+Content-Signal: search=yes, ai-input=yes, ai-train=no
+
+User-agent: ClaudeBot
+Allow: /
+Content-Signal: search=yes, ai-input=yes, ai-train=no
+
+User-agent: Claude-Web
+Allow: /
+Content-Signal: search=yes, ai-input=yes, ai-train=no
+
+User-agent: anthropic-ai
+Allow: /
+Content-Signal: search=yes, ai-input=yes, ai-train=no
+
+User-agent: PerplexityBot
+Allow: /
+Content-Signal: search=yes, ai-input=yes, ai-train=no
+
+User-agent: Perplexity-User
+Allow: /
+Content-Signal: search=yes, ai-input=yes, ai-train=no
+
+User-agent: Google-Extended
+Allow: /
+Content-Signal: search=yes, ai-input=yes, ai-train=no
+
+User-agent: Googlebot
+Allow: /
+
+User-agent: Bingbot
+Allow: /
+
+User-agent: Applebot
+Allow: /
+
+User-agent: Applebot-Extended
+Allow: /
+Content-Signal: search=yes, ai-input=yes, ai-train=no
+
+User-agent: Amazonbot
+Allow: /
+
+User-agent: Bytespider
+Allow: /
+Content-Signal: search=yes, ai-input=yes, ai-train=no
+
+User-agent: CCBot
+Disallow: /
+
+User-agent: FacebookBot
+Allow: /
+
+User-agent: meta-externalagent
+Allow: /
+Content-Signal: search=yes, ai-input=yes, ai-train=no
+
+User-agent: Diffbot
+Allow: /
+
+User-agent: cohere-ai
+Allow: /
+Content-Signal: search=yes, ai-input=yes, ai-train=no
+
+User-agent: Omgilibot
+Disallow: /
 
 Sitemap: ${BASE_URL}/sitemap.xml
 `);

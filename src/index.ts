@@ -21,6 +21,8 @@ import reservationRoutes from "./routes/reservation";
 import marketplaceRoutes from "./routes/marketplace";
 import mcpRoutes from "./routes/mcp";
 import seoRoutes from "./routes/seo";
+import agentReadinessRoutes from "./routes/agent-readiness";
+import { linkHeaders, markdownNegotiation } from "./middleware/agent-discovery";
 import { analyticsService } from "./services/analytics-service";
 import analyticsRoutes from "./routes/analytics";
 import { seedData } from "./seed";
@@ -63,6 +65,21 @@ app.use(sanitizeInput);
 
 // Analytics middleware (before routes, after security)
 app.use(analyticsService.middleware());
+
+// ─── Agent discovery ────────────────────────────────────────
+// Link headers (RFC 8288) on every response — cheap, helps agents
+// auto-discover our well-known endpoints without poking around.
+app.use(linkHeaders);
+
+// Markdown content negotiation — when an agent sends
+// `Accept: text/markdown` on a content route, return markdown
+// instead of HTML. Saves tokens, improves agent comprehension.
+app.use(markdownNegotiation);
+
+// Well-known discovery endpoints (MCP Server Card, Agent Skills,
+// API Catalog, OAuth Protected Resource). Mounted BEFORE static
+// so the .well-known/* paths are served dynamically, not from disk.
+app.use("/", agentReadinessRoutes);
 
 // Serve the marketplace dashboard
 app.use(express.static(path.join(__dirname, "public"), { extensions: ["html"] }));
