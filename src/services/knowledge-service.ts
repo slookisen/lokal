@@ -98,6 +98,7 @@ export interface AgentInfoResponse {
     openingHours: OpeningHour[];
     products: ProductInfo[];
     about?: string;
+    description?: string;
     specialties: string[];
     certifications: string[];
     paymentMethods: string[];
@@ -160,7 +161,8 @@ class KnowledgeService {
         email: knowledge?.email,
         openingHours: knowledge?.openingHours || [],
         products: knowledge?.products || [],
-        about: knowledge?.about || agent.description,
+        about: agent.description || knowledge?.about || "",
+        description: agent.description || "",
         specialties: knowledge?.specialties || [],
         certifications: knowledge?.certifications || [],
         paymentMethods: knowledge?.paymentMethods || [],

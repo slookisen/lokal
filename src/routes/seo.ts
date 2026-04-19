@@ -1233,6 +1233,7 @@ const PROFILE_CSS = `
   .pf-name { font-size: 2.2rem; font-weight: 800; letter-spacing: -1px; line-height: 1.15; margin-bottom: 6px; }
   .pf-loc { display: flex; align-items: center; gap: 6px; font-size: 0.95rem; color: var(--g500); margin-bottom: 14px; }
   .pf-desc { font-size: 1rem; color: var(--g700); line-height: 1.7; max-width: 580px; }
+  .pf-desc-extra { font-size: 0.9rem; color: var(--g500); line-height: 1.6; max-width: 580px; margin-top: 6px; font-style: italic; }
   .pf-stats { display: flex; gap: 22px; margin-top: 18px; flex-wrap: wrap; }
   .pf-stat { display: flex; align-items: center; gap: 8px; }
   .pf-stat-icon { width: 34px; height: 34px; border-radius: 8px; display: flex; align-items: center; justify-content: center; font-size: 0.95rem; }
@@ -1420,7 +1421,24 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
         <div class="pf-badges">${badges.join("")}</div>
         <h1 class="pf-name">${escapeHtml(agent.name)}</h1>
         ${cityName ? `<div class="pf-loc">&#128205; ${escapeHtml(k.address || cityName)}${k.postalCode ? `, ${escapeHtml(k.postalCode)}` : ""}</div>` : ""}
-        ${agent.description || k.about ? `<p class="pf-desc">${escapeHtml((agent.description && k.about ? (agent.description.length >= k.about.length ? agent.description : k.about) : agent.description || k.about) || "")}</p>` : ""}
+        ${(() => {
+          const desc = agent.description || "";
+          const about = k.about || "";
+          if (!desc && !about) return "";
+          // If only one exists, use it
+          if (!desc) return `<p class="pf-desc">${escapeHtml(about)}</p>`;
+          if (!about) return `<p class="pf-desc">${escapeHtml(desc)}</p>`;
+          // If they're essentially the same, just show one
+          if (desc === about || about.length < 20) return `<p class="pf-desc">${escapeHtml(desc)}</p>`;
+          // Both exist and differ — description is the primary (enrichment-maintained),
+          // but about may have unique context worth showing
+          const descLower = desc.toLowerCase();
+          const aboutAddsInfo = !descLower.includes(about.substring(0, Math.min(30, about.length)).toLowerCase());
+          if (aboutAddsInfo && about.length > 30) {
+            return `<p class="pf-desc">${escapeHtml(desc)}</p><p class="pf-desc-extra">${escapeHtml(about)}</p>`;
+          }
+          return `<p class="pf-desc">${escapeHtml(desc)}</p>`;
+        })()}
         <div class="pf-stats">
           <div class="pf-stat"><div class="pf-stat-icon t">&#9733;</div><div><strong>${trustPct}%</strong><small>Trust Score</small></div></div>
           ${k.googleRating ? `<div class="pf-stat"><div class="pf-stat-icon r">&#11088;</div><div><strong>${k.googleRating} / 5</strong><small>${k.googleReviewCount || 0} anmeldelser</small></div></div>` : ""}
