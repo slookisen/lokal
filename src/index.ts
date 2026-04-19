@@ -21,6 +21,7 @@ import reservationRoutes from "./routes/reservation";
 import marketplaceRoutes from "./routes/marketplace";
 import mcpRoutes from "./routes/mcp";
 import seoRoutes from "./routes/seo";
+import discoveryRoutes from "./routes/discovery";
 import agentReadinessRoutes from "./routes/agent-readiness";
 import { linkHeaders, markdownNegotiation } from "./middleware/agent-discovery";
 import { analyticsService } from "./services/analytics-service";
@@ -223,6 +224,7 @@ app.get("/health", (_req, res) => {
 app.use("/admin/analytics", analyticsRoutes);
 
 // SEO pages LAST — /:city is a catch-all wildcard
+app.use("/", discoveryRoutes);  // llms.txt, MCP server-card, agents.txt, openapi.json
 app.use("/", seoRoutes);
 
 // ─── Database + Seed (with idempotency guard) ───────────────

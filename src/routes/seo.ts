@@ -206,6 +206,14 @@ function shell(title: string, description: string, content: string, extra?: { ca
   <meta property="og:url" content="${canonicalUrl}">
   <meta property="og:type" content="website">
   <meta property="og:locale" content="nb_NO">
+  <meta property="og:site_name" content="Rett fra Bonden">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="${escapeHtml(title)}">
+  <meta name="twitter:description" content="${escapeHtml(description)}">
+  <meta name="robots" content="index, follow, max-snippet:-1, max-image-preview:large">
+  <link rel="alternate" hreflang="nb" href="${canonicalUrl}">
+  <link rel="alternate" hreflang="en" href="${canonicalUrl}">
+  <link rel="alternate" hreflang="x-default" href="${canonicalUrl}">
   ${jsonLdScript}
   ${CSS}
   ${extra?.extraCss ? `<style>${extra.extraCss}</style>` : ""}
@@ -1152,8 +1160,10 @@ router.get("/:city", (req: Request, res: Response, next: any) => {
   if (citySlug.startsWith("api") || citySlug.startsWith(".") || citySlug === "health"
       || citySlug === "a2a" || citySlug === "mcp" || citySlug === "sok"
       || citySlug === "produsent" || citySlug === "sitemap.xml" || citySlug === "robots.txt"
-      || citySlug === "openapi.yaml" || citySlug === "favicon.ico"
+      || citySlug === "openapi.json" || citySlug === "openapi.yaml" || citySlug === "favicon.ico"
       || citySlug === "selger" || citySlug === "admin" || citySlug === "om" || citySlug === "teknologi"
+      || citySlug === "personvern" || citySlug === "llms.txt" || citySlug === "llms-full.txt"
+      || citySlug === "agents" || citySlug === "docs"
       || citySlug.includes(".")) {
     return next();
   }
@@ -1308,6 +1318,11 @@ const PROFILE_CSS = `
   /* Tier 2: Languages */
   .lang-row { display: flex; gap: 6px; flex-wrap: wrap; }
   .lang-tag { padding: 5px 12px; background: var(--g100); border-radius: 20px; font-size: 0.8rem; font-weight: 600; color: var(--g700); }
+  .reviews-grid { display: flex; flex-direction: column; gap: 14px; }
+  .review-item { padding: 14px; background: var(--g50, #f9fafb); border-radius: 10px; border-left: 3px solid var(--green-200, #bbf7d0); }
+  .review-stars { font-size: 0.85rem; margin-bottom: 4px; }
+  .review-text { font-size: 0.9rem; color: var(--g700); line-height: 1.6; margin: 0; font-style: italic; }
+  .review-author { font-size: 0.78rem; color: var(--g500); margin-top: 6px; }
   @media (max-width: 840px) {
     .pf-header { grid-template-columns: 1fr; }
     .pf-content { grid-template-columns: 1fr; }
@@ -1550,7 +1565,7 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
       };
     }
 
-    // Reviews from external sources
+    // Reviews from external sources (JSON-LD + visible HTML)
     const reviewsList = Array.isArray(k.externalReviews) ? k.externalReviews : [];
     if (reviewsList.length) {
       jsonLd.review = reviewsList.slice(0, 5).map((r: any) => ({
@@ -1565,6 +1580,20 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
         ...(r.date ? { "datePublished": r.date } : {}),
       }));
     }
+    // Build visible reviews HTML
+    const reviewsHtml = reviewsList.length
+      ? reviewsList.slice(0, 5).map((r: any) => {
+          const stars = r.rating ? "&#11088;".repeat(Math.min(Math.round(r.rating), 5)) : "";
+          const author = r.author || "Kunde";
+          const source = r.source ? ` — ${escapeHtml(r.source)}` : "";
+          const date = r.date ? ` (${new Date(r.date).toLocaleDateString("nb-NO")})` : "";
+          return `<div class="review-item">
+            ${stars ? `<div class="review-stars">${stars}</div>` : ""}
+            <p class="review-text">\u201c${escapeHtml(r.text || "")}\u201d</p>
+            <div class="review-author">${escapeHtml(author)}${source}${date}</div>
+          </div>`;
+        }).join("")
+      : "";
 
     // Products as makesOffer
     if (productsList.length) {
@@ -1703,6 +1732,12 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
         <div class="card">
           <div class="card-head"><span>&#127760;</span><h3>Spr\u00e5k</h3></div>
           <div class="card-body">${langsHtml}</div>
+        </div>` : ""}
+
+        ${reviewsHtml ? `
+        <div class="card">
+          <div class="card-head"><span>&#128172;</span><h3>Kundeanmeldelser</h3></div>
+          <div class="card-body"><div class="reviews-grid">${reviewsHtml}</div></div>
         </div>` : ""}
 
         <div class="claim-bar">
@@ -1873,6 +1908,15 @@ User-agent: Omgilibot
 Disallow: /
 
 Sitemap: ${BASE_URL}/sitemap.xml
+
+# ─── AI discovery endpoints ──────────────────────────────────
+# LLM-friendly overview:    ${BASE_URL}/llms.txt
+# Full producer data:       ${BASE_URL}/llms-full.txt
+# A2A Agent Card:           ${BASE_URL}/.well-known/agent-card.json
+# MCP Server Card:          ${BASE_URL}/.well-known/mcp/server-card.json
+# MCP Manifest:             ${BASE_URL}/.well-known/mcp
+# Agent Discovery:          ${BASE_URL}/.well-known/agents.txt
+# OpenAPI Spec:             ${BASE_URL}/openapi.json
 `);
 });
 

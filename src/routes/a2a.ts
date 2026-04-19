@@ -315,7 +315,7 @@ function serveAgentCard(_req: Request, res: Response) {
   const registryCard = marketplaceRegistry.getRegistryCard(BASE_URL);
   const legacyProducers = agentCardService.generateRegistry(BASE_URL);
 
-  res.json({
+  const card = {
     ...registryCard,
     producers: legacyProducers,
     endpoints: {
@@ -324,20 +324,68 @@ function serveAgentCard(_req: Request, res: Response) {
       search: `${BASE_URL}/api/marketplace/search`,
       register: `${BASE_URL}/api/marketplace/register`,
       agents: `${BASE_URL}/api/marketplace/agents`,
+      mcp: `${BASE_URL}/mcp`,
+      llms: `${BASE_URL}/llms.txt`,
+      openapi: `${BASE_URL}/openapi.json`,
     },
-  });
+  };
+
+  // A2A spec recommends caching headers: Cache-Control + ETag
+  const etag = `"v1-${Date.now().toString(36)}"`;
+  res.header("Cache-Control", "public, max-age=3600");
+  res.header("ETag", etag);
+  res.json(card);
 }
 
 router.get("/.well-known/agent-card.json", serveAgentCard); // A2A spec v1.0.0
 router.get("/.well-known/agent.json", serveAgentCard);       // Legacy compat
 
-// GET /agents/:id/agent.json — Individual producer Agent Card
+// GET /agents/:id/agent.json — Individual producer Agent Card (enriched with knowledge)
 router.get("/agents/:id/agent.json", (req: Request, res: Response) => {
   const card = agentCardService.generateCard(req.params.id as string, BASE_URL);
   if (!card) {
     res.status(404).json({ error: "Agent not found" });
     return;
   }
+
+  // Enrich with knowledge data so buyer-agents get the full picture
+  const knowledge = knowledgeService.getKnowledge(req.params.id as string);
+  if (knowledge) {
+    const enriched: Record<string, any> = { ...card };
+    enriched["x-knowledge"] = {
+      address: knowledge.address,
+      postalCode: knowledge.postalCode,
+      phone: knowledge.phone,
+      email: knowledge.email,
+      website: knowledge.website,
+      openingHours: knowledge.openingHours,
+      products: knowledge.products?.map((p: any) => ({
+        name: p.name, category: p.category, seasonal: p.seasonal, months: p.months, organic: p.organic,
+      })),
+      specialties: knowledge.specialties,
+      certifications: knowledge.certifications,
+      paymentMethods: knowledge.paymentMethods,
+      deliveryOptions: knowledge.deliveryOptions,
+      deliveryRadius: knowledge.deliveryRadius,
+      googleRating: knowledge.googleRating,
+      googleReviewCount: knowledge.googleReviewCount,
+      externalLinks: knowledge.externalLinks,
+      seasonality: knowledge.seasonality,
+      about: knowledge.about,
+      dataSource: knowledge.dataSource,
+      lastEnrichedAt: knowledge.lastEnrichedAt,
+    };
+    // Remove undefined values
+    const xk = enriched["x-knowledge"];
+    for (const key of Object.keys(xk)) {
+      if (xk[key] === undefined || xk[key] === null) delete xk[key];
+    }
+    res.header("Cache-Control", "public, max-age=1800");
+    res.json(enriched);
+    return;
+  }
+
+  res.header("Cache-Control", "public, max-age=1800");
   res.json(card);
 });
 

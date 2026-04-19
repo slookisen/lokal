@@ -163,6 +163,46 @@ function registerTools(server: McpServer) {
       return { content: [{ type: "text" as const, text }] };
     }
   );
+
+  // ─── MCP Resources ──────────────────────────────────────────
+  // Resources let agents READ data directly (vs tools which are actions).
+  // This is the MCP equivalent of a database view.
+
+  server.resource(
+    "producers-overview",
+    "lokal://producers/overview",
+    { description: "Overview of all local food producers — count, cities, and categories", mimeType: "text/plain" },
+    async () => {
+      const agents = marketplaceRegistry.getActiveAgents();
+      const cities = new Map<string, number>();
+      for (const a of agents) {
+        const city = (a as any).city || a.location?.city || "Ukjent";
+        cities.set(city, (cities.get(city) || 0) + 1);
+      }
+      const topCities = [...cities.entries()].sort((a, b) => b[1] - a[1]).slice(0, 20);
+      const text = [
+        `# Rett fra Bonden — ${agents.length} lokale matprodusenter i Norge`,
+        ``,
+        `## Byer:`,
+        ...topCities.map(([city, count]) => `- ${city}: ${count} produsenter`),
+      ].join("\n");
+      return { contents: [{ uri: "lokal://producers/overview", text, mimeType: "text/plain" }] };
+    }
+  );
+
+  server.resource(
+    "producer-detail",
+    "lokal://producers/{agentId}",
+    { description: "Detailed info about a specific food producer", mimeType: "application/json" },
+    async (uri) => {
+      const agentId = uri.pathname?.split("/").pop() || "";
+      const info = knowledgeService.getAgentInfo(agentId);
+      if (!info) {
+        return { contents: [{ uri: uri.href, text: "Producer not found", mimeType: "text/plain" }] };
+      }
+      return { contents: [{ uri: uri.href, text: JSON.stringify(info, null, 2), mimeType: "application/json" }] };
+    }
+  );
 }
 
 // ─── Compact agent formatter ────────────────────────────────
@@ -172,7 +212,7 @@ function formatAgentCompact(agent: any, idx: number, contact?: any): string {
   if (agent.description) lines.push(`   ${agent.description}`);
 
   const meta: string[] = [];
-  if (agent.location?.city) meta.push(`📍 ${agent.location.city}`);
+  if ((agent as any).city || agent.location?.city) meta.push(`📍 ${(agent as any).city || agent.location?.city}`);
   if (agent.categories?.length) meta.push(`🏷️ ${agent.categories.join(", ")}`);
   if (agent.trustScore) meta.push(`✅ Trust ${Math.round(agent.trustScore * 100)}%`);
   if (meta.length) lines.push(`   ${meta.join("  ·  ")}`);
