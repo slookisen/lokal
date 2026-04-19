@@ -39,11 +39,21 @@ export interface AgentKnowledge {
   externalReviews: ExternalReview[];
   externalLinks: ExternalLink[];
   images: string[];
+  // Tier 2 fields
+  seasonality: SeasonalProduct[];     // Product-to-month mapping
+  deliveryRadius?: number;            // km — how far they deliver
+  minOrderValue?: number;             // NOK — minimum order for delivery
   dataSource: "auto" | "owner" | "hybrid";
   autoSources: string[];
   lastEnrichedAt?: string;
   ownerUpdatedAt?: string;
   preferences: Record<string, any>;
+}
+
+export interface SeasonalProduct {
+  product: string;      // "Jordbær", "Epler", "Honning"
+  months: number[];     // [6,7,8] = June-August
+  note?: string;        // "Selvplukk i juni"
 }
 
 export interface OpeningHour {
@@ -88,6 +98,7 @@ export interface AgentInfoResponse {
     trustScore: number;
     isVerified: boolean;
     isClaimed: boolean;
+    languages: string[];
   };
   knowledge: {
     address?: string;
@@ -103,6 +114,10 @@ export interface AgentInfoResponse {
     certifications: string[];
     paymentMethods: string[];
     deliveryOptions: string[];
+    images: string[];
+    seasonality: SeasonalProduct[];
+    deliveryRadius?: number;
+    minOrderValue?: number;
     ratings?: {
       google?: { score: number; reviews: number };
       tripadvisor?: { score: number };
@@ -152,6 +167,7 @@ class KnowledgeService {
         trustScore: agent.trust_score,
         isVerified: agent.is_verified === 1,
         isClaimed,
+        languages: agent.languages ? JSON.parse(agent.languages) : ["no"],
       },
       knowledge: {
         address: knowledge?.address,
@@ -167,6 +183,10 @@ class KnowledgeService {
         certifications: knowledge?.certifications || [],
         paymentMethods: knowledge?.paymentMethods || [],
         deliveryOptions: knowledge?.deliveryOptions || [],
+        images: knowledge?.images || [],
+        seasonality: knowledge?.seasonality || [],
+        deliveryRadius: knowledge?.deliveryRadius,
+        minOrderValue: knowledge?.minOrderValue,
         ratings: this.buildRatings(knowledge),
       },
       meta: {
@@ -193,9 +213,10 @@ class KnowledgeService {
           opening_hours, products, about, specialties, certifications,
           payment_methods, delivery_options, google_rating, google_review_count,
           tripadvisor_rating, external_reviews, external_links, images,
+          seasonality, delivery_radius, min_order_value,
           data_source, auto_sources, last_enriched_at, preferences,
           created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `).run(
         agentId,
         data.address || null,
@@ -216,6 +237,9 @@ class KnowledgeService {
         JSON.stringify(data.externalReviews || []),
         JSON.stringify(data.externalLinks || []),
         JSON.stringify(data.images || []),
+        JSON.stringify(data.seasonality || []),
+        data.deliveryRadius || null,
+        data.minOrderValue || null,
         data.dataSource || "auto",
         JSON.stringify(data.autoSources || []),
         now,
@@ -234,6 +258,7 @@ class KnowledgeService {
           certifications = ?, payment_methods = ?, delivery_options = ?,
           google_rating = ?, google_review_count = ?, tripadvisor_rating = ?,
           external_reviews = ?, external_links = ?, images = ?,
+          seasonality = ?, delivery_radius = ?, min_order_value = ?,
           data_source = ?,
           auto_sources = ?,
           last_enriched_at = CASE WHEN ? = 'auto' THEN ? ELSE last_enriched_at END,
@@ -260,6 +285,9 @@ class KnowledgeService {
         JSON.stringify(merged.externalReviews || []),
         JSON.stringify(merged.externalLinks || []),
         JSON.stringify(merged.images || []),
+        JSON.stringify(merged.seasonality || []),
+        merged.deliveryRadius || null,
+        merged.minOrderValue || null,
         isOwnerUpdate ? (existing.dataSource === "auto" ? "hybrid" : "owner") : merged.dataSource,
         JSON.stringify(merged.autoSources || []),
         data.dataSource || "auto", now,
@@ -526,6 +554,9 @@ class KnowledgeService {
       externalReviews: update.externalReviews?.length ? update.externalReviews : existing.externalReviews,
       externalLinks: update.externalLinks?.length ? update.externalLinks : existing.externalLinks,
       images: update.images?.length ? update.images : existing.images,
+      seasonality: update.seasonality?.length ? update.seasonality : existing.seasonality,
+      deliveryRadius: update.deliveryRadius ?? existing.deliveryRadius,
+      minOrderValue: update.minOrderValue ?? existing.minOrderValue,
       dataSource: update.dataSource || existing.dataSource,
       autoSources: [...new Set([...(existing.autoSources || []), ...(update.autoSources || [])])],
       lastEnrichedAt: update.lastEnrichedAt ?? existing.lastEnrichedAt,
@@ -567,6 +598,9 @@ class KnowledgeService {
       externalReviews: row.external_reviews ? JSON.parse(row.external_reviews) : [],
       externalLinks: row.external_links ? JSON.parse(row.external_links) : [],
       images: row.images ? JSON.parse(row.images) : [],
+      seasonality: row.seasonality ? JSON.parse(row.seasonality) : [],
+      deliveryRadius: row.delivery_radius || undefined,
+      minOrderValue: row.min_order_value || undefined,
       dataSource: row.data_source || "auto",
       autoSources: row.auto_sources ? JSON.parse(row.auto_sources) : [],
       lastEnrichedAt: row.last_enriched_at,

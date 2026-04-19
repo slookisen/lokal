@@ -402,6 +402,23 @@ function initSchema(db: Database.Database): void {
     // Column already exists — expected after first migration
   }
 
+  // ─── Tier 2: Add seasonality, delivery_radius, min_order_value ──
+  try {
+    db.exec(`ALTER TABLE agent_knowledge ADD COLUMN seasonality TEXT DEFAULT '[]'`);
+  } catch {
+    // Column already exists
+  }
+  try {
+    db.exec(`ALTER TABLE agent_knowledge ADD COLUMN delivery_radius REAL`);
+  } catch {
+    // Column already exists
+  }
+  try {
+    db.exec(`ALTER TABLE agent_knowledge ADD COLUMN min_order_value REAL`);
+  } catch {
+    // Column already exists
+  }
+
   // ─── Add is_owner column to analytics tables ─────────────────
   // Allows filtering out owner/developer traffic in dashboard
   for (const table of ["analytics_page_views", "analytics_queries", "analytics_agent_views"]) {

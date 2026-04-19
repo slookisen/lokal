@@ -1282,6 +1282,32 @@ const PROFILE_CSS = `
   .rel-card:hover { background: var(--green-50); transform: translateY(-2px); box-shadow: var(--shadow-md); text-decoration: none; }
   .rel-name { font-weight: 700; font-size: 0.88rem; margin-bottom: 3px; }
   .rel-meta { font-size: 0.75rem; color: var(--g500); }
+  /* Tier 2: Images */
+  .img-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; }
+  .img-item img { width: 100%; height: 140px; object-fit: cover; border-radius: var(--r-md); background: var(--g100); }
+  /* Tier 2: Seasonality calendar */
+  .season-grid { display: flex; flex-direction: column; gap: 10px; }
+  .season-row { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; padding: 6px 0; border-bottom: 1px solid var(--g100); }
+  .season-row:last-child { border-bottom: none; }
+  .season-name { font-weight: 600; font-size: 0.88rem; min-width: 120px; display: flex; align-items: center; gap: 5px; }
+  .season-live { color: var(--green-700); font-size: 0.6rem; }
+  .season-bar { display: flex; gap: 2px; font-size: 0.62rem; font-weight: 600; }
+  .season-bar span { width: 22px; height: 22px; display: flex; align-items: center; justify-content: center; border-radius: 4px; }
+  .sm-on { background: var(--green-100); color: var(--green-700); }
+  .sm-now { background: var(--green-700); color: var(--white); }
+  .sm-off { background: var(--g100); color: var(--g400); }
+  .season-note { font-size: 0.75rem; color: var(--g500); width: 100%; }
+  /* Tier 2: Delivery */
+  .del-grid { display: flex; flex-direction: column; gap: 8px; }
+  .del-item { font-size: 0.88rem; color: var(--g700); }
+  .del-item strong { color: var(--charcoal); }
+  /* Tier 2: External links */
+  .ext-links { display: flex; flex-wrap: wrap; gap: 8px; }
+  .ext-link { display: inline-flex; align-items: center; gap: 5px; padding: 7px 14px; background: var(--g100); border-radius: var(--r-md); font-size: 0.82rem; font-weight: 600; color: var(--charcoal); text-decoration: none; transition: all 0.2s; }
+  .ext-link:hover { background: var(--green-50); color: var(--green-700); transform: translateY(-1px); }
+  /* Tier 2: Languages */
+  .lang-row { display: flex; gap: 6px; flex-wrap: wrap; }
+  .lang-tag { padding: 5px 12px; background: var(--g100); border-radius: 20px; font-size: 0.8rem; font-weight: 600; color: var(--g700); }
   @media (max-width: 840px) {
     .pf-header { grid-template-columns: 1fr; }
     .pf-content { grid-template-columns: 1fr; }
@@ -1289,6 +1315,9 @@ const PROFILE_CSS = `
     .pf-name { font-size: 1.7rem; }
     .claim-bar { flex-direction: column; text-align: center; }
     .rel-grid { grid-template-columns: 1fr; }
+    .img-grid { grid-template-columns: 1fr 1fr; }
+    .season-bar span { width: 18px; height: 18px; font-size: 0.55rem; }
+    .season-name { min-width: 100px; }
   }
 `;
 
@@ -1392,6 +1421,63 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
       </a>`;
     }).join("");
 
+    // Images gallery
+    const imagesList = Array.isArray(k.images) ? k.images.filter((u: string) => u && u.startsWith("http")) : [];
+    const imagesHtml = imagesList.length
+      ? imagesList.slice(0, 6).map((url: string) =>
+          `<div class="img-item"><img src="${escapeHtml(url)}" alt="${escapeHtml(agent.name)}" loading="lazy" onerror="this.parentElement.style.display='none'"></div>`
+        ).join("")
+      : "";
+
+    // Seasonality calendar
+    const seasonList = Array.isArray(k.seasonality) ? k.seasonality : [];
+    const currentMonth = new Date().getMonth() + 1; // 1-12
+    const seasonHtml = seasonList.length
+      ? seasonList.map((s: any) => {
+          const months = s.months || [];
+          const inSeason = months.includes(currentMonth);
+          const monthDots = Array.from({ length: 12 }, (_, i) => {
+            const m = i + 1;
+            const active = months.includes(m);
+            const cls = active ? (m === currentMonth ? "sm-now" : "sm-on") : "sm-off";
+            return `<span class="${cls}" title="${MONTH_NAMES[m] || m}">${MONTH_NAMES[m]?.charAt(0) || m}</span>`;
+          }).join("");
+          return `<div class="season-row">
+            <div class="season-name">${inSeason ? '<span class="season-live">&#9679;</span>' : ""}${escapeHtml(s.product || "")}</div>
+            <div class="season-bar">${monthDots}</div>
+            ${s.note ? `<div class="season-note">${escapeHtml(s.note)}</div>` : ""}
+          </div>`;
+        }).join("")
+      : "";
+
+    // Delivery info
+    const deliveryParts: string[] = [];
+    if (k.deliveryRadius) deliveryParts.push(`<div class="del-item"><strong>Leveringsradius:</strong> ${k.deliveryRadius} km</div>`);
+    if (k.minOrderValue) deliveryParts.push(`<div class="del-item"><strong>Minstebestilling:</strong> ${k.minOrderValue} kr</div>`);
+    if ((k.deliveryOptions || []).length) deliveryParts.push(`<div class="del-item"><strong>Leveringsmetoder:</strong> ${(k.deliveryOptions as string[]).join(", ")}</div>`);
+    if ((k.paymentMethods || []).length) deliveryParts.push(`<div class="del-item"><strong>Betaling:</strong> ${(k.paymentMethods as string[]).join(", ")}</div>`);
+    const deliveryHtml = deliveryParts.join("");
+
+    // Languages
+    const agentLangs: string[] = info?.agent?.languages || ["no"];
+    const langMap: Record<string, string> = { no: "Norsk", en: "English", se: "Samisk", de: "Deutsch", pl: "Polski", sv: "Svenska", da: "Dansk" };
+    const langsHtml = agentLangs.length > 1 || (agentLangs.length === 1 && agentLangs[0] !== "no")
+      ? `<div class="lang-row">${agentLangs.map(l => `<span class="lang-tag">${escapeHtml(langMap[l] || l)}</span>`).join("")}</div>`
+      : "";
+
+    // External links (social media etc.)
+    const linksList = Array.isArray(k.externalLinks) ? k.externalLinks : [];
+    const linksHtml = linksList.length
+      ? linksList.map((l: any) => {
+          const icon = l.type === "social" && l.label?.toLowerCase().includes("facebook") ? "&#128101;"
+            : l.type === "social" && l.label?.toLowerCase().includes("instagram") ? "&#128247;"
+            : l.type === "maps" ? "&#128506;"
+            : l.type === "shop" ? "&#128722;"
+            : "&#128279;";
+          return `<a href="${escapeHtml(l.url)}" class="ext-link" target="_blank" rel="noopener">${icon} ${escapeHtml(l.label || "Lenke")}</a>`;
+        }).join("")
+      : "";
+
     // Schema.org
     const jsonLd: any = {
       "@context": "https://schema.org", "@type": "LocalBusiness",
@@ -1460,10 +1546,22 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
 
     <div class="pf-content">
       <div class="pf-main">
+        ${imagesHtml ? `
+        <div class="card">
+          <div class="card-head"><span>&#128247;</span><h3>Bilder</h3></div>
+          <div class="card-body"><div class="img-grid">${imagesHtml}</div></div>
+        </div>` : ""}
+
         ${productsHtml ? `
         <div class="card">
           <div class="card-head"><span>&#127813;</span><h3>Produkter (${productsList.length})</h3></div>
           <div class="card-body"><div class="prod-grid">${productsHtml}</div></div>
+        </div>` : ""}
+
+        ${seasonHtml ? `
+        <div class="card">
+          <div class="card-head"><span>&#127793;</span><h3>Sesongkalender</h3></div>
+          <div class="card-body"><div class="season-grid">${seasonHtml}</div></div>
         </div>` : ""}
 
         ${hoursHtml ? `
@@ -1472,14 +1570,28 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
           <div class="card-body"><div class="hrs-grid">${hoursHtml}</div></div>
         </div>` : ""}
 
+        ${deliveryHtml ? `
+        <div class="card">
+          <div class="card-head"><span>&#128666;</span><h3>Levering og betaling</h3></div>
+          <div class="card-body"><div class="del-grid">${deliveryHtml}</div></div>
+        </div>` : ""}
+
         ${certsHtml ? `
         <div class="card">
           <div class="card-head"><span>&#127942;</span><h3>Sertifiseringer</h3></div>
-          <div class="card-body">
-            <div class="certs-row">${certsHtml}</div>
-            ${k.paymentMethods?.length ? `<p style="margin-top:14px;font-size:0.85rem;"><strong>Betaling:</strong> <span style="color:var(--g500);">${k.paymentMethods.join(", ")}</span></p>` : ""}
-            ${k.deliveryOptions?.length ? `<p style="margin-top:6px;font-size:0.85rem;"><strong>Levering:</strong> <span style="color:var(--g500);">${k.deliveryOptions.join(", ")}</span></p>` : ""}
-          </div>
+          <div class="card-body"><div class="certs-row">${certsHtml}</div></div>
+        </div>` : ""}
+
+        ${linksHtml ? `
+        <div class="card">
+          <div class="card-head"><span>&#128279;</span><h3>Finn oss</h3></div>
+          <div class="card-body"><div class="ext-links">${linksHtml}</div></div>
+        </div>` : ""}
+
+        ${langsHtml ? `
+        <div class="card">
+          <div class="card-head"><span>&#127760;</span><h3>Spr\u00e5k</h3></div>
+          <div class="card-body">${langsHtml}</div>
         </div>` : ""}
 
         <div class="claim-bar">
