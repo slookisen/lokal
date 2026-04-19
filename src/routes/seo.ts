@@ -1428,16 +1428,18 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
           // If only one exists, use it
           if (!desc) return `<p class="pf-desc">${escapeHtml(about)}</p>`;
           if (!about) return `<p class="pf-desc">${escapeHtml(desc)}</p>`;
-          // If they're essentially the same, just show one
+          // If they're the same text, just show one
           if (desc === about || about.length < 20) return `<p class="pf-desc">${escapeHtml(desc)}</p>`;
-          // Both exist and differ — description is the primary (enrichment-maintained),
-          // but about may have unique context worth showing
-          const descLower = desc.toLowerCase();
-          const aboutAddsInfo = !descLower.includes(about.substring(0, Math.min(30, about.length)).toLowerCase());
-          if (aboutAddsInfo && about.length > 30) {
-            return `<p class="pf-desc">${escapeHtml(desc)}</p><p class="pf-desc-extra">${escapeHtml(about)}</p>`;
+          // Both exist and differ — pick the most informative as primary,
+          // show the other as supplementary if it adds unique context
+          const primary = desc.length >= about.length ? desc : about;
+          const secondary = desc.length >= about.length ? about : desc;
+          const primaryLower = primary.toLowerCase();
+          const secondaryAddsInfo = !primaryLower.includes(secondary.substring(0, Math.min(30, secondary.length)).toLowerCase());
+          if (secondaryAddsInfo && secondary.length > 30) {
+            return `<p class="pf-desc">${escapeHtml(primary)}</p><p class="pf-desc-extra">${escapeHtml(secondary)}</p>`;
           }
-          return `<p class="pf-desc">${escapeHtml(desc)}</p>`;
+          return `<p class="pf-desc">${escapeHtml(primary)}</p>`;
         })()}
         <div class="pf-stats">
           <div class="pf-stat"><div class="pf-stat-icon t">&#9733;</div><div><strong>${trustPct}%</strong><small>Trust Score</small></div></div>

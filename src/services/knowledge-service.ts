@@ -161,7 +161,7 @@ class KnowledgeService {
         email: knowledge?.email,
         openingHours: knowledge?.openingHours || [],
         products: knowledge?.products || [],
-        about: agent.description || knowledge?.about || "",
+        about: knowledge?.about || "",
         description: agent.description || "",
         specialties: knowledge?.specialties || [],
         certifications: knowledge?.certifications || [],
