@@ -7,6 +7,7 @@ import { geocodingService } from "../services/geocoding-service";
 import { getDb } from "../database/init";
 import { emailService } from "../services/email-service";
 import { trustScoreService } from "../services/trust-score-service";
+import { conversationService } from "../services/conversation-service";
 
 // ─── Marketplace Routes ───────────────────────────────────────
 // These are the OPEN endpoints that make Lokal a marketplace.
@@ -252,6 +253,23 @@ router.post("/discover", (req: Request, res: Response) => {
       contact: buildContactBlock(r.agent.id),
     }));
 
+    // Auto-start conversations with top matches
+    const conversations: any[] = [];
+    if (results.length > 0) {
+      const queryDesc = [query.categories?.join(", "), query.tags?.join(", ")].filter(Boolean).join(" — ") || "strukturert søk";
+      for (const r of results.slice(0, 2)) {
+        try {
+          const conv = conversationService.startConversation({
+            sellerAgentId: r.agent.id,
+            queryText: queryDesc,
+            source: "api",
+            autoRespond: true,
+          });
+          conversations.push({ conversationId: conv.id, sellerAgentId: r.agent.id });
+        } catch { /* non-critical */ }
+      }
+    }
+
     res.json({
       success: true,
       count: enrichedResults.length,
@@ -262,6 +280,7 @@ router.post("/discover", (req: Request, res: Response) => {
         maxDistanceKm: query.maxDistanceKm,
       },
       results: enrichedResults,
+      conversations,
     });
   } catch (error: any) {
     if (error.name === "ZodError") {
@@ -376,15 +395,47 @@ router.get("/search", async (req: Request, res: Response) => {
     contact: buildContactBlock(r.agent.id),
   }));
 
+  // ─── Auto-start conversations with top matches ────────────
+  // Only for bot/agent traffic — not for humans browsing the site.
+  // ChatGPT Custom GPT, OpenAI agents, etc. have identifiable UA strings.
+  // Humans use the /sok frontend which calls discover() directly.
+  const ua = (req.headers["user-agent"] || "").toLowerCase();
+  const acceptHeader = (req.headers["accept"] || "").toLowerCase();
+  const isAgent = ua.includes("gpt") || ua.includes("openai") || ua.includes("claude")
+    || ua.includes("bot") || ua.includes("agent") || ua.includes("python")
+    || ua.includes("node-fetch") || ua.includes("axios") || ua.includes("httpie")
+    || acceptHeader.includes("application/json") && !acceptHeader.includes("text/html");
+
+  const conversations: any[] = [];
+  if (isAgent && results.length > 0) {
+    for (const r of results.slice(0, 2)) {
+      try {
+        const conv = conversationService.startConversation({
+          sellerAgentId: r.agent.id,
+          queryText: q,
+          source: "api",
+          autoRespond: true,
+        });
+        conversations.push({
+          conversationId: conv.id,
+          sellerAgentId: r.agent.id,
+          sellerAgentName: conv.sellerAgentName,
+          messageCount: conv.messages.length,
+        });
+      } catch { /* non-critical */ }
+    }
+  }
+
   const safeQuery = q.replace(/<[^>]*>/g, "").replace(/javascript:/gi, "");
   res.json({
     success: true,
     query: safeQuery,
     parsed,
-    geoFiltered: !!parsed.location && !heleNorge,  // tells frontend if results were geo-limited
-    geoSource,                                       // "browser", "kartverket", "database", "hardcoded", "none"
+    geoFiltered: !!parsed.location && !heleNorge,
+    geoSource,
     count: enrichedResults.length,
     results: enrichedResults,
+    conversations,
   });
 });
 
