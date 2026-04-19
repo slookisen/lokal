@@ -27,7 +27,11 @@ export declare class EmailService {
         messageId?: string;
         error?: string;
     }>;
-    private sendEmail;
+    sendEmail(options: EmailOptions): Promise<{
+        success: boolean;
+        messageId?: string;
+        error?: string;
+    }>;
     private generateClaimInvitationHtml;
     private generateClaimInvitationText;
     private generateVerificationCodeHtml;

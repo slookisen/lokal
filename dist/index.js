@@ -93,16 +93,107 @@ app.get("/openapi.yaml", (_req, res) => {
     res.sendFile(path_1.default.join(__dirname, "..", "openapi.yaml"));
 });
 // ─── Health check ────────────────────────────────────────────
+const BOOT_TIME = new Date().toISOString();
 app.get("/health", (_req, res) => {
-    const stats = require("./services/marketplace-registry").marketplaceRegistry.getStats();
-    res.json({
-        status: "ok",
-        service: "lokal",
-        version: "0.3.0",
-        database: "sqlite",
-        agents: stats.totalAgents,
-        uptime: Math.floor(process.uptime()),
-    });
+    const startMs = Date.now();
+    try {
+        const { marketplaceRegistry } = require("./services/marketplace-registry");
+        const { getDb } = require("./database/init");
+        const db = getDb();
+        // DB responsiveness — timed simple query
+        const dbStart = Date.now();
+        const stats = marketplaceRegistry.getStats();
+        const dbLatencyMs = Date.now() - dbStart;
+        // Memory usage
+        const mem = process.memoryUsage();
+        const memUsedMb = Math.round(mem.rss / 1024 / 1024);
+        const heapUsedMb = Math.round(mem.heapUsed / 1024 / 1024);
+        const heapTotalMb = Math.round(mem.heapTotal / 1024 / 1024);
+        // Database file sizes
+        const fs = require("fs");
+        const dbPath = process.env.DB_PATH || "./data/lokal.db";
+        let dbSizeMb = 0;
+        try {
+            dbSizeMb = Math.round(fs.statSync(dbPath).size / 1024 / 1024 * 10) / 10;
+        }
+        catch { }
+        // Row counts for key tables
+        const agentCount = db.prepare("SELECT COUNT(*) as c FROM agents WHERE is_active = 1").get().c;
+        const pvCount = db.prepare("SELECT COUNT(*) as c FROM analytics_page_views").get().c;
+        const queryCount = db.prepare("SELECT COUNT(*) as c FROM analytics_queries").get().c;
+        // Recent activity (last hour)
+        const oneHourAgo = new Date(Date.now() - 3600000).toISOString().replace("T", " ").replace(/\.\d{3}Z$/, "");
+        const recentPv = db.prepare("SELECT COUNT(*) as c FROM analytics_page_views WHERE created_at > ?").get(oneHourAgo).c;
+        // Uptime
+        const uptimeSec = Math.floor(process.uptime());
+        // Overall status based on thresholds
+        let status = "healthy";
+        const warnings = [];
+        if (memUsedMb > 420) {
+            status = "critical";
+            warnings.push(`Memory critical: ${memUsedMb}MB / 512MB`);
+        }
+        else if (memUsedMb > 350) {
+            status = "warning";
+            warnings.push(`Memory high: ${memUsedMb}MB / 512MB`);
+        }
+        if (dbLatencyMs > 3000) {
+            status = "critical";
+            warnings.push(`DB slow: ${dbLatencyMs}ms`);
+        }
+        else if (dbLatencyMs > 1000) {
+            if (status !== "critical")
+                status = "warning";
+            warnings.push(`DB latency elevated: ${dbLatencyMs}ms`);
+        }
+        if (dbSizeMb > 200) {
+            if (status !== "critical")
+                status = "warning";
+            warnings.push(`DB large: ${dbSizeMb}MB`);
+        }
+        if (pvCount > 500000) {
+            warnings.push(`analytics_page_views has ${pvCount} rows — consider pruning`);
+        }
+        const responseMs = Date.now() - startMs;
+        res.json({
+            status,
+            warnings,
+            service: "rettfrabonden",
+            version: "1.0.0",
+            uptime: uptimeSec,
+            uptimeHuman: `${Math.floor(uptimeSec / 3600)}h ${Math.floor((uptimeSec % 3600) / 60)}m`,
+            bootedAt: BOOT_TIME,
+            timestamp: new Date().toISOString(),
+            memory: {
+                rssMb: memUsedMb,
+                heapUsedMb,
+                heapTotalMb,
+                limitMb: 512,
+                pct: Math.round(memUsedMb / 512 * 100),
+            },
+            database: {
+                latencyMs: dbLatencyMs,
+                sizeMb: dbSizeMb,
+                agents: agentCount,
+                pageViews: pvCount,
+                queries: queryCount,
+            },
+            traffic: {
+                lastHourPageViews: recentPv,
+                totalAgents: stats.totalAgents,
+                activeCities: stats.cities.length,
+            },
+            responseMs,
+        });
+    }
+    catch (err) {
+        res.status(500).json({
+            status: "critical",
+            warnings: [`Health check failed: ${err}`],
+            timestamp: new Date().toISOString(),
+            responseMs: Date.now() - startMs,
+        });
+    }
 });
 // Analytics admin endpoints
 app.use("/admin/analytics", analytics_1.default);
@@ -163,20 +254,8 @@ if (existingAgentCount === 0) {
 }
 else {
     console.log(`✅ Database already has ${existingAgentCount} agents — skipping seed`);
-    // Run deduplication on existing data (one-time cleanup for the 429→370 issue)
-    const dupeCount = db.prepare(`
-    SELECT COUNT(*) as c FROM agents WHERE id NOT IN (
-      SELECT MIN(id) FROM agents GROUP BY name, city
-    )
-  `).get().c;
-    if (dupeCount > 0) {
-        db.prepare(`
-      DELETE FROM agents WHERE id NOT IN (
-        SELECT MIN(id) FROM agents GROUP BY name, city
-      )
-    `).run();
-        console.log(`🧹 Cleaned up ${dupeCount} duplicate agents from previous restarts`);
-    }
+    // Deduplication removed — data is already clean after initial cleanup.
+    // Keeping the seed-path dedup for fresh databases only.
     // Enrich knowledge if not already done
     if (seedKnowledge) {
         const knowledgeCount = db.prepare("SELECT COUNT(*) as c FROM agent_knowledge").get().c;
@@ -186,12 +265,9 @@ else {
         }
     }
 }
-// ─── Recalculate trust scores on boot ────────────────────────
-// Every deploy gets fresh scores reflecting current data.
-// This replaces the static 0.5 default with real calculations.
-console.log("📊 Recalculating trust scores...");
-const trustResult = trust_score_service_1.trustScoreService.recalculateAll();
-console.log(`   ✅ Updated ${trustResult.updated} agents (avg: ${Math.round(trustResult.avgScore * 100)}%)`);
+// ─── Recalculate trust scores AFTER server starts ────────────
+// Deferred to avoid blocking startup. Existing scores remain valid
+// until recalc completes (typically a few seconds after boot).
 // ─── Start ───────────────────────────────────────────────────
 const BASE_URL = process.env.BASE_URL || `http://localhost:${PORT}`;
 // Bind to 0.0.0.0 — required for Docker/Fly.io (localhost won't work in containers)
@@ -210,9 +286,26 @@ app.listen(Number(PORT), HOST, async () => {
     console.log(`   MCP Server:    npx lokal-mcp (for Claude Desktop)`);
     console.log(`   MCP HTTP:      POST ${BASE_URL}/mcp (for ChatGPT & remote clients)`);
     console.log(`\n   ── Discovery ────────────────────────────────`);
-    // Initialize discovery service (registers with A2A registries if public URL)
-    await discovery_service_1.discoveryService.initialize(BASE_URL);
+    // Initialize discovery service in background (non-blocking)
+    // Registry registration involves network calls that can be slow/timeout
+    discovery_service_1.discoveryService.initialize(BASE_URL).then(() => {
+        console.log("[Discovery] Initialization complete");
+    }).catch((err) => {
+        console.warn("[Discovery] Initialization failed (non-fatal):", err);
+    });
     console.log("");
+    // Recalculate trust scores in background (non-blocking)
+    // Uses setTimeout(0) so the event loop can handle incoming requests first.
+    setTimeout(() => {
+        try {
+            console.log("📊 Recalculating trust scores (background)...");
+            const trustResult = trust_score_service_1.trustScoreService.recalculateAll();
+            console.log(`   ✅ Updated ${trustResult.updated} agents (avg: ${Math.round(trustResult.avgScore * 100)}%)`);
+        }
+        catch (err) {
+            console.error("Trust recalc failed (non-fatal):", err);
+        }
+    }, 2000); // 2 second delay — let health checks pass first
 });
 // ─── Graceful shutdown ───────────────────────────────────────
 process.on("SIGTERM", () => { discovery_service_1.discoveryService.shutdown(); (0, init_1.closeDb)(); process.exit(0); });

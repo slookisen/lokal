@@ -37,6 +37,40 @@ export declare const AgentRegistrationSchema: z.ZodObject<{
     languages: z.ZodDefault<z.ZodArray<z.ZodString>>;
 }, z.core.$strip>;
 export type AgentRegistration = z.infer<typeof AgentRegistrationSchema>;
+export declare const AdminRegistrationSchema: z.ZodObject<{
+    name: z.ZodString;
+    description: z.ZodDefault<z.ZodString>;
+    provider: z.ZodDefault<z.ZodString>;
+    contactEmail: z.ZodDefault<z.ZodString>;
+    url: z.ZodDefault<z.ZodString>;
+    version: z.ZodDefault<z.ZodString>;
+    capabilities: z.ZodDefault<z.ZodRecord<z.ZodString, z.ZodAny>>;
+    skills: z.ZodDefault<z.ZodArray<z.ZodObject<{
+        id: z.ZodDefault<z.ZodString>;
+        name: z.ZodDefault<z.ZodString>;
+        description: z.ZodDefault<z.ZodString>;
+        tags: z.ZodDefault<z.ZodArray<z.ZodString>>;
+        inputModes: z.ZodDefault<z.ZodArray<z.ZodString>>;
+        outputModes: z.ZodDefault<z.ZodArray<z.ZodString>>;
+    }, z.core.$strip>>>;
+    role: z.ZodDefault<z.ZodEnum<{
+        producer: "producer";
+        consumer: "consumer";
+        logistics: "logistics";
+        quality: "quality";
+        "price-intel": "price-intel";
+    }>>;
+    location: z.ZodOptional<z.ZodObject<{
+        lat: z.ZodNumber;
+        lng: z.ZodNumber;
+        city: z.ZodString;
+        radiusKm: z.ZodOptional<z.ZodNumber>;
+    }, z.core.$strip>>;
+    categories: z.ZodDefault<z.ZodArray<z.ZodString>>;
+    tags: z.ZodDefault<z.ZodArray<z.ZodString>>;
+    languages: z.ZodDefault<z.ZodArray<z.ZodString>>;
+}, z.core.$strip>;
+export type AdminRegistration = z.infer<typeof AdminRegistrationSchema>;
 export declare const RegisteredAgentSchema: z.ZodObject<{
     name: z.ZodString;
     description: z.ZodString;

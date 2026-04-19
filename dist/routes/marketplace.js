@@ -5,6 +5,7 @@ const marketplace_registry_1 = require("../services/marketplace-registry");
 const marketplace_1 = require("../models/marketplace");
 const interaction_logger_1 = require("../services/interaction-logger");
 const knowledge_service_1 = require("../services/knowledge-service");
+const geocoding_service_1 = require("../services/geocoding-service");
 const init_1 = require("../database/init");
 const email_service_1 = require("../services/email-service");
 const trust_score_service_1 = require("../services/trust-score-service");
@@ -18,6 +19,12 @@ const trust_score_service_1 = require("../services/trust-score-service");
 // This is the "DNS for food agents" — the endpoints that external
 // AI agents (ChatGPT, Claude, Gemini plugins) will call.
 const router = (0, express_1.Router)();
+// ─── Admin key helper ────────────────────────────────────────
+// Accepts ADMIN_KEY or ANALYTICS_ADMIN_KEY so the enrichment
+// pipeline can authenticate with the same key used for the dashboard.
+function getAdminKey() {
+    return process.env.ADMIN_KEY || process.env.ANALYTICS_ADMIN_KEY || "";
+}
 // ─── Ensure agent exists in SQLite for FK constraints ───────
 // The marketplace registry keeps agents in-memory (loaded from seed/discovery).
 // But agent_claims has a FOREIGN KEY to agents(id). If the agent only exists
@@ -79,7 +86,8 @@ function buildVCard(agentId) {
     const info = knowledge_service_1.knowledgeService.getAgentInfo(agentId);
     if (!info)
         return null;
-    const { agent, knowledge: k } = info;
+    const { agent: _agent, knowledge: k } = info;
+    const agent = _agent; // Cast for flexibility — agent shape varies
     const lines = [];
     lines.push("BEGIN:VCARD");
     lines.push("VERSION:3.0");
@@ -102,24 +110,48 @@ function buildVCard(agentId) {
     }
     // Products as NOTE appendix (visible in most contact apps)
     if (k.products && Array.isArray(k.products) && k.products.length > 0) {
-        const productList = k.products.map((p) => {
-            let item = p.name || p.product || "Ukjent";
+        const productList = k.products
+            .map((p) => {
+            // Handle object products and plain strings; skip empty/unknown
+            const name = typeof p === "string" ? p : (p.name || p.product || "");
+            if (!name || name.toLowerCase() === "ukjent")
+                return null;
+            let item = name;
             if (p.price)
                 item += ` (${p.price})`;
-            if (p.season)
-                item += ` [${p.season}]`;
+            if (p.seasonal && p.months?.length)
+                item += ` [sesong]`;
             return item;
-        }).join(", ");
-        const notePrefix = k.about ? escapeVCard(k.about) + "\\n\\nProdukter: " : "Produkter: ";
-        // Override NOTE with about + products combined
-        const noteIdx = lines.findIndex(l => l.startsWith("NOTE:"));
-        if (noteIdx >= 0)
-            lines[noteIdx] = `NOTE:${notePrefix}${escapeVCard(productList)}`;
-        else
-            lines.push(`NOTE:Produkter: ${escapeVCard(productList)}`);
+        })
+            .filter(Boolean)
+            .join(", ");
+        if (productList) {
+            const notePrefix = k.about ? escapeVCard(k.about) + "\\n\\nProdukter: " : "Produkter: ";
+            const noteIdx = lines.findIndex(l => l.startsWith("NOTE:"));
+            if (noteIdx >= 0)
+                lines[noteIdx] = `NOTE:${notePrefix}${escapeVCard(productList)}`;
+            else
+                lines.push(`NOTE:Produkter: ${escapeVCard(productList)}`);
+        }
     }
+    // GEO field — helps contact apps show location
+    if (agent.location?.lat && agent.location?.lng && agent.location.lat !== 0) {
+        lines.push(`GEO:${agent.location.lat};${agent.location.lng}`);
+    }
+    // Google Maps search URL as custom field — AI agents and contact apps can use this
+    const mapsParts = [agent.name];
+    if (k.address)
+        mapsParts.push(k.address);
+    if (agent.city)
+        mapsParts.push(agent.city);
+    mapsParts.push("Norge");
+    lines.push(`X-LOKAL-MAPS:https://www.google.com/maps/search/${encodeURIComponent(mapsParts.join(", "))}`);
     // Category tag helps contact apps group these
-    lines.push("CATEGORIES:Rett fra Bonden,Norsk mat,Produsent");
+    const catNames = (agent.categories || []).map((c) => c.charAt(0).toUpperCase() + c.slice(1));
+    lines.push(`CATEGORIES:Rett fra Bonden,${catNames.length ? catNames.join(",") : "Norsk mat"},Produsent`);
+    // Producer page URL
+    const profileSlug = agent.name.toLowerCase().replace(/[^a-zæøå0-9]+/g, "-").replace(/-+/g, "-").replace(/^-|-$/g, "");
+    lines.push(`X-LOKAL-PROFILE:https://rettfrabonden.com/produsent/${profileSlug}`);
     lines.push(`X-LOKAL-AGENT-ID:${agent.id}`);
     if (agent.trustScore !== undefined && agent.trustScore !== null) {
         lines.push(`X-LOKAL-TRUST-SCORE:${Math.round(agent.trustScore * 100)}`);
@@ -221,41 +253,103 @@ router.post("/discover", (req, res) => {
 // we parse it and return matching agents.
 //
 // Example: GET /search?q=ferske+økologiske+grønnsaker+nær+Grünerløkka
-router.get("/search", (req, res) => {
+router.get("/search", async (req, res) => {
     const q = req.query.q;
     if (!q) {
         res.status(400).json({ success: false, error: "Mangler ?q= parameter" });
         return;
     }
-    // Parse natural language into structured query
+    // Parse natural language into structured query (categories, tags, product terms)
     const parsed = marketplace_registry_1.marketplaceRegistry.parseNaturalQuery(q);
+    // ── Location resolution (priority order) ──
+    // 1. Frontend geolocation (user clicked "Nær meg")
+    // 2. Location extracted from query text via geocoding ("tomat i Nesbyen")
+    // 3. No location → results from whole country
+    const frontendLat = parseFloat(req.query.lat);
+    const frontendLng = parseFloat(req.query.lng);
+    const heleNorge = req.query.heleNorge === "true"; // explicit opt-out of geo filter
+    let geoSource = "none";
+    if (!heleNorge) {
+        if (!isNaN(frontendLat) && !isNaN(frontendLng)) {
+            // User's browser geolocation
+            parsed.location = { lat: frontendLat, lng: frontendLng };
+            parsed.maxDistanceKm = parseFloat(req.query.radius) || 30;
+            geoSource = "browser";
+        }
+        else if (!parsed.location) {
+            // Try to extract place name from query and geocode it
+            const geoResult = await geocoding_service_1.geocodingService.extractAndGeocode(q);
+            if (geoResult) {
+                parsed.location = { lat: geoResult.lat, lng: geoResult.lng };
+                parsed.maxDistanceKm = geoResult.radiusKm;
+                geoSource = geoResult.source;
+            }
+        }
+    }
+    // Preserve _productTerms through schema parsing (Zod strips unknown fields)
+    const productTerms = parsed._productTerms;
+    const requestedLimit = parseInt(req.query.limit) || 20;
     const query = marketplace_1.DiscoveryQuerySchema.parse({
         ...parsed,
-        limit: parseInt(req.query.limit) || 20,
+        limit: requestedLimit,
         offset: parseInt(req.query.offset) || 0,
     });
+    if (productTerms)
+        query._productTerms = productTerms;
     const startTime = Date.now();
-    const results = marketplace_registry_1.marketplaceRegistry.discover(query);
+    let results = marketplace_registry_1.marketplaceRegistry.discover(query);
+    // ── Auto-expanding radius ──
+    // If geo-filtered and too few results, widen the search automatically.
+    // This handles rural areas where 30km might only have 1-2 sellers.
+    const MIN_RESULTS = 3;
+    const RADIUS_STEPS = [50, 100, 200]; // km
+    if (parsed.location && results.length < MIN_RESULTS && !heleNorge) {
+        for (const expandedRadius of RADIUS_STEPS) {
+            if (results.length >= MIN_RESULTS)
+                break;
+            const expandedQuery = marketplace_1.DiscoveryQuerySchema.parse({
+                ...parsed,
+                maxDistanceKm: expandedRadius,
+                limit: requestedLimit,
+                offset: 0,
+            });
+            if (productTerms)
+                expandedQuery._productTerms = productTerms;
+            results = marketplace_registry_1.marketplaceRegistry.discover(expandedQuery);
+        }
+        // Last resort: no geo filter at all (show whole country)
+        if (results.length < MIN_RESULTS) {
+            const noGeoQuery = marketplace_1.DiscoveryQuerySchema.parse({
+                ...parsed,
+                location: undefined,
+                maxDistanceKm: undefined,
+                limit: requestedLimit,
+                offset: 0,
+            });
+            if (productTerms)
+                noGeoQuery._productTerms = productTerms;
+            results = marketplace_registry_1.marketplaceRegistry.discover(noGeoQuery);
+        }
+    }
     interaction_logger_1.interactionLogger.log("search", {
         query: q,
         resultCount: results.length,
         matchedAgentIds: results.map(r => r.agent.id),
-        metadata: { parsed },
+        metadata: { parsed, geoSource },
         ipAddress: req.ip,
         durationMs: Date.now() - startTime,
     });
-    // Enrich each result with a compact contact block so MCP/chat clients
-    // can present action-handles (tel:, mailto:, vCard) without extra calls.
     const enrichedResults = results.map((r) => ({
         ...r,
         contact: buildContactBlock(r.agent.id),
     }));
-    // Sanitize query echo to prevent reflected XSS if rendered by consumers
     const safeQuery = q.replace(/<[^>]*>/g, "").replace(/javascript:/gi, "");
     res.json({
         success: true,
         query: safeQuery,
-        parsed, // Show what we understood (transparency)
+        parsed,
+        geoFiltered: !!parsed.location && !heleNorge, // tells frontend if results were geo-limited
+        geoSource, // "browser", "kartverket", "database", "hardcoded", "none"
         count: enrichedResults.length,
         results: enrichedResults,
     });
@@ -282,13 +376,96 @@ router.get("/agents/:id/vcard", (req, res) => {
     res.send(vcard);
 });
 // ─── GET /agents/:id/card — Individual agent card (A2A) ──────
-// Standard A2A agent card for a registered agent
+// Standard A2A agent card enriched with knowledge data.
+// This is the main endpoint AI agents use to learn about a producer,
+// so it must include everything: contact, products, hours, certs, links.
 router.get("/agents/:id/card", (req, res) => {
     const agentId = req.params.id;
     const card = marketplace_registry_1.marketplaceRegistry.getAgentCard(agentId);
     if (!card) {
         res.status(404).json({ error: "Agent ikke funnet" });
         return;
+    }
+    // Enrich with knowledge data so AI agents get the full picture
+    const info = knowledge_service_1.knowledgeService.getAgentInfo(agentId);
+    if (info) {
+        const k = info.knowledge;
+        const agent = info.agent;
+        const cityName = agent.city || agent.location?.city || "";
+        // Contact info block — critical for AI agents recommending businesses
+        const contact = {};
+        if (k.address)
+            contact.address = k.address;
+        if (k.postalCode)
+            contact.postalCode = k.postalCode;
+        if (cityName)
+            contact.city = cityName;
+        contact.country = "Norway";
+        if (k.phone)
+            contact.phone = k.phone;
+        if (k.email)
+            contact.email = k.email;
+        if (k.website)
+            contact.website = k.website;
+        if (Object.keys(contact).length > 1)
+            card.contact = contact;
+        // Products — the core of what this producer offers
+        if (k.products && Array.isArray(k.products) && k.products.length > 0) {
+            card.products = k.products
+                .map((p) => {
+                if (typeof p === "string")
+                    return { name: p };
+                const item = {};
+                if (p.name)
+                    item.name = p.name;
+                if (p.category)
+                    item.category = p.category;
+                if (p.price)
+                    item.price = p.price;
+                if (p.seasonal)
+                    item.seasonal = p.seasonal;
+                if (p.months)
+                    item.availableMonths = p.months;
+                if (p.organic)
+                    item.organic = true;
+                return Object.keys(item).length > 0 ? item : null;
+            })
+                .filter(Boolean);
+        }
+        // Opening hours
+        if (k.openingHours && Array.isArray(k.openingHours) && k.openingHours.length > 0) {
+            card.openingHours = k.openingHours;
+        }
+        else if (typeof k.openingHours === "string" && k.openingHours) {
+            card.openingHours = k.openingHours;
+        }
+        // Certifications, specialties, payment, delivery
+        if (k.certifications?.length)
+            card.certifications = k.certifications;
+        if (k.specialties?.length)
+            card.specialties = k.specialties;
+        if (k.paymentMethods?.length)
+            card.paymentMethods = k.paymentMethods;
+        if (k.deliveryOptions?.length)
+            card.deliveryOptions = k.deliveryOptions;
+        // About text (richer than description)
+        if (k.about)
+            card["x-lokal"].about = k.about;
+        // Useful links for AI agents and consumers
+        const slug = agent.name.toLowerCase().replace(/[^a-zæøå0-9]+/g, "-").replace(/-+/g, "-").replace(/^-|-$/g, "");
+        const mapsParts = [agent.name];
+        if (k.address)
+            mapsParts.push(k.address);
+        if (cityName)
+            mapsParts.push(cityName);
+        mapsParts.push("Norge");
+        card.links = {
+            profile: `https://rettfrabonden.com/produsent/${slug}`,
+            googleMaps: `https://www.google.com/maps/search/${encodeURIComponent(mapsParts.join(", "))}`,
+            vcard: `${getBaseUrl(req)}/api/marketplace/agents/${agentId}/vcard`,
+        };
+        if (k.website)
+            card.links.website = k.website;
     }
     res.json(card);
 });
@@ -312,6 +489,38 @@ router.put("/agents/:id", (req, res) => {
         return;
     }
     res.json({ success: true, data: { id: updated.id, name: updated.name, lastSeenAt: updated.lastSeenAt } });
+});
+// ─── PATCH /agents/:id — Admin update agent fields ──────────
+// Allows admin to update description, categories, tags, etc.
+// Requires X-Admin-Key header.
+router.patch("/agents/:id", (req, res) => {
+    const expectedKey = getAdminKey();
+    if (!expectedKey) {
+        res.status(503).json({ error: "Admin not configured" });
+        return;
+    }
+    const adminKey = req.headers["x-admin-key"];
+    const apiKey = req.headers["x-api-key"];
+    const agentId = req.params.id;
+    // Accept either admin key or the agent's own API key
+    let authorized = false;
+    if (expectedKey && adminKey && adminKey === expectedKey)
+        authorized = true;
+    if (!authorized && apiKey) {
+        const agent = marketplace_registry_1.marketplaceRegistry.getAgentByApiKey(apiKey);
+        if (agent && agent.id === agentId)
+            authorized = true;
+    }
+    if (!authorized) {
+        res.status(403).json({ error: "Krever X-Admin-Key eller X-API-Key header" });
+        return;
+    }
+    const updated = marketplace_registry_1.marketplaceRegistry.updateAgent(agentId, req.body);
+    if (!updated) {
+        res.status(404).json({ error: "Agent ikke funnet" });
+        return;
+    }
+    res.json({ success: true, data: { id: updated.id, name: updated.name, description: updated.description } });
 });
 // ─── POST /agents/:id/heartbeat — Keep agent alive ───────────
 // Agents should ping this periodically so we know they're active
@@ -408,7 +617,7 @@ router.get("/knowledge/stats", (_req, res) => {
 // ═══════════════════════════════════════════════════════════════
 // ─── POST /agents/:id/claim — Request to claim an agent ─────
 router.post("/agents/:id/claim", async (req, res) => {
-    const { name, email, phone } = req.body;
+    const { name, email, phone, source } = req.body;
     const agentId = req.params.id;
     if (!name || !email) {
         res.status(400).json({ success: false, error: "Navn og e-post er påkrevd" });
@@ -424,6 +633,7 @@ router.post("/agents/:id/claim", async (req, res) => {
             claimantName: name,
             claimantEmail: email,
             claimantPhone: phone,
+            source: source || 'organic',
         });
         // Get agent name for the email
         const agents = marketplace_registry_1.marketplaceRegistry.getActiveAgents();
@@ -577,7 +787,7 @@ router.post("/agents/:id/unclaim", (req, res) => {
 });
 // ─── POST /admin/agents/:id/reset-claim — Admin: reset verified/claim status ──
 router.post("/admin/agents/:id/reset-claim", (req, res) => {
-    const expectedKey = process.env.ADMIN_KEY;
+    const expectedKey = getAdminKey();
     const agentId = req.params.id;
     if (!expectedKey) {
         res.status(503).json({ success: false, error: "Admin not configured" });
@@ -608,7 +818,7 @@ router.put("/agents/:id/knowledge", (req, res) => {
     const claimToken = req.headers["x-claim-token"] || "";
     const apiKey = req.headers["x-api-key"] || "";
     const adminKeyHeader = req.headers["x-admin-key"] || "";
-    const expectedAdminKey = process.env.ADMIN_KEY || "";
+    const expectedAdminKey = getAdminKey();
     const agentId = req.params.id;
     let authorized = false;
     let isAdmin = false;
@@ -658,12 +868,64 @@ router.put("/agents/:id/knowledge", (req, res) => {
         res.status(400).json({ success: false, error: err.message });
     }
 });
+// ─── POST /admin/register — Relaxed registration for auto-discovery ──
+// Only requires name — everything else gets sensible defaults.
+// Agents registered this way get lower trust scores until enriched,
+// because the completeness signal penalizes missing fields automatically.
+// The PUBLIC /register keeps strict requirements — producers who
+// self-register MUST provide email, URL, etc. for verification.
+router.post("/admin/register", (req, res) => {
+    const expectedKey = getAdminKey();
+    if (!expectedKey) {
+        res.status(503).json({ error: "Admin not configured" });
+        return;
+    }
+    const adminKey = req.headers["x-admin-key"];
+    if (!adminKey || adminKey !== expectedKey) {
+        res.status(403).json({ error: "Krever X-Admin-Key header" });
+        return;
+    }
+    try {
+        const registration = marketplace_1.AdminRegistrationSchema.parse(req.body);
+        // Cast needed: AdminRegistration has optional contactEmail and flexible capabilities,
+        // but after Zod parsing all defaults are filled. The DB insert handles both shapes.
+        const agent = marketplace_registry_1.marketplaceRegistry.register(registration);
+        interaction_logger_1.interactionLogger.log("register", {
+            agentId: agent.id,
+            metadata: { name: agent.name, role: agent.role, city: agent.location?.city, source: "admin" },
+            ipAddress: req.ip,
+        });
+        res.status(201).json({
+            success: true,
+            message: "Agent registrert via admin (relaxed schema)",
+            data: {
+                id: agent.id,
+                apiKey: agent.apiKey,
+                agentCardUrl: `${getBaseUrl(req)}/api/marketplace/agents/${agent.id}/card`,
+                registeredAt: agent.registeredAt,
+            },
+        });
+    }
+    catch (error) {
+        if (error.name === "ZodError") {
+            res.status(400).json({
+                success: false,
+                error: "Ugyldig registrering",
+                details: error.errors,
+            });
+        }
+        else {
+            console.error("[admin/register] Error:", error);
+            res.status(500).json({ success: false, error: error.message || "Intern feil" });
+        }
+    }
+});
 // ─── POST /admin/bulk-enrich — Batch enrich multiple agents ──
 // Accepts an array of { agentId, data } objects.
 // Uses the existing bulkEnrich method (dataSource: "auto").
 // Requires ADMIN_KEY header.
 router.post("/admin/bulk-enrich", (req, res) => {
-    const expectedKey = process.env.ADMIN_KEY;
+    const expectedKey = getAdminKey();
     if (!expectedKey) {
         res.status(503).json({ error: "Admin not configured" });
         return;
@@ -710,7 +972,7 @@ router.post("/admin/bulk-enrich", (req, res) => {
 router.delete("/agents/:id", (req, res) => {
     try {
         const adminKey = req.headers["x-admin-key"];
-        const expectedKey = process.env.ADMIN_KEY;
+        const expectedKey = getAdminKey();
         const agentId = req.params.id;
         if (!expectedKey) {
             res.status(503).json({ error: "Admin not configured" });
@@ -765,7 +1027,7 @@ router.delete("/agents/:id", (req, res) => {
 // Requires ADMIN_KEY header.
 router.post("/admin/deduplicate", (req, res) => {
     const adminKey = req.headers["x-admin-key"];
-    const expectedKey = process.env.ADMIN_KEY || "";
+    const expectedKey = getAdminKey();
     if (!adminKey || adminKey !== expectedKey) {
         res.status(403).json({ error: "Krever X-Admin-Key header" });
         return;
@@ -856,7 +1118,7 @@ router.get("/agents/:id/trust", (req, res) => {
 // Run after deploy or periodically to ensure scores reflect
 // current data. Requires ADMIN_KEY header.
 router.post("/admin/recalculate-trust", (req, res) => {
-    const expectedKey = process.env.ADMIN_KEY;
+    const expectedKey = getAdminKey();
     if (!expectedKey) {
         res.status(503).json({ error: "Admin not configured" });
         return;
@@ -1016,6 +1278,124 @@ router.get("/find-match", (req, res) => {
 //  the dedup guard is applied in the selger.html frontend by
 //  calling /find-match first. Backend guard is a safety net.)
 // ─── Helper ──────────────────────────────────────────────────
+// ─── GET /admin/claims — Campaign tracking overview ───────────
+// Shows all claims grouped by source, so you can track which
+// outreach campaigns are converting.
+router.get("/admin/claims", (req, res) => {
+    const expectedKey = getAdminKey();
+    if (!expectedKey) {
+        res.status(503).json({ error: "Admin not configured" });
+        return;
+    }
+    const adminKey = req.headers["x-admin-key"] || req.query.key;
+    if (!adminKey || adminKey !== expectedKey) {
+        res.status(403).json({ error: "Krever admin-nøkkel" });
+        return;
+    }
+    const db = (0, init_1.getDb)();
+    // All claims with source info
+    const claims = db.prepare(`
+    SELECT ac.id, ac.agent_id, ac.claimant_name, ac.claimant_email, ac.status,
+           ac.source, ac.created_at, ac.verified_at, a.name as agent_name
+    FROM agent_claims ac
+    LEFT JOIN agents a ON a.id = ac.agent_id
+    ORDER BY ac.created_at DESC
+  `).all();
+    // Summary by source
+    const byCampaign = db.prepare(`
+    SELECT source, status, COUNT(*) as count
+    FROM agent_claims
+    GROUP BY source, status
+    ORDER BY source, status
+  `).all();
+    res.json({
+        success: true,
+        data: {
+            claims,
+            byCampaign,
+            total: claims.length,
+            verified: claims.filter((c) => c.status === 'verified').length,
+        }
+    });
+});
+// ═══════════════════════════════════════════════════════════════
+// INBOUND EMAIL WEBHOOK
+// Resend sends a POST here when someone emails *@rettfrabonden.com
+// We forward it to the admin's Gmail so nothing gets lost.
+// ═══════════════════════════════════════════════════════════════
+router.post("/webhooks/inbound-email", async (req, res) => {
+    try {
+        const payload = req.body;
+        // Log full payload to debug Resend's format
+        console.log(`[Inbound] Raw payload: ${JSON.stringify(payload).substring(0, 2000)}`);
+        // Resend wraps inbound data in { type, created_at, data: { ... } }
+        const data = payload.data || payload; // fallback for direct test calls
+        const from = data.from || payload.from || "unknown";
+        const to = data.to || payload.to || [];
+        const subject = data.subject || payload.subject || "(ingen emne)";
+        const emailId = data.email_id || payload.email_id;
+        console.log(`[Inbound] Event: ${payload.type || "unknown"}, email_id: ${emailId}, from: ${from}, subject: "${subject}"`);
+        // Resend inbound webhooks don't include body — fetch it via API
+        let html = "";
+        let text = "";
+        const resendKey = process.env.RESEND_API_KEY;
+        if (emailId && resendKey) {
+            try {
+                const emailRes = await fetch(`https://api.resend.com/emails/receiving/${emailId}`, {
+                    headers: { Authorization: `Bearer ${resendKey}` },
+                });
+                if (emailRes.ok) {
+                    const emailData = await emailRes.json();
+                    html = emailData.html || "";
+                    text = emailData.text || "";
+                    console.log(`[Inbound] Fetched body for ${emailId} (${html.length} chars HTML, ${text.length} chars text)`);
+                }
+                else {
+                    console.warn(`[Inbound] Could not fetch email body: ${emailRes.status} ${emailRes.statusText}`);
+                }
+            }
+            catch (fetchErr) {
+                console.warn(`[Inbound] Error fetching email body:`, fetchErr);
+            }
+        }
+        else if (!resendKey) {
+            console.warn(`[Inbound] RESEND_API_KEY not set — cannot fetch email body`);
+        }
+        // Extract sender email for reply-to (format: "Name <email@domain.com>")
+        const senderEmail = typeof from === "string"
+            ? (from.match(/<([^>]+)>/)?.[1] || from)
+            : undefined;
+        // Forward to admin Gmail
+        const forwardTo = process.env.ADMIN_EMAIL || "da.fredriksen@gmail.com";
+        const bodyHtml = html || (text ? `<pre>${text}</pre>` : `<p><em>Ingen innhold i eposten.</em></p>`);
+        const bodyText = text || "(ingen tekstinnhold)";
+        const forwarded = await email_service_1.emailService.sendEmail({
+            to: forwardTo,
+            subject: `[Innkommende] ${subject} (fra ${from})`,
+            htmlContent: `
+        <div style="border-bottom:1px solid #ccc;padding-bottom:8px;margin-bottom:16px;color:#666;font-size:13px;">
+          <strong>Fra:</strong> ${from}<br>
+          <strong>Til:</strong> ${Array.isArray(to) ? to.join(", ") : to}<br>
+          <strong>Emne:</strong> ${subject}
+        </div>
+        ${bodyHtml}
+      `,
+            textContent: `Videresent fra: ${from}\nTil: ${Array.isArray(to) ? to.join(", ") : to}\nEmne: ${subject}\n\n${bodyText}`,
+            replyTo: senderEmail,
+        });
+        if (forwarded) {
+            console.log(`[Inbound] Forwarded to ${forwardTo}`);
+        }
+        else {
+            console.warn(`[Inbound] Forward failed — email service not configured or send failed`);
+        }
+        res.status(200).json({ received: true });
+    }
+    catch (err) {
+        console.error("[Inbound] Webhook error:", err);
+        res.status(200).json({ received: true }); // Always 200 so Resend doesn't retry
+    }
+});
 function getBaseUrl(req) {
     return process.env.BASE_URL || `${req.protocol}://${req.get("host")}`;
 }

@@ -76,10 +76,10 @@ function sanitizeInput(req, _res, next) {
 // validation — Fly's edge proxy is trusted infrastructure.
 const sharedValidate = { trustProxy: false };
 // ─── Rate Limiters ───────────────────────────────────────────
-// General API limiter
+// General API limiter — raised to 300/15min for enrichment runs (200 agents × ~2 req each)
 exports.generalLimiter = (0, express_rate_limit_1.default)({
     windowMs: 15 * 60 * 1000, // 15 minutes
-    max: 100,
+    max: 300,
     standardHeaders: true,
     legacyHeaders: false,
     validate: sharedValidate,
@@ -116,10 +116,10 @@ exports.searchLimiter = (0, express_rate_limit_1.default)({
 // Fix #6: Strict rate limiter for destructive admin endpoints
 exports.adminLimiter = (0, express_rate_limit_1.default)({
     windowMs: 60 * 60 * 1000, // 1 hour
-    max: 10,
+    max: 500, // Raised from 100 — admin endpoints require X-Admin-Key anyway, need room for 200-agent enrichment runs
     standardHeaders: true,
     legacyHeaders: false,
     validate: sharedValidate,
-    message: { success: false, error: "Admin rate limit nådd. Maks 10 admin-operasjoner per time." },
+    message: { success: false, error: "Admin rate limit nådd. Maks 100 admin-operasjoner per time." },
 });
 //# sourceMappingURL=security.js.map

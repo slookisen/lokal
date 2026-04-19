@@ -16,7 +16,7 @@ export declare class AnalyticsService {
     /**
      * Track page view for human visitors
      */
-    trackPageView(req: Request): void;
+    trackPageView(req: Request, isOwner?: boolean): void;
     /**
      * Track search queries (both human and AI)
      * Call from /api/marketplace/search and similar endpoints
@@ -27,7 +27,7 @@ export declare class AnalyticsService {
         city?: string;
         resultCount?: number;
         agentId?: string;
-    }): void;
+    }, isOwner?: boolean): void;
     /**
      * Track when a producer/agent profile is viewed
      * Call from SEO routes when /produsent/:id is loaded
@@ -38,8 +38,13 @@ export declare class AnalyticsService {
      * For A2A and MCP protocol tracking
      */
     trackAPIUsage(req: Request, protocol: "a2a" | "mcp" | "api", duration: number, metadata?: Record<string, any>): void;
+    _summaryCache: Map<number, {
+        data: any;
+        time: number;
+    }>;
+    private static SUMMARY_CACHE_TTL;
     /**
-     * Get analytics summary for a time range
+     * Get analytics summary for a time range (cached 2 min)
      */
     getSummary(hoursBack?: number): {
         pageViews: number;
@@ -55,6 +60,10 @@ export declare class AnalyticsService {
             chatgpt: number;
             claude: number;
             other: number;
+        };
+        ownerStats: {
+            pageViews: number;
+            queries: number;
         };
     };
     /**

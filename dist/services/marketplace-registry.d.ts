@@ -1,8 +1,21 @@
 import { AgentRegistration, RegisteredAgent, DiscoveryQuery, DiscoveryResult } from "../models/marketplace";
 declare class MarketplaceRegistry {
+    _agentsCache: RegisteredAgent[] | null;
+    _agentsCacheTime: number;
+    _statsCache: {
+        totalAgents: number;
+        activeProducers: number;
+        cities: string[];
+        totalListings: number;
+    } | null;
+    _statsCacheTime: number;
+    private static CACHE_TTL;
+    private invalidateCache;
     register(registration: AgentRegistration): RegisteredAgent;
     discover(query: DiscoveryQuery): DiscoveryResult[];
-    parseNaturalQuery(query: string): Partial<DiscoveryQuery>;
+    parseNaturalQuery(query: string): Partial<DiscoveryQuery> & {
+        _productTerms?: string[];
+    };
     getAgentCard(agentId: string): object | null;
     getRegistryCard(baseUrl: string): object;
     getAgent(id: string): RegisteredAgent | undefined;

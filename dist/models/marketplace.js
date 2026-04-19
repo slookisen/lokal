@@ -1,6 +1,6 @@
 "use strict";
 Object.defineProperty(exports, "__esModule", { value: true });
-exports.DiscoveryQuerySchema = exports.RegisteredAgentSchema = exports.AgentRegistrationSchema = void 0;
+exports.DiscoveryQuerySchema = exports.RegisteredAgentSchema = exports.AdminRegistrationSchema = exports.AgentRegistrationSchema = void 0;
 const zod_1 = require("zod");
 // ─── Agent Marketplace Models ─────────────────────────────────
 // These models power Lokal as a REGISTRY — the discovery layer
@@ -55,6 +55,49 @@ exports.AgentRegistrationSchema = zod_1.z.object({
     categories: zod_1.z.array(zod_1.z.string()).default([]), // ["vegetables", "fruit", "dairy"]
     tags: zod_1.z.array(zod_1.z.string()).default([]), // ["organic", "seasonal", "budget"]
     languages: zod_1.z.array(zod_1.z.string()).default(["no"]), // ISO 639-1
+});
+// ─── Admin Agent Registration (relaxed) ──────────────────────
+// Used by auto-discovery pipeline via POST /admin/register with X-Admin-Key.
+// Only requires name — everything else has sensible defaults.
+// Agents registered this way get lower trust scores until enriched,
+// because the completeness signal in trust-score-service penalizes
+// missing fields automatically.
+//
+// The PUBLIC /register keeps strict requirements above — producers
+// who self-register MUST provide email, URL, etc. for verification.
+exports.AdminRegistrationSchema = zod_1.z.object({
+    name: zod_1.z.string().min(1),
+    description: zod_1.z.string().default(""),
+    provider: zod_1.z.string().default("auto-discovery"),
+    contactEmail: zod_1.z.string().default(""),
+    url: zod_1.z.string().default("https://rettfrabonden.com"),
+    version: zod_1.z.string().default("1.0.0"),
+    capabilities: zod_1.z.record(zod_1.z.string(), zod_1.z.any()).default({}),
+    skills: zod_1.z.array(zod_1.z.object({
+        id: zod_1.z.string().default("default"),
+        name: zod_1.z.string().default("Lokal matprodusent"),
+        description: zod_1.z.string().default("Selger lokalprodusert mat"),
+        tags: zod_1.z.array(zod_1.z.string()).default([]),
+        inputModes: zod_1.z.array(zod_1.z.string()).default(["application/json"]),
+        outputModes: zod_1.z.array(zod_1.z.string()).default(["application/json"]),
+    })).default([{
+            id: "default",
+            name: "Lokal matprodusent",
+            description: "Selger lokalprodusert mat",
+            tags: [],
+            inputModes: ["application/json"],
+            outputModes: ["application/json"],
+        }]),
+    role: zod_1.z.enum(["producer", "consumer", "logistics", "quality", "price-intel"]).default("producer"),
+    location: zod_1.z.object({
+        lat: zod_1.z.number().min(-90).max(90),
+        lng: zod_1.z.number().min(-180).max(180),
+        city: zod_1.z.string(),
+        radiusKm: zod_1.z.number().optional(),
+    }).optional(),
+    categories: zod_1.z.array(zod_1.z.string()).default([]),
+    tags: zod_1.z.array(zod_1.z.string()).default([]),
+    languages: zod_1.z.array(zod_1.z.string()).default(["no"]),
 });
 // ─── Registered Agent (stored in registry) ────────────────────
 exports.RegisteredAgentSchema = exports.AgentRegistrationSchema.extend({

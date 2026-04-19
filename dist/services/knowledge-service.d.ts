@@ -18,11 +18,19 @@ export interface AgentKnowledge {
     externalReviews: ExternalReview[];
     externalLinks: ExternalLink[];
     images: string[];
+    seasonality: SeasonalProduct[];
+    deliveryRadius?: number;
+    minOrderValue?: number;
     dataSource: "auto" | "owner" | "hybrid";
     autoSources: string[];
     lastEnrichedAt?: string;
     ownerUpdatedAt?: string;
     preferences: Record<string, any>;
+}
+export interface SeasonalProduct {
+    product: string;
+    months: number[];
+    note?: string;
 }
 export interface OpeningHour {
     day: string;
@@ -58,6 +66,7 @@ export interface AgentInfoResponse {
         trustScore: number;
         isVerified: boolean;
         isClaimed: boolean;
+        languages: string[];
     };
     knowledge: {
         address?: string;
@@ -68,10 +77,15 @@ export interface AgentInfoResponse {
         openingHours: OpeningHour[];
         products: ProductInfo[];
         about?: string;
+        description?: string;
         specialties: string[];
         certifications: string[];
         paymentMethods: string[];
         deliveryOptions: string[];
+        images: string[];
+        seasonality: SeasonalProduct[];
+        deliveryRadius?: number;
+        minOrderValue?: number;
         ratings?: {
             google?: {
                 score: number;
@@ -103,6 +117,7 @@ declare class KnowledgeService {
         claimantName: string;
         claimantEmail: string;
         claimantPhone?: string;
+        source?: string;
     }): {
         claimId: string;
         verificationCode: string;

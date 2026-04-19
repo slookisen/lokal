@@ -10,6 +10,7 @@
  *   GET /sok?q=...            → Search results page
  *   GET /:city                → City page with all producers in that city
  *   GET /produsent/:slug      → Individual producer profile page
+ *   GET /personvern            → Privacy policy (GDPR)
  *   GET /sitemap.xml          → Dynamic sitemap for Google
  *   GET /robots.txt           → Crawl instructions
  */

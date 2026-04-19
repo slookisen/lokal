@@ -11,6 +11,7 @@
  *   GET /sok?q=...            → Search results page
  *   GET /:city                → City page with all producers in that city
  *   GET /produsent/:slug      → Individual producer profile page
+ *   GET /personvern            → Privacy policy (GDPR)
  *   GET /sitemap.xml          → Dynamic sitemap for Google
  *   GET /robots.txt           → Crawl instructions
  */
@@ -18,7 +19,10 @@ Object.defineProperty(exports, "__esModule", { value: true });
 const express_1 = require("express");
 const marketplace_registry_1 = require("../services/marketplace-registry");
 const knowledge_service_1 = require("../services/knowledge-service");
+const geocoding_service_1 = require("../services/geocoding-service");
 const analytics_service_1 = require("../services/analytics-service");
+const marketplace_1 = require("../models/marketplace");
+const init_1 = require("../database/init");
 const router = (0, express_1.Router)();
 // ─── Helpers ────────────────────────────────────────────────
 function slugify(text) {
@@ -28,7 +32,9 @@ function slugify(text) {
         .replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "");
 }
 function escapeHtml(text) {
-    return text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
+    if (!text)
+        return "";
+    return String(text).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
         .replace(/"/g, "&quot;").replace(/'/g, "&#39;");
 }
 const BASE_URL = process.env.BASE_URL || "https://rettfrabonden.com";
@@ -210,7 +216,7 @@ function shell(title, description, content, extra) {
       </div>
       <div class="ft-col">
         <h4>Plattformen</h4>
-        <a href="/sok">S\u00f8k produsenter</a><a href="/teknologi">Hvordan det fungerer</a><a href="/om">Om Rett fra Bonden</a>
+        <a href="/sok">S\u00f8k produsenter</a><a href="/teknologi">Hvordan det fungerer</a><a href="/om">Om Rett fra Bonden</a><a href="/personvern">Personvern</a>
       </div>
       <div class="ft-col">
         <h4>For produsenter</h4>
@@ -227,8 +233,12 @@ function shell(title, description, content, extra) {
 </html>`;
 }
 // ─── Producer card HTML (reused across pages) ───────────────
-function producerCard(a) {
+function producerCard(a, matchReasons) {
     const city = a.city || a.location?.city || "";
+    const distKm = a.location?.distanceKm;
+    const cityText = distKm != null
+        ? `${escapeHtml(city)} &middot; ${distKm < 1 ? (distKm * 1000).toFixed(0) + " m" : distKm.toFixed(1) + " km"}`
+        : escapeHtml(city);
     const slug = slugify(a.name);
     const cats = (a.categories || []).slice(0, 3).map((c) => `<span class="tag">${catEmoji(c)} ${escapeHtml(formatCat(c))}</span>`).join("");
     const trustPct = Math.round((a.trustScore || 0) * 100);
@@ -238,7 +248,7 @@ function producerCard(a) {
     <div class="pc-top">
       <div>
         <div class="pc-name">${escapeHtml(a.name)}</div>
-        <div class="pc-city">${escapeHtml(city)}</div>
+        <div class="pc-city">${cityText}</div>
       </div>
       ${verified}
     </div>
@@ -250,6 +260,75 @@ function producerCard(a) {
     </div>
   </a>`;
 }
+// ─── Traffic stats helper ───────────────────────────────────────
+function sqlDate(date) {
+    return date.toISOString().replace("T", " ").replace(/\.\d{3}Z$/, "");
+}
+// Bot detection patterns (same as analytics.ts traffic-classification)
+const BOT_PATTERNS = ['bot', 'Bot', 'spider', 'crawl', 'serpstat', 'GPTBot', 'ClaudeBot', 'Chiark', 'Go-http-client', 'Dataprovider', 'NotHumanSearch', 'DuckDuck', 'Googlebot', 'GoogleOther', 'Bytespider', 'Applebot', 'YandexBot', 'BingPreview', 'facebookexternal', 'Twitterbot'];
+const DEV_PATTERNS = ['curl/', 'Python/', 'aiohttp', 'Lokal/', 'Lokal-Enricher', 'Claude-User', 'Python-urllib', 'node-fetch', 'axios/'];
+let _trafficCache = null;
+let _trafficCacheTime = 0;
+const TRAFFIC_CACHE_TTL = 120_000; // 2 minutes
+function getTrafficStats() {
+    const now = Date.now();
+    if (_trafficCache && (now - _trafficCacheTime) < TRAFFIC_CACHE_TTL) {
+        return _trafficCache;
+    }
+    try {
+        const db = (0, init_1.getDb)();
+        const notOwner = "(is_owner IS NULL OR is_owner = 0)";
+        // Total page views (excluding owner)
+        const pageViews = db.prepare(`SELECT COUNT(*) as n FROM analytics_page_views WHERE ${notOwner}`).get()?.n ?? 0;
+        // Session-based classification: group by session_id, check UA for bots
+        const sessions = db.prepare(`
+      SELECT session_id, COUNT(*) as views
+      FROM analytics_page_views
+      WHERE ${notOwner}
+      GROUP BY session_id
+    `).all();
+        let realHumans = 0;
+        let botViews = 0;
+        for (const s of sessions) {
+            const ua = s.session_id.includes(':') ? s.session_id.split(':').slice(1).join(':') : '';
+            const isBot = BOT_PATTERNS.some(p => ua.includes(p));
+            const isDev = DEV_PATTERNS.some(p => ua.includes(p));
+            if (isBot || isDev) {
+                botViews += s.views;
+            }
+            else {
+                realHumans += s.views;
+            }
+        }
+        // AI queries from analytics_queries
+        const aiQueries = db.prepare(`SELECT COUNT(*) as n FROM analytics_queries WHERE ${notOwner}`).get()?.n ?? 0;
+        _trafficCache = {
+            pageViews,
+            uniqueVisitors: sessions.length,
+            realHumans,
+            botAndAi: botViews + aiQueries,
+            aiQueries,
+        };
+        _trafficCacheTime = Date.now();
+        return _trafficCache;
+    }
+    catch {
+        return { pageViews: 0, uniqueVisitors: 0, realHumans: 0, botAndAi: 0, aiQueries: 0 };
+    }
+}
+// ═══════════════════════════════════════════════════════════════
+// GET /api/traffic-stats — Public traffic stats
+// ═══════════════════════════════════════════════════════════════
+router.get("/api/traffic-stats", (_req, res) => {
+    const s = getTrafficStats();
+    res.json({
+        pageViews: s.pageViews,
+        uniqueVisitors: s.uniqueVisitors,
+        realHumans: s.realHumans,
+        botAndAi: s.botAndAi,
+        aiQueries: s.aiQueries,
+    });
+});
 // ═══════════════════════════════════════════════════════════════
 // GET / — Landing page
 // ═══════════════════════════════════════════════════════════════
@@ -296,6 +375,18 @@ const LANDING_CSS = `
   .how-num { width: 44px; height: 44px; border-radius: 50%; background: var(--green-700); color: var(--white); display: flex; align-items: center; justify-content: center; font-weight: 800; font-size: 1rem; margin: 0 auto 14px; }
   .how-step h3 { font-size: 1rem; font-weight: 700; margin-bottom: 6px; }
   .how-step p { font-size: 0.85rem; color: var(--g500); line-height: 1.5; }
+  .proof-bar { background: var(--white); border-top: 1px solid var(--g100); border-bottom: 1px solid var(--g100); padding: 18px 24px; }
+  .proof-inner { max-width: 900px; margin: 0 auto; display: flex; justify-content: center; align-items: center; gap: 32px; flex-wrap: wrap; }
+  .proof-item { text-align: center; }
+  .proof-val { font-size: 1.3rem; font-weight: 800; color: var(--green-700); letter-spacing: -0.5px; line-height: 1; }
+  .proof-val-purple { color: #7c3aed; }
+  .proof-lbl { font-size: 0.68rem; color: var(--g500); margin-top: 3px; font-weight: 500; text-transform: uppercase; letter-spacing: 0.5px; }
+  .proof-sep { width: 1px; height: 28px; background: var(--g200); }
+  @media (max-width: 600px) {
+    .proof-inner { gap: 18px; }
+    .proof-val { font-size: 1.1rem; }
+    .proof-sep { display: none; }
+  }
   .seller-cta { padding: 72px 32px; background: linear-gradient(135deg, var(--green-700) 0%, var(--green-900) 100%); color: var(--white); text-align: center; }
   .seller-cta h2 { font-size: 2rem; font-weight: 800; margin-bottom: 10px; }
   .seller-cta p { font-size: 1rem; opacity: 0.85; margin-bottom: 28px; max-width: 500px; margin-left: auto; margin-right: auto; }
@@ -329,6 +420,7 @@ router.get("/", (_req, res) => {
         const stats = marketplace_registry_1.marketplaceRegistry.getStats();
         const agents = marketplace_registry_1.marketplaceRegistry.getActiveAgents();
         const totalAgents = stats.totalAgents || agents.length;
+        const traffic = getTrafficStats();
         // City counts
         const cityCounts = {};
         const categoryCounts = {};
@@ -406,6 +498,30 @@ router.get("/", (_req, res) => {
         </div>
       </div>
     </section>
+
+    <div class="proof-bar">
+      <div class="proof-inner">
+        <div class="proof-item">
+          <div class="proof-val">${traffic.pageViews.toLocaleString("nb-NO")}</div>
+          <div class="proof-lbl">Sidevisninger</div>
+        </div>
+        <div class="proof-sep"></div>
+        <div class="proof-item">
+          <div class="proof-val">${traffic.uniqueVisitors.toLocaleString("nb-NO")}</div>
+          <div class="proof-lbl">Unike bes\u00f8kende</div>
+        </div>
+        <div class="proof-sep"></div>
+        <div class="proof-item">
+          <div class="proof-val">${traffic.realHumans.toLocaleString("nb-NO")}</div>
+          <div class="proof-lbl">Ekte mennesker</div>
+        </div>
+        <div class="proof-sep"></div>
+        <div class="proof-item">
+          <div class="proof-val proof-val-purple">${traffic.botAndAi.toLocaleString("nb-NO")}</div>
+          <div class="proof-lbl">Bot &amp; AI-trafikk</div>
+        </div>
+      </div>
+    </div>
 
     <section class="cats-section">
       <div class="sh" style="max-width:1100px;margin:0 auto 28px;">
@@ -487,7 +603,7 @@ const SEARCH_CSS = `
   .results-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 16px; }
   @media (max-width: 768px) { .results-grid { grid-template-columns: 1fr; } }
 `;
-router.get("/sok", (req, res) => {
+router.get("/sok", async (req, res) => {
     const q = req.query.q;
     if (!q) {
         res.redirect("/");
@@ -495,8 +611,55 @@ router.get("/sok", (req, res) => {
     }
     try {
         const parsed = marketplace_registry_1.marketplaceRegistry.parseNaturalQuery(q);
-        const results = marketplace_registry_1.marketplaceRegistry.discover({ ...parsed, limit: 30, offset: 0 });
-        const resultCards = results.map((r) => producerCard(r.agent)).join("");
+        const heleNorge = req.query.heleNorge === "true";
+        // Geocode location from query text (e.g. "honning bergen" → Bergen coords)
+        if (!heleNorge && !parsed.location) {
+            const frontendLat = parseFloat(req.query.lat);
+            const frontendLng = parseFloat(req.query.lng);
+            if (!isNaN(frontendLat) && !isNaN(frontendLng)) {
+                parsed.location = { lat: frontendLat, lng: frontendLng };
+                parsed.maxDistanceKm = parseFloat(req.query.radius) || 30;
+            }
+            else {
+                const geoResult = await geocoding_service_1.geocodingService.extractAndGeocode(q);
+                if (geoResult) {
+                    parsed.location = { lat: geoResult.lat, lng: geoResult.lng };
+                    parsed.maxDistanceKm = geoResult.radiusKm;
+                }
+            }
+        }
+        // Preserve product terms through Zod parsing
+        const productTerms = parsed._productTerms;
+        const query = marketplace_1.DiscoveryQuerySchema.parse({ ...parsed, limit: 30, offset: 0 });
+        if (productTerms)
+            query._productTerms = productTerms;
+        let results = marketplace_registry_1.marketplaceRegistry.discover(query);
+        // Auto-expanding radius if too few results
+        const MIN_RESULTS = 3;
+        if (parsed.location && results.length < MIN_RESULTS && !heleNorge) {
+            for (const radius of [50, 100, 200]) {
+                if (results.length >= MIN_RESULTS)
+                    break;
+                const expanded = marketplace_1.DiscoveryQuerySchema.parse({ ...parsed, maxDistanceKm: radius, limit: 30, offset: 0 });
+                if (productTerms)
+                    expanded._productTerms = productTerms;
+                results = marketplace_registry_1.marketplaceRegistry.discover(expanded);
+            }
+            if (results.length < MIN_RESULTS) {
+                const noGeo = marketplace_1.DiscoveryQuerySchema.parse({ ...parsed, location: undefined, maxDistanceKm: undefined, limit: 30, offset: 0 });
+                if (productTerms)
+                    noGeo._productTerms = productTerms;
+                results = marketplace_registry_1.marketplaceRegistry.discover(noGeo);
+            }
+        }
+        const geoFiltered = !!parsed.location && !heleNorge;
+        const resultCards = results.map((r) => producerCard(r.agent, r.matchReasons)).join("");
+        const heleNorgeLink = geoFiltered
+            ? `<a href="/sok?q=${encodeURIComponent(q)}&heleNorge=true" style="display:inline-block;margin-top:12px;padding:7px 18px;background:var(--green-100,#e8f0e0);color:var(--green-700,#2D5016);border:1.5px solid var(--green-700,#2D5016);border-radius:8px;text-decoration:none;font-weight:600;font-size:0.85rem;">&#127758; Vis hele Norge</a>`
+            : "";
+        const geoNote = geoFiltered
+            ? `<p style="color:var(--g500,#666);font-size:0.85rem;margin-top:8px;">Resultater filtrert etter sted. ${heleNorgeLink}</p>`
+            : "";
         const content = `
     <section class="search-hero">
       <div class="container">
@@ -504,8 +667,10 @@ router.get("/sok", (req, res) => {
         <h1>S\u00f8keresultater for \u201c${escapeHtml(q)}\u201d \u2014 ${results.length} treff</h1>
         <form class="search-form" action="/sok" method="GET">
           <input type="text" name="q" value="${escapeHtml(q)}" aria-label="S\u00f8k">
+          <button type="button" id="geoBtn" style="padding:12px 16px;background:var(--green-100,#e8f0e0);color:var(--green-700,#2D5016);border:2px solid var(--green-700,#2D5016);border-left:none;font-weight:700;font-size:0.85rem;cursor:pointer;white-space:nowrap;">&#128205; N\u00e6r meg</button>
           <button type="submit">S\u00f8k</button>
         </form>
+        ${geoNote}
       </div>
     </section>
     <section class="sec">
@@ -515,7 +680,26 @@ router.get("/sok", (req, res) => {
             <p style="font-size:1.1rem;">Ingen resultater for \u201c${escapeHtml(q)}\u201d</p>
             <p style="margin-top:8px;"><a href="/">Pr\u00f8v et annet s\u00f8k</a></p>
           </div>`}
-    </section>`;
+    </section>
+    <script>
+    (function() {
+      var geoBtn = document.getElementById('geoBtn');
+      if (!geoBtn || !navigator.geolocation) { if(geoBtn) geoBtn.style.display='none'; return; }
+      geoBtn.addEventListener('click', function() {
+        geoBtn.textContent = '\u23F3 Henter...';
+        geoBtn.disabled = true;
+        navigator.geolocation.getCurrentPosition(function(pos) {
+          var form = geoBtn.closest('form');
+          var q = form.querySelector('input[name=q]').value;
+          window.location.href = '/sok?q=' + encodeURIComponent(q) + '&lat=' + pos.coords.latitude + '&lng=' + pos.coords.longitude + '&radius=30';
+        }, function() {
+          geoBtn.textContent = '\\u274C Avsl\u00e5tt';
+          geoBtn.disabled = false;
+          setTimeout(function() { geoBtn.innerHTML = '&#128205; N\u00e6r meg'; }, 2000);
+        }, { enableHighAccuracy: false, timeout: 8000 });
+      });
+    })();
+    </script>`;
         res.send(shell(`${q} \u2014 S\u00f8k i Rett fra Bonden`, `S\u00f8keresultater for \u201c${q}\u201d \u2014 finn lokale matprodusenter i Norge.`, content, { canonical: `${BASE_URL}/sok?q=${encodeURIComponent(q)}`, extraCss: SEARCH_CSS }));
     }
     catch (err) {
@@ -710,6 +894,155 @@ router.get("/teknologi", (_req, res) => {
     res.send(shell("Slik fungerer AI-s\u00f8k \u2014 Rett fra Bonden", "Rett fra Bonden bruker A2A, MCP og Schema.org for \u00e5 gj\u00f8re lokale matprodusenter synlige for AI-assistenter.", content, { canonical: `${BASE_URL}/teknologi`, extraCss: TECH_CSS }));
 });
 // ═══════════════════════════════════════════════════════════════
+// GET /personvern — Privacy policy (GDPR-compliant, factual)
+// ═══════════════════════════════════════════════════════════════
+const PERSONVERN_CSS = `
+  .pv-hero { background: linear-gradient(135deg, #f8f9fa 0%, #f0f4f3 100%); padding: 64px 24px 48px; text-align: center; }
+  .pv-hero h1 { font-size: 2.2rem; font-weight: 800; color: var(--charcoal); letter-spacing: -1px; margin-bottom: 12px; }
+  .pv-hero p { font-size: 1.05rem; color: var(--g500); max-width: 600px; margin: 0 auto; line-height: 1.7; }
+  .pv-sec { max-width: 760px; margin: 0 auto; padding: 48px 24px; }
+  .pv-sec h2 { font-size: 1.4rem; font-weight: 800; color: var(--charcoal); margin-top: 36px; margin-bottom: 12px; }
+  .pv-sec h3 { font-size: 1.1rem; font-weight: 700; color: var(--charcoal); margin-top: 24px; margin-bottom: 8px; }
+  .pv-sec p { font-size: 0.95rem; color: var(--g700); line-height: 1.8; margin-bottom: 12px; }
+  .pv-sec ul { margin: 8px 0 16px 20px; }
+  .pv-sec li { font-size: 0.95rem; color: var(--g700); line-height: 1.7; margin-bottom: 4px; }
+  .pv-table { width: 100%; border-collapse: collapse; margin: 16px 0 24px; font-size: 0.9rem; }
+  .pv-table th { text-align: left; padding: 10px 12px; background: var(--green-50); border-bottom: 2px solid var(--g200); font-weight: 700; color: var(--charcoal); }
+  .pv-table td { padding: 10px 12px; border-bottom: 1px solid var(--g100); color: var(--g700); }
+  .pv-updated { font-size: 0.85rem; color: var(--g400); margin-top: 48px; padding-top: 16px; border-top: 1px solid var(--g100); }
+  @media (max-width: 768px) {
+    .pv-hero h1 { font-size: 1.6rem; }
+    .pv-table { font-size: 0.8rem; }
+    .pv-table th, .pv-table td { padding: 8px 6px; }
+  }
+`;
+router.get("/personvern", (_req, res) => {
+    const content = `
+  <section class="pv-hero">
+    <h1>Personvern</h1>
+    <p>Hvordan Rett fra Bonden behandler data \u2014 ærlig og uten fyllord.</p>
+  </section>
+
+  <section class="pv-sec">
+    <h2>Hvem vi er</h2>
+    <p>Rett fra Bonden er en åpen katalog over lokale matprodusenter i Norge, tilgjengelig på rettfrabonden.com. Tjenesten drives som et uavhengig prosjekt. Kontakt: kontakt@rettfrabonden.com.</p>
+
+    <h2>Hva vi samler inn</h2>
+    <p>Vi samler inn forskjellige typer data avhengig av hvordan du bruker tjenesten. Her er en fullstendig oversikt:</p>
+
+    <h3>Besøkende på nettsiden (alle)</h3>
+    <p>Når du besøker rettfrabonden.com registrerer vi:</p>
+    <ul>
+      <li>Hvilken side du besøker (URL-sti)</li>
+      <li>Referanse-URL (hvor du kom fra)</li>
+      <li>En anonymisert hash av IP-adresse og nettleser-type (SHA-256, forkortet \u2014 vi lagrer ikke fullstendig IP-adresse eller nettleser-streng)</li>
+      <li>Tidspunkt for besøket</li>
+    </ul>
+    <p>Vi bruker ingen informasjonskapsler (cookies). Vi bruker ingen tredjepartsanalyseverktøy som Google Analytics. All analyse skjer i vår egen database.</p>
+
+    <h3>Søk og AI-spørringer</h3>
+    <p>Når du søker etter produsenter \u2014 enten via nettsiden, ChatGPT, Claude MCP eller API-et \u2014 lagrer vi:</p>
+    <ul>
+      <li>Søketeksten du skrev</li>
+      <li>Valgt kategori og by</li>
+      <li>Antall resultater returnert</li>
+      <li>Hvilken protokoll som ble brukt (API, MCP, A2A)</li>
+      <li>Anonymisert IP-hash (samme metode som for sidebesøk)</li>
+    </ul>
+    <p>Vi lagrer dette for å forstå hvilke søk som gir gode resultater, og for å forbedre tjenesten.</p>
+
+    <h3>Selgere som registrerer seg (claim)</h3>
+    <p>Når du som matprodusent registrerer deg for å administrere din profil, samler vi inn:</p>
+    <ul>
+      <li>Navn, e-postadresse og eventuelt telefonnummer</li>
+      <li>En 6-sifret verifiseringskode sendt til din e-post</li>
+      <li>Claim-token (kryptografisk nøkkel for pålogging, utløper etter 30 dager)</li>
+    </ul>
+    <p>Etter verifisering kan du selv legge inn og redigere: adresse, åpningstider, produkter, sertifiseringer, beskrivelse, bilder og kontaktinfo. Alt du legger inn er synlig på din offentlige profilside.</p>
+
+    <h3>Innlogging</h3>
+    <p>Vi bruker ikke passord. Innlogging skjer via magisk lenke sendt til din e-post. Lenken er gyldig i 15 minutter og kan bare brukes én gang. Vi lagrer ikke passord fordi vi ikke har noen.</p>
+
+    <h3>Bilder</h3>
+    <p>Selgere kan laste opp profilbilder og produktbilder. Disse lagres på serveren. Hvis bildeskanning er aktivert, kan bildet sendes til en ekstern AI-tjeneste (Anthropic Claude eller OpenAI) for automatisk produktgjenkjenning.</p>
+
+    <h3>Samtaler mellom agenter</h3>
+    <p>Rett fra Bonden støtter A2A-protokollen (agent-til-agent). Når en AI-agent kontakter en produsent-agent, lagres samtaletekst, status og eventuell transaksjonsinfo i databasen.</p>
+
+    <h2>Hva vi ikke samler inn</h2>
+    <ul>
+      <li>Vi bruker ingen informasjonskapsler (cookies)</li>
+      <li>Vi har ingen tredjepartssporing (ingen Google Analytics, Facebook Pixel, etc.)</li>
+      <li>Vi lagrer ikke fullstendige IP-adresser \u2014 kun en forkortet hash</li>
+      <li>Vi lagrer ikke passord (passwordless innlogging)</li>
+      <li>Vi samler ikke inn betalingsinformasjon</li>
+      <li>Vi selger aldri data til tredjeparter</li>
+    </ul>
+
+    <h2>Rettslig grunnlag</h2>
+    <p>Vi behandler persondata basert på:</p>
+    <table class="pv-table">
+      <thead><tr><th>Datatype</th><th>Grunnlag</th><th>Forklaring</th></tr></thead>
+      <tbody>
+        <tr><td>Analytikk (sidebesøk, søk)</td><td>Berettiget interesse</td><td>For å forbedre tjenesten. Dataen er anonymisert (hashet IP/UA).</td></tr>
+        <tr><td>Selgerregistrering</td><td>Samtykke</td><td>Du gir aktivt data når du registrerer deg. Du kan trekke tilbake samtykket.</td></tr>
+        <tr><td>Selgerprofil (offentlig info)</td><td>Samtykke</td><td>Du velger selv hva du legger inn. Alt er synlig på din profilside.</td></tr>
+        <tr><td>Bildeoppasting</td><td>Samtykke</td><td>Du laster selv opp bilder. Bildeskanning er valgfritt.</td></tr>
+      </tbody>
+    </table>
+
+    <h2>Hvor data lagres</h2>
+    <p>All data lagres i en SQLite-database på en server hostet av Fly.io i Stockholm-regionen (ARN). Data overføres ikke til land utenfor EU/EØS, med unntak av:</p>
+    <ul>
+      <li>E-post sendes via SMTP-tjeneste for å levere verifiseringskoder og magiske lenker</li>
+      <li>Hvis bildeskanning er aktivert, kan bilder sendes til Anthropic (USA) eller OpenAI (USA) for analyse</li>
+    </ul>
+    <p>Kildekoden er åpen og tilgjengelig på <a href="https://github.com/slookisen/lokal" style="color:var(--green-700);">GitHub</a>.</p>
+
+    <h2>Hvor lenge vi lagrer data</h2>
+    <table class="pv-table">
+      <thead><tr><th>Datatype</th><th>Oppbevaring</th></tr></thead>
+      <tbody>
+        <tr><td>Sidebesøk-analytikk</td><td>Kan slettes via admin. Ingen automatisk utløp er satt per i dag.</td></tr>
+        <tr><td>Søkelogger</td><td>Samme som analytikk.</td></tr>
+        <tr><td>Verifiseringskoder</td><td>Uverifiserte claims utløper etter 7 dager.</td></tr>
+        <tr><td>Magiske lenker</td><td>Utløper etter 15 minutter. Brukte lenker eldre enn 1 time slettes automatisk.</td></tr>
+        <tr><td>Claim-token (innlogging)</td><td>Utløper etter 30 dager. Fornyes ved ny innlogging.</td></tr>
+        <tr><td>Selgerprofil</td><td>Så lenge du ønsker å være registrert.</td></tr>
+        <tr><td>Opplastede bilder</td><td>Lagres til de slettes manuelt.</td></tr>
+      </tbody>
+    </table>
+
+    <h2>Dine rettigheter</h2>
+    <p>Etter personopplysningsloven og GDPR har du rett til å:</p>
+    <ul>
+      <li><strong>Be om innsyn</strong> \u2014 vi kan fortelle deg hva vi har lagret om deg</li>
+      <li><strong>Rette feil</strong> \u2014 selgere kan oppdatere sin profil direkte via dashboardet</li>
+      <li><strong>Slette data</strong> \u2014 kontakt oss for å få fjernet din profil og tilknyttet data</li>
+      <li><strong>Trekke tilbake samtykke</strong> \u2014 du kan når som helst be om å bli fjernet</li>
+      <li><strong>Klage</strong> \u2014 du kan klage til Datatilsynet (datatilsynet.no) hvis du mener vi bryter reglene</li>
+    </ul>
+    <p>For alle henvendelser: <a href="mailto:kontakt@rettfrabonden.com" style="color:var(--green-700);">kontakt@rettfrabonden.com</a></p>
+
+    <h2>Sikkerhet</h2>
+    <p>Vi bruker følgende tiltak for å beskytte data:</p>
+    <ul>
+      <li>All trafikk er kryptert med HTTPS/TLS</li>
+      <li>Admin-tilgang er beskyttet med API-nøkler i miljøvariabler</li>
+      <li>Content Security Policy (CSP) og andre sikkerhetsheadere er aktive</li>
+      <li>Alle databasespørringer er parameterisert (beskyttelse mot SQL-injeksjon)</li>
+      <li>IP-adresser og nettleserinfo lagres kun som hasher (ikke-reversibel anonymisering)</li>
+      <li>Rate limiting på sensitive endepunkter</li>
+    </ul>
+
+    <h2>Endringer i denne policyen</h2>
+    <p>Hvis vi endrer hvordan vi behandler data, oppdaterer vi denne siden. Vi har ingen nyhetsbrev eller popup-varsler \u2014 sjekk denne siden hvis du lurer.</p>
+
+    <p class="pv-updated">Sist oppdatert: 16. april 2026</p>
+  </section>`;
+    res.send(shell("Personvern \u2014 Rett fra Bonden", "Hvordan Rett fra Bonden behandler persondata. Ingen cookies, ingen tredjepartssporing, åpen kildekode.", content, { canonical: `${BASE_URL}/personvern`, extraCss: PERSONVERN_CSS }));
+});
+// ═══════════════════════════════════════════════════════════════
 // GET /:city — City page
 // ═══════════════════════════════════════════════════════════════
 const CITY_CSS = `
@@ -791,6 +1124,7 @@ const PROFILE_CSS = `
   .pf-name { font-size: 2.2rem; font-weight: 800; letter-spacing: -1px; line-height: 1.15; margin-bottom: 6px; }
   .pf-loc { display: flex; align-items: center; gap: 6px; font-size: 0.95rem; color: var(--g500); margin-bottom: 14px; }
   .pf-desc { font-size: 1rem; color: var(--g700); line-height: 1.7; max-width: 580px; }
+  .pf-desc-extra { font-size: 0.9rem; color: var(--g500); line-height: 1.6; max-width: 580px; margin-top: 6px; font-style: italic; }
   .pf-stats { display: flex; gap: 22px; margin-top: 18px; flex-wrap: wrap; }
   .pf-stat { display: flex; align-items: center; gap: 8px; }
   .pf-stat-icon { width: 34px; height: 34px; border-radius: 8px; display: flex; align-items: center; justify-content: center; font-size: 0.95rem; }
@@ -839,6 +1173,32 @@ const PROFILE_CSS = `
   .rel-card:hover { background: var(--green-50); transform: translateY(-2px); box-shadow: var(--shadow-md); text-decoration: none; }
   .rel-name { font-weight: 700; font-size: 0.88rem; margin-bottom: 3px; }
   .rel-meta { font-size: 0.75rem; color: var(--g500); }
+  /* Tier 2: Images */
+  .img-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; }
+  .img-item img { width: 100%; height: 140px; object-fit: cover; border-radius: var(--r-md); background: var(--g100); }
+  /* Tier 2: Seasonality calendar */
+  .season-grid { display: flex; flex-direction: column; gap: 10px; }
+  .season-row { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; padding: 6px 0; border-bottom: 1px solid var(--g100); }
+  .season-row:last-child { border-bottom: none; }
+  .season-name { font-weight: 600; font-size: 0.88rem; min-width: 120px; display: flex; align-items: center; gap: 5px; }
+  .season-live { color: var(--green-700); font-size: 0.6rem; }
+  .season-bar { display: flex; gap: 2px; font-size: 0.62rem; font-weight: 600; }
+  .season-bar span { width: 22px; height: 22px; display: flex; align-items: center; justify-content: center; border-radius: 4px; }
+  .sm-on { background: var(--green-100); color: var(--green-700); }
+  .sm-now { background: var(--green-700); color: var(--white); }
+  .sm-off { background: var(--g100); color: var(--g400); }
+  .season-note { font-size: 0.75rem; color: var(--g500); width: 100%; }
+  /* Tier 2: Delivery */
+  .del-grid { display: flex; flex-direction: column; gap: 8px; }
+  .del-item { font-size: 0.88rem; color: var(--g700); }
+  .del-item strong { color: var(--charcoal); }
+  /* Tier 2: External links */
+  .ext-links { display: flex; flex-wrap: wrap; gap: 8px; }
+  .ext-link { display: inline-flex; align-items: center; gap: 5px; padding: 7px 14px; background: var(--g100); border-radius: var(--r-md); font-size: 0.82rem; font-weight: 600; color: var(--charcoal); text-decoration: none; transition: all 0.2s; }
+  .ext-link:hover { background: var(--green-50); color: var(--green-700); transform: translateY(-1px); }
+  /* Tier 2: Languages */
+  .lang-row { display: flex; gap: 6px; flex-wrap: wrap; }
+  .lang-tag { padding: 5px 12px; background: var(--g100); border-radius: 20px; font-size: 0.8rem; font-weight: 600; color: var(--g700); }
   @media (max-width: 840px) {
     .pf-header { grid-template-columns: 1fr; }
     .pf-content { grid-template-columns: 1fr; }
@@ -846,6 +1206,9 @@ const PROFILE_CSS = `
     .pf-name { font-size: 1.7rem; }
     .claim-bar { flex-direction: column; text-align: center; }
     .rel-grid { grid-template-columns: 1fr; }
+    .img-grid { grid-template-columns: 1fr 1fr; }
+    .season-bar span { width: 18px; height: 18px; font-size: 0.55rem; }
+    .season-name { min-width: 100px; }
   }
 `;
 router.get("/produsent/:slug", (req, res) => {
@@ -884,25 +1247,44 @@ router.get("/produsent/:slug", (req, res) => {
             contactItems.push(`<div class="ct-item"><div class="ct-icon">&#9993;</div><div><div class="ct-label">E-post</div><div class="ct-val"><a href="mailto:${k.email}">${escapeHtml(k.email)}</a></div></div></div>`);
         if (k.website)
             contactItems.push(`<div class="ct-item"><div class="ct-icon">&#127760;</div><div><div class="ct-label">Nettside</div><div class="ct-val"><a href="${escapeHtml(k.website)}" target="_blank" rel="noopener">${escapeHtml(k.website.replace(/^https?:\/\//, ""))}</a></div></div></div>`);
-        // Products
-        const productsHtml = k.products?.length
-            ? k.products.map((p) => {
-                const months = p.months || p.seasonMonths || [];
-                const seasonal = p.seasonal && months.length
+        // Google Maps link — ALWAYS search by business name, never raw coordinates.
+        // Our lat/lng are often just city-center approximations, not actual business
+        // locations. Google Maps search finds the real registered business listing.
+        const mapsSearchParts = [agent.name];
+        if (k.address)
+            mapsSearchParts.push(k.address);
+        if (cityName)
+            mapsSearchParts.push(cityName);
+        mapsSearchParts.push("Norge");
+        const mapsUrl = `https://www.google.com/maps/search/${encodeURIComponent(mapsSearchParts.join(", "))}`;
+        contactItems.push(`<div class="ct-item"><div class="ct-icon">&#128506;</div><div><div class="ct-label">Kart</div><div class="ct-val"><a href="${mapsUrl}" target="_blank" rel="noopener">Vis p\u00e5 Google Maps</a></div></div></div>`);
+        // Products — guard against string data (some agents have free-text or plain string arrays)
+        const productsList = Array.isArray(k.products) ? k.products : [];
+        const productsHtml = productsList.length
+            ? productsList.map((p) => {
+                // Handle both object products ({name, category, price}) and plain strings ("brød")
+                const name = typeof p === "string" ? p : (p.name || "");
+                if (!name)
+                    return "";
+                const months = (typeof p === "object" && (p.months || p.seasonMonths)) || [];
+                const seasonal = typeof p === "object" && p.seasonal && months.length
                     ? `<span class="prod-season">${months.map((m) => MONTH_NAMES[m] || m).join("\u2013")}</span>` : "";
-                const org = p.organic ? `<span class="prod-org">&#127793; \u00d8ko</span>` : "";
-                const price = p.price ? `<span class="prod-price">${escapeHtml(String(p.price))}${p.priceUnit && p.priceUnit !== 'kr' ? ' ' + escapeHtml(p.priceUnit) : ''}</span>` : "";
-                return `<div class="prod-item"><span class="prod-name">${escapeHtml(p.name)}</span>${price}<div class="prod-meta">${seasonal}${org}</div></div>`;
-            }).join("") : "";
-        // Opening hours
+                const org = typeof p === "object" && p.organic ? `<span class="prod-org">&#127793; \u00d8ko</span>` : "";
+                const price = typeof p === "object" && p.price ? `<span class="prod-price">${escapeHtml(String(p.price))}${p.priceUnit && p.priceUnit !== 'kr' ? ' ' + escapeHtml(p.priceUnit) : ''}</span>` : "";
+                return `<div class="prod-item"><span class="prod-name">${escapeHtml(name)}</span>${price}<div class="prod-meta">${seasonal}${org}</div></div>`;
+            }).filter(Boolean).join("") : "";
+        // Opening hours — guard against string data (some agents have free-text like "Man-Fre 10-17")
         const today = new Date().toLocaleDateString("en-US", { weekday: "long" }).toLowerCase();
         const todayShort = today.slice(0, 3);
-        const hoursHtml = k.openingHours?.length
-            ? k.openingHours.map((h) => {
+        const hoursList = Array.isArray(k.openingHours) ? k.openingHours : [];
+        const hoursText = !Array.isArray(k.openingHours) && typeof k.openingHours === "string" && k.openingHours ? k.openingHours : "";
+        const hoursHtml = hoursList.length
+            ? hoursList.map((h) => {
                 const isToday = h.day === todayShort || h.day === today;
                 const cls = isToday ? " hrs-today" : "";
                 return `<div class="hrs-day${cls}">${DAY_NAMES[h.day] || h.day}${isToday ? '<span class="hrs-open"><span class="hrs-dot"></span> I dag</span>' : ""}</div><div class="hrs-time${cls}">${h.open} \u2013 ${h.close}${h.note ? ` (${escapeHtml(h.note)})` : ""}</div>`;
-            }).join("") : "";
+            }).join("")
+            : hoursText ? `<div class="hrs-day">${escapeHtml(hoursText)}</div>` : "";
         // Certifications
         const certsHtml = certs.length
             ? certs.map((c) => `<div class="cert-item"><span style="font-size:1.1rem;">&#127942;</span><span class="cert-text">${escapeHtml(c)}</span></div>`).join("") : "";
@@ -922,6 +1304,60 @@ router.get("/produsent/:slug", (req, res) => {
         <div style="margin-top:6px;">${cats}</div>
       </a>`;
         }).join("");
+        // Images gallery
+        const imagesList = Array.isArray(k.images) ? k.images.filter((u) => u && u.startsWith("http")) : [];
+        const imagesHtml = imagesList.length
+            ? imagesList.slice(0, 6).map((url) => `<div class="img-item"><img src="${escapeHtml(url)}" alt="${escapeHtml(agent.name)}" loading="lazy" onerror="this.parentElement.style.display='none'"></div>`).join("")
+            : "";
+        // Seasonality calendar
+        const seasonList = Array.isArray(k.seasonality) ? k.seasonality : [];
+        const currentMonth = new Date().getMonth() + 1; // 1-12
+        const seasonHtml = seasonList.length
+            ? seasonList.map((s) => {
+                const months = s.months || [];
+                const inSeason = months.includes(currentMonth);
+                const monthDots = Array.from({ length: 12 }, (_, i) => {
+                    const m = i + 1;
+                    const active = months.includes(m);
+                    const cls = active ? (m === currentMonth ? "sm-now" : "sm-on") : "sm-off";
+                    return `<span class="${cls}" title="${MONTH_NAMES[m] || m}">${MONTH_NAMES[m]?.charAt(0) || m}</span>`;
+                }).join("");
+                return `<div class="season-row">
+            <div class="season-name">${inSeason ? '<span class="season-live">&#9679;</span>' : ""}${escapeHtml(s.product || "")}</div>
+            <div class="season-bar">${monthDots}</div>
+            ${s.note ? `<div class="season-note">${escapeHtml(s.note)}</div>` : ""}
+          </div>`;
+            }).join("")
+            : "";
+        // Delivery info
+        const deliveryParts = [];
+        if (k.deliveryRadius)
+            deliveryParts.push(`<div class="del-item"><strong>Leveringsradius:</strong> ${k.deliveryRadius} km</div>`);
+        if (k.minOrderValue)
+            deliveryParts.push(`<div class="del-item"><strong>Minstebestilling:</strong> ${k.minOrderValue} kr</div>`);
+        if ((k.deliveryOptions || []).length)
+            deliveryParts.push(`<div class="del-item"><strong>Leveringsmetoder:</strong> ${k.deliveryOptions.join(", ")}</div>`);
+        if ((k.paymentMethods || []).length)
+            deliveryParts.push(`<div class="del-item"><strong>Betaling:</strong> ${k.paymentMethods.join(", ")}</div>`);
+        const deliveryHtml = deliveryParts.join("");
+        // Languages
+        const agentLangs = info?.agent?.languages || ["no"];
+        const langMap = { no: "Norsk", en: "English", se: "Samisk", de: "Deutsch", pl: "Polski", sv: "Svenska", da: "Dansk" };
+        const langsHtml = agentLangs.length > 1 || (agentLangs.length === 1 && agentLangs[0] !== "no")
+            ? `<div class="lang-row">${agentLangs.map(l => `<span class="lang-tag">${escapeHtml(langMap[l] || l)}</span>`).join("")}</div>`
+            : "";
+        // External links (social media etc.)
+        const linksList = Array.isArray(k.externalLinks) ? k.externalLinks : [];
+        const linksHtml = linksList.length
+            ? linksList.map((l) => {
+                const icon = l.type === "social" && l.label?.toLowerCase().includes("facebook") ? "&#128101;"
+                    : l.type === "social" && l.label?.toLowerCase().includes("instagram") ? "&#128247;"
+                        : l.type === "maps" ? "&#128506;"
+                            : l.type === "shop" ? "&#128722;"
+                                : "&#128279;";
+                return `<a href="${escapeHtml(l.url)}" class="ext-link" target="_blank" rel="noopener">${icon} ${escapeHtml(l.label || "Lenke")}</a>`;
+            }).join("")
+            : "";
         // Schema.org
         const jsonLd = {
             "@context": "https://schema.org", "@type": "LocalBusiness",
@@ -938,9 +1374,9 @@ router.get("/produsent/:slug", (req, res) => {
             jsonLd.sameAs = k.website;
         if (agent.location?.lat && agent.location?.lng)
             jsonLd.geo = { "@type": "GeoCoordinates", "latitude": agent.location.lat, "longitude": agent.location.lng };
-        if (k.openingHours?.length) {
+        if (hoursList.length) {
             const dayMap = { mon: "Mo", tue: "Tu", wed: "We", thu: "Th", fri: "Fr", sat: "Sa", sun: "Su" };
-            jsonLd.openingHoursSpecification = k.openingHours.map((h) => ({
+            jsonLd.openingHoursSpecification = hoursList.map((h) => ({
                 "@type": "OpeningHoursSpecification",
                 "dayOfWeek": dayMap[h.day] || h.day,
                 "opens": h.open, "closes": h.close,
@@ -956,7 +1392,30 @@ router.get("/produsent/:slug", (req, res) => {
         <div class="pf-badges">${badges.join("")}</div>
         <h1 class="pf-name">${escapeHtml(agent.name)}</h1>
         ${cityName ? `<div class="pf-loc">&#128205; ${escapeHtml(k.address || cityName)}${k.postalCode ? `, ${escapeHtml(k.postalCode)}` : ""}</div>` : ""}
-        ${k.about || agent.description ? `<p class="pf-desc">${escapeHtml(k.about || agent.description || "")}</p>` : ""}
+        ${(() => {
+            const desc = agent.description || "";
+            const about = k.about || "";
+            if (!desc && !about)
+                return "";
+            // If only one exists, use it
+            if (!desc)
+                return `<p class="pf-desc">${escapeHtml(about)}</p>`;
+            if (!about)
+                return `<p class="pf-desc">${escapeHtml(desc)}</p>`;
+            // If they're the same text, just show one
+            if (desc === about || about.length < 20)
+                return `<p class="pf-desc">${escapeHtml(desc)}</p>`;
+            // Both exist and differ — pick the most informative as primary,
+            // show the other as supplementary if it adds unique context
+            const primary = desc.length >= about.length ? desc : about;
+            const secondary = desc.length >= about.length ? about : desc;
+            const primaryLower = primary.toLowerCase();
+            const secondaryAddsInfo = !primaryLower.includes(secondary.substring(0, Math.min(30, secondary.length)).toLowerCase());
+            if (secondaryAddsInfo && secondary.length > 30) {
+                return `<p class="pf-desc">${escapeHtml(primary)}</p><p class="pf-desc-extra">${escapeHtml(secondary)}</p>`;
+            }
+            return `<p class="pf-desc">${escapeHtml(primary)}</p>`;
+        })()}
         <div class="pf-stats">
           <div class="pf-stat"><div class="pf-stat-icon t">&#9733;</div><div><strong>${trustPct}%</strong><small>Trust Score</small></div></div>
           ${k.googleRating ? `<div class="pf-stat"><div class="pf-stat-icon r">&#11088;</div><div><strong>${k.googleRating} / 5</strong><small>${k.googleReviewCount || 0} anmeldelser</small></div></div>` : ""}
@@ -968,6 +1427,7 @@ router.get("/produsent/:slug", (req, res) => {
         ${contactItems.join("") || `<p style="color:var(--g500);font-size:0.88rem;">Ingen kontaktinfo tilgjengelig enn\u00e5.</p>`}
         <div class="ct-actions">
           ${k.website ? `<a href="${escapeHtml(k.website)}" class="btn-p" target="_blank" rel="noopener">&#127760; Bes\u00f8k nettside</a>` : ""}
+          <a href="${mapsUrl}" class="btn-s" target="_blank" rel="noopener">&#128506; Vis p\u00e5 kart</a>
           <a href="${BASE_URL}/api/marketplace/agents/${agent.id}/vcard" class="btn-s">&#128195; Last ned kontaktkort</a>
         </div>
       </div>
@@ -975,10 +1435,22 @@ router.get("/produsent/:slug", (req, res) => {
 
     <div class="pf-content">
       <div class="pf-main">
+        ${imagesHtml ? `
+        <div class="card">
+          <div class="card-head"><span>&#128247;</span><h3>Bilder</h3></div>
+          <div class="card-body"><div class="img-grid">${imagesHtml}</div></div>
+        </div>` : ""}
+
         ${productsHtml ? `
         <div class="card">
-          <div class="card-head"><span>&#127813;</span><h3>Produkter (${k.products.length})</h3></div>
+          <div class="card-head"><span>&#127813;</span><h3>Produkter (${productsList.length})</h3></div>
           <div class="card-body"><div class="prod-grid">${productsHtml}</div></div>
+        </div>` : ""}
+
+        ${seasonHtml ? `
+        <div class="card">
+          <div class="card-head"><span>&#127793;</span><h3>Sesongkalender</h3></div>
+          <div class="card-body"><div class="season-grid">${seasonHtml}</div></div>
         </div>` : ""}
 
         ${hoursHtml ? `
@@ -987,14 +1459,28 @@ router.get("/produsent/:slug", (req, res) => {
           <div class="card-body"><div class="hrs-grid">${hoursHtml}</div></div>
         </div>` : ""}
 
+        ${deliveryHtml ? `
+        <div class="card">
+          <div class="card-head"><span>&#128666;</span><h3>Levering og betaling</h3></div>
+          <div class="card-body"><div class="del-grid">${deliveryHtml}</div></div>
+        </div>` : ""}
+
         ${certsHtml ? `
         <div class="card">
           <div class="card-head"><span>&#127942;</span><h3>Sertifiseringer</h3></div>
-          <div class="card-body">
-            <div class="certs-row">${certsHtml}</div>
-            ${k.paymentMethods?.length ? `<p style="margin-top:14px;font-size:0.85rem;"><strong>Betaling:</strong> <span style="color:var(--g500);">${k.paymentMethods.join(", ")}</span></p>` : ""}
-            ${k.deliveryOptions?.length ? `<p style="margin-top:6px;font-size:0.85rem;"><strong>Levering:</strong> <span style="color:var(--g500);">${k.deliveryOptions.join(", ")}</span></p>` : ""}
-          </div>
+          <div class="card-body"><div class="certs-row">${certsHtml}</div></div>
+        </div>` : ""}
+
+        ${linksHtml ? `
+        <div class="card">
+          <div class="card-head"><span>&#128279;</span><h3>Finn oss</h3></div>
+          <div class="card-body"><div class="ext-links">${linksHtml}</div></div>
+        </div>` : ""}
+
+        ${langsHtml ? `
+        <div class="card">
+          <div class="card-head"><span>&#127760;</span><h3>Spr\u00e5k</h3></div>
+          <div class="card-body">${langsHtml}</div>
         </div>` : ""}
 
         <div class="claim-bar">
@@ -1045,7 +1531,8 @@ router.get("/sitemap.xml", (_req, res) => {
 <urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
   <url><loc>${BASE_URL}/</loc><changefreq>daily</changefreq><priority>1.0</priority><lastmod>${today}</lastmod></url>
   <url><loc>${BASE_URL}/om</loc><changefreq>monthly</changefreq><priority>0.7</priority><lastmod>${today}</lastmod></url>
-  <url><loc>${BASE_URL}/teknologi</loc><changefreq>monthly</changefreq><priority>0.7</priority><lastmod>${today}</lastmod></url>`;
+  <url><loc>${BASE_URL}/teknologi</loc><changefreq>monthly</changefreq><priority>0.7</priority><lastmod>${today}</lastmod></url>
+  <url><loc>${BASE_URL}/personvern</loc><changefreq>monthly</changefreq><priority>0.5</priority><lastmod>${today}</lastmod></url>`;
         for (const city of cities) {
             xml += `\n  <url><loc>${BASE_URL}/${city}</loc><changefreq>weekly</changefreq><priority>0.8</priority><lastmod>${today}</lastmod></url>`;
         }

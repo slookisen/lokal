@@ -11,7 +11,11 @@ class KnowledgeService {
     // ─── Get knowledge for an agent ──────────────────────────
     getKnowledge(agentId) {
         const db = (0, init_1.getDb)();
-        const row = db.prepare("SELECT * FROM agent_knowledge WHERE agent_id = ?").get(agentId);
+        const row = db.prepare(`SELECT agent_id, address, postal_code, website, phone, email,
+      opening_hours, products, about, specialties, certifications, payment_methods,
+      delivery_options, google_rating, google_review_count, tripadvisor_rating,
+      external_reviews, external_links, data_source, auto_sources, last_enriched_at,
+      owner_updated_at, preferences FROM agent_knowledge WHERE agent_id = ?`).get(agentId);
         if (!row)
             return null;
         return this.rowToKnowledge(row);
@@ -36,6 +40,7 @@ class KnowledgeService {
                 trustScore: agent.trust_score,
                 isVerified: agent.is_verified === 1,
                 isClaimed,
+                languages: agent.languages ? JSON.parse(agent.languages) : ["no"],
             },
             knowledge: {
                 address: knowledge?.address,
@@ -45,11 +50,16 @@ class KnowledgeService {
                 email: knowledge?.email,
                 openingHours: knowledge?.openingHours || [],
                 products: knowledge?.products || [],
-                about: knowledge?.about || agent.description,
+                about: knowledge?.about || "",
+                description: agent.description || "",
                 specialties: knowledge?.specialties || [],
                 certifications: knowledge?.certifications || [],
                 paymentMethods: knowledge?.paymentMethods || [],
                 deliveryOptions: knowledge?.deliveryOptions || [],
+                images: knowledge?.images || [],
+                seasonality: knowledge?.seasonality || [],
+                deliveryRadius: knowledge?.deliveryRadius,
+                minOrderValue: knowledge?.minOrderValue,
                 ratings: this.buildRatings(knowledge),
             },
             meta: {
@@ -74,10 +84,11 @@ class KnowledgeService {
           opening_hours, products, about, specialties, certifications,
           payment_methods, delivery_options, google_rating, google_review_count,
           tripadvisor_rating, external_reviews, external_links, images,
+          seasonality, delivery_radius, min_order_value,
           data_source, auto_sources, last_enriched_at, preferences,
           created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-      `).run(agentId, data.address || null, data.postalCode || null, data.website || null, data.phone || null, data.email || null, JSON.stringify(data.openingHours || []), JSON.stringify(data.products || []), data.about || null, JSON.stringify(data.specialties || []), JSON.stringify(data.certifications || []), JSON.stringify(data.paymentMethods || []), JSON.stringify(data.deliveryOptions || []), data.googleRating || null, data.googleReviewCount || null, data.tripadvisorRating || null, JSON.stringify(data.externalReviews || []), JSON.stringify(data.externalLinks || []), JSON.stringify(data.images || []), data.dataSource || "auto", JSON.stringify(data.autoSources || []), now, JSON.stringify(data.preferences || {}), now, now);
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `).run(agentId, data.address || null, data.postalCode || null, data.website || null, data.phone || null, data.email || null, JSON.stringify(data.openingHours || []), JSON.stringify(data.products || []), data.about || null, JSON.stringify(data.specialties || []), JSON.stringify(data.certifications || []), JSON.stringify(data.paymentMethods || []), JSON.stringify(data.deliveryOptions || []), data.googleRating || null, data.googleReviewCount || null, data.tripadvisorRating || null, JSON.stringify(data.externalReviews || []), JSON.stringify(data.externalLinks || []), JSON.stringify(data.images || []), JSON.stringify(data.seasonality || []), data.deliveryRadius || null, data.minOrderValue || null, data.dataSource || "auto", JSON.stringify(data.autoSources || []), now, JSON.stringify(data.preferences || {}), now, now);
         }
         else {
             // Merge: owner data takes precedence over auto data
@@ -90,6 +101,7 @@ class KnowledgeService {
           certifications = ?, payment_methods = ?, delivery_options = ?,
           google_rating = ?, google_review_count = ?, tripadvisor_rating = ?,
           external_reviews = ?, external_links = ?, images = ?,
+          seasonality = ?, delivery_radius = ?, min_order_value = ?,
           data_source = ?,
           auto_sources = ?,
           last_enriched_at = CASE WHEN ? = 'auto' THEN ? ELSE last_enriched_at END,
@@ -97,7 +109,7 @@ class KnowledgeService {
           preferences = ?,
           updated_at = ?
         WHERE agent_id = ?
-      `).run(merged.address || null, merged.postalCode || null, merged.website || null, merged.phone || null, merged.email || null, JSON.stringify(merged.openingHours || []), JSON.stringify(merged.products || []), merged.about || null, JSON.stringify(merged.specialties || []), JSON.stringify(merged.certifications || []), JSON.stringify(merged.paymentMethods || []), JSON.stringify(merged.deliveryOptions || []), merged.googleRating || null, merged.googleReviewCount || null, merged.tripadvisorRating || null, JSON.stringify(merged.externalReviews || []), JSON.stringify(merged.externalLinks || []), JSON.stringify(merged.images || []), isOwnerUpdate ? (existing.dataSource === "auto" ? "hybrid" : "owner") : merged.dataSource, JSON.stringify(merged.autoSources || []), data.dataSource || "auto", now, data.dataSource || "auto", now, JSON.stringify(merged.preferences || {}), now, agentId);
+      `).run(merged.address || null, merged.postalCode || null, merged.website || null, merged.phone || null, merged.email || null, JSON.stringify(merged.openingHours || []), JSON.stringify(merged.products || []), merged.about || null, JSON.stringify(merged.specialties || []), JSON.stringify(merged.certifications || []), JSON.stringify(merged.paymentMethods || []), JSON.stringify(merged.deliveryOptions || []), merged.googleRating || null, merged.googleReviewCount || null, merged.tripadvisorRating || null, JSON.stringify(merged.externalReviews || []), JSON.stringify(merged.externalLinks || []), JSON.stringify(merged.images || []), JSON.stringify(merged.seasonality || []), merged.deliveryRadius || null, merged.minOrderValue || null, isOwnerUpdate ? (existing.dataSource === "auto" ? "hybrid" : "owner") : merged.dataSource, JSON.stringify(merged.autoSources || []), data.dataSource || "auto", now, data.dataSource || "auto", now, JSON.stringify(merged.preferences || {}), now, agentId);
         }
     }
     // ─── Owner update (after claiming) ──────────────────────
@@ -143,9 +155,9 @@ class KnowledgeService {
         // users can't complete old claims — let them try again)
         db.prepare("DELETE FROM agent_claims WHERE agent_id = ? AND status IN ('pending','code_sent')").run(agentId);
         db.prepare(`
-      INSERT INTO agent_claims (id, agent_id, claimant_name, claimant_email, claimant_phone, verification_code, status, expires_at, created_at)
-      VALUES (?, ?, ?, ?, ?, ?, 'code_sent', ?, ?)
-    `).run(id, agentId, opts.claimantName, opts.claimantEmail, opts.claimantPhone || null, code, expiresAt, now);
+      INSERT INTO agent_claims (id, agent_id, claimant_name, claimant_email, claimant_phone, verification_code, status, source, expires_at, created_at)
+      VALUES (?, ?, ?, ?, ?, ?, 'code_sent', ?, ?, ?)
+    `).run(id, agentId, opts.claimantName, opts.claimantEmail, opts.claimantPhone || null, code, opts.source || 'organic', expiresAt, now);
         return { claimId: id, verificationCode: code };
     }
     verifyClaim(claimId, code) {
@@ -292,6 +304,9 @@ class KnowledgeService {
             externalReviews: update.externalReviews?.length ? update.externalReviews : existing.externalReviews,
             externalLinks: update.externalLinks?.length ? update.externalLinks : existing.externalLinks,
             images: update.images?.length ? update.images : existing.images,
+            seasonality: update.seasonality?.length ? update.seasonality : existing.seasonality,
+            deliveryRadius: update.deliveryRadius ?? existing.deliveryRadius,
+            minOrderValue: update.minOrderValue ?? existing.minOrderValue,
             dataSource: update.dataSource || existing.dataSource,
             autoSources: [...new Set([...(existing.autoSources || []), ...(update.autoSources || [])])],
             lastEnrichedAt: update.lastEnrichedAt ?? existing.lastEnrichedAt,
@@ -332,6 +347,9 @@ class KnowledgeService {
             externalReviews: row.external_reviews ? JSON.parse(row.external_reviews) : [],
             externalLinks: row.external_links ? JSON.parse(row.external_links) : [],
             images: row.images ? JSON.parse(row.images) : [],
+            seasonality: row.seasonality ? JSON.parse(row.seasonality) : [],
+            deliveryRadius: row.delivery_radius || undefined,
+            minOrderValue: row.min_order_value || undefined,
             dataSource: row.data_source || "auto",
             autoSources: row.auto_sources ? JSON.parse(row.auto_sources) : [],
             lastEnrichedAt: row.last_enriched_at,

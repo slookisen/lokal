@@ -19,6 +19,19 @@ const init_1 = require("../database/init");
 //   - JSON arrays stored as TEXT, parsed on read
 //   - Prepared statements for performance
 class MarketplaceRegistry {
+    // ─── In-memory cache ──────────────────────────────────────────
+    // Avoids re-querying + JSON.parse() on 1100+ agents per request.
+    // Cache invalidated on register/update/deactivate. TTL as fallback.
+    // Public so ops agent can clear them via /ops/clear-cache.
+    _agentsCache = null;
+    _agentsCacheTime = 0;
+    _statsCache = null;
+    _statsCacheTime = 0;
+    static CACHE_TTL = 60_000; // 60 seconds
+    invalidateCache() {
+        this._agentsCache = null;
+        this._statsCache = null;
+    }
     // â”€â”€â”€ Registration â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     register(registration) {
         const db = (0, init_1.getDb)();
@@ -43,6 +56,7 @@ class MarketplaceRegistry {
       )
     `);
         stmt.run(id, registration.name, registration.description, registration.provider, registration.contactEmail, registration.url, registration.version || "1.0.0", registration.role, apiKey, registration.location?.lat ?? null, registration.location?.lng ?? null, registration.location?.city ?? null, registration.location?.radiusKm ?? null, JSON.stringify(registration.categories || []), JSON.stringify(registration.tags || []), JSON.stringify(registration.skills), JSON.stringify(registration.capabilities || {}), JSON.stringify(registration.languages || ["no"]), now, now);
+        this.invalidateCache();
         return this.rowToAgent(db.prepare("SELECT * FROM agents WHERE id = ?").get(id));
     }
     // â”€â”€â”€ Discovery (the money endpoint) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
@@ -88,9 +102,52 @@ class MarketplaceRegistry {
                 return dist <= query.maxDistanceKm;
             });
         }
+        // 6b. Product-level filtering — if user searched for specific products (e.g. "tomat"),
+        // load each candidate's products from knowledge and check for matches.
+        // This prevents a meat shop from appearing when someone searches for tomatoes.
+        const productTerms = query._productTerms;
+        let productMatchMap = new Map(); // agentId → matched product names
+        if (productTerms && productTerms.length > 0) {
+            const candidateIds = candidates.map(c => c.id);
+            if (candidateIds.length > 0) {
+                // Bulk-load products for all candidates in one query
+                const placeholders = candidateIds.map(() => "?").join(",");
+                const rows = db.prepare(`SELECT agent_id, products FROM agent_knowledge WHERE agent_id IN (${placeholders})`).all(...candidateIds);
+                for (const row of rows) {
+                    try {
+                        const products = typeof row.products === "string" ? JSON.parse(row.products) : row.products;
+                        if (!Array.isArray(products))
+                            continue;
+                        const matchedNames = [];
+                        for (const p of products) {
+                            const pName = (typeof p === "string" ? p : p?.name || "").toLowerCase();
+                            for (const term of productTerms) {
+                                if (pName.includes(term) || new RegExp(`\\b${term}\\b`).test(pName)) {
+                                    matchedNames.push(typeof p === "string" ? p : p?.name || pName);
+                                    break;
+                                }
+                            }
+                        }
+                        if (matchedNames.length > 0) {
+                            productMatchMap.set(row.agent_id, matchedNames);
+                        }
+                    }
+                    catch { /* skip malformed JSON */ }
+                }
+                // Filter: keep only agents that have matching products OR agents without knowledge
+                // (we don't want to exclude agents that simply haven't been enriched yet)
+                candidates = candidates.filter(a => {
+                    if (productMatchMap.has(a.id))
+                        return true;
+                    // Check if this agent has knowledge at all — if not, keep them (benefit of doubt)
+                    const hasKnowledge = rows.some(r => r.agent_id === a.id);
+                    return !hasKnowledge;
+                });
+            }
+        }
         // 7. Score and rank
         const results = candidates.map(agent => {
-            const { score, reasons } = this.calculateRelevance(agent, query);
+            const { score, reasons } = this.calculateRelevance(agent, query, productTerms, productMatchMap);
             // Track discovery stats (async-safe â€” fire and forget)
             this.incrementDiscovery(agent.id);
             return {
@@ -127,34 +184,76 @@ class MarketplaceRegistry {
     }
     // â”€â”€â”€ Natural language query parsing â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     parseNaturalQuery(query) {
-        const q = query.toLowerCase();
+        const q = query.toLowerCase().replace(/[?!.,]/g, "");
         const parsed = {};
+        // ── Product→Category mapping (expanded with Norwegian food terms) ──
+        // Each keyword maps to a category AND is stored as a product search term
+        // so we can match at product-level, not just category-level.
         const categoryMap = {
-            "vegetables": ["grÃ¸nnsaker", "grÃ¸nt", "vegetables", "poteter", "gulrÃ¸tter", "lÃ¸k", "kÃ¥l", "tomat"],
-            "fruit": ["frukt", "fruit", "epler", "pÃ¦rer", "plommer"],
-            "berries": ["bÃ¦r", "berries", "jordbÃ¦r", "blÃ¥bÃ¦r", "bringebÃ¦r"],
-            "dairy": ["meieri", "dairy", "melk", "ost", "smÃ¸r", "yoghurt"],
-            "eggs": ["egg", "eggs"],
-            "meat": ["kjÃ¸tt", "meat", "lam", "svin", "storfe", "kylling"],
-            "fish": ["fisk", "fish", "laks", "torsk", "reker"],
-            "bread": ["brÃ¸d", "bread", "bakervarer"],
-            "honey": ["honning", "honey"],
-            "herbs": ["urter", "herbs", "krydder"],
+            "vegetables": [
+                "grønnsaker", "grønt", "vegetables", "poteter", "potet", "gulrøtter", "gulrot",
+                "løk", "kål", "tomat", "tomater", "agurk", "brokkoli", "blomkål", "squash",
+                "paprika", "selleri", "purre", "spinat", "salat", "reddik", "gresskar",
+                "mais", "erter", "bønner", "rødbeter", "nepe", "pastinakk",
+            ],
+            "fruit": [
+                "frukt", "fruit", "epler", "eple", "pærer", "pære", "plommer", "plomme",
+                "kirsebær", "moreller", "rips", "stikkelsbær", "druer",
+            ],
+            "berries": [
+                "bær", "berries", "jordbær", "blåbær", "bringebær", "tyttebær",
+                "solbær", "multe", "multer", "markjordbær",
+            ],
+            "dairy": [
+                "meieri", "dairy", "melk", "ost", "smør", "yoghurt", "fløte", "rømme",
+                "brunost", "hvitost", "geitost", "pultost", "gamalost", "smøreost",
+            ],
+            "eggs": ["egg", "eggs", "frittgående", "økologiske egg"],
+            "meat": [
+                "kjøtt", "meat", "lam", "lammekjøtt", "svin", "svinekjøtt", "storfe",
+                "storfekjøtt", "kylling", "and", "vilt", "elg", "hjort", "rein",
+                "reinsdyr", "pølser", "spekemat", "fenalår", "ribbe", "pinnekjøtt",
+            ],
+            "fish": [
+                "fisk", "fish", "sjømat", "laks", "torsk", "reker", "krabbe", "blåskjell",
+                "ørret", "røye", "sei", "hyse", "kveite", "steinbit", "tørrfisk",
+                "klippfisk", "lutefisk", "rakfisk", "gravlaks",
+            ],
+            "bread": [
+                "brød", "bread", "bakervarer", "lefse", "flatbrød", "rundstykker",
+                "boller", "kanelboller", "surdeig", "grovbrød",
+            ],
+            "honey": ["honning", "honey", "birøkt"],
+            "herbs": ["urter", "herbs", "krydder", "dill", "persille", "basilikum", "timian"],
         };
         const detectedCategories = [];
+        const productTerms = [];
         for (const [category, keywords] of Object.entries(categoryMap)) {
-            if (keywords.some(kw => q.includes(kw))) {
-                detectedCategories.push(category);
+            for (const kw of keywords) {
+                // Use word-boundary matching to avoid partial matches ("ost" in "Tromsø kosten")
+                const regex = new RegExp(`\\b${kw}\\b`);
+                if (regex.test(q)) {
+                    if (!detectedCategories.includes(category))
+                        detectedCategories.push(category);
+                    // Store the specific product term (not the category keyword like "vegetables")
+                    if (!["grønnsaker", "grønt", "vegetables", "frukt", "fruit", "bær", "berries",
+                        "meieri", "dairy", "kjøtt", "meat", "fisk", "fish", "sjømat", "brød", "bread",
+                        "bakervarer", "urter", "herbs", "egg", "eggs"].includes(kw)) {
+                        productTerms.push(kw);
+                    }
+                }
             }
         }
         if (detectedCategories.length > 0)
             parsed.categories = detectedCategories;
+        if (productTerms.length > 0)
+            parsed._productTerms = productTerms;
         const tagMap = {
-            "organic": ["Ã¸kologisk", "organic", "Ã¸ko", "debio"],
+            "organic": ["økologisk", "organic", "øko", "debio"],
             "seasonal": ["sesong", "seasonal", "i sesong"],
             "budget": ["billig", "rimelig", "budget", "cheap"],
-            "local": ["lokal", "local", "nÃ¦rme", "kort reisevei"],
-            "fresh": ["fersk", "fresh", "nyhÃ¸stet"],
+            "local": ["lokal", "local", "nærme", "kort reisevei"],
+            "fresh": ["fersk", "fresh", "nyhøstet"],
         };
         const detectedTags = [];
         for (const [tag, keywords] of Object.entries(tagMap)) {
@@ -164,136 +263,9 @@ class MarketplaceRegistry {
         }
         if (detectedTags.length > 0)
             parsed.tags = detectedTags;
-        // Norwegian cities & regions (radius in km) + Oslo districts (tighter radius)
-        const locations = {
-            // ── Major cities ──
-            "oslo": { lat: 59.9139, lng: 10.7522, radius: 25 },
-            "bergen": { lat: 60.3913, lng: 5.3221, radius: 30 },
-            "trondheim": { lat: 63.4305, lng: 10.3951, radius: 30 },
-            "stavanger": { lat: 58.9700, lng: 5.7331, radius: 30 },
-            "tromsø": { lat: 69.6496, lng: 18.9560, radius: 30 },
-            "kristiansand": { lat: 58.1599, lng: 8.0182, radius: 30 },
-            "drammen": { lat: 59.7441, lng: 10.2045, radius: 25 },
-            "fredrikstad": { lat: 59.2181, lng: 10.9298, radius: 25 },
-            "sandnes": { lat: 58.8524, lng: 5.7352, radius: 25 },
-            "bodø": { lat: 67.2804, lng: 14.4049, radius: 40 },
-            "bodo": { lat: 67.2804, lng: 14.4049, radius: 40 },
-            "ålesund": { lat: 62.4722, lng: 6.1495, radius: 30 },
-            "alesund": { lat: 62.4722, lng: 6.1495, radius: 30 },
-            "tønsberg": { lat: 59.2675, lng: 10.4076, radius: 25 },
-            "tonsberg": { lat: 59.2675, lng: 10.4076, radius: 25 },
-            "haugesund": { lat: 59.4138, lng: 5.2680, radius: 25 },
-            "sandefjord": { lat: 59.1314, lng: 10.2166, radius: 25 },
-            "moss": { lat: 59.4346, lng: 10.6588, radius: 20 },
-            "arendal": { lat: 58.4616, lng: 8.7724, radius: 25 },
-            "porsgrunn": { lat: 59.1405, lng: 9.6562, radius: 20 },
-            "skien": { lat: 59.2099, lng: 9.6089, radius: 25 },
-            "sarpsborg": { lat: 59.2839, lng: 11.1096, radius: 25 },
-            "molde": { lat: 62.7375, lng: 7.1591, radius: 30 },
-            "harstad": { lat: 68.7984, lng: 16.5415, radius: 30 },
-            "larvik": { lat: 59.0530, lng: 10.0271, radius: 25 },
-            "halden": { lat: 59.1229, lng: 11.3875, radius: 25 },
-            "kongsberg": { lat: 59.6630, lng: 9.6501, radius: 25 },
-            "lillehammer": { lat: 61.1153, lng: 10.4662, radius: 30 },
-            "gjøvik": { lat: 60.7957, lng: 10.6915, radius: 25 },
-            "gjovik": { lat: 60.7957, lng: 10.6915, radius: 25 },
-            "hamar": { lat: 60.7945, lng: 11.0680, radius: 25 },
-            "kristiansund": { lat: 63.1103, lng: 7.7279, radius: 25 },
-            "hønefoss": { lat: 60.1686, lng: 10.2564, radius: 25 },
-            "honefoss": { lat: 60.1686, lng: 10.2564, radius: 25 },
-            "narvik": { lat: 68.4385, lng: 17.4273, radius: 30 },
-            "alta": { lat: 69.9689, lng: 23.2716, radius: 40 },
-            "hammerfest": { lat: 70.6634, lng: 23.6821, radius: 40 },
-            "mo i rana": { lat: 66.3167, lng: 14.1667, radius: 30 },
-            "elverum": { lat: 60.8831, lng: 11.5615, radius: 25 },
-            "steinkjer": { lat: 64.0149, lng: 11.4955, radius: 25 },
-            "namsos": { lat: 64.4666, lng: 11.4945, radius: 25 },
-            "voss": { lat: 60.6298, lng: 6.4123, radius: 25 },
-            "sogndal": { lat: 61.2297, lng: 7.1037, radius: 30 },
-            "førde": { lat: 61.4519, lng: 5.8571, radius: 30 },
-            "forde": { lat: 61.4519, lng: 5.8571, radius: 30 },
-            "lillestrom": { lat: 59.9550, lng: 11.0493, radius: 20 },
-            "lillestrøm": { lat: 59.9550, lng: 11.0493, radius: 20 },
-            "jessheim": { lat: 60.1467, lng: 11.1760, radius: 20 },
-            "asker": { lat: 59.8371, lng: 10.4348, radius: 20 },
-            "bærum": { lat: 59.8945, lng: 10.5213, radius: 20 },
-            "baerum": { lat: 59.8945, lng: 10.5213, radius: 20 },
-            "ski": { lat: 59.7193, lng: 10.8348, radius: 20 },
-            "røros": { lat: 62.5748, lng: 11.3845, radius: 30 },
-            "roros": { lat: 62.5748, lng: 11.3845, radius: 30 },
-            "lofoten": { lat: 68.2094, lng: 14.5630, radius: 50 },
-            "lier": { lat: 59.7925, lng: 10.2458, radius: 20 },
-            "eidsvoll": { lat: 60.3275, lng: 11.2614, radius: 20 },
-            "geilo": { lat: 60.5345, lng: 8.2060, radius: 25 },
-            "oppdal": { lat: 62.5930, lng: 9.6910, radius: 25 },
-            "lom": { lat: 61.8374, lng: 8.5673, radius: 25 },
-            "grimstad": { lat: 58.3405, lng: 8.5934, radius: 25 },
-            "mandal": { lat: 58.0293, lng: 7.4614, radius: 25 },
-            "flekkefjord": { lat: 58.2970, lng: 6.6630, radius: 25 },
-            "stord": { lat: 59.7792, lng: 5.5000, radius: 25 },
-            "odda": { lat: 60.0688, lng: 6.5455, radius: 25 },
-            "levanger": { lat: 63.7462, lng: 11.2997, radius: 20 },
-            "stjørdal": { lat: 63.4695, lng: 10.9119, radius: 20 },
-            "verdal": { lat: 63.7923, lng: 11.4844, radius: 20 },
-            "svolvær": { lat: 68.2339, lng: 14.5681, radius: 25 },
-            "sortland": { lat: 68.6919, lng: 15.4138, radius: 25 },
-            "finnsnes": { lat: 69.2340, lng: 17.9851, radius: 25 },
-            "kirkenes": { lat: 69.7271, lng: 30.0459, radius: 40 },
-            "honningsvåg": { lat: 70.9813, lng: 25.9706, radius: 30 },
-            "kautokeino": { lat: 69.0118, lng: 23.0406, radius: 40 },
-            "horten": { lat: 59.4167, lng: 10.4833, radius: 20 },
-            "notodden": { lat: 59.5650, lng: 9.2592, radius: 25 },
-            "jæren": { lat: 58.7500, lng: 5.6000, radius: 30 },
-            "hardanger": { lat: 60.3200, lng: 6.8400, radius: 40 },
-            "rogaland": { lat: 58.8000, lng: 5.8000, radius: 50 },
-            "nordland": { lat: 67.0000, lng: 15.0000, radius: 80 },
-            "vestfold": { lat: 59.2000, lng: 10.2000, radius: 40 },
-            "telemark": { lat: 59.2000, lng: 9.0000, radius: 50 },
-            "hedmark": { lat: 61.0000, lng: 11.5000, radius: 60 },
-            "innlandet": { lat: 61.0000, lng: 10.0000, radius: 70 },
-            "vestland": { lat: 60.5000, lng: 6.0000, radius: 60 },
-            "viken": { lat: 59.8000, lng: 10.5000, radius: 40 },
-            "trøndelag": { lat: 63.5000, lng: 10.5000, radius: 70 },
-            "agder": { lat: 58.2000, lng: 8.0000, radius: 50 },
-            // ── Oslo districts (tighter radius) ──
-            "grünerløkka": { lat: 59.9225, lng: 10.7584, radius: 5 },
-            "grunerlokka": { lat: 59.9225, lng: 10.7584, radius: 5 },
-            "grønland": { lat: 59.9127, lng: 10.7600, radius: 5 },
-            "majorstuen": { lat: 59.9288, lng: 10.7136, radius: 5 },
-            "frogner": { lat: 59.9201, lng: 10.7004, radius: 5 },
-            "bygdøy": { lat: 59.9033, lng: 10.6850, radius: 5 },
-            "storo": { lat: 59.9466, lng: 10.7718, radius: 5 },
-            "sagene": { lat: 59.9375, lng: 10.7517, radius: 5 },
-            "torshov": { lat: 59.9375, lng: 10.7600, radius: 5 },
-            "oslo sentrum": { lat: 59.9139, lng: 10.7522, radius: 5 },
-            "vulkan": { lat: 59.9225, lng: 10.7515, radius: 5 },
-            "mathallen": { lat: 59.9225, lng: 10.7515, radius: 5 },
-            "tøyen": { lat: 59.9165, lng: 10.7720, radius: 5 },
-            "vålerenga": { lat: 59.9073, lng: 10.7820, radius: 5 },
-            "skøyen": { lat: 59.9208, lng: 10.6797, radius: 5 },
-        };
-        // Match longest location name first (e.g. "oslo sentrum" before "oslo")
-        const sortedLocations = Object.entries(locations).sort((a, b) => b[0].length - a[0].length);
-        for (const [name, data] of sortedLocations) {
-            if (q.includes(name)) {
-                parsed.location = { lat: data.lat, lng: data.lng };
-                parsed.maxDistanceKm = data.radius;
-                break;
-            }
-        }
-        // Fallback: if no location matched from map, check if query matches a city in the database
-        if (!parsed.location) {
-            const db = (0, init_1.getDb)();
-            const words = q.split(/\s+/).filter(w => w.length >= 2);
-            for (const word of words) {
-                const match = db.prepare("SELECT lat, lng, city FROM agents WHERE LOWER(city) = ? AND lat IS NOT NULL AND lng IS NOT NULL LIMIT 1").get(word);
-                if (match) {
-                    parsed.location = { lat: match.lat, lng: match.lng };
-                    parsed.maxDistanceKm = 30;
-                    break;
-                }
-            }
-        }
+        // Location resolution is handled by geocodingService in the search route.
+        // This keeps parseNaturalQuery synchronous and fast — geocoding (which may
+        // call Kartverket API) happens one level up in the async route handler.
         parsed.role = "producer";
         return parsed;
     }
@@ -532,6 +504,7 @@ class MarketplaceRegistry {
         }
         values.push(id);
         db.prepare(`UPDATE agents SET ${setClauses.join(", ")} WHERE id = ?`).run(...values);
+        this.invalidateCache();
         return this.getAgent(id);
     }
     heartbeat(id) {
@@ -541,6 +514,7 @@ class MarketplaceRegistry {
     deactivate(id) {
         const db = (0, init_1.getDb)();
         const result = db.prepare("UPDATE agents SET is_active = 0 WHERE id = ?").run(id);
+        this.invalidateCache();
         return result.changes > 0;
     }
     getAllAgents() {
@@ -549,22 +523,34 @@ class MarketplaceRegistry {
         return rows.map(r => this.rowToAgent(r));
     }
     getActiveAgents() {
+        const now = Date.now();
+        if (this._agentsCache && (now - this._agentsCacheTime) < MarketplaceRegistry.CACHE_TTL) {
+            return this._agentsCache;
+        }
         const db = (0, init_1.getDb)();
         const rows = db.prepare("SELECT * FROM agents WHERE is_active = 1 ORDER BY trust_score DESC, created_at DESC").all();
-        return rows.map(r => this.rowToAgent(r));
+        this._agentsCache = rows.map(r => this.rowToAgent(r));
+        this._agentsCacheTime = now;
+        return this._agentsCache;
     }
     getStats() {
+        const now = Date.now();
+        if (this._statsCache && (now - this._statsCacheTime) < MarketplaceRegistry.CACHE_TTL) {
+            return this._statsCache;
+        }
         const db = (0, init_1.getDb)();
         const total = db.prepare("SELECT COUNT(*) as c FROM agents").get().c;
         const activeProducers = db.prepare("SELECT COUNT(*) as c FROM agents WHERE role = 'producer' AND is_active = 1").get().c;
         const citiesRows = db.prepare("SELECT DISTINCT city FROM agents WHERE city IS NOT NULL").all();
         const totalListings = db.prepare("SELECT COUNT(*) as c FROM listings").get().c;
-        return {
+        this._statsCache = {
             totalAgents: total,
             activeProducers,
             cities: citiesRows.map(r => r.city),
             totalListings,
         };
+        this._statsCacheTime = now;
+        return this._statsCache;
     }
     // â”€â”€â”€ Task lifecycle (A2A Gap 7 fix) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     createTask(method, params, consumerAgentId) {
@@ -733,42 +719,56 @@ class MarketplaceRegistry {
             } : undefined,
         };
     }
-    calculateRelevance(agent, query) {
+    calculateRelevance(agent, query, productTerms, productMatchMap) {
         let score = 0;
         const reasons = [];
+        // Category match (base relevance)
         if (query.categories && query.categories.length > 0) {
             const matches = query.categories.filter(cat => agent.categories.some(ac => ac.toLowerCase().includes(cat.toLowerCase())));
             if (matches.length > 0) {
-                score += 0.3 * (matches.length / query.categories.length);
+                score += 0.25 * (matches.length / query.categories.length);
                 reasons.push(`Kategorier: ${matches.join(", ")}`);
             }
         }
         else {
-            score += 0.15;
+            score += 0.1;
         }
+        // Product-level match bonus — agents carrying the exact product rank much higher.
+        // "tomat" → tomato sellers first, not just any vegetable shop.
+        if (productTerms && productTerms.length > 0 && productMatchMap) {
+            const matchedProducts = productMatchMap.get(agent.id);
+            if (matchedProducts && matchedProducts.length > 0) {
+                const productScore = Math.min(1, matchedProducts.length / productTerms.length);
+                score += 0.25 * productScore;
+                reasons.push(`Produkter: ${matchedProducts.slice(0, 3).join(", ")}`);
+            }
+        }
+        // Tag match
         if (query.tags && query.tags.length > 0) {
             const matches = query.tags.filter(tag => agent.tags.some(at => at.toLowerCase().includes(tag.toLowerCase())));
             if (matches.length > 0) {
-                score += 0.2 * (matches.length / query.tags.length);
+                score += 0.15 * (matches.length / query.tags.length);
                 reasons.push(`Tags: ${matches.join(", ")}`);
             }
         }
+        // Skills match
         if (query.skills && query.skills.length > 0) {
             const matches = query.skills.filter(skillId => agent.skills.some(s => s.id === skillId || s.tags.some(t => t.includes(skillId))));
             if (matches.length > 0) {
-                score += 0.15 * (matches.length / query.skills.length);
+                score += 0.1 * (matches.length / query.skills.length);
                 reasons.push(`Skills: ${matches.join(", ")}`);
             }
         }
+        // Geo proximity — closer agents rank higher
         if (query.location && agent.location) {
             const dist = haversine(query.location.lat, query.location.lng, agent.location.lat, agent.location.lng);
             const maxDist = query.maxDistanceKm || 20;
             const distScore = Math.max(0, 1 - dist / maxDist);
-            score += 0.2 * distScore;
+            score += 0.15 * distScore;
             if (dist < 5)
                 reasons.push(`${dist.toFixed(1)} km unna`);
         }
-        score += 0.1 * agent.trustScore;
+        score += 0.05 * agent.trustScore;
         if (agent.trustScore > 0.8)
             reasons.push("HÃ¸y tillitsscore");
         if (agent.isVerified) {

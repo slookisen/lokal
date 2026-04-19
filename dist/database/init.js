@@ -280,6 +280,7 @@ function initSchema(db) {
       claim_token TEXT,                           -- Token for managing agent after claim
       claim_token_expires_at TEXT,                -- Token expires 30 days after issue
       notes TEXT,                                 -- Admin notes
+      source TEXT DEFAULT 'organic',              -- 'organic' | 'email-apr26' | 'test' | campaign tag
       created_at TEXT DEFAULT (datetime('now')),
       verified_at TEXT,
       expires_at TEXT                             -- Claims expire after 7 days if unverified
@@ -394,6 +395,41 @@ function initSchema(db) {
     }
     catch {
         // Column already exists
+    }
+    try {
+        db.exec(`ALTER TABLE agent_claims ADD COLUMN source TEXT DEFAULT 'organic'`);
+    }
+    catch {
+        // Column already exists — expected after first migration
+    }
+    // ─── Tier 2: Add seasonality, delivery_radius, min_order_value ──
+    try {
+        db.exec(`ALTER TABLE agent_knowledge ADD COLUMN seasonality TEXT DEFAULT '[]'`);
+    }
+    catch {
+        // Column already exists
+    }
+    try {
+        db.exec(`ALTER TABLE agent_knowledge ADD COLUMN delivery_radius REAL`);
+    }
+    catch {
+        // Column already exists
+    }
+    try {
+        db.exec(`ALTER TABLE agent_knowledge ADD COLUMN min_order_value REAL`);
+    }
+    catch {
+        // Column already exists
+    }
+    // ─── Add is_owner column to analytics tables ─────────────────
+    // Allows filtering out owner/developer traffic in dashboard
+    for (const table of ["analytics_page_views", "analytics_queries", "analytics_agent_views"]) {
+        try {
+            db.exec(`ALTER TABLE ${table} ADD COLUMN is_owner INTEGER DEFAULT 0`);
+        }
+        catch {
+            // Column already exists
+        }
     }
     // ─── One-time cleanup: reset all test verifications ──────────
     // No real sellers have claimed yet — all is_verified=1 entries
