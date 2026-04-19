@@ -111,6 +111,42 @@ In addition to Tier 1, now also collect these NEW fields when data is available:
    - PATCH: `{"languages": ["no", "en"]}`
    - Don't change if you're unsure — `["no"]` is safe default
 
+### ⚠️ CRITICAL: MAKING TIER 1+2 ENRICHMENT ACTUALLY WORK
+
+Previous runs have FAILED to populate Tier 1+2 fields (0% googleRating, 0% externalLinks, 0% seasonality, 0% images). This is because social media sites block scraping. Here's what ACTUALLY works:
+
+**For externalLinks (most achievable — target 60%+):**
+- Web search `"AGENT_NAME" site:facebook.com` → you'll get the Facebook URL in search results WITHOUT needing to visit facebook.com
+- Web search `"AGENT_NAME" site:instagram.com` → same approach, URL from search results
+- Construct Google Maps URL: `https://www.google.com/maps/search/AGENT_NAME,+CITY,+Norge` — always add this
+- **EVERY agent should get at least 1 externalLink** (Google Maps URL). Most should get 2-3 (+ Facebook/Instagram).
+
+**For googleRating (harder — use search snippets):**
+- Web search `"AGENT_NAME" "CITY" anmeldelser` or `"AGENT_NAME" rating`
+- Google often shows star ratings in search result snippets: "4.5 ★ (28 reviews)"
+- TripAdvisor listings often show ratings that are scrapable
+- If you find ANY rating from ANY credible source, store it as googleRating
+- **Even partial data matters**: if you see "4.5 stars" but not the review count, store `googleRating: 4.5, googleReviewCount: 1`
+
+**For seasonality (use common knowledge + website):**
+- Most producers' websites mention seasons ("sesong", "tilgjengelig", "selvplukk i juni")
+- For products you KNOW are seasonal, apply standard Norwegian seasons from the guide above
+- A strawberry farm ALWAYS has seasonality [6,7,8] even if they don't say it explicitly
+- A dairy does NOT get seasonality (year-round). A honey producer gets [7,8,9].
+
+**For images (producer websites only):**
+- Only collect from producer's OWN website (not Facebook/Instagram — those block access)
+- Look for `<img>` tags on the website homepage and product pages
+- Prefer: farm exterior photos, product shots, owner photos
+- Verify each URL is accessible with a quick fetch
+
+**For deliveryRadius:**
+- Producer websites mention delivery: "Vi leverer innen 30 km" → `deliveryRadius: 30`
+- REKO-ring and farm shop agents: `deliveryRadius: 0` (pickup only) — apply this broadly
+- Most agents can get `deliveryRadius: 0` since farm shops and REKO are the most common types
+
+**REMEMBER: Partial data is infinitely better than no data. Even just adding a Google Maps URL to externalLinks moves coverage from 0% to >0%.**
+
 **Agent selection priority:** Prioritize agents MISSING Tier 1 fields first (googleRating, externalLinks, openingHours). Collect Tier 2 data (seasonality, images, delivery) along the way when found during research — don't make separate passes.
 
 ```python
@@ -235,27 +271,40 @@ Useful for verifying that a business is real and active. Sometimes lists email a
 ### SOURCE 5: Google Maps — Phone, Website, Hours, Reviews & Customer Quotes
 **Best for:** phone, website, opening hours, Google rating, customer reviews.
 
-Search: `https://www.google.com/maps/search/AGENT_NAME+CITY+Norge`
+**⚠️ CRITICAL: Use web search to find Google Maps data — do NOT try to scrape google.com/maps directly.**
 
-Google Maps listings often have phone numbers and websites that aren't available elsewhere.
+Strategy that WORKS:
+1. **Web search**: Search `"AGENT_NAME" "CITY" google maps rating reviews` or `"AGENT_NAME" anmeldelser`
+2. **Look for rating snippets** in search results — Google often shows "4.5 ★ (28 reviews)" directly in search snippets
+3. **Try fetching the Google Maps URL**: `https://www.google.com/maps/search/AGENT_NAME+CITY+Norge` — sometimes the page content includes rating data
+4. **Fallback**: Search for the business on TripAdvisor or Yelp as alternative review sources
 
-**IMPORTANT — Mine reviews for about-text material:**
-- Note the `googleRating` and `googleReviewCount` — store these fields directly
-- **Read customer reviews** — look for recurring themes: what do people praise? ("fantastisk ost", "beste honningen i byen", "hyggelig atmosfære")
-- Pick 1-2 standout review quotes to inspire the about-text (don't copy verbatim, but use the themes)
-- Store notable reviews in `externalReviews`: `[{"source": "google", "text": "Beste gårdsbutikken i Rogaland!", "rating": 5}]`
+**Extract and store:**
+- `googleRating` (float 1.0-5.0) and `googleReviewCount` (int) — even approximate counts help
+- `externalReviews`: 1-3 notable review quotes
+- If you find ANY rating data from ANY source, store it. Partial data is better than no data.
+
+**Google Maps URL for externalLinks:**
+- Always construct: `https://www.google.com/maps/search/AGENT_NAME,+ADDRESS,+CITY,+Norge`
+- Store in externalLinks even if you can't get the rating — the link itself is valuable
 
 ### SOURCE 6: Facebook — Groups, Pages, Contact Info & Customer Feedback
 **Best for:** Facebook page/group URL, phone, email, events, product photos, customer comments.
 
-Search: `AGENT_NAME CITY site:facebook.com`
+**⚠️ CRITICAL: Facebook pages often block scraping. Use web search to FIND the URL, then try to fetch it.**
 
-Many Norwegian producers use Facebook as their primary online presence. Look for:
-- **Facebook Page** → extract phone, email, website from the "About" section
-- **Facebook Group** (common for REKO-ringer) → note the group URL
-- **Customer comments and recommendations** → look for recurring praise ("alltid fersk fisk", "beste eplemosteren") — use themes in about-text
-- **Producer's own posts** → how do they describe their products? What tone do they use? This reveals their personality and brand voice.
-- Store the Facebook URL in `externalLinks`: `{"label": "Facebook", "url": "https://facebook.com/...", "type": "social"}`
+Strategy that WORKS:
+1. **Web search**: `"AGENT_NAME" "CITY" site:facebook.com` or `"AGENT_NAME" facebook`
+2. **The Facebook URL itself is valuable** — even if you can't read the page content, store the URL in externalLinks
+3. **Try fetching the URL** — sometimes public pages DO return content with phone/email in meta tags
+4. **Google cached version**: Try `cache:facebook.com/agentpage` — sometimes Google has a cached copy
+
+**What to extract (if accessible):**
+- Facebook Page URL → store in `externalLinks`: `{"label": "Facebook", "url": "https://facebook.com/...", "type": "social"}`
+- Phone, email, website from the page's "About" section
+- Customer reviews/recommendations
+
+**ALWAYS store the Facebook URL** in externalLinks even if you can't scrape the page content. The URL itself is the most important output.
 
 ### SOURCE 7: Producer's Own Website — The Best Source for Authentic Voice
 **Best for:** product list, about text, certifications, delivery options, email, and the producer's OWN story.
@@ -283,9 +332,12 @@ Search these if the above sources didn't give full coverage:
 - **vinmonopolet.no** — For cider/wine/spirits producers — lists producer details
 
 ### SOURCE 9: Instagram
-Search: `AGENT_NAME site:instagram.com`
+**⚠️ Instagram blocks scraping entirely. Only goal: find and store the URL.**
 
-Some producers are only on Instagram. Store the URL in `externalLinks`: `{"label": "Instagram", "url": "https://instagram.com/...", "type": "social"}`
+Strategy that WORKS:
+1. **Web search**: `"AGENT_NAME" site:instagram.com` or `"AGENT_NAME" instagram`
+2. Store any found URL in `externalLinks`: `{"label": "Instagram", "url": "https://instagram.com/...", "type": "social"}`
+3. Do NOT try to fetch instagram.com pages — they always require login. The URL itself is the deliverable.
 
 ### RESEARCH STRATEGY PER MISSING FIELD
 
@@ -505,14 +557,54 @@ curl -X POST "https://rettfrabonden.com/api/marketplace/admin/register" \
 
 **Do NOT use the public `/register` endpoint** — it requires email, URL, and full skills array.
 
-## STEP 4: Flag agents for removal
+## STEP 4: Clean up invalid agents (DELETE)
 
-If during research you find agents that should NOT be on the platform (chains, import stores, closed businesses), add them to a removal-candidates section in the report with:
+During each run, actively scan for and **DELETE** agents that do not belong on the platform. This keeps the registry clean and trustworthy.
+
+### 4a: Identify agents to delete
+
+Scan through ALL agents (not just the enrichment batch) for:
+
+**Invalid entries:**
+- Agents with no meaningful name (empty, "Test", "Unknown", single characters)
+- Agents where brreg.no shows `slettedato` (dissolved) or `konkurs` (bankrupt)
+- Agents with clearly fake or placeholder data
+
+**Chains and industrial companies (not local food):**
+- Import stores: names containing "Import" + food terms
+- Large retail chains: Rema 1000, Kiwi, Coop Extra/Mega/Obs/Prix, Bunnpris, Meny, Spar, Joker, NorgesGruppen
+- Industrial food companies: TINE SA, Nortura, Gilde, Orkla ASA, Mills, Stabburet
+- Pure restaurants/cafés with no local food sales component
+
+**Duplicates:**
+- Same producer with multiple entries (e.g., "Voll Ysteri" + "Voll Ysteri — Jæren")
+- When deleting duplicates: keep the entry with the HIGHER trust score
+- **NOT duplicates (keep both):** Bondens marked in different cities, REKO-ringer in different cities
+
+### 4b: Delete via API
+
+```bash
+# Delete an invalid/chain/duplicate agent
+curl -X DELETE "https://rettfrabonden.com/api/marketplace/agents/{AGENT_ID}" \
+  -H "X-Admin-Key: $ADMIN_KEY"
+```
+
+The DELETE endpoint removes the agent AND all related data (knowledge, claims, analytics views) in a single transaction.
+
+### 4c: Log all deletions
+
+For EVERY deletion, log:
 - Agent ID and name
-- Reason for removal
-- Evidence (e.g., "brreg.no shows status: Slettet" or "This is a Rema 1000 supermarket")
+- Reason (invalid / chain / duplicate / closed business)
+- Evidence (e.g., "brreg.no shows status: Slettet", "This is a Rema 1000 supermarket", "Duplicate of agent X with higher trust score")
 
-Do NOT delete agents yourself. Flag them for admin review.
+Include the full deletion log in the enrichment report (Step 7).
+
+### Safety rules:
+- NEVER delete Bondens marked or REKO-ring entries (these are legitimate per-city entities)
+- NEVER delete small local producers even if they have sparse data — enrich them instead
+- When in doubt about whether something is a chain: check brreg.no for `organisasjonsform` — "ENK" (sole proprietorship) and "DA/ANS" are almost always local. "AS" with many subsidiaries is likely a chain.
+- Delete confidently when the evidence is clear (chain name match, dissolved in brreg, obvious duplicate)
 
 ## STEP 5: Generate vCard contact cards
 
