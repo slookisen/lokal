@@ -22,6 +22,7 @@ import marketplaceRoutes from "./routes/marketplace";
 import mcpRoutes from "./routes/mcp";
 import seoRoutes from "./routes/seo";
 import discoveryRoutes from "./routes/discovery";
+import conversationUiRoutes from "./routes/conversation-ui";
 import agentReadinessRoutes from "./routes/agent-readiness";
 import { linkHeaders, markdownNegotiation } from "./middleware/agent-discovery";
 import { analyticsService } from "./services/analytics-service";
@@ -222,6 +223,9 @@ app.get("/health", (_req, res) => {
 
 // Analytics admin endpoints
 app.use("/admin/analytics", analyticsRoutes);
+
+// Conversation UI — /samtaler and /samtale/:id (before SEO catch-all)
+app.use("/", conversationUiRoutes);
 
 // SEO pages LAST — /:city is a catch-all wildcard
 app.use("/", discoveryRoutes);  // llms.txt, MCP server-card, agents.txt, openapi.json

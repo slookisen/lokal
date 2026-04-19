@@ -1163,7 +1163,7 @@ router.get("/:city", (req: Request, res: Response, next: any) => {
       || citySlug === "openapi.json" || citySlug === "openapi.yaml" || citySlug === "favicon.ico"
       || citySlug === "selger" || citySlug === "admin" || citySlug === "om" || citySlug === "teknologi"
       || citySlug === "personvern" || citySlug === "llms.txt" || citySlug === "llms-full.txt"
-      || citySlug === "agents" || citySlug === "docs"
+      || citySlug === "agents" || citySlug === "docs" || citySlug === "samtaler" || citySlug === "samtale"
       || citySlug.includes(".")) {
     return next();
   }
