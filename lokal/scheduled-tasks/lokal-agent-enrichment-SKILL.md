@@ -458,6 +458,58 @@ The about-text is sent in the PUT to /knowledge AND as description in the PATCH 
 - **Verify business is active**: If brreg.no shows "Slettet" or "Avviklet", note it in the report
 - NEVER fabricate or guess information. Only use verifiable public data.
 
+### ⚠️ MANDATORY: Link verification before storing
+
+**ALL URLs must be verified before storing.** Dead links damage trust more than missing links.
+
+For every URL you plan to store (website, externalLinks, images):
+
+```bash
+# Quick check — verify the URL returns 200 OK
+curl -sI -o /dev/null -w "%{http_code}" "URL_HERE" --max-time 5
+```
+
+**Verification rules:**
+- **HTTP 200**: ✅ Store the link
+- **HTTP 301/302 (redirect)**: ✅ Follow the redirect, store the FINAL destination URL
+- **HTTP 403/404/500 or timeout**: ❌ Do NOT store the link. Log it as "dead link skipped"
+- **SSL errors**: ❌ Do NOT store — broken HTTPS is worse than no link
+
+**Per field type:**
+- **website**: Fetch the homepage. If it returns non-200 or redirects to a parked domain / "this domain is for sale" page, set website to null
+- **externalLinks (Facebook/Instagram)**: Do a HEAD request. Facebook pages often return 200 even for public pages. Instagram always returns 302→login, so store Instagram URLs found via web search WITHOUT verification (they're always valid if found in search results)
+- **externalLinks (Google Maps)**: Constructed URLs like `https://www.google.com/maps/search/...` are always valid — no need to verify these
+- **images**: Fetch with HEAD. Must return `Content-Type: image/*`. If not an image or returns 404, skip it
+
+**For existing agents with stored links:** When enriching an agent that already has a website or externalLinks, verify the existing URLs too. Remove any that are now dead. This keeps the database clean over time.
+
+### 🔍 Google Maps/Places as active-business check
+
+Google Maps is the best signal for whether a business is still operating. Use it as your PRIMARY active-check (brreg.no only catches formally dissolved businesses):
+
+**How to check:**
+1. Search Google Maps for the agent: web search `"AGENT_NAME" "CITY" site:google.com/maps` or try `https://www.google.com/maps/search/AGENT_NAME+CITY+Norge`
+2. Look for these signals in the results:
+
+**🔴 INACTIVE signals (flag for deletion in Step 4):**
+- "Permanently closed" in the Google Maps listing
+- "This place is no longer in business"
+- No Google Maps listing AT ALL + no working website + brreg.no shows no recent activity
+- Website redirects to domain parking or is for sale
+
+**🟡 UNCERTAIN signals (keep but note in report):**
+- Google Maps listing exists but has no reviews and no hours
+- Website exists but hasn't been updated in years
+- brreg.no shows active but no online presence at all
+
+**🟢 ACTIVE signals (good to go):**
+- Google Maps listing with recent reviews (last 12 months)
+- Working website with current content
+- Active Facebook/Instagram with recent posts
+- Listed on bondensmarked.no or rekoringen.no for upcoming events
+
+**Action:** For agents flagged as 🔴 INACTIVE, add them to the deletion list in Step 4 with evidence. For 🟡 UNCERTAIN, keep them but add a note in the enrichment report.
+
 ## STEP 3: Update agent knowledge via API
 
 Use the admin key to update knowledge:
@@ -570,6 +622,12 @@ Scan through ALL agents (not just the enrichment batch) for:
 - Agents where brreg.no shows `slettedato` (dissolved) or `konkurs` (bankrupt)
 - Agents with clearly fake or placeholder data
 
+**Inactive/closed businesses (use Google Maps as primary signal):**
+- Google Maps shows "Permanently closed" or "This place is no longer in business"
+- No Google Maps listing + no working website + brreg.no shows no recent activity = likely closed
+- Website is parked domain or "for sale" page
+- See the "Google Maps/Places as active-business check" section above for full criteria
+
 **Chains and industrial companies (not local food):**
 - Import stores: names containing "Import" + food terms
 - Large retail chains: Rema 1000, Kiwi, Coop Extra/Mega/Obs/Prix, Bunnpris, Meny, Spar, Joker, NorgesGruppen
@@ -652,7 +710,9 @@ Save to `lokal/enrichment-reports/enrichment-{YYYY-MM-DD-auto}.md` with:
 - Average trust score before/after
 - **Persistence verification**: How many agents had data confirmed stored after PUT
 - Notable findings (certifications, awards, closures)
-- Removal candidates (if any found)
+- **Link verification results**: URLs tested / verified OK / dead links removed / redirects followed
+- **Active-business check**: Agents confirmed active (Google Maps listing) / flagged inactive / deleted
+- **Agents deleted** (with full deletion log from Step 4)
 - API errors encountered (with agent IDs for retry)
 - Failed agents list (for next run to pick up)
 
