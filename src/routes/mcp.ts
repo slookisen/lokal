@@ -29,12 +29,22 @@ const router = Router();
 
 function registerTools(server: McpServer) {
   // Tool 1: Natural language search
-  server.tool(
+  server.registerTool(
     "lokal_search",
-    "Search for local food producers in Norway using natural language. Supports Norwegian and English. Returns ranked producers with contact info. Examples: 'fresh vegetables near Grünerløkka', 'organic honey Oslo', 'ost Trondheim'.",
     {
-      query: z.string().describe("Natural language search query (Norwegian or English)"),
-      limit: z.number().min(1).max(50).default(10).describe("Max results"),
+      title: "Search local food producers",
+      description: "Search for local food producers in Norway using natural language. Supports Norwegian and English. Returns ranked producers with contact info and automatically starts a conversation with the top matches so sellers can respond. Examples: 'fresh vegetables near Grünerløkka', 'organic honey Oslo', 'ost Trondheim'.",
+      inputSchema: {
+        query: z.string().describe("Natural language search query (Norwegian or English)"),
+        limit: z.number().min(1).max(50).default(10).describe("Max results"),
+      },
+      annotations: {
+        title: "Search local food producers",
+        readOnlyHint: false,
+        destructiveHint: false,
+        idempotentHint: false,
+        openWorldHint: false,
+      },
     },
     async ({ query, limit }) => {
       const parsed = marketplaceRegistry.parseNaturalQuery(query);
@@ -75,16 +85,26 @@ function registerTools(server: McpServer) {
   );
 
   // Tool 2: Structured discovery
-  server.tool(
+  server.registerTool(
     "lokal_discover",
-    "Structured search in the Lokal food producer registry. Filter by food categories, tags, and geographic distance.",
     {
-      categories: z.array(z.string()).optional().describe("Categories: vegetables, fruit, berries, dairy, eggs, meat, fish, bread, honey, herbs"),
-      tags: z.array(z.string()).optional().describe("Tags: organic, seasonal, budget, local, fresh"),
-      lat: z.number().optional().describe("Latitude for distance filtering"),
-      lng: z.number().optional().describe("Longitude for distance filtering"),
-      maxDistanceKm: z.number().optional().describe("Max distance in km"),
-      limit: z.number().min(1).max(50).default(10).describe("Max results"),
+      title: "Discover producers by filter",
+      description: "Structured search in the Lokal food producer registry. Filter by food categories, tags, and geographic distance. Automatically starts a conversation with the top matches so sellers can respond.",
+      inputSchema: {
+        categories: z.array(z.string()).optional().describe("Categories: vegetables, fruit, berries, dairy, eggs, meat, fish, bread, honey, herbs"),
+        tags: z.array(z.string()).optional().describe("Tags: organic, seasonal, budget, local, fresh"),
+        lat: z.number().optional().describe("Latitude for distance filtering"),
+        lng: z.number().optional().describe("Longitude for distance filtering"),
+        maxDistanceKm: z.number().optional().describe("Max distance in km"),
+        limit: z.number().min(1).max(50).default(10).describe("Max results"),
+      },
+      annotations: {
+        title: "Discover producers by filter",
+        readOnlyHint: false,
+        destructiveHint: false,
+        idempotentHint: false,
+        openWorldHint: false,
+      },
     },
     async ({ categories, tags, lat, lng, maxDistanceKm, limit }) => {
       const body: any = { categories, tags, lat, lng, maxDistanceKm, limit: limit || 10, role: "producer" };
@@ -125,11 +145,21 @@ function registerTools(server: McpServer) {
   );
 
   // Tool 3: Producer details
-  server.tool(
+  server.registerTool(
     "lokal_info",
-    "Get detailed information about a specific Lokal producer — address, products, opening hours, certifications, and contact info.",
     {
-      agentId: z.string().describe("The producer's agent ID (UUID)"),
+      title: "Producer details",
+      description: "Get detailed information about a specific Lokal producer — address, products, opening hours, certifications, and contact info.",
+      inputSchema: {
+        agentId: z.string().describe("The producer's agent ID (UUID)"),
+      },
+      annotations: {
+        title: "Producer details",
+        readOnlyHint: true,
+        destructiveHint: false,
+        idempotentHint: true,
+        openWorldHint: false,
+      },
     },
     async ({ agentId }) => {
       const info = knowledgeService.getAgentInfo(agentId);
@@ -189,10 +219,20 @@ function registerTools(server: McpServer) {
   );
 
   // Tool 4: Platform stats
-  server.tool(
+  server.registerTool(
     "lokal_stats",
-    "Get Lokal platform statistics — total agents, cities covered, interactions.",
-    {},
+    {
+      title: "Platform statistics",
+      description: "Get Lokal platform statistics — total agents, cities covered, interactions.",
+      inputSchema: {},
+      annotations: {
+        title: "Platform statistics",
+        readOnlyHint: true,
+        destructiveHint: false,
+        idempotentHint: true,
+        openWorldHint: false,
+      },
+    },
     async () => {
       const stats = marketplaceRegistry.getStats();
       const text = [
