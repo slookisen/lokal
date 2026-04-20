@@ -101,12 +101,24 @@ const server = new McpServer({
 });
 
 // Tool 1: Natural language search
-server.tool(
+// Annotations: read-only, safe, idempotent, open-world (queries a public registry).
+// These hints are required by the Anthropic Claude Connectors Directory review.
+server.registerTool(
   "lokal_search",
-  "Search for local food producers in Norway using natural language. Supports Norwegian and English. Returns ranked producers with contact info and a vCard link so the user can add them to their contacts. Examples: 'fresh vegetables near Grünerløkka', 'organic honey Oslo', 'ost Trondheim'.",
   {
-    query: z.string().describe("Natural language search query (Norwegian or English)"),
-    limit: z.number().min(1).max(50).default(10).describe("Max results"),
+    title: "Search local food producers",
+    description: "Search for local food producers in Norway using natural language. Supports Norwegian and English. Returns ranked producers with contact info and a vCard link so the user can add them to their contacts. Examples: 'fresh vegetables near Grünerløkka', 'organic honey Oslo', 'ost Trondheim'.",
+    inputSchema: {
+      query: z.string().describe("Natural language search query (Norwegian or English)"),
+      limit: z.number().min(1).max(50).default(10).describe("Max results"),
+    },
+    annotations: {
+      title: "Search local food producers",
+      readOnlyHint: true,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: true,
+    },
   },
   async ({ query, limit }) => {
     const params = new URLSearchParams({ q: query, limit: String(limit || 10) });
@@ -127,16 +139,26 @@ server.tool(
 );
 
 // Tool 2: Structured discovery
-server.tool(
+server.registerTool(
   "lokal_discover",
-  "Structured search in the Lokal food producer registry. Filter by food categories, tags, and geographic distance. Returns ranked producers with contact info and vCard links.",
   {
-    categories: z.array(z.string()).optional().describe("Categories: vegetables, fruit, berries, dairy, eggs, meat, fish, bread, honey, herbs"),
-    tags: z.array(z.string()).optional().describe("Tags: organic, seasonal, budget, local, fresh"),
-    lat: z.number().optional().describe("Latitude for distance filtering"),
-    lng: z.number().optional().describe("Longitude for distance filtering"),
-    maxDistanceKm: z.number().optional().describe("Max distance in km"),
-    limit: z.number().min(1).max(50).default(10).describe("Max results"),
+    title: "Discover producers by filter",
+    description: "Structured search in the Lokal food producer registry. Filter by food categories, tags, and geographic distance. Returns ranked producers with contact info and vCard links.",
+    inputSchema: {
+      categories: z.array(z.string()).optional().describe("Categories: vegetables, fruit, berries, dairy, eggs, meat, fish, bread, honey, herbs"),
+      tags: z.array(z.string()).optional().describe("Tags: organic, seasonal, budget, local, fresh"),
+      lat: z.number().optional().describe("Latitude for distance filtering"),
+      lng: z.number().optional().describe("Longitude for distance filtering"),
+      maxDistanceKm: z.number().optional().describe("Max distance in km"),
+      limit: z.number().min(1).max(50).default(10).describe("Max results"),
+    },
+    annotations: {
+      title: "Discover producers by filter",
+      readOnlyHint: true,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: true,
+    },
   },
   async ({ categories, tags, lat, lng, maxDistanceKm, limit }) => {
     const body = { categories, tags, lat, lng, maxDistanceKm, limit: limit || 10, role: "producer" };
@@ -157,11 +179,21 @@ server.tool(
 );
 
 // Tool 3: Producer details — structured markdown, not raw JSON
-server.tool(
+server.registerTool(
   "lokal_info",
-  "Get detailed information about a specific Lokal producer — address, products, opening hours, certifications, and a vCard link the user can add to their contacts.",
   {
-    agentId: z.string().describe("The producer's agent ID (UUID)"),
+    title: "Producer details",
+    description: "Get detailed information about a specific Lokal producer — address, products, opening hours, certifications, and a vCard link the user can add to their contacts.",
+    inputSchema: {
+      agentId: z.string().describe("The producer's agent ID (UUID)"),
+    },
+    annotations: {
+      title: "Producer details",
+      readOnlyHint: true,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: true,
+    },
   },
   async ({ agentId }) => {
     const data = await fetchJSON(`${BASE_URL}/api/marketplace/agents/${agentId}/info`);
@@ -216,10 +248,20 @@ server.tool(
 );
 
 // Tool 4: Platform stats
-server.tool(
+server.registerTool(
   "lokal_stats",
-  "Get Lokal platform statistics — total agents, cities covered, interactions.",
-  {},
+  {
+    title: "Platform statistics",
+    description: "Get Lokal platform statistics — total agents, cities covered, interactions.",
+    inputSchema: {},
+    annotations: {
+      title: "Platform statistics",
+      readOnlyHint: true,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: true,
+    },
+  },
   async () => {
     const data = await fetchJSON(`${BASE_URL}/api/stats`);
     const s = data.data || data;

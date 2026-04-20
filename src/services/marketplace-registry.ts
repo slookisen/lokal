@@ -8,7 +8,7 @@ import {
   DiscoveryResult,
 } from "../models/marketplace";
 
-// â"€â"€â"€ Marketplace Registry Service (SQLite-backed) â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€
+// ─── Marketplace Registry Service (SQLite-backed) ────────────
 // This is the CORE of what makes Lokal unique: the agent registry.
 //
 // v2: Now persistent with SQLite. Data survives restart.
@@ -36,7 +36,7 @@ class MarketplaceRegistry {
     this._statsCache = null;
   }
 
-  // â"€â"€â"€ Registration â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€
+  // ─── Registration ─────────────────────────────────────────
 
   register(registration: AgentRegistration): RegisteredAgent {
     const db = getDb();
@@ -89,7 +89,7 @@ class MarketplaceRegistry {
     return this.rowToAgent(db.prepare("SELECT * FROM agents WHERE id = ?").get(id) as any)!;
   }
 
-  // â"€â"€â"€ Discovery (the money endpoint) â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€
+  // ─── Discovery (the money endpoint) ───────────────────────
   // Consumer agents call this to find producers.
   // Uses bounding-box pre-filter for geo (Gap 6 fix).
 
@@ -247,7 +247,7 @@ class MarketplaceRegistry {
     return results.slice(query.offset || 0, (query.offset || 0) + (query.limit || 20));
   }
 
-  // â"€â"€â"€ Natural language query parsing â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€
+  // ─── Natural language query parsing ───────────────────────
 
   parseNaturalQuery(query: string): Partial<DiscoveryQuery> & { _productTerms?: string[] } {
     const q = query.toLowerCase().replace(/[?!.,]/g, "");
@@ -338,7 +338,7 @@ class MarketplaceRegistry {
     return parsed;
   }
 
-  // â"€â"€â"€ Agent Card Generation (A2A standard) â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€
+  // ─── Agent Card Generation (A2A standard) ─────────────────
 
   getAgentCard(agentId: string): object | null {
     const agent = this.getAgent(agentId);
@@ -370,20 +370,20 @@ class MarketplaceRegistry {
     };
   }
 
-  // â"€â"€â"€ Registry-level Agent Card (Lokal itself) â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€
+  // ─── Registry-level Agent Card (Lokal itself) ──────────────
 
   getRegistryCard(baseUrl: string): object {
     const stats = this.getStats();
     return {
-      // â"€â"€â"€ A2A spec-compliant fields â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€
+      // ─── A2A spec-compliant fields ─────────────────────────
       // WHY bilingual: Consumer agents (Claude, GPT, Gemini, etc.)
       // search in English. Norwegian producers search in Norwegian.
       // Both need to find us. Bilingual descriptions = 2x discovery surface.
       name: "Lokal",
       description: "A2A marketplace for local food in Norway. " +
-        `Connect AI agents with ${stats.totalAgents || 1400}+ local farms, shops, and producers. ` +
-        "Search fresh produce, organic vegetables, meat, fish, dairy, honey, bread, and more. " +
-        "Agent-markedsplass for lokal mat i Norge - ferske gronnsaker, frukt, kjott, fisk, meieri, honning, brod og mer.",
+        `Connect AI agents with ${stats.totalAgents || 1169}+ verified local farms, shops, cooperatives, farm shops, REKO rings, and markets. ` +
+        "Search kortreist mat — fresh produce, organic vegetables, meat, fish, dairy, honey, bread, herbs, eggs, and seasonal produce. " +
+        "Agent-markedsplass for lokal mat i Norge — ferske gr\u00f8nnsaker, frukt, kj\u00f8tt, fisk, meieri, honning, br\u00f8d, \u00f8kologisk, kortreist, g\u00e5rdsbutikk, REKO-ring og mer.",
       url: baseUrl,
       provider: {
         organization: "Lokal",
@@ -399,20 +399,20 @@ class MarketplaceRegistry {
 
 
 
-      // â"€â"€â"€ Protocol capabilities â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€
+      // ─── Protocol capabilities ─────────────────────────────
       capabilities: {
         streaming: false,
         pushNotifications: false,
         stateTransitionHistory: true,
       },
 
-      // â"€â"€â"€ Authentication â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€
+      // ─── Authentication ────────────────────────────────────
       authentication: {
         schemes: ["apiKey"],
         credentials: null, // Open for reads, key for writes
       },
 
-      // â"€â"€â"€ A2A interfaces â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€
+      // ─── A2A interfaces ────────────────────────────────────
       interfaces: [
         {
           type: "json-rpc",
@@ -427,7 +427,7 @@ class MarketplaceRegistry {
         },
       ],
 
-      // â"€â"€â"€ Skills (what agents can DO through us) â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€
+      // ─── Skills (what agents can DO through us) ────────────
       // Each skill is a capability an external agent can invoke.
       // Rich descriptions + tags = higher match probability.
       skills: [
@@ -518,7 +518,7 @@ class MarketplaceRegistry {
         },
       ],
 
-      // â"€â"€â"€ Security â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€
+      // ─── Security ──────────────────────────────────────────
       securitySchemes: {
         apiKey: {
           type: "apiKey",
@@ -530,7 +530,7 @@ class MarketplaceRegistry {
         },
       },
 
-      // â"€â"€â"€ Lokal-specific metadata â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€
+      // ─── Lokal-specific metadata ───────────────────────────
       "x-lokal": {
         type: "registry",
         region: "Norway",
@@ -549,7 +549,7 @@ class MarketplaceRegistry {
     };
   }
 
-  // â"€â"€â"€ CRUD helpers â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€
+  // ─── CRUD helpers ─────────────────────────────────────────
 
   getAgent(id: string): RegisteredAgent | undefined {
     const db = getDb();
@@ -646,7 +646,7 @@ class MarketplaceRegistry {
     return this._statsCache;
   }
 
-  // â"€â"€â"€ Task lifecycle (A2A Gap 7 fix) â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€
+  // ─── Task lifecycle (A2A Gap 7 fix) ───────────────────────
 
   createTask(method: string, params: any, consumerAgentId?: string): any {
     const db = getDb();
@@ -713,7 +713,7 @@ class MarketplaceRegistry {
     }));
   }
 
-  // â"€â"€â"€ Listing CRUD â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€
+  // ─── Listing CRUD ─────────────────────────────────────────
 
   addListing(agentId: string, listing: any): any {
     const db = getDb();
@@ -741,7 +741,7 @@ class MarketplaceRegistry {
     return db.prepare("SELECT * FROM listings WHERE agent_id = ? ORDER BY created_at DESC").all(agentId) as any[];
   }
 
-  // â"€â"€â"€ Check if agent exists by name (for idempotent seeding) â"€
+  // ─── Check if agent exists by name (for idempotent seeding) â"€
 
   getAgentByName(name: string): RegisteredAgent | undefined {
     const db = getDb();
@@ -749,7 +749,7 @@ class MarketplaceRegistry {
     return row ? this.rowToAgent(row) : undefined;
   }
 
-  // â"€â"€â"€ Private helpers â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€
+  // ─── Private helpers ──────────────────────────────────────
 
   private generateApiKey(): string {
     return `lok_${crypto.randomBytes(32).toString("hex")}`;
@@ -765,7 +765,7 @@ class MarketplaceRegistry {
     } catch { /* non-critical */ }
   }
 
-  // â"€â"€â"€ Reputation Engine â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€
+  // ─── Reputation Engine ──────────────────────────────────
   // Recalculates trust score based on real behavior, not just defaults.
   // Called after transactions complete.
   //
@@ -927,7 +927,7 @@ class MarketplaceRegistry {
   }
 }
 
-// â"€â"€â"€ Haversine distance â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€
+// ─── Haversine distance ──────────────────────────────────────
 
 function haversine(lat1: number, lng1: number, lat2: number, lng2: number): number {
   const R = 6371;

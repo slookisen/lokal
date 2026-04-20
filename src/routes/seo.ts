@@ -2027,6 +2027,10 @@ User-agent: Claude-Web
 Allow: /
 Content-Signal: search=yes, ai-input=yes, ai-train=no
 
+User-agent: Claude-SearchBot
+Allow: /
+Content-Signal: search=yes, ai-input=yes, ai-train=no
+
 User-agent: anthropic-ai
 Allow: /
 Content-Signal: search=yes, ai-input=yes, ai-train=no

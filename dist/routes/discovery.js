@@ -251,7 +251,7 @@ router.get("/.well-known/mcp", (_req, res) => {
 // Emerging standard (expired draft, but still parsed by tools).
 // Declares what AI agents can do on our site.
 // ═══════════════════════════════════════════════════════════════
-router.get("/.well-known/agents.txt", (_req, res) => {
+function serveAgentsTxt(_req, res) {
     const agents = marketplace_registry_1.marketplaceRegistry.getActiveAgents();
     res.header("Content-Type", "text/plain; charset=utf-8");
     res.header("Cache-Control", "public, max-age=3600");
@@ -283,7 +283,11 @@ Rate-limit: 500 requests per hour (admin)
 # Contact
 Contact: https://github.com/slookisen/lokal/issues
 `);
-});
+}
+router.get("/.well-known/agents.txt", serveAgentsTxt);
+// Root alias — some agent-discovery conventions look at /agents.txt directly
+// rather than /.well-known/agents.txt. Serve both so we don't miss crawlers.
+router.get("/agents.txt", serveAgentsTxt);
 // Also serve agents.json (AWP format)
 router.get("/.well-known/agents.json", (_req, res) => {
     const agents = marketplace_registry_1.marketplaceRegistry.getActiveAgents();
@@ -476,6 +480,128 @@ router.get("/openapi.json", (_req, res) => {
             },
         },
     });
+});
+// ═══════════════════════════════════════════════════════════════
+// 9. GET /privacy — Privacy policy (bilingual NO/EN)
+//
+// Required for listing in the Anthropic Claude Connectors Directory
+// and similar AI marketplaces that verify data-handling practices.
+// Kept minimal + factual: only describes what we actually do.
+// ═══════════════════════════════════════════════════════════════
+router.get(["/privacy", "/privacy-policy", "/personvern"], (_req, res) => {
+    res.header("Content-Type", "text/html; charset=utf-8");
+    res.header("Cache-Control", "public, max-age=3600");
+    res.send(`<!DOCTYPE html>
+<html lang="no">
+<head>
+<meta charset="utf-8">
+<title>Personvern / Privacy — Rett fra Bonden</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="description" content="Privacy policy for Rett fra Bonden (rettfrabonden.com) — A2A marketplace for local food in Norway.">
+<style>
+  body { font-family: system-ui, -apple-system, sans-serif; max-width: 760px; margin: 2rem auto; padding: 0 1rem; color: #1a1a1a; line-height: 1.6; }
+  h1 { border-bottom: 2px solid #2d5016; padding-bottom: 0.3rem; }
+  h2 { color: #2d5016; margin-top: 2rem; }
+  code { background: #f4f4f4; padding: 0.1em 0.3em; border-radius: 3px; }
+  .lang-switch { text-align: right; margin-bottom: 1rem; font-size: 0.9rem; }
+  .lang-switch a { color: #2d5016; }
+  footer { margin-top: 3rem; padding-top: 1rem; border-top: 1px solid #ddd; font-size: 0.85rem; color: #666; }
+</style>
+</head>
+<body>
+<div class="lang-switch"><a href="#en">English</a></div>
+
+<h1>Personvern</h1>
+<p><strong>Sist oppdatert:</strong> 20. april 2026</p>
+
+<p>Rett fra Bonden (rettfrabonden.com) er en agent-til-agent-markedsplass som hjelper AI-agenter
+med å finne lokale matprodusenter i Norge. Vi respekterer personvernet til produsenter, brukere
+og AI-agenter som samhandler med plattformen.</p>
+
+<h2>Hva vi samler inn</h2>
+<ul>
+  <li><strong>Produsentdata:</strong> Navn, adresse, kontaktinformasjon, produkter og åpningstider.
+    Dette er offentlig tilgjengelig informasjon som produsentene selv har publisert, eller som er
+    samlet fra offentlige kilder (nettsider, Brønnøysundregistrene, HANEN, Visit Norway, Google Maps
+    med flere).</li>
+  <li><strong>Agent-forespørsler:</strong> Vi logger hvilke agenter (ChatGPT, Claude, Perplexity m.fl.)
+    som gjør søk, hvilke søkeord som brukes, og hvilke produsenter som blir vist — i aggregert form,
+    uten IP-adresser eller personlige identifikatorer.</li>
+  <li><strong>Eier-henvendelser:</strong> Hvis en produsent tar kontakt for å "claim" sin egen agentprofil,
+    lagrer vi e-postadresse og verifikasjonskode så lenge det er nødvendig for å bekrefte eierskap.</li>
+</ul>
+
+<h2>Hva vi IKKE samler inn</h2>
+<ul>
+  <li>Vi setter ingen sporingscookies.</li>
+  <li>Vi bruker ingen tredjeparts analyseverktøy (Google Analytics, Meta, osv.).</li>
+  <li>Vi behandler ingen betalinger og lagrer ingen betalingskortopplysninger.</li>
+  <li>Vi selger ikke data til tredjepart.</li>
+</ul>
+
+<h2>Lagringstid</h2>
+<p>Aggregerte analytikkdata lagres i opptil 180 dager. Produsentdata som kommer fra offentlige kilder
+lagres så lenge produsenten er aktiv. Produsenter kan når som helst be om å bli fjernet (se under).</p>
+
+<h2>Rettighetene dine</h2>
+<p>Er du produsent og ønsker å bli fjernet fra katalogen, eller ønsker å korrigere informasjon om
+deg selv? Send en e-post til <a href="mailto:kontakt@rettfrabonden.com">kontakt@rettfrabonden.com</a>.
+Vi svarer innen rimelig tid og fjerner/oppdaterer oppføringen.</p>
+
+<h2>Kontakt</h2>
+<p>E-post: <a href="mailto:kontakt@rettfrabonden.com">kontakt@rettfrabonden.com</a><br>
+Operatør: Daniel Fredriksen, Norge.</p>
+
+<hr>
+
+<h1 id="en">Privacy Policy</h1>
+<p><strong>Last updated:</strong> 20 April 2026</p>
+
+<p>Rett fra Bonden (rettfrabonden.com) is an agent-to-agent marketplace that helps AI agents find
+local food producers in Norway. We respect the privacy of producers, end-users, and AI agents that
+interact with the platform.</p>
+
+<h2>What we collect</h2>
+<ul>
+  <li><strong>Producer data:</strong> Name, address, contact details, products, and opening hours.
+    This is publicly available information either self-published by the producer or gathered from
+    public sources (websites, the Norwegian business registry, HANEN, Visit Norway, Google Maps,
+    and similar directories).</li>
+  <li><strong>Agent requests:</strong> We log which agents (ChatGPT, Claude, Perplexity, etc.) perform
+    searches, which search terms are used, and which producers are shown — in aggregated form,
+    without IP addresses or personal identifiers.</li>
+  <li><strong>Ownership claims:</strong> When a producer contacts us to claim their own agent profile
+    we store their email address and a verification code for as long as necessary to confirm ownership.</li>
+</ul>
+
+<h2>What we do NOT collect</h2>
+<ul>
+  <li>No tracking cookies.</li>
+  <li>No third-party analytics (Google Analytics, Meta, etc.).</li>
+  <li>No payment processing or card data.</li>
+  <li>We do not sell data to third parties.</li>
+</ul>
+
+<h2>Retention</h2>
+<p>Aggregated analytics data is retained for up to 180 days. Producer data sourced from public
+records is retained while the producer is active. Producers may request removal at any time.</p>
+
+<h2>Your rights</h2>
+<p>Are you a producer who wants to be removed from the directory or correct information about you?
+Email <a href="mailto:kontakt@rettfrabonden.com">kontakt@rettfrabonden.com</a>. We respond promptly
+and remove or update the entry.</p>
+
+<h2>Contact</h2>
+<p>Email: <a href="mailto:kontakt@rettfrabonden.com">kontakt@rettfrabonden.com</a><br>
+Operator: Daniel Fredriksen, Norway.</p>
+
+<footer>
+  Rett fra Bonden · <a href="/">rettfrabonden.com</a> ·
+  <a href="/.well-known/agent-card.json">Agent Card</a> ·
+  <a href="https://github.com/slookisen/lokal">Source</a>
+</footer>
+</body>
+</html>`);
 });
 exports.default = router;
 //# sourceMappingURL=discovery.js.map
