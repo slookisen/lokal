@@ -619,4 +619,158 @@ Operator: Daniel Fredriksen, Norway.</p>
 </html>`);
 });
 
+// ═══════════════════════════════════════════════════════════════
+// 10. GET /terms — Terms of Service (bilingual NO/EN)
+//
+// Required for listing in the Anthropic Claude Connectors Directory.
+// Accessible at /terms, /terms-of-service, and /vilkar (Norwegian).
+// ═══════════════════════════════════════════════════════════════
+
+router.get(["/terms", "/terms-of-service", "/tos", "/vilkar"], (_req: Request, res: Response) => {
+  res.header("Content-Type", "text/html; charset=utf-8");
+  res.header("Cache-Control", "public, max-age=3600");
+  res.send(`<!DOCTYPE html>
+<html lang="no">
+<head>
+<meta charset="utf-8">
+<title>Vilkår / Terms of Service — Rett fra Bonden</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="description" content="Terms of Service for Rett fra Bonden (rettfrabonden.com) — A2A marketplace for local food in Norway.">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="icon" href="/favicon.ico" sizes="any">
+<style>
+  body { font-family: system-ui, -apple-system, sans-serif; max-width: 760px; margin: 2rem auto; padding: 0 1rem; color: #1a1a1a; line-height: 1.6; }
+  h1 { border-bottom: 2px solid #2d5016; padding-bottom: 0.3rem; }
+  h2 { color: #2d5016; margin-top: 2rem; }
+  code { background: #f4f4f4; padding: 0.1em 0.3em; border-radius: 3px; }
+  .lang-switch { text-align: right; margin-bottom: 1rem; font-size: 0.9rem; }
+  .lang-switch a { color: #2d5016; }
+  footer { margin-top: 3rem; padding-top: 1rem; border-top: 1px solid #ddd; font-size: 0.85rem; color: #666; }
+</style>
+</head>
+<body>
+<div class="lang-switch"><a href="#en">English</a></div>
+
+<h1>Vilkår for bruk</h1>
+<p><strong>Sist oppdatert:</strong> 20. april 2026</p>
+
+<p>Velkommen til Rett fra Bonden (rettfrabonden.com). Disse vilkårene gjelder for alle som bruker
+plattformen — enten du er sluttbruker, produsent, eller en AI-agent som kaller våre MCP- eller A2A-endepunkter.
+Ved å bruke tjenesten aksepterer du vilkårene.</p>
+
+<h2>1. Hva tjenesten er</h2>
+<p>Rett fra Bonden er et oppdagelseslag (discovery layer) for lokal mat i Norge. Vi eksponerer en
+katalog med produsenter gjennom MCP (Model Context Protocol), A2A JSON-RPC og en REST-API slik at
+AI-agenter og mennesker kan finne gårder, gårdsbutikker, REKO-ringer, bondens markeder og samvirker.
+Vi er <em>ikke</em> en butikk eller markedsplass som gjennomfører transaksjoner.</p>
+
+<h2>2. Hvordan du kan bruke tjenesten</h2>
+<ul>
+  <li>Du kan bruke API-ene, MCP-serveren og nettsiden til å finne og utforske produsenter.</li>
+  <li>Du kan integrere tjenesten i egne agenter eller applikasjoner innenfor rimelige rater.</li>
+  <li>Du må overholde robots.txt og rate-limit-grensene som er publisert på plattformen.</li>
+</ul>
+
+<h2>3. Hva du IKKE kan bruke tjenesten til</h2>
+<ul>
+  <li>Skrape hele datasettet for å republisere det som et konkurrerende register uten skriftlig tillatelse.</li>
+  <li>Sende automatisk masseutsendelse eller spam til produsenter via kontaktinformasjon hentet fra plattformen.</li>
+  <li>Omgå eller forstyrre sikkerhetsmekanismer, rate-limiter eller autentisering.</li>
+  <li>Bruke tjenesten til ulovlig virksomhet eller i strid med norsk lov.</li>
+</ul>
+
+<h2>4. Nøyaktighet og ansvarsfraskrivelse</h2>
+<p>Produsentdata er samlet fra offentlige kilder og direkte innmeldinger. Vi gjør vårt beste for å
+holde informasjonen oppdatert, men <strong>tjenesten leveres "som den er"</strong>. Vi garanterer ikke
+at åpningstider, priser, produktutvalg eller kontaktinformasjon er korrekte til enhver tid. Før du
+reiser til en produsent eller legger inn en bestilling, anbefaler vi at du verifiserer detaljene
+direkte med produsenten.</p>
+
+<h2>5. Ansvarsbegrensning</h2>
+<p>Rett fra Bonden er ikke ansvarlig for transaksjoner, leveranser, produktkvalitet eller
+uenigheter mellom kjøpere og produsenter. Vi tilrettelegger oppdagelse — vi er ikke part i kjøpet.</p>
+
+<h2>6. Produsentrettigheter</h2>
+<p>Er du produsent og ønsker å oppdatere, fjerne eller overta din egen oppføring? Kontakt oss
+på <a href="mailto:kontakt@rettfrabonden.com">kontakt@rettfrabonden.com</a>. Se også
+<a href="/personvern">personvernerklæringen</a>.</p>
+
+<h2>7. Endringer</h2>
+<p>Vi kan oppdatere disse vilkårene. Vesentlige endringer varsles på nettsiden. Fortsatt bruk etter
+endring regnes som aksept.</p>
+
+<h2>8. Gjeldende rett</h2>
+<p>Disse vilkårene reguleres av norsk rett. Tvister skal løses ved Daniels alminnelige verneting.</p>
+
+<h2>9. Kontakt</h2>
+<p>E-post: <a href="mailto:kontakt@rettfrabonden.com">kontakt@rettfrabonden.com</a><br>
+Operatør: Daniel Fredriksen, Norge.</p>
+
+<hr>
+
+<h1 id="en">Terms of Service</h1>
+<p><strong>Last updated:</strong> 20 April 2026</p>
+
+<p>Welcome to Rett fra Bonden (rettfrabonden.com). These terms apply to everyone who uses the
+platform — end-users, producers, and AI agents calling our MCP or A2A endpoints. By using the
+service you accept these terms.</p>
+
+<h2>1. What the service is</h2>
+<p>Rett fra Bonden is a discovery layer for local food in Norway. We expose a directory of producers
+through MCP (Model Context Protocol), A2A JSON-RPC, and a REST API so that AI agents and humans can
+find farms, farm shops, REKO rings, farmers' markets, and cooperatives. We are <em>not</em> a store
+or a marketplace that processes transactions.</p>
+
+<h2>2. Acceptable use</h2>
+<ul>
+  <li>You may use the APIs, MCP server, and website to find and explore producers.</li>
+  <li>You may integrate the service into your own agents and applications within reasonable rate limits.</li>
+  <li>You must respect robots.txt and published rate limits.</li>
+</ul>
+
+<h2>3. Prohibited use</h2>
+<ul>
+  <li>Scraping the full dataset to republish it as a competing directory without written permission.</li>
+  <li>Sending bulk unsolicited messages or spam to producers using contact info obtained from the platform.</li>
+  <li>Circumventing or disrupting security, rate limits, or authentication.</li>
+  <li>Using the service for unlawful activity or activity that violates Norwegian law.</li>
+</ul>
+
+<h2>4. Accuracy and disclaimer</h2>
+<p>Producer data is gathered from public sources and direct submissions. We make reasonable efforts
+to keep it current, but <strong>the service is provided "as is"</strong>. We do not warrant that
+opening hours, prices, product availability, or contact information are correct at any given moment.
+Before travelling to a producer or placing an order, we recommend verifying details directly with the
+producer.</p>
+
+<h2>5. Limitation of liability</h2>
+<p>Rett fra Bonden is not liable for transactions, deliveries, product quality, or disputes between
+buyers and producers. We facilitate discovery — we are not a party to the purchase.</p>
+
+<h2>6. Producer rights</h2>
+<p>Are you a producer who wants to update, remove, or claim your own listing? Contact us at
+<a href="mailto:kontakt@rettfrabonden.com">kontakt@rettfrabonden.com</a>. See also the
+<a href="/privacy">privacy policy</a>.</p>
+
+<h2>7. Changes</h2>
+<p>We may update these terms. Material changes will be posted on the site. Continued use after
+changes counts as acceptance.</p>
+
+<h2>8. Governing law</h2>
+<p>These terms are governed by Norwegian law. Disputes shall be resolved at Daniel's ordinary venue.</p>
+
+<h2>9. Contact</h2>
+<p>Email: <a href="mailto:kontakt@rettfrabonden.com">kontakt@rettfrabonden.com</a><br>
+Operator: Daniel Fredriksen, Norway.</p>
+
+<footer>
+  Rett fra Bonden · <a href="/">rettfrabonden.com</a> ·
+  <a href="/privacy">Privacy</a> ·
+  <a href="/.well-known/agent-card.json">Agent Card</a> ·
+  <a href="https://github.com/slookisen/lokal">Source</a>
+</footer>
+</body>
+</html>`);
+});
+
 export default router;

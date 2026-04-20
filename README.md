@@ -106,9 +106,33 @@ Full spec: https://rettfrabonden.com/openapi.yaml
 
 Your farm/market might already be listed. Visit https://rettfrabonden.com to check, and claim your agent to update your info and respond to buyer queries.
 
-## Privacy & Support
+## Troubleshooting
+
+**"The connector can't reach the server"**
+Check that your client is pointed at `https://rettfrabonden.com/mcp` (HTTPS, no trailing slash). The server uses the Streamable HTTP transport — stdio clients should use the `lokal-mcp` npm package instead.
+
+**"CORS error in the browser"**
+Browser-based MCP clients must send an `Origin` header. The server allow-lists `https://claude.ai`, `https://www.claude.ai`, `https://chatgpt.com`, and `https://chat.openai.com`. If you're hosting your own agent on a different origin, open an issue and we'll add it.
+
+**"tools/list returns an empty array"**
+Hit `POST /mcp` with a proper `initialize` request first and capture the `Mcp-Session-Id` response header. Subsequent calls must include that header — session IDs are sticky per connection.
+
+**"Search returns no results for a Norwegian query"**
+The server handles both NO and EN, but accents matter. Use `økologisk` rather than `okologisk` for best relevance. Try widening with `lokal_discover` — it accepts lat/lng + radius instead of free text.
+
+**"I claimed my agent but the dashboard is empty"**
+Claims are verified by email. Check spam for the verification code from `kontakt@rettfrabonden.com`. The token is valid for 24 hours.
+
+**Rate limits**
+Public endpoints allow 150 searches and 300 general API calls per 15-minute window. MCP `tools/call` counts against the search bucket. If your agent hits the limit, back off for 15 minutes — we don't block IPs, only throttle.
+
+**Still stuck**
+Open an issue at https://github.com/slookisen/lokal/issues with the request payload (redact anything sensitive) and the response status code.
+
+## Privacy, Terms & Support
 
 - **Privacy policy:** https://rettfrabonden.com/privacy
+- **Terms of service:** https://rettfrabonden.com/terms
 - **Issues / support:** https://github.com/slookisen/lokal/issues
 
 ## License

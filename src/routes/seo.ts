@@ -1332,7 +1332,9 @@ router.get("/:city", (req: Request, res: Response, next: any) => {
       || citySlug === "produsent" || citySlug === "sitemap.xml" || citySlug === "robots.txt"
       || citySlug === "openapi.json" || citySlug === "openapi.yaml" || citySlug === "favicon.ico"
       || citySlug === "selger" || citySlug === "admin" || citySlug === "om" || citySlug === "teknologi"
-      || citySlug === "personvern" || citySlug === "llms.txt" || citySlug === "llms-full.txt"
+      || citySlug === "personvern" || citySlug === "privacy" || citySlug === "privacy-policy"
+      || citySlug === "terms" || citySlug === "terms-of-service" || citySlug === "tos" || citySlug === "vilkar"
+      || citySlug === "llms.txt" || citySlug === "llms-full.txt"
       || citySlug === "agents" || citySlug === "docs" || citySlug === "samtaler" || citySlug === "samtale"
       || citySlug.includes(".")) {
     return next();
