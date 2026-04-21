@@ -802,6 +802,26 @@ router.post("/agents/:id/claim/verify", (req: Request, res: Response) => {
   // Recalculate trust score now that the agent is verified
   const newTrustScore = trustScoreService.update(agentId);
 
+  // Send admin notification about the new verified claim
+  try {
+    const db = getDb();
+    const claim = db.prepare(
+      "SELECT claimant_name, claimant_email, source FROM agent_claims WHERE id = ?"
+    ).get(claimId) as any;
+    const agent = db.prepare("SELECT name FROM agents WHERE id = ?").get(agentId) as any;
+    if (claim && agent) {
+      emailService.sendAdminClaimNotification(
+        agent.name,
+        agentId,
+        claim.claimant_name,
+        claim.claimant_email,
+        claim.source || "organic"
+      ).catch((err: any) => console.error("[Admin notify] Failed:", err.message));
+    }
+  } catch (err: any) {
+    console.error("[Admin notify] Error:", err.message);
+  }
+
   res.json({
     success: true,
     message: "Agenten er nå din! Bruk claim-token for å oppdatere informasjon.",

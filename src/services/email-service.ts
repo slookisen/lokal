@@ -622,6 +622,55 @@ Rett fra Bonden | rettfrabonden.com`;
     }
   }
 
+  async sendAdminClaimNotification(
+    agentName: string,
+    agentId: string,
+    claimantName: string,
+    claimantEmail: string,
+    source: string
+  ): Promise<{ success: boolean; messageId?: string; error?: string }> {
+    const adminEmail = process.env.ADMIN_NOTIFICATION_EMAIL;
+    if (!adminEmail) {
+      logger.info('ADMIN_NOTIFICATION_EMAIL not set — skipping claim notification');
+      return { success: true, messageId: 'NO_ADMIN_EMAIL' };
+    }
+
+    try {
+      const profileUrl = `https://rettfrabonden.com/produsent/${agentId}`;
+      const dashboardUrl = `https://rettfrabonden.com/admin/dashboard`;
+      const subject = `Ny verifisert bruker: ${claimantName} — ${agentName}`;
+
+      const htmlContent = `
+        <div style="font-family: -apple-system, sans-serif; max-width: 600px; margin: 0 auto; padding: 20px;">
+          <h2 style="color: #2d5016;">Ny verifisert produsent på Rett fra Bonden</h2>
+          <table style="width: 100%; border-collapse: collapse; margin: 16px 0;">
+            <tr><td style="padding: 8px; border-bottom: 1px solid #eee; font-weight: bold;">Produsent:</td><td style="padding: 8px; border-bottom: 1px solid #eee;">${this.escapeHtml(agentName)}</td></tr>
+            <tr><td style="padding: 8px; border-bottom: 1px solid #eee; font-weight: bold;">Eier:</td><td style="padding: 8px; border-bottom: 1px solid #eee;">${this.escapeHtml(claimantName)}</td></tr>
+            <tr><td style="padding: 8px; border-bottom: 1px solid #eee; font-weight: bold;">E-post:</td><td style="padding: 8px; border-bottom: 1px solid #eee;">${this.escapeHtml(claimantEmail)}</td></tr>
+            <tr><td style="padding: 8px; border-bottom: 1px solid #eee; font-weight: bold;">Kilde:</td><td style="padding: 8px; border-bottom: 1px solid #eee;">${this.escapeHtml(source || 'organic')}</td></tr>
+            <tr><td style="padding: 8px; font-weight: bold;">Tidspunkt:</td><td style="padding: 8px;">${new Date().toLocaleString('nb-NO', { timeZone: 'Europe/Oslo' })}</td></tr>
+          </table>
+          <p><a href="${profileUrl}" style="color: #2d5016;">Se produsentprofil →</a></p>
+          <p style="color: #888; font-size: 12px;">Automatisk varsling fra Rett fra Bonden</p>
+        </div>`;
+
+      const textContent = `Ny verifisert produsent på Rett fra Bonden\n\nProdusent: ${agentName}\nEier: ${claimantName}\nE-post: ${claimantEmail}\nKilde: ${source || 'organic'}\nTidspunkt: ${new Date().toISOString()}\n\nProfil: ${profileUrl}`;
+
+      return await this.sendEmail({
+        to: adminEmail,
+        subject,
+        htmlContent,
+        textContent,
+      });
+    } catch (error) {
+      logger.error('Error sending admin claim notification', {
+        agentName, claimantEmail,
+        error: error instanceof Error ? error.message : String(error),
+      });
+      return { success: false, error: error instanceof Error ? error.message : 'Unknown error' };
+    }
+  }
+
   private escapeHtml(text: string): string {
     const map: { [key: string]: string } = {
       '&': '&amp;',
