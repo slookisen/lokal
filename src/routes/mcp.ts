@@ -27,7 +27,7 @@ const router = Router();
 // ─── Tool definitions (shared logic) ────────────────────────
 // These mirror the stdio MCP server tools but call services directly.
 
-function registerTools(server: McpServer) {
+function registerTools(server: McpServer, getClientIdentity?: () => string | undefined) {
   // Tool 1: Natural language search
   server.registerTool(
     "lokal_search",
@@ -63,6 +63,7 @@ function registerTools(server: McpServer) {
             sellerAgentId: r.agent.id,
             queryText: query,
             source: "mcp",
+            clientIdentity: getClientIdentity?.(),
             autoRespond: true,
           });
           convLinks.push(`💬 [Samtale med ${conv.sellerAgentName}](${BASE}/samtale/${conv.id})`);
@@ -124,6 +125,7 @@ function registerTools(server: McpServer) {
             sellerAgentId: r.agent.id,
             queryText: queryDesc,
             source: "mcp",
+            clientIdentity: getClientIdentity?.(),
             autoRespond: true,
           });
           convLinks.push(`💬 [Samtale med ${conv.sellerAgentName}](${BASE}/samtale/${conv.id})`);
@@ -317,7 +319,28 @@ interface McpSession {
   transport: StreamableHTTPServerTransport;
   server: McpServer;
   lastActivity: number;
+  clientIdentity?: string;  // e.g. "ChatGPT", "Claude Desktop", "Cursor"
 }
+
+// ─── MCP client identity detection ─────────────────────────
+// Identifies the AI platform from request headers.
+function detectMcpClient(req: Request): string | undefined {
+  const ua = (req.headers["user-agent"] || "").toLowerCase();
+  const origin = (req.headers["origin"] || "").toLowerCase();
+  const referer = (req.headers["referer"] || "").toLowerCase();
+
+  if (ua.includes("chatgpt") || ua.includes("openai") || origin.includes("openai") || origin.includes("chatgpt")) return "ChatGPT";
+  if (ua.includes("claude") || origin.includes("claude.ai") || origin.includes("anthropic")) return "Claude";
+  if (ua.includes("cursor")) return "Cursor";
+  if (ua.includes("copilot") || origin.includes("github.com")) return "GitHub Copilot";
+  if (ua.includes("windsurf")) return "Windsurf";
+  if (ua.includes("cline")) return "Cline";
+  if (ua.includes("continue")) return "Continue";
+  if (ua.includes("python")) return "Python SDK";
+  if (ua.includes("node")) return "Node SDK";
+  return undefined;
+}
+
 
 const sessions = new Map<string, McpSession>();
 const SESSION_TTL_MS = 30 * 60 * 1000; // 30 minutes
@@ -333,17 +356,24 @@ setInterval(() => {
   }
 }, 5 * 60 * 1000);
 
-async function getOrCreateSession(sessionId?: string): Promise<{ id: string; session: McpSession }> {
+async function getOrCreateSession(sessionId?: string, req?: Request): Promise<{ id: string; session: McpSession }> {
   if (sessionId && sessions.has(sessionId)) {
     const session = sessions.get(sessionId)!;
     session.lastActivity = Date.now();
+    // Update client identity if we detect one and didn't have one before
+    if (!session.clientIdentity && req) {
+      session.clientIdentity = detectMcpClient(req);
+    }
     return { id: sessionId, session };
   }
 
-  // Create new session
+  // Create new session — detect which AI platform is connecting
   const id = sessionId || randomUUID();
+  const clientIdentity = req ? detectMcpClient(req) : undefined;
+
   const server = new McpServer({ name: "lokal", version: "0.3.0" });
-  registerTools(server);
+  const sessionRef = { clientIdentity };
+  registerTools(server, () => sessionRef.clientIdentity);
 
   const transport = new StreamableHTTPServerTransport({
     sessionIdGenerator: () => id,
@@ -351,7 +381,7 @@ async function getOrCreateSession(sessionId?: string): Promise<{ id: string; ses
 
   await server.connect(transport);
 
-  const session: McpSession = { transport, server, lastActivity: Date.now() };
+  const session: McpSession = { transport, server, lastActivity: Date.now(), clientIdentity };
   sessions.set(id, session);
   return { id, session };
 }
@@ -362,7 +392,7 @@ async function getOrCreateSession(sessionId?: string): Promise<{ id: string; ses
 router.post("/", async (req: Request, res: Response) => {
   try {
     const sessionId = req.headers["mcp-session-id"] as string | undefined;
-    const { session } = await getOrCreateSession(sessionId);
+    const { session } = await getOrCreateSession(sessionId, req);
     await session.transport.handleRequest(req, res, req.body);
   } catch (err: any) {
     console.error("MCP POST error:", err.message);

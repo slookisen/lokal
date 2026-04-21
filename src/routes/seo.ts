@@ -827,6 +827,21 @@ router.get("/sok", async (req: Request, res: Response) => {
 
     const geoFiltered = !!parsed.location && !heleNorge;
 
+    // ─── Log web search as conversation (source: "web") ─────────
+    // Captures human frontend searches in /samtaler alongside AI traffic.
+    // Only top 1 match to avoid noise from casual browsing.
+    if (results.length > 0) {
+      try {
+        conversationService.startConversation({
+          sellerAgentId: results[0].agent.id,
+          queryText: q,
+          source: "web",
+          buyerAgentName: "Besøkende",
+          autoRespond: true,
+        });
+      } catch { /* non-critical — don't break search if logging fails */ }
+    }
+
     const resultCards = results.map((r: any) => producerCard(r.agent, r.matchReasons)).join("");
 
     const heleNorgeLink = geoFiltered

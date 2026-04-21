@@ -58,10 +58,12 @@ class ConversationService {
   // knowledge base — no LLM needed, pure template logic.
   startConversation(opts: {
     buyerAgentId?: string;
+    buyerAgentName?: string;
     sellerAgentId: string;
     queryText?: string;
     taskId?: string;
     source?: "a2a" | "mcp" | "web" | "api";
+    clientIdentity?: string;   // e.g. "ChatGPT", "Claude Desktop", "Cursor"
     autoRespond?: boolean;  // default true — seller agent replies automatically
   }): Conversation {
     const db = getDb();
@@ -81,16 +83,17 @@ class ConversationService {
     const sellerCategories = seller?.categories ? JSON.parse(seller.categories).join(", ") : "";
 
     // System message introducing the match
+    const clientTag = opts.clientIdentity ? ` via ${opts.clientIdentity}` : "";
     const systemMsg = opts.queryText
-      ? `Søk: "${opts.queryText}" → Match: ${sellerName} (${sellerCity}). Kategorier: ${sellerCategories}.`
-      : `Ny samtale startet med ${sellerName} (${sellerCity}).`;
+      ? `Søk: "${opts.queryText}" → Match: ${sellerName} (${sellerCity}). Kategorier: ${sellerCategories}.${clientTag}`
+      : `Ny samtale startet med ${sellerName} (${sellerCity}).${clientTag}`;
 
     this.addMessage({
       conversationId: id,
       senderRole: "system",
       content: systemMsg,
       messageType: "info",
-      metadata: { sellerAgentId: opts.sellerAgentId, queryText: opts.queryText, source },
+      metadata: { sellerAgentId: opts.sellerAgentId, queryText: opts.queryText, source, ...(opts.clientIdentity ? { clientIdentity: opts.clientIdentity } : {}) },
     });
 
     // ─── Seller agent auto-response ──────────────────────────
@@ -367,7 +370,7 @@ class ConversationService {
   }
 
   // ─── List recent conversations ──────────────────────────
-  listConversations(opts: { limit?: number; status?: string; agentId?: string } = {}): Conversation[] {
+  listConversations(opts: { limit?: number; status?: string; agentId?: string; source?: string } = {}): Conversation[] {
     const db = getDb();
     let sql = `
       SELECT c.*,
@@ -381,6 +384,7 @@ class ConversationService {
     const params: any[] = [];
 
     if (opts.status) { sql += " AND c.status = ?"; params.push(opts.status); }
+    if (opts.source) { sql += " AND c.source = ?"; params.push(opts.source); }
     if (opts.agentId) {
       sql += " AND (c.buyer_agent_id = ? OR c.seller_agent_id = ?)";
       params.push(opts.agentId, opts.agentId);
@@ -403,6 +407,19 @@ class ConversationService {
       createdAt: row.created_at,
       updatedAt: row.updated_at,
     }));
+  }
+
+  // ─── Conversation stats by source ─────────────────────────
+  getSourceStats(): { source: string; count: number; lastActivity: string }[] {
+    const db = getDb();
+    const rows = db.prepare(`
+      SELECT COALESCE(source, 'api') as source, COUNT(*) as count,
+        MAX(updated_at) as last_activity
+      FROM conversations
+      GROUP BY COALESCE(source, 'api')
+      ORDER BY count DESC
+    `).all() as any[];
+    return rows.map(r => ({ source: r.source, count: r.count, lastActivity: r.last_activity }));
   }
 
   // ─── Get agent metrics (seller dashboard / social proof) ─
