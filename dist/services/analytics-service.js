@@ -44,16 +44,25 @@ function parseUserAgent(ua) {
         return { isBot: false, clientType: "unknown" };
     const lower = ua.toLowerCase();
     // AI agent detection
-    if (lower.includes("chatgpt"))
+    // WHY: we were previously only matching "chatgpt" but OpenAI's crawler is
+    // "GPTBot" and its browsing agent is "ChatGPT-User"; likewise ClaudeBot and
+    // Claude-User for Anthropic. Match the full real-world fleet so agentTraffic
+    // actually reflects crawler hits.
+    if (lower.includes("gptbot") || lower.includes("chatgpt") || lower.includes("oai-searchbot")) {
         return { isBot: true, clientType: "chatgpt", clientName: "ChatGPT" };
-    if (lower.includes("claude"))
+    }
+    if (lower.includes("claudebot") || lower.includes("claude-user") || lower.includes("claude")) {
         return { isBot: true, clientType: "claude", clientName: "Claude" };
+    }
     if (lower.includes("gpt-4") || lower.includes("gpt-3"))
         return { isBot: true, clientType: "chatgpt", clientName: "GPT" };
-    if (lower.includes("gemini"))
+    if (lower.includes("gemini") || lower.includes("google-extended"))
         return { isBot: true, clientType: "gemini", clientName: "Gemini" };
-    if (lower.includes("bingbot") || lower.includes("googlebot"))
+    if (lower.includes("perplexitybot") || lower.includes("perplexity"))
+        return { isBot: true, clientType: "a2a-agent", clientName: "Perplexity", botSource: "ai_search" };
+    if (lower.includes("bingbot") || lower.includes("googlebot") || lower.includes("ccbot") || lower.includes("bytespider") || lower.includes("applebot") || lower.includes("yandexbot")) {
         return { isBot: true, clientType: "a2a-agent", botSource: "search_engine" };
+    }
     if (lower.includes("curl") || lower.includes("node") || lower.includes("python"))
         return { isBot: true, clientType: "a2a-agent", botSource: "api_client" };
     // Human browser detection
@@ -303,13 +312,48 @@ class AnalyticsService {
       `).all(cutoff);
             const topSearchTerms = topQueriesResult.map(r => ({ query: r.query, count: r.count }));
             // AI agent traffic breakdown
-            const agentResult = db.prepare(`
+            // WHY: bots overwhelmingly produce page views, not search queries, so the
+            // old agent_id read from analytics_queries always came back ~0 even when
+            // GPTBot and ClaudeBot were hammering the site. session_id is stored as
+            // `${ipHash}:${userAgent}`, so we can scan it for crawler UA tokens and
+            // get a truthful read on AI visibility.
+            const agentTraffic = { chatgpt: 0, claude: 0, other: 0 };
+            // ChatGPT family: OpenAI crawlers and ChatGPT-User browsing agent.
+            const chatgptRow = db.prepare(`
+        SELECT COUNT(*) as count FROM analytics_page_views
+        WHERE created_at > ? AND ${"(is_owner IS NULL OR is_owner = 0)"}
+          AND (session_id LIKE '%GPTBot%' OR session_id LIKE '%ChatGPT%' OR session_id LIKE '%OAI-SearchBot%')
+      `).get(cutoff);
+            agentTraffic.chatgpt = chatgptRow?.count || 0;
+            // Claude family: ClaudeBot crawler and Claude-User browsing agent.
+            const claudeRow = db.prepare(`
+        SELECT COUNT(*) as count FROM analytics_page_views
+        WHERE created_at > ? AND ${"(is_owner IS NULL OR is_owner = 0)"}
+          AND (session_id LIKE '%ClaudeBot%' OR session_id LIKE '%Claude-User%' OR session_id LIKE '%Anthropic%')
+      `).get(cutoff);
+            agentTraffic.claude = claudeRow?.count || 0;
+            // Other AI / non-human retrievers — Gemini, Perplexity, Google-Extended,
+            // CCBot, Bytespider, Applebot, YandexBot.
+            const otherRow = db.prepare(`
+        SELECT COUNT(*) as count FROM analytics_page_views
+        WHERE created_at > ? AND ${"(is_owner IS NULL OR is_owner = 0)"}
+          AND (
+            session_id LIKE '%Gemini%' OR session_id LIKE '%Google-Extended%'
+            OR session_id LIKE '%PerplexityBot%' OR session_id LIKE '%Perplexity-User%'
+            OR session_id LIKE '%CCBot%' OR session_id LIKE '%Bytespider%'
+            OR session_id LIKE '%Applebot-Extended%' OR session_id LIKE '%YandexAdditional%'
+          )
+      `).get(cutoff);
+            agentTraffic.other = otherRow?.count || 0;
+            // Back-compat: if the analytics_queries table has search-query hits from
+            // explicitly named agents (ChatGPT/Claude), fold those in too so we don't
+            // under-count real search-query traffic that also happens to be AI.
+            const agentQueryResult = db.prepare(`
         SELECT agent_id, COUNT(*) as count FROM analytics_queries
         WHERE created_at > ? AND agent_id IS NOT NULL
         GROUP BY agent_id
       `).all(cutoff);
-            const agentTraffic = { chatgpt: 0, claude: 0, other: 0 };
-            agentResult.forEach(row => {
+            agentQueryResult.forEach(row => {
                 if (row.agent_id === "ChatGPT")
                     agentTraffic.chatgpt += row.count;
                 else if (row.agent_id === "Claude")

@@ -98,7 +98,7 @@ ${topCats.map(([cat, count]) => `- ${cat} (${count} produsenter)`).join("\n")}
 
 - Nettside: ${BASE_URL}
 - GitHub: https://github.com/slookisen/lokal
-- npm: https://www.npmjs.com/package/lokal-food-mcp
+- npm: https://www.npmjs.com/package/lokal-mcp
 
 ## Lisens
 

@@ -4,6 +4,7 @@ export declare const corsOptions: {
     credentials: boolean;
     methods: string[];
     allowedHeaders: string[];
+    exposedHeaders: string[];
 };
 export declare const securityHeaders: (req: import("node:http").IncomingMessage, res: import("node:http").ServerResponse, next: (err?: unknown) => void) => void;
 export declare const MAX_REQUEST_SIZE = "1mb";

@@ -27,9 +27,20 @@ const router = (0, express_1.Router)();
 // These mirror the stdio MCP server tools but call services directly.
 function registerTools(server) {
     // Tool 1: Natural language search
-    server.tool("lokal_search", "Search for local food producers in Norway using natural language. Supports Norwegian and English. Returns ranked producers with contact info. Examples: 'fresh vegetables near Grünerløkka', 'organic honey Oslo', 'ost Trondheim'.", {
-        query: zod_1.z.string().describe("Natural language search query (Norwegian or English)"),
-        limit: zod_1.z.number().min(1).max(50).default(10).describe("Max results"),
+    server.registerTool("lokal_search", {
+        title: "Search local food producers",
+        description: "Search for local food producers in Norway using natural language. Supports Norwegian and English. Returns ranked producers with contact info and automatically starts a conversation with the top matches so sellers can respond. Examples: 'fresh vegetables near Grünerløkka', 'organic honey Oslo', 'ost Trondheim'.",
+        inputSchema: {
+            query: zod_1.z.string().describe("Natural language search query (Norwegian or English)"),
+            limit: zod_1.z.number().min(1).max(50).default(10).describe("Max results"),
+        },
+        annotations: {
+            title: "Search local food producers",
+            readOnlyHint: false,
+            destructiveHint: false,
+            idempotentHint: false,
+            openWorldHint: false,
+        },
     }, async ({ query, limit }) => {
         const parsed = marketplace_registry_1.marketplaceRegistry.parseNaturalQuery(query);
         const results = marketplace_registry_1.marketplaceRegistry.discover({ ...parsed, limit: limit || 10, offset: 0 });
@@ -63,13 +74,24 @@ function registerTools(server) {
         return { content: [{ type: "text", text: header + "\n" + lines.join("\n\n") + convSection }] };
     });
     // Tool 2: Structured discovery
-    server.tool("lokal_discover", "Structured search in the Lokal food producer registry. Filter by food categories, tags, and geographic distance.", {
-        categories: zod_1.z.array(zod_1.z.string()).optional().describe("Categories: vegetables, fruit, berries, dairy, eggs, meat, fish, bread, honey, herbs"),
-        tags: zod_1.z.array(zod_1.z.string()).optional().describe("Tags: organic, seasonal, budget, local, fresh"),
-        lat: zod_1.z.number().optional().describe("Latitude for distance filtering"),
-        lng: zod_1.z.number().optional().describe("Longitude for distance filtering"),
-        maxDistanceKm: zod_1.z.number().optional().describe("Max distance in km"),
-        limit: zod_1.z.number().min(1).max(50).default(10).describe("Max results"),
+    server.registerTool("lokal_discover", {
+        title: "Discover producers by filter",
+        description: "Structured search in the Lokal food producer registry. Filter by food categories, tags, and geographic distance. Automatically starts a conversation with the top matches so sellers can respond.",
+        inputSchema: {
+            categories: zod_1.z.array(zod_1.z.string()).optional().describe("Categories: vegetables, fruit, berries, dairy, eggs, meat, fish, bread, honey, herbs"),
+            tags: zod_1.z.array(zod_1.z.string()).optional().describe("Tags: organic, seasonal, budget, local, fresh"),
+            lat: zod_1.z.number().optional().describe("Latitude for distance filtering"),
+            lng: zod_1.z.number().optional().describe("Longitude for distance filtering"),
+            maxDistanceKm: zod_1.z.number().optional().describe("Max distance in km"),
+            limit: zod_1.z.number().min(1).max(50).default(10).describe("Max results"),
+        },
+        annotations: {
+            title: "Discover producers by filter",
+            readOnlyHint: false,
+            destructiveHint: false,
+            idempotentHint: false,
+            openWorldHint: false,
+        },
     }, async ({ categories, tags, lat, lng, maxDistanceKm, limit }) => {
         const body = { categories, tags, lat, lng, maxDistanceKm, limit: limit || 10, role: "producer" };
         const results = marketplace_registry_1.marketplaceRegistry.discover(body);
@@ -103,8 +125,19 @@ function registerTools(server) {
         return { content: [{ type: "text", text: header + "\n" + lines.join("\n\n") + convSection }] };
     });
     // Tool 3: Producer details
-    server.tool("lokal_info", "Get detailed information about a specific Lokal producer — address, products, opening hours, certifications, and contact info.", {
-        agentId: zod_1.z.string().describe("The producer's agent ID (UUID)"),
+    server.registerTool("lokal_info", {
+        title: "Producer details",
+        description: "Get detailed information about a specific Lokal producer — address, products, opening hours, certifications, and contact info.",
+        inputSchema: {
+            agentId: zod_1.z.string().describe("The producer's agent ID (UUID)"),
+        },
+        annotations: {
+            title: "Producer details",
+            readOnlyHint: true,
+            destructiveHint: false,
+            idempotentHint: true,
+            openWorldHint: false,
+        },
     }, async ({ agentId }) => {
         const info = knowledge_service_1.knowledgeService.getAgentInfo(agentId);
         if (!info) {
@@ -161,7 +194,18 @@ function registerTools(server) {
         return { content: [{ type: "text", text: sections.join("\n") }] };
     });
     // Tool 4: Platform stats
-    server.tool("lokal_stats", "Get Lokal platform statistics — total agents, cities covered, interactions.", {}, async () => {
+    server.registerTool("lokal_stats", {
+        title: "Platform statistics",
+        description: "Get Lokal platform statistics — total agents, cities covered, interactions.",
+        inputSchema: {},
+        annotations: {
+            title: "Platform statistics",
+            readOnlyHint: true,
+            destructiveHint: false,
+            idempotentHint: true,
+            openWorldHint: false,
+        },
+    }, async () => {
         const stats = marketplace_registry_1.marketplaceRegistry.getStats();
         const text = [
             "📊 **Lokal — Plattformstatistikk**",

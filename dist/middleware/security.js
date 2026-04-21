@@ -8,17 +8,38 @@ exports.sanitizeInput = sanitizeInput;
 const express_rate_limit_1 = __importDefault(require("express-rate-limit"));
 const helmet_1 = __importDefault(require("helmet"));
 // ─── CORS ────────────────────────────────────────────────────
-// Fix #8: Restrict to known origins instead of reflecting all
+// Fix #8: Restrict to known origins instead of reflecting all.
+// Allowed origins include our own surfaces PLUS the AI platforms that
+// connect to /mcp over Streamable HTTP from a browser context
+// (Claude.ai, ChatGPT). Without these, browser-initiated MCP
+// connections fail CORS preflight.
 exports.corsOptions = {
     origin: [
         "https://rettfrabonden.com",
         "https://www.rettfrabonden.com",
         "https://lokal.fly.dev",
+        "https://claude.ai",
+        "https://www.claude.ai",
+        "https://chatgpt.com",
+        "https://chat.openai.com",
         ...(process.env.NODE_ENV !== "production" ? ["http://localhost:3000"] : []),
     ],
     credentials: true,
     methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
-    allowedHeaders: ["Content-Type", "Authorization", "X-API-Key", "X-Admin-Key", "X-Claim-Token"],
+    allowedHeaders: [
+        "Content-Type",
+        "Authorization",
+        "X-API-Key",
+        "X-Admin-Key",
+        "X-Claim-Token",
+        // MCP Streamable HTTP (spec 2025-06-18) — session + version headers
+        "Mcp-Session-Id",
+        "Mcp-Protocol-Version",
+        // SSE resumption for Streamable HTTP long-lived responses
+        "Last-Event-ID",
+    ],
+    // Expose MCP headers so browser clients can read them from responses
+    exposedHeaders: ["Mcp-Session-Id", "Mcp-Protocol-Version"],
 };
 // ─── Security headers (Helmet) ───────────────────────────────
 // Fix #9: Enable CSP with sensible defaults

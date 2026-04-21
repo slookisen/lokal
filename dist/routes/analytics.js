@@ -326,6 +326,16 @@ router.get("/pages", (req, res) => {
     try {
         const db = (0, init_1.getDb)();
         const cutoff = sqliteDatetime(new Date(Date.now() - hours * 60 * 60 * 1000));
+        // Exclude automated vulnerability-scanner paths. These paths are hit by
+        // bots looking for vulnerable WordPress/PHP installs and aren't signal for
+        // what real users or AI agents are reading. They were previously polluting
+        // the top-20 (103 views on /wordpress/wp-admin/setup-config.php, etc).
+        const SCANNER_PATTERNS = [
+            "%wp-admin%", "%wp-login%", "%wp-includes%", "%wordpress%",
+            "%wlwmanifest%", "%xmlrpc%", "%/.env%", "%/.git%",
+            "%phpunit%", "%phpinfo%", "%setup-config%",
+        ];
+        const scannerExclusion = SCANNER_PATTERNS.map(() => "path NOT LIKE ?").join(" AND ");
         const pages = db.prepare(`
       SELECT
         path,
@@ -333,10 +343,11 @@ router.get("/pages", (req, res) => {
         COUNT(DISTINCT session_id) as visitors
       FROM analytics_page_views
       WHERE created_at > ? AND ${NOT_OWNER}
+        AND (${scannerExclusion})
       GROUP BY path
       ORDER BY views DESC
       LIMIT ?
-    `).all(cutoff, limit);
+    `).all(cutoff, ...SCANNER_PATTERNS, limit);
         res.json({ pages });
     }
     catch (err) {
