@@ -30,6 +30,46 @@ const BASE_URL = process.env.BASE_URL || "http://localhost:3000";
 // We respond with standard JSON-RPC results.
 // ═══════════════════════════════════════════════════════════════
 
+// ─── GET /a2a — Health check & agent card discovery ─────────
+// A2A registries (a2aregistry.org, etc.) send GET requests to check
+// health. Returning the agent card here makes us conformant and
+// lets registries verify we're alive without needing a POST.
+router.get("/a2a", (_req: Request, res: Response) => {
+  try {
+    const agents = marketplaceRegistry.getActiveAgents();
+    const cities = [...new Set(agents.map((a: any) => a.city).filter(Boolean))];
+    const card = {
+      name: "Lokal",
+      description: `A2A marketplace for local food in Norway. Connect AI agents with ${agents.length}+ verified local farms, shops, cooperatives, farm shops, REKO rings, and markets. Agent-markedsplass for lokal mat i Norge.`,
+      url: process.env.BASE_URL || "https://rettfrabonden.com",
+      provider: {
+        organization: "Lokal",
+        url: process.env.BASE_URL || "https://rettfrabonden.com",
+        contactUrl: `${process.env.BASE_URL || "https://rettfrabonden.com"}/docs`,
+        description: "Open agent-to-agent food marketplace operator. Norges første A2A-markedsplass for lokal mat.",
+      },
+      version: "1.0.0",
+      documentationUrl: `${process.env.BASE_URL || "https://rettfrabonden.com"}/docs`,
+      defaultInputModes: ["text/plain", "application/json"],
+      defaultOutputModes: ["application/json"],
+      capabilities: { streaming: false, pushNotifications: false, stateTransitionHistory: true },
+      authentication: { schemes: ["apiKey"], credentials: null },
+      interfaces: [
+        { type: "json-rpc", url: `${process.env.BASE_URL || "https://rettfrabonden.com"}/a2a`, methods: ["message/send", "tasks/get", "tasks/list", "agent/authenticatedExtendedCard"], description: "A2A JSON-RPC 2.0 endpoint" },
+        { type: "rest", url: `${process.env.BASE_URL || "https://rettfrabonden.com"}/api/marketplace`, description: "REST API for search, discovery, registration" },
+      ],
+      skills: [
+        { id: "discover-local-food-agents", name: "Discover Local Food Agents", description: `Search ${agents.length}+ verified local food producers in Norway`, tags: ["local food", "organic", "farm direct", "Norway"], examples: ["Find organic farms near Oslo", "finn grønnsaker i Bergen"] },
+        { id: "agent-conversation", name: "Start Agent Negotiation", description: "Initiate buyer-seller conversation between agents", tags: ["negotiate", "order", "transaction"], examples: ["negotiate delivery of tomatoes"] },
+      ],
+      "x-lokal": { type: "registry", region: "Norway", stats: { totalAgents: agents.length, cities: cities.slice(0, 30) } },
+    };
+    res.json(card);
+  } catch (err: any) {
+    res.status(500).json({ error: "Failed to generate agent card", detail: err.message });
+  }
+});
+
 router.post("/a2a", (req: Request, res: Response) => {
   const { jsonrpc, method, params, id } = req.body;
 
