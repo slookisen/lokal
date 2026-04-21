@@ -3,8 +3,8 @@
 
 **Project:** Rett fra Bonden (rettfrabonden.com)
 **Domain:** Local food producers in Norway
-**Timeline:** March 29 – April 20, 2026 (~3 weeks)
-**Result:** 1,400+ producer agents, 5 MCP marketplaces, A2A protocol, Custom GPT, Claude Connectors, AWS Registry
+**Timeline:** March 29 – April 21, 2026 (~3.5 weeks)
+**Result:** 1,165 live producer agents (1,400+ total records), 5 MCP marketplaces, A2A protocol, Custom GPT, Claude Connectors, AWS Bedrock AgentCore Registry
 **Auto-updated by:** `rfb-guidebook` scheduled agent
 
 > This guide is designed so that an AI agent can follow it step-by-step to reproduce the entire project with a different domain/vertical. Human intervention is only needed for: account logins, domain purchases, and payment confirmations.
@@ -805,6 +805,43 @@ fly secrets set ANALYTICS_ADMIN_KEY=your-secure-key
 
 **GOTCHA:** Fly.io "Set secret" only stages the value. You must click "Deploy Secrets" or run `fly deploy` to activate it.
 
+### 7.4 AI-Bot User-Agent Classifier
+
+The `agentTraffic` summary metric (chatgpt / claude / other) is the platform's primary AI-visibility KPI. It is computed in `analytics-service.ts` and **must be derived from page views, not search queries** — AI crawlers produce GETs against your pages, they almost never hit `/search`. Two rules:
+
+1. Store `session_id` as `ipHash:userAgent` in `analytics_page_views` so you can recover the UA later via a `LIKE` substring match.
+2. `parseUserAgent()` must whitelist the full set of AI crawler UA tokens, not just the consumer chat product names. As of April 2026 the live list is:
+
+   ```
+   GPTBot, ChatGPT-User, OAI-SearchBot          → "chatgpt"
+   ClaudeBot, Claude-User                       → "claude"
+   PerplexityBot, Perplexity-User               → "perplexity"
+   Google-Extended, Googlebot                   → "google" / "googlebot"
+   CCBot, Bytespider, Applebot, YandexBot, …    → "other-ai"
+   ```
+
+   Combine this with the older `analytics_queries.agent_id` lookup (folded in for back-compat so any human-on-ChatGPT search traffic still counts).
+
+Without this, a site that's getting 1,000+ AI-crawler hits per day will report `chatgpt: 0, claude: 0` and quietly under-sell its main growth metric.
+
+### 7.5 Top-Pages Scanner Noise Filter
+
+`/admin/analytics/pages` ranks paths by view count. WordPress vulnerability scanners hit hundreds of plausible-looking paths (`/wp-admin/setup-config.php`, `/wlwmanifest.xml`, `/.env`, `/.git/config`, `/phpinfo.php`, `/setup-config`) that will dominate any new site's top-20 within 48 hours. Filter them at the report level (don't drop the rows from the table — you still want them in `/traffic-classification` as `scanner` for security visibility):
+
+```sql
+WHERE path NOT LIKE '%wp-admin%'
+  AND path NOT LIKE '%wp-login%'
+  AND path NOT LIKE '%wp-includes%'
+  AND path NOT LIKE '%wordpress%'
+  AND path NOT LIKE '%wlwmanifest%'
+  AND path NOT LIKE '%xmlrpc%'
+  AND path NOT LIKE '%.env%'
+  AND path NOT LIKE '%.git%'
+  AND path NOT LIKE '%phpunit%'
+  AND path NOT LIKE '%phpinfo%'
+  AND path NOT LIKE '%setup-config%'
+```
+
 ---
 
 <a id="phase-8"></a>
@@ -1101,6 +1138,29 @@ links:        0.10 weight (external link validation)
 - **Tier S:** Compliance (valid agent card, all required schema fields)
 - **Tier A:** AI readiness (structured data, keywords, trust score > 0.5)
 
+### 11.5 Coverage Snapshot — Run #30 (2026-04-21)
+
+Track these numbers between runs. They are the enrichment pipeline's primary KPIs; if any of them regresses without a schema change, the run probably silently 401'd or rate-limited.
+
+| Field | Coverage | Target |
+|---|---|---|
+| Phone | 72.5% | 80%+ |
+| Email | 65.0% | 70%+ |
+| Website | 90.0% | 95%+ |
+| Address | 97.5% | 98%+ |
+| About-text | 100.0% | — |
+| External Links | **100.0%** | 60%+ (exceeded) |
+| Opening Hours | 27.5% | 70%+ |
+| Google Rating | 2.5% | 50%+ (blocked by Google Maps scraping — use Places API) |
+| Trust score (mean) | 0.429 | 0.60+ |
+
+**Unreachable without schema work:** `seasonality` (389 values computed, 0 persisted), `deliveryRadius` (721 computed, 0 persisted), `images`, `minOrderValue`. See Appendix C.11.
+
+### 11.6 Throughput Tuning
+
+- Fly.io rate limit in the live `security` middleware: **300 requests / 15-minute window.** A full-registry pass over ~1,165 agents at 3 requests per agent (GET /marketplace/agents/:id + GET /agents/:id/knowledge + PUT) requires ≥8 rate-limit windows, i.e. ~2 hours wall-clock.
+- Target 50 agents per enrichment run when running as a scheduled agent; a full registry pass is a weekend job, not a weekday one.
+
 ---
 
 <a id="phase-12"></a>
@@ -1180,6 +1240,17 @@ app.use((req, res, next) => {
 });
 ```
 
+### 12.5 Keep Self-Described Identifiers in Sync
+
+Your `/llms.txt`, `/agents.txt`, agent-card, and MCP registry description all advertise the **same** counts and the **same** npm/registry links. When any of those drift, every AI crawler that fetches two of the four endpoints gets conflicting data — and trust degrades silently.
+
+Checklist for every endpoint that self-describes:
+- Counts (`1165+ producers`) must be read from the live registry at request time, **not hardcoded or templated at build time**.
+- Package names (e.g. `lokal-mcp`) must match the published npm name exactly. A typo like `lokal-food-mcp` in `llms.txt` sends every AI agent to a 404 — silent discoverability loss.
+- Version numbers must come from `package.json`, not a string literal.
+
+Suggested contract: a single `src/config/identity.ts` exports `{ packageName, registryCount, version }` and every self-describing route imports from there.
+
 ---
 
 <a id="phase-13"></a>
@@ -1200,6 +1271,19 @@ Test your agent compliance at: https://isitagentready.com/YOUR_DOMAIN
 - `/.well-known/oauth-protected-resource` (RFC 9728)
 - Link headers on all responses
 - Markdown content negotiation
+
+### 13.2 A2A v1.0 — Signed Agent Cards (incoming table-stakes)
+
+A2A v1.0 shipped early 2026 with four changes: **Signed Agent Cards** (cryptographic signature proving domain ownership), multi-tenancy, multi-protocol bindings (JSON-RPC + gRPC), and version negotiation. Of these, **Signed Agent Cards is the one decentralized discovery actually depends on** — consuming agents will increasingly prefer signed cards and downrank unsigned ones.
+
+**Timeline:** not yet blocking in April 2026, but ~2 quarters (Q3 2026) before unsigned cards are penalized in agent-trust scoring. Plan for:
+
+1. Generate a domain signing key pair (keep the private key in Fly secrets: `AGENT_CARD_SIGNING_KEY`).
+2. Publish the public key at `/.well-known/agent-card-public-key.pem` or as a JWK at `/.well-known/jwks.json`.
+3. Emit a detached JWS over the agent-card JSON on every request to `/.well-known/agent-card.json` (header: `X-Agent-Card-Signature`) OR embed the signature as a top-level `signature` field per the A2A v1.0 spec.
+4. Rotate the signing key via a scheduled task every 12 months; publish the old public key with a `validUntil` field so in-flight clients don't break.
+
+Estimated effort: ~1 day of work once the A2A v1.0 JWS schema stabilizes. Track the A2A spec repo for the canonical signature format before implementing.
 
 ---
 
@@ -1503,6 +1587,14 @@ Post-deploy:
    app.get("/agents.txt", agentsTxt);
    ```
 
+14. **AI-bot user-agent classifier reads from the wrong table** — `agentTraffic.chatgpt` / `agentTraffic.claude` reported 0 for weeks while `/admin/analytics/visitors` clearly showed GPTBot with 906 page views and ClaudeBot with 48. Two compounding bugs: (a) the classifier matched substring `chatgpt` against the user-agent, missing `GPTBot` entirely; (b) it aggregated from `analytics_queries` (the search-query table), but crawlers produce page views, not search queries — they almost never hit `/search`. Fix: store `session_id` as `ipHash:userAgent`, aggregate from `analytics_page_views` with `session_id LIKE '%GPTBot%'` (etc.), and whitelist the full crawler UA list (see Phase 7.4). Symptom when this happens: a "we have no AI traffic" panic that's actually a metric bug.
+
+15. **WordPress vulnerability scanners poison `/admin/analytics/pages`** — Within 48 hours of going live, automated scanners hit `/wp-admin/setup-config.php`, `/wlwmanifest.xml` (8 path variants), `/.env`, `/.git/config`, `/phpunit/eval-stdin.php` etc. — hundreds of times. They will dominate your top-20 pages chart and obscure real content popularity. Filter them at the top-pages query, but keep the rows in the underlying `analytics_page_views` table (they show up correctly in `/traffic-classification` as `scanner` for security visibility). See Phase 7.5 for the SQL.
+
+16. **`llms.txt` advertised the wrong npm package name** — `lokal-food-mcp` instead of `lokal-mcp`. Lived in production for ~5 days before anyone caught it. Every AI agent that followed our self-described discovery doc hit a 404 on npm. Root cause: hardcoded string in `discovery.ts` that wasn't kept in sync with the actual `mcp-server/package.json` name. See Phase 12.5 for the fix pattern (single identity module).
+
+17. **a2a-registry doesn't accept PR submissions** — We submitted PR #102 with a clean agent-card JSON file; the maintainer closed it on 2026-04-20 with a note that registration must happen via the registry's programmatic registration endpoint, not via Pull Request. Always check a registry's preferred submission channel **before** investing in a PR. Symptom: a clean PR sitting open for days, then closed with a one-line "wrong channel" note.
+
 ### C.2 Architecture Decisions
 
 1. **SQLite over PostgreSQL** — Zero ops, single file, perfect for solo developer. Good up to ~10K agents.
@@ -1527,15 +1619,19 @@ Post-deploy:
 | Glama.ai | ✅ Live | glama.ai/mcp/servers/slookisen/lokal | v0.3.1 |
 | mcp.so | ✅ Submitted | mcp.so | Manual review |
 | Official MCP Registry | ✅ Published | registry.modelcontextprotocol.io | v0.3.3 |
-| A2A Registry | ⏳ PR Open | github.com/prassanna-ravishankar/a2a-registry/pull/102 | Schema fixes applied |
+| A2A Registry | ❌ PR Closed | github.com/prassanna-ravishankar/a2a-registry/pull/102 | Closed 2026-04-20. Maintainer requires programmatic registration via the registry endpoint, not PRs. Re-submit through `a2aregistry.org` API. |
 | Google Search Console | ✅ Verified | search.google.com | 850+ URLs indexed |
 | Custom GPT | ✅ Live | chatgpt.com/g/g-69dbf...finn-lokal-mat-i-norge | Public GPT Store |
-| Claude Connectors | ⏳ Submitted | clau.de/mcp-directory-submission | ~2 week review |
+| Claude Connectors | ⏳ Submitted | clau.de/mcp-directory-submission | ~2 week review (submitted 2026-04-20) |
 | AWS Bedrock AgentCore | ✅ Live | eu-west-1 registry | 2 records approved |
 | Apicurio Agent Registry | 📋 Backlog | apicur.io (v3.1+, Feb 2026) | First OSS registry with native AGENT_CARD artifact support. Self-register via `curl`. |
 | data.norge.no API Catalog | 📋 Backlog | data.norge.no/en/catalogs/data-services | Norwegian national API catalog (DCAT-AP-NO). Altinn auth required. Government-grade backlink. |
 | Perplexity Computer (enterprise) | ℹ️ Admin-install | perplexity.ai | Enterprise admins self-install MCP connectors. No public directory. Document the connect URL in README. |
 | a2aagentlist.com | 📋 Backlog | a2aagentlist.com | Mirror submission of PR #102 content if the main A2A Registry goes silent. |
+| AGNTCY Agent Directory (Cisco/Outshift) | 📋 Backlog | docs.agntcy.org/dir/hosted-agent-directory | **Highest-leverage new registry** — only one that accepts both an A2A card and an MCP server as one composite record. Requires `dirctl` CLI (`go install github.com/agntcy/dir/cmd/dirctl@latest`) + Sigstore-signed records. GitHub-org auth. |
+| MACH Alliance MCP Registry | 📋 Backlog | machalliance.org/mach-alliance-mcp-registry | Vendor-neutral, launched late 2025, rapid enterprise uptake Q1 2026. Open to non-members, ~30-min form submission. |
+| NANDA Index (MIT Media Lab) | 📋 Backlog | nanda.media.mit.edu | "Open Agentic Web" project. Uses AgentFacts decentralized verifiable credentials. Year-round open registration. NANDA Summit ran Apr 9–11, 2026. |
+| PulseMCP | 📋 Backlog | pulsemcp.com | Independent MCP directory. Open submissions. |
 
 ---
 
@@ -1674,8 +1770,9 @@ to build the same platform for a different vertical.
 | 2026-04-19 | 12, 13, 15, 17 | Discovery layer, agent readiness, AWS registry, conversations |
 | 2026-04-20 | 14, 16 | Claude Connectors submission, supervisor agent, Product schema fix |
 | 2026-04-20 | 14, 15, C, D | Terms-of-service aliases, Apicurio + data.norge.no registries, Tier 2 enrichment & stale-admin-key gotchas, `/agents.txt` root alias |
+| 2026-04-21 | 7, 11, 12, 13, C, D | Analytics: AI-bot UA classifier (7.4) + scanner-noise filter (7.5). Enrichment run #30 coverage snapshot (11.5) + throughput tuning (11.6). Discovery: keep self-described identifiers in sync (12.5). A2A v1.0 Signed Agent Cards plan (13.2). Appendix C: gotchas C.14 (UA classifier), C.15 (WP scanner noise), C.16 (llms.txt npm typo), C.17 (a2a-registry submission channel). Appendix D: AGNTCY, MACH Alliance, NANDA, PulseMCP added to backlog; a2a-registry status flipped from PR-Open to PR-Closed. |
 
 ---
 
-*Last updated: 2026-04-20 (22:00 CEST) by rfb-guidebook agent*
+*Last updated: 2026-04-21 (14:05 CEST) by rfb-guidebook agent*
 *Guide version: 1.0.0*
