@@ -458,10 +458,50 @@ export class AnalyticsService {
         else agentTraffic.other += row.count;
       });
 
+      // Average time on site (seconds) — approximation from session page-view spans.
+      // WHY: we don't have explicit beacons/pagehide tracking, but session_id is
+      // stable per visitor, so for any multi-pageview session we can take
+      // (last_view - first_view) as a lower-bound for time spent. We cap each
+      // session at 1800s (30 min) to filter "tab left open overnight" outliers,
+      // and we exclude single-pageview sessions from the numerator because they
+      // give us no duration signal at all — they show up as bounces in
+      // uniqueVisitors but shouldn't drag the average to zero. Bots (session_id
+      // containing a UA token like GPTBot/ClaudeBot) are excluded so we measure
+      // human dwell time only.
+      let avgTimeOnSite = 0;
+      try {
+        const durRow = db.prepare(`
+          SELECT AVG(dur) as avg_dur FROM (
+            SELECT MIN(
+              1800,
+              CAST((julianday(MAX(created_at)) - julianday(MIN(created_at))) * 86400 AS INTEGER)
+            ) as dur
+            FROM analytics_page_views
+            WHERE created_at > ?
+              AND (is_owner IS NULL OR is_owner = 0)
+              AND session_id IS NOT NULL
+              AND session_id NOT LIKE '%GPTBot%'
+              AND session_id NOT LIKE '%ClaudeBot%'
+              AND session_id NOT LIKE '%Claude-User%'
+              AND session_id NOT LIKE '%ChatGPT%'
+              AND session_id NOT LIKE '%bot%'
+              AND session_id NOT LIKE '%Bot%'
+              AND session_id NOT LIKE '%crawler%'
+              AND session_id NOT LIKE '%spider%'
+            GROUP BY session_id
+            HAVING COUNT(*) >= 2
+          )
+        `).get(cutoff) as any;
+        avgTimeOnSite = Math.round(durRow?.avg_dur || 0);
+      } catch (e) {
+        // Non-fatal: keep avgTimeOnSite at 0 rather than failing the whole summary.
+        console.warn("[analytics] avgTimeOnSite calculation skipped:", (e as Error).message);
+      }
+
       const result = {
         pageViews,
         uniqueVisitors,
-        avgTimeOnSite: 0, // would need session duration tracking
+        avgTimeOnSite,
         totalQueries,
         topSearchTerms,
         trafficBySource,
