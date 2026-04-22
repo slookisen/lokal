@@ -1382,6 +1382,49 @@ router.get("/:city", (req: Request, res: Response, next: any) => {
 
     const producerCards = cityAgents.map((a: any) => producerCard(a)).join("");
 
+    // City-specific context paragraph (SEO: gives Google unique content per city
+    // instead of a template-only page). All values are computed from the live
+    // registry so each city page gets a factually grounded, distinct lede.
+    const categoryCounts = new Map<string, number>();
+    let verifiedCount = 0;
+    for (const a of cityAgents) {
+      if ((a as any).isVerified) verifiedCount++;
+      const cats = (a as any).categories || [];
+      for (const c of cats) {
+        if (!c) continue;
+        const key = String(c).toLowerCase();
+        categoryCounts.set(key, (categoryCounts.get(key) || 0) + 1);
+      }
+    }
+    const CATEGORY_LABELS_NO: Record<string, string> = {
+      vegetables: "gr\u00f8nnsaker", fruit: "frukt", berries: "b\u00e6r",
+      meat: "kj\u00f8tt", dairy: "meieri", cheese: "ost", eggs: "egg",
+      honey: "honning", bakery: "bakeri", fish: "fisk", seafood: "sj\u00f8mat",
+      herbs: "urter", grains: "korn", flour: "mel", juice: "saft",
+      beer: "\u00f8l", wine: "vin", cider: "sider", coffee: "kaffe",
+      preserves: "syltet\u00f8y", pickles: "syltede", beverages: "drikke",
+      oil: "olje", mushrooms: "sopp", nuts: "n\u00f8tter",
+    };
+    const topCategories = Array.from(categoryCounts.entries())
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, 3)
+      .map(([k]) => CATEGORY_LABELS_NO[k] || k);
+    // Natural Norwegian list — "A, B og C" / "A og B" / "A" / ""
+    let categoriesText = "";
+    if (topCategories.length === 3) categoriesText = `${topCategories[0]}, ${topCategories[1]} og ${topCategories[2]}`;
+    else if (topCategories.length === 2) categoriesText = `${topCategories[0]} og ${topCategories[1]}`;
+    else if (topCategories.length === 1) categoriesText = topCategories[0];
+    const contextSentences: string[] = [];
+    if (categoriesText) {
+      contextSentences.push(`Popul\u00e6re kategorier her er ${categoriesText}.`);
+    }
+    if (verifiedCount > 0) {
+      contextSentences.push(`${verifiedCount} av produsentene er verifiserte, og du kan kontakte dem direkte \u2014 uten mellomledd eller annonser.`);
+    } else {
+      contextSentences.push(`Alle produsenter kan kontaktes direkte \u2014 uten mellomledd eller annonser.`);
+    }
+    const contextPara = contextSentences.join(" ");
+
     // Schema.org
     const jsonLdItems = cityAgents.slice(0, 50).map((a: any) => {
       const info = knowledgeService.getAgentInfo(a.id);
@@ -1403,6 +1446,7 @@ router.get("/:city", (req: Request, res: Response, next: any) => {
         <div class="bc" style="padding:0 0 12px;"><a href="/">Hjem</a><span>/</span>${escapeHtml(cityName)}</div>
         <h1>Lokal mat i ${escapeHtml(cityName)}</h1>
         <p>${cityAgents.length} lokale matprodusenter i ${escapeHtml(cityName)}-omr\u00e5det.</p>
+        ${contextPara ? `<p style="margin-top:8px;color:var(--g500);">${escapeHtml(contextPara)}</p>` : ""}
       </div>
     </section>
     <section class="sec">
