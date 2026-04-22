@@ -2104,6 +2104,13 @@ User-agent: cohere-ai
 Allow: /
 Content-Signal: search=yes, ai-input=yes, ai-train=no
 
+User-agent: NotHumanSearch
+Allow: /
+Content-Signal: search=yes, ai-input=yes, ai-train=no
+
+User-agent: DuckDuckBot
+Allow: /
+
 User-agent: Omgilibot
 Disallow: /
 

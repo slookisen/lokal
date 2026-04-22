@@ -60,7 +60,14 @@ function parseUserAgent(ua) {
         return { isBot: true, clientType: "gemini", clientName: "Gemini" };
     if (lower.includes("perplexitybot") || lower.includes("perplexity"))
         return { isBot: true, clientType: "a2a-agent", clientName: "Perplexity", botSource: "ai_search" };
-    if (lower.includes("bingbot") || lower.includes("googlebot") || lower.includes("ccbot") || lower.includes("bytespider") || lower.includes("applebot") || lower.includes("yandexbot")) {
+    // AI-native search engines that specifically index sites for agent
+    // consumption (agentic search). NotHumanSearch launched 2026 and is now
+    // a meaningful chunk of our crawl traffic — classify it so it shows up
+    // in summary.agentTraffic instead of getting buried in "unknown".
+    if (lower.includes("nothumansearch")) {
+        return { isBot: true, clientType: "a2a-agent", clientName: "NotHumanSearch", botSource: "ai_search" };
+    }
+    if (lower.includes("bingbot") || lower.includes("googlebot") || lower.includes("ccbot") || lower.includes("bytespider") || lower.includes("applebot") || lower.includes("yandexbot") || lower.includes("duckduckbot")) {
         return { isBot: true, clientType: "a2a-agent", botSource: "search_engine" };
     }
     if (lower.includes("curl") || lower.includes("node") || lower.includes("python"))
@@ -333,7 +340,10 @@ class AnalyticsService {
       `).get(cutoff);
             agentTraffic.claude = claudeRow?.count || 0;
             // Other AI / non-human retrievers — Gemini, Perplexity, Google-Extended,
-            // CCBot, Bytespider, Applebot, YandexBot.
+            // CCBot, Bytespider, Applebot, YandexBot, NotHumanSearch, DuckDuckBot,
+            // Googlebot. We deliberately include mainstream search bots here because
+            // they contribute to LLM-grounding pipelines and our primary KPI is
+            // "non-human traffic discovering us," not strictly LLM-branded crawlers.
             const otherRow = db.prepare(`
         SELECT COUNT(*) as count FROM analytics_page_views
         WHERE created_at > ? AND ${"(is_owner IS NULL OR is_owner = 0)"}
@@ -342,6 +352,8 @@ class AnalyticsService {
             OR session_id LIKE '%PerplexityBot%' OR session_id LIKE '%Perplexity-User%'
             OR session_id LIKE '%CCBot%' OR session_id LIKE '%Bytespider%'
             OR session_id LIKE '%Applebot-Extended%' OR session_id LIKE '%YandexAdditional%'
+            OR session_id LIKE '%NotHumanSearch%' OR session_id LIKE '%DuckDuckBot%'
+            OR session_id LIKE '%Googlebot%'
           )
       `).get(cutoff);
             agentTraffic.other = otherRow?.count || 0;

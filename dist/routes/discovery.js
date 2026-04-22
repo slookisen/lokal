@@ -246,6 +246,117 @@ router.get("/.well-known/mcp", (_req, res) => {
     });
 });
 // ═══════════════════════════════════════════════════════════════
+// GET /.well-known/ai-plugin.json — ChatGPT plugin manifest
+//
+// WHY: although OpenAI deprecated plugins in favor of GPTs, the
+// /.well-known/ai-plugin.json file is still scanned by AI-discovery
+// indexes (e.g. NotHumanSearch) and historical plugin registries as
+// a "machine-readable API contract" signal. It's a cheap 20-pt
+// agentic-readiness signal and a lightweight pointer to our OpenAPI
+// spec, so we keep one around even though OpenAI no longer loads it.
+// ═══════════════════════════════════════════════════════════════
+router.get("/.well-known/ai-plugin.json", (_req, res) => {
+    const stats = marketplace_registry_1.marketplaceRegistry.getStats();
+    res.header("Content-Type", "application/json");
+    res.header("Cache-Control", "public, max-age=3600");
+    res.header("X-Content-Type-Options", "nosniff");
+    res.json({
+        schema_version: "v1",
+        name_for_human: "Rett fra Bonden",
+        name_for_model: "rettfrabonden",
+        description_for_human: "Finn lokalprodusert mat i Norge. Søk blant gårder, markeder, " +
+            "gårdsbutikker og REKO-ringer med kontaktinfo og åpningstider.",
+        description_for_model: "Plugin for searching and discovering local food producers in Norway. " +
+            `Provides access to ${stats.totalAgents || "1150+"} verified producers ` +
+            "including farms, farmers' markets, REKO rings, farm shops, and " +
+            "cooperatives. Use the search endpoint for natural-language queries " +
+            "(Norwegian or English) and the agents endpoint for structured lookups " +
+            "by city, category, or ID.",
+        auth: { type: "none" },
+        api: {
+            type: "openapi",
+            url: `${BASE_URL}/openapi.json`,
+        },
+        logo_url: `${BASE_URL}/logo.svg`,
+        contact_email: "hello@rettfrabonden.com",
+        legal_info_url: `${BASE_URL}/terms`,
+    });
+});
+// ═══════════════════════════════════════════════════════════════
+// GET /api and GET /api/v1 — REST API index (structured-API signal)
+//
+// WHY: NotHumanSearch and similar AI-indexers award points for a
+// "discoverable, browseable API surface" at /api or /api/v1 that
+// returns JSON listing available routes. Previously these paths
+// 404'd even though /api/marketplace/* worked, which hid our API
+// from crawlers. A simple JSON index fixes that without changing
+// any behavior of the real routes.
+// ═══════════════════════════════════════════════════════════════
+function serveApiIndex(_req, res) {
+    const stats = marketplace_registry_1.marketplaceRegistry.getStats();
+    res.header("Content-Type", "application/json");
+    res.header("Cache-Control", "public, max-age=3600");
+    res.header("X-Content-Type-Options", "nosniff");
+    res.json({
+        name: "Rett fra Bonden API",
+        version: "v1",
+        description: "REST API for Norwegian local food producers. " +
+            `${stats.totalAgents || "1150+"} verified agents across farms, markets, ` +
+            "REKO rings, and cooperatives.",
+        documentation: `${BASE_URL}/openapi.json`,
+        protocols: {
+            rest: `${BASE_URL}/api/marketplace`,
+            mcp: `${BASE_URL}/mcp`,
+            a2a: `${BASE_URL}/a2a`,
+        },
+        routes: [
+            {
+                path: "/api/marketplace/search",
+                method: "GET",
+                description: "Natural-language search across all producers",
+            },
+            {
+                path: "/api/marketplace/agents",
+                method: "GET",
+                description: "List all active producers (paginated)",
+            },
+            {
+                path: "/api/marketplace/agents/{id}",
+                method: "GET",
+                description: "Get detailed info for one producer",
+            },
+            {
+                path: "/api/marketplace/discover",
+                method: "POST",
+                description: "Structured discovery with filters (city, category, tags)",
+            },
+            {
+                path: "/api/marketplace/register",
+                method: "POST",
+                description: "Register a new producer (requires API key)",
+            },
+        ],
+        authentication: {
+            read: "none",
+            write: "api-key (X-API-Key header)",
+        },
+        rate_limits: {
+            general: "300 requests / 15 minutes",
+            admin: "500 requests / hour",
+        },
+        discovery: {
+            llms_txt: `${BASE_URL}/llms.txt`,
+            openapi: `${BASE_URL}/openapi.json`,
+            ai_plugin: `${BASE_URL}/.well-known/ai-plugin.json`,
+            agent_card: `${BASE_URL}/.well-known/agent-card.json`,
+            mcp_server_card: `${BASE_URL}/.well-known/mcp/server-card.json`,
+        },
+    });
+}
+router.get("/api", serveApiIndex);
+router.get("/api/v1", serveApiIndex);
+router.get("/api/marketplace", serveApiIndex);
+// ═══════════════════════════════════════════════════════════════
 // 7. GET /.well-known/agents.txt — IETF Agent Discovery
 //
 // Emerging standard (expired draft, but still parsed by tools).

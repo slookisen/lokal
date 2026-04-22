@@ -778,6 +778,21 @@ router.get("/sok", async (req, res) => {
             }
         }
         const geoFiltered = !!parsed.location && !heleNorge;
+        // ─── Log web search as conversation (source: "web") ─────────
+        // Captures human frontend searches in /samtaler alongside AI traffic.
+        // Only top 1 match to avoid noise from casual browsing.
+        if (results.length > 0) {
+            try {
+                conversation_service_1.conversationService.startConversation({
+                    sellerAgentId: results[0].agent.id,
+                    queryText: q,
+                    source: "web",
+                    buyerAgentName: "Besøkende",
+                    autoRespond: true,
+                });
+            }
+            catch { /* non-critical — don't break search if logging fails */ }
+        }
         const resultCards = results.map((r) => producerCard(r.agent, r.matchReasons)).join("");
         const heleNorgeLink = geoFiltered
             ? `<a href="/sok?q=${encodeURIComponent(q)}&heleNorge=true" style="display:inline-block;margin-top:12px;padding:7px 18px;background:var(--green-100,#e8f0e0);color:var(--green-700,#2D5016);border:1.5px solid var(--green-700,#2D5016);border-radius:8px;text-decoration:none;font-weight:600;font-size:0.85rem;">&#127758; Vis hele Norge</a>`
@@ -1958,6 +1973,13 @@ Allow: /
 User-agent: cohere-ai
 Allow: /
 Content-Signal: search=yes, ai-input=yes, ai-train=no
+
+User-agent: NotHumanSearch
+Allow: /
+Content-Signal: search=yes, ai-input=yes, ai-train=no
+
+User-agent: DuckDuckBot
+Allow: /
 
 User-agent: Omgilibot
 Disallow: /
