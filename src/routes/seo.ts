@@ -1035,6 +1035,8 @@ const TECH_CSS = `
 `;
 
 router.get("/teknologi", (_req: Request, res: Response) => {
+  const stats = marketplaceRegistry.getStats();
+  const totalAgents = stats.totalAgents || marketplaceRegistry.getActiveAgents().length;
   const content = `
   <section class="tech-hero">
     <h1>Slik finner AI-en din maten</h1>
@@ -1108,7 +1110,7 @@ router.get("/teknologi", (_req: Request, res: Response) => {
     <p>Alt skjer automatisk. Produsenten trenger ikke gj\u00f8re noe \u2014 vi samler data fra offentlige kilder, verifiserer det, og gj\u00f8r det tilgjengelig for alle AI-plattformer.</p>
 
     <h2 id="mcp-oppsett">Sett opp MCP &mdash; s\u00f8k fra din AI</h2>
-    <p>MCP (Model Context Protocol) lar AI-assistenten din s\u00f8ke direkte i v\u00e5r database med 1400+ matprodusenter. Her er hvordan du setter det opp:</p>
+    <p>MCP (Model Context Protocol) lar AI-assistenten din s\u00f8ke direkte i v\u00e5r database med ${totalAgents}+ matprodusenter. Her er hvordan du setter det opp:</p>
 
     <div id="chatgpt-mcp" class="setup-guide">
       <h3>&#128154; ChatGPT (enklest)</h3>
