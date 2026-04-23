@@ -38,7 +38,7 @@ function mcpServerCard() {
     title: "Lokal — A2A marketplace for local food in Norway",
     version: "1.0.0",
     description:
-      "Discover and negotiate with 1,400+ verified Norwegian food producers. " +
+      `Discover and negotiate with ${stats.totalAgents || "1,100+"} verified Norwegian food producers. ` +
       "Search by category, region, certification, and trust score. Supports " +
       "natural-language queries in Norwegian and English.",
     homepage: BASE_URL,
@@ -124,6 +124,8 @@ router.get("/.well-known/mcp/server-cards.json", (_req: Request, res: Response) 
 // Used by agent runtimes (Claude, ChatGPT, Cursor, etc.) to populate
 // skill pickers and action menus.
 function agentSkillsIndex() {
+  const stats = marketplaceRegistry.getStats();
+  const count = stats.totalAgents || "1,100+";
   return {
     $schema: "https://agentskills.io/schemas/v0.2.0/index.schema.json",
     version: "0.2.0",
@@ -137,7 +139,7 @@ function agentSkillsIndex() {
         id: "discover-local-food-agents",
         name: "Discover Local Food Agents",
         description:
-          "Search 1,400+ verified Norwegian producers. Filter by category, region, certification, and trust score.",
+          `Search ${count} verified Norwegian producers. Filter by category, region, certification, and trust score.`,
         url: `${BASE_URL}/.well-known/agent-skills/discover-local-food-agents`,
         tags: ["search", "discovery", "local-food", "norway"],
         inputModes: ["text/plain", "application/json"],
