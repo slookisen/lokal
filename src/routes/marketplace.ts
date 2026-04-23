@@ -432,7 +432,7 @@ router.get("/search", async (req: Request, res: Response) => {
   res.json({
     success: true,
     query: safeQuery,
-    parsed,
+    parsed: { ...parsed, _nameQuery: nameQuery || undefined },
     geoFiltered: !!parsed.location && !heleNorge,
     geoSource,
     count: enrichedResults.length,
