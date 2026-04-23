@@ -377,18 +377,39 @@ class MarketplaceRegistry {
     // call Kartverket API) happens one level up in the async route handler.
 
     // ── Name-based search extraction ──
-    // If query contains words that look like a producer name (capitalized, "Gård", "Farm"),
-    // extract them as a name search term so discover() can match by agent name.
-    // This catches: "Bjørndal Gård Oppdal", "hva har Rørosmat?", "produkter fra Erga"
-    const nameIndicators = /\b(gård|gard|farm|mat|ysteri|bakeri|bryggeri|marked|butikk|kooperativ|meieri|slakteri|SA)\b/i;
-    // Also catch multi-word capitalized names: "Bjørndal Gård", "Erga Gardsutsalg"
-    const capitalWords = query.match(/[A-ZÆØÅ][a-zæøå]+(?:\s+(?:[A-ZÆØÅ][a-zæøå]+|i|på|fra|og|—|-))+/g);
+    // If query contains a producer name indicator word (gård, farm, mat, etc.),
+    // extract the surrounding words as a name search term.
+    // Handles both "Bjørndal Gård Oppdal" and "bjørndal gård oppdal" (case-insensitive).
+    const nameIndicators = ["gård", "gard", "farm", "mat", "ysteri", "bakeri", "bryggeri",
+      "marked", "butikk", "kooperativ", "meieri", "slakteri", "gardsmat", "gardsutsalg"];
+    const queryWords = query.split(/\s+/);
+    const indicatorIndex = queryWords.findIndex(w =>
+      nameIndicators.some(ind => w.toLowerCase().replace(/[.,!?]/g, "") === ind ||
+        w.toLowerCase().replace(/[.,!?]/g, "").endsWith(ind))
+    );
 
-    if (nameIndicators.test(query) && capitalWords?.length) {
-      // Use the longest capitalized phrase as the name query
-      const nameCandidate = capitalWords.sort((a, b) => b.length - a.length)[0];
-      if (nameCandidate.length >= 4) {
-        (parsed as any)._nameQuery = nameCandidate;
+    if (indicatorIndex >= 0) {
+      // Take the indicator word and adjacent words that look like name parts
+      // (not common query words like "hva", "har", "hos", "fra", "i", "på", "kan", etc.)
+      const skipWords = new Set(["hva", "har", "hos", "fra", "i", "på", "kan", "du", "jeg",
+        "det", "er", "en", "et", "og", "med", "til", "av", "som", "dem", "de", "vi",
+        "liste", "prisliste", "priser", "pris", "produkter", "varer", "varene", "koster",
+        "kost", "selger", "tilbyr", "finne", "finn", "søk", "kjøpe", "bestille"]);
+
+      const nameParts: string[] = [];
+      for (const word of queryWords) {
+        const clean = word.replace(/[.,!?]/g, "");
+        if (clean.length < 2) continue;
+        if (skipWords.has(clean.toLowerCase())) continue;
+        // Include: name words, indicator words, city names (capitalized or not)
+        nameParts.push(clean);
+      }
+
+      if (nameParts.length >= 1) {
+        const nameCandidate = nameParts.join(" ");
+        if (nameCandidate.length >= 4) {
+          (parsed as any)._nameQuery = nameCandidate;
+        }
       }
     }
 
