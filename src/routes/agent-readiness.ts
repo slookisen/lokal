@@ -110,6 +110,14 @@ router.get("/.well-known/mcp.json", (_req: Request, res: Response) => {
   res.json(mcpServerCard());
 });
 
+// Hyphenated alias — probed by some MCP directory scanners
+// (e.g. NotHumanSearch-style crawlers) as `/.well-known/mcp-server.json`.
+router.get("/.well-known/mcp-server.json", (_req: Request, res: Response) => {
+  res.header("Content-Type", "application/json; charset=utf-8");
+  res.header("Cache-Control", "public, max-age=300");
+  res.json(mcpServerCard());
+});
+
 router.get("/.well-known/mcp/server-cards.json", (_req: Request, res: Response) => {
   res.header("Content-Type", "application/json; charset=utf-8");
   res.header("Cache-Control", "public, max-age=300");
