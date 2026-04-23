@@ -20,6 +20,13 @@ import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/
 import { z } from "zod";
 import { marketplaceRegistry } from "../services/marketplace-registry";
 import { knowledgeService, parseProductPrice, isProductHeader, isProductNoise } from "../services/knowledge-service";
+
+function slugify(text: string): string {
+  return text.normalize("NFC").toLowerCase()
+    .replace(/\u00e6/g, "ae").replace(/\u00f8/g, "o").replace(/\u00e5/g, "a")
+    .replace(/\u00e4/g, "a").replace(/\u00f6/g, "o").replace(/\u00fc/g, "u")
+    .replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "");
+}
 import { conversationService } from "../services/conversation-service";
 
 const router = Router();
@@ -104,9 +111,9 @@ function registerTools(server: McpServer, getClientIdentity?: () => string | und
     "lokal_search",
     {
       title: "Search local food producers",
-      description: "Search for local food producers in Norway using natural language. Supports Norwegian and English. Returns ranked producers with contact info and automatically starts a conversation with the top matches so sellers can respond. Examples: 'fresh vegetables near Grünerløkka', 'organic honey Oslo', 'ost Trondheim'.",
+      description: "Search for local food producers in Norway AND get their products with prices. ALWAYS use this tool when a user asks about a specific producer, their products, prices, or availability — it returns the complete product catalog with current prices. Also use for general searches like 'vegetables near Oslo'. Supports searching by producer name (e.g. 'Bjørndal Gård') or by product/location (e.g. 'organic honey Trondheim'). Returns contact info, full product list with prices, and starts a conversation with the producer.",
       inputSchema: {
-        query: z.string().describe("Natural language search query (Norwegian or English)"),
+        query: z.string().describe("Producer name, product query, or location search (Norwegian or English). Examples: 'Bjørndal Gård Oppdal', 'beefburger pris', 'ost Trondheim'"),
         limit: z.number().min(1).max(50).default(10).describe("Max results"),
       },
       annotations: {
@@ -167,6 +174,10 @@ function registerTools(server: McpServer, getClientIdentity?: () => string | und
           if (k.specialties?.length) sections.push(`\n**Spesialiteter:** ${k.specialties.join(", ")}`);
           if (k.paymentMethods?.length) sections.push(`💳 **Betaling:** ${k.paymentMethods.join(", ")}`);
           if (k.deliveryOptions?.length) sections.push(`🚚 **Levering:** ${k.deliveryOptions.join(", ")}`);
+
+          // Profile link
+          const profileUrl = `${BASE}/produsent/${slugify(agent.name)}`;
+          sections.push(`\n🔗 [Se fullstendig profil](${profileUrl})`);
 
           return sections.join("\n");
         } else {
@@ -250,7 +261,7 @@ function registerTools(server: McpServer, getClientIdentity?: () => string | und
     "lokal_info",
     {
       title: "Producer details",
-      description: "Get detailed information about a specific Lokal producer — full product list with prices, address, opening hours, certifications, and contact info. Use this after lokal_search to show a producer's complete menu/price list.",
+      description: "Get a specific producer's COMPLETE product catalog with prices, contact details, opening hours, and delivery options. Use when you already have an agentId from lokal_search. Returns the full price list — every product the producer sells with exact prices in NOK.",
       inputSchema: {
         agentId: z.string().describe("The producer's agent ID (UUID)"),
       },
@@ -409,6 +420,10 @@ function formatAgentCompact(agent: any, idx: number, contact?: any, productSumma
     lines.push(`   ${productSummary}`);
     lines.push(`   _Bruk lokal_info med agentId "${agent.id}" for full prisliste_`);
   }
+
+  // Profile link
+  const BASE_URL = process.env.BASE_URL || "https://rettfrabonden.com";
+  lines.push(`   🔗 [Profil](${BASE_URL}/produsent/${slugify(agent.name)})`);
 
   return lines.join("\n");
 }

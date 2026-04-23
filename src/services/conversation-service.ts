@@ -249,6 +249,14 @@ class ConversationService {
       parts.push(`✅ ${k.certifications.join(", ")}`);
     }
 
+    // Profile link
+    const BASE_URL = process.env.BASE_URL || "https://rettfrabonden.com";
+    const slug = agent.name.normalize("NFC").toLowerCase()
+      .replace(/\u00e6/g, "ae").replace(/\u00f8/g, "o").replace(/\u00e5/g, "a")
+      .replace(/\u00e4/g, "a").replace(/\u00f6/g, "o").replace(/\u00fc/g, "u")
+      .replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "");
+    parts.push(`\n🔗 Se profilen vår: ${BASE_URL}/produsent/${slug}`);
+
     // Closing
     parts.push("\nTa gjerne kontakt for spørsmål eller bestilling!");
 
