@@ -700,6 +700,34 @@ app.get("/sitemap.xml", (req, res) => {
 });
 ```
 
+### 5.5 Per-City Context Paragraph (cheap unique content for Google)
+
+**Problem:** A templated lede like *"N lokale matprodusenter i {city}-området"* is the same string on /oslo, /bergen, /trondheim, /stavanger, … Google has nothing unique to index between those pages, so they compete with each other for the same query rather than each ranking for its own city.
+
+**Fix:** Inject a computed second paragraph grounded in **live registry data** — the top three categories in that city (translated to Norwegian labels) plus the verified-producer count. No per-city editorial writing required; each page now has a factually distinct block above the fold.
+
+```typescript
+// src/routes/seo.ts — inside /:city handler
+const agents = marketplaceRegistry.searchByCity(city);
+const categoryCounts = agents.reduce<Record<string, number>>((acc, a) => {
+  const cat = a.category || "other";
+  acc[cat] = (acc[cat] || 0) + 1;
+  return acc;
+}, {});
+const topCats = Object.entries(categoryCounts)
+  .sort(([, a], [, b]) => b - a)
+  .slice(0, 3)
+  .map(([c]) => norwegianCategoryLabel(c));
+const verified = agents.filter(a => a.trustTier === "verified").length;
+
+const contextParagraph = `
+  I ${city} finner du ${agents.length} lokale matprodusenter fra
+  ${topCats.join(", ")}. ${verified} av dem er verifiserte.
+`;
+```
+
+**Result (commit `a56d0c2`):** /oslo, /bergen, /trondheim now each carry a unique city-grounded paragraph Google can use to disambiguate them. Cheapest SEO win available without editorial effort.
+
 ---
 
 <a id="phase-6"></a>
@@ -742,6 +770,35 @@ Static HTML (`src/public/selger.html`) with JavaScript:
 - Trust score breakdown
 
 **GOTCHA:** Never use inline `onclick` handlers. Use `addEventListener` instead. MetaMask's SES (Secure ECMAScript) blocks inline handlers.
+
+### 6.4 Admin Notification on Claim Verification
+
+When a producer successfully verifies their claim, email the admin so conversion can be tracked in real time (the analytics dashboard only shows counts, not *who* just claimed).
+
+```typescript
+// src/routes/marketplace.ts — inside POST /verify-claim, after success
+if (process.env.ADMIN_NOTIFICATION_EMAIL) {
+  // Non-blocking — do NOT await, and do NOT let a mail failure
+  // delay the 200 OK response to the producer.
+  emailService
+    .sendAdminClaimNotification({
+      to: process.env.ADMIN_NOTIFICATION_EMAIL,
+      producerName: agent.name,
+      ownerName: claim.ownerName,
+      ownerEmail: claim.email,
+      campaignSource: claim.source,
+      verifiedAt: new Date().toISOString(),
+    })
+    .catch(err => console.warn("[admin-notify] failed", err));
+}
+```
+
+**Design rules:**
+- Fire-and-forget. A transient SMTP failure must not block the producer's verify response.
+- Include campaign source (`utm_source` captured at claim time) so you can see which outreach channel converted.
+- Guard behind `ADMIN_NOTIFICATION_EMAIL` env var so unconfigured deploys don't try to send mail.
+
+Commit: `2181d9d`.
 
 ---
 
@@ -841,6 +898,31 @@ WHERE path NOT LIKE '%wp-admin%'
   AND path NOT LIKE '%phpinfo%'
   AND path NOT LIKE '%setup-config%'
 ```
+
+### 7.6 `avgTimeOnSite` from Session Spans (no beacons required)
+
+**Problem:** The dashboard's *Average time on site* metric had been hardcoded to `0` with a `TODO` comment since analytics first shipped. Without a pagehide/unload beacon, there is no obvious way to measure dwell time.
+
+**Solution (commit `fda2a2e`):** `session_id` is already stable per visitor (`ipHash:userAgent`), so for any multi-pageview session the span between the first and last `created_at` is a reasonable lower-bound for time on site. Aggregate across sessions for the average.
+
+```sql
+-- Exclude single-view sessions (no span signal) and bot sessions (we want human dwell time).
+SELECT AVG(span_seconds) AS avg_seconds
+FROM (
+  SELECT
+    (strftime('%s', MAX(created_at)) - strftime('%s', MIN(created_at))) AS span_seconds
+  FROM analytics_page_views
+  WHERE is_bot = 0
+    AND created_at > datetime('now', '-30 days')
+  GROUP BY session_id
+  HAVING COUNT(*) > 1
+);
+```
+
+**Caveats to document in the dashboard tooltip:**
+- It's a **lower bound** — the user is always on the last page for *some* time after the final pageview is recorded, but we don't know how long.
+- Single-view sessions are excluded from the numerator. Including them as `0` would drag the average toward zero with no actual signal about engagement.
+- Bot sessions are excluded. We want *human* dwell time, and bots often fetch in bursts that compress span to milliseconds.
 
 ---
 
@@ -1177,13 +1259,25 @@ Make your marketplace discoverable by every type of AI agent:
 |----------|----------|---------|
 | `/.well-known/agent-card.json` | A2A | Agent identity and capabilities |
 | `/.well-known/mcp/server-card.json` | SEP-1649 | MCP server discovery |
+| `/.well-known/mcp-server.json` | ad-hoc | **Hyphenated alias** — some directory scanners hit this path instead of the slashed form. Same payload. |
 | `/.well-known/mcp.json` | SEP-1960 | MCP manifest |
+| `/.well-known/ai-plugin.json` | OpenAI plugins (deprecated) | Still indexed by NotHumanSearch and historical plugin registries as a machine-readable API signal. |
 | `/.well-known/agents.txt` | IETF draft | Text-based agent discovery |
 | `/.well-known/agents.json` | AWP | JSON agent discovery |
+| `/api`, `/api/v1`, `/api/marketplace` | ad-hoc | JSON index of available routes — gives AI indexers a "browseable API" signal. |
 | `/llms.txt` | llms.txt spec | LLM-friendly site overview |
 | `/llms-full.txt` | llms.txt spec | Complete data dump for LLMs |
 | `/openapi.json` | OpenAPI 3.1 | REST API specification |
 | `/robots.txt` | Standard | With AI bot rules |
+
+**Serve the hyphenated alias from the same factory as the canonical endpoint** so the two can never drift:
+
+```typescript
+// src/routes/discovery.ts
+const mcpServerCardHandler = (_req, res) => res.json(mcpServerCard());
+router.get("/.well-known/mcp/server-card.json", mcpServerCardHandler);
+router.get("/.well-known/mcp-server.json", mcpServerCardHandler); // d79032e
+```
 
 ### 12.2 robots.txt for AI Bots
 
@@ -1250,6 +1344,71 @@ Checklist for every endpoint that self-describes:
 - Version numbers must come from `package.json`, not a string literal.
 
 Suggested contract: a single `src/config/identity.ts` exports `{ packageName, registryCount, version }` and every self-describing route imports from there.
+
+### 12.6 `ai-plugin.json` + `/api` Index (+35 pts on NotHumanSearch)
+
+NotHumanSearch (and similar AI-discovery indexers) scores agentic-readiness partly on the presence of machine-readable API contracts. Two cheap additions lift the score by an estimated 35 points combined:
+
+**1. `/.well-known/ai-plugin.json` — ChatGPT plugin manifest**
+
+Even though OpenAI deprecated the plugin system in favor of GPTs, the file is still harvested as a "machine-readable API contract" signal (+~20 pts). It's a thin pointer to your OpenAPI spec.
+
+```typescript
+// src/routes/discovery.ts
+router.get("/.well-known/ai-plugin.json", (_req, res) => {
+  const stats = marketplaceRegistry.getStats();
+  res.json({
+    schema_version: "v1",
+    name_for_human: "Rett fra Bonden",
+    name_for_model: "rettfrabonden",
+    description_for_human: "Finn lokalprodusert mat i Norge...",
+    description_for_model:
+      `Plugin for searching Norwegian local food producers. ` +
+      `Access to ${stats.totalAgents || "1150+"} verified producers...`,
+    auth: { type: "none" },
+    api: { type: "openapi", url: `${BASE_URL}/openapi.json` },
+    logo_url: `${BASE_URL}/logo.svg`,
+    contact_email: "hello@rettfrabonden.com",
+    legal_info_url: `${BASE_URL}/terms`,
+  });
+});
+```
+
+**2. `/api`, `/api/v1`, `/api/marketplace` — JSON API index** (+~15 pts)
+
+Previously these paths 404'd even though `/api/marketplace/*` sub-routes worked — which hides the API surface from crawlers. A single JSON index lists available routes without changing any existing behavior.
+
+```typescript
+function serveApiIndex(_req, res) {
+  const stats = marketplaceRegistry.getStats();
+  res.json({
+    name: "Rett fra Bonden API",
+    version: "v1",
+    description: `REST API. ${stats.totalAgents || "1150+"} agents.`,
+    documentation: `${BASE_URL}/openapi.json`,
+    protocols: {
+      rest: `${BASE_URL}/api/marketplace`,
+      mcp: `${BASE_URL}/mcp`,
+      a2a: `${BASE_URL}/a2a`,
+    },
+  });
+}
+router.get("/api", serveApiIndex);
+router.get("/api/v1", serveApiIndex);
+router.get("/api/marketplace", serveApiIndex); // was 404 — advertised on A2A card
+```
+
+**3. Welcome NotHumanSearch + DuckDuckBot in robots.txt** (no score impact but removes ambiguity)
+
+```
+User-agent: NotHumanSearch
+Allow: /
+
+User-agent: DuckDuckBot
+Allow: /
+```
+
+**4. Classify them in analytics.** Before this change NotHumanSearch alone was ~130 pageviews / 7 days that analytics was not attributing to any AI source. Add the UA tokens to `parseUserAgent()` and count them in the `other` bucket of the `agentTraffic` summary. (Commit `819577f`.)
 
 ---
 
@@ -1503,6 +1662,60 @@ for (const agent of results) {
 
 A web-based UI at `/samtale/:id` showing the A2A conversation between buyer and seller agents. Grouped by search query in an accordion layout.
 
+### 17.3 `/samtaler` — Source Filters, Per-Source Stats, Client Identity
+
+Once traffic is coming from A2A, MCP, the web frontend, and direct API calls all at once, a flat conversation list becomes noise. The overview page at `/samtaler` now supports:
+
+**1. Source filter tabs.** `?kilde=a2a|mcp|web|api` narrows the list to one source. The tab bar also shows the per-source count so the distribution is visible at a glance.
+
+**2. Stats dashboard at the top of the page.** A card per source with the total conversation count. The active filter's card is highlighted. Implemented via a new service method:
+
+```typescript
+// src/services/conversation-service.ts
+getSourceStats(): Array<{ source: string; count: number }> {
+  return db
+    .prepare(`SELECT source, COUNT(*) AS count FROM conversations
+              GROUP BY source ORDER BY count DESC`)
+    .all();
+}
+```
+
+**3. Display cap at 50 conversations** to keep the page fast as the corpus grows.
+
+**4. Web-frontend search tracking.** Searches from `/sok` (the human-facing search page) now emit conversations with `source: "web"` so the same UI can show human traffic alongside agent traffic.
+
+**5. MCP client identity detection.** Requests into `/mcp` carry client-identity hints in User-Agent or `x-mcp-client` headers. Parse them and tag each conversation so you can tell ChatGPT, Claude, and Cursor apart:
+
+```typescript
+// src/routes/mcp.ts — inside the MCP request handler
+function detectMcpClient(req: Request): string | undefined {
+  const ua = (req.get("user-agent") || "").toLowerCase();
+  const hdr = (req.get("x-mcp-client") || "").toLowerCase();
+  if (ua.includes("chatgpt") || hdr.includes("chatgpt")) return "chatgpt";
+  if (ua.includes("claude")  || hdr.includes("claude"))  return "claude";
+  if (ua.includes("cursor")  || hdr.includes("cursor"))  return "cursor";
+  return undefined;
+}
+```
+
+The client tag is rendered next to each conversation group so you can see at a glance *who* is searching through your MCP surface.
+
+Commit: `63b0605`.
+
+### 17.4 A2A Registry Health: `GET /a2a` Returns the Agent Card
+
+A2A registries (e.g. `a2aregistry.org`) probe endpoints with a plain `GET` as a health check. Our endpoint only implemented the `POST` JSON-RPC path, so the registry saw a 404 and flagged us as unhealthy — even though the A2A protocol itself worked. Fix: add a `GET` handler that returns the dynamic agent card (live agent count, live stats) so registry health checks pass.
+
+```typescript
+// src/routes/a2a.ts
+router.get("/", (_req, res) => {
+  const stats = marketplaceRegistry.getStats();
+  res.json(buildAgentCard({ agentCount: stats.totalAgents }));
+});
+```
+
+This is the pattern to follow for *any* protocol endpoint: the "wrong verb" should return something useful (card, manifest, or docs), not 404. Commit: `98dd4cf`.
+
 ---
 
 <a id="appendix-a"></a>
@@ -1594,6 +1807,14 @@ Post-deploy:
 16. **`llms.txt` advertised the wrong npm package name** — `lokal-food-mcp` instead of `lokal-mcp`. Lived in production for ~5 days before anyone caught it. Every AI agent that followed our self-described discovery doc hit a 404 on npm. Root cause: hardcoded string in `discovery.ts` that wasn't kept in sync with the actual `mcp-server/package.json` name. See Phase 12.5 for the fix pattern (single identity module).
 
 17. **a2a-registry doesn't accept PR submissions** — We submitted PR #102 with a clean agent-card JSON file; the maintainer closed it on 2026-04-20 with a note that registration must happen via the registry's programmatic registration endpoint, not via Pull Request. Always check a registry's preferred submission channel **before** investing in a PR. Symptom: a clean PR sitting open for days, then closed with a one-line "wrong channel" note.
+
+18. **Tier 2 enrichment columns written but never read** — `upsertKnowledge()` correctly persisted `images`, `seasonality`, `delivery_radius`, and `min_order_value`, but `getKnowledge()` used an explicit column list that predated those fields. Reads returned `undefined`, the enrichment agent saw "empty" and re-wrote the same value on every run — silently wasting budget and producing "no change" in the eyes of any consumer. The fix is a one-line change to the SELECT, but the lesson is structural: **explicit column lists in both INSERT and SELECT must be kept in lock-step whenever the schema evolves.** A safer pattern is `SELECT *` with a typed projection at the TypeScript layer, so adding a column is additive in only one place. Commit: `3a69038`.
+
+19. **Stale hardcoded counts drift across self-describing files** — The number `1,400+` (or `1400+`) appeared as a hardcoded literal in `README.md`, `mcp-server/server.json`, the `/teknologi` HTML template, `llms.txt` fallbacks, and agent-readiness copy — long after the registry had dropped to ~1,150 live agents. AI crawlers that fetch two of these files see conflicting claims and quietly downgrade trust. Root cause: Phase 12.5's "single identity module" rule was added *after* some of these literals had already landed. Running fix-up: keep a weekly visibility-agent sweep that greps for the last claimed count in every file, and track every file that self-describes the count in a single list. Commits: `2fe7854`, `6b2dca7`, `c9074db`.
+
+20. **Protocol endpoints that only support one HTTP verb fail health checks** — `POST /a2a` worked fine, but registries probe with `GET /a2a` as a liveness check. Without a `GET` handler we returned 404 and got flagged as unhealthy, even though the protocol itself was up. Fix: every protocol endpoint's "wrong verb" should return something useful (the agent card, a small manifest, or docs), never 404. Commit: `98dd4cf`. See Phase 17.4.
+
+21. **`/samtaler` shell appended the brand twice** — The page template auto-appends " — Rett fra Bonden" to the `<title>`, and the route also included the brand in its explicit title string, so the rendered title read *"Samtaler — Rett fra Bonden — Rett fra Bonden"*. Only the shell should brand the page; route titles should be the page-specific part only. Commit: `c9074db`.
 
 ### C.2 Architecture Decisions
 
@@ -1771,8 +1992,11 @@ to build the same platform for a different vertical.
 | 2026-04-20 | 14, 16 | Claude Connectors submission, supervisor agent, Product schema fix |
 | 2026-04-20 | 14, 15, C, D | Terms-of-service aliases, Apicurio + data.norge.no registries, Tier 2 enrichment & stale-admin-key gotchas, `/agents.txt` root alias |
 | 2026-04-21 | 7, 11, 12, 13, C, D | Analytics: AI-bot UA classifier (7.4) + scanner-noise filter (7.5). Enrichment run #30 coverage snapshot (11.5) + throughput tuning (11.6). Discovery: keep self-described identifiers in sync (12.5). A2A v1.0 Signed Agent Cards plan (13.2). Appendix C: gotchas C.14 (UA classifier), C.15 (WP scanner noise), C.16 (llms.txt npm typo), C.17 (a2a-registry submission channel). Appendix D: AGNTCY, MACH Alliance, NANDA, PulseMCP added to backlog; a2a-registry status flipped from PR-Open to PR-Closed. |
+| 2026-04-21 | 6, 17, C | Admin notification email on claim verify (6.4). `/samtaler` upgrade: source filter tabs, per-source stats, web-search tracking, MCP client identity detection (17.3). `GET /a2a` returns agent card for registry health checks (17.4). Appendix C: gotcha C.18 (Tier 2 columns written but not read — `getKnowledge()` SELECT fix), C.20 (protocol endpoints must handle both verbs). |
+| 2026-04-22 | 5, 7, 12 | Per-city context paragraph grounded in live registry data (5.5). `avgTimeOnSite` computed from session spans instead of hardcoded 0 (7.6). `/.well-known/ai-plugin.json` + `/api` JSON index (+35 pts on NotHumanSearch agentic-readiness) (12.6). NotHumanSearch + DuckDuckBot classified in analytics and welcomed in robots.txt. Stale "1400+" count purged from `/teknologi` and server-card fallback. |
+| 2026-04-23 | 12, C | `/.well-known/mcp-server.json` hyphenated alias added to discovery endpoints (12.1). Remaining "1,400+" literal purged from AI-facing metadata (agent-readiness copy, agent-discovery middleware, llms.txt home/about). README and MCP registry description reduced to safe under-claim ("1,100+"). `/samtaler` double-brand `<title>` fix. Appendix C: gotchas C.19 (hardcoded counts drift across self-describing files), C.21 (double-brand title). |
 
 ---
 
-*Last updated: 2026-04-21 (14:05 CEST) by rfb-guidebook agent*
-*Guide version: 1.0.0*
+*Last updated: 2026-04-23 (14:00 CEST) by rfb-guidebook agent*
+*Guide version: 1.1.0*
