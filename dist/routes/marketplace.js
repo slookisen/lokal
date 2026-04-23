@@ -325,7 +325,9 @@ router.get("/search", async (req, res) => {
     // This handles rural areas where 30km might only have 1-2 sellers.
     const MIN_RESULTS = 3;
     const RADIUS_STEPS = [50, 100, 200]; // km
-    if (parsed.location && results.length < MIN_RESULTS && !heleNorge) {
+    // Don't expand if we got results from a name-based search — those are exact matches
+    const wasNameMatch = nameQuery && results.length > 0 && results[0]?.matchReasons?.some((r) => r.startsWith("Navnematch"));
+    if (parsed.location && results.length < MIN_RESULTS && !heleNorge && !wasNameMatch) {
         for (const expandedRadius of RADIUS_STEPS) {
             if (results.length >= MIN_RESULTS)
                 break;
