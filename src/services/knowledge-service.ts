@@ -70,6 +70,62 @@ export interface ProductInfo {
   months?: number[];  // [6,7,8,9] = June-September
   organic?: boolean;
   note?: string;
+  price?: string;       // "275/kg", "150", "200 pr.sekk"
+  priceUnit?: string;   // "kr"
+}
+
+// ─── Shared product parsing utilities ─────────────────────
+// Used by MCP, A2A, auto-response, and web routes to normalize product data.
+
+/** Check if a product entry is a section header (e.g. "🐑 LAM", "📋 STYKNINGSDELER") */
+export function isProductHeader(name: string): boolean {
+  if (!name || name.length > 50) return false;
+  const stripped = name.replace(/[\p{Emoji_Presentation}\p{Emoji}\uFE0F]/gu, "").trim();
+  return /^[A-ZÆØÅÉ\s&]+$/.test(stripped) && stripped.length >= 2;
+}
+
+/** Check if a product entry should be skipped (dividers, out-of-stock notes, metadata) */
+export function isProductNoise(name: string): boolean {
+  if (!name) return true;
+  if (/^[❌⸻─—\s]+$/.test(name)) return true;           // dividers
+  if (/^❌\s/.test(name)) return true;                     // "❌ Tomt for ..."
+  if (/^(Alle unntatt|Håndlaget med)/i.test(name)) return true; // notes
+  if (/^Kr\s*\.?\s*\d/i.test(name) && !name.includes("–")) return true; // price-only lines like "Kr.1000"
+  return false;
+}
+
+/** Parse price from a product name like "Lammelår – kr 275/kg" → { cleanName, price } */
+export function parseProductPrice(p: ProductInfo): { cleanName: string; price: string | null; section: string | null } {
+  const name = (p.name || "").trim();
+
+  // Section header?
+  if (isProductHeader(name)) {
+    const headerText = name.replace(/[\p{Emoji_Presentation}\p{Emoji}\uFE0F]/gu, "").trim();
+    const subInfo = p.price && !/^\d/.test(p.price) ? p.price : null;
+    return { cleanName: headerText, price: null, section: subInfo || headerText };
+  }
+
+  // Skip noise
+  if (isProductNoise(name)) return { cleanName: name, price: null, section: null };
+
+  // Use existing price field if it has a numeric value
+  let price = (p.price || "").trim();
+  if (price && !/\d/.test(price)) price = ""; // non-numeric price field = descriptor, not price
+
+  let cleanName = name;
+
+  // Parse price from name: "Product – kr XXX/kg" or "Product – kr XXX"
+  if (!price) {
+    const m = name.match(/^(.+?)\s*[–\-—]\s*kr\.?\s*([\d,.\s]+(?:\/\w+)?)\s*$/i);
+    if (m) { cleanName = m[1].trim(); price = `kr ${m[2].trim()}`; }
+  }
+  // "Product kr.XXX" (no dash)
+  if (!price) {
+    const m = name.match(/^(.+?)\s+kr\.?\s*([\d,.\s]+(?:\/\w+)?)\s*$/i);
+    if (m) { cleanName = m[1].trim(); price = `kr ${m[2].trim()}`; }
+  }
+
+  return { cleanName, price: price || null, section: null };
 }
 
 export interface ExternalReview {

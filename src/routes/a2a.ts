@@ -429,6 +429,7 @@ router.get("/agents/:id/agent.json", (req: Request, res: Response) => {
       openingHours: knowledge.openingHours,
       products: knowledge.products?.map((p: any) => ({
         name: p.name, category: p.category, seasonal: p.seasonal, months: p.months, organic: p.organic,
+        price: p.price, priceUnit: p.priceUnit,
       })),
       specialties: knowledge.specialties,
       certifications: knowledge.certifications,

@@ -19,77 +19,45 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { z } from "zod";
 import { marketplaceRegistry } from "../services/marketplace-registry";
-import { knowledgeService } from "../services/knowledge-service";
+import { knowledgeService, parseProductPrice, isProductHeader, isProductNoise } from "../services/knowledge-service";
 import { conversationService } from "../services/conversation-service";
 
 const router = Router();
 
-// ─── Product formatting helpers ────────────────────────────
-// Parse structured product data from knowledge, including prices embedded in name strings.
-
-function formatProductLine(p: any): string | null {
-  const name = (p.name || "").trim();
-  if (!name) return null;
-
-  // Skip decorative lines: dividers, "Tomt for..." notes, non-product metadata
-  if (/^[❌⸻─—\s]+$/.test(name)) return null;
-  if (/^❌\s/.test(name)) return null;
-  if (/^(Alle unntatt|Håndlaget med|Kr\s|kr\s)/i.test(name) && !name.includes("–")) return null;
-
-  // Check if it's a section header (emoji + ALL-CAPS text, short)
-  if (/^[\p{Emoji_Presentation}\p{Emoji}\uFE0F\s]*[A-ZÆØÅÉ\s&]{2,}[\p{Emoji_Presentation}\p{Emoji}\uFE0F\s]*$/u.test(name) && name.length < 45) return null;
-
-  // Extract price from name if price field is empty/non-numeric
-  let displayName = name;
-  let price = (p.price || "").trim();
-  // price field sometimes contains descriptors, not numbers — ignore those
-  if (price && !/\d/.test(price)) price = "";
-
-  // Pattern: "Product – kr XXX/kg" or "Product – kr XXX"
-  const priceInName = name.match(/^(.+?)\s*[–\-—]\s*kr\.?\s*([\d,.\s]+(?:\/\w+)?)\s*$/i);
-  if (priceInName && !price) {
-    displayName = priceInName[1].trim();
-    price = `kr ${priceInName[2].trim()}`;
-  }
-  // Pattern: "Product kr.XXX" (no dash)
-  const priceInName2 = name.match(/^(.+?)\s+kr\.?\s*([\d,.\s]+(?:\/\w+)?)\s*$/i);
-  if (priceInName2 && !price) {
-    displayName = priceInName2[1].trim();
-    price = `kr ${priceInName2[2].trim()}`;
-  }
-
-  const cat = p.category && p.category !== "other" ? ` [${p.category}]` : "";
-  const priceStr = price ? ` — ${price}` : "";
-  const seasonal = p.seasonal ? " 🌿sesong" : "";
-
-  return `- ${displayName}${cat}${priceStr}${seasonal}`;
-}
+// ─── Product formatting for MCP ────────────────────────────
+// Uses shared parseProductPrice() from knowledge-service.
 
 function formatProductsForMcp(products: any[]): string {
   if (!products?.length) return "";
 
   const lines: string[] = [];
+  let productCount = 0;
 
   for (const p of products) {
     const name = (p.name || "").trim();
     if (!name) continue;
 
-    // Detect section headers like "🐑 LAM", "🐂 STORFE"
-    if (/^[\p{Emoji_Presentation}\p{Emoji}\uFE0F\s]*[A-ZÆØÅÉ\s&]{2,}[\p{Emoji_Presentation}\p{Emoji}\uFE0F\s]*$/u.test(name) && name.length < 45) {
-      const headerText = name.replace(/[\p{Emoji_Presentation}\p{Emoji}\uFE0F]/gu, "").trim();
-      if (headerText) {
-        lines.push(`\n**${headerText}**`);
-        // price field sometimes has sub-info for headers (e.g. "GRASFÔRA DEXTER")
-        if (p.price && !/^\d/.test(p.price)) lines.push(`_${p.price}_`);
-      }
+    const { cleanName, price, section } = parseProductPrice(p);
+
+    // Section header
+    if (section && isProductHeader(name)) {
+      lines.push(`\n**${section}**`);
+      if (p.price && !/^\d/.test(p.price)) lines.push(`_${p.price}_`);
       continue;
     }
 
-    const formatted = formatProductLine(p);
-    if (formatted) lines.push(formatted);
+    // Skip noise
+    if (isProductNoise(name)) continue;
+
+    // Product line
+    const cat = p.category && p.category !== "other" ? ` [${p.category}]` : "";
+    const priceStr = price ? ` — ${price}` : "";
+    const seasonal = p.seasonal ? " 🌿sesong" : "";
+    lines.push(`- ${cleanName}${cat}${priceStr}${seasonal}`);
+    productCount++;
   }
 
-  return lines.length ? `\n## Produkter (${lines.filter(l => l.startsWith("- ")).length} stk)\n${lines.join("\n")}` : "";
+  return productCount > 0 ? `\n## Produkter (${productCount} stk)\n${lines.join("\n")}` : "";
 }
 
 // Build contact + product summary for a given agent ID, used by search results
@@ -107,21 +75,17 @@ function getAgentKnowledgeSummary(agentId: string): { contact?: any; productSumm
   const products = k.products || [];
   const realProducts = products.filter((p: any) => {
     const n = (p.name || "").trim();
-    if (!n) return false;
-    if (/^[\p{Emoji_Presentation}\p{Emoji}\uFE0F\s]*[A-ZÆØÅÉ\s&]{2,}[\p{Emoji_Presentation}\p{Emoji}\uFE0F\s]*$/u.test(n) && n.length < 45) return false;
-    if (/^❌/.test(n)) return false;
-    return true;
+    return n && !isProductHeader(n) && !isProductNoise(n);
   });
 
-  // For compact view: just list up to 5 product names + count
-  const topNames = realProducts.slice(0, 5).map((p: any) => {
-    const n = (p.name || "").trim();
-    // Strip price suffix for compact display
-    return n.replace(/\s*[–\-—]\s*kr\.?\s*[\d,.\s/]+$/i, "").trim();
+  // Compact view: top 5 product names with prices
+  const topItems = realProducts.slice(0, 5).map((p: any) => {
+    const { cleanName, price } = parseProductPrice(p);
+    return price ? `${cleanName} (${price})` : cleanName;
   });
 
-  const productSummary = topNames.length
-    ? `🛒 ${topNames.join(", ")}${realProducts.length > 5 ? ` +${realProducts.length - 5} flere` : ""}`
+  const productSummary = topItems.length
+    ? `🛒 ${topItems.join(", ")}${realProducts.length > 5 ? ` +${realProducts.length - 5} flere` : ""}`
     : undefined;
 
   return {

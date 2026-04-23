@@ -2,7 +2,7 @@ import { v4 as uuid } from "uuid";
 import { getDb } from "../database/init";
 import { interactionLogger } from "./interaction-logger";
 import { marketplaceRegistry } from "./marketplace-registry";
-import { knowledgeService } from "./knowledge-service";
+import { knowledgeService, parseProductPrice, isProductHeader, isProductNoise } from "./knowledge-service";
 
 // ─── Conversation Service ───────────────────────────────────
 // This is what makes Lokal an OPERATOR, not just a registry.
@@ -146,32 +146,62 @@ class ConversationService {
 
     // Match query to relevant products if possible
     const queryLower = (queryText || "").toLowerCase();
-    const matchedProducts = (k.products || []).filter((p: any) => {
-      if (!queryLower) return true;
-      const pName = (p.name || "").toLowerCase();
-      const pCat = (p.category || "").toLowerCase();
-      return queryLower.includes(pName) || pName.includes(queryLower)
-        || queryLower.includes(pCat) || pCat.includes(queryLower);
+    const allProducts = (k.products || []).filter((p: any) => {
+      const name = (p.name || "").trim();
+      return name && !isProductNoise(name) && !isProductHeader(name);
     });
 
-    // If we have matching products, show them. Otherwise show all (up to 5).
-    const productsToShow = matchedProducts.length > 0
-      ? matchedProducts.slice(0, 5)
-      : (k.products || []).slice(0, 5);
+    const matchedProducts = queryLower ? allProducts.filter((p: any) => {
+      const pName = (p.name || "").toLowerCase();
+      const pCat = (p.category || "").toLowerCase();
+      return queryLower.split(/\s+/).some((word: string) =>
+        word.length > 2 && (pName.includes(word) || pCat.includes(word))
+      );
+    }) : [];
 
-    if (productsToShow.length > 0) {
-      const intro = matchedProducts.length > 0
-        ? "Vi har det du leter etter:"
-        : "Her er noe av det vi tilbyr:";
-      parts.push(intro);
-      for (const p of productsToShow) {
-        const seasonal = p.seasonal && p.months?.length
-          ? ` (sesong: ${p.months.map((m: number) => ["", "jan", "feb", "mar", "apr", "mai", "jun", "jul", "aug", "sep", "okt", "nov", "des"][m] || m).join(", ")})`
-          : "";
-        const organic = p.organic ? " 🌿 økologisk" : "";
-        parts.push(`• ${p.name}${p.category ? ` — ${p.category}` : ""}${organic}${seasonal}`);
+    // Show matched products (all of them) or a compact overview of all products
+    if (matchedProducts.length > 0) {
+      parts.push(`Vi har det du leter etter:`);
+      for (const p of matchedProducts.slice(0, 15)) {
+        const { cleanName, price } = parseProductPrice(p);
+        const priceStr = price ? ` — ${price}` : "";
+        const organic = p.organic ? " 🌿" : "";
+        parts.push(`• ${cleanName}${priceStr}${organic}`);
       }
-      meta.products = productsToShow;
+      if (matchedProducts.length > 15) {
+        parts.push(`  _...og ${matchedProducts.length - 15} flere_`);
+      }
+      meta.products = matchedProducts;
+    } else if (allProducts.length > 0) {
+      // Show all products grouped by section headers from the original data
+      parts.push(`Her er det vi tilbyr (${allProducts.length} produkter):`);
+      let currentSection = "";
+      let shown = 0;
+      for (const p of k.products || []) {
+        const name = (p.name || "").trim();
+        if (!name) continue;
+        if (isProductNoise(name)) continue;
+
+        // Section header
+        if (isProductHeader(name)) {
+          const headerText = name.replace(/[\p{Emoji_Presentation}\p{Emoji}\uFE0F]/gu, "").trim();
+          if (headerText && headerText !== currentSection) {
+            currentSection = headerText;
+            parts.push(`\n**${headerText}**`);
+          }
+          continue;
+        }
+
+        const { cleanName, price } = parseProductPrice(p);
+        const priceStr = price ? ` — ${price}` : "";
+        parts.push(`• ${cleanName}${priceStr}`);
+        shown++;
+        if (shown >= 30) {
+          parts.push(`  _...og ${allProducts.length - shown} flere produkter_`);
+          break;
+        }
+      }
+      meta.products = allProducts;
     }
 
     // Specialties
@@ -223,7 +253,7 @@ class ConversationService {
     parts.push("\nTa gjerne kontakt for spørsmål eller bestilling!");
 
     // Determine message type: if we have products with potential pricing, it's an "offer"
-    const msgType: MessageType = productsToShow.length > 0 ? "offer" : "text";
+    const msgType: MessageType = allProducts.length > 0 ? "offer" : "text";
 
     return {
       text: parts.join("\n"),
