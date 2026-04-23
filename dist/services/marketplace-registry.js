@@ -64,6 +64,55 @@ class MarketplaceRegistry {
     // Uses bounding-box pre-filter for geo (Gap 6 fix).
     discover(query) {
         const db = (0, init_1.getDb)();
+        // ── 0. Name-based search: if query contains a producer name, find it directly ──
+        // This handles "Bjørndal Gård Oppdal", "hva tilbyr Bjørndal Gård?" etc.
+        // NOTE: SQLite's LOWER() only works for ASCII, so we do case-insensitive
+        // matching in JavaScript instead of SQL to handle Norwegian characters (ø,å,æ).
+        const nameQuery = query._nameQuery;
+        if (nameQuery && nameQuery.length >= 3) {
+            // Fetch all active agents and filter by name in JS (case-insensitive for Unicode)
+            const allRows = db.prepare("SELECT * FROM agents WHERE is_active = 1").all();
+            const nameWords = nameQuery.toLowerCase().split(/\s+/).filter(w => w.length >= 2);
+            console.log(`[name-search] query="${nameQuery}", words=${JSON.stringify(nameWords)}, totalAgents=${allRows.length}`);
+            const nameRows = allRows.filter(row => {
+                const agentName = (row.name || "").toLowerCase();
+                // All name words must appear somewhere in the agent name
+                return nameWords.every(word => agentName.includes(word));
+            });
+            console.log(`[name-search] matched=${nameRows.length}${nameRows.length > 0 ? ` → ${nameRows.map((r) => r.name).join(", ")}` : ""}`);
+            if (nameRows.length > 0) {
+                // Found by name — return these as top results, skip geo filtering
+                let nameCandidates = nameRows.map(r => this.rowToAgent(r));
+                if (query.role) {
+                    nameCandidates = nameCandidates.filter(a => a.role === query.role);
+                }
+                if (nameCandidates.length > 0) {
+                    const results = nameCandidates.map(agent => {
+                        const { score, reasons } = this.calculateRelevance(agent, query, [], new Map());
+                        this.incrementDiscovery(agent.id);
+                        return {
+                            agent: {
+                                id: agent.id, name: agent.name, description: agent.description,
+                                url: agent.url, role: agent.role,
+                                skills: agent.skills.map(s => ({ id: s.id, name: s.name, description: s.description, tags: s.tags })),
+                                location: agent.location ? {
+                                    city: agent.location.city,
+                                    distanceKm: query.location
+                                        ? haversine(query.location.lat, query.location.lng, agent.location.lat, agent.location.lng)
+                                        : undefined,
+                                } : undefined,
+                                trustScore: agent.trustScore, isVerified: agent.isVerified,
+                                categories: agent.categories, tags: agent.tags,
+                            },
+                            relevanceScore: Math.max(score, 0.9), // Name match = high relevance
+                            matchReasons: [`Navnematch: "${nameQuery}"`, ...reasons],
+                        };
+                    });
+                    results.sort((a, b) => b.relevanceScore - a.relevanceScore);
+                    return results.slice(0, query.limit || 20);
+                }
+            }
+        }
         // Build SQL dynamically based on query filters
         let sql = "SELECT * FROM agents WHERE is_active = 1";
         const params = [];
@@ -266,6 +315,39 @@ class MarketplaceRegistry {
         // Location resolution is handled by geocodingService in the search route.
         // This keeps parseNaturalQuery synchronous and fast — geocoding (which may
         // call Kartverket API) happens one level up in the async route handler.
+        // ── Name-based search extraction ──
+        // If query contains a producer name indicator word (gård, farm, mat, etc.),
+        // extract the surrounding words as a name search term.
+        // Handles both "Bjørndal Gård Oppdal" and "bjørndal gård oppdal" (case-insensitive).
+        const nameIndicators = ["gård", "gard", "farm", "mat", "ysteri", "bakeri", "bryggeri",
+            "marked", "butikk", "kooperativ", "meieri", "slakteri", "gardsmat", "gardsutsalg"];
+        const queryWords = query.split(/\s+/);
+        const indicatorIndex = queryWords.findIndex(w => nameIndicators.some(ind => w.toLowerCase().replace(/[.,!?]/g, "") === ind ||
+            w.toLowerCase().replace(/[.,!?]/g, "").endsWith(ind)));
+        if (indicatorIndex >= 0) {
+            // Take the indicator word and adjacent words that look like name parts
+            // (not common query words like "hva", "har", "hos", "fra", "i", "på", "kan", etc.)
+            const skipWords = new Set(["hva", "har", "hos", "fra", "i", "på", "kan", "du", "jeg",
+                "det", "er", "en", "et", "og", "med", "til", "av", "som", "dem", "de", "vi",
+                "liste", "prisliste", "priser", "pris", "produkter", "varer", "varene", "koster",
+                "kost", "selger", "tilbyr", "finne", "finn", "søk", "kjøpe", "bestille"]);
+            const nameParts = [];
+            for (const word of queryWords) {
+                const clean = word.replace(/[.,!?]/g, "");
+                if (clean.length < 2)
+                    continue;
+                if (skipWords.has(clean.toLowerCase()))
+                    continue;
+                // Include: name words, indicator words, city names (capitalized or not)
+                nameParts.push(clean);
+            }
+            if (nameParts.length >= 1) {
+                const nameCandidate = nameParts.join(" ");
+                if (nameCandidate.length >= 4) {
+                    parsed._nameQuery = nameCandidate;
+                }
+            }
+        }
         parsed.role = "producer";
         return parsed;
     }
@@ -356,12 +438,12 @@ class MarketplaceRegistry {
                 {
                     id: "discover-local-food-agents",
                     name: "Discover Local Food Agents / Finn lokale matagenter",
-                    description: `Search a registry of ${stats.totalAgents || 1400}+ verified local food producers in Norway. ` +
+                    description: `Search a registry of ${stats.totalAgents || 1100}+ verified local food producers in Norway. ` +
                         "Filter by category (vegetables, fruit, meat, fish, dairy, eggs, honey, herbs, bread, berries), " +
                         "location (Oslo, Bergen, Trondheim, Stavanger, Troms\u00f8, and rural districts), " +
                         "certifications (organic, Debio, farm-direct), delivery options (pickup, local delivery), " +
                         "and trust score. Returns ranked results with contact info and A2A endpoints. " +
-                        `Søk blant ${stats.totalAgents || 1400}+ verifiserte lokale matprodusenter i Norge.`,
+                        `Søk blant ${stats.totalAgents || 1100}+ verifiserte lokale matprodusenter i Norge.`,
                     tags: [
                         // English discovery keywords (what agents actually search for)
                         "local food", "fresh produce", "organic", "farm direct", "vegetables", "fruit",

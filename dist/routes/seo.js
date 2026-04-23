@@ -964,6 +964,8 @@ const TECH_CSS = `
   }
 `;
 router.get("/teknologi", (_req, res) => {
+    const stats = marketplace_registry_1.marketplaceRegistry.getStats();
+    const totalAgents = stats.totalAgents || marketplace_registry_1.marketplaceRegistry.getActiveAgents().length;
     const content = `
   <section class="tech-hero">
     <h1>Slik finner AI-en din maten</h1>
@@ -1037,7 +1039,7 @@ router.get("/teknologi", (_req, res) => {
     <p>Alt skjer automatisk. Produsenten trenger ikke gj\u00f8re noe \u2014 vi samler data fra offentlige kilder, verifiserer det, og gj\u00f8r det tilgjengelig for alle AI-plattformer.</p>
 
     <h2 id="mcp-oppsett">Sett opp MCP &mdash; s\u00f8k fra din AI</h2>
-    <p>MCP (Model Context Protocol) lar AI-assistenten din s\u00f8ke direkte i v\u00e5r database med 1400+ matprodusenter. Her er hvordan du setter det opp:</p>
+    <p>MCP (Model Context Protocol) lar AI-assistenten din s\u00f8ke direkte i v\u00e5r database med ${totalAgents}+ matprodusenter. Her er hvordan du setter det opp:</p>
 
     <div id="chatgpt-mcp" class="setup-guide">
       <h3>&#128154; ChatGPT (enklest)</h3>
@@ -1279,6 +1281,54 @@ router.get("/:city", (req, res, next) => {
         // Use the first agent as representative — getCityStats groups by city
         analytics_service_1.analyticsService.trackAgentView(cityAgents[0].id, cityAgents[0].name, cityName, "seo");
         const producerCards = cityAgents.map((a) => producerCard(a)).join("");
+        // City-specific context paragraph (SEO: gives Google unique content per city
+        // instead of a template-only page). All values are computed from the live
+        // registry so each city page gets a factually grounded, distinct lede.
+        const categoryCounts = new Map();
+        let verifiedCount = 0;
+        for (const a of cityAgents) {
+            if (a.isVerified)
+                verifiedCount++;
+            const cats = a.categories || [];
+            for (const c of cats) {
+                if (!c)
+                    continue;
+                const key = String(c).toLowerCase();
+                categoryCounts.set(key, (categoryCounts.get(key) || 0) + 1);
+            }
+        }
+        const CATEGORY_LABELS_NO = {
+            vegetables: "gr\u00f8nnsaker", fruit: "frukt", berries: "b\u00e6r",
+            meat: "kj\u00f8tt", dairy: "meieri", cheese: "ost", eggs: "egg",
+            honey: "honning", bakery: "bakeri", fish: "fisk", seafood: "sj\u00f8mat",
+            herbs: "urter", grains: "korn", flour: "mel", juice: "saft",
+            beer: "\u00f8l", wine: "vin", cider: "sider", coffee: "kaffe",
+            preserves: "syltet\u00f8y", pickles: "syltede", beverages: "drikke",
+            oil: "olje", mushrooms: "sopp", nuts: "n\u00f8tter",
+        };
+        const topCategories = Array.from(categoryCounts.entries())
+            .sort((a, b) => b[1] - a[1])
+            .slice(0, 3)
+            .map(([k]) => CATEGORY_LABELS_NO[k] || k);
+        // Natural Norwegian list — "A, B og C" / "A og B" / "A" / ""
+        let categoriesText = "";
+        if (topCategories.length === 3)
+            categoriesText = `${topCategories[0]}, ${topCategories[1]} og ${topCategories[2]}`;
+        else if (topCategories.length === 2)
+            categoriesText = `${topCategories[0]} og ${topCategories[1]}`;
+        else if (topCategories.length === 1)
+            categoriesText = topCategories[0];
+        const contextSentences = [];
+        if (categoriesText) {
+            contextSentences.push(`Popul\u00e6re kategorier her er ${categoriesText}.`);
+        }
+        if (verifiedCount > 0) {
+            contextSentences.push(`${verifiedCount} av produsentene er verifiserte, og du kan kontakte dem direkte \u2014 uten mellomledd eller annonser.`);
+        }
+        else {
+            contextSentences.push(`Alle produsenter kan kontaktes direkte \u2014 uten mellomledd eller annonser.`);
+        }
+        const contextPara = contextSentences.join(" ");
         // Schema.org
         const jsonLdItems = cityAgents.slice(0, 50).map((a) => {
             const info = knowledge_service_1.knowledgeService.getAgentInfo(a.id);
@@ -1302,6 +1352,7 @@ router.get("/:city", (req, res, next) => {
         <div class="bc" style="padding:0 0 12px;"><a href="/">Hjem</a><span>/</span>${escapeHtml(cityName)}</div>
         <h1>Lokal mat i ${escapeHtml(cityName)}</h1>
         <p>${cityAgents.length} lokale matprodusenter i ${escapeHtml(cityName)}-omr\u00e5det.</p>
+        ${contextPara ? `<p style="margin-top:8px;color:var(--g500);">${escapeHtml(contextPara)}</p>` : ""}
       </div>
     </section>
     <section class="sec">

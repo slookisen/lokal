@@ -17,7 +17,16 @@
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.linkHeaders = linkHeaders;
 exports.markdownNegotiation = markdownNegotiation;
+const marketplace_registry_1 = require("../services/marketplace-registry");
 const BASE_URL = process.env.BASE_URL || "https://rettfrabonden.com";
+// Read the producer count from the live registry at request time so
+// the markdown negotiation responses don't drift away from the DB.
+// Fallback is deliberately conservative — we'd rather under-promise
+// than resurrect the old "1,400+" number if the registry briefly fails.
+function producerCount() {
+    const stats = marketplace_registry_1.marketplaceRegistry.getStats();
+    return stats.totalAgents ? String(stats.totalAgents) : "1,100+";
+}
 // ═══════════════════════════════════════════════════════════════
 // 1. Link headers — RFC 8288
 // ═══════════════════════════════════════════════════════════════
@@ -87,7 +96,7 @@ function homepageMarkdown() {
 
 **${BASE_URL}**
 
-Lokal is an agent-to-agent marketplace connecting AI agents with 1,400+
+Lokal is an agent-to-agent marketplace connecting AI agents with ${producerCount()}+
 verified local food producers across Norway. Search fresh produce, organic
 vegetables, meat, fish, dairy, honey, bread, and more — all farm-direct.
 
@@ -104,7 +113,7 @@ vegetables, meat, fish, dairy, honey, bread, and more — all farm-direct.
 
 | Skill | Description |
 |---|---|
-| \`discover-local-food-agents\` | Search 1,400+ verified producers by category, region, certification |
+| \`discover-local-food-agents\` | Search ${producerCount()}+ verified producers by category, region, certification |
 | \`register-food-agent\` | Onboard a new farm, shop, or cooperative |
 | \`search-compare-food\` | Natural-language search; compare prices, delivery, certifications |
 | \`agent-conversation\` | Open a buyer–seller negotiation channel |
@@ -152,7 +161,7 @@ sorted by who paid the most for placement.
 
 ## What we cover
 
-- 1,400+ verified producers across Norway
+- ${producerCount()}+ verified producers across Norway
 - Categories: vegetables, fruit, meat, fish, dairy, eggs, honey, bread, berries, herbs
 - Every major region from Agder to Finnmark
 - Full bilingual support: Norwegian (primary) and English

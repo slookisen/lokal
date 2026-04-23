@@ -106,11 +106,15 @@ class MarketplaceRegistry {
       const allRows = db.prepare("SELECT * FROM agents WHERE is_active = 1").all() as any[];
       const nameWords = nameQuery.toLowerCase().split(/\s+/).filter(w => w.length >= 2);
 
+      console.log(`[name-search] query="${nameQuery}", words=${JSON.stringify(nameWords)}, totalAgents=${allRows.length}`);
+
       const nameRows = allRows.filter(row => {
         const agentName = (row.name || "").toLowerCase();
         // All name words must appear somewhere in the agent name
         return nameWords.every(word => agentName.includes(word));
       });
+
+      console.log(`[name-search] matched=${nameRows.length}${nameRows.length > 0 ? ` → ${nameRows.map((r: any) => r.name).join(", ")}` : ""}`);
 
       if (nameRows.length > 0) {
         // Found by name — return these as top results, skip geo filtering

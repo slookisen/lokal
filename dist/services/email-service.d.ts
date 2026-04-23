@@ -43,6 +43,11 @@ export declare class EmailService {
         messageId?: string;
         error?: string;
     }>;
+    sendAdminClaimNotification(agentName: string, agentId: string, claimantName: string, claimantEmail: string, source: string): Promise<{
+        success: boolean;
+        messageId?: string;
+        error?: string;
+    }>;
     private escapeHtml;
 }
 export declare const emailService: EmailService;

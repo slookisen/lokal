@@ -114,9 +114,24 @@ const CHAT_CSS = `
   .container { max-width: 900px; margin: 0 auto; padding: 0 24px; }
 
   /* ═══ Conversation List ══════════════════════════════════════ */
-  .conv-list-header { padding: 40px 0 24px; text-align: center; }
+  .conv-list-header { padding: 40px 0 12px; text-align: center; }
   .conv-list-header h1 { font-size: 1.6rem; font-weight: 800; color: var(--charcoal); margin-bottom: 6px; }
   .conv-list-header p { font-size: 0.9rem; color: var(--g500); }
+
+  /* Stats cards */
+  .stats-row { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 12px; margin: 20px 0; }
+  .stat-card { background: var(--white); border: 1px solid var(--g100); border-radius: var(--r-md); padding: 16px; text-align: center; }
+  .stat-card .stat-num { font-size: 1.5rem; font-weight: 800; color: var(--green-700); }
+  .stat-card .stat-label { font-size: 0.72rem; color: var(--g500); margin-top: 2px; text-transform: uppercase; letter-spacing: 0.5px; }
+  .stat-card.active { border-color: var(--green-700); box-shadow: 0 0 0 1px var(--green-700); }
+
+  /* Source filter tabs */
+  .filter-tabs { display: flex; gap: 8px; justify-content: center; margin: 16px 0 24px; flex-wrap: wrap; }
+  .filter-tab { display: inline-flex; align-items: center; gap: 6px; padding: 6px 16px; border-radius: 20px; border: 1.5px solid var(--g200); background: var(--white); font-size: 0.82rem; font-weight: 600; color: var(--g500); cursor: pointer; text-decoration: none; transition: all 0.15s; }
+  .filter-tab:hover { border-color: var(--green-700); color: var(--green-700); text-decoration: none; }
+  .filter-tab.active { background: var(--green-700); color: var(--white); border-color: var(--green-700); }
+  .filter-tab .tab-count { background: rgba(0,0,0,0.08); padding: 1px 7px; border-radius: 10px; font-size: 0.7rem; }
+  .filter-tab.active .tab-count { background: rgba(255,255,255,0.25); }
 
   .conv-item { background: var(--white); border-radius: var(--r-lg); border: 1px solid var(--g100); padding: 18px 22px; margin-bottom: 12px; display: block; text-decoration: none; color: var(--charcoal); transition: all 0.2s; }
   .conv-item:hover { transform: translateY(-2px); box-shadow: var(--shadow-md); border-color: var(--green-100); text-decoration: none; }
@@ -139,6 +154,8 @@ const CHAT_CSS = `
   .empty-state .icon { font-size: 3rem; margin-bottom: 12px; }
   .empty-state p { font-size: 0.9rem; }
   .conv-stats { margin-top: 8px; font-size: 0.8rem; color: var(--g500); }
+
+  .pagination-note { text-align: center; padding: 16px 0 32px; font-size: 0.8rem; color: var(--g500); }
 
   /* ═══ Query Groups (accordion) ══════════════════════════════ */
   .query-group { background: var(--white); border-radius: var(--r-lg); border: 1px solid var(--g100); margin-bottom: 12px; overflow: hidden; }
@@ -258,20 +275,67 @@ function chatShell(title, description, content) {
 // ═══════════════════════════════════════════════════════════════
 // GET /samtaler — Conversation list
 // ═══════════════════════════════════════════════════════════════
-router.get("/samtaler", (_req, res) => {
+router.get("/samtaler", (req, res) => {
     try {
-        const conversations = conversation_service_1.conversationService.listConversations({ limit: 100 });
+        // ─── Source filter from query param ──────────────────────────
+        const activeSource = req.query.kilde || "";
+        const validSources = ["a2a", "mcp", "web", "api"];
+        const filterSource = validSources.includes(activeSource) ? activeSource : undefined;
+        // ─── Stats per source (always show all, regardless of filter) ─
+        const sourceStats = conversation_service_1.conversationService.getSourceStats();
+        const totalAll = sourceStats.reduce((s, r) => s + r.count, 0);
+        const statsMap = new Map(sourceStats.map(s => [s.source, s]));
+        // ─── Filtered conversations (max 50) ────────────────────────
+        const conversations = conversation_service_1.conversationService.listConversations({
+            limit: 50,
+            source: filterSource,
+        });
+        // ─── Stats cards ────────────────────────────────────────────
+        const sourceLabels = {
+            mcp: { icon: "&#129302;", label: "MCP" },
+            a2a: { icon: "&#128640;", label: "A2A" },
+            web: { icon: "&#127760;", label: "Web" },
+            api: { icon: "&#128268;", label: "API" },
+        };
+        const statsHtml = `<div class="stats-row">
+      <div class="stat-card">
+        <div class="stat-num">${totalAll}</div>
+        <div class="stat-label">Totalt samtaler</div>
+      </div>
+      ${["mcp", "a2a", "web", "api"].map(src => {
+            const s = statsMap.get(src);
+            const count = s?.count || 0;
+            const info = sourceLabels[src];
+            return `<div class="stat-card${activeSource === src ? " active" : ""}">
+          <div class="stat-num">${count}</div>
+          <div class="stat-label">${info.icon} ${info.label}</div>
+        </div>`;
+        }).join("\n")}
+    </div>`;
+        // ─── Filter tabs ─────────────────────────────────────────────
+        const tabsHtml = `<div class="filter-tabs">
+      <a href="/samtaler" class="filter-tab${!activeSource ? " active" : ""}">Alle <span class="tab-count">${totalAll}</span></a>
+      ${["mcp", "a2a", "web", "api"].map(src => {
+            const count = statsMap.get(src)?.count || 0;
+            const info = sourceLabels[src];
+            return `<a href="/samtaler?kilde=${src}" class="filter-tab${activeSource === src ? " active" : ""}">${info.icon} ${info.label} <span class="tab-count">${count}</span></a>`;
+        }).join("\n")}
+    </div>`;
+        // ─── Conversation groups ─────────────────────────────────────
         let listHtml = "";
         if (conversations.length === 0) {
+            const emptyMsg = activeSource
+                ? `Ingen samtaler via ${sourceLabels[activeSource]?.label || activeSource} enn&aring;.`
+                : `Ingen samtaler enn&aring;. N&aring;r agenter begynner &aring; snakke med hverandre, dukker samtalene opp her.`;
             listHtml = `
         <div class="empty-state">
           <div class="icon">&#128172;</div>
-          <p>Ingen samtaler enn&aring;. N&aring;r AI-agenter begynner &aring; snakke med hverandre, dukker samtalene opp her.</p>
+          <p>${emptyMsg}</p>
+          ${activeSource ? `<p style="margin-top:12px"><a href="/samtaler">&larr; Vis alle samtaler</a></p>` : ""}
         </div>`;
         }
         else {
-            // ─── Group conversations by query text ──────────────────
-            // Each search becomes one accordion card showing all responding agents.
+            // Group by query text
             const groups = new Map();
             for (const conv of conversations) {
                 const key = (conv.queryText || "").trim().toLowerCase() || conv.id;
@@ -290,10 +354,13 @@ router.get("/samtaler", (_req, res) => {
                 const agentCount = convs.length;
                 const mostRecent = convs.reduce((a, b) => a.updatedAt > b.updatedAt ? a : b);
                 const groupId = `grp-${groupIdx}`;
-                // Agent sub-cards (inside accordion)
+                // Check for client identity in system message metadata
+                const systemMsg = first.messages.find(m => m.senderRole === "system");
+                const clientIdentity = systemMsg?.metadata?.clientIdentity;
+                const clientTag = clientIdentity ? ` <span style="font-size:0.7rem;opacity:0.7">(${escapeHtml(clientIdentity)})</span>` : "";
+                // Agent sub-cards
                 const agentCards = convs.map(conv => {
                     const sellerName = escapeHtml(conv.sellerAgentName || "Ukjent selger");
-                    // Get the seller's auto-response (last non-system message)
                     const sellerMsg = [...conv.messages].reverse().find(m => m.senderRole === "seller");
                     const preview = sellerMsg
                         ? escapeHtml(sellerMsg.content).slice(0, 150) + (sellerMsg.content.length > 150 ? "..." : "")
@@ -315,7 +382,7 @@ router.get("/samtaler", (_req, res) => {
             <div class="query-left">
               <div class="query-icon">&#128269;</div>
               <div>
-                <div class="query-text">&laquo;${queryDisplay}&raquo;</div>
+                <div class="query-text">&laquo;${queryDisplay}&raquo;${clientTag}</div>
                 <div class="query-meta">${agentCount} produsent${agentCount > 1 ? "er" : ""} svarte &middot; ${totalMsgs} meldinger &middot; ${formatTime(mostRecent.updatedAt)}</div>
               </div>
             </div>
@@ -331,15 +398,19 @@ router.get("/samtaler", (_req, res) => {
             }).join("\n");
         }
         const totalConvs = conversations.length;
-        const totalQueries = new Set(conversations.map(c => (c.queryText || "").trim().toLowerCase())).size;
-        const html = chatShell("A2A Samtaler", "Se hvordan AI-agenter snakker sammen for å finne lokal mat", `
+        const paginationNote = totalConvs >= 50
+            ? `<div class="pagination-note">Viser siste 50 samtaler${activeSource ? ` fra ${sourceLabels[activeSource]?.label || activeSource}` : ""}.</div>`
+            : "";
+        const html = chatShell("Samtaler", "Se hvordan AI-agenter og besøkende finner lokal mat", `
       <div class="container">
         <div class="conv-list-header">
-          <h1>&#128172; Agent-til-Agent Samtaler</h1>
-          <p>Se hvordan AI-agenter forhandler om lokal mat i sanntid</p>
-          ${totalConvs > 0 ? `<div class="conv-stats">${totalQueries} s&oslash;k &middot; ${totalConvs} samtaler</div>` : ""}
+          <h1>&#128172; Samtaler</h1>
+          <p>Se hvordan AI-agenter og bes&oslash;kende finner lokal mat &mdash; i sanntid</p>
         </div>
+        ${statsHtml}
+        ${tabsHtml}
         ${listHtml}
+        ${paginationNote}
       </div>
       <script>
         document.querySelectorAll("[data-toggle]").forEach(function(header) {
@@ -603,8 +674,9 @@ interaction_logger_1.interactionLogger.on("message", (msg) => {
     }
 });
 // ─── GET /api/ag-ui/conversations — List active streams ─────
-router.get("/api/ag-ui/conversations", (_req, res) => {
-    const conversations = conversation_service_1.conversationService.listConversations({ limit: 50 });
+router.get("/api/ag-ui/conversations", (req, res) => {
+    const source = req.query.source;
+    const conversations = conversation_service_1.conversationService.listConversations({ limit: 50, source });
     res.json({
         conversations: conversations.map(c => ({
             id: c.id,

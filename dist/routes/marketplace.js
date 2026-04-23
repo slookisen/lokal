@@ -305,8 +305,9 @@ router.get("/search", async (req, res) => {
             }
         }
     }
-    // Preserve _productTerms through schema parsing (Zod strips unknown fields)
+    // Preserve internal fields through schema parsing (Zod strips unknown fields)
     const productTerms = parsed._productTerms;
+    const nameQuery = parsed._nameQuery;
     const requestedLimit = parseInt(req.query.limit) || 20;
     const query = marketplace_1.DiscoveryQuerySchema.parse({
         ...parsed,
@@ -315,6 +316,8 @@ router.get("/search", async (req, res) => {
     });
     if (productTerms)
         query._productTerms = productTerms;
+    if (nameQuery)
+        query._nameQuery = nameQuery;
     const startTime = Date.now();
     let results = marketplace_registry_1.marketplaceRegistry.discover(query);
     // ── Auto-expanding radius ──
@@ -396,7 +399,7 @@ router.get("/search", async (req, res) => {
     res.json({
         success: true,
         query: safeQuery,
-        parsed,
+        parsed: { ...parsed, _nameQuery: nameQuery || undefined },
         geoFiltered: !!parsed.location && !heleNorge,
         geoSource,
         count: enrichedResults.length,
@@ -742,6 +745,18 @@ router.post("/agents/:id/claim/verify", (req, res) => {
     }
     // Recalculate trust score now that the agent is verified
     const newTrustScore = trust_score_service_1.trustScoreService.update(agentId);
+    // Send admin notification about the new verified claim
+    try {
+        const db = (0, init_1.getDb)();
+        const claim = db.prepare("SELECT claimant_name, claimant_email, source FROM agent_claims WHERE id = ?").get(claimId);
+        const agent = db.prepare("SELECT name FROM agents WHERE id = ?").get(agentId);
+        if (claim && agent) {
+            email_service_1.emailService.sendAdminClaimNotification(agent.name, agentId, claim.claimant_name, claim.claimant_email, claim.source || "organic").catch((err) => console.error("[Admin notify] Failed:", err.message));
+        }
+    }
+    catch (err) {
+        console.error("[Admin notify] Error:", err.message);
+    }
     res.json({
         success: true,
         message: "Agenten er nå din! Bruk claim-token for å oppdatere informasjon.",

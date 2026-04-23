@@ -30,10 +30,12 @@ export interface ConversationMessage {
 declare class ConversationService {
     startConversation(opts: {
         buyerAgentId?: string;
+        buyerAgentName?: string;
         sellerAgentId: string;
         queryText?: string;
         taskId?: string;
         source?: "a2a" | "mcp" | "web" | "api";
+        clientIdentity?: string;
         autoRespond?: boolean;
     }): Conversation;
     generateSellerResponse(sellerAgentId: string, queryText?: string): {
@@ -58,7 +60,13 @@ declare class ConversationService {
         limit?: number;
         status?: string;
         agentId?: string;
+        source?: string;
     }): Conversation[];
+    getSourceStats(): {
+        source: string;
+        count: number;
+        lastActivity: string;
+    }[];
     getAgentMetrics(agentId: string): any;
     getLeaderboard(limit?: number): any[];
     private getMessages;

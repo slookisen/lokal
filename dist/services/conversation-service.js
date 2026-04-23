@@ -26,15 +26,16 @@ class ConversationService {
         const sellerCity = seller?.city || "";
         const sellerCategories = seller?.categories ? JSON.parse(seller.categories).join(", ") : "";
         // System message introducing the match
+        const clientTag = opts.clientIdentity ? ` via ${opts.clientIdentity}` : "";
         const systemMsg = opts.queryText
-            ? `Søk: "${opts.queryText}" → Match: ${sellerName} (${sellerCity}). Kategorier: ${sellerCategories}.`
-            : `Ny samtale startet med ${sellerName} (${sellerCity}).`;
+            ? `Søk: "${opts.queryText}" → Match: ${sellerName} (${sellerCity}). Kategorier: ${sellerCategories}.${clientTag}`
+            : `Ny samtale startet med ${sellerName} (${sellerCity}).${clientTag}`;
         this.addMessage({
             conversationId: id,
             senderRole: "system",
             content: systemMsg,
             messageType: "info",
-            metadata: { sellerAgentId: opts.sellerAgentId, queryText: opts.queryText, source },
+            metadata: { sellerAgentId: opts.sellerAgentId, queryText: opts.queryText, source, ...(opts.clientIdentity ? { clientIdentity: opts.clientIdentity } : {}) },
         });
         // ─── Seller agent auto-response ──────────────────────────
         // The seller agent "wakes up" and responds with what it knows.
@@ -77,31 +78,59 @@ class ConversationService {
         parts.push(`Hei fra ${agent.name}! 👋`);
         // Match query to relevant products if possible
         const queryLower = (queryText || "").toLowerCase();
-        const matchedProducts = (k.products || []).filter((p) => {
-            if (!queryLower)
-                return true;
+        const allProducts = (k.products || []).filter((p) => {
+            const name = (p.name || "").trim();
+            return name && !(0, knowledge_service_1.isProductNoise)(name) && !(0, knowledge_service_1.isProductHeader)(name);
+        });
+        const matchedProducts = queryLower ? allProducts.filter((p) => {
             const pName = (p.name || "").toLowerCase();
             const pCat = (p.category || "").toLowerCase();
-            return queryLower.includes(pName) || pName.includes(queryLower)
-                || queryLower.includes(pCat) || pCat.includes(queryLower);
-        });
-        // If we have matching products, show them. Otherwise show all (up to 5).
-        const productsToShow = matchedProducts.length > 0
-            ? matchedProducts.slice(0, 5)
-            : (k.products || []).slice(0, 5);
-        if (productsToShow.length > 0) {
-            const intro = matchedProducts.length > 0
-                ? "Vi har det du leter etter:"
-                : "Her er noe av det vi tilbyr:";
-            parts.push(intro);
-            for (const p of productsToShow) {
-                const seasonal = p.seasonal && p.months?.length
-                    ? ` (sesong: ${p.months.map((m) => ["", "jan", "feb", "mar", "apr", "mai", "jun", "jul", "aug", "sep", "okt", "nov", "des"][m] || m).join(", ")})`
-                    : "";
-                const organic = p.organic ? " 🌿 økologisk" : "";
-                parts.push(`• ${p.name}${p.category ? ` — ${p.category}` : ""}${organic}${seasonal}`);
+            return queryLower.split(/\s+/).some((word) => word.length > 2 && (pName.includes(word) || pCat.includes(word)));
+        }) : [];
+        // Show matched products (all of them) or a compact overview of all products
+        if (matchedProducts.length > 0) {
+            parts.push(`Vi har det du leter etter:`);
+            for (const p of matchedProducts.slice(0, 15)) {
+                const { cleanName, price } = (0, knowledge_service_1.parseProductPrice)(p);
+                const priceStr = price ? ` — ${price}` : "";
+                const organic = p.organic ? " 🌿" : "";
+                parts.push(`• ${cleanName}${priceStr}${organic}`);
             }
-            meta.products = productsToShow;
+            if (matchedProducts.length > 15) {
+                parts.push(`  _...og ${matchedProducts.length - 15} flere_`);
+            }
+            meta.products = matchedProducts;
+        }
+        else if (allProducts.length > 0) {
+            // Show all products grouped by section headers from the original data
+            parts.push(`Her er det vi tilbyr (${allProducts.length} produkter):`);
+            let currentSection = "";
+            let shown = 0;
+            for (const p of k.products || []) {
+                const name = (p.name || "").trim();
+                if (!name)
+                    continue;
+                if ((0, knowledge_service_1.isProductNoise)(name))
+                    continue;
+                // Section header
+                if ((0, knowledge_service_1.isProductHeader)(name)) {
+                    const headerText = name.replace(/[\p{Emoji_Presentation}\p{Emoji}\uFE0F]/gu, "").trim();
+                    if (headerText && headerText !== currentSection) {
+                        currentSection = headerText;
+                        parts.push(`\n**${headerText}**`);
+                    }
+                    continue;
+                }
+                const { cleanName, price } = (0, knowledge_service_1.parseProductPrice)(p);
+                const priceStr = price ? ` — ${price}` : "";
+                parts.push(`• ${cleanName}${priceStr}`);
+                shown++;
+                if (shown >= 30) {
+                    parts.push(`  _...og ${allProducts.length - shown} flere produkter_`);
+                    break;
+                }
+            }
+            meta.products = allProducts;
         }
         // Specialties
         if (k.specialties?.length) {
@@ -146,10 +175,17 @@ class ConversationService {
         if (k.certifications?.length) {
             parts.push(`✅ ${k.certifications.join(", ")}`);
         }
+        // Profile link
+        const BASE_URL = process.env.BASE_URL || "https://rettfrabonden.com";
+        const slug = agent.name.normalize("NFC").toLowerCase()
+            .replace(/\u00e6/g, "ae").replace(/\u00f8/g, "o").replace(/\u00e5/g, "a")
+            .replace(/\u00e4/g, "a").replace(/\u00f6/g, "o").replace(/\u00fc/g, "u")
+            .replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "");
+        parts.push(`\n🔗 Se profilen vår: ${BASE_URL}/produsent/${slug}`);
         // Closing
         parts.push("\nTa gjerne kontakt for spørsmål eller bestilling!");
         // Determine message type: if we have products with potential pricing, it's an "offer"
-        const msgType = productsToShow.length > 0 ? "offer" : "text";
+        const msgType = allProducts.length > 0 ? "offer" : "text";
         return {
             text: parts.join("\n"),
             type: msgType,
@@ -284,6 +320,10 @@ class ConversationService {
             sql += " AND c.status = ?";
             params.push(opts.status);
         }
+        if (opts.source) {
+            sql += " AND c.source = ?";
+            params.push(opts.source);
+        }
         if (opts.agentId) {
             sql += " AND (c.buyer_agent_id = ? OR c.seller_agent_id = ?)";
             params.push(opts.agentId, opts.agentId);
@@ -305,6 +345,18 @@ class ConversationService {
             createdAt: row.created_at,
             updatedAt: row.updated_at,
         }));
+    }
+    // ─── Conversation stats by source ─────────────────────────
+    getSourceStats() {
+        const db = (0, init_1.getDb)();
+        const rows = db.prepare(`
+      SELECT COALESCE(source, 'api') as source, COUNT(*) as count,
+        MAX(updated_at) as last_activity
+      FROM conversations
+      GROUP BY COALESCE(source, 'api')
+      ORDER BY count DESC
+    `).all();
+        return rows.map(r => ({ source: r.source, count: r.count, lastActivity: r.last_activity }));
     }
     // ─── Get agent metrics (seller dashboard / social proof) ─
     getAgentMetrics(agentId) {

@@ -45,7 +45,19 @@ export interface ProductInfo {
     months?: number[];
     organic?: boolean;
     note?: string;
+    price?: string;
+    priceUnit?: string;
 }
+/** Check if a product entry is a section header (e.g. "🐑 LAM", "📋 STYKNINGSDELER") */
+export declare function isProductHeader(name: string): boolean;
+/** Check if a product entry should be skipped (dividers, out-of-stock notes, metadata) */
+export declare function isProductNoise(name: string): boolean;
+/** Parse price from a product name like "Lammelår – kr 275/kg" → { cleanName, price } */
+export declare function parseProductPrice(p: ProductInfo): {
+    cleanName: string;
+    price: string | null;
+    section: string | null;
+};
 export interface ExternalReview {
     source: string;
     text: string;
@@ -108,6 +120,7 @@ export interface AgentInfoResponse {
 declare class KnowledgeService {
     getKnowledge(agentId: string): AgentKnowledge | null;
     getAgentInfo(agentId: string): AgentInfoResponse | null;
+    private normalizeProducts;
     upsertKnowledge(agentId: string, data: Partial<AgentKnowledge>): void;
     ownerUpdate(agentId: string, data: Partial<AgentKnowledge>): void;
     bulkEnrich(enrichments: Array<{

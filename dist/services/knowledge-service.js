@@ -4,9 +4,70 @@ var __importDefault = (this && this.__importDefault) || function (mod) {
 };
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.knowledgeService = void 0;
+exports.isProductHeader = isProductHeader;
+exports.isProductNoise = isProductNoise;
+exports.parseProductPrice = parseProductPrice;
 const uuid_1 = require("uuid");
 const crypto_1 = __importDefault(require("crypto"));
 const init_1 = require("../database/init");
+// ─── Shared product parsing utilities ─────────────────────
+// Used by MCP, A2A, auto-response, and web routes to normalize product data.
+/** Check if a product entry is a section header (e.g. "🐑 LAM", "📋 STYKNINGSDELER") */
+function isProductHeader(name) {
+    if (!name || name.length > 50)
+        return false;
+    const stripped = name.replace(/[\p{Emoji_Presentation}\p{Emoji}\uFE0F]/gu, "").trim();
+    return /^[A-ZÆØÅÉ\s&]+$/.test(stripped) && stripped.length >= 2;
+}
+/** Check if a product entry should be skipped (dividers, out-of-stock notes, metadata) */
+function isProductNoise(name) {
+    if (!name)
+        return true;
+    if (/^[❌⸻─—\s]+$/.test(name))
+        return true; // dividers
+    if (/^❌\s/.test(name))
+        return true; // "❌ Tomt for ..."
+    if (/^(Alle unntatt|Håndlaget med)/i.test(name))
+        return true; // notes
+    if (/^Kr\s*\.?\s*\d/i.test(name) && !name.includes("–"))
+        return true; // price-only lines like "Kr.1000"
+    return false;
+}
+/** Parse price from a product name like "Lammelår – kr 275/kg" → { cleanName, price } */
+function parseProductPrice(p) {
+    const name = (p.name || "").trim();
+    // Section header?
+    if (isProductHeader(name)) {
+        const headerText = name.replace(/[\p{Emoji_Presentation}\p{Emoji}\uFE0F]/gu, "").trim();
+        const subInfo = p.price && !/^\d/.test(p.price) ? p.price : null;
+        return { cleanName: headerText, price: null, section: subInfo || headerText };
+    }
+    // Skip noise
+    if (isProductNoise(name))
+        return { cleanName: name, price: null, section: null };
+    // Use existing price field if it has a numeric value
+    let price = (p.price || "").trim();
+    if (price && !/\d/.test(price))
+        price = ""; // non-numeric price field = descriptor, not price
+    let cleanName = name;
+    // Parse price from name: "Product – kr XXX/kg" or "Product – kr XXX"
+    if (!price) {
+        const m = name.match(/^(.+?)\s*[–\-—]\s*kr\.?\s*([\d,.\s]+(?:\/\w+)?)\s*$/i);
+        if (m) {
+            cleanName = m[1].trim();
+            price = `kr ${m[2].trim()}`;
+        }
+    }
+    // "Product kr.XXX" (no dash)
+    if (!price) {
+        const m = name.match(/^(.+?)\s+kr\.?\s*([\d,.\s]+(?:\/\w+)?)\s*$/i);
+        if (m) {
+            cleanName = m[1].trim();
+            price = `kr ${m[2].trim()}`;
+        }
+    }
+    return { cleanName, price: price || null, section: null };
+}
 class KnowledgeService {
     // ─── Get knowledge for an agent ──────────────────────────
     getKnowledge(agentId) {
@@ -14,7 +75,8 @@ class KnowledgeService {
         const row = db.prepare(`SELECT agent_id, address, postal_code, website, phone, email,
       opening_hours, products, about, specialties, certifications, payment_methods,
       delivery_options, google_rating, google_review_count, tripadvisor_rating,
-      external_reviews, external_links, data_source, auto_sources, last_enriched_at,
+      external_reviews, external_links, images, seasonality, delivery_radius, min_order_value,
+      data_source, auto_sources, last_enriched_at,
       owner_updated_at, preferences FROM agent_knowledge WHERE agent_id = ?`).get(agentId);
         if (!row)
             return null;
@@ -74,11 +136,38 @@ class KnowledgeService {
             },
         };
     }
+    // ─── Normalize products before storage ─────────────────
+    // Extracts prices embedded in product names and moves them to the price field.
+    // This handles data from sellers who paste AI-extracted product lists.
+    normalizeProducts(products) {
+        if (!products?.length)
+            return products;
+        return products.map(p => {
+            const name = (p.name || "").trim();
+            if (!name)
+                return p;
+            // Skip if price field already has a numeric value
+            if (p.price && /\d/.test(p.price))
+                return p;
+            // Skip section headers and noise
+            if (isProductHeader(name) || isProductNoise(name))
+                return p;
+            const { cleanName, price } = parseProductPrice(p);
+            if (price && cleanName !== name) {
+                return { ...p, name: cleanName, price, priceUnit: p.priceUnit || "kr" };
+            }
+            return p;
+        });
+    }
     // ─── Set/update knowledge (used by enrichment + owner) ────
     upsertKnowledge(agentId, data) {
         const db = (0, init_1.getDb)();
         const existing = this.getKnowledge(agentId);
         const now = new Date().toISOString();
+        // Normalize products: extract prices from name field before storage
+        if (data.products?.length) {
+            data = { ...data, products: this.normalizeProducts(data.products) };
+        }
         if (!existing) {
             db.prepare(`
         INSERT INTO agent_knowledge (

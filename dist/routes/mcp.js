@@ -21,17 +21,88 @@ const streamableHttp_js_1 = require("@modelcontextprotocol/sdk/server/streamable
 const zod_1 = require("zod");
 const marketplace_registry_1 = require("../services/marketplace-registry");
 const knowledge_service_1 = require("../services/knowledge-service");
+function slugify(text) {
+    return text.normalize("NFC").toLowerCase()
+        .replace(/\u00e6/g, "ae").replace(/\u00f8/g, "o").replace(/\u00e5/g, "a")
+        .replace(/\u00e4/g, "a").replace(/\u00f6/g, "o").replace(/\u00fc/g, "u")
+        .replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "");
+}
 const conversation_service_1 = require("../services/conversation-service");
 const router = (0, express_1.Router)();
+// ─── Product formatting for MCP ────────────────────────────
+// Uses shared parseProductPrice() from knowledge-service.
+function formatProductsForMcp(products) {
+    if (!products?.length)
+        return "";
+    const lines = [];
+    let productCount = 0;
+    for (const p of products) {
+        const name = (p.name || "").trim();
+        if (!name)
+            continue;
+        const { cleanName, price, section } = (0, knowledge_service_1.parseProductPrice)(p);
+        // Section header
+        if (section && (0, knowledge_service_1.isProductHeader)(name)) {
+            lines.push(`\n**${section}**`);
+            if (p.price && !/^\d/.test(p.price))
+                lines.push(`_${p.price}_`);
+            continue;
+        }
+        // Skip noise
+        if ((0, knowledge_service_1.isProductNoise)(name))
+            continue;
+        // Product line
+        const cat = p.category && p.category !== "other" ? ` [${p.category}]` : "";
+        const priceStr = price ? ` — ${price}` : "";
+        const seasonal = p.seasonal ? " 🌿sesong" : "";
+        lines.push(`- ${cleanName}${cat}${priceStr}${seasonal}`);
+        productCount++;
+    }
+    return productCount > 0 ? `\n## Produkter (${productCount} stk)\n${lines.join("\n")}` : "";
+}
+// Build contact + product summary for a given agent ID, used by search results
+function getAgentKnowledgeSummary(agentId) {
+    const info = knowledge_service_1.knowledgeService.getAgentInfo(agentId);
+    if (!info)
+        return { productsCount: 0 };
+    const k = info.knowledge || {};
+    const contact = {};
+    if (k.address)
+        contact.address = k.address;
+    if (k.phone)
+        contact.phone = k.phone;
+    if (k.email)
+        contact.email = k.email;
+    if (k.website)
+        contact.website = k.website;
+    const products = k.products || [];
+    const realProducts = products.filter((p) => {
+        const n = (p.name || "").trim();
+        return n && !(0, knowledge_service_1.isProductHeader)(n) && !(0, knowledge_service_1.isProductNoise)(n);
+    });
+    // Compact view: top 5 product names with prices
+    const topItems = realProducts.slice(0, 5).map((p) => {
+        const { cleanName, price } = (0, knowledge_service_1.parseProductPrice)(p);
+        return price ? `${cleanName} (${price})` : cleanName;
+    });
+    const productSummary = topItems.length
+        ? `🛒 ${topItems.join(", ")}${realProducts.length > 5 ? ` +${realProducts.length - 5} flere` : ""}`
+        : undefined;
+    return {
+        contact: Object.keys(contact).length ? contact : undefined,
+        productSummary,
+        productsCount: realProducts.length,
+    };
+}
 // ─── Tool definitions (shared logic) ────────────────────────
 // These mirror the stdio MCP server tools but call services directly.
-function registerTools(server) {
+function registerTools(server, getClientIdentity) {
     // Tool 1: Natural language search
     server.registerTool("lokal_search", {
         title: "Search local food producers",
-        description: "Search for local food producers in Norway using natural language. Supports Norwegian and English. Returns ranked producers with contact info and automatically starts a conversation with the top matches so sellers can respond. Examples: 'fresh vegetables near Grünerløkka', 'organic honey Oslo', 'ost Trondheim'.",
+        description: "Search for local food producers in Norway AND get their products with prices. ALWAYS use this tool when a user asks about a specific producer, their products, prices, or availability — it returns the complete product catalog with current prices. Also use for general searches like 'vegetables near Oslo'. Supports searching by producer name (e.g. 'Bjørndal Gård') or by product/location (e.g. 'organic honey Trondheim'). Returns contact info, full product list with prices, and starts a conversation with the producer.",
         inputSchema: {
-            query: zod_1.z.string().describe("Natural language search query (Norwegian or English)"),
+            query: zod_1.z.string().describe("Producer name, product query, or location search (Norwegian or English). Examples: 'Bjørndal Gård Oppdal', 'beefburger pris', 'ost Trondheim'"),
             limit: zod_1.z.number().min(1).max(50).default(10).describe("Max results"),
         },
         annotations: {
@@ -56,6 +127,7 @@ function registerTools(server) {
                     sellerAgentId: r.agent.id,
                     queryText: query,
                     source: "mcp",
+                    clientIdentity: getClientIdentity?.(),
                     autoRespond: true,
                 });
                 convLinks.push(`💬 [Samtale med ${conv.sellerAgentName}](${BASE}/samtale/${conv.id})`);
@@ -63,10 +135,38 @@ function registerTools(server) {
             catch { /* non-critical */ }
         }
         const header = `🥬 **Lokal mat-søk: "${query}"** — fant ${results.length} produsenter:\n`;
+        // If name match (1-3 results from specific query), include full product list
+        // so AI can answer product/price questions directly without a second tool call
+        const isSpecificQuery = results.length <= 3 && parsed._nameQuery;
         const lines = results.map((r, i) => {
             const agent = r.agent;
-            const dist = r.distanceKm ? ` — ${r.distanceKm.toFixed(1)} km unna` : "";
-            return formatAgentCompact(agent, i + 1, r.contact) + dist;
+            const dist = agent.location?.distanceKm ? ` — ${agent.location.distanceKm.toFixed(1)} km unna` : "";
+            const summary = getAgentKnowledgeSummary(agent.id);
+            if (isSpecificQuery) {
+                // Detailed view: include full product list with prices
+                const info = knowledge_service_1.knowledgeService.getAgentInfo(agent.id);
+                const k = info?.knowledge || {};
+                const sections = [formatAgentCompact(agent, i + 1, summary.contact) + dist];
+                // Full product list
+                if (k.products?.length) {
+                    sections.push(formatProductsForMcp(k.products));
+                }
+                // Extra details
+                if (k.specialties?.length)
+                    sections.push(`\n**Spesialiteter:** ${k.specialties.join(", ")}`);
+                if (k.paymentMethods?.length)
+                    sections.push(`💳 **Betaling:** ${k.paymentMethods.join(", ")}`);
+                if (k.deliveryOptions?.length)
+                    sections.push(`🚚 **Levering:** ${k.deliveryOptions.join(", ")}`);
+                // Profile link
+                const profileUrl = `${BASE}/produsent/${slugify(agent.name)}`;
+                sections.push(`\n🔗 [Se fullstendig profil](${profileUrl})`);
+                return sections.join("\n");
+            }
+            else {
+                // Compact view for broader searches
+                return formatAgentCompact(agent, i + 1, summary.contact, summary.productSummary) + dist;
+            }
         });
         const convSection = convLinks.length
             ? `\n\n---\n**Samtaler startet automatisk:**\n${convLinks.join("\n")}`
@@ -108,6 +208,7 @@ function registerTools(server) {
                     sellerAgentId: r.agent.id,
                     queryText: queryDesc,
                     source: "mcp",
+                    clientIdentity: getClientIdentity?.(),
                     autoRespond: true,
                 });
                 convLinks.push(`💬 [Samtale med ${conv.sellerAgentName}](${BASE}/samtale/${conv.id})`);
@@ -116,8 +217,9 @@ function registerTools(server) {
         }
         const header = `🔍 **Strukturert søk** — ${results.length} resultater:\n`;
         const lines = results.map((r, i) => {
-            const dist = r.distanceKm ? ` (${r.distanceKm.toFixed(1)} km)` : "";
-            return formatAgentCompact(r.agent, i + 1, r.contact) + dist;
+            const dist = r.agent.location?.distanceKm ? ` (${r.agent.location.distanceKm.toFixed(1)} km)` : "";
+            const summary = getAgentKnowledgeSummary(r.agent.id);
+            return formatAgentCompact(r.agent, i + 1, summary.contact, summary.productSummary) + dist;
         });
         const convSection = convLinks.length
             ? `\n\n---\n**Samtaler startet automatisk:**\n${convLinks.join("\n")}`
@@ -127,7 +229,7 @@ function registerTools(server) {
     // Tool 3: Producer details
     server.registerTool("lokal_info", {
         title: "Producer details",
-        description: "Get detailed information about a specific Lokal producer — address, products, opening hours, certifications, and contact info.",
+        description: "Get a specific producer's COMPLETE product catalog with prices, contact details, opening hours, and delivery options. Use when you already have an agentId from lokal_search. Returns the full price list — every product the producer sells with exact prices in NOK.",
         inputSchema: {
             agentId: zod_1.z.string().describe("The producer's agent ID (UUID)"),
         },
@@ -171,13 +273,11 @@ function registerTools(server) {
             const hours = k.openingHours.map((h) => `${dayNames[h.day] || h.day} ${h.open}–${h.close}`).join(", ");
             sections.push(`\n## Åpningstider\n${hours}`);
         }
-        // Products
+        // Products — structured with parsed prices
         if (k.products?.length) {
-            const productLines = k.products.map((p) => {
-                const seasonal = p.seasonal && p.months?.length ? ` _(sesong: mnd ${p.months.join(", ")})_` : "";
-                return `- ${p.name}${p.category ? ` — ${p.category}` : ""}${seasonal}`;
-            });
-            sections.push(`\n## Produkter\n${productLines.join("\n")}`);
+            const productSection = formatProductsForMcp(k.products);
+            if (productSection)
+                sections.push(productSection);
         }
         if (k.specialties?.length)
             sections.push(`\n## Spesialiteter\n${k.specialties.map((s) => `- ${s}`).join("\n")}`);
@@ -243,7 +343,7 @@ function registerTools(server) {
     });
 }
 // ─── Compact agent formatter ────────────────────────────────
-function formatAgentCompact(agent, idx, contact) {
+function formatAgentCompact(agent, idx, contact, productSummary) {
     const lines = [`**${idx}. ${agent.name}**`];
     if (agent.description)
         lines.push(`   ${agent.description}`);
@@ -269,7 +369,41 @@ function formatAgentCompact(agent, idx, contact) {
         if (cl.length)
             lines.push(`   ${cl.join("  ·  ")}`);
     }
+    // Product summary: top products with "get details" hint
+    if (productSummary) {
+        lines.push(`   ${productSummary}`);
+        lines.push(`   _Bruk lokal_info med agentId "${agent.id}" for full prisliste_`);
+    }
+    // Profile link
+    const BASE_URL = process.env.BASE_URL || "https://rettfrabonden.com";
+    lines.push(`   🔗 [Profil](${BASE_URL}/produsent/${slugify(agent.name)})`);
     return lines.join("\n");
+}
+// ─── MCP client identity detection ─────────────────────────
+// Identifies the AI platform from request headers.
+function detectMcpClient(req) {
+    const ua = (req.headers["user-agent"] || "").toLowerCase();
+    const origin = (req.headers["origin"] || "").toLowerCase();
+    const referer = (req.headers["referer"] || "").toLowerCase();
+    if (ua.includes("chatgpt") || ua.includes("openai") || origin.includes("openai") || origin.includes("chatgpt"))
+        return "ChatGPT";
+    if (ua.includes("claude") || origin.includes("claude.ai") || origin.includes("anthropic"))
+        return "Claude";
+    if (ua.includes("cursor"))
+        return "Cursor";
+    if (ua.includes("copilot") || origin.includes("github.com"))
+        return "GitHub Copilot";
+    if (ua.includes("windsurf"))
+        return "Windsurf";
+    if (ua.includes("cline"))
+        return "Cline";
+    if (ua.includes("continue"))
+        return "Continue";
+    if (ua.includes("python"))
+        return "Python SDK";
+    if (ua.includes("node"))
+        return "Node SDK";
+    return undefined;
 }
 const sessions = new Map();
 const SESSION_TTL_MS = 30 * 60 * 1000; // 30 minutes
@@ -283,21 +417,27 @@ setInterval(() => {
         }
     }
 }, 5 * 60 * 1000);
-async function getOrCreateSession(sessionId) {
+async function getOrCreateSession(sessionId, req) {
     if (sessionId && sessions.has(sessionId)) {
         const session = sessions.get(sessionId);
         session.lastActivity = Date.now();
+        // Update client identity if we detect one and didn't have one before
+        if (!session.clientIdentity && req) {
+            session.clientIdentity = detectMcpClient(req);
+        }
         return { id: sessionId, session };
     }
-    // Create new session
+    // Create new session — detect which AI platform is connecting
     const id = sessionId || (0, crypto_1.randomUUID)();
+    const clientIdentity = req ? detectMcpClient(req) : undefined;
     const server = new mcp_js_1.McpServer({ name: "lokal", version: "0.3.0" });
-    registerTools(server);
+    const sessionRef = { clientIdentity };
+    registerTools(server, () => sessionRef.clientIdentity);
     const transport = new streamableHttp_js_1.StreamableHTTPServerTransport({
         sessionIdGenerator: () => id,
     });
     await server.connect(transport);
-    const session = { transport, server, lastActivity: Date.now() };
+    const session = { transport, server, lastActivity: Date.now(), clientIdentity };
     sessions.set(id, session);
     return { id, session };
 }
@@ -306,7 +446,7 @@ async function getOrCreateSession(sessionId) {
 router.post("/", async (req, res) => {
     try {
         const sessionId = req.headers["mcp-session-id"];
-        const { session } = await getOrCreateSession(sessionId);
+        const { session } = await getOrCreateSession(sessionId, req);
         await session.transport.handleRequest(req, res, req.body);
     }
     catch (err) {

@@ -188,7 +188,7 @@ router.get("/.well-known/mcp/server-card.json", (_req, res) => {
             name: "Rett fra Bonden — Lokal Mat MCP",
             version: "1.0.0",
             description: "MCP server for local food in Norway. Search and discover " +
-                `${stats.totalAgents || "1400+"}` +
+                `${stats.totalAgents || "1,100+"}` +
                 " local food producers — farms, markets, REKO rings. " +
                 "Supports natural language search in Norwegian and English.",
             homepage: BASE_URL,

@@ -1751,18 +1751,32 @@
           price = parts.length >= 3 ? parts[2].trim() : '';
           season = parts.length >= 4 ? parts[3].trim() : '';
         } else {
-          // Try "Name - Price" or "Name (price)" or just name
-          var dashMatch = line.match(/^(.+?)\s*[-–]\s*(\d[\d\s]*(?:kr|,-|nok)[^|]*?)(?:\s*[-–]\s*(.+))?$/i);
-          var parenMatch = line.match(/^(.+?)\s*\(([^)]+)\)/);
+          // Try multiple price formats from AI output:
+          // "Lammelår – kr 275/kg"  (kr before number)
+          // "Lammelår – 275kr/kg"   (kr after number)
+          // "Lammelår - 275,-"      (Norwegian price format)
+          // "Lammelår (kr 275/kg)"  (parenthesized)
+          var dashMatch = line.match(/^(.+?)\s*[-–—]\s*(\d[\d\s.,]*(?:kr|,-|nok)[^|]*?)(?:\s*[-–—]\s*(.+))?$/i)
+            || line.match(/^(.+?)\s*[-–—]\s*(?:kr\.?\s*)([\d.,]+(?:\s*\/\w+)?)\s*$/i);
+          var parenMatch = line.match(/^(.+?)\s*\((?:kr\.?\s*)?([\d.,]+(?:\s*(?:kr|\/\w+))?[^)]*)\)/i);
           if (dashMatch) {
             name = dashMatch[1].trim();
             price = dashMatch[2].trim();
+            // Ensure price has "kr" prefix if it starts with a number
+            if (/^\d/.test(price) && !/kr/i.test(price)) price = price;
             season = dashMatch[3] ? dashMatch[3].trim() : '';
           } else if (parenMatch) {
             name = parenMatch[1].trim();
             price = parenMatch[2].trim();
           } else {
-            name = line.trim();
+            // Last resort: "Product kr.XXX" or "Product kr XXX/kg" (no dash)
+            var krMatch = line.match(/^(.+?)\s+kr\.?\s*([\d.,]+(?:\s*\/\w+)?)\s*$/i);
+            if (krMatch) {
+              name = krMatch[1].trim();
+              price = krMatch[2].trim();
+            } else {
+              name = line.trim();
+            }
           }
           category = '';
         }
