@@ -2,7 +2,7 @@ import { Router, Request, Response } from "express";
 import { marketplaceRegistry } from "../services/marketplace-registry";
 import { AgentRegistrationSchema, AdminRegistrationSchema, DiscoveryQuerySchema } from "../models/marketplace";
 import { interactionLogger } from "../services/interaction-logger";
-import { knowledgeService } from "../services/knowledge-service";
+import { knowledgeService, parseProductPrice, isProductHeader, isProductNoise } from "../services/knowledge-service";
 import { geocodingService } from "../services/geocoding-service";
 import { getDb } from "../database/init";
 import { emailService } from "../services/email-service";
@@ -394,10 +394,48 @@ router.get("/search", async (req: Request, res: Response) => {
     durationMs: Date.now() - startTime,
   });
 
-  const enrichedResults = results.map((r: any) => ({
-    ...r,
-    contact: buildContactBlock(r.agent.id),
-  }));
+  // Slugify for profile links
+  const slug = (text: string) => text.normalize("NFC").toLowerCase()
+    .replace(/\u00e6/g, "ae").replace(/\u00f8/g, "o").replace(/\u00e5/g, "a")
+    .replace(/\u00e4/g, "a").replace(/\u00f6/g, "o").replace(/\u00fc/g, "u")
+    .replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "");
+
+  const BASE_URL = process.env.BASE_URL || "https://rettfrabonden.com";
+
+  const enrichedResults = results.map((r: any) => {
+    const contact = buildContactBlock(r.agent.id);
+    const profileUrl = `${BASE_URL}/produsent/${slug(r.agent.name)}`;
+
+    // Include products with prices for all results (essential for AI agents)
+    const info = knowledgeService.getAgentInfo(r.agent.id);
+    const k = info?.knowledge;
+    let products: any[] | undefined;
+    if (k?.products?.length) {
+      products = k.products
+        .filter((p: any) => {
+          const n = (p.name || "").trim();
+          return n && !isProductHeader(n) && !isProductNoise(n);
+        })
+        .map((p: any) => {
+          const { cleanName, price } = parseProductPrice(p);
+          return {
+            name: cleanName,
+            category: p.category !== "other" ? p.category : undefined,
+            price: price || p.price || undefined,
+            seasonal: p.seasonal || undefined,
+            organic: p.organic || undefined,
+          };
+        });
+    }
+
+    return {
+      ...r,
+      contact,
+      profileUrl,
+      products,
+      productsCount: products?.length || 0,
+    };
+  });
 
   // ─── Auto-start conversations with top matches ────────────
   // Only for bot/agent traffic — not for humans browsing the site.
@@ -405,10 +443,12 @@ router.get("/search", async (req: Request, res: Response) => {
   // Humans use the /sok frontend which calls discover() directly.
   const ua = (req.headers["user-agent"] || "").toLowerCase();
   const acceptHeader = (req.headers["accept"] || "").toLowerCase();
-  const isAgent = ua.includes("gpt") || ua.includes("openai") || ua.includes("claude")
+  // Treat all JSON-accepting clients as agents (ChatGPT JIT plugin, MCP clients, etc.)
+  // The /sok frontend uses its own discover() call, not this endpoint.
+  const isAgent = acceptHeader.includes("application/json")
+    || ua.includes("gpt") || ua.includes("openai") || ua.includes("claude")
     || ua.includes("bot") || ua.includes("agent") || ua.includes("python")
-    || ua.includes("node-fetch") || ua.includes("axios") || ua.includes("httpie")
-    || acceptHeader.includes("application/json") && !acceptHeader.includes("text/html");
+    || ua.includes("node-fetch") || ua.includes("axios") || ua.includes("httpie");
 
   const conversations: any[] = [];
   if (isAgent && results.length > 0) {
