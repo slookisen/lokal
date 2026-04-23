@@ -24,6 +24,113 @@ import { conversationService } from "../services/conversation-service";
 
 const router = Router();
 
+// ─── Product formatting helpers ────────────────────────────
+// Parse structured product data from knowledge, including prices embedded in name strings.
+
+function formatProductLine(p: any): string | null {
+  const name = (p.name || "").trim();
+  if (!name) return null;
+
+  // Skip decorative lines: dividers, "Tomt for..." notes, non-product metadata
+  if (/^[❌⸻─—\s]+$/.test(name)) return null;
+  if (/^❌\s/.test(name)) return null;
+  if (/^(Alle unntatt|Håndlaget med|Kr\s|kr\s)/i.test(name) && !name.includes("–")) return null;
+
+  // Check if it's a section header (emoji + ALL-CAPS text, short)
+  if (/^[\p{Emoji_Presentation}\p{Emoji}\uFE0F\s]*[A-ZÆØÅÉ\s&]{2,}[\p{Emoji_Presentation}\p{Emoji}\uFE0F\s]*$/u.test(name) && name.length < 45) return null;
+
+  // Extract price from name if price field is empty/non-numeric
+  let displayName = name;
+  let price = (p.price || "").trim();
+  // price field sometimes contains descriptors, not numbers — ignore those
+  if (price && !/\d/.test(price)) price = "";
+
+  // Pattern: "Product – kr XXX/kg" or "Product – kr XXX"
+  const priceInName = name.match(/^(.+?)\s*[–\-—]\s*kr\.?\s*([\d,.\s]+(?:\/\w+)?)\s*$/i);
+  if (priceInName && !price) {
+    displayName = priceInName[1].trim();
+    price = `kr ${priceInName[2].trim()}`;
+  }
+  // Pattern: "Product kr.XXX" (no dash)
+  const priceInName2 = name.match(/^(.+?)\s+kr\.?\s*([\d,.\s]+(?:\/\w+)?)\s*$/i);
+  if (priceInName2 && !price) {
+    displayName = priceInName2[1].trim();
+    price = `kr ${priceInName2[2].trim()}`;
+  }
+
+  const cat = p.category && p.category !== "other" ? ` [${p.category}]` : "";
+  const priceStr = price ? ` — ${price}` : "";
+  const seasonal = p.seasonal ? " 🌿sesong" : "";
+
+  return `- ${displayName}${cat}${priceStr}${seasonal}`;
+}
+
+function formatProductsForMcp(products: any[]): string {
+  if (!products?.length) return "";
+
+  const lines: string[] = [];
+
+  for (const p of products) {
+    const name = (p.name || "").trim();
+    if (!name) continue;
+
+    // Detect section headers like "🐑 LAM", "🐂 STORFE"
+    if (/^[\p{Emoji_Presentation}\p{Emoji}\uFE0F\s]*[A-ZÆØÅÉ\s&]{2,}[\p{Emoji_Presentation}\p{Emoji}\uFE0F\s]*$/u.test(name) && name.length < 45) {
+      const headerText = name.replace(/[\p{Emoji_Presentation}\p{Emoji}\uFE0F]/gu, "").trim();
+      if (headerText) {
+        lines.push(`\n**${headerText}**`);
+        // price field sometimes has sub-info for headers (e.g. "GRASFÔRA DEXTER")
+        if (p.price && !/^\d/.test(p.price)) lines.push(`_${p.price}_`);
+      }
+      continue;
+    }
+
+    const formatted = formatProductLine(p);
+    if (formatted) lines.push(formatted);
+  }
+
+  return lines.length ? `\n## Produkter (${lines.filter(l => l.startsWith("- ")).length} stk)\n${lines.join("\n")}` : "";
+}
+
+// Build contact + product summary for a given agent ID, used by search results
+function getAgentKnowledgeSummary(agentId: string): { contact?: any; productSummary?: string; productsCount: number } {
+  const info = knowledgeService.getAgentInfo(agentId);
+  if (!info) return { productsCount: 0 };
+
+  const k = info.knowledge || {} as any;
+  const contact: any = {};
+  if (k.address) contact.address = k.address;
+  if (k.phone) contact.phone = k.phone;
+  if (k.email) contact.email = k.email;
+  if (k.website) contact.website = k.website;
+
+  const products = k.products || [];
+  const realProducts = products.filter((p: any) => {
+    const n = (p.name || "").trim();
+    if (!n) return false;
+    if (/^[\p{Emoji_Presentation}\p{Emoji}\uFE0F\s]*[A-ZÆØÅÉ\s&]{2,}[\p{Emoji_Presentation}\p{Emoji}\uFE0F\s]*$/u.test(n) && n.length < 45) return false;
+    if (/^❌/.test(n)) return false;
+    return true;
+  });
+
+  // For compact view: just list up to 5 product names + count
+  const topNames = realProducts.slice(0, 5).map((p: any) => {
+    const n = (p.name || "").trim();
+    // Strip price suffix for compact display
+    return n.replace(/\s*[–\-—]\s*kr\.?\s*[\d,.\s/]+$/i, "").trim();
+  });
+
+  const productSummary = topNames.length
+    ? `🛒 ${topNames.join(", ")}${realProducts.length > 5 ? ` +${realProducts.length - 5} flere` : ""}`
+    : undefined;
+
+  return {
+    contact: Object.keys(contact).length ? contact : undefined,
+    productSummary,
+    productsCount: realProducts.length,
+  };
+}
+
 // ─── Tool definitions (shared logic) ────────────────────────
 // These mirror the stdio MCP server tools but call services directly.
 
@@ -73,8 +180,9 @@ function registerTools(server: McpServer, getClientIdentity?: () => string | und
       const header = `🥬 **Lokal mat-søk: "${query}"** — fant ${results.length} produsenter:\n`;
       const lines = results.map((r: any, i: number) => {
         const agent = r.agent;
-        const dist = r.distanceKm ? ` — ${r.distanceKm.toFixed(1)} km unna` : "";
-        return formatAgentCompact(agent, i + 1, r.contact) + dist;
+        const dist = agent.location?.distanceKm ? ` — ${agent.location.distanceKm.toFixed(1)} km unna` : "";
+        const summary = getAgentKnowledgeSummary(agent.id);
+        return formatAgentCompact(agent, i + 1, summary.contact, summary.productSummary) + dist;
       });
 
       const convSection = convLinks.length
@@ -134,8 +242,9 @@ function registerTools(server: McpServer, getClientIdentity?: () => string | und
 
       const header = `🔍 **Strukturert søk** — ${results.length} resultater:\n`;
       const lines = results.map((r: any, i: number) => {
-        const dist = r.distanceKm ? ` (${r.distanceKm.toFixed(1)} km)` : "";
-        return formatAgentCompact(r.agent, i + 1, r.contact) + dist;
+        const dist = r.agent.location?.distanceKm ? ` (${r.agent.location.distanceKm.toFixed(1)} km)` : "";
+        const summary = getAgentKnowledgeSummary(r.agent.id);
+        return formatAgentCompact(r.agent, i + 1, summary.contact, summary.productSummary) + dist;
       });
 
       const convSection = convLinks.length
@@ -151,7 +260,7 @@ function registerTools(server: McpServer, getClientIdentity?: () => string | und
     "lokal_info",
     {
       title: "Producer details",
-      description: "Get detailed information about a specific Lokal producer — address, products, opening hours, certifications, and contact info.",
+      description: "Get detailed information about a specific Lokal producer — full product list with prices, address, opening hours, certifications, and contact info. Use this after lokal_search to show a producer's complete menu/price list.",
       inputSchema: {
         agentId: z.string().describe("The producer's agent ID (UUID)"),
       },
@@ -197,13 +306,10 @@ function registerTools(server: McpServer, getClientIdentity?: () => string | und
         sections.push(`\n## Åpningstider\n${hours}`);
       }
 
-      // Products
+      // Products — structured with parsed prices
       if (k.products?.length) {
-        const productLines = k.products.map((p: any) => {
-          const seasonal = p.seasonal && p.months?.length ? ` _(sesong: mnd ${p.months.join(", ")})_` : "";
-          return `- ${p.name}${p.category ? ` — ${p.category}` : ""}${seasonal}`;
-        });
-        sections.push(`\n## Produkter\n${productLines.join("\n")}`);
+        const productSection = formatProductsForMcp(k.products);
+        if (productSection) sections.push(productSection);
       }
 
       if (k.specialties?.length) sections.push(`\n## Spesialiteter\n${k.specialties.map((s: string) => `- ${s}`).join("\n")}`);
@@ -289,7 +395,7 @@ function registerTools(server: McpServer, getClientIdentity?: () => string | und
 
 // ─── Compact agent formatter ────────────────────────────────
 
-function formatAgentCompact(agent: any, idx: number, contact?: any): string {
+function formatAgentCompact(agent: any, idx: number, contact?: any, productSummary?: string): string {
   const lines = [`**${idx}. ${agent.name}**`];
   if (agent.description) lines.push(`   ${agent.description}`);
 
@@ -306,6 +412,12 @@ function formatAgentCompact(agent: any, idx: number, contact?: any): string {
     if (contact.email) cl.push(`✉️ ${contact.email}`);
     if (contact.website) cl.push(`🌐 ${contact.website}`);
     if (cl.length) lines.push(`   ${cl.join("  ·  ")}`);
+  }
+
+  // Product summary: top products with "get details" hint
+  if (productSummary) {
+    lines.push(`   ${productSummary}`);
+    lines.push(`   _Bruk lokal_info med agentId "${agent.id}" for full prisliste_`);
   }
 
   return lines.join("\n");
