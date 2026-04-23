@@ -98,11 +98,19 @@ class MarketplaceRegistry {
 
     // ── 0. Name-based search: if query contains a producer name, find it directly ──
     // This handles "Bjørndal Gård Oppdal", "hva tilbyr Bjørndal Gård?" etc.
+    // NOTE: SQLite's LOWER() only works for ASCII, so we do case-insensitive
+    // matching in JavaScript instead of SQL to handle Norwegian characters (ø,å,æ).
     const nameQuery = (query as any)._nameQuery as string | undefined;
     if (nameQuery && nameQuery.length >= 3) {
-      const nameRows = db.prepare(
-        "SELECT * FROM agents WHERE is_active = 1 AND (LOWER(name) LIKE ? OR LOWER(name) LIKE ?)"
-      ).all(`%${nameQuery.toLowerCase()}%`, `%${nameQuery.toLowerCase().replace(/\s+/g, "%")}%`) as any[];
+      // Fetch all active agents and filter by name in JS (case-insensitive for Unicode)
+      const allRows = db.prepare("SELECT * FROM agents WHERE is_active = 1").all() as any[];
+      const nameWords = nameQuery.toLowerCase().split(/\s+/).filter(w => w.length >= 2);
+
+      const nameRows = allRows.filter(row => {
+        const agentName = (row.name || "").toLowerCase();
+        // All name words must appear somewhere in the agent name
+        return nameWords.every(word => agentName.includes(word));
+      });
 
       if (nameRows.length > 0) {
         // Found by name — return these as top results, skip geo filtering
