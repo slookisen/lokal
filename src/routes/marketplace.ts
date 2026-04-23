@@ -335,8 +335,9 @@ router.get("/search", async (req: Request, res: Response) => {
     }
   }
 
-  // Preserve _productTerms through schema parsing (Zod strips unknown fields)
+  // Preserve internal fields through schema parsing (Zod strips unknown fields)
   const productTerms = parsed._productTerms;
+  const nameQuery = (parsed as any)._nameQuery;
   const requestedLimit = parseInt(req.query.limit as string) || 20;
   const query = DiscoveryQuerySchema.parse({
     ...parsed,
@@ -344,6 +345,7 @@ router.get("/search", async (req: Request, res: Response) => {
     offset: parseInt(req.query.offset as string) || 0,
   });
   if (productTerms) (query as any)._productTerms = productTerms;
+  if (nameQuery) (query as any)._nameQuery = nameQuery;
 
   const startTime = Date.now();
   let results = marketplaceRegistry.discover(query);
