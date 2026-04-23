@@ -419,7 +419,7 @@ router.get("/samtaler", (req: Request, res: Response) => {
       ? `<div class="pagination-note">Viser siste 50 samtaler${activeSource ? ` fra ${sourceLabels[activeSource]?.label || activeSource}` : ""}.</div>`
       : "";
 
-    const html = chatShell("Samtaler — Rett fra Bonden", "Se hvordan AI-agenter og besøkende finner lokal mat", `
+    const html = chatShell("Samtaler", "Se hvordan AI-agenter og besøkende finner lokal mat", `
       <div class="container">
         <div class="conv-list-header">
           <h1>&#128172; Samtaler</h1>
