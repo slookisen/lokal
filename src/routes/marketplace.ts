@@ -1191,6 +1191,187 @@ router.post("/admin/bulk-enrich", (req: Request, res: Response) => {
   }
 });
 
+// ─── POST /admin/google-rating/:id — Fetch Google Places rating ──
+// Uses the server-side GOOGLE_PLACES_API_KEY to look up a producer's
+// Google rating and review count, then persists it to knowledge.
+// This lets enrichment agents (running in sandbox without the key)
+// trigger Google rating lookups via our own API.
+
+router.post("/admin/google-rating/:id", async (req: Request, res: Response) => {
+  const adminKey = req.headers["x-admin-key"] as string;
+  const expectedKey = getAdminKey();
+  if (!expectedKey || !adminKey || adminKey !== expectedKey) {
+    res.status(403).json({ error: "Krever X-Admin-Key header" });
+    return;
+  }
+
+  const agentId = req.params.id as string;
+  const placesKey = process.env.GOOGLE_PLACES_API_KEY;
+  if (!placesKey) {
+    res.status(503).json({ success: false, error: "GOOGLE_PLACES_API_KEY not configured" });
+    return;
+  }
+
+  // Get agent info for search query
+  const info = knowledgeService.getAgentInfo(agentId);
+  if (!info) {
+    res.status(404).json({ success: false, error: "Agent ikke funnet" });
+    return;
+  }
+
+  const { agent, knowledge: k } = info;
+  const city = (agent as any).city || "";
+  const searchQuery = `${agent.name} ${city} Norway`.replace(/\s*[—–-]\s*/g, " ").trim();
+
+  try {
+    // Google Places Text Search (New API)
+    const placesResp = await fetch("https://places.googleapis.com/v1/places:searchText", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "X-Goog-Api-Key": placesKey,
+        "X-Goog-FieldMask": "places.rating,places.userRatingCount,places.displayName,places.formattedAddress",
+      },
+      body: JSON.stringify({ textQuery: searchQuery, languageCode: "no" }),
+    });
+
+    if (!placesResp.ok) {
+      const errText = await placesResp.text();
+      res.status(502).json({ success: false, error: `Google Places API error: ${placesResp.status}`, detail: errText.slice(0, 200) });
+      return;
+    }
+
+    const placesData = await placesResp.json() as any;
+    const places = placesData.places || [];
+
+    if (places.length === 0) {
+      res.json({ success: true, found: false, message: `Ingen Google Places-treff for "${searchQuery}"` });
+      return;
+    }
+
+    // Take the first result — verify it's a reasonable match
+    const place = places[0];
+    const rating = place.rating;
+    const reviewCount = place.userRatingCount || 0;
+    const placeName = place.displayName?.text || "";
+    const placeAddr = place.formattedAddress || "";
+
+    if (!rating) {
+      res.json({ success: true, found: true, hasRating: false, placeName, message: "Funnet på Google Maps men ingen rating" });
+      return;
+    }
+
+    // Persist to knowledge
+    knowledgeService.upsertKnowledge(agentId, {
+      googleRating: rating,
+      googleReviewCount: reviewCount,
+      dataSource: "auto",
+    } as any);
+
+    // Update trust score
+    const newTrust = trustScoreService.update(agentId);
+
+    res.json({
+      success: true,
+      found: true,
+      hasRating: true,
+      googleRating: rating,
+      googleReviewCount: reviewCount,
+      placeName,
+      placeAddress: placeAddr,
+      newTrustScore: newTrust,
+    });
+  } catch (err: any) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// ─── POST /admin/google-rating-batch — Batch fetch ratings ──
+// Accepts { agentIds: string[] }, fetches Google rating for each.
+// Max 50 per request to respect API limits.
+
+router.post("/admin/google-rating-batch", async (req: Request, res: Response) => {
+  const adminKey = req.headers["x-admin-key"] as string;
+  const expectedKey = getAdminKey();
+  if (!expectedKey || !adminKey || adminKey !== expectedKey) {
+    res.status(403).json({ error: "Krever X-Admin-Key header" });
+    return;
+  }
+
+  const placesKey = process.env.GOOGLE_PLACES_API_KEY;
+  if (!placesKey) {
+    res.status(503).json({ success: false, error: "GOOGLE_PLACES_API_KEY not configured" });
+    return;
+  }
+
+  const { agentIds } = req.body;
+  if (!Array.isArray(agentIds) || agentIds.length === 0) {
+    res.status(400).json({ success: false, error: "Forventer { agentIds: string[] }" });
+    return;
+  }
+
+  const batch = agentIds.slice(0, 50); // Max 50 per request
+  const results: any[] = [];
+  let enriched = 0;
+
+  for (const agentId of batch) {
+    const info = knowledgeService.getAgentInfo(agentId);
+    if (!info) { results.push({ agentId, status: "not_found" }); continue; }
+
+    const city = (info.agent as any).city || "";
+    const searchQuery = `${info.agent.name} ${city} Norway`.replace(/\s*[—–-]\s*/g, " ").trim();
+
+    try {
+      const resp = await fetch("https://places.googleapis.com/v1/places:searchText", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "X-Goog-Api-Key": placesKey,
+          "X-Goog-FieldMask": "places.rating,places.userRatingCount,places.displayName",
+        },
+        body: JSON.stringify({ textQuery: searchQuery, languageCode: "no" }),
+      });
+
+      if (!resp.ok) { results.push({ agentId, status: "api_error", code: resp.status }); continue; }
+
+      const data = await resp.json() as any;
+      const place = (data.places || [])[0];
+
+      if (!place?.rating) {
+        results.push({ agentId, name: info.agent.name, status: "no_rating" });
+        continue;
+      }
+
+      knowledgeService.upsertKnowledge(agentId, {
+        googleRating: place.rating,
+        googleReviewCount: place.userRatingCount || 0,
+        dataSource: "auto",
+      } as any);
+      trustScoreService.update(agentId);
+      enriched++;
+
+      results.push({
+        agentId,
+        name: info.agent.name,
+        status: "enriched",
+        googleRating: place.rating,
+        googleReviewCount: place.userRatingCount || 0,
+      });
+
+      // Small delay to be nice to Google
+      await new Promise(r => setTimeout(r, 200));
+    } catch (err: any) {
+      results.push({ agentId, status: "error", message: err.message });
+    }
+  }
+
+  res.json({
+    success: true,
+    message: `Google-rating hentet for ${enriched} av ${batch.length} agenter`,
+    data: { enriched, total: batch.length, results },
+  });
+});
+
 // ─── DELETE /agents/:id — Remove agent (admin) ─────────────
 // Admin endpoint for removing duplicate or invalid agents.
 // Requires ADMIN_KEY header for authorization.
