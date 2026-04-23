@@ -261,11 +261,37 @@ class KnowledgeService {
     };
   }
 
+  // ─── Normalize products before storage ─────────────────
+  // Extracts prices embedded in product names and moves them to the price field.
+  // This handles data from sellers who paste AI-extracted product lists.
+  private normalizeProducts(products: ProductInfo[]): ProductInfo[] {
+    if (!products?.length) return products;
+    return products.map(p => {
+      const name = (p.name || "").trim();
+      if (!name) return p;
+      // Skip if price field already has a numeric value
+      if (p.price && /\d/.test(p.price)) return p;
+      // Skip section headers and noise
+      if (isProductHeader(name) || isProductNoise(name)) return p;
+
+      const { cleanName, price } = parseProductPrice(p);
+      if (price && cleanName !== name) {
+        return { ...p, name: cleanName, price, priceUnit: p.priceUnit || "kr" };
+      }
+      return p;
+    });
+  }
+
   // ─── Set/update knowledge (used by enrichment + owner) ────
   upsertKnowledge(agentId: string, data: Partial<AgentKnowledge>): void {
     const db = getDb();
     const existing = this.getKnowledge(agentId);
     const now = new Date().toISOString();
+
+    // Normalize products: extract prices from name field before storage
+    if (data.products?.length) {
+      data = { ...data, products: this.normalizeProducts(data.products) };
+    }
 
     if (!existing) {
       db.prepare(`
