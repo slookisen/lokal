@@ -96,6 +96,48 @@ class MarketplaceRegistry {
   discover(query: DiscoveryQuery): DiscoveryResult[] {
     const db = getDb();
 
+    // ── 0. Name-based search: if query contains a producer name, find it directly ──
+    // This handles "Bjørndal Gård Oppdal", "hva tilbyr Bjørndal Gård?" etc.
+    const nameQuery = (query as any)._nameQuery as string | undefined;
+    if (nameQuery && nameQuery.length >= 3) {
+      const nameRows = db.prepare(
+        "SELECT * FROM agents WHERE is_active = 1 AND (LOWER(name) LIKE ? OR LOWER(name) LIKE ?)"
+      ).all(`%${nameQuery.toLowerCase()}%`, `%${nameQuery.toLowerCase().replace(/\s+/g, "%")}%`) as any[];
+
+      if (nameRows.length > 0) {
+        // Found by name — return these as top results, skip geo filtering
+        let nameCandidates = nameRows.map(r => this.rowToAgent(r)!);
+        if (query.role) {
+          nameCandidates = nameCandidates.filter(a => a.role === query.role);
+        }
+        if (nameCandidates.length > 0) {
+          const results: DiscoveryResult[] = nameCandidates.map(agent => {
+            const { score, reasons } = this.calculateRelevance(agent, query, [], new Map());
+            this.incrementDiscovery(agent.id);
+            return {
+              agent: {
+                id: agent.id, name: agent.name, description: agent.description,
+                url: agent.url, role: agent.role,
+                skills: agent.skills.map(s => ({ id: s.id, name: s.name, description: s.description, tags: s.tags })),
+                location: agent.location ? {
+                  city: agent.location.city,
+                  distanceKm: query.location
+                    ? haversine(query.location.lat, query.location.lng, agent.location.lat, agent.location.lng)
+                    : undefined,
+                } : undefined,
+                trustScore: agent.trustScore, isVerified: agent.isVerified,
+                categories: agent.categories, tags: agent.tags,
+              },
+              relevanceScore: Math.max(score, 0.9), // Name match = high relevance
+              matchReasons: [`Navnematch: "${nameQuery}"`, ...reasons],
+            };
+          });
+          results.sort((a, b) => b.relevanceScore - a.relevanceScore);
+          return results.slice(0, query.limit || 20);
+        }
+      }
+    }
+
     // Build SQL dynamically based on query filters
     let sql = "SELECT * FROM agents WHERE is_active = 1";
     const params: any[] = [];
@@ -333,6 +375,22 @@ class MarketplaceRegistry {
     // Location resolution is handled by geocodingService in the search route.
     // This keeps parseNaturalQuery synchronous and fast — geocoding (which may
     // call Kartverket API) happens one level up in the async route handler.
+
+    // ── Name-based search extraction ──
+    // If query contains words that look like a producer name (capitalized, "Gård", "Farm"),
+    // extract them as a name search term so discover() can match by agent name.
+    // This catches: "Bjørndal Gård Oppdal", "hva har Rørosmat?", "produkter fra Erga"
+    const nameIndicators = /\b(gård|gard|farm|mat|ysteri|bakeri|bryggeri|marked|butikk|kooperativ|meieri|slakteri|SA)\b/i;
+    // Also catch multi-word capitalized names: "Bjørndal Gård", "Erga Gardsutsalg"
+    const capitalWords = query.match(/[A-ZÆØÅ][a-zæøå]+(?:\s+(?:[A-ZÆØÅ][a-zæøå]+|i|på|fra|og|—|-))+/g);
+
+    if (nameIndicators.test(query) && capitalWords?.length) {
+      // Use the longest capitalized phrase as the name query
+      const nameCandidate = capitalWords.sort((a, b) => b.length - a.length)[0];
+      if (nameCandidate.length >= 4) {
+        (parsed as any)._nameQuery = nameCandidate;
+      }
+    }
 
     parsed.role = "producer";
     return parsed;

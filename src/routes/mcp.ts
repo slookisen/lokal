@@ -142,11 +142,37 @@ function registerTools(server: McpServer, getClientIdentity?: () => string | und
       }
 
       const header = `🥬 **Lokal mat-søk: "${query}"** — fant ${results.length} produsenter:\n`;
+
+      // If name match (1-3 results from specific query), include full product list
+      // so AI can answer product/price questions directly without a second tool call
+      const isSpecificQuery = results.length <= 3 && (parsed as any)._nameQuery;
+
       const lines = results.map((r: any, i: number) => {
         const agent = r.agent;
         const dist = agent.location?.distanceKm ? ` — ${agent.location.distanceKm.toFixed(1)} km unna` : "";
         const summary = getAgentKnowledgeSummary(agent.id);
-        return formatAgentCompact(agent, i + 1, summary.contact, summary.productSummary) + dist;
+
+        if (isSpecificQuery) {
+          // Detailed view: include full product list with prices
+          const info = knowledgeService.getAgentInfo(agent.id);
+          const k = info?.knowledge || {} as any;
+          const sections = [formatAgentCompact(agent, i + 1, summary.contact) + dist];
+
+          // Full product list
+          if (k.products?.length) {
+            sections.push(formatProductsForMcp(k.products));
+          }
+
+          // Extra details
+          if (k.specialties?.length) sections.push(`\n**Spesialiteter:** ${k.specialties.join(", ")}`);
+          if (k.paymentMethods?.length) sections.push(`💳 **Betaling:** ${k.paymentMethods.join(", ")}`);
+          if (k.deliveryOptions?.length) sections.push(`🚚 **Levering:** ${k.deliveryOptions.join(", ")}`);
+
+          return sections.join("\n");
+        } else {
+          // Compact view for broader searches
+          return formatAgentCompact(agent, i + 1, summary.contact, summary.productSummary) + dist;
+        }
       });
 
       const convSection = convLinks.length
