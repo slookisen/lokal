@@ -538,7 +538,13 @@ interactionLogger.on("message", (msg: any) => {
 router.get("/api/interactions", (req: Request, res: Response) => {
   const limit = parseInt(req.query.limit as string) || 50;
   const interactions = interactionLogger.getRecent(limit);
-  res.json({ success: true, data: interactions, count: interactions.length });
+  // Redact PII from user-typed query strings before public response
+  const safe = interactions.map((it: any) => (
+    it && typeof it.query === "string"
+      ? { ...it, query: redactPII(it.query) }
+      : it
+  ));
+  res.json({ success: true, data: safe, count: safe.length });
 });
 
 // GET /api/interactions/stats — Interaction statistics
@@ -560,6 +566,24 @@ router.post("/api/conversations", (req: Request, res: Response) => {
   res.json({ success: true, data: conversation });
 });
 
+// Redact PII from a conversation's public-facing fields without touching
+// seller-role messages (producer-controlled content).
+function redactConversationForPublic(conv: any): any {
+  if (!conv || typeof conv !== "object") return conv;
+  const safe: any = { ...conv };
+  if (typeof conv.queryText === "string") safe.queryText = redactPII(conv.queryText);
+  if (Array.isArray(conv.messages)) {
+    safe.messages = conv.messages.map((m: any) => {
+      if (!m || typeof m.content !== "string") return m;
+      if (m.senderRole === "buyer" || m.senderRole === "system") {
+        return { ...m, content: redactPII(m.content) };
+      }
+      return m;
+    });
+  }
+  return safe;
+}
+
 // GET /api/conversations — List conversations
 router.get("/api/conversations", (req: Request, res: Response) => {
   const conversations = conversationService.listConversations({
@@ -567,7 +591,8 @@ router.get("/api/conversations", (req: Request, res: Response) => {
     status: (req.query.status as string) || undefined,
     agentId: (req.query.agentId as string) || undefined,
   });
-  res.json({ success: true, data: conversations, count: conversations.length });
+  const safe = conversations.map(redactConversationForPublic);
+  res.json({ success: true, data: safe, count: safe.length });
 });
 
 // GET /api/conversations/:id — Get single conversation with messages
@@ -577,7 +602,7 @@ router.get("/api/conversations/:id", (req: Request, res: Response) => {
     res.status(404).json({ success: false, error: "Conversation not found" });
     return;
   }
-  res.json({ success: true, data: conversation });
+  res.json({ success: true, data: redactConversationForPublic(conversation) });
 });
 
 // POST /api/conversations/:id/messages — Add message to conversation
