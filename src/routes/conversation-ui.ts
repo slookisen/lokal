@@ -17,6 +17,7 @@ import { Router, Request, Response } from "express";
 import { randomUUID } from "crypto";
 import { conversationService } from "../services/conversation-service";
 import { interactionLogger } from "../services/interaction-logger";
+import { redactPII } from "../utils/pii-redact";
 
 const router = Router();
 
@@ -359,7 +360,8 @@ router.get("/samtaler", (req: Request, res: Response) => {
       listHtml = [...groups.entries()].map(([_key, convs]) => {
         groupIdx++;
         const first = convs[0];
-        const queryDisplay = first.queryText ? escapeHtml(first.queryText) : "Direkte samtale";
+        // PII filter on user-typed search query text before public render
+        const queryDisplay = first.queryText ? escapeHtml(redactPII(first.queryText)) : "Direkte samtale";
         const source = first.source || "api";
         const srcBadge = sourceBadge(source);
         const totalMsgs = convs.reduce((s, c) => s + c.messages.length, 0);
@@ -485,9 +487,10 @@ router.get("/samtale/:id", (req: Request, res: Response) => {
       }
 
       if (role === "system") {
+        // System messages often echo the buyer's query — redact PII
         return `${dateSep}<div class="msg msg-system msg-${msg.messageType}">
           <div class="bubble bubble-system">
-            ${messageTypeIcon(msg.messageType)} ${escapeHtml(msg.content)}
+            ${messageTypeIcon(msg.messageType)} ${escapeHtml(redactPII(msg.content))}
             <div class="bubble-footer"><span class="bubble-time">${formatTimeShort(msg.createdAt)}</span></div>
           </div>
         </div>`;
@@ -499,10 +502,14 @@ router.get("/samtale/:id", (req: Request, res: Response) => {
       const name = msg.senderAgentName || (isBuyer ? buyerName : sellerName);
       const typeIcon = messageTypeIcon(msg.messageType);
 
+      // Buyer-side content is user-typed — redact PII. Seller-side content is
+      // producer-controlled and passes through unchanged.
+      const displayContent = isBuyer ? redactPII(msg.content) : msg.content;
+
       return `${dateSep}<div class="msg ${msgCls} msg-${msg.messageType}">
         <div class="bubble ${bubbleCls}">
           <div class="bubble-name">${escapeHtml(name)}</div>
-          <div class="bubble-content">${typeIcon ? typeIcon + " " : ""}${escapeHtml(msg.content)}</div>
+          <div class="bubble-content">${typeIcon ? typeIcon + " " : ""}${escapeHtml(displayContent)}</div>
           <div class="bubble-footer">
             ${msg.messageType !== "text" ? `<span class="bubble-type">${escapeHtml(msg.messageType)}</span>` : ""}
             <span class="bubble-time">${formatTimeShort(msg.createdAt)}</span>
@@ -515,9 +522,11 @@ router.get("/samtale/:id", (req: Request, res: Response) => {
     const buyerInitial = buyerName.charAt(0).toUpperCase();
     const sellerInitial = sellerName.charAt(0).toUpperCase();
 
+    // Redact PII from the query text before it appears in page title / meta
+    const safeQueryText = conv.queryText ? redactPII(conv.queryText) : "";
     const html = chatShell(
       `${buyerName} ↔ ${sellerName}`,
-      `A2A-samtale: ${conv.queryText || "agent-dialog"}`,
+      `A2A-samtale: ${safeQueryText || "agent-dialog"}`,
       `
       <div class="container">
         <div class="bc">
@@ -530,7 +539,7 @@ router.get("/samtale/:id", (req: Request, res: Response) => {
             ${statusBadge(conv.status)}
             <span>${conv.messages.length} meldinger</span>
             <span>Startet ${formatTime(conv.createdAt)}</span>
-            ${conv.queryText ? `<span>S&oslash;k: &laquo;${escapeHtml(conv.queryText)}&raquo;</span>` : ""}
+            ${safeQueryText ? `<span>S&oslash;k: &laquo;${escapeHtml(safeQueryText)}&raquo;</span>` : ""}
           </div>
         </div>
 

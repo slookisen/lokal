@@ -6,6 +6,7 @@ import { interactionLogger, InteractionEvent } from "../services/interaction-log
 import { conversationService } from "../services/conversation-service";
 import { discoveryService } from "../services/discovery-service";
 import { knowledgeService } from "../services/knowledge-service";
+import { redactPII } from "../utils/pii-redact";
 
 // ─── A2A Routes ──────────────────────────────────────────────
 // Two protocols served here:
@@ -516,7 +517,14 @@ interactionLogger.on("interaction", (event: InteractionEvent) => {
 });
 
 interactionLogger.on("message", (msg: any) => {
-  const data = JSON.stringify({ type: "conversation_message", ...msg });
+  // Redact PII from buyer/system content before broadcasting live.
+  // Seller content is producer-controlled and passes through unchanged.
+  const safe = { ...msg };
+  if (msg && typeof msg.content === "string" &&
+      (msg.senderRole === "buyer" || msg.senderRole === "system")) {
+    safe.content = redactPII(msg.content);
+  }
+  const data = JSON.stringify({ type: "conversation_message", ...safe });
   for (const client of sseClients) {
     try { client.write(`data: ${data}\n\n`); } catch { sseClients.delete(client); }
   }
