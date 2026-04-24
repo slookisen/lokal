@@ -1,21 +1,27 @@
 {
-  "name": "io.github.slookisen/lokal",
-  "description": "A2A marketplace for local food in Norway. Search 1,400+ farms, markets, and shops across 100+ Norwegian cities. Returns ranked producers with contact info, trust scores, and vCard links.",
-  "version": "0.2.0",
-  "packages": [
-    {
-      "registry_type": "npm",
-      "name": "lokal-mcp",
-      "version": "0.2.0"
-    }
-  ],
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.slookisen/lokal-mcp",
+  "description": "Find local food in Norway. Search 1,100+ farms, shops, REKO rings and cooperatives across 360+ cities. Returns ranked producers with contact info, trust scores, and vCard links.",
   "repository": {
     "url": "https://github.com/slookisen/lokal",
-    "source": "github"
+    "source": "github",
+    "subfolder": "mcp-server"
   },
-  "remoteEndpoints": [
+  "version": "0.3.3",
+  "packages": [
     {
-      "transportType": "streamablehttp",
+      "registryType": "npm",
+      "identifier": "lokal-mcp",
+      "version": "0.3.3",
+      "transport": {
+        "type": "stdio"
+      },
+      "environmentVariables": []
+    }
+  ],
+  "remotes": [
+    {
+      "type": "streamable-http",
       "url": "https://rettfrabonden.com/mcp"
     }
   ]
