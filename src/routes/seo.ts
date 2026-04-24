@@ -1738,7 +1738,7 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
       "@type": "LocalBusiness",
       "@id": `${BASE_URL}/produsent/${slug}#business`,
       "name": agent.name,
-      "description": agent.description || k.about || "",
+      "description": agent.description || k.about || `Lokal matprodusent i ${cityName || "Norge"}`,
       "url": `${BASE_URL}/produsent/${slug}`,
     };
 
@@ -1768,9 +1768,12 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
       };
     }
 
-    // Images — first image as primary, rest in array
+    // Images — Google requires image for LocalBusiness and merchant listings
     if (imagesList.length) {
       jsonLd.image = imagesList.length === 1 ? imagesList[0] : imagesList;
+    } else {
+      // Fallback: use platform logo so Google doesn't reject the listing
+      jsonLd.image = `${BASE_URL}/logo.png`;
     }
 
     // sameAs — website + all social/external links
@@ -1834,32 +1837,56 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
         }).join("")
       : "";
 
-    // Products as makesOffer
+    // Products as makesOffer — Google requires price + priceCurrency in every Offer
     if (productsList.length) {
       jsonLd.makesOffer = productsList.slice(0, 20).map((p: any) => {
-        const name = typeof p === "string" ? p : (p.name || "");
-        if (!name) return null;
+        const rawName = typeof p === "string" ? p : (p.name || "");
+        if (!rawName) return null;
+
+        // Parse price from name if not in price field (e.g. "Lammelår – kr 275/kg")
+        let productName = rawName;
+        let priceValue = typeof p === "object" ? (p.price || "") : "";
+
+        // Extract numeric price from various formats
+        if (!priceValue || !/\d/.test(priceValue)) {
+          const m = rawName.match(/^(.+?)\s*[–\-—]\s*(?:kr\.?\s*)?([\d.,]+)/i)
+            || rawName.match(/^(.+?)\s+kr\.?\s*([\d.,]+)/i);
+          if (m) {
+            productName = m[1].trim();
+            priceValue = m[2].replace(",", ".").trim();
+          }
+        }
+        // Clean price to numeric: "kr 275/kg" → "275", "kr 350" → "350"
+        const numericPrice = (priceValue || "").replace(/[^0-9.,]/g, "").replace(",", ".").split("/")[0];
+
+        // Google REQUIRES price — skip products without one (they cause validation errors)
+        if (!numericPrice || isNaN(parseFloat(numericPrice))) return null;
+
         const product: any = {
           "@type": "Product",
-          "name": name,
+          "name": productName,
+          "description": `${productName} fra ${agent.name}`,
           "offers": {
             "@type": "Offer",
+            "price": parseFloat(numericPrice),
+            "priceCurrency": "NOK",
             "availability": "https://schema.org/InStock",
+            "seller": { "@type": "LocalBusiness", "name": agent.name },
           },
         };
-        if (typeof p === "object" && p.price) {
-          product.offers.price = p.price;
-          product.offers.priceCurrency = "NOK";
+
+        // Add image if producer has one (Google requires image for merchant listings)
+        if (imagesList.length) {
+          product.image = imagesList[0];
         }
-        const offer: any = {
+
+        return {
           "@type": "Offer",
           "itemOffered": product,
+          "price": parseFloat(numericPrice),
+          "priceCurrency": "NOK",
+          "availability": "https://schema.org/InStock",
         };
-        if (typeof p === "object" && p.price) {
-          offer.price = p.price;
-          offer.priceCurrency = "NOK";
-        }
-        return offer;
       }).filter(Boolean);
     }
 
