@@ -29,11 +29,15 @@ function sqliteDatetime(date: Date): string {
 // ops traffic (supervisor, marketing, enrichment, contact-verifier) doesn't
 // inflate "direct" visits in the dashboard. These UAs are set by our own
 // scripts — they represent us calling our own site, not external traffic.
-const OWNER_UA_MARKERS = [
-  "Lokal/",
-  "Lokal-Enricher",
-  "rfb-",             // scheduled tasks use rfb-* prefixes
-  "Python-urllib",    // scheduled python scripts
+// Match case-insensitively — real UAs include "RFB-ContactVerifier",
+// "Lokal-Enricher", "Python-urllib" with varied casing. Bug seen in prod:
+// lowercase "rfb-" failed to match "RFB-ContactVerifier/1.0" so 794 ops
+// views were classified as HUMAN visitors in the last-24h window.
+const OWNER_UA_MARKERS_LC = [
+  "lokal/",
+  "lokal-enricher",
+  "rfb-",             // scheduled tasks use rfb-* prefixes (RFB-ContactVerifier, etc.)
+  "python-urllib",    // scheduled python scripts
   "python-requests",
   "node-fetch",       // internal node scripts
   "axios/",           // internal node scripts
@@ -42,8 +46,8 @@ const OWNER_UA_MARKERS = [
 function isOwnerRequest(req: Request): boolean {
   const cookieHeader = req.headers.cookie || "";
   if (cookieHeader.split(";").some(c => c.trim() === "_rfb_owner=1")) return true;
-  const ua = req.headers["user-agent"] || "";
-  return OWNER_UA_MARKERS.some(m => ua.includes(m));
+  const ua = (req.headers["user-agent"] || "").toLowerCase();
+  return OWNER_UA_MARKERS_LC.some(m => ua.includes(m));
 }
 
 // ─── Helper: Privacy-safe IP hashing ─────────────────────────
