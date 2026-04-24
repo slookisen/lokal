@@ -414,25 +414,91 @@ router.get("/devices", (req: Request, res: Response) => {
     const db = getDb();
     const cutoff = sqliteDatetime(new Date(Date.now() - hours * 60 * 60 * 1000));
 
-    // Infer device from user_agent_hash patterns
-    // Since we hash UAs we can't parse them, but the page_views middleware
-    // already tracks source. We'll infer from session patterns instead.
-    const devices = db.prepare(`
-      SELECT
-        source as device,
-        COUNT(*) as count,
-        COUNT(DISTINCT session_id) as visitors
+    // Proper device breakdown from the User-Agent embedded in session_id
+    // (format: "ipHash:userAgent"). Previously this endpoint grouped by the
+    // `source` column (direct/search/social/referral), which is *referrer*,
+    // not device — meaning Trafikkilder and Enheter showed identical data.
+    //
+    // Filter out bots/scanners so the Enheter widget reflects human visitors
+    // only. Bot traffic has its own widget (Bot-fordeling).
+    const rows = db.prepare(`
+      SELECT session_id, COUNT(*) as count
       FROM analytics_page_views
       WHERE created_at > ? AND ${NOT_OWNER}
-      GROUP BY source
-      ORDER BY count DESC
+        AND session_id NOT LIKE '%Bot%'
+        AND session_id NOT LIKE '%bot%'
+        AND session_id NOT LIKE '%spider%'
+        AND session_id NOT LIKE '%crawl%'
+        AND session_id NOT LIKE '%curl/%'
+        AND session_id NOT LIKE '%Python/%'
+        AND session_id NOT LIKE '%aiohttp%'
+        AND session_id NOT LIKE '%Lokal/%'
+        AND session_id NOT LIKE '%node-fetch%'
+        AND session_id NOT LIKE '%axios/%'
+      GROUP BY session_id
     `).all(cutoff) as any[];
 
-    // Re-map as device-like categories
+    const buckets: Record<string, { count: number; visitors: number }> = {
+      desktop: { count: 0, visitors: 0 },
+      mobile: { count: 0, visitors: 0 },
+      tablet: { count: 0, visitors: 0 },
+      unknown: { count: 0, visitors: 0 },
+    };
+
+    for (const r of rows) {
+      const ua = r.session_id.includes(':') ? r.session_id.split(':').slice(1).join(':') : '';
+      const lower = ua.toLowerCase();
+      let device: 'desktop' | 'mobile' | 'tablet' | 'unknown';
+      // Order matters — tablet check first because iPads include "Mobile" too.
+      if (lower.includes('ipad') || lower.includes('tablet')) {
+        device = 'tablet';
+      } else if (lower.includes('mobile') || lower.includes('iphone') || lower.includes('android')) {
+        device = 'mobile';
+      } else if (lower.includes('mozilla') || lower.includes('chrome') || lower.includes('safari') || lower.includes('firefox') || lower.includes('edg/')) {
+        device = 'desktop';
+      } else {
+        device = 'unknown';
+      }
+      buckets[device].count += r.count;
+      buckets[device].visitors += 1;
+    }
+
+    const devices = Object.entries(buckets)
+      .map(([device, v]) => ({ device, count: v.count, visitors: v.visitors }))
+      .filter(d => d.count > 0)
+      .sort((a, b) => b.count - a.count);
+
     res.json({ devices });
   } catch (err) {
     console.error("[analytics] devices error:", err);
     res.json({ devices: [] });
+  }
+});
+
+/**
+ * GET /admin/analytics/conversations
+ * Samtaler (business-level agent-to-agent conversations) totals and per-source.
+ * Separate signal from HTTP page-views; see conversation-service.
+ */
+router.get("/conversations", (_req: Request, res: Response) => {
+  try {
+    // Lazy import to avoid circular init at module load.
+    const { conversationService } = require("../services/conversation-service");
+    const sourceStats = conversationService.getSourceStats() as Array<{ source: string; count: number; lastActivity: string }>;
+    const total = sourceStats.reduce((s, r) => s + r.count, 0);
+    const bySource: Record<string, number> = { mcp: 0, a2a: 0, web: 0, api: 0 };
+    for (const r of sourceStats) {
+      bySource[r.source] = r.count;
+    }
+    res.json({
+      timestamp: new Date().toISOString(),
+      total,
+      bySource,
+      sourceStats,
+    });
+  } catch (err) {
+    console.error("[analytics] conversations error:", err);
+    res.json({ total: 0, bySource: {}, sourceStats: [] });
   }
 });
 
@@ -461,10 +527,40 @@ router.get("/traffic-classification", (req: Request, res: Response) => {
     `).all(cutoff) as any[];
 
     // Classification patterns
-    const botPatterns = ['bot', 'Bot', 'spider', 'crawl', 'serpstat', 'GPTBot', 'ClaudeBot', 'Chiark', 'Go-http-client', 'Dataprovider', 'NotHumanSearch', 'DuckDuck', 'Googlebot', 'GoogleOther', 'Bytespider', 'Applebot', 'YandexBot', 'BingPreview', 'facebookexternal', 'Twitterbot'];
+    // Bot detection: UA contains "bot"/"spider"/"crawl" as whole-ish word (not
+    // substring of something like "bot_name_lookalike"), OR a known named bot
+    // that doesn't itself contain "bot" (e.g. Bytespider, facebookexternalhit).
+    // The whole-word rule avoids false positives where a browser UA happens to
+    // include "robot" or similar incidentally.
+    const botPatterns = ['bot', 'Bot', 'spider', 'crawl', 'serpstat', 'GPTBot', 'ClaudeBot', 'Chiark', 'Go-http-client', 'Dataprovider', 'NotHumanSearch', 'DuckDuck', 'Googlebot', 'GoogleOther', 'Bytespider', 'Applebot', 'YandexBot', 'BingPreview', 'facebookexternal', 'Twitterbot', 'Amazonbot', 'meta-external', 'PetalBot', 'SemrushBot', 'AhrefsBot', 'DotBot', 'BLEXBot', 'MojeekBot', 'SeekportBot', 'CCBot', 'anthropic-ai', 'cohere-ai', 'ImagesiftBot', 'Diffbot', 'LinkedInBot', 'Slackbot', 'WhatsApp', 'TelegramBot'];
     const devPatterns = ['curl/', 'Python/', 'aiohttp', 'Lokal/', 'Lokal-Enricher', 'Claude-User', 'Python-urllib', 'node-fetch', 'axios/'];
     const scannerPatterns = ['Chrome/78.0', 'Chrome/89.0', 'Chrome/95.0', 'Chrome/58.0', 'Chrome/102.0'];
     const scannerPaths = ['wp-admin', 'wp-login', 'xmlrpc', 'wlwmanifest', '.env', '.git', 'wp-includes'];
+
+    // Dynamic bot-name extractor. Tries (in order):
+    //   1. Exact token ending in Bot/Crawler/Spider/bot (case-insensitive) —
+    //      catches AhrefsBot, SemrushBot, PetalBot, etc. without us having
+    //      to hardcode every crawler in existence.
+    //   2. First identifier before a "/" (UA convention "Name/version ...") —
+    //      catches "facebookexternalhit/1.1" → "facebookexternalhit",
+    //      "meta-externalagent/1.1" → "meta-externalagent".
+    //   3. First alphanumeric token — last-resort bucket ("UA looks weird").
+    // Returns { name, otherSample } where otherSample is the raw UA (truncated)
+    // for UAs that fell through to #3, so Daniel can see what's hiding in "other".
+    function extractBotName(ua: string): string {
+      // 1. Known-good substring match first (preserves existing labels)
+      const known = ua.match(/(ClaudeBot|GPTBot|MJ12bot|serpstatbot|Googlebot|GoogleOther|DuckDuckBot|Applebot|Chiark|Dataprovider|NotHumanSearch|BingPreview|facebookexternalhit|facebookexternal|Twitterbot|YandexBot|Bytespider|Amazonbot|PetalBot|SemrushBot|AhrefsBot|DotBot|BLEXBot|MojeekBot|SeekportBot|CCBot|meta-externalagent|anthropic-ai|LinkedInBot|Slackbot|TelegramBot|ImagesiftBot|Diffbot)/i);
+      if (known) return known[1];
+      // 2. Generic "*Bot/*Crawler/*Spider" token (e.g. "HostBot", "MyCrawler")
+      const generic = ua.match(/([A-Za-z][A-Za-z0-9_-]*(?:Bot|Crawler|Spider|bot|crawler|spider))/);
+      if (generic) return generic[1];
+      // 3. First "Name/version" tuple (e.g. "Go-http-client/1.1")
+      const slash = ua.match(/^([A-Za-z][A-Za-z0-9_.-]+)\//);
+      if (slash) return slash[1];
+      // 4. Fallback: first word-like token
+      const word = ua.match(/([A-Za-z][A-Za-z0-9_-]{2,})/);
+      return word ? word[1] : 'other';
+    }
 
     // Also get scanner paths
     const scannerHits = db.prepare(`
@@ -475,8 +571,11 @@ router.get("/traffic-classification", (req: Request, res: Response) => {
     const scannerSessionIds = new Set(scannerHits.map((r: any) => r.session_id));
 
     const classification = { human: { views: 0, sessions: 0 }, bot: { views: 0, sessions: 0 }, dev: { views: 0, sessions: 0 }, scanner: { views: 0, sessions: 0 } };
-    const botDetails: Record<string, { name: string; views: number }> = {};
+    const botDetails: Record<string, { name: string; views: number; sampleUa?: string }> = {};
     const humanSessions: any[] = [];
+    // Sample raw UAs that fell into "other" so the dashboard can show them.
+    // We keep at most one sample per unique UA prefix to stay under ~30 samples.
+    const otherSamples: Array<{ ua: string; views: number }> = [];
 
     for (const v of visitors) {
       const ua = v.session_id.includes(':') ? v.session_id.split(':').slice(1).join(':') : '';
@@ -487,11 +586,14 @@ router.get("/traffic-classification", (req: Request, res: Response) => {
       let type: string;
       if (isBot) {
         type = 'bot';
-        // Extract bot name
-        const botMatch = ua.match(/(ClaudeBot|GPTBot|MJ12bot|serpstatbot|Googlebot|GoogleOther|DuckDuckBot|Applebot|Chiark|Dataprovider|NotHumanSearch|BingPreview|facebookexternal|Twitterbot|YandexBot|Bytespider)/i);
-        const botName = botMatch ? botMatch[1] : 'other';
-        if (!botDetails[botName]) botDetails[botName] = { name: botName, views: 0 };
+        const botName = extractBotName(ua);
+        if (!botDetails[botName]) botDetails[botName] = { name: botName, views: 0, sampleUa: ua.slice(0, 120) };
         botDetails[botName].views += v.views;
+        // If we fell back to the last-resort token, preserve the raw UA so we
+        // can surface it in the dashboard's "other" drill-down.
+        if (botName === 'other' || /^(Mozilla|compatible)$/i.test(botName)) {
+          otherSamples.push({ ua: ua.slice(0, 160), views: v.views });
+        }
       } else if (isDev) {
         type = 'dev';
       } else if (isScanner) {
@@ -517,6 +619,18 @@ router.get("/traffic-classification", (req: Request, res: Response) => {
     // Bot breakdown sorted by views
     const bots = Object.values(botDetails).sort((a, b) => b.views - a.views);
 
+    // Dedupe "other" UA samples by first 40 chars, keep top 20 by views.
+    const sampleMap = new Map<string, { ua: string; views: number }>();
+    for (const s of otherSamples) {
+      const key = s.ua.slice(0, 40);
+      const existing = sampleMap.get(key);
+      if (existing) existing.views += s.views;
+      else sampleMap.set(key, { ua: s.ua, views: s.views });
+    }
+    const otherUaSamples = [...sampleMap.values()]
+      .sort((a, b) => b.views - a.views)
+      .slice(0, 20);
+
     res.json({
       timeframe: `last ${hours} hours`,
       timestamp: new Date().toISOString(),
@@ -524,6 +638,9 @@ router.get("/traffic-classification", (req: Request, res: Response) => {
       totalSessions: visitors.length,
       classification,
       bots,
+      // Raw UA samples for the "other"/long-tail bucket, so the dashboard can
+      // expose "who is hiding here" instead of an opaque number.
+      otherUaSamples,
       humanSessions: humanSessions.slice(0, 30),
     });
   } catch (err) {

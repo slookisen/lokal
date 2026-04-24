@@ -156,6 +156,9 @@
         <div id="ownerCookieBanner" style="display:none; background:#fef3c7; border:1px solid #f59e0b; border-radius:8px; padding:10px 16px; margin-bottom:16px; font-size:0.85rem; color:#92400e;">
             <strong>Eier-modus aktiv</strong> — din trafikk ekskluderes fra tallene. <a href="#" id="ownerCookieRemove" style="color:#b45309;">Fjern</a>
         </div>
+        <div id="ownerCookieOffer" style="display:none; background:#ecfccb; border:1px solid #84cc16; border-radius:8px; padding:10px 16px; margin-bottom:16px; font-size:0.85rem; color:#365314;">
+            <strong>Ekskluder deg selv fra tallene?</strong> Du er ikke tagget som eier i denne nettleseren. <a href="#" id="ownerCookieAdd" style="color:#365314; font-weight:600;">Marker meg som eier</a> (gjelder kun denne nettleseren).
+        </div>
 
         <!-- Stat Cards (7 now) -->
         <div class="stat-grid">
@@ -211,6 +214,14 @@
             <div class="panel">
                 <div class="panel-title">🤖 Bot-fordeling</div>
                 <div id="botBreakdown"><div class="loading"><div class="spinner"></div>Laster...</div></div>
+            </div>
+        </div>
+
+        <!-- Samtaler (agent-til-agent) -->
+        <div class="panel-grid">
+            <div class="panel panel-full">
+                <div class="panel-title">💬 Samtaler (agent-til-agent)</div>
+                <div id="conversationsPanel"><div class="loading"><div class="spinner"></div>Laster...</div></div>
             </div>
         </div>
 
@@ -297,16 +308,37 @@
             document.getElementById("loginScreen").style.display = "none";
             document.getElementById("dashboard").style.display = "block";
 
-            // Check if owner cookie is set
+            // Check if owner cookie is set — show banner or offer accordingly.
             var hasOwnerCookie = document.cookie.split(";").some(function(c) { return c.trim() === "_rfb_owner=1"; });
             if (hasOwnerCookie) {
                 document.getElementById("ownerCookieBanner").style.display = "block";
+            } else {
+                document.getElementById("ownerCookieOffer").style.display = "block";
             }
             document.getElementById("ownerCookieRemove").addEventListener("click", function(e) {
                 e.preventDefault();
                 document.cookie = "_rfb_owner=0; Path=/; Max-Age=0; SameSite=Lax";
                 document.getElementById("ownerCookieBanner").style.display = "none";
+                document.getElementById("ownerCookieOffer").style.display = "block";
                 alert("Cookie fjernet. Trafikken din telles som vanlig fra nå av.");
+            });
+            // One-click "Marker meg som eier" — sets cookie via admin endpoint
+            // (which requires the admin key) so the action is authenticated.
+            document.getElementById("ownerCookieAdd").addEventListener("click", function(e) {
+                e.preventDefault();
+                fetch(BASE + "/admin/analytics/mark-owner?key=" + encodeURIComponent(API_KEY), {
+                    credentials: "include"
+                })
+                .then(function(r) { return r.ok ? r.json() : Promise.reject(); })
+                .then(function() {
+                    document.getElementById("ownerCookieOffer").style.display = "none";
+                    document.getElementById("ownerCookieBanner").style.display = "block";
+                    alert("Du er nå markert som eier i denne nettleseren. Lastes inn på nytt.");
+                    loadDashboard();
+                })
+                .catch(function() {
+                    alert("Kunne ikke sette eier-cookie. Sjekk admin-nøkkel.");
+                });
             });
 
             loadDashboard();
@@ -370,6 +402,7 @@
             api("/devices?hours=" + hours),
             api("/traffic-classification?hours=" + hours),
             api("/referrers?hours=" + hours),
+            api("/conversations"),
         ])
         .then(function(results) {
             var summary = results[0];
@@ -381,6 +414,7 @@
             var devices = results[6];
             var classification = results[7];
             var referrers = results[8];
+            var conversations = results[9];
 
             document.getElementById("lastUpdated").textContent =
                 "Sist oppdatert: " + new Date().toLocaleString("no-NO") + " — " + summary.timeframe;
@@ -389,6 +423,7 @@
             renderHourlyChart(hourly.hourly || []);
             renderTrafficClassification(classification);
             renderBotBreakdown(classification);
+            renderConversations(conversations || {});
             renderReferrers(referrers.referrers || []);
             renderAgentDonut(summary.agentTraffic);
             renderTrafficSources(summary.trafficBySource);
@@ -638,10 +673,52 @@
 
         var max = bots[0].views;
         var botColors = { "ClaudeBot": "purple", "GPTBot": "green", "Googlebot": "cyan", "GoogleOther": "cyan", "MJ12bot": "yellow", "serpstatbot": "red", "DuckDuckBot": "green" };
-        el.innerHTML = bots.slice(0, 10).map(function(b) {
+        var bars = bots.slice(0, 12).map(function(b) {
             var color = botColors[b.name] || "yellow";
-            return '<div class="bar-row"><span class="bar-label">' + escHtml(b.name) + '</span><div class="bar-track"><div class="bar-fill ' + color + '" style="width: ' + (b.views / max * 100).toFixed(1) + '%"></div></div><span class="bar-count">' + fmtNum(b.views) + '</span></div>';
+            var title = b.sampleUa ? ' title="' + escHtml(b.sampleUa) + '"' : '';
+            return '<div class="bar-row"' + title + '><span class="bar-label">' + escHtml(b.name) + '</span><div class="bar-track"><div class="bar-fill ' + color + '" style="width: ' + (b.views / max * 100).toFixed(1) + '%"></div></div><span class="bar-count">' + fmtNum(b.views) + '</span></div>';
         }).join("");
+
+        // Expose the raw UA samples for the "other" bucket so we can see who's
+        // hiding there instead of just a number.
+        var samples = data.otherUaSamples || [];
+        var drilldown = "";
+        if (samples.length > 0) {
+            var rows = samples.map(function(s) {
+                return '<tr><td style="font-family:ui-monospace,Menlo,monospace;font-size:0.72rem;color:var(--text-dim);word-break:break-all">' + escHtml(s.ua) + '</td><td style="text-align:right">' + fmtNum(s.views) + '</td></tr>';
+            }).join("");
+            drilldown = '<details style="margin-top:10px"><summary style="cursor:pointer;font-size:0.82rem;color:var(--text-dim)">Vis User-Agent-prøver fra «other» (' + samples.length + ')</summary>' +
+                '<table class="data-table" style="margin-top:8px"><thead><tr><th>User-Agent</th><th style="text-align:right">Visn.</th></tr></thead><tbody>' + rows + '</tbody></table></details>';
+        }
+
+        el.innerHTML = bars + drilldown;
+    }
+
+    // ─── Samtaler Panel ─────────────────────────────
+    // Surfaces conversationService totals on the analytics dashboard so both
+    // HTTP-level signal (page-views, queries) and business-level signal
+    // (agent-to-agent conversations) are visible on one screen.
+    function renderConversations(data) {
+        var el = document.getElementById("conversationsPanel");
+        if (!el) return;
+        var total = data.total || 0;
+        var by = data.bySource || {};
+        if (total === 0) {
+            el.innerHTML = '<div class="empty-state">Ingen samtaler registrert enda</div>';
+            return;
+        }
+        var items = [
+            { key: "mcp",  label: "MCP",  icon: "🤖", color: "purple" },
+            { key: "a2a",  label: "A2A",  icon: "🚀", color: "cyan" },
+            { key: "web",  label: "Web",  icon: "🌐", color: "green" },
+            { key: "api",  label: "API",  icon: "🔌", color: "yellow" },
+        ];
+        var max = Math.max.apply(null, items.map(function(i) { return by[i.key] || 0; })) || 1;
+        var bars = items.map(function(i) {
+            var v = by[i.key] || 0;
+            return '<div class="bar-row"><span class="bar-label">' + i.icon + ' ' + i.label + '</span><div class="bar-track"><div class="bar-fill ' + i.color + '" style="width: ' + (v / max * 100).toFixed(1) + '%"></div></div><span class="bar-count">' + fmtNum(v) + '</span></div>';
+        }).join("");
+        el.innerHTML = '<div style="font-size:0.85rem;color:var(--text-dim);margin-bottom:10px">Totalt <strong style="color:var(--text)">' + fmtNum(total) + '</strong> samtaler (agent-til-agent). Ikke samme som sidevisninger — se forklaring på <a href="/samtaler" style="color:var(--accent)" target="_blank">/samtaler</a>.</div>' + bars;
     }
 
     // ─── Referrers ──────────────────────────────────

@@ -25,9 +25,25 @@ function sqliteDatetime(date: Date): string {
 }
 
 // ─── Helper: Check owner cookie from raw header ─────────────
+// Also treats our own scheduled agents and local dev clients as "owner" so
+// ops traffic (supervisor, marketing, enrichment, contact-verifier) doesn't
+// inflate "direct" visits in the dashboard. These UAs are set by our own
+// scripts — they represent us calling our own site, not external traffic.
+const OWNER_UA_MARKERS = [
+  "Lokal/",
+  "Lokal-Enricher",
+  "rfb-",             // scheduled tasks use rfb-* prefixes
+  "Python-urllib",    // scheduled python scripts
+  "python-requests",
+  "node-fetch",       // internal node scripts
+  "axios/",           // internal node scripts
+  "curl/",            // manual terminal checks
+];
 function isOwnerRequest(req: Request): boolean {
   const cookieHeader = req.headers.cookie || "";
-  return cookieHeader.split(";").some(c => c.trim() === "_rfb_owner=1");
+  if (cookieHeader.split(";").some(c => c.trim() === "_rfb_owner=1")) return true;
+  const ua = req.headers["user-agent"] || "";
+  return OWNER_UA_MARKERS.some(m => ua.includes(m));
 }
 
 // ─── Helper: Privacy-safe IP hashing ─────────────────────────
