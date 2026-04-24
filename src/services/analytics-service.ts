@@ -252,6 +252,16 @@ export class AnalyticsService {
       const city = result?.city || null;
       const resultCount = result?.resultCount || 0;
 
+      // Skip autocomplete/single-char noise. Client search inputs fire a request
+      // per keystroke, so "a", "ap", "app" all land here — the single-char rows
+      // dominate topSearchTerms and bury real intent signal. Drop <2 chars unless
+      // there's a resultCount (i.e. the request actually ran to completion with
+      // structured filters attached). Category/city-only queries still pass.
+      const queryStr = String(query).trim();
+      if (queryStr.length < 2 && !city && !categories) {
+        return;
+      }
+
       // Determine protocol from request
       let protocol = "api";
       if (req.path.startsWith("/a2a")) protocol = "a2a";
@@ -391,10 +401,13 @@ export class AnalyticsService {
       `).get(cutoff) as any;
       const ownerQueries = ownerQResult.count;
 
-      // Top search terms (excluding owner)
+      // Top search terms (excluding owner, excluding single-char autocomplete noise)
       const topQueriesResult = db.prepare(`
         SELECT query, COUNT(*) as count FROM analytics_queries
-        WHERE created_at > ? AND query IS NOT NULL AND query != '' AND (is_owner IS NULL OR is_owner = 0)
+        WHERE created_at > ?
+          AND query IS NOT NULL
+          AND LENGTH(TRIM(query)) >= 2
+          AND (is_owner IS NULL OR is_owner = 0)
         GROUP BY query
         ORDER BY count DESC
         LIMIT 10
