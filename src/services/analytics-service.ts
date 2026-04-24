@@ -91,17 +91,46 @@ function parseUserAgent(ua: string): UAParseResult {
 }
 
 // ─── Helper: Infer referrer source ──────────────────────────────
-function inferReferrerSource(referrer: string | undefined): "direct" | "organic" | "search" | "social" | "referral" {
+// Accepts both referrer (HTTP Referer header) AND user-agent. Crawlers almost
+// never send a Referer, so without UA-based classification GoogleBot/BingBot/
+// DuckDuckBot hits all landed in "direct" and buried our "search" bucket at
+// implausibly-low counts (1/day). Visibility report 2026-04-24 §1 flagged this.
+function inferReferrerSource(
+  referrer: string | undefined,
+  userAgent?: string
+): "direct" | "organic" | "search" | "social" | "referral" {
+  // UA-based classification runs first — crawlers typically have no referrer
+  // at all. We only add to "search" for search-engine crawlers that will
+  // produce human-visible search results (Google, Bing, DuckDuckGo, Yandex,
+  // Baidu, Apple). AI-assistant bots (ChatGPT, Claude, Perplexity) are tracked
+  // separately in the agent-traffic bucket and should stay out of "search"
+  // to keep the meaning of that column honest.
+  if (userAgent) {
+    const ua = userAgent.toLowerCase();
+    if (
+      ua.includes("googlebot") ||
+      ua.includes("bingbot") ||
+      ua.includes("duckduckbot") ||
+      ua.includes("yandexbot") ||
+      ua.includes("baiduspider") ||
+      ua.includes("applebot") ||
+      ua.includes("slurp") // Yahoo
+    ) {
+      return "search";
+    }
+  }
+
   if (!referrer) return "direct";
 
   const ref = referrer.toLowerCase();
 
-  // Search engines
+  // Search engines (human click-through from SERP)
   if (ref.includes("google") || ref.includes("bing") || ref.includes("duckduckgo")) return "search";
 
   // Social platforms
   if (ref.includes("facebook") || ref.includes("twitter") || ref.includes("instagram") ||
-      ref.includes("linkedin") || ref.includes("reddit") || ref.includes("tiktok")) {
+      ref.includes("linkedin") || ref.includes("reddit") || ref.includes("tiktok") ||
+      ref.includes("bsky.app") || ref.includes("bluesky")) {
     return "social";
   }
 
@@ -218,7 +247,7 @@ export class AnalyticsService {
       const userAgent = req.get("user-agent") || "";
       const clientIp = req.ip || "unknown";
 
-      const source = inferReferrerSource(referrer);
+      const source = inferReferrerSource(referrer, userAgent);
       const userAgentHash = hashUserAgent(userAgent);
       const ipHash = hashIP(clientIp);
       const sessionId = sessionManager.getOrCreate(ipHash, userAgent);
@@ -721,7 +750,7 @@ export class AnalyticsService {
   }): void {
     try {
       const db = getDb();
-      const source = inferReferrerSource(data.referrer);
+      const source = inferReferrerSource(data.referrer, data.userAgent);
       const userAgentHash = hashUserAgent(data.userAgent);
 
       db.prepare(`
