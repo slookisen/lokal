@@ -211,9 +211,15 @@ function shell(title: string, description: string, content: string, extra?: { ca
   <meta property="og:type" content="website">
   <meta property="og:locale" content="nb_NO">
   <meta property="og:site_name" content="Rett fra Bonden">
-  <meta name="twitter:card" content="summary">
+  <meta property="og:image" content="${BASE_URL}/logo-512.png">
+  <meta property="og:image:width" content="512">
+  <meta property="og:image:height" content="512">
+  <meta property="og:image:alt" content="Rett fra Bonden — lokal mat rett fra bonden i Norge">
+  <meta name="twitter:card" content="summary_large_image">
   <meta name="twitter:title" content="${escapeHtml(title)}">
   <meta name="twitter:description" content="${escapeHtml(description)}">
+  <meta name="twitter:image" content="${BASE_URL}/logo-512.png">
+  <meta name="twitter:image:alt" content="Rett fra Bonden — lokal mat rett fra bonden i Norge">
   <meta name="robots" content="index, follow, max-snippet:-1, max-image-preview:large">
   <link rel="alternate" hreflang="nb" href="${canonicalUrl}">
   <link rel="alternate" hreflang="en" href="${canonicalUrl}">
