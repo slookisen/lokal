@@ -548,6 +548,71 @@ paths:
           schema: { type: string }
 ```
 
+### 3.5 Tool Descriptions That Prevent AI Hallucination
+
+MCP-connected AI assistants (ChatGPT in particular) decide **whether to call your tool** based solely on the tool's description string. A vague description — *"Search for producers"* — lets the model guess from its training data instead of calling you. For a marketplace whose value proposition is **accurate, live prices**, that's catastrophic.
+
+Two rules we converged on after watching ChatGPT hallucinate prices:
+
+1. **Be explicit about when to call.** Enumerate the question shapes the tool answers, and include the phrase *"ALWAYS call ... for ..."*. Models treat ALL-CAPS imperative as a hard rule.
+2. **Advertise the payload shape.** If your tool returns products with prices, say so in the description — ChatGPT needs to know it can answer price questions from tool output rather than from prior knowledge.
+
+```typescript
+server.registerTool({
+  name: "lokal_search",
+  title: "Search Producers & Products",
+  description:
+    "Search for local Norwegian food producers AND their products with prices. " +
+    "ALWAYS call this tool when the user asks about products, prices, or " +
+    "availability — do not answer from prior knowledge. " +
+    "Returns producer profiles including products[] with parsed prices and " +
+    "profileUrl. Supports producer-name queries (e.g. 'Bjørndal Gård Oppdal').",
+  // ...
+}, handler);
+```
+
+**Also return the full product list for narrow queries.** When a search resolves to 1–3 agents (e.g. the user named a specific producer), return the full product catalogue with prices instead of the standard 5-item summary. Commit `4306b5a`. Without this, ChatGPT sees three products, assumes those are all the producer sells, and tells the user the item they asked about "doesn't seem to be in the menu".
+
+### 3.6 Name-Based Search (and the Norwegian Unicode Trap)
+
+ChatGPT's JIT plugin sends queries in lowercase (`"hva koster beefburger hos bjørndal gård oppdal"`), so the discovery layer must:
+
+1. **Extract the producer name.** `parseNaturalQuery()` strips common query words (`hva`, `har`, `hos`, `fra`, `koster`, …) and keeps the remainder as a candidate name. No reliance on capital-letter detection.
+2. **Match case-insensitively across Unicode.** SQLite's built-in `LOWER()` **only handles ASCII** — `LOWER('Ø')` returns `'Ø'`, not `'ø'`. A `WHERE LOWER(name) LIKE '%bjørndal%'` on Norwegian data silently finds zero rows. Fix: fetch the candidate set (or the full active registry at this scale) and compare using JavaScript's `String.prototype.toLowerCase()`, which is Unicode-aware.
+
+```typescript
+// marketplace-registry.ts
+const needle = nameQuery.toLowerCase();
+const hits = rows.filter(r => r.name.toLowerCase().includes(needle));
+```
+
+Commit: `f39014a`.
+
+**Don't auto-expand the radius when name-search hits.** The geo auto-expand logic (kicks in when results < `MIN_RESULTS=3`) was overwriting 1 exact name match with 3 unrelated Bergen producers. Skip expansion when the caller supplied a `_nameQuery`. Commit: `48fa649`.
+
+### 3.7 Product Prices in the Data Model
+
+Prices were embedded inside product *names* like `"Lammelår – kr 275/kg"` because bulk-paste imports (producers copying from ChatGPT) land that way. Parsing them only at display time meant every channel (MCP, A2A, auto-response) re-ran a parser with slightly different rules — and the database still stored the raw string, so downstream consumers saw ugly strings.
+
+Two-step fix (commits `dc977a5`, `4709c38`):
+
+1. **Normalize at save time** (`knowledge-service.ts#normalizeProducts`). `upsertKnowledge()` splits `"Lammelår – kr 275/kg"` into `{ name: "Lammelår", price: "kr 275/kg" }` before `INSERT`/`UPDATE`. Runs on every write path — bulk import, REST, enrichment — so no source can bypass it.
+2. **Shared `parseProductPrice()` utility.** Returns `{ cleanName, price, section }`. MCP `lokal_info`, A2A `agent/info`, and the auto-response formatter all call the same utility, so price display is identical across channels.
+
+```typescript
+// ProductInfo interface gains two fields
+export interface ProductInfo {
+  name: string;
+  description?: string;
+  price?: string;       // e.g. "kr 275/kg"
+  priceUnit?: string;   // e.g. "/kg"
+  // ...
+}
+```
+
+Lesson: **if the same field shows up in three output channels, normalize at the storage boundary, not at each render site.**
+
+
 ---
 
 <a id="phase-4"></a>
@@ -727,6 +792,31 @@ const contextParagraph = `
 ```
 
 **Result (commit `a56d0c2`):** /oslo, /bergen, /trondheim now each carry a unique city-grounded paragraph Google can use to disambiguate them. Cheapest SEO win available without editorial effort.
+
+### 5.6 Social Preview Cards (`og:image` + `twitter:card` large image)
+
+If you share your domain in Slack, X/Twitter, LinkedIn, or iMessage and it renders as a bare blue link with no preview, you're losing half the click-through rate you'd otherwise get. Two meta tags fix it.
+
+```html
+<!-- Open Graph -->
+<meta property="og:image" content="https://YOUR_DOMAIN/logo-512.png" />
+<meta property="og:image:width" content="512" />
+<meta property="og:image:height" content="512" />
+<meta property="og:image:alt" content="YOUR_PLATFORM logo" />
+
+<!-- Twitter -->
+<meta name="twitter:card" content="summary_large_image" />
+<meta name="twitter:image" content="https://YOUR_DOMAIN/logo-512.png" />
+<meta name="twitter:image:alt" content="YOUR_PLATFORM logo" />
+```
+
+Set them once in the shared SEO shell (`src/routes/seo.ts`) so every route inherits them. Commit: `fa02a73`.
+
+Two nuances we tripped on:
+- **Per-route override.** If a route (e.g. a producer profile) has its own richer image, override `og:image` in that route's template only — don't leave the base shell's default in place, or LinkedIn will cache the logo and never upgrade.
+- **Absolute URLs required.** Social crawlers don't follow relative paths. Always construct with `${BASE_URL}/logo-512.png`, never `/logo-512.png`.
+- **`summary_large_image` needs ≥300 × 157 px.** A 512 × 512 logo technically meets the minimum; for a true edge-to-edge card, produce a 1200 × 628 variant and swap it in. Deferred — logo is good enough for v1.
+
 
 ---
 
@@ -924,6 +1014,65 @@ FROM (
 - Single-view sessions are excluded from the numerator. Including them as `0` would drag the average toward zero with no actual signal about engagement.
 - Bot sessions are excluded. We want *human* dwell time, and bots often fetch in bursts that compress span to milliseconds.
 
+### 7.7 Search-Engine Crawlers Don't Send a Referer — Classify by UA
+
+`trafficBySource.search` was stuck at ~1/day even though Google Search Console showed healthy indexing activity. Root cause: `inferReferrerSource()` was keyed off the `Referer` header, but GoogleBot / BingBot / DuckDuckBot almost never send a `Referer` — so every crawler hit landed in `direct`.
+
+Fix: let the classifier see the user-agent too, and tag recognised search crawlers as `search` even when `Referer` is empty.
+
+```typescript
+export function inferReferrerSource(
+  referrer: string | null,
+  userAgent?: string,
+): TrafficSource {
+  // UA fallback first — crawlers rarely forward Referer.
+  if (userAgent) {
+    if (/GoogleBot|BingBot|DuckDuckBot|YandexBot|Baidu|Applebot|Yahoo!\s?Slurp/i
+          .test(userAgent)) {
+      return "search";
+    }
+    // Deliberately NOT folded in — AI-assistant bots stay in their own bucket:
+    // GPTBot / ClaudeBot / PerplexityBot → counted under agentTraffic.
+  }
+  return classifyByReferrer(referrer);
+}
+```
+
+Commit: `6c25383`. Also added `bsky.app` / `bluesky` to the social-referrer pattern since the marketing agent is now drafting Bluesky posts.
+
+### 7.8 Filter Single-Character Search Queries
+
+Search boxes that fire a request per keystroke pollute `topSearchTerms` with one-letter "queries" — in one 24-hour window, the letters `a`, `o`, `i`, `g` racked up 105 combined hits, burying real queries like `Bjørndal gård Oppdal` down at rank 8+.
+
+Filter at both ingest and readout so already-stored rows clean up on the next dashboard load:
+
+```typescript
+// Ingest — analytics-service.ts#trackSearchQuery
+if ((!query || query.trim().length < 2) && !hasStructuredFilters) return;
+
+// Readout — getSummary() SQL
+SELECT query, COUNT(*) AS hits
+FROM analytics_queries
+WHERE LENGTH(TRIM(query)) >= 2
+  AND created_at > datetime('now', '-24 hours')
+GROUP BY query ORDER BY hits DESC LIMIT 20;
+```
+
+Commit: `79bef09`. A structured filter (city, categories) with empty query text is still counted — those are zero-text filter queries, not noise.
+
+### 7.9 Clamp Over-Max `limit` Values Instead of 400'ing
+
+Callers hitting `/api/marketplace/search?limit=500` were getting noisy `ZodError` 400s in the production error stream. The cap is real — serving 500 agents in one response would blow the payload budget — but the *error* was polluting logs with no user benefit. Replace `z.number().max(100)` with `z.number().max(100).catch(100)`, and apply the same treatment to negative offsets.
+
+```typescript
+// src/models/marketplace.ts
+limit:  z.number().int().min(1).max(100).catch(100).default(20),
+offset: z.number().int().min(0).catch(0).default(0),
+```
+
+Commit: `11e8502`. Clamp silently, log nothing, preserve the cap.
+
+
 ---
 
 <a id="phase-8"></a>
@@ -959,6 +1108,51 @@ app.use("/auth", rateLimit({ windowMs: 15 * 60 * 1000, max: 5 }));
 // Admin: 100 req/hour (raised for enrichment runs)
 app.use("/admin", rateLimit({ windowMs: 60 * 60 * 1000, max: 100 }));
 ```
+
+
+### 8.3 PII Redaction for Publicly-Rendered User Input
+
+A production scan found `skf@hjortegarden.no` (an identifiable farmer's email) sitting in raw search-query logs on `/samtaler`. Those logs were about to be quoted in a draft blog post — the kind of silent GDPR leak that only surfaces when someone notices.
+
+**Scope decision:** redact at **render time**, not at storage time. Admin tooling still needs to read raw data to investigate abuse, and spread-of-redactor-to-every-code-path is a maintenance hazard. Apply the filter on the four surfaces that actually render user content publicly:
+
+- `GET /samtaler`, `GET /samtale/:id` — conversation pages
+- `GET /api/live` (SSE) — live activity stream
+- `GET /api/interactions` — search query feed
+- `GET /api/conversations`, `GET /api/conversations/:id` — conversation JSON API
+
+**What to redact:**
+- **E-mail addresses** — always
+- **Norwegian fødselsnummer** — 11 digits **validated with mod-11 checksum** so random 11-digit sequences (order numbers, timestamps) don't false-positive
+- **Norwegian phones** — with `+47` prefix, or standalone 8-digit whose first digit is 2–9 (the actual phone-number range). 8-digit sequences starting 0/1 pass through
+
+**What to NOT redact:**
+- Organisation numbers (9 digits — public in Brønnøysundregistrene)
+- Postal codes (4 digits), ISO dates, prices, coordinates, URLs
+- Producer-entered content (seller-role messages) — controlled input
+- Product/category/city/producer names
+
+**Failure mode:** prefer false negatives (miss a rare PII token) over false positives (redacting `"oslo"` would be worse than missing a phone number).
+
+```typescript
+// src/utils/pii-redact.ts — excerpt
+const EMAIL_RE = /\b[A-Za-z0-9._%+-]+@[A-Za-z0-9][A-Za-z0-9.-]*\.[A-Za-z]{2,}\b/g;
+const NO_PERSONAL_ID_RE = /\b(\d{6})[ -]?(\d{5})\b/g;
+const NO_PHONE_CC_RE = /\+?\s?47[\s-]?\d{2}[\s-]?\d{2}[\s-]?\d{2}[\s-]?\d{2}\b/g;
+const NO_PHONE_PLAIN_RE = /(?<![\d\w])[2-9]\d(?:\s?\d{2}){3}(?![\d\w])/g;
+
+export function redactPii(text: string): string {
+  return text
+    .replace(EMAIL_RE, "[redacted-email]")
+    .replace(NO_PERSONAL_ID_RE, (m, a, b) =>
+      isValidFodselsnummer(a + b) ? "[redacted-id]" : m)
+    .replace(NO_PHONE_CC_RE, "[redacted-phone]")
+    .replace(NO_PHONE_PLAIN_RE, "[redacted-phone]");
+}
+```
+
+**Test with the opposite case too.** 33 test cases in `tests/test.ts` cover (a) known PII → redacted and (b) known false-positive candidates (ISO dates, postal codes, org numbers, SKUs, coordinates, URLs) → pass through unchanged. Add `"test": "tsx tests/test.ts"` to `package.json`. Commits: `2d97da4`, `4135e30`.
+
 
 ---
 
@@ -1242,6 +1436,39 @@ Track these numbers between runs. They are the enrichment pipeline's primary KPI
 
 - Fly.io rate limit in the live `security` middleware: **300 requests / 15-minute window.** A full-registry pass over ~1,165 agents at 3 requests per agent (GET /marketplace/agents/:id + GET /agents/:id/knowledge + PUT) requires ≥8 rate-limit windows, i.e. ~2 hours wall-clock.
 - Target 50 agents per enrichment run when running as a scheduled agent; a full registry pass is a weekend job, not a weekday one.
+
+### 11.7 Google Places Rating — Server-Side Admin Endpoint
+
+Enrichment agents running in sandboxes don't have the `GOOGLE_PLACES_API_KEY` — and you don't want to pass it around. Instead, expose two thin admin endpoints on the main server that use the server-side key, search Google Places by name + city, persist the rating, and recalculate the trust score:
+
+```
+POST /admin/google-rating/:id       — single agent
+POST /admin/google-rating-batch     — up to 50 agents
+```
+
+Both are gated by the admin key. Shape of the per-agent flow:
+
+```typescript
+// src/routes/marketplace.ts (sketched)
+const searchRes = await fetch(
+  `https://maps.googleapis.com/maps/api/place/findplacefromtext/json` +
+  `?input=${encodeURIComponent(agent.name + " " + agent.city)}` +
+  `&inputtype=textquery&fields=place_id,rating,user_ratings_total` +
+  `&key=${process.env.GOOGLE_PLACES_API_KEY}`
+);
+const place = (await searchRes.json()).candidates?.[0];
+if (place?.rating) {
+  db.prepare(
+    `UPDATE agents SET google_rating = ?, google_rating_count = ? WHERE id = ?`
+  ).run(place.rating, place.user_ratings_total, id);
+  trustScoreService.recalculate(id);
+}
+```
+
+**Why server-side:** (a) the API key stays in one place, (b) rate limiting and billing live with the main Fly app, (c) the enrichment agent can run without any Google credentials of its own. Commit: `fe74492`.
+
+**Coverage impact:** Google rating was stuck at 2.5% because sandbox-based scrapers kept tripping Google's bot protection. With the Places API proxy live, the enrichment agent can attempt ratings on every producer without scraping — targeting 50%+ coverage as the Tier 2 pipeline catches up.
+
 
 ---
 
@@ -1816,6 +2043,25 @@ Post-deploy:
 
 21. **`/samtaler` shell appended the brand twice** — The page template auto-appends " — Rett fra Bonden" to the `<title>`, and the route also included the brand in its explicit title string, so the rendered title read *"Samtaler — Rett fra Bonden — Rett fra Bonden"*. Only the shell should brand the page; route titles should be the page-specific part only. Commit: `c9074db`.
 
+
+22. **SQLite `LOWER()` is ASCII-only — Norwegian `ø`/`å`/`æ` fall through** — A `WHERE LOWER(name) LIKE '%bjørndal%'` match against Norwegian producer names silently returns zero rows. SQLite's built-in `LOWER()` only lowercases A–Z; everything else passes through unchanged. Fix: fetch into memory and compare via JavaScript `String.prototype.toLowerCase()` (Unicode-aware), **or** use the `sqlite3` `ICU` extension if you need the work done in SQL. At ~1,100 rows the in-memory filter is fast enough. Commit: `f39014a`.
+
+23. **Prices embedded in product names require normalization at save time** — Producers bulk-paste from ChatGPT in the form `"Lammelår – kr 275/kg"`, which landed verbatim in the `products[].name` column. Parsing prices only at render time spread the logic across three channels (MCP / A2A / auto-response) and let the raw string leak to every downstream consumer of the REST API. Fix: run a single `normalizeProducts()` pass inside `upsertKnowledge()` so every write path — bulk import, REST, enrichment — produces the same clean `{ name, price, priceUnit }` shape. Commits: `dc977a5`, `4709c38`.
+
+24. **Geo auto-expand overwrote exact name matches** — The "if results < 3, widen the radius" logic was overriding 1 exact-name hit with 3 unrelated city-based results, producing the infamous "ChatGPT found Bergen producers when I searched for Bjørndal Gård Oppdal" bug. Skip expansion when the caller supplied a `_nameQuery`. Rule: **never widen a targeted query**. Commit: `48fa649`.
+
+25. **`_nameQuery` was being stripped by Zod at the REST boundary** — The REST `/api/marketplace/search` endpoint (used by ChatGPT's JIT plugin) called `DiscoveryQuerySchema.parse()`, which dropped extra keys like `_nameQuery` and `_productTerms` — so name-based search never triggered from REST even though the MCP path worked fine. Fix: explicitly preserve the `_` internal-prefix fields across Zod parsing. Commit: `2d3c6d5`. Lesson: if internal-use fields share a namespace with user-facing fields, either prefix them and passthrough-allow them, or move them to a separate envelope object.
+
+26. **Search-engine crawlers rarely forward `Referer`** — `trafficBySource.search` was stuck at ~1/day even while Google Search Console showed healthy indexing, because GoogleBot / BingBot / DuckDuckBot send requests with no referrer and every hit landed in `direct`. Widen the classifier to fall back to UA when `Referer` is empty. Keep AI crawlers (GPTBot / ClaudeBot / PerplexityBot) in their own `agentTraffic` bucket — don't fold them in. Commit: `6c25383`. See Phase 7.7.
+
+27. **Keystroke-per-char search boxes pollute `topSearchTerms`** — One-letter queries `a`, `o`, `i`, `g` racked up 105 hits in a 24h window, outranking real queries. Filter `LENGTH(TRIM(query)) >= 2` at both ingest and readout so already-stored rows clean up on the next dashboard load. Leave structured-filter-only queries (empty text + city/categories) alone. Commit: `79bef09`. See Phase 7.8.
+
+28. **ZodError 400s for over-max `limit` values flood prod logs** — Callers sending `limit=500` got `400 ZodError` responses, but the error stream was noise, not a customer problem we wanted to surface. Use `z.number().max(100).catch(100)` to silently clamp. Same treatment for negative offsets. Cap remains real; error noise is gone. Commit: `11e8502`.
+
+29. **MCP tool descriptions determine whether the model calls you at all** — ChatGPT will happily hallucinate prices from training data if the tool description doesn't explicitly tell it *when* to call. Use imperative ALL-CAPS (*"ALWAYS call ... for product/price questions"*) and describe the payload shape (*"returns products[] with parsed prices"*) so the model knows it can answer price questions from tool output. Also return the **full** product list for 1–3-hit searches so ChatGPT sees the catalogue, not a 5-item summary. Commits: `218d44f`, `4306b5a`. See Phase 3.5.
+
+30. **PII leaks through render paths long after you add a filter elsewhere** — We had a render-time filter on `/samtaler` HTML but `/api/interactions` and `/api/conversations` still returned raw query text. A scan surfaced `skf@hjortegarden.no` sitting unredacted in the JSON API a week later. Rule: **every publicly-exposed surface that renders user input needs the filter — not only the HTML renderers.** Enumerate the surfaces explicitly in a test. Commits: `2d97da4`, `4135e30`. See Phase 8.3.
+
 ### C.2 Architecture Decisions
 
 1. **SQLite over PostgreSQL** — Zero ops, single file, perfect for solo developer. Good up to ~10K agents.
@@ -1995,8 +2241,9 @@ to build the same platform for a different vertical.
 | 2026-04-21 | 6, 17, C | Admin notification email on claim verify (6.4). `/samtaler` upgrade: source filter tabs, per-source stats, web-search tracking, MCP client identity detection (17.3). `GET /a2a` returns agent card for registry health checks (17.4). Appendix C: gotcha C.18 (Tier 2 columns written but not read — `getKnowledge()` SELECT fix), C.20 (protocol endpoints must handle both verbs). |
 | 2026-04-22 | 5, 7, 12 | Per-city context paragraph grounded in live registry data (5.5). `avgTimeOnSite` computed from session spans instead of hardcoded 0 (7.6). `/.well-known/ai-plugin.json` + `/api` JSON index (+35 pts on NotHumanSearch agentic-readiness) (12.6). NotHumanSearch + DuckDuckBot classified in analytics and welcomed in robots.txt. Stale "1400+" count purged from `/teknologi` and server-card fallback. |
 | 2026-04-23 | 12, C | `/.well-known/mcp-server.json` hyphenated alias added to discovery endpoints (12.1). Remaining "1,400+" literal purged from AI-facing metadata (agent-readiness copy, agent-discovery middleware, llms.txt home/about). README and MCP registry description reduced to safe under-claim ("1,100+"). `/samtaler` double-brand `<title>` fix. Appendix C: gotchas C.19 (hardcoded counts drift across self-describing files), C.21 (double-brand title). |
+| 2026-04-24 | 3, 5, 7, 8, 11, C | MCP tool descriptions + name-based search with Norwegian Unicode fix (3.5, 3.6). Price normalization at save time across MCP/A2A/auto-response (3.7). `og:image` + `twitter:card summary_large_image` in base SEO shell (5.6). Search-engine crawler UA classifier (7.7). Single-char query filter (7.8). Over-max `limit` clamped via `z.catch(100)` instead of 400 (7.9). Render-time PII filter for conversation pages + `/api/interactions` + `/api/conversations` (8.3). Server-side Google Places rating admin endpoints (11.7). Appendix C: C.22 (SQLite `LOWER()` ASCII-only), C.23 (prices in names → normalize at save), C.24 (auto-expand overwrites exact matches), C.25 (`_nameQuery` stripped by Zod), C.26 (crawlers skip `Referer`), C.27 (keystroke pollution), C.28 (ZodError 400 noise), C.29 (tool descriptions shape LLM behaviour), C.30 (PII filter must cover every render surface). |
 
 ---
 
-*Last updated: 2026-04-23 (14:00 CEST) by rfb-guidebook agent*
-*Guide version: 1.1.0*
+*Last updated: 2026-04-24 (14:00 CEST) by rfb-guidebook agent*
+*Guide version: 1.2.0*
