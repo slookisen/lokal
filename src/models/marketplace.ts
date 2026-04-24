@@ -159,8 +159,11 @@ export const DiscoveryQuerySchema = z.object({
   maxDistanceKm: z.number().optional(),
 
   // Pagination
-  limit: z.number().min(1).max(100).default(20),
-  offset: z.number().min(0).default(0),
+  // Note: `.catch(100)` silently coerces out-of-range limits (e.g. 500, 1000)
+  // down to 100 instead of 400ing. Callers that send too-big limits get the
+  // max page size instead of an error — matches the intent of pagination.
+  limit: z.number().min(1).max(100).catch(100).default(20),
+  offset: z.number().min(0).catch(0).default(0),
 });
 
 export type DiscoveryQuery = z.infer<typeof DiscoveryQuerySchema>;
