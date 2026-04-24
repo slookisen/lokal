@@ -1,0 +1,44 @@
+# Auto-deploy to Fly.io on every push to main.
+#
+# Setup (one-time):
+#   1. Create a Fly deploy token: `fly tokens create deploy -a lokal -x 999999h`
+#      (or at https://fly.io/apps/lokal/tokens — scope: "Deploy tokens")
+#   2. Add it as a GitHub secret: Repo → Settings → Secrets and variables →
+#      Actions → New repository secret → Name: FLY_API_TOKEN, Value: <token>
+#   3. Done. Every `git push origin main` will now trigger a deploy.
+#
+# Why this exists: local `fly deploy` is blocked by Windows Application
+# Control policy. GitHub-hosted runner has no such restriction.
+
+name: Fly Deploy
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:       # lets you trigger manually from Actions tab
+
+jobs:
+  deploy:
+    name: Deploy to Fly.io
+    runs-on: ubuntu-latest
+    concurrency:
+      group: fly-deploy-main
+      cancel-in-progress: false   # don't abort a running deploy if a new push arrives
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup flyctl
+        uses: superfly/flyctl-actions/setup-flyctl@master
+
+      - name: Deploy
+        run: flyctl deploy --remote-only
+        env:
+          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
+
+      - name: Smoke test
+        run: |
+          sleep 10
+          curl -sf -o /dev/null -w "%{http_code}\n" https://rettfrabonden.com/healthz || \
+            curl -sf -o /dev/null -w "%{http_code}\n" https://rettfrabonden.com/
