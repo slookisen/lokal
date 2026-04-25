@@ -371,6 +371,31 @@ function initSchema(db: Database.Database): void {
     CREATE INDEX IF NOT EXISTS idx_magic_links_token ON magic_links(token);
     CREATE INDEX IF NOT EXISTS idx_magic_links_email ON magic_links(email);
 
+    -- ─── agent_blocklist ─────────────────────────────────────
+    -- "Do not re-add" list. When a producer asks to be removed
+    -- (replies "fjern" to outreach, sends GDPR request, etc.) we
+    -- delete their agent row AND record their identifying signals
+    -- here, so the daily discovery agent doesn't just re-find them
+    -- on lokalmat.no/Facebook the next morning and re-insert them.
+    --
+    -- identifier_type: 'website_domain' | 'email_domain' |
+    --                  'name_normalized' | 'agent_id'
+    -- A single blocklist request typically inserts 2-3 rows
+    -- (domain + normalized name) so we catch them whether the next
+    -- discovery cycle finds them by name OR by website.
+    CREATE TABLE IF NOT EXISTS agent_blocklist (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      identifier_type TEXT NOT NULL,
+      identifier_value TEXT NOT NULL,
+      reason TEXT,
+      source_email TEXT,
+      original_agent_id TEXT,
+      original_agent_name TEXT,
+      created_at TEXT DEFAULT (datetime('now')),
+      UNIQUE(identifier_type, identifier_value)
+    );
+    CREATE INDEX IF NOT EXISTS idx_agent_blocklist_type_value ON agent_blocklist(identifier_type, identifier_value);
+
     -- Analytics indexes (for fast aggregation)
     CREATE INDEX IF NOT EXISTS idx_analytics_page_views_created ON analytics_page_views(created_at);
     CREATE INDEX IF NOT EXISTS idx_analytics_page_views_source ON analytics_page_views(source);

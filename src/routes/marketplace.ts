@@ -9,6 +9,7 @@ import { emailService } from "../services/email-service";
 import { trustScoreService } from "../services/trust-score-service";
 import { conversationService } from "../services/conversation-service";
 import { slugify } from "../utils/slug";
+import { isBlocked, add as blocklistAdd, list as blocklistList, remove as blocklistRemove } from "../services/blocklist-service";
 
 // ─── Marketplace Routes ───────────────────────────────────────
 // These are the OPEN endpoints that make Lokal a marketplace.
@@ -43,6 +44,23 @@ function ensureAgentInDb(agentId: string): boolean {
   const agents = marketplaceRegistry.getActiveAgents();
   const agent = agents.find((a: any) => a.id === agentId);
   if (!agent) return false;
+
+  // ─── Blocklist gate ────────────────────────────────────────
+  // Producers who replied "fjern" to outreach (or sent a GDPR
+  // request) are kept in agent_blocklist. Re-discovery from the
+  // daily pipeline must not silently re-insert them. We check
+  // by name + website + email so partial-info discovery cycles
+  // (e.g. only a name and a Facebook page) still hit the block.
+  const blockCheck = isBlocked({
+    agentId: agent.id,
+    name: agent.name,
+    website: agent.url,
+    email: agent.contactEmail,
+  });
+  if (blockCheck.blocked) {
+    console.log(`[blocklist] refused ensureAgentInDb for ${agent.name} (matched ${blockCheck.matchedBy}=${blockCheck.matchedValue})`);
+    return false;
+  }
 
   try {
     db.prepare(`
@@ -196,6 +214,19 @@ function safeFileName(name: string): string {
 router.post("/register", (req: Request, res: Response) => {
   try {
     const registration = AgentRegistrationSchema.parse(req.body);
+
+    // Blocklist gate — quietly reject without leaking why.
+    const blocked = isBlocked({
+      name: registration.name,
+      website: (registration as any).url,
+      email: (registration as any).contactEmail,
+    });
+    if (blocked.blocked) {
+      console.log(`[blocklist] refused /register for ${registration.name} (matched ${blocked.matchedBy})`);
+      res.status(403).json({ success: false, error: "Registrering ikke tillatt" });
+      return;
+    }
+
     const agent = marketplaceRegistry.register(registration);
 
     interactionLogger.log("register", {
@@ -1113,6 +1144,19 @@ router.post("/admin/register", (req: Request, res: Response) => {
 
   try {
     const registration = AdminRegistrationSchema.parse(req.body);
+
+    // Blocklist gate — discovery agent should never re-insert a producer who opted out.
+    const blocked = isBlocked({
+      name: registration.name,
+      website: (registration as any).url,
+      email: (registration as any).contactEmail,
+    });
+    if (blocked.blocked) {
+      console.log(`[blocklist] refused /admin/register for ${registration.name} (matched ${blocked.matchedBy})`);
+      res.status(409).json({ success: false, error: "Produsent på blokklisten", matchedBy: blocked.matchedBy });
+      return;
+    }
+
     // Cast needed: AdminRegistration has optional contactEmail and flexible capabilities,
     // but after Zod parsing all defaults are filled. The DB insert handles both shapes.
     const agent = marketplaceRegistry.register(registration as any);
@@ -1413,11 +1457,37 @@ router.delete("/agents/:id", (req: Request, res: Response) => {
     });
     deleteAll();
 
+    // ─── Optional blocklist auto-add ──────────────────────────
+    // Pass body { addToBlocklist: true } (or query ?addToBlocklist=1)
+    // and the deleted agent's identifying signals are written to
+    // agent_blocklist so the daily discovery agent doesn't re-insert
+    // them. Caller can also pass { reason, sourceEmail } for audit.
+    let blocklistResult: { inserted: number; rows: any[] } | null = null;
+    const wantsBlock = req.body?.addToBlocklist === true || req.query?.addToBlocklist === "1" || req.query?.addToBlocklist === "true";
+    if (wantsBlock) {
+      try {
+        const fullAgent = db.prepare("SELECT id, name, contact_email, url FROM agents WHERE id = ?").get(agentId) as any;
+        // fullAgent is null here (we just deleted) — read from `agent` row pre-delete + try registry for richer data
+        const fromRegistry = marketplaceRegistry.getActiveAgents().find((a: any) => a.id === agentId) as any;
+        blocklistResult = blocklistAdd({
+          agentId,
+          name: agent.name,
+          website: fromRegistry?.url,
+          email: fromRegistry?.contactEmail,
+          reason: req.body?.reason || "admin-delete with addToBlocklist",
+          sourceEmail: req.body?.sourceEmail,
+          agentNameForAudit: agent.name,
+        });
+      } catch (blockErr) {
+        console.error("[delete] blocklist auto-add failed (non-critical):", blockErr);
+      }
+    }
+
     // Log (non-critical — wrapped so logging failure doesn't crash the response)
     try {
       interactionLogger.log("message", {
         agentId: agentId,
-        metadata: { name: agent.name, city: agent.city, reason: req.body?.reason || "cleanup", action: "admin-delete" },
+        metadata: { name: agent.name, city: agent.city, reason: req.body?.reason || "cleanup", action: "admin-delete", blocklistInserted: blocklistResult?.inserted ?? 0 },
         ipAddress: req.ip || "unknown",
       });
     } catch (logErr) {
@@ -1428,6 +1498,7 @@ router.delete("/agents/:id", (req: Request, res: Response) => {
       success: true,
       message: `Agent "${agent.name}" (${agent.city}) slettet`,
       id: agentId,
+      blocklist: blocklistResult,
     });
   } catch (err) {
     console.error("[delete] Agent delete failed:", err);
@@ -1964,5 +2035,89 @@ router.post("/webhooks/inbound-email", async (req: Request, res: Response) => {
 function getBaseUrl(req: Request): string {
   return process.env.BASE_URL || `${req.protocol}://${req.get("host")}`;
 }
+
+
+// ─── Admin blocklist endpoints ────────────────────────────────
+// "Do not re-add" list. The daily discovery agent and the public
+// /register endpoint both call isBlocked() before insert, so the
+// only way to make a producer permanently un-discoverable is via
+// these endpoints.
+//
+// All require X-Admin-Key.
+//
+//   GET  /api/marketplace/admin/blocklist?limit=100&offset=0
+//        → list rows (most-recent first)
+//   POST /api/marketplace/admin/blocklist
+//        body: { name?, website?, email?, agentId?, reason, sourceEmail? }
+//        → inserts up to 4 rows (one per non-empty identifier)
+//   DELETE /api/marketplace/admin/blocklist/:id
+//        → undoes a single row by primary key
+//
+// Typical use after a "fjern" reply:
+//   1) DELETE /api/marketplace/agents/<uuid>?addToBlocklist=1
+//      with body { reason: "opt-out via outreach reply", sourceEmail: "post@x.no" }
+//   2) (optional) POST /admin/blocklist for richer signals if you
+//      have data the registry didn't have.
+
+router.get("/admin/blocklist", (req: Request, res: Response) => {
+  const adminKey = req.headers["x-admin-key"] as string;
+  const expectedKey = getAdminKey();
+  if (!expectedKey) { res.status(503).json({ error: "Admin not configured" }); return; }
+  if (!adminKey || adminKey !== expectedKey) {
+    res.status(403).json({ error: "Krever X-Admin-Key header" });
+    return;
+  }
+  try {
+    const limit = parseInt(String(req.query.limit || "100"), 10) || 100;
+    const offset = parseInt(String(req.query.offset || "0"), 10) || 0;
+    const rows = blocklistList({ limit, offset });
+    res.json({ success: true, count: rows.length, rows });
+  } catch (err: any) {
+    res.status(500).json({ error: "List failed", detail: err.message });
+  }
+});
+
+router.post("/admin/blocklist", (req: Request, res: Response) => {
+  const adminKey = req.headers["x-admin-key"] as string;
+  const expectedKey = getAdminKey();
+  if (!expectedKey) { res.status(503).json({ error: "Admin not configured" }); return; }
+  if (!adminKey || adminKey !== expectedKey) {
+    res.status(403).json({ error: "Krever X-Admin-Key header" });
+    return;
+  }
+  try {
+    const { name, website, email, agentId, reason, sourceEmail } = req.body || {};
+    if (!reason || typeof reason !== "string") {
+      res.status(400).json({ error: "Body må inneholde 'reason' (string)" });
+      return;
+    }
+    if (!name && !website && !email && !agentId) {
+      res.status(400).json({ error: "Minst én av name/website/email/agentId må oppgis" });
+      return;
+    }
+    const result = blocklistAdd({ name, website, email, agentId, reason, sourceEmail });
+    res.status(201).json({ success: true, ...result });
+  } catch (err: any) {
+    res.status(500).json({ error: "Add failed", detail: err.message });
+  }
+});
+
+router.delete("/admin/blocklist/:id", (req: Request, res: Response) => {
+  const adminKey = req.headers["x-admin-key"] as string;
+  const expectedKey = getAdminKey();
+  if (!expectedKey) { res.status(503).json({ error: "Admin not configured" }); return; }
+  if (!adminKey || adminKey !== expectedKey) {
+    res.status(403).json({ error: "Krever X-Admin-Key header" });
+    return;
+  }
+  try {
+    const id = parseInt(req.params.id as string, 10);
+    if (!id) { res.status(400).json({ error: "Ugyldig id" }); return; }
+    const removed = blocklistRemove({ id });
+    res.json({ success: true, removed });
+  } catch (err: any) {
+    res.status(500).json({ error: "Remove failed", detail: err.message });
+  }
+});
 
 export default router;
