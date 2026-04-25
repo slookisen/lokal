@@ -1575,6 +1575,77 @@ const PROFILE_CSS = `
   }
 `;
 
+// ─── Producer slug fuzzy matcher ──────────────────────────────
+// Why: AI engines (Perplexity, ChatGPT, Claude) and link-shorteners often
+// invent /produsent/<slug> URLs by slugifying a producer name they've
+// seen elsewhere — but our canonical slugs include locality suffixes
+// (e.g. request "bondens-marked-grunerlokka" vs. real
+// "bondens-marked-birkelunden-grunerlokka"). A naive 404 there is dead
+// traffic. This helper picks a high-confidence redirect target when the
+// requested tokens are a unique subset of one canonical slug, and falls
+// back to Jaccard-similarity suggestions otherwise.
+function findProducerMatches(
+  requestSlug: string,
+  agents: any[]
+): { redirect?: any; suggestions: any[] } {
+  // Stop tokens: short Norwegian connectors that add noise to the
+  // similarity score without carrying meaning ("Frukt og Grønt" etc.).
+  const STOP = new Set(["og", "av", "i", "pa", "fra", "til", "for", "med", "the", "of"]);
+  const tokenize = (s: string) =>
+    new Set(
+      s.split("-").filter((t) => t.length > 1 && !STOP.has(t))
+    );
+
+  const reqTokens = tokenize(requestSlug);
+  if (reqTokens.size === 0) return { suggestions: [] };
+
+  const subsetMatches: any[] = [];
+  const scored: Array<{ agent: any; score: number }> = [];
+
+  for (const a of agents) {
+    const slug = slugify(a.name);
+    if (!slug) continue;
+    const tokens = tokenize(slug);
+    if (tokens.size === 0) continue;
+
+    // Subset rule: every requested token is present in the canonical slug
+    let allPresent = true;
+    for (const t of reqTokens) {
+      if (!tokens.has(t)) { allPresent = false; break; }
+    }
+    if (allPresent) subsetMatches.push(a);
+
+    // Jaccard fallback for partial overlap
+    let intersect = 0;
+    for (const t of reqTokens) if (tokens.has(t)) intersect++;
+    const union = reqTokens.size + tokens.size - intersect;
+    const jaccard = union > 0 ? intersect / union : 0;
+    if (jaccard >= 0.25) scored.push({ agent: a, score: jaccard });
+  }
+
+  // Single unambiguous subset match → high-confidence redirect target
+  if (subsetMatches.length === 1) {
+    return { redirect: subsetMatches[0], suggestions: [] };
+  }
+
+  // Multiple subset matches → all become suggestions, ranked by trust
+  if (subsetMatches.length > 1) {
+    return {
+      suggestions: subsetMatches
+        .sort((a, b) => (b.trustScore || 0) - (a.trustScore || 0))
+        .slice(0, 6),
+    };
+  }
+
+  // No subset match → top Jaccard-scored suggestions
+  scored.sort(
+    (a, b) =>
+      b.score - a.score ||
+      (b.agent.trustScore || 0) - (a.agent.trustScore || 0)
+  );
+  return { suggestions: scored.slice(0, 6).map((s) => s.agent) };
+}
+
 router.get("/produsent/:slug", (req: Request, res: Response) => {
   const slug = (req.params.slug as string).toLowerCase();
 
@@ -1583,12 +1654,54 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
     const agent = agents.find((a: any) => slugify(a.name) === slug);
 
     if (!agent) {
+      // Fuzzy fallback so AI-engine traffic that constructs slugs from
+      // names (e.g. Perplexity citing "bondens-marked-grunerlokka" when
+      // the canonical is "bondens-marked-birkelunden-grunerlokka") gets
+      // a useful page instead of a dead end.
+      const match = findProducerMatches(slug, agents);
+
+      if (match.redirect) {
+        const canonical = slugify(match.redirect.name);
+        if (canonical && canonical !== slug) {
+          // 301 tells crawlers to update their index — preserves SEO juice
+          // and teaches Perplexity/ChatGPT/Claude the canonical URL.
+          return res.redirect(301, `/produsent/${canonical}`);
+        }
+      }
+
+      const totalAgents = agents.length;
+      const suggestionsHtml = match.suggestions.length
+        ? `<div class="sec">
+            <h2 style="font-size:1.4rem;margin-bottom:8px;">Mente du noen av disse?</h2>
+            <p style="color:var(--g500);margin-bottom:24px;">Vi har ${totalAgents}+ produsenter. Disse ligner mest på det du søkte etter.</p>
+            <div class="grid">${match.suggestions.map((a: any) => producerCard(a)).join("")}</div>
+          </div>`
+        : "";
+
+      // HTTP 404 status (soft-200 hurts Google ranking) but rich body so
+      // AI agents and humans can still find what they were after.
       return res.status(404).send(shell(
-        "Produsent ikke funnet", "Denne produsenten finnes ikke.",
-        `<div class="sec" style="text-align:center;padding:80px 24px;">
-          <h1 style="font-size:1.8rem;margin-bottom:12px;">Produsent ikke funnet</h1>
-          <p style="color:var(--g500);"><a href="/">Tilbake til forsiden</a></p>
-        </div>`
+        "Produsent ikke funnet — Rett fra Bonden",
+        `Vi fant ingen produsent med URL «${slug}». Søk eller bla blant ${totalAgents}+ matprodusenter i hele Norge.`,
+        `<div class="sec" style="text-align:center;padding:64px 24px 32px;">
+          <h1 style="font-size:2rem;margin-bottom:12px;">Produsent ikke funnet</h1>
+          <p style="color:var(--g500);max-width:640px;margin:0 auto 28px;">URL-en <code style="background:var(--g100);padding:2px 8px;border-radius:4px;">/produsent/${escapeHtml(slug)}</code> matcher ingen produsent i nettverket vårt. Lenken kan være utdatert, eller produsentnavnet kan ha endret seg.</p>
+          <form action="/sok" method="get" style="max-width:520px;margin:0 auto 24px;display:flex;gap:8px;">
+            <input type="text" name="q" placeholder="Søk etter mat, sted eller produsent…" aria-label="Søk produsenter" style="flex:1;padding:14px 16px;border:1px solid var(--g300);border-radius:10px;font-size:1rem;">
+            <button type="submit" style="padding:14px 24px;background:var(--green);color:#fff;border:0;border-radius:10px;font-weight:600;cursor:pointer;">Søk</button>
+          </form>
+          <div style="display:flex;gap:12px;justify-content:center;flex-wrap:wrap;">
+            <a href="/oslo" class="city-pill">Oslo</a>
+            <a href="/bergen" class="city-pill">Bergen</a>
+            <a href="/trondheim" class="city-pill">Trondheim</a>
+            <a href="/stavanger" class="city-pill">Stavanger</a>
+            <a href="/sok" class="city-pill">Se alle ${totalAgents}+ produsenter →</a>
+          </div>
+        </div>
+        ${suggestionsHtml}`,
+        {
+          extraCss: `.city-pill{display:inline-block;padding:10px 18px;background:var(--g100);color:var(--g700);border-radius:999px;font-weight:500;text-decoration:none;transition:all .15s;}.city-pill:hover{background:var(--green);color:#fff;}`,
+        }
       ));
     }
 
