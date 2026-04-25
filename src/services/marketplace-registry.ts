@@ -248,13 +248,23 @@ class MarketplaceRegistry {
           } catch { /* skip malformed JSON */ }
         }
 
-        // Filter: keep only agents that have matching products OR agents without knowledge
-        // (we don't want to exclude agents that simply haven't been enriched yet)
+        // Filter: keep agents with matching products, OR agents that haven't been enriched,
+        // OR agents whose category matches the query (even if products aren't populated yet).
+        // This prevents over-filtering agents with incomplete product data.
         candidates = candidates.filter(a => {
           if (productMatchMap.has(a.id)) return true;
-          // Check if this agent has knowledge at all — if not, keep them (benefit of doubt)
+          // No knowledge at all → benefit of doubt
           const hasKnowledge = rows.some(r => r.agent_id === a.id);
-          return !hasKnowledge;
+          if (!hasKnowledge) return true;
+          // Has knowledge but no matching products — still keep if their category matches
+          // (a dairy farmer without enriched products should still show up for "ost")
+          if (query.categories?.length) {
+            const catMatch = query.categories.some(cat =>
+              a.categories.some(ac => ac.toLowerCase() === cat.toLowerCase())
+            );
+            if (catMatch) return true;
+          }
+          return false;
         });
       }
     }
@@ -389,9 +399,17 @@ class MarketplaceRegistry {
     // call Kartverket API) happens one level up in the async route handler.
 
     // ── Name-based search extraction ──
-    // If query contains a producer name indicator word (gård, farm, mat, etc.),
-    // extract the surrounding words as a name search term.
-    // Handles both "Bjørndal Gård Oppdal" and "bjørndal gård oppdal" (case-insensitive).
+    // Two-pass approach:
+    //   Pass 1: If query has indicator words (gård, bakeri, etc.), extract name from context
+    //   Pass 2: If no indicator, check if any query word matches an actual agent name in DB
+    // This handles both "Bjørndal Gård Oppdal" AND just "Rørosmat"
+
+    const skipWords = new Set(["hva", "har", "hos", "fra", "i", "på", "kan", "du", "jeg",
+      "det", "er", "en", "et", "og", "med", "til", "av", "som", "dem", "de", "vi",
+      "liste", "prisliste", "priser", "pris", "produkter", "varer", "varene", "koster",
+      "kost", "selger", "tilbyr", "finne", "finn", "søk", "kjøpe", "bestille",
+      "nær", "nærme", "nærmeste", "meg", "oss", "her", "der", "hvor"]);
+
     const nameIndicators = ["gård", "gard", "farm", "mat", "ysteri", "bakeri", "bryggeri",
       "marked", "butikk", "kooperativ", "meieri", "slakteri", "gardsmat", "gardsutsalg"];
     const queryWords = query.split(/\s+/);
@@ -401,26 +419,53 @@ class MarketplaceRegistry {
     );
 
     if (indicatorIndex >= 0) {
-      // Take the indicator word and adjacent words that look like name parts
-      // (not common query words like "hva", "har", "hos", "fra", "i", "på", "kan", etc.)
-      const skipWords = new Set(["hva", "har", "hos", "fra", "i", "på", "kan", "du", "jeg",
-        "det", "er", "en", "et", "og", "med", "til", "av", "som", "dem", "de", "vi",
-        "liste", "prisliste", "priser", "pris", "produkter", "varer", "varene", "koster",
-        "kost", "selger", "tilbyr", "finne", "finn", "søk", "kjøpe", "bestille"]);
-
+      // Pass 1: Indicator word found — extract name from surrounding words
       const nameParts: string[] = [];
       for (const word of queryWords) {
         const clean = word.replace(/[.,!?]/g, "");
         if (clean.length < 2) continue;
         if (skipWords.has(clean.toLowerCase())) continue;
-        // Include: name words, indicator words, city names (capitalized or not)
         nameParts.push(clean);
       }
+      if (nameParts.length >= 1 && nameParts.join(" ").length >= 4) {
+        (parsed as any)._nameQuery = nameParts.join(" ");
+      }
+    } else {
+      // Pass 2: No indicator word — check if query words match any agent name
+      // This catches "Rørosmat", "Bjørndal", "Erga" etc.
+      const nonSkipWords = queryWords
+        .map(w => w.replace(/[.,!?]/g, "").toLowerCase())
+        .filter(w => w.length >= 3 && !skipWords.has(w));
 
-      if (nameParts.length >= 1) {
-        const nameCandidate = nameParts.join(" ");
-        if (nameCandidate.length >= 4) {
-          (parsed as any)._nameQuery = nameCandidate;
+      // Don't name-search if all words are food/location terms (avoid false positives)
+      const allAreKnownTerms = nonSkipWords.every(w => {
+        for (const keywords of Object.values(categoryMap)) {
+          if ((keywords as string[]).includes(w)) return true;
+        }
+        for (const keywords of Object.values(tagMap)) {
+          if ((keywords as string[]).includes(w)) return true;
+        }
+        return false;
+      });
+
+      if (!allAreKnownTerms && nonSkipWords.length > 0) {
+        // Quick check: do any of these words appear in an agent name?
+        const db = getDb();
+        const allNames = (db.prepare("SELECT name FROM agents WHERE is_active = 1").all() as any[])
+          .map(r => (r.name || "").toLowerCase());
+
+        const nameMatches = nonSkipWords.filter(word =>
+          allNames.some(name => name.includes(word))
+        );
+
+        if (nameMatches.length > 0) {
+          // At least one word matches an agent name — use it as name query
+          const nameParts = queryWords
+            .map(w => w.replace(/[.,!?]/g, ""))
+            .filter(w => w.length >= 2 && !skipWords.has(w.toLowerCase()));
+          if (nameParts.join(" ").length >= 3) {
+            (parsed as any)._nameQuery = nameParts.join(" ");
+          }
         }
       }
     }
