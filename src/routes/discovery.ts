@@ -151,6 +151,12 @@ router.get("/llms-full.txt", (_req: Request, res: Response) => {
         if (cats.length) parts.push(`Kategorier: ${cats.join(", ")}`);
         if (k?.phone) parts.push(`Tlf: ${k.phone}`);
         if (k?.website) parts.push(`Web: ${k.website}`);
+        // Canonical profile URL — without this, AI engines reading llms-full.txt
+        // have no mapping from producer name → rettfrabonden page, so they cite
+        // the external website (Web:) instead of our profile. Adding the slug
+        // here is the difference between Perplexity citing hommegaard.no vs.
+        // rettfrabonden.com/produsent/homme-gard-ovrebo.
+        parts.push(`Profil: ${BASE_URL}/produsent/${slugify(a.name)}`);
         if (k?.about) parts.push(k.about.substring(0, 120));
         lines.push(parts.join(" | "));
       }
