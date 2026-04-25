@@ -1,4 +1,29 @@
+# Dependencies
 node_modules/
+
+# Build output (compiled from src/)
+dist/
+
+# SQLite databases — production data lives in Fly volume,
+# never in the repo. (Historical leak: data/lokal.db was tracked
+# until 2026-04-25; keys for 370 agents were rotated as a result.)
+data/*.db
+data/*.db-journal
+data/*.db-wal
+data/*.db-shm
+data/*.sqlite
+data/*.sqlite3
+
+# Environment / secrets
+.env
+.env.*
+!.env.example
+
+# Local credential files (used by sandbox; never commit)
+.fly-token
+.gh-pat
+*.pem
+*.key
 
 # Windows-reserved device names — never let these into the tree.
 # Caused 'error: invalid path nul' on Daniel's Windows pull 2026-04-25.
@@ -8,3 +33,16 @@ prn
 aux
 com[1-9]
 lpt[1-9]
+
+# Logs and temp files
+*.log
+*.tmp
+.DS_Store
+.idea/
+.vscode/
+
+# Fly.io local artifacts
+.fly/
+
+# OS
+Thumbs.db

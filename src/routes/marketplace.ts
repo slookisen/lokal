@@ -1431,6 +1431,105 @@ router.delete("/agents/:id", (req: Request, res: Response) => {
   }
 });
 
+// ─── POST /admin/rotate-keys — Rotate leaked API keys ──────────
+// Regenerates `api_key` for agents created on/before a cutoff date.
+// Built to clean up after data/lokal.db (March seed batch) was committed
+// to a public git repo. The 370 agents in that snapshot have keys exposed;
+// this endpoint mints new ones so the leaked values stop authenticating.
+//
+// Body:
+//   { cutoff: "YYYY-MM-DD", dryRun?: boolean }
+//   - cutoff:  ISO date. Rotates keys for agents with created_at <= cutoff
+//              23:59:59 UTC. Required.
+//   - dryRun:  default true. Returns counts only; no DB writes.
+//
+// Returns: { rotated, sample: [{id, name, oldKeyPrefix}], dryRun }
+// We never return the new keys — sellers who claim later get them via the
+// claim flow. (This batch has 0 claims, per agent_claims table.)
+
+router.post("/admin/rotate-keys", (req: Request, res: Response) => {
+  const adminKey = req.headers["x-admin-key"] as string;
+  const expectedKey = getAdminKey();
+  if (!expectedKey) { res.status(503).json({ error: "Admin not configured" }); return; }
+  if (!adminKey || adminKey !== expectedKey) {
+    res.status(403).json({ error: "Krever X-Admin-Key header" });
+    return;
+  }
+
+  const cutoff = req.body?.cutoff as string | undefined;
+  const dryRun = req.body?.dryRun !== false; // safe default
+  if (!cutoff || !/^\d{4}-\d{2}-\d{2}$/.test(cutoff)) {
+    res.status(400).json({ error: "Body må inneholde 'cutoff: YYYY-MM-DD'" });
+    return;
+  }
+  // Cover the entire cutoff day (UTC). created_at is ISO8601 UTC string.
+  const cutoffEnd = `${cutoff}T23:59:59.999Z`;
+
+  const db = getDb();
+  const targets = db.prepare(`
+    SELECT id, name, api_key, created_at
+    FROM agents
+    WHERE created_at <= ?
+    ORDER BY created_at ASC
+  `).all(cutoffEnd) as Array<{ id: string; name: string; api_key: string; created_at: string }>;
+
+  if (dryRun) {
+    res.json({
+      success: true,
+      dryRun: true,
+      cutoff: cutoffEnd,
+      candidateCount: targets.length,
+      sample: targets.slice(0, 5).map(t => ({
+        id: t.id,
+        name: t.name,
+        oldKeyPrefix: (t.api_key || "").slice(0, 12),
+        createdAt: t.created_at,
+      })),
+      hint: "Send {dryRun: false} to actually rotate.",
+    });
+    return;
+  }
+
+  // Real rotation: one transaction so we never end up half-way.
+  const update = db.prepare("UPDATE agents SET api_key = ? WHERE id = ?");
+  const sample: Array<{ id: string; name: string; oldKeyPrefix: string }> = [];
+  let rotated = 0;
+  const tx = db.transaction(() => {
+    for (const t of targets) {
+      const newKey = marketplaceRegistry.newApiKey();
+      update.run(newKey, t.id);
+      rotated++;
+      if (sample.length < 5) {
+        sample.push({
+          id: t.id,
+          name: t.name,
+          oldKeyPrefix: (t.api_key || "").slice(0, 12),
+        });
+      }
+    }
+  });
+  tx();
+
+  // Log so we have an audit trail
+  try {
+    interactionLogger.log("message", {
+      agentId: "admin",
+      metadata: { action: "rotate-keys", cutoff: cutoffEnd, rotated },
+      ipAddress: req.ip || "unknown",
+    });
+  } catch (logErr) {
+    console.error("[rotate-keys] log failed (non-critical):", logErr);
+  }
+
+  res.json({
+    success: true,
+    dryRun: false,
+    cutoff: cutoffEnd,
+    rotated,
+    sample,
+  });
+});
+
 // ─── POST /admin/deduplicate — Smart deduplication ──────────
 // Finds and removes duplicate agents based on fuzzy name matching.
 // Keeps the oldest entry (by created_at) for each group.

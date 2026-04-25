@@ -897,6 +897,11 @@ class MarketplaceRegistry {
     return `lok_${crypto.randomBytes(32).toString("hex")}`;
   }
 
+  // Public wrapper used by admin key-rotation endpoint
+  public newApiKey(): string {
+    return this.generateApiKey();
+  }
+
   private incrementDiscovery(agentId: string): void {
     try {
       const db = getDb();
