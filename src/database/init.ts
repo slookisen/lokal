@@ -296,6 +296,7 @@ function initSchema(db: Database.Database): void {
       source TEXT DEFAULT 'unknown',               -- 'direct','organic','search','social','referral'
       user_agent_hash TEXT,                        -- Hashed UA (privacy-safe, no full UA)
       session_id TEXT,                             -- Cookies-based session tracking
+      status_code INTEGER,                         -- HTTP status (200/301/404 etc) — null for legacy rows
       created_at TEXT DEFAULT (datetime('now'))
     );
 
@@ -439,6 +440,15 @@ function initSchema(db: Database.Database): void {
     } catch {
       // Column already exists
     }
+  }
+
+  // ─── Add status_code to page_views ───────────────────────────
+  // Lets us measure what AI bots actually hit — 200 vs 301 vs 404 —
+  // so the fuzzy-redirect fix's effect is visible in analytics.
+  try {
+    db.exec(`ALTER TABLE analytics_page_views ADD COLUMN status_code INTEGER`);
+  } catch {
+    // Column already exists
   }
 
   // ─── Add source column to conversations ──────────────────────

@@ -231,11 +231,15 @@ export class AnalyticsService {
         return next();
       }
 
-      // Track page views for human visitors (GET requests to frontend pages only)
-      // Exclude API endpoints — only track actual page loads
+      // Track page views for human visitors (GET requests to frontend pages only).
+      // Defer until response finish so we capture statusCode (200/301/404) — that
+      // way we can measure how often /produsent/<slug> hits 404 from AI crawlers
+      // and whether the fuzzy-redirect fix is actually catching dead traffic.
       if (self.options.trackPageViews && req.method === "GET" && !req.path.startsWith("/api/")) {
         const isOwner = isOwnerRequest(req);
-        self.trackPageView(req, isOwner);
+        res.on("finish", () => {
+          self.trackPageView(req, isOwner, res.statusCode);
+        });
       }
 
       // Intercept response to track timing
@@ -259,7 +263,7 @@ export class AnalyticsService {
   /**
    * Track page view for human visitors
    */
-  trackPageView(req: Request, isOwner: boolean = false): void {
+  trackPageView(req: Request, isOwner: boolean = false, statusCode?: number): void {
     try {
       const db = getDb();
       const path = req.path;
@@ -273,9 +277,9 @@ export class AnalyticsService {
       const sessionId = sessionManager.getOrCreate(ipHash, userAgent);
 
       db.prepare(`
-        INSERT INTO analytics_page_views (path, referrer, source, user_agent_hash, session_id, is_owner)
-        VALUES (?, ?, ?, ?, ?, ?)
-      `).run(path, referrer || null, source, userAgentHash, sessionId, isOwner ? 1 : 0);
+        INSERT INTO analytics_page_views (path, referrer, source, user_agent_hash, session_id, is_owner, status_code)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+      `).run(path, referrer || null, source, userAgentHash, sessionId, isOwner ? 1 : 0, statusCode ?? null);
     } catch (err) {
       console.error("[analytics] Failed to track page view:", err);
     }

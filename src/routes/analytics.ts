@@ -894,4 +894,76 @@ router.get("/ops/diagnostics", (_req: Request, res: Response) => {
   }
 });
 
+// ─── GET /admin/analytics/producer-outcomes ─────────────────────
+// Per-day breakdown of /produsent/<slug> hits by AI-bot class and
+// HTTP status. Built specifically to measure whether the
+// fuzzy-redirect fix (commit 78c025d) is actually catching dead
+// AI traffic — i.e. fewer 404s and a growing 301 count from
+// Perplexity/GPTBot/ClaudeBot.
+//
+// Query params:
+//   days=30          — lookback window (default 30, max 90)
+//
+// Response shape:
+//   {
+//     window: { from: ISO, to: ISO, days: 30 },
+//     totals: { Perplexity: { 200: N, 301: N, 404: N }, ... },
+//     byDay:  [{ day: "2026-04-25", bot: "Perplexity", status: 301, hits: 7 }, ...],
+//   }
+router.get("/producer-outcomes", requireAdminAuth, (req: Request, res: Response) => {
+  try {
+    const db = getDb();
+    const days = Math.min(90, Math.max(1, parseInt(String(req.query.days || "30"), 10) || 30));
+
+    // Bucket by UA token in session_id. session_id = `${ipHash}:${userAgent}`
+    // so substring match works (see SessionManager.getOrCreate).
+    const botCase = `
+      CASE
+        WHEN session_id LIKE '%Perplexity%' THEN 'Perplexity'
+        WHEN session_id LIKE '%GPTBot%' OR session_id LIKE '%ChatGPT%' OR session_id LIKE '%OAI-SearchBot%' THEN 'OpenAI'
+        WHEN session_id LIKE '%ClaudeBot%' OR session_id LIKE '%Claude-User%' OR session_id LIKE '%Anthropic%' THEN 'Anthropic'
+        WHEN session_id LIKE '%Googlebot%' OR session_id LIKE '%Google-Extended%' THEN 'Google'
+        WHEN session_id LIKE '%Gemini%' THEN 'Gemini'
+        WHEN session_id LIKE '%Bytespider%' OR session_id LIKE '%CCBot%' OR session_id LIKE '%Applebot%' OR session_id LIKE '%YandexBot%' OR session_id LIKE '%bingbot%' THEN 'OtherBot'
+        WHEN session_id LIKE '%Mozilla%' OR session_id LIKE '%Chrome%' OR session_id LIKE '%Safari%' THEN 'Human'
+        ELSE 'Unknown'
+      END
+    `;
+
+    const rows = db.prepare(`
+      SELECT
+        substr(created_at, 1, 10) AS day,
+        ${botCase} AS bot,
+        COALESCE(status_code, 0) AS status,
+        COUNT(*) AS hits
+      FROM analytics_page_views
+      WHERE path LIKE '/produsent/%'
+        AND created_at > datetime('now', '-' || ? || ' days')
+        AND (is_owner IS NULL OR is_owner = 0)
+      GROUP BY day, bot, status
+      ORDER BY day DESC, bot, status
+    `).all(days) as Array<{ day: string; bot: string; status: number; hits: number }>;
+
+    // Roll up totals per bot
+    const totals: Record<string, Record<string, number>> = {};
+    for (const r of rows) {
+      const key = String(r.status || "unknown");
+      totals[r.bot] = totals[r.bot] || {};
+      totals[r.bot][key] = (totals[r.bot][key] || 0) + r.hits;
+    }
+
+    const now = new Date();
+    const from = new Date(now.getTime() - days * 24 * 3600 * 1000);
+
+    res.json({
+      window: { from: from.toISOString(), to: now.toISOString(), days },
+      totals,
+      byDay: rows,
+    });
+  } catch (err: any) {
+    res.status(500).json({ error: "Query failed", detail: err.message });
+  }
+});
+
+
 export default router;
