@@ -1,1 +1,10 @@
 node_modules/
+
+# Windows-reserved device names — never let these into the tree.
+# Caused 'error: invalid path nul' on Daniel's Windows pull 2026-04-25.
+nul
+con
+prn
+aux
+com[1-9]
+lpt[1-9]
