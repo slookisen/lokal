@@ -3,6 +3,7 @@ import { getDb } from "../database/init";
 import { interactionLogger } from "./interaction-logger";
 import { marketplaceRegistry } from "./marketplace-registry";
 import { knowledgeService, parseProductPrice, isProductHeader, isProductNoise } from "./knowledge-service";
+import { slugify } from "../utils/slug";
 
 // ─── Conversation Service ───────────────────────────────────
 // This is what makes Lokal an OPERATOR, not just a registry.
@@ -251,10 +252,7 @@ class ConversationService {
 
     // Profile link
     const BASE_URL = process.env.BASE_URL || "https://rettfrabonden.com";
-    const slug = agent.name.normalize("NFC").toLowerCase()
-      .replace(/\u00e6/g, "ae").replace(/\u00f8/g, "o").replace(/\u00e5/g, "a")
-      .replace(/\u00e4/g, "a").replace(/\u00f6/g, "o").replace(/\u00fc/g, "u")
-      .replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "");
+    const slug = slugify(agent.name);
     parts.push(`\n🔗 Se profilen vår: ${BASE_URL}/produsent/${slug}`);
 
     // Closing

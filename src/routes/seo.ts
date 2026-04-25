@@ -23,17 +23,13 @@ import { analyticsService } from "../services/analytics-service";
 import { DiscoveryQuerySchema } from "../models/marketplace";
 import { getDb } from "../database/init";
 import { conversationService } from "../services/conversation-service";
+import { slugify } from "../utils/slug";
 
 const router = Router();
 
 // ─── Helpers ────────────────────────────────────────────────
 
-function slugify(text: string): string {
-  return text.normalize("NFC").toLowerCase()
-    .replace(/\u00e6/g, "ae").replace(/\u00f8/g, "o").replace(/\u00e5/g, "a")
-    .replace(/\u00e4/g, "a").replace(/\u00f6/g, "o").replace(/\u00fc/g, "u")
-    .replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "");
-}
+
 
 function escapeHtml(text: string): string {
   if (!text) return "";

@@ -14,16 +14,13 @@
 import { Router, Request, Response } from "express";
 import { marketplaceRegistry } from "../services/marketplace-registry";
 import { knowledgeService } from "../services/knowledge-service";
+import { slugify } from "../utils/slug";
 
 const router = Router();
 const BASE_URL = process.env.BASE_URL || "https://rettfrabonden.com";
 
 // Helper: slugify (same as seo.ts)
-function slugify(str: string): string {
-  return str.toLowerCase()
-    .replace(/æ/g, "ae").replace(/ø/g, "o").replace(/å/g, "a")
-    .replace(/[^a-z0-9]+/g, "-").replace(/(^-|-$)/g, "");
-}
+
 
 // ═══════════════════════════════════════════════════════════════
 // 1. GET /llms.txt — LLM-friendly site overview (Markdown)

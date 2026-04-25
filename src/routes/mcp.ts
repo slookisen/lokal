@@ -20,13 +20,9 @@ import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/
 import { z } from "zod";
 import { marketplaceRegistry } from "../services/marketplace-registry";
 import { knowledgeService, parseProductPrice, isProductHeader, isProductNoise } from "../services/knowledge-service";
+import { slugify } from "../utils/slug";
 
-function slugify(text: string): string {
-  return text.normalize("NFC").toLowerCase()
-    .replace(/\u00e6/g, "ae").replace(/\u00f8/g, "o").replace(/\u00e5/g, "a")
-    .replace(/\u00e4/g, "a").replace(/\u00f6/g, "o").replace(/\u00fc/g, "u")
-    .replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "");
-}
+
 import { conversationService } from "../services/conversation-service";
 
 const router = Router();
