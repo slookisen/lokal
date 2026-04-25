@@ -8,6 +8,7 @@ import { getDb } from "../database/init";
 import { emailService } from "../services/email-service";
 import { trustScoreService } from "../services/trust-score-service";
 import { conversationService } from "../services/conversation-service";
+import { slugify } from "../utils/slug";
 
 // ─── Marketplace Routes ───────────────────────────────────────
 // These are the OPEN endpoints that make Lokal a marketplace.
@@ -168,7 +169,7 @@ function buildVCard(agentId: string): string | null {
   const catNames = (agent.categories || []).map((c: string) => c.charAt(0).toUpperCase() + c.slice(1));
   lines.push(`CATEGORIES:Rett fra Bonden,${catNames.length ? catNames.join(",") : "Norsk mat"},Produsent`);
   // Producer page URL
-  const profileSlug = agent.name.toLowerCase().replace(/[^a-zæøå0-9]+/g, "-").replace(/-+/g, "-").replace(/^-|-$/g, "");
+  const profileSlug = slugify(agent.name);
   lines.push(`X-LOKAL-PROFILE:https://rettfrabonden.com/produsent/${profileSlug}`);
   lines.push(`X-LOKAL-AGENT-ID:${agent.id}`);
   if (agent.trustScore !== undefined && agent.trustScore !== null) {
@@ -589,12 +590,15 @@ router.get("/agents/:id/card", (req: Request, res: Response) => {
     card.agentVersion = agent.agentVersion || 1;
 
     // Useful links for AI agents and consumers
-    const slug = agent.name.toLowerCase().replace(/[^a-zæøå0-9]+/g, "-").replace(/-+/g, "-").replace(/^-|-$/g, "");
+    const slug = slugify(agent.name);
     const mapsParts = [agent.name];
     if (k.address) mapsParts.push(k.address);
     if (cityName) mapsParts.push(cityName);
     mapsParts.push("Norge");
 
+    // Top-level canonical URL — explicit so AI agents reading the
+    // card don't have to dig into links.profile or invent one from name.
+    card.canonicalUrl = `https://rettfrabonden.com/produsent/${slug}`;
     card.links = {
       profile: `https://rettfrabonden.com/produsent/${slug}`,
       googleMaps: `https://www.google.com/maps/search/${encodeURIComponent(mapsParts.join(", "))}`,
