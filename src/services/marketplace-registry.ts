@@ -475,7 +475,12 @@ class MarketplaceRegistry {
         `Connect AI agents with ${stats.totalAgents || 1169}+ verified local farms, shops, cooperatives, farm shops, REKO rings, and markets. ` +
         "Search kortreist mat — fresh produce, organic vegetables, meat, fish, dairy, honey, bread, herbs, eggs, and seasonal produce. " +
         "Agent-markedsplass for lokal mat i Norge — ferske gr\u00f8nnsaker, frukt, kj\u00f8tt, fisk, meieri, honning, br\u00f8d, \u00f8kologisk, kortreist, g\u00e5rdsbutikk, REKO-ring og mer.",
-      url: baseUrl,
+      // A2A spec: this MUST be the JSON-RPC endpoint, not the website root.
+      // Compliant clients (incl. a2aregistry.org) POST messages directly to
+      // this URL. Pointing it at `${baseUrl}` made every client land on
+      // Express's HTML 404 page and report "404 Not Found when sending
+      // messages" — flagged by A2A Registry maintainer 2026-04-25.
+      url: `${baseUrl}/a2a`,
       provider: {
         organization: "Lokal",
         url: baseUrl,
@@ -484,6 +489,7 @@ class MarketplaceRegistry {
           "Norges f\u00f8rste A2A-markedsplass for lokal mat.",
       },
       version: "1.0.0",
+      protocolVersion: "0.3.0",
       documentationUrl: `${baseUrl}/docs`,
       defaultInputModes: ["text/plain", "application/json"],
       defaultOutputModes: ["application/json"],

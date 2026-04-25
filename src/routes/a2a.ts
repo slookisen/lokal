@@ -87,6 +87,7 @@ router.post("/a2a", (req: Request, res: Response) => {
   try {
     switch (method) {
       case "message/send":
+      case "tasks/send": // Backward-compat alias for older A2A clients (<0.3)
         handleMessageSend(params, id, req, res);
         break;
       case "tasks/get":

@@ -1,4 +1,4 @@
-﻿# â”€â”€â”€ Lokal: A2A Food Marketplace â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# â”€â”€â”€ Lokal: A2A Food Marketplace â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 # Uses tsx for TypeScript execution (same as dev).
 # SQLite data persists via a mounted volume at /app/data.
 
@@ -11,6 +11,14 @@ RUN apk add --no-cache python3 make g++
 # Install all deps (tsx is needed for runtime)
 COPY package*.json ./
 RUN npm ci && apk del python3 make g++
+
+# Cache-bust on every commit. Pass --build-arg BUILD_REV=$(git rev-parse HEAD)
+# at deploy time so Fly's remote builder cannot reuse a stale `COPY src/` layer.
+# Visibility report 2026-04-25 found ~3 weeks of accumulated source changes
+# weren't actually reaching prod because the layer was cached.
+ARG BUILD_REV=dev
+LABEL build_rev=$BUILD_REV
+RUN echo "build_rev=$BUILD_REV" > /app/.build-rev
 
 # Copy source + public assets
 COPY src/ ./src/
