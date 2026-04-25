@@ -1,4 +1,5 @@
 import nodemailer, { Transporter } from 'nodemailer';
+import { slugify } from "../utils/slug";
 
 // Simple logger — replace with winston/pino in production
 const logger = {
@@ -636,7 +637,9 @@ Rett fra Bonden | rettfrabonden.com`;
     }
 
     try {
-      const profileUrl = `https://rettfrabonden.com/produsent/${agentId}`;
+      // Use canonical name-slug, not UUID — UUID URLs 404. agentName
+      // is the producer's display name; slugify matches the seo.ts handler.
+      const profileUrl = `https://rettfrabonden.com/produsent/${slugify(agentName)}`;
       const dashboardUrl = `https://rettfrabonden.com/admin/dashboard`;
       const subject = `Ny verifisert bruker: ${claimantName} — ${agentName}`;
 

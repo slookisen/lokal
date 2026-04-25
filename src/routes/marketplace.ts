@@ -54,7 +54,7 @@ function ensureAgentInDb(agentId: string): boolean {
       agent.description || "",
       agent.provider || "auto-discovered",
       agent.contactEmail || "ukjent@rettfrabonden.com",
-      agent.url || `https://rettfrabonden.com/produsent/${agent.id}`,
+      agent.url || `https://rettfrabonden.com/produsent/${slugify(agent.name)}`,
       agent.role || "producer",
       agent.apiKey || `auto_${agent.id}`,
       agent.location?.lat || null,
