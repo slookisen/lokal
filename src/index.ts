@@ -27,6 +27,7 @@ import agentReadinessRoutes from "./routes/agent-readiness";
 import { linkHeaders, markdownNegotiation } from "./middleware/agent-discovery";
 import { analyticsService } from "./services/analytics-service";
 import analyticsRoutes from "./routes/analytics";
+import crmRoutes from "./routes/crm";
 import { seedData } from "./seed";
 // Seed files moved to src/_seeds/ — only loaded if DB is empty (see below).
 import { discoveryService } from "./services/discovery-service";
@@ -223,6 +224,14 @@ app.get("/health", (_req, res) => {
 
 // Analytics admin endpoints
 app.use("/admin/analytics", analyticsRoutes);
+
+// CRM admin endpoints + page (feature-flagged via CRM_ENABLED env var; default ON)
+if (process.env.CRM_ENABLED !== "0") {
+  app.use("/admin/crm", crmRoutes);
+  app.get("/admin/crm-dashboard", (_req, res) => {
+    res.sendFile(path.join(__dirname, "public", "admin-crm.html"));
+  });
+}
 
 // Conversation UI — /samtaler and /samtale/:id (before SEO catch-all)
 app.use("/", conversationUiRoutes);

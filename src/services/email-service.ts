@@ -211,6 +211,43 @@ export class EmailService {
     }
   }
 
+
+  async sendRaw(options: {
+    to: string;
+    cc?: string;
+    subject: string;
+    textContent: string;
+    htmlContent?: string;
+    inReplyToMessageId?: string;
+  }): Promise<{ success: boolean; messageId?: string; error?: string }> {
+    if (!this.isConfigured) {
+      logger.info('DRY RUN: Would send raw email', { to: options.to, subject: options.subject });
+      return { success: true, messageId: 'DRY_RUN' };
+    }
+    try {
+      const headers: Record<string, string> = { 'X-Lokal-Agent': 'crm-system/v1' };
+      if (options.inReplyToMessageId) {
+        headers['In-Reply-To'] = options.inReplyToMessageId;
+        headers['References'] = options.inReplyToMessageId;
+      }
+      const mailOptions: any = {
+        from: this.fromAddress,
+        to: options.to,
+        subject: options.subject,
+        text: options.textContent,
+        headers,
+      };
+      if (options.cc) mailOptions.cc = options.cc;
+      if (options.htmlContent) mailOptions.html = options.htmlContent;
+      const info = await this.transporter.sendMail(mailOptions);
+      logger.info('Raw email sent', { to: options.to, subject: options.subject, messageId: info.messageId as string });
+      return { success: true, messageId: info.messageId as string };
+    } catch (error) {
+      logger.error('Failed to send raw email', { to: options.to, error: error instanceof Error ? error.message : String(error) });
+      return { success: false, error: error instanceof Error ? error.message : 'Unknown error' };
+    }
+  }
+
   private generateClaimInvitationHtml(
     sellerName: string,
     agentName: string,
