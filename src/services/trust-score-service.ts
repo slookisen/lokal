@@ -176,7 +176,7 @@ class TrustScoreService {
         completeness: { value: completeness, weight: WEIGHTS.completeness, detail: `${Math.round(completeness * 100)}% av felter fylt ut` },
         freshness: { value: freshness, weight: WEIGHTS.freshness, detail: `Siste aktivitet: ${this.getLastActivityLabel(agentId)}` },
         interaction: { value: interaction, weight: WEIGHTS.interaction, detail: this.getInteractionDetail(agentId) },
-        community: { value: community, weight: WEIGHTS.community, detail: "Kommer i fremtidig versjon" },
+        community: { value: community, weight: WEIGHTS.community, detail: this.getCommunityDetail(agentId) },
       },
       tips,
     };
@@ -299,11 +299,32 @@ class TrustScoreService {
     return discoveryScore * 0.3 + contactScore * 0.4 + chosenScore * 0.3;
   }
 
-  private communitySignal(_agentId: string): number {
-    // Phase 3: will use ratings, repeat buyers, external reviews.
-    // For now, return a neutral 0.3 so it doesn't drag scores down
-    // but also doesn't inflate them.
-    return 0.3;
+  private communitySignal(agentId: string): number {
+    // ── Community signal v2 (2026-04-26) ────────────────────────
+    // Reads agent_knowledge.google_rating + google_review_count.
+    // No rating in DB → 0.3 (neutral baseline; no penalty for new agents).
+    // Otherwise: rating normalized to 0..1, blended with a 0.5 prior
+    // when review-count is low (Bayesian-ish — protects against
+    // 1-review cherry-picks while letting well-rated agents reach 1.0).
+    const db = getDb();
+    const k = db.prepare(
+      "SELECT google_rating, google_review_count FROM agent_knowledge WHERE agent_id = ?"
+    ).get(agentId) as any;
+
+    const rating: number | null = k?.google_rating ?? null;
+    const reviewCount: number = k?.google_review_count ?? 0;
+
+    if (rating == null || rating <= 0) return 0.3;
+
+    // Normalize 1.0–5.0 → 0.0–1.0 (a 1-star rating still beats no rating because
+    // it's evidence of activity; a 0/1 input is treated defensively).
+    const ratingNorm = Math.max(0, Math.min(1, (rating - 1) / 4));
+
+    // Volume weight: 20+ reviews = full weight, fewer reviews shrink toward
+    // a 0.5 prior so a single 5-star review can't max the score.
+    const volumeWeight = Math.min(1, Math.log10(reviewCount + 1) / Math.log10(20));
+
+    return ratingNorm * volumeWeight + 0.5 * (1 - volumeWeight);
   }
 
   // ─── Helpers ───────────────────────────────────────────────
@@ -353,6 +374,17 @@ class TrustScoreService {
     if (metrics.times_chosen) parts.push(`${metrics.times_chosen} valgt`);
 
     return parts.length > 0 ? parts.join(", ") : "Ingen interaksjoner ennå";
+  }
+
+  private getCommunityDetail(agentId: string): string {
+    const db = getDb();
+    const k = db.prepare(
+      "SELECT google_rating, google_review_count FROM agent_knowledge WHERE agent_id = ?"
+    ).get(agentId) as any;
+    const rating = k?.google_rating;
+    const reviews = k?.google_review_count ?? 0;
+    if (!rating) return "Ingen Google-vurdering enn\u00e5";
+    return `Google: ${rating}/5 (${reviews} anmeldelse${reviews === 1 ? "" : "r"})`;
   }
 }
 

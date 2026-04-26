@@ -17,6 +17,12 @@ const DB_PATH = process.env.DB_PATH || path.join(__dirname, "../../data/lokal.db
 
 let db: Database.Database;
 
+// Test-only: inject an in-memory DB so unit tests can run without touching prod.
+// Never call this from production code paths.
+export function __setDbForTesting(injected: Database.Database): void {
+  db = injected;
+}
+
 export function getDb(): Database.Database {
   if (!db) {
     // Ensure data directory exists

@@ -608,9 +608,9 @@ router.get("/agents/:id/card", (req: Request, res: Response) => {
     if (k.minOrderValue != null) card.minOrderValue = k.minOrderValue;
 
     // Google rating
-    if (k.ratings?.google?.rating) {
-      card.googleRating = k.ratings.google.rating;
-      card.googleReviewCount = k.ratings.google.reviewCount || 0;
+    if (k.ratings?.google?.score) {
+      card.googleRating = k.ratings.google.score;
+      card.googleReviewCount = k.ratings.google.reviews || 0;
     }
 
     // About text (richer than description)

@@ -180,6 +180,8 @@ export interface AgentInfoResponse {
       google?: { score: number; reviews: number };
       tripadvisor?: { score: number };
     };
+    googleRating?: number;
+    googleReviewCount?: number;
   };
   meta: {
     dataSource: "auto" | "owner" | "hybrid";
@@ -249,6 +251,8 @@ class KnowledgeService {
         deliveryRadius: knowledge?.deliveryRadius,
         minOrderValue: knowledge?.minOrderValue,
         ratings: this.buildRatings(knowledge),
+        googleRating: knowledge?.googleRating,
+        googleReviewCount: knowledge?.googleReviewCount,
       },
       meta: {
         dataSource,
