@@ -134,7 +134,7 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;backgrou
     <h1>🌾 CRM</h1>
     <div class="subtitle">Rett fra Bonden — kundeoppfølging</div>
     <input type="password" id="adminKey" placeholder="Admin-nøkkel" autofocus>
-    <button onclick="login()">Logg inn</button>
+    <button data-action="login">Logg inn</button>
     <div class="login-error" id="loginError"></div>
   </div>
 </div>
@@ -150,8 +150,8 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;backgrou
       <span class="kpi"><span class="num" id="kpiNew">0</span> nye</span>
       <span class="kpi warn"><span class="num" id="kpiAwait">0</span> venter</span>
       <span class="kpi"><span class="num" id="kpiOutbox">0</span> i kø</span>
-      <button class="btn-sm" onclick="refresh()">↻ Oppdater</button>
-      <button class="btn-sm" onclick="logout()">Logg ut</button>
+      <button class="btn-sm" data-action="refresh">↻ Oppdater</button>
+      <button class="btn-sm" data-action="logout">Logg ut</button>
     </div>
   </div>
 
@@ -165,7 +165,7 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;backgrou
   <div class="main">
     <div class="list-pane">
       <div class="list-search">
-        <input type="text" id="searchInput" placeholder="Søk e-post eller navn..." oninput="onSearchChange()">
+        <input type="text" id="searchInput" placeholder="Søk e-post eller navn..." data-action="search">
       </div>
       <div class="contact-list" id="contactList">
         <div class="empty">Laster…</div>
@@ -305,7 +305,7 @@ async function loadContacts() {
       return;
     }
     list.innerHTML = contacts.map(c => `
-      <div class="contact-row ${c.id === activeContactId ? 'active' : ''}" onclick="selectContact('${c.id}')">
+      <div class="contact-row ${c.id === activeContactId ? 'active' : ''}" data-action="selectContact" data-id="${c.id}">
         <div class="head">
           <div class="name">${escapeHtml(c.name || c.organization || c.email)}</div>
           <div class="time">${fmtTime(c.last_message_at)}</div>
@@ -346,14 +346,14 @@ async function loadContactDetail(id) {
         </div>
         <div class="actions">
           <span class="pill ${c.type}">${c.type}</span>
-          <select class="select" id="reclassify" onchange="reclassifyContact('${c.id}', this.value)">
+          <select class="select" id="reclassify" data-action="reclassifyContact" data-id="${c.id}">
             <option value="">Endre type…</option>
             <option value="producer">→ Kunde (Produsent)</option>
             <option value="marketing">→ Markedsføring</option>
             <option value="vendor">→ Leverandør</option>
             <option value="unknown">→ Ukjent</option>
           </select>
-          <select class="select" onchange="setContactStatus('${c.id}', this.value)">
+          <select class="select" data-action="setContactStatus" data-id="${c.id}">
             <option value="">Status: ${c.status}</option>
             <option value="active">Aktiv</option>
             <option value="blocked">Blokker</option>
@@ -365,7 +365,7 @@ async function loadContactDetail(id) {
       <div class="threads-section">
         <div class="section-title">Tråder (${threads.length})</div>
         ${threads.length ? threads.map(t => `
-          <div class="thread-card ${t.id === activeThreadId ? 'active' : ''}" onclick="selectThread('${t.id}')">
+          <div class="thread-card ${t.id === activeThreadId ? 'active' : ''}" data-action="selectThread" data-id="${t.id}">
             <div class="top">
               <div class="subject">${escapeHtml(t.subject || '(uten emne)')}</div>
               <div class="info">
@@ -381,7 +381,7 @@ async function loadContactDetail(id) {
 
       <div class="notes-section">
         <div class="section-title">Notater om kontakt</div>
-        <textarea id="contactNotes" placeholder="Notater om denne kontakten…" onblur="saveContactNotes('${c.id}')">${escapeHtml(c.notes || '')}</textarea>
+        <textarea id="contactNotes" placeholder="Notater om denne kontakten…" data-action="saveContactNotes" data-id="${c.id}">${escapeHtml(c.notes || '')}</textarea>
       </div>
 
       <div id="threadDetail"></div>
@@ -413,7 +413,7 @@ async function selectThread(id) {
         <div class="section-title" style="display:flex;justify-content:space-between;align-items:center;margin-bottom:14px">
           <span>${escapeHtml(t.subject || '(uten emne)')}</span>
           <span style="display:flex;gap:8px">
-            <select class="select" onchange="setThreadStatus('${t.id}', this.value)">
+            <select class="select" data-action="setThreadStatus" data-id="${t.id}">
               <option value="">Status: ${t.status}</option>
               <option value="new">Ny</option>
               <option value="in_progress">Under arbeid</option>
@@ -421,7 +421,7 @@ async function selectThread(id) {
               <option value="done">Ferdig</option>
               <option value="archived">Arkivert</option>
             </select>
-            <select class="select" onchange="setAssignee('${t.id}', this.value)">
+            <select class="select" data-action="setAssignee" data-id="${t.id}">
               <option value="">Tildelt: ${t.assigned_to}</option>
               <option value="claude">Claude</option>
               <option value="daniel">Daniel</option>
@@ -442,13 +442,13 @@ async function selectThread(id) {
             <label><input type="radio" name="sendMode" value="gmail_draft" checked> Lag draft i Gmail</label>
             <label><input type="radio" name="sendMode" value="resend_send"> Send nå (Resend)</label>
           </div>
-          <button class="btn-primary" onclick="sendReply('${t.id}')" id="sendBtn">Send</button>
+          <button class="btn-primary" data-action="sendReply" data-id="${t.id}" id="sendBtn">Send</button>
         </div>
       </div>
 
       <div class="notes-section">
         <div class="section-title">Notater på tråd</div>
-        <textarea id="threadNotes" placeholder="Notater spesifikt for denne tråden…" onblur="saveThreadNotes('${t.id}')">${escapeHtml(t.notes || '')}</textarea>
+        <textarea id="threadNotes" placeholder="Notater spesifikt for denne tråden…" data-action="saveThreadNotes" data-id="${t.id}">${escapeHtml(t.notes || '')}</textarea>
       </div>
     `;
     detail.scrollIntoView({ behavior: 'smooth', block: 'start' });
@@ -468,7 +468,7 @@ function renderMessage(m) {
           <span>${fmtFull(m.sent_at || m.received_at)}</span>
         </div>
         <div class="body${long ? ' collapsed' : ''}" id="msg-${m.id}">${escapeHtml(body)}</div>
-        ${long ? `<span class="show-more" onclick="document.getElementById('msg-${m.id}').classList.toggle('collapsed')">Vis mer ▾</span>` : ''}
+        ${long ? `<span class="show-more" data-action="toggleMsg" data-id="${m.id}">Vis mer ▾</span>` : ''}
       </div>
     </div>
   `;
@@ -548,7 +548,51 @@ function slugify(s) {
   return String(s).toLowerCase().replace(/æ/g,'ae').replace(/ø/g,'o').replace(/å/g,'a').replace(/[^a-z0-9]+/g,'-').replace(/^-|-$/g,'');
 }
 
-document.getElementById('adminKey')?.addEventListener('keypress', e => { if (e.key === 'Enter') login(); });
+// ─── Event delegation (CSP-safe — no inline handlers) ───
+const ACTIONS = {
+  login, logout, refresh,
+  search: onSearchChange,
+  selectContact: id => selectContact(id),
+  selectThread: id => selectThread(id),
+  toggleMsg: id => document.getElementById('msg-' + id)?.classList.toggle('collapsed'),
+  sendReply: id => sendReply(id),
+  reclassifyContact: (id, val) => reclassifyContact(id, val),
+  setContactStatus: (id, val) => setContactStatus(id, val),
+  setThreadStatus: (id, val) => setThreadStatus(id, val),
+  setAssignee: (id, val) => setAssignee(id, val),
+  saveContactNotes: id => saveContactNotes(id),
+  saveThreadNotes: id => saveThreadNotes(id),
+};
+
+function dispatchAction(e, eventType) {
+  let el = e.target;
+  // Walk up to find element with data-action (handles clicks on child nodes)
+  while (el && el !== document.body && !el.dataset.action) el = el.parentElement;
+  if (!el || !el.dataset.action) return;
+  const action = el.dataset.action;
+  const fn = ACTIONS[action];
+  if (!fn) return;
+  const id = el.dataset.id;
+  const val = el.value;
+  // For change events on selects, pass id+val. For others, just id.
+  if (eventType === 'change') {
+    fn(id, val);
+  } else {
+    fn(id);
+  }
+}
+
+document.body.addEventListener('click', e => dispatchAction(e, 'click'));
+document.body.addEventListener('change', e => dispatchAction(e, 'change'));
+document.body.addEventListener('input', e => {
+  if (e.target.id === 'searchInput') onSearchChange();
+});
+// blur doesn't bubble — capture phase
+document.body.addEventListener('blur', e => dispatchAction(e, 'blur'), true);
+// Enter key on adminKey input
+document.body.addEventListener('keypress', e => {
+  if (e.target.id === 'adminKey' && e.key === 'Enter') login();
+});
 </script>
 </body>
 </html>
