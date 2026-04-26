@@ -817,6 +817,55 @@ Two nuances we tripped on:
 - **Absolute URLs required.** Social crawlers don't follow relative paths. Always construct with `${BASE_URL}/logo-512.png`, never `/logo-512.png`.
 - **`summary_large_image` needs ≥300 × 157 px.** A 512 × 512 logo technically meets the minimum; for a true edge-to-edge card, produce a 1200 × 628 variant and swap it in. Deferred — logo is good enough for v1.
 
+### 5.7 Smart Fallback for `/produsent/<slug>` 404s
+
+AI engines (Perplexity, ChatGPT, Claude) and stale links often *invent* `/produsent/<slug>` URLs by slugifying a producer name they read elsewhere — but canonical slugs include locality suffixes. Request `bondens-marked-grunerlokka`, real slug is `bondens-marked-birkelunden-grunerlokka`. A naïve 404 there is dead AI traffic. Add a token-subset matcher:
+
+```typescript
+// src/routes/seo.ts
+function findProducerMatches(requestSlug: string, agents: any[]) {
+  const STOP = new Set(["og","av","i","pa","fra","til","for","med","the","of"]);
+  const tokenize = (s: string) => new Set(s.split("-").filter(t => t.length > 1 && !STOP.has(t)));
+  const reqTokens = tokenize(requestSlug);
+  // Pass 1: unique subset → 301 to canonical (preserves SEO juice, teaches crawler)
+  // Pass 2: Jaccard similarity → 404 body with up to 6 "Mente du?" cards + city quick-links
+  // Pass 3: no overlap → search-fallback 404 (keeps user on site)
+}
+```
+
+Three rules:
+
+1. **Never soft-200 a 404** — Google penalises that. Status code stays `404` even when the body is helpful.
+2. **301 only on unique subset hits** — multiple matches must stay 404 with suggestions, otherwise you redirect the wrong producer.
+3. **Verify offline against the live sitemap before shipping.** Tested 1187 slugs locally: `bondens-marked-grunerlokka → 301 ...-birkelunden-grunerlokka`, `oslo-kooperativ → suggests trondheim/vestfold variants`, `dagligvare-frukt-og-gronnsaker → search fallback`. Catching false redirects in CI is much cheaper than rolling back in prod.
+
+Commit: `78c025d`. Pair with analytics tracking of HTTP status (Phase 7.10) to quantify how much traffic the fix is catching.
+
+### 5.8 Static-Page SEO + Admin `noindex`
+
+`og:image`/`twitter:card`/`canonical`/`description` only land automatically on routes that go through your seo-shell renderer. Standalone HTML pages (signup landings, SPA shell, admin) need them stamped by hand or you ship a "no preview" page to LinkedIn and let Google index your admin panel.
+
+```html
+<!-- src/public/selger.html  (producer signup, top-of-funnel) -->
+<html lang="nb">  <!-- BCP-47, not "no" -->
+<meta name="description" content="Bli synlig for AI-søk. Gratis selgerprofil…">
+<meta property="og:title" content="Bli funnet av AI-søk — Rett fra Bonden">
+<meta property="og:image" content="https://rettfrabonden.com/logo-512.png">
+<meta name="twitter:card" content="summary_large_image">
+<link rel="canonical" href="https://rettfrabonden.com/selger">
+
+<!-- src/public/admin.html, admin-dashboard.html, dashboard.html -->
+<meta name="robots" content="noindex, nofollow">
+```
+
+Post-deploy HTTP check:
+```bash
+curl -s https://rettfrabonden.com/selger | grep 'twitter:card'
+curl -s https://rettfrabonden.com/admin | grep 'noindex'
+```
+
+Commit: `19aaa4b`. Audit any new public page that bypasses the shell renderer.
+
 
 ---
 
@@ -1072,6 +1121,63 @@ offset: z.number().int().min(0).catch(0).default(0),
 
 Commit: `11e8502`. Clamp silently, log nothing, preserve the cap.
 
+### 7.10 Track HTTP Status + AI-Bot Producer Outcomes
+
+The fuzzy-redirect fix in 5.7 is hard to evaluate without measuring whether AI bots actually hit `/produsent/<slug>` and what status they got. Add a `status_code` column to `analytics_page_views` and defer the write until `res.on('finish')` so the real status is captured:
+
+```typescript
+// src/database/init.ts (idempotent migration)
+try { db.exec(`ALTER TABLE analytics_page_views ADD COLUMN status_code INTEGER`); } catch {}
+
+// src/services/analytics-service.ts
+res.on("finish", () => trackPageView(req, res.statusCode));
+```
+
+Then a rollup endpoint: `GET /admin/analytics/producer-outcomes?days=30` groups `/produsent/*` hits per day × bot class × status (200 / 301 / 404). Bot bucketing reuses the `session_id LIKE '%GPTBot%'` pattern from 7.4. Legacy rows (status_code NULL) are excluded — they predate the fix anyway.
+
+Commit: `251137d`. Use this to tune the fuzzy matcher: if the 404 share for AI bots stays high a week after deploy, the token-subset rule is too strict.
+
+### 7.11 Enheter, Dynamic Bot Naming, Owner UX, Samtaler Panel
+
+Four coupled dashboard fixes after the first week of real traffic:
+
+- **`Enheter` widget was identical to `Trafikkilder`.** Both were re-grouping `referrer_source`. Fix: parse actual device class (`desktop`/`mobile`/`tablet`) from the UA stored inside `session_id`, and exclude bots so device share reflects humans only.
+- **Bot-fordeling hardcoded a whitelist** that grew stale every time a new crawler showed up — 1,637 hits ended up in the unnamed bucket. Replace with a dynamic extractor: any token matching `/Bot|Crawler|Spider/i` becomes a label, fall back to `Name/version`, then first word. Add a collapsible drill-down to surface raw UAs from the "other" bucket so unknowns become discoverable.
+- **Owner-traffic pollution.** Our own scheduled agents (Lokal/, rfb-*, axios/, curl/, node-fetch, python-*) showed up in `direct` and inflated human-traffic numbers. Fix: auto-tag those UAs `is_owner=1`. Plus a one-click "Marker meg som eier" button on the dashboard for ad-hoc cases.
+- **Samtaler panel.** New endpoint `/admin/analytics/conversations` surfaces total conversation count + per-source breakdown (MCP / A2A / Web / API) on the admin dashboard. Business-level signal sits next to HTTP-level stats, both linking to `/samtaler` for the canonical view.
+
+Commits: `11de418` (the four fixes), `a6acccb` (case-insensitive owner UA match — earlier version skipped `RFB-ContactVerifier` because it wasn't lowercased before comparison).
+
+### 7.12 Inbox CRM Dashboard
+
+Once the customer-service agent (Phase 16) starts running, you need a place to see the actual conversations — not just the analytics rollup. We added a single-file admin CRM at `/admin/crm-dashboard`:
+
+```
+src/database/init.ts            -- 5 new tables: crm_contacts, crm_threads,
+                                   crm_messages, crm_actions, crm_outbox
+src/services/crm-service.ts     -- ingestion (idempotent), contact resolution,
+                                   status/notes/assignee, outbox queue
+src/services/email-service.ts   -- sendRaw() with In-Reply-To threading + cc
+src/routes/crm.ts               -- 14 endpoints (summary/contacts/threads,
+                                   ingest/status/assignee/notes/send,
+                                   outbox pending+result)
+src/public/admin-crm.html       -- 554-line three-tab UI (Innkommende /
+                                   System / Marketing) + "Ukjent" triage,
+                                   thread timeline, compose-with-draft
+                                   (Gmail) or send-now (Resend) toggle
+```
+
+Schema highlights:
+
+- `crm_contacts.type IN ('producer','marketing','vendor','unknown')` with a `UNIQUE` index on email so re-ingestion is a no-op.
+- `crm_threads.status IN ('new','in_progress','awaiting_review','done','archived')` and `assigned_to IN ('unassigned','claude','daniel')` so the dashboard can filter by who needs to act next.
+- `crm_outbox` queues sends in two intents: `gmail_draft` (the customer-service agent reads the queue, drafts via the Gmail MCP, reports back) or `resend_send` (server-side SMTP via Resend, no agent loop). Both record `result_id` and `error` for audit.
+- `crm_actions` is an append-only audit log keyed by `actor IN ('claude','daniel','system')`.
+
+Feature-flagged via `CRM_ENABLED` env var (default on; set to `0` to disable). Commit: `29f5209`.
+
+Pair this with the customer-service agent prompt (`/A2A/scheduled-agents/rfb-customer-service.md`) which polls `crm_outbox` for pending `gmail_draft` rows, calls Gmail MCP `create_draft`, and writes the result back via `POST /api/crm/outbox/:id/result`. The dashboard auto-refreshes; humans see drafts ready to review.
+
 
 ---
 
@@ -1152,6 +1258,93 @@ export function redactPii(text: string): string {
 ```
 
 **Test with the opposite case too.** 33 test cases in `tests/test.ts` cover (a) known PII → redacted and (b) known false-positive candidates (ISO dates, postal codes, org numbers, SKUs, coordinates, URLs) → pass through unchanged. Add `"test": "tsx tests/test.ts"` to `package.json`. Commits: `2d97da4`, `4135e30`.
+
+
+
+### 8.4 Rotate API Keys + `.gitignore` Hardening (After a Data Leak)
+
+If you ever discover the SQLite file is checked into git — even briefly — the `api_key` column for every agent in that snapshot is permanently public. Two changes to plug it:
+
+1. **Untrack the data + ignore future commits.**
+
+```gitignore
+# Build output (never belongs in git)
+dist/
+
+# SQLite databases — production data lives in Fly volume, never in repo
+data/*.db
+data/*.db-journal
+data/*.db-wal
+data/*.db-shm
+
+# Environment / secrets
+.env
+.env.*
+!.env.example
+
+# Local credential files (sandbox-only; never commit)
+.fly-token
+.gh-pat
+*.key
+*.pem
+```
+
+```bash
+git rm --cached data/lokal.db
+git rm -rf --cached dist/
+```
+
+2. **Rotate keys for all agents that existed in the leaked snapshot.** Add an admin endpoint:
+
+```http
+POST /api/marketplace/admin/rotate-keys
+X-Admin-Key: ...
+{ "cutoff": "2026-03-31", "dryRun": true }
+```
+
+`dryRun:true` returns the count of candidate rows; `dryRun:false` writes new `api_key`s. Built to invalidate the 370 keys leaked in `data/lokal.db` (March seed batch), but reusable for future events.
+
+Commit: `8cf5bfc`. Note: the historical commits still contain the snapshot — that's a separate cleanup with `git filter-repo`. The .gitignore + key rotation stops the bleed; the filter-repo erases the receipt.
+
+### 8.5 Producer Opt-Out — `agent_blocklist`
+
+GDPR removal requests and "fjern" replies were silently re-inserted by the daily discovery agent on the next pass through lokalmat.no/Facebook. Without a blocklist the same producer comes back ~24 h later and the user gets re-emailed.
+
+Schema:
+
+```sql
+CREATE TABLE IF NOT EXISTS agent_blocklist (
+  id INTEGER PRIMARY KEY,
+  identifier_type TEXT CHECK(identifier_type IN ('website_domain','email_domain','name_normalized','agent_id')),
+  identifier_value TEXT NOT NULL,
+  reason TEXT,
+  source_email TEXT,
+  original_agent_id TEXT,
+  original_agent_name TEXT,
+  created_at TEXT DEFAULT (datetime('now')),
+  UNIQUE(identifier_type, identifier_value)
+);
+```
+
+Service: `src/services/blocklist-service.ts` — `isBlocked()`, `add()`, `list()`, `remove()`. `normalizeDomain()` handles bare-domain / URL / email inputs; `normalizeName()` reuses the slugify rules so a blocked "Øvre-Eide Gård" matches a re-discovered "ovre-eide gard". **Fail-open on query errors** — the blocklist itself can never DoS the registry.
+
+Wired into four insert paths:
+
+- `ensureAgentInDb()` (FK-sync, used by claims + discovery)
+- `POST /register` (public — returns `403` quietly)
+- `POST /admin/register` (discovery agent's auto-register — returns `409`)
+- `DELETE /agents/:id` with body `{ addToBlocklist: true }` or `?addToBlocklist=1` — auto-records identifiers from the deleted row before INSERT
+
+Match strategy: domain + normalized name **by default**. A single opt-out reply typically inserts 2–3 rows (`website_domain`, `email_domain`, `name_normalized`) so re-discovery hits the block whether the source surfaces them by name OR by URL.
+
+Admin endpoints (X-Admin-Key required):
+```
+GET    /api/marketplace/admin/blocklist?limit&offset
+POST   /api/marketplace/admin/blocklist
+DELETE /api/marketplace/admin/blocklist/:id
+```
+
+Commit: `81b7823`. First customer: Øvre-Eide Gård (replied "fjern" 2026-04-25). Workflow: DELETE the agent row with `addToBlocklist: true`, identifiers auto-recorded, future discovery passes silently skip.
 
 
 ---
@@ -1470,6 +1663,31 @@ if (place?.rating) {
 **Coverage impact:** Google rating was stuck at 2.5% because sandbox-based scrapers kept tripping Google's bot protection. With the Places API proxy live, the enrichment agent can attempt ratings on every producer without scraping — targeting 50%+ coverage as the Tier 2 pipeline catches up.
 
 
+
+### 11.8 Wire Google Rating Into Trust Score
+
+We were collecting `google_rating` + `google_review_count` for ~90% of agents (Phase 11.7) but the trust-score `communitySignal()` returned a hardcoded `0.3` for everyone. Three coupled fixes:
+
+1. **`trust-score-service.ts`** — `communitySignal()` reads `agent_knowledge.google_rating` + `google_review_count`. Formula: rating normalized 1–5 → 0–1, blended with a 0.5 prior when review-count is low (volume guard so a single 5-star review can't max the score). No rating in DB stays at 0.3 neutral — unrated agents aren't penalised.
+2. **`knowledge-service.ts`** — `getAgentInfo()` exposes `googleRating` + `googleReviewCount` as top-level fields alongside the existing `k.ratings.google.{score,reviews}` shape. Backwards compatible. Unblocks `seo.ts` which already read `k.googleRating` and was getting `undefined`.
+3. **`marketplace.ts`** vCard endpoint — was reading `k.ratings.google.rating` and `.reviewCount`, but the service produces `.score` and `.reviews`. Fixed key names so `/agents/:id/card` actually returns `googleRating`.
+
+Effect on existing top agent (Homme Gard, 4.7 / 22 reviews): community 0.30 → 0.925, total trust 0.855 → ~0.92. Theoretical max trust now reaches 1.0 (was capped at 0.93).
+
+Test pattern that surfaced this: 6 unit tests in `tests/test.ts` using an in-memory SQLite + a `__setDbForTesting()` escape hatch in `init.ts`. Cover: no-rating neutral baseline, Homme-like (4.7/22), single-review volume guard, 5.0/20+ ceiling, low-rating penalty, full max-everything ≥ 0.99.
+
+Post-deploy assertions:
+
+```bash
+curl -s https://rettfrabonden.com/produsent/homme-gard-ovrebo \
+  | grep -o aggregateRating          # was missing, should appear
+curl -s https://rettfrabonden.com/api/marketplace/agents/<id>/trust \
+  | python3 -c '...; print(d["community"]["value"])'   # was 0.3, should be ~0.925
+```
+
+Commit: `6c11d5e`. Lesson: **explicit column-list mismatches between writer and reader silently degrade signal across half the pipeline.** Write a top-level passthrough field in addition to the nested shape, and you stop rewarding readers for guessing the schema.
+
+
 ---
 
 <a id="phase-12"></a>
@@ -1636,6 +1854,53 @@ Allow: /
 ```
 
 **4. Classify them in analytics.** Before this change NotHumanSearch alone was ~130 pageviews / 7 days that analytics was not attributing to any AI source. Add the UA tokens to `parseUserAgent()` and count them in the `other` bucket of the `agentTraffic` summary. (Commit `819577f`.)
+
+
+### 12.7 Slug Single-Source-of-Truth + `canonicalUrl`
+
+Around 53% of agent cards (627 / 1187 on 2026-04-25) were returning æøå-encoded `/produsent/` URLs that 400'd at the CDN. Symptom: a Norwegian crawler hits the agent-card, follows the URL, gets `400 Bad Request`. Root cause: four call sites each reinvented their own slug logic (`discovery.ts`, `mcp.ts`, `seo.ts`, `conversation-service.ts`), some preserving Unicode, some not, two of them falling back to UUIDs when slugify failed.
+
+Fix in two parts:
+
+**Part 1 — Single source of truth (`src/utils/slug.ts`)**
+
+```typescript
+// One canonical slugify with æøå → aoa, no UUID fallbacks
+export function producerSlug(name: string): string { /* ... */ }
+export function producerUrl(name: string): string {
+  return `/produsent/${producerSlug(name)}`;
+}
+```
+
+Then refactor the four call sites to import from `slug.ts` instead of rolling their own. Commit: `19c655d`. Two more UUID-as-URL landmines fixed in `0219c25`.
+
+**Part 2 — `canonicalUrl` field on agent cards + llms-full**
+
+Don't make consumers re-slugify. Stamp the canonical URL on the resource itself:
+
+```json
+// /agents/:id (agent-card)
+{
+  "id": "...",
+  "name": "Homme Gard, Øvrebø",
+  "canonicalUrl": "https://rettfrabonden.com/produsent/homme-gard-ovrebo"
+}
+```
+
+Same field added to every entry in `/llms-full.txt`. Commits: `a5f4623` (agent-card), `a62ffc0` (llms-full).
+
+Post-deploy verification:
+
+```bash
+# Sample 50 random agent IDs and curl each canonical URL — every one must 200
+curl -s 'https://rettfrabonden.com/api/marketplace/agents?limit=50&offset=0' \
+  | jq -r '.agents[] | .canonicalUrl' \
+  | xargs -I {} curl -s -o /dev/null -w "%{http_code} {}\n" {} \
+  | grep -v ^200
+```
+
+Lesson: **any URL that the spec exposes to a third-party client should be a stamped field, not a derived value.** Crawlers will re-slugify your name and 400 themselves; they will not re-slugify a `canonicalUrl` you handed them.
+
 
 ---
 
@@ -1860,6 +2125,52 @@ Scheduled agents need a GitHub PAT to push code changes:
 3. Save to `.gh-pat` file in workspace (add to .gitignore)
 4. Agent reads PAT → pushes → scrubs URL
 
+
+### 16.4 GitHub-Actions Auto-Deploy (Replaces Local `flyctl`)
+
+Local `fly deploy` from a Windows host is blocked by Application Control policy (WDAC/AppLocker). For most of the project we worked around that with sandbox-side `flyctl deploy --remote-only` using a long-lived deploy token, but that put deploy ownership inside individual scheduled-agent runs (which can fail, time out, or rotate tokens). Better model: **let `git push` deploy.**
+
+```yaml
+# .github/workflows/fly-deploy.yml
+name: Fly Deploy
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    concurrency:
+      group: fly-deploy-main
+      cancel-in-progress: false   # don't abort a running deploy on a new push
+    steps:
+      - uses: actions/checkout@v4
+      - uses: superfly/flyctl-actions/setup-flyctl@master
+      - run: flyctl deploy --remote-only
+        env:
+          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
+      - name: Smoke test
+        run: |
+          sleep 10
+          curl -sf -o /dev/null -w "%{http_code}\n" https://rettfrabonden.com/healthz \
+            || curl -sf -o /dev/null -w "%{http_code}\n" https://rettfrabonden.com/
+```
+
+One-time setup:
+
+1. `fly tokens create deploy -a lokal -x 999999h` (or scope "Deploy tokens" at fly.io/apps/lokal/tokens)
+2. GitHub → Settings → Secrets and variables → Actions → New secret → `FLY_API_TOKEN`
+3. Done. Every `git push origin main` (or manual trigger via Actions tab) deploys.
+
+Commit: `15a4a5d`. Process implications:
+
+- **Sub-agents commit and push only.** They never call `flyctl`. The supervisor stops being the deploy choke-point too — review + Probe 3 + rollback are still its job, but the deploy itself happens automatically on push.
+- **Concurrency `cancel-in-progress: false`.** Two pushes in a row queue rather than racing — important when the supervisor lands a 5-commit batch one push at a time.
+- **Smoke test in the workflow itself.** Saves a round-trip; a failed deploy goes red before any human looks at it.
+
+This is now the "deploy model" referenced throughout this guide. Older sections that say *"the supervisor deploys"* are kept for context, but on every push the GH Action wins the race and the supervisor's job collapses to verification + rollback.
+
+
 ---
 
 <a id="phase-17"></a>
@@ -1942,6 +2253,65 @@ router.get("/", (_req, res) => {
 ```
 
 This is the pattern to follow for *any* protocol endpoint: the "wrong verb" should return something useful (card, manifest, or docs), not 404. Commit: `98dd4cf`.
+
+
+### 17.5 `AgentCard.url` Must Point at the JSON-RPC Endpoint, not the Homepage
+
+`a2aregistry.org`'s maintainer reported `404 Not Found when sending messages` on 2026-04-25. Root cause: our `AgentCard.url` was the homepage `https://rettfrabonden.com/`. Compliant clients POST their JSON-RPC envelope to whatever URL is in `card.url`, so they were hitting the SSR HTML 404 instead of `/a2a`.
+
+```typescript
+// src/services/marketplace-registry.ts
+const card = {
+  protocolVersion: "0.3.0",
+  url: `${BASE_URL}/a2a`,    // not BASE_URL — the JSON-RPC endpoint
+  // ...
+};
+```
+
+Plus a backward-compat alias for older clients (<0.3 of the spec used `tasks/send` instead of `message/send`):
+
+```typescript
+// src/routes/a2a.ts
+case "tasks/send":      // backward-compat alias
+case "message/send":
+  return handleMessageSend(...);
+```
+
+Commit: `1f6c7bb`. Same commit also adds the Dockerfile cache-bust pattern (Appendix C.32) — three weeks of accumulated source changes had been ghost-deploying because Fly's remote builder was reusing a stale `COPY src/` layer.
+
+### 17.6 Tolerate `parts` Discriminator Drift (`type` → `kind` → bare)
+
+Conversations from A2A clients were rendering as raw JSON envelopes:
+
+```
+«{"message":{"role":"user","parts":[{"text":"honning"}]}}»
+```
+
+`extractText()` required `parts[i].type === 'text'`, but the A2A spec changed the discriminator from `type` → `kind` in v0.2 and many clients drop it entirely. With no match, the function returned `null`, the caller fell through to `JSON.stringify(params)`, and the entire envelope got recorded as `conversations.query_text`.
+
+Fix: accept any part with a non-empty `.text` field. If `type` or `kind` is present, it must equal `"text"`; if either is absent, accept it.
+
+```typescript
+const textPart = msg.parts.find((p: any) => {
+  if (!p || typeof p.text !== "string" || !p.text) return false;
+  if (p.type !== undefined && p.type !== "text") return false;
+  if (p.kind !== undefined && p.kind !== "text") return false;
+  return true;
+});
+```
+
+Spec versions seen in the wild:
+
+| Shape                                 | Version       |
+|---------------------------------------|---------------|
+| `{ type: "text", text: "..." }`       | v0.1 legacy   |
+| `{ kind: "text", text: "..." }`       | v0.2+ current |
+| `{ text: "..." }`                     | liberal       |
+| `"honning"`                           | bare string   |
+| `{ text: "honning" }` (no parts)      | flat          |
+
+Commit: `71f3a81`. Old conversations with malformed `query_text` still sit in the DB; the fix only stops new ones from being recorded that way.
+
 
 ---
 
@@ -2061,6 +2431,39 @@ Post-deploy:
 29. **MCP tool descriptions determine whether the model calls you at all** — ChatGPT will happily hallucinate prices from training data if the tool description doesn't explicitly tell it *when* to call. Use imperative ALL-CAPS (*"ALWAYS call ... for product/price questions"*) and describe the payload shape (*"returns products[] with parsed prices"*) so the model knows it can answer price questions from tool output. Also return the **full** product list for 1–3-hit searches so ChatGPT sees the catalogue, not a 5-item summary. Commits: `218d44f`, `4306b5a`. See Phase 3.5.
 
 30. **PII leaks through render paths long after you add a filter elsewhere** — We had a render-time filter on `/samtaler` HTML but `/api/interactions` and `/api/conversations` still returned raw query text. A scan surfaced `skf@hjortegarden.no` sitting unredacted in the JSON API a week later. Rule: **every publicly-exposed surface that renders user input needs the filter — not only the HTML renderers.** Enumerate the surfaces explicitly in a test. Commits: `2d97da4`, `4135e30`. See Phase 8.3.
+
+31. **`nul` (and other Windows-reserved device names) blocks `git pull` on Windows** — A prior sandbox session redirected stderr to a file literally named `nul` (instead of `/dev/null`), and the file got committed. On Windows, `nul/con/prn/aux/com[1-9]/lpt[1-9]` are reserved device names and cannot exist as regular files, so `git pull` fails with `error: invalid path nul` and the working tree is left in a broken state. Add all of them to `.gitignore` defensively, and **always use `2>/dev/null` not `2>nul` in cross-platform sandbox scripts.** Commit: `cab345c`.
+
+32. **Fly's remote-builder cached `COPY src/` for ~3 weeks of "ghost" deploys** — `fly deploy` reported success, the new image went live, but the running code was unchanged. Caught only because a self-described count (`1,400+`) kept appearing in prod days after the source had been changed to `1,150+`. Root cause: Fly's remote builder reuses Docker layer cache aggressively, and `COPY src/ ./src/` only invalidates when one of those files' content changes — but if you're tweaking the same line repeatedly, Fly may judge the layer "equivalent." Fix: add a build-time cache-bust:
+   ```dockerfile
+   ARG BUILD_REV=dev
+   LABEL build_rev=$BUILD_REV
+   RUN echo "build_rev=$BUILD_REV" > /app/.build-rev
+   # ... then COPY src/
+   ```
+   And always pass `--build-arg BUILD_REV=$(git rev-parse HEAD)` on deploy. The `LABEL` is queryable via `flyctl image show` so you can verify in <5s which commit is actually running. Commit: `1f6c7bb`. Lesson: **layer cache is correctness-impacting state, not just performance state — make it observable.**
+
+33. **A2A `AgentCard.url` is the JSON-RPC endpoint, not the homepage** — Compliant clients POST the JSON-RPC envelope to whatever URL the card advertises. With `url` pointing at `/`, every `message/send` returned the SSR HTML 404. The maintainer of `a2aregistry.org` flagged this in writing on 2026-04-25 — a real-world symptom of letting "url" stay ambiguous. Always explicit-test `POST <card.url>` after every card change, not just `GET <card.url>`. Commit: `1f6c7bb`. See Phase 17.5.
+
+34. **A2A `parts[]` discriminator drifted across spec versions** — v0.1 used `type:"text"`, v0.2 changed to `kind:"text"`, and many real clients drop the discriminator entirely. A strict-equality check on `type === "text"` produces an empty extractor, the caller falls through to `JSON.stringify(envelope)`, and the entire JSON-RPC envelope ends up in `conversations.query_text`. Accept *any* part with a non-empty `.text` and only reject if `type`/`kind` is *present and not "text"*. Commit: `71f3a81`. See Phase 17.6.
+
+35. **`data/lokal.db` was tracked in git for 27 days, leaking 370 API keys** — SQLite's "single file" virtue makes accidental `git add .` catastrophic in a public repo. Three things to do, in order: (a) untrack the file (`git rm --cached`) and add `data/*.db` to `.gitignore`; (b) ship a `POST /admin/rotate-keys` endpoint with a `cutoff` date so you can invalidate exactly the leaked snapshot; (c) `git filter-repo` the historical commits separately. Don't skip (b) — until keys rotate, the leak is still live in any clone. Commit: `8cf5bfc`. See Phase 8.4.
+
+36. **`communitySignal()` returned a hardcoded 0.3 while we collected ratings for 90% of agents** — The trust-score module's community signal was scaffolded as a placeholder ("Phase 3: will use ratings, repeat buyers, external reviews — for now, return 0.3"). The ratings landed in `agent_knowledge.google_rating` weeks later, but the placeholder shipped. Effect: trust score capped at 0.93 instead of 1.0; top-rated producers ranked the same as unrated ones. Watch your placeholders — they have a way of becoming permanent. Commit: `6c11d5e`. See Phase 11.8.
+
+37. **Reader/writer schema drift between `getKnowledge()` and the rest of the codebase** — `buildRatings()` produced `k.ratings.google.score`, the vCard endpoint read `k.ratings.google.rating`, and `seo.ts` read `k.googleRating` (top-level). Three names for the same field; two of three readers got `undefined`. Lesson: when you have a field consumers commonly need, **expose it both as a top-level passthrough and inside any nested shape.** The tests should assert *every* reader gets the same value. Commit: `6c11d5e`.
+
+38. **Owner-traffic UA matches must be case-insensitive** — Our scheduled `RFB-ContactVerifier` agent was tagged as human in analytics because the owner-tagger lowercased the haystack but compared to a CamelCase needle. Two minutes of dashboard pollution per day, but it skewed every "real human" stat we computed. Always `userAgent.toLowerCase().includes(needle.toLowerCase())` (or normalise both sides up front). Commit: `a6acccb`.
+
+39. **`/produsent/<slug>` 53% æøå-encoded URLs in agent cards because slugify logic was reinvented in 4 places** — `discovery.ts`, `mcp.ts`, `seo.ts`, and `conversation-service.ts` each had their own slug helper. Two preserved Unicode, two fell back to UUIDs when slugify failed. Result: 627 of 1187 cards advertised an æøå-encoded URL that returned `400 Bad Request` at the CDN. Fix: one `producerSlug()` in `src/utils/slug.ts`, every call site imports from it, and the canonical URL gets stamped on the resource itself as `canonicalUrl` so clients don't re-slugify. Commits: `19c655d`, `a5f4623`, `a62ffc0`. See Phase 12.7.
+
+40. **AI engines invent `/produsent/<slug>` URLs by slugifying the producer name they read elsewhere** — Perplexity, ChatGPT, and Claude often guess URLs rather than follow ones we provide. They strip locality suffixes, so they hit `/produsent/bondens-marked-grunerlokka` instead of the real `/produsent/bondens-marked-birkelunden-grunerlokka`. A naïve 404 there is dead AI traffic. Add a token-subset matcher: unique subset → 301 to canonical, multiple matches → 404 body with "Mente du?" cards (still 404 status, never soft-200). Commit: `78c025d`. See Phase 5.7.
+
+41. **Discovery silently re-inserts opted-out producers within 24 h unless you have a blocklist** — A producer replies "fjern" to outreach, you `DELETE /agents/:id`, and the next discovery sweep through lokalmat.no/Facebook re-creates the same row with a new UUID. They get re-emailed. You ship an apology. Plug it with `agent_blocklist` checked at every insert path (public register, admin register, FK-sync). Block on multiple identifiers (domain, email-domain, normalized name) so re-discovery via either source surface hits the block. Commit: `81b7823`. See Phase 8.5.
+
+42. **`name`-based search needs to look up actual DB names, not just match indicator words** — "Rørosmat" alone returned 0 results because the parser only triggered the name-search path when an indicator word (`gård`, `bakeri`, etc.) was present. Two-pass parser: pass 1 extracts name-from-context if an indicator is present; pass 2 checks if any query word matches an actual agent name in the DB (excluding pure food terms like "ost", "kjøtt" to avoid false positives). Plus: don't over-filter agents with an empty product list — keep them if their *category* matches the query, since they may simply not be enriched yet. Commit: `b6773f3`.
+
+43. **Schema.org `Product` validation in Google Search Console** — GSC flagged "Invalid Product" / "Missing field 'offers'" / "Either 'review', 'aggregateRating', or 'offers' should be specified" on every producer page. Three rules: (a) every `Product` needs an `offers.{availability,priceCurrency,price}` block, even when price is unknown — use `availability: "https://schema.org/InStock"` and `price: "0"` rather than dropping the field; (b) `aggregateRating` only renders when you have ≥1 review; conditionally include it; (c) put `Product[]` inside `mainEntity` of a `WebPage`, not as a top-level node, so GSC parses the page correctly. Commit: `47a0114`.
 
 ### C.2 Architecture Decisions
 
@@ -2242,8 +2645,10 @@ to build the same platform for a different vertical.
 | 2026-04-22 | 5, 7, 12 | Per-city context paragraph grounded in live registry data (5.5). `avgTimeOnSite` computed from session spans instead of hardcoded 0 (7.6). `/.well-known/ai-plugin.json` + `/api` JSON index (+35 pts on NotHumanSearch agentic-readiness) (12.6). NotHumanSearch + DuckDuckBot classified in analytics and welcomed in robots.txt. Stale "1400+" count purged from `/teknologi` and server-card fallback. |
 | 2026-04-23 | 12, C | `/.well-known/mcp-server.json` hyphenated alias added to discovery endpoints (12.1). Remaining "1,400+" literal purged from AI-facing metadata (agent-readiness copy, agent-discovery middleware, llms.txt home/about). README and MCP registry description reduced to safe under-claim ("1,100+"). `/samtaler` double-brand `<title>` fix. Appendix C: gotchas C.19 (hardcoded counts drift across self-describing files), C.21 (double-brand title). |
 | 2026-04-24 | 3, 5, 7, 8, 11, C | MCP tool descriptions + name-based search with Norwegian Unicode fix (3.5, 3.6). Price normalization at save time across MCP/A2A/auto-response (3.7). `og:image` + `twitter:card summary_large_image` in base SEO shell (5.6). Search-engine crawler UA classifier (7.7). Single-char query filter (7.8). Over-max `limit` clamped via `z.catch(100)` instead of 400 (7.9). Render-time PII filter for conversation pages + `/api/interactions` + `/api/conversations` (8.3). Server-side Google Places rating admin endpoints (11.7). Appendix C: C.22 (SQLite `LOWER()` ASCII-only), C.23 (prices in names → normalize at save), C.24 (auto-expand overwrites exact matches), C.25 (`_nameQuery` stripped by Zod), C.26 (crawlers skip `Referer`), C.27 (keystroke pollution), C.28 (ZodError 400 noise), C.29 (tool descriptions shape LLM behaviour), C.30 (PII filter must cover every render surface). |
+| 2026-04-25 | 5, 7, 8, 11, 12, 16, 17, C | Smart fallback for `/produsent/<slug>` 404s (5.7). HTTP-status + AI-bot producer outcomes analytics (7.10). Enheter device parsing, dynamic bot naming, owner UX, Samtaler panel (7.11). Rotate-keys admin endpoint + .gitignore for `data/dist` after key leak (8.4). `agent_blocklist` table + opt-out gate (8.5). Wire `googleRating` into `communitySignal()` (11.8). Slug single-source-of-truth + `canonicalUrl` field (12.7). GitHub-Actions auto-deploy replaces local `flyctl` (16.4). `AgentCard.url` at `/a2a` JSON-RPC endpoint + `tasks/send` backward-compat alias + Dockerfile `BUILD_REV` cache-bust (17.5). Tolerant A2A `parts[]` extractor (17.6). Smart name-search without indicator words. Google Search Console structured-data fixes. Appendix C: C.31 (`nul` blocks Windows pull), C.32 (Fly cache-bust), C.33 (`AgentCard.url` = endpoint), C.34 (parts discriminator drift), C.35 (data file leak), C.36 (placeholder community signal), C.37 (reader/writer schema drift), C.38 (case-insensitive owner UA), C.39 (slug logic reinvented 4×), C.40 (AI engines invent slugs), C.41 (discovery re-inserts opted-out), C.42 (name-search needs DB lookup), C.43 (`Product` schema). |
+| 2026-04-26 | 5, 7, 17 | Static-page SEO meta on `/selger` + `/app`, `noindex` on admin pages (5.8). Inbox CRM dashboard at `/admin/crm-dashboard` with 5 new tables, 14 endpoints, single-file 554-line UI (7.12). Unify stale fallback counts (`1,400+` → `1,150+`) + add `repository` field to MCP server card. |
 
 ---
 
-*Last updated: 2026-04-24 (14:00 CEST) by rfb-guidebook agent*
-*Guide version: 1.2.0*
+*Last updated: 2026-04-26 (14:00 CEST) by rfb-guidebook agent*
+*Guide version: 1.3.0*
