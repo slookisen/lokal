@@ -57,45 +57,91 @@ class CrmService {
    *  - If domain ∈ VENDOR_DOMAINS → 'vendor'
    *  - Else 'unknown' (Daniel can re-classify later)
    */
+  /**
+   * Classify an email against the agents table. Used both at create-time
+   * and to re-evaluate existing 'unknown' contacts after agents are added/edited.
+   *
+   * Priority:
+   *   1. Exact match on agents.contact_email (highest confidence)
+   *   2. Domain match on agents.contact_email
+   *   3. Vendor allowlist
+   *   4. unknown
+   */
+  classifyEmail(email: string): { type: ContactType; agentId: string | null } {
+    const db = getDb();
+    const lowerEmail = email.trim().toLowerCase();
+    const domain = lowerEmail.split("@")[1] ?? "";
+
+    // 1. Exact match
+    const exact = db
+      .prepare("SELECT id FROM agents WHERE LOWER(contact_email) = ? AND is_active = 1 LIMIT 1")
+      .get(lowerEmail) as { id: string } | undefined;
+    if (exact) return { type: "producer", agentId: exact.id };
+
+    // 2. Domain match (skip generic freemail domains so we don't false-positive)
+    const FREEMAIL = new Set(["gmail.com", "outlook.com", "hotmail.com", "yahoo.com", "live.com", "icloud.com", "online.no", "broadpark.no"]);
+    if (domain && !FREEMAIL.has(domain)) {
+      const byDomain = db
+        .prepare("SELECT id FROM agents WHERE LOWER(contact_email) LIKE ? AND is_active = 1 LIMIT 1")
+        .get(`%@${domain}`) as { id: string } | undefined;
+      if (byDomain) return { type: "producer", agentId: byDomain.id };
+    }
+
+    // 3. Vendor allowlist
+    if (VENDOR_DOMAINS.has(domain)) return { type: "vendor", agentId: null };
+
+    return { type: "unknown", agentId: null };
+  }
+
   resolveContact(email: string, hintName?: string | null): { id: string; created: boolean } {
     const db = getDb();
     const lowerEmail = email.trim().toLowerCase();
     const domain = lowerEmail.split("@")[1] ?? "";
 
     const existing = db
-      .prepare("SELECT id FROM crm_contacts WHERE email = ?")
-      .get(lowerEmail) as { id: string } | undefined;
+      .prepare("SELECT id, type, agent_id FROM crm_contacts WHERE email = ?")
+      .get(lowerEmail) as { id: string; type: ContactType; agent_id: string | null } | undefined;
 
     if (existing) {
+      // Re-evaluate type if currently 'unknown' (cheap, one indexed lookup)
+      if (existing.type === "unknown") {
+        const c = this.classifyEmail(lowerEmail);
+        if (c.type !== "unknown") {
+          db.prepare("UPDATE crm_contacts SET type = ?, agent_id = ?, last_seen_at = datetime('now') WHERE id = ?")
+            .run(c.type, c.agentId, existing.id);
+          return { id: existing.id, created: false };
+        }
+      }
       db.prepare("UPDATE crm_contacts SET last_seen_at = datetime('now') WHERE id = ?").run(existing.id);
       return { id: existing.id, created: false };
     }
 
-    // Classify
-    let type: ContactType = "unknown";
-    let agentId: string | null = null;
-
-    // Try producer match: domain → agents.contact_email domain
-    if (domain) {
-      const producerByDomain = db
-        .prepare("SELECT id FROM agents WHERE LOWER(contact_email) LIKE ? AND is_active = 1 LIMIT 1")
-        .get(`%@${domain}`) as { id: string } | undefined;
-
-      if (producerByDomain) {
-        type = "producer";
-        agentId = producerByDomain.id;
-      } else if (VENDOR_DOMAINS.has(domain)) {
-        type = "vendor";
-      }
-    }
-
+    const c = this.classifyEmail(lowerEmail);
     const id = randomUUID();
     db.prepare(`
       INSERT INTO crm_contacts (id, type, agent_id, email, name, domain)
       VALUES (?, ?, ?, ?, ?, ?)
-    `).run(id, type, agentId, lowerEmail, hintName ?? null, domain || null);
+    `).run(id, c.type, c.agentId, lowerEmail, hintName ?? null, domain || null);
 
     return { id, created: true };
+  }
+
+  /**
+   * Bulk re-classify all 'unknown' contacts. Used after seeding new agents
+   * or when admin notices misclassifications.
+   */
+  reclassifyUnknown(): { evaluated: number; reclassified: number } {
+    const db = getDb();
+    const rows = db.prepare("SELECT id, email FROM crm_contacts WHERE type = 'unknown'").all() as Array<{ id: string; email: string }>;
+    let reclassified = 0;
+    for (const r of rows) {
+      const c = this.classifyEmail(r.email);
+      if (c.type !== "unknown") {
+        db.prepare("UPDATE crm_contacts SET type = ?, agent_id = ? WHERE id = ?").run(c.type, c.agentId, r.id);
+        reclassified++;
+      }
+    }
+    return { evaluated: rows.length, reclassified };
   }
 
   setContactType(contactId: string, type: ContactType, agentId?: string | null): void {

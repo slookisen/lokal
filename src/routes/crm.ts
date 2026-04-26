@@ -300,4 +300,13 @@ router.post("/outbox/:id/result", (req, res) => {
   res.json({ success: true });
 });
 
+
+// ─── POST /admin/crm/contacts/reclassify-unknown ─────────────
+// Re-evaluate all 'unknown' contacts against current agents table.
+// Useful after seeding new producers or fixing email typos.
+router.post("/contacts/reclassify-unknown", (_req, res) => {
+  const result = crmService.reclassifyUnknown();
+  res.json(result);
+});
+
 export default router;

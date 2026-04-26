@@ -421,6 +421,7 @@ async function selectThread(id) {
               <option value="done">Ferdig</option>
               <option value="archived">Arkivert</option>
             </select>
+            ${t.status !== 'done' && t.status !== 'archived' ? `<button class="btn-secondary" data-action="markDone" data-id="${t.id}" title="Sett ferdig">✓ Ferdig</button>` : ''}
             <select class="select" data-action="setAssignee" data-id="${t.id}">
               <option value="">Tildelt: ${t.assigned_to}</option>
               <option value="claude">Claude</option>
@@ -551,6 +552,7 @@ function slugify(s) {
 // ─── Event delegation (CSP-safe — no inline handlers) ───
 const ACTIONS = {
   login, logout, refresh,
+  markDone: id => setThreadStatus(id, 'done'),
   search: onSearchChange,
   selectContact: id => selectContact(id),
   selectThread: id => selectThread(id),
