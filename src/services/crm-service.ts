@@ -57,6 +57,17 @@ class CrmService {
    *  - If domain ∈ VENDOR_DOMAINS → 'vendor'
    *  - Else 'unknown' (Daniel can re-classify later)
    */
+
+  private matchesVendorDomain(domain: string): boolean {
+    if (!domain) return false;
+    if (VENDOR_DOMAINS.has(domain)) return true;
+    // Check if any vendor domain is a suffix (e.g. accounts.google.com → google.com)
+    for (const v of VENDOR_DOMAINS) {
+      if (domain.endsWith("." + v)) return true;
+    }
+    return false;
+  }
+
   /**
    * Classify an email against the agents table. Used both at create-time
    * and to re-evaluate existing 'unknown' contacts after agents are added/edited.
@@ -87,8 +98,8 @@ class CrmService {
       if (byDomain) return { type: "producer", agentId: byDomain.id };
     }
 
-    // 3. Vendor allowlist
-    if (VENDOR_DOMAINS.has(domain)) return { type: "vendor", agentId: null };
+    // 3. Vendor allowlist (exact OR subdomain match)
+    if (this.matchesVendorDomain(domain)) return { type: "vendor", agentId: null };
 
     return { type: "unknown", agentId: null };
   }
