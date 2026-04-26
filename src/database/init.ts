@@ -413,6 +413,108 @@ function initSchema(db: Database.Database): void {
     CREATE INDEX IF NOT EXISTS idx_analytics_agent_views_agent ON analytics_agent_views(agent_id);
   `);
 
+  // ════════════════════════════════════════════════════════════
+  // CRM: contacts, threads, messages, actions, outbox
+  // Inbox-CRM for customer-service workflow.
+  // Producer threads link to agents.id; vendor/marketing threads
+  // are stand-alone contacts.
+  // ════════════════════════════════════════════════════════════
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS crm_contacts (
+      id TEXT PRIMARY KEY,
+      type TEXT NOT NULL CHECK(type IN ('producer','marketing','vendor','unknown')),
+      agent_id TEXT REFERENCES agents(id) ON DELETE SET NULL,
+      email TEXT NOT NULL,
+      name TEXT,
+      domain TEXT,
+      organization TEXT,
+      notes TEXT,
+      status TEXT DEFAULT 'active' CHECK(status IN ('active','blocked','archived')),
+      first_seen_at TEXT DEFAULT (datetime('now')),
+      last_seen_at TEXT DEFAULT (datetime('now')),
+      metadata TEXT DEFAULT '{}'
+    );
+    CREATE INDEX IF NOT EXISTS idx_crm_contacts_email ON crm_contacts(email);
+    CREATE INDEX IF NOT EXISTS idx_crm_contacts_type ON crm_contacts(type);
+    CREATE INDEX IF NOT EXISTS idx_crm_contacts_agent ON crm_contacts(agent_id);
+    CREATE INDEX IF NOT EXISTS idx_crm_contacts_domain ON crm_contacts(domain);
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_crm_contacts_email_unique ON crm_contacts(email);
+
+    CREATE TABLE IF NOT EXISTS crm_threads (
+      id TEXT PRIMARY KEY,
+      contact_id TEXT NOT NULL REFERENCES crm_contacts(id) ON DELETE CASCADE,
+      subject TEXT,
+      status TEXT DEFAULT 'new' CHECK(status IN ('new','in_progress','awaiting_review','done','archived')),
+      assigned_to TEXT DEFAULT 'unassigned' CHECK(assigned_to IN ('unassigned','claude','daniel')),
+      category TEXT CHECK(category IN ('innkommende','system','marketing','leverandor','unknown')),
+      severity TEXT DEFAULT 'normal' CHECK(severity IN ('p0','p1','p2','normal')),
+      message_count INTEGER DEFAULT 0,
+      last_message_at TEXT,
+      last_inbound_at TEXT,
+      last_outbound_at TEXT,
+      notes TEXT,
+      created_at TEXT DEFAULT (datetime('now')),
+      updated_at TEXT DEFAULT (datetime('now'))
+    );
+    CREATE INDEX IF NOT EXISTS idx_crm_threads_contact ON crm_threads(contact_id);
+    CREATE INDEX IF NOT EXISTS idx_crm_threads_status ON crm_threads(status);
+    CREATE INDEX IF NOT EXISTS idx_crm_threads_category ON crm_threads(category);
+    CREATE INDEX IF NOT EXISTS idx_crm_threads_last_message ON crm_threads(last_message_at);
+
+    CREATE TABLE IF NOT EXISTS crm_messages (
+      id TEXT PRIMARY KEY,
+      thread_id TEXT NOT NULL REFERENCES crm_threads(id) ON DELETE CASCADE,
+      direction TEXT NOT NULL CHECK(direction IN ('in','out')),
+      from_email TEXT NOT NULL,
+      to_emails TEXT,
+      cc_emails TEXT,
+      subject TEXT,
+      body_text TEXT,
+      body_html TEXT,
+      snippet TEXT,
+      sent_at TEXT,
+      received_at TEXT DEFAULT (datetime('now')),
+      raw_metadata TEXT DEFAULT '{}'
+    );
+    CREATE INDEX IF NOT EXISTS idx_crm_messages_thread ON crm_messages(thread_id);
+    CREATE INDEX IF NOT EXISTS idx_crm_messages_sent_at ON crm_messages(sent_at);
+
+    CREATE TABLE IF NOT EXISTS crm_actions (
+      id TEXT PRIMARY KEY,
+      thread_id TEXT REFERENCES crm_threads(id) ON DELETE CASCADE,
+      contact_id TEXT REFERENCES crm_contacts(id) ON DELETE SET NULL,
+      type TEXT NOT NULL,
+      actor TEXT NOT NULL CHECK(actor IN ('claude','daniel','system')),
+      payload TEXT DEFAULT '{}',
+      created_at TEXT DEFAULT (datetime('now'))
+    );
+    CREATE INDEX IF NOT EXISTS idx_crm_actions_thread ON crm_actions(thread_id);
+    CREATE INDEX IF NOT EXISTS idx_crm_actions_contact ON crm_actions(contact_id);
+    CREATE INDEX IF NOT EXISTS idx_crm_actions_created ON crm_actions(created_at);
+
+    CREATE TABLE IF NOT EXISTS crm_outbox (
+      id TEXT PRIMARY KEY,
+      thread_id TEXT REFERENCES crm_threads(id) ON DELETE SET NULL,
+      contact_id TEXT REFERENCES crm_contacts(id) ON DELETE SET NULL,
+      intent TEXT NOT NULL CHECK(intent IN ('gmail_draft','resend_send')),
+      status TEXT DEFAULT 'pending' CHECK(status IN ('pending','processing','completed','failed')),
+      to_emails TEXT NOT NULL,
+      cc_emails TEXT,
+      subject TEXT NOT NULL,
+      body_text TEXT NOT NULL,
+      body_html TEXT,
+      reply_to_message_id TEXT,
+      result_id TEXT,
+      error TEXT,
+      created_at TEXT DEFAULT (datetime('now')),
+      processed_at TEXT,
+      created_by TEXT NOT NULL CHECK(created_by IN ('claude','daniel'))
+    );
+    CREATE INDEX IF NOT EXISTS idx_crm_outbox_status ON crm_outbox(status);
+    CREATE INDEX IF NOT EXISTS idx_crm_outbox_intent ON crm_outbox(intent);
+  `);
+
+
   // ─── Safe migrations for existing databases ─────────────────
   // SQLite doesn't support ADD COLUMN IF NOT EXISTS, so we catch
   // the "duplicate column" error and ignore it.
