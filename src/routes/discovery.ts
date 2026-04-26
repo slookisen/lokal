@@ -197,7 +197,7 @@ router.get("/.well-known/mcp/server-card.json", (_req: Request, res: Response) =
       name: "Rett fra Bonden — Lokal Mat MCP",
       version: "1.0.0",
       description: "MCP server for local food in Norway. Search and discover " +
-        `${stats.totalAgents || "1,100+"}` +
+        `${stats.totalAgents || "1,150+"}` +
         " local food producers — farms, markets, REKO rings. " +
         "Supports natural language search in Norwegian and English.",
       homepage: BASE_URL,
@@ -281,7 +281,7 @@ router.get("/.well-known/ai-plugin.json", (_req: Request, res: Response) => {
       "gårdsbutikker og REKO-ringer med kontaktinfo og åpningstider.",
     description_for_model:
       "Plugin for searching and discovering local food producers in Norway. " +
-      `Provides access to ${stats.totalAgents || "1195+"} verified producers ` +
+      `Provides access to ${stats.totalAgents || "1,150+"} verified producers ` +
       "including farms, farmers' markets, REKO rings, farm shops, and " +
       "cooperatives. Use the search endpoint for natural-language queries " +
       "(Norwegian or English) and the agents endpoint for structured lookups " +
@@ -318,7 +318,7 @@ function serveApiIndex(_req: Request, res: Response): void {
     version: "v1",
     description:
       "REST API for Norwegian local food producers. " +
-      `${stats.totalAgents || "1195+"} verified agents across farms, markets, ` +
+      `${stats.totalAgents || "1,150+"} verified agents across farms, markets, ` +
       "REKO rings, and cooperatives.",
     documentation: `${BASE_URL}/openapi.json`,
     protocols: {
