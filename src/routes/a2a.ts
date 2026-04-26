@@ -144,14 +144,28 @@ function handleMessageSend(params: any, id: any, req: Request, res: Response) {
 
   let discoveryQuery: any;
 
-  // Extract text from various A2A message formats
-  // The A2A spec uses { role, parts: [{ type: "text", text: "..." }] }
-  // but agents may also send { text: "..." } or just a string.
+  // Extract text from various A2A message formats.
+  // The spec has shifted across versions and clients are inconsistent:
+  //   v0.1:  { type: "text", text: "..." }   (legacy `type` discriminator)
+  //   v0.2+: { kind: "text", text: "..." }   (current spec uses `kind`)
+  //   liberal: { text: "..." }               (no discriminator at all)
+  //   bare:    "honning"                     (string instead of object)
+  //   flat:    { text: "honning" }           (no parts array)
+  // Bug observed in conversation logs: parts with bare `{text: "honning"}`
+  // returned null, which made the caller fall back to JSON.stringify(params)
+  // and the user saw the whole envelope rendered as the query.
   const extractText = (msg: any): string | null => {
     if (typeof msg === "string") return msg;
     if (msg.text) return msg.text;
     if (msg.parts && Array.isArray(msg.parts)) {
-      const textPart = msg.parts.find((p: any) => p.type === "text" && p.text);
+      // Accept any part that carries a `text` field, regardless of how
+      // (or whether) the discriminator is named.
+      const textPart = msg.parts.find((p: any) => {
+        if (!p || typeof p.text !== "string" || !p.text) return false;
+        if (p.type !== undefined && p.type !== "text") return false;
+        if (p.kind !== undefined && p.kind !== "text") return false;
+        return true;
+      });
       if (textPart) return textPart.text;
     }
     return null;
