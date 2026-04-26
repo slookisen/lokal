@@ -2,7 +2,7 @@
 
 **Live:** https://rettfrabonden.com | **MCP Server:** https://rettfrabonden.com/mcp | **API Spec:** https://rettfrabonden.com/openapi.yaml
 
-Lokal is the discovery layer for local food in Norway. 1,100+ producers — farms, farm shops, REKO rings, farmers markets, and cooperatives — discoverable by AI agents and humans alike.
+Lokal is the discovery layer for local food in Norway. 1,170+ producers — farms, farm shops, REKO rings, farmers markets, and cooperatives — discoverable by AI agents and humans alike.
 
 Not an app. Not a webshop. **Infrastructure** — the DNS for food agents.
 
@@ -100,7 +100,7 @@ Full spec: https://rettfrabonden.com/openapi.yaml
 - **MCP 2025-06-18** over Streamable HTTP + stdio (remote + local)
 - **A2A v1.0.0** compliant (JSON-RPC 2.0 + Agent Card)
 - **Value-based matching** — no ads, no pay-to-rank
-- **1,100+ agents** across 300+ Norwegian cities
+- **1,170+ agents** across 300+ Norwegian cities
 
 ## For producers
 
