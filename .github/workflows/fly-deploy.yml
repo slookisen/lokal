@@ -33,7 +33,11 @@ jobs:
         uses: superfly/flyctl-actions/setup-flyctl@master
 
       - name: Deploy
-        run: flyctl deploy --remote-only
+        # Pass --build-arg BUILD_REV so the Dockerfile's ARG/LABEL/RUN cache-bust
+        # block actually invalidates the COPY src/ layer per commit. Without
+        # this, Fly's remote builder reuses the cached layer indefinitely
+        # (caught 2026-04-27 — F1 search-bug fix didn't ship for that reason).
+        run: flyctl deploy --remote-only --build-arg BUILD_REV=${{ github.sha }}
         env:
           FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
 

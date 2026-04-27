@@ -46,3 +46,6 @@ lpt[1-9]
 
 # OS
 Thumbs.db
+
+# Belt-and-suspenders — mcp-server has its own node_modules
+mcp-server/node_modules/
