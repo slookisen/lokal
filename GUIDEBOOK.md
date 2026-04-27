@@ -1178,6 +1178,102 @@ Feature-flagged via `CRM_ENABLED` env var (default on; set to `0` to disable). C
 
 Pair this with the customer-service agent prompt (`/A2A/scheduled-agents/rfb-customer-service.md`) which polls `crm_outbox` for pending `gmail_draft` rows, calls Gmail MCP `create_draft`, and writes the result back via `POST /api/crm/outbox/:id/result`. The dashboard auto-refreshes; humans see drafts ready to review.
 
+#### 7.12.1 Contact resolution (classifyEmail) and self-healing triage
+
+The first version of `resolveContact()` only ran classification at create-time. After running for a day this turned out to be wrong: incoming mail from a brand-new producer was tagged `unknown` because the producer hadn't been seeded yet, and the contact stayed `unknown` forever even after the producer landed in `agents`. Same problem in reverse — a vendor email from `accounts.google.com` was tagged `unknown` because `VENDOR_DOMAINS.has(domain)` only matched on exact strings and the allowlist contained `google.com`, not every subdomain.
+
+The fix is to split classification out of `resolveContact()` into a pure `classifyEmail()` function and call it both at create-time AND on every subsequent ingest if the existing contact is currently `unknown`:
+
+```ts
+classifyEmail(email: string): { type: ContactType; agentId: string | null } {
+  const lowerEmail = email.trim().toLowerCase();
+  const domain = lowerEmail.split("@")[1] ?? "";
+
+  // 1. Exact match — highest confidence
+  const exact = db
+    .prepare("SELECT id FROM agents WHERE LOWER(contact_email) = ? AND is_active = 1 LIMIT 1")
+    .get(lowerEmail);
+  if (exact) return { type: "producer", agentId: exact.id };
+
+  // 2. Domain match — skip generic freemail so a producer using gmail
+  //    doesn't shadow every other gmail sender as the same agent
+  const FREEMAIL = new Set(["gmail.com", "outlook.com", "hotmail.com",
+    "yahoo.com", "live.com", "icloud.com", "online.no", "broadpark.no"]);
+  if (domain && !FREEMAIL.has(domain)) {
+    const byDomain = db
+      .prepare("SELECT id FROM agents WHERE LOWER(contact_email) LIKE ? AND is_active = 1 LIMIT 1")
+      .get(`%@${domain}`);
+    if (byDomain) return { type: "producer", agentId: byDomain.id };
+  }
+
+  // 3. Vendor allowlist — exact OR suffix-of-vendor (accounts.google.com → google.com)
+  if (this.matchesVendorDomain(domain)) return { type: "vendor", agentId: null };
+
+  return { type: "unknown", agentId: null };
+}
+
+private matchesVendorDomain(domain: string): boolean {
+  if (!domain) return false;
+  if (VENDOR_DOMAINS.has(domain)) return true;
+  for (const v of VENDOR_DOMAINS) if (domain.endsWith("." + v)) return true;
+  return false;
+}
+```
+
+Inside `resolveContact()`, when the contact already exists *and* its type is `unknown`, re-run `classifyEmail()`. If the answer is no longer `unknown`, promote the row in place. This means a producer who replies *before* the discovery agent has registered them gets correctly retagged on their second message (or after the next discovery sweep) — no manual intervention needed.
+
+For the bulk case — a discovery batch lands 50 new producers, and you want all the previously-unknown contacts in `crm_contacts` re-evaluated against the new agents — call:
+
+```bash
+curl -X POST $API/api/crm/contacts/reclassify-unknown \
+  -H "x-admin-key: $ADMIN_KEY"
+# → { "evaluated": 17, "reclassified": 4 }
+```
+
+It's cheap (one indexed lookup per row), idempotent, and worth running at the tail of every discovery/enrichment job. Commits: `c85d2de`, `2cd53a0`.
+
+#### 7.12.2 CSP-safe event handling — no inline `onclick` anywhere
+
+The CRM dashboard shipped with 16 inline event attributes (`onclick="login()"`, `onchange="setThreadStatus(...)"`, `onblur="saveContactNotes(...)"`, etc.). It worked in vanilla Chrome, then died the moment Daniel opened it from the Comet browser — clicking "Logg inn" did nothing.
+
+Root cause: our CSP includes `script-src-attr 'none'`, which blocks all inline event-attribute handlers. Some browsers enforce this strictly (Comet, Brave with shields up, MetaMask SES); regular Chrome was lenient. There was no error in the user-facing UI — buttons silently became inert.
+
+The fix is event delegation on `document.body`, with a single `data-action` attribute on each interactive element:
+
+```html
+<button data-action="login">Logg inn</button>
+<select data-action="setThreadStatus" data-id="${t.id}">…</select>
+<textarea data-action="saveContactNotes" data-id="${c.id}">…</textarea>
+```
+
+```js
+const ACTIONS = {
+  login, logout, refresh,
+  search: onSearchChange,
+  selectContact: id => selectContact(id),
+  setThreadStatus: (id, val) => setThreadStatus(id, val),
+  saveContactNotes: id => saveContactNotes(id),
+  markDone: id => setThreadStatus(id, 'done'),
+  // …16 actions total
+};
+
+document.body.addEventListener('click', e => {
+  const el = e.target.closest('[data-action]');
+  if (!el) return;
+  const fn = ACTIONS[el.dataset.action];
+  if (fn) fn(el.dataset.id, el.value);
+});
+document.body.addEventListener('change', /* same pattern */);
+document.body.addEventListener('blur',   /* same pattern */, true); // capture for blur
+document.body.addEventListener('keypress', e => {
+  if (e.target.id === 'adminKey' && e.key === 'Enter') login();
+});
+```
+
+Two listeners (click + change) cover ~95% of the surface; blur (capture) covers the textarea autosave; keypress covers the Enter-to-login affordance. There is now **zero** inline JS in any of our HTML payloads, and the rule is in repo memory: never reach for `onclick=` again. Commit: `908338c`.
+
+The same refactor added a one-click **"✓ Ferdig"** button next to each thread's status dropdown — wraps `setThreadStatus(id, 'done')`, only renders when the thread isn't already `done`/`archived`. Half the daily triage flow ends up being "this is fine, mark it done", and a dropdown for that was three clicks too many.
+
 
 ---
 
@@ -2465,6 +2561,12 @@ Post-deploy:
 
 43. **Schema.org `Product` validation in Google Search Console** — GSC flagged "Invalid Product" / "Missing field 'offers'" / "Either 'review', 'aggregateRating', or 'offers' should be specified" on every producer page. Three rules: (a) every `Product` needs an `offers.{availability,priceCurrency,price}` block, even when price is unknown — use `availability: "https://schema.org/InStock"` and `price: "0"` rather than dropping the field; (b) `aggregateRating` only renders when you have ≥1 review; conditionally include it; (c) put `Product[]` inside `mainEntity` of a `WebPage`, not as a top-level node, so GSC parses the page correctly. Commit: `47a0114`.
 
+44. **CSP `script-src-attr 'none'` silently kills inline `onclick` on strict browsers** — Worked everywhere we tested in regular Chrome; broke instantly when Daniel opened the CRM in Comet (and would have broken Brave-with-shields, MetaMask SES, anyone else with strict CSP). No console error in the user-facing UI — buttons just become inert. The rule for this codebase: **zero inline event attributes in any served HTML**. Use `data-action="…"` plus a delegated listener on `document.body`. One pattern, one diff to land it everywhere. Commit: `908338c`.
+
+45. **Vendor-domain allowlist must match subdomains, not just exact strings** — `accounts.google.com`, `sc-noreply.google.com`, `mail-noreply.google.com` all classified as `unknown` because `VENDOR_DOMAINS.has("accounts.google.com")` is `false` when only `google.com` is in the set. Add a `matchesVendorDomain()` helper that also checks `domain.endsWith("." + v)`. Same rule applies to any allowlist matching a domain (CORS, blocklists, trust scoring). Commit: `2cd53a0`.
+
+46. **`unknown` CRM contacts must be re-evaluated on every subsequent ingest, not just at create-time** — A producer replies *before* the discovery agent has registered them → contact is created as `unknown` → discovery seeds the producer next morning → contact is still `unknown` because `resolveContact()` only ran classification on first sight. Fix: when an existing row has `type='unknown'`, re-run `classifyEmail()` on every ingest and promote in place if the new answer is non-unknown. Pair with a `POST /api/crm/contacts/reclassify-unknown` admin endpoint that does the same thing in bulk for the long-tail backlog after seeding runs. Cheap (one indexed lookup per row), idempotent, run it at the tail of every discovery/enrichment job. Commit: `c85d2de`.
+
 ### C.2 Architecture Decisions
 
 1. **SQLite over PostgreSQL** — Zero ops, single file, perfect for solo developer. Good up to ~10K agents.
@@ -2647,8 +2749,9 @@ to build the same platform for a different vertical.
 | 2026-04-24 | 3, 5, 7, 8, 11, C | MCP tool descriptions + name-based search with Norwegian Unicode fix (3.5, 3.6). Price normalization at save time across MCP/A2A/auto-response (3.7). `og:image` + `twitter:card summary_large_image` in base SEO shell (5.6). Search-engine crawler UA classifier (7.7). Single-char query filter (7.8). Over-max `limit` clamped via `z.catch(100)` instead of 400 (7.9). Render-time PII filter for conversation pages + `/api/interactions` + `/api/conversations` (8.3). Server-side Google Places rating admin endpoints (11.7). Appendix C: C.22 (SQLite `LOWER()` ASCII-only), C.23 (prices in names → normalize at save), C.24 (auto-expand overwrites exact matches), C.25 (`_nameQuery` stripped by Zod), C.26 (crawlers skip `Referer`), C.27 (keystroke pollution), C.28 (ZodError 400 noise), C.29 (tool descriptions shape LLM behaviour), C.30 (PII filter must cover every render surface). |
 | 2026-04-25 | 5, 7, 8, 11, 12, 16, 17, C | Smart fallback for `/produsent/<slug>` 404s (5.7). HTTP-status + AI-bot producer outcomes analytics (7.10). Enheter device parsing, dynamic bot naming, owner UX, Samtaler panel (7.11). Rotate-keys admin endpoint + .gitignore for `data/dist` after key leak (8.4). `agent_blocklist` table + opt-out gate (8.5). Wire `googleRating` into `communitySignal()` (11.8). Slug single-source-of-truth + `canonicalUrl` field (12.7). GitHub-Actions auto-deploy replaces local `flyctl` (16.4). `AgentCard.url` at `/a2a` JSON-RPC endpoint + `tasks/send` backward-compat alias + Dockerfile `BUILD_REV` cache-bust (17.5). Tolerant A2A `parts[]` extractor (17.6). Smart name-search without indicator words. Google Search Console structured-data fixes. Appendix C: C.31 (`nul` blocks Windows pull), C.32 (Fly cache-bust), C.33 (`AgentCard.url` = endpoint), C.34 (parts discriminator drift), C.35 (data file leak), C.36 (placeholder community signal), C.37 (reader/writer schema drift), C.38 (case-insensitive owner UA), C.39 (slug logic reinvented 4×), C.40 (AI engines invent slugs), C.41 (discovery re-inserts opted-out), C.42 (name-search needs DB lookup), C.43 (`Product` schema). |
 | 2026-04-26 | 5, 7, 17 | Static-page SEO meta on `/selger` + `/app`, `noindex` on admin pages (5.8). Inbox CRM dashboard at `/admin/crm-dashboard` with 5 new tables, 14 endpoints, single-file 554-line UI (7.12). Unify stale fallback counts (`1,400+` → `1,150+`) + add `repository` field to MCP server card. |
+| 2026-04-27 | 7, C | CRM contact-resolution upgrade (7.12.1): `classifyEmail()` split out as a pure function, freemail allowlist prevents gmail/outlook senders from shadowing real producer matches, vendor allowlist now accepts subdomain suffixes (`accounts.google.com` → `google.com`), `unknown` rows re-evaluated on every subsequent ingest plus bulk endpoint `POST /api/crm/contacts/reclassify-unknown`. CSP-safe event delegation in `admin-crm.html` (7.12.2): all 16 inline `onclick`/`onchange`/`onblur` replaced with `data-action` + a single `document.body` listener after Comet browser blocked login. "✓ Ferdig" one-click status button on each thread. Stale-count fallbacks `1,100`/`1,150+` → `1,170+` across `discovery.ts`, `agent-readiness.ts`, narrator strings in `app.html`/`dashboard.html`, README, server.json. Appendix C: C.44 (CSP-strict browsers kill inline `onclick`), C.45 (vendor-domain subdomain match), C.46 (re-classify `unknown` on every ingest). |
 
 ---
 
-*Last updated: 2026-04-26 (14:00 CEST) by rfb-guidebook agent*
-*Guide version: 1.3.0*
+*Last updated: 2026-04-27 (14:00 CEST) by rfb-guidebook agent*
+*Guide version: 1.4.0*
