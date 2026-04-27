@@ -442,7 +442,7 @@ router.get("/search", async (req: Request, res: Response) => {
     const info = knowledgeService.getAgentInfo(r.agent.id);
     const k = info?.knowledge;
     let products: any[] | undefined;
-    if (k?.products?.length) {
+    if (Array.isArray(k?.products) && k.products.length) {
       products = k.products
         .filter((p: any) => {
           const n = (p.name || "").trim();
