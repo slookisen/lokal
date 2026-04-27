@@ -63,8 +63,8 @@ Rett fra Bonden er en åpen plattform som lar AI-agenter finne, sammenligne og k
 ## Nøkkeltall
 
 - ${agents.length} registrerte produsenter
-- ${topCities.length} byer dekket
-- ${topCats.length}+ matkategorier
+- ${cities.size} byer dekket
+- ${categories.size} matkategorier
 - Oppdateres daglig med nye produsenter og data
 
 ## Byer med produsenter

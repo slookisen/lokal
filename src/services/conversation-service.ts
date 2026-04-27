@@ -147,7 +147,10 @@ class ConversationService {
 
     // Match query to relevant products if possible
     const queryLower = (queryText || "").toLowerCase();
-    const allProducts = (k.products || []).filter((p: any) => {
+    // Defensive: some agents have a non-array `products` field (string or null);
+    // "|| []" doesn't protect against that — use Array.isArray.
+    const productsList = Array.isArray(k.products) ? k.products : [];
+    const allProducts = productsList.filter((p: any) => {
       const name = (p.name || "").trim();
       return name && !isProductNoise(name) && !isProductHeader(name);
     });
@@ -178,7 +181,7 @@ class ConversationService {
       parts.push(`Her er det vi tilbyr (${allProducts.length} produkter):`);
       let currentSection = "";
       let shown = 0;
-      for (const p of k.products || []) {
+      for (const p of productsList) {
         const name = (p.name || "").trim();
         if (!name) continue;
         if (isProductNoise(name)) continue;

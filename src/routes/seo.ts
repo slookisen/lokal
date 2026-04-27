@@ -829,6 +829,33 @@ router.get("/sok", async (req: Request, res: Response) => {
 
     const geoFiltered = !!parsed.location && !heleNorge;
 
+    // ── Total-count probe ─────────────────────────────────────
+    // The display block above renders `results.length` (capped at 30) — but
+    // before this fix the header literally said "${N} treff" which made
+    // every search look identical at "30 treff". Run one extra discover()
+    // with a higher limit (capped at the schema max of 100) so we can
+    // truthfully say "viser N av M" or "M+ treff". We don't need the rows;
+    // just the count. Cheap because discover() is in-memory ranked.
+    let totalCount = results.length;
+    let totalAtMax = false;
+    if (results.length >= 30) {
+      try {
+        const countQuery = DiscoveryQuerySchema.parse({
+          ...parsed,
+          location: heleNorge ? undefined : parsed.location,
+          maxDistanceKm: heleNorge ? undefined : parsed.maxDistanceKm,
+          limit: 100, offset: 0,
+        });
+        if (productTerms) (countQuery as any)._productTerms = productTerms;
+        const countResults = marketplaceRegistry.discover(countQuery);
+        totalCount = countResults.length;
+        totalAtMax = totalCount >= 100;
+      } catch { /* keep results.length as fallback */ }
+    }
+    const headerText = results.length >= totalCount
+      ? `${totalCount}${totalAtMax ? "+" : ""} treff`
+      : `viser ${results.length} av ${totalCount}${totalAtMax ? "+" : ""}`;
+
     // ─── Log web search as conversation (source: "web") ─────────
     // Captures human frontend searches in /samtaler alongside AI traffic.
     // Only top 1 match to avoid noise from casual browsing.
@@ -858,7 +885,7 @@ router.get("/sok", async (req: Request, res: Response) => {
     <section class="search-hero">
       <div class="container">
         <div class="bc" style="padding:0 0 12px;"><a href="/">Hjem</a><span>/</span>S\u00f8k: \u201c${escapeHtml(q)}\u201d</div>
-        <h1>S\u00f8keresultater for \u201c${escapeHtml(q)}\u201d \u2014 ${results.length} treff</h1>
+        <h1>S\u00f8keresultater for \u201c${escapeHtml(q)}\u201d \u2014 ${headerText}</h1>
         <form class="search-form" action="/sok" method="GET">
           <input type="text" name="q" value="${escapeHtml(q)}" aria-label="S\u00f8k">
           <button type="button" id="geoBtn" style="padding:12px 16px;background:var(--green-100,#e8f0e0);color:var(--green-700,#2D5016);border:2px solid var(--green-700,#2D5016);border-left:none;font-weight:700;font-size:0.85rem;cursor:pointer;white-space:nowrap;">&#128205; N\u00e6r meg</button>
