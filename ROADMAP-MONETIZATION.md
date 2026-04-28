@@ -6,7 +6,7 @@
 
 ## Visjon
 
-Rett fra Bonden eier datalaget som AI-assistenter bruker for å svare på matspørsmål i Norge. Koden er åpen, men verdien sitter i produsentdataene (1169+), AI-distribusjonen (ChatGPT, MCP, A2A), og nettverkseffekten. Strategien er å bygge inntekt som beviser forretningsmodellen, og posisjonere for oppkjøp innen 12–18 måneder.
+Rett fra Bonden eier datalaget som AI-assistenter bruker for å svare på matspørsmål i Norge. Koden er åpen, men verdien sitter i produsentdataene (1,180+), AI-distribusjonen (ChatGPT, MCP, A2A), og nettverkseffekten. Strategien er å bygge inntekt som beviser forretningsmodellen, og posisjonere for oppkjøp innen 12–18 måneder.
 
 ---
 
