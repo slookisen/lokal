@@ -25,7 +25,7 @@ const BASE_URL = process.env.BASE_URL || "https://rettfrabonden.com";
 // than resurrect the old "1,400+" number if the registry briefly fails.
 function producerCount(): string {
   const stats = marketplaceRegistry.getStats();
-  return stats.totalAgents ? String(stats.totalAgents) : "1,170+";
+  return stats.totalAgents ? String(stats.totalAgents) : "1,180+";
 }
 
 // ═══════════════════════════════════════════════════════════════
