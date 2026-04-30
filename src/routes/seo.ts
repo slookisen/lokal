@@ -804,25 +804,43 @@ router.get("/sok", async (req: Request, res: Response) => {
       }
     }
 
-    // Preserve product terms through Zod parsing
+    // Preserve internal fields through Zod parsing (Zod strips unknown keys).
+    // _nameQuery is critical: when present, discover() returns name-matched
+    // agents anywhere in Norway and skips geo. Without this re-attach, /sok
+    // silently fell back to geo-rank fallback and surfaced unrelated nearby
+    // producers when the user typed a producer name not present locally.
     const productTerms = parsed._productTerms;
+    const nameQuery = (parsed as any)._nameQuery as string | undefined;
     const query = DiscoveryQuerySchema.parse({ ...parsed, limit: 30, offset: 0 });
     if (productTerms) (query as any)._productTerms = productTerms;
+    if (nameQuery) (query as any)._nameQuery = nameQuery;
 
     let results = marketplaceRegistry.discover(query);
 
-    // Auto-expanding radius if too few results
+    // If discover returned name-matched results (relevanceScore≥0.9 +
+    // matchReasons starts with "Navnematch"), don't run the geo-fallback —
+    // we already have the user's actual target. Mirrors /api/marketplace/search.
+    const wasNameMatch = !!nameQuery && results.length > 0 &&
+      results[0]?.matchReasons?.some((r: string) => r.startsWith("Navnematch"));
+
+    // Auto-expanding radius if too few results.
+    // Skip entirely when the first pass was a name match — name matches are
+    // exact targets the user typed; widening geo would dilute them with
+    // unrelated nearby producers (the bug Daniel hit on 2026-04-30 with
+    // "Erga Gårdsutsalg": 7 random Trondheim hits instead of the 1 in Kleppe).
     const MIN_RESULTS = 3;
-    if (parsed.location && results.length < MIN_RESULTS && !heleNorge) {
+    if (parsed.location && results.length < MIN_RESULTS && !heleNorge && !wasNameMatch) {
       for (const radius of [50, 100, 200]) {
         if (results.length >= MIN_RESULTS) break;
         const expanded = DiscoveryQuerySchema.parse({ ...parsed, maxDistanceKm: radius, limit: 30, offset: 0 });
         if (productTerms) (expanded as any)._productTerms = productTerms;
+        if (nameQuery) (expanded as any)._nameQuery = nameQuery;
         results = marketplaceRegistry.discover(expanded);
       }
       if (results.length < MIN_RESULTS) {
         const noGeo = DiscoveryQuerySchema.parse({ ...parsed, location: undefined, maxDistanceKm: undefined, limit: 30, offset: 0 });
         if (productTerms) (noGeo as any)._productTerms = productTerms;
+        if (nameQuery) (noGeo as any)._nameQuery = nameQuery;
         results = marketplaceRegistry.discover(noGeo);
       }
     }

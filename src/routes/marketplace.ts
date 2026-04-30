@@ -1439,9 +1439,38 @@ router.delete("/agents/:id", (req: Request, res: Response) => {
 
     const db = getDb();
 
-    const agent = db.prepare("SELECT id, name, city FROM agents WHERE id = ?").get(agentId) as any;
+    const agent = db.prepare("SELECT id, name, city, is_verified FROM agents WHERE id = ?").get(agentId) as any;
     if (!agent) {
       res.status(404).json({ error: "Agent ikke funnet", id: agentId });
+      return;
+    }
+
+    // ── Verified-agent guard (added 2026-04-30) ────────────────
+    // Refuse to delete an agent whose owner has verified ownership via
+    // claim flow (`is_verified=1`), because DELETE cascades into
+    // agent_claims and silently destroys the verification record. This
+    // is exactly how "Erga Gardsutsalg" (verified 2026-04-22) was lost
+    // when the enrichment-agent's old dedup policy auto-merged it.
+    // To force delete (e.g. legitimate opt-out where the owner asked
+    // to be removed), pass body { force: true } / query ?force=1, OR
+    // first call POST /admin/agents/:id/reset-claim to clear the
+    // verification flag explicitly.
+    const wantsForce = req.body?.force === true || req.query?.force === "1" || req.query?.force === "true";
+    if (agent.is_verified === 1 && !wantsForce) {
+      res.status(409).json({
+        success: false,
+        error: "Agent er verifisert av eier — ikke slett uten ?force=1 eller etter /admin/agents/:id/reset-claim",
+        details: {
+          agentId: agent.id,
+          agentName: agent.name,
+          isVerified: true,
+          remediation: [
+            "If this is an opt-out request: pass ?force=1 (or body { force: true }) — this still preserves blocklist + audit",
+            "If this is a duplicate-merge: call POST /admin/agents/:id/reset-claim FIRST, then DELETE",
+            "If you reached this from an automated dedup script: stop and flag for human review",
+          ],
+        },
+      });
       return;
     }
 
