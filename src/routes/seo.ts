@@ -874,6 +874,15 @@ router.get("/sok", async (req: Request, res: Response) => {
       ? `${totalCount}${totalAtMax ? "+" : ""} treff`
       : `viser ${results.length} av ${totalCount}${totalAtMax ? "+" : ""}`;
 
+    // ─── Fuzzy-match banner ──────────────────────────────────────
+    // If discover() returned only relaxed matches ("Mulig navnematch"),
+    // surface a small note so the user understands they got similar
+    // names rather than exact matches. This is what Daniel hit when
+    // searching "Dyrøy Sjømat" — actual producer is "Dyrøymat".
+    const allFuzzy = results.length > 0 && results.every(
+      (r: any) => r.matchReasons?.some((m: string) => m.startsWith("Mulig navnematch")),
+    );
+
     // ─── Log web search as conversation (source: "web") ─────────
     // Captures human frontend searches in /samtaler alongside AI traffic.
     // Only top 1 match to avoid noise from casual browsing.
@@ -904,6 +913,7 @@ router.get("/sok", async (req: Request, res: Response) => {
       <div class="container">
         <div class="bc" style="padding:0 0 12px;"><a href="/">Hjem</a><span>/</span>S\u00f8k: \u201c${escapeHtml(q)}\u201d</div>
         <h1>S\u00f8keresultater for \u201c${escapeHtml(q)}\u201d \u2014 ${headerText}</h1>
+        ${allFuzzy ? `<p style="color:var(--g500,#666);font-size:0.9rem;margin-top:4px;">Fant ingen eksakte navnematch for \u201c${escapeHtml(q)}\u201d \u2014 viser produsenter med lignende navn.</p>` : ""}
         <form class="search-form" action="/sok" method="GET">
           <input type="text" name="q" value="${escapeHtml(q)}" aria-label="S\u00f8k">
           <button type="button" id="geoBtn" style="padding:12px 16px;background:var(--green-100,#e8f0e0);color:var(--green-700,#2D5016);border:2px solid var(--green-700,#2D5016);border-left:none;font-weight:700;font-size:0.85rem;cursor:pointer;white-space:nowrap;">&#128205; N\u00e6r meg</button>

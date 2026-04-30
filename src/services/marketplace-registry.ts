@@ -148,6 +148,71 @@ class MarketplaceRegistry {
           return results.slice(0, query.limit || 20);
         }
       }
+
+      // ── RELAXED FALLBACK ──────────────────────────────────────
+      // Strict ALL-words match found nothing. Try ANY-word match —
+      // but only on words that look like a producer name (not generic
+      // food/category terms like "sjømat", "kjøtt", "bakeri"). This
+      // catches the case where the user typed "Dyrøy Sjømat" but the
+      // actual producer is "Dyrøymat" (single word, no space). The
+      // distinctive token "dyrøy" matches; "sjømat" is filtered out
+      // because it would otherwise pull in every fish producer.
+      const GENERIC_NAME_TOKENS = new Set([
+        // food categories that often appear in producer names but are
+        // not distinctive enough to fuzzy-match on alone
+        "mat", "sjømat", "kjøtt", "fisk", "bakeri", "bryggeri", "ysteri",
+        "meieri", "marked", "butikk", "gård", "gard", "farm", "kooperativ",
+        "slakteri", "gardsmat", "gardsutsalg", "frukt", "bær", "honning",
+        "egg", "melk", "ost", "brød", "korn", "grønt", "grønnsaker",
+        "lokalmat", "økologisk", "tradisjon", "tradisjons",
+      ]);
+      const distinctiveWords = nameWords.filter(w => !GENERIC_NAME_TOKENS.has(w) && w.length >= 3);
+      if (distinctiveWords.length > 0) {
+        const fuzzyRows = allRows
+          .map(row => {
+            const agentName = (row.name || "").toLowerCase();
+            const matchedCount = distinctiveWords.filter(w => agentName.includes(w)).length;
+            return { row, matchedCount };
+          })
+          .filter(x => x.matchedCount > 0);
+
+        if (fuzzyRows.length > 0) {
+          // Sort by # distinctive words matched, then trust
+          fuzzyRows.sort((a, b) => {
+            if (b.matchedCount !== a.matchedCount) return b.matchedCount - a.matchedCount;
+            return (b.row.trust_score || 0) - (a.row.trust_score || 0);
+          });
+
+          let fuzzyCandidates = fuzzyRows.slice(0, 10).map(x => this.rowToAgent(x.row)!);
+          if (query.role) fuzzyCandidates = fuzzyCandidates.filter(a => a.role === query.role);
+          if (fuzzyCandidates.length > 0) {
+            console.log(`[name-search-fuzzy] matched=${fuzzyCandidates.length} → ${fuzzyCandidates.map(a => a.name).join(", ")}`);
+            const results: DiscoveryResult[] = fuzzyCandidates.map(agent => {
+              const { score, reasons } = this.calculateRelevance(agent, query, [], new Map());
+              this.incrementDiscovery(agent.id);
+              return {
+                agent: {
+                  id: agent.id, name: agent.name, description: agent.description,
+                  url: agent.url, role: agent.role,
+                  skills: agent.skills.map(s => ({ id: s.id, name: s.name, description: s.description, tags: s.tags })),
+                  location: agent.location ? {
+                    city: agent.location.city,
+                    distanceKm: query.location
+                      ? haversine(query.location.lat, query.location.lng, agent.location.lat, agent.location.lng)
+                      : undefined,
+                  } : undefined,
+                  trustScore: agent.trustScore, isVerified: agent.isVerified,
+                  categories: agent.categories, tags: agent.tags,
+                },
+                relevanceScore: Math.max(score, 0.75), // fuzzy = lower than strict 0.9
+                matchReasons: [`Mulig navnematch: "${nameQuery}"`, ...reasons],
+              };
+            });
+            results.sort((a, b) => b.relevanceScore - a.relevanceScore);
+            return results.slice(0, query.limit || 20);
+          }
+        }
+      }
     }
 
     // Build SQL dynamically based on query filters
