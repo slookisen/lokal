@@ -1486,13 +1486,16 @@ router.delete("/agents/:id", (req: Request, res: Response) => {
     });
     deleteAll();
 
-    // ─── Optional blocklist auto-add ──────────────────────────
-    // Pass body { addToBlocklist: true } (or query ?addToBlocklist=1)
-    // and the deleted agent's identifying signals are written to
-    // agent_blocklist so the daily discovery agent doesn't re-insert
-    // them. Caller can also pass { reason, sourceEmail } for audit.
+    // ─── Blocklist auto-add (default ON) ─────────────────────
+    // Every deleted agent is automatically blocklisted so the daily
+    // discovery agent doesn't re-insert them from lokalmat.no/Facebook.
+    // To skip blocklisting (e.g. test-data cleanup), pass
+    // ?skipBlocklist=1 or body { skipBlocklist: true }.
     let blocklistResult: { inserted: number; rows: any[] } | null = null;
-    const wantsBlock = req.body?.addToBlocklist === true || req.query?.addToBlocklist === "1" || req.query?.addToBlocklist === "true";
+    const skipBlock = req.body?.skipBlocklist === true || req.query?.skipBlocklist === "1" || req.query?.skipBlocklist === "true";
+    // Legacy support: still honour explicit addToBlocklist=true/false
+    const legacyExplicitOff = (req.body?.addToBlocklist === false || req.query?.addToBlocklist === "0" || req.query?.addToBlocklist === "false");
+    const wantsBlock = !skipBlock && !legacyExplicitOff;
     if (wantsBlock) {
       try {
         const fullAgent = db.prepare("SELECT id, name, contact_email, url FROM agents WHERE id = ?").get(agentId) as any;
@@ -1503,7 +1506,7 @@ router.delete("/agents/:id", (req: Request, res: Response) => {
           name: agent.name,
           website: fromRegistry?.url,
           email: fromRegistry?.contactEmail,
-          reason: req.body?.reason || "admin-delete with addToBlocklist",
+          reason: req.body?.reason || "auto-blocklisted on admin DELETE",
           sourceEmail: req.body?.sourceEmail,
           agentNameForAudit: agent.name,
         });
@@ -2083,8 +2086,9 @@ function getBaseUrl(req: Request): string {
 //        → undoes a single row by primary key
 //
 // Typical use after a "fjern" reply:
-//   1) DELETE /api/marketplace/agents/<uuid>?addToBlocklist=1
+//   1) DELETE /api/marketplace/agents/<uuid>
 //      with body { reason: "opt-out via outreach reply", sourceEmail: "post@x.no" }
+//      (blocklist is now automatic — pass ?skipBlocklist=1 to suppress)
 //   2) (optional) POST /admin/blocklist for richer signals if you
 //      have data the registry didn't have.
 
