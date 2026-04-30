@@ -122,7 +122,7 @@
 | Duplicates flagged | 16 (awaiting deletion) |
 | Deep-enriched | 26 |
 | Products scanned | 525 (0 issues) |
-| **Projected final count** | **1,223** (after 16 deletions) |
+| **Final count** | **1,217** (1,232 - 15 Phase 4 duplicates) |
 
 ### Quality notes
 - Website domain verification caught 2 wrong-domain matches (lovetanna.no, rondane.no)
