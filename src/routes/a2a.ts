@@ -72,14 +72,28 @@ router.get("/a2a", (_req: Request, res: Response) => {
 });
 
 router.post("/a2a", (req: Request, res: Response) => {
-  const { jsonrpc, method, params, id } = req.body;
+  // Defensive: a request without Content-Type: application/json (or with a malformed
+  // body) leaves req.body as undefined, and destructuring it throws — Express then
+  // emits a default HTML 500 to a JSON-RPC client. Return a clean parse error instead.
+  // (Hardened 2026-04-30 after a2aregistry maintainer note flagged "404 Not Found" —
+  //  the leak path was actually 500/HTML when the prober omits Content-Type.)
+  const body = (req.body && typeof req.body === "object") ? req.body : null;
+  if (!body) {
+    res.status(400).json({
+      jsonrpc: "2.0",
+      error: { code: -32700, message: "Parse error: request body must be JSON. Send 'Content-Type: application/json'." },
+      id: null,
+    });
+    return;
+  }
+  const { jsonrpc, method, params, id } = body;
 
   // Validate JSON-RPC envelope
   if (jsonrpc !== "2.0" || !method || id === undefined) {
     res.status(400).json({
       jsonrpc: "2.0",
       error: { code: -32600, message: "Invalid Request: must include jsonrpc:'2.0', method, and id" },
-      id: id || null,
+      id: id ?? null,
     });
     return;
   }
