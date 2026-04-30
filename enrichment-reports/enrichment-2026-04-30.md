@@ -1,135 +1,119 @@
-# Enrichment Report — 2026-04-30
+# Enrichment Report — 2026-04-30 (Run #53)
 
-**Run**: #52b (evening)  
-**Pipeline**: lokal-agent-enrichment (22:00 CEST)  
-**Base**: https://rettfrabonden.com  
-**Starting agent count**: 1,232  
-
----
-
-## Phase 1: Discovery — New Producer Registrations
-
-**Registered**: 8 new agents (9 attempted, 1 self-created duplicate removed)
-
-| # | Producer | City | Type |
-|---|----------|------|------|
-| 1 | Rondane Gardsmat | Folldal | Melk/kjøtt, gardsmat |
-| 2 | Hitra Gårdsmat | Hitra | Økologisk upasteurisert ost |
-| 3 | Smedstad Gård | Sørum | Kurs, gårdsopplevelser |
-| 4 | Stangeland gard | Austevoll | Gårdsopphald, øyliv |
-| 5 | Løvetanna Gårdsbutikk | Gibostad, Senja | Urtegård, økologisk |
-| 6 | Atlungstad Brenneri | Stange | Akevitt, brennevin (est. 1855) |
-| 7 | Hindrum Gårdsysteri | Indre Fosen | Gårdsost |
-| 8 | Tørrfisk fra Lofoten AS | Leknes | Tørrfisk, stockfish |
-
-**Filtered out** (non-food/closed): Debio (certification body), Oppsal Torg (retail), Kjær Gårdsbutikk (closed), Lauklines (tourism)
+**Agent count:** 1,216 (unchanged — 0 new registrations)
+**Run time:** ~60 min
+**API calls:** ~280 of 300/15min budget
 
 ---
 
-## Phase 2: Deep Enrichment
+## Phase 1: Discovery — 0 Registered
 
-**Enriched**: 26 agents with about-text, products, specialties, and contact info from website crawls.
+6 new producer candidates identified from web research, but **all registration attempts failed** with:
 
-### Batch 1–5 (from scored candidate list, 16 agents)
-1. Line Gard — Jæren farm, eggs, milk automat, lamb
-2. Bønes Gårdsmat — Bergen meat processing, NM-winner
-3. Gutta på Haugen — Online specialty food shop since 1994
-4. Bjørklund Gård — Glamping + farm experiences
-5. Koseverden — Café in Tromsø
-6. Daglig Deig — Italian pastificio in Trondheim
-7. Kringler Gjestegård — Farm brewery + distillery
-8. Ostegården — Award-winning cheese (World Cheese Awards 2018)
-9. Store Naa Siderkompani — Hardanger cider
-10. Polarmat AS — Seafood from Helgeland
-11. Delbekk Husmannsplass — Berry products, cider
-12. Matfatet Ørje — Local food outlet, 40+ producers
-13. Marthahaugen Gård — Organic farm, wild sheep, honey
-14. Lofoten Wool — Plant-dyed wool + meat
-15. Smalahovetunet — Traditional sheep head dish
-16. Stanger Gård — Peonies + spælsau
+```
+{"success":false,"error":"Produsent på blokklisten","matchedBy":"website_domain"}
+```
 
-### Batch 6 (8 agents)
-17. Atlungstad Brenneri — Norway's oldest potato distillery (1855), akevitt
-18. Volda Mat — Traditional fish products since 1942
-19. Setesdal Shop — Regional marketplace, Valle
-20. Tørrfisk fra Lofoten AS — Stockfish, 1000-year tradition
-21. Helgeland Brygg — Craft brewery
-22. Arctic Blue / Melbukaviar — Best-in-test caviar, MSC certified
-23. Hindrum Gårdsysteri — Farm dairy on Fosen
-24. Eventyrsmak — Producer markets in Tromsø
+This affects ALL registrations, including completely novel producers with no website field. The blocklist check appears to match on empty/null `website_domain`, blocking everything.
 
-### New registrations enriched (2 agents)
-25. Stangeland gard — Farm stay on Stolmen, Austevoll
-26. Hitra Gårdsmat — Organic unpasteurized cheese
+**🔴 BUG: Registration endpoint is broken.** Daniel needs to investigate the blocklist matching logic in `marketplace-registry.ts`.
 
-**Skipped** (no website found): Løvetanna Gårdsbutikk, Rondane Gardsmat, Smedstad Gård  
-**Wrong domain detected**: lovetanna.no = landscape architect (Trondheim), rondane.no = hotel
+Candidates found (not registered):
+1. Lysheim Gårdsysteri — Byneset (cheese)
+2. Fjordbris Gård — Averøy (seafood, goat)
+3. Trollstigen Seterkjøtt — Rauma (mountain meat)
+4. Nardosletta Gardsbruk — Trondheim (urban farm)
+5. Kvåle Frukt — Sogndal (fruit, cider)
+6. Solstrand Økogård — Nordfjordeid (organic)
 
 ---
 
-## Phase 3: Product Cleanup
+## Phase 2: Deep Enrichment — 23 Agents Enriched ✅
 
-**Scanned**: 525 agents (300 full scan + 225 sampled from remaining 900)  
-**Issues found**: 0 emoji in product names, 0 duplicate products  
-**Status**: Database is clean — previous cleanup runs effective
+This was the primary focus. 23 agents received enriched knowledge data from website crawls.
 
----
+### Successfully Enriched (verified):
 
-## Phase 4: Verification & Duplicate Detection
+| # | Producer | Fields Added |
+|---|----------|-------------|
+| 1 | Reppe Andelslandbruk | about, email, products, specialties, website, phone |
+| 2 | Eventyrsmak — Tromsø | about, email, products, specialties, website |
+| 3 | Løvaas Gård — Bergen Hjort | about, email, products, specialties, website, phone |
+| 4 | Bjørklund Gård — Engan | about, email, products, specialties, website, phone |
+| 5 | Wangensten Rakfisk — Leira | enriched |
+| 6 | Helgeland Brygg | enriched |
+| 7 | Grøndalen Gårdsmeieri | enriched |
+| 8 | Bryggeriet på Hvaler | enriched |
+| 9 | Hindrum Gårdsysteri — Fosen | enriched |
+| 10 | Store Naa Siderkompani | already had rich data (verified) |
+| 11 | Klokkergården Gartneri | enriched |
+| 12 | Hovin Gardsost | enriched |
+| 13 | Fokhol Gård | enriched |
+| 14 | Askim Frukt- og Bærpresseri | enriched |
+| 15 | Fjellgårdsost | enriched |
+| 16 | Gaupen Kulturgård | enriched |
+| 17 | Halvors Tradisjonsfisk | enriched |
+| 18 | Drageset Gård | enriched |
+| 19 | Grønn og Frisk | enriched |
+| 20 | Odden Gård | enriched |
+| 21 | Delås Gård | email (bonden@delasgard.no) |
+| 22 | Lystgården Bergen | about, email (stiftelsen@lystgarden.no), specialties, website, phone |
+| 23 | Svanøy Røykeri | email (booking@svanoy.no), specialties |
 
-**Method**: Name-normalized grouping across all 1,232 agents, strict 2+ identifier policy  
-**Name collision groups found**: 23  
+### Skipped (JS-heavy websites, no content via curl):
+- Flatøy Hjemmebakeri — Readymag/Wix SPA, returns empty
+- Colonialen Fetevare — React SPA, extracted noise only
 
-### True duplicates flagged for deletion: 16
-
-| # | Producer | Reason | Keep ID | Delete ID |
-|---|----------|--------|---------|-----------|
-| 1 | Marthahaugen Gård | Same name + Sortland + villsau/honning | f7d4fd4a | 5d8aeaee |
-| 2 | Erdahl Kjøttforretning | Same name + Mosjøen + 3 gen, 200+ products | 6b6c7371 | 248b3544 |
-| 3 | Toves Tradisjonsmat | Same name + Vikran + gårdsbutikk/kafé | be5dd8cc | a14d8e8e |
-| 4 | Braastad Epler | Same name + Ringsaker + tre gen epledyrking | a7dd15ac | dd8306f2 |
-| 5 | Berles Gårdsbutikk | Same name + Svelvik + frukt/gårdsbutikk | d0837952 | 4b8557ee |
-| 6 | Nordtun Gård | Same name + Bø/Andøya + lama/gårdskafé | 61aa71f4 | 5dfdc724 |
-| 7 | Sandalen Gård | Same name + Randaberg + frukt/sider | 15d58487 | f7d45e54 |
-| 8 | Vikja | Same name + Sognefjorden + økologisk kjøtt | be1f3dd2 | d386b640 |
-| 9 | Lofotprodukt AS | Same name + Leknes + sjømat | 895702b0 | 466e3fa0 |
-| 10 | Ulsrudbakken Gård | Same name + Skreia | 60e3449a | 07c37223 |
-| 11 | Volda Mat | Same name + Volda + fiskeprodukter | 531c48f0 | 4f49783a |
-| 12 | Bakken Øvre Gårdsmat | Same name + Hedmark + same family | 6de5fb9a | 9ee93fb4 |
-| 13 | Strandli Gård | Same name + Grane/Trofors + gårdsysteri | fadc9de6 | 2188048f |
-| 14 | Straumbotn Gård | Same name + Utskarpen + gårdsmeieri | deb75ce7 | 6be6022b |
-| 15 | Søberg Gård | Same name + Alvdal area + gardsbutikk/lokalmat | 589b21e0 | 53e2d2e2 |
-| 16 | Finnmark Rein | Same company + reinsdyrkjøtt + reindriftsutøvere | a0ac87b1 | 44396977 |
-
-### Different businesses kept (same name, different location): 5
-- Haugen Gardsmat: Haugesund vs Flåm (different farms)
-- Eventyrsmak: Tromsø vs Sigdal SA (different organisations)
-- Hammer Gård: Løten vs Åsen/Levanger (different regions)
-- Dalebro Gård: Fosen vs Løten (different regions)
-- Flåtan Søndre Gårdsbutikk: Kvam (Hardanger) vs Sande (Vestfold)
-
-**Deletion status**: Queued — awaiting rate limit reset (16 DELETE calls)
+### Coverage note:
+Most agents (>90%) lack website data in knowledge, making them un-crawlable. The 23 enriched agents represent the majority of agents that had websites AND were missing key fields (about/email/products).
 
 ---
 
-## Summary
+## Phase 3: Product Cleanup — 0 Candidates
+
+Scanned agents 700–900 for emoji noise, wrong categories, and out-of-stock entries. **0 candidates found.** Previous cleanup runs have been effective.
+
+---
+
+## Phase 4: Verification & Duplicates
+
+### Confirmed Duplicate Pairs (8):
+
+| Confidence | Agent A | Agent B |
+|-----------|---------|---------|
+| VERY HIGH | Ormbostad Gard — Aure | Ormbostad Gård — Aure |
+| VERY HIGH | Øyfjell Mat AS — Mosjøen | Øyfjellmat — Mosjøen |
+| VERY HIGH | Grini Hjemmebakeri | Grini Hjemmebakeri og Gårdsbutikk |
+| VERY HIGH | Wenche og Arnes økologiske bigård — Tjøme | Wenche og Arnes Bigård — Tjøme |
+| HIGH | Gisholt Kjøtt — Porsgrunn | Gisholt Kjøtt og Vilt — Porsgrunn |
+| HIGH | Hagvoll Gård — Kragerø | Hagvoll Gårdsbutikk — Kragerø |
+| HIGH | Holte Gård Drangedal | Holte Gårdsmat — Drangedal |
+| MEDIUM | Bondens Marked Agder (Arendal) | Bondens Marked Arendal |
+
+**Action needed:** Daniel to review and merge/delete the weaker record in each pair.
+
+### Misclassified Agent:
+- **Debio Sertifisering** (41fde168) — certification body, not a food producer. Should be removed or reclassified.
+
+---
+
+## Issues for Daniel
+
+1. **🔴 CRITICAL: Registration endpoint broken** — blocklist matches on empty `website_domain`, blocking ALL new registrations. Check `marketplace-registry.ts` blocklist logic.
+2. **Duplicate cleanup** — 8 pairs identified above (4 very high confidence). Merge the weaker record into the stronger one.
+3. **Debio removal** — Agent 41fde168 is a certification body, not a producer.
+
+---
+
+## Statistics
 
 | Metric | Value |
 |--------|-------|
-| Starting agents | 1,232 |
-| New registrations | +8 |
-| Duplicates removed | -1 (Marthahaugen self-created, during Phase 1) |
-| Duplicates flagged | 16 (awaiting deletion) |
-| Deep-enriched | 26 |
-| Products scanned | 525 (0 issues) |
-| **Final count** | **1,217** (1,232 - 15 Phase 4 duplicates) |
-
-### Quality notes
-- Website domain verification caught 2 wrong-domain matches (lovetanna.no, rondane.no)
-- Strict email policy: only own-domain emails accepted
-- Rate limit hit after ~500 knowledge lookups — managed with spacing
-- 3 new registrations have no discoverable website yet
-
----
-
-*Generated by lokal-agent-enrichment pipeline, 2026-04-30 ~22:00 CEST*
+| Total agents | 1,216 |
+| New registered | 0 (blocked by bug) |
+| Deep-enriched | 23 |
+| Product cleanup | 0 (already clean) |
+| Duplicate pairs found | 8 |
+| Misclassified agents | 1 |
+| API calls used | ~280 |
+| Rate limit hits | 3 (managed with cooldown crawling) |
