@@ -80,7 +80,7 @@ export const AdminRegistrationSchema = z.object({
   provider: z.string().default("auto-discovery"),
   contactEmail: z.string().default(""),
 
-  url: z.string().default("https://rettfrabonden.com"),
+  url: z.string().default(""),  // empty = "no known website" — DB layer falls back; do NOT default to our domain (creates false-positive blocklist matches)
   version: z.string().default("1.0.0"),
   capabilities: z.record(z.string(), z.any()).default({}),
 

@@ -47,6 +47,14 @@ export function normalizeDomain(input: string | null | undefined): string {
   return s;
 }
 
+// ─── Sentinel: our own domain ──────────────────────────────────
+// rettfrabonden.com is the schema default for AdminRegistration.url
+// when discovery doesn't know the producer's real website. Treating
+// this as a real producer signal is wrong — every blocklist match on
+// our own domain is a false positive. Both the read path (isBlocked)
+// and the write path (add) refuse to operate on it.
+const OWN_DOMAINS = new Set(["rettfrabonden.com", "lokal.fly.dev"]);
+
 export function normalizeName(input: string | null | undefined): string {
   if (!input) return "";
   // Match the slugify rules so a blocked "Øvre-Eide Gård" catches
@@ -81,11 +89,11 @@ export function isBlocked(opts: {
     if (opts.agentId) checks.push(["agent_id", opts.agentId.toLowerCase()]);
     if (opts.website) {
       const dom = normalizeDomain(opts.website);
-      if (dom) checks.push(["website_domain", dom]);
+      if (dom && !OWN_DOMAINS.has(dom)) checks.push(["website_domain", dom]);
     }
     if (opts.email) {
       const dom = normalizeDomain(opts.email);
-      if (dom) checks.push(["email_domain", dom]);
+      if (dom && !OWN_DOMAINS.has(dom)) checks.push(["email_domain", dom]);
     }
     if (opts.name) {
       const norm = normalizeName(opts.name);
@@ -135,11 +143,11 @@ export function add(input: {
   if (input.agentId) rowsToInsert.push({ type: "agent_id", value: input.agentId.toLowerCase() });
   if (input.website) {
     const dom = normalizeDomain(input.website);
-    if (dom) rowsToInsert.push({ type: "website_domain", value: dom });
+    if (dom && !OWN_DOMAINS.has(dom)) rowsToInsert.push({ type: "website_domain", value: dom });
   }
   if (input.email) {
     const dom = normalizeDomain(input.email);
-    if (dom) rowsToInsert.push({ type: "email_domain", value: dom });
+    if (dom && !OWN_DOMAINS.has(dom)) rowsToInsert.push({ type: "email_domain", value: dom });
   }
   if (input.name) {
     const norm = normalizeName(input.name);
