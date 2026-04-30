@@ -4,7 +4,7 @@
 **Project:** Rett fra Bonden (rettfrabonden.com)
 **Domain:** Local food producers in Norway
 **Timeline:** March 29 – April 21, 2026 (~3.5 weeks)
-**Result:** 1,165 live producer agents (1,400+ total records), 5 MCP marketplaces, A2A protocol, Custom GPT, Claude Connectors, AWS Bedrock AgentCore Registry
+**Result:** 1,195 live producer agents (1,400+ total records), 5 MCP marketplaces, A2A protocol, Custom GPT, Claude Connectors, AWS Bedrock AgentCore Registry
 **Auto-updated by:** `rfb-guidebook` scheduled agent
 
 > This guide is designed so that an AI agent can follow it step-by-step to reproduce the entire project with a different domain/vertical. Human intervention is only needed for: account logins, domain purchases, and payment confirmations.
@@ -2408,6 +2408,48 @@ Spec versions seen in the wild:
 
 Commit: `71f3a81`. Old conversations with malformed `query_text` still sit in the DB; the fix only stops new ones from being recorded that way.
 
+### 17.7 Harden the A2A Endpoint Against Header-less Probes
+
+JSON-RPC clients are well-behaved; registry health-probers and curiosity probes are not. When `a2aregistry.org`'s prober POSTs to `/a2a` without `Content-Type: application/json`, Express's body-parser silently leaves `req.body` as `undefined`. The original handler immediately destructured it (`const { method, params, id } = req.body`), threw a `TypeError` synchronously (before the `try`/`catch` wrapping the JSON-RPC dispatch), and Express fell back to its default HTML 500 page. Result: the registry's auto-prober logged "A2A endpoint returns 404 Not Found" — a misleading symptom that maintainers hand-pin as a *sticky* note. Same shape kills any naive curl probe (`curl -X POST https://rettfrabonden.com/a2a` without flags).
+
+Guard at the very top of the route, before destructuring:
+
+```typescript
+// src/routes/a2a.ts
+router.post("/a2a", async (req: Request, res: Response) => {
+  if (!req.body || typeof req.body !== "object") {
+    return res.status(400).json({
+      jsonrpc: "2.0",
+      error: { code: -32700, message: "Parse error: missing or invalid JSON body" },
+      id: null,
+    });
+  }
+  const { method, params, id } = req.body;
+  // ... rest of handler
+});
+```
+
+Two micro-details that matter:
+
+1. **`-32700` is the JSON-RPC reserved code for *Parse error***. Don't invent a custom code; spec-compliant clients can already render this.
+2. **Use `id ?? null`, not `id || null`**, when echoing the request id. With `||`, a perfectly valid `id: 0` round-trips as `null` and downstream correlation breaks.
+
+Probe both shapes after every change:
+
+```bash
+# Happy path: should still return result.task.status:'completed'
+curl -s -X POST -H 'Content-Type: application/json' \
+  -d '{"jsonrpc":"2.0","id":1,"method":"message/send",
+       "params":{"message":{"role":"user","parts":[{"text":"melk"}]}}}' \
+  https://rettfrabonden.com/a2a | jq .result.task.status
+
+# Header-less probe: was HTML 500, now 400 with structured JSON-RPC error
+curl -s -o /dev/null -w '%{http_code}\n' -X POST https://rettfrabonden.com/a2a
+```
+
+Commit: `1d88b6a`. Lesson: **registry probers and naive curl share a failure mode — the unhappy path needs a structured response too, not just a stack trace.**
+
+
 
 ---
 
@@ -2566,6 +2608,16 @@ Post-deploy:
 45. **Vendor-domain allowlist must match subdomains, not just exact strings** — `accounts.google.com`, `sc-noreply.google.com`, `mail-noreply.google.com` all classified as `unknown` because `VENDOR_DOMAINS.has("accounts.google.com")` is `false` when only `google.com` is in the set. Add a `matchesVendorDomain()` helper that also checks `domain.endsWith("." + v)`. Same rule applies to any allowlist matching a domain (CORS, blocklists, trust scoring). Commit: `2cd53a0`.
 
 46. **`unknown` CRM contacts must be re-evaluated on every subsequent ingest, not just at create-time** — A producer replies *before* the discovery agent has registered them → contact is created as `unknown` → discovery seeds the producer next morning → contact is still `unknown` because `resolveContact()` only ran classification on first sight. Fix: when an existing row has `type='unknown'`, re-run `classifyEmail()` on every ingest and promote in place if the new answer is non-unknown. Pair with a `POST /api/crm/contacts/reclassify-unknown` admin endpoint that does the same thing in bulk for the long-tail backlog after seeding runs. Cheap (one indexed lookup per row), idempotent, run it at the tail of every discovery/enrichment job. Commit: `c85d2de`.
+
+47. **`k.products.length` is true for strings, not just arrays** — `(k.products || []).filter(...)` and `if (k?.products?.length)` both *look* defensive, but neither guards against the bad-data shape we actually see in prod: a non-empty STRING in `agent_knowledge.products`. Strings have `.length` too, and `String.prototype.filter` doesn't exist, so a request that hits `agent_knowledge.products = "honning, vokslys"` crashes the route with `TypeError: k.products.filter is not a function`. The right guard is `Array.isArray(k?.products) && k.products.length`. Same defect surfaced in `conversation-service.ts:150` and `marketplace.ts:447` on consecutive deploys — symptom: `/api/marketplace/search?q=fisk&limit=100` returns 500. Probably worth centralising in `knowledge-service.rowToKnowledge()` so every reader gets a known-array shape, but a hotfix sweep with `Array.isArray` works in the meantime. Commits: `5a7d182`, `8197525`.
+
+48. **GitHub Actions Fly deploy needs the `BUILD_REV` build-arg explicitly threaded** — Appendix C.32 documented the Dockerfile cache-bust pattern, and the *manual* supervisor `flyctl deploy --build-arg BUILD_REV=$(git rev-parse HEAD)` was honouring it. The `.github/workflows/fly-deploy.yml` step did not — `flyctl deploy --remote-only` defaulted `ARG BUILD_REV=dev` on every CI build, the LABEL block never changed across commits, and Fly's remote builder reused the cached `COPY src/` layer indefinitely. Symptom on 2026-04-27: a search-500 hotfix in `conversation-service.ts` showed `GH_SHA` LABEL matching HEAD, but `flyctl image show` showed `build_rev=dev` and Fly logs *kept emitting the pre-fix TypeError*. Fix: add `--build-arg BUILD_REV=${{ github.sha }}` to the workflow's flyctl step. Verify with `flyctl image show -a lokal | grep build_rev` after every deploy. Commit: `f80f42a`. Lesson: **the cache-bust pattern is correct but the cache-bust *value* is also part of the deploy contract — every deploy path has to thread it.**
+
+49. **`/a2a` POST without `Content-Type: application/json` returned HTML 500, masquerading as 404** — Registry health-probers and naive `curl -X POST` requests don't always send the JSON body header. Express's body-parser then leaves `req.body === undefined`. The handler destructured it before the JSON-RPC try/catch caught the throw, so Express fell back to its default HTML 500 page. The `a2aregistry.org` maintainer hand-pinned a sticky `maintainer_notes` ("A2A endpoint returns 404 Not Found") that PUT refresh could not clear — likely because the prober was triggering this exact path. Always guard before destructuring; return a JSON-RPC `-32700` Parse error with HTTP 400 instead. Use `id ?? null`, not `id || null`, so `id:0` round-trips. Commit: `1d88b6a`. See Phase 17.7. Lesson: **the unhappy path needs a structured response too — every public protocol endpoint should be probed without optional headers as part of CI smoke.**
+
+50. **`/sok?q=X` rendered a constant "30 treff" header regardless of true total count** — The route capped `discover()` at `limit=30` and rendered `${results.length} treff` directly in the H1. So every search at-or-above the cap looked identical to humans *and* AI crawlers indexing the page. Fix: when `results.length` hits the cap, run one extra `discover()` with `limit=100` purely to learn the true count (cheap, in-memory ranked), then render `"M+ treff"` when even the second probe caps, `"viser N av M"` when not, and `"M treff"` when below cap. Commit: `5a7d182`. Lesson: **any aggregate count rendered for crawlers must be the real total, not a paginated slice — if you've capped the query, you've lied about the result.**
+
+51. **`/llms.txt` "byer dekket" / "matkategorier" reported the slice length, not the Map size** — Same shape: `topCities.slice(0, 15).length` is always 15, but `cities.size` is ~370. AI agents reading `llms.txt` were under-indexing the platform's true coverage by ~25×. The slice is the right shape for the *list* of top cities to display, but the wrong shape for the *count* claim about coverage. Read `cities.size` / `categories.size` for the headline number; keep the slice for the rendered list. Commit: `5a7d182`. Lesson: **slices answer "what should I show", `.size` answers "how much do I have" — never substitute one for the other in self-describing content.**
 
 ### C.2 Architecture Decisions
 
@@ -2750,8 +2802,9 @@ to build the same platform for a different vertical.
 | 2026-04-25 | 5, 7, 8, 11, 12, 16, 17, C | Smart fallback for `/produsent/<slug>` 404s (5.7). HTTP-status + AI-bot producer outcomes analytics (7.10). Enheter device parsing, dynamic bot naming, owner UX, Samtaler panel (7.11). Rotate-keys admin endpoint + .gitignore for `data/dist` after key leak (8.4). `agent_blocklist` table + opt-out gate (8.5). Wire `googleRating` into `communitySignal()` (11.8). Slug single-source-of-truth + `canonicalUrl` field (12.7). GitHub-Actions auto-deploy replaces local `flyctl` (16.4). `AgentCard.url` at `/a2a` JSON-RPC endpoint + `tasks/send` backward-compat alias + Dockerfile `BUILD_REV` cache-bust (17.5). Tolerant A2A `parts[]` extractor (17.6). Smart name-search without indicator words. Google Search Console structured-data fixes. Appendix C: C.31 (`nul` blocks Windows pull), C.32 (Fly cache-bust), C.33 (`AgentCard.url` = endpoint), C.34 (parts discriminator drift), C.35 (data file leak), C.36 (placeholder community signal), C.37 (reader/writer schema drift), C.38 (case-insensitive owner UA), C.39 (slug logic reinvented 4×), C.40 (AI engines invent slugs), C.41 (discovery re-inserts opted-out), C.42 (name-search needs DB lookup), C.43 (`Product` schema). |
 | 2026-04-26 | 5, 7, 17 | Static-page SEO meta on `/selger` + `/app`, `noindex` on admin pages (5.8). Inbox CRM dashboard at `/admin/crm-dashboard` with 5 new tables, 14 endpoints, single-file 554-line UI (7.12). Unify stale fallback counts (`1,400+` → `1,150+`) + add `repository` field to MCP server card. |
 | 2026-04-27 | 7, C | CRM contact-resolution upgrade (7.12.1): `classifyEmail()` split out as a pure function, freemail allowlist prevents gmail/outlook senders from shadowing real producer matches, vendor allowlist now accepts subdomain suffixes (`accounts.google.com` → `google.com`), `unknown` rows re-evaluated on every subsequent ingest plus bulk endpoint `POST /api/crm/contacts/reclassify-unknown`. CSP-safe event delegation in `admin-crm.html` (7.12.2): all 16 inline `onclick`/`onchange`/`onblur` replaced with `data-action` + a single `document.body` listener after Comet browser blocked login. "✓ Ferdig" one-click status button on each thread. Stale-count fallbacks `1,100`/`1,150+` → `1,170+` across `discovery.ts`, `agent-readiness.ts`, narrator strings in `app.html`/`dashboard.html`, README, server.json. Appendix C: C.44 (CSP-strict browsers kill inline `onclick`), C.45 (vendor-domain subdomain match), C.46 (re-classify `unknown` on every ingest). |
+| 2026-04-30 | 16, 17, C | CI cache-bust fix: `.github/workflows/fly-deploy.yml` now threads `--build-arg BUILD_REV=${{ github.sha }}` (16.4) — without it, GH-Actions builds defaulted `ARG BUILD_REV=dev` and Fly's remote builder reused the cached `COPY src/` layer for three weeks. `/a2a` POST hardened against header-less probes: returns JSON-RPC `-32700` (HTTP 400) instead of HTML 500, likely cause of the sticky `a2aregistry.org` maintainer note that PUT refresh couldn't clear (17.7). Repo hygiene: `mcp-server/node_modules/` untracked (~28 MB), six dead files removed (`seo-backup.ts`, `LokalApp_copy.jsx`, two PowerShell scripts, etc.) — `tsc` and 39/39 tests still pass. Stale narrator + fallback literals walked from `1,170+` → `1,180+` → `1,195+` to match prod (DB at 1,195). Appendix C: C.47 (`Array.isArray` guard — strings have `.length` too), C.48 (CI deploy must thread `BUILD_REV`), C.49 (A2A endpoint guard for missing body / wrong Content-Type), C.50 (`/sok` H1 was always `30 treff`), C.51 (`/llms.txt` reported slice length not Map size). |
 
 ---
 
-*Last updated: 2026-04-27 (14:00 CEST) by rfb-guidebook agent*
-*Guide version: 1.4.0*
+*Last updated: 2026-04-30 (14:00 CEST) by rfb-guidebook agent*
+*Guide version: 1.5.0*
