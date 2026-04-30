@@ -226,6 +226,104 @@ router.post("/threads/:id/send", async (req, res) => {
   });
 });
 
+// ─── POST /admin/crm/compose ─────────────────────────────────
+// New free-form email — creates a new thread + contact (if needed),
+// inserts an outbound message, then either sends immediately via Resend
+// or queues a Gmail draft for the CS-agent.
+//
+// Use case: Daniel needs to email a producer/partner for whom no inbound
+// thread yet exists (e.g. re-issuing a verification link after the Erga
+// dedup incident). Reply-to is kontakt@rettfrabonden.com so future replies
+// land in the inbox and get ingested by the CS-agent on next run.
+const composeSchema = z.object({
+  to: z.string().email(),
+  contactName: z.string().max(200).optional(),
+  subject: z.string().min(1).max(500),
+  bodyText: z.string().min(1).max(50000),
+  bodyHtml: z.string().max(100000).optional(),
+  intent: z.enum(["gmail_draft", "resend_send"]),
+  category: z.enum(["innkommende", "marketing", "leverandor", "system", "unknown"]).optional(),
+  severity: z.enum(["p0", "p1", "p2", "normal"]).optional(),
+  createdBy: z.enum(["claude", "daniel"]),
+});
+
+router.post("/compose", async (req, res) => {
+  const parsed = composeSchema.safeParse(req.body);
+  if (!parsed.success) return res.status(400).json({ error: "invalid body", details: parsed.error.issues });
+  const { to, contactName, subject, bodyText, bodyHtml, intent, category, severity, createdBy } = parsed.data;
+
+  try {
+    const { threadId, contactId } = crmService.composeNewThread({
+      toEmail: to,
+      contactName,
+      subject,
+      bodyText,
+      bodyHtml,
+      category: category ?? "innkommende",
+      severity: severity ?? "normal",
+      createdBy,
+    });
+
+    const queued = crmService.enqueueOutbox({
+      threadId,
+      contactId,
+      intent,
+      toEmails: [to],
+      subject,
+      bodyText,
+      bodyHtml,
+      replyToMessageId: null,
+      createdBy,
+    });
+
+    if (intent === "resend_send") {
+      try {
+        const result = await emailService.sendRaw({
+          to,
+          subject,
+          textContent: bodyText,
+          htmlContent: bodyHtml ?? bodyText,
+        });
+        if (result.success) {
+          crmService.markOutboxResult(queued.id, "completed", result.messageId);
+          crmService.logAction({
+            threadId,
+            contactId,
+            type: "sent",
+            actor: createdBy,
+            payload: { outboxId: queued.id, messageId: result.messageId, channel: "resend_smtp", composedNew: true },
+          });
+          return res.json({
+            success: true,
+            threadId,
+            contactId,
+            outboxId: queued.id,
+            messageId: result.messageId,
+            channel: "resend_smtp",
+          });
+        }
+        crmService.markOutboxResult(queued.id, "failed", undefined, result.error || "send failed");
+        return res.status(500).json({ success: false, error: result.error || "send failed", outboxId: queued.id, threadId });
+      } catch (err: any) {
+        crmService.markOutboxResult(queued.id, "failed", undefined, err.message ?? "exception");
+        return res.status(500).json({ success: false, error: err.message ?? "exception", threadId });
+      }
+    }
+
+    // gmail_draft path
+    res.json({
+      success: true,
+      threadId,
+      contactId,
+      outboxId: queued.id,
+      intent: "gmail_draft",
+      note: "Queued — will appear in your Gmail Drafts after next CS-agent run.",
+    });
+  } catch (err: any) {
+    res.status(500).json({ success: false, error: err.message ?? "compose failed" });
+  }
+});
+
 // ─── POST /admin/crm/ingest ──────────────────────────────────
 // Called by the CS-agent each run with new/updated threads.
 router.post("/ingest", (req, res) => {

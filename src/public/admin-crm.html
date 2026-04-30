@@ -74,6 +74,18 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;backgrou
 .pill.p1{background:#fbbf2422;color:#fbbf24}
 .select{padding:6px 10px;background:var(--surface2);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:12px;cursor:pointer;outline:none}
 
+.compose-overlay{position:fixed;inset:0;background:rgba(0,0,0,0.6);display:flex;align-items:center;justify-content:center;z-index:1000;backdrop-filter:blur(2px)}
+.compose-modal{background:var(--bg);border:1px solid var(--border);border-radius:12px;width:min(640px,92vw);max-height:90vh;display:flex;flex-direction:column;box-shadow:0 20px 60px rgba(0,0,0,0.5)}
+.compose-header{display:flex;align-items:center;gap:14px;padding:14px 18px;border-bottom:1px solid var(--border)}
+.compose-header strong{font-size:14px}
+.compose-header button{margin-left:auto}
+.compose-body{padding:14px 18px;overflow-y:auto;display:flex;flex-direction:column;gap:10px}
+.compose-body label{display:flex;flex-direction:column;font-size:11px;color:var(--text-dim);gap:4px;text-transform:uppercase;letter-spacing:0.5px;font-weight:600}
+.compose-body label input,.compose-body label textarea,.compose-body label select{padding:8px 12px;background:var(--surface2);border:1px solid var(--border);border-radius:6px;color:var(--text);font-size:13px;text-transform:none;letter-spacing:normal;font-weight:400}
+.compose-body label textarea{resize:vertical;font-family:inherit;line-height:1.45}
+.compose-body .modes{display:flex;gap:14px;font-size:12px;color:var(--text);text-transform:none;letter-spacing:normal;font-weight:400}
+.compose-body .modes label{flex-direction:row;align-items:center;gap:6px;text-transform:none;letter-spacing:normal;font-weight:400}
+.compose-footer{display:flex;justify-content:flex-end;gap:10px;padding:12px 18px;border-top:1px solid var(--border);background:var(--surface)}
 .threads-section{padding:18px 24px}
 .section-title{font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:0.5px;color:var(--text-dim);margin-bottom:12px}
 .thread-card{background:var(--surface);border:1px solid var(--border);border-radius:8px;padding:14px;margin-bottom:10px;cursor:pointer}
@@ -151,7 +163,41 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;backgrou
       <span class="kpi warn"><span class="num" id="kpiAwait">0</span> venter</span>
       <span class="kpi"><span class="num" id="kpiOutbox">0</span> i kø</span>
       <button class="btn-sm" data-action="refresh">↻ Oppdater</button>
+      <button class="btn-primary btn-sm" data-action="openCompose" title="Send ny e-post fra kontakt@rettfrabonden.com">✉ Ny epost</button>
       <button class="btn-sm" data-action="logout">Logg ut</button>
+    </div>
+  </div>
+
+  <div id="composeOverlay" class="compose-overlay" style="display:none">
+    <div class="compose-modal">
+      <div class="compose-header">
+        <strong>Ny e-post</strong>
+        <span style="color:var(--text-dim);font-size:11px">Sendes fra <code>kontakt@rettfrabonden.com</code></span>
+        <button class="btn-sm" data-action="closeCompose" title="Lukk">✕</button>
+      </div>
+      <div class="compose-body">
+        <label>Til <input type="email" id="composeNewTo" placeholder="navn@eksempel.no" autocomplete="off"></label>
+        <label>Navn (valgfritt) <input type="text" id="composeNewName" placeholder="Bård-Egil Erga" autocomplete="off"></label>
+        <label>Emne <input type="text" id="composeNewSubject" placeholder="..." autocomplete="off"></label>
+        <label>Melding <textarea id="composeNewBody" rows="10" placeholder="Skriv melding her…"></textarea></label>
+        <label>Kategori
+          <select id="composeNewCategory">
+            <option value="innkommende" selected>Kunde / produsent</option>
+            <option value="leverandor">Leverandør</option>
+            <option value="marketing">Markedsføring</option>
+            <option value="system">System</option>
+            <option value="unknown">Ukjent</option>
+          </select>
+        </label>
+        <div class="modes">
+          <label><input type="radio" name="composeNewMode" value="gmail_draft" checked> Lag draft i Gmail</label>
+          <label><input type="radio" name="composeNewMode" value="resend_send"> Send nå (Resend)</label>
+        </div>
+      </div>
+      <div class="compose-footer">
+        <button class="btn-secondary" data-action="closeCompose">Avbryt</button>
+        <button class="btn-primary" data-action="sendCompose" id="composeNewSendBtn">Send</button>
+      </div>
     </div>
   </div>
 
@@ -550,8 +596,57 @@ function slugify(s) {
 }
 
 // ─── Event delegation (CSP-safe — no inline handlers) ───
+function openCompose() {
+  document.getElementById('composeOverlay').style.display = 'flex';
+  setTimeout(() => document.getElementById('composeNewTo')?.focus(), 50);
+}
+
+function closeCompose() {
+  document.getElementById('composeOverlay').style.display = 'none';
+  // Don't clear fields — Daniel may want to retry on send-failure.
+  // Clearing only happens after successful send (in sendCompose).
+}
+
+async function sendCompose() {
+  const to = document.getElementById('composeNewTo').value.trim();
+  const name = document.getElementById('composeNewName').value.trim();
+  const subject = document.getElementById('composeNewSubject').value.trim();
+  const body = document.getElementById('composeNewBody').value.trim();
+  const category = document.getElementById('composeNewCategory').value;
+  const mode = document.querySelector('input[name=composeNewMode]:checked')?.value || 'gmail_draft';
+
+  if (!to || !subject || !body) { toast('Til, emne og melding må fylles ut', true); return; }
+  if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(to)) { toast('Ugyldig e-postadresse', true); return; }
+  if (mode === 'resend_send' && !confirm(`Sende e-post nå til ${to}?\n\nFra: kontakt@rettfrabonden.com\nDenne kan ikke trekkes tilbake.`)) return;
+
+  const btn = document.getElementById('composeNewSendBtn');
+  btn.disabled = true;
+  btn.innerHTML = '<span class="spinner"></span>';
+  try {
+    const r = await api('/compose', {
+      method: 'POST',
+      body: JSON.stringify({
+        to,
+        contactName: name || undefined,
+        subject,
+        bodyText: body,
+        intent: mode,
+        category,
+        createdBy: 'daniel',
+      })
+    });
+    toast(mode === 'resend_send' ? `Sendt til ${to}!` : 'Lagt i kø — agent oppretter draft ved neste kjøring');
+    // Clear fields + close
+    ['composeNewTo','composeNewName','composeNewSubject','composeNewBody'].forEach(id => document.getElementById(id).value = '');
+    closeCompose();
+    refresh();
+  } catch (e) { toast(e.message, true); }
+  finally { btn.disabled = false; btn.textContent = 'Send'; }
+}
+
 const ACTIONS = {
   login, logout, refresh,
+  openCompose, closeCompose, sendCompose,
   markDone: id => setThreadStatus(id, 'done'),
   search: onSearchChange,
   selectContact: id => selectContact(id),

@@ -264,6 +264,76 @@ class CrmService {
     return { threadId, contactId, newMessages };
   }
 
+  // ─── Compose a brand-new outbound thread ──────────────────
+  // Used by the CRM "Ny epost" UI. Creates the contact (if missing),
+  // a fresh thread, and one outbound message — then the route layer
+  // sends via Resend or enqueues a Gmail draft. Mirrors ingestThread's
+  // bookkeeping (denormalized counters, action log) so the new thread
+  // appears in the dashboard the same as inbound ones.
+  composeNewThread(input: {
+    toEmail: string;
+    contactName?: string | null;
+    subject: string;
+    bodyText: string;
+    bodyHtml?: string | null;
+    category?: "innkommende" | "marketing" | "leverandor" | "system" | "unknown";
+    severity?: "p0" | "p1" | "p2" | "normal";
+    createdBy: "claude" | "daniel";
+  }): { threadId: string; contactId: string } {
+    const db = getDb();
+    const lowerTo = input.toEmail.trim().toLowerCase();
+    const contact = this.resolveContact(lowerTo, input.contactName ?? null);
+    const contactId = contact.id;
+
+    if (input.contactName && contact.created) {
+      db.prepare("UPDATE crm_contacts SET name = COALESCE(name, ?) WHERE id = ?")
+        .run(input.contactName, contactId);
+    }
+
+    const threadId = `compose-${randomUUID()}`;
+    const messageId = `msg-${randomUUID()}`;
+    const now = new Date().toISOString();
+
+    db.prepare(`
+      INSERT INTO crm_threads (id, contact_id, subject, category, severity, assigned_to, status, last_message_at, last_outbound_at, message_count, updated_at)
+      VALUES (?, ?, ?, ?, ?, 'daniel', 'in_progress', ?, ?, 1, datetime('now'))
+    `).run(
+      threadId,
+      contactId,
+      input.subject,
+      input.category ?? "innkommende",
+      input.severity ?? "normal",
+      now,
+      now,
+    );
+
+    db.prepare(`
+      INSERT INTO crm_messages
+        (id, thread_id, direction, from_email, to_emails, cc_emails, subject, body_text, body_html, snippet, sent_at, raw_metadata)
+      VALUES (?, ?, 'out', 'kontakt@rettfrabonden.com', ?, '[]', ?, ?, ?, ?, ?, ?)
+    `).run(
+      messageId,
+      threadId,
+      JSON.stringify([lowerTo]),
+      input.subject,
+      input.bodyText,
+      input.bodyHtml ?? null,
+      (input.bodyText || "").slice(0, 200),
+      now,
+      JSON.stringify({ source: "crm-compose", createdBy: input.createdBy }),
+    );
+
+    this.logAction({
+      threadId,
+      contactId,
+      type: "composed",
+      actor: input.createdBy === "daniel" ? "daniel" : "claude",
+      payload: { messageId, to: lowerTo, subject: input.subject, source: "crm-compose-ui" },
+    });
+
+    return { threadId, contactId };
+  }
+
   setThreadStatus(threadId: string, status: ThreadStatus, actor: Actor): void {
     const db = getDb();
     const prev = db.prepare("SELECT status FROM crm_threads WHERE id = ?").get(threadId) as { status: string } | undefined;
