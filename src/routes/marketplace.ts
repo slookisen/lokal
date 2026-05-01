@@ -2155,8 +2155,14 @@ router.delete("/admin/blocklist/:id", (req: Request, res: Response) => {
 
 // ─── GET /admin/agents/dump ─────────────────────────────────
 // Returns all active agents with contact info for outreach tooling.
-// Fields: id, name, city, email, website, contacted_at, is_claimed.
+// Fields: id, name, city, email, website, contacted_at (derived from
+// crm_messages.sent_at, NULL if no outbound CRM message), is_claimed.
 // Protected by x-admin-key. Recommended by e15 marketing run 2026-04-30.
+//
+// HISTORY: Original commit a6e583a3 referenced a.contacted_at as if it
+// were a column on agents; that column does not exist and the endpoint
+// returned 500.  This rewrite derives contacted_at from CRM and makes
+// the ?uncontacted filter actually work.
 router.get("/admin/agents/dump", (req: Request, res: Response) => {
   const adminKey = req.headers["x-admin-key"] as string;
   const expectedKey = getAdminKey();
@@ -2170,19 +2176,29 @@ router.get("/admin/agents/dump", (req: Request, res: Response) => {
     const hasEmail = req.query.hasEmail === "true";
     const uncontacted = req.query.uncontacted === "true";
 
+    // contacted_at = MAX(crm_messages.sent_at) for any outbound msg
+    // sent to a crm_contact whose email matches a.contact_email.
     let sql = `
       SELECT a.id, a.name, a.city, a.contact_email as email, a.url as website,
-             a.contacted_at,
+             (
+               SELECT MAX(m.sent_at)
+               FROM crm_messages m
+               JOIN crm_contacts c ON c.id = m.contact_id
+               WHERE m.direction = 'outbound'
+                 AND LOWER(c.email) = LOWER(a.contact_email)
+             ) as contacted_at,
              CASE WHEN ac.id IS NOT NULL THEN 1 ELSE 0 END as is_claimed
       FROM agents a
       LEFT JOIN agent_claims ac ON ac.agent_id = a.id AND ac.status = 'verified'
       WHERE a.is_active = 1
     `;
     if (hasEmail) sql += " AND a.contact_email IS NOT NULL AND a.contact_email != ''";
-    if (uncontacted) sql += " AND a.contacted_at IS NULL";
     sql += " ORDER BY a.city, a.name";
 
-    const rows = db.prepare(sql).all();
+    let rows = db.prepare(sql).all() as any[];
+    if (uncontacted) {
+      rows = rows.filter((r) => r.contacted_at == null);
+    }
     res.json({ success: true, count: rows.length, agents: rows });
   } catch (err: any) {
     res.status(500).json({ error: "Dump failed", detail: err.message });
