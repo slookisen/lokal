@@ -2178,13 +2178,16 @@ router.get("/admin/agents/dump", (req: Request, res: Response) => {
 
     // contacted_at = MAX(crm_messages.sent_at) for any outbound msg
     // sent to a crm_contact whose email matches a.contact_email.
+    // crm_messages → crm_threads.contact_id → crm_contacts.id (no
+    // contact_id on messages directly).  direction enum is 'in'/'out'.
     let sql = `
       SELECT a.id, a.name, a.city, a.contact_email as email, a.url as website,
              (
                SELECT MAX(m.sent_at)
                FROM crm_messages m
-               JOIN crm_contacts c ON c.id = m.contact_id
-               WHERE m.direction = 'outbound'
+               JOIN crm_threads t ON t.id = m.thread_id
+               JOIN crm_contacts c ON c.id = t.contact_id
+               WHERE m.direction = 'out'
                  AND LOWER(c.email) = LOWER(a.contact_email)
              ) as contacted_at,
              CASE WHEN ac.id IS NOT NULL THEN 1 ELSE 0 END as is_claimed
