@@ -2153,4 +2153,40 @@ router.delete("/admin/blocklist/:id", (req: Request, res: Response) => {
   }
 });
 
+// ─── GET /admin/agents/dump ─────────────────────────────────
+// Returns all active agents with contact info for outreach tooling.
+// Fields: id, name, city, email, website, contacted_at, is_claimed.
+// Protected by x-admin-key. Recommended by e15 marketing run 2026-04-30.
+router.get("/admin/agents/dump", (req: Request, res: Response) => {
+  const adminKey = req.headers["x-admin-key"] as string;
+  const expectedKey = getAdminKey();
+  if (!expectedKey) { res.status(503).json({ error: "Admin not configured" }); return; }
+  if (!adminKey || adminKey !== expectedKey) {
+    res.status(403).json({ error: "Krever X-Admin-Key header" });
+    return;
+  }
+  try {
+    const db = getDb();
+    const hasEmail = req.query.hasEmail === "true";
+    const uncontacted = req.query.uncontacted === "true";
+
+    let sql = `
+      SELECT a.id, a.name, a.city, a.contact_email as email, a.url as website,
+             a.contacted_at,
+             CASE WHEN ac.id IS NOT NULL THEN 1 ELSE 0 END as is_claimed
+      FROM agents a
+      LEFT JOIN agent_claims ac ON ac.agent_id = a.id AND ac.status = 'verified'
+      WHERE a.is_active = 1
+    `;
+    if (hasEmail) sql += " AND a.contact_email IS NOT NULL AND a.contact_email != ''";
+    if (uncontacted) sql += " AND a.contacted_at IS NULL";
+    sql += " ORDER BY a.city, a.name";
+
+    const rows = db.prepare(sql).all();
+    res.json({ success: true, count: rows.length, agents: rows });
+  } catch (err: any) {
+    res.status(500).json({ error: "Dump failed", detail: err.message });
+  }
+});
+
 export default router;
