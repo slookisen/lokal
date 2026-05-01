@@ -253,7 +253,11 @@ router.post("/compose", async (req, res) => {
   const { to, contactName, subject, bodyText, bodyHtml, intent, category, severity, createdBy } = parsed.data;
 
   try {
-    const { threadId, contactId } = crmService.composeNewThread({
+    // We always start in 'queued' state — the message row gets updated
+    // to 'sent' / 'failed' / 'draft_in_gmail' only after the actual send
+    // outcome is known.  This prevents the dashboard from showing emails
+    // as sent when they're really sitting in a Gmail Drafts folder.
+    const { threadId, contactId, messageId } = crmService.composeNewThread({
       toEmail: to,
       contactName,
       subject,
@@ -262,6 +266,7 @@ router.post("/compose", async (req, res) => {
       category: category ?? "innkommende",
       severity: severity ?? "normal",
       createdBy,
+      deliveryStatus: "queued",
     });
 
     const queued = crmService.enqueueOutbox({
@@ -286,12 +291,13 @@ router.post("/compose", async (req, res) => {
         });
         if (result.success) {
           crmService.markOutboxResult(queued.id, "completed", result.messageId);
+          crmService.updateMessageDeliveryStatus(messageId, "sent");
           crmService.logAction({
             threadId,
             contactId,
             type: "sent",
             actor: createdBy,
-            payload: { outboxId: queued.id, messageId: result.messageId, channel: "resend_smtp", composedNew: true },
+            payload: { outboxId: queued.id, messageId: result.messageId, channel: "resend_smtp", composedNew: true, internalMessageId: messageId },
           });
           return res.json({
             success: true,
@@ -303,14 +309,19 @@ router.post("/compose", async (req, res) => {
           });
         }
         crmService.markOutboxResult(queued.id, "failed", undefined, result.error || "send failed");
+        crmService.updateMessageDeliveryStatus(messageId, "failed");
         return res.status(500).json({ success: false, error: result.error || "send failed", outboxId: queued.id, threadId });
       } catch (err: any) {
         crmService.markOutboxResult(queued.id, "failed", undefined, err.message ?? "exception");
+        crmService.updateMessageDeliveryStatus(messageId, "failed");
         return res.status(500).json({ success: false, error: err.message ?? "exception", threadId });
       }
     }
 
-    // gmail_draft path
+    // gmail_draft path: leave delivery_status as 'queued' here.
+    // It transitions to 'draft_in_gmail' once the CS-agent picks up the
+    // outbox item and reports back via /outbox/:id/result.
+
     res.json({
       success: true,
       threadId,
@@ -394,6 +405,18 @@ router.post("/outbox/:id/result", (req, res) => {
       actor: row.created_by,
       payload: { outboxId: req.params.id, resultId: parsed.data.resultId, error: parsed.data.error },
     });
+
+    // Bring crm_messages.delivery_status in sync with the actual outcome.
+    // Only applies when this outbox item was created from a /compose call
+    // (which leaves a 'queued' message row).  Reply-from-thread sends don't
+    // create crm_messages, so this no-ops in that case.
+    const msgId = crmService.getLatestOutboundMessageId(row.thread_id);
+    if (msgId) {
+      const newStatus = parsed.data.status === "completed"
+        ? (row.intent === "gmail_draft" ? "draft_in_gmail" : "sent")
+        : "failed";
+      crmService.updateMessageDeliveryStatus(msgId, newStatus);
+    }
   }
   res.json({ success: true });
 });

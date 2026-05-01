@@ -474,7 +474,9 @@ function initSchema(db: Database.Database): void {
       snippet TEXT,
       sent_at TEXT,
       received_at TEXT DEFAULT (datetime('now')),
-      raw_metadata TEXT DEFAULT '{}'
+      raw_metadata TEXT DEFAULT '{}',
+      delivery_status TEXT NOT NULL DEFAULT 'sent'
+        CHECK(delivery_status IN ('sent','queued','draft_in_gmail','failed'))
     );
     CREATE INDEX IF NOT EXISTS idx_crm_messages_thread ON crm_messages(thread_id);
     CREATE INDEX IF NOT EXISTS idx_crm_messages_sent_at ON crm_messages(sent_at);
@@ -527,6 +529,17 @@ function initSchema(db: Database.Database): void {
 
 
   // ─── Safe migrations for existing databases ─────────────────
+
+  // crm_messages.delivery_status — added 2026-05-01 to fix a bug where outbound
+  // messages were marked as sent immediately on compose, even when the actual
+  // Resend send failed or the email was just queued as a Gmail draft.  Default
+  // 'sent' keeps existing rows truthful (they were inbound or actually sent).
+  try {
+    db.exec("ALTER TABLE crm_messages ADD COLUMN delivery_status TEXT NOT NULL DEFAULT 'sent' CHECK(delivery_status IN ('sent','queued','draft_in_gmail','failed'))");
+  } catch (e) {
+    // column already exists — fine
+  }
+
   // SQLite doesn't support ADD COLUMN IF NOT EXISTS, so we catch
   // the "duplicate column" error and ignore it.
   try {

@@ -279,7 +279,14 @@ class CrmService {
     category?: "innkommende" | "marketing" | "leverandor" | "system" | "unknown";
     severity?: "p0" | "p1" | "p2" | "normal";
     createdBy: "claude" | "daniel";
-  }): { threadId: string; contactId: string } {
+    /**
+     * Initial delivery state for the outbound message we record.  Use 'queued'
+     * when the actual send hasn't happened yet — caller must update via
+     * updateMessageDeliveryStatus once Resend/Gmail has confirmed.  Default
+     * 'sent' is for back-compat callers that genuinely send synchronously.
+     */
+    deliveryStatus?: "sent" | "queued" | "draft_in_gmail" | "failed";
+  }): { threadId: string; contactId: string; messageId: string } {
     const db = getDb();
     const lowerTo = input.toEmail.trim().toLowerCase();
     const contact = this.resolveContact(lowerTo, input.contactName ?? null);
@@ -307,10 +314,15 @@ class CrmService {
       now,
     );
 
+    const deliveryStatus = input.deliveryStatus ?? "sent";
+    // For non-confirmed states, leave sent_at NULL so dashboards can render
+    // an "ikke sendt"-banner instead of falsely showing a sent timestamp.
+    const recordedSentAt = deliveryStatus === "sent" ? now : null;
+
     db.prepare(`
       INSERT INTO crm_messages
-        (id, thread_id, direction, from_email, to_emails, cc_emails, subject, body_text, body_html, snippet, sent_at, raw_metadata)
-      VALUES (?, ?, 'out', 'kontakt@rettfrabonden.com', ?, '[]', ?, ?, ?, ?, ?, ?)
+        (id, thread_id, direction, from_email, to_emails, cc_emails, subject, body_text, body_html, snippet, sent_at, raw_metadata, delivery_status)
+      VALUES (?, ?, 'out', 'kontakt@rettfrabonden.com', ?, '[]', ?, ?, ?, ?, ?, ?, ?)
     `).run(
       messageId,
       threadId,
@@ -319,8 +331,9 @@ class CrmService {
       input.bodyText,
       input.bodyHtml ?? null,
       (input.bodyText || "").slice(0, 200),
-      now,
+      recordedSentAt,
       JSON.stringify({ source: "crm-compose", createdBy: input.createdBy }),
+      deliveryStatus,
     );
 
     this.logAction({
@@ -331,7 +344,35 @@ class CrmService {
       payload: { messageId, to: lowerTo, subject: input.subject, source: "crm-compose-ui" },
     });
 
-    return { threadId, contactId };
+    return { threadId, contactId, messageId };
+  }
+
+  /**
+   * Update an outbound message's delivery_status after the actual send
+   * outcome is known.  Sets sent_at to NOW only when transitioning to
+   * 'sent' and sent_at was previously NULL — preserves audit accuracy.
+   */
+  updateMessageDeliveryStatus(messageId: string, status: "sent" | "queued" | "draft_in_gmail" | "failed"): void {
+    const db = getDb();
+    if (status === "sent") {
+      db.prepare(`UPDATE crm_messages SET delivery_status = ?, sent_at = COALESCE(sent_at, datetime('now')) WHERE id = ?`).run(status, messageId);
+    } else {
+      db.prepare(`UPDATE crm_messages SET delivery_status = ? WHERE id = ?`).run(status, messageId);
+    }
+  }
+
+  /**
+   * Find the most recent outbound crm_messages id for a thread, for use
+   * when the caller has only the threadId (e.g. /outbox/:id/result).
+   */
+  getLatestOutboundMessageId(threadId: string): string | null {
+    const db = getDb();
+    const row = db.prepare(`
+      SELECT id FROM crm_messages
+      WHERE thread_id = ? AND direction = 'out'
+      ORDER BY received_at DESC LIMIT 1
+    `).get(threadId) as { id: string } | undefined;
+    return row?.id ?? null;
   }
 
   setThreadStatus(threadId: string, status: ThreadStatus, actor: Actor): void {
