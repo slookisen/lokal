@@ -26,6 +26,7 @@ import discoveryRoutes from "./routes/discovery";
 import conversationUiRoutes from "./routes/conversation-ui";
 import agentReadinessRoutes from "./routes/agent-readiness";
 import { linkHeaders, markdownNegotiation } from "./middleware/agent-discovery";
+import { langMiddleware } from "./i18n/middleware";
 import { analyticsService } from "./services/analytics-service";
 import analyticsRoutes from "./routes/analytics";
 import adminRunsRoutes from "./routes/admin-runs";
@@ -87,6 +88,9 @@ app.use(linkHeaders);
 // `Accept: text/markdown` on a content route, return markdown
 // instead of HTML. Saves tokens, improves agent comprehension.
 app.use(markdownNegotiation);
+
+// Detect /en prefix → req.lang. Must run before any HTML route.
+app.use(langMiddleware);
 
 // Well-known discovery endpoints (MCP Server Card, Agent Skills,
 // API Catalog, OAuth Protected Resource). Mounted BEFORE static

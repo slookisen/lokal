@@ -25,6 +25,7 @@ import { DiscoveryQuerySchema } from "../models/marketplace";
 import { getDb } from "../database/init";
 import { conversationService } from "../services/conversation-service";
 import { slugify } from "../utils/slug";
+import { t, htmlLangAttr, ogLocale, localizedPath, type Lang } from "../i18n/t";
 
 const router = Router();
 
@@ -183,16 +184,79 @@ const CSS = `
 
 // ─── Page shell ─────────────────────────────────────────────
 
-function shell(title: string, description: string, content: string, extra?: { canonical?: string; jsonLd?: object | object[]; extraCss?: string }): string {
+function shell(
+  title: string,
+  description: string,
+  content: string,
+  extra?: { canonical?: string; jsonLd?: object | object[]; extraCss?: string; lang?: Lang; pathForAlternate?: string }
+): string {
+  const lang: Lang = extra?.lang || "no";
   const canonicalUrl = extra?.canonical || BASE_URL;
+
+  // Build hreflang alternates from the route's NO path.
+  // pathForAlternate is the canonical NO path (e.g. "/sok?q=mat").
+  // We derive the EN URL by prepending /en. If pathForAlternate is missing,
+  // fall back to canonical; this still produces valid (if less precise) hreflang.
+  const noPath = extra?.pathForAlternate || (canonicalUrl.startsWith(BASE_URL) ? canonicalUrl.slice(BASE_URL.length) || "/" : "/");
+  const enPath = noPath === "/" ? "/en" : "/en" + noPath;
+  const noUrl = BASE_URL + (noPath === "/" ? "" : noPath);
+  const enUrl = BASE_URL + enPath;
+
   const jsonLdScript = extra?.jsonLd
     ? (Array.isArray(extra.jsonLd)
         ? extra.jsonLd.map(j => `<script type="application/ld+json">${JSON.stringify(j)}</script>`).join("\n")
         : `<script type="application/ld+json">${JSON.stringify(extra.jsonLd)}</script>`)
     : "";
 
+  const langSwitcherCss = `
+  .lang-switch{position:relative;display:inline-block;margin-right:14px;}
+  .lang-switch button{display:inline-flex;align-items:center;gap:6px;background:transparent;border:1px solid var(--border,#e0e0e0);color:var(--ink,#222);padding:6px 12px;border-radius:18px;font-size:14px;cursor:pointer;font-weight:500;}
+  .lang-switch button:hover{background:#f5f5f5;}
+  .lang-switch .ls-flag{font-size:14px;line-height:1;}
+  .lang-switch .ls-caret{font-size:10px;opacity:.6;}
+  .lang-switch .ls-menu{position:absolute;top:calc(100% + 6px);right:0;background:#fff;border:1px solid var(--border,#e0e0e0);border-radius:10px;box-shadow:0 8px 24px rgba(0,0,0,.08);min-width:140px;padding:6px;display:none;z-index:200;}
+  .lang-switch.is-open .ls-menu{display:block;}
+  .lang-switch .ls-menu a{display:flex;align-items:center;gap:8px;padding:8px 10px;border-radius:6px;text-decoration:none;color:var(--ink,#222);font-size:14px;}
+  .lang-switch .ls-menu a:hover{background:#f5f5f5;}
+  .lang-switch .ls-menu a.is-active{font-weight:600;background:#fafafa;}
+  @media (max-width:640px){.lang-switch button{padding:5px 8px;font-size:13px;} .lang-switch{margin-right:8px;}}
+`;
+
+  const flag = (l: Lang) => l === "en" ? "🇬🇧" : "🇳🇴";
+  const labelShort = (l: Lang) => l === "en" ? "EN" : "NO";
+
+  const langSwitcher = `
+    <div class="lang-switch" id="langSwitch">
+      <button type="button" aria-label="${escapeHtml(t(lang, "nav.language"))}" aria-haspopup="true" aria-expanded="false" id="langSwitchBtn">
+        <span class="ls-flag">${flag(lang)}</span><span>${labelShort(lang)}</span><span class="ls-caret">▾</span>
+      </button>
+      <div class="ls-menu" role="menu">
+        <a href="${noUrl}" hreflang="nb" class="${lang === "no" ? "is-active" : ""}" role="menuitem"><span class="ls-flag">🇳🇴</span> ${escapeHtml(t(lang, "nav.lang_no"))}</a>
+        <a href="${enUrl}" hreflang="en" class="${lang === "en" ? "is-active" : ""}" role="menuitem"><span class="ls-flag">🇬🇧</span> ${escapeHtml(t(lang, "nav.lang_en"))}</a>
+      </div>
+    </div>`;
+
+  const langSwitcherJs = `
+  <script>
+  (function(){
+    var sw = document.getElementById('langSwitch');
+    if (!sw) return;
+    var btn = document.getElementById('langSwitchBtn');
+    btn.addEventListener('click', function(e){
+      e.stopPropagation();
+      sw.classList.toggle('is-open');
+      btn.setAttribute('aria-expanded', sw.classList.contains('is-open') ? 'true' : 'false');
+    });
+    document.addEventListener('click', function(){ sw.classList.remove('is-open'); btn.setAttribute('aria-expanded','false'); });
+    // Persist the user's choice (for client-only views like /selger).
+    sw.querySelectorAll('.ls-menu a').forEach(function(a){
+      a.addEventListener('click', function(){ try{ localStorage.setItem('rfb_lang', a.hreflang === 'en' ? 'en' : 'no'); document.cookie = 'lang=' + (a.hreflang === 'en' ? 'en' : 'no') + '; path=/; max-age=' + (60*60*24*365); }catch(_){} });
+    });
+  })();
+  </script>`;
+
   return `<!DOCTYPE html>
-<html lang="nb">
+<html lang="${htmlLangAttr(lang)}">
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
@@ -206,7 +270,7 @@ function shell(title: string, description: string, content: string, extra?: { ca
   <meta property="og:description" content="${escapeHtml(description)}">
   <meta property="og:url" content="${canonicalUrl}">
   <meta property="og:type" content="website">
-  <meta property="og:locale" content="nb_NO">
+  <meta property="og:locale" content="${ogLocale(lang)}">
   <meta property="og:site_name" content="${getConfig().display_name}">
   <meta property="og:image" content="${BASE_URL}/logo-512.png">
   <meta property="og:image:width" content="512">
@@ -218,22 +282,24 @@ function shell(title: string, description: string, content: string, extra?: { ca
   <meta name="twitter:image" content="${BASE_URL}/logo-512.png">
   <meta name="twitter:image:alt" content="${getConfig().display_name} — lokal mat rett fra bonden i Norge">
   <meta name="robots" content="index, follow, max-snippet:-1, max-image-preview:large">
-  <link rel="alternate" hreflang="nb" href="${canonicalUrl}">
-  <link rel="alternate" hreflang="en" href="${canonicalUrl}">
-  <link rel="alternate" hreflang="x-default" href="${canonicalUrl}">
+  <link rel="alternate" hreflang="nb" href="${noUrl}">
+  <link rel="alternate" hreflang="en" href="${enUrl}">
+  <link rel="alternate" hreflang="x-default" href="${noUrl}">
   ${jsonLdScript}
   ${CSS}
+  <style>${langSwitcherCss}</style>
   ${extra?.extraCss ? `<style>${extra.extraCss}</style>` : ""}
 </head>
 <body>
   <nav class="nav">
-    <a href="/" class="nav-logo"><div class="nav-icon">&#127793;</div> ${getConfig().display_name}</a>
+    <a href="${localizedPath("/", lang)}" class="nav-logo"><div class="nav-icon">🌱</div> ${getConfig().display_name}</a>
     <div class="nav-links">
-      <a href="/samtaler">Samtaler</a>
-      <a href="/sok">S\u00f8k</a>
-      <a href="/teknologi">Hvordan det fungerer</a>
-      <a href="/om">Om oss</a>
-      <a href="/selger" class="nav-cta">For produsenter</a>
+      <a href="${localizedPath("/samtaler", lang)}">${escapeHtml(t(lang, "nav.conversations"))}</a>
+      <a href="${localizedPath("/sok", lang)}">${escapeHtml(t(lang, "nav.search"))}</a>
+      <a href="${localizedPath("/teknologi", lang)}">${escapeHtml(t(lang, "nav.how_it_works"))}</a>
+      <a href="${localizedPath("/om", lang)}">${escapeHtml(t(lang, "nav.about"))}</a>
+      ${langSwitcher}
+      <a href="/selger" class="nav-cta">${escapeHtml(t(lang, "nav.for_producers"))}</a>
     </div>
   </nav>
   ${content}
@@ -241,30 +307,31 @@ function shell(title: string, description: string, content: string, extra?: { ca
     <div class="ft-inner">
       <div>
         <div class="ft-brand">${getConfig().display_name}</div>
-        <div class="ft-desc">Norges f\u00f8rste agent-til-agent (A2A) nettverk for lokal mat. Vi gj\u00f8r ${getConfig().domain_dictionary.entity_plural_long} synlige for AI-assistenter \u2014 s\u00e5 kundene finner deg n\u00e5r de sp\u00f8r.</div>
+        <div class="ft-desc">${escapeHtml(t(lang, "footer.tagline"))}</div>
       </div>
       <div class="ft-col">
-        <h4>Plattformen</h4>
-        <a href="/sok">S\u00f8k produsenter</a><a href="/teknologi">Hvordan det fungerer</a><a href="/om">Om ${getConfig().display_name}</a><a href="/personvern">Personvern</a>
+        <h4>${escapeHtml(t(lang, "footer.platform"))}</h4>
+        <a href="${localizedPath("/sok", lang)}">${escapeHtml(t(lang, "footer.search_producers"))}</a><a href="${localizedPath("/teknologi", lang)}">${escapeHtml(t(lang, "footer.how_it_works"))}</a><a href="${localizedPath("/om", lang)}">${escapeHtml(t(lang, "footer.about_link"))}</a><a href="${localizedPath("/personvern", lang)}">${escapeHtml(t(lang, "footer.privacy"))}</a>
       </div>
       <div class="ft-col">
-        <h4>For produsenter</h4>
-        <a href="/selger">Registrer deg</a><a href="/selger">Logg inn</a>
+        <h4>${escapeHtml(t(lang, "footer.for_producers"))}</h4>
+        <a href="/selger">${escapeHtml(t(lang, "footer.register"))}</a><a href="/selger">${escapeHtml(t(lang, "footer.login"))}</a>
       </div>
       <div class="ft-col">
-        <h4>For utviklere</h4>
-        <a href="/api/marketplace/search?q=mat">API</a><a href="https://github.com/slookisen/lokal">GitHub</a><a href="https://smithery.ai/servers/slookisen/lokal">MCP Server</a>
+        <h4>${escapeHtml(t(lang, "footer.for_developers"))}</h4>
+        <a href="/api/marketplace/search?q=mat">${escapeHtml(t(lang, "footer.api"))}</a><a href="https://github.com/slookisen/lokal">${escapeHtml(t(lang, "footer.github"))}</a><a href="https://smithery.ai/servers/slookisen/lokal">${escapeHtml(t(lang, "footer.mcp_server"))}</a>
       </div>
     </div>
-    <div class="ft-bottom">${getConfig().display_name} &copy; ${new Date().getFullYear()}. Gj\u00f8r ${getConfig().domain_dictionary.entity_plural_long} synlige i hele Norge.</div>
+    <div class="ft-bottom">${escapeHtml(t(lang, "footer.copyright", { year: new Date().getFullYear() }))}</div>
   </footer>
+  ${langSwitcherJs}
 </body>
 </html>`;
 }
 
 // ─── Producer card HTML (reused across pages) ───────────────
 
-function producerCard(a: any, matchReasons?: string[]): string {
+function producerCard(a: any, _matchReasons?: string[], lang: Lang = "no"): string {
   const city = a.city || a.location?.city || "";
   const distKm = a.location?.distanceKm;
   const cityText = distKm != null
@@ -274,9 +341,12 @@ function producerCard(a: any, matchReasons?: string[]): string {
   const cats = (a.categories || []).slice(0, 3).map((c: string) => `<span class="tag">${catEmoji(c)} ${escapeHtml(formatCat(c))}</span>`).join("");
   const trustPct = Math.round((a.trustScore || 0) * 100);
   const desc = a.description || "";
-  const verified = a.isVerified ? `<span class="badge badge-v">&#10003; Verifisert</span>` : "";
+  const verified = a.isVerified ? `<span class="badge badge-v">&#10003; ${escapeHtml(t(lang, "producer.verified"))}</span>` : "";
+  // EN viewers see a discreet "Norwegian original" hint when descriptions
+  // have not been translated yet (we only have NO descriptions for now).
+  const noteHtml = (lang === "en" && desc) ? `<div class="pc-note" title="${escapeHtml(t(lang, "common.translate_note"))}" style="font-size:11px;color:#888;margin-top:4px;">\u{1F1F3}\u{1F1F4} ${escapeHtml(t(lang, "common.from_norwegian"))}</div>` : "";
 
-  return `<a href="/produsent/${slug}" class="pc">
+  return `<a href="${localizedPath("/produsent/" + slug, lang)}" class="pc">
     <div class="pc-top">
       <div>
         <div class="pc-name">${escapeHtml(a.name)}</div>
@@ -284,11 +354,11 @@ function producerCard(a: any, matchReasons?: string[]): string {
       </div>
       ${verified}
     </div>
-    ${desc ? `<div class="pc-desc">${escapeHtml(desc)}</div>` : ""}
+    ${desc ? `<div class="pc-desc">${escapeHtml(desc)}</div>${noteHtml}` : ""}
     <div class="pc-tags">${cats}</div>
     <div class="pc-foot">
       <div class="trust-m"><div class="trust-bar"><div class="trust-fill" style="width:${trustPct}%"></div></div> ${trustPct}%</div>
-      <span class="pc-link">Se profil &rarr;</span>
+      <span class="pc-link">${escapeHtml(t(lang, "common.see_profile"))}</span>
     </div>
   </a>`;
 }
@@ -367,7 +437,7 @@ function getTrafficStats(): TrafficStats {
 
 // ─── Live conversation showcase for landing page ────────────
 
-function buildConversationShowcase(): string {
+function buildConversationShowcase(_lang: Lang = "no"): string {
   try {
     const convs = conversationService.listConversations({ limit: 3 });
     if (convs.length === 0) return "";
@@ -561,14 +631,14 @@ const LANDING_CSS = `
   .cv-time { color: var(--g300); }
 `;
 
-router.get("/", (_req: Request, res: Response) => {
+router.get("/", (req: Request, res: Response) => {
+  const lang = req.lang;
   try {
     const stats = marketplaceRegistry.getStats();
     const agents = marketplaceRegistry.getActiveAgents();
     const totalAgents = stats.totalAgents || agents.length;
     const traffic = getTrafficStats();
 
-    // City counts
     const cityCounts: Record<string, number> = {};
     const categoryCounts: Record<string, number> = {};
     agents.forEach((a: any) => {
@@ -580,9 +650,8 @@ router.get("/", (_req: Request, res: Response) => {
     });
 
     const topCities = Object.entries(cityCounts).sort((a, b) => b[1] - a[1]).slice(0, 8);
-    const cityIcons = ["&#127968;", "&#127963;", "&#9875;", "&#127750;", "&#127748;", "&#9981;", "&#9973;", "&#127793;"];
+    const cityIcons = ["\u{1F3D8}\uFE0F", "\u{1F3DB}\uFE0F", "\u2693", "\u{1F306}", "\u{1F304}", "\u{26F0}\uFE0F", "\u{26F5}", "\u{1F33F}"];
 
-    // Featured producers — verified first, then highest trust. Show more to fill section.
     const featured = agents
       .filter((a: any) => a.trustScore >= 0.35)
       .sort((a: any, b: any) => {
@@ -592,25 +661,24 @@ router.get("/", (_req: Request, res: Response) => {
       })
       .slice(0, 8);
 
-    // Category cards
     const catCards = Object.entries(CATEGORY_MAP)
-      .map(([key, val]) => {
-        const count = categoryCounts[key] || 0;
-        return `<a href="/sok?q=${encodeURIComponent(val.name.toLowerCase())}" class="cat-card">
+      .map(([_key, val]) => {
+        const count = categoryCounts[_key] || 0;
+        return `<a href="${localizedPath("/sok", lang)}?q=${encodeURIComponent(val.name.toLowerCase())}" class="cat-card">
           <span class="cat-emoji">${val.emoji}</span>
           <div class="cat-name">${val.name}</div>
-          <div class="cat-count">${count} produsenter</div>
+          <div class="cat-count">${count} ${escapeHtml(t(lang, "home.cats_count_suffix"))}</div>
         </a>`;
       }).join("");
 
     const cityCards = topCities.map(([city, count], i) =>
-      `<a href="/${slugify(city)}" class="city-card">
-        <div class="city-icon">${cityIcons[i] || "&#127793;"}</div>
-        <div><div class="city-name">${escapeHtml(city)}</div><div class="city-count">${count} produsenter</div></div>
+      `<a href="${localizedPath("/" + slugify(city), lang)}" class="city-card">
+        <div class="city-icon">${cityIcons[i] || "\u{1F33F}"}</div>
+        <div><div class="city-name">${escapeHtml(city)}</div><div class="city-count">${count} ${escapeHtml(t(lang, "home.cats_count_suffix"))}</div></div>
       </a>`
     ).join("");
 
-    const featuredCards = featured.map((a: any) => producerCard(a)).join("");
+    const featuredCards = featured.map((a: any) => producerCard(a, undefined, lang)).join("");
 
     const uniqueCities = Object.keys(cityCounts).length;
 
@@ -619,50 +687,46 @@ router.get("/", (_req: Request, res: Response) => {
       "@type": "WebSite",
       "name": `${getConfig().display_name}`,
       "url": BASE_URL,
-      "description": "Finn lokalprodusert mat i Norge. S\u00f8k blant g\u00e5rder, markeder og g\u00e5rdsbutikker.",
+      "description": t(lang, "home.description", { count: totalAgents }),
       "potentialAction": {
         "@type": "SearchAction",
-        "target": `${BASE_URL}/sok?q={search_term_string}`,
+        "target": `${BASE_URL}${localizedPath("/sok", lang)}?q={search_term_string}`,
         "query-input": "required name=search_term_string"
       }
     };
 
+    const numFmt = lang === "en" ? "en-US" : "nb-NO";
+
     const content = `
     <section class="hero">
       <div class="hero-inner">
-        <div class="hero-pill"><span class="hero-dot"></span> ${totalAgents} produsenter i hele Norge</div>
-        <h1>Finn <em>fersk, lokal mat</em> n\u00e6r deg</h1>
-        <p class="hero-sub">S\u00f8k blant g\u00e5rder, markeder og g\u00e5rdsbutikker over hele landet. Direkte fra bonden til bordet ditt.</p>
+        <div class="hero-pill"><span class="hero-dot"></span> ${t(lang, "home.hero_pill", { count: totalAgents })}</div>
+        <h1>${t(lang, "home.hero_title")}</h1>
+        <p class="hero-sub">${escapeHtml(t(lang, "home.hero_sub"))}</p>
         <div class="hero-search">
-          <form action="/sok" method="GET">
-            <input type="text" name="q" placeholder="S\u00f8k etter mat, sted eller produsent..." aria-label="S\u00f8k">
-            <button type="submit">S\u00f8k</button>
+          <form action="${localizedPath("/sok", lang)}" method="GET">
+            <input type="text" name="q" placeholder="${escapeHtml(t(lang, "home.search_placeholder"))}" aria-label="${escapeHtml(t(lang, "home.search_aria"))}">
+            <button type="submit">${escapeHtml(t(lang, "home.search_btn"))}</button>
           </form>
         </div>
         <div class="hero-chips">
-          <a href="/sok?q=gr%C3%B8nnsaker+oslo" class="chip">&#127813; Gr\u00f8nnsaker i Oslo</a>
-          <a href="/sok?q=honning+bergen" class="chip">&#127855; Honning i Bergen</a>
-          <a href="/sok?q=%C3%B8kologisk+kj%C3%B8tt" class="chip">&#129385; \u00d8kologisk kj\u00f8tt</a>
-          <a href="/sok?q=g%C3%A5rdsbutikk" class="chip">&#127793; G\u00e5rdsbutikker</a>
+          <a href="${localizedPath("/sok", lang)}?q=${encodeURIComponent(lang === "en" ? "vegetables oslo" : "gr\u00f8nnsaker oslo")}" class="chip">\u{1F955} ${escapeHtml(t(lang, "home.chip_vegetables_oslo"))}</a>
+          <a href="${localizedPath("/sok", lang)}?q=${encodeURIComponent(lang === "en" ? "honey bergen" : "honning bergen")}" class="chip">\u{1F36F} ${escapeHtml(t(lang, "home.chip_honey_bergen"))}</a>
+          <a href="${localizedPath("/sok", lang)}?q=${encodeURIComponent(lang === "en" ? "organic meat" : "\u00f8kologisk kj\u00f8tt")}" class="chip">\u{1F969} ${escapeHtml(t(lang, "home.chip_organic_meat"))}</a>
+          <a href="${localizedPath("/sok", lang)}?q=${encodeURIComponent(lang === "en" ? "farm shop" : "g\u00e5rdsbutikk")}" class="chip">\u{1F33F} ${escapeHtml(t(lang, "home.chip_farm_shops"))}</a>
         </div>
         <div class="ai-assist">
-          <p class="ai-assist-label">Eller sp\u00f8r din AI-assistent:</p>
+          <p class="ai-assist-label">${escapeHtml(t(lang, "home.ai_assist_label"))}</p>
           <div class="ai-assist-btns">
-            <a href="https://chatgpt.com/g/g-69dbf8593c1c81919050f8da98cd327d-finn-lokal-mat-i-norge" target="_blank" rel="noopener" class="ai-btn ai-chatgpt">
-              <svg viewBox="0 0 24 24" width="18" height="18" fill="currentColor"><path d="M22.282 9.821a5.985 5.985 0 0 0-.516-4.91 6.046 6.046 0 0 0-6.51-2.9A6.065 6.065 0 0 0 4.981 4.18a5.998 5.998 0 0 0-3.998 2.9 6.042 6.042 0 0 0 .743 7.097 5.98 5.98 0 0 0 .51 4.911 6.051 6.051 0 0 0 6.515 2.9A5.985 5.985 0 0 0 13.26 24a6.056 6.056 0 0 0 5.772-4.206 5.99 5.99 0 0 0 3.997-2.9 6.056 6.056 0 0 0-.747-7.073zM13.26 22.43a4.476 4.476 0 0 1-2.876-1.04l.141-.081 4.779-2.758a.795.795 0 0 0 .392-.681v-6.737l2.02 1.168a.071.071 0 0 1 .038.052v5.583a4.504 4.504 0 0 1-4.494 4.494zM3.6 18.304a4.47 4.47 0 0 1-.535-3.014l.142.085 4.783 2.759a.771.771 0 0 0 .78 0l5.843-3.369v2.332a.08.08 0 0 1-.033.062L9.74 19.95a4.5 4.5 0 0 1-6.14-1.646zM2.34 7.896a4.485 4.485 0 0 1 2.366-1.973V11.6a.766.766 0 0 0 .388.676l5.815 3.355-2.02 1.168a.076.076 0 0 1-.071 0l-4.83-2.786A4.504 4.504 0 0 1 2.34 7.872zm16.597 3.855l-5.833-3.387L15.119 7.2a.076.076 0 0 1 .071 0l4.83 2.791a4.494 4.494 0 0 1-.676 8.105v-5.678a.79.79 0 0 0-.407-.667zm2.01-3.023l-.141-.085-4.774-2.782a.776.776 0 0 0-.785 0L9.409 9.23V6.897a.066.066 0 0 1 .028-.061l4.83-2.787a4.5 4.5 0 0 1 6.68 4.66zm-12.64 4.135l-2.02-1.164a.08.08 0 0 1-.038-.057V6.075a4.5 4.5 0 0 1 7.375-3.453l-.142.08L8.704 5.46a.795.795 0 0 0-.393.681zm1.097-2.365l2.602-1.5 2.607 1.5v2.999l-2.597 1.5-2.607-1.5z"/></svg>
-              ChatGPT
-            </a>
-            <a href="/teknologi#claude-mcp" class="ai-btn ai-claude">
-              <svg viewBox="0 0 24 24" width="18" height="18" fill="currentColor"><path d="M4.709 15.955l4.397-2.553-.209-.12-4.478 2.488.29.185zm7.737-4.48L8.051 8.97l-.209.12 4.394 2.505.21-.12zm-4.187-2.384L12.656 6.6l-.21-.12-4.397 2.553.21.058zm8.375-.12l-4.188 2.43.21.12 4.187-2.43-.21-.12zM12 2C6.477 2 2 6.477 2 12s4.477 10 10 10 10-4.477 10-10S17.523 2 12 2z"/></svg>
-              Claude
-            </a>
+            <a href="https://chatgpt.com/g/g-69dbf8593c1c81919050f8da98cd327d-finn-lokal-mat-i-norge" target="_blank" rel="noopener" class="ai-btn ai-chatgpt">ChatGPT</a>
+            <a href="${localizedPath("/teknologi", lang)}#claude-mcp" class="ai-btn ai-claude">Claude</a>
           </div>
-          <p class="ai-assist-hint">Bruk MCP for \u00e5 la AI-en din s\u00f8ke direkte i v\u00e5r database. <a href="/teknologi#mcp-oppsett">Se oppsettguide &rarr;</a></p>
+          <p class="ai-assist-hint">${escapeHtml(t(lang, "home.ai_assist_hint"))} <a href="${localizedPath("/teknologi", lang)}#mcp-oppsett">${escapeHtml(t(lang, "home.ai_assist_setup_link"))}</a></p>
         </div>
         <div class="stats-bar">
-          <div style="text-align:center"><div class="stat-n">${totalAgents}</div><div class="stat-l">Produsenter</div></div>
-          <div style="text-align:center"><div class="stat-n">${uniqueCities}</div><div class="stat-l">Byer</div></div>
-          <div style="text-align:center"><div class="stat-n">${Object.keys(categoryCounts).length}</div><div class="stat-l">Kategorier</div></div>
+          <div style="text-align:center"><div class="stat-n">${totalAgents}</div><div class="stat-l">${escapeHtml(t(lang, "home.stat_producers"))}</div></div>
+          <div style="text-align:center"><div class="stat-n">${uniqueCities}</div><div class="stat-l">${escapeHtml(t(lang, "home.stat_cities"))}</div></div>
+          <div style="text-align:center"><div class="stat-n">${Object.keys(categoryCounts).length}</div><div class="stat-l">${escapeHtml(t(lang, "home.stat_categories"))}</div></div>
         </div>
       </div>
     </section>
@@ -670,94 +734,94 @@ router.get("/", (_req: Request, res: Response) => {
     <div class="proof-bar">
       <div class="proof-inner">
         <div class="proof-item">
-          <div class="proof-val">${traffic.pageViews.toLocaleString("nb-NO")}</div>
-          <div class="proof-lbl">Sidevisninger</div>
+          <div class="proof-val">${traffic.pageViews.toLocaleString(numFmt)}</div>
+          <div class="proof-lbl">${escapeHtml(t(lang, "home.proof_pageviews"))}</div>
         </div>
         <div class="proof-sep"></div>
         <div class="proof-item">
-          <div class="proof-val">${traffic.uniqueVisitors.toLocaleString("nb-NO")}</div>
-          <div class="proof-lbl">Unike bes\u00f8kende</div>
+          <div class="proof-val">${traffic.uniqueVisitors.toLocaleString(numFmt)}</div>
+          <div class="proof-lbl">${escapeHtml(t(lang, "home.proof_unique"))}</div>
         </div>
         <div class="proof-sep"></div>
         <div class="proof-item">
-          <div class="proof-val">${traffic.realHumans.toLocaleString("nb-NO")}</div>
-          <div class="proof-lbl">Ekte mennesker</div>
+          <div class="proof-val">${traffic.realHumans.toLocaleString(numFmt)}</div>
+          <div class="proof-lbl">${escapeHtml(t(lang, "home.proof_humans"))}</div>
         </div>
         <div class="proof-sep"></div>
         <div class="proof-item">
-          <div class="proof-val proof-val-purple">${traffic.botAndAi.toLocaleString("nb-NO")}</div>
-          <div class="proof-lbl">Bot &amp; AI-trafikk</div>
+          <div class="proof-val proof-val-purple">${traffic.botAndAi.toLocaleString(numFmt)}</div>
+          <div class="proof-lbl">${escapeHtml(t(lang, "home.proof_bots"))}</div>
         </div>
       </div>
     </div>
 
     <section class="cats-section">
       <div class="sh" style="max-width:1100px;margin:0 auto 28px;">
-        <div class="sh-label">Kategorier</div>
-        <div class="sh-title">Hva leter du etter?</div>
+        <div class="sh-label">${escapeHtml(t(lang, "home.cats_label"))}</div>
+        <div class="sh-title">${escapeHtml(t(lang, "home.cats_title"))}</div>
       </div>
       <div class="cats-grid">${catCards}</div>
     </section>
 
     <section class="sec">
       <div class="sh">
-        <div class="sh-label">Utforsk</div>
-        <div class="sh-title">Popul\u00e6re byer</div>
-        <div class="sh-sub">Finn produsenter i n\u00e6rheten av deg</div>
+        <div class="sh-label">${escapeHtml(t(lang, "home.explore_label"))}</div>
+        <div class="sh-title">${escapeHtml(t(lang, "home.explore_title"))}</div>
+        <div class="sh-sub">${escapeHtml(t(lang, "home.explore_sub"))}</div>
       </div>
       <div class="cities-grid">${cityCards}</div>
     </section>
 
     <section class="sec" style="background:var(--white);">
       <div class="sh">
-        <div class="sh-label">Oppdag</div>
-        <div class="sh-title">Produsenter</div>
-        <div class="sh-sub">Norske ${getConfig().domain_dictionary.entity_plural_long} i nettverket</div>
+        <div class="sh-label">${escapeHtml(t(lang, "home.discover_label"))}</div>
+        <div class="sh-title">${escapeHtml(t(lang, "home.discover_title"))}</div>
+        <div class="sh-sub">${escapeHtml(t(lang, "home.discover_sub"))}</div>
       </div>
       <div class="feat-grid">${featuredCards}</div>
     </section>
 
     <section class="sec how-sec">
       <div class="sh">
-        <div class="sh-label">Slik fungerer det</div>
-        <div class="sh-title">Fra s\u00f8k til g\u00e5rdsbes\u00f8k</div>
+        <div class="sh-label">${escapeHtml(t(lang, "home.how_label"))}</div>
+        <div class="sh-title">${escapeHtml(t(lang, "home.how_title"))}</div>
       </div>
       <div class="how-grid">
-        <div class="how-step"><div class="how-num">1</div><h3>S\u00f8k etter det du vil ha</h3><p>Skriv inn hva du leter etter \u2014 \u00abgrønnsaker i Oslo\u00bb eller \u00ab\u00f8kologisk kj\u00f8tt\u00bb.</p></div>
-        <div class="how-step"><div class="how-num">2</div><h3>Utforsk produsenter</h3><p>Se produkter, \u00e5pningstider, sertifiseringer og kontaktinfo.</p></div>
-        <div class="how-step"><div class="how-num">3</div><h3>Kj\u00f8p direkte</h3><p>Bes\u00f8k g\u00e5rdsbutikken, ring direkte, eller la AI-assistenten din finne det automatisk.</p></div>
+        <div class="how-step"><div class="how-num">1</div><h3>${escapeHtml(t(lang, "home.how_step1_title"))}</h3><p>${escapeHtml(t(lang, "home.how_step1_body"))}</p></div>
+        <div class="how-step"><div class="how-num">2</div><h3>${escapeHtml(t(lang, "home.how_step2_title"))}</h3><p>${escapeHtml(t(lang, "home.how_step2_body"))}</p></div>
+        <div class="how-step"><div class="how-num">3</div><h3>${escapeHtml(t(lang, "home.how_step3_title"))}</h3><p>${escapeHtml(t(lang, "home.how_step3_body"))}</p></div>
       </div>
     </section>
 
     <section class="seller-cta">
-      <h2>Er du ${getConfig().domain_dictionary.entity}?</h2>
-      <p>Registrer deg gratis og bli synlig for tusenvis av kunder \u2014 og AI-assistentene deres.</p>
-      <a href="/selger" class="seller-btn">Registrer gratis</a>
-      <span class="seller-note">Under 2 minutter. Ingen kredittkort.</span>
+      <h2>${escapeHtml(t(lang, "home.seller_cta_title"))}</h2>
+      <p>${escapeHtml(t(lang, "home.seller_cta_body"))}</p>
+      <a href="/selger" class="seller-btn">${escapeHtml(t(lang, "home.seller_cta_btn"))}</a>
+      <span class="seller-note">${escapeHtml(t(lang, "home.seller_cta_note"))}</span>
     </section>
 
-    ${buildConversationShowcase()}
+    ${buildConversationShowcase(lang)}
 
     <section class="ai-sec">
       <div class="ai-banner">
-        <div class="ai-icon">&#129302;</div>
+        <div class="ai-icon">\u{1F916}</div>
         <div class="ai-text">
-          <h3>Bruk AI-assistenten din til \u00e5 finne lokal mat</h3>
-          <p>Sp\u00f8r ChatGPT eller Claude \u00abhvor finner jeg ferske gr\u00f8nnsaker i Oslo?\u00bb \u2014 de finner svaret her. Velg din plattform:</p>
+          <h3>${escapeHtml(t(lang, "home.ai_sec_title"))}</h3>
+          <p>${escapeHtml(t(lang, "home.ai_sec_body"))}</p>
           <div class="ai-logos">
-            <a href="https://chatgpt.com/g/g-69dbf8593c1c81919050f8da98cd327d-finn-lokal-mat-i-norge" target="_blank" rel="noopener" class="ai-logo" title="\u00c5pne Lokal Norsk Matfinner i ChatGPT">&#128172; ChatGPT</a>
-            <a href="https://www.npmjs.com/package/lokal-mcp" target="_blank" rel="noopener" class="ai-logo" title="Installer lokal-mcp for Claude Desktop">&#128268; Claude MCP</a>
-            <a href="https://github.com/slookisen/lokal" target="_blank" rel="noopener" class="ai-logo" title="Se kildekoden p\u00e5 GitHub">\u2B50 GitHub</a>
+            <a href="https://chatgpt.com/g/g-69dbf8593c1c81919050f8da98cd327d-finn-lokal-mat-i-norge" target="_blank" rel="noopener" class="ai-logo">\u{1F4AC} ChatGPT</a>
+            <a href="https://www.npmjs.com/package/lokal-mcp" target="_blank" rel="noopener" class="ai-logo">\u{1F50C} Claude MCP</a>
+            <a href="https://github.com/slookisen/lokal" target="_blank" rel="noopener" class="ai-logo">\u{2B50} GitHub</a>
           </div>
         </div>
       </div>
     </section>`;
 
     res.send(shell(
-      `${getConfig().display_name} \u2014 Finn lokalprodusert mat i Norge`,
-      `S\u00f8k blant ${totalAgents} lokale ${getConfig().domain_dictionary.entity_plural_long} i Norge. G\u00e5rder, markeder, g\u00e5rdsbutikker med kontaktinfo og \u00e5pningstider.`,
+      t(lang, "home.title"),
+      t(lang, "home.description", { count: totalAgents }),
       content,
-      { canonical: BASE_URL, jsonLd, extraCss: LANDING_CSS }
+      { canonical: BASE_URL + (lang === "en" ? "/en" : ""), jsonLd, extraCss: LANDING_CSS, lang, pathForAlternate: "/" }
     ));
   } catch (err) {
     console.error("SEO / error:", err);
@@ -782,8 +846,9 @@ const SEARCH_CSS = `
 `;
 
 router.get("/sok", async (req: Request, res: Response) => {
+  const lang = req.lang;
   const q = req.query.q as string;
-  if (!q) { res.redirect("/"); return; }
+  if (!q) { res.redirect(localizedPath("/", lang)); return; }
 
   try {
     const parsed = marketplaceRegistry.parseNaturalQuery(q);
@@ -872,8 +937,8 @@ router.get("/sok", async (req: Request, res: Response) => {
       } catch { /* keep results.length as fallback */ }
     }
     const headerText = results.length >= totalCount
-      ? `${totalCount}${totalAtMax ? "+" : ""} treff`
-      : `viser ${results.length} av ${totalCount}${totalAtMax ? "+" : ""}`;
+      ? `${totalCount}${totalAtMax ? "+" : ""} ${lang === "en" ? "results" : "treff"}`
+      : `${lang === "en" ? "showing" : "viser"} ${results.length} ${lang === "en" ? "of" : "av"} ${totalCount}${totalAtMax ? "+" : ""}`;
 
     // ─── Fuzzy-match banner ──────────────────────────────────────
     // If discover() returned only relaxed matches ("Mulig navnematch"),
@@ -899,26 +964,26 @@ router.get("/sok", async (req: Request, res: Response) => {
       } catch { /* non-critical — don't break search if logging fails */ }
     }
 
-    const resultCards = results.map((r: any) => producerCard(r.agent, r.matchReasons)).join("");
+    const resultCards = results.map((r: any) => producerCard(r.agent, r.matchReasons, lang)).join("");
 
     const heleNorgeLink = geoFiltered
-      ? `<a href="/sok?q=${encodeURIComponent(q)}&heleNorge=true" style="display:inline-block;margin-top:12px;padding:7px 18px;background:var(--green-100,#e8f0e0);color:var(--green-700,#2D5016);border:1.5px solid var(--green-700,#2D5016);border-radius:8px;text-decoration:none;font-weight:600;font-size:0.85rem;">&#127758; Vis hele Norge</a>`
+      ? `<a href="${localizedPath("/sok", lang)}?q=${encodeURIComponent(q)}&heleNorge=true" style="display:inline-block;margin-top:12px;padding:7px 18px;background:var(--green-100,#e8f0e0);color:var(--green-700,#2D5016);border:1.5px solid var(--green-700,#2D5016);border-radius:8px;text-decoration:none;font-weight:600;font-size:0.85rem;">\u{1F30D} ${lang === "en" ? "Show all of Norway" : "Vis hele Norge"}</a>`
       : "";
 
     const geoNote = geoFiltered
-      ? `<p style="color:var(--g500,#666);font-size:0.85rem;margin-top:8px;">Resultater filtrert etter sted. ${heleNorgeLink}</p>`
+      ? `<p style="color:var(--g500,#666);font-size:0.85rem;margin-top:8px;">${lang === "en" ? "Results filtered by location." : "Resultater filtrert etter sted."} ${heleNorgeLink}</p>`
       : "";
 
     const content = `
     <section class="search-hero">
       <div class="container">
-        <div class="bc" style="padding:0 0 12px;"><a href="/">Hjem</a><span>/</span>S\u00f8k: \u201c${escapeHtml(q)}\u201d</div>
-        <h1>S\u00f8keresultater for \u201c${escapeHtml(q)}\u201d \u2014 ${headerText}</h1>
-        ${allFuzzy ? `<p style="color:var(--g500,#666);font-size:0.9rem;margin-top:4px;">Fant ingen eksakte navnematch for \u201c${escapeHtml(q)}\u201d \u2014 viser produsenter med lignende navn.</p>` : ""}
-        <form class="search-form" action="/sok" method="GET">
-          <input type="text" name="q" value="${escapeHtml(q)}" aria-label="S\u00f8k">
-          <button type="button" id="geoBtn" style="padding:12px 16px;background:var(--green-100,#e8f0e0);color:var(--green-700,#2D5016);border:2px solid var(--green-700,#2D5016);border-left:none;font-weight:700;font-size:0.85rem;cursor:pointer;white-space:nowrap;">&#128205; N\u00e6r meg</button>
-          <button type="submit">S\u00f8k</button>
+        <div class="bc" style="padding:0 0 12px;"><a href="${localizedPath("/", lang)}">${lang === "en" ? "Home" : "Hjem"}</a><span>/</span>${escapeHtml(t(lang, "search.page_title"))}: \u201c${escapeHtml(q)}\u201d</div>
+        <h1>${lang === "en" ? "Search results for" : "S\u00f8keresultater for"} \u201c${escapeHtml(q)}\u201d \u2014 ${headerText}</h1>
+        ${allFuzzy ? `<p style="color:var(--g500,#666);font-size:0.9rem;margin-top:4px;">${lang === "en" ? "No exact name match for" : "Fant ingen eksakte navnematch for"} \u201c${escapeHtml(q)}\u201d \u2014 ${lang === "en" ? "showing producers with similar names." : "viser produsenter med lignende navn."}</p>` : ""}
+        <form class="search-form" action="${localizedPath("/sok", lang)}" method="GET">
+          <input type="text" name="q" value="${escapeHtml(q)}" aria-label="${escapeHtml(t(lang, "search.btn_search"))}">
+          <button type="button" id="geoBtn" style="padding:12px 16px;background:var(--green-100,#e8f0e0);color:var(--green-700,#2D5016);border:2px solid var(--green-700,#2D5016);border-left:none;font-weight:700;font-size:0.85rem;cursor:pointer;white-space:nowrap;">\u{1F4CD} ${lang === "en" ? "Near me" : "N\u00e6r meg"}</button>
+          <button type="submit">${escapeHtml(t(lang, "search.btn_search"))}</button>
         </form>
         ${geoNote}
       </div>
@@ -927,8 +992,8 @@ router.get("/sok", async (req: Request, res: Response) => {
       ${results.length > 0
         ? `<div class="results-grid">${resultCards}</div>`
         : `<div style="text-align:center;padding:48px 0;color:var(--g500);">
-            <p style="font-size:1.1rem;">Ingen resultater for \u201c${escapeHtml(q)}\u201d</p>
-            <p style="margin-top:8px;"><a href="/">Pr\u00f8v et annet s\u00f8k</a></p>
+            <p style="font-size:1.1rem;">${lang === "en" ? "No results for" : "Ingen resultater for"} \u201c${escapeHtml(q)}\u201d</p>
+            <p style="margin-top:8px;"><a href="${localizedPath("/", lang)}">${lang === "en" ? "Try a different search" : "Pr\u00f8v et annet s\u00f8k"}</a></p>
           </div>`
       }
     </section>
@@ -942,7 +1007,7 @@ router.get("/sok", async (req: Request, res: Response) => {
         navigator.geolocation.getCurrentPosition(function(pos) {
           var form = geoBtn.closest('form');
           var q = form.querySelector('input[name=q]').value;
-          window.location.href = '/sok?q=' + encodeURIComponent(q) + '&lat=' + pos.coords.latitude + '&lng=' + pos.coords.longitude + '&radius=30';
+          window.location.href = "${localizedPath("/sok", lang)}?q=" + encodeURIComponent(q) + '&lat=' + pos.coords.latitude + '&lng=' + pos.coords.longitude + '&radius=30';
         }, function() {
           geoBtn.textContent = '\\u274C Avsl\u00e5tt';
           geoBtn.disabled = false;
@@ -953,10 +1018,10 @@ router.get("/sok", async (req: Request, res: Response) => {
     </script>`;
 
     res.send(shell(
-      `${q} \u2014 S\u00f8k i ${getConfig().display_name}`,
-      `S\u00f8keresultater for \u201c${q}\u201d \u2014 finn lokale ${getConfig().domain_dictionary.entity_plural_long} i Norge.`,
+      `${q} \u2014 ${t(lang, "search.title")}`,
+      `${lang === "en" ? "Search results for" : "S\u00f8keresultater for"} \u201c${q}\u201d.`,
       content,
-      { canonical: `${BASE_URL}/sok?q=${encodeURIComponent(q)}`, extraCss: SEARCH_CSS }
+      { canonical: `${BASE_URL}${localizedPath("/sok", lang)}?q=${encodeURIComponent(q)}`, extraCss: SEARCH_CSS, lang, pathForAlternate: `/sok?q=${encodeURIComponent(q)}` }
     ));
   } catch (err) {
     console.error("SEO /sok error:", err);
@@ -990,7 +1055,8 @@ const OM_CSS = `
   }
 `;
 
-router.get("/om", (_req: Request, res: Response) => {
+router.get("/om", (req: Request, res: Response) => {
+  const lang = req.lang;
   const content = `
   <section class="om-hero">
     <h1>Maten fortjener \u00e5 bli <em>funnet</em></h1>
@@ -1040,10 +1106,10 @@ router.get("/om", (_req: Request, res: Response) => {
   </section>`;
 
   res.send(shell(
-    `Om ${getConfig().display_name} \u2014 V\u00e5r historie`,
-    `${getConfig().display_name} gj\u00f8r lokale ${getConfig().domain_dictionary.entity_plural_long} synlige for AI-assistenter. Les om v\u00e5r misjon og hvorfor vi bygger dette.`,
+    t(lang, "about.title"),
+    t(lang, "about.description"),
     content,
-    { canonical: `${BASE_URL}/om`, extraCss: OM_CSS }
+    { canonical: `${BASE_URL}${localizedPath("/om", lang)}`, extraCss: OM_CSS, lang, pathForAlternate: "/om" }
   ));
 });
 
@@ -1092,7 +1158,8 @@ const TECH_CSS = `
   }
 `;
 
-router.get("/teknologi", (_req: Request, res: Response) => {
+router.get("/teknologi", (req: Request, res: Response) => {
+  const lang = req.lang;
   const stats = marketplaceRegistry.getStats();
   const totalAgents = stats.totalAgents || marketplaceRegistry.getActiveAgents().length;
   const content = `
@@ -1220,10 +1287,10 @@ router.get("/teknologi", (_req: Request, res: Response) => {
   </section>`;
 
   res.send(shell(
-    `Slik fungerer AI-s\u00f8k \u2014 ${getConfig().display_name}`,
-    `${getConfig().display_name} bruker A2A, MCP og Schema.org for \u00e5 gj\u00f8re lokale ${getConfig().domain_dictionary.entity_plural_long} synlige for AI-assistenter.`,
+    t(lang, "tech.title"),
+    t(lang, "tech.description"),
     content,
-    { canonical: `${BASE_URL}/teknologi`, extraCss: TECH_CSS }
+    { canonical: `${BASE_URL}${localizedPath("/teknologi", lang)}`, extraCss: TECH_CSS, lang, pathForAlternate: "/teknologi" }
   ));
 });
 
@@ -1253,7 +1320,8 @@ const PERSONVERN_CSS = `
   }
 `;
 
-router.get("/personvern", (_req: Request, res: Response) => {
+router.get("/personvern", (req: Request, res: Response) => {
+  const lang = req.lang;
   const content = `
   <section class="pv-hero">
     <h1>Personvern</h1>
@@ -1379,10 +1447,10 @@ router.get("/personvern", (_req: Request, res: Response) => {
   </section>`;
 
   res.send(shell(
-    `Personvern \u2014 ${getConfig().display_name}`,
-    `Hvordan ${getConfig().display_name} behandler persondata. Ingen cookies, ingen tredjepartssporing, åpen kildekode.`,
+    t(lang, "privacy.title"),
+    t(lang, "privacy.description"),
     content,
-    { canonical: `${BASE_URL}/personvern`, extraCss: PERSONVERN_CSS }
+    { canonical: `${BASE_URL}${localizedPath("/personvern", lang)}`, extraCss: PERSONVERN_CSS, lang, pathForAlternate: "/personvern" }
   ));
 });
 
@@ -1411,9 +1479,11 @@ router.get("/:city", (req: Request, res: Response, next: any) => {
       || citySlug === "terms" || citySlug === "terms-of-service" || citySlug === "tos" || citySlug === "vilkar"
       || citySlug === "llms.txt" || citySlug === "llms-full.txt"
       || citySlug === "agents" || citySlug === "docs" || citySlug === "samtaler" || citySlug === "samtale"
+      || citySlug === "en" || citySlug === "no"
       || citySlug.includes(".")) {
     return next();
   }
+  const lang = req.lang;
 
   try {
     const agents = marketplaceRegistry.getActiveAgents();
@@ -1424,7 +1494,8 @@ router.get("/:city", (req: Request, res: Response, next: any) => {
 
     if (cityAgents.length === 0) {
       return res.status(404).send(shell(
-        "Fant ingen produsenter", "Ingen produsenter funnet.",
+        lang === "en" ? "No producers found" : "Fant ingen produsenter",
+        lang === "en" ? "No producers found." : "Ingen produsenter funnet.",
         `<div class="sec" style="text-align:center;padding:80px 24px;">
           <h1 style="font-size:1.8rem;margin-bottom:12px;">Fant ingen produsenter for \u201c${escapeHtml(citySlug)}\u201d</h1>
           <p style="color:var(--g500);"><a href="/">Tilbake til forsiden</a></p>
@@ -1438,7 +1509,7 @@ router.get("/:city", (req: Request, res: Response, next: any) => {
     // Use the first agent as representative — getCityStats groups by city
     analyticsService.trackAgentView(cityAgents[0].id, cityAgents[0].name, cityName, "seo");
 
-    const producerCards = cityAgents.map((a: any) => producerCard(a)).join("");
+    const producerCards = cityAgents.map((a: any) => producerCard(a, undefined, lang)).join("");
 
     // City-specific context paragraph (SEO: gives Google unique content per city
     // instead of a template-only page). All values are computed from the live
@@ -1512,10 +1583,10 @@ router.get("/:city", (req: Request, res: Response, next: any) => {
     </section>`;
 
     res.send(shell(
-      `Lokal mat i ${cityName} \u2014 ${cityAgents.length} produsenter`,
-      `Finn ${cityAgents.length} lokale ${getConfig().domain_dictionary.entity_plural_long} i ${cityName}. G\u00e5rder, markeder og g\u00e5rdsbutikker.`,
+      t(lang, "city.title", { city: cityName }),
+      t(lang, "city.description", { count: cityAgents.length, city: cityName }),
       content,
-      { canonical: `${BASE_URL}/${citySlug}`, jsonLd: jsonLdItems, extraCss: CITY_CSS }
+      { canonical: `${BASE_URL}${localizedPath("/" + citySlug, lang)}`, jsonLd: jsonLdItems, extraCss: CITY_CSS, lang, pathForAlternate: "/" + citySlug }
     ));
   } catch (err) {
     console.error(`SEO /${citySlug} error:`, err);
@@ -1699,6 +1770,7 @@ function findProducerMatches(
 }
 
 router.get("/produsent/:slug", (req: Request, res: Response) => {
+  const lang = req.lang;
   const slug = (req.params.slug as string).toLowerCase();
 
   try {
@@ -1717,7 +1789,7 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
         if (canonical && canonical !== slug) {
           // 301 tells crawlers to update their index — preserves SEO juice
           // and teaches Perplexity/ChatGPT/Claude the canonical URL.
-          return res.redirect(301, `/produsent/${canonical}`);
+          return res.redirect(301, `${localizedPath("/produsent/" + canonical, lang)}`);
         }
       }
 
@@ -2206,10 +2278,10 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
     </div>`;
 
     res.send(shell(
-      `${agent.name} \u2014 Lokal mat${cityName ? ` i ${cityName}` : ""}`,
-      `${agent.name}${cityName ? ` i ${cityName}` : ""}. ${agent.description || "Lokalprodusert mat i Norge."}`,
+      `${agent.name}${cityName ? t(lang, "producer.title_suffix", { city: cityName }) : ""}`,
+      `${agent.name}${cityName ? ` ${lang === "en" ? "in" : "i"} ${cityName}` : ""}. ${agent.description || (lang === "en" ? "Local food in Norway." : "Lokalprodusert mat i Norge.")}`,
       content,
-      { canonical: `${BASE_URL}/produsent/${slug}`, jsonLd, extraCss: PROFILE_CSS }
+      { canonical: `${BASE_URL}${localizedPath("/produsent/" + slug, lang)}`, jsonLd, extraCss: PROFILE_CSS, lang, pathForAlternate: "/produsent/" + slug }
     ));
   } catch (err) {
     console.error(`SEO /produsent/${slug} error:`, err);
@@ -2231,19 +2303,25 @@ router.get("/sitemap.xml", (_req: Request, res: Response) => {
       if (city) cities.add(slugify(city));
     });
 
+    // Build sitemap with NO + EN URLs and xhtml:link hreflang per Google guidelines.
+    // https://developers.google.com/search/docs/specialized/international/localized-versions
     let xml = `<?xml version="1.0" encoding="UTF-8"?>
-<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
-  <url><loc>${BASE_URL}/</loc><changefreq>daily</changefreq><priority>1.0</priority><lastmod>${today}</lastmod></url>
-  <url><loc>${BASE_URL}/om</loc><changefreq>monthly</changefreq><priority>0.7</priority><lastmod>${today}</lastmod></url>
-  <url><loc>${BASE_URL}/teknologi</loc><changefreq>monthly</changefreq><priority>0.7</priority><lastmod>${today}</lastmod></url>
-  <url><loc>${BASE_URL}/personvern</loc><changefreq>monthly</changefreq><priority>0.5</priority><lastmod>${today}</lastmod></url>`;
+<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9" xmlns:xhtml="http://www.w3.org/1999/xhtml">`;
 
-    for (const city of cities) {
-      xml += `\n  <url><loc>${BASE_URL}/${city}</loc><changefreq>weekly</changefreq><priority>0.8</priority><lastmod>${today}</lastmod></url>`;
+    const corePaths = ["/", "/om", "/teknologi", "/personvern"];
+    const corePriorities: Record<string, string> = { "/": "1.0", "/om": "0.7", "/teknologi": "0.7", "/personvern": "0.5" };
+    const coreFreq: Record<string, string> = { "/": "daily" };
+
+    function addEntry(path: string, freq: string, priority: string) {
+      const noLoc = `${BASE_URL}${path === "/" ? "" : path}`;
+      const enLoc = `${BASE_URL}/en${path === "/" ? "" : path}`;
+      xml += `\n  <url>\n    <loc>${noLoc}</loc>\n    <changefreq>${freq}</changefreq>\n    <priority>${priority}</priority>\n    <lastmod>${today}</lastmod>\n    <xhtml:link rel="alternate" hreflang="nb" href="${noLoc}"/>\n    <xhtml:link rel="alternate" hreflang="en" href="${enLoc}"/>\n    <xhtml:link rel="alternate" hreflang="x-default" href="${noLoc}"/>\n  </url>`;
+      xml += `\n  <url>\n    <loc>${enLoc}</loc>\n    <changefreq>${freq}</changefreq>\n    <priority>${priority}</priority>\n    <lastmod>${today}</lastmod>\n    <xhtml:link rel="alternate" hreflang="nb" href="${noLoc}"/>\n    <xhtml:link rel="alternate" hreflang="en" href="${enLoc}"/>\n    <xhtml:link rel="alternate" hreflang="x-default" href="${noLoc}"/>\n  </url>`;
     }
-    for (const a of agents) {
-      xml += `\n  <url><loc>${BASE_URL}/produsent/${slugify(a.name)}</loc><changefreq>weekly</changefreq><priority>0.6</priority><lastmod>${today}</lastmod></url>`;
-    }
+
+    for (const p of corePaths) addEntry(p, coreFreq[p] || "monthly", corePriorities[p]);
+    for (const city of cities) addEntry(`/${city}`, "weekly", "0.8");
+    for (const a of agents) addEntry(`/produsent/${slugify(a.name)}`, "weekly", "0.6");
 
     xml += "\n</urlset>";
     res.header("Content-Type", "application/xml");
