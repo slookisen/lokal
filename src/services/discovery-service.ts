@@ -118,7 +118,7 @@ class DiscoveryService {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
-        "User-Agent": "Lokal/1.0 (A2A Food Marketplace)",
+        "User-Agent": "RettFraBonden/1.0 (A2A Food Marketplace)",
       },
       body: JSON.stringify({
         agentCard: card,
@@ -179,7 +179,7 @@ class DiscoveryService {
       // For future DNS-SD (mDNS) local network discovery
       "dns-sd": {
         serviceType: "_a2a._tcp",
-        serviceName: "Lokal Food Marketplace",
+        serviceName: "Rett fra Bonden Food Marketplace",
         txtRecords: {
           "path": "/.well-known/agent-card.json",
           "type": "food-marketplace",

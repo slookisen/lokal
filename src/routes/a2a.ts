@@ -40,11 +40,11 @@ router.get("/a2a", (_req: Request, res: Response) => {
     const agents = marketplaceRegistry.getActiveAgents();
     const cities = [...new Set(agents.map((a: any) => a.city).filter(Boolean))];
     const card = {
-      name: "Lokal",
+      name: "Rett fra Bonden",
       description: `A2A marketplace for local food in Norway. Connect AI agents with ${agents.length}+ verified local farms, shops, cooperatives, farm shops, REKO rings, and markets. Agent-markedsplass for lokal mat i Norge.`,
       url: process.env.BASE_URL || "https://rettfrabonden.com",
       provider: {
-        organization: "Lokal",
+        organization: "Rett fra Bonden",
         url: process.env.BASE_URL || "https://rettfrabonden.com",
         contactUrl: `${process.env.BASE_URL || "https://rettfrabonden.com"}/docs`,
         description: "Open agent-to-agent food marketplace operator. Norges første A2A-markedsplass for lokal mat.",

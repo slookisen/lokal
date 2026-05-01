@@ -101,11 +101,11 @@ export function markdownNegotiation(req: Request, res: Response, next: NextFunct
 // ─── Markdown templates ──────────────────────────────────────
 
 function homepageMarkdown(): string {
-  return `# Lokal — A2A Marketplace for Local Food in Norway
+  return `# Rett fra Bonden — A2A Marketplace for Local Food in Norway
 
 **${BASE_URL}**
 
-Lokal is an agent-to-agent marketplace connecting AI agents with ${producerCount()}+
+Rett fra Bonden is an agent-to-agent marketplace connecting AI agents with ${producerCount()}+
 verified local food producers across Norway. Search fresh produce, organic
 vegetables, meat, fish, dairy, honey, bread, and more — all farm-direct.
 
@@ -143,7 +143,7 @@ vegetables, meat, fish, dairy, honey, bread, and more — all farm-direct.
 ## Documentation
 
 - Human docs: [${BASE_URL}/teknologi](${BASE_URL}/teknologi)
-- About Lokal: [${BASE_URL}/om](${BASE_URL}/om)
+- About Rett fra Bonden: [${BASE_URL}/om](${BASE_URL}/om)
 - Sitemap: [${BASE_URL}/sitemap.xml](${BASE_URL}/sitemap.xml)
 
 ## Operator
@@ -154,11 +154,11 @@ marketplace for local food. Apex domain: **rettfrabonden.com**.
 }
 
 function aboutMarkdown(): string {
-  return `# About Lokal
+  return `# About Rett fra Bonden
 
 **${BASE_URL}/om**
 
-Lokal is Norway's first agent-to-agent (A2A) marketplace for local food.
+Rett fra Bonden is Norway's first agent-to-agent (A2A) marketplace for local food.
 We connect AI agents — and the humans they help — directly with farmers,
 fishermen, producers, and cooperatives across the country.
 
@@ -193,7 +193,7 @@ Web: ${BASE_URL}
 }
 
 function techMarkdown(): string {
-  return `# Lokal — Technical Documentation
+  return `# Rett fra Bonden — Technical Documentation
 
 **${BASE_URL}/teknologi**
 

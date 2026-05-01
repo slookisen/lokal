@@ -580,7 +580,7 @@ class MarketplaceRegistry {
       // WHY bilingual: Consumer agents (Claude, GPT, Gemini, etc.)
       // search in English. Norwegian producers search in Norwegian.
       // Both need to find us. Bilingual descriptions = 2x discovery surface.
-      name: "Lokal",
+      name: "Rett fra Bonden",
       description: "A2A marketplace for local food in Norway. " +
         `Connect AI agents with ${stats.totalAgents || 1169}+ verified local farms, shops, cooperatives, farm shops, REKO rings, and markets. ` +
         "Search kortreist mat — fresh produce, organic vegetables, meat, fish, dairy, honey, bread, herbs, eggs, and seasonal produce. " +
@@ -592,7 +592,7 @@ class MarketplaceRegistry {
       // messages" — flagged by A2A Registry maintainer 2026-04-25.
       url: `${baseUrl}/a2a`,
       provider: {
-        organization: "Lokal",
+        organization: "Rett fra Bonden",
         url: baseUrl,
         contactUrl: `${baseUrl}/docs`,
         description: "Open agent-to-agent food marketplace operator. " +
@@ -672,10 +672,10 @@ class MarketplaceRegistry {
         {
           id: "register-food-agent",
           name: "Register Food Producer Agent / Registrer matagent",
-          description: "Register a new food producer, farm, shop, or cooperative as an agent in the Lokal marketplace. " +
+          description: "Register a new food producer, farm, shop, or cooperative as an agent in the Rett fra Bonden marketplace. " +
             "Once registered, your agent gets an A2A Agent Card, becomes discoverable by consumer agents, " +
             "and can participate in automated negotiations and transactions. " +
-            "Registrer en ny matprodusent som agent i Lokal-markedsplassen.",
+            "Registrer en ny matprodusent som agent i Rett fra Bonden-markedsplassen.",
           tags: [
             "register", "onboard", "producer", "farm", "shop", "cooperative",
             "registrering", "produsent", "g\u00e5rd", "butikk", "andelslag",

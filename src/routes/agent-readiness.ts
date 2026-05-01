@@ -49,7 +49,7 @@ function mcpServerCard() {
     documentation: `${BASE_URL}/teknologi`,
     icon: `${BASE_URL}/favicon.ico`,
     vendor: {
-      name: "Lokal",
+      name: "Rett fra Bonden",
       url: BASE_URL,
     },
     license: "MIT",
@@ -142,7 +142,7 @@ function agentSkillsIndex() {
     $schema: "https://agentskills.io/schemas/v0.2.0/index.schema.json",
     version: "0.2.0",
     provider: {
-      name: "Lokal",
+      name: "Rett fra Bonden",
       url: BASE_URL,
       description: "A2A marketplace for local Norwegian food producers.",
     },
