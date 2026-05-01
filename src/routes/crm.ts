@@ -407,4 +407,54 @@ router.post("/contacts/reclassify-unknown", (_req, res) => {
   res.json(result);
 });
 
+// ─── GET /admin/crm/marketing/batch-report ───────────────────
+// Per-batch outreach metrics: how many sent, how many replied, how
+// many added themselves to the blocklist (= unsubscribed).  Drives
+// the v1-vs-v2 template comparison and the daily marketing summary.
+//
+// Thread IDs follow the pattern `marketing-batch-e<N>-<producerId>`,
+// e.g. `marketing-batch-e15-1247`.
+router.get("/marketing/batch-report", (_req, res) => {
+  try {
+    const db = getDb();
+    const sql = `
+      WITH parsed AS (
+        SELECT
+          t.id AS thread_id,
+          SUBSTR(t.id, LENGTH('marketing-batch-')+1,
+                 INSTR(SUBSTR(t.id, LENGTH('marketing-batch-')+1), '-')-1) AS batch,
+          c.email AS to_email,
+          (CASE WHEN t.last_inbound_at IS NOT NULL THEN 1 ELSE 0 END) AS replied,
+          (CASE WHEN EXISTS (
+              SELECT 1 FROM agent_blocklist b
+              WHERE b.identifier_type = 'email'
+                AND LOWER(b.identifier_value) = LOWER(c.email)
+            ) THEN 1 ELSE 0 END) AS unsubscribed
+        FROM crm_threads t
+        JOIN crm_contacts c ON c.id = t.contact_id
+        WHERE t.id LIKE 'marketing-batch-e%'
+      )
+      SELECT
+        batch,
+        COUNT(*) AS sent,
+        SUM(replied) AS replied,
+        SUM(unsubscribed) AS unsubscribed,
+        ROUND(100.0 * SUM(replied) / NULLIF(COUNT(*), 0), 1) AS reply_rate_pct,
+        ROUND(100.0 * SUM(unsubscribed) / NULLIF(COUNT(*), 0), 1) AS unsub_rate_pct
+      FROM parsed
+      WHERE batch != ''
+      GROUP BY batch
+      ORDER BY batch DESC
+    `;
+    const rows = db.prepare(sql).all();
+    res.json({
+      batches: rows,
+      generated_at: new Date().toISOString(),
+      note: "v1 = e1..e15.  v2 starts at e16 (verifiserings-frame + personal_observation).",
+    });
+  } catch (err: any) {
+    res.status(500).json({ error: "batch_report_failed", detail: err.message });
+  }
+});
+
 export default router;

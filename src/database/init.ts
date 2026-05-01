@@ -512,6 +512,17 @@ function initSchema(db: Database.Database): void {
     );
     CREATE INDEX IF NOT EXISTS idx_crm_outbox_status ON crm_outbox(status);
     CREATE INDEX IF NOT EXISTS idx_crm_outbox_intent ON crm_outbox(intent);
+
+    -- ─── producer_observations ───────────────────────────────
+    -- Cache for LLM-generated personal observations used in v2
+    -- outreach mailene.  One row per producer; reused across follow-up
+    -- mails so we don't re-spend $ on the same observation.
+    CREATE TABLE IF NOT EXISTS producer_observations (
+      producer_id INTEGER PRIMARY KEY,
+      observation TEXT NOT NULL,
+      generated_at TEXT NOT NULL DEFAULT (datetime('now')),
+      used_in_batches TEXT DEFAULT ''  -- comma-separated batch IDs (e16,e17,...)
+    );
   `);
 
 
