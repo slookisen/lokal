@@ -7,6 +7,11 @@
 #      Actions → New repository secret → Name: FLY_API_TOKEN, Value: <token>
 #   3. Done. Every `git push origin main` will now trigger a deploy.
 #
+# Optional (for signed deploy.completed triggers):
+#   4. Generate HMAC secret: `openssl rand -hex 32`
+#   5. Set as GitHub secret: TRIGGER_HMAC_SECRET (same value as Fly env var
+#      TRIGGER_HMAC_SECRET — both must match for signature verification).
+#
 # Why this exists: local `fly deploy` is blocked by Windows Application
 # Control policy. GitHub-hosted runner has no such restriction.
 
@@ -46,3 +51,50 @@ jobs:
           sleep 10
           curl -sf -o /dev/null -w "%{http_code}\n" https://rettfrabonden.com/healthz || \
             curl -sf -o /dev/null -w "%{http_code}\n" https://rettfrabonden.com/
+
+      - name: Notify platform — deploy.completed trigger
+        # Posts to /platform/triggers/deploy.completed so platform-verifier
+        # can probe the new commit on its next 15-min cycle (or sooner, when
+        # we add a "check pending triggers" step to verifier — Phase 3.3b).
+        # If TRIGGER_HMAC_SECRET is set, the trigger is signed and lands with
+        # signature_verified=true. If not, it lands with signature_verified=false
+        # (still recorded — dev mode).
+        # Failure of this step does NOT fail the deploy — the deploy already
+        # succeeded; this is just observability glue.
+        if: success()
+        continue-on-error: true
+        env:
+          TRIGGER_HMAC_SECRET: ${{ secrets.TRIGGER_HMAC_SECRET }}
+        run: |
+          set -e
+          PAYLOAD=$(cat <<JSON
+          {"commit":"${{ github.sha }}","actor":"${{ github.actor }}","run_id":"${{ github.run_id }}","run_url":"${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}","completed_at":"$(date -u +%Y-%m-%dT%H:%M:%SZ)"}
+          JSON
+          )
+
+          IDEMPOTENCY_KEY="gh-deploy-${{ github.run_id }}-${{ github.run_attempt }}"
+
+          if [ -n "${TRIGGER_HMAC_SECRET}" ]; then
+            SIG=$(printf '%s' "${PAYLOAD}" | openssl dgst -sha256 -hmac "${TRIGGER_HMAC_SECRET}" -hex | awk '{print $2}')
+            SIG_HEADER="-H X-Trigger-Signature:sha256=${SIG}"
+          else
+            SIG_HEADER=""
+            echo "::warning::TRIGGER_HMAC_SECRET not set — trigger will land unsigned (signature_verified=false)"
+          fi
+
+          HTTP_CODE=$(curl -s -o /tmp/trigger-resp.json --max-time 12 -w "%{http_code}" -X POST \
+            -H "X-Idempotency-Key: ${IDEMPOTENCY_KEY}" \
+            -H "X-Trigger-Source: github-actions" \
+            -H "Content-Type: application/json" \
+            ${SIG_HEADER} \
+            -d "${PAYLOAD}" \
+            https://rettfrabonden.com/platform/triggers/deploy.completed)
+
+          echo "Trigger POST: HTTP ${HTTP_CODE}"
+          cat /tmp/trigger-resp.json
+          echo ""
+
+          # 200 expected. Anything else: warn but don't fail the workflow.
+          if [ "${HTTP_CODE}" != "200" ]; then
+            echo "::warning::Trigger POST returned HTTP ${HTTP_CODE} — see response body above"
+          fi
