@@ -334,6 +334,30 @@ function initSchema(db: Database.Database): void {
       view_source TEXT DEFAULT 'unknown',          -- 'search','direct','discovery','seo'
       created_at TEXT DEFAULT (datetime('now'))
     );
+    -- ════════════════════════════════════════════════════════════
+    -- RUNS: Platform run-ledger (every scheduled-agent run lands here)
+    -- Contract defined in src/types/run-envelope.ts (RunEnvelope)
+    -- Read by platform-verifier (3-layer probes) and orchestrator
+    -- ════════════════════════════════════════════════════════════
+    CREATE TABLE IF NOT EXISTS runs (
+      run_id TEXT PRIMARY KEY,                     -- run-YYYY-MM-DD-<agent>-<seq>-<vertical>
+      vertical TEXT NOT NULL DEFAULT 'rfb',        -- rfb | tannlege | ...
+      agent TEXT NOT NULL,                         -- marketing | customer-service | enrichment | ...
+      trigger_source TEXT NOT NULL,                -- cron | webhook | signal | manual
+      started_at TEXT NOT NULL,                    -- ISO 8601 UTC
+      finished_at TEXT,                            -- ISO 8601 UTC; null if interrupted
+      status TEXT NOT NULL,                        -- completed | failed | partial (agent's view)
+      claims TEXT NOT NULL DEFAULT '[]',           -- JSON array of Claim
+      evidence TEXT NOT NULL DEFAULT '[]',         -- JSON array of Evidence
+      next_suggested TEXT,                         -- JSON array of agent names
+      errors TEXT,                                 -- JSON array of {message,meta}
+      notes TEXT,                                  -- prose summary <500 chars
+      verifier_state TEXT NOT NULL DEFAULT 'pending', -- pending | verified | failed | skipped
+      verifier_checked_at TEXT,                    -- ISO 8601 UTC; null until verifier touches it
+      verifier_findings TEXT,                      -- JSON array of VerifierFinding
+      created_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+
 
     -- ════════════════════════════════════════════════════════════
     -- INDEXES: Geo bounding-box + common lookups
@@ -356,6 +380,15 @@ function initSchema(db: Database.Database): void {
     CREATE INDEX IF NOT EXISTS idx_conversations_seller ON conversations(seller_agent_id);
     CREATE INDEX IF NOT EXISTS idx_conversations_status ON conversations(status);
     CREATE INDEX IF NOT EXISTS idx_messages_conversation ON messages(conversation_id);
+    -- Run ledger indexes
+    CREATE INDEX IF NOT EXISTS idx_runs_vertical_agent_started
+        ON runs(vertical, agent, started_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_runs_verifier_pending
+        ON runs(verifier_state, started_at DESC)
+        WHERE verifier_state IN ('pending', 'failed');
+    CREATE INDEX IF NOT EXISTS idx_runs_status_finished
+        ON runs(status, finished_at DESC);
+
 
     -- Knowledge & claims indexes
     CREATE INDEX IF NOT EXISTS idx_agent_claims_agent ON agent_claims(agent_id);
