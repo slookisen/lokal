@@ -21,12 +21,45 @@ on:
   push:
     branches:
       - main
+  pull_request:
+    branches:
+      - main                 # build-check runs on PRs to main; deploy is gated below
   workflow_dispatch:       # lets you trigger manually from Actions tab
 
 jobs:
+  build-check:
+    name: Type-check + tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Type-check (tsc --noEmit)
+        # Fail-fast on TypeScript errors before we waste a Fly build slot.
+        # Catches things like @types/express 5 req.params.X = string|string[]
+        # regression that landed silently between Phase 1.2 and Phase 4.1
+        # because the prod runtime uses tsx (no compile-time check) — only
+        # `npm run build` enforces tsc, and that ran only on Daniel's local.
+        run: npx tsc --noEmit
+
+      - name: Run tests
+        run: npm test
+
   deploy:
     name: Deploy to Fly.io
     runs-on: ubuntu-latest
+    needs: build-check
+    # Only deploy on push to main / manual dispatch — PR runs only the gate.
+    if: github.event_name != 'pull_request'
     concurrency:
       group: fly-deploy-main
       cancel-in-progress: false   # don't abort a running deploy if a new push arrives

@@ -2,6 +2,7 @@ import express from "express";
 import cors from "cors";
 import path from "path";
 import { getDb, closeDb } from "./database/init";
+import { loadConfigsAtBoot } from "./config/vertical-config";
 import {
   securityHeaders,
   generalLimiter,
@@ -38,6 +39,12 @@ import { trustScoreService } from "./services/trust-score-service";
 // Seed-knowledge loaded dynamically — only used if DB is empty
 let seedKnowledge: (() => void) | undefined;
 try { seedKnowledge = require("./_seeds/seed-knowledge").seedKnowledge; } catch { /* ok */ }
+
+// ─── Vertical config — Phase 4.1 ────────────────────────────
+// Read verticals/<id>/config.yaml at boot. App refuses to start
+// if YAML is malformed or schema validation fails. Must run before
+// any service touches getConfig().
+loadConfigsAtBoot();
 
 const app = express();
 const PORT = process.env.PORT || 3000;

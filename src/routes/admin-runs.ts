@@ -194,7 +194,7 @@ router.get("/summary", (req: Request, res: Response) => {
 router.post("/:run_id/verify", (req: Request, res: Response) => {
   if (!requireAdmin(req, res)) return;
 
-  const runId = req.params.run_id;
+  const runId = req.params.run_id as string;
   const body = req.body as { state?: unknown; findings?: unknown };
 
   const validStates = ["pending", "verified", "failed", "skipped"];

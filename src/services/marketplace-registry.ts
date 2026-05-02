@@ -1,6 +1,7 @@
 ﻿import { v4 as uuid } from "uuid";
 import crypto from "crypto";
 import { getDb } from "../database/init";
+import { getConfig } from "../config/vertical-config";
 import {
   AgentRegistration,
   RegisteredAgent,
@@ -646,7 +647,7 @@ class MarketplaceRegistry {
             "location (Oslo, Bergen, Trondheim, Stavanger, Troms\u00f8, and rural districts), " +
             "certifications (organic, Debio, farm-direct), delivery options (pickup, local delivery), " +
             "and trust score. Returns ranked results with contact info and A2A endpoints. " +
-            `Søk blant ${stats.totalAgents || 1270}+ verifiserte lokale matprodusenter i Norge.`,
+            `Søk blant ${stats.totalAgents || 1270}+ verifiserte lokale ${getConfig().domain_dictionary.entity_plural_long} i Norge.`,
           tags: [
             // English discovery keywords (what agents actually search for)
             "local food", "fresh produce", "organic", "farm direct", "vegetables", "fruit",
