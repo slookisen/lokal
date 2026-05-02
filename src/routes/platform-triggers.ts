@@ -12,11 +12,9 @@
 //   - All admin endpoints require X-Admin-Key.
 
 import { Router, Request, Response } from "express";
+import { ALLOWED_EVENT_TYPES } from "../types/trigger";
 import {
   isAllowedEventType,
-  ALLOWED_EVENT_TYPES,
-} from "../types/trigger";
-import {
   recordTrigger,
   verifyHmac,
   listPendingTriggers,
