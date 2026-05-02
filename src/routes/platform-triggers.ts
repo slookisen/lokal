@@ -45,7 +45,7 @@ function requireAdmin(req: Request, res: Response): boolean {
 const publicRouter = Router();
 
 publicRouter.post("/triggers/:event_type", (req: Request, res: Response) => {
-  const eventType = req.params.event_type;
+  const eventType = req.params.event_type as string;
   if (!isAllowedEventType(eventType)) {
     res.status(400).json({
       error: "Unknown event_type",
@@ -149,7 +149,7 @@ adminRouter.get("/triggers/recent", (req: Request, res: Response) => {
 
 adminRouter.post("/triggers/:trigger_id/consume", (req: Request, res: Response) => {
   if (!requireAdmin(req, res)) return;
-  const triggerId = req.params.trigger_id;
+  const triggerId = req.params.trigger_id as string;
   const body = req.body as { consumed_by?: string; result?: string };
 
   if (!body.consumed_by || typeof body.consumed_by !== "string") {
