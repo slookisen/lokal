@@ -1,0 +1,32 @@
+# Test-vertikal — brukes KUN for unit-tester av config-loader.
+# Alle agenter er disabled så plattformen ikke prøver å kjøre noe
+# selv om denne fila skulle havne i prod ved et uhell.
+#
+# Dette gir oss en falsifiserbar test på multi-vertikal-loading
+# før vi har en ekte vertikal nr. 2.
+
+vertical_id: test
+display_name: Test Vertical
+domain: example.test
+
+domain_dictionary:
+  entity: testitem
+  entity_plural: testitems
+  entity_plural_long: long-form testitems
+  service: testservice
+  buyer: testbuyer
+
+agents:
+  marketing:
+    enabled: false
+    schedule: "0 0 * * *"
+    batch_size: 1
+  enrichment:
+    enabled: false
+    schedule: "0 0 * * *"
+    cap_per_run: 1
+
+connectors:
+  github_repo: example/test-repo
+  fly_app: test-app
+  resend_domain: example.test

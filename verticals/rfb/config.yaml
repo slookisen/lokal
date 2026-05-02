@@ -1,0 +1,52 @@
+# Rett fra Bonden — vertikal-konfig v1
+#
+# Phase 4.1 scope: domene-ordbok + agent-status + connectors.
+# Hardkodet "produsent"/"lokalmat" på tvers av services migreres
+# inkrementelt i Phase 4.2-4.4 til å lese fra denne fila.
+#
+# Schedule-felt er informasjonelle pr 4.1 — Cowork scheduler eier
+# faktisk dispatching utenfor app. Phase 5 vurderer å gjøre dette til
+# single source of truth.
+
+vertical_id: rfb
+display_name: Rett fra Bonden
+domain: rettfrabonden.com
+
+domain_dictionary:
+  entity: produsent
+  entity_plural: produsenter
+  entity_plural_long: matprodusenter
+  service: lokalmat
+  buyer: kunde
+
+agents:
+  marketing:
+    enabled: true
+    schedule: "30 7 * * *"
+    batch_size: 30
+  customer_service:
+    enabled: true
+    # Hourly fallback til Pub/Sub er live (Phase 3.2 deferred)
+    schedule: "0 * * * *"
+  enrichment:
+    enabled: true
+    schedule: "0 4 * * *"
+    cap_per_run: 30
+  discovery:
+    enabled: true
+    schedule: "0 5 * * *"
+    cap_per_run: 30
+  contact_verifier:
+    enabled: true
+    schedule: "0 10 * * *"
+  visibility:
+    enabled: true
+    schedule: "0 7 * * *"
+  supervisor:
+    enabled: true
+    schedule: "0 12 * * *"
+
+connectors:
+  github_repo: slookisen/lokal
+  fly_app: lokal
+  resend_domain: rettfrabonden.com

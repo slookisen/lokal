@@ -26,6 +26,22 @@ function assertTrue(cond: boolean, label: string): void {
   }
 }
 
+function assertThrows(fn: () => void, pattern: RegExp, label: string): void {
+  try {
+    fn();
+    failed++;
+    failures.push(`✗ ${label} (no throw)`);
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    if (pattern.test(msg)) {
+      passed++;
+    } else {
+      failed++;
+      failures.push(`✗ ${label}\n    expected pattern: ${pattern}\n    actual: ${msg}`);
+    }
+  }
+}
+
 // Construct a checksum-valid fødselsnummer at test time so we don't hardcode a
 // real-looking one in the repo.
 function makeValidFnr(first9: string): string {
@@ -209,6 +225,179 @@ const fullScore = trustScoreService.calculate("test-perfect");
 assertTrue(fullScore >= 0.99, `max-everything agent → ${fullScore}, expected ≥ 0.99 (100% now reachable)`);
 
 memdb.close();
+
+// ─── VERTICAL CONFIG (Phase 4.1) ──────────────────────────────────────
+// Loader for verticals/<id>/config.yaml. Cold-load, fail-fast, deep-frozen.
+import * as fs2 from "fs";
+import * as path2 from "path";
+import * as os2 from "os";
+import {
+  loadConfigsAtBoot,
+  getConfig,
+  listVerticals,
+  lookupVerticalByHost,
+  _resetConfigCacheForTests,
+} from "../src/config/vertical-config";
+
+const VALID_RFB = `
+vertical_id: rfb
+display_name: Rett fra Bonden
+domain: rettfrabonden.com
+domain_dictionary:
+  entity: produsent
+  entity_plural: produsenter
+  entity_plural_long: matprodusenter
+  service: lokalmat
+  buyer: kunde
+agents:
+  marketing:
+    enabled: true
+    schedule: "30 7 * * *"
+    batch_size: 30
+connectors:
+  github_repo: slookisen/lokal
+  fly_app: lokal
+  resend_domain: rettfrabonden.com
+`;
+
+function tmpFixtureDir(): string {
+  return fs2.mkdtempSync(path2.join(os2.tmpdir(), "vc-test-"));
+}
+function writeConfig(dir: string, vid: string, content: string): void {
+  const sub = path2.join(dir, vid);
+  fs2.mkdirSync(sub, { recursive: true });
+  fs2.writeFileSync(path2.join(sub, "config.yaml"), content);
+}
+
+// Case A: valid rfb config loads and exposes typed values
+_resetConfigCacheForTests();
+{
+  const dir = tmpFixtureDir();
+  writeConfig(dir, "rfb", VALID_RFB);
+  loadConfigsAtBoot({ dir });
+  const cfg = getConfig("rfb");
+  assertEq(cfg.vertical_id, "rfb", "config: vertical_id loaded");
+  assertEq(cfg.domain_dictionary.entity_plural_long, "matprodusenter",
+    "config: entity_plural_long loaded");
+  assertEq(cfg.agents.marketing?.batch_size, 30, "config: agent batch_size loaded");
+}
+
+// Case B: listVerticals returns loaded ids
+_resetConfigCacheForTests();
+{
+  const dir = tmpFixtureDir();
+  writeConfig(dir, "rfb", VALID_RFB);
+  writeConfig(dir, "test", VALID_RFB.replace(/rfb/g, "test").replace("Rett fra Bonden", "Test"));
+  loadConfigsAtBoot({ dir, requireRfb: false });
+  const ids = listVerticals().sort().join(",");
+  assertEq(ids, "rfb,test", "config: listVerticals returns both");
+}
+
+// Case C: malformed YAML throws with file path in message
+_resetConfigCacheForTests();
+{
+  const dir = tmpFixtureDir();
+  writeConfig(dir, "rfb", "vertical_id: rfb\n  bad: : indent");
+  assertThrows(
+    () => loadConfigsAtBoot({ dir }),
+    /Failed to parse.*config\.yaml/,
+    "config: malformed YAML throws with path",
+  );
+}
+
+// Case D: schema violation throws
+_resetConfigCacheForTests();
+{
+  const dir = tmpFixtureDir();
+  writeConfig(dir, "rfb", "vertical_id: rfb\ndisplay_name: ok\n");
+  assertThrows(
+    () => loadConfigsAtBoot({ dir }),
+    /Schema validation failed/,
+    "config: missing required fields throws",
+  );
+}
+
+// Case E: directory name mismatch is caught
+_resetConfigCacheForTests();
+{
+  const dir = tmpFixtureDir();
+  writeConfig(dir, "wrong-folder", VALID_RFB);
+  assertThrows(
+    () => loadConfigsAtBoot({ dir, requireRfb: false }),
+    /Directory name 'wrong-folder' does not match vertical_id 'rfb'/,
+    "config: dirname/vertical_id mismatch throws",
+  );
+}
+
+// Case F: missing rfb when required throws
+_resetConfigCacheForTests();
+{
+  const dir = tmpFixtureDir();
+  assertThrows(
+    () => loadConfigsAtBoot({ dir }),
+    /Required vertical 'rfb'/,
+    "config: missing rfb (requireRfb=true) throws",
+  );
+}
+
+// Case G: getConfig before load throws clearly
+_resetConfigCacheForTests();
+assertThrows(
+  () => getConfig("rfb"),
+  /loadConfigsAtBoot\(\) must be called/,
+  "config: getConfig before loadConfigsAtBoot throws",
+);
+
+// Case H: unknown vertical throws with known list
+_resetConfigCacheForTests();
+{
+  const dir = tmpFixtureDir();
+  writeConfig(dir, "rfb", VALID_RFB);
+  loadConfigsAtBoot({ dir });
+  assertThrows(
+    () => getConfig("nonexistent"),
+    /Unknown vertical: 'nonexistent'.*rfb/,
+    "config: unknown vertical throws with hint",
+  );
+}
+
+// Case I: loaded config is deeply frozen
+_resetConfigCacheForTests();
+{
+  const dir = tmpFixtureDir();
+  writeConfig(dir, "rfb", VALID_RFB);
+  loadConfigsAtBoot({ dir });
+  const cfg = getConfig("rfb");
+  assertTrue(Object.isFrozen(cfg), "config: top-level frozen");
+  assertTrue(Object.isFrozen(cfg.domain_dictionary), "config: nested domain_dictionary frozen");
+  assertTrue(Object.isFrozen(cfg.agents.marketing!), "config: nested agent frozen");
+}
+
+// Case J: Norway problem — `NO` parses as string, not boolean false
+_resetConfigCacheForTests();
+{
+  const dir = tmpFixtureDir();
+  const yamlWithNO = VALID_RFB.replace("matprodusenter", "NO");
+  writeConfig(dir, "rfb", yamlWithNO);
+  loadConfigsAtBoot({ dir });
+  const cfg = getConfig("rfb");
+  assertEq(cfg.domain_dictionary.entity_plural_long, "NO",
+    "config: NO stays string under JSON_SCHEMA");
+  assertEq(typeof cfg.domain_dictionary.entity_plural_long, "string",
+    "config: NO is string type");
+}
+
+// Case K: lookupVerticalByHost returns rfb (Phase 4.1 placeholder)
+assertEq(lookupVerticalByHost("rettfrabonden.com"), "rfb",
+  "config: lookupVerticalByHost(rettfrabonden.com) → rfb");
+assertEq(lookupVerticalByHost("tannlege.rettfrabonden.com"), "rfb",
+  "config: lookupVerticalByHost defaults to rfb in Phase 4.1");
+assertEq(lookupVerticalByHost(undefined), "rfb",
+  "config: lookupVerticalByHost(undefined) → rfb");
+
+// Restore cache to real verticals/ for any later tests
+_resetConfigCacheForTests();
+
 
 // ── REPORT ────────────────────────────────────────────────────────────
 console.log(`\n${passed} passed, ${failed} failed\n`);
