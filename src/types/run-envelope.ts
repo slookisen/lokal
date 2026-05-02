@@ -91,6 +91,19 @@ export interface RunEnvelope {
   notes?: string;
 }
 
+
+/**
+ * What gets read back from the run-ledger API. Includes the original
+ * `RunEnvelope` an agent emitted PLUS the verifier's view of it. Agents
+ * never read this; only the dashboard, the verifier itself (to find what
+ * to probe), and the orchestrator (to plan from past results).
+ */
+export interface RunRecord extends RunEnvelope {
+  verifier_state: VerifierState;
+  verifier_checked_at?: string;
+  verifier_findings?: VerifierFinding[];
+}
+
 /**
  * What the platform-verifier writes back to the runs table after probing.
  * Lives in a separate column so the agent's own view (status) and the

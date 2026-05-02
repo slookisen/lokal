@@ -13,6 +13,7 @@ import Database from "better-sqlite3";
 import { getDb } from "../database/init";
 import type {
   RunEnvelope,
+  RunRecord,
   VerifierFinding,
   VerifierState,
 } from "../types/run-envelope";
@@ -36,7 +37,7 @@ interface RunRow {
   created_at: string;
 }
 
-function rowToEnvelope(row: RunRow): RunEnvelope {
+function rowToRecord(row: RunRow): RunRecord {
   return {
     run_id: row.run_id,
     vertical: row.vertical,
@@ -52,6 +53,11 @@ function rowToEnvelope(row: RunRow): RunEnvelope {
       : undefined,
     errors: row.errors ? JSON.parse(row.errors) : undefined,
     notes: row.notes ?? undefined,
+    verifier_state: (row.verifier_state || "pending") as VerifierState,
+    verifier_checked_at: row.verifier_checked_at ?? undefined,
+    verifier_findings: row.verifier_findings
+      ? JSON.parse(row.verifier_findings)
+      : undefined,
   };
 }
 
@@ -105,7 +111,7 @@ export function listRecentRuns(opts: {
   sinceHours?: number;
   limit?: number;
   db?: Database.Database;
-} = {}): RunEnvelope[] {
+} = {}): RunRecord[] {
   const conn = opts.db ?? getDb();
   const sinceHours = opts.sinceHours ?? 24;
   const limit = Math.min(opts.limit ?? 200, 1000);
@@ -129,7 +135,7 @@ export function listRecentRuns(opts: {
   `;
   params.push(limit);
   const rows = conn.prepare(sql).all(...params) as RunRow[];
-  return rows.map(rowToEnvelope);
+  return rows.map(rowToRecord);
 }
 
 /**
@@ -141,7 +147,7 @@ export function listPendingVerification(opts: {
   maxAgeHours?: number;
   limit?: number;
   db?: Database.Database;
-} = {}): RunEnvelope[] {
+} = {}): RunRecord[] {
   const conn = opts.db ?? getDb();
   const maxAge = opts.maxAgeHours ?? 48;
   const limit = Math.min(opts.limit ?? 50, 500);
@@ -164,7 +170,7 @@ export function listPendingVerification(opts: {
   `;
   params.push(limit);
   const rows = conn.prepare(sql).all(...params) as RunRow[];
-  return rows.map(rowToEnvelope);
+  return rows.map(rowToRecord);
 }
 
 /**
@@ -175,7 +181,7 @@ export function listStaleRuns(opts: {
   graceMinutes?: number;
   vertical?: string;
   db?: Database.Database;
-} = {}): RunEnvelope[] {
+} = {}): RunRecord[] {
   const conn = opts.db ?? getDb();
   const grace = opts.graceMinutes ?? 30;
   const cutoff = new Date(Date.now() - grace * 60_000).toISOString();
@@ -197,7 +203,7 @@ export function listStaleRuns(opts: {
     LIMIT 200
   `;
   const rows = conn.prepare(sql).all(...params) as RunRow[];
-  return rows.map(rowToEnvelope);
+  return rows.map(rowToRecord);
 }
 
 /**

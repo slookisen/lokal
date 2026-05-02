@@ -227,6 +227,11 @@ app.get("/health", (_req, res) => {
 app.use("/admin/analytics", analyticsRoutes);
 app.use("/admin/runs", adminLimiter, adminRunsRoutes);
 
+// Serve the verifier dashboard HTML at /admin/verifier-dashboard
+app.get("/admin/verifier-dashboard", (_req, res) => {
+  res.sendFile(path.join(__dirname, "public", "admin-verifier-dashboard.html"));
+});
+
 // CRM admin endpoints + page (feature-flagged via CRM_ENABLED env var; default ON)
 if (process.env.CRM_ENABLED !== "0") {
   app.use("/admin/crm", crmRoutes);

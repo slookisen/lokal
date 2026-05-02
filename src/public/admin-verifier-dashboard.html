@@ -1,0 +1,315 @@
+<!DOCTYPE html>
+<html lang="nb">
+<head>
+<meta charset="utf-8">
+<title>Verifier Dashboard — Rett fra Bonden</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex">
+<style>
+:root {
+  --bg: #0f1117;
+  --surface: #1a1d27;
+  --surface2: #232733;
+  --border: #2d3142;
+  --text: #e8eaf0;
+  --text-dim: #8b90a0;
+  --accent: #4ade80;
+  --accent2: #22d3ee;
+  --accent3: #a78bfa;
+  --warn: #fbbf24;
+  --danger: #f87171;
+  --radius: 12px;
+}
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body {
+  background: var(--bg);
+  color: var(--text);
+  font: 14px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+  padding: 32px 20px;
+}
+.wrap { max-width: 1200px; margin: 0 auto; }
+header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 24px; flex-wrap: wrap; gap: 16px; }
+h1 { font-size: 22px; font-weight: 600; }
+.muted { color: var(--text-dim); font-size: 13px; }
+button { background: var(--surface2); color: var(--text); border: 1px solid var(--border); border-radius: 8px; padding: 8px 14px; cursor: pointer; font: inherit; }
+button:hover { background: var(--border); }
+button.primary { background: var(--accent); color: #000; border-color: var(--accent); font-weight: 600; }
+input { background: var(--surface2); color: var(--text); border: 1px solid var(--border); border-radius: 8px; padding: 8px 12px; font: inherit; width: 280px; }
+
+#loginScreen { display: flex; align-items: center; justify-content: center; min-height: 60vh; }
+#loginBox { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); padding: 32px; max-width: 400px; width: 100%; }
+#loginBox h2 { margin-bottom: 16px; }
+#loginBox p { color: var(--text-dim); margin-bottom: 16px; }
+#loginBox input { width: 100%; margin-bottom: 12px; }
+#loginBox button { width: 100%; }
+
+#dashboard { display: none; }
+
+.stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 12px; margin-bottom: 24px; }
+.stat { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); padding: 14px 16px; }
+.stat .lbl { font-size: 11px; color: var(--text-dim); text-transform: uppercase; letter-spacing: 0.4px; }
+.stat .val { font-size: 28px; font-weight: 600; margin-top: 4px; }
+.stat.verified .val { color: var(--accent); }
+.stat.failed .val { color: var(--danger); }
+.stat.pending .val { color: var(--warn); }
+.stat.skipped .val { color: var(--text-dim); }
+
+section.panel { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); margin-bottom: 20px; overflow: hidden; }
+section.panel > h3 { padding: 14px 18px; background: var(--surface2); border-bottom: 1px solid var(--border); font-size: 14px; font-weight: 600; color: var(--text-dim); text-transform: uppercase; letter-spacing: 0.4px; }
+
+table { width: 100%; border-collapse: collapse; }
+th, td { padding: 10px 14px; text-align: left; border-bottom: 1px solid var(--border); font-size: 13px; }
+th { background: var(--surface2); color: var(--text-dim); font-weight: 500; font-size: 11px; text-transform: uppercase; letter-spacing: 0.4px; }
+tr:last-child td { border-bottom: none; }
+tr.row-failed { background: rgba(248, 113, 113, 0.05); }
+tr.row-clickable { cursor: pointer; }
+tr.row-clickable:hover { background: var(--surface2); }
+.tag { display: inline-block; padding: 2px 8px; border-radius: 4px; font-size: 11px; font-weight: 500; }
+.tag.completed { background: rgba(74, 222, 128, 0.15); color: var(--accent); }
+.tag.partial { background: rgba(251, 191, 36, 0.15); color: var(--warn); }
+.tag.failed { background: rgba(248, 113, 113, 0.15); color: var(--danger); }
+.tag.verified { background: rgba(74, 222, 128, 0.15); color: var(--accent); }
+.tag.pending { background: rgba(251, 191, 36, 0.15); color: var(--warn); }
+.tag.skipped { background: rgba(139, 144, 160, 0.15); color: var(--text-dim); }
+.detail { padding: 14px 18px; background: var(--surface2); border-bottom: 1px solid var(--border); font-family: ui-monospace, "SF Mono", Menlo, monospace; font-size: 12px; color: var(--text-dim); white-space: pre-wrap; word-break: break-word; max-height: 400px; overflow: auto; }
+.agent-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap: 10px; padding: 14px 18px; }
+.agent-card { background: var(--surface2); border: 1px solid var(--border); border-radius: 8px; padding: 12px; }
+.agent-card .name { font-weight: 500; margin-bottom: 6px; word-break: break-all; }
+.agent-card .meta { font-size: 11px; color: var(--text-dim); }
+.empty { padding: 32px; text-align: center; color: var(--text-dim); }
+.spinner { display: inline-block; width: 14px; height: 14px; border: 2px solid var(--border); border-top-color: var(--accent); border-radius: 50%; animation: spin 0.7s linear infinite; vertical-align: middle; margin-right: 8px; }
+@keyframes spin { to { transform: rotate(360deg); } }
+.loading { padding: 32px; text-align: center; color: var(--text-dim); }
+.refresh-info { font-size: 11px; color: var(--text-dim); }
+</style>
+</head>
+<body>
+
+<div class="wrap">
+  <div id="loginScreen">
+    <div id="loginBox">
+      <h2>Verifier Dashboard</h2>
+      <p>Skriv inn admin-nøkkelen for å se kjøre-loggen.</p>
+      <input type="password" id="keyInput" placeholder="X-Admin-Key" autofocus>
+      <button id="loginBtn" class="primary">Logg inn</button>
+    </div>
+  </div>
+
+  <div id="dashboard">
+    <header>
+      <div>
+        <h1>Verifier Dashboard</h1>
+        <div class="muted">Run-ledger oversikt over alle planlagte agenter — Phase 2.3</div>
+      </div>
+      <div style="display:flex;align-items:center;gap:12px;">
+        <span class="refresh-info" id="refreshInfo"></span>
+        <button id="refreshBtn">Oppdater</button>
+      </div>
+    </header>
+
+    <div class="stats" id="stats"><div class="loading"><span class="spinner"></span>Laster…</div></div>
+
+    <section class="panel">
+      <h3>Per agent — siste kjøring</h3>
+      <div class="agent-grid" id="agentGrid"><div class="loading"><span class="spinner"></span>Laster…</div></div>
+    </section>
+
+    <section class="panel">
+      <h3>Siste 50 kjøringer</h3>
+      <table id="runsTable">
+        <thead>
+          <tr>
+            <th>Tidspunkt</th>
+            <th>Agent</th>
+            <th>Vertikal</th>
+            <th>Status</th>
+            <th>Verifier</th>
+            <th style="text-align:right">Claims</th>
+            <th>Notes</th>
+          </tr>
+        </thead>
+        <tbody id="runsBody"><tr><td colspan="7" class="loading"><span class="spinner"></span>Laster…</td></tr></tbody>
+      </table>
+    </section>
+  </div>
+</div>
+
+<script>
+var API_KEY = "";
+var BASE = window.location.origin;
+var REFRESH_INTERVAL_MS = 30000;
+var refreshTimer = null;
+
+// ─── Auth ────────────────────────────────────────
+document.getElementById("loginBtn").addEventListener("click", doLogin);
+document.getElementById("keyInput").addEventListener("keydown", function(e) {
+  if (e.key === "Enter") doLogin();
+});
+
+function doLogin() {
+  var key = document.getElementById("keyInput").value.trim();
+  if (!key) return;
+  var btn = document.getElementById("loginBtn");
+  btn.disabled = true;
+  btn.textContent = "Sjekker…";
+  fetch(BASE + "/admin/runs/summary", { headers: { "X-Admin-Key": key } })
+    .then(function(r) {
+      if (!r.ok) throw new Error("HTTP " + r.status);
+      return r.json();
+    })
+    .then(function() {
+      API_KEY = key;
+      try { sessionStorage.setItem("rfb_admin_key", key); } catch(e) {}
+      document.getElementById("loginScreen").style.display = "none";
+      document.getElementById("dashboard").style.display = "block";
+      load();
+      refreshTimer = setInterval(load, REFRESH_INTERVAL_MS);
+    })
+    .catch(function() {
+      btn.disabled = false;
+      btn.textContent = "Logg inn";
+      alert("Feil nøkkel eller server utilgjengelig.");
+    });
+}
+
+document.getElementById("refreshBtn").addEventListener("click", load);
+
+// Try restore session on load
+(function() {
+  try {
+    var saved = sessionStorage.getItem("rfb_admin_key");
+    if (saved) {
+      document.getElementById("keyInput").value = saved;
+      doLogin();
+    }
+  } catch(e) {}
+})();
+
+// ─── Load & render ───────────────────────────────
+function api(path) {
+  return fetch(BASE + path, { headers: { "X-Admin-Key": API_KEY } }).then(function(r) {
+    if (!r.ok) throw new Error("HTTP " + r.status + " on " + path);
+    return r.json();
+  });
+}
+
+function load() {
+  document.getElementById("refreshInfo").textContent = "Henter…";
+  Promise.all([
+    api("/admin/runs/summary?since_hours=48"),
+    api("/admin/runs?limit=50&since_hours=48"),
+  ])
+    .then(function(results) {
+      renderStats(results[0]);
+      renderAgentGrid(results[1].runs || []);
+      renderRunsTable(results[1].runs || []);
+      var now = new Date();
+      document.getElementById("refreshInfo").textContent =
+        "Sist oppdatert " + pad(now.getHours()) + ":" + pad(now.getMinutes()) + ":" + pad(now.getSeconds());
+    })
+    .catch(function(err) {
+      document.getElementById("refreshInfo").textContent = "Feil: " + err.message;
+    });
+}
+
+function pad(n) { return n < 10 ? "0" + n : "" + n; }
+
+function renderStats(s) {
+  var v = s.by_verifier || {};
+  var st = s.by_status || {};
+  var html = "";
+  html += card("Totalt (48h)", s.total || 0, "");
+  html += card("Verified", v.verified || 0, "verified");
+  html += card("Failed", v.failed || 0, "failed");
+  html += card("Pending", v.pending || 0, "pending");
+  html += card("Skipped", v.skipped || 0, "skipped");
+  html += card("Completed", st.completed || 0, "verified");
+  html += card("Partial", st.partial || 0, "pending");
+  html += card("Failed status", st.failed || 0, "failed");
+  document.getElementById("stats").innerHTML = html;
+}
+
+function card(label, value, kind) {
+  return '<div class="stat ' + kind + '"><div class="lbl">' + esc(label) + '</div><div class="val">' + value + '</div></div>';
+}
+
+function renderAgentGrid(runs) {
+  // Pick latest run per agent.
+  var byAgent = {};
+  runs.forEach(function(r) {
+    if (!byAgent[r.agent] || r.started_at > byAgent[r.agent].started_at) {
+      byAgent[r.agent] = r;
+    }
+  });
+  var entries = Object.values(byAgent).sort(function(a, b) { return a.agent < b.agent ? -1 : 1; });
+  if (!entries.length) {
+    document.getElementById("agentGrid").innerHTML = '<div class="empty">Ingen kjøringer i siste 48h</div>';
+    return;
+  }
+  var html = "";
+  entries.forEach(function(r) {
+    var ago = humanAgo(r.started_at);
+    html += '<div class="agent-card">';
+    html += '  <div class="name">' + esc(r.agent) + '</div>';
+    html += '  <div class="meta">' + ago + ' · ';
+    html += '<span class="tag ' + esc(r.status) + '">' + esc(r.status) + '</span> ';
+    var vs = (r.verifier_state || "pending");
+    html += '<span class="tag ' + esc(vs) + '">' + esc(vs) + '</span>';
+    html += '</div>';
+    html += '</div>';
+  });
+  document.getElementById("agentGrid").innerHTML = html;
+}
+
+function renderRunsTable(runs) {
+  if (!runs.length) {
+    document.getElementById("runsBody").innerHTML = '<tr><td colspan="7" class="empty">Ingen kjøringer</td></tr>';
+    return;
+  }
+  var html = "";
+  runs.forEach(function(r, i) {
+    var trClass = r.status === "failed" ? "row-failed" : "";
+    if ((r.claims && r.claims.length) || r.errors) trClass += " row-clickable";
+    var notes = (r.notes || "").substring(0, 90);
+    if ((r.notes || "").length > 90) notes += "…";
+    var vs = r.verifier_state || "pending";
+    html += '<tr class="' + trClass + '" data-idx="' + i + '">';
+    html += '<td>' + esc(r.started_at.replace("T", " ").substring(0, 16)) + 'Z</td>';
+    html += '<td>' + esc(r.agent) + '</td>';
+    html += '<td>' + esc(r.vertical) + '</td>';
+    html += '<td><span class="tag ' + esc(r.status) + '">' + esc(r.status) + '</span></td>';
+    html += '<td><span class="tag ' + esc(vs) + '">' + esc(vs) + '</span></td>';
+    html += '<td style="text-align:right">' + ((r.claims || []).length) + '</td>';
+    html += '<td>' + esc(notes) + '</td>';
+    html += '</tr>';
+    html += '<tr class="detail-row" id="detail-' + i + '" style="display:none"><td colspan="7"><div class="detail">' + esc(JSON.stringify(r, null, 2)) + '</div></td></tr>';
+  });
+  document.getElementById("runsBody").innerHTML = html;
+  // Attach click handlers
+  document.querySelectorAll("#runsBody tr.row-clickable").forEach(function(tr) {
+    tr.addEventListener("click", function() {
+      var idx = tr.getAttribute("data-idx");
+      var detail = document.getElementById("detail-" + idx);
+      if (detail) detail.style.display = (detail.style.display === "none") ? "table-row" : "none";
+    });
+  });
+}
+
+function humanAgo(iso) {
+  var ts = new Date(iso).getTime();
+  var diffSec = Math.floor((Date.now() - ts) / 1000);
+  if (diffSec < 60) return diffSec + "s siden";
+  if (diffSec < 3600) return Math.floor(diffSec / 60) + " min siden";
+  if (diffSec < 86400) return Math.floor(diffSec / 3600) + "h siden";
+  return Math.floor(diffSec / 86400) + "d siden";
+}
+
+function esc(s) {
+  if (s == null) return "";
+  return String(s).replace(/[&<>"']/g, function(c) {
+    return ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c];
+  });
+}
+</script>
+</body>
+</html>
