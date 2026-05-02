@@ -21,6 +21,9 @@ on:
   push:
     branches:
       - main
+  pull_request:
+    branches:
+      - main                 # build-check runs on PRs to main; deploy is gated below
   workflow_dispatch:       # lets you trigger manually from Actions tab
 
 jobs:
@@ -55,6 +58,8 @@ jobs:
     name: Deploy to Fly.io
     runs-on: ubuntu-latest
     needs: build-check
+    # Only deploy on push to main / manual dispatch — PR runs only the gate.
+    if: github.event_name != 'pull_request'
     concurrency:
       group: fly-deploy-main
       cancel-in-progress: false   # don't abort a running deploy if a new push arrives
