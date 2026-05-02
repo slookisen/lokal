@@ -22,8 +22,13 @@ import {
   listPendingVerification,
   listStaleRuns,
   summariseRuns,
+  recordVerifierResult,
 } from "../services/run-ledger";
-import type { RunEnvelope } from "../types/run-envelope";
+import type {
+  RunEnvelope,
+  VerifierFinding,
+  VerifierState,
+} from "../types/run-envelope";
 
 const router = Router();
 
@@ -175,6 +180,64 @@ router.get("/summary", (req: Request, res: Response) => {
     res.json({ success: true, ...summary });
   } catch (err: any) {
     res.status(500).json({ error: "Summary failed", detail: err.message });
+  }
+});
+
+
+// ─── POST /admin/runs/:run_id/verify ─────────────────────────
+// Platform-verifier writes back here after probing each claim.
+// Body: { state: VerifierState, findings: VerifierFinding[] }
+//
+// Idempotent on (run_id) — re-posting overwrites the prior verifier
+// result. This is the *opposite* of POST / (which is no-op on dup);
+// verifier output should always reflect latest probe.
+router.post("/:run_id/verify", (req: Request, res: Response) => {
+  if (!requireAdmin(req, res)) return;
+
+  const runId = req.params.run_id;
+  const body = req.body as { state?: unknown; findings?: unknown };
+
+  const validStates = ["pending", "verified", "failed", "skipped"];
+  if (!validStates.includes(body.state as string)) {
+    res.status(400).json({
+      error: "Invalid state",
+      reason: `state must be one of ${validStates.join(",")}`,
+    });
+    return;
+  }
+
+  if (!Array.isArray(body.findings)) {
+    res.status(400).json({ error: "Invalid findings", reason: "must be array" });
+    return;
+  }
+
+  // Light per-finding validation
+  for (let i = 0; i < body.findings.length; i++) {
+    const f = body.findings[i] as Record<string, unknown>;
+    if (
+      typeof f?.claim_idx !== "number" ||
+      typeof f?.probe_kind !== "string" ||
+      typeof f?.matched !== "boolean" ||
+      typeof f?.reason !== "string" ||
+      typeof f?.probed_at !== "string"
+    ) {
+      res.status(400).json({
+        error: "Invalid finding",
+        reason: `findings[${i}] missing required fields (claim_idx, probe_kind, matched, reason, probed_at)`,
+      });
+      return;
+    }
+  }
+
+  try {
+    recordVerifierResult({
+      run_id: runId,
+      state: body.state as VerifierState,
+      findings: body.findings as VerifierFinding[],
+    });
+    res.json({ success: true, run_id: runId, state: body.state });
+  } catch (err: any) {
+    res.status(500).json({ error: "Verify failed", detail: err.message });
   }
 });
 
