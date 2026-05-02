@@ -28,6 +28,7 @@ import { linkHeaders, markdownNegotiation } from "./middleware/agent-discovery";
 import { analyticsService } from "./services/analytics-service";
 import analyticsRoutes from "./routes/analytics";
 import adminRunsRoutes from "./routes/admin-runs";
+import platformTriggersRoutes, { adminRouter as adminTriggersRoutes } from "./routes/platform-triggers";
 import crmRoutes from "./routes/crm";
 import { seedData } from "./seed";
 // Seed files moved to src/_seeds/ — only loaded if DB is empty (see below).
@@ -226,6 +227,12 @@ app.get("/health", (_req, res) => {
 // Analytics admin endpoints
 app.use("/admin/analytics", analyticsRoutes);
 app.use("/admin/runs", adminLimiter, adminRunsRoutes);
+
+// Platform triggers — public webhook receiver + admin queue access.
+// /platform/triggers/* uses HMAC (no admin-key); /admin/triggers/* uses admin-key.
+// Same router file routes both; rate-limit applied via existing middleware below.
+app.use("/platform", platformTriggersRoutes);
+app.use("/admin", adminLimiter, adminTriggersRoutes);
 
 // Serve the verifier dashboard HTML at /admin/verifier-dashboard
 app.get("/admin/verifier-dashboard", (_req, res) => {
