@@ -24,6 +24,9 @@ RUN echo "build_rev=$BUILD_REV" > /app/.build-rev
 COPY src/ ./src/
 COPY tsconfig.json ./
 COPY openapi.yaml ./
+# Vertical config bundles (Phase 4.1) — read at boot via loadConfigsAtBoot().
+# App refuses to start without verticals/rfb/config.yaml.
+COPY verticals/ ./verticals/
 
 # SQLite data directory (mount a volume here for persistence)
 RUN mkdir -p /app/data
