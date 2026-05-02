@@ -825,7 +825,7 @@ router.get("/", (req: Request, res: Response) => {
     ));
   } catch (err) {
     console.error("SEO / error:", err);
-    res.status(500).send("Intern feil");
+    res.status(500).send(lang === "en" ? "Internal error" : "Intern feil");
   }
 });
 
@@ -1025,7 +1025,7 @@ router.get("/sok", async (req: Request, res: Response) => {
     ));
   } catch (err) {
     console.error("SEO /sok error:", err);
-    res.status(500).send("Intern feil");
+    res.status(500).send(lang === "en" ? "Internal error" : "Intern feil");
   }
 });
 
@@ -1573,8 +1573,8 @@ router.get("/:city", (req: Request, res: Response, next: any) => {
     <section class="city-hero">
       <div class="container">
         <div class="bc" style="padding:0 0 12px;"><a href="/">Hjem</a><span>/</span>${escapeHtml(cityName)}</div>
-        <h1>Lokal mat i ${escapeHtml(cityName)}</h1>
-        <p>${cityAgents.length} lokale ${getConfig().domain_dictionary.entity_plural_long} i ${escapeHtml(cityName)}-omr\u00e5det.</p>
+        <h1>${lang === "en" ? `Local food in ${escapeHtml(cityName)}` : `Lokal mat i ${escapeHtml(cityName)}`}</h1>
+        <p>${lang === "en" ? `${cityAgents.length} local producers in and around ${escapeHtml(cityName)}.` : `${cityAgents.length} lokale ${getConfig().domain_dictionary.entity_plural_long} i ${escapeHtml(cityName)}-omr\u00e5det.`}</p>
         ${contextPara ? `<p style="margin-top:8px;color:var(--g500);">${escapeHtml(contextPara)}</p>` : ""}
       </div>
     </section>
@@ -1590,7 +1590,7 @@ router.get("/:city", (req: Request, res: Response, next: any) => {
     ));
   } catch (err) {
     console.error(`SEO /${citySlug} error:`, err);
-    res.status(500).send("Intern feil");
+    res.status(500).send(lang === "en" ? "Internal error" : "Intern feil");
   }
 });
 
@@ -1794,37 +1794,43 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
       }
 
       const totalAgents = agents.length;
+      const enS = lang === "en";
       const suggestionsHtml = match.suggestions.length
         ? `<div class="sec">
-            <h2 style="font-size:1.4rem;margin-bottom:8px;">Mente du noen av disse?</h2>
-            <p style="color:var(--g500);margin-bottom:24px;">Vi har ${totalAgents}+ produsenter. Disse ligner mest på det du søkte etter.</p>
-            <div class="grid">${match.suggestions.map((a: any) => producerCard(a)).join("")}</div>
+            <h2 style="font-size:1.4rem;margin-bottom:8px;">${enS ? "Did you mean any of these?" : "Mente du noen av disse?"}</h2>
+            <p style="color:var(--g500);margin-bottom:24px;">${enS ? `We have ${totalAgents}+ producers. These are the closest matches for what you searched.` : `Vi har ${totalAgents}+ produsenter. Disse ligner mest på det du søkte etter.`}</p>
+            <div class="grid">${match.suggestions.map((a: any) => producerCard(a, undefined, lang)).join("")}</div>
           </div>`
         : "";
 
       // HTTP 404 status (soft-200 hurts Google ranking) but rich body so
       // AI agents and humans can still find what they were after.
+      const en = lang === "en";
       return res.status(404).send(shell(
-        `Produsent ikke funnet — ${getConfig().display_name}`,
-        `Vi fant ingen produsent med URL «${slug}». Søk eller bla blant ${totalAgents}+ ${getConfig().domain_dictionary.entity_plural_long} i hele Norge.`,
+        en ? `Producer not found — ${getConfig().display_name}` : `Produsent ikke funnet — ${getConfig().display_name}`,
+        en
+          ? `We couldn't find a producer at URL «${slug}». Search or browse our ${totalAgents}+ food producers across Norway.`
+          : `Vi fant ingen produsent med URL «${slug}». Søk eller bla blant ${totalAgents}+ ${getConfig().domain_dictionary.entity_plural_long} i hele Norge.`,
         `<div class="sec" style="text-align:center;padding:64px 24px 32px;">
-          <h1 style="font-size:2rem;margin-bottom:12px;">Produsent ikke funnet</h1>
-          <p style="color:var(--g500);max-width:640px;margin:0 auto 28px;">URL-en <code style="background:var(--g100);padding:2px 8px;border-radius:4px;">/produsent/${escapeHtml(slug)}</code> matcher ingen produsent i nettverket vårt. Lenken kan være utdatert, eller produsentnavnet kan ha endret seg.</p>
-          <form action="/sok" method="get" style="max-width:520px;margin:0 auto 24px;display:flex;gap:8px;">
-            <input type="text" name="q" placeholder="Søk etter mat, sted eller produsent…" aria-label="Søk produsenter" style="flex:1;padding:14px 16px;border:1px solid var(--g300);border-radius:10px;font-size:1rem;">
-            <button type="submit" style="padding:14px 24px;background:var(--green);color:#fff;border:0;border-radius:10px;font-weight:600;cursor:pointer;">Søk</button>
+          <h1 style="font-size:2rem;margin-bottom:12px;">${en ? "Producer not found" : "Produsent ikke funnet"}</h1>
+          <p style="color:var(--g500);max-width:640px;margin:0 auto 28px;">${en ? "The URL" : "URL-en"} <code style="background:var(--g100);padding:2px 8px;border-radius:4px;">/produsent/${escapeHtml(slug)}</code> ${en ? "doesn't match any producer in our network. The link may be outdated, or the producer name may have changed." : "matcher ingen produsent i nettverket vårt. Lenken kan være utdatert, eller produsentnavnet kan ha endret seg."}</p>
+          <form action="${localizedPath("/sok", lang)}" method="get" style="max-width:520px;margin:0 auto 24px;display:flex;gap:8px;">
+            <input type="text" name="q" placeholder="${en ? "Search for food, place or producer…" : "Søk etter mat, sted eller produsent…"}" aria-label="${en ? "Search producers" : "Søk produsenter"}" style="flex:1;padding:14px 16px;border:1px solid var(--g300);border-radius:10px;font-size:1rem;">
+            <button type="submit" style="padding:14px 24px;background:var(--green);color:#fff;border:0;border-radius:10px;font-weight:600;cursor:pointer;">${en ? "Search" : "Søk"}</button>
           </form>
           <div style="display:flex;gap:12px;justify-content:center;flex-wrap:wrap;">
-            <a href="/oslo" class="city-pill">Oslo</a>
-            <a href="/bergen" class="city-pill">Bergen</a>
-            <a href="/trondheim" class="city-pill">Trondheim</a>
-            <a href="/stavanger" class="city-pill">Stavanger</a>
-            <a href="/sok" class="city-pill">Se alle ${totalAgents}+ produsenter →</a>
+            <a href="${localizedPath("/oslo", lang)}" class="city-pill">Oslo</a>
+            <a href="${localizedPath("/bergen", lang)}" class="city-pill">Bergen</a>
+            <a href="${localizedPath("/trondheim", lang)}" class="city-pill">Trondheim</a>
+            <a href="${localizedPath("/stavanger", lang)}" class="city-pill">Stavanger</a>
+            <a href="${localizedPath("/sok", lang)}" class="city-pill">${en ? "See all " + totalAgents + "+ producers →" : "Se alle " + totalAgents + "+ produsenter →"}</a>
           </div>
         </div>
         ${suggestionsHtml}`,
         {
           extraCss: `.city-pill{display:inline-block;padding:10px 18px;background:var(--g100);color:var(--g700);border-radius:999px;font-weight:500;text-decoration:none;transition:all .15s;}.city-pill:hover{background:var(--green);color:#fff;}`,
+          lang,
+          pathForAlternate: "/produsent/" + slug,
         }
       ));
     }
@@ -2179,15 +2185,16 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
           }
           return `<p class="pf-desc">${escapeHtml(primary)}</p>`;
         })()}
+        ${lang === "en" && (agent.description || k.about) ? `<div style="display:inline-block;margin-top:10px;padding:4px 10px;background:#f8f8f4;border:1px solid #e8e8e0;border-radius:6px;font-size:11px;color:#666;" title="${escapeHtml(t(lang, "common.translate_note"))}">\u{1F1F3}\u{1F1F4} ${escapeHtml(t(lang, "common.from_norwegian"))}</div>` : ""}
         <div class="pf-stats">
-          <div class="pf-stat"><div class="pf-stat-icon t">&#9733;</div><div><strong>${trustPct}%</strong><small>Trust Score</small></div></div>
-          ${k.googleRating ? `<div class="pf-stat"><div class="pf-stat-icon r">&#11088;</div><div><strong>${k.googleRating} / 5</strong><small>${k.googleReviewCount || 0} anmeldelser</small></div></div>` : ""}
+          <div class="pf-stat"><div class="pf-stat-icon t">&#9733;</div><div><strong>${trustPct}%</strong><small>${lang === "en" ? "Trust Score" : "Trust Score"}</small></div></div>
+          ${k.googleRating ? `<div class="pf-stat"><div class="pf-stat-icon r">&#11088;</div><div><strong>${k.googleRating} / 5</strong><small>${k.googleReviewCount || 0} ${lang === "en" ? "reviews" : "anmeldelser"}</small></div></div>` : ""}
         </div>
       </div>
 
       <div class="ct-card">
-        <h3>Kontaktinformasjon</h3>
-        ${contactItems.join("") || `<p style="color:var(--g500);font-size:0.88rem;">Ingen kontaktinfo tilgjengelig enn\u00e5.</p>`}
+        <h3>${lang === "en" ? "Contact information" : "Kontaktinformasjon"}</h3>
+        ${contactItems.join("") || `<p style="color:var(--g500);font-size:0.88rem;">${lang === "en" ? "No contact info available yet." : "Ingen kontaktinfo tilgjengelig enn\u00e5."}</p>`}
         <div class="ct-actions">
           ${k.website ? `<a href="${escapeHtml(k.website)}" class="btn-p" target="_blank" rel="noopener">&#127760; Bes\u00f8k nettside</a>` : ""}
           <a href="${mapsUrl}" class="btn-s" target="_blank" rel="noopener">&#128506; Vis p\u00e5 kart</a>
@@ -2230,7 +2237,7 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
 
         ${certsHtml ? `
         <div class="card">
-          <div class="card-head"><span>&#127942;</span><h3>Sertifiseringer</h3></div>
+          <div class="card-head"><span>&#127942;</span><h3>${lang === "en" ? "Certifications" : "Sertifiseringer"}</h3></div>
           <div class="card-body"><div class="certs-row">${certsHtml}</div></div>
         </div>` : ""}
 
@@ -2248,21 +2255,33 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
 
         ${reviewsHtml ? `
         <div class="card">
-          <div class="card-head"><span>&#128172;</span><h3>Kundeanmeldelser</h3></div>
+          <div class="card-head"><span>&#128172;</span><h3>${lang === "en" ? "Customer reviews" : "Kundeanmeldelser"}</h3></div>
           <div class="card-body"><div class="reviews-grid">${reviewsHtml}</div></div>
         </div>` : ""}
 
         <div class="claim-bar">
           <div>
-            <h3>${agent.isVerified ? "Jobber du ogs\u00e5 her?" : "Er du eieren av " + escapeHtml(agent.name) + "?"}</h3>
-            <p>${agent.isVerified ? "Flere personer kan administrere denne profilen." : "Gj\u00f8r krav p\u00e5 profilen for \u00e5 oppdatere informasjon og bli synlig for flere."}</p>
+            <h3>${lang === "en"
+              ? (agent.isVerified ? "Do you also work here?" : "Are you the owner of " + escapeHtml(agent.name) + "?")
+              : (agent.isVerified ? "Jobber du ogs\u00e5 her?" : "Er du eieren av " + escapeHtml(agent.name) + "?")
+            }</h3>
+            <p>${lang === "en"
+              ? (agent.isVerified ? "Multiple people can manage this profile." : "Claim the profile to update information and become visible to more customers.")
+              : (agent.isVerified ? "Flere personer kan administrere denne profilen." : "Gj\u00f8r krav p\u00e5 profilen for \u00e5 oppdatere informasjon og bli synlig for flere.")
+            }</p>
           </div>
-          <a href="/selger" class="claim-btn">${agent.isVerified ? "F\u00e5 tilgang" : "Gj\u00f8r krav"}</a>
+          <a href="/selger" class="claim-btn">${lang === "en"
+            ? (agent.isVerified ? "Get access" : "Claim")
+            : (agent.isVerified ? "F\u00e5 tilgang" : "Gj\u00f8r krav")
+          }</a>
         </div>
 
         <div class="data-src">
           <span class="data-dot ${(!k.dataSource || k.dataSource === "auto") ? "auto" : "owner"}"></span>
-          ${(!k.dataSource || k.dataSource === "auto") ? "Automatisk innhentet data" : k.dataSource === "hybrid" ? "Verifisert av eier" : "Eierstyrt"}${k.lastEnrichedAt ? ` \u2014 Sist oppdatert ${new Date(k.lastEnrichedAt).toLocaleDateString("nb-NO")}` : ""}
+          ${lang === "en"
+            ? ((!k.dataSource || k.dataSource === "auto") ? "Auto-collected data" : k.dataSource === "hybrid" ? "Verified by owner" : "Owner-managed")
+            : ((!k.dataSource || k.dataSource === "auto") ? "Automatisk innhentet data" : k.dataSource === "hybrid" ? "Verifisert av eier" : "Eierstyrt")
+          }${k.lastEnrichedAt ? ` \u2014 ${lang === "en" ? "Last updated" : "Sist oppdatert"} ${new Date(k.lastEnrichedAt).toLocaleDateString(lang === "en" ? "en-US" : "nb-NO")}` : ""}
         </div>
 
         ${meta.disclaimer ? `<p style="margin-top:8px;font-size:0.75rem;color:var(--g500);">${escapeHtml(meta.disclaimer)}</p>` : ""}
@@ -2271,7 +2290,7 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
       <div>
         ${related.length > 0 ? `
         <div class="card">
-          <div class="card-head"><span>&#127793;</span><h3>Andre i ${escapeHtml(cityName)}</h3></div>
+          <div class="card-head"><span>&#127793;</span><h3>${lang === "en" ? `Others in ${escapeHtml(cityName)}` : `Andre i ${escapeHtml(cityName)}`}</h3></div>
           <div class="card-body"><div class="rel-grid">${relatedHtml}</div></div>
         </div>` : ""}
       </div>
@@ -2285,7 +2304,7 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
     ));
   } catch (err) {
     console.error(`SEO /produsent/${slug} error:`, err);
-    res.status(500).send("Intern feil");
+    res.status(500).send(lang === "en" ? "Internal error" : "Intern feil");
   }
 });
 
