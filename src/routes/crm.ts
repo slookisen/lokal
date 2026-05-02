@@ -430,6 +430,47 @@ router.post("/contacts/reclassify-unknown", (_req, res) => {
   res.json(result);
 });
 
+// ─── POST /admin/crm/marketing/dedupe-legacy-threads ─────────
+// One-off (idempotent) cleanup for the e16/e17 dual-ingest bug
+// where marketing-agent produced both `marketing-e<N>-<id>` (wrong)
+// AND `marketing-batch-e<N>-<id>` (correct) thread-IDs for the same
+// producer.  This deletes the wrong-pattern thread, keeping the one
+// that batch-report can read.
+//
+// Cascade-deletes the message rows via FK ON DELETE CASCADE.
+router.post("/marketing/dedupe-legacy-threads", (_req, res) => {
+  try {
+    const db = getDb();
+    // Find legacy-pattern threads where a correct-pattern twin exists.
+    const legacy = db.prepare(`
+      SELECT t1.id AS legacy_id, t2.id AS correct_id, t1.contact_id
+      FROM crm_threads t1
+      JOIN crm_threads t2 ON t1.contact_id = t2.contact_id
+        AND t2.id LIKE 'marketing-batch-' || SUBSTR(t1.id, 11)
+      WHERE t1.id LIKE 'marketing-e1%-%'
+        AND t1.id NOT LIKE 'marketing-batch-%'
+    `).all() as Array<{ legacy_id: string; correct_id: string; contact_id: string }>;
+
+    let deleted = 0;
+    const stmt = db.prepare("DELETE FROM crm_threads WHERE id = ?");
+    for (const row of legacy) {
+      const r = stmt.run(row.legacy_id);
+      if (r.changes > 0) {
+        deleted++;
+      }
+    }
+
+    res.json({
+      ok: true,
+      legacy_threads_found: legacy.length,
+      legacy_threads_deleted: deleted,
+      sample_pairs: legacy.slice(0, 3),
+    });
+  } catch (err: any) {
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
 // ─── GET /admin/crm/marketing/batch-report ───────────────────
 // Per-batch outreach metrics: how many sent, how many replied, how
 // many added themselves to the blocklist (= unsubscribed).  Drives
