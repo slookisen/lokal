@@ -114,12 +114,18 @@ export interface VerifierFinding {
   claim_idx: number;
   /** What probe was run. */
   probe_kind: string;
-  /** Did the probe match the claim? */
+  /** Did the probe match the claim?
+   *  Note: when `skipped=true`, `matched=false` is the convention but should
+   *  NOT be counted as a failure when rolling up the run's verifier_state. */
   matched: boolean;
   /** Free-form reason — especially useful when matched=false. */
   reason: string;
   /** When the probe ran. */
   probed_at: string;
+  /** True when no probe was attempted (e.g. unknown claim.kind, missing endpoint).
+   *  Aggregator MUST treat skipped findings as neutral, not as failures.
+   *  Phase 2.7b — fixes the "unknown kind = failed run" misclassification. */
+  skipped?: boolean;
 }
 
 /**

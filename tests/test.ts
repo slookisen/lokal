@@ -500,6 +500,39 @@ function captureFromInvitation(): { subject: string; html: string; text: string 
 // Restore cache state for any subsequent tests (defensive)
 _resetConfigCacheForTests();
 
+// ─── ADMIN-RUNS skipped-semantics (Phase 2.7b) ───────────────────────
+// VerifierFinding gained optional `skipped` field. Validation must accept
+// it (boolean) but reject non-boolean. Existing findings without the field
+// must still pass — backward compat is critical because old verifier runs
+// already in DB don't have it.
+import type { VerifierFinding } from "../src/types/run-envelope";
+
+// Case 1: VerifierFinding type accepts optional skipped boolean (compile-time)
+{
+  const finding: VerifierFinding = {
+    claim_idx: 0,
+    probe_kind: "test",
+    matched: false,
+    reason: "unknown kind",
+    probed_at: new Date().toISOString(),
+    skipped: true,
+  };
+  assertEq(finding.skipped, true, "verifier-finding: skipped field type-checked + assignable");
+}
+
+// Case 2: Backward-compat — finding without skipped is still valid
+{
+  const legacy: VerifierFinding = {
+    claim_idx: 0,
+    probe_kind: "test",
+    matched: true,
+    reason: "ok",
+    probed_at: new Date().toISOString(),
+  };
+  assertEq(legacy.skipped, undefined, "verifier-finding: legacy finding without skipped still valid");
+}
+
+
 
 
 // ── REPORT ────────────────────────────────────────────────────────────
