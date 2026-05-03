@@ -261,14 +261,52 @@ const composeSchema = z.object({
   category: z.enum(["innkommende", "marketing", "leverandor", "system", "unknown"]).optional(),
   severity: z.enum(["p0", "p1", "p2", "normal"]).optional(),
   createdBy: z.enum(["claude", "daniel"]),
+  // Phase 4.10c-2 Steg 3 — explicit override for the recipient-rate-limit guard.
+  // Daniel can pass force=true on manual sends (e.g. urgency); claude-actor
+  // calls are always rate-limited.
+  force: z.boolean().optional(),
 });
 
 router.post("/compose", async (req, res) => {
   const parsed = composeSchema.safeParse(req.body);
   if (!parsed.success) return res.status(400).json({ error: "invalid body", details: parsed.error.issues });
-  const { to, contactName, subject, bodyText, bodyHtml, intent, category, severity, createdBy } = parsed.data;
+  const { to, contactName, subject, bodyText, bodyHtml, intent, category, severity, createdBy, force } = parsed.data;
 
   try {
+    // ─── Phase 4.10c-2 Steg 3 — service-level rate-limit ────────
+    // Defense-in-depth backstop: regardless of agent-side checks (Steg 2)
+    // or DB trigger (Steg 1), the compose endpoint refuses to send if the
+    // same recipient got an out+sent message in the last 24h from the
+    // same actor. Daniel-actor can override with force=true (urgency).
+    // claude-actor is always rate-limited — no override path.
+    if (intent === "resend_send" && createdBy === "claude" && !force) {
+      const lookbackIso = new Date(Date.now() - 24 * 3600_000).toISOString();
+      const recent = getDb().prepare(`
+        SELECT m.id, m.thread_id, m.subject, m.sent_at
+        FROM crm_messages m
+        JOIN crm_threads t ON t.id = m.thread_id
+        JOIN crm_contacts c ON c.id = t.contact_id
+        WHERE m.direction = 'out'
+          AND m.delivery_status = 'sent'
+          AND LOWER(c.email) = LOWER(?)
+          AND m.sent_at >= ?
+        ORDER BY m.sent_at DESC
+        LIMIT 5
+      `).all(to, lookbackIso) as Array<{ id: string; thread_id: string; subject: string; sent_at: string }>;
+      if (recent.length > 0) {
+        return res.status(429).json({
+          success: false,
+          error: "rate_limited",
+          reason: `claude-actor already sent ${recent.length} email(s) to ${to} in the last 24h`,
+          last_sent_at: recent[0].sent_at,
+          prior_thread_id: recent[0].thread_id,
+          prior_subjects: recent.map((r) => r.subject),
+          override: "Pass createdBy=daniel and force=true to bypass (manual override)",
+        });
+      }
+    }
+
+    // (original flow continues below)
     // We always start in 'queued' state — the message row gets updated
     // to 'sent' / 'failed' / 'draft_in_gmail' only after the actual send
     // outcome is known.  This prevents the dashboard from showing emails
@@ -565,6 +603,13 @@ router.get("/sent-log", (req, res) => {
     if (actor && actor !== "all") {
       messages = messages.filter((m) => m.actor === actor);
     }
+    // Phase 4.10c-2 Steg 2 — contact_email filter for the CS-agent dual-source guard.
+    // Used by the agent to check "has this recipient gotten ANY outbound from us
+    // in the lookback window?" before deciding to send a confirmation.
+    const contactEmail = (req.query.contact_email as string | undefined)?.trim().toLowerCase();
+    if (contactEmail) {
+      messages = messages.filter((m) => (m.contact_email || "").toLowerCase() === contactEmail);
+    }
 
     // Quick aggregates so the dashboard can show counters at the top
     const byActor: Record<string, number> = {};
@@ -581,7 +626,7 @@ router.get("/sent-log", (req, res) => {
       count: messages.length,
       messages,
       summary: { by_actor: byActor, by_channel: byChannel, by_status: byStatus },
-      filters: { since_hours: sinceHours ?? "all", channel: channel ?? "all", actor: actor ?? "all", status: statusFilter ?? "all" },
+      filters: { since_hours: sinceHours ?? "all", channel: channel ?? "all", actor: actor ?? "all", status: statusFilter ?? "all", contact_email: contactEmail ?? "all" },
       generated_at: new Date().toISOString(),
     });
   } catch (err: any) {

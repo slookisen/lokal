@@ -894,6 +894,82 @@ console.log("── Phase 4.10c-2 Steg 1: thread.last_outbound_at trigger ──
 }
 
 
+// ─── PHASE 4.10c-2 Steg 3: rate-limit query semantics ─────────────────
+// Verifies the SQL the rate-limit guard uses correctly identifies whether
+// a given recipient has gotten a recent out+sent message from claude-actor.
+// The route handler wraps this query in a 429 response when matches exist
+// AND createdBy='claude' AND force=false.
+console.log("── Phase 4.10c-2 Steg 3: compose rate-limit query ──");
+{
+  const Database = require("better-sqlite3");
+  const memdb = new Database(":memory:");
+  memdb.exec(`
+    CREATE TABLE crm_contacts (id TEXT PRIMARY KEY, email TEXT NOT NULL);
+    CREATE TABLE crm_threads (
+      id TEXT PRIMARY KEY,
+      contact_id TEXT NOT NULL,
+      subject TEXT
+    );
+    CREATE TABLE crm_messages (
+      id TEXT PRIMARY KEY,
+      thread_id TEXT NOT NULL,
+      direction TEXT NOT NULL,
+      sent_at TEXT,
+      subject TEXT,
+      delivery_status TEXT NOT NULL DEFAULT 'sent'
+    );
+  `);
+
+  memdb.prepare("INSERT INTO crm_contacts VALUES (?, ?)").run("c1", "bjarne@nittedalsjokoladefabrikk.no");
+  memdb.prepare("INSERT INTO crm_threads VALUES (?, ?, ?)").run("t1", "c1", "Re: Profil-utkast");
+
+  const lookbackIso = new Date(Date.now() - 24 * 3600_000).toISOString();
+  const recentIso = new Date(Date.now() - 1 * 3600_000).toISOString(); // 1h ago
+  const oldIso = new Date(Date.now() - 48 * 3600_000).toISOString();  // 48h ago
+
+  const sql = `
+    SELECT m.id FROM crm_messages m
+    JOIN crm_threads t ON t.id = m.thread_id
+    JOIN crm_contacts c ON c.id = t.contact_id
+    WHERE m.direction = 'out' AND m.delivery_status = 'sent'
+      AND LOWER(c.email) = LOWER(?) AND m.sent_at >= ?
+    ORDER BY m.sent_at DESC
+  `;
+
+  // Case A: recent send → guard fires
+  memdb.prepare("INSERT INTO crm_messages (id, thread_id, direction, sent_at, subject, delivery_status) VALUES (?, ?, 'out', ?, ?, 'sent')").run("m-recent", "t1", recentIso, "Re: Profil-utkast");
+  let hits = memdb.prepare(sql).all("bjarne@nittedalsjokoladefabrikk.no", lookbackIso) as Array<{ id: string }>;
+  assertEq(hits.length, 1, "phase4.10c-2 Steg 3: recent out+sent matches lookback window");
+
+  // Case B: case-insensitive email match
+  hits = memdb.prepare(sql).all("Bjarne@NittedalSjokoladefabrikk.NO", lookbackIso) as Array<{ id: string }>;
+  assertEq(hits.length, 1, "phase4.10c-2 Steg 3: email match is case-insensitive");
+
+  // Case C: only inbound on this thread → no match
+  memdb.prepare("INSERT INTO crm_contacts VALUES (?, ?)").run("c2", "test@example.com");
+  memdb.prepare("INSERT INTO crm_threads VALUES (?, ?, ?)").run("t2", "c2", "Test");
+  memdb.prepare("INSERT INTO crm_messages (id, thread_id, direction, sent_at, subject, delivery_status) VALUES (?, ?, 'in', ?, ?, 'sent')").run("m-in", "t2", recentIso, "Inbound");
+  hits = memdb.prepare(sql).all("test@example.com", lookbackIso) as Array<{ id: string }>;
+  assertEq(hits.length, 0, "phase4.10c-2 Steg 3: inbound-only contact does NOT match");
+
+  // Case D: out+queued (not yet sent) → no match
+  memdb.prepare("INSERT INTO crm_contacts VALUES (?, ?)").run("c3", "queued@example.com");
+  memdb.prepare("INSERT INTO crm_threads VALUES (?, ?, ?)").run("t3", "c3", "Queued");
+  memdb.prepare("INSERT INTO crm_messages (id, thread_id, direction, sent_at, subject, delivery_status) VALUES (?, ?, 'out', ?, ?, 'queued')").run("m-q", "t3", recentIso, "Queued");
+  hits = memdb.prepare(sql).all("queued@example.com", lookbackIso) as Array<{ id: string }>;
+  assertEq(hits.length, 0, "phase4.10c-2 Steg 3: out+queued (not sent) does NOT match");
+
+  // Case E: out+sent but >24h ago → no match
+  memdb.prepare("INSERT INTO crm_contacts VALUES (?, ?)").run("c4", "old@example.com");
+  memdb.prepare("INSERT INTO crm_threads VALUES (?, ?, ?)").run("t4", "c4", "Old");
+  memdb.prepare("INSERT INTO crm_messages (id, thread_id, direction, sent_at, subject, delivery_status) VALUES (?, ?, 'out', ?, ?, 'sent')").run("m-old", "t4", oldIso, "Old send");
+  hits = memdb.prepare(sql).all("old@example.com", lookbackIso) as Array<{ id: string }>;
+  assertEq(hits.length, 0, "phase4.10c-2 Steg 3: out+sent older than 24h does NOT match");
+
+  memdb.close();
+}
+
+
 // ── REPORT ────────────────────────────────────────────────────────────
 console.log(`\n${passed} passed, ${failed} failed\n`);
 if (failed > 0) {
