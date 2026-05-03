@@ -571,6 +571,49 @@ import type { VerifierFinding } from "../src/types/run-envelope";
   memdb46.close();
 }
 
+// ─── PHASE 4.7: smoke-test test-vertical alongside RFB ─────────────────
+// Akseptansekriterium for Phase 4: kan vi onboarde en ny vertikal uten å
+// bryte RFB? verticals/test/ er konstruert for nettopp denne testen
+// (alle agenter disabled, ingen prod-impact).
+{
+  _resetConfigCacheForTests();
+  const repoRoot = path2.resolve(__dirname, "..");
+  const realDir = path2.join(repoRoot, "verticals");
+  loadConfigsAtBoot({ dir: realDir, requireRfb: true });
+
+  // Both verticals must load
+  const ids = listVerticals().sort();
+  assertTrue(ids.includes("rfb"), "phase4.7: rfb loaded");
+  assertTrue(ids.includes("test"), "phase4.7: test loaded");
+
+  // RFB unaffected by test-vertical existence
+  const rfb = getConfig("rfb");
+  assertEq(rfb.display_name, "Rett fra Bonden", "phase4.7: rfb display_name unchanged");
+  assertEq(rfb.domain_dictionary.entity_plural_long, "matprodusenter", "phase4.7: rfb entity unchanged");
+
+  // Test-vertical exposes its own values
+  const testV = getConfig("test");
+  assertTrue(testV.vertical_id === "test", "phase4.7: test vertical_id");
+  assertTrue(testV.display_name !== "Rett fra Bonden", "phase4.7: test display_name distinct from rfb");
+
+  // Test-vertical has all agents disabled (acceptance criterion: no
+  // accidental cron-fire if test config gets pushed to prod by mistake)
+  for (const agentName of Object.keys(testV.agents)) {
+    assertEq(testV.agents[agentName]!.enabled, false,
+      `phase4.7: test agent ${agentName} disabled (no accidental cron)`);
+  }
+
+  // Email-templates dir for test-vertical can exist (4.5 convention)
+  const testTplDir = path2.join(realDir, "test", "email-templates");
+  if (fs2.existsSync(testTplDir)) {
+    // Just verify it's a directory; .gitkeep is fine
+    const stat = fs2.statSync(testTplDir);
+    assertTrue(stat.isDirectory(), "phase4.7: test/email-templates is a directory");
+  }
+
+  _resetConfigCacheForTests();
+}
+
 
 
 
