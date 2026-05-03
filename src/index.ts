@@ -256,6 +256,10 @@ if (process.env.CRM_ENABLED !== "0") {
   app.get("/admin/crm-dashboard", (_req, res) => {
     res.sendFile(path.join(__dirname, "public", "admin-crm.html"));
   });
+  // Phase 4.10c — Sendt-logg: outbound message log with filters + duplicate detection
+  app.get("/admin/sent-log", (_req, res) => {
+    res.sendFile(path.join(__dirname, "public", "admin-sent-log.html"));
+  });
 }
 
 // Conversation UI — /samtaler and /samtale/:id (before SEO catch-all)

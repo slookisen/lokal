@@ -641,6 +641,122 @@ class CrmService {
   }
 
   /**
+   * Phase 4.10c — list outbound messages with thread + contact context for the
+   * "Sendt-logg"-page. Used by the admin /admin/crm/sent-log dashboard so
+   * Daniel can see every email leaving kontakt@rettfrabonden.com (autonomous
+   * via Claude or manual via Daniel) on a single sortable page.
+   *
+   * NB: only returns messages with direction='out'. Filters by sent_at when
+   * `since_hours` is given; otherwise all-time. Always orders newest first.
+   */
+  listSentMessages(opts: {
+    sinceHours?: number;
+    limit?: number;
+    deliveryStatus?: "sent" | "queued" | "draft_in_gmail" | "failed";
+  } = {}): Array<{
+    message_id: string;
+    thread_id: string;
+    sent_at: string | null;
+    received_at: string;
+    delivery_status: string;
+    from_email: string;
+    to_emails: string;
+    subject: string | null;
+    actor: string | null;
+    channel: string | null;
+    contact_email: string | null;
+    contact_name: string | null;
+    contact_organization: string | null;
+    thread_subject: string | null;
+    thread_status: string | null;
+    thread_origin: "compose" | "inbound";
+  }> {
+    const db = getDb();
+    const limit = Math.min(opts.limit ?? 500, 2000);
+    const where: string[] = ["m.direction = 'out'"];
+    const params: unknown[] = [];
+
+    if (opts.sinceHours) {
+      const cutoff = new Date(Date.now() - opts.sinceHours * 3600_000).toISOString();
+      where.push("(m.sent_at >= ? OR m.received_at >= ?)");
+      params.push(cutoff, cutoff);
+    }
+    if (opts.deliveryStatus) {
+      where.push("m.delivery_status = ?");
+      params.push(opts.deliveryStatus);
+    }
+
+    const sql = `
+      SELECT
+        m.id              AS message_id,
+        m.thread_id,
+        m.sent_at,
+        m.received_at,
+        m.delivery_status,
+        m.from_email,
+        m.to_emails,
+        m.subject,
+        m.raw_metadata,
+        t.subject         AS thread_subject,
+        t.status          AS thread_status,
+        c.email           AS contact_email,
+        c.name            AS contact_name,
+        c.organization    AS contact_organization,
+        (
+          SELECT a.actor
+          FROM crm_actions a
+          WHERE a.thread_id = m.thread_id AND a.type = 'sent'
+            AND json_extract(a.payload, '$.internalMessageId') = m.id
+          ORDER BY a.created_at DESC LIMIT 1
+        ) AS sent_actor,
+        (
+          SELECT json_extract(a.payload, '$.channel')
+          FROM crm_actions a
+          WHERE a.thread_id = m.thread_id AND a.type = 'sent'
+            AND json_extract(a.payload, '$.internalMessageId') = m.id
+          ORDER BY a.created_at DESC LIMIT 1
+        ) AS sent_channel
+      FROM crm_messages m
+      JOIN crm_threads t ON t.id = m.thread_id
+      JOIN crm_contacts c ON c.id = t.contact_id
+      WHERE ${where.join(" AND ")}
+      ORDER BY COALESCE(m.sent_at, m.received_at) DESC
+      LIMIT ?
+    `;
+    params.push(limit);
+    const rows = db.prepare(sql).all(...params) as any[];
+
+    return rows.map((r: any) => {
+      let actor: string | null = r.sent_actor ?? null;
+      // Fallback: parse from raw_metadata.createdBy if no sent-action found
+      if (!actor && r.raw_metadata) {
+        try {
+          const meta = JSON.parse(r.raw_metadata);
+          actor = meta?.createdBy ?? null;
+        } catch { /* ignore */ }
+      }
+      return {
+        message_id: r.message_id,
+        thread_id: r.thread_id,
+        sent_at: r.sent_at,
+        received_at: r.received_at,
+        delivery_status: r.delivery_status,
+        from_email: r.from_email,
+        to_emails: r.to_emails,
+        subject: r.subject,
+        actor,
+        channel: r.sent_channel ?? null,
+        contact_email: r.contact_email,
+        contact_name: r.contact_name,
+        contact_organization: r.contact_organization,
+        thread_subject: r.thread_subject,
+        thread_status: r.thread_status,
+        thread_origin: String(r.thread_id).startsWith("compose-") ? "compose" : "inbound",
+      };
+    });
+  }
+
+  /**
    * Cross-tab summary for the dashboard header.
    */
   getDashboardSummary(): any {

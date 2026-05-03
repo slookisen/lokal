@@ -537,4 +537,56 @@ router.get("/marketing/batch-report", (_req, res) => {
   }
 });
 
+// ─── GET /admin/crm/sent-log ─────────────────────────────────
+// Phase 4.10c — list outbound messages for the Sendt-logg dashboard.
+// Filters: ?since_hours=24|168|720|all, ?channel=resend_smtp|gmail_draft|all,
+// ?actor=claude|daniel|all, ?status=sent|queued|draft_in_gmail|failed|all
+router.get("/sent-log", (req, res) => {
+  try {
+    const sinceHoursRaw = (req.query.since_hours as string) || "168";
+    const sinceHours = sinceHoursRaw === "all" ? undefined : Math.max(1, parseInt(sinceHoursRaw, 10) || 168);
+    const limit = Math.min(parseInt((req.query.limit as string) || "500", 10) || 500, 2000);
+    const statusFilter = req.query.status as string | undefined;
+
+    let messages = crmService.listSentMessages({
+      sinceHours,
+      limit,
+      deliveryStatus: (statusFilter && statusFilter !== "all"
+        ? (statusFilter as "sent" | "queued" | "draft_in_gmail" | "failed")
+        : undefined),
+    });
+
+    // Optional in-memory filters
+    const channel = req.query.channel as string | undefined;
+    if (channel && channel !== "all") {
+      messages = messages.filter((m) => m.channel === channel || (channel === "resend_smtp" && m.channel?.includes("resend")));
+    }
+    const actor = req.query.actor as string | undefined;
+    if (actor && actor !== "all") {
+      messages = messages.filter((m) => m.actor === actor);
+    }
+
+    // Quick aggregates so the dashboard can show counters at the top
+    const byActor: Record<string, number> = {};
+    const byChannel: Record<string, number> = {};
+    const byStatus: Record<string, number> = {};
+    for (const m of messages) {
+      byActor[m.actor || "unknown"] = (byActor[m.actor || "unknown"] || 0) + 1;
+      byChannel[m.channel || "unknown"] = (byChannel[m.channel || "unknown"] || 0) + 1;
+      byStatus[m.delivery_status || "unknown"] = (byStatus[m.delivery_status || "unknown"] || 0) + 1;
+    }
+
+    res.json({
+      success: true,
+      count: messages.length,
+      messages,
+      summary: { by_actor: byActor, by_channel: byChannel, by_status: byStatus },
+      filters: { since_hours: sinceHours ?? "all", channel: channel ?? "all", actor: actor ?? "all", status: statusFilter ?? "all" },
+      generated_at: new Date().toISOString(),
+    });
+  } catch (err: any) {
+    res.status(500).json({ error: "sent_log_failed", detail: err.message });
+  }
+});
+
 export default router;
