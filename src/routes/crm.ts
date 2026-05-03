@@ -589,4 +589,63 @@ router.get("/sent-log", (req, res) => {
   }
 });
 
+// ─── POST /admin/crm/backfill-last-outbound (Phase 4.10c-2 Steg 0) ───
+// One-shot remediation: set crm_threads.last_outbound_at on every thread
+// that has at least one out-message with delivery_status='sent' but a NULL
+// last_outbound_at. Idempotent — safe to re-run; only updates rows where
+// NULL → MAX(sent_at). Replaced by Steg 1 trigger going forward.
+//
+// Origin: orchestrator work-order #2 (run-2026-05-03T1940-platform-orchestrator-rfb).
+router.post("/backfill-last-outbound", (_req, res) => {
+  try {
+    const db = getDb();
+    const beforeRow = db.prepare(`
+      SELECT COUNT(*) AS n FROM crm_threads t
+      WHERE t.last_outbound_at IS NULL
+        AND EXISTS (
+          SELECT 1 FROM crm_messages m
+          WHERE m.thread_id = t.id AND m.direction = 'out' AND m.delivery_status = 'sent'
+        )
+    `).get() as { n: number };
+
+    const result = db.prepare(`
+      UPDATE crm_threads
+      SET last_outbound_at = (
+            SELECT MAX(sent_at)
+            FROM crm_messages
+            WHERE crm_messages.thread_id = crm_threads.id
+              AND direction = 'out'
+              AND delivery_status = 'sent'
+          ),
+          updated_at = datetime('now')
+      WHERE last_outbound_at IS NULL
+        AND EXISTS (
+          SELECT 1 FROM crm_messages
+          WHERE crm_messages.thread_id = crm_threads.id
+            AND direction = 'out'
+            AND delivery_status = 'sent'
+        )
+    `).run();
+
+    const afterRow = db.prepare(`
+      SELECT COUNT(*) AS n FROM crm_threads t
+      WHERE t.last_outbound_at IS NULL
+        AND EXISTS (
+          SELECT 1 FROM crm_messages m
+          WHERE m.thread_id = t.id AND m.direction = 'out' AND m.delivery_status = 'sent'
+        )
+    `).get() as { n: number };
+
+    res.json({
+      success: true,
+      rows_updated: result.changes,
+      threads_remaining_with_null_outbound_but_sent_messages: afterRow.n,
+      threads_pre_backfill: beforeRow.n,
+      acceptance_passed: afterRow.n === 0,
+    });
+  } catch (err: any) {
+    res.status(500).json({ error: "backfill_failed", detail: err.message });
+  }
+});
+
 export default router;
