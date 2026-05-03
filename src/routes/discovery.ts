@@ -626,7 +626,7 @@ router.get("/openapi.json", (_req: Request, res: Response) => {
 // Kept minimal + factual: only describes what we actually do.
 // ═══════════════════════════════════════════════════════════════
 
-router.get(["/privacy", "/privacy-policy", "/personvern"], (_req: Request, res: Response) => {
+router.get(["/privacy", "/privacy-policy"], (_req: Request, res: Response) => {
   res.header("Content-Type", "text/html; charset=utf-8");
   res.header("Cache-Control", "public, max-age=3600");
   res.send(`<!DOCTYPE html>

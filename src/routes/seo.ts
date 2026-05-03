@@ -292,7 +292,7 @@ function shell(
 </head>
 <body>
   <nav class="nav">
-    <a href="${localizedPath("/", lang)}" class="nav-logo"><div class="nav-icon">🌱</div> ${getConfig().display_name}</a>
+    <a href="${localizedPath("/", lang)}" class="nav-logo"><div class="nav-icon">🌱</div> <span translate="no">${getConfig().display_name}</span></a>
     <div class="nav-links">
       <a href="${localizedPath("/samtaler", lang)}">${escapeHtml(t(lang, "nav.conversations"))}</a>
       <a href="${localizedPath("/sok", lang)}">${escapeHtml(t(lang, "nav.search"))}</a>
@@ -306,7 +306,7 @@ function shell(
   <footer class="ft">
     <div class="ft-inner">
       <div>
-        <div class="ft-brand">${getConfig().display_name}</div>
+        <div class="ft-brand"><span translate="no">${getConfig().display_name}</span></div>
         <div class="ft-desc">${escapeHtml(t(lang, "footer.tagline"))}</div>
       </div>
       <div class="ft-col">
@@ -349,12 +349,12 @@ function producerCard(a: any, _matchReasons?: string[], lang: Lang = "no"): stri
   return `<a href="${localizedPath("/produsent/" + slug, lang)}" class="pc">
     <div class="pc-top">
       <div>
-        <div class="pc-name">${escapeHtml(a.name)}</div>
-        <div class="pc-city">${cityText}</div>
+        <div class="pc-name" translate="no">${escapeHtml(a.name)}</div>
+        <div class="pc-city" translate="no">${cityText}</div>
       </div>
       ${verified}
     </div>
-    ${desc ? `<div class="pc-desc">${escapeHtml(desc)}</div>${noteHtml}` : ""}
+    ${desc ? `<div class="pc-desc"${lang === "en" ? ' lang="nb"' : ""}>${escapeHtml(desc)}</div>${noteHtml}` : ""}
     <div class="pc-tags">${cats}</div>
     <div class="pc-foot">
       <div class="trust-m"><div class="trust-bar"><div class="trust-fill" style="width:${trustPct}%"></div></div> ${trustPct}%</div>
@@ -1057,10 +1057,58 @@ const OM_CSS = `
 
 router.get("/om", (req: Request, res: Response) => {
   const lang = req.lang;
-  const content = `
+  const brand = `<span translate="no">${getConfig().display_name}</span>`;
+  const en = lang === "en";
+  const content = en ? `
+  <section class="om-hero">
+    <h1>Food deserves to be <em>found</em></h1>
+    <p>${brand} makes local ${getConfig().domain_dictionary.entity_plural_long} visible \u2014 not only to people, but to the AI assistants that help them shop.</p>
+  </section>
+
+  <section class="om-sec">
+    <h2>Why we're building this</h2>
+    <p>Norway has hundreds of farm shops, markets and small-scale producers making outstanding food. Yet most of them are invisible online. They have no marketing department, no SEO strategy, and when someone asks an AI assistant \u201cwhere can I find fresh vegetables near me?\u201d \u2014 they never get the answer.</p>
+    <p>So customers shop at the big chains. Not because the food is better, but because the big chains are visible and the small ones aren't.</p>
+    <p>We're changing that.</p>
+
+    <div class="om-quote">
+      <p>\u201cIf your AI assistant doesn't know the farm shop exists, it doesn't exist for you.\u201d</p>
+    </div>
+
+    <h2>What we do</h2>
+    <p>${brand} is an open catalogue that automatically collects information about local ${getConfig().domain_dictionary.entity_plural_long} \u2014 products, opening hours, contact info, certifications \u2014 and makes it all available through standard protocols that AI systems understand.</p>
+    <p>When someone asks ChatGPT, Claude or another AI assistant about local food in Norway, they find the answers here.</p>
+
+    <div class="om-values">
+      <div class="om-val">
+        <span class="om-val-icon">&#127793;</span>
+        <h3>Straight from the farmer</h3>
+        <p>No middlemen. The customer finds the producer and buys directly.</p>
+      </div>
+      <div class="om-val">
+        <span class="om-val-icon">&#129302;</span>
+        <h3>AI visibility</h3>
+        <p>Structured data that AI assistants understand. Not just text on a website.</p>
+      </div>
+      <div class="om-val">
+        <span class="om-val-icon">&#128275;</span>
+        <h3>Open platform</h3>
+        <p>Free to join. No ads, no paid placements, no algorithms that favour the big players.</p>
+      </div>
+      <div class="om-val">
+        <span class="om-val-icon">&#127987;</span>
+        <h3>Norway first</h3>
+        <p>Built for Norwegian farms, markets and food traditions. <span translate="no">Oslo</span> first, the rest of the country to follow.</p>
+      </div>
+    </div>
+
+    <h2>Our vision</h2>
+    <p>We believe the future of commerce is about visibility. Whoever gets found, gets the customer. We're building the infrastructure that lets local producers compete on equal terms with the big chains \u2014 in a world where more and more shopping happens through AI.</p>
+    <p>${brand} is a non-profit initiative. The code is open source.</p>
+  </section>` : `
   <section class="om-hero">
     <h1>Maten fortjener \u00e5 bli <em>funnet</em></h1>
-    <p>${getConfig().display_name} gj\u00f8r lokale ${getConfig().domain_dictionary.entity_plural_long} synlige \u2014 ikke bare for mennesker, men for AI-assistentene som hjelper dem \u00e5 handle.</p>
+    <p>${brand} gj\u00f8r lokale ${getConfig().domain_dictionary.entity_plural_long} synlige \u2014 ikke bare for mennesker, men for AI-assistentene som hjelper dem \u00e5 handle.</p>
   </section>
 
   <section class="om-sec">
@@ -1074,7 +1122,7 @@ router.get("/om", (req: Request, res: Response) => {
     </div>
 
     <h2>Hva vi gj\u00f8r</h2>
-    <p>${getConfig().display_name} er en \u00e5pen katalog som automatisk samler informasjon om lokale ${getConfig().domain_dictionary.entity_plural_long} \u2014 produkter, \u00e5pningstider, kontaktinfo, sertifiseringer \u2014 og gj\u00f8r alt tilgjengelig via standardprotokoller som AI-systemer forst\u00e5r.</p>
+    <p>${brand} er en \u00e5pen katalog som automatisk samler informasjon om lokale ${getConfig().domain_dictionary.entity_plural_long} \u2014 produkter, \u00e5pningstider, kontaktinfo, sertifiseringer \u2014 og gj\u00f8r alt tilgjengelig via standardprotokoller som AI-systemer forst\u00e5r.</p>
     <p>N\u00e5r noen sp\u00f8r ChatGPT, Claude eller en annen AI-assistent om lokal mat i Norge, finner de svarene her.</p>
 
     <div class="om-values">
@@ -1096,13 +1144,13 @@ router.get("/om", (req: Request, res: Response) => {
       <div class="om-val">
         <span class="om-val-icon">&#127987;</span>
         <h3>Norsk f\u00f8rst</h3>
-        <p>Bygget for norske g\u00e5rder, markeder og mattradisjoner. Oslo f\u00f8rst, hele landet etter.</p>
+        <p>Bygget for norske g\u00e5rder, markeder og mattradisjoner. <span translate="no">Oslo</span> f\u00f8rst, hele landet etter.</p>
       </div>
     </div>
 
     <h2>Visjonen v\u00e5r</h2>
     <p>Vi tror at fremtidens handel handler om synlighet. Den som blir funnet, f\u00e5r kunden. Vi bygger infrastrukturen som gj\u00f8r at lokale produsenter konkurrerer p\u00e5 like vilk\u00e5r med de store kjedene \u2014 i en verden der stadig flere handler gjennom AI.</p>
-    <p>${getConfig().display_name} er et non-profit initiativ. Koden er \u00e5pen kildekode.</p>
+    <p>${brand} er et non-profit initiativ. Koden er \u00e5pen kildekode.</p>
   </section>`;
 
   res.send(shell(
@@ -1162,7 +1210,131 @@ router.get("/teknologi", (req: Request, res: Response) => {
   const lang = req.lang;
   const stats = marketplaceRegistry.getStats();
   const totalAgents = stats.totalAgents || marketplaceRegistry.getActiveAgents().length;
-  const content = `
+  const brand = `<span translate="no">${getConfig().display_name}</span>`;
+  const en = lang === "en";
+  const content = en ? `
+  <section class="tech-hero">
+    <h1>How your AI finds the food</h1>
+    <p>Traditional SEO is about ranking high on Google. We're building something different: structured data that AI assistants understand directly.</p>
+  </section>
+
+  <section class="tech-sec">
+    <h2>The problem with Google search</h2>
+    <p>When you search for "local food in <span translate="no">Oslo</span>" on Google, you get ads, big grocery chains, and maybe a blog post. The small producers drown.</p>
+    <p>AI assistants work differently. They don't read websites \u2014 they fetch structured data from protocols designed for machine-to-machine communication.</p>
+
+    <div class="tech-compare">
+      <div class="tech-card old">
+        <h3>&#128269; Traditional search</h3>
+        <ul>
+          <li>Based on website ranking</li>
+          <li>Favours large players with SEO budgets</li>
+          <li>Ads dominate the results</li>
+          <li>Text designed for humans</li>
+        </ul>
+      </div>
+      <div class="tech-card new">
+        <h3>&#129302; AI-driven search</h3>
+        <ul>
+          <li>Based on structured, verified data</li>
+          <li>Equal terms for all producers</li>
+          <li>No ads in the results</li>
+          <li>Data designed for machines</li>
+        </ul>
+      </div>
+    </div>
+
+    <h2>The protocols we use</h2>
+    <p>${brand} uses open standards that let any AI assistant find and understand information about Norwegian ${getConfig().domain_dictionary.entity_plural_long}:</p>
+
+    <div class="tech-proto">
+      <div class="proto-card">
+        <span class="proto-icon">&#127760;</span>
+        <h3 translate="no">A2A</h3>
+        <p>Google's Agent-to-Agent protocol. Agents communicate directly with each other.</p>
+      </div>
+      <div class="proto-card">
+        <span class="proto-icon">&#128268;</span>
+        <h3 translate="no">MCP</h3>
+        <p>Anthropic's Model Context Protocol. Claude and other AIs fetch data as tools.</p>
+      </div>
+      <div class="proto-card">
+        <span class="proto-icon">&#128214;</span>
+        <h3 translate="no">Schema.org</h3>
+        <p>Structured markup that Google Rich Results understands.</p>
+      </div>
+      <div class="proto-card">
+        <span class="proto-icon">&#128736;</span>
+        <h3 translate="no">OpenAPI</h3>
+        <p>Standard API specification. Any developer can integrate.</p>
+      </div>
+    </div>
+
+    <h2>How it works in practice</h2>
+    <p>Here's an example of what happens when you ask an AI assistant "where can I find fresh vegetables in <span translate="no">Oslo</span>?":</p>
+
+    <div class="tech-code">
+      <span class="comment">// 1. The AI assistant sends a request via the A2A protocol</span><br>
+      <span class="key">POST</span> rettfrabonden.com/api/a2a<br><br>
+      <span class="comment">// 2. Our agent finds relevant producers</span><br>
+      { <span class="key">"query"</span>: <span class="val">"vegetables oslo"</span>, <span class="key">"results"</span>: [...] }<br><br>
+      <span class="comment">// 3. Structured data returns with opening hours, contact info, certifications</span><br>
+      { <span class="key">"name"</span>: <span class="val">"Gr\u00f8nn Bonde"</span>, <span class="key">"hours"</span>: <span class="val">"Mon\u2013Sat 08\u201316"</span> }
+    </div>
+
+    <p>Everything happens automatically. The producer doesn't have to do anything \u2014 we collect data from public sources, verify it, and make it available to all AI platforms.</p>
+
+    <h2 id="mcp-oppsett">Set up MCP \u2014 search from your AI</h2>
+    <p>MCP (Model Context Protocol) lets your AI assistant search our database of ${totalAgents}+ ${getConfig().domain_dictionary.entity_plural_long} directly. Here's how to set it up:</p>
+
+    <div id="chatgpt-mcp" class="setup-guide">
+      <h3>&#128154; ChatGPT (easiest)</h3>
+      <div class="setup-steps">
+        <div class="setup-step"><span class="step-n">1</span><div>Go to <a href="https://chatgpt.com" target="_blank">chatgpt.com</a> and open a new conversation</div></div>
+        <div class="setup-step"><span class="step-n">2</span><div>Click the tools icon (&#128295;) in the message field and choose <strong>"Add an MCP Server"</strong></div></div>
+        <div class="setup-step"><span class="step-n">3</span><div>Paste this URL: <code>https://rettfrabonden.com/mcp</code></div></div>
+        <div class="setup-step"><span class="step-n">4</span><div>Done! Try for example <em>"Find organic honey in <span translate="no">Bergen</span>"</em></div></div>
+      </div>
+    </div>
+
+    <div id="claude-mcp" class="setup-guide">
+      <h3>&#129520; Claude Desktop (Pro/Max/Team/Enterprise)</h3>
+      <p><strong>Method 1 \u2014 Remote MCP (recommended, no install):</strong></p>
+      <div class="setup-steps">
+        <div class="setup-step"><span class="step-n">1</span><div>Open Claude Desktop &rarr; <strong>Settings</strong> &rarr; <strong>Integrations</strong></div></div>
+        <div class="setup-step"><span class="step-n">2</span><div>Click <strong>"Add custom connector"</strong></div></div>
+        <div class="setup-step"><span class="step-n">3</span><div>Paste: <code>https://rettfrabonden.com/mcp</code></div></div>
+        <div class="setup-step"><span class="step-n">4</span><div>Done! Try for example <em>"Find organic meat in <span translate="no">Trondheim</span>"</em></div></div>
+      </div>
+      <p style="font-size:0.82rem;color:var(--g500);margin-top:14px;"><strong>Method 2 \u2014 Local npm package</strong> (for developers, Claude Code, or Claude Desktop without Pro):</p>
+      <div class="setup-steps">
+        <div class="setup-step"><span class="step-n">1</span><div>Install <a href="https://nodejs.org" target="_blank">Node.js</a> &rarr; Open Claude Desktop &rarr; Settings &rarr; Developer &rarr; <strong>Edit Config</strong></div></div>
+        <div class="setup-step"><span class="step-n">2</span><div>Add:
+          <div class="tech-code" style="margin:8px 0 0;font-size:0.8rem;">
+{<br>
+&nbsp;&nbsp;<span class="key">"mcpServers"</span>: {<br>
+&nbsp;&nbsp;&nbsp;&nbsp;<span class="key">"lokal"</span>: {<br>
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;<span class="key">"command"</span>: <span class="val">"npx"</span>,<br>
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;<span class="key">"args"</span>: [<span class="val">"lokal-mcp"</span>]<br>
+&nbsp;&nbsp;&nbsp;&nbsp;}<br>
+&nbsp;&nbsp;}<br>
+}
+          </div>
+        </div></div>
+        <div class="setup-step"><span class="step-n">3</span><div>Save (Ctrl+S) and restart Claude Desktop.</div></div>
+      </div>
+    </div>
+
+    <div class="setup-guide">
+      <h3>&#9881;&#65039; Other AI platforms</h3>
+      <p>Any platform that supports MCP Streamable HTTP can connect: <code>https://rettfrabonden.com/mcp</code></p>
+      <p>For REST-based integrations, see our <a href="/openapi.json">OpenAPI specification</a>.</p>
+    </div>
+
+    <h2>Open source</h2>
+    <p>The whole project is open source. We believe infrastructure for food visibility should be a shared good, not a commercial product.</p>
+    <p><a href="https://github.com/slookisen/lokal" style="display:inline-flex;align-items:center;gap:8px;padding:10px 20px;background:var(--charcoal);color:var(--white);border-radius:10px;font-weight:600;font-size:0.9rem;">See the code on GitHub &#8594;</a></p>
+  </section>` : `
   <section class="tech-hero">
     <h1>Slik finner AI-en din maten</h1>
     <p>Tradisjonell SEO handler om \u00e5 rangere h\u00f8yt i Google. Vi bygger noe annet: strukturert data som AI-assistenter forst\u00e5r direkte.</p>
@@ -1195,7 +1367,7 @@ router.get("/teknologi", (req: Request, res: Response) => {
     </div>
 
     <h2>Protokollene vi bruker</h2>
-    <p>${getConfig().display_name} bruker \u00e5pne standarder som gj\u00f8r at enhver AI-assistent kan finne og forst\u00e5 informasjon om norske ${getConfig().domain_dictionary.entity_plural_long}:</p>
+    <p>${brand} bruker \u00e5pne standarder som gj\u00f8r at enhver AI-assistent kan finne og forst\u00e5 informasjon om norske ${getConfig().domain_dictionary.entity_plural_long}:</p>
 
     <div class="tech-proto">
       <div class="proto-card">
@@ -1322,15 +1494,139 @@ const PERSONVERN_CSS = `
 
 router.get("/personvern", (req: Request, res: Response) => {
   const lang = req.lang;
-  const content = `
+  const brand = `<span translate="no">${getConfig().display_name}</span>`;
+  const en = lang === "en";
+  const content = en ? `
+  <section class="pv-hero">
+    <h1>Privacy</h1>
+    <p>How ${brand} handles data \u2014 honestly, without filler.</p>
+  </section>
+
+  <section class="pv-sec">
+    <h2>Who we are</h2>
+    <p>${brand} is an open catalogue of local ${getConfig().domain_dictionary.entity_plural_long} in Norway, available at rettfrabonden.com. The service is run as an independent project. Contact: kontakt@${getConfig().domain}.</p>
+
+    <h2>What we collect</h2>
+    <p>We collect different types of data depending on how you use the service. Here is the full overview:</p>
+
+    <h3>Website visitors (everyone)</h3>
+    <p>When you visit rettfrabonden.com we register:</p>
+    <ul>
+      <li>Which page you visit (URL path)</li>
+      <li>Referrer URL (where you came from)</li>
+      <li>An anonymised hash of IP address and browser type (SHA-256, truncated \u2014 we do not store the full IP address or browser string)</li>
+      <li>Timestamp of the visit</li>
+    </ul>
+    <p>We use no cookies. We use no third-party analytics tools such as Google Analytics. All analysis happens in our own database.</p>
+
+    <h3>Search and AI queries</h3>
+    <p>When you search for producers \u2014 via the website, ChatGPT, Claude MCP or the API \u2014 we store:</p>
+    <ul>
+      <li>The text you searched for</li>
+      <li>Selected category and city</li>
+      <li>Number of results returned</li>
+      <li>Which protocol was used (API, MCP, A2A)</li>
+      <li>Anonymised IP hash (same method as for page visits)</li>
+    </ul>
+    <p>We store this to understand which searches give good results and to improve the service.</p>
+
+    <h3>Sellers who register (claim)</h3>
+    <p>When you register as a ${getConfig().domain_dictionary.entity} to manage your profile, we collect:</p>
+    <ul>
+      <li>Name, email address and optionally phone number</li>
+      <li>A 6-digit verification code sent to your email</li>
+      <li>Claim token (cryptographic key for sign-in, expires after 30 days)</li>
+    </ul>
+    <p>After verification you can yourself add and edit: address, opening hours, products, certifications, description, images and contact info. Everything you add is visible on your public profile page.</p>
+
+    <h3>Sign-in</h3>
+    <p>We do not use passwords. Sign-in happens via a magic link sent to your email. The link is valid for 15 minutes and can only be used once. We do not store passwords because we do not have any.</p>
+
+    <h3>Images</h3>
+    <p>Sellers can upload profile pictures and product photos. These are stored on the server. If image scanning is enabled, the image may be sent to an external AI service (Anthropic Claude or OpenAI) for automatic product recognition.</p>
+
+    <h3>Conversations between agents</h3>
+    <p>${brand} supports the A2A protocol (agent-to-agent). When an AI agent contacts a producer agent, the conversation text, status and any transaction info are stored in the database.</p>
+
+    <h2>What we do not collect</h2>
+    <ul>
+      <li>We use no cookies</li>
+      <li>We have no third-party tracking (no Google Analytics, Facebook Pixel, etc.)</li>
+      <li>We do not store full IP addresses \u2014 only a truncated hash</li>
+      <li>We do not store passwords (passwordless sign-in)</li>
+      <li>We do not collect payment information</li>
+      <li>We never sell data to third parties</li>
+    </ul>
+
+    <h2>Legal basis</h2>
+    <p>We process personal data based on:</p>
+    <table class="pv-table">
+      <thead><tr><th>Data type</th><th>Basis</th><th>Explanation</th></tr></thead>
+      <tbody>
+        <tr><td>Analytics (page visits, searches)</td><td>Legitimate interest</td><td>To improve the service. The data is anonymised (hashed IP/UA).</td></tr>
+        <tr><td>Seller registration</td><td>Consent</td><td>You actively provide data when you register. You can withdraw consent.</td></tr>
+        <tr><td>Seller profile (public info)</td><td>Consent</td><td>You choose what to add. Everything is visible on your profile page.</td></tr>
+        <tr><td>Image upload</td><td>Consent</td><td>You upload images yourself. Image scanning is optional.</td></tr>
+      </tbody>
+    </table>
+
+    <h2>Where data is stored</h2>
+    <p>All data is stored in a SQLite database on a server hosted by <span translate="no">Fly.io</span> in the <span translate="no">Stockholm</span> region (ARN). Data is not transferred to countries outside the EU/EEA, with the exception of:</p>
+    <ul>
+      <li>Email is sent via an SMTP service to deliver verification codes and magic links</li>
+      <li>If image scanning is enabled, images may be sent to <span translate="no">Anthropic</span> (USA) or <span translate="no">OpenAI</span> (USA) for analysis</li>
+    </ul>
+    <p>The source code is open and available on <a href="https://github.com/slookisen/lokal" style="color:var(--green-700);">GitHub</a>.</p>
+
+    <h2>How long we keep data</h2>
+    <table class="pv-table">
+      <thead><tr><th>Data type</th><th>Retention</th></tr></thead>
+      <tbody>
+        <tr><td>Page-visit analytics</td><td>Can be deleted via admin. No automatic expiry is set today.</td></tr>
+        <tr><td>Search logs</td><td>Same as analytics.</td></tr>
+        <tr><td>Verification codes</td><td>Unverified claims expire after 7 days.</td></tr>
+        <tr><td>Magic links</td><td>Expire after 15 minutes. Used links older than 1 hour are auto-deleted.</td></tr>
+        <tr><td>Claim token (sign-in)</td><td>Expires after 30 days. Renewed at next sign-in.</td></tr>
+        <tr><td>Seller profile</td><td>For as long as you wish to remain registered.</td></tr>
+        <tr><td>Uploaded images</td><td>Stored until manually deleted.</td></tr>
+      </tbody>
+    </table>
+
+    <h2>Your rights</h2>
+    <p>Under the Norwegian Personal Data Act and the GDPR you have the right to:</p>
+    <ul>
+      <li><strong>Request access</strong> \u2014 we can tell you what we have stored about you</li>
+      <li><strong>Correct errors</strong> \u2014 sellers can update their profile directly via the dashboard</li>
+      <li><strong>Delete data</strong> \u2014 contact us to have your profile and associated data removed</li>
+      <li><strong>Withdraw consent</strong> \u2014 you can ask to be removed at any time</li>
+      <li><strong>File a complaint</strong> \u2014 you can complain to <span translate="no">Datatilsynet</span> (the Norwegian Data Protection Authority, datatilsynet.no) if you believe we are breaking the rules</li>
+    </ul>
+    <p>For all enquiries: <a href="mailto:kontakt@${getConfig().domain}" style="color:var(--green-700);">kontakt@${getConfig().domain}</a></p>
+
+    <h2>Security</h2>
+    <p>We use the following measures to protect data:</p>
+    <ul>
+      <li>All traffic is encrypted with HTTPS/TLS</li>
+      <li>Admin access is protected by API keys in environment variables</li>
+      <li>Content Security Policy (CSP) and other security headers are active</li>
+      <li>All database queries are parameterised (protection against SQL injection)</li>
+      <li>IP addresses and browser info are stored only as hashes (irreversible anonymisation)</li>
+      <li>Rate limiting on sensitive endpoints</li>
+    </ul>
+
+    <h2>Changes to this policy</h2>
+    <p>If we change how we handle data, we update this page. We have no newsletter or popup notifications \u2014 check this page if you're wondering.</p>
+
+    <p class="pv-updated">Last updated: 16 April 2026</p>
+  </section>` : `
   <section class="pv-hero">
     <h1>Personvern</h1>
-    <p>Hvordan ${getConfig().display_name} behandler data \u2014 ærlig og uten fyllord.</p>
+    <p>Hvordan ${brand} behandler data \u2014 ærlig og uten fyllord.</p>
   </section>
 
   <section class="pv-sec">
     <h2>Hvem vi er</h2>
-    <p>${getConfig().display_name} er en åpen katalog over lokale ${getConfig().domain_dictionary.entity_plural_long} i Norge, tilgjengelig på rettfrabonden.com. Tjenesten drives som et uavhengig prosjekt. Kontakt: kontakt@${getConfig().domain}.</p>
+    <p>${brand} er en åpen katalog over lokale ${getConfig().domain_dictionary.entity_plural_long} i Norge, tilgjengelig på rettfrabonden.com. Tjenesten drives som et uavhengig prosjekt. Kontakt: kontakt@${getConfig().domain}.</p>
 
     <h2>Hva vi samler inn</h2>
     <p>Vi samler inn forskjellige typer data avhengig av hvordan du bruker tjenesten. Her er en fullstendig oversikt:</p>
@@ -1372,7 +1668,7 @@ router.get("/personvern", (req: Request, res: Response) => {
     <p>Selgere kan laste opp profilbilder og produktbilder. Disse lagres på serveren. Hvis bildeskanning er aktivert, kan bildet sendes til en ekstern AI-tjeneste (Anthropic Claude eller OpenAI) for automatisk produktgjenkjenning.</p>
 
     <h3>Samtaler mellom agenter</h3>
-    <p>${getConfig().display_name} støtter A2A-protokollen (agent-til-agent). Når en AI-agent kontakter en produsent-agent, lagres samtaletekst, status og eventuell transaksjonsinfo i databasen.</p>
+    <p>${brand} støtter A2A-protokollen (agent-til-agent). Når en AI-agent kontakter en produsent-agent, lagres samtaletekst, status og eventuell transaksjonsinfo i databasen.</p>
 
     <h2>Hva vi ikke samler inn</h2>
     <ul>
@@ -1573,8 +1869,8 @@ router.get("/:city", (req: Request, res: Response, next: any) => {
     <section class="city-hero">
       <div class="container">
         <div class="bc" style="padding:0 0 12px;"><a href="/">Hjem</a><span>/</span>${escapeHtml(cityName)}</div>
-        <h1>${lang === "en" ? `Local food in ${escapeHtml(cityName)}` : `Lokal mat i ${escapeHtml(cityName)}`}</h1>
-        <p>${lang === "en" ? `${cityAgents.length} local producers in and around ${escapeHtml(cityName)}.` : `${cityAgents.length} lokale ${getConfig().domain_dictionary.entity_plural_long} i ${escapeHtml(cityName)}-omr\u00e5det.`}</p>
+        <h1>${lang === "en" ? `Local food in <span translate="no">${escapeHtml(cityName)}</span>` : `Lokal mat i <span translate="no">${escapeHtml(cityName)}</span>`}</h1>
+        <p>${lang === "en" ? `${cityAgents.length} local producers in and around <span translate="no">${escapeHtml(cityName)}</span>.` : `${cityAgents.length} lokale ${getConfig().domain_dictionary.entity_plural_long} i <span translate="no">${escapeHtml(cityName)}</span>-omr\u00e5det.`}</p>
         ${contextPara ? `<p style="margin-top:8px;color:var(--g500);">${escapeHtml(contextPara)}</p>` : ""}
       </div>
     </section>
@@ -2163,17 +2459,17 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
     <div class="pf-header">
       <div class="pf-hero">
         <div class="pf-badges">${badges.join("")}</div>
-        <h1 class="pf-name">${escapeHtml(agent.name)}</h1>
+        <h1 class="pf-name" translate="no">${escapeHtml(agent.name)}</h1>
         ${cityName ? `<div class="pf-loc">&#128205; ${escapeHtml(k.address || cityName)}${k.postalCode ? `, ${escapeHtml(k.postalCode)}` : ""}</div>` : ""}
         ${(() => {
           const desc = agent.description || "";
           const about = k.about || "";
           if (!desc && !about) return "";
           // If only one exists, use it
-          if (!desc) return `<p class="pf-desc">${escapeHtml(about)}</p>`;
-          if (!about) return `<p class="pf-desc">${escapeHtml(desc)}</p>`;
+          if (!desc) return `<p class="pf-desc"${lang === "en" ? ' lang="nb"' : ""}>${escapeHtml(about)}</p>`;
+          if (!about) return `<p class="pf-desc"${lang === "en" ? ' lang="nb"' : ""}>${escapeHtml(desc)}</p>`;
           // If they're the same text, just show one
-          if (desc === about || about.length < 20) return `<p class="pf-desc">${escapeHtml(desc)}</p>`;
+          if (desc === about || about.length < 20) return `<p class="pf-desc"${lang === "en" ? ' lang="nb"' : ""}>${escapeHtml(desc)}</p>`;
           // Both exist and differ — pick the most informative as primary,
           // show the other as supplementary if it adds unique context
           const primary = desc.length >= about.length ? desc : about;
@@ -2290,7 +2586,7 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
       <div>
         ${related.length > 0 ? `
         <div class="card">
-          <div class="card-head"><span>&#127793;</span><h3>${lang === "en" ? `Others in ${escapeHtml(cityName)}` : `Andre i ${escapeHtml(cityName)}`}</h3></div>
+          <div class="card-head"><span>&#127793;</span><h3>${lang === "en" ? `Others in <span translate="no">${escapeHtml(cityName)}</span>` : `Andre i <span translate="no">${escapeHtml(cityName)}</span>`}</h3></div>
           <div class="card-body"><div class="rel-grid">${relatedHtml}</div></div>
         </div>` : ""}
       </div>
