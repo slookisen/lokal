@@ -18,6 +18,7 @@
 import { Router, Request, Response } from "express";
 import { marketplaceRegistry } from "../services/marketplace-registry";
 import { knowledgeService } from "../services/knowledge-service";
+import { getConfig } from "../config/vertical-config";
 import { geocodingService } from "../services/geocoding-service";
 import { analyticsService } from "../services/analytics-service";
 import { DiscoveryQuerySchema } from "../models/marketplace";
@@ -206,16 +207,16 @@ function shell(title: string, description: string, content: string, extra?: { ca
   <meta property="og:url" content="${canonicalUrl}">
   <meta property="og:type" content="website">
   <meta property="og:locale" content="nb_NO">
-  <meta property="og:site_name" content="Rett fra Bonden">
+  <meta property="og:site_name" content="${getConfig().display_name}">
   <meta property="og:image" content="${BASE_URL}/logo-512.png">
   <meta property="og:image:width" content="512">
   <meta property="og:image:height" content="512">
-  <meta property="og:image:alt" content="Rett fra Bonden — lokal mat rett fra bonden i Norge">
+  <meta property="og:image:alt" content="${getConfig().display_name} — lokal mat rett fra bonden i Norge">
   <meta name="twitter:card" content="summary_large_image">
   <meta name="twitter:title" content="${escapeHtml(title)}">
   <meta name="twitter:description" content="${escapeHtml(description)}">
   <meta name="twitter:image" content="${BASE_URL}/logo-512.png">
-  <meta name="twitter:image:alt" content="Rett fra Bonden — lokal mat rett fra bonden i Norge">
+  <meta name="twitter:image:alt" content="${getConfig().display_name} — lokal mat rett fra bonden i Norge">
   <meta name="robots" content="index, follow, max-snippet:-1, max-image-preview:large">
   <link rel="alternate" hreflang="nb" href="${canonicalUrl}">
   <link rel="alternate" hreflang="en" href="${canonicalUrl}">
@@ -226,7 +227,7 @@ function shell(title: string, description: string, content: string, extra?: { ca
 </head>
 <body>
   <nav class="nav">
-    <a href="/" class="nav-logo"><div class="nav-icon">&#127793;</div> Rett fra Bonden</a>
+    <a href="/" class="nav-logo"><div class="nav-icon">&#127793;</div> ${getConfig().display_name}</a>
     <div class="nav-links">
       <a href="/samtaler">Samtaler</a>
       <a href="/sok">S\u00f8k</a>
@@ -239,12 +240,12 @@ function shell(title: string, description: string, content: string, extra?: { ca
   <footer class="ft">
     <div class="ft-inner">
       <div>
-        <div class="ft-brand">Rett fra Bonden</div>
-        <div class="ft-desc">Norges f\u00f8rste agent-til-agent (A2A) nettverk for lokal mat. Vi gj\u00f8r matprodusenter synlige for AI-assistenter \u2014 s\u00e5 kundene finner deg n\u00e5r de sp\u00f8r.</div>
+        <div class="ft-brand">${getConfig().display_name}</div>
+        <div class="ft-desc">Norges f\u00f8rste agent-til-agent (A2A) nettverk for lokal mat. Vi gj\u00f8r ${getConfig().domain_dictionary.entity_plural_long} synlige for AI-assistenter \u2014 s\u00e5 kundene finner deg n\u00e5r de sp\u00f8r.</div>
       </div>
       <div class="ft-col">
         <h4>Plattformen</h4>
-        <a href="/sok">S\u00f8k produsenter</a><a href="/teknologi">Hvordan det fungerer</a><a href="/om">Om Rett fra Bonden</a><a href="/personvern">Personvern</a>
+        <a href="/sok">S\u00f8k produsenter</a><a href="/teknologi">Hvordan det fungerer</a><a href="/om">Om ${getConfig().display_name}</a><a href="/personvern">Personvern</a>
       </div>
       <div class="ft-col">
         <h4>For produsenter</h4>
@@ -255,7 +256,7 @@ function shell(title: string, description: string, content: string, extra?: { ca
         <a href="/api/marketplace/search?q=mat">API</a><a href="https://github.com/slookisen/lokal">GitHub</a><a href="https://smithery.ai/servers/slookisen/lokal">MCP Server</a>
       </div>
     </div>
-    <div class="ft-bottom">Rett fra Bonden &copy; ${new Date().getFullYear()}. Gj\u00f8r matprodusenter synlige i hele Norge.</div>
+    <div class="ft-bottom">${getConfig().display_name} &copy; ${new Date().getFullYear()}. Gj\u00f8r ${getConfig().domain_dictionary.entity_plural_long} synlige i hele Norge.</div>
   </footer>
 </body>
 </html>`;
@@ -616,7 +617,7 @@ router.get("/", (_req: Request, res: Response) => {
     const jsonLd = {
       "@context": "https://schema.org",
       "@type": "WebSite",
-      "name": "Rett fra Bonden",
+      "name": `${getConfig().display_name}`,
       "url": BASE_URL,
       "description": "Finn lokalprodusert mat i Norge. S\u00f8k blant g\u00e5rder, markeder og g\u00e5rdsbutikker.",
       "potentialAction": {
@@ -711,7 +712,7 @@ router.get("/", (_req: Request, res: Response) => {
       <div class="sh">
         <div class="sh-label">Oppdag</div>
         <div class="sh-title">Produsenter</div>
-        <div class="sh-sub">Norske matprodusenter i nettverket</div>
+        <div class="sh-sub">Norske ${getConfig().domain_dictionary.entity_plural_long} i nettverket</div>
       </div>
       <div class="feat-grid">${featuredCards}</div>
     </section>
@@ -729,7 +730,7 @@ router.get("/", (_req: Request, res: Response) => {
     </section>
 
     <section class="seller-cta">
-      <h2>Er du matprodusent?</h2>
+      <h2>Er du ${getConfig().domain_dictionary.entity}?</h2>
       <p>Registrer deg gratis og bli synlig for tusenvis av kunder \u2014 og AI-assistentene deres.</p>
       <a href="/selger" class="seller-btn">Registrer gratis</a>
       <span class="seller-note">Under 2 minutter. Ingen kredittkort.</span>
@@ -753,8 +754,8 @@ router.get("/", (_req: Request, res: Response) => {
     </section>`;
 
     res.send(shell(
-      "Rett fra Bonden \u2014 Finn lokalprodusert mat i Norge",
-      `S\u00f8k blant ${totalAgents} lokale matprodusenter i Norge. G\u00e5rder, markeder, g\u00e5rdsbutikker med kontaktinfo og \u00e5pningstider.`,
+      `${getConfig().display_name} \u2014 Finn lokalprodusert mat i Norge`,
+      `S\u00f8k blant ${totalAgents} lokale ${getConfig().domain_dictionary.entity_plural_long} i Norge. G\u00e5rder, markeder, g\u00e5rdsbutikker med kontaktinfo og \u00e5pningstider.`,
       content,
       { canonical: BASE_URL, jsonLd, extraCss: LANDING_CSS }
     ));
@@ -952,8 +953,8 @@ router.get("/sok", async (req: Request, res: Response) => {
     </script>`;
 
     res.send(shell(
-      `${q} \u2014 S\u00f8k i Rett fra Bonden`,
-      `S\u00f8keresultater for \u201c${q}\u201d \u2014 finn lokale matprodusenter i Norge.`,
+      `${q} \u2014 S\u00f8k i ${getConfig().display_name}`,
+      `S\u00f8keresultater for \u201c${q}\u201d \u2014 finn lokale ${getConfig().domain_dictionary.entity_plural_long} i Norge.`,
       content,
       { canonical: `${BASE_URL}/sok?q=${encodeURIComponent(q)}`, extraCss: SEARCH_CSS }
     ));
@@ -993,7 +994,7 @@ router.get("/om", (_req: Request, res: Response) => {
   const content = `
   <section class="om-hero">
     <h1>Maten fortjener \u00e5 bli <em>funnet</em></h1>
-    <p>Rett fra Bonden gj\u00f8r lokale matprodusenter synlige \u2014 ikke bare for mennesker, men for AI-assistentene som hjelper dem \u00e5 handle.</p>
+    <p>${getConfig().display_name} gj\u00f8r lokale ${getConfig().domain_dictionary.entity_plural_long} synlige \u2014 ikke bare for mennesker, men for AI-assistentene som hjelper dem \u00e5 handle.</p>
   </section>
 
   <section class="om-sec">
@@ -1007,7 +1008,7 @@ router.get("/om", (_req: Request, res: Response) => {
     </div>
 
     <h2>Hva vi gj\u00f8r</h2>
-    <p>Rett fra Bonden er en \u00e5pen katalog som automatisk samler informasjon om lokale matprodusenter \u2014 produkter, \u00e5pningstider, kontaktinfo, sertifiseringer \u2014 og gj\u00f8r alt tilgjengelig via standardprotokoller som AI-systemer forst\u00e5r.</p>
+    <p>${getConfig().display_name} er en \u00e5pen katalog som automatisk samler informasjon om lokale ${getConfig().domain_dictionary.entity_plural_long} \u2014 produkter, \u00e5pningstider, kontaktinfo, sertifiseringer \u2014 og gj\u00f8r alt tilgjengelig via standardprotokoller som AI-systemer forst\u00e5r.</p>
     <p>N\u00e5r noen sp\u00f8r ChatGPT, Claude eller en annen AI-assistent om lokal mat i Norge, finner de svarene her.</p>
 
     <div class="om-values">
@@ -1035,12 +1036,12 @@ router.get("/om", (_req: Request, res: Response) => {
 
     <h2>Visjonen v\u00e5r</h2>
     <p>Vi tror at fremtidens handel handler om synlighet. Den som blir funnet, f\u00e5r kunden. Vi bygger infrastrukturen som gj\u00f8r at lokale produsenter konkurrerer p\u00e5 like vilk\u00e5r med de store kjedene \u2014 i en verden der stadig flere handler gjennom AI.</p>
-    <p>Rett fra Bonden er et non-profit initiativ. Koden er \u00e5pen kildekode.</p>
+    <p>${getConfig().display_name} er et non-profit initiativ. Koden er \u00e5pen kildekode.</p>
   </section>`;
 
   res.send(shell(
-    "Om Rett fra Bonden \u2014 V\u00e5r historie",
-    "Rett fra Bonden gj\u00f8r lokale matprodusenter synlige for AI-assistenter. Les om v\u00e5r misjon og hvorfor vi bygger dette.",
+    `Om ${getConfig().display_name} \u2014 V\u00e5r historie`,
+    `${getConfig().display_name} gj\u00f8r lokale ${getConfig().domain_dictionary.entity_plural_long} synlige for AI-assistenter. Les om v\u00e5r misjon og hvorfor vi bygger dette.`,
     content,
     { canonical: `${BASE_URL}/om`, extraCss: OM_CSS }
   ));
@@ -1127,7 +1128,7 @@ router.get("/teknologi", (_req: Request, res: Response) => {
     </div>
 
     <h2>Protokollene vi bruker</h2>
-    <p>Rett fra Bonden bruker \u00e5pne standarder som gj\u00f8r at enhver AI-assistent kan finne og forst\u00e5 informasjon om norske matprodusenter:</p>
+    <p>${getConfig().display_name} bruker \u00e5pne standarder som gj\u00f8r at enhver AI-assistent kan finne og forst\u00e5 informasjon om norske ${getConfig().domain_dictionary.entity_plural_long}:</p>
 
     <div class="tech-proto">
       <div class="proto-card">
@@ -1167,7 +1168,7 @@ router.get("/teknologi", (_req: Request, res: Response) => {
     <p>Alt skjer automatisk. Produsenten trenger ikke gj\u00f8re noe \u2014 vi samler data fra offentlige kilder, verifiserer det, og gj\u00f8r det tilgjengelig for alle AI-plattformer.</p>
 
     <h2 id="mcp-oppsett">Sett opp MCP &mdash; s\u00f8k fra din AI</h2>
-    <p>MCP (Model Context Protocol) lar AI-assistenten din s\u00f8ke direkte i v\u00e5r database med ${totalAgents}+ matprodusenter. Her er hvordan du setter det opp:</p>
+    <p>MCP (Model Context Protocol) lar AI-assistenten din s\u00f8ke direkte i v\u00e5r database med ${totalAgents}+ ${getConfig().domain_dictionary.entity_plural_long}. Her er hvordan du setter det opp:</p>
 
     <div id="chatgpt-mcp" class="setup-guide">
       <h3>&#128154; ChatGPT (enklest)</h3>
@@ -1219,8 +1220,8 @@ router.get("/teknologi", (_req: Request, res: Response) => {
   </section>`;
 
   res.send(shell(
-    "Slik fungerer AI-s\u00f8k \u2014 Rett fra Bonden",
-    "Rett fra Bonden bruker A2A, MCP og Schema.org for \u00e5 gj\u00f8re lokale matprodusenter synlige for AI-assistenter.",
+    `Slik fungerer AI-s\u00f8k \u2014 ${getConfig().display_name}`,
+    `${getConfig().display_name} bruker A2A, MCP og Schema.org for \u00e5 gj\u00f8re lokale ${getConfig().domain_dictionary.entity_plural_long} synlige for AI-assistenter.`,
     content,
     { canonical: `${BASE_URL}/teknologi`, extraCss: TECH_CSS }
   ));
@@ -1256,12 +1257,12 @@ router.get("/personvern", (_req: Request, res: Response) => {
   const content = `
   <section class="pv-hero">
     <h1>Personvern</h1>
-    <p>Hvordan Rett fra Bonden behandler data \u2014 ærlig og uten fyllord.</p>
+    <p>Hvordan ${getConfig().display_name} behandler data \u2014 ærlig og uten fyllord.</p>
   </section>
 
   <section class="pv-sec">
     <h2>Hvem vi er</h2>
-    <p>Rett fra Bonden er en åpen katalog over lokale matprodusenter i Norge, tilgjengelig på rettfrabonden.com. Tjenesten drives som et uavhengig prosjekt. Kontakt: kontakt@rettfrabonden.com.</p>
+    <p>${getConfig().display_name} er en åpen katalog over lokale ${getConfig().domain_dictionary.entity_plural_long} i Norge, tilgjengelig på rettfrabonden.com. Tjenesten drives som et uavhengig prosjekt. Kontakt: kontakt@${getConfig().domain}.</p>
 
     <h2>Hva vi samler inn</h2>
     <p>Vi samler inn forskjellige typer data avhengig av hvordan du bruker tjenesten. Her er en fullstendig oversikt:</p>
@@ -1288,7 +1289,7 @@ router.get("/personvern", (_req: Request, res: Response) => {
     <p>Vi lagrer dette for å forstå hvilke søk som gir gode resultater, og for å forbedre tjenesten.</p>
 
     <h3>Selgere som registrerer seg (claim)</h3>
-    <p>Når du som matprodusent registrerer deg for å administrere din profil, samler vi inn:</p>
+    <p>Når du som ${getConfig().domain_dictionary.entity} registrerer deg for å administrere din profil, samler vi inn:</p>
     <ul>
       <li>Navn, e-postadresse og eventuelt telefonnummer</li>
       <li>En 6-sifret verifiseringskode sendt til din e-post</li>
@@ -1303,7 +1304,7 @@ router.get("/personvern", (_req: Request, res: Response) => {
     <p>Selgere kan laste opp profilbilder og produktbilder. Disse lagres på serveren. Hvis bildeskanning er aktivert, kan bildet sendes til en ekstern AI-tjeneste (Anthropic Claude eller OpenAI) for automatisk produktgjenkjenning.</p>
 
     <h3>Samtaler mellom agenter</h3>
-    <p>Rett fra Bonden støtter A2A-protokollen (agent-til-agent). Når en AI-agent kontakter en produsent-agent, lagres samtaletekst, status og eventuell transaksjonsinfo i databasen.</p>
+    <p>${getConfig().display_name} støtter A2A-protokollen (agent-til-agent). Når en AI-agent kontakter en produsent-agent, lagres samtaletekst, status og eventuell transaksjonsinfo i databasen.</p>
 
     <h2>Hva vi ikke samler inn</h2>
     <ul>
@@ -1358,7 +1359,7 @@ router.get("/personvern", (_req: Request, res: Response) => {
       <li><strong>Trekke tilbake samtykke</strong> \u2014 du kan når som helst be om å bli fjernet</li>
       <li><strong>Klage</strong> \u2014 du kan klage til Datatilsynet (datatilsynet.no) hvis du mener vi bryter reglene</li>
     </ul>
-    <p>For alle henvendelser: <a href="mailto:kontakt@rettfrabonden.com" style="color:var(--green-700);">kontakt@rettfrabonden.com</a></p>
+    <p>For alle henvendelser: <a href="mailto:kontakt@${getConfig().domain}" style="color:var(--green-700);">kontakt@${getConfig().domain}</a></p>
 
     <h2>Sikkerhet</h2>
     <p>Vi bruker følgende tiltak for å beskytte data:</p>
@@ -1378,8 +1379,8 @@ router.get("/personvern", (_req: Request, res: Response) => {
   </section>`;
 
   res.send(shell(
-    "Personvern \u2014 Rett fra Bonden",
-    "Hvordan Rett fra Bonden behandler persondata. Ingen cookies, ingen tredjepartssporing, åpen kildekode.",
+    `Personvern \u2014 ${getConfig().display_name}`,
+    `Hvordan ${getConfig().display_name} behandler persondata. Ingen cookies, ingen tredjepartssporing, åpen kildekode.`,
     content,
     { canonical: `${BASE_URL}/personvern`, extraCss: PERSONVERN_CSS }
   ));
@@ -1502,7 +1503,7 @@ router.get("/:city", (req: Request, res: Response, next: any) => {
       <div class="container">
         <div class="bc" style="padding:0 0 12px;"><a href="/">Hjem</a><span>/</span>${escapeHtml(cityName)}</div>
         <h1>Lokal mat i ${escapeHtml(cityName)}</h1>
-        <p>${cityAgents.length} lokale matprodusenter i ${escapeHtml(cityName)}-omr\u00e5det.</p>
+        <p>${cityAgents.length} lokale ${getConfig().domain_dictionary.entity_plural_long} i ${escapeHtml(cityName)}-omr\u00e5det.</p>
         ${contextPara ? `<p style="margin-top:8px;color:var(--g500);">${escapeHtml(contextPara)}</p>` : ""}
       </div>
     </section>
@@ -1512,7 +1513,7 @@ router.get("/:city", (req: Request, res: Response, next: any) => {
 
     res.send(shell(
       `Lokal mat i ${cityName} \u2014 ${cityAgents.length} produsenter`,
-      `Finn ${cityAgents.length} lokale matprodusenter i ${cityName}. G\u00e5rder, markeder og g\u00e5rdsbutikker.`,
+      `Finn ${cityAgents.length} lokale ${getConfig().domain_dictionary.entity_plural_long} i ${cityName}. G\u00e5rder, markeder og g\u00e5rdsbutikker.`,
       content,
       { canonical: `${BASE_URL}/${citySlug}`, jsonLd: jsonLdItems, extraCss: CITY_CSS }
     ));
@@ -1732,8 +1733,8 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
       // HTTP 404 status (soft-200 hurts Google ranking) but rich body so
       // AI agents and humans can still find what they were after.
       return res.status(404).send(shell(
-        "Produsent ikke funnet — Rett fra Bonden",
-        `Vi fant ingen produsent med URL «${slug}». Søk eller bla blant ${totalAgents}+ matprodusenter i hele Norge.`,
+        `Produsent ikke funnet — ${getConfig().display_name}`,
+        `Vi fant ingen produsent med URL «${slug}». Søk eller bla blant ${totalAgents}+ ${getConfig().domain_dictionary.entity_plural_long} i hele Norge.`,
         `<div class="sec" style="text-align:center;padding:64px 24px 32px;">
           <h1 style="font-size:2rem;margin-bottom:12px;">Produsent ikke funnet</h1>
           <p style="color:var(--g500);max-width:640px;margin:0 auto 28px;">URL-en <code style="background:var(--g100);padding:2px 8px;border-radius:4px;">/produsent/${escapeHtml(slug)}</code> matcher ingen produsent i nettverket vårt. Lenken kan være utdatert, eller produsentnavnet kan ha endret seg.</p>
@@ -1902,7 +1903,7 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
       "@type": "LocalBusiness",
       "@id": `${BASE_URL}/produsent/${slug}#business`,
       "name": agent.name,
-      "description": agent.description || k.about || `Lokal matprodusent i ${cityName || "Norge"}`,
+      "description": agent.description || k.about || `Lokal ${getConfig().domain_dictionary.entity} i ${cityName || "Norge"}`,
       "url": `${BASE_URL}/produsent/${slug}`,
     };
 
