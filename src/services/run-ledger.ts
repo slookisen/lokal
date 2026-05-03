@@ -139,8 +139,19 @@ export function listRecentRuns(opts: {
 }
 
 /**
- * Find runs whose verifier hasn't checked them yet (or whose check failed
- * and we should retry). Caller is the platform-verifier scheduled task.
+ * Find runs whose verifier hasn't checked them yet. Caller is the
+ * platform-verifier scheduled task.
+ *
+ * Why we DON'T re-include `verifier_state = 'failed'`:
+ * Originally we included `failed` so the verifier could retry. In practice
+ * that meant the same row got re-probed every cycle, the probe failed for
+ * the same upstream reason (e.g. agent's review_queue_appended claim doesn't
+ * match disk), and the row stayed `failed` forever — wasting ~3 HTTP calls
+ * per cycle for a problem the verifier already reported in `next_suggested`.
+ * Verifier T1216/T1311/T1412/T1512 (2026-05-03) flagged this as a persistent
+ * issue. Decision: `failed` is terminal until a write op (orchestrator
+ * resolves the issue, or manual review re-queues) clears it. Retrying a
+ * deterministic upstream failure on a 1h cadence is just billable noise.
  */
 export function listPendingVerification(opts: {
   vertical?: string;
@@ -154,7 +165,7 @@ export function listPendingVerification(opts: {
   const cutoff = new Date(Date.now() - maxAge * 3600_000).toISOString();
 
   const where: string[] = [
-    "verifier_state IN ('pending', 'failed')",
+    "verifier_state = 'pending'",
     "started_at >= ?",
   ];
   const params: unknown[] = [cutoff];
