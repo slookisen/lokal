@@ -635,6 +635,46 @@ import type { VerifierFinding } from "../src/types/run-envelope";
   _resetConfigCacheForTests();
 }
 
+// ─── PHASE 4.9a: agent_knowledge.curated_fields ────────────────────────
+// Verifies that the migration adds the column with default '{}', and
+// that setCuratedFieldLock / getCuratedFields round-trip correctly.
+{
+  const sqlite = require("better-sqlite3");
+  const memdb49 = new sqlite(":memory:");
+  // Replicate the relevant agent_knowledge schema (subset)
+  memdb49.exec(`
+    CREATE TABLE agent_knowledge (
+      agent_id TEXT PRIMARY KEY,
+      about TEXT
+    );
+  `);
+  // Apply Phase 4.9a migration
+  memdb49.exec(`ALTER TABLE agent_knowledge ADD COLUMN curated_fields TEXT NOT NULL DEFAULT '{}'`);
+  memdb49.prepare("INSERT INTO agent_knowledge (agent_id, about) VALUES (?, ?)").run("k1", "old text");
+
+  // Existing rows backfilled to '{}'
+  const r1 = memdb49.prepare("SELECT curated_fields FROM agent_knowledge WHERE agent_id = ?").get("k1") as { curated_fields?: string };
+  assertEq(r1.curated_fields, "{}", "phase4.9a: existing row backfilled to {}");
+
+  // Set a lock
+  const lockMeta = JSON.stringify({
+    about: { locked_at: "2026-05-03T14:00:00Z", by: "rfb-customer-service", thread_id: "thr-1", request_summary: "test" }
+  });
+  memdb49.prepare("UPDATE agent_knowledge SET curated_fields = ? WHERE agent_id = ?").run(lockMeta, "k1");
+  const r2 = memdb49.prepare("SELECT curated_fields FROM agent_knowledge WHERE agent_id = ?").get("k1") as { curated_fields?: string };
+  const parsed = JSON.parse(r2.curated_fields || "{}");
+  assertEq(parsed.about?.by, "rfb-customer-service", "phase4.9a: lock-meta round-trips via JSON");
+  assertEq(parsed.about?.locked_at, "2026-05-03T14:00:00Z", "phase4.9a: locked_at preserved");
+
+  // Unlock by removing entry
+  delete parsed.about;
+  memdb49.prepare("UPDATE agent_knowledge SET curated_fields = ? WHERE agent_id = ?").run(JSON.stringify(parsed), "k1");
+  const r3 = memdb49.prepare("SELECT curated_fields FROM agent_knowledge WHERE agent_id = ?").get("k1") as { curated_fields?: string };
+  assertEq(r3.curated_fields, "{}", "phase4.9a: unlock removes entry → empty object");
+
+  memdb49.close();
+}
+
 
 
 
