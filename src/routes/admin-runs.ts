@@ -219,7 +219,8 @@ router.post("/:run_id/verify", (req: Request, res: Response) => {
       typeof f?.probe_kind !== "string" ||
       typeof f?.matched !== "boolean" ||
       typeof f?.reason !== "string" ||
-      typeof f?.probed_at !== "string"
+      typeof f?.probed_at !== "string" ||
+      (f.skipped !== undefined && typeof f.skipped !== "boolean")
     ) {
       res.status(400).json({
         error: "Invalid finding",
