@@ -627,6 +627,13 @@ import type { VerifierFinding } from "../src/types/run-envelope";
     assertEq(cfg.kpis.marketing?.reply_rate_min_pct, 2.0, "phase4.8: marketing.reply_rate_min_pct (justert til 2.0)");
     assertEq(cfg.kpis.platform?.failed_run_max_per_day, 5, "phase4.8: platform.failed_run_max_per_day (justert til 5)");
     assertEq(cfg.kpis.customer_service?.p0_open_max_count, 0, "phase4.8: cs.p0_open_max_count");
+    // Phase 4.9c — nye decision-KPIs
+    assertEq(cfg.kpis.customer_service?.decisions_fulfilled_within_24h_pct_min, 90,
+      "phase4.9c: cs.decisions_fulfilled_within_24h_pct_min");
+    assertEq(cfg.kpis.customer_service?.decisions_overdue_max_count, 0,
+      "phase4.9c: cs.decisions_overdue_max_count");
+    assertEq(cfg.kpis.customer_service?.decisions_failed_verification_max_count, 0,
+      "phase4.9c: cs.decisions_failed_verification_max_count");
   }
   // Test-vertical may NOT have kpis — that's allowed (optional)
   const testCfg = getConfig("test");

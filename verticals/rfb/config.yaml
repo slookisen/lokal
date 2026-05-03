@@ -68,6 +68,10 @@ kpis:
   customer_service:
     response_within_hours_max: 24
     p0_open_max_count: 0          # ingen P0 skal være ulest
+    # Phase 4.9c — autonom CS-fulfillment målbart
+    decisions_fulfilled_within_24h_pct_min: 90  # % av AUTONOMOUS-decisions som er DONE innen 24t
+    decisions_overdue_max_count: 0              # antall PENDING-FULFILL eldre enn 48h (P0)
+    decisions_failed_verification_max_count: 0  # antall verifikasjons-svikt (P0)
   platform:
     verifier_backlog_max_pct: 25
     failed_run_max_per_day: 5     # justert opp fra 3 — 9 agenter, realistisk margin

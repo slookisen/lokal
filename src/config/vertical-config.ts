@@ -56,6 +56,10 @@ const KpiConfigSchema = z.object({
   customer_service: z.object({
     response_within_hours_max: z.number().nonnegative().optional(),
     p0_open_max_count: z.number().int().nonnegative().optional(),
+    // Phase 4.9c — autonom CS-fulfillment målbart
+    decisions_fulfilled_within_24h_pct_min: z.number().nonnegative().optional(),
+    decisions_overdue_max_count: z.number().int().nonnegative().optional(),
+    decisions_failed_verification_max_count: z.number().int().nonnegative().optional(),
   }).optional(),
   platform: z.object({
     verifier_backlog_max_pct: z.number().nonnegative().optional(),
