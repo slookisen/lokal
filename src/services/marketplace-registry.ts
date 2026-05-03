@@ -642,12 +642,12 @@ class MarketplaceRegistry {
         {
           id: "discover-local-food-agents",
           name: "Discover Local Food Agents / Finn lokale matagenter",
-          description: `Search a registry of ${stats.totalAgents || 1270}+ verified local food producers in Norway. ` +
+          description: `Search a registry of ${stats.totalAgents || 1396}+ verified local food producers in Norway. ` +
             "Filter by category (vegetables, fruit, meat, fish, dairy, eggs, honey, herbs, bread, berries), " +
             "location (Oslo, Bergen, Trondheim, Stavanger, Troms\u00f8, and rural districts), " +
             "certifications (organic, Debio, farm-direct), delivery options (pickup, local delivery), " +
             "and trust score. Returns ranked results with contact info and A2A endpoints. " +
-            `Søk blant ${stats.totalAgents || 1270}+ verifiserte lokale ${getConfig().domain_dictionary.entity_plural_long} i Norge.`,
+            `Søk blant ${stats.totalAgents || 1396}+ verifiserte lokale ${getConfig().domain_dictionary.entity_plural_long} i Norge.`,
           tags: [
             // English discovery keywords (what agents actually search for)
             "local food", "fresh produce", "organic", "farm direct", "vegetables", "fruit",
