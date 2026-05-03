@@ -585,6 +585,62 @@ class CrmService {
   }
 
   /**
+   * List threads filtered by status across all contacts.
+   * Used by the dashboard "venter" / "nye" KPI badges to show what
+   * needs attention without drilling into each contact tab.
+   *
+   * Returned rows are joined with contact info (email, name, type, agent_name)
+   * + a snippet of the latest inbound message for quick context.
+   */
+  listThreadsByStatus(
+    status: ThreadStatus,
+    opts: { limit?: number; offset?: number } = {}
+  ): any[] {
+    const db = getDb();
+    const limit = Math.min(opts.limit ?? 200, 500);
+    const offset = opts.offset ?? 0;
+    return db.prepare(`
+      SELECT
+        t.id,
+        t.subject,
+        t.status,
+        t.severity,
+        t.category,
+        t.assigned_to,
+        t.message_count,
+        t.last_message_at,
+        t.created_at,
+        c.id          AS contact_id,
+        c.email       AS contact_email,
+        c.name        AS contact_name,
+        c.organization AS contact_organization,
+        c.type        AS contact_type,
+        c.agent_id,
+        a.name        AS agent_name,
+        (
+          SELECT m.snippet
+          FROM crm_messages m
+          WHERE m.thread_id = t.id AND m.direction = 'in'
+          ORDER BY m.sent_at DESC NULLS LAST, m.received_at DESC
+          LIMIT 1
+        ) AS last_inbound_snippet,
+        (
+          SELECT m.from_email
+          FROM crm_messages m
+          WHERE m.thread_id = t.id AND m.direction = 'in'
+          ORDER BY m.sent_at DESC NULLS LAST, m.received_at DESC
+          LIMIT 1
+        ) AS last_inbound_from
+      FROM crm_threads t
+      JOIN crm_contacts c ON c.id = t.contact_id
+      LEFT JOIN agents a ON a.id = c.agent_id
+      WHERE t.status = ?
+      ORDER BY t.last_message_at DESC NULLS LAST, t.created_at DESC
+      LIMIT ? OFFSET ?
+    `).all(status, limit, offset);
+  }
+
+  /**
    * Cross-tab summary for the dashboard header.
    */
   getDashboardSummary(): any {

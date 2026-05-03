@@ -115,6 +115,22 @@ router.post("/contacts/:id/notes", (req, res) => {
   res.json({ success: true });
 });
 
+// ─── GET /admin/crm/threads?status=... ──────────────────────
+// List threads filtered by status across all contacts. Used by the
+// dashboard KPI badges (venter / nye / under arbeid) to show what
+// needs attention without drilling into each tab.
+router.get("/threads", (req, res) => {
+  const status = (req.query.status as string) || "awaiting_review";
+  const allowed = ["new", "in_progress", "awaiting_review", "done", "archived"] as const;
+  if (!allowed.includes(status as any)) {
+    return res.status(400).json({ error: "invalid status", allowed });
+  }
+  const limit = Math.min(parseInt(req.query.limit as string) || 200, 500);
+  const offset = parseInt(req.query.offset as string) || 0;
+  const threads = crmService.listThreadsByStatus(status as any, { limit, offset });
+  res.json({ threads, status, count: threads.length });
+});
+
 // ─── GET /admin/crm/threads/:id ──────────────────────────────
 router.get("/threads/:id", (req, res) => {
   const detail = crmService.getThreadDetail(req.params.id);
