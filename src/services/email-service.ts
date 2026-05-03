@@ -1,5 +1,6 @@
 import nodemailer, { Transporter } from 'nodemailer';
 import { slugify } from "../utils/slug";
+import { getConfig } from "../config/vertical-config";
 
 // Simple logger — replace with winston/pino in production
 const logger = {
@@ -19,11 +20,30 @@ export interface EmailOptions {
 
 export class EmailService {
   private transporter!: Transporter;
-  private fromAddress: string;
   private isConfigured: boolean;
 
+  // ─── Vertical-config accessors (Phase 4.2) ───────────────────────
+  // Read display_name + entity_plural_long + support email lazily on
+  // each call so different verticals can share a single EmailService
+  // instance, and so the constructor doesn't depend on
+  // loadConfigsAtBoot() ordering.
+  private get brand(): string {
+    return getConfig().display_name;
+  }
+  private get entityPluralLong(): string {
+    return getConfig().domain_dictionary.entity_plural_long;
+  }
+  private get supportEmail(): string {
+    return `kontakt@${getConfig().connectors.resend_domain}`;
+  }
+  // From-address: env override > config-derived. Lazy so loadConfigsAtBoot()
+  // can run between module load (where the singleton is constructed) and
+  // first sendEmail() call.
+  private get fromAddress(): string {
+    return process.env.SMTP_FROM || this.supportEmail;
+  }
+
   constructor() {
-    this.fromAddress = process.env.SMTP_FROM || 'kontakt@rettfrabonden.com';
     this.isConfigured = this.setupTransporter();
   }
 
@@ -63,7 +83,7 @@ export class EmailService {
       const unsubscribeLink = `${process.env.APP_URL || 'https://rettfrabonden.com'}/unsubscribe?email=${encodeURIComponent(sellerEmail)}&agent=${agentId}`;
       const claimUrl = `${process.env.APP_URL || 'https://rettfrabonden.com'}/agent/${agentId}/claim`;
 
-      const subject = `Rett fra Bonden — Vi har funnet deg og dine produkter!`;
+      const subject = `${this.brand} — Vi har funnet deg og dine produkter!`;
 
       const htmlContent = this.generateClaimInvitationHtml(
         sellerName,
@@ -85,7 +105,7 @@ export class EmailService {
         subject,
         htmlContent,
         textContent,
-        replyTo: 'kontakt@rettfrabonden.com',
+        replyTo: this.supportEmail,
         listUnsubscribe: `<${unsubscribeLink}>`,
       });
     } catch (error) {
@@ -107,7 +127,7 @@ export class EmailService {
     agentName: string
   ): Promise<{ success: boolean; messageId?: string; error?: string }> {
     try {
-      const subject = `Din bekreftelseskode for ${agentName} på Rett fra Bonden`;
+      const subject = `Din bekreftelseskode for ${agentName} på ${this.brand}`;
 
       const htmlContent = this.generateVerificationCodeHtml(code, agentName);
       const textContent = this.generateVerificationCodeText(code, agentName);
@@ -117,7 +137,7 @@ export class EmailService {
         subject,
         htmlContent,
         textContent,
-        replyTo: 'kontakt@rettfrabonden.com',
+        replyTo: this.supportEmail,
       });
     } catch (error) {
       logger.error('Error sending verification code', {
@@ -138,7 +158,7 @@ export class EmailService {
     dashboardUrl: string
   ): Promise<{ success: boolean; messageId?: string; error?: string }> {
     try {
-      const subject = `Gratulerer! ${agentName} er nå ditt på Rett fra Bonden`;
+      const subject = `Gratulerer! ${agentName} er nå ditt på ${this.brand}`;
 
       const htmlContent = this.generateClaimConfirmationHtml(agentName, dashboardUrl);
       const textContent = this.generateClaimConfirmationText(agentName, dashboardUrl);
@@ -148,7 +168,7 @@ export class EmailService {
         subject,
         htmlContent,
         textContent,
-        replyTo: 'kontakt@rettfrabonden.com',
+        replyTo: this.supportEmail,
       });
     } catch (error) {
       logger.error('Error sending claim confirmation', {
@@ -336,14 +356,14 @@ export class EmailService {
 <body>
   <div class="container">
     <div class="header">
-      <div class="logo">🌾 Rett fra Bonden</div>
+      <div class="logo">🌾 ${this.brand}</div>
     </div>
 
     <h1>Hei ${this.escapeHtml(sellerName)}!</h1>
 
-    <p>Vi bygger et nettverk for lokale matprodusenter — hvor dine produkter møter mennesker som leter etter akkurat det du har.</p>
+    <p>Vi bygger et nettverk for lokale ${this.entityPluralLong} — hvor dine produkter møter mennesker som leter etter akkurat det du har.</p>
 
-    <p><strong>Vi har funnet deg og dine produkter på Rett fra Bonden, og vi ønsker at du skal eie din egen agent her.</strong></p>
+    <p><strong>Vi har funnet deg og dine produkter på ${this.brand}, og vi ønsker at du skal eie din egen agent her.</strong></p>
 
     <div class="info-box">
       <strong>Vi har registrert:</strong>
@@ -356,16 +376,16 @@ export class EmailService {
 
     <p style="font-weight: bold; margin-top: 20px;">Det tar mindre enn 5 minutter. Klikk her:</p>
 
-    <a href="${this.escapeHtml(claimUrl)}" class="cta-button">Krav din agent på Rett fra Bonden</a>
+    <a href="${this.escapeHtml(claimUrl)}" class="cta-button">Krav din agent på ${this.brand}</a>
 
-    <p style="font-size: 14px; color: #666; margin-top: 25px;">Har du spørsmål? Svar på denne e-posten eller kontakt oss på <a href="mailto:kontakt@rettfrabonden.com" class="footer-link">kontakt@rettfrabonden.com</a>.</p>
+    <p style="font-size: 14px; color: #666; margin-top: 25px;">Har du spørsmål? Svar på denne e-posten eller kontakt oss på <a href="mailto:${this.supportEmail}" class="footer-link">${this.supportEmail}</a>.</p>
 
     <div class="footer">
-      <p>Rett fra Bonden bygger nettverk hvor norske matprodusenter møter mennesker som verdsetter lokal og god mat.</p>
+      <p>${this.brand} bygger nettverk hvor norske ${this.entityPluralLong} møter mennesker som verdsetter lokal og god mat.</p>
       <p>
         <a href="${this.escapeHtml(unsubscribeLink)}" class="footer-link">Avslutt abonnement</a>
       </p>
-      <p style="margin-top: 15px; color: #999;">Rett fra Bonden | rettfrabonden.com</p>
+      <p style="margin-top: 15px; color: #999;">${this.brand} | ${getConfig().domain}</p>
     </div>
   </div>
 </body>
@@ -382,9 +402,9 @@ export class EmailService {
     return `
 Hei ${sellerName}!
 
-Vi bygger et nettverk for lokale matprodusenter — hvor dine produkter møter mennesker som leter etter akkurat det du har.
+Vi bygger et nettverk for lokale ${this.entityPluralLong} — hvor dine produkter møter mennesker som leter etter akkurat det du har.
 
-Vi har funnet deg og dine produkter på Rett fra Bonden, og vi ønsker at du skal eie din egen agent her.
+Vi har funnet deg og dine produkter på ${this.brand}, og vi ønsker at du skal eie din egen agent her.
 
 VI HAR REGISTRERT:
 ${agentName}
@@ -402,10 +422,10 @@ ${claimUrl}
 
 SPØRSMÅL?
 
-Svar på denne e-posten eller kontakt oss på kontakt@rettfrabonden.com
+Svar på denne e-posten eller kontakt oss på ${this.supportEmail}
 
 ---
-Rett fra Bonden bygger nettverk hvor norske matprodusenter møter mennesker som verdsetter lokal og god mat.
+${this.brand} bygger nettverk hvor norske ${this.entityPluralLong} møter mennesker som verdsetter lokal og god mat.
     `;
   }
 
@@ -451,9 +471,9 @@ Rett fra Bonden bygger nettverk hvor norske matprodusenter møter mennesker som 
 </head>
 <body>
   <div class="container">
-    <div class="logo">🌾 Rett fra Bonden</div>
+    <div class="logo">🌾 ${this.brand}</div>
     <h1>Din bekreftelseskode</h1>
-    <p>Du ba om å bekrefte at du eier <strong>${this.escapeHtml(agentName)}</strong> på Rett fra Bonden.</p>
+    <p>Du ba om å bekrefte at du eier <strong>${this.escapeHtml(agentName)}</strong> på ${this.brand}.</p>
     <p>Din bekreftelseskode er:</p>
     <div class="code-box">
       <div class="code">${code}</div>
@@ -470,7 +490,7 @@ Rett fra Bonden bygger nettverk hvor norske matprodusenter møter mennesker som 
     return `
 Din bekreftelseskode
 
-Du ba om å bekrefte at du eier ${agentName} på Rett fra Bonden.
+Du ba om å bekrefte at du eier ${agentName} på ${this.brand}.
 
 Din bekreftelseskode er:
 
@@ -526,10 +546,10 @@ Hvis du ikke ba om denne koden, kan du ignorere denne e-posten.
 </head>
 <body>
   <div class="container">
-    <div class="logo">🌾 Rett fra Bonden</div>
+    <div class="logo">🌾 ${this.brand}</div>
     <h1>Gratulerer!</h1>
     <div class="success-box">
-      <p><strong>${this.escapeHtml(agentName)}</strong> er nå ditt på Rett fra Bonden.</p>
+      <p><strong>${this.escapeHtml(agentName)}</strong> er nå ditt på ${this.brand}.</p>
     </div>
     <p>Din agent er klar. Du kan nå:</p>
     <ul>
@@ -549,7 +569,7 @@ Hvis du ikke ba om denne koden, kan du ignorere denne e-posten.
     return `
 Gratulerer!
 
-${agentName} er nå ditt på Rett fra Bonden.
+${agentName} er nå ditt på ${this.brand}.
 
 Din agent er klar. Du kan nå:
 - Oppdatere informasjon om produkter og åpningstider
@@ -569,7 +589,7 @@ Lykke til!
     agentName: string
   ): Promise<{ success: boolean; messageId?: string; error?: string }> {
     try {
-      const subject = `Logg inn på Rett fra Bonden`;
+      const subject = `Logg inn på ${this.brand}`;
 
       const htmlContent = `
 <!DOCTYPE html>
@@ -615,7 +635,7 @@ Lykke til!
 </head>
 <body>
   <div class="container">
-    <div class="logo">\u{1F33E} Rett fra Bonden</div>
+    <div class="logo">\u{1F33E} ${this.brand}</div>
     <h1 style="font-size: 20px;">Logg inn</h1>
     <p>Du ba om å logge inn for å administrere <strong>${this.escapeHtml(agentName)}</strong>.</p>
     <p>Klikk knappen under for å logge inn. Lenken er gyldig i 15 minutter.</p>
@@ -624,13 +644,13 @@ Lykke til!
     <p style="font-size: 12px; color: #999; word-break: break-all;">${this.escapeHtml(magicUrl)}</p>
     <div class="footer">
       <p>Hvis du ikke ba om denne lenken, kan du trygt ignorere denne e-posten.</p>
-      <p>Rett fra Bonden | rettfrabonden.com</p>
+      <p>${this.brand} | ${getConfig().domain}</p>
     </div>
   </div>
 </body>
 </html>`;
 
-      const textContent = `Logg inn på Rett fra Bonden
+      const textContent = `Logg inn på ${this.brand}
 
 Du ba om å logge inn for å administrere ${agentName}.
 
@@ -639,14 +659,14 @@ ${magicUrl}
 
 Hvis du ikke ba om denne lenken, kan du trygt ignorere denne e-posten.
 
-Rett fra Bonden | rettfrabonden.com`;
+${this.brand} | ${getConfig().domain}`;
 
       return await this.sendEmail({
         to: email,
         subject,
         htmlContent,
         textContent,
-        replyTo: 'kontakt@rettfrabonden.com',
+        replyTo: this.supportEmail,
       });
     } catch (error) {
       logger.error('Error sending magic link', {
@@ -682,7 +702,7 @@ Rett fra Bonden | rettfrabonden.com`;
 
       const htmlContent = `
         <div style="font-family: -apple-system, sans-serif; max-width: 600px; margin: 0 auto; padding: 20px;">
-          <h2 style="color: #2d5016;">Ny verifisert produsent på Rett fra Bonden</h2>
+          <h2 style="color: #2d5016;">Ny verifisert produsent på ${this.brand}</h2>
           <table style="width: 100%; border-collapse: collapse; margin: 16px 0;">
             <tr><td style="padding: 8px; border-bottom: 1px solid #eee; font-weight: bold;">Produsent:</td><td style="padding: 8px; border-bottom: 1px solid #eee;">${this.escapeHtml(agentName)}</td></tr>
             <tr><td style="padding: 8px; border-bottom: 1px solid #eee; font-weight: bold;">Eier:</td><td style="padding: 8px; border-bottom: 1px solid #eee;">${this.escapeHtml(claimantName)}</td></tr>
@@ -691,10 +711,10 @@ Rett fra Bonden | rettfrabonden.com`;
             <tr><td style="padding: 8px; font-weight: bold;">Tidspunkt:</td><td style="padding: 8px;">${new Date().toLocaleString('nb-NO', { timeZone: 'Europe/Oslo' })}</td></tr>
           </table>
           <p><a href="${profileUrl}" style="color: #2d5016;">Se produsentprofil →</a></p>
-          <p style="color: #888; font-size: 12px;">Automatisk varsling fra Rett fra Bonden</p>
+          <p style="color: #888; font-size: 12px;">Automatisk varsling fra ${this.brand}</p>
         </div>`;
 
-      const textContent = `Ny verifisert produsent på Rett fra Bonden\n\nProdusent: ${agentName}\nEier: ${claimantName}\nE-post: ${claimantEmail}\nKilde: ${source || 'organic'}\nTidspunkt: ${new Date().toISOString()}\n\nProfil: ${profileUrl}`;
+      const textContent = `Ny verifisert produsent på ${this.brand}\n\nProdusent: ${agentName}\nEier: ${claimantName}\nE-post: ${claimantEmail}\nKilde: ${source || 'organic'}\nTidspunkt: ${new Date().toISOString()}\n\nProfil: ${profileUrl}`;
 
       return await this.sendEmail({
         to: adminEmail,

@@ -398,6 +398,109 @@ assertEq(lookupVerticalByHost(undefined), "rfb",
 // Restore cache to real verticals/ for any later tests
 _resetConfigCacheForTests();
 
+// ─── EMAIL SERVICE (Phase 4.2) ────────────────────────────────────────
+// Verifies that brand strings ('Rett fra Bonden') and entity strings
+// ('matprodusenter') flow from verticals/rfb/config.yaml through the
+// lazy getters in EmailService into the rendered subject/HTML/text.
+//
+// For RFB the output must be byte-identical to pre-Phase-4.2 — the
+// trojan-horse principle. If any test here fails, real producers may
+// receive different email content than yesterday.
+import { EmailService } from "../src/services/email-service";
+
+// Phase 4.2 tests need the real RFB config loaded.
+{
+  const repoRoot = path2.resolve(__dirname, "..");
+  const realDir = path2.join(repoRoot, "verticals");
+  loadConfigsAtBoot({ dir: realDir });
+}
+
+// Capture-pattern: override sendEmail on a fresh instance to intercept
+// the EmailOptions that would have been dispatched. Avoids real SMTP
+// calls and lets us assert on the rendered content.
+function captureFromInvitation(): { subject: string; html: string; text: string } | null {
+  const svc = new EmailService();
+  let captured: { subject: string; html: string; text: string } | null = null;
+  // @ts-expect-error — overriding for test
+  svc.sendEmail = async (opts: { subject: string; htmlContent: string; textContent: string }) => {
+    captured = {
+      subject: opts.subject,
+      html: opts.htmlContent,
+      text: opts.textContent,
+    };
+    return { success: true, messageId: "test" };
+  };
+  // Fire and forget — sendClaimInvitation is async but we don't await tests' top-level
+  // The override resolves immediately, so by the time .then runs we'll have captured.
+  void svc.sendClaimInvitation(
+    "agent-test-123",
+    "ola@example.com",
+    "Ola Nordmann",
+    "Test Gård",
+    "https://rettfrabonden.com/produsent/test-gard",
+  );
+  return captured;
+}
+
+// Case 1: subject contains "Rett fra Bonden" (display_name from config)
+{
+  const out = captureFromInvitation();
+  assertTrue(out !== null, "email: invitation captured");
+  if (out) {
+    assertEq(
+      out.subject,
+      "Rett fra Bonden — Vi har funnet deg og dine produkter!",
+      "email: subject byte-identical for RFB",
+    );
+    assertTrue(out.html.includes("Rett fra Bonden"),
+      "email: HTML contains brand from config");
+    assertTrue(out.html.includes("matprodusenter"),
+      "email: HTML contains entity_plural_long from config");
+    assertTrue(out.text.includes("Rett fra Bonden"),
+      "email: text contains brand from config");
+    assertTrue(out.text.includes("matprodusenter"),
+      "email: text contains entity from config");
+  }
+}
+
+// Case 2: verification subject format
+{
+  const svc = new EmailService();
+  let captured: { subject: string } | null = null;
+  // @ts-expect-error
+  svc.sendEmail = async (opts: { subject: string }) => {
+    captured = { subject: opts.subject };
+    return { success: true, messageId: "test" };
+  };
+  void svc.sendVerificationCode("ola@example.com", "123456", "Test Gård");
+  assertEq(
+    captured ? captured.subject : "",
+    "Din bekreftelseskode for Test Gård på Rett fra Bonden",
+    "email: verification subject byte-identical",
+  );
+}
+
+// Case 3: confirmation subject format
+{
+  const svc = new EmailService();
+  let captured: { subject: string } | null = null;
+  // @ts-expect-error
+  svc.sendEmail = async (opts: { subject: string }) => {
+    captured = { subject: opts.subject };
+    return { success: true, messageId: "test" };
+  };
+  void svc.sendClaimConfirmation("ola@example.com", "Test Gård", "https://rettfrabonden.com/admin");
+  assertEq(
+    captured ? captured.subject : "",
+    "Gratulerer! Test Gård er nå ditt på Rett fra Bonden",
+    "email: confirmation subject byte-identical",
+  );
+}
+
+// Restore cache state for any subsequent tests (defensive)
+_resetConfigCacheForTests();
+
+
 
 // ── REPORT ────────────────────────────────────────────────────────────
 console.log(`\n${passed} passed, ${failed} failed\n`);
