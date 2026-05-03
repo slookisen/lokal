@@ -1,5 +1,6 @@
 import { Router, Request, Response } from "express";
 import { marketplaceRegistry } from "../services/marketplace-registry";
+import { getConfig } from "../config/vertical-config";
 import { AgentRegistrationSchema, AdminRegistrationSchema, DiscoveryQuerySchema } from "../models/marketplace";
 import { interactionLogger } from "../services/interaction-logger";
 import { knowledgeService, parseProductPrice, isProductHeader, isProductNoise } from "../services/knowledge-service";
@@ -185,7 +186,7 @@ function buildVCard(agentId: string): string | null {
   lines.push(`X-LOKAL-MAPS:https://www.google.com/maps/search/${encodeURIComponent(mapsParts.join(", "))}`);
   // Category tag helps contact apps group these
   const catNames = (agent.categories || []).map((c: string) => c.charAt(0).toUpperCase() + c.slice(1));
-  lines.push(`CATEGORIES:Rett fra Bonden,${catNames.length ? catNames.join(",") : "Norsk mat"},Produsent`);
+  lines.push(`CATEGORIES:${getConfig().display_name},${catNames.length ? catNames.join(",") : "Norsk mat"},Produsent`);
   // Producer page URL
   const profileSlug = slugify(agent.name);
   lines.push(`X-LOKAL-PROFILE:https://rettfrabonden.com/produsent/${profileSlug}`);

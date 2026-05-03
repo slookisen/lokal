@@ -532,6 +532,23 @@ import type { VerifierFinding } from "../src/types/run-envelope";
   assertEq(legacy.skipped, undefined, "verifier-finding: legacy finding without skipped still valid");
 }
 
+// ─── PHASE 4.3: discovery-service config integration ──────────────────
+// Smoke-test that getConfig() values are accessible and match RFB's
+// expected display name + entity name. Routes/discovery.ts and
+// routes/marketplace.ts use these values in template literals at
+// request-time; if config-load failed the requests would 500.
+{
+  const repoRoot = path2.resolve(__dirname, "..");
+  const realDir = path2.join(repoRoot, "verticals");
+  _resetConfigCacheForTests();
+  loadConfigsAtBoot({ dir: realDir });
+  const cfg = getConfig("rfb");
+  assertEq(cfg.display_name, "Rett fra Bonden", "phase4.3: brand snapshot");
+  assertEq(cfg.domain_dictionary.entity_plural_long, "matprodusenter", "phase4.3: entity snapshot");
+  assertEq(cfg.domain, "rettfrabonden.com", "phase4.3: domain snapshot for mailto:kontakt@${cfg.domain}");
+  _resetConfigCacheForTests();
+}
+
 
 
 

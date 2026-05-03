@@ -15,6 +15,7 @@ import { Router, Request, Response } from "express";
 import { marketplaceRegistry } from "../services/marketplace-registry";
 import { knowledgeService } from "../services/knowledge-service";
 import { slugify } from "../utils/slug";
+import { getConfig } from "../config/vertical-config";
 
 const router = Router();
 const BASE_URL = process.env.BASE_URL || "https://rettfrabonden.com";
@@ -50,15 +51,15 @@ router.get("/llms.txt", (_req: Request, res: Response) => {
 
     res.header("Content-Type", "text/plain; charset=utf-8");
     res.header("Cache-Control", "public, max-age=3600");
-    res.send(`# Rett fra Bonden — Lokal mat i Norge
+    res.send(`# ${getConfig().display_name} — Lokal mat i Norge
 
-> Norges første agent-til-agent (A2A) markedsplass for lokal mat. Vi kobler forbrukere direkte med ${agents.length}+ lokale matprodusenter — gårder, bondensmarkeder, REKO-ringer, gårdsbutikker og kooperativer over hele Norge. Ingen mellomledd, ingen reklame, bare ekte mat rett fra bonden.
+> Norges første agent-til-agent (A2A) markedsplass for lokal mat. Vi kobler forbrukere direkte med ${agents.length}+ lokale ${getConfig().domain_dictionary.entity_plural_long} — gårder, bondensmarkeder, REKO-ringer, gårdsbutikker og kooperativer over hele Norge. Ingen mellomledd, ingen reklame, bare ekte mat rett fra bonden.
 
 > Norway's first agent-to-agent (A2A) marketplace for local food. We connect consumers directly with ${agents.length}+ local food producers — farms, farmers' markets, REKO rings, farm shops, and cooperatives across Norway.
 
 ## Hva er dette?
 
-Rett fra Bonden er en åpen plattform som lar AI-agenter finne, sammenligne og kontakte lokale matprodusenter i Norge. Plattformen støtter tre protokoller: A2A (agent-til-agent), MCP (Model Context Protocol), og REST API.
+${getConfig().display_name} er en åpen plattform som lar AI-agenter finne, sammenligne og kontakte lokale ${getConfig().domain_dictionary.entity_plural_long} i Norge. Plattformen støtter tre protokoller: A2A (agent-til-agent), MCP (Model Context Protocol), og REST API.
 
 ## Nøkkeltall
 
@@ -86,7 +87,7 @@ ${topCats.map(([cat, count]) => `- ${cat} (${count} produsenter)`).join("\n")}
 
 ## For mennesker
 
-- [Forsiden](${BASE_URL}/): Søk og utforsk lokale matprodusenter
+- [Forsiden](${BASE_URL}/): Søk og utforsk lokale ${getConfig().domain_dictionary.entity_plural_long}
 - [Om oss](${BASE_URL}/om): Historien bak plattformen
 - [Teknologi](${BASE_URL}/teknologi): Hvordan A2A-teknologien fungerer
 - [Personvern](${BASE_URL}/personvern): Ingen cookies, ingen sporing
@@ -119,9 +120,9 @@ router.get("/llms-full.txt", (_req: Request, res: Response) => {
   try {
     const agents = marketplaceRegistry.getActiveAgents();
     const lines: string[] = [
-      `# Rett fra Bonden — Komplett produsentoversikt`,
+      `# ${getConfig().display_name} — Komplett produsentoversikt`,
       ``,
-      `> ${agents.length} lokale matprodusenter i Norge. Oppdatert ${new Date().toISOString().split("T")[0]}.`,
+      `> ${agents.length} lokale ${getConfig().domain_dictionary.entity_plural_long} i Norge. Oppdatert ${new Date().toISOString().split("T")[0]}.`,
       ``,
       `## Alle produsenter`,
       ``,
@@ -194,7 +195,7 @@ router.get("/.well-known/mcp/server-card.json", (_req: Request, res: Response) =
     version: "1.0",
     protocolVersion: "2025-06-18",
     serverInfo: {
-      name: "Rett fra Bonden — Lokal Mat MCP",
+      name: `${getConfig().display_name} — Lokal Mat MCP`,
       version: "1.0.0",
       description: "MCP server for local food in Norway. Search and discover " +
         `${stats.totalAgents || "1,290+"}` +
@@ -274,7 +275,7 @@ router.get("/.well-known/ai-plugin.json", (_req: Request, res: Response) => {
   res.header("X-Content-Type-Options", "nosniff");
   res.json({
     schema_version: "v1",
-    name_for_human: "Rett fra Bonden",
+    name_for_human: `${getConfig().display_name}`,
     name_for_model: "rettfrabonden",
     description_for_human:
       "Finn lokalprodusert mat i Norge. Søk blant gårder, markeder, " +
@@ -314,7 +315,7 @@ function serveApiIndex(_req: Request, res: Response): void {
   res.header("Cache-Control", "public, max-age=3600");
   res.header("X-Content-Type-Options", "nosniff");
   res.json({
-    name: "Rett fra Bonden API",
+    name: `${getConfig().display_name} API`,
     version: "v1",
     description:
       "REST API for Norwegian local food producers. " +
@@ -401,7 +402,7 @@ A2A-endpoint: ${BASE_URL}/a2a
 API-base: ${BASE_URL}/api/marketplace
 
 # Capabilities
-Name: Rett fra Bonden
+Name: ${getConfig().display_name}
 Description: Local food marketplace with ${agents.length}+ producers in Norway
 Languages: no, en
 Categories: food, marketplace, local-commerce, organic, farm-direct
@@ -428,7 +429,7 @@ router.get("/.well-known/agents.json", (_req: Request, res: Response) => {
   res.header("Cache-Control", "public, max-age=3600");
   res.json({
     schema_version: "1.0",
-    name: "Rett fra Bonden",
+    name: `${getConfig().display_name}`,
     description: `Local food marketplace with ${agents.length}+ producers in Norway`,
     url: BASE_URL,
     capabilities: {
@@ -465,7 +466,7 @@ router.get("/openapi.json", (_req: Request, res: Response) => {
   res.json({
     openapi: "3.1.0",
     info: {
-      title: "Rett fra Bonden — Local Food API",
+      title: `${getConfig().display_name} — Local Food API`,
       version: "1.0.0",
       description: "REST API for discovering local food producers in Norway. " +
         "Supports search, discovery, registration, and agent-to-agent communication.",
@@ -632,9 +633,9 @@ router.get(["/privacy", "/privacy-policy", "/personvern"], (_req: Request, res: 
 <html lang="no">
 <head>
 <meta charset="utf-8">
-<title>Personvern / Privacy — Rett fra Bonden</title>
+<title>Personvern / Privacy — ${getConfig().display_name}</title>
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<meta name="description" content="Privacy policy for Rett fra Bonden (rettfrabonden.com) — A2A marketplace for local food in Norway.">
+<meta name="description" content="Privacy policy for ${getConfig().display_name} (rettfrabonden.com) — A2A marketplace for local food in Norway.">
 <style>
   body { font-family: system-ui, -apple-system, sans-serif; max-width: 760px; margin: 2rem auto; padding: 0 1rem; color: #1a1a1a; line-height: 1.6; }
   h1 { border-bottom: 2px solid #2d5016; padding-bottom: 0.3rem; }
@@ -651,8 +652,8 @@ router.get(["/privacy", "/privacy-policy", "/personvern"], (_req: Request, res: 
 <h1>Personvern</h1>
 <p><strong>Sist oppdatert:</strong> 20. april 2026</p>
 
-<p>Rett fra Bonden (rettfrabonden.com) er en agent-til-agent-markedsplass som hjelper AI-agenter
-med å finne lokale matprodusenter i Norge. Vi respekterer personvernet til produsenter, brukere
+<p>${getConfig().display_name} (rettfrabonden.com) er en agent-til-agent-markedsplass som hjelper AI-agenter
+med å finne lokale ${getConfig().domain_dictionary.entity_plural_long} i Norge. Vi respekterer personvernet til produsenter, brukere
 og AI-agenter som samhandler med plattformen.</p>
 
 <h2>Hva vi samler inn</h2>
@@ -682,11 +683,11 @@ lagres så lenge produsenten er aktiv. Produsenter kan når som helst be om å b
 
 <h2>Rettighetene dine</h2>
 <p>Er du produsent og ønsker å bli fjernet fra katalogen, eller ønsker å korrigere informasjon om
-deg selv? Send en e-post til <a href="mailto:kontakt@rettfrabonden.com">kontakt@rettfrabonden.com</a>.
+deg selv? Send en e-post til <a href="mailto:kontakt@${getConfig().domain}">kontakt@${getConfig().domain}</a>.
 Vi svarer innen rimelig tid og fjerner/oppdaterer oppføringen.</p>
 
 <h2>Kontakt</h2>
-<p>E-post: <a href="mailto:kontakt@rettfrabonden.com">kontakt@rettfrabonden.com</a><br>
+<p>E-post: <a href="mailto:kontakt@${getConfig().domain}">kontakt@${getConfig().domain}</a><br>
 Operatør: Daniel Fredriksen, Norge.</p>
 
 <hr>
@@ -694,7 +695,7 @@ Operatør: Daniel Fredriksen, Norge.</p>
 <h1 id="en">Privacy Policy</h1>
 <p><strong>Last updated:</strong> 20 April 2026</p>
 
-<p>Rett fra Bonden (rettfrabonden.com) is an agent-to-agent marketplace that helps AI agents find
+<p>${getConfig().display_name} (rettfrabonden.com) is an agent-to-agent marketplace that helps AI agents find
 local food producers in Norway. We respect the privacy of producers, end-users, and AI agents that
 interact with the platform.</p>
 
@@ -725,15 +726,15 @@ records is retained while the producer is active. Producers may request removal 
 
 <h2>Your rights</h2>
 <p>Are you a producer who wants to be removed from the directory or correct information about you?
-Email <a href="mailto:kontakt@rettfrabonden.com">kontakt@rettfrabonden.com</a>. We respond promptly
+Email <a href="mailto:kontakt@${getConfig().domain}">kontakt@${getConfig().domain}</a>. We respond promptly
 and remove or update the entry.</p>
 
 <h2>Contact</h2>
-<p>Email: <a href="mailto:kontakt@rettfrabonden.com">kontakt@rettfrabonden.com</a><br>
+<p>Email: <a href="mailto:kontakt@${getConfig().domain}">kontakt@${getConfig().domain}</a><br>
 Operator: Daniel Fredriksen, Norway.</p>
 
 <footer>
-  Rett fra Bonden · <a href="/">rettfrabonden.com</a> ·
+  ${getConfig().display_name} · <a href="/">rettfrabonden.com</a> ·
   <a href="/.well-known/agent-card.json">Agent Card</a> ·
   <a href="https://github.com/slookisen/lokal">Source</a>
 </footer>
@@ -755,9 +756,9 @@ router.get(["/terms", "/terms-of-service", "/tos", "/vilkar"], (_req: Request, r
 <html lang="no">
 <head>
 <meta charset="utf-8">
-<title>Vilkår / Terms of Service — Rett fra Bonden</title>
+<title>Vilkår / Terms of Service — ${getConfig().display_name}</title>
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<meta name="description" content="Terms of Service for Rett fra Bonden (rettfrabonden.com) — A2A marketplace for local food in Norway.">
+<meta name="description" content="Terms of Service for ${getConfig().display_name} (rettfrabonden.com) — A2A marketplace for local food in Norway.">
 <link rel="icon" href="/favicon.svg" type="image/svg+xml">
 <link rel="icon" href="/favicon.ico" sizes="any">
 <style>
@@ -776,12 +777,12 @@ router.get(["/terms", "/terms-of-service", "/tos", "/vilkar"], (_req: Request, r
 <h1>Vilkår for bruk</h1>
 <p><strong>Sist oppdatert:</strong> 20. april 2026</p>
 
-<p>Velkommen til Rett fra Bonden (rettfrabonden.com). Disse vilkårene gjelder for alle som bruker
+<p>Velkommen til ${getConfig().display_name} (rettfrabonden.com). Disse vilkårene gjelder for alle som bruker
 plattformen — enten du er sluttbruker, produsent, eller en AI-agent som kaller våre MCP- eller A2A-endepunkter.
 Ved å bruke tjenesten aksepterer du vilkårene.</p>
 
 <h2>1. Hva tjenesten er</h2>
-<p>Rett fra Bonden er et oppdagelseslag (discovery layer) for lokal mat i Norge. Vi eksponerer en
+<p>${getConfig().display_name} er et oppdagelseslag (discovery layer) for lokal mat i Norge. Vi eksponerer en
 katalog med produsenter gjennom MCP (Model Context Protocol), A2A JSON-RPC og en REST-API slik at
 AI-agenter og mennesker kan finne gårder, gårdsbutikker, REKO-ringer, bondens markeder og samvirker.
 Vi er <em>ikke</em> en butikk eller markedsplass som gjennomfører transaksjoner.</p>
@@ -809,12 +810,12 @@ reiser til en produsent eller legger inn en bestilling, anbefaler vi at du verif
 direkte med produsenten.</p>
 
 <h2>5. Ansvarsbegrensning</h2>
-<p>Rett fra Bonden er ikke ansvarlig for transaksjoner, leveranser, produktkvalitet eller
+<p>${getConfig().display_name} er ikke ansvarlig for transaksjoner, leveranser, produktkvalitet eller
 uenigheter mellom kjøpere og produsenter. Vi tilrettelegger oppdagelse — vi er ikke part i kjøpet.</p>
 
 <h2>6. Produsentrettigheter</h2>
 <p>Er du produsent og ønsker å oppdatere, fjerne eller overta din egen oppføring? Kontakt oss
-på <a href="mailto:kontakt@rettfrabonden.com">kontakt@rettfrabonden.com</a>. Se også
+på <a href="mailto:kontakt@${getConfig().domain}">kontakt@${getConfig().domain}</a>. Se også
 <a href="/personvern">personvernerklæringen</a>.</p>
 
 <h2>7. Endringer</h2>
@@ -825,7 +826,7 @@ endring regnes som aksept.</p>
 <p>Disse vilkårene reguleres av norsk rett. Tvister skal løses ved Daniels alminnelige verneting.</p>
 
 <h2>9. Kontakt</h2>
-<p>E-post: <a href="mailto:kontakt@rettfrabonden.com">kontakt@rettfrabonden.com</a><br>
+<p>E-post: <a href="mailto:kontakt@${getConfig().domain}">kontakt@${getConfig().domain}</a><br>
 Operatør: Daniel Fredriksen, Norge.</p>
 
 <hr>
@@ -833,12 +834,12 @@ Operatør: Daniel Fredriksen, Norge.</p>
 <h1 id="en">Terms of Service</h1>
 <p><strong>Last updated:</strong> 20 April 2026</p>
 
-<p>Welcome to Rett fra Bonden (rettfrabonden.com). These terms apply to everyone who uses the
+<p>Welcome to ${getConfig().display_name} (rettfrabonden.com). These terms apply to everyone who uses the
 platform — end-users, producers, and AI agents calling our MCP or A2A endpoints. By using the
 service you accept these terms.</p>
 
 <h2>1. What the service is</h2>
-<p>Rett fra Bonden is a discovery layer for local food in Norway. We expose a directory of producers
+<p>${getConfig().display_name} is a discovery layer for local food in Norway. We expose a directory of producers
 through MCP (Model Context Protocol), A2A JSON-RPC, and a REST API so that AI agents and humans can
 find farms, farm shops, REKO rings, farmers' markets, and cooperatives. We are <em>not</em> a store
 or a marketplace that processes transactions.</p>
@@ -866,12 +867,12 @@ Before travelling to a producer or placing an order, we recommend verifying deta
 producer.</p>
 
 <h2>5. Limitation of liability</h2>
-<p>Rett fra Bonden is not liable for transactions, deliveries, product quality, or disputes between
+<p>${getConfig().display_name} is not liable for transactions, deliveries, product quality, or disputes between
 buyers and producers. We facilitate discovery — we are not a party to the purchase.</p>
 
 <h2>6. Producer rights</h2>
 <p>Are you a producer who wants to update, remove, or claim your own listing? Contact us at
-<a href="mailto:kontakt@rettfrabonden.com">kontakt@rettfrabonden.com</a>. See also the
+<a href="mailto:kontakt@${getConfig().domain}">kontakt@${getConfig().domain}</a>. See also the
 <a href="/privacy">privacy policy</a>.</p>
 
 <h2>7. Changes</h2>
@@ -882,11 +883,11 @@ changes counts as acceptance.</p>
 <p>These terms are governed by Norwegian law. Disputes shall be resolved at Daniel's ordinary venue.</p>
 
 <h2>9. Contact</h2>
-<p>Email: <a href="mailto:kontakt@rettfrabonden.com">kontakt@rettfrabonden.com</a><br>
+<p>Email: <a href="mailto:kontakt@${getConfig().domain}">kontakt@${getConfig().domain}</a><br>
 Operator: Daniel Fredriksen, Norway.</p>
 
 <footer>
-  Rett fra Bonden · <a href="/">rettfrabonden.com</a> ·
+  ${getConfig().display_name} · <a href="/">rettfrabonden.com</a> ·
   <a href="/privacy">Privacy</a> ·
   <a href="/.well-known/agent-card.json">Agent Card</a> ·
   <a href="https://github.com/slookisen/lokal">Source</a>
