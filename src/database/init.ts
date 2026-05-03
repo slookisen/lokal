@@ -674,6 +674,57 @@ function initSchema(db: Database.Database): void {
     // Column already exists
   }
 
+
+  // ─── Phase 4.6a — vertical_id column on per-vertical tables ───
+  // Multi-vertical groundwork: every per-tenant row belongs to exactly
+  // one vertical. Default 'rfb' on existing rows means RFB is unaffected.
+  // Phase 4.6b will start filtering queries by vertical_id; until then
+  // this column is dormant data.
+  //
+  // SQLite supports NOT NULL DEFAULT on ALTER TABLE — existing rows
+  // backfill automatically. Note: we don't add the column in CREATE TABLE
+  // because that requires editing 22 multi-line statements with embedded
+  // CHECK/DEFAULT clauses (regex-prone). The ALTER block below runs every
+  // boot and is idempotent (try/catch on duplicate-column).
+  for (const table of [
+    "agents",
+    "agent_blocklist",
+    "agent_claims",
+    "agent_knowledge",
+    "agent_metrics",
+    "analytics_agent_views",
+    "analytics_page_views",
+    "analytics_queries",
+    "chain_prices",
+    "conversations",
+    "crm_actions",
+    "crm_contacts",
+    "crm_messages",
+    "crm_outbox",
+    "crm_threads",
+    "interactions",
+    "listings",
+    "magic_links",
+    "messages",
+    "platform_triggers",
+    "producer_observations",
+    "tasks",
+  ]) {
+    try {
+      db.exec(`ALTER TABLE ${table} ADD COLUMN vertical_id TEXT NOT NULL DEFAULT 'rfb'`);
+    } catch {
+      // Column already exists — expected after first migration
+    }
+  }
+
+  // Index for the hottest table (agents). Other tables get indexes
+  // when Phase 4.6b starts filtering on them.
+  try {
+    db.exec(`CREATE INDEX IF NOT EXISTS idx_agents_vertical_id ON agents(vertical_id)`);
+  } catch {
+    // Index already exists
+  }
+
   // ─── One-time cleanup: reset all test verifications ──────────
   // No real sellers have claimed yet — all is_verified=1 entries
   // are from development/testing. Reset them to 0 and clean claims.
