@@ -796,6 +796,51 @@ router.get("/agents/:id/knowledge", (req: Request, res: Response) => {
   res.json({ success: true, data: knowledge });
 });
 
+// ─── POST /admin/agents/:id/curated-fields — Set or clear field lock (Phase 4.9a) ───
+// Used by rfb-customer-service when applying customer-requested changes.
+// Body: { "field": "about", "meta": { locked_at, by, thread_id, request_summary } }
+// To unlock: send { "field": "about", "meta": null }
+//
+// Auth: admin-key only (CS-agent uses this).
+router.post("/admin/agents/:id/curated-fields", (req: Request, res: Response) => {
+  const adminKeyHeader = (req.headers["x-admin-key"] as string) || "";
+  const expectedAdminKey = getAdminKey();
+  if (!expectedAdminKey || adminKeyHeader !== expectedAdminKey) {
+    res.status(403).json({ success: false, error: "Admin key required" });
+    return;
+  }
+  const agentId = req.params.id as string;
+  const { field, meta } = req.body as { field?: unknown; meta?: unknown };
+  if (typeof field !== "string" || !field) {
+    res.status(400).json({ success: false, error: "field (string) required" });
+    return;
+  }
+  if (meta !== null && (typeof meta !== "object" || !meta)) {
+    res.status(400).json({ success: false, error: "meta must be object or null" });
+    return;
+  }
+  if (meta && typeof (meta as Record<string, unknown>).locked_at !== "string") {
+    res.status(400).json({ success: false, error: "meta.locked_at (ISO string) required when meta is set" });
+    return;
+  }
+  if (meta && typeof (meta as Record<string, unknown>).by !== "string") {
+    res.status(400).json({ success: false, error: "meta.by (string) required when meta is set" });
+    return;
+  }
+  try {
+    knowledgeService.setCuratedFieldLock(agentId, field, meta as any);
+    res.json({
+      success: true,
+      agent_id: agentId,
+      field,
+      locked: meta !== null,
+      curated_fields: knowledgeService.getCuratedFields(agentId),
+    });
+  } catch (err: any) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
 // ─── GET /knowledge/stats — Knowledge layer statistics ──────
 
 router.get("/knowledge/stats", (_req: Request, res: Response) => {

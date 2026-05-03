@@ -48,6 +48,19 @@ export interface AgentKnowledge {
   lastEnrichedAt?: string;
   ownerUpdatedAt?: string;
   preferences: Record<string, any>;
+  /** Phase 4.9a — fields that are customer-curated (set by CS-agent on
+   *  customer request). Enrichment must check this and skip locked fields
+   *  to avoid overwriting customer's preferred content. */
+  curatedFields?: Record<string, CuratedFieldMeta>;
+}
+
+/** Per-field lock metadata. Set by rfb-customer-service when applying
+ *  a customer-requested change. Enrichment-agent reads and skips. */
+export interface CuratedFieldMeta {
+  locked_at: string;       // ISO 8601 UTC
+  by: string;              // agent that set the lock (e.g. "rfb-customer-service")
+  thread_id?: string;      // Gmail thread-id (audit trail)
+  request_summary?: string; // 1-line: "Eirin (daglig leder) ba om ny beskrivelse"
 }
 
 export interface SeasonalProduct {
@@ -201,7 +214,7 @@ class KnowledgeService {
       delivery_options, google_rating, google_review_count, tripadvisor_rating,
       external_reviews, external_links, images, seasonality, delivery_radius, min_order_value,
       data_source, auto_sources, last_enriched_at,
-      owner_updated_at, preferences FROM agent_knowledge WHERE agent_id = ?`).get(agentId) as any;
+      owner_updated_at, preferences, curated_fields FROM agent_knowledge WHERE agent_id = ?`).get(agentId) as any;
     if (!row) return null;
     return this.rowToKnowledge(row);
   }
@@ -704,7 +717,43 @@ class KnowledgeService {
       lastEnrichedAt: row.last_enriched_at,
       ownerUpdatedAt: row.owner_updated_at,
       preferences: row.preferences ? JSON.parse(row.preferences) : {},
+      curatedFields: row.curated_fields ? JSON.parse(row.curated_fields) : {},
     };
+  }
+
+  /** Phase 4.9a — set or unset a curated-field lock.
+   *  Used by rfb-customer-service when applying customer-requested changes. */
+  setCuratedFieldLock(
+    agentId: string,
+    field: string,
+    meta: CuratedFieldMeta | null,
+  ): void {
+    const db = getDb();
+    const row = db.prepare("SELECT curated_fields FROM agent_knowledge WHERE agent_id = ?").get(agentId) as { curated_fields?: string } | undefined;
+    if (!row) return;
+    const current: Record<string, CuratedFieldMeta> = row.curated_fields
+      ? JSON.parse(row.curated_fields)
+      : {};
+    if (meta === null) {
+      delete current[field];
+    } else {
+      current[field] = meta;
+    }
+    db.prepare("UPDATE agent_knowledge SET curated_fields = ? WHERE agent_id = ?")
+      .run(JSON.stringify(current), agentId);
+  }
+
+  /** Phase 4.9a — get current curated-field locks (used by enrichment-agent
+   *  before PUT, and by orchestrator for KPI-reporting). */
+  getCuratedFields(agentId: string): Record<string, CuratedFieldMeta> {
+    const db = getDb();
+    const row = db.prepare("SELECT curated_fields FROM agent_knowledge WHERE agent_id = ?").get(agentId) as { curated_fields?: string } | undefined;
+    if (!row || !row.curated_fields) return {};
+    try {
+      return JSON.parse(row.curated_fields) as Record<string, CuratedFieldMeta>;
+    } catch {
+      return {};
+    }
   }
 }
 

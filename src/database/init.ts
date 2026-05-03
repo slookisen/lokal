@@ -725,6 +725,28 @@ function initSchema(db: Database.Database): void {
     // Index already exists
   }
 
+
+  // ─── Phase 4.9a — agent_knowledge.curated_fields ──────────────
+  // Customer-curated content protection: when CS-agent applies a
+  // customer-requested change (about-text, opening hours, contact info),
+  // the field is locked here. Enrichment-agent must check curated_fields
+  // before PUT and skip locked fields — otherwise customer's preferred
+  // text gets overwritten on next crawl.
+  //
+  // Schema: JSON object, keyed by field name.
+  //   {
+  //     "about": {"locked_at": "ISO", "by": "rfb-customer-service",
+  //               "thread_id": "<gmail-thread>", "request_summary": "..."},
+  //     "opening_hours": {...}
+  //   }
+  // Empty {} = no locks (default for all existing rows).
+  try {
+    db.exec(`ALTER TABLE agent_knowledge ADD COLUMN curated_fields TEXT NOT NULL DEFAULT '{}'`);
+  } catch {
+    // Column already exists — expected after first migration
+  }
+
+
   // ─── One-time cleanup: reset all test verifications ──────────
   // No real sellers have claimed yet — all is_verified=1 entries
   // are from development/testing. Reset them to 0 and clean claims.
