@@ -34,6 +34,35 @@ const AgentConfigSchema = z.object({
   cap_per_run: z.number().int().positive().optional(),
 });
 
+/**
+ * Per-agent KPI-tresholds. Optional — kun definert for agenter
+ * orchestrator skal måle. Verdier som ikke er satt = ingen advarsel
+ * fra orchestrator.
+ */
+const KpiConfigSchema = z.object({
+  marketing: z.object({
+    pool_depth_min: z.number().int().nonnegative().optional(),
+    reply_rate_min_pct: z.number().nonnegative().optional(),
+    strict_own_domain_min_pct: z.number().nonnegative().optional(),
+  }).optional(),
+  enrichment: z.object({
+    cap_utilization_min_pct: z.number().nonnegative().optional(),
+    new_agents_per_week_min: z.number().int().nonnegative().optional(),
+  }).optional(),
+  visibility: z.object({
+    well_known_uptime_min_pct: z.number().nonnegative().optional(),
+    ai_bot_visits_min_per_day: z.number().int().nonnegative().optional(),
+  }).optional(),
+  customer_service: z.object({
+    response_within_hours_max: z.number().nonnegative().optional(),
+    p0_open_max_count: z.number().int().nonnegative().optional(),
+  }).optional(),
+  platform: z.object({
+    verifier_backlog_max_pct: z.number().nonnegative().optional(),
+    failed_run_max_per_day: z.number().int().nonnegative().optional(),
+  }).optional(),
+}).optional();
+
 const VerticalConfigSchema = z.object({
   vertical_id: z.string().min(1).regex(/^[a-z][a-z0-9_-]*$/,
     "vertical_id må være lowercase, starte med bokstav, kun [a-z0-9_-]"),
@@ -52,10 +81,12 @@ const VerticalConfigSchema = z.object({
     fly_app: z.string().min(1),
     resend_domain: z.string().min(1),
   }),
+  kpis: KpiConfigSchema,
 });
 
 export type VerticalConfig = z.infer<typeof VerticalConfigSchema>;
 export type AgentConfig = z.infer<typeof AgentConfigSchema>;
+export type KpiConfig = z.infer<typeof KpiConfigSchema>;
 
 // ─── Internals ──────────────────────────────────────────────────
 

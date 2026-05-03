@@ -50,3 +50,24 @@ connectors:
   github_repo: slookisen/lokal
   fly_app: lokal
   resend_domain: rettfrabonden.com
+
+# Phase 4.8 KPIs — orchestrator overvåker disse hver kjøring og eskalerer
+# ved avvik. Tresholds tunet til faktisk RFB-data 2026-05-03. Reevaluer
+# etter 30 dager med v2-marketing-data.
+kpis:
+  marketing:
+    pool_depth_min: 30          # uncontacted producer-leads minimum
+    reply_rate_min_pct: 2.0     # rolling 14-batch (justert ned fra 3.0 — v2 trenger tid)
+    strict_own_domain_min_pct: 85
+  enrichment:
+    cap_utilization_min_pct: 80  # bruk minst 80% av cap_per_run=30
+    new_agents_per_week_min: 30
+  visibility:
+    well_known_uptime_min_pct: 99
+    ai_bot_visits_min_per_day: 5
+  customer_service:
+    response_within_hours_max: 24
+    p0_open_max_count: 0          # ingen P0 skal være ulest
+  platform:
+    verifier_backlog_max_pct: 25
+    failed_run_max_per_day: 5     # justert opp fra 3 — 9 agenter, realistisk margin

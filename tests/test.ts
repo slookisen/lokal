@@ -614,6 +614,27 @@ import type { VerifierFinding } from "../src/types/run-envelope";
   _resetConfigCacheForTests();
 }
 
+// ─── PHASE 4.8: KPI-config loaded from verticals/rfb/config.yaml ────────
+{
+  _resetConfigCacheForTests();
+  const repoRoot = path2.resolve(__dirname, "..");
+  const realDir = path2.join(repoRoot, "verticals");
+  loadConfigsAtBoot({ dir: realDir });
+  const cfg = getConfig("rfb");
+  assertTrue(cfg.kpis !== undefined, "phase4.8: rfb has kpis section");
+  if (cfg.kpis) {
+    assertEq(cfg.kpis.marketing?.pool_depth_min, 30, "phase4.8: marketing.pool_depth_min");
+    assertEq(cfg.kpis.marketing?.reply_rate_min_pct, 2.0, "phase4.8: marketing.reply_rate_min_pct (justert til 2.0)");
+    assertEq(cfg.kpis.platform?.failed_run_max_per_day, 5, "phase4.8: platform.failed_run_max_per_day (justert til 5)");
+    assertEq(cfg.kpis.customer_service?.p0_open_max_count, 0, "phase4.8: cs.p0_open_max_count");
+  }
+  // Test-vertical may NOT have kpis — that's allowed (optional)
+  const testCfg = getConfig("test");
+  assertTrue(testCfg.kpis === undefined || testCfg.kpis !== undefined,
+    "phase4.8: kpis is optional (test-vertical can have or not have it)");
+  _resetConfigCacheForTests();
+}
+
 
 
 
