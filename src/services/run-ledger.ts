@@ -227,9 +227,9 @@ export function recordVerifierResult(args: {
   state: VerifierState;
   findings: VerifierFinding[];
   db?: Database.Database;
-}): void {
+}): { rowsAffected: number } {
   const conn = args.db ?? getDb();
-  conn
+  const info = conn
     .prepare(
       `UPDATE runs
        SET verifier_state = ?,
@@ -243,6 +243,11 @@ export function recordVerifierResult(args: {
       JSON.stringify(args.findings),
       args.run_id,
     );
+  // Phase 4.10: caller can detect run-not-found (silent UPDATE no-op was the
+  // original verifier-write-bug — POST returned 200 success even when run_id
+  // didn't match any row, so the verifier thought it had recorded findings
+  // but nothing persisted).
+  return { rowsAffected: info.changes };
 }
 
 /**

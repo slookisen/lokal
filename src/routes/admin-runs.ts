@@ -231,12 +231,29 @@ router.post("/:run_id/verify", (req: Request, res: Response) => {
   }
 
   try {
-    recordVerifierResult({
+    const { rowsAffected } = recordVerifierResult({
       run_id: runId,
       state: body.state as VerifierState,
       findings: body.findings as VerifierFinding[],
     });
-    res.json({ success: true, run_id: runId, state: body.state });
+    // Phase 4.10 — fail loud on run-not-found instead of silent 200. Closes
+    // the verifier-write-bug where POST returned success even when run_id
+    // typo'd or the run was deleted, leaving the verifier convinced it had
+    // persisted findings that never landed.
+    if (rowsAffected === 0) {
+      res.status(404).json({
+        error: "Run not found",
+        reason: `no run with run_id=${runId}; UPDATE matched 0 rows`,
+        run_id: runId,
+      });
+      return;
+    }
+    res.json({
+      success: true,
+      run_id: runId,
+      state: body.state,
+      findings_count: (body.findings as unknown[]).length,
+    });
   } catch (err: any) {
     res.status(500).json({ error: "Verify failed", detail: err.message });
   }

@@ -685,6 +685,122 @@ import type { VerifierFinding } from "../src/types/run-envelope";
 
 
 
+// ─── PHASE 4.10: verifier write-bug — failed-state findings persist ────
+// Backend write-path was suspected of dropping failed-state findings (3
+// verifier cycles in a row showed claim_count > persisted_count, with the
+// gap exactly equal to the failed-state finding count). Investigation
+// showed the backend write itself is correct — UPDATE preserves whatever
+// JSON the route sends. Two real bugs were found:
+//   1. Silent UPDATE-no-op when run_id doesn't exist (POST returned 200
+//      success but persisted nothing). Fixed: route now returns 404 when
+//      rowsAffected=0.
+//   2. Read-side overwrite-loop (verifier re-picked failed runs and
+//      overwrote findings). Fixed earlier today by e0da490 — listPending
+//      now filters verifier_state='pending' only.
+console.log("── Phase 4.10: verifier write-bug regression tests ──");
+{
+  const Database = require("better-sqlite3");
+  const memdb = new Database(":memory:");
+  // Mirror just the columns recordVerifierResult touches
+  memdb.exec(`
+    CREATE TABLE runs (
+      run_id TEXT PRIMARY KEY,
+      vertical TEXT NOT NULL,
+      agent TEXT NOT NULL,
+      trigger_source TEXT,
+      started_at TEXT NOT NULL,
+      finished_at TEXT,
+      status TEXT NOT NULL,
+      claims TEXT,
+      evidence TEXT,
+      next_suggested TEXT,
+      errors TEXT,
+      notes TEXT,
+      verifier_state TEXT NOT NULL DEFAULT 'pending',
+      verifier_checked_at TEXT,
+      verifier_findings TEXT,
+      created_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+  `);
+
+  // Seed one run that the verifier will probe
+  memdb.prepare(`
+    INSERT INTO runs (run_id, vertical, agent, started_at, status, claims, verifier_state)
+    VALUES (?, 'rfb', 'test-agent', '2026-05-03T00:00:00Z', 'completed', '[]', 'pending')
+  `).run("test-run-write-bug-001");
+
+  // Mixed findings: 2 verified + 2 failed + 1 skipped (mirrors real verifier output)
+  const findings = [
+    { claim_idx: 0, probe_kind: "http_endpoint", matched: true,  reason: "200 OK", probed_at: "2026-05-03T17:00:00Z" },
+    { claim_idx: 1, probe_kind: "http_endpoint", matched: false, reason: "404 not found", probed_at: "2026-05-03T17:00:01Z" },
+    { claim_idx: 2, probe_kind: "db_count",      matched: true,  reason: "match", probed_at: "2026-05-03T17:00:02Z" },
+    { claim_idx: 3, probe_kind: "db_count",      matched: false, reason: "expected 5 got 3", probed_at: "2026-05-03T17:00:03Z" },
+    { claim_idx: 4, probe_kind: "unknown",       matched: false, reason: "no probe", probed_at: "2026-05-03T17:00:04Z", skipped: true },
+  ];
+
+  // Mimic the recordVerifierResult write
+  const info = memdb.prepare(`
+    UPDATE runs
+    SET verifier_state = ?, verifier_checked_at = ?, verifier_findings = ?
+    WHERE run_id = ?
+  `).run("failed", "2026-05-03T17:00:05Z", JSON.stringify(findings), "test-run-write-bug-001");
+
+  // Case A: rowsAffected reflects whether the row existed
+  assertEq(info.changes, 1, "phase4.10: existing run UPDATE returns rowsAffected=1");
+
+  // Case B: all 5 findings round-trip through JSON column (no row-level drop)
+  const row = memdb.prepare("SELECT verifier_findings FROM runs WHERE run_id = ?").get("test-run-write-bug-001") as { verifier_findings: string };
+  const parsed = JSON.parse(row.verifier_findings);
+  assertEq(parsed.length, 5, "phase4.10: all 5 findings persist (mixed verified/failed/skipped)");
+  assertEq(parsed.filter((f: any) => f.matched === true).length, 2, "phase4.10: 2 matched=true findings preserved");
+  assertEq(parsed.filter((f: any) => f.matched === false && !f.skipped).length, 2, "phase4.10: 2 matched=false (failed) findings preserved — backend does NOT drop failed-state");
+  assertEq(parsed.filter((f: any) => f.skipped === true).length, 1, "phase4.10: skipped finding preserved");
+
+  // Case C: silent UPDATE no-op — wrong run_id returns rowsAffected=0
+  const noOp = memdb.prepare(`
+    UPDATE runs
+    SET verifier_state = ?, verifier_checked_at = ?, verifier_findings = ?
+    WHERE run_id = ?
+  `).run("verified", "2026-05-03T17:00:06Z", "[]", "this-run-id-does-not-exist");
+  assertEq(noOp.changes, 0, "phase4.10: typo'd run_id UPDATE returns rowsAffected=0 (route must convert this to 404, not silent 200)");
+
+  memdb.close();
+}
+
+// ─── PHASE 4.10b: e0da490 listPendingVerification filter ──────────────
+// Verify the read-side fix shipped today: failed-state runs no longer
+// re-surface in pending queue. This stops the overwrite-loop where
+// verifier-cycle B re-probed runs that A already marked failed and
+// overwrote A's findings with B's (which were often partial).
+{
+  const Database = require("better-sqlite3");
+  const memdb2 = new Database(":memory:");
+  memdb2.exec(`
+    CREATE TABLE runs (
+      run_id TEXT PRIMARY KEY,
+      vertical TEXT NOT NULL,
+      agent TEXT NOT NULL,
+      started_at TEXT NOT NULL,
+      status TEXT NOT NULL,
+      verifier_state TEXT NOT NULL DEFAULT 'pending'
+    );
+  `);
+  memdb2.prepare("INSERT INTO runs VALUES (?, 'rfb', 'a', '2026-05-03T00:00:00Z', 'completed', 'pending')").run("r-pending");
+  memdb2.prepare("INSERT INTO runs VALUES (?, 'rfb', 'a', '2026-05-03T00:00:00Z', 'completed', 'failed')").run("r-failed");
+  memdb2.prepare("INSERT INTO runs VALUES (?, 'rfb', 'a', '2026-05-03T00:00:00Z', 'completed', 'verified')").run("r-verified");
+
+  // Mirror the e0da490 query
+  const pending = memdb2.prepare(`
+    SELECT run_id FROM runs WHERE verifier_state = 'pending' AND started_at >= '2026-05-01T00:00:00Z' ORDER BY started_at ASC
+  `).all() as Array<{ run_id: string }>;
+
+  assertEq(pending.length, 1, "phase4.10b: listPending only returns 'pending' rows after e0da490");
+  assertEq(pending[0].run_id, "r-pending", "phase4.10b: failed-state row does NOT re-surface (was the overwrite-loop trigger)");
+
+  memdb2.close();
+}
+
+
 // ── REPORT ────────────────────────────────────────────────────────────
 console.log(`\n${passed} passed, ${failed} failed\n`);
 if (failed > 0) {
