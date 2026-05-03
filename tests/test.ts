@@ -801,6 +801,99 @@ console.log("── Phase 4.10: verifier write-bug regression tests ──");
 }
 
 
+// ─── PHASE 4.10c-2 Steg 1: trigger auto-updates last_outbound_at ──────
+// Defense-in-depth: a DB trigger on crm_messages INSERT (direction=out,
+// delivery_status=sent) ensures that crm_threads.last_outbound_at is
+// always in sync, even for write-paths that bypass composeNewThread.
+console.log("── Phase 4.10c-2 Steg 1: thread.last_outbound_at trigger ──");
+{
+  const Database = require("better-sqlite3");
+  const memdb = new Database(":memory:");
+  // Mirror minimal schema for the trigger test
+  memdb.exec(`
+    CREATE TABLE crm_threads (
+      id TEXT PRIMARY KEY,
+      contact_id TEXT NOT NULL,
+      subject TEXT,
+      status TEXT NOT NULL DEFAULT 'in_progress',
+      last_message_at TEXT,
+      last_outbound_at TEXT,
+      message_count INTEGER NOT NULL DEFAULT 0,
+      updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+    CREATE TABLE crm_messages (
+      id TEXT PRIMARY KEY,
+      thread_id TEXT NOT NULL,
+      direction TEXT NOT NULL,
+      from_email TEXT,
+      to_emails TEXT,
+      subject TEXT,
+      body_text TEXT,
+      sent_at TEXT,
+      delivery_status TEXT NOT NULL DEFAULT 'sent'
+    );
+    CREATE TRIGGER trg_update_thread_outbound_at
+      AFTER INSERT ON crm_messages
+      FOR EACH ROW
+      WHEN NEW.direction = 'out' AND NEW.delivery_status = 'sent'
+      BEGIN
+        UPDATE crm_threads
+        SET last_outbound_at = NEW.sent_at,
+            updated_at = datetime('now')
+        WHERE id = NEW.thread_id
+          AND (last_outbound_at IS NULL OR last_outbound_at < NEW.sent_at);
+      END;
+  `);
+
+  // Seed thread with last_outbound_at NULL (simulate the regression-path)
+  memdb.prepare("INSERT INTO crm_threads (id, contact_id, subject) VALUES (?, ?, ?)").run("t-trig-1", "c1", "Test thread");
+
+  // Case A: INSERT out+sent → last_outbound_at set to sent_at
+  memdb.prepare(`
+    INSERT INTO crm_messages (id, thread_id, direction, from_email, to_emails, sent_at, delivery_status)
+    VALUES (?, ?, 'out', 'kontakt@rettfrabonden.com', '["x@y.com"]', '2026-05-03T18:00:00Z', 'sent')
+  `).run("m-1", "t-trig-1");
+  let row = memdb.prepare("SELECT last_outbound_at FROM crm_threads WHERE id = ?").get("t-trig-1") as { last_outbound_at: string };
+  assertEq(row.last_outbound_at, "2026-05-03T18:00:00Z", "phase4.10c-2: trigger sets last_outbound_at on out+sent INSERT");
+
+  // Case B: newer out+sent INSERT → updates to newer
+  memdb.prepare(`
+    INSERT INTO crm_messages (id, thread_id, direction, from_email, to_emails, sent_at, delivery_status)
+    VALUES (?, ?, 'out', 'kontakt@rettfrabonden.com', '["x@y.com"]', '2026-05-03T19:00:00Z', 'sent')
+  `).run("m-2", "t-trig-1");
+  row = memdb.prepare("SELECT last_outbound_at FROM crm_threads WHERE id = ?").get("t-trig-1") as { last_outbound_at: string };
+  assertEq(row.last_outbound_at, "2026-05-03T19:00:00Z", "phase4.10c-2: newer out+sent updates last_outbound_at");
+
+  // Case C: older out+sent INSERT → does NOT update (preserves newest)
+  memdb.prepare(`
+    INSERT INTO crm_messages (id, thread_id, direction, from_email, to_emails, sent_at, delivery_status)
+    VALUES (?, ?, 'out', 'kontakt@rettfrabonden.com', '["x@y.com"]', '2026-05-03T17:00:00Z', 'sent')
+  `).run("m-3", "t-trig-1");
+  row = memdb.prepare("SELECT last_outbound_at FROM crm_threads WHERE id = ?").get("t-trig-1") as { last_outbound_at: string };
+  assertEq(row.last_outbound_at, "2026-05-03T19:00:00Z", "phase4.10c-2: older out+sent does NOT regress last_outbound_at");
+
+  // Case D: direction='in' INSERT → does NOT touch last_outbound_at
+  memdb.prepare("INSERT INTO crm_threads (id, contact_id, subject) VALUES (?, ?, ?)").run("t-trig-2", "c2", "Inbound only");
+  memdb.prepare(`
+    INSERT INTO crm_messages (id, thread_id, direction, from_email, to_emails, sent_at, delivery_status)
+    VALUES (?, ?, 'in', 'x@y.com', '["kontakt@rettfrabonden.com"]', '2026-05-03T20:00:00Z', 'sent')
+  `).run("m-4", "t-trig-2");
+  row = memdb.prepare("SELECT last_outbound_at FROM crm_threads WHERE id = ?").get("t-trig-2") as { last_outbound_at: string };
+  assertEq(row.last_outbound_at, null, "phase4.10c-2: inbound INSERT does NOT set last_outbound_at");
+
+  // Case E: out+queued (not sent yet) → does NOT trigger
+  memdb.prepare("INSERT INTO crm_threads (id, contact_id, subject) VALUES (?, ?, ?)").run("t-trig-3", "c3", "Queued only");
+  memdb.prepare(`
+    INSERT INTO crm_messages (id, thread_id, direction, from_email, to_emails, sent_at, delivery_status)
+    VALUES (?, ?, 'out', 'kontakt@rettfrabonden.com', '["x@y.com"]', NULL, 'queued')
+  `).run("m-5", "t-trig-3");
+  row = memdb.prepare("SELECT last_outbound_at FROM crm_threads WHERE id = ?").get("t-trig-3") as { last_outbound_at: string };
+  assertEq(row.last_outbound_at, null, "phase4.10c-2: out+queued does NOT trigger (only sent counts)");
+
+  memdb.close();
+}
+
+
 // ── REPORT ────────────────────────────────────────────────────────────
 console.log(`\n${passed} passed, ${failed} failed\n`);
 if (failed > 0) {

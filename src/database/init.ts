@@ -747,6 +747,72 @@ function initSchema(db: Database.Database): void {
   }
 
 
+  // ─── Phase 4.10c-2 Steg 1 — DB-trigger: auto-update last_outbound_at ─
+  // Whenever a crm_messages row is INSERTed with direction='out' AND
+  // delivery_status='sent', set the parent thread's last_outbound_at if
+  // either it's NULL or the new sent_at is newer. Closes the duplicate-send
+  // bug where the agent never knew an outbound had already been sent.
+  //
+  // Idempotent: CREATE TRIGGER IF NOT EXISTS — safe to re-run on every boot.
+  // Catches every write path including manual scripts, future agents,
+  // Resend-webhooks if/when added — not just the composeNewThread path.
+  //
+  // Origin: orchestrator work-order #2 (run-2026-05-03T1940-platform-orchestrator-rfb).
+  try {
+    db.exec(`
+      CREATE TRIGGER IF NOT EXISTS trg_update_thread_outbound_at
+        AFTER INSERT ON crm_messages
+        FOR EACH ROW
+        WHEN NEW.direction = 'out' AND NEW.delivery_status = 'sent'
+        BEGIN
+          UPDATE crm_threads
+          SET last_outbound_at = NEW.sent_at,
+              updated_at = datetime('now')
+          WHERE id = NEW.thread_id
+            AND (last_outbound_at IS NULL OR last_outbound_at < NEW.sent_at);
+        END
+    `);
+  } catch (err) {
+    console.error("Migration trg_update_thread_outbound_at failed:", err);
+  }
+
+  // ─── Idempotent backfill: same migration block as the trigger ────
+  // Catch threads that were created before the trigger landed, OR that
+  // were INSERTed with delivery_status='sent' via paths not covered by
+  // composeNewThread (which already sets last_outbound_at synchronously).
+  // Safe re-run: WHERE filter ensures only NULL→MAX(sent_at) updates.
+  try {
+    db.exec(`CREATE TABLE IF NOT EXISTS migrations (name TEXT PRIMARY KEY, applied_at TEXT DEFAULT (datetime('now')))`);
+    const alreadyRan = db.prepare("SELECT 1 FROM migrations WHERE name = 'backfill_last_outbound_at_v1'").get();
+    if (!alreadyRan) {
+      const result = db.prepare(`
+        UPDATE crm_threads
+        SET last_outbound_at = (
+              SELECT MAX(sent_at)
+              FROM crm_messages
+              WHERE crm_messages.thread_id = crm_threads.id
+                AND direction = 'out'
+                AND delivery_status = 'sent'
+            ),
+            updated_at = datetime('now')
+        WHERE last_outbound_at IS NULL
+          AND EXISTS (
+            SELECT 1 FROM crm_messages
+            WHERE crm_messages.thread_id = crm_threads.id
+              AND direction = 'out'
+              AND delivery_status = 'sent'
+          )
+      `).run();
+      db.prepare("INSERT INTO migrations (name) VALUES ('backfill_last_outbound_at_v1')").run();
+      if (result.changes > 0) {
+        console.log(`🧹 Migration backfill_last_outbound_at_v1: updated ${result.changes} thread(s)`);
+      }
+    }
+  } catch (err) {
+    console.error("Migration backfill_last_outbound_at_v1 failed:", err);
+  }
+
+
   // ─── One-time cleanup: reset all test verifications ──────────
   // No real sellers have claimed yet — all is_verified=1 entries
   // are from development/testing. Reset them to 0 and clean claims.
