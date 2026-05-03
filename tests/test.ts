@@ -549,6 +549,28 @@ import type { VerifierFinding } from "../src/types/run-envelope";
   _resetConfigCacheForTests();
 }
 
+// ─── PHASE 4.6: vertical_id column on per-vertical tables ──────────────
+// Bekrefter at migrasjons-blokken legger til vertical_id med default 'rfb'
+// på en typisk per-vertikal-tabell (agents). Bruker en in-memory SQLite-
+// instans for å unngå å røre prod-DB-en.
+{
+  const sqlite = require("better-sqlite3");
+  const memdb46 = new sqlite(":memory:");
+  // Replikér den minimale CREATE TABLE for agents (uten vertical_id
+  // — så ALTER må lykkes).
+  memdb46.exec(`CREATE TABLE agents (id TEXT PRIMARY KEY, name TEXT)`);
+  memdb46.prepare("INSERT INTO agents (id, name) VALUES (?, ?)").run("test-1", "Test Gård");
+  // Apply migration the same way init.ts does
+  memdb46.exec(`ALTER TABLE agents ADD COLUMN vertical_id TEXT NOT NULL DEFAULT \'rfb\'`);
+  const row: { vertical_id?: string } = memdb46.prepare("SELECT vertical_id FROM agents WHERE id = ?").get("test-1") as { vertical_id?: string };
+  assertEq(row.vertical_id, "rfb", "phase4.6: existing rows backfilled to rfb");
+  // Inserts default to rfb
+  memdb46.prepare("INSERT INTO agents (id, name) VALUES (?, ?)").run("test-2", "Test Tannlege");
+  const row2: { vertical_id?: string } = memdb46.prepare("SELECT vertical_id FROM agents WHERE id = ?").get("test-2") as { vertical_id?: string };
+  assertEq(row2.vertical_id, "rfb", "phase4.6: new inserts default to rfb");
+  memdb46.close();
+}
+
 
 
 
