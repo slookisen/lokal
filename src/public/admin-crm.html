@@ -250,6 +250,64 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;backgrou
       <div class="detail-empty">← Velg en kontakt</div>
     </div>
   </div>
+
+  <div class="sent-log-view" id="sentLogView" style="display:none">
+    <div class="sl-filters">
+      <label>Periode:
+        <select id="slFilterSince">
+          <option value="24">Siste 24t</option>
+          <option value="168" selected>Siste 7d</option>
+          <option value="720">Siste 30d</option>
+          <option value="all">Alt</option>
+        </select>
+      </label>
+      <label>Kanal:
+        <select id="slFilterChannel">
+          <option value="all">Alle</option>
+          <option value="resend_smtp">Resend (sendt)</option>
+          <option value="gmail_draft">Gmail draft</option>
+        </select>
+      </label>
+      <label>Avsender:
+        <select id="slFilterActor">
+          <option value="all">Alle</option>
+          <option value="claude">Claude (autonomt)</option>
+          <option value="daniel">Daniel (manuelt)</option>
+        </select>
+      </label>
+      <label>Status:
+        <select id="slFilterStatus">
+          <option value="all">Alle</option>
+          <option value="sent">sent</option>
+          <option value="draft_in_gmail">draft_in_gmail</option>
+          <option value="queued">queued</option>
+          <option value="failed">failed</option>
+        </select>
+      </label>
+      <label>Søk:
+        <input type="text" id="slFilterSearch" placeholder="mottaker, emne...">
+      </label>
+      <button class="action" id="slRefreshBtn" style="margin-left:auto">↻ Oppdater</button>
+      <span style="color:var(--text-dim);font-size:11px" id="slGeneratedAt"></span>
+    </div>
+    <div class="sl-summary" id="slSummary"></div>
+    <div class="sl-table-wrap">
+      <table class="sl-table" id="slTable">
+        <thead>
+          <tr>
+            <th data-sort="when">Tidspunkt ▼</th>
+            <th data-sort="recipient">Mottaker</th>
+            <th data-sort="subject">Emne</th>
+            <th data-sort="actor">Avsender</th>
+            <th data-sort="channel">Kanal</th>
+            <th data-sort="status">Status</th>
+            <th>Tråd</th>
+          </tr>
+        </thead>
+        <tbody id="slTbody"><tr><td colspan="7" class="sl-empty">Velg fanen "Utsendinger" for å laste.</td></tr></tbody>
+      </table>
+    </div>
+  </div>
 </div>
 
 <div class="toast" id="toast"></div>
@@ -329,14 +387,200 @@ async function init() {
   document.querySelectorAll('.tab').forEach(t => t.addEventListener('click', () => {
     document.querySelectorAll('.tab').forEach(x => x.classList.remove('active'));
     t.classList.add('active');
-    activeType = t.dataset.type;
-    activeContactId = null;
-    activeThreadId = null;
-    document.getElementById('detailPane').innerHTML = '<div class="detail-empty">← Velg en kontakt</div>';
-    loadContacts();
+
+    if (t.dataset.view === 'sent-log') {
+      // Switch to Sendt-logg view: hide contact main, show sent-log
+      document.querySelector('.main').style.display = 'none';
+      document.getElementById('sentLogView').style.display = 'flex';
+      loadSentLog();
+    } else {
+      // Switch to contact-type view: hide sent-log, show contact main
+      document.getElementById('sentLogView').style.display = 'none';
+      document.querySelector('.main').style.display = 'grid';
+      activeType = t.dataset.type;
+      activeContactId = null;
+      activeThreadId = null;
+      document.getElementById('detailPane').innerHTML = '<div class="detail-empty">← Velg en kontakt</div>';
+      loadContacts();
+    }
   }));
+  // Sent-log filter handlers
+  ['slFilterSince','slFilterChannel','slFilterActor','slFilterStatus'].forEach(id => {
+    const el = document.getElementById(id);
+    if (el) el.addEventListener('change', loadSentLog);
+  });
+  const slSearch = document.getElementById('slFilterSearch');
+  if (slSearch) slSearch.addEventListener('input', () => renderSentLog(slLastData, slLastDupSet));
+  const slRefresh = document.getElementById('slRefreshBtn');
+  if (slRefresh) slRefresh.addEventListener('click', loadSentLog);
+  document.querySelectorAll('#slTable th[data-sort]').forEach(th => {
+    th.addEventListener('click', () => {
+      const f = th.dataset.sort;
+      if (slSortField === f) slSortDir = -slSortDir; else { slSortField = f; slSortDir = -1; }
+      // Update visual indicator
+      document.querySelectorAll('#slTable th[data-sort]').forEach(x => x.textContent = x.textContent.replace(/[▲▼]/g, '').trim());
+      th.textContent = th.textContent.trim() + ' ' + (slSortDir < 0 ? '▼' : '▲');
+      renderSentLog(slLastData, slLastDupSet);
+    });
+  });
   await refresh();
+  // Pre-load sent-log count for the badge
+  loadSentLogBadge();
 }
+
+// ─── Sendt-logg state ──────────────────────────────────────
+let slLastData = null;
+let slLastDupSet = new Set();
+let slSortField = 'when';
+let slSortDir = -1;
+
+async function loadSentLogBadge() {
+  try {
+    const r = await fetch(API + '/sent-log?since_hours=24&limit=500', { headers: { 'X-Admin-Key': adminKey } });
+    if (!r.ok) return;
+    const data = await r.json();
+    const sent = (data.summary && data.summary.by_status && data.summary.by_status.sent) || 0;
+    document.getElementById('cnt-sent-log').textContent = sent;
+  } catch (e) { /* ignore */ }
+}
+
+async function loadSentLog() {
+  const tbody = document.getElementById('slTbody');
+  if (tbody) tbody.innerHTML = '<tr><td colspan="7" class="sl-empty">Laster…</td></tr>';
+  const since = document.getElementById('slFilterSince').value;
+  const channel = document.getElementById('slFilterChannel').value;
+  const actor = document.getElementById('slFilterActor').value;
+  const status = document.getElementById('slFilterStatus').value;
+  const url = `${API}/sent-log?since_hours=${since}&channel=${channel}&actor=${actor}&status=${status}&limit=1000`;
+  try {
+    const r = await fetch(url, { headers: { 'X-Admin-Key': adminKey } });
+    if (!r.ok) {
+      tbody.innerHTML = `<tr><td colspan="7" class="sl-empty">Feil: HTTP ${r.status}</td></tr>`;
+      return;
+    }
+    const data = await r.json();
+    document.getElementById('slGeneratedAt').textContent = 'Generert ' + new Date(data.generated_at).toLocaleString('nb-NO');
+
+    // Detect duplicates: same recipient with multiple sends in 24h windows
+    const byRecipient = {};
+    for (const m of data.messages || []) {
+      const to = (m.contact_email || '').toLowerCase();
+      if (!to) continue;
+      if (!byRecipient[to]) byRecipient[to] = [];
+      byRecipient[to].push(m);
+    }
+    const dupSet = new Set();
+    for (const to in byRecipient) {
+      const arr = byRecipient[to].slice().sort((a, b) => {
+        const ta = new Date(a.sent_at || a.received_at).getTime();
+        const tb = new Date(b.sent_at || b.received_at).getTime();
+        return ta - tb;
+      });
+      for (let i = 1; i < arr.length; i++) {
+        const dt = new Date(arr[i].sent_at || arr[i].received_at).getTime() - new Date(arr[i - 1].sent_at || arr[i - 1].received_at).getTime();
+        if (dt < 24 * 3600 * 1000) dupSet.add(arr[i].message_id);
+      }
+    }
+
+    // Summary pills
+    const sumEl = document.getElementById('slSummary');
+    sumEl.innerHTML = '';
+    const summary = data.summary || {};
+    const sections = [['Status', summary.by_status], ['Avsender', summary.by_actor], ['Kanal', summary.by_channel]];
+    for (const [label, obj] of sections) {
+      if (!obj) continue;
+      for (const [k, v] of Object.entries(obj)) {
+        const span = document.createElement('span');
+        span.className = 'sl-pill';
+        span.innerHTML = `<span class="v">${v}</span>${label.toLowerCase()}: ${slEsc(k)}`;
+        sumEl.appendChild(span);
+      }
+    }
+    if (dupSet.size > 0) {
+      const dupPill = document.createElement('span');
+      dupPill.className = 'sl-pill warn';
+      dupPill.innerHTML = `<span class="v">${dupSet.size}</span>duplikater (samme mottaker &lt;24t)`;
+      sumEl.appendChild(dupPill);
+    }
+
+    slLastData = data;
+    slLastDupSet = dupSet;
+    renderSentLog(data, dupSet);
+    // Refresh badge while we are at it
+    document.getElementById('cnt-sent-log').textContent = (summary.by_status && summary.by_status.sent) || 0;
+  } catch (e) {
+    tbody.innerHTML = `<tr><td colspan="7" class="sl-empty">Feil: ${slEsc(e.message)}</td></tr>`;
+  }
+}
+
+function renderSentLog(data, dupSet) {
+  const tbody = document.getElementById('slTbody');
+  if (!data) { tbody.innerHTML = '<tr><td colspan="7" class="sl-empty">Ingen data.</td></tr>'; return; }
+  const search = (document.getElementById('slFilterSearch').value || '').toLowerCase().trim();
+  let rows = (data.messages || []).slice();
+  if (search) {
+    rows = rows.filter(m =>
+      (m.contact_email || '').toLowerCase().includes(search) ||
+      (m.contact_name || '').toLowerCase().includes(search) ||
+      (m.subject || '').toLowerCase().includes(search) ||
+      (m.thread_subject || '').toLowerCase().includes(search));
+  }
+  // Sort
+  rows.sort((a, b) => {
+    let va, vb;
+    switch (slSortField) {
+      case 'when': va = a.sent_at || a.received_at; vb = b.sent_at || b.received_at; break;
+      case 'recipient': va = (a.contact_email || '').toLowerCase(); vb = (b.contact_email || '').toLowerCase(); break;
+      case 'subject': va = (a.subject || '').toLowerCase(); vb = (b.subject || '').toLowerCase(); break;
+      case 'actor': va = a.actor || ''; vb = b.actor || ''; break;
+      case 'channel': va = a.channel || ''; vb = b.channel || ''; break;
+      case 'status': va = a.delivery_status || ''; vb = b.delivery_status || ''; break;
+      default: va = ''; vb = '';
+    }
+    if (va < vb) return -slSortDir;
+    if (va > vb) return slSortDir;
+    return 0;
+  });
+
+  if (!rows.length) {
+    tbody.innerHTML = '<tr><td colspan="7" class="sl-empty">Ingen utsendinger i valgt periode/filter.</td></tr>';
+    return;
+  }
+
+  tbody.innerHTML = rows.map(m => {
+    const when = m.sent_at || m.received_at || '';
+    const whenFmt = when ? new Date(when).toLocaleString('nb-NO', { day: '2-digit', month: 'short', hour: '2-digit', minute: '2-digit' }) : '—';
+    const recipient = m.contact_name ? `${slEsc(m.contact_name)}<br><span style="color:var(--text-dim)">${slEsc(m.contact_email || '')}</span>` : slEsc(m.contact_email || '?');
+    const subject = slEsc(m.subject || m.thread_subject || '(uten emne)');
+    const actorTag = m.actor === 'claude' ? '<span class="sl-tag sl-tag-claude">claude</span>'
+                    : m.actor === 'daniel' ? '<span class="sl-tag sl-tag-daniel">daniel</span>'
+                    : '<span class="sl-tag" style="color:var(--text-dim)">?</span>';
+    const channelTag = m.channel && m.channel.indexOf('resend') >= 0 ? '<span class="sl-tag sl-tag-resend">resend</span>'
+                      : m.channel && m.channel.indexOf('gmail') >= 0 ? '<span class="sl-tag sl-tag-gmail">gmail</span>'
+                      : `<span style="color:var(--text-dim)">${slEsc(m.channel || '-')}</span>`;
+    const statusTag = m.delivery_status === 'sent' ? '<span class="sl-tag sl-tag-sent">sent</span>'
+                    : m.delivery_status === 'failed' ? '<span class="sl-tag sl-tag-failed">failed</span>'
+                    : m.delivery_status === 'draft_in_gmail' ? '<span class="sl-tag sl-tag-draft">draft</span>'
+                    : m.delivery_status === 'queued' ? '<span class="sl-tag sl-tag-queued">queued</span>'
+                    : `<span style="color:var(--text-dim)">${slEsc(m.delivery_status || '-')}</span>`;
+    const threadOriginTag = m.thread_origin === 'compose'
+      ? '<span class="sl-tag sl-tag-thread-compose" title="Ny tråd opprettet av /compose — ikke koblet til opprinnelig inbound">compose</span>'
+      : '<span class="sl-tag sl-tag-thread-inbound" title="Reply på opprinnelig inbound-tråd">inbound</span>';
+    const isDup = dupSet.has(m.message_id);
+    const dupNote = isDup ? '<div class="sl-dup-warning">⚠ duplikat (&lt;24t)</div>' : '';
+    return `<tr class="${isDup ? 'sl-row-dup' : ''}">
+      <td>${whenFmt}${dupNote}</td>
+      <td>${recipient}</td>
+      <td>${subject}</td>
+      <td>${actorTag}</td>
+      <td>${channelTag}</td>
+      <td>${statusTag}</td>
+      <td>${threadOriginTag}</td>
+    </tr>`;
+  }).join('');
+}
+
+function slEsc(s) { return String(s == null ? '' : s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c])); }
 
 async function refresh() {
   await Promise.all([loadSummary(), loadContacts()]);
