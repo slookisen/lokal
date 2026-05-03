@@ -71,7 +71,7 @@ a:hover{text-decoration:underline}
     <h1>Sendt-logg</h1>
     <p class="subtitle">Lim inn admin-nøkkel</p>
     <input type="password" id="adminKeyInput" placeholder="X-Admin-Key" autocomplete="off">
-    <button id="loginBtn" onclick="login()">Logg inn</button>
+    <button id="loginBtn">Logg inn</button>
     <div class="login-error" id="loginError">Feil nøkkel</div>
   </div>
 </div>
@@ -87,8 +87,8 @@ a:hover{text-decoration:underline}
       <span class="kpi">sent <span class="v" id="kpiSent">0</span></span>
       <span class="kpi">draft <span class="v warn" id="kpiDraft">0</span></span>
       <span class="kpi">duplikater <span class="v warn" id="kpiDup">0</span></span>
-      <button class="action" onclick="loadData()">↻ Oppdater</button>
-      <button class="action" onclick="logout()">Logg ut</button>
+      <button class="action" id="refreshBtn">↻ Oppdater</button>
+      <button class="action" id="logoutBtn">Logg ut</button>
     </div>
   </div>
 
@@ -332,8 +332,11 @@ document.getElementById('filterSearch').addEventListener('input', () => {
   renderTable(new Set());
 });
 
-// Login on Enter
+// Login on Enter + button click handlers (CSP-compliant — no inline onclick)
 document.getElementById('adminKeyInput').addEventListener('keydown', e => { if(e.key === 'Enter') login(); });
+document.getElementById('loginBtn').addEventListener('click', login);
+document.getElementById('refreshBtn').addEventListener('click', loadData);
+document.getElementById('logoutBtn').addEventListener('click', logout);
 
 // Auto-login if key already stored
 if(getKey()){ showApp(); loadData(); }
