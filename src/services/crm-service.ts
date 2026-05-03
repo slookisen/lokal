@@ -720,7 +720,7 @@ class CrmService {
       JOIN crm_threads t ON t.id = m.thread_id
       JOIN crm_contacts c ON c.id = t.contact_id
       WHERE ${where.join(" AND ")}
-      ORDER BY COALESCE(m.sent_at, m.received_at) DESC
+      ORDER BY datetime(COALESCE(m.sent_at, m.received_at)) DESC
       LIMIT ?
     `;
     params.push(limit);
