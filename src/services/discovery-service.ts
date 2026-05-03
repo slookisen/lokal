@@ -26,6 +26,7 @@
 // when agents search for "food marketplace Norway", we're there.
 
 import { marketplaceRegistry } from "./marketplace-registry";
+import { getConfig } from "../config/vertical-config";
 
 // ─── Known A2A Registries ──────────────────────────────────
 // These are public registries where agents look for services.
@@ -179,7 +180,7 @@ class DiscoveryService {
       // For future DNS-SD (mDNS) local network discovery
       "dns-sd": {
         serviceType: "_a2a._tcp",
-        serviceName: "Rett fra Bonden Food Marketplace",
+        serviceName: `${getConfig().display_name} Food Marketplace`,
         txtRecords: {
           "path": "/.well-known/agent-card.json",
           "type": "food-marketplace",
