@@ -1163,6 +1163,43 @@ console.log("── agent-stats: per-agent stats endpoint logic ──");
 }
 
 
+// ── WO #5: claim_via / claimed_at / claimed_by_user_id columns (Phase 4.13) ──
+{
+  // The migration ALTER TABLEs run idempotently in init.ts. We can't easily run
+  // init.ts here without booting the whole DB, but we CAN assert the SQL strings
+  // are present in the source as a process-flag — if a future commit removes
+  // them, this test breaks loudly.
+  const fs = require("fs");
+  const initSrc = fs.readFileSync("src/database/init.ts", "utf8");
+  assertTrue(
+    initSrc.includes("ALTER TABLE agents ADD COLUMN claimed_by_user_id TEXT"),
+    "wo5: claimed_by_user_id migration present"
+  );
+  assertTrue(
+    initSrc.includes("ALTER TABLE agents ADD COLUMN claimed_at TEXT"),
+    "wo5: claimed_at migration present"
+  );
+  assertTrue(
+    initSrc.includes("ALTER TABLE agents ADD COLUMN claimed_via TEXT"),
+    "wo5: claimed_via migration present"
+  );
+
+  // Sanity-check: the producer-page button now passes ?agent=<id>
+  const seoSrc = fs.readFileSync("src/routes/seo.ts", "utf8");
+  assertTrue(
+    seoSrc.includes('href="/selger?agent=${encodeURIComponent(agent.id)}"'),
+    "wo5: claim button on /produsent/<slug> passes ?agent=<id>"
+  );
+
+  // Sanity-check: selger.html has the pre-select fetch logic
+  const selgerSrc = fs.readFileSync("src/public/selger.html", "utf8");
+  assertTrue(
+    selgerSrc.includes('preselectFromQuery'),
+    "wo5: selger.html includes preselectFromQuery script"
+  );
+}
+
+
 // ── REPORT ────────────────────────────────────────────────────────────
 console.log(`\n${passed} passed, ${failed} failed\n`);
 if (failed > 0) {

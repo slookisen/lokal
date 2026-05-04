@@ -747,6 +747,39 @@
     const API_BASE = window.location.origin;
     const API = `${API_BASE}/api/marketplace`;
 
+    // ── Phase 4.13 / WO #5: pre-select an agent if user came via /selger?agent=<id> ──
+    // When the user clicks "Ta eierskap" / "Claim" on /produsent/<slug>, the link now
+    // carries ?agent=<id>. We detect that here, fetch the agent info, and pre-fill the
+    // "Finn butikken" search field so the user can confirm with one click instead of
+    // typing the same name they just clicked.
+    (function preselectFromQuery() {
+      try {
+        const params = new URLSearchParams(window.location.search);
+        const presetId = params.get("agent");
+        if (!presetId) return;
+        // Hint the existing find form is going to be auto-driven
+        const findAlertEl = document.getElementById("findAlert");
+        if (findAlertEl) findAlertEl.innerHTML = '<div style="padding:0.5rem 0.75rem;background:#eff6ff;border:1px solid #bfdbfe;border-radius:8px;color:#1e40af;font-size:0.9rem;margin-top:0.5rem;">Henter butikken du kom fra...</div>';
+        fetch(`${API}/agents/${encodeURIComponent(presetId)}/info`)
+          .then(r => r.ok ? r.json() : Promise.reject(r.status))
+          .then(payload => {
+            const info = (payload && payload.data) || payload;
+            if (!info || !info.name) {
+              // Invalid id — fall back to default UI
+              if (findAlertEl) findAlertEl.innerHTML = "";
+              return;
+            }
+            const findNameEl = document.getElementById("findName");
+            if (findNameEl) {
+              findNameEl.value = info.name;
+              if (findAlertEl) findAlertEl.innerHTML = '<div style="padding:0.5rem 0.75rem;background:#f0fdf4;border:1px solid #bbf7d0;border-radius:8px;color:#166534;font-size:0.9rem;margin-top:0.5rem;">Vi har fylt ut butikkens navn. Klikk \u201CSjekk registeret\u201D for \u00e5 ta eierskap.</div>';
+            }
+          })
+          .catch(() => { if (findAlertEl) findAlertEl.innerHTML = ""; });
+      } catch (_e) { /* never block initial render */ }
+    })();
+
+
     // ── State ──
     let state = {
       lang: 'no',

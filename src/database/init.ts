@@ -647,6 +647,27 @@ function initSchema(db: Database.Database): void {
     // Column already exists
   }
 
+  // ─── Phase 4.13 / WO #5: claim tracking columns ─────────────
+  // claimed_by_user_id, claimed_at, claimed_via — populated when the
+  // agent's owner takes ownership of the listing. Backfill not needed:
+  // existing rows are pre-claim (or admin-manual), and that semantic
+  // is captured by NULL claimed_via.
+  try {
+    db.exec(`ALTER TABLE agents ADD COLUMN claimed_by_user_id TEXT`);
+  } catch {
+    // Column already exists
+  }
+  try {
+    db.exec(`ALTER TABLE agents ADD COLUMN claimed_at TEXT`);
+  } catch {
+    // Column already exists
+  }
+  try {
+    db.exec(`ALTER TABLE agents ADD COLUMN claimed_via TEXT`);
+  } catch {
+    // Column already exists
+  }
+
   // ─── Add is_owner column to analytics tables ─────────────────
   // Allows filtering out owner/developer traffic in dashboard
   for (const table of ["analytics_page_views", "analytics_queries", "analytics_agent_views"]) {

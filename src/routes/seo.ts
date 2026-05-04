@@ -2587,9 +2587,9 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
               : (agent.isVerified ? "Flere personer kan administrere denne profilen." : "Gj\u00f8r krav p\u00e5 profilen for \u00e5 oppdatere informasjon og bli synlig for flere.")
             }</p>
           </div>
-          <a href="/selger" class="claim-btn">${lang === "en"
-            ? (agent.isVerified ? "Get access" : "Claim")
-            : (agent.isVerified ? "F\u00e5 tilgang" : "Gj\u00f8r krav")
+          <a href="/selger?agent=${encodeURIComponent(agent.id)}" class="claim-btn">${lang === "en"
+            ? (agent.isVerified ? "Get access" : "Claim this listing")
+            : (agent.isVerified ? "F\u00e5 tilgang" : "Gj\u00f8r krav p\u00e5 denne")
           }</a>
         </div>
 
