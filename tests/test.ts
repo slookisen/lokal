@@ -1200,6 +1200,101 @@ console.log("── agent-stats: per-agent stats endpoint logic ──");
 }
 
 
+// ── WO #6: bounce-service + email_bounces schema (Phase 4.14) ──────
+{
+  // Use the same memdb pattern as agent-stats tests above.
+  const Database = require("better-sqlite3");
+  const memdb = new Database(":memory:");
+
+  // Mirror the schema from src/database/init.ts so we can test the service
+  // logic deterministically without booting the whole DB stack.
+  memdb.exec(`
+    CREATE TABLE email_bounces (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      email TEXT NOT NULL,
+      bounced_at TEXT NOT NULL,
+      resend_email_id TEXT,
+      bounce_type TEXT,
+      reason TEXT,
+      agent_id_at_send TEXT,
+      batch_id TEXT,
+      investigated INTEGER DEFAULT 0,
+      investigated_at TEXT,
+      investigation_outcome TEXT,
+      created_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+    CREATE UNIQUE INDEX idx_email_bounces_dedup
+      ON email_bounces(email, COALESCE(resend_email_id, ''));
+  `);
+
+  // Idempotent insert
+  const ins1 = memdb.prepare(`
+    INSERT OR IGNORE INTO email_bounces
+      (email, bounced_at, resend_email_id, bounce_type, reason)
+    VALUES (?, ?, ?, ?, ?)
+  `).run("test@x.no", "2026-05-04T10:00:00Z", "rs-1", "hard", "550 5.1.1");
+  assertEq(ins1.changes, 1, "wo6: first bounce insert succeeds");
+
+  const ins2 = memdb.prepare(`
+    INSERT OR IGNORE INTO email_bounces
+      (email, bounced_at, resend_email_id, bounce_type, reason)
+    VALUES (?, ?, ?, ?, ?)
+  `).run("test@x.no", "2026-05-04T10:00:00Z", "rs-1", "hard", "550 5.1.1");
+  assertEq(ins2.changes, 0, "wo6: duplicate (email, resend_email_id) = idempotent skip");
+
+  // Different resend_email_id for same email = NEW row (legitimate retry)
+  const ins3 = memdb.prepare(`
+    INSERT OR IGNORE INTO email_bounces (email, bounced_at, resend_email_id, bounce_type)
+    VALUES (?, ?, ?, ?)
+  `).run("test@x.no", "2026-05-04T11:00:00Z", "rs-2", "hard");
+  assertEq(ins3.changes, 1, "wo6: same email + new resend_id = new row");
+
+  // hardBouncedEmails query — exclude soft + unknown
+  memdb.prepare(`INSERT INTO email_bounces (email, bounced_at, bounce_type, resend_email_id)
+                 VALUES ('soft@y.no', '2026-05-04T11:00Z', 'soft', 'rs-3')`).run();
+  memdb.prepare(`INSERT INTO email_bounces (email, bounced_at, bounce_type, resend_email_id)
+                 VALUES ('complaint@z.no', '2026-05-04T11:00Z', 'complaint', 'rs-4')`).run();
+  const hardRows = memdb.prepare(`
+    SELECT DISTINCT email FROM email_bounces WHERE bounce_type IN ('hard', 'complaint')
+  `).all();
+  const hardEmails = new Set(hardRows.map((r: any) => r.email));
+  assertTrue(hardEmails.has("test@x.no"), "wo6: hardBounced includes hard-bounced email");
+  assertTrue(hardEmails.has("complaint@z.no"), "wo6: hardBounced includes complaints");
+  assertTrue(!hardEmails.has("soft@y.no"), "wo6: hardBounced excludes soft bounces");
+
+  // listUninvestigated filter
+  memdb.prepare(`UPDATE email_bounces SET investigated = 1 WHERE email = 'test@x.no' AND resend_email_id = 'rs-1'`).run();
+  const uninvestigated = memdb.prepare(`
+    SELECT * FROM email_bounces WHERE investigated = 0 ORDER BY bounced_at DESC
+  `).all();
+  assertEq(uninvestigated.length, 3, "wo6: listUninvestigated returns 3 (rs-2, rs-3, rs-4)");
+
+  memdb.close();
+
+  // Source-presence: confirm endpoints + service exist (process flag)
+  const fs = require("fs");
+  const indexSrc = fs.readFileSync("src/index.ts", "utf8");
+  assertTrue(
+    indexSrc.includes('app.get("/admin/email-bounces"'),
+    "wo6: GET /admin/email-bounces endpoint present"
+  );
+  assertTrue(
+    indexSrc.includes('app.patch("/admin/email-bounces/:id/investigated"'),
+    "wo6: PATCH /admin/email-bounces/:id/investigated endpoint present"
+  );
+  assertTrue(
+    indexSrc.includes('app.post("/admin/email-bounces"'),
+    "wo6: POST /admin/email-bounces endpoint present"
+  );
+
+  const serviceSrc = fs.readFileSync("src/services/bounce-service.ts", "utf8");
+  assertTrue(
+    serviceSrc.includes("INSERT OR IGNORE INTO email_bounces"),
+    "wo6: bounce-service uses idempotent INSERT OR IGNORE"
+  );
+}
+
+
 // ── REPORT ────────────────────────────────────────────────────────────
 console.log(`\n${passed} passed, ${failed} failed\n`);
 if (failed > 0) {

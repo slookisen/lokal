@@ -460,6 +460,32 @@ function initSchema(db: Database.Database): void {
     );
     CREATE INDEX IF NOT EXISTS idx_agent_blocklist_type_value ON agent_blocklist(identifier_type, identifier_value);
 
+    -- ─── email_bounces (Phase 4.14 / WO #6) ────────────────────
+    -- Resend reports bounces; we mirror them so marketing-comms can
+    -- exclude bounced addresses and enrichment-agent can investigate
+    -- alternative addresses for hard-bounce producers.
+    CREATE TABLE IF NOT EXISTS email_bounces (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      email TEXT NOT NULL,
+      bounced_at TEXT NOT NULL,
+      resend_email_id TEXT,
+      bounce_type TEXT,
+      reason TEXT,
+      agent_id_at_send TEXT,
+      batch_id TEXT,
+      investigated INTEGER DEFAULT 0,
+      investigated_at TEXT,
+      investigation_outcome TEXT,
+      created_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+    CREATE INDEX IF NOT EXISTS idx_email_bounces_email ON email_bounces(email);
+    CREATE INDEX IF NOT EXISTS idx_email_bounces_investigated ON email_bounces(investigated, bounced_at);
+    CREATE INDEX IF NOT EXISTS idx_email_bounces_bounced_at ON email_bounces(bounced_at);
+    -- UNIQUE on (email, COALESCE(resend_email_id,'')) so retries are idempotent
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_email_bounces_dedup
+      ON email_bounces(email, COALESCE(resend_email_id, ''));
+
+
     -- Analytics indexes (for fast aggregation)
     CREATE INDEX IF NOT EXISTS idx_analytics_page_views_created ON analytics_page_views(created_at);
     CREATE INDEX IF NOT EXISTS idx_analytics_page_views_source ON analytics_page_views(source);

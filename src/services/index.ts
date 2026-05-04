@@ -5,3 +5,4 @@ export { agentCardService, AgentCardService } from "./agent-card";
 export { visionScanner, VisionScannerService } from "./vision-scanner";
 export { reservationService, ReservationService } from "./reservation-service";
 export { discoveryService } from "./discovery-service";
+export { bounceService } from "./bounce-service";

@@ -34,6 +34,7 @@ import adminRunsRoutes from "./routes/admin-runs";
 import platformTriggersRoutes, { adminRouter as adminTriggersRoutes } from "./routes/platform-triggers";
 import crmRoutes from "./routes/crm";
 import { list as blocklistList } from "./services/blocklist-service";
+import { bounceService } from "./services/bounce-service";
 import { seedData } from "./seed";
 // Seed files moved to src/_seeds/ — only loaded if DB is empty (see below).
 import { discoveryService } from "./services/discovery-service";
@@ -285,6 +286,89 @@ app.get("/admin/blocklist", adminLimiter, (req, res) => {
     res.json({ success: true, count: rows.length, since: since ?? null, entries: rows });
   } catch (err: any) {
     res.status(500).json({ error: "List failed", detail: err.message });
+  }
+});
+
+// ─── /admin/email-bounces (Phase 4.14 / WO #6) ───────────────────────
+// Mirror of Resend bounce events. ETL is intentionally minimal in this
+// commit — backfill from Resend lives in a follow-up WO so the schema +
+// query surface land first and marketing-comms can already exclude
+// hard-bounces from candidate-pools as soon as data exists.
+function requireAdmin(req: any, res: any): boolean {
+  const adminKey = req.headers["x-admin-key"] as string;
+  const expected = process.env.ADMIN_KEY || process.env.ANALYTICS_ADMIN_KEY || "";
+  if (!expected) { res.status(503).json({ error: "Admin not configured" }); return false; }
+  if (!adminKey || adminKey !== expected) { res.status(403).json({ error: "Krever X-Admin-Key header" }); return false; }
+  return true;
+}
+
+app.get("/admin/email-bounces", adminLimiter, (req, res) => {
+  if (!requireAdmin(req, res)) return;
+  try {
+    const limit = parseInt(String(req.query.limit ?? "100"), 10) || 100;
+    const offset = parseInt(String(req.query.offset ?? "0"), 10) || 0;
+    const sinceRaw = req.query.since ? String(req.query.since) : undefined;
+    const since = sinceRaw && /^\d{4}-\d{2}-\d{2}/.test(sinceRaw) ? sinceRaw : undefined;
+    const uninvestigatedOnly = req.query.uninvestigated === "true";
+    const rows = uninvestigatedOnly
+      ? bounceService.listUninvestigated({ limit, since })
+      : bounceService.listAll({ limit, offset, since });
+    res.json({
+      success: true,
+      count: rows.length,
+      total: bounceService.countTotal(),
+      since: since ?? null,
+      entries: rows,
+    });
+  } catch (err: any) {
+    res.status(500).json({ error: "List failed", detail: err.message });
+  }
+});
+
+app.patch("/admin/email-bounces/:id/investigated", adminLimiter, express.json(), (req, res) => {
+  if (!requireAdmin(req, res)) return;
+  const id = parseInt(req.params.id, 10);
+  if (!Number.isFinite(id) || id <= 0) { res.status(400).json({ error: "Invalid id" }); return; }
+  const outcome = String((req.body || {}).outcome || "");
+  const allowed = ["alternative_found", "business_inactive", "blocklisted"] as const;
+  if (!allowed.includes(outcome as any)) {
+    res.status(400).json({ error: "outcome must be one of " + allowed.join(", ") });
+    return;
+  }
+  try {
+    const r = bounceService.markInvestigated({ id, outcome: outcome as any, notes: (req.body || {}).notes });
+    if (!r.updated) { res.status(404).json({ error: "Bounce row not found" }); return; }
+    res.json({ success: true });
+  } catch (err: any) {
+    res.status(500).json({ error: "Update failed", detail: err.message });
+  }
+});
+
+// Manual record endpoint — useful for the eventual webhook receiver and for
+// admin-initiated entries (e.g. a known-dead address Daniel saw in Resend
+// dashboard but isn't yet in our DB). Idempotent on (email, resend_email_id).
+app.post("/admin/email-bounces", adminLimiter, express.json(), (req, res) => {
+  if (!requireAdmin(req, res)) return;
+  const body = req.body || {};
+  const email = String(body.email || "").trim();
+  const bouncedAt = String(body.bouncedAt || body.bounced_at || "").trim();
+  if (!email || !bouncedAt) {
+    res.status(400).json({ error: "email + bouncedAt required" });
+    return;
+  }
+  try {
+    const out = bounceService.record({
+      email,
+      bouncedAt,
+      resendEmailId: body.resendEmailId || body.resend_email_id,
+      bounceType: body.bounceType || body.bounce_type,
+      reason: body.reason,
+      agentIdAtSend: body.agentIdAtSend || body.agent_id_at_send,
+      batchId: body.batchId || body.batch_id,
+    });
+    res.json({ success: true, ...out });
+  } catch (err: any) {
+    res.status(500).json({ error: "Record failed", detail: err.message });
   }
 });
 
