@@ -327,7 +327,7 @@ app.get("/admin/email-bounces", adminLimiter, (req, res) => {
 
 app.patch("/admin/email-bounces/:id/investigated", adminLimiter, express.json(), (req, res) => {
   if (!requireAdmin(req, res)) return;
-  const id = parseInt(req.params.id, 10);
+  const id = parseInt(String(req.params.id), 10);
   if (!Number.isFinite(id) || id <= 0) { res.status(400).json({ error: "Invalid id" }); return; }
   const outcome = String((req.body || {}).outcome || "");
   const allowed = ["alternative_found", "business_inactive", "blocklisted"] as const;
