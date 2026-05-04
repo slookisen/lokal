@@ -168,7 +168,7 @@ router.get("/summary", (_req: Request, res: Response) => {
  */
 router.get("/summary/:hours", (req: Request, res: Response) => {
   const hoursParam = req.params.hours as string;
-  const hours = Math.max(1, Math.min(720, parseInt(hoursParam) || 24));
+  const hours = Math.max(1, Math.min(87600, parseInt(hoursParam) || 24));
   const summary = analyticsService.getSummary(hours);
   res.json({
     timeframe: `last ${hours} hours`,
@@ -186,7 +186,7 @@ router.get("/summary/:hours", (req: Request, res: Response) => {
  */
 router.get("/producers", (req: Request, res: Response) => {
   const limit = Math.min(100, parseInt(req.query.limit as string) || 20);
-  const hours = Math.max(1, Math.min(720, parseInt(req.query.hours as string) || 24));
+  const hours = Math.max(1, Math.min(87600, parseInt(req.query.hours as string) || 24));
 
   const producers = analyticsService.getTopProducers(limit, hours);
   res.json({
@@ -205,7 +205,7 @@ router.get("/producers", (req: Request, res: Response) => {
  *   hours=24 (default)
  */
 router.get("/cities", (req: Request, res: Response) => {
-  const hours = Math.max(1, Math.min(720, parseInt(req.query.hours as string) || 24));
+  const hours = Math.max(1, Math.min(87600, parseInt(req.query.hours as string) || 24));
 
   const cities = analyticsService.getCityStats(hours);
   res.json({
@@ -297,7 +297,7 @@ router.get("/health", (_req: Request, res: Response) => {
  * Detailed visitor list with session info
  */
 router.get("/visitors", (req: Request, res: Response) => {
-  const hours = Math.max(1, Math.min(720, parseInt(req.query.hours as string) || 24));
+  const hours = Math.max(1, Math.min(87600, parseInt(req.query.hours as string) || 24));
   const limit = Math.min(200, parseInt(req.query.limit as string) || 50);
 
   try {
@@ -365,7 +365,7 @@ router.get("/hourly", (req: Request, res: Response) => {
  * Top pages by view count
  */
 router.get("/pages", (req: Request, res: Response) => {
-  const hours = Math.max(1, Math.min(720, parseInt(req.query.hours as string) || 24));
+  const hours = Math.max(1, Math.min(87600, parseInt(req.query.hours as string) || 24));
   const limit = Math.min(100, parseInt(req.query.limit as string) || 20);
 
   try {
@@ -408,7 +408,7 @@ router.get("/pages", (req: Request, res: Response) => {
  * Device type breakdown
  */
 router.get("/devices", (req: Request, res: Response) => {
-  const hours = Math.max(1, Math.min(720, parseInt(req.query.hours as string) || 24));
+  const hours = Math.max(1, Math.min(87600, parseInt(req.query.hours as string) || 24));
 
   try {
     const db = getDb();
@@ -508,7 +508,7 @@ router.get("/conversations", (_req: Request, res: Response) => {
  * This is the key endpoint for understanding real vs artificial traffic
  */
 router.get("/traffic-classification", (req: Request, res: Response) => {
-  const hours = Math.max(1, Math.min(720, parseInt(req.query.hours as string) || 24));
+  const hours = Math.max(1, Math.min(87600, parseInt(req.query.hours as string) || 24));
 
   try {
     const db = getDb();
@@ -654,7 +654,7 @@ router.get("/traffic-classification", (req: Request, res: Response) => {
  * Shows actual referrer URLs for non-direct traffic
  */
 router.get("/referrers", (req: Request, res: Response) => {
-  const hours = Math.max(1, Math.min(720, parseInt(req.query.hours as string) || 24));
+  const hours = Math.max(1, Math.min(87600, parseInt(req.query.hours as string) || 24));
 
   try {
     const db = getDb();

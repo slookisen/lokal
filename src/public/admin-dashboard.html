@@ -146,6 +146,9 @@
                 <option value="72">Siste 3 dager</option>
                 <option value="168">Siste uke</option>
                 <option value="720">Siste 30 dager</option>
+                <option value="2160">Siste 90 dager</option>
+                <option value="8760">Siste år</option>
+                <option value="all">Hele perioden</option>
             </select>
             <button id="refreshBtn" class="btn-sm">↻ Oppdater</button>
             <button id="logoutBtn" class="btn-logout">Logg ut</button>
@@ -393,12 +396,18 @@
     // ─── Load Dashboard ──────────────────────────────
     function loadDashboard() {
         var hours = document.getElementById("timeSelect").value;
+        // "all" is presented in the dropdown but the API expects a number.
+        // 87600h = 10 years — well past site launch, so it's effectively
+        // "all data" without needing a special-case server param.
+        if (hours === "all") hours = "87600";
+        // /hourly bins blow up beyond a week, so cap that one separately.
+        var hourlyHours = (parseInt(hours, 10) > 168) ? "168" : hours;
         Promise.all([
             api("/summary/" + hours),
             api("/producers?hours=" + hours + "&limit=15"),
             api("/cities?hours=" + hours),
             api("/visitors?hours=" + hours + "&limit=30"),
-            api("/hourly?hours=" + hours),
+            api("/hourly?hours=" + hourlyHours),
             api("/pages?hours=" + hours),
             api("/devices?hours=" + hours),
             api("/traffic-classification?hours=" + hours),

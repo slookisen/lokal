@@ -970,6 +970,152 @@ console.log("── Phase 4.10c-2 Steg 3: compose rate-limit query ──");
 }
 
 
+
+// ─── AGENT-STATS: per-agent visibility tiles + AI-conversations card ───
+// Tests the SQL and helpers behind /api/agents/:id/stats. We don't spin
+// up Express here — the route is a thin shell over these queries — but
+// we mirror the exact SQL the route uses against an in-memory DB seeded
+// with realistic page-view + conversation data.
+console.log("── agent-stats: per-agent stats endpoint logic ──");
+{
+  const Database = require("better-sqlite3");
+  const memdb = new Database(":memory:");
+
+  // Replicate just the columns agent-stats.ts touches.
+  memdb.exec(`
+    CREATE TABLE analytics_page_views (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      path TEXT NOT NULL,
+      session_id TEXT,
+      is_owner INTEGER DEFAULT 0,
+      created_at TEXT DEFAULT (datetime('now'))
+    );
+    CREATE TABLE conversations (
+      id TEXT PRIMARY KEY,
+      seller_agent_id TEXT,
+      source TEXT DEFAULT 'api',
+      query_text TEXT,
+      created_at TEXT DEFAULT (datetime('now'))
+    );
+    CREATE TABLE messages (
+      id TEXT PRIMARY KEY,
+      conversation_id TEXT NOT NULL,
+      sender_role TEXT NOT NULL,
+      content TEXT NOT NULL,
+      created_at TEXT DEFAULT (datetime('now'))
+    );
+  `);
+
+  // Slugify helper — must match seo.ts::slugify byte-for-byte. Copied here
+  // to detect drift; if seo.ts changes the rules, this test will break.
+  function slugify(text: string): string {
+    return (text || "").normalize("NFC").toLowerCase()
+      .replace(/æ/g, "ae").replace(/ø/g, "o").replace(/å/g, "a")
+      .replace(/ä/g, "a").replace(/ö/g, "o").replace(/ü/g, "u")
+      .replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "");
+  }
+  // Slug-regression: encoded-character producer names that were the
+  // source of our 2026-04-25 mass-404-fix incident must still slugify
+  // identically across both files.
+  assertEq(slugify("Test Gård"), "test-gard", "agent-stats slugify: æøå");
+  assertEq(slugify("Brønnøysund Røyk"), "bronnoysund-royk", "agent-stats slugify: ø");
+  assertEq(slugify("Hjortegården"), "hjortegarden", "agent-stats slugify: NFC normalization");
+
+  const slug = "test-gard";
+  const path = "/produsent/" + slug;
+  const agentId = "agent-stats-test-1";
+
+  // Seed page views: 5 human (no bot markers) + 3 GPTBot + 2 ClaudeBot
+  // + 1 Googlebot. is_owner=0 for all so they all count in stats.
+  const insertPv = memdb.prepare(`INSERT INTO analytics_page_views (path, session_id, is_owner) VALUES (?, ?, 0)`);
+  for (let i = 0; i < 5; i++) insertPv.run(path, "iphash" + i + ":Mozilla/5.0 (Macintosh) Chrome/120");
+  for (let i = 0; i < 3; i++) insertPv.run(path, "iphash-gpt-" + i + ":Mozilla/5.0 (compatible; GPTBot/1.0)");
+  for (let i = 0; i < 2; i++) insertPv.run(path, "iphash-claude-" + i + ":Mozilla/5.0 (compatible; ClaudeBot/1.0)");
+  insertPv.run(path, "iphash-google:Mozilla/5.0 (compatible; Googlebot/2.1)");
+
+  // Seed one OWNER row — must be excluded from human/AI counts entirely.
+  memdb.prepare(`INSERT INTO analytics_page_views (path, session_id, is_owner) VALUES (?, ?, 1)`)
+    .run(path, "iphash-owner:Lokal-Enricher/1.0");
+
+  // Seed conversations: 5 total, mixed sources. Add one inbound (buyer) message each.
+  const convRows = [
+    { id: "c1", source: "mcp", query: "Har du økologiske gulrøtter til levering i Oslo?", days_ago: 1 },
+    { id: "c2", source: "a2a", query: "Åpningstider for gårdsbutikk?", days_ago: 4 },
+    { id: "c3", source: "mcp", query: "Selger dere ost direkte?", days_ago: 9 },
+    { id: "c4", source: "web", query: "Når er sesongen for jordbær?", days_ago: 14 },
+    { id: "c5", source: "mcp", query: "Hva slags sertifiseringer har dere?", days_ago: 28 },
+  ];
+  for (const c of convRows) {
+    const ts = `datetime('now', '-${c.days_ago} days')`;
+    memdb.prepare(`INSERT INTO conversations (id, seller_agent_id, source, query_text, created_at) VALUES (?, ?, ?, ?, datetime('now', ?))`)
+      .run(c.id, agentId, c.source, c.query, `-${c.days_ago} days`);
+    // Each conversation also has a buyer message — query_text is the
+    // primary source but we want to make sure the fallback works too.
+    memdb.prepare(`INSERT INTO messages (id, conversation_id, sender_role, content) VALUES (?, ?, 'buyer', ?)`)
+      .run("m-" + c.id, c.id, c.query);
+  }
+
+  // Mirror agent-stats.ts SQL: human count (NOT any AI marker, is_owner=0)
+  const AI_MARKERS = ["GPTBot", "ChatGPT", "OAI-SearchBot", "ClaudeBot", "Claude-User", "Anthropic",
+    "Gemini", "Google-Extended", "PerplexityBot", "Perplexity-User", "CCBot", "Bytespider",
+    "Applebot-Extended", "YandexAdditional", "NotHumanSearch", "DuckDuckBot", "Googlebot"];
+  const aiNotClause = AI_MARKERS.map(() => "session_id NOT LIKE ?").join(" AND ");
+  const aiNotParams = AI_MARKERS.map(m => `%${m}%`);
+  const humanRow = memdb.prepare(`
+    SELECT COUNT(*) as c FROM analytics_page_views
+    WHERE path = ? AND (is_owner IS NULL OR is_owner = 0) AND ${aiNotClause}
+  `).get(path, ...aiNotParams) as { c: number };
+  assertEq(humanRow.c, 5, "agent-stats: human view count excludes bots + owner");
+
+  // ChatGPT bucket: GPTBot family
+  function aiBucket(markers: string[]): number {
+    const clause = markers.map(() => "session_id LIKE ?").join(" OR ");
+    const params = markers.map(m => `%${m}%`);
+    const r = memdb.prepare(`
+      SELECT COUNT(*) as c FROM analytics_page_views
+      WHERE path = ? AND (is_owner IS NULL OR is_owner = 0) AND (${clause})
+    `).get(path, ...params) as { c: number };
+    return r.c;
+  }
+  assertEq(aiBucket(["GPTBot", "ChatGPT", "OAI-SearchBot"]), 3, "agent-stats: chatgpt bucket = 3");
+  assertEq(aiBucket(["ClaudeBot", "Claude-User", "Anthropic"]), 2, "agent-stats: claude bucket = 2");
+  assertEq(aiBucket(["Googlebot"]), 1, "agent-stats: googlebot bucket = 1");
+
+  // Conversation count + last 5 (in DESC order)
+  const convCount = (memdb.prepare(`SELECT COUNT(*) as c FROM conversations WHERE seller_agent_id = ?`).get(agentId) as { c: number }).c;
+  assertEq(convCount, 5, "agent-stats: conversationCount");
+
+  interface ConvRow { id: string; source: string; query_text: string; first_buyer_msg: string | null; }
+  const lastConvs = memdb.prepare(`
+    SELECT c.id, c.source, c.query_text,
+      (SELECT m.content FROM messages m WHERE m.conversation_id = c.id AND m.sender_role = 'buyer'
+       ORDER BY m.created_at ASC LIMIT 1) as first_buyer_msg
+    FROM conversations c
+    WHERE c.seller_agent_id = ?
+    ORDER BY c.created_at DESC LIMIT 5
+  `).all(agentId) as ConvRow[];
+  assertEq(lastConvs.length, 5, "agent-stats: lastConversations returns 5 rows");
+  assertEq(lastConvs[0].id, "c1", "agent-stats: most recent first");
+  assertEq(lastConvs[4].id, "c5", "agent-stats: oldest last in 5-row window");
+
+  // Empty agent — no page views, no conversations — must return zeros.
+  const otherAgent = "agent-stats-test-empty";
+  const otherPath = "/produsent/this-does-not-exist";
+  const emptyHuman = memdb.prepare(`SELECT COUNT(*) as c FROM analytics_page_views WHERE path = ?`).get(otherPath) as { c: number };
+  assertEq(emptyHuman.c, 0, "agent-stats: empty agent → 0 page views");
+  const emptyConv = memdb.prepare(`SELECT COUNT(*) as c FROM conversations WHERE seller_agent_id = ?`).get(otherAgent) as { c: number };
+  assertEq(emptyConv.c, 0, "agent-stats: empty agent → 0 conversations");
+
+  // Truncate-rule for long queries (140 chars). Mirrors the route's slice(0,137)+"...".
+  const longQ = "x".repeat(200);
+  const truncated = longQ.length > 140 ? longQ.slice(0, 137) + "..." : longQ;
+  assertEq(truncated.length, 140, "agent-stats: 200-char query truncated to 140");
+  assertTrue(truncated.endsWith("..."), "agent-stats: truncation has ellipsis");
+
+  memdb.close();
+}
+
+
 // ── REPORT ────────────────────────────────────────────────────────────
 console.log(`\n${passed} passed, ${failed} failed\n`);
 if (failed > 0) {

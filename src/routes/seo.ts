@@ -1907,6 +1907,8 @@ const PROFILE_CSS = `
   .pf-stat-icon { width: 34px; height: 34px; border-radius: 8px; display: flex; align-items: center; justify-content: center; font-size: 0.95rem; }
   .pf-stat-icon.t { background: var(--green-100); }
   .pf-stat-icon.r { background: #fef3c7; }
+  .pf-stat-icon.h { background: #dbeafe; }
+  .pf-stat-icon.a { background: #ede9fe; }
   .pf-stat strong { display: block; font-size: 0.9rem; }
   .pf-stat small { font-size: 0.72rem; color: var(--g500); }
   .ct-card { background: var(--white); border-radius: var(--r-lg); box-shadow: var(--shadow-lg); padding: 24px; position: sticky; top: 70px; }
@@ -1992,6 +1994,15 @@ const PROFILE_CSS = `
     .season-bar span { width: 18px; height: 18px; font-size: 0.55rem; }
     .season-name { min-width: 100px; }
   }
+  /* Visibility tiles (humans / AI) — hidden until JS confirms there is data */
+  .pf-stat[data-stat] { display: none; }
+  /* AI-conversations card */
+  .conv-list { display: flex; flex-direction: column; gap: 12px; }
+  .conv-item { padding: 12px 14px; background: var(--g100); border-radius: var(--r-md); border-left: 3px solid #c4b5fd; }
+  .conv-head { display: flex; align-items: center; gap: 8px; font-size: 0.78rem; color: var(--g500); margin-bottom: 6px; }
+  .conv-src { font-weight: 700; color: #6d28d9; }
+  .conv-text { font-size: 0.9rem; color: var(--g700); line-height: 1.55; font-style: italic; }
+  #pf-conv-card { display: none; }
 `;
 
 // ─── Producer slug fuzzy matcher ──────────────────────────────
@@ -2485,6 +2496,8 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
         <div class="pf-stats">
           <div class="pf-stat"><div class="pf-stat-icon t">&#9733;</div><div><strong>${trustPct}%</strong><small>${lang === "en" ? "Trust Score" : "Trust Score"}</small></div></div>
           ${k.googleRating ? `<div class="pf-stat"><div class="pf-stat-icon r">&#11088;</div><div><strong>${k.googleRating} / 5</strong><small>${k.googleReviewCount || 0} ${lang === "en" ? "reviews" : "anmeldelser"}</small></div></div>` : ""}
+          <div class="pf-stat" data-stat="human" title="${lang === "en" ? "Views from humans" : "Visninger fra mennesker"}"><div class="pf-stat-icon h">&#127760;</div><div><strong data-fill="human">0</strong><small>${lang === "en" ? "Humans" : "Mennesker"}</small></div></div>
+          <div class="pf-stat" data-stat="ai" title="${lang === "en" ? "Views from AI agents (ChatGPT, Claude, Perplexity etc.)" : "Visninger fra AI-agenter (ChatGPT, Claude, Perplexity m.fl.)"}"><div class="pf-stat-icon a">&#129302;</div><div><strong data-fill="ai">0</strong><small>${lang === "en" ? "AI agents" : "AI-agenter"}</small></div></div>
         </div>
       </div>
 
@@ -2501,6 +2514,13 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
 
     <div class="pf-content">
       <div class="pf-main">
+        <!-- Per-agent stats: hidden until /api/agents/<id>/stats fills it.
+             Sits between Trust score and Produkter per Daniels brief. -->
+        <div id="pf-conv-card" class="card">
+          <div class="card-head"><span>&#128172;</span><h3>${lang === "en" ? "Recent conversations with AI agents" : "Siste samtaler med AI-agenter"}</h3></div>
+          <div class="card-body"><div id="pf-conv-list" class="conv-list"></div></div>
+        </div>
+
         ${imagesHtml ? `
         <div class="card">
           <div class="card-head"><span>&#128247;</span><h3>Bilder</h3></div>
@@ -2590,7 +2610,73 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
           <div class="card-body"><div class="rel-grid">${relatedHtml}</div></div>
         </div>` : ""}
       </div>
-    </div>`;
+    </div>
+    <script>
+      // Per-agent stats hydration. Server keeps the page cacheable; this
+      // small fetch personalises the visibility tiles + AI-conversation
+      // card client-side. Fail-quiet: if the API errors or returns 0,
+      // the placeholders stay hidden (display:none in PROFILE_CSS).
+      (function () {
+        var agentId = ${JSON.stringify(agent.id)};
+        var url = "/api/agents/" + encodeURIComponent(agentId) + "/stats";
+        fetch(url, { credentials: "same-origin" })
+          .then(function (r) { return r.ok ? r.json() : null; })
+          .then(function (s) {
+            if (!s) return;
+            var fmt = function (n) { return (n || 0).toLocaleString(${JSON.stringify(lang === "en" ? "en-GB" : "nb-NO")}); };
+            if (s.humanViews > 0) {
+              var h = document.querySelector('[data-stat="human"]');
+              if (h) { h.querySelector('[data-fill="human"]').textContent = fmt(s.humanViews); h.style.display = "flex"; }
+            }
+            if (s.aiViews > 0) {
+              var a = document.querySelector('[data-stat="ai"]');
+              if (a) {
+                a.querySelector('[data-fill="ai"]').textContent = fmt(s.aiViews);
+                a.style.display = "flex";
+                var b = s.aiBreakdown || {};
+                var parts = [];
+                if (b.chatgpt) parts.push("ChatGPT " + b.chatgpt);
+                if (b.claude) parts.push("Claude " + b.claude);
+                if (b.other) parts.push(${JSON.stringify(lang === "en" ? "Other" : "Annet")} + " " + b.other);
+                if (parts.length) a.setAttribute("title", parts.join(" · "));
+              }
+            }
+            if (s.lastConversations && s.lastConversations.length > 0) {
+              var srcLabel = function (src) {
+                if (src === "a2a") return ${JSON.stringify(lang === "en" ? "A2A agent" : "A2A-agent")};
+                if (src === "mcp") return ${JSON.stringify(lang === "en" ? "MCP client" : "MCP-klient")};
+                if (src === "web") return "Web";
+                return ${JSON.stringify(lang === "en" ? "Agent" : "Agent")};
+              };
+              var EN = ${JSON.stringify(lang === "en")};
+              var relTime = function (iso) {
+                if (!iso) return "";
+                var d = Math.floor((Date.now() - new Date(iso).getTime()) / 86400000);
+                if (d <= 0) return EN ? "today" : "i dag";
+                if (d === 1) return EN ? "yesterday" : "i går";
+                if (d < 7) return d + (EN ? " days ago" : " dager siden");
+                if (d < 30) return Math.floor(d / 7) + (EN ? " weeks ago" : " uker siden");
+                if (d < 365) return Math.floor(d / 30) + (EN ? " months ago" : " måneder siden");
+                return Math.floor(d / 365) + (EN ? " years ago" : " år siden");
+              };
+              var escape = function (t) {
+                return String(t || "").replace(/&/g, "&amp;").replace(/</g, "&lt;")
+                  .replace(/>/g, "&gt;").replace(/"/g, "&quot;").replace(/'/g, "&#39;");
+              };
+              var html = s.lastConversations.map(function (c) {
+                return '<div class="conv-item">' +
+                  '<div class="conv-head"><span>&#129302;</span><span class="conv-src">' + escape(srcLabel(c.source)) + '</span><span>&middot; ' + escape(relTime(c.createdAt)) + '</span></div>' +
+                  '<div class="conv-text">&ldquo;' + escape(c.question) + '&rdquo;</div>' +
+                  '</div>';
+              }).join("");
+              var list = document.getElementById("pf-conv-list");
+              var card = document.getElementById("pf-conv-card");
+              if (list && card) { list.innerHTML = html; card.style.display = "block"; }
+            }
+          })
+          .catch(function () { /* fail-quiet — no UI on error */ });
+      })();
+    </script>`;
 
     res.send(shell(
       `${agent.name}${cityName ? t(lang, "producer.title_suffix", { city: cityName }) : ""}`,
