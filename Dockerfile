@@ -18,6 +18,7 @@ RUN npm ci && apk del python3 make g++
 # weren't actually reaching prod because the layer was cached.
 ARG BUILD_REV=dev
 LABEL build_rev=$BUILD_REV
+ENV GIT_SHA=$BUILD_REV
 RUN echo "build_rev=$BUILD_REV" > /app/.build-rev
 
 # Copy source + public assets

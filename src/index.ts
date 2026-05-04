@@ -32,6 +32,7 @@ import analyticsRoutes from "./routes/analytics";
 import adminRunsRoutes from "./routes/admin-runs";
 import platformTriggersRoutes, { adminRouter as adminTriggersRoutes } from "./routes/platform-triggers";
 import crmRoutes from "./routes/crm";
+import { list as blocklistList } from "./services/blocklist-service";
 import { seedData } from "./seed";
 // Seed files moved to src/_seeds/ — only loaded if DB is empty (see below).
 import { discoveryService } from "./services/discovery-service";
@@ -200,6 +201,7 @@ app.get("/health", (_req, res) => {
       warnings,
       service: "rettfrabonden",
       version: "1.0.0",
+      git_sha: process.env.GIT_SHA || "unknown",
       uptime: uptimeSec,
       uptimeHuman: `${Math.floor(uptimeSec / 3600)}h ${Math.floor((uptimeSec % 3600) / 60)}m`,
       bootedAt: BOOT_TIME,
@@ -261,6 +263,29 @@ if (process.env.CRM_ENABLED !== "0") {
     res.sendFile(path.join(__dirname, "public", "admin-sent-log.html"));
   });
 }
+
+// ─── GET /admin/blocklist (Phase 4.11 — work-order #3 step 4) ─────────
+// Thin alias for /api/marketplace/admin/blocklist so verifier probes don't
+// need to know the marketplace mount path. Adds an optional `since` filter
+// (ISO8601) so verifier can ask "who got blocklisted since this run started?"
+// without scanning the full table.
+app.get("/admin/blocklist", adminLimiter, (req, res) => {
+  const adminKey = req.headers["x-admin-key"] as string;
+  const expected = process.env.ADMIN_KEY || process.env.ANALYTICS_ADMIN_KEY || "";
+  if (!expected) { res.status(503).json({ error: "Admin not configured" }); return; }
+  if (!adminKey || adminKey !== expected) { res.status(403).json({ error: "Krever X-Admin-Key header" }); return; }
+  try {
+    const limit = parseInt(String(req.query.limit ?? "100"), 10) || 100;
+    const offset = parseInt(String(req.query.offset ?? "0"), 10) || 0;
+    const sinceRaw = req.query.since ? String(req.query.since) : undefined;
+    // Light validation: ISO8601 prefix
+    const since = sinceRaw && /^\d{4}-\d{2}-\d{2}/.test(sinceRaw) ? sinceRaw : undefined;
+    const rows = blocklistList({ limit, offset, since });
+    res.json({ success: true, count: rows.length, since: since ?? null, entries: rows });
+  } catch (err: any) {
+    res.status(500).json({ error: "List failed", detail: err.message });
+  }
+});
 
 // Conversation UI — /samtaler and /samtale/:id (before SEO catch-all)
 app.use("/", conversationUiRoutes);

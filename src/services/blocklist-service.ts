@@ -183,10 +183,15 @@ export function add(input: {
 }
 
 // ─── list ──────────────────────────────────────────────────────
-export function list(opts?: { limit?: number; offset?: number }): BlocklistEntry[] {
+export function list(opts?: { limit?: number; offset?: number; since?: string }): BlocklistEntry[] {
   const db = getDb();
   const limit = Math.min(500, Math.max(1, opts?.limit || 100));
   const offset = Math.max(0, opts?.offset || 0);
+  if (opts?.since) {
+    return db.prepare(
+      "SELECT * FROM agent_blocklist WHERE created_at >= ? ORDER BY created_at DESC LIMIT ? OFFSET ?"
+    ).all(opts.since, limit, offset) as BlocklistEntry[];
+  }
   return db.prepare(
     "SELECT * FROM agent_blocklist ORDER BY created_at DESC LIMIT ? OFFSET ?"
   ).all(limit, offset) as BlocklistEntry[];
