@@ -1910,7 +1910,8 @@ const PROFILE_CSS = `
   .pf-stat-icon.h { background: #dbeafe; }
   .pf-stat-icon.a { background: #ede9fe; }
   .pf-stat strong { display: block; font-size: 0.9rem; }
-  .pf-stat small { font-size: 0.72rem; color: var(--g500); }
+  .pf-stat small { font-size: 0.72rem; color: var(--g500); line-height: 1.25; }
+  .pf-stat-meta { font-size: 0.66rem; color: var(--g400, #999); display: block; margin-top: 1px; }
   .ct-card { background: var(--white); border-radius: var(--r-lg); box-shadow: var(--shadow-lg); padding: 24px; position: sticky; top: 70px; }
   .ct-card h3 { font-size: 1rem; font-weight: 700; margin-bottom: 16px; }
   .ct-item { display: flex; align-items: flex-start; gap: 10px; padding: 9px 0; border-bottom: 1px solid var(--g100); font-size: 0.88rem; }
@@ -2496,8 +2497,8 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
         <div class="pf-stats">
           <div class="pf-stat"><div class="pf-stat-icon t">&#9733;</div><div><strong>${trustPct}%</strong><small>${lang === "en" ? "Trust Score" : "Trust Score"}</small></div></div>
           ${k.googleRating ? `<div class="pf-stat"><div class="pf-stat-icon r">&#11088;</div><div><strong>${k.googleRating} / 5</strong><small>${k.googleReviewCount || 0} ${lang === "en" ? "reviews" : "anmeldelser"}</small></div></div>` : ""}
-          <div class="pf-stat" data-stat="human" title="${lang === "en" ? "Views from humans" : "Visninger fra mennesker"}"><div class="pf-stat-icon h">&#127760;</div><div><strong data-fill="human">0</strong><small>${lang === "en" ? "Humans" : "Mennesker"}</small></div></div>
-          <div class="pf-stat" data-stat="ai" title="${lang === "en" ? "Views from AI agents (ChatGPT, Claude, Perplexity etc.)" : "Visninger fra AI-agenter (ChatGPT, Claude, Perplexity m.fl.)"}"><div class="pf-stat-icon a">&#129302;</div><div><strong data-fill="ai">0</strong><small>${lang === "en" ? "AI agents" : "AI-agenter"}</small></div></div>
+          <div class="pf-stat" data-stat="human" title="${lang === "en" ? "Page views from humans, last 90 days" : "Sidevisninger fra mennesker, siste 90 dager"}"><div class="pf-stat-icon h">&#127760;</div><div><strong data-fill="human">0</strong><small>${lang === "en" ? "Page views" : "Sidevisninger"}<br><span class="pf-stat-meta">${lang === "en" ? "humans &middot; 90d" : "mennesker &middot; 90d"}</span></small></div></div>
+          <div class="pf-stat" data-stat="ai" title="${lang === "en" ? "Page views from AI agents (ChatGPT, Claude, Perplexity etc.), last 90 days" : "Sidevisninger fra AI-agenter (ChatGPT, Claude, Perplexity m.fl.), siste 90 dager"}"><div class="pf-stat-icon a">&#129302;</div><div><strong data-fill="ai">0</strong><small>${lang === "en" ? "Page views" : "Sidevisninger"}<br><span class="pf-stat-meta">${lang === "en" ? "AI agents &middot; 90d" : "AI-agenter &middot; 90d"}</span></small></div></div>
         </div>
       </div>
 
