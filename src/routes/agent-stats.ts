@@ -5,7 +5,10 @@
  *
  *  GET /api/agents/:id/stats
  *
- * Returns all-time aggregates pulled from existing analytics tables. We do NOT
+ * Returns last-90-days view aggregates pulled from existing analytics tables.
+ * conversationCount and lastConversations remain all-time (cumulative engagement
+ * is a meaningful lifetime metric; views are noisy and benefit from a window).
+ * We do NOT
  * write anything new in this route — all source data is already captured by
  * analytics-service middleware and trackAgentView() in seo.ts. We just slice
  * it per agent here.
@@ -97,10 +100,17 @@ router.get("/api/agents/:id/stats", (req: Request, res: Response) => {
     const aiNotClause = ALL_AI_MARKERS.map(() => "session_id NOT LIKE ?").join(" AND ");
     const aiNotParams = ALL_AI_MARKERS.map(m => `%${m}%`);
 
+    // ─── Period cutoff ───────────────────────────────────────────────
+    // 90 days. Tile labels "Sidevisninger ... siste 90 dager" must stay in
+    // sync with this; if you change the window here, also update seo.ts
+    // (search for "siste 90 dager" / "last 90 days").
+    const PERIOD_CUTOFF = "datetime('now', '-90 days')";
+
     const humanRow = db.prepare(`
       SELECT COUNT(*) as count FROM analytics_page_views
       WHERE path = ?
         AND (is_owner IS NULL OR is_owner = 0)
+        AND created_at >= ${PERIOD_CUTOFF}
         AND ${aiNotClause}
     `).get(path, ...aiNotParams) as { count: number } | undefined;
     const humanViews = humanRow?.count ?? 0;
@@ -111,6 +121,7 @@ router.get("/api/agents/:id/stats", (req: Request, res: Response) => {
       const row = db.prepare(`
         SELECT COUNT(*) as count FROM analytics_page_views
         WHERE path = ? AND (is_owner IS NULL OR is_owner = 0)
+          AND created_at >= ${PERIOD_CUTOFF}
           AND (${clause})
       `).get(path, ...params) as { count: number } | undefined;
       return row?.count ?? 0;
