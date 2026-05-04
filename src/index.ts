@@ -29,6 +29,7 @@ import { linkHeaders, markdownNegotiation } from "./middleware/agent-discovery";
 import { langMiddleware } from "./i18n/middleware";
 import { analyticsService } from "./services/analytics-service";
 import analyticsRoutes from "./routes/analytics";
+import agentStatsRoutes from "./routes/agent-stats";
 import adminRunsRoutes from "./routes/admin-runs";
 import platformTriggersRoutes, { adminRouter as adminTriggersRoutes } from "./routes/platform-triggers";
 import crmRoutes from "./routes/crm";
@@ -289,6 +290,9 @@ app.get("/admin/blocklist", adminLimiter, (req, res) => {
 
 // Conversation UI — /samtaler and /samtale/:id (before SEO catch-all)
 app.use("/", conversationUiRoutes);
+
+// Public per-agent stats (powers visibility tiles + AI-conversation card on /produsent/<slug>)
+app.use("/", agentStatsRoutes);
 
 // SEO pages LAST — /:city is a catch-all wildcard
 app.use("/", discoveryRoutes);  // llms.txt, MCP server-card, agents.txt, openapi.json
