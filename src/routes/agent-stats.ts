@@ -10,6 +10,20 @@
  * analytics-service middleware and trackAgentView() in seo.ts. We just slice
  * it per agent here.
  *
+ * No-double-count contract:
+ *  - This route is mounted under /api/* which the analytics middleware
+ *    explicitly excludes from page-view tracking
+ *    (see analytics-service.ts middleware: `!req.path.startsWith("/api/")`).
+ *  - Therefore, browser-side hydration calls to /api/agents/:id/stats do
+ *    NOT register a second page-view. The /produsent/<slug> SEO render
+ *    is the only thing that increments analytics_page_views.
+ *  - If you ever change either the mount path or the analytics-middleware
+ *    filter, also re-verify this guarantee.
+ *
+ * Rate-limit:
+ *  - Inherits app.use("/api", generalLimiter) from index.ts: 300 req / 15 min
+ *    per IP. No extra limiter needed.
+ *
  * Privacy:
  *  - No buyer identity, no IP hashes, no email — only the buyer's first
  *    message text (which is what the seller agent answers based on public
@@ -22,24 +36,19 @@
 import { Router, Request, Response } from "express";
 import { getDb } from "../database/init";
 import { marketplaceRegistry } from "../services/marketplace-registry";
+import { slugify } from "../utils/slug";
 
 const router = Router();
-
-// ─── slug helper (mirrors seo.ts::slugify) ────────────────────────────
-// MUST stay byte-identical to seo.ts or we'll under-count visits because
-// the path stored in analytics_page_views won't match what we look up.
-// There's a regression test guarding this in tests/test.ts.
-function slugify(text: string): string {
-  return (text || "").normalize("NFC").toLowerCase()
-    .replace(/æ/g, "ae").replace(/ø/g, "o").replace(/å/g, "a")
-    .replace(/ä/g, "a").replace(/ö/g, "o").replace(/ü/g, "u")
-    .replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "");
-}
 
 // ─── AI bot UA markers stored in session_id (`${ipHash}:${userAgent}`) ─
 // Each marker is a substring we LIKE-match against session_id. Aligned with
 // analytics-service.ts parseUserAgent + getSummary so the per-agent split
 // matches the dashboard top-level totals.
+//
+// SYNC-TODO: When a new AI bot is added to analytics-service.ts (e.g. Mistral,
+// Cohere), it MUST also be added here, otherwise per-agent counts drift below
+// dashboard totals. Long-term fix: extract to src/constants/ai-bot-markers.ts
+// shared by both files. Tracked for Phase 5 cleanup.
 const AI_MARKERS = {
   chatgpt: ["GPTBot", "ChatGPT", "OAI-SearchBot"],
   claude: ["ClaudeBot", "Claude-User", "Anthropic"],
@@ -73,7 +82,9 @@ router.get("/api/agents/:id/stats", (req: Request, res: Response) => {
     const agent = agents.find((a: any) => a.id === agentId);
     if (!agent) return res.status(404).json({ error: "agent not found" });
 
-    const slug = slugify(agent.name);
+    // Use the shared slugify util (single source of truth — same as seo.ts).
+    // Empty-name guard handled inline since shared util doesn't take falsy.
+    const slug = slugify(agent.name || "");
     const path = `/produsent/${slug}`;
 
     const db = getDb();
@@ -157,6 +168,11 @@ router.get("/api/agents/:id/stats", (req: Request, res: Response) => {
         question: truncated,
       };
     }).filter(c => c.question.length > 0);  // Hide bare/empty rows
+
+    // 5-min HTTP cache. All-time aggregates change slowly; this absorbs
+    // most of the load from AI bot crawls (which hit /produsent/<slug>
+    // and trigger the hydration script) without sacrificing freshness.
+    res.setHeader("Cache-Control", "public, max-age=300");
 
     res.json({
       agentId,
