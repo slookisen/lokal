@@ -1116,6 +1116,53 @@ console.log("── agent-stats: per-agent stats endpoint logic ──");
 }
 
 
+// ── A2A v0.3.0 spec-compliance helpers (Phase 4.13 / WO #4) ──────────
+{
+  // Lazy-import so we don't bring up the whole Express stack
+  const { toA2AStatus, toA2ATask, toA2ADataArtifact } = require("../src/routes/a2a");
+
+  // toA2AStatus: must return {state, timestamp}
+  const s1 = toA2AStatus("completed");
+  assertEq(typeof s1, "object", "a2a-spec: toA2AStatus returns object");
+  assertEq(s1.state, "completed", "a2a-spec: toA2AStatus sets state");
+  assertTrue(typeof s1.timestamp === "string" && /^\d{4}-\d{2}-\d{2}T/.test(s1.timestamp), "a2a-spec: toA2AStatus sets ISO timestamp");
+
+  // toA2AStatus: explicit timestamp passes through
+  const s2 = toA2AStatus("submitted", "2026-05-04T20:00:00Z");
+  assertEq(s2.timestamp, "2026-05-04T20:00:00Z", "a2a-spec: toA2AStatus preserves explicit timestamp");
+
+  // toA2ATask: legacy string-status task gets wrapped
+  const legacyTask = { id: "t1", status: "completed", updatedAt: "2026-05-04T19:00:00Z" };
+  const wrapped = toA2ATask(legacyTask);
+  assertEq(typeof wrapped.status, "object", "a2a-spec: toA2ATask wraps string status into object");
+  assertEq(wrapped.status.state, "completed", "a2a-spec: toA2ATask preserves state");
+  assertEq(wrapped.status.timestamp, "2026-05-04T19:00:00Z", "a2a-spec: toA2ATask uses task.updatedAt");
+  assertEq(wrapped.id, "t1", "a2a-spec: toA2ATask preserves id");
+
+  // toA2ATask: idempotent on already-shaped task (no double wrap)
+  const alreadyShaped = { id: "t2", status: { state: "running", timestamp: "2026-05-04T19:30:00Z" } };
+  const idem = toA2ATask(alreadyShaped);
+  assertEq(idem.status.state, "running", "a2a-spec: toA2ATask idempotent on shaped task — preserves state");
+  assertEq(idem.status.timestamp, "2026-05-04T19:30:00Z", "a2a-spec: toA2ATask idempotent — preserves timestamp");
+
+  // toA2ATask: null/undefined pass-through
+  assertEq(toA2ATask(null), null, "a2a-spec: toA2ATask returns null on null");
+
+  // toA2ADataArtifact: spec-compliant {artifactId, name, parts: [{kind, data}]}
+  const art = toA2ADataArtifact({ artifactId: "a-1", name: "search-results", data: { count: 5 } });
+  assertEq(art.artifactId, "a-1", "a2a-spec: artifact.artifactId set");
+  assertEq(art.name, "search-results", "a2a-spec: artifact.name set");
+  assertTrue(Array.isArray(art.parts), "a2a-spec: artifact.parts is array");
+  assertEq(art.parts.length, 1, "a2a-spec: artifact.parts has one entry");
+  assertEq(art.parts[0].kind, "data", "a2a-spec: artifact.parts[0].kind === 'data'");
+  assertEq((art.parts[0] as any).data.count, 5, "a2a-spec: artifact.parts[0].data preserved");
+
+  // No legacy fields leaked
+  assertTrue(!("type" in art), "a2a-spec: artifact does NOT carry legacy 'type' field");
+  assertTrue(!("data" in art), "a2a-spec: artifact does NOT carry legacy top-level 'data' field");
+}
+
+
 // ── REPORT ────────────────────────────────────────────────────────────
 console.log(`\n${passed} passed, ${failed} failed\n`);
 if (failed > 0) {

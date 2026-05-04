@@ -20,6 +20,32 @@ import { redactPII } from "../utils/pii-redact";
 const router = Router();
 const BASE_URL = process.env.BASE_URL || "http://localhost:3000";
 
+// ─── A2A v0.3.0 spec-compliant response helpers (Phase 4.13 / WO #4) ──
+// Spec: task.status is an object {state, timestamp}, not a bare string.
+// Spec: artifacts[] use {artifactId, name, parts: [{kind, ...}]}, not {type, data}.
+export function toA2AStatus(state: string, timestamp?: string) {
+  return { state, timestamp: timestamp || new Date().toISOString() };
+}
+
+export function toA2ATask(task: any): any {
+  if (!task) return task;
+  // If status is already an object (already spec-shape), pass through.
+  if (task.status && typeof task.status === "object" && "state" in task.status) return task;
+  return {
+    ...task,
+    status: toA2AStatus(String(task.status || "unknown"), task.updatedAt || task.updated_at),
+  };
+}
+
+export function toA2ADataArtifact(opts: { artifactId: string; name: string; data: any }) {
+  return {
+    artifactId: opts.artifactId,
+    name: opts.name,
+    parts: [{ kind: "data", data: opts.data }],
+  };
+}
+
+
 // ═══════════════════════════════════════════════════════════════
 // JSON-RPC 2.0 ENDPOINT (Gap 3 fix)
 // This is what makes us A2A-compatible.
@@ -268,18 +294,19 @@ function handleMessageSend(params: any, id: any, req: Request, res: Response) {
       result: {
         task: {
           id: task.id,
-          status: "completed",
+          status: toA2AStatus("completed"),
         },
         artifacts: [
-          {
-            type: "application/json",
+          toA2ADataArtifact({
+            artifactId: `search-${task.id}`,
+            name: "search-results",
             data: {
               count: results.length,
               agents: results,
               conversations,
               parsedQuery: messageText ? marketplaceRegistry.parseNaturalQuery(messageText) : discoveryQuery,
             },
-          },
+          }),
         ],
       },
       id,
@@ -321,7 +348,7 @@ function handleTasksGet(params: any, id: any, res: Response) {
 
   res.json({
     jsonrpc: "2.0",
-    result: { task },
+    result: { task: toA2ATask(task) },
     id,
   });
 }
@@ -333,7 +360,7 @@ function handleTasksList(params: any, id: any, res: Response) {
   const tasks = marketplaceRegistry.listTasks(params?.agentId, params?.status);
   res.json({
     jsonrpc: "2.0",
-    result: { tasks },
+    result: { tasks: tasks.map(toA2ATask) },
     id,
   });
 }
@@ -392,11 +419,14 @@ function handleAgentInfo(params: any, id: any, res: Response) {
   res.json({
     jsonrpc: "2.0",
     result: {
-      task: { id: `info-${agentId}`, status: "completed" },
-      artifacts: [{
-        type: "application/json",
-        data: info,
-      }],
+      task: { id: `info-${agentId}`, status: toA2AStatus("completed") },
+      artifacts: [
+        toA2ADataArtifact({
+          artifactId: `info-${agentId}`,
+          name: "agent-info",
+          data: info,
+        }),
+      ],
     },
     id,
   });
