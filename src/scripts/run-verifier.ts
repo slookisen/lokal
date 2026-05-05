@@ -28,11 +28,30 @@ const ADMIN_KEY = process.env.ADMIN_KEY;
 const BASE = process.env.BASE_URL || "http://localhost:3000";
 const BATCH_SIZE = parseInt(process.env.VERIFIER_BATCH_SIZE || "30", 10);
 
+// Time-window: only run 22:00-06:00 UTC (covers low-traffic night hours).
+// Fly Machines `--schedule hourly` fires 24×/day; this gate skips 15 of 24
+// runs so we get effective 9-runs-per-night without needing cron-expression.
+// Override via env: FORCE_RUN=1 to bypass (manual ad-hoc runs).
+const ALLOWED_UTC_HOURS = [22, 23, 0, 1, 2, 3, 4, 5, 6];
+
 async function main(): Promise<number> {
-  const runStartedAt = new Date().toISOString();
+  const now = new Date();
+  const hourUTC = now.getUTCHours();
+  const forceRun = process.env.FORCE_RUN === "1";
+
+  if (!ALLOWED_UTC_HOURS.includes(hourUTC) && !forceRun) {
+    console.log(
+      `[verifier-runner] Skipping — current UTC hour ${hourUTC} outside allowed window 22-06`
+    );
+    console.log(`[verifier-runner] (set FORCE_RUN=1 to override for manual testing)`);
+    return 0;
+  }
+
+  const runStartedAt = now.toISOString();
   const runId = `run-${runStartedAt.replace(/[:.]/g, "").slice(0, 15)}-lokal-agent-verifier-rfb`;
 
   console.log(`[verifier-runner] Starting ${runId}`);
+  console.log(`[verifier-runner] Hour UTC: ${hourUTC} (allowed window 22-06, force=${forceRun})`);
   console.log(`[verifier-runner] Batch size: ${BATCH_SIZE}`);
 
   const db = getDb();
@@ -81,33 +100,4 @@ async function main(): Promise<number> {
       const resp = await fetch(`${BASE}/admin/runs`, {
         method: "POST",
         headers: {
-          "X-Admin-Key": ADMIN_KEY,
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify(envelope),
-      });
-
-      if (resp.ok) {
-        console.log(`[verifier-runner] Envelope posted: ${runId}`);
-      } else {
-        console.error(`[verifier-runner] Envelope POST failed: HTTP ${resp.status}`);
-        errorCount++;
-      }
-    } catch (err: any) {
-      console.error(`[verifier-runner] Envelope POST error:`, err?.message || err);
-      errorCount++;
-    }
-  } else {
-    console.warn(`[verifier-runner] No ADMIN_KEY in env — skipping envelope POST`);
-  }
-
-  console.log(`[verifier-runner] Done. Exit code: ${errorCount > 0 ? 1 : 0}`);
-  return errorCount > 0 ? 1 : 0;
-}
-
-main()
-  .then((code) => process.exit(code))
-  .catch((err) => {
-    console.error(`[verifier-runner] Unhandled error:`, err);
-    process.exit(2);
-  });
+          "X-Admin-Key": A
