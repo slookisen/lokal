@@ -9,7 +9,6 @@
 // Set FORCE_RUN=1 to bypass for manual ad-hoc testing.
 
 import { runVerifierBatch, buildRunEnvelope } from "../agents/lokal-agent-verifier";
-import { getDb } from "../database/init";
 
 const ADMIN_KEY = process.env.ADMIN_KEY;
 const BASE = process.env.BASE_URL || "http://localhost:3000";
@@ -27,47 +26,47 @@ async function main(): Promise<number> {
     return 0;
   }
 
-  const runStartedAt = now.toISOString();
-  const runId = `run-${runStartedAt.replace(/[:.]/g, "").slice(0, 15)}-lokal-agent-verifier-rfb`;
+  console.log(`[verifier-runner] Starting (hour=${hourUTC}, force=${forceRun}, batch=${BATCH_SIZE})`);
 
-  console.log(`[verifier-runner] Starting ${runId} (hour=${hourUTC}, force=${forceRun})`);
-  console.log(`[verifier-runner] Batch size: ${BATCH_SIZE}`);
-
-  const db = getDb();
-  let results: any[] = [];
+  let batchResult;
   let errorCount = 0;
 
   try {
-    const batchResult = await runVerifierBatch({ db, batchSize: BATCH_SIZE, runStartedAt });
-    results = batchResult.results || [];
-    console.log(`[verifier-runner] Processed ${results.length} agents`);
+    batchResult = await runVerifierBatch({ batchSize: BATCH_SIZE });
+    console.log(`[verifier-runner] Run ID: ${batchResult.run_id}`);
+    console.log(`[verifier-runner] Processed ${batchResult.results.length} agents`);
   } catch (err: any) {
     console.error(`[verifier-runner] Critical error:`, err?.message || err);
-    errorCount++;
+    return 1;
   }
 
-  const finishedAt = new Date().toISOString();
+  const results = batchResult.results;
   const passed = results.filter((r) => r.passed).length;
   const reviewRequired = results.filter((r) => r.new_verification_status === "review_required").length;
   const pendingVerify = results.filter((r) => r.new_verification_status === "pending_verify").length;
-  const httpUnreachable = results.filter((r) => r.flags?.includes("website_unreachable")).length;
+  const httpUnreachable = results.filter((r) => r.flags.includes("website_unreachable")).length;
   const brregInactive = results.filter((r) =>
-    (r.flags || []).some((f: string) => f === "brreg_inactive" || f === "brreg_konkurs")
+    r.flags.some((f: string) => f === "brreg_inactive" || f === "brreg_konkurs")
   ).length;
-  const pooledNew = results.filter((r) => r.outreach_eligible_at).length;
+  const pooledNew = results.filter((r) => r.outreach_eligible_at !== null).length;
 
   console.log(`[verifier-runner] passed=${passed} review=${reviewRequired} pending=${pendingVerify} unreachable=${httpUnreachable} brreg_inactive=${brregInactive} pool_added=${pooledNew}`);
 
   if (ADMIN_KEY) {
     try {
-      const envelope = buildRunEnvelope({ runId, startedAt: runStartedAt, finishedAt, results });
+      const envelope = buildRunEnvelope({
+        run_id: batchResult.run_id,
+        started_at: batchResult.started_at,
+        finished_at: batchResult.finished_at,
+        results,
+      });
       const resp = await fetch(`${BASE}/admin/runs`, {
         method: "POST",
         headers: { "X-Admin-Key": ADMIN_KEY, "Content-Type": "application/json" },
         body: JSON.stringify(envelope),
       });
       if (resp.ok) {
-        console.log(`[verifier-runner] Envelope posted: ${runId}`);
+        console.log(`[verifier-runner] Envelope posted: ${batchResult.run_id}`);
       } else {
         console.error(`[verifier-runner] Envelope POST failed: HTTP ${resp.status}`);
         errorCount++;
