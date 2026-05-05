@@ -784,6 +784,13 @@ class MarketplaceRegistry {
       categories: "categories",
       tags: "tags",
       skills: "skills",
+      // Phase 4.x — allow admin/owner to correct geo metadata.
+      // city is the column on the agents table that surfaces in
+      // search results, contact-card downloads, and the agent
+      // detail page. Misclassified region (e.g. Akershus vs Buskerud
+      // when postal code is in Buskerud) shows up in 3+ places —
+      // exposing this field in PATCH closes that whole class of bug.
+      city: "city",
     };
 
     const setClauses: string[] = ["last_seen_at = datetime('now')"];
