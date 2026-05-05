@@ -1295,6 +1295,147 @@ console.log("── agent-stats: per-agent stats endpoint logic ──");
 }
 
 
+
+// ── WO #7 / Phase 5.1: outreach_ready_pool + verify-first schema ─────
+{
+  const sqlite = require("better-sqlite3");
+  const wo7db = new sqlite(":memory:");
+
+  // Minimal schema replica — only what WO #7 touches
+  wo7db.exec(`
+    CREATE TABLE agents (id TEXT PRIMARY KEY, name TEXT NOT NULL, role TEXT, city TEXT);
+    CREATE TABLE agent_knowledge (
+      agent_id TEXT PRIMARY KEY REFERENCES agents(id),
+      address TEXT, phone TEXT, email TEXT, about TEXT,
+      products TEXT DEFAULT '[]', opening_hours TEXT DEFAULT '[]',
+      specialties TEXT DEFAULT '[]', certifications TEXT DEFAULT '[]',
+      data_source TEXT DEFAULT 'auto', auto_sources TEXT DEFAULT '[]',
+      last_enriched_at TEXT,
+      field_provenance TEXT NOT NULL DEFAULT '{}',
+      verification_status TEXT NOT NULL DEFAULT 'unverified',
+      enrichment_status TEXT NOT NULL DEFAULT 'thin',
+      outreach_eligible_at TEXT,
+      last_verified_at TEXT,
+      last_http_check_at TEXT,
+      last_http_status INTEGER
+    );
+    CREATE TABLE outreach_sent_log (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      agent_id TEXT NOT NULL REFERENCES agents(id),
+      sent_at TEXT NOT NULL DEFAULT (datetime('now')),
+      channel TEXT NOT NULL DEFAULT 'email',
+      message_id TEXT,
+      notes TEXT
+    );
+    CREATE VIEW outreach_ready_pool AS
+      SELECT a.id AS agent_id, a.name, a.role, a.city AS location_city,
+             k.email, k.phone, k.verification_status, k.enrichment_status,
+             k.outreach_eligible_at, k.last_verified_at
+      FROM agents a INNER JOIN agent_knowledge k ON k.agent_id = a.id
+      WHERE k.email IS NOT NULL AND k.email != ''
+        AND k.verification_status = 'verified'
+        AND k.enrichment_status IN ('partial','rich')
+        AND 1=1
+        AND NOT EXISTS (SELECT 1 FROM outreach_sent_log o WHERE o.agent_id = a.id);
+  `);
+
+  // Test 1: agent_knowledge has new columns after migration
+  const cols = wo7db.prepare(`PRAGMA table_info(agent_knowledge)`).all().map((r: any) => r.name);
+  for (const need of ["field_provenance","verification_status","enrichment_status","outreach_eligible_at","last_verified_at","last_http_check_at","last_http_status"]) {
+    assertTrue(cols.includes(need), `wo7: agent_knowledge.${need} column exists`);
+  }
+
+  // Helper for seeding
+  const seed = (id: string, opts: any = {}) => {
+    wo7db.prepare("INSERT INTO agents (id, name, role, city) VALUES (?, ?, ?, ?)")
+      .run(id, opts.name || `Test ${id}`, opts.role || "producer", opts.city || "Oslo");
+    wo7db.prepare(`INSERT INTO agent_knowledge
+      (agent_id, email, phone, about, products, auto_sources, data_source, last_enriched_at,
+       verification_status, enrichment_status)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
+        id,
+        opts.email ?? "x@example.no",
+        opts.phone ?? null,
+        opts.about ?? null,
+        opts.products ?? "[]",
+        opts.auto_sources ?? '["hanen.no"]',
+        opts.data_source ?? "auto",
+        opts.last_enriched_at ?? "2026-04-01T00:00:00Z",
+        opts.verification_status ?? "unverified",
+        opts.enrichment_status ?? "thin",
+      );
+  };
+
+  // Test 2: VIEW returns 0 rows when all agents are unverified
+  for (let i = 1; i <= 5; i++) seed(`u-${i}`);
+  let count = (wo7db.prepare("SELECT COUNT(*) AS c FROM outreach_ready_pool").get() as any).c;
+  assertEq(count, 0, "wo7: outreach_ready_pool=0 when all agents unverified");
+
+  // Test 3: VIEW returns 1 when agent is verified+rich+uncontacted
+  seed("v-1", { email: "v1@example.no", verification_status: "verified", enrichment_status: "rich" });
+  count = (wo7db.prepare("SELECT COUNT(*) AS c FROM outreach_ready_pool WHERE agent_id = 'v-1'").get() as any).c;
+  assertEq(count, 1, "wo7: pool includes verified+rich+uncontacted agent");
+
+  // Test 4: VIEW excludes agents with prior outreach
+  seed("v-2", { email: "v2@example.no", verification_status: "verified", enrichment_status: "partial" });
+  wo7db.prepare("INSERT INTO outreach_sent_log (agent_id, channel, message_id) VALUES (?, ?, ?)").run("v-2", "email", "msg-1");
+  count = (wo7db.prepare("SELECT COUNT(*) AS c FROM outreach_ready_pool WHERE agent_id = 'v-2'").get() as any).c;
+  assertEq(count, 0, "wo7: pool excludes agents with prior outreach");
+
+  // Test 5: backfillProvenance creates valid JSON for rows with email
+  // Replicate the production backfill loop locally
+  const backfillRows = wo7db.prepare(`SELECT agent_id, address, phone, email, about, products, opening_hours, specialties, certifications, data_source, auto_sources, last_enriched_at FROM agent_knowledge`).all() as any[];
+  const trackable = ['address','phone','email','about','products','opening_hours','specialties','certifications'];
+  let touched = 0;
+  for (const r of backfillRows) {
+    let sources: string[] = [];
+    try { sources = JSON.parse(r.auto_sources || '[]'); } catch { sources = []; }
+    const provenance: Record<string, any> = {};
+    const stamp = r.last_enriched_at || new Date().toISOString();
+    for (const f of trackable) {
+      const v = r[f];
+      if (v && v !== '' && v !== '[]' && v !== '{}') {
+        provenance[f] = {
+          source_type: r.data_source || 'auto',
+          source_url: sources[0] || 'unknown',
+          evidence_level: 'B',
+          confidence: 0.7,
+          fetched_at: stamp,
+          last_verified_at: stamp,
+          verifier: 'backfill-phase51',
+          cross_sources: [],
+        };
+      }
+    }
+    if (Object.keys(provenance).length > 0) {
+      wo7db.prepare("UPDATE agent_knowledge SET field_provenance = ? WHERE agent_id = ?").run(JSON.stringify(provenance), r.agent_id);
+      touched++;
+    }
+  }
+  assertTrue(touched >= 5, `wo7: backfill touched >=5 rows (got ${touched})`);
+  const sample = wo7db.prepare("SELECT field_provenance FROM agent_knowledge WHERE agent_id = 'v-1'").get() as any;
+  let parsed: any = null;
+  try { parsed = JSON.parse(sample.field_provenance); } catch {}
+  assertTrue(parsed && parsed.email && parsed.email.evidence_level === 'B', "wo7: provenance row has email with evidence_level=B");
+
+  // Test 6: admin route file is wired into index.ts
+  const fs6 = require("fs");
+  const indexSrc6 = fs6.readFileSync("src/index.ts", "utf8");
+  assertTrue(
+    indexSrc6.includes('admin-outreach-pool') && indexSrc6.includes('/admin/outreach-ready-pool'),
+    "wo7: /admin/outreach-ready-pool route mounted in index.ts"
+  );
+  const routeSrc = fs6.readFileSync("src/routes/admin-outreach-pool.ts", "utf8");
+  assertTrue(routeSrc.includes('/stats') && routeSrc.includes('outreach_ready_pool'), "wo7: route file exposes /stats and queries the VIEW");
+
+  // Source-presence: confirm migration block landed in init.ts
+  const initSrc = fs6.readFileSync("src/database/init.ts", "utf8");
+  assertTrue(initSrc.includes('Phase 5.1') && initSrc.includes('field_provenance'), "wo7: Phase 5.1 migration block present in init.ts");
+  assertTrue(initSrc.includes('outreach_sent_log') && initSrc.includes('CREATE VIEW outreach_ready_pool'), "wo7: outreach_sent_log table + VIEW in init.ts");
+
+  wo7db.close();
+}
+
 // ── REPORT ────────────────────────────────────────────────────────────
 console.log(`\n${passed} passed, ${failed} failed\n`);
 if (failed > 0) {

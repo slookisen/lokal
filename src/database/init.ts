@@ -878,6 +878,146 @@ function initSchema(db: Database.Database): void {
   } catch (err) {
     console.error("Migration reset_test_verifications failed:", err);
   }
+
+  // ─── Phase 5.1 — verify-first schema (WO #7, 2026-05-05) ─────
+  // Adds the columns that lokal-agent-verifier (WO #8, future) will
+  // populate. All seven columns get safe defaults so the existing
+  // 1416 agents start as `unverified`/`thin` and the marketing
+  // pipeline keeps reading from the legacy uncontacted-pool until
+  // WO #9 switches it to outreach_ready_pool.
+  //
+  // Reference: PHASE5-DATA-QUALITY-PLAN.md §3.1
+  for (const stmt of [
+    `ALTER TABLE agent_knowledge ADD COLUMN field_provenance TEXT NOT NULL DEFAULT '{}'`,
+    `ALTER TABLE agent_knowledge ADD COLUMN verification_status TEXT NOT NULL DEFAULT 'unverified'`,
+    `ALTER TABLE agent_knowledge ADD COLUMN enrichment_status TEXT NOT NULL DEFAULT 'thin'`,
+    `ALTER TABLE agent_knowledge ADD COLUMN outreach_eligible_at TEXT`,
+    `ALTER TABLE agent_knowledge ADD COLUMN last_verified_at TEXT`,
+    `ALTER TABLE agent_knowledge ADD COLUMN last_http_check_at TEXT`,
+    `ALTER TABLE agent_knowledge ADD COLUMN last_http_status INTEGER`,
+  ]) {
+    try {
+      db.exec(stmt);
+    } catch {
+      // Column already exists — expected after first migration
+    }
+  }
+
+  // outreach_sent_log — Phase 5 ledger of WHAT we have actually sent
+  // through the verify-first pipeline. Empty initially; the WO #9
+  // marketing-pool-switch will start writing rows here. CRM threads
+  // are NOT backfilled in here on purpose — they belong to the legacy
+  // uncontacted-pool and have their own dedupe (last_outbound_at).
+  try {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS outreach_sent_log (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        agent_id TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+        sent_at TEXT NOT NULL DEFAULT (datetime('now')),
+        channel TEXT NOT NULL DEFAULT 'email',
+        message_id TEXT,
+        notes TEXT
+      )
+    `);
+    db.exec(`CREATE INDEX IF NOT EXISTS idx_outreach_sent_log_agent ON outreach_sent_log(agent_id)`);
+  } catch (err) {
+    console.error("Migration outreach_sent_log failed:", err);
+  }
+
+  // outreach_ready_pool VIEW — the list marketing will read once
+  // WO #9 switches over. Filtered by:
+  //   - non-null email
+  //   - verification_status = 'verified'
+  //   - enrichment_status in ('partial','rich')
+  //   - never sent through the new pipeline (outreach_sent_log)
+  // NOTE: agents.removed_at does not exist yet (Phase 5.10) — using
+  // 1=1 as placeholder so the VIEW resolves on prod today.
+  try {
+    db.exec(`DROP VIEW IF EXISTS outreach_ready_pool`);
+    db.exec(`
+      CREATE VIEW outreach_ready_pool AS
+      SELECT
+        a.id AS agent_id,
+        a.name,
+        a.role,
+        a.city AS location_city,
+        k.email,
+        k.phone,
+        k.verification_status,
+        k.enrichment_status,
+        k.outreach_eligible_at,
+        k.last_verified_at
+      FROM agents a
+      INNER JOIN agent_knowledge k ON k.agent_id = a.id
+      WHERE
+        k.email IS NOT NULL
+        AND k.email != ''
+        AND k.verification_status = 'verified'
+        AND k.enrichment_status IN ('partial', 'rich')
+        AND 1=1  /* TODO Phase 5.10: AND a.removed_at IS NULL */
+        AND NOT EXISTS (
+          SELECT 1 FROM outreach_sent_log o
+          WHERE o.agent_id = a.id
+        )
+    `);
+  } catch (err) {
+    console.error("Migration outreach_ready_pool VIEW failed:", err);
+  }
+
+  // Phase 5.1 backfill — populate field_provenance for existing rows
+  // from data_source + auto_sources. Tier-B confidence (0.7) since
+  // these were enriched before per-field provenance existed.
+  try {
+    const alreadyRan = db.prepare(
+      "SELECT 1 FROM migrations WHERE name = 'phase51_backfill_provenance_v1'"
+    ).get();
+    if (!alreadyRan) {
+      const rows = db.prepare(`
+        SELECT agent_id, address, phone, email, about, products,
+               opening_hours, specialties, certifications,
+               data_source, auto_sources, last_enriched_at
+        FROM agent_knowledge
+        WHERE field_provenance = '{}' OR field_provenance IS NULL
+      `).all() as any[];
+      const trackable = ['address','phone','email','about','products','opening_hours','specialties','certifications'];
+      const upd = db.prepare("UPDATE agent_knowledge SET field_provenance = ? WHERE agent_id = ?");
+      let touched = 0;
+      const tx = db.transaction((batch: any[]) => {
+        for (const r of batch) {
+          let sources: string[] = [];
+          try { sources = JSON.parse(r.auto_sources || '[]'); } catch { sources = []; }
+          const provenance: Record<string, any> = {};
+          const stamp = r.last_enriched_at || new Date().toISOString();
+          for (const f of trackable) {
+            const v = r[f];
+            if (v && v !== '' && v !== '[]' && v !== '{}') {
+              provenance[f] = {
+                source_type: r.data_source || 'auto',
+                source_url: sources[0] || 'unknown',
+                evidence_level: 'B',
+                confidence: 0.7,
+                fetched_at: stamp,
+                last_verified_at: stamp,
+                verifier: 'backfill-phase51',
+                cross_sources: [],
+              };
+            }
+          }
+          if (Object.keys(provenance).length > 0) {
+            upd.run(JSON.stringify(provenance), r.agent_id);
+            touched++;
+          }
+        }
+      });
+      tx(rows);
+      db.prepare("INSERT INTO migrations (name) VALUES ('phase51_backfill_provenance_v1')").run();
+      if (touched > 0) {
+        console.log(`🧹 Migration phase51_backfill_provenance_v1: touched ${touched}/${rows.length} agent_knowledge row(s)`);
+      }
+    }
+  } catch (err) {
+    console.error("Migration phase51_backfill_provenance_v1 failed:", err);
+  }
 }
 
 export function closeDb(): void {
