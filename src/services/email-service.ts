@@ -208,6 +208,12 @@ export class EmailService {
         text: options.textContent,
         replyTo: options.replyTo,
         headers,
+        // Force base64 transfer-encoding to preserve `=` in URLs (e.g. magic-link
+        // ?magic=<token>). Default quoted-printable line-wraps long URLs at the
+        // `=` boundary, and some receivers decode `=XX` as a single byte before
+        // Gmail's plaintext extractor strips the now-invalid char. Verified
+        // 2026-05-05 (rfb-supervisor claim-flow E2E test).
+        textEncoding: 'base64' as const,
       };
 
       const info = await this.transporter.sendMail(mailOptions);
@@ -256,6 +262,8 @@ export class EmailService {
         subject: options.subject,
         text: options.textContent,
         headers,
+        // See sendEmail above — base64 transfer-encoding to preserve URL `=`.
+        textEncoding: 'base64',
       };
       if (options.cc) mailOptions.cc = options.cc;
       if (options.htmlContent) mailOptions.html = options.htmlContent;
