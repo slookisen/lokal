@@ -1001,7 +1001,11 @@ router.post("/auth/magic-link", async (req: Request, res: Response) => {
     }
 
     const baseUrl = process.env.APP_URL || "https://rettfrabonden.com";
-    const magicUrl = `${baseUrl}/selger?magic=${result.token}`;
+    // Path-based URL (no `=` in plaintext) so SMTP relays cannot mangle it as
+    // quoted-printable. Redirect route below sends browser to /selger?magic=...
+    // where existing JS reads it from window.location.search.
+    // See `GET /auth/m/:token` route below.
+    const magicUrl = `${baseUrl}/api/marketplace/auth/m/${result.token}`;
 
     await emailService.sendMagicLink(email, magicUrl, result.agentName || "din agent");
 
@@ -1037,6 +1041,23 @@ router.get("/auth/magic-verify", (req: Request, res: Response) => {
       claimantName: result.claimantName,
     },
   });
+});
+
+// ─── GET /auth/m/:token — Path-based magic redirect ──────────
+// Email plaintext URLs don't tolerate `=` reliably (Resend SMTP relay
+// re-encodes as quoted-printable, mangling `?magic=<hex>` so receivers
+// see `?magic7b...` (= dropped) or `?magic\u00ef\u00bf\u00bd518d...` (replacement char).
+// 2026-05-05: rfb-supervisor confirmed `textEncoding: base64` on app side
+// did not help — relay re-encodes downstream.) This route accepts the
+// token in the path (no `=`) and 302-redirects to /selger?magic=<token>
+// where existing selger.html JS handles auto-login.
+router.get("/auth/m/:token", (req: Request, res: Response) => {
+  const token = req.params.token as string;
+  if (!token || !/^[A-Za-z0-9_-]+$/.test(token)) {
+    res.status(400).send("Ugyldig lenke");
+    return;
+  }
+  res.redirect(302, `/selger?magic=${encodeURIComponent(token)}`);
 });
 
 // ─── POST /agents/:id/unclaim — Give up ownership ──────────
