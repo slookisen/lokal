@@ -1,5 +1,5 @@
 # Smithery.ai MCP Server Configuration
-# This file tells Smithery how to run and list the Lokal MCP server.
+# This file tells Smithery how to run and list the Rett fra Bonden MCP server.
 
 startCommand:
   type: stdio
@@ -9,7 +9,7 @@ startCommand:
       LOKAL_API_URL:
         type: string
         default: "https://rettfrabonden.com"
-        description: "URL of the Lokal API server"
+        description: "URL of the Rett fra Bonden API server"
     required: []
   commandFunction: |-
     (config) => ({
