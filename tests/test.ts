@@ -1436,6 +1436,151 @@ console.log("── agent-stats: per-agent stats endpoint logic ──");
   wo7db.close();
 }
 
+
+// ── WO #8 / Phase 5: lokal-agent-verifier kvalitets-gate ─────────────
+{
+  const {
+    computeKvalitetsGate,
+    computeEnrichmentStatus,
+    deriveVerificationStatus,
+    pickBatch,
+    applyVerifierOutcome,
+    buildRunEnvelope,
+  } = require("../src/agents/lokal-agent-verifier");
+
+  // Test 1: gate passes when all signals are healthy
+  const gateOk = computeKvalitetsGate({
+    http_status: 200,
+    email: "post@gard.no",
+    website: "https://gard.no",
+    about: "Vi driver et lite småbruk på Vestlandet. Vi selger melk, ost og kjøtt direkte fra gården.",
+    products: [{ name: "melk" }, { name: "ost" }, { name: "kjøtt" }],
+    brreg: { is_active: true, is_konkurs: false, naering: "Husdyrhold" },
+  });
+  assertTrue(gateOk.passes, "wo8: gate passes when all signals healthy");
+  assertTrue(gateOk.flags.length === 0, `wo8: clean run yields no flags (got ${JSON.stringify(gateOk.flags)})`);
+
+  // Test 2: gate fails when website returns 4xx
+  const gate404 = computeKvalitetsGate({
+    http_status: 404,
+    email: "post@gard.no",
+    website: "https://gard.no",
+    about: "Vi driver et lite småbruk på Vestlandet. Vi selger melk, ost og kjøtt direkte fra gården.",
+    products: [{ name: "melk" }],
+    brreg: { is_active: true, is_konkurs: false },
+  });
+  assertTrue(!gate404.passes, "wo8: gate fails when http 404");
+  assertTrue(gate404.flags.includes("http_404"), "wo8: 404 flagged");
+  assertEq(deriveVerificationStatus(gate404.passes, gate404.flags), "pending_verify",
+    "wo8: 404 → pending_verify (re-try later)");
+
+  // Test 3: NACE-blacklist match → review_required
+  const gateNace = computeKvalitetsGate({
+    http_status: 200,
+    email: "post@restauranten.no",
+    website: "https://restauranten.no",
+    about: "Vi driver en restaurant midt i sentrum med lokale råvarer.",
+    products: [{ name: "menyer" }],
+    brreg: { is_active: true, is_konkurs: false, naering: "Drift av restauranter" },
+  });
+  assertTrue(!gateNace.passes, "wo8: gate fails when NACE-blacklisted");
+  assertTrue(gateNace.flags.some((f: string) => f.startsWith("nace_blacklist:")), "wo8: NACE flag emitted");
+  assertEq(deriveVerificationStatus(gateNace.passes, gateNace.flags), "review_required",
+    "wo8: NACE-blacklisted → review_required");
+
+  // Test 4: konkurs Brreg → review_required
+  const gateKonkurs = computeKvalitetsGate({
+    http_status: 200,
+    email: "post@gard.no",
+    website: "https://gard.no",
+    about: "Vi driver et lite småbruk på Vestlandet. Vi selger melk, ost og kjøtt direkte fra gården.",
+    products: [{ name: "melk" }],
+    brreg: { is_active: false, is_konkurs: true, naering: "Husdyrhold" },
+  });
+  assertTrue(!gateKonkurs.passes, "wo8: gate fails when konkurs");
+  assertEq(deriveVerificationStatus(gateKonkurs.passes, gateKonkurs.flags), "review_required",
+    "wo8: konkurs → review_required");
+
+  // Test 5: email-domain mismatch flagged
+  const gateEmail = computeKvalitetsGate({
+    http_status: 200,
+    email: "post@gmail.com",
+    website: "https://gard.no",
+    about: "Vi driver et lite småbruk på Vestlandet. Vi selger melk, ost og kjøtt direkte fra gården.",
+    products: [{ name: "melk" }, { name: "ost" }, { name: "kjøtt" }],
+    brreg: null,
+  });
+  assertTrue(gateEmail.flags.includes("email_domain_mismatch"), "wo8: gmail-on-gard.no email flagged");
+  assertTrue(!gateEmail.passes, "wo8: email_domain_mismatch fails gate");
+
+  // Test 6: enrichment-status logic
+  assertEq(computeEnrichmentStatus({ about: "x".repeat(200), products: [1,2,3,4], address: "Vei 1" }),
+    "rich", "wo8: long+products+address → rich");
+  assertEq(computeEnrichmentStatus({ about: "x".repeat(100), products: [], address: null }),
+    "partial", "wo8: medium-about → partial");
+  assertEq(computeEnrichmentStatus({ about: null, products: [], address: null }),
+    "thin", "wo8: empty → thin");
+
+  // Test 7: end-to-end DB write — use in-memory replica
+  const sqlite = require("better-sqlite3");
+  const wo8db = new sqlite(":memory:");
+  wo8db.exec(`
+    CREATE TABLE agents (id TEXT PRIMARY KEY, name TEXT, role TEXT, city TEXT);
+    CREATE TABLE agent_knowledge (
+      agent_id TEXT PRIMARY KEY,
+      address TEXT, website TEXT, phone TEXT, email TEXT,
+      about TEXT, products TEXT DEFAULT '[]',
+      verification_status TEXT NOT NULL DEFAULT 'unverified',
+      enrichment_status TEXT NOT NULL DEFAULT 'thin',
+      outreach_eligible_at TEXT,
+      last_verified_at TEXT, last_http_check_at TEXT, last_http_status INTEGER,
+      field_provenance TEXT NOT NULL DEFAULT '{}'
+    );
+  `);
+  wo8db.prepare("INSERT INTO agents (id,name,role,city) VALUES ('a-1','Test Gård','producer','Oslo'),('a-2','Old Gård','producer','Bergen')").run();
+  wo8db.prepare(`INSERT INTO agent_knowledge (agent_id, email, website, about, products, verification_status, last_verified_at) VALUES
+    ('a-1', 'post@gard.no', 'https://gard.no', 'Vi driver et lite småbruk på Vestlandet. Vi selger melk, ost og kjøtt direkte fra gården.', '[{"name":"melk"}]', 'unverified', NULL),
+    ('a-2', 'old@old.no', 'https://old.no', null, '[]', 'unverified', '1970-01-01')`).run();
+
+  const batch = pickBatch(wo8db, 10);
+  assertTrue(batch.length === 2, `wo8: pickBatch returned 2 (got ${batch.length})`);
+  // Oldest verified first → 'a-2' has 1970-01-01, 'a-1' has NULL (treated as 1970-01-01 by COALESCE → tie-broken by HTTP-status)
+  // Both should appear; oldest_verified order is fine
+
+  applyVerifierOutcome(wo8db, "a-1", {
+    new_verification_status: "verified",
+    new_enrichment_status: "partial",
+    http_status: 200,
+    runStartedAt: "2026-05-05T13:00:00Z",
+    eligibleAt: "2026-05-05T13:00:00Z",
+  });
+  const after = wo8db.prepare("SELECT verification_status, enrichment_status, outreach_eligible_at, last_http_status FROM agent_knowledge WHERE agent_id = 'a-1'").get() as any;
+  assertEq(after.verification_status, "verified", "wo8: applyVerifierOutcome sets verification_status");
+  assertEq(after.enrichment_status, "partial", "wo8: applyVerifierOutcome sets enrichment_status");
+  assertEq(after.last_http_status, 200, "wo8: applyVerifierOutcome sets last_http_status");
+  assertTrue(after.outreach_eligible_at !== null, "wo8: outreach_eligible_at populated on first transition");
+  wo8db.close();
+
+  // Test 8: run-envelope shape
+  const env = buildRunEnvelope({
+    run_id: "run-test-rfb",
+    started_at: "2026-05-05T13:00:00Z",
+    finished_at: "2026-05-05T13:05:00Z",
+    results: [
+      { agent_id: "a-1", passed: true, flags: [], fields_verified: [], fields_failed: [], http_status: 200, brreg_status: "aktiv", new_verification_status: "verified", new_enrichment_status: "rich", outreach_eligible_at: "2026-05-05T13:00:00Z" },
+      { agent_id: "a-2", passed: false, flags: ["http_404"], fields_verified: [], fields_failed: ["website_ok"], http_status: 404, brreg_status: null, new_verification_status: "pending_verify", new_enrichment_status: "thin", outreach_eligible_at: null },
+    ],
+    reportPath: "verifier-runs/2026-05-05/13.md",
+  });
+  assertEq((env as any).vertical, "rfb", "wo8: envelope vertical=rfb");
+  assertEq((env as any).agent, "lokal-agent-verifier", "wo8: envelope agent name");
+  const claims = (env as any).claims as any[];
+  const verifiedClaim = claims.find((c) => c.meta?.kind === "agents_verified");
+  assertEq(verifiedClaim.value, 1, "wo8: envelope agents_verified=1");
+  const poolClaim = claims.find((c) => c.meta?.kind === "outreach_pool_added");
+  assertEq(poolClaim.value, 1, "wo8: envelope outreach_pool_added=1");
+}
+
 // ── REPORT ────────────────────────────────────────────────────────────
 console.log(`\n${passed} passed, ${failed} failed\n`);
 if (failed > 0) {
