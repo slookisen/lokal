@@ -54,12 +54,14 @@ async function main(): Promise<number> {
 
   if (ADMIN_KEY) {
     try {
-      const envelope = buildRunEnvelope({
+      const envelope: any = buildRunEnvelope({
         run_id: batchResult.run_id,
         started_at: batchResult.started_at,
         finished_at: batchResult.finished_at,
         results,
       });
+      // Backfill: /admin/runs requires evidence field, library omits it
+      if (!envelope.evidence) envelope.evidence = [];
       const resp = await fetch(`${BASE}/admin/runs`, {
         method: "POST",
         headers: { "X-Admin-Key": ADMIN_KEY, "Content-Type": "application/json" },
