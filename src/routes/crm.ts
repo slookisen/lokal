@@ -273,37 +273,59 @@ router.post("/compose", async (req, res) => {
   const { to, contactName, subject, bodyText, bodyHtml, intent, category, severity, createdBy, force } = parsed.data;
 
   try {
-    // ─── Phase 4.10c-2 Steg 3 — service-level rate-limit ────────
-    // Defense-in-depth backstop: regardless of agent-side checks (Steg 2)
-    // or DB trigger (Steg 1), the compose endpoint refuses to send if the
-    // same recipient got an out+sent message in the last 24h from the
-    // same actor. Daniel-actor can override with force=true (urgency).
-    // claude-actor is always rate-limited — no override path.
+    // ─── Phase 4.10c-3 — refined service-level rate-limit ───────
+    // 2026-05-06 fix: original 4.10c-2 logic was too aggressive — it blocked
+    // ALL outbound to a recipient if any out+sent existed in 24h. That broke
+    // CS responses to legitimate inbound messages whenever marketing had
+    // contacted the same address recently.
+    //
+    // New rule: only block COLD-OUTREACH duplicates. If the contact has
+    // sent us an inbound message in the last 7 days, this compose is a
+    // legitimate conversation response — do not rate-limit.
     if (intent === "resend_send" && createdBy === "claude" && !force) {
-      const lookbackIso = new Date(Date.now() - 24 * 3600_000).toISOString();
-      const recent = getDb().prepare(`
-        SELECT m.id, m.thread_id, m.subject, m.sent_at
+      const lookback24h = new Date(Date.now() - 24 * 3600_000).toISOString();
+      const lookback7d = new Date(Date.now() - 7 * 24 * 3600_000).toISOString();
+
+      // Has the contact sent us anything inbound in the last 7 days?
+      const hasRecentInbound = getDb().prepare(`
+        SELECT 1 AS hit
         FROM crm_messages m
         JOIN crm_threads t ON t.id = m.thread_id
         JOIN crm_contacts c ON c.id = t.contact_id
-        WHERE m.direction = 'out'
-          AND m.delivery_status = 'sent'
+        WHERE m.direction = 'in'
           AND LOWER(c.email) = LOWER(?)
-          AND m.sent_at >= ?
-        ORDER BY m.sent_at DESC
-        LIMIT 5
-      `).all(to, lookbackIso) as Array<{ id: string; thread_id: string; subject: string; sent_at: string }>;
-      if (recent.length > 0) {
-        return res.status(429).json({
-          success: false,
-          error: "rate_limited",
-          reason: `claude-actor already sent ${recent.length} email(s) to ${to} in the last 24h`,
-          last_sent_at: recent[0].sent_at,
-          prior_thread_id: recent[0].thread_id,
-          prior_subjects: recent.map((r) => r.subject),
-          override: "Pass createdBy=daniel and force=true to bypass (manual override)",
-        });
+          AND m.received_at >= ?
+        LIMIT 1
+      `).get(to, lookback7d) as { hit: number } | undefined;
+
+      if (!hasRecentInbound) {
+        // No active inbound conversation — apply cold-outreach rate-limit
+        const recent = getDb().prepare(`
+          SELECT m.id, m.thread_id, m.subject, m.sent_at
+          FROM crm_messages m
+          JOIN crm_threads t ON t.id = m.thread_id
+          JOIN crm_contacts c ON c.id = t.contact_id
+          WHERE m.direction = 'out'
+            AND m.delivery_status = 'sent'
+            AND LOWER(c.email) = LOWER(?)
+            AND m.sent_at >= ?
+          ORDER BY m.sent_at DESC
+          LIMIT 5
+        `).all(to, lookback24h) as Array<{ id: string; thread_id: string; subject: string; sent_at: string }>;
+
+        if (recent.length > 0) {
+          return res.status(429).json({
+            success: false,
+            error: "rate_limited",
+            reason: `claude-actor already sent ${recent.length} cold-outreach email(s) to ${to} in the last 24h, and contact has no inbound in last 7 days`,
+            last_sent_at: recent[0].sent_at,
+            prior_thread_id: recent[0].thread_id,
+            prior_subjects: recent.map((r) => r.subject),
+            override: "Pass createdBy=daniel and force=true to bypass (manual override)",
+          });
+        }
       }
+      // If hasRecentInbound: skip rate-limit — legitimate conversation response
     }
 
     // (original flow continues below)
