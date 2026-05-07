@@ -592,6 +592,12 @@ class MarketplaceRegistry {
       // Express's HTML 404 page and report "404 Not Found when sending
       // messages" — flagged by A2A Registry maintainer 2026-04-25.
       url: `${baseUrl}/a2a`,
+      // ─── Top-level discovery metadata (registry display) ───
+      // homepage + iconUrl are recommended top-level fields per A2A spec.
+      // a2aregistry.org and other directories surface these directly to humans;
+      // without them, registry records show "None" / fallback rendering.
+      homepage: baseUrl,
+      iconUrl: `${baseUrl}/logo.svg`,
       provider: {
         organization: "Rett fra Bonden",
         url: baseUrl,
