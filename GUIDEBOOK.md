@@ -4,7 +4,7 @@
 **Project:** Rett fra Bonden (rettfrabonden.com)
 **Domain:** Local food producers in Norway
 **Timeline:** March 29 – April 21, 2026 (~3.5 weeks)
-**Result:** 1,195 live producer agents (1,400+ total records), 5 MCP marketplaces, A2A protocol, Custom GPT, Claude Connectors, AWS Bedrock AgentCore Registry
+**Result:** 1,416 live producer agents (1,400+ total records), 5 MCP marketplaces, A2A protocol, Custom GPT, Claude Connectors, AWS Bedrock AgentCore Registry
 **Auto-updated by:** `rfb-guidebook` scheduled agent
 
 > This guide is designed so that an AI agent can follow it step-by-step to reproduce the entire project with a different domain/vertical. Human intervention is only needed for: account logins, domain purchases, and payment confirmations.
@@ -31,11 +31,12 @@
 16. [Phase 15: AWS Bedrock AgentCore Registry](#phase-15)
 17. [Phase 16: Automated Agent Operations](#phase-16)
 18. [Phase 17: Conversation System & AG-UI](#phase-17)
-19. [Appendix A: Tech Stack Reference](#appendix-a)
-20. [Appendix B: Deployment Checklist](#appendix-b)
-21. [Appendix C: Gotchas & Lessons Learned](#appendix-c)
-22. [Appendix D: Registry Status Matrix](#appendix-d)
-23. [Appendix E: Agent Prompts (Copy-Paste Ready)](#appendix-e)
+19. [Phase 18: Verify-First Outreach — Quality Gate Before Marketing](#phase-18)
+20. [Appendix A: Tech Stack Reference](#appendix-a)
+21. [Appendix B: Deployment Checklist](#appendix-b)
+22. [Appendix C: Gotchas & Lessons Learned](#appendix-c)
+23. [Appendix D: Registry Status Matrix](#appendix-d)
+24. [Appendix E: Agent Prompts (Copy-Paste Ready)](#appendix-e)
 
 ---
 
@@ -2453,6 +2454,162 @@ Commit: `1d88b6a`. Lesson: **registry probers and naive curl share a failure mod
 
 ---
 
+<a id="phase-18"></a>
+## Phase 18: Verify-First Outreach — Quality Gate Before Marketing
+
+**Duration:** May 4 – May 7, 2026
+**Commits:** `909cc9d`, `e463481`, `60fda88`, `fa329ad`, `8326541`, `b49ecbe`, `bac5858`, `aae5e93`
+**Goal:** Stop sending cold-outreach to agents whose data has not been programmatically verified. Every outbound contact must originate from a row whose website resolves, whose email lives on the producer's own domain, whose Brreg organisasjon is active, and whose enrichment passes a content threshold. Without a gate like this, Tier-A enrichment errors become customer-facing apologies the next morning.
+
+The plan was scoped as two work-orders: **WO #7 — schema scaffolding + read-only pool** (`909cc9d`), and **WO #8 — verifier core, runner, and Option-B execution path** (everything after).
+
+### 18.1 Schema scaffolding (WO #7, commit `909cc9d`)
+
+The verify-first foundation is purely additive — no migrations break existing rows.
+
+```sql
+-- agent_knowledge gains 7 columns (idempotent ALTERs, safe defaults):
+ALTER TABLE agent_knowledge ADD COLUMN field_provenance TEXT;          -- per-field origin map (JSON)
+ALTER TABLE agent_knowledge ADD COLUMN verification_status TEXT
+  DEFAULT 'pending_verify';                                            -- verified | review_required | pending_verify
+ALTER TABLE agent_knowledge ADD COLUMN enrichment_status TEXT
+  DEFAULT 'thin';                                                      -- thin | partial | rich
+ALTER TABLE agent_knowledge ADD COLUMN outreach_eligible_at TEXT;      -- timestamp of first verified→eligible transition
+ALTER TABLE agent_knowledge ADD COLUMN last_verified_at TEXT;
+ALTER TABLE agent_knowledge ADD COLUMN last_http_check_at TEXT;
+ALTER TABLE agent_knowledge ADD COLUMN last_http_status INTEGER;
+
+-- New ledger of what we sent through the verify-first pipe (separate from CRM threads):
+CREATE TABLE outreach_sent_log (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  agent_id TEXT NOT NULL,
+  sent_at TEXT NOT NULL,
+  channel TEXT NOT NULL,
+  template_key TEXT,
+  ...
+);
+
+-- Read-side gate; marketing-comms reads from here once WO #9 cuts over:
+CREATE VIEW outreach_ready_pool AS
+  SELECT a.*, k.*
+  FROM agents a
+  JOIN agent_knowledge k ON k.agent_id = a.id
+  WHERE k.email IS NOT NULL
+    AND k.verification_status = 'verified'
+    AND k.enrichment_status IN ('partial','rich')
+    AND NOT EXISTS (SELECT 1 FROM outreach_sent_log s WHERE s.agent_id = a.id);
+```
+
+Key property: the VIEW returns 0 rows on initial deploy because `verification_status` defaults to `pending_verify` for all 1416 agents. The verifier (next section) is the only thing that promotes rows to `verified`. Marketing-comms is unchanged in this WO — it keeps reading from the legacy uncontacted-pool until WO #9.
+
+A one-shot backfill `phase51_backfill_provenance_v1` populates `field_provenance` from `data_source` + `auto_sources` for existing rows at Tier-B confidence (these were enriched before per-field provenance existed). Migration flag prevents re-run.
+
+Two new admin endpoints expose the pool for inspection (cap 500/req):
+
+```bash
+curl -H "X-Admin-Key: $ADMIN_KEY" \
+  https://rettfrabonden.com/admin/outreach-ready-pool/stats
+# → { pool_size, by_verification_status, by_enrichment_status }
+
+curl -H "X-Admin-Key: $ADMIN_KEY" \
+  https://rettfrabonden.com/admin/outreach-ready-pool?limit=50
+```
+
+### 18.2 Verifier library (WO #8 partial, commit `e463481`)
+
+The verifier is a **pure-functional kvalitets-gate** so the logic is testable without Fly Machines or live HTTP. `src/agents/lokal-agent-verifier.ts` exports:
+
+| Function | Purpose |
+|----------|---------|
+| `computeKvalitetsGate(agent, knowledge)` | Pure. Runs 5 sub-rules: `website_ok`, `email_own_domain`, `no_wrong_fit`, `brreg_active`, `content_threshold`. Returns `{ passed, flags[] }`. |
+| `computeEnrichmentStatus(knowledge)` | Returns `thin` / `partial` / `rich` based on field count + content density. |
+| `deriveVerificationStatus(gateResult)` | `verified` if all 5 pass; `review_required` if any non-recoverable flag (e.g. `brreg_konkurs`); `pending_verify` if recoverable (e.g. `website_unreachable`). |
+| `pickBatch({ batchSize })` | Oldest-verified first; HTTP-failed rows bumped to front so transient outages re-resolve quickly. |
+| `applyVerifierOutcome(agent_id, outcome, db)` | Idempotent UPDATE on `agent_knowledge`. Sets `outreach_eligible_at` only on the first transition into `verified`. |
+| `runVerifierBatch({ batchSize, brregLookup? })` | Async main loop. `brregLookup` is dep-injectable for tests + a future Brreg-rate-limit layer. |
+| `buildRunEnvelope({ run_id, started_at, finished_at, results })` | Assembles a `/admin/runs` payload from results. Currently omits `evidence` — see C.53. |
+
+All five gate rules and the DB write/envelope shape are covered by 8 new tests in `tests/test.ts`.
+
+### 18.3 Runner script + time-window gate (commits `60fda88` → `8326541`)
+
+`src/scripts/run-verifier.ts` is the standalone entry-point invoked by Fly Machines cron:
+
+```bash
+npx tsx /app/src/scripts/run-verifier.ts
+```
+
+Why a thin runner: Fly Machines `--schedule` only accepts preset values (hourly/daily/weekly). To get effective 9-runs-per-night without writing a custom cron-manager, the runner checks `Date.getUTCHours()` and skips runs outside the 22:00–06:00 UTC window. Fly cron fires 24×/day, 15 invocations no-op (cost ≈ $0.001 each), 9 do real work. `FORCE_RUN=1` overrides for ad-hoc testing.
+
+```typescript
+const ALLOWED_UTC_HOURS = [22, 23, 0, 1, 2, 3, 4, 5, 6];
+if (!ALLOWED_UTC_HOURS.includes(now.getUTCHours()) && process.env.FORCE_RUN !== "1") {
+  console.log(`[verifier-runner] Skipping — UTC hour ${hourUTC} outside 22-06 window`);
+  return 0;
+}
+```
+
+`8326541` re-pushed the file because `fa329ad` truncated mid-`catch`. Reminder: file-replace tooling silently dropping the tail produces a runner that compiles but exits non-zero from a bare `process.exit` shadow; always `wc -l` the working tree against the diff before committing.
+
+`b49ecbe` then matched the runner's option shape to the library — `runVerifierBatch` auto-generates `run_id` + `started_at` (they're outputs, not inputs), and `buildRunEnvelope` expects snake_case (`run_id`, `started_at`, `finished_at`), not camelCase. Symptom: TypeScript compile error after the v0.0.1 deploy.
+
+### 18.4 Option B: run inside main app process (commit `aae5e93`)
+
+The original plan was to deploy a separate `lokal-agent-verifier` Fly Machine with its own cron. Live test 2026-05-05 17:39 UTC pushed pool from 0 → 13 then stalled. Investigation: **Fly volumes are not shared between machines** — the verifier-cron-machine had its own empty volume, so `runVerifierBatch` walked a DB of 0 rows and exited cleanly. The main-app DB (1416 rows) was untouched.
+
+**Option B fix:** run the verifier inside the main app process, since the main app already has the correct volume mount. The Fly cron-machine becomes a thin HTTP-trigger.
+
+```typescript
+// src/routes/admin-run-verifier.ts
+router.post("/admin/run-verifier", async (req, res) => {
+  if (!requireAdmin(req, res)) return;
+
+  const force = req.query.force === "1";
+  const hour = new Date().getUTCHours();
+  if (!ALLOWED_UTC_HOURS.includes(hour) && !force) {
+    return res.json({ skipped: true, reason: `outside 22-06 UTC window (hour=${hour})` });
+  }
+
+  const result = await runVerifierBatch({ batchSize: 30 });
+  // Record envelope directly via run-ledger service — no HTTP roundtrip:
+  recordRun(buildRunEnvelopeWithEvidence(result));
+  return res.json({ run_id: result.run_id, processed: result.results.length });
+});
+```
+
+The cron machine now just `curl -X POST -H "X-Admin-Key: $ADMIN_KEY" https://rettfrabonden.com/admin/run-verifier`. Same time-window gate, same batch logic, but the SQLite reads/writes hit the real volume.
+
+`bac5858` followed: `POST /admin/runs` requires an `evidence` field that `buildRunEnvelope()` does not emit. The runner now backfills `envelope.evidence = []` before recording. Long-term fix is to add it to the library — see C.53 for the gotcha and rationale.
+
+### 18.5 Operational runbook
+
+```bash
+# Manual force-run for testing (any hour):
+curl -X POST -H "X-Admin-Key: $ADMIN_KEY" \
+  "https://rettfrabonden.com/admin/run-verifier?force=1"
+
+# Inspect pool growth:
+watch -n 30 'curl -s -H "X-Admin-Key: $ADMIN_KEY" \
+  https://rettfrabonden.com/admin/outreach-ready-pool/stats | jq'
+
+# Find the latest envelope in the run-ledger:
+curl -s -H "X-Admin-Key: $ADMIN_KEY" \
+  https://rettfrabonden.com/admin/runs?limit=1 | jq
+```
+
+Expected steady-state after first full pass: pool size grows ~30 rows per nightly run × 9 runs = ~270/night, until enrichment-thin and `pending_verify` rows clear. Tier-A enriched agents with own-domain email become `verified` first; freemail-only or thin rows stay in `pending_verify` until enrichment catches them up.
+
+### 18.6 What is NOT in this phase (deploy-token-blocked, pending-Daniel)
+
+These items remain on Daniel's plate:
+
+- A dedicated Fly app/machine for the verifier (Option B made this optional but useful for isolation).
+- Setting Fly secrets `ANTHROPIC_API_KEY` for the verifier machine if Option A is ever revisited.
+- WO #9: switching marketing-comms to read from `outreach_ready_pool` instead of the legacy uncontacted-pool. Until WO #9 ships, the verify-first ledger is fully populated but unused — a safety property worth confirming before the cutover PR lands.
+
+
+---
+
 <a id="appendix-a"></a>
 ## Appendix A: Tech Stack Reference
 
@@ -2618,6 +2775,17 @@ Post-deploy:
 50. **`/sok?q=X` rendered a constant "30 treff" header regardless of true total count** — The route capped `discover()` at `limit=30` and rendered `${results.length} treff` directly in the H1. So every search at-or-above the cap looked identical to humans *and* AI crawlers indexing the page. Fix: when `results.length` hits the cap, run one extra `discover()` with `limit=100` purely to learn the true count (cheap, in-memory ranked), then render `"M+ treff"` when even the second probe caps, `"viser N av M"` when not, and `"M treff"` when below cap. Commit: `5a7d182`. Lesson: **any aggregate count rendered for crawlers must be the real total, not a paginated slice — if you've capped the query, you've lied about the result.**
 
 51. **`/llms.txt` "byer dekket" / "matkategorier" reported the slice length, not the Map size** — Same shape: `topCities.slice(0, 15).length` is always 15, but `cities.size` is ~370. AI agents reading `llms.txt` were under-indexing the platform's true coverage by ~25×. The slice is the right shape for the *list* of top cities to display, but the wrong shape for the *count* claim about coverage. Read `cities.size` / `categories.size` for the headline number; keep the slice for the rendered list. Commit: `5a7d182`. Lesson: **slices answer "what should I show", `.size` answers "how much do I have" — never substitute one for the other in self-describing content.**
+
+52. **Fly volumes are not shared between machines — a separate verifier-cron-machine processed 0 agents** — The Phase 5 plan was to deploy `lokal-agent-verifier` as its own Fly Machine with `--schedule hourly`. Live test 2026-05-05 17:39 UTC showed pool 0→13 then stalled. Symptom: the verifier-machine's logs reported batch=30 with 0 results every hour. Cause: each Fly machine gets its own volume mount; the verifier-machine had a fresh empty volume, so `runVerifierBatch` walked a DB of 0 rows and exited cleanly. The main-app DB (1416 rows) was untouched. Fix (Option B): collapse the verifier into the main-app process via `POST /admin/run-verifier`, leaving the cron-machine as a thin HTTP-trigger that just curls the endpoint. Time-window gate moves from runner script → endpoint. Commit: `aae5e93`. Lesson: **shared SQLite-on-Fly only works if every reader/writer is in the same Machine; the second you split the workload you split the data.**
+
+53. **`buildRunEnvelope()` omits the `evidence` field that `POST /admin/runs` requires** — Library function in `src/agents/lokal-agent-verifier.ts` returns an envelope shaped for the run-ledger but missing the mandatory `evidence` array. Symptom: 2026-05-05 force-run got HTTP 400 "missing field: evidence" from `/admin/runs` even though the verifier itself processed agents fine. Workaround in runner: backfill `envelope.evidence = []` before recording. Long-term fix: add `evidence: results.map(r => ({ agent_id: r.agent_id, flags: r.flags }))` inside the library so every consumer sees a valid envelope. Commit: `bac5858`. Lesson: **a function whose output crosses an external schema boundary should produce something that boundary accepts; "the caller adds the missing field" is a fragile contract that breaks the moment a second caller appears.**
+
+54. **24h email-level rate-limit blocked CS responses to inbound questions** — Phase 4.10c's anti-spam check fired on any send-attempt to a recipient we'd contacted in the last 24h, regardless of which direction the conversation was flowing. Symptom 2026-05-06: six legitimate Gmail drafts replying to producer questions stuck in "rate-limited" because we'd sent cold-marketing the day before. Fix: rate-limit only fires when `(out + sent in last 24h) AND (no inbound in last 7 days)`. CS responses to active conversations are now always allowed; cold marketing 2× in 24h still blocks; manual `force=true` still bypasses. Commit: `3d78b5d` (Phase 4.10c-3). Lesson: **rate-limits framed as "anti-spam" must be conditional on conversation direction — recipient-level cooldowns that ignore inbound activity will silence customer service traffic on day two.**
+
+55. **`PATCH /agents/:id` allowed `name` + `description` but not `city`** — `agents.city` lives on the `agents` table (not `agent_knowledge`), so the curated-fields lock from Phase 4.9a doesn't apply. The legacy update path only listed `name`/`description`/`location` in `marketplaceRegistry.updateAgent`'s allowed-fields, so a CS-corrected city would silently no-op. Symptom: Haugerud Gård at postal code 3302 (Buskerud) showed "Akershus" across `/sok`, contact card, and related-producers tile even after the CS agent issued the PATCH. Fix: add `city` to the allow-list. Customer impact resolved 2026-05-07. Commit: `2f21686`. Lesson: **every column shown on a public surface needs an admin update path — and the allow-list must be audited whenever a new surface is added that reads from it.**
+
+56. **A2A agent-card was rendering as plain-text in registries because `homepage` and `iconUrl` were nested-only** — `a2aregistry.org/api/agents/00157ca1` showed `iconUrl: null, homepage: null` even though both values were embedded inside our `agent_card.skills[*].metadata`. The A2A spec recommends them as **top-level** fields for registry-display fallback; without them, agent-aggregators fall back to plain-text rendering instead of showing our logo and a clickable homepage. Fix: emit `homepage: ${baseUrl}` and `iconUrl: ${baseUrl}/logo.svg` at the root of `/.well-known/agent-card.json`. Verified 200 on the logo path. Commit: `61e08e2`. Lesson: **if a spec calls a field "recommended for display" the registry treats it as required-for-display; nested copies don't substitute.**
+
 
 ### C.2 Architecture Decisions
 
@@ -2803,8 +2971,9 @@ to build the same platform for a different vertical.
 | 2026-04-26 | 5, 7, 17 | Static-page SEO meta on `/selger` + `/app`, `noindex` on admin pages (5.8). Inbox CRM dashboard at `/admin/crm-dashboard` with 5 new tables, 14 endpoints, single-file 554-line UI (7.12). Unify stale fallback counts (`1,400+` → `1,150+`) + add `repository` field to MCP server card. |
 | 2026-04-27 | 7, C | CRM contact-resolution upgrade (7.12.1): `classifyEmail()` split out as a pure function, freemail allowlist prevents gmail/outlook senders from shadowing real producer matches, vendor allowlist now accepts subdomain suffixes (`accounts.google.com` → `google.com`), `unknown` rows re-evaluated on every subsequent ingest plus bulk endpoint `POST /api/crm/contacts/reclassify-unknown`. CSP-safe event delegation in `admin-crm.html` (7.12.2): all 16 inline `onclick`/`onchange`/`onblur` replaced with `data-action` + a single `document.body` listener after Comet browser blocked login. "✓ Ferdig" one-click status button on each thread. Stale-count fallbacks `1,100`/`1,150+` → `1,170+` across `discovery.ts`, `agent-readiness.ts`, narrator strings in `app.html`/`dashboard.html`, README, server.json. Appendix C: C.44 (CSP-strict browsers kill inline `onclick`), C.45 (vendor-domain subdomain match), C.46 (re-classify `unknown` on every ingest). |
 | 2026-04-30 | 16, 17, C | CI cache-bust fix: `.github/workflows/fly-deploy.yml` now threads `--build-arg BUILD_REV=${{ github.sha }}` (16.4) — without it, GH-Actions builds defaulted `ARG BUILD_REV=dev` and Fly's remote builder reused the cached `COPY src/` layer for three weeks. `/a2a` POST hardened against header-less probes: returns JSON-RPC `-32700` (HTTP 400) instead of HTML 500, likely cause of the sticky `a2aregistry.org` maintainer note that PUT refresh couldn't clear (17.7). Repo hygiene: `mcp-server/node_modules/` untracked (~28 MB), six dead files removed (`seo-backup.ts`, `LokalApp_copy.jsx`, two PowerShell scripts, etc.) — `tsc` and 39/39 tests still pass. Stale narrator + fallback literals walked from `1,170+` → `1,180+` → `1,195+` to match prod (DB at 1,195). Appendix C: C.47 (`Array.isArray` guard — strings have `.length` too), C.48 (CI deploy must thread `BUILD_REV`), C.49 (A2A endpoint guard for missing body / wrong Content-Type), C.50 (`/sok` H1 was always `30 treff`), C.51 (`/llms.txt` reported slice length not Map size). |
+| 2026-05-04 to 2026-05-07 | 18 (new), 4, 9, 13, C | Phase 18 verify-first foundation: `outreach_ready_pool` VIEW + 7 new `agent_knowledge` columns + `outreach_sent_log` ledger + Tier-B provenance backfill (WO #7, `909cc9d`). `lokal-agent-verifier` library with pure-functional 5-rule kvalitets-gate + 8 new tests (WO #8, `e463481`). Runner script with 22-06 UTC time-window gate (`60fda88` → `8326541` → `b49ecbe`). Option B `/admin/run-verifier` endpoint after Fly volumes-not-shared blocker capped pool at 13 (`aae5e93`, `bac5858`). `PATCH /agents/:id` allow-list now includes `city` for CS geo-fixes (Haugerud Gård / Buskerud, `2f21686`). CRM rate-limit narrowed to cold-outreach only — CS responses to inbound never blocked (`3d78b5d`). `/.well-known/agent-card.json` now emits top-level `homepage` + `iconUrl` for registry display (`61e08e2`). `mcp-server/package.json` bumped to 0.3.4 awaiting Daniel's `npm publish` (`5296480`). Appendix C: C.52 (Fly volumes not shared between machines), C.53 (`buildRunEnvelope` omits required `evidence`), C.54 (CRM rate-limit must distinguish cold-outreach from CS reply), C.55 (admin PATCH allow-list missed `city`), C.56 (A2A registries need top-level `homepage`/`iconUrl`). |
 
 ---
 
-*Last updated: 2026-04-30 (14:00 CEST) by rfb-guidebook agent*
-*Guide version: 1.5.0*
+*Last updated: 2026-05-08 (14:00 CEST) by rfb-guidebook agent*
+*Guide version: 1.6.0*
