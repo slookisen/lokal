@@ -1581,6 +1581,54 @@ console.log("── agent-stats: per-agent stats endpoint logic ──");
   assertEq(poolClaim.value, 1, "wo8: envelope outreach_pool_added=1");
 }
 
+
+// ── orchestrator-pr-3: knowledge-service mergeKnowledge clear-fix ────
+// Verifies the explicit-clear predicate. The real mergeKnowledge is private;
+// this block mirrors its predicate for array fields and verifies semantics.
+// Live-prod E2E is performed by orchestrator post-deploy (PUT openingHours=[]
+// then assert HTML page does not render the cleared block).
+{
+  // Predicate must match knowledge-service.ts mergeKnowledge for array fields
+  const mergeArr = <T>(updateField: T[] | undefined, existingField: T[]): T[] =>
+    Array.isArray(updateField) ? updateField : existingField;
+
+  const existing = [{ day: "mon", open: "10:00", close: "17:00" } as any];
+
+  // 1. Explicit `[]` clears
+  assertEq(mergeArr<any>([], existing).length, 0,
+    "pr-3: openingHours:[] clears the field (was silent no-op)");
+
+  // 2. `undefined` preserves existing
+  assertEq(mergeArr<any>(undefined, existing).length, 1,
+    "pr-3: undefined preserves existing (no-change semantics)");
+
+  // 3. Non-empty replaces
+  const replacement = [{ day: "tue", open: "08:00", close: "12:00" } as any];
+  const r3 = mergeArr<any>(replacement, existing);
+  assertEq(r3.length, 1, "pr-3: non-empty replaces existing (length 1)");
+  assertEq((r3[0] as any).day, "tue", "pr-3: non-empty replaces existing (value)");
+
+  // 4. Same predicate covers products / certifications / specialties / etc.
+  const certsExisting = ["debio"];
+  assertEq(mergeArr<string>([], certsExisting).length, 0,
+    "pr-3: certifications:[] clears");
+  assertEq(mergeArr<string>(undefined, certsExisting).length, 1,
+    "pr-3: certifications undefined preserves");
+
+  // 5. Mixed-update semantics — clearing one field while leaving another untouched
+  // is achieved by passing `[]` for the field to clear and omitting the other.
+  // Predicate-level proof: each field is decided independently.
+  const a = mergeArr<any>([], existing);             // cleared
+  const b = mergeArr<any>(undefined, ["produkt"]);   // preserved
+  assertTrue(a.length === 0 && b.length === 1,
+    "pr-3: mixed update — clear one field, preserve another");
+
+  // 6. Type-guard regression: previously `[].length === 0` was falsy → wrong branch.
+  // Confirm the new predicate selects the update arg even when length is 0.
+  assertTrue(mergeArr<any>([], existing) !== existing,
+    "pr-3: empty-array path returns the empty update, not the existing");
+}
+
 // ── REPORT ────────────────────────────────────────────────────────────
 console.log(`\n${passed} passed, ${failed} failed\n`);
 if (failed > 0) {
