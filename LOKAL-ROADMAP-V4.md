@@ -1,7 +1,7 @@
 # Rett fra Bonden — Roadmap v4: Kvalitet, Sikkerhet & Selgervekst
 
 **Dato:** 16. april 2026
-**Status:** Live på https://rettfrabonden.com · 1 177 agenter · 331 byer · MCP 0.3.1 på npm
+**Status:** Live på https://rettfrabonden.com · 1 425 agenter · 369 byer · MCP 0.3.3 på npm
 **Erstatter:** LOKAL-ROADMAP-V3.md (12. april)
 **Sist oppdatert:** 16. april 2026 — full audit mot produksjon
 
@@ -15,7 +15,7 @@
 | Express + SQLite prod | ✅ Live | rettfrabonden.com, Fly.io Stockholm |
 | Eget domene + SSL | ✅ Live | rettfrabonden.com (Namecheap DNS, Fly certs) |
 | Custom GPT | ✅ Live | chatgpt.com/g/g-69db…lokal-norsk-matfinner |
-| Claude Desktop MCP | ✅ Live | `npx lokal-mcp@latest` (npm v0.3.1) |
+| Claude Desktop MCP | ✅ Live | `npx lokal-mcp@latest` (npm v0.3.3) |
 | MCP HTTP transport | ✅ Live | rettfrabonden.com/mcp (Streamable HTTP) |
 | ChatGPT MCP (dev mode) | ✅ Live | @Lokal i ChatGPT Developer Mode |
 | A2A Protocol | ✅ Live | /.well-known/agent-card.json + /a2a JSON-RPC |
@@ -51,7 +51,7 @@
 ### MCP Marketplace-registreringer — FERDIG ✅
 | Registry | Status | Detaljer |
 |----------|--------|---------|
-| npm | ✅ Live | lokal-mcp@0.3.1 |
+| npm | ✅ Live | lokal-mcp@0.3.3 |
 | Glama | ✅ Live | Listet og verifisert (301 redirect bekreftet) |
 | Smithery | ✅ Live | Listet (308 redirect bekreftet) |
 | mcp.so | ✅ Live | Publisert og godkjent |

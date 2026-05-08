@@ -319,7 +319,7 @@ function shell(
       </div>
       <div class="ft-col">
         <h4>${escapeHtml(t(lang, "footer.for_developers"))}</h4>
-        <a href="/api/marketplace/search?q=mat">${escapeHtml(t(lang, "footer.api"))}</a><a href="https://github.com/slookisen/lokal">${escapeHtml(t(lang, "footer.github"))}</a><a href="https://smithery.ai/servers/slookisen/lokal">${escapeHtml(t(lang, "footer.mcp_server"))}</a>
+        <a href="/api/marketplace/search?q=mat">${escapeHtml(t(lang, "footer.api"))}</a><a href="https://github.com/slookisen/lokal">${escapeHtml(t(lang, "footer.github"))}</a><a href="https://smithery.ai/servers/slookisen/lokal-norsk-matfinner">${escapeHtml(t(lang, "footer.mcp_server"))}</a>
       </div>
     </div>
     <div class="ft-bottom">${escapeHtml(t(lang, "footer.copyright", { year: new Date().getFullYear() }))}</div>

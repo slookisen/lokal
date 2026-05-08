@@ -2808,7 +2808,7 @@ Post-deploy:
 |-------------------|--------|-----|-------|
 | npm | ✅ Live | npmjs.com/package/lokal-mcp | v0.3.3 |
 | Smithery.ai | ✅ Live | smithery.ai/servers/slookisen/lokal-norsk-matfinner | Score 76/100 |
-| Glama.ai | ✅ Live | glama.ai/mcp/servers/slookisen/lokal | v0.3.1 |
+| Glama.ai | ✅ Live | glama.ai/mcp/servers/slookisen/lokal | v0.3.3 |
 | mcp.so | ✅ Submitted | mcp.so | Manual review |
 | Official MCP Registry | ✅ Published | registry.modelcontextprotocol.io | v0.3.3 |
 | A2A Registry | ❌ PR Closed | github.com/prassanna-ravishankar/a2a-registry/pull/102 | Closed 2026-04-20. Maintainer requires programmatic registration via the registry endpoint, not PRs. Re-submit through `a2aregistry.org` API. |
