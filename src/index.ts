@@ -35,6 +35,7 @@ import adminOutreachPoolRoutes from "./routes/admin-outreach-pool";
 import adminRunVerifierRoutes from "./routes/admin-run-verifier";
 import ownerPortalRoutes from "./routes/owner-portal";
 import adminAgentAuditRoutes from "./routes/admin-agent-audit";
+import adminVerifierReviewQueueRoutes from "./routes/admin-verifier-review-queue";
 import platformTriggersRoutes, { adminRouter as adminTriggersRoutes } from "./routes/platform-triggers";
 import crmRoutes from "./routes/crm";
 import { list as blocklistList } from "./services/blocklist-service";
@@ -255,6 +256,7 @@ app.use("/admin/outreach-ready-pool", adminLimiter, adminOutreachPoolRoutes);
 app.use("/admin/run-verifier", adminLimiter, adminRunVerifierRoutes);
 // ─── M1: Daniel-only agent audit trail (Phase 5.4a) ──────────
 app.use("/admin/agent-audit", adminLimiter, adminAgentAuditRoutes);
+app.use("/admin/verifier-review-queue", adminLimiter, adminVerifierReviewQueueRoutes);
 
 // Platform triggers — public webhook receiver + admin queue access.
 // /platform/triggers/* uses HMAC (no admin-key); /admin/triggers/* uses admin-key.

@@ -18,6 +18,11 @@
 // Reference: PHASE5-ENRICHMENT-REORG.md §8 + WO #8.
 
 import { getDb } from "../database/init";
+import {
+  crossSourceAgreement,
+  type FieldName,
+  type ProvenanceRecord,
+} from "../services/cross-source-validator";
 
 export interface VerifierResult {
   agent_id: string;
@@ -30,6 +35,7 @@ export interface VerifierResult {
   new_verification_status: string;
   new_enrichment_status: string;
   outreach_eligible_at: string | null;
+  cross_source_reason: Record<string, unknown>;
 }
 
 export interface BrregLookupResult {
@@ -205,16 +211,18 @@ export function applyVerifierOutcome(
     http_status: number | null;
     runStartedAt: string;
     eligibleAt: string | null;
+    cross_source_reason?: Record<string, unknown>;
   }
 ): void {
   db.prepare(
     `UPDATE agent_knowledge SET
-       verification_status   = ?,
-       enrichment_status     = ?,
-       last_verified_at      = ?,
-       last_http_check_at    = ?,
-       last_http_status      = ?,
-       outreach_eligible_at  = COALESCE(?, outreach_eligible_at)
+       verification_status         = ?,
+       enrichment_status           = ?,
+       last_verified_at            = ?,
+       last_http_check_at          = ?,
+       last_http_status            = ?,
+       outreach_eligible_at        = COALESCE(?, outreach_eligible_at),
+       verification_review_reason  = ?
      WHERE agent_id = ?`
   ).run(
     outcome.new_verification_status,
@@ -223,22 +231,33 @@ export function applyVerifierOutcome(
     outcome.runStartedAt,
     outcome.http_status,
     outcome.eligibleAt,
+    JSON.stringify(outcome.cross_source_reason ?? {}),
     agentId
   );
 }
 
-// Decide verification_status from gate result + flags. Pure function.
+// Decide verification_status from gate result + flags + cross-source check.
+// cross_source_passes=true means all 3 critical fields have >=2 agreeing sources
+// (or owner-curated). Only agents that pass BOTH the basic gate AND cross-source
+// are promoted to "verified". Pure function.
 export function deriveVerificationStatus(
   passes: boolean,
-  flags: string[]
+  flags: string[],
+  cross_source_passes?: boolean
 ): "verified" | "review_required" | "pending_verify" {
-  if (passes) return "verified";
-  // Reviewable: structural NACE/Brreg issues that need human eyes
-  if (flags.some((f) => f.startsWith("nace_blacklist") || f === "brreg_konkurs" || f === "brreg_inactive")) {
+  if (!passes) {
+    // Basic gate failed — reviewable if NACE/Brreg issues, otherwise retry
+    if (flags.some((f) => f.startsWith("nace_blacklist") || f === "brreg_konkurs" || f === "brreg_inactive")) {
+      return "review_required";
+    }
+    return "pending_verify";
+  }
+  // Basic gate passed — now check cross-source
+  if (cross_source_passes === false) {
+    // Basic gate passed but cross-source failed → needs human review
     return "review_required";
   }
-  // Otherwise: re-try later (transient HTTP, thin content, etc.)
-  return "pending_verify";
+  return "verified";
 }
 
 // Main loop. Caller (Fly Machine job, test, or manual) provides a
@@ -277,7 +296,41 @@ export async function runVerifierBatch(opts: {
       brreg,
     });
 
-    const newVerification = deriveVerificationStatus(gate.passes, gate.flags);
+    // ── Cross-source gate (Phase 5.3 / WO-16) ───────────────────────────────
+    // Parse field_provenance (may be JSON string from SQLite or already an object)
+    let fieldProv: Record<string, ProvenanceRecord[] | ProvenanceRecord | unknown> = {};
+    try {
+      fieldProv = typeof agent.field_provenance === "string"
+        ? JSON.parse(agent.field_provenance)
+        : (agent.field_provenance ?? {});
+    } catch {
+      fieldProv = {};
+    }
+
+    const csFields: FieldName[] = ["address", "phone", "business_status"];
+    const crossSourceResults: Record<string, unknown> = {};
+    let cross_source_passes = true;
+
+    for (const field of csFields) {
+      const result = crossSourceAgreement(fieldProv, field);
+      crossSourceResults[field] = result;
+      if (!result.agree) cross_source_passes = false;
+    }
+
+    if (gate.passes && !cross_source_passes) {
+      console.log(
+        `[verifier] ${agent.id} (${agent.name ?? "?"}) passed basic gate but failed cross-source: ` +
+        csFields
+          .filter((f) => !(crossSourceResults[f] as { agree: boolean }).agree)
+          .map((f) => {
+            const r = crossSourceResults[f] as { agree: boolean; sources_used?: string[] };
+            return `${f}(sources=${(r.sources_used ?? []).join(",") || "none"})`;
+          })
+          .join(", ")
+      );
+    }
+
+    const newVerification = deriveVerificationStatus(gate.passes, gate.flags, cross_source_passes);
     const newEnrichment = computeEnrichmentStatus({
       about: agent.about,
       products,
@@ -294,6 +347,7 @@ export async function runVerifierBatch(opts: {
       http_status: httpStatus,
       runStartedAt: startedAt,
       eligibleAt,
+      cross_source_reason: crossSourceResults,
     });
 
     results.push({
@@ -307,6 +361,7 @@ export async function runVerifierBatch(opts: {
       new_verification_status: newVerification,
       new_enrichment_status: newEnrichment,
       outreach_eligible_at: eligibleAt,
+      cross_source_reason: crossSourceResults,
     });
   }
 

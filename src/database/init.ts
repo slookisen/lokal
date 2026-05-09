@@ -1058,6 +1058,69 @@ function initSchema(db: Database.Database): void {
   } catch (err) {
     console.error("Migration agent_knowledge_audit failed:", err);
   }
+
+  // ─── Phase 5.3 (WO-16): cross-source verification columns ────────────────
+  // verification_review_reason: JSON object with per-field CrossSourceResult so
+  // the admin dashboard can surface WHY an agent is review_required.
+  // field_provenance_v2: idempotent migration — if existing rows have a single-
+  // object (legacy) shape per field, convert to 1-element array. New rows from
+  // WO-16 onwards write array shape directly.
+  try {
+    db.exec(`ALTER TABLE agent_knowledge ADD COLUMN verification_review_reason TEXT NOT NULL DEFAULT '{}'`);
+  } catch {
+    // Column already exists — expected after first migration
+  }
+
+  // Backfill: convert legacy single-object field_provenance entries to arrays.
+  // An agent's field_provenance is "legacy" if any of the tracked fields stores
+  // a plain JSON object (not an array). The UPDATE is guarded by a SELECT so it
+  // only touches rows that actually need migration, making it safe to re-run.
+  try {
+    const alreadyRan = db.prepare(
+      "SELECT 1 FROM migrations WHERE name = 'phase53_provenance_to_array_v1'"
+    ).get();
+    if (!alreadyRan) {
+      const rows = db.prepare(
+        `SELECT agent_id, field_provenance FROM agent_knowledge WHERE field_provenance != '{}' AND field_provenance IS NOT NULL`
+      ).all() as { agent_id: string; field_provenance: string }[];
+
+      const upd = db.prepare("UPDATE agent_knowledge SET field_provenance = ? WHERE agent_id = ?");
+      let migrated = 0;
+
+      const TRACKED_FIELDS = ["address", "phone", "business_status", "email", "about",
+                              "products", "opening_hours", "specialties", "certifications"];
+
+      const tx = db.transaction((batch: { agent_id: string; field_provenance: string }[]) => {
+        for (const row of batch) {
+          let prov: Record<string, unknown>;
+          try { prov = JSON.parse(row.field_provenance); } catch { continue; }
+
+          let needsUpdate = false;
+          for (const field of TRACKED_FIELDS) {
+            const val = prov[field];
+            if (val && typeof val === "object" && !Array.isArray(val)) {
+              // Legacy single-record → wrap in 1-element array
+              prov[field] = [val];
+              needsUpdate = true;
+            }
+          }
+          if (needsUpdate) {
+            upd.run(JSON.stringify(prov), row.agent_id);
+            migrated++;
+          }
+        }
+      });
+      tx(rows);
+
+      db.prepare("INSERT INTO migrations (name) VALUES ('phase53_provenance_to_array_v1')").run();
+      if (migrated > 0) {
+        console.log(`Migration phase53_provenance_to_array_v1: converted ${migrated} legacy provenance row(s) to array shape`);
+      }
+    }
+  } catch (err) {
+    console.error("Migration phase53_provenance_to_array_v1 failed:", err);
+  }
+
 }
 
 export function closeDb(): void {
