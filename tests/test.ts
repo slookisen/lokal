@@ -2080,6 +2080,254 @@ runIntegrationTests().catch((err) => {
 });
 
 
+
+// ── WO-24: postcode-fylke + address-consistency + dup-streetAddress ──────────
+import {
+  fylkeForPostcode,
+  fylkeForCity,
+  cityIsInFylke,
+} from "../src/services/postcode-fylke";
+import {
+  validateAddressConsistency,
+  findDuplicateStreetAddresses,
+} from "../src/services/cross-source-validator";
+
+console.log("\n── WO-24: postcode-fylke lookup ──");
+
+// Spec-required postcodes (key bug-detection cases)
+assertEq(fylkeForPostcode("4513"), "Agder", "wo24-pc: 4513=Mandal→Agder");
+assertEq(fylkeForPostcode("6817"), "Vestland", "wo24-pc: 6817=Naustdal→Vestland");
+assertEq(fylkeForPostcode("1940"), "Akershus", "wo24-pc: 1940=Bjørkelangen→Akershus");
+assertEq(fylkeForPostcode("0287"), "Oslo", "wo24-pc: 0287=Oslo");
+assertEq(fylkeForPostcode("5977"), "Vestland", "wo24-pc: 5977=Gulen→Vestland");
+
+// Range-coverage spot checks
+assertEq(fylkeForPostcode("0001"), "Oslo", "wo24-pc: 0001 lower bound Oslo");
+assertEq(fylkeForPostcode("1295"), "Oslo", "wo24-pc: 1295 upper bound Oslo");
+assertEq(fylkeForPostcode("1300"), "Akershus", "wo24-pc: 1300=Akershus boundary");
+assertEq(fylkeForPostcode("4500"), "Agder", "wo24-pc: 4500=Agder");
+assertEq(fylkeForPostcode("5000"), "Vestland", "wo24-pc: 5000=Bergen");
+assertEq(fylkeForPostcode("6800"), "Vestland", "wo24-pc: 6800=Vestland (Sunnfjord)");
+assertEq(fylkeForPostcode("7000"), "Trøndelag", "wo24-pc: 7000=Trondheim");
+assertEq(fylkeForPostcode("8000"), "Nordland", "wo24-pc: 8000=Bodø");
+assertEq(fylkeForPostcode("9000"), "Troms", "wo24-pc: 9000=Tromsø");
+assertEq(fylkeForPostcode("9510"), "Finnmark", "wo24-pc: 9510=Finnmark");
+
+// Invalid / null inputs
+assertEq(fylkeForPostcode(null), null, "wo24-pc: null→null");
+assertEq(fylkeForPostcode(""), null, "wo24-pc: empty→null");
+assertEq(fylkeForPostcode("xxxx"), null, "wo24-pc: non-numeric→null");
+assertEq(fylkeForPostcode("123"), null, "wo24-pc: 3 digits→null");
+assertEq(fylkeForPostcode("12345"), null, "wo24-pc: 5 digits→null");
+
+console.log("\n── WO-24: city → fylke lookup ──");
+assertEq(fylkeForCity("Mandal"), "Agder", "wo24-city: Mandal→Agder");
+assertEq(fylkeForCity("Naustdal"), "Vestland", "wo24-city: Naustdal→Vestland");
+assertEq(fylkeForCity("Oslo"), "Oslo", "wo24-city: Oslo→Oslo");
+assertEq(fylkeForCity("Bjørkelangen"), "Akershus", "wo24-city: Bjørkelangen→Akershus");
+assertEq(fylkeForCity("OSLO"), "Oslo", "wo24-city: case-insensitive");
+assertEq(fylkeForCity(" oslo "), "Oslo", "wo24-city: whitespace-tolerant");
+assertEq(fylkeForCity("Atlantis"), null, "wo24-city: unknown→null");
+assertEq(fylkeForCity(null), null, "wo24-city: null→null");
+
+console.log("\n── WO-24: cityIsInFylke ──");
+assertEq(cityIsInFylke("Mandal", "4513"), true, "wo24-cif: Mandal+4513=match");
+assertEq(cityIsInFylke("Mandal", "6817"), false, "wo24-cif: Mandal+6817=mismatch");
+assertEq(cityIsInFylke("Oslo", "0287"), true, "wo24-cif: Oslo+0287=match");
+assertEq(cityIsInFylke("Oslo", "1940"), false, "wo24-cif: Oslo+1940=Akershus mismatch");
+assertEq(cityIsInFylke("Atlantis", "4513"), null, "wo24-cif: unknown city→null");
+assertEq(cityIsInFylke("Mandal", "xxxx"), null, "wo24-cif: invalid postcode→null");
+assertEq(cityIsInFylke(null, "4513"), null, "wo24-cif: null city→null");
+
+console.log("\n── WO-24: validateAddressConsistency ──");
+
+// Bug-1: Berrvellene template-leak (Mandal addressLocality + 6817 postcode)
+{
+  const r = validateAddressConsistency({
+    streetAddress: "Berrvellene 7",
+    postalCode: "6817",
+    addressLocality: "Mandal",
+  });
+  assertEq(r.ok, false, "wo24-vac: Mandal+6817 ok=false");
+  assertEq(r.reason, "postcode_outside_fylke", "wo24-vac: reason=postcode_outside_fylke");
+}
+
+// Correct address passes
+{
+  const r = validateAddressConsistency({
+    streetAddress: "Vågsbygdveien 1",
+    postalCode: "4513",
+    addressLocality: "Mandal",
+  });
+  assertEq(r.ok, true, "wo24-vac: Mandal+4513 ok=true");
+  assertTrue(r.reason === undefined, "wo24-vac: ok→no reason");
+}
+
+// Bug-2: Oslo addressLocality + 1940 (Bjørkelangen) postcode
+{
+  const r = validateAddressConsistency({
+    streetAddress: "Bjørkeveien 20B",
+    postalCode: "1940",
+    addressLocality: "Oslo",
+  });
+  assertEq(r.ok, false, "wo24-vac: Oslo+1940 ok=false");
+  assertEq(r.reason, "postcode_outside_fylke", "wo24-vac: reason=postcode_outside_fylke (Oslo/Akershus)");
+}
+
+// Bug-3: Botanisk Hage / Tøyen template-leak (Stavanger addressLocality with Oslo postcode)
+{
+  const r = validateAddressConsistency({
+    streetAddress: "Sars gate 1",
+    postalCode: "0562",
+    addressLocality: "Stavanger",
+  });
+  assertEq(r.ok, false, "wo24-vac: Stavanger+0562 ok=false (Tøyen leak)");
+}
+
+// Null/missing fields → conservative pass
+{
+  const r1 = validateAddressConsistency({
+    streetAddress: "Some Road 1",
+    postalCode: null,
+    addressLocality: "Oslo",
+  });
+  assertEq(r1.ok, true, "wo24-vac: null postcode → ok=true (conservative)");
+
+  const r2 = validateAddressConsistency({
+    streetAddress: "Some Road 1",
+    postalCode: "0287",
+    addressLocality: null,
+  });
+  assertEq(r2.ok, true, "wo24-vac: null locality → ok=true (conservative)");
+
+  const r3 = validateAddressConsistency({
+    streetAddress: null,
+    postalCode: "",
+    addressLocality: "",
+  });
+  assertEq(r3.ok, true, "wo24-vac: all empty → ok=true");
+}
+
+// Unknown city → conservative pass (don't flag what we can't verify)
+{
+  const r = validateAddressConsistency({
+    streetAddress: "Test Road 1",
+    postalCode: "4513",
+    addressLocality: "Atlantis",
+  });
+  assertEq(r.ok, true, "wo24-vac: unknown city → ok=true");
+}
+
+console.log("\n── WO-24: findDuplicateStreetAddresses (in-memory SQLite) ──");
+
+{
+  const Database = require("better-sqlite3");
+  const memdb = new Database(":memory:");
+  // Minimal schema — just the columns the validator queries.
+  memdb.exec(`
+    CREATE TABLE agent_knowledge (
+      agent_id TEXT PRIMARY KEY,
+      address TEXT,
+      postal_code TEXT
+    );
+  `);
+
+  // Template-leak scenario: 3 agents share "Berrvellene 7", 1 unique address,
+  // 1 short address that should be EXCLUDED, 1 NULL that should be excluded.
+  const seed = [
+    ["bm-agder",      "Berrvellene 7", "4513"],
+    ["bm-trondheim",  "Berrvellene 7", "7000"],
+    ["bm-stavanger",  "Berrvellene 7", "4000"],
+    ["unique-agent",  "Vågsbygdveien 1", "4513"],
+    ["short-agent",   "Vei", "0287"],         // length 3 — excluded
+    ["short-agent-2", "Vei", "0287"],         // would-be dup but too short
+    ["null-agent",    null, "0287"],          // null — excluded
+    ["empty-agent",   "", "0287"],            // empty — excluded
+    ["empty-agent-2", "   ", "0287"],         // whitespace-only — excluded
+  ];
+  const ins = memdb.prepare(
+    "INSERT INTO agent_knowledge (agent_id, address, postal_code) VALUES (?, ?, ?)"
+  );
+  for (const row of seed) ins.run(...row);
+
+  const groups = findDuplicateStreetAddresses(memdb);
+
+  assertEq(groups.length, 1, "wo24-dup: exactly 1 duplicate group surfaces");
+  assertEq(groups[0]?.streetAddress, "Berrvellene 7", "wo24-dup: group street=Berrvellene 7");
+  assertEq(groups[0]?.count, 3, "wo24-dup: group count=3");
+  assertEq(groups[0]?.agent_ids.length, 3, "wo24-dup: 3 agent_ids");
+  assertTrue(
+    groups[0]?.agent_ids.includes("bm-agder") === true &&
+      groups[0]?.agent_ids.includes("bm-trondheim") === true &&
+      groups[0]?.agent_ids.includes("bm-stavanger") === true,
+    "wo24-dup: agent_ids contain all 3 leak victims"
+  );
+  // Short-address would-be-dup must NOT appear
+  assertTrue(
+    !groups.some((g) => g.streetAddress === "Vei"),
+    "wo24-dup: <4-char address excluded"
+  );
+  // Null/empty must not show up either
+  assertTrue(
+    !groups.some((g) => g.streetAddress === null || g.streetAddress === ""),
+    "wo24-dup: null/empty addresses excluded"
+  );
+
+  memdb.close();
+}
+
+// Empty DB / no duplicates — returns []
+{
+  const Database = require("better-sqlite3");
+  const memdb = new Database(":memory:");
+  memdb.exec(`
+    CREATE TABLE agent_knowledge (
+      agent_id TEXT PRIMARY KEY,
+      address TEXT,
+      postal_code TEXT
+    );
+  `);
+  memdb.prepare(
+    "INSERT INTO agent_knowledge (agent_id, address, postal_code) VALUES (?, ?, ?)"
+  ).run("only-agent", "Vågsbygdveien 1", "4513");
+
+  const groups = findDuplicateStreetAddresses(memdb);
+  assertEq(groups.length, 0, "wo24-dup: 1 unique row → no groups");
+  memdb.close();
+}
+
+// Multiple groups — sorted by count DESC
+{
+  const Database = require("better-sqlite3");
+  const memdb = new Database(":memory:");
+  memdb.exec(`
+    CREATE TABLE agent_knowledge (
+      agent_id TEXT PRIMARY KEY,
+      address TEXT,
+      postal_code TEXT
+    );
+  `);
+  const ins = memdb.prepare(
+    "INSERT INTO agent_knowledge (agent_id, address, postal_code) VALUES (?, ?, ?)"
+  );
+  // 4× "Big Leak Street", 2× "Small Leak Avenue", 1× unique
+  ins.run("a1", "Big Leak Street", "0287");
+  ins.run("a2", "Big Leak Street", "0287");
+  ins.run("a3", "Big Leak Street", "0287");
+  ins.run("a4", "Big Leak Street", "0287");
+  ins.run("b1", "Small Leak Avenue", "0287");
+  ins.run("b2", "Small Leak Avenue", "0287");
+  ins.run("c1", "Unique Place", "0287");
+
+  const groups = findDuplicateStreetAddresses(memdb);
+  assertEq(groups.length, 2, "wo24-dup: 2 duplicate groups");
+  assertEq(groups[0]?.streetAddress, "Big Leak Street", "wo24-dup: largest group first");
+  assertEq(groups[0]?.count, 4, "wo24-dup: largest group count=4");
+  assertEq(groups[1]?.streetAddress, "Small Leak Avenue", "wo24-dup: smaller group second");
+  assertEq(groups[1]?.count, 2, "wo24-dup: smaller group count=2");
+  memdb.close();
+}
+
 // ── REPORT ────────────────────────────────────────────────────────────
 console.log(`\n${passed} passed, ${failed} failed\n`);
 if (failed > 0) {

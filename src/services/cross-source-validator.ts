@@ -221,3 +221,128 @@ export function coerceProvenanceToArrayShape(
   }
   return result;
 }
+
+// ─── WO-24: address-consistency + duplicate-streetAddress validators ────────
+//
+// Two additional validators added in WO-24 to surface data-quality defects
+// found in the 2026-05-09 30-agent pool probe:
+//
+//   1. validateAddressConsistency() — postalCode must match addressLocality's
+//      fylke. Catches the "Berrvellene 7, 6817 / Mandal" template-leak class
+//      where one chapter's address bled into other chapters' records.
+//
+//   2. findDuplicateStreetAddresses() — surfaces template-leak directly by
+//      looking for streetAddress values that appear on >1 agent.
+//
+// These are PURE / READ-ONLY: they inspect input, never mutate the DB.
+// Wiring into the verifier pipeline is left to a later WO (PR-11 / WO-26).
+
+import { cityIsInFylke } from "./postcode-fylke";
+
+export type AddressConsistencyInput = {
+  streetAddress: string | null;
+  postalCode: string | null;
+  addressLocality: string | null;
+};
+
+export type AddressConsistencyResult = {
+  ok: boolean;
+  reason?: string;
+};
+
+/**
+ * Decide whether a (streetAddress, postalCode, addressLocality) triple is
+ * internally consistent. Today we only check postalCode↔addressLocality fylke
+ * agreement. If either field is null/empty/unknown we return ok=true (the
+ * caller cannot determine a violation from missing data).
+ *
+ * Reasons returned on failure:
+ *   "postcode_outside_fylke" — postalCode resolves to a fylke that does not
+ *                              match addressLocality's fylke.
+ */
+export function validateAddressConsistency(
+  input: AddressConsistencyInput
+): AddressConsistencyResult {
+  const { postalCode, addressLocality } = input;
+
+  // Missing fields → cannot determine inconsistency, treat as ok.
+  if (!postalCode || !postalCode.trim()) return { ok: true };
+  if (!addressLocality || !addressLocality.trim()) return { ok: true };
+
+  const inFylke = cityIsInFylke(addressLocality, postalCode);
+
+  // Unknown city or unknown postcode → conservative pass.
+  if (inFylke === null) return { ok: true };
+
+  if (inFylke === false) {
+    return { ok: false, reason: "postcode_outside_fylke" };
+  }
+  return { ok: true };
+}
+
+// ─── findDuplicateStreetAddresses ──────────────────────────────────────────
+
+export type DuplicateStreetAddressGroup = {
+  streetAddress: string;
+  postalCode: string | null;
+  count: number;
+  agent_ids: string[];
+};
+
+/**
+ * Query agent_knowledge for streetAddress values that appear on >1 agent.
+ * Excludes null, empty, and very short strings (length < 4 — too generic
+ * to be a real street address).
+ *
+ * Returns groups sorted by count DESC, then alphabetically by streetAddress.
+ *
+ * Each group also exposes the postal_code observed for the FIRST agent in
+ * the group (informational only — within a true template-leak the postal
+ * codes may be inconsistent across chapters, which is itself a signal).
+ *
+ * The `db` parameter is loosely typed (any) so this works against both the
+ * production better-sqlite3 instance and an in-memory test instance without
+ * pulling the @types/better-sqlite3 type into this file.
+ */
+export function findDuplicateStreetAddresses(
+  db: any
+): DuplicateStreetAddressGroup[] {
+  const sql = `
+    SELECT
+      address      AS streetAddress,
+      COUNT(*)     AS count
+    FROM agent_knowledge
+    WHERE address IS NOT NULL
+      AND TRIM(address) != ''
+      AND LENGTH(TRIM(address)) >= 4
+    GROUP BY TRIM(address)
+    HAVING COUNT(*) > 1
+    ORDER BY COUNT(*) DESC, address ASC
+  `;
+  const rows = db.prepare(sql).all() as Array<{
+    streetAddress: string;
+    count: number;
+  }>;
+
+  const out: DuplicateStreetAddressGroup[] = [];
+  for (const row of rows) {
+    const detail = db
+      .prepare(
+        `SELECT agent_id, postal_code
+         FROM agent_knowledge
+         WHERE TRIM(address) = TRIM(?)
+         ORDER BY agent_id ASC`
+      )
+      .all(row.streetAddress) as Array<{
+      agent_id: string;
+      postal_code: string | null;
+    }>;
+    out.push({
+      streetAddress: row.streetAddress,
+      postalCode: detail[0]?.postal_code ?? null,
+      count: row.count,
+      agent_ids: detail.map((d) => d.agent_id),
+    });
+  }
+  return out;
+}
