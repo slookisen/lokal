@@ -266,6 +266,7 @@ export async function runVerifierBatch(opts: {
   batchSize?: number;
   brregLookup?: BrregFn | null;
   db?: any;
+  headProbe?: ((url: string, timeoutMs?: number) => Promise<number | null>) | null;
 }): Promise<{
   run_id: string;
   started_at: string;
@@ -281,7 +282,8 @@ export async function runVerifierBatch(opts: {
   const results: VerifierResult[] = [];
 
   for (const agent of candidates) {
-    const httpStatus = agent.website ? await headProbe(agent.website) : null;
+    const probe = opts.headProbe ?? headProbe;
+    const httpStatus = agent.website ? await probe(agent.website) : null;
     const brreg = opts.brregLookup
       ? await opts.brregLookup(agent.name, agent.location_city || null).catch(() => null)
       : null;

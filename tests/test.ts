@@ -1942,7 +1942,8 @@ async function runIntegrationTests(): Promise<void> {
       },
     });
 
-    const result = await runVerifierBatch({ db, batchSize: 10, brregLookup: null });
+    const mockHeadProbe = async (_url: string) => 200 as number | null;
+    const result = await runVerifierBatch({ db, batchSize: 10, brregLookup: null, headProbe: mockHeadProbe });
     const agentResult = result.results.find((r) => r.agent_id === "agent-single-source");
     assertTrue(!!agentResult, "intg-1: agent-single-source found in results");
     assertEq(
@@ -2058,7 +2059,8 @@ async function runIntegrationTests(): Promise<void> {
     assertEq(crossSourceAgreement(provData, "phone").agree, false, "intg-3: 1-source phone → agree=false");
     assertEq(crossSourceAgreement(provData, "business_status").agree, false, "intg-3: 1-source business_status → agree=false");
 
-    const result = await runVerifierBatch({ db, batchSize: 10, brregLookup: null });
+    const mockHeadProbe3 = async (_url: string) => 200 as number | null;
+    const result = await runVerifierBatch({ db, batchSize: 10, brregLookup: null, headProbe: mockHeadProbe3 });
     const agentResult = result.results.find((r) => r.agent_id === "agent-partial-owner");
     assertTrue(!!agentResult, "intg-3: agent-partial-owner found in results");
     assertEq(
