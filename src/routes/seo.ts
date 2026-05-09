@@ -188,7 +188,7 @@ function shell(
   title: string,
   description: string,
   content: string,
-  extra?: { canonical?: string; jsonLd?: object | object[]; extraCss?: string; lang?: Lang; pathForAlternate?: string }
+  extra?: { canonical?: string; jsonLd?: object | object[]; extraCss?: string; lang?: Lang; pathForAlternate?: string; extraHead?: string }
 ): string {
   const lang: Lang = extra?.lang || "no";
   const canonicalUrl = extra?.canonical || BASE_URL;
@@ -285,6 +285,7 @@ function shell(
   <link rel="alternate" hreflang="nb" href="${noUrl}">
   <link rel="alternate" hreflang="en" href="${enUrl}">
   <link rel="alternate" hreflang="x-default" href="${noUrl}">
+  ${extra?.extraHead || ""}
   ${jsonLdScript}
   ${CSS}
   <style>${langSwitcherCss}</style>
@@ -1761,7 +1762,45 @@ const CITY_CSS = `
   .city-hero p { font-size: 1rem; color: var(--g500); }
   .city-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 16px; }
   @media (max-width: 768px) { .city-grid { grid-template-columns: 1fr; } }
+  .city-pager { margin-top: 32px; display: flex; justify-content: center; gap: 12px; flex-wrap: wrap; align-items: center; }
+  .city-pager a, .city-pager span { display: inline-block; padding: 8px 14px; border-radius: 8px; font-size: 0.95rem; text-decoration: none; }
+  .city-pager a { background: var(--green-50); color: var(--charcoal); border: 1px solid var(--g100); }
+  .city-pager a:hover { background: var(--green-100); }
+  .city-pager .city-pager-current { color: var(--g500); }
+  .city-producer-list { margin: 24px 0 0; padding: 0; list-style: none; display: grid; gap: 8px; }
+  .city-producer-list li a { color: var(--charcoal); font-weight: 600; text-decoration: none; }
+  .city-producer-list li a:hover { text-decoration: underline; }
+  .city-producer-list li .cpl-desc { color: var(--g500); font-weight: 400; font-size: 0.9rem; margin-left: 6px; }
 `;
+
+// City-page pagination size. 50 producer cards is enough to keep the page
+// under ~150 KB while still giving Google deep enough internal links to
+// discover every producer in <=3 hops from the homepage.
+const CITY_PAGE_SIZE = 50;
+
+/**
+ * Returns the set of agent IDs whose verification_status indicates they
+ * should NOT appear on public city pages. Currently: opt_out (and the
+ * forward-compat 'wrong_fit' status, see WO-23/PHASE5-DATA-QUALITY-PLAN).
+ *
+ * The query is defensive — agent_knowledge rows may not exist for every
+ * agent yet (the schema was added in Phase 5), so missing rows mean
+ * "include the agent". We only EXCLUDE on an explicit opt_out / wrong_fit.
+ */
+function getExcludedAgentIds(): Set<string> {
+  try {
+    const db = getDb();
+    const rows = db.prepare(
+      `SELECT agent_id FROM agent_knowledge
+        WHERE verification_status IN ('opt_out', 'wrong_fit')`
+    ).all() as { agent_id: string }[];
+    return new Set(rows.map(r => r.agent_id));
+  } catch {
+    // agent_knowledge table missing or query failed — fail open (don't hide
+    // producers because of an infra glitch).
+    return new Set();
+  }
+}
 
 router.get("/:city", (req: Request, res: Response, next: any) => {
   const citySlug = (req.params.city as string).toLowerCase();
@@ -1781,38 +1820,86 @@ router.get("/:city", (req: Request, res: Response, next: any) => {
   }
   const lang = req.lang;
 
+  // Parse ?page=N (1-indexed). Reject anything non-positive — falls back to 1.
+  const pageRaw = parseInt(String(req.query.page ?? "1"), 10);
+  const page = Number.isFinite(pageRaw) && pageRaw >= 1 ? pageRaw : 1;
+
   try {
     const agents = marketplaceRegistry.getActiveAgents();
-    const cityAgents = agents.filter((a: any) => {
+
+    // 1. Filter to this city only.
+    const cityAgentsAll = agents.filter((a: any) => {
       const city = a.city || a.location?.city || "";
       return slugify(city) === citySlug;
     });
 
-    if (cityAgents.length === 0) {
+    if (cityAgentsAll.length === 0) {
       return res.status(404).send(shell(
         lang === "en" ? "No producers found" : "Fant ingen produsenter",
         lang === "en" ? "No producers found." : "Ingen produsenter funnet.",
         `<div class="sec" style="text-align:center;padding:80px 24px;">
-          <h1 style="font-size:1.8rem;margin-bottom:12px;">Fant ingen produsenter for \u201c${escapeHtml(citySlug)}\u201d</h1>
+          <h1 style="font-size:1.8rem;margin-bottom:12px;">Fant ingen produsenter for “${escapeHtml(citySlug)}”</h1>
           <p style="color:var(--g500);"><a href="/">Tilbake til forsiden</a></p>
         </div>`
       ));
     }
 
-    const cityName = (cityAgents[0] as any).city || (cityAgents[0] as any).location?.city || citySlug;
+    // 2. Drop opted-out / wrong-fit producers (WO-23: only crawl-eligible profiles).
+    const excludedIds = getExcludedAgentIds();
+    const cityAgentsVisible = cityAgentsAll.filter((a: any) => !excludedIds.has(a.id));
+
+    // 3. Deterministic ordering — name ASC. Same agent always gets the same
+    //    page across requests, so Google's crawl-cache stays consistent.
+    cityAgentsVisible.sort((a: any, b: any) =>
+      String(a.name || "").localeCompare(String(b.name || ""), "nb")
+    );
+
+    const totalCount = cityAgentsVisible.length;
+    const totalPages = Math.max(1, Math.ceil(totalCount / CITY_PAGE_SIZE));
+    // Clamp page to [1, totalPages].
+    const safePage = Math.min(page, totalPages);
+    const sliceStart = (safePage - 1) * CITY_PAGE_SIZE;
+    const sliceEnd = sliceStart + CITY_PAGE_SIZE;
+    const cityAgents = cityAgentsVisible.slice(sliceStart, sliceEnd);
+
+    const cityName = (cityAgentsAll[0] as any).city || (cityAgentsAll[0] as any).location?.city || citySlug;
 
     // Track city page view for analytics dashboard (one entry per city visit)
-    // Use the first agent as representative — getCityStats groups by city
-    analyticsService.trackAgentView(cityAgents[0].id, cityAgents[0].name, cityName, "seo");
+    // Use the first agent as representative — getCityStats groups by city.
+    // Only track on page 1 to avoid double-counting paginated views.
+    if (safePage === 1) {
+      analyticsService.trackAgentView(cityAgentsAll[0].id, cityAgentsAll[0].name, cityName, "seo");
+    }
 
     const producerCards = cityAgents.map((a: any) => producerCard(a, undefined, lang)).join("");
+
+    // Plain <ul> of <a href="/produsent/..."> links. This is the
+    // crawl-friendly internal-link manifest — every producer in this city
+    // appears here as a real anchor with name + truncated description, so
+    // Google can discover and index every profile within 3 hops.
+    function truncate(s: string, max: number): string {
+      if (!s) return "";
+      const trimmed = s.trim();
+      if (trimmed.length <= max) return trimmed;
+      return trimmed.slice(0, max - 1).trimEnd() + "…";
+    }
+    const producerListItems = cityAgents.map((a: any) => {
+      const slug = slugify(a.name);
+      const desc = truncate(a.description || "", 100);
+      const href = localizedPath("/produsent/" + slug, lang);
+      const cityLabel = (a as any).city || (a as any).location?.city || cityName;
+      const descHtml = desc
+        ? ` <span class="cpl-desc">— ${escapeHtml(desc)} <span translate="no">(${escapeHtml(cityLabel)})</span></span>`
+        : ` <span class="cpl-desc"><span translate="no">(${escapeHtml(cityLabel)})</span></span>`;
+      return `<li><a href="${href}">${escapeHtml(a.name)}</a>${descHtml}</li>`;
+    }).join("");
 
     // City-specific context paragraph (SEO: gives Google unique content per city
     // instead of a template-only page). All values are computed from the live
     // registry so each city page gets a factually grounded, distinct lede.
     const categoryCounts = new Map<string, number>();
     let verifiedCount = 0;
-    for (const a of cityAgents) {
+    for (const a of cityAgentsVisible) {
       if ((a as any).isVerified) verifiedCount++;
       const cats = (a as any).categories || [];
       for (const c of cats) {
@@ -1822,13 +1909,13 @@ router.get("/:city", (req: Request, res: Response, next: any) => {
       }
     }
     const CATEGORY_LABELS_NO: Record<string, string> = {
-      vegetables: "gr\u00f8nnsaker", fruit: "frukt", berries: "b\u00e6r",
-      meat: "kj\u00f8tt", dairy: "meieri", cheese: "ost", eggs: "egg",
-      honey: "honning", bakery: "bakeri", fish: "fisk", seafood: "sj\u00f8mat",
+      vegetables: "grønnsaker", fruit: "frukt", berries: "bær",
+      meat: "kjøtt", dairy: "meieri", cheese: "ost", eggs: "egg",
+      honey: "honning", bakery: "bakeri", fish: "fisk", seafood: "sjømat",
       herbs: "urter", grains: "korn", flour: "mel", juice: "saft",
-      beer: "\u00f8l", wine: "vin", cider: "sider", coffee: "kaffe",
-      preserves: "syltet\u00f8y", pickles: "syltede", beverages: "drikke",
-      oil: "olje", mushrooms: "sopp", nuts: "n\u00f8tter",
+      beer: "øl", wine: "vin", cider: "sider", coffee: "kaffe",
+      preserves: "syltetøy", pickles: "syltede", beverages: "drikke",
+      oil: "olje", mushrooms: "sopp", nuts: "nøtter",
     };
     const topCategories = Array.from(categoryCounts.entries())
       .sort((a, b) => b[1] - a[1])
@@ -1841,17 +1928,17 @@ router.get("/:city", (req: Request, res: Response, next: any) => {
     else if (topCategories.length === 1) categoriesText = topCategories[0];
     const contextSentences: string[] = [];
     if (categoriesText) {
-      contextSentences.push(`Popul\u00e6re kategorier her er ${categoriesText}.`);
+      contextSentences.push(`Populære kategorier her er ${categoriesText}.`);
     }
     if (verifiedCount > 0) {
-      contextSentences.push(`${verifiedCount} av produsentene er verifiserte, og du kan kontakte dem direkte \u2014 uten mellomledd eller annonser.`);
+      contextSentences.push(`${verifiedCount} av produsentene er verifiserte, og du kan kontakte dem direkte — uten mellomledd eller annonser.`);
     } else {
-      contextSentences.push(`Alle produsenter kan kontaktes direkte \u2014 uten mellomledd eller annonser.`);
+      contextSentences.push(`Alle produsenter kan kontaktes direkte — uten mellomledd eller annonser.`);
     }
     const contextPara = contextSentences.join(" ");
 
-    // Schema.org
-    const jsonLdItems = cityAgents.slice(0, 50).map((a: any) => {
+    // Schema.org — only items shown on this page (don't lie about page contents).
+    const jsonLdItems = cityAgents.map((a: any) => {
       const info = knowledgeService.getAgentInfo(a.id);
       const k = info?.knowledge || {} as any;
       const item: any = {
@@ -1865,24 +1952,73 @@ router.get("/:city", (req: Request, res: Response, next: any) => {
       return item;
     });
 
+    // Pagination URL helpers. We always link in the user's current language.
+    const cityPathBase = localizedPath("/" + citySlug, lang);
+    function pageUrl(p: number): string {
+      return p <= 1 ? cityPathBase : `${cityPathBase}?page=${p}`;
+    }
+    const prevPage = safePage > 1 ? safePage - 1 : null;
+    const nextPage = safePage < totalPages ? safePage + 1 : null;
+
+    // Visible pager (only shown when there is more than one page).
+    let pagerHtml = "";
+    if (totalPages > 1) {
+      const parts: string[] = [];
+      if (prevPage) {
+        parts.push(`<a href="${pageUrl(prevPage)}" rel="prev">← ${lang === "en" ? "Previous" : "Forrige"}</a>`);
+      }
+      parts.push(`<span class="city-pager-current">${lang === "en" ? "Page" : "Side"} ${safePage} / ${totalPages}</span>`);
+      if (nextPage) {
+        parts.push(`<a href="${pageUrl(nextPage)}" rel="next">${lang === "en" ? "Next" : "Neste"} →</a>`);
+      }
+      pagerHtml = `<nav class="city-pager" aria-label="${lang === "en" ? "Pagination" : "Sidenummerering"}">${parts.join("")}</nav>`;
+    }
+
+    // <head> rel=next/prev so search engines understand the series.
+    // (Even though Google deprecated rel=next/prev as a ranking signal in
+    // 2019, Bing and other crawlers still honour it, and it's the
+    // conventional accessibility hint.)
+    let extraHead = "";
+    if (prevPage) extraHead += `\n  <link rel="prev" href="${BASE_URL}${pageUrl(prevPage)}">`;
+    if (nextPage) extraHead += `\n  <link rel="next" href="${BASE_URL}${pageUrl(nextPage)}">`;
+
+    // Canonical: page 1 -> /<city>; page N -> /<city>?page=N (each page
+    // self-canonicals so Google indexes them as separate URLs).
+    const canonical = `${BASE_URL}${pageUrl(safePage)}`;
+
+    const heroCount = totalCount;
+    const pageLabel = totalPages > 1
+      ? (lang === "en" ? ` &middot; page ${safePage} of ${totalPages}` : ` &middot; side ${safePage} av ${totalPages}`)
+      : "";
+
     const content = `
     <section class="city-hero">
       <div class="container">
         <div class="bc" style="padding:0 0 12px;"><a href="/">Hjem</a><span>/</span>${escapeHtml(cityName)}</div>
         <h1>${lang === "en" ? `Local food in <span translate="no">${escapeHtml(cityName)}</span>` : `Lokal mat i <span translate="no">${escapeHtml(cityName)}</span>`}</h1>
-        <p>${lang === "en" ? `${cityAgents.length} local producers in and around <span translate="no">${escapeHtml(cityName)}</span>.` : `${cityAgents.length} lokale ${getConfig().domain_dictionary.entity_plural_long} i <span translate="no">${escapeHtml(cityName)}</span>-omr\u00e5det.`}</p>
+        <p>${lang === "en" ? `${heroCount} local producers in and around <span translate="no">${escapeHtml(cityName)}</span>${pageLabel}.` : `${heroCount} lokale ${getConfig().domain_dictionary.entity_plural_long} i <span translate="no">${escapeHtml(cityName)}</span>-området${pageLabel}.`}</p>
         ${contextPara ? `<p style="margin-top:8px;color:var(--g500);">${escapeHtml(contextPara)}</p>` : ""}
       </div>
     </section>
     <section class="sec">
       <div class="city-grid">${producerCards}</div>
+      <h2 style="font-size:1.1rem;margin:32px 0 8px;color:var(--g500);font-weight:600;">${lang === "en" ? `All producers in ${escapeHtml(cityName)} (${totalCount})` : `Alle ${getConfig().domain_dictionary.entity_plural_long} i ${escapeHtml(cityName)} (${totalCount})`}</h2>
+      <ul class="city-producer-list">${producerListItems}</ul>
+      ${pagerHtml}
     </section>`;
 
     res.send(shell(
       t(lang, "city.title", { city: cityName }),
-      t(lang, "city.description", { count: cityAgents.length, city: cityName }),
+      t(lang, "city.description", { count: heroCount, city: cityName }),
       content,
-      { canonical: `${BASE_URL}${localizedPath("/" + citySlug, lang)}`, jsonLd: jsonLdItems, extraCss: CITY_CSS, lang, pathForAlternate: "/" + citySlug }
+      {
+        canonical,
+        jsonLd: jsonLdItems,
+        extraCss: CITY_CSS,
+        lang,
+        pathForAlternate: pageUrl(safePage),
+        extraHead,
+      }
     ));
   } catch (err) {
     console.error(`SEO /${citySlug} error:`, err);
@@ -2699,11 +2835,21 @@ router.get("/sitemap.xml", (_req: Request, res: Response) => {
   try {
     const agents = marketplaceRegistry.getActiveAgents();
     const today = new Date().toISOString().split("T")[0];
-    const cities = new Set<string>();
+
+    // Build city -> producer-count so we can emit paginated city URLs
+    // (?page=2, ?page=3, ...) for cities with >CITY_PAGE_SIZE producers.
+    // WO-23: every paginated city page is its own indexable URL so Google
+    // discovers all 1424 producer profiles within 3 hops of the homepage.
+    const cityCounts = new Map<string, number>();
+    const excludedIds = getExcludedAgentIds();
     agents.forEach((a: any) => {
+      if (excludedIds.has(a.id)) return;
       const city = a.city || a.location?.city;
-      if (city) cities.add(slugify(city));
+      if (!city) return;
+      const slug = slugify(city);
+      cityCounts.set(slug, (cityCounts.get(slug) || 0) + 1);
     });
+    const cities = new Set<string>(cityCounts.keys());
 
     // Build sitemap with NO + EN URLs and xhtml:link hreflang per Google guidelines.
     // https://developers.google.com/search/docs/specialized/international/localized-versions
@@ -2722,7 +2868,15 @@ router.get("/sitemap.xml", (_req: Request, res: Response) => {
     }
 
     for (const p of corePaths) addEntry(p, coreFreq[p] || "monthly", corePriorities[p]);
-    for (const city of cities) addEntry(`/${city}`, "weekly", "0.8");
+    for (const city of cities) {
+      addEntry(`/${city}`, "weekly", "0.8");
+      // Emit paginated city URLs when the city has more than one page.
+      const count = cityCounts.get(city) || 0;
+      const pages = Math.ceil(count / CITY_PAGE_SIZE);
+      for (let p = 2; p <= pages; p++) {
+        addEntry(`/${city}?page=${p}`, "weekly", "0.7");
+      }
+    }
     for (const a of agents) addEntry(`/produsent/${slugify(a.name)}`, "weekly", "0.6");
 
     xml += "\n</urlset>";

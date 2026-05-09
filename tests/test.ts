@@ -2072,6 +2072,209 @@ async function runIntegrationTests(): Promise<void> {
     const poolRow = db.prepare("SELECT * FROM outreach_ready_pool WHERE agent_id = 'agent-partial-owner'").get();
     assertTrue(!poolRow, "intg-3: partial-owner agent not in outreach_ready_pool");
   }
+
+}
+
+// ── WO-23: city-page internal-link density (synchronous) ─────────────
+// City pages must list every visible producer in the city as <a href="/produsent/...">.
+// Pagination triggers at >50 producers/city.
+// We test by driving the seo router's /:city handler directly with mock
+// req/res — the handler is synchronous (no awaits), so we can avoid a full
+// HTTP server.
+console.log("\n── WO-23: city page internal links + pagination ──");
+{
+  const sqliteWo23 = require("better-sqlite3");
+  const wdb = new sqliteWo23(":memory:");
+  // Build the minimal schema the seo route + getActiveAgents need.
+  // Build a minimal-but-route-complete schema. We include the full set
+  // of columns the city-page handler indirectly touches via knowledgeService
+  // and analyticsService so the handler runs to completion.
+  const buildSchemaWO23 = (database: any) => database.exec(`
+    CREATE TABLE agents (
+      id TEXT PRIMARY KEY,
+      name TEXT,
+      description TEXT,
+      provider TEXT,
+      contact_email TEXT,
+      url TEXT,
+      version TEXT,
+      role TEXT,
+      api_key TEXT,
+      created_at TEXT,
+      last_seen_at TEXT,
+      is_active INTEGER DEFAULT 1,
+      is_verified INTEGER DEFAULT 0,
+      trust_score REAL DEFAULT 0.5,
+      total_interactions INTEGER DEFAULT 0,
+      discovery_count INTEGER DEFAULT 0,
+      interaction_count INTEGER DEFAULT 0,
+      capabilities TEXT, skills TEXT, categories TEXT, tags TEXT, languages TEXT,
+      lat REAL, lng REAL, city TEXT, radius_km REAL,
+      schema_version TEXT, agent_version INTEGER
+    );
+    CREATE TABLE agent_knowledge (
+      agent_id TEXT PRIMARY KEY,
+      address TEXT, postal_code TEXT, website TEXT, phone TEXT, email TEXT,
+      opening_hours TEXT, products TEXT, about TEXT, specialties TEXT,
+      certifications TEXT, payment_methods TEXT, delivery_options TEXT,
+      google_rating REAL, google_review_count INTEGER, tripadvisor_rating REAL,
+      external_reviews TEXT, external_links TEXT, images TEXT, seasonality TEXT,
+      delivery_radius INTEGER, min_order_value INTEGER,
+      data_source TEXT, auto_sources TEXT, last_enriched_at TEXT,
+      owner_updated_at TEXT, preferences TEXT, curated_fields TEXT,
+      verification_status TEXT NOT NULL DEFAULT 'unverified',
+      enrichment_status TEXT NOT NULL DEFAULT 'thin'
+    );
+    CREATE TABLE agent_claims (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      agent_id TEXT NOT NULL,
+      claimant_email TEXT,
+      status TEXT
+    );
+    CREATE TABLE analytics_agent_views (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      agent_id TEXT, agent_name TEXT, city TEXT, view_source TEXT,
+      created_at TEXT DEFAULT (datetime('now'))
+    );
+  `);
+  buildSchemaWO23(wdb);
+
+  const insertCityAgent = (id: string, name: string, city: string, optOut = false) => {
+    wdb.prepare(
+      `INSERT INTO agents (id, name, description, role, city, lat, lng, radius_km, categories, tags, languages, capabilities, skills, is_active, is_verified, trust_score, created_at, last_seen_at)
+       VALUES (?, ?, ?, 'producer', ?, 60.0, 11.0, 10, '["vegetables"]', '[]', '["no"]', '{}', '[]', 1, 0, 0.5, datetime('now'), datetime('now'))`
+    ).run(id, name, `${name} description`, city);
+    wdb.prepare(
+      `INSERT INTO agent_knowledge (agent_id, verification_status) VALUES (?, ?)`
+    ).run(id, optOut ? "opt_out" : "unverified");
+  };
+
+  for (let n = 1; n <= 100; n++) {
+    insertCityAgent(`p-test-${String(n).padStart(3, "0")}`, `Testgaard ${String(n).padStart(3, "0")}`, "Testby");
+  }
+  insertCityAgent("p-optout-1", "Hidden Farm A", "Testby", true);
+  insertCityAgent("p-optout-2", "Hidden Farm B", "Testby", true);
+
+  // Wire the in-memory DB to the global getDb singleton + invalidate registry cache.
+  const initMod = require("../src/database/init");
+  initMod.__setDbForTesting(wdb);
+  const { marketplaceRegistry } = require("../src/services/marketplace-registry");
+  marketplaceRegistry._agentsCache = null;
+  marketplaceRegistry._agentsCacheTime = 0;
+
+  // The seo route's shell() helper calls getConfig(), which requires that
+  // loadConfigsAtBoot() has been invoked first. Boot the config for the rfb
+  // vertical so the route's HTML render works under test.
+  const { loadConfigsAtBoot } = require("../src/config/vertical-config");
+  try { loadConfigsAtBoot({ activeVerticalId: "rfb" }); } catch (_) { /* already booted */ }
+
+  // Pull the seo router and walk its stack to find the GET "/:city" handler.
+  const seoRouter = require("../src/routes/seo").default;
+  // Express 5 stack: each layer has .route?.path and .route.stack[0].handle
+  const stack: any[] = (seoRouter as any).stack || [];
+  let cityHandler: any = null;
+  let sitemapHandler: any = null;
+  for (const layer of stack) {
+    const path: string | undefined = layer.route?.path;
+    if (!path) continue;
+    if (path === "/:city" && layer.route.methods?.get) {
+      cityHandler = layer.route.stack.find((s: any) => s.method === "get")?.handle;
+    }
+    if (path === "/sitemap.xml" && layer.route.methods?.get) {
+      sitemapHandler = layer.route.stack.find((s: any) => s.method === "get")?.handle;
+    }
+  }
+  assertTrue(typeof cityHandler === "function", "wo23: city handler resolved from router");
+  assertTrue(typeof sitemapHandler === "function", "wo23: sitemap handler resolved from router");
+
+  function callHandler(handler: any, params: any, query: any = {}): { status: number; body: string } {
+    let captured = "";
+    let status = 200;
+    let nextCalled = false;
+    const req: any = { params, query, lang: "no", header: () => undefined, get: () => undefined };
+    const res: any = {
+      _headers: {} as Record<string, string>,
+      status(code: number) { status = code; return res; },
+      header(k: string, v: string) { res._headers[k.toLowerCase()] = v; return res; },
+      set(k: string, v: string) { res._headers[k.toLowerCase()] = v; return res; },
+      send(body: string) { captured = String(body); },
+    };
+    const next = () => { nextCalled = true; };
+    handler(req, res, next);
+    if (nextCalled) status = 0; // signal route delegated
+    return { status, body: captured };
+  }
+
+  // ── Test 1: page 1 of /testby renders 50 producer links + has page=2 link
+  const r1 = callHandler(cityHandler, { city: "testby" });
+  assertEq(r1.status, 200, "wo23: page 1 status 200");
+  const matches1 = r1.body.match(/href="\/produsent\/testgaard-\d+"/g) || [];
+  const unique1 = new Set(matches1);
+  assertEq(unique1.size, 50, "wo23: page 1 contains 50 unique producer links");
+  assertTrue(/<link rel="next" href="[^"]*\/testby\?page=2">/.test(r1.body),
+    "wo23: page 1 emits <link rel=next> in head");
+  assertTrue(/href="\/testby\?page=2"[^>]*rel="next"/.test(r1.body),
+    "wo23: page 1 has visible Neste pager link to ?page=2");
+  assertTrue(!/Hidden Farm/.test(r1.body), "wo23: opt_out producers NOT rendered on page 1");
+  // Self-canonical to root path on page 1 (no ?page= query)
+  assertTrue(/<link rel="canonical" href="[^"]*\/testby">/.test(r1.body)
+          && !/<link rel="canonical" href="[^"]*\/testby\?page=/.test(r1.body),
+    "wo23: page 1 canonical points to /testby (no ?page=)");
+
+  // ── Test 2: page 2 of /testby renders the remaining 50 + rel=prev + canonical
+  const r2 = callHandler(cityHandler, { city: "testby" }, { page: "2" });
+  assertEq(r2.status, 200, "wo23: page 2 status 200");
+  const matches2 = r2.body.match(/href="\/produsent\/testgaard-\d+"/g) || [];
+  const unique2 = new Set(matches2);
+  assertEq(unique2.size, 50, "wo23: page 2 contains 50 unique producer links");
+  assertTrue(/<link rel="prev" href="[^"]*\/testby">/.test(r2.body),
+    "wo23: page 2 emits <link rel=prev> in head");
+  assertTrue(/<link rel="canonical" href="[^"]*\/testby\?page=2">/.test(r2.body),
+    "wo23: page 2 self-canonicals to ?page=2");
+
+  // ── Test 3: page1 + page2 together cover all 100 producers
+  const allUnique = new Set<string>([...unique1, ...unique2]);
+  assertEq(allUnique.size, 100, "wo23: page1 + page2 together link to all 100 producers");
+
+  // ── Test 4: every producer in page 1's <ul> list is anchored
+  // (regression: ensures we render <a href="/produsent/...">name</a> for each)
+  const ulMatch = r1.body.match(/<ul class="city-producer-list">[\s\S]*?<\/ul>/);
+  assertTrue(!!ulMatch, "wo23: city-producer-list <ul> rendered on page 1");
+  const ulInner = ulMatch ? ulMatch[0] : "";
+  const liAnchors = (ulInner.match(/<li><a href="\/produsent\/[^"]+">/g) || []);
+  assertEq(liAnchors.length, 50, "wo23: <ul> has exactly 50 <li><a href=/produsent/...> entries");
+
+  // ── Test 5: sitemap.xml emits paginated city URLs
+  const sm = callHandler(sitemapHandler, {});
+  assertEq(sm.status, 200, "wo23: sitemap.xml status 200");
+  assertTrue(/<loc>[^<]*\/testby<\/loc>/.test(sm.body), "wo23: sitemap includes /testby");
+  assertTrue(/<loc>[^<]*\/testby\?page=2<\/loc>/.test(sm.body), "wo23: sitemap includes /testby?page=2");
+
+  // ── Test 6: small city (≤50 producers) does NOT emit pagination markup
+  // Spin up a fresh DB with only 10 producers in "Smaaby".
+  const wdb2 = new sqliteWo23(":memory:");
+  buildSchemaWO23(wdb2);
+  for (let n = 1; n <= 10; n++) {
+    const id = `p-small-${n}`;
+    wdb2.prepare(
+      `INSERT INTO agents (id, name, description, role, city, lat, lng, radius_km, categories, tags, languages, capabilities, skills, is_active, is_verified, trust_score, created_at, last_seen_at)
+       VALUES (?, ?, ?, 'producer', 'Smaaby', 60.0, 11.0, 10, '["vegetables"]', '[]', '["no"]', '{}', '[]', 1, 0, 0.5, datetime('now'), datetime('now'))`
+    ).run(id, `Smaagaard ${n}`, "desc");
+    wdb2.prepare(`INSERT INTO agent_knowledge (agent_id, verification_status) VALUES (?, 'unverified')`).run(id);
+  }
+  initMod.__setDbForTesting(wdb2);
+  marketplaceRegistry._agentsCache = null;
+  marketplaceRegistry._agentsCacheTime = 0;
+
+  const r3 = callHandler(cityHandler, { city: "smaaby" });
+  assertEq(r3.status, 200, "wo23: small city status 200");
+  assertTrue(!/<link rel="next"/.test(r3.body), "wo23: small city does NOT emit rel=next");
+  assertTrue(!/<link rel="prev"/.test(r3.body), "wo23: small city does NOT emit rel=prev");
+  // The class name `city-pager` appears in the inline <style> CSS even when
+  // no pager is rendered, so check for the actual <nav class="city-pager">.
+  assertTrue(!/<nav class="city-pager"/.test(r3.body), "wo23: small city does NOT render visible <nav class=city-pager>");
+  const smallMatches = (r3.body.match(/href="\/produsent\/smaagaard-\d+"/g) || []);
+  assertEq(new Set(smallMatches).size, 10, "wo23: small city has all 10 producer links");
 }
 
 runIntegrationTests().catch((err) => {
