@@ -1941,6 +1941,14 @@ const PROFILE_CSS = `
   .cert-item { display: flex; align-items: center; gap: 7px; padding: 8px 14px; background: var(--green-50); border-radius: var(--r-md); border: 1px solid var(--green-100); }
   .cert-text { font-size: 0.82rem; font-weight: 600; color: var(--green-700); }
   .claim-bar { background: linear-gradient(135deg, var(--green-700), var(--green-900)); color: var(--white); border-radius: var(--r-lg); padding: 24px 28px; display: flex; align-items: center; justify-content: space-between; gap: 16px; }
+  /* Phase 5.4a M2 — Variant A: hero claim banner shown for unclaimed agents.
+     Server-rendered (visible to AI bots) above the fold. */
+  .claim-hero { background: linear-gradient(135deg, #2D5016, #1a3d0a); color: var(--white); border-radius: var(--r-lg); padding: 20px 24px; margin: 0 0 20px; display: flex; align-items: center; justify-content: space-between; gap: 16px; flex-wrap: wrap; }
+  .claim-hero h2 { font-size: 1.15rem; font-weight: 700; margin: 0 0 4px; color: var(--white); }
+  .claim-hero p { font-size: 0.9rem; opacity: 0.9; margin: 0; }
+  .claim-hero a.claim-hero-btn { display: inline-flex; align-items: center; min-height: 44px; padding: 12px 24px; background: #D4A373; color: #1a1a1a; border-radius: 8px; font-weight: 700; font-size: 0.95rem; text-decoration: none; white-space: nowrap; }
+  .claim-hero a.claim-hero-btn:hover, .claim-hero a.claim-hero-btn:focus { background: #e8c9a0; outline: 2px solid #fff; }
+  @media (max-width: 600px) { .claim-hero { flex-direction: column; align-items: stretch; text-align: center; } .claim-hero a.claim-hero-btn { width: 100%; justify-content: center; } }
   .claim-bar h3 { font-size: 1.05rem; font-weight: 700; margin-bottom: 4px; }
   .claim-bar p { font-size: 0.85rem; opacity: 0.85; }
   .claim-btn { padding: 10px 22px; background: var(--white); color: var(--green-700); border: none; border-radius: var(--r-md); font-weight: 700; font-size: 0.85rem; cursor: pointer; white-space: nowrap; }
@@ -2146,6 +2154,18 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
     // Track producer page view for analytics dashboard
     const cityName = (agent as any).city || (agent as any).location?.city || "";
     analyticsService.trackAgentView(agent.id, agent.name, cityName, "seo");
+
+    // Phase 5.4a M2 — claim status (server-rendered so AI bots see CTA per A3).
+    // claimed_at is on the agents table but not exposed by RegisteredAgent — query directly.
+    let isClaimed = false;
+    try {
+      const claimRow = getDb()
+        .prepare("SELECT claimed_at FROM agents WHERE id = ?")
+        .get(agent.id) as any;
+      isClaimed = !!(claimRow && claimRow.claimed_at);
+    } catch (e) {
+      console.error("[seo] claim status query failed:", e);
+    }
 
     const info = knowledgeService.getAgentInfo(agent.id);
     const k = (info?.knowledge || {}) as any;
@@ -2465,8 +2485,22 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
       };
     }
 
+    // Phase 5.4a M2 — Variant A hero claim banner for unclaimed agents.
+    // Renders above the fold, server-rendered so AI bots see it (A3).
+    const heroClaimHtml = !isClaimed
+      ? `<div class="claim-hero">
+           <div>
+             <h2>${lang === "en" ? "Do you own this shop?" : "Eier denne butikken?"}</h2>
+             <p>${lang === "en" ? "Take ownership of " + escapeHtml(agent.name) + " and manage your own profile." : "Ta eierskap over " + escapeHtml(agent.name) + " og styr din egen profil."}</p>
+           </div>
+           <a href="/selger?agent=${encodeURIComponent(agent.id)}" class="claim-hero-btn">${lang === "en" ? "Take ownership here" : "Ta eierskap her"}</a>
+         </div>`
+      : "";
+
     const content = `
     <div class="bc"><a href="/">Hjem</a>${cityName ? `<span>/</span><a href="/${slugify(cityName)}">${escapeHtml(cityName)}</a>` : ""}<span>/</span>${escapeHtml(agent.name)}</div>
+
+    ${heroClaimHtml}
 
     <div class="pf-header">
       <div class="pf-hero">
@@ -2576,22 +2610,13 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
           <div class="card-body"><div class="reviews-grid">${reviewsHtml}</div></div>
         </div>` : ""}
 
-        <div class="claim-bar">
+        ${isClaimed ? `<div class="claim-bar" style="padding:16px 20px;font-size:0.95rem;">
           <div>
-            <h3>${lang === "en"
-              ? (agent.isVerified ? "Do you also work here?" : "Are you the owner of " + escapeHtml(agent.name) + "?")
-              : (agent.isVerified ? "Jobber du ogs\u00e5 her?" : "Er du eieren av " + escapeHtml(agent.name) + "?")
-            }</h3>
-            <p>${lang === "en"
-              ? (agent.isVerified ? "Multiple people can manage this profile." : "Claim the profile to update information and become visible to more customers.")
-              : (agent.isVerified ? "Flere personer kan administrere denne profilen." : "Gj\u00f8r krav p\u00e5 profilen for \u00e5 oppdatere informasjon og bli synlig for flere.")
-            }</p>
+            <h3 style="font-size:0.95rem;">${lang === "en" ? "Are you also an owner?" : "Er du ogs\u00e5 eier?"}</h3>
+            <p style="font-size:0.8rem;">${lang === "en" ? "Request access to manage this profile." : "Be om tilgang til \u00e5 administrere denne profilen."}</p>
           </div>
-          <a href="/selger?agent=${encodeURIComponent(agent.id)}" class="claim-btn">${lang === "en"
-            ? (agent.isVerified ? "Get access" : "Claim this listing")
-            : (agent.isVerified ? "F\u00e5 tilgang" : "Gj\u00f8r krav p\u00e5 denne")
-          }</a>
-        </div>
+          <a href="/selger?agent=${encodeURIComponent(agent.id)}" class="claim-btn" style="font-size:0.8rem;padding:8px 16px;">${lang === "en" ? "Request access here" : "Be om tilgang her"}</a>
+        </div>` : ""}
 
         <div class="data-src">
           <span class="data-dot ${(!k.dataSource || k.dataSource === "auto") ? "auto" : "owner"}"></span>
