@@ -20,9 +20,11 @@
 import { getDb } from "../database/init";
 import {
   crossSourceAgreement,
+  findDuplicateStreetAddresses,
   type FieldName,
   type ProvenanceRecord,
 } from "../services/cross-source-validator";
+import { planAutoFix, type AutoFixResult } from "../services/auto-fix-service";
 
 export interface VerifierResult {
   agent_id: string;
@@ -267,11 +269,21 @@ export async function runVerifierBatch(opts: {
   brregLookup?: BrregFn | null;
   db?: any;
   headProbe?: ((url: string, timeoutMs?: number) => Promise<number | null>) | null;
+  // WO-26: when true, after the basic verifier pass we call planAutoFix on
+  // every result with status 'review_required'. If the plan has confidence
+  // 'high' AND manual_review_recommended is false, we apply it and bump the
+  // status to 'auto_fixed'. Default: false (opt-in only).
+  autoFixOnReviewRequired?: boolean;
 }): Promise<{
   run_id: string;
   started_at: string;
   finished_at: string;
   results: VerifierResult[];
+  auto_fix?: {
+    attempted: number;
+    applied: number;
+    flagged_for_review: number;
+  };
 }> {
   const db = opts.db ?? getDb();
   const limit = opts.batchSize ?? 30;
@@ -367,11 +379,132 @@ export async function runVerifierBatch(opts: {
     });
   }
 
+  // ── WO-26: optional auto-fix pass on review_required results ────────────
+  let autoFixSummary: { attempted: number; applied: number; flagged_for_review: number } | undefined;
+  if (opts.autoFixOnReviewRequired) {
+    autoFixSummary = { attempted: 0, applied: 0, flagged_for_review: 0 };
+    const dupGroups = findDuplicateStreetAddresses(db);
+    const finishedAtIso = new Date().toISOString();
+
+    for (const r of results) {
+      if (r.new_verification_status !== "review_required") continue;
+      autoFixSummary.attempted++;
+
+      // Re-read agent record so the planner sees fresh fields
+      const row = db
+        .prepare(
+          `SELECT a.id AS agent_id, a.name, a.url,
+                  k.address, k.postal_code, a.city,
+                  k.website, k.phone, k.email,
+                  k.verification_status, k.outreach_eligible_at
+             FROM agents a
+       INNER JOIN agent_knowledge k ON k.agent_id = a.id
+            WHERE a.id = ?`
+        )
+        .get(r.agent_id) as any;
+      if (!row) continue;
+
+      let plan: AutoFixResult;
+      try {
+        plan = await planAutoFix({
+          agent_id: r.agent_id,
+          current_knowledge: {
+            agent_id: r.agent_id,
+            name: row.name,
+            address: row.address,
+            postal_code: row.postal_code,
+            city: row.city,
+            website: row.website,
+            phone: row.phone,
+            email: row.email,
+            url: row.url,
+            verification_status: row.verification_status,
+            outreach_eligible_at: row.outreach_eligible_at,
+          },
+          brregLookup: opts.brregLookup ?? null,
+          duplicateStreetAddresses: dupGroups,
+        });
+      } catch (err) {
+        console.error(`[verifier auto-fix] planAutoFix crashed for ${r.agent_id}:`, err);
+        continue;
+      }
+
+      const safeToApply =
+        plan.actions.length > 0 &&
+        plan.confidence === "high" &&
+        plan.manual_review_recommended === false;
+
+      if (!safeToApply) {
+        if (plan.actions.length > 0) autoFixSummary.flagged_for_review++;
+        continue;
+      }
+
+      // Apply: write set_field actions to agent_knowledge, set_status to verification_status,
+      // log everything to auto_fix_log. Mirrors admin-auto-fix route's applyActions logic.
+      try {
+        const tx = db.transaction(() => {
+          for (const action of plan.actions) {
+            if (action.type === "flag_review") continue;
+            if (action.type === "set_status") {
+              db.prepare(
+                "UPDATE agent_knowledge SET verification_status = ? WHERE agent_id = ?"
+              ).run(action.new_status, r.agent_id);
+              db.prepare(
+                `INSERT INTO auto_fix_log (agent_id, applied_at, fix_category, field, old_value, new_value, source, reason)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+              ).run(
+                r.agent_id, finishedAtIso, plan.fix_categories[0] ?? "set_status",
+                "verification_status", action.old_status, action.new_status,
+                "auto-fix:verifier", action.reason
+              );
+              continue;
+            }
+            // set_field — agents owns: name, city, url. Knowledge owns the rest.
+            const AGENT_FIELDS = new Set(["url", "city", "name"]);
+            const isAgentField = AGENT_FIELDS.has(action.field);
+            const table = isAgentField ? "agents" : "agent_knowledge";
+            const fkCol = isAgentField ? "id" : "agent_id";
+            db.prepare(`UPDATE ${table} SET ${action.field} = ? WHERE ${fkCol} = ?`).run(
+              action.new_value as any, r.agent_id
+            );
+            db.prepare(
+              `INSERT INTO auto_fix_log (agent_id, applied_at, fix_category, field, old_value, new_value, source, reason)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+            ).run(
+              r.agent_id, finishedAtIso, plan.fix_categories[0] ?? "set_field",
+              action.field,
+              action.old_value === null || action.old_value === undefined ? null : String(action.old_value),
+              action.new_value === null || action.new_value === undefined ? null : String(action.new_value),
+              action.source, action.reason
+            );
+          }
+          // Mark as auto_fixed (unless a status action already set it elsewhere)
+          const stillReview = db.prepare(
+            "SELECT verification_status AS s FROM agent_knowledge WHERE agent_id = ?"
+          ).get(r.agent_id) as { s: string } | undefined;
+          if (stillReview?.s === "review_required") {
+            db.prepare(
+              "UPDATE agent_knowledge SET verification_status = 'auto_fixed' WHERE agent_id = ?"
+            ).run(r.agent_id);
+            r.new_verification_status = "auto_fixed";
+          } else if (stillReview) {
+            r.new_verification_status = stillReview.s;
+          }
+        });
+        tx();
+        autoFixSummary.applied++;
+      } catch (err) {
+        console.error(`[verifier auto-fix] apply crashed for ${r.agent_id}:`, err);
+      }
+    }
+  }
+
   return {
     run_id: runId,
     started_at: startedAt,
     finished_at: new Date().toISOString(),
     results,
+    ...(autoFixSummary ? { auto_fix: autoFixSummary } : {}),
   };
 }
 
@@ -383,6 +516,7 @@ export function buildRunEnvelope(input: {
   finished_at: string;
   results: VerifierResult[];
   reportPath?: string;
+  auto_fix?: { attempted: number; applied: number; flagged_for_review: number };
 }): Record<string, unknown> {
   const r = input.results;
   const verified = r.filter((x) => x.new_verification_status === "verified").length;
@@ -413,6 +547,12 @@ export function buildRunEnvelope(input: {
       },
       ...(input.reportPath
         ? [{ type: "file_deployed", value: input.reportPath, meta: { kind: "hourly_report" } }]
+        : []),
+      ...(input.auto_fix
+        ? [
+            { type: "db_state_change", value: input.auto_fix.applied, meta: { kind: "auto_fix_applied" } },
+            { type: "db_state_change", value: input.auto_fix.flagged_for_review, meta: { kind: "auto_fix_flag_review" } },
+          ]
         : []),
     ],
     next_suggested: ["platform-verifier"],

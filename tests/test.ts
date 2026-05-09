@@ -2328,11 +2328,509 @@ console.log("\n── WO-24: findDuplicateStreetAddresses (in-memory SQLite) ─
   memdb.close();
 }
 
-// ── REPORT ────────────────────────────────────────────────────────────
-console.log(`\n${passed} passed, ${failed} failed\n`);
-if (failed > 0) {
-  console.log("Failures:");
-  for (const f of failures) console.log(f);
-  process.exit(1);
+// ── WO-24 P1 fix-up: 1790-1999 strip split correctly ─────────────────────────
+console.log("\n── WO-24 P1: postcode-fylke 1790-1999 strip split ──");
+assertEq(fylkeForPostcode("1790"), "Østfold", "wo24-p1: 1790=Tistedal→Østfold (was wrongly Akershus)");
+assertEq(fylkeForPostcode("1850"), "Østfold", "wo24-p1: 1850=Mysen→Østfold (was wrongly Akershus)");
+assertEq(fylkeForPostcode("1899"), "Østfold", "wo24-p1: 1899 upper Østfold");
+assertEq(fylkeForPostcode("1900"), "Akershus", "wo24-p1: 1900 lower Akershus carve-out");
+assertEq(fylkeForPostcode("1949"), "Akershus", "wo24-p1: 1949 upper Akershus carve-out");
+assertEq(fylkeForPostcode("1950"), "Østfold", "wo24-p1: 1950 lower Østfold tail");
+assertEq(fylkeForPostcode("1999"), "Østfold", "wo24-p1: 1999 upper Østfold");
+assertEq(fylkeForPostcode("1940"), "Akershus", "wo24-p1: 1940=Bjørkelangen still Akershus");
+assertEq(fylkeForCity("Mysen"), "Østfold", "wo24-p1: Mysen city → Østfold");
+assertEq(fylkeForCity("Tistedal"), "Østfold", "wo24-p1: Tistedal city → Østfold");
+
+// ── WO-24 P2 fix-up: case-insensitive duplicate street addresses ─────────────
+console.log("\n── WO-24 P2: findDuplicateStreetAddresses case-insensitive ──");
+{
+  const Database = require("better-sqlite3");
+  const memdb = new Database(":memory:");
+  memdb.exec(`
+    CREATE TABLE agent_knowledge (
+      agent_id TEXT PRIMARY KEY,
+      address TEXT,
+      postal_code TEXT
+    );
+  `);
+  const ins = memdb.prepare(
+    "INSERT INTO agent_knowledge (agent_id, address, postal_code) VALUES (?, ?, ?)"
+  );
+  // Mixed-case template-leak: should collapse to a SINGLE group of 3.
+  ins.run("a1", "Berrvellene 7", "4513");
+  ins.run("a2", "BERRVELLENE 7", "7000");
+  ins.run("a3", "berrvellene 7", "4000");
+  ins.run("u1", "Vågsbygdveien 1", "4513");
+
+  const groups = findDuplicateStreetAddresses(memdb);
+  assertEq(groups.length, 1, "wo24-p2: case variants collapse to 1 group");
+  assertEq(groups[0]?.count, 3, "wo24-p2: count includes all 3 case variants");
+  assertEq(groups[0]?.agent_ids.length, 3, "wo24-p2: 3 agent_ids");
+  memdb.close();
 }
-console.log("✓ all tests passed");
+
+// ── WO-26: auto-fix-service unit tests ────────────────────────────────────────
+console.log("\n── WO-26: auto-fix-service ──");
+import {
+  planAutoFix,
+  normalizePhoneDigits,
+  extractPhonesFromHtml,
+  extractNaceCode,
+  DEFAULT_NACE_BLACKLIST,
+} from "../src/services/auto-fix-service";
+
+// Synchronous helper tests (no await) -----------------------------------
+assertEq(normalizePhoneDigits("+47 41 63 22 99"), "41632299", "wo26-norm: +47 with spaces");
+assertEq(normalizePhoneDigits("0047-41632299"), "41632299", "wo26-norm: 0047 with dash");
+assertEq(normalizePhoneDigits("(41) 63 22 99"), "41632299", "wo26-norm: parens");
+assertEq(normalizePhoneDigits(null), "", "wo26-norm: null → empty");
+assertEq(normalizePhoneDigits(""), "", "wo26-norm: empty → empty");
+
+assertEq(extractNaceCode("79.90 Annet — festivaler"), "79.90", "wo26-nace: with label");
+assertEq(extractNaceCode("47.11"), "47.11", "wo26-nace: bare code");
+assertEq(extractNaceCode("47.1"), "47.1", "wo26-nace: short form");
+assertEq(extractNaceCode(null), null, "wo26-nace: null → null");
+assertEq(extractNaceCode("Some text"), null, "wo26-nace: non-NACE → null");
+
+{
+  const phones = extractPhonesFromHtml(
+    "<p>Ring oss på +47 41 63 22 99</p><p>eller mobil 90012345</p>"
+  );
+  assertTrue(phones.includes("41632299"), "wo26-phones: +47 prefixed match");
+  assertTrue(phones.includes("90012345"), "wo26-phones: bare 9-prefix match");
+}
+{
+  const phones = extractPhonesFromHtml('<a href="tel:+4741632299">Call</a>');
+  assertTrue(phones.includes("41632299"), "wo26-phones: tel: link match");
+}
+
+assertTrue(DEFAULT_NACE_BLACKLIST.includes("79.90"), "wo26-blacklist: 79.90 (festivals)");
+assertTrue(DEFAULT_NACE_BLACKLIST.includes("47.11"), "wo26-blacklist: 47.11 (retail)");
+assertTrue(!DEFAULT_NACE_BLACKLIST.includes("55.10"), "wo26-blacklist: 55.* hotels NOT blacklisted");
+
+async function runWo26AutoFixTests(): Promise<void> {
+  // ── Strategy 1: Postcode↔fylke fix → flag_review when no Brreg ──────────
+  {
+    const r = await planAutoFix({
+      agent_id: "test-1",
+      current_knowledge: {
+        address: "Berrvellene 7",
+        postal_code: "6817",       // Vestland
+        city: "Mandal",            // Agder
+        verification_status: "verified",
+      },
+      brregLookup: null,
+    });
+    assertTrue(r.actions.length === 1, "wo26-s1: 1 action");
+    assertEq(r.actions[0]?.type, "flag_review", "wo26-s1: flag_review action");
+    assertTrue(r.fix_categories.includes("postcode_fylke"), "wo26-s1: postcode_fylke category");
+    assertEq(r.confidence, "low", "wo26-s1: confidence=low (no source)");
+    assertTrue(r.manual_review_recommended, "wo26-s1: manual_review_recommended");
+  }
+
+  // Self-consistent address → no actions
+  {
+    const r = await planAutoFix({
+      agent_id: "test-1b",
+      current_knowledge: {
+        address: "Vågsbygdveien 1",
+        postal_code: "4513",
+        city: "Mandal",
+      },
+    });
+    assertEq(r.actions.length, 0, "wo26-s1: consistent address → 0 actions");
+  }
+
+  // ── Strategy 2: Template-leak demote ────────────────────────────────────
+  {
+    const dupGroups = [
+      {
+        streetAddress: "Berrvellene 7",
+        postalCode: "4513",
+        count: 4,
+        agent_ids: ["bm-agder", "bm-trondheim", "bm-stavanger", "bm-bergen"],
+      },
+    ];
+    const r = await planAutoFix({
+      agent_id: "bm-trondheim",
+      current_knowledge: {
+        address: "Berrvellene 7",
+        postal_code: "7000",
+        city: "Trondheim",
+        verification_status: "verified",
+      },
+      duplicateStreetAddresses: dupGroups,
+    });
+    assertTrue(r.actions.length >= 4, "wo26-s2: at least 4 actions (3 set_field + 1 set_status)");
+    assertTrue(r.fix_categories.includes("duplicate_streetAddress"), "wo26-s2: dup category");
+    const statusAction = r.actions.find((a) => a.type === "set_status");
+    assertTrue(statusAction !== undefined, "wo26-s2: has set_status");
+    if (statusAction && statusAction.type === "set_status") {
+      assertEq(statusAction.new_status, "unverified", "wo26-s2: demoted to unverified");
+    }
+  }
+
+  // Non-leaking agent (unique address) → no template-leak actions
+  {
+    const dupGroups = [
+      {
+        streetAddress: "Berrvellene 7",
+        postalCode: "4513",
+        count: 3,
+        agent_ids: ["bm-agder", "bm-trondheim", "bm-stavanger"],
+      },
+    ];
+    const r = await planAutoFix({
+      agent_id: "unique-farm",
+      current_knowledge: {
+        address: "Vågsbygdveien 1",
+        postal_code: "4513",
+        city: "Mandal",
+      },
+      duplicateStreetAddresses: dupGroups,
+    });
+    assertTrue(
+      !r.fix_categories.includes("duplicate_streetAddress"),
+      "wo26-s2: unique agent → no dup category"
+    );
+  }
+
+  // ── Strategy 3: NACE-blacklist wrong-fit ────────────────────────────────
+  {
+    const fakeBrreg = async () => ({
+      is_active: true,
+      is_konkurs: false,
+      naering: "79.90 Annet — festivaler og events",
+    });
+    const r = await planAutoFix({
+      agent_id: "test-festival",
+      current_knowledge: {
+        name: "Mathallen Festival",
+        address: "Vulkan 1",
+        postal_code: "0178",
+        city: "Oslo",
+        verification_status: "verified",
+        outreach_eligible_at: "2026-05-01T00:00:00Z",
+      },
+      brregLookup: fakeBrreg as any,
+    });
+    assertTrue(r.fix_categories.includes("wrong_fit"), "wo26-s3: wrong_fit category");
+    const statusAction = r.actions.find((a) => a.type === "set_status");
+    assertTrue(statusAction !== undefined, "wo26-s3: has set_status");
+    if (statusAction && statusAction.type === "set_status") {
+      assertEq(statusAction.new_status, "wrong_fit", "wo26-s3: status → wrong_fit");
+    }
+    const clearedEligible = r.actions.find(
+      (a) => a.type === "set_field" && a.field === "outreach_eligible_at"
+    );
+    assertTrue(clearedEligible !== undefined, "wo26-s3: cleared outreach_eligible_at");
+  }
+
+  // Brreg returns OK NACE (real producer) → no wrong-fit action
+  {
+    const fakeBrreg = async () => ({
+      is_active: true,
+      is_konkurs: false,
+      naering: "01.50 Allsidig husdyrhold",
+    });
+    const r = await planAutoFix({
+      agent_id: "test-real-farm",
+      current_knowledge: {
+        name: "Hjortegården",
+        address: "Hjorteveien 3",
+        postal_code: "4513",
+        city: "Mandal",
+      },
+      brregLookup: fakeBrreg as any,
+    });
+    assertTrue(!r.fix_categories.includes("wrong_fit"), "wo26-s3: real farm → no wrong_fit");
+  }
+
+  // ── Strategy 4: Phone re-fetch ──────────────────────────────────────────
+  {
+    const fakeProbe = async () => ({
+      status: 200,
+      html: '<html><body>Ring oss: +47 41 63 22 99</body></html>',
+    });
+    const r = await planAutoFix({
+      agent_id: "test-phone",
+      current_knowledge: {
+        name: "Test Farm",
+        address: "Test 1",
+        postal_code: "4513",
+        city: "Mandal",
+        website: "https://example.no",
+        phone: "+47 99 88 77 66",
+      },
+      homepageProbe: fakeProbe as any,
+    });
+    assertTrue(r.fix_categories.includes("phone_refetch"), "wo26-s4: phone_refetch category");
+    const phoneSet = r.actions.find((a) => a.type === "set_field" && a.field === "phone");
+    assertTrue(phoneSet !== undefined, "wo26-s4: set_field phone");
+    if (phoneSet && phoneSet.type === "set_field") {
+      assertTrue(
+        String(phoneSet.new_value).includes("41 63 22 99"),
+        "wo26-s4: new phone formatted"
+      );
+    }
+    assertEq(r.confidence, "medium", "wo26-s4: confidence=medium");
+  }
+
+  // Phone matches homepage → no action
+  {
+    const fakeProbe = async () => ({
+      status: 200,
+      html: 'Ring +47 99 88 77 66 i dag',
+    });
+    const r = await planAutoFix({
+      agent_id: "test-phone-ok",
+      current_knowledge: {
+        name: "Test Farm",
+        address: "Test 1",
+        postal_code: "4513",
+        city: "Mandal",
+        website: "https://example.no",
+        phone: "+47 99 88 77 66",
+      },
+      homepageProbe: fakeProbe as any,
+    });
+    assertTrue(!r.fix_categories.includes("phone_refetch"), "wo26-s4: phone agrees → no action");
+  }
+
+  // ── Strategy 5: Bondens Marked URL-rot ──────────────────────────────────
+  {
+    const fakeProbe = async () => ({
+      status: 200,
+      html: '<html><body>Lokallag ikke funnet</body></html>',
+    });
+    const r = await planAutoFix({
+      agent_id: "bm-trondheim",
+      current_knowledge: {
+        name: "Bondens Marked Trondheim",
+        url: "https://bondensmarked.no/lokallag/trondheim-old",
+      },
+      homepageProbe: fakeProbe as any,
+    });
+    assertTrue(r.fix_categories.includes("bondens_marked_url"), "wo26-s5: bm category");
+    const urlSet = r.actions.find((a) => a.type === "set_field" && a.field === "url");
+    assertTrue(urlSet !== undefined, "wo26-s5: set_field url");
+    if (urlSet && urlSet.type === "set_field") {
+      assertEq(urlSet.new_value, "https://bondensmarked.no", "wo26-s5: url → chapter index");
+    }
+  }
+
+  // Non-Bondens-Marked agent → no action even if URL 404s
+  {
+    const fakeProbe = async () => ({ status: 404, html: "" });
+    const r = await planAutoFix({
+      agent_id: "regular-farm",
+      current_knowledge: {
+        name: "Hjortegården",
+        url: "https://hjortegarden.no",
+      },
+      homepageProbe: fakeProbe as any,
+    });
+    assertTrue(!r.fix_categories.includes("bondens_marked_url"), "wo26-s5: non-BM → skip");
+  }
+
+  // ── Full-cycle end-to-end with in-memory DB ────────────────────────────
+  console.log("\n── WO-26: auto-fix end-to-end (in-memory DB) ──");
+  {
+    const Database = require("better-sqlite3");
+    const memdb = new Database(":memory:");
+    memdb.exec(`
+      CREATE TABLE agents (
+        id TEXT PRIMARY KEY,
+        name TEXT,
+        city TEXT,
+        url TEXT
+      );
+      CREATE TABLE agent_knowledge (
+        agent_id TEXT PRIMARY KEY,
+        address TEXT,
+        postal_code TEXT,
+        website TEXT,
+        phone TEXT,
+        email TEXT,
+        verification_status TEXT,
+        outreach_eligible_at TEXT,
+        last_verified_at TEXT
+      );
+      CREATE TABLE auto_fix_log (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        agent_id TEXT,
+        applied_at TEXT,
+        fix_category TEXT,
+        field TEXT,
+        old_value TEXT,
+        new_value TEXT,
+        source TEXT,
+        reason TEXT,
+        reverted_at TEXT,
+        reverted_reason TEXT
+      );
+    `);
+
+    const insA = memdb.prepare("INSERT INTO agents (id,name,city,url) VALUES (?,?,?,?)");
+    const insK = memdb.prepare(
+      `INSERT INTO agent_knowledge (agent_id,address,postal_code,website,phone,email,verification_status,outreach_eligible_at,last_verified_at)
+       VALUES (?,?,?,?,?,?,?,?,?)`
+    );
+
+    insA.run("agt-1", "Bondens Marked Agder", "Mandal", "https://bondensmarked.no/agder");
+    insK.run("agt-1", "Berrvellene 7", "4513", null, null, null, "verified", "2026-05-01T00:00:00Z", "2026-05-08");
+    insA.run("agt-2", "Bondens Marked Trondheim", "Trondheim", "https://bondensmarked.no/trondheim");
+    insK.run("agt-2", "Berrvellene 7", "7000", null, null, null, "verified", "2026-05-01T00:00:00Z", "2026-05-08");
+    insA.run("agt-3", "Test Farm 3", "Mandal", null);
+    insK.run("agt-3", "Sars gate 1", "0562", null, null, null, "review_required", null, "2026-05-08");
+    insA.run("agt-4", "Hjortegården", "Mandal", null);
+    insK.run("agt-4", "Hjorteveien 3", "4513", null, null, null, "verified", "2026-05-01T00:00:00Z", "2026-05-08");
+    insA.run("agt-5", "Phone Farm", "Mandal", null);
+    insK.run("agt-5", "Phoneveien 9", "4513", "https://phonefarm.no", "+47 99 88 77 66", null, "verified", "2026-05-01T00:00:00Z", "2026-05-08");
+
+    const dupGroups = findDuplicateStreetAddresses(memdb);
+    assertEq(dupGroups.length, 1, "wo26-e2e: 1 dup group from fixture");
+    assertEq(dupGroups[0]?.count, 2, "wo26-e2e: dup count=2");
+
+    const appliedAt = new Date().toISOString();
+    let mutatedCount = 0;
+
+    for (const aid of ["agt-1", "agt-2", "agt-3", "agt-4", "agt-5"]) {
+      const row = memdb.prepare(
+        `SELECT a.id AS agent_id, a.name, a.url, a.city,
+                k.address, k.postal_code, k.website, k.phone, k.email,
+                k.verification_status, k.outreach_eligible_at
+           FROM agents a INNER JOIN agent_knowledge k ON k.agent_id = a.id
+          WHERE a.id = ?`
+      ).get(aid) as any;
+
+      const plan = await planAutoFix({
+        agent_id: aid,
+        current_knowledge: {
+          agent_id: aid, name: row.name,
+          address: row.address, postal_code: row.postal_code, city: row.city,
+          website: row.website, phone: row.phone, email: row.email, url: row.url,
+          verification_status: row.verification_status, outreach_eligible_at: row.outreach_eligible_at,
+        },
+        duplicateStreetAddresses: dupGroups,
+      });
+
+      if (plan.actions.length === 0) continue;
+
+      for (const action of plan.actions) {
+        if (action.type === "flag_review") {
+          memdb.prepare(
+            "INSERT INTO auto_fix_log (agent_id, applied_at, fix_category, field, source, reason) VALUES (?, ?, ?, ?, ?, ?)"
+          ).run(aid, appliedAt, plan.fix_categories[0] || "flag", action.field, "auto-fix", action.reason);
+        } else if (action.type === "set_status") {
+          memdb.prepare("UPDATE agent_knowledge SET verification_status = ? WHERE agent_id = ?")
+            .run(action.new_status, aid);
+          memdb.prepare(
+            "INSERT INTO auto_fix_log (agent_id, applied_at, fix_category, field, old_value, new_value, source, reason) VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
+          ).run(aid, appliedAt, plan.fix_categories[0] || "status", "verification_status", action.old_status, action.new_status, "auto-fix", action.reason);
+        } else if (action.type === "set_field") {
+          const AGENT_FIELDS = new Set(["url", "city", "name"]);
+          const isAgentField = AGENT_FIELDS.has(action.field);
+          const table = isAgentField ? "agents" : "agent_knowledge";
+          const fkCol = isAgentField ? "id" : "agent_id";
+          memdb.prepare(`UPDATE ${table} SET ${action.field} = ? WHERE ${fkCol} = ?`)
+            .run(action.new_value, aid);
+          memdb.prepare(
+            "INSERT INTO auto_fix_log (agent_id, applied_at, fix_category, field, old_value, new_value, source, reason) VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
+          ).run(aid, appliedAt, plan.fix_categories[0] || "field", action.field, action.old_value === null || action.old_value === undefined ? null : String(action.old_value), action.new_value === null || action.new_value === undefined ? null : String(action.new_value), action.source, action.reason);
+        }
+      }
+      mutatedCount++;
+    }
+
+    const logCount = (memdb.prepare("SELECT COUNT(*) AS c FROM auto_fix_log").get() as { c: number }).c;
+    assertTrue(logCount >= mutatedCount, "wo26-e2e: auto_fix_log received entries");
+    assertTrue(mutatedCount >= 3, "wo26-e2e: at least 3 agents had plans");
+
+    const v1 = memdb.prepare("SELECT verification_status AS s FROM agent_knowledge WHERE agent_id = 'agt-1'").get() as { s: string };
+    const v2 = memdb.prepare("SELECT verification_status AS s FROM agent_knowledge WHERE agent_id = 'agt-2'").get() as { s: string };
+    assertEq(v1.s, "unverified", "wo26-e2e: agt-1 demoted");
+    assertEq(v2.s, "unverified", "wo26-e2e: agt-2 demoted");
+    const a1 = memdb.prepare("SELECT address FROM agent_knowledge WHERE agent_id = 'agt-1'").get() as { address: string | null };
+    assertEq(a1.address, null, "wo26-e2e: agt-1 address cleared");
+
+    const v4 = memdb.prepare("SELECT verification_status AS s, address FROM agent_knowledge WHERE agent_id = 'agt-4'").get() as { s: string; address: string };
+    assertEq(v4.s, "verified", "wo26-e2e: clean agt-4 untouched");
+    assertEq(v4.address, "Hjorteveien 3", "wo26-e2e: agt-4 address intact");
+
+    memdb.close();
+  }
+
+  // ── Dry-run guarantee — simulate route's dry_run path ──────────────────
+  {
+    const Database = require("better-sqlite3");
+    const memdb = new Database(":memory:");
+    memdb.exec(`
+      CREATE TABLE agents (id TEXT PRIMARY KEY, name TEXT, city TEXT, url TEXT);
+      CREATE TABLE agent_knowledge (
+        agent_id TEXT PRIMARY KEY, address TEXT, postal_code TEXT,
+        website TEXT, phone TEXT, email TEXT,
+        verification_status TEXT, outreach_eligible_at TEXT, last_verified_at TEXT
+      );
+      CREATE TABLE auto_fix_log (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        agent_id TEXT, applied_at TEXT, fix_category TEXT,
+        field TEXT, old_value TEXT, new_value TEXT, source TEXT, reason TEXT,
+        reverted_at TEXT, reverted_reason TEXT
+      );
+    `);
+    memdb.prepare("INSERT INTO agents (id,name,city) VALUES (?,?,?)").run("dry-1","Bondens Marked Agder","Mandal");
+    memdb.prepare("INSERT INTO agents (id,name,city) VALUES (?,?,?)").run("dry-2","Bondens Marked Trondheim","Trondheim");
+    memdb.prepare(
+      "INSERT INTO agent_knowledge (agent_id,address,postal_code,verification_status) VALUES (?,?,?,?)"
+    ).run("dry-1", "Berrvellene 7", "4513", "verified");
+    memdb.prepare(
+      "INSERT INTO agent_knowledge (agent_id,address,postal_code,verification_status) VALUES (?,?,?,?)"
+    ).run("dry-2", "Berrvellene 7", "7000", "verified");
+
+    const dupGroups = findDuplicateStreetAddresses(memdb);
+    const plan = await planAutoFix({
+      agent_id: "dry-1",
+      current_knowledge: {
+        agent_id: "dry-1", name: "Bondens Marked Agder",
+        address: "Berrvellene 7", postal_code: "4513", city: "Mandal",
+        verification_status: "verified",
+      },
+      duplicateStreetAddresses: dupGroups,
+    });
+    assertTrue(plan.actions.length > 0, "wo26-dryrun: plan has actions");
+
+    // No log rows, no mutations (we never called apply)
+    const logCount = (memdb.prepare("SELECT COUNT(*) AS c FROM auto_fix_log").get() as { c: number }).c;
+    assertEq(logCount, 0, "wo26-dryrun: no auto_fix_log rows");
+    const v1 = memdb.prepare("SELECT verification_status AS s, address FROM agent_knowledge WHERE agent_id = 'dry-1'").get() as { s: string; address: string };
+    assertEq(v1.s, "verified", "wo26-dryrun: status untouched");
+    assertEq(v1.address, "Berrvellene 7", "wo26-dryrun: address untouched");
+
+    memdb.close();
+  }
+}
+
+// Chain: integration tests already fired, then WO-26 async tests, then REPORT
+runWo26AutoFixTests().catch((err) => {
+  failed++;
+  failures.push(`wo26: unexpected error: ${err?.message || err}`);
+}).finally(() => {
+  finalReport();
+});
+
+function finalReport(): void {
+  console.log(`\n${passed} passed, ${failed} failed\n`);
+  if (failed > 0) {
+    console.log("Failures:");
+    for (const f of failures) console.log(f);
+    process.exit(1);
+  }
+  console.log("✓ all tests passed");
+}
+
+// (REPORT block moved inside finalReport above)
+const __wo26_report_anchor__ = true;
+void __wo26_report_anchor__;
+
+// ── REPORT ───────────── (handled by finalReport above) ─

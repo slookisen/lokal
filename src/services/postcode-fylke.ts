@@ -33,10 +33,17 @@ const RANGES: readonly Range[] = [
   [1300, 1599, "Akershus"],
 
   // 1600-1999: historically Østfold; many of these are now Akershus after
-  // Viken split back. 1940 = Bjørkelangen which is in Akershus.
-  // 1600-1789 = Østfold (Fredrikstad, Sarpsborg, Halden), 1790-1999 = Akershus.
+  // Viken split back. Carved up correctly post-WO-24 P1 fix-up:
+  //   1600-1789 = Østfold (Fredrikstad, Sarpsborg, Halden)
+  //   1790-1899 = Østfold (Tistedal=1790, Mysen=1850, Rakkestad=1890)
+  //   1900-1949 = Akershus (Fetsund=1900-area, Bjørkelangen=1940)
+  //   1950-1999 = Østfold
+  // The earlier wide "1790-1999=Akershus" rule was incorrect — Mysen and
+  // Tistedal were misclassified, surfaced by the 2026-05-09 quality probe.
   [1600, 1789, "Østfold"],
-  [1790, 1999, "Akershus"],
+  [1790, 1899, "Østfold"],
+  [1900, 1949, "Akershus"],
+  [1950, 1999, "Østfold"],
 
   // 2000-2099: Lillestrøm/Skedsmo area = Akershus
   [2000, 2099, "Akershus"],
@@ -138,6 +145,7 @@ const CITY_FYLKE: Record<string, string> = {
   drøbak: "Akershus",
   drobak: "Akershus",
   jessheim: "Akershus",
+  fetsund: "Akershus",
 
   // Østfold
   fredrikstad: "Østfold",
@@ -145,6 +153,9 @@ const CITY_FYLKE: Record<string, string> = {
   moss: "Østfold",
   halden: "Østfold",
   askim: "Østfold",
+  mysen: "Østfold",
+  tistedal: "Østfold",
+  rakkestad: "Østfold",
 
   // Innlandet
   hamar: "Innlandet",

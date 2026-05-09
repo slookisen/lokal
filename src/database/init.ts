@@ -1121,6 +1121,36 @@ function initSchema(db: Database.Database): void {
     console.error("Migration phase53_provenance_to_array_v1 failed:", err);
   }
 
+  // ─── WO-26: auto_fix_log ─────────────────────────────────────────────────
+  // Records every action applied by the auto-fix pipeline so we can review
+  // (and revert, if needed) any change. Idempotent: the CREATE IF NOT EXISTS
+  // guard makes re-running safe; the indexes are also IF NOT EXISTS.
+  //
+  // verification_status values introduced by WO-26: 'auto_fixed', 'wrong_fit'
+  // (TEXT column — no schema change required).
+  try {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS auto_fix_log (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        agent_id TEXT NOT NULL,
+        applied_at TEXT NOT NULL,
+        fix_category TEXT NOT NULL,
+        field TEXT,
+        old_value TEXT,
+        new_value TEXT,
+        source TEXT,
+        reason TEXT,
+        reverted_at TEXT,
+        reverted_reason TEXT,
+        FOREIGN KEY (agent_id) REFERENCES agents(id)
+      )
+    `);
+    db.exec(`CREATE INDEX IF NOT EXISTS idx_auto_fix_log_agent ON auto_fix_log(agent_id)`);
+    db.exec(`CREATE INDEX IF NOT EXISTS idx_auto_fix_log_applied_at ON auto_fix_log(applied_at)`);
+  } catch (err) {
+    console.error("Migration auto_fix_log failed:", err);
+  }
+
 }
 
 export function closeDb(): void {

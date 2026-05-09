@@ -307,20 +307,26 @@ export type DuplicateStreetAddressGroup = {
 export function findDuplicateStreetAddresses(
   db: any
 ): DuplicateStreetAddressGroup[] {
+  // WO-24 P2 fix-up: GROUP BY uses LOWER(TRIM(address)) so that mixed-case
+  // template-leaks ("Berrvellene 7" vs "BERRVELLENE 7" vs "berrvellene 7")
+  // are detected as a single group rather than three separate non-duplicates.
+  // We pick MIN(address) as the canonical representation for the group.
   const sql = `
     SELECT
-      address      AS streetAddress,
-      COUNT(*)     AS count
+      MIN(address)              AS streetAddress,
+      LOWER(TRIM(address))      AS norm_address,
+      COUNT(*)                  AS count
     FROM agent_knowledge
     WHERE address IS NOT NULL
       AND TRIM(address) != ''
       AND LENGTH(TRIM(address)) >= 4
-    GROUP BY TRIM(address)
+    GROUP BY LOWER(TRIM(address))
     HAVING COUNT(*) > 1
-    ORDER BY COUNT(*) DESC, address ASC
+    ORDER BY COUNT(*) DESC, MIN(address) ASC
   `;
   const rows = db.prepare(sql).all() as Array<{
     streetAddress: string;
+    norm_address: string;
     count: number;
   }>;
 
@@ -328,14 +334,15 @@ export function findDuplicateStreetAddresses(
   for (const row of rows) {
     const detail = db
       .prepare(
-        `SELECT agent_id, postal_code
+        `SELECT agent_id, postal_code, address
          FROM agent_knowledge
-         WHERE TRIM(address) = TRIM(?)
+         WHERE LOWER(TRIM(address)) = ?
          ORDER BY agent_id ASC`
       )
-      .all(row.streetAddress) as Array<{
+      .all(row.norm_address) as Array<{
       agent_id: string;
       postal_code: string | null;
+      address: string;
     }>;
     out.push({
       streetAddress: row.streetAddress,
