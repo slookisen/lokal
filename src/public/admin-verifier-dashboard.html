@@ -373,7 +373,6 @@ function renderReviewTable(agents) {
   var html = "";
   agents.forEach(function(a) {
     var reason = a.review_reason || {};
-    var conflictHtml = buildConflictDetail(reason);
     html += '<tr class="row-clickable" onclick="this.nextElementSibling.style.display=this.nextElementSibling.style.display===\'none\'?\'table-row\':\'none\'">';
     html += '<td><code style="font-size:11px">' + esc(a.agent_id) + '</code></td>';
     html += '<td>' + esc(a.name || "—") + '</td>';
