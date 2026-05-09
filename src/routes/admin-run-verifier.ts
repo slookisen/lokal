@@ -7,8 +7,12 @@
 // so it reads the real DB and writes back to the same volume.
 //
 // Triggered hourly by a thin Fly Machine cron that just curls this URL.
-// Time-window gate (22:00-06:00 UTC) is enforced here so the trigger
-// can fire 24×/day without doing work outside the window.
+//
+// WO-25 (capacity ramp): the time-window gate is now 24/7 so the
+// pre-WO-16 pool can be drained + rebuilt in days, not weeks. Brreg +
+// HTTP-HEAD only — both free APIs — so there is no cost concern.
+// The gate structure is kept intact (with force=1 override) in case
+// someone wants to re-narrow it later.
 //
 // All endpoints require X-Admin-Key.
 
@@ -18,7 +22,9 @@ import { recordRun } from "../services/run-ledger";
 
 const router = Router();
 
-const ALLOWED_UTC_HOURS = [22, 23, 0, 1, 2, 3, 4, 5, 6];
+export const ALLOWED_UTC_HOURS = [
+  0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23,
+];
 
 function getAdminKey(): string {
   return process.env.ADMIN_KEY || process.env.ANALYTICS_ADMIN_KEY || "";
@@ -56,14 +62,14 @@ router.post("/", async (req: Request, res: Response) => {
     res.json({
       success: true,
       skipped: true,
-      reason: `UTC hour ${hourUTC} outside 22-06 window`,
+      reason: `UTC hour ${hourUTC} outside allowed window`,
       hint: "POST with body {force:true} or query ?force=1 to override",
     });
     return;
   }
 
   const batchSizeRaw = (req.body && req.body.batchSize) || req.query.batchSize;
-  const batchSize = Math.min(Math.max(parseInt(String(batchSizeRaw ?? "30"), 10) || 30, 1), 100);
+  const batchSize = Math.min(Math.max(parseInt(String(batchSizeRaw ?? "50"), 10) || 50, 1), 100);
 
   try {
     const batchResult = await runVerifierBatch({ batchSize });
@@ -108,6 +114,7 @@ router.post("/", async (req: Request, res: Response) => {
       envelope_recorded: envelopeRecorded,
       hour_utc: hourUTC,
       forced: !!force,
+      batch_size: batchSize,
     });
   } catch (err: any) {
     res.status(500).json({

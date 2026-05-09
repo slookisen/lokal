@@ -4,17 +4,20 @@
 // src/agents/lokal-agent-verifier.ts only exports functions; this
 // runner imports + invokes runVerifierBatch().
 //
-// Time-window: 22:00-06:00 UTC. Fly --schedule only accepts hourly,
-// so this script runs 24×/day but skips 15 of those (outside window).
-// Set FORCE_RUN=1 to bypass for manual ad-hoc testing.
+// Time-window: 24/7 since WO-25 (capacity ramp). Verifier uses only
+// Brreg + HTTP-HEAD (free APIs) so no cost concern.
+// The gate structure is preserved with FORCE_RUN=1 override in case
+// someone wants to re-narrow it later.
 
 import { runVerifierBatch, buildRunEnvelope } from "../agents/lokal-agent-verifier";
 
 const ADMIN_KEY = process.env.ADMIN_KEY;
 const BASE = process.env.BASE_URL || "http://localhost:3000";
-const BATCH_SIZE = parseInt(process.env.VERIFIER_BATCH_SIZE || "30", 10);
+const BATCH_SIZE = parseInt(process.env.VERIFIER_BATCH_SIZE || "50", 10);
 
-const ALLOWED_UTC_HOURS = [22, 23, 0, 1, 2, 3, 4, 5, 6];
+const ALLOWED_UTC_HOURS = [
+  0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23,
+];
 
 async function main(): Promise<number> {
   const now = new Date();
@@ -22,7 +25,7 @@ async function main(): Promise<number> {
   const forceRun = process.env.FORCE_RUN === "1";
 
   if (!ALLOWED_UTC_HOURS.includes(hourUTC) && !forceRun) {
-    console.log(`[verifier-runner] Skipping — UTC hour ${hourUTC} outside 22-06 window`);
+    console.log(`[verifier-runner] Skipping — UTC hour ${hourUTC} outside allowed window`);
     return 0;
   }
 

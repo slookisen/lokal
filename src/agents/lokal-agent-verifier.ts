@@ -274,7 +274,7 @@ export async function runVerifierBatch(opts: {
   results: VerifierResult[];
 }> {
   const db = opts.db ?? getDb();
-  const limit = opts.batchSize ?? 30;
+  const limit = opts.batchSize ?? 50;
   const startedAt = new Date().toISOString();
   const runId = `run-${startedAt.replace(/[:.]/g, "").slice(0, 15)}-lokal-agent-verifier-rfb`;
 

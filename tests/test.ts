@@ -1864,6 +1864,43 @@ function prov(value: string, source_type: string): ProvenanceRecord {
   assertEq(r.source_count, 2, "cs: Tier-S override → still reports source_count=2");
 }
 
+// ── WO-25: capacity-ramp config sanity tests ──
+console.log("\n── WO-25: verifier capacity ramp (constants + batch defaults) ──");
+
+{
+  // Import compiled route module to read exported ALLOWED_UTC_HOURS
+  // (synchronous require-style import via top-level import below).
+  const { ALLOWED_UTC_HOURS: hours } = require("../src/routes/admin-run-verifier") as {
+    ALLOWED_UTC_HOURS: number[];
+  };
+  assertEq(hours.length, 24, "WO-25: ALLOWED_UTC_HOURS has 24 entries");
+  for (let h = 0; h < 24; h++) {
+    assertTrue(hours.includes(h), `WO-25: ALLOWED_UTC_HOURS includes hour ${h}`);
+  }
+}
+
+{
+  // Default batchSize for runVerifierBatch is 50.
+  // We can't easily call runVerifierBatch with no DB rows from the
+  // sync block without async setup; instead we read the source string.
+  const fs = require("fs") as typeof import("fs");
+  const src = fs.readFileSync("src/agents/lokal-agent-verifier.ts", "utf8");
+  assertTrue(
+    /const limit = opts\.batchSize \?\? 50;/.test(src),
+    "WO-25: lokal-agent-verifier default batchSize is 50"
+  );
+  const routeSrc = fs.readFileSync("src/routes/admin-run-verifier.ts", "utf8");
+  assertTrue(
+    /parseInt\(String\(batchSizeRaw \?\? "50"\), 10\) \|\| 50, 1\), 100\)/.test(routeSrc),
+    "WO-25: admin-run-verifier default batchSize is 50 (cap 100)"
+  );
+  const scriptSrc = fs.readFileSync("src/scripts/run-verifier.ts", "utf8");
+  assertTrue(
+    /VERIFIER_BATCH_SIZE \|\| "50"/.test(scriptSrc),
+    "WO-25: run-verifier script default batchSize is 50"
+  );
+}
+
 // ── WO-16: Integration tests (runVerifierBatch with cross-source gate) ───────
 
 console.log("\n── cross-source-validator: runVerifierBatch integration tests ──");
@@ -2071,6 +2108,106 @@ async function runIntegrationTests(): Promise<void> {
 
     const poolRow = db.prepare("SELECT * FROM outreach_ready_pool WHERE agent_id = 'agent-partial-owner'").get();
     assertTrue(!poolRow, "intg-3: partial-owner agent not in outreach_ready_pool");
+  }
+
+  // ── WO-25 Fixture: force-re-verify-pool DB logic ─────────────────
+  // We exercise the same SQL the route uses, since the route handlers
+  // are thin wrappers around the queries below (the test runner has no
+  // express harness).
+  {
+    const db = buildTestDb();
+    const { getDb } = await import("../src/database/init");
+    __setDbForTesting(db);
+    getDb();
+
+    // Two agents verified BEFORE the WO-16 cutoff (stale).
+    insertTestAgent(db, "stale-1", "Stale One");
+    insertTestAgent(db, "stale-2", "Stale Two");
+    // One agent verified AFTER the cutoff (fresh — must NOT be demoted).
+    insertTestAgent(db, "fresh-1", "Fresh One");
+
+    const since = "2026-05-09T12:51:26Z";
+    db.prepare(
+      `UPDATE agent_knowledge SET verification_status='verified',
+         last_verified_at=?, outreach_eligible_at=?
+         WHERE agent_id=?`
+    ).run("2026-05-01T10:00:00Z", "2026-05-01T10:00:00Z", "stale-1");
+    db.prepare(
+      `UPDATE agent_knowledge SET verification_status='verified',
+         last_verified_at=?, outreach_eligible_at=?
+         WHERE agent_id=?`
+    ).run("2026-05-08T23:00:00Z", "2026-05-08T23:00:00Z", "stale-2");
+    db.prepare(
+      `UPDATE agent_knowledge SET verification_status='verified',
+         last_verified_at=?, outreach_eligible_at=?
+         WHERE agent_id=?`
+    ).run("2026-05-09T15:00:00Z", "2026-05-09T15:00:00Z", "fresh-1");
+
+    // ── Dry run: count candidates, no mutation ──
+    const dryCount = (db.prepare(
+      `SELECT COUNT(*) as count FROM agent_knowledge
+        WHERE verification_status='verified'
+          AND last_verified_at IS NOT NULL
+          AND last_verified_at < ?`
+    ).get(since) as { count: number }).count;
+    assertEq(dryCount, 2, "WO-25: dry-run finds 2 stale verified rows");
+
+    // Sanity: dry-run did not mutate
+    const stale1Before = db.prepare(
+      `SELECT verification_status FROM agent_knowledge WHERE agent_id='stale-1'`
+    ).get() as { verification_status: string };
+    assertEq(stale1Before.verification_status, "verified", "WO-25: dry-run does not mutate stale-1");
+
+    // ── Execute: demote stale rows ──
+    const candidates = db.prepare(
+      `SELECT a.id FROM agents a
+   INNER JOIN agent_knowledge k ON k.agent_id = a.id
+        WHERE k.verification_status='verified'
+          AND k.last_verified_at IS NOT NULL
+          AND k.last_verified_at < ?`
+    ).all(since) as Array<{ id: string }>;
+    const stmt = db.prepare(
+      `UPDATE agent_knowledge
+          SET verification_status='unverified',
+              last_verified_at=NULL,
+              outreach_eligible_at=NULL
+        WHERE agent_id=?`
+    );
+    const txn = db.transaction((ids: string[]) => {
+      for (const id of ids) stmt.run(id);
+    });
+    txn(candidates.map((c) => c.id));
+
+    const stale1After = db.prepare(
+      `SELECT verification_status, last_verified_at, outreach_eligible_at
+         FROM agent_knowledge WHERE agent_id='stale-1'`
+    ).get() as { verification_status: string; last_verified_at: string | null; outreach_eligible_at: string | null };
+    assertEq(stale1After.verification_status, "unverified", "WO-25: stale-1 demoted to unverified");
+    assertEq(stale1After.last_verified_at, null, "WO-25: stale-1 last_verified_at cleared");
+    assertEq(stale1After.outreach_eligible_at, null, "WO-25: stale-1 outreach_eligible_at cleared");
+
+    const stale2After = db.prepare(
+      `SELECT verification_status FROM agent_knowledge WHERE agent_id='stale-2'`
+    ).get() as { verification_status: string };
+    assertEq(stale2After.verification_status, "unverified", "WO-25: stale-2 demoted to unverified");
+
+    // Fresh agent must be untouched
+    const fresh1After = db.prepare(
+      `SELECT verification_status, last_verified_at, outreach_eligible_at
+         FROM agent_knowledge WHERE agent_id='fresh-1'`
+    ).get() as { verification_status: string; last_verified_at: string | null; outreach_eligible_at: string | null };
+    assertEq(fresh1After.verification_status, "verified", "WO-25: fresh-1 NOT demoted (verified-after-cutoff)");
+    assertEq(fresh1After.last_verified_at, "2026-05-09T15:00:00Z", "WO-25: fresh-1 last_verified_at preserved");
+    assertEq(fresh1After.outreach_eligible_at, "2026-05-09T15:00:00Z", "WO-25: fresh-1 outreach_eligible_at preserved");
+
+    // Idempotent: re-running the same demote returns 0 candidates
+    const reCount = (db.prepare(
+      `SELECT COUNT(*) as count FROM agent_knowledge
+        WHERE verification_status='verified'
+          AND last_verified_at IS NOT NULL
+          AND last_verified_at < ?`
+    ).get(since) as { count: number }).count;
+    assertEq(reCount, 0, "WO-25: idempotent — re-running finds 0 candidates");
   }
 }
 
