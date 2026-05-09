@@ -194,7 +194,7 @@ export function pickBatch(db: any, limit = 30): any[] {
               k.last_verified_at, k.last_http_check_at, k.last_http_status
          FROM agents a
    INNER JOIN agent_knowledge k ON k.agent_id = a.id
-        WHERE k.verification_status NOT IN ('opt_out')
+        WHERE k.verification_status NOT IN ('opt_out', 'wrong_fit')
      ORDER BY CASE WHEN k.last_http_status >= 400 THEN 0 ELSE 1 END,
               COALESCE(k.last_verified_at, '1970-01-01') ASC
         LIMIT ?`

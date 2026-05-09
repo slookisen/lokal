@@ -2809,6 +2809,46 @@ async function runWo26AutoFixTests(): Promise<void> {
 
     memdb.close();
   }
+
+  // ── WO-26 P1 regression: pickBatch must exclude wrong_fit ─────────────
+  // Without this filter, wrong-fit agents would be re-picked by the cron and
+  // overwritten back to verified by applyVerifierOutcome — defeating the
+  // entire wrong-fit flagging workflow. auto_fixed agents SHOULD still be
+  // picked up (they go back through the gate after auto-correction).
+  console.log("\n── WO-26 P1: pickBatch excludes wrong_fit ──");
+  {
+    const { pickBatch } = require("../src/agents/lokal-agent-verifier");
+    const sqlite = require("better-sqlite3");
+    const db = new sqlite(":memory:");
+    db.exec(`
+      CREATE TABLE agents (id TEXT PRIMARY KEY, name TEXT, role TEXT, city TEXT);
+      CREATE TABLE agent_knowledge (
+        agent_id TEXT PRIMARY KEY,
+        address TEXT, website TEXT, phone TEXT, email TEXT,
+        about TEXT, products TEXT DEFAULT '[]',
+        verification_status TEXT NOT NULL DEFAULT 'unverified',
+        enrichment_status TEXT NOT NULL DEFAULT 'thin',
+        outreach_eligible_at TEXT,
+        last_verified_at TEXT, last_http_check_at TEXT, last_http_status INTEGER,
+        field_provenance TEXT NOT NULL DEFAULT '{}',
+        verification_review_reason TEXT NOT NULL DEFAULT '{}'
+      );
+    `);
+    db.prepare("INSERT INTO agents (id,name,role,city) VALUES ('v-1','Verified Gård','producer','Oslo'),('w-1','Wrong Fit Gård','producer','Bergen'),('u-1','Unverified Gård','producer','Trondheim')").run();
+    db.prepare(`INSERT INTO agent_knowledge (agent_id, email, website, verification_status, last_verified_at) VALUES
+      ('v-1', 'a@a.no', 'https://a.no', 'verified', '2026-05-01'),
+      ('w-1', 'b@b.no', 'https://b.no', 'wrong_fit', '2026-05-01'),
+      ('u-1', 'c@c.no', 'https://c.no', 'unverified', NULL)`).run();
+
+    const batch = pickBatch(db, 10);
+    const ids = batch.map((r: any) => r.id);
+    assertTrue(!ids.includes("w-1"), `wo26-p1: wrong_fit agent excluded from pickBatch (got ${JSON.stringify(ids)})`);
+    assertTrue(ids.includes("u-1"), `wo26-p1: unverified agent included in pickBatch (got ${JSON.stringify(ids)})`);
+    assertTrue(ids.includes("v-1"), `wo26-p1: verified agent still included (auto_fixed/verified must re-cycle through gate) (got ${JSON.stringify(ids)})`);
+    assertEq(batch.length, 2, "wo26-p1: pickBatch returns 2 of 3 (wrong_fit filtered out)");
+
+    db.close();
+  }
 }
 
 // Chain: integration tests already fired, then WO-26 async tests, then REPORT
