@@ -33,6 +33,8 @@ import agentStatsRoutes from "./routes/agent-stats";
 import adminRunsRoutes from "./routes/admin-runs";
 import adminOutreachPoolRoutes from "./routes/admin-outreach-pool";
 import adminRunVerifierRoutes from "./routes/admin-run-verifier";
+import ownerPortalRoutes from "./routes/owner-portal";
+import adminAgentAuditRoutes from "./routes/admin-agent-audit";
 import platformTriggersRoutes, { adminRouter as adminTriggersRoutes } from "./routes/platform-triggers";
 import crmRoutes from "./routes/crm";
 import { list as blocklistList } from "./services/blocklist-service";
@@ -101,6 +103,11 @@ app.use(langMiddleware);
 // API Catalog, OAuth Protected Resource). Mounted BEFORE static
 // so the .well-known/* paths are served dynamically, not from disk.
 app.use("/", agentReadinessRoutes);
+
+// ─── Owner Portal Routes (M1, Phase 5.4a) ───────────────────
+// Magic-link auth + 7-field profile management for producers.
+// Mounted at root because it serves both /api/agents/:id/* and /magic-link-verify.
+app.use("/", ownerPortalRoutes);
 
 // Serve the marketplace dashboard
 app.use(express.static(path.join(__dirname, "public"), { extensions: ["html"] }));
@@ -246,6 +253,8 @@ app.use("/admin/analytics", analyticsRoutes);
 app.use("/admin/runs", adminLimiter, adminRunsRoutes);
 app.use("/admin/outreach-ready-pool", adminLimiter, adminOutreachPoolRoutes);
 app.use("/admin/run-verifier", adminLimiter, adminRunVerifierRoutes);
+// ─── M1: Daniel-only agent audit trail (Phase 5.4a) ──────────
+app.use("/admin/agent-audit", adminLimiter, adminAgentAuditRoutes);
 
 // Platform triggers — public webhook receiver + admin queue access.
 // /platform/triggers/* uses HMAC (no admin-key); /admin/triggers/* uses admin-key.

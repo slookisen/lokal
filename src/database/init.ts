@@ -721,6 +721,21 @@ function initSchema(db: Database.Database): void {
     // Column already exists
   }
 
+  // ─── M1 (Phase 5.4a): magic_links.used_at ───────────────────
+  // Tracks WHEN a magic-link token was actually used (clicked & redeemed).
+  // Backfill for already-used rows: copy created_at as best-available estimate.
+  try {
+    db.exec(`ALTER TABLE magic_links ADD COLUMN used_at TEXT`);
+  } catch (e: any) {
+    if (!String(e?.message || '').includes('duplicate column name')) throw e;
+    // Column already exists — idempotent, safe to ignore
+  }
+  try {
+    db.exec(`UPDATE magic_links SET used_at = created_at WHERE used = 1 AND used_at IS NULL`);
+  } catch (e) {
+    // backfill is best-effort
+  }
+
 
   // ─── Phase 4.6a — vertical_id column on per-vertical tables ───
   // Multi-vertical groundwork: every per-tenant row belongs to exactly
@@ -1017,6 +1032,31 @@ function initSchema(db: Database.Database): void {
     }
   } catch (err) {
     console.error("Migration phase51_backfill_provenance_v1 failed:", err);
+  }
+
+  // ─── M1 (Phase 5.4a): agent_knowledge_audit ─────────────────
+  // Owner profile change history. Immutable changelog (insert-only).
+  // Daniel uses GET /admin/agent-audit to inspect ownership changes.
+  // FK ON DELETE CASCADE: orphan-audits cleaned up when agent removed.
+  try {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS agent_knowledge_audit (
+        id TEXT PRIMARY KEY,
+        agent_id TEXT NOT NULL,
+        field_name TEXT NOT NULL,
+        old_value TEXT,
+        new_value TEXT,
+        changed_by TEXT NOT NULL CHECK(changed_by IN ('owner', 'admin', 'system')),
+        changed_by_email TEXT,
+        changed_at TEXT NOT NULL DEFAULT (datetime('now')),
+        notes TEXT,
+        FOREIGN KEY (agent_id) REFERENCES agents(id) ON DELETE CASCADE
+      )
+    `);
+    db.exec(`CREATE INDEX IF NOT EXISTS idx_agent_knowledge_audit_agent ON agent_knowledge_audit(agent_id)`);
+    db.exec(`CREATE INDEX IF NOT EXISTS idx_agent_knowledge_audit_changed_at ON agent_knowledge_audit(changed_at)`);
+  } catch (err) {
+    console.error("Migration agent_knowledge_audit failed:", err);
   }
 }
 
