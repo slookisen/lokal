@@ -13,7 +13,12 @@ import { getDb } from "../database/init";
 
 export type BlocklistEntry = {
   id: number;
-  identifier_type: "website_domain" | "email_domain" | "name_normalized" | "agent_id";
+  // 'email_domain' is DEPRECATED 2026-05-10 (PR-14): blocking whole domains
+  // produces too many false positives for free-mail addresses (gmail.com,
+  // hotmail.com, etc.). New entries use 'email' (literal address). Existing
+  // 'email_domain' rows are migrated out by init.ts on next boot. Read paths
+  // ignore them.
+  identifier_type: "website_domain" | "email" | "email_domain" | "name_normalized" | "agent_id";
   identifier_value: string;
   reason: string | null;
   source_email: string | null;
@@ -55,6 +60,17 @@ export function normalizeDomain(input: string | null | undefined): string {
 // and the write path (add) refuse to operate on it.
 const OWN_DOMAINS = new Set(["rettfrabonden.com", "lokal.fly.dev"]);
 
+// ─── normalizeEmail (PR-14) ────────────────────────────────────
+// Literal email match: lowercase + trim. We do NOT extract the domain —
+// that was the old policy and it caused false-positives whenever a producer
+// happened to share an email-domain with a previously-deleted agent (e.g.
+// every gmail.com user got blocked once anyone with a gmail address was deleted).
+
+export function normalizeEmail(input: string | null | undefined): string {
+  if (!input) return "";
+  return String(input).trim().toLowerCase();
+}
+
 export function normalizeName(input: string | null | undefined): string {
   if (!input) return "";
   // Match the slugify rules so a blocked "Øvre-Eide Gård" catches
@@ -92,8 +108,9 @@ export function isBlocked(opts: {
       if (dom && !OWN_DOMAINS.has(dom)) checks.push(["website_domain", dom]);
     }
     if (opts.email) {
-      const dom = normalizeDomain(opts.email);
-      if (dom && !OWN_DOMAINS.has(dom)) checks.push(["email_domain", dom]);
+      // PR-14: literal email address only (do NOT block whole domain)
+      const norm = normalizeEmail(opts.email);
+      if (norm) checks.push(["email", norm]);
     }
     if (opts.name) {
       const norm = normalizeName(opts.name);
@@ -146,8 +163,9 @@ export function add(input: {
     if (dom && !OWN_DOMAINS.has(dom)) rowsToInsert.push({ type: "website_domain", value: dom });
   }
   if (input.email) {
-    const dom = normalizeDomain(input.email);
-    if (dom && !OWN_DOMAINS.has(dom)) rowsToInsert.push({ type: "email_domain", value: dom });
+    // PR-14: store literal email address (not domain) — see normalizeEmail comment.
+    const norm = normalizeEmail(input.email);
+    if (norm) rowsToInsert.push({ type: "email", value: norm });
   }
   if (input.name) {
     const norm = normalizeName(input.name);

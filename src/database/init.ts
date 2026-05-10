@@ -442,8 +442,9 @@ function initSchema(db: Database.Database): void {
     -- here, so the daily discovery agent doesn't just re-find them
     -- on lokalmat.no/Facebook the next morning and re-insert them.
     --
-    -- identifier_type: 'website_domain' | 'email_domain' |
+    -- identifier_type: 'website_domain' | 'email' (PR-14, literal) |
     --                  'name_normalized' | 'agent_id'
+    -- LEGACY (purged on boot): 'email_domain' — see PR-14 migration below
     -- A single blocklist request typically inserts 2-3 rows
     -- (domain + normalized name) so we catch them whether the next
     -- discovery cycle finds them by name OR by website.
@@ -459,6 +460,15 @@ function initSchema(db: Database.Database): void {
       UNIQUE(identifier_type, identifier_value)
     );
     CREATE INDEX IF NOT EXISTS idx_agent_blocklist_type_value ON agent_blocklist(identifier_type, identifier_value);
+
+    -- PR-14 (2026-05-10): migrate away from 'email_domain' identifier_type.
+    -- Reason: blocking whole email domains produces too many false-positives
+    -- for free-mail addresses (every gmail.com user gets blocked when any
+    -- gmail-using agent is deleted). New entries store literal email
+    -- addresses under identifier_type='email'. Existing 'email_domain' rows
+    -- are purged here. Migration is idempotent — runs every boot and only
+    -- removes rows that survived a prior boot.
+    DELETE FROM agent_blocklist WHERE identifier_type = 'email_domain';
 
     -- ─── email_bounces (Phase 4.14 / WO #6) ────────────────────
     -- Resend reports bounces; we mirror them so marketing-comms can
