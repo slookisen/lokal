@@ -763,15 +763,21 @@
         fetch(`${API}/agents/${encodeURIComponent(presetId)}/info`)
           .then(r => r.ok ? r.json() : Promise.reject(r.status))
           .then(payload => {
-            const info = (payload && payload.data) || payload;
-            if (!info || !info.name) {
+            // FIX 2026-05-10 (PR-13): /api/marketplace/agents/:id/info returns
+            // { success, data: { agent: { name, ... }, knowledge: {...} } }
+            // Earlier parser read payload.data.name (always undefined) so it
+            // silently fell into the no-info branch and Handler 2's UUID fallback
+            // (or PR-12's no-op early-return) left findName empty.
+            const info = (payload && payload.data) || payload || {};
+            const resolvedName = (info.agent && info.agent.name) || info.name;
+            if (!resolvedName) {
               // Invalid id — fall back to default UI
               if (findAlertEl) findAlertEl.innerHTML = "";
               return;
             }
             const findNameEl = document.getElementById("findName");
             if (findNameEl) {
-              findNameEl.value = info.name;
+              findNameEl.value = resolvedName;
               if (findAlertEl) findAlertEl.innerHTML = '<div style="padding:0.5rem 0.75rem;background:#f0fdf4;border:1px solid #bbf7d0;border-radius:8px;color:#166534;font-size:0.9rem;margin-top:0.5rem;">Vi har fylt ut butikkens navn. Klikk \u201CSjekk registeret\u201D for \u00e5 ta eierskap.</div>';
             }
           })
