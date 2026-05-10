@@ -2409,9 +2409,22 @@
     (function() {
       var params = new URLSearchParams(window.location.search);
 
-      // ?agent=NAME → show claim section and pre-fill search
+      // ?agent=NAME or ?agent=<uuid>
+      // FIX 2026-05-10 (PR-12): When ?agent=<uuid> is passed (the Phase 5.4a M2 hero
+      // CTA pattern from /produsent/<slug>), Handler 1 above (preselectFromQuery)
+      // already does an async fetch to /api/agents/<uuid>/info and fills findName
+      // with the resolved name. The legacy block below was overwriting that with
+      // the literal UUID string, breaking the find-or-create flow. We skip the
+      // legacy path when the param looks like a UUID and let Handler 1 finish.
       var agentParam = params.get('agent');
       if (agentParam) {
+        var isUuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(agentParam);
+        if (isUuid) {
+          // Let Handler 1 (preselectFromQuery, line ~756) resolve the name async.
+          // No-op here; Handler 1 will fill findName + show the green confirmation.
+          return;
+        }
+        // Legacy ?agent=NAME path: literal name string passed in URL.
         // If new find-or-create flow exists, pre-fill that instead
         var findNameEl = document.getElementById('findName');
         var claimSearchEl2 = document.getElementById('claimSearch');
