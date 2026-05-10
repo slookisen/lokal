@@ -2156,13 +2156,13 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
     analyticsService.trackAgentView(agent.id, agent.name, cityName, "seo");
 
     // Phase 5.4a M2 — claim status (server-rendered so AI bots see CTA per A3).
-    // claimed_at is on the agents table but not exposed by RegisteredAgent — query directly.
+    // FIX 2026-05-10: PR-8 used agents.claimed_at directly, but canonical claim signal
+    // is agent_claims.status='verified' (used by /api/marketplace/agents and elsewhere).
+    // M1's magic-link-verify doesn't currently write to agents.claimed_at, so the
+    // direct-column probe always returned false, breaking Variant A.
     let isClaimed = false;
     try {
-      const claimRow = getDb()
-        .prepare("SELECT claimed_at FROM agents WHERE id = ?")
-        .get(agent.id) as any;
-      isClaimed = !!(claimRow && claimRow.claimed_at);
+      isClaimed = knowledgeService.isAgentClaimed(agent.id);
     } catch (e) {
       console.error("[seo] claim status query failed:", e);
     }
