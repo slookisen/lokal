@@ -1,6 +1,7 @@
 import express, { Router, Request, Response } from "express";
 import { getDb } from "../database/init";
 import { emailService } from "../services/email-service";
+import { slugify } from "../utils/slug";
 import crypto from "crypto";
 
 const router = Router();
@@ -190,7 +191,8 @@ router.get("/magic-link-verify", (req: Request, res: Response) => {
     console.log(`[owner-portal] GET magic-link-verify, token=${token}`);
 
     if (!token || typeof token !== "string") {
-      return res.redirect(302, "/min-profil/feil?reason=invalid_token");
+      // FIX 2026-05-10: /min-profil/feil does not exist. Send user to a usable page.
+      return res.redirect(302, "/?error=invalid_token");
     }
 
     const db = getDb();
@@ -205,7 +207,8 @@ router.get("/magic-link-verify", (req: Request, res: Response) => {
 
     if (!magicLink) {
       console.log(`[owner-portal] Invalid or expired token: ${token}`);
-      return res.redirect(302, "/min-profil/feil?reason=invalid_token");
+      // FIX 2026-05-10: /min-profil/feil does not exist; send user to a usable page.
+      return res.redirect(302, "/?error=invalid_token");
     }
 
     const agentId = magicLink.agent_id;
@@ -229,7 +232,8 @@ router.get("/magic-link-verify", (req: Request, res: Response) => {
     return res.redirect(302, `/eier/${agentId}/portal`);
   } catch (error) {
     console.error("[owner-portal] Error in magic-link-verify:", error);
-    return res.redirect(302, "/min-profil/feil?reason=error");
+    // FIX 2026-05-10: /min-profil/feil does not exist; send user to a usable page.
+    return res.redirect(302, "/?error=verify_failed");
   }
 });
 
@@ -524,7 +528,8 @@ router.get("/api/agents/:id/profile", (req: Request, res: Response) => {
 
     const db = getDb();
 
-    const agent = db.prepare("SELECT id, name, slug FROM agents WHERE id = ?").get(id) as any;
+    const agent = db.prepare("SELECT id, name FROM agents WHERE id = ?").get(id) as any;
+    if (agent) (agent as any).slug = slugify(String(agent.name || ""));
     if (!agent) {
       return res.status(404).json({
         success: false,
@@ -717,8 +722,9 @@ router.get("/eier/:agentId", (req: Request, res: Response) => {
     const agentId = String((req.params as any).agentId || "");
     const db = getDb();
     const agent = db
-      .prepare("SELECT id, name, slug FROM agents WHERE id = ?")
+      .prepare("SELECT id, name FROM agents WHERE id = ?")
       .get(agentId) as any;
+    if (agent) (agent as any).slug = slugify(String(agent.name || ""));
 
     if (!agent) {
       return res.status(404).send(portalShell(
@@ -872,8 +878,9 @@ router.get("/eier/:agentId/portal", (req: Request, res: Response) => {
 
     const db = getDb();
     const agent = db
-      .prepare("SELECT id, name, slug FROM agents WHERE id = ?")
+      .prepare("SELECT id, name FROM agents WHERE id = ?")
       .get(agentId) as any;
+    if (agent) (agent as any).slug = slugify(String(agent.name || ""));
     if (!agent) {
       return res.status(404).send(portalShell(
         "Fant ikke produsent",
@@ -1103,7 +1110,8 @@ router.post("/eier/:agentId/save", express.urlencoded({ extended: false }), asyn
 router.post("/eier/:agentId/logout", (req: Request, res: Response) => {
   const agentId = String((req.params as any).agentId || "");
   const db = getDb();
-  const agent = db.prepare("SELECT slug FROM agents WHERE id = ?").get(agentId) as any;
+  const agent = db.prepare("SELECT id, name FROM agents WHERE id = ?").get(agentId) as any;
+  if (agent) (agent as any).slug = slugify(String(agent.name || ""));
   // Clear cookie (matching attributes used at set time so browsers honour it)
   res.clearCookie("rfb_owner_session", {
     path: "/",
