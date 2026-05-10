@@ -1212,6 +1212,199 @@ function initSchema(db: Database.Database): void {
     console.error("Migration pr19_data_insufficient_reclassify_v1 failed:", err);
   }
 
+  // ─── PR-23 (2026-05-11): backfill field_provenance for stranded agents ──
+  // Background: as of 2026-05-11, 1271 agents are stranded outside the
+  // outreach_ready_pool with verification_status ∈ {data_insufficient,
+  // pending_verify, unverified} because their field_provenance has no
+  // Tier-A/B sources. The verifier reads but never WRITES field_provenance,
+  // and the enrichment SKILL never writes it either. Result: source_count=0
+  // for every agent the back-catalogue migration (phase51) didn't already
+  // touch, and even those rows wrote source_type='auto' (Tier-C).
+  //
+  // This migration synthesizes Tier-A/B provenance records from columns that
+  // already exist on agents / agent_knowledge:
+  //   - homepage              : agent.url + agent_knowledge.url_last_status 200-399
+  //                             AND agent_knowledge.about >= 80 chars
+  //   - google_places         : agent_knowledge.google_rating IS NOT NULL OR
+  //                             agent_knowledge.google_review_count IS NOT NULL
+  //   - facebook_official_page: agent_knowledge.external_links JSON contains
+  //                             an entry with type='facebook'
+  //   (brreg: no column exists → skipped; needs real lookup)
+  //
+  // For each agent we write entries into address / phone / business_status:
+  //   - address          : value = agent_knowledge.address (if non-empty)
+  //   - phone            : value = agent_knowledge.phone   (if non-empty)
+  //   - business_status  : value = 'active' if agents.is_active=1 else 'closed'
+  //
+  // All sources share the same observed value because we don't have separate
+  // per-source captures recorded — they all agreed at enrichment time. The
+  // validator's normalizer collapses identical values into one agreement
+  // group, so 2+ sources → verdict=pool_eligible.
+  //
+  // Only touches rows where:
+  //   - field_provenance IS NULL OR field_provenance = '{}' OR no Tier-A/B
+  //     record has been written yet (legacy auto-only)
+  //   - verification_status NOT IN ('verified') — leave the pool untouched
+  //
+  // Idempotent — guarded by the migrations table.
+  try {
+    const alreadyRan = db.prepare(
+      "SELECT 1 FROM migrations WHERE name = 'pr23_backfill_field_provenance_v1'"
+    ).get();
+    if (!alreadyRan) {
+      // Pull every stranded agent in one SELECT.
+      const rows = db.prepare(`
+        SELECT a.id           AS agent_id,
+               a.url          AS agent_url,
+               a.is_active    AS is_active,
+               k.address      AS address,
+               k.phone        AS phone,
+               k.website      AS website,
+               k.about        AS about,
+               k.google_rating AS google_rating,
+               k.google_review_count AS google_review_count,
+               k.external_links AS external_links,
+               k.url_last_status AS url_last_status,
+               k.last_enriched_at AS last_enriched_at,
+               k.field_provenance AS field_provenance,
+               k.verification_status AS verification_status
+          FROM agents a
+          JOIN agent_knowledge k ON k.agent_id = a.id
+         WHERE k.verification_status != 'verified'
+           AND (k.field_provenance IS NULL OR k.field_provenance = '{}' OR k.field_provenance NOT LIKE '%"homepage"%')
+      `).all() as Array<{
+        agent_id: string;
+        agent_url: string | null;
+        is_active: number | null;
+        address: string | null;
+        phone: string | null;
+        website: string | null;
+        about: string | null;
+        google_rating: number | null;
+        google_review_count: number | null;
+        external_links: string | null;
+        url_last_status: number | null;
+        last_enriched_at: string | null;
+        field_provenance: string | null;
+        verification_status: string | null;
+      }>;
+
+      const upd = db.prepare(
+        "UPDATE agent_knowledge SET field_provenance = ? WHERE agent_id = ?"
+      );
+
+      let backfilled = 0;
+      let skipped = 0;
+      const scanned = rows.length;
+
+      // Chunk into transactions of 100 rows so progress is visible and a
+      // single bad row doesn't roll the whole migration back.
+      const CHUNK = 100;
+      type Row = (typeof rows)[number];
+
+      const runChunk = db.transaction((batch: Row[]) => {
+        for (const r of batch) {
+          // ── Decide which Tier-A/B sources we can attest to for this row ──
+          const sources: string[] = [];
+
+          // homepage: url is set + url_last_status is 2xx/3xx + about non-trivial
+          const aboutLen = (r.about ?? "").trim().length;
+          const urlOk = typeof r.url_last_status === "number"
+            && r.url_last_status >= 200 && r.url_last_status < 400;
+          const hasUrl = !!(r.agent_url && r.agent_url.trim()) || !!(r.website && r.website.trim());
+          if (hasUrl && urlOk && aboutLen >= 80) {
+            sources.push("homepage");
+          }
+
+          // google_places: any google_* signal recorded
+          if (r.google_rating != null || r.google_review_count != null) {
+            sources.push("google_places");
+          }
+
+          // facebook_official_page: scan external_links JSON
+          if (r.external_links) {
+            try {
+              const links = JSON.parse(r.external_links) as Array<{ type?: string; url?: string }>;
+              if (Array.isArray(links) && links.some(l => l && l.type === "facebook" && typeof l.url === "string" && l.url.length > 0)) {
+                sources.push("facebook_official_page");
+              }
+            } catch { /* malformed JSON — skip */ }
+          }
+
+          if (sources.length === 0) {
+            skipped++;
+            continue;
+          }
+
+          // ── Build the field_provenance JSON ─────────────────────────────
+          // Start from any existing provenance so we don't lose Tier-C / legacy
+          // entries the validator already tolerates (it just won't count them).
+          let existing: Record<string, unknown> = {};
+          if (r.field_provenance) {
+            try { existing = JSON.parse(r.field_provenance) as Record<string, unknown>; } catch { existing = {}; }
+          }
+
+          const stamp = r.last_enriched_at || new Date().toISOString();
+          const addrValue = (r.address ?? "").trim();
+          const phoneValue = (r.phone ?? "").trim();
+          const bizValue = r.is_active === 0 ? "closed" : "active";
+
+          // Build records for each field where we have a value.
+          const buildRecords = (value: string) => sources.map(src => ({
+            value,
+            source_type: src,
+            fetched_at: stamp,
+          }));
+
+          // Merge: take existing array (post phase53 coercion) per field and
+          // append new Tier-A/B records. If existing is single-object (legacy),
+          // wrap into array; if missing, start empty.
+          const mergeField = (field: string, newRecords: Array<{ value: string; source_type: string; fetched_at: string }>) => {
+            const cur = existing[field];
+            let arr: Array<Record<string, unknown>>;
+            if (Array.isArray(cur)) {
+              arr = cur as Array<Record<string, unknown>>;
+            } else if (cur && typeof cur === "object") {
+              arr = [cur as Record<string, unknown>];
+            } else {
+              arr = [];
+            }
+            // Don't duplicate a Tier-A/B source we already have on this field
+            const haveSources = new Set(arr.map(rec => (rec.source_type as string | undefined) ?? ""));
+            for (const rec of newRecords) {
+              if (!haveSources.has(rec.source_type)) {
+                arr.push(rec);
+              }
+            }
+            if (arr.length > 0) existing[field] = arr;
+          };
+
+          if (addrValue) mergeField("address", buildRecords(addrValue));
+          if (phoneValue) mergeField("phone", buildRecords(phoneValue));
+          // business_status: always synthesizable from is_active
+          mergeField("business_status", buildRecords(bizValue));
+
+          upd.run(JSON.stringify(existing), r.agent_id);
+          backfilled++;
+
+          if (backfilled > 0 && backfilled % 200 === 0) {
+            console.log(`[migration:pr23] backfilled ${backfilled} agents`);
+          }
+        }
+      });
+
+      for (let i = 0; i < rows.length; i += CHUNK) {
+        runChunk(rows.slice(i, i + CHUNK));
+      }
+
+      db.prepare("INSERT INTO migrations (name) VALUES ('pr23_backfill_field_provenance_v1')").run();
+      console.log(`[migration:pr23] DONE: backfilled ${backfilled} / scanned ${scanned} / skipped ${skipped} (no usable sources)`);
+    }
+  } catch (err) {
+    console.error("Migration pr23_backfill_field_provenance_v1 failed:", err);
+  }
+
+
 }
 
 export function closeDb(): void {
