@@ -2103,9 +2103,15 @@ const _m2Promise = (async function runOwnerPortalTests() {
       seoSrc.includes("Be om tilgang her") && seoSrc.includes("isClaimed"),
       "m2-A2: footer 'Be om tilgang her' CTA gated on isClaimed (claimed agents)"
     );
+    // FIX 2026-05-10 (PR-11 follow-up to PR-10): test updated to match canonical claim signal.
+    // PR-8 originally checked for direct SQL on agents.claimed_at; PR-10 switched to
+    // knowledgeService.isAgentClaimed() which queries agent_claims.status='verified'.
+    // The semantic property (server-side claim determination, AI-bot-visible) holds
+    // either way — the assertion now accepts the canonical signal.
     assertTrue(
-      seoSrc.includes("SELECT claimed_at FROM agents WHERE id = ?"),
-      "m2-A3: claim status determined server-side from claimed_at (visible to AI bots)"
+      seoSrc.includes("knowledgeService.isAgentClaimed(") ||
+        seoSrc.includes("SELECT claimed_at FROM agents WHERE id = ?"),
+      "m2-A3: claim status determined server-side (canonical: isAgentClaimed; legacy: claimed_at column)"
     );
 
     // Build an isolated DB for owner-portal route tests. We materialise the
