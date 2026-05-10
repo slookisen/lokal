@@ -238,6 +238,30 @@ export class EmailService {
   }
 
 
+  /**
+   * Phase 5.4a M2 — Send the owner-portal magic-link email.
+   *
+   * Norwegian Bokmål body that:
+   *   - Greets the owner and references the agent name explicitly,
+   *   - Explains in one sentence what the link does,
+   *   - Includes the verify URL (https://rettfrabonden.com/magic-link-verify?token=...),
+   *   - States the 7-day expiry,
+   *   - Sends from kontakt@rettfrabonden.com (config-derived).
+   */
+  async sendOwnerMagicLink(opts: {
+    to: string;
+    agentName: string;
+    verifyUrl: string;
+  }): Promise<{ success: boolean; messageId?: string; error?: string }> {
+    const { to, agentName, verifyUrl } = opts;
+    return await this.sendEmail({
+      to,
+      subject: `Logg inn på eierportalen for ${agentName} — Rett fra Bonden`,
+      htmlContent: buildOwnerMagicLinkHtml(agentName, verifyUrl),
+      textContent: buildOwnerMagicLinkText(agentName, verifyUrl),
+    });
+  }
+
   async sendRaw(options: {
     to: string;
     cc?: string;
@@ -749,6 +773,93 @@ ${this.brand} | ${getConfig().domain}`;
     };
     return text.replace(/[&<>"']/g, (char) => map[char]);
   }
+}
+
+
+// ─────────────────────────────────────────────────────────────────
+// Phase 5.4a M2 — owner-portal magic-link templates (Norwegian Bokmål)
+// ─────────────────────────────────────────────────────────────────
+
+function epEscape(s: string): string {
+  return String(s).replace(/[&<>"']/g, (c) => ({
+    "&": "&amp;",
+    "<": "&lt;",
+    ">": "&gt;",
+    '"': "&quot;",
+    "'": "&#039;",
+  } as Record<string, string>)[c]!);
+}
+
+function buildOwnerMagicLinkHtml(agentName: string, verifyUrl: string): string {
+  const safeName = epEscape(agentName);
+  const safeUrl = epEscape(verifyUrl);
+  return `<!DOCTYPE html>
+<html lang="nb">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <style>
+    body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Helvetica Neue', sans-serif; line-height: 1.6; color: #333; max-width: 600px; margin: 0 auto; padding: 0; }
+    .container { background: #ffffff; padding: 40px 20px; }
+    .header { margin-bottom: 24px; border-bottom: 3px solid #2D5016; padding-bottom: 16px; }
+    .logo { font-size: 22px; font-weight: 700; color: #2D5016; }
+    .logo span { color: #D4A373; }
+    h1 { font-size: 20px; color: #1a1a1a; margin: 18px 0 14px 0; }
+    p { margin: 12px 0; font-size: 15px; line-height: 1.7; }
+    .cta-button { display: inline-block; background: #2D5016; color: #ffffff !important; padding: 14px 32px; text-decoration: none; border-radius: 8px; font-weight: 700; margin: 18px 0; }
+    .cta-button:hover { background: #3a6b1e; }
+    .footer { margin-top: 36px; padding-top: 18px; border-top: 1px solid #eee; font-size: 13px; color: #666; }
+    code { word-break: break-all; background: #f5f5f5; padding: 4px 6px; display: inline-block; border-radius: 4px; }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <div class="header">
+      <div class="logo">Rett fra <span>Bonden</span></div>
+    </div>
+
+    <h1>Hei ${safeName}!</h1>
+
+    <p>Klikk lenken under for å logge inn på eierportalen for <strong>${safeName}</strong>.</p>
+
+    <p style="text-align:center;">
+      <a href="${safeUrl}" class="cta-button">Logg inn på eierportalen</a>
+    </p>
+
+    <p style="font-size: 14px; color: #666;">
+      Eller kopier og lim inn denne lenken i nettleseren:
+      <br />
+      <code>${safeUrl}</code>
+    </p>
+
+    <p>Lenken er gyldig i 7 dager.</p>
+
+    <p>Hvis du ikke ba om denne innloggingen, kan du trygt ignorere e-posten.</p>
+
+    <div class="footer">
+      <p>Mvh,<br>Rett fra Bonden — kontakt@rettfrabonden.com<br>https://rettfrabonden.com</p>
+    </div>
+  </div>
+</body>
+</html>`;
+}
+
+function buildOwnerMagicLinkText(agentName: string, verifyUrl: string): string {
+  return `Hei ${agentName}!
+
+Klikk lenken under for å logge inn på eierportalen for ${agentName}:
+
+${verifyUrl}
+
+Lenken er gyldig i 7 dager.
+
+Hvis du ikke ba om denne innloggingen, kan du trygt ignorere e-posten.
+
+Mvh,
+Rett fra Bonden
+kontakt@rettfrabonden.com
+https://rettfrabonden.com
+`;
 }
 
 export const emailService = new EmailService();
