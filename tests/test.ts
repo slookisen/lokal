@@ -1583,6 +1583,198 @@ console.log("── agent-stats: per-agent stats endpoint logic ──");
 }
 
 
+// ── PR-21 / WO-19: link-freshness probe (probeAgentUrl) ──────────────
+console.log("\n── PR-21 / WO-19: probeAgentUrl unit tests ──");
+const _pr21Promises: Promise<unknown>[] = [];
+{
+  const {
+    probeAgentUrl,
+    applyUrlProbeResult,
+  } = require("../src/agents/lokal-agent-verifier");
+
+  // Helper: build a fake fetch returning the configured status, with optional
+  // 405-on-HEAD then 200-on-GET fallback behavior.
+  function makeFetch(statusByMethod: Record<string, number> | number, capture?: { calls: Array<{ url: string; method: string }> }) {
+    return async (url: string, init?: any) => {
+      const method = (init?.method || "GET").toUpperCase();
+      capture?.calls.push({ url, method });
+      const status = typeof statusByMethod === "number" ? statusByMethod : (statusByMethod[method] ?? 200);
+      return { status };
+    };
+  }
+
+  // Test 1: HEAD 200 → ok
+  _pr21Promises.push((async () => {
+    const r = await probeAgentUrl("https://gard.no", { fetchImpl: makeFetch(200), timeoutMs: 1000 });
+    assertEq(r.status, 200, "pr21: probe HEAD 200 → status=200");
+    assertTrue(r.ok === true, "pr21: probe HEAD 200 → ok=true");
+    assertTrue(typeof r.durationMs === "number" && r.durationMs >= 0, "pr21: probe returns durationMs >= 0");
+  })());
+
+  // Test 2: HEAD 404 → not ok (no fallback for non-405 4xx)
+  _pr21Promises.push((async () => {
+    const calls: Array<{ url: string; method: string }> = [];
+    const r = await probeAgentUrl("https://broken.no", { fetchImpl: makeFetch(404, { calls }), timeoutMs: 1000 });
+    assertEq(r.status, 404, "pr21: probe HEAD 404 → status=404");
+    assertTrue(r.ok === false, "pr21: probe HEAD 404 → ok=false");
+    assertEq(calls.length, 1, "pr21: probe HEAD 404 → no GET fallback");
+    assertEq(calls[0]!.method, "HEAD", "pr21: probe HEAD 404 → only HEAD attempted");
+  })());
+
+  // Test 3: HEAD 403 → not ok (treat blocks as broken-for-marketing)
+  _pr21Promises.push((async () => {
+    const r = await probeAgentUrl("https://reinhartsen.no", { fetchImpl: makeFetch(403), timeoutMs: 1000 });
+    assertEq(r.status, 403, "pr21: probe HEAD 403 → status=403");
+    assertTrue(r.ok === false, "pr21: probe HEAD 403 → ok=false (blocked URL not pool-eligible)");
+  })());
+
+  // Test 4: HEAD 405 → falls back to GET, GET 200 → ok
+  _pr21Promises.push((async () => {
+    const calls: Array<{ url: string; method: string }> = [];
+    const r = await probeAgentUrl("https://picky.no", {
+      fetchImpl: makeFetch({ HEAD: 405, GET: 200 }, { calls }),
+      timeoutMs: 1000,
+    });
+    assertEq(r.status, 200, "pr21: HEAD 405 → fallback GET 200 → status=200");
+    assertTrue(r.ok === true, "pr21: HEAD 405 → fallback GET 200 → ok=true");
+    assertEq(calls.length, 2, "pr21: HEAD 405 → both HEAD and GET attempted");
+    assertEq(calls[0]!.method, "HEAD", "pr21: first call is HEAD");
+    assertEq(calls[1]!.method, "GET", "pr21: second call is GET fallback");
+  })());
+
+  // Test 5: network error / timeout → status=0, ok=false
+  _pr21Promises.push((async () => {
+    const erroringFetch = async () => { throw new Error("ECONNREFUSED"); };
+    const r = await probeAgentUrl("https://offline.invalid", { fetchImpl: erroringFetch as any, timeoutMs: 100 });
+    assertEq(r.status, 0, "pr21: network error → status=0");
+    assertTrue(r.ok === false, "pr21: network error → ok=false");
+  })());
+
+  // Test 6: 301 redirect-status counts as ok
+  _pr21Promises.push((async () => {
+    const r = await probeAgentUrl("https://redir.no", { fetchImpl: makeFetch(301), timeoutMs: 1000 });
+    assertEq(r.status, 301, "pr21: 301 → status=301");
+    assertTrue(r.ok === true, "pr21: 301 → ok=true (URL is reachable via redirect)");
+  })());
+
+  // ── PR-21: applyUrlProbeResult demotes rich → partial when broken ──
+  const sqlite = require("better-sqlite3");
+  const pdb = new sqlite(":memory:");
+  pdb.exec(`
+    CREATE TABLE agent_knowledge (
+      agent_id TEXT PRIMARY KEY,
+      enrichment_status TEXT NOT NULL DEFAULT 'thin',
+      url_last_probed TEXT,
+      url_last_status INTEGER
+    );
+  `);
+  pdb.prepare("INSERT INTO agent_knowledge (agent_id, enrichment_status) VALUES (?, ?)").run("a-rich", "rich");
+  pdb.prepare("INSERT INTO agent_knowledge (agent_id, enrichment_status) VALUES (?, ?)").run("a-partial", "partial");
+
+  // Broken URL on a 'rich' agent → demoted to 'partial'
+  const r1 = applyUrlProbeResult(pdb, "a-rich", { status: 404, ok: false, probedAt: "2026-05-10T16:00:00Z" });
+  assertEq(r1.demoted, true, "pr21: applyUrlProbeResult demotes rich on 404");
+  const a1 = pdb.prepare("SELECT enrichment_status, url_last_status, url_last_probed FROM agent_knowledge WHERE agent_id='a-rich'").get();
+  assertEq(a1.enrichment_status, "partial", "pr21: rich agent now partial after broken probe");
+  assertEq(a1.url_last_status, 404, "pr21: url_last_status persisted");
+  assertEq(a1.url_last_probed, "2026-05-10T16:00:00Z", "pr21: url_last_probed persisted");
+
+  // Broken URL on a 'partial' agent → no further demote (still partial)
+  const r2 = applyUrlProbeResult(pdb, "a-partial", { status: 500, ok: false, probedAt: "2026-05-10T16:01:00Z" });
+  assertEq(r2.demoted, false, "pr21: applyUrlProbeResult does not demote already-partial");
+  const a2 = pdb.prepare("SELECT enrichment_status, url_last_status FROM agent_knowledge WHERE agent_id='a-partial'").get();
+  assertEq(a2.enrichment_status, "partial", "pr21: partial stays partial");
+  assertEq(a2.url_last_status, 500, "pr21: url_last_status updated even when not demoting");
+
+  // OK probe on rich agent → stays rich, fields updated
+  pdb.prepare("UPDATE agent_knowledge SET enrichment_status='rich' WHERE agent_id='a-rich'").run();
+  const r3 = applyUrlProbeResult(pdb, "a-rich", { status: 200, ok: true, probedAt: "2026-05-10T16:02:00Z" });
+  assertEq(r3.demoted, false, "pr21: ok probe → no demote");
+  const a3 = pdb.prepare("SELECT enrichment_status, url_last_status FROM agent_knowledge WHERE agent_id='a-rich'").get();
+  assertEq(a3.enrichment_status, "rich", "pr21: rich stays rich on ok probe");
+  assertEq(a3.url_last_status, 200, "pr21: url_last_status=200 written");
+
+  pdb.close();
+}
+
+
+// ── PR-21 / WO-19: outreach_ready_pool VIEW excludes broken/stale URLs ──
+console.log("── PR-21 / WO-19: outreach_ready_pool freshness gate ──");
+{
+  const sqlite = require("better-sqlite3");
+  const pooldb = new sqlite(":memory:");
+  // Mirror the production schema for the columns the VIEW reads.
+  pooldb.exec(`
+    CREATE TABLE agents (id TEXT PRIMARY KEY, name TEXT, role TEXT, city TEXT);
+    CREATE TABLE agent_knowledge (
+      agent_id TEXT PRIMARY KEY,
+      email TEXT, phone TEXT,
+      verification_status TEXT NOT NULL DEFAULT 'unverified',
+      enrichment_status TEXT NOT NULL DEFAULT 'thin',
+      outreach_eligible_at TEXT,
+      last_verified_at TEXT,
+      url_last_probed TEXT,
+      url_last_status INTEGER
+    );
+    CREATE TABLE outreach_sent_log (id INTEGER PRIMARY KEY, agent_id TEXT NOT NULL);
+    CREATE VIEW outreach_ready_pool AS
+      SELECT a.id AS agent_id, a.name, a.role, a.city AS location_city,
+             k.email, k.phone,
+             k.verification_status, k.enrichment_status,
+             k.outreach_eligible_at, k.last_verified_at,
+             k.url_last_probed, k.url_last_status
+      FROM agents a
+      INNER JOIN agent_knowledge k ON k.agent_id = a.id
+      WHERE k.email IS NOT NULL
+        AND k.email != ''
+        AND k.verification_status = 'verified'
+        AND k.enrichment_status IN ('partial', 'rich')
+        AND k.url_last_status IS NOT NULL
+        AND k.url_last_status >= 200 AND k.url_last_status < 400
+        AND k.url_last_probed IS NOT NULL
+        AND k.url_last_probed > datetime('now', '-30 days')
+        AND NOT EXISTS (SELECT 1 FROM outreach_sent_log o WHERE o.agent_id = a.id);
+  `);
+
+  pooldb.prepare(`INSERT INTO agents (id, name, role, city) VALUES
+    ('p-ok','Good Gård','producer','Oslo'),
+    ('p-broken','Broken Gård','producer','Oslo'),
+    ('p-blocked','Blocked Gård','producer','Oslo'),
+    ('p-stale','Stale Gård','producer','Oslo'),
+    ('p-never','Never-Probed Gård','producer','Oslo')`).run();
+
+  const insK = pooldb.prepare(`INSERT INTO agent_knowledge
+    (agent_id, email, verification_status, enrichment_status, url_last_probed, url_last_status)
+    VALUES (?,?,?,?,?,?)`);
+  // p-ok: probe 1 day ago, 200 → in pool
+  insK.run("p-ok", "ok@gard.no", "verified", "rich",
+    new Date(Date.now() - 1 * 24 * 3600 * 1000).toISOString(), 200);
+  // p-broken: probe today, 404 → out
+  insK.run("p-broken", "b@gard.no", "verified", "partial",
+    new Date().toISOString(), 404);
+  // p-blocked: probe today, 403 → out
+  insK.run("p-blocked", "x@gard.no", "verified", "partial",
+    new Date().toISOString(), 403);
+  // p-stale: probe 60 days ago, 200 → out (stale)
+  insK.run("p-stale", "s@gard.no", "verified", "rich",
+    new Date(Date.now() - 60 * 24 * 3600 * 1000).toISOString(), 200);
+  // p-never: never probed → out
+  insK.run("p-never", "n@gard.no", "verified", "rich", null, null);
+
+  const rows = pooldb.prepare("SELECT agent_id FROM outreach_ready_pool ORDER BY agent_id").all();
+  assertEq(rows.length, 1, `pr21-pool: only p-ok in pool (got ${JSON.stringify(rows)})`);
+  assertEq(rows[0]?.agent_id, "p-ok", "pr21-pool: p-ok is the surviving row");
+
+  // Sanity: re-probe p-broken successfully → it joins the pool
+  pooldb.prepare(`UPDATE agent_knowledge SET url_last_status=200, url_last_probed=? WHERE agent_id='p-broken'`)
+    .run(new Date().toISOString());
+  const rows2 = pooldb.prepare("SELECT agent_id FROM outreach_ready_pool ORDER BY agent_id").all();
+  assertEq(rows2.length, 2, "pr21-pool: re-probed p-broken joins pool after fix");
+
+  pooldb.close();
+}
+
+
 // ── orchestrator-pr-3: knowledge-service mergeKnowledge clear-fix ────
 // Verifies the explicit-clear predicate. The real mergeKnowledge is private;
 // this block mirrors its predicate for array fields and verifies semantics.
@@ -2650,6 +2842,7 @@ const _m2Promise = (async function runOwnerPortalTests() {
 // run without await per their original design; swallowed errors there
 // remain swallowed — out of scope for M2.)
 (async () => {
+  try { await Promise.all(_pr21Promises); } catch { /* errors already pushed to failures */ }
   try { await _m2Promise; } catch { /* errors already pushed to failures */ }
   // Drop pre-existing intg failures (unmasked by awaiting) — they predate M2
   // and live behind a separate fix-it task. Counting them here would surface

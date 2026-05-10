@@ -920,6 +920,13 @@ function initSchema(db: Database.Database): void {
     `ALTER TABLE agent_knowledge ADD COLUMN last_verified_at TEXT`,
     `ALTER TABLE agent_knowledge ADD COLUMN last_http_check_at TEXT`,
     `ALTER TABLE agent_knowledge ADD COLUMN last_http_status INTEGER`,
+    // ─── PR-21 / WO-19 (2026-05-10): link-freshness probe ───
+    // url_last_probed: ISO timestamp of the last HEAD/GET probe of agent.url
+    // url_last_status: HTTP status returned (0 = network failure / abort).
+    // Together with the outreach_ready_pool VIEW these enforce a 30d freshness
+    // window so marketing never emails an agent whose homepage 4xx/5xx's.
+    `ALTER TABLE agent_knowledge ADD COLUMN url_last_probed TEXT`,
+    `ALTER TABLE agent_knowledge ADD COLUMN url_last_status INTEGER`,
   ]) {
     try {
       db.exec(stmt);
@@ -959,6 +966,13 @@ function initSchema(db: Database.Database): void {
   // 1=1 as placeholder so the VIEW resolves on prod today.
   try {
     db.exec(`DROP VIEW IF EXISTS outreach_ready_pool`);
+    // ─── PR-21 / WO-19 (2026-05-10): link-freshness gating ───
+    // Two extra conditions vs. the original WO #7 view:
+    //   - url_last_status BETWEEN 200 AND 399  → URL was reachable last probe
+    //   - url_last_probed > now-30d            → probe is fresh
+    // Together: an agent whose URL has not been probed in 30d, OR whose last
+    // probe returned 4xx/5xx/0, is silently dropped from the marketing pool
+    // until lokal-agent-verifier re-probes successfully.
     db.exec(`
       CREATE VIEW outreach_ready_pool AS
       SELECT
@@ -971,7 +985,9 @@ function initSchema(db: Database.Database): void {
         k.verification_status,
         k.enrichment_status,
         k.outreach_eligible_at,
-        k.last_verified_at
+        k.last_verified_at,
+        k.url_last_probed,
+        k.url_last_status
       FROM agents a
       INNER JOIN agent_knowledge k ON k.agent_id = a.id
       WHERE
@@ -980,6 +996,11 @@ function initSchema(db: Database.Database): void {
         AND k.verification_status = 'verified'
         AND k.enrichment_status IN ('partial', 'rich')
         AND 1=1  /* TODO Phase 5.10: AND a.removed_at IS NULL */
+        AND k.url_last_status IS NOT NULL
+        AND k.url_last_status >= 200
+        AND k.url_last_status < 400
+        AND k.url_last_probed IS NOT NULL
+        AND k.url_last_probed > datetime('now', '-30 days')
         AND NOT EXISTS (
           SELECT 1 FROM outreach_sent_log o
           WHERE o.agent_id = a.id
