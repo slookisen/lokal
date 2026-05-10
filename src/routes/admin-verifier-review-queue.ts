@@ -1,19 +1,28 @@
-// ─── Admin: Verifier review queue (Phase 5.3 / WO-16) ────────────────────────
+// ─── Admin: Verifier review queue (Phase 5.3 / WO-16, PR-19 update) ──────────
 //
-// Surfaces agents with verification_status='review_required' and their
-// cross-source conflict details so Daniel can manually triage and apply
-// curated_fields locks to override.
+// Surfaces agents with verification_status='review_required' (default) or
+// verification_status='data_insufficient' so Daniel can manually triage.
+//
+// PR-19 (2026-05-10): added ?status= query parameter so the dashboard can
+// fetch the new data_insufficient bucket separately. Default status=
+// review_required keeps backwards-compatibility with existing callers.
 //
 // Requires X-Admin-Key header.
 //
 // GET /admin/verifier-review-queue
-//   Returns: { success, count, agents: [{ agent_id, name, verification_status,
-//              review_reason: { address, phone, business_status } }] }
+//   Query: ?status=review_required (default) | data_insufficient
+//   Returns: { success, count, status, agents: [{ agent_id, name,
+//              verification_status, review_reason, last_verified_at }] }
 
 import { Router, Request, Response } from "express";
 import { getDb } from "../database/init";
 
 const router = Router();
+
+// Whitelist of statuses this endpoint is allowed to surface. Other statuses
+// (e.g. 'verified', 'pending_verify', 'unverified', 'opt_out') are NOT
+// review-queue material and should not be queryable through this route.
+const ALLOWED_STATUSES = new Set(["review_required", "data_insufficient"]);
 
 function getAdminKey(): string {
   return process.env.ADMIN_KEY || process.env.ANALYTICS_ADMIN_KEY || "";
@@ -37,6 +46,15 @@ function requireAdmin(req: Request, res: Response): boolean {
 router.get("/", (req: Request, res: Response) => {
   if (!requireAdmin(req, res)) return;
 
+  const requestedStatus = (req.query.status as string) || "review_required";
+  if (!ALLOWED_STATUSES.has(requestedStatus)) {
+    res.status(400).json({
+      success: false,
+      error: `Invalid status filter: ${requestedStatus}. Allowed: ${[...ALLOWED_STATUSES].join(", ")}`,
+    });
+    return;
+  }
+
   try {
     const db = getDb();
     const rows = db
@@ -45,11 +63,11 @@ router.get("/", (req: Request, res: Response) => {
                 k.verification_review_reason, k.last_verified_at
            FROM agents a
      INNER JOIN agent_knowledge k ON k.agent_id = a.id
-          WHERE k.verification_status = 'review_required'
+          WHERE k.verification_status = ?
        ORDER BY k.last_verified_at DESC
           LIMIT 500`
       )
-      .all() as {
+      .all(requestedStatus) as {
         agent_id: string;
         name: string;
         verification_status: string;
@@ -75,6 +93,7 @@ router.get("/", (req: Request, res: Response) => {
 
     res.json({
       success: true,
+      status: requestedStatus,
       count: agents.length,
       agents,
     });

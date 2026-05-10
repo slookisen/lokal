@@ -44,13 +44,14 @@ async function main(): Promise<number> {
   const passed = results.filter((r) => r.passed).length;
   const reviewRequired = results.filter((r) => r.new_verification_status === "review_required").length;
   const pendingVerify = results.filter((r) => r.new_verification_status === "pending_verify").length;
+  const dataInsufficient = results.filter((r) => r.new_verification_status === "data_insufficient").length;
   const httpUnreachable = results.filter((r) => r.flags.includes("website_unreachable")).length;
   const brregInactive = results.filter((r) =>
     r.flags.some((f: string) => f === "brreg_inactive" || f === "brreg_konkurs")
   ).length;
   const pooledNew = results.filter((r) => r.outreach_eligible_at !== null).length;
 
-  console.log(`[verifier-runner] passed=${passed} review=${reviewRequired} pending=${pendingVerify} unreachable=${httpUnreachable} brreg_inactive=${brregInactive} pool_added=${pooledNew}`);
+  console.log(`[verifier-runner] passed=${passed} review=${reviewRequired} pending=${pendingVerify} data_insufficient=${dataInsufficient} unreachable=${httpUnreachable} brreg_inactive=${brregInactive} pool_added=${pooledNew}`);
 
   if (ADMIN_KEY) {
     try {

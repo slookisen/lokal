@@ -1131,6 +1131,66 @@ function initSchema(db: Database.Database): void {
     console.error("Migration phase53_provenance_to_array_v1 failed:", err);
   }
 
+  // ─── PR-19 (2026-05-10): gate-split data_insufficient reclassification ──
+  // Background: as of 2026-05-10, ~119 agents from the pre-WO-7-enrichment
+  // back-catalogue landed in the review-queue with source_count=0 for ALL
+  // critical fields, because their field_provenance is empty. They don't
+  // need human review — they need more enrichment. Reclassify them into a
+  // new 'data_insufficient' bucket so the review queue stays focused on
+  // genuine conflicts.
+  //
+  // Only touches rows where:
+  //   - verification_status = 'review_required'
+  //   - verification_review_reason parses as JSON
+  //   - EVERY tracked field (address, phone, business_status) reports
+  //     source_count === 0
+  //
+  // Idempotent — guarded by the migrations table.
+  try {
+    const alreadyRan = db.prepare(
+      "SELECT 1 FROM migrations WHERE name = 'pr19_data_insufficient_reclassify_v1'"
+    ).get();
+    if (!alreadyRan) {
+      const rows = db.prepare(
+        `SELECT agent_id, verification_review_reason
+           FROM agent_knowledge
+          WHERE verification_status = 'review_required'`
+      ).all() as { agent_id: string; verification_review_reason: string }[];
+
+      const upd = db.prepare(
+        `UPDATE agent_knowledge SET verification_status = 'data_insufficient' WHERE agent_id = ?`
+      );
+      const TRACKED = ["address", "phone", "business_status"];
+      let reclassified = 0;
+
+      const tx = db.transaction((batch: { agent_id: string; verification_review_reason: string }[]) => {
+        for (const row of batch) {
+          let reason: Record<string, unknown>;
+          try { reason = JSON.parse(row.verification_review_reason || "{}"); } catch { continue; }
+          // All three tracked fields must be present AND have source_count===0
+          let allZero = true;
+          for (const f of TRACKED) {
+            const r = reason[f] as { source_count?: number } | undefined;
+            if (!r || typeof r.source_count !== "number" || r.source_count !== 0) {
+              allZero = false;
+              break;
+            }
+          }
+          if (allZero) {
+            upd.run(row.agent_id);
+            reclassified++;
+          }
+        }
+      });
+      tx(rows);
+
+      db.prepare("INSERT INTO migrations (name) VALUES ('pr19_data_insufficient_reclassify_v1')").run();
+      console.log(`Migration pr19_data_insufficient_reclassify_v1: reclassified ${reclassified} review_required agent(s) → data_insufficient (scanned ${rows.length} review_required rows)`);
+    }
+  } catch (err) {
+    console.error("Migration pr19_data_insufficient_reclassify_v1 failed:", err);
+  }
+
 }
 
 export function closeDb(): void {

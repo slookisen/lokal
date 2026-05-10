@@ -4,9 +4,20 @@
 // sources that agree (or 1 Tier-S owner-curated source).
 //
 // Reference: supervisor-inbox/2026-05-07-work-order-16-phase5.3-cross-source.md
+// PR-19 (2026-05-10): added per-field verdict so the verifier can split the
+// gate into three buckets — pool_eligible / review_required / data_insufficient.
 
 export type FieldName = "address" | "phone" | "business_status";
 export type SourceTier = "S" | "A" | "B" | "C";
+
+// Per-field verdict (PR-19 / 2026-05-10).
+//   pool_eligible      — ≥2 high-quality sources agree, or Tier-S override
+//   review_required    — exactly 1 source recorded; we have *some* data but
+//                        cannot confirm it without a human
+//   data_insufficient  — 0 sources recorded; the back-catalogue case where
+//                        field_provenance is empty / missing → needs more
+//                        enrichment, not human review
+export type CrossSourceVerdict = "pool_eligible" | "review_required" | "data_insufficient";
 
 export type ProvenanceRecord = {
   value: string;
@@ -19,6 +30,7 @@ export type CrossSourceResult = {
   agree: boolean;
   source_count: number;
   sources_used: string[];
+  verdict: CrossSourceVerdict;
   conflict?: {
     values: { source: string; value: string }[];
     severity: "minor" | "major";
@@ -111,7 +123,8 @@ export function crossSourceAgreement(
   const valid = records.filter((r) => typeof r.value === "string" && r.value.trim() !== "");
 
   if (valid.length === 0) {
-    return { agree: false, source_count: 0, sources_used: [] };
+    // PR-19: 0 sources → the back-catalogue case. Cannot review without data.
+    return { agree: false, source_count: 0, sources_used: [], verdict: "data_insufficient" };
   }
 
   const sources_used = valid.map((r) => r.source_type);
@@ -123,6 +136,7 @@ export function crossSourceAgreement(
       agree: true,
       source_count: valid.length,
       sources_used,
+      verdict: "pool_eligible",
     };
   }
 
@@ -133,12 +147,16 @@ export function crossSourceAgreement(
   });
 
   if (highQuality.length < 2) {
-    // Fewer than 2 high-quality sources — cannot meet the bar regardless of agreement
+    // Fewer than 2 high-quality sources — cannot meet the bar regardless of agreement.
+    // Verdict depends on total source_count: 1 source → review_required; ≥2 (but
+    // mostly Tier-C) → review_required as well, since we have some data and could
+    // potentially confirm by hand.
     const mayHaveConflict = valid.length >= 2;
     return {
       agree: false,
       source_count: valid.length,
       sources_used,
+      verdict: "review_required",
       ...(mayHaveConflict
         ? {
             conflict: {
@@ -176,6 +194,7 @@ export function crossSourceAgreement(
       agree: true,
       source_count: valid.length,
       sources_used,
+      verdict: "pool_eligible",
     };
   }
 
@@ -184,6 +203,7 @@ export function crossSourceAgreement(
     agree: false,
     source_count: valid.length,
     sources_used,
+    verdict: "review_required",
     conflict: {
       values: normalized.map((n) => ({ source: n.source, value: n.value })),
       severity: computeConflictSeverity(fieldName, highQuality),
@@ -201,6 +221,28 @@ function computeConflictSeverity(
   const first = norms[0] ?? "";
   const allSame = norms.every((n) => n === first);
   return allSame ? "minor" : "major";
+}
+
+// ─── Per-agent aggregate verdict (PR-19 / 2026-05-10) ────────────────────────
+//
+// Given a map of field → CrossSourceResult, compute the agent-level verdict:
+//   - any field with verdict='data_insufficient' → agent is data_insufficient
+//   - else any field with verdict='review_required' → agent is review_required
+//   - else (all fields pool_eligible) → agent is pool_eligible
+//
+// This is the gate-split logic that the verifier and the migration both need.
+export function aggregateVerdict(
+  perField: Record<string, CrossSourceResult>
+): CrossSourceVerdict {
+  let hasInsufficient = false;
+  let hasReview = false;
+  for (const r of Object.values(perField)) {
+    if (r.verdict === "data_insufficient") hasInsufficient = true;
+    else if (r.verdict === "review_required") hasReview = true;
+  }
+  if (hasInsufficient) return "data_insufficient";
+  if (hasReview) return "review_required";
+  return "pool_eligible";
 }
 
 // ─── Migration helper: coerce field_provenance from legacy single-record shape ─

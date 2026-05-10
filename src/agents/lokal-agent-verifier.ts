@@ -20,8 +20,11 @@
 import { getDb } from "../database/init";
 import {
   crossSourceAgreement,
+  aggregateVerdict,
   type FieldName,
   type ProvenanceRecord,
+  type CrossSourceResult,
+  type CrossSourceVerdict,
 } from "../services/cross-source-validator";
 
 export interface VerifierResult {
@@ -236,15 +239,26 @@ export function applyVerifierOutcome(
   );
 }
 
-// Decide verification_status from gate result + flags + cross-source check.
-// cross_source_passes=true means all 3 critical fields have >=2 agreeing sources
-// (or owner-curated). Only agents that pass BOTH the basic gate AND cross-source
-// are promoted to "verified". Pure function.
+// Decide verification_status from gate result + flags + cross-source verdict.
+//
+// PR-19 / 2026-05-10: gate-split. The cross-source step now returns one of three
+// verdicts per field; the agent-level verdict (computed via aggregateVerdict)
+// flows through this function:
+//   - cross_source_verdict='pool_eligible'    → "verified"  (≥2 agreeing sources)
+//   - cross_source_verdict='review_required'  → "review_required"  (1 source, or
+//     conflicting Tier-A/B sources — needs a human to triage)
+//   - cross_source_verdict='data_insufficient'→ "data_insufficient"  (0 sources;
+//     the back-catalogue case → needs more enrichment, NOT human review)
+//
+// Older callers still pass the boolean cross_source_passes; we accept either
+// for backwards compat.
+//
+// Pure function.
 export function deriveVerificationStatus(
   passes: boolean,
   flags: string[],
-  cross_source_passes?: boolean
-): "verified" | "review_required" | "pending_verify" {
+  cross_source_verdict?: CrossSourceVerdict | boolean
+): "verified" | "review_required" | "pending_verify" | "data_insufficient" {
   if (!passes) {
     // Basic gate failed — reviewable if NACE/Brreg issues, otherwise retry
     if (flags.some((f) => f.startsWith("nace_blacklist") || f === "brreg_konkurs" || f === "brreg_inactive")) {
@@ -252,11 +266,18 @@ export function deriveVerificationStatus(
     }
     return "pending_verify";
   }
-  // Basic gate passed — now check cross-source
-  if (cross_source_passes === false) {
-    // Basic gate passed but cross-source failed → needs human review
-    return "review_required";
+  // Basic gate passed — now check cross-source verdict
+  // Accept legacy boolean (true/undefined → pool_eligible, false → review_required)
+  let verdict: CrossSourceVerdict;
+  if (cross_source_verdict === undefined || cross_source_verdict === true) {
+    verdict = "pool_eligible";
+  } else if (cross_source_verdict === false) {
+    verdict = "review_required";
+  } else {
+    verdict = cross_source_verdict;
   }
+  if (verdict === "data_insufficient") return "data_insufficient";
+  if (verdict === "review_required") return "review_required";
   return "verified";
 }
 
@@ -310,29 +331,29 @@ export async function runVerifierBatch(opts: {
     }
 
     const csFields: FieldName[] = ["address", "phone", "business_status"];
-    const crossSourceResults: Record<string, unknown> = {};
-    let cross_source_passes = true;
+    const crossSourceResults: Record<string, CrossSourceResult> = {};
 
     for (const field of csFields) {
-      const result = crossSourceAgreement(fieldProv, field);
-      crossSourceResults[field] = result;
-      if (!result.agree) cross_source_passes = false;
+      crossSourceResults[field] = crossSourceAgreement(fieldProv, field);
     }
 
-    if (gate.passes && !cross_source_passes) {
+    // PR-19: aggregate the per-field verdicts into a single agent-level verdict.
+    const agentVerdict = aggregateVerdict(crossSourceResults);
+
+    if (gate.passes && agentVerdict !== "pool_eligible") {
       console.log(
-        `[verifier] ${agent.id} (${agent.name ?? "?"}) passed basic gate but failed cross-source: ` +
+        `[verifier] ${agent.id} (${agent.name ?? "?"}) passed basic gate but cross-source verdict=${agentVerdict}: ` +
         csFields
-          .filter((f) => !(crossSourceResults[f] as { agree: boolean }).agree)
+          .filter((f) => crossSourceResults[f].verdict !== "pool_eligible")
           .map((f) => {
-            const r = crossSourceResults[f] as { agree: boolean; sources_used?: string[] };
-            return `${f}(sources=${(r.sources_used ?? []).join(",") || "none"})`;
+            const r = crossSourceResults[f];
+            return `${f}(verdict=${r.verdict},sources=${(r.sources_used ?? []).join(",") || "none"})`;
           })
           .join(", ")
       );
     }
 
-    const newVerification = deriveVerificationStatus(gate.passes, gate.flags, cross_source_passes);
+    const newVerification = deriveVerificationStatus(gate.passes, gate.flags, agentVerdict);
     const newEnrichment = computeEnrichmentStatus({
       about: agent.about,
       products,
@@ -388,6 +409,7 @@ export function buildRunEnvelope(input: {
   const verified = r.filter((x) => x.new_verification_status === "verified").length;
   const review = r.filter((x) => x.new_verification_status === "review_required").length;
   const pending = r.filter((x) => x.new_verification_status === "pending_verify").length;
+  const dataInsufficient = r.filter((x) => x.new_verification_status === "data_insufficient").length;
   const httpUnreachable = r.filter((x) => x.flags.includes("website_unreachable")).length;
   const brregFlagged = r.filter((x) => x.flags.includes("brreg_inactive") || x.flags.includes("brreg_konkurs")).length;
   const newlyEligible = r.filter((x) => x.outreach_eligible_at !== null).length;
@@ -404,6 +426,7 @@ export function buildRunEnvelope(input: {
       { type: "db_state_change", value: verified, meta: { kind: "agents_verified" } },
       { type: "db_state_change", value: review, meta: { kind: "agents_review_required" } },
       { type: "db_state_change", value: pending, meta: { kind: "agents_pending_verify" } },
+      { type: "db_state_change", value: dataInsufficient, meta: { kind: "agents_data_insufficient" } },
       { type: "db_state_change", value: httpUnreachable, meta: { kind: "http_unreachable" } },
       { type: "db_state_change", value: brregFlagged, meta: { kind: "brreg_inactive_flagged" } },
       {
