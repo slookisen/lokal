@@ -2340,7 +2340,17 @@
           var cs = document.getElementById('claimSearch');
           if (cs) { cs.value = name; setTimeout(function() { searchAgents(name); }, 800); }
         } else {
-          showAlert('regAlert', data.error || 'Registrering feilet. Prøv igjen.', 'error');
+          // PR-14 UX: surface Zod validation details when available (e.g.
+        // "description: String must contain at least 10 character(s)")
+        var errMsg = data.error || 'Registrering feilet. Prøv igjen.';
+        if (data.details && Array.isArray(data.details) && data.details.length > 0) {
+          var fieldErrors = data.details.map(function(d) {
+            var path = (d.path && d.path.length) ? d.path.join('.') : '?';
+            return path + ': ' + (d.message || 'ugyldig');
+          }).join('; ');
+          errMsg = errMsg + ' (' + fieldErrors + ')';
+        }
+        showAlert('regAlert', errMsg, 'error');
         }
       } catch (err) {
         showAlert('regAlert', 'Feil: ' + escHtml(err.message), 'error');
