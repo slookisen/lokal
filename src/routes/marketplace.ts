@@ -251,7 +251,7 @@ router.post("/register", (req: Request, res: Response) => {
       res.status(400).json({
         success: false,
         error: "Ugyldig registrering",
-        details: error.errors,
+        details: (error as any).issues ?? error.errors,
       });
     } else {
       res.status(500).json({ success: false, error: "Intern feil" });
@@ -317,7 +317,7 @@ router.post("/discover", (req: Request, res: Response) => {
     });
   } catch (error: any) {
     if (error.name === "ZodError") {
-      res.status(400).json({ success: false, error: "Ugyldig søk", details: error.errors });
+      res.status(400).json({ success: false, error: "Ugyldig søk", details: (error as any).issues ?? error.errors });
     } else {
       res.status(500).json({ success: false, error: "Intern feil" });
     }
@@ -1249,7 +1249,7 @@ router.post("/admin/register", (req: Request, res: Response) => {
       res.status(400).json({
         success: false,
         error: "Ugyldig registrering",
-        details: error.errors,
+        details: (error as any).issues ?? error.errors,
       });
     } else {
       console.error("[admin/register] Error:", error);

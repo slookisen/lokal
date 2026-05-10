@@ -2221,9 +2221,15 @@
         if (cb.checked) categories.push(cb.value);
       });
 
-      // Validate
+      // Validate (PR-15: also enforce description.length >= 10 to match
+      // backend AgentRegistrationSchema's z.string().min(10) before POST.
+      // PR-14 attempted this fix but lost it during commit; re-applying.)
       if (!name || !description || !email || categories.length === 0) {
         showAlert('regAlert', 'Fyll ut navn, beskrivelse, e-post, og velg minst én kategori.', 'error');
+        return;
+      }
+      if (description.length < 10) {
+        showAlert('regAlert', 'Beskrivelsen må være minst 10 tegn lang.', 'error');
         return;
       }
 
