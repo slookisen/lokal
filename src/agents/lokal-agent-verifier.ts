@@ -39,6 +39,10 @@ export interface VerifierResult {
   new_enrichment_status: string;
   outreach_eligible_at: string | null;
   cross_source_reason: Record<string, unknown>;
+  // PR-21 / WO-19: link-freshness probe outcome
+  url_last_probed: string | null;
+  url_last_status: number | null;
+  url_demoted: boolean;
 }
 
 export interface BrregLookupResult {
@@ -99,6 +103,75 @@ async function headProbe(url: string, timeoutMs = 5000): Promise<number | null> 
     return null;
   }
 }
+
+// ─── PR-21 / WO-19 (2026-05-10): link-freshness probe ─────────────
+//
+// Richer companion to headProbe(). Whereas headProbe is used by the
+// kvalitets-gate (any 200-399 ≈ ok), probeAgentUrl is the dedicated
+// freshness check that records the result on agent_knowledge so the
+// outreach_ready_pool VIEW can drop agents with broken URLs.
+//
+// Behaviour:
+//   - Try HEAD with 8s timeout.
+//   - If HEAD returns 405 (method-not-allowed), fall back to GET with
+//     a 0-1023 byte-range header so we don't pull the full body.
+//   - On network failure / abort: status=0, ok=false.
+//   - 200-399  → ok=true   (redirects are fine, URL is reachable).
+//   - 400-599  → ok=false  (broken or blocked — 403 is a "block", which
+//                            we still treat as broken-for-marketing-purposes
+//                            because outbound emails would link to a wall).
+//
+// Pure-ish: the only side-effect is the network call; deterministic given
+// the network response. The fetcher is injectable for tests.
+export interface ProbeResult {
+  status: number;
+  ok: boolean;
+  durationMs: number;
+}
+
+export type FetchLike = (
+  url: string,
+  init?: { method?: string; signal?: AbortSignal; headers?: Record<string, string>; redirect?: "follow" | "manual" | "error" }
+) => Promise<{ status: number }>;
+
+export async function probeAgentUrl(
+  url: string,
+  opts?: { timeoutMs?: number; fetchImpl?: FetchLike }
+): Promise<ProbeResult> {
+  const timeoutMs = opts?.timeoutMs ?? 8000;
+  const fetchImpl: FetchLike = (opts?.fetchImpl ?? (fetch as unknown as FetchLike));
+  const start = Date.now();
+
+  // Helper: one fetch attempt with its own AbortController + timeout.
+  async function attempt(method: "HEAD" | "GET"): Promise<{ status: number } | { status: 0 }> {
+    const ctrl = new AbortController();
+    const t = setTimeout(() => ctrl.abort(), timeoutMs);
+    try {
+      const headers: Record<string, string> = {};
+      if (method === "GET") headers["Range"] = "bytes=0-1023";
+      const r = await fetchImpl(url, { method, signal: ctrl.signal, redirect: "follow", headers });
+      return { status: r.status };
+    } catch {
+      return { status: 0 };
+    } finally {
+      clearTimeout(t);
+    }
+  }
+
+  // 1) HEAD first.
+  let res = await attempt("HEAD");
+  // 2) If HEAD said "405 method-not-allowed" (or 0 = aborted/network),
+  //    retry with byte-ranged GET. We do NOT retry on 4xx/5xx other
+  //    than 405 — those are real responses from a real server.
+  if (res.status === 405 || res.status === 0) {
+    res = await attempt("GET");
+  }
+
+  const durationMs = Date.now() - start;
+  const ok = res.status >= 200 && res.status < 400;
+  return { status: res.status, ok, durationMs };
+}
+
 
 // Brreg lookup — placeholder. Real implementation uses
 // https://data.brreg.no/enhetsregisteret/api/enheter?navn=<name>
@@ -215,8 +288,39 @@ export function applyVerifierOutcome(
     runStartedAt: string;
     eligibleAt: string | null;
     cross_source_reason?: Record<string, unknown>;
+    // PR-21 / WO-19: optional probe outcome (when omitted, columns
+    // are left untouched so the existing test-suite is not broken).
+    url_last_probed?: string | null;
+    url_last_status?: number | null;
   }
 ): void {
+  if (outcome.url_last_probed !== undefined || outcome.url_last_status !== undefined) {
+    db.prepare(
+      `UPDATE agent_knowledge SET
+         verification_status         = ?,
+         enrichment_status           = ?,
+         last_verified_at            = ?,
+         last_http_check_at          = ?,
+         last_http_status            = ?,
+         outreach_eligible_at        = COALESCE(?, outreach_eligible_at),
+         verification_review_reason  = ?,
+         url_last_probed             = COALESCE(?, url_last_probed),
+         url_last_status             = COALESCE(?, url_last_status)
+       WHERE agent_id = ?`
+    ).run(
+      outcome.new_verification_status,
+      outcome.new_enrichment_status,
+      outcome.runStartedAt,
+      outcome.runStartedAt,
+      outcome.http_status,
+      outcome.eligibleAt,
+      JSON.stringify(outcome.cross_source_reason ?? {}),
+      outcome.url_last_probed ?? null,
+      outcome.url_last_status ?? null,
+      agentId
+    );
+    return;
+  }
   db.prepare(
     `UPDATE agent_knowledge SET
        verification_status         = ?,
@@ -237,6 +341,39 @@ export function applyVerifierOutcome(
     JSON.stringify(outcome.cross_source_reason ?? {}),
     agentId
   );
+}
+
+// ─── PR-21 / WO-19 (2026-05-10): standalone url_last_probe writer ──
+// Used by the boot-time backfill path. Updates ONLY url_last_probed +
+// url_last_status, and (if the probe failed) demotes a 'rich' enrichment
+// to 'partial' so the agent is dropped from the outreach pool until the
+// next successful probe. Idempotent for re-runs.
+export function applyUrlProbeResult(
+  db: any,
+  agentId: string,
+  probe: { status: number; ok: boolean; probedAt: string }
+): { demoted: boolean } {
+  // Read current enrichment_status so we know whether to demote.
+  const row = db
+    .prepare(`SELECT enrichment_status FROM agent_knowledge WHERE agent_id = ?`)
+    .get(agentId) as { enrichment_status: string } | undefined;
+  if (!row) return { demoted: false };
+
+  let newEnrichment = row.enrichment_status;
+  let demoted = false;
+  if (!probe.ok && row.enrichment_status === "rich") {
+    newEnrichment = "partial";
+    demoted = true;
+  }
+
+  db.prepare(
+    `UPDATE agent_knowledge SET
+       url_last_probed   = ?,
+       url_last_status   = ?,
+       enrichment_status = ?
+     WHERE agent_id = ?`
+  ).run(probe.probedAt, probe.status, newEnrichment, agentId);
+  return { demoted };
 }
 
 // Decide verification_status from gate result + flags + cross-source verdict.
@@ -354,11 +491,31 @@ export async function runVerifierBatch(opts: {
     }
 
     const newVerification = deriveVerificationStatus(gate.passes, gate.flags, agentVerdict);
-    const newEnrichment = computeEnrichmentStatus({
+    let newEnrichment = computeEnrichmentStatus({
       about: agent.about,
       products,
       address: agent.address,
     });
+
+    // ─── PR-21 / WO-19 (2026-05-10): link-freshness probe (Phase 2D) ────
+    // Runs AFTER the description-quality gate (computeEnrichmentStatus)
+    // and BEFORE the agent_knowledge write. If the URL is broken (4xx/5xx
+    // or network failure) and we computed 'rich', demote to 'partial' so
+    // the outreach pool drops the agent until its URL is fixed.
+    let probeResult: { status: number; ok: boolean; durationMs: number } | null = null;
+    let urlDemoted = false;
+    if (agent.website) {
+      probeResult = await probeAgentUrl(agent.website);
+      if (!probeResult.ok) {
+        console.log(
+          `[enrichment] URL probe failed for agent ${agent.id}: status=${probeResult.status}`
+        );
+        if (newEnrichment === "rich") {
+          newEnrichment = "partial";
+          urlDemoted = true;
+        }
+      }
+    }
 
     const wasInPool = agent.verification_status === "verified";
     const nowInPool = newVerification === "verified" && newEnrichment !== "thin";
@@ -371,6 +528,8 @@ export async function runVerifierBatch(opts: {
       runStartedAt: startedAt,
       eligibleAt,
       cross_source_reason: crossSourceResults,
+      url_last_probed: probeResult ? startedAt : null,
+      url_last_status: probeResult ? probeResult.status : null,
     });
 
     results.push({
@@ -385,6 +544,9 @@ export async function runVerifierBatch(opts: {
       new_enrichment_status: newEnrichment,
       outreach_eligible_at: eligibleAt,
       cross_source_reason: crossSourceResults,
+      url_last_probed: probeResult ? startedAt : null,
+      url_last_status: probeResult ? probeResult.status : null,
+      url_demoted: urlDemoted,
     });
   }
 
@@ -441,4 +603,72 @@ export function buildRunEnvelope(input: {
     next_suggested: ["platform-verifier"],
     notes: `Verified ${r.length} agents, ${verified} passed kvalitets-gate, ${newlyEligible} added to outreach_ready_pool`,
   };
+}
+
+// ─── PR-21 / WO-19 (2026-05-10): boot-time URL freshness backfill ─────
+//
+// Probes every agent currently in the outreach pool and writes the result
+// to url_last_probed + url_last_status. Demotes any 4xx/5xx-URL agent with
+// enrichment_status='rich' to 'partial', which removes them from the
+// outreach_ready_pool VIEW.
+//
+// Designed to be called from src/index.ts AFTER app.listen so the boot
+// itself is non-blocking. Worst case: 8s × 129 agents ≈ 17 min, run
+// sequentially. Logs progress every 10 agents so operators can watch.
+export async function runUrlBackfill(opts?: {
+  db?: any;
+  fetchImpl?: FetchLike;
+  onProgress?: (done: number, total: number) => void;
+  logEveryN?: number;
+}): Promise<{ scanned: number; ok: number; broken: number; demoted: number; durationMs: number }> {
+  const db = opts?.db ?? getDb();
+  const start = Date.now();
+  const logEveryN = opts?.logEveryN ?? 10;
+
+  // Pull every agent currently meeting the (pre-freshness) pool gate, so
+  // the backfill doesn't re-probe agents that are already filtered out by
+  // verification_status / enrichment_status / email rules.
+  const candidates = db.prepare(
+    `SELECT a.id AS agent_id, k.website
+       FROM agents a
+       INNER JOIN agent_knowledge k ON k.agent_id = a.id
+      WHERE k.email IS NOT NULL
+        AND k.email != ''
+        AND k.verification_status = 'verified'
+        AND k.enrichment_status IN ('partial', 'rich')
+        AND k.website IS NOT NULL
+        AND k.website != ''`
+  ).all() as Array<{ agent_id: string; website: string }>;
+
+  let okCount = 0;
+  let brokenCount = 0;
+  let demoted = 0;
+
+  for (let i = 0; i < candidates.length; i++) {
+    const c = candidates[i]!;
+    const probedAt = new Date().toISOString();
+    let probe: { status: number; ok: boolean; durationMs: number };
+    try {
+      probe = await probeAgentUrl(c.website, { fetchImpl: opts?.fetchImpl });
+    } catch {
+      probe = { status: 0, ok: false, durationMs: 0 };
+    }
+    if (probe.ok) okCount++;
+    else {
+      brokenCount++;
+      console.log(`[enrichment] URL probe failed for agent ${c.agent_id}: status=${probe.status}`);
+    }
+    const r = applyUrlProbeResult(db, c.agent_id, { status: probe.status, ok: probe.ok, probedAt });
+    if (r.demoted) demoted++;
+    if ((i + 1) % logEveryN === 0) {
+      console.log(`[enrichment-backfill] progress ${i + 1}/${candidates.length} (ok=${okCount} broken=${brokenCount} demoted=${demoted})`);
+    }
+    if (opts?.onProgress) opts.onProgress(i + 1, candidates.length);
+  }
+
+  const durationMs = Date.now() - start;
+  console.log(
+    `[enrichment-backfill] complete: scanned=${candidates.length} ok=${okCount} broken=${brokenCount} demoted=${demoted} took=${Math.round(durationMs / 1000)}s`
+  );
+  return { scanned: candidates.length, ok: okCount, broken: brokenCount, demoted, durationMs };
 }

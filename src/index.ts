@@ -507,6 +507,27 @@ app.listen(Number(PORT), HOST, async () => {
       console.error("Trust recalc failed (non-fatal):", err);
     }
   }, 2000); // 2 second delay — let health checks pass first
+
+  // ─── PR-21 / WO-19 (2026-05-10): link-freshness backfill ────────────
+  // On every boot, probe every agent currently in the outreach pool.
+  // Worst case: 8s timeout × ~130 agents ≈ 17 min. Run AFTER trust-score
+  // recalc + with a delay so health checks pass first. Non-blocking, so
+  // a slow probe never holds up the server.
+  //
+  // Disable by setting RFB_DISABLE_URL_BACKFILL=1 (e.g. on dev / CI).
+  if (process.env.RFB_DISABLE_URL_BACKFILL !== "1") {
+    setTimeout(() => {
+      console.log("[enrichment-backfill] starting URL freshness backfill (non-blocking)…");
+      // Lazy-require so a syntax error in the verifier never blocks boot.
+      // eslint-disable-next-line @typescript-eslint/no-var-requires
+      const { runUrlBackfill } = require("./agents/lokal-agent-verifier");
+      Promise.resolve()
+        .then(() => runUrlBackfill())
+        .catch((err: unknown) => {
+          console.error("[enrichment-backfill] failed (non-fatal):", err);
+        });
+    }, 5000); // 5s delay — let health checks + trust recalc settle first
+  }
 });
 
 // ─── Graceful shutdown ───────────────────────────────────────
