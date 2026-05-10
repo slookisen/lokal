@@ -72,6 +72,7 @@ router.post("/", async (req: Request, res: Response) => {
     const passed = results.filter((r) => r.passed).length;
     const reviewRequired = results.filter((r) => r.new_verification_status === "review_required").length;
     const pendingVerify = results.filter((r) => r.new_verification_status === "pending_verify").length;
+    const dataInsufficient = results.filter((r) => r.new_verification_status === "data_insufficient").length;
     const httpUnreachable = results.filter((r) => r.flags.includes("website_unreachable")).length;
     const brregInactive = results.filter((r) =>
       r.flags.some((f: string) => f === "brreg_inactive" || f === "brreg_konkurs")
@@ -102,6 +103,7 @@ router.post("/", async (req: Request, res: Response) => {
       passed,
       review_required: reviewRequired,
       pending_verify: pendingVerify,
+      data_insufficient: dataInsufficient,
       http_unreachable: httpUnreachable,
       brreg_inactive: brregInactive,
       pool_added: pooledNew,

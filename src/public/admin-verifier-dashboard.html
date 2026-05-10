@@ -122,6 +122,7 @@ tr.row-clickable:hover { background: var(--surface2); }
     <nav class="tabs">
       <button class="tab-btn active" data-tab="tab-runs">Kjøringer</button>
       <button class="tab-btn" data-tab="tab-review">Trenger gjennomgang <span class="review-badge" id="reviewBadge">…</span></button>
+      <button class="tab-btn" data-tab="tab-data-insufficient">Mangler kilder <span class="review-badge" id="dataInsufficientBadge">…</span></button>
     </nav>
 
     <div id="tab-runs" class="tab-pane active">
@@ -168,6 +169,29 @@ tr.row-clickable:hover { background: var(--surface2); }
         </table>
       </section>
     </div>
+
+    <div id="tab-data-insufficient" class="tab-pane">
+      <section class="panel">
+        <h3>Mangler kilder — trenger berikelse</h3>
+        <p class="muted" style="padding:10px 18px 0;">
+          Disse agentene har <code>source_count = 0</code> på alle kritiske felt.
+          De trenger ikke menneskelig gjennomgang — de trenger en ny berikelses-runde
+          som fyller inn <code>field_provenance</code>.
+        </p>
+        <table id="dataInsufficientTable">
+          <thead>
+            <tr>
+              <th>Agent ID</th>
+              <th>Navn</th>
+              <th>Status</th>
+              <th>Sist verifisert</th>
+              <th>Detaljer</th>
+            </tr>
+          </thead>
+          <tbody id="dataInsufficientBody"><tr><td colspan="5" class="loading"><span class="spinner"></span>Laster…</td></tr></tbody>
+        </table>
+      </section>
+    </div>
   </div>
 </div>
 
@@ -186,6 +210,7 @@ document.querySelectorAll(".tab-btn").forEach(function(btn) {
     btn.classList.add("active");
     document.getElementById(target).classList.add("active");
     if (target === "tab-review") loadReviewQueue();
+    if (target === "tab-data-insufficient") loadDataInsufficient();
   });
 });
 
@@ -259,8 +284,9 @@ function load() {
     .catch(function(err) {
       document.getElementById("refreshInfo").textContent = "Feil: " + err.message;
     });
-  // Always refresh the review badge count in the background
+  // Always refresh both queue badge counts in the background
   loadReviewQueue(true);
+  loadDataInsufficient(true);
 }
 
 function pad(n) { return n < 10 ? "0" + n : "" + n; }
@@ -349,7 +375,7 @@ function renderRunsTable(runs) {
 
 // ─── Review queue ────────────────────────────────
 function loadReviewQueue(badgeOnly) {
-  api("/admin/verifier-review-queue")
+  api("/admin/verifier-review-queue?status=review_required")
     .then(function(data) {
       var agents = data.agents || [];
       var badge = document.getElementById("reviewBadge");
@@ -362,6 +388,44 @@ function loadReviewQueue(badgeOnly) {
           '<tr><td colspan="5" style="padding:20px;color:var(--danger)">Feil: ' + esc(err.message) + '</td></tr>';
       }
     });
+}
+
+// ─── Data-insufficient queue (PR-19) ─────────────
+function loadDataInsufficient(badgeOnly) {
+  api("/admin/verifier-review-queue?status=data_insufficient")
+    .then(function(data) {
+      var agents = data.agents || [];
+      var badge = document.getElementById("dataInsufficientBadge");
+      if (badge) badge.textContent = agents.length || "0";
+      if (!badgeOnly) renderDataInsufficientTable(agents);
+    })
+    .catch(function(err) {
+      if (!badgeOnly) {
+        document.getElementById("dataInsufficientBody").innerHTML =
+          '<tr><td colspan="5" style="padding:20px;color:var(--danger)">Feil: ' + esc(err.message) + '</td></tr>';
+      }
+    });
+}
+
+function renderDataInsufficientTable(agents) {
+  if (!agents.length) {
+    document.getElementById("dataInsufficientBody").innerHTML =
+      '<tr><td colspan="5" class="empty">Ingen agenter mangler kilder</td></tr>';
+    return;
+  }
+  var html = "";
+  agents.forEach(function(a) {
+    var reason = a.review_reason || {};
+    html += '<tr class="row-clickable" onclick="this.nextElementSibling.style.display=this.nextElementSibling.style.display===\'none\'?\'table-row\':\'none\'">';
+    html += '<td><code style="font-size:11px">' + esc(a.agent_id) + '</code></td>';
+    html += '<td>' + esc(a.name || "—") + '</td>';
+    html += '<td><span class="tag pending">data_insufficient</span></td>';
+    html += '<td>' + esc(a.last_verified_at ? a.last_verified_at.replace("T", " ").substring(0, 16) + "Z" : "—") + '</td>';
+    html += '<td class="conflict-detail">Alle felt mangler <code>field_provenance</code></td>';
+    html += '</tr>';
+    html += '<tr style="display:none"><td colspan="5"><div class="detail">' + esc(JSON.stringify(reason, null, 2)) + '</div></td></tr>';
+  });
+  document.getElementById("dataInsufficientBody").innerHTML = html;
 }
 
 function renderReviewTable(agents) {

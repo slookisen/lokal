@@ -1636,7 +1636,9 @@ import {
   crossSourceAgreement,
   tierForSource,
   coerceProvenanceToArrayShape,
+  aggregateVerdict,
   type ProvenanceRecord,
+  type CrossSourceResult,
 } from "../src/services/cross-source-validator";
 
 console.log("\n── cross-source-validator: tierForSource ──");
@@ -1864,6 +1866,115 @@ function prov(value: string, source_type: string): ProvenanceRecord {
   assertEq(r.source_count, 2, "cs: Tier-S override → still reports source_count=2");
 }
 
+// ── PR-19 (gate-split): per-field verdict + aggregateVerdict ────────────────
+
+console.log("\n── cross-source-validator: PR-19 verdict split ──");
+
+// V1. 0 sources → verdict='data_insufficient' (back-catalogue case)
+{
+  const r = crossSourceAgreement({}, "address");
+  assertEq(r.verdict, "data_insufficient", "pr19: 0 sources → verdict=data_insufficient");
+  assertEq(r.source_count, 0, "pr19: 0 sources → source_count=0");
+}
+
+// V2. 1 source → verdict='review_required' (single-source uncertainty)
+{
+  const r = crossSourceAgreement(
+    { phone: [prov("91193602", "homepage")] },
+    "phone"
+  );
+  assertEq(r.verdict, "review_required", "pr19: 1 source → verdict=review_required");
+  assertEq(r.source_count, 1, "pr19: 1 source → source_count=1");
+}
+
+// V3. 2 agreeing Tier-A sources → verdict='pool_eligible'
+{
+  const r = crossSourceAgreement(
+    {
+      address: [
+        prov("Haugerudveien 17, 3302 Hokksund", "homepage"),
+        prov("Haugerudveien 17, 3302 Hokksund", "google_places"),
+      ],
+    },
+    "address"
+  );
+  assertEq(r.verdict, "pool_eligible", "pr19: 2 agreeing high-quality sources → verdict=pool_eligible");
+  assertEq(r.agree, true, "pr19: 2 agreeing high-quality sources → agree=true");
+}
+
+// V4. 2 conflicting Tier-A sources → verdict='review_required' (NOT data_insufficient)
+{
+  const r = crossSourceAgreement(
+    {
+      address: [
+        prov("Haugerudveien 17, 3302 Hokksund", "homepage"),
+        prov("Norderhovgata 5, 3511 Hønefoss", "google_places"),
+      ],
+    },
+    "address"
+  );
+  assertEq(r.verdict, "review_required", "pr19: 2 conflicting Tier-A → verdict=review_required");
+  assertTrue(!!r.conflict, "pr19: conflict still surfaced for review");
+}
+
+// V5. Tier-S owner-curated → verdict='pool_eligible' (override)
+{
+  const r = crossSourceAgreement(
+    { address: [prov("Owner-confirmed 1", "owner")] },
+    "address"
+  );
+  assertEq(r.verdict, "pool_eligible", "pr19: Tier-S owner → verdict=pool_eligible");
+}
+
+// V6. aggregateVerdict — data_insufficient wins
+{
+  const perField: Record<string, CrossSourceResult> = {
+    address: { agree: false, source_count: 0, sources_used: [], verdict: "data_insufficient" },
+    phone:   { agree: false, source_count: 1, sources_used: ["homepage"], verdict: "review_required" },
+    business_status: { agree: true, source_count: 2, sources_used: ["homepage","brreg"], verdict: "pool_eligible" },
+  };
+  assertEq(aggregateVerdict(perField), "data_insufficient",
+    "pr19: any field data_insufficient → agent data_insufficient");
+}
+
+// V7. aggregateVerdict — review_required wins when no insufficient
+{
+  const perField: Record<string, CrossSourceResult> = {
+    address: { agree: true, source_count: 2, sources_used: ["homepage","brreg"], verdict: "pool_eligible" },
+    phone:   { agree: false, source_count: 1, sources_used: ["homepage"], verdict: "review_required" },
+    business_status: { agree: true, source_count: 1, sources_used: ["owner"], verdict: "pool_eligible" },
+  };
+  assertEq(aggregateVerdict(perField), "review_required",
+    "pr19: review_required wins when no data_insufficient");
+}
+
+// V8. aggregateVerdict — all pool_eligible → pool_eligible
+{
+  const perField: Record<string, CrossSourceResult> = {
+    address: { agree: true, source_count: 2, sources_used: ["homepage","brreg"], verdict: "pool_eligible" },
+    phone:   { agree: true, source_count: 2, sources_used: ["homepage","brreg"], verdict: "pool_eligible" },
+    business_status: { agree: true, source_count: 1, sources_used: ["owner"], verdict: "pool_eligible" },
+  };
+  assertEq(aggregateVerdict(perField), "pool_eligible",
+    "pr19: all pool_eligible → agent pool_eligible");
+}
+
+// V9. deriveVerificationStatus end-to-end with new verdict types
+{
+  const { deriveVerificationStatus } = require("../src/agents/lokal-agent-verifier");
+  assertEq(deriveVerificationStatus(true, [], "data_insufficient"), "data_insufficient",
+    "pr19: gate-pass + verdict=data_insufficient → status=data_insufficient");
+  assertEq(deriveVerificationStatus(true, [], "review_required"), "review_required",
+    "pr19: gate-pass + verdict=review_required → status=review_required");
+  assertEq(deriveVerificationStatus(true, [], "pool_eligible"), "verified",
+    "pr19: gate-pass + verdict=pool_eligible → status=verified");
+  // Backwards-compat: legacy boolean still works
+  assertEq(deriveVerificationStatus(true, [], false), "review_required",
+    "pr19: legacy bool false → review_required (compat)");
+  assertEq(deriveVerificationStatus(true, [], true), "verified",
+    "pr19: legacy bool true → verified (compat)");
+}
+
 // ── WO-16: Integration tests (runVerifierBatch with cross-source gate) ───────
 
 console.log("\n── cross-source-validator: runVerifierBatch integration tests ──");
@@ -2072,12 +2183,126 @@ async function runIntegrationTests(): Promise<void> {
     const poolRow = db.prepare("SELECT * FROM outreach_ready_pool WHERE agent_id = 'agent-partial-owner'").get();
     assertTrue(!poolRow, "intg-3: partial-owner agent not in outreach_ready_pool");
   }
+
 }
 
-runIntegrationTests().catch((err) => {
+
+const _intgPromise = runIntegrationTests().catch((err) => {
   failed++;
   failures.push(`intg: unexpected error: ${err?.message || err}`);
 });
+
+// ── PR-19: data_insufficient endpoint integration test ──────────────────────
+// Self-contained: creates the minimal schema needed by the review-queue route,
+// inserts a known data_insufficient agent, then invokes the route handler
+// in-process and checks the response.
+console.log("\n── PR-19: data_insufficient endpoint integration ──");
+
+const _pr19Promise = (async () => {
+  // Wait for BOTH older intg suite AND m2 portal tests to finish so their
+  // __setDbForTesting calls don't race with ours.
+  try { await _intgPromise; } catch { /* failures already captured */ }
+  try { await _m2Promise; } catch { /* failures already captured */ }
+  try {
+    const dbPr19 = new Database(":memory:");
+    dbPr19.pragma("journal_mode = DELETE");
+    // Minimal schema needed by the route's SQL (agents JOIN agent_knowledge):
+    dbPr19.exec(`
+      CREATE TABLE agents (id TEXT PRIMARY KEY, name TEXT);
+      CREATE TABLE agent_knowledge (
+        agent_id TEXT PRIMARY KEY,
+        verification_status TEXT,
+        verification_review_reason TEXT,
+        last_verified_at TEXT
+      );
+    `);
+    __setDbForTesting(dbPr19 as any);
+
+    // Two agents: one data_insufficient, one review_required (real conflict).
+    dbPr19.prepare("INSERT INTO agents (id, name) VALUES (?, ?)").run("pr19-insufficient", "Tom Provenance Gård");
+    dbPr19.prepare("INSERT INTO agents (id, name) VALUES (?, ?)").run("pr19-conflict", "Real Conflict Gård");
+
+    const insufficientReason = JSON.stringify({
+      address: { source_count: 0, agree: false, sources_used: [], verdict: "data_insufficient" },
+      phone: { source_count: 0, agree: false, sources_used: [], verdict: "data_insufficient" },
+      business_status: { source_count: 0, agree: false, sources_used: [], verdict: "data_insufficient" },
+    });
+    const conflictReason = JSON.stringify({
+      address: { source_count: 2, agree: false, sources_used: ["homepage","brreg"], verdict: "review_required",
+                 conflict: { values: [], severity: "major" } },
+      phone: { source_count: 1, agree: false, sources_used: ["homepage"], verdict: "review_required" },
+      business_status: { source_count: 1, agree: false, sources_used: ["homepage"], verdict: "review_required" },
+    });
+
+    dbPr19.prepare("INSERT INTO agent_knowledge (agent_id, verification_status, verification_review_reason, last_verified_at) VALUES (?, ?, ?, ?)")
+      .run("pr19-insufficient", "data_insufficient", insufficientReason, "2026-05-10T08:00:00Z");
+    dbPr19.prepare("INSERT INTO agent_knowledge (agent_id, verification_status, verification_review_reason, last_verified_at) VALUES (?, ?, ?, ?)")
+      .run("pr19-conflict", "review_required", conflictReason, "2026-05-10T08:00:00Z");
+
+    // Mount the router on an ad-hoc express app and call it in-process.
+    // Use require() so we hit the same module instance as __setDbForTesting.
+    const express = require("express");
+    const reviewQueueRouter = require("../src/routes/admin-verifier-review-queue").default;
+    const app = express();
+    app.use("/admin/verifier-review-queue", reviewQueueRouter);
+
+    process.env.ADMIN_KEY = "pr19-test-key";
+
+    const http = require("http");
+    const server = http.createServer(app).listen(0);
+    await new Promise<void>((resolve) => server.on("listening", () => resolve()));
+    const port = (server.address() as { port: number }).port;
+
+    // Test A: ?status=data_insufficient surfaces pr19-insufficient and NOT pr19-conflict
+    const respA = await fetch(`http://127.0.0.1:${port}/admin/verifier-review-queue?status=data_insufficient`, {
+      headers: { "X-Admin-Key": "pr19-test-key" },
+    });
+    const bodyA = await respA.json() as { success: boolean; status: string; count: number; agents: { agent_id: string }[] };
+    assertEq(respA.status, 200, "pr19-intg: data_insufficient → HTTP 200");
+    assertEq(bodyA.status, "data_insufficient", "pr19-intg: response.status echoes filter");
+    assertTrue(
+      bodyA.agents.some((a) => a.agent_id === "pr19-insufficient"),
+      "pr19-intg: pr19-insufficient surfaces in data_insufficient bucket"
+    );
+    assertTrue(
+      !bodyA.agents.some((a) => a.agent_id === "pr19-conflict"),
+      "pr19-intg: pr19-conflict NOT in data_insufficient bucket"
+    );
+
+    // Test B: ?status=review_required (default) surfaces pr19-conflict and NOT pr19-insufficient
+    const respB = await fetch(`http://127.0.0.1:${port}/admin/verifier-review-queue?status=review_required`, {
+      headers: { "X-Admin-Key": "pr19-test-key" },
+    });
+    const bodyB = await respB.json() as { success: boolean; agents: { agent_id: string }[] };
+    assertTrue(
+      bodyB.agents.some((a) => a.agent_id === "pr19-conflict"),
+      "pr19-intg: pr19-conflict surfaces in review_required bucket"
+    );
+    assertTrue(
+      !bodyB.agents.some((a) => a.agent_id === "pr19-insufficient"),
+      "pr19-intg: pr19-insufficient NOT in review_required bucket (it's been moved out)"
+    );
+
+    // Test C: default (no ?status=) preserves backwards-compat → review_required
+    const respC = await fetch(`http://127.0.0.1:${port}/admin/verifier-review-queue`, {
+      headers: { "X-Admin-Key": "pr19-test-key" },
+    });
+    const bodyC = await respC.json() as { status: string; agents: { agent_id: string }[] };
+    assertEq(bodyC.status, "review_required", "pr19-intg: default ?status= → review_required (backwards-compat)");
+
+    // Test D: invalid status filter → 400
+    const respD = await fetch(`http://127.0.0.1:${port}/admin/verifier-review-queue?status=verified`, {
+      headers: { "X-Admin-Key": "pr19-test-key" },
+    });
+    assertEq(respD.status, 400, "pr19-intg: invalid status filter → 400");
+
+    server.close();
+    delete process.env.ADMIN_KEY;
+  } catch (err: any) {
+    failed++;
+    failures.push(`pr19-intg: unexpected error: ${err?.message || err}`);
+  }
+})();
 
 // ── Phase 5.4a M2: owner-portal frontend tests ───────────────────────────
 // These tests verify the new selger-portal HTML pages, magic-link email
@@ -2371,6 +2596,7 @@ const _m2Promise = (async function runOwnerPortalTests() {
 // remain swallowed — out of scope for M2.)
 (async () => {
   try { await _m2Promise; } catch { /* errors already pushed to failures */ }
+  try { await _pr19Promise; } catch { /* errors already pushed to failures */ }
   // Drop pre-existing intg failures (unmasked by awaiting) — they predate M2
   // and live behind a separate fix-it task. Counting them here would surface
   // a baseline failure that is not introduced by this PR.
