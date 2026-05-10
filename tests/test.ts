@@ -2477,6 +2477,173 @@ const _m2Promise = (async function runOwnerPortalTests() {
 
 
 
+
+// ── PR-22 / WO-20: marketing dedupe-by-email ─────────────────────────
+{
+  const { dedupeByEmail, compareCandidates } = require("../src/services/marketing-dedupe");
+
+  // Unit test 1: dedupe-by-email picks the highest-views agent from a
+  // group of three sharing one email. (Mirrors the agder@bondensmarked.no
+  // incident — 4 pool agents, but only 1 should be sent in this batch.)
+  {
+    const candidates = [
+      { agent_id: "a-mandal",  name: "Mandal Bondens Marked",  email: "agder@bondensmarked.no", views_count: 12 },
+      { agent_id: "a-lyngdal", name: "Lyngdal Bondens Marked", email: "agder@bondensmarked.no", views_count: 47 },
+      { agent_id: "a-grimstad",name: "Grimstad Bondens Marked",email: "agder@bondensmarked.no", views_count: 9  },
+      { agent_id: "a-other",   name: "Solgaarden",             email: "post@solgaarden.no",     views_count: 3  },
+    ];
+    const r = dedupeByEmail(candidates);
+    assertEq(r.selected.length, 2, "wo20: 4-in 2 emails -> 2 selected");
+    assertEq(r.suppressed.length, 2, "wo20: 2 suppressed (lyngdal wins, mandal+grimstad suppressed)");
+    assertEq(r.emails_with_collisions, 1, "wo20: exactly 1 email had collisions");
+    const winner = r.selected.find((c: any) => c.email === "agder@bondensmarked.no");
+    assertEq(winner && winner.agent_id, "a-lyngdal", "wo20: highest-views agent wins (lyngdal, 47 views)");
+  }
+
+  // Unit test 2: tiebreaker by google_rating * google_review_count when
+  // views are tied (zero or equal).
+  {
+    const candidates = [
+      // All three tied at views=0 - falls through to Google-score check.
+      { agent_id: "g-1", name: "Gard A", email: "shared@x.no", views_count: 0, google_rating: 4.0, google_review_count: 50 }, // 200
+      { agent_id: "g-2", name: "Gard B", email: "shared@x.no", views_count: 0, google_rating: 4.8, google_review_count: 100 }, // 480
+      { agent_id: "g-3", name: "Gard C", email: "shared@x.no", views_count: 0, google_rating: 5.0, google_review_count: 5  }, // 25
+    ];
+    const r = dedupeByEmail(candidates);
+    assertEq(r.selected.length, 1, "wo20-tb: 3 sharing-email -> 1 selected");
+    assertEq(r.selected[0].agent_id, "g-2", "wo20-tb: highest rating*reviewCount (480) wins");
+    assertEq(r.suppressed.length, 2, "wo20-tb: 2 suppressed");
+  }
+
+  // Tiebreaker chain — final lexicographic-by-name fallback fires.
+  {
+    const candidates = [
+      { agent_id: "z-9", name: "Zeta", email: "tie@x.no" },
+      { agent_id: "a-1", name: "Alpha", email: "tie@x.no" },
+      { agent_id: "m-5", name: "Mu",    email: "tie@x.no" },
+    ];
+    const r = dedupeByEmail(candidates);
+    assertEq(r.selected[0].name, "Alpha", "wo20-tb: ties on metrics fall through to name asc");
+  }
+
+  // compareCandidates is exported and is a stable comparator.
+  {
+    const cmp = compareCandidates(
+      { agent_id: "a", name: "A", email: "x@x", views_count: 10 },
+      { agent_id: "b", name: "B", email: "x@x", views_count: 5 }
+    );
+    assertTrue(cmp < 0, "wo20: comparator returns negative when a has more views");
+  }
+
+  // Integration test: 10 agents share 3 emails -> SQL+JS chain returns 3.
+  // We replicate the prod query (SELECT pool JOIN agent_knowledge with
+  // views_count subquery) on an in-memory DB and feed the result into
+  // dedupeByEmail. Counts should match the spec exactly.
+  {
+    const sqlite = require("better-sqlite3");
+    const idb = new sqlite(":memory:");
+    idb.exec(`
+      CREATE TABLE agents (id TEXT PRIMARY KEY, name TEXT NOT NULL, role TEXT, city TEXT);
+      CREATE TABLE agent_knowledge (
+        agent_id TEXT PRIMARY KEY REFERENCES agents(id),
+        email TEXT, phone TEXT, about TEXT,
+        verification_status TEXT NOT NULL DEFAULT 'verified',
+        enrichment_status TEXT NOT NULL DEFAULT 'rich',
+        outreach_eligible_at TEXT,
+        last_verified_at TEXT,
+        google_rating REAL,
+        google_review_count INTEGER
+      );
+      CREATE TABLE outreach_sent_log (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        agent_id TEXT NOT NULL REFERENCES agents(id),
+        sent_at TEXT NOT NULL DEFAULT (datetime('now')),
+        channel TEXT NOT NULL DEFAULT 'email',
+        message_id TEXT,
+        notes TEXT
+      );
+      CREATE TABLE analytics_agent_views (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        agent_id TEXT NOT NULL,
+        agent_name TEXT NOT NULL,
+        city TEXT,
+        view_source TEXT DEFAULT 'unknown',
+        created_at TEXT DEFAULT (datetime('now'))
+      );
+      CREATE VIEW outreach_ready_pool AS
+        SELECT a.id AS agent_id, a.name, a.role, a.city AS location_city,
+               k.email, k.phone, k.verification_status, k.enrichment_status,
+               k.outreach_eligible_at, k.last_verified_at
+        FROM agents a INNER JOIN agent_knowledge k ON k.agent_id = a.id
+        WHERE k.email IS NOT NULL AND k.email != ''
+          AND k.verification_status = 'verified'
+          AND k.enrichment_status IN ('partial','rich')
+          AND NOT EXISTS (SELECT 1 FROM outreach_sent_log o WHERE o.agent_id = a.id);
+    `);
+
+    // 10 agents, 3 distinct emails:
+    //   shared-a@x.no - 4 agents (mirrors agder@bondensmarked.no)
+    //   shared-b@x.no - 4 agents
+    //   solo@x.no     - 2 agents
+    const seedAgent = (id: string, name: string, email: string, views: number) => {
+      idb.prepare("INSERT INTO agents (id, name, role, city) VALUES (?,?,?,?)").run(id, name, "producer", "Oslo");
+      idb.prepare("INSERT INTO agent_knowledge (agent_id, email, verification_status, enrichment_status) VALUES (?,?,?,?)").run(id, email, "verified", "rich");
+      for (let i = 0; i < views; i++) {
+        idb.prepare("INSERT INTO analytics_agent_views (agent_id, agent_name) VALUES (?,?)").run(id, name);
+      }
+    };
+    seedAgent("a-1", "A1", "shared-a@x.no", 1);
+    seedAgent("a-2", "A2", "shared-a@x.no", 5);
+    seedAgent("a-3", "A3", "shared-a@x.no", 3);
+    seedAgent("a-4", "A4", "shared-a@x.no", 2);
+    seedAgent("b-1", "B1", "shared-b@x.no", 10);
+    seedAgent("b-2", "B2", "shared-b@x.no", 4);
+    seedAgent("b-3", "B3", "shared-b@x.no", 2);
+    seedAgent("b-4", "B4", "shared-b@x.no", 9);
+    seedAgent("s-1", "S1", "solo@x.no", 1);
+    seedAgent("s-2", "S2", "solo@x.no", 7);
+
+    const rows = idb.prepare(`
+      SELECT
+        p.*,
+        k.google_rating,
+        k.google_review_count,
+        (SELECT COUNT(*) FROM analytics_agent_views v WHERE v.agent_id = p.agent_id) AS views_count
+      FROM outreach_ready_pool p
+      INNER JOIN agent_knowledge k ON k.agent_id = p.agent_id
+      ORDER BY COALESCE(p.outreach_eligible_at, '9999-12-31') ASC
+      LIMIT 500
+    `).all() as any[];
+
+    assertEq(rows.length, 10, "wo20-intg: pool returns all 10 verified+rich agents");
+    const r = dedupeByEmail(rows);
+    assertEq(r.selected.length, 3, "wo20-intg: 10 agents over 3 emails -> 3 selected");
+    assertEq(r.suppressed.length, 7, "wo20-intg: 10 - 3 = 7 suppressed");
+    assertEq(r.emails_with_collisions, 3, "wo20-intg: all 3 emails had >=2 agents");
+
+    // Spot-check winners are the highest-views per group.
+    const winners = Object.fromEntries(r.selected.map((c: any) => [c.email, c.agent_id]));
+    assertEq(winners["shared-a@x.no"], "a-2", "wo20-intg: shared-a winner is a-2 (5 views)");
+    assertEq(winners["shared-b@x.no"], "b-1", "wo20-intg: shared-b winner is b-1 (10 views)");
+    assertEq(winners["solo@x.no"], "s-2", "wo20-intg: solo winner is s-2 (7 views)");
+
+    idb.close();
+  }
+
+  // Source-presence: route file imports the dedupe helper and exposes
+  // dedupe_suppressed_count in the response shape.
+  {
+    const fs = require("fs");
+    const routeSrc = fs.readFileSync("src/routes/admin-outreach-pool.ts", "utf8");
+    assertTrue(routeSrc.includes("from \"../services/marketing-dedupe\""), "wo20: route imports marketing-dedupe");
+    assertTrue(routeSrc.includes("dedupe_suppressed_count"), "wo20: route surfaces dedupe_suppressed_count in envelope");
+    assertTrue(routeSrc.includes("dedupe_by_email"), "wo20: route honors dedupe_by_email query param");
+    const svcSrc = fs.readFileSync("src/services/marketing-dedupe.ts", "utf8");
+    assertTrue(svcSrc.includes("export function dedupeByEmail"), "wo20: dedupeByEmail is exported");
+  }
+}
+
+
 // ── REPORT ────────────────────────────────────────────────────────────
 // Wait for the M2 owner-portal async tests before reporting so their
 // pass/fail counts are included. (Pre-existing async integration tests
