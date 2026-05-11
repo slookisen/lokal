@@ -3241,6 +3241,183 @@ const _pr24Promise = (async function runPr24Tests() {
         assertEq(merged.address.length, 2, "pr24-12: merge dedup works");
         assertEq(merged.address[0].fetched_at, "t1", "pr24-12: dedup keeps original timestamp");
       }
+
+      // ─── PR-28 (2026-05-11): defensive handling of malformed legacy ──
+      // field_provenance from phase51_backfill_provenance_v1. That
+      // migration wrote records WITHOUT a `value` field; phase53 wrapped
+      // them in an array. mergeFieldProvenance previously crashed in
+      // dedupKey on `rec.value.trim()` → express returned plain-HTML 500.
+
+      // ── pr28-1: mergeFieldProvenance filters malformed existing records
+      {
+        const merged = adminKnowledgeMod.mergeFieldProvenance(
+          {
+            // Legacy phase51 shape — no `value` field
+            address: [
+              {
+                source_type: "homepage",
+                source_url: "https://example.com",
+                evidence_level: "B",
+                confidence: 0.7,
+                fetched_at: "2026-05-01T00:00:00Z",
+                verifier: "backfill-phase51",
+                cross_sources: [],
+              },
+            ],
+          },
+          {
+            address: {
+              sources: [
+                { source_type: "homepage", raw_value: "X", captured_at: "2026-05-11T00:00:00Z" },
+              ],
+            },
+          },
+        );
+        assertEq(merged.address.length, 1, "pr28-1: malformed legacy record filtered, new one kept");
+        assertEq(merged.address[0].value, "X", "pr28-1: surviving record is the well-formed one");
+        assertEq(merged.address[0].source_type, "homepage", "pr28-1: surviving source_type");
+      }
+
+      // ── pr28-2: dedupKey doesn't throw on records missing value
+      {
+        let threw = false;
+        let result: string | null = "sentinel";
+        try {
+          result = adminKnowledgeMod.dedupKey({ source_type: "homepage" } as any);
+        } catch {
+          threw = true;
+        }
+        assertEq(threw, false, "pr28-2: dedupKey({source_type only}) does not throw");
+        assertEq(result, null, "pr28-2: dedupKey returns null sentinel for missing value");
+      }
+
+      // ── pr28-3: dedupKey doesn't throw on records missing source_type
+      {
+        let threw = false;
+        let result: string | null = "sentinel";
+        try {
+          result = adminKnowledgeMod.dedupKey({ value: "X" } as any);
+        } catch {
+          threw = true;
+        }
+        assertEq(threw, false, "pr28-3: dedupKey({value only}) does not throw");
+        assertEq(result, null, "pr28-3: dedupKey returns null sentinel for missing source_type");
+      }
+
+      // ── pr28-4: dedupKey doesn't throw on null/undefined
+      {
+        let threw = false;
+        try {
+          adminKnowledgeMod.dedupKey(null);
+          adminKnowledgeMod.dedupKey(undefined);
+          adminKnowledgeMod.dedupKey({ value: null, source_type: null } as any);
+        } catch {
+          threw = true;
+        }
+        assertEq(threw, false, "pr28-4: dedupKey gracefully handles null/undefined/non-string fields");
+      }
+
+      // ── pr28-5: dedupKey filters non-string value (e.g. null)
+      {
+        const r = adminKnowledgeMod.dedupKey({ value: null, source_type: "homepage" } as any);
+        assertEq(r, null, "pr28-5: dedupKey returns null when value is null");
+      }
+
+      // ── pr28-6: regression — reproducer from PR-28 issue. Seed pr24db
+      // with malformed phase51-style field_provenance, then attempt the
+      // failing reproducer payload. Pre-PR-28 this returned plain-HTML
+      // 500 from express; post-PR-28 it returns 200 JSON and the cleaned
+      // shape lands on disk.
+      {
+        pr24db.prepare(
+          "INSERT INTO agents (id, name, slug, role, api_key) VALUES ('pr28-repro', 'PR28 Repro Gård', 'pr28-repro', 'producer', 'k')"
+        ).run();
+        // Mimic phase51_backfill_provenance_v1 → phase53 array-wrap output:
+        // records with source_type/source_url/confidence/fetched_at but NO `value`.
+        const malformed = {
+          address: [
+            {
+              source_type: "auto",
+              source_url: "https://example.com",
+              evidence_level: "B",
+              confidence: 0.7,
+              fetched_at: "2026-05-01T00:00:00Z",
+              last_verified_at: "2026-05-01T00:00:00Z",
+              verifier: "backfill-phase51",
+              cross_sources: [],
+            },
+          ],
+          phone: [
+            {
+              source_type: "auto",
+              source_url: "https://example.com",
+              evidence_level: "B",
+              confidence: 0.7,
+              fetched_at: "2026-05-01T00:00:00Z",
+              last_verified_at: "2026-05-01T00:00:00Z",
+              verifier: "backfill-phase51",
+              cross_sources: [],
+            },
+          ],
+          business_status: [
+            { value: "OPERATIONAL", source_type: "google_places", fetched_at: "2026-05-01T00:00:00Z" },
+          ],
+        };
+        pr24db.prepare(
+          "INSERT INTO agent_knowledge (agent_id, field_provenance, updated_at) VALUES (?, ?, ?)"
+        ).run("pr28-repro", JSON.stringify(malformed), "2026-05-01T00:00:00Z");
+
+        // Reproducer: write address (was failing pre-PR-28).
+        const respAddr = await pr24Req("PUT", "/admin/knowledge", {
+          agent_id: "pr28-repro",
+          field_provenance: {
+            address: {
+              sources: [
+                { source_type: "homepage", fetched_at: "2026-05-11T17:00:00Z", value: "Test" },
+              ],
+            },
+          },
+        }, PR24_KEY);
+        assertEq(respAddr.status, 200, "pr28-6: address write succeeds against malformed legacy data (no more 500)");
+        assertEq(respAddr.body?.success, true, "pr28-6: success=true");
+        const provAfterAddr = getProv("pr28-repro");
+        // Address: malformed legacy record filtered out, new homepage one kept → length 1.
+        assertEq(provAfterAddr.address?.length, 1, "pr28-6: malformed legacy address dropped, new homepage kept");
+        assertEq(provAfterAddr.address[0].value, "Test", "pr28-6: surviving address value");
+
+        // Reproducer: write phone (was failing pre-PR-28).
+        const respPhone = await pr24Req("PUT", "/admin/knowledge", {
+          agent_id: "pr28-repro",
+          field_provenance: {
+            phone: {
+              sources: [
+                { source_type: "homepage", fetched_at: "2026-05-11T17:00:00Z", value: "+47 12345678" },
+              ],
+            },
+          },
+        }, PR24_KEY);
+        assertEq(respPhone.status, 200, "pr28-6: phone write succeeds against malformed legacy data");
+        const provAfterPhone = getProv("pr28-repro");
+        assertEq(provAfterPhone.phone?.length, 1, "pr28-6: malformed legacy phone dropped, new homepage kept");
+        assertEq(provAfterPhone.phone[0].value, "+47 12345678", "pr28-6: surviving phone value");
+
+        // business_status was already well-formed and was working — confirm
+        // we didn't regress it.
+        const respBs = await pr24Req("PUT", "/admin/knowledge", {
+          agent_id: "pr28-repro",
+          field_provenance: {
+            business_status: {
+              sources: [
+                { source_type: "google_places", fetched_at: "2026-05-11T17:00:00Z", value: "OPERATIONAL" },
+              ],
+            },
+          },
+        }, PR24_KEY);
+        assertEq(respBs.status, 200, "pr28-6: business_status write still succeeds (no regression)");
+        const provAfterBs = getProv("pr28-repro");
+        // Existing was 1 OPERATIONAL/google_places — re-PUT dedupes → still 1.
+        assertEq(provAfterBs.business_status?.length, 1, "pr28-6: business_status dedup still 1");
+      }
     } finally {
       // Restore admin-key + close server
       if (prevAdminKey === undefined) delete process.env.ADMIN_KEY;
