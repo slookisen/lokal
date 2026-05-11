@@ -4329,8 +4329,147 @@ const _pr30Promise = (async function runPr30RouteTests() {
     failures.push("pr30 intg: unexpected error: " + (err instanceof Error ? err.stack || err.message : String(err)));
   }
 })();
+// ── PR-29: related-producers sections on /produsent/<slug> ──────────
+// SEO PR — adds two internal-linking blocks ("Andre lokale matprodusenter
+// i <by>" + "Andre <kategori>-produsenter i Norge") to the producer page.
+console.log("── PR-29 related-producers tests ──");
+{
+  const sqlite = require("better-sqlite3");
+  const pr29db = new sqlite(":memory:");
+
+  pr29db.exec(`
+    CREATE TABLE agents (
+      id TEXT PRIMARY KEY,
+      name TEXT NOT NULL,
+      description TEXT,
+      role TEXT,
+      city TEXT,
+      categories TEXT DEFAULT '[]',
+      is_active INTEGER DEFAULT 1
+    );
+    CREATE TABLE agent_knowledge (
+      agent_id TEXT PRIMARY KEY REFERENCES agents(id),
+      about TEXT,
+      verification_status TEXT NOT NULL DEFAULT 'unverified',
+      enrichment_status TEXT NOT NULL DEFAULT 'thin'
+    );
+  `);
+
+  const seedAgent29 = (id: string, opts: any = {}) => {
+    pr29db.prepare(`INSERT INTO agents (id, name, description, role, city, categories, is_active)
+      VALUES (?, ?, ?, ?, ?, ?, ?)`).run(
+        id,
+        opts.name ?? `Gård ${id}`,
+        opts.description ?? `Beskrivelse av ${id}.`,
+        opts.role ?? "producer",
+        opts.city ?? "Oslo",
+        opts.categories ?? '["vegetables"]',
+        opts.is_active ?? 1,
+      );
+    pr29db.prepare(`INSERT INTO agent_knowledge (agent_id, about, verification_status, enrichment_status)
+      VALUES (?, ?, ?, ?)`).run(
+        id,
+        opts.about ?? null,
+        opts.verification_status ?? "unverified",
+        opts.enrichment_status ?? "thin",
+      );
+  };
+
+  seedAgent29("a-self", { name: "Selv Gård", city: "Oslo", categories: '["vegetables","eggs"]', verification_status: "verified", enrichment_status: "rich" });
+  seedAgent29("a-oslo-verified-rich", { name: "Verifisert Rich", city: "Oslo", verification_status: "verified", enrichment_status: "rich", about: "En rik økologisk gård. Selger grønnsaker direkte." });
+  seedAgent29("a-oslo-unverified", { name: "Uverifisert Tynn", city: "Oslo", verification_status: "unverified", enrichment_status: "thin" });
+  seedAgent29("a-oslo-verified-partial", { name: "Verifisert Partial", city: "Oslo", verification_status: "verified", enrichment_status: "partial" });
+  seedAgent29("a-bergen-other", { name: "Bergen Bonde", city: "Bergen", categories: '["vegetables"]', verification_status: "verified", enrichment_status: "rich" });
+  seedAgent29("a-oslo-inactive", { name: "Inaktiv Oslo", city: "Oslo", is_active: 0, verification_status: "verified", enrichment_status: "rich" });
+  seedAgent29("a-oslo-consumer", { name: "Kunde Agent", city: "Oslo", role: "consumer", verification_status: "verified", enrichment_status: "rich" });
+
+  const seo29 = require("../src/routes/seo");
+
+  // Test 1: same-city excludes self / inactive / non-producer / wrong-city
+  const cityRows = seo29.getRelatedBySameCity(pr29db, "a-self", "Oslo", 5);
+  const cityIds = cityRows.map((r: any) => r.id);
+  assertTrue(!cityIds.includes("a-self"), "pr29: same-city excludes the requesting agent");
+  assertTrue(!cityIds.includes("a-oslo-inactive"), "pr29: same-city excludes is_active=0 agents");
+  assertTrue(!cityIds.includes("a-oslo-consumer"), "pr29: same-city excludes non-producer roles");
+  assertTrue(!cityIds.includes("a-bergen-other"), "pr29: same-city excludes other cities");
+  assertEq(cityRows.length, 3, "pr29: same-city returns 3 valid Oslo producers");
+
+  // Test 2: same-city orders verified+rich first (despite RANDOM() tie-break)
+  let verifiedRichFirstCount = 0;
+  for (let i = 0; i < 5; i++) {
+    const r = seo29.getRelatedBySameCity(pr29db, "a-self", "Oslo", 5);
+    if (r[0].id === "a-oslo-verified-rich") verifiedRichFirstCount++;
+  }
+  assertEq(verifiedRichFirstCount, 5, "pr29: verified+rich always ranks first regardless of RANDOM tiebreak");
+
+  // Test 3: same-category prefers non-same-city (geographic diversity)
+  const catRows = seo29.getRelatedBySameCategory(pr29db, "a-self", "vegetables", "Oslo", 5);
+  assertTrue(!catRows.some((r: any) => r.id === "a-self"), "pr29: same-category excludes the requesting agent");
+  assertTrue(catRows.length > 0, "pr29: same-category returns at least one row when matches exist");
+  assertEq(catRows[0].id, "a-bergen-other", "pr29: same-category prefers non-same-city producers");
+
+  // Test 4: quoted-token category match avoids 'egg' vs 'eggs' false positives
+  seedAgent29("a-egg-only", { name: "Egg Bare", city: "Trondheim", categories: '["eggs"]', verification_status: "verified", enrichment_status: "rich" });
+  const eggSubstrRows = seo29.getRelatedBySameCategory(pr29db, "a-self", "egg", null, 5);
+  assertTrue(!eggSubstrRows.some((r: any) => r.id === "a-egg-only"),
+    "pr29: category 'egg' does not falsely match 'eggs'");
+  const eggExactRows = seo29.getRelatedBySameCategory(pr29db, "a-self", "eggs", null, 5);
+  assertTrue(eggExactRows.some((r: any) => r.id === "a-egg-only"),
+    "pr29: category 'eggs' does exactly match 'eggs'");
+
+  // Test 5: formatRelatedPreview rules
+  assertEq(seo29.formatRelatedPreview(null), "", "pr29: preview of null → empty string");
+  assertEq(seo29.formatRelatedPreview(""), "", "pr29: preview of empty → empty string");
+  assertEq(seo29.formatRelatedPreview("En kort setning."), "En kort setning.",
+    "pr29: single short sentence preserved");
+  const twoSent = seo29.formatRelatedPreview("Første setning. Andre setning. Tredje setning.");
+  assertEq(twoSent, "Første setning. Andre setning.",
+    "pr29: preview keeps up to two sentences, drops third");
+  const longText = "x".repeat(400);
+  const truncated = seo29.formatRelatedPreview(longText, 180);
+  assertTrue(truncated.length <= 180, `pr29: preview honours maxChars (got len=${truncated.length})`);
+  assertTrue(truncated.endsWith("…"), "pr29: long preview gets ellipsis");
+
+  // Test 6: rendered section produces 3-5 internal /produsent/* links
+  const linksHtml = seo29.renderRelatedSection(cityRows, "Andre lokale matprodusenter i Oslo", "no");
+  const linkMatches = linksHtml.match(/href="\/produsent\//g) || [];
+  assertTrue(linkMatches.length >= 3 && linkMatches.length <= 5,
+    `pr29: rendered section contains 3-5 internal /produsent/* links (got ${linkMatches.length})`);
+  assertTrue(linksHtml.includes("Andre lokale matprodusenter i Oslo"),
+    "pr29: rendered section contains the heading text");
+  assertTrue(linksHtml.includes('class="rp-card"'),
+    "pr29: rendered section uses the .rp-card class for styling");
+
+  // Test 7: empty rows → empty string (sections hidden, no empty UI)
+  const emptyHtml = seo29.renderRelatedSection([], "Anything", "no");
+  assertEq(emptyHtml, "", "pr29: empty rows → empty string (no empty UI shell)");
+
+  // Test 8: empty inputs short-circuit
+  assertEq(seo29.getRelatedBySameCity(pr29db, "a-self", "", 5).length, 0,
+    "pr29: empty city → empty array");
+  assertEq(seo29.getRelatedBySameCity(pr29db, "", "Oslo", 5).length, 0,
+    "pr29: empty agentId → empty array");
+  assertEq(seo29.getRelatedBySameCategory(pr29db, "a-self", "", null, 5).length, 0,
+    "pr29: empty primaryCategory → empty array");
+
+  // Test 9: integration — the producer route actually wires in these helpers
+  const fs29 = require("fs");
+  const seoSrc = fs29.readFileSync("src/routes/seo.ts", "utf8");
+  assertTrue(seoSrc.includes("getRelatedBySameCity(db, agent.id, cityName"),
+    "pr29: producer route calls getRelatedBySameCity()");
+  assertTrue(seoSrc.includes("getRelatedBySameCategory(db, agent.id, primaryCategory"),
+    "pr29: producer route calls getRelatedBySameCategory()");
+  assertTrue(seoSrc.includes("RELATED_PRODUCERS_CSS"),
+    "pr29: producer route includes the RELATED_PRODUCERS_CSS bundle");
+  assertTrue(seoSrc.includes("PR-29 anchor"),
+    "pr29: anchor comment present (helps PR-30 merge avoid conflicts)");
+
+  pr29db.close();
+}
+
 
 // ── REPORT ────────────────────────────────────────────────────────────
+
 // Wait for the M2 owner-portal async tests before reporting so their
 // pass/fail counts are included. (Pre-existing async integration tests
 // run without await per their original design; swallowed errors there
