@@ -36,10 +36,25 @@
 //   - Untouched fields preserve existing provenance.
 //   - Untouched columns (about, products, ...) preserve existing values.
 //
+// PR-28 (2026-05-11): defensive handling of malformed existing
+// field_provenance. The phase51_backfill_provenance_v1 migration writes
+// records WITHOUT a `value` field (only source_type/source_url/
+// confidence/fetched_at). phase53_provenance_to_array_v1 then wraps
+// those legacy single-objects in a 1-element array. When this route
+// loaded such an entry and called `mergeFieldProvenance` → `dedupKey`,
+// `rec.value.trim()` threw on `undefined.trim()`, the error escaped the
+// route's try/catch (which only wrapped tx()), and express's default
+// handler returned plain-HTML 500 — breaking enrichment for address/
+// phone on any agent touched by the back-catalogue migrations. We now
+// (1) skip malformed records on the way in, (2) guard dedupKey against
+// undefined, and (3) wrap mergeFieldProvenance + parse in try/catch so
+// any unexpected shape returns a 500 JSON instead of crashing express.
+//
 // Auth: X-Admin-Key (same pattern as admin-outreach-pool).
 //
 // Reference:
 //   - PR-23: parallel backfill for stranded back-catalogue (different file).
+//   - PR-28: this defensive-coding fix.
 //   - WO-16: source of the cross-source gate.
 //   - scheduled-agents/lokal-agent-enrichment-field-provenance-addendum.md
 //     (A2A repo) — SKILL update that makes use of this endpoint.
@@ -119,13 +134,39 @@ function extractSources(entry: IncomingFieldEntry): IncomingSource[] {
 // per-field (phone strips +47 etc), but for dedup purposes the raw
 // `${source_type}::${value.trim()}` pair is precise enough to avoid
 // double-counting on repeat enrichment runs.
-function dedupKey(rec: ProvenanceRecord): string {
-  return `${rec.source_type}::${rec.value.trim()}`;
+//
+// PR-28: tolerates malformed records — if value or source_type is
+// missing/non-string, returns null. Callers MUST treat null as "skip
+// this record" (don't add to seen-set, don't include in output).
+export function dedupKey(rec: ProvenanceRecord | null | undefined): string | null {
+  if (!rec || typeof rec !== "object") return null;
+  const st = rec.source_type;
+  const v = rec.value;
+  if (typeof st !== "string" || st.length === 0) return null;
+  if (typeof v !== "string") return null;
+  return `${st}::${v.trim()}`;
+}
+
+// PR-28: a record loaded from disk is "well-formed" only if both
+// source_type and value are non-empty strings. Anything else is dropped
+// before the merge so the rest of the merge pipeline can assume the
+// invariant. Mirrors the validator's downstream filter.
+function isWellFormedRecord(r: unknown): r is ProvenanceRecord {
+  if (!r || typeof r !== "object") return false;
+  const o = r as Record<string, unknown>;
+  if (typeof o.source_type !== "string" || o.source_type.trim().length === 0) return false;
+  if (typeof o.value !== "string" || o.value.trim().length === 0) return false;
+  return true;
 }
 
 /**
  * Merge an incoming field_provenance payload into an existing on-disk
  * field_provenance object. Pure function — exported for unit-testing.
+ *
+ * PR-28: malformed existing records (missing value or source_type — as
+ * produced by the phase51 backfill migration) are filtered out instead
+ * of being carried forward. The route handler will overwrite the column
+ * with the cleaned shape on the next provenance write.
  *
  * @param existing parsed JSON from agent_knowledge.field_provenance (may be {})
  * @param incoming wire-shape payload (wrapped or flat per field)
@@ -136,27 +177,41 @@ export function mergeFieldProvenance(
   incoming: IncomingProvenance,
 ): Record<string, ProvenanceRecord[]> {
   // Start from a shallow copy of existing — coerce legacy single-record
-  // shape into arrays so the merge logic below has one code path.
+  // shape into arrays, then drop malformed entries (PR-28 defensive
+  // coding for back-catalogue rows from phase51 backfill).
   const out: Record<string, ProvenanceRecord[]> = {};
   for (const [field, val] of Object.entries(existing)) {
+    let arr: unknown[];
     if (Array.isArray(val)) {
-      out[field] = (val as ProvenanceRecord[]).slice();
+      arr = val.slice();
     } else if (val && typeof val === "object") {
       // Legacy single-record shape (pre-WO-16) → wrap in array.
-      out[field] = [val as ProvenanceRecord];
+      arr = [val];
+    } else {
+      // null / primitives → drop (mirrors validator behaviour).
+      continue;
     }
-    // null / primitives → drop (mirrors validator behaviour).
+    // PR-28: filter out malformed records before they reach dedupKey.
+    out[field] = arr.filter(isWellFormedRecord);
   }
 
   for (const [field, entry] of Object.entries(incoming)) {
     const incomingSources = extractSources(entry);
     if (incomingSources.length === 0) continue;
     const existingForField = out[field] ?? [];
-    const seen = new Set(existingForField.map(dedupKey));
+    // Seed seen-set from well-formed existing records. dedupKey now
+    // returns null on malformed inputs — they were already filtered
+    // above, but the null-guard keeps belt-and-braces.
+    const seen = new Set<string>();
+    for (const r of existingForField) {
+      const k = dedupKey(r);
+      if (k !== null) seen.add(k);
+    }
     for (const s of incomingSources) {
       const rec = normaliseSource(s);
       if (!rec) continue;
       const key = dedupKey(rec);
+      if (key === null) continue;
       if (seen.has(key)) continue;
       seen.add(key);
       existingForField.push(rec);
@@ -222,6 +277,9 @@ router.put("/", (req: Request, res: Response) => {
     columnUpdates.push({ col: "opening_hours", val: JSON.stringify(body.openingHours) });
 
   // ── Build the field_provenance piece ──────────────────────────────────
+  // PR-28: wrap merge in try/catch so an unexpected on-disk shape returns
+  // a structured 500 JSON instead of letting the throw escape to express's
+  // default HTML handler.
   let provenanceMerged: Record<string, ProvenanceRecord[]> | null = null;
   if (body.field_provenance && typeof body.field_provenance === "object") {
     const existingRow = db
@@ -236,7 +294,15 @@ router.put("/", (req: Request, res: Response) => {
         existing = {};
       }
     }
-    provenanceMerged = mergeFieldProvenance(existing, body.field_provenance);
+    try {
+      provenanceMerged = mergeFieldProvenance(existing, body.field_provenance);
+    } catch (mergeErr: any) {
+      res.status(500).json({
+        error: "field_provenance_merge_failed",
+        detail: mergeErr?.message ?? String(mergeErr),
+      });
+      return;
+    }
   }
 
   // ── Apply ─────────────────────────────────────────────────────────────
