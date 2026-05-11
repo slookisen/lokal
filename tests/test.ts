@@ -2151,6 +2151,52 @@ console.log("\n── cross-source-validator: PR-19 verdict split ──");
     "pr19: all pool_eligible → agent pool_eligible");
 }
 
+// ── PR-26 (2026-05-11): business_status no longer gates pool eligibility ────
+
+// V10. PR-26: business_status review_required does NOT tank the agent
+{
+  const perField: Record<string, CrossSourceResult> = {
+    address: { agree: true, source_count: 2, sources_used: ["google_places","homepage"], verdict: "pool_eligible" },
+    phone:   { agree: true, source_count: 2, sources_used: ["google_places","homepage"], verdict: "pool_eligible" },
+    business_status: { agree: false, source_count: 1, sources_used: ["google_places"], verdict: "review_required" },
+  };
+  assertEq(aggregateVerdict(perField), "pool_eligible",
+    "pr26: address+phone pool_eligible, business_status review_required → pool_eligible (business_status ignored)");
+}
+
+// V11. PR-26: address review_required still gates
+{
+  const perField: Record<string, CrossSourceResult> = {
+    address: { agree: false, source_count: 1, sources_used: ["homepage"], verdict: "review_required" },
+    phone:   { agree: true, source_count: 2, sources_used: ["google_places","homepage"], verdict: "pool_eligible" },
+    business_status: { agree: true, source_count: 2, sources_used: ["google_places","homepage"], verdict: "pool_eligible" },
+  };
+  assertEq(aggregateVerdict(perField), "review_required",
+    "pr26: address review_required → agent review_required (address still gates)");
+}
+
+// V12. PR-26: phone review_required still gates
+{
+  const perField: Record<string, CrossSourceResult> = {
+    address: { agree: true, source_count: 2, sources_used: ["google_places","homepage"], verdict: "pool_eligible" },
+    phone:   { agree: false, source_count: 1, sources_used: ["homepage"], verdict: "review_required" },
+    business_status: { agree: true, source_count: 2, sources_used: ["google_places","homepage"], verdict: "pool_eligible" },
+  };
+  assertEq(aggregateVerdict(perField), "review_required",
+    "pr26: phone review_required → agent review_required (phone still gates)");
+}
+
+// V13. PR-26: data_insufficient on address still wins over phone pool_eligible
+{
+  const perField: Record<string, CrossSourceResult> = {
+    address: { agree: false, source_count: 0, sources_used: [], verdict: "data_insufficient" },
+    phone:   { agree: true, source_count: 2, sources_used: ["google_places","homepage"], verdict: "pool_eligible" },
+    business_status: { agree: true, source_count: 2, sources_used: ["google_places","homepage"], verdict: "pool_eligible" },
+  };
+  assertEq(aggregateVerdict(perField), "data_insufficient",
+    "pr26: address data_insufficient → agent data_insufficient (worst-bucket still wins for gating fields)");
+}
+
 // V9. deriveVerificationStatus end-to-end with new verdict types
 {
   const { deriveVerificationStatus } = require("../src/agents/lokal-agent-verifier");
