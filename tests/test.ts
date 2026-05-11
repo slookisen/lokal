@@ -3398,6 +3398,231 @@ console.log("\n── PR-23: field_provenance backfill ──");
 
 
 
+// ── PR-25 (2026-05-11): relax homepage-source backfill condition ──
+console.log("\n── PR-25: relaxed homepage-source backfill ──");
+{
+  const SqlDb = require("better-sqlite3");
+  const bdb = new SqlDb(":memory:");
+
+  bdb.exec(`
+    CREATE TABLE agents (
+      id TEXT PRIMARY KEY,
+      name TEXT NOT NULL DEFAULT '',
+      url TEXT,
+      is_active INTEGER DEFAULT 1
+    );
+    CREATE TABLE agent_knowledge (
+      agent_id TEXT PRIMARY KEY REFERENCES agents(id),
+      address TEXT,
+      phone TEXT,
+      about TEXT,
+      url_last_status INTEGER,
+      last_enriched_at TEXT,
+      field_provenance TEXT DEFAULT '{}',
+      verification_status TEXT DEFAULT 'unverified'
+    );
+    CREATE TABLE migrations (name TEXT PRIMARY KEY, applied_at TEXT DEFAULT (datetime('now')));
+  `);
+
+  const longAbout = "Vi er en familieeid gård i Hokksund som har drevet økologisk landbruk siden 1997. " +
+                    "Hovedfokuset er ferske grønnsaker, gårdsegg og hjemmelaget syltetøy. " +
+                    "Velkommen innom mandag til lørdag.";
+
+  const seed = (id: string, agentUrl: string | null, k: Record<string, any>) => {
+    bdb.prepare("INSERT INTO agents (id, name, url, is_active) VALUES (?, ?, ?, ?)")
+      .run(id, id, agentUrl, k.is_active ?? 1);
+    bdb.prepare(`INSERT INTO agent_knowledge
+      (agent_id, address, phone, about, url_last_status, last_enriched_at, field_provenance, verification_status)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)`).run(
+        id,
+        k.address ?? null,
+        k.phone ?? null,
+        k.about ?? null,
+        k.url_last_status ?? null,
+        k.last_enriched_at ?? null,
+        k.field_provenance ?? "{}",
+        k.verification_status ?? "data_insufficient"
+      );
+  };
+
+  const stamp = "2026-04-15T10:00:00Z";
+
+  // Scenario A: post-PR-23 state — only google_places source was written
+  // (PR-23 skipped homepage because url_last_status was NULL). PR-25 must
+  // add a homepage source on address, phone, and business_status.
+  seed("pr25-google-only", "https://example1.no", {
+    address: "Haugerudveien 17, 3302 Hokksund",
+    phone: "+4791193602",
+    about: longAbout,
+    url_last_status: null, // <-- the bug condition PR-25 fixes
+    last_enriched_at: stamp,
+    field_provenance: JSON.stringify({
+      address: [{ value: "Haugerudveien 17, 3302 Hokksund", source_type: "google_places", fetched_at: stamp }],
+      phone:   [{ value: "+4791193602", source_type: "google_places", fetched_at: stamp }],
+      business_status: [{ value: "active", source_type: "google_places", fetched_at: stamp }],
+    }),
+  });
+
+  // Scenario B: agent that PR-23 didn't touch (field_provenance empty) — PR-25 must skip.
+  seed("pr25-empty-prov", "https://example2.no", {
+    address: "Norderhovgata 5",
+    phone: "+4792000000",
+    about: longAbout,
+    url_last_status: null,
+    last_enriched_at: stamp,
+    field_provenance: "{}",
+  });
+
+  // Scenario C: already has homepage source — PR-25 must skip via WHERE LIKE.
+  seed("pr25-already-homepage", "https://example3.no", {
+    address: "Storgata 1",
+    phone: "+4793000000",
+    about: longAbout,
+    url_last_status: 200,
+    last_enriched_at: stamp,
+    field_provenance: JSON.stringify({
+      address: [
+        { value: "Storgata 1", source_type: "homepage", fetched_at: stamp },
+        { value: "Storgata 1", source_type: "google_places", fetched_at: stamp },
+      ],
+      phone: [
+        { value: "+4793000000", source_type: "homepage", fetched_at: stamp },
+        { value: "+4793000000", source_type: "google_places", fetched_at: stamp },
+      ],
+      business_status: [
+        { value: "active", source_type: "homepage", fetched_at: stamp },
+        { value: "active", source_type: "google_places", fetched_at: stamp },
+      ],
+    }),
+  });
+
+  // Scenario D: no agent.url — PR-25 must skip (homepage claim needs a URL).
+  seed("pr25-no-url", null, {
+    address: "Brutt gate 2",
+    phone: "+4794000000",
+    about: longAbout,
+    url_last_status: null,
+    last_enriched_at: stamp,
+    field_provenance: JSON.stringify({
+      address: [{ value: "Brutt gate 2", source_type: "google_places", fetched_at: stamp }],
+    }),
+  });
+
+  // Scenario E: about too short — PR-25 must skip (no rich text to attest a homepage).
+  seed("pr25-thin-about", "https://example5.no", {
+    address: "Tynn vei 3",
+    phone: "+4795000000",
+    about: "thin",
+    url_last_status: null,
+    last_enriched_at: stamp,
+    field_provenance: JSON.stringify({
+      address: [{ value: "Tynn vei 3", source_type: "google_places", fetched_at: stamp }],
+    }),
+  });
+
+  // Replicate the production migration loop (pr25_backfill_homepage_source_v1)
+  const runPr25 = () => {
+    const rows = bdb.prepare(`
+      SELECT a.id AS agent_id, a.url AS agent_url,
+             k.address, k.phone, k.about, k.last_enriched_at, k.field_provenance
+        FROM agents a JOIN agent_knowledge k ON k.agent_id = a.id
+       WHERE k.field_provenance IS NOT NULL
+         AND k.field_provenance != '{}'
+         AND k.field_provenance NOT LIKE '%"homepage"%'
+         AND a.url IS NOT NULL
+         AND TRIM(a.url) != ''
+         AND LENGTH(COALESCE(k.about, '')) >= 80
+    `).all() as any[];
+
+    const upd = bdb.prepare("UPDATE agent_knowledge SET field_provenance = ? WHERE agent_id = ?");
+    let backfilled = 0;
+    let skipped = 0;
+
+    for (const r of rows) {
+      let existing: Record<string, any> = {};
+      try { existing = JSON.parse(r.field_provenance || "{}"); } catch { existing = {}; }
+
+      const ts = r.last_enriched_at || new Date().toISOString();
+      const addrValue = ((r.address ?? "").trim() || null) as string | null;
+      const phoneValue = ((r.phone ?? "").trim() || null) as string | null;
+      const bizValue: string | null = null;
+
+      const mergeField = (field: string, value: string | null) => {
+        const cur = existing[field];
+        let arr: any[] = Array.isArray(cur) ? cur : (cur && typeof cur === "object" ? [cur] : []);
+        const dup = arr.some(rec => rec.source_type === "homepage" && (rec.value ?? null) === value);
+        if (!dup) {
+          arr.push({ value, source_type: "homepage", fetched_at: ts });
+          existing[field] = arr;
+        }
+      };
+
+      let touched = false;
+      if ("address" in existing) { mergeField("address", addrValue); touched = true; }
+      if ("phone" in existing) { mergeField("phone", phoneValue); touched = true; }
+      if ("business_status" in existing) { mergeField("business_status", bizValue); touched = true; }
+
+      if (!touched) { skipped++; continue; }
+
+      upd.run(JSON.stringify(existing), r.agent_id);
+      backfilled++;
+    }
+    return { backfilled, skipped, scanned: rows.length };
+  };
+
+  const r1 = runPr25();
+
+  // ── Unit Test 1: pr25-google-only → now has 2 sources (google_places + homepage) ──
+  const g = JSON.parse((bdb.prepare("SELECT field_provenance FROM agent_knowledge WHERE agent_id='pr25-google-only'").get() as any).field_provenance);
+  assertTrue(Array.isArray(g.address) && g.address.length === 2, "pr25: google-only → 2 sources on address after backfill");
+  const gSrc = new Set(g.address.map((x: any) => x.source_type));
+  assertTrue(gSrc.has("google_places") && gSrc.has("homepage"), "pr25: google-only → both google_places and homepage on address");
+  assertTrue(Array.isArray(g.phone) && g.phone.length === 2, "pr25: google-only → 2 sources on phone");
+  assertTrue(Array.isArray(g.business_status) && g.business_status.length === 2, "pr25: google-only → 2 sources on business_status");
+  // Shape check on the new entry
+  const homeAddr = g.address.find((x: any) => x.source_type === "homepage");
+  assertTrue(homeAddr && typeof homeAddr.value === "string" && typeof homeAddr.fetched_at === "string",
+    "pr25: homepage entry has {value, source_type, fetched_at} shape");
+
+  // ── Unit Test 2: pr25-empty-prov → field_provenance stays '{}' (PR-23 skipped, so PR-25 skips too) ──
+  const eRow = (bdb.prepare("SELECT field_provenance FROM agent_knowledge WHERE agent_id='pr25-empty-prov'").get() as any).field_provenance;
+  assertEq(eRow, "{}", "pr25: empty-prov → field_provenance untouched (PR-23 didn't touch it either)");
+
+  // ── Unit Test 3: idempotent — running PR-25 twice doesn't duplicate ──
+  const r2 = runPr25();
+  assertEq(r2.scanned, 0, "pr25: second run → 0 rows scanned (WHERE filters out already-homepage'd rows)");
+  const gAfter2 = JSON.parse((bdb.prepare("SELECT field_provenance FROM agent_knowledge WHERE agent_id='pr25-google-only'").get() as any).field_provenance);
+  assertTrue(gAfter2.address.length === 2, "pr25: idempotent — address still has exactly 2 sources after re-run");
+  assertTrue(gAfter2.phone.length === 2, "pr25: idempotent — phone still has exactly 2 sources after re-run");
+  assertTrue(gAfter2.business_status.length === 2, "pr25: idempotent — business_status still has exactly 2 sources after re-run");
+
+  // Sanity: pre-existing homepage row was untouched (WHERE excluded it from r1)
+  const aH = JSON.parse((bdb.prepare("SELECT field_provenance FROM agent_knowledge WHERE agent_id='pr25-already-homepage'").get() as any).field_provenance);
+  assertEq(aH.address.length, 2, "pr25: already-homepage → untouched (still 2 sources)");
+
+  // Sanity: no-url row stays at 1 source
+  const aN = JSON.parse((bdb.prepare("SELECT field_provenance FROM agent_knowledge WHERE agent_id='pr25-no-url'").get() as any).field_provenance);
+  assertEq(aN.address.length, 1, "pr25: no-url → untouched (still 1 source)");
+
+  // Sanity: thin-about row stays at 1 source
+  const aT = JSON.parse((bdb.prepare("SELECT field_provenance FROM agent_knowledge WHERE agent_id='pr25-thin-about'").get() as any).field_provenance);
+  assertEq(aT.address.length, 1, "pr25: thin-about → untouched (still 1 source)");
+
+  // First-run counts
+  assertEq(r1.backfilled, 1, "pr25: first run backfilled == 1 (only pr25-google-only)");
+  assertEq(r1.scanned, 1, "pr25: first run scanned == 1");
+
+  // ── Source-presence: migration block landed in init.ts ──
+  const fs = require("fs");
+  const initSrc = fs.readFileSync("src/database/init.ts", "utf8");
+  assertTrue(initSrc.includes("pr25_backfill_homepage_source_v1"), "pr25: migration name present in init.ts");
+  assertTrue(initSrc.includes("[migration:pr25] DONE"), "pr25: migration DONE log present in init.ts");
+  assertTrue(initSrc.includes("[migration:pr25] backfilled"), "pr25: migration progress log present in init.ts");
+
+  bdb.close();
+}
+
+
 // ── REPORT ────────────────────────────────────────────────────────────
 // Wait for the M2 owner-portal async tests before reporting so their
 // pass/fail counts are included. (Pre-existing async integration tests

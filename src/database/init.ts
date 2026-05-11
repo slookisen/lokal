@@ -1404,6 +1404,142 @@ function initSchema(db: Database.Database): void {
     console.error("Migration pr23_backfill_field_provenance_v1 failed:", err);
   }
 
+  // ─── PR-25 (2026-05-11): relax homepage-source backfill condition ───────
+  // Hot-fix on top of PR-23. Background: PR-23 only added the homepage
+  // source when url_last_status BETWEEN 200-399. The link-freshness probe
+  // (PR-22) had only backfilled url_last_status for the 129 agents already
+  // in the pool — leaving ~1271 stranded agents with NULL url_last_status.
+  // Net effect: ~450+ agents with rich Google Places ratings ended up with
+  // only google_places (source_count=1 → review_required) even though they
+  // also have a homepage URL + rich about-text that the homepage scraper
+  // already produced.
+  //
+  // PR-25 adds a homepage source for the SAME set of agents PR-23 already
+  // touched, with a RELAXED condition: drop the url_last_status check. We
+  // still require:
+  //   - agent.url is non-empty (so a "homepage source" claim is meaningful)
+  //   - about >= 80 chars (same rich-text threshold PR-23 used to justify
+  //     trusting the homepage as a source)
+  //
+  // The migration only touches rows where PR-23 already produced a non-empty
+  // field_provenance, and skips rows where 'homepage' is already recorded
+  // (idempotency safeguard — also lets us re-run safely).
+  //
+  // Source entry shape is the SAME PR-23 used: {value, source_type, fetched_at}.
+  // The validator collapses duplicate values into one agreement group, so
+  // having homepage + google_places agreeing on address/phone → pool_eligible.
+  //
+  // Idempotent — guarded by the migrations table AND by an in-row check.
+  try {
+    const alreadyRan = db.prepare(
+      "SELECT 1 FROM migrations WHERE name = 'pr25_backfill_homepage_source_v1'"
+    ).get();
+    if (!alreadyRan) {
+      const rows = db.prepare(`
+        SELECT a.id           AS agent_id,
+               a.url          AS agent_url,
+               k.address      AS address,
+               k.phone        AS phone,
+               k.about        AS about,
+               k.last_enriched_at AS last_enriched_at,
+               k.field_provenance AS field_provenance
+          FROM agents a
+          JOIN agent_knowledge k ON k.agent_id = a.id
+         WHERE k.field_provenance IS NOT NULL
+           AND k.field_provenance != '{}'
+           AND k.field_provenance NOT LIKE '%"homepage"%'
+           AND a.url IS NOT NULL
+           AND TRIM(a.url) != ''
+           AND LENGTH(COALESCE(k.about, '')) >= 80
+      `).all() as Array<{
+        agent_id: string;
+        agent_url: string | null;
+        address: string | null;
+        phone: string | null;
+        about: string | null;
+        last_enriched_at: string | null;
+        field_provenance: string | null;
+      }>;
+
+      const upd = db.prepare(
+        "UPDATE agent_knowledge SET field_provenance = ? WHERE agent_id = ?"
+      );
+
+      let backfilled = 0;
+      let skipped = 0;
+      const scanned = rows.length;
+
+      const CHUNK = 100;
+      type Row = (typeof rows)[number];
+
+      const runChunk = db.transaction((batch: Row[]) => {
+        for (const r of batch) {
+          let existing: Record<string, unknown> = {};
+          if (r.field_provenance) {
+            try { existing = JSON.parse(r.field_provenance) as Record<string, unknown>; } catch { existing = {}; }
+          }
+
+          const stamp = r.last_enriched_at || new Date().toISOString();
+          const addrValue = ((r.address ?? "").trim() || null) as string | null;
+          const phoneValue = ((r.phone ?? "").trim() || null) as string | null;
+          // business_status: we don't have is_active in this SELECT (and
+          // PR-23 already wrote a value); use null so the entry attests
+          // presence-of-source without overriding the captured value.
+          const bizValue: string | null = null;
+
+          // Merge: dedupe by {source_type, value} so re-running is safe.
+          const mergeField = (field: string, value: string | null) => {
+            const cur = existing[field];
+            let arr: Array<Record<string, unknown>>;
+            if (Array.isArray(cur)) {
+              arr = cur as Array<Record<string, unknown>>;
+            } else if (cur && typeof cur === "object") {
+              arr = [cur as Record<string, unknown>];
+            } else {
+              arr = [];
+            }
+            const dup = arr.some(rec =>
+              (rec.source_type as string | undefined) === "homepage"
+              && ((rec.value as string | null | undefined) ?? null) === value
+            );
+            if (!dup) {
+              arr.push({ value, source_type: "homepage", fetched_at: stamp });
+              existing[field] = arr;
+            }
+          };
+
+          let touched = false;
+          // Only merge fields PR-23 already has an entry for, to stay
+          // strictly additive within the agent's existing field set.
+          if ("address" in existing) { mergeField("address", addrValue); touched = true; }
+          if ("phone" in existing) { mergeField("phone", phoneValue); touched = true; }
+          if ("business_status" in existing) { mergeField("business_status", bizValue); touched = true; }
+
+          if (!touched) {
+            skipped++;
+            continue;
+          }
+
+          upd.run(JSON.stringify(existing), r.agent_id);
+          backfilled++;
+
+          if (backfilled > 0 && backfilled % 200 === 0) {
+            console.log(`[migration:pr25] backfilled ${backfilled} agents`);
+          }
+        }
+      });
+
+      for (let i = 0; i < rows.length; i += CHUNK) {
+        runChunk(rows.slice(i, i + CHUNK));
+      }
+
+      db.prepare("INSERT INTO migrations (name) VALUES ('pr25_backfill_homepage_source_v1')").run();
+      console.log(`[migration:pr25] DONE: backfilled ${backfilled} / scanned ${scanned} / skipped ${skipped} (no PR-23 field entries)`);
+    }
+  } catch (err) {
+    console.error("Migration pr25_backfill_homepage_source_v1 failed:", err);
+  }
+
 
 }
 
