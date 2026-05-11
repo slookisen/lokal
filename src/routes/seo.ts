@@ -2085,6 +2085,157 @@ function findProducerMatches(
   return { suggestions: scored.slice(0, 6).map((s) => s.agent) };
 }
 
+// ─── PR-29: related-producers data access ───────────────────
+//
+// Why direct SQL instead of filtering getActiveAgents() in memory:
+//   1. We need the agent_knowledge.about column for the preview snippet,
+//      which marketplaceRegistry doesn't surface on the cached agent objects.
+//   2. We want verified/rich agents to bubble up first, and that signal lives
+//      on agent_knowledge — joining at the DB layer keeps the ranking honest
+//      even when the marketplace cache is cold.
+//   3. RANDOM() at the SQL layer gives each request a different slice of the
+//      "good enough" pool, which spreads internal-link juice across more
+//      producer pages over time (the actual SEO goal of this PR).
+//
+// Both queries deliberately use plain LIKE on categories (a JSON-encoded TEXT
+// column) rather than a JSON1 extension call — better-sqlite3 ships JSON1 by
+// default but we keep the query portable for any future migrate-to-Postgres.
+export interface RelatedProducerRow {
+  id: string;
+  name: string;
+  city: string | null;
+  about: string | null;
+  description: string | null;
+  categories: string | null;
+  verification_status: string | null;
+  enrichment_status: string | null;
+}
+
+export function getRelatedBySameCity(
+  db: any,
+  agentId: string,
+  cityName: string,
+  limit: number = 5,
+): RelatedProducerRow[] {
+  if (!cityName || !agentId) return [];
+  // Ordering rationale:
+  //   verified DESC → trusted producers first (matches search rank logic)
+  //   rich DESC    → producers with full data render the best preview
+  //   RANDOM()     → break ties without favouring alphabetical order
+  // is_active = 1 keeps the city block in sync with the live registry.
+  return db.prepare(`
+    SELECT a.id, a.name, a.city, a.description, a.categories,
+           k.about, k.verification_status, k.enrichment_status
+    FROM agents a
+    LEFT JOIN agent_knowledge k ON k.agent_id = a.id
+    WHERE a.city = ?
+      AND a.id != ?
+      AND a.is_active = 1
+      AND a.role = 'producer'
+    ORDER BY
+      CASE WHEN k.verification_status = 'verified' THEN 0 ELSE 1 END,
+      CASE WHEN k.enrichment_status = 'rich' THEN 0
+           WHEN k.enrichment_status = 'partial' THEN 1
+           ELSE 2 END,
+      RANDOM()
+    LIMIT ?
+  `).all(cityName, agentId, limit) as RelatedProducerRow[];
+}
+
+export function getRelatedBySameCategory(
+  db: any,
+  agentId: string,
+  primaryCategory: string,
+  excludeCity: string | null,
+  limit: number = 5,
+): RelatedProducerRow[] {
+  if (!primaryCategory || !agentId) return [];
+  // categories is stored as a JSON array like ["vegetables","eggs"].
+  // LIKE '%"<cat>"%' is the cheapest way to match a single token without
+  // false positives (e.g. "egg" vs "eggs"). The quotes are essential.
+  const needle = `%"${primaryCategory}"%`;
+  // We try to avoid duplicating the same-city block. If excludeCity is set,
+  // prefer producers from OTHER cities — surfaces the "in Norway" framing
+  // and adds geographic diversity to internal links. If we run out of
+  // non-same-city producers we still fall back to same-city (covered by the
+  // ORDER BY tiebreak below) rather than render an empty section.
+  return db.prepare(`
+    SELECT a.id, a.name, a.city, a.description, a.categories,
+           k.about, k.verification_status, k.enrichment_status
+    FROM agents a
+    LEFT JOIN agent_knowledge k ON k.agent_id = a.id
+    WHERE a.id != ?
+      AND a.is_active = 1
+      AND a.role = 'producer'
+      AND a.categories LIKE ?
+    ORDER BY
+      CASE WHEN ? IS NOT NULL AND a.city = ? THEN 1 ELSE 0 END,
+      CASE WHEN k.verification_status = 'verified' THEN 0 ELSE 1 END,
+      CASE WHEN k.enrichment_status = 'rich' THEN 0
+           WHEN k.enrichment_status = 'partial' THEN 1
+           ELSE 2 END,
+      RANDOM()
+    LIMIT ?
+  `).all(agentId, needle, excludeCity, excludeCity, limit) as RelatedProducerRow[];
+}
+
+// Format a producer description into a 1-2 sentence preview for the
+// related-producers card. We split on sentence-ending punctuation and
+// take up to two sentences, capped at ~180 chars so the card height
+// stays predictable on mobile.
+export function formatRelatedPreview(text: string | null | undefined, maxChars: number = 180): string {
+  if (!text) return "";
+  const cleaned = String(text).replace(/\s+/g, " ").trim();
+  if (!cleaned) return "";
+  // Match one or two sentences ending in . ! ? — fall back to char-cap.
+  const sentenceMatch = cleaned.match(/^[^.!?]+[.!?](?:\s+[^.!?]+[.!?])?/);
+  let preview = sentenceMatch ? sentenceMatch[0] : cleaned;
+  if (preview.length > maxChars) {
+    preview = preview.slice(0, maxChars - 1).replace(/\s+\S*$/, "") + "…";
+  }
+  return preview;
+}
+
+export function renderRelatedSection(
+  rows: RelatedProducerRow[],
+  heading: string,
+  lang: Lang = "no",
+): string {
+  if (!rows.length) return "";
+  const items = rows.map((r) => {
+    const slug = slugify(r.name);
+    const preview = formatRelatedPreview(r.description || r.about, 180);
+    const cityLabel = r.city ? escapeHtml(r.city) : "";
+    return `<a href="${localizedPath("/produsent/" + slug, lang)}" class="rp-card">
+      <div class="rp-name">${escapeHtml(r.name)}</div>
+      ${cityLabel ? `<div class="rp-city">&#128205; ${cityLabel}</div>` : ""}
+      ${preview ? `<p class="rp-preview"${lang === "en" ? ' lang="nb"' : ""}>${escapeHtml(preview)}</p>` : ""}
+    </a>`;
+  }).join("");
+  return `<section class="rp-sec" aria-labelledby="rp-${slugify(heading)}">
+    <h2 class="rp-h" id="rp-${slugify(heading)}">${escapeHtml(heading)}</h2>
+    <div class="rp-grid">${items}</div>
+  </section>`;
+}
+
+// CSS for the PR-29 related-producers sections. Lightweight, reuses the
+// shared --green-* tokens, and is appended to PROFILE_CSS only on the
+// producer page so other routes don't pay the byte cost.
+export const RELATED_PRODUCERS_CSS = `
+  .rp-sec { max-width: 1080px; margin: 32px auto 0; padding: 0 24px; }
+  .rp-h { font-size: 1.2rem; font-weight: 700; color: var(--green-700); margin-bottom: 14px; letter-spacing: -0.2px; }
+  .rp-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(240px, 1fr)); gap: 12px; }
+  .rp-card { display: block; padding: 14px 16px; background: var(--green-50); border: 1px solid var(--green-100); border-radius: var(--r-md); color: var(--charcoal); text-decoration: none; transition: all 0.15s; }
+  .rp-card:hover { background: var(--white); border-color: var(--green-700); transform: translateY(-1px); box-shadow: var(--shadow-sm); text-decoration: none; }
+  .rp-name { font-weight: 700; color: var(--green-700); font-size: 0.95rem; margin-bottom: 4px; }
+  .rp-city { font-size: 0.78rem; color: var(--g500); margin-bottom: 6px; }
+  .rp-preview { font-size: 0.82rem; color: var(--g700); line-height: 1.5; margin: 0; }
+  @media (max-width: 560px) {
+    .rp-sec { padding: 0 16px; margin-top: 24px; }
+    .rp-grid { grid-template-columns: 1fr; }
+  }
+`;
+
 router.get("/produsent/:slug", (req: Request, res: Response) => {
   const lang = req.lang;
   const slug = (req.params.slug as string).toLowerCase();
@@ -2497,6 +2648,37 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
          </div>`
       : "";
 
+    // ─── PR-29: related-producers (internal-link SEO boost) ───
+    // Fetch up to 5 producers in the same city and up to 5 in the
+    // same primary category. Both queries fail-quiet — if anything
+    // goes wrong we render the page without the sections rather
+    // than 500'ing on what is supplementary content.
+    let relCitySection = "";
+    let relCategorySection = "";
+    try {
+      const db = getDb();
+      const primaryCategory = ((agent.categories as string[] | undefined) || [])[0] || "";
+      if (cityName) {
+        const cityRows = getRelatedBySameCity(db, agent.id, cityName, 5);
+        const heading = lang === "en"
+          ? `Other local food producers in ${cityName}`
+          : `Andre lokale matprodusenter i ${cityName}`;
+        relCitySection = renderRelatedSection(cityRows, heading, lang);
+      }
+      if (primaryCategory) {
+        const catRows = getRelatedBySameCategory(db, agent.id, primaryCategory, cityName || null, 5);
+        const catLabel = formatCat(primaryCategory).toLowerCase();
+        const heading = lang === "en"
+          ? `Other ${catLabel} producers in Norway`
+          : `Andre ${catLabel}-produsenter i Norge`;
+        relCategorySection = renderRelatedSection(catRows, heading, lang);
+      }
+    } catch (e) {
+      // Non-fatal — the producer page must still render. SEO sections
+      // simply won't appear, which is exactly the "hide if 0 rows" rule.
+      console.error("[seo] related-producers query failed:", e);
+    }
+
     const content = `
     <div class="bc"><a href="/">Hjem</a>${cityName ? `<span>/</span><a href="/${slugify(cityName)}">${escapeHtml(cityName)}</a>` : ""}<span>/</span>${escapeHtml(agent.name)}</div>
 
@@ -2637,6 +2819,12 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
         </div>` : ""}
       </div>
     </div>
+
+    <!-- PR-29 anchor: related-producers sections (above the closing
+         scripts; PR-30 freshness work targets head/body areas elsewhere). -->
+    ${relCitySection}
+    ${relCategorySection}
+
     <script>
       // Per-agent stats hydration. Server keeps the page cacheable; this
       // small fetch personalises the visibility tiles + AI-conversation
@@ -2708,7 +2896,7 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
       `${agent.name}${cityName ? t(lang, "producer.title_suffix", { city: cityName }) : ""}`,
       `${agent.name}${cityName ? ` ${lang === "en" ? "in" : "i"} ${cityName}` : ""}. ${agent.description || (lang === "en" ? "Local food in Norway." : "Lokalprodusert mat i Norge.")}`,
       content,
-      { canonical: `${BASE_URL}${localizedPath("/produsent/" + slug, lang)}`, jsonLd, extraCss: PROFILE_CSS, lang, pathForAlternate: "/produsent/" + slug }
+      { canonical: `${BASE_URL}${localizedPath("/produsent/" + slug, lang)}`, jsonLd, extraCss: PROFILE_CSS + RELATED_PRODUCERS_CSS, lang, pathForAlternate: "/produsent/" + slug }
     ));
   } catch (err) {
     console.error(`SEO /produsent/${slug} error:`, err);
