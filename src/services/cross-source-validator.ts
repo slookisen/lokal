@@ -223,20 +223,34 @@ function computeConflictSeverity(
   return allSame ? "minor" : "major";
 }
 
-// ─── Per-agent aggregate verdict (PR-19 / 2026-05-10) ────────────────────────
+// ─── Per-agent aggregate verdict (PR-19 / 2026-05-10, PR-26 / 2026-05-11) ────
 //
 // Given a map of field → CrossSourceResult, compute the agent-level verdict:
-//   - any field with verdict='data_insufficient' → agent is data_insufficient
-//   - else any field with verdict='review_required' → agent is review_required
-//   - else (all fields pool_eligible) → agent is pool_eligible
+//   - any gating field with verdict='data_insufficient' → agent is data_insufficient
+//   - else any gating field with verdict='review_required' → agent is review_required
+//   - else (all gating fields pool_eligible) → agent is pool_eligible
+//
+// PR-26 (2026-05-11) policy: ONLY `address` and `phone` gate pool eligibility.
+// `business_status` is intentionally excluded — it answers "is the business
+// open?" and that's a Google-Places-canonical signal that is never
+// crosscheckable against a homepage. Requiring 2-source cross-check on it
+// makes it impossible for an agent to become pool-eligible without
+// facebook/brreg data, which most Norwegian small producers don't have.
+// The cross-source value for outreach is in address + phone (the fields
+// used for delivery). business_status is still computed and surfaced in
+// CrossSourceResult outputs for review-queue display — it just doesn't gate.
 //
 // This is the gate-split logic that the verifier and the migration both need.
+const GATING_FIELDS: readonly string[] = ["address", "phone"];
+
 export function aggregateVerdict(
   perField: Record<string, CrossSourceResult>
 ): CrossSourceVerdict {
   let hasInsufficient = false;
   let hasReview = false;
-  for (const r of Object.values(perField)) {
+  for (const [field, r] of Object.entries(perField)) {
+    // PR-26: skip non-gating fields (currently business_status).
+    if (!GATING_FIELDS.includes(field)) continue;
     if (r.verdict === "data_insufficient") hasInsufficient = true;
     else if (r.verdict === "review_required") hasReview = true;
   }
