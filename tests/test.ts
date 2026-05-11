@@ -3149,6 +3149,253 @@ const _pr24Promise = (async function runPr24Tests() {
     failures.push(`✗ pr24: unexpected error: ${err instanceof Error ? err.stack || err.message : String(err)}`);
   }
 })();
+// ── PR-23 (2026-05-11): backfill field_provenance for stranded agents ──
+console.log("\n── PR-23: field_provenance backfill ──");
+{
+  const SqlDb = require("better-sqlite3");
+  const bdb = new SqlDb(":memory:");
+
+  // Build a minimal schema replicating columns the migration reads.
+  bdb.exec(`
+    CREATE TABLE agents (
+      id TEXT PRIMARY KEY,
+      name TEXT NOT NULL DEFAULT '',
+      url TEXT,
+      is_active INTEGER DEFAULT 1
+    );
+    CREATE TABLE agent_knowledge (
+      agent_id TEXT PRIMARY KEY REFERENCES agents(id),
+      address TEXT,
+      phone TEXT,
+      website TEXT,
+      about TEXT,
+      google_rating REAL,
+      google_review_count INTEGER,
+      external_links TEXT DEFAULT '[]',
+      url_last_status INTEGER,
+      last_enriched_at TEXT,
+      field_provenance TEXT DEFAULT '{}',
+      verification_status TEXT DEFAULT 'unverified'
+    );
+    CREATE TABLE migrations (name TEXT PRIMARY KEY, applied_at TEXT DEFAULT (datetime('now')));
+  `);
+
+  // Seed
+  const seed = (id: string, agent: Record<string, any>, k: Record<string, any>) => {
+    bdb.prepare("INSERT INTO agents (id, name, url, is_active) VALUES (?, ?, ?, ?)")
+      .run(id, agent.name ?? id, agent.url ?? null, agent.is_active ?? 1);
+    bdb.prepare(`
+      INSERT INTO agent_knowledge
+        (agent_id, address, phone, website, about, google_rating, google_review_count,
+         external_links, url_last_status, last_enriched_at, field_provenance, verification_status)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+      .run(
+        id,
+        k.address ?? null,
+        k.phone ?? null,
+        k.website ?? null,
+        k.about ?? null,
+        k.google_rating ?? null,
+        k.google_review_count ?? null,
+        k.external_links ?? "[]",
+        k.url_last_status ?? null,
+        k.last_enriched_at ?? null,
+        k.field_provenance ?? "{}",
+        k.verification_status ?? "unverified"
+      );
+  };
+
+  // a-2src: homepage + google_places — both Tier-A → pool_eligible expected
+  const longAbout = "Vi er en familieeid gård i Hokksund som har drevet økologisk landbruk siden 1997. " +
+                    "Hovedfokuset er ferske grønnsaker, gårdsegg og hjemmelaget syltetøy. " +
+                    "Velkommen innom mandag til lørdag.";
+  seed("a-2src", { url: "https://example1.no", is_active: 1 }, {
+    address: "Haugerudveien 17, 3302 Hokksund",
+    phone: "+4791193602",
+    website: "https://example1.no",
+    about: longAbout,
+    google_rating: 4.7,
+    google_review_count: 28,
+    url_last_status: 200,
+    last_enriched_at: "2026-04-15T10:00:00Z",
+    verification_status: "data_insufficient",
+  });
+
+  // a-1src: homepage only — single Tier-A → review_required expected
+  seed("a-1src", { url: "https://example2.no", is_active: 1 }, {
+    address: "Norderhovgata 5, 3511 Hønefoss",
+    phone: "+4792000000",
+    website: "https://example2.no",
+    about: longAbout,
+    url_last_status: 200,
+    last_enriched_at: "2026-04-15T10:00:00Z",
+    verification_status: "pending_verify",
+  });
+
+  // a-empty: no usable signals → skipped (no url-status, no google, no facebook)
+  seed("a-empty", { url: null, is_active: 1 }, {
+    address: null,
+    phone: null,
+    about: "thin",
+    verification_status: "unverified",
+  });
+
+  // a-fb: homepage + facebook_official_page (no google rating)
+  seed("a-fb", { url: "https://example3.no", is_active: 1 }, {
+    address: "Storgata 1, 0155 Oslo",
+    phone: "+4793000000",
+    website: "https://example3.no",
+    about: longAbout,
+    external_links: JSON.stringify([
+      { label: "Facebook", url: "https://facebook.com/example3", type: "facebook" }
+    ]),
+    url_last_status: 200,
+    last_enriched_at: "2026-04-15T10:00:00Z",
+    verification_status: "data_insufficient",
+  });
+
+  // a-verified: already in pool → must be skipped
+  seed("a-verified", { url: "https://verified.no", is_active: 1 }, {
+    address: "Verified vei 1",
+    phone: "+4794000000",
+    google_rating: 4.5,
+    url_last_status: 200,
+    verification_status: "verified",
+  });
+
+  // a-broken-url: homepage signal blocked by url_last_status=500
+  seed("a-broken-url", { url: "https://broken.no", is_active: 1 }, {
+    address: "Brutt gate 2",
+    phone: "+4795000000",
+    about: longAbout,
+    google_rating: 4.2,
+    url_last_status: 500, // homepage NOT eligible
+    last_enriched_at: "2026-04-15T10:00:00Z",
+    verification_status: "data_insufficient",
+  });
+
+  // Replicate the production migration loop (pr23_backfill_field_provenance_v1)
+  const rows = bdb.prepare(`
+    SELECT a.id AS agent_id, a.url AS agent_url, a.is_active AS is_active,
+           k.address, k.phone, k.website, k.about, k.google_rating, k.google_review_count,
+           k.external_links, k.url_last_status, k.last_enriched_at,
+           k.field_provenance, k.verification_status
+      FROM agents a JOIN agent_knowledge k ON k.agent_id = a.id
+     WHERE k.verification_status != 'verified'
+       AND (k.field_provenance IS NULL OR k.field_provenance = '{}' OR k.field_provenance NOT LIKE '%"homepage"%')
+  `).all() as any[];
+
+  const upd = bdb.prepare("UPDATE agent_knowledge SET field_provenance = ? WHERE agent_id = ?");
+
+  let backfilled = 0;
+  let skipped = 0;
+
+  for (const r of rows) {
+    const sources: string[] = [];
+    const aboutLen = (r.about ?? "").trim().length;
+    const urlOk = typeof r.url_last_status === "number" && r.url_last_status >= 200 && r.url_last_status < 400;
+    const hasUrl = !!(r.agent_url && r.agent_url.trim()) || !!(r.website && r.website.trim());
+    if (hasUrl && urlOk && aboutLen >= 80) sources.push("homepage");
+    if (r.google_rating != null || r.google_review_count != null) sources.push("google_places");
+    if (r.external_links) {
+      try {
+        const links = JSON.parse(r.external_links);
+        if (Array.isArray(links) && links.some((l: any) => l && l.type === "facebook" && typeof l.url === "string" && l.url.length > 0)) {
+          sources.push("facebook_official_page");
+        }
+      } catch {}
+    }
+
+    if (sources.length === 0) { skipped++; continue; }
+
+    let existing: Record<string, any> = {};
+    try { existing = JSON.parse(r.field_provenance || "{}"); } catch { existing = {}; }
+
+    const stamp = r.last_enriched_at || new Date().toISOString();
+    const addrValue = (r.address ?? "").trim();
+    const phoneValue = (r.phone ?? "").trim();
+    const bizValue = r.is_active === 0 ? "closed" : "active";
+
+    const buildRecords = (v: string) => sources.map(s => ({ value: v, source_type: s, fetched_at: stamp }));
+    const mergeField = (field: string, newRecs: any[]) => {
+      const cur = existing[field];
+      let arr: any[] = Array.isArray(cur) ? cur : (cur && typeof cur === "object" ? [cur] : []);
+      const have = new Set(arr.map(x => x.source_type));
+      for (const rec of newRecs) if (!have.has(rec.source_type)) arr.push(rec);
+      if (arr.length > 0) existing[field] = arr;
+    };
+
+    if (addrValue) mergeField("address", buildRecords(addrValue));
+    if (phoneValue) mergeField("phone", buildRecords(phoneValue));
+    mergeField("business_status", buildRecords(bizValue));
+
+    upd.run(JSON.stringify(existing), r.agent_id);
+    backfilled++;
+  }
+
+  // ── Unit Test 1: a-2src (homepage + google_places) → 2 sources on address ──
+  const a2 = JSON.parse((bdb.prepare("SELECT field_provenance FROM agent_knowledge WHERE agent_id='a-2src'").get() as any).field_provenance);
+  assertTrue(Array.isArray(a2.address) && a2.address.length === 2, "pr23: a-2src → 2 sources on address");
+  const a2srcSet = new Set(a2.address.map((x: any) => x.source_type));
+  assertTrue(a2srcSet.has("homepage") && a2srcSet.has("google_places"), "pr23: a-2src → homepage+google_places");
+  assertTrue(Array.isArray(a2.phone) && a2.phone.length === 2, "pr23: a-2src → 2 sources on phone");
+  assertTrue(Array.isArray(a2.business_status) && a2.business_status.length === 2, "pr23: a-2src → 2 sources on business_status");
+
+  // Cross-source agreement should yield pool_eligible for all three fields
+  const { crossSourceAgreement, aggregateVerdict } = require("../src/services/cross-source-validator");
+  const csA2 = {
+    address: crossSourceAgreement(a2, "address"),
+    phone:   crossSourceAgreement(a2, "phone"),
+    business_status: crossSourceAgreement(a2, "business_status"),
+  };
+  assertEq(csA2.address.verdict, "pool_eligible", "pr23: a-2src address → pool_eligible");
+  assertEq(csA2.phone.verdict, "pool_eligible", "pr23: a-2src phone → pool_eligible");
+  assertEq(csA2.business_status.verdict, "pool_eligible", "pr23: a-2src business_status → pool_eligible");
+  assertEq(aggregateVerdict(csA2), "pool_eligible", "pr23: a-2src aggregate verdict → pool_eligible");
+
+  // ── Unit Test 2: a-1src (homepage only) → 1 source ──
+  const a1 = JSON.parse((bdb.prepare("SELECT field_provenance FROM agent_knowledge WHERE agent_id='a-1src'").get() as any).field_provenance);
+  assertTrue(Array.isArray(a1.address) && a1.address.length === 1, "pr23: a-1src → 1 source on address");
+  assertEq(a1.address[0].source_type, "homepage", "pr23: a-1src → only homepage recorded");
+  // Cross-source agreement → review_required (only 1 Tier-A)
+  assertEq(crossSourceAgreement(a1, "address").verdict, "review_required", "pr23: a-1src address → review_required");
+
+  // ── Unit Test 3: a-empty → skipped, field_provenance stays empty ──
+  const aE = (bdb.prepare("SELECT field_provenance FROM agent_knowledge WHERE agent_id='a-empty'").get() as any).field_provenance;
+  assertEq(aE, "{}", "pr23: a-empty → field_provenance stays empty");
+
+  // ── Unit Test 4: a-fb (homepage + facebook) → 2 sources ──
+  const aFB = JSON.parse((bdb.prepare("SELECT field_provenance FROM agent_knowledge WHERE agent_id='a-fb'").get() as any).field_provenance);
+  assertTrue(Array.isArray(aFB.address) && aFB.address.length === 2, "pr23: a-fb → 2 sources on address");
+  const fbSrcSet = new Set(aFB.address.map((x: any) => x.source_type));
+  assertTrue(fbSrcSet.has("homepage") && fbSrcSet.has("facebook_official_page"), "pr23: a-fb → homepage+facebook_official_page");
+  assertEq(crossSourceAgreement(aFB, "address").verdict, "pool_eligible", "pr23: a-fb → pool_eligible (Tier-A + Tier-B agree)");
+
+  // ── Unit Test 5: a-verified is skipped (excluded by WHERE clause) ──
+  const aV = (bdb.prepare("SELECT field_provenance FROM agent_knowledge WHERE agent_id='a-verified'").get() as any).field_provenance;
+  assertEq(aV, "{}", "pr23: a-verified (already pool) → field_provenance untouched");
+
+  // ── Unit Test 6: a-broken-url → google_places only (homepage blocked by 5xx) ──
+  const aB = JSON.parse((bdb.prepare("SELECT field_provenance FROM agent_knowledge WHERE agent_id='a-broken-url'").get() as any).field_provenance);
+  assertTrue(Array.isArray(aB.address) && aB.address.length === 1, "pr23: a-broken-url → exactly 1 source (homepage blocked by 5xx)");
+  assertEq(aB.address[0].source_type, "google_places", "pr23: a-broken-url → only google_places recorded");
+
+  // ── Integration test: counts ──
+  assertEq(backfilled, 4, "pr23: backfilled count == 4 (a-2src, a-1src, a-fb, a-broken-url)");
+  assertEq(skipped, 1, "pr23: skipped count == 1 (a-empty)");
+  // a-verified excluded by WHERE → not counted at all
+  assertEq(rows.length, 5, "pr23: scanned == 5 (excludes verified row)");
+
+  // ── Source-presence: migration block landed in init.ts ──
+  const fs = require("fs");
+  const initSrc = fs.readFileSync("src/database/init.ts", "utf8");
+  assertTrue(initSrc.includes("pr23_backfill_field_provenance_v1"), "pr23: migration name present in init.ts");
+  assertTrue(initSrc.includes("[migration:pr23] DONE"), "pr23: migration DONE log present in init.ts");
+  assertTrue(initSrc.includes("[migration:pr23] backfilled"), "pr23: migration progress log present in init.ts");
+
+  bdb.close();
+}
+
 
 
 // ── REPORT ────────────────────────────────────────────────────────────
