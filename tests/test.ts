@@ -4247,4 +4247,6 @@ console.log("── PR-29 related-producers tests ──");
     process.exit(1);
   }
   console.log("✓ all tests passed");
+  // PR-32: explicit exit prevents CI hangs from dangling handles (e.g. seo router require)
+  process.exit(0);
 })();
