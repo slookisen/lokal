@@ -940,6 +940,106 @@ if (process.env.ADMIN_NOTIFICATION_EMAIL) {
 
 Commit: `2181d9d`.
 
+### 6.5 Selger/Eier Portal — Phase 5.4a M1+M2 (May 2026)
+
+The portal is the producer-facing "owner page" — once a producer claims their agent via the Phase 6.1 flow, all subsequent profile edits happen here, not in the legacy `/selger` dashboard. M1 shipped the magic-link backend and the field-update plumbing (`127a4ce`); M2 shipped the server-rendered HTML pages (`442d551`). Two hot-fix rounds (`13594de`, `924066f`) and a CI gate fix (`372033e`) followed within 36 hours.
+
+**Files added/changed:**
+- `src/routes/owner-portal.ts` — 1196 LOC (auth + 7-field whitelist + 5 server-rendered HTML routes).
+- `src/routes/admin-agent-audit.ts` — Daniel-only audit reader, X-Admin-Key gated.
+- `src/services/email-service.ts` — new `sendOwnerMagicLink(agentName, verifyUrl)` (Norwegian Bokmål, references agent name + 7-day expiry).
+- `src/database/init.ts` — `ALTER TABLE magic_links ADD COLUMN used_at`, `CREATE TABLE agent_knowledge_audit`.
+
+**Endpoint surface:**
+
+```
+POST  /api/agents/:id/request-magic-link   — JSON, rate-limited 3/hour
+GET   /magic-link-verify?token=…           — sets HttpOnly cookie, redirects → /eier/:id/portal
+POST  /api/agents/:id/update-profile       — JSON, 7-field whitelist + audit-write
+GET   /api/agents/:id/profile              — session-aware read (shows lock status)
+
+GET   /eier/:agentId                       — magic-link request form (server-rendered)
+POST  /eier/:agentId/request               — graceful-degradation form POST (no JS)
+GET   /eier/:agentId/portal                — authenticated edit page (7 fields + stats + audit)
+POST  /eier/:agentId/save                  — graceful-degradation profile save
+POST  /eier/:agentId/logout                — clear session + redirect to /produsent/<slug>
+
+GET   /api/agents/:agentId/my-audit        — owner-side audit (session-gated, no admin key)
+GET   /admin/agent-audit                   — Daniel-only audit reader, X-Admin-Key
+```
+
+Both JSON and graceful-degradation form paths exist so producers without JavaScript (or in restricted browsers) can still update their profile. Sessions are cookie-based (`HttpOnly`, `Secure` in prod), 7-day expiry, agent-scoped — visiting `/eier/X/portal` while logged in as agent Y returns 403, not data leak.
+
+**Editable fields (7, whitelisted in `EDITABLE_FIELDS`):**
+```
+email, phone, address, postal_code, website, opening_hours, description (maps to about)
+```
+
+**Read-only / never owner-writable (`READ_ONLY_FIELDS`):**
+```
+googleRating, google_rating, googleReviewCount, google_review_count,
+tripadvisorRating, tripadvisor_rating, views_count, ai_conversations_count
+```
+
+Every write goes through `agent_knowledge_audit` with `(agent_id, field, old_value, new_value, changed_by, changed_at)`. Daniel's admin reader can replay the full edit history of any producer; the owner's `my-audit` returns only their own rows.
+
+**Magic-link UX (PR-8, B2 spec):**
+The email body explicitly names the agent (so a producer who manages two farms knows which one this link unlocks) and states the 7-day expiry up front:
+
+```
+Hei!
+
+Du kan nå redigere profilen til <agent.name> på Rett fra Bonden:
+https://rettfrabonden.com/magic-link-verify?token=…
+
+Lenken er gyldig i 7 dager. Hvis du ikke ba om denne, kan du ignorere e-posten.
+```
+
+**Server-side Variant A claim CTA (PR-8, A1-A3):**
+`/produsent/<slug>` now renders a hero banner "Ta eierskap her" (for unclaimed agents) or a demoted footer banner "Be om tilgang her" (for claimed agents). The branching uses `knowledgeService.isAgentClaimed(agentId)` — the **canonical** helper that queries `agent_claims.status='verified'`. PR-9 originally reinvented this check inline and shipped to prod against a non-existent column; PR-10 (`924066f`) reverted to the canonical helper. See gotcha C.59.
+
+**P0 hot-fix round (PR-9, `13594de`):**
+M2 went live `2026-05-10` and immediately returned HTTP 500 on every `/eier/:id` request. Two bugs:
+
+1. `SELECT id, name, slug FROM agents` — but `agents` table has no `slug` column. Slug is derived via `slugify(name)` (see `src/utils/slug.ts`). Fix: drop `slug` from 5 SELECTs, derive post-fetch.
+2. Magic-link-verify error paths redirected to `/min-profil/feil?reason=…` — route doesn't exist. Pre-dates M2 but was hidden by silent error redirects. Fix: redirect to `/?error=<reason>` (homepage with query param).
+
+Both fixes are mechanical (no logic change). See gotchas C.57 and C.58.
+
+**Selger.html UUID race-condition (PR-12 / `5833028`, PR-13 / `6d8dfc4`):**
+The legacy `/selger` page has two competing handlers for the `?agent=` URL query param:
+
+- **Handler 1** (`preselectFromQuery`): async-fetches `/api/marketplace/agents/:id/info`, resolves the producer name, fills the find-name input.
+- **Handler 2**: synchronously dumps the raw query param into the find-name input and clicks "Find".
+
+With the legacy `?agent=NAME` pattern (e.g. `?agent=Godt%20Brød%20Bergen`), Handler 2's overwrite was harmless — string == string. With the new `?agent=<uuid>` pattern from M2's hero CTA on `/produsent/<slug>`, Handler 2 dumped a UUID into "Butikknavn", searched for a UUID-as-name, found nothing, and told the producer their store wasn't registered. Reported by Daniel via the Godt Brød Bergen claim flow.
+
+Fix (PR-12): Handler 2 now detects UUID-shaped `agentParam` and skips its overwrite, letting Handler 1's async resolution win. Legacy `?agent=NAME` path preserved with a 14-line addition (UUID regex + early return).
+
+Follow-up (PR-13): smoke-test after PR-12 deploy showed `findName` stayed empty — Handler 1 was reading `payload.data.name` but the API actually returns `payload.data.agent.name` (the `info` response wraps `agent` inside `data`). Fix: read `info.agent?.name ?? info.name` so the new and legacy shapes both resolve.
+
+See gotchas C.60 and C.61.
+
+**Blocklist policy reversal (PR-14 / `5f48132`):**
+M2's `/selger` self-registration flow surfaced a regression: gmail.com was on `agent_blocklist` with `identifier_type='email_domain'` (auto-added when an agent with a gmail address was previously deleted). Every gmail user trying to self-register through M2 got a 400 "blocked" error.
+
+Daniel-instructed policy change `2026-05-10`: **never block whole email domains**. If an email needs blocking, the **literal address** is added — not the domain. Changes:
+
+- `BlocklistEntry.identifier_type`: added `'email'` (literal address), marked `'email_domain'` DEPRECATED.
+- `normalizeEmail()` helper: lowercase + trim, no domain extraction.
+- `isBlocked()` / `add()`: switched to literal-email comparison.
+- Idempotent boot migration: `DELETE FROM agent_blocklist WHERE identifier_type = 'email_domain'`. Runs every boot; once stable, no-op. Effect: gmail.com (and 6 other free-mail domains accidentally blocked) purged on next deploy.
+
+Future DELETEs only blocklist the specific email, not the whole domain. See gotcha C.62.
+
+**Zod v4 `.issues` compatibility + lost description-length check (PR-15 / `de2b81c`):**
+PR-14's UX fix surfaced field-level errors from `data.details`, but `data.details` was always `undefined` in prod — because `error.errors` (the Zod v3 property) was renamed to `error.issues` in Zod v4 (this codebase pins `zod: ^4.3.6`). Three occurrences in `src/routes/marketplace.ts` (lines 254, 320, 1252 — public register, discovery, admin register) sent `details: error.errors` which `JSON.stringify` omits as `undefined`.
+
+Fix pattern (forward-compat with v3 fallback): `(error as any).issues ?? error.errors`. Now field-level errors actually reach the client.
+
+Bonus: PR-14 attempted a client-side `description.length >= 10` check in `selger.html`'s register button (matching the backend `AgentRegistrationSchema.z.string().min(10)`), but an orchestration-script bug applied the patch in-memory, ran a second patch over it, and never wrote the first patch to disk. PR-15 re-applies it. Users now get immediate client-side feedback instead of a 400 round-trip. See gotchas C.63 and C.64.
+
+
 ---
 
 <a id="phase-7"></a>
@@ -2608,6 +2708,142 @@ These items remain on Daniel's plate:
 - WO #9: switching marketing-comms to read from `outreach_ready_pool` instead of the legacy uncontacted-pool. Until WO #9 ships, the verify-first ledger is fully populated but unused — a safety property worth confirming before the cutover PR lands.
 
 
+### 18.7 Cross-source verification gate (WO-16 / commit `679d58e`)
+
+The Phase 18 verifier shipped with a binary gate: pass the 5 rules or stay `pending_verify`. In practice that lets through agents whose `address` or `phone` came from a single Tier-C source — exactly the rows where Tier-A enrichment has introduced typos before. WO-16 adds a second gate on top: for any of `address`, `phone`, `business_status`, require either 1 Tier-S source (the owner) **or** ≥2 independent Tier-A/B sources that agree.
+
+Tier classification lives in `src/services/cross-source-validator.ts`:
+
+```ts
+const TIER_S = ["owner"];                              // owner-curated, auto-trust
+const TIER_A = ["homepage", "google_places"];          // 1st-party + canonical 3rd-party
+const TIER_B = ["brreg", "facebook_official_page"];    // verified 3rd-party
+// Everything else (heuristics, llm scrapes, social-graph) → Tier C, never decisive.
+```
+
+`crossSourceAgreement(field, provenance[])` returns one of three verdicts per field:
+
+| Verdict | Meaning | Verifier outcome |
+|---|---|---|
+| `pool_eligible` | Tier-S override OR ≥2 agreeing Tier-A/B | passes this gate |
+| `review_required` | exactly 1 source recorded | `verification_status='review_required'` |
+| `data_insufficient` | 0 sources / empty provenance | `verification_status='data_insufficient'` (PR-19) |
+
+The agent's overall `verification_status` is the worst verdict across the three tracked fields. `agent_knowledge.verification_review_reason` captures *which* field tripped the gate so the admin dashboard can render a useful triage view.
+
+**Why split `review_required` and `data_insufficient` (PR-19, `b5bdab5`):**
+Before PR-19, both buckets landed in `review_required`. That noised up the human-review queue with 119 rows that just needed more enrichment — not human judgement. A boot-time idempotent migration (`pr19_data_insufficient_reclassify_v1`) walks existing `review_required` rows whose `field_provenance` is empty / all-zero-counts and demotes them to `data_insufficient`. The dashboard now has two tabs:
+
+```bash
+# Human-actionable triage (1 conflicting source per field — needs a call):
+curl -H "X-Admin-Key: $ADMIN_KEY" "https://rettfrabonden.com/admin/verifier-review-queue?bucket=review_required"
+
+# Back-catalogue (0 sources — needs enrichment, not human):
+curl -H "X-Admin-Key: $ADMIN_KEY" "https://rettfrabonden.com/admin/verifier-review-queue?bucket=data_insufficient"
+```
+
+`outreach_ready_pool` excludes both buckets; only `verified` rows ever surface to marketing.
+
+### 18.8 Retroactive provenance backfill (PR-23 / commit `2e7895f`)
+
+WO-16 + PR-19 surfaced a side-effect: 1271 agents that *were* enriched (homepage / Google Places / Facebook all present in `agent_knowledge`) but never had `field_provenance` populated were stuck in `data_insufficient` after PR-19's reclassification. They had the data, just not the metadata that lets the cross-source gate count it.
+
+PR-23 adds a chunked, idempotent boot migration that **synthesizes** provenance retroactively from the columns the agent already has — no fabrication, only attestation that "we have a homepage value, so `homepage` is a source for `address` at that field". Concretely:
+
+```ts
+// Pseudo-code from src/database/init.ts (PR-23 migration)
+for (const row of strandedAgents) {
+  const fp: FieldProvenance = {};
+  if (row.address && row.url)            push(fp, "address", { source_type: "homepage", value: row.address });
+  if (row.address && row.google_place_id) push(fp, "address", { source_type: "google_places", value: row.address });
+  if (row.phone   && row.url)            push(fp, "phone",   { source_type: "homepage", value: row.phone });
+  // ... etc for business_status
+  UPDATE agent_knowledge SET field_provenance = json(fp) WHERE agent_id = row.id;
+}
+```
+
+Expected effect: 250–500 stranded agents promote from `data_insufficient`/`pending_verify` → `verified`/pool on the next 1–3 verifier cycles. Migration is gated by a flag in the `migrations` table so it never re-runs.
+
+**Caveat noted in PR-23's reviewer-verdict:** `business_status` is also attributed to every available source, which neutralises `business_status` as a *gating* signal in the cross-source check — the pool effectively becomes "address + phone + source_count" thereafter. That's the right trade-off because Google's `business_status` field is the only reliable source for shut-down detection and it can't disagree with itself; we accept the loss of redundancy in exchange for unblocking 1271 rows.
+
+### 18.9 Enrichment SKILL must write field_provenance (PR-24 / commit `829b386`)
+
+The Cowork-scheduled `lokal-agent-enrichment` SKILL crawls producer homepages and updates `agent_knowledge.{about,products,address,phone,openingHours,...}`. Before PR-24 it had no surface to write `field_provenance`, so every newly-enriched row landed in `data_insufficient` despite having fresh Tier-A data. Symptom: pool size frozen at 129 from 2026-05-05 onwards.
+
+PR-24 adds `PUT /admin/knowledge` accepting `field_provenance` as a first-class payload, with two wire-shapes for SKILL-author convenience:
+
+```bash
+# Flavour 1 — flat (matches on-disk shape, what cross-source-validator reads):
+curl -X PUT -H "X-Admin-Key: $ADMIN_KEY" -H "content-type: application/json" \
+  https://rettfrabonden.com/admin/knowledge \
+  -d '{"agent_id":"a1b2…", "address": [
+        {"value":"Stortingsgata 1, 0107 Oslo","source_type":"homepage","fetched_at":"2026-05-11T13:00Z","source_url":"https://example.no"},
+        {"value":"Stortingsgata 1, 0107 Oslo","source_type":"google_places","fetched_at":"2026-05-11T13:00Z"}
+      ]}'
+
+# Flavour 2 — wrapped (matches the SKILL-addendum example):
+#   { "field_provenance": { "address": { "sources": [{source_type, captured_at, raw_value}, …] } } }
+```
+
+Merge semantics (pure function `mergeFieldProvenance` exported for testing):
+- Append new sources to the existing array.
+- Dedupe by `{source_type, normalised value}` — re-running the same SKILL crawl is a no-op.
+- Untouched fields preserve existing provenance.
+- Auto-creates `agent_knowledge` row if missing (so first-time enrichment doesn't require a prior INSERT).
+
+**Critical**: this is **additive**. The existing `POST /api/marketplace/agents/:id/knowledge` is still the right surface for rich-column writes (about / products / openingHours). The enrichment SKILL must call **both**: knowledge first, then `PUT /admin/knowledge` with the provenance map. Filing this in the SKILL addendum was the only way to avoid a second pool-freeze.
+
+### 18.10 Link-freshness probe + auto-demote (PR-21 / WO-19, commit `2611f7c`)
+
+Pool rows whose `agent.url` 404s in production are worse than no data — outreach lands on a producer page that's been down for months, and we look like we haven't read our own database. PR-21 adds an HTTP HEAD-first / GET-fallback probe to the Phase 2D enrichment loop and integrates link-freshness into the `outreach_ready_pool` VIEW.
+
+```ts
+// src/agents/lokal-agent-verifier.ts — never throws, 8s timeout
+export async function probeAgentUrl(url: string): Promise<{ status: number; took_ms: number }> {
+  // HEAD first; some hosts return 405 for HEAD → fall back to GET with
+  // small range header so we don't pull the whole document.
+}
+```
+
+Two new `agent_knowledge` columns capture the result:
+
+```sql
+ALTER TABLE agent_knowledge ADD COLUMN url_last_probed TEXT;     -- ISO timestamp
+ALTER TABLE agent_knowledge ADD COLUMN url_last_status INTEGER;  -- 0 = network fail / abort
+```
+
+The VIEW now requires:
+
+```sql
+AND k.url_last_status BETWEEN 200 AND 399        -- URL reachable last probe
+AND k.url_last_probed > datetime('now', '-30 days')  -- probe is fresh
+```
+
+Demotion path: a 4xx/5xx probe demotes `enrichment_status` from `rich` → `partial`, which excludes the row from the pool until the URL recovers (re-enrichment can re-promote). A boot-time background backfill probes the existing pool agents (~17 min for 129 rows at the rate-limit budget). The first 17 minutes after a deploy have an empty pool — safe today because marketing-cron is 09:10 CEST and the Fly deploys we do are typically afternoon/evening, but worth knowing.
+
+### 18.11 Outreach dedupe by recipient email (PR-22 / WO-20, commit `7b51c97`)
+
+Free-mail and shared-mailbox producers commonly share a recipient address — e.g. `agder@bondensmarked.no` belongs to 4 distinct agent rows (Mandal, Lyngdal, Grimstad, Agder root). Pre-PR-22, a marketing batch would draft 4 "Hei …!" emails to the same inbox. Deliverability and human dignity both suffer.
+
+`src/services/marketing-dedupe.ts` adds a pure function used by `/admin/outreach-ready-pool`:
+
+```ts
+export function dedupeByEmail<T extends DedupeCandidate>(
+  rows: T[],
+): DedupeResult<T> {
+  // Group by normalised email (lowercase + trim).
+  // Tiebreaker chain inside each group:
+  //   1. highest views_count        (most-active proxies real demand)
+  //   2. highest googleRating × googleReviewCount  (most-reviewed)
+  //   3. lexicographic by name      (stable / deterministic)
+  // Suppressed rows stay in the pool — they surface on the *next* batch
+  // once the selected one moves to outreach_sent_log.
+}
+```
+
+Surface change: the pool endpoint now accepts `?dedupe_by_email=true` (default ON as of PR-22, opt-out available for explicit-target testing).
+
+
 ---
 
 <a id="appendix-a"></a>
@@ -2785,6 +3021,33 @@ Post-deploy:
 55. **`PATCH /agents/:id` allowed `name` + `description` but not `city`** — `agents.city` lives on the `agents` table (not `agent_knowledge`), so the curated-fields lock from Phase 4.9a doesn't apply. The legacy update path only listed `name`/`description`/`location` in `marketplaceRegistry.updateAgent`'s allowed-fields, so a CS-corrected city would silently no-op. Symptom: Haugerud Gård at postal code 3302 (Buskerud) showed "Akershus" across `/sok`, contact card, and related-producers tile even after the CS agent issued the PATCH. Fix: add `city` to the allow-list. Customer impact resolved 2026-05-07. Commit: `2f21686`. Lesson: **every column shown on a public surface needs an admin update path — and the allow-list must be audited whenever a new surface is added that reads from it.**
 
 56. **A2A agent-card was rendering as plain-text in registries because `homepage` and `iconUrl` were nested-only** — `a2aregistry.org/api/agents/00157ca1` showed `iconUrl: null, homepage: null` even though both values were embedded inside our `agent_card.skills[*].metadata`. The A2A spec recommends them as **top-level** fields for registry-display fallback; without them, agent-aggregators fall back to plain-text rendering instead of showing our logo and a clickable homepage. Fix: emit `homepage: ${baseUrl}` and `iconUrl: ${baseUrl}/logo.svg` at the root of `/.well-known/agent-card.json`. Verified 200 on the logo path. Commit: `61e08e2`. Lesson: **if a spec calls a field "recommended for display" the registry treats it as required-for-display; nested copies don't substitute.**
+
+57. **`SELECT id, name, slug FROM agents` — the column doesn't exist** — `agents` has `id`/`name`/`city` and a few others, but no `slug`. Slugs are derived via `slugify(name)` (see `src/utils/slug.ts` for the canonical helper — already documented in C.39 as the single-source-of-truth). PR-8's owner-portal route reinvented the column reference in 5 SELECTs and shipped a 500 on every `/eier/:id` request the moment it hit prod. Fix: drop the column from the query, derive post-fetch. **Rule of thumb:** before adding a new column reference, search the schema migrations — anything you can't see in `CREATE TABLE agents (…)` doesn't exist on disk, regardless of how natural the name sounds. Commit: `13594de`. See Phase 6.5.
+
+58. **Magic-link error path redirected to a route that didn't exist** — `/magic-link-verify`'s error branches redirected to `/min-profil/feil?reason=…` but no route handler ever existed at that path. Users hit "Cannot GET /min-profil/feil" — a 404 page from Express's default handler that looks broken, not informative. Bug pre-dated PR-8 but was hidden behind the silent redirect; PR-8's smoke-test surfaced it because M2 now actively exercises the error paths. Fix: redirect to `/?error=<reason>` (homepage with query param). **Rule:** every URL emitted by `res.redirect()` should be one of your own registered routes — grep your own route table before merging redirect changes. Commit: `13594de`. See Phase 6.5.
+
+59. **Don't reinvent `isAgentClaimed` — there's a canonical helper** — PR-9 added a Variant A claim CTA gate that queried `agents.is_claimed` (a column that, like `slug`, doesn't exist on disk) instead of using `knowledgeService.isAgentClaimed(agentId)`. Canonical helper queries `agent_claims.status='verified'` and matches the semantics that `/api/marketplace/agents` uses everywhere else. Symptom: every producer page rendered the unclaimed-state hero CTA, even for verified-owner pages. Fix: import + call `knowledgeService.isAgentClaimed()`. **Rule:** before writing a "does this agent have X" boolean, grep `services/` and `models/` — if a same-name helper already exists, use it. Inconsistent claim-checks silently fork your product into "Variant A" vs "everywhere else". Commit: `924066f` (5-line change in `src/routes/seo.ts`).
+
+60. **Two competing query-param handlers — async winner gets overwritten by sync loser** — `selger.html` had a `preselectFromQuery` handler that async-fetched `/api/.../info` to resolve a producer name from `?agent=<uuid>`, AND a second handler that synchronously dumped the raw query param into the find-name input. The sync handler ran *after* the async one resolved, so it overwrote the resolved name with the literal UUID. Worked fine with the legacy `?agent=NAME` (string overwrites identical string), broke the second M2's hero CTA started emitting `?agent=<uuid>`. Reported by Daniel: clicking "Ta eierskap her" on `/produsent/godt-brod-bergen` landed on `/selger` with a UUID in the "Butikknavn" field instead of "Godt Brød Bergen". Fix: detect UUID-shape in the sync handler and skip the overwrite — let the async handler win. **Rule:** if two handlers can mutate the same DOM node from the same trigger, only one of them gets to be the source of truth — name it, document it, make the other one explicitly defer. Commit: `5833028`. See Phase 6.5.
+
+61. **API response shape `data.agent.name` vs `data.name` — silent parser drift** — `selger.html`'s async handler read `info.name` after extracting `info = payload.data`. But `/api/marketplace/agents/:id/info` returns `{ data: { agent: {…}, knowledge: {…} } }` — `name` lives at `data.agent.name`, not `data.name`. The truthy-check failed, the handler returned silently, and `findName` stayed empty. Bug pre-dated Phase 5.4a but Handler 1 had never been exercised end-to-end until PR-12 made it the only resolver. Fix: read `info.agent?.name ?? info.name` (current + legacy shape both resolve). **Rule:** static HTML pages that consume API responses are easy to miss in test runs — `selger.html` is not test-imported, so this fork lived in prod for months. Either move the consumer into a tested module, or add a smoke-test that requests the page + asserts the rendered value. Commit: `6d8dfc4`. See Phase 6.5.
+
+62. **`identifier_type='email_domain'` blocks free-mail domains and locks out every legitimate user on them** — `agent_blocklist` auto-added the *domain* of any deleted producer's email. Delete one gmail-using producer → `gmail.com` is now on the blocklist → every gmail user fails self-registration with a 400. Surfaced by Daniel discovering he himself couldn't register a test agent through the M2 `/selger` flow. Daniel-instructed policy change: **never block whole email domains. Block the literal address only.** Migration: idempotent boot-time `DELETE FROM agent_blocklist WHERE identifier_type = 'email_domain'`. New entries write under `identifier_type='email'` with the literal lowercased address. The `email_domain` enum value is marked DEPRECATED but still readable for the migration window. **Rule:** any blocklist that operates at a coarser grain than "the entity you actually wanted to block" will eventually false-positive at scale — and free-mail domains are the worst case because they amplify the false-positive over millions of users. Commit: `5f48132`. See Phase 6.5.
+
+63. **Zod v4 dropped `error.errors` — it's `.issues` now, and `JSON.stringify` silently omits `undefined`** — Three error-response paths in `src/routes/marketplace.ts` sent `details: error.errors` after a Zod validation failure. Worked on v3, returns `undefined` on v4 (package pins `zod: ^4.3.6`). `JSON.stringify({ details: undefined })` produces `{}` — no thrown error, no warning, the field just disappears. PR-14's UX fix to surface `data.details` per-field on the client was therefore a no-op for weeks: the server never sent the details. PR-15 fix: `(error as any).issues ?? error.errors` — forward-compat with v3 fallback. **Rule:** when bumping a validation library across major versions, grep every `error.errors` / `error.issues` / `.format()` / `.flatten()` call — Zod v4's `.issues` rename is one example; other libs have similar API churn at major bumps. Add a smoke-test that POSTs invalid input and asserts the response includes a non-empty `details` array. Commit: `de2b81c`. See Phase 6.5.
+
+64. **Orchestration patch applied in-memory, never written to disk, silently overwritten by the next patch** — PR-14 attempted to land two small patches in `selger.html`: (a) a client-side `description.length >= 10` check in the register button, (b) better error-surfacing. The orchestration script read the file, applied (a) to the in-memory buffer, applied (b), then wrote the buffer — but the (a) edit was lost in a sub-process boundary; only (b) survived. The error-surfacing change deployed, the validation check did not. Symptom: users still hit the backend's 400 on short descriptions, with no client-side feedback even after PR-14's "fix". Caught by Daniel's manual smoke-test, fixed in PR-15 by re-applying patch (a) cleanly. **Rule:** if you're running a script that applies multiple edits to one file, always `git diff` the result before commit — and prefer pipelines where each patch writes-then-reads disk so the next step can't silently lose changes. **Smaller rule:** static HTML is hard to test; a missing client-side check looks identical to a "passing" form until a real user hits the backend validator. Commit: `de2b81c`. See Phase 6.5.
+
+65. **Cross-source gate's `review_required` bucket polluted by 0-source rows that just need enrichment** — Phase 18 + WO-16 originally had two outcomes for cross-source disagreement: `verified` (pass) or `review_required` (any failure). After PR-19's prod backfill, 119 rows landed in `review_required` whose `field_provenance` was all-zero — meaning they had no sources at all, not conflicting sources. Human review can't add data that doesn't exist; those agents need *enrichment*, not judgement. Fix (PR-19): add a third bucket `data_insufficient`. Verdict mapping: 0 sources → `data_insufficient`, 1 source → `review_required`, ≥2 agreeing or Tier-S → `pool_eligible`. Idempotent boot migration walks existing `review_required` rows and reclassifies the source_count=0 ones. Admin dashboard splits into two tabs so the human-actionable queue stays focused. **Rule:** when a quality gate's failure-bucket grows past ~50 items, audit whether they all *need the same intervention*. "Reviewer queue too long" is often "two different problems sharing a label". Commit: `b5bdab5`. See Phase 18.7.
+
+66. **Pool VIEW must filter on link freshness — broken-URL agents are worse than no data** — Sending cold-outreach that references the producer's homepage is fine; sending it after the homepage 404'd six months ago makes us look like a stale aggregator scraper. PR-21 / WO-19 adds an HTTP HEAD-first / GET-fallback probe (`probeAgentUrl`, 8s timeout, never throws) to the enrichment loop and two new columns: `url_last_probed` (ISO timestamp), `url_last_status` (HTTP code, 0 for network failure). `outreach_ready_pool` now requires `url_last_status BETWEEN 200 AND 399 AND url_last_probed > datetime('now', '-30 days')`. 4xx/5xx demotes `enrichment_status` from `rich` → `partial`, excluding from the pool until re-enrichment recovers it. Boot-time background backfill probes existing pool agents (~17 min for 129 rows). **Rule:** any "evidence" your outreach relies on (URLs, addresses, phone numbers) needs a freshness check shorter than your sales cycle — and a path to demote rows automatically when the evidence rots. Commit: `2611f7c`. See Phase 18.10.
+
+67. **Same recipient email shared across multiple agents — 4 "Hei …!" emails to one inbox per batch** — Pool collisions on `email` are common with shared-mailbox or free-mail producers (e.g. `agder@bondensmarked.no` belongs to 4 distinct agents). Pre-PR-22, marketing-comms drafted one email per agent. Deliverability suffers; human dignity suffers more. Fix: `dedupeByEmail()` groups by normalised email and picks one survivor per group via tiebreaker chain (highest views_count → highest google_rating × review_count → lexicographic by name). Suppressed agents stay in the pool — they surface in the next batch once the chosen one moves to `outreach_sent_log`. Surface: `/admin/outreach-ready-pool?dedupe_by_email=true` (default ON since PR-22). **Rule:** pool-shaped data must be deduped on every *delivery key* before it leaves the system, not just on the *identity key* — recipient email, recipient phone, postal address are all delivery keys that can collide across rows with distinct identities. Commit: `7b51c97`. See Phase 18.11.
+
+68. **Enrichment writes rich columns but not `field_provenance` — pool freezes silently** — `lokal-agent-enrichment` SKILL crawls homepages and updates `agent_knowledge.{about,products,address,phone,openingHours}`. Until PR-24, it had no surface to update `field_provenance`. Result: every newly-enriched row had Tier-A data but 0 recorded sources, landed in `data_insufficient`, never entered the pool. Pool froze at 129 from `2026-05-05` through `2026-05-11`. Fix (PR-24): new `PUT /admin/knowledge` endpoint that accepts a `field_provenance` payload in either wrapped (`{address:{sources:[…]}}`) or flat (`{address:[{value,source_type,fetched_at}]}`) shape, merges with existing on-disk provenance, dedupes by `{source_type, normalised value}`. **Critical:** the route is *additive*; the SKILL must call both the existing knowledge endpoint AND the new provenance endpoint on every enrichment write. Filed in the SKILL addendum. **Rule:** if your quality gate reads metadata, every writer of the underlying data must also write the metadata — gate-protected systems break the moment one writer forgets, and the failure is invisible until you investigate why the pool isn't growing. Commit: `829b386`. See Phase 18.9.
+
+69. **1271 stranded agents had the data, just not the provenance — retroactive synthesis from existing columns** — After PR-19 + PR-24, 1271 agents that *were* enriched (homepage / google_places / facebook populated in `agent_knowledge`) but were enriched *before* per-field `field_provenance` existed got stranded in `data_insufficient`. They had no `field_provenance` rows even though the data was on disk. PR-23 adds a chunked, idempotent boot migration that synthesizes provenance retroactively: for each stranded row, attribute `address`/`phone`/`business_status` to the existing column source (`homepage`, `google_places`, `facebook_official_page` — whichever are populated). No fabrication — only attestation of what's already there. Expected unblock: 250–500 agents from `data_insufficient`/`pending_verify` → `verified`/pool over 1–3 verifier cycles. **Caveat:** `business_status` ends up attributed to every source, which neutralises it as a *cross-source* gating field (a field can't disagree with itself). Pool eligibility effectively becomes `address + phone + source_count ≥ 2`. Right trade-off for unblocking 1271 rows. **Rule:** when a metadata-only migration would unblock substantial volume, prefer "synthesize from extant data" over "wait for re-enrichment to catch up" — but always document which fields lose redundancy in the process. Commit: `2e7895f`. See Phase 18.8.
+
 
 
 ### C.2 Architecture Decisions
@@ -2972,8 +3235,9 @@ to build the same platform for a different vertical.
 | 2026-04-27 | 7, C | CRM contact-resolution upgrade (7.12.1): `classifyEmail()` split out as a pure function, freemail allowlist prevents gmail/outlook senders from shadowing real producer matches, vendor allowlist now accepts subdomain suffixes (`accounts.google.com` → `google.com`), `unknown` rows re-evaluated on every subsequent ingest plus bulk endpoint `POST /api/crm/contacts/reclassify-unknown`. CSP-safe event delegation in `admin-crm.html` (7.12.2): all 16 inline `onclick`/`onchange`/`onblur` replaced with `data-action` + a single `document.body` listener after Comet browser blocked login. "✓ Ferdig" one-click status button on each thread. Stale-count fallbacks `1,100`/`1,150+` → `1,170+` across `discovery.ts`, `agent-readiness.ts`, narrator strings in `app.html`/`dashboard.html`, README, server.json. Appendix C: C.44 (CSP-strict browsers kill inline `onclick`), C.45 (vendor-domain subdomain match), C.46 (re-classify `unknown` on every ingest). |
 | 2026-04-30 | 16, 17, C | CI cache-bust fix: `.github/workflows/fly-deploy.yml` now threads `--build-arg BUILD_REV=${{ github.sha }}` (16.4) — without it, GH-Actions builds defaulted `ARG BUILD_REV=dev` and Fly's remote builder reused the cached `COPY src/` layer for three weeks. `/a2a` POST hardened against header-less probes: returns JSON-RPC `-32700` (HTTP 400) instead of HTML 500, likely cause of the sticky `a2aregistry.org` maintainer note that PUT refresh couldn't clear (17.7). Repo hygiene: `mcp-server/node_modules/` untracked (~28 MB), six dead files removed (`seo-backup.ts`, `LokalApp_copy.jsx`, two PowerShell scripts, etc.) — `tsc` and 39/39 tests still pass. Stale narrator + fallback literals walked from `1,170+` → `1,180+` → `1,195+` to match prod (DB at 1,195). Appendix C: C.47 (`Array.isArray` guard — strings have `.length` too), C.48 (CI deploy must thread `BUILD_REV`), C.49 (A2A endpoint guard for missing body / wrong Content-Type), C.50 (`/sok` H1 was always `30 treff`), C.51 (`/llms.txt` reported slice length not Map size). |
 | 2026-05-04 to 2026-05-07 | 18 (new), 4, 9, 13, C | Phase 18 verify-first foundation: `outreach_ready_pool` VIEW + 7 new `agent_knowledge` columns + `outreach_sent_log` ledger + Tier-B provenance backfill (WO #7, `909cc9d`). `lokal-agent-verifier` library with pure-functional 5-rule kvalitets-gate + 8 new tests (WO #8, `e463481`). Runner script with 22-06 UTC time-window gate (`60fda88` → `8326541` → `b49ecbe`). Option B `/admin/run-verifier` endpoint after Fly volumes-not-shared blocker capped pool at 13 (`aae5e93`, `bac5858`). `PATCH /agents/:id` allow-list now includes `city` for CS geo-fixes (Haugerud Gård / Buskerud, `2f21686`). CRM rate-limit narrowed to cold-outreach only — CS responses to inbound never blocked (`3d78b5d`). `/.well-known/agent-card.json` now emits top-level `homepage` + `iconUrl` for registry display (`61e08e2`). `mcp-server/package.json` bumped to 0.3.4 awaiting Daniel's `npm publish` (`5296480`). Appendix C: C.52 (Fly volumes not shared between machines), C.53 (`buildRunEnvelope` omits required `evidence`), C.54 (CRM rate-limit must distinguish cold-outreach from CS reply), C.55 (admin PATCH allow-list missed `city`), C.56 (A2A registries need top-level `homepage`/`iconUrl`). |
+| 2026-05-08 to 2026-05-11 | 6, 18, C | Selger/Eier portal M1+M2: magic-link backend (`127a4ce`), 5 server-rendered HTML routes + claim CTAs + audit trail (`442d551`), P0 hot-fixes for non-existent `slug` column + `/min-profil/feil` redirect (`13594de`), canonical `isAgentClaimed()` revert (`924066f`), CI m2-A3 test gate (`372033e`), Norwegian Bokmål magic-link email body + 7-day expiry (`442d551`). Selger.html hardening: UUID race-condition fix between Handler 1 / Handler 2 (`5833028`), `payload.data.agent.name` parser fix (`6d8dfc4`). Blocklist policy reversal: drop `email_domain` (gmail.com was blocking every gmail user from M2 self-registration), literal-email only, idempotent purge migration (`5f48132`). Zod v4 `.issues` compat in 3 marketplace error paths + re-applied lost description-length client check (`de2b81c`). Phase 18 hardening: cross-source verification gate WO-16 (`679d58e`) + admin needs-review queue (`d33d855`), `data_insufficient` bucket split from `review_required` (`b5bdab5`), URL-freshness probe + auto-demote (`2611f7c`), recipient-email dedupe (`7b51c97`), retroactive provenance backfill for 1271 stranded agents (`2e7895f`), `PUT /admin/knowledge` endpoint to fix pool-freeze at 129 (`829b386`). Appendix C: C.57 (non-existent `slug` column), C.58 (redirect to unregistered route), C.59 (canonical `isAgentClaimed()` helper), C.60 (two competing query-param handlers), C.61 (`data.agent.name` vs `data.name`), C.62 (`email_domain` blocks free-mail), C.63 (Zod v4 `.issues` rename), C.64 (orchestration patch lost in-memory), C.65 (cross-source `data_insufficient` split), C.66 (pool-VIEW link-freshness), C.67 (recipient-email dedupe), C.68 (enrichment must write `field_provenance`), C.69 (retroactive provenance synthesis). |
 
 ---
 
-*Last updated: 2026-05-08 (14:00 CEST) by rfb-guidebook agent*
-*Guide version: 1.6.0*
+*Last updated: 2026-05-11 (14:00 CEST) by rfb-guidebook agent*
+*Guide version: 1.7.0*
