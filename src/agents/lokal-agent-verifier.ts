@@ -276,6 +276,29 @@ export function pickBatch(db: any, limit = 30): any[] {
     .all(limit);
 }
 
+// PR-27: Re-process review_required + data_insufficient agents first.
+// After PR-25 backfill + PR-26 aggregateVerdict fix, many of these
+// now have proper provenance and can be moved to `verified`. Default
+// pickBatch order (oldest last_verified_at) would re-process them last
+// because their last_verified_at is recent. This variant scopes the
+// pool to just those rows, oldest-first, so the caller can drain the
+// review queue quickly.
+export function pickReviewQueueBatch(db: any, limit = 30): any[] {
+  return db
+    .prepare(
+      `SELECT a.id, a.name, a.city AS location_city, k.email, k.phone, k.address,
+              k.website, k.about, k.products, k.field_provenance,
+              k.verification_status, k.enrichment_status,
+              k.last_verified_at, k.last_http_check_at, k.last_http_status
+         FROM agents a
+   INNER JOIN agent_knowledge k ON k.agent_id = a.id
+        WHERE k.verification_status IN ('review_required', 'data_insufficient')
+     ORDER BY COALESCE(k.last_verified_at, '1970-01-01') ASC
+        LIMIT ?`
+    )
+    .all(limit);
+}
+
 // Apply verifier outcome to agent_knowledge. Pure DB write — caller
 // owns the transaction.
 export function applyVerifierOutcome(
@@ -425,6 +448,9 @@ export async function runVerifierBatch(opts: {
   brregLookup?: BrregFn | null;
   db?: any;
   headProbe?: ((url: string, timeoutMs?: number) => Promise<number | null>) | null;
+  // PR-27: Optional override for the candidate-picker. Defaults to
+  // pickBatch. Pass pickReviewQueueBatch to drain the review queue.
+  pickFn?: (db: any, limit?: number) => any[];
 }): Promise<{
   run_id: string;
   started_at: string;
@@ -436,7 +462,8 @@ export async function runVerifierBatch(opts: {
   const startedAt = new Date().toISOString();
   const runId = `run-${startedAt.replace(/[:.]/g, "").slice(0, 15)}-lokal-agent-verifier-rfb`;
 
-  const candidates = pickBatch(db, limit);
+  const pickFn = opts.pickFn ?? pickBatch;
+  const candidates = pickFn(db, limit);
   const results: VerifierResult[] = [];
 
   for (const agent of candidates) {

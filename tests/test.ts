@@ -1583,6 +1583,64 @@ console.log("── agent-stats: per-agent stats endpoint logic ──");
 }
 
 
+// ── PR-27: pickReviewQueueBatch (re-process review_required first) ───
+console.log("\n── PR-27: pickReviewQueueBatch unit tests ──");
+{
+  const {
+    pickReviewQueueBatch,
+  } = require("../src/agents/lokal-agent-verifier");
+
+  const sqlite = require("better-sqlite3");
+  const db = new sqlite(":memory:");
+  db.exec(`
+    CREATE TABLE agents (id TEXT PRIMARY KEY, name TEXT, role TEXT, city TEXT);
+    CREATE TABLE agent_knowledge (
+      agent_id TEXT PRIMARY KEY,
+      address TEXT, website TEXT, phone TEXT, email TEXT,
+      about TEXT, products TEXT DEFAULT '[]',
+      verification_status TEXT NOT NULL DEFAULT 'unverified',
+      enrichment_status TEXT NOT NULL DEFAULT 'thin',
+      outreach_eligible_at TEXT,
+      last_verified_at TEXT, last_http_check_at TEXT, last_http_status INTEGER,
+      field_provenance TEXT NOT NULL DEFAULT '{}',
+      verification_review_reason TEXT NOT NULL DEFAULT '{}'
+    );
+  `);
+  db.prepare("INSERT INTO agents (id,name,role,city) VALUES ('rq-unv','U','producer','Oslo'),('rq-pen','P','producer','Oslo'),('rq-ver','V','producer','Oslo'),('rq-rev1','R1','producer','Oslo'),('rq-rev2','R2','producer','Oslo'),('rq-din','D','producer','Oslo'),('rq-opt','O','producer','Oslo')").run();
+  const ins = db.prepare(`INSERT INTO agent_knowledge (agent_id, email, website, verification_status, last_verified_at) VALUES (?, ?, ?, ?, ?)`);
+  ins.run("rq-unv", "u@x.no", "https://u.no", "unverified", null);
+  ins.run("rq-pen", "p@x.no", "https://p.no", "pending_verify", "2026-05-09T00:00:00Z");
+  ins.run("rq-ver", "v@x.no", "https://v.no", "verified", "2026-05-09T00:00:00Z");
+  ins.run("rq-rev1", "r1@x.no", "https://r1.no", "review_required", "2026-05-01T00:00:00Z");
+  ins.run("rq-rev2", "r2@x.no", "https://r2.no", "review_required", "2026-05-08T00:00:00Z");
+  ins.run("rq-din", "d@x.no", "https://d.no", "data_insufficient", "2026-04-15T00:00:00Z");
+  ins.run("rq-opt", "o@x.no", "https://o.no", "opt_out", "2026-05-01T00:00:00Z");
+
+  // Test 1: only review_required + data_insufficient rows returned
+  const batch = pickReviewQueueBatch(db, 50);
+  const ids = batch.map((r: any) => r.id);
+  assertEq(batch.length, 3, `pr27: pickReviewQueueBatch returns 3 rows (got ${batch.length})`);
+  assertTrue(ids.includes("rq-rev1"), "pr27: includes review_required (rq-rev1)");
+  assertTrue(ids.includes("rq-rev2"), "pr27: includes review_required (rq-rev2)");
+  assertTrue(ids.includes("rq-din"), "pr27: includes data_insufficient (rq-din)");
+  assertTrue(!ids.includes("rq-unv"), "pr27: excludes unverified");
+  assertTrue(!ids.includes("rq-pen"), "pr27: excludes pending_verify");
+  assertTrue(!ids.includes("rq-ver"), "pr27: excludes verified");
+  assertTrue(!ids.includes("rq-opt"), "pr27: excludes opt_out");
+
+  // Test 2: ordered by last_verified_at ASC (oldest first)
+  assertEq(batch[0].id, "rq-din", "pr27: oldest (2026-04-15) first");
+  assertEq(batch[1].id, "rq-rev1", "pr27: 2026-05-01 second");
+  assertEq(batch[2].id, "rq-rev2", "pr27: 2026-05-08 last");
+
+  // Test 3: LIMIT honored
+  const limited = pickReviewQueueBatch(db, 2);
+  assertEq(limited.length, 2, "pr27: LIMIT param honored");
+
+  db.close();
+}
+
+
 // ── PR-21 / WO-19: link-freshness probe (probeAgentUrl) ──────────────
 console.log("\n── PR-21 / WO-19: probeAgentUrl unit tests ──");
 const _pr21Promises: Promise<unknown>[] = [];
