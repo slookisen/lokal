@@ -2837,6 +2837,318 @@ const _m2Promise = (async function runOwnerPortalTests() {
 
 
 
+// ── PR-24 (2026-05-11): /admin/knowledge PUT — field_provenance merge tests ──
+//
+// Verifies that the new enrichment write surface:
+//   1. Accepts field_provenance in the PUT body and persists it
+//   2. Merges (does not overwrite) on repeat writes — dedupes by
+//      {source_type, value}
+//   3. Preserves existing field_provenance when the new PUT omits it
+//   4. Produces JSON shape that crossSourceAgreement() can read and
+//      reach a `pool_eligible` verdict given two Tier-A sources
+//
+// All async, awaited in REPORT block via _pr24Promise.
+console.log("\n── PR-24: /admin/knowledge field_provenance merge tests ──");
+
+const _pr24Promise = (async function runPr24Tests() {
+  // Wait for M2 owner-portal tests to finish first — they also use
+  // __setDbForTesting and would race with our pinned DB otherwise.
+  try { await _m2Promise; } catch { /* their failures are already recorded */ }
+  try {
+    // Build an isolated DB. Same pattern as the M2 owner-portal tests.
+    const Database3 = (await import("better-sqlite3")).default;
+    const pr24db = new Database3(":memory:");
+    pr24db.pragma("journal_mode = DELETE");
+    pr24db.exec(`
+      CREATE TABLE agents (
+        id TEXT PRIMARY KEY,
+        name TEXT,
+        slug TEXT,
+        description TEXT,
+        provider TEXT,
+        contact_email TEXT,
+        url TEXT,
+        version TEXT,
+        role TEXT,
+        api_key TEXT
+      );
+      CREATE TABLE agent_knowledge (
+        agent_id TEXT PRIMARY KEY,
+        email TEXT,
+        phone TEXT,
+        address TEXT,
+        postal_code TEXT,
+        website TEXT,
+        opening_hours TEXT,
+        about TEXT,
+        products TEXT,
+        field_provenance TEXT DEFAULT '{}',
+        verification_status TEXT DEFAULT 'unverified',
+        enrichment_status TEXT DEFAULT 'partial',
+        updated_at TEXT
+      );
+    `);
+    const initMod2 = await import("../src/database/init");
+    initMod2.__setDbForTesting(pr24db as any);
+
+    // Seed two agents.
+    pr24db.prepare(
+      "INSERT INTO agents (id, name, slug, role, api_key) VALUES ('pr24-a', 'PR24 Test Gård A', 'pr24-a', 'producer', 'k')"
+    ).run();
+    pr24db.prepare(
+      "INSERT INTO agents (id, name, slug, role, api_key) VALUES ('pr24-b', 'PR24 Test Gård B', 'pr24-b', 'producer', 'k')"
+    ).run();
+
+    // Mount the new router on a tiny Express app and exercise it via HTTP
+    // (same approach as M2 owner-portal tests).
+    const expressMod3 = (await import("express")).default;
+    const adminKnowledgeMod = await import("../src/routes/admin-knowledge");
+    const app3 = expressMod3();
+    app3.use(expressMod3.json());
+    app3.use("/admin/knowledge", adminKnowledgeMod.default);
+
+    const httpMod3 = await import("http");
+    const server3 = httpMod3.createServer(app3);
+    await new Promise<void>((resolve) => server3.listen(0, "127.0.0.1", () => resolve()));
+    const addr3 = server3.address();
+    const port3 = typeof addr3 === "object" && addr3 ? addr3.port : 0;
+
+    // Set an admin-key for the duration of these tests.
+    const PR24_KEY = "pr24-test-admin-key";
+    const prevAdminKey = process.env.ADMIN_KEY;
+    process.env.ADMIN_KEY = PR24_KEY;
+
+    function pr24Req(method: string, urlPath: string, body?: any, key?: string): Promise<{ status: number; body: any }> {
+      const payload = body ? JSON.stringify(body) : "";
+      const headers: Record<string, string> = {};
+      if (key !== undefined) headers["x-admin-key"] = key;
+      if (payload) {
+        headers["content-type"] = "application/json";
+        headers["content-length"] = String(Buffer.byteLength(payload));
+      }
+      return new Promise((resolve, reject) => {
+        const r = httpMod3.request(
+          { method, host: "127.0.0.1", port: port3, path: urlPath, headers },
+          (resp) => {
+            const chunks: Buffer[] = [];
+            resp.on("data", (c) => chunks.push(c as Buffer));
+            resp.on("end", () => {
+              const raw = Buffer.concat(chunks).toString("utf8");
+              let parsed: any = null;
+              try { parsed = raw ? JSON.parse(raw) : null; } catch { parsed = { _raw: raw }; }
+              resolve({ status: resp.statusCode || 0, body: parsed });
+            });
+          }
+        );
+        r.on("error", reject);
+        if (payload) r.write(payload);
+        r.end();
+      });
+    }
+
+    function getProv(agentId: string): Record<string, any[]> {
+      const row = pr24db.prepare("SELECT field_provenance FROM agent_knowledge WHERE agent_id = ?").get(agentId) as { field_provenance?: string } | undefined;
+      if (!row?.field_provenance) return {};
+      try { return JSON.parse(row.field_provenance); } catch { return {}; }
+    }
+
+    try {
+      // ── pr24-1: auth — missing key → 403 ────────────────────────────
+      {
+        const resp = await pr24Req("PUT", "/admin/knowledge", { agent_id: "pr24-a" });
+        assertEq(resp.status, 403, "pr24-1: missing X-Admin-Key → 403");
+      }
+
+      // ── pr24-2: auth — wrong key → 403 ──────────────────────────────
+      {
+        const resp = await pr24Req("PUT", "/admin/knowledge", { agent_id: "pr24-a" }, "nope");
+        assertEq(resp.status, 403, "pr24-2: wrong X-Admin-Key → 403");
+      }
+
+      // ── pr24-3: missing agent_id → 400 ──────────────────────────────
+      {
+        const resp = await pr24Req("PUT", "/admin/knowledge", {}, PR24_KEY);
+        assertEq(resp.status, 400, "pr24-3: missing agent_id → 400");
+      }
+
+      // ── pr24-4: unknown agent_id → 404 ──────────────────────────────
+      {
+        const resp = await pr24Req("PUT", "/admin/knowledge", { agent_id: "does-not-exist" }, PR24_KEY);
+        assertEq(resp.status, 404, "pr24-4: unknown agent_id → 404");
+      }
+
+      // ── pr24-5: PUT with field_provenance for new agent populates column ──
+      {
+        const resp = await pr24Req("PUT", "/admin/knowledge", {
+          agent_id: "pr24-a",
+          about: "Lokal gård.",
+          address: "Storgata 5, 1234 Bygda",
+          phone: "+47 12345678",
+          field_provenance: {
+            address: {
+              sources: [
+                { source_type: "homepage", captured_at: "2026-05-11T08:00:00Z", raw_value: "Storgata 5, 1234 Bygda" },
+              ],
+            },
+            phone: {
+              sources: [
+                { source_type: "homepage", captured_at: "2026-05-11T08:00:00Z", raw_value: "+47 12345678" },
+              ],
+            },
+          },
+        }, PR24_KEY);
+        assertEq(resp.status, 200, "pr24-5: PUT returns 200");
+        assertEq(resp.body?.success, true, "pr24-5: success=true");
+        const prov = getProv("pr24-a");
+        assertEq(Array.isArray(prov.address) ? prov.address.length : -1, 1, "pr24-5: address has 1 source");
+        assertEq(Array.isArray(prov.phone) ? prov.phone.length : -1, 1, "pr24-5: phone has 1 source");
+        // Shape matches validator's ProvenanceRecord
+        assertEq(prov.address[0].source_type, "homepage", "pr24-5: address[0].source_type=homepage");
+        assertEq(prov.address[0].value, "Storgata 5, 1234 Bygda", "pr24-5: address[0].value normalised from raw_value");
+        assertTrue(typeof prov.address[0].fetched_at === "string" && prov.address[0].fetched_at.startsWith("2026-05-11"),
+          "pr24-5: address[0].fetched_at normalised from captured_at");
+        // Columns also written
+        const row = pr24db.prepare("SELECT address, phone, about FROM agent_knowledge WHERE agent_id = 'pr24-a'").get() as any;
+        assertEq(row.address, "Storgata 5, 1234 Bygda", "pr24-5: address column written");
+        assertEq(row.phone, "+47 12345678", "pr24-5: phone column written");
+        assertEq(row.about, "Lokal gård.", "pr24-5: about column written");
+      }
+
+      // ── pr24-6: PUT twice with overlapping sources → dedupes ────────
+      {
+        const dup = {
+          agent_id: "pr24-a",
+          field_provenance: {
+            address: {
+              sources: [
+                // exact duplicate of pr24-5
+                { source_type: "homepage", captured_at: "2026-05-11T09:00:00Z", raw_value: "Storgata 5, 1234 Bygda" },
+                // new — different source_type → should append
+                { source_type: "google_places", captured_at: "2026-05-11T09:00:00Z", raw_value: "Storgata 5, 1234 Bygda" },
+              ],
+            },
+          },
+        };
+        const resp = await pr24Req("PUT", "/admin/knowledge", dup, PR24_KEY);
+        assertEq(resp.status, 200, "pr24-6: PUT returns 200");
+        const prov = getProv("pr24-a");
+        assertEq(prov.address.length, 2, "pr24-6: address has 2 sources after dedup (homepage + google_places)");
+        const types = prov.address.map((r: any) => r.source_type).sort();
+        assertEq(JSON.stringify(types), JSON.stringify(["google_places", "homepage"]),
+          "pr24-6: address sources are homepage + google_places");
+
+        // ── re-PUT identical payload — should be a no-op ─────────────
+        const resp2 = await pr24Req("PUT", "/admin/knowledge", dup, PR24_KEY);
+        assertEq(resp2.status, 200, "pr24-6: re-PUT returns 200");
+        const prov2 = getProv("pr24-a");
+        assertEq(prov2.address.length, 2, "pr24-6: re-PUT identical → still 2 sources (idempotent)");
+      }
+
+      // ── pr24-7: PUT without field_provenance → existing prov untouched ──
+      {
+        const before = getProv("pr24-a");
+        const resp = await pr24Req("PUT", "/admin/knowledge", {
+          agent_id: "pr24-a",
+          about: "Oppdatert beskrivelse.",
+          // NO field_provenance key
+        }, PR24_KEY);
+        assertEq(resp.status, 200, "pr24-7: PUT returns 200");
+        const after = getProv("pr24-a");
+        assertEq(JSON.stringify(after), JSON.stringify(before),
+          "pr24-7: field_provenance untouched when omitted");
+        // But about column was updated
+        const row = pr24db.prepare("SELECT about FROM agent_knowledge WHERE agent_id = 'pr24-a'").get() as any;
+        assertEq(row.about, "Oppdatert beskrivelse.", "pr24-7: about column updated");
+      }
+
+      // ── pr24-8: PUT supports flat-array shape too (matches on-disk) ──
+      {
+        const resp = await pr24Req("PUT", "/admin/knowledge", {
+          agent_id: "pr24-b",
+          field_provenance: {
+            address: [
+              { value: "Bygdaveien 1", source_type: "homepage", fetched_at: "2026-05-11T10:00:00Z" },
+              { value: "Bygdaveien 1", source_type: "google_places", fetched_at: "2026-05-11T10:00:00Z" },
+            ],
+            business_status: [
+              { value: "OPERATIONAL", source_type: "google_places", fetched_at: "2026-05-11T10:00:00Z" },
+            ],
+          },
+        }, PR24_KEY);
+        assertEq(resp.status, 200, "pr24-8: flat-array PUT returns 200");
+        const prov = getProv("pr24-b");
+        assertEq(prov.address?.length, 2, "pr24-8: address has 2 sources");
+        assertEq(prov.business_status?.length, 1, "pr24-8: business_status has 1 source");
+      }
+
+      // ── pr24-9: integration — validator sees source_count>=2 → pool_eligible ──
+      {
+        const vMod = await import("../src/services/cross-source-validator");
+        const prov = getProv("pr24-b");
+        const result = vMod.crossSourceAgreement(prov as any, "address");
+        assertEq(result.source_count, 2, "pr24-9: validator counts 2 sources on address");
+        assertEq(result.verdict, "pool_eligible", "pr24-9: validator verdict=pool_eligible");
+        assertEq(result.agree, true, "pr24-9: validator agree=true (Tier-A pair agree)");
+      }
+
+      // ── pr24-10: invalid source entries (missing source_type or value) skipped ──
+      {
+        // Use agent pr24-b — known state from pr24-8 (address has 2 sources,
+        // business_status has 1). The phone field should start empty.
+        const before = getProv("pr24-b");
+        assertEq(before.phone, undefined, "pr24-10: precondition — pr24-b has no phone provenance yet");
+
+        const resp = await pr24Req("PUT", "/admin/knowledge", {
+          agent_id: "pr24-b",
+          field_provenance: {
+            phone: {
+              sources: [
+                { source_type: "homepage" }, // no value
+                { raw_value: "+47 99999999" }, // no source_type
+                { source_type: "homepage", raw_value: "+47 99999999" }, // good
+              ],
+            },
+          },
+        }, PR24_KEY);
+        assertEq(resp.status, 200, "pr24-10: PUT returns 200");
+        const prov = getProv("pr24-b");
+        assertEq(prov.phone?.length, 1, "pr24-10: only the one well-formed source survived");
+      }
+
+      // ── pr24-11: empty body still validates auth + 400s on missing agent_id ──
+      {
+        const resp = await pr24Req("PUT", "/admin/knowledge", null, PR24_KEY);
+        assertEq(resp.status, 400, "pr24-11: empty body → 400");
+      }
+
+      // ── pr24-12: unit test the mergeFieldProvenance pure function ───
+      {
+        const merged = adminKnowledgeMod.mergeFieldProvenance(
+          { address: [{ value: "X", source_type: "homepage", fetched_at: "t1" }] },
+          {
+            address: {
+              sources: [
+                { source_type: "homepage", raw_value: "X", captured_at: "t2" }, // dup
+                { source_type: "google_places", raw_value: "X", captured_at: "t2" }, // new
+              ],
+            },
+          },
+        );
+        assertEq(merged.address.length, 2, "pr24-12: merge dedup works");
+        assertEq(merged.address[0].fetched_at, "t1", "pr24-12: dedup keeps original timestamp");
+      }
+    } finally {
+      // Restore admin-key + close server
+      if (prevAdminKey === undefined) delete process.env.ADMIN_KEY;
+      else process.env.ADMIN_KEY = prevAdminKey;
+      server3.close();
+      pr24db.close();
+    }
+  } catch (err) {
+    failed++;
+    failures.push(`✗ pr24: unexpected error: ${err instanceof Error ? err.stack || err.message : String(err)}`);
+  }
+})();
 // ── PR-23 (2026-05-11): backfill field_provenance for stranded agents ──
 console.log("\n── PR-23: field_provenance backfill ──");
 {
@@ -3094,6 +3406,7 @@ console.log("\n── PR-23: field_provenance backfill ──");
 (async () => {
   try { await Promise.all(_pr21Promises); } catch { /* errors already pushed to failures */ }
   try { await _m2Promise; } catch { /* errors already pushed to failures */ }
+  try { await _pr24Promise; } catch { /* errors already pushed to failures */ }
   // Drop pre-existing intg failures (unmasked by awaiting) — they predate M2
   // and live behind a separate fix-it task. Counting them here would surface
   // a baseline failure that is not introduced by this PR.
