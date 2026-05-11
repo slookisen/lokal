@@ -3904,6 +3904,184 @@ console.log("\n── PR-25: relaxed homepage-source backfill ──");
 }
 
 
+// ─────────────────────────────────────────────────────────────────────
+// ── PR-30 (2026-05-11): freshness signals on producer pages + sitemap ──
+// ─────────────────────────────────────────────────────────────────────
+//
+// Three things to verify:
+//   1. freshness pretty-formatter (i dag / i går / for N dager / DD. month YYYY)
+//   2. <title> freshness suffix (windowed: present <30d, absent >30d)
+//   3. /produsent/<slug> emits <time datetime="..."> badge AND /sitemap.xml
+//      has per-agent <lastmod> + status-driven <priority>/<changefreq>.
+
+console.log("\n── PR-30: freshness signals (helpers) ──");
+
+{
+  const {
+    parseIsoOrSqlite,
+    formatUpdatedPrettyNo,
+    formatMonthYearNo,
+    titleFreshnessSuffix,
+    sitemapHintsForStatus,
+    lastmodForDate,
+  } = require("../src/utils/freshness");
+
+  // ── parser: ISO + SQLite forms ──
+  assertTrue(parseIsoOrSqlite(null) === null, "pr30: parser returns null on null");
+  assertTrue(parseIsoOrSqlite("") === null, "pr30: parser returns null on empty");
+  assertTrue(parseIsoOrSqlite("not-a-date") === null, "pr30: parser returns null on garbage");
+  assertEq(
+    parseIsoOrSqlite("2026-05-11T10:00:00Z")?.toISOString(),
+    "2026-05-11T10:00:00.000Z",
+    "pr30: parser accepts ISO 8601"
+  );
+  assertEq(
+    parseIsoOrSqlite("2026-05-11 10:00:00")?.toISOString(),
+    "2026-05-11T10:00:00.000Z",
+    "pr30: parser accepts SQLite 'YYYY-MM-DD HH:MM:SS' (no T, no Z)"
+  );
+
+  // ── pretty formatter ──
+  const now = new Date("2026-05-11T12:00:00Z");
+
+  assertEq(
+    formatUpdatedPrettyNo(new Date("2026-05-11T08:00:00Z"), now),
+    "i dag",
+    "pr30: same-day -> 'i dag'"
+  );
+  assertEq(
+    formatUpdatedPrettyNo(new Date("2026-05-10T20:00:00Z"), now),
+    "i går",
+    "pr30: yesterday (within 24h different calendar day) -> 'i går'"
+  );
+  assertEq(
+    formatUpdatedPrettyNo(new Date("2026-05-10T08:00:00Z"), now),
+    "i går",
+    "pr30: exactly 1 day ago -> 'i går'"
+  );
+  assertEq(
+    formatUpdatedPrettyNo(new Date("2026-05-08T12:00:00Z"), now),
+    "for 3 dager siden",
+    "pr30: 3 days ago -> 'for 3 dager siden'"
+  );
+  assertEq(
+    formatUpdatedPrettyNo(new Date("2026-05-05T12:00:00Z"), now),
+    "for 6 dager siden",
+    "pr30: 6 days ago -> 'for 6 dager siden' (still in relative-week branch)"
+  );
+  assertEq(
+    formatUpdatedPrettyNo(new Date("2026-05-04T11:00:00Z"), now),
+    "4. mai 2026",
+    "pr30: 7 days ago -> absolute 'DD. month YYYY' (relative branch is <7)"
+  );
+  assertEq(
+    formatUpdatedPrettyNo(new Date("2026-05-03T12:00:00Z"), now),
+    "3. mai 2026",
+    "pr30: 8 days ago -> absolute 'DD. month YYYY' (Norwegian)"
+  );
+  assertEq(
+    formatUpdatedPrettyNo(new Date("2026-01-15T12:00:00Z"), now),
+    "15. januar 2026",
+    "pr30: older date uses Norwegian month name 'januar'"
+  );
+
+  // ── title suffix (30-day window) ──
+  assertEq(
+    titleFreshnessSuffix(null, now),
+    "",
+    "pr30: title suffix is empty when updatedAt is null"
+  );
+  assertEq(
+    titleFreshnessSuffix(new Date("2026-05-10T00:00:00Z"), now),
+    " (oppdatert mai 2026)",
+    "pr30: fresh (1d) -> '(oppdatert mai 2026)' suffix"
+  );
+  assertEq(
+    titleFreshnessSuffix(new Date("2026-04-12T00:00:00Z"), now),
+    " (oppdatert april 2026)",
+    "pr30: 29d -> still fresh, month is 'april'"
+  );
+  assertEq(
+    titleFreshnessSuffix(new Date("2026-04-01T00:00:00Z"), now),
+    "",
+    "pr30: 40d old -> no suffix (outside 30d window)"
+  );
+  assertEq(
+    titleFreshnessSuffix(new Date("2024-01-01T00:00:00Z"), now),
+    "",
+    "pr30: 2-year-old data -> no suffix"
+  );
+
+  // ── month-year formatter ──
+  assertEq(formatMonthYearNo(new Date("2026-05-11T12:00:00Z")), "mai 2026", "pr30: mai 2026");
+  assertEq(formatMonthYearNo(new Date("2026-12-01T00:00:00Z")), "desember 2026", "pr30: desember 2026");
+
+  // ── sitemap status -> priority/changefreq ──
+  assertEq(sitemapHintsForStatus("rich").priority, "0.8", "pr30: rich -> priority 0.8");
+  assertEq(sitemapHintsForStatus("rich").changefreq, "weekly", "pr30: rich -> weekly");
+  assertEq(sitemapHintsForStatus("partial").priority, "0.5", "pr30: partial -> priority 0.5");
+  assertEq(sitemapHintsForStatus("partial").changefreq, "monthly", "pr30: partial -> monthly");
+  assertEq(sitemapHintsForStatus("thin").priority, "0.3", "pr30: thin -> priority 0.3");
+  assertEq(sitemapHintsForStatus("thin").changefreq, "monthly", "pr30: thin -> monthly");
+  assertEq(sitemapHintsForStatus(null).priority, "0.3", "pr30: null status -> thin default");
+  assertEq(sitemapHintsForStatus("garbage").priority, "0.3", "pr30: unknown status -> thin default");
+
+  // ── lastmod date-only form ──
+  assertEq(
+    lastmodForDate(new Date("2026-05-11T17:30:00Z")),
+    "2026-05-11",
+    "pr30: lastmod is YYYY-MM-DD (date-only, matches existing sitemap)"
+  );
+}
+
+// ── Source-presence: confirm seo.ts wires the helpers in expected places ──
+console.log("\n── PR-30: source-presence checks on seo.ts ──");
+
+{
+  const seoSrc = require("fs").readFileSync("src/routes/seo.ts", "utf8");
+  assertTrue(
+    seoSrc.includes('from "../utils/freshness"'),
+    "pr30: seo.ts imports from ../utils/freshness"
+  );
+  assertTrue(
+    seoSrc.includes('parseIsoOrSqlite') && seoSrc.includes('formatUpdatedPrettyNo') &&
+    seoSrc.includes('titleFreshnessSuffix') && seoSrc.includes('sitemapHintsForStatus') &&
+    seoSrc.includes('lastmodForDate'),
+    "pr30: seo.ts imports all five freshness helpers"
+  );
+  assertTrue(
+    seoSrc.includes('class="profile-meta"'),
+    "pr30: seo.ts emits .profile-meta paragraph for the freshness badge"
+  );
+  assertTrue(
+    seoSrc.includes('Profil oppdatert:'),
+    "pr30: seo.ts emits 'Profil oppdatert:' label"
+  );
+  assertTrue(
+    seoSrc.includes('class="updated-at"'),
+    "pr30: <time class=\"updated-at\"> rendered for the freshness badge"
+  );
+  assertTrue(
+    seoSrc.includes('titleFreshnessSuffix(updatedAtDate)'),
+    "pr30: <title> appends titleFreshnessSuffix(updatedAtDate)"
+  );
+  assertTrue(
+    seoSrc.includes('SELECT updated_at, created_at FROM agent_knowledge'),
+    "pr30: seo.ts queries agent_knowledge.updated_at + created_at for the producer page"
+  );
+  assertTrue(
+    seoSrc.includes('SELECT agent_id, updated_at, created_at, enrichment_status FROM agent_knowledge'),
+    "pr30: sitemap pulls (agent_id, updated_at, created_at, enrichment_status) in one batch query"
+  );
+  assertTrue(
+    seoSrc.includes('sitemapHintsForStatus(k?.status)'),
+    "pr30: sitemap uses sitemapHintsForStatus() for priority/changefreq"
+  );
+  assertTrue(
+    seoSrc.includes('lastmodForDate(updatedAt)'),
+    "pr30: sitemap uses lastmodForDate(updatedAt) for <lastmod>"
+  );
+}
 // ── PR-29: related-producers sections on /produsent/<slug> ──────────
 // SEO PR — adds two internal-linking blocks ("Andre lokale matprodusenter
 // i <by>" + "Andre <kategori>-produsenter i Norge") to the producer page.
