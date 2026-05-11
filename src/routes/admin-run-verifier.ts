@@ -13,7 +13,7 @@
 // All endpoints require X-Admin-Key.
 
 import { Router, Request, Response } from "express";
-import { runVerifierBatch, buildRunEnvelope } from "../agents/lokal-agent-verifier";
+import { runVerifierBatch, buildRunEnvelope, pickReviewQueueBatch } from "../agents/lokal-agent-verifier";
 import { recordRun } from "../services/run-ledger";
 
 const router = Router();
@@ -65,8 +65,20 @@ router.post("/", async (req: Request, res: Response) => {
   const batchSizeRaw = (req.body && req.body.batchSize) || req.query.batchSize;
   const batchSize = Math.min(Math.max(parseInt(String(batchSizeRaw ?? "30"), 10) || 30, 1), 100);
 
+  // PR-27: Optional reprocess-review-queue mode. When set, scope the
+  // pick to review_required + data_insufficient rows (oldest first) so
+  // we drain the review queue instead of starving on `unverified`.
+  const reprocessReviewQueue =
+    req.query.reprocess_review_queue === "1" ||
+    req.query.reprocess_review_queue === "true" ||
+    (req.body && (req.body.reprocess_review_queue === true || req.body.reprocess_review_queue === "1"));
+
   try {
-    const batchResult = await runVerifierBatch({ batchSize });
+    const batchResult = await runVerifierBatch(
+      reprocessReviewQueue
+        ? { batchSize, pickFn: pickReviewQueueBatch }
+        : { batchSize }
+    );
     const results = batchResult.results;
 
     const passed = results.filter((r) => r.passed).length;
@@ -110,6 +122,7 @@ router.post("/", async (req: Request, res: Response) => {
       envelope_recorded: envelopeRecorded,
       hour_utc: hourUTC,
       forced: !!force,
+      reprocess_review_queue: !!reprocessReviewQueue,
     });
   } catch (err: any) {
     res.status(500).json({
