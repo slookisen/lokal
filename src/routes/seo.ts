@@ -26,6 +26,13 @@ import { getDb } from "../database/init";
 import { conversationService } from "../services/conversation-service";
 import { slugify } from "../utils/slug";
 import { t, htmlLangAttr, ogLocale, localizedPath, type Lang } from "../i18n/t";
+import {
+  parseIsoOrSqlite,
+  formatUpdatedPrettyNo,
+  titleFreshnessSuffix,
+  sitemapHintsForStatus,
+  lastmodForDate,
+} from "../utils/freshness";
 
 const router = Router();
 
@@ -2012,6 +2019,9 @@ const PROFILE_CSS = `
   .conv-src { font-weight: 700; color: #6d28d9; }
   .conv-text { font-size: 0.9rem; color: var(--g700); line-height: 1.55; font-style: italic; }
   #pf-conv-card { display: none; }
+  /* PR-30: freshness badge — subtle, sits between badges and name */
+  .profile-meta { margin: 0 0 8px; font-size: 0.78rem; color: var(--g500); }
+  .profile-meta .updated-at { color: var(--g500); }
 `;
 
 // ─── Producer slug fuzzy matcher ──────────────────────────────
@@ -2154,6 +2164,26 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
     // Track producer page view for analytics dashboard
     const cityName = (agent as any).city || (agent as any).location?.city || "";
     analyticsService.trackAgentView(agent.id, agent.name, cityName, "seo");
+
+    // ── PR-30: freshness signal ─────────────────────────────────────
+    // agent_knowledge.updated_at (TEXT, ISO 8601) is bumped on every
+    // enrichment write (PR-24/PR-28 wired this into the hourly verifier).
+    // We surface that as:
+    //   1. A visible <time> badge near the top of this page
+    //   2. A "(oppdatert <month>)" suffix on <title> when <30d old
+    //   3. <lastmod> per URL in /sitemap.xml
+    // Fallback: created_at if updated_at is null (legacy rows).
+    let updatedAtDate: Date | null = null;
+    try {
+      const fresh = getDb()
+        .prepare("SELECT updated_at, created_at FROM agent_knowledge WHERE agent_id = ?")
+        .get(agent.id) as { updated_at?: string; created_at?: string } | undefined;
+      if (fresh) {
+        updatedAtDate = parseIsoOrSqlite(fresh.updated_at) || parseIsoOrSqlite(fresh.created_at);
+      }
+    } catch (e) {
+      console.error("[seo] freshness query failed:", e);
+    }
 
     // Phase 5.4a M2 — claim status (server-rendered so AI bots see CTA per A3).
     // FIX 2026-05-10: PR-8 used agents.claimed_at directly, but canonical claim signal
@@ -2505,6 +2535,7 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
     <div class="pf-header">
       <div class="pf-hero">
         <div class="pf-badges">${badges.join("")}</div>
+        ${updatedAtDate ? `<p class="profile-meta"><time datetime="${updatedAtDate.toISOString()}" class="updated-at">Profil oppdatert: ${escapeHtml(formatUpdatedPrettyNo(updatedAtDate))}</time></p>` : ""}
         <h1 class="pf-name" translate="no">${escapeHtml(agent.name)}</h1>
         ${cityName ? `<div class="pf-loc">&#128205; ${escapeHtml(k.address || cityName)}${k.postalCode ? `, ${escapeHtml(k.postalCode)}` : ""}</div>` : ""}
         ${(() => {
@@ -2705,7 +2736,7 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
     </script>`;
 
     res.send(shell(
-      `${agent.name}${cityName ? t(lang, "producer.title_suffix", { city: cityName }) : ""}`,
+      `${agent.name}${cityName ? t(lang, "producer.title_suffix", { city: cityName }) : ""}${titleFreshnessSuffix(updatedAtDate)}`,
       `${agent.name}${cityName ? ` ${lang === "en" ? "in" : "i"} ${cityName}` : ""}. ${agent.description || (lang === "en" ? "Local food in Norway." : "Lokalprodusert mat i Norge.")}`,
       content,
       { canonical: `${BASE_URL}${localizedPath("/produsent/" + slug, lang)}`, jsonLd, extraCss: PROFILE_CSS, lang, pathForAlternate: "/produsent/" + slug }
@@ -2730,6 +2761,25 @@ router.get("/sitemap.xml", (_req: Request, res: Response) => {
       if (city) cities.add(slugify(city));
     });
 
+    // ── PR-30: per-agent freshness + enrichment-status hints ──────────
+    // One-shot batch query so we don't N+1 the DB. We map agent_id ->
+    // { updated_at, enrichment_status }; missing rows fall back to today's
+    // date + thin status defaults.
+    const knowledgeByAgent = new Map<string, { updatedAt: string | null; status: string | null }>();
+    try {
+      const rows = getDb()
+        .prepare("SELECT agent_id, updated_at, created_at, enrichment_status FROM agent_knowledge")
+        .all() as Array<{ agent_id: string; updated_at?: string; created_at?: string; enrichment_status?: string }>;
+      for (const r of rows) {
+        knowledgeByAgent.set(r.agent_id, {
+          updatedAt: r.updated_at || r.created_at || null,
+          status: r.enrichment_status || null,
+        });
+      }
+    } catch (e) {
+      console.error("[sitemap] knowledge query failed:", e);
+    }
+
     // Build sitemap with NO + EN URLs and xhtml:link hreflang per Google guidelines.
     // https://developers.google.com/search/docs/specialized/international/localized-versions
     let xml = `<?xml version="1.0" encoding="UTF-8"?>
@@ -2739,16 +2789,24 @@ router.get("/sitemap.xml", (_req: Request, res: Response) => {
     const corePriorities: Record<string, string> = { "/": "1.0", "/om": "0.7", "/teknologi": "0.7", "/personvern": "0.5" };
     const coreFreq: Record<string, string> = { "/": "daily" };
 
-    function addEntry(path: string, freq: string, priority: string) {
+    function addEntry(path: string, freq: string, priority: string, lastmod: string) {
       const noLoc = `${BASE_URL}${path === "/" ? "" : path}`;
       const enLoc = `${BASE_URL}/en${path === "/" ? "" : path}`;
-      xml += `\n  <url>\n    <loc>${noLoc}</loc>\n    <changefreq>${freq}</changefreq>\n    <priority>${priority}</priority>\n    <lastmod>${today}</lastmod>\n    <xhtml:link rel="alternate" hreflang="nb" href="${noLoc}"/>\n    <xhtml:link rel="alternate" hreflang="en" href="${enLoc}"/>\n    <xhtml:link rel="alternate" hreflang="x-default" href="${noLoc}"/>\n  </url>`;
-      xml += `\n  <url>\n    <loc>${enLoc}</loc>\n    <changefreq>${freq}</changefreq>\n    <priority>${priority}</priority>\n    <lastmod>${today}</lastmod>\n    <xhtml:link rel="alternate" hreflang="nb" href="${noLoc}"/>\n    <xhtml:link rel="alternate" hreflang="en" href="${enLoc}"/>\n    <xhtml:link rel="alternate" hreflang="x-default" href="${noLoc}"/>\n  </url>`;
+      xml += `\n  <url>\n    <loc>${noLoc}</loc>\n    <changefreq>${freq}</changefreq>\n    <priority>${priority}</priority>\n    <lastmod>${lastmod}</lastmod>\n    <xhtml:link rel="alternate" hreflang="nb" href="${noLoc}"/>\n    <xhtml:link rel="alternate" hreflang="en" href="${enLoc}"/>\n    <xhtml:link rel="alternate" hreflang="x-default" href="${noLoc}"/>\n  </url>`;
+      xml += `\n  <url>\n    <loc>${enLoc}</loc>\n    <changefreq>${freq}</changefreq>\n    <priority>${priority}</priority>\n    <lastmod>${lastmod}</lastmod>\n    <xhtml:link rel="alternate" hreflang="nb" href="${noLoc}"/>\n    <xhtml:link rel="alternate" hreflang="en" href="${enLoc}"/>\n    <xhtml:link rel="alternate" hreflang="x-default" href="${noLoc}"/>\n  </url>`;
     }
 
-    for (const p of corePaths) addEntry(p, coreFreq[p] || "monthly", corePriorities[p]);
-    for (const city of cities) addEntry(`/${city}`, "weekly", "0.8");
-    for (const a of agents) addEntry(`/produsent/${slugify(a.name)}`, "weekly", "0.6");
+    for (const p of corePaths) addEntry(p, coreFreq[p] || "monthly", corePriorities[p]!, today);
+    for (const city of cities) addEntry(`/${city}`, "weekly", "0.8", today);
+
+    // PR-30: producer URLs get per-agent <lastmod> + status-driven priority/changefreq
+    for (const a of agents) {
+      const k = knowledgeByAgent.get(a.id);
+      const updatedAt = parseIsoOrSqlite(k?.updatedAt);
+      const lastmod = updatedAt ? lastmodForDate(updatedAt) : today;
+      const hints = sitemapHintsForStatus(k?.status);
+      addEntry(`/produsent/${slugify(a.name)}`, hints.changefreq, hints.priority, lastmod);
+    }
 
     xml += "\n</urlset>";
     res.header("Content-Type", "application/xml");

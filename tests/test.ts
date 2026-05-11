@@ -3904,6 +3904,432 @@ console.log("\n── PR-25: relaxed homepage-source backfill ──");
 }
 
 
+// ─────────────────────────────────────────────────────────────────────
+// ── PR-30 (2026-05-11): freshness signals on producer pages + sitemap ──
+// ─────────────────────────────────────────────────────────────────────
+//
+// Three things to verify:
+//   1. freshness pretty-formatter (i dag / i går / for N dager / DD. month YYYY)
+//   2. <title> freshness suffix (windowed: present <30d, absent >30d)
+//   3. /produsent/<slug> emits <time datetime="..."> badge AND /sitemap.xml
+//      has per-agent <lastmod> + status-driven <priority>/<changefreq>.
+
+console.log("\n── PR-30: freshness signals (helpers) ──");
+
+{
+  const {
+    parseIsoOrSqlite,
+    formatUpdatedPrettyNo,
+    formatMonthYearNo,
+    titleFreshnessSuffix,
+    sitemapHintsForStatus,
+    lastmodForDate,
+  } = require("../src/utils/freshness");
+
+  // ── parser: ISO + SQLite forms ──
+  assertTrue(parseIsoOrSqlite(null) === null, "pr30: parser returns null on null");
+  assertTrue(parseIsoOrSqlite("") === null, "pr30: parser returns null on empty");
+  assertTrue(parseIsoOrSqlite("not-a-date") === null, "pr30: parser returns null on garbage");
+  assertEq(
+    parseIsoOrSqlite("2026-05-11T10:00:00Z")?.toISOString(),
+    "2026-05-11T10:00:00.000Z",
+    "pr30: parser accepts ISO 8601"
+  );
+  assertEq(
+    parseIsoOrSqlite("2026-05-11 10:00:00")?.toISOString(),
+    "2026-05-11T10:00:00.000Z",
+    "pr30: parser accepts SQLite 'YYYY-MM-DD HH:MM:SS' (no T, no Z)"
+  );
+
+  // ── pretty formatter ──
+  const now = new Date("2026-05-11T12:00:00Z");
+
+  assertEq(
+    formatUpdatedPrettyNo(new Date("2026-05-11T08:00:00Z"), now),
+    "i dag",
+    "pr30: same-day -> 'i dag'"
+  );
+  assertEq(
+    formatUpdatedPrettyNo(new Date("2026-05-10T20:00:00Z"), now),
+    "i går",
+    "pr30: yesterday (within 24h different calendar day) -> 'i går'"
+  );
+  assertEq(
+    formatUpdatedPrettyNo(new Date("2026-05-10T08:00:00Z"), now),
+    "i går",
+    "pr30: exactly 1 day ago -> 'i går'"
+  );
+  assertEq(
+    formatUpdatedPrettyNo(new Date("2026-05-08T12:00:00Z"), now),
+    "for 3 dager siden",
+    "pr30: 3 days ago -> 'for 3 dager siden'"
+  );
+  assertEq(
+    formatUpdatedPrettyNo(new Date("2026-05-05T12:00:00Z"), now),
+    "for 6 dager siden",
+    "pr30: 6 days ago -> 'for 6 dager siden' (still in relative-week branch)"
+  );
+  assertEq(
+    formatUpdatedPrettyNo(new Date("2026-05-04T11:00:00Z"), now),
+    "4. mai 2026",
+    "pr30: 7 days ago -> absolute 'DD. month YYYY' (relative branch is <7)"
+  );
+  assertEq(
+    formatUpdatedPrettyNo(new Date("2026-05-03T12:00:00Z"), now),
+    "3. mai 2026",
+    "pr30: 8 days ago -> absolute 'DD. month YYYY' (Norwegian)"
+  );
+  assertEq(
+    formatUpdatedPrettyNo(new Date("2026-01-15T12:00:00Z"), now),
+    "15. januar 2026",
+    "pr30: older date uses Norwegian month name 'januar'"
+  );
+
+  // ── title suffix (30-day window) ──
+  assertEq(
+    titleFreshnessSuffix(null, now),
+    "",
+    "pr30: title suffix is empty when updatedAt is null"
+  );
+  assertEq(
+    titleFreshnessSuffix(new Date("2026-05-10T00:00:00Z"), now),
+    " (oppdatert mai 2026)",
+    "pr30: fresh (1d) -> '(oppdatert mai 2026)' suffix"
+  );
+  assertEq(
+    titleFreshnessSuffix(new Date("2026-04-12T00:00:00Z"), now),
+    " (oppdatert april 2026)",
+    "pr30: 29d -> still fresh, month is 'april'"
+  );
+  assertEq(
+    titleFreshnessSuffix(new Date("2026-04-01T00:00:00Z"), now),
+    "",
+    "pr30: 40d old -> no suffix (outside 30d window)"
+  );
+  assertEq(
+    titleFreshnessSuffix(new Date("2024-01-01T00:00:00Z"), now),
+    "",
+    "pr30: 2-year-old data -> no suffix"
+  );
+
+  // ── month-year formatter ──
+  assertEq(formatMonthYearNo(new Date("2026-05-11T12:00:00Z")), "mai 2026", "pr30: mai 2026");
+  assertEq(formatMonthYearNo(new Date("2026-12-01T00:00:00Z")), "desember 2026", "pr30: desember 2026");
+
+  // ── sitemap status -> priority/changefreq ──
+  assertEq(sitemapHintsForStatus("rich").priority, "0.8", "pr30: rich -> priority 0.8");
+  assertEq(sitemapHintsForStatus("rich").changefreq, "weekly", "pr30: rich -> weekly");
+  assertEq(sitemapHintsForStatus("partial").priority, "0.5", "pr30: partial -> priority 0.5");
+  assertEq(sitemapHintsForStatus("partial").changefreq, "monthly", "pr30: partial -> monthly");
+  assertEq(sitemapHintsForStatus("thin").priority, "0.3", "pr30: thin -> priority 0.3");
+  assertEq(sitemapHintsForStatus("thin").changefreq, "monthly", "pr30: thin -> monthly");
+  assertEq(sitemapHintsForStatus(null).priority, "0.3", "pr30: null status -> thin default");
+  assertEq(sitemapHintsForStatus("garbage").priority, "0.3", "pr30: unknown status -> thin default");
+
+  // ── lastmod date-only form ──
+  assertEq(
+    lastmodForDate(new Date("2026-05-11T17:30:00Z")),
+    "2026-05-11",
+    "pr30: lastmod is YYYY-MM-DD (date-only, matches existing sitemap)"
+  );
+}
+
+// ── Source-presence: confirm seo.ts wires the helpers in expected places ──
+console.log("\n── PR-30: source-presence checks on seo.ts ──");
+
+{
+  const seoSrc = require("fs").readFileSync("src/routes/seo.ts", "utf8");
+  assertTrue(
+    seoSrc.includes('from "../utils/freshness"'),
+    "pr30: seo.ts imports from ../utils/freshness"
+  );
+  assertTrue(
+    seoSrc.includes('parseIsoOrSqlite') && seoSrc.includes('formatUpdatedPrettyNo') &&
+    seoSrc.includes('titleFreshnessSuffix') && seoSrc.includes('sitemapHintsForStatus') &&
+    seoSrc.includes('lastmodForDate'),
+    "pr30: seo.ts imports all five freshness helpers"
+  );
+  assertTrue(
+    seoSrc.includes('class="profile-meta"'),
+    "pr30: seo.ts emits .profile-meta paragraph for the freshness badge"
+  );
+  assertTrue(
+    seoSrc.includes('Profil oppdatert:'),
+    "pr30: seo.ts emits 'Profil oppdatert:' label"
+  );
+  assertTrue(
+    seoSrc.includes('class="updated-at"'),
+    "pr30: <time class=\"updated-at\"> rendered for the freshness badge"
+  );
+  assertTrue(
+    seoSrc.includes('titleFreshnessSuffix(updatedAtDate)'),
+    "pr30: <title> appends titleFreshnessSuffix(updatedAtDate)"
+  );
+  assertTrue(
+    seoSrc.includes('SELECT updated_at, created_at FROM agent_knowledge'),
+    "pr30: seo.ts queries agent_knowledge.updated_at + created_at for the producer page"
+  );
+  assertTrue(
+    seoSrc.includes('SELECT agent_id, updated_at, created_at, enrichment_status FROM agent_knowledge'),
+    "pr30: sitemap pulls (agent_id, updated_at, created_at, enrichment_status) in one batch query"
+  );
+  assertTrue(
+    seoSrc.includes('sitemapHintsForStatus(k?.status)'),
+    "pr30: sitemap uses sitemapHintsForStatus() for priority/changefreq"
+  );
+  assertTrue(
+    seoSrc.includes('lastmodForDate(updatedAt)'),
+    "pr30: sitemap uses lastmodForDate(updatedAt) for <lastmod>"
+  );
+}
+
+// ── Integration: /produsent/<slug> + /sitemap.xml end-to-end ──
+console.log("\n── PR-30: route integration tests ──");
+
+const _pr30Promise = (async function runPr30RouteTests() {
+  try {
+    // Wait for earlier async test blocks to finish their __setDbForTesting
+    // calls before we pin our own DB — otherwise concurrent IIFEs race the
+    // singleton and our route tests hit the wrong schema.
+    try { await _m2Promise; } catch { /* errors already pushed */ }
+    try { await _pr24Promise; } catch { /* errors already pushed */ }
+    const Database = (await import("better-sqlite3")).default;
+    const initMod = await import("../src/database/init");
+    const db = new Database(":memory:");
+    db.pragma("journal_mode = DELETE");
+
+    // Minimal schema for /sitemap.xml + /produsent/<slug>. We hand-roll
+    // here because src/database/init.ts:initSchema is private and we want
+    // an isolated DB just for these route tests.
+    db.exec(`
+      CREATE TABLE agents (
+        id TEXT PRIMARY KEY,
+        name TEXT,
+        description TEXT,
+        provider TEXT,
+        contact_email TEXT,
+        url TEXT,
+        version TEXT,
+        role TEXT,
+        api_key TEXT,
+        capabilities TEXT,
+        skills TEXT,
+        categories TEXT,
+        tags TEXT,
+        languages TEXT,
+        schema_version TEXT,
+        agent_version INTEGER,
+        lat REAL, lng REAL, city TEXT, radius_km INTEGER,
+        trust_score REAL DEFAULT 0.5,
+        is_active INTEGER DEFAULT 1,
+        is_verified INTEGER DEFAULT 0,
+        discovery_count INTEGER DEFAULT 0,
+        interaction_count INTEGER DEFAULT 0,
+        total_interactions INTEGER DEFAULT 0,
+        avg_response_time_ms REAL,
+        created_at TEXT DEFAULT (datetime('now')),
+        last_seen_at TEXT DEFAULT (datetime('now'))
+      );
+      CREATE TABLE agent_knowledge (
+        agent_id TEXT PRIMARY KEY,
+        google_rating REAL,
+        google_review_count INTEGER,
+        address TEXT, postal_code TEXT, website TEXT, phone TEXT, email TEXT,
+        opening_hours TEXT, products TEXT, about TEXT, specialties TEXT,
+        certifications TEXT, payment_methods TEXT, delivery_options TEXT,
+        tripadvisor_rating REAL, external_reviews TEXT, external_links TEXT,
+        images TEXT, seasonality TEXT, delivery_radius INTEGER, min_order_value INTEGER,
+        data_source TEXT, auto_sources TEXT, last_enriched_at TEXT,
+        owner_updated_at TEXT, preferences TEXT, curated_fields TEXT,
+        field_provenance TEXT DEFAULT '{}',
+        verification_status TEXT DEFAULT 'unverified',
+        enrichment_status TEXT DEFAULT 'thin',
+        created_at TEXT DEFAULT (datetime('now')),
+        updated_at TEXT DEFAULT (datetime('now'))
+      );
+      CREATE TABLE analytics_agent_views (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        agent_id TEXT NOT NULL,
+        agent_name TEXT NOT NULL,
+        city TEXT,
+        view_source TEXT DEFAULT 'unknown',
+        created_at TEXT DEFAULT (datetime('now'))
+      );
+      CREATE TABLE agent_claims (
+        id INTEGER PRIMARY KEY,
+        agent_id TEXT,
+        status TEXT
+      );
+      CREATE TABLE agent_metrics (
+        agent_id TEXT PRIMARY KEY,
+        times_discovered INTEGER DEFAULT 0
+      );
+    `);
+
+    // Pin this DB for the SEO route's getDb() / marketplaceRegistry calls.
+    initMod.__setDbForTesting(db as any);
+
+    // SEO handler calls getConfig() which requires the vertical-config boot.
+    // Idempotent in practice: loadConfigsAtBoot() is safe to call twice.
+    try {
+      const cfgMod = await import("../src/config/vertical-config");
+      cfgMod.loadConfigsAtBoot({ requireRfb: false });
+    } catch (e) {
+      // If verticals/ dir is missing or already loaded, swallow.
+    }
+
+    // Two agents: rich (recent updated_at) + thin (older updated_at).
+    const richUpdated = "2026-05-10T12:00:00Z";   // 1 day before "today" 2026-05-11
+    const thinUpdated = "2026-03-15T08:30:00Z";   // ~57 days old
+    db.prepare(
+      "INSERT INTO agents (id, name, role, city, trust_score, is_active, categories, tags, languages) VALUES (?, ?, 'producer', ?, 0.8, 1, '[]', '[]', '[\"no\"]')"
+    ).run("pr30-rich", "PR30 Rik Gard", "Oslo");
+    db.prepare(
+      "INSERT INTO agents (id, name, role, city, trust_score, is_active, categories, tags, languages) VALUES (?, ?, 'producer', ?, 0.4, 1, '[]', '[]', '[\"no\"]')"
+    ).run("pr30-thin", "PR30 Tynn Bod", "Bergen");
+    db.prepare(
+      "INSERT INTO agent_knowledge (agent_id, enrichment_status, updated_at, created_at) VALUES (?, 'rich', ?, ?)"
+    ).run("pr30-rich", richUpdated, richUpdated);
+    db.prepare(
+      "INSERT INTO agent_knowledge (agent_id, enrichment_status, updated_at, created_at) VALUES (?, 'thin', ?, ?)"
+    ).run("pr30-thin", thinUpdated, thinUpdated);
+
+    // Reset the marketplaceRegistry's in-memory cache so it re-reads our DB.
+    const mrMod = await import("../src/services/marketplace-registry");
+    (mrMod.marketplaceRegistry as any)._agentsCache = null;
+    (mrMod.marketplaceRegistry as any)._statsCache = null;
+
+    const expressMod = (await import("express")).default;
+    const seoMod = await import("../src/routes/seo");
+    const langMidMod = await import("../src/i18n/middleware");
+    const app = expressMod();
+    // The seo router relies on req.lang (set by i18n middleware in prod).
+    // We try to mount the middleware if it exposes one; otherwise we pin
+    // a default so the routes don't crash.
+    if (typeof (langMidMod as any).languageMiddleware === "function") {
+      app.use((langMidMod as any).languageMiddleware);
+    } else {
+      app.use((req: any, _res: any, next: any) => { req.lang = "no"; next(); });
+    }
+    app.use("/", seoMod.default);
+
+    const httpMod = await import("http");
+    const server = httpMod.createServer(app);
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", () => resolve()));
+    const addr = server.address();
+    const port = typeof addr === "object" && addr ? addr.port : 0;
+
+    function fetchPath(urlPath: string): Promise<{ status: number; body: string }> {
+      return new Promise((resolve, reject) => {
+        const r = httpMod.request(
+          { method: "GET", host: "127.0.0.1", port, path: urlPath },
+          (resp) => {
+            const chunks: Buffer[] = [];
+            resp.on("data", (c) => chunks.push(c as Buffer));
+            resp.on("end", () => resolve({ status: resp.statusCode || 0, body: Buffer.concat(chunks).toString("utf8") }));
+          }
+        );
+        r.on("error", reject);
+        r.end();
+      });
+    }
+
+    // ── Sitemap integration ──
+    const sitemap = await fetchPath("/sitemap.xml");
+    assertEq(sitemap.status, 200, "pr30 intg: GET /sitemap.xml -> 200");
+    assertTrue(sitemap.body.startsWith("<?xml"), "pr30 intg: sitemap is XML");
+    assertTrue(
+      sitemap.body.includes("<urlset"),
+      "pr30 intg: sitemap has <urlset>"
+    );
+    // The rich URL should appear with priority 0.8 + weekly.
+    const richSlug = "pr30-rik-gard";
+    const thinSlug = "pr30-tynn-bod";
+    assertTrue(
+      sitemap.body.includes("/produsent/" + richSlug),
+      "pr30 intg: sitemap includes /produsent/" + richSlug
+    );
+    assertTrue(
+      sitemap.body.includes("/produsent/" + thinSlug),
+      "pr30 intg: sitemap includes /produsent/" + thinSlug
+    );
+    // Locate the rich agent's <url> block and assert priority/changefreq/lastmod.
+    const richBlock = (() => {
+      const idx = sitemap.body.indexOf("/produsent/" + richSlug);
+      if (idx < 0) return "";
+      // Walk back to the previous <url> and forward to </url> to bound it.
+      const start = sitemap.body.lastIndexOf("<url>", idx);
+      const end = sitemap.body.indexOf("</url>", idx) + "</url>".length;
+      return sitemap.body.slice(start, end);
+    })();
+    assertTrue(
+      richBlock.includes("<priority>0.8</priority>"),
+      "pr30 intg: sitemap rich agent gets <priority>0.8</priority>"
+    );
+    assertTrue(
+      richBlock.includes("<changefreq>weekly</changefreq>"),
+      "pr30 intg: sitemap rich agent gets <changefreq>weekly</changefreq>"
+    );
+    assertTrue(
+      richBlock.includes("<lastmod>2026-05-10</lastmod>"),
+      "pr30 intg: sitemap rich agent <lastmod> matches agent_knowledge.updated_at date"
+    );
+
+    const thinBlock = (() => {
+      const idx = sitemap.body.indexOf("/produsent/" + thinSlug);
+      if (idx < 0) return "";
+      const start = sitemap.body.lastIndexOf("<url>", idx);
+      const end = sitemap.body.indexOf("</url>", idx) + "</url>".length;
+      return sitemap.body.slice(start, end);
+    })();
+    assertTrue(
+      thinBlock.includes("<priority>0.3</priority>"),
+      "pr30 intg: sitemap thin agent gets <priority>0.3</priority>"
+    );
+    assertTrue(
+      thinBlock.includes("<changefreq>monthly</changefreq>"),
+      "pr30 intg: sitemap thin agent gets <changefreq>monthly</changefreq>"
+    );
+    assertTrue(
+      thinBlock.includes("<lastmod>2026-03-15</lastmod>"),
+      "pr30 intg: sitemap thin agent <lastmod> matches agent_knowledge.updated_at date"
+    );
+
+    // ── Producer page integration ──
+    const producerPage = await fetchPath("/produsent/" + richSlug);
+    assertEq(producerPage.status, 200, "pr30 intg: GET /produsent/<rich-slug> -> 200");
+    assertTrue(
+      /<time datetime="2026-05-10T12:00:00\.000Z" class="updated-at">/.test(producerPage.body),
+      "pr30 intg: producer page emits <time datetime='<ISO>' class='updated-at'>"
+    );
+    assertTrue(
+      producerPage.body.includes("Profil oppdatert: i går"),
+      "pr30 intg: producer page shows 'Profil oppdatert: i går' for 1-day-old data"
+    );
+
+    // The <title> for the rich agent should carry the freshness suffix.
+    // We allow either Intl-style "(oppdatert mai 2026)" depending on the
+    // running clock; if the test runs after the 30d window the suffix won't
+    // be present and we'd want a deterministic check — so we narrow the
+    // assertion to a presence check on the structural tokens used by the
+    // helper. (The unit tests above already pin formatter behaviour.)
+    const titleMatch = producerPage.body.match(/<title>([^<]*)<\/title>/);
+    assertTrue(!!titleMatch, "pr30 intg: producer page has <title>");
+    // Either the suffix is there (if <30d at run time) or absent (>30d).
+    // Both are valid — but we MUST have at least the agent name.
+    assertTrue(
+      (titleMatch?.[1] || "").includes("PR30 Rik Gard"),
+      "pr30 intg: producer page <title> contains agent name"
+    );
+
+    server.close();
+    db.close();
+  } catch (err) {
+    failed++;
+    failures.push("pr30 intg: unexpected error: " + (err instanceof Error ? err.stack || err.message : String(err)));
+  }
+})();
+
 // ── REPORT ────────────────────────────────────────────────────────────
 // Wait for the M2 owner-portal async tests before reporting so their
 // pass/fail counts are included. (Pre-existing async integration tests
@@ -3913,6 +4339,7 @@ console.log("\n── PR-25: relaxed homepage-source backfill ──");
   try { await Promise.all(_pr21Promises); } catch { /* errors already pushed to failures */ }
   try { await _m2Promise; } catch { /* errors already pushed to failures */ }
   try { await _pr24Promise; } catch { /* errors already pushed to failures */ }
+  try { await _pr30Promise; } catch { /* errors already pushed to failures */ }
   // Drop pre-existing intg failures (unmasked by awaiting) — they predate M2
   // and live behind a separate fix-it task. Counting them here would surface
   // a baseline failure that is not introduced by this PR.
