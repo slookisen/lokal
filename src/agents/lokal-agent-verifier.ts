@@ -21,10 +21,12 @@ import { getDb } from "../database/init";
 import {
   crossSourceAgreement,
   aggregateVerdict,
+  domainCoherenceCheck,
   type FieldName,
   type ProvenanceRecord,
   type CrossSourceResult,
   type CrossSourceVerdict,
+  type DomainCoherenceResult,
 } from "../services/cross-source-validator";
 
 export interface VerifierResult {
@@ -43,6 +45,8 @@ export interface VerifierResult {
   url_last_probed: string | null;
   url_last_status: number | null;
   url_demoted: boolean;
+  // orch-PR-20260512-33: domain-coherence override (Eidsmo fix)
+  domain_incoherent: boolean;
 }
 
 export interface BrregLookupResult {
@@ -262,7 +266,8 @@ export function computeEnrichmentStatus(input: {
 export function pickBatch(db: any, limit = 30): any[] {
   return db
     .prepare(
-      `SELECT a.id, a.name, a.city AS location_city, k.email, k.phone, k.address,
+      `SELECT a.id, a.name, a.url AS agent_url, a.city AS location_city,
+              k.email, k.phone, k.address,
               k.website, k.about, k.products, k.field_provenance,
               k.verification_status, k.enrichment_status,
               k.last_verified_at, k.last_http_check_at, k.last_http_status
@@ -286,7 +291,8 @@ export function pickBatch(db: any, limit = 30): any[] {
 export function pickReviewQueueBatch(db: any, limit = 30): any[] {
   return db
     .prepare(
-      `SELECT a.id, a.name, a.city AS location_city, k.email, k.phone, k.address,
+      `SELECT a.id, a.name, a.url AS agent_url, a.city AS location_city,
+              k.email, k.phone, k.address,
               k.website, k.about, k.products, k.field_provenance,
               k.verification_status, k.enrichment_status,
               k.last_verified_at, k.last_http_check_at, k.last_http_status
@@ -517,7 +523,27 @@ export async function runVerifierBatch(opts: {
       );
     }
 
-    const newVerification = deriveVerificationStatus(gate.passes, gate.flags, agentVerdict);
+    // ── Domain-coherence check (orch-PR-20260512-33 / Eidsmo fix) ──────────
+    // Even when per-field cross-source agreement passes, if the homepage
+    // URL discovered for the agent disagrees with the website/email stored
+    // by enrichment, those signals are pointing at a DIFFERENT legal entity
+    // (e.g. two companies sharing an address). Force review_required so a
+    // human can pick which signals are correct before outreach fires.
+    const coherence: DomainCoherenceResult = domainCoherenceCheck(
+      agent.agent_url,
+      agent.website,
+      agent.email,
+    );
+    let newVerification = deriveVerificationStatus(gate.passes, gate.flags, agentVerdict);
+    if (!coherence.coherent) {
+      console.log(
+        `[verifier] ${agent.id} (${agent.name ?? "?"}) domain-incoherent: ${coherence.reason}`,
+      );
+      newVerification = "review_required";
+      // Surface the reason on the persisted cross_source_reason JSON so
+      // the review-queue UI / admin tooling can see why.
+      (crossSourceResults as Record<string, unknown>).domain_coherence = coherence;
+    }
     let newEnrichment = computeEnrichmentStatus({
       about: agent.about,
       products,
@@ -574,6 +600,7 @@ export async function runVerifierBatch(opts: {
       url_last_probed: probeResult ? startedAt : null,
       url_last_status: probeResult ? probeResult.status : null,
       url_demoted: urlDemoted,
+      domain_incoherent: !coherence.coherent,
     });
   }
 
@@ -602,6 +629,10 @@ export function buildRunEnvelope(input: {
   const httpUnreachable = r.filter((x) => x.flags.includes("website_unreachable")).length;
   const brregFlagged = r.filter((x) => x.flags.includes("brreg_inactive") || x.flags.includes("brreg_konkurs")).length;
   const newlyEligible = r.filter((x) => x.outreach_eligible_at !== null).length;
+  // orch-PR-20260512-33 (Eidsmo fix): track domain-coherence overrides so
+  // operators can see at a glance how many agents this hourly run pulled
+  // out of pool eligibility for mismatched website/email hosts.
+  const domainIncoherent = r.filter((x) => x.domain_incoherent).length;
 
   return {
     run_id: input.run_id,
@@ -618,6 +649,7 @@ export function buildRunEnvelope(input: {
       { type: "db_state_change", value: dataInsufficient, meta: { kind: "agents_data_insufficient" } },
       { type: "db_state_change", value: httpUnreachable, meta: { kind: "http_unreachable" } },
       { type: "db_state_change", value: brregFlagged, meta: { kind: "brreg_inactive_flagged" } },
+      { type: "db_state_change", value: domainIncoherent, meta: { kind: "agents_domain_incoherent" } },
       {
         type: "db_state_change",
         value: newlyEligible,

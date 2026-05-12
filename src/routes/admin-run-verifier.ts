@@ -89,6 +89,8 @@ router.post("/", async (req: Request, res: Response) => {
     const brregInactive = results.filter((r) =>
       r.flags.some((f: string) => f === "brreg_inactive" || f === "brreg_konkurs")
     ).length;
+    // orch-PR-20260512-33: domain-coherence overrides (Eidsmo fix)
+    const domainIncoherent = results.filter((r) => r.domain_incoherent).length;
     const pooledNew = results.filter((r) => r.outreach_eligible_at !== null).length;
 
     // Build envelope and record directly via service (no HTTP roundtrip)
@@ -118,6 +120,7 @@ router.post("/", async (req: Request, res: Response) => {
       data_insufficient: dataInsufficient,
       http_unreachable: httpUnreachable,
       brreg_inactive: brregInactive,
+      domain_incoherent: domainIncoherent,
       pool_added: pooledNew,
       envelope_recorded: envelopeRecorded,
       hour_utc: hourUTC,

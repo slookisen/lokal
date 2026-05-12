@@ -1525,7 +1525,7 @@ console.log("── agent-stats: per-agent stats endpoint logic ──");
   const sqlite = require("better-sqlite3");
   const wo8db = new sqlite(":memory:");
   wo8db.exec(`
-    CREATE TABLE agents (id TEXT PRIMARY KEY, name TEXT, role TEXT, city TEXT);
+    CREATE TABLE agents (id TEXT PRIMARY KEY, name TEXT, role TEXT, city TEXT, url TEXT);
     CREATE TABLE agent_knowledge (
       agent_id TEXT PRIMARY KEY,
       address TEXT, website TEXT, phone TEXT, email TEXT,
@@ -1593,7 +1593,7 @@ console.log("\n── PR-27: pickReviewQueueBatch unit tests ──");
   const sqlite = require("better-sqlite3");
   const db = new sqlite(":memory:");
   db.exec(`
-    CREATE TABLE agents (id TEXT PRIMARY KEY, name TEXT, role TEXT, city TEXT);
+    CREATE TABLE agents (id TEXT PRIMARY KEY, name TEXT, role TEXT, city TEXT, url TEXT);
     CREATE TABLE agent_knowledge (
       agent_id TEXT PRIMARY KEY,
       address TEXT, website TEXT, phone TEXT, email TEXT,
@@ -1763,7 +1763,7 @@ console.log("── PR-21 / WO-19: outreach_ready_pool freshness gate ──");
   const pooldb = new sqlite(":memory:");
   // Mirror the production schema for the columns the VIEW reads.
   pooldb.exec(`
-    CREATE TABLE agents (id TEXT PRIMARY KEY, name TEXT, role TEXT, city TEXT);
+    CREATE TABLE agents (id TEXT PRIMARY KEY, name TEXT, role TEXT, city TEXT, url TEXT);
     CREATE TABLE agent_knowledge (
       agent_id TEXT PRIMARY KEY,
       email TEXT, phone TEXT,
@@ -1887,6 +1887,8 @@ import {
   tierForSource,
   coerceProvenanceToArrayShape,
   aggregateVerdict,
+  domainCoherenceCheck,
+  isKnownDirectoryHost,
   type ProvenanceRecord,
   type CrossSourceResult,
 } from "../src/services/cross-source-validator";
@@ -2269,6 +2271,73 @@ console.log("\n── cross-source-validator: PR-19 verdict split ──");
     "pr19: legacy bool false → review_required (compat)");
   assertEq(deriveVerificationStatus(true, [], true), "verified",
     "pr19: legacy bool true → verified (compat)");
+}
+
+// ── orch-PR-20260512-33: domainCoherenceCheck (Eidsmo fix) ──────────────────
+console.log("\n── cross-source-validator: domainCoherenceCheck ──");
+
+{
+  const r = domainCoherenceCheck("https://eidsmokjott.no/", "https://eidsmokjott.no", "post@eidsmokjott.no");
+  assertEq(r.coherent, true, "dc: same domain across all three → coherent");
+}
+{
+  const r = domainCoherenceCheck("https://eidsmokjott.no/", "https://shop.eidsmokjott.no/", "kontakt@shop.eidsmokjott.no");
+  assertEq(r.coherent, true, "dc: subdomains under same root → coherent");
+}
+{
+  const r = domainCoherenceCheck("https://eidsmokjott.no/", "https://slakthuset.no", "post@eidsmokjott.no");
+  assertEq(r.coherent, false, "dc: website mismatch → incoherent");
+  assertTrue(/knowledge\.website/.test(r.reason || ""), "dc: website-mismatch reason mentions website");
+}
+{
+  const r = domainCoherenceCheck("https://eidsmokjott.no/", "https://eidsmokjott.no", "post@slakthuset.no");
+  assertEq(r.coherent, false, "dc: email mismatch with own-domain agent → incoherent");
+  assertTrue(/knowledge\.email/.test(r.reason || ""), "dc: email-mismatch reason mentions email");
+}
+{
+  const r = domainCoherenceCheck("https://gard.no/", "https://gard.no", "ola@gmail.com");
+  assertEq(r.coherent, true, "dc: free-mail email on own-domain agent → coherent (pass)");
+}
+{
+  const r1 = domainCoherenceCheck(null, "https://slakthuset.no", "post@slakthuset.no");
+  assertEq(r1.coherent, true, "dc: null agentUrl → coherent (no signal)");
+  const r2 = domainCoherenceCheck("", "https://slakthuset.no", "post@slakthuset.no");
+  assertEq(r2.coherent, true, "dc: empty agentUrl → coherent (no signal)");
+}
+{
+  const r = domainCoherenceCheck("https://eidsmokjott.no/", null, null);
+  assertEq(r.coherent, true, "dc: agentUrl set, both knowledge fields null → coherent");
+}
+{
+  // Specific Eidsmo case: website mismatch should take precedence over email mismatch
+  const r = domainCoherenceCheck(
+    "https://eidsmokjott.no/",
+    "https://slakthuset.no",
+    "post@slakthuset.no",
+  );
+  assertEq(r.coherent, false, "dc: Eidsmo case → incoherent");
+  assertTrue(
+    (r.reason || "").includes("knowledge.website") && (r.reason || "").includes("slakthuset.no") && (r.reason || "").includes("eidsmokjott.no"),
+    "dc: Eidsmo reason cites website mismatch (slakthuset.no != eidsmokjott.no)",
+  );
+}
+
+// orch-PR-20260512-33 iteration 2: directory-host bypass
+{
+  const r = domainCoherenceCheck("https://hanen.no/produsent/foo", "https://realproducer.no", "post@realproducer.no");
+  assertEq(r.coherent, true, "dc: hanen.no agentUrl → directory bypass coherent");
+}
+{
+  const r = domainCoherenceCheck("https://hanen.no", "https://realproducer.no", "post@otherco.no");
+  assertEq(r.coherent, true, "dc: hanen.no agentUrl with email mismatch → still bypass");
+}
+{
+  const r = domainCoherenceCheck("https://www.lokalmat.no/eidsmo", "https://eidsmokjott.no", "vidar@eidsmo.no");
+  assertEq(r.coherent, true, "dc: www.lokalmat.no agentUrl → directory bypass coherent");
+}
+{
+  assertEq(isKnownDirectoryHost("hanen.no"), true, "dc: isKnownDirectoryHost('hanen.no') → true");
+  assertEq(isKnownDirectoryHost("eidsmokjott.no"), false, "dc: isKnownDirectoryHost('eidsmokjott.no') → false");
 }
 
 // ── WO-16: Integration tests (runVerifierBatch with cross-source gate) ───────
