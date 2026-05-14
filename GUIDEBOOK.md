@@ -3,7 +3,7 @@
 
 **Project:** Rett fra Bonden (rettfrabonden.com)
 **Domain:** Local food producers in Norway
-**Timeline:** March 29 – April 21, 2026 (~3.5 weeks)
+**Timeline:** March 29, 2026 – ongoing (Phase 19 landed 2026-05-12 – 2026-05-14)
 **Result:** 1,416 live producer agents (1,400+ total records), 5 MCP marketplaces, A2A protocol, Custom GPT, Claude Connectors, AWS Bedrock AgentCore Registry
 **Auto-updated by:** `rfb-guidebook` scheduled agent
 
@@ -32,11 +32,12 @@
 17. [Phase 16: Automated Agent Operations](#phase-16)
 18. [Phase 17: Conversation System & AG-UI](#phase-17)
 19. [Phase 18: Verify-First Outreach — Quality Gate Before Marketing](#phase-18)
-20. [Appendix A: Tech Stack Reference](#appendix-a)
-21. [Appendix B: Deployment Checklist](#appendix-b)
-22. [Appendix C: Gotchas & Lessons Learned](#appendix-c)
-23. [Appendix D: Registry Status Matrix](#appendix-d)
-24. [Appendix E: Agent Prompts (Copy-Paste Ready)](#appendix-e)
+20. [Phase 19: Pool-Fill Push — Domain Coherence, Queue Drain, SEO Freshness](#phase-19)
+21. [Appendix A: Tech Stack Reference](#appendix-a)
+22. [Appendix B: Deployment Checklist](#appendix-b)
+23. [Appendix C: Gotchas & Lessons Learned](#appendix-c)
+24. [Appendix D: Registry Status Matrix](#appendix-d)
+25. [Appendix E: Agent Prompts (Copy-Paste Ready)](#appendix-e)
 
 ---
 
@@ -2844,6 +2845,216 @@ export function dedupeByEmail<T extends DedupeCandidate>(
 Surface change: the pool endpoint now accepts `?dedupe_by_email=true` (default ON as of PR-22, opt-out available for explicit-target testing).
 
 
+
+---
+
+<a id="phase-19"></a>
+## Phase 19: Pool-Fill Push — Domain Coherence, Queue Drain, SEO Freshness
+
+**Duration:** May 12 – May 14, 2026 (~3 days)
+**Commits:** `8baddc4`, `bf6f015`, `3674230`, `4b7d37c`, `707fac3`, `627be8d`, `5c01cf3`, `97c1d70`
+**Goal:** Close the long tail of Phase 18: get the 450+ agents stranded between `review_required` and `data_insufficient` into the pool without compromising the quality gate, and add SEO freshness signals so producer pages re-index quickly after enrichment writes.
+
+After Phase 18.11 the verifier pipeline was complete, but the pool was still leaking volume in four distinct ways: (1) PR-23's homepage-source backfill required `url_last_status` between 200–399, which most stranded rows had as NULL; (2) `aggregateVerdict()` let `business_status` (Google-Places-only, impossible to cross-source) tank otherwise-perfect agents; (3) the verifier scan order processed unverified-first, so backfilled rows would not be re-evaluated for weeks; and (4) two distinct legal entities sharing a physical address (Eidsmo Kjøtt vs. Slakthuset Eidsmo Dullum) snuck past cross-source agreement and ended up with the slaughterhouse's contact details. Phase 19 fixes each one and ships the SEO-side freshness signals that Phase 18's per-row `updated_at` writes were already producing.
+
+### 19.1 Homepage-source backfill — relax the URL-status precondition (PR-25, commit `8baddc4`)
+
+PR-23 attributed `address`, `phone`, and `business_status` for stranded agents to whichever source columns were populated (`homepage`, `google_places`, `facebook_official_page`). The homepage branch was guarded by `WHERE k.url_last_status BETWEEN 200 AND 399` — but `url_last_status` is populated by PR-21's link-freshness probe, which only ran for the 129 existing pool agents at the time. Result: ~450+ stranded agents got `google_places` attribution but no `homepage` attribution, leaving them at `source_count=1 → review_required`.
+
+PR-25 adds a second idempotent boot migration `pr25_backfill_homepage_source_v1` that runs the same backfill with the `url_last_status` precondition removed. JSON shape identical to PR-23, dedupes per-source within field. Expected unblock on next verifier cycle: 450+ agents from `review_required` → `verified`.
+
+### 19.2 `aggregateVerdict()` ignores `business_status` (PR-26, commit `bf6f015`)
+
+After PR-23 + PR-25, many agents had:
+- `address`: 2 sources → `pool_eligible`
+- `phone`: 2 sources → `pool_eligible`
+- `business_status`: 1 source (google_places only) → `review_required`
+
+The worst-bucket-wins logic in `aggregateVerdict()` let `business_status` tank these. Fix: introduce a `GATING_FIELDS = ["address", "phone"]` constant in `src/services/cross-source-validator.ts`. `business_status` is still computed and surfaced in the review-queue UI; it just doesn't gate pool eligibility.
+
+```ts
+// src/services/cross-source-validator.ts
+const GATING_FIELDS: readonly string[] = ["address", "phone"];
+
+export function aggregateVerdict(perField: Record<string, CrossSourceResult>): CrossSourceVerdict {
+  let hasInsufficient = false;
+  let hasReview = false;
+  for (const [field, r] of Object.entries(perField)) {
+    if (!GATING_FIELDS.includes(field)) continue;  // skip non-gating
+    if (r.verdict === "data_insufficient") hasInsufficient = true;
+    else if (r.verdict === "review_required") hasReview = true;
+  }
+  if (hasInsufficient) return "data_insufficient";
+  if (hasReview) return "review_required";
+  return "pool_eligible";
+}
+```
+
+Reasoning: `business_status` is Google-Places-canonical (operational / closed). Cross-source checking it is impossible without Facebook/Brreg data, which most Norwegian small producers lack.
+
+### 19.3 Queue-drain endpoint — `?reprocess_review_queue=1` (PR-27, commit `3674230`)
+
+`pickBatch()` orders by oldest `last_verified_at` ASC, which sorts unverified-first. PR-23/25/26 backfilled the 180+ agent review queue with recent `last_verified_at` timestamps, so the verifier would not naturally re-process them for weeks.
+
+`src/agents/lokal-agent-verifier.ts` adds `pickReviewQueueBatch()` — same shape as `pickBatch()` but scoped to `verification_status IN ('review_required', 'data_insufficient')`:
+
+```ts
+export function pickReviewQueueBatch(db: any, limit = 30): any[] {
+  return db.prepare(
+    `SELECT a.id, a.name, a.url AS agent_url, a.city AS location_city,
+            k.email, k.phone, k.address, k.website, k.about, k.products,
+            k.field_provenance, k.verification_status, k.enrichment_status,
+            k.last_verified_at, k.last_http_check_at, k.last_http_status
+       FROM agents a
+ INNER JOIN agent_knowledge k ON k.agent_id = a.id
+      WHERE k.verification_status IN ('review_required', 'data_insufficient')
+   ORDER BY COALESCE(k.last_verified_at, '1970-01-01') ASC
+      LIMIT ?`
+  ).all(limit);
+}
+```
+
+`/admin/run-verifier` now accepts `reprocess_review_queue=1` (query or body). When set, it swaps the `pickFn`:
+
+```
+POST /admin/run-verifier?force=1&reprocess_review_queue=1&batchSize=50
+```
+
+The run-envelope echoes the flag back so observers can distinguish drain runs from normal cycles.
+
+### 19.4 Defensive `field_provenance` handling in `PUT /admin/knowledge` (PR-28, commit `4b7d37c`)
+
+P1 hot-fix. `PUT /admin/knowledge` was returning plain-HTML 500 (escaping the route's try/catch) on `address` and `phone` writes, but worked on `business_status`. Root cause: the Phase-51 backfill that originally seeded `field_provenance` wrote records *without* a `value` field — just `{source_type, source_url, evidence_level, confidence, fetched_at, …}`. Phase-53 later wrapped those in arrays. Then `dedupKey()` did `rec.value.trim()` → `TypeError: undefined.trim` → bubbled past the route's try/catch (which only wrapped the `tx()` call) → Express default HTML 500. `business_status` was unaffected because Phase-51's trackable-field list excluded it.
+
+Fix:
+
+```ts
+// src/routes/admin-knowledge.ts
+function dedupKey(rec: any): string | null {
+  // PR-28: return null instead of throwing on missing / non-string fields
+  if (!rec || typeof rec.value !== "string") return null;
+  return `${rec.source_type ?? ""}::${rec.value.trim().toLowerCase()}`;
+}
+
+function isWellFormedRecord(rec: any): boolean {
+  return rec && typeof rec.value === "string" && rec.value.length > 0;
+}
+
+// mergeFieldProvenance call now wrapped — returns JSON 500 not HTML
+try {
+  next = mergeFieldProvenance(existing, incoming);
+} catch (e) {
+  return res.status(500).json({ error: "field_provenance_merge_failed", detail: String(e) });
+}
+```
+
+Existing-field arrays are now filtered through `isWellFormedRecord()` before deduping so malformed legacy records don't poison the merge.
+
+### 19.5 Related-producers section on `/produsent/<slug>` (PR-29, commit `707fac3`)
+
+The internal-link density on producer pages was too low — Search Console reported 1,195 "Discovered – currently not indexed" URLs (May 2026 snapshot). PR-29 adds two server-rendered sections to each producer page (`src/routes/seo.ts`):
+
+- *Andre lokale matprodusenter i [city]* — 3–5 producers in the same city
+- *Andre [category]-produsenter i Norge* — 3–5 producers in the same primary category, preferring non-same-city for geographic diversity
+
+SQL:
+```sql
+-- same-city query (simplified)
+SELECT a.id, a.name, a.url, a.city
+  FROM agents a
+  LEFT JOIN agent_knowledge k ON k.agent_id = a.id
+ WHERE a.id != ?
+   AND a.city = ?
+   AND k.is_active = 1
+   AND a.agent_type = 'producer'
+ ORDER BY (k.verification_status = 'verified') DESC,
+          (k.enrichment_status = 'rich') DESC,
+          RANDOM()
+ LIMIT 5;
+```
+
+Empty result → no UI rendered (graceful). Server-rendered, no JS, ~4.6 KB additional per page. Visible to Googlebot, GPTBot, ClaudeBot, and the standard MCP discovery crawlers. The `try { … } catch` wraps both queries so a SQL error never 500s the producer page — supplementary content fails quietly.
+
+### 19.6 Freshness signals: badge, `<title>` suffix, sitemap (PR-30, commit `627be8d`)
+
+`src/utils/freshness.ts` is a new pure-function module wired into three render surfaces:
+
+```ts
+// Three exported helpers (no I/O, no Express, no DB):
+parseIsoOrSqlite(value)                 // tolerates "2026-05-11T10:00:00Z" + SQLite "2026-05-11 10:00:00"
+formatUpdatedPrettyNo(updatedAt, now)   // "i dag" | "for N dager siden" | "11. mai 2026"
+titleFreshnessSuffix(updatedAt, now, 30) // " (oppdatert mai 2026)" inside the 30-day window, else ""
+sitemapHintsForStatus(status)           // rich→0.8/weekly, partial→0.5/monthly, thin/other→0.3/monthly
+lastmodForDate(d)                       // YYYY-MM-DD (matches existing static-page sitemap shape)
+```
+
+Wired in:
+1. **Visible badge on `/produsent/<slug>`** — `<time datetime="…" class="updated-at">Profil oppdatert: 11. mai 2026</time>` near the top of the hero block. AI-bot-visible (SSR, no JS).
+2. **`<title>` suffix** — when `agent_knowledge.updated_at` is < 30 days old, the page `<title>` gets a ` (oppdatert mai 2026)` suffix to boost CTR in search results.
+3. **`sitemap.xml` per-URL** — `<lastmod>`, `<priority>`, `<changefreq>` driven by `agent_knowledge.updated_at` + `enrichment_status` instead of a hardcoded site-wide weekly stamp.
+
+Locale is hardcoded (NB month names in `freshness.ts`) so the deploy-host's ICU build doesn't affect output. Tests cover boundary cases (29d → suffix present, 31d → suffix absent, NULL → empty string).
+
+### 19.7 Test-hang hot-fix (PR-31 / PR-32, commits `627be8d`-`5c01cf3`)
+
+PR-29 introduced `require("../src/routes/seo")` for the related-producers SQL helpers. Importing `seo.ts` instantiates an Express router that lazily references the DB, which in turn keeps an open libuv handle alive after the test REPORT block. CI deploys stopped passing because Node held the process open past the 5-minute test budget.
+
+PR-31 trimmed 5 schema-coupled integration tests. PR-32 added the actual fix:
+
+```ts
+// tests/test.ts, at the end of the REPORT block
+console.log(`\nTests: ${passed}/${total} passed`);
+process.exit(0);  // PR-32: explicit exit to prevent CI hangs
+```
+
+Auto-merged via `protocols/auto-merge.md`. 514/514 tests pass post-hotfix.
+
+### 19.8 Domain-coherence check — the Eidsmo Kjøtt fix (PR-33, commit `97c1d70`)
+
+On 2026-05-12 an outreach incident surfaced: agent `Eidsmo Kjøtt` (orgnr 995662175, agents.url=`eidsmokjott.no`) had `knowledge.website=slakthuset.no` and `knowledge.email=post@slakthuset.no`. Cross-source agreement (WO-16) passed because address and phone matched — both companies operate at the same physical address. But they're distinct legal entities: `Slakthuset Eidsmo Dullum AS` (orgnr 988300020, the slaughterhouse) was enriched into the `Eidsmo Kjøtt` row. Marketing mailed the wrong company.
+
+`src/services/cross-source-validator.ts` adds `domainCoherenceCheck()` — pure function comparing the registrable domain of `agents.url` against `knowledge.website` and `knowledge.email`:
+
+```ts
+export function domainCoherenceCheck(
+  agentUrl: string | null | undefined,
+  knowledgeWebsite: string | null | undefined,
+  knowledgeEmail: string | null | undefined
+): DomainCoherenceResult
+```
+
+Key design choices:
+- **Registrable domain (eTLD+1)** — `mat.eidsmokjott.no` vs `eidsmokjott.no` is coherent. `MULTI_LABEL_SUFFIXES = ["co.uk", "com.au", "co.nz", "co.jp"]` so multi-label public suffixes get the right number of labels; `.no` and most others use last-2.
+- **Free-mail bypass** — `gmail.com`, `outlook.com`, `hotmail.com`, `yahoo.com`, `proton.me`, `protonmail.com`, `icloud.com`, `live.com`, `msn.com`. Personal email on commodity providers is signal-free.
+- **Directory-host bypass** — if `agents.url` itself is a directory listing (Hanen, Lokalmat, Brreg, Facebook, Instagram, Bondensmarked, Gulesider, Proff, Visitnorway, 1881, Reko, Matprat, Matnyhetene, Bondebladet, Kortreist(mat), LinkedIn, etc.), it is NOT the entity-truth signal — discovery saved the directory listing, and enrichment correctly upgraded `knowledge.website` to the producer's real site. Returning incoherent here would mass-demote ~199 agents whose `agents.url` is `hanen.no/produsent/<slug>`. Bypass: return coherent.
+- **Website-first** — `knowledge.website` is the stronger signal (it's a URL the enrichment crawler resolved). If `website` disagrees, that's the reason. If only `email` disagrees (and isn't free-mail), that's the reason.
+
+Wired into `lokal-agent-verifier.ts` after `aggregateVerdict()` and before the final `deriveVerificationStatus()` call:
+
+```ts
+const coherence = domainCoherenceCheck(agent.agent_url, agent.website, agent.email);
+let newVerification = deriveVerificationStatus(gate.passes, gate.flags, agentVerdict);
+if (!coherence.coherent) {
+  newVerification = "review_required";
+  (crossSourceResults as Record<string, unknown>).domain_coherence = coherence;
+}
+```
+
+Surfacing: the reason JSON is appended to the existing `cross_source_reason` column (no schema change), and a run-envelope claim `agents_domain_incoherent` is emitted for observability. Tests: 531 passing (+5 vs PR-32 main). `tsc --noEmit` clean.
+
+### 19.9 Operational state at the end of Phase 19
+
+| Signal | Value |
+|---|---|
+| Tests | 531/531 passing |
+| `verification_status` distribution (post-deploy) | Pending PR-25/26 verifier cycle to drain |
+| New review-queue triage path | `POST /admin/run-verifier?force=1&reprocess_review_queue=1&batchSize=50` |
+| New observability claim | `agents_domain_incoherent` in run-envelope |
+| New pure-function modules | `domainCoherenceCheck`, `freshness.ts` (5 helpers) |
+| SEO-visible additions | Profil-oppdatert badge, title suffix, per-URL sitemap hints, related-producers sections |
+
+
+
 ---
 
 <a id="appendix-a"></a>
@@ -3048,6 +3259,20 @@ Post-deploy:
 
 69. **1271 stranded agents had the data, just not the provenance — retroactive synthesis from existing columns** — After PR-19 + PR-24, 1271 agents that *were* enriched (homepage / google_places / facebook populated in `agent_knowledge`) but were enriched *before* per-field `field_provenance` existed got stranded in `data_insufficient`. They had no `field_provenance` rows even though the data was on disk. PR-23 adds a chunked, idempotent boot migration that synthesizes provenance retroactively: for each stranded row, attribute `address`/`phone`/`business_status` to the existing column source (`homepage`, `google_places`, `facebook_official_page` — whichever are populated). No fabrication — only attestation of what's already there. Expected unblock: 250–500 agents from `data_insufficient`/`pending_verify` → `verified`/pool over 1–3 verifier cycles. **Caveat:** `business_status` ends up attributed to every source, which neutralises it as a *cross-source* gating field (a field can't disagree with itself). Pool eligibility effectively becomes `address + phone + source_count ≥ 2`. Right trade-off for unblocking 1271 rows. **Rule:** when a metadata-only migration would unblock substantial volume, prefer "synthesize from extant data" over "wait for re-enrichment to catch up" — but always document which fields lose redundancy in the process. Commit: `2e7895f`. See Phase 18.8.
 
+70. **Backfill migration's `WHERE` clause excluded the rows you actually wanted to fix** — PR-23 attributed homepage provenance for stranded agents but gated the homepage branch on `url_last_status BETWEEN 200 AND 399`. `url_last_status` is populated by PR-21's link-freshness probe, which had only ever run for the 129 then-pool agents. ~450+ stranded rows had NULL there, so the migration silently skipped homepage attribution and they stayed at `source_count=1 → review_required`. PR-25 ships a second migration with the precondition removed. **Rule:** a migration's `WHERE` clause is the most important line in the file — it decides which rows actually receive the fix. When backfilling provenance/metadata, always run a `SELECT COUNT(*)` with the exact same `WHERE` before writing the migration and compare against the population you intended to repair. If they don't match, the precondition is the bug. Commit: `8baddc4`. See Phase 19.1.
+
+71. **Worst-bucket-wins lets a non-cross-sourceable field tank otherwise-perfect agents** — `aggregateVerdict()` returned the worst per-field verdict across `[address, phone, business_status]`. `business_status` is Google-Places-canonical (operational / closed), and most Norwegian small producers have no second source (no Facebook page, no Brreg op-status feed) — so it permanently sat at 1 source → `review_required`. Even after PR-23 + PR-25 gave every agent two sources for address + phone, the agent-level verdict was `review_required` because of `business_status`. PR-26 introduces `GATING_FIELDS=["address", "phone"]`; `business_status` is still computed and shown in the review-queue UI, but no longer gates pool eligibility. **Rule:** when aggregating per-field quality signals, separate the fields you *gate on* from the fields you *display*. A field that can't fail "well" (no second source ever) shouldn't dominate the agent-level verdict. Commit: `bf6f015`. See Phase 19.2.
+
+72. **`pickBatch()` ordered by oldest `last_verified_at` ASC — backfilled rows queue at the back** — PR-23/25/26 stamped fresh `last_verified_at` values onto 180+ review-queue rows when applying their backfilled provenance. `pickBatch()` sorts by `COALESCE(last_verified_at, '1970-01-01') ASC`, so still-unverified agents always picked first. The 180-row queue would drain at the natural verifier cadence — weeks. PR-27 adds `pickReviewQueueBatch()`, scoped to `verification_status IN ('review_required', 'data_insufficient')`, exposed via `POST /admin/run-verifier?reprocess_review_queue=1`. **Rule:** if you write a batch operation that bumps a "freshness" timestamp on many rows, also provide a way to *re-evaluate* those rows specifically — otherwise your scan order will treat them as already-done. Commit: `3674230`. See Phase 19.3.
+
+73. **`dedupKey(rec.value.trim())` blew up on legacy records that never had a `value` field** — Phase-51 wrote `field_provenance` records as `{source_type, source_url, evidence_level, confidence, fetched_at}` — no `value` field. Phase-53 wrapped those into arrays. Then `PUT /admin/knowledge`'s deduper called `rec.value.trim()` and crashed with `TypeError: Cannot read properties of undefined (reading 'trim')`. The error escaped the route's `try/catch` (which only wrapped the `tx()` call, not the merge), so Express served a default HTML 500. The 500 only fired on `address` / `phone` writes because Phase-51's trackable-field list excluded `business_status`. PR-28 makes `dedupKey()` return `null` instead of throwing, adds `isWellFormedRecord()` to filter malformed rows out of existing arrays before deduping, and wraps `mergeFieldProvenance()` in its own `try/catch` returning JSON `{error, detail}` 500 instead of HTML 500. **Rule:** if your schema evolved through 2+ migrations, your readers must defensively handle every prior shape — and the route's `try/catch` must wrap *every* call that touches user data, not just the obvious one. Commit: `4b7d37c`. See Phase 19.4.
+
+74. **`require()` of a route file at test time keeps libuv handles open → CI hangs forever** — PR-29 introduced `require("../src/routes/seo")` so tests could exercise the related-producers SQL helpers. Importing `seo.ts` constructs an Express router whose handlers lazily reference the DB module; that's enough for Node to keep an open handle past the test REPORT block. The test process never exited, the CI deploy step timed out, and the GitHub-Actions Fly deploy chain stopped firing on every commit between PR-29 and PR-32. PR-31 trimmed schema-coupled tests (incidentally helpful), PR-32 added the actual fix — an explicit `process.exit(0)` at the end of the test REPORT block. **Rule:** any test runner that finishes its assertions but doesn't exit cleanly is one `require()` away from CI silently breaking. If you don't control every module imported by your tests, end the test file with an explicit `process.exit(passed === total ? 0 : 1)` — don't rely on Node draining the event loop. Commit: `5c01cf3`. See Phase 19.7.
+
+75. **Two distinct legal entities at the same address silently merged by enrichment — domain coherence catches what address-agreement can't** — `Eidsmo Kjøtt AS` (orgnr 995662175, `eidsmokjott.no`) and `Slakthuset Eidsmo Dullum AS` (orgnr 988300020, `slakthuset.no`) operate from the same physical address. Google-Places enrichment for the Eidsmo Kjøtt row pulled the slaughterhouse's homepage and email, so `agents.url=eidsmokjott.no` but `knowledge.website=slakthuset.no` and `knowledge.email=post@slakthuset.no`. WO-16 cross-source agreement *passed* (address + phone matched — they share both), and marketing mailed the slaughterhouse pretending to be the Eidsmo Kjøtt producer. Fix: `domainCoherenceCheck()` compares the registrable domain (`eTLD+1`, with multi-label-suffix support for `.co.uk` / `.com.au` / etc.) of `agents.url` against `knowledge.website` and `knowledge.email`. Mismatches force `review_required`. Critical bypasses: (a) free-mail email (gmail/outlook/proton/…) is signal-free, do not penalize; (b) when `agents.url` is itself a known directory host (Hanen, Lokalmat, Brreg, Bondensmarked, Facebook, Instagram, Visitnorway, Proff, Gulesider, 1881, Reko, Matprat, Matnyhetene, Bondebladet, Kortreist/Kortreistmat, LinkedIn — full list in `KNOWN_DIRECTORY_HOSTS`), do not penalize, because the inverse case (discovery saved the directory listing, enrichment upgraded `knowledge.website` to the producer's real site) is the correct outcome and would otherwise mass-demote ~199 agents. **Rule:** cross-source agreement on a *field* is necessary but not sufficient — when two entities can share the field, you need an *identity* check too. For producers in Norway, the domain of the website/email is the cheapest entity-identity signal we have. Commit: `97c1d70`. See Phase 19.8.
+
+76. **Sitemap and freshness signals belong on every page that updates — not the site root** — Google Search Console reported 1,195 "Discovered – currently not indexed" producer URLs in May 2026. The static-page sitemap had a single weekly `lastmod` for the whole site, so Google had no signal that any *specific* page had been updated even though hourly enrichment was writing to `agent_knowledge.updated_at` on most rows. PR-30 wires a pure-function freshness module (`src/utils/freshness.ts`) into three render surfaces: (1) a `<time class="updated-at">Profil oppdatert: 11. mai 2026</time>` badge on `/produsent/<slug>`, (2) a 30-day-window `<title>` suffix `(oppdatert mai 2026)` to boost CTR, (3) per-URL `<lastmod>` + `<priority>` + `<changefreq>` in `sitemap.xml` driven by `enrichment_status` (`rich → 0.8/weekly`, `partial → 0.5/monthly`, `thin/other → 0.3/monthly`). Locale-hardcoded (NB month names baked into freshness.ts) so the deploy-host's ICU build doesn't change output. PR-29 separately ships related-producer sections (`Andre lokale matprodusenter i [city]` + `Andre [kategori]-produsenter`) to boost internal-link density on the same pages. **Rule:** when a SEO surface has hourly background updates but the freshness signals are static, Google has no reason to re-crawl. The signal must arrive at the same granularity as the change. Commits: `707fac3`, `627be8d`. See Phase 19.5 + 19.6.
+
 
 
 ### C.2 Architecture Decisions
@@ -3236,8 +3461,9 @@ to build the same platform for a different vertical.
 | 2026-04-30 | 16, 17, C | CI cache-bust fix: `.github/workflows/fly-deploy.yml` now threads `--build-arg BUILD_REV=${{ github.sha }}` (16.4) — without it, GH-Actions builds defaulted `ARG BUILD_REV=dev` and Fly's remote builder reused the cached `COPY src/` layer for three weeks. `/a2a` POST hardened against header-less probes: returns JSON-RPC `-32700` (HTTP 400) instead of HTML 500, likely cause of the sticky `a2aregistry.org` maintainer note that PUT refresh couldn't clear (17.7). Repo hygiene: `mcp-server/node_modules/` untracked (~28 MB), six dead files removed (`seo-backup.ts`, `LokalApp_copy.jsx`, two PowerShell scripts, etc.) — `tsc` and 39/39 tests still pass. Stale narrator + fallback literals walked from `1,170+` → `1,180+` → `1,195+` to match prod (DB at 1,195). Appendix C: C.47 (`Array.isArray` guard — strings have `.length` too), C.48 (CI deploy must thread `BUILD_REV`), C.49 (A2A endpoint guard for missing body / wrong Content-Type), C.50 (`/sok` H1 was always `30 treff`), C.51 (`/llms.txt` reported slice length not Map size). |
 | 2026-05-04 to 2026-05-07 | 18 (new), 4, 9, 13, C | Phase 18 verify-first foundation: `outreach_ready_pool` VIEW + 7 new `agent_knowledge` columns + `outreach_sent_log` ledger + Tier-B provenance backfill (WO #7, `909cc9d`). `lokal-agent-verifier` library with pure-functional 5-rule kvalitets-gate + 8 new tests (WO #8, `e463481`). Runner script with 22-06 UTC time-window gate (`60fda88` → `8326541` → `b49ecbe`). Option B `/admin/run-verifier` endpoint after Fly volumes-not-shared blocker capped pool at 13 (`aae5e93`, `bac5858`). `PATCH /agents/:id` allow-list now includes `city` for CS geo-fixes (Haugerud Gård / Buskerud, `2f21686`). CRM rate-limit narrowed to cold-outreach only — CS responses to inbound never blocked (`3d78b5d`). `/.well-known/agent-card.json` now emits top-level `homepage` + `iconUrl` for registry display (`61e08e2`). `mcp-server/package.json` bumped to 0.3.4 awaiting Daniel's `npm publish` (`5296480`). Appendix C: C.52 (Fly volumes not shared between machines), C.53 (`buildRunEnvelope` omits required `evidence`), C.54 (CRM rate-limit must distinguish cold-outreach from CS reply), C.55 (admin PATCH allow-list missed `city`), C.56 (A2A registries need top-level `homepage`/`iconUrl`). |
 | 2026-05-08 to 2026-05-11 | 6, 18, C | Selger/Eier portal M1+M2: magic-link backend (`127a4ce`), 5 server-rendered HTML routes + claim CTAs + audit trail (`442d551`), P0 hot-fixes for non-existent `slug` column + `/min-profil/feil` redirect (`13594de`), canonical `isAgentClaimed()` revert (`924066f`), CI m2-A3 test gate (`372033e`), Norwegian Bokmål magic-link email body + 7-day expiry (`442d551`). Selger.html hardening: UUID race-condition fix between Handler 1 / Handler 2 (`5833028`), `payload.data.agent.name` parser fix (`6d8dfc4`). Blocklist policy reversal: drop `email_domain` (gmail.com was blocking every gmail user from M2 self-registration), literal-email only, idempotent purge migration (`5f48132`). Zod v4 `.issues` compat in 3 marketplace error paths + re-applied lost description-length client check (`de2b81c`). Phase 18 hardening: cross-source verification gate WO-16 (`679d58e`) + admin needs-review queue (`d33d855`), `data_insufficient` bucket split from `review_required` (`b5bdab5`), URL-freshness probe + auto-demote (`2611f7c`), recipient-email dedupe (`7b51c97`), retroactive provenance backfill for 1271 stranded agents (`2e7895f`), `PUT /admin/knowledge` endpoint to fix pool-freeze at 129 (`829b386`). Appendix C: C.57 (non-existent `slug` column), C.58 (redirect to unregistered route), C.59 (canonical `isAgentClaimed()` helper), C.60 (two competing query-param handlers), C.61 (`data.agent.name` vs `data.name`), C.62 (`email_domain` blocks free-mail), C.63 (Zod v4 `.issues` rename), C.64 (orchestration patch lost in-memory), C.65 (cross-source `data_insufficient` split), C.66 (pool-VIEW link-freshness), C.67 (recipient-email dedupe), C.68 (enrichment must write `field_provenance`), C.69 (retroactive provenance synthesis). |
+| 2026-05-12 to 2026-05-14 | 19 (new), 5, 18, C | Phase 19 pool-fill push: homepage-source backfill with `url_last_status` precondition relaxed unblocks ~450 stranded agents (PR-25 / `8baddc4`, 19.1); `aggregateVerdict()` gated by `GATING_FIELDS=[address,phone]` so `business_status` no longer tanks otherwise-perfect rows (PR-26 / `bf6f015`, 19.2); `POST /admin/run-verifier?reprocess_review_queue=1` flag + `pickReviewQueueBatch()` drains the 180+ review queue (PR-27 / `3674230`, 19.3); defensive `PUT /admin/knowledge` for malformed legacy `field_provenance` records — P1 hot-fix for HTML 500 on address/phone writes (PR-28 / `4b7d37c`, 19.4). SEO: related-producer sections (same city + same category, 3–5 each, server-rendered, no JS) on `/produsent/<slug>` to address 1,195 Discovered-not-indexed URLs (PR-29 / `707fac3`, 19.5); freshness signals — Profil-oppdatert badge, 30-day `<title>` suffix, per-URL `<lastmod>`/`<priority>`/`<changefreq>` in sitemap (PR-30 / `627be8d`, 19.6); CI hang hot-fix `process.exit(0)` after `seo.ts` route-require kept libuv handles alive (PR-31/32 / `5c01cf3`, 19.7). Domain-coherence check catches the Eidsmo Kjøtt incident — two legal entities sharing an address; `domainCoherenceCheck()` compares registrable domain of `agents.url` vs `knowledge.website`/`knowledge.email`, with free-mail and directory-host bypasses, demotes mismatches to `review_required`, emits `agents_domain_incoherent` claim (PR-33 / `97c1d70`, 19.8). 531/531 tests passing. Appendix C: C.70 (migration `WHERE` excluded target rows), C.71 (worst-bucket-wins for non-cross-sourceable field), C.72 (scan order pushes backfilled rows to the back), C.73 (legacy `field_provenance` without `value`), C.74 (`require()` of route file → CI hangs), C.75 (domain coherence for distinct entities at shared address), C.76 (freshness signals must be per-page, not site-wide). |
 
 ---
 
-*Last updated: 2026-05-11 (14:00 CEST) by rfb-guidebook agent*
-*Guide version: 1.7.0*
+*Last updated: 2026-05-14 (14:00 CEST) by rfb-guidebook agent*
+*Guide version: 1.8.0*
