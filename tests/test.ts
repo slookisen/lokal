@@ -5931,6 +5931,183 @@ console.log("── PR-29 related-producers tests ──");
     "phase5.11-a5: National has parent_umbrella_id=NULL (no breadcrumb rendered)");
 }
 
+// ─── Phase 5.11 A6 (PR-52): homepage umbrella shortcut ──────────────
+//
+// Adds a "Markeder og paraplyer" section to the GET / homepage so users
+// (and AI crawlers) can discover umbrella networks like Bondens marked
+// Norge without knowing the direct /produsent/<slug> URL.
+//
+// The query filters parent_umbrella_id IS NULL so only national-level
+// umbrellas appear; lokallag drilldown is via the national profile page.
+//
+// Section is render-gated: if zero rows match, no heading is emitted.
+{
+  console.log("\n── Phase 5.11 A6 (PR-52): homepage umbrella shortcut ──");
+  const fs = require("fs");
+  const Database = require("better-sqlite3");
+  const seoSrc = fs.readFileSync("src/routes/seo.ts", "utf8");
+
+  // ─── Source-presence: section heading + EN copy ──────────────────
+  assertTrue(
+    /Phase 5\.11 A6: Umbrella discovery section/.test(seoSrc),
+    "phase5.11-a6: CSS comment marker for A6 umbrella section present"
+  );
+  assertTrue(
+    /Phase 5\.11 A6: Top-level umbrella shortcut/.test(seoSrc),
+    "phase5.11-a6: handler comment marker for A6 query present"
+  );
+  assertTrue(
+    /"Markeder og paraplyer"/.test(seoSrc),
+    "phase5.11-a6: Norwegian section label 'Markeder og paraplyer' in source"
+  );
+  assertTrue(
+    /"Markets & Networks"/.test(seoSrc),
+    "phase5.11-a6: English section label 'Markets & Networks' in source"
+  );
+  assertTrue(
+    /"Markedsnettverk i Norge"/.test(seoSrc),
+    "phase5.11-a6: Norwegian section title 'Markedsnettverk i Norge' in source"
+  );
+  assertTrue(
+    /"Norwegian market networks"/.test(seoSrc),
+    "phase5.11-a6: English section title 'Norwegian market networks' in source"
+  );
+
+  // ─── Source-presence: query filters + render gating ──────────────
+  assertTrue(
+    /AND parent_umbrella_id IS NULL/.test(seoSrc),
+    "phase5.11-a6: query filters parent_umbrella_id IS NULL (national-level only)"
+  );
+  assertTrue(
+    /umbrella_type != 'venue'/.test(seoSrc),
+    "phase5.11-a6: query excludes venue-type umbrellas"
+  );
+  assertTrue(
+    /umbRows\.length > 0/.test(seoSrc),
+    "phase5.11-a6: section render gated on umbRows.length > 0 (hidden when empty)"
+  );
+  assertTrue(
+    /\$\{umbrellaSectionHtml\}/.test(seoSrc),
+    "phase5.11-a6: umbrellaSectionHtml interpolated into homepage template"
+  );
+
+  // ─── Source-presence: link target uses slugify ───────────────────
+  assertTrue(
+    /href="\/produsent\/\$\{slug\}"/.test(seoSrc),
+    "phase5.11-a6: umbrella cards link to /produsent/<slug>"
+  );
+
+  // ─── Source-presence: CSS class definitions ──────────────────────
+  assertTrue(
+    /\.umb-card \{[\s\S]{0,200}border-radius:/.test(seoSrc),
+    "phase5.11-a6: .umb-card CSS rule defined"
+  );
+  assertTrue(
+    /\.umb-card-badge \{[\s\S]{0,200}background:/.test(seoSrc),
+    "phase5.11-a6: .umb-card-badge CSS rule defined"
+  );
+  assertTrue(
+    /\.umb-grid \{[\s\S]{0,200}grid-template-columns:/.test(seoSrc),
+    "phase5.11-a6: .umb-grid CSS rule defined"
+  );
+
+  // ─── Runtime: query semantics via in-memory DB ───────────────────
+  // Build the agents schema and exercise the exact SQL the handler runs.
+  // Three scenarios:
+  //  1. With 1 national umbrella + 13 lokallag + 0 venues: returns just 1
+  //  2. With 0 umbrellas at all: returns 0 (section hidden)
+  //  3. With 2 national umbrellas: returns both, ORDER BY member_count DESC
+  const a6db = new Database(":memory:");
+  a6db.pragma("foreign_keys = ON");
+  a6db.exec(`
+    CREATE TABLE agents (
+      id TEXT PRIMARY KEY, name TEXT NOT NULL, api_key TEXT UNIQUE NOT NULL,
+      role TEXT NOT NULL DEFAULT 'producer', is_active INTEGER DEFAULT 1,
+      umbrella_type TEXT, parent_umbrella_id TEXT, umbrella_member_count INTEGER
+    );
+  `);
+  const insA6 = a6db.prepare(`
+    INSERT INTO agents (id, name, api_key, role, is_active, umbrella_type, parent_umbrella_id, umbrella_member_count)
+    VALUES (?, ?, ?, 'producer', 1, ?, ?, ?)
+  `);
+  // Scenario 1: national + lokallag + venue + plain producer
+  insA6.run("bm-nat", "Bondens marked Norge", "k-bm-nat", "market_network", null, 13);
+  insA6.run("bm-oslo", "Bondens marked Oslo", "k-bm-oslo", "market_network", "bm-nat", 4);
+  insA6.run("bm-mandal", "Bondens marked Mandal", "k-bm-mandal", "venue", "bm-oslo", null);
+  insA6.run("erga", "Erga Gårdsutsalg", "k-erga", null, null, null);
+
+  const query = `
+    SELECT id, name, umbrella_type, umbrella_member_count
+    FROM agents
+    WHERE umbrella_type IS NOT NULL
+      AND umbrella_type != 'venue'
+      AND is_active = 1
+      AND parent_umbrella_id IS NULL
+    ORDER BY COALESCE(umbrella_member_count, 0) DESC, name ASC
+    LIMIT 6
+  `;
+  const rows1 = a6db.prepare(query).all() as any[];
+  assertEq(rows1.length, 1, "phase5.11-a6: scenario 1 — query returns exactly the 1 national umbrella");
+  assertEq(rows1[0].id, "bm-nat", "phase5.11-a6: scenario 1 — id is bm-nat (Bondens marked Norge)");
+  assertEq(rows1[0].name, "Bondens marked Norge", "phase5.11-a6: scenario 1 — name is 'Bondens marked Norge'");
+  assertEq(rows1[0].umbrella_member_count, 13, "phase5.11-a6: scenario 1 — member_count surfaces to render");
+
+  // Slug verification — the rendered href uses slugify(name)
+  // We don't import slugify here, but assert the expected slug pattern
+  // is what the test for /produsent/<slug> would target.
+  const expectedSlug = rows1[0].name.toLowerCase().replace(/\s+/g, "-").replace(/[^a-z0-9-]/g, "");
+  assertEq(expectedSlug, "bondens-marked-norge",
+    "phase5.11-a6: slug format for Bondens marked Norge resolves to 'bondens-marked-norge'");
+
+  // Scenario 2: 0 umbrellas — render gate hides section
+  const a6db2 = new Database(":memory:");
+  a6db2.exec(`
+    CREATE TABLE agents (
+      id TEXT PRIMARY KEY, name TEXT NOT NULL, api_key TEXT UNIQUE NOT NULL,
+      role TEXT NOT NULL DEFAULT 'producer', is_active INTEGER DEFAULT 1,
+      umbrella_type TEXT, parent_umbrella_id TEXT, umbrella_member_count INTEGER
+    );
+  `);
+  a6db2.prepare(`
+    INSERT INTO agents (id, name, api_key, role, is_active, umbrella_type, parent_umbrella_id, umbrella_member_count)
+    VALUES (?, ?, ?, 'producer', 1, NULL, NULL, NULL)
+  `).run("only-producer", "Erga Gårdsutsalg", "k-only-producer");
+
+  const rows2 = a6db2.prepare(query).all() as any[];
+  assertEq(rows2.length, 0,
+    "phase5.11-a6: scenario 2 — zero umbrellas → query returns 0 rows (section hidden by render gate)");
+
+  // Scenario 3: 2 nationals → ORDER BY member_count DESC, name ASC
+  const a6db3 = new Database(":memory:");
+  a6db3.exec(`
+    CREATE TABLE agents (
+      id TEXT PRIMARY KEY, name TEXT NOT NULL, api_key TEXT UNIQUE NOT NULL,
+      role TEXT NOT NULL DEFAULT 'producer', is_active INTEGER DEFAULT 1,
+      umbrella_type TEXT, parent_umbrella_id TEXT, umbrella_member_count INTEGER
+    );
+  `);
+  const ins3 = a6db3.prepare(`
+    INSERT INTO agents (id, name, api_key, role, is_active, umbrella_type, parent_umbrella_id, umbrella_member_count)
+    VALUES (?, ?, ?, 'producer', 1, ?, NULL, ?)
+  `);
+  ins3.run("hanen", "Hanen", "k-hanen", "market_network", 5);
+  ins3.run("bm-nat", "Bondens marked Norge", "k-bm-nat", "market_network", 13);
+  ins3.run("mathallen", "Mathallen", "k-mathallen", "venue", 10); // excluded (venue)
+  // Add an inactive one — should not appear
+  a6db3.prepare(`
+    INSERT INTO agents (id, name, api_key, role, is_active, umbrella_type, parent_umbrella_id, umbrella_member_count)
+    VALUES (?, ?, ?, 'producer', 0, 'market_network', NULL, 99)
+  `).run("inactive-umb", "Inactive Network", "k-inactive");
+
+  const rows3 = a6db3.prepare(query).all() as any[];
+  assertEq(rows3.length, 2,
+    "phase5.11-a6: scenario 3 — 2 active national market_networks returned (venue + inactive excluded)");
+  assertEq(rows3[0].id, "bm-nat",
+    "phase5.11-a6: scenario 3 — Bondens marked (13 members) ranks first by member_count");
+  assertEq(rows3[1].id, "hanen",
+    "phase5.11-a6: scenario 3 — Hanen (5 members) ranks second");
+}
+
 // ── REPORT ────────────────────────────────────────────────────────────
 
 // Wait for the M2 owner-portal async tests before reporting so their

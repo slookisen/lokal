@@ -636,6 +636,17 @@ const LANDING_CSS = `
   .cv-preview { font-size: 0.8rem; color: var(--g500); line-height: 1.4; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; margin-bottom: 8px; }
   .cv-foot { display: flex; justify-content: space-between; font-size: 0.72rem; color: var(--g500); }
   .cv-time { color: var(--g300); }
+  /* Phase 5.11 A6: Umbrella discovery section (homepage shortcut) */
+  .umb-section { background: var(--white); }
+  .umb-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(240px, 1fr)); gap: 14px; max-width: 1100px; margin: 0 auto; }
+  .umb-card { background: var(--white); border-radius: var(--r-lg); padding: 20px 22px; border: 1px solid var(--g100); transition: all 0.3s; text-decoration: none; color: var(--charcoal); display: block; }
+  .umb-card:hover { transform: translateY(-2px); box-shadow: var(--shadow-md); border-color: var(--green-100); text-decoration: none; }
+  .umb-card-badge { display: inline-block; padding: 3px 9px; background: var(--green-50); color: var(--green-700); border-radius: 10px; font-size: 0.7rem; font-weight: 600; margin-bottom: 8px; letter-spacing: 0.3px; }
+  .umb-card-name { font-weight: 700; font-size: 1rem; margin-bottom: 4px; line-height: 1.3; }
+  .umb-card-meta { font-size: 0.8rem; color: var(--g500); }
+  .umb-section-more { text-align: center; margin-top: 18px; font-size: 0.85rem; }
+  .umb-section-more a { color: var(--green-700); text-decoration: none; font-weight: 600; }
+  .umb-section-more a:hover { text-decoration: underline; }
 `;
 
 router.get("/", (req: Request, res: Response) => {
@@ -686,6 +697,64 @@ router.get("/", (req: Request, res: Response) => {
     ).join("");
 
     const featuredCards = featured.map((a: any) => producerCard(a, undefined, lang)).join("");
+
+    // Phase 5.11 A6: Top-level umbrella shortcut (national-level only).
+    // parent_umbrella_id IS NULL filters out lokallag/venues — those are
+    // reachable via drilldown from the national umbrella profile.
+    // Render-gated: if there are zero rows, the section is omitted.
+    let umbrellaCards = "";
+    let umbrellaSectionHtml = "";
+    try {
+      const umbDb = getDb();
+      const umbRows = umbDb.prepare(`
+        SELECT id, name, umbrella_type, umbrella_member_count
+        FROM agents
+        WHERE umbrella_type IS NOT NULL
+          AND umbrella_type != 'venue'
+          AND is_active = 1
+          AND parent_umbrella_id IS NULL
+        ORDER BY COALESCE(umbrella_member_count, 0) DESC, name ASC
+        LIMIT 6
+      `).all() as Array<{ id: string; name: string; umbrella_type: string; umbrella_member_count: number | null }>;
+
+      if (umbRows.length > 0) {
+        const umbBadgeLabel = lang === "en" ? "Market network" : "Marked-nettverk";
+        const umbCountSuffix = lang === "en" ? "local chapters" : "lokallag";
+        umbrellaCards = umbRows.map((u) => {
+          const slug = slugify(u.name);
+          const memberCount = u.umbrella_member_count || 0;
+          const metaLine = memberCount > 0
+            ? `${memberCount} ${escapeHtml(umbCountSuffix)}`
+            : (lang === "en" ? "National network" : "Nasjonalt nettverk");
+          return `<a href="/produsent/${slug}" class="umb-card">
+            <span class="umb-card-badge">${escapeHtml(umbBadgeLabel)}</span>
+            <div class="umb-card-name">${escapeHtml(u.name)}</div>
+            <div class="umb-card-meta">${metaLine}</div>
+          </a>`;
+        }).join("");
+
+        const umbLabel = lang === "en" ? "Markets & Networks" : "Markeder og paraplyer";
+        const umbTitle = lang === "en" ? "Norwegian market networks" : "Markedsnettverk i Norge";
+        const umbSub = lang === "en"
+          ? "Discover food networks like Bondens marked — local farmers' markets nationwide."
+          : "Oppdag matnettverk som Bondens marked — lokale bondemarkeder over hele landet.";
+
+        umbrellaSectionHtml = `
+    <section class="sec umb-section">
+      <div class="sh">
+        <div class="sh-label">${escapeHtml(umbLabel)}</div>
+        <div class="sh-title">${escapeHtml(umbTitle)}</div>
+        <div class="sh-sub">${escapeHtml(umbSub)}</div>
+      </div>
+      <div class="umb-grid">${umbrellaCards}</div>
+    </section>`;
+      }
+    } catch (umbErr) {
+      // Defensive: if the umbrella query fails (e.g. column missing in dev
+      // DB pre-migration), skip the section entirely rather than crash the
+      // homepage. Logged at warn-level.
+      console.warn("[seo /] umbrella discovery query failed:", umbErr);
+    }
 
     const uniqueCities = Object.keys(cityCounts).length;
 
@@ -778,7 +847,7 @@ router.get("/", (req: Request, res: Response) => {
       </div>
       <div class="cities-grid">${cityCards}</div>
     </section>
-
+${umbrellaSectionHtml}
     <section class="sec" style="background:var(--white);">
       <div class="sh">
         <div class="sh-label">${escapeHtml(t(lang, "home.discover_label"))}</div>
