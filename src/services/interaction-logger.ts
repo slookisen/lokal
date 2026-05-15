@@ -13,7 +13,11 @@ import { EventEmitter } from "events";
 //   - EventEmitter for SSE — no polling, instant updates
 //   - Non-blocking: log failures don't break the request
 
-export type InteractionType = "search" | "discover" | "register" | "view" | "message" | "transaction";
+export type InteractionType =
+  | "search" | "discover" | "register" | "view" | "message" | "transaction"
+  // Phase 5.11 (umbrella agents / affiliations) — admin audit-log events
+  | "umbrella_created" | "umbrella_updated"
+  | "affiliation_upserted" | "affiliation_updated";
 
 export interface InteractionEvent {
   id: string;

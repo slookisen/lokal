@@ -2393,4 +2393,465 @@ router.get("/admin/agents/dump", (req: Request, res: Response) => {
   }
 });
 
+// ─── Phase 5.11 A3: Umbrella agents + affiliations admin endpoints ──
+// All endpoints below are gated by X-Admin-Key. They power the Phase 5.11
+// data model introduced in A1 (umbrella_type, agent_affiliations) and
+// rendered conditionally in A2 (producer "Tilknytninger" card, umbrella
+// stub template, JSON-LD memberOf/member/subOrganization).
+//
+// Endpoints:
+//   POST   /admin/umbrellas                  — create a new umbrella agent
+//   PATCH  /admin/agents/:id/umbrella-meta   — edit umbrella-specific fields
+//   GET    /admin/affiliations               — list affiliations (filterable)
+//   POST   /admin/affiliations               — create/upsert producer↔umbrella link
+//   PATCH  /admin/affiliations/:id           — update status/labels/notes
+//
+// All state changes log to interactionLogger so audit trail is preserved.
+
+// ─── helper: list of valid umbrella_type values ─────────────────────
+const UMBRELLA_TYPES = new Set([
+  "market_network",   // Bondens marked, REKO
+  "venue",            // Mathallen Oslo
+  "industry_org",     // Hanen
+  "certification",    // Debio
+  "cooperative",      // Norsk Gardsmat
+]);
+
+// ─── POST /admin/umbrellas — create a new umbrella agent ────────────
+router.post("/admin/umbrellas", (req: Request, res: Response) => {
+  const expectedKey = getAdminKey();
+  if (!expectedKey) { res.status(503).json({ success: false, error: "Admin not configured" }); return; }
+  const adminKey = req.headers["x-admin-key"] as string;
+  if (!adminKey || adminKey !== expectedKey) {
+    res.status(403).json({ success: false, error: "Krever X-Admin-Key header" });
+    return;
+  }
+
+  try {
+    const body = req.body || {};
+    const name = typeof body.name === "string" ? body.name.trim() : "";
+    const umbrellaType = typeof body.umbrella_type === "string" ? body.umbrella_type.trim() : "";
+    const description = typeof body.description === "string" ? body.description.trim() : "";
+    const contactEmail = typeof body.contact_email === "string" ? body.contact_email.trim() : "";
+    const url = typeof body.url === "string" ? body.url.trim() : "";
+    const city = typeof body.city === "string" ? body.city.trim() : null;
+    const parentUmbrellaId = typeof body.parent_umbrella_id === "string" ? body.parent_umbrella_id.trim() : null;
+
+    if (!name || name.length < 1 || name.length > 200) {
+      res.status(400).json({ success: false, error: "name required (1-200 chars)" });
+      return;
+    }
+    if (!UMBRELLA_TYPES.has(umbrellaType)) {
+      res.status(400).json({ success: false, error: `umbrella_type must be one of: ${Array.from(UMBRELLA_TYPES).join(", ")}` });
+      return;
+    }
+
+    const db = getDb();
+
+    // Verify parent_umbrella_id exists + IS an umbrella (no circular nesting allowed)
+    if (parentUmbrellaId) {
+      const parent = db.prepare("SELECT umbrella_type FROM agents WHERE id = ?").get(parentUmbrellaId) as any;
+      if (!parent) {
+        res.status(400).json({ success: false, error: `parent_umbrella_id ${parentUmbrellaId} not found` });
+        return;
+      }
+      if (!parent.umbrella_type) {
+        res.status(400).json({ success: false, error: `parent_umbrella_id ${parentUmbrellaId} is not an umbrella agent` });
+        return;
+      }
+    }
+
+    // Reject duplicate name within the same umbrella_type (case-insensitive)
+    const existing = db.prepare(
+      "SELECT id FROM agents WHERE LOWER(name) = LOWER(?) AND umbrella_type IS NOT NULL"
+    ).get(name) as any;
+    if (existing) {
+      res.status(409).json({ success: false, error: "Umbrella with this name already exists", existing_id: existing.id });
+      return;
+    }
+
+    // Generate id + api-key (umbrellas don't expose an external API but the
+    // agents table still requires a key — same column constraints as producer agents)
+    const id = require("crypto").randomUUID();
+    const apiKey = `umb_${require("crypto").randomBytes(24).toString("hex")}`;
+
+    const stmt = db.prepare(`
+      INSERT INTO agents (
+        id, name, description, provider, contact_email, url,
+        role, api_key,
+        city, is_active, is_verified, trust_score,
+        umbrella_type, parent_umbrella_id, umbrella_member_count
+      ) VALUES (
+        ?, ?, ?, 'umbrella-admin', ?, ?,
+        'producer', ?,
+        ?, 1, 1, 0.9,
+        ?, ?, 0
+      )
+    `);
+    stmt.run(
+      id, name, description, contactEmail, url,
+      apiKey,
+      city,
+      umbrellaType, parentUmbrellaId
+    );
+
+    interactionLogger.log("umbrella_created", {
+      agentId: id,
+      metadata: { name, umbrella_type: umbrellaType, parent_umbrella_id: parentUmbrellaId, source: "admin" },
+      ipAddress: req.ip,
+    });
+
+    res.status(201).json({
+      success: true,
+      message: "Umbrella agent created",
+      data: {
+        id,
+        name,
+        umbrella_type: umbrellaType,
+        parent_umbrella_id: parentUmbrellaId,
+        slug: slugify(name),
+        profile_url: `${getBaseUrl(req)}/produsent/${slugify(name)}`,
+        api_key: apiKey,
+      },
+    });
+  } catch (err: any) {
+    console.error("[admin/umbrellas] Error:", err);
+    res.status(500).json({ success: false, error: err.message || "Intern feil" });
+  }
+});
+
+// ─── PATCH /admin/agents/:id/umbrella-meta — edit umbrella fields ───
+// Allows editing umbrella-specific columns without going through the
+// producer-oriented /admin/agents/:id endpoint. Only operates on rows
+// where umbrella_type IS NOT NULL (refuses to silently convert a producer
+// into an umbrella via this endpoint — use POST /admin/umbrellas for that).
+router.patch("/admin/agents/:id/umbrella-meta", (req: Request, res: Response) => {
+  const expectedKey = getAdminKey();
+  if (!expectedKey) { res.status(503).json({ success: false, error: "Admin not configured" }); return; }
+  const adminKey = req.headers["x-admin-key"] as string;
+  if (!adminKey || adminKey !== expectedKey) {
+    res.status(403).json({ success: false, error: "Krever X-Admin-Key header" });
+    return;
+  }
+
+  const agentId = req.params.id as string;
+  const body = req.body || {};
+
+  // Allow-list — refuses any unexpected field
+  const ALLOWED = new Set([
+    "umbrella_type", "parent_umbrella_id", "umbrella_member_count",
+    "umbrella_scrape_config", "umbrella_venues",
+    "name", "description",
+  ]);
+  for (const key of Object.keys(body)) {
+    if (!ALLOWED.has(key)) {
+      res.status(400).json({ success: false, error: `Felt ikke tillatt: ${key}` });
+      return;
+    }
+  }
+  if (Object.keys(body).length === 0) {
+    res.status(400).json({ success: false, error: "Trenger minst ett av: " + Array.from(ALLOWED).join(", ") });
+    return;
+  }
+
+  try {
+    const db = getDb();
+    const existing = db.prepare("SELECT id, name, umbrella_type FROM agents WHERE id = ?").get(agentId) as any;
+    if (!existing) {
+      res.status(404).json({ success: false, error: "Agent not found" });
+      return;
+    }
+    if (!existing.umbrella_type) {
+      res.status(409).json({
+        success: false,
+        error: "Agent is not an umbrella — use POST /admin/umbrellas to create umbrellas, or PATCH /agents/:id for producer fields",
+      });
+      return;
+    }
+
+    // Validate updated umbrella_type if provided
+    if (typeof body.umbrella_type === "string" && !UMBRELLA_TYPES.has(body.umbrella_type)) {
+      res.status(400).json({ success: false, error: `umbrella_type must be one of: ${Array.from(UMBRELLA_TYPES).join(", ")}` });
+      return;
+    }
+
+    // Validate JSON fields parse correctly
+    for (const jsonField of ["umbrella_scrape_config", "umbrella_venues"]) {
+      if (body[jsonField] !== undefined && body[jsonField] !== null) {
+        if (typeof body[jsonField] === "object") {
+          body[jsonField] = JSON.stringify(body[jsonField]);
+        } else if (typeof body[jsonField] === "string") {
+          try { JSON.parse(body[jsonField]); }
+          catch { res.status(400).json({ success: false, error: `${jsonField} must be valid JSON` }); return; }
+        }
+      }
+    }
+
+    // Length bounds for text fields
+    if (typeof body.name === "string" && (body.name.length < 1 || body.name.length > 200)) {
+      res.status(400).json({ success: false, error: "name length 1-200" });
+      return;
+    }
+    if (typeof body.description === "string" && body.description.length > 2000) {
+      res.status(400).json({ success: false, error: "description length 0-2000" });
+      return;
+    }
+
+    // Build SET clause from validated fields
+    const setParts: string[] = [];
+    const setValues: any[] = [];
+    for (const key of Object.keys(body)) {
+      setParts.push(`${key} = ?`);
+      setValues.push(body[key]);
+    }
+    setValues.push(agentId);
+
+    db.prepare(`UPDATE agents SET ${setParts.join(", ")} WHERE id = ?`).run(...setValues);
+
+    interactionLogger.log("umbrella_updated", {
+      agentId,
+      metadata: { fields_updated: Object.keys(body), source: "admin" },
+      ipAddress: req.ip,
+    });
+
+    const updated = db.prepare("SELECT id, name, umbrella_type, parent_umbrella_id, umbrella_member_count FROM agents WHERE id = ?").get(agentId) as any;
+    res.json({ success: true, message: "Umbrella meta updated", data: updated });
+  } catch (err: any) {
+    console.error("[admin/agents/:id/umbrella-meta] Error:", err);
+    res.status(500).json({ success: false, error: err.message || "Intern feil" });
+  }
+});
+
+// ─── GET /admin/affiliations — list affiliations (filterable) ───────
+router.get("/admin/affiliations", (req: Request, res: Response) => {
+  const expectedKey = getAdminKey();
+  if (!expectedKey) { res.status(503).json({ success: false, error: "Admin not configured" }); return; }
+  const adminKey = req.headers["x-admin-key"] as string;
+  if (!adminKey || adminKey !== expectedKey) {
+    res.status(403).json({ success: false, error: "Krever X-Admin-Key header" });
+    return;
+  }
+
+  try {
+    const producerId = typeof req.query.producer_id === "string" ? req.query.producer_id : null;
+    const umbrellaId = typeof req.query.umbrella_id === "string" ? req.query.umbrella_id : null;
+    const status = typeof req.query.status === "string" ? req.query.status : null;
+    const limit = Math.min(parseInt((req.query.limit as string) || "200", 10) || 200, 1000);
+
+    const db = getDb();
+    const wheres: string[] = ["1 = 1"];
+    const params: any[] = [];
+    if (producerId) { wheres.push("aff.producer_id = ?"); params.push(producerId); }
+    if (umbrellaId) { wheres.push("aff.umbrella_id = ?"); params.push(umbrellaId); }
+    if (status) {
+      if (!["pending_confirmation", "active", "historical", "rejected"].includes(status)) {
+        res.status(400).json({ success: false, error: "Invalid status filter" });
+        return;
+      }
+      wheres.push("aff.status = ?"); params.push(status);
+    }
+    params.push(limit);
+
+    const rows = db.prepare(`
+      SELECT
+        aff.id, aff.producer_id, aff.umbrella_id, aff.status, aff.source,
+        aff.labels, aff.notes, aff.joined_at, aff.confirmed_at, aff.expires_at,
+        aff.created_at, aff.updated_at,
+        p.name AS producer_name,
+        u.name AS umbrella_name,
+        u.umbrella_type
+      FROM agent_affiliations aff
+      LEFT JOIN agents p ON p.id = aff.producer_id
+      LEFT JOIN agents u ON u.id = aff.umbrella_id
+      WHERE ${wheres.join(" AND ")}
+      ORDER BY aff.updated_at DESC
+      LIMIT ?
+    `).all(...params) as any[];
+
+    res.json({ success: true, count: rows.length, affiliations: rows });
+  } catch (err: any) {
+    console.error("[admin/affiliations] GET Error:", err);
+    res.status(500).json({ success: false, error: err.message || "Intern feil" });
+  }
+});
+
+// ─── POST /admin/affiliations — create or upsert producer↔umbrella link
+router.post("/admin/affiliations", (req: Request, res: Response) => {
+  const expectedKey = getAdminKey();
+  if (!expectedKey) { res.status(503).json({ success: false, error: "Admin not configured" }); return; }
+  const adminKey = req.headers["x-admin-key"] as string;
+  if (!adminKey || adminKey !== expectedKey) {
+    res.status(403).json({ success: false, error: "Krever X-Admin-Key header" });
+    return;
+  }
+
+  try {
+    const body = req.body || {};
+    const producerId = typeof body.producer_id === "string" ? body.producer_id.trim() : "";
+    const umbrellaId = typeof body.umbrella_id === "string" ? body.umbrella_id.trim() : "";
+    const status = typeof body.status === "string" ? body.status : "pending_confirmation";
+    const source = typeof body.source === "string" ? body.source : "admin";
+    let labels: string[] = [];
+    if (Array.isArray(body.labels)) labels = body.labels.map((s: any) => String(s));
+    const notes = typeof body.notes === "string" ? body.notes : null;
+    const joinedAt = typeof body.joined_at === "string" ? body.joined_at : null;
+
+    if (!producerId || !umbrellaId) {
+      res.status(400).json({ success: false, error: "producer_id and umbrella_id required" });
+      return;
+    }
+    if (!["pending_confirmation", "active", "historical", "rejected"].includes(status)) {
+      res.status(400).json({ success: false, error: "Invalid status" });
+      return;
+    }
+    if (!["self_claimed", "scraped", "admin", "umbrella_confirmed"].includes(source)) {
+      res.status(400).json({ success: false, error: "Invalid source" });
+      return;
+    }
+
+    const db = getDb();
+
+    // Verify producer + umbrella exist (and are the right kinds)
+    const producer = db.prepare("SELECT id, umbrella_type FROM agents WHERE id = ?").get(producerId) as any;
+    if (!producer) { res.status(404).json({ success: false, error: `producer_id ${producerId} not found` }); return; }
+    if (producer.umbrella_type) {
+      res.status(400).json({ success: false, error: "producer_id is an umbrella — affiliations link producers TO umbrellas" });
+      return;
+    }
+    const umbrella = db.prepare("SELECT id, umbrella_type FROM agents WHERE id = ?").get(umbrellaId) as any;
+    if (!umbrella) { res.status(404).json({ success: false, error: `umbrella_id ${umbrellaId} not found` }); return; }
+    if (!umbrella.umbrella_type) {
+      res.status(400).json({ success: false, error: "umbrella_id is not an umbrella" });
+      return;
+    }
+
+    // Upsert via UNIQUE(producer_id, umbrella_id)
+    const existing = db.prepare(
+      "SELECT id FROM agent_affiliations WHERE producer_id = ? AND umbrella_id = ?"
+    ).get(producerId, umbrellaId) as any;
+
+    const now = new Date().toISOString();
+    const confirmedAt = status === "active" ? now : null;
+    // Default expiry: 18 months from confirmed_at
+    const expiresAt = confirmedAt ? new Date(Date.now() + 18 * 30 * 24 * 60 * 60 * 1000).toISOString() : null;
+
+    if (existing) {
+      db.prepare(`
+        UPDATE agent_affiliations
+        SET status = ?, source = ?, labels = ?, notes = ?, joined_at = ?,
+            confirmed_at = COALESCE(confirmed_at, ?),
+            expires_at = COALESCE(expires_at, ?),
+            updated_at = ?
+        WHERE id = ?
+      `).run(status, source, JSON.stringify(labels), notes, joinedAt, confirmedAt, expiresAt, now, existing.id);
+
+      interactionLogger.log("affiliation_upserted", {
+        agentId: producerId,
+        metadata: { affiliation_id: existing.id, producer_id: producerId, umbrella_id: umbrellaId, status, source, source_kind: "update" },
+        ipAddress: req.ip,
+      });
+
+      const updated = db.prepare("SELECT * FROM agent_affiliations WHERE id = ?").get(existing.id) as any;
+      res.json({ success: true, message: "Affiliation updated (idempotent upsert)", data: updated });
+      return;
+    }
+
+    const result = db.prepare(`
+      INSERT INTO agent_affiliations (
+        producer_id, umbrella_id, status, source, labels, notes,
+        joined_at, confirmed_at, expires_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(producerId, umbrellaId, status, source, JSON.stringify(labels), notes, joinedAt, confirmedAt, expiresAt);
+
+    interactionLogger.log("affiliation_upserted", {
+      agentId: producerId,
+      metadata: { affiliation_id: result.lastInsertRowid, producer_id: producerId, umbrella_id: umbrellaId, status, source, source_kind: "create" },
+      ipAddress: req.ip,
+    });
+
+    const created = db.prepare("SELECT * FROM agent_affiliations WHERE id = ?").get(result.lastInsertRowid) as any;
+    res.status(201).json({ success: true, message: "Affiliation created", data: created });
+  } catch (err: any) {
+    console.error("[admin/affiliations] POST Error:", err);
+    res.status(500).json({ success: false, error: err.message || "Intern feil" });
+  }
+});
+
+// ─── PATCH /admin/affiliations/:id — update status/labels/notes ────
+router.patch("/admin/affiliations/:id", (req: Request, res: Response) => {
+  const expectedKey = getAdminKey();
+  if (!expectedKey) { res.status(503).json({ success: false, error: "Admin not configured" }); return; }
+  const adminKey = req.headers["x-admin-key"] as string;
+  if (!adminKey || adminKey !== expectedKey) {
+    res.status(403).json({ success: false, error: "Krever X-Admin-Key header" });
+    return;
+  }
+
+  const affId = req.params.id as string;
+  const body = req.body || {};
+
+  const ALLOWED = new Set(["status", "labels", "notes", "expires_at"]);
+  for (const key of Object.keys(body)) {
+    if (!ALLOWED.has(key)) {
+      res.status(400).json({ success: false, error: `Felt ikke tillatt: ${key}` });
+      return;
+    }
+  }
+  if (Object.keys(body).length === 0) {
+    res.status(400).json({ success: false, error: "Trenger minst ett av: " + Array.from(ALLOWED).join(", ") });
+    return;
+  }
+
+  try {
+    const db = getDb();
+    const existing = db.prepare("SELECT id, status FROM agent_affiliations WHERE id = ?").get(affId) as any;
+    if (!existing) {
+      res.status(404).json({ success: false, error: "Affiliation not found" });
+      return;
+    }
+
+    if (body.status !== undefined && !["pending_confirmation", "active", "historical", "rejected"].includes(body.status)) {
+      res.status(400).json({ success: false, error: "Invalid status" });
+      return;
+    }
+    if (body.labels !== undefined) {
+      if (!Array.isArray(body.labels)) {
+        res.status(400).json({ success: false, error: "labels must be an array" });
+        return;
+      }
+      body.labels = JSON.stringify(body.labels);
+    }
+
+    const now = new Date().toISOString();
+    const setParts: string[] = ["updated_at = ?"];
+    const setValues: any[] = [now];
+    for (const key of Object.keys(body)) {
+      setParts.push(`${key} = ?`);
+      setValues.push(body[key]);
+    }
+    // If transitioning to 'active', set confirmed_at if NULL
+    if (body.status === "active") {
+      setParts.push("confirmed_at = COALESCE(confirmed_at, ?)");
+      setValues.push(now);
+    }
+    setValues.push(affId);
+
+    db.prepare(`UPDATE agent_affiliations SET ${setParts.join(", ")} WHERE id = ?`).run(...setValues);
+
+    interactionLogger.log("affiliation_updated", {
+      agentId: affId,
+      metadata: { affiliation_id: affId, fields_updated: Object.keys(body), previous_status: existing.status, source: "admin" },
+      ipAddress: req.ip,
+    });
+
+    const updated = db.prepare("SELECT * FROM agent_affiliations WHERE id = ?").get(affId) as any;
+    res.json({ success: true, message: "Affiliation updated", data: updated });
+  } catch (err: any) {
+    console.error("[admin/affiliations/:id] PATCH Error:", err);
+    res.status(500).json({ success: false, error: err.message || "Intern feil" });
+  }
+});
+
+
+
 export default router;

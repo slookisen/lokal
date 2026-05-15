@@ -4618,6 +4618,192 @@ console.log("── PR-29 related-producers tests ──");
 }
 
 
+
+// ─── Phase 5.11 A3: admin endpoints for umbrellas + affiliations ─────
+// Source-presence tests (same pattern as PR-42 + A2). The endpoints are
+// gated by X-Admin-Key and have allow-list body validation; we pin
+// these contract guarantees at the source level so a future refactor
+// can't silently drop them.
+{
+  console.log("\n── Phase 5.11 A3: admin endpoints ──");
+  const fs = require("fs");
+  const src = fs.readFileSync("src/routes/marketplace.ts", "utf8");
+
+  // Test 3.1: POST /admin/umbrellas registered
+  assertTrue(
+    src.includes('router.post("/admin/umbrellas"'),
+    "phase5.11-a3: POST /admin/umbrellas route registered"
+  );
+
+  // Test 3.2: PATCH /admin/agents/:id/umbrella-meta registered
+  assertTrue(
+    src.includes('router.patch("/admin/agents/:id/umbrella-meta"'),
+    "phase5.11-a3: PATCH /admin/agents/:id/umbrella-meta route registered"
+  );
+
+  // Test 3.3: GET /admin/affiliations registered
+  assertTrue(
+    src.includes('router.get("/admin/affiliations"'),
+    "phase5.11-a3: GET /admin/affiliations route registered"
+  );
+
+  // Test 3.4: POST /admin/affiliations registered
+  assertTrue(
+    src.includes('router.post("/admin/affiliations"'),
+    "phase5.11-a3: POST /admin/affiliations route registered"
+  );
+
+  // Test 3.5: PATCH /admin/affiliations/:id registered
+  assertTrue(
+    src.includes('router.patch("/admin/affiliations/:id"'),
+    "phase5.11-a3: PATCH /admin/affiliations/:id route registered"
+  );
+
+  // Test 3.6: UMBRELLA_TYPES allow-list correct (5 canonical values)
+  const umbTypesMatch = src.match(/const UMBRELLA_TYPES = new Set\(\[([\s\S]*?)\]\);/);
+  assertTrue(!!umbTypesMatch, "phase5.11-a3: UMBRELLA_TYPES set defined");
+  if (umbTypesMatch) {
+    const body = umbTypesMatch[1];
+    for (const v of ["market_network", "venue", "industry_org", "certification", "cooperative"]) {
+      assertTrue(body.includes(`"${v}"`), `phase5.11-a3: UMBRELLA_TYPES includes "${v}"`);
+    }
+  }
+
+  // Test 3.7: All 5 endpoints check X-Admin-Key
+  const endpointStarts = [
+    'router.post("/admin/umbrellas"',
+    'router.patch("/admin/agents/:id/umbrella-meta"',
+    'router.get("/admin/affiliations"',
+    'router.post("/admin/affiliations"',
+    'router.patch("/admin/affiliations/:id"',
+  ];
+  for (const start of endpointStarts) {
+    const idx = src.indexOf(start);
+    if (idx < 0) { failed++; failures.push(`✗ phase5.11-a3: ${start} not found for auth check`); continue; }
+    const end = src.indexOf("\nrouter.", idx + 1);
+    const body = src.slice(idx, end > idx ? end : src.length);
+    assertTrue(body.includes('"x-admin-key"'), `phase5.11-a3: ${start.replace("router.", "")} accepts x-admin-key`);
+    assertTrue(body.includes("Krever X-Admin-Key header"), `phase5.11-a3: ${start.replace("router.", "")} returns 403 when no key`);
+  }
+
+  // Test 3.8: POST /admin/umbrellas validates umbrella_type membership
+  const createBlockStart = src.indexOf('router.post("/admin/umbrellas"');
+  const createBlockEnd = src.indexOf("\nrouter.", createBlockStart + 1);
+  const createBody = src.slice(createBlockStart, createBlockEnd);
+  assertTrue(
+    /UMBRELLA_TYPES\.has\(umbrellaType\)/.test(createBody),
+    "phase5.11-a3: POST /admin/umbrellas validates umbrella_type against allow-list"
+  );
+  assertTrue(
+    /name required \(1-200 chars\)/.test(createBody),
+    "phase5.11-a3: POST /admin/umbrellas enforces name length 1-200"
+  );
+
+  // Test 3.9: parent_umbrella_id validated against existing umbrella row
+  assertTrue(
+    /parent\.umbrella_type/.test(createBody),
+    "phase5.11-a3: parent_umbrella_id validation checks the parent row's umbrella_type"
+  );
+
+  // Test 3.10: Duplicate-name rejection
+  assertTrue(
+    /Umbrella with this name already exists/.test(createBody),
+    "phase5.11-a3: POST /admin/umbrellas rejects duplicate name with 409"
+  );
+
+  // Test 3.11: PATCH umbrella-meta refuses non-umbrella rows
+  const patchMetaStart = src.indexOf('router.patch("/admin/agents/:id/umbrella-meta"');
+  const patchMetaEnd = src.indexOf("\nrouter.", patchMetaStart + 1);
+  const patchMetaBody = src.slice(patchMetaStart, patchMetaEnd);
+  assertTrue(
+    /Agent is not an umbrella/.test(patchMetaBody),
+    "phase5.11-a3: PATCH /umbrella-meta refuses non-umbrella rows (umbrella_type IS NULL)"
+  );
+
+  // Test 3.12: PATCH umbrella-meta has allow-list (rejects unknown fields)
+  assertTrue(
+    /const ALLOWED = new Set\(\[\s*[\s\S]*?"umbrella_type",[\s\S]*?"parent_umbrella_id",/.test(patchMetaBody),
+    "phase5.11-a3: PATCH /umbrella-meta has allow-list including umbrella_type + parent_umbrella_id"
+  );
+  assertTrue(
+    /Felt ikke tillatt:/.test(patchMetaBody),
+    "phase5.11-a3: PATCH /umbrella-meta rejects unknown fields with Norwegian message"
+  );
+
+  // Test 3.13: POST /admin/affiliations validates status + source against allow-lists
+  const postAffStart = src.indexOf('router.post("/admin/affiliations"');
+  const postAffEnd = src.indexOf("\nrouter.", postAffStart + 1);
+  const postAffBody = src.slice(postAffStart, postAffEnd);
+  assertTrue(
+    postAffBody.includes('"pending_confirmation", "active", "historical", "rejected"'),
+    "phase5.11-a3: POST /admin/affiliations enforces status enum"
+  );
+  assertTrue(
+    postAffBody.includes('"self_claimed", "scraped", "admin", "umbrella_confirmed"'),
+    "phase5.11-a3: POST /admin/affiliations enforces source enum"
+  );
+
+  // Test 3.14: POST /admin/affiliations rejects producer→producer or umbrella→producer mismatches
+  assertTrue(
+    /producer_id is an umbrella/.test(postAffBody),
+    "phase5.11-a3: POST /admin/affiliations rejects producer_id that IS an umbrella"
+  );
+  assertTrue(
+    /umbrella_id is not an umbrella/.test(postAffBody),
+    "phase5.11-a3: POST /admin/affiliations rejects umbrella_id that is NOT an umbrella"
+  );
+
+  // Test 3.15: POST /admin/affiliations is idempotent (upsert via UNIQUE)
+  assertTrue(
+    /UPDATE agent_affiliations[\s\S]{0,2000}WHERE id = \?/.test(postAffBody) &&
+    /Affiliation updated \(idempotent upsert\)/.test(postAffBody),
+    "phase5.11-a3: POST /admin/affiliations performs idempotent upsert on (producer_id, umbrella_id)"
+  );
+
+  // Test 3.16: Affiliations default 18-month expiry when status='active'
+  assertTrue(
+    /18 \* 30 \* 24 \* 60 \* 60 \* 1000/.test(postAffBody),
+    "phase5.11-a3: POST /admin/affiliations sets 18-month default expiry on active status"
+  );
+
+  // Test 3.17: GET /admin/affiliations supports producer_id + umbrella_id + status filters
+  const getAffStart = src.indexOf('router.get("/admin/affiliations"');
+  const getAffEnd = src.indexOf("\nrouter.", getAffStart + 1);
+  const getAffBody = src.slice(getAffStart, getAffEnd);
+  assertTrue(
+    /req\.query\.producer_id/.test(getAffBody) && /req\.query\.umbrella_id/.test(getAffBody) && /req\.query\.status/.test(getAffBody),
+    "phase5.11-a3: GET /admin/affiliations supports producer_id + umbrella_id + status query filters"
+  );
+  assertTrue(
+    /LEFT JOIN agents p ON p\.id = aff\.producer_id/.test(getAffBody) && /LEFT JOIN agents u ON u\.id = aff\.umbrella_id/.test(getAffBody),
+    "phase5.11-a3: GET /admin/affiliations joins both sides for name resolution"
+  );
+
+  // Test 3.18: PATCH /admin/affiliations/:id has allow-list + status validation
+  const patchAffStart = src.indexOf('router.patch("/admin/affiliations/:id"');
+  const patchAffEnd = src.indexOf("\nrouter.", patchAffStart + 1);
+  const patchAffBody = src.slice(patchAffStart, patchAffEnd === -1 ? src.length : patchAffEnd);
+  assertTrue(
+    /const ALLOWED = new Set\(\["status", "labels", "notes", "expires_at"\]\)/.test(patchAffBody),
+    "phase5.11-a3: PATCH /admin/affiliations allow-list = status/labels/notes/expires_at"
+  );
+
+  // Test 3.19: PATCH /admin/affiliations sets confirmed_at on transition to active
+  assertTrue(
+    /body\.status === "active"[\s\S]{0,200}confirmed_at = COALESCE\(confirmed_at, \?\)/.test(patchAffBody),
+    "phase5.11-a3: PATCH /admin/affiliations sets confirmed_at when transitioning to active"
+  );
+
+  // Test 3.20: All write endpoints log to interactionLogger
+  for (const evt of ["umbrella_created", "umbrella_updated", "affiliation_upserted", "affiliation_updated"]) {
+    assertTrue(
+      src.includes(`"${evt}"`),
+      `phase5.11-a3: interactionLogger.log("${evt}") call present`
+    );
+  }
+}
+
+
 // ── REPORT ────────────────────────────────────────────────────────────
 
 // Wait for the M2 owner-portal async tests before reporting so their
