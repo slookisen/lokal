@@ -1,8 +1,8 @@
 {
   "name": "lokal-mcp",
-  "version": "0.3.4",
+  "version": "0.4.0",
   "mcpName": "io.github.slookisen/lokal-mcp",
-  "description": "MCP server for Rett fra Bonden — find local food producers in Norway via Claude Desktop. Returns ranked producers with contact info and vCard links.",
+  "description": "MCP server for Rett fra Bonden \u2014 find local food producers in Norway via Claude Desktop. Returns ranked producers with contact info and vCard links.",
   "main": "index.js",
   "bin": {
     "lokal-mcp": "index.js"

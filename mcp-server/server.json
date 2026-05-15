@@ -1,18 +1,18 @@
 {
   "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
   "name": "io.github.slookisen/lokal-mcp",
-  "description": "Find local food in Norway. Search 1,431+ farms, shops, REKO rings and cooperatives across 365+ cities. Returns ranked producers with contact info, trust scores, and vCard links.",
+  "description": "Find local food in Norway. Search 1,431+ farms, shops, and umbrella organizations (Bondens marked, REKO, Mathallen, Hanen, Debio) across 368+ cities. Returns ranked producers with contact info, trust scores, and vCard links.",
   "repository": {
     "url": "https://github.com/slookisen/lokal",
     "source": "github",
     "subfolder": "mcp-server"
   },
-  "version": "0.3.4",
+  "version": "0.4.0",
   "packages": [
     {
       "registryType": "npm",
       "identifier": "lokal-mcp",
-      "version": "0.3.4",
+      "version": "0.4.0",
       "transport": {
         "type": "stdio"
       },

@@ -4804,6 +4804,173 @@ console.log("── PR-29 related-producers tests ──");
 }
 
 
+
+// ─── Phase 5.11 A2.5: A2A agent-card + MCP discovery surface ──
+// Source-presence assertions for the public discovery endpoints + MCP tools.
+// These are the surfaces AI agents (Claude Desktop, ChatGPT MCP-bridge,
+// Perplexity) use to navigate the umbrella network without HTML-scraping.
+{
+  console.log("\n── Phase 5.11 A2.5: A2A agent-card + MCP discovery ──");
+  const fs = require("fs");
+  const mp = fs.readFileSync("src/routes/marketplace.ts", "utf8");
+  const mcp = fs.readFileSync("mcp-server/index.js", "utf8");
+  const serverJson = JSON.parse(fs.readFileSync("mcp-server/server.json", "utf8"));
+  const pkgJson = JSON.parse(fs.readFileSync("mcp-server/package.json", "utf8"));
+
+  // ── HTTP endpoints ─────────────────────────────────────────────
+  // Test 4.1: 3 new public discovery endpoints registered
+  assertTrue(
+    mp.includes('router.get("/umbrellas"'),
+    "phase5.11-a2.5: GET /umbrellas route registered"
+  );
+  assertTrue(
+    mp.includes('router.get("/umbrellas/:id/members"'),
+    "phase5.11-a2.5: GET /umbrellas/:id/members route registered"
+  );
+  assertTrue(
+    mp.includes('router.get("/producers/:id/affiliations"'),
+    "phase5.11-a2.5: GET /producers/:id/affiliations route registered"
+  );
+
+  // Test 4.2: discovery endpoints are READ-ONLY (no admin-key required)
+  // They sit BEFORE the A3 admin block, and don't contain x-admin-key checks
+  const umbStart = mp.indexOf('router.get("/umbrellas"');
+  const a3Start = mp.indexOf("// ─── Phase 5.11 A3: Umbrella agents");
+  const publicSection = mp.slice(umbStart, a3Start);
+  assertTrue(
+    !publicSection.includes('"x-admin-key"'),
+    "phase5.11-a2.5: discovery endpoints do not require X-Admin-Key (public API)"
+  );
+
+  // Test 4.3: /umbrellas filters on umbrella_type IS NOT NULL
+  const umbBlockEnd = mp.indexOf('router.get("/umbrellas/:id/members"');
+  const umbBody = mp.slice(umbStart, umbBlockEnd);
+  assertTrue(
+    /umbrella_type IS NOT NULL/.test(umbBody) && /is_active = 1/.test(umbBody),
+    "phase5.11-a2.5: GET /umbrellas filters umbrella_type IS NOT NULL AND is_active=1"
+  );
+
+  // Test 4.4: /umbrellas/:id/members rejects 404 on non-existent or non-umbrella IDs
+  const membStart = mp.indexOf('router.get("/umbrellas/:id/members"');
+  const membEnd = mp.indexOf('router.get("/producers/:id/affiliations"');
+  const membBody = mp.slice(membStart, membEnd);
+  assertTrue(
+    /Umbrella ikke funnet/.test(membBody),
+    "phase5.11-a2.5: GET /umbrellas/:id/members 404s on missing umbrella"
+  );
+
+  // Test 4.5: /producers/:id/affiliations rejects umbrella IDs with 400
+  const affStart = mp.indexOf('router.get("/producers/:id/affiliations"');
+  const a3Marker = mp.indexOf("// ─── Phase 5.11 A3:");
+  const affBody = mp.slice(affStart, a3Marker);
+  assertTrue(
+    /Agent er en paraply, ikke en produsent/.test(affBody),
+    "phase5.11-a2.5: GET /producers/:id/affiliations rejects umbrella IDs with helpful Norwegian error"
+  );
+
+  // ── Agent-card extension ───────────────────────────────────────
+  // Test 4.6: card handler conditionally adds 'umbrella-members' or 'affiliations' skill
+  const cardStart = mp.indexOf('router.get("/agents/:id/card"');
+  const cardEnd = mp.indexOf('router.put("/agents/:id"', cardStart);
+  const cardBody = mp.slice(cardStart, cardEnd);
+
+  assertTrue(
+    /id: "umbrella-members"/.test(cardBody),
+    "phase5.11-a2.5: agent-card emits umbrella-members skill for umbrellas"
+  );
+  assertTrue(
+    /id: "affiliations"/.test(cardBody),
+    "phase5.11-a2.5: agent-card emits affiliations skill for producers"
+  );
+
+  // Test 4.7: agent-card affiliations queries gated by aff.status = 'active'
+  assertTrue(
+    (cardBody.match(/aff\.status = 'active'/g) || []).length >= 2,
+    "phase5.11-a2.5: agent-card queries filter affiliations to status='active' on both sides"
+  );
+
+  // Test 4.8: agent-card umbrella-members LIMIT 200 (per scale note from PR-45 reviewer)
+  assertTrue(
+    /LIMIT 200/.test(cardBody),
+    "phase5.11-a2.5: agent-card umbrella-members capped at LIMIT 200 (matches scale-cap note)"
+  );
+
+  // Test 4.9: agent-card fail-open on affiliations errors (don't break card delivery)
+  assertTrue(
+    /\[seo:phase5\.11\.a2\.5\] agent-card affiliations failed/.test(cardBody),
+    "phase5.11-a2.5: agent-card affiliations queries wrapped in try/catch with diagnostic log"
+  );
+
+  // Test 4.10: agent-card includes umbrella metadata block when role is umbrella
+  assertTrue(
+    /card\.umbrella = \{[\s\S]{0,200}type: a\.umbrella_type/.test(cardBody),
+    "phase5.11-a2.5: agent-card adds top-level umbrella metadata block for umbrellas"
+  );
+
+  // ── MCP tools (mcp-server/index.js) ─────────────────────────
+  // Test 4.11: 3 new MCP tools registered
+  for (const tool of ["lokal_list_umbrellas", "lokal_get_umbrella_members", "lokal_get_producer_affiliations"]) {
+    assertTrue(
+      mcp.includes(`registerTool(\n  "${tool}"`),
+      `phase5.11-a2.5: MCP tool ${tool} registered`
+    );
+  }
+
+  // Test 4.12: MCP tools all marked read-only + idempotent + open-world
+  const listStart = mcp.indexOf('"lokal_list_umbrellas"');
+  const startSect = mcp.indexOf('"lokal_list_umbrellas"');
+  // All three tool blocks contain the annotation set
+  const allMcpTools = mcp.slice(startSect);
+  const readonlyCount = (allMcpTools.match(/readOnlyHint:\s*true/g) || []).length;
+  assertTrue(
+    readonlyCount >= 3,
+    "phase5.11-a2.5: All 3 new MCP tools have readOnlyHint: true"
+  );
+
+  // Test 4.13: MCP tool descriptions include umbrella concepts
+  assertTrue(
+    /Bondens marked|REKO|Mathallen|Hanen|Debio/.test(mcp.slice(listStart)),
+    "phase5.11-a2.5: MCP tool descriptions reference real Norwegian umbrella names"
+  );
+
+  // Test 4.14: MCP tools call our public discovery endpoints (not admin)
+  assertTrue(
+    mcp.includes("/api/marketplace/umbrellas?"),
+    "phase5.11-a2.5: lokal_list_umbrellas calls /api/marketplace/umbrellas"
+  );
+  assertTrue(
+    mcp.includes("/api/marketplace/umbrellas/${umbrellaId}/members"),
+    "phase5.11-a2.5: lokal_get_umbrella_members calls /api/marketplace/umbrellas/:id/members"
+  );
+  assertTrue(
+    mcp.includes("/api/marketplace/producers/${producerId}/affiliations"),
+    "phase5.11-a2.5: lokal_get_producer_affiliations calls /api/marketplace/producers/:id/affiliations"
+  );
+
+  // Test 4.15: server.json + package.json versions bumped to 0.4.0
+  assertTrue(
+    serverJson.version === "0.4.0",
+    "phase5.11-a2.5: server.json version bumped to 0.4.0 (minor — adds capabilities)"
+  );
+  assertTrue(
+    pkgJson.version === "0.4.0",
+    "phase5.11-a2.5: mcp-server/package.json version bumped to 0.4.0"
+  );
+
+  // Test 4.16: server.json description mentions umbrella organizations
+  assertTrue(
+    /umbrella|Bondens marked|REKO|Hanen|Debio/.test(serverJson.description),
+    "phase5.11-a2.5: server.json description updated to mention umbrella organizations"
+  );
+
+  // Test 4.17: lokal_list_umbrellas enum-validates umbrellaType filter
+  assertTrue(
+    mcp.includes('z.enum(["market_network", "venue", "industry_org", "certification", "cooperative"])'),
+    "phase5.11-a2.5: lokal_list_umbrellas umbrellaType uses z.enum allow-list"
+  );
+}
+
+
 // ── REPORT ────────────────────────────────────────────────────────────
 
 // Wait for the M2 owner-portal async tests before reporting so their

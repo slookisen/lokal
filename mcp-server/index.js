@@ -97,7 +97,7 @@ function formatOpeningHours(hours) {
 
 const server = new McpServer({
   name: "lokal",
-  version: "0.2.0",
+  version: "0.4.0",
 });
 
 // Tool 1: Natural language search
@@ -272,6 +272,149 @@ server.registerTool(
       `Interaksjoner: ${s.totalInteractions || "?"}`,
     ].join("\n");
     return { content: [{ type: "text", text }] };
+  }
+);
+
+// Tool 5 (Phase 5.11 A2.5): List umbrella organizations
+// Bondens marked, Mathallen, Hanen, Debio, REKO etc. — organizations that
+// aggregate or represent producers rather than being producers themselves.
+server.registerTool(
+  "lokal_list_umbrellas",
+  {
+    title: "List umbrella organizations",
+    description: "List all umbrella organizations on Lokal — markets-networks (Bondens marked, REKO), venues (Mathallen), industry orgs (Hanen), certifiers (Debio), and cooperatives. Each umbrella has many member producers. Optionally filter by type. Useful when the user asks 'where can I find local food markets?', 'what is Bondens marked?', or 'which certifications matter for local Norwegian food?'.",
+    inputSchema: {
+      umbrellaType: z.enum(["market_network", "venue", "industry_org", "certification", "cooperative"]).optional().describe("Filter by umbrella type"),
+      limit: z.number().min(1).max(200).default(50).describe("Max results"),
+    },
+    annotations: {
+      title: "List umbrella organizations",
+      readOnlyHint: true,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: true,
+    },
+  },
+  async ({ umbrellaType, limit }) => {
+    const params = new URLSearchParams({ limit: String(limit || 50) });
+    if (umbrellaType) params.append("umbrella_type", umbrellaType);
+    const data = await fetchJSON(`${BASE_URL}/api/marketplace/umbrellas?${params}`);
+
+    if (!data.umbrellas?.length) {
+      return { content: [{ type: "text", text: umbrellaType
+        ? `Ingen paraplyer av type "${umbrellaType}" funnet.`
+        : "Ingen paraplyer registrert ennå." }] };
+    }
+
+    const typeLabels = {
+      market_network: "🏪 Marked-nettverk",
+      venue: "🏛 Salgs-venue",
+      industry_org: "🤝 Bransjeorganisasjon",
+      certification: "✓ Sertifisering",
+      cooperative: "👥 Samvirke",
+    };
+
+    const grouped = {};
+    for (const u of data.umbrellas) {
+      const key = u.umbrella_type;
+      if (!grouped[key]) grouped[key] = [];
+      grouped[key].push(u);
+    }
+
+    const sections = [`🌐 **Paraplyer på Lokal** — ${data.count} totalt:\n`];
+    for (const [type, items] of Object.entries(grouped)) {
+      sections.push(`\n## ${typeLabels[type] || type} (${items.length})`);
+      for (const u of items) {
+        const where = u.city ? ` — ${u.city}` : "";
+        const members = u.member_count > 0 ? ` · ${u.member_count} medlemmer` : "";
+        sections.push(`- **${u.name}**${where}${members}`);
+        sections.push(`  ${u.profile_url}`);
+      }
+    }
+    return { content: [{ type: "text", text: sections.join("\n") }] };
+  }
+);
+
+// Tool 6 (Phase 5.11 A2.5): Producers in an umbrella's network
+server.registerTool(
+  "lokal_get_umbrella_members",
+  {
+    title: "Get producers in an umbrella's network",
+    description: "List producers that are members of a specific umbrella organization (e.g. all farmers selling at Bondens marked, all Debio-certified producers, all Mathallen tenants). Returns producer names + cities + profile links. Useful when the user asks 'which farmers sell at Bondens marked?', 'show me all Debio-certified producers', or 'who is at Mathallen Oslo?'.",
+    inputSchema: {
+      umbrellaId: z.string().describe("Umbrella agent ID (UUID). Use lokal_list_umbrellas to find IDs."),
+      limit: z.number().min(1).max(500).default(100).describe("Max results"),
+    },
+    annotations: {
+      title: "Get producers in an umbrella's network",
+      readOnlyHint: true,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: true,
+    },
+  },
+  async ({ umbrellaId, limit }) => {
+    const params = new URLSearchParams({ limit: String(limit || 100) });
+    const data = await fetchJSON(`${BASE_URL}/api/marketplace/umbrellas/${umbrellaId}/members?${params}`);
+
+    const umb = data.umbrella || {};
+    if (!data.members?.length) {
+      return { content: [{ type: "text", text: `Ingen produsenter i ${umb.name || "denne paraplyen"} ennå.` }] };
+    }
+
+    const sections = [`🤝 **${umb.name}** — ${data.count} produsenter:\n`];
+    for (const m of data.members) {
+      const labels = m.affiliation?.labels?.length ? ` _(${m.affiliation.labels.join(", ")})_` : "";
+      const where = m.city ? ` — ${m.city}` : "";
+      sections.push(`- **${m.name}**${where}${labels}`);
+      sections.push(`  ${m.profile_url}`);
+    }
+    return { content: [{ type: "text", text: sections.join("\n") }] };
+  }
+);
+
+// Tool 7 (Phase 5.11 A2.5): Umbrellas a producer belongs to
+server.registerTool(
+  "lokal_get_producer_affiliations",
+  {
+    title: "Get a producer's umbrella affiliations",
+    description: "List umbrella organizations a specific producer is a member of (e.g. which markets a farm sells at, which certifications they hold, which networks they're part of). Returns umbrella names + types + their profile links. Useful when the user asks 'where does <Farmer X> sell?', 'is <Farm Y> Debio-certified?', or 'which markets does <Producer Z> attend?'.",
+    inputSchema: {
+      producerId: z.string().describe("Producer agent ID (UUID). Get this from lokal_search or lokal_discover results."),
+    },
+    annotations: {
+      title: "Get a producer's umbrella affiliations",
+      readOnlyHint: true,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: true,
+    },
+  },
+  async ({ producerId }) => {
+    const data = await fetchJSON(`${BASE_URL}/api/marketplace/producers/${producerId}/affiliations`);
+
+    const prod = data.producer || {};
+    if (!data.affiliations?.length) {
+      return { content: [{ type: "text", text: `${prod.name || "Produsent"} har ingen registrerte paraplyer-tilknytninger.` }] };
+    }
+
+    const typeLabels = {
+      market_network: "Marked-nettverk",
+      venue: "Salgs-venue",
+      industry_org: "Bransjeorganisasjon",
+      certification: "Sertifisering",
+      cooperative: "Samvirke",
+    };
+
+    const sections = [`🔗 **${prod.name}** — ${data.count} tilknytninger:\n`];
+    for (const a of data.affiliations) {
+      const u = a.umbrella;
+      const labels = a.affiliation?.labels?.length ? ` _(${a.affiliation.labels.join(", ")})_` : "";
+      const type = typeLabels[u.umbrella_type] || u.umbrella_type;
+      sections.push(`- **${u.name}** (${type})${labels}`);
+      sections.push(`  ${u.profile_url}`);
+    }
+    return { content: [{ type: "text", text: sections.join("\n") }] };
   }
 );
 

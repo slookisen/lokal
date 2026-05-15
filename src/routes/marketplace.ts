@@ -637,6 +637,80 @@ router.get("/agents/:id/card", (req: Request, res: Response) => {
       vcard: `${getBaseUrl(req)}/api/marketplace/agents/${agentId}/vcard`,
     };
     if (k.website) card.links.website = k.website;
+
+    // ─── Phase 5.11 A2.5: affiliations skill (producer + umbrella) ──
+    // Adds machine-readable umbrella memberships to the A2A agent-card so
+    // AI agents can navigate the network without HTML-scraping the page.
+    // Producer view: list umbrellas the producer is an active member of.
+    // Umbrella view: list producers in the umbrella's network (cap 200).
+    try {
+      const db = getDb();
+      const a = (agent as any);
+      if (a.umbrella_type) {
+        const members = db.prepare(`
+          SELECT p.id, p.name, p.city, aff.labels, aff.status
+          FROM agent_affiliations aff
+          INNER JOIN agents p ON p.id = aff.producer_id
+          WHERE aff.umbrella_id = ?
+            AND aff.status = 'active'
+            AND p.is_active = 1
+          ORDER BY p.trust_score DESC, p.name ASC
+          LIMIT 200
+        `).all(agentId) as any[];
+        if (members.length) {
+          card.skills = (card.skills || []).concat([{
+            id: "umbrella-members",
+            name: "Produsenter i nettverket",
+            description: "Liste over produsenter som er medlem av denne paraplyen.",
+            tags: ["umbrella", "members", "network", a.umbrella_type],
+            members: members.map(m => ({
+              producer_id: m.id,
+              producer_name: m.name,
+              city: m.city,
+              labels: m.labels ? (() => { try { return JSON.parse(m.labels); } catch { return []; } })() : [],
+              card_url: `${getBaseUrl(req)}/api/marketplace/agents/${m.id}/card`,
+              profile_url: `https://rettfrabonden.com/produsent/${slugify(m.name)}`,
+            })),
+          }]);
+        }
+        // Always expose umbrella metadata so AI clients can parse type + parent
+        card.umbrella = {
+          type: a.umbrella_type,
+          parent_umbrella_id: a.parent_umbrella_id || null,
+          member_count: a.umbrella_member_count || 0,
+        };
+      } else {
+        // Producer view: list affiliations
+        const affs = db.prepare(`
+          SELECT u.id, u.name, u.umbrella_type, aff.labels, aff.status
+          FROM agent_affiliations aff
+          INNER JOIN agents u ON u.id = aff.umbrella_id
+          WHERE aff.producer_id = ?
+            AND aff.status = 'active'
+            AND u.is_active = 1
+          ORDER BY u.name ASC
+        `).all(agentId) as any[];
+        if (affs.length) {
+          card.skills = (card.skills || []).concat([{
+            id: "affiliations",
+            name: "Tilknytninger",
+            description: "Paraplyer denne produsenten er medlem av (markeds-nettverk, sertifiseringer, samvirker).",
+            tags: ["affiliations", "umbrella-membership"],
+            affiliations: affs.map(u => ({
+              umbrella_id: u.id,
+              umbrella_name: u.name,
+              umbrella_type: u.umbrella_type,
+              labels: u.labels ? (() => { try { return JSON.parse(u.labels); } catch { return []; } })() : [],
+              card_url: `${getBaseUrl(req)}/api/marketplace/agents/${u.id}/card`,
+              profile_url: `https://rettfrabonden.com/produsent/${slugify(u.name)}`,
+            })),
+          }]);
+        }
+      }
+    } catch (e) {
+      // Affiliations are optional metadata — failure here must not break card delivery
+      console.error("[seo:phase5.11.a2.5] agent-card affiliations failed:", e);
+    }
   }
 
   res.json(card);
@@ -2392,6 +2466,196 @@ router.get("/admin/agents/dump", (req: Request, res: Response) => {
     res.status(500).json({ error: "Dump failed", detail: err.message });
   }
 });
+
+// ─── Phase 5.11 A2.5: Public umbrella + affiliations discovery API ───
+// Read-only endpoints (no admin-key required) that surface the Phase 5.11
+// data model to A2A clients, AI search agents (Perplexity/ChatGPT/Claude),
+// and our own MCP server. They mirror what crawlers can extract from the
+// HTML profile pages (memberOf/member JSON-LD) but in machine-friendly form.
+//
+// Endpoints:
+//   GET /umbrellas                 — list umbrella agents (filterable by type)
+//   GET /umbrellas/:id/members     — list producers in an umbrella's network
+//   GET /producers/:id/affiliations — list umbrellas a producer belongs to
+
+router.get("/umbrellas", (req: Request, res: Response) => {
+  try {
+    const umbrellaType = typeof req.query.umbrella_type === "string" ? req.query.umbrella_type : null;
+    const limit = Math.min(parseInt((req.query.limit as string) || "100", 10) || 100, 500);
+
+    const db = getDb();
+    const wheres: string[] = ["umbrella_type IS NOT NULL", "is_active = 1"];
+    const params: any[] = [];
+    if (umbrellaType) { wheres.push("umbrella_type = ?"); params.push(umbrellaType); }
+    params.push(limit);
+
+    const rows = db.prepare(`
+      SELECT
+        id, name, description, umbrella_type, parent_umbrella_id,
+        umbrella_member_count, city,
+        trust_score, is_verified
+      FROM agents
+      WHERE ${wheres.join(" AND ")}
+      ORDER BY trust_score DESC, name ASC
+      LIMIT ?
+    `).all(...params) as any[];
+
+    const umbrellas = rows.map(r => ({
+      id: r.id,
+      name: r.name,
+      description: r.description,
+      umbrella_type: r.umbrella_type,
+      parent_umbrella_id: r.parent_umbrella_id,
+      member_count: r.umbrella_member_count || 0,
+      city: r.city,
+      slug: slugify(r.name),
+      profile_url: `${getBaseUrl(req)}/produsent/${slugify(r.name)}`,
+      card_url: `${getBaseUrl(req)}/api/marketplace/agents/${r.id}/card`,
+      trust_score: r.trust_score,
+      is_verified: r.is_verified === 1,
+    }));
+
+    res.json({ success: true, count: umbrellas.length, umbrellas });
+  } catch (err: any) {
+    console.error("[/umbrellas] Error:", err);
+    res.status(500).json({ success: false, error: err.message || "Intern feil" });
+  }
+});
+
+router.get("/umbrellas/:id/members", (req: Request, res: Response) => {
+  const umbrellaId = req.params.id as string;
+  try {
+    const limit = Math.min(parseInt((req.query.limit as string) || "100", 10) || 100, 500);
+    const status = typeof req.query.status === "string" ? req.query.status : "active";
+
+    const db = getDb();
+    const umbrella = db.prepare(
+      "SELECT id, name, umbrella_type FROM agents WHERE id = ? AND umbrella_type IS NOT NULL AND is_active = 1"
+    ).get(umbrellaId) as any;
+    if (!umbrella) {
+      res.status(404).json({ success: false, error: "Umbrella ikke funnet" });
+      return;
+    }
+
+    if (!["pending_confirmation", "active", "historical", "rejected", "all"].includes(status)) {
+      res.status(400).json({ success: false, error: "Invalid status filter" });
+      return;
+    }
+
+    const wheres: string[] = ["aff.umbrella_id = ?", "p.is_active = 1"];
+    const params: any[] = [umbrellaId];
+    if (status !== "all") { wheres.push("aff.status = ?"); params.push(status); }
+    params.push(limit);
+
+    const rows = db.prepare(`
+      SELECT
+        p.id, p.name, p.city, p.trust_score, p.is_verified,
+        aff.id AS affiliation_id, aff.status, aff.labels, aff.joined_at
+      FROM agent_affiliations aff
+      INNER JOIN agents p ON p.id = aff.producer_id
+      WHERE ${wheres.join(" AND ")}
+      ORDER BY p.trust_score DESC, p.name ASC
+      LIMIT ?
+    `).all(...params) as any[];
+
+    const members = rows.map(r => ({
+      id: r.id,
+      name: r.name,
+      city: r.city,
+      slug: slugify(r.name),
+      profile_url: `${getBaseUrl(req)}/produsent/${slugify(r.name)}`,
+      card_url: `${getBaseUrl(req)}/api/marketplace/agents/${r.id}/card`,
+      trust_score: r.trust_score,
+      is_verified: r.is_verified === 1,
+      affiliation: {
+        id: r.affiliation_id,
+        status: r.status,
+        labels: r.labels ? (() => { try { return JSON.parse(r.labels); } catch { return []; } })() : [],
+        joined_at: r.joined_at,
+      },
+    }));
+
+    res.json({
+      success: true,
+      count: members.length,
+      umbrella: { id: umbrella.id, name: umbrella.name, umbrella_type: umbrella.umbrella_type },
+      members,
+    });
+  } catch (err: any) {
+    console.error("[/umbrellas/:id/members] Error:", err);
+    res.status(500).json({ success: false, error: err.message || "Intern feil" });
+  }
+});
+
+router.get("/producers/:id/affiliations", (req: Request, res: Response) => {
+  const producerId = req.params.id as string;
+  try {
+    const status = typeof req.query.status === "string" ? req.query.status : "active";
+    const db = getDb();
+
+    const producer = db.prepare(
+      "SELECT id, name, umbrella_type FROM agents WHERE id = ? AND is_active = 1"
+    ).get(producerId) as any;
+    if (!producer) {
+      res.status(404).json({ success: false, error: "Produsent ikke funnet" });
+      return;
+    }
+    if (producer.umbrella_type) {
+      res.status(400).json({
+        success: false,
+        error: "Agent er en paraply, ikke en produsent. Bruk /umbrellas/:id/members.",
+      });
+      return;
+    }
+
+    if (!["pending_confirmation", "active", "historical", "rejected", "all"].includes(status)) {
+      res.status(400).json({ success: false, error: "Invalid status filter" });
+      return;
+    }
+
+    const wheres: string[] = ["aff.producer_id = ?", "u.is_active = 1"];
+    const params: any[] = [producerId];
+    if (status !== "all") { wheres.push("aff.status = ?"); params.push(status); }
+
+    const rows = db.prepare(`
+      SELECT
+        u.id, u.name, u.umbrella_type, u.parent_umbrella_id,
+        aff.id AS affiliation_id, aff.status, aff.labels, aff.joined_at
+      FROM agent_affiliations aff
+      INNER JOIN agents u ON u.id = aff.umbrella_id
+      WHERE ${wheres.join(" AND ")}
+      ORDER BY u.name ASC
+    `).all(...params) as any[];
+
+    const affiliations = rows.map(r => ({
+      umbrella: {
+        id: r.id,
+        name: r.name,
+        umbrella_type: r.umbrella_type,
+        parent_umbrella_id: r.parent_umbrella_id,
+        slug: slugify(r.name),
+        profile_url: `${getBaseUrl(req)}/produsent/${slugify(r.name)}`,
+      },
+      affiliation: {
+        id: r.affiliation_id,
+        status: r.status,
+        labels: r.labels ? (() => { try { return JSON.parse(r.labels); } catch { return []; } })() : [],
+        joined_at: r.joined_at,
+      },
+    }));
+
+    res.json({
+      success: true,
+      count: affiliations.length,
+      producer: { id: producer.id, name: producer.name },
+      affiliations,
+    });
+  } catch (err: any) {
+    console.error("[/producers/:id/affiliations] Error:", err);
+    res.status(500).json({ success: false, error: err.message || "Intern feil" });
+  }
+});
+
 
 // ─── Phase 5.11 A3: Umbrella agents + affiliations admin endpoints ──
 // All endpoints below are gated by X-Admin-Key. They power the Phase 5.11
