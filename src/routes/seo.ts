@@ -2022,6 +2022,23 @@ const PROFILE_CSS = `
   /* PR-30: freshness badge — subtle, sits between badges and name */
   .profile-meta { margin: 0 0 8px; font-size: 0.78rem; color: var(--g500); }
   .profile-meta .updated-at { color: var(--g500); }
+  /* Phase 5.11 A2: umbrella affiliations badges (producer view) + umbrella stub */
+  .aff-grid { display: flex; flex-wrap: wrap; gap: 8px; }
+  .aff-item { display: flex; align-items: center; gap: 8px; padding: 8px 14px; background: var(--green-50); border-radius: var(--r-md); border: 1px solid var(--green-100); text-decoration: none; color: var(--green-700); transition: all 0.2s; }
+  .aff-item:hover { background: var(--green-100); transform: translateY(-1px); }
+  .aff-icon { font-size: 1.05rem; }
+  .aff-name { font-size: 0.86rem; font-weight: 600; }
+  .aff-labels { font-size: 0.7rem; color: var(--g500); margin-left: 4px; }
+  /* Umbrella profile (Phase 5.11 — stub in A2, filled in A4/Phase B) */
+  .umb-hero { padding: 24px 0; }
+  .umb-type-badge { display: inline-block; padding: 4px 10px; background: var(--green-100); color: var(--green-700); border-radius: 12px; font-size: 0.75rem; font-weight: 600; margin-bottom: 10px; }
+  .umb-about { font-size: 0.95rem; color: var(--g700); line-height: 1.7; margin-top: 8px; max-width: 720px; }
+  .umb-member-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap: 12px; }
+  .umb-member-card { padding: 12px 14px; background: var(--g100); border-radius: var(--r-md); text-decoration: none; color: var(--charcoal); transition: all 0.2s; }
+  .umb-member-card:hover { background: var(--green-50); transform: translateY(-1px); }
+  .umb-member-name { font-weight: 700; font-size: 0.88rem; margin-bottom: 3px; }
+  .umb-member-meta { font-size: 0.72rem; color: var(--g500); }
+  .umb-empty { color: var(--g500); font-size: 0.9rem; padding: 24px; background: var(--g100); border-radius: var(--r-md); text-align: center; }
 `;
 
 // ─── Producer slug fuzzy matcher ──────────────────────────────
@@ -2353,6 +2370,192 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
     const meta = (info?.meta || {}) as any;
     const trustPct = Math.round((agent.trustScore || 0) * 100);
 
+    // ─── Phase 5.11 A2: umbrella-fields + affiliations lookup ─────────
+    // The A1 migration added umbrella_type/parent_umbrella_id/etc. as
+    // nullable columns. We read them directly here rather than threading
+    // them through marketplaceRegistry.RegisteredAgent for now (keeps the
+    // type changes scoped to seo.ts). When A3 ships admin write endpoints,
+    // we'll consider promoting these into the RegisteredAgent shape.
+    const umbDb = getDb();
+    let umbrellaRow: any = null;
+    try {
+      umbrellaRow = umbDb.prepare(
+        "SELECT umbrella_type, parent_umbrella_id, umbrella_member_count, umbrella_scrape_config, umbrella_venues FROM agents WHERE id = ?"
+      ).get(agent.id);
+    } catch (e) {
+      // If columns are missing (pre-A1 deploy somehow) treat as non-umbrella.
+      console.error("[seo:phase5.11] umbrella row lookup failed:", e);
+    }
+    const isUmbrella = !!(umbrellaRow && umbrellaRow.umbrella_type);
+
+    // Affiliations FOR a producer (forward direction):
+    //   "What umbrellas is this producer a member of?"
+    // Used to render the conditional "Tilknytninger" card + memberOf JSON-LD.
+    type Affiliation = {
+      umbrella_id: string;
+      umbrella_name: string;
+      umbrella_slug: string;
+      labels: string[];
+    };
+    let affiliations: Affiliation[] = [];
+    if (!isUmbrella) {
+      try {
+        const rows = umbDb.prepare(`
+          SELECT a.id AS umbrella_id, a.name AS umbrella_name, aff.labels
+          FROM agent_affiliations aff
+          INNER JOIN agents a ON a.id = aff.umbrella_id
+          WHERE aff.producer_id = ?
+            AND aff.status = 'active'
+          ORDER BY a.name ASC
+        `).all(agent.id) as any[];
+        affiliations = rows.map(r => ({
+          umbrella_id: r.umbrella_id,
+          umbrella_name: r.umbrella_name,
+          umbrella_slug: slugify(r.umbrella_name),
+          labels: r.labels ? (() => { try { return JSON.parse(r.labels); } catch { return []; } })() : [],
+        }));
+      } catch (e) {
+        // No agent_affiliations table → fall through with empty array.
+        console.error("[seo:phase5.11] affiliations forward query failed:", e);
+      }
+    }
+
+    // Affiliations FOR an umbrella (reverse direction):
+    //   "Which producers are members of this umbrella?"
+    // Used by the umbrella stub template's "Produsenter i nettverket" section.
+    type MemberProducer = {
+      producer_id: string;
+      producer_name: string;
+      producer_slug: string;
+      city: string | null;
+    };
+    let umbrellaMembers: MemberProducer[] = [];
+    if (isUmbrella) {
+      try {
+        const rows = umbDb.prepare(`
+          SELECT a.id AS producer_id, a.name AS producer_name, a.city AS city
+          FROM agent_affiliations aff
+          INNER JOIN agents a ON a.id = aff.producer_id
+          WHERE aff.umbrella_id = ?
+            AND aff.status = 'active'
+            AND a.is_active = 1
+          ORDER BY a.trust_score DESC, a.name ASC
+          LIMIT 100
+        `).all(agent.id) as any[];
+        umbrellaMembers = rows.map(r => ({
+          producer_id: r.producer_id,
+          producer_name: r.producer_name,
+          producer_slug: slugify(r.producer_name),
+          city: r.city,
+        }));
+      } catch (e) {
+        console.error("[seo:phase5.11] affiliations reverse query failed:", e);
+      }
+    }
+
+    // ─── Phase 5.11 A2: umbrella stub render ─────────────────────────
+    // Render a minimal umbrella-profile page when umbrella_type is set.
+    // This is a STUB: Stage A2 ships the role-branching plumbing; Stage A4
+    // and Phase B populate venues + members and refine the visual design.
+    // For now: hero (umbrella_type badge + name + "Hva er X?" placeholder),
+    // optional venues list, member-producer grid. JSON-LD uses Organization
+    // type with `member` (reverse direction of producer's `memberOf`).
+    if (isUmbrella) {
+      const umbType = umbrellaRow.umbrella_type as string;
+      const umbTypeNo: Record<string, string> = {
+        "market_network": "Marked-nettverk",
+        "venue": "Salgsvenue",
+        "industry_org": "Bransjeorganisasjon",
+        "certification": "Sertifiseringsorganisasjon",
+        "cooperative": "Samvirke",
+      };
+      const umbTypeBadge = umbTypeNo[umbType] || umbType;
+      const aboutText = (k.about || agent.description || "").trim();
+      const venuesList = (() => {
+        try { return umbrellaRow.umbrella_venues ? JSON.parse(umbrellaRow.umbrella_venues) : []; }
+        catch { return []; }
+      })();
+      const memberGridHtml = umbrellaMembers.length
+        ? umbrellaMembers.map(m =>
+            `<a href="/produsent/${m.producer_slug}" class="umb-member-card">` +
+            `<div class="umb-member-name">${escapeHtml(m.producer_name)}</div>` +
+            `<div class="umb-member-meta">${m.city ? escapeHtml(m.city) : "&nbsp;"}</div>` +
+            `</a>`).join("")
+        : "";
+
+      const umbJsonLd: any = {
+        "@context": "https://schema.org",
+        "@type": "Organization",
+        "@id": `${BASE_URL}/produsent/${slug}#org`,
+        "name": agent.name,
+        "description": aboutText || `${umbTypeBadge} på rettfrabonden.com`,
+        "url": `${BASE_URL}/produsent/${slug}`,
+      };
+      if (umbrellaRow.parent_umbrella_id) {
+        try {
+          const parent = umbDb.prepare("SELECT name FROM agents WHERE id = ?").get(umbrellaRow.parent_umbrella_id) as any;
+          if (parent?.name) {
+            umbJsonLd.subOrganization = {
+              "@type": "Organization",
+              "@id": `${BASE_URL}/produsent/${slugify(parent.name)}#org`,
+              "name": parent.name,
+              "url": `${BASE_URL}/produsent/${slugify(parent.name)}`,
+            };
+          }
+        } catch (e) { /* parent not found — ignore */ }
+      }
+      if (umbrellaMembers.length) {
+        umbJsonLd.member = umbrellaMembers.map(m => ({
+          "@type": "LocalBusiness",
+          "name": m.producer_name,
+          "url": `${BASE_URL}/produsent/${m.producer_slug}`,
+        }));
+      }
+
+      const umbContent = `
+    <div class="bc"><a href="/">Hjem</a><span>/</span>${escapeHtml(agent.name)}</div>
+
+    <div class="pf-header" style="grid-template-columns: 1fr;">
+      <div class="umb-hero">
+        <span class="umb-type-badge">${escapeHtml(umbTypeBadge)}</span>
+        <h1 class="pf-name" translate="no">${escapeHtml(agent.name)}</h1>
+        ${aboutText ? `<p class="umb-about">${escapeHtml(aboutText)}</p>` : `<p class="umb-empty">Beskrivelse av denne paraplyen blir lagt til snart.</p>`}
+      </div>
+    </div>
+
+    <div class="pf-content" style="grid-template-columns: 1fr;">
+      <div class="pf-main">
+        <div class="card">
+          <div class="card-head"><span>&#128101;</span><h3>Produsenter i nettverket${umbrellaMembers.length ? ` (${umbrellaMembers.length})` : ""}</h3></div>
+          <div class="card-body">
+            ${memberGridHtml ? `<div class="umb-member-grid">${memberGridHtml}</div>` : `<div class="umb-empty">Ingen produsenter er ennå koblet til ${escapeHtml(agent.name)}. Hvis du er produsent og selger gjennom denne paraplyen, kan du opprette en tilknytning fra din profilside.</div>`}
+          </div>
+        </div>
+
+        ${venuesList.length ? `
+        <div class="card">
+          <div class="card-head"><span>&#128205;</span><h3>Markedsplasser</h3></div>
+          <div class="card-body"><ul>${venuesList.slice(0, 50).map((v: any) =>
+            `<li>${escapeHtml(typeof v === "string" ? v : (v.name || ""))}${typeof v === "object" && v.city ? ` — ${escapeHtml(v.city)}` : ""}</li>`
+          ).join("")}</ul></div>
+        </div>` : ""}
+      </div>
+    </div>`;
+
+      return res.send(shell(
+        `${agent.name} — ${getConfig().display_name}`,
+        aboutText || `${umbTypeBadge} på rettfrabonden.com med ${umbrellaMembers.length} medlemsprodusenter`,
+        umbContent,
+        {
+          extraCss: PROFILE_CSS,
+          lang,
+          jsonLd: umbJsonLd,
+          pathForAlternate: "/produsent/" + slug,
+        }
+      ));
+    }
+
+
     // Badges
     const badges: string[] = [];
     if (agent.isVerified) badges.push(`<span class="badge badge-v">&#10003; Verifisert</span>`);
@@ -2463,6 +2666,19 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
     if ((k.deliveryOptions || []).length) deliveryParts.push(`<div class="del-item"><strong>Leveringsmetoder:</strong> ${(k.deliveryOptions as string[]).join(", ")}</div>`);
     if ((k.paymentMethods || []).length) deliveryParts.push(`<div class="del-item"><strong>Betaling:</strong> ${(k.paymentMethods as string[]).join(", ")}</div>`);
     const deliveryHtml = deliveryParts.join("");
+
+    // ─── Phase 5.11 A2: affiliations card (producer view) ───────────
+    // Hidden when affiliations is empty (matches the existing hide-when-empty
+    // pattern used by imagesHtml, productsHtml, hoursHtml, etc.).
+    const affiliationsHtml = affiliations.length
+      ? affiliations.map(a => {
+          const labelsTxt = a.labels.length ? ` <span class="aff-labels">${a.labels.map(l => escapeHtml(l)).join(" · ")}</span>` : "";
+          return `<a href="/produsent/${a.umbrella_slug}" class="aff-item" rel="related">` +
+                 `<span class="aff-icon">&#129309;</span>` +  // 🤝 handshake
+                 `<span class="aff-name">${escapeHtml(a.umbrella_name)}</span>${labelsTxt}` +
+                 `</a>`;
+        }).join("")
+      : "";
 
     // Languages
     const agentLangs: string[] = info?.agent?.languages || ["no"];
@@ -2647,6 +2863,21 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
       jsonLd.keywords = certs.join(", ");
     }
 
+    // ─── Phase 5.11 A2: memberOf — producer ↔ umbrella crawler signal ──
+    // schema.org/memberOf is the canonical primitive AI crawlers (Google,
+    // Perplexity, ChatGPT, Claude) use to navigate producer → umbrella.
+    // Always-array shape per schema.org — even with 1 entry, callers expect
+    // memberOf as a list.
+    if (affiliations.length) {
+      jsonLd.memberOf = affiliations.map(a => ({
+        "@type": "Organization",
+        "@id": `${BASE_URL}/produsent/${a.umbrella_slug}#org`,
+        "name": a.umbrella_name,
+        "url": `${BASE_URL}/produsent/${a.umbrella_slug}`,
+        ...(a.labels.length ? { "additionalType": a.labels.join(", ") } : {}),
+      }));
+    }
+
     // Payment methods
     if ((k.paymentMethods || []).length) {
       jsonLd.paymentAccepted = (k.paymentMethods as string[]).join(", ");
@@ -2779,6 +3010,12 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
         <div class="card">
           <div class="card-head"><span>&#127813;</span><h3>Produkter (${productsList.length})</h3></div>
           <div class="card-body"><div class="prod-grid">${productsHtml}</div></div>
+        </div>` : ""}
+
+        ${affiliationsHtml ? `
+        <div class="card">
+          <div class="card-head"><span>&#129309;</span><h3>Tilknytninger</h3></div>
+          <div class="card-body"><div class="aff-grid">${affiliationsHtml}</div></div>
         </div>` : ""}
 
         ${seasonHtml ? `

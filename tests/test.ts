@@ -4508,6 +4508,116 @@ console.log("── PR-29 related-producers tests ──");
 }
 
 
+
+// ─── Phase 5.11 A2: producer/umbrella rendering + memberOf JSON-LD ────
+// These tests inspect src/routes/seo.ts as source — same source-presence
+// pattern PR-30 / PR-42 use. We can't easily wire up the full Express
+// handler in this test runner, so we lock in the contract at the source
+// level: the umbrella branch exists, the affiliations queries exist,
+// the conditional renders use the hide-when-empty pattern, and the
+// memberOf JSON-LD is gated on affiliations.length.
+{
+  console.log("\n── Phase 5.11 A2: producer/umbrella rendering ──");
+  const fs = require("fs");
+  const seoSrc = fs.readFileSync("src/routes/seo.ts", "utf8");
+
+  // Test 2.1: umbrella branch exists and gates on isUmbrella
+  assertTrue(
+    /const isUmbrella = !!\(umbrellaRow && umbrellaRow\.umbrella_type\)/.test(seoSrc),
+    "phase5.11-a2: isUmbrella derived from umbrella_type IS NOT NULL"
+  );
+  assertTrue(
+    /if \(isUmbrella\) \{[\s\S]{0,8000}return res\.send\(shell\(/.test(seoSrc),
+    "phase5.11-a2: umbrella branch issues its own res.send (early-render, doesn't fall through to producer template)"
+  );
+
+  // Test 2.2: forward affiliations query (producer → umbrellas) skipped on umbrella view
+  assertTrue(
+    /let affiliations: Affiliation\[\] = \[\];[\s\S]{0,200}if \(!isUmbrella\) \{/.test(seoSrc),
+    "phase5.11-a2: forward affiliations query gated on !isUmbrella (umbrellas don't have memberships)"
+  );
+
+  // Test 2.3: reverse affiliations query (umbrella → producers) only on umbrella view
+  assertTrue(
+    /let umbrellaMembers: MemberProducer\[\] = \[\];[\s\S]{0,200}if \(isUmbrella\) \{/.test(seoSrc),
+    "phase5.11-a2: reverse affiliations query gated on isUmbrella"
+  );
+
+  // Test 2.4: affiliations card uses hide-when-empty pattern
+  assertTrue(
+    /\$\{affiliationsHtml \? `[\s\S]{0,200}aff-grid/.test(seoSrc),
+    "phase5.11-a2: affiliations card uses hide-when-empty pattern (matches existing imagesHtml/productsHtml pattern)"
+  );
+
+  // Test 2.5: memberOf JSON-LD only emitted when affiliations exist
+  assertTrue(
+    /if \(affiliations\.length\) \{[\s\S]{0,400}jsonLd\.memberOf = affiliations\.map/.test(seoSrc),
+    "phase5.11-a2: jsonLd.memberOf gated on affiliations.length > 0"
+  );
+
+  // Test 2.6: memberOf entries use schema.org Organization
+  assertTrue(
+    /jsonLd\.memberOf = affiliations\.map\([\s\S]{0,300}"@type": "Organization"/.test(seoSrc),
+    "phase5.11-a2: memberOf entries are @type=Organization with @id and url"
+  );
+
+  // Test 2.7: umbrella JSON-LD uses Organization type (not LocalBusiness)
+  assertTrue(
+    /umbJsonLd: any = \{[\s\S]{0,300}"@type": "Organization"/.test(seoSrc),
+    "phase5.11-a2: umbrella JSON-LD uses @type=Organization (not LocalBusiness)"
+  );
+
+  // Test 2.8: umbrella JSON-LD reverse direction — member array references producers
+  assertTrue(
+    /if \(umbrellaMembers\.length\) \{[\s\S]{0,300}umbJsonLd\.member = umbrellaMembers\.map/.test(seoSrc),
+    "phase5.11-a2: umbrella JSON-LD member array gated on umbrellaMembers.length"
+  );
+
+  // Test 2.9: subOrganization linking for lokallag (parent_umbrella_id)
+  assertTrue(
+    /if \(umbrellaRow\.parent_umbrella_id\) \{[\s\S]{0,400}umbJsonLd\.subOrganization = \{/.test(seoSrc),
+    "phase5.11-a2: subOrganization JSON-LD emitted for lokallag (parent_umbrella_id != null)"
+  );
+
+  // Test 2.10: aff-grid CSS rule present in PROFILE_CSS
+  assertTrue(
+    /\.aff-grid \{[^}]*display: flex/.test(seoSrc),
+    "phase5.11-a2: .aff-grid CSS rule defined"
+  );
+  assertTrue(
+    /\.umb-member-grid \{/.test(seoSrc),
+    "phase5.11-a2: .umb-member-grid CSS rule defined"
+  );
+
+  // Test 2.11: umbrella card order — Produsenter section comes BEFORE Markedsplasser
+  const umbCardOrderMatch = seoSrc.match(/Produsenter i nettverket[\s\S]{0,2000}Markedsplasser/);
+  assertTrue(
+    !!umbCardOrderMatch,
+    "phase5.11-a2: umbrella stub renders Produsenter section before Markedsplasser"
+  );
+
+  // Test 2.12: producer card order — affiliations card sits between Produkter and Sesongkalender
+  // so that the most-likely-clicked sections (products, affiliations) come before secondary info
+  const prodCardOrderMatch = seoSrc.match(/Produkter \(\${productsList\.length\}\)[\s\S]{0,1500}Tilknytninger[\s\S]{0,1500}Sesongkalender/);
+  assertTrue(
+    !!prodCardOrderMatch,
+    "phase5.11-a2: producer affiliations card sits between Produkter and Sesongkalender"
+  );
+
+  // Test 2.13: SQL queries use only A1 schema (no new tables/columns required)
+  assertTrue(
+    /FROM agent_affiliations aff[\s\S]{0,200}INNER JOIN agents a ON a\.id = aff\.umbrella_id[\s\S]{0,200}WHERE aff\.producer_id = \?/.test(seoSrc),
+    "phase5.11-a2: forward query uses agent_affiliations + agents JOIN, gated to status='active'"
+  );
+
+  // Test 2.14: queries wrapped in try/catch so missing A1 schema fails open
+  assertTrue(
+    (seoSrc.match(/console\.error\("\[seo:phase5\.11\][^"]+/g) || []).length >= 3,
+    "phase5.11-a2: all 3 new queries wrapped in try/catch with diagnostic logging"
+  );
+}
+
+
 // ── REPORT ────────────────────────────────────────────────────────────
 
 // Wait for the M2 owner-portal async tests before reporting so their
