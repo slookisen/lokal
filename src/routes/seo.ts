@@ -886,7 +886,7 @@ ${umbrellaSectionHtml}
           <p>${escapeHtml(t(lang, "home.ai_sec_body"))}</p>
           <div class="ai-logos">
             <a href="https://chatgpt.com/g/g-69dbf8593c1c81919050f8da98cd327d-finn-lokal-mat-i-norge" target="_blank" rel="noopener" class="ai-logo">\u{1F4AC} ChatGPT</a>
-            <a href="https://www.npmjs.com/package/lokal-mcp" target="_blank" rel="noopener" class="ai-logo">\u{1F50C} Claude MCP</a>
+            <a href="${localizedPath("/teknologi", lang)}#claude-mcp" class="ai-logo">\u{1F50C} Claude MCP</a>
             <a href="https://github.com/slookisen/lokal" target="_blank" rel="noopener" class="ai-logo">\u{2B50} GitHub</a>
           </div>
         </div>

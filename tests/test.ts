@@ -6108,6 +6108,49 @@ console.log("── PR-29 related-producers tests ──");
     "phase5.11-a6: scenario 3 — Hanen (5 members) ranks second");
 }
 
+// ─── PR-53: homepage Claude MCP link points to setup guide ──────────
+//
+// The homepage AI-logos block previously linked Claude MCP to
+// https://www.npmjs.com/package/lokal-mcp — a raw npm package page that
+// confuses end-users (most can't install MCPs from npm manually). The
+// link now points to our own /teknologi#claude-mcp setup guide which has
+// the Pro/Max Integrations method and the npm fallback.
+//
+// These are source-presence checks against src/routes/seo.ts.
+{
+  console.log("\n── PR-53: homepage Claude MCP link to setup guide ──");
+  const fs = require("fs");
+  const seoSrc = fs.readFileSync("src/routes/seo.ts", "utf8");
+
+  // Locate the ai-logos block (homepage) so the npm-link assertion is
+  // scoped to the homepage and not, e.g., privacy page mentions.
+  const aiLogosMatch = seoSrc.match(/<div class="ai-logos">[\s\S]*?<\/div>/);
+  assertTrue(
+    aiLogosMatch !== null,
+    "pr53: homepage ai-logos block present in seo.ts"
+  );
+  const aiLogosBlock = aiLogosMatch ? aiLogosMatch[0] : "";
+
+  // (1) Homepage ai-logos block no longer links to the raw npm page.
+  assertTrue(
+    !/npmjs\.com\/package\/lokal-mcp/.test(aiLogosBlock),
+    "pr53: homepage ai-logos block does NOT link to npmjs.com/package/lokal-mcp"
+  );
+
+  // (2) Homepage Claude MCP button uses the localizedPath helper and
+  //     points at the /teknologi#claude-mcp anchor.
+  assertTrue(
+    /localizedPath\("\/teknologi", lang\)\}#claude-mcp/.test(aiLogosBlock),
+    "pr53: homepage Claude MCP link uses localizedPath('/teknologi') + #claude-mcp anchor"
+  );
+
+  // (3) The setup-guide anchor target still exists on /teknologi.
+  assertTrue(
+    /id="claude-mcp"/.test(seoSrc),
+    "pr53: /teknologi page still contains id=\"claude-mcp\" anchor (setup guide)"
+  );
+}
+
 // ── REPORT ────────────────────────────────────────────────────────────
 
 // Wait for the M2 owner-portal async tests before reporting so their
