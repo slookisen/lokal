@@ -2523,6 +2523,7 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
       producer_slug: string;
       city: string | null;
       umbrella_type: string | null;
+      member_count?: number;
     };
     let umbrellaChildren: UmbrellaChild[] = [];
     if (isUmbrella) {
@@ -2531,7 +2532,7 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
       // Source 1: direct children via parent_umbrella_id
       try {
         const rows = umbDb.prepare(`
-          SELECT id, name, city, umbrella_type
+          SELECT id, name, city, umbrella_type, umbrella_member_count
           FROM agents
           WHERE parent_umbrella_id = ?
             AND is_active = 1
@@ -2544,6 +2545,7 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
             producer_slug: slugify(r.name),
             city: r.city,
             umbrella_type: r.umbrella_type || null,
+            member_count: typeof r.umbrella_member_count === "number" ? r.umbrella_member_count : undefined,
           });
         }
       } catch (e) {
@@ -2664,22 +2666,14 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
 
       // Per-child cards include a small umbrella_type badge so users
       // immediately understand the hierarchy at a glance.
-      const childTypeBadgeNo: Record<string, string> = {
-        "market_network": "Lokallag",
-        "venue": "Markedsplass",
-        "industry_org": "Bransjeorg.",
-        "certification": "Sertifisering",
-        "cooperative": "Samvirke",
-      };
       const memberGridHtml = umbrellaChildren.length
         ? umbrellaChildren.map(m => {
-            const tBadge = m.umbrella_type && childTypeBadgeNo[m.umbrella_type]
-              ? `<span class="umb-child-type">${escapeHtml(childTypeBadgeNo[m.umbrella_type])}</span>`
+            const countSuffix = m.umbrella_type && m.member_count
+              ? ` &middot; ${m.member_count} ${m.umbrella_type === 'venue' ? 'produsenter' : 'markedsplasser'}`
               : "";
-            const cityHtml = m.city ? escapeHtml(m.city) : "&nbsp;";
             return `<a href="/produsent/${m.producer_slug}" class="umb-member-card">` +
               `<div class="umb-member-name">${escapeHtml(m.producer_name)}</div>` +
-              `<div class="umb-member-meta">${cityHtml}${tBadge}</div>` +
+              `<div class="umb-member-meta">${m.city ? escapeHtml(m.city) : ""}${countSuffix}</div>` +
               `</a>`;
           }).join("")
         : "";
