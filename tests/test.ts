@@ -6151,6 +6151,71 @@ console.log("── PR-29 related-producers tests ──");
   );
 }
 
+// ─── Phase 5.11 A7 (PR-54): MCP HTTP endpoint umbrella tools ─────────
+//
+// The HTTP /mcp endpoint at src/routes/mcp.ts was stale: it reported
+// name="lokal" version="0.3.0" with only 4 tools (search/discover/info/
+// stats) while the npm-published lokal-mcp@0.4.0 has 7 tools — three new
+// umbrella tools were added in Phase 5.11 A2.5 to the stdio MCP server
+// (mcp-server/index.js) but never mirrored into the HTTP gateway.
+//
+// Smithery's release probe discovered the stale-state. A2A clients that
+// connect via the HTTP gateway (rather than installing the npm package
+// locally) saw only the 4 old tools.
+//
+// PR-54 syncs them: bumps name/version to "rett-fra-bonden"/"0.4.0" and
+// registers lokal_list_umbrellas, lokal_get_umbrella_members, and
+// lokal_get_producer_affiliations — calling the DB directly via getDb()
+// rather than HTTP-looping back through /api/marketplace/*.
+//
+// Source-presence assertions only — the runtime DB calls share the same
+// SQL exercised by the existing /api/marketplace/umbrellas tests
+// (Phase 5.11 A3 + A2.5 suites).
+{
+  console.log("\n── Phase 5.11 A7 (PR-54): MCP HTTP endpoint umbrella tools ──");
+  const fs = require("fs");
+  const mcpSrc = fs.readFileSync("src/routes/mcp.ts", "utf8");
+
+  // (1) Server identity now matches the npm package
+  assertTrue(
+    /name: "rett-fra-bonden"/.test(mcpSrc),
+    "phase5.11-a7: McpServer name is 'rett-fra-bonden' (matches npm package)"
+  );
+  assertTrue(
+    /version: "0\.4\.0"/.test(mcpSrc),
+    "phase5.11-a7: McpServer version is '0.4.0' (matches npm-published lokal-mcp)"
+  );
+  assertTrue(
+    !/name: "lokal", version: "0\.3\.0"/.test(mcpSrc),
+    "phase5.11-a7: old 'lokal' / '0.3.0' identity removed"
+  );
+
+  // (2) Three new umbrella tools registered
+  assertTrue(
+    /"lokal_list_umbrellas"/.test(mcpSrc),
+    "phase5.11-a7: lokal_list_umbrellas tool registered"
+  );
+  assertTrue(
+    /"lokal_get_umbrella_members"/.test(mcpSrc),
+    "phase5.11-a7: lokal_get_umbrella_members tool registered"
+  );
+  assertTrue(
+    /"lokal_get_producer_affiliations"/.test(mcpSrc),
+    "phase5.11-a7: lokal_get_producer_affiliations tool registered"
+  );
+
+  // (3) Exactly 7 tool registrations (4 existing + 3 new)
+  const toolCount = (mcpSrc.match(/server\.registerTool\(/g) || []).length;
+  assertEq(toolCount, 7,
+    "phase5.11-a7: src/routes/mcp.ts registers exactly 7 tools (matches npm-package count)");
+
+  // (4) DB-direct pattern: getDb() imported (no HTTP loopback for new tools)
+  assertTrue(
+    /import \{ getDb \} from "\.\.\/database\/init"/.test(mcpSrc),
+    "phase5.11-a7: getDb imported — new umbrella tools call SQLite directly (no HTTP loopback)"
+  );
+}
+
 // ── REPORT ────────────────────────────────────────────────────────────
 
 // Wait for the M2 owner-portal async tests before reporting so their

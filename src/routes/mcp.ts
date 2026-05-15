@@ -21,6 +21,7 @@ import { z } from "zod";
 import { marketplaceRegistry } from "../services/marketplace-registry";
 import { knowledgeService, parseProductPrice, isProductHeader, isProductNoise } from "../services/knowledge-service";
 import { slugify } from "../utils/slug";
+import { getDb } from "../database/init";
 
 
 import { conversationService } from "../services/conversation-service";
@@ -349,6 +350,195 @@ function registerTools(server: McpServer, getClientIdentity?: () => string | und
     }
   );
 
+  // ─── Phase 5.11 A2.5 tools — umbrella discovery ────────────
+  // Mirrors the npm-package tools but calls the DB directly (no HTTP loopback).
+
+  // Tool 5: List umbrella organizations
+  server.registerTool(
+    "lokal_list_umbrellas",
+    {
+      title: "List umbrella organizations",
+      description: "List all umbrella organizations on Lokal — markets-networks (Bondens marked, REKO), venues (Mathallen), industry orgs (Hanen), certifiers (Debio), and cooperatives. Each umbrella has many member producers. Optionally filter by type. Useful when the user asks 'where can I find local food markets?', 'what is Bondens marked?', or 'which certifications matter for local Norwegian food?'.",
+      inputSchema: {
+        umbrellaType: z.enum(["market_network", "venue", "industry_org", "certification", "cooperative"]).optional().describe("Filter by umbrella type"),
+        limit: z.number().min(1).max(200).default(50).describe("Max results"),
+      },
+      annotations: {
+        title: "List umbrella organizations",
+        readOnlyHint: true,
+        destructiveHint: false,
+        idempotentHint: true,
+        openWorldHint: false,
+      },
+    },
+    async ({ umbrellaType, limit }) => {
+      const db = getDb();
+      const wheres: string[] = ["umbrella_type IS NOT NULL", "is_active = 1"];
+      const params: any[] = [];
+      if (umbrellaType) { wheres.push("umbrella_type = ?"); params.push(umbrellaType); }
+      const lim = Math.min(limit || 50, 200);
+      params.push(lim);
+
+      const rows = db.prepare(`
+        SELECT id, name, description, umbrella_type, parent_umbrella_id,
+               umbrella_member_count, city
+        FROM agents
+        WHERE ${wheres.join(" AND ")}
+        ORDER BY COALESCE(umbrella_member_count, 0) DESC, name ASC
+        LIMIT ?
+      `).all(...params) as any[];
+
+      if (!rows.length) {
+        return { content: [{ type: "text" as const, text: umbrellaType
+          ? `Ingen paraplyer av type "${umbrellaType}" funnet.`
+          : "Ingen paraplyer registrert ennå." }] };
+      }
+
+      const BASE = process.env.BASE_URL || "https://rettfrabonden.com";
+      const typeLabels: Record<string, string> = {
+        market_network: "🏪 Marked-nettverk",
+        venue: "🏛 Salgs-venue",
+        industry_org: "🤝 Bransjeorganisasjon",
+        certification: "✓ Sertifisering",
+        cooperative: "👥 Samvirke",
+      };
+
+      const grouped: Record<string, any[]> = {};
+      for (const u of rows) {
+        const key = u.umbrella_type;
+        if (!grouped[key]) grouped[key] = [];
+        grouped[key].push(u);
+      }
+
+      const sections = [`🌐 **Paraplyer på Lokal** — ${rows.length} totalt:\n`];
+      for (const [type, items] of Object.entries(grouped)) {
+        sections.push(`\n## ${typeLabels[type] || type} (${items.length})`);
+        for (const u of items) {
+          const where = u.city ? ` — ${u.city}` : "";
+          const members = (u.umbrella_member_count || 0) > 0 ? ` · ${u.umbrella_member_count} medlemmer` : "";
+          sections.push(`- **${u.name}**${where}${members}`);
+          sections.push(`  ${BASE}/produsent/${slugify(u.name)}`);
+        }
+      }
+      return { content: [{ type: "text" as const, text: sections.join("\n") }] };
+    }
+  );
+
+  // Tool 6: Producers in an umbrella's network
+  server.registerTool(
+    "lokal_get_umbrella_members",
+    {
+      title: "Get producers in an umbrella's network",
+      description: "List producers that are members of a specific umbrella organization (e.g. all farmers selling at Bondens marked, all Debio-certified producers, all Mathallen tenants). Returns producer names + cities + profile links. Useful when the user asks 'which farmers sell at Bondens marked?', 'show me all Debio-certified producers', or 'who is at Mathallen Oslo?'.",
+      inputSchema: {
+        umbrellaId: z.string().describe("Umbrella agent ID (UUID). Use lokal_list_umbrellas to find IDs."),
+        limit: z.number().min(1).max(500).default(100).describe("Max results"),
+      },
+      annotations: {
+        title: "Get producers in an umbrella's network",
+        readOnlyHint: true,
+        destructiveHint: false,
+        idempotentHint: true,
+        openWorldHint: false,
+      },
+    },
+    async ({ umbrellaId, limit }) => {
+      const db = getDb();
+      const umbrella = db.prepare(
+        "SELECT id, name, umbrella_type FROM agents WHERE id = ? AND umbrella_type IS NOT NULL AND is_active = 1"
+      ).get(umbrellaId) as any;
+      if (!umbrella) {
+        return { content: [{ type: "text" as const, text: `Fant ingen paraply med ID ${umbrellaId}.` }] };
+      }
+
+      const lim = Math.min(limit || 100, 500);
+      const rows = db.prepare(`
+        SELECT p.id, p.name, p.city, aff.labels
+        FROM agent_affiliations aff
+        INNER JOIN agents p ON p.id = aff.producer_id
+        WHERE aff.umbrella_id = ? AND aff.status = 'active' AND p.is_active = 1
+        ORDER BY p.name ASC
+        LIMIT ?
+      `).all(umbrellaId, lim) as any[];
+
+      if (!rows.length) {
+        return { content: [{ type: "text" as const, text: `Ingen produsenter i ${umbrella.name} ennå.` }] };
+      }
+
+      const BASE = process.env.BASE_URL || "https://rettfrabonden.com";
+      const sections = [`🤝 **${umbrella.name}** — ${rows.length} produsenter:\n`];
+      for (const m of rows) {
+        let labels: string[] = [];
+        if (m.labels) { try { labels = JSON.parse(m.labels); } catch { /* ignore */ } }
+        const labelStr = labels.length ? ` _(${labels.join(", ")})_` : "";
+        const where = m.city ? ` — ${m.city}` : "";
+        sections.push(`- **${m.name}**${where}${labelStr}`);
+        sections.push(`  ${BASE}/produsent/${slugify(m.name)}`);
+      }
+      return { content: [{ type: "text" as const, text: sections.join("\n") }] };
+    }
+  );
+
+  // Tool 7: Umbrellas a producer belongs to
+  server.registerTool(
+    "lokal_get_producer_affiliations",
+    {
+      title: "Get a producer's umbrella affiliations",
+      description: "List umbrella organizations a specific producer is a member of (e.g. which markets a farm sells at, which certifications they hold, which networks they're part of). Returns umbrella names + types + their profile links. Useful when the user asks 'where does <Farmer X> sell?', 'is <Farm Y> Debio-certified?', or 'which markets does <Producer Z> attend?'.",
+      inputSchema: {
+        producerId: z.string().describe("Producer agent ID (UUID). Get this from lokal_search or lokal_discover results."),
+      },
+      annotations: {
+        title: "Get a producer's umbrella affiliations",
+        readOnlyHint: true,
+        destructiveHint: false,
+        idempotentHint: true,
+        openWorldHint: false,
+      },
+    },
+    async ({ producerId }) => {
+      const db = getDb();
+      const producer = db.prepare(
+        "SELECT id, name, umbrella_type FROM agents WHERE id = ? AND is_active = 1"
+      ).get(producerId) as any;
+      if (!producer) {
+        return { content: [{ type: "text" as const, text: `Fant ingen produsent med ID ${producerId}.` }] };
+      }
+
+      const rows = db.prepare(`
+        SELECT u.id, u.name, u.umbrella_type, aff.labels
+        FROM agent_affiliations aff
+        INNER JOIN agents u ON u.id = aff.umbrella_id
+        WHERE aff.producer_id = ? AND aff.status = 'active' AND u.is_active = 1
+        ORDER BY u.name ASC
+      `).all(producerId) as any[];
+
+      if (!rows.length) {
+        return { content: [{ type: "text" as const, text: `${producer.name} har ingen registrerte paraplyer-tilknytninger.` }] };
+      }
+
+      const BASE = process.env.BASE_URL || "https://rettfrabonden.com";
+      const typeLabels: Record<string, string> = {
+        market_network: "Marked-nettverk",
+        venue: "Salgs-venue",
+        industry_org: "Bransjeorganisasjon",
+        certification: "Sertifisering",
+        cooperative: "Samvirke",
+      };
+
+      const sections = [`🔗 **${producer.name}** — ${rows.length} tilknytninger:\n`];
+      for (const a of rows) {
+        let labels: string[] = [];
+        if (a.labels) { try { labels = JSON.parse(a.labels); } catch { /* ignore */ } }
+        const labelStr = labels.length ? ` _(${labels.join(", ")})_` : "";
+        const type = typeLabels[a.umbrella_type] || a.umbrella_type;
+        sections.push(`- **${a.name}** (${type})${labelStr}`);
+        sections.push(`  ${BASE}/produsent/${slugify(a.name)}`);
+      }
+      return { content: [{ type: "text" as const, text: sections.join("\n") }] };
+    }
+  );
+
   // ─── MCP Resources ──────────────────────────────────────────
   // Resources let agents READ data directly (vs tools which are actions).
   // This is the MCP equivalent of a database view.
@@ -484,7 +674,7 @@ async function getOrCreateSession(sessionId?: string, req?: Request): Promise<{ 
   const id = sessionId || randomUUID();
   const clientIdentity = req ? detectMcpClient(req) : undefined;
 
-  const server = new McpServer({ name: "lokal", version: "0.3.0" });
+  const server = new McpServer({ name: "rett-fra-bonden", version: "0.4.0" });
   const sessionRef = { clientIdentity };
   registerTools(server, () => sessionRef.clientIdentity);
 
