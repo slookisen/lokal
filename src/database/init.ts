@@ -993,6 +993,7 @@ function initSchema(db: Database.Database): void {
       WHERE
         k.email IS NOT NULL
         AND k.email != ''
+        AND a.umbrella_type IS NULL  /* Phase 5.11 A4.1: exclude umbrella agents from marketing outreach */
         AND k.verification_status = 'verified'
         AND k.enrichment_status IN ('partial', 'rich')
         AND 1=1  /* TODO Phase 5.10: AND a.removed_at IS NULL */

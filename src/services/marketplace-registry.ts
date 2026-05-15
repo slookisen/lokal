@@ -104,7 +104,8 @@ class MarketplaceRegistry {
     const nameQuery = (query as any)._nameQuery as string | undefined;
     if (nameQuery && nameQuery.length >= 3) {
       // Fetch all active agents and filter by name in JS (case-insensitive for Unicode)
-      const allRows = db.prepare("SELECT * FROM agents WHERE is_active = 1").all() as any[];
+      // Phase 5.11 A4.1: exclude umbrella agents from producer-discovery surfaces
+      const allRows = db.prepare("SELECT * FROM agents WHERE is_active = 1 AND umbrella_type IS NULL").all() as any[];
       const nameWords = nameQuery.toLowerCase().split(/\s+/).filter(w => w.length >= 2);
 
       console.log(`[name-search] query="${nameQuery}", words=${JSON.stringify(nameWords)}, totalAgents=${allRows.length}`);
@@ -217,7 +218,8 @@ class MarketplaceRegistry {
     }
 
     // Build SQL dynamically based on query filters
-    let sql = "SELECT * FROM agents WHERE is_active = 1";
+    // Phase 5.11 A4.1: exclude umbrella agents from producer-discovery surfaces
+    let sql = "SELECT * FROM agents WHERE is_active = 1 AND umbrella_type IS NULL";
     const params: any[] = [];
 
     // 1. Filter by role
@@ -517,7 +519,8 @@ class MarketplaceRegistry {
       if (!allAreKnownTerms && nonSkipWords.length > 0) {
         // Quick check: do any of these words appear in an agent name?
         const db = getDb();
-        const allNames = (db.prepare("SELECT name FROM agents WHERE is_active = 1").all() as any[])
+        // Phase 5.11 A4.1: exclude umbrellas from name-match candidate set
+        const allNames = (db.prepare("SELECT name FROM agents WHERE is_active = 1 AND umbrella_type IS NULL").all() as any[])
           .map(r => (r.name || "").toLowerCase());
 
         const nameMatches = nonSkipWords.filter(word =>
@@ -840,7 +843,8 @@ class MarketplaceRegistry {
       return this._agentsCache;
     }
     const db = getDb();
-    const rows = db.prepare("SELECT * FROM agents WHERE is_active = 1 ORDER BY trust_score DESC, created_at DESC").all() as any[];
+    // Phase 5.11 A4.1: getActiveAgents powers producer-discovery surfaces; exclude umbrellas
+    const rows = db.prepare("SELECT * FROM agents WHERE is_active = 1 AND umbrella_type IS NULL ORDER BY trust_score DESC, created_at DESC").all() as any[];
     this._agentsCache = rows.map(r => this.rowToAgent(r)!);
     this._agentsCacheTime = now;
     return this._agentsCache;
@@ -853,8 +857,10 @@ class MarketplaceRegistry {
     }
     const db = getDb();
     const total = (db.prepare("SELECT COUNT(*) as c FROM agents").get() as any).c;
-    const activeProducers = (db.prepare("SELECT COUNT(*) as c FROM agents WHERE role = 'producer' AND is_active = 1").get() as any).c;
-    const citiesRows = db.prepare("SELECT DISTINCT city FROM agents WHERE city IS NOT NULL").all() as any[];
+    // Phase 5.11 A4.1: activeProducers stat should exclude umbrella-tagged agents
+    const activeProducers = (db.prepare("SELECT COUNT(*) as c FROM agents WHERE role = 'producer' AND is_active = 1 AND umbrella_type IS NULL").get() as any).c;
+    // Phase 5.11 A4.1: cities stat should not count umbrella locations
+    const citiesRows = db.prepare("SELECT DISTINCT city FROM agents WHERE city IS NOT NULL AND umbrella_type IS NULL").all() as any[];
     const totalListings = (db.prepare("SELECT COUNT(*) as c FROM listings").get() as any).c;
 
     this._statsCache = {

@@ -4971,6 +4971,217 @@ console.log("── PR-29 related-producers tests ──");
 }
 
 
+
+// ─── Phase 5.11 A4.1: umbrella exclusion from producer surfaces ───────
+// PR-48: marketplace-registry SELECTs and the outreach_ready_pool VIEW
+// must filter out umbrella-tagged agents (umbrella_type IS NOT NULL).
+// Direct-fetch paths (getAgent, /umbrellas) must still find them.
+{
+  console.log("\n── Phase 5.11 A4.1: umbrella exclusion from producer surfaces ──");
+
+  const Database3 = require("better-sqlite3");
+  const initMod3 = require("../src/database/init");
+  const regMod3 = require("../src/services/marketplace-registry");
+
+  // Build a fresh in-memory DB with the columns the registry + outreach
+  // VIEW need. We can't call src/database/init.ts:initSchema (private and
+  // getDb short-circuits once __setDbForTesting has pinned a handle), so
+  // we materialise the minimal shape inline.
+  const a41db = new Database3(":memory:");
+  a41db.pragma("journal_mode = DELETE");
+  a41db.pragma("foreign_keys = ON");
+  a41db.exec(`
+    CREATE TABLE agents (
+      id TEXT PRIMARY KEY,
+      name TEXT NOT NULL,
+      description TEXT,
+      provider TEXT,
+      contact_email TEXT,
+      url TEXT,
+      version TEXT DEFAULT '1.0.0',
+      role TEXT,
+      api_key TEXT UNIQUE,
+      lat REAL, lng REAL, city TEXT, radius_km REAL,
+      categories TEXT DEFAULT '[]',
+      tags TEXT DEFAULT '[]',
+      skills TEXT DEFAULT '[]',
+      capabilities TEXT DEFAULT '{}',
+      languages TEXT DEFAULT '["no"]',
+      trust_score REAL DEFAULT 0.5,
+      is_active INTEGER DEFAULT 1,
+      is_verified INTEGER DEFAULT 0,
+      discovery_count INTEGER DEFAULT 0,
+      interaction_count INTEGER DEFAULT 0,
+      total_interactions INTEGER DEFAULT 0,
+      avg_response_time_ms REAL,
+      created_at TEXT DEFAULT (datetime('now')),
+      last_seen_at TEXT DEFAULT (datetime('now')),
+      umbrella_type TEXT,
+      parent_umbrella_id TEXT,
+      umbrella_member_count INTEGER,
+      umbrella_scrape_config TEXT,
+      umbrella_venues TEXT
+    );
+    CREATE TABLE agent_knowledge (
+      agent_id TEXT PRIMARY KEY,
+      email TEXT, phone TEXT, address TEXT, website TEXT,
+      verification_status TEXT DEFAULT 'unverified',
+      enrichment_status TEXT DEFAULT 'partial',
+      outreach_eligible_at TEXT,
+      last_verified_at TEXT,
+      url_last_probed TEXT,
+      url_last_status INTEGER
+    );
+    CREATE TABLE outreach_sent_log (
+      agent_id TEXT PRIMARY KEY,
+      sent_at TEXT DEFAULT (datetime('now'))
+    );
+    CREATE TABLE listings (id TEXT PRIMARY KEY);
+    DROP VIEW IF EXISTS outreach_ready_pool;
+    CREATE VIEW outreach_ready_pool AS
+    SELECT
+      a.id AS agent_id, a.name, a.role, a.city AS location_city,
+      k.email, k.phone, k.verification_status, k.enrichment_status,
+      k.outreach_eligible_at, k.last_verified_at,
+      k.url_last_probed, k.url_last_status
+    FROM agents a
+    INNER JOIN agent_knowledge k ON k.agent_id = a.id
+    WHERE
+      k.email IS NOT NULL
+      AND k.email != ''
+      AND a.umbrella_type IS NULL  /* Phase 5.11 A4.1 */
+      AND k.verification_status = 'verified'
+      AND k.enrichment_status IN ('partial', 'rich')
+      AND k.url_last_status IS NOT NULL
+      AND k.url_last_status >= 200
+      AND k.url_last_status < 400
+      AND k.url_last_probed IS NOT NULL
+      AND k.url_last_probed > datetime('now', '-30 days')
+      AND NOT EXISTS (
+        SELECT 1 FROM outreach_sent_log o WHERE o.agent_id = a.id
+      );
+  `);
+  initMod3.__setDbForTesting(a41db);
+
+  // Reset the registry's caches so it re-reads from our injected db
+  const reg = regMod3.marketplaceRegistry as any;
+  reg._agentsCache = null;
+  reg._statsCache = null;
+
+  // Seed: 1 plain producer + 1 producer tagged as umbrella
+  a41db.prepare(`
+    INSERT INTO agents (id, name, description, provider, contact_email, url, role, api_key, city, is_active)
+    VALUES ('a41-prod-1','A41 Plain Producer','desc','test','prod@test.no','https://prod.test.no','producer','k-a41-prod-1','Oslo',1)
+  `).run();
+  a41db.prepare(`
+    INSERT INTO agents (id, name, description, provider, contact_email, url, role, api_key, city, is_active, umbrella_type)
+    VALUES ('a41-umb-1','Bondens marked Oslo','desc','test','umb@test.no','https://umb.test.no','producer','k-a41-umb-1','Oslo',1,'market_network')
+  `).run();
+  const probedAt = new Date().toISOString();
+  a41db.prepare(`
+    INSERT INTO agent_knowledge (agent_id, email, verification_status, enrichment_status, url_last_probed, url_last_status)
+    VALUES ('a41-prod-1','prod@test.no','verified','rich',?,200)
+  `).run(probedAt);
+  a41db.prepare(`
+    INSERT INTO agent_knowledge (agent_id, email, verification_status, enrichment_status, url_last_probed, url_last_status)
+    VALUES ('a41-umb-1','umb@test.no','verified','rich',?,200)
+  `).run(probedAt);
+
+  // discover() is async — wrap in IIFE-style synchronous test via .then chain
+  // The intg pattern in this file already uses dangling promises with failures
+  // pushed to the shared `failures` array; we do the same and await it from
+  // the REPORT block below by pushing onto _a41Promises (reused pattern).
+  // Simplest approach: do sync assertions first, then dispatch the async one.
+
+  // Sync test A4.1.1: getActiveAgents() excludes umbrella
+  reg._agentsCache = null;
+  const activeAgents = regMod3.marketplaceRegistry.getActiveAgents();
+  const activeIds = activeAgents.map((a: any) => a.id);
+  assertTrue(
+    activeIds.includes("a41-prod-1"),
+    "phase5.11-a4.1: getActiveAgents() includes plain producer"
+  );
+  assertTrue(
+    !activeIds.includes("a41-umb-1"),
+    "phase5.11-a4.1: getActiveAgents() excludes umbrella-tagged agent"
+  );
+
+  // Sync test A4.1.2: getStats().activeProducers does not count umbrella
+  reg._statsCache = null;
+  const stats = regMod3.marketplaceRegistry.getStats();
+  assertEq(
+    stats.activeProducers, 1,
+    "phase5.11-a4.1: getStats().activeProducers excludes umbrella (1 producer, not 2)"
+  );
+
+  // Sync test A4.1.3: outreach_ready_pool VIEW excludes umbrella
+  const poolRows = a41db.prepare("SELECT agent_id FROM outreach_ready_pool ORDER BY agent_id").all();
+  const poolIds = poolRows.map((r: any) => r.agent_id);
+  assertTrue(
+    poolIds.includes("a41-prod-1"),
+    "phase5.11-a4.1: outreach_ready_pool VIEW includes verified plain producer"
+  );
+  assertTrue(
+    !poolIds.includes("a41-umb-1"),
+    "phase5.11-a4.1: outreach_ready_pool VIEW excludes umbrella (filter in WHERE)"
+  );
+
+  // Sync test A4.1.4: direct fetch via getAgent(id) still returns umbrella
+  const directFetch = regMod3.marketplaceRegistry.getAgent("a41-umb-1");
+  assertTrue(
+    !!directFetch && directFetch.id === "a41-umb-1",
+    "phase5.11-a4.1: getAgent(id) still returns umbrella (direct-fetch unaffected)"
+  );
+
+  // Sync test A4.1.5: getAgentByApiKey still returns umbrella
+  const byKey = regMod3.marketplaceRegistry.getAgentByApiKey("k-a41-umb-1");
+  assertTrue(
+    !!byKey && byKey.id === "a41-umb-1",
+    "phase5.11-a4.1: getAgentByApiKey() still returns umbrella (direct-fetch unaffected)"
+  );
+
+  // Source-presence guard: A4.1 filter lines are in the committed source
+  const fs2 = require("fs");
+  const regSrc = fs2.readFileSync("src/services/marketplace-registry.ts", "utf8");
+  const regCount = (regSrc.match(/umbrella_type IS NULL/g) || []).length;
+  assertTrue(
+    regCount >= 6,
+    `phase5.11-a4.1: marketplace-registry.ts contains >=6 "umbrella_type IS NULL" filters (actual: ${regCount})`
+  );
+  const initSrc = fs2.readFileSync("src/database/init.ts", "utf8");
+  assertTrue(
+    /CREATE VIEW outreach_ready_pool[\s\S]*?a\.umbrella_type IS NULL[\s\S]*?\)/.test(initSrc),
+    "phase5.11-a4.1: outreach_ready_pool VIEW WHERE clause includes a.umbrella_type IS NULL"
+  );
+
+  // /api/marketplace/umbrellas SQL still selects umbrellas
+  const mpSrc = fs2.readFileSync("src/routes/marketplace.ts", "utf8");
+  assertTrue(
+    /router\.get\("\/umbrellas"[\s\S]*?umbrella_type IS NOT NULL/.test(mpSrc),
+    "phase5.11-a4.1: /umbrellas route still filters umbrella_type IS NOT NULL (umbrellas remain discoverable)"
+  );
+
+  // Sync test A4.1.6: discover({}) excludes umbrella
+  // discover() returns DiscoveryResult[] — array of { agent: { id, ... }, ... }
+  reg._agentsCache = null;
+  try {
+    const discoverResult = regMod3.marketplaceRegistry.discover({}) as any[];
+    const discoverIds = discoverResult.map((r: any) => r.agent?.id || r.id);
+    assertTrue(
+      discoverIds.includes("a41-prod-1"),
+      "phase5.11-a4.1: discover({}) includes plain producer"
+    );
+    assertTrue(
+      !discoverIds.includes("a41-umb-1"),
+      "phase5.11-a4.1: discover({}) excludes umbrella-tagged agent"
+    );
+  } catch (e: any) {
+    failures.push("phase5.11-a4.1: discover() test threw: " + (e?.message || e));
+    failed++;
+  }
+}
+
+
 // ── REPORT ────────────────────────────────────────────────────────────
 
 // Wait for the M2 owner-portal async tests before reporting so their
