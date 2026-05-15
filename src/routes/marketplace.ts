@@ -3118,4 +3118,262 @@ router.patch("/admin/affiliations/:id", (req: Request, res: Response) => {
 
 
 
+
+// ─── Phase 5.11 A4.3: Bondens marked migration admin endpoint ───────
+// One-shot, idempotent migration that reshapes the 70 existing Bondens
+// marked entries into umbrella/venue role while creating 2 new umbrella
+// agents (national "Bondens marked Norge" + Sogn og Fjordane lokallag).
+//
+// Zero deletions — preserves all 70 existing agents and creates 70
+// agent_affiliations rows (12 lokallag→national + 58 venue→lokallag).
+//
+// Per-row migration table is generated from
+// protocols/phase5.11-a4-bm-migration-plan.csv (slookisen/A2A, reviewed
+// by Daniel 2026-05-15) and embedded as a TS constant in src/data/.
+//
+// Supports body { dry_run: true } to inspect the resulting shape without
+// committing — uses a manual BEGIN/ROLLBACK around the transaction so
+// the DB state is unchanged after a dry-run.
+//
+// Idempotency: refuses to run if "Bondens marked Norge" already exists
+// as an umbrella (409). Designed to be SAFE to retry post-failure.
+
+router.post("/admin/migrations/phase-5.11-a4-bm", (req: Request, res: Response) => {
+  const expectedKey = getAdminKey();
+  if (!expectedKey) { res.status(503).json({ success: false, error: "Admin not configured" }); return; }
+  const adminKey = req.headers["x-admin-key"] as string;
+  if (!adminKey || adminKey !== expectedKey) {
+    res.status(403).json({ success: false, error: "Krever X-Admin-Key header" });
+    return;
+  }
+
+  const body = (req.body || {}) as { dry_run?: boolean };
+  const dryRun = body.dry_run === true;
+
+  try {
+    const db = getDb();
+
+    // ── Idempotency guard ───────────────────────────────────────
+    // Refuse to run if "Bondens marked Norge" already exists as an
+    // umbrella. Name match is case-insensitive (LOWER comparison) and
+    // requires umbrella_type IS NOT NULL — a plain producer named
+    // similarly would NOT block the migration.
+    const existing = db.prepare(
+      "SELECT id FROM agents WHERE LOWER(name) = LOWER(?) AND umbrella_type IS NOT NULL"
+    ).get("Bondens marked Norge") as any;
+    if (existing) {
+      res.status(409).json({
+        success: false,
+        error: "Idempotency violation: 'Bondens marked Norge' umbrella already exists",
+        existing_id: existing.id,
+      });
+      return;
+    }
+
+    // Lazy-import so unit tests that don't need this data don't pay parse cost
+    const { BM_MIGRATION_DATA } = require("../data/phase5.11-a4-bm-migration");
+    const crypto = require("crypto");
+
+    // ── Manual transaction (allows dry-run via ROLLBACK) ────────
+    // better-sqlite3's db.transaction() always commits on success — we need
+    // explicit BEGIN/COMMIT|ROLLBACK control to support dry_run. Pattern
+    // mirrors what the affiliations PATCH endpoint would use if it needed
+    // multi-step rollback semantics.
+    db.exec("BEGIN");
+    let summary: any = null;
+    try {
+      const PROVENANCE = JSON.stringify({
+        source: "phase5.11-a4-migration",
+        verified_via: "bondensmarked.no/lokallag cross-ref + manual review by Daniel 2026-05-15",
+      });
+
+      // 1. Create national umbrella
+      const nationalId = crypto.randomUUID();
+      const nationalApiKey = `umb_${crypto.randomBytes(24).toString("hex")}`;
+      db.prepare(`
+        INSERT INTO agents (
+          id, name, description, provider, contact_email, url,
+          role, api_key,
+          city, is_active, is_verified, trust_score,
+          umbrella_type, parent_umbrella_id, umbrella_member_count
+        ) VALUES (
+          ?, ?, ?, 'umbrella-admin', ?, ?,
+          'producer', ?,
+          NULL, 1, 1, 0.9,
+          'market_network', NULL, 0
+        )
+      `).run(
+        nationalId,
+        BM_MIGRATION_DATA.national.name,
+        BM_MIGRATION_DATA.national.description,
+        BM_MIGRATION_DATA.national.email,
+        BM_MIGRATION_DATA.national.url,
+        nationalApiKey,
+      );
+      knowledgeService.upsertKnowledge(nationalId, {
+        website: BM_MIGRATION_DATA.national.url,
+        email: BM_MIGRATION_DATA.national.email,
+        phone: BM_MIGRATION_DATA.national.phone,
+        about: BM_MIGRATION_DATA.national.description,
+        dataSource: "owner",
+      });
+
+      // 2. Create new Sogn og Fjordane lokallag
+      const sognId = crypto.randomUUID();
+      const sognApiKey = `umb_${crypto.randomBytes(24).toString("hex")}`;
+      db.prepare(`
+        INSERT INTO agents (
+          id, name, description, provider, contact_email, url,
+          role, api_key,
+          city, is_active, is_verified, trust_score,
+          umbrella_type, parent_umbrella_id, umbrella_member_count
+        ) VALUES (
+          ?, ?, '', 'umbrella-admin', '', '',
+          'producer', ?,
+          NULL, 1, 1, 0.85,
+          'market_network', ?, 0
+        )
+      `).run(sognId, "Bondens Marked Sogn og Fjordane", sognApiKey, nationalId);
+
+      // 3. Build name→id map for lokallag (drives venue parent resolution
+      //    + affiliation creation)
+      const lokallagNameToId: Record<string, string> = {
+        "Bondens marked Norge": nationalId,
+        "Bondens Marked Sogn og Fjordane": sognId,
+      };
+
+      // 4. PROMOTE-TO-LOKALLAG: 12 existing agents → market_network + parent=national
+      const promoteStmt = db.prepare(
+        "UPDATE agents SET umbrella_type = 'market_network', parent_umbrella_id = ? WHERE id = ?"
+      );
+      let promoted = 0;
+      for (const row of BM_MIGRATION_DATA.promote_to_lokallag) {
+        const result = promoteStmt.run(nationalId, row.agent_id);
+        if (result.changes === 0) {
+          throw new Error(`promote_to_lokallag: agent_id ${row.agent_id} (${row.current_name}) not found`);
+        }
+        lokallagNameToId[row.current_name] = row.agent_id;
+        promoted++;
+      }
+
+      // 5. DEMOTE-DUP + SET-AS-VENUE: 4 + 54 = 58 entries → venue + parent=<lokallag>
+      const venueStmt = db.prepare(
+        "UPDATE agents SET umbrella_type = 'venue', parent_umbrella_id = ? WHERE id = ?"
+      );
+      let demoted = 0;
+      let setVenue = 0;
+      for (const row of BM_MIGRATION_DATA.demote_dup_to_venue) {
+        const parentId = lokallagNameToId[row.parent_lokallag_name];
+        if (!parentId) throw new Error(`demote_dup_to_venue: unknown parent lokallag '${row.parent_lokallag_name}' for ${row.current_name}`);
+        const result = venueStmt.run(parentId, row.agent_id);
+        if (result.changes === 0) {
+          throw new Error(`demote_dup_to_venue: agent_id ${row.agent_id} (${row.current_name}) not found`);
+        }
+        demoted++;
+      }
+      for (const row of BM_MIGRATION_DATA.set_as_venue) {
+        const parentId = lokallagNameToId[row.parent_lokallag_name];
+        if (!parentId) throw new Error(`set_as_venue: unknown parent lokallag '${row.parent_lokallag_name}' for ${row.current_name}`);
+        const result = venueStmt.run(parentId, row.agent_id);
+        if (result.changes === 0) {
+          throw new Error(`set_as_venue: agent_id ${row.agent_id} (${row.current_name}) not found`);
+        }
+        setVenue++;
+      }
+
+      // 6. Create agent_affiliations rows
+      //    - 12 lokallag → national (producer_id=lokallag.id, umbrella_id=national.id)
+      //    - 58 venues → lokallag (producer_id=venue.id, umbrella_id=lokallag.id)
+      //    status='active', source='admin', confirmed_at=now, 18-month expiry
+      const affStmt = db.prepare(`
+        INSERT INTO agent_affiliations (
+          producer_id, umbrella_id, status, source, labels, notes,
+          joined_at, confirmed_at, expires_at, field_provenance
+        ) VALUES (?, ?, 'active', 'admin', '[]', ?, NULL, ?, ?, ?)
+      `);
+      const now = new Date().toISOString();
+      const expiresAt = new Date(Date.now() + 18 * 30 * 24 * 60 * 60 * 1000).toISOString();
+
+      let affiliationsCreated = 0;
+      // 12 lokallag → national
+      for (const row of BM_MIGRATION_DATA.promote_to_lokallag) {
+        affStmt.run(
+          row.agent_id, nationalId,
+          `Phase 5.11 A4.3 migration: ${row.current_name} → ${BM_MIGRATION_DATA.national.name}`,
+          now, expiresAt, PROVENANCE,
+        );
+        affiliationsCreated++;
+      }
+      // 58 venues → lokallag
+      for (const row of [...BM_MIGRATION_DATA.demote_dup_to_venue, ...BM_MIGRATION_DATA.set_as_venue]) {
+        const parentId = lokallagNameToId[row.parent_lokallag_name];
+        affStmt.run(
+          row.agent_id, parentId,
+          `Phase 5.11 A4.3 migration: ${row.current_name} → ${row.parent_lokallag_name}`,
+          now, expiresAt, PROVENANCE,
+        );
+        affiliationsCreated++;
+      }
+
+      // 7. Refresh umbrella_member_count for all umbrellas (national + 13 lokallag)
+      db.prepare(`
+        UPDATE agents
+        SET umbrella_member_count = (
+          SELECT COUNT(*) FROM agent_affiliations
+          WHERE umbrella_id = agents.id AND status = 'active'
+        )
+        WHERE umbrella_type IS NOT NULL
+      `).run();
+
+      // 8. Build summary response
+      const totalAgents = (db.prepare("SELECT COUNT(*) AS c FROM agents").get() as any).c;
+      const totalUmbrellas = (db.prepare("SELECT COUNT(*) AS c FROM agents WHERE umbrella_type IS NOT NULL").get() as any).c;
+      const totalVenues = (db.prepare("SELECT COUNT(*) AS c FROM agents WHERE umbrella_type = 'venue'").get() as any).c;
+
+      summary = {
+        success: true,
+        dry_run: dryRun,
+        created: {
+          national: 1,
+          new_lokallag: 1,
+          total: 2,
+        },
+        promoted_to_lokallag: promoted,
+        demoted_to_venue: demoted,
+        set_as_venue: setVenue,
+        affiliations_created: affiliationsCreated,
+        total_agents_after: totalAgents,
+        total_umbrellas_after: totalUmbrellas,
+        total_venues_after: totalVenues,
+        national_id: nationalId,
+        sogn_id: sognId,
+      };
+
+      if (dryRun) {
+        db.exec("ROLLBACK");
+      } else {
+        db.exec("COMMIT");
+        interactionLogger.log("umbrella_created", {
+          agentId: nationalId,
+          metadata: {
+            migration: "phase-5.11-a4-bm",
+            source: "admin",
+            summary,
+          },
+          ipAddress: req.ip,
+        });
+      }
+    } catch (innerErr: any) {
+      try { db.exec("ROLLBACK"); } catch { /* already rolled back */ }
+      throw innerErr;
+    }
+
+    res.json(summary);
+  } catch (err: any) {
+    console.error("[admin/migrations/phase-5.11-a4-bm] Error:", err);
+    res.status(500).json({ success: false, error: err.message || "Intern feil" });
+  }
+});
+
+
 export default router;
