@@ -1192,6 +1192,124 @@ router.put("/agents/:id/knowledge", (req: Request, res: Response) => {
   }
 });
 
+// ─── PUT /agents/:id/description — Write agent.name + agent.description (PR-42) ─
+// The `/knowledge` endpoint writes `agent_knowledge.about` (long-form bio).
+// THIS endpoint writes the columns on the `agents` table that drive
+// h1/title/og:description/Schema.org meta tags on /produsent/<slug>.
+//
+// Why a separate endpoint:
+// - CS-agent and orchestrator both confirmed 2026-05-12..15 that they could
+//   not find a discoverable path to fix `agents.name`/`agents.description`.
+//   (PATCH /agents/:id exists with the same auth and column-set but the
+//    /knowledge sibling is what CS reaches for; this alias makes the write
+//    path symmetrical and discoverable.)
+// - Two real instances broke autonomous CS: PAN (2026-05-14) + Fiddan (2026-05-15).
+//   Both required Daniel-attestation + manual DB write. This endpoint closes
+//   that dev-debt class so future B2-HIGH-evidens corrections can land
+//   autonomously.
+//
+// Auth model mirrors PUT /agents/:id/knowledge:
+//   1. X-Admin-Key   → admin enrichment / CS-relay fixes
+//   2. X-Claim-Token → producer who has claimed their listing
+//   3. X-API-Key     → agent's own key
+//
+// Body: { name?: string, description?: string }
+//   - Both fields optional; at least one required.
+//   - name: 1..200 chars after trim
+//   - description: 1..500 chars after trim
+//   - Any other field in the body is rejected (so callers don't accidentally
+//     overwrite city/categories/tags via this endpoint — those have their
+//     own routes via /knowledge and PATCH /agents/:id).
+router.put("/agents/:id/description", (req: Request, res: Response) => {
+  const claimToken = (req.headers["x-claim-token"] as string) || "";
+  const apiKey = (req.headers["x-api-key"] as string) || "";
+  const adminKeyHeader = (req.headers["x-admin-key"] as string) || "";
+  const expectedAdminKey = getAdminKey();
+  const agentId = req.params.id as string;
+
+  let authorized = false;
+
+  if (expectedAdminKey && adminKeyHeader && adminKeyHeader === expectedAdminKey) {
+    authorized = true;
+  }
+  if (!authorized && claimToken) {
+    const claim = knowledgeService.getClaimByToken(claimToken);
+    if (claim && claim.agentId === agentId) authorized = true;
+  }
+  if (!authorized && apiKey) {
+    const a = marketplaceRegistry.getAgentByApiKey(apiKey);
+    if (a && a.id === agentId) authorized = true;
+  }
+
+  if (!authorized) {
+    res.status(403).json({
+      success: false,
+      error: "Ikke autorisert. Bruk X-Admin-Key, X-Claim-Token eller X-API-Key header.",
+    });
+    return;
+  }
+
+  const body = (req.body || {}) as Record<string, unknown>;
+  const ALLOWED = new Set(["name", "description"]);
+  const extra = Object.keys(body).filter((k) => !ALLOWED.has(k));
+  if (extra.length > 0) {
+    res.status(400).json({
+      success: false,
+      error: `Felt ikke tillatt på denne pathen: ${extra.join(", ")}. Bruk PUT /agents/:id/knowledge eller PATCH /agents/:id for andre felter.`,
+    });
+    return;
+  }
+
+  const updates: { name?: string; description?: string } = {};
+  if (typeof body.name === "string") {
+    const trimmed = body.name.trim();
+    if (trimmed.length < 1 || trimmed.length > 200) {
+      res.status(400).json({ success: false, error: "name må være 1-200 tegn etter trim." });
+      return;
+    }
+    updates.name = trimmed;
+  } else if (body.name !== undefined) {
+    res.status(400).json({ success: false, error: "name må være string." });
+    return;
+  }
+
+  if (typeof body.description === "string") {
+    const trimmed = body.description.trim();
+    if (trimmed.length < 1 || trimmed.length > 500) {
+      res.status(400).json({ success: false, error: "description må være 1-500 tegn etter trim." });
+      return;
+    }
+    updates.description = trimmed;
+  } else if (body.description !== undefined) {
+    res.status(400).json({ success: false, error: "description må være string." });
+    return;
+  }
+
+  if (updates.name === undefined && updates.description === undefined) {
+    res.status(400).json({
+      success: false,
+      error: "Trenger minst ett av: name, description.",
+    });
+    return;
+  }
+
+  const updated = marketplaceRegistry.updateAgent(agentId, updates);
+  if (!updated) {
+    res.status(404).json({ success: false, error: "Agent ikke funnet." });
+    return;
+  }
+
+  res.json({
+    success: true,
+    message: "Agent navn/beskrivelse oppdatert",
+    data: {
+      id: updated.id,
+      name: updated.name,
+      description: updated.description,
+    },
+  });
+});
+
 // ─── POST /admin/register — Relaxed registration for auto-discovery ──
 // Only requires name — everything else gets sensible defaults.
 // Agents registered this way get lower trust scores until enriched,

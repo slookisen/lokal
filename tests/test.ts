@@ -4290,6 +4290,83 @@ console.log("── PR-29 related-producers tests ──");
 }
 
 
+// ── PR-42: PUT /api/marketplace/agents/:id/description (source-presence) ──
+// The runtime handler is exercised by manual probes against prod (see
+// supervisor-rejections/2026-05-15-pr-42-success.md). These tests lock in
+// the route's source-presence + key behaviour invariants so a future
+// refactor that drops the auth check, allow-list, or length-bound is
+// caught at CI time.
+{
+  const fs = require("fs");
+  const src = fs.readFileSync("src/routes/marketplace.ts", "utf8");
+
+  assertTrue(
+    src.includes('router.put("/agents/:id/description"'),
+    "pr42: PUT /agents/:id/description route registered"
+  );
+  assertTrue(
+    src.includes('marketplaceRegistry.updateAgent(agentId, updates)'),
+    "pr42: route delegates write to marketplaceRegistry.updateAgent"
+  );
+  assertTrue(
+    /ALLOWED = new Set\(\["name", "description"\]\)/.test(src),
+    "pr42: body allow-list restricts writable fields to name + description"
+  );
+  // Auth model: same three-way as PUT /knowledge — admin, claim-token, api-key.
+  // We grep the strings in the new handler block to avoid matching the
+  // unrelated PUT /knowledge handler that lives above it.
+  const handlerStart = src.indexOf('router.put("/agents/:id/description"');
+  assertTrue(handlerStart > 0, "pr42: handler start position found");
+  // Slice up to the next top-level "router." declaration so the handlerSrc
+  // contains the full body (including the nested `});` of the early 403 return).
+  const nextRouter = src.indexOf("\nrouter.", handlerStart + 1);
+  const handlerEnd = nextRouter > handlerStart ? nextRouter : src.length;
+  const handlerSrc = src.slice(handlerStart, handlerEnd);
+  assertTrue(
+    handlerSrc.includes('x-admin-key'),
+    "pr42: handler accepts X-Admin-Key"
+  );
+  assertTrue(
+    handlerSrc.includes('x-claim-token'),
+    "pr42: handler accepts X-Claim-Token"
+  );
+  assertTrue(
+    handlerSrc.includes('x-api-key'),
+    "pr42: handler accepts X-API-Key"
+  );
+  assertTrue(
+    handlerSrc.includes('Ikke autorisert'),
+    "pr42: handler returns Norwegian 403 message when no auth"
+  );
+  // Length bounds — 1..200 for name, 1..500 for description.
+  assertTrue(
+    handlerSrc.includes('200') && handlerSrc.includes('500'),
+    "pr42: name (1-200) and description (1-500) length bounds present"
+  );
+  assertTrue(
+    handlerSrc.includes('Trenger minst ett av'),
+    "pr42: at-least-one-of validation enforced"
+  );
+  assertTrue(
+    handlerSrc.includes('Felt ikke tillatt'),
+    "pr42: extra-field rejection enforced"
+  );
+  // Registry guarantee — the underlying updateAgent allow-list must still
+  // include name and description. If a future refactor removes them from
+  // allowedFields, the runtime write becomes a silent no-op for these
+  // fields. This pins the contract at the source level.
+  const registrySrc = fs.readFileSync("src/services/marketplace-registry.ts", "utf8");
+  assertTrue(
+    /allowedFields[\s\S]{0,400}name:\s*"name"/.test(registrySrc),
+    "pr42: marketplaceRegistry.updateAgent still maps name → column"
+  );
+  assertTrue(
+    /allowedFields[\s\S]{0,400}description:\s*"description"/.test(registrySrc),
+    "pr42: marketplaceRegistry.updateAgent still maps description → column"
+  );
+}
+
+
 // ── REPORT ────────────────────────────────────────────────────────────
 
 // Wait for the M2 owner-portal async tests before reporting so their
