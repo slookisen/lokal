@@ -2268,8 +2268,22 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
   const slug = (req.params.slug as string).toLowerCase();
 
   try {
+    // Phase 5.11 A4.4 (PR-50 hotfix): the main agent lookup must include
+    // umbrella-tagged agents — A4.3's migration tagged 14 lokallag + 58
+    // venues, and PR-48's filter (umbrella_type IS NULL) on getActiveAgents()
+    // was hiding all 70+ of those slugs from this route, returning 404 for
+    // /produsent/bondens-marked-norge, /produsent/bondens-marked-mandal, etc.
+    // The dedicated method below queries `WHERE is_active = 1` (no umbrella
+    // filter). Downstream logic in this handler already branches on
+    // umbrellaRow.umbrella_type to render either the umbrella-stub OR the
+    // producer template, so all we need to do is let the lookup find them.
+    //
+    // The `agents` list below is still producer-only — it powers suggestions,
+    // related producers, and the fuzzy fallback. Suggestions on the 404 page
+    // should be PRODUCERS (humans typing producer names), not umbrellas, so
+    // getActiveAgents()'s filter is correct there.
+    const agent = marketplaceRegistry.getAgentBySlugIncludingUmbrellas(slug);
     const agents = marketplaceRegistry.getActiveAgents();
-    const agent = agents.find((a: any) => slugify(a.name) === slug);
 
     if (!agent) {
       // Fuzzy fallback so AI-engine traffic that constructs slugs from

@@ -5468,6 +5468,244 @@ console.log("── PR-29 related-producers tests ──");
   assertEq(dryUmb, 0, "phase5.11-a4.3: dry_run path leaves umbrella_type unset");
 }
 
+
+// ─── Phase 5.11 A4.4 (PR-50): /produsent/:slug umbrella fix + Sogn backfill ─
+// Two regression-targeted hotfixes after A4.3 (PR-49):
+//
+//   1. getAgentBySlugIncludingUmbrellas — slug lookup that bypasses
+//      PR-48's `umbrella_type IS NULL` filter so umbrella/venue profile
+//      pages (14 lokallag + 58 venues from BM migration) stop 404'ing.
+//
+//   2. POST /admin/migrations/phase-5.11-a4-bm-fix-sogn-affiliation —
+//      one-shot backfill that inserts the missing Sogn og Fjordane →
+//      Bondens marked Norge affiliation. A4.3 missed this row because
+//      Sogn was CREATED during the migration, not promoted from one of
+//      the 12 existing agents.
+{
+  console.log("\n── Phase 5.11 A4.4 (PR-50): /produsent/:slug umbrella fix + Sogn backfill ──");
+  const fs = require("fs");
+  const Database = require("better-sqlite3");
+
+  // ─── Fix #1: getAgentBySlugIncludingUmbrellas source-presence ──────
+  const regSrc = fs.readFileSync("src/services/marketplace-registry.ts", "utf8");
+  assertTrue(
+    /getAgentBySlugIncludingUmbrellas\(slug: string\)/.test(regSrc),
+    "phase5.11-a4.4: marketplace-registry.ts exports getAgentBySlugIncludingUmbrellas(slug)"
+  );
+  assertTrue(
+    /SELECT \* FROM agents WHERE is_active = 1["\`]\)/.test(regSrc),
+    "phase5.11-a4.4: new method queries WHERE is_active = 1 (no umbrella_type filter)"
+  );
+
+  const seoSrc = fs.readFileSync("src/routes/seo.ts", "utf8");
+  assertTrue(
+    /marketplaceRegistry\.getAgentBySlugIncludingUmbrellas\(slug\)/.test(seoSrc),
+    "phase5.11-a4.4: /produsent/:slug handler uses getAgentBySlugIncludingUmbrellas for main lookup"
+  );
+
+  // The producer-only getActiveAgents() is still used for suggestions / fuzzy fallback
+  assertTrue(
+    /const agents = marketplaceRegistry\.getActiveAgents\(\);/.test(seoSrc),
+    "phase5.11-a4.4: /produsent/:slug still uses getActiveAgents() for suggestions/related"
+  );
+
+  // ─── Fix #1: runtime behaviour via real registry against an in-memory DB ──
+  // We build a tiny schema + seed two rows (one umbrella, one producer) and
+  // invoke the registry method directly. Verifies the slug lookup finds the
+  // umbrella while getActiveAgents() still excludes it.
+  const a44db = new Database(":memory:");
+  a44db.pragma("foreign_keys = ON");
+  a44db.exec(`
+    CREATE TABLE agents (
+      id TEXT PRIMARY KEY, name TEXT NOT NULL,
+      description TEXT NOT NULL DEFAULT '', provider TEXT NOT NULL DEFAULT '',
+      contact_email TEXT NOT NULL DEFAULT '', url TEXT NOT NULL DEFAULT '',
+      version TEXT, role TEXT NOT NULL DEFAULT 'producer',
+      api_key TEXT UNIQUE NOT NULL, city TEXT, lat REAL, lng REAL, radius_km REAL,
+      is_active INTEGER DEFAULT 1, is_verified INTEGER DEFAULT 0,
+      trust_score REAL DEFAULT 0.5, total_interactions INTEGER DEFAULT 0,
+      discovery_count INTEGER DEFAULT 0, interaction_count INTEGER DEFAULT 0,
+      capabilities TEXT, skills TEXT, categories TEXT, tags TEXT, languages TEXT,
+      created_at TEXT DEFAULT (datetime('now')), last_seen_at TEXT,
+      umbrella_type TEXT, parent_umbrella_id TEXT, umbrella_member_count INTEGER,
+      umbrella_scrape_config TEXT, umbrella_venues TEXT
+    );
+  `);
+  a44db.prepare(`
+    INSERT INTO agents (id, name, api_key, role, is_active, umbrella_type)
+    VALUES (?, ?, ?, 'producer', 1, ?)
+  `).run("a44-umb-1", "Bondens marked Norge", "k-a44-umb-1", "market_network");
+  a44db.prepare(`
+    INSERT INTO agents (id, name, api_key, role, is_active, umbrella_type)
+    VALUES (?, ?, ?, 'producer', 1, NULL)
+  `).run("a44-prod-1", "Haugerud Gard Regenerativt", "k-a44-prod-1");
+
+  const initMod = require("../src/database/init");
+  initMod.__setDbForTesting(a44db);
+  {
+    const regMod = require("../src/services/marketplace-registry");
+    regMod.marketplaceRegistry._agentsCache = null;
+    regMod.marketplaceRegistry._statsCache = null;
+
+    // The new method finds umbrellas
+    const umb = regMod.marketplaceRegistry.getAgentBySlugIncludingUmbrellas("bondens-marked-norge");
+    assertTrue(!!umb && umb.id === "a44-umb-1",
+      "phase5.11-a4.4: getAgentBySlugIncludingUmbrellas finds umbrella-tagged agent by slug");
+
+    // And still finds plain producers
+    regMod.marketplaceRegistry._agentsCache = null;
+    const prod = regMod.marketplaceRegistry.getAgentBySlugIncludingUmbrellas("haugerud-gard-regenerativt");
+    assertTrue(!!prod && prod.id === "a44-prod-1",
+      "phase5.11-a4.4: getAgentBySlugIncludingUmbrellas finds plain producer by slug (regression check)");
+
+    // Slug lookup is case-insensitive
+    regMod.marketplaceRegistry._agentsCache = null;
+    const upper = regMod.marketplaceRegistry.getAgentBySlugIncludingUmbrellas("BONDENS-MARKED-NORGE");
+    assertTrue(!!upper && upper.id === "a44-umb-1",
+      "phase5.11-a4.4: getAgentBySlugIncludingUmbrellas is case-insensitive");
+
+    // Non-existent slug returns undefined
+    regMod.marketplaceRegistry._agentsCache = null;
+    const missing = regMod.marketplaceRegistry.getAgentBySlugIncludingUmbrellas("nope-not-here");
+    assertEq(missing, undefined,
+      "phase5.11-a4.4: getAgentBySlugIncludingUmbrellas returns undefined for unknown slug");
+
+    // Sanity: getActiveAgents() still excludes the umbrella (PR-48 invariant)
+    regMod.marketplaceRegistry._agentsCache = null;
+    const active = regMod.marketplaceRegistry.getActiveAgents();
+    const activeIds = active.map((a: any) => a.id);
+    assertTrue(activeIds.includes("a44-prod-1"),
+      "phase5.11-a4.4: getActiveAgents() still includes plain producer (regression check)");
+    assertTrue(!activeIds.includes("a44-umb-1"),
+      "phase5.11-a4.4: getActiveAgents() still excludes umbrella (PR-48 invariant preserved)");
+  }
+
+  // ─── Fix #2: Sogn backfill endpoint source-presence ────────────────
+  const mpSrc = fs.readFileSync("src/routes/marketplace.ts", "utf8");
+  assertTrue(
+    mpSrc.includes('router.post("/admin/migrations/phase-5.11-a4-bm-fix-sogn-affiliation"'),
+    "phase5.11-a4.4: POST /admin/migrations/phase-5.11-a4-bm-fix-sogn-affiliation registered"
+  );
+
+  const fStart = mpSrc.indexOf('router.post("/admin/migrations/phase-5.11-a4-bm-fix-sogn-affiliation"');
+  const fEnd = mpSrc.indexOf("\nrouter.", fStart + 1);
+  const fBody = mpSrc.slice(fStart, fEnd === -1 ? mpSrc.length : fEnd);
+
+  assertTrue(
+    fBody.includes('"x-admin-key"') && fBody.includes("Krever X-Admin-Key header"),
+    "phase5.11-a4.4: fix-sogn endpoint gated by X-Admin-Key header"
+  );
+  assertTrue(
+    /res\.status\(403\)/.test(fBody),
+    "phase5.11-a4.4: fix-sogn endpoint returns 403 when admin key missing"
+  );
+  assertTrue(
+    /res\.status\(409\)/.test(fBody) && /already exists/.test(fBody),
+    "phase5.11-a4.4: fix-sogn endpoint returns 409 if affiliation already exists"
+  );
+  assertTrue(
+    /Bondens Marked Sogn og Fjordane/.test(fBody) && /Bondens marked Norge/.test(fBody),
+    "phase5.11-a4.4: fix-sogn endpoint references both Sogn lokallag and national umbrella names"
+  );
+  assertTrue(
+    /umbrella_type = 'market_network'/.test(fBody),
+    "phase5.11-a4.4: fix-sogn endpoint filters on umbrella_type='market_network'"
+  );
+  assertTrue(
+    /INSERT INTO agent_affiliations/.test(fBody) && /'active'/.test(fBody) && /'admin'/.test(fBody),
+    "phase5.11-a4.4: fix-sogn endpoint INSERTs affiliation with status='active', source='admin'"
+  );
+  assertTrue(
+    /phase5\.11-a4-fix-sogn/.test(fBody),
+    "phase5.11-a4.4: fix-sogn endpoint uses field_provenance source='phase5.11-a4-fix-sogn'"
+  );
+
+  // ─── Fix #2: SQL-path semantics via in-memory DB ───────────────────
+  // We seed a tiny schema + the two umbrella rows + (deliberately) NO
+  // existing affiliation, then run the same INSERT the endpoint runs and
+  // verify success path + idempotency re-run produces a UNIQUE violation.
+  const sognDb = new Database(":memory:");
+  sognDb.pragma("foreign_keys = ON");
+  sognDb.exec(`
+    CREATE TABLE agents (
+      id TEXT PRIMARY KEY, name TEXT NOT NULL, api_key TEXT UNIQUE NOT NULL,
+      role TEXT NOT NULL DEFAULT 'producer', is_active INTEGER DEFAULT 1,
+      umbrella_type TEXT, parent_umbrella_id TEXT, umbrella_member_count INTEGER
+    );
+    CREATE TABLE agent_affiliations (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      producer_id TEXT NOT NULL, umbrella_id TEXT NOT NULL,
+      status TEXT NOT NULL DEFAULT 'pending_confirmation'
+        CHECK(status IN ('pending_confirmation','active','historical','rejected')),
+      source TEXT NOT NULL CHECK(source IN ('self_claimed','scraped','admin','umbrella_confirmed')),
+      labels TEXT, notes TEXT, joined_at TEXT, confirmed_at TEXT, expires_at TEXT, field_provenance TEXT,
+      created_at TEXT DEFAULT (datetime('now')), updated_at TEXT DEFAULT (datetime('now')),
+      UNIQUE(producer_id, umbrella_id)
+    );
+  `);
+  sognDb.prepare(`
+    INSERT INTO agents (id, name, api_key, umbrella_type, parent_umbrella_id, umbrella_member_count)
+    VALUES (?, ?, ?, 'market_network', NULL, 12)
+  `).run("nat-1", "Bondens marked Norge", "k_nat_1");
+  sognDb.prepare(`
+    INSERT INTO agents (id, name, api_key, umbrella_type, parent_umbrella_id, umbrella_member_count)
+    VALUES (?, ?, ?, 'market_network', ?, 0)
+  `).run("sogn-1", "Bondens Marked Sogn og Fjordane", "k_sogn_1", "nat-1");
+
+  // Pre-state: 0 affiliations, national count=12
+  const preAff = (sognDb.prepare("SELECT COUNT(*) AS c FROM agent_affiliations").get() as any).c;
+  assertEq(preAff, 0, "phase5.11-a4.4: pre-backfill no affiliations exist");
+
+  // Lookups should resolve case-insensitively
+  const sogn = sognDb.prepare(
+    "SELECT id, name FROM agents WHERE LOWER(name) = LOWER(?) AND umbrella_type = 'market_network'"
+  ).get("Bondens Marked Sogn og Fjordane") as any;
+  assertTrue(!!sogn && sogn.id === "sogn-1",
+    "phase5.11-a4.4: Sogn lokallag lookup resolves case-insensitively");
+
+  const national = sognDb.prepare(
+    "SELECT id, name FROM agents WHERE LOWER(name) = LOWER(?) AND umbrella_type = 'market_network' AND parent_umbrella_id IS NULL"
+  ).get("Bondens marked Norge") as any;
+  assertTrue(!!national && national.id === "nat-1",
+    "phase5.11-a4.4: National umbrella lookup resolves (parent_umbrella_id IS NULL)");
+
+  // Run the INSERT path
+  const now = new Date().toISOString();
+  const expiresAt = new Date(Date.now() + 18 * 30 * 24 * 60 * 60 * 1000).toISOString();
+  const prov = JSON.stringify({ source: "phase5.11-a4-fix-sogn", verified_via: "PR-50 follow-up to A4.3 migration" });
+  sognDb.prepare(`
+    INSERT INTO agent_affiliations (
+      producer_id, umbrella_id, status, source, labels, notes, joined_at, confirmed_at, expires_at, field_provenance
+    ) VALUES (?, ?, 'active', 'admin', '[]', ?, NULL, ?, ?, ?)
+  `).run(sogn.id, national.id, "test backfill", now, expiresAt, prov);
+  sognDb.prepare(`
+    UPDATE agents SET umbrella_member_count = (
+      SELECT COUNT(*) FROM agent_affiliations WHERE umbrella_id = agents.id AND status = 'active'
+    ) WHERE id = ?
+  `).run(national.id);
+
+  const postAff = (sognDb.prepare("SELECT COUNT(*) AS c FROM agent_affiliations").get() as any).c;
+  assertEq(postAff, 1, "phase5.11-a4.4: backfill INSERT creates 1 affiliation row");
+
+  const newCount = (sognDb.prepare("SELECT umbrella_member_count FROM agents WHERE id = ?").get(national.id) as any).umbrella_member_count;
+  assertEq(newCount, 1,
+    "phase5.11-a4.4: national umbrella_member_count refreshed after backfill (1 in this isolated test, 13 in prod where 12 exist)");
+
+  // Idempotency: re-running the INSERT must violate the UNIQUE constraint
+  let duplicateRejected = false;
+  try {
+    sognDb.prepare(`
+      INSERT INTO agent_affiliations (
+        producer_id, umbrella_id, status, source, labels, notes, joined_at, confirmed_at, expires_at, field_provenance
+      ) VALUES (?, ?, 'active', 'admin', '[]', 'dup attempt', NULL, ?, ?, ?)
+    `).run(sogn.id, national.id, now, expiresAt, prov);
+  } catch (e: any) {
+    if (/UNIQUE constraint failed/.test(e.message)) duplicateRejected = true;
+  }
+  assertTrue(duplicateRejected,
+    "phase5.11-a4.4: re-running backfill is rejected by UNIQUE(producer_id, umbrella_id) — endpoint pre-check returns 409 before this");
+}
+
 // ── REPORT ────────────────────────────────────────────────────────────
 
 // Wait for the M2 owner-portal async tests before reporting so their

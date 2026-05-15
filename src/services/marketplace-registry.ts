@@ -8,6 +8,7 @@ import {
   DiscoveryQuery,
   DiscoveryResult,
 } from "../models/marketplace";
+import { slugify } from "../utils/slug";
 
 // ─── Marketplace Registry Service (SQLite-backed) ────────────
 // This is the CORE of what makes Lokal unique: the agent registry.
@@ -848,6 +849,28 @@ class MarketplaceRegistry {
     this._agentsCache = rows.map(r => this.rowToAgent(r)!);
     this._agentsCacheTime = now;
     return this._agentsCache;
+  }
+
+  // ─── Phase 5.11 A4.4: slug lookup that INCLUDES umbrella-tagged agents ──
+  // Why this exists: PR-48 narrowed getActiveAgents() to exclude umbrellas so
+  // producer discovery surfaces (search, /sok, related, suggestions) don't
+  // surface them as if they were normal producers. But the SEO route
+  // /produsent/:slug needs to find umbrellas too — A4.3 just migrated 14
+  // lokallag + 58 venue profile pages and every one of those URLs was
+  // returning 404. This method bypasses the umbrella filter and is used
+  // ONLY by the slug-lookup branch in seo.ts. Suggestions, related
+  // producers, and discovery surfaces continue to use getActiveAgents()
+  // (producer-only) — only the direct main-agent lookup widens.
+  //
+  // Not cached: this is called once per /produsent/:slug request and the
+  // working set is small (a few thousand rows max). Caching would invite
+  // staleness for newly-tagged umbrellas without measurable upside.
+  getAgentBySlugIncludingUmbrellas(slug: string): RegisteredAgent | undefined {
+    const target = slug.toLowerCase();
+    const db = getDb();
+    const rows = db.prepare("SELECT * FROM agents WHERE is_active = 1").all() as any[];
+    const row = rows.find(r => slugify(r.name).toLowerCase() === target);
+    return row ? this.rowToAgent(row) : undefined;
   }
 
   getStats(): { totalAgents: number; activeProducers: number; cities: string[]; totalListings: number } {

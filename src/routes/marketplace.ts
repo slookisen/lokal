@@ -3376,4 +3376,120 @@ router.post("/admin/migrations/phase-5.11-a4-bm", (req: Request, res: Response) 
 });
 
 
+// ─── Phase 5.11 A4.4 (PR-50): Sogn og Fjordane affiliation backfill ──
+// A4.3 migration created 70 affiliations (12 PROMOTE→national + 58
+// venues→lokallag) but missed one row: the NEW Sogn og Fjordane lokallag
+// that was CREATED during the migration (it wasn't in the 12 promoted
+// agents). Result: /api/marketplace/umbrellas/<national-id>/members
+// returns count=12 instead of expected 13.
+//
+// This endpoint inserts the missing affiliation row. Same X-Admin-Key
+// gate as the A4.3 migration. Idempotent — returns 409 if the affiliation
+// already exists. Designed as a one-time fix; safe to re-run (no-op).
+router.post("/admin/migrations/phase-5.11-a4-bm-fix-sogn-affiliation", (req: Request, res: Response) => {
+  const expectedKey = getAdminKey();
+  if (!expectedKey) { res.status(503).json({ success: false, error: "Admin not configured" }); return; }
+  const adminKey = req.headers["x-admin-key"] as string;
+  if (!adminKey || adminKey !== expectedKey) {
+    res.status(403).json({ success: false, error: "Krever X-Admin-Key header" });
+    return;
+  }
+
+  try {
+    const db = getDb();
+
+    // 1. Look up Sogn og Fjordane lokallag (case-insensitive, must be umbrella)
+    const sogn = db.prepare(
+      "SELECT id, name FROM agents WHERE LOWER(name) = LOWER(?) AND umbrella_type = 'market_network'"
+    ).get("Bondens Marked Sogn og Fjordane") as any;
+    if (!sogn) {
+      res.status(404).json({
+        success: false,
+        error: "Sogn og Fjordane lokallag not found — has the A4.3 migration run yet?",
+      });
+      return;
+    }
+
+    // 2. Look up Bondens marked Norge (national umbrella)
+    const national = db.prepare(
+      "SELECT id, name FROM agents WHERE LOWER(name) = LOWER(?) AND umbrella_type = 'market_network' AND parent_umbrella_id IS NULL"
+    ).get("Bondens marked Norge") as any;
+    if (!national) {
+      res.status(404).json({
+        success: false,
+        error: "National umbrella 'Bondens marked Norge' not found — has the A4.3 migration run yet?",
+      });
+      return;
+    }
+
+    // 3. Idempotency pre-check (UNIQUE(producer_id, umbrella_id) catches it too,
+    // but a friendly 409 is preferable to a generic constraint-violation 500).
+    const existing = db.prepare(
+      "SELECT id FROM agent_affiliations WHERE producer_id = ? AND umbrella_id = ?"
+    ).get(sogn.id, national.id) as any;
+    if (existing) {
+      res.status(409).json({
+        success: false,
+        error: "Affiliation already exists (Sogn og Fjordane → Bondens marked Norge)",
+        existing_affiliation_id: existing.id,
+      });
+      return;
+    }
+
+    // 4. INSERT the affiliation
+    const now = new Date().toISOString();
+    const expiresAt = new Date(Date.now() + 18 * 30 * 24 * 60 * 60 * 1000).toISOString();
+    const provenance = JSON.stringify({
+      source: "phase5.11-a4-fix-sogn",
+      verified_via: "PR-50 follow-up to A4.3 migration",
+    });
+    const insertResult = db.prepare(`
+      INSERT INTO agent_affiliations (
+        producer_id, umbrella_id, status, source, labels, notes,
+        joined_at, confirmed_at, expires_at, field_provenance
+      ) VALUES (?, ?, 'active', 'admin', '[]', ?, NULL, ?, ?, ?)
+    `).run(
+      sogn.id, national.id,
+      `Phase 5.11 A4.4 backfill: ${sogn.name} → ${national.name}`,
+      now, expiresAt, provenance,
+    );
+
+    // 5. Refresh national umbrella's member count
+    db.prepare(`
+      UPDATE agents
+      SET umbrella_member_count = (
+        SELECT COUNT(*) FROM agent_affiliations
+        WHERE umbrella_id = agents.id AND status = 'active'
+      )
+      WHERE id = ?
+    `).run(national.id);
+
+    const newRow = db.prepare("SELECT * FROM agent_affiliations WHERE id = ?").get(insertResult.lastInsertRowid) as any;
+    const newMemberCount = (db.prepare("SELECT umbrella_member_count FROM agents WHERE id = ?").get(national.id) as any).umbrella_member_count;
+
+    interactionLogger.log("affiliation_upserted", {
+      agentId: national.id,
+      metadata: {
+        migration: "phase-5.11-a4-bm-fix-sogn-affiliation",
+        source: "admin",
+        producer_id: sogn.id,
+        umbrella_id: national.id,
+      },
+      ipAddress: req.ip,
+    });
+
+    res.json({
+      success: true,
+      affiliation: newRow,
+      sogn_id: sogn.id,
+      national_id: national.id,
+      national_member_count: newMemberCount,
+    });
+  } catch (err: any) {
+    console.error("[admin/migrations/phase-5.11-a4-bm-fix-sogn-affiliation] Error:", err);
+    res.status(500).json({ success: false, error: err.message || "Intern feil" });
+  }
+});
+
+
 export default router;
