@@ -4367,6 +4367,147 @@ console.log("── PR-29 related-producers tests ──");
 }
 
 
+
+
+// ─── Phase 5.11 A1: umbrella schema migration ─────────────────────────
+// Mirror the migration block from src/database/init.ts so we can verify
+// it produces the expected columns + table + indexes on a fresh DB.
+// Pattern follows WO #7 (manual minimal schema in :memory: db).
+{
+  console.log("\n── Phase 5.11 A1: umbrella schema migration ──");
+  const sqlite = require("better-sqlite3");
+  const a1db = new sqlite(":memory:");
+
+  // Minimal base schema — just the agents table (replica of init.ts lines 60–82)
+  a1db.exec(`
+    CREATE TABLE agents (
+      id TEXT PRIMARY KEY,
+      name TEXT NOT NULL,
+      description TEXT NOT NULL DEFAULT '',
+      provider TEXT NOT NULL DEFAULT '',
+      contact_email TEXT NOT NULL DEFAULT '',
+      url TEXT NOT NULL DEFAULT '',
+      role TEXT NOT NULL DEFAULT 'producer'
+        CHECK(role IN ('producer','consumer','logistics','quality','price-intel')),
+      api_key TEXT UNIQUE NOT NULL,
+      city TEXT,
+      is_active INTEGER DEFAULT 1
+    );
+  `);
+
+  // Run the Phase 5.11 A1 migration statements (must mirror init.ts §"Phase 5.11")
+  for (const stmt of [
+    `ALTER TABLE agents ADD COLUMN umbrella_type TEXT`,
+    `ALTER TABLE agents ADD COLUMN parent_umbrella_id TEXT`,
+    `ALTER TABLE agents ADD COLUMN umbrella_member_count INTEGER`,
+    `ALTER TABLE agents ADD COLUMN umbrella_scrape_config TEXT`,
+    `ALTER TABLE agents ADD COLUMN umbrella_venues TEXT`,
+  ]) {
+    try { a1db.exec(stmt); } catch { /* already exists — expected */ }
+  }
+  a1db.exec(`
+    CREATE TABLE IF NOT EXISTS agent_affiliations (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      producer_id TEXT NOT NULL,
+      umbrella_id TEXT NOT NULL,
+      status TEXT NOT NULL DEFAULT 'pending_confirmation'
+        CHECK(status IN ('pending_confirmation','active','historical','rejected')),
+      source TEXT NOT NULL
+        CHECK(source IN ('self_claimed','scraped','admin','umbrella_confirmed')),
+      labels TEXT,
+      notes TEXT,
+      joined_at TEXT,
+      confirmed_at TEXT,
+      expires_at TEXT,
+      field_provenance TEXT,
+      created_at TEXT DEFAULT (datetime('now')),
+      updated_at TEXT DEFAULT (datetime('now')),
+      UNIQUE(producer_id, umbrella_id),
+      FOREIGN KEY (producer_id) REFERENCES agents(id) ON DELETE CASCADE,
+      FOREIGN KEY (umbrella_id) REFERENCES agents(id) ON DELETE CASCADE
+    )
+  `);
+  a1db.exec(`CREATE INDEX IF NOT EXISTS idx_affiliations_producer ON agent_affiliations(producer_id, status)`);
+  a1db.exec(`CREATE INDEX IF NOT EXISTS idx_affiliations_umbrella ON agent_affiliations(umbrella_id, status)`);
+  a1db.exec(`CREATE INDEX IF NOT EXISTS idx_agents_umbrella_type ON agents(umbrella_type) WHERE umbrella_type IS NOT NULL`);
+
+  // Test 1.1: new columns on agents
+  const agentCols = a1db.prepare(`PRAGMA table_info(agents)`).all().map((r: any) => r.name);
+  for (const need of ["umbrella_type", "parent_umbrella_id", "umbrella_member_count", "umbrella_scrape_config", "umbrella_venues"]) {
+    assertTrue(agentCols.includes(need), `phase5.11-a1: agents.${need} column exists`);
+  }
+
+  // Test 1.2: agent_affiliations table
+  const tables = a1db.prepare(`SELECT name FROM sqlite_master WHERE type='table'`).all().map((r: any) => r.name);
+  assertTrue(tables.includes("agent_affiliations"), "phase5.11-a1: agent_affiliations table exists");
+
+  // Test 1.3: agent_affiliations columns
+  const affCols = a1db.prepare(`PRAGMA table_info(agent_affiliations)`).all().map((r: any) => r.name);
+  for (const need of ["producer_id", "umbrella_id", "status", "source", "labels", "joined_at", "confirmed_at", "expires_at", "field_provenance"]) {
+    assertTrue(affCols.includes(need), `phase5.11-a1: agent_affiliations.${need} column exists`);
+  }
+
+  // Test 1.4: CHECK constraint on status
+  let statusCheckPassed = false;
+  try {
+    a1db.prepare("INSERT INTO agent_affiliations (producer_id, umbrella_id, status, source) VALUES ('p1','u1','bogus_status','self_claimed')").run();
+  } catch (e: any) {
+    if (/CHECK constraint/i.test(e.message)) statusCheckPassed = true;
+  }
+  assertTrue(statusCheckPassed, "phase5.11-a1: agent_affiliations.status CHECK rejects invalid values");
+
+  // Test 1.5: CHECK constraint on source
+  let sourceCheckPassed = false;
+  try {
+    a1db.prepare("INSERT INTO agent_affiliations (producer_id, umbrella_id, status, source) VALUES ('p1','u1','active','bogus_source')").run();
+  } catch (e: any) {
+    if (/CHECK constraint/i.test(e.message)) sourceCheckPassed = true;
+  }
+  assertTrue(sourceCheckPassed, "phase5.11-a1: agent_affiliations.source CHECK rejects invalid values");
+
+  // Test 1.6: UNIQUE(producer_id, umbrella_id) constraint
+  a1db.prepare("INSERT INTO agents (id, name, api_key) VALUES ('prod-1','P1','k1')").run();
+  a1db.prepare("INSERT INTO agents (id, name, api_key) VALUES ('umb-1','U1','k2')").run();
+  a1db.prepare("INSERT INTO agent_affiliations (producer_id, umbrella_id, status, source) VALUES ('prod-1','umb-1','active','self_claimed')").run();
+  let uniqueCheckPassed = false;
+  try {
+    a1db.prepare("INSERT INTO agent_affiliations (producer_id, umbrella_id, status, source) VALUES ('prod-1','umb-1','pending_confirmation','admin')").run();
+  } catch (e: any) {
+    if (/UNIQUE constraint/i.test(e.message)) uniqueCheckPassed = true;
+  }
+  assertTrue(uniqueCheckPassed, "phase5.11-a1: agent_affiliations UNIQUE(producer_id, umbrella_id) enforced");
+
+  // Test 1.7: ON DELETE CASCADE on producer
+  a1db.pragma("foreign_keys = ON");
+  a1db.prepare("DELETE FROM agents WHERE id = 'prod-1'").run();
+  const remaining = a1db.prepare("SELECT COUNT(*) as n FROM agent_affiliations WHERE producer_id = 'prod-1'").get() as { n: number };
+  assertTrue(remaining.n === 0, "phase5.11-a1: agent_affiliations FK cascade on producer delete");
+
+  // Test 1.8: indexes exist
+  const idxs = a1db.prepare(`SELECT name FROM sqlite_master WHERE type='index'`).all().map((r: any) => r.name);
+  assertTrue(idxs.includes("idx_affiliations_producer"), "phase5.11-a1: idx_affiliations_producer exists");
+  assertTrue(idxs.includes("idx_affiliations_umbrella"), "phase5.11-a1: idx_affiliations_umbrella exists");
+  assertTrue(idxs.includes("idx_agents_umbrella_type"), "phase5.11-a1: idx_agents_umbrella_type (partial) exists");
+
+  // Test 1.9: idempotent ALTER (re-running raises "duplicate column")
+  let idempotent = false;
+  try {
+    a1db.exec(`ALTER TABLE agents ADD COLUMN umbrella_type TEXT`);
+  } catch (e: any) {
+    idempotent = /duplicate column/i.test(e.message);
+  }
+  assertTrue(idempotent, "phase5.11-a1: ALTER TABLE umbrella_type is idempotent-detectable (duplicate-column error)");
+
+  // Test 1.10: parent_umbrella_id is nullable (supports root umbrellas with no parent)
+  a1db.prepare("INSERT INTO agents (id, name, api_key, umbrella_type) VALUES ('umb-root','Root','k3','market_network')").run();
+  a1db.prepare("UPDATE agents SET parent_umbrella_id = NULL WHERE id = 'umb-root'").run();
+  const root = a1db.prepare("SELECT parent_umbrella_id FROM agents WHERE id = 'umb-root'").get() as { parent_umbrella_id: string | null };
+  assertTrue(root.parent_umbrella_id === null, "phase5.11-a1: parent_umbrella_id supports NULL for root umbrellas");
+
+  a1db.close();
+}
+
+
 // ── REPORT ────────────────────────────────────────────────────────────
 
 // Wait for the M2 owner-portal async tests before reporting so their

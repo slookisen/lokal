@@ -1541,6 +1541,65 @@ function initSchema(db: Database.Database): void {
   }
 
 
+
+  // ─── Phase 5.11 — Umbrella agents schema (A1, 2026-05-15) ────────────
+  // Introduces the data model for umbrella-type agents (Bondens marked,
+  // Mathallen Oslo, Hanen, Debio, REKO, etc.) that represent organizations
+  // OVER producers rather than being producers themselves.
+  //
+  // Discriminator: umbrella_type IS NOT NULL identifies an umbrella agent.
+  // We do NOT add a new role value because the existing agents.role CHECK
+  // constraint limits it to A2A-marketplace roles (producer/consumer/...).
+  // Adding role='umbrella' would require a table-recreation migration; the
+  // umbrella_type discriminator pattern is simpler and forward-compatible.
+  //
+  // All new columns are nullable so the 1431 existing producer agents are
+  // unaffected (all stay umbrella_type=NULL, parent_umbrella_id=NULL, etc).
+
+  // 5.11.A1.1 — new columns on agents (idempotent ALTERs)
+  for (const stmt of [
+    `ALTER TABLE agents ADD COLUMN umbrella_type TEXT`,
+    `ALTER TABLE agents ADD COLUMN parent_umbrella_id TEXT`,
+    `ALTER TABLE agents ADD COLUMN umbrella_member_count INTEGER`,
+    `ALTER TABLE agents ADD COLUMN umbrella_scrape_config TEXT`,
+    `ALTER TABLE agents ADD COLUMN umbrella_venues TEXT`,
+  ]) {
+    try { db.exec(stmt); } catch { /* already exists — expected */ }
+  }
+
+  // 5.11.A1.2 — agent_affiliations table for producer ↔ umbrella links
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS agent_affiliations (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      producer_id TEXT NOT NULL,
+      umbrella_id TEXT NOT NULL,
+      status TEXT NOT NULL DEFAULT 'pending_confirmation'
+        CHECK(status IN ('pending_confirmation','active','historical','rejected')),
+      source TEXT NOT NULL
+        CHECK(source IN ('self_claimed','scraped','admin','umbrella_confirmed')),
+      labels TEXT,                          -- JSON array of label keys
+      notes TEXT,
+      joined_at TEXT,
+      confirmed_at TEXT,
+      expires_at TEXT,
+      field_provenance TEXT,
+      created_at TEXT DEFAULT (datetime('now')),
+      updated_at TEXT DEFAULT (datetime('now')),
+      UNIQUE(producer_id, umbrella_id),
+      FOREIGN KEY (producer_id) REFERENCES agents(id) ON DELETE CASCADE,
+      FOREIGN KEY (umbrella_id) REFERENCES agents(id) ON DELETE CASCADE
+    )
+  `);
+
+  // 5.11.A1.3 — Indexes for the two most-common query patterns
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_affiliations_producer ON agent_affiliations(producer_id, status)`);
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_affiliations_umbrella ON agent_affiliations(umbrella_id, status)`);
+
+  // 5.11.A1.4 — Optional partial index on umbrella agents (umbrella_type IS NOT NULL)
+  // Speeds up "list all umbrellas" queries. Partial-index pattern matches PR-23's
+  // is_active filter so it stays cheap.
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_agents_umbrella_type ON agents(umbrella_type) WHERE umbrella_type IS NOT NULL`);
+
 }
 
 export function closeDb(): void {
