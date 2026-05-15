@@ -2039,6 +2039,10 @@ const PROFILE_CSS = `
   .umb-member-name { font-weight: 700; font-size: 0.88rem; margin-bottom: 3px; }
   .umb-member-meta { font-size: 0.72rem; color: var(--g500); }
   .umb-empty { color: var(--g500); font-size: 0.9rem; padding: 24px; background: var(--g100); border-radius: var(--r-md); text-align: center; }
+  .umb-parent-link { font-size: 0.82rem; color: var(--g500); margin-bottom: 10px; }
+  .umb-parent-link a { color: var(--green-700); text-decoration: none; }
+  .umb-parent-link a:hover { text-decoration: underline; }
+  .umb-child-type { display: inline-block; padding: 2px 7px; margin-left: 6px; background: var(--green-100); color: var(--green-700); border-radius: 8px; font-size: 0.65rem; font-weight: 600; }
 `;
 
 // ─── Producer slug fuzzy matcher ──────────────────────────────
@@ -2437,17 +2441,50 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
     // Affiliations FOR an umbrella (reverse direction):
     //   "Which producers are members of this umbrella?"
     // Used by the umbrella stub template's "Produsenter i nettverket" section.
-    type MemberProducer = {
+    // ─── Phase 5.11 A5: umbrella children come from TWO sources ──────
+    // 1. Direct hierarchy (agents.parent_umbrella_id = this umbrella):
+    //    national → lokallag, lokallag → venues, venue → producers (rare).
+    // 2. Affiliations table (independent producers tied to umbrellas
+    //    via agent_affiliations, e.g. Erga Gårdsutsalg ↔ Bondens marked).
+    // We merge + dedupe by id, preserving umbrella_type so the render
+    // code can choose the right section label and JSON-LD subtype.
+    type UmbrellaChild = {
       producer_id: string;
       producer_name: string;
       producer_slug: string;
       city: string | null;
+      umbrella_type: string | null;
     };
-    let umbrellaMembers: MemberProducer[] = [];
+    let umbrellaChildren: UmbrellaChild[] = [];
     if (isUmbrella) {
+      const byId = new Map<string, UmbrellaChild>();
+
+      // Source 1: direct children via parent_umbrella_id
       try {
         const rows = umbDb.prepare(`
-          SELECT a.id AS producer_id, a.name AS producer_name, a.city AS city
+          SELECT id, name, city, umbrella_type
+          FROM agents
+          WHERE parent_umbrella_id = ?
+            AND is_active = 1
+          ORDER BY name ASC
+        `).all(agent.id) as any[];
+        for (const r of rows) {
+          byId.set(r.id, {
+            producer_id: r.id,
+            producer_name: r.name,
+            producer_slug: slugify(r.name),
+            city: r.city,
+            umbrella_type: r.umbrella_type || null,
+          });
+        }
+      } catch (e) {
+        console.error("[seo:phase5.11] direct children query failed:", e);
+      }
+
+      // Source 2: affiliated producers via agent_affiliations
+      try {
+        const rows = umbDb.prepare(`
+          SELECT a.id AS producer_id, a.name AS producer_name, a.city AS city, a.umbrella_type AS umbrella_type
           FROM agent_affiliations aff
           INNER JOIN agents a ON a.id = aff.producer_id
           WHERE aff.umbrella_id = ?
@@ -2456,15 +2493,22 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
           ORDER BY a.trust_score DESC, a.name ASC
           LIMIT 100
         `).all(agent.id) as any[];
-        umbrellaMembers = rows.map(r => ({
-          producer_id: r.producer_id,
-          producer_name: r.producer_name,
-          producer_slug: slugify(r.producer_name),
-          city: r.city,
-        }));
+        for (const r of rows) {
+          if (!byId.has(r.producer_id)) {
+            byId.set(r.producer_id, {
+              producer_id: r.producer_id,
+              producer_name: r.producer_name,
+              producer_slug: slugify(r.producer_name),
+              city: r.city,
+              umbrella_type: r.umbrella_type || null,
+            });
+          }
+        }
       } catch (e) {
         console.error("[seo:phase5.11] affiliations reverse query failed:", e);
       }
+
+      umbrellaChildren = Array.from(byId.values());
     }
 
     // ─── Phase 5.11 A2: umbrella stub render ─────────────────────────
@@ -2489,12 +2533,86 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
         try { return umbrellaRow.umbrella_venues ? JSON.parse(umbrellaRow.umbrella_venues) : []; }
         catch { return []; }
       })();
-      const memberGridHtml = umbrellaMembers.length
-        ? umbrellaMembers.map(m =>
-            `<a href="/produsent/${m.producer_slug}" class="umb-member-card">` +
-            `<div class="umb-member-name">${escapeHtml(m.producer_name)}</div>` +
-            `<div class="umb-member-meta">${m.city ? escapeHtml(m.city) : "&nbsp;"}</div>` +
-            `</a>`).join("")
+
+      // ─── Phase 5.11 A5 Fix #2: parent breadcrumb back-link ─────────
+      // If this umbrella has a parent, render a "← Del av: <parent>"
+      // link above the H1. Walks one level only; deep hierarchies render
+      // their lineage one hop at a time via the chain of profile pages.
+      let umbParentHtml = "";
+      let umbParentJsonLd: { name: string; slug: string } | null = null;
+      if (umbrellaRow.parent_umbrella_id) {
+        try {
+          const parent = umbDb.prepare("SELECT name FROM agents WHERE id = ?").get(umbrellaRow.parent_umbrella_id) as any;
+          if (parent?.name) {
+            const parentSlug = slugify(parent.name);
+            umbParentJsonLd = { name: parent.name, slug: parentSlug };
+            umbParentHtml = `<div class="umb-parent-link">&larr; <a href="/produsent/${parentSlug}">Del av: ${escapeHtml(parent.name)}</a></div>`;
+          }
+        } catch (e) { /* parent not found — ignore */ }
+      }
+
+      // ─── Phase 5.11 A5 Fix #1: contact card (reuses producer pattern) ──
+      // Same contactItems shape as the producer template. Hidden entirely
+      // if no contact fields are set. Maps search always falls back to
+      // "<name>, <city>, Norge" even if address is missing.
+      const umbContactItems: string[] = [];
+      if (k.address) umbContactItems.push(`<div class="ct-item"><div class="ct-icon">&#128205;</div><div><div class="ct-label">Adresse</div><div class="ct-val">${escapeHtml(k.address)}${k.postalCode ? `, ${escapeHtml(k.postalCode)}` : ""}</div></div></div>`);
+      if (k.phone) umbContactItems.push(`<div class="ct-item"><div class="ct-icon">&#128222;</div><div><div class="ct-label">Telefon</div><div class="ct-val"><a href="tel:${k.phone.replace(/\s+/g, "")}">${escapeHtml(k.phone)}</a></div></div></div>`);
+      if (k.email) umbContactItems.push(`<div class="ct-item"><div class="ct-icon">&#9993;</div><div><div class="ct-label">E-post</div><div class="ct-val"><a href="mailto:${k.email}">${escapeHtml(k.email)}</a></div></div></div>`);
+      if (k.website) umbContactItems.push(`<div class="ct-item"><div class="ct-icon">&#127760;</div><div><div class="ct-label">Nettside</div><div class="ct-val"><a href="${escapeHtml(k.website)}" target="_blank" rel="noopener">${escapeHtml(k.website.replace(/^https?:\/\//, ""))}</a></div></div></div>`);
+      // Google Maps search — search by name + (address|city), never raw coords.
+      if (k.address || k.phone || k.email || k.website) {
+        const umbMapsParts = [agent.name];
+        if (k.address) umbMapsParts.push(k.address);
+        if (cityName) umbMapsParts.push(cityName);
+        umbMapsParts.push("Norge");
+        const umbMapsUrl = `https://www.google.com/maps/search/${encodeURIComponent(umbMapsParts.join(", "))}`;
+        umbContactItems.push(`<div class="ct-item"><div class="ct-icon">&#128506;</div><div><div class="ct-label">Kart</div><div class="ct-val"><a href="${umbMapsUrl}" target="_blank" rel="noopener">Vis p\u00e5 Google Maps</a></div></div></div>`);
+      }
+      const umbContactHtml = umbContactItems.length
+        ? `<div class="card"><div class="card-head"><span>&#128242;</span><h3>Kontakt</h3></div><div class="card-body">${umbContactItems.join("")}</div></div>`
+        : "";
+
+      // ─── Phase 5.11 A5 Fix #4: section label varies by children's type ──
+      const childTypes = new Set(umbrellaChildren.map(c => c.umbrella_type || "producer"));
+      let sectionLabel = "";
+      if (umbType === "venue") {
+        // Venues are leaves in the hierarchy — no children section.
+        sectionLabel = "";
+      } else if (umbrellaChildren.length === 0) {
+        // Non-venue umbrella with no children → keep the existing
+        // empty-state copy so producers know how to opt in.
+        sectionLabel = "Produsenter i nettverket";
+      } else if (childTypes.size === 1 && childTypes.has("market_network")) {
+        sectionLabel = "Lokallag i nettverket";
+      } else if (childTypes.size === 1 && childTypes.has("venue")) {
+        sectionLabel = "Markedsplasser";
+      } else if (childTypes.has("market_network") && childTypes.has("venue")) {
+        sectionLabel = "Lokallag og markedsplasser";
+      } else {
+        sectionLabel = "Produsenter i nettverket";
+      }
+
+      // Per-child cards include a small umbrella_type badge so users
+      // immediately understand the hierarchy at a glance.
+      const childTypeBadgeNo: Record<string, string> = {
+        "market_network": "Lokallag",
+        "venue": "Markedsplass",
+        "industry_org": "Bransjeorg.",
+        "certification": "Sertifisering",
+        "cooperative": "Samvirke",
+      };
+      const memberGridHtml = umbrellaChildren.length
+        ? umbrellaChildren.map(m => {
+            const tBadge = m.umbrella_type && childTypeBadgeNo[m.umbrella_type]
+              ? `<span class="umb-child-type">${escapeHtml(childTypeBadgeNo[m.umbrella_type])}</span>`
+              : "";
+            const cityHtml = m.city ? escapeHtml(m.city) : "&nbsp;";
+            return `<a href="/produsent/${m.producer_slug}" class="umb-member-card">` +
+              `<div class="umb-member-name">${escapeHtml(m.producer_name)}</div>` +
+              `<div class="umb-member-meta">${cityHtml}${tBadge}</div>` +
+              `</a>`;
+          }).join("")
         : "";
 
       const umbJsonLd: any = {
@@ -2505,22 +2623,18 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
         "description": aboutText || `${umbTypeBadge} på rettfrabonden.com`,
         "url": `${BASE_URL}/produsent/${slug}`,
       };
-      if (umbrellaRow.parent_umbrella_id) {
-        try {
-          const parent = umbDb.prepare("SELECT name FROM agents WHERE id = ?").get(umbrellaRow.parent_umbrella_id) as any;
-          if (parent?.name) {
-            umbJsonLd.subOrganization = {
-              "@type": "Organization",
-              "@id": `${BASE_URL}/produsent/${slugify(parent.name)}#org`,
-              "name": parent.name,
-              "url": `${BASE_URL}/produsent/${slugify(parent.name)}`,
-            };
-          }
-        } catch (e) { /* parent not found — ignore */ }
+      if (umbParentJsonLd) {
+        umbJsonLd.subOrganization = {
+          "@type": "Organization",
+          "@id": `${BASE_URL}/produsent/${umbParentJsonLd.slug}#org`,
+          "name": umbParentJsonLd.name,
+          "url": `${BASE_URL}/produsent/${umbParentJsonLd.slug}`,
+        };
       }
-      if (umbrellaMembers.length) {
-        umbJsonLd.member = umbrellaMembers.map(m => ({
-          "@type": "LocalBusiness",
+      // ─── Phase 5.11 A5 Fix #5: JSON-LD member type tracks child type ──
+      if (umbrellaChildren.length) {
+        umbJsonLd.member = umbrellaChildren.map(m => ({
+          "@type": m.umbrella_type === "market_network" ? "Organization" : "LocalBusiness",
           "name": m.producer_name,
           "url": `${BASE_URL}/produsent/${m.producer_slug}`,
         }));
@@ -2531,6 +2645,7 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
 
     <div class="pf-header" style="grid-template-columns: 1fr;">
       <div class="umb-hero">
+        ${umbParentHtml}
         <span class="umb-type-badge">${escapeHtml(umbTypeBadge)}</span>
         <h1 class="pf-name" translate="no">${escapeHtml(agent.name)}</h1>
         ${aboutText ? `<p class="umb-about">${escapeHtml(aboutText)}</p>` : `<p class="umb-empty">Beskrivelse av denne paraplyen blir lagt til snart.</p>`}
@@ -2539,12 +2654,15 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
 
     <div class="pf-content" style="grid-template-columns: 1fr;">
       <div class="pf-main">
+        ${umbContactHtml}
+
+        ${sectionLabel ? `
         <div class="card">
-          <div class="card-head"><span>&#128101;</span><h3>Produsenter i nettverket${umbrellaMembers.length ? ` (${umbrellaMembers.length})` : ""}</h3></div>
+          <div class="card-head"><span>&#128101;</span><h3>${escapeHtml(sectionLabel)}${umbrellaChildren.length ? ` (${umbrellaChildren.length})` : ""}</h3></div>
           <div class="card-body">
             ${memberGridHtml ? `<div class="umb-member-grid">${memberGridHtml}</div>` : `<div class="umb-empty">Ingen produsenter er ennå koblet til ${escapeHtml(agent.name)}. Hvis du er produsent og selger gjennom denne paraplyen, kan du opprette en tilknytning fra din profilside.</div>`}
           </div>
-        </div>
+        </div>` : ""}
 
         ${venuesList.length ? `
         <div class="card">
@@ -2558,7 +2676,7 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
 
       return res.send(shell(
         `${agent.name} — ${getConfig().display_name}`,
-        aboutText || `${umbTypeBadge} på rettfrabonden.com med ${umbrellaMembers.length} medlemsprodusenter`,
+        aboutText || `${umbTypeBadge} på rettfrabonden.com med ${umbrellaChildren.length} medlemsprodusenter`,
         umbContent,
         {
           extraCss: PROFILE_CSS,

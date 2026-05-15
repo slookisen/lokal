@@ -4527,7 +4527,7 @@ console.log("── PR-29 related-producers tests ──");
     "phase5.11-a2: isUmbrella derived from umbrella_type IS NOT NULL"
   );
   assertTrue(
-    /if \(isUmbrella\) \{[\s\S]{0,8000}return res\.send\(shell\(/.test(seoSrc),
+    /if \(isUmbrella\) \{[\s\S]{0,20000}return res\.send\(shell\(/.test(seoSrc),
     "phase5.11-a2: umbrella branch issues its own res.send (early-render, doesn't fall through to producer template)"
   );
 
@@ -4539,7 +4539,7 @@ console.log("── PR-29 related-producers tests ──");
 
   // Test 2.3: reverse affiliations query (umbrella → producers) only on umbrella view
   assertTrue(
-    /let umbrellaMembers: MemberProducer\[\] = \[\];[\s\S]{0,200}if \(isUmbrella\) \{/.test(seoSrc),
+    /let umbrellaChildren: UmbrellaChild\[\] = \[\];[\s\S]{0,200}if \(isUmbrella\) \{/.test(seoSrc),
     "phase5.11-a2: reverse affiliations query gated on isUmbrella"
   );
 
@@ -4569,13 +4569,13 @@ console.log("── PR-29 related-producers tests ──");
 
   // Test 2.8: umbrella JSON-LD reverse direction — member array references producers
   assertTrue(
-    /if \(umbrellaMembers\.length\) \{[\s\S]{0,300}umbJsonLd\.member = umbrellaMembers\.map/.test(seoSrc),
-    "phase5.11-a2: umbrella JSON-LD member array gated on umbrellaMembers.length"
+    /if \(umbrellaChildren\.length\) \{[\s\S]{0,400}umbJsonLd\.member = umbrellaChildren\.map/.test(seoSrc),
+    "phase5.11-a2: umbrella JSON-LD member array gated on umbrellaChildren.length"
   );
 
   // Test 2.9: subOrganization linking for lokallag (parent_umbrella_id)
   assertTrue(
-    /if \(umbrellaRow\.parent_umbrella_id\) \{[\s\S]{0,400}umbJsonLd\.subOrganization = \{/.test(seoSrc),
+    /if \(umbParentJsonLd\) \{[\s\S]{0,400}umbJsonLd\.subOrganization = \{/.test(seoSrc),
     "phase5.11-a2: subOrganization JSON-LD emitted for lokallag (parent_umbrella_id != null)"
   );
 
@@ -5704,6 +5704,231 @@ console.log("── PR-29 related-producers tests ──");
   }
   assertTrue(duplicateRejected,
     "phase5.11-a4.4: re-running backfill is rejected by UNIQUE(producer_id, umbrella_id) — endpoint pre-check returns 409 before this");
+}
+
+// ─── Phase 5.11 A5 (PR-51): umbrella profile polish ─────────────────
+// Four UX fixes to the umbrella-stub render in src/routes/seo.ts:
+//   1. Kontakt card (phone, email, website, address, Maps) reused
+//      from the producer template, hidden when all contact fields empty
+//   2. Parent breadcrumb "← Del av: <parent>" above the H1
+//   3. Auto-populate children from BOTH parent_umbrella_id AND
+//      agent_affiliations (deduped by id)
+//   4. Section label varies by children's umbrella_type
+//      (Lokallag / Markedsplasser / mixed / hidden for venues)
+//   5. JSON-LD member type tracks child umbrella_type
+//      (Organization for market_network, LocalBusiness otherwise)
+{
+  console.log("\n── Phase 5.11 A5 (PR-51): umbrella profile polish ──");
+  const fs = require("fs");
+  const Database = require("better-sqlite3");
+  const seoSrc = fs.readFileSync("src/routes/seo.ts", "utf8");
+
+  // ─── Source-presence: Fix #1 (contact card) ──────────────────────
+  assertTrue(
+    /const umbContactItems: string\[\] = \[\];/.test(seoSrc),
+    "phase5.11-a5: umbrella contact items array exists in umbrella branch"
+  );
+  assertTrue(
+    /if \(k\.phone\) umbContactItems\.push\(`<div class="ct-item">[\s\S]{0,200}tel:\$\{k\.phone/.test(seoSrc),
+    "phase5.11-a5: umbrella phone uses tel: link (same pattern as producer)"
+  );
+  assertTrue(
+    /if \(k\.email\) umbContactItems\.push\(`<div class="ct-item">[\s\S]{0,200}mailto:\$\{k\.email/.test(seoSrc),
+    "phase5.11-a5: umbrella email uses mailto: link"
+  );
+  assertTrue(
+    /if \(k\.website\) umbContactItems\.push\([\s\S]{0,300}target="_blank" rel="noopener"/.test(seoSrc),
+    "phase5.11-a5: umbrella website opens in new tab"
+  );
+  // Hide-entire-card pattern
+  assertTrue(
+    /const umbContactHtml = umbContactItems\.length[\s\S]{0,400}: ""/.test(seoSrc),
+    "phase5.11-a5: contact card hidden entirely when umbContactItems empty"
+  );
+  // Maps URL gated on at least one contact field
+  assertTrue(
+    /if \(k\.address \|\| k\.phone \|\| k\.email \|\| k\.website\) \{[\s\S]{0,500}encodeURIComponent\(umbMapsParts/.test(seoSrc),
+    "phase5.11-a5: Google Maps search link only added when at least one contact field is set"
+  );
+
+  // ─── Source-presence: Fix #2 (parent breadcrumb) ─────────────────
+  assertTrue(
+    /let umbParentHtml = "";/.test(seoSrc),
+    "phase5.11-a5: umbParentHtml initialized empty"
+  );
+  assertTrue(
+    /if \(umbrellaRow\.parent_umbrella_id\) \{[\s\S]{0,600}umbParentHtml = `<div class="umb-parent-link">&larr; <a href="\/produsent\/\$\{parentSlug\}">Del av: /.test(seoSrc),
+    "phase5.11-a5: parent breadcrumb rendered as '← Del av:' link when parent_umbrella_id is set"
+  );
+  // The breadcrumb is injected ABOVE the H1 inside .umb-hero
+  assertTrue(
+    /\$\{umbParentHtml\}\s*<span class="umb-type-badge">/.test(seoSrc),
+    "phase5.11-a5: parent breadcrumb sits above the umbrella-type badge in the hero"
+  );
+
+  // ─── Source-presence: Fix #3 (two-source children) ───────────────
+  assertTrue(
+    /WHERE parent_umbrella_id = \?[\s\S]{0,100}AND is_active = 1/.test(seoSrc),
+    "phase5.11-a5: direct children query filters parent_umbrella_id AND is_active=1"
+  );
+  assertTrue(
+    /FROM agent_affiliations aff[\s\S]{0,300}WHERE aff\.umbrella_id = \?[\s\S]{0,100}AND aff\.status = 'active'/.test(seoSrc),
+    "phase5.11-a5: affiliations query still present and gated on status='active'"
+  );
+  assertTrue(
+    /const byId = new Map<string, UmbrellaChild>\(\);/.test(seoSrc),
+    "phase5.11-a5: children dedupe via Map<id, child>"
+  );
+  // Affiliation source skips IDs already added by parent_umbrella_id source
+  assertTrue(
+    /if \(!byId\.has\(r\.producer_id\)\) \{/.test(seoSrc),
+    "phase5.11-a5: dedupe — affiliation rows skipped if already in byId map"
+  );
+
+  // ─── Source-presence: Fix #4 (terminology) ───────────────────────
+  assertTrue(
+    /const childTypes = new Set\(umbrellaChildren\.map\(c => c\.umbrella_type \|\| "producer"\)\);/.test(seoSrc),
+    "phase5.11-a5: childTypes set built from umbrellaChildren umbrella_type"
+  );
+  assertTrue(
+    /sectionLabel = "Lokallag i nettverket"/.test(seoSrc),
+    "phase5.11-a5: section label 'Lokallag i nettverket' for all-market_network children"
+  );
+  assertTrue(
+    /sectionLabel = "Markedsplasser"/.test(seoSrc),
+    "phase5.11-a5: section label 'Markedsplasser' for all-venue children"
+  );
+  assertTrue(
+    /sectionLabel = "Lokallag og markedsplasser"/.test(seoSrc),
+    "phase5.11-a5: section label 'Lokallag og markedsplasser' for mixed children"
+  );
+  // Venue umbrellas hide the section entirely
+  assertTrue(
+    /if \(umbType === "venue"\) \{[\s\S]{0,200}sectionLabel = "";/.test(seoSrc),
+    "phase5.11-a5: venues hide the children section (sectionLabel = '')"
+  );
+  // Render conditional on sectionLabel truthy
+  assertTrue(
+    /\$\{sectionLabel \? `[\s\S]{0,200}<div class="card">/.test(seoSrc),
+    "phase5.11-a5: children card only rendered when sectionLabel is non-empty"
+  );
+  // Child cards carry the type badge
+  assertTrue(
+    /umb-child-type/.test(seoSrc) && /childTypeBadgeNo/.test(seoSrc),
+    "phase5.11-a5: child cards include a per-type badge (Lokallag/Markedsplass/…)"
+  );
+
+  // ─── Source-presence: Fix #5 (JSON-LD member subtype) ────────────
+  assertTrue(
+    /umbJsonLd\.member = umbrellaChildren\.map\(m => \(\{[\s\S]{0,200}"@type": m\.umbrella_type === "market_network" \? "Organization" : "LocalBusiness"/.test(seoSrc),
+    "phase5.11-a5: JSON-LD member.@type tracks child umbrella_type (Organization vs LocalBusiness)"
+  );
+
+  // ─── Source-presence: CSS additions ──────────────────────────────
+  assertTrue(
+    /\.umb-parent-link \{[\s\S]{0,200}font-size:/.test(seoSrc),
+    "phase5.11-a5: .umb-parent-link CSS rule defined"
+  );
+  assertTrue(
+    /\.umb-child-type \{[\s\S]{0,200}background:/.test(seoSrc),
+    "phase5.11-a5: .umb-child-type CSS rule defined"
+  );
+
+  // ─── Runtime: dedupe + label semantics via in-memory DB ──────────
+  // Mirror the agents + agent_affiliations + agent_knowledge schema and
+  // exercise the same SQL the umbrella branch runs. We assert:
+  //   - National finds 13 lokallag (umbrella_type='market_network')
+  //   - Lokallag finds N venues (umbrella_type='venue')
+  //   - Venue finds 0 direct children
+  //   - Dedupe: an affiliation row already in parent_umbrella_id source is skipped
+  //   - Section label resolves correctly for each level
+  const a5db = new Database(":memory:");
+  a5db.pragma("foreign_keys = ON");
+  a5db.exec(`
+    CREATE TABLE agents (
+      id TEXT PRIMARY KEY, name TEXT NOT NULL, api_key TEXT UNIQUE NOT NULL,
+      role TEXT NOT NULL DEFAULT 'producer', is_active INTEGER DEFAULT 1,
+      city TEXT, trust_score REAL DEFAULT 0.5,
+      umbrella_type TEXT, parent_umbrella_id TEXT
+    );
+    CREATE TABLE agent_affiliations (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      producer_id TEXT NOT NULL, umbrella_id TEXT NOT NULL,
+      status TEXT NOT NULL DEFAULT 'pending_confirmation'
+        CHECK(status IN ('pending_confirmation','active','historical','rejected')),
+      source TEXT NOT NULL CHECK(source IN ('self_claimed','scraped','admin','umbrella_confirmed')),
+      labels TEXT, joined_at TEXT, confirmed_at TEXT, expires_at TEXT, field_provenance TEXT,
+      UNIQUE(producer_id, umbrella_id)
+    );
+  `);
+  // Seed: national → 2 lokallag (Oslo, Agder); Agder → 1 venue (Mandal);
+  //       Oslo → 0 venues; an independent producer affiliated with national.
+  const ins = a5db.prepare(`INSERT INTO agents (id, name, api_key, role, is_active, city, umbrella_type, parent_umbrella_id) VALUES (?, ?, ?, 'producer', 1, ?, ?, ?)`);
+  ins.run("nat", "Bondens marked Norge", "k_nat", null, "market_network", null);
+  ins.run("oslo", "Bondens marked Oslo", "k_oslo", "Oslo", "market_network", "nat");
+  ins.run("agder", "Bondens Marked Agder", "k_agder", "Kristiansand", "market_network", "nat");
+  ins.run("mandal", "Bondens Marked Mandal", "k_mandal", "Mandal", "venue", "agder");
+  ins.run("indie", "Erga Gårdsutsalg", "k_indie", "Sandnes", null, null);
+  // Affiliation: indie → national (independent producer affiliated)
+  a5db.prepare(`INSERT INTO agent_affiliations (producer_id, umbrella_id, status, source) VALUES (?, ?, 'active', 'self_claimed')`).run("indie", "nat");
+  // Affiliation ALSO duplicates the direct child (oslo → nat) to verify dedupe:
+  a5db.prepare(`INSERT INTO agent_affiliations (producer_id, umbrella_id, status, source) VALUES (?, ?, 'active', 'admin')`).run("oslo", "nat");
+
+  // ── 1. National: 2 lokallag + 1 affiliated producer (oslo deduped to 1) = 3
+  const natDirect = a5db.prepare(`
+    SELECT id, name, city, umbrella_type FROM agents WHERE parent_umbrella_id = ? AND is_active = 1 ORDER BY name ASC
+  `).all("nat") as any[];
+  assertEq(natDirect.length, 2, "phase5.11-a5: National has 2 direct-children lokallag");
+
+  const natAff = a5db.prepare(`
+    SELECT a.id AS producer_id, a.name AS producer_name, a.umbrella_type AS umbrella_type
+    FROM agent_affiliations aff INNER JOIN agents a ON a.id = aff.producer_id
+    WHERE aff.umbrella_id = ? AND aff.status = 'active' AND a.is_active = 1
+  `).all("nat") as any[];
+  assertEq(natAff.length, 2, "phase5.11-a5: National has 2 raw affiliation rows (oslo dup + indie)");
+
+  // Now mirror the dedupe Map<> logic in code:
+  const natMap = new Map<string, any>();
+  for (const r of natDirect) natMap.set(r.id, { umbrella_type: r.umbrella_type });
+  for (const r of natAff) if (!natMap.has(r.producer_id)) natMap.set(r.producer_id, { umbrella_type: r.umbrella_type });
+  assertEq(natMap.size, 3,
+    "phase5.11-a5: National children dedupe → 3 unique (2 lokallag + 1 independent producer)");
+
+  const natTypes = new Set(Array.from(natMap.values()).map(c => c.umbrella_type || "producer"));
+  // Mixed market_network + producer — should resolve to "Produsenter i nettverket"
+  // (the fallback) per spec: childTypes has both 'market_network' AND 'producer'
+  // but NOT 'venue', so neither single-type nor mixed-with-venue branch matches.
+  assertTrue(natTypes.has("market_network") && natTypes.has("producer"),
+    "phase5.11-a5: National's childTypes set contains both market_network and producer");
+
+  // ── 2. Lokallag (Agder): 1 venue child, 0 affiliations → "Markedsplasser"
+  const agderDirect = a5db.prepare(`
+    SELECT id, umbrella_type FROM agents WHERE parent_umbrella_id = ? AND is_active = 1
+  `).all("agder") as any[];
+  assertEq(agderDirect.length, 1, "phase5.11-a5: Agder lokallag has 1 venue child");
+  const agderTypes = new Set(agderDirect.map((c: any) => c.umbrella_type || "producer"));
+  assertTrue(agderTypes.size === 1 && agderTypes.has("venue"),
+    "phase5.11-a5: Agder children are all umbrella_type='venue' → label resolves to 'Markedsplasser'");
+
+  // ── 3. Venue (Mandal): 0 children → sectionLabel = "" (section hidden)
+  const mandalDirect = a5db.prepare(`
+    SELECT id FROM agents WHERE parent_umbrella_id = ? AND is_active = 1
+  `).all("mandal") as any[];
+  assertEq(mandalDirect.length, 0, "phase5.11-a5: Venue (Mandal) has zero direct children");
+
+  // ── 4. Parent breadcrumb resolution
+  // Mandal → parent Agder
+  const mandalRow = a5db.prepare("SELECT parent_umbrella_id FROM agents WHERE id = ?").get("mandal") as any;
+  assertEq(mandalRow.parent_umbrella_id, "agder",
+    "phase5.11-a5: Mandal venue has parent_umbrella_id pointing at Agder lokallag");
+  const parentRow = a5db.prepare("SELECT name FROM agents WHERE id = ?").get(mandalRow.parent_umbrella_id) as any;
+  assertEq(parentRow.name, "Bondens Marked Agder",
+    "phase5.11-a5: parent lookup resolves Agder name (breadcrumb shows 'Del av: Bondens Marked Agder')");
+
+  // National has no parent → breadcrumb should not render
+  const natRow = a5db.prepare("SELECT parent_umbrella_id FROM agents WHERE id = ?").get("nat") as any;
+  assertEq(natRow.parent_umbrella_id, null,
+    "phase5.11-a5: National has parent_umbrella_id=NULL (no breadcrumb rendered)");
 }
 
 // ── REPORT ────────────────────────────────────────────────────────────
