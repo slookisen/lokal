@@ -873,6 +873,20 @@ class MarketplaceRegistry {
     return row ? this.rowToAgent(row) : undefined;
   }
 
+  // ─── Phase 5.11 follow-up: id lookup that INCLUDES umbrella-tagged agents ──
+  // Companion to getAgentBySlugIncludingUmbrellas above. The per-agent stats
+  // route (/api/agents/:id/stats) needs to resolve umbrella IDs too, because
+  // umbrella agents (Bondens marked Norge, lokallag, venues) own /produsent/<slug>
+  // SEO pages that should display the same view-count tile producers do.
+  // Without this method the route falls back to getActiveAgents().find() which
+  // filters umbrellas out → endpoint 404s for any umbrella ID present in
+  // /admin/analytics/producers (the visibility-agent's runtime lookup target).
+  getActiveAgentByIdIncludingUmbrellas(id: string): RegisteredAgent | undefined {
+    const db = getDb();
+    const row = db.prepare("SELECT * FROM agents WHERE id = ? AND is_active = 1").get(id) as any;
+    return row ? this.rowToAgent(row) : undefined;
+  }
+
   getStats(): { totalAgents: number; activeProducers: number; cities: string[]; totalListings: number } {
     const now = Date.now();
     if (this._statsCache && (now - this._statsCacheTime) < MarketplaceRegistry.CACHE_TTL) {

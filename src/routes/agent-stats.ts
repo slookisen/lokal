@@ -81,8 +81,13 @@ router.get("/api/agents/:id/stats", (req: Request, res: Response) => {
 
     // Resolve the agent — we need the canonical name to derive the URL path
     // analytics_page_views actually saw (`/produsent/<slug>`).
-    const agents = marketplaceRegistry.getActiveAgents();
-    const agent = agents.find((a: any) => a.id === agentId);
+    // Phase 5.11 follow-up: include umbrella-tagged agents. Without this,
+    // any umbrella that hits top-N on /admin/analytics/producers (e.g. "Bondens
+    // marked Norge") 404s here — and the visibility-agent's runtime probe
+    // (which picks the top producer at runtime) breaks whenever an umbrella
+    // happens to be #1. Producer-discovery surfaces still use the narrower
+    // getActiveAgents() everywhere else.
+    const agent = marketplaceRegistry.getActiveAgentByIdIncludingUmbrellas(agentId);
     if (!agent) return res.status(404).json({ error: "agent not found" });
 
     // Use the shared slugify util (single source of truth — same as seo.ts).
