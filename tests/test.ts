@@ -6227,6 +6227,43 @@ console.log("── PR-29 related-producers tests ──");
   );
 }
 
+// ─── PR-57: Playwright render-worker client + worker scaffolding ──
+{
+  console.log("\n── PR-57: Playwright render-worker scaffolding ──");
+
+  // (1) render-worker package files exist
+  const fs = require("fs");
+  assertTrue(fs.existsSync("render-worker/package.json"), "pr-57: render-worker/package.json present");
+  assertTrue(fs.existsSync("render-worker/Dockerfile"), "pr-57: render-worker/Dockerfile present");
+  assertTrue(fs.existsSync("render-worker/fly.toml"), "pr-57: render-worker/fly.toml present");
+  assertTrue(fs.existsSync("render-worker/src/index.ts"), "pr-57: render-worker/src/index.ts present");
+  assertTrue(fs.existsSync("render-worker/README.md"), "pr-57: render-worker/README.md present");
+
+  // (2) fly.toml app name correct
+  const flyToml = fs.readFileSync("render-worker/fly.toml", "utf-8");
+  assertTrue(/app\s*=\s*['"]lokal-render-worker['"]/.test(flyToml),
+    "pr-57: fly.toml app name is lokal-render-worker (not 'lokal')");
+
+  // (3) Dockerfile uses official Playwright image
+  const dockerfile = fs.readFileSync("render-worker/Dockerfile", "utf-8");
+  assertTrue(/mcr\.microsoft\.com\/playwright/.test(dockerfile),
+    "pr-57: Dockerfile uses official mcr.microsoft.com/playwright image");
+
+  // (4) Worker source exposes /health and /render
+  const workerSrc = fs.readFileSync("render-worker/src/index.ts", "utf-8");
+  assertTrue(/['"]\/health['"]/.test(workerSrc), "pr-57: worker registers /health route");
+  assertTrue(/['"]\/render['"]/.test(workerSrc), "pr-57: worker registers /render route");
+  assertTrue(/X-Render-Key/i.test(workerSrc), "pr-57: worker validates X-Render-Key header");
+
+  // (5) Client wrapper exists in main repo and exports renderPage
+  assertTrue(fs.existsSync("src/services/render-client.ts"), "pr-57: src/services/render-client.ts present");
+  const clientSrc = fs.readFileSync("src/services/render-client.ts", "utf-8");
+  assertTrue(/export\s+async\s+function\s+renderPage/.test(clientSrc),
+    "pr-57: render-client exports async renderPage()");
+  assertTrue(/RENDER_WORKER_KEY/.test(clientSrc),
+    "pr-57: render-client reads RENDER_WORKER_KEY env var");
+}
+
 // ── REPORT ────────────────────────────────────────────────────────────
 
 // Wait for the M2 owner-portal async tests before reporting so their
