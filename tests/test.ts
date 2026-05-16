@@ -6216,6 +6216,55 @@ console.log("── PR-29 related-producers tests ──");
   );
 }
 
+// ─── PR-56: Smithery distribution channel wired into agent-card + server.json ──
+// PR-56 sequence:
+//   1. server.json (root) + mcp-server/server.json bumped to v0.4.0 with remotes[]
+//      now including Smithery gateway URL
+//   2. getRegistryCard() emits a `distribution` field listing smithery + npm + a2a
+//      so consumer agents that hit /.well-known/agent-card.json can discover us
+//      across all three indexes without a separate API call
+{
+  console.log("\n── PR-56: Smithery distribution wiring ──");
+
+  // (1) server.json (root) — must contain Smithery URL in remotes[]
+  const serverJsonRoot = require("fs").readFileSync("server.json", "utf-8");
+  const serverParsed = JSON.parse(serverJsonRoot);
+  assertTrue(
+    serverParsed.version === "0.4.0",
+    "pr-56: server.json bumped to v0.4.0 (was 0.3.3)"
+  );
+  assertTrue(
+    Array.isArray(serverParsed.remotes) &&
+      serverParsed.remotes.some((r: any) =>
+        typeof r.url === "string" && r.url.includes("server.smithery.ai")),
+    "pr-56: server.json remotes[] includes server.smithery.ai entry"
+  );
+
+  // (2) mcp-server/server.json — also has Smithery in remotes[]
+  const mcpServerJson = require("fs").readFileSync("mcp-server/server.json", "utf-8");
+  const mcpParsed = JSON.parse(mcpServerJson);
+  assertTrue(
+    Array.isArray(mcpParsed.remotes) &&
+      mcpParsed.remotes.some((r: any) =>
+        typeof r.url === "string" && r.url.includes("server.smithery.ai")),
+    "pr-56: mcp-server/server.json remotes[] includes Smithery"
+  );
+
+  // (3) getRegistryCard() emits distribution[] with smithery + npm + a2a-registry
+  const registrySrc = require("fs").readFileSync("src/services/marketplace-registry.ts", "utf-8");
+  assertTrue(
+    /distribution: \[/.test(registrySrc),
+    "pr-56: marketplace-registry.ts getRegistryCard() emits a distribution[] field"
+  );
+  assertTrue(
+    /channel: "smithery"/.test(registrySrc) &&
+      /channel: "npm"/.test(registrySrc) &&
+      /channel: "a2a-registry"/.test(registrySrc),
+    "pr-56: distribution[] includes smithery, npm, and a2a-registry channels"
+  );
+}
+
+
 // ── REPORT ────────────────────────────────────────────────────────────
 
 // Wait for the M2 owner-portal async tests before reporting so their
