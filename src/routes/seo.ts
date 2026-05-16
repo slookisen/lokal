@@ -2689,6 +2689,89 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
           }).join("")
         : "";
 
+      // ─── PR-56 (2026-05-16): Kommende Bondens marked-arrangementer ───
+      // Renders only when this umbrella is in the Bondens marked tree
+      // (national / lokallag / venue). Reads bm_market_events populated by
+      // the daily scraper. Quietly omitted on empty/missing-table.
+      let bmEventsHtml = "";
+      let bmEventsCountHeader = "";
+      try {
+        // Decide whether this umbrella participates in the BM tree.
+        const isVenue = umbrellaRow.umbrella_type === "venue";
+        const isLokallag = umbrellaRow.umbrella_type === "market_network" && !!umbrellaRow.parent_umbrella_id;
+        const isNational = agent.name.toLowerCase() === "bondens marked norge";
+
+        if (isVenue || isLokallag || isNational) {
+          let eventRows: Array<{ event_name: string; location_text: string; start_at: string; end_at: string | null; source_url: string; venue_name: string; venue_id: string }> = [];
+          const nowIso = new Date().toISOString();
+          if (isVenue) {
+            eventRows = umbDb.prepare(`
+              SELECT e.event_name, e.location_text, e.start_at, e.end_at, e.source_url,
+                     a.id AS venue_id, a.name AS venue_name
+              FROM bm_market_events e INNER JOIN agents a ON a.id = e.venue_agent_id
+              WHERE e.venue_agent_id = ? AND e.start_at >= ?
+              ORDER BY e.start_at ASC LIMIT 5
+            `).all(agent.id, nowIso) as any[];
+          } else if (isLokallag) {
+            eventRows = umbDb.prepare(`
+              SELECT e.event_name, e.location_text, e.start_at, e.end_at, e.source_url,
+                     a.id AS venue_id, a.name AS venue_name
+              FROM bm_market_events e INNER JOIN agents a ON a.id = e.venue_agent_id
+              WHERE (a.parent_umbrella_id = ? OR e.venue_agent_id = ?) AND e.start_at >= ?
+              ORDER BY e.start_at ASC LIMIT 10
+            `).all(agent.id, agent.id, nowIso) as any[];
+          } else {
+            // National: top-5 + counts
+            eventRows = umbDb.prepare(`
+              SELECT e.event_name, e.location_text, e.start_at, e.end_at, e.source_url,
+                     a.id AS venue_id, a.name AS venue_name
+              FROM bm_market_events e INNER JOIN agents a ON a.id = e.venue_agent_id
+              WHERE e.start_at >= ?
+              ORDER BY e.start_at ASC LIMIT 5
+            `).all(nowIso) as any[];
+            const weekIso = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString();
+            const monthIso = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString();
+            const countWeek = umbDb.prepare(
+              "SELECT COUNT(*) AS c FROM bm_market_events WHERE start_at >= ? AND start_at <= ?"
+            ).get(nowIso, weekIso) as { c: number } | undefined;
+            const countMonth = umbDb.prepare(
+              "SELECT COUNT(*) AS c FROM bm_market_events WHERE start_at >= ? AND start_at <= ?"
+            ).get(nowIso, monthIso) as { c: number } | undefined;
+            if ((countWeek?.c || 0) > 0 || (countMonth?.c || 0) > 0) {
+              bmEventsCountHeader = `<div class="bm-events-counts">
+                <strong>${countWeek?.c || 0}</strong> markeder denne uka &middot;
+                <strong>${countMonth?.c || 0}</strong> markeder neste 30 dager
+              </div>`;
+            }
+          }
+
+          if (eventRows.length > 0) {
+            const items = eventRows.map(r => {
+              const date = (r.start_at || "").slice(0, 10);
+              const time = (r.start_at || "").slice(11, 16);
+              const endTime = r.end_at ? (r.end_at || "").slice(11, 16) : "";
+              const timeStr = time ? ` ${escapeHtml(time)}${endTime ? "&ndash;" + escapeHtml(endTime) : ""}` : "";
+              // Show venue annotation when this isn't a venue page itself.
+              const venueAnno = !isVenue ? ` &middot; <a href="/produsent/${slugify(r.venue_name)}">${escapeHtml(r.venue_name)}</a>` : "";
+              const loc = r.location_text ? ` (${escapeHtml(r.location_text)})` : "";
+              return `<li><strong>${escapeHtml(date)}</strong>${timeStr} &mdash; ${escapeHtml(r.event_name)}${loc}${venueAnno}</li>`;
+            }).join("");
+            bmEventsHtml = `
+        <div class="card">
+          <div class="card-head"><span>&#128197;</span><h3>Kommende markedsdager${eventRows.length ? ` (${eventRows.length})` : ""}</h3></div>
+          <div class="card-body">
+            ${bmEventsCountHeader}
+            <ul class="bm-events-list">${items}</ul>
+          </div>
+        </div>`;
+          }
+        }
+      } catch (e) {
+        // Table missing or query failed — silently omit the section.
+        // Most common cause: bm_market_events not yet populated by the
+        // daily scraper, which is fine on a fresh deploy.
+      }
+
       const umbJsonLd: any = {
         "@context": "https://schema.org",
         "@type": "Organization",
@@ -2729,6 +2812,8 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
     <div class="pf-content" style="grid-template-columns: 1fr;">
       <div class="pf-main">
         ${umbContactHtml}
+
+        ${bmEventsHtml}
 
         ${sectionLabel ? `
         <div class="card">

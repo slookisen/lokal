@@ -3492,4 +3492,87 @@ router.post("/admin/migrations/phase-5.11-a4-bm-fix-sogn-affiliation", (req: Req
 });
 
 
+// ─── GET /api/marketplace/bm-events (PR-56, 2026-05-16) ─────────────
+// Public read of upcoming Bondens marked events. Used by:
+//   - the venue/lokallag/national profile pages (server-side render)
+//   - external consumers + AI agents (no auth required)
+//
+// Filters:
+//   from / to        — ISO datetime window (default: now → now+7 days)
+//   lokallag         — agent_id of a lokallag; returns events at any of its
+//                      child venues OR matched-via-fallback to that lokallag
+//   venue            — agent_id of a specific venue
+//   region           — case-insensitive substring match on location_text
+//   limit            — default 50, max 200
+router.get("/bm-events", (req: Request, res: Response) => {
+  try {
+    const db = getDb();
+
+    const fromIso = (req.query.from as string) || new Date().toISOString();
+    const defaultTo = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString();
+    const toIso = (req.query.to as string) || defaultTo;
+
+    const lokallag = (req.query.lokallag as string) || "";
+    const venue = (req.query.venue as string) || "";
+    const region = (req.query.region as string) || "";
+
+    let limit = parseInt((req.query.limit as string) || "50", 10);
+    if (!Number.isFinite(limit) || limit < 1) limit = 50;
+    if (limit > 200) limit = 200;
+
+    const wheres: string[] = ["e.start_at >= ?", "e.start_at <= ?"];
+    const params: any[] = [fromIso, toIso];
+
+    if (venue) {
+      wheres.push("e.venue_agent_id = ?");
+      params.push(venue);
+    } else if (lokallag) {
+      // Match events at any venue under this lokallag PLUS events matched
+      // directly to the lokallag itself via the fallback path.
+      wheres.push("(e.venue_agent_id = ? OR a.parent_umbrella_id = ?)");
+      params.push(lokallag, lokallag);
+    }
+    if (region) {
+      wheres.push("LOWER(e.location_text) LIKE ?");
+      params.push(`%${region.toLowerCase()}%`);
+    }
+
+    const sql = `
+      SELECT e.event_slug, e.event_name, e.location_text, e.start_at, e.end_at, e.source_url,
+             a.id AS venue_agent_id, a.name AS venue_name, a.umbrella_type AS venue_type
+      FROM bm_market_events e
+      INNER JOIN agents a ON a.id = e.venue_agent_id
+      WHERE ${wheres.join(" AND ")}
+      ORDER BY e.start_at ASC
+      LIMIT ?
+    `;
+    const rows = db.prepare(sql).all(...params, limit) as any[];
+
+    const events = rows.map(r => ({
+      event_slug: r.event_slug,
+      event_name: r.event_name,
+      venue: {
+        agent_id: r.venue_agent_id,
+        name: r.venue_name,
+        slug: slugify(r.venue_name),
+        type: r.venue_type,
+      },
+      location_text: r.location_text,
+      start_at: r.start_at,
+      end_at: r.end_at,
+      source_url: r.source_url,
+    }));
+
+    res.json({ count: events.length, events });
+  } catch (err: any) {
+    // Most likely cause: bm_market_events table missing (migration didn't run).
+    // Return 503 so callers can distinguish "no data yet" from a real bug.
+    res.status(503).json({
+      error: "bm-events query failed",
+      detail: err?.message || String(err),
+    });
+  }
+});
+
+
 export default router;

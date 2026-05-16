@@ -6215,10 +6215,10 @@ console.log("── PR-29 related-producers tests ──");
     "phase5.11-a7: lokal_get_producer_affiliations tool registered"
   );
 
-  // (3) Exactly 7 tool registrations (4 existing + 3 new)
+  // (3) Exactly 8 tool registrations (4 base + 3 umbrella + 1 BM events from PR-56)
   const toolCount = (mcpSrc.match(/server\.registerTool\(/g) || []).length;
-  assertEq(toolCount, 7,
-    "phase5.11-a7: src/routes/mcp.ts registers exactly 7 tools (matches npm-package count)");
+  assertEq(toolCount, 8,
+    "phase5.11-a7: src/routes/mcp.ts registers exactly 8 tools (4 base + 3 umbrella + 1 BM events from PR-56)");
 
   // (4) DB-direct pattern: getDb() imported (no HTTP loopback for new tools)
   assertTrue(
@@ -6419,6 +6419,213 @@ console.log("── PR-29 related-producers tests ──");
     "pr-57: render-client reads RENDER_WORKER_KEY env var");
 }
 
+
+// PR-56 async-test handle — settled by the IIFE inside the block below.
+let _pr56Resolve: () => void = () => {};
+const _pr56Promise: Promise<void> = new Promise<void>(r => { _pr56Resolve = r; });
+
+// ─── PR-56: Bondens marked events scraper (Wave 2 of Phase 5.11 Stage B.1) ──
+// Behavioural tests: matcher (with stubbed agents) + scraper pipeline (with
+// stubbed global fetch). Source-presence tests confirm endpoints/MCP-tool
+// are wired in and the new bm_market_events table is in init.ts.
+{
+  console.log("\n── PR-56: Bondens marked events scraper ──");
+  const fs = require("fs");
+
+  // (1) Source-presence: scraper module exists with required exports
+  assertTrue(fs.existsSync("src/services/bm-events-scraper.ts"),
+    "pr-56: bm-events-scraper.ts present");
+  const scraperSrc = fs.readFileSync("src/services/bm-events-scraper.ts", "utf-8");
+  assertTrue(/export\s+async\s+function\s+fetchEventSlugs/.test(scraperSrc),
+    "pr-56: bm-events-scraper exports fetchEventSlugs()");
+  assertTrue(/export\s+async\s+function\s+fetchEventDetails/.test(scraperSrc),
+    "pr-56: bm-events-scraper exports fetchEventDetails()");
+  assertTrue(/export\s+async\s+function\s+matchEventToVenue/.test(scraperSrc),
+    "pr-56: bm-events-scraper exports matchEventToVenue()");
+  assertTrue(/export\s+async\s+function\s+runBmEventsScraper/.test(scraperSrc),
+    "pr-56: bm-events-scraper exports runBmEventsScraper()");
+
+  // (2) Source-presence: admin endpoint registered
+  assertTrue(fs.existsSync("src/routes/admin-bm-events.ts"),
+    "pr-56: admin-bm-events route file present");
+  const adminBmSrc = fs.readFileSync("src/routes/admin-bm-events.ts", "utf-8");
+  assertTrue(/router\.post\(\s*['"]\/scrape['"]/.test(adminBmSrc),
+    "pr-56: POST /admin/bm-events/scrape registered");
+  const indexSrc = fs.readFileSync("src/index.ts", "utf-8");
+  assertTrue(/['"]\/admin\/bm-events['"]/.test(indexSrc),
+    "pr-56: index.ts mounts /admin/bm-events router");
+
+  // (3) Source-presence: public endpoint registered
+  const marketSrc = fs.readFileSync("src/routes/marketplace.ts", "utf-8");
+  assertTrue(/router\.get\(\s*['"]\/bm-events['"]/.test(marketSrc),
+    "pr-56: GET /api/marketplace/bm-events registered");
+
+  // (4) Source-presence: MCP tool registered
+  const mcpSrc = fs.readFileSync("src/routes/mcp.ts", "utf-8");
+  assertTrue(/lokal_bm_next_markets/.test(mcpSrc),
+    "pr-56: MCP tool lokal_bm_next_markets registered");
+
+  // (5) Source-presence: schema migration in init.ts
+  const initSrc = fs.readFileSync("src/database/init.ts", "utf-8");
+  assertTrue(/CREATE TABLE IF NOT EXISTS bm_market_events/.test(initSrc),
+    "pr-56: init.ts creates bm_market_events table");
+  assertTrue(/event_slug TEXT UNIQUE NOT NULL/.test(initSrc),
+    "pr-56: bm_market_events.event_slug is UNIQUE (idempotent UPSERT)");
+
+  // ─── Behavioural: matcher (venue_exact / fuzzy / fallback / unmatched) ───
+  // Spin up an in-memory DB shaped just enough for matchEventToVenue() to
+  // walk the BM tree. Pattern matches PR-58/PR-56(Smithery)/A7 tests.
+  // The async work is exposed on _pr56Promise (declared below the block) so
+  // the REPORT IIFE awaits it before tallying pass/fail.
+  {
+    const Database = require("better-sqlite3");
+    const initMod = require("../src/database/init");
+    const db = new Database(":memory:");
+    db.exec(`
+      CREATE TABLE agents (
+        id TEXT PRIMARY KEY,
+        name TEXT NOT NULL,
+        umbrella_type TEXT,
+        parent_umbrella_id TEXT,
+        city TEXT,
+        is_active INTEGER DEFAULT 1
+      );
+      CREATE TABLE bm_market_events (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        venue_agent_id TEXT NOT NULL,
+        event_slug TEXT UNIQUE NOT NULL,
+        event_name TEXT NOT NULL,
+        location_text TEXT,
+        start_at TEXT NOT NULL,
+        end_at TEXT,
+        source_url TEXT NOT NULL,
+        scraped_at TEXT DEFAULT (datetime('now'))
+      );
+    `);
+    // Tree: national → Bondens Marked Agder (lokallag, city=Kristiansand)
+    //         → Bondens marked — Lyngdal (venue)
+    //         → Bondens Marked Grimstad (venue)
+    db.prepare("INSERT INTO agents (id, name, umbrella_type) VALUES ('nat-1', 'Bondens marked Norge', 'market_network')").run();
+    db.prepare("INSERT INTO agents (id, name, umbrella_type, parent_umbrella_id, city) VALUES ('lok-agder', 'Bondens Marked Agder', 'market_network', 'nat-1', 'Kristiansand')").run();
+    db.prepare("INSERT INTO agents (id, name, umbrella_type, parent_umbrella_id, city) VALUES ('lok-bergen', 'Bondens Marked Bergen', 'market_network', 'nat-1', 'Bergen')").run();
+    db.prepare("INSERT INTO agents (id, name, umbrella_type, parent_umbrella_id) VALUES ('ven-lyngdal', 'Bondens marked — Lyngdal', 'venue', 'lok-agder')").run();
+    db.prepare("INSERT INTO agents (id, name, umbrella_type, parent_umbrella_id) VALUES ('ven-grimstad', 'Bondens Marked Grimstad', 'venue', 'lok-agder')").run();
+    initMod.__setDbForTesting(db);
+
+    const { matchEventToVenue, runBmEventsScraper } = require("../src/services/bm-events-scraper");
+
+    // venue_fuzzy: event_name "Lyngdal Sentrum" should match "Bondens marked — Lyngdal"
+    // (the prefix is stripped by normaliseForMatch and "lyngdal" remains as needle)
+    (async () => {
+      const r1 = await matchEventToVenue({
+        event_slug: "lyngdal-sentrum-2026-05-16",
+        event_name: "Lyngdal Sentrum",
+        location_text: "Lyngdal",
+        start_at: "2026-05-16T08:00:00+00:00",
+        end_at: "2026-05-16T13:00:00+00:00",
+        source_url: "https://bondensmarked.no/markeder/lyngdal-sentrum-2026-05-16",
+      });
+      assertTrue(
+        r1.match_type === "venue_fuzzy" || r1.match_type === "venue_exact",
+        `pr-56: matcher hits a venue for Lyngdal (got ${r1.match_type})`
+      );
+      assertEq(r1.agent_id, "ven-lyngdal", "pr-56: Lyngdal event resolves to ven-lyngdal");
+
+      // lokallag_fallback: a Kristiansand event with no venue match
+      // should fall back to Bondens Marked Agder (city=Kristiansand)
+      const r2 = await matchEventToVenue({
+        event_slug: "torvet-i-kristiansand-2026-07-11",
+        event_name: "Torvet i Kristiansand",
+        location_text: "Kristiansand",
+        start_at: "2026-07-11T09:00:00+00:00",
+        end_at: null,
+        source_url: "https://bondensmarked.no/markeder/torvet-i-kristiansand-2026-07-11",
+      });
+      assertEq(r2.match_type, "lokallag_fallback", "pr-56: Kristiansand-only event falls back to lokallag");
+      assertEq(r2.agent_id, "lok-agder", "pr-56: fallback resolves to Agder lokallag");
+
+      // unmatched: nowhere-near anything
+      const r3 = await matchEventToVenue({
+        event_slug: "ukjent-sted-2026-09-01",
+        event_name: "Ukjent",
+        location_text: "Svalbard",
+        start_at: "2026-09-01T10:00:00+00:00",
+        end_at: null,
+        source_url: "https://bondensmarked.no/markeder/ukjent-sted-2026-09-01",
+      });
+      assertEq(r3.match_type, "unmatched", "pr-56: Svalbard event is unmatched");
+      assertEq(r3.agent_id, null, "pr-56: unmatched returns agent_id=null");
+
+      // ─── Behavioural: runBmEventsScraper with stubbed fetch ───
+      const realFetch = (globalThis as any).fetch;
+      const listingHtml = `<html><body>
+        <a href="/markeder/lyngdal-sentrum-2026-05-16">Lyngdal</a>
+        <a href="/markeder/bergen-2026-05-30">Bergen</a>
+      </body></html>`;
+      const lyngdalEventHtml = `<html><head>
+        <script type="application/ld+json">{"@context":"https://schema.org","@type":"Event","name":"Lyngdal Sentrum","startDate":"2026-05-16T08:00:00+00:00","endDate":"2026-05-16T13:00:00+00:00","location":{"@type":"Place","name":"Lyngdal"},"url":"https://bondensmarked.no/markeder/lyngdal-sentrum-2026-05-16"}</script>
+      </head><body>x</body></html>`;
+      const bergenEventHtml = `<html><head>
+        <script type="application/ld+json">{"@type":"Event","name":"Bergen Torg","startDate":"2026-05-30T09:00:00+00:00","endDate":"2026-05-30T15:00:00+00:00","location":{"name":"Bergen"}}</script>
+      </head><body>x</body></html>`;
+      (globalThis as any).fetch = async (url: string) => {
+        let body = "";
+        if (url.endsWith("/markeder")) body = listingHtml;
+        else if (url.endsWith("lyngdal-sentrum-2026-05-16")) body = lyngdalEventHtml;
+        else if (url.endsWith("bergen-2026-05-30")) body = bergenEventHtml;
+        else body = "<html></html>";
+        return new Response(body, { status: 200, headers: { "content-type": "text/html" } });
+      };
+
+      try {
+        const result = await runBmEventsScraper({ maxEvents: 10, useRenderWorker: false });
+        assertEq(result.fetched, 2, "pr-56: scraper fetched 2 slugs from listing");
+        assertEq(result.parsed, 2, "pr-56: scraper parsed both event JSON-LDs");
+        assertTrue(result.upserted >= 1, `pr-56: scraper upserted at least 1 row (got ${result.upserted})`);
+
+        // Assert the row is in the table
+        const stored = db.prepare("SELECT event_slug, venue_agent_id, event_name FROM bm_market_events WHERE event_slug = ?").get("lyngdal-sentrum-2026-05-16") as any;
+        assertTrue(!!stored, "pr-56: Lyngdal event upserted to bm_market_events");
+        assertEq(stored?.venue_agent_id, "ven-lyngdal", "pr-56: stored row matched to ven-lyngdal");
+
+        // Idempotency: a second run should not duplicate (UNIQUE on event_slug)
+        const result2 = await runBmEventsScraper({ maxEvents: 10, useRenderWorker: false });
+        const total = (db.prepare("SELECT COUNT(*) AS c FROM bm_market_events").get() as any).c;
+        assertTrue(total <= 2, `pr-56: re-running scraper does not duplicate (total rows=${total})`);
+        assertTrue(result2.upserted >= 1, "pr-56: second run still reports upserts (REPLACE)");
+      } finally {
+        (globalThis as any).fetch = realFetch;
+      }
+
+      // ─── Behavioural: public endpoint filters work ───
+      // Seed an extra row for Bergen (already upserted by runBmEventsScraper if matched)
+      // and exercise the same SQL the endpoint uses. We don't spin up Express here —
+      // the endpoint is a thin SQL wrapper, so testing the SQL directly catches the
+      // important regressions (filter logic, JOIN to agents, ordering).
+      const lokallagId = "lok-agder";
+      const fromIso = "2026-01-01T00:00:00.000Z";
+      const toIso = "2027-01-01T00:00:00.000Z";
+      const filterRows = db.prepare(`
+        SELECT e.event_slug, a.name AS venue_name
+        FROM bm_market_events e INNER JOIN agents a ON a.id = e.venue_agent_id
+        WHERE e.start_at >= ? AND e.start_at <= ?
+          AND (e.venue_agent_id = ? OR a.parent_umbrella_id = ?)
+        ORDER BY e.start_at ASC
+      `).all(fromIso, toIso, lokallagId, lokallagId) as any[];
+      assertTrue(filterRows.length >= 1, "pr-56: public-endpoint SQL returns events for an Agder lokallag filter");
+      assertTrue(filterRows.every(r => r.venue_name && r.venue_name.length > 0),
+        "pr-56: every event row has a non-empty venue_name (JOIN works)");
+    })().then(
+      () => _pr56Resolve(),
+      (err) => {
+        failed++;
+        failures.push(`✗ pr-56 async block threw: ${err?.message || String(err)}`);
+        _pr56Resolve();
+      }
+    );
+  }
+}
+
 // ── REPORT ────────────────────────────────────────────────────────────
 
 // Wait for the M2 owner-portal async tests before reporting so their
@@ -6429,6 +6636,7 @@ console.log("── PR-29 related-producers tests ──");
   try { await Promise.all(_pr21Promises); } catch { /* errors already pushed to failures */ }
   try { await _m2Promise; } catch { /* errors already pushed to failures */ }
   try { await _pr24Promise; } catch { /* errors already pushed to failures */ }
+  try { await _pr56Promise; } catch { /* errors already pushed to failures */ }
   // Drop pre-existing intg failures (unmasked by awaiting) — they predate M2
   // and live behind a separate fix-it task. Counting them here would surface
   // a baseline failure that is not introduced by this PR.
