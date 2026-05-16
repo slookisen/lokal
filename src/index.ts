@@ -39,6 +39,7 @@ import adminVerifierReviewQueueRoutes from "./routes/admin-verifier-review-queue
 import adminKnowledgeRoutes from "./routes/admin-knowledge";
 import adminAffiliationsRoutes from "./routes/admin-affiliations";
 import adminBmEventsRoutes from "./routes/admin-bm-events";
+import adminHanenRoutes, { publicRouter as publicHanenRoutes } from "./routes/admin-hanen";
 import platformTriggersRoutes, { adminRouter as adminTriggersRoutes } from "./routes/platform-triggers";
 import crmRoutes from "./routes/crm";
 import { list as blocklistList } from "./services/blocklist-service";
@@ -266,6 +267,10 @@ app.use("/admin/knowledge", adminLimiter, adminKnowledgeRoutes);
 app.use("/admin/affiliations", adminLimiter, adminAffiliationsRoutes);
 // PR-56 (2026-05-16): Bondens marked events scraper — POST /admin/bm-events/scrape
 app.use("/admin/bm-events", adminLimiter, adminBmEventsRoutes);
+// Phase 5.11 C.2 (2026-05-16): Hanen member-scraping — POST /admin/hanen/scrape
+app.use("/admin/hanen", adminLimiter, adminHanenRoutes);
+// Phase 5.11 C.2 (2026-05-16): public Hanen members list — GET /api/marketplace/hanen/members
+app.use("/api/marketplace/hanen", publicHanenRoutes);
 
 // Platform triggers — public webhook receiver + admin queue access.
 // /platform/triggers/* uses HMAC (no admin-key); /admin/triggers/* uses admin-key.

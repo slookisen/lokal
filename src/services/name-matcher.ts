@@ -1,0 +1,121 @@
+// ─── Name matcher utilities (Phase 5.11 C.2, 2026-05-16) ────────────
+//
+// Shared fuzzy-name matching primitives. Extracted from
+// bm-events-scraper.ts so the Hanen scraper (hanen-scraper.ts) can use
+// the same Norwegian-aware normalisation rules.
+//
+// Exports:
+//   normaliseForMatch(s)          — NFC-lowercase, transliterate æ/ø/å,
+//                                   strip punctuation, collapse whitespace
+//   diceCoefficient(a, b)         — bigram Dice coefficient ∈ [0, 1].
+//                                   Symmetric, robust on short strings.
+//   nameSimilarity(a, b)          — convenience wrapper that applies
+//                                   normaliseForMatch to both inputs
+//                                   first, then returns Dice on the
+//                                   normalised strings. Returns 1.0 for
+//                                   exact normalised hit (short-circuit).
+//                                   Returns 0 if either is empty.
+//   bestMatch(needle, candidates) — returns the highest-scoring candidate
+//                                   along with its score; null if no
+//                                   candidate scores above 0.
+//
+// Why Dice (not Jaccard, not Levenshtein-ratio):
+//   - Symmetric so order doesn't matter.
+//   - Bigram-based: tolerates a missing accent or a swapped letter
+//     without collapsing to 0 the way exact-equal would.
+//   - O(n+m) per pair — fast enough for matching ~500 Hanen members
+//     against ~1500 agents in a single scrape run.
+//   - The bm-events-scraper's substring-overlap scorer is kept inside
+//     that file because its semantics (longest-overlap wins) are
+//     specific to BM's venue-name patterns; Dice is the right default
+//     for fuzzy person/farm-name matching.
+
+// ─── 1. normaliseForMatch ──────────────────────────────────────
+// Identical semantics to the original private helper in
+// bm-events-scraper.ts (verified by the PR-56 behavioural tests).
+// Kept BM-prefix stripping for backward-compat, even though the
+// Hanen scraper won't hit BM-prefixed strings — extra cost is one
+// regex per call and the prefix would never accidentally collide.
+export function normaliseForMatch(s: string): string {
+  if (!s) return "";
+  return s
+    .normalize("NFC")
+    .toLowerCase()
+    .replace(/æ/g, "ae")
+    .replace(/ø/g, "o")
+    .replace(/å/g, "a")
+    .replace(/ä/g, "a")
+    .replace(/ö/g, "o")
+    .replace(/ü/g, "u")
+    .replace(/^bondens?\s*marked\s*[-—–:]?\s*/i, "")
+    .replace(/[^\p{L}\p{N}\s]/gu, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+// ─── 2. diceCoefficient ────────────────────────────────────────
+// Sørensen–Dice over character bigrams.
+//   - Strings of length < 2 fall back to equality (1 if equal, 0 else)
+//     since they have no bigrams.
+//   - Whitespace inside the string contributes bigrams normally — this
+//     is desired so "olav g" ≠ "olavg" but "olav gard" ≈ "olav  gard"
+//     (caller is expected to normaliseForMatch first to collapse
+//     whitespace).
+export function diceCoefficient(a: string, b: string): number {
+  if (a === b) return 1;
+  if (a.length < 2 || b.length < 2) return 0;
+
+  const bigramsA = new Map<string, number>();
+  for (let i = 0; i < a.length - 1; i++) {
+    const bg = a.slice(i, i + 2);
+    bigramsA.set(bg, (bigramsA.get(bg) || 0) + 1);
+  }
+
+  let intersection = 0;
+  let totalB = 0;
+  // Walk b's bigrams once, draining matches from bigramsA so each
+  // occurrence is counted at most once (standard Dice on multisets).
+  for (let i = 0; i < b.length - 1; i++) {
+    const bg = b.slice(i, i + 2);
+    totalB++;
+    const count = bigramsA.get(bg) || 0;
+    if (count > 0) {
+      intersection++;
+      bigramsA.set(bg, count - 1);
+    }
+  }
+
+  const totalA = a.length - 1;
+  return (2 * intersection) / (totalA + totalB);
+}
+
+// ─── 3. nameSimilarity ─────────────────────────────────────────
+// Convenience: normalises both inputs and returns Dice. Short-circuits
+// on exact normalised equality (very common — saves the bigram cost
+// for the obvious case where Hanen and our DB spell a farm identically).
+export function nameSimilarity(a: string, b: string): number {
+  const na = normaliseForMatch(a);
+  const nb = normaliseForMatch(b);
+  if (!na || !nb) return 0;
+  if (na === nb) return 1;
+  return diceCoefficient(na, nb);
+}
+
+// ─── 4. bestMatch ──────────────────────────────────────────────
+// Scan candidates, return the highest-scoring one. Useful for the
+// "match one Hanen member to one agent" inner loop. Threshold
+// filtering is left to the caller so different scrapers can use
+// different cut-offs (Hanen starts at 0.85).
+export function bestMatch<T>(
+  needle: string,
+  candidates: Array<{ key: string; item: T }>
+): { item: T; score: number; key: string } | null {
+  let best: { item: T; score: number; key: string } | null = null;
+  for (const c of candidates) {
+    const score = nameSimilarity(needle, c.key);
+    if (score > 0 && (!best || score > best.score)) {
+      best = { item: c.item, score, key: c.key };
+    }
+  }
+  return best;
+}

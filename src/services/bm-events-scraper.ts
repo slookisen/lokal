@@ -27,6 +27,7 @@
 
 import { getDb } from "../database/init";
 import { renderPage } from "./render-client";
+import { normaliseForMatch } from "./name-matcher";
 
 const LISTING_URL = "https://bondensmarked.no/markeder";
 const EVENT_BASE = "https://bondensmarked.no/markeder/";
@@ -57,26 +58,6 @@ export type ScrapeResult = {
   upserted: number;
   errors: string[];
 };
-
-// ─── Norwegian-aware string normalisation ──────────────────────
-// Lowercase + strip diacritics + collapse whitespace + drop common
-// venue prefixes ("bondens marked", "bondens marked —") so fuzzy
-// matching on event_name "Lyngdal Sentrum" → "Bondens marked — Lyngdal".
-function normaliseForMatch(s: string): string {
-  return s
-    .normalize("NFC")
-    .toLowerCase()
-    .replace(/æ/g, "ae")
-    .replace(/ø/g, "o")
-    .replace(/å/g, "a")
-    .replace(/ä/g, "a")
-    .replace(/ö/g, "o")
-    .replace(/ü/g, "u")
-    .replace(/^bondens?\s*marked\s*[-—–:]?\s*/i, "")
-    .replace(/[^\p{L}\p{N}\s]/gu, " ")
-    .replace(/\s+/g, " ")
-    .trim();
-}
 
 // ─── 1. fetchEventSlugs ─────────────────────────────────────────
 // Pulls the listing HTML and extracts unique slugs from /markeder/<slug>

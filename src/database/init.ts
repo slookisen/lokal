@@ -1710,6 +1710,35 @@ function initSchema(db: Database.Database): void {
   // SQLite's planner handles the range scan cheaply at this table size.
   db.exec(`CREATE INDEX IF NOT EXISTS idx_bm_events_start ON bm_market_events(start_at)`);
 
+  // ─── Phase 5.11 C.2 (2026-05-16): Hanen member-scraping unmatched log ──
+  // hanen.no/medlemmer scraper (src/services/hanen-scraper.ts) writes one
+  // row per parsed Hanen member that did NOT match any existing agent
+  // above the 0.85 Dice threshold. The table is intentionally append-and-
+  // refresh (UNIQUE on parsed_name): re-running the scraper updates the
+  // last_seen_at + best_match_score so we can audit drift over time, but
+  // never creates duplicate rows. Phase B.2-equivalent (auto-create new
+  // producer agents for unmatched Hanen members) will read from here
+  // later — that work is deferred.
+  //
+  // Why a separate table (not just errors[]): the bm-events errors[] is
+  // ephemeral (returned in the scrape response, then lost). Hanen has
+  // potentially ~50-200 unmatched members across a year of re-scrapes;
+  // they're worth durable storage so we can build a triage UI for Daniel.
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS hanen_unmatched_members (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      parsed_name TEXT UNIQUE NOT NULL,
+      parsed_location TEXT,
+      parsed_website TEXT,
+      parsed_category TEXT,
+      source_url TEXT NOT NULL,
+      best_match_score REAL,
+      first_seen_at TEXT DEFAULT (datetime('now')),
+      last_seen_at TEXT DEFAULT (datetime('now'))
+    )
+  `);
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_hanen_unmatched_last_seen ON hanen_unmatched_members(last_seen_at)`);
+
 }
 
 export function closeDb(): void {

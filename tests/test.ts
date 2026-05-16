@@ -6677,6 +6677,162 @@ const _pr56Promise: Promise<void> = new Promise<void>(r => { _pr56Resolve = r; }
   }
 }
 
+
+// ─── Phase 5.11 C.2: Hanen member scraper ──────────────────────
+// Source-presence + light behavioural assertions. Mirrors the PR-56
+// presence-test block so the same set of guarantees (module exists,
+// route mounted, schema migration present, threshold constant exported)
+// is enforced for the Hanen scraper. Behavioural tests live inside the
+// IIFE so they can require() the parser without breaking earlier
+// blocks if better-sqlite3 is unavailable.
+{
+  console.log("\n── Phase 5.11 C.2: Hanen member scraper ──");
+  const fs = require("fs");
+
+  // (1) Source-presence: scraper module + required exports.
+  assertTrue(fs.existsSync("src/services/hanen-scraper.ts"),
+    "c.2: hanen-scraper.ts present");
+  const hanenSrc = fs.readFileSync("src/services/hanen-scraper.ts", "utf-8");
+  assertTrue(/export\s+async\s+function\s+fetchHanenListing/.test(hanenSrc),
+    "c.2: hanen-scraper exports fetchHanenListing()");
+  assertTrue(/export\s+function\s+parseHanenMembers/.test(hanenSrc),
+    "c.2: hanen-scraper exports parseHanenMembers()");
+  assertTrue(/export\s+function\s+matchHanenMemberToAgent/.test(hanenSrc),
+    "c.2: hanen-scraper exports matchHanenMemberToAgent()");
+  assertTrue(/export\s+async\s+function\s+runHanenScraper/.test(hanenSrc),
+    "c.2: hanen-scraper exports runHanenScraper()");
+  assertTrue(/HANEN_MATCH_THRESHOLD\s*=\s*MATCH_THRESHOLD/.test(hanenSrc),
+    "c.2: hanen-scraper exports HANEN_MATCH_THRESHOLD constant");
+
+  // (2) Source-presence: shared name-matcher utility.
+  assertTrue(fs.existsSync("src/services/name-matcher.ts"),
+    "c.2: name-matcher.ts present");
+  const nmSrc = fs.readFileSync("src/services/name-matcher.ts", "utf-8");
+  assertTrue(/export\s+function\s+normaliseForMatch/.test(nmSrc),
+    "c.2: name-matcher exports normaliseForMatch()");
+  assertTrue(/export\s+function\s+nameSimilarity/.test(nmSrc),
+    "c.2: name-matcher exports nameSimilarity()");
+  // bm-events-scraper must consume the shared helper (no duplication)
+  const bmSrc = fs.readFileSync("src/services/bm-events-scraper.ts", "utf-8");
+  assertTrue(/from\s+["']\.\/name-matcher["']/.test(bmSrc),
+    "c.2: bm-events-scraper imports from name-matcher (shared)");
+
+  // (3) Source-presence: admin endpoint + public endpoint registered.
+  assertTrue(fs.existsSync("src/routes/admin-hanen.ts"),
+    "c.2: admin-hanen route file present");
+  const adminSrc = fs.readFileSync("src/routes/admin-hanen.ts", "utf-8");
+  assertTrue(/adminRouter\.post\(\s*['"]\/scrape['"]/.test(adminSrc),
+    "c.2: POST /admin/hanen/scrape registered on adminRouter");
+  assertTrue(/publicRouter\.get\(\s*['"]\/members['"]/.test(adminSrc),
+    "c.2: GET /api/marketplace/hanen/members registered on publicRouter");
+  const indexSrc = fs.readFileSync("src/index.ts", "utf-8");
+  assertTrue(/['"]\/admin\/hanen['"]/.test(indexSrc),
+    "c.2: index.ts mounts /admin/hanen router");
+  assertTrue(/['"]\/api\/marketplace\/hanen['"]/.test(indexSrc),
+    "c.2: index.ts mounts /api/marketplace/hanen router");
+
+  // (4) Source-presence: schema migration for hanen_unmatched_members.
+  const initSrc = fs.readFileSync("src/database/init.ts", "utf-8");
+  assertTrue(/CREATE TABLE IF NOT EXISTS hanen_unmatched_members/.test(initSrc),
+    "c.2: init.ts creates hanen_unmatched_members table");
+  assertTrue(/parsed_name TEXT UNIQUE NOT NULL/.test(initSrc),
+    "c.2: hanen_unmatched_members.parsed_name is UNIQUE (idempotent upsert)");
+
+  // (5) Response-shape constants — admin route returns the documented keys.
+  // Keep this brittle on purpose: any drift on the response contract
+  // breaks the C.2 reviewer's expectation + the cron caller.
+  for (const k of ["success", "fetched", "parsed", "matched", "unmatched", "upserted", "errors"]) {
+    assertTrue(new RegExp(k + ":").test(hanenSrc),
+      `c.2: HanenScrapeResult includes "${k}" key`);
+  }
+
+  // (6) Behavioural: parseHanenMembers + matcher + threshold.
+  // Lightweight — runs synchronously, no DB needed for the parser path.
+  try {
+    const hs = require("../src/services/hanen-scraper");
+    const nm = require("../src/services/name-matcher");
+
+    // 6a. Dice coefficient sanity — symmetric, [0,1], exact = 1.
+    const d1 = nm.diceCoefficient("olav gard", "olav gard");
+    assertEq(d1, 1, "c.2: Dice(equal) === 1");
+    const d2 = nm.diceCoefficient("olav gard", "olav grd");
+    assertTrue(d2 > 0.7 && d2 < 1, "c.2: Dice(near) ∈ (0.7, 1)");
+    const d3 = nm.diceCoefficient("alpha", "omega");
+    assertEq(d3, 0, "c.2: Dice(disjoint) === 0");
+
+    // 6b. nameSimilarity handles Norwegian normalisation.
+    const sim = nm.nameSimilarity("Bråtå Gård", "Bratå Gard");
+    assertTrue(sim >= 0.85, "c.2: nameSimilarity normalises Norwegian diacritics");
+
+    // 6c. Parser extracts a member from a minimal Hanen-shaped HTML fixture.
+    const fixture = [
+      "<html><body>",
+      "<a href=\"/medlem/123-bratabu-gard\" class=\"member-card\">",
+      "  <h3>Bråtabu Gård</h3>",
+      "  <span class=\"location\">Lyngdal, Agder</span>",
+      "  <span class=\"category\">Gårdsbutikk</span>",
+      "  <a href=\"https://bratabu.no\">bratabu.no</a>",
+      "</a>",
+      "<a href=\"/medlem/456-stordalen-saeter\" class=\"member-card\">",
+      "  <h3>Stordalen Sæter</h3>",
+      "  <span class=\"location\">Hallingdal, Buskerud</span>",
+      "</a>",
+      "</body></html>",
+    ].join("\n");
+    const members = hs.parseHanenMembers(fixture, "https://hanen.no/medlemmer");
+    assertEq(members.length, 2, "c.2: parser extracts 2 members from fixture");
+    assertEq(members[0].parsed_name, "Bråtabu Gård",
+      "c.2: parser preserves Norwegian characters in name");
+    assertTrue(members[0].parsed_location.toLowerCase().includes("lyngdal"),
+      "c.2: parser extracts location text");
+    assertEq(members[0].parsed_website, "https://bratabu.no",
+      "c.2: parser extracts external website");
+
+    // 6c-bis. Parser also handles the real WordPress markup Hanen uses
+    // (verified 2026-05-16: hanen.no/medlemmer ships hanen_county-X +
+    // hanen_category-Y class names on a <div ... itemtype=schema.org/CreativeWork>
+    // wrapper, with a /bedrift/<slug>/ detail link). Keeps us honest if
+    // someone "simplifies" the parser later and drops Strategy A.
+    const wpFixture = [
+      "<div class=\"fl-post-grid-post hanen_county-vestland hanen_category-gaardsbutikk\" itemscope itemtype=\"https://schema.org/CreativeWork\">",
+      "  <meta itemscope itemprop=\"mainEntityOfPage\" itemtype=\"https://schema.org/WebPage\" itemid=\"https://www.hanen.no/bedrift/test-gaard/\" content=\"Test Gård\" />",
+      "  <h2 class=\"fl-post-grid-title\"><a href=\"https://www.hanen.no/bedrift/test-gaard/\" title=\"Test Gård\">Test Gård</a></h2>",
+      "  </div>",
+      "</div>",
+    ].join("\n");
+    const wpMembers = hs.parseHanenMembers(wpFixture, "https://www.hanen.no/medlemmer/");
+    assertEq(wpMembers.length, 1,
+      "c.2: parser handles real Hanen WordPress markup (1 member from fixture)");
+    assertEq(wpMembers[0].parsed_name, "Test Gård",
+      "c.2: parser pulls Norwegian-char name from itemid content attribute");
+    assertEq(wpMembers[0].parsed_location, "Vestland",
+      "c.2: parser pulls location from hanen_county-<fylke> class");
+
+    // 6d. matchHanenMemberToAgent honours MATCH_THRESHOLD (0.85).
+    const member = members[0];
+    const corpus = [
+      { id: "a1", name: "Bratabu Gard", city: "Lyngdal" },
+      { id: "a2", name: "Completely Different Farm", city: "Oslo" },
+    ];
+    const verdict = hs.matchHanenMemberToAgent(member, corpus);
+    assertEq(verdict.agent_id, "a1",
+      "c.2: matcher picks the high-similarity candidate (a1)");
+    assertTrue(verdict.score >= hs.HANEN_MATCH_THRESHOLD,
+      `c.2: match score (${verdict.score}) >= HANEN_MATCH_THRESHOLD (${hs.HANEN_MATCH_THRESHOLD})`);
+
+    // 6e. Sub-threshold matches return null agent_id.
+    const onlyJunk = [{ id: "j1", name: "Completely Different Farm", city: null }];
+    const verdict2 = hs.matchHanenMemberToAgent(member, onlyJunk);
+    assertEq(verdict2.agent_id, null,
+      "c.2: matcher rejects sub-threshold matches");
+    assertEq(verdict2.method, "below_threshold",
+      "c.2: matcher marks rejected matches as below_threshold");
+  } catch (e: any) {
+    failed++;
+    failures.push("✗ c.2 behavioural: " + (e?.message || String(e)));
+  }
+}
+
 // ── REPORT ────────────────────────────────────────────────────────────
 
 // Wait for the M2 owner-portal async tests before reporting so their
