@@ -2098,6 +2098,8 @@ const PROFILE_CSS = `
   .aff-icon { font-size: 1.05rem; }
   .aff-name { font-size: 0.86rem; font-weight: 600; }
   .aff-labels { font-size: 0.7rem; color: var(--g500); margin-left: 4px; }
+  /* PR-58: pending_confirmation + inferred (auto-tagged via organic-cert detector) */
+  .affiliation-pending { opacity: 0.7; border-style: dashed; cursor: help; }
   /* Umbrella profile (Phase 5.11 — stub in A2, filled in A4/Phase B) */
   .umb-hero { padding: 24px 0; }
   .umb-type-badge { display: inline-block; padding: 4px 10px; background: var(--green-100); color: var(--green-700); border-radius: 12px; font-size: 0.75rem; font-weight: 600; margin-bottom: 10px; }
@@ -2478,21 +2480,28 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
     // Affiliations FOR a producer (forward direction):
     //   "What umbrellas is this producer a member of?"
     // Used to render the conditional "Tilknytninger" card + memberOf JSON-LD.
+    // PR-58 (2026-05-16): also surface pending_confirmation+inferred rows so
+    // the producer page shows "antatt sertifisert via Debio (ikke bekreftet)"
+    // for auto-tagged organic-cert links until the producer accepts/rejects.
     type Affiliation = {
       umbrella_id: string;
       umbrella_name: string;
       umbrella_slug: string;
       labels: string[];
+      status: string;   // 'active' | 'pending_confirmation'
+      source: string;   // 'self_claimed' | 'scraped' | 'admin' | 'umbrella_confirmed' | 'inferred'
     };
     let affiliations: Affiliation[] = [];
     if (!isUmbrella) {
       try {
         const rows = umbDb.prepare(`
-          SELECT a.id AS umbrella_id, a.name AS umbrella_name, aff.labels
+          SELECT a.id AS umbrella_id, a.name AS umbrella_name, aff.labels,
+                 aff.status, aff.source
           FROM agent_affiliations aff
           INNER JOIN agents a ON a.id = aff.umbrella_id
           WHERE aff.producer_id = ?
-            AND aff.status = 'active'
+            AND (aff.status = 'active'
+              OR (aff.status = 'pending_confirmation' AND aff.source = 'inferred'))
           ORDER BY a.name ASC
         `).all(agent.id) as any[];
         affiliations = rows.map(r => ({
@@ -2500,6 +2509,8 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
           umbrella_name: r.umbrella_name,
           umbrella_slug: slugify(r.umbrella_name),
           labels: r.labels ? (() => { try { return JSON.parse(r.labels); } catch { return []; } })() : [],
+          status: r.status,
+          source: r.source,
         }));
       } catch (e) {
         // No agent_affiliations table → fall through with empty array.
@@ -2868,9 +2879,18 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
     const affiliationsHtml = affiliations.length
       ? affiliations.map(a => {
           const labelsTxt = a.labels.length ? ` <span class="aff-labels">${a.labels.map(l => escapeHtml(l)).join(" · ")}</span>` : "";
-          return `<a href="/produsent/${a.umbrella_slug}" class="aff-item" rel="related">` +
+          // PR-58: pending_confirmation + inferred rows render with a
+          // dashed "antatt — ikke bekreftet" treatment until the producer
+          // confirms (via owner-portal) or rejects (via /opt-out).
+          const isPending = a.status === "pending_confirmation" && a.source === "inferred";
+          const pendingClass = isPending ? " affiliation-pending" : "";
+          const pendingSuffix = isPending ? " (antatt — ikke bekreftet)" : "";
+          const pendingTitle = isPending
+            ? ` title="Vi har gjettet denne tilknytningen basert på tekst på din nettside. Logg inn på eier-portalen for å bekrefte eller avvise."`
+            : "";
+          return `<a href="/produsent/${a.umbrella_slug}" class="aff-item${pendingClass}" rel="related"${pendingTitle}>` +
                  `<span class="aff-icon">&#129309;</span>` +  // 🤝 handshake
-                 `<span class="aff-name">${escapeHtml(a.umbrella_name)}</span>${labelsTxt}` +
+                 `<span class="aff-name">${escapeHtml(a.umbrella_name)}${pendingSuffix}</span>${labelsTxt}` +
                  `</a>`;
         }).join("")
       : "";
@@ -3064,13 +3084,20 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
     // Always-array shape per schema.org — even with 1 entry, callers expect
     // memberOf as a list.
     if (affiliations.length) {
-      jsonLd.memberOf = affiliations.map(a => ({
-        "@type": "Organization",
-        "@id": `${BASE_URL}/produsent/${a.umbrella_slug}#org`,
-        "name": a.umbrella_name,
-        "url": `${BASE_URL}/produsent/${a.umbrella_slug}`,
-        ...(a.labels.length ? { "additionalType": a.labels.join(", ") } : {}),
-      }));
+      jsonLd.memberOf = affiliations.map(a => {
+        // PR-58: skip pending_confirmation + inferred — emitting an
+        // unverified guess as schema.org/memberOf would mislead crawlers.
+        if (a.status === "pending_confirmation" && a.source === "inferred") return null;
+        return {
+          "@type": "Organization",
+          "@id": `${BASE_URL}/produsent/${a.umbrella_slug}#org`,
+          "name": a.umbrella_name,
+          "url": `${BASE_URL}/produsent/${a.umbrella_slug}`,
+          ...(a.labels.length ? { "additionalType": a.labels.join(", ") } : {}),
+        };
+      }).filter(Boolean);
+      // Hide the key entirely if every row was pending — keeps JSON-LD clean.
+      if (!jsonLd.memberOf.length) delete jsonLd.memberOf;
     }
 
     // Payment methods

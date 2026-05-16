@@ -1569,6 +1569,9 @@ function initSchema(db: Database.Database): void {
   }
 
   // 5.11.A1.2 — agent_affiliations table for producer ↔ umbrella links
+  // PR-58 (2026-05-16): added 'inferred' to source CHECK + new evidence_json
+  // column to support C.1-C auto-tag enrichment (Debio organic-cert detector
+  // POSTs pending_confirmation rows with evidence snippets).
   db.exec(`
     CREATE TABLE IF NOT EXISTS agent_affiliations (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1577,13 +1580,14 @@ function initSchema(db: Database.Database): void {
       status TEXT NOT NULL DEFAULT 'pending_confirmation'
         CHECK(status IN ('pending_confirmation','active','historical','rejected')),
       source TEXT NOT NULL
-        CHECK(source IN ('self_claimed','scraped','admin','umbrella_confirmed')),
+        CHECK(source IN ('self_claimed','scraped','admin','umbrella_confirmed','inferred')),
       labels TEXT,                          -- JSON array of label keys
       notes TEXT,
       joined_at TEXT,
       confirmed_at TEXT,
       expires_at TEXT,
       field_provenance TEXT,
+      evidence_json TEXT,                   -- PR-58: JSON {matched_keywords, evidence_snippets, confidence, source_url}
       created_at TEXT DEFAULT (datetime('now')),
       updated_at TEXT DEFAULT (datetime('now')),
       UNIQUE(producer_id, umbrella_id),
@@ -1595,6 +1599,81 @@ function initSchema(db: Database.Database): void {
   // 5.11.A1.3 — Indexes for the two most-common query patterns
   db.exec(`CREATE INDEX IF NOT EXISTS idx_affiliations_producer ON agent_affiliations(producer_id, status)`);
   db.exec(`CREATE INDEX IF NOT EXISTS idx_affiliations_umbrella ON agent_affiliations(umbrella_id, status)`);
+
+  // ─── PR-58 (2026-05-16): additive migrations for existing DBs ────────
+  // Two changes vs A1.2 baseline:
+  //   1. Add evidence_json column (nullable) — easy ALTER.
+  //   2. Widen source CHECK constraint to include 'inferred' — SQLite
+  //      can't ALTER CHECK in place, so we rebuild the table only when
+  //      the constraint is missing (idempotent on already-migrated DBs).
+  try {
+    const cols = db.prepare("PRAGMA table_info(agent_affiliations)").all() as Array<{ name: string }>;
+    if (!cols.some(c => c.name === "evidence_json")) {
+      db.exec("ALTER TABLE agent_affiliations ADD COLUMN evidence_json TEXT");
+    }
+  } catch (e) {
+    console.warn("[init][pr-58] evidence_json migration skipped:", e instanceof Error ? e.message : String(e));
+  }
+
+  try {
+    // Read the table's create-statement from sqlite_master and check
+    // whether 'inferred' already appears in the source CHECK list.
+    const schemaRow = db.prepare(
+      "SELECT sql FROM sqlite_master WHERE type='table' AND name='agent_affiliations'"
+    ).get() as { sql: string } | undefined;
+    const needsRebuild = schemaRow && !/'inferred'/.test(schemaRow.sql);
+    if (needsRebuild) {
+      // Rebuild table with widened source CHECK. Wrapped in a transaction
+      // so we never leave a half-rebuilt schema if one statement fails.
+      const tx = db.transaction(() => {
+        db.exec(`
+          CREATE TABLE agent_affiliations__pr58_new (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            producer_id TEXT NOT NULL,
+            umbrella_id TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'pending_confirmation'
+              CHECK(status IN ('pending_confirmation','active','historical','rejected')),
+            source TEXT NOT NULL
+              CHECK(source IN ('self_claimed','scraped','admin','umbrella_confirmed','inferred')),
+            labels TEXT,
+            notes TEXT,
+            joined_at TEXT,
+            confirmed_at TEXT,
+            expires_at TEXT,
+            field_provenance TEXT,
+            evidence_json TEXT,
+            created_at TEXT DEFAULT (datetime('now')),
+            updated_at TEXT DEFAULT (datetime('now')),
+            UNIQUE(producer_id, umbrella_id),
+            FOREIGN KEY (producer_id) REFERENCES agents(id) ON DELETE CASCADE,
+            FOREIGN KEY (umbrella_id) REFERENCES agents(id) ON DELETE CASCADE
+          )
+        `);
+        // Copy all existing rows. evidence_json may already exist (from the
+        // ALTER above), or default to NULL.
+        db.exec(`
+          INSERT INTO agent_affiliations__pr58_new
+            (id, producer_id, umbrella_id, status, source, labels, notes,
+             joined_at, confirmed_at, expires_at, field_provenance,
+             evidence_json, created_at, updated_at)
+          SELECT id, producer_id, umbrella_id, status, source, labels, notes,
+                 joined_at, confirmed_at, expires_at, field_provenance,
+                 evidence_json, created_at, updated_at
+          FROM agent_affiliations
+        `);
+        db.exec(`DROP TABLE agent_affiliations`);
+        db.exec(`ALTER TABLE agent_affiliations__pr58_new RENAME TO agent_affiliations`);
+        // Indexes were dropped with the old table — recreate them now so
+        // the same boot doesn't leave them missing.
+        db.exec(`CREATE INDEX IF NOT EXISTS idx_affiliations_producer ON agent_affiliations(producer_id, status)`);
+        db.exec(`CREATE INDEX IF NOT EXISTS idx_affiliations_umbrella ON agent_affiliations(umbrella_id, status)`);
+      });
+      tx();
+      console.log("[init][pr-58] agent_affiliations.source CHECK widened to include 'inferred'");
+    }
+  } catch (e) {
+    console.warn("[init][pr-58] source-CHECK widening skipped:", e instanceof Error ? e.message : String(e));
+  }
 
   // 5.11.A1.4 — Optional partial index on umbrella agents (umbrella_type IS NOT NULL)
   // Speeds up "list all umbrellas" queries. Partial-index pattern matches PR-23's
