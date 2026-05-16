@@ -1738,6 +1738,26 @@ function initSchema(db: Database.Database): void {
     )
   `);
   db.exec(`CREATE INDEX IF NOT EXISTS idx_hanen_unmatched_last_seen ON hanen_unmatched_members(last_seen_at)`);
+  // ─── Phase 5.11 C.1-A (2026-05-16): Debio TRACES cross-check ────────
+  // Unmatched Debio organic-operators surfaced by /admin/debio/cross-check.
+  // We do NOT auto-create producer agents for these — the operator may be
+  // a legal entity that legitimately isn't on our marketplace yet. The row
+  // gives the orchestrator visibility (`first_seen_at`, `last_seen_at`,
+  // `best_match_score`) so a future manual-review or relaxed-fuzzy pass can
+  // attempt the link. operator_name is UNIQUE so the cross-check is
+  // idempotent on re-runs (ON CONFLICT updates `last_seen_at`).
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS debio_unmatched_operators (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      operator_name TEXT UNIQUE NOT NULL,
+      postal_code TEXT,
+      operator_identifier TEXT,
+      first_seen_at TEXT NOT NULL,
+      last_seen_at TEXT NOT NULL,
+      best_match_score REAL
+    )
+  `);
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_debio_unmatched_last_seen ON debio_unmatched_operators(last_seen_at)`);
 
 }
 

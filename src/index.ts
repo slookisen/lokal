@@ -40,6 +40,7 @@ import adminKnowledgeRoutes from "./routes/admin-knowledge";
 import adminAffiliationsRoutes from "./routes/admin-affiliations";
 import adminBmEventsRoutes from "./routes/admin-bm-events";
 import adminHanenRoutes, { publicRouter as publicHanenRoutes } from "./routes/admin-hanen";
+import adminDebioCrossCheckRoutes from "./routes/admin-debio-cross-check";
 import platformTriggersRoutes, { adminRouter as adminTriggersRoutes } from "./routes/platform-triggers";
 import crmRoutes from "./routes/crm";
 import { list as blocklistList } from "./services/blocklist-service";
@@ -271,6 +272,8 @@ app.use("/admin/bm-events", adminLimiter, adminBmEventsRoutes);
 app.use("/admin/hanen", adminLimiter, adminHanenRoutes);
 // Phase 5.11 C.2 (2026-05-16): public Hanen members list — GET /api/marketplace/hanen/members
 app.use("/api/marketplace/hanen", publicHanenRoutes);
+// C.1-A (2026-05-16): Debio TRACES+Brreg cross-check — POST /admin/debio/cross-check
+app.use("/admin/debio", adminLimiter, adminDebioCrossCheckRoutes);
 
 // Platform triggers — public webhook receiver + admin queue access.
 // /platform/triggers/* uses HMAC (no admin-key); /admin/triggers/* uses admin-key.

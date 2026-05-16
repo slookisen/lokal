@@ -6833,6 +6833,270 @@ const _pr56Promise: Promise<void> = new Promise<void>(r => { _pr56Resolve = r; }
   }
 }
 
+// PR-63 (C.1-A): Debio TRACES+Brreg cross-check async-test handle
+let _pr63Resolve: () => void = () => {};
+const _pr63Promise: Promise<void> = new Promise<void>(r => { _pr63Resolve = r; });
+
+// ─── C.1-A: Debio TRACES + Brreg cross-check (Phase 5.11) ─────────────
+{
+  console.log("\n── C.1-A: Debio TRACES + Brreg cross-check ──");
+  const fs = require("fs");
+
+  // (1) Source-presence: all three service files exist
+  assertTrue(fs.existsSync("src/services/traces-client.ts"),
+    "c1a: traces-client.ts present");
+  assertTrue(fs.existsSync("src/services/brreg-client.ts"),
+    "c1a: brreg-client.ts present");
+  assertTrue(fs.existsSync("src/services/debio-cross-check.ts"),
+    "c1a: debio-cross-check.ts present");
+
+  const tracesSrc = fs.readFileSync("src/services/traces-client.ts", "utf-8");
+  const brregSrc  = fs.readFileSync("src/services/brreg-client.ts", "utf-8");
+  const xcheckSrc = fs.readFileSync("src/services/debio-cross-check.ts", "utf-8");
+
+  // (2) TRACES client: filter logic keeps only NO-ØKO-01
+  assertTrue(/NO-ØKO-01/.test(tracesSrc),
+    "c1a: traces-client filters competentAuthority.code == 'NO-ØKO-01'");
+  assertTrue(/export\s+async\s+function\s+fetchDebioOperators/.test(tracesSrc),
+    "c1a: traces-client exports fetchDebioOperators()");
+  assertTrue(/export\s+function\s+isDebioRecord/.test(tracesSrc),
+    "c1a: traces-client exports isDebioRecord() for unit testing");
+
+  // (3) Brreg client: URL construction + name-lookup export
+  assertTrue(/data\.brreg\.no\/enhetsregisteret\/api/.test(brregSrc),
+    "c1a: brreg-client targets data.brreg.no/enhetsregisteret/api");
+  assertTrue(/export\s+async\s+function\s+findOrgnumberByName/.test(brregSrc),
+    "c1a: brreg-client exports findOrgnumberByName()");
+
+  // (4) Admin route: file exists + endpoint registered
+  assertTrue(fs.existsSync("src/routes/admin-debio-cross-check.ts"),
+    "c1a: admin-debio-cross-check route file present");
+  const adminSrc = fs.readFileSync("src/routes/admin-debio-cross-check.ts", "utf-8");
+  assertTrue(/router\.post\(\s*['"]\/cross-check['"]/.test(adminSrc),
+    "c1a: POST /admin/debio/cross-check registered");
+
+  const indexSrc = fs.readFileSync("src/index.ts", "utf-8");
+  assertTrue(/['"]\/admin\/debio['"]/.test(indexSrc),
+    "c1a: index.ts mounts /admin/debio router");
+
+  // (5) Schema: debio_unmatched_operators table in init.ts
+  const initSrc = fs.readFileSync("src/database/init.ts", "utf-8");
+  assertTrue(/CREATE TABLE IF NOT EXISTS debio_unmatched_operators/.test(initSrc),
+    "c1a: init.ts creates debio_unmatched_operators table");
+  assertTrue(/operator_name TEXT UNIQUE NOT NULL/.test(initSrc),
+    "c1a: debio_unmatched_operators.operator_name is UNIQUE (idempotent)");
+
+  // ─── Behavioural: confidence-scoring rubric ──────────────────────
+  const { scoreNameMatch, findOrgnumberByName, __clearBrregCacheForTesting } =
+    require("../src/services/brreg-client");
+
+  // Exact normalised-name match → 1.0
+  assertEq(scoreNameMatch("Aalrust Gård AS", "Aalrust Gård AS", null, null), 1.0,
+    "c1a: rubric — exact match returns 1.0");
+  assertEq(scoreNameMatch("Aalrust Gård", "Aalrust Gård AS", null, null), 1.0,
+    "c1a: rubric — exact match after org-suffix prune returns 1.0");
+
+  // First-word + postal match → 0.95
+  assertEq(scoreNameMatch("Aalrust Frukthage", "Aalrust Eple og Bær", "1234", "1234"), 0.95,
+    "c1a: rubric — first-word + postal match returns 0.95");
+
+  // First-word alone → 0.80
+  assertEq(scoreNameMatch("Aalrust Frukthage", "Aalrust Eple og Bær", null, null), 0.80,
+    "c1a: rubric — first-word match alone returns 0.80");
+  assertEq(scoreNameMatch("Aalrust Frukthage", "Aalrust Eple og Bær", "1234", "5678"), 0.80,
+    "c1a: rubric — first-word match with postal mismatch returns 0.80");
+
+  // No overlap → 0
+  assertEq(scoreNameMatch("Aalrust Gård", "Helt Annet Sted", null, null), 0.0,
+    "c1a: rubric — no overlap returns 0");
+
+  // findOrgnumberByName: <0.9 confidence → null
+  __clearBrregCacheForTesting();
+  (async () => {
+    // Wait for PR-56's async block first — both blocks swap the global
+    // db singleton via __setDbForTesting and racing them corrupts PR-56's
+    // in-memory DB. PR-56 finishes in ~50ms with stubbed fetch, so this
+    // wait is essentially free.
+    try { await _pr56Promise; } catch { /* failures already tallied */ }
+    const stubLowConf = async (_url: string) => new Response(JSON.stringify({
+      _embedded: { enheter: [
+        { organisasjonsnummer: "999888777", navn: "Bygdens Egen Gård AS",
+          forretningsadresse: { postnummer: "5678" } },
+      ]}
+    }), { status: 200, headers: { "content-type": "application/json" } });
+    const r = await findOrgnumberByName("Aalrust Gård", "1234", stubLowConf as any);
+    assertEq(r, null, "c1a: findOrgnumberByName returns null when best confidence < 0.9");
+
+    // findOrgnumberByName: ≥0.9 confidence → hit
+    __clearBrregCacheForTesting();
+    const stubGoodConf = async (url: string) => {
+      assertTrue(/data\.brreg\.no\/enhetsregisteret\/api\/enheter\?navn=/.test(url),
+        "c1a: brreg URL constructed correctly (path + navn param)");
+      return new Response(JSON.stringify({
+        _embedded: { enheter: [
+          { organisasjonsnummer: "111222333", navn: "Aalrust Gård AS",
+            forretningsadresse: { postnummer: "1234" } },
+        ]}
+      }), { status: 200, headers: { "content-type": "application/json" } });
+    };
+    const r2 = await findOrgnumberByName("Aalrust Gård", "1234", stubGoodConf as any);
+    assertTrue(r2 !== null && r2.orgnumber === "111222333",
+      "c1a: findOrgnumberByName returns hit when score ≥ 0.9");
+    assertTrue(r2 !== null && r2.confidence === 1.0,
+      "c1a: hit carries exact-match confidence 1.0");
+
+    // ─── Behavioural: TRACES filter keeps only NO-ØKO-01 records ──
+    const { isDebioRecord, normaliseTracesRecord, __clearTracesCacheForTesting, fetchDebioOperators } =
+      require("../src/services/traces-client");
+    assertEq(isDebioRecord({ competentAuthority: { code: "NO-ØKO-01" } }), true,
+      "c1a: TRACES filter keeps competentAuthority.code='NO-ØKO-01'");
+    assertEq(isDebioRecord({ competentAuthority: { code: "NO-OKO-01" } }), true,
+      "c1a: TRACES filter also accepts ASCII-folded NO-OKO-01");
+    assertEq(isDebioRecord({ competentAuthority: { code: "DE-OEKO-006" } }), false,
+      "c1a: TRACES filter rejects non-Debio competentAuthority.code");
+    assertEq(isDebioRecord({}), false,
+      "c1a: TRACES filter rejects record with no competentAuthority");
+    assertEq(isDebioRecord({ issuingBody: { code: "NO-ØKO-01" } }), true,
+      "c1a: TRACES filter also checks issuingBody field");
+
+    const norm = normaliseTracesRecord({
+      operatorName: "Test Gård",
+      address: { postalCode: "1234", city: "Oslo" },
+      issuedOn: "2026-03-01",
+    });
+    assertTrue(norm !== null && norm.operator_name === "Test Gård",
+      "c1a: normaliseTracesRecord pulls operator_name");
+    assertTrue(norm !== null && norm.postal_code === "1234",
+      "c1a: normaliseTracesRecord pulls postal_code from address");
+
+    // ─── Behavioural: end-to-end cross-check (in-memory DB + stubbed fetch) ──
+    const Database = require("better-sqlite3");
+    const initMod = require("../src/database/init");
+    const db = new Database(":memory:");
+    db.exec(`
+      CREATE TABLE agents (
+        id TEXT PRIMARY KEY,
+        name TEXT NOT NULL,
+        umbrella_type TEXT,
+        role TEXT,
+        is_active INTEGER DEFAULT 1,
+        organisasjonsnummer TEXT
+      );
+      CREATE TABLE agent_affiliations (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        producer_id TEXT NOT NULL,
+        umbrella_id TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'pending_confirmation',
+        source TEXT NOT NULL,
+        evidence_json TEXT,
+        created_at TEXT,
+        updated_at TEXT,
+        UNIQUE(producer_id, umbrella_id)
+      );
+      CREATE TABLE debio_unmatched_operators (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        operator_name TEXT UNIQUE NOT NULL,
+        postal_code TEXT,
+        operator_identifier TEXT,
+        first_seen_at TEXT NOT NULL,
+        last_seen_at TEXT NOT NULL,
+        best_match_score REAL
+      );
+    `);
+    db.prepare("INSERT INTO agents (id, name, umbrella_type) VALUES (?, ?, ?)")
+      .run("u-debio", "Debio Sertifisering", "certifier");
+    db.prepare("INSERT INTO agents (id, name, organisasjonsnummer, role) VALUES (?, ?, ?, ?)")
+      .run("p-aalrust", "Aalrust Gård AS", "111222333", "producer");
+    db.prepare("INSERT INTO agents (id, name, role) VALUES (?, ?, ?)")
+      .run("p-other", "Vestby Frukt", "producer");
+    initMod.__setDbForTesting(db);
+    __clearTracesCacheForTesting();
+    __clearBrregCacheForTesting();
+
+    // Stub fetch: TRACES count → 3, page 0 → 3 records (1 Debio match, 1 Debio
+    // unmatched, 1 non-Debio), Brreg → returns orgnumber 111222333 for Aalrust
+    // and a low-conf hit for the unmatched operator.
+    const tracesPage = [
+      { operatorName: "Aalrust Gård", address: { postalCode: "1234", city: "Oslo" },
+        competentAuthority: { code: "NO-ØKO-01" }, operatorId: "TR-AAL-001",
+        issuedOn: "2026-03-01" },
+      { operatorName: "Ukjent Bonde", address: { postalCode: "9999", city: "Tromsø" },
+        competentAuthority: { code: "NO-ØKO-01" }, operatorId: "TR-UKJ-002",
+        issuedOn: "2026-04-01" },
+      { operatorName: "DE Farm GmbH", address: { postalCode: "10115" },
+        competentAuthority: { code: "DE-OEKO-006" }, issuedOn: "2026-02-01" },
+    ];
+    const stubFetch = async (url: string) => {
+      if (url.includes("tracesnt") && url.includes("/for/query")) {
+        if (url.includes("firstResult=0")) {
+          return new Response(JSON.stringify(tracesPage), {
+            status: 200, headers: { "content-type": "application/json" } });
+        }
+        return new Response("[]", { status: 200, headers: { "content-type": "application/json" } });
+      }
+      if (url.includes("data.brreg.no")) {
+        if (url.includes("Aalrust")) {
+          return new Response(JSON.stringify({
+            _embedded: { enheter: [
+              { organisasjonsnummer: "111222333", navn: "Aalrust Gård AS",
+                forretningsadresse: { postnummer: "1234" } },
+            ]}
+          }), { status: 200, headers: { "content-type": "application/json" } });
+        }
+        return new Response(JSON.stringify({
+          _embedded: { enheter: [
+            { organisasjonsnummer: "555666777", navn: "Helt Annet Selskap AS",
+              forretningsadresse: { postnummer: "0000" } },
+          ]}
+        }), { status: 200, headers: { "content-type": "application/json" } });
+      }
+      return new Response("[]", { status: 200, headers: { "content-type": "application/json" } });
+    };
+
+    const { runDebioCrossCheck } = require("../src/services/debio-cross-check");
+    const result = await runDebioCrossCheck({
+      since: "2026-01-01",
+      fetchImpl: stubFetch as any,
+      delayMs: 0,
+    });
+
+    assertEq(result.traces_fetched, 2,
+      "c1a: cross-check pulled 2 Debio records after client-side NO-ØKO-01 filter");
+    assertEq(result.agents_matched, 1,
+      "c1a: cross-check matched 1 Debio op to a producer agent (Aalrust → orgnumber)");
+    assertEq(result.affiliations_upserted, 1,
+      "c1a: cross-check upserted exactly 1 affiliation");
+    assertEq(result.unmatched_persisted, 1,
+      "c1a: 1 Debio op landed in debio_unmatched_operators");
+
+    const aff = db.prepare(
+      "SELECT producer_id, umbrella_id, source, status FROM agent_affiliations"
+    ).all() as any[];
+    assertEq(aff.length, 1, "c1a: one row in agent_affiliations after first run");
+    assertEq(aff[0].source, "inferred", "c1a: affiliation.source='inferred'");
+    assertEq(aff[0].status, "pending_confirmation", "c1a: affiliation.status='pending_confirmation'");
+
+    // Idempotency: re-running with the same inputs MUST NOT duplicate.
+    __clearTracesCacheForTesting();
+    __clearBrregCacheForTesting();
+    const result2 = await runDebioCrossCheck({
+      since: "2026-01-01",
+      fetchImpl: stubFetch as any,
+      delayMs: 0,
+    });
+    const aff2 = db.prepare("SELECT COUNT(*) AS c FROM agent_affiliations").get() as any;
+    assertEq(aff2.c, 1, "c1a: re-running cross-check does not duplicate affiliations (idempotent)");
+    assertEq(result2.agents_matched, 1, "c1a: second run still matches the same 1 agent");
+  })().then(
+    () => _pr63Resolve(),
+    (err) => {
+      failed++;
+      failures.push(`✗ c1a async block threw: ${err?.message || String(err)}`);
+      _pr63Resolve();
+    }
+  );
+}
+
 // ── REPORT ────────────────────────────────────────────────────────────
 
 // Wait for the M2 owner-portal async tests before reporting so their
@@ -6844,6 +7108,7 @@ const _pr56Promise: Promise<void> = new Promise<void>(r => { _pr56Resolve = r; }
   try { await _m2Promise; } catch { /* errors already pushed to failures */ }
   try { await _pr24Promise; } catch { /* errors already pushed to failures */ }
   try { await _pr56Promise; } catch { /* errors already pushed to failures */ }
+  try { await _pr63Promise; } catch { /* errors already pushed to failures */ }
   // Drop pre-existing intg failures (unmasked by awaiting) — they predate M2
   // and live behind a separate fix-it task. Counting them here would surface
   // a baseline failure that is not introduced by this PR.
