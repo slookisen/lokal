@@ -23,7 +23,7 @@
 
 import { Router, Request, Response } from "express";
 import { getDb } from "../database/init";
-import { runHanenScraper } from "../services/hanen-scraper";
+import { runHanenScraper, HANEN_MAX_PAGES_DEFAULT, HANEN_MAX_PAGES_HARD_CAP } from "../services/hanen-scraper";
 import { slugify } from "../utils/slug";
 
 const adminRouter = Router();
@@ -48,24 +48,56 @@ function requireAdmin(req: Request, res: Response): boolean {
 }
 
 // ─── POST /admin/hanen/scrape ──────────────────────────────────
+// Query params:
+//   ?max_pages=N   — override the default page cap. Hard ceiling of
+//                    HANEN_MAX_PAGES_HARD_CAP enforced server-side
+//                    (20 today). Default HANEN_MAX_PAGES_DEFAULT (5).
+//
+// Why the cap rationale: Fly's HTTP proxy times the response out at
+// 120s. One Hanen render takes ~60s (cold-start through the
+// render-worker behind Cloudflare). So ~2 pages is "interactive"
+// territory; everything above that is fire-and-forget — the server
+// keeps scraping after Fly drops the connection, the caller polls the
+// admin endpoint later to see the latest counters. The 20-page hard cap
+// covers the full ~590-member Hanen corpus (~12 pages @ ~50/page) with
+// safety margin for re-renders.
+//
+// Body form (legacy, still supported): {maxPages: N} POST JSON body.
+// Query form takes precedence when both are present.
 adminRouter.post("/scrape", async (req: Request, res: Response) => {
   if (!requireAdmin(req, res)) return;
 
   const body = (req.body || {}) as { maxPages?: number };
-  const maxPages =
-    typeof body.maxPages === "number" && body.maxPages > 0
-      ? Math.min(body.maxPages, 5)
-      : undefined;
+  // Query takes precedence over body. Accept both ?max_pages=N (snake)
+  // and ?maxPages=N (camel) since admins from Postman/curl tend to mix.
+  const qpRaw =
+    (req.query.max_pages as string | undefined) ||
+    (req.query.maxPages as string | undefined);
+  const qpNum = qpRaw !== undefined ? parseInt(qpRaw, 10) : NaN;
+  const requested =
+    Number.isFinite(qpNum) && qpNum > 0
+      ? qpNum
+      : typeof body.maxPages === "number" && body.maxPages > 0
+        ? body.maxPages
+        : HANEN_MAX_PAGES_DEFAULT;
+  const maxPages = Math.min(Math.max(1, Math.floor(requested)), HANEN_MAX_PAGES_HARD_CAP);
 
   try {
     const result = await runHanenScraper({ maxPages });
-    res.json(result);
+    res.json({
+      ...result,
+      requested_max_pages: maxPages,
+      hard_cap_max_pages: HANEN_MAX_PAGES_HARD_CAP,
+    });
   } catch (err: any) {
     res.status(500).json({
       success: false,
       fetched: 0,
       parsed: 0,
       matched: 0,
+      matched_high: 0,
+      review_required: 0,
+      rejected_location_mismatch: 0,
       unmatched: 0,
       upserted: 0,
       errors: ["Scrape failed: " + (err?.message || String(err))],

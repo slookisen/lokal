@@ -1578,7 +1578,7 @@ function initSchema(db: Database.Database): void {
       producer_id TEXT NOT NULL,
       umbrella_id TEXT NOT NULL,
       status TEXT NOT NULL DEFAULT 'pending_confirmation'
-        CHECK(status IN ('pending_confirmation','active','historical','rejected')),
+        CHECK(status IN ('pending_confirmation','active','historical','rejected','review_required')),
       source TEXT NOT NULL
         CHECK(source IN ('self_claimed','scraped','admin','umbrella_confirmed','inferred')),
       labels TEXT,                          -- JSON array of label keys
@@ -1673,6 +1673,64 @@ function initSchema(db: Database.Database): void {
     }
   } catch (e) {
     console.warn("[init][pr-58] source-CHECK widening skipped:", e instanceof Error ? e.message : String(e));
+  }
+
+  // ─── PR-64 (2026-05-16): widen status CHECK to include 'review_required' ──
+  // Adds a fifth allowed status used by the Hanen matcher v2 for MEDIUM-
+  // confidence matches that need human triage before the producer is
+  // exposed publicly as a Hanen member. Mirrors the PR-58 rebuild
+  // pattern exactly — idempotent: only runs when the current CHECK
+  // doesn't already include 'review_required'.
+  try {
+    const schemaRow = db.prepare(
+      "SELECT sql FROM sqlite_master WHERE type='table' AND name='agent_affiliations'"
+    ).get() as { sql: string } | undefined;
+    const needsRebuild = schemaRow && !/'review_required'/.test(schemaRow.sql);
+    if (needsRebuild) {
+      const tx = db.transaction(() => {
+        db.exec(`
+          CREATE TABLE agent_affiliations__pr64_new (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            producer_id TEXT NOT NULL,
+            umbrella_id TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'pending_confirmation'
+              CHECK(status IN ('pending_confirmation','active','historical','rejected','review_required')),
+            source TEXT NOT NULL
+              CHECK(source IN ('self_claimed','scraped','admin','umbrella_confirmed','inferred')),
+            labels TEXT,
+            notes TEXT,
+            joined_at TEXT,
+            confirmed_at TEXT,
+            expires_at TEXT,
+            field_provenance TEXT,
+            evidence_json TEXT,
+            created_at TEXT DEFAULT (datetime('now')),
+            updated_at TEXT DEFAULT (datetime('now')),
+            UNIQUE(producer_id, umbrella_id),
+            FOREIGN KEY (producer_id) REFERENCES agents(id) ON DELETE CASCADE,
+            FOREIGN KEY (umbrella_id) REFERENCES agents(id) ON DELETE CASCADE
+          )
+        `);
+        db.exec(`
+          INSERT INTO agent_affiliations__pr64_new
+            (id, producer_id, umbrella_id, status, source, labels, notes,
+             joined_at, confirmed_at, expires_at, field_provenance,
+             evidence_json, created_at, updated_at)
+          SELECT id, producer_id, umbrella_id, status, source, labels, notes,
+                 joined_at, confirmed_at, expires_at, field_provenance,
+                 evidence_json, created_at, updated_at
+          FROM agent_affiliations
+        `);
+        db.exec(`DROP TABLE agent_affiliations`);
+        db.exec(`ALTER TABLE agent_affiliations__pr64_new RENAME TO agent_affiliations`);
+        db.exec(`CREATE INDEX IF NOT EXISTS idx_affiliations_producer ON agent_affiliations(producer_id, status)`);
+        db.exec(`CREATE INDEX IF NOT EXISTS idx_affiliations_umbrella ON agent_affiliations(umbrella_id, status)`);
+      });
+      tx();
+      console.log("[init][pr-64] agent_affiliations.status CHECK widened to include 'review_required'");
+    }
+  } catch (e) {
+    console.warn("[init][pr-64] status-CHECK widening skipped:", e instanceof Error ? e.message : String(e));
   }
 
   // 5.11.A1.4 — Optional partial index on umbrella agents (umbrella_type IS NOT NULL)

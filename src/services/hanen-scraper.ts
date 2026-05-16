@@ -31,7 +31,8 @@
 
 import { getDb } from "../database/init";
 import { renderPage } from "./render-client";
-import { nameSimilarity } from "./name-matcher";
+import { nameSimilarity, nameVariants } from "./name-matcher";
+import { cityToFylke, fylkerMatch, normaliseFylke } from "./norway-fylke";
 
 const LISTING_URL = "https://hanen.no/medlemmer";
 
@@ -46,9 +47,19 @@ const MATCH_THRESHOLD = 0.85;
 // 120s Fly admin endpoint cap (60s render + 30s parse/match/upsert + slack).
 const RENDER_TIMEOUT_MS = 60000;
 
-// Hard ceiling on pages to crawl if Hanen ever switches to paged URLs
-// (?page=N). Defensive; today's site is single-page.
+// Default ceiling on pages to crawl. Hanen's /medlemmer ships ~50
+// members per WordPress page, total membership ~590, so a full sweep
+// needs ~12 pages. We default to 5 (one HTTP call ≈ 60s render * 5 ~=
+// 5min, well past Fly's 120s proxy cap — see HANEN_MAX_PAGES_HARD_CAP
+// note below for why this is still fire-and-forget territory).
 const MAX_PAGES = 5;
+
+// Hard cap on the ?max_pages query param. Above 20 the cumulative
+// wall time (~20min) is well past any HTTP deadline; the server keeps
+// running after Fly cuts the response but callers can no longer see
+// progress. 20 was chosen as enough to comfortably cover the full
+// ~590-member Hanen corpus (~12 pages) with safety margin.
+const MAX_PAGES_HARD_CAP = 20;
 
 export type HanenMemberRecord = {
   parsed_name: string;
@@ -62,15 +73,48 @@ export type HanenScrapeResult = {
   success: boolean;
   fetched: number;                // raw HTML pages fetched (typically 1)
   parsed: number;                 // distinct members extracted from HTML
-  matched: number;                // members matched ≥ MATCH_THRESHOLD
-  unmatched: number;              // members logged to unmatched table
+  matched: number;                // members matched ≥ MATCH_THRESHOLD (HIGH+MEDIUM)
+  matched_high: number;           // PR-64: HIGH-confidence matches only
+  review_required: number;        // PR-64: MEDIUM-confidence matches (auto-attached as review_required, or pending_confirmation+evidence flag if widening unavailable)
+  rejected_location_mismatch: number; // PR-64: matches above-threshold but rejected on fylke conflict
+  unmatched: number;              // members logged to unmatched table (below-threshold)
   upserted: number;               // agent_affiliations rows written
   errors: string[];
 };
 
-export type HanenMatchVerdict =
-  | { agent_id: string; score: number; method: "name_dice" }
-  | { agent_id: null; score: number; method: "below_threshold" };
+// ─── matcher verdict types (PR-64) ─────────────────────────────
+// PR-64 widened the single-signal { name_dice | below_threshold } verdict
+// to a multi-signal scorer that combines name-Dice + location-fylke
+// agreement and emits one of seven methods with a HIGH/MEDIUM/null
+// confidence tier.
+//
+// Confidence semantics:
+//   "high"   → auto-attach as pending_confirmation, no human required.
+//   "medium" → attach as review_required (or pending_confirmation +
+//              evidence_json.match_confidence='medium' as fallback) so
+//              admin UI can surface it for triage.
+//   null     → no match emitted; logged to hanen_unmatched_members.
+export type MatchConfidence = "high" | "medium" | null;
+
+export type MatchVerdict = {
+  agent_id: string | null;
+  score: number;
+  method:
+    | "exact_name_with_location"
+    | "dice_high_with_location"
+    | "dice_high_no_location"
+    | "dice_medium_with_location"
+    | "below_threshold"
+    | "location_mismatch_rejection";
+  confidence: MatchConfidence;
+  location_check: "match" | "mismatch" | "unknown";
+};
+
+// Backwards-compat alias for callers/tests that imported the old name.
+// The old discriminated union is retained as a structural subset of the
+// new MatchVerdict (agent_id + score + method) so existing test code
+// continues to compile.
+export type HanenMatchVerdict = MatchVerdict;
 
 // ─── 1. fetchHanenListing ──────────────────────────────────────
 // Renders hanen.no/medlemmer through the render-worker. Returns the
@@ -85,7 +129,10 @@ export async function fetchHanenListing(
     renderer?: (url: string) => Promise<string>;
   }
 ): Promise<{ pages: Array<{ url: string; html: string }>; errors: string[] }> {
-  const cap = Math.min(opts?.maxPages ?? MAX_PAGES, MAX_PAGES);
+  // Respect the caller's maxPages but never exceed the hard cap. The
+  // default (MAX_PAGES) is conservative; admin callers ramp via
+  // ?max_pages=N when running a one-off full sweep.
+  const cap = Math.min(opts?.maxPages ?? MAX_PAGES, MAX_PAGES_HARD_CAP);
   const errors: string[] = [];
   const pages: Array<{ url: string; html: string }> = [];
 
@@ -301,26 +348,148 @@ export function parseHanenMembers(html: string, sourceUrl: string): HanenMemberR
   return out;
 }
 
-// ─── 3. matchHanenMemberToAgent ────────────────────────────────
-// Returns the best-scoring agent above MATCH_THRESHOLD or null. Pulls
-// every active producer (umbrella_type IS NULL) once and scores each
-// with Dice. At ~1500 producers × N Hanen members this is O(N·1500) —
-// fast enough (<1s for 500 members on a warm SQLite cache).
+// ─── 3. matchHanenMemberToAgent (PR-64: location-aware multi-signal) ──
+// PR-64 hardening:
+//   - Generate multiple normalised variants of each name (org/farm
+//     suffix stripped, first-word fallback) and take the MAX Dice over
+//     the cross product. Pulls "Heim Gård AS" ↔ "Heim Gardsbutikk"
+//     above threshold without weakening the global cut-off.
+//   - Compare member.parsed_location (a fylke string from Hanen's
+//     hanen_county-<fylke> class) against the agent's city
+//     (mapped through cityToFylke()). location_check ∈ {match,
+//     mismatch, unknown}.
+//   - Decision tree (in order, first hit wins):
+//       Dice == 1.0 AND location match  → HIGH  exact_name_with_location
+//       Dice ≥ 0.95  AND location match  → HIGH  dice_high_with_location
+//       Dice ≥ 0.95  AND location mismatch → REJECT location_mismatch_rejection
+//       Dice ≥ 0.95  AND location unknown  → MEDIUM dice_high_no_location
+//       Dice ≥ 0.85  AND location match  → MEDIUM dice_medium_with_location
+//       Dice ≥ 0.85  AND location mismatch → REJECT location_mismatch_rejection
+//       otherwise                          → null  below_threshold
+//
+// The 0.95 + mismatch and 0.85 + mismatch REJECTs are the false-positive
+// defense: Norwegian farm names recur across the country ("Liset Gård"
+// in both Oslo and Trøndelag). Dice alone would auto-attach to the
+// wrong family.
+//
+// O(N · M · |variants|²) — for the typical 50 members × ~1500 producers
+// × ~4 variants per side = ~1.2M Dice calls per scrape run. Each Dice
+// is O(L) on the bigrams, L ~= 15 chars → still well under 1s wall.
 export function matchHanenMemberToAgent(
   member: HanenMemberRecord,
   agents: Array<{ id: string; name: string; city: string | null }>
-): HanenMatchVerdict {
-  let best: { id: string; score: number } | null = null;
+): MatchVerdict {
+  // Member-side: variants of the parsed Hanen name + fylke from the
+  // hanen_county-<fylke> class (or empty string if unknown).
+  const memberVariants = nameVariants(member.parsed_name);
+  const memberFylke = normaliseFylke(member.parsed_location);
+
+  // Pick highest-Dice agent across all (member_variant × agent_variant) pairs.
+  let best: { id: string; score: number; locationCheck: "match" | "mismatch" | "unknown" } | null = null;
   for (const a of agents) {
-    const score = nameSimilarity(member.parsed_name, a.name);
-    if (!best || score > best.score) {
-      best = { id: a.id, score };
+    const agentVariants = nameVariants(a.name);
+    let bestForAgent = 0;
+    for (const mv of memberVariants) {
+      for (const av of agentVariants) {
+        // Use raw diceCoefficient via nameSimilarity for symmetric
+        // normalisation. Variants are already normalised so this is a
+        // no-op normalise + Dice on bigrams.
+        const s = nameSimilarity(mv, av);
+        if (s > bestForAgent) bestForAgent = s;
+      }
+    }
+    if (!best || bestForAgent > best.score) {
+      // Compute location_check for this candidate. Done inside the
+      // loop because the winning candidate's location is what we
+      // report, not the global best location.
+      const agentFylke = cityToFylke(a.city);
+      let locationCheck: "match" | "mismatch" | "unknown";
+      if (memberFylke && agentFylke) {
+        locationCheck = fylkerMatch(memberFylke, agentFylke) ? "match" : "mismatch";
+      } else {
+        locationCheck = "unknown";
+      }
+      best = { id: a.id, score: bestForAgent, locationCheck };
     }
   }
-  if (best && best.score >= MATCH_THRESHOLD) {
-    return { agent_id: best.id, score: best.score, method: "name_dice" };
+
+  if (!best) {
+    return {
+      agent_id: null,
+      score: 0,
+      method: "below_threshold",
+      confidence: null,
+      location_check: "unknown",
+    };
   }
-  return { agent_id: null, score: best?.score ?? 0, method: "below_threshold" };
+
+  const score = best.score;
+  const loc = best.locationCheck;
+
+  // Decision tree — first matching rule wins.
+  if (score === 1.0 && loc === "match") {
+    return {
+      agent_id: best.id,
+      score,
+      method: "exact_name_with_location",
+      confidence: "high",
+      location_check: loc,
+    };
+  }
+  if (score >= 0.95 && loc === "match") {
+    return {
+      agent_id: best.id,
+      score,
+      method: "dice_high_with_location",
+      confidence: "high",
+      location_check: loc,
+    };
+  }
+  if (score >= 0.95 && loc === "mismatch") {
+    return {
+      agent_id: null,
+      score,
+      method: "location_mismatch_rejection",
+      confidence: null,
+      location_check: loc,
+    };
+  }
+  if (score >= 0.95 && loc === "unknown") {
+    return {
+      agent_id: best.id,
+      score,
+      method: "dice_high_no_location",
+      confidence: "medium",
+      location_check: loc,
+    };
+  }
+  if (score >= MATCH_THRESHOLD && loc === "match") {
+    return {
+      agent_id: best.id,
+      score,
+      method: "dice_medium_with_location",
+      confidence: "medium",
+      location_check: loc,
+    };
+  }
+  if (score >= MATCH_THRESHOLD && loc === "mismatch") {
+    return {
+      agent_id: null,
+      score,
+      method: "location_mismatch_rejection",
+      confidence: null,
+      location_check: loc,
+    };
+  }
+  // Below threshold — no match, but the score is preserved so the
+  // unmatched-table row can record how close we got.
+  return {
+    agent_id: null,
+    score,
+    method: "below_threshold",
+    confidence: null,
+    location_check: loc,
+  };
 }
 
 // ─── 4. runHanenScraper ────────────────────────────────────────
@@ -337,6 +506,9 @@ export async function runHanenScraper(opts?: {
     fetched: 0,
     parsed: 0,
     matched: 0,
+    matched_high: 0,
+    review_required: 0,
+    rejected_location_mismatch: 0,
     unmatched: 0,
     upserted: 0,
     errors: [],
@@ -400,32 +572,61 @@ export async function runHanenScraper(opts?: {
     return result;
   }
 
-  // 3. Load matching corpus once (active producers only).
+  // 3. Load matching corpus once. PR-64: tightened to role='producer'
+  // (excludes consumer/quality/logistics/price-intel agents per reviewer
+  // note on PR-62 — they should never be tagged as Hanen members).
   let agents: Array<{ id: string; name: string; city: string | null }> = [];
   try {
     agents = db.prepare(
-      "SELECT id, name, city FROM agents WHERE is_active = 1 AND (umbrella_type IS NULL OR umbrella_type = '')"
+      "SELECT id, name, city FROM agents WHERE is_active = 1 AND (umbrella_type IS NULL OR umbrella_type = '') AND role = 'producer'"
     ).all() as Array<{ id: string; name: string; city: string | null }>;
   } catch (e) {
     result.errors.push(`producer corpus load failed: ${e instanceof Error ? e.message : String(e)}`);
     return result;
   }
 
-  // 4. Match + upsert.
-  // INSERT OR IGNORE on agent_affiliations relies on the UNIQUE
-  // (producer_id, umbrella_id) constraint declared in init.ts. On
-  // conflict we leave the existing row alone (it may have been
-  // already accepted/rejected by the producer). Updating evidence_json
-  // for an existing pending_confirmation row IS done so re-scrapes
-  // refresh match_score + scraped_at — matters if Hanen renames a
-  // member and our match score improves.
+  // 4. Match + upsert. PR-64 three-tier writeback:
+  //   - HIGH confidence  → INSERT with status='pending_confirmation' (today's behaviour)
+  //   - MEDIUM confidence → INSERT with status='review_required' if the
+  //                         CHECK widening is in place; FALLBACK to
+  //                         'pending_confirmation' with evidence_json.match_confidence='medium'
+  //                         so admin UI can still surface it.
+  //   - location_mismatch_rejection → log to hanen_unmatched_members
+  //                         with best_match_score=-1 to differentiate
+  //                         from "no name match" (which uses the real score)
+  //   - below_threshold  → log to hanen_unmatched_members as today
+  //
+  // INSERT … ON CONFLICT on the UNIQUE (producer_id, umbrella_id)
+  // constraint keeps reruns idempotent. We refresh evidence_json only
+  // when the existing status is still pending_confirmation or
+  // review_required (i.e. not yet acted on by the producer/admin).
+
+  // Detect whether the schema migration widened the status CHECK to
+  // include 'review_required'. If not, we keep MEDIUM matches as
+  // pending_confirmation + evidence flag. Cached per-call; the schema
+  // doesn't change mid-process.
+  let statusCheckIncludesReviewRequired = false;
+  try {
+    const schemaRow = db.prepare(
+      "SELECT sql FROM sqlite_master WHERE type='table' AND name='agent_affiliations'"
+    ).get() as { sql: string } | undefined;
+    statusCheckIncludesReviewRequired = !!(schemaRow && /'review_required'/.test(schemaRow.sql));
+  } catch {
+    // tolerate — fall back to pending_confirmation
+  }
+
   const insertAff = db.prepare(`
     INSERT INTO agent_affiliations
       (producer_id, umbrella_id, status, source, evidence_json, created_at, updated_at)
-    VALUES (?, ?, 'pending_confirmation', 'inferred', ?, ?, ?)
+    VALUES (?, ?, ?, 'inferred', ?, ?, ?)
     ON CONFLICT(producer_id, umbrella_id) DO UPDATE SET
+      status = CASE
+        WHEN agent_affiliations.status IN ('pending_confirmation','review_required')
+          THEN excluded.status
+        ELSE agent_affiliations.status
+      END,
       evidence_json = CASE
-        WHEN agent_affiliations.status = 'pending_confirmation'
+        WHEN agent_affiliations.status IN ('pending_confirmation','review_required')
           THEN excluded.evidence_json
         ELSE agent_affiliations.evidence_json
       END,
@@ -446,7 +647,7 @@ export async function runHanenScraper(opts?: {
 
   const nowIso = new Date().toISOString();
   for (const member of members) {
-    let verdict: HanenMatchVerdict;
+    let verdict: MatchVerdict;
     try {
       verdict = matchHanenMemberToAgent(member, agents);
     } catch (e) {
@@ -454,8 +655,9 @@ export async function runHanenScraper(opts?: {
       continue;
     }
 
-    if (verdict.agent_id) {
+    if (verdict.agent_id && verdict.confidence === "high") {
       result.matched++;
+      result.matched_high++;
       const evidence = {
         source: "hanen.no/medlemmer",
         umbrella_slug: "hanen",
@@ -466,14 +668,77 @@ export async function runHanenScraper(opts?: {
         parsed_category: member.parsed_category,
         match_score: verdict.score,
         match_method: verdict.method,
+        match_confidence: "high",
+        location_check: verdict.location_check,
       };
       try {
-        insertAff.run(verdict.agent_id, umbrella.id, JSON.stringify(evidence), nowIso, nowIso);
+        insertAff.run(
+          verdict.agent_id,
+          umbrella.id,
+          "pending_confirmation",
+          JSON.stringify(evidence),
+          nowIso,
+          nowIso,
+        );
         result.upserted++;
       } catch (e) {
         result.errors.push(`upsert affiliation for "${member.parsed_name}" failed: ${e instanceof Error ? e.message : String(e)}`);
       }
+    } else if (verdict.agent_id && verdict.confidence === "medium") {
+      result.matched++;
+      result.review_required++;
+      const targetStatus = statusCheckIncludesReviewRequired
+        ? "review_required"
+        : "pending_confirmation";
+      const evidence = {
+        source: "hanen.no/medlemmer",
+        umbrella_slug: "hanen",
+        scraped_at: nowIso,
+        parsed_name: member.parsed_name,
+        parsed_location: member.parsed_location,
+        parsed_website: member.parsed_website,
+        parsed_category: member.parsed_category,
+        match_score: verdict.score,
+        match_method: verdict.method,
+        match_confidence: "medium",
+        location_check: verdict.location_check,
+        // review_required flag carries even if we couldn't promote the
+        // row's status — admin UI can pivot on this field alone.
+        review_required: true,
+      };
+      try {
+        insertAff.run(
+          verdict.agent_id,
+          umbrella.id,
+          targetStatus,
+          JSON.stringify(evidence),
+          nowIso,
+          nowIso,
+        );
+        result.upserted++;
+      } catch (e) {
+        result.errors.push(`upsert affiliation for "${member.parsed_name}" failed: ${e instanceof Error ? e.message : String(e)}`);
+      }
+    } else if (verdict.method === "location_mismatch_rejection") {
+      // Above-threshold name match REJECTED on fylke conflict. Log to
+      // unmatched table with best_match_score=-1 so admin triage can
+      // distinguish "false-positive prevented" from "no match found".
+      result.rejected_location_mismatch++;
+      try {
+        insertUnmatched.run(
+          member.parsed_name,
+          member.parsed_location,
+          member.parsed_website,
+          member.parsed_category,
+          member.source_url,
+          -1,
+          nowIso,
+        );
+      } catch (e) {
+        result.errors.push(`upsert location-rejected "${member.parsed_name}" failed: ${e instanceof Error ? e.message : String(e)}`);
+      }
     } else {
+      // below_threshold — no name match strong enough. Log the real score.
       result.unmatched++;
       try {
         insertUnmatched.run(
@@ -571,3 +836,5 @@ function normaliseJsonMember(m: any, sourceUrl: string): HanenMemberRecord | nul
 // Exported constants so tests + the admin route can sanity-check.
 export const HANEN_MATCH_THRESHOLD = MATCH_THRESHOLD;
 export const HANEN_LISTING_URL = LISTING_URL;
+export const HANEN_MAX_PAGES_DEFAULT = MAX_PAGES;
+export const HANEN_MAX_PAGES_HARD_CAP = MAX_PAGES_HARD_CAP;

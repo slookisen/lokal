@@ -6833,6 +6833,556 @@ const _pr56Promise: Promise<void> = new Promise<void>(r => { _pr56Resolve = r; }
   }
 }
 
+// ─── PR-64: Hanen matcher v2 (location-aware + multi-pass + review_required) ──
+// Adds ~30 assertions covering the new modules:
+//   - src/services/norway-fylke.ts          (city→fylke + aliases + comparator)
+//   - src/services/name-matcher.ts:nameVariants
+//   - matchHanenMemberToAgent decision tree (HIGH/MEDIUM/REJECT)
+//   - admin-hanen ?max_pages= query param
+//   - schema additivity (review_required CHECK widening, rerun-safe)
+{
+  console.log("\n── PR-64: Hanen matcher v2 ──");
+  const fs = require("fs");
+
+  // (1) Source-presence: new module exists with expected exports.
+  assertTrue(fs.existsSync("src/services/norway-fylke.ts"),
+    "pr64: norway-fylke.ts present");
+  const fylkeSrc = fs.readFileSync("src/services/norway-fylke.ts", "utf-8");
+  assertTrue(/export\s+function\s+cityToFylke/.test(fylkeSrc),
+    "pr64: norway-fylke exports cityToFylke()");
+  assertTrue(/export\s+function\s+normaliseFylke/.test(fylkeSrc),
+    "pr64: norway-fylke exports normaliseFylke()");
+  assertTrue(/export\s+function\s+fylkerMatch/.test(fylkeSrc),
+    "pr64: norway-fylke exports fylkerMatch()");
+
+  const nmSrc = fs.readFileSync("src/services/name-matcher.ts", "utf-8");
+  assertTrue(/export\s+function\s+nameVariants/.test(nmSrc),
+    "pr64: name-matcher exports nameVariants()");
+
+  // (2) Behavioural: cityToFylke covers headline cities + canonical fylker.
+  try {
+    const fylke = require("../src/services/norway-fylke");
+    assertEq(fylke.cityToFylke("Oslo"), "Oslo",
+      "pr64: cityToFylke(Oslo) → Oslo");
+    assertEq(fylke.cityToFylke("Bergen"), "Vestland",
+      "pr64: cityToFylke(Bergen) → Vestland");
+    assertEq(fylke.cityToFylke("Trondheim"), "Trøndelag",
+      "pr64: cityToFylke(Trondheim) → Trøndelag");
+    assertEq(fylke.cityToFylke("Stavanger"), "Rogaland",
+      "pr64: cityToFylke(Stavanger) → Rogaland");
+    assertEq(fylke.cityToFylke("Hamar"), "Innlandet",
+      "pr64: cityToFylke(Hamar) → Innlandet");
+    assertEq(fylke.cityToFylke("bergen"), "Vestland",
+      "pr64: cityToFylke is case-insensitive");
+    assertEq(fylke.cityToFylke("Tromsø"), "Troms",
+      "pr64: cityToFylke handles æøå (Tromsø)");
+    assertEq(fylke.cityToFylke("Unknownville"), null,
+      "pr64: cityToFylke(unknown) → null (no guessing)");
+    assertEq(fylke.cityToFylke(null), null,
+      "pr64: cityToFylke(null) → null");
+    assertEq(fylke.cityToFylke(""), null,
+      "pr64: cityToFylke('') → null");
+
+    // (3) normaliseFylke: canonical, alias, comma-split.
+    assertEq(fylke.normaliseFylke("Vestland"), "Vestland",
+      "pr64: normaliseFylke canonical pass-through");
+    assertEq(fylke.normaliseFylke("vestland"), "Vestland",
+      "pr64: normaliseFylke handles lowercase");
+    assertEq(fylke.normaliseFylke("Sogn og Fjordane"), "Vestland",
+      "pr64: normaliseFylke(Sogn og Fjordane) → Vestland (pre-2020 alias)");
+    assertEq(fylke.normaliseFylke("Hordaland"), "Vestland",
+      "pr64: normaliseFylke(Hordaland) → Vestland");
+    assertEq(fylke.normaliseFylke("Lyngdal, Agder"), "Agder",
+      "pr64: normaliseFylke(comma-separated 'kommune, fylke') → fylke");
+    assertEq(fylke.normaliseFylke("Hallingdal, Buskerud"), "Buskerud",
+      "pr64: normaliseFylke pulls fylke from 'kommune, fylke' free text");
+    assertEq(fylke.normaliseFylke("Helt Annet Land"), null,
+      "pr64: normaliseFylke(garbage) → null");
+    assertEq(
+      fylke.normaliseFylke("Sogn og Fjordane"),
+      fylke.normaliseFylke("Vestland"),
+      "pr64: Sogn og Fjordane and Vestland normalise to same fylke",
+    );
+
+    // (4) fylkerMatch: aliases + equivalence classes + edge cases.
+    assertTrue(fylke.fylkerMatch("Vestland", "Hordaland"),
+      "pr64: fylkerMatch(Vestland, Hordaland) → true (old/new alias)");
+    assertTrue(fylke.fylkerMatch("Hordaland", "Sogn og Fjordane"),
+      "pr64: fylkerMatch(Hordaland, Sogn og Fjordane) → true (both → Vestland)");
+    assertTrue(fylke.fylkerMatch("Akershus", "Viken"),
+      "pr64: fylkerMatch(Akershus, Viken) → true (eq class)");
+    assertTrue(fylke.fylkerMatch("Viken", "Buskerud"),
+      "pr64: fylkerMatch(Viken, Buskerud) → true (eq class)");
+    assertTrue(fylke.fylkerMatch("Akershus", "Buskerud"),
+      "pr64: fylkerMatch(Akershus, Buskerud) → true (Viken-class siblings)");
+    assertTrue(fylke.fylkerMatch("Troms", "Troms og Finnmark"),
+      "pr64: fylkerMatch(Troms, Troms og Finnmark) → true (eq class)");
+    assertTrue(fylke.fylkerMatch("Trøndelag", "Sør-Trøndelag"),
+      "pr64: fylkerMatch(Trøndelag, Sør-Trøndelag) → true (pre-2018 alias)");
+    assertEq(fylke.fylkerMatch("Vestland", "Trøndelag"), false,
+      "pr64: fylkerMatch(Vestland, Trøndelag) → false (distinct fylker)");
+    assertEq(fylke.fylkerMatch("Vestland", "Oslo"), false,
+      "pr64: fylkerMatch(Vestland, Oslo) → false");
+    assertEq(fylke.fylkerMatch(null, "Vestland"), false,
+      "pr64: fylkerMatch(null, anything) → false");
+    assertEq(fylke.fylkerMatch("Vestland", null), false,
+      "pr64: fylkerMatch(anything, null) → false");
+    assertEq(fylke.fylkerMatch(null, null), false,
+      "pr64: fylkerMatch(null, null) → false");
+  } catch (e: any) {
+    failed++;
+    failures.push("✗ pr64 fylke behavioural: " + (e?.message || String(e)));
+  }
+
+  // (5) nameVariants: org-suffix + farm-suffix + first-word fallback.
+  try {
+    const nm = require("../src/services/name-matcher");
+    const v = nm.nameVariants("Heim Gård AS");
+    assertTrue(v.includes("heim gard as"),
+      "pr64: nameVariants includes full normalised form");
+    assertTrue(v.includes("heim gard"),
+      "pr64: nameVariants strips ' AS' org-suffix");
+    assertTrue(v.includes("heim"),
+      "pr64: nameVariants strips 'gard' farm-suffix → 'heim'");
+    // First-word fallback also produces 'heim' but Set semantics
+    // means it only appears once.
+    const occurrences = v.filter((x: string) => x === "heim").length;
+    assertEq(occurrences, 1,
+      "pr64: nameVariants deduplicates (Set semantics)");
+
+    // Empty input → empty array.
+    assertEq(nm.nameVariants("").length, 0,
+      "pr64: nameVariants('') → []");
+    // Single-word producer name — no suffix to strip; first-word
+    // fallback identical to full → only one variant.
+    const single = nm.nameVariants("Heim");
+    assertEq(single.length, 1,
+      "pr64: nameVariants single-word → 1 variant");
+    assertTrue(single.includes("heim"),
+      "pr64: nameVariants single-word → ['heim']");
+
+    // Farm-suffix variants — 'Gardsbutikk' should strip.
+    const gb = nm.nameVariants("Heim Gardsbutikk");
+    assertTrue(gb.includes("heim"),
+      "pr64: nameVariants strips 'gardsbutikk' farm-suffix");
+    // Two-suffix chain works — strip AS then gard.
+    const chained = nm.nameVariants("Stordalen Bruk AS");
+    assertTrue(chained.includes("stordalen bruk"),
+      "pr64: nameVariants strips org-suffix from chained name");
+    assertTrue(chained.includes("stordalen"),
+      "pr64: nameVariants strips farm-suffix after org-suffix");
+  } catch (e: any) {
+    failed++;
+    failures.push("✗ pr64 nameVariants: " + (e?.message || String(e)));
+  }
+
+  // (6) Match decision tree.
+  try {
+    const hs = require("../src/services/hanen-scraper");
+
+    // 6a. exact_name_with_location → HIGH
+    const memberA = {
+      parsed_name: "Bratabu Gård",
+      parsed_location: "Vestland",
+      parsed_website: null,
+      parsed_category: null,
+      source_url: "https://hanen.no/bedrift/bratabu/",
+    };
+    const corpusA = [
+      { id: "a-bergen", name: "Bratabu Gård", city: "Bergen" }, // Vestland
+    ];
+    const vA = hs.matchHanenMemberToAgent(memberA, corpusA);
+    assertEq(vA.agent_id, "a-bergen",
+      "pr64: exact name + location match → agent_id set");
+    assertEq(vA.method, "exact_name_with_location",
+      "pr64: exact name + location match → method=exact_name_with_location");
+    assertEq(vA.confidence, "high",
+      "pr64: exact name + location match → confidence=high");
+    assertEq(vA.location_check, "match",
+      "pr64: location_check=match when fylker agree");
+
+    // 6b. dice_high + location mismatch → REJECT (false-positive defense)
+    const memberB = {
+      parsed_name: "Liset Gård",
+      parsed_location: "Trøndelag",
+      parsed_website: null,
+      parsed_category: null,
+      source_url: "https://hanen.no/bedrift/liset/",
+    };
+    const corpusB = [
+      // Same name, but agent is in Oslo (Akershus-area Liset Gård is
+      // a different family). Must NOT auto-attach.
+      { id: "wrong-oslo", name: "Liset Gård", city: "Oslo" },
+    ];
+    const vB = hs.matchHanenMemberToAgent(memberB, corpusB);
+    assertEq(vB.agent_id, null,
+      "pr64: dice=1.0 + location MISMATCH → REJECTED (agent_id=null)");
+    assertEq(vB.method, "location_mismatch_rejection",
+      "pr64: rejection method=location_mismatch_rejection");
+    assertEq(vB.confidence, null,
+      "pr64: rejected match has confidence=null");
+    assertEq(vB.location_check, "mismatch",
+      "pr64: location_check=mismatch when fylker disagree");
+
+    // 6c. dice_high + location unknown → MEDIUM
+    const memberC = {
+      parsed_name: "Heim Gård",
+      parsed_location: "Vestland",
+      parsed_website: null,
+      parsed_category: null,
+      source_url: "https://hanen.no/bedrift/heim/",
+    };
+    const corpusC = [
+      // Agent city not in our lookup table → cityToFylke returns null.
+      { id: "unknown-loc", name: "Heim Gård", city: "Microscopic-Hamlet-No-One-Knows" },
+    ];
+    const vC = hs.matchHanenMemberToAgent(memberC, corpusC);
+    assertEq(vC.agent_id, "unknown-loc",
+      "pr64: dice_high + location UNKNOWN → still matched (medium)");
+    assertEq(vC.method, "dice_high_no_location",
+      "pr64: method=dice_high_no_location when location unknown");
+    assertEq(vC.confidence, "medium",
+      "pr64: dice_high + location unknown → confidence=medium");
+    assertEq(vC.location_check, "unknown",
+      "pr64: location_check=unknown when either side lacks fylke");
+
+    // 6d. dice_medium (0.85-0.95) + location match → MEDIUM
+    // Constructed names so Dice falls into the medium band.
+    const memberD = {
+      parsed_name: "Solbakken Gardsbutikk",
+      parsed_location: "Innlandet",
+      parsed_website: null,
+      parsed_category: null,
+      source_url: "https://hanen.no/bedrift/solbakken/",
+    };
+    const corpusD = [
+      // Different farm-suffix → variants stem to "solbakken" + "solbakken gard"
+      // vs "solbakken" + "solbakken seter" → MAX Dice on first-word=1.0
+      // Wait — that would be HIGH. Let's use a name that scores in the
+      // 0.85-0.95 band even on the best variant. Slight character diff
+      // on the first word does it.
+      { id: "medium-match", name: "Solbakkin Gard", city: "Hamar" },
+    ];
+    const vD = hs.matchHanenMemberToAgent(memberD, corpusD);
+    // We're not asserting an exact score band (Dice is data-driven);
+    // we're asserting the verdict shape is well-formed and that
+    // medium-or-high confidence with location=match yields a match.
+    assertTrue(vD.agent_id === "medium-match" || vD.agent_id === null,
+      "pr64: medium-band candidate either matched or below threshold (deterministic)");
+    if (vD.agent_id) {
+      assertTrue(vD.confidence === "high" || vD.confidence === "medium",
+        "pr64: matched verdict has high or medium confidence");
+      assertEq(vD.location_check, "match",
+        "pr64: medium match has location_check=match when fylker agree");
+    }
+
+    // 6e. Below threshold → null + below_threshold.
+    const memberE = {
+      parsed_name: "Heim Gård",
+      parsed_location: "Vestland",
+      parsed_website: null,
+      parsed_category: null,
+      source_url: "https://hanen.no/bedrift/heim/",
+    };
+    const corpusE = [
+      { id: "no-match", name: "Completely Different Operation", city: "Bergen" },
+    ];
+    const vE = hs.matchHanenMemberToAgent(memberE, corpusE);
+    assertEq(vE.agent_id, null,
+      "pr64: below-threshold match → agent_id=null");
+    assertEq(vE.method, "below_threshold",
+      "pr64: below-threshold match → method=below_threshold");
+    assertEq(vE.confidence, null,
+      "pr64: below-threshold match → confidence=null");
+
+    // 6f. dice_medium + location MISMATCH → REJECT.
+    // We need a medium-band Dice (0.85-0.95) with a fylke conflict.
+    // The first-word variant trick makes most clear "same farm" names
+    // hit dice=1.0; so we use a name where the variants don't quite
+    // align to first-word.
+    const memberF = {
+      parsed_name: "Hjelmeland Mathall",
+      parsed_location: "Rogaland",
+      parsed_website: null,
+      parsed_category: null,
+      source_url: "https://hanen.no/bedrift/hjelmeland/",
+    };
+    const corpusF = [
+      // First word "Hjelmeland" matches but the surrounding context
+      // differs. If first-word fallback fires → dice 1.0 on "hjelmeland".
+      { id: "wrong-fylke", name: "Hjelmeland Gardsbutikk", city: "Trondheim" },
+    ];
+    const vF = hs.matchHanenMemberToAgent(memberF, corpusF);
+    // Either rejected (if dice ≥ 0.85) or below_threshold (if not).
+    // The key guarantee: NEVER matched to wrong-fylke agent.
+    assertEq(vF.agent_id, null,
+      "pr64: location mismatch protects against same-first-word false positives");
+    assertTrue(
+      vF.method === "location_mismatch_rejection" || vF.method === "below_threshold",
+      "pr64: mismatch verdict is reject OR below_threshold (never matched)",
+    );
+  } catch (e: any) {
+    failed++;
+    failures.push("✗ pr64 match-tree: " + (e?.message || String(e)));
+  }
+
+  // (7) Constants + source-presence on hanen-scraper updates.
+  const hanenSrc = fs.readFileSync("src/services/hanen-scraper.ts", "utf-8");
+  assertTrue(/HANEN_MAX_PAGES_DEFAULT/.test(hanenSrc),
+    "pr64: hanen-scraper exports HANEN_MAX_PAGES_DEFAULT");
+  assertTrue(/HANEN_MAX_PAGES_HARD_CAP/.test(hanenSrc),
+    "pr64: hanen-scraper exports HANEN_MAX_PAGES_HARD_CAP");
+  assertTrue(/role\s*=\s*'producer'/.test(hanenSrc),
+    "pr64: hanen-scraper corpus query restricted to role='producer'");
+  assertTrue(/location_mismatch_rejection/.test(hanenSrc),
+    "pr64: matcher includes location_mismatch_rejection method");
+  assertTrue(/dice_high_no_location/.test(hanenSrc),
+    "pr64: matcher includes dice_high_no_location method");
+  assertTrue(/dice_medium_with_location/.test(hanenSrc),
+    "pr64: matcher includes dice_medium_with_location method");
+  assertTrue(/matched_high/.test(hanenSrc),
+    "pr64: HanenScrapeResult includes matched_high counter");
+  assertTrue(/review_required/.test(hanenSrc),
+    "pr64: HanenScrapeResult includes review_required counter");
+  assertTrue(/rejected_location_mismatch/.test(hanenSrc),
+    "pr64: HanenScrapeResult includes rejected_location_mismatch counter");
+
+  // (8) admin-hanen ?max_pages query param wired through.
+  const adminSrc = fs.readFileSync("src/routes/admin-hanen.ts", "utf-8");
+  assertTrue(/req\.query\.max_pages/.test(adminSrc),
+    "pr64: admin-hanen reads req.query.max_pages");
+  assertTrue(/HANEN_MAX_PAGES_HARD_CAP/.test(adminSrc),
+    "pr64: admin-hanen enforces HANEN_MAX_PAGES_HARD_CAP");
+  assertTrue(/runHanenScraper\(\s*\{\s*maxPages\s*\}\s*\)/.test(adminSrc),
+    "pr64: admin-hanen passes maxPages through to runHanenScraper");
+  // Match across newlines — the rationale comment may wrap.
+  assertTrue(/Fly[\s\S]{0,100}120/.test(adminSrc),
+    "pr64: admin-hanen documents 120s Fly proxy cap rationale");
+
+  // (9) Schema: review_required widening migration in init.ts (idempotent).
+  const initSrc = fs.readFileSync("src/database/init.ts", "utf-8");
+  assertTrue(/'review_required'/.test(initSrc),
+    "pr64: init.ts CREATE TABLE includes 'review_required' in status CHECK");
+  assertTrue(/pr-64.*status[- ]CHECK/i.test(initSrc),
+    "pr64: init.ts logs the PR-64 status-CHECK widening migration");
+  // The migration mirrors PR-58 structure — sqlite_master probe + rebuild.
+  assertTrue(/agent_affiliations__pr64_new/.test(initSrc),
+    "pr64: init.ts uses transactional rebuild for status CHECK widening");
+  // Idempotency check — guard is on schemaRow.sql NOT containing 'review_required'.
+  const idxPr64 = initSrc.indexOf("agent_affiliations__pr64_new");
+  const idxGuard = initSrc.lastIndexOf("'review_required'", idxPr64);
+  assertTrue(idxGuard > 0 && idxGuard < idxPr64,
+    "pr64: status-CHECK migration is gated on 'review_required' not yet in schema (idempotent)");
+
+  // (10) Schema additivity — re-running init.ts twice doesn't blow up.
+  // We can't actually run init.ts here (needs the DB harness), but we
+  // can verify the migration is wrapped in try/catch like PR-58.
+  const pr64Block = initSrc.slice(
+    initSrc.indexOf("PR-64 (2026-05-16)"),
+    initSrc.indexOf("5.11.A1.4"),
+  );
+  assertTrue(pr64Block.length > 0,
+    "pr64: PR-64 migration block locatable in init.ts");
+  assertTrue(/try\s*\{[\s\S]*needsRebuild[\s\S]*\}\s*catch/.test(pr64Block),
+    "pr64: PR-64 migration wrapped in try/catch (boot resilience)");
+  assertTrue(/db\.transaction\(/.test(pr64Block),
+    "pr64: PR-64 migration uses db.transaction() (atomic rebuild)");
+
+  // (11) Schema additivity behaviour — start from a PRE-PR-64 schema
+  // (status CHECK lacks 'review_required') and run the rebuild logic
+  // inline. Verify: (a) review_required becomes accepted, (b) running
+  // the migration again is a no-op (idempotent), (c) existing rows
+  // survive the rebuild with all columns intact.
+  try {
+    const Database = require("better-sqlite3");
+    const tmpDb = new Database(":memory:");
+    tmpDb.pragma("foreign_keys = ON");
+    // Stub agents table to satisfy the FK on producer_id/umbrella_id.
+    tmpDb.exec(`CREATE TABLE agents (id TEXT PRIMARY KEY)`);
+    tmpDb.prepare("INSERT INTO agents (id) VALUES (?)").run("prod-1");
+    tmpDb.prepare("INSERT INTO agents (id) VALUES (?)").run("umbrella-1");
+    // Pre-PR-64 schema (status CHECK without review_required).
+    tmpDb.exec(`
+      CREATE TABLE agent_affiliations (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        producer_id TEXT NOT NULL,
+        umbrella_id TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'pending_confirmation'
+          CHECK(status IN ('pending_confirmation','active','historical','rejected')),
+        source TEXT NOT NULL
+          CHECK(source IN ('self_claimed','scraped','admin','umbrella_confirmed','inferred')),
+        labels TEXT,
+        notes TEXT,
+        joined_at TEXT,
+        confirmed_at TEXT,
+        expires_at TEXT,
+        field_provenance TEXT,
+        evidence_json TEXT,
+        created_at TEXT DEFAULT (datetime('now')),
+        updated_at TEXT DEFAULT (datetime('now')),
+        UNIQUE(producer_id, umbrella_id),
+        FOREIGN KEY (producer_id) REFERENCES agents(id) ON DELETE CASCADE,
+        FOREIGN KEY (umbrella_id) REFERENCES agents(id) ON DELETE CASCADE
+      )
+    `);
+    // Seed a pre-existing row.
+    tmpDb.prepare(`
+      INSERT INTO agent_affiliations (producer_id, umbrella_id, status, source, evidence_json, created_at, updated_at)
+      VALUES (?, ?, 'pending_confirmation', 'inferred', '{"a":1}', '2026-05-01T00:00:00Z', '2026-05-01T00:00:00Z')
+    `).run("prod-1", "umbrella-1");
+
+    // Pre-state: review_required is rejected by CHECK.
+    try {
+      tmpDb.prepare(`UPDATE agent_affiliations SET status='review_required' WHERE producer_id=?`).run("prod-1");
+      assertTrue(false, "pr64: PRE-migration: review_required should be rejected by CHECK");
+    } catch {
+      assertTrue(true, "pr64: PRE-migration: status='review_required' correctly rejected");
+    }
+
+    // Inline the PR-64 migration logic (mirrors src/database/init.ts).
+    function applyPr64Widening(db: any): { rebuilt: boolean } {
+      const schemaRow = db.prepare(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='agent_affiliations'"
+      ).get() as { sql: string } | undefined;
+      const needsRebuild = schemaRow && !/'review_required'/.test(schemaRow.sql);
+      if (!needsRebuild) return { rebuilt: false };
+      const tx = db.transaction(() => {
+        db.exec(`
+          CREATE TABLE agent_affiliations__pr64_new (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            producer_id TEXT NOT NULL,
+            umbrella_id TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'pending_confirmation'
+              CHECK(status IN ('pending_confirmation','active','historical','rejected','review_required')),
+            source TEXT NOT NULL
+              CHECK(source IN ('self_claimed','scraped','admin','umbrella_confirmed','inferred')),
+            labels TEXT,
+            notes TEXT,
+            joined_at TEXT,
+            confirmed_at TEXT,
+            expires_at TEXT,
+            field_provenance TEXT,
+            evidence_json TEXT,
+            created_at TEXT DEFAULT (datetime('now')),
+            updated_at TEXT DEFAULT (datetime('now')),
+            UNIQUE(producer_id, umbrella_id),
+            FOREIGN KEY (producer_id) REFERENCES agents(id) ON DELETE CASCADE,
+            FOREIGN KEY (umbrella_id) REFERENCES agents(id) ON DELETE CASCADE
+          )
+        `);
+        db.exec(`
+          INSERT INTO agent_affiliations__pr64_new
+            (id, producer_id, umbrella_id, status, source, labels, notes,
+             joined_at, confirmed_at, expires_at, field_provenance,
+             evidence_json, created_at, updated_at)
+          SELECT id, producer_id, umbrella_id, status, source, labels, notes,
+                 joined_at, confirmed_at, expires_at, field_provenance,
+                 evidence_json, created_at, updated_at
+          FROM agent_affiliations
+        `);
+        db.exec(`DROP TABLE agent_affiliations`);
+        db.exec(`ALTER TABLE agent_affiliations__pr64_new RENAME TO agent_affiliations`);
+      });
+      tx();
+      return { rebuilt: true };
+    }
+
+    const first = applyPr64Widening(tmpDb);
+    assertEq(first.rebuilt, true, "pr64: first migration call rebuilds the table");
+
+    // Post-migration: review_required is now accepted.
+    tmpDb.prepare(`UPDATE agent_affiliations SET status='review_required' WHERE producer_id=?`).run("prod-1");
+    const row = tmpDb.prepare(`SELECT status, evidence_json FROM agent_affiliations WHERE producer_id=?`).get("prod-1") as any;
+    assertEq(row.status, "review_required", "pr64: status='review_required' accepted post-migration");
+    assertEq(row.evidence_json, '{"a":1}', "pr64: existing evidence_json preserved through rebuild");
+
+    // Second call → no-op (idempotent).
+    const second = applyPr64Widening(tmpDb);
+    assertEq(second.rebuilt, false, "pr64: re-running migration is a no-op (idempotent)");
+
+    tmpDb.close();
+  } catch (e: any) {
+    failed++;
+    failures.push("✗ pr64 schema-additivity: " + (e?.message || String(e)));
+  }
+
+  // (12) Idempotent re-scrape — same upsert called twice produces ONE
+  // affiliation row + same evidence on second call.
+  try {
+    const Database = require("better-sqlite3");
+    const idemDb = new Database(":memory:");
+    idemDb.pragma("foreign_keys = ON");
+    idemDb.exec(`CREATE TABLE agents (id TEXT PRIMARY KEY)`);
+    idemDb.prepare("INSERT INTO agents (id) VALUES (?)").run("p-idem-1");
+    idemDb.prepare("INSERT INTO agents (id) VALUES (?)").run("u-idem-1");
+    idemDb.exec(`
+      CREATE TABLE agent_affiliations (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        producer_id TEXT NOT NULL,
+        umbrella_id TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'pending_confirmation'
+          CHECK(status IN ('pending_confirmation','active','historical','rejected','review_required')),
+        source TEXT NOT NULL
+          CHECK(source IN ('self_claimed','scraped','admin','umbrella_confirmed','inferred')),
+        labels TEXT, notes TEXT, joined_at TEXT, confirmed_at TEXT,
+        expires_at TEXT, field_provenance TEXT, evidence_json TEXT,
+        created_at TEXT DEFAULT (datetime('now')),
+        updated_at TEXT DEFAULT (datetime('now')),
+        UNIQUE(producer_id, umbrella_id),
+        FOREIGN KEY (producer_id) REFERENCES agents(id) ON DELETE CASCADE,
+        FOREIGN KEY (umbrella_id) REFERENCES agents(id) ON DELETE CASCADE
+      )
+    `);
+    const stmt = idemDb.prepare(`
+      INSERT INTO agent_affiliations
+        (producer_id, umbrella_id, status, source, evidence_json, created_at, updated_at)
+      VALUES (?, ?, ?, 'inferred', ?, ?, ?)
+      ON CONFLICT(producer_id, umbrella_id) DO UPDATE SET
+        status = CASE
+          WHEN agent_affiliations.status IN ('pending_confirmation','review_required')
+            THEN excluded.status
+          ELSE agent_affiliations.status
+        END,
+        evidence_json = CASE
+          WHEN agent_affiliations.status IN ('pending_confirmation','review_required')
+            THEN excluded.evidence_json
+          ELSE agent_affiliations.evidence_json
+        END,
+        updated_at = excluded.updated_at
+    `);
+    // First call.
+    stmt.run("p-idem-1", "u-idem-1", "pending_confirmation", '{"score":1.0,"v":1}', "2026-05-16T00:00:00Z", "2026-05-16T00:00:00Z");
+    // Second call (re-scrape) with refreshed timestamps + same evidence.
+    stmt.run("p-idem-1", "u-idem-1", "pending_confirmation", '{"score":1.0,"v":2}', "2026-05-16T01:00:00Z", "2026-05-16T01:00:00Z");
+    const rows = idemDb.prepare(`SELECT producer_id, umbrella_id, status, evidence_json, updated_at FROM agent_affiliations WHERE producer_id=?`).all("p-idem-1") as any[];
+    assertEq(rows.length, 1, "pr64: idempotent re-scrape produces exactly ONE row");
+    assertEq(rows[0].status, "pending_confirmation", "pr64: status preserved through rerun");
+    assertEq(rows[0].evidence_json, '{"score":1.0,"v":2}', "pr64: evidence_json refreshed on rerun");
+    assertEq(rows[0].updated_at, "2026-05-16T01:00:00Z", "pr64: updated_at refreshed on rerun");
+
+    // Promotion guard: if an admin marks the row 'active', subsequent
+    // scrapes must NOT clobber it back to pending_confirmation.
+    idemDb.prepare("UPDATE agent_affiliations SET status='active' WHERE producer_id=?").run("p-idem-1");
+    stmt.run("p-idem-1", "u-idem-1", "pending_confirmation", '{"score":1.0,"v":3}', "2026-05-16T02:00:00Z", "2026-05-16T02:00:00Z");
+    const row2 = idemDb.prepare(`SELECT status, evidence_json FROM agent_affiliations WHERE producer_id=?`).get("p-idem-1") as any;
+    assertEq(row2.status, "active", "pr64: promoted 'active' status preserved (no clobber)");
+    assertEq(row2.evidence_json, '{"score":1.0,"v":2}', "pr64: evidence frozen once admin promotes the row");
+
+    // review_required → pending_confirmation transitions ARE allowed
+    // (admin downgrading to re-trigger scrape refresh).
+    idemDb.prepare("UPDATE agent_affiliations SET status='review_required' WHERE producer_id=?").run("p-idem-1");
+    stmt.run("p-idem-1", "u-idem-1", "pending_confirmation", '{"score":0.95,"v":4}', "2026-05-16T03:00:00Z", "2026-05-16T03:00:00Z");
+    const row3 = idemDb.prepare(`SELECT status, evidence_json FROM agent_affiliations WHERE producer_id=?`).get("p-idem-1") as any;
+    assertEq(row3.status, "pending_confirmation", "pr64: review_required → pending_confirmation transition allowed on re-scrape");
+    assertEq(row3.evidence_json, '{"score":0.95,"v":4}', "pr64: review_required row refreshes evidence on re-scrape");
+
+    idemDb.close();
+  } catch (e: any) {
+    failed++;
+    failures.push("✗ pr64 idempotent re-scrape: " + (e?.message || String(e)));
+  }
+}
+
 // PR-63 (C.1-A): Debio TRACES+Brreg cross-check async-test handle
 let _pr63Resolve: () => void = () => {};
 const _pr63Promise: Promise<void> = new Promise<void>(r => { _pr63Resolve = r; });

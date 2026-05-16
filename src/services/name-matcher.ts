@@ -119,3 +119,67 @@ export function bestMatch<T>(
   }
   return best;
 }
+
+// ─── 5. nameVariants ───────────────────────────────────────────
+// Generate multiple normalised variants of a producer name so the
+// matcher can compare against the strongest plausible spelling of
+// either side. All variants are lowercase, æ/ø/å transliterated.
+//
+// Variants generated from `normaliseForMatch(s)`:
+//   1. Full normalised form               ("heim gard as")
+//   2. With common org-suffix stripped    ("heim gard")
+//   3. With farm-suffix stripped          ("heim")
+//   4. First-word-only fallback           ("heim")
+//
+// Set semantics — duplicates collapse. Empty string is filtered out.
+//
+// Why: Hanen sometimes uses just "Heim Gardsbutikk" while our agent
+// is registered as "Heim Gård AS"; the first/last-word stems align
+// even though full Dice would be below threshold.
+//
+// Suffix lists (case-insensitive, end-of-string only):
+//   Org-suffix:  as, asa, da, ans, enk, sa, ba, ks, nuf, stif, stiftelse
+//   Farm-suffix: gard, gard*sbutikk*, gard*sutsalg*, gardsbruk, gartneri,
+//                seter, bruk, hage, hagebruk
+//   (Note: "gård" has already been transliterated to "gard" by
+//   normaliseForMatch, so we match the transliterated forms.)
+const ORG_SUFFIX_RE = /\s+(?:as|asa|da|ans|enk|sa|ba|ks|nuf|stif|stiftelse)$/;
+const FARM_SUFFIX_RE = /\s+(?:gard|gardsbutikk|gardsutsalg|gardsbruk|gartneri|seter|bruk|hage|hagebruk)$/;
+
+export function nameVariants(s: string): string[] {
+  const base = normaliseForMatch(s);
+  if (!base) return [];
+  const out = new Set<string>();
+  out.add(base);
+
+  // Strip org-suffix (e.g. " AS" at end). Apply iteratively in case of
+  // chained suffixes like "AS AS" — unusual but cheap to be defensive.
+  let stripped = base;
+  for (let i = 0; i < 3; i++) {
+    const next = stripped.replace(ORG_SUFFIX_RE, "");
+    if (next === stripped) break;
+    stripped = next;
+  }
+  if (stripped && stripped !== base) out.add(stripped);
+
+  // Strip farm-suffix from EITHER the base or the org-stripped form
+  // (handles "Heim Gård AS" → "heim gard as" → "heim gard" → "heim").
+  for (const candidate of [base, stripped]) {
+    let farmless = candidate;
+    for (let i = 0; i < 3; i++) {
+      const next = farmless.replace(FARM_SUFFIX_RE, "");
+      if (next === farmless) break;
+      farmless = next;
+    }
+    if (farmless && farmless !== candidate) out.add(farmless);
+  }
+
+  // First-word-only fallback. Skip if the first word is too short to be
+  // distinctive (≤2 chars: "av", "og", "de") — produces too many false
+  // positives on the matcher side.
+  const firstWord = base.split(/\s+/)[0] || "";
+  if (firstWord.length >= 3) out.add(firstWord);
+
+  // Return as array, drop empties just in case.
+  return Array.from(out).filter(v => v.length > 0);
+}
