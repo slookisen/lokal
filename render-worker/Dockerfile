@@ -3,7 +3,7 @@
 # The base image already includes Chromium and all required system libs.
 
 # ── Stage 1: build TypeScript ────────────────────────────────
-FROM mcr.microsoft.com/playwright:v1.45.0-jammy AS builder
+FROM mcr.microsoft.com/playwright:v1.60.0-jammy AS builder
 
 WORKDIR /app
 
@@ -20,7 +20,7 @@ RUN npm run build
 RUN npm prune --omit=dev
 
 # ── Stage 2: runtime ─────────────────────────────────────────
-FROM mcr.microsoft.com/playwright:v1.45.0-jammy AS runtime
+FROM mcr.microsoft.com/playwright:v1.60.0-jammy AS runtime
 
 ENV NODE_ENV=production
 ENV PORT=8080
