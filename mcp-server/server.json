@@ -18,5 +18,15 @@
       },
       "environmentVariables": []
     }
+  ],
+  "remotes": [
+    {
+      "type": "streamable-http",
+      "url": "https://rettfrabonden.com/mcp"
+    },
+    {
+      "type": "streamable-http",
+      "url": "https://server.smithery.ai/@slookisen/rettfrabonden"
+    }
   ]
 }

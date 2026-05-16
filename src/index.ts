@@ -37,6 +37,7 @@ import ownerPortalRoutes from "./routes/owner-portal";
 import adminAgentAuditRoutes from "./routes/admin-agent-audit";
 import adminVerifierReviewQueueRoutes from "./routes/admin-verifier-review-queue";
 import adminKnowledgeRoutes from "./routes/admin-knowledge";
+import adminAffiliationsRoutes from "./routes/admin-affiliations";
 import platformTriggersRoutes, { adminRouter as adminTriggersRoutes } from "./routes/platform-triggers";
 import crmRoutes from "./routes/crm";
 import { list as blocklistList } from "./services/blocklist-service";
@@ -260,6 +261,8 @@ app.use("/admin/agent-audit", adminLimiter, adminAgentAuditRoutes);
 app.use("/admin/verifier-review-queue", adminLimiter, adminVerifierReviewQueueRoutes);
 // PR-24 (2026-05-11): enrichment write surface accepts field_provenance
 app.use("/admin/knowledge", adminLimiter, adminKnowledgeRoutes);
+// PR-58 (2026-05-16): C.1-C auto-tag enrichment — POST /admin/affiliations/auto-create
+app.use("/admin/affiliations", adminLimiter, adminAffiliationsRoutes);
 
 // Platform triggers — public webhook receiver + admin queue access.
 // /platform/triggers/* uses HMAC (no admin-key); /admin/triggers/* uses admin-key.

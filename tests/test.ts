@@ -6227,6 +6227,161 @@ console.log("── PR-29 related-producers tests ──");
   );
 }
 
+// ─── PR-56: Smithery distribution channel wired into agent-card + server.json ──
+// PR-56 sequence:
+//   1. server.json (root) + mcp-server/server.json bumped to v0.4.0 with remotes[]
+//      now including Smithery gateway URL
+//   2. getRegistryCard() emits a `x-distribution` field listing smithery + npm + a2a
+//      (x- prefix per code-reviewer note re strict A2A validators)
+//      so consumer agents that hit /.well-known/agent-card.json can discover us
+//      across all three indexes without a separate API call
+{
+  console.log("\n── PR-56: Smithery distribution wiring ──");
+
+  // (1) server.json (root) — must contain Smithery URL in remotes[]
+  const serverJsonRoot = require("fs").readFileSync("server.json", "utf-8");
+  const serverParsed = JSON.parse(serverJsonRoot);
+  assertTrue(
+    serverParsed.version === "0.4.0",
+    "pr-56: server.json bumped to v0.4.0 (was 0.3.3)"
+  );
+  assertTrue(
+    Array.isArray(serverParsed.remotes) &&
+      serverParsed.remotes.some((r: any) =>
+        typeof r.url === "string" && r.url.includes("server.smithery.ai")),
+    "pr-56: server.json remotes[] includes server.smithery.ai entry"
+  );
+  assertTrue(
+    !serverParsed.remotes.some((r: any) => "headers" in r),
+    "pr-56: server.json remotes[] do NOT include headers[] (per code-reviewer — would be misused as real HTTP headers)"
+  );
+
+  // (2) mcp-server/server.json — also has Smithery in remotes[]
+  const mcpServerJson = require("fs").readFileSync("mcp-server/server.json", "utf-8");
+  const mcpParsed = JSON.parse(mcpServerJson);
+  assertTrue(
+    Array.isArray(mcpParsed.remotes) &&
+      mcpParsed.remotes.some((r: any) =>
+        typeof r.url === "string" && r.url.includes("server.smithery.ai")),
+    "pr-56: mcp-server/server.json remotes[] includes Smithery"
+  );
+
+  // (3) Behavioural test — actually invoke getRegistryCard() and assert on
+  // the returned object's x-distribution[] (not just source-string match).
+  // getRegistryCard() calls getStats() (needs `listings` + `agents` tables)
+  // and uses getConfig() in skill descriptions (needs loadConfigsAtBoot()).
+  // We bring up both before invoking. This catches runtime regressions a
+  // regex would miss.
+  {
+    const Database = require("better-sqlite3");
+    const initMod56 = require("../src/database/init");
+    const regMod56 = require("../src/services/marketplace-registry");
+    const cfgMod56 = require("../src/config/vertical-config");
+    cfgMod56._resetConfigCacheForTests();
+    cfgMod56.loadConfigsAtBoot({ dir: "./verticals" });
+    const db56 = new Database(":memory:");
+    db56.exec(`
+      CREATE TABLE IF NOT EXISTS agents (
+        id TEXT PRIMARY KEY, name TEXT, role TEXT, city TEXT,
+        is_active INTEGER DEFAULT 1, umbrella_type TEXT,
+        trust_score INTEGER DEFAULT 0, created_at TEXT DEFAULT (datetime('now'))
+      );
+      CREATE TABLE IF NOT EXISTS listings (id TEXT PRIMARY KEY);
+    `);
+    initMod56.__setDbForTesting(db56);
+    const reg56 = regMod56.marketplaceRegistry as any;
+    reg56._agentsCache = null;
+    reg56._statsCache = null;
+
+    const card = regMod56.marketplaceRegistry.getRegistryCard("https://rettfrabonden.com") as any;
+    const dist = card["x-distribution"];
+    assertTrue(
+      Array.isArray(dist) && dist.length === 3,
+      `pr-56: getRegistryCard() emits x-distribution with 3 entries (got ${Array.isArray(dist) ? dist.length : typeof dist})`
+    );
+    const channels = (dist || []).map((d: any) => d.channel).sort();
+    assertTrue(
+      JSON.stringify(channels) === JSON.stringify(["a2a-registry", "npm", "smithery"]),
+      `pr-56: x-distribution channels are exactly [a2a-registry, npm, smithery] (got ${JSON.stringify(channels)})`
+    );
+    const a2aEntry = (dist || []).find((d: any) => d.channel === "a2a-registry");
+    assertTrue(
+      a2aEntry && typeof a2aEntry.install === "string" &&
+        a2aEntry.install.startsWith("https://rettfrabonden.com/.well-known/"),
+      "pr-56: x-distribution a2a-registry.install correctly interpolates baseUrl"
+    );
+    const smitheryEntry = (dist || []).find((d: any) => d.channel === "smithery");
+    assertTrue(
+      smitheryEntry && smitheryEntry.url === "https://smithery.ai/servers/@slookisen/rettfrabonden",
+      "pr-56: x-distribution smithery.url points to public Smithery listing page"
+    );
+
+    // Cleanup so subsequent tests can re-init their own db
+    db56.close();
+  }
+}
+
+
+// ─── PR-58: Debio C.1-C — auto-tag enrichment for organic certifications ──
+{
+  console.log("\n── PR-58: Debio auto-tag enrichment ──");
+
+  // (1) detector unit-tests
+  const { detectOrganicCertification } = require("../src/services/organic-keyword-detector");
+
+  const high = detectOrganicCertification("<html><body><p>Vi er Debio sertifisert siden 2010.</p></body></html>");
+  assertEq(high.detected, true, "pr-58: detector fires on 'Debio sertifisert'");
+  assertEq(high.confidence, "high", "pr-58: 'Debio sertifisert' is HIGH confidence");
+  assertTrue(high.evidence_snippets.length >= 1, "pr-58: detector returns at least 1 evidence snippet");
+
+  const medium = detectOrganicCertification("Vi driver med økologisk produksjon. All vår organic farming følger streng standard.");
+  assertEq(medium.confidence, "medium", "pr-58: ≥2 MEDIUM keywords → medium confidence");
+
+  const low = detectOrganicCertification("Vi tenker på å gå over til økologisk drift.");
+  assertEq(low.confidence, "low", "pr-58: bare 'økologisk' uten kontekst → low confidence");
+
+  const noMatch = detectOrganicCertification("<html>Vi selger melk og ost.</html>");
+  assertEq(noMatch.detected, false, "pr-58: detector returns false on unrelated content");
+
+  // (2) script + style tags stripped before matching
+  const inScript = detectOrganicCertification('<script>var s = "Debio sertifisert"</script><body>nothing here</body>');
+  assertEq(inScript.detected, false, "pr-58: keywords inside <script> tags are stripped before matching");
+
+  // (3) Ø-merket alternate-spelling matches
+  const omerket = detectOrganicCertification("<p>Vi har vært Ø-merket i 5 år.</p>");
+  assertEq(omerket.confidence, "high", "pr-58: 'Ø-merket' is HIGH confidence (unicode handled)");
+
+  // (4) Source-presence: new endpoint registered
+  const adminKnowSrc = require("fs").readFileSync("src/routes/admin-knowledge.ts", "utf-8");
+  const adminAffSrc = require("fs").existsSync("src/routes/admin-affiliations.ts")
+    ? require("fs").readFileSync("src/routes/admin-affiliations.ts", "utf-8")
+    : "";
+  assertTrue(
+    /['"]\/admin\/affiliations\/auto-create['"]/.test(adminKnowSrc) ||
+      /['"]\/admin\/affiliations\/auto-create['"]/.test(adminAffSrc) ||
+      /['"]\/auto-create['"]/.test(adminAffSrc),
+    "pr-58: POST /admin/affiliations/auto-create endpoint registered"
+  );
+
+  // (5) UI rendering condition for pending_confirmation present in seo.ts
+  const seoSrc = require("fs").readFileSync("src/routes/seo.ts", "utf-8");
+  assertTrue(
+    /pending_confirmation/.test(seoSrc),
+    "pr-58: seo.ts checks affiliation status === pending_confirmation for 'antatt' rendering"
+  );
+  assertTrue(
+    /antatt/i.test(seoSrc),
+    "pr-58: seo.ts emits 'antatt' label for inferred-affiliation badges"
+  );
+
+  // (6) evidence_json column migration in init.ts
+  const initSrc = require("fs").readFileSync("src/database/init.ts", "utf-8");
+  assertTrue(
+    /evidence_json/.test(initSrc),
+    "pr-58: init.ts contains evidence_json column reference (additive ALTER)"
+  );
+}
+
 // ─── PR-57: Playwright render-worker client + worker scaffolding ──
 {
   console.log("\n── PR-57: Playwright render-worker scaffolding ──");

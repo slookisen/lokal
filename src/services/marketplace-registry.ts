@@ -748,6 +748,37 @@ class MarketplaceRegistry {
         },
       },
 
+      // ─── Distribution channels (Phase 5.11 — Smithery added 2026-05-16) ─
+      // External registries that index this server. Consumer agents that
+      // discover us via these channels can verify they are talking to the
+      // canonical Rett fra Bonden marketplace by cross-checking the homepage
+      // and `name` here.
+      // Prefixed with `x-` to follow the in-file extension convention
+      // (matches `x-lokal` below) and stay safe with strict A2A validators.
+      "x-distribution": [
+        {
+          channel: "smithery",
+          url: "https://smithery.ai/servers/@slookisen/rettfrabonden",
+          install: "https://server.smithery.ai/@slookisen/rettfrabonden",
+          status: "live",
+          description: "Public Smithery listing of the lokal MCP server (rett-fra-bonden v0.4.0). Reads are open; writes require X-API-Key.",
+        },
+        {
+          channel: "npm",
+          url: "https://www.npmjs.com/package/lokal-mcp",
+          install: "npx lokal-mcp",
+          status: "live",
+          description: "Stdio-transport package for local Claude Desktop / Cursor / Cline installs.",
+        },
+        {
+          channel: "a2a-registry",
+          url: "https://a2aregistry.org/agents/00157ca1-450f-4341-91a5-dbcab7a667ef",
+          install: `${baseUrl}/.well-known/agent-card.json`,
+          status: "live",
+          description: "A2A protocol registry listing — direct JSON-RPC at /a2a.",
+        },
+      ],
+
       // ─── Lokal-specific metadata ───────────────────────────
       "x-lokal": {
         type: "registry",

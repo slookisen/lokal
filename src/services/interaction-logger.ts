@@ -17,7 +17,9 @@ export type InteractionType =
   | "search" | "discover" | "register" | "view" | "message" | "transaction"
   // Phase 5.11 (umbrella agents / affiliations) — admin audit-log events
   | "umbrella_created" | "umbrella_updated"
-  | "affiliation_upserted" | "affiliation_updated";
+  | "affiliation_upserted" | "affiliation_updated"
+  // PR-58 (2026-05-16): C.1-C auto-tag enrichment via /admin/affiliations/auto-create
+  | "affiliation_auto_created";
 
 export interface InteractionEvent {
   id: string;
