@@ -1702,10 +1702,12 @@ function initSchema(db: Database.Database): void {
     )
   `);
   db.exec(`CREATE INDEX IF NOT EXISTS idx_bm_events_venue ON bm_market_events(venue_agent_id, start_at)`);
-  // Partial index for "upcoming events" queries — most reads filter on future
-  // dates, so a partial index keeps the index small. SQLite evaluates
-  // datetime('now') at index-build time, but partial-index expressions are
-  // re-checked at write time too, so this stays correct as time advances.
+  // Regular index on start_at — supports "upcoming events" range queries
+  // (datetime('now')-relative). A partial index with WHERE clause was
+  // considered but rejected: SQLite evaluates datetime('now') at index-build
+  // time only, which would fix the cutoff at deploy time and need a manual
+  // REINDEX as the cutoff drifts forward. A regular index is simpler and
+  // SQLite's planner handles the range scan cheaply at this table size.
   db.exec(`CREATE INDEX IF NOT EXISTS idx_bm_events_start ON bm_market_events(start_at)`);
 
 }
