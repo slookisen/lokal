@@ -5812,10 +5812,21 @@ console.log("── PR-29 related-producers tests ──");
     /\$\{sectionLabel \? `[\s\S]{0,200}<div class="card">/.test(seoSrc),
     "phase5.11-a5: children card only rendered when sectionLabel is non-empty"
   );
-  // Child cards carry the type badge
+  // PR-55: Child cards show count suffix instead of bare type badge
+  // (e.g. "Oslo · 13 markedsplasser"). The .umb-child-type CSS rule
+  // remains defined for backward compat / future re-use, but is no
+  // longer emitted in the meta line.
   assertTrue(
-    /umb-child-type/.test(seoSrc) && /childTypeBadgeNo/.test(seoSrc),
-    "phase5.11-a5: child cards include a per-type badge (Lokallag/Markedsplass/…)"
+    /umbrella_member_count/.test(seoSrc),
+    "phase5.11-a8 (PR-55): direct-children SELECT includes umbrella_member_count"
+  );
+  assertTrue(
+    /m\.umbrella_type === 'venue' \? 'produsenter' : 'markedsplasser'/.test(seoSrc),
+    "phase5.11-a8 (PR-55): count suffix uses produsenter (venue) / markedsplasser (lokallag) terminology"
+  );
+  assertTrue(
+    /member_count\?: number/.test(seoSrc),
+    "phase5.11-a8 (PR-55): UmbrellaChild interface has optional member_count field"
   );
 
   // ─── Source-presence: Fix #5 (JSON-LD member subtype) ────────────
