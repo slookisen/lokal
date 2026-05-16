@@ -4151,6 +4151,57 @@ console.log("\n── PR-30: source-presence checks on seo.ts ──");
     "pr30: sitemap uses lastmodForDate(updatedAt) for <lastmod>"
   );
 }
+
+// ── WO-17: Search Console JSON-LD + sitemap-404 source-presence ──
+// Regression guard for the 2026-05-15 MerchantListing + Product-snippet
+// reports and the 2026-05-14 sitemap-404 report. Source-grep style mirrors
+// the PR-30 block above. Behavioural-render checks live in
+// tests/seo-jsonld.test.ts (standalone, runnable via tsx).
+console.log("\n── WO-17: seo.ts source-presence (JSON-LD + sitemap) ──");
+{
+  const fsWo17 = require("fs");
+  const seoSrcWo17 = fsWo17.readFileSync("src/routes/seo.ts", "utf8");
+  assertTrue(seoSrcWo17.includes("hasMerchantReturnPolicy"), "wo17: seo.ts contains hasMerchantReturnPolicy");
+  assertTrue(seoSrcWo17.includes("shippingDetails"), "wo17: seo.ts contains shippingDetails");
+  assertTrue(/"@type":\s*"Brand"/.test(seoSrcWo17), "wo17: seo.ts contains Brand @type");
+  assertTrue(/"@type":\s*"MerchantReturnPolicy"/.test(seoSrcWo17), "wo17: seo.ts contains MerchantReturnPolicy @type");
+  assertTrue(/"@type":\s*"OfferShippingDetails"/.test(seoSrcWo17), "wo17: seo.ts contains OfferShippingDetails @type");
+  assertTrue(seoSrcWo17.includes("merchantReturnDays"), "wo17: seo.ts sets merchantReturnDays");
+  assertTrue(
+    seoSrcWo17.includes("product.aggregateRating = jsonLd.aggregateRating"),
+    "wo17: seo.ts propagates aggregateRating to inner Product",
+  );
+  assertTrue(
+    seoSrcWo17.includes("product.review = jsonLd.review.slice(0, 3)"),
+    "wo17: seo.ts propagates review (capped to 3) to inner Product",
+  );
+  // Sitemap 404 gate
+  assertTrue(seoSrcWo17.includes("skippedCount"), "wo17: sitemap loop tracks skippedCount");
+  assertTrue(
+    seoSrcWo17.includes("[sitemap] producer-entry filtering"),
+    "wo17: sitemap logs filter delta",
+  );
+  assertTrue(
+    seoSrcWo17.includes("if (!slug || slug.length < 2)"),
+    "wo17: sitemap gates on short/empty slug",
+  );
+}
+
+// ── PR-56 reviewer note 3: init.ts comment accuracy ──
+console.log("\n── PR-56 note 3: init.ts comment accuracy ──");
+{
+  const fsP56 = require("fs");
+  const initSrcP56 = fsP56.readFileSync("src/database/init.ts", "utf8");
+  assertTrue(
+    initSrcP56.includes("Regular index on start_at"),
+    "pr56-n3: init.ts comment now accurately describes a regular index",
+  );
+  assertTrue(
+    !initSrcP56.includes('Partial index for "upcoming events"'),
+    "pr56-n3: init.ts no longer claims partial index",
+  );
+}
+
 // ── PR-29: related-producers sections on /produsent/<slug> ──────────
 // SEO PR — adds two internal-linking blocks ("Andre lokale matprodusenter
 // i <by>" + "Andre <kategori>-produsenter i Norge") to the producer page.

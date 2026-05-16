@@ -3134,18 +3134,61 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
           "@type": "Product",
           "name": productName,
           "description": `${productName} fra ${agent.name}`,
+          // WO-17: brand satisfies Google's "global identifier OR brand" rule
+          // for MerchantListing (fresh-farm goods rarely have GTINs).
+          "brand": {
+            "@type": "Brand",
+            "name": agent.name,
+          },
           "offers": {
             "@type": "Offer",
             "price": parseFloat(numericPrice),
             "priceCurrency": "NOK",
             "availability": "https://schema.org/InStock",
             "seller": { "@type": "LocalBusiness", "name": agent.name },
+            // WO-17: 14-day Norwegian angrerett (distance-sale law default).
+            "hasMerchantReturnPolicy": {
+              "@type": "MerchantReturnPolicy",
+              "applicableCountry": "NO",
+              "returnPolicyCategory": "https://schema.org/MerchantReturnFiniteReturnWindow",
+              "merchantReturnDays": 14,
+              "returnMethod": "https://schema.org/ReturnByMail",
+              "returnFees": "https://schema.org/FreeReturn",
+            },
+            // WO-17: local-pickup is the realistic default for rettfrabonden
+            // producers. Per-producer overrides are out of scope for this WO.
+            "shippingDetails": {
+              "@type": "OfferShippingDetails",
+              "shippingRate": {
+                "@type": "MonetaryAmount",
+                "value": 0,
+                "currency": "NOK",
+              },
+              "shippingDestination": {
+                "@type": "DefinedRegion",
+                "addressCountry": "NO",
+              },
+              "deliveryTime": {
+                "@type": "ShippingDeliveryTime",
+                "handlingTime": { "@type": "QuantitativeValue", "minValue": 0, "maxValue": 1, "unitCode": "DAY" },
+                "transitTime":  { "@type": "QuantitativeValue", "minValue": 0, "maxValue": 2, "unitCode": "DAY" },
+              },
+            },
           },
         };
 
         // Add image if producer has one (Google requires image for merchant listings)
         if (imagesList.length) {
           product.image = imagesList[0];
+        }
+
+        // WO-17: propagate parent rating/review to inner Product so Google's
+        // "Product snippets" report sees them on the right entity.
+        if (jsonLd.aggregateRating) {
+          product.aggregateRating = jsonLd.aggregateRating;
+        }
+        if (Array.isArray(jsonLd.review) && jsonLd.review.length) {
+          product.review = jsonLd.review.slice(0, 3); // cap to keep payload small
         }
 
         return {
@@ -3532,13 +3575,26 @@ router.get("/sitemap.xml", (_req: Request, res: Response) => {
     for (const city of cities) addEntry(`/${city}`, "weekly", "0.8", today);
 
     // PR-30: producer URLs get per-agent <lastmod> + status-driven priority/changefreq
+    // WO-17: pre-flight gate filters agents that would 404 in the route handler
+    // (short/empty slugs, skeleton imports with no knowledge row and no claim).
+    // Symptom of the 2026-05-14 Search Console "sitemap-listed URLs returning
+    // 404" report.
+    let skippedCount = 0;
     for (const a of agents) {
+      const slug = slugify(a.name);
+      if (!slug || slug.length < 2) { skippedCount++; continue; }
       const k = knowledgeByAgent.get(a.id);
+      // RegisteredAgent type doesn't surface claimed_by_user_id, but the
+      // underlying agents row does — narrow-cast to read it without polluting
+      // the public type.
+      const claimedBy = (a as any).claimed_by_user_id ?? (a as any).claimed_by;
+      if (!k && !claimedBy) { skippedCount++; continue; }
       const updatedAt = parseIsoOrSqlite(k?.updatedAt);
       const lastmod = updatedAt ? lastmodForDate(updatedAt) : today;
       const hints = sitemapHintsForStatus(k?.status);
-      addEntry(`/produsent/${slugify(a.name)}`, hints.changefreq, hints.priority, lastmod);
+      addEntry(`/produsent/${slug}`, hints.changefreq, hints.priority, lastmod);
     }
+    console.log(`[sitemap] producer-entry filtering: ${skippedCount}/${agents.length} excluded by WO-17 gate`);
 
     xml += "\n</urlset>";
     res.header("Content-Type", "application/xml");
