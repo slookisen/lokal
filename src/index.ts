@@ -38,6 +38,7 @@ import adminAgentAuditRoutes from "./routes/admin-agent-audit";
 import adminVerifierReviewQueueRoutes from "./routes/admin-verifier-review-queue";
 import adminKnowledgeRoutes from "./routes/admin-knowledge";
 import adminAffiliationsRoutes from "./routes/admin-affiliations";
+import adminBmEventsRoutes from "./routes/admin-bm-events";
 import platformTriggersRoutes, { adminRouter as adminTriggersRoutes } from "./routes/platform-triggers";
 import crmRoutes from "./routes/crm";
 import { list as blocklistList } from "./services/blocklist-service";
@@ -263,6 +264,8 @@ app.use("/admin/verifier-review-queue", adminLimiter, adminVerifierReviewQueueRo
 app.use("/admin/knowledge", adminLimiter, adminKnowledgeRoutes);
 // PR-58 (2026-05-16): C.1-C auto-tag enrichment — POST /admin/affiliations/auto-create
 app.use("/admin/affiliations", adminLimiter, adminAffiliationsRoutes);
+// PR-56 (2026-05-16): Bondens marked events scraper — POST /admin/bm-events/scrape
+app.use("/admin/bm-events", adminLimiter, adminBmEventsRoutes);
 
 // Platform triggers — public webhook receiver + admin queue access.
 // /platform/triggers/* uses HMAC (no admin-key); /admin/triggers/* uses admin-key.

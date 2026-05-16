@@ -1680,6 +1680,34 @@ function initSchema(db: Database.Database): void {
   // is_active filter so it stays cheap.
   db.exec(`CREATE INDEX IF NOT EXISTS idx_agents_umbrella_type ON agents(umbrella_type) WHERE umbrella_type IS NOT NULL`);
 
+  // ─── Phase 5.11 PR-56 (2026-05-16): Bondens marked events scraper ────
+  // Stores upcoming markedsdager scraped daily from bondensmarked.no/markeder.
+  // Each row links to a venue agent (umbrella_type='venue') OR — when no
+  // venue matches by name — falls back to the lokallag whose city contains
+  // the event's location_text. event_slug is the canonical
+  // <venue-slug>-<YYYY-MM-DD> string from the source URL and is unique so
+  // re-runs are idempotent (INSERT OR REPLACE).
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS bm_market_events (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      venue_agent_id TEXT NOT NULL,
+      event_slug TEXT UNIQUE NOT NULL,
+      event_name TEXT NOT NULL,
+      location_text TEXT,
+      start_at TEXT NOT NULL,
+      end_at TEXT,
+      source_url TEXT NOT NULL,
+      scraped_at TEXT DEFAULT (datetime('now')),
+      FOREIGN KEY (venue_agent_id) REFERENCES agents(id) ON DELETE CASCADE
+    )
+  `);
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_bm_events_venue ON bm_market_events(venue_agent_id, start_at)`);
+  // Partial index for "upcoming events" queries — most reads filter on future
+  // dates, so a partial index keeps the index small. SQLite evaluates
+  // datetime('now') at index-build time, but partial-index expressions are
+  // re-checked at write time too, so this stays correct as time advances.
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_bm_events_start ON bm_market_events(start_at)`);
+
 }
 
 export function closeDb(): void {

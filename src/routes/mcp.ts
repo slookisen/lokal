@@ -539,6 +539,97 @@ function registerTools(server: McpServer, getClientIdentity?: () => string | und
     }
   );
 
+  // Tool 8: Upcoming Bondens marked events (PR-56, 2026-05-16)
+  // Public-data DB-direct query — same pattern as the umbrella tools above
+  // (no HTTP loopback). Reads bm_market_events populated by the daily
+  // scraper at POST /admin/bm-events/scrape.
+  server.registerTool(
+    "lokal_bm_next_markets",
+    {
+      title: "Get upcoming Bondens marked events",
+      description: "Returns upcoming Bondens marked events (markedsdager) for a region or specific lokallag/venue. Useful when AI agents are asked 'when is the next Bondens marked in Oslo?' or similar. Data is refreshed daily from bondensmarked.no.",
+      inputSchema: {
+        region: z.string().optional().describe("City or region substring filter, e.g. 'Oslo', 'Bergen', 'Vestfold'"),
+        lokallag_slug: z.string().optional().describe("Lokallag slug, e.g. 'bondens-marked-agder'. Filters to events at any venue under this lokallag."),
+        days: z.number().int().min(1).max(90).optional().describe("Look-ahead window in days (default 30, max 90)"),
+      },
+      annotations: {
+        title: "Upcoming Bondens marked events",
+        readOnlyHint: true,
+        destructiveHint: false,
+        idempotentHint: true,
+        openWorldHint: false,
+      },
+    },
+    async ({ region, lokallag_slug, days }) => {
+      const db = getDb();
+      const lookahead = Math.max(1, Math.min(days || 30, 90));
+      const fromIso = new Date().toISOString();
+      const toIso = new Date(Date.now() + lookahead * 24 * 60 * 60 * 1000).toISOString();
+
+      const wheres: string[] = ["e.start_at >= ?", "e.start_at <= ?"];
+      const params: any[] = [fromIso, toIso];
+
+      let lokallagId: string | null = null;
+      if (lokallag_slug) {
+        // Resolve the slug back to an agent_id by scanning lokallag rows
+        // (small set — at most ~15) and slugifying each name.
+        try {
+          const lokallags = db.prepare(
+            "SELECT id, name FROM agents WHERE umbrella_type IN ('market_network','venue') AND is_active = 1"
+          ).all() as Array<{ id: string; name: string }>;
+          const wanted = lokallag_slug.toLowerCase();
+          const hit = lokallags.find(l => slugify(l.name) === wanted);
+          if (hit) lokallagId = hit.id;
+        } catch { /* table missing — leave lokallagId null */ }
+      }
+      if (lokallagId) {
+        wheres.push("(e.venue_agent_id = ? OR a.parent_umbrella_id = ?)");
+        params.push(lokallagId, lokallagId);
+      }
+      if (region) {
+        wheres.push("LOWER(e.location_text) LIKE ?");
+        params.push(`%${region.toLowerCase()}%`);
+      }
+
+      let rows: any[] = [];
+      try {
+        rows = db.prepare(`
+          SELECT e.event_slug, e.event_name, e.location_text, e.start_at, e.end_at, e.source_url,
+                 a.id AS venue_agent_id, a.name AS venue_name
+          FROM bm_market_events e
+          INNER JOIN agents a ON a.id = e.venue_agent_id
+          WHERE ${wheres.join(" AND ")}
+          ORDER BY e.start_at ASC
+          LIMIT 50
+        `).all(...params) as any[];
+      } catch {
+        return { content: [{ type: "text" as const, text: "Bondens marked-arrangementer er ikke tilgjengelig ennå (skraperen har ikke kjørt)." }] };
+      }
+
+      if (!rows.length) {
+        const filters: string[] = [];
+        if (region) filters.push(`region "${region}"`);
+        if (lokallag_slug) filters.push(`lokallag "${lokallag_slug}"`);
+        const filterStr = filters.length ? ` med filter ${filters.join(", ")}` : "";
+        return { content: [{ type: "text" as const, text: `Ingen kommende markedsdager neste ${lookahead} dager${filterStr}.` }] };
+      }
+
+      const BASE = process.env.BASE_URL || "https://rettfrabonden.com";
+      const sections = [`📅 **${rows.length} kommende markedsdager** (neste ${lookahead} dager):\n`];
+      for (const r of rows) {
+        const date = (r.start_at || "").slice(0, 10);
+        const time = (r.start_at || "").slice(11, 16);
+        const endTime = r.end_at ? (r.end_at || "").slice(11, 16) : "";
+        const timeStr = time ? ` ${time}${endTime ? "–" + endTime : ""}` : "";
+        sections.push(`- **${date}${timeStr}** — ${r.event_name} (${r.location_text})`);
+        sections.push(`  ${BASE}/produsent/${slugify(r.venue_name)}`);
+        sections.push(`  Kilde: ${r.source_url}`);
+      }
+      return { content: [{ type: "text" as const, text: sections.join("\n") }] };
+    }
+  );
+
   // ─── MCP Resources ──────────────────────────────────────────
   // Resources let agents READ data directly (vs tools which are actions).
   // This is the MCP equivalent of a database view.
