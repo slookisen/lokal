@@ -6227,6 +6227,101 @@ console.log("── PR-29 related-producers tests ──");
   );
 }
 
+// ─── PR-56: Smithery distribution channel wired into agent-card + server.json ──
+// PR-56 sequence:
+//   1. server.json (root) + mcp-server/server.json bumped to v0.4.0 with remotes[]
+//      now including Smithery gateway URL
+//   2. getRegistryCard() emits a `x-distribution` field listing smithery + npm + a2a
+//      (x- prefix per code-reviewer note re strict A2A validators)
+//      so consumer agents that hit /.well-known/agent-card.json can discover us
+//      across all three indexes without a separate API call
+{
+  console.log("\n── PR-56: Smithery distribution wiring ──");
+
+  // (1) server.json (root) — must contain Smithery URL in remotes[]
+  const serverJsonRoot = require("fs").readFileSync("server.json", "utf-8");
+  const serverParsed = JSON.parse(serverJsonRoot);
+  assertTrue(
+    serverParsed.version === "0.4.0",
+    "pr-56: server.json bumped to v0.4.0 (was 0.3.3)"
+  );
+  assertTrue(
+    Array.isArray(serverParsed.remotes) &&
+      serverParsed.remotes.some((r: any) =>
+        typeof r.url === "string" && r.url.includes("server.smithery.ai")),
+    "pr-56: server.json remotes[] includes server.smithery.ai entry"
+  );
+  assertTrue(
+    !serverParsed.remotes.some((r: any) => "headers" in r),
+    "pr-56: server.json remotes[] do NOT include headers[] (per code-reviewer — would be misused as real HTTP headers)"
+  );
+
+  // (2) mcp-server/server.json — also has Smithery in remotes[]
+  const mcpServerJson = require("fs").readFileSync("mcp-server/server.json", "utf-8");
+  const mcpParsed = JSON.parse(mcpServerJson);
+  assertTrue(
+    Array.isArray(mcpParsed.remotes) &&
+      mcpParsed.remotes.some((r: any) =>
+        typeof r.url === "string" && r.url.includes("server.smithery.ai")),
+    "pr-56: mcp-server/server.json remotes[] includes Smithery"
+  );
+
+  // (3) Behavioural test — actually invoke getRegistryCard() and assert on
+  // the returned object's x-distribution[] (not just source-string match).
+  // getRegistryCard() calls getStats() (needs `listings` + `agents` tables)
+  // and uses getConfig() in skill descriptions (needs loadConfigsAtBoot()).
+  // We bring up both before invoking. This catches runtime regressions a
+  // regex would miss.
+  {
+    const Database = require("better-sqlite3");
+    const initMod56 = require("../src/database/init");
+    const regMod56 = require("../src/services/marketplace-registry");
+    const cfgMod56 = require("../src/config/vertical-config");
+    cfgMod56._resetConfigCacheForTests();
+    cfgMod56.loadConfigsAtBoot({ dir: "./verticals" });
+    const db56 = new Database(":memory:");
+    db56.exec(`
+      CREATE TABLE IF NOT EXISTS agents (
+        id TEXT PRIMARY KEY, name TEXT, role TEXT, city TEXT,
+        is_active INTEGER DEFAULT 1, umbrella_type TEXT,
+        trust_score INTEGER DEFAULT 0, created_at TEXT DEFAULT (datetime('now'))
+      );
+      CREATE TABLE IF NOT EXISTS listings (id TEXT PRIMARY KEY);
+    `);
+    initMod56.__setDbForTesting(db56);
+    const reg56 = regMod56.marketplaceRegistry as any;
+    reg56._agentsCache = null;
+    reg56._statsCache = null;
+
+    const card = regMod56.marketplaceRegistry.getRegistryCard("https://rettfrabonden.com") as any;
+    const dist = card["x-distribution"];
+    assertTrue(
+      Array.isArray(dist) && dist.length === 3,
+      `pr-56: getRegistryCard() emits x-distribution with 3 entries (got ${Array.isArray(dist) ? dist.length : typeof dist})`
+    );
+    const channels = (dist || []).map((d: any) => d.channel).sort();
+    assertTrue(
+      JSON.stringify(channels) === JSON.stringify(["a2a-registry", "npm", "smithery"]),
+      `pr-56: x-distribution channels are exactly [a2a-registry, npm, smithery] (got ${JSON.stringify(channels)})`
+    );
+    const a2aEntry = (dist || []).find((d: any) => d.channel === "a2a-registry");
+    assertTrue(
+      a2aEntry && typeof a2aEntry.install === "string" &&
+        a2aEntry.install.startsWith("https://rettfrabonden.com/.well-known/"),
+      "pr-56: x-distribution a2a-registry.install correctly interpolates baseUrl"
+    );
+    const smitheryEntry = (dist || []).find((d: any) => d.channel === "smithery");
+    assertTrue(
+      smitheryEntry && smitheryEntry.url === "https://smithery.ai/servers/@slookisen/rettfrabonden",
+      "pr-56: x-distribution smithery.url points to public Smithery listing page"
+    );
+
+    // Cleanup so subsequent tests can re-init their own db
+    db56.close();
+  }
+}
+
+
 // ── REPORT ────────────────────────────────────────────────────────────
 
 // Wait for the M2 owner-portal async tests before reporting so their
