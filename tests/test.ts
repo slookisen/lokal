@@ -6322,6 +6322,66 @@ console.log("── PR-29 related-producers tests ──");
 }
 
 
+// ─── PR-58: Debio C.1-C — auto-tag enrichment for organic certifications ──
+{
+  console.log("\n── PR-58: Debio auto-tag enrichment ──");
+
+  // (1) detector unit-tests
+  const { detectOrganicCertification } = require("../src/services/organic-keyword-detector");
+
+  const high = detectOrganicCertification("<html><body><p>Vi er Debio sertifisert siden 2010.</p></body></html>");
+  assertEq(high.detected, true, "pr-58: detector fires on 'Debio sertifisert'");
+  assertEq(high.confidence, "high", "pr-58: 'Debio sertifisert' is HIGH confidence");
+  assertTrue(high.evidence_snippets.length >= 1, "pr-58: detector returns at least 1 evidence snippet");
+
+  const medium = detectOrganicCertification("Vi driver med økologisk produksjon. All vår organic farming følger streng standard.");
+  assertEq(medium.confidence, "medium", "pr-58: ≥2 MEDIUM keywords → medium confidence");
+
+  const low = detectOrganicCertification("Vi tenker på å gå over til økologisk drift.");
+  assertEq(low.confidence, "low", "pr-58: bare 'økologisk' uten kontekst → low confidence");
+
+  const noMatch = detectOrganicCertification("<html>Vi selger melk og ost.</html>");
+  assertEq(noMatch.detected, false, "pr-58: detector returns false on unrelated content");
+
+  // (2) script + style tags stripped before matching
+  const inScript = detectOrganicCertification('<script>var s = "Debio sertifisert"</script><body>nothing here</body>');
+  assertEq(inScript.detected, false, "pr-58: keywords inside <script> tags are stripped before matching");
+
+  // (3) Ø-merket alternate-spelling matches
+  const omerket = detectOrganicCertification("<p>Vi har vært Ø-merket i 5 år.</p>");
+  assertEq(omerket.confidence, "high", "pr-58: 'Ø-merket' is HIGH confidence (unicode handled)");
+
+  // (4) Source-presence: new endpoint registered
+  const adminKnowSrc = require("fs").readFileSync("src/routes/admin-knowledge.ts", "utf-8");
+  const adminAffSrc = require("fs").existsSync("src/routes/admin-affiliations.ts")
+    ? require("fs").readFileSync("src/routes/admin-affiliations.ts", "utf-8")
+    : "";
+  assertTrue(
+    /['"]\/admin\/affiliations\/auto-create['"]/.test(adminKnowSrc) ||
+      /['"]\/admin\/affiliations\/auto-create['"]/.test(adminAffSrc) ||
+      /['"]\/auto-create['"]/.test(adminAffSrc),
+    "pr-58: POST /admin/affiliations/auto-create endpoint registered"
+  );
+
+  // (5) UI rendering condition for pending_confirmation present in seo.ts
+  const seoSrc = require("fs").readFileSync("src/routes/seo.ts", "utf-8");
+  assertTrue(
+    /pending_confirmation/.test(seoSrc),
+    "pr-58: seo.ts checks affiliation status === pending_confirmation for 'antatt' rendering"
+  );
+  assertTrue(
+    /antatt/i.test(seoSrc),
+    "pr-58: seo.ts emits 'antatt' label for inferred-affiliation badges"
+  );
+
+  // (6) evidence_json column migration in init.ts
+  const initSrc = require("fs").readFileSync("src/database/init.ts", "utf-8");
+  assertTrue(
+    /evidence_json/.test(initSrc),
+    "pr-58: init.ts contains evidence_json column reference (additive ALTER)"
+  );
+}
+
 // ── REPORT ────────────────────────────────────────────────────────────
 
 // Wait for the M2 owner-portal async tests before reporting so their
