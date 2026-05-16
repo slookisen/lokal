@@ -26,13 +26,7 @@
     },
     {
       "type": "streamable-http",
-      "url": "https://server.smithery.ai/@slookisen/rettfrabonden",
-      "headers": [
-        {
-          "name": "x-smithery-listing",
-          "description": "Public Smithery listing — proxied to https://rettfrabonden.com/mcp. Browsable at https://smithery.ai/servers/@slookisen/rettfrabonden"
-        }
-      ]
+      "url": "https://server.smithery.ai/@slookisen/rettfrabonden"
     }
   ]
 }

@@ -753,7 +753,9 @@ class MarketplaceRegistry {
       // discover us via these channels can verify they are talking to the
       // canonical Rett fra Bonden marketplace by cross-checking the homepage
       // and `name` here.
-      distribution: [
+      // Prefixed with `x-` to follow the in-file extension convention
+      // (matches `x-lokal` below) and stay safe with strict A2A validators.
+      "x-distribution": [
         {
           channel: "smithery",
           url: "https://smithery.ai/servers/@slookisen/rettfrabonden",
