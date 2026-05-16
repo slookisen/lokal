@@ -61,6 +61,11 @@ const MAX_PAGES = 5;
 // ~590-member Hanen corpus (~12 pages) with safety margin.
 const MAX_PAGES_HARD_CAP = 20;
 
+// PR-65 (2026-05-17): max value for the ?start_page=N offset param.
+// Hanen ships ~12 pages today; 100 leaves comfortable headroom for
+// growth without admitting "scroll the entire EU" requests.
+const MAX_START_PAGE = 100;
+
 export type HanenMemberRecord = {
   parsed_name: string;
   parsed_location: string;        // kommune + fylke as a single string
@@ -126,6 +131,7 @@ export type HanenMatchVerdict = MatchVerdict;
 export async function fetchHanenListing(
   opts?: {
     maxPages?: number;
+    startPage?: number;
     renderer?: (url: string) => Promise<string>;
   }
 ): Promise<{ pages: Array<{ url: string; html: string }>; errors: string[] }> {
@@ -133,6 +139,17 @@ export async function fetchHanenListing(
   // default (MAX_PAGES) is conservative; admin callers ramp via
   // ?max_pages=N when running a one-off full sweep.
   const cap = Math.min(opts?.maxPages ?? MAX_PAGES, MAX_PAGES_HARD_CAP);
+
+  // PR-65: support ?start_page=N offset so a full ~590-member sweep
+  // can be chunked across multiple admin POSTs (each chunk stays under
+  // Fly's 120s proxy limit). Default 1; clamp at MAX_START_PAGE.
+  const rawStart = opts?.startPage ?? 1;
+  const startPage = Math.min(
+    Math.max(1, Number.isFinite(rawStart) && rawStart > 0 ? Math.floor(rawStart) : 1),
+    MAX_START_PAGE,
+  );
+  const endPage = startPage + cap - 1; // inclusive
+
   const errors: string[] = [];
   const pages: Array<{ url: string; html: string }> = [];
 
@@ -144,10 +161,18 @@ export async function fetchHanenListing(
     return r.html;
   });
 
-  // Always fetch page 1.
+  // We always need page 1's HTML to detect whether pagination exists
+  // (the <ul class="page-numbers"> block lives only on page 1). When
+  // startPage === 1 we keep this page in the returned `pages` array;
+  // when startPage > 1 we use it ONLY for the pagination-presence
+  // sniff and do not surface it to the caller (the caller is asking
+  // for a later slice and would otherwise re-process page 1 contents).
+  let page1Html = "";
   try {
-    const html = await render(LISTING_URL);
-    pages.push({ url: LISTING_URL, html });
+    page1Html = await render(LISTING_URL);
+    if (startPage === 1) {
+      pages.push({ url: LISTING_URL, html: page1Html });
+    }
   } catch (e) {
     errors.push(`fetchHanenListing(page=1) failed: ${e instanceof Error ? e.message : String(e)}`);
     return { pages, errors };
@@ -158,12 +183,14 @@ export async function fetchHanenListing(
   // <ul class="page-numbers"> block; absence means "this is already the
   // last page" → stop. We also bail on duplicate content (defensive vs.
   // CDN echo) and empty pages (<500 bytes is always a soft 404 here).
-  if (cap > 1 && /class=["'][^"']*page-numbers/i.test(pages[0].html)) {
-    for (let n = 2; n <= cap; n++) {
+  const hasPagination = /class=["'][^"']*page-numbers/i.test(page1Html);
+  if (hasPagination && endPage >= 2) {
+    const firstExtra = Math.max(2, startPage);
+    for (let n = firstExtra; n <= endPage; n++) {
       const url = `${LISTING_URL.replace(/\/$/, "")}/page/${n}/`;
       try {
         const html = await render(url);
-        if (!html || html.length < 500 || html === pages[0].html) break;
+        if (!html || html.length < 500 || html === page1Html) break;
         pages.push({ url, html });
       } catch (e) {
         errors.push(`fetchHanenListing(page=${n}) failed: ${e instanceof Error ? e.message : String(e)}`);
@@ -499,6 +526,7 @@ export function matchHanenMemberToAgent(
 // parsed_name (UNIQUE) so re-running just refreshes the last_seen_at.
 export async function runHanenScraper(opts?: {
   maxPages?: number;
+  startPage?: number;
   renderer?: (url: string) => Promise<string>;
 }): Promise<HanenScrapeResult> {
   const result: HanenScrapeResult = {
@@ -544,6 +572,7 @@ export async function runHanenScraper(opts?: {
   // 1. Fetch (render-worker).
   const { pages, errors: fetchErrors } = await fetchHanenListing({
     maxPages: opts?.maxPages,
+    startPage: opts?.startPage,
     renderer: opts?.renderer,
   });
   result.fetched = pages.length;
@@ -838,3 +867,4 @@ export const HANEN_MATCH_THRESHOLD = MATCH_THRESHOLD;
 export const HANEN_LISTING_URL = LISTING_URL;
 export const HANEN_MAX_PAGES_DEFAULT = MAX_PAGES;
 export const HANEN_MAX_PAGES_HARD_CAP = MAX_PAGES_HARD_CAP;
+export const HANEN_MAX_START_PAGE = MAX_START_PAGE;

@@ -41,6 +41,7 @@ import adminAffiliationsRoutes from "./routes/admin-affiliations";
 import adminBmEventsRoutes from "./routes/admin-bm-events";
 import adminHanenRoutes, { publicRouter as publicHanenRoutes } from "./routes/admin-hanen";
 import adminDebioCrossCheckRoutes from "./routes/admin-debio-cross-check";
+import adminJobsRoutes from "./routes/admin-jobs";
 import platformTriggersRoutes, { adminRouter as adminTriggersRoutes } from "./routes/platform-triggers";
 import crmRoutes from "./routes/crm";
 import { list as blocklistList } from "./services/blocklist-service";
@@ -274,6 +275,8 @@ app.use("/admin/hanen", adminLimiter, adminHanenRoutes);
 app.use("/api/marketplace/hanen", publicHanenRoutes);
 // C.1-A (2026-05-16): Debio TRACES+Brreg cross-check — POST /admin/debio/cross-check
 app.use("/admin/debio", adminLimiter, adminDebioCrossCheckRoutes);
+// PR-65 (2026-05-17): in-memory job tracker for ?async=1 admin endpoints — GET /admin/jobs[/:id]
+app.use("/admin", adminLimiter, adminJobsRoutes);
 
 // Platform triggers — public webhook receiver + admin queue access.
 // /platform/triggers/* uses HMAC (no admin-key); /admin/triggers/* uses admin-key.

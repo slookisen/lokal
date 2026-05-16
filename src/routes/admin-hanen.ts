@@ -23,7 +23,8 @@
 
 import { Router, Request, Response } from "express";
 import { getDb } from "../database/init";
-import { runHanenScraper, HANEN_MAX_PAGES_DEFAULT, HANEN_MAX_PAGES_HARD_CAP } from "../services/hanen-scraper";
+import { runHanenScraper, HANEN_MAX_PAGES_DEFAULT, HANEN_MAX_PAGES_HARD_CAP, HANEN_MAX_START_PAGE } from "../services/hanen-scraper";
+import { startJob } from "../services/job-tracker";
 import { slugify } from "../utils/slug";
 
 const adminRouter = Router();
@@ -49,18 +50,28 @@ function requireAdmin(req: Request, res: Response): boolean {
 
 // ─── POST /admin/hanen/scrape ──────────────────────────────────
 // Query params:
-//   ?max_pages=N   — override the default page cap. Hard ceiling of
-//                    HANEN_MAX_PAGES_HARD_CAP enforced server-side
-//                    (20 today). Default HANEN_MAX_PAGES_DEFAULT (5).
+//   ?max_pages=N       — override the default page cap. Hard ceiling of
+//                        HANEN_MAX_PAGES_HARD_CAP enforced server-side
+//                        (20 today). Default HANEN_MAX_PAGES_DEFAULT (5).
+//   ?start_page=N      — (PR-65) start crawling from page N. Default 1.
+//                        Clamped at HANEN_MAX_START_PAGE (100). Use
+//                        together with ?max_pages to chunk a full sweep:
+//                        ?start_page=1&max_pages=5, then 6&5, 11&5, ...
+//                        Page 1 is still fetched silently when
+//                        startPage > 1 so the pagination-presence sniff
+//                        keeps working.
+//   ?async=1           — (PR-65) fire-and-forget: returns 202 + {job_id}
+//                        immediately. Poll GET /admin/jobs/<job_id> for
+//                        progress. Use this for any sweep larger than
+//                        ~2 pages (Fly proxy timeout is ~120s).
 //
 // Why the cap rationale: Fly's HTTP proxy times the response out at
 // 120s. One Hanen render takes ~60s (cold-start through the
 // render-worker behind Cloudflare). So ~2 pages is "interactive"
-// territory; everything above that is fire-and-forget — the server
-// keeps scraping after Fly drops the connection, the caller polls the
-// admin endpoint later to see the latest counters. The 20-page hard cap
-// covers the full ~590-member Hanen corpus (~12 pages @ ~50/page) with
-// safety margin for re-renders.
+// territory; everything above that should use ?async=1 OR be chunked
+// via ?start_page=N&max_pages=N from a polling caller. The 20-page
+// hard cap covers the full ~590-member Hanen corpus (~12 pages @
+// ~50/page) with safety margin for re-renders.
 //
 // Body form (legacy, still supported): {maxPages: N} POST JSON body.
 // Query form takes precedence when both are present.
@@ -82,11 +93,44 @@ adminRouter.post("/scrape", async (req: Request, res: Response) => {
         : HANEN_MAX_PAGES_DEFAULT;
   const maxPages = Math.min(Math.max(1, Math.floor(requested)), HANEN_MAX_PAGES_HARD_CAP);
 
+  // PR-65: ?start_page=N offset (default 1, clamped at HANEN_MAX_START_PAGE).
+  const spRaw =
+    (req.query.start_page as string | undefined) ||
+    (req.query.startPage as string | undefined);
+  const spNum = spRaw !== undefined ? parseInt(spRaw, 10) : NaN;
+  const startPage = Math.min(
+    Math.max(1, Number.isFinite(spNum) && spNum > 0 ? spNum : 1),
+    HANEN_MAX_START_PAGE,
+  );
+
+  // PR-65: ?async=1 → fire-and-forget via the in-memory job tracker.
+  const wantAsync = req.query.async === "1" || req.query.async === "true";
+
+  const opts = { maxPages, startPage };
+
+  if (wantAsync) {
+    const dedupeKey = `start=${startPage}:max=${maxPages}`;
+    const job = startJob("hanen-scrape", async () => {
+      return await runHanenScraper(opts);
+    }, { dedupeKey });
+    return res.status(202).json({
+      job_id: job.job_id,
+      status: job.status,
+      started_at: job.started_at,
+      endpoint: job.endpoint,
+      requested_max_pages: maxPages,
+      start_page: startPage,
+      hard_cap_max_pages: HANEN_MAX_PAGES_HARD_CAP,
+      poll_url: `/admin/jobs/${job.job_id}`,
+    });
+  }
+
   try {
-    const result = await runHanenScraper({ maxPages });
+    const result = await runHanenScraper(opts);
     res.json({
       ...result,
       requested_max_pages: maxPages,
+      start_page: startPage,
       hard_cap_max_pages: HANEN_MAX_PAGES_HARD_CAP,
     });
   } catch (err: any) {

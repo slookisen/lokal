@@ -75,6 +75,10 @@ export type CrossCheckResult = {
   errors: string[];
   since: string;
   duration_ms: number;
+  // PR-65: which slice of the TRACES global list this run processed.
+  // start = startTracesPage opt; end = start + maxTracesPages - 1
+  // (inclusive). Always present; defaults are {start:0, end:1199}.
+  traces_pages_processed: { start: number; end: number };
 };
 
 export type CrossCheckOptions = {
@@ -84,6 +88,10 @@ export type CrossCheckOptions = {
   maxFiltered?: number;          // hard cap on TRACES records processed
   /** Override which umbrella agent counts as Debio. Tests use this. */
   debioUmbrellaId?: string;
+  /** PR-65: start TRACES pagination from this 0-based page index. Default 0. */
+  startTracesPage?: number;
+  /** PR-65: max TRACES pages this call may fetch. Default 1200. */
+  maxTracesPages?: number;
 };
 
 // ─── Helper: find the Debio umbrella agent's id ──────────────────────
@@ -218,6 +226,20 @@ export async function runDebioCrossCheck(
 ): Promise<CrossCheckResult> {
   const since = opts.since ?? DEFAULT_SINCE_ISO;
   const t0 = Date.now();
+  // PR-65: compute the inclusive page window we'll report back, so
+  // even if the run fails early the caller knows which slice was
+  // attempted. Defaults match the prior global-sweep behaviour.
+  const startTracesPage = Math.max(
+    0,
+    Number.isFinite(opts.startTracesPage) ? Math.floor(opts.startTracesPage ?? 0) : 0,
+  );
+  const maxTracesPages = Math.max(
+    1,
+    Number.isFinite(opts.maxTracesPages) && (opts.maxTracesPages ?? 0) > 0
+      ? Math.floor(opts.maxTracesPages ?? 1200)
+      : 1200,
+  );
+
   const result: CrossCheckResult = {
     traces_fetched: 0,
     traces_filtered: 0,
@@ -228,6 +250,10 @@ export async function runDebioCrossCheck(
     errors: [],
     since,
     duration_ms: 0,
+    traces_pages_processed: {
+      start: startTracesPage,
+      end: startTracesPage + maxTracesPages - 1,
+    },
   };
 
   const db = getDb();
@@ -248,6 +274,8 @@ export async function runDebioCrossCheck(
       fetchImpl: opts.fetchImpl,
       delayMs: opts.delayMs,
       maxFiltered: opts.maxFiltered,
+      startTracesPage,
+      maxTracesPages,
     });
   } catch (e) {
     result.errors.push(

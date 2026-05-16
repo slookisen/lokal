@@ -7153,7 +7153,12 @@ const _pr56Promise: Promise<void> = new Promise<void>(r => { _pr56Resolve = r; }
     "pr64: admin-hanen reads req.query.max_pages");
   assertTrue(/HANEN_MAX_PAGES_HARD_CAP/.test(adminSrc),
     "pr64: admin-hanen enforces HANEN_MAX_PAGES_HARD_CAP");
-  assertTrue(/runHanenScraper\(\s*\{\s*maxPages\s*\}\s*\)/.test(adminSrc),
+  // PR-65 changed the call site to pass an opts object (maxPages + startPage).
+  // Accept either: {maxPages} OR runHanenScraper(opts) where opts is a local
+  // const containing maxPages (covers both shapes).
+  assertTrue(
+    /runHanenScraper\(\s*\{[^}]*maxPages[^}]*\}\s*\)/.test(adminSrc)
+      || /runHanenScraper\(\s*opts\s*\)/.test(adminSrc),
     "pr64: admin-hanen passes maxPages through to runHanenScraper");
   // Match across newlines — the rationale comment may wrap.
   assertTrue(/Fly[\s\S]{0,100}120/.test(adminSrc),
@@ -7647,6 +7652,547 @@ const _pr63Promise: Promise<void> = new Promise<void>(r => { _pr63Resolve = r; }
   );
 }
 
+
+// PR-65 async-test handle (job-tracker uses setImmediate so completion
+// is observable only after a tick).
+let _pr65Resolve: () => void = () => {};
+const _pr65Promise: Promise<void> = new Promise<void>(r => { _pr65Resolve = r; });
+
+// ─── PR-65: async job pattern + Hanen offset + Debio TRACES pagination ──
+{
+  console.log("\n── PR-65: async + offset (Option D) ──");
+  const fs = require("fs");
+
+  // ── (1) Source-presence: new files ──
+  assertTrue(fs.existsSync("src/services/job-tracker.ts"),
+    "pr65: job-tracker.ts present");
+  assertTrue(fs.existsSync("src/routes/admin-jobs.ts"),
+    "pr65: admin-jobs.ts present");
+
+  const jtSrc = fs.readFileSync("src/services/job-tracker.ts", "utf-8");
+  assertTrue(/export\s+function\s+startJob/.test(jtSrc),
+    "pr65: job-tracker exports startJob()");
+  assertTrue(/export\s+function\s+getJob/.test(jtSrc),
+    "pr65: job-tracker exports getJob()");
+  assertTrue(/export\s+function\s+listJobs/.test(jtSrc),
+    "pr65: job-tracker exports listJobs()");
+  assertTrue(/export\s+function\s+_clearJobsForTesting/.test(jtSrc),
+    "pr65: job-tracker exports _clearJobsForTesting()");
+  assertTrue(/randomUUID/.test(jtSrc),
+    "pr65: job-tracker uses crypto.randomUUID (no new external deps)");
+  assertTrue(/setImmediate/.test(jtSrc),
+    "pr65: job-tracker schedules fn via setImmediate");
+
+  const ajSrc = fs.readFileSync("src/routes/admin-jobs.ts", "utf-8");
+  assertTrue(/router\.get\(["']\/jobs["']/.test(ajSrc),
+    "pr65: admin-jobs registers GET /jobs");
+  assertTrue(/router\.get\(["']\/jobs\/:id["']/.test(ajSrc),
+    "pr65: admin-jobs registers GET /jobs/:id");
+  assertTrue(/requireAdmin/.test(ajSrc),
+    "pr65: admin-jobs gates both endpoints behind requireAdmin");
+  assertTrue(/status\(404\)/.test(ajSrc),
+    "pr65: admin-jobs returns 404 for unknown job_id");
+
+  const indexSrc = fs.readFileSync("src/index.ts", "utf-8");
+  assertTrue(/adminJobsRoutes/.test(indexSrc),
+    "pr65: index.ts imports adminJobsRoutes");
+  assertTrue(/app\.use\(["']\/admin["'],\s*adminLimiter,\s*adminJobsRoutes\)/.test(indexSrc),
+    "pr65: index.ts mounts /admin adminLimiter adminJobsRoutes");
+
+  // ── (2) Source-presence: Hanen offset wired through ──
+  const hanenSvcSrc = fs.readFileSync("src/services/hanen-scraper.ts", "utf-8");
+  assertTrue(/MAX_START_PAGE\s*=/.test(hanenSvcSrc),
+    "pr65: hanen-scraper defines MAX_START_PAGE constant");
+  assertTrue(/HANEN_MAX_START_PAGE/.test(hanenSvcSrc),
+    "pr65: hanen-scraper exports HANEN_MAX_START_PAGE");
+  assertTrue(/startPage\?:\s*number/.test(hanenSvcSrc),
+    "pr65: fetchHanenListing accepts startPage option");
+  assertTrue(/runHanenScraper[\s\S]{0,400}startPage\?:\s*number/.test(hanenSvcSrc),
+    "pr65: runHanenScraper accepts startPage option");
+
+  const hanenRouteSrc = fs.readFileSync("src/routes/admin-hanen.ts", "utf-8");
+  assertTrue(/req\.query\.start_page/.test(hanenRouteSrc),
+    "pr65: admin-hanen reads req.query.start_page");
+  assertTrue(/req\.query\.async/.test(hanenRouteSrc),
+    "pr65: admin-hanen reads req.query.async");
+  assertTrue(/startJob\(["']hanen-scrape["']/.test(hanenRouteSrc),
+    "pr65: admin-hanen calls startJob('hanen-scrape', ...) for async mode");
+  assertTrue(/status\(202\)/.test(hanenRouteSrc),
+    "pr65: admin-hanen returns 202 in async mode");
+  assertTrue(/HANEN_MAX_START_PAGE/.test(hanenRouteSrc),
+    "pr65: admin-hanen enforces HANEN_MAX_START_PAGE clamp");
+
+  // ── (3) Source-presence: Debio TRACES pagination wired through ──
+  const tracesSrc = fs.readFileSync("src/services/traces-client.ts", "utf-8");
+  assertTrue(/startTracesPage\?:\s*number/.test(tracesSrc),
+    "pr65: traces-client FetchTracesOptions includes startTracesPage");
+  assertTrue(/maxTracesPages\?:\s*number/.test(tracesSrc),
+    "pr65: traces-client FetchTracesOptions includes maxTracesPages");
+  assertTrue(/startTracesPage \* pageSize/.test(tracesSrc),
+    "pr65: traces-client uses startTracesPage * pageSize for firstResult");
+  assertTrue(/s=\$\{startForKey\}\|m=\$\{maxForKey\}/.test(tracesSrc),
+    "pr65: traces-client cache key includes start+max so partial sweeps don't poison cache");
+
+  const debioSvcSrc = fs.readFileSync("src/services/debio-cross-check.ts", "utf-8");
+  assertTrue(/traces_pages_processed:\s*\{\s*start:\s*number;\s*end:\s*number\s*\}/.test(debioSvcSrc),
+    "pr65: CrossCheckResult includes traces_pages_processed { start, end }");
+  assertTrue(/startTracesPage\?:\s*number/.test(debioSvcSrc),
+    "pr65: CrossCheckOptions includes startTracesPage");
+  assertTrue(/maxTracesPages\?:\s*number/.test(debioSvcSrc),
+    "pr65: CrossCheckOptions includes maxTracesPages");
+
+  const debioRouteSrc = fs.readFileSync("src/routes/admin-debio-cross-check.ts", "utf-8");
+  assertTrue(/req\.query\.start_traces_page/.test(debioRouteSrc),
+    "pr65: admin-debio reads req.query.start_traces_page");
+  assertTrue(/req\.query\.max_traces_pages/.test(debioRouteSrc),
+    "pr65: admin-debio reads req.query.max_traces_pages");
+  assertTrue(/req\.query\.async/.test(debioRouteSrc),
+    "pr65: admin-debio reads req.query.async");
+  assertTrue(/startJob\(["']debio-cross-check["']/.test(debioRouteSrc),
+    "pr65: admin-debio calls startJob('debio-cross-check', ...) for async mode");
+
+  // ── (4) Behavioural: job-tracker basics ──
+  const jt = require("../src/services/job-tracker");
+  jt._clearJobsForTesting();
+
+  // 4a. startJob returns running state with valid UUID
+  const j1 = jt.startJob("test-endpoint", async () => 42);
+  assertEq(j1.status, "running",
+    "pr65: startJob returns initial status='running'");
+  assertEq(j1.endpoint, "test-endpoint",
+    "pr65: startJob sets endpoint");
+  assertEq(typeof j1.job_id, "string",
+    "pr65: startJob assigns a string job_id");
+  // RFC 4122 v4: 8-4-4-4-12 hex with version nibble = 4
+  assertTrue(/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(j1.job_id),
+    "pr65: startJob job_id is a valid UUID v4");
+  assertEq(j1.result, null, "pr65: running job's result is null");
+  assertEq(j1.error, null, "pr65: running job's error is null");
+  assertEq(j1.finished_at, null, "pr65: running job's finished_at is null");
+  assertTrue(typeof j1.started_at === "string" && j1.started_at.length > 0,
+    "pr65: running job has started_at ISO timestamp");
+
+  // 4b. getJob(unknown_id) returns null
+  assertEq(jt.getJob("nonexistent-id-1234"), null,
+    "pr65: getJob() with unknown id returns null");
+
+  // 4c. listJobs basic filter
+  const allJobs = jt.listJobs();
+  assertTrue(allJobs.length >= 1,
+    "pr65: listJobs() returns at least the job we just started");
+  const filteredJobs = jt.listJobs({ endpoint: "test-endpoint" });
+  assertEq(filteredJobs.length, 1,
+    "pr65: listJobs({endpoint: 'test-endpoint'}) returns 1 match");
+  const noMatchJobs = jt.listJobs({ endpoint: "nonexistent" });
+  assertEq(noMatchJobs.length, 0,
+    "pr65: listJobs({endpoint: 'nonexistent'}) returns 0 matches");
+}
+
+// Async block: must await setImmediate completion to see status transitions.
+{
+  (async () => {
+    const jt = require("../src/services/job-tracker");
+    jt._clearJobsForTesting();
+
+    // 4d. Successful completion via setImmediate
+    const okJob = jt.startJob("ok-endpoint", async () => ({ value: 42 }));
+    // Wait for setImmediate-scheduled fn to settle.
+    await new Promise(r => setImmediate(r));
+    await new Promise(r => setImmediate(r));
+    const okFresh = jt.getJob(okJob.job_id);
+    assertTrue(okFresh !== null,
+      "pr65: getJob returns the completed job state");
+    if (okFresh) {
+      assertEq(okFresh.status, "completed",
+        "pr65: status flips to 'completed' after fn resolves");
+      assertTrue(okFresh.result !== null && (okFresh.result as any).value === 42,
+        "pr65: completed job's result holds fn return value");
+      assertTrue(okFresh.finished_at !== null && typeof okFresh.finished_at === "string",
+        "pr65: completed job has finished_at ISO timestamp");
+      assertTrue(typeof okFresh.duration_ms === "number" && okFresh.duration_ms >= 0,
+        "pr65: completed job has non-negative duration_ms");
+      assertEq(okFresh.error, null,
+        "pr65: completed job's error stays null");
+    }
+
+    // 4e. Failed completion
+    const failJob = jt.startJob("fail-endpoint", async () => {
+      throw new Error("boom");
+    });
+    await new Promise(r => setImmediate(r));
+    await new Promise(r => setImmediate(r));
+    const failFresh = jt.getJob(failJob.job_id);
+    assertTrue(failFresh !== null,
+      "pr65: getJob returns the failed job state");
+    if (failFresh) {
+      assertEq(failFresh.status, "failed",
+        "pr65: status flips to 'failed' after fn rejects");
+      assertEq(failFresh.error, "boom",
+        "pr65: failed job's error holds the thrown message");
+      assertEq(failFresh.result, null,
+        "pr65: failed job's result stays null");
+      assertTrue(failFresh.finished_at !== null,
+        "pr65: failed job has finished_at set");
+    }
+
+    // 4f. Progress updates surface through getJob
+    let resolveLong: ((v: number) => void) | null = null;
+    const longProm = new Promise<number>(r => { resolveLong = r; });
+    const progJob = jt.startJob("prog-endpoint", async (update: any) => {
+      update({ stage: "step1", current: 1, total: 3 });
+      return await longProm;
+    });
+    // Let setImmediate fire so update() runs.
+    await new Promise(r => setImmediate(r));
+    await new Promise(r => setImmediate(r));
+    const progMid = jt.getJob(progJob.job_id);
+    assertTrue(progMid !== null && progMid.progress !== null,
+      "pr65: progress visible mid-run via getJob");
+    if (progMid && progMid.progress) {
+      assertEq(progMid.progress.stage, "step1",
+        "pr65: progress.stage = 'step1'");
+      assertEq(progMid.progress.current, 1,
+        "pr65: progress.current = 1");
+      assertEq(progMid.progress.total, 3,
+        "pr65: progress.total = 3");
+    }
+    // Resolve long fn so the process can exit cleanly.
+    if (resolveLong) (resolveLong as (v: number) => void)(99);
+    await new Promise(r => setImmediate(r));
+
+    // 4g. Dedupe: same (endpoint, dedupeKey) within window → same job_id
+    jt._clearJobsForTesting();
+    const dup1 = jt.startJob("dup-ep", async () => 1, { dedupeKey: "k1" });
+    const dup2 = jt.startJob("dup-ep", async () => 2, { dedupeKey: "k1" });
+    assertEq(dup1.job_id, dup2.job_id,
+      "pr65: dedupe — identical (endpoint, key) returns same job_id");
+    const distinct = jt.startJob("dup-ep", async () => 3, { dedupeKey: "k2" });
+    assertTrue(distinct.job_id !== dup1.job_id,
+      "pr65: dedupe — different dedupeKey starts a new job");
+    const otherEp = jt.startJob("other-ep", async () => 4, { dedupeKey: "k1" });
+    assertTrue(otherEp.job_id !== dup1.job_id,
+      "pr65: dedupe scopes to (endpoint, key) — different endpoint same key starts new job");
+    await new Promise(r => setImmediate(r));
+    await new Promise(r => setImmediate(r));
+
+    // 4h. TTL expiry: directly mutate started_at to 2h ago → getJob returns null
+    jt._clearJobsForTesting();
+    const expJob = jt.startJob("exp-ep", async () => "old");
+    await new Promise(r => setImmediate(r));
+    await new Promise(r => setImmediate(r));
+    const expState = jt.getJob(expJob.job_id);
+    if (expState) {
+      const twoHoursAgo = new Date(Date.now() - 2 * 60 * 60 * 1000).toISOString();
+      (expState as any).started_at = twoHoursAgo;
+      (expState as any).finished_at = twoHoursAgo;
+    }
+    const expAfter = jt.getJob(expJob.job_id);
+    assertEq(expAfter, null,
+      "pr65: TTL — job aged > 1h is treated as expired (getJob returns null)");
+
+    // 4i. listJobs respects limit
+    jt._clearJobsForTesting();
+    for (let i = 0; i < 5; i++) {
+      jt.startJob("multi-ep", async () => i);
+    }
+    const limited = jt.listJobs({ endpoint: "multi-ep", limit: 3 });
+    assertEq(limited.length, 3,
+      "pr65: listJobs respects limit param");
+    const unlimited = jt.listJobs({ endpoint: "multi-ep" });
+    assertEq(unlimited.length, 5,
+      "pr65: listJobs default returns all (≤20) recent jobs");
+
+    // ── (5) Hanen offset behaviour via runHanenScraper (stub renderer) ──
+    const hs = require("../src/services/hanen-scraper");
+    // Page 1 must include the page-numbers block for pagination to engage.
+    const page1Html = `
+      <html><body>
+      <ul class="page-numbers"><li><a href="/medlemmer/page/2/">2</a></li></ul>
+      <div class="fl-post-grid-post hanen_county-oslo hanen_category-mat" itemscope itemtype="https://schema.org/CreativeWork">
+        <meta itemscope itemprop="mainEntityOfPage" itemtype="https://schema.org/WebPage" itemid="https://www.hanen.no/bedrift/page1-only/" content="Page1 Only" />
+        <h2><a href="https://www.hanen.no/bedrift/page1-only/" title="Page1 Only">Page1 Only</a></h2>
+      </div></div></body></html>`.padEnd(800, ' ');
+    function makePageHtml(n: number): string {
+      return `<html><body>
+      <div class="fl-post-grid-post hanen_county-oslo hanen_category-mat" itemscope itemtype="https://schema.org/CreativeWork">
+        <meta itemscope itemprop="mainEntityOfPage" itemtype="https://schema.org/WebPage" itemid="https://www.hanen.no/bedrift/p${n}/" content="Page${n} Member" />
+        <h2><a href="https://www.hanen.no/bedrift/p${n}/" title="Page${n} Member">Page${n} Member</a></h2>
+      </div></div></body></html>`.padEnd(800, ' ');
+    }
+    const renderedUrls: string[] = [];
+    const stubRender = async (url: string): Promise<string> => {
+      renderedUrls.push(url);
+      if (url === "https://hanen.no/medlemmer") return page1Html;
+      const m = /\/page\/(\d+)\//.exec(url);
+      if (m) return makePageHtml(parseInt(m[1], 10));
+      return "";
+    };
+
+    // 5a. startPage=5, maxPages=3 → fetches page 1 silently + pages 5,6,7
+    renderedUrls.length = 0;
+    const { fetchHanenListing } = hs;
+    const offsetResult = await fetchHanenListing({
+      startPage: 5,
+      maxPages: 3,
+      renderer: stubRender,
+    });
+    assertEq(offsetResult.pages.length, 3,
+      "pr65: fetchHanenListing(start=5,max=3) returns 3 pages");
+    assertTrue(renderedUrls[0] === "https://hanen.no/medlemmer",
+      "pr65: page 1 fetched silently for pagination-presence sniff when start>1");
+    assertTrue(renderedUrls.includes("https://hanen.no/medlemmer/page/5/"),
+      "pr65: fetched /page/5/ when startPage=5");
+    assertTrue(renderedUrls.includes("https://hanen.no/medlemmer/page/7/"),
+      "pr65: fetched /page/7/ when startPage=5,maxPages=3 (inclusive end)");
+    assertTrue(!offsetResult.pages.some((p: any) => p.url === "https://hanen.no/medlemmer"),
+      "pr65: page 1 NOT in returned pages array when startPage > 1");
+
+    // 5b. startPage defaults to 1 (backward-compat)
+    renderedUrls.length = 0;
+    const defaultResult = await fetchHanenListing({ maxPages: 1, renderer: stubRender });
+    assertEq(defaultResult.pages.length, 1,
+      "pr65: fetchHanenListing default startPage=1 returns 1 page when maxPages=1");
+    assertEq(defaultResult.pages[0].url, "https://hanen.no/medlemmer",
+      "pr65: default start fetches the medlemmer root URL as page 1");
+
+    // 5c. startPage=200 (over MAX_START_PAGE=100) clamps to 100
+    //     Sniff via renderedUrls — the highest /page/N/ URL must be ≤ 100.
+    renderedUrls.length = 0;
+    const clampStub = async (url: string): Promise<string> => {
+      renderedUrls.push(url);
+      if (url === "https://hanen.no/medlemmer") return page1Html;
+      const m = /\/page\/(\d+)\//.exec(url);
+      if (m) {
+        const n = parseInt(m[1], 10);
+        // Return empty after page 102 to stop the loop quickly.
+        return n <= 102 ? makePageHtml(n) : "";
+      }
+      return "";
+    };
+    await fetchHanenListing({
+      startPage: 200,
+      maxPages: 1,
+      renderer: clampStub,
+    });
+    const pageNumsHit = renderedUrls
+      .map((u: string) => /\/page\/(\d+)\//.exec(u))
+      .filter((m: any) => m)
+      .map((m: any) => parseInt(m[1], 10));
+    if (pageNumsHit.length > 0) {
+      const maxHit = Math.max(...pageNumsHit);
+      assertTrue(maxHit <= 100,
+        `pr65: startPage=200 clamps at HANEN_MAX_START_PAGE=100 (max /page/N/ hit = ${maxHit})`);
+    } else {
+      // It's possible to clamp so aggressively that no /page/N/ is fetched at all.
+      // That still passes the clamp contract.
+      passed++;
+    }
+
+    assertEq(hs.HANEN_MAX_START_PAGE, 100,
+      "pr65: HANEN_MAX_START_PAGE constant exported as 100");
+
+    // ── (6) Debio TRACES pagination behaviour ──
+    const tc = require("../src/services/traces-client");
+    tc.__clearTracesCacheForTesting();
+    const fetched: number[] = [];
+    const debioRaw = {
+      operatorName: "Test Operator",
+      operatorId: "T1",
+      address: { city: "Oslo", postalCode: "0001" },
+      competentAuthority: { code: "NO-ØKO-01" },
+      issuedOn: "2026-05-01",
+    };
+    // Build a full page (100 records) so fetchTracesPage keeps paginating
+    // (the loop bails on "Short page = last page" when page.length < pageSize).
+    const fullPage: any[] = [];
+    for (let i = 0; i < 100; i++) fullPage.push(debioRaw);
+    const stubFetch = async (url: string): Promise<any> => {
+      const m = /firstResult=(\d+)&maxResults=(\d+)/.exec(url);
+      const firstResult = m ? parseInt(m[1], 10) : 0;
+      fetched.push(firstResult);
+      return {
+        ok: true,
+        status: 200,
+        text: async () => JSON.stringify(fullPage),
+        json: async () => fullPage,
+      };
+    };
+    // 6a. Start at page 2, max 3 pages → firstResults 200, 300, 400
+    fetched.length = 0;
+    await tc.fetchDebioOperators({
+      startTracesPage: 2,
+      maxTracesPages: 3,
+      delayMs: 0,
+      fetchImpl: stubFetch,
+    });
+    assertEq(fetched[0], 200,
+      "pr65: fetchDebioOperators(start=2) sets firstResult=200 on first page");
+    assertTrue(fetched.length <= 3,
+      "pr65: fetchDebioOperators respects maxTracesPages=3 cap");
+    assertTrue(fetched.includes(200) && fetched.includes(300),
+      "pr65: pages 2 and 3 (firstResult 200, 300) both hit");
+
+    // 6b. Cache key includes window — different windows are independent
+    tc.__clearTracesCacheForTesting();
+    fetched.length = 0;
+    await tc.fetchDebioOperators({
+      startTracesPage: 0,
+      maxTracesPages: 1,
+      delayMs: 0,
+      fetchImpl: stubFetch,
+    });
+    const firstWindowCount = fetched.length;
+    // Second call with different window should NOT hit cache.
+    fetched.length = 0;
+    await tc.fetchDebioOperators({
+      startTracesPage: 5,
+      maxTracesPages: 1,
+      delayMs: 0,
+      fetchImpl: stubFetch,
+    });
+    assertTrue(fetched.length > 0,
+      "pr65: different (startTracesPage, maxTracesPages) window bypasses prior cache entry");
+    assertTrue(firstWindowCount > 0,
+      "pr65: first window call did make HTTP requests");
+
+    // 6c. Backward-compat: no params → default behaviour
+    tc.__clearTracesCacheForTesting();
+    fetched.length = 0;
+    await tc.fetchDebioOperators({
+      maxTracesPages: 1, // keep small for test
+      delayMs: 0,
+      fetchImpl: stubFetch,
+    });
+    assertEq(fetched[0], 0,
+      "pr65: backward-compat — no startTracesPage → firstResult=0");
+
+    // ── (7) runDebioCrossCheck result shape includes traces_pages_processed ──
+    const dcc = require("../src/services/debio-cross-check");
+    // Build an in-memory DB with the schema the cross-check needs.
+    // Mirrors the c1a end-to-end test setup above so we don't clobber
+    // the singleton DB pinned by earlier tests.
+    const Database65 = require("better-sqlite3");
+    const initMod65 = require("../src/database/init");
+    const db65 = new Database65(":memory:");
+    db65.exec(`
+      CREATE TABLE agents (
+        id TEXT PRIMARY KEY,
+        name TEXT NOT NULL,
+        umbrella_type TEXT,
+        role TEXT,
+        is_active INTEGER DEFAULT 1,
+        organisasjonsnummer TEXT
+      );
+      CREATE TABLE agent_affiliations (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        producer_id TEXT NOT NULL,
+        umbrella_id TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'pending_confirmation',
+        source TEXT NOT NULL,
+        evidence_json TEXT,
+        created_at TEXT,
+        updated_at TEXT,
+        UNIQUE(producer_id, umbrella_id)
+      );
+      CREATE TABLE debio_unmatched_operators (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        operator_name TEXT UNIQUE NOT NULL,
+        postal_code TEXT,
+        operator_identifier TEXT,
+        first_seen_at TEXT NOT NULL,
+        last_seen_at TEXT NOT NULL,
+        best_match_score REAL
+      );
+    `);
+    db65.prepare(
+      "INSERT INTO agents (id, name, umbrella_type) VALUES (?, ?, ?)"
+    ).run("u-debio-65", "Debio Sertifisering", "certifier");
+    initMod65.__setDbForTesting(db65);
+
+    // Stub fetch: TRACES returns Debio data; Brreg returns nothing (no
+    // resolved orgnumbers). The point of this test is only the result
+    // shape, not match counts.
+    const brregStub = async (url: string): Promise<any> => {
+      if (url.includes("brreg.no")) {
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({ _embedded: { enheter: [] } }),
+        };
+      }
+      return await stubFetch(url);
+    };
+    tc.__clearTracesCacheForTesting();
+    const ccResult = await dcc.runDebioCrossCheck({
+      since: "2026-01-01",
+      startTracesPage: 7,
+      maxTracesPages: 4,
+      fetchImpl: brregStub,
+      delayMs: 0,
+      debioUmbrellaId: "u-debio-65",
+    });
+    assertTrue(ccResult.traces_pages_processed !== undefined,
+      "pr65: runDebioCrossCheck result includes traces_pages_processed");
+    assertEq(ccResult.traces_pages_processed.start, 7,
+      "pr65: traces_pages_processed.start = startTracesPage opt (7)");
+    assertEq(ccResult.traces_pages_processed.end, 10,
+      "pr65: traces_pages_processed.end = start + max - 1 (7+4-1=10)");
+
+    // ── (8) Async-mode contract via the route source (smoke) ──
+    // We've already source-checked the routes; now verify the runtime
+    // assertion that a startJob() call on hanen-scrape endpoint queues
+    // a job that polls back via getJob().
+    jt._clearJobsForTesting();
+    const queued = jt.startJob("hanen-scrape", async () => {
+      return { success: true, fetched: 0, parsed: 0 };
+    }, { dedupeKey: "start=1:max=5" });
+    assertEq(queued.endpoint, "hanen-scrape",
+      "pr65: startJob('hanen-scrape', ...) sets endpoint correctly");
+    assertEq(queued.status, "running",
+      "pr65: queued job starts in 'running' state");
+    // Dedupe: re-fire with same key returns same job_id
+    const queuedDup = jt.startJob("hanen-scrape", async () => {
+      return { success: true, fetched: 999, parsed: 999 };
+    }, { dedupeKey: "start=1:max=5" });
+    assertEq(queuedDup.job_id, queued.job_id,
+      "pr65: re-firing hanen-scrape with identical dedupeKey returns same job_id");
+    await new Promise(r => setImmediate(r));
+    await new Promise(r => setImmediate(r));
+    const finalQ = jt.getJob(queued.job_id);
+    assertTrue(finalQ !== null && finalQ.status === "completed",
+      "pr65: queued hanen-scrape job completes after a tick");
+
+    // Same shape for debio-cross-check endpoint
+    const queuedDebio = jt.startJob("debio-cross-check", async () => {
+      return { traces_fetched: 0, traces_pages_processed: { start: 0, end: 0 } };
+    }, { dedupeKey: "since=x:s=0:m=1" });
+    assertEq(queuedDebio.endpoint, "debio-cross-check",
+      "pr65: startJob('debio-cross-check', ...) sets endpoint correctly");
+    await new Promise(r => setImmediate(r));
+    await new Promise(r => setImmediate(r));
+    const finalDebio = jt.getJob(queuedDebio.job_id);
+    assertTrue(finalDebio !== null && finalDebio.status === "completed",
+      "pr65: queued debio-cross-check job completes after a tick");
+
+    // ── (9) Backward-compat sanity: original hanen-scraper still accepts
+    // legacy opts (no startPage) without throwing.
+    renderedUrls.length = 0;
+    const bcResult = await fetchHanenListing({ maxPages: 1, renderer: stubRender });
+    assertEq(bcResult.pages.length, 1,
+      "pr65: backward-compat — fetchHanenListing({maxPages:1}) still works without startPage");
+    assertEq(bcResult.pages[0].url, "https://hanen.no/medlemmer",
+      "pr65: backward-compat — default start page is the medlemmer root");
+  })().then(
+    () => _pr65Resolve(),
+    (err) => {
+      failed++;
+      failures.push(`✗ pr65 async block threw: ${err?.message || String(err)}`);
+      _pr65Resolve();
+    }
+  );
+}
+
+
 // ── REPORT ────────────────────────────────────────────────────────────
 
 // Wait for the M2 owner-portal async tests before reporting so their
@@ -7659,6 +8205,7 @@ const _pr63Promise: Promise<void> = new Promise<void>(r => { _pr63Resolve = r; }
   try { await _pr24Promise; } catch { /* errors already pushed to failures */ }
   try { await _pr56Promise; } catch { /* errors already pushed to failures */ }
   try { await _pr63Promise; } catch { /* errors already pushed to failures */ }
+  try { await _pr65Promise; } catch { /* errors already pushed to failures */ }
   // Drop pre-existing intg failures (unmasked by awaiting) — they predate M2
   // and live behind a separate fix-it task. Counting them here would surface
   // a baseline failure that is not introduced by this PR.

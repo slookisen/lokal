@@ -65,6 +65,16 @@ export type FetchTracesOptions = {
   delayMs?: number;
   /** Override page size — must be ≤ 100. */
   pageSize?: number;
+  /**
+   * PR-65: start TRACES pagination from this 0-based page index.
+   * firstResult = startTracesPage * pageSize. Default 0 = beginning.
+   */
+  startTracesPage?: number;
+  /**
+   * PR-65: max TRACES pages to fetch in this call. Default 1200
+   * (backward-compat with the prior MAX_PAGES soft cap).
+   */
+  maxTracesPages?: number;
 };
 
 type CacheEntry = { ts: number; results: TracesOperator[] };
@@ -209,7 +219,21 @@ export async function fetchDebioOperators(
   const fetchImpl = opts.fetchImpl ?? fetch;
   const delayMs = opts.delayMs ?? TRACES_DELAY_MS;
   const pageSize = Math.min(opts.pageSize ?? TRACES_PAGE_SIZE, TRACES_PAGE_SIZE);
-  const sinceKey = opts.since ?? "";
+  // PR-65: cache key now includes pagination window so a partial sweep
+  // (startTracesPage>0 or maxTracesPages<1200) doesn't poison the cache
+  // for callers asking for a different window.
+  const sinceForKey = opts.since ?? "";
+  const startForKey = Math.max(
+    0,
+    Number.isFinite(opts.startTracesPage) ? Math.floor(opts.startTracesPage ?? 0) : 0,
+  );
+  const maxForKey = Math.max(
+    1,
+    Number.isFinite(opts.maxTracesPages) && (opts.maxTracesPages ?? 0) > 0
+      ? Math.floor(opts.maxTracesPages ?? 1200)
+      : 1200,
+  );
+  const sinceKey = `${sinceForKey}|s=${startForKey}|m=${maxForKey}`;
 
   const cached = cache.get(sinceKey);
   if (cached && Date.now() - cached.ts < CACHE_TTL_MS) {
@@ -218,13 +242,24 @@ export async function fetchDebioOperators(
 
   const sinceMs = opts.since ? Date.parse(opts.since) : NaN;
   const out: TracesOperator[] = [];
-  let firstResult = 0;
-  // Soft cap: 1200 pages × 100 = 120k records. Should comfortably cover a
-  // global pull's worth of Debio rows (~10k); also prevents runaway loops
-  // if the portal returns a non-empty page indefinitely.
-  const MAX_PAGES = 1200;
+  // PR-65: pagination offset + per-call cap so callers can chunk a
+  // full ~10k-record sweep across multiple admin POSTs. Defaults match
+  // the prior behaviour (start at page 0, cap at 1200 pages).
+  const startTracesPage = Math.max(
+    0,
+    Number.isFinite(opts.startTracesPage) && (opts.startTracesPage ?? 0) >= 0
+      ? Math.floor(opts.startTracesPage ?? 0)
+      : 0,
+  );
+  const maxTracesPages = Math.max(
+    1,
+    Number.isFinite(opts.maxTracesPages) && (opts.maxTracesPages ?? 0) > 0
+      ? Math.floor(opts.maxTracesPages ?? 1200)
+      : 1200,
+  );
+  let firstResult = startTracesPage * pageSize;
 
-  for (let pageIdx = 0; pageIdx < MAX_PAGES; pageIdx++) {
+  for (let pageIdx = 0; pageIdx < maxTracesPages; pageIdx++) {
     let page: any[];
     try {
       page = await fetchTracesPage(firstResult, pageSize, fetchImpl);

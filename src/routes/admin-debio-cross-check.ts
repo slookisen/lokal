@@ -17,22 +17,29 @@
 //       unmatched_persisted,
 //       errors: string[],
 //       since,
-//       duration_ms
+//       duration_ms,
+//       traces_pages_processed: { start, end }    // PR-65
 //     }
 //
 //   Query params:
-//     since=YYYY-MM-DD   — only process TRACES records issued on/after this
-//                          date. Defaults to 2026-01-01 (incremental).
+//     since=YYYY-MM-DD       — only process TRACES records issued on/after this
+//                              date. Defaults to 2026-01-01 (incremental).
+//     start_traces_page=N    — (PR-65) 0-based offset into TRACES pages.
+//                              Default 0. Use with max_traces_pages to chunk.
+//     max_traces_pages=N     — (PR-65) max TRACES pages this call may fetch.
+//                              Default 1200 (backward-compat).
+//     async=1                — (PR-65) fire-and-forget; returns 202 + job_id.
+//                              Poll GET /admin/jobs/<job_id> for progress.
 //
 // Auth: X-Admin-Key header (same key as other /admin/* endpoints).
 //
-// Run-time budget: a full historical run can exceed Fly's 120s proxy
-// timeout. The default `since=2026-01-01` keeps incremental runs
-// well below the limit. The response includes a `duration_ms` field
-// so the caller can spot drift.
+// Run-time budget: a full historical run (1200 pages × 1.1s polite delay
+// ≈ 22 min) WILL exceed Fly's 120s proxy timeout — use ?async=1 or
+// chunk via start_traces_page/max_traces_pages.
 
 import { Router, Request, Response } from "express";
 import { runDebioCrossCheck, DEFAULT_SINCE_ISO } from "../services/debio-cross-check";
+import { startJob } from "../services/job-tracker";
 
 const router = Router();
 
@@ -63,17 +70,59 @@ function parseSince(raw: unknown): string {
   return v;
 }
 
+// PR-65: parse the optional 0-based start_traces_page query param.
+function parseStartTracesPage(raw: unknown): number {
+  if (typeof raw !== "string" || raw.trim().length === 0) return 0;
+  const n = parseInt(raw, 10);
+  if (!Number.isFinite(n) || n < 0) return 0;
+  return Math.floor(n);
+}
+
+// PR-65: parse the optional max_traces_pages query param. Default 1200
+// preserves the prior "global sweep" behaviour for callers who omit it.
+function parseMaxTracesPages(raw: unknown): number {
+  if (typeof raw !== "string" || raw.trim().length === 0) return 1200;
+  const n = parseInt(raw, 10);
+  if (!Number.isFinite(n) || n <= 0) return 1200;
+  return Math.floor(n);
+}
+
 router.post("/cross-check", async (req: Request, res: Response) => {
   if (!requireAdmin(req, res)) return;
 
   const since = parseSince(req.query.since);
+  // PR-65: pagination offset + per-call cap.
+  const startTracesPage = parseStartTracesPage(req.query.start_traces_page);
+  const maxTracesPages = parseMaxTracesPages(req.query.max_traces_pages);
+  const wantAsync = req.query.async === "1" || req.query.async === "true";
+
+  const opts = { since, startTracesPage, maxTracesPages };
+
+  if (wantAsync) {
+    const dedupeKey = `since=${since}:s=${startTracesPage}:m=${maxTracesPages}`;
+    const job = startJob("debio-cross-check", async () => {
+      return await runDebioCrossCheck(opts);
+    }, { dedupeKey });
+    return res.status(202).json({
+      job_id: job.job_id,
+      status: job.status,
+      started_at: job.started_at,
+      endpoint: job.endpoint,
+      since,
+      traces_pages_processed: {
+        start: startTracesPage,
+        end: startTracesPage + maxTracesPages - 1,
+      },
+      poll_url: `/admin/jobs/${job.job_id}`,
+    });
+  }
 
   try {
-    const result = await runDebioCrossCheck({ since });
+    const result = await runDebioCrossCheck(opts);
     res.json({
       success: true,
       ...result,
-      hint: "Re-run with ?since=YYYY-MM-DD to incrementalize; a full historical run can exceed the 120s proxy limit.",
+      hint: "For full sweeps, use ?async=1 or chunk via start_traces_page/max_traces_pages (each chunk fits in <120s).",
     });
   } catch (err: any) {
     res.status(500).json({
