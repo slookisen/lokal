@@ -171,6 +171,85 @@ const MAJOR_CITIES: Record<string, { lat: number; lng: number; radius: number }>
   "nordland":     { lat: 67.5000, lng: 14.0000, radius: 120 },
   "troms":        { lat: 69.5000, lng: 19.0000, radius: 100 },
   "finnmark":     { lat: 70.0000, lng: 25.0000, radius: 120 },
+
+  // ── PR-78: Storby-bydeler (neighborhoods) ──
+  // Fixes Kartverket Stedsnavn ambiguity where common neighborhood names
+  // (e.g. "Oppsal") collide with rural places elsewhere in Norway.
+  // The first Kartverket match for "Oppsal" is Lier (59.847, 10.267)
+  // rather than Oslo-east (59.886, 10.879). Hardcoding here bypasses the
+  // ambiguous Stedsnavn lookup. Radius is small (2-6 km, neighborhood-
+  // scale) so the geo-filter stays local to the bydel rather than the
+  // whole city. ASCII-aliaser for ø/å/æ follow the existing pattern.
+
+  // ── Oslo bydeler (fixes Oppsal/Bøler/Manglerud disambiguation) ──
+  "oppsal":            { lat: 59.886, lng: 10.879, radius: 4 },
+  "bøler":             { lat: 59.881, lng: 10.864, radius: 4 },
+  "boler":             { lat: 59.881, lng: 10.864, radius: 4 },
+  "manglerud":         { lat: 59.890, lng: 10.845, radius: 4 },
+  "grünerløkka":       { lat: 59.923, lng: 10.760, radius: 3 },
+  "grunerlokka":       { lat: 59.923, lng: 10.760, radius: 3 },
+  "vålerenga":         { lat: 59.910, lng: 10.778, radius: 3 },
+  "valerenga":         { lat: 59.910, lng: 10.778, radius: 3 },
+  "tøyen":             { lat: 59.917, lng: 10.769, radius: 3 },
+  "toyen":             { lat: 59.917, lng: 10.769, radius: 3 },
+  "sagene":            { lat: 59.937, lng: 10.760, radius: 3 },
+  "frogner":           { lat: 59.924, lng: 10.706, radius: 4 },
+  "majorstuen":        { lat: 59.928, lng: 10.715, radius: 3 },
+  "bjørvika":          { lat: 59.907, lng: 10.755, radius: 2 },
+  "bjorvika":          { lat: 59.907, lng: 10.755, radius: 2 },
+  "bislett":           { lat: 59.925, lng: 10.738, radius: 2 },
+  "st. hanshaugen":    { lat: 59.929, lng: 10.737, radius: 3 },
+  "st-hanshaugen":     { lat: 59.929, lng: 10.737, radius: 3 },
+  "torshov":           { lat: 59.940, lng: 10.760, radius: 3 },
+  "sinsen":            { lat: 59.943, lng: 10.785, radius: 3 },
+  "carl berner":       { lat: 59.927, lng: 10.789, radius: 3 },
+  "ekeberg":           { lat: 59.890, lng: 10.770, radius: 4 },
+  "holmlia":           { lat: 59.838, lng: 10.799, radius: 4 },
+  "mortensrud":        { lat: 59.842, lng: 10.836, radius: 4 },
+  "bjørndal":          { lat: 59.823, lng: 10.829, radius: 4 },
+  "bjorndal":          { lat: 59.823, lng: 10.829, radius: 4 },
+  "tveita":            { lat: 59.916, lng: 10.864, radius: 3 },
+  "furuset":           { lat: 59.940, lng: 10.901, radius: 4 },
+  "lambertseter":      { lat: 59.871, lng: 10.806, radius: 4 },
+  "linderud":          { lat: 59.951, lng: 10.840, radius: 4 },
+  "romsås":            { lat: 59.963, lng: 10.886, radius: 5 },
+  "romsas":            { lat: 59.963, lng: 10.886, radius: 5 },
+  "nydalen":           { lat: 59.948, lng: 10.762, radius: 4 },
+  "storo":             { lat: 59.946, lng: 10.776, radius: 3 },
+  "bryn":              { lat: 59.913, lng: 10.819, radius: 3 },
+  "skøyen":            { lat: 59.923, lng: 10.677, radius: 4 },
+  "skoyen":            { lat: 59.923, lng: 10.677, radius: 4 },
+  "smestad":           { lat: 59.939, lng: 10.667, radius: 4 },
+  "røa":               { lat: 59.948, lng: 10.642, radius: 4 },
+  "roa":               { lat: 59.948, lng: 10.642, radius: 4 },
+
+  // ── Bergen bydeler ──
+  "fyllingsdalen":     { lat: 60.358, lng: 5.265,  radius: 5 },
+  "sandviken":         { lat: 60.412, lng: 5.314,  radius: 4 },
+  "åsane":             { lat: 60.460, lng: 5.327,  radius: 6 },
+  "asane":             { lat: 60.460, lng: 5.327,  radius: 6 },
+  "laksevåg":          { lat: 60.382, lng: 5.270,  radius: 5 },
+  "laksevag":          { lat: 60.382, lng: 5.270,  radius: 5 },
+  "loddefjord":        { lat: 60.350, lng: 5.183,  radius: 5 },
+  "nesttun":           { lat: 60.317, lng: 5.358,  radius: 5 },
+  "arna":              { lat: 60.421, lng: 5.480,  radius: 6 },
+  "paradis (bergen)":  { lat: 60.357, lng: 5.336,  radius: 4 },
+
+  // ── Trondheim bydeler ──
+  "sluppen":           { lat: 63.398, lng: 10.391, radius: 4 },
+  "lade":              { lat: 63.452, lng: 10.444, radius: 5 },
+  "heimdal":           { lat: 63.355, lng: 10.341, radius: 5 },
+  "singsaker":         { lat: 63.428, lng: 10.412, radius: 3 },
+  "ila":               { lat: 63.434, lng: 10.366, radius: 3 },
+  "lerkendal":         { lat: 63.412, lng: 10.408, radius: 3 },
+
+  // ── Stavanger bydeler ──
+  "madla":             { lat: 58.953, lng: 5.671,  radius: 5 },
+  "storhaug":          { lat: 58.972, lng: 5.751,  radius: 3 },
+  "hillevåg":          { lat: 58.939, lng: 5.726,  radius: 4 },
+  "hillevag":          { lat: 58.939, lng: 5.726,  radius: 4 },
+  "hundvåg":           { lat: 58.998, lng: 5.751,  radius: 5 },
+  "hundvag":           { lat: 58.998, lng: 5.751,  radius: 5 },
 };
 
 // ── Radius heuristic based on place type ──
