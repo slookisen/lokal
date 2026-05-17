@@ -7581,9 +7581,22 @@ const _pr63Promise: Promise<void> = new Promise<void>(r => { _pr63Resolve = r; }
       { operatorName: "DE Farm GmbH", address: { postalCode: "10115" },
         competentAuthority: { code: "DE-OEKO-006" }, issuedOn: "2026-02-01" },
     ];
-    const stubFetch = async (url: string) => {
+    const stubFetch = async (url: string, init?: any) => {
       if (url.includes("tracesnt") && url.includes("/for/query")) {
-        if (url.includes("firstResult=0")) {
+        // PR-66: POST body filter is the new default; legacy GET path
+        // still ships firstResult in the query string. Read whichever
+        // shape this request carries.
+        let firstResult = 0;
+        const bodyStr = init && typeof init.body === "string" ? init.body : "";
+        if (bodyStr) {
+          try {
+            const b = JSON.parse(bodyStr);
+            if (typeof b.firstResult === "number") firstResult = b.firstResult;
+          } catch { /* fall through to URL parse */ }
+        }
+        const m = /firstResult=(\d+)/.exec(url);
+        if (m) firstResult = parseInt(m[1], 10);
+        if (firstResult === 0) {
           return new Response(JSON.stringify(tracesPage), {
             status: 200, headers: { "content-type": "application/json" } });
         }
@@ -8006,9 +8019,20 @@ const _pr65Promise: Promise<void> = new Promise<void>(r => { _pr65Resolve = r; }
     // (the loop bails on "Short page = last page" when page.length < pageSize).
     const fullPage: any[] = [];
     for (let i = 0; i < 100; i++) fullPage.push(debioRaw);
-    const stubFetch = async (url: string): Promise<any> => {
-      const m = /firstResult=(\d+)&maxResults=(\d+)/.exec(url);
-      const firstResult = m ? parseInt(m[1], 10) : 0;
+    const stubFetch = async (url: string, init?: any): Promise<any> => {
+      // PR-66: prefer body-parsed firstResult (POST default), fall back
+      // to URL query-string for the GET fallback path.
+      let firstResult = 0;
+      const bodyStr = init && typeof init.body === "string" ? init.body : "";
+      if (bodyStr) {
+        try {
+          const b = JSON.parse(bodyStr);
+          if (typeof b.firstResult === "number") firstResult = b.firstResult;
+        } catch { /* fall through */ }
+      } else {
+        const m = /firstResult=(\d+)&maxResults=(\d+)/.exec(url);
+        if (m) firstResult = parseInt(m[1], 10);
+      }
       fetched.push(firstResult);
       return {
         ok: true,
@@ -8193,6 +8217,258 @@ const _pr65Promise: Promise<void> = new Promise<void>(r => { _pr65Resolve = r; }
 }
 
 
+// PR-66 async-test handle — settled by the IIFE inside the block below.
+let _pr66Resolve: () => void = () => {};
+const _pr66Promise: Promise<void> = new Promise<void>(r => { _pr66Resolve = r; });
+
+// ─── PR-66: TRACES POST-body country/competentAuthority filter ────────
+{
+  console.log("\n── PR-66: TRACES POST-body filter + GET fallback ──");
+  const fs = require("fs");
+
+  // ── (1) Source-presence: traces-client now exposes POST helpers ──
+  const tracesSrc = fs.readFileSync("src/services/traces-client.ts", "utf-8");
+  assertTrue(/export\s+function\s+buildTracesPostBody/.test(tracesSrc),
+    "pr66: traces-client exports buildTracesPostBody()");
+  assertTrue(/export\s+function\s+buildTracesGetUrl/.test(tracesSrc),
+    "pr66: traces-client exports buildTracesGetUrl() for fallback path");
+  assertTrue(/export\s+async\s+function\s+fetchTracesPagePost/.test(tracesSrc),
+    "pr66: traces-client exports fetchTracesPagePost()");
+  assertTrue(/export\s+async\s+function\s+fetchTracesPageAny/.test(tracesSrc),
+    "pr66: traces-client exports fetchTracesPageAny() (POST-first w/ GET fallback)");
+  assertTrue(/export\s+function\s+parseTracesPageResponse/.test(tracesSrc),
+    "pr66: traces-client exports parseTracesPageResponse() for permissive envelope parsing");
+  assertTrue(/export\s+const\s+TRACES_FILTER_COUNTRY\s*=\s*"NO"/.test(tracesSrc),
+    "pr66: traces-client pins TRACES_FILTER_COUNTRY = 'NO'");
+  assertTrue(/forceGetFallback\?:\s*boolean/.test(tracesSrc),
+    "pr66: FetchTracesOptions includes forceGetFallback for test/operator override");
+
+  // ── (2) Behavioural: POST body shape ──
+  const tc = require("../src/services/traces-client");
+  tc.__clearTracesCacheForTesting();
+
+  const body0 = tc.buildTracesPostBody(0, 100);
+  assertEq(body0.firstResult, 0,
+    "pr66: buildTracesPostBody sets firstResult on the body");
+  assertEq(body0.maxResults, 100,
+    "pr66: buildTracesPostBody sets maxResults on the body");
+  assertTrue(body0.filter !== undefined,
+    "pr66: buildTracesPostBody body has a filter object");
+  assertEq(body0.filter.competentAuthority.code, "NO-ØKO-01",
+    "pr66: POST filter narrows to competentAuthority.code = 'NO-ØKO-01' (Debio)");
+  assertEq(body0.filter.country, "NO",
+    "pr66: POST filter narrows to country = 'NO' (Norway)");
+
+  const body200 = tc.buildTracesPostBody(200, 50);
+  assertEq(body200.firstResult, 200,
+    "pr66: buildTracesPostBody honours non-zero firstResult (pagination)");
+  assertEq(body200.maxResults, 50,
+    "pr66: buildTracesPostBody honours custom maxResults (pagination)");
+
+  // ── (11) Behavioural: buildTracesGetUrl shape (sync — no fetch) ──
+  const getUrl = tc.buildTracesGetUrl(300, 100);
+  assertTrue(getUrl.includes("firstResult=300"),
+    "pr66: GET fallback URL includes firstResult=N");
+  assertTrue(getUrl.includes("maxResults=100"),
+    "pr66: GET fallback URL includes maxResults=N");
+  assertTrue(getUrl.includes("country=NO"),
+    "pr66: GET fallback URL includes country=NO");
+  // URL-encoded NO-ØKO-01 — Ø → %C3%98.
+  assertTrue(/competentAuthority=NO-%C3%98KO-01/.test(getUrl),
+    "pr66: GET fallback URL URL-encodes the NO-ØKO-01 competent-authority code");
+
+  // ── Async tail: fetch-dependent assertions live in this IIFE. ──
+  (async () => {
+    // ── (3) Behavioural: fetchTracesPagePost issues a POST request ──
+  const calls: Array<{ url: string; method: string; body: any }> = [];
+  const norwegianDebio = {
+    operatorName: "Norsk Bonde AS",
+    operatorId: "TR-NB-001",
+    address: { city: "Bergen", postalCode: "5001" },
+    competentAuthority: { code: "NO-ØKO-01" },
+    issuedOn: "2026-04-15",
+  };
+  const postStub = async (url: string, init?: any): Promise<any> => {
+    let body: any = null;
+    try { body = init && init.body ? JSON.parse(init.body) : null; } catch { body = null; }
+    calls.push({ url, method: init?.method ?? "GET", body });
+    return {
+      ok: true,
+      status: 200,
+      text: async () => JSON.stringify([norwegianDebio]),
+      json: async () => [norwegianDebio],
+    };
+  };
+  const postPage = await tc.fetchTracesPagePost(0, 100, postStub as any);
+  assertTrue(Array.isArray(postPage) && postPage.length === 1,
+    "pr66: fetchTracesPagePost returns the parsed page array");
+  assertEq(calls.length, 1, "pr66: fetchTracesPagePost issues exactly one HTTP call");
+  assertEq(calls[0].method, "POST", "pr66: fetchTracesPagePost uses HTTP POST");
+  assertTrue(calls[0].url.endsWith("/for/query"),
+    "pr66: POST hits /for/query (no query string)");
+  assertTrue(calls[0].body && calls[0].body.filter
+            && calls[0].body.filter.competentAuthority
+            && calls[0].body.filter.competentAuthority.code === "NO-ØKO-01",
+    "pr66: POST body carries filter.competentAuthority.code = NO-ØKO-01");
+  assertEq(calls[0].body.filter.country, "NO",
+    "pr66: POST body carries filter.country = NO");
+
+  // ── (4) Behavioural: 405 on POST triggers the GET fallback ──
+  tc.__clearTracesCacheForTesting();
+  const allCalls: Array<{ url: string; method: string }> = [];
+  const fallback405 = async (url: string, init?: any): Promise<any> => {
+    const method = init?.method ?? "GET";
+    allCalls.push({ url, method });
+    if (method === "POST") {
+      return { ok: false, status: 405, text: async () => "Method Not Allowed", json: async () => ({}) };
+    }
+    // GET fallback returns one Debio record.
+    return {
+      ok: true,
+      status: 200,
+      text: async () => JSON.stringify([norwegianDebio]),
+      json: async () => [norwegianDebio],
+    };
+  };
+  const postNull = await tc.fetchTracesPagePost(0, 100, fallback405 as any);
+  assertEq(postNull, null,
+    "pr66: fetchTracesPagePost returns null when POST responds 405 (signal fallback)");
+  // After the latch trips, fetchTracesPageAny should go straight to GET.
+  allCalls.length = 0;
+  const any405 = await tc.fetchTracesPageAny(0, 100, fallback405 as any);
+  assertTrue(Array.isArray(any405) && any405.length === 1,
+    "pr66: fetchTracesPageAny returns GET fallback page once POST is latched as unsupported");
+  assertTrue(allCalls.length >= 1, "pr66: fallback path issues at least one request");
+  assertTrue(allCalls.every(c => c.method === "GET"),
+    "pr66: after the 405 latch trips, no further POST attempts are made");
+  assertTrue(allCalls.some(c => c.url.includes("country=NO")),
+    "pr66: GET fallback URL includes country=NO query param");
+  assertTrue(allCalls.some(c => c.url.includes("competentAuthority=NO")),
+    "pr66: GET fallback URL includes competentAuthority=NO-ØKO-01 query param");
+
+  // ── (5) Behavioural: forceGetFallback skips POST entirely ──
+  tc.__clearTracesCacheForTesting();
+  allCalls.length = 0;
+  const observe = async (url: string, init?: any): Promise<any> => {
+    allCalls.push({ url, method: init?.method ?? "GET" });
+    return {
+      ok: true,
+      status: 200,
+      text: async () => JSON.stringify([]),
+      json: async () => [],
+    };
+  };
+  await tc.fetchTracesPageAny(0, 100, observe as any, { forceGetFallback: true });
+  assertTrue(allCalls.length === 1 && allCalls[0].method === "GET",
+    "pr66: forceGetFallback=true skips the POST attempt entirely");
+
+  // ── (6) Behavioural: fetchDebioOperators integrates with POST path ──
+  tc.__clearTracesCacheForTesting();
+  const integratedCalls: Array<{ method: string; body: any }> = [];
+  const debioRaw = {
+    operatorName: "Aalrust Gård",
+    operatorId: "T1",
+    address: { city: "Oslo", postalCode: "0001" },
+    competentAuthority: { code: "NO-ØKO-01" },
+    issuedOn: "2026-05-01",
+  };
+  const integrated = async (_url: string, init?: any): Promise<any> => {
+    let body: any = null;
+    try { body = init && init.body ? JSON.parse(init.body) : null; } catch { body = null; }
+    integratedCalls.push({ method: init?.method ?? "GET", body });
+    // Single page of 1 record (< pageSize triggers loop exit).
+    return {
+      ok: true,
+      status: 200,
+      text: async () => JSON.stringify([debioRaw]),
+      json: async () => [debioRaw],
+    };
+  };
+  const ops = await tc.fetchDebioOperators({
+    delayMs: 0,
+    fetchImpl: integrated as any,
+    maxTracesPages: 1,
+  });
+  assertEq(ops.length, 1,
+    "pr66: fetchDebioOperators returns the Norwegian Debio record via POST path");
+  assertEq(integratedCalls[0].method, "POST",
+    "pr66: fetchDebioOperators defaults to POST transport");
+  assertTrue(integratedCalls[0].body && integratedCalls[0].body.filter
+            && integratedCalls[0].body.filter.competentAuthority.code === "NO-ØKO-01",
+    "pr66: fetchDebioOperators POSTs the competentAuthority filter to TRACES");
+
+  // ── (7) Behavioural: parseTracesPageResponse handles assorted envelopes ──
+  assertEq(tc.parseTracesPageResponse([1, 2, 3]).length, 3,
+    "pr66: parseTracesPageResponse passes plain arrays through unchanged");
+  assertEq(tc.parseTracesPageResponse({ content: [{ a: 1 }] }).length, 1,
+    "pr66: parseTracesPageResponse unwraps {content:[…]} envelopes");
+  assertEq(tc.parseTracesPageResponse({ results: [{ a: 1 }, { b: 2 }] }).length, 2,
+    "pr66: parseTracesPageResponse unwraps {results:[…]} envelopes");
+  assertEq(tc.parseTracesPageResponse({ data: [{ x: 1 }] }).length, 1,
+    "pr66: parseTracesPageResponse unwraps {data:[…]} envelopes");
+  assertEq(tc.parseTracesPageResponse({ operators: [{ y: 1 }] }).length, 1,
+    "pr66: parseTracesPageResponse unwraps {operators:[…]} envelopes");
+  assertEq(tc.parseTracesPageResponse(null).length, 0,
+    "pr66: parseTracesPageResponse coerces null to []");
+  assertEq(tc.parseTracesPageResponse({ unknown: "shape" }).length, 0,
+    "pr66: parseTracesPageResponse coerces unknown envelopes to []");
+
+  // ── (8) Behavioural: 404 on POST also trips the fallback latch ──
+  tc.__clearTracesCacheForTesting();
+  const fallback404 = async (_url: string, init?: any): Promise<any> => {
+    if ((init?.method ?? "GET") === "POST") {
+      return { ok: false, status: 404, text: async () => "Not Found", json: async () => ({}) };
+    }
+    return { ok: true, status: 200, text: async () => "[]", json: async () => [] };
+  };
+  const post404 = await tc.fetchTracesPagePost(0, 100, fallback404 as any);
+  assertEq(post404, null,
+    "pr66: fetchTracesPagePost returns null when POST responds 404 (signal fallback)");
+
+  // ── (9) Behavioural: 501 on POST also trips the fallback latch ──
+  tc.__clearTracesCacheForTesting();
+  const fallback501 = async (_url: string, init?: any): Promise<any> => {
+    if ((init?.method ?? "GET") === "POST") {
+      return { ok: false, status: 501, text: async () => "Not Implemented", json: async () => ({}) };
+    }
+    return { ok: true, status: 200, text: async () => "[]", json: async () => [] };
+  };
+  const post501 = await tc.fetchTracesPagePost(0, 100, fallback501 as any);
+  assertEq(post501, null,
+    "pr66: fetchTracesPagePost returns null when POST responds 501 (signal fallback)");
+
+  // ── (10) Behavioural: non-405 5xx errors are NOT latched ──
+  // A 500 on POST should bubble (it's a transient server error, not a
+  // permanent "filter not supported" signal). fetchTracesPagePost throws.
+  tc.__clearTracesCacheForTesting();
+  const transient500 = async (_url: string, init?: any): Promise<any> => {
+    if ((init?.method ?? "GET") === "POST") {
+      return { ok: false, status: 500, text: async () => "Internal", json: async () => ({}) };
+    }
+    return { ok: true, status: 200, text: async () => "[]", json: async () => [] };
+  };
+  let threw = false;
+  try {
+    await tc.fetchTracesPagePost(0, 100, transient500 as any);
+  } catch (e: any) {
+    threw = true;
+    assertTrue(/HTTP 500/.test(e?.message ?? ""),
+      "pr66: 500 on POST throws with the status in the error message");
+  }
+  assertTrue(threw,
+    "pr66: 500 on POST throws (transient — does NOT latch the fallback)");
+
+  })().then(
+    () => _pr66Resolve(),
+    (err) => {
+      failed++;
+      failures.push(`✗ pr66 async block threw: ${err?.message || String(err)}`);
+      _pr66Resolve();
+    }
+  );
+}
+
+
 // ── REPORT ────────────────────────────────────────────────────────────
 
 // Wait for the M2 owner-portal async tests before reporting so their
@@ -8206,6 +8482,7 @@ const _pr65Promise: Promise<void> = new Promise<void>(r => { _pr65Resolve = r; }
   try { await _pr56Promise; } catch { /* errors already pushed to failures */ }
   try { await _pr63Promise; } catch { /* errors already pushed to failures */ }
   try { await _pr65Promise; } catch { /* errors already pushed to failures */ }
+  try { await _pr66Promise; } catch { /* errors already pushed to failures */ }
   // Drop pre-existing intg failures (unmasked by awaiting) — they predate M2
   // and live behind a separate fix-it task. Counting them here would surface
   // a baseline failure that is not introduced by this PR.
