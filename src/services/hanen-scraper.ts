@@ -43,6 +43,15 @@ const LISTING_URL = "https://hanen.no/medlemmer";
 // review). 0.85 on Dice ≈ "two characters different in a 12-char name".
 const MATCH_THRESHOLD = 0.85;
 
+// PR-69 dual-corroboration cut-off. When BOTH the agent's name-suffix
+// fylke AND the agent's city-derived fylke independently agree with
+// the Hanen-side fylke, we can safely accept a lower Dice score —
+// the two independent location signals provide the corroboration that
+// MATCH_THRESHOLD = 0.85 was protecting against false positives for.
+// 0.75 on Dice ≈ "a Norwegian name with an org-form ('Heim Gård AS')
+// vs the bare farm-name ('Heim Gard')".
+const DUAL_CORROBORATION_THRESHOLD = 0.75;
+
 // renderPage default is 30s — Hanen's SPA cold-loads slowly, especially
 // behind their Cloudflare front. 60s leaves ample headroom inside the
 // 120s Fly admin endpoint cap (60s render + 30s parse/match/upsert + slack).
@@ -116,7 +125,10 @@ export type MatchVerdict = {
     | "domain_match_exact"
     | "domain_match_with_dice_high"
     | "fylke_match_with_dice_high"
-    | "name_suffix_location_match";
+    | "name_suffix_location_match"
+    // PR-69: dual-corroboration fylke match — Dice >= 0.75 with BOTH
+    // name-suffix-fylke AND city-fylke agreeing with Hanen-side fylke.
+    | "fylke_dual_corroboration";
   confidence: MatchConfidence;
   location_check: "match" | "mismatch" | "unknown";
 };
@@ -314,12 +326,18 @@ export function parseHanenMembers(html: string, sourceUrl: string): HanenMemberR
       category = category.charAt(0).toUpperCase() + category.slice(1);
     }
 
-    // Website: not exposed on the listing page. Detail-page fetch is
-    // out of scope per the C.2 brief (one renderPage() per run).
+    // PR-69: Website extraction from Strategy A. Hanen's WordPress
+    // post-grid card often ships a "Besøk hjemmeside" / "Hjemmeside"
+    // anchor or an `itemprop="url"` link pointing at the member's
+    // own domain. We extract the FIRST external (non-hanen.no) link
+    // from the inner block. If no such link is present, leave null
+    // (downstream still records the member, just with no Signal C).
+    const website = extractExternalWebsite(inner);
+
     pushUnique({
       parsed_name: name,
       parsed_location: location,
-      parsed_website: null,
+      parsed_website: website,
       parsed_category: category,
       source_url: detailUrl,
     });
@@ -446,6 +464,10 @@ export function matchHanenMemberToAgent(
     fylkeFallback: "match" | "mismatch" | "unknown";
     suffixLocCheck: "match" | "mismatch" | "unknown";
     domainCheck: "match" | "unknown";
+    // PR-69: dual-corroboration — TRUE when the agent has BOTH a
+    // name-suffix-derived fylke AND a city-derived fylke, AND both
+    // point at the same fylke as the Hanen member-side fylke.
+    dualCorroboration: "match" | "unknown";
   } | null = null;
   for (const a of agents) {
     const agentVariants = nameVariants(a.name);
@@ -513,6 +535,23 @@ export function matchHanenMemberToAgent(
       // call-time). Hanen-member side uses `parsed_website`.
       const domainCheck: "match" | "unknown" = candidateDomainMatch ? "match" : "unknown";
 
+      // PR-69 signal D — dual-corroboration. Requires the agent to
+      // carry BOTH a name-suffix-derived fylke AND a city-derived
+      // fylke, and BOTH must agree with the Hanen member-side fylke
+      // (which itself comes from parsed_location OR member-name-suffix).
+      // This is a stricter signal than the single-source fylke fallback,
+      // so it justifies a lower Dice threshold (0.75 vs 0.85/0.95).
+      let dualCorroboration: "match" | "unknown" = "unknown";
+      if (
+        memberFylkeFromSuffix &&
+        agentFylkeFromAgentSuffix &&
+        agentFylke &&
+        fylkerMatch(memberFylkeFromSuffix, agentFylkeFromAgentSuffix) &&
+        fylkerMatch(memberFylkeFromSuffix, agentFylke)
+      ) {
+        dualCorroboration = "match";
+      }
+
       best = {
         id: a.id,
         score: bestForAgent,
@@ -521,6 +560,7 @@ export function matchHanenMemberToAgent(
         fylkeFallback,
         suffixLocCheck,
         domainCheck,
+        dualCorroboration,
       };
     }
   }
@@ -635,6 +675,31 @@ export function matchHanenMemberToAgent(
       location_check: loc,
     };
   }
+
+  // PR-69 signal D — dual-corroboration. Placed BEFORE the MEDIUM-tier
+  // fall-throughs (dice_medium_with_location, location_mismatch_rejection
+  // at 0.85, below_threshold) so it can promote MEDIUM → HIGH and rescue
+  // Dice [0.75, 0.85) cases that would otherwise drop to below_threshold.
+  // Requires BOTH the agent's name-suffix-derived fylke AND the agent's
+  // city-derived fylke to agree with the Hanen-side fylke — two
+  // independent location signals + Dice >= 0.75. By construction the
+  // agent fylke must equal the member fylke, so locationCheck cannot
+  // be "mismatch" here; the guard is purely defensive.
+  const dc = best.dualCorroboration;
+  if (
+    score >= DUAL_CORROBORATION_THRESHOLD &&
+    dc === "match" &&
+    loc !== "mismatch"
+  ) {
+    return {
+      agent_id: best.id,
+      score,
+      method: "fylke_dual_corroboration",
+      confidence: "high",
+      location_check: loc,
+    };
+  }
+
   if (score >= MATCH_THRESHOLD && loc === "match") {
     return {
       agent_id: best.id,
@@ -942,6 +1007,75 @@ export async function runHanenScraper(opts?: {
 
 // ─── helpers ───────────────────────────────────────────────────
 
+// PR-69: extract the first external (non-Hanen) website link from a
+// rendered member-card block. The Hanen WordPress listing pages today
+// include — for many members — either a "Besøk hjemmeside"/"Hjemmeside"
+// labelled anchor, or an `itemprop="url"` <link>/<a> pointing at the
+// member's own domain. We scan all anchor hrefs in priority order:
+//
+//   1. <a itemprop="url" href="...">                — schema.org canonical
+//   2. <a ... href="..."> ... Besøk hjemmeside ...  — labelled CTA
+//   3. <a ... href="..."> ... hjemmeside ...        — case-insensitive fallback
+//   4. <a class="...website|hjemmeside..." href="...">  — class-name hint
+//   5. first generic <a href="http..."> NOT pointing at hanen.no       (lowest priority)
+//
+// In all cases the href MUST be absolute (http/https) AND its host
+// MUST NOT be hanen.no / www.hanen.no (those are the listing-detail
+// links we already capture in detailUrl). Returns null when no such
+// link exists. Pure string utility — no I/O, no deps.
+export function extractExternalWebsite(block: string): string | null {
+  if (!block) return null;
+
+  // Helper: is this href a usable external (non-hanen) URL?
+  const isExternal = (href: string): boolean => {
+    if (!href) return false;
+    if (!/^https?:\/\//i.test(href)) return false;
+    // strip protocol + optional www
+    const stripped = href.replace(/^https?:\/\//i, "").replace(/^www\./i, "").toLowerCase();
+    // First host-part token (before / ? # space)
+    const host = stripped.split(/[\s/?#]/)[0] || "";
+    if (!host) return false;
+    // Skip Hanen's own domain — that's the detail-page URL, not the
+    // member's external website.
+    if (host === "hanen.no" || host.endsWith(".hanen.no")) return false;
+    return true;
+  };
+
+  // 1. itemprop="url" with href on the SAME tag (order-independent).
+  //    Matches both `<a itemprop="url" href="...">` and `<a href="..." itemprop="url">`.
+  const itempropRe = /<a[^>]*itemprop=["']url["'][^>]*href=["']([^"']+)["'][^>]*>/i;
+  const itempropRe2 = /<a[^>]*href=["']([^"']+)["'][^>]*itemprop=["']url["'][^>]*>/i;
+  const ip = itempropRe.exec(block) ?? itempropRe2.exec(block);
+  if (ip && isExternal(ip[1])) return ip[1];
+
+  // 2/3. Labelled CTA: "Besøk hjemmeside" or any anchor whose visible
+  //    text mentions "hjemmeside" (case-insensitive). Scan all anchors
+  //    sequentially and pick the first whose inner text matches.
+  const allAnchorsRe = /<a[^>]*href=["']([^"']+)["'][^>]*>([\s\S]*?)<\/a>/gi;
+  let m: RegExpExecArray | null;
+  const externalHits: string[] = [];
+  while ((m = allAnchorsRe.exec(block)) !== null) {
+    const href = m[1];
+    const inner = m[2];
+    if (!isExternal(href)) continue;
+    const text = inner.replace(/<[^>]+>/g, " ").toLowerCase();
+    if (/hjemmeside|bes[øo]k\s+hjemmeside|nettside|websted/i.test(text)) {
+      return href;
+    }
+    externalHits.push(href);
+  }
+
+  // 4. class-name hint on the anchor itself ("...website..." / "...hjemmeside...").
+  const classHintRe = /<a[^>]*class=["'][^"']*(?:website|hjemmeside|nettside)[^"']*["'][^>]*href=["']([^"']+)["'][^>]*>/i;
+  const ch = classHintRe.exec(block);
+  if (ch && isExternal(ch[1])) return ch[1];
+
+  // 5. Fallback: first non-hanen external link we saw.
+  if (externalHits.length > 0) return externalHits[0];
+
+  return null;
+}
+
 function stripTags(html: string): string {
   return html
     .replace(/<[^>]+>/g, " ")
@@ -1160,6 +1294,7 @@ export function reclassifyHanenAffiliations(): HanenReclassifyResult {
 
 // Exported constants so tests + the admin route can sanity-check.
 export const HANEN_MATCH_THRESHOLD = MATCH_THRESHOLD;
+export const HANEN_DUAL_CORROBORATION_THRESHOLD = DUAL_CORROBORATION_THRESHOLD;
 export const HANEN_LISTING_URL = LISTING_URL;
 export const HANEN_MAX_PAGES_DEFAULT = MAX_PAGES;
 export const HANEN_MAX_PAGES_HARD_CAP = MAX_PAGES_HARD_CAP;
