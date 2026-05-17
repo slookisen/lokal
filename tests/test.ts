@@ -10293,6 +10293,362 @@ const _pr78Promise: Promise<void> = new Promise<void>(r => { _pr78Resolve = r; }
     _pr78Resolve();
   });
 
+// ─── PR-71: BM event-participants scraper ───────────────────────────
+// Behavioural tests: participant parser + matcher (no I/O) + pipeline
+// (stubbed fetcher). Source-presence tests confirm the new files +
+// route mount + schema migrations.
+console.log("\n── PR-71: BM event-participants scraper ──");
+
+{
+  const fs = require("fs");
+
+  // (1) Source-presence: scraper module exists with required exports.
+  assertTrue(fs.existsSync("src/services/bm-event-participants-scraper.ts"),
+    "pr71: bm-event-participants-scraper.ts present");
+  const scraperSrc = fs.readFileSync("src/services/bm-event-participants-scraper.ts", "utf-8");
+  assertTrue(/export\s+function\s+parseEventParticipants/.test(scraperSrc),
+    "pr71: exports parseEventParticipants()");
+  assertTrue(/export\s+function\s+matchParticipantToAgent/.test(scraperSrc),
+    "pr71: exports matchParticipantToAgent()");
+  assertTrue(/export\s+function\s+resolveEventLokallag/.test(scraperSrc),
+    "pr71: exports resolveEventLokallag()");
+  assertTrue(/export\s+async\s+function\s+runBmEventParticipantsScraper/.test(scraperSrc),
+    "pr71: exports runBmEventParticipantsScraper()");
+  assertTrue(/export\s+async\s+function\s+fetchEventDetailHtml/.test(scraperSrc),
+    "pr71: exports fetchEventDetailHtml()");
+  // Reuses shared matcher (no duplication of Dice/nameVariants).
+  assertTrue(/from\s+["']\.\/name-matcher["']/.test(scraperSrc),
+    "pr71: scraper imports from name-matcher (shared)");
+
+  // (2) Source-presence: admin route + index mount.
+  assertTrue(fs.existsSync("src/routes/admin-bm-participants.ts"),
+    "pr71: admin-bm-participants.ts present");
+  const adminSrc = fs.readFileSync("src/routes/admin-bm-participants.ts", "utf-8");
+  assertTrue(/router\.post\(\s*['"]\/scrape-participants['"]/.test(adminSrc),
+    "pr71: POST /admin/bm-events/scrape-participants registered");
+  const indexSrc = fs.readFileSync("src/index.ts", "utf-8");
+  assertTrue(/adminBmParticipantsRoutes/.test(indexSrc),
+    "pr71: index.ts mounts admin-bm-participants router");
+
+  // (3) Source-presence: schema migrations.
+  const initSrc = fs.readFileSync("src/database/init.ts", "utf-8");
+  assertTrue(/CREATE TABLE IF NOT EXISTS bm_unmatched_participants/.test(initSrc),
+    "pr71: init.ts creates bm_unmatched_participants table");
+  assertTrue(/ALTER TABLE bm_market_events ADD COLUMN last_participants_scraped_at/.test(initSrc),
+    "pr71: init.ts adds last_participants_scraped_at column (additive)");
+  assertTrue(/PRAGMA table_info\(bm_market_events\)/.test(initSrc),
+    "pr71: init.ts probes table_info before ALTER (idempotent migration)");
+  assertTrue(/UNIQUE\(event_id,\s*parsed_name\)/.test(initSrc),
+    "pr71: bm_unmatched_participants has UNIQUE(event_id, parsed_name) for idempotent re-runs");
+}
+
+// ── Behavioural: parseEventParticipants (no DB needed) ──
+{
+  const { parseEventParticipants } = require("../src/services/bm-event-participants-scraper");
+
+  // Pad bodies so the >500-char guard in parseEventParticipants doesn't reject
+  // small fixtures. We append a long innocuous filler in every test body.
+  const FILLER = "<!-- " + "x".repeat(600) + " -->";
+
+  // [1] Multi-participant happy path: <h3> name + <span> category.
+  const html1 = FILLER + `
+    <section><h2>Produsenter (3)</h2><div class="grid">
+      <a href="/produsenter/eiker-gardsysteri" class="card"><img alt="Eiker"><h3>Eiker Gårdsysteri</h3><span class="cat">Ost og meieri</span></a>
+      <a href="/produsenter/froysagarden" class="card"><img alt="Frøysa"><h3>Frøysagarden</h3><span class="cat">Fisk</span></a>
+      <a href="/produsenter/saetrehonning" class="card"><img alt="Sætrehonning"><h3>Sætrehonning</h3><span class="cat">Honning</span></a>
+    </div></section>` + FILLER;
+  const r1 = parseEventParticipants(html1);
+  assertEq(r1.length, 3, "pr71-parse: multi-participant happy path extracts 3");
+  assertEq(r1[0].parsed_slug, "eiker-gardsysteri", "pr71-parse: first slug");
+  assertEq(r1[0].parsed_name, "Eiker Gårdsysteri", "pr71-parse: first name from <h3>");
+  assertEq(r1[0].parsed_category, "Ost og meieri", "pr71-parse: first category from <span>");
+
+  // [2] Single participant.
+  const html2 = FILLER + `<a href="/produsenter/lonely-farm" class="card"><h3>Lonely Farm</h3><span>Kjøtt</span></a>` + FILLER;
+  const r2 = parseEventParticipants(html2);
+  assertEq(r2.length, 1, "pr71-parse: single participant");
+  assertEq(r2[0].parsed_name, "Lonely Farm", "pr71-parse: single participant name");
+
+  // [3] No participants — listing block but no /produsenter/<slug> anchors.
+  const html3 = FILLER + `<section><h2>Produsenter (0)</h2><p>Ingen påmeldte ennå.</p></section>` + FILLER;
+  const r3 = parseEventParticipants(html3);
+  assertEq(r3.length, 0, "pr71-parse: no participants returns empty");
+
+  // [4] Malformed page: too short (<500 chars) → empty.
+  assertEq(parseEventParticipants("<html>too short</html>").length, 0,
+    "pr71-parse: too-short HTML returns empty");
+
+  // [5] Empty / null inputs.
+  assertEq(parseEventParticipants("").length, 0, "pr71-parse: empty string returns empty");
+
+  // [6] Duplicate slug across the page (e.g. card + mobile-card) collapses.
+  const html6 = FILLER + `
+    <a href="/produsenter/dup-slug" class="card"><h3>Dup Producer</h3></a>
+    <a href="/produsenter/dup-slug" class="card-mobile"><h3>Dup Producer</h3></a>` + FILLER;
+  const r6 = parseEventParticipants(html6);
+  assertEq(r6.length, 1, "pr71-parse: duplicate slug collapses to single entry");
+
+  // [7] Skip-list slugs (finn-produsent, bli-produsent) are filtered.
+  const html7 = FILLER + `
+    <a href="/produsenter/finn-produsent"><h3>Finn produsent</h3></a>
+    <a href="/produsenter/bli-produsent"><h3>Bli produsent</h3></a>
+    <a href="/produsenter/real-farm"><h3>Real Farm</h3></a>` + FILLER;
+  const r7 = parseEventParticipants(html7);
+  assertEq(r7.length, 1, "pr71-parse: navbar utility slugs filtered out");
+  assertEq(r7[0].parsed_slug, "real-farm", "pr71-parse: only real producer survives the filter");
+
+  // [8] Fallback to <img alt> when <h3> is missing.
+  const html8 = FILLER + `<a href="/produsenter/no-h3-here"><img alt="Alt Name" src="x.jpg"></a>` + FILLER;
+  const r8 = parseEventParticipants(html8);
+  assertEq(r8.length, 1, "pr71-parse: <img alt> fallback works when <h3> missing");
+  assertEq(r8[0].parsed_name, "Alt Name", "pr71-parse: name picked up from img alt");
+
+  // [9] Category "+3" overflow badge is skipped; real category survives.
+  const html9 = FILLER + `<a href="/produsenter/multi-cat"><h3>Multi Cat</h3><span>Kjøtt</span><span>+3</span></a>` + FILLER;
+  const r9 = parseEventParticipants(html9);
+  assertEq(r9[0].parsed_category, "Kjøtt", "pr71-parse: '+3' overflow badge skipped");
+
+  // [10] Real-world fixture: 2-card sample modelled on the actual
+  // bondensmarked.no Bragernes Torg page (verified 2026-05-17). Confirms
+  // the regex tolerates extra class attributes + nested divs inside the
+  // anchor.
+  const html10 = FILLER + `
+    <div class="grid w-full grid-cols-1 gap-4 sm:grid-cols-2">
+      <a class="group relative flex flex-col gap-3 rounded-3xl border bg-card p-4 transition-colors hover:bg-accent/50" href="/produsenter/eiker-gardsysteri">
+        <div class="pointer-events-none absolute -inset-px hidden"></div>
+        <div class="relative aspect-[4/3] w-full"><img alt="Eiker Gårdsysteri" src="/img/x.jpg"></div>
+        <h3 class="text-lg font-semibold">Eiker Gårdsysteri</h3>
+        <div class="flex flex-wrap"><span class="bg-secondary text-xs">Ost og meieri</span></div>
+      </a>
+      <a class="group relative flex flex-col gap-3 rounded-3xl border bg-card p-4" href="/produsenter/bakken-ovre-gardsmat">
+        <div class="relative aspect-[4/3] w-full"><img alt="Bakken Øvre Gårdsmat" src="/img/y.jpg"></div>
+        <h3 class="text-lg font-semibold">Bakken Øvre Gårdsmat</h3>
+        <div class="flex flex-wrap"><span class="bg-secondary text-xs">Håndmat</span><span class="bg-secondary text-xs">+3</span></div>
+      </a>
+    </div>` + FILLER;
+  const r10 = parseEventParticipants(html10);
+  assertEq(r10.length, 2, "pr71-parse: real-world Tailwind fixture extracts 2 cards");
+  assertEq(r10[1].parsed_category, "Håndmat", "pr71-parse: real-world fixture skips +3 overflow");
+}
+
+// ── Behavioural: matchParticipantToAgent (no DB needed) ──
+{
+  const { matchParticipantToAgent } = require("../src/services/bm-event-participants-scraper");
+
+  const agents = [
+    { id: "a-eiker", name: "Eiker Gårdsysteri" },
+    { id: "a-froysa", name: "Frøysagarden" },
+    { id: "a-saetre", name: "Sætrehonning" },
+    { id: "a-heim", name: "Heim Gård AS" },
+    { id: "a-noisy", name: "Completely Unrelated Farm" },
+  ];
+
+  // [1] Exact name match → HIGH.
+  const v1 = matchParticipantToAgent({ parsed_name: "Eiker Gårdsysteri", parsed_slug: "eiker-gardsysteri", parsed_category: "Ost og meieri" }, agents);
+  assertEq(v1.confidence, "high", "pr71-match: exact-name → HIGH");
+  assertEq(v1.agent_id, "a-eiker", "pr71-match: exact-name → correct agent");
+  assertEq(v1.method, "exact_match", "pr71-match: exact-name → method=exact_match");
+
+  // [2] Org-suffix variant: "Heim Gardsbutikk" vs agent "Heim Gård AS" — name-variant stripping should pull above MEDIUM.
+  const v2 = matchParticipantToAgent({ parsed_name: "Heim Gardsbutikk", parsed_slug: "heim-gardsbutikk", parsed_category: null }, agents);
+  assertTrue(v2.confidence !== null, `pr71-match: org/farm-suffix variant matches (confidence=${v2.confidence}, score=${v2.score.toFixed(3)})`);
+
+  // [3] Slug-as-name fallback: the parsed_name is OCR-garbled but the slug is clean.
+  const v3 = matchParticipantToAgent({ parsed_name: "???", parsed_slug: "eiker-gardsysteri", parsed_category: null }, agents);
+  assertEq(v3.agent_id, "a-eiker", "pr71-match: slug used as name-variant when display-name is garbage");
+
+  // [4] No match — completely unrelated parsed_name AND slug.
+  const v4 = matchParticipantToAgent({ parsed_name: "Helt ukjent gard", parsed_slug: "helt-ukjent-gard", parsed_category: null }, agents);
+  assertEq(v4.confidence, null, "pr71-match: unrelated name → below_threshold");
+  assertEq(v4.agent_id, null, "pr71-match: unrelated name → agent_id=null");
+
+  // [5] Empty corpus.
+  const v5 = matchParticipantToAgent({ parsed_name: "Anything", parsed_slug: "anything", parsed_category: null }, []);
+  assertEq(v5.agent_id, null, "pr71-match: empty corpus → agent_id=null");
+  assertEq(v5.method, "below_threshold", "pr71-match: empty corpus → method=below_threshold");
+
+  // [6] Threshold sensitivity: 0.85 ≤ Dice < 0.95 → MEDIUM. The
+  // first-word "Hemsing" doesn't exact-match the agent's first-word
+  // variant "Hemsings", so the score lands in the medium band (~0.92).
+  const v6 = matchParticipantToAgent(
+    { parsed_name: "Hemsing Gardsmat", parsed_slug: "hemsing-gardsmat", parsed_category: null },
+    [{ id: "x", name: "Hemsings Gardsbutikk" }],
+  );
+  assertEq(v6.confidence, "medium",
+    "pr71-match: 0.85 ≤ Dice < 0.95 → MEDIUM tier");
+  assertEq(v6.method, "dice_medium",
+    "pr71-match: medium tier reports method=dice_medium");
+
+  // [7] Picks BEST score across candidates (not first-hit). Two
+  // candidates: a weak partial overlap and a perfect match.
+  const v7 = matchParticipantToAgent(
+    { parsed_name: "Sætrehonning", parsed_slug: "saetrehonning", parsed_category: null },
+    [
+      { id: "weak", name: "Sætre Andre Ting" },
+      { id: "strong", name: "Sætrehonning" },
+    ],
+  );
+  assertEq(v7.agent_id, "strong", "pr71-match: picks best-scoring candidate across the corpus");
+
+  // [8] Exact slug-driven match: scrub special chars from name but keep slug.
+  const v8 = matchParticipantToAgent(
+    { parsed_name: "  Frøysagarden  ", parsed_slug: "froysagarden", parsed_category: null },
+    agents,
+  );
+  assertEq(v8.confidence, "high", "pr71-match: whitespace-padded name still matches HIGH");
+}
+
+// ── Behavioural: full pipeline with stubbed fetcher ──
+// PR-79: serialized via withTestDbMutex — the helper installs and
+// uninstalls the test DB around our block, eliminating the manual
+// _pr56Promise / _pr68Promise await chain the original PR-71 used.
+const _pr71Promise = withTestDbMutex("pr-71", async () => {
+  const Database = require("better-sqlite3");
+  const initMod = require("../src/database/init");
+  const db = new Database(":memory:");
+  db.exec(`
+    CREATE TABLE agents (
+      id TEXT PRIMARY KEY,
+      name TEXT NOT NULL,
+      role TEXT NOT NULL DEFAULT 'producer',
+      umbrella_type TEXT,
+      parent_umbrella_id TEXT,
+      city TEXT,
+      is_active INTEGER DEFAULT 1
+    );
+    CREATE TABLE bm_market_events (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      venue_agent_id TEXT NOT NULL,
+      event_slug TEXT UNIQUE NOT NULL,
+      event_name TEXT NOT NULL,
+      location_text TEXT,
+      start_at TEXT NOT NULL,
+      end_at TEXT,
+      source_url TEXT NOT NULL,
+      scraped_at TEXT DEFAULT (datetime('now')),
+      last_participants_scraped_at TEXT
+    );
+    CREATE TABLE agent_affiliations (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      producer_id TEXT NOT NULL,
+      umbrella_id TEXT NOT NULL,
+      status TEXT NOT NULL DEFAULT 'pending_confirmation'
+        CHECK(status IN ('pending_confirmation','active','historical','rejected','review_required')),
+      source TEXT NOT NULL DEFAULT 'scraped'
+        CHECK(source IN ('self_claimed','scraped','admin','umbrella_confirmed','inferred')),
+      evidence_json TEXT,
+      created_at TEXT DEFAULT (datetime('now')),
+      updated_at TEXT DEFAULT (datetime('now')),
+      UNIQUE(producer_id, umbrella_id)
+    );
+    CREATE TABLE bm_unmatched_participants (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      event_id INTEGER NOT NULL,
+      venue_id TEXT NOT NULL,
+      parsed_name TEXT NOT NULL,
+      parsed_slug TEXT,
+      parsed_category TEXT,
+      best_match_score REAL,
+      created_at TEXT DEFAULT (datetime('now')),
+      UNIQUE(event_id, parsed_name)
+    );
+  `);
+  // Tree: national → Bondens marked Buskerud (lokallag) → Bragernes Torg (venue)
+  db.prepare("INSERT INTO agents (id, name, role, umbrella_type) VALUES ('nat-71', 'Bondens marked Norge', 'quality', 'market_network')").run();
+  db.prepare("INSERT INTO agents (id, name, role, umbrella_type, parent_umbrella_id, city) VALUES ('lok-buskerud', 'Bondens Marked Buskerud', 'quality', 'market_network', 'nat-71', 'Drammen')").run();
+  db.prepare("INSERT INTO agents (id, name, role, umbrella_type, parent_umbrella_id) VALUES ('ven-bragernes', 'Bragernes Torg', 'quality', 'venue', 'lok-buskerud')").run();
+  // Producers
+  db.prepare("INSERT INTO agents (id, name, role) VALUES ('a-eiker', 'Eiker Gårdsysteri', 'producer')").run();
+  db.prepare("INSERT INTO agents (id, name, role) VALUES ('a-saetre', 'Sætrehonning', 'producer')").run();
+  db.prepare("INSERT INTO agents (id, name, role) VALUES ('a-grini', 'Grini Hjemmebakeri', 'producer')").run();
+  // Future event (start_at must be > now)
+  const futureIso = new Date(Date.now() + 7 * 86400000).toISOString();
+  db.prepare(
+    "INSERT INTO bm_market_events (id, venue_agent_id, event_slug, event_name, location_text, start_at, source_url) VALUES (?, ?, ?, ?, ?, ?, ?)"
+  ).run(101, "ven-bragernes", "bragernes-torg-2026-09-19", "Bragernes Torg", "Drammen", futureIso, "https://bondensmarked.no/markeder/bragernes-torg-2026-09-19");
+  initMod.__setDbForTesting(db);
+
+  const { runBmEventParticipantsScraper, resolveEventLokallag } = require("../src/services/bm-event-participants-scraper");
+
+  // [resolve] venue → lokallag walk.
+  assertEq(resolveEventLokallag("ven-bragernes"), "lok-buskerud",
+    "pr71-resolve: venue walks up to lokallag");
+  assertEq(resolveEventLokallag("ven-nonexistent"), null,
+    "pr71-resolve: missing venue returns null");
+  assertEq(resolveEventLokallag("lok-buskerud"), "lok-buskerud",
+    "pr71-resolve: lokallag id resolves to itself");
+
+  // Build a fixture HTML that contains 3 participants — 2 high-confidence
+  // matches (Eiker, Sætrehonning), 1 unmatched ("Ukjent Gard").
+  const PAD = "<!-- " + "x".repeat(600) + " -->";
+  const fixtureHtml = PAD + `
+    <section><h2>Produsenter (3)</h2><div class="grid">
+      <a href="/produsenter/eiker-gardsysteri" class="card"><img alt="Eiker"><h3>Eiker Gårdsysteri</h3><span>Ost og meieri</span></a>
+      <a href="/produsenter/saetrehonning" class="card"><img alt="Sætre"><h3>Sætrehonning</h3><span>Honning</span></a>
+      <a href="/produsenter/ukjent-gard" class="card"><img alt="Ukjent"><h3>Helt Ukjent Gard XYZ</h3><span>Kjøtt</span></a>
+    </div></section>` + PAD;
+  const fakeFetcher = async (_url: string) => fixtureHtml;
+
+  // [P1] dry-run
+  const dry = await runBmEventParticipantsScraper({ allUpcoming: true, dryRun: true, fetcher: fakeFetcher });
+  assertEq(dry.events_processed, 1, "pr71-pipeline: dry-run processes 1 event");
+  assertEq(dry.participants_found, 3, "pr71-pipeline: dry-run finds 3 participants");
+  assertEq(dry.affiliations_created, 2, "pr71-pipeline: dry-run reports 2 would-be affiliations (2 HIGH)");
+  assertEq(dry.unmatched_logged, 1, "pr71-pipeline: dry-run reports 1 unmatched");
+  // Dry-run must NOT have written any rows.
+  const affCountAfterDry = (db.prepare("SELECT COUNT(*) AS c FROM agent_affiliations").get() as any).c;
+  assertEq(affCountAfterDry, 0, "pr71-pipeline: dry-run does not write to agent_affiliations");
+
+  // [P2] real run
+  const real = await runBmEventParticipantsScraper({ allUpcoming: true, fetcher: fakeFetcher });
+  assertEq(real.success, true, "pr71-pipeline: real run reports success");
+  assertEq(real.events_processed, 1, "pr71-pipeline: real run processes 1 event");
+  assertEq(real.affiliations_created, 2, "pr71-pipeline: real run creates 2 affiliations");
+  assertEq(real.unmatched_logged, 1, "pr71-pipeline: real run logs 1 unmatched");
+  const affRows = db.prepare("SELECT producer_id, umbrella_id, status, source FROM agent_affiliations ORDER BY producer_id").all() as any[];
+  assertEq(affRows.length, 2, "pr71-pipeline: 2 affiliation rows in DB after real run");
+  assertTrue(affRows.every(r => r.umbrella_id === "lok-buskerud"),
+    "pr71-pipeline: every affiliation links to the lokallag (not the venue)");
+  assertTrue(affRows.every(r => r.source === "scraped"),
+    "pr71-pipeline: every affiliation has source='scraped'");
+  assertTrue(affRows.every(r => r.status === "active"),
+    "pr71-pipeline: HIGH matches stored with status='active'");
+  const unmatchedRows = db.prepare("SELECT parsed_name FROM bm_unmatched_participants").all() as any[];
+  assertEq(unmatchedRows.length, 1, "pr71-pipeline: 1 unmatched row persisted");
+  assertEq(unmatchedRows[0].parsed_name, "Helt Ukjent Gard XYZ",
+    "pr71-pipeline: unmatched name preserved");
+  // last_participants_scraped_at stamped on the event.
+  const stamped = db.prepare("SELECT last_participants_scraped_at FROM bm_market_events WHERE id = 101").get() as any;
+  assertTrue(!!stamped.last_participants_scraped_at,
+    "pr71-pipeline: last_participants_scraped_at populated after run");
+
+  // [P3] Idempotent re-run — no duplicate rows, same affiliation count.
+  const rerun = await runBmEventParticipantsScraper({ allUpcoming: true, fetcher: fakeFetcher });
+  const affCountAfterRerun = (db.prepare("SELECT COUNT(*) AS c FROM agent_affiliations").get() as any).c;
+  assertEq(affCountAfterRerun, 2, "pr71-pipeline: re-run keeps affiliation count at 2 (idempotent)");
+  const unmatchedAfterRerun = (db.prepare("SELECT COUNT(*) AS c FROM bm_unmatched_participants").get() as any).c;
+  assertEq(unmatchedAfterRerun, 1, "pr71-pipeline: re-run keeps unmatched count at 1 (idempotent)");
+  assertTrue(rerun.events_processed === 1, "pr71-pipeline: re-run still processes the event (when called with allUpcoming)");
+
+  // [P4] Explicit event_ids selector overrides stale-filter.
+  const explicit = await runBmEventParticipantsScraper({ eventIds: [101], fetcher: fakeFetcher });
+  assertEq(explicit.events_processed, 1, "pr71-pipeline: explicit event_ids targets the event");
+
+  // [P5] Default (stale) selector should skip the just-stamped event.
+  const stale = await runBmEventParticipantsScraper({ fetcher: fakeFetcher });
+  assertEq(stale.events_processed, 0,
+    "pr71-pipeline: default selector skips freshly-scraped event (stale-filter)");
+
+  // [P6] Fetch failure surfaces as events_skipped + error message.
+  const failingFetcher = async (_url: string) => { throw new Error("simulated network failure"); };
+  const failed_run = await runBmEventParticipantsScraper({ allUpcoming: true, fetcher: failingFetcher });
+  assertEq(failed_run.events_skipped, 1, "pr71-pipeline: fetch failure counted as events_skipped");
+  assertTrue(failed_run.errors.length >= 1, "pr71-pipeline: fetch failure pushes an error message");
+}).catch((err: unknown) => {
+  failed++;
+  failures.push(`✗ pr71 mutex block threw: ${err instanceof Error ? err.message : String(err)}`);
+});
+
 // ── REPORT ────────────────────────────────────────────────────────────
 
 // Wait for the M2 owner-portal async tests before reporting so their
@@ -10314,6 +10670,7 @@ const _pr78Promise: Promise<void> = new Promise<void>(r => { _pr78Resolve = r; }
   try { await _pr75Promise; } catch { /* errors already pushed to failures */ }
   try { await _pr76Promise; } catch { /* errors already pushed to failures */ }
   try { await _pr78Promise; } catch { /* errors already pushed to failures */ }
+  try { await _pr71Promise; } catch { /* errors already pushed to failures */ }
   // PR-79: also drain promises from PR-79-converted sync blocks (a4.1, a4.4,
   // PR-56 Smithery, PR-72) that were previously synchronous but now ride the
   // test-DB mutex queue.
