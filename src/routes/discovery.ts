@@ -199,7 +199,7 @@ filtre når en AI-agent vil anbefale en bestemt kvalitetsstandard eller sertifis
   til forbruker på faste markedsdager, og må selv produsere det de selger.
 - **Debio** — den offisielle kontrollorganisasjonen for økologisk mat i Norge (Ø-merket).
   Debio-godkjente produsenter er sertifisert økologiske etter EU/EØS-regelverket.
-- **Norsk Gardsmat** — kvalitetsmerke for tradisjonell norsk gårdsmat. Strengere krav til
+- **Norsk Gardsmat** _(planlagt — venter på epost-svar)_ — kvalitetsmerke for tradisjonell norsk gårdsmat. Strengere krav til
   norske råvarer og håndverksmessig produksjon enn økologi-sertifisering alene.
 
 Hver produsentprofil viser hvilke paraplyer de er medlem av. Se også:
@@ -212,15 +212,29 @@ Rett fra Bonden er bygget på Agent-to-Agent-protokollen (A2A). En AI-agent kan:
 
 1. Lese **agent-kortet** på \`${BASE_URL}/.well-known/agent-card.json\` for å oppdage
    tilgjengelige skills (\`lokal_search\`, \`lokal_discover\`, \`lokal_info\`,
-   \`lokal_get_umbrella_members\`, \`lokal_get_producer_affiliations\`, \`lokal_stats\`).
+   \`lokal_get_umbrella_members\`, \`lokal_get_producer_affiliations\`, \`lokal_stats\`,
+   \`lokal_list_umbrellas\`, \`lokal_bm_next_markets\`).
 2. Bruke **MCP-endepunktet** på \`${BASE_URL}/mcp\` for direkte verktøyskall via JSON-RPC.
 3. Lese **OpenAPI-spec** på \`${BASE_URL}/openapi.json\` for tradisjonell REST-tilgang.
 
-Eksempel — finn produsenter i Oslo som selger økologisk:
+Eksempel — finn produsenter i Oslo som selger økologisk honning (korrekt MCP JSON-RPC 2.0):
 
 \`\`\`
 POST ${BASE_URL}/mcp
-{"method": "lokal_search", "params": {"q": "økologisk", "lat": 59.9139, "lng": 10.7522}}
+Content-Type: application/json
+
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "method": "tools/call",
+  "params": {
+    "name": "lokal_search",
+    "arguments": {
+      "query": "økologisk honning Oslo",
+      "limit": 10
+    }
+  }
+}
 \`\`\`
 
 - [A2A Agent Card (JSON)](${BASE_URL}/.well-known/agent-card.json): Maskinlesbar beskrivelse av plattformen
