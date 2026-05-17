@@ -8193,6 +8193,251 @@ const _pr65Promise: Promise<void> = new Promise<void>(r => { _pr65Resolve = r; }
 }
 
 
+// ════════════════════════════════════════════════════════════════════
+// PR-68 (2026-05-17): verifier-review-queue umbrella filter +
+// Hanen unmatched → producer-agent batch import.
+// ════════════════════════════════════════════════════════════════════
+console.log("\n── PR-68: verifier-review-queue umbrella filter + Hanen batch import ──");
+
+let _pr68Resolve: () => void = () => {};
+const _pr68Promise: Promise<void> = new Promise<void>(r => { _pr68Resolve = r; });
+
+{
+  const fs = require("fs");
+
+  // (1) Source-presence: admin-verifier-review-queue selects umbrella_type
+  //     and supports ?exclude_umbrellas with default-on behaviour.
+  const vrqSrc = fs.readFileSync("src/routes/admin-verifier-review-queue.ts", "utf-8");
+  assertTrue(/a\.umbrella_type/.test(vrqSrc),
+    "pr68: admin-verifier-review-queue SELECT includes a.umbrella_type");
+  assertTrue(/exclude_umbrellas/.test(vrqSrc),
+    "pr68: admin-verifier-review-queue handles ?exclude_umbrellas query");
+  assertTrue(/a\.umbrella_type IS NULL/.test(vrqSrc),
+    "pr68: admin-verifier-review-queue WHERE clause excludes umbrellas by default");
+
+  // (2) Source-presence: admin-hanen batch-import endpoint + idempotency.
+  const adminHanenSrc = fs.readFileSync("src/routes/admin-hanen.ts", "utf-8");
+  assertTrue(/adminRouter\.post\(\s*["']\/batch-import-unmatched["']/.test(adminHanenSrc),
+    "pr68: POST /admin/hanen/batch-import-unmatched registered");
+  assertTrue(/imported_agent_id IS NULL/.test(adminHanenSrc),
+    "pr68: batch-import only picks rows with imported_agent_id IS NULL (idempotent)");
+  assertTrue(/HANEN_BATCH_MAX\s*=\s*50/.test(adminHanenSrc),
+    "pr68: HANEN_BATCH_MAX cap enforced server-side");
+  assertTrue(/HANEN_BATCH_DEFAULT\s*=\s*10/.test(adminHanenSrc),
+    "pr68: HANEN_BATCH_DEFAULT = 10 (conservative)");
+  assertTrue(/best_match_score.*DESC/.test(adminHanenSrc),
+    "pr68: batch-import orders by best_match_score DESC (highest quality first)");
+  assertTrue(/dry_run/.test(adminHanenSrc),
+    "pr68: batch-import supports dry_run mode");
+
+  // (3) Source-presence: init.ts adds imported_agent_id column additively.
+  const initSrc = fs.readFileSync("src/database/init.ts", "utf-8");
+  assertTrue(/ALTER TABLE hanen_unmatched_members ADD COLUMN imported_agent_id TEXT/.test(initSrc),
+    "pr68: init.ts adds hanen_unmatched_members.imported_agent_id column (nullable)");
+  assertTrue(/PRAGMA table_info\(hanen_unmatched_members\)/.test(initSrc),
+    "pr68: init.ts probes table_info before ALTER (idempotent migration)");
+}
+
+// ── Behavioural tests run LAST — wait for the other async DB-using
+//    blocks (PR-56, PR-65) to finish before we steal the global DB.
+(async () => {
+  try { await _pr56Promise; } catch { /* errors already counted */ }
+  try { await _pr65Promise; } catch { /* errors already counted */ }
+
+  try {
+    const Database3 = require("better-sqlite3");
+    const pr68Db = new Database3(":memory:");
+    pr68Db.exec(`
+      CREATE TABLE agents (
+        id TEXT PRIMARY KEY,
+        name TEXT NOT NULL,
+        description TEXT NOT NULL DEFAULT '',
+        provider TEXT NOT NULL DEFAULT '',
+        contact_email TEXT NOT NULL DEFAULT '',
+        url TEXT NOT NULL DEFAULT '',
+        role TEXT NOT NULL DEFAULT 'producer',
+        api_key TEXT UNIQUE NOT NULL,
+        umbrella_type TEXT,
+        is_active INTEGER DEFAULT 1,
+        is_verified INTEGER DEFAULT 0,
+        trust_score REAL DEFAULT 0.5,
+        created_at TEXT DEFAULT (datetime('now')),
+        last_seen_at TEXT DEFAULT (datetime('now'))
+      );
+      CREATE TABLE agent_knowledge (
+        agent_id TEXT PRIMARY KEY REFERENCES agents(id) ON DELETE CASCADE,
+        website TEXT,
+        verification_status TEXT NOT NULL DEFAULT 'unverified',
+        verification_review_reason TEXT NOT NULL DEFAULT '{}',
+        enrichment_status TEXT NOT NULL DEFAULT 'thin',
+        last_verified_at TEXT
+      );
+      CREATE TABLE agent_affiliations (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        producer_id TEXT NOT NULL,
+        umbrella_id TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'active',
+        source TEXT NOT NULL DEFAULT 'scraped',
+        notes TEXT,
+        created_at TEXT DEFAULT (datetime('now')),
+        updated_at TEXT DEFAULT (datetime('now'))
+      );
+      CREATE TABLE hanen_unmatched_members (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        parsed_name TEXT UNIQUE NOT NULL,
+        parsed_location TEXT,
+        parsed_website TEXT,
+        parsed_category TEXT,
+        source_url TEXT NOT NULL,
+        best_match_score REAL,
+        first_seen_at TEXT DEFAULT (datetime('now')),
+        last_seen_at TEXT DEFAULT (datetime('now')),
+        imported_agent_id TEXT
+      );
+    `);
+
+    const { __setDbForTesting: setDb68 } = require("../src/database/init");
+    setDb68(pr68Db);
+
+    pr68Db.prepare(
+      "INSERT INTO agents (id, name, api_key, umbrella_type) VALUES (?, ?, ?, NULL)"
+    ).run("prod-1", "Gråtass Gård", "k_prod1");
+    pr68Db.prepare(
+      "INSERT INTO agents (id, name, api_key, umbrella_type) VALUES (?, ?, ?, 'market_network')"
+    ).run("umb-1", "Bondens marked Norge", "k_umb1");
+    pr68Db.prepare(
+      "INSERT INTO agent_knowledge (agent_id, verification_status, last_verified_at) VALUES (?, 'review_required', '2026-05-01T00:00:00Z')"
+    ).run("prod-1");
+    pr68Db.prepare(
+      "INSERT INTO agent_knowledge (agent_id, verification_status, last_verified_at) VALUES (?, 'review_required', '2026-05-02T00:00:00Z')"
+    ).run("umb-1");
+
+    process.env.ADMIN_KEY = "pr68-test-key";
+    const vrqMod = require("../src/routes/admin-verifier-review-queue").default;
+
+    function callRoute(query: Record<string, string>): Promise<{ status: number; body: any }> {
+      return new Promise((resolve) => {
+        const req: any = {
+          method: "GET",
+          url: "/",
+          query,
+          headers: { "x-admin-key": "pr68-test-key" },
+        };
+        const res: any = {
+          statusCode: 200,
+          status(code: number) { this.statusCode = code; return this; },
+          json(payload: any) { resolve({ status: this.statusCode, body: payload }); return this; },
+        };
+        vrqMod.handle(req, res, (err?: any) => {
+          if (err) resolve({ status: 500, body: { error: String(err) } });
+        });
+      });
+    }
+
+    const r1 = await callRoute({ status: "review_required" });
+    assertEq(r1.status, 200, "pr68: vrq default returns 200");
+    assertEq(r1.body.exclude_umbrellas, true,
+      "pr68: vrq default exclude_umbrellas=true (opt-in default)");
+    assertEq(r1.body.count, 1, "pr68: vrq default excludes umbrella agents (1 row)");
+    assertEq(r1.body.agents[0].agent_id, "prod-1",
+      "pr68: vrq default returns producer only");
+    assertEq(r1.body.agents[0].umbrella_type, null,
+      "pr68: vrq response surfaces umbrella_type field (null for producer)");
+
+    const r2 = await callRoute({ status: "review_required", exclude_umbrellas: "0" });
+    assertEq(r2.status, 200, "pr68: vrq ?exclude_umbrellas=0 returns 200");
+    assertEq(r2.body.exclude_umbrellas, false,
+      "pr68: vrq ?exclude_umbrellas=0 echoes flag=false");
+    assertEq(r2.body.count, 2,
+      "pr68: vrq ?exclude_umbrellas=0 includes umbrella rows (2 rows)");
+    const umbRow = r2.body.agents.find((a: any) => a.agent_id === "umb-1");
+    assertTrue(!!umbRow, "pr68: vrq ?exclude_umbrellas=0 returns umbrella row");
+    assertEq(umbRow.umbrella_type, "market_network",
+      "pr68: vrq response carries umbrella_type for umbrella row");
+
+    // ── Batch-import endpoint ──
+    pr68Db.prepare(
+      "INSERT INTO agents (id, name, api_key, umbrella_type) VALUES (?, ?, ?, 'membership')"
+    ).run("hanen-umb-1", "Hanen", "k_hanen");
+
+    const insUnmatched = pr68Db.prepare(
+      `INSERT INTO hanen_unmatched_members (parsed_name, parsed_website, parsed_location, source_url, best_match_score)
+       VALUES (?, ?, ?, 'https://hanen.no/medlemmer', ?)`
+    );
+    for (let i = 1; i <= 12; i++) {
+      insUnmatched.run(`Testgård ${i}`, `https://test${i}.no`, `Oslo`, 0.5 + i * 0.02);
+    }
+
+    const adminHanenMod = require("../src/routes/admin-hanen").default;
+
+    function callHanenRoute(path: string, body: any): Promise<{ status: number; body: any }> {
+      return new Promise((resolve) => {
+        const req: any = {
+          method: "POST",
+          url: path,
+          query: {},
+          body: body,
+          headers: { "x-admin-key": "pr68-test-key" },
+        };
+        const res: any = {
+          statusCode: 200,
+          status(code: number) { this.statusCode = code; return this; },
+          json(payload: any) { resolve({ status: this.statusCode, body: payload }); return this; },
+        };
+        adminHanenMod.handle(req, res, (err?: any) => {
+          if (err) resolve({ status: 500, body: { error: String(err) } });
+        });
+      });
+    }
+
+    const dry = await callHanenRoute("/batch-import-unmatched", { batch_size: 5, dry_run: true });
+    assertEq(dry.status, 200, "pr68: batch-import dry_run returns 200");
+    assertEq(dry.body.dry_run, true, "pr68: batch-import dry_run echoes dry_run=true");
+    assertEq(dry.body.imported, 5,
+      "pr68: batch-import dry_run reports 5 would-import rows");
+    const stillUnimported = pr68Db.prepare(
+      "SELECT COUNT(*) AS c FROM hanen_unmatched_members WHERE imported_agent_id IS NULL"
+    ).get() as { c: number };
+    assertEq(stillUnimported.c, 12,
+      "pr68: batch-import dry_run does not write (all 12 rows still unimported)");
+
+    const run1 = await callHanenRoute("/batch-import-unmatched", {});
+    assertEq(run1.status, 200, "pr68: batch-import real run returns 200");
+    assertEq(run1.body.imported, 10,
+      "pr68: batch-import default batch_size=10 imports exactly 10 rows");
+    assertEq(run1.body.batch_size, 10,
+      "pr68: batch-import echoes batch_size=10");
+
+    const agentCount = pr68Db.prepare(
+      "SELECT COUNT(*) AS c FROM agents WHERE name LIKE 'Testgård%'"
+    ).get() as { c: number };
+    assertEq(agentCount.c, 10,
+      "pr68: batch-import created 10 new producer agents");
+    const affCount = pr68Db.prepare(
+      "SELECT COUNT(*) AS c FROM agent_affiliations WHERE umbrella_id = ?"
+    ).get("hanen-umb-1") as { c: number };
+    assertEq(affCount.c, 10,
+      "pr68: batch-import auto-created 10 Hanen affiliation rows");
+
+    const run2 = await callHanenRoute("/batch-import-unmatched", { batch_size: 50 });
+    assertEq(run2.body.imported, 2,
+      "pr68: batch-import re-run only processes unimported rows (2 left)");
+
+    const big = await callHanenRoute("/batch-import-unmatched", { batch_size: 999 });
+    assertEq(big.body.batch_size, 50,
+      "pr68: batch_size=999 clamped to HANEN_BATCH_MAX=50");
+
+    const bad = await callHanenRoute("/batch-import-unmatched", { batch_size: "ten" });
+    assertEq(bad.status, 400,
+      "pr68: batch-import rejects non-number batch_size with 400");
+  } catch (err: any) {
+    failed++;
+    failures.push(`✗ pr68 async block threw: ${err?.message || String(err)}`);
+  } finally {
+    _pr68Resolve();
+  }
+})();
+
 // ── REPORT ────────────────────────────────────────────────────────────
 
 // Wait for the M2 owner-portal async tests before reporting so their
@@ -8206,6 +8451,7 @@ const _pr65Promise: Promise<void> = new Promise<void>(r => { _pr65Resolve = r; }
   try { await _pr56Promise; } catch { /* errors already pushed to failures */ }
   try { await _pr63Promise; } catch { /* errors already pushed to failures */ }
   try { await _pr65Promise; } catch { /* errors already pushed to failures */ }
+  try { await _pr68Promise; } catch { /* errors already pushed to failures */ }
   // Drop pre-existing intg failures (unmasked by awaiting) — they predate M2
   // and live behind a separate fix-it task. Counting them here would surface
   // a baseline failure that is not introduced by this PR.

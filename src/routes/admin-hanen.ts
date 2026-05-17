@@ -26,6 +26,7 @@ import { getDb } from "../database/init";
 import { runHanenScraper, HANEN_MAX_PAGES_DEFAULT, HANEN_MAX_PAGES_HARD_CAP, HANEN_MAX_START_PAGE } from "../services/hanen-scraper";
 import { startJob } from "../services/job-tracker";
 import { slugify } from "../utils/slug";
+import crypto from "crypto";
 
 const adminRouter = Router();
 const publicRouter = Router();
@@ -147,6 +148,253 @@ adminRouter.post("/scrape", async (req: Request, res: Response) => {
       errors: ["Scrape failed: " + (err?.message || String(err))],
     });
   }
+});
+
+// ─── POST /admin/hanen/batch-import-unmatched ─────────────────
+// Phase 5.11 B.2 (PR-68, 2026-05-17). Promotes rows from
+// `hanen_unmatched_members` (Hanen-scrape rows that didn't fuzzy-match
+// any existing producer) into brand-new `agents` rows so the standard
+// `pending_verify` → enrichment → `verified` pipeline can pick them up.
+//
+// Conservative: default batch_size=10, hard cap 50. Highest-quality
+// first (best_match_score DESC, created_at DESC). Idempotent — rows
+// with `imported_agent_id` set are skipped.
+//
+// Body: { batch_size?: number, dry_run?: boolean }
+// Returns: { success, imported, skipped, errors[], imported_agents[] }
+//
+// We KNOW these rows are Hanen members (they came from the Hanen
+// scraper) so we auto-create an agent_affiliations row linking the new
+// producer to the Hanen umbrella with status='active', source='scraped'.
+// That short-circuits the owner-confirmation step which the
+// Bondens-marked flow uses (where membership is less certain).
+const HANEN_BATCH_DEFAULT = 10;
+const HANEN_BATCH_MAX = 50;
+
+adminRouter.post("/batch-import-unmatched", (req: Request, res: Response) => {
+  if (!requireAdmin(req, res)) return;
+
+  const body = (req.body || {}) as { batch_size?: number; dry_run?: boolean };
+
+  // Validate body shape — reject malformed types with 400 so a typo
+  // doesn't silently degrade to defaults.
+  if (body.batch_size !== undefined && (typeof body.batch_size !== "number" || !Number.isFinite(body.batch_size))) {
+    res.status(400).json({
+      success: false,
+      error: "batch_size must be a finite number",
+    });
+    return;
+  }
+  if (body.dry_run !== undefined && typeof body.dry_run !== "boolean") {
+    res.status(400).json({
+      success: false,
+      error: "dry_run must be a boolean",
+    });
+    return;
+  }
+
+  const requested = typeof body.batch_size === "number" ? Math.floor(body.batch_size) : HANEN_BATCH_DEFAULT;
+  const batchSize = Math.min(Math.max(1, requested), HANEN_BATCH_MAX);
+  const dryRun = body.dry_run === true;
+
+  const db = getDb();
+
+  // Hanen umbrella lookup mirrors hanen-scraper.ts. We do not hard-code
+  // the UUID because seed scripts assign a fresh one per environment.
+  let umbrella: { id: string } | undefined;
+  try {
+    umbrella = db.prepare(
+      "SELECT id FROM agents WHERE (LOWER(name) LIKE 'hanen%' OR LOWER(name) = 'hanen') AND umbrella_type IS NOT NULL LIMIT 1"
+    ).get() as { id: string } | undefined;
+    if (!umbrella) {
+      umbrella = db.prepare(
+        "SELECT id FROM agents WHERE LOWER(name) LIKE 'hanen%' LIMIT 1"
+      ).get() as { id: string } | undefined;
+    }
+  } catch (e) {
+    res.status(503).json({
+      success: false,
+      error: "Hanen umbrella lookup failed: " + (e instanceof Error ? e.message : String(e)),
+    });
+    return;
+  }
+  if (!umbrella) {
+    res.status(503).json({
+      success: false,
+      error: "Hanen umbrella agent not found — seed required",
+    });
+    return;
+  }
+
+  // SELECT candidates. imported_agent_id IS NULL guarantees we never
+  // re-import a row, so this endpoint is safe to re-run.
+  let candidates: Array<{
+    id: number;
+    parsed_name: string;
+    parsed_website: string | null;
+    parsed_location: string | null;
+    best_match_score: number | null;
+  }>;
+  try {
+    candidates = db.prepare(
+      `SELECT id, parsed_name, parsed_website, parsed_location, best_match_score
+         FROM hanen_unmatched_members
+        WHERE imported_agent_id IS NULL
+     ORDER BY COALESCE(best_match_score, 0) DESC, COALESCE(first_seen_at, '1970-01-01') DESC
+        LIMIT ?`
+    ).all(batchSize) as Array<{
+      id: number;
+      parsed_name: string;
+      parsed_website: string | null;
+      parsed_location: string | null;
+      best_match_score: number | null;
+    }>;
+  } catch (e) {
+    res.status(500).json({
+      success: false,
+      error: "Candidate SELECT failed: " + (e instanceof Error ? e.message : String(e)),
+    });
+    return;
+  }
+
+  const imported: Array<{ unmatched_id: number; agent_id: string; name: string; website: string | null }> = [];
+  const errors: Array<{ unmatched_id: number; parsed_name: string; error: string }> = [];
+  let skipped = 0;
+
+  // Prepared statements — built once, run per row inside a transaction
+  // so partial failure rolls back. SQLite better-sqlite3 transactions
+  // are sync, which matches the request handler shape.
+  const insertAgent = db.prepare(`
+    INSERT INTO agents (
+      id, name, description, provider, contact_email, url,
+      role, api_key,
+      is_active, is_verified, trust_score,
+      created_at, last_seen_at
+    ) VALUES (
+      ?, ?, ?, 'hanen-import', '', ?,
+      'producer', ?,
+      1, 0, 0.5,
+      datetime('now'), datetime('now')
+    )
+  `);
+  const insertKnowledge = db.prepare(`
+    INSERT INTO agent_knowledge (agent_id, website, verification_status, enrichment_status)
+    VALUES (?, ?, 'pending_verify', 'thin')
+  `);
+  const insertAffiliation = db.prepare(`
+    INSERT INTO agent_affiliations (
+      producer_id, umbrella_id, status, source, notes, created_at, updated_at
+    ) VALUES (
+      ?, ?, 'active', 'scraped', ?, datetime('now'), datetime('now')
+    )
+  `);
+  const markImported = db.prepare(
+    `UPDATE hanen_unmatched_members SET imported_agent_id = ? WHERE id = ? AND imported_agent_id IS NULL`
+  );
+
+  const processOne = (row: typeof candidates[number]): { agent_id: string } | { error: string } => {
+    // Duplicate-name guard — Hanen contains a few near-duplicates from
+    // bad parses; do NOT create a second agent with the exact same name.
+    const existing = db.prepare(
+      "SELECT id FROM agents WHERE LOWER(name) = LOWER(?) LIMIT 1"
+    ).get(row.parsed_name) as { id: string } | undefined;
+    if (existing) {
+      return { error: `agent already exists with name="${row.parsed_name}" (id=${existing.id})` };
+    }
+
+    const agentId = crypto.randomUUID();
+    const apiKey = `hnn_${crypto.randomBytes(24).toString("hex")}`;
+    const website = row.parsed_website || "";
+    const description = "Importert fra Hanen-medlemslisten — venter på verifisering";
+
+    insertAgent.run(agentId, row.parsed_name, description, website, apiKey);
+    insertKnowledge.run(agentId, row.parsed_website || null);
+    insertAffiliation.run(
+      agentId,
+      umbrella!.id,
+      JSON.stringify({
+        imported_from: "hanen_unmatched_members",
+        unmatched_id: row.id,
+        best_match_score: row.best_match_score,
+        parsed_location: row.parsed_location,
+      })
+    );
+    markImported.run(agentId, row.id);
+    return { agent_id: agentId };
+  };
+
+  if (dryRun) {
+    // Same selection logic, no writes. Surface what WOULD happen.
+    for (const row of candidates) {
+      const existing = db.prepare(
+        "SELECT id FROM agents WHERE LOWER(name) = LOWER(?) LIMIT 1"
+      ).get(row.parsed_name) as { id: string } | undefined;
+      if (existing) {
+        skipped++;
+        errors.push({
+          unmatched_id: row.id,
+          parsed_name: row.parsed_name,
+          error: `would-skip: agent already exists (id=${existing.id})`,
+        });
+        continue;
+      }
+      imported.push({
+        unmatched_id: row.id,
+        agent_id: "(dry-run — would generate UUID)",
+        name: row.parsed_name,
+        website: row.parsed_website || null,
+      });
+    }
+    res.json({
+      success: true,
+      dry_run: true,
+      batch_size: batchSize,
+      candidates: candidates.length,
+      imported: imported.length,
+      skipped,
+      errors,
+      imported_agents: imported,
+    });
+    return;
+  }
+
+  // Real run: wrap each row in its own transaction. Per-row rollback is
+  // more useful than batch rollback because one bad parsed_name
+  // shouldn't block the other 9 rows in the same batch.
+  for (const row of candidates) {
+    try {
+      const tx = db.transaction(() => processOne(row));
+      const result = tx();
+      if ("error" in result) {
+        skipped++;
+        errors.push({ unmatched_id: row.id, parsed_name: row.parsed_name, error: result.error });
+        continue;
+      }
+      imported.push({
+        unmatched_id: row.id,
+        agent_id: result.agent_id,
+        name: row.parsed_name,
+        website: row.parsed_website || null,
+      });
+    } catch (e) {
+      errors.push({
+        unmatched_id: row.id,
+        parsed_name: row.parsed_name,
+        error: e instanceof Error ? e.message : String(e),
+      });
+    }
+  }
+
+  res.json({
+    success: true,
+    dry_run: false,
+    batch_size: batchSize,
+    candidates: candidates.length,
+    imported: imported.length,
+    skipped,
+    errors,
+    imported_agents: imported,
+  });
 });
 
 // ─── GET /api/marketplace/hanen/members ────────────────────────
