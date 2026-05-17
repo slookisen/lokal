@@ -214,6 +214,49 @@ paths:
                             type: array
                             items:
                               type: string
+  /api/marketplace/geocode:
+    get:
+      operationId: geocodePlace
+      summary: Geocode a Norwegian place name
+      description: Resolve a Norwegian place name (city, town, region, fylke, or kommune) to lat/lng coordinates with a suggested search radius. Use when you need explicit coordinates for the discoverProducers endpoint (e.g., 'show me organic farms within 10 km of Florø'). Covers all of Norway via Kartverket Stedsnavn API fallback.
+      parameters:
+        - name: place
+          in: query
+          required: true
+          description: Norwegian place name (city, town, region, fylke, kommune)
+          schema:
+            type: string
+          example: "Florø"
+      responses:
+        "200":
+          description: Coordinates found
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                  place:
+                    type: string
+                  result:
+                    type: object
+                    properties:
+                      name:
+                        type: string
+                      lat:
+                        type: number
+                      lng:
+                        type: number
+                      radiusKm:
+                        type: number
+                      source:
+                        type: string
+                        enum: [cache, hardcoded, database, kartverket]
+        "404":
+          description: Place not found
+        "400":
+          description: Missing place parameter
   /api/stats:
     get:
       operationId: getPlatformStats
