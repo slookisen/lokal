@@ -10220,6 +10220,7 @@ const _pr71Promise: Promise<void> = new Promise<void>(r => { _pr71Resolve = r; }
   try { await _pr65Promise; } catch { /* counted */ }
   try { await _pr67Promise; } catch { /* counted */ }
   try { await _pr68Promise; } catch { /* counted */ }
+  try { await _m2Promise; } catch { /* counted */ } // iter-3: ensures magic_links table exists in CI scheduler
 
   try {
     const Database = require("better-sqlite3");
