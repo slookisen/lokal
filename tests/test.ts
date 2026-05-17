@@ -9461,10 +9461,19 @@ const _pr71Promise: Promise<void> = new Promise<void>(r => { _pr71Resolve = r; }
 }
 
 // ── Behavioural: full pipeline with stubbed fetcher ──
-// Same shape as the PR-56 scraper test. Wait for PR-56's DB-shared
-// block before stealing the global DB.
+// Same shape as the PR-56 scraper test. Wait for ALL prior DB-shared
+// blocks (PR-56, PR-65, PR-67, PR-68) before stealing the global DB.
+// PR-67's inner IIFE calls __setDbForTesting(null) on completion —
+// if that races AFTER our __setDbForTesting(db) below, the singleton
+// gets nulled out mid-test and the next getDb() re-inits an empty
+// data/lokal.db file (no test fixtures). This is the CI-only race
+// that produced 'no such table: agents' on the GH Actions runner
+// (Run 5, 2026-05-17). Serialising on _pr67Promise + _pr65Promise
+// matches the PR-67 / PR-68 pattern.
 (async () => {
   try { await _pr56Promise; } catch { /* counted */ }
+  try { await _pr65Promise; } catch { /* counted */ }
+  try { await _pr67Promise; } catch { /* counted */ }
   try { await _pr68Promise; } catch { /* counted */ }
 
   try {
