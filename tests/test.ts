@@ -9251,6 +9251,274 @@ const _pr68Promise: Promise<void> = new Promise<void>(r => { _pr68Resolve = r; }
   }
 })();
 
+
+// ════════════════════════════════════════════════════════════════════
+// PR-72 (2026-05-17): Search relevance — category beats city
+// When a query contains BOTH a category keyword (fisk) AND a city
+// (Bergen), the user wants fish producers near Bergen, not bakeries
+// whose name happens to contain "Bergen". Pass-2 of parseNaturalQuery
+// must not treat city/region words as distinctive name tokens.
+// ════════════════════════════════════════════════════════════════════
+console.log("\n── PR-72: search relevance — category beats city ──");
+
+{
+  const Database72 = require("better-sqlite3");
+  const initMod72 = require("../src/database/init");
+  const regMod72 = require("../src/services/marketplace-registry");
+
+  // Fresh in-memory DB with the columns marketplace-registry reads.
+  const pr72db = new Database72(":memory:");
+  pr72db.pragma("journal_mode = DELETE");
+  pr72db.exec(`
+    CREATE TABLE agents (
+      id TEXT PRIMARY KEY,
+      name TEXT NOT NULL,
+      description TEXT,
+      provider TEXT,
+      contact_email TEXT,
+      url TEXT,
+      version TEXT DEFAULT '1.0.0',
+      role TEXT,
+      api_key TEXT UNIQUE,
+      lat REAL, lng REAL, city TEXT, radius_km REAL,
+      categories TEXT DEFAULT '[]',
+      tags TEXT DEFAULT '[]',
+      skills TEXT DEFAULT '[]',
+      capabilities TEXT DEFAULT '{}',
+      languages TEXT DEFAULT '["no"]',
+      trust_score REAL DEFAULT 0.5,
+      is_active INTEGER DEFAULT 1,
+      is_verified INTEGER DEFAULT 0,
+      discovery_count INTEGER DEFAULT 0,
+      interaction_count INTEGER DEFAULT 0,
+      total_interactions INTEGER DEFAULT 0,
+      avg_response_time_ms REAL,
+      created_at TEXT DEFAULT (datetime('now')),
+      last_seen_at TEXT DEFAULT (datetime('now')),
+      umbrella_type TEXT,
+      parent_umbrella_id TEXT,
+      umbrella_member_count INTEGER,
+      umbrella_scrape_config TEXT,
+      umbrella_venues TEXT
+    );
+    CREATE TABLE agent_knowledge (
+      agent_id TEXT PRIMARY KEY,
+      products TEXT
+    );
+  `);
+  // Capture the current DB so we can restore it after the block — other
+  // async test blocks may still be referring to their own pinned DBs via
+  // dangling promises (PR-56 etc). Swapping the singleton ruins them.
+  const _prevDb72 = (() => {
+    try { return initMod72.getDb(); } catch { return null; }
+  })();
+  initMod72.__setDbForTesting(pr72db);
+  const reg72 = regMod72.marketplaceRegistry as any;
+  reg72._agentsCache = null;
+
+  // Seed the regression scenario: 2 Bergen "X" agents in unrelated categories
+  // (their NAME contains "Bergen") + 2 actual fish producers in Bergen.
+  const ins = pr72db.prepare(`INSERT INTO agents
+    (id, name, role, api_key, lat, lng, city, categories, tags, trust_score, is_active, is_verified)
+    VALUES (?, ?, 'producer', ?, ?, ?, ?, ?, ?, ?, 1, ?)`);
+
+  // Bakeries with "Bergen" in the name (NOT fish)
+  ins.run("pr72-godt-brod", "Godt Brød Bergen", "k-pr72-1", 60.39, 5.32, "Bergen",
+    JSON.stringify(["bread"]), JSON.stringify(["fresh"]), 0.85, 1);
+  ins.run("pr72-kinsarvik", "Kinsarvik Naturkost Bergen", "k-pr72-2", 60.39, 5.32, "Bergen",
+    JSON.stringify(["vegetables", "fruit"]), JSON.stringify(["organic"]), 0.80, 1);
+
+  // Actual fish producers in Bergen
+  ins.run("pr72-fish-me", "Fish Me Bergen", "k-pr72-3", 60.39, 5.32, "Bergen",
+    JSON.stringify(["fish"]), JSON.stringify(["fresh"]), 0.70, 1);
+  ins.run("pr72-bergen-rokeri", "Bergen Røkeri", "k-pr72-4", 60.39, 5.32, "Bergen",
+    JSON.stringify(["fish"]), JSON.stringify([]), 0.65, 0);
+
+  // Honey producer in Oslo (for the "økologisk honning Oslo" case)
+  ins.run("pr72-honning-bedre", "Bedre Birøkt Oslo", "k-pr72-5", 59.91, 10.75, "Oslo",
+    JSON.stringify(["honey"]), JSON.stringify(["organic"]), 0.75, 1);
+  // Oslo bakery (should NOT win an honey-in-Oslo query)
+  ins.run("pr72-oslo-bakeri", "Oslo Surdeig Bakeri", "k-pr72-6", 59.91, 10.75, "Oslo",
+    JSON.stringify(["bread"]), JSON.stringify([]), 0.80, 1);
+  // Honey producer in Bergen (further from Oslo — should rank below the Oslo honey)
+  ins.run("pr72-honning-far", "Vest Birøkt", "k-pr72-7", 60.39, 5.32, "Bergen",
+    JSON.stringify(["honey"]), JSON.stringify(["organic"]), 0.70, 1);
+
+  reg72._agentsCache = null;
+
+  // ── Test 1: parseNaturalQuery extracts categories but NOT _nameQuery
+  //   when query mixes a category keyword (fisk) with a city (Bergen).
+  const parsed1 = reg72.parseNaturalQuery("Hvor kan jeg kjøpe fersk fisk i Bergen?");
+  assertTrue(
+    Array.isArray(parsed1.categories) && parsed1.categories.includes("fish"),
+    "pr72: 'fersk fisk i Bergen' parses categories=[fish]"
+  );
+  assertTrue(
+    !parsed1._nameQuery,
+    "pr72: 'fersk fisk i Bergen' does NOT set _nameQuery (city is not a distinctive name token)"
+  );
+
+  // ── Test 2: discover with categories=[fish] + Bergen location returns
+  //   Fish Me Bergen / Bergen Røkeri, NOT Godt Brød / Kinsarvik.
+  const fishResults = reg72.discover({
+    role: "producer",
+    categories: ["fish"],
+    location: { lat: 60.39, lng: 5.32 },
+    maxDistanceKm: 30,
+    limit: 10,
+  }) as any[];
+  const fishNames = fishResults.map((r: any) => r.agent.name);
+  assertTrue(
+    fishNames.includes("Fish Me Bergen"),
+    "pr72: fish+Bergen discover returns 'Fish Me Bergen' (was missing before the fix)"
+  );
+  assertTrue(
+    fishNames.includes("Bergen Røkeri"),
+    "pr72: fish+Bergen discover returns 'Bergen Røkeri'"
+  );
+  assertTrue(
+    !fishNames.includes("Godt Brød Bergen"),
+    "pr72: fish+Bergen discover EXCLUDES the bakery 'Godt Brød Bergen' (category filter wins)"
+  );
+  assertTrue(
+    !fishNames.includes("Kinsarvik Naturkost Bergen"),
+    "pr72: fish+Bergen discover EXCLUDES vegetables shop 'Kinsarvik Naturkost Bergen'"
+  );
+
+  // ── Test 3: Category-only query (no city) — old behaviour preserved.
+  const catOnly = reg72.parseNaturalQuery("fisk");
+  assertTrue(
+    Array.isArray(catOnly.categories) && catOnly.categories.includes("fish"),
+    "pr72: 'fisk' alone still parses categories=[fish]"
+  );
+  assertTrue(
+    !catOnly._nameQuery,
+    "pr72: 'fisk' alone does not set _nameQuery (all words are known terms)"
+  );
+
+  // ── Test 4: City-only query (no category) — old behaviour preserved.
+  //   "Bergen" alone has nothing to attach to → no name-query, no categories.
+  const cityOnly = reg72.parseNaturalQuery("Bergen");
+  assertTrue(
+    !cityOnly._nameQuery,
+    "pr72: 'Bergen' alone does not set _nameQuery (single known place word)"
+  );
+  assertTrue(
+    !cityOnly.categories || cityOnly.categories.length === 0,
+    "pr72: 'Bergen' alone does not set categories"
+  );
+
+  // ── Test 5: Empty/generic query — old behaviour preserved.
+  const generic = reg72.parseNaturalQuery("mat");
+  assertTrue(
+    !generic._nameQuery,
+    "pr72: 'mat' generic word does not set _nameQuery"
+  );
+
+  // ── Test 6: Name-only query still works — "Bjørndal" must trigger name-search
+  //   so we don't regress the existing producer-name flow.
+  pr72db.prepare(`INSERT INTO agents (id, name, role, api_key, is_active)
+    VALUES ('pr72-bjorndal', 'Bjørndal Gård', 'producer', 'k-pr72-bj', 1)`).run();
+  reg72._agentsCache = null;
+  const nameOnly = reg72.parseNaturalQuery("bjørndal");
+  assertTrue(
+    typeof nameOnly._nameQuery === "string" && nameOnly._nameQuery.toLowerCase().includes("bjørndal"),
+    "pr72: 'bjørndal' (a real distinctive name word) still sets _nameQuery"
+  );
+
+  // ── Test 7: Pass 1 indicator words still work — "Bjørndal Gård" → name-search.
+  //   "gård" is an explicit producer indicator, so we keep the name flow.
+  const indicator = reg72.parseNaturalQuery("Bjørndal Gård");
+  assertTrue(
+    typeof indicator._nameQuery === "string" && indicator._nameQuery.length > 0,
+    "pr72: Pass-1 indicator 'gård' still triggers name-search ('Bjørndal Gård')"
+  );
+
+  // ── Test 8: honning + Oslo — honey producers win, not the Oslo bakery.
+  const parsedHon = reg72.parseNaturalQuery("økologisk honning i Oslo");
+  assertTrue(
+    Array.isArray(parsedHon.categories) && parsedHon.categories.includes("honey"),
+    "pr72: 'økologisk honning i Oslo' parses categories=[honey]"
+  );
+  assertTrue(
+    !parsedHon._nameQuery,
+    "pr72: 'økologisk honning i Oslo' does NOT set _nameQuery (Oslo is a known place word)"
+  );
+
+  // Discover near Oslo for honey
+  const honResults = reg72.discover({
+    role: "producer",
+    categories: ["honey"],
+    tags: ["organic"],
+    location: { lat: 59.91, lng: 10.75 },
+    maxDistanceKm: 30,
+    limit: 10,
+  }) as any[];
+  const honNames = honResults.map((r: any) => r.agent.name);
+  assertTrue(
+    honNames.includes("Bedre Birøkt Oslo"),
+    "pr72: honey+Oslo discover returns the Oslo honey producer"
+  );
+  assertTrue(
+    !honNames.includes("Oslo Surdeig Bakeri"),
+    "pr72: honey+Oslo discover EXCLUDES the Oslo bakery (category=bread, not honey)"
+  );
+
+  // ── Test 9: When no location filter, fish-Bergen query still puts
+  //   real fish producers above name-of-Bergen agents.
+  const fishNoGeo = reg72.discover({
+    role: "producer",
+    categories: ["fish"],
+    limit: 10,
+  }) as any[];
+  const fishNoGeoNames = fishNoGeo.map((r: any) => r.agent.name);
+  assertTrue(
+    fishNoGeoNames.includes("Fish Me Bergen") &&
+      !fishNoGeoNames.includes("Godt Brød Bergen"),
+    "pr72: discover({categories:[fish]}) returns fish producers and excludes the bakery"
+  );
+
+  // ── Test 10: Tromsø + fish — another city used in the place-words list.
+  const parsedTr = reg72.parseNaturalQuery("fisk fra Tromsø");
+  assertTrue(
+    Array.isArray(parsedTr.categories) && parsedTr.categories.includes("fish"),
+    "pr72: 'fisk fra Tromsø' parses categories=[fish]"
+  );
+  assertTrue(
+    !parsedTr._nameQuery,
+    "pr72: 'fisk fra Tromsø' does NOT set _nameQuery (Tromsø is a known place word)"
+  );
+
+  // ── Test 11: Mixed city + category in any order — also handled.
+  const parsedMix = reg72.parseNaturalQuery("Stavanger økologisk kjøtt");
+  assertTrue(
+    Array.isArray(parsedMix.categories) && parsedMix.categories.includes("meat"),
+    "pr72: 'Stavanger økologisk kjøtt' parses categories=[meat]"
+  );
+  assertTrue(
+    !parsedMix._nameQuery,
+    "pr72: 'Stavanger økologisk kjøtt' does NOT set _nameQuery"
+  );
+
+  // ── Test 12: Region/fylke names also treated as places.
+  const parsedReg = reg72.parseNaturalQuery("ost i Vestland");
+  assertTrue(
+    Array.isArray(parsedReg.categories) && parsedReg.categories.includes("dairy"),
+    "pr72: 'ost i Vestland' parses categories=[dairy] (ost → dairy via word-boundary regex)"
+  );
+  assertTrue(
+    !parsedReg._nameQuery,
+    "pr72: 'ost i Vestland' does NOT set _nameQuery (Vestland is a known fylke)"
+  );
+
+  // Restore prior DB so PR-56 / other async test blocks resume with their
+  // own pinned in-memory DB instead of our pr72db.
+  if (_prevDb72) initMod72.__setDbForTesting(_prevDb72);
+  reg72._agentsCache = null;
+  reg72._statsCache = null;
+}
+
+
 // ── REPORT ────────────────────────────────────────────────────────────
 
 // Wait for the M2 owner-portal async tests before reporting so their
