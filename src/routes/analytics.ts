@@ -966,4 +966,197 @@ router.get("/producer-outcomes", requireAdminAuth, (req: Request, res: Response)
 });
 
 
+
+// ─── GET /admin/analytics/umbrella-traffic ──────────────────────
+// Per-umbrella (markedsnettverk) traffic breakdown.
+// For each umbrella agent (umbrella_type IS NOT NULL), returns:
+//   - pageViews_via_profile: hits on the umbrella's own /produsent/<slug>
+//   - pageViews_via_members: hits on member producers' /produsent/<slug>
+//   - ai_bot_pageviews:      either-channel hits whose session_id matches
+//                            a known AI / search-bot UA token
+//   - search_referrals:      either-channel hits whose source = 'search'
+//   - active_members:        count of agent_affiliations rows where
+//                            status='active' for this umbrella
+//
+// Members are joined via agent_affiliations (status='active'). Slug
+// matching uses the same rules as src/utils/slug.ts so the path lookup
+// stays consistent with /produsent/<slug>.
+//
+// Query params:
+//   since_hours=24 (default, min 1, max 87600 = 10y)
+//
+// Response shape — see PR-74 spec in repo notes.
+router.get("/umbrella-traffic", (req: Request, res: Response) => {
+  // ── Param validation ────────────────────────────────────────
+  // Reject malformed values explicitly (vs. silent fallback) so the
+  // dashboard can't accidentally show "24h" when the user typed "abc".
+  const rawHours = req.query.since_hours;
+  if (rawHours !== undefined) {
+    const s = String(rawHours);
+    if (!/^\d+$/.test(s)) {
+      res.status(400).json({ error: "Invalid since_hours — must be a positive integer" });
+      return;
+    }
+  }
+  const sinceHours = Math.max(1, Math.min(87600, parseInt(String(rawHours || "24"), 10) || 24));
+
+  try {
+    const db = getDb();
+
+    // Slugify mirror of src/utils/slug.ts. Inline here because SQLite
+    // can't call into TS — we slugify each umbrella + member name in
+    // JS and then query with the resulting paths. The path column is
+    // indexed (idx_analytics_page_views_path).
+    const slugify = (text: string): string =>
+      (text || "")
+        .normalize("NFC")
+        .toLowerCase()
+        .replace(/æ/g, "ae")
+        .replace(/ø/g, "o")
+        .replace(/å/g, "a")
+        .replace(/ä/g, "a")
+        .replace(/ö/g, "o")
+        .replace(/ü/g, "u")
+        .replace(/[^a-z0-9]+/g, "-")
+        .replace(/^-|-$/g, "");
+
+    // ── 1. List umbrellas ─────────────────────────────────────
+    const umbrellas = db.prepare(`
+      SELECT id, name, umbrella_type
+      FROM agents
+      WHERE umbrella_type IS NOT NULL
+        AND (is_active IS NULL OR is_active = 1)
+      ORDER BY name
+    `).all() as Array<{ id: string; name: string; umbrella_type: string }>;
+
+    if (umbrellas.length === 0) {
+      res.json({ success: true, since_hours: sinceHours, umbrellas: [] });
+      return;
+    }
+
+    // ── 2. For each umbrella, gather members + counts ─────────
+    // We intentionally run one round-trip per umbrella. There are
+    // typically <30 umbrellas across the whole platform and the
+    // per-umbrella query is bounded by the size of its membership
+    // list, so a single batched IN-clause would be a wash on cost
+    // and significantly less readable.
+    const cutoff = sqliteDatetime(new Date(Date.now() - sinceHours * 3600 * 1000));
+
+    // AI / bot UA tokens — match the bucket used elsewhere in this
+    // file (producer-outcomes) so the meaning of "AI bot view" is
+    // consistent across widgets.
+    const AI_TOKENS = [
+      "GPTBot", "ChatGPT", "OAI-SearchBot",
+      "ClaudeBot", "Claude-User", "Anthropic",
+      "Googlebot", "Google-Extended", "Gemini",
+      "PerplexityBot", "Perplexity-User",
+      "Bytespider", "CCBot", "Applebot", "YandexBot", "bingbot",
+    ];
+    const aiClause = AI_TOKENS.map(() => "session_id LIKE ?").join(" OR ");
+    const aiParams = AI_TOKENS.map(t => `%${t}%`);
+
+    const memberCountStmt = db.prepare(`
+      SELECT COUNT(*) as c FROM agent_affiliations
+      WHERE umbrella_id = ? AND status = 'active'
+    `);
+    const memberNamesStmt = db.prepare(`
+      SELECT a.name FROM agent_affiliations af
+      JOIN agents a ON a.id = af.producer_id
+      WHERE af.umbrella_id = ? AND af.status = 'active'
+    `);
+
+    type Bucket = {
+      id: string;
+      name: string;
+      umbrella_type: string;
+      active_members: number;
+      pageViews_total: number;
+      pageViews_via_profile: number;
+      pageViews_via_members: number;
+      ai_bot_pageviews: number;
+      search_referrals: number;
+    };
+
+    const out: Bucket[] = [];
+
+    for (const u of umbrellas) {
+      const activeMembers = (memberCountStmt.get(u.id) as { c: number }).c;
+      const memberNames = memberNamesStmt.all(u.id) as Array<{ name: string }>;
+
+      const umbrellaPath = `/produsent/${slugify(u.name)}`;
+      const memberPaths = memberNames
+        .map(m => `/produsent/${slugify(m.name)}`)
+        .filter(p => p !== "/produsent/"); // skip blank-name members
+
+      // pageViews_via_profile — hits on umbrella's own /produsent/<slug>
+      const profileRow = db.prepare(`
+        SELECT COUNT(*) as c FROM analytics_page_views
+        WHERE path = ?
+          AND created_at > ?
+          AND (is_owner IS NULL OR is_owner = 0)
+      `).get(umbrellaPath, cutoff) as { c: number };
+      const pageViews_via_profile = profileRow.c;
+
+      // pageViews_via_members — hits on any member's /produsent/<slug>
+      let pageViews_via_members = 0;
+      if (memberPaths.length > 0) {
+        const placeholders = memberPaths.map(() => "?").join(",");
+        const memberRow = db.prepare(`
+          SELECT COUNT(*) as c FROM analytics_page_views
+          WHERE path IN (${placeholders})
+            AND created_at > ?
+            AND (is_owner IS NULL OR is_owner = 0)
+        `).get(...memberPaths, cutoff) as { c: number };
+        pageViews_via_members = memberRow.c;
+      }
+
+      // ai_bot_pageviews — either channel, UA matches known bot token
+      const allPaths = [umbrellaPath, ...memberPaths];
+      const pathPlaceholders = allPaths.map(() => "?").join(",");
+      const aiRow = db.prepare(`
+        SELECT COUNT(*) as c FROM analytics_page_views
+        WHERE path IN (${pathPlaceholders})
+          AND created_at > ?
+          AND (is_owner IS NULL OR is_owner = 0)
+          AND (${aiClause})
+      `).get(...allPaths, cutoff, ...aiParams) as { c: number };
+      const ai_bot_pageviews = aiRow.c;
+
+      // search_referrals — either channel, source = 'search'
+      const searchRow = db.prepare(`
+        SELECT COUNT(*) as c FROM analytics_page_views
+        WHERE path IN (${pathPlaceholders})
+          AND created_at > ?
+          AND (is_owner IS NULL OR is_owner = 0)
+          AND source = 'search'
+      `).get(...allPaths, cutoff) as { c: number };
+      const search_referrals = searchRow.c;
+
+      out.push({
+        id: u.id,
+        name: u.name,
+        umbrella_type: u.umbrella_type,
+        active_members: activeMembers,
+        pageViews_total: pageViews_via_profile + pageViews_via_members,
+        pageViews_via_profile,
+        pageViews_via_members,
+        ai_bot_pageviews,
+        search_referrals,
+      });
+    }
+
+    // Sorted by total pageViews descending — most-trafficked first
+    out.sort((a, b) => b.pageViews_total - a.pageViews_total);
+
+    res.json({
+      success: true,
+      since_hours: sinceHours,
+      umbrellas: out,
+    });
+  } catch (err: any) {
+    res.status(500).json({ error: "Query failed", detail: err.message });
+  }
+});
+
+
 export default router;
