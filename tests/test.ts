@@ -7626,6 +7626,9 @@ const _pr63Promise: Promise<void> = new Promise<void>(r => { _pr63Resolve = r; }
       since: "2026-01-01",
       fetchImpl: stubFetch as any,
       delayMs: 0,
+      // PR-70: pin TRACES so this PR-63 behavioural test keeps
+      // exercising the same path it always has.
+      source: "traces",
     });
 
     assertEq(result.traces_fetched, 2,
@@ -7651,6 +7654,7 @@ const _pr63Promise: Promise<void> = new Promise<void>(r => { _pr63Resolve = r; }
       since: "2026-01-01",
       fetchImpl: stubFetch as any,
       delayMs: 0,
+      source: "traces",
     });
     const aff2 = db.prepare("SELECT COUNT(*) AS c FROM agent_affiliations").get() as any;
     assertEq(aff2.c, 1, "c1a: re-running cross-check does not duplicate affiliations (idempotent)");
@@ -8154,6 +8158,9 @@ const _pr65Promise: Promise<void> = new Promise<void>(r => { _pr65Resolve = r; }
       fetchImpl: brregStub,
       delayMs: 0,
       debioUmbrellaId: "u-debio-65",
+      // PR-70: pin TRACES so this PR-65 test exercises the TRACES
+      // pagination path it was designed for.
+      source: "traces",
     });
     assertTrue(ccResult.traces_pages_processed !== undefined,
       "pr65: runDebioCrossCheck result includes traces_pages_processed");
@@ -10246,6 +10253,323 @@ const _pr78Promise: Promise<void> = new Promise<void>(r => { _pr78Resolve = r; }
     failures.push(`✗ pr-78 async test setup failed: ${err instanceof Error ? err.message : String(err)}`);
     _pr78Resolve();
   });
+// ════════════════════════════════════════════════════════════════════
+// PR-70 (2026-05-17): Debio cross-check switches PRIMARY source from
+// EU TRACES NT to finnoko.debio.no/api/acm/companies.
+// ════════════════════════════════════════════════════════════════════
+console.log("\n── PR-70: Debio cross-check via finnoko (primary) ──");
+
+let _pr70Resolve: () => void = () => {};
+const _pr70Promise: Promise<void> = new Promise<void>(r => { _pr70Resolve = r; });
+
+{
+  const fs = require("fs");
+
+  // (1) Source-presence: debio-finnoko-client.ts exists and exports the
+  //     core entry points.
+  assertTrue(fs.existsSync("src/services/debio-finnoko-client.ts"),
+    "pr70: debio-finnoko-client.ts present");
+  const finnokoSrc = fs.readFileSync("src/services/debio-finnoko-client.ts", "utf-8");
+  assertTrue(/export\s+async\s+function\s+fetchFinnokoCompanies/.test(finnokoSrc),
+    "pr70: debio-finnoko-client exports fetchFinnokoCompanies()");
+  assertTrue(/export\s+function\s+isFinnokoCompany/.test(finnokoSrc),
+    "pr70: debio-finnoko-client exports isFinnokoCompany() type guard");
+  assertTrue(/finnoko\.debio\.no\/api\/acm\/companies/.test(finnokoSrc),
+    "pr70: debio-finnoko-client points at finnoko.debio.no/api/acm/companies");
+
+  // (2) Source-presence: debio-cross-check now imports the finnoko
+  //     client and exposes crossCheckViaFinnoko + DebioSource type.
+  const debioSvcSrc = fs.readFileSync("src/services/debio-cross-check.ts", "utf-8");
+  assertTrue(/from\s+["']\.\/debio-finnoko-client["']/.test(debioSvcSrc),
+    "pr70: debio-cross-check imports from ./debio-finnoko-client");
+  assertTrue(/export\s+type\s+DebioSource\s*=\s*"finnoko"\s*\|\s*"traces"\s*\|\s*"auto"/.test(debioSvcSrc),
+    "pr70: debio-cross-check exports DebioSource union");
+  assertTrue(/export\s+async\s+function\s+crossCheckViaFinnoko/.test(debioSvcSrc),
+    "pr70: debio-cross-check exports crossCheckViaFinnoko()");
+  assertTrue(/source_used:\s*DebioSource\s*\|\s*"none"/.test(debioSvcSrc),
+    "pr70: CrossCheckResult.source_used is DebioSource | 'none'");
+  assertTrue(/finnoko_fetched:\s*number/.test(debioSvcSrc),
+    "pr70: CrossCheckResult.finnoko_fetched is number");
+
+  // (3) Source-presence: admin route adds ?source= query param.
+  const adminRouteSrc = fs.readFileSync("src/routes/admin-debio-cross-check.ts", "utf-8");
+  assertTrue(/req\.query\.source/.test(adminRouteSrc),
+    "pr70: admin-debio-cross-check reads req.query.source");
+  assertTrue(/parseSource/.test(adminRouteSrc),
+    "pr70: admin-debio-cross-check has a parseSource helper");
+}
+
+// ── Behavioural tail: fetch-stubbed end-to-end. Runs AFTER all prior
+// PR async blocks so the global DB singleton isn't being thrashed.
+(async () => {
+  try {
+    try { await _pr56Promise; } catch { /* already counted */ }
+    try { await _m2Promise; } catch { /* already counted */ }
+    try { await _pr63Promise; } catch { /* already counted */ }
+    try { await _pr65Promise; } catch { /* already counted */ }
+    try { await _pr66Promise; } catch { /* already counted */ }
+    try { await _pr67Promise; } catch { /* already counted */ }
+    try { await _pr68Promise; } catch { /* already counted */ }
+    try { await _pr74Promise; } catch { /* already counted */ }
+    try { await _pr75Promise; } catch { /* already counted */ }
+    try { await _pr78Promise; } catch { /* already counted */ }
+
+    const fc = require("../src/services/debio-finnoko-client");
+
+    // ── (4) parseFinnokoResponse permissive parsing ──
+    assertEq(fc.parseFinnokoResponse([1, 2, 3]).length, 3,
+      "pr70: parseFinnokoResponse accepts a bare array");
+    assertEq(fc.parseFinnokoResponse({ results: ["a"] }).length, 1,
+      "pr70: parseFinnokoResponse unwraps {results:[…]} envelope");
+    assertEq(fc.parseFinnokoResponse({ data: ["a", "b"] }).length, 2,
+      "pr70: parseFinnokoResponse unwraps {data:[…]} envelope");
+    assertEq(fc.parseFinnokoResponse(null).length, 0,
+      "pr70: parseFinnokoResponse returns [] for null");
+
+    // ── (5) isFinnokoCompany + normaliseFinnokoRecord type guards ──
+    const validRaw = {
+      partner_sid: 5775,
+      display_name: "Østre Pavestad Gård",
+      contact_mail: "petter@pavestad.no",
+      website: "www.norskullgris.no",
+    };
+    assertEq(fc.isFinnokoCompany(validRaw), true,
+      "pr70: isFinnokoCompany accepts a record with partner_sid+display_name");
+    assertEq(fc.isFinnokoCompany({ display_name: "X" }), false,
+      "pr70: isFinnokoCompany rejects records missing partner_sid");
+    assertEq(fc.isFinnokoCompany({ partner_sid: 1, display_name: "" }), false,
+      "pr70: isFinnokoCompany rejects records with empty display_name");
+    assertEq(fc.isFinnokoCompany({ partner_sid: 1, display_name: null }), false,
+      "pr70: isFinnokoCompany rejects records with null display_name");
+    assertEq(fc.isFinnokoCompany(null), false,
+      "pr70: isFinnokoCompany rejects null");
+
+    // ── (6) fetchFinnokoCompanies caching ──
+    fc.__clearFinnokoCacheForTesting();
+    let callCount = 0;
+    const okStub = async (url: string): Promise<any> => {
+      callCount++;
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ([
+          { partner_sid: 1, display_name: "Aalrust Gård" },
+          { partner_sid: 2, display_name: "Vestby Frukt" },
+          { partner_sid: 3, display_name: null }, // dropped by type guard
+          { partner_sid: 4, display_name: "Ukjent Gård" },
+        ]),
+      };
+    };
+    const first = await fc.fetchFinnokoCompanies({ fetchImpl: okStub });
+    assertEq(first.length, 3,
+      "pr70: fetchFinnokoCompanies filters out records with null display_name (4 in, 3 out)");
+    assertEq(callCount, 1, "pr70: fetchFinnokoCompanies makes 1 HTTP call");
+    const second = await fc.fetchFinnokoCompanies({ fetchImpl: okStub });
+    assertEq(second.length, 3,
+      "pr70: cached fetchFinnokoCompanies still returns 3 records");
+    assertEq(callCount, 1,
+      "pr70: fetchFinnokoCompanies does NOT re-call fetch within the 60-min cache TTL");
+
+    // ── (7) fetchFinnokoCompanies HTTP error surfaces as throw ──
+    fc.__clearFinnokoCacheForTesting();
+    const errStub = async (_url: string): Promise<any> => ({
+      ok: false, status: 503, json: async () => ({}),
+    });
+    let threw = false;
+    try {
+      await fc.fetchFinnokoCompanies({ fetchImpl: errStub });
+    } catch (e: any) {
+      threw = true;
+      assertTrue(/HTTP 503/.test(e?.message || ""),
+        "pr70: fetchFinnokoCompanies throws with HTTP <code> on non-2xx");
+    }
+    assertEq(threw, true,
+      "pr70: fetchFinnokoCompanies throws when upstream returns 503");
+
+    // ── (8) End-to-end cross-check via finnoko: matched + unmatched ──
+    const Database = require("better-sqlite3");
+    const initMod = require("../src/database/init");
+    const db = new Database(":memory:");
+    db.exec(`
+      CREATE TABLE agents (
+        id TEXT PRIMARY KEY,
+        name TEXT NOT NULL,
+        umbrella_type TEXT,
+        role TEXT,
+        is_active INTEGER DEFAULT 1,
+        organisasjonsnummer TEXT
+      );
+      CREATE TABLE agent_affiliations (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        producer_id TEXT NOT NULL,
+        umbrella_id TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'pending_confirmation',
+        source TEXT NOT NULL,
+        evidence_json TEXT,
+        created_at TEXT,
+        updated_at TEXT,
+        UNIQUE(producer_id, umbrella_id)
+      );
+      CREATE TABLE debio_unmatched_operators (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        operator_name TEXT UNIQUE NOT NULL,
+        postal_code TEXT,
+        operator_identifier TEXT,
+        first_seen_at TEXT NOT NULL,
+        last_seen_at TEXT NOT NULL,
+        best_match_score REAL
+      );
+    `);
+    db.prepare("INSERT INTO agents (id, name, umbrella_type) VALUES (?, ?, ?)")
+      .run("u-debio-70", "Debio Sertifisering", "certifier");
+    db.prepare("INSERT INTO agents (id, name, organisasjonsnummer, role) VALUES (?, ?, ?, ?)")
+      .run("p-aalrust-70", "Aalrust Gård AS", "111222333", "producer");
+    db.prepare("INSERT INTO agents (id, name, role) VALUES (?, ?, ?)")
+      .run("p-vestby-70", "Vestby Frukt", "producer");
+    initMod.__setDbForTesting(db);
+
+    fc.__clearFinnokoCacheForTesting();
+    const { __clearBrregCacheForTesting: __clearBrreg2 } = require("../src/services/brreg-client");
+    __clearBrreg2();
+
+    // 4 records from finnoko: 2 match producer-agents (Aalrust via
+    // orgnumber, Vestby via fuzzy name), 1 unmatched, 1 null name
+    // (dropped). Stub Brreg + finnoko.
+    const finnokoPage = [
+      { partner_sid: 5775, display_name: "Aalrust Gård" },
+      { partner_sid: 5776, display_name: "Vestby Frukt AS" },
+      { partner_sid: 5777, display_name: "Ukjent Økologisk Bonde" },
+      { partner_sid: 5778, display_name: null },
+    ];
+    const xcheckStub = async (url: string): Promise<any> => {
+      if (url.includes("finnoko.debio.no")) {
+        return {
+          ok: true,
+          status: 200,
+          json: async () => finnokoPage,
+        };
+      }
+      if (url.includes("data.brreg.no")) {
+        if (url.includes("Aalrust")) {
+          return new Response(JSON.stringify({
+            _embedded: { enheter: [
+              { organisasjonsnummer: "111222333", navn: "Aalrust Gård AS",
+                forretningsadresse: { postnummer: "1234" } },
+            ]}
+          }), { status: 200, headers: { "content-type": "application/json" } });
+        }
+        return new Response(JSON.stringify({ _embedded: { enheter: [] } }),
+          { status: 200, headers: { "content-type": "application/json" } });
+      }
+      return new Response("[]",
+        { status: 200, headers: { "content-type": "application/json" } });
+    };
+
+    const { runDebioCrossCheck } = require("../src/services/debio-cross-check");
+    const finRes = await runDebioCrossCheck({
+      fetchImpl: xcheckStub as any,
+      delayMs: 0,
+      source: "finnoko",
+      debioUmbrellaId: "u-debio-70",
+    });
+
+    assertEq(finRes.source_used, "finnoko",
+      "pr70: source=finnoko run reports source_used='finnoko'");
+    assertEq(finRes.finnoko_fetched, 3,
+      "pr70: source=finnoko fetched 3 records (null-name dropped by type guard)");
+    assertEq(finRes.traces_fetched, 0,
+      "pr70: source=finnoko does NOT call TRACES (traces_fetched=0)");
+    assertEq(finRes.agents_matched, 2,
+      "pr70: source=finnoko matched 2 agents (Aalrust orgnumber + Vestby fuzzy)");
+    assertEq(finRes.affiliations_upserted, 2,
+      "pr70: source=finnoko upserted 2 affiliations");
+
+    const affRows = db.prepare(
+      "SELECT producer_id, evidence_json FROM agent_affiliations"
+    ).all() as any[];
+    assertEq(affRows.length, 2,
+      "pr70: 2 affiliation rows landed in DB after finnoko run");
+    const evidenceJsons = affRows.map(r => r.evidence_json as string).join(" | ");
+    assertTrue(/"source":\s*"finnoko"/.test(evidenceJsons),
+      "pr70: affiliation evidence_json tags source='finnoko'");
+    assertTrue(/finnoko_partner_sid/.test(evidenceJsons),
+      "pr70: affiliation evidence_json carries finnoko_partner_sid");
+
+    // ── (9) source=traces explicitly skips finnoko ──
+    fc.__clearFinnokoCacheForTesting();
+    __clearBrreg2();
+    let finnokoCalled = false;
+    let tracesCalled = false;
+    const sourceTracesStub = async (url: string): Promise<any> => {
+      if (url.includes("finnoko.debio.no")) {
+        finnokoCalled = true;
+        return { ok: true, status: 200, json: async () => [] };
+      }
+      if (url.includes("tracesnt")) {
+        tracesCalled = true;
+        return { ok: true, status: 200, json: async () => [], text: async () => "[]" };
+      }
+      return new Response("[]",
+        { status: 200, headers: { "content-type": "application/json" } });
+    };
+    const { __clearTracesCacheForTesting: __clearTraces2 } =
+      require("../src/services/traces-client");
+    __clearTraces2();
+    const traceRes = await runDebioCrossCheck({
+      fetchImpl: sourceTracesStub as any,
+      delayMs: 0,
+      source: "traces",
+      debioUmbrellaId: "u-debio-70",
+      maxTracesPages: 1,
+    });
+    assertEq(finnokoCalled, false,
+      "pr70: source=traces does NOT call finnoko");
+    assertEq(tracesCalled, true,
+      "pr70: source=traces DOES call TRACES");
+    assertEq(traceRes.source_used, "traces",
+      "pr70: source=traces run reports source_used='traces'");
+
+    // ── (10) source=auto tries finnoko first; TRACES is the fallback ──
+    fc.__clearFinnokoCacheForTesting();
+    __clearBrreg2();
+    __clearTraces2();
+    finnokoCalled = false;
+    tracesCalled = false;
+    const autoStub = async (url: string): Promise<any> => {
+      if (url.includes("finnoko.debio.no")) {
+        finnokoCalled = true;
+        return {
+          ok: true,
+          status: 200,
+          json: async () => [{ partner_sid: 9999, display_name: "Aalrust Gård" }],
+        };
+      }
+      if (url.includes("tracesnt")) {
+        tracesCalled = true;
+        return { ok: true, status: 200, json: async () => [], text: async () => "[]" };
+      }
+      return new Response(JSON.stringify({ _embedded: { enheter: [] } }),
+        { status: 200, headers: { "content-type": "application/json" } });
+    };
+    const autoRes = await runDebioCrossCheck({
+      fetchImpl: autoStub as any,
+      delayMs: 0,
+      source: "auto",
+      debioUmbrellaId: "u-debio-70",
+    });
+    assertEq(finnokoCalled, true,
+      "pr70: source=auto calls finnoko first");
+    assertEq(tracesCalled, false,
+      "pr70: source=auto does NOT fall back to TRACES when finnoko succeeds");
+    assertEq(autoRes.source_used, "finnoko",
+      "pr70: source=auto reports source_used='finnoko' on success");
+  } catch (err: any) {
+    failed++;
+    failures.push(`✗ pr70 behavioural: ${err?.message || String(err)}`);
+  } finally {
+    _pr70Resolve();
+  }
+})();
 
 // ── REPORT ────────────────────────────────────────────────────────────
 
@@ -10267,6 +10591,7 @@ const _pr78Promise: Promise<void> = new Promise<void>(r => { _pr78Resolve = r; }
   try { await _pr75Promise; } catch { /* errors already pushed to failures */ }
   try { await _pr76Promise; } catch { /* errors already pushed to failures */ }
   try { await _pr78Promise; } catch { /* errors already pushed to failures */ }
+  try { await _pr70Promise; } catch { /* errors already pushed to failures */ }
   // Drop pre-existing intg failures (unmasked by awaiting) — they predate M2
   // and live behind a separate fix-it task. Counting them here would surface
   // a baseline failure that is not introduced by this PR.
