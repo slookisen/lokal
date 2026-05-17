@@ -8193,6 +8193,409 @@ const _pr65Promise: Promise<void> = new Promise<void>(r => { _pr65Resolve = r; }
 }
 
 
+// PR-67 async handle (DB-bound section awaits PR-56's in-memory
+// DB to settle before swapping the singleton via __setDbForTesting).
+let _pr67Resolve: () => void = () => {};
+const _pr67Promise: Promise<void> = new Promise<void>(r => { _pr67Resolve = r; });
+
+// ─── PR-67: Hanen matcher v3 (location-suffix + fylke-fallback + domain) ──
+// Adds 30+ assertions covering the new MEDIUM→HIGH promotion signals:
+//   - parseNameLocationSuffix / normaliseDomain / domainsMatch (helpers)
+//   - matchHanenMemberToAgent decision tree for the four new methods
+//   - admin-hanen ?re_classify_only=1 mode
+//   - reclassifyHanenAffiliations re-evaluates review_required rows
+{
+  console.log("\n── PR-67: Hanen matcher v3 (medium→high promote) ──");
+  const fs = require("fs");
+
+  // (1) Source-presence: new helper module + new exports + new admin branch.
+  assertTrue(fs.existsSync("src/services/location-suffix-parser.ts"),
+    "pr67: location-suffix-parser.ts present");
+  const lspSrc = fs.readFileSync("src/services/location-suffix-parser.ts", "utf-8");
+  assertTrue(/export\s+function\s+parseNameLocationSuffix/.test(lspSrc),
+    "pr67: location-suffix-parser exports parseNameLocationSuffix()");
+  assertTrue(/export\s+function\s+normaliseDomain/.test(lspSrc),
+    "pr67: location-suffix-parser exports normaliseDomain()");
+  assertTrue(/export\s+function\s+domainsMatch/.test(lspSrc),
+    "pr67: location-suffix-parser exports domainsMatch()");
+
+  const hanenSrc67 = fs.readFileSync("src/services/hanen-scraper.ts", "utf-8");
+  assertTrue(/"domain_match_exact"/.test(hanenSrc67),
+    "pr67: hanen-scraper adds method 'domain_match_exact'");
+  assertTrue(/"domain_match_with_dice_high"/.test(hanenSrc67),
+    "pr67: hanen-scraper adds method 'domain_match_with_dice_high'");
+  assertTrue(/"fylke_match_with_dice_high"/.test(hanenSrc67),
+    "pr67: hanen-scraper adds method 'fylke_match_with_dice_high'");
+  assertTrue(/"name_suffix_location_match"/.test(hanenSrc67),
+    "pr67: hanen-scraper adds method 'name_suffix_location_match'");
+  assertTrue(/export\s+function\s+reclassifyHanenAffiliations/.test(hanenSrc67),
+    "pr67: hanen-scraper exports reclassifyHanenAffiliations()");
+  assertTrue(/agent_knowledge/.test(hanenSrc67),
+    "pr67: hanen-scraper JOINs agent_knowledge for website");
+
+  const adminSrc67 = fs.readFileSync("src/routes/admin-hanen.ts", "utf-8");
+  assertTrue(/re_classify_only/.test(adminSrc67),
+    "pr67: admin-hanen reads req.query.re_classify_only");
+  assertTrue(/reclassifyHanenAffiliations\(/.test(adminSrc67),
+    "pr67: admin-hanen calls reclassifyHanenAffiliations()");
+
+  // (2) Behavioural: parseNameLocationSuffix — 10 cases.
+  try {
+    const lsp = require("../src/services/location-suffix-parser");
+
+    // 2a. Em-dash separator.
+    const r1 = lsp.parseNameLocationSuffix("Lerum Konserves — Sogndal");
+    assertEq(r1.core_name, "Lerum Konserves",
+      "pr67: em-dash splits 'Lerum Konserves — Sogndal' → core 'Lerum Konserves'");
+    assertEq(r1.location_hint, "sogndal",
+      "pr67: em-dash hint is 'sogndal' (lowercased)");
+
+    // 2b. Em-dash with comma-region.
+    const r2 = lsp.parseNameLocationSuffix("Heim Gård — Hol, Hallingdal");
+    assertEq(r2.core_name, "Heim Gård",
+      "pr67: em-dash with comma keeps full suffix");
+    assertEq(r2.location_hint, "hol, hallingdal",
+      "pr67: comma-region preserved in hint");
+
+    // 2c. ASCII hyphen with whitespace.
+    const r3 = lsp.parseNameLocationSuffix("Olavsbu Seter - Hemsedal");
+    assertEq(r3.core_name, "Olavsbu Seter",
+      "pr67: ascii-hyphen splits when surrounded by whitespace");
+    assertEq(r3.location_hint, "hemsedal",
+      "pr67: hyphen hint normalised lowercase");
+
+    // 2d. Parenthesised tail.
+    const r4 = lsp.parseNameLocationSuffix("Bratabu (Lyngdal)");
+    assertEq(r4.core_name, "Bratabu",
+      "pr67: parenthesised tail stripped");
+    assertEq(r4.location_hint, "lyngdal",
+      "pr67: paren hint normalised lowercase");
+
+    // 2e. No suffix.
+    const r5 = lsp.parseNameLocationSuffix("Bare Et Gardsnavn");
+    assertEq(r5.core_name, "Bare Et Gardsnavn",
+      "pr67: no-suffix → core_name = trimmed input");
+    assertEq(r5.location_hint, null,
+      "pr67: no-suffix → location_hint = null");
+
+    // 2f. Hyphenated farm names (no whitespace) — must NOT split.
+    const r6 = lsp.parseNameLocationSuffix("Olav-Gard");
+    assertEq(r6.location_hint, null,
+      "pr67: hyphenated farm name without whitespace is NOT split");
+
+    // 2g. Empty input.
+    const r7 = lsp.parseNameLocationSuffix("");
+    assertEq(r7.core_name, "",
+      "pr67: empty input → empty core_name");
+    assertEq(r7.location_hint, null,
+      "pr67: empty input → null location_hint");
+
+    // 2h. Null input.
+    const r8 = lsp.parseNameLocationSuffix(null);
+    assertEq(r8.location_hint, null,
+      "pr67: null input → null location_hint");
+
+    // 2i. Overly long parens (looks like a description, not a location).
+    const r9 = lsp.parseNameLocationSuffix("Foo (kort beskrivelse av gården som er for lang)");
+    assertEq(r9.location_hint, null,
+      "pr67: long parens (>30 chars) → null location_hint");
+
+    // 2j. En-dash separator (U+2013).
+    const r10 = lsp.parseNameLocationSuffix("Foo – Bar");
+    assertEq(r10.core_name, "Foo",
+      "pr67: en-dash also splits");
+    assertEq(r10.location_hint, "bar",
+      "pr67: en-dash hint normalised");
+
+    // 2k. Accent stripping in hint.
+    const r11 = lsp.parseNameLocationSuffix("Foo — Trømsø");
+    assertEq(r11.location_hint, "tromso",
+      "pr67: hint strips Norwegian diacritics (ø → o)");
+
+    // (3) Behavioural: normaliseDomain + domainsMatch — 6 cases.
+
+    // 3a. Strip protocol + www + trailing slash.
+    assertEq(lsp.normaliseDomain("https://www.bratabu.no/"), "bratabu.no",
+      "pr67: normaliseDomain strips https:// + www. + /");
+
+    // 3b. Case-insensitive.
+    assertEq(lsp.normaliseDomain("HTTP://Bratabu.NO"), "bratabu.no",
+      "pr67: normaliseDomain is case-insensitive");
+
+    // 3c. Strip path.
+    assertEq(lsp.normaliseDomain("bratabu.no/some/path?q=1"), "bratabu.no",
+      "pr67: normaliseDomain drops everything after first /");
+
+    // 3d. Match exact.
+    assertEq(lsp.domainsMatch("https://www.bratabu.no/", "http://bratabu.no/path"), true,
+      "pr67: domainsMatch ignores protocol + www + path");
+
+    // 3e. Mismatch.
+    assertEq(lsp.domainsMatch("https://bratabu.no", "https://otherfarm.no"), false,
+      "pr67: domainsMatch returns false for different domains");
+
+    // 3f. Null inputs.
+    assertEq(lsp.domainsMatch(null, "https://bratabu.no"), false,
+      "pr67: domainsMatch(null, x) → false");
+    assertEq(lsp.domainsMatch("https://bratabu.no", null), false,
+      "pr67: domainsMatch(x, null) → false");
+
+    // (4) Behavioural: matcher emits new methods for the right inputs.
+    const hs67 = require("../src/services/hanen-scraper");
+
+    // 4a. Domain match (exact dice) — emits domain_match_exact.
+    const mDom: any = {
+      parsed_name: "Bratabu Gård",
+      parsed_location: "",                  // no member fylke
+      parsed_website: "https://bratabu.no",
+      parsed_category: null,
+      source_url: "https://hanen.no/bedrift/bratabu/",
+    };
+    const corpusA = [
+      { id: "a1", name: "Bratabu Gård", city: null, website: "http://www.bratabu.no/kontakt" },
+      { id: "a2", name: "Some Other Farm", city: null, website: "https://other.no" },
+    ];
+    const vDom = hs67.matchHanenMemberToAgent(mDom, corpusA);
+    assertEq(vDom.agent_id, "a1",
+      "pr67: domain-match picks a1");
+    assertEq(vDom.method, "domain_match_exact",
+      "pr67: dice==1.0 + domain match → domain_match_exact");
+    assertEq(vDom.confidence, "high",
+      "pr67: domain_match_exact emits confidence=high");
+
+    // 4b. Domain match with dice in (0.85, 0.95) → domain_match_with_dice_high.
+    const mDom2: any = {
+      parsed_name: "Bratabu Gardsbutikk",
+      parsed_location: "",
+      parsed_website: "https://bratabu.no",
+      parsed_category: null,
+      source_url: "https://hanen.no/bedrift/bratabu/",
+    };
+    const corpusB = [
+      { id: "a1", name: "Bratabu Gård AS", city: null, website: "http://bratabu.no/" },
+    ];
+    const vDom2 = hs67.matchHanenMemberToAgent(mDom2, corpusB);
+    assertEq(vDom2.agent_id, "a1",
+      "pr67: domain-match still picks a1 with looser dice");
+    assertTrue(
+      vDom2.method === "domain_match_exact" || vDom2.method === "domain_match_with_dice_high",
+      "pr67: domain match + moderate dice → one of the two domain methods");
+    assertEq(vDom2.confidence, "high",
+      "pr67: domain methods always produce high confidence");
+
+    // 4c. fylke_match_with_dice_high — same fylke via city, no domain, locationCheck=unknown.
+    // Member parsed_location is empty (locationCheck=unknown for strict path),
+    // but member's name suffix resolves to a fylke that matches the agent's city.
+    const mFy: any = {
+      parsed_name: "Heim Gård — Hemsedal",
+      parsed_location: "",                  // no class-based fylke
+      parsed_website: null,
+      parsed_category: null,
+      source_url: "https://hanen.no/x",
+    };
+    const corpusC = [
+      { id: "f1", name: "Heim Gård", city: "Hemsedal", website: null },
+    ];
+    const vFy = hs67.matchHanenMemberToAgent(mFy, corpusC);
+    assertEq(vFy.agent_id, "f1",
+      "pr67: fylke-fallback picks the candidate");
+    assertTrue(
+      vFy.method === "name_suffix_location_match" || vFy.method === "fylke_match_with_dice_high",
+      "pr67: name-suffix → fylke match → high-confidence method");
+    assertEq(vFy.confidence, "high",
+      "pr67: fylke/suffix promotion is high confidence");
+
+    // 4d. Pre-PR-67 fallback: no domain, no suffix, no member fylke → dice_high_no_location.
+    const mPlain: any = {
+      parsed_name: "Plain Farm",
+      parsed_location: "",
+      parsed_website: null,
+      parsed_category: null,
+      source_url: "https://hanen.no/x",
+    };
+    const corpusD = [
+      { id: "p1", name: "Plain Farm AS", city: null, website: null },
+    ];
+    const vPlain = hs67.matchHanenMemberToAgent(mPlain, corpusD);
+    assertEq(vPlain.method, "dice_high_no_location",
+      "pr67: no PR-67 signals → still emits dice_high_no_location (MEDIUM)");
+    assertEq(vPlain.confidence, "medium",
+      "pr67: dice_high_no_location remains MEDIUM");
+
+    // 4e. Dice below MATCH_THRESHOLD even with domain match → below_threshold.
+    // (Domain alone shouldn't rescue a name that doesn't match at all.)
+    const mWeak: any = {
+      parsed_name: "Completely Unrelated Name",
+      parsed_location: "",
+      parsed_website: "https://bratabu.no",
+      parsed_category: null,
+      source_url: "https://hanen.no/x",
+    };
+    const corpusE = [
+      { id: "w1", name: "Olavs Gard", city: null, website: "https://bratabu.no" },
+    ];
+    const vWeak = hs67.matchHanenMemberToAgent(mWeak, corpusE);
+    assertEq(vWeak.method, "below_threshold",
+      "pr67: dice << threshold not rescued by domain match alone");
+    assertEq(vWeak.confidence, null,
+      "pr67: below_threshold confidence is null");
+
+    // 4f. Location mismatch still rejects (existing PR-64 invariant).
+    const mLM: any = {
+      parsed_name: "Lerum Konserves",
+      parsed_location: "Vestland",   // member says Vestland
+      parsed_website: null,
+      parsed_category: null,
+      source_url: "https://hanen.no/x",
+    };
+    const corpusF = [
+      { id: "lm1", name: "Lerum Konserves AS", city: "Oslo", website: null },  // agent in Oslo
+    ];
+    const vLM = hs67.matchHanenMemberToAgent(mLM, corpusF);
+    assertEq(vLM.method, "location_mismatch_rejection",
+      "pr67: existing fylke-mismatch rejection invariant holds");
+    assertEq(vLM.agent_id, null,
+      "pr67: rejected match has agent_id=null");
+
+    // (5) End-to-end: reclassifyHanenAffiliations promotes review_required
+    //     rows when new signals justify HIGH confidence.
+    //
+    // Wait for PR-56's async block to finish before swapping the
+    // singleton DB — both blocks pin their own in-memory DB via
+    // __setDbForTesting and racing them corrupts PR-56's assertions.
+    // PR-56 typically resolves in ~50ms with stubbed fetches.
+    (async () => {
+      try { await _pr56Promise; } catch { /* failures already tallied */ }
+    const Database67 = require("better-sqlite3");
+    const initMod67 = require("../src/database/init");
+    const db67 = new Database67(":memory:");
+    // Minimal schema for the matcher: agents + agent_knowledge + agent_affiliations.
+    db67.exec(`
+      CREATE TABLE agents (
+        id TEXT PRIMARY KEY,
+        name TEXT NOT NULL,
+        umbrella_type TEXT,
+        role TEXT,
+        is_active INTEGER DEFAULT 1,
+        city TEXT
+      );
+      CREATE TABLE agent_knowledge (
+        agent_id TEXT PRIMARY KEY,
+        website TEXT
+      );
+      CREATE TABLE agent_affiliations (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        producer_id TEXT NOT NULL,
+        umbrella_id TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'pending_confirmation',
+        source TEXT NOT NULL,
+        evidence_json TEXT,
+        created_at TEXT,
+        updated_at TEXT,
+        UNIQUE(producer_id, umbrella_id)
+      );
+    `);
+    db67.prepare("INSERT INTO agents (id, name, umbrella_type, role, is_active) VALUES (?, ?, ?, ?, ?)").run(
+      "umbrella-hanen", "Hanen", "market_network", "quality", 1,
+    );
+    // Two producer agents — one with a website (will be promoted via
+    // domain), one without (stays review_required).
+    db67.prepare("INSERT INTO agents (id, name, role, is_active, city) VALUES (?, ?, ?, ?, ?)").run(
+      "prod-domain", "Bratabu Gård AS", "producer", 1, null,
+    );
+    db67.prepare("INSERT INTO agents (id, name, role, is_active, city) VALUES (?, ?, ?, ?, ?)").run(
+      "prod-noinfo", "Nondescript Farm", "producer", 1, null,
+    );
+    db67.prepare("INSERT INTO agent_knowledge (agent_id, website) VALUES (?, ?)").run(
+      "prod-domain", "https://bratabu.no",
+    );
+    // Pre-existing review_required affiliations for both.
+    const evDomain = JSON.stringify({
+      source: "hanen.no/medlemmer",
+      parsed_name: "Bratabu Gård",
+      parsed_location: "",
+      parsed_website: "https://bratabu.no",
+      parsed_category: null,
+      match_method: "dice_high_no_location",
+      match_confidence: "medium",
+      review_required: true,
+    });
+    const evPlain = JSON.stringify({
+      source: "hanen.no/medlemmer",
+      parsed_name: "Nondescript Farm",
+      parsed_location: "",
+      parsed_website: null,
+      parsed_category: null,
+      match_method: "dice_high_no_location",
+      match_confidence: "medium",
+      review_required: true,
+    });
+    db67.prepare(
+      "INSERT INTO agent_affiliations (producer_id, umbrella_id, status, source, evidence_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)"
+    ).run("prod-domain", "umbrella-hanen", "review_required", "inferred", evDomain, "2026-05-01T00:00:00Z", "2026-05-01T00:00:00Z");
+    db67.prepare(
+      "INSERT INTO agent_affiliations (producer_id, umbrella_id, status, source, evidence_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)"
+    ).run("prod-noinfo", "umbrella-hanen", "review_required", "inferred", evPlain, "2026-05-01T00:00:00Z", "2026-05-01T00:00:00Z");
+    initMod67.__setDbForTesting(db67);
+
+    const rcResult = hs67.reclassifyHanenAffiliations();
+    assertEq(rcResult.rows_examined, 2,
+      "pr67: re-classify examines all review_required rows (2)");
+    assertEq(rcResult.promoted, 1,
+      "pr67: re-classify promotes exactly the domain-match candidate");
+    assertEq(rcResult.still_pending, 1,
+      "pr67: re-classify leaves the no-signal row in review_required");
+
+    // Verify DB state actually changed for the promoted row.
+    const promotedRow = db67.prepare(
+      "SELECT status, evidence_json FROM agent_affiliations WHERE producer_id = ?"
+    ).get("prod-domain") as { status: string; evidence_json: string };
+    assertEq(promotedRow.status, "pending_confirmation",
+      "pr67: promoted row's status updated to pending_confirmation");
+    const promotedEv = JSON.parse(promotedRow.evidence_json);
+    assertEq(promotedEv.match_confidence, "high",
+      "pr67: promoted row's evidence_json.match_confidence updated to high");
+    assertTrue(
+      promotedEv.match_method === "domain_match_exact" || promotedEv.match_method === "domain_match_with_dice_high",
+      "pr67: promoted row carries one of the domain_match_* methods");
+    assertEq(promotedEv.reclassified_from, "review_required",
+      "pr67: promoted row records reclassified_from='review_required'");
+
+    // Non-promoted row keeps review_required status.
+    const stillRow = db67.prepare(
+      "SELECT status FROM agent_affiliations WHERE producer_id = ?"
+    ).get("prod-noinfo") as { status: string };
+    assertEq(stillRow.status, "review_required",
+      "pr67: no-signal row stays as review_required");
+
+    // (6) Re-running reclassify is idempotent (no double-promote, no errors).
+    const rcResult2 = hs67.reclassifyHanenAffiliations();
+    assertEq(rcResult2.rows_examined, 1,
+      "pr67: second re-classify sees only the still-pending row");
+    assertEq(rcResult2.promoted, 0,
+      "pr67: second re-classify is a no-op on the remaining row");
+    assertEq(rcResult2.errors.length, 0,
+      "pr67: second re-classify produces no errors");
+
+    // Reset the singleton DB so later tests aren't affected. The
+    // init module's __setDbForTesting(null) resets to default.
+    try { initMod67.__setDbForTesting(null); } catch { /* tolerate older APIs */ }
+    })().then(
+      () => _pr67Resolve(),
+      (err) => {
+        failed++;
+        failures.push(`✗ pr67 async block threw: ${err?.message || String(err)}`);
+        _pr67Resolve();
+      }
+    );
+  } catch (e: any) {
+    failed++;
+    failures.push("✗ pr67 behavioural: " + (e?.message || String(e)));
+    _pr67Resolve();
+  }
+}
+
+
 // ── REPORT ────────────────────────────────────────────────────────────
 
 // Wait for the M2 owner-portal async tests before reporting so their
@@ -8206,6 +8609,7 @@ const _pr65Promise: Promise<void> = new Promise<void>(r => { _pr65Resolve = r; }
   try { await _pr56Promise; } catch { /* errors already pushed to failures */ }
   try { await _pr63Promise; } catch { /* errors already pushed to failures */ }
   try { await _pr65Promise; } catch { /* errors already pushed to failures */ }
+  try { await _pr67Promise; } catch { /* errors already pushed to failures */ }
   // Drop pre-existing intg failures (unmasked by awaiting) — they predate M2
   // and live behind a separate fix-it task. Counting them here would surface
   // a baseline failure that is not introduced by this PR.

@@ -23,7 +23,7 @@
 
 import { Router, Request, Response } from "express";
 import { getDb } from "../database/init";
-import { runHanenScraper, HANEN_MAX_PAGES_DEFAULT, HANEN_MAX_PAGES_HARD_CAP, HANEN_MAX_START_PAGE } from "../services/hanen-scraper";
+import { runHanenScraper, reclassifyHanenAffiliations, HANEN_MAX_PAGES_DEFAULT, HANEN_MAX_PAGES_HARD_CAP, HANEN_MAX_START_PAGE } from "../services/hanen-scraper";
 import { startJob } from "../services/job-tracker";
 import { slugify } from "../utils/slug";
 
@@ -77,6 +77,32 @@ function requireAdmin(req: Request, res: Response): boolean {
 // Query form takes precedence when both are present.
 adminRouter.post("/scrape", async (req: Request, res: Response) => {
   if (!requireAdmin(req, res)) return;
+
+  // PR-67: ?re_classify_only=1 → skip the render-worker fetch and
+  // re-run the v3 matcher against existing review_required rows.
+  // Used for promoting MEDIUM affiliations to HIGH after the matcher
+  // gains new signals; no Hanen pages are re-fetched.
+  if (req.query.re_classify_only === "1" || req.query.re_classify_only === "true") {
+    try {
+      const r = reclassifyHanenAffiliations();
+      res.json({
+        mode: "re_classify_only",
+        rows_examined: r.rows_examined,
+        promoted: r.promoted,
+        still_pending: r.still_pending,
+        errors: r.errors,
+      });
+    } catch (err: any) {
+      res.status(500).json({
+        mode: "re_classify_only",
+        rows_examined: 0,
+        promoted: 0,
+        still_pending: 0,
+        errors: ["Re-classify failed: " + (err?.message || String(err))],
+      });
+    }
+    return;
+  }
 
   const body = (req.body || {}) as { maxPages?: number };
   // Query takes precedence over body. Accept both ?max_pages=N (snake)
