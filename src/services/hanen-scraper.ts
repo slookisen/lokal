@@ -33,6 +33,7 @@ import { getDb } from "../database/init";
 import { renderPage } from "./render-client";
 import { nameSimilarity, nameVariants } from "./name-matcher";
 import { cityToFylke, fylkerMatch, normaliseFylke } from "./norway-fylke";
+import { parseNameLocationSuffix, normaliseDomain, domainsMatch } from "./location-suffix-parser";
 
 const LISTING_URL = "https://hanen.no/medlemmer";
 
@@ -110,7 +111,12 @@ export type MatchVerdict = {
     | "dice_high_no_location"
     | "dice_medium_with_location"
     | "below_threshold"
-    | "location_mismatch_rejection";
+    | "location_mismatch_rejection"
+    // PR-67: new signal-based promotions (all confidence="high")
+    | "domain_match_exact"
+    | "domain_match_with_dice_high"
+    | "fylke_match_with_dice_high"
+    | "name_suffix_location_match";
   confidence: MatchConfidence;
   location_check: "match" | "mismatch" | "unknown";
 };
@@ -404,15 +410,43 @@ export function parseHanenMembers(html: string, sourceUrl: string): HanenMemberR
 // is O(L) on the bigrams, L ~= 15 chars → still well under 1s wall.
 export function matchHanenMemberToAgent(
   member: HanenMemberRecord,
-  agents: Array<{ id: string; name: string; city: string | null }>
+  agents: Array<{ id: string; name: string; city: string | null; website?: string | null }>
 ): MatchVerdict {
   // Member-side: variants of the parsed Hanen name + fylke from the
   // hanen_county-<fylke> class (or empty string if unknown).
   const memberVariants = nameVariants(member.parsed_name);
   const memberFylke = normaliseFylke(member.parsed_location);
+  // PR-67 signal A — parse the Hanen member's name for a trailing
+  // location-suffix ("Foo — Sandane"). Used when the parsed_location
+  // from class-attribute fallback is empty.
+  const memberNameSuffix = parseNameLocationSuffix(member.parsed_name).location_hint;
+  const memberFylkeFromSuffix = memberFylke ?? normaliseFylke(memberNameSuffix || "");
+  // PR-67 signal C — Hanen member-side website (domain only).
+  const memberDomain = normaliseDomain(member.parsed_website);
 
-  // Pick highest-Dice agent across all (member_variant × agent_variant) pairs.
-  let best: { id: string; score: number; locationCheck: "match" | "mismatch" | "unknown" } | null = null;
+  // PR-67 — per-candidate signals so the decision tree can emit the new
+  // method values. We collect:
+  //   - locationCheck   : strict city → fylke vs member fylke
+  //   - suffixLocCheck  : member name-suffix fylke vs agent city/suffix fylke
+  //   - fylkeFallback   : either-side fylke match including suffix hints
+  //   - domainCheck     : agent_knowledge.website domain == member website domain
+  // PR-67 iter2 P1-2: a small Dice boost given to candidates whose
+  // domain matches the Hanen-member's parsed_website. This breaks ties
+  // and slight Dice inversions so that domain-corroborated candidates
+  // out-rank a marginally-higher-Dice candidate without a domain match.
+  // 0.05 is tuned to flip a (0.94 domain) over a (0.96 no-domain) but
+  // not flip a (0.85 domain) over a (0.95 no-domain).
+  const DOMAIN_BOOST = 0.05;
+
+  let best: {
+    id: string;
+    score: number;
+    rankKey: number;
+    locationCheck: "match" | "mismatch" | "unknown";
+    fylkeFallback: "match" | "mismatch" | "unknown";
+    suffixLocCheck: "match" | "mismatch" | "unknown";
+    domainCheck: "match" | "unknown";
+  } | null = null;
   for (const a of agents) {
     const agentVariants = nameVariants(a.name);
     let bestForAgent = 0;
@@ -425,10 +459,13 @@ export function matchHanenMemberToAgent(
         if (s > bestForAgent) bestForAgent = s;
       }
     }
-    if (!best || bestForAgent > best.score) {
-      // Compute location_check for this candidate. Done inside the
-      // loop because the winning candidate's location is what we
-      // report, not the global best location.
+    // Domain corroboration computed up-front so it can boost rankKey.
+    const candidateDomainMatch = domainsMatch(a.website, member.parsed_website);
+    const rankKey = bestForAgent + (candidateDomainMatch ? DOMAIN_BOOST : 0);
+    if (!best || rankKey > best.rankKey) {
+      // Strict locationCheck — same semantics as PR-64. memberFylke is
+      // the Hanen-side fylke from hanen_county-<fylke>; agent fylke is
+      // mapped from agents.city via cityToFylke().
       const agentFylke = cityToFylke(a.city);
       let locationCheck: "match" | "mismatch" | "unknown";
       if (memberFylke && agentFylke) {
@@ -436,7 +473,55 @@ export function matchHanenMemberToAgent(
       } else {
         locationCheck = "unknown";
       }
-      best = { id: a.id, score: bestForAgent, locationCheck };
+
+      // PR-67 signal A — agent-side name-suffix fylke. Parses the
+      // agent's NAME for a trailing location-suffix ("Heim Gard —
+      // Hemsedal") and resolves it via cityToFylke()/normaliseFylke().
+      // This signal is reachable ONLY when the agent has a name-suffix
+      // — it's the "agent's own name carries location evidence" path.
+      const agentNameSuffix = parseNameLocationSuffix(a.name).location_hint;
+      const agentFylkeFromAgentSuffix = agentNameSuffix
+        ? (cityToFylke(agentNameSuffix) ?? normaliseFylke(agentNameSuffix))
+        : null;
+
+      // suffixLocCheck — fires only when BOTH sides carry name-suffix
+      // evidence (member's parsed_name AND agent's name). This is
+      // distinct from the broader fylkeFallback below so that branch B
+      // is reachable independently. Note: in suffixLocCheck we
+      // deliberately require the agent's fylke to come from its NAME
+      // suffix (not its city), so that the "agent has city but no name
+      // suffix" case routes to branch B instead.
+      let suffixLocCheck: "match" | "mismatch" | "unknown" = "unknown";
+      if (memberFylkeFromSuffix && agentFylkeFromAgentSuffix) {
+        suffixLocCheck = fylkerMatch(memberFylkeFromSuffix, agentFylkeFromAgentSuffix) ? "match" : "mismatch";
+      }
+
+      // PR-67 signal B — fylke-fallback. Uses the agent's CITY-derived
+      // fylke (cityToFylke(a.city)) against the member-side fylke (from
+      // parsed_location OR name-suffix). Reachable when the agent has a
+      // city but no name-suffix, and the strict locationCheck path was
+      // "unknown" (e.g. member's parsed_location was empty so strict
+      // path needed both signals). This covers the case suffixLocCheck
+      // can't — agent's evidence is in agents.city, not its name.
+      let fylkeFallback: "match" | "mismatch" | "unknown" = "unknown";
+      if (memberFylkeFromSuffix && agentFylke) {
+        fylkeFallback = fylkerMatch(memberFylkeFromSuffix, agentFylke) ? "match" : "mismatch";
+      }
+
+      // PR-67 signal C — domain corroboration. Agents pass website via
+      // an optional `website` field (joined from agent_knowledge at
+      // call-time). Hanen-member side uses `parsed_website`.
+      const domainCheck: "match" | "unknown" = candidateDomainMatch ? "match" : "unknown";
+
+      best = {
+        id: a.id,
+        score: bestForAgent,
+        rankKey,
+        locationCheck,
+        fylkeFallback,
+        suffixLocCheck,
+        domainCheck,
+      };
     }
   }
 
@@ -452,8 +537,68 @@ export function matchHanenMemberToAgent(
 
   const score = best.score;
   const loc = best.locationCheck;
+  const fy = best.fylkeFallback;
+  const sx = best.suffixLocCheck;
+  const dom = best.domainCheck;
 
-  // Decision tree — first matching rule wins.
+  // ── Decision tree — first matching rule wins ──
+  // PR-67 introduces four new HIGH-confidence early-out rules ABOVE the
+  // PR-64 tree so any of the new signals can promote MEDIUM → HIGH:
+  //
+  //   C. domain_match_exact          — Dice >= 0.95 AND domain match
+  //   C. domain_match_with_dice_high — Dice >= MATCH_THRESHOLD AND domain match
+  //   A. name_suffix_location_match  — Dice >= 0.95 AND name-suffix-fylke match
+  //   B. fylke_match_with_dice_high  — Dice >= 0.95 AND fylke-fallback match
+  //
+  // Order: domain wins over location (a matching website is a stronger
+  // signal than a fylke); within location, name-suffix wins over the
+  // generic fylke-fallback because the suffix is a per-agent assertion.
+
+  // C. Domain match — strongest new signal. PR-67 iter2 P0-1: gated on
+  // loc !== "mismatch" so a domain hit does NOT override a strict fylke
+  // mismatch. A shared/franchise hosting domain colliding with a
+  // producer in the wrong fylke must fall through to the
+  // location_mismatch_rejection branch below.
+  if (score >= MATCH_THRESHOLD && dom === "match" && loc !== "mismatch") {
+    return {
+      agent_id: best.id,
+      score,
+      method: score >= 0.95 ? "domain_match_exact" : "domain_match_with_dice_high",
+      confidence: "high",
+      location_check: loc,
+    };
+  }
+
+  // A. Name-suffix-derived fylke match (Dice >= 0.95, MEDIUM tier).
+  // Only fires when strict locationCheck is "unknown" (city missing) AND
+  // suffix-derived fylke check matches. Mismatched suffix is NOT a
+  // rejection signal (the suffix is heuristic; let dice_high_no_location
+  // still produce MEDIUM).
+  if (score >= 0.95 && loc === "unknown" && sx === "match") {
+    return {
+      agent_id: best.id,
+      score,
+      method: "name_suffix_location_match",
+      confidence: "high",
+      location_check: loc,
+    };
+  }
+
+  // B. Fylke-fallback match (Dice >= 0.95, MEDIUM tier). Fires when
+  // strict locationCheck is "unknown" but the broader fallback (any
+  // side's fylke from city OR suffix) matches. Same caveat as (A): we
+  // don't promote-reject on fallback mismatch.
+  if (score >= 0.95 && loc === "unknown" && fy === "match") {
+    return {
+      agent_id: best.id,
+      score,
+      method: "fylke_match_with_dice_high",
+      confidence: "high",
+      location_check: loc,
+    };
+  }
+
+  // ── PR-64 decision tree (unchanged below) ──
   if (score === 1.0 && loc === "match") {
     return {
       agent_id: best.id,
@@ -606,9 +751,15 @@ export async function runHanenScraper(opts?: {
   // note on PR-62 — they should never be tagged as Hanen members).
   let agents: Array<{ id: string; name: string; city: string | null }> = [];
   try {
+    // PR-67: LEFT JOIN agent_knowledge to pick up the website for
+    // domain-corroboration matching. agent_knowledge is 1:1 with
+    // agents but optional, so LEFT JOIN keeps agents without a
+    // knowledge row visible (website will be null in that case).
     agents = db.prepare(
-      "SELECT id, name, city FROM agents WHERE is_active = 1 AND (umbrella_type IS NULL OR umbrella_type = '') AND role = 'producer'"
-    ).all() as Array<{ id: string; name: string; city: string | null }>;
+      "SELECT a.id, a.name, a.city, k.website AS website "
+      + "FROM agents a LEFT JOIN agent_knowledge k ON k.agent_id = a.id "
+      + "WHERE a.is_active = 1 AND (a.umbrella_type IS NULL OR a.umbrella_type = '') AND a.role = 'producer'"
+    ).all() as Array<{ id: string; name: string; city: string | null; website: string | null }>;
   } catch (e) {
     result.errors.push(`producer corpus load failed: ${e instanceof Error ? e.message : String(e)}`);
     return result;
@@ -860,6 +1011,151 @@ function normaliseJsonMember(m: any, sourceUrl: string): HanenMemberRecord | nul
     parsed_category: category,
     source_url: sourceUrl,
   };
+}
+
+// ─── 5. reclassifyHanenAffiliations (PR-67) ────────────────────
+// Re-run the v3 matcher against existing review_required affiliations
+// WITHOUT re-fetching Hanen pages. Reads each row's evidence_json to
+// reconstruct the parsed Hanen member, then re-evaluates against the
+// current producer + agent_knowledge tables. Promotes high-confidence
+// verdicts to pending_confirmation; leaves the rest as-is.
+//
+// Idempotent + cheap (no I/O outside SQLite). Designed for the
+// ?re_classify_only=1 query mode on POST /admin/hanen/scrape.
+
+export type HanenReclassifyResult = {
+  rows_examined: number;
+  promoted: number;
+  still_pending: number;
+  errors: string[];
+};
+
+export function reclassifyHanenAffiliations(): HanenReclassifyResult {
+  const result: HanenReclassifyResult = {
+    rows_examined: 0,
+    promoted: 0,
+    still_pending: 0,
+    errors: [],
+  };
+  const db = getDb();
+
+  // Locate Hanen umbrella — same lookup as runHanenScraper().
+  let umbrella: { id: string } | undefined;
+  try {
+    umbrella = db.prepare(
+      "SELECT id FROM agents WHERE (LOWER(name) LIKE 'hanen%' OR LOWER(name) = 'hanen') AND umbrella_type IS NOT NULL LIMIT 1"
+    ).get() as { id: string } | undefined;
+    if (!umbrella) {
+      umbrella = db.prepare(
+        "SELECT id FROM agents WHERE LOWER(name) LIKE 'hanen%' LIMIT 1"
+      ).get() as { id: string } | undefined;
+    }
+  } catch (e) {
+    result.errors.push(`Hanen umbrella lookup failed: ${e instanceof Error ? e.message : String(e)}`);
+    return result;
+  }
+  if (!umbrella) {
+    result.errors.push("Hanen umbrella agent not found in agents table");
+    return result;
+  }
+
+  // Load the producer corpus once, same shape as runHanenScraper().
+  let agents: Array<{ id: string; name: string; city: string | null; website: string | null }> = [];
+  try {
+    agents = db.prepare(
+      "SELECT a.id, a.name, a.city, k.website AS website "
+      + "FROM agents a LEFT JOIN agent_knowledge k ON k.agent_id = a.id "
+      + "WHERE a.is_active = 1 AND (a.umbrella_type IS NULL OR a.umbrella_type = '') AND a.role = 'producer'"
+    ).all() as Array<{ id: string; name: string; city: string | null; website: string | null }>;
+  } catch (e) {
+    result.errors.push(`producer corpus load failed: ${e instanceof Error ? e.message : String(e)}`);
+    return result;
+  }
+
+  // Read all current review_required rows for the Hanen umbrella.
+  let rows: Array<{ id: number; producer_id: string; evidence_json: string | null }> = [];
+  try {
+    rows = db.prepare(
+      "SELECT id, producer_id, evidence_json FROM agent_affiliations "
+      + "WHERE umbrella_id = ? AND status = 'review_required'"
+    ).all(umbrella.id) as Array<{ id: number; producer_id: string; evidence_json: string | null }>;
+  } catch (e) {
+    result.errors.push(`affiliations read failed: ${e instanceof Error ? e.message : String(e)}`);
+    return result;
+  }
+  result.rows_examined = rows.length;
+
+  const update = db.prepare(
+    "UPDATE agent_affiliations SET status = ?, evidence_json = ?, updated_at = ? WHERE id = ?"
+  );
+  const nowIso = new Date().toISOString();
+
+  for (const row of rows) {
+    if (!row.evidence_json) {
+      result.still_pending++;
+      continue;
+    }
+    let ev: any;
+    try {
+      ev = JSON.parse(row.evidence_json);
+    } catch {
+      result.still_pending++;
+      continue;
+    }
+    // Reconstruct a Hanen member record from the persisted evidence.
+    const member: HanenMemberRecord = {
+      parsed_name: typeof ev.parsed_name === "string" ? ev.parsed_name : "",
+      parsed_location: typeof ev.parsed_location === "string" ? ev.parsed_location : "",
+      parsed_website: typeof ev.parsed_website === "string" ? ev.parsed_website : null,
+      parsed_category: typeof ev.parsed_category === "string" ? ev.parsed_category : null,
+      source_url: typeof ev.source_url === "string" ? ev.source_url : (typeof ev.source === "string" ? ev.source : ""),
+    };
+    if (!member.parsed_name) {
+      result.still_pending++;
+      continue;
+    }
+
+    let verdict: MatchVerdict;
+    try {
+      // Limit to just THIS row's producer — we're verifying the existing
+      // candidate gained new signals, not searching afresh. Pull the
+      // agent record + any others (matcher picks highest Dice).
+      verdict = matchHanenMemberToAgent(member, agents);
+    } catch (e) {
+      result.errors.push(`re-match failed for "${member.parsed_name}": ${e instanceof Error ? e.message : String(e)}`);
+      continue;
+    }
+
+    if (
+      verdict.agent_id === row.producer_id &&
+      verdict.confidence === "high"
+    ) {
+      // Promote — preserve historical evidence fields and add the
+      // updated signal record.
+      const newEvidence = {
+        ...ev,
+        match_score: verdict.score,
+        match_method: verdict.method,
+        match_confidence: "high",
+        location_check: verdict.location_check,
+        reclassified_at: nowIso,
+        reclassified_from: "review_required",
+      };
+      // Drop the legacy `review_required: true` flag — the status column
+      // now carries that information.
+      delete newEvidence.review_required;
+      try {
+        update.run("pending_confirmation", JSON.stringify(newEvidence), nowIso, row.id);
+        result.promoted++;
+      } catch (e) {
+        result.errors.push(`promote affiliation ${row.id} failed: ${e instanceof Error ? e.message : String(e)}`);
+      }
+    } else {
+      result.still_pending++;
+    }
+  }
+
+  return result;
 }
 
 // Exported constants so tests + the admin route can sanity-check.
