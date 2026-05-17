@@ -8457,6 +8457,141 @@ const _pr67Promise: Promise<void> = new Promise<void>(r => { _pr67Resolve = r; }
     assertEq(vLM.agent_id, null,
       "pr67: rejected match has agent_id=null");
 
+    // ── PR-67 iter2: reviewer findings P0-1, P1-1, P1-2 ──
+
+    // 4g. P0-1 regression: domain match must NOT override a strict
+    // fylke MISMATCH. Member in Vestland, agent in Oslo, both share a
+    // domain (e.g. shared/franchise hosting). Expected: rejected.
+    const mDomMis: any = {
+      parsed_name: "Lerum Konserves",
+      parsed_location: "Vestland",
+      parsed_website: "https://shared-host.no",
+      parsed_category: null,
+      source_url: "https://hanen.no/x",
+    };
+    const corpusDomMis = [
+      { id: "dm1", name: "Lerum Konserves AS", city: "Oslo", website: "https://shared-host.no" },
+    ];
+    const vDomMis = hs67.matchHanenMemberToAgent(mDomMis, corpusDomMis);
+    assertEq(vDomMis.method, "location_mismatch_rejection",
+      "pr67 iter2 P0-1: domain match + loc=mismatch → rejected (not promoted)");
+    assertEq(vDomMis.agent_id, null,
+      "pr67 iter2 P0-1: rejected verdict has agent_id=null");
+    assertEq(vDomMis.confidence, null,
+      "pr67 iter2 P0-1: rejected verdict has confidence=null");
+
+    // 4h. P0-1 sanity: when loc=match (or unknown) AND domain matches,
+    // the existing domain-promote path still fires (don't over-restrict).
+    const mDomOK: any = {
+      parsed_name: "Lerum Konserves",
+      parsed_location: "Vestland",
+      parsed_website: "https://lerum.no",
+      parsed_category: null,
+      source_url: "https://hanen.no/x",
+    };
+    const corpusDomOK = [
+      { id: "dok1", name: "Lerum Konserves AS", city: "Sogndal", website: "https://lerum.no" },
+    ];
+    const vDomOK = hs67.matchHanenMemberToAgent(mDomOK, corpusDomOK);
+    assertTrue(
+      vDomOK.method === "domain_match_exact" || vDomOK.method === "domain_match_with_dice_high",
+      "pr67 iter2 P0-1: domain match + loc=match still promotes via domain_match_*");
+    assertEq(vDomOK.confidence, "high",
+      "pr67 iter2 P0-1: loc=match + domain still emits HIGH");
+
+    // 4i. P1-1: Branch B (fylke_match_with_dice_high) must be reachable
+    // independently of Branch A. Agent has city='Bergen' but no
+    // name-suffix; Hanen member has parsed_location='Hordaland' and no
+    // name-suffix either. Strict locationCheck would be "match" via
+    // Vestland↔Hordaland — so to force Branch B path, parsed_location is
+    // empty and the member's name-suffix carries 'Hordaland'.
+    const mBrB: any = {
+      parsed_name: "Vestland Gard — Hordaland",
+      parsed_location: "",                  // empty → strict path unknown
+      parsed_website: null,
+      parsed_category: null,
+      source_url: "https://hanen.no/x",
+    };
+    const corpusBrB = [
+      // Agent has city=Bergen (→ Vestland) but its name has NO suffix.
+      { id: "brb1", name: "Vestland Gard", city: "Bergen", website: null },
+    ];
+    const vBrB = hs67.matchHanenMemberToAgent(mBrB, corpusBrB);
+    assertEq(vBrB.agent_id, "brb1",
+      "pr67 iter2 P1-1: Branch B candidate selected");
+    assertEq(vBrB.method, "fylke_match_with_dice_high",
+      "pr67 iter2 P1-1: agent.city → fylke vs member-suffix → fylke triggers Branch B");
+    assertEq(vBrB.confidence, "high",
+      "pr67 iter2 P1-1: Branch B emits HIGH confidence");
+
+    // 4j. P1-1 sanity: Branch A still fires when BOTH names carry
+    // suffixes (member's parsed_name has " — Hemsedal" AND agent's
+    // name carries a suffix too, even if it's the same suffix-style).
+    const mBrA: any = {
+      parsed_name: "Heim Gard — Hemsedal",
+      parsed_location: "",
+      parsed_website: null,
+      parsed_category: null,
+      source_url: "https://hanen.no/x",
+    };
+    const corpusBrA = [
+      // Agent name carries its own location suffix → Branch A path.
+      { id: "bra1", name: "Heim Gard — Hemsedal", city: null, website: null },
+    ];
+    const vBrA = hs67.matchHanenMemberToAgent(mBrA, corpusBrA);
+    assertEq(vBrA.agent_id, "bra1",
+      "pr67 iter2 P1-1: Branch A candidate selected");
+    assertEq(vBrA.method, "name_suffix_location_match",
+      "pr67 iter2 P1-1: both-side name-suffix evidence triggers Branch A");
+    assertEq(vBrA.confidence, "high",
+      "pr67 iter2 P1-1: Branch A emits HIGH confidence");
+
+    // 4k. P1-2: best-candidate selection should prefer a domain-match
+    // candidate over a slightly-higher-Dice candidate without one.
+    // Agent Y is a marginally better Dice fit but has no domain. Agent
+    // X is a slightly worse Dice fit AND has the matching domain.
+    // Without the boost, Y wins and the domain path can't fire.
+    // With the boost (P1-2), X wins and we get HIGH confidence.
+    const mTie: any = {
+      parsed_name: "Bratabu Gard",
+      parsed_location: "",
+      parsed_website: "https://bratabu.no",
+      parsed_category: null,
+      source_url: "https://hanen.no/x",
+    };
+    const corpusTie = [
+      // Y: very close name, no domain.
+      { id: "y", name: "Bratabu Gard AS", city: null, website: null },
+      // X: slightly worse name (extra word), matching domain.
+      { id: "x", name: "Bratabu Gard Garden Stuff", city: null, website: "https://bratabu.no" },
+    ];
+    const vTie = hs67.matchHanenMemberToAgent(mTie, corpusTie);
+    assertEq(vTie.agent_id, "x",
+      "pr67 iter2 P1-2: domain-match candidate (x) preferred over higher-Dice no-domain candidate (y)");
+    assertTrue(
+      vTie.method === "domain_match_exact" || vTie.method === "domain_match_with_dice_high",
+      "pr67 iter2 P1-2: winning candidate gets the domain-match method");
+    assertEq(vTie.confidence, "high",
+      "pr67 iter2 P1-2: P1-2 winner emits HIGH confidence");
+
+    // 4l. P1-2 sanity: boost (0.05) must NOT flip a very-low-Dice
+    // domain candidate over a very-high-Dice non-domain candidate. We
+    // don't want the boost to rescue Dice << threshold.
+    const mNoFlip: any = {
+      parsed_name: "Bratabu Gard",
+      parsed_location: "",
+      parsed_website: "https://bratabu.no",
+      parsed_category: null,
+      source_url: "https://hanen.no/x",
+    };
+    const corpusNoFlip = [
+      { id: "good", name: "Bratabu Gard", city: null, website: null },           // dice 1.0, no domain
+      { id: "bad", name: "Completely Unrelated", city: null, website: "https://bratabu.no" }, // dice ~0, has domain
+    ];
+    const vNoFlip = hs67.matchHanenMemberToAgent(mNoFlip, corpusNoFlip);
+    assertEq(vNoFlip.agent_id, "good",
+      "pr67 iter2 P1-2: boost (+0.05) does NOT flip a near-zero Dice over a perfect match");
+
     // (5) End-to-end: reclassifyHanenAffiliations promotes review_required
     //     rows when new signals justify HIGH confidence.
     //

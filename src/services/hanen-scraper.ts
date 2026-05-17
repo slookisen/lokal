@@ -430,9 +430,18 @@ export function matchHanenMemberToAgent(
   //   - suffixLocCheck  : member name-suffix fylke vs agent city/suffix fylke
   //   - fylkeFallback   : either-side fylke match including suffix hints
   //   - domainCheck     : agent_knowledge.website domain == member website domain
+  // PR-67 iter2 P1-2: a small Dice boost given to candidates whose
+  // domain matches the Hanen-member's parsed_website. This breaks ties
+  // and slight Dice inversions so that domain-corroborated candidates
+  // out-rank a marginally-higher-Dice candidate without a domain match.
+  // 0.05 is tuned to flip a (0.94 domain) over a (0.96 no-domain) but
+  // not flip a (0.85 domain) over a (0.95 no-domain).
+  const DOMAIN_BOOST = 0.05;
+
   let best: {
     id: string;
     score: number;
+    rankKey: number;
     locationCheck: "match" | "mismatch" | "unknown";
     fylkeFallback: "match" | "mismatch" | "unknown";
     suffixLocCheck: "match" | "mismatch" | "unknown";
@@ -450,7 +459,10 @@ export function matchHanenMemberToAgent(
         if (s > bestForAgent) bestForAgent = s;
       }
     }
-    if (!best || bestForAgent > best.score) {
+    // Domain corroboration computed up-front so it can boost rankKey.
+    const candidateDomainMatch = domainsMatch(a.website, member.parsed_website);
+    const rankKey = bestForAgent + (candidateDomainMatch ? DOMAIN_BOOST : 0);
+    if (!best || rankKey > best.rankKey) {
       // Strict locationCheck — same semantics as PR-64. memberFylke is
       // the Hanen-side fylke from hanen_county-<fylke>; agent fylke is
       // mapped from agents.city via cityToFylke().
@@ -462,36 +474,49 @@ export function matchHanenMemberToAgent(
         locationCheck = "unknown";
       }
 
-      // PR-67 signal A — agent-side name-suffix fylke fallback.
-      // Many Hanen members have city=null but a name suffix like
-      // " — Hemsedal". Parse it and resolve to a fylke through
-      // cityToFylke() (treats the suffix as a kommune).
+      // PR-67 signal A — agent-side name-suffix fylke. Parses the
+      // agent's NAME for a trailing location-suffix ("Heim Gard —
+      // Hemsedal") and resolves it via cityToFylke()/normaliseFylke().
+      // This signal is reachable ONLY when the agent has a name-suffix
+      // — it's the "agent's own name carries location evidence" path.
       const agentNameSuffix = parseNameLocationSuffix(a.name).location_hint;
-      const agentFylkeFromSuffix = agentFylke
-        ?? (agentNameSuffix ? cityToFylke(agentNameSuffix) ?? normaliseFylke(agentNameSuffix) : null);
+      const agentFylkeFromAgentSuffix = agentNameSuffix
+        ? (cityToFylke(agentNameSuffix) ?? normaliseFylke(agentNameSuffix))
+        : null;
 
+      // suffixLocCheck — fires only when BOTH sides carry name-suffix
+      // evidence (member's parsed_name AND agent's name). This is
+      // distinct from the broader fylkeFallback below so that branch B
+      // is reachable independently. Note: in suffixLocCheck we
+      // deliberately require the agent's fylke to come from its NAME
+      // suffix (not its city), so that the "agent has city but no name
+      // suffix" case routes to branch B instead.
       let suffixLocCheck: "match" | "mismatch" | "unknown" = "unknown";
-      if (memberFylkeFromSuffix && agentFylkeFromSuffix) {
-        suffixLocCheck = fylkerMatch(memberFylkeFromSuffix, agentFylkeFromSuffix) ? "match" : "mismatch";
+      if (memberFylkeFromSuffix && agentFylkeFromAgentSuffix) {
+        suffixLocCheck = fylkerMatch(memberFylkeFromSuffix, agentFylkeFromAgentSuffix) ? "match" : "mismatch";
       }
 
-      // PR-67 signal B — fylke-fallback. Treat agent-suffix fylke OR
-      // agent-city fylke as the agent-side; treat member-suffix fylke
-      // OR member-parsed-location fylke as the member-side. This is the
-      // most permissive of the three location signals.
+      // PR-67 signal B — fylke-fallback. Uses the agent's CITY-derived
+      // fylke (cityToFylke(a.city)) against the member-side fylke (from
+      // parsed_location OR name-suffix). Reachable when the agent has a
+      // city but no name-suffix, and the strict locationCheck path was
+      // "unknown" (e.g. member's parsed_location was empty so strict
+      // path needed both signals). This covers the case suffixLocCheck
+      // can't — agent's evidence is in agents.city, not its name.
       let fylkeFallback: "match" | "mismatch" | "unknown" = "unknown";
-      if (memberFylkeFromSuffix && agentFylkeFromSuffix) {
-        fylkeFallback = fylkerMatch(memberFylkeFromSuffix, agentFylkeFromSuffix) ? "match" : "mismatch";
+      if (memberFylkeFromSuffix && agentFylke) {
+        fylkeFallback = fylkerMatch(memberFylkeFromSuffix, agentFylke) ? "match" : "mismatch";
       }
 
       // PR-67 signal C — domain corroboration. Agents pass website via
       // an optional `website` field (joined from agent_knowledge at
       // call-time). Hanen-member side uses `parsed_website`.
-      const domainCheck: "match" | "unknown" = domainsMatch(a.website, member.parsed_website) ? "match" : "unknown";
+      const domainCheck: "match" | "unknown" = candidateDomainMatch ? "match" : "unknown";
 
       best = {
         id: a.id,
         score: bestForAgent,
+        rankKey,
         locationCheck,
         fylkeFallback,
         suffixLocCheck,
@@ -529,8 +554,12 @@ export function matchHanenMemberToAgent(
   // signal than a fylke); within location, name-suffix wins over the
   // generic fylke-fallback because the suffix is a per-agent assertion.
 
-  // C. Domain match — strongest new signal.
-  if (score >= MATCH_THRESHOLD && dom === "match") {
+  // C. Domain match — strongest new signal. PR-67 iter2 P0-1: gated on
+  // loc !== "mismatch" so a domain hit does NOT override a strict fylke
+  // mismatch. A shared/franchise hosting domain colliding with a
+  // producer in the wrong fylke must fall through to the
+  // location_mismatch_rejection branch below.
+  if (score >= MATCH_THRESHOLD && dom === "match" && loc !== "mismatch") {
     return {
       agent_id: best.id,
       score,
