@@ -1832,6 +1832,51 @@ function initSchema(db: Database.Database): void {
   `);
   db.exec(`CREATE INDEX IF NOT EXISTS idx_debio_unmatched_last_seen ON debio_unmatched_operators(last_seen_at)`);
 
+
+  // ─── PR-71 (2026-05-17): BM event-participants scraper schema ──────
+  // Additive migrations for the bm-event-participants-scraper:
+  //   (1) bm_market_events.last_participants_scraped_at  — stamp when the
+  //       event's participant list was last fetched, so the daily-cron
+  //       can skip recently-scraped events. Nullable so reruns on old
+  //       DBs route the event through the scraper at least once.
+  //   (2) bm_unmatched_participants  — log every parsed-participant name
+  //       that did NOT reach the MEDIUM Dice threshold against any
+  //       producer agent. Mirrors the hanen_unmatched_members /
+  //       debio_unmatched_operators pattern so the orchestrator and
+  //       admin-triage UIs have durable storage for backlog review.
+  //
+  // Both are wrapped in try/catch so an ALTER on a fresh DB (where the
+  // column already exists from the next CREATE TABLE in this file)
+  // doesn't error out. Mirrors the PR-58 / PR-68 additive-migration
+  // pattern.
+  try {
+    const cols = db.prepare("PRAGMA table_info(bm_market_events)").all() as Array<{ name: string }>;
+    if (!cols.some(c => c.name === "last_participants_scraped_at")) {
+      db.exec(`ALTER TABLE bm_market_events ADD COLUMN last_participants_scraped_at TEXT`);
+    }
+  } catch (e) {
+    console.warn("[init][pr-71] bm_market_events.last_participants_scraped_at migration skipped:", e instanceof Error ? e.message : String(e));
+  }
+
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS bm_unmatched_participants (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      event_id INTEGER NOT NULL,
+      venue_id TEXT NOT NULL,
+      parsed_name TEXT NOT NULL,
+      parsed_slug TEXT,
+      parsed_category TEXT,
+      best_match_score REAL,
+      created_at TEXT DEFAULT (datetime('now')),
+      FOREIGN KEY (event_id) REFERENCES bm_market_events(id) ON DELETE CASCADE,
+      UNIQUE(event_id, parsed_name)
+    )
+  `);
+  // Two indexes: by venue (per-lokallag triage) and by score (worst-
+  // scoring first when an admin wants the most-likely manual fixes).
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_bm_unmatched_venue ON bm_unmatched_participants(venue_id)`);
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_bm_unmatched_score ON bm_unmatched_participants(best_match_score)`);
+
 }
 
 export function closeDb(): void {
