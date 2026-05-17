@@ -1,10 +1,19 @@
-// ─── BM event-participant scraper (Phase 5.11 PR-71, 2026-05-17) ────
+// ─── BM event-participant scraper (Phase 5.11 PR-71 + PR-77, 2026-05-17) ────
 //
 // The Bondens marked events scraper (PR-56) populates `bm_market_events`
 // with venue + start_at + slug, but each event's PARTICIPANT LIST
 // (`/markeder/<slug>` detail page → "Produsenter (N)" section) is NOT
 // linked to producer agents. Today the 13 BM lokallag umbrellas hold
 // only ~73 producer affiliations total — they should each have 30-80.
+//
+// PR-77 extends this further: in addition to the producer→lokallag
+// affiliation (PR-71), each participant also gets a producer→VENUE
+// affiliation (the specific marked-place where the event happens).
+// This populates the BM venue-pages (e.g. /produsent/bm-arendal) which
+// were previously empty of producer-medlems-kort despite the venue-row
+// existing in `agents`. Both rows share the same UNIQUE(producer_id,
+// umbrella_id) key so the venue and lokallag affiliations are stored
+// as separate rows; ON CONFLICT keeps them idempotent across re-runs.
 //
 // This module closes that gap. For every event we:
 //
@@ -16,9 +25,12 @@
 //      category label).
 //   3. Walk the event's `venue_agent_id` → `parent_umbrella_id` chain to
 //      land on the lokallag umbrella (`umbrella_type='market_network'`).
-//      Affiliations always link the producer to a LOKALLAG, never to a
-//      bare venue, so a producer appearing at 3 venues of one lokallag
-//      gets exactly one affiliation row (UNIQUE producer_id + umbrella_id).
+//      PR-77 writes TWO affiliations per match:
+//        (a) producer → venue_agent_id   (specific marked-place)
+//        (b) producer → lokallag_id      (broader regional umbrella)
+//      A producer at 3 venues within the same lokallag therefore gets
+//      3 venue-affiliations + 1 lokallag-affiliation (the latter is
+//      de-duped via UNIQUE(producer_id, umbrella_id) ON CONFLICT).
 //   4. Name-match each parsed participant against existing producer
 //      agents using the shared Dice + nameVariants logic from the Hanen
 //      v3 matcher (HIGH / MEDIUM / REJECT classification).
@@ -504,52 +516,117 @@ export async function runBmEventParticipantsScraper(opts?: {
           match_confidence: verdict.confidence,
         };
 
-        if (verdict.agent_id && verdict.confidence === "high") {
-          if (dryRun) {
-            result.affiliations_created++;
-            continue;
-          }
+        // PR-77 helper: write a single producer→umbrella affiliation row.
+        // Used for BOTH the venue-level and the lokallag-level rows.
+        // Returns 'created' | 'updated' | 'error'.
+        const writeAffiliation = (
+          umbrellaId: string,
+          status: "active" | "review_required" | "pending_confirmation",
+          ev_json: any,
+          label: string,
+        ): "created" | "updated" | "error" => {
           try {
             const existing = db.prepare(
               "SELECT id FROM agent_affiliations WHERE producer_id = ? AND umbrella_id = ?"
-            ).get(verdict.agent_id, lokallag);
+            ).get(verdict.agent_id, umbrellaId);
             insertAff.run(
               verdict.agent_id,
-              lokallag,
-              "active",
-              JSON.stringify(evidence),
+              umbrellaId,
+              status,
+              JSON.stringify(ev_json),
               nowIso,
               nowIso,
             );
-            if (existing) result.affiliations_updated++;
-            else result.affiliations_created++;
+            return existing ? "updated" : "created";
           } catch (e) {
-            result.errors.push(`upsert active for ${p.parsed_slug}: ${e instanceof Error ? e.message : String(e)}`);
+            result.errors.push(`upsert ${label} for ${p.parsed_slug}: ${e instanceof Error ? e.message : String(e)}`);
+            return "error";
+          }
+        };
+
+        if (verdict.agent_id && verdict.confidence === "high") {
+          // PR-77: in dry-run we also count BOTH levels (venue + lokallag
+          // when distinct) so dry-run totals match the real-run totals.
+          if (dryRun) {
+            result.affiliations_created++; // venue row
+            if (lokallag !== ev.venue_agent_id) result.affiliations_created++; // lokallag row
+            continue;
+          }
+          // (a) producer → venue (specific marked-place)
+          const venueEvidence = {
+            ...evidence,
+            affiliation_level: "venue",
+            parent_lokallag_id: lokallag,
+          };
+          const venueOutcome = writeAffiliation(
+            ev.venue_agent_id,
+            "active",
+            venueEvidence,
+            "active-venue",
+          );
+          if (venueOutcome === "created") result.affiliations_created++;
+          else if (venueOutcome === "updated") result.affiliations_updated++;
+
+          // (b) producer → lokallag (broader regional) — only if distinct
+          // from the venue id (a lokallag-rooted event would otherwise
+          // collide on UNIQUE(producer_id, umbrella_id)).
+          if (lokallag && lokallag !== ev.venue_agent_id) {
+            const lokallagEvidence = {
+              ...evidence,
+              affiliation_level: "lokallag",
+              via_venue_id: ev.venue_agent_id,
+            };
+            const lokallagOutcome = writeAffiliation(
+              lokallag,
+              "active",
+              lokallagEvidence,
+              "active-lokallag",
+            );
+            if (lokallagOutcome === "created") result.affiliations_created++;
+            else if (lokallagOutcome === "updated") result.affiliations_updated++;
           }
         } else if (verdict.agent_id && verdict.confidence === "medium") {
           if (dryRun) {
-            result.affiliations_created++;
+            result.affiliations_created++; // venue row
+            if (lokallag !== ev.venue_agent_id) result.affiliations_created++; // lokallag row
             continue;
           }
           const targetStatus = statusCheckIncludesReviewRequired
             ? "review_required"
             : "pending_confirmation";
-          try {
-            const existing = db.prepare(
-              "SELECT id FROM agent_affiliations WHERE producer_id = ? AND umbrella_id = ?"
-            ).get(verdict.agent_id, lokallag);
-            insertAff.run(
-              verdict.agent_id,
+
+          // (a) producer → venue
+          const venueEvidence = {
+            ...evidence,
+            affiliation_level: "venue",
+            parent_lokallag_id: lokallag,
+            review_required: true,
+          };
+          const venueOutcome = writeAffiliation(
+            ev.venue_agent_id,
+            targetStatus,
+            venueEvidence,
+            "review-venue",
+          );
+          if (venueOutcome === "created") result.affiliations_created++;
+          else if (venueOutcome === "updated") result.affiliations_updated++;
+
+          // (b) producer → lokallag (only if distinct)
+          if (lokallag && lokallag !== ev.venue_agent_id) {
+            const lokallagEvidence = {
+              ...evidence,
+              affiliation_level: "lokallag",
+              via_venue_id: ev.venue_agent_id,
+              review_required: true,
+            };
+            const lokallagOutcome = writeAffiliation(
               lokallag,
               targetStatus,
-              JSON.stringify({ ...evidence, review_required: true }),
-              nowIso,
-              nowIso,
+              lokallagEvidence,
+              "review-lokallag",
             );
-            if (existing) result.affiliations_updated++;
-            else result.affiliations_created++;
-          } catch (e) {
-            result.errors.push(`upsert review for ${p.parsed_slug}: ${e instanceof Error ? e.message : String(e)}`);
+            if (lokallagOutcome === "created") result.affiliations_created++;
+            else if (lokallagOutcome === "updated") result.affiliations_updated++;
           }
         } else {
           // below_threshold — log to unmatched table.
