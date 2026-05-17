@@ -130,6 +130,79 @@ import Database from "better-sqlite3";
 import { __setDbForTesting } from "../src/database/init";
 import { trustScoreService } from "../src/services/trust-score-service";
 
+
+// === Test-DB Mutex (PR-79) ===
+//
+// Every test block that calls `__setDbForTesting(db)` to install its own
+// in-memory DB must go through this helper. It serializes all callers via
+// a single global promise queue. This eliminates the entire class of
+// "__setDbForTesting race" bugs that caused Runs 3/5/6/7/8/9 rejections
+// in May 2026.
+//
+// Behavior:
+//   - Each call queues behind the previous one (FIFO).
+//   - `setupDb()` is invoked AFTER the prior holder releases, so each block
+//     sees a fresh DB built specifically for it.
+//   - On block completion (success or error), the DB is uninstalled and
+//     the next block in the queue gets its turn.
+//   - Errors are propagated through the returned promise but DO NOT block
+//     downstream blocks (each block has its own try/finally).
+let _lastTestDbPromise: Promise<unknown> = Promise.resolve();
+
+async function withTestDb<T>(
+  _label: string,
+  setupDb: () => unknown | Promise<unknown>,
+  fn: (db: any) => Promise<T>,
+): Promise<T> {
+  const prior = _lastTestDbPromise;
+  let releaseMe: () => void = () => {};
+  const myTurn = new Promise<void>(r => { releaseMe = r; });
+  _lastTestDbPromise = myTurn;
+
+  try {
+    try { await prior; } catch { /* prior block errored — don't block us */ }
+    const db = (await setupDb()) as any;
+    __setDbForTesting(db as any);
+    try {
+      return await fn(db);
+    } finally {
+      try { __setDbForTesting(null as any); } catch { /* tolerate older APIs */ }
+    }
+  } finally {
+    releaseMe();
+  }
+}
+
+// Promises from blocks we still want REPORT to await but that don't have
+// their own well-known top-level promise name (e.g. the Smithery block
+// inside PR-56's sync source-presence tests, or sync blocks like a4.1/a4.4
+// which were converted to mutex-wrapped async functions in PR-79).
+const _pr79Promises: Promise<unknown>[] = [];
+
+// Variant: claim the mutex without auto-installing a DB. The body owns
+// installing and uninstalling the DB. Useful for blocks whose DB setup
+// is interleaved with `await import(...)` of routes / Express, where
+// we can't hand setupDb a sync builder.
+async function withTestDbMutex<T>(
+  _label: string,
+  fn: () => Promise<T>,
+): Promise<T> {
+  const prior = _lastTestDbPromise;
+  let releaseMe: () => void = () => {};
+  const myTurn = new Promise<void>(r => { releaseMe = r; });
+  _lastTestDbPromise = myTurn;
+  try {
+    try { await prior; } catch { /* prior block errored — don't block us */ }
+    try {
+      return await fn();
+    } finally {
+      try { __setDbForTesting(null as any); } catch { /* tolerate older APIs */ }
+    }
+  } finally {
+    releaseMe();
+  }
+}
+
 const memdb = new Database(":memory:");
 memdb.exec(`
   CREATE TABLE agents (
@@ -2552,10 +2625,16 @@ async function runIntegrationTests(): Promise<void> {
 }
 
 
-const _intgPromise = runIntegrationTests().catch((err) => {
-  failed++;
-  failures.push(`intg: unexpected error: ${err?.message || err}`);
-});
+// PR-79: serialize the integration tests through the test-DB mutex —
+// runIntegrationTests builds 3 in-memory DBs back-to-back via buildTestDb()
+// (which calls __setDbForTesting). Holding the mutex for the whole function
+// prevents downstream blocks from racing those swaps.
+const _intgPromise = withTestDbMutex("intg", () =>
+  runIntegrationTests().catch((err) => {
+    failed++;
+    failures.push(`intg: unexpected error: ${err?.message || err}`);
+  })
+);
 
 // ── Phase 5.4a M2: owner-portal frontend tests ───────────────────────────
 // These tests verify the new selger-portal HTML pages, magic-link email
@@ -2564,7 +2643,7 @@ const _intgPromise = runIntegrationTests().catch((err) => {
 
 console.log("\n── Phase 5.4a M2: owner-portal frontend tests ──");
 
-const _m2Promise = (async function runOwnerPortalTests() {
+const _m2Promise = withTestDbMutex("m2", async () => {
   try {
     // Static-source assertions for Variant A claim-CTA (E1: "Hero claim-CTA
     // renders for unclaimed agents" + "footer claim-CTA renders for claimed").
@@ -2838,7 +2917,7 @@ const _m2Promise = (async function runOwnerPortalTests() {
     failed++;
     failures.push(`m2 owner-portal: unexpected error: ${(err as any)?.message || err}`);
   }
-})();
+});
 
 
 
@@ -3023,10 +3102,8 @@ const _m2Promise = (async function runOwnerPortalTests() {
 // All async, awaited in REPORT block via _pr24Promise.
 console.log("\n── PR-24: /admin/knowledge field_provenance merge tests ──");
 
-const _pr24Promise = (async function runPr24Tests() {
-  // Wait for M2 owner-portal tests to finish first — they also use
-  // __setDbForTesting and would race with our pinned DB otherwise.
-  try { await _m2Promise; } catch { /* their failures are already recorded */ }
+const _pr24Promise = withTestDbMutex("pr-24", async () => {
+  // PR-79: mutex serializes us behind earlier blocks (m2, etc).
   try {
     // Build an isolated DB. Same pattern as the M2 owner-portal tests.
     const Database3 = (await import("better-sqlite3")).default;
@@ -3498,7 +3575,7 @@ const _pr24Promise = (async function runPr24Tests() {
     failed++;
     failures.push(`✗ pr24: unexpected error: ${err instanceof Error ? err.stack || err.message : String(err)}`);
   }
-})();
+});
 // ── PR-23 (2026-05-11): backfill field_provenance for stranded agents ──
 console.log("\n── PR-23: field_provenance backfill ──");
 {
@@ -5027,7 +5104,11 @@ console.log("── PR-29 related-producers tests ──");
 // PR-48: marketplace-registry SELECTs and the outreach_ready_pool VIEW
 // must filter out umbrella-tagged agents (umbrella_type IS NOT NULL).
 // Direct-fetch paths (getAgent, /umbrellas) must still find them.
-{
+//
+// PR-79: was a sync block that pinned the global DB and never released.
+// Now serialized via withTestDbMutex so downstream blocks see a clean
+// slate after this block completes.
+_pr79Promises.push(withTestDbMutex("phase-5.11-a4.1", async () => {
   console.log("\n── Phase 5.11 A4.1: umbrella exclusion from producer surfaces ──");
 
   const Database3 = require("better-sqlite3");
@@ -5230,7 +5311,7 @@ console.log("── PR-29 related-producers tests ──");
     failures.push("phase5.11-a4.1: discover() test threw: " + (e?.message || e));
     failed++;
   }
-}
+}));
 
 
 
@@ -5532,7 +5613,9 @@ console.log("── PR-29 related-producers tests ──");
 //      Bondens marked Norge affiliation. A4.3 missed this row because
 //      Sogn was CREATED during the migration, not promoted from one of
 //      the 12 existing agents.
-{
+//
+// PR-79: was a sync block; now serialized via withTestDbMutex.
+_pr79Promises.push(withTestDbMutex("phase-5.11-a4.4", async () => {
   console.log("\n── Phase 5.11 A4.4 (PR-50): /produsent/:slug umbrella fix + Sogn backfill ──");
   const fs = require("fs");
   const Database = require("better-sqlite3");
@@ -5755,7 +5838,7 @@ console.log("── PR-29 related-producers tests ──");
   }
   assertTrue(duplicateRejected,
     "phase5.11-a4.4: re-running backfill is rejected by UNIQUE(producer_id, umbrella_id) — endpoint pre-check returns 409 before this");
-}
+}));
 
 // ─── Phase 5.11 A5 (PR-51): umbrella profile polish ─────────────────
 // Four UX fixes to the umbrella-stub render in src/routes/seo.ts:
@@ -6323,7 +6406,9 @@ console.log("── PR-29 related-producers tests ──");
   // and uses getConfig() in skill descriptions (needs loadConfigsAtBoot()).
   // We bring up both before invoking. This catches runtime regressions a
   // regex would miss.
-  {
+  // PR-79: wrapped in withTestDbMutex so the DB pin/unpin is serialized.
+  // Promise is intentionally fire-and-forget — REPORT awaits via _pr56Promise chain ordering.
+  _pr79Promises.push(withTestDbMutex("pr-56-smithery", async () => {
     const Database = require("better-sqlite3");
     const initMod56 = require("../src/database/init");
     const regMod56 = require("../src/services/marketplace-registry");
@@ -6369,7 +6454,7 @@ console.log("── PR-29 related-producers tests ──");
 
     // Cleanup so subsequent tests can re-init their own db
     db56.close();
-  }
+  }));
 }
 
 
@@ -6471,9 +6556,10 @@ console.log("── PR-29 related-producers tests ──");
 }
 
 
-// PR-56 async-test handle — settled by the IIFE inside the block below.
-let _pr56Resolve: () => void = () => {};
-const _pr56Promise: Promise<void> = new Promise<void>(r => { _pr56Resolve = r; });
+// PR-56 async-test handle — settled by the withTestDbMutex call inside the block below.
+// PR-79: serialization handled by the mutex; _pr56Promise resolves when DB
+// is released so downstream awaiters can hold-then-release.
+let _pr56Promise: Promise<unknown> = Promise.resolve();
 
 // ─── PR-56: Bondens marked events scraper (Wave 2 of Phase 5.11 Stage B.1) ──
 // Behavioural tests: matcher (with stubbed agents) + scraper pipeline (with
@@ -6526,9 +6612,8 @@ const _pr56Promise: Promise<void> = new Promise<void>(r => { _pr56Resolve = r; }
   // ─── Behavioural: matcher (venue_exact / fuzzy / fallback / unmatched) ───
   // Spin up an in-memory DB shaped just enough for matchEventToVenue() to
   // walk the BM tree. Pattern matches PR-58/PR-56(Smithery)/A7 tests.
-  // The async work is exposed on _pr56Promise (declared below the block) so
-  // the REPORT IIFE awaits it before tallying pass/fail.
-  {
+  // PR-79: wrapped in withTestDbMutex so the DB pin/unpin is serialized.
+  _pr56Promise = withTestDbMutex("pr-56", async () => {
     const Database = require("better-sqlite3");
     const initMod = require("../src/database/init");
     const db = new Database(":memory:");
@@ -6567,7 +6652,7 @@ const _pr56Promise: Promise<void> = new Promise<void>(r => { _pr56Resolve = r; }
 
     // venue_fuzzy: event_name "Lyngdal Sentrum" should match "Bondens marked — Lyngdal"
     // (the prefix is stripped by normaliseForMatch and "lyngdal" remains as needle)
-    (async () => {
+    try {
       const r1 = await matchEventToVenue({
         event_slug: "lyngdal-sentrum-2026-05-16",
         event_name: "Lyngdal Sentrum",
@@ -6666,15 +6751,11 @@ const _pr56Promise: Promise<void> = new Promise<void>(r => { _pr56Resolve = r; }
       assertTrue(filterRows.length >= 1, "pr-56: public-endpoint SQL returns events for an Agder lokallag filter");
       assertTrue(filterRows.every(r => r.venue_name && r.venue_name.length > 0),
         "pr-56: every event row has a non-empty venue_name (JOIN works)");
-    })().then(
-      () => _pr56Resolve(),
-      (err) => {
-        failed++;
-        failures.push(`✗ pr-56 async block threw: ${err?.message || String(err)}`);
-        _pr56Resolve();
-      }
-    );
-  }
+    } catch (err: any) {
+      failed++;
+      failures.push(`✗ pr-56 async block threw: ${err?.message || String(err)}`);
+    }
+  });
 }
 
 
@@ -7389,8 +7470,8 @@ const _pr56Promise: Promise<void> = new Promise<void>(r => { _pr56Resolve = r; }
 }
 
 // PR-63 (C.1-A): Debio TRACES+Brreg cross-check async-test handle
-let _pr63Resolve: () => void = () => {};
-const _pr63Promise: Promise<void> = new Promise<void>(r => { _pr63Resolve = r; });
+// PR-79: serialized via the test-DB mutex below.
+let _pr63Promise: Promise<unknown> = Promise.resolve();
 
 // ─── C.1-A: Debio TRACES + Brreg cross-check (Phase 5.11) ─────────────
 {
@@ -7467,12 +7548,8 @@ const _pr63Promise: Promise<void> = new Promise<void>(r => { _pr63Resolve = r; }
 
   // findOrgnumberByName: <0.9 confidence → null
   __clearBrregCacheForTesting();
-  (async () => {
-    // Wait for PR-56's async block first — both blocks swap the global
-    // db singleton via __setDbForTesting and racing them corrupts PR-56's
-    // in-memory DB. PR-56 finishes in ~50ms with stubbed fetch, so this
-    // wait is essentially free.
-    try { await _pr56Promise; } catch { /* failures already tallied */ }
+  _pr63Promise = withTestDbMutex("pr-63", async () => {
+    try {
     const stubLowConf = async (_url: string) => new Response(JSON.stringify({
       _embedded: { enheter: [
         { organisasjonsnummer: "999888777", navn: "Bygdens Egen Gård AS",
@@ -7655,21 +7732,18 @@ const _pr63Promise: Promise<void> = new Promise<void>(r => { _pr63Resolve = r; }
     const aff2 = db.prepare("SELECT COUNT(*) AS c FROM agent_affiliations").get() as any;
     assertEq(aff2.c, 1, "c1a: re-running cross-check does not duplicate affiliations (idempotent)");
     assertEq(result2.agents_matched, 1, "c1a: second run still matches the same 1 agent");
-  })().then(
-    () => _pr63Resolve(),
-    (err) => {
+    } catch (err: any) {
       failed++;
       failures.push(`✗ c1a async block threw: ${err?.message || String(err)}`);
-      _pr63Resolve();
     }
-  );
+  });
 }
 
 
 // PR-65 async-test handle (job-tracker uses setImmediate so completion
 // is observable only after a tick).
-let _pr65Resolve: () => void = () => {};
-const _pr65Promise: Promise<void> = new Promise<void>(r => { _pr65Resolve = r; });
+// PR-79: serialized via the test-DB mutex below.
+let _pr65Promise: Promise<unknown> = Promise.resolve();
 
 // ─── PR-65: async job pattern + Hanen offset + Debio TRACES pagination ──
 {
@@ -7802,8 +7876,9 @@ const _pr65Promise: Promise<void> = new Promise<void>(r => { _pr65Resolve = r; }
 }
 
 // Async block: must await setImmediate completion to see status transitions.
-{
-  (async () => {
+// PR-79: wrapped in withTestDbMutex so the DB pin/unpin is serialized.
+_pr65Promise = withTestDbMutex("pr-65", async () => {
+  try {
     const jt = require("../src/services/job-tracker");
     jt._clearJobsForTesting();
 
@@ -8206,15 +8281,11 @@ const _pr65Promise: Promise<void> = new Promise<void>(r => { _pr65Resolve = r; }
       "pr65: backward-compat — fetchHanenListing({maxPages:1}) still works without startPage");
     assertEq(bcResult.pages[0].url, "https://hanen.no/medlemmer",
       "pr65: backward-compat — default start page is the medlemmer root");
-  })().then(
-    () => _pr65Resolve(),
-    (err) => {
-      failed++;
-      failures.push(`✗ pr65 async block threw: ${err?.message || String(err)}`);
-      _pr65Resolve();
-    }
-  );
-}
+  } catch (err: any) {
+    failed++;
+    failures.push(`✗ pr65 async block threw: ${err?.message || String(err)}`);
+  }
+});
 
 
 // PR-66 async-test handle — settled by the IIFE inside the block below.
@@ -8468,10 +8539,9 @@ const _pr66Promise: Promise<void> = new Promise<void>(r => { _pr66Resolve = r; }
   );
 }
 
-// PR-67 async handle (DB-bound section awaits PR-56's in-memory
-// DB to settle before swapping the singleton via __setDbForTesting).
-let _pr67Resolve: () => void = () => {};
-const _pr67Promise: Promise<void> = new Promise<void>(r => { _pr67Resolve = r; });
+// PR-67 async handle.
+// PR-79: serialized via the test-DB mutex below.
+let _pr67Promise: Promise<unknown> = Promise.resolve();
 
 // ─── PR-67: Hanen matcher v3 (location-suffix + fylke-fallback + domain) ──
 // Adds 30+ assertions covering the new MEDIUM→HIGH promotion signals:
@@ -8869,13 +8939,9 @@ const _pr67Promise: Promise<void> = new Promise<void>(r => { _pr67Resolve = r; }
 
     // (5) End-to-end: reclassifyHanenAffiliations promotes review_required
     //     rows when new signals justify HIGH confidence.
-    //
-    // Wait for PR-56's async block to finish before swapping the
-    // singleton DB — both blocks pin their own in-memory DB via
-    // __setDbForTesting and racing them corrupts PR-56's assertions.
-    // PR-56 typically resolves in ~50ms with stubbed fetches.
-    (async () => {
-      try { await _pr56Promise; } catch { /* failures already tallied */ }
+    // PR-79: wrapped in withTestDbMutex so the DB pin/unpin is serialized.
+    _pr67Promise = withTestDbMutex("pr-67", async () => {
+      try {
     const Database67 = require("better-sqlite3");
     const initMod67 = require("../src/database/init");
     const db67 = new Database67(":memory:");
@@ -8987,21 +9053,15 @@ const _pr67Promise: Promise<void> = new Promise<void>(r => { _pr67Resolve = r; }
     assertEq(rcResult2.errors.length, 0,
       "pr67: second re-classify produces no errors");
 
-    // Reset the singleton DB so later tests aren't affected. The
-    // init module's __setDbForTesting(null) resets to default.
-    try { initMod67.__setDbForTesting(null); } catch { /* tolerate older APIs */ }
-    })().then(
-      () => _pr67Resolve(),
-      (err) => {
+    // PR-79: DB cleanup is handled automatically by withTestDbMutex.
+      } catch (err: any) {
         failed++;
         failures.push(`✗ pr67 async block threw: ${err?.message || String(err)}`);
-        _pr67Resolve();
       }
-    );
+    });
   } catch (e: any) {
     failed++;
     failures.push("✗ pr67 behavioural: " + (e?.message || String(e)));
-    _pr67Resolve();
   }
 }
 
@@ -9012,8 +9072,8 @@ const _pr67Promise: Promise<void> = new Promise<void>(r => { _pr67Resolve = r; }
 // ════════════════════════════════════════════════════════════════════
 console.log("\n── PR-68: verifier-review-queue umbrella filter + Hanen batch import ──");
 
-let _pr68Resolve: () => void = () => {};
-const _pr68Promise: Promise<void> = new Promise<void>(r => { _pr68Resolve = r; });
+// PR-79: serialized via the test-DB mutex below.
+let _pr68Promise: Promise<unknown> = Promise.resolve();
 
 {
   const fs = require("fs");
@@ -9051,12 +9111,9 @@ const _pr68Promise: Promise<void> = new Promise<void>(r => { _pr68Resolve = r; }
     "pr68: init.ts probes table_info before ALTER (idempotent migration)");
 }
 
-// ── Behavioural tests run LAST — wait for the other async DB-using
-//    blocks (PR-56, PR-65) to finish before we steal the global DB.
-(async () => {
-  try { await _pr56Promise; } catch { /* errors already counted */ }
-  try { await _pr65Promise; } catch { /* errors already counted */ }
-
+// ── Behavioural tests run LAST.
+// PR-79: wrapped in withTestDbMutex so the DB pin/unpin is serialized.
+_pr68Promise = withTestDbMutex("pr-68", async () => {
   try {
     const Database3 = require("better-sqlite3");
     const pr68Db = new Database3(":memory:");
@@ -9246,10 +9303,8 @@ const _pr68Promise: Promise<void> = new Promise<void>(r => { _pr68Resolve = r; }
   } catch (err: any) {
     failed++;
     failures.push(`✗ pr68 async block threw: ${err?.message || String(err)}`);
-  } finally {
-    _pr68Resolve();
   }
-})();
+});
 
 
 // ════════════════════════════════════════════════════════════════════
@@ -9261,7 +9316,9 @@ const _pr68Promise: Promise<void> = new Promise<void>(r => { _pr68Resolve = r; }
 // ════════════════════════════════════════════════════════════════════
 console.log("\n── PR-72: search relevance — category beats city ──");
 
-{
+// PR-79: was a sync block that saved/restored the prior DB.
+// Now serialized via withTestDbMutex so the swap is atomic vs. other blocks.
+_pr79Promises.push(withTestDbMutex("pr-72", async () => {
   const Database72 = require("better-sqlite3");
   const initMod72 = require("../src/database/init");
   const regMod72 = require("../src/services/marketplace-registry");
@@ -9306,12 +9363,8 @@ console.log("\n── PR-72: search relevance — category beats city ──");
       products TEXT
     );
   `);
-  // Capture the current DB so we can restore it after the block — other
-  // async test blocks may still be referring to their own pinned DBs via
-  // dangling promises (PR-56 etc). Swapping the singleton ruins them.
-  const _prevDb72 = (() => {
-    try { return initMod72.getDb(); } catch { return null; }
-  })();
+  // PR-79: prior-DB capture/restore no longer needed — withTestDbMutex
+  // serializes all callers and clears the global pin on exit.
   initMod72.__setDbForTesting(pr72db);
   const reg72 = regMod72.marketplaceRegistry as any;
   reg72._agentsCache = null;
@@ -9511,12 +9564,12 @@ console.log("\n── PR-72: search relevance — category beats city ──");
     "pr72: 'ost i Vestland' does NOT set _nameQuery (Vestland is a known fylke)"
   );
 
-  // Restore prior DB so PR-56 / other async test blocks resume with their
-  // own pinned in-memory DB instead of our pr72db.
-  if (_prevDb72) initMod72.__setDbForTesting(_prevDb72);
+  // PR-79: DB cleanup is automatic via withTestDbMutex. The pr72db restore
+  // logic is no longer needed because withTestDbMutex clears the global pin
+  // on exit and downstream blocks each install their own DB through the mutex.
   reg72._agentsCache = null;
   reg72._statsCache = null;
-}
+}));
 
 
 // ── PR-73: UTM-tagging on outbound producer links ────────────────────
@@ -9635,18 +9688,11 @@ console.log("\n── PR-73: /llms.txt expanded content ──");
 // fresh in-memory DB injected via __setDbForTesting, then mount the real
 // Express router so we exercise the exact code path production runs.
 console.log("\n── PR-74: umbrella-traffic aggregation + endpoint ──");
-const _pr74Promise = (async () => {
-  // Wait for all prior async blocks that also steal the global DB singleton.
-  // PR-68 is the last sequential block but the M2 portal IIFE and the PR-21
-  // collection run in parallel — any of them can race PR-74's __setDbForTesting
-  // call. If we skip these awaits, the analytics router executes against
-  // whatever DB happens to be installed at that moment and returns 500s.
-  try { await _pr68Promise; } catch { /* errors counted upstream */ }
-  try { await _m2Promise; } catch { /* errors counted upstream */ }
-  try { await _pr24Promise; } catch { /* errors counted upstream */ }
+// PR-79: wrapped in withTestDbMutex so the DB pin/unpin is serialized.
+// PR-21 promises are not in the mutex (they don't touch __setDbForTesting),
+// but we still await them so they complete before PR-74 returns.
+const _pr74Promise = withTestDbMutex("pr-74", async () => {
   try { await Promise.all(_pr21Promises); } catch { /* errors counted upstream */ }
-  try { await _pr63Promise; } catch { /* errors counted upstream */ }
-  try { await _pr67Promise; } catch { /* errors counted upstream */ }
   const Database = require("better-sqlite3");
   const pr74db = new Database(":memory:");
 
@@ -9871,7 +9917,7 @@ const _pr74Promise = (async () => {
   assertTrue(r5.body.success === true, "pr-74 endpoint: success:true even with empty list");
 
   server.close();
-})().catch(err => {
+}).catch(err => {
   failed++;
   failures.push(`✗ pr-74 async test setup failed: ${err instanceof Error ? err.message : String(err)}`);
 });
@@ -10255,6 +10301,7 @@ const _pr78Promise: Promise<void> = new Promise<void>(r => { _pr78Resolve = r; }
 // remain swallowed — out of scope for M2.)
 (async () => {
   try { await Promise.all(_pr21Promises); } catch { /* errors already pushed to failures */ }
+  try { await _intgPromise; } catch { /* errors already pushed to failures */ }
   try { await _m2Promise; } catch { /* errors already pushed to failures */ }
   try { await _pr24Promise; } catch { /* errors already pushed to failures */ }
   try { await _pr56Promise; } catch { /* errors already pushed to failures */ }
@@ -10267,6 +10314,13 @@ const _pr78Promise: Promise<void> = new Promise<void>(r => { _pr78Resolve = r; }
   try { await _pr75Promise; } catch { /* errors already pushed to failures */ }
   try { await _pr76Promise; } catch { /* errors already pushed to failures */ }
   try { await _pr78Promise; } catch { /* errors already pushed to failures */ }
+  // PR-79: also drain promises from PR-79-converted sync blocks (a4.1, a4.4,
+  // PR-56 Smithery, PR-72) that were previously synchronous but now ride the
+  // test-DB mutex queue.
+  try { await Promise.all(_pr79Promises); } catch { /* errors already pushed to failures */ }
+  // PR-79: drain the mutex itself to ensure no in-flight DB-pinned block
+  // remains when REPORT prints.
+  try { await _lastTestDbPromise; } catch { /* errors already pushed to failures */ }
   // Drop pre-existing intg failures (unmasked by awaiting) — they predate M2
   // and live behind a separate fix-it task. Counting them here would surface
   // a baseline failure that is not introduced by this PR.
