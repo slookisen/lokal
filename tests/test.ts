@@ -9627,6 +9627,255 @@ console.log("\n── PR-73: /llms.txt expanded content ──");
   // preview harness during development → 6.7 KB rendered body).
   assertTrue(discSrc.length > 8000, `pr73: discovery.ts is large after expansion (${discSrc.length} bytes)`);
 }
+// ─── PR-74: per-umbrella traffic widget on /admin/dashboard ──────────────
+// Validates the SQL-aggregation logic the new
+// GET /admin/analytics/umbrella-traffic endpoint relies on, plus the
+// route-level behaviour (param validation, response shape, ordering, and
+// empty-result handling). We mirror the route's query logic against a
+// fresh in-memory DB injected via __setDbForTesting, then mount the real
+// Express router so we exercise the exact code path production runs.
+console.log("\n── PR-74: umbrella-traffic aggregation + endpoint ──");
+const _pr74Promise = (async () => {
+  // Wait for all prior async blocks that also steal the global DB singleton.
+  // PR-68 is the last sequential block but the M2 portal IIFE and the PR-21
+  // collection run in parallel — any of them can race PR-74's __setDbForTesting
+  // call. If we skip these awaits, the analytics router executes against
+  // whatever DB happens to be installed at that moment and returns 500s.
+  try { await _pr68Promise; } catch { /* errors counted upstream */ }
+  try { await _m2Promise; } catch { /* errors counted upstream */ }
+  try { await _pr24Promise; } catch { /* errors counted upstream */ }
+  try { await Promise.all(_pr21Promises); } catch { /* errors counted upstream */ }
+  try { await _pr63Promise; } catch { /* errors counted upstream */ }
+  try { await _pr67Promise; } catch { /* errors counted upstream */ }
+  const Database = require("better-sqlite3");
+  const pr74db = new Database(":memory:");
+
+  pr74db.exec(`
+    CREATE TABLE agents (
+      id TEXT PRIMARY KEY,
+      name TEXT NOT NULL,
+      umbrella_type TEXT,
+      is_active INTEGER DEFAULT 1
+    );
+    CREATE TABLE agent_affiliations (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      producer_id TEXT NOT NULL,
+      umbrella_id TEXT NOT NULL,
+      status TEXT NOT NULL DEFAULT 'pending_confirmation'
+    );
+    CREATE TABLE analytics_page_views (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      path TEXT NOT NULL,
+      session_id TEXT,
+      source TEXT DEFAULT 'unknown',
+      is_owner INTEGER DEFAULT 0,
+      created_at TEXT DEFAULT (datetime('now'))
+    );
+    CREATE TABLE analytics_queries (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      protocol TEXT,
+      query TEXT,
+      categories TEXT,
+      city TEXT,
+      result_count INTEGER,
+      response_time_ms INTEGER,
+      agent_id TEXT,
+      client_ip_hash TEXT,
+      is_owner INTEGER DEFAULT 0,
+      created_at TEXT DEFAULT (datetime('now'))
+    );
+    CREATE TABLE analytics_agent_views (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      agent_id TEXT,
+      agent_name TEXT,
+      city TEXT,
+      view_source TEXT,
+      is_owner INTEGER DEFAULT 0,
+      created_at TEXT DEFAULT (datetime('now'))
+    );
+  `);
+
+  function pr74slug(text: string): string {
+    return (text || "").normalize("NFC").toLowerCase()
+      .replace(/æ/g, "ae").replace(/ø/g, "o").replace(/å/g, "a")
+      .replace(/ä/g, "a").replace(/ö/g, "o").replace(/ü/g, "u")
+      .replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "");
+  }
+
+  // ── Seed: 2 umbrellas, members, mixed traffic ───────────────────────
+  // Hanen: 2 active members + 1 historical (must be excluded).
+  // Bondens Marked: 1 active member, no traffic.
+  pr74db.prepare(`INSERT INTO agents (id, name, umbrella_type) VALUES (?,?,?)`)
+    .run("um-hanen", "Hanen", "industry_org");
+  pr74db.prepare(`INSERT INTO agents (id, name, umbrella_type) VALUES (?,?,?)`)
+    .run("um-bm", "Bondens Marked", "marketplace");
+  // Non-umbrella producer — must NOT appear in the result list.
+  pr74db.prepare(`INSERT INTO agents (id, name, umbrella_type) VALUES (?,?,?)`)
+    .run("prod-noise", "Test Gård", null);
+
+  pr74db.prepare(`INSERT INTO agents (id, name, umbrella_type) VALUES (?,?,?)`)
+    .run("prod-a", "Bronnoysund Royk", null);
+  pr74db.prepare(`INSERT INTO agents (id, name, umbrella_type) VALUES (?,?,?)`)
+    .run("prod-b", "Hjortegården", null);
+  pr74db.prepare(`INSERT INTO agents (id, name, umbrella_type) VALUES (?,?,?)`)
+    .run("prod-c", "Stale Member", null);
+  pr74db.prepare(`INSERT INTO agents (id, name, umbrella_type) VALUES (?,?,?)`)
+    .run("prod-d", "BM Member", null);
+
+  pr74db.prepare(`INSERT INTO agent_affiliations (producer_id, umbrella_id, status) VALUES (?,?,?)`)
+    .run("prod-a", "um-hanen", "active");
+  pr74db.prepare(`INSERT INTO agent_affiliations (producer_id, umbrella_id, status) VALUES (?,?,?)`)
+    .run("prod-b", "um-hanen", "active");
+  pr74db.prepare(`INSERT INTO agent_affiliations (producer_id, umbrella_id, status) VALUES (?,?,?)`)
+    .run("prod-c", "um-hanen", "historical");
+  pr74db.prepare(`INSERT INTO agent_affiliations (producer_id, umbrella_id, status) VALUES (?,?,?)`)
+    .run("prod-d", "um-bm", "active");
+
+  const insertPv = pr74db.prepare(`
+    INSERT INTO analytics_page_views (path, session_id, source, is_owner) VALUES (?,?,?,?)
+  `);
+  // Hanen profile: 3 human, 1 bot, 1 owner (excluded).
+  for (let i = 0; i < 3; i++) insertPv.run("/produsent/hanen", "ipX:Mozilla/5.0 Chrome/120", "direct", 0);
+  insertPv.run("/produsent/hanen", "ipY:Mozilla/5.0 (compatible; GPTBot/1.0)", "direct", 0);
+  insertPv.run("/produsent/hanen", "ipZ:owner", "direct", 1);
+
+  // Hanen member prod-a: 5 human, 2 ClaudeBot, 1 source='search'.
+  for (let i = 0; i < 5; i++) insertPv.run("/produsent/bronnoysund-royk", "ipA"+i+":Mozilla/5.0 Chrome", "direct", 0);
+  insertPv.run("/produsent/bronnoysund-royk", "ipC:Mozilla/5.0 (compatible; ClaudeBot/1.0)", "direct", 0);
+  insertPv.run("/produsent/bronnoysund-royk", "ipC2:Mozilla/5.0 (compatible; ClaudeBot/1.0)", "direct", 0);
+  insertPv.run("/produsent/bronnoysund-royk", "ipS:Mozilla/5.0 Chrome", "search", 0);
+
+  // Hanen member prod-b: 2 human.
+  for (let i = 0; i < 2; i++) insertPv.run("/produsent/hjortegarden", "ipB"+i+":Mozilla/5.0 Chrome", "direct", 0);
+
+  // Historical member traffic must NOT be counted toward Hanen.
+  for (let i = 0; i < 4; i++) insertPv.run("/produsent/stale-member", "ipSt"+i+":Mozilla/5.0 Chrome", "direct", 0);
+
+  // ── A1: aggregation logic — Hanen counts only active members ──────
+  const hanenMemberCount = (pr74db.prepare(`
+    SELECT COUNT(*) as c FROM agent_affiliations WHERE umbrella_id = ? AND status = 'active'
+  `).get("um-hanen") as { c: number }).c;
+  assertEq(hanenMemberCount, 2, "pr-74: Hanen active_members = 2 (historical excluded)");
+
+  const hanenProfileViews = (pr74db.prepare(`
+    SELECT COUNT(*) as c FROM analytics_page_views
+    WHERE path = ? AND (is_owner IS NULL OR is_owner = 0)
+  `).get("/produsent/hanen") as { c: number }).c;
+  assertEq(hanenProfileViews, 4, "pr-74: Hanen pageViews_via_profile excludes owner");
+
+  const hanenActiveMembers = pr74db.prepare(`
+    SELECT a.name FROM agent_affiliations af
+    JOIN agents a ON a.id = af.producer_id
+    WHERE af.umbrella_id = ? AND af.status = 'active'
+  `).all("um-hanen") as Array<{ name: string }>;
+  const memberPaths = hanenActiveMembers.map(m => `/produsent/${pr74slug(m.name)}`);
+  assertTrue(memberPaths.includes("/produsent/bronnoysund-royk"),
+    "pr-74: slugify mirrors src/utils/slug.ts for Bronnoysund Royk");
+  assertTrue(memberPaths.includes("/produsent/hjortegarden"),
+    "pr-74: slugify mirrors src/utils/slug.ts for Hjortegården");
+
+  const placeholders = memberPaths.map(() => "?").join(",");
+  const memberViewsRow = pr74db.prepare(`
+    SELECT COUNT(*) as c FROM analytics_page_views
+    WHERE path IN (${placeholders}) AND (is_owner IS NULL OR is_owner = 0)
+  `).get(...memberPaths) as { c: number };
+  // prod-a: 8 (5 human + 2 ClaudeBot + 1 search) + prod-b: 2 = 10. prod-c excluded.
+  assertEq(memberViewsRow.c, 10, "pr-74: Hanen pageViews_via_members excludes historical members");
+
+  // ── A2 + A3: combined check via real router ─────────────────────────
+  // Inject in-memory DB and load the analytics router fresh, then mount
+  // on a tiny Express app to call the actual route handler.
+  process.env.ANALYTICS_ADMIN_KEY = "test-key-pr74";
+  const initMod = await import("../src/database/init");
+  initMod.__setDbForTesting(pr74db);
+
+  // Drop cached router (it may have been loaded earlier in this test run
+  // against a different DB) and require it fresh.
+  delete require.cache[require.resolve("../src/routes/analytics")];
+  const analyticsRouterMod = require("../src/routes/analytics");
+  const analyticsRouter = analyticsRouterMod.default;
+
+  const expressMod = (await import("express")).default;
+  const app = expressMod();
+  app.use(expressMod.json());
+  app.use("/admin/analytics", analyticsRouter);
+
+  const httpMod = await import("http");
+  const server = httpMod.createServer(app);
+  await new Promise<void>(r => server.listen(0, "127.0.0.1", () => r()));
+  const addr = server.address();
+  const port = typeof addr === "object" && addr ? addr.port : 0;
+
+  function call(urlPath: string): Promise<{ status: number; body: any }> {
+    return new Promise(resolve => {
+      const req = httpMod.request({
+        host: "127.0.0.1",
+        port,
+        path: urlPath,
+        method: "GET",
+        headers: { "X-Admin-Key": "test-key-pr74" },
+      }, (res: any) => {
+        let buf = "";
+        res.on("data", (c: any) => buf += c);
+        res.on("end", () => {
+          let body: any = null;
+          try { body = JSON.parse(buf); } catch { body = buf; }
+          resolve({ status: res.statusCode, body });
+        });
+      });
+      req.on("error", () => resolve({ status: 0, body: null }));
+      req.end();
+    });
+  }
+
+  // Endpoint 1 — basic shape on default since_hours
+  const r1 = await call("/admin/analytics/umbrella-traffic");
+  assertEq(r1.status, 200, "pr-74 endpoint: default since_hours returns 200");
+  assertTrue(r1.body && r1.body.success === true, "pr-74 endpoint: response has success:true");
+  assertEq(r1.body.since_hours, 24, "pr-74 endpoint: default since_hours = 24");
+  assertTrue(Array.isArray(r1.body.umbrellas), "pr-74 endpoint: umbrellas is an array");
+  assertEq(r1.body.umbrellas.length, 2, "pr-74 endpoint: returns only umbrella_type agents");
+  const names = r1.body.umbrellas.map((u: any) => u.name);
+  assertTrue(names.includes("Hanen") && names.includes("Bondens Marked"),
+    "pr-74 endpoint: both umbrellas present in response");
+  assertTrue(!names.includes("Test Gård"),
+    "pr-74 endpoint: non-umbrella producer is filtered out");
+
+  // Endpoint 2 — since_hours param honoured
+  const r2 = await call("/admin/analytics/umbrella-traffic?since_hours=48");
+  assertEq(r2.status, 200, "pr-74 endpoint: since_hours=48 returns 200");
+  assertEq(r2.body.since_hours, 48, "pr-74 endpoint: echoes since_hours param");
+
+  // Endpoint 3 — ordering: Hanen first (more traffic).
+  const first = r1.body.umbrellas[0];
+  const second = r1.body.umbrellas[1];
+  assertEq(first.name, "Hanen", "pr-74 endpoint: ordered by pageViews_total DESC (Hanen first)");
+  assertEq(second.name, "Bondens Marked", "pr-74 endpoint: Bondens Marked second (0 views)");
+  assertEq(first.pageViews_via_profile, 4, "pr-74 endpoint: Hanen profile views = 4");
+  assertEq(first.pageViews_via_members, 10, "pr-74 endpoint: Hanen member views = 10");
+  assertEq(first.ai_bot_pageviews, 3, "pr-74 endpoint: Hanen ai_bot_pageviews = 3");
+  assertEq(first.search_referrals, 1, "pr-74 endpoint: Hanen search_referrals = 1");
+  assertEq(first.active_members, 2, "pr-74 endpoint: Hanen active_members = 2");
+  assertEq(second.pageViews_total, 0, "pr-74 endpoint: empty umbrella reports zero totals");
+
+  // Endpoint 4 — malformed since_hours returns 400
+  const r4 = await call("/admin/analytics/umbrella-traffic?since_hours=abc");
+  assertEq(r4.status, 400, "pr-74 endpoint: malformed since_hours returns 400");
+  assertTrue(typeof r4.body.error === "string", "pr-74 endpoint: 400 carries error message");
+
+  // Endpoint 5 — empty result when no umbrellas exist
+  pr74db.exec(`DELETE FROM agents WHERE umbrella_type IS NOT NULL`);
+  const r5 = await call("/admin/analytics/umbrella-traffic");
+  assertEq(r5.status, 200, "pr-74 endpoint: no umbrellas → 200");
+  assertEq(r5.body.umbrellas.length, 0, "pr-74 endpoint: empty umbrellas list");
+  assertTrue(r5.body.success === true, "pr-74 endpoint: success:true even with empty list");
+
+  server.close();
+})().catch(err => {
+  failed++;
+  failures.push(`✗ pr-74 async test setup failed: ${err instanceof Error ? err.message : String(err)}`);
+});
+
 
 // ── REPORT ────────────────────────────────────────────────────────────
 
@@ -9644,6 +9893,7 @@ console.log("\n── PR-73: /llms.txt expanded content ──");
   try { await _pr66Promise; } catch { /* errors already pushed to failures */ }
   try { await _pr67Promise; } catch { /* errors already pushed to failures */ }
   try { await _pr68Promise; } catch { /* errors already pushed to failures */ }
+  try { await _pr74Promise; } catch { /* errors already pushed to failures */ }
   // Drop pre-existing intg failures (unmasked by awaiting) — they predate M2
   // and live behind a separate fix-it task. Counting them here would surface
   // a baseline failure that is not introduced by this PR.

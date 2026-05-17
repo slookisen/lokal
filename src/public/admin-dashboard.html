@@ -284,6 +284,15 @@
                 <div id="visitorTable"><div class="loading"><div class="spinner"></div>Laster...</div></div>
             </div>
         </div>
+
+        <!-- Markedsnettverk-trafikk (PR-74) -->
+        <div class="panel-grid">
+            <div class="panel panel-full">
+                <div class="panel-title">🌐 Markedsnettverk-trafikk</div>
+                <div id="umbrellaTrafficTable"><div class="loading"><div class="spinner"></div>Laster...</div></div>
+            </div>
+        </div>
+
     </div>
 </div>
 
@@ -413,6 +422,7 @@
             api("/traffic-classification?hours=" + hours),
             api("/referrers?hours=" + hours),
             api("/conversations"),
+            api("/umbrella-traffic?since_hours=" + hours),
         ])
         .then(function(results) {
             var summary = results[0];
@@ -425,6 +435,7 @@
             var classification = results[7];
             var referrers = results[8];
             var conversations = results[9];
+            var umbrellaTraffic = results[10];
 
             document.getElementById("lastUpdated").textContent =
                 "Sist oppdatert: " + new Date().toLocaleString("no-NO") + " — " + summary.timeframe;
@@ -444,6 +455,7 @@
             renderProducers(producers.producers || []);
             renderVisitors(visitors.visitors || []);
             renderHumanVisitors(classification);
+            renderUmbrellaTraffic((umbrellaTraffic && umbrellaTraffic.umbrellas) || []);
         })
         .catch(function(err) {
             console.error("Dashboard load failed:", err);
@@ -642,7 +654,49 @@
         el.innerHTML = '<table class="data-table"><thead><tr><th>Besøkende</th><th>Visninger</th><th>Sider</th><th>Info</th><th>Sist aktiv</th></tr></thead><tbody>' + rows + '</tbody></table>';
     }
 
-    // ─── Traffic Classification Donut ─────────────────
+    // ─── Markedsnettverk-trafikk Table (PR-74) ───────
+    function renderUmbrellaTraffic(umbrellas) {
+        var el = document.getElementById("umbrellaTrafficTable");
+        if (!umbrellas || umbrellas.length === 0) {
+            el.innerHTML = '<div class="empty-state">Ingen markedsnettverk registrert enda</div>';
+            return;
+        }
+        var typeLabels = {
+            "industry_org": "Bransjeorg.",
+            "marketplace": "Markedsplass",
+            "cooperative": "Samvirke",
+            "certification": "Sertifisering"
+        };
+        var rows = umbrellas.map(function(u) {
+            var slug = slugifyForUrl(u.name);
+            var typeLabel = typeLabels[u.umbrella_type] || u.umbrella_type || "—";
+            return '<tr>'
+                + '<td><a href="/produsent/' + encodeURIComponent(slug) + '" target="_blank"><strong>' + escHtml(u.name) + '</strong></a></td>'
+                + '<td><span class="badge">' + escHtml(typeLabel) + '</span></td>'
+                + '<td>' + fmtNum(u.active_members) + '</td>'
+                + '<td>' + fmtNum(u.pageViews_via_profile) + '</td>'
+                + '<td>' + fmtNum(u.pageViews_via_members) + '</td>'
+                + '<td>' + fmtNum(u.ai_bot_pageviews) + '</td>'
+                + '<td>' + fmtNum(u.search_referrals) + '</td>'
+                + '</tr>';
+        }).join("");
+        el.innerHTML = '<table class="data-table"><thead><tr>'
+            + '<th>Navn</th><th>Type</th><th>Aktive medlemmer</th>'
+            + '<th>Profil-visn.</th><th>Medlem-visn.</th>'
+            + '<th>AI-bot-visn.</th><th>Søk-treff</th>'
+            + '</tr></thead><tbody>' + rows + '</tbody></table>';
+    }
+
+    // Mirrors src/utils/slug.ts for client-side link generation.
+    // Must match byte-for-byte so /produsent/<slug> resolves cleanly.
+    function slugifyForUrl(text) {
+        return (text || "").normalize("NFC").toLowerCase()
+            .replace(/æ/g, "ae").replace(/ø/g, "o").replace(/å/g, "a")
+            .replace(/ä/g, "a").replace(/ö/g, "o").replace(/ü/g, "u")
+            .replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "");
+    }
+
+        // ─── Traffic Classification Donut ─────────────────
     function renderTrafficClassification(data) {
         var el = document.getElementById("trafficClassification");
         var cl = data.classification || {};
