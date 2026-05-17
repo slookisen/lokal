@@ -34,20 +34,102 @@ const BASE_URL = process.env.BASE_URL || "https://rettfrabonden.com";
 router.get("/llms.txt", (_req: Request, res: Response) => {
   try {
     const agents = marketplaceRegistry.getActiveAgents();
-    const stats = marketplaceRegistry.getStats();
 
-    // Count categories and cities
+    // Count categories and cities (city counts also drive the per-city
+    // produsent-page links and the category x city matrix examples below).
     const cities = new Map<string, number>();
     const categories = new Map<string, number>();
+    // citySamples: city -> first 1-2 producer slugs (used for matrix examples)
+    const citySamples = new Map<string, string[]>();
     for (const a of agents) {
       const city = (a as any).city || a.location?.city;
-      if (city) cities.set(city, (cities.get(city) || 0) + 1);
+      if (city) {
+        cities.set(city, (cities.get(city) || 0) + 1);
+        const samples = citySamples.get(city) || [];
+        if (samples.length < 2) {
+          samples.push(slugify(a.name));
+          citySamples.set(city, samples);
+        }
+      }
       const cats = Array.isArray(a.categories) ? a.categories : (typeof a.categories === "string" ? JSON.parse(a.categories || "[]") : []);
       for (const c of cats) categories.set(c, (categories.get(c) || 0) + 1);
     }
 
     const topCities = [...cities.entries()].sort((a, b) => b[1] - a[1]).slice(0, 15);
     const topCats = [...categories.entries()].sort((a, b) => b[1] - a[1]).slice(0, 15);
+
+    // ── 30 Norwegian cities w/ coordinates ────────────────────────
+    // Lifted from custom-gpt-instructions.md (14 cities) and extended
+    // to the 30 largest population centers + tourism hubs. Coordinates
+    // are city-center lat/lng to ~4 decimals (~10 m precision); good
+    // enough for radius search seed points used by AI agents.
+    const cityCoords: Array<[string, number, number]> = [
+      ["Oslo", 59.9139, 10.7522],
+      ["Bergen", 60.3913, 5.3221],
+      ["Trondheim", 63.4305, 10.3951],
+      ["Stavanger", 58.9700, 5.7331],
+      ["Kristiansand", 58.1599, 8.0182],
+      ["Tromsø", 69.6492, 18.9553],
+      ["Drammen", 59.7441, 10.2045],
+      ["Fredrikstad", 59.2181, 10.9298],
+      ["Bodø", 67.2804, 14.4049],
+      ["Tønsberg", 59.2675, 10.4076],
+      ["Sarpsborg", 59.2839, 11.1098],
+      ["Ålesund", 62.4722, 6.1495],
+      ["Hamar", 60.7945, 11.0680],
+      ["Lillestrøm", 59.9560, 11.0493],
+      ["Sandnes", 58.8517, 5.7361],
+      ["Skien", 59.2096, 9.6090],
+      ["Porsgrunn", 59.1405, 9.6561],
+      ["Arendal", 58.4612, 8.7724],
+      ["Haugesund", 59.4138, 5.2680],
+      ["Moss", 59.4359, 10.6605],
+      ["Larvik", 59.0537, 10.0353],
+      ["Sandefjord", 59.1326, 10.2167],
+      ["Halden", 59.1230, 11.3875],
+      ["Mo i Rana", 66.3128, 14.1428],
+      ["Molde", 62.7372, 7.1607],
+      ["Harstad", 68.7984, 16.5413],
+      ["Lillehammer", 61.1153, 10.4662],
+      ["Gjøvik", 60.7957, 10.6916],
+      ["Kongsberg", 59.6650, 9.6469],
+      ["Narvik", 68.4385, 17.4272],
+    ];
+
+    // ── Category x city matrix examples ───────────────────────────
+    // Pick top 3 categories x top 3 covered cities and emit a small
+    // matrix of "<Category> in <City>: <produsent-link>" lines. Helps
+    // LLMs answer "organic vegetables in Bergen" style queries with
+    // a real URL rather than hallucinating a slug.
+    const matrixCats = topCats.slice(0, 4).map(([c]) => c);
+    const matrixCities = topCities.slice(0, 4).map(([c]) => c);
+    const matrixLines: string[] = [];
+    for (const cat of matrixCats) {
+      for (const city of matrixCities) {
+        const samples = citySamples.get(city) || [];
+        if (samples.length === 0) continue;
+        const links = samples.map(s => `${BASE_URL}/produsent/${s}`).join(", ");
+        matrixLines.push(`- ${cat} i ${city}: ${links}`);
+      }
+    }
+
+    // ── Sesong-info (Norwegian seasonal produce by month) ─────────
+    // Source: Bondelaget / Matprat seasonality calendars. This helps
+    // an LLM answer "hva er i sesong nå?" without guessing.
+    const seasonRows = [
+      ["Januar", "lagringspoteter, gulrot, kålrot, rødbeter, løk, eple"],
+      ["Februar", "lagringsgrønnsaker, eple, fisk (torsk, sei)"],
+      ["Mars", "rabarbra (tidlig), purre, eple"],
+      ["April", "asparges (tidlig), grønnkål, ramsløk, rabarbra"],
+      ["Mai", "asparges, rabarbra, ramsløk, salat, vårløk"],
+      ["Juni", "jordbær, blomkål, brokkoli, salat, agurk, urter"],
+      ["Juli", "bringebær, kirsebær, jordbær, erter, blomkål, ny potet"],
+      ["August", "blåbær, plommer, mais, tomat, paprika, squash, sopp"],
+      ["September", "epler, pærer, kantarell, gresskar, kålrot, løk"],
+      ["Oktober", "epler, kålrot, gulrot, rødbeter, vilt, sopp"],
+      ["November", "lagringsgrønnsaker, vilt, sjømat, eple"],
+      ["Desember", "lagringsgrønnsaker, lutefisk, pinnekjøtt, juleribbe"],
+    ];
 
     res.header("Content-Type", "text/plain; charset=utf-8");
     res.header("Cache-Control", "public, max-age=3600");
@@ -76,7 +158,70 @@ ${topCities.map(([city, count]) => `- [${city} (${count} produsenter)](${BASE_UR
 
 ${topCats.map(([cat, count]) => `- ${cat} (${count} produsenter)`).join("\n")}
 
-## For AI-agenter
+## Kategori x by — eksempler
+
+Disse mønstrene viser hvordan AI-agenter kan finne produsenter direkte uten å gjette URLer:
+
+${matrixLines.length ? matrixLines.join("\n") : "- (ingen matrise-data tilgjengelig ennå)"}
+
+For andre kombinasjoner, bruk søke-API-et:
+
+- Søk by + kategori: \`${BASE_URL}/api/marketplace/search?q=<kategori>+i+<by>\`
+- Søk produkter: \`${BASE_URL}/api/marketplace/search?q=<produktnavn>\`
+- Søk med koordinater: \`${BASE_URL}/api/marketplace/search?q=<søk>&lat=<lat>&lng=<lng>&radius=30\`
+
+## Norske byer med koordinater
+
+For radius-søk eller geografisk filtrering, bruk disse koordinatene:
+
+| By | Breddegrad | Lengdegrad |
+|---|---|---|
+${cityCoords.map(([n, lat, lng]) => `| ${n} | ${lat} | ${lng} |`).join("\n")}
+
+Standardradius for søk: 30 km. Øk til 50 eller 100 km i grisgrendte strøk.
+
+## Sesong-info (norsk lokal mat)
+
+Hva er i sesong når? Bruk denne tabellen til å gi sesongriktige anbefalinger:
+
+| Måned | I sesong |
+|---|---|
+${seasonRows.map(([m, p]) => `| ${m} | ${p} |`).join("\n")}
+
+## Paraply-organisasjoner (umbrellas)
+
+Mange norske produsenter er medlem av en eller flere bransjeparaplyer. Disse er nyttige
+filtre når en AI-agent vil anbefale en bestemt kvalitetsstandard eller sertifisering:
+
+- **Hanen** — bransjeorganisasjonen for bygdenæringer (gårdsturisme, gårdsmat, opplevelser).
+  Hanen-medlemmer driver alt fra gårdshotell til serveringssteder med egen råvareproduksjon.
+- **Bondens Marked** — nasjonalt nettverk av bondensmarkeder. Produsentene selger direkte
+  til forbruker på faste markedsdager, og må selv produsere det de selger.
+- **Debio** — den offisielle kontrollorganisasjonen for økologisk mat i Norge (Ø-merket).
+  Debio-godkjente produsenter er sertifisert økologiske etter EU/EØS-regelverket.
+- **Norsk Gardsmat** — kvalitetsmerke for tradisjonell norsk gårdsmat. Strengere krav til
+  norske råvarer og håndverksmessig produksjon enn økologi-sertifisering alene.
+
+Hver produsentprofil viser hvilke paraplyer de er medlem av. Se også:
+- [Paraply-API](${BASE_URL}/api/marketplace/umbrellas): JSON-liste over alle paraplyer
+- [Produsenter per paraply](${BASE_URL}/api/marketplace/umbrellas/<slug>/members): medlemmer
+
+## For AI-agenter (A2A-protokollen)
+
+Rett fra Bonden er bygget på Agent-to-Agent-protokollen (A2A). En AI-agent kan:
+
+1. Lese **agent-kortet** på \`${BASE_URL}/.well-known/agent-card.json\` for å oppdage
+   tilgjengelige skills (\`lokal_search\`, \`lokal_discover\`, \`lokal_info\`,
+   \`lokal_get_umbrella_members\`, \`lokal_get_producer_affiliations\`, \`lokal_stats\`).
+2. Bruke **MCP-endepunktet** på \`${BASE_URL}/mcp\` for direkte verktøyskall via JSON-RPC.
+3. Lese **OpenAPI-spec** på \`${BASE_URL}/openapi.json\` for tradisjonell REST-tilgang.
+
+Eksempel — finn produsenter i Oslo som selger økologisk:
+
+\`\`\`
+POST ${BASE_URL}/mcp
+{"method": "lokal_search", "params": {"q": "økologisk", "lat": 59.9139, "lng": 10.7522}}
+\`\`\`
 
 - [A2A Agent Card (JSON)](${BASE_URL}/.well-known/agent-card.json): Maskinlesbar beskrivelse av plattformen
 - [MCP Endpoint](${BASE_URL}/mcp): Model Context Protocol for ChatGPT, Claude, Cursor

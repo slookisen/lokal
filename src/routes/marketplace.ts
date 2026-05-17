@@ -10,6 +10,7 @@ import { emailService } from "../services/email-service";
 import { trustScoreService } from "../services/trust-score-service";
 import { conversationService } from "../services/conversation-service";
 import { slugify } from "../utils/slug";
+import { addUtmParams } from "../utils/url-utm";
 import { isBlocked, add as blocklistAdd, list as blocklistList, remove as blocklistRemove } from "../services/blocklist-service";
 
 // ─── Marketplace Routes ───────────────────────────────────────
@@ -119,7 +120,7 @@ function buildContactBlock(agentId: string): {
     postalCode: k.postalCode,
     phone: k.phone,
     email: k.email,
-    website: k.website,
+    website: k.website ? addUtmParams(k.website) : undefined,
     openingHours: k.openingHours,
     paymentMethods: k.paymentMethods,
     deliveryOptions: k.deliveryOptions,
@@ -569,7 +570,7 @@ router.get("/agents/:id/card", (req: Request, res: Response) => {
     contact.country = "Norway";
     if (k.phone) contact.phone = k.phone;
     if (k.email) contact.email = k.email;
-    if (k.website) contact.website = k.website;
+    if (k.website) contact.website = addUtmParams(k.website);
     if (Object.keys(contact).length > 1) card.contact = contact;
 
     // Products — the core of what this producer offers
@@ -636,7 +637,7 @@ router.get("/agents/:id/card", (req: Request, res: Response) => {
       googleMaps: `https://www.google.com/maps/search/${encodeURIComponent(mapsParts.join(", "))}`,
       vcard: `${getBaseUrl(req)}/api/marketplace/agents/${agentId}/vcard`,
     };
-    if (k.website) card.links.website = k.website;
+    if (k.website) card.links.website = addUtmParams(k.website);
 
     // ─── Phase 5.11 A2.5: affiliations skill (producer + umbrella) ──
     // Adds machine-readable umbrella memberships to the A2A agent-card so
