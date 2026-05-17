@@ -28,7 +28,24 @@
 
 import { getDb } from "../database/init";
 import { fetchDebioOperators, TracesOperator } from "./traces-client";
+import { fetchFinnokoCompanies, FinnokoCompany } from "./debio-finnoko-client";
 import { findOrgnumberByName, normaliseName, BrregHit } from "./brreg-client";
+
+// ─── PR-70: data-source selector ─────────────────────────────────────
+//
+// The cross-check has TWO upstream sources:
+//   - "finnoko" (PRIMARY, PR-70): pulls Debio's own ACM directory at
+//     https://finnoko.debio.no/api/acm/companies — ~82 Norwegian
+//     producers, single round-trip, no pagination. By construction
+//     every record is Debio-certified.
+//   - "traces" (FALLBACK, PR-66): pulls EU TRACES NT and filters
+//     client-side to competentAuthority.code == NO-ØKO-01. Empirical
+//     record yield is ~0 because the live portal rejected the POST
+//     filter shape. Kept as fallback so the system gracefully
+//     degrades if finnoko goes down.
+//   - "auto" (DEFAULT): try finnoko first, fall back to traces only
+//     if the finnoko fetch raises.
+export type DebioSource = "finnoko" | "traces" | "auto";
 
 // ─── Minimal Dice coefficient (inline until PR-62 C.2 lands) ─────────
 // TODO: consolidate with name-matcher.ts once PR-62 merges. The C.2 PR
@@ -66,9 +83,20 @@ const FUZZY_NAME_THRESHOLD = 0.85;
 export const DEFAULT_SINCE_ISO = "2026-01-01";
 
 export type CrossCheckResult = {
+  // PR-70: which upstream source actually delivered the operator
+  // records used in this run. "finnoko" | "traces" | "none" (no data
+  // returned by either source).
+  source_used: DebioSource | "none";
+  // PR-70: count of Debio-certified records pulled from finnoko.debio.no
+  finnoko_fetched: number;
+  // PR-70: count of finnoko records that passed our shape filter
+  // (display_name + partner_sid required). Same number as
+  // finnoko_fetched in practice — kept for response symmetry with
+  // the TRACES traces_fetched/traces_filtered pair.
+  finnoko_filtered: number;
   traces_fetched: number;        // count of NO-ØKO-01 records pulled from TRACES
   traces_filtered: number;       // same as traces_fetched (kept for response symmetry)
-  brreg_resolved: number;        // TRACES ops resolved to an orgnumber via Brreg
+  brreg_resolved: number;        // ops resolved to an orgnumber via Brreg
   agents_matched: number;        // matched to one of our existing producer agents
   affiliations_upserted: number; // rows inserted OR updated
   unmatched_persisted: number;   // rows landed in debio_unmatched_operators
@@ -92,6 +120,14 @@ export type CrossCheckOptions = {
   startTracesPage?: number;
   /** PR-65: max TRACES pages this call may fetch. Default 1200. */
   maxTracesPages?: number;
+  /**
+   * PR-70: choose the upstream Debio operator list.
+   *   "finnoko" — query finnoko.debio.no/api/acm/companies (primary)
+   *   "traces"  — query EU TRACES NT (legacy fallback)
+   *   "auto"    — try finnoko first, fall back to TRACES on error
+   * Default: "auto".
+   */
+  source?: DebioSource;
 };
 
 // ─── Helper: find the Debio umbrella agent's id ──────────────────────
@@ -220,12 +256,249 @@ function upsertUnmatchedOperator(
   );
 }
 
-// ─── Main entry: orchestrate TRACES → Brreg → our agents ─────────────
+// ─── PR-70: shared per-operator matching shape ──────────────────────
+//
+// Both the finnoko and TRACES sources are normalised into this shape
+// before the Brreg→agent matching loop. Keeps the matching logic
+// identical regardless of source.
+type NormalisedOperator = {
+  operator_name: string;
+  postal_code: string | null;
+  operator_identifier: string | null;
+  /** Source-tagged raw record, used to enrich evidence_json. */
+  source: "finnoko" | "traces";
+  raw: TracesOperator | FinnokoCompany;
+};
+
+// ─── PR-70: per-operator matcher (Brreg → agents → affiliation) ──────
+//
+// Extracted from the prior inline loop in runDebioCrossCheck so the
+// finnoko and traces source paths can share it. Pure side-effects:
+//   - mutates `result` counters and errors
+//   - writes to agent_affiliations and debio_unmatched_operators
+async function matchAndUpsertOne(
+  db: ReturnType<typeof getDb>,
+  op: NormalisedOperator,
+  debioUmbrellaId: string,
+  fetchImpl: typeof fetch | undefined,
+  result: CrossCheckResult,
+): Promise<void> {
+  // Step 1: Brreg reverse lookup.
+  let brregHit: BrregHit | null = null;
+  try {
+    brregHit = await findOrgnumberByName(op.operator_name, op.postal_code, fetchImpl);
+  } catch (e) {
+    result.errors.push(
+      `brreg lookup failed for "${op.operator_name}": ${e instanceof Error ? e.message : String(e)}`,
+    );
+  }
+  if (brregHit) result.brreg_resolved++;
+
+  // Step 2: agent lookup.
+  let matchedAgentId: string | null = null;
+  let matchMethod: "orgnumber" | "name_fuzzy" = "orgnumber";
+  let matchScore = brregHit?.confidence ?? 0;
+
+  if (brregHit) {
+    matchedAgentId = findAgentByOrgnumber(db, brregHit.orgnumber);
+  }
+  if (!matchedAgentId) {
+    const fuzz = fuzzyMatchAgent(db, op.operator_name);
+    if (fuzz) {
+      matchedAgentId = fuzz.agent_id;
+      matchMethod = "name_fuzzy";
+      matchScore = fuzz.score;
+    }
+  }
+
+  if (!matchedAgentId) {
+    try {
+      // Reuse the same `debio_unmatched_operators` table — the row
+      // shape (operator_name, postal_code, operator_identifier) is
+      // source-agnostic. The finnoko `partner_sid` is stringified
+      // into operator_identifier for stable cross-source dedup.
+      upsertUnmatchedOperator(
+        db,
+        {
+          operator_name: op.operator_name,
+          postal_code: op.postal_code,
+          operator_identifier: op.operator_identifier,
+          country: null,
+          city: null,
+          status: null,
+          issued_on: null,
+          expires_on: null,
+        },
+        brregHit?.confidence ?? null,
+      );
+      result.unmatched_persisted++;
+    } catch (e) {
+      result.errors.push(
+        `unmatched insert failed for "${op.operator_name}": ${e instanceof Error ? e.message : String(e)}`,
+      );
+    }
+    return;
+  }
+
+  result.agents_matched++;
+
+  // Step 3: upsert affiliation. Evidence JSON is source-tagged so
+  // a downstream reviewer can see whether the match came from
+  // finnoko or TRACES.
+  try {
+    const evidence: Record<string, unknown> = {
+      source: op.source,
+      operator_id: op.operator_identifier,
+      operator_name: op.operator_name,
+      postal_code: op.postal_code,
+      brreg_orgnumber: brregHit?.orgnumber ?? null,
+      brreg_confidence: brregHit?.confidence ?? null,
+      agent_match_method: matchMethod,
+      match_score: matchScore,
+      scraped_at: new Date().toISOString(),
+    };
+    // Keep TRACES-shaped keys around for backward-compat with PR-63
+    // evidence-readers (the cross-check has been in prod long enough
+    // that some consumers may grep for these specific keys).
+    if (op.source === "traces") {
+      evidence.traces_operator_id = op.operator_identifier;
+      evidence.traces_operator_name = op.operator_name;
+      evidence.traces_postal_code = op.postal_code;
+    } else {
+      evidence.finnoko_partner_sid = op.operator_identifier;
+      evidence.finnoko_display_name = op.operator_name;
+    }
+    const decision = upsertAffiliation(db, matchedAgentId, debioUmbrellaId, evidence);
+    if (decision === "inserted" || decision === "updated") {
+      result.affiliations_upserted++;
+    }
+  } catch (e) {
+    result.errors.push(
+      `affiliation upsert failed for agent ${matchedAgentId}: ${e instanceof Error ? e.message : String(e)}`,
+    );
+  }
+}
+
+// ─── PR-70: finnoko-source cross-check helper ────────────────────────
+//
+// Fetches the finnoko company list (single HTTP GET, ~82 records) and
+// runs the shared matcher. Returns the count of records actually
+// processed so the caller (runDebioCrossCheck) can update
+// result.finnoko_fetched/filtered + decide whether to attempt a
+// TRACES fallback.
+//
+// Exported so the admin route can call it directly when source=finnoko
+// is forced; "auto" mode also goes through here.
+export async function crossCheckViaFinnoko(
+  db: ReturnType<typeof getDb>,
+  debioUmbrellaId: string,
+  result: CrossCheckResult,
+  opts: CrossCheckOptions = {},
+): Promise<{ fetched: number; processed: number }> {
+  let companies: FinnokoCompany[];
+  try {
+    companies = await fetchFinnokoCompanies({ fetchImpl: opts.fetchImpl });
+  } catch (e) {
+    result.errors.push(
+      `fetchFinnokoCompanies failed: ${e instanceof Error ? e.message : String(e)}`,
+    );
+    throw e;
+  }
+
+  result.finnoko_fetched = companies.length;
+  result.finnoko_filtered = companies.length;
+
+  const cap = opts.maxFiltered && opts.maxFiltered > 0
+    ? Math.min(opts.maxFiltered, companies.length)
+    : companies.length;
+
+  for (let i = 0; i < cap; i++) {
+    const c = companies[i];
+    await matchAndUpsertOne(
+      db,
+      {
+        operator_name: c.display_name,
+        // finnoko has no postal-code field — Brreg lookup falls back
+        // to name-only mode, which still works (just lower confidence
+        // when multiple Brreg hits exist).
+        postal_code: null,
+        operator_identifier: String(c.partner_sid),
+        source: "finnoko",
+        raw: c,
+      },
+      debioUmbrellaId,
+      opts.fetchImpl,
+      result,
+    );
+  }
+
+  return { fetched: companies.length, processed: cap };
+}
+
+// ─── PR-70: TRACES-source cross-check helper (extracted) ─────────────
+//
+// Same body as the legacy pre-PR-70 inline loop, just refactored into
+// a callable so source-selection can dispatch into it.
+export async function crossCheckViaTraces(
+  db: ReturnType<typeof getDb>,
+  debioUmbrellaId: string,
+  result: CrossCheckResult,
+  opts: CrossCheckOptions = {},
+  startTracesPage: number = 0,
+  maxTracesPages: number = 1200,
+): Promise<void> {
+  const since = opts.since ?? DEFAULT_SINCE_ISO;
+  let operators: TracesOperator[];
+  try {
+    operators = await fetchDebioOperators({
+      since,
+      fetchImpl: opts.fetchImpl,
+      delayMs: opts.delayMs,
+      maxFiltered: opts.maxFiltered,
+      startTracesPage,
+      maxTracesPages,
+    });
+  } catch (e) {
+    result.errors.push(
+      `fetchDebioOperators failed: ${e instanceof Error ? e.message : String(e)}. ` +
+      `Tip: TRACES pulls can exceed Fly's 120s proxy timeout — re-run with a tighter ?since=`,
+    );
+    throw e;
+  }
+  result.traces_fetched = operators.length;
+  result.traces_filtered = operators.length;
+
+  for (const op of operators) {
+    await matchAndUpsertOne(
+      db,
+      {
+        operator_name: op.operator_name,
+        postal_code: op.postal_code,
+        operator_identifier: op.operator_identifier,
+        source: "traces",
+        raw: op,
+      },
+      debioUmbrellaId,
+      opts.fetchImpl,
+      result,
+    );
+  }
+}
+
+// ─── Main entry: orchestrate finnoko / TRACES → Brreg → our agents ───
+//
+// PR-70: source selection lives here.
+//   - opts.source === "finnoko"  → finnoko only; do NOT fall back.
+//   - opts.source === "traces"   → TRACES only; do NOT call finnoko.
+//   - opts.source === "auto" (default) → try finnoko first, fall
+//     back to TRACES only if the finnoko call threw.
 export async function runDebioCrossCheck(
   opts: CrossCheckOptions = {},
 ): Promise<CrossCheckResult> {
   const since = opts.since ?? DEFAULT_SINCE_ISO;
   const t0 = Date.now();
+  const source: DebioSource = opts.source ?? "auto";
+
   // PR-65: compute the inclusive page window we'll report back, so
   // even if the run fails early the caller knows which slice was
   // attempted. Defaults match the prior global-sweep behaviour.
@@ -241,6 +514,9 @@ export async function runDebioCrossCheck(
   );
 
   const result: CrossCheckResult = {
+    source_used: "none",
+    finnoko_fetched: 0,
+    finnoko_filtered: 0,
     traces_fetched: 0,
     traces_filtered: 0,
     brreg_resolved: 0,
@@ -267,89 +543,39 @@ export async function runDebioCrossCheck(
     return result;
   }
 
-  let operators: TracesOperator[];
-  try {
-    operators = await fetchDebioOperators({
-      since,
-      fetchImpl: opts.fetchImpl,
-      delayMs: opts.delayMs,
-      maxFiltered: opts.maxFiltered,
-      startTracesPage,
-      maxTracesPages,
-    });
-  } catch (e) {
-    result.errors.push(
-      `fetchDebioOperators failed: ${e instanceof Error ? e.message : String(e)}. ` +
-      `Tip: TRACES pulls can exceed Fly's 120s proxy timeout — re-run with a tighter ?since=`,
-    );
-    result.duration_ms = Date.now() - t0;
-    return result;
-  }
-  result.traces_fetched = operators.length;
-  result.traces_filtered = operators.length;
-
-  for (const op of operators) {
-    // Step 1: Brreg reverse lookup.
-    let brregHit: BrregHit | null = null;
+  // ─── Source dispatch ────────────────────────────────────────────
+  if (source === "finnoko") {
     try {
-      brregHit = await findOrgnumberByName(op.operator_name, op.postal_code, opts.fetchImpl);
-    } catch (e) {
-      result.errors.push(
-        `brreg lookup failed for "${op.operator_name}": ${e instanceof Error ? e.message : String(e)}`,
-      );
+      await crossCheckViaFinnoko(db, debioUmbrellaId, result, opts);
+      result.source_used = "finnoko";
+    } catch {
+      // crossCheckViaFinnoko already pushed the error onto result.errors.
+      result.source_used = "none";
     }
-    if (brregHit) result.brreg_resolved++;
-
-    // Step 2: agent lookup.
-    let matchedAgentId: string | null = null;
-    let matchMethod: "orgnumber" | "name_fuzzy" = "orgnumber";
-    let matchScore = brregHit?.confidence ?? 0;
-
-    if (brregHit) {
-      matchedAgentId = findAgentByOrgnumber(db, brregHit.orgnumber);
+  } else if (source === "traces") {
+    try {
+      await crossCheckViaTraces(db, debioUmbrellaId, result, opts, startTracesPage, maxTracesPages);
+      result.source_used = "traces";
+    } catch {
+      result.source_used = "none";
     }
-    if (!matchedAgentId) {
-      const fuzz = fuzzyMatchAgent(db, op.operator_name);
-      if (fuzz) {
-        matchedAgentId = fuzz.agent_id;
-        matchMethod = "name_fuzzy";
-        matchScore = fuzz.score;
-      }
+  } else {
+    // "auto" — try finnoko first; on thrown error fall back to TRACES.
+    let finnokoOk = false;
+    try {
+      await crossCheckViaFinnoko(db, debioUmbrellaId, result, opts);
+      finnokoOk = true;
+      result.source_used = "finnoko";
+    } catch {
+      // pushed error already; will attempt TRACES below.
     }
-
-    if (!matchedAgentId) {
+    if (!finnokoOk) {
       try {
-        upsertUnmatchedOperator(db, op, brregHit?.confidence ?? null);
-        result.unmatched_persisted++;
-      } catch (e) {
-        result.errors.push(
-          `unmatched insert failed for "${op.operator_name}": ${e instanceof Error ? e.message : String(e)}`,
-        );
+        await crossCheckViaTraces(db, debioUmbrellaId, result, opts, startTracesPage, maxTracesPages);
+        result.source_used = "traces";
+      } catch {
+        result.source_used = "none";
       }
-      continue;
-    }
-
-    result.agents_matched++;
-
-    // Step 3: upsert affiliation.
-    try {
-      const decision = upsertAffiliation(db, matchedAgentId, debioUmbrellaId, {
-        traces_operator_id: op.operator_identifier,
-        traces_operator_name: op.operator_name,
-        traces_postal_code: op.postal_code,
-        brreg_orgnumber: brregHit?.orgnumber ?? null,
-        brreg_confidence: brregHit?.confidence ?? null,
-        agent_match_method: matchMethod,
-        match_score: matchScore,
-        scraped_at: new Date().toISOString(),
-      });
-      if (decision === "inserted" || decision === "updated") {
-        result.affiliations_upserted++;
-      }
-    } catch (e) {
-      result.errors.push(
-        `affiliation upsert failed for agent ${matchedAgentId}: ${e instanceof Error ? e.message : String(e)}`,
-      );
     }
   }
 
