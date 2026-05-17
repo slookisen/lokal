@@ -10137,6 +10137,116 @@ const _pr76Promise: Promise<void> = new Promise<void>(r => { _pr76Resolve = r; }
   });
 
 
+// ─── PR-78: Storby-bydeler in MAJOR_CITIES (Oppsal disambiguation fix) ──
+// Pure data-extension test. Validates that the hardcoded geocoder returns
+// the *Oslo* (not Lier) coordinates for "Oppsal" and similar major-city
+// neighborhoods. Same pattern as PR-75: hardcoded cache-hits don't touch
+// the DB or Kartverket, so this is sync-safe and DB-race-free.
+console.log("\n── PR-78: Storby-bydeler (Oppsal disambiguation) ──");
+let _pr78Resolve: () => void = () => {};
+const _pr78Promise: Promise<void> = new Promise<void>(r => { _pr78Resolve = r; });
+(async () => {
+  const { geocodingService } = require("../src/services/geocoding-service");
+
+  async function expectHardcoded(name: string, expLat: number, expLng: number, label: string) {
+    const r = await geocodingService.geocode(name);
+    assertTrue(r !== null, `pr78: ${label} (${name}) → result is non-null`);
+    if (!r) return;
+    assertEq(r.source, "hardcoded", `pr78: ${label} (${name}) → source=hardcoded`);
+    assertTrue(
+      Math.abs(r.lat - expLat) < 0.02 && Math.abs(r.lng - expLng) < 0.02,
+      `pr78: ${label} (${name}) → coords near (${expLat}, ${expLng}); got (${r.lat}, ${r.lng})`
+    );
+  }
+
+  // ── CRITICAL: Oppsal must resolve to Oslo-east (~59.886, ~10.879),
+  //    NOT to Oppsal in Lier (~59.847, ~10.267). This is the bug PR-78
+  //    fixes — Kartverket returned the wrong "Oppsal" by default.
+  {
+    const r = await geocodingService.geocode("Oppsal");
+    assertTrue(!!r, "pr78: Oppsal resolves (non-null)");
+    if (r) {
+      assertEq(r.source, "hardcoded", "pr78: Oppsal source=hardcoded (bypasses Kartverket)");
+      assertTrue(
+        Math.abs(r.lat - 59.886) < 0.01,
+        `pr78: CRITICAL — Oppsal lat ≈ 59.886 (Oslo, NOT Lier 59.847); got ${r.lat}`
+      );
+      assertTrue(
+        Math.abs(r.lng - 10.879) < 0.01,
+        `pr78: CRITICAL — Oppsal lng ≈ 10.879 (Oslo, NOT Lier 10.267); got ${r.lng}`
+      );
+      assertTrue(
+        Math.abs(r.lat - 59.847) > 0.03 || Math.abs(r.lng - 10.267) > 0.05,
+        `pr78: CRITICAL — Oppsal must NOT return Lier coords (59.847, 10.267); got (${r.lat}, ${r.lng})`
+      );
+      assertTrue(
+        r.radiusKm <= 10,
+        `pr78: Oppsal radius ≤ 10 km (neighborhood-scale); got ${r.radiusKm}`
+      );
+    }
+  }
+
+  // ── 5 Oslo bydeler ──
+  await expectHardcoded("Oppsal",       59.886, 10.879, "Oslo bydel (CRITICAL)");
+  await expectHardcoded("Grünerløkka",  59.923, 10.760, "Oslo bydel");
+  await expectHardcoded("Frogner",      59.924, 10.706, "Oslo bydel");
+  await expectHardcoded("Nydalen",      59.948, 10.762, "Oslo bydel");
+  await expectHardcoded("Holmlia",      59.838, 10.799, "Oslo bydel");
+
+  // ── 3 Bergen bydeler ──
+  await expectHardcoded("Fyllingsdalen", 60.358, 5.265, "Bergen bydel");
+  await expectHardcoded("Sandviken",     60.412, 5.314, "Bergen bydel");
+  await expectHardcoded("Åsane",         60.460, 5.327, "Bergen bydel");
+
+  // ── 2 Trondheim bydeler ──
+  await expectHardcoded("Sluppen",       63.398, 10.391, "Trondheim bydel");
+  await expectHardcoded("Heimdal",       63.355, 10.341, "Trondheim bydel");
+
+  // ── 2 Stavanger bydeler ──
+  await expectHardcoded("Madla",         58.953, 5.671, "Stavanger bydel");
+  await expectHardcoded("Storhaug",      58.972, 5.751, "Stavanger bydel");
+
+  // ── 3 ASCII-aliaser ──
+  {
+    const a = await geocodingService.geocode("Bøler");
+    const b = await geocodingService.geocode("boler");
+    assertTrue(!!a && !!b && a.lat === b.lat && a.lng === b.lng,
+      "pr78: Bøler/boler ASCII-alias resolves to same coords");
+  }
+  {
+    const a = await geocodingService.geocode("Åsane");
+    const b = await geocodingService.geocode("asane");
+    assertTrue(!!a && !!b && a.lat === b.lat && a.lng === b.lng,
+      "pr78: Åsane/asane ASCII-alias resolves to same coords");
+  }
+  {
+    const a = await geocodingService.geocode("Hundvåg");
+    const b = await geocodingService.geocode("hundvag");
+    assertTrue(!!a && !!b && a.lat === b.lat && a.lng === b.lng,
+      "pr78: Hundvåg/hundvag ASCII-alias resolves to same coords");
+  }
+
+  // ── Sanity: MAJOR_CITIES has expanded substantially and the Oppsal
+  //    entry is present and Oslo-side (not Lier-side). ──
+  {
+    const fs78 = require("fs") as typeof import("fs");
+    const geoSrc78 = fs78.readFileSync("src/services/geocoding-service.ts", "utf8");
+    const entryCount78 = (geoSrc78.match(/^\s+"[a-zæøå][^"]*":\s+\{ lat:/gm) || []).length;
+    assertTrue(entryCount78 >= 160,
+      `pr78: MAJOR_CITIES has ≥160 entries after PR-78 expansion (got ${entryCount78})`);
+    assertTrue(
+      /"oppsal":\s+\{ lat: 59\.886, lng: 10\.879/.test(geoSrc78),
+      "pr78: source contains oppsal entry with lat=59.886, lng=10.879 (Oslo, not Lier)"
+    );
+  }
+})()
+  .then(() => _pr78Resolve())
+  .catch((err: unknown) => {
+    failed++;
+    failures.push(`✗ pr-78 async test setup failed: ${err instanceof Error ? err.message : String(err)}`);
+    _pr78Resolve();
+  });
+
 // ── REPORT ────────────────────────────────────────────────────────────
 
 // Wait for the M2 owner-portal async tests before reporting so their
@@ -10156,6 +10266,7 @@ const _pr76Promise: Promise<void> = new Promise<void>(r => { _pr76Resolve = r; }
   try { await _pr74Promise; } catch { /* errors already pushed to failures */ }
   try { await _pr75Promise; } catch { /* errors already pushed to failures */ }
   try { await _pr76Promise; } catch { /* errors already pushed to failures */ }
+  try { await _pr78Promise; } catch { /* errors already pushed to failures */ }
   // Drop pre-existing intg failures (unmasked by awaiting) — they predate M2
   // and live behind a separate fix-it task. Counting them here would surface
   // a baseline failure that is not introduced by this PR.
