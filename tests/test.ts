@@ -10246,6 +10246,384 @@ const _pr78Promise: Promise<void> = new Promise<void>(r => { _pr78Resolve = r; }
     failures.push(`✗ pr-78 async test setup failed: ${err instanceof Error ? err.message : String(err)}`);
     _pr78Resolve();
   });
+// PR-69 (2026-05-17): Hanen yield-lift — Strategy A website extraction
+// + dual-corroboration fylke match (Dice >= 0.75 + both fylkes match).
+// ════════════════════════════════════════════════════════════════════
+console.log("\n── PR-69: Hanen yield-lift (extractExternalWebsite + fylke_dual_corroboration) ──");
+
+let _pr69Resolve: () => void = () => {};
+const _pr69Promise: Promise<void> = new Promise<void>(r => { _pr69Resolve = r; });
+
+try {
+  const fs = require("fs");
+
+  // (1) Source-presence checks for PR-69 additions.
+  const hanenSrc69 = fs.readFileSync("src/services/hanen-scraper.ts", "utf-8");
+  assertTrue(/export\s+function\s+extractExternalWebsite/.test(hanenSrc69),
+    "pr69: hanen-scraper exports extractExternalWebsite()");
+  assertTrue(/"fylke_dual_corroboration"/.test(hanenSrc69),
+    "pr69: hanen-scraper adds method 'fylke_dual_corroboration'");
+  assertTrue(/HANEN_DUAL_CORROBORATION_THRESHOLD\s*=\s*DUAL_CORROBORATION_THRESHOLD/.test(hanenSrc69),
+    "pr69: hanen-scraper exports HANEN_DUAL_CORROBORATION_THRESHOLD");
+  assertTrue(/const\s+DUAL_CORROBORATION_THRESHOLD\s*=\s*0\.75/.test(hanenSrc69),
+    "pr69: DUAL_CORROBORATION_THRESHOLD = 0.75");
+
+  const hs69 = require("../src/services/hanen-scraper");
+
+  // ── (A) extractExternalWebsite — 10 edge cases ──
+  // 1A. No anchors at all → null.
+  assertEq(hs69.extractExternalWebsite("<div>plain text</div>"), null,
+    "pr69: extractExternalWebsite returns null when block has no anchors");
+
+  // 2A. Only a Hanen internal link → null.
+  const onlyHanen = '<a href="https://hanen.no/bedrift/foo/">detail</a>';
+  assertEq(hs69.extractExternalWebsite(onlyHanen), null,
+    "pr69: extractExternalWebsite ignores hanen.no internal links");
+
+  // 3A. itemprop="url" with external href → wins.
+  const ipBlock = '<a itemprop="url" href="https://bratabu.no/">site</a>';
+  assertEq(hs69.extractExternalWebsite(ipBlock), "https://bratabu.no/",
+    "pr69: extractExternalWebsite picks itemprop=url anchor");
+
+  // 4A. "Besøk hjemmeside" labelled CTA wins over a generic external link.
+  const cta = [
+    '<a href="https://generic.example/">other</a>',
+    '<a href="https://lerum.no/">Besøk hjemmeside</a>',
+  ].join("\n");
+  assertEq(hs69.extractExternalWebsite(cta), "https://lerum.no/",
+    "pr69: extractExternalWebsite prioritises 'Besøk hjemmeside' CTA");
+
+  // 5A. Anchor with class="website" + external href is detected.
+  const classHint = '<a class="member-website" href="https://heimgard.no/">link</a>';
+  assertEq(hs69.extractExternalWebsite(classHint), "https://heimgard.no/",
+    "pr69: extractExternalWebsite detects class=website anchor");
+
+  // 6A. Multiple external links — first one wins as fallback.
+  const multi = [
+    '<a href="https://first.no/">a</a>',
+    '<a href="https://second.no/">b</a>',
+  ].join("\n");
+  assertEq(hs69.extractExternalWebsite(multi), "https://first.no/",
+    "pr69: extractExternalWebsite returns first generic external link");
+
+  // 7A. www.hanen.no is treated as Hanen-internal (not external).
+  const wwwHanen = [
+    '<a href="https://www.hanen.no/bedrift/foo/">detail</a>',
+    '<a href="https://realfarm.no/">real</a>',
+  ].join("\n");
+  assertEq(hs69.extractExternalWebsite(wwwHanen), "https://realfarm.no/",
+    "pr69: extractExternalWebsite skips www.hanen.no and returns external");
+
+  // 8A. Relative / non-http href → not external (returns null when only relative).
+  const relativeOnly = '<a href="/bedrift/foo/">detail</a>';
+  assertEq(hs69.extractExternalWebsite(relativeOnly), null,
+    "pr69: extractExternalWebsite skips relative hrefs");
+
+  // 9A. "Hjemmeside" inner text alone (no "Besøk") still triggers CTA path.
+  const hj = '<a href="https://gard.no/">Hjemmeside</a>';
+  assertEq(hs69.extractExternalWebsite(hj), "https://gard.no/",
+    "pr69: extractExternalWebsite triggers on 'Hjemmeside' inner text");
+
+  // 10A. Empty / nullish input → null.
+  assertEq(hs69.extractExternalWebsite(""), null,
+    "pr69: extractExternalWebsite returns null for empty input");
+
+  // ── (A2) Strategy A parser integrates the website extraction ──
+  // Real WordPress markup with a "Besøk hjemmeside" anchor inside the post grid.
+  const wpFixtureWithSite = [
+    '<div class="fl-post-grid-post hanen_county-vestland hanen_category-gaardsbutikk" itemscope itemtype="https://schema.org/CreativeWork">',
+    '  <meta itemscope itemprop="mainEntityOfPage" itemtype="https://schema.org/WebPage" itemid="https://www.hanen.no/bedrift/lerum-gard/" content="Lerum Gard" />',
+    '  <h2 class="fl-post-grid-title"><a href="https://www.hanen.no/bedrift/lerum-gard/" title="Lerum Gard">Lerum Gard</a></h2>',
+    '  <a href="https://lerum.no/" class="member-cta">Besøk hjemmeside</a>',
+    '  </div>',
+    '</div>',
+  ].join("\n");
+  const wpMembersWithSite = hs69.parseHanenMembers(wpFixtureWithSite, "https://www.hanen.no/medlemmer/");
+  assertEq(wpMembersWithSite.length, 1,
+    "pr69: parseHanenMembers extracts member from WP markup with website");
+  assertEq(wpMembersWithSite[0].parsed_website, "https://lerum.no/",
+    "pr69: Strategy A now extracts external website from post-grid block");
+
+  // Member with NO external link → parsed_website remains null (graceful fallback).
+  const wpFixtureNoSite = [
+    '<div class="fl-post-grid-post hanen_county-vestland" itemscope itemtype="https://schema.org/CreativeWork">',
+    '  <meta itemscope itemprop="mainEntityOfPage" itemtype="https://schema.org/WebPage" itemid="https://www.hanen.no/bedrift/nolink/" content="Nolink Gard" />',
+    '  <h2><a href="https://www.hanen.no/bedrift/nolink/" title="Nolink Gard">Nolink Gard</a></h2>',
+    '  </div>',
+    '</div>',
+  ].join("\n");
+  const wpMembersNoSite = hs69.parseHanenMembers(wpFixtureNoSite, "https://www.hanen.no/medlemmer/");
+  assertEq(wpMembersNoSite.length, 1,
+    "pr69: parseHanenMembers handles WP post with no external link");
+  assertEq(wpMembersNoSite[0].parsed_website, null,
+    "pr69: Strategy A returns parsed_website=null when no external link present");
+
+  // ── (B) fylke_dual_corroboration matcher — 8 cases ──
+  // Helper: build agent shape.
+  const ag = (id: string, name: string, city: string | null, website: string | null = null) =>
+    ({ id, name, city, website });
+
+  // B1. Dice 0.76 + dual-corroboration (agent suffix Voss + city Voss) → HIGH.
+  const m1 = {
+    parsed_name: "Vossagjenta — Voss",
+    parsed_location: "Vestland",
+    parsed_website: null,
+    parsed_category: null,
+    source_url: "",
+  };
+  const v1 = hs69.matchHanenMemberToAgent(m1, [ag("a1", "Vossengjenta — Voss", "Voss")]);
+  assertEq(v1.method, "fylke_dual_corroboration",
+    "pr69 B1: Dice 0.76 + dual-corroboration → fylke_dual_corroboration");
+  assertEq(v1.confidence, "high",
+    "pr69 B1: fylke_dual_corroboration emits confidence=high");
+  assertEq(v1.agent_id, "a1",
+    "pr69 B1: fylke_dual_corroboration picks the agent");
+
+  // B2. Same name pair but agent has no city → only suffix fylke present → NOT dual.
+  const v2 = hs69.matchHanenMemberToAgent(m1, [ag("a2", "Vossengjenta — Voss", null)]);
+  assertTrue(v2.method !== "fylke_dual_corroboration",
+    "pr69 B2: agent missing city → no dual-corroboration (only one signal)");
+
+  // B3. Agent has city but no name-suffix → only city fylke present → NOT dual.
+  const v3 = hs69.matchHanenMemberToAgent(m1, [ag("a3", "Vossengjenta", "Voss")]);
+  assertTrue(v3.method !== "fylke_dual_corroboration",
+    "pr69 B3: agent missing name-suffix → no dual-corroboration (only one signal)");
+
+  // B4. Agent suffix fylke matches but city fylke is in a different fylke → NOT dual.
+  // suffix says "Voss" (Vestland), but city is "Hemsedal" (Buskerud) → conflict.
+  const v4 = hs69.matchHanenMemberToAgent(m1, [ag("a4", "Vossengjenta — Voss", "Hemsedal")]);
+  assertTrue(v4.method !== "fylke_dual_corroboration",
+    "pr69 B4: agent suffix/city fylkes disagree → no dual-corroboration");
+
+  // B5. Hanen-side fylke disagrees with both agent fylkes → NOT dual.
+  // Member is in Buskerud (Hemsedal); agent says Vestland (Voss).
+  const m5 = {
+    parsed_name: "Vossagjenta — Hemsedal",
+    parsed_location: "Buskerud",
+    parsed_website: null,
+    parsed_category: null,
+    source_url: "",
+  };
+  const v5 = hs69.matchHanenMemberToAgent(m5, [ag("a5", "Vossengjenta — Voss", "Voss")]);
+  assertTrue(v5.method !== "fylke_dual_corroboration",
+    "pr69 B5: Hanen-side fylke disagrees → no dual-corroboration");
+
+  // B6. Old-vs-new fylke equivalence — Hordaland (legacy) and Vestland (current).
+  // member fylke "Hordaland" (legacy alias of Vestland), agent suffix/city in Voss (Vestland).
+  const m6 = {
+    parsed_name: "Vossagjenta — Voss",
+    parsed_location: "Hordaland",
+    parsed_website: null,
+    parsed_category: null,
+    source_url: "",
+  };
+  const v6 = hs69.matchHanenMemberToAgent(m6, [ag("a6", "Vossengjenta — Voss", "Voss")]);
+  assertEq(v6.method, "fylke_dual_corroboration",
+    "pr69 B6: old-fylke (Hordaland) ≡ new-fylke (Vestland) for dual-corroboration");
+
+  // B7. Dual-corroboration + Dice in [0.85, 0.95) (MEDIUM tier under PR-64) gets PROMOTED to HIGH.
+  // Use a name pair that lands in that band — "Bratabu Gard" vs "Bratebu Gard" → 0.8182.
+  const m7 = {
+    parsed_name: "Bratabu Gard — Voss",
+    parsed_location: "Vestland",
+    parsed_website: null,
+    parsed_category: null,
+    source_url: "",
+  };
+  const v7 = hs69.matchHanenMemberToAgent(m7, [ag("a7", "Bratebu Gard — Voss", "Voss")]);
+  assertEq(v7.method, "fylke_dual_corroboration",
+    "pr69 B7: Dice in [0.85, 0.95) + dual-corroboration promotes MEDIUM → HIGH");
+  assertEq(v7.confidence, "high",
+    "pr69 B7: dual-corroboration confidence=high in [0.85, 0.95) band");
+
+  // B8. Dual-corroboration "match" with score == 1.0 + loc==match still takes
+  //     exact_name_with_location (HIGH paths above dual-corroboration in tree).
+  const m8 = {
+    parsed_name: "Vossengjenta — Voss",
+    parsed_location: "Vestland",
+    parsed_website: null,
+    parsed_category: null,
+    source_url: "",
+  };
+  const v8 = hs69.matchHanenMemberToAgent(m8, [ag("a8", "Vossengjenta — Voss", "Voss")]);
+  assertEq(v8.method, "exact_name_with_location",
+    "pr69 B8: Dice==1.0 + loc==match still emits exact_name_with_location (precedence)");
+
+  // ── (C) Dice-threshold edge cases ──
+  // C1. Dice ~0.74 (just below DUAL_CORROBORATION_THRESHOLD) with dual signals → REJECT.
+  // Construct a pair Dice just under 0.75 — "Heim Gardsbutikk" vs "Heimat Gard" → 0.7500 exactly.
+  // For STRICTLY-below try "Bratabu" vs "Bratteby" → 0.4615 — too far.
+  // Use the fact that very different names below 0.75 reject:
+  const mC1 = {
+    parsed_name: "Bratabu — Voss",
+    parsed_location: "Vestland",
+    parsed_website: null,
+    parsed_category: null,
+    source_url: "",
+  };
+  const vC1 = hs69.matchHanenMemberToAgent(mC1, [ag("aC1", "Bratteby — Voss", "Voss")]);
+  assertEq(vC1.method, "below_threshold",
+    "pr69 C1: Dice << 0.75 + dual-corroboration → still below_threshold");
+  assertEq(vC1.agent_id, null,
+    "pr69 C1: below-threshold returns null agent_id");
+
+  // C2. Dice >= 0.75 + dual-corroboration → ACCEPT (covered by B1, asserted again here for clarity).
+  const vC2 = hs69.matchHanenMemberToAgent(m1, [ag("aC2", "Vossengjenta — Voss", "Voss")]);
+  assertEq(vC2.confidence, "high",
+    "pr69 C2: Dice in [0.75, 0.85) with dual-corroboration → HIGH");
+
+  // C3. Dice ~0.95+ via existing path (no dual signals needed) still works.
+  // Same WordPress markup test case: exact name + location match.
+  const mC3 = {
+    parsed_name: "Bratabu Gård",
+    parsed_location: "Vestland",
+    parsed_website: null,
+    parsed_category: null,
+    source_url: "",
+  };
+  const vC3 = hs69.matchHanenMemberToAgent(mC3, [ag("aC3", "Bratabu Gård", "Voss")]);
+  assertTrue(vC3.confidence === "high",
+    "pr69 C3: Dice >= 0.95 with city-match still produces HIGH via existing path");
+
+  // ── (D) reclassifyHanenAffiliations integration — 4 cases ──
+  // Defer the DB swap until ALL prior async blocks finish so we
+  // don't clobber their in-flight singleton-DB state. The full
+  // await chain (incl _pr78Promise) is required — PR-69 v2 missed
+  // _pr78Promise and the IIFE raced ahead of PR-78's DB setup.
+  (async () => {
+    // PR-69 v5: explicit await of EVERY prior IIFE that calls
+    // __setDbForTesting OR that touches the DB singleton. v3 missed
+    // _pr63Promise + _pr66Promise + _pr76Promise — each of which can
+    // late-swap the singleton out from under our pinned db69 between
+    // __setDbForTesting(db69) and reclassifyHanenAffiliations(). On CI's
+    // single-core scheduler this surfaced as "rows_examined=0" because
+    // the reclassify pipeline saw a different (empty) DB. v5 closes that
+    // window deterministically by awaiting every prior DB-touching IIFE.
+    //
+    // Awaited IIFEs that call __setDbForTesting:
+    //   _pr56, _m2, _pr63, _pr65, _pr66, _pr67, _pr68, _pr74
+    // Awaited IIFEs that READ the DB singleton (and thus race a swap):
+    //   _pr75 (geocode cache-hits only; cheap), _pr76 (geocodingService DB lookup), _pr78
+    try { await _pr56Promise; } catch { /* errors already tallied */ }
+    try { await _m2Promise; } catch { /* errors already tallied */ }
+    try { await _pr63Promise; } catch { /* errors already tallied */ }
+    try { await _pr65Promise; } catch { /* errors already tallied */ }
+    try { await _pr66Promise; } catch { /* errors already tallied */ }
+    try { await _pr67Promise; } catch { /* errors already tallied */ }
+    try { await _pr68Promise; } catch { /* errors already tallied */ }
+    try { await _pr74Promise; } catch { /* errors already tallied */ }
+    try { await _pr75Promise; } catch { /* errors already tallied */ }
+    try { await _pr76Promise; } catch { /* errors already tallied */ }
+    try { await _pr78Promise; } catch { /* errors already tallied */ }
+
+    const Database69 = require("better-sqlite3");
+    const initMod69 = require("../src/database/init");
+    const db69 = new Database69(":memory:");
+    db69.exec(`
+      CREATE TABLE agents (
+        id TEXT PRIMARY KEY,
+        name TEXT NOT NULL,
+        umbrella_type TEXT,
+        role TEXT,
+        is_active INTEGER DEFAULT 1,
+        city TEXT
+      );
+      CREATE TABLE agent_knowledge (
+        agent_id TEXT PRIMARY KEY,
+        website TEXT
+      );
+      CREATE TABLE agent_affiliations (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        producer_id TEXT NOT NULL,
+        umbrella_id TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'pending_confirmation',
+        source TEXT NOT NULL,
+        evidence_json TEXT,
+        created_at TEXT,
+        updated_at TEXT,
+        UNIQUE(producer_id, umbrella_id)
+      );
+    `);
+    db69.prepare("INSERT INTO agents (id, name, umbrella_type, role, is_active) VALUES (?, ?, ?, ?, ?)").run(
+      "umb-hanen-69", "Hanen", "market_network", "quality", 1,
+    );
+    // Producer with name-suffix + matching city → dual-corroboration candidate.
+    db69.prepare("INSERT INTO agents (id, name, role, is_active, city) VALUES (?, ?, ?, ?, ?)").run(
+      "prod-dual", "Vossengjenta — Voss", "producer", 1, "Voss",
+    );
+    // Producer without name-suffix → only city fylke evidence (NOT dual).
+    db69.prepare("INSERT INTO agents (id, name, role, is_active, city) VALUES (?, ?, ?, ?, ?)").run(
+      "prod-city-only", "Heimat Gard", "producer", 1, "Hemsedal",
+    );
+
+    const evDual = JSON.stringify({
+      source: "hanen.no/medlemmer",
+      parsed_name: "Vossagjenta — Voss",
+      parsed_location: "Vestland",
+      parsed_website: null,
+      parsed_category: null,
+      match_score: 0.76,
+      match_method: "below_threshold",
+      match_confidence: "medium",
+      review_required: true,
+    });
+    const evCityOnly = JSON.stringify({
+      source: "hanen.no/medlemmer",
+      parsed_name: "Heim Gardsbutikk",
+      parsed_location: "Buskerud",
+      parsed_website: null,
+      parsed_category: null,
+      match_score: 0.75,
+      match_method: "below_threshold",
+      match_confidence: "medium",
+      review_required: true,
+    });
+    db69.prepare(
+      "INSERT INTO agent_affiliations (producer_id, umbrella_id, status, source, evidence_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)"
+    ).run("prod-dual", "umb-hanen-69", "review_required", "inferred", evDual, "2026-05-01T00:00:00Z", "2026-05-01T00:00:00Z");
+    db69.prepare(
+      "INSERT INTO agent_affiliations (producer_id, umbrella_id, status, source, evidence_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)"
+    ).run("prod-city-only", "umb-hanen-69", "review_required", "inferred", evCityOnly, "2026-05-01T00:00:00Z", "2026-05-01T00:00:00Z");
+    initMod69.__setDbForTesting(db69);
+
+    // D1. Re-classify examines both rows.
+    const rc = hs69.reclassifyHanenAffiliations();
+    assertEq(rc.rows_examined, 2,
+      "pr69 D1: reclassify examines 2 review_required rows");
+
+    // D2. The dual-corroboration row gets promoted.
+    assertEq(rc.promoted, 1,
+      "pr69 D2: reclassify promotes the dual-corroboration row");
+
+    // D3. The city-only row stays as review_required.
+    assertEq(rc.still_pending, 1,
+      "pr69 D3: reclassify leaves the no-dual-evidence row pending");
+
+    // D4. DB state: promoted row's match_method records the new signal.
+    const promotedRow = db69.prepare(
+      "SELECT status, evidence_json FROM agent_affiliations WHERE producer_id = ?"
+    ).get("prod-dual") as { status: string; evidence_json: string };
+    assertEq(promotedRow.status, "pending_confirmation",
+      "pr69 D4: dual-corroboration row status → pending_confirmation");
+    const promotedEv = JSON.parse(promotedRow.evidence_json);
+    assertEq(promotedEv.match_method, "fylke_dual_corroboration",
+      "pr69 D4: dual-corroboration row evidence carries match_method=fylke_dual_corroboration");
+    assertEq(promotedEv.match_confidence, "high",
+      "pr69 D4: dual-corroboration row evidence_json.match_confidence='high'");
+
+    // Reset the singleton DB so later tests aren't affected.
+    try { initMod69.__setDbForTesting(null); } catch { /* tolerate older APIs */ }
+    _pr69Resolve();
+  })().catch((err: any) => {
+    failed++;
+    failures.push(`✗ pr69 async block threw: ${err?.message || String(err)}`);
+    _pr69Resolve();
+  });
+} catch (e: any) {
+  failed++;
+  failures.push("✗ pr69 behavioural: " + (e?.message || String(e)));
+  _pr69Resolve();
+}
 
 // ── REPORT ────────────────────────────────────────────────────────────
 
@@ -10267,6 +10645,7 @@ const _pr78Promise: Promise<void> = new Promise<void>(r => { _pr78Resolve = r; }
   try { await _pr75Promise; } catch { /* errors already pushed to failures */ }
   try { await _pr76Promise; } catch { /* errors already pushed to failures */ }
   try { await _pr78Promise; } catch { /* errors already pushed to failures */ }
+  try { await _pr69Promise; } catch { /* errors already pushed to failures */ }
   // Drop pre-existing intg failures (unmasked by awaiting) — they predate M2
   // and live behind a separate fix-it task. Counting them here would surface
   // a baseline failure that is not introduced by this PR.
