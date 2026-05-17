@@ -9877,6 +9877,127 @@ const _pr74Promise = (async () => {
 });
 
 
+
+// ─── PR-75: MAJOR_CITIES expansion (28 → ~100) ───────────────────────────
+// Pure data-extension test. Validates that the hardcoded geocoder returns
+// the expected coordinates + source="hardcoded" for newly added cities,
+// ASCII-aliaser, fylker, and that the radius heuristic is sane.
+// No DB or network: cache-hit on hardcoded path means lookupInDatabase /
+// lookupKartverket are never reached, so this is fully sync-safe and
+// doesn't race the global DB singleton.
+console.log("\n── PR-75: MAJOR_CITIES expansion ──");
+const _pr75Promise = (async () => {
+  const { geocodingService } = require("../src/services/geocoding-service");
+
+  // Helper — assert a city resolves via the hardcoded table.
+  async function expectHardcoded(name: string, expLat: number, expLng: number, label: string) {
+    const r = await geocodingService.geocode(name);
+    assertTrue(r !== null, `pr75: ${label} (${name}) → result is non-null`);
+    if (!r) return;
+    assertEq(r.source, "hardcoded", `pr75: ${label} (${name}) → source=hardcoded`);
+    // Loose lat/lng equality (≈ 0.01 degrees ≈ 1 km)
+    assertTrue(
+      Math.abs(r.lat - expLat) < 0.02 && Math.abs(r.lng - expLng) < 0.02,
+      `pr75: ${label} (${name}) → coords near (${expLat}, ${expLng}); got (${r.lat}, ${r.lng})`
+    );
+  }
+
+  // ── 10 assertions for new cities (each pair counts as 3 sub-asserts) ──
+  await expectHardcoded("Florø",       61.5996, 5.0329,  "Vestlandet by");
+  await expectHardcoded("Voss",        60.6278, 6.4183,  "Vestlandet tettsted");
+  await expectHardcoded("Røros",       62.5743, 11.3834, "Innlandet by");
+  await expectHardcoded("Steinkjer",   64.0148, 11.4954, "Trøndelag by");
+  await expectHardcoded("Narvik",      68.4383, 17.4278, "Nord-Norge by");
+  await expectHardcoded("Alta",        69.9689, 23.2716, "Finnmark by");
+  await expectHardcoded("Mo i Rana",   66.3128, 14.1428, "multi-word place");
+  await expectHardcoded("Arendal",     58.4612, 8.7670,  "Sørlandet by");
+  await expectHardcoded("Halden",      59.1246, 11.3874, "Østlandet by");
+  await expectHardcoded("Hammerfest",  70.6634, 23.6821, "Finnmark nord");
+
+  // ── 4 ASCII-aliaser ──
+  {
+    const a = await geocodingService.geocode("Florø");
+    const b = await geocodingService.geocode("floro");
+    assertTrue(!!a && !!b && a.lat === b.lat && a.lng === b.lng,
+      "pr75: Florø/floro ASCII-alias resolves to same coords");
+  }
+  {
+    const a = await geocodingService.geocode("Røros");
+    const b = await geocodingService.geocode("roros");
+    assertTrue(!!a && !!b && a.lat === b.lat && a.lng === b.lng,
+      "pr75: Røros/roros ASCII-alias resolves to same coords");
+  }
+  {
+    const a = await geocodingService.geocode("Risør");
+    const b = await geocodingService.geocode("risor");
+    assertTrue(!!a && !!b && a.lat === b.lat && a.lng === b.lng,
+      "pr75: Risør/risor ASCII-alias resolves to same coords");
+  }
+  {
+    const a = await geocodingService.geocode("Vadsø");
+    const b = await geocodingService.geocode("vadso");
+    assertTrue(!!a && !!b && a.lat === b.lat && a.lng === b.lng,
+      "pr75: Vadsø/vadso ASCII-alias resolves to same coords");
+  }
+
+  // ── 3 fylke-level assertions (region-radius is wide) ──
+  {
+    const r = await geocodingService.geocode("Vestland");
+    assertTrue(!!r && r.source === "hardcoded",
+      "pr75: Vestland fylke hardcoded");
+    assertTrue(!!r && r.radiusKm >= 50,
+      `pr75: Vestland radius wide (got ${r && r.radiusKm})`);
+  }
+  {
+    const r = await geocodingService.geocode("Trøndelag");
+    assertTrue(!!r && r.source === "hardcoded",
+      "pr75: Trøndelag fylke hardcoded");
+    assertTrue(!!r && r.radiusKm >= 50,
+      `pr75: Trøndelag radius wide (got ${r && r.radiusKm})`);
+  }
+  {
+    const r = await geocodingService.geocode("Vestfold");
+    assertTrue(!!r && r.source === "hardcoded",
+      "pr75: Vestfold fylke hardcoded");
+    assertTrue(!!r && r.radiusKm >= 50,
+      `pr75: Vestfold radius wide (got ${r && r.radiusKm})`);
+  }
+
+  // ── 2 radius sanity checks ──
+  {
+    const r = await geocodingService.geocode("Oslo");
+    assertEq(r && r.radiusKm, 25, "pr75: Oslo radius = 25 km (unchanged)");
+  }
+  {
+    const r1 = await geocodingService.geocode("Røros");
+    const r2 = await geocodingService.geocode("Vestland");
+    assertTrue(!!r1 && r1.radiusKm <= 25,
+      `pr75: Røros radius small/medium (≤25, got ${r1 && r1.radiusKm})`);
+    assertTrue(!!r2 && r2.radiusKm >= 50,
+      `pr75: Vestland radius ≥50 vs Røros (got ${r2 && r2.radiusKm})`);
+  }
+
+  // ── Sanity: MAJOR_CITIES table has expanded ──
+  // Read the source file directly and count entries; should be >>28.
+  {
+    const fs75 = require("fs") as typeof import("fs");
+    const geoSrc = fs75.readFileSync("src/services/geocoding-service.ts", "utf8");
+    const entryCount = (geoSrc.match(/^\s+"[a-zæøå][^"]*":\s+\{ lat:/gm) || []).length;
+    assertTrue(entryCount >= 100,
+      `pr75: MAJOR_CITIES has ≥100 entries after expansion (got ${entryCount})`);
+    // Distinct coordinate pairs (real places, not just aliases)
+    const coordPairs = new Set(
+      (geoSrc.match(/lat: [0-9.]+, lng: [0-9.]+/g) || [])
+    );
+    assertTrue(coordPairs.size >= 90,
+      `pr75: ≥90 distinct places (got ${coordPairs.size})`);
+  }
+})().catch((err: unknown) => {
+  failed++;
+  failures.push(`✗ pr-75 async test setup failed: ${err instanceof Error ? err.message : String(err)}`);
+});
+
+
 // ── REPORT ────────────────────────────────────────────────────────────
 
 // Wait for the M2 owner-portal async tests before reporting so their
@@ -9894,6 +10015,7 @@ const _pr74Promise = (async () => {
   try { await _pr67Promise; } catch { /* errors already pushed to failures */ }
   try { await _pr68Promise; } catch { /* errors already pushed to failures */ }
   try { await _pr74Promise; } catch { /* errors already pushed to failures */ }
+  try { await _pr75Promise; } catch { /* errors already pushed to failures */ }
   // Drop pre-existing intg failures (unmasked by awaiting) — they predate M2
   // and live behind a separate fix-it task. Counting them here would surface
   // a baseline failure that is not introduced by this PR.
