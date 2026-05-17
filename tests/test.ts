@@ -10313,7 +10313,7 @@ const _pr71Promise: Promise<void> = new Promise<void>(r => { _pr71Resolve = r; }
     const dry = await runBmEventParticipantsScraper({ allUpcoming: true, dryRun: true, fetcher: fakeFetcher });
     assertEq(dry.events_processed, 1, "pr71-pipeline: dry-run processes 1 event");
     assertEq(dry.participants_found, 3, "pr71-pipeline: dry-run finds 3 participants");
-    assertEq(dry.affiliations_created, 2, "pr71-pipeline: dry-run reports 2 would-be affiliations (2 HIGH)");
+    assertEq(dry.affiliations_created, 4, "pr71-pipeline: dry-run reports 4 would-be affiliations (2 HIGH x 2 levels: venue + lokallag, PR-77)");
     assertEq(dry.unmatched_logged, 1, "pr71-pipeline: dry-run reports 1 unmatched");
     // Dry-run must NOT have written any rows.
     const affCountAfterDry = (db.prepare("SELECT COUNT(*) AS c FROM agent_affiliations").get() as any).c;
@@ -10323,12 +10323,16 @@ const _pr71Promise: Promise<void> = new Promise<void>(r => { _pr71Resolve = r; }
     const real = await runBmEventParticipantsScraper({ allUpcoming: true, fetcher: fakeFetcher });
     assertEq(real.success, true, "pr71-pipeline: real run reports success");
     assertEq(real.events_processed, 1, "pr71-pipeline: real run processes 1 event");
-    assertEq(real.affiliations_created, 2, "pr71-pipeline: real run creates 2 affiliations");
+    assertEq(real.affiliations_created, 4, "pr71-pipeline: real run creates 4 affiliations (2 HIGH x 2 levels: venue + lokallag, PR-77)");
     assertEq(real.unmatched_logged, 1, "pr71-pipeline: real run logs 1 unmatched");
-    const affRows = db.prepare("SELECT producer_id, umbrella_id, status, source FROM agent_affiliations ORDER BY producer_id").all() as any[];
-    assertEq(affRows.length, 2, "pr71-pipeline: 2 affiliation rows in DB after real run");
-    assertTrue(affRows.every(r => r.umbrella_id === "lok-buskerud"),
-      "pr71-pipeline: every affiliation links to the lokallag (not the venue)");
+    const affRows = db.prepare("SELECT producer_id, umbrella_id, status, source FROM agent_affiliations ORDER BY producer_id, umbrella_id").all() as any[];
+    assertEq(affRows.length, 4, "pr71-pipeline: 4 affiliation rows in DB after real run (PR-77: 2 HIGH x 2 levels = venue + lokallag)");
+    assertTrue(affRows.every(r => r.umbrella_id === "lok-buskerud" || r.umbrella_id === "ven-bragernes"),
+      "pr71-pipeline: every affiliation links to either the lokallag or the venue (PR-77 writes both)");
+    assertTrue(affRows.filter(r => r.umbrella_id === "lok-buskerud").length === 2,
+      "pr71-pipeline: 2 lokallag-level affiliations (one per HIGH producer)");
+    assertTrue(affRows.filter(r => r.umbrella_id === "ven-bragernes").length === 2,
+      "pr71-pipeline: 2 venue-level affiliations (one per HIGH producer, PR-77)");
     assertTrue(affRows.every(r => r.source === "scraped"),
       "pr71-pipeline: every affiliation has source='scraped'");
     assertTrue(affRows.every(r => r.status === "active"),
@@ -10345,7 +10349,7 @@ const _pr71Promise: Promise<void> = new Promise<void>(r => { _pr71Resolve = r; }
     // [P3] Idempotent re-run — no duplicate rows, same affiliation count.
     const rerun = await runBmEventParticipantsScraper({ allUpcoming: true, fetcher: fakeFetcher });
     const affCountAfterRerun = (db.prepare("SELECT COUNT(*) AS c FROM agent_affiliations").get() as any).c;
-    assertEq(affCountAfterRerun, 2, "pr71-pipeline: re-run keeps affiliation count at 2 (idempotent)");
+    assertEq(affCountAfterRerun, 4, "pr71-pipeline: re-run keeps affiliation count at 4 (idempotent across both levels)");
     const unmatchedAfterRerun = (db.prepare("SELECT COUNT(*) AS c FROM bm_unmatched_participants").get() as any).c;
     assertEq(unmatchedAfterRerun, 1, "pr71-pipeline: re-run keeps unmatched count at 1 (idempotent)");
     assertTrue(rerun.events_processed === 1, "pr71-pipeline: re-run still processes the event (when called with allUpcoming)");
@@ -10372,6 +10376,230 @@ const _pr71Promise: Promise<void> = new Promise<void>(r => { _pr71Resolve = r; }
   }
 })();
 
+// ─── PR-77: BM venue-level affiliations (extends PR-71) ─────────────
+// Behavioural tests: confirm the BM scraper now writes BOTH a
+// producer→venue and a producer→lokallag affiliation per event-match,
+// populating the previously-empty BM venue-pages.
+console.log("\n── PR-77: BM venue-level affiliations ──");
+
+let _pr77Resolve: () => void = () => {};
+const _pr77Promise: Promise<void> = new Promise<void>(r => { _pr77Resolve = r; });
+
+// Source-presence assertions run synchronously (no DB needed).
+{
+  const fs = require("fs");
+  const scraperSrc = fs.readFileSync("src/services/bm-event-participants-scraper.ts", "utf-8");
+  assertTrue(/affiliation_level/.test(scraperSrc),
+    "pr77-src: scraper writes evidence.affiliation_level field");
+  assertTrue(/parent_lokallag_id/.test(scraperSrc),
+    "pr77-src: scraper writes evidence.parent_lokallag_id on venue rows");
+  assertTrue(/via_venue_id/.test(scraperSrc),
+    "pr77-src: scraper writes evidence.via_venue_id on lokallag rows");
+  assertTrue(/ev\.venue_agent_id/.test(scraperSrc),
+    "pr77-src: scraper inserts ev.venue_agent_id as an umbrella_id (venue affiliation)");
+}
+
+// DB-backed behavioural block — same singleton-race-safe IIFE pattern
+// as PR-67/PR-68/PR-71. Await every prior promise that touches the DB
+// singleton (and m2 magic_links) before stealing the global DB.
+(async () => {
+  try { await _pr56Promise; } catch { /* counted */ }
+  try { await _pr65Promise; } catch { /* counted */ }
+  try { await _pr67Promise; } catch { /* counted */ }
+  try { await _pr68Promise; } catch { /* counted */ }
+  try { await _pr74Promise; } catch { /* counted */ }
+  try { await _pr75Promise; } catch { /* counted */ }
+  try { await _pr71Promise; } catch { /* counted — must run AFTER pr71 finishes; pr71 nulls the DB on completion */ }
+  try { await _m2Promise; } catch { /* counted */ }
+
+  try {
+    const Database = require("better-sqlite3");
+    const initMod = require("../src/database/init");
+    const db = new Database(":memory:");
+    db.exec(`
+      CREATE TABLE agents (
+        id TEXT PRIMARY KEY,
+        name TEXT NOT NULL,
+        role TEXT NOT NULL DEFAULT 'producer',
+        umbrella_type TEXT,
+        parent_umbrella_id TEXT,
+        city TEXT,
+        is_active INTEGER DEFAULT 1
+      );
+      CREATE TABLE bm_market_events (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        venue_agent_id TEXT NOT NULL,
+        event_slug TEXT UNIQUE NOT NULL,
+        event_name TEXT NOT NULL,
+        location_text TEXT,
+        start_at TEXT NOT NULL,
+        end_at TEXT,
+        source_url TEXT NOT NULL,
+        scraped_at TEXT DEFAULT (datetime('now')),
+        last_participants_scraped_at TEXT
+      );
+      CREATE TABLE agent_affiliations (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        producer_id TEXT NOT NULL,
+        umbrella_id TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'pending_confirmation'
+          CHECK(status IN ('pending_confirmation','active','historical','rejected','review_required')),
+        source TEXT NOT NULL DEFAULT 'scraped'
+          CHECK(source IN ('self_claimed','scraped','admin','umbrella_confirmed','inferred')),
+        evidence_json TEXT,
+        created_at TEXT DEFAULT (datetime('now')),
+        updated_at TEXT DEFAULT (datetime('now')),
+        UNIQUE(producer_id, umbrella_id)
+      );
+      CREATE TABLE bm_unmatched_participants (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        event_id INTEGER NOT NULL,
+        venue_id TEXT NOT NULL,
+        parsed_name TEXT NOT NULL,
+        parsed_slug TEXT,
+        parsed_category TEXT,
+        best_match_score REAL,
+        created_at TEXT DEFAULT (datetime('now')),
+        UNIQUE(event_id, parsed_name)
+      );
+    `);
+    // Tree: national → BM Agder lokallag → {Arendal venue, Kristiansand venue}
+    //                                     → also BM Oslo lokallag → Birkelunden venue
+    db.prepare("INSERT INTO agents (id, name, role, umbrella_type) VALUES ('nat-77', 'Bondens marked Norge', 'quality', 'market_network')").run();
+    db.prepare("INSERT INTO agents (id, name, role, umbrella_type, parent_umbrella_id) VALUES ('lok-agder', 'BM Agder', 'quality', 'market_network', 'nat-77')").run();
+    db.prepare("INSERT INTO agents (id, name, role, umbrella_type, parent_umbrella_id) VALUES ('lok-oslo', 'BM Oslo', 'quality', 'market_network', 'nat-77')").run();
+    db.prepare("INSERT INTO agents (id, name, role, umbrella_type, parent_umbrella_id) VALUES ('ven-arendal', 'BM Arendal', 'quality', 'venue', 'lok-agder')").run();
+    db.prepare("INSERT INTO agents (id, name, role, umbrella_type, parent_umbrella_id) VALUES ('ven-krs', 'BM Kristiansand', 'quality', 'venue', 'lok-agder')").run();
+    db.prepare("INSERT INTO agents (id, name, role, umbrella_type, parent_umbrella_id) VALUES ('ven-birk', 'BM Birkelunden', 'quality', 'venue', 'lok-oslo')").run();
+    // Producers — same names as the fixture HTML so they HIGH-match.
+    db.prepare("INSERT INTO agents (id, name, role) VALUES ('a-pr-eiker', 'Eiker Gårdsysteri', 'producer')").run();
+    db.prepare("INSERT INTO agents (id, name, role) VALUES ('a-pr-saetre', 'Sætrehonning', 'producer')").run();
+    db.prepare("INSERT INTO agents (id, name, role) VALUES ('a-pr-grini', 'Grini Hjemmebakeri', 'producer')").run();
+    // Three future events: one per venue. Eiker attends ALL three (cross-lokallag scenario).
+    // Sætrehonning attends Arendal + Kristiansand (same-lokallag scenario). Grini attends only Birkelunden.
+    const futureIso = (offsetDays: number) =>
+      new Date(Date.now() + offsetDays * 86400000).toISOString();
+    db.prepare(
+      "INSERT INTO bm_market_events (id, venue_agent_id, event_slug, event_name, location_text, start_at, source_url) VALUES (?, ?, ?, ?, ?, ?, ?)"
+    ).run(201, "ven-arendal", "bm-arendal-2026-06-07", "BM Arendal", "Arendal", futureIso(7), "https://bondensmarked.no/markeder/bm-arendal-2026-06-07");
+    db.prepare(
+      "INSERT INTO bm_market_events (id, venue_agent_id, event_slug, event_name, location_text, start_at, source_url) VALUES (?, ?, ?, ?, ?, ?, ?)"
+    ).run(202, "ven-krs", "bm-krs-2026-06-14", "BM Kristiansand", "Kristiansand", futureIso(14), "https://bondensmarked.no/markeder/bm-krs-2026-06-14");
+    db.prepare(
+      "INSERT INTO bm_market_events (id, venue_agent_id, event_slug, event_name, location_text, start_at, source_url) VALUES (?, ?, ?, ?, ?, ?, ?)"
+    ).run(203, "ven-birk", "bm-birk-2026-06-21", "BM Birkelunden", "Oslo", futureIso(21), "https://bondensmarked.no/markeder/bm-birk-2026-06-21");
+    initMod.__setDbForTesting(db);
+
+    const { runBmEventParticipantsScraper } = require("../src/services/bm-event-participants-scraper");
+
+    // Per-event fixture HTML keyed by event slug.
+    const PAD = "<!-- " + "x".repeat(600) + " -->";
+    const fixturesBySlug: Record<string, string> = {
+      "bm-arendal-2026-06-07": PAD + `
+        <section><h2>Produsenter (2)</h2><div class="grid">
+          <a href="/produsenter/eiker-gardsysteri" class="card"><img alt="Eiker"><h3>Eiker Gårdsysteri</h3><span>Ost</span></a>
+          <a href="/produsenter/saetrehonning" class="card"><img alt="Sætre"><h3>Sætrehonning</h3><span>Honning</span></a>
+        </div></section>` + PAD,
+      "bm-krs-2026-06-14": PAD + `
+        <section><h2>Produsenter (2)</h2><div class="grid">
+          <a href="/produsenter/eiker-gardsysteri" class="card"><img alt="Eiker"><h3>Eiker Gårdsysteri</h3><span>Ost</span></a>
+          <a href="/produsenter/saetrehonning" class="card"><img alt="Sætre"><h3>Sætrehonning</h3><span>Honning</span></a>
+        </div></section>` + PAD,
+      "bm-birk-2026-06-21": PAD + `
+        <section><h2>Produsenter (2)</h2><div class="grid">
+          <a href="/produsenter/eiker-gardsysteri" class="card"><img alt="Eiker"><h3>Eiker Gårdsysteri</h3><span>Ost</span></a>
+          <a href="/produsenter/grini-hjemmebakeri" class="card"><img alt="Grini"><h3>Grini Hjemmebakeri</h3><span>Bakeri</span></a>
+        </div></section>` + PAD,
+    };
+    const fixtureFetcher = async (url: string) => {
+      const slug = url.split("/").pop() || "";
+      return fixturesBySlug[slug] || "";
+    };
+
+    // ── [T1] Dry-run: no writes for venue OR lokallag.
+    const dry = await runBmEventParticipantsScraper({ allUpcoming: true, dryRun: true, fetcher: fixtureFetcher });
+    assertEq(dry.events_processed, 3, "pr77-dry: dry-run processes all 3 events");
+    const dryAffCount = (db.prepare("SELECT COUNT(*) AS c FROM agent_affiliations").get() as any).c;
+    assertEq(dryAffCount, 0, "pr77-dry: dry-run writes NO rows (neither venue nor lokallag)");
+    const dryUnmatched = (db.prepare("SELECT COUNT(*) AS c FROM bm_unmatched_participants").get() as any).c;
+    assertEq(dryUnmatched, 0, "pr77-dry: dry-run writes no unmatched rows either");
+
+    // ── [T2] Real run: both venue + lokallag rows present.
+    const real = await runBmEventParticipantsScraper({ allUpcoming: true, fetcher: fixtureFetcher });
+    assertEq(real.success, true, "pr77-real: run reports success");
+    assertEq(real.events_processed, 3, "pr77-real: 3 events processed");
+
+    // Expected rows:
+    //   Eiker: venue rows {ven-arendal, ven-krs, ven-birk} + lokallag rows {lok-agder, lok-oslo}     = 5 rows
+    //   Sætre: venue rows {ven-arendal, ven-krs}              + lokallag rows {lok-agder}            = 3 rows
+    //   Grini: venue rows {ven-birk}                           + lokallag rows {lok-oslo}             = 2 rows
+    //   Total: 10 rows.
+    const allRows = db.prepare(
+      "SELECT producer_id, umbrella_id, status, source, evidence_json FROM agent_affiliations ORDER BY producer_id, umbrella_id"
+    ).all() as any[];
+    assertEq(allRows.length, 10,
+      `pr77-real: 10 affiliation rows total (got ${allRows.length}: ${JSON.stringify(allRows.map(r => `${r.producer_id}->${r.umbrella_id}`))})`);
+
+    // Per-event: BOTH a venue and a lokallag affiliation are created.
+    const eikerVenues = allRows.filter(r => r.producer_id === "a-pr-eiker" && r.umbrella_id.startsWith("ven-"));
+    const eikerLokallag = allRows.filter(r => r.producer_id === "a-pr-eiker" && r.umbrella_id.startsWith("lok-"));
+    assertEq(eikerVenues.length, 3, "pr77-real: Eiker (3 venues across 2 lokallag) → 3 venue-affiliations");
+    assertEq(eikerLokallag.length, 2, "pr77-real: Eiker (3 venues across 2 lokallag) → 2 lokallag-affiliations (de-duped)");
+
+    // Producer at multiple venues in SAME lokallag → N venue + 1 lokallag (de-duped via UNIQUE).
+    const saetreVenues = allRows.filter(r => r.producer_id === "a-pr-saetre" && r.umbrella_id.startsWith("ven-"));
+    const saetreLokallag = allRows.filter(r => r.producer_id === "a-pr-saetre" && r.umbrella_id.startsWith("lok-"));
+    assertEq(saetreVenues.length, 2, "pr77-real: Sætre (2 venues in same lokallag) → 2 venue-affiliations");
+    assertEq(saetreLokallag.length, 1, "pr77-real: Sætre (2 venues in same lokallag) → 1 lokallag-affiliation (de-duped on UNIQUE)");
+
+    // Producer at single venue → 1 venue + 1 lokallag.
+    const griniRows = allRows.filter(r => r.producer_id === "a-pr-grini");
+    assertEq(griniRows.length, 2, "pr77-real: Grini (1 venue) → 2 total affiliations (1 venue + 1 lokallag)");
+
+    // ── [T3] evidence_json.affiliation_level distinguishes venue vs lokallag.
+    const venueRow = allRows.find(r => r.producer_id === "a-pr-grini" && r.umbrella_id === "ven-birk");
+    const lokallagRow = allRows.find(r => r.producer_id === "a-pr-grini" && r.umbrella_id === "lok-oslo");
+    assertTrue(!!venueRow, "pr77-evidence: grini venue-row present");
+    assertTrue(!!lokallagRow, "pr77-evidence: grini lokallag-row present");
+    const venueEv = JSON.parse(venueRow.evidence_json);
+    const lokallagEv = JSON.parse(lokallagRow.evidence_json);
+    assertEq(venueEv.affiliation_level, "venue",
+      "pr77-evidence: venue-row evidence_json.affiliation_level === 'venue'");
+    assertEq(lokallagEv.affiliation_level, "lokallag",
+      "pr77-evidence: lokallag-row evidence_json.affiliation_level === 'lokallag'");
+
+    // ── [T4] evidence_json includes event_id on BOTH levels.
+    assertTrue(typeof venueEv.event_id === "number" && venueEv.event_id > 0,
+      "pr77-evidence: venue-row evidence_json includes event_id");
+    assertTrue(typeof lokallagEv.event_id === "number" && lokallagEv.event_id > 0,
+      "pr77-evidence: lokallag-row evidence_json includes event_id");
+
+    // Cross-link fields on each level.
+    assertEq(venueEv.parent_lokallag_id, "lok-oslo",
+      "pr77-evidence: venue-row carries parent_lokallag_id pointer");
+    assertEq(lokallagEv.via_venue_id, "ven-birk",
+      "pr77-evidence: lokallag-row carries via_venue_id pointer (the venue that triggered it)");
+
+    // ── [T5] Status transitions correctly — every match is HIGH so all 'active'.
+    assertTrue(allRows.every(r => r.status === "active"),
+      "pr77-status: all HIGH matches stored with status='active'");
+    assertTrue(allRows.every(r => r.source === "scraped"),
+      "pr77-status: all affiliations have source='scraped'");
+
+    // ── [T6] Idempotency — re-run does NOT duplicate.
+    const rerun = await runBmEventParticipantsScraper({ allUpcoming: true, fetcher: fixtureFetcher });
+    assertEq(rerun.events_processed, 3, "pr77-idem: re-run still processes 3 events");
+    const rerunAffCount = (db.prepare("SELECT COUNT(*) AS c FROM agent_affiliations").get() as any).c;
+    assertEq(rerunAffCount, 10, "pr77-idem: re-run does NOT duplicate any rows (UNIQUE producer_id+umbrella_id)");
+  } catch (err: any) {
+    failed++;
+    failures.push(`✗ pr77 async block threw: ${err?.message || String(err)}`);
+  } finally {
+    _pr77Resolve();
+  }
+})();
+
+
 // ── REPORT ────────────────────────────────────────────────────────────
 
 // Wait for the M2 owner-portal async tests before reporting so their
@@ -10391,6 +10619,7 @@ const _pr71Promise: Promise<void> = new Promise<void>(r => { _pr71Resolve = r; }
   try { await _pr74Promise; } catch { /* errors already pushed to failures */ }
   try { await _pr75Promise; } catch { /* errors already pushed to failures */ }
   try { await _pr71Promise; } catch { /* errors already pushed to failures */ }
+  try { await _pr77Promise; } catch { /* errors already pushed to failures */ }
   // Drop pre-existing intg failures (unmasked by awaiting) — they predate M2
   // and live behind a separate fix-it task. Counting them here would surface
   // a baseline failure that is not introduced by this PR.
