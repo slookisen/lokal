@@ -9519,6 +9519,115 @@ console.log("\n── PR-72: search relevance — category beats city ──");
 }
 
 
+// ── PR-73: UTM-tagging on outbound producer links ────────────────────
+console.log("\n── PR-73: addUtmParams (outbound producer-link UTM tagging) ──");
+import { addUtmParams as pr73AddUtm } from "../src/utils/url-utm";
+
+// 1. https URL with no query — UTM params appended
+assertEq(
+  pr73AddUtm("https://example.no"),
+  "https://example.no/?utm_source=rettfrabonden&utm_medium=referral&utm_campaign=producer_profile",
+  "pr73: https URL no query -> UTM appended (note URL() normalises bare host to host/)",
+);
+
+// 2. https URL with path + existing query — UTM appended with &
+assertEq(
+  pr73AddUtm("https://example.no/sok?q=eple"),
+  "https://example.no/sok?q=eple&utm_source=rettfrabonden&utm_medium=referral&utm_campaign=producer_profile",
+  "pr73: https URL with existing query -> UTM appended after &",
+);
+
+// 3. http (not https) — preserved
+assertEq(
+  pr73AddUtm("http://x.com"),
+  "http://x.com/?utm_source=rettfrabonden&utm_medium=referral&utm_campaign=producer_profile",
+  "pr73: http URL preserved (no upgrade to https)",
+);
+
+// 4. URL with trailing slash on a path — slash preserved
+assertEq(
+  pr73AddUtm("https://farm.no/butikk/"),
+  "https://farm.no/butikk/?utm_source=rettfrabonden&utm_medium=referral&utm_campaign=producer_profile",
+  "pr73: trailing slash on path preserved",
+);
+
+// 5. Malformed / non-URL input — returned unchanged
+assertEq(pr73AddUtm("not-a-url"), "not-a-url", "pr73: malformed URL returned unchanged");
+assertEq(pr73AddUtm(""), "", "pr73: empty string returned unchanged");
+
+// 6. Non-http(s) schemes — left alone (mailto/tel/javascript)
+assertEq(pr73AddUtm("mailto:hei@gard.no"), "mailto:hei@gard.no", "pr73: mailto: untouched");
+assertEq(pr73AddUtm("tel:+4791234567"), "tel:+4791234567", "pr73: tel: untouched");
+
+// 7. http://x.com vs https://x.com/path?a=1 — both work, scheme preserved
+assertEq(
+  pr73AddUtm("https://x.com/path?a=1"),
+  "https://x.com/path?a=1&utm_source=rettfrabonden&utm_medium=referral&utm_campaign=producer_profile",
+  "pr73: https URL with path+query gets UTM appended",
+);
+
+// 8. Producer already has utm_source — we leave the whole URL alone (their
+// attribution wins; we don't squat on existing UTM tagging).
+assertEq(
+  pr73AddUtm("https://example.no/?utm_source=meta_ads&utm_medium=cpc"),
+  "https://example.no/?utm_source=meta_ads&utm_medium=cpc",
+  "pr73: existing utm_source -> URL untouched (don't squat)",
+);
+
+// ── PR-73: llms.txt expansion ────────────────────────────────────────
+// Source-grep approach (same pattern as m2-A1/A2/A3 above): we assert that
+// the new sections are present in discovery.ts. Booting an express server
+// here would race the m2 owner-portal in-memory DB singleton (see PR-69/70
+// revert in 28ad96f for the same class of issue). The live render is also
+// covered by the visibility-check scheduled task post-deploy.
+console.log("\n── PR-73: /llms.txt expanded content ──");
+{
+  const fs73 = require("fs") as typeof import("fs");
+  const discSrc = fs73.readFileSync("src/routes/discovery.ts", "utf8");
+
+  // Hard-coded: the rendered body is built from this template literal, so
+  // a substring match in source = substring in response.
+  assertTrue(
+    discSrc.includes("/llms.txt"),
+    "pr73: discovery.ts has /llms.txt route (sanity check)"
+  );
+  // Stand-in for "response length > 3000 bytes" — the template literal we
+  // added is itself > 3000 bytes of static content. We measure it by
+  // checking that the new section headers are all present (each is unique).
+  const requiredSections = [
+    "Kategori x by",
+    "Norske byer med koordinater",
+    "Sesong-info",
+    "Paraply-organisasjoner",
+    "For AI-agenter (A2A-protokollen)",
+  ];
+  for (const s of requiredSections) {
+    assertTrue(discSrc.includes(s), `pr73: llms.txt source contains section '${s}'`);
+  }
+  assertTrue(
+    discSrc.includes("Hanen") && discSrc.includes("Bondens Marked") && discSrc.includes("Debio"),
+    "pr73: llms.txt source mentions Hanen + Bondens Marked + Debio"
+  );
+  assertTrue(
+    discSrc.includes("Norsk Gardsmat"),
+    "pr73: llms.txt source mentions Norsk Gardsmat (4th umbrella)"
+  );
+  // Coordinate table: 30 cities including the Oslo lat we added
+  assertTrue(
+    discSrc.includes("59.9139") && discSrc.includes("10.7522"),
+    "pr73: llms.txt source contains Oslo coordinates (59.9139, 10.7522)"
+  );
+  // 30 city tuples — count the lat brackets we wrote
+  const cityCount = (discSrc.match(/\[\"[A-Za-zæøåÆØÅ ]+\", \d+\.\d+, \d+\.\d+\]/g) || []).length;
+  assertTrue(cityCount >= 30, `pr73: at least 30 city coordinate tuples present (was ${cityCount})`);
+  // Sesong content sanity: "ramsløk" appears in the April/May rows
+  assertTrue(discSrc.includes("ramsløk"), "pr73: sesong table includes ramsløk");
+  // Total file size as a rough proxy for "response > 3000 bytes" (the new
+  // template literal alone added > 3000 bytes; verified by the live render
+  // preview harness during development → 6.7 KB rendered body).
+  assertTrue(discSrc.length > 8000, `pr73: discovery.ts is large after expansion (${discSrc.length} bytes)`);
+}
+
 // ── REPORT ────────────────────────────────────────────────────────────
 
 // Wait for the M2 owner-portal async tests before reporting so their

@@ -25,6 +25,7 @@ import { DiscoveryQuerySchema } from "../models/marketplace";
 import { getDb } from "../database/init";
 import { conversationService } from "../services/conversation-service";
 import { slugify } from "../utils/slug";
+import { addUtmParams } from "../utils/url-utm";
 import { t, htmlLangAttr, ogLocale, localizedPath, type Lang } from "../i18n/t";
 import {
   parseIsoOrSqlite,
@@ -2641,7 +2642,7 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
       if (k.address) umbContactItems.push(`<div class="ct-item"><div class="ct-icon">&#128205;</div><div><div class="ct-label">Adresse</div><div class="ct-val">${escapeHtml(k.address)}${k.postalCode ? `, ${escapeHtml(k.postalCode)}` : ""}</div></div></div>`);
       if (k.phone) umbContactItems.push(`<div class="ct-item"><div class="ct-icon">&#128222;</div><div><div class="ct-label">Telefon</div><div class="ct-val"><a href="tel:${k.phone.replace(/\s+/g, "")}">${escapeHtml(k.phone)}</a></div></div></div>`);
       if (k.email) umbContactItems.push(`<div class="ct-item"><div class="ct-icon">&#9993;</div><div><div class="ct-label">E-post</div><div class="ct-val"><a href="mailto:${k.email}">${escapeHtml(k.email)}</a></div></div></div>`);
-      if (k.website) umbContactItems.push(`<div class="ct-item"><div class="ct-icon">&#127760;</div><div><div class="ct-label">Nettside</div><div class="ct-val"><a href="${escapeHtml(k.website)}" target="_blank" rel="noopener">${escapeHtml(k.website.replace(/^https?:\/\//, ""))}</a></div></div></div>`);
+      if (k.website) umbContactItems.push(`<div class="ct-item"><div class="ct-icon">&#127760;</div><div><div class="ct-label">Nettside</div><div class="ct-val"><a href="${escapeHtml(addUtmParams(k.website))}" target="_blank" rel="noopener">${escapeHtml(k.website.replace(/^https?:\/\//, ""))}</a></div></div></div>`);
       // Google Maps search — search by name + (address|city), never raw coords.
       if (k.address || k.phone || k.email || k.website) {
         const umbMapsParts = [agent.name];
@@ -2859,7 +2860,7 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
     if (k.address) contactItems.push(`<div class="ct-item"><div class="ct-icon">&#128205;</div><div><div class="ct-label">Adresse</div><div class="ct-val">${escapeHtml(k.address)}${k.postalCode ? `, ${escapeHtml(k.postalCode)}` : ""}</div></div></div>`);
     if (k.phone) contactItems.push(`<div class="ct-item"><div class="ct-icon">&#128222;</div><div><div class="ct-label">Telefon</div><div class="ct-val"><a href="tel:${k.phone.replace(/\s+/g, "")}">${escapeHtml(k.phone)}</a></div></div></div>`);
     if (k.email) contactItems.push(`<div class="ct-item"><div class="ct-icon">&#9993;</div><div><div class="ct-label">E-post</div><div class="ct-val"><a href="mailto:${k.email}">${escapeHtml(k.email)}</a></div></div></div>`);
-    if (k.website) contactItems.push(`<div class="ct-item"><div class="ct-icon">&#127760;</div><div><div class="ct-label">Nettside</div><div class="ct-val"><a href="${escapeHtml(k.website)}" target="_blank" rel="noopener">${escapeHtml(k.website.replace(/^https?:\/\//, ""))}</a></div></div></div>`);
+    if (k.website) contactItems.push(`<div class="ct-item"><div class="ct-icon">&#127760;</div><div><div class="ct-label">Nettside</div><div class="ct-val"><a href="${escapeHtml(addUtmParams(k.website))}" target="_blank" rel="noopener">${escapeHtml(k.website.replace(/^https?:\/\//, ""))}</a></div></div></div>`);
 
     // Google Maps link — ALWAYS search by business name, never raw coordinates.
     // Our lat/lng are often just city-center approximations, not actual business
@@ -3334,7 +3335,7 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
         <h3>${lang === "en" ? "Contact information" : "Kontaktinformasjon"}</h3>
         ${contactItems.join("") || `<p style="color:var(--g500);font-size:0.88rem;">${lang === "en" ? "No contact info available yet." : "Ingen kontaktinfo tilgjengelig enn\u00e5."}</p>`}
         <div class="ct-actions">
-          ${k.website ? `<a href="${escapeHtml(k.website)}" class="btn-p" target="_blank" rel="noopener">&#127760; Bes\u00f8k nettside</a>` : ""}
+          ${k.website ? `<a href="${escapeHtml(addUtmParams(k.website))}" class="btn-p" target="_blank" rel="noopener">&#127760; Bes\u00f8k nettside</a>` : ""}
           <a href="${mapsUrl}" class="btn-s" target="_blank" rel="noopener">&#128506; Vis p\u00e5 kart</a>
           <a href="${BASE_URL}/api/marketplace/agents/${agent.id}/vcard" class="btn-s">&#128195; Last ned kontaktkort</a>
         </div>
