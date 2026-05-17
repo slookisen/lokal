@@ -506,8 +506,33 @@ class MarketplaceRegistry {
         .map(w => w.replace(/[.,!?]/g, "").toLowerCase())
         .filter(w => w.length >= 3 && !skipWords.has(w));
 
-      // Don't name-search if all words are food/location terms (avoid false positives)
-      const allAreKnownTerms = nonSkipWords.every(w => {
+      // PR-72: Known Norwegian place names that should NOT trigger name-search.
+      // Without this list, queries like "fersk fisk i Bergen" set
+      // _nameQuery="fersk fisk bergen". The fuzzy fallback then matches every
+      // agent with "Bergen" in its name (e.g. "Godt Brød Bergen" — a bakery),
+      // overriding the category filter (fish) and yielding wildly off-topic
+      // results. The route's geocoding handles location filtering separately,
+      // so we can safely treat these as location words, not name tokens.
+      const KNOWN_PLACE_WORDS = new Set([
+        // Top-30 cities (mirrors geocoding-service.ts MAJOR_CITIES)
+        "oslo", "bergen", "trondheim", "stavanger", "tromsø", "tromso",
+        "kristiansand", "drammen", "fredrikstad", "bodø", "bodo",
+        "ålesund", "alesund", "tønsberg", "tonsberg", "haugesund",
+        "sandnes", "lillestrøm", "lillestrom", "hamar", "lillehammer",
+        "sandefjord", "sarpsborg", "skien", "molde", "moss", "asker",
+        "kongsberg", "porsgrunn", "arendal", "larvik", "halden",
+        // Common region/fylke names
+        "vestland", "viken", "rogaland", "trøndelag", "trondelag",
+        "nordland", "innlandet", "troms", "finnmark", "agder", "vestfold",
+        "telemark", "østfold", "ostfold", "akershus", "buskerud", "oppland",
+        "hedmark", "sogn", "fjordane", "møre", "more", "romsdal",
+        // Common Oslo districts / neighborhoods
+        "grünerløkka", "grunerlokka", "frogner", "majorstuen", "sentrum",
+      ]);
+
+      // Don't name-search if all words are food/location/place terms (avoid false positives)
+      const isKnownTerm = (w: string) => {
+        if (KNOWN_PLACE_WORDS.has(w)) return true;
         for (const keywords of Object.values(categoryMap)) {
           if ((keywords as string[]).includes(w)) return true;
         }
@@ -515,26 +540,40 @@ class MarketplaceRegistry {
           if ((keywords as string[]).includes(w)) return true;
         }
         return false;
-      });
+      };
+      const allAreKnownTerms = nonSkipWords.every(isKnownTerm);
 
       if (!allAreKnownTerms && nonSkipWords.length > 0) {
-        // Quick check: do any of these words appear in an agent name?
-        const db = getDb();
-        // Phase 5.11 A4.1: exclude umbrellas from name-match candidate set
-        const allNames = (db.prepare("SELECT name FROM agents WHERE is_active = 1 AND umbrella_type IS NULL").all() as any[])
-          .map(r => (r.name || "").toLowerCase());
+        // PR-72: Words that drive name-matching must NOT include known
+        // categories/tags/places. Otherwise "Bergen" alone would qualify the
+        // query as a name-search just because some agent contains "Bergen"
+        // in its name.
+        const nameCandidateWords = nonSkipWords.filter(w => !isKnownTerm(w));
 
-        const nameMatches = nonSkipWords.filter(word =>
-          allNames.some(name => name.includes(word))
-        );
+        if (nameCandidateWords.length > 0) {
+          // Quick check: do any of these distinctive words appear in an agent name?
+          const db = getDb();
+          // Phase 5.11 A4.1: exclude umbrellas from name-match candidate set
+          const allNames = (db.prepare("SELECT name FROM agents WHERE is_active = 1 AND umbrella_type IS NULL").all() as any[])
+            .map(r => (r.name || "").toLowerCase());
 
-        if (nameMatches.length > 0) {
-          // At least one word matches an agent name — use it as name query
-          const nameParts = queryWords
-            .map(w => w.replace(/[.,!?]/g, ""))
-            .filter(w => w.length >= 2 && !skipWords.has(w.toLowerCase()));
-          if (nameParts.join(" ").length >= 3) {
-            (parsed as any)._nameQuery = nameParts.join(" ");
+          const nameMatches = nameCandidateWords.filter(word =>
+            allNames.some(name => name.includes(word))
+          );
+
+          if (nameMatches.length > 0) {
+            // At least one DISTINCTIVE word matches an agent name — use it as name query.
+            // PR-72: If categories were also detected, prefer the category-filter path
+            // over name-search (category match is stronger signal than a fuzzy name word).
+            // Pass 1 (explicit indicator words like "gård") still sets _nameQuery directly.
+            if (!parsed.categories || parsed.categories.length === 0) {
+              const nameParts = queryWords
+                .map(w => w.replace(/[.,!?]/g, ""))
+                .filter(w => w.length >= 2 && !skipWords.has(w.toLowerCase()));
+              if (nameParts.join(" ").length >= 3) {
+                (parsed as any)._nameQuery = nameParts.join(" ");
+              }
+            }
           }
         }
       }
