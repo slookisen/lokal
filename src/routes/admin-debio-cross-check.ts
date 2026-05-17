@@ -30,6 +30,11 @@
 //                              Default 1200 (backward-compat).
 //     async=1                — (PR-65) fire-and-forget; returns 202 + job_id.
 //                              Poll GET /admin/jobs/<job_id> for progress.
+//     source=finnoko|traces|auto
+//                            — (PR-70) which upstream to query. Default
+//                              "auto" = finnoko first, TRACES on error.
+//                              "finnoko" = skip TRACES entirely.
+//                              "traces" = skip finnoko (legacy behaviour).
 //
 // Auth: X-Admin-Key header (same key as other /admin/* endpoints).
 //
@@ -38,7 +43,7 @@
 // chunk via start_traces_page/max_traces_pages.
 
 import { Router, Request, Response } from "express";
-import { runDebioCrossCheck, DEFAULT_SINCE_ISO } from "../services/debio-cross-check";
+import { runDebioCrossCheck, DEFAULT_SINCE_ISO, DebioSource } from "../services/debio-cross-check";
 import { startJob } from "../services/job-tracker";
 
 const router = Router();
@@ -87,19 +92,31 @@ function parseMaxTracesPages(raw: unknown): number {
   return Math.floor(n);
 }
 
+// PR-70: parse the optional source query param. Default "auto" (try
+// finnoko first, fall back to TRACES on error). Accepts only the three
+// canonical values — anything else falls through to "auto".
+function parseSource(raw: unknown): DebioSource {
+  if (typeof raw !== "string") return "auto";
+  const v = raw.trim().toLowerCase();
+  if (v === "finnoko" || v === "traces" || v === "auto") return v;
+  return "auto";
+}
+
 router.post("/cross-check", async (req: Request, res: Response) => {
   if (!requireAdmin(req, res)) return;
 
   const since = parseSince(req.query.since);
-  // PR-65: pagination offset + per-call cap.
+  // PR-65: pagination offset + per-call cap (TRACES-only knobs).
   const startTracesPage = parseStartTracesPage(req.query.start_traces_page);
   const maxTracesPages = parseMaxTracesPages(req.query.max_traces_pages);
+  // PR-70: which data source to query — defaults to "auto".
+  const source = parseSource(req.query.source);
   const wantAsync = req.query.async === "1" || req.query.async === "true";
 
-  const opts = { since, startTracesPage, maxTracesPages };
+  const opts = { since, startTracesPage, maxTracesPages, source };
 
   if (wantAsync) {
-    const dedupeKey = `since=${since}:s=${startTracesPage}:m=${maxTracesPages}`;
+    const dedupeKey = `src=${source}:since=${since}:s=${startTracesPage}:m=${maxTracesPages}`;
     const job = startJob("debio-cross-check", async () => {
       return await runDebioCrossCheck(opts);
     }, { dedupeKey });
@@ -109,6 +126,7 @@ router.post("/cross-check", async (req: Request, res: Response) => {
       started_at: job.started_at,
       endpoint: job.endpoint,
       since,
+      source,
       traces_pages_processed: {
         start: startTracesPage,
         end: startTracesPage + maxTracesPages - 1,
