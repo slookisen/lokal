@@ -1796,6 +1796,21 @@ function initSchema(db: Database.Database): void {
     )
   `);
   db.exec(`CREATE INDEX IF NOT EXISTS idx_hanen_unmatched_last_seen ON hanen_unmatched_members(last_seen_at)`);
+
+  // ─── PR-68 (2026-05-17): hanen_unmatched_members.imported_agent_id ──
+  // Phase B.2 batch-import endpoint promotes unmatched Hanen rows into
+  // new producer agents. We track the resulting agent id ON the
+  // unmatched row so subsequent /admin/hanen/batch-import-unmatched
+  // calls skip already-imported rows (re-run safety). Mirrors the
+  // PR-58 additive-migration pattern (ALTER TABLE inside a try/catch).
+  try {
+    const cols = db.prepare("PRAGMA table_info(hanen_unmatched_members)").all() as Array<{ name: string }>;
+    if (!cols.some(c => c.name === "imported_agent_id")) {
+      db.exec(`ALTER TABLE hanen_unmatched_members ADD COLUMN imported_agent_id TEXT`);
+    }
+  } catch (e) {
+    console.warn("[init][pr-68] hanen_unmatched_members.imported_agent_id migration skipped:", e instanceof Error ? e.message : String(e));
+  }
   // ─── Phase 5.11 C.1-A (2026-05-16): Debio TRACES cross-check ────────
   // Unmatched Debio organic-operators surfaced by /admin/debio/cross-check.
   // We do NOT auto-create producer agents for these — the operator may be
