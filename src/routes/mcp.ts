@@ -22,7 +22,6 @@ import { marketplaceRegistry } from "../services/marketplace-registry";
 import { knowledgeService, parseProductPrice, isProductHeader, isProductNoise } from "../services/knowledge-service";
 import { slugify } from "../utils/slug";
 import { getDb } from "../database/init";
-import { geocodingService } from "../services/geocoding-service";
 
 
 import { conversationService } from "../services/conversation-service";
@@ -628,47 +627,6 @@ function registerTools(server: McpServer, getClientIdentity?: () => string | und
         sections.push(`  Kilde: ${r.source_url}`);
       }
       return { content: [{ type: "text" as const, text: sections.join("\n") }] };
-    }
-  );
-
-  // Tool 9: Geocode Norwegian place names (PR-76)
-  // Resolves a Norwegian place name to lat/lng coordinates. Backs the
-  // geocodingService directly — no HTTP loopback. With PR-75's expanded
-  // MAJOR_CITIES, most calls return hardcoded coords instantly. Anything
-  // not hardcoded falls back to DB-lookup → Kartverket API.
-  server.registerTool(
-    "lokal_geocode",
-    {
-      title: "Geocode a Norwegian place name",
-      description: "Resolve a Norwegian place name (city, town, region, fylke, or kommune) to lat/lng coordinates. Use this when you need explicit coordinates for lokal_discover (e.g., 'show me organic farms within 10 km of Florø'). Returns coordinates + suggested search radius. Covers all of Norway via Kartverket Stedsnavn API fallback. Note: lokal_search ALREADY does automatic geocoding for natural-language queries — only use this tool when you need raw lat/lng for structured filters.",
-      inputSchema: {
-        place: z.string().describe("Norwegian place name (city, town, region, fylke, kommune). Examples: 'Oslo', 'Røros', 'Vestland', 'Setesdal', 'Florø'"),
-      },
-      annotations: {
-        title: "Geocode Norwegian place",
-        readOnlyHint: true,
-        destructiveHint: false,
-        idempotentHint: true,
-        openWorldHint: false,
-      },
-    },
-    async ({ place }) => {
-      const result = await geocodingService.geocode(place);
-      if (!result) {
-        return {
-          content: [{
-            type: "text" as const,
-            text: `Fant ikke koordinater for "${place}". Prøv en kjent norsk by, kommune, region eller fylke.`,
-          }],
-        };
-      }
-      // Concise structured text — LLM-friendly + line-parseable
-      return {
-        content: [{
-          type: "text" as const,
-          text: `📍 ${result.name}\nlat: ${result.lat}\nlng: ${result.lng}\nradius_km: ${result.radiusKm}\nsource: ${result.source}`,
-        }],
-      };
     }
   );
 
