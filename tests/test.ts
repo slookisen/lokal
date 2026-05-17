@@ -127,8 +127,16 @@ console.log("── trust-score community signal tests ──");
 // Spin up an in-memory database that mimics the production schema so the
 // service's direct SQL works without touching a real DB file.
 import Database from "better-sqlite3";
-import { __setDbForTesting } from "../src/database/init";
+import { __setDbForTesting, __resetDbSingleton, __setStrictUnpinnedGuard } from "../src/database/init";
 import { trustScoreService } from "../src/services/trust-score-service";
+
+// PR-79 v2: enable strict-unpinned guard at test start so any stray
+// service call between mutex slots throws (caught by the block's try/catch)
+// instead of silently creating an on-disk lokal.db with empty schema.
+// Local tearing-down is fast enough that this race never surfaces; CI's
+// slower process tickles it, and v1's mutex didn't cover it.
+__setStrictUnpinnedGuard(true);
+
 
 
 // === Test-DB Mutex (PR-79) ===
@@ -161,12 +169,19 @@ async function withTestDb<T>(
 
   try {
     try { await prior; } catch { /* prior block errored — don't block us */ }
+    // PR-79 v2: reset singleton BEFORE setup so any orphaned disk handle
+    // left by an earlier stray getDb() call is closed and the variable
+    // is unambiguously null. setupDb() then builds its fresh in-memory DB.
+    __resetDbSingleton();
     const db = (await setupDb()) as any;
     __setDbForTesting(db as any);
     try {
       return await fn(db);
     } finally {
-      try { __setDbForTesting(null as any); } catch { /* tolerate older APIs */ }
+      // PR-79 v2: tear down via __resetDbSingleton() rather than setting
+      // to null only. This closes the test DB handle and guarantees the
+      // next slot starts from a known-empty singleton state.
+      try { __resetDbSingleton(); } catch { /* tolerate older APIs */ }
     }
   } finally {
     releaseMe();
@@ -193,10 +208,19 @@ async function withTestDbMutex<T>(
   _lastTestDbPromise = myTurn;
   try {
     try { await prior; } catch { /* prior block errored — don't block us */ }
+    // PR-79 v2: reset singleton BEFORE the slot runs so an orphaned disk
+    // handle created by a stray pre-mutex getDb() (e.g. geocodingService
+    // lookupInDatabase invoked from the non-mutex'd PR-76 IIFE while we
+    // were between slots) is closed. The block then pins its own DB.
+    __resetDbSingleton();
     try {
       return await fn();
     } finally {
-      try { __setDbForTesting(null as any); } catch { /* tolerate older APIs */ }
+      // PR-79 v2: close the test DB handle as well so the next slot
+      // starts from a clean singleton state — `__setDbForTesting(null)`
+      // alone left the in-memory handle dangling and (locally only) the
+      // disk fallback bound itself silently on the next stray getDb().
+      try { __resetDbSingleton(); } catch { /* tolerate older APIs */ }
     }
   } finally {
     releaseMe();
