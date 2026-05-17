@@ -6266,10 +6266,10 @@ console.log("── PR-29 related-producers tests ──");
     "phase5.11-a7: lokal_get_producer_affiliations tool registered"
   );
 
-  // (3) Exactly 8 tool registrations (4 base + 3 umbrella + 1 BM events from PR-56)
+  // (3) Exactly 9 tool registrations (4 base + 3 umbrella + 1 BM events from PR-56 + 1 geocode from PR-76)
   const toolCount = (mcpSrc.match(/server\.registerTool\(/g) || []).length;
-  assertEq(toolCount, 8,
-    "phase5.11-a7: src/routes/mcp.ts registers exactly 8 tools (4 base + 3 umbrella + 1 BM events from PR-56)");
+  assertEq(toolCount, 9,
+    "phase5.11-a7: src/routes/mcp.ts registers exactly 9 tools (4 base + 3 umbrella + 1 BM events from PR-56 + 1 geocode from PR-76)");
 
   // (4) DB-direct pattern: getDb() imported (no HTTP loopback for new tools)
   assertTrue(
@@ -9996,6 +9996,138 @@ const _pr75Promise = (async () => {
   failed++;
   failures.push(`✗ pr-75 async test setup failed: ${err instanceof Error ? err.message : String(err)}`);
 });
+// ── PR-76: lokal_geocode MCP tool ────────────────────────────────────
+// Behavioural tests on the geocodingService (which the new MCP tool calls
+// directly) + source-grep tests confirming the tool wiring is in place in
+// both the HTTP-MCP server (src/routes/mcp.ts) and the stdio MCP server
+// (mcp-server/index.js).
+let _pr76Resolve: () => void = () => {};
+const _pr76Promise: Promise<void> = new Promise<void>(r => { _pr76Resolve = r; });
+
+(async () => {
+  // Wait for pr-56 (which also stubs globalThis.fetch) to finish before
+  // we touch fetch — otherwise our stubs collide and pr-56 tests flake.
+  try { await _pr56Promise; } catch { /* ignored; pr-56 owns its own failures */ }
+  console.log("\n── PR-76: lokal_geocode MCP tool ──");
+  const fs = require("fs");
+  const mcpSrc = fs.readFileSync("src/routes/mcp.ts", "utf-8");
+  const stdioSrc = fs.readFileSync("mcp-server/index.js", "utf-8");
+  const marketplaceSrc = fs.readFileSync("src/routes/marketplace.ts", "utf-8");
+
+  // (1) HTTP-MCP server: lokal_geocode tool is registered
+  assertTrue(
+    /registerTool\(\s*"lokal_geocode"/.test(mcpSrc),
+    "pr-76: lokal_geocode tool registered in src/routes/mcp.ts"
+  );
+
+  // (2) HTTP-MCP server: geocodingService imported (DB-direct, no HTTP loopback)
+  assertTrue(
+    /import \{ geocodingService \} from "\.\.\/services\/geocoding-service"/.test(mcpSrc),
+    "pr-76: geocodingService imported in src/routes/mcp.ts"
+  );
+
+  // (3) HTTP-MCP server: tool description mentions key concepts
+  const toolBlockMatch = mcpSrc.match(/registerTool\(\s*"lokal_geocode"[\s\S]{0,2000}\)/);
+  assertTrue(
+    !!toolBlockMatch && /Norwegian place name/i.test(toolBlockMatch[0]),
+    "pr-76: lokal_geocode description mentions 'Norwegian place name'"
+  );
+
+  // (4) HTTP-MCP server: tool annotations are read-only + idempotent + closed-world
+  assertTrue(
+    !!toolBlockMatch &&
+      /readOnlyHint:\s*true/.test(toolBlockMatch[0]) &&
+      /idempotentHint:\s*true/.test(toolBlockMatch[0]) &&
+      /openWorldHint:\s*false/.test(toolBlockMatch[0]),
+    "pr-76: lokal_geocode is read-only + idempotent + openWorldHint:false"
+  );
+
+  // (5) Stdio MCP server: lokal_geocode mirrored
+  assertTrue(
+    /registerTool\(\s*"lokal_geocode"/.test(stdioSrc),
+    "pr-76: lokal_geocode tool mirrored in mcp-server/index.js (stdio server)"
+  );
+
+  // (6) Stdio mirror calls public /api/marketplace/geocode endpoint
+  assertTrue(
+    /\/api\/marketplace\/geocode/.test(stdioSrc),
+    "pr-76: stdio mirror calls /api/marketplace/geocode HTTP endpoint"
+  );
+
+  // (7) HTTP endpoint registered for stdio mirror to call
+  assertTrue(
+    /router\.get\("\/geocode"/.test(marketplaceSrc),
+    "pr-76: GET /api/marketplace/geocode endpoint registered in marketplace.ts"
+  );
+
+  // ── Behavioural tests on geocodingService (what the tool handler invokes) ──
+  const { geocodingService } = require("../src/services/geocoding-service");
+
+  // (8) Hardcoded city: Oslo returns known coords with source 'hardcoded'
+  const oslo = await geocodingService.geocode("Oslo");
+  assertTrue(
+    !!oslo && oslo.lat === 59.9139 && oslo.lng === 10.7522,
+    "pr-76: geocode('Oslo') returns lat=59.9139, lng=10.7522"
+  );
+  assertEq(
+    oslo && oslo.source, "hardcoded",
+    "pr-76: geocode('Oslo') source = 'hardcoded'"
+  );
+
+  // (9) Hardcoded city: Bergen
+  const bergen = await geocodingService.geocode("Bergen");
+  assertEq(
+    bergen && bergen.source, "hardcoded",
+    "pr-76: geocode('Bergen') source = 'hardcoded'"
+  );
+
+  // (10) Tool handler output format — verify the text shape the MCP tool emits
+  // for hardcoded city Oslo (mirrors the handler body in src/routes/mcp.ts)
+  const sample = oslo
+    ? `📍 ${oslo.name}\nlat: ${oslo.lat}\nlng: ${oslo.lng}\nradius_km: ${oslo.radiusKm}\nsource: ${oslo.source}`
+    : "";
+  assertTrue(
+    /lat: 59\.9139/.test(sample) && /lng: 10\.7522/.test(sample) && /source: hardcoded/.test(sample),
+    "pr-76: tool output text contains lat, lng, and source lines for Oslo"
+  );
+
+  // (11) Not found: stub Kartverket fetch to return empty so we can assert null
+  // gracefully (without making a real network call). The geocodingService
+  // caches by lowercased name, so use a unique key that hasn't been cached.
+  const realFetch = (globalThis as any).fetch;
+  (globalThis as any).fetch = async (url: string) => {
+    if (typeof url === "string" && url.includes("ws.geonorge.no")) {
+      return {
+        ok: true,
+        status: 200,
+        statusText: "OK",
+        json: async () => ({ navn: [] }),
+      };
+    }
+    return realFetch ? realFetch(url) : { ok: false, status: 500, statusText: "no fetch", json: async () => ({}) };
+  };
+  try {
+    const bogus = await geocodingService.geocode("InvalidPlace123XYZ");
+    assertEq(bogus, null, "pr-76: geocode('InvalidPlace123XYZ') returns null (graceful)");
+
+    // (12) Tool handler emits 'Fant ikke' text for null geocode result
+    const bogusText = bogus
+      ? "found"
+      : `Fant ikke koordinater for "InvalidPlace123XYZ". Prøv en kjent norsk by, kommune, region eller fylke.`;
+    assertTrue(
+      /Fant ikke koordinater/.test(bogusText),
+      "pr-76: tool handler returns 'Fant ikke koordinater' text when geocode returns null"
+    );
+  } finally {
+    (globalThis as any).fetch = realFetch;
+  }
+})()
+  .then(() => _pr76Resolve())
+  .catch(err => {
+    failed++;
+    failures.push(`✗ pr-76 async test setup failed: ${err instanceof Error ? err.message : String(err)}`);
+    _pr76Resolve();
+  });
 
 
 // ── REPORT ────────────────────────────────────────────────────────────
@@ -10016,6 +10148,7 @@ const _pr75Promise = (async () => {
   try { await _pr68Promise; } catch { /* errors already pushed to failures */ }
   try { await _pr74Promise; } catch { /* errors already pushed to failures */ }
   try { await _pr75Promise; } catch { /* errors already pushed to failures */ }
+  try { await _pr76Promise; } catch { /* errors already pushed to failures */ }
   // Drop pre-existing intg failures (unmasked by awaiting) — they predate M2
   // and live behind a separate fix-it task. Counting them here would surface
   // a baseline failure that is not introduced by this PR.

@@ -801,6 +801,38 @@ router.get("/stats", (_req: Request, res: Response) => {
   });
 });
 
+// ─── GET /geocode — Resolve Norwegian place name → lat/lng (PR-76) ────
+// Backs the lokal_geocode MCP tool for the stdio (npm) server which calls
+// this endpoint over HTTP. The HTTP-MCP server (src/routes/mcp.ts) calls
+// the geocodingService directly without going through this endpoint.
+router.get("/geocode", async (req: Request, res: Response) => {
+  const place = (req.query.place || req.query.q || "").toString().trim();
+  if (!place) {
+    res.status(400).json({ success: false, error: "Missing 'place' query parameter" });
+    return;
+  }
+  try {
+    const result = await geocodingService.geocode(place);
+    if (!result) {
+      res.status(404).json({ success: false, error: `No coordinates found for "${place}"`, place });
+      return;
+    }
+    res.json({
+      success: true,
+      place,
+      result: {
+        name: result.name,
+        lat: result.lat,
+        lng: result.lng,
+        radiusKm: result.radiusKm,
+        source: result.source,
+      },
+    });
+  } catch (err: any) {
+    res.status(500).json({ success: false, error: err?.message || "Geocoding failed" });
+  }
+});
+
 // ─── GET /agents — List all active agents ────────────────────
 
 router.get("/agents", (_req: Request, res: Response) => {

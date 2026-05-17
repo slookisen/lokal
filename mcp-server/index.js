@@ -418,6 +418,48 @@ server.registerTool(
   }
 );
 
+// Tool 8 (PR-76): Geocode a Norwegian place name
+// Mirrors the HTTP-MCP server's lokal_geocode tool but calls the public
+// /api/marketplace/geocode endpoint (HTTP loopback — same pattern as the
+// other stdio tools in this file).
+server.registerTool(
+  "lokal_geocode",
+  {
+    title: "Geocode a Norwegian place name",
+    description: "Resolve a Norwegian place name (city, town, region, fylke, or kommune) to lat/lng coordinates. Use this when you need explicit coordinates for lokal_discover (e.g., 'show me organic farms within 10 km of Florø'). Returns coordinates + suggested search radius. Covers all of Norway via Kartverket Stedsnavn API fallback. Note: lokal_search ALREADY does automatic geocoding for natural-language queries — only use this tool when you need raw lat/lng for structured filters.",
+    inputSchema: {
+      place: z.string().describe("Norwegian place name (city, town, region, fylke, kommune). Examples: 'Oslo', 'Røros', 'Vestland', 'Setesdal', 'Florø'"),
+    },
+    annotations: {
+      title: "Geocode Norwegian place",
+      readOnlyHint: true,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: false,
+    },
+  },
+  async ({ place }) => {
+    const url = `${BASE_URL}/api/marketplace/geocode?place=${encodeURIComponent(place)}`;
+    const res = await fetch(url, {
+      headers: { "Accept": "application/json", "User-Agent": "lokal-mcp/0.2.0" },
+    });
+    if (res.status === 404) {
+      return { content: [{ type: "text", text: `Fant ikke koordinater for "${place}". Prøv en kjent norsk by, kommune, region eller fylke.` }] };
+    }
+    if (!res.ok) {
+      throw new Error(`HTTP ${res.status}: ${res.statusText}`);
+    }
+    const data = await res.json();
+    const r = data.result || data;
+    return {
+      content: [{
+        type: "text",
+        text: `📍 ${r.name}\nlat: ${r.lat}\nlng: ${r.lng}\nradius_km: ${r.radiusKm}\nsource: ${r.source}`,
+      }],
+    };
+  }
+);
+
 // ── Start ────────────────────────────────────────────────────
 
 async function main() {
