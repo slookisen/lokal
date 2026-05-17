@@ -9269,6 +9269,8 @@ const _pr74Promise = (async () => {
   try { await _m2Promise; } catch { /* errors counted upstream */ }
   try { await _pr24Promise; } catch { /* errors counted upstream */ }
   try { await Promise.all(_pr21Promises); } catch { /* errors counted upstream */ }
+  try { await _pr63Promise; } catch { /* errors counted upstream */ }
+  try { await _pr67Promise; } catch { /* errors counted upstream */ }
   const Database = require("better-sqlite3");
   const pr74db = new Database(":memory:");
 
