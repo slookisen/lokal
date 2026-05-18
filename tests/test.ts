@@ -7626,6 +7626,9 @@ const _pr63Promise: Promise<void> = new Promise<void>(r => { _pr63Resolve = r; }
       since: "2026-01-01",
       fetchImpl: stubFetch as any,
       delayMs: 0,
+      // PR-70: pin TRACES so this PR-63 behavioural test keeps
+      // exercising the same path it always has.
+      source: "traces",
     });
 
     assertEq(result.traces_fetched, 2,
@@ -7651,6 +7654,7 @@ const _pr63Promise: Promise<void> = new Promise<void>(r => { _pr63Resolve = r; }
       since: "2026-01-01",
       fetchImpl: stubFetch as any,
       delayMs: 0,
+      source: "traces",
     });
     const aff2 = db.prepare("SELECT COUNT(*) AS c FROM agent_affiliations").get() as any;
     assertEq(aff2.c, 1, "c1a: re-running cross-check does not duplicate affiliations (idempotent)");
@@ -8154,6 +8158,9 @@ const _pr65Promise: Promise<void> = new Promise<void>(r => { _pr65Resolve = r; }
       fetchImpl: brregStub,
       delayMs: 0,
       debioUmbrellaId: "u-debio-65",
+      // PR-70: pin TRACES so this PR-65 test exercises the TRACES
+      // pagination path it was designed for.
+      source: "traces",
     });
     assertTrue(ccResult.traces_pages_processed !== undefined,
       "pr65: runDebioCrossCheck result includes traces_pages_processed");
