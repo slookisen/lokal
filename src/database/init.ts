@@ -15,6 +15,18 @@ import path from "path";
 // On Windows mounted filesystems, WAL mode may not work — we detect and fallback.
 const DB_PATH = process.env.DB_PATH || path.join(__dirname, "../../data/lokal.db");
 
+
+// PR-79 v3: env-gated trace instrumentation for the SET/RESET/GETDB sequencing
+// of the DB singleton. Off by default; enabled via TESTDB_TRACE=1 in CI's
+// fly-deploy.yml so when the strict-unpinned guard fires we have visibility
+// into which call site set the singleton last.
+function _trace(event: string, detail?: string): void {
+  if (process.env.TESTDB_TRACE === "1") {
+    const stack = new Error().stack?.split("\n").slice(2, 5).join(" | ") || "";
+    console.log(`[TESTDB_TRACE] ${event}${detail ? " " + detail : ""} :: ${stack}`);
+  }
+}
+
 let db: Database.Database;
 
 // Test-only: inject an in-memory DB so unit tests can run without touching prod.
@@ -25,6 +37,7 @@ let db: Database.Database;
 // for a tear-down that also closes any orphaned disk handle.
 export function __setDbForTesting(injected: Database.Database | null | undefined): void {
   db = injected as Database.Database;
+  _trace("SET", injected ? "pinned" : "unpinned");
 }
 
 // Test-only (PR-79 v2): fully tear down the singleton so the next getDb()
@@ -39,6 +52,7 @@ export function __resetDbSingleton(): void {
     try { db.close(); } catch { /* already closed or in-memory */ }
   }
   db = undefined as unknown as Database.Database;
+  _trace("RESET");
 }
 
 // Test-only guard (PR-79 v2): when set, getDb() will THROW instead of
@@ -53,6 +67,7 @@ export function __setStrictUnpinnedGuard(on: boolean): void {
 }
 
 export function getDb(): Database.Database {
+  _trace("GETDB", db ? "pinned" : "unpinned-falling-back");
   if (!db) {
     if (_strictUnpinnedGuard) {
       throw new Error(
