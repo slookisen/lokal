@@ -19,49 +19,12 @@ let db: Database.Database;
 
 // Test-only: inject an in-memory DB so unit tests can run without touching prod.
 // Never call this from production code paths.
-//
-// Passing null/undefined unpins the test handle. Subsequent getDb() calls
-// will re-initialize against the on-disk DB path — see __resetDbSingleton()
-// for a tear-down that also closes any orphaned disk handle.
-export function __setDbForTesting(injected: Database.Database | null | undefined): void {
-  db = injected as Database.Database;
-}
-
-// Test-only (PR-79 v2): fully tear down the singleton so the next getDb()
-// call goes through the full first-time init path. Closes a previously
-// opened on-disk handle if one was created via a stray getDb() between
-// test blocks (the disk-DB-fallback race that bit CI but not local).
-//
-// Calling this between test slots eliminates the "I called __setDbForTesting
-// for my block but getDb() still returned someone else's DB" failure mode.
-export function __resetDbSingleton(): void {
-  if (db) {
-    try { db.close(); } catch { /* already closed or in-memory */ }
-  }
-  db = undefined as unknown as Database.Database;
-}
-
-// Test-only guard (PR-79 v2): when set, getDb() will THROW instead of
-// silently re-initialising the on-disk DB if called while the singleton
-// is unpinned. This catches stray service calls that race between two
-// mutex slots and would otherwise spawn an on-disk lokal.db with empty
-// schema — which is exactly the CI race-class symptom (rows_examined=0,
-// "umbrella not found") seen in PR-79 v1.
-let _strictUnpinnedGuard = false;
-export function __setStrictUnpinnedGuard(on: boolean): void {
-  _strictUnpinnedGuard = on;
+export function __setDbForTesting(injected: Database.Database): void {
+  db = injected;
 }
 
 export function getDb(): Database.Database {
   if (!db) {
-    if (_strictUnpinnedGuard) {
-      throw new Error(
-        "[init.ts] getDb() called while DB singleton is unpinned. " +
-        "A test block likely leaked an async DB call past its withTestDb mutex slot. " +
-        "Wrap the call in withTestDbMutex(), or set __setStrictUnpinnedGuard(false) " +
-        "to fall back to the on-disk DB (production behavior)."
-      );
-    }
     // Ensure data directory exists
     const dir = path.dirname(DB_PATH);
     const fs = require("fs");
