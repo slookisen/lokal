@@ -10074,12 +10074,7 @@ const _pr75Promise = (async () => {
 let _pr76Resolve: () => void = () => {};
 const _pr76Promise: Promise<void> = new Promise<void>(r => { _pr76Resolve = r; });
 
-// PR-79 v3: wrap in withTestDbMutex — the geocodingService.geocode() calls
-// below reach getDb() (via lookupInDatabase, and via Kartverket-stub paths
-// that exercise the not-found branch). Without the mutex, those calls
-// race between other slots' __resetDbSingleton() and trip PR-79 v2's
-// strict-unpinned guard. The _pr76Promise resolve-chain is preserved.
-_pr79Promises.push(withTestDbMutex("pr-76-geocode", async () => {
+(async () => {
   // Serialize against prior PR setup so schema & DB singletons are ready
   // in CI's scheduler. Without these awaits, m2 owner-portal tests can
   // race PR-76's DB-touching geocode calls and surface CI-only failures
@@ -10203,13 +10198,13 @@ _pr79Promises.push(withTestDbMutex("pr-76-geocode", async () => {
   } finally {
     (globalThis as any).fetch = realFetch;
   }
-})
+})()
   .then(() => _pr76Resolve())
   .catch(err => {
     failed++;
     failures.push(`✗ pr-76 async test setup failed: ${err instanceof Error ? err.message : String(err)}`);
     _pr76Resolve();
-  }));
+  });
 
 
 // ─── PR-78: Storby-bydeler in MAJOR_CITIES (Oppsal disambiguation fix) ──
@@ -10220,11 +10215,7 @@ _pr79Promises.push(withTestDbMutex("pr-76-geocode", async () => {
 console.log("\n── PR-78: Storby-bydeler (Oppsal disambiguation) ──");
 let _pr78Resolve: () => void = () => {};
 const _pr78Promise: Promise<void> = new Promise<void>(r => { _pr78Resolve = r; });
-// PR-79 v3: wrap in withTestDbMutex for the same reason as PR-76 — even though
-// every assertion expects source=hardcoded, the geocodingService.geocode()
-// entry point is still an async function whose body lives in the same async
-// task graph as the other mutex slots. Wrapping serializes it.
-_pr79Promises.push(withTestDbMutex("pr-78-geocode", async () => {
+(async () => {
   const { geocodingService } = require("../src/services/geocoding-service");
 
   async function expectHardcoded(name: string, expLat: number, expLng: number, label: string) {
@@ -10318,13 +10309,13 @@ _pr79Promises.push(withTestDbMutex("pr-78-geocode", async () => {
       "pr78: source contains oppsal entry with lat=59.886, lng=10.879 (Oslo, not Lier)"
     );
   }
-})
+})()
   .then(() => _pr78Resolve())
   .catch((err: unknown) => {
     failed++;
     failures.push(`✗ pr-78 async test setup failed: ${err instanceof Error ? err.message : String(err)}`);
     _pr78Resolve();
-  }));
+  });
 
 // ── REPORT ────────────────────────────────────────────────────────────
 

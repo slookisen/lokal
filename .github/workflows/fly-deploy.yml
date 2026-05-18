@@ -52,12 +52,6 @@ jobs:
         run: npx tsc --noEmit
 
       - name: Run tests
-        env:
-          # PR-79 v3: enable TESTDB_TRACE so the SET/RESET/GETDB sequencing
-          # of the DB singleton is logged. If the strict-unpinned guard fires
-          # again, the trace lines pinpoint which call site set the singleton
-          # last and which stack reached getDb() while unpinned.
-          TESTDB_TRACE: '1'
         run: npm test
 
   deploy:
