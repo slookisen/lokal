@@ -169,10 +169,16 @@ async function withTestDb<T>(
 
   try {
     try { await prior; } catch { /* prior block errored — don't block us */ }
-    // PR-79 v2: reset singleton BEFORE setup so any orphaned disk handle
-    // left by an earlier stray getDb() call is closed and the variable
-    // is unambiguously null. setupDb() then builds its fresh in-memory DB.
-    __resetDbSingleton();
+    // PR-79 v4 (Option 1): NO __resetDbSingleton() at slot entry. The
+    // entry-time reset opened an "unpinned window" between the reset and
+    // the subsequent __setDbForTesting(db) SET. If another mutex slot's
+    // body was still executing on the same microtask tick (because of an
+    // inner await yielding), its getDb() could observe the unpinned
+    // singleton mid-flight and trip the strict-guard (intra-slot leak
+    // confirmed by TESTDB_TRACE in v3 at tests/test.ts:5220 -> 5254).
+    // Building setupDb() and SET-ing it atomically keeps the singleton
+    // either pinned-to-prior or pinned-to-new — never "transiently null".
+    // We still RESET in the finally so the next slot starts clean.
     const db = (await setupDb()) as any;
     __setDbForTesting(db as any);
     try {
@@ -208,11 +214,18 @@ async function withTestDbMutex<T>(
   _lastTestDbPromise = myTurn;
   try {
     try { await prior; } catch { /* prior block errored — don't block us */ }
-    // PR-79 v2: reset singleton BEFORE the slot runs so an orphaned disk
-    // handle created by a stray pre-mutex getDb() (e.g. geocodingService
-    // lookupInDatabase invoked from the non-mutex'd PR-76 IIFE while we
-    // were between slots) is closed. The block then pins its own DB.
-    __resetDbSingleton();
+    // PR-79 v4 (Option 1): NO __resetDbSingleton() at slot entry. The
+    // entry-time reset created an "unpinned window" where the singleton
+    // was transiently null between the slot acquiring the mutex and its
+    // body calling __setDbForTesting(db). TESTDB_TRACE v3 confirmed an
+    // intra-slot leak at tests/test.ts:5220 -> 5254: while slot N's body
+    // was mid-execution, slot N+1's entry-RESET unpinned the singleton
+    // on a microtask tick boundary, then slot N's deferred getDb() saw
+    // the transiently-null DB and the strict-guard fired. By dropping
+    // the entry reset we close that window entirely — the singleton
+    // remains pinned to whatever the previous slot finally-reset cleared
+    // (i.e. undefined) until this slot SETs its own DB. We still RESET
+    // in finally so the next slot starts clean.
     try {
       return await fn();
     } finally {
