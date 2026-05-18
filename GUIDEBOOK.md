@@ -33,11 +33,12 @@
 18. [Phase 17: Conversation System & AG-UI](#phase-17)
 19. [Phase 18: Verify-First Outreach — Quality Gate Before Marketing](#phase-18)
 20. [Phase 19: Pool-Fill Push — Domain Coherence, Queue Drain, SEO Freshness](#phase-19)
-21. [Appendix A: Tech Stack Reference](#appendix-a)
-22. [Appendix B: Deployment Checklist](#appendix-b)
-23. [Appendix C: Gotchas & Lessons Learned](#appendix-c)
-24. [Appendix D: Registry Status Matrix](#appendix-d)
-25. [Appendix E: Agent Prompts (Copy-Paste Ready)](#appendix-e)
+21. [Phase 20: Phase 5.11 Cross-Source Verification, MCP Geocoding & AI-Visibility Polish](#phase-20)
+22. [Appendix A: Tech Stack Reference](#appendix-a)
+23. [Appendix B: Deployment Checklist](#appendix-b)
+24. [Appendix C: Gotchas & Lessons Learned](#appendix-c)
+25. [Appendix D: Registry Status Matrix](#appendix-d)
+26. [Appendix E: Agent Prompts (Copy-Paste Ready)](#appendix-e)
 
 ---
 
@@ -3057,6 +3058,167 @@ Surfacing: the reason JSON is appended to the existing `cross_source_reason` col
 
 ---
 
+
+<a id="phase-20"></a>
+## Phase 20: Phase 5.11 Cross-Source Verification, MCP Geocoding & AI-Visibility Polish
+
+**Period:** 2026-05-15 to 2026-05-18 (PR-66 through PR-79).
+**Theme:** Continue the Phase 5.11 cross-source verification arc (Hanen + Debio + Bondens marked) while shipping a clean batch of marketplace-quality, geocoding, UTM-attribution, and admin-observability work. A recurring CI test-DB race-class dominated half the cycle — 5 PRs (PR-69, PR-70, PR-71, PR-79) were merged then reverted because `__setDbForTesting` shares process-level state across test blocks. The IIFE-await-chain mitigation (see 20.7) is the workaround in place at end of Phase 20; PR-79's mutex attempt to solve it cleanly failed and was reverted (see Appendix C.79).
+
+### 20.1 Debio TRACES POST-body filter — Norwegian slice (PR-66, commit `9084939`)
+
+PR-63 (C.1-A) added TRACES NT as a Debio cross-check source, but the GET-only `/for/query` path sorts globally across ~945k operator records — the Norwegian Debio rows are too sparse in the first 10k pages to surface within Fly's 120s proxy window. Result: 0 Debio matches after each cycle.
+
+PR-66 wires `src/services/traces-client.ts` to issue a POST body with `country=NO` + `competentAuthority=Debio` as a server-side filter, falling back to the GET path when TRACES returns 404/405/501. A "fallback latch" sticks on the first non-200 so subsequent calls in the same process don't re-pay the timeout cost. Defense-in-depth: client-side `isDebioRecord()` still applies after fetch — POST or GET, the Norwegian Debio shape is the only thing we keep.
+
+**Verify:**
+```bash
+curl -X POST "https://rettfrabonden.com/admin/debio/cross-check?async=1&max_traces_pages=3" \
+  -H "x-admin-key: $ADMIN_KEY"
+# → job_id returned, completes ~5s; traces_fetched=0 in worst-case (POST unsupported upstream),
+#   GET-fallback behaviour retained, no error.
+```
+
+### 20.2 Hanen matcher v3 — location-suffix + fylke-fallback + domain corroboration (PR-67, commit `9b97896` + iter-2 `ffab7b3`)
+
+`src/services/hanen-scraper.ts` and new `src/services/location-suffix-parser.ts`:
+
+1. **`parseNameLocationSuffix()`** strips an em-dash / en-dash / hyphen / parenthesis location tail from a Hanen member name (e.g. `Stuevolla – Røros`, `Storlidalen (Oppdal)`) and returns the suffix as a fallback fylke/kommune signal.
+2. **`normaliseDomain()` + `domainsMatch()`** compare the registrable domain of Hanen's listed website against `agents.url` for a corroboration boost.
+3. Matcher now ranks candidates by: (a) exact name + exact city, (b) exact name + suffix-derived fylke, (c) fuzzy name + domain match, (d) fuzzy name + dual fylke corroboration (both the official Hanen fylke AND the suffix-derived one agree). `review_required` only when no signal lands.
+4. New endpoint `POST /admin/hanen/scrape?re_classify_only=1` re-runs the matcher against existing `review_required` rows without re-fetching Hanen — for retroactive promotion after each matcher upgrade.
+
+**Verify:**
+```bash
+curl -X POST "https://rettfrabonden.com/admin/hanen/scrape?re_classify_only=1" \
+  -H "x-admin-key: $ADMIN_KEY"
+# → { rows_examined: 195, promoted: 33, still_pending: 162, errors: [] }
+# (matcher v3 is still conservative on parsed-website-cold cohort; subsequent
+#  yield-lift PRs PR-69 v2..v4 still chasing the same cohort, all reverted as
+#  of 2026-05-18 due to CI race-class — see 20.7.)
+```
+
+### 20.3 Verifier umbrella filter + Hanen batch-import (PR-68, commit `504422e`)
+
+**Verifier (`src/routes/admin-verifier-review-queue.ts`):** the review-queue SELECT now includes `umbrella_type`, and a new default-on `?exclude_umbrellas=1` query param filters them out. Without this, enrichment hour-07 was a silent no-op — umbrella rows (Hanen-aggregates, Bondens-marked-event venues) were dominating the queue and starving real producers.
+
+**Hanen batch-import (`src/routes/admin-hanen.ts`):** new `POST /admin/hanen/batch-import-unmatched` endpoint promotes high-confidence `hanen_unmatched_members` rows to real `agents` rows. Body: `{ dry_run: true|false, batch_size: 5..50 }`. Always dry-run first; the real-run still requires Daniel's explicit go-ahead per PR-68 deploy plan §4. Additive PRAGMA-guarded schema change: `hanen_unmatched_members ADD COLUMN imported_agent_id TEXT` (nullable, same pattern as PR-58).
+
+**Verify dry-run:**
+```bash
+curl -X POST "https://rettfrabonden.com/admin/hanen/batch-import-unmatched" \
+  -H "x-admin-key: $ADMIN_KEY" -H "Content-Type: application/json" \
+  -d '{"dry_run": true, "batch_size": 5}'
+# → { candidates: 5, imported: 5, skipped: 0, errors: [] } — no writes.
+```
+
+### 20.4 Search relevance: category beats city (PR-72, commit `19237fa`)
+
+When a Norwegian query contains BOTH a category keyword AND a city (`fersk fisk i Bergen?`, `eple ved Oslo`), the old `parseNaturalQuery` pass set `_nameQuery='fersk fisk bergen'` via Pass 2, and the fuzzy fallback matched every agent with `Bergen` in its name — drowning legitimate fish producers in `*Bergen*` hits.
+
+Fix: when a category and a city both resolve, drop the city from `_nameQuery` and use it only as a geo-filter. Category wins the *what*; city only narrows the *where*. Single-token queries unchanged. Covered by `parseNaturalQuery_categoryBeatsCity` tests in `tests/test.ts`.
+
+### 20.5 UTM-tagging on outbound producer links + llms.txt expansion (PR-73, commit `e8c6de9`)
+
+**Change A — UTM on outbound producer links.** New `src/utils/url-utm.ts::addUtmParams(url, source, medium, campaign)`. Defaults: `utm_source=rettfrabonden`, `utm_medium=referral`, `utm_campaign=producer_profile`. Wired into the producer profile (`src/routes/seo.ts`, 3 sites) and the marketplace search/agent-card surfaces (`src/routes/marketplace.ts`, 3 sites). NOT applied to producer-card descriptions (kept clean per spec).
+
+**Producer-set utm_source wins.** If a producer's website link already has `utm_source=...`, the whole URL is returned unchanged. Don't squat on existing attribution. Why: when a producer asks "do you send me traffic?", their own analytics dashboard needs to show our hits — that's the strongest argument when asking them to claim/update their profile.
+
+```typescript
+import { addUtmParams } from "../utils/url-utm";
+
+addUtmParams("https://gard.no/butikk/");
+// → "https://gard.no/butikk/?utm_source=rettfrabonden&utm_medium=referral&utm_campaign=producer_profile"
+
+addUtmParams("https://gard.no/?utm_source=newsletter");
+// → "https://gard.no/?utm_source=newsletter"  (untouched — producer's attribution wins)
+
+addUtmParams("mailto:hei@gard.no");
+// → "mailto:hei@gard.no"  (non-http schemes returned as-is)
+```
+
+**Change B — `/llms.txt` expansion (3.5 KB → 6.7 KB rendered).** Adds: (1) kategori × by matrix with concrete `/produsent/<slug>` links, (2) 30 Norwegian cities with lat/lng (was 14 in `custom-gpt-instructions.md`), (3) sesong-info table (måned → norske råvarer i sesong), (4) paraply-organisasjoner section: Hanen, Bondens Marked, Debio, Norsk Gardsmat, (5) A2A-protokoll section with a correct MCP JSON-RPC `tools/call` example using `lokal_search`. The post-fix `a3d5948` corrects the MCP JSON-RPC envelope shape — the first cut used the old `tasks/send` shape.
+
+### 20.6 Per-umbrella traffic widget on `/admin/dashboard` (PR-74, commit `eb59467`)
+
+`GET /admin/analytics/umbrella-traffic?since_hours=24` (default 24, range 1..87600 = 10y). Per umbrella agent (where `umbrella_type IS NOT NULL`), returns:
+
+- `pageViews_via_profile`: hits on the umbrella's own `/produsent/<slug>`
+- `pageViews_via_members`: hits on member producers' `/produsent/<slug>` (joined via `agent_affiliations.status='active'`)
+- `ai_bot_pageviews`: either-channel hits whose UA matches the AI/search-bot classifier
+- `search_referrals`: either-channel hits whose `source='search'`
+- `active_members`: count of active affiliations for this umbrella
+
+Slug lookup uses `src/utils/slug.ts` so it stays consistent with the `/produsent/<slug>` routes. Frontend widget on `/admin/dashboard` renders the same data as a table; no schema changes. 27 new tests covering aggregation + endpoint contract. Post-fix `a0faf3f` drops a misleading time-suffix in the table title.
+
+### 20.7 Geocoding push: MAJOR_CITIES 28 → 100, `lokal_geocode` MCP tool, bydeler — Oppsal fix (PR-75 + PR-76 + PR-78)
+
+**PR-75 (`5717a4f`):** `src/services/geocoding-service.ts::MAJOR_CITIES` expanded from 28 to ~100 Norwegian places. Adds smaller kommuner and regional centers so the hardcoded table short-circuits more of the Kartverket Stedsnavn lookups (which are rate-limited and add ~200ms per uncached query). Pure data, no logic change.
+
+**PR-76 iter-2 (`a7ee91d`):** new `lokal_geocode` MCP tool — for both the stdio (npm) server in `mcp-server/index.js` and the HTTP-MCP server in `src/routes/mcp.ts`. Backed by a new `GET /api/marketplace/geocode?place=<name>` REST endpoint (`src/routes/marketplace.ts`) that returns `{ name, lat, lng, radiusKm, source }`. The stdio server calls the REST endpoint over HTTP loopback (same pattern as the other stdio tools); the HTTP-MCP server calls `geocodingService.geocode()` directly. OpenAPI spec updated.
+
+Tool description (verbatim — these strings shape LLM tool-selection, see C.29 from earlier):
+
+> Resolve a Norwegian place name (city, town, region, fylke, or kommune) to lat/lng coordinates. Use this when you need explicit coordinates for `lokal_discover` (e.g., 'show me organic farms within 10 km of Florø'). Returns coordinates + suggested search radius. Covers all of Norway via Kartverket Stedsnavn API fallback. **Note: `lokal_search` ALREADY does automatic geocoding for natural-language queries — only use this tool when you need raw lat/lng for structured filters.**
+
+The "already does automatic geocoding" note is deliberate: without it, models call `lokal_geocode` then `lokal_discover(lat, lng)` for queries that `lokal_search` would have resolved in one hop.
+
+**Verify:**
+```bash
+curl "https://rettfrabonden.com/api/marketplace/geocode?place=Røros"
+# → { success: true, place: "Røros", result: { name: "Røros", lat: 62.574, lng: 11.382, radiusKm: 25, source: "hardcoded" } }
+```
+
+**PR-78 (`a155687`):** storby-bydeler (neighborhoods) — fixes a real ChatGPT/Claude search incident. User reported "grønnsaker nært Oppsal" was returning Lier/Asker producers instead of Oslo-east. Root cause: Kartverket Stedsnavn returns the *first* match for "Oppsal" — a rural place in Lier (59.847, 10.267), not the Oslo-east neighborhood (59.886, 10.879). Fix: hardcode the major-city bydeler in `MAJOR_CITIES`, short-circuiting the ambiguous Kartverket lookup.
+
+Coverage:
+- Oslo: 30 bydeler (Oppsal, Bøler, Manglerud, Grünerløkka, Vålerenga, Tøyen, Sagene, Frogner, Majorstuen, Bjørvika, Bislett, St. Hanshaugen, Torshov, Sinsen, Carl Berner, Ekeberg, Holmlia, Mortensrud, Bjørndal, Tveita, Furuset, Lambertseter, Linderud, Romsås, Nydalen, Storo, Bryn, Skøyen, Smestad, Røa)
+- Bergen: 8 bydeler (Fyllingsdalen, Sandviken, Åsane, Laksevåg, Loddefjord, Nesttun, Arna, Paradis)
+- Trondheim: 6 (Sluppen, Lade, Heimdal, Singsaker, Ila, Lerkendal)
+- Stavanger: 4 (Madla, Storhaug, Hillevåg, Hundvåg)
+
+ASCII-aliaser (`bøler` ↔ `boler`, `vålerenga` ↔ `valerenga`, etc.) follow the existing pattern. Radius is 2–6 km (neighborhood-scale) so the geo-filter stays inside the bydel rather than the whole city. **Critical assertion in `tests/test.ts`:** `geocode('Oppsal')` returns Oslo coords AND explicitly NOT Lier coords.
+
+### 20.8 The recurring `__setDbForTesting` race-class — PR-69 / PR-70 / PR-71 / PR-79
+
+**Symptom:** PR merges locally with 100% test pass; in CI, 20–25 unrelated tests fail with empty-DB or wrong-row-count assertions. Affected blocks always share the test runner process — phase5.11-a4.1, phase5.11-a4.4, pr67, pr72 are the recurring victims.
+
+**Diagnosis:** `tests/test.ts` rebinds the DB singleton via `__setDbForTesting()` for each test block. The singleton is process-global; test blocks that don't fully wait for the previous block's teardown can see a stale DB reference. Locally the in-memory tear-down is fast enough to hide it; CI's slower process tickles the race.
+
+**Mitigation in place (Phase 20):** the **IIFE await chain**. Every new test block wraps its setup in:
+```ts
+let _myBlockPromise: Promise<void>;
+(async () => {
+  await _previousBlockPromise; // chain on every prior promise that touches __setDb
+  // ...block setup + assertions...
+})();
+_myBlockPromise = ...
+```
+
+New PRs that touch `tests/test.ts` MUST add their `_pr<N>Promise` to the chain of every subsequent block that uses `__setDbForTesting`. Practical chains observed: PR-69 v3 awaits `m2 → pr67 → pr68 → pr75 → pr78`; PR-71 iter-4 awaits the same set plus PR-77.
+
+**Reverted-this-cycle PRs (CI race-class):**
+- **PR-69 v1/v2/v3** (Hanen yield-lift Strategy A): all merged green locally, all failed CI on the same race-class. Reverted: `28ad96f`, `3228fba`, `ccac896`.
+- **PR-70 v1/v3** (Debio finnoko cross-check source): reverted `28ad96f`, `fe13c9f`.
+- **PR-71** (BM event-participants scraper to populate lokallag affiliations): reverted `92f72a0`, `2a778c4`, `d350182`.
+- **PR-79** (mutex refactor — the *attempt* to solve the race-class cleanly): see C.79 — the mutex eliminated the FIFO race but introduced a singleton-lifecycle race because `withTestDb` didn't reset `getDb()` between slots. Reverted `771cdac`, `4daab90`, `aee170e`.
+
+**Open dependencies (deferred):** PR-71 iter-5, PR-69 v4, PR-70 v4, PR-77 v3 are all blocked behind a working PR-79 v2 (or an alternative that doesn't require process-global serialization). See `A2A/supervisor-rejections/2026-05-17-pr-79-rejected-ci-race-class.md` for the suggested PR-79 v2 skeleton: `withTestDb` must own *both* the FIFO mutex AND the DB-singleton lifecycle (`__resetDbSingleton()` before setup AND after teardown).
+
+### 20.9 Operational state at end of Phase 20
+
+| Metric | Value | Source |
+|---|---|---|
+| Agents in `lokal` DB | 1,437 | `/health.database.agents` |
+| Last live commit (Fly v392+) | `504422e` (PR-66+67+68 image) → subsequent PR-72..PR-78 image | supervisor reports 5/17 run-2..run-9 |
+| Smithery + Glama listings | live | rfb-ai-visibility-growth agent 2026-05-17 |
+| npm `lokal-mcp` | `0.4.0` published | as of 2026-05-17 (3 new umbrella tools + lokal_geocode pending v0.5.0 publish) |
+| AI-bot traffic | +78.6% / 24h | PerplexityBot deep-recrawl during 17. mai cycle |
+| CI-race-blocked PRs | PR-69, PR-70, PR-71, PR-77, PR-79 | see 20.8 |
+| Deploy model | **Supervisor-only** (since 2026-04-25 PM) | guidebook agent commits + pushes, supervisor deploys |
+
+---
+
 <a id="appendix-a"></a>
 ## Appendix A: Tech Stack Reference
 
@@ -3272,6 +3434,17 @@ Post-deploy:
 75. **Two distinct legal entities at the same address silently merged by enrichment — domain coherence catches what address-agreement can't** — `Eidsmo Kjøtt AS` (orgnr 995662175, `eidsmokjott.no`) and `Slakthuset Eidsmo Dullum AS` (orgnr 988300020, `slakthuset.no`) operate from the same physical address. Google-Places enrichment for the Eidsmo Kjøtt row pulled the slaughterhouse's homepage and email, so `agents.url=eidsmokjott.no` but `knowledge.website=slakthuset.no` and `knowledge.email=post@slakthuset.no`. WO-16 cross-source agreement *passed* (address + phone matched — they share both), and marketing mailed the slaughterhouse pretending to be the Eidsmo Kjøtt producer. Fix: `domainCoherenceCheck()` compares the registrable domain (`eTLD+1`, with multi-label-suffix support for `.co.uk` / `.com.au` / etc.) of `agents.url` against `knowledge.website` and `knowledge.email`. Mismatches force `review_required`. Critical bypasses: (a) free-mail email (gmail/outlook/proton/…) is signal-free, do not penalize; (b) when `agents.url` is itself a known directory host (Hanen, Lokalmat, Brreg, Bondensmarked, Facebook, Instagram, Visitnorway, Proff, Gulesider, 1881, Reko, Matprat, Matnyhetene, Bondebladet, Kortreist/Kortreistmat, LinkedIn — full list in `KNOWN_DIRECTORY_HOSTS`), do not penalize, because the inverse case (discovery saved the directory listing, enrichment upgraded `knowledge.website` to the producer's real site) is the correct outcome and would otherwise mass-demote ~199 agents. **Rule:** cross-source agreement on a *field* is necessary but not sufficient — when two entities can share the field, you need an *identity* check too. For producers in Norway, the domain of the website/email is the cheapest entity-identity signal we have. Commit: `97c1d70`. See Phase 19.8.
 
 76. **Sitemap and freshness signals belong on every page that updates — not the site root** — Google Search Console reported 1,195 "Discovered – currently not indexed" producer URLs in May 2026. The static-page sitemap had a single weekly `lastmod` for the whole site, so Google had no signal that any *specific* page had been updated even though hourly enrichment was writing to `agent_knowledge.updated_at` on most rows. PR-30 wires a pure-function freshness module (`src/utils/freshness.ts`) into three render surfaces: (1) a `<time class="updated-at">Profil oppdatert: 11. mai 2026</time>` badge on `/produsent/<slug>`, (2) a 30-day-window `<title>` suffix `(oppdatert mai 2026)` to boost CTR, (3) per-URL `<lastmod>` + `<priority>` + `<changefreq>` in `sitemap.xml` driven by `enrichment_status` (`rich → 0.8/weekly`, `partial → 0.5/monthly`, `thin/other → 0.3/monthly`). Locale-hardcoded (NB month names baked into freshness.ts) so the deploy-host's ICU build doesn't change output. PR-29 separately ships related-producer sections (`Andre lokale matprodusenter i [city]` + `Andre [kategori]-produsenter`) to boost internal-link density on the same pages. **Rule:** when a SEO surface has hourly background updates but the freshness signals are static, Google has no reason to re-crawl. The signal must arrive at the same granularity as the change. Commits: `707fac3`, `627be8d`. See Phase 19.5 + 19.6.
+77. **Hanen member names carry a location suffix the matcher must parse — em-dash AND en-dash AND hyphen AND paren** — Hanen lists members as `Stuevolla – Røros`, `Storlidalen (Oppdal)`, `Gunhildgarden - Telemark`. The matcher v2 stripped only the em-dash form; v3 (PR-67, `9b97896`) introduces `parseNameLocationSuffix()` in `src/services/location-suffix-parser.ts` to handle all four delimiters plus normalize the tail (lowercase, trim, fold ø/å/æ aliases) so it can be used as a fylke/kommune fallback when the official Hanen fylke field is empty. **Rule:** in a multi-source dataset where one source encodes a hint in a free-text suffix, treat the parser as a first-class typed helper. It will be reused (PR-69 v3 / PR-70 v4 / PR-71 iter-5 all depend on it).
+
+78. **Kartverket Stedsnavn returns the *first* match — Oslo neighborhood "Oppsal" silently lost to a rural Lier place** — ChatGPT/Claude search "grønnsaker nært Oppsal" returned Lier/Asker producers instead of Oslo-east. Stedsnavn's first match for `Oppsal` is at 59.847, 10.267 (rural Lier), not the Oslo-east bydel at 59.886, 10.879. We had no signal to disambiguate. **Fix (PR-78, `a155687`):** pre-populate `MAJOR_CITIES` in `src/services/geocoding-service.ts` with ~70 storby-bydeler (30 Oslo + 8 Bergen + 6 Trondheim + 4 Stavanger, plus ASCII-aliaser), short-circuiting the ambiguous Stedsnavn lookup. Radius 2–6 km (neighborhood-scale). **Rule:** any external geocoder that returns "the first match" without disambiguation will eventually mis-route a query in your busiest city. Hardcode the high-traffic neighborhoods; let Stedsnavn handle the long tail. The test for this MUST assert both the right coords AND the absence of the wrong coords.
+
+79. **Mutexing test blocks doesn't fix the `__setDbForTesting` race-class — the mutex must also own the singleton lifecycle** — PR-79 (`920cb96`) introduced `withTestDb(label, setup, fn)` as a FIFO mutex around test blocks that rebind `getDb()` via `__setDbForTesting`. Locally green; 23 CI failures in unrelated blocks (phase5.11-a4.1, a4.4, pr67, pr72). Mutex serialized the *order* but the singleton inside `database/init.ts` held a stale reference to a previously-set test DB after the mutex released. Reverted as `771cdac`. The PR-79 v2 skeleton (in `A2A/supervisor-rejections/2026-05-17-pr-79-rejected-ci-race-class.md`) shows the fix: `withTestDb` must call `__resetDbSingleton()` *both* before `setup()` *and* after `fn()` teardown, so the next block always allocates a fresh singleton. **Rule:** when fixing a race-class introduced by a process-global singleton, the mutex must own the singleton's full lifecycle, not just the call ordering around it. Serializing access to a thing you don't actually clear between turns is still a race.
+
+80. **UTM-tagging on outbound producer links must respect producer-set attribution — don't squat on `utm_source`** — `addUtmParams()` in `src/utils/url-utm.ts` defaults to `utm_source=rettfrabonden&utm_medium=referral&utm_campaign=producer_profile`, but bails out the moment the producer's URL already has `utm_source=...`. We don't overwrite the producer's own attribution chain — their analytics dashboard is the strongest argument we have when asking them to claim/update their profile. Additional bails: non-http(s) scheme (`mailto:`, `tel:`, `javascript:`), malformed URL that doesn't parse via `new URL()` (return original string, never throw). **Rule:** outbound-link decoration is a place where the user (here, the producer) had their hands on the URL first. Default-deferring to their attribution is both correct UX and reduces "why did you erase my campaign code?" support tickets.
+
+81. **MCP tool descriptions must explicitly steer the model away from redundant tools** — when `lokal_geocode` shipped (PR-76, `3128314`) alongside `lokal_search` and `lokal_discover`, models started calling `lokal_geocode → lokal_discover(lat, lng)` for queries that `lokal_search` would resolve in one hop (`lokal_search` already runs geocoding internally for natural-language inputs). The fix isn't smarter routing — it's an explicit boundary inside the new tool's description: *"`lokal_search` ALREADY does automatic geocoding for natural-language queries — only use this tool when you need raw lat/lng for structured filters."* **Rule:** when adding a tool that overlaps the upstream behaviour of an existing tool, the new tool's description is the place to draw the line. Don't trust the model to infer "they're not the same — pick the cheaper one"; spell out which one is the default and which one is the escape hatch.
+
+82. **The CI race-class hits *unrelated* test blocks — diagnose the shared mutable state, not the new code** — PR-69 (Hanen yield-lift), PR-70 (Debio finnoko switch), PR-71 (BM event-participants scraper), and PR-79 (test mutex) all merged green locally and failed CI in blocks they don't touch (phase5.11-a4.1, a4.4, pr67, pr72). Several iterations chased "what did this PR break in pr67?" before realising the right question is "what does pr67's setup depend on that the *prior* block's teardown isn't fully unwinding?" Once `__setDbForTesting`'s process-global singleton was identified, the mitigation pattern (IIFE await-chain — see 20.7) became obvious, even though the proper fix (singleton-lifecycle-aware mutex) is still TBD. **Rule:** when CI consistently reports failures in tests you didn't touch, look for the shared mutable state your tests share with the failing tests, not for the new behaviour you just introduced. The simplest diagnostic: run the failing test blocks *alone* — if they pass standalone but fail in a full run, the shared state is the bug.
 
 
 
@@ -3462,8 +3635,9 @@ to build the same platform for a different vertical.
 | 2026-05-04 to 2026-05-07 | 18 (new), 4, 9, 13, C | Phase 18 verify-first foundation: `outreach_ready_pool` VIEW + 7 new `agent_knowledge` columns + `outreach_sent_log` ledger + Tier-B provenance backfill (WO #7, `909cc9d`). `lokal-agent-verifier` library with pure-functional 5-rule kvalitets-gate + 8 new tests (WO #8, `e463481`). Runner script with 22-06 UTC time-window gate (`60fda88` → `8326541` → `b49ecbe`). Option B `/admin/run-verifier` endpoint after Fly volumes-not-shared blocker capped pool at 13 (`aae5e93`, `bac5858`). `PATCH /agents/:id` allow-list now includes `city` for CS geo-fixes (Haugerud Gård / Buskerud, `2f21686`). CRM rate-limit narrowed to cold-outreach only — CS responses to inbound never blocked (`3d78b5d`). `/.well-known/agent-card.json` now emits top-level `homepage` + `iconUrl` for registry display (`61e08e2`). `mcp-server/package.json` bumped to 0.3.4 awaiting Daniel's `npm publish` (`5296480`). Appendix C: C.52 (Fly volumes not shared between machines), C.53 (`buildRunEnvelope` omits required `evidence`), C.54 (CRM rate-limit must distinguish cold-outreach from CS reply), C.55 (admin PATCH allow-list missed `city`), C.56 (A2A registries need top-level `homepage`/`iconUrl`). |
 | 2026-05-08 to 2026-05-11 | 6, 18, C | Selger/Eier portal M1+M2: magic-link backend (`127a4ce`), 5 server-rendered HTML routes + claim CTAs + audit trail (`442d551`), P0 hot-fixes for non-existent `slug` column + `/min-profil/feil` redirect (`13594de`), canonical `isAgentClaimed()` revert (`924066f`), CI m2-A3 test gate (`372033e`), Norwegian Bokmål magic-link email body + 7-day expiry (`442d551`). Selger.html hardening: UUID race-condition fix between Handler 1 / Handler 2 (`5833028`), `payload.data.agent.name` parser fix (`6d8dfc4`). Blocklist policy reversal: drop `email_domain` (gmail.com was blocking every gmail user from M2 self-registration), literal-email only, idempotent purge migration (`5f48132`). Zod v4 `.issues` compat in 3 marketplace error paths + re-applied lost description-length client check (`de2b81c`). Phase 18 hardening: cross-source verification gate WO-16 (`679d58e`) + admin needs-review queue (`d33d855`), `data_insufficient` bucket split from `review_required` (`b5bdab5`), URL-freshness probe + auto-demote (`2611f7c`), recipient-email dedupe (`7b51c97`), retroactive provenance backfill for 1271 stranded agents (`2e7895f`), `PUT /admin/knowledge` endpoint to fix pool-freeze at 129 (`829b386`). Appendix C: C.57 (non-existent `slug` column), C.58 (redirect to unregistered route), C.59 (canonical `isAgentClaimed()` helper), C.60 (two competing query-param handlers), C.61 (`data.agent.name` vs `data.name`), C.62 (`email_domain` blocks free-mail), C.63 (Zod v4 `.issues` rename), C.64 (orchestration patch lost in-memory), C.65 (cross-source `data_insufficient` split), C.66 (pool-VIEW link-freshness), C.67 (recipient-email dedupe), C.68 (enrichment must write `field_provenance`), C.69 (retroactive provenance synthesis). |
 | 2026-05-12 to 2026-05-14 | 19 (new), 5, 18, C | Phase 19 pool-fill push: homepage-source backfill with `url_last_status` precondition relaxed unblocks ~450 stranded agents (PR-25 / `8baddc4`, 19.1); `aggregateVerdict()` gated by `GATING_FIELDS=[address,phone]` so `business_status` no longer tanks otherwise-perfect rows (PR-26 / `bf6f015`, 19.2); `POST /admin/run-verifier?reprocess_review_queue=1` flag + `pickReviewQueueBatch()` drains the 180+ review queue (PR-27 / `3674230`, 19.3); defensive `PUT /admin/knowledge` for malformed legacy `field_provenance` records — P1 hot-fix for HTML 500 on address/phone writes (PR-28 / `4b7d37c`, 19.4). SEO: related-producer sections (same city + same category, 3–5 each, server-rendered, no JS) on `/produsent/<slug>` to address 1,195 Discovered-not-indexed URLs (PR-29 / `707fac3`, 19.5); freshness signals — Profil-oppdatert badge, 30-day `<title>` suffix, per-URL `<lastmod>`/`<priority>`/`<changefreq>` in sitemap (PR-30 / `627be8d`, 19.6); CI hang hot-fix `process.exit(0)` after `seo.ts` route-require kept libuv handles alive (PR-31/32 / `5c01cf3`, 19.7). Domain-coherence check catches the Eidsmo Kjøtt incident — two legal entities sharing an address; `domainCoherenceCheck()` compares registrable domain of `agents.url` vs `knowledge.website`/`knowledge.email`, with free-mail and directory-host bypasses, demotes mismatches to `review_required`, emits `agents_domain_incoherent` claim (PR-33 / `97c1d70`, 19.8). 531/531 tests passing. Appendix C: C.70 (migration `WHERE` excluded target rows), C.71 (worst-bucket-wins for non-cross-sourceable field), C.72 (scan order pushes backfilled rows to the back), C.73 (legacy `field_provenance` without `value`), C.74 (`require()` of route file → CI hangs), C.75 (domain coherence for distinct entities at shared address), C.76 (freshness signals must be per-page, not site-wide). |
+| 2026-05-15 to 2026-05-18 | 20 (new), 11, 12, 5, C | Phase 5.11 cross-source verification cycle: Debio TRACES POST-body country filter so Norwegian rows surface within Fly's 120s window (PR-66 / `9084939`, 20.1); Hanen matcher v3 — `parseNameLocationSuffix()` parses em-dash/en-dash/hyphen/paren tails, `domainsMatch()` adds registrable-domain corroboration, fylke-fallback when official field is empty + `POST /admin/hanen/scrape?re_classify_only=1` for retroactive promotion (PR-67 / `9b97896`, 20.2); verifier review-queue umbrella-filter default-on (`?exclude_umbrellas=1`) + `POST /admin/hanen/batch-import-unmatched` with mandatory dry-run gate + additive `imported_agent_id` column (PR-68 / `504422e`, 20.3). Marketplace polish: search relevance category-beats-city — `fersk fisk i Bergen` no longer drowns in `*Bergen*` name-matches (PR-72 / `19237fa`, 20.4); UTM-tagging on outbound producer links via new `src/utils/url-utm.ts::addUtmParams()` — respects producer-set `utm_source`, refuses non-http schemes + malformed URLs, wired into 3 sites in `seo.ts` and 3 sites in `marketplace.ts`; `/llms.txt` expansion 3.5 KB → 6.7 KB with kategori×by matrix, 30 cities w/ lat/lng, sesong-info table, paraply-org section, A2A-protokoll example (PR-73 / `e8c6de9` + `a3d5948`, 20.5); per-umbrella traffic widget at `GET /admin/analytics/umbrella-traffic` + dashboard frontend (PR-74 / `eb59467`, 20.6). Geocoding push: `MAJOR_CITIES` 28 → ~100 (PR-75 / `5717a4f`), `lokal_geocode` MCP tool in both stdio + HTTP servers + `GET /api/marketplace/geocode` REST endpoint with explicit tool-description note steering away from `lokal_search` overlap (PR-76 iter-2 / `a7ee91d`, 20.7), Oslo/Bergen/Trondheim/Stavanger bydeler — Oppsal-Lier disambiguation fix surfaced from a real ChatGPT/Claude search incident (PR-78 / `a155687`). **CI race-class:** PR-69 (Hanen yield-lift), PR-70 (Debio finnoko), PR-71 (BM event-participants), PR-79 (test mutex) all reverted on `__setDbForTesting` singleton race — IIFE-await-chain mitigation in place, singleton-lifecycle-aware mutex (PR-79 v2) is the suggested next attempt (`A2A/supervisor-rejections/2026-05-17-pr-79-rejected-ci-race-class.md`). Appendix C: C.77 (Hanen suffix parser multi-delimiter), C.78 (Kartverket first-match disambiguation), C.79 (mutex must own singleton lifecycle), C.80 (UTM tag must respect producer attribution), C.81 (MCP tool description must steer model away from redundant siblings), C.82 (CI race-class hits unrelated blocks — look at shared mutable state, not new code). |
 
 ---
 
-*Last updated: 2026-05-14 (14:00 CEST) by rfb-guidebook agent*
-*Guide version: 1.8.0*
+*Last updated: 2026-05-18 (14:00 CEST) by rfb-guidebook agent*
+*Guide version: 1.9.0*
