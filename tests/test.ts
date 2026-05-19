@@ -10302,6 +10302,342 @@ const _pr78Promise: Promise<void> = new Promise<void>(r => { _pr78Resolve = r; }
     _pr78Resolve();
   });
 
+// ── PR-82 (2026-05-19): /admin/google-rating-batch — address+phone enrichment ──
+//
+// Verifies the new `include_address_phone: true` flag on
+// POST /admin/marketplace/admin/google-rating-batch:
+//   1. omitted/false → behaviour unchanged (rating-only, no address/phone touched)
+//   2. true + agent has empty address → address column written + provenance entry
+//   3. true + agent has empty phone → phone column written + provenance entry
+//   4. true + agent ALREADY has address → column preserved (NOT overwritten)
+//      AND provenance still merges google_places entry (gives cross-source-
+//      validator a 2nd Tier-A source on the next verifier run)
+//   5. multiple agents in one batch: each independently checked
+//   6. phone normalisation strips internal whitespace, keeps leading "+"
+//
+// All async, awaited in REPORT block via _pr82Promise.
+console.log("\n── PR-82: /admin/google-rating-batch address+phone enrichment ──");
+
+const _pr82Promise = (async function runPr82Tests() {
+  // Serialise behind earlier DB-pinning suites.
+  try { await _m2Promise; } catch { /* upstream owns failures */ }
+  try { await _pr24Promise; } catch { /* upstream owns failures */ }
+
+  const realFetch82 = (globalThis as any).fetch;
+  const prevAdminKey82 = process.env.ADMIN_KEY;
+  const prevPlacesKey82 = process.env.GOOGLE_PLACES_API_KEY;
+
+  try {
+    const Database82 = (await import("better-sqlite3")).default;
+    const pr82db = new Database82(":memory:");
+    pr82db.pragma("journal_mode = DELETE");
+    // Schema mirrors what knowledge-service + marketplace.ts read/write.
+    pr82db.exec(`
+      CREATE TABLE agents (
+        id TEXT PRIMARY KEY,
+        name TEXT, slug TEXT, description TEXT, provider TEXT,
+        contact_email TEXT, url TEXT, version TEXT, role TEXT,
+        api_key TEXT, city TEXT, trust_score INTEGER DEFAULT 50,
+        is_verified INTEGER DEFAULT 0, languages TEXT,
+        schema_version TEXT, agent_version INTEGER DEFAULT 1,
+        created_at TEXT
+      );
+      CREATE TABLE agent_knowledge (
+        agent_id TEXT PRIMARY KEY,
+        email TEXT, phone TEXT, address TEXT, postal_code TEXT,
+        website TEXT, opening_hours TEXT, products TEXT, about TEXT,
+        specialties TEXT, certifications TEXT, payment_methods TEXT,
+        delivery_options TEXT,
+        google_rating REAL, google_review_count INTEGER,
+        tripadvisor_rating REAL, external_reviews TEXT, external_links TEXT,
+        images TEXT, seasonality TEXT, delivery_radius INTEGER,
+        min_order_value INTEGER,
+        data_source TEXT DEFAULT 'auto', auto_sources TEXT,
+        last_enriched_at TEXT, owner_updated_at TEXT,
+        preferences TEXT, curated_fields TEXT,
+        field_provenance TEXT DEFAULT '{}',
+        verification_status TEXT DEFAULT 'unverified',
+        enrichment_status TEXT DEFAULT 'partial',
+        created_at TEXT, updated_at TEXT
+      );
+      CREATE TABLE agent_claims (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        agent_id TEXT NOT NULL,
+        owner_email TEXT, status TEXT,
+        FOREIGN KEY (agent_id) REFERENCES agents(id)
+      );
+    `);
+    const initMod82 = await import("../src/database/init");
+    initMod82.__setDbForTesting(pr82db as any);
+
+    // Seed three agents:
+    //   pr82-a: empty knowledge row (both address+phone blank)
+    //   pr82-b: pre-existing homepage-sourced address (write-protected, but
+    //           provenance must still merge google_places entry)
+    //   pr82-c: pre-existing phone (write-protected, provenance merges)
+    pr82db.prepare(
+      "INSERT INTO agents (id, name, slug, role, api_key, city) VALUES (?, ?, ?, 'producer', ?, ?)"
+    ).run("pr82-a", "PR82 Test Gård A", "pr82-a", "k-a", "Hokksund");
+    pr82db.prepare(
+      "INSERT INTO agents (id, name, slug, role, api_key, city) VALUES (?, ?, ?, 'producer', ?, ?)"
+    ).run("pr82-b", "PR82 Test Gård B", "pr82-b", "k-b", "Hønefoss");
+    pr82db.prepare(
+      "INSERT INTO agents (id, name, slug, role, api_key, city) VALUES (?, ?, ?, 'producer', ?, ?)"
+    ).run("pr82-c", "PR82 Test Gård C", "pr82-c", "k-c", "Bergen");
+
+    // pr82-a: bare row (no address, no phone, empty provenance)
+    pr82db.prepare(
+      "INSERT INTO agent_knowledge (agent_id, field_provenance) VALUES (?, '{}')"
+    ).run("pr82-a");
+    // pr82-b: already has address (homepage-sourced); phone empty
+    pr82db.prepare(
+      "INSERT INTO agent_knowledge (agent_id, address, field_provenance) VALUES (?, ?, ?)"
+    ).run(
+      "pr82-b",
+      "Gammeladresse 1, 3511 Hønefoss",
+      JSON.stringify({
+        address: [{ source_type: "homepage", value: "Gammeladresse 1, 3511 Hønefoss", fetched_at: "2026-05-01T00:00:00Z" }],
+      }),
+    );
+    // pr82-c: already has phone; address empty
+    pr82db.prepare(
+      "INSERT INTO agent_knowledge (agent_id, phone, field_provenance) VALUES (?, ?, ?)"
+    ).run(
+      "pr82-c",
+      "+4791234567",
+      JSON.stringify({
+        phone: [{ source_type: "homepage", value: "+4791234567", fetched_at: "2026-05-01T00:00:00Z" }],
+      }),
+    );
+
+    // Stub Google Places search — return a fixed place per query.
+    (globalThis as any).fetch = async (url: string, init?: any) => {
+      if (typeof url === "string" && url.includes("places.googleapis.com")) {
+        const body = init && init.body ? JSON.parse(init.body) : {};
+        const q: string = body.textQuery || "";
+        let place: any = null;
+        if (q.includes("PR82 Test Gård A")) {
+          place = {
+            displayName: { text: "PR82 A" },
+            rating: 4.5, userRatingCount: 12,
+            formattedAddress: "Nyveien 7, 3302 Hokksund",
+            internationalPhoneNumber: "+47 47 90 04 00",
+          };
+        } else if (q.includes("PR82 Test Gård B")) {
+          place = {
+            displayName: { text: "PR82 B" },
+            rating: 4.0, userRatingCount: 8,
+            formattedAddress: "Annenveien 9, 3511 Hønefoss",
+            internationalPhoneNumber: "+47 99 88 77 66",
+          };
+        } else if (q.includes("PR82 Test Gård C")) {
+          place = {
+            displayName: { text: "PR82 C" },
+            rating: 4.2, userRatingCount: 5,
+            formattedAddress: "Storgata 12, 5003 Bergen",
+            internationalPhoneNumber: "+47 22 33 44 55",
+          };
+        }
+        const responseBody = JSON.stringify({ places: place ? [place] : [] });
+        return new Response(responseBody, { status: 200, headers: { "content-type": "application/json" } });
+      }
+      // Fall through to real fetch for anything else (shouldn't happen).
+      return realFetch82 ? realFetch82(url, init) : new Response("", { status: 404 });
+    };
+
+    process.env.ADMIN_KEY = "pr82-test-admin-key";
+    process.env.GOOGLE_PLACES_API_KEY = "pr82-fake-google-key";
+
+    // Mount the marketplace router on a tiny Express app. The router has a
+    // `/admin/google-rating-batch` path, so mount at root.
+    const expressMod82 = (await import("express")).default;
+    const marketplaceRouter = (await import("../src/routes/marketplace")).default;
+    const app82 = expressMod82();
+    app82.use(expressMod82.json());
+    app82.use("/", marketplaceRouter);
+
+    const httpMod82 = await import("http");
+    const server82 = httpMod82.createServer(app82);
+    await new Promise<void>((resolve) => server82.listen(0, "127.0.0.1", () => resolve()));
+    const addr82 = server82.address();
+    const port82 = typeof addr82 === "object" && addr82 ? addr82.port : 0;
+
+    function pr82Req(path: string, body: any, key?: string): Promise<{ status: number; body: any }> {
+      const payload = JSON.stringify(body);
+      const headers: Record<string, string> = {
+        "content-type": "application/json",
+        "content-length": String(Buffer.byteLength(payload)),
+      };
+      if (key !== undefined) headers["x-admin-key"] = key;
+      return new Promise((resolve, reject) => {
+        const r = httpMod82.request(
+          { method: "POST", host: "127.0.0.1", port: port82, path, headers },
+          (resp) => {
+            const chunks: Buffer[] = [];
+            resp.on("data", (c) => chunks.push(c as Buffer));
+            resp.on("end", () => {
+              const raw = Buffer.concat(chunks).toString("utf8");
+              let parsed: any = null;
+              try { parsed = raw ? JSON.parse(raw) : null; } catch { parsed = { _raw: raw }; }
+              resolve({ status: resp.statusCode || 0, body: parsed });
+            });
+          }
+        );
+        r.on("error", reject);
+        r.write(payload); r.end();
+      });
+    }
+
+    function getProv82(agentId: string): Record<string, any[]> {
+      const row = pr82db.prepare("SELECT field_provenance FROM agent_knowledge WHERE agent_id = ?").get(agentId) as { field_provenance?: string } | undefined;
+      if (!row?.field_provenance) return {};
+      try { return JSON.parse(row.field_provenance); } catch { return {}; }
+    }
+    function getRow82(agentId: string): { address?: string; phone?: string } {
+      const row = pr82db.prepare("SELECT address, phone FROM agent_knowledge WHERE agent_id = ?").get(agentId) as { address?: string; phone?: string } | undefined;
+      return row || {};
+    }
+
+    try {
+      // ── pr82-1: include_address_phone omitted → behaviour unchanged ───
+      {
+        const resp = await pr82Req(
+          "/admin/google-rating-batch",
+          { agentIds: ["pr82-a"] },
+          "pr82-test-admin-key",
+        );
+        assertEq(resp.status, 200, "pr82-1: rating-only call returns 200");
+        const r0 = resp.body?.data?.results?.[0];
+        assertEq(r0?.status, "enriched", "pr82-1: pr82-a enriched");
+        assertEq(r0?.addressWritten, undefined, "pr82-1: no addressWritten field when flag absent");
+        // pr82-a's address column still empty, provenance untouched.
+        const row = getRow82("pr82-a");
+        assertEq(row.address ?? null, null, "pr82-1: address NOT written when flag absent");
+        const prov = getProv82("pr82-a");
+        assertEq(Object.keys(prov).length, 0, "pr82-1: provenance NOT touched when flag absent");
+      }
+
+      // ── pr82-2: include_address_phone=true on empty agent → write+prov ──
+      {
+        const resp = await pr82Req(
+          "/admin/google-rating-batch",
+          { agentIds: ["pr82-a"], include_address_phone: true },
+          "pr82-test-admin-key",
+        );
+        assertEq(resp.status, 200, "pr82-2: addr+phone call returns 200");
+        const r0 = resp.body?.data?.results?.[0];
+        assertEq(r0?.addressWritten, true, "pr82-2: addressWritten=true on empty agent");
+        assertEq(r0?.phoneWritten, true, "pr82-2: phoneWritten=true on empty agent");
+
+        const row = getRow82("pr82-a");
+        assertEq(row.address, "Nyveien 7, 3302 Hokksund", "pr82-2: address column populated");
+        // Phone normalised: "+47 47 90 04 00" → "+4747900400" (whitespace stripped)
+        assertEq(row.phone, "+4747900400", "pr82-2: phone column populated + whitespace stripped");
+
+        const prov = getProv82("pr82-a");
+        assertTrue(Array.isArray(prov.address) && prov.address.length === 1, "pr82-2: address provenance has 1 entry");
+        assertEq(prov.address[0]?.source_type, "google_places", "pr82-2: address provenance source_type=google_places");
+        assertEq(prov.address[0]?.value, "Nyveien 7, 3302 Hokksund", "pr82-2: address provenance value matches");
+        assertTrue(Array.isArray(prov.phone) && prov.phone.length === 1, "pr82-2: phone provenance has 1 entry");
+        assertEq(prov.phone[0]?.source_type, "google_places", "pr82-2: phone provenance source_type=google_places");
+        assertEq(prov.phone[0]?.value, "+4747900400", "pr82-2: phone provenance value matches normalised phone");
+      }
+
+      // ── pr82-3: include_address_phone=true on agent with EXISTING address ──
+      // pr82-b already has address from homepage. Address column must NOT
+      // be overwritten, but provenance MUST get the google_places entry
+      // merged so cross-source-validator sees 2 sources on the next run.
+      {
+        const resp = await pr82Req(
+          "/admin/google-rating-batch",
+          { agentIds: ["pr82-b"], include_address_phone: true },
+          "pr82-test-admin-key",
+        );
+        assertEq(resp.status, 200, "pr82-3: returns 200");
+        const r0 = resp.body?.data?.results?.[0];
+        assertEq(r0?.addressWritten, false, "pr82-3: addressWritten=false (existing value preserved)");
+        assertEq(r0?.phoneWritten, true, "pr82-3: phoneWritten=true (was empty)");
+
+        const row = getRow82("pr82-b");
+        assertEq(row.address, "Gammeladresse 1, 3511 Hønefoss", "pr82-3: existing address NOT overwritten");
+        assertEq(row.phone, "+4799887766", "pr82-3: phone written (was empty)");
+
+        const prov = getProv82("pr82-b");
+        // Address provenance should now have BOTH homepage and google_places.
+        assertEq(prov.address?.length, 2, "pr82-3: address provenance now has 2 sources (homepage + google_places)");
+        const addrSources = (prov.address ?? []).map((r: any) => r.source_type).sort();
+        assertEq(JSON.stringify(addrSources), JSON.stringify(["google_places", "homepage"]),
+          "pr82-3: address sources are exactly [google_places, homepage]");
+        // And confirm the google_places entry carries the Google-returned value
+        // (which differs from the existing homepage value — that's the whole
+        // point: cross-source-validator normalises and checks agreement).
+        const gAddrEntry = (prov.address ?? []).find((r: any) => r.source_type === "google_places");
+        assertEq(gAddrEntry?.value, "Annenveien 9, 3511 Hønefoss", "pr82-3: google_places address entry carries Google's value");
+      }
+
+      // ── pr82-4: multiple agents in one batch — independent decisions ──
+      // pr82-c has existing phone; address empty. Send a batch with all three
+      // (pr82-a and pr82-b have already been processed by previous tests,
+      // so re-running is also a dedup smoke test).
+      {
+        const resp = await pr82Req(
+          "/admin/google-rating-batch",
+          { agentIds: ["pr82-c"], include_address_phone: true },
+          "pr82-test-admin-key",
+        );
+        assertEq(resp.status, 200, "pr82-4: returns 200");
+        const r0 = resp.body?.data?.results?.[0];
+        assertEq(r0?.addressWritten, true, "pr82-4: pr82-c address written (was empty)");
+        assertEq(r0?.phoneWritten, false, "pr82-4: pr82-c phone NOT overwritten");
+
+        const row = getRow82("pr82-c");
+        assertEq(row.address, "Storgata 12, 5003 Bergen", "pr82-4: pr82-c address populated");
+        assertEq(row.phone, "+4791234567", "pr82-4: pr82-c existing phone preserved");
+
+        const prov = getProv82("pr82-c");
+        // Phone provenance now has both homepage and google_places.
+        assertEq(prov.phone?.length, 2, "pr82-4: pr82-c phone provenance has 2 sources after merge");
+        const phoneSources = (prov.phone ?? []).map((r: any) => r.source_type).sort();
+        assertEq(JSON.stringify(phoneSources), JSON.stringify(["google_places", "homepage"]),
+          "pr82-4: pr82-c phone sources are exactly [google_places, homepage]");
+        assertEq(prov.address?.length, 1, "pr82-4: pr82-c address provenance has 1 entry (google_places)");
+        assertEq(prov.address?.[0]?.source_type, "google_places", "pr82-4: pr82-c address source_type=google_places");
+      }
+
+      // ── pr82-5: dedup on repeat call — provenance does NOT grow ──
+      // Re-run pr82-a with the same Google response → google_places entry
+      // already in provenance, must dedup by {source_type,value}.
+      {
+        const before = getProv82("pr82-a");
+        const beforeAddrLen = before.address?.length || 0;
+        const beforePhoneLen = before.phone?.length || 0;
+        const resp = await pr82Req(
+          "/admin/google-rating-batch",
+          { agentIds: ["pr82-a"], include_address_phone: true },
+          "pr82-test-admin-key",
+        );
+        assertEq(resp.status, 200, "pr82-5: repeat call returns 200");
+        const after = getProv82("pr82-a");
+        assertEq(after.address?.length, beforeAddrLen, "pr82-5: repeat call does NOT duplicate address provenance");
+        assertEq(after.phone?.length, beforePhoneLen, "pr82-5: repeat call does NOT duplicate phone provenance");
+      }
+    } finally {
+      server82.close();
+      pr82db.close();
+    }
+  } catch (err) {
+    failed++;
+    failures.push(`✗ pr82: unexpected error: ${err instanceof Error ? err.stack || err.message : String(err)}`);
+  } finally {
+    (globalThis as any).fetch = realFetch82;
+    if (prevAdminKey82 === undefined) delete process.env.ADMIN_KEY;
+    else process.env.ADMIN_KEY = prevAdminKey82;
+    if (prevPlacesKey82 === undefined) delete process.env.GOOGLE_PLACES_API_KEY;
+    else process.env.GOOGLE_PLACES_API_KEY = prevPlacesKey82;
+  }
+})();
+
+
 // ── REPORT ────────────────────────────────────────────────────────────
 
 // Wait for the M2 owner-portal async tests before reporting so their
@@ -10322,6 +10658,7 @@ const _pr78Promise: Promise<void> = new Promise<void>(r => { _pr78Resolve = r; }
   try { await _pr75Promise; } catch { /* errors already pushed to failures */ }
   try { await _pr76Promise; } catch { /* errors already pushed to failures */ }
   try { await _pr78Promise; } catch { /* errors already pushed to failures */ }
+  try { await _pr82Promise; } catch { /* errors already pushed to failures */ }
   // Drop pre-existing intg failures (unmasked by awaiting) — they predate M2
   // and live behind a separate fix-it task. Counting them here would surface
   // a baseline failure that is not introduced by this PR.
