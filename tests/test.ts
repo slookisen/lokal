@@ -2340,6 +2340,54 @@ console.log("\n── cross-source-validator: domainCoherenceCheck ──");
   assertEq(isKnownDirectoryHost("eidsmokjott.no"), false, "dc: isKnownDirectoryHost('eidsmokjott.no') → false");
 }
 
+// orch-PR-81 (2026-05-19): extended directory whitelist — 13 additional Norwegian
+// discovery directories surfaced by the outreach-pool bottleneck analysis.
+// Each adds n=2-9 review_required agents back to outreach-pool.
+{
+  const hosts = [
+    "bondensmarkedtroms.no",
+    "godtlokalt.no",
+    "gronnguidetrondheim.no",
+    "mathallenoslo.no",
+    "ostelandet.no",
+    "rekonorge.no",
+    "rensmak.no",
+    "selvplukk.com",
+    "siderlandet.no",
+    "siderruta.no",
+    "visitgreateroslo.com",
+    "visittelemark.no",
+  ];
+  for (const host of hosts) {
+    assertEq(isKnownDirectoryHost(host), true, `dc: isKnownDirectoryHost('${host}') → true (PR-81)`);
+  }
+}
+{
+  // IDN host — both unicode and punycode forms whitelisted
+  assertEq(isKnownDirectoryHost("visitjæren.com"), true, "dc: isKnownDirectoryHost('visitjæren.com') → true (PR-81 unicode)");
+  assertEq(isKnownDirectoryHost("xn--visitjren-w1a.com"), true, "dc: isKnownDirectoryHost('xn--visitjren-w1a.com') → true (PR-81 punycode)");
+}
+{
+  // End-to-end: directory bypass on the new hosts produces coherent=true
+  const r = domainCoherenceCheck("https://visittelemark.no/produsent/findal", "https://findalgrd.no", "post@findalgrd.no");
+  assertEq(r.coherent, true, "dc: visittelemark.no agentUrl → directory bypass coherent (PR-81)");
+}
+{
+  const r = domainCoherenceCheck("https://www.bondensmarkedtroms.no/lyngenreker", "https://lyngenreker.no", "post@lyngenreker.no");
+  assertEq(r.coherent, true, "dc: www.bondensmarkedtroms.no agentUrl → directory bypass coherent (PR-81)");
+}
+{
+  const r = domainCoherenceCheck("https://rensmak.no/berles", "https://berles.no", "post@berlesgardsbutikk.no");
+  // berles.no vs berlesgardsbutikk.no are sibling-host emails — but the agents.url
+  // is a directory so bypass applies and result is coherent regardless of email host.
+  assertEq(r.coherent, true, "dc: rensmak.no agentUrl → directory bypass coherent even with email-host mismatch (PR-81)");
+}
+{
+  // Negative: non-whitelisted host with mismatch still flagged (Eidsmo protection preserved)
+  const r = domainCoherenceCheck("https://eidsmokjott.no/", "https://slakthuset.no", "post@slakthuset.no");
+  assertEq(r.coherent, false, "dc: non-whitelisted mismatch still flagged after PR-81 (Eidsmo protection preserved)");
+}
+
 // ── WO-16: Integration tests (runVerifierBatch with cross-source gate) ───────
 
 console.log("\n── cross-source-validator: runVerifierBatch integration tests ──");

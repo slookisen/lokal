@@ -300,13 +300,24 @@ const FREE_MAIL_DOMAINS: readonly string[] = [
 // downstream enrichment correctly upgrades knowledge.website to the
 // producer's real site. Skip the mismatch check entirely in that case.
 // orch-PR-20260512-33 iteration 2: directory-host bypass.
+// Extended 2026-05-19 (orch-PR-81): additional Norwegian discovery directories
+// surfaced by domain-coherence false-positives in the review queue (n=102
+// agents blocked solely by mismatches against these hosts). Categories:
+// tourism guides (Visit-*), food-route directories (siderlandet, ostelandet,
+// gronnguidetrondheim), REKO/Bondens-marked regional umbrellas (rekonorge,
+// bondensmarkedtroms), Mathallen Oslo, self-pick directory (selvplukk),
+// and local-food shop platforms (rensmak, godtlokalt). Both unicode and
+// punycode forms included for IDN hosts (visitjæren.com).
 export const KNOWN_DIRECTORY_HOSTS: ReadonlySet<string> = new Set([
   "1881.no",
   "bondebladet.no",
   "bondensmarked.no",
+  "bondensmarkedtroms.no",
   "bondesmarked.no",
   "brreg.no",
   "facebook.com",
+  "godtlokalt.no",
+  "gronnguidetrondheim.no",
   "gulesider.no",
   "hanen.no",
   "instagram.com",
@@ -314,13 +325,24 @@ export const KNOWN_DIRECTORY_HOSTS: ReadonlySet<string> = new Set([
   "kortreistmat.no",
   "linkedin.com",
   "lokalmat.no",
+  "mathallenoslo.no",
   "matnyhetene.no",
   "matprat.no",
+  "ostelandet.no",
   "proff.no",
   "reko.no",
+  "rekonorge.no",
   "rekoring.no",
+  "rensmak.no",
+  "selvplukk.com",
+  "siderlandet.no",
+  "siderruta.no",
+  "visitgreateroslo.com",
+  "visitjæren.com",
   "visitnorway.com",
   "visitnorway.no",
+  "visittelemark.no",
+  "xn--visitjren-w1a.com",
 ]);
 
 export function isKnownDirectoryHost(host: string): boolean {
