@@ -12,6 +12,7 @@ import { conversationService } from "../services/conversation-service";
 import { slugify } from "../utils/slug";
 import { addUtmParams } from "../utils/url-utm";
 import { isBlocked, add as blocklistAdd, list as blocklistList, remove as blocklistRemove } from "../services/blocklist-service";
+import { mergeFieldProvenance } from "./admin-knowledge";
 
 // ─── Marketplace Routes ───────────────────────────────────────
 // These are the OPEN endpoints that make Lokal a marketplace.
@@ -1644,11 +1645,23 @@ router.post("/admin/google-rating-batch", async (req: Request, res: Response) =>
     return;
   }
 
-  const { agentIds } = req.body;
+  const { agentIds, include_address_phone } = req.body;
   if (!Array.isArray(agentIds) || agentIds.length === 0) {
     res.status(400).json({ success: false, error: "Forventer { agentIds: string[] }" });
     return;
   }
+
+  // PR-82 (2026-05-19): optional Google-Places address+phone enrichment.
+  // When include_address_phone=true, we expand the FieldMask to also
+  // fetch formattedAddress + internationalPhoneNumber, and write each
+  // missing field with source_type:"google_places" field_provenance.
+  // This gives the cross-source-validator a 2nd Tier-A source (alongside
+  // homepage) on address/phone, recovering agents stuck at source_count=1
+  // in `review_required`. Behaviour without the flag is unchanged.
+  const wantAddrPhone = include_address_phone === true;
+  const fieldMask = wantAddrPhone
+    ? "places.rating,places.userRatingCount,places.displayName,places.formattedAddress,places.internationalPhoneNumber"
+    : "places.rating,places.userRatingCount,places.displayName";
 
   const batch = agentIds.slice(0, 50); // Max 50 per request
   const results: any[] = [];
@@ -1667,7 +1680,7 @@ router.post("/admin/google-rating-batch", async (req: Request, res: Response) =>
         headers: {
           "Content-Type": "application/json",
           "X-Goog-Api-Key": placesKey,
-          "X-Goog-FieldMask": "places.rating,places.userRatingCount,places.displayName",
+          "X-Goog-FieldMask": fieldMask,
         },
         body: JSON.stringify({ textQuery: searchQuery, languageCode: "no" }),
       });
@@ -1690,12 +1703,101 @@ router.post("/admin/google-rating-batch", async (req: Request, res: Response) =>
       trustScoreService.update(agentId);
       enriched++;
 
+      // ── PR-82: optional address/phone write + provenance merge ──
+      let addressWritten = false;
+      let phoneWritten = false;
+      if (wantAddrPhone) {
+        try {
+          const gAddrRaw = typeof place.formattedAddress === "string" ? place.formattedAddress.trim() : "";
+          const gPhoneRaw = typeof place.internationalPhoneNumber === "string" ? place.internationalPhoneNumber : "";
+          // Normalise phone: strip whitespace (and any leading "tel:"), keep the leading "+".
+          const gPhone = gPhoneRaw.replace(/^tel:/i, "").replace(/\s+/g, "").trim();
+
+          if (gAddrRaw || gPhone) {
+            const db = getDb();
+            // Re-read the row AFTER upsertKnowledge so we see any rating-row
+            // inserts and the current address/phone column state.
+            const row = db
+              .prepare("SELECT address, phone, field_provenance FROM agent_knowledge WHERE agent_id = ?")
+              .get(agentId) as { address?: string | null; phone?: string | null; field_provenance?: string | null } | undefined;
+
+            const currAddr = (row?.address ?? "").toString().trim();
+            const currPhone = (row?.phone ?? "").toString().trim();
+
+            // Decide which columns we're allowed to overwrite (empty only).
+            const writeAddr = !currAddr && !!gAddrRaw;
+            const writePhone = !currPhone && !!gPhone;
+
+            // Build the incoming provenance payload — include EVERY field we
+            // got a value for, regardless of whether the column itself got
+            // written. The cross-source-validator counts provenance entries,
+            // so an agent that already has a homepage-sourced address still
+            // needs the google_places entry merged in to reach source_count=2.
+            const incomingProv: Record<string, { sources: Array<{ source_type: string; value: string; fetched_at: string }> }> = {};
+            const nowIso = new Date().toISOString();
+            if (gAddrRaw) {
+              incomingProv.address = {
+                sources: [{ source_type: "google_places", value: gAddrRaw, fetched_at: nowIso }],
+              };
+            }
+            if (gPhone) {
+              incomingProv.phone = {
+                sources: [{ source_type: "google_places", value: gPhone, fetched_at: nowIso }],
+              };
+            }
+
+            // Parse existing provenance (best-effort; malformed = start from {}).
+            let existingProv: Record<string, unknown> = {};
+            if (row?.field_provenance) {
+              try {
+                const parsed = JSON.parse(row.field_provenance);
+                if (parsed && typeof parsed === "object") existingProv = parsed as Record<string, unknown>;
+              } catch { /* tolerate junk */ }
+            }
+            const mergedProv = mergeFieldProvenance(existingProv, incomingProv);
+            const provJson = JSON.stringify(mergedProv);
+
+            // Single transactional write: column updates + provenance.
+            const tx = db.transaction(() => {
+              const sets: string[] = [];
+              const params: any[] = [];
+              if (writeAddr) { sets.push("address = ?"); params.push(gAddrRaw); }
+              if (writePhone) { sets.push("phone = ?"); params.push(gPhone); }
+              sets.push("field_provenance = ?"); params.push(provJson);
+              sets.push("updated_at = ?"); params.push(nowIso);
+              params.push(agentId);
+              db.prepare(`UPDATE agent_knowledge SET ${sets.join(", ")} WHERE agent_id = ?`).run(...params);
+            });
+            tx();
+            addressWritten = writeAddr;
+            phoneWritten = writePhone;
+          }
+        } catch (provErr: any) {
+          // Provenance write failure must not abort the batch — record it on
+          // the per-agent result and continue.
+          results.push({
+            agentId,
+            name: info.agent.name,
+            status: "enriched_provenance_error",
+            googleRating: place.rating,
+            googleReviewCount: place.userRatingCount || 0,
+            addressWritten: false,
+            phoneWritten: false,
+            provenanceError: provErr?.message ?? String(provErr),
+          });
+          // Skip the success-push below.
+          await new Promise(r => setTimeout(r, 200));
+          continue;
+        }
+      }
+
       results.push({
         agentId,
         name: info.agent.name,
         status: "enriched",
         googleRating: place.rating,
         googleReviewCount: place.userRatingCount || 0,
+        ...(wantAddrPhone ? { addressWritten, phoneWritten } : {}),
       });
 
       // Small delay to be nice to Google
