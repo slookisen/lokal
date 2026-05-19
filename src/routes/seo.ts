@@ -371,6 +371,180 @@ function producerCard(a: any, _matchReasons?: string[], lang: Lang = "no"): stri
   </a>`;
 }
 
+// ─── PR-84: "Open now" computation from openingHours ───────
+
+function isOpenNow(openingHours: Array<{ day: string; open: string; close: string }> | undefined): { isOpen: boolean; todayLabel?: string } | null {
+  if (!Array.isArray(openingHours) || !openingHours.length) return null;
+
+  // Get current Norway day + time
+  const fmt = new Intl.DateTimeFormat("en-GB", { timeZone: "Europe/Oslo", weekday: "short", hour: "2-digit", minute: "2-digit", hour12: false });
+  const parts = fmt.formatToParts(new Date());
+  const dayLong = parts.find(p => p.type === "weekday")?.value.toLowerCase() || "";
+  const dayKey = dayLong.slice(0, 3); // "mon", "tue", etc
+  const hourStr = parts.find(p => p.type === "hour")?.value || "00";
+  const minStr = parts.find(p => p.type === "minute")?.value || "00";
+  const nowMins = parseInt(hourStr) * 60 + parseInt(minStr);
+
+  const today = openingHours.find(h => h.day?.toLowerCase() === dayKey);
+  if (!today) return { isOpen: false };
+
+  const [oh, om] = (today.open || "00:00").split(":").map(Number);
+  const [ch, cm] = (today.close || "00:00").split(":").map(Number);
+  const openMins = oh * 60 + om;
+  const closeMins = ch * 60 + cm;
+
+  const isOpen = nowMins >= openMins && nowMins < closeMins;
+  return { isOpen, todayLabel: `${today.open}–${today.close}` };
+}
+
+// ─── PR-84: Ultra-rich card for positions 1-3 (claimed top producers) ───
+
+function producerCardUltraRich(a: any, knowledge: any, lang: Lang = "no"): string {
+  const city = a.city || a.location?.city || "";
+  const distKm = a.location?.distanceKm;
+  const postal = knowledge?.postalCode ? ` ${escapeHtml(knowledge.postalCode)}` : "";
+  const cityText = distKm != null
+    ? `${escapeHtml(city)}${postal} &middot; ${distKm < 1 ? (distKm * 1000).toFixed(0) + " m" : distKm.toFixed(1) + " km"}`
+    : `${escapeHtml(city)}${postal}`;
+  const slug = slugify(a.name);
+  const cats = (a.categories || []).slice(0, 5).map((c: string) => `<span class="tag">${catEmoji(c)} ${escapeHtml(formatCat(c))}</span>`).join("");
+  const trustPct = Math.round((a.trustScore || 0) * 100);
+
+  // Description: prefer knowledge.about, fall back to agent description. Cap at 350 chars.
+  let desc = (knowledge?.about && knowledge.about.length > 20) ? knowledge.about : (a.description || "");
+  if (desc.length > 350) desc = desc.slice(0, 347).trimEnd() + "…";
+
+  const verified = `<span class="badge badge-v">&#10003; ${escapeHtml(t(lang, "producer.verified"))}</span>`;
+
+  // Rating: ★ 4.7 (159)
+  const rating = (typeof knowledge?.googleRating === "number" && knowledge.googleRating > 0)
+    ? `<span class="pc-rating">★ ${knowledge.googleRating.toFixed(1)}${knowledge.googleReviewCount ? ` (${knowledge.googleReviewCount})` : ""}</span>`
+    : "";
+
+  // Product summary line: top 3 product names with category-emoji + "+N produkter"
+  const products = Array.isArray(knowledge?.products) ? knowledge.products : [];
+  let productLine = "";
+  if (products.length) {
+    const top = products.slice(0, 3).map((p: any) => `${catEmoji(p.category || "")} ${escapeHtml(p.name || "")}`).join(", ");
+    const more = products.length > 3 ? ` <span class="pc-more">+${products.length - 3} ${escapeHtml(lang === "en" ? "products" : "produkter")}</span>` : "";
+    productLine = `<div class="pc-products">${top}${more}</div>`;
+  }
+
+  // Address
+  const addressLine = knowledge?.address
+    ? `<div class="pc-meta-line">📍 ${escapeHtml(knowledge.address)}</div>`
+    : "";
+
+  // Open-now indicator (only if openingHours present)
+  let openLine = "";
+  const openInfo = isOpenNow(knowledge?.openingHours);
+  if (openInfo) {
+    const label = openInfo.isOpen
+      ? `<span class="pc-open-now">${escapeHtml(lang === "en" ? "Open now" : "Åpent nå")}</span>`
+      : `<span class="pc-closed">${escapeHtml(lang === "en" ? "Closed" : "Stengt")}</span>`;
+    const hours = openInfo.todayLabel ? ` <span class="pc-hours">${escapeHtml(openInfo.todayLabel)}</span>` : "";
+    openLine = `<div class="pc-meta-line">🕒 ${label}${hours}</div>`;
+  }
+
+  // Phone
+  const phoneLine = knowledge?.phone
+    ? `<div class="pc-meta-line">📞 ${escapeHtml(knowledge.phone)}</div>`
+    : "";
+
+  // TODO PR-84-followup: image support when knowledge.images populates
+  const noteHtml = (lang === "en" && desc) ? `<div class="pc-note" title="${escapeHtml(t(lang, "common.translate_note"))}" style="font-size:11px;color:#888;margin-top:4px;">\u{1F1F3}\u{1F1F4} ${escapeHtml(t(lang, "common.from_norwegian"))}</div>` : "";
+
+  return `<a href="${localizedPath("/produsent/" + slug, lang)}" class="pc pc-ultra">
+    <div class="pc-top">
+      <div>
+        <div class="pc-name" translate="no">${escapeHtml(a.name)}${rating}</div>
+        <div class="pc-city" translate="no">${cityText}</div>
+      </div>
+      ${verified}
+    </div>
+    ${desc ? `<div class="pc-desc"${lang === "en" ? ' lang="nb"' : ""}>${escapeHtml(desc)}</div>${noteHtml}` : ""}
+    ${productLine}
+    <div class="pc-meta">
+      ${addressLine}
+      ${openLine}
+      ${phoneLine}
+    </div>
+    <div class="pc-tags">${cats}</div>
+    <div class="pc-foot">
+      <div class="trust-m"><div class="trust-bar"><div class="trust-fill" style="width:${trustPct}%"></div></div> ${trustPct}%</div>
+      <span class="pc-link">${escapeHtml(t(lang, "common.see_profile"))}</span>
+    </div>
+  </a>`;
+}
+
+// ─── PR-84: Medium-rich card for positions 4-11 (claimed producers) ───
+
+function producerCardMediumRich(a: any, knowledge: any, lang: Lang = "no"): string {
+  const city = a.city || a.location?.city || "";
+  const distKm = a.location?.distanceKm;
+  const cityText = distKm != null
+    ? `${escapeHtml(city)} &middot; ${distKm < 1 ? (distKm * 1000).toFixed(0) + " m" : distKm.toFixed(1) + " km"}`
+    : escapeHtml(city);
+  const slug = slugify(a.name);
+  const cats = (a.categories || []).slice(0, 3).map((c: string) => `<span class="tag">${catEmoji(c)} ${escapeHtml(formatCat(c))}</span>`).join("");
+  const trustPct = Math.round((a.trustScore || 0) * 100);
+
+  // Description: keep existing truncation behavior (~180 chars)
+  let desc = a.description || "";
+  if (desc.length > 180) desc = desc.slice(0, 177).trimEnd() + "…";
+
+  const verified = `<span class="badge badge-v">&#10003; ${escapeHtml(t(lang, "producer.verified"))}</span>`;
+
+  const rating = (typeof knowledge?.googleRating === "number" && knowledge.googleRating > 0)
+    ? `<span class="pc-rating">★ ${knowledge.googleRating.toFixed(1)}</span>`
+    : "";
+
+  // Address line: full address, or fall back to city
+  const addressVal = knowledge?.address || city;
+  const addressLine = addressVal
+    ? `<div class="pc-meta-line">📍 ${escapeHtml(addressVal)}</div>`
+    : "";
+
+  // Phone OR website (first available)
+  let contactLine = "";
+  if (knowledge?.phone) {
+    contactLine = `<div class="pc-meta-line">📞 ${escapeHtml(knowledge.phone)}</div>`;
+  } else if (knowledge?.website) {
+    const cleanWeb = String(knowledge.website).replace(/^https?:\/\//, "").replace(/\/$/, "");
+    contactLine = `<div class="pc-meta-line">🌐 ${escapeHtml(cleanWeb)}</div>`;
+  }
+
+  // Product count
+  const products = Array.isArray(knowledge?.products) ? knowledge.products : [];
+  const productLine = products.length
+    ? `<div class="pc-meta-line">🛒 ${products.length} ${escapeHtml(lang === "en" ? "products" : "produkter")}</div>`
+    : "";
+
+  // TODO PR-84-followup: image support when knowledge.images populates
+  const noteHtml = (lang === "en" && desc) ? `<div class="pc-note" title="${escapeHtml(t(lang, "common.translate_note"))}" style="font-size:11px;color:#888;margin-top:4px;">\u{1F1F3}\u{1F1F4} ${escapeHtml(t(lang, "common.from_norwegian"))}</div>` : "";
+
+  return `<a href="${localizedPath("/produsent/" + slug, lang)}" class="pc pc-medium">
+    <div class="pc-top">
+      <div>
+        <div class="pc-name" translate="no">${escapeHtml(a.name)}${rating}</div>
+        <div class="pc-city" translate="no">${cityText}</div>
+      </div>
+      ${verified}
+    </div>
+    ${desc ? `<div class="pc-desc"${lang === "en" ? ' lang="nb"' : ""}>${escapeHtml(desc)}</div>${noteHtml}` : ""}
+    <div class="pc-meta">
+      ${addressLine}
+      ${contactLine}
+      ${productLine}
+    </div>
+    <div class="pc-tags">${cats}</div>
+    <div class="pc-foot">
+      <div class="trust-m"><div class="trust-bar"><div class="trust-fill" style="width:${trustPct}%"></div></div> ${trustPct}%</div>
+      <span class="pc-link">${escapeHtml(t(lang, "common.see_profile"))}</span>
+    </div>
+  </a>`;
+}
+
 // ─── Traffic stats helper ───────────────────────────────────────
 
 function sqlDate(date: Date): string {
@@ -579,6 +753,22 @@ const LANDING_CSS = `
   .city-name { font-weight: 700; font-size: 0.95rem; }
   .city-count { font-size: 0.8rem; color: var(--g500); }
   .feat-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 18px; }
+  /* PR-84: Ultra-rich card (positions 1-3 — claimed top producers) */
+  .pc-ultra { grid-column: span 1; }
+  .pc-ultra .pc-name { font-size: 1.15rem; }
+  .pc-ultra .pc-desc { display: block; -webkit-line-clamp: unset; max-height: 6em; overflow: hidden; }
+  .pc-ultra .pc-meta { margin: 12px 0; font-size: 0.85rem; color: var(--g700); }
+  .pc-ultra .pc-meta-line { display: flex; align-items: center; gap: 6px; margin: 4px 0; }
+  .pc-ultra .pc-rating { color: #f59e0b; font-weight: 600; margin-left: 8px; font-size: 0.92rem; }
+  .pc-ultra .pc-open-now { color: #16a34a; font-weight: 600; }
+  .pc-ultra .pc-closed { color: #dc2626; }
+  .pc-ultra .pc-hours { color: var(--g500); font-size: 0.82rem; }
+  .pc-ultra .pc-products { margin: 8px 0; color: var(--g700); font-size: 0.88rem; }
+  .pc-ultra .pc-more { color: var(--g500); font-size: 0.82rem; }
+  /* PR-84: Medium-rich card (positions 4-11 — claimed producers) */
+  .pc-medium .pc-meta { font-size: 0.82rem; color: var(--g700); margin: 8px 0; }
+  .pc-medium .pc-meta-line { display: flex; align-items: center; gap: 6px; margin: 3px 0; }
+  .pc-medium .pc-rating { color: #f59e0b; font-weight: 600; margin-left: 8px; font-size: 0.88rem; }
   .how-sec { background: var(--green-50); }
   .how-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 28px; max-width: 850px; margin: 0 auto; }
   .how-step { text-align: center; }
@@ -674,11 +864,14 @@ router.get("/", (req: Request, res: Response) => {
     const featured = agents
       .filter((a: any) => a.trustScore >= 0.35)
       .sort((a: any, b: any) => {
+        // PR-84: claimed first, then verified, then trust
+        if (a.isClaimed && !b.isClaimed) return -1;
+        if (!a.isClaimed && b.isClaimed) return 1;
         if (a.isVerified && !b.isVerified) return -1;
         if (!a.isVerified && b.isVerified) return 1;
         return (b.trustScore || 0) - (a.trustScore || 0);
       })
-      .slice(0, 8);
+      .slice(0, 16);
 
     const catCards = Object.entries(CATEGORY_MAP)
       .map(([_key, val]) => {
@@ -697,7 +890,17 @@ router.get("/", (req: Request, res: Response) => {
       </a>`
     ).join("");
 
-    const featuredCards = featured.map((a: any) => producerCard(a, undefined, lang)).join("");
+    const featuredCards = featured.map((a: any, i: number) => {
+      if (i < 3 && a.isClaimed) {
+        const info = knowledgeService.getAgentInfo(a.id);
+        return producerCardUltraRich(a, info?.knowledge || {}, lang);
+      }
+      if (i < 11 && a.isClaimed) {
+        const info = knowledgeService.getAgentInfo(a.id);
+        return producerCardMediumRich(a, info?.knowledge || {}, lang);
+      }
+      return producerCard(a, undefined, lang);
+    }).join("");
 
     // Phase 5.11 A6: Top-level umbrella shortcut (national-level only).
     // parent_umbrella_id IS NULL filters out lokallag/venues — those are
