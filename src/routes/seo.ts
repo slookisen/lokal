@@ -871,7 +871,7 @@ router.get("/", (req: Request, res: Response) => {
     // — it's a copy returned from getActiveAgents, not a shared singleton.
     const featuredCandidates = agents.filter((a: any) => a.trustScore >= 0.35);
     for (const a of featuredCandidates) {
-      a.isClaimed = knowledgeService.isAgentClaimed(a.id);
+      (a as any).isClaimed = knowledgeService.isAgentClaimed(a.id);
     }
     const featured = featuredCandidates
       .sort((a: any, b: any) => {
