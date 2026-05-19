@@ -21,6 +21,7 @@ import { z } from "zod";
 import { marketplaceRegistry } from "../services/marketplace-registry";
 import { knowledgeService, parseProductPrice, isProductHeader, isProductNoise } from "../services/knowledge-service";
 import { slugify } from "../utils/slug";
+import { addAiUtmParams } from "../utils/url-utm";
 import { getDb } from "../database/init";
 import { geocodingService } from "../services/geocoding-service";
 
@@ -161,7 +162,7 @@ function registerTools(server: McpServer, getClientIdentity?: () => string | und
           // Detailed view: include full product list with prices
           const info = knowledgeService.getAgentInfo(agent.id);
           const k = info?.knowledge || {} as any;
-          const sections = [formatAgentCompact(agent, i + 1, summary.contact) + dist];
+          const sections = [formatAgentCompact(agent, i + 1, summary.contact, undefined, getClientIdentity?.()) + dist];
 
           // Full product list
           if (k.products?.length) {
@@ -174,13 +175,13 @@ function registerTools(server: McpServer, getClientIdentity?: () => string | und
           if (k.deliveryOptions?.length) sections.push(`🚚 **Levering:** ${k.deliveryOptions.join(", ")}`);
 
           // Profile link
-          const profileUrl = `${BASE}/produsent/${slugify(agent.name)}`;
+          const profileUrl = addAiUtmParams(`${BASE}/produsent/${slugify(agent.name)}`, getClientIdentity?.());
           sections.push(`\n🔗 [Se fullstendig profil](${profileUrl})`);
 
           return sections.join("\n");
         } else {
           // Compact view for broader searches
-          return formatAgentCompact(agent, i + 1, summary.contact, summary.productSummary) + dist;
+          return formatAgentCompact(agent, i + 1, summary.contact, summary.productSummary, getClientIdentity?.()) + dist;
         }
       });
 
@@ -243,7 +244,7 @@ function registerTools(server: McpServer, getClientIdentity?: () => string | und
       const lines = results.map((r: any, i: number) => {
         const dist = r.agent.location?.distanceKm ? ` (${r.agent.location.distanceKm.toFixed(1)} km)` : "";
         const summary = getAgentKnowledgeSummary(r.agent.id);
-        return formatAgentCompact(r.agent, i + 1, summary.contact, summary.productSummary) + dist;
+        return formatAgentCompact(r.agent, i + 1, summary.contact, summary.productSummary, getClientIdentity?.()) + dist;
       });
 
       const convSection = convLinks.length
@@ -296,7 +297,7 @@ function registerTools(server: McpServer, getClientIdentity?: () => string | und
       if (contact.length) sections.push(`\n## Kontakt\n${contact.join("\n")}`);
 
       // vCard
-      sections.push(`\n🪪 [Last ned kontaktkort (vCard)](${BASE_URL}/api/marketplace/agents/${agent.id}/vcard)`);
+      sections.push(`\n🪪 [Last ned kontaktkort (vCard)](${addAiUtmParams(`${BASE_URL}/api/marketplace/agents/${agent.id}/vcard`, getClientIdentity?.())})`);
 
       // Opening hours
       if (k.openingHours?.length) {
@@ -418,7 +419,7 @@ function registerTools(server: McpServer, getClientIdentity?: () => string | und
           const where = u.city ? ` — ${u.city}` : "";
           const members = (u.umbrella_member_count || 0) > 0 ? ` · ${u.umbrella_member_count} medlemmer` : "";
           sections.push(`- **${u.name}**${where}${members}`);
-          sections.push(`  ${BASE}/produsent/${slugify(u.name)}`);
+          sections.push(`  ${addAiUtmParams(`${BASE}/produsent/${slugify(u.name)}`, getClientIdentity?.())}`);
         }
       }
       return { content: [{ type: "text" as const, text: sections.join("\n") }] };
@@ -474,7 +475,7 @@ function registerTools(server: McpServer, getClientIdentity?: () => string | und
         const labelStr = labels.length ? ` _(${labels.join(", ")})_` : "";
         const where = m.city ? ` — ${m.city}` : "";
         sections.push(`- **${m.name}**${where}${labelStr}`);
-        sections.push(`  ${BASE}/produsent/${slugify(m.name)}`);
+        sections.push(`  ${addAiUtmParams(`${BASE}/produsent/${slugify(m.name)}`, getClientIdentity?.())}`);
       }
       return { content: [{ type: "text" as const, text: sections.join("\n") }] };
     }
@@ -534,7 +535,7 @@ function registerTools(server: McpServer, getClientIdentity?: () => string | und
         const labelStr = labels.length ? ` _(${labels.join(", ")})_` : "";
         const type = typeLabels[a.umbrella_type] || a.umbrella_type;
         sections.push(`- **${a.name}** (${type})${labelStr}`);
-        sections.push(`  ${BASE}/produsent/${slugify(a.name)}`);
+        sections.push(`  ${addAiUtmParams(`${BASE}/produsent/${slugify(a.name)}`, getClientIdentity?.())}`);
       }
       return { content: [{ type: "text" as const, text: sections.join("\n") }] };
     }
@@ -624,7 +625,7 @@ function registerTools(server: McpServer, getClientIdentity?: () => string | und
         const endTime = r.end_at ? (r.end_at || "").slice(11, 16) : "";
         const timeStr = time ? ` ${time}${endTime ? "–" + endTime : ""}` : "";
         sections.push(`- **${date}${timeStr}** — ${r.event_name} (${r.location_text})`);
-        sections.push(`  ${BASE}/produsent/${slugify(r.venue_name)}`);
+        sections.push(`  ${addAiUtmParams(`${BASE}/produsent/${slugify(r.venue_name)}`, getClientIdentity?.())}`);
         sections.push(`  Kilde: ${r.source_url}`);
       }
       return { content: [{ type: "text" as const, text: sections.join("\n") }] };
@@ -715,7 +716,7 @@ function registerTools(server: McpServer, getClientIdentity?: () => string | und
 
 // ─── Compact agent formatter ────────────────────────────────
 
-function formatAgentCompact(agent: any, idx: number, contact?: any, productSummary?: string): string {
+function formatAgentCompact(agent: any, idx: number, contact?: any, productSummary?: string, clientIdentity?: string): string {
   const lines = [`**${idx}. ${agent.name}**`];
   if (agent.description) lines.push(`   ${agent.description}`);
 
@@ -742,7 +743,7 @@ function formatAgentCompact(agent: any, idx: number, contact?: any, productSumma
 
   // Profile link
   const BASE_URL = process.env.BASE_URL || "https://rettfrabonden.com";
-  lines.push(`   🔗 [Profil](${BASE_URL}/produsent/${slugify(agent.name)})`);
+  lines.push(`   🔗 [Profil](${addAiUtmParams(`${BASE_URL}/produsent/${slugify(agent.name)}`, clientIdentity)})`);
 
   return lines.join("\n");
 }
