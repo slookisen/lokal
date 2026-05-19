@@ -861,8 +861,19 @@ router.get("/", (req: Request, res: Response) => {
     const topCities = Object.entries(cityCounts).sort((a, b) => b[1] - a[1]).slice(0, 8);
     const cityIcons = ["\u{1F3D8}\uFE0F", "\u{1F3DB}\uFE0F", "\u2693", "\u{1F306}", "\u{1F304}", "\u{26F0}\uFE0F", "\u{26F5}", "\u{1F33F}"];
 
-    const featured = agents
-      .filter((a: any) => a.trustScore >= 0.35)
+    // PR-85: marketplaceRegistry.getActiveAgents() does NOT populate
+    // isClaimed (that's only set at API-response time in marketplace.ts:854).
+    // For the homepage we need it for sort priority + render-tier decision,
+    // so we hydrate it from knowledgeService.isAgentClaimed() on the
+    // pre-filtered subset (~30-50 agents with trustScore >= 0.35). Same
+    // approach for isVerified, which can also drift between data-source-
+    // verified status and actual claim. We mutate the agent object in place
+    // — it's a copy returned from getActiveAgents, not a shared singleton.
+    const featuredCandidates = agents.filter((a: any) => a.trustScore >= 0.35);
+    for (const a of featuredCandidates) {
+      a.isClaimed = knowledgeService.isAgentClaimed(a.id);
+    }
+    const featured = featuredCandidates
       .sort((a: any, b: any) => {
         // PR-84: claimed first, then verified, then trust
         if (a.isClaimed && !b.isClaimed) return -1;
