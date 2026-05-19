@@ -1,0 +1,59 @@
+name: Publish to MCP Registry
+
+# Triggers:
+#   1. workflow_dispatch — manual one-shot re-publish without bumping version (e.g. after description fix)
+#   2. push to tags matching v* — auto-publish on every npm-style version tag (v0.4.1, v0.5.0, ...)
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write  # required for OIDC authentication to MCP Registry
+      contents: read
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v5
+
+      - name: Install mcp-publisher
+        run: |
+          curl -fsSL "https://github.com/modelcontextprotocol/registry/releases/latest/download/mcp-publisher_linux_amd64.tar.gz" \
+            | tar -xz mcp-publisher
+          chmod +x mcp-publisher
+
+      - name: Validate mcp-server/server.json
+        run: ./mcp-publisher validate ./mcp-server/server.json
+
+      - name: Authenticate via GitHub OIDC
+        run: ./mcp-publisher login github-oidc
+
+      - name: Publish to MCP Registry
+        run: ./mcp-publisher publish ./mcp-server/server.json
+
+      - name: Verify publication
+        run: |
+          sleep 5
+          curl -fsS "https://registry.modelcontextprotocol.io/v0/servers?search=io.github.slookisen/lokal-mcp" \
+            | python3 -c "
+          import json, sys
+          data = json.load(sys.stdin)
+          latest = next((s for s in data.get('servers', []) if s['_meta']['io.modelcontextprotocol.registry/official'].get('isLatest')), None)
+          if latest:
+              v = latest['server']['version']
+              print(f'Latest in registry: v{v}')
+              with open('mcp-server/server.json') as f:
+                  expected = json.load(f)['version']
+              if v == expected:
+                  print('✅ Registry matches local server.json version')
+              else:
+                  print(f'⚠️  Mismatch: registry={v}, expected={expected}')
+                  sys.exit(1)
+          else:
+              print('❌ No isLatest entry found')
+              sys.exit(1)
+          "
