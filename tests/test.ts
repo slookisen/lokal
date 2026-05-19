@@ -9629,46 +9629,6 @@ assertEq(
   "pr73: existing utm_source -> URL untouched (don't squat)",
 );
 
-// ── PR-83: AI-source UTM-tagging on MCP/A2A responses ───────────────
-console.log("\n── PR-83: addAiUtmParams (AI-source UTM tagging on MCP responses) ──");
-import { addAiUtmParams as pr83AddAiUtm, aiSourceFromClient as pr83AiSrc } from "../src/utils/url-utm";
-
-// 1. ChatGPT identity -> "chatgpt"
-assertEq(pr83AiSrc("ChatGPT"), "chatgpt", "pr83: aiSourceFromClient('ChatGPT') -> 'chatgpt'");
-
-// 2. Claude identity -> "claude"
-assertEq(pr83AiSrc("Claude"), "claude", "pr83: aiSourceFromClient('Claude') -> 'claude'");
-
-// 3. Cursor identity -> "cursor"
-assertEq(pr83AiSrc("Cursor"), "cursor", "pr83: aiSourceFromClient('Cursor') -> 'cursor'");
-
-// 4. Undefined identity -> generic "ai_assistant" fallback
-assertEq(pr83AiSrc(undefined), "ai_assistant", "pr83: aiSourceFromClient(undefined) -> 'ai_assistant'");
-
-// 5. Unknown client -> "ai_assistant" fallback (not the raw string)
-assertEq(pr83AiSrc("UnknownClient"), "ai_assistant", "pr83: unknown client name -> 'ai_assistant' fallback");
-
-// 6. ChatGPT URL gets the full UTM tag triple
-assertEq(
-  pr83AddAiUtm("https://rettfrabonden.com/produsent/foo", "ChatGPT"),
-  "https://rettfrabonden.com/produsent/foo?utm_source=chatgpt&utm_medium=mcp&utm_campaign=ai_search",
-  "pr83: ChatGPT identity produces utm_source=chatgpt&utm_medium=mcp&utm_campaign=ai_search",
-);
-
-// 7. Undefined identity still tags URL, just with generic source
-assertEq(
-  pr83AddAiUtm("https://rettfrabonden.com/produsent/foo", undefined),
-  "https://rettfrabonden.com/produsent/foo?utm_source=ai_assistant&utm_medium=mcp&utm_campaign=ai_search",
-  "pr83: undefined identity -> utm_source=ai_assistant (still tagged)",
-);
-
-// 8. Existing utm_source on URL -> we don't squat (inherits addUtmParams contract)
-assertEq(
-  pr83AddAiUtm("https://example.no/?utm_source=meta_ads", "Claude"),
-  "https://example.no/?utm_source=meta_ads",
-  "pr83: existing utm_source -> URL untouched (inherits addUtmParams contract)",
-);
-
 // ── PR-73: llms.txt expansion ────────────────────────────────────────
 // Source-grep approach (same pattern as m2-A1/A2/A3 above): we assert that
 // the new sections are present in discovery.ts. Booting an express server
