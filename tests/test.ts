@@ -10319,27 +10319,60 @@ const _pr78Promise: Promise<void> = new Promise<void>(r => { _pr78Resolve = r; }
 console.log("\n── PR-82: /admin/google-rating-batch address+phone enrichment ──");
 
 const _pr82Promise = (async function runPr82Tests() {
-  // Serialise behind earlier DB-pinning suites.
+  // Serialise behind every earlier suite that swaps the global DB singleton
+  // via __setDbForTesting. If any of these are still running when PR-82
+  // calls __setDbForTesting(pr82db), they race for ownership of the global
+  // `db` handle in src/database/init.ts and the marketplace endpoint
+  // executes against whichever DB happens to be pinned at fetch-time,
+  // producing "no such table: agents" 500s from KnowledgeService.getAgentInfo.
   try { await _m2Promise; } catch { /* upstream owns failures */ }
   try { await _pr24Promise; } catch { /* upstream owns failures */ }
+  try { await Promise.all(_pr21Promises); } catch { /* upstream owns failures */ }
+  try { await _pr56Promise; } catch { /* upstream owns failures */ }
+  try { await _pr63Promise; } catch { /* upstream owns failures */ }
+  try { await _pr65Promise; } catch { /* upstream owns failures */ }
+  try { await _pr66Promise; } catch { /* upstream owns failures */ }
+  try { await _pr67Promise; } catch { /* upstream owns failures */ }
+  try { await _pr68Promise; } catch { /* upstream owns failures */ }
+  try { await _pr74Promise; } catch { /* upstream owns failures */ }
+  try { await _pr75Promise; } catch { /* upstream owns failures */ }
+  try { await _pr76Promise; } catch { /* upstream owns failures */ }
+  try { await _pr78Promise; } catch { /* upstream owns failures */ }
 
   const realFetch82 = (globalThis as any).fetch;
   const prevAdminKey82 = process.env.ADMIN_KEY;
   const prevPlacesKey82 = process.env.GOOGLE_PLACES_API_KEY;
 
+  // Capture whatever DB is currently pinned so we can restore it after the
+  // block — same pattern as PR-72. Anything downstream (e.g. the final REPORT
+  // IIFE) that resolves a dangling reference to the prior DB must keep working.
+  const initMod82 = await import("../src/database/init");
+  const _prevDb82 = (() => {
+    try { return initMod82.getDb(); } catch { return null; }
+  })();
+
   try {
     const Database82 = (await import("better-sqlite3")).default;
     const pr82db = new Database82(":memory:");
     pr82db.pragma("journal_mode = DELETE");
-    // Schema mirrors what knowledge-service + marketplace.ts read/write.
+    // Schema mirrors every table the marketplace endpoint chain reads/writes:
+    //   KnowledgeService.getAgentInfo  → agents, agent_knowledge, agent_claims
+    //   KnowledgeService.upsertKnowledge → agent_knowledge
+    //   trustScoreService.update → agents, agent_knowledge, agent_metrics,
+    //                              agent_claims
+    // Missing any of these surfaces as a 500 from the endpoint (the
+    // SqliteError bubbles out of the try block in marketplace.ts and the
+    // response code reaches the test as 500 with no JSON body).
     pr82db.exec(`
       CREATE TABLE agents (
         id TEXT PRIMARY KEY,
         name TEXT, slug TEXT, description TEXT, provider TEXT,
         contact_email TEXT, url TEXT, version TEXT, role TEXT,
-        api_key TEXT, city TEXT, trust_score INTEGER DEFAULT 50,
-        is_verified INTEGER DEFAULT 0, languages TEXT,
+        api_key TEXT, city TEXT, trust_score REAL DEFAULT 0.5,
+        is_verified INTEGER DEFAULT 0, is_active INTEGER DEFAULT 1,
+        languages TEXT, categories TEXT, tags TEXT,
         schema_version TEXT, agent_version INTEGER DEFAULT 1,
+        last_seen_at TEXT,
         created_at TEXT
       );
       CREATE TABLE agent_knowledge (
@@ -10366,8 +10399,14 @@ const _pr82Promise = (async function runPr82Tests() {
         owner_email TEXT, status TEXT,
         FOREIGN KEY (agent_id) REFERENCES agents(id)
       );
+      CREATE TABLE agent_metrics (
+        agent_id TEXT PRIMARY KEY,
+        times_discovered INTEGER DEFAULT 0,
+        times_contacted INTEGER DEFAULT 0,
+        times_chosen INTEGER DEFAULT 0,
+        last_interaction_at TEXT
+      );
     `);
-    const initMod82 = await import("../src/database/init");
     initMod82.__setDbForTesting(pr82db as any);
 
     // Seed three agents:
@@ -10623,58 +10662,14 @@ const _pr82Promise = (async function runPr82Tests() {
       }
     } finally {
       server82.close();
-      pr82db.close();
+      // NOTE: do NOT pr82db.close() here. The REPORT IIFE below races with
+      // any dangling refs and closing the handle mid-flight throws
+      // "Database is not open". The in-memory DB is GC'd when the closure
+      // releases its reference, which is enough for the test process.
     }
   } catch (err) {
     failed++;
     failures.push(`✗ pr82: unexpected error: ${err instanceof Error ? err.stack || err.message : String(err)}`);
   } finally {
     (globalThis as any).fetch = realFetch82;
-    if (prevAdminKey82 === undefined) delete process.env.ADMIN_KEY;
-    else process.env.ADMIN_KEY = prevAdminKey82;
-    if (prevPlacesKey82 === undefined) delete process.env.GOOGLE_PLACES_API_KEY;
-    else process.env.GOOGLE_PLACES_API_KEY = prevPlacesKey82;
-  }
-})();
-
-
-// ── REPORT ────────────────────────────────────────────────────────────
-
-// Wait for the M2 owner-portal async tests before reporting so their
-// pass/fail counts are included. (Pre-existing async integration tests
-// run without await per their original design; swallowed errors there
-// remain swallowed — out of scope for M2.)
-(async () => {
-  try { await Promise.all(_pr21Promises); } catch { /* errors already pushed to failures */ }
-  try { await _m2Promise; } catch { /* errors already pushed to failures */ }
-  try { await _pr24Promise; } catch { /* errors already pushed to failures */ }
-  try { await _pr56Promise; } catch { /* errors already pushed to failures */ }
-  try { await _pr63Promise; } catch { /* errors already pushed to failures */ }
-  try { await _pr65Promise; } catch { /* errors already pushed to failures */ }
-  try { await _pr66Promise; } catch { /* errors already pushed to failures */ }
-  try { await _pr67Promise; } catch { /* errors already pushed to failures */ }
-  try { await _pr68Promise; } catch { /* errors already pushed to failures */ }
-  try { await _pr74Promise; } catch { /* errors already pushed to failures */ }
-  try { await _pr75Promise; } catch { /* errors already pushed to failures */ }
-  try { await _pr76Promise; } catch { /* errors already pushed to failures */ }
-  try { await _pr78Promise; } catch { /* errors already pushed to failures */ }
-  try { await _pr82Promise; } catch { /* errors already pushed to failures */ }
-  // Drop pre-existing intg failures (unmasked by awaiting) — they predate M2
-  // and live behind a separate fix-it task. Counting them here would surface
-  // a baseline failure that is not introduced by this PR.
-  for (let i = failures.length - 1; i >= 0; i--) {
-    if (failures[i] && failures[i].startsWith("intg: unexpected error")) {
-      failures.splice(i, 1);
-      failed = Math.max(0, failed - 1);
-    }
-  }
-  console.log(`\n${passed} passed, ${failed} failed\n`);
-  if (failed > 0) {
-    console.log("Failures:");
-    for (const f of failures) console.log(f);
-    process.exit(1);
-  }
-  console.log("✓ all tests passed");
-  // PR-32: explicit exit prevents CI hangs from dangling handles (e.g. seo router require)
-  process.exit(0);
-})();
+    if (prevAdminKey82 === undefined) delete p
