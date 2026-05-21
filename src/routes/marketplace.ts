@@ -13,6 +13,7 @@ import { slugify } from "../utils/slug";
 import { addUtmParams } from "../utils/url-utm";
 import { isBlocked, add as blocklistAdd, list as blocklistList, remove as blocklistRemove } from "../services/blocklist-service";
 import { mergeFieldProvenance } from "./admin-knowledge";
+import { crossSourceAgreement, type FieldName } from "../services/cross-source-validator";
 
 // ─── Marketplace Routes ───────────────────────────────────────
 // These are the OPEN endpoints that make Lokal a marketplace.
@@ -2544,6 +2545,359 @@ router.delete("/admin/blocklist/:id", (req: Request, res: Response) => {
     res.json({ success: true, removed });
   } catch (err: any) {
     res.status(500).json({ error: "Remove failed", detail: err.message });
+  }
+});
+
+// ─── POST /admin/knowledge/:agentId/provenance/cleanup ───────────────
+// Remove provenance entries from a single agent's field_provenance JSON
+// matching {field, source_type, value_regex?}. Returns the count and
+// remaining sources for that field.
+//
+// Body shape:
+//   { field: "phone" | "address" | "business_status",
+//     source_type: string,
+//     value_regex?: string }
+//
+// Built to clean up the 2026-05 garbage homepage-phone entries (Cookiebot
+// script IDs etc.) that the homepage-regex crawler wrote alongside the
+// real google_places phone, which were causing cross-source-validator to
+// flag the row as `review_required: source_disagreement`.
+//
+// Auth: X-Admin-Key (same idiom as the rest of marketplace.ts).
+// Returns: 200 { success, agent_id, field, removed_count, remaining_sources }
+// Errors: 400 (bad body), 403 (no key), 404 (agent not in agent_knowledge),
+//         503 (no admin key configured).
+
+router.post("/admin/knowledge/:agentId/provenance/cleanup", (req: Request, res: Response) => {
+  const adminKey = req.headers["x-admin-key"] as string;
+  const expectedKey = getAdminKey();
+  if (!expectedKey) { res.status(503).json({ error: "Admin not configured" }); return; }
+  if (!adminKey || adminKey !== expectedKey) {
+    res.status(403).json({ error: "Krever X-Admin-Key header" });
+    return;
+  }
+
+  const agentId = String(req.params.agentId || "").trim();
+  if (!agentId) {
+    res.status(400).json({ error: "agentId required in path" });
+    return;
+  }
+
+  const body = (req.body ?? {}) as {
+    field?: string;
+    source_type?: string;
+    value_regex?: string;
+  };
+  const field = typeof body.field === "string" ? body.field.trim() : "";
+  const sourceType = typeof body.source_type === "string" ? body.source_type.trim() : "";
+  const valueRegexRaw = typeof body.value_regex === "string" ? body.value_regex : undefined;
+
+  const ALLOWED_FIELDS = new Set(["phone", "address", "business_status"]);
+  if (!ALLOWED_FIELDS.has(field)) {
+    res.status(400).json({ error: "field must be one of phone|address|business_status" });
+    return;
+  }
+  if (!sourceType) {
+    res.status(400).json({ error: "source_type required" });
+    return;
+  }
+
+  let valueRegex: RegExp | null = null;
+  if (valueRegexRaw !== undefined) {
+    try {
+      valueRegex = new RegExp(valueRegexRaw);
+    } catch (err: any) {
+      res.status(400).json({ error: "value_regex is not a valid RegExp", detail: err?.message });
+      return;
+    }
+  }
+
+  try {
+    const db = getDb();
+    const row = db
+      .prepare("SELECT field_provenance FROM agent_knowledge WHERE agent_id = ?")
+      .get(agentId) as { field_provenance?: string | null } | undefined;
+    if (!row) {
+      res.status(404).json({ error: "agent not found in agent_knowledge" });
+      return;
+    }
+
+    let provenance: Record<string, unknown> = {};
+    if (row.field_provenance) {
+      try {
+        const parsed = JSON.parse(row.field_provenance);
+        if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+          provenance = parsed as Record<string, unknown>;
+        }
+      } catch { /* malformed → start from {} */ }
+    }
+
+    const entry = provenance[field];
+    // Mirror cross-source-validator's tolerance for legacy single-object
+    // shape and the wrapped `{sources:[...]}` shape (some routes emit it).
+    let records: any[] = [];
+    let wasWrapped = false;
+    if (Array.isArray(entry)) {
+      records = entry;
+    } else if (entry && typeof entry === "object") {
+      const e = entry as Record<string, unknown>;
+      if (Array.isArray(e.sources)) {
+        records = e.sources as any[];
+        wasWrapped = true;
+      } else {
+        // Legacy single record → wrap so the filter operates on the same shape.
+        records = [e];
+      }
+    }
+
+    const kept: any[] = [];
+    let removedCount = 0;
+    for (const r of records) {
+      if (!r || typeof r !== "object") { kept.push(r); continue; }
+      const stMatch = typeof r.source_type === "string" && r.source_type === sourceType;
+      if (!stMatch) { kept.push(r); continue; }
+      if (valueRegex) {
+        const v = typeof r.value === "string" ? r.value : "";
+        if (!valueRegex.test(v)) { kept.push(r); continue; }
+      }
+      removedCount++;
+    }
+
+    if (removedCount > 0) {
+      if (wasWrapped) {
+        provenance[field] = { ...((entry as object) ?? {}), sources: kept };
+      } else {
+        provenance[field] = kept;
+      }
+      const nowIso = new Date().toISOString();
+      db.prepare(
+        "UPDATE agent_knowledge SET field_provenance = ?, updated_at = ? WHERE agent_id = ?"
+      ).run(JSON.stringify(provenance), nowIso, agentId);
+    }
+
+    const remainingSources = kept
+      .filter((r) => r && typeof r === "object" && typeof r.source_type === "string")
+      .map((r) => r.source_type as string);
+
+    res.json({
+      success: true,
+      agent_id: agentId,
+      field,
+      removed_count: removedCount,
+      remaining_sources: remainingSources,
+    });
+  } catch (err: any) {
+    res.status(500).json({ error: "cleanup failed", detail: err?.message ?? String(err) });
+  }
+});
+
+// ─── POST /admin/knowledge/provenance/cleanup ────────────────────────
+// Bulk variant of the above — applies the cleanup across ALL agent_knowledge
+// rows. Supports `dry_run: true` for a read-only count.
+//
+// Required to clean up the 7-8 garbage Cookiebot-script-ID phone entries
+// from the morning of 2026-05-21 in one shot.
+//
+// Body shape:
+//   { field, source_type, value_regex?, dry_run? }
+// Returns: { success, agents_touched, total_removed_count, dry_run? }
+
+router.post("/admin/knowledge/provenance/cleanup", (req: Request, res: Response) => {
+  const adminKey = req.headers["x-admin-key"] as string;
+  const expectedKey = getAdminKey();
+  if (!expectedKey) { res.status(503).json({ error: "Admin not configured" }); return; }
+  if (!adminKey || adminKey !== expectedKey) {
+    res.status(403).json({ error: "Krever X-Admin-Key header" });
+    return;
+  }
+
+  const body = (req.body ?? {}) as {
+    field?: string;
+    source_type?: string;
+    value_regex?: string;
+    dry_run?: boolean;
+  };
+  const field = typeof body.field === "string" ? body.field.trim() : "";
+  const sourceType = typeof body.source_type === "string" ? body.source_type.trim() : "";
+  const valueRegexRaw = typeof body.value_regex === "string" ? body.value_regex : undefined;
+  const dryRun = body.dry_run === true;
+
+  const ALLOWED_FIELDS = new Set(["phone", "address", "business_status"]);
+  if (!ALLOWED_FIELDS.has(field)) {
+    res.status(400).json({ error: "field must be one of phone|address|business_status" });
+    return;
+  }
+  if (!sourceType) {
+    res.status(400).json({ error: "source_type required" });
+    return;
+  }
+
+  let valueRegex: RegExp | null = null;
+  if (valueRegexRaw !== undefined) {
+    try {
+      valueRegex = new RegExp(valueRegexRaw);
+    } catch (err: any) {
+      res.status(400).json({ error: "value_regex is not a valid RegExp", detail: err?.message });
+      return;
+    }
+  }
+
+  try {
+    const db = getDb();
+    const rows = db
+      .prepare("SELECT agent_id, field_provenance FROM agent_knowledge WHERE field_provenance IS NOT NULL AND field_provenance != '' AND field_provenance != '{}'")
+      .all() as { agent_id: string; field_provenance: string | null }[];
+
+    let agentsTouched = 0;
+    let totalRemoved = 0;
+    const nowIso = new Date().toISOString();
+    const updateStmt = db.prepare(
+      "UPDATE agent_knowledge SET field_provenance = ?, updated_at = ? WHERE agent_id = ?"
+    );
+
+    // Wrap writes in a single transaction (no-op when dry_run).
+    const tx = db.transaction((pending: { agentId: string; json: string }[]) => {
+      for (const p of pending) updateStmt.run(p.json, nowIso, p.agentId);
+    });
+
+    const pendingWrites: { agentId: string; json: string }[] = [];
+
+    for (const row of rows) {
+      let provenance: Record<string, unknown> = {};
+      if (row.field_provenance) {
+        try {
+          const parsed = JSON.parse(row.field_provenance);
+          if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+            provenance = parsed as Record<string, unknown>;
+          } else {
+            continue;
+          }
+        } catch {
+          continue;
+        }
+      }
+
+      const entry = provenance[field];
+      let records: any[] = [];
+      let wasWrapped = false;
+      if (Array.isArray(entry)) {
+        records = entry;
+      } else if (entry && typeof entry === "object") {
+        const e = entry as Record<string, unknown>;
+        if (Array.isArray(e.sources)) {
+          records = e.sources as any[];
+          wasWrapped = true;
+        } else {
+          records = [e];
+        }
+      } else {
+        continue;
+      }
+
+      const kept: any[] = [];
+      let removedHere = 0;
+      for (const r of records) {
+        if (!r || typeof r !== "object") { kept.push(r); continue; }
+        const stMatch = typeof r.source_type === "string" && r.source_type === sourceType;
+        if (!stMatch) { kept.push(r); continue; }
+        if (valueRegex) {
+          const v = typeof r.value === "string" ? r.value : "";
+          if (!valueRegex.test(v)) { kept.push(r); continue; }
+        }
+        removedHere++;
+      }
+
+      if (removedHere > 0) {
+        agentsTouched++;
+        totalRemoved += removedHere;
+        if (wasWrapped) {
+          provenance[field] = { ...((entry as object) ?? {}), sources: kept };
+        } else {
+          provenance[field] = kept;
+        }
+        if (!dryRun) {
+          pendingWrites.push({ agentId: row.agent_id, json: JSON.stringify(provenance) });
+        }
+      }
+    }
+
+    if (!dryRun && pendingWrites.length > 0) {
+      tx(pendingWrites);
+    }
+
+    res.json({
+      success: true,
+      agents_touched: agentsTouched,
+      total_removed_count: totalRemoved,
+      ...(dryRun ? { dry_run: true } : {}),
+    });
+  } catch (err: any) {
+    res.status(500).json({ error: "bulk cleanup failed", detail: err?.message ?? String(err) });
+  }
+});
+
+// ─── GET /admin/knowledge/:agentId/field-provenance ──────────────────
+// Returns the parsed field_provenance JSON for an agent plus a
+// sources_summary slice that mirrors cross-source-validator's
+// `sources_used` for each known field. Built so the supervisor can
+// externally verify that PR-82's google_places provenance merge
+// actually landed (the public knowledge endpoint doesn't expose this).
+//
+// Auth: X-Admin-Key.
+// Returns: 200 { success, agent_id, field_provenance, sources_summary }
+// Errors: 403 / 404 / 503 — same idiom as the cleanup endpoints.
+
+router.get("/admin/knowledge/:agentId/field-provenance", (req: Request, res: Response) => {
+  const adminKey = req.headers["x-admin-key"] as string;
+  const expectedKey = getAdminKey();
+  if (!expectedKey) { res.status(503).json({ error: "Admin not configured" }); return; }
+  if (!adminKey || adminKey !== expectedKey) {
+    res.status(403).json({ error: "Krever X-Admin-Key header" });
+    return;
+  }
+
+  const agentId = String(req.params.agentId || "").trim();
+  if (!agentId) {
+    res.status(400).json({ error: "agentId required in path" });
+    return;
+  }
+
+  try {
+    const db = getDb();
+    const row = db
+      .prepare("SELECT field_provenance FROM agent_knowledge WHERE agent_id = ?")
+      .get(agentId) as { field_provenance?: string | null } | undefined;
+    if (!row) {
+      res.status(404).json({ error: "agent not found in agent_knowledge" });
+      return;
+    }
+
+    let fieldProvenance: Record<string, unknown> = {};
+    if (row.field_provenance) {
+      try {
+        const parsed = JSON.parse(row.field_provenance);
+        if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+          fieldProvenance = parsed as Record<string, unknown>;
+        }
+      } catch { /* malformed → empty */ }
+    }
+
+    const FIELDS: FieldName[] = ["address", "phone", "business_status"];
+    const sourcesSummary: Record<string, string[]> = {};
+    for (const f of FIELDS) {
+      // crossSourceAgreement already handles legacy/array/missing shapes.
+      const result = crossSourceAgreement(fieldProvenance as any, f);
+      sourcesSummary[f] = result.sources_used;
+    }
+
+    res.json({
+      success: true,
+      agent_id: agentId,
+      field_provenance: fieldProvenance,
+      sources_summary: sourcesSummary,
+    });
+  } catch (err: any) {
+    res.status(500).json({ error: "field-provenance read failed", detail: err?.message ?? String(err) });
   }
 });
 

@@ -1836,6 +1836,9 @@ Enrichment agents running in sandboxes don't have the `GOOGLE_PLACES_API_KEY` �
 ```
 POST /admin/google-rating/:id       — single agent
 POST /admin/google-rating-batch     — up to 50 agents
+POST /admin/knowledge/:agentId/provenance/cleanup  — remove provenance entries by {field, source_type, value_regex?}
+POST /admin/knowledge/provenance/cleanup           — bulk variant (supports dry_run)
+GET  /admin/knowledge/:agentId/field-provenance    — read field_provenance JSON + sources_summary
 ```
 
 Both are gated by the admin key. Shape of the per-agent flow:
