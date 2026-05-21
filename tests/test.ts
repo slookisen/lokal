@@ -10302,6 +10302,367 @@ const _pr78Promise: Promise<void> = new Promise<void>(r => { _pr78Resolve = r; }
     _pr78Resolve();
   });
 
+
+// ── orch-pr-86: provenance cleanup + read endpoints ──
+console.log("── orch-pr-86: provenance cleanup + read endpoints ──");
+
+let _orchPr86Resolve: () => void = () => {};
+const _orchPr86Promise: Promise<void> = new Promise<void>(r => { _orchPr86Resolve = r; });
+
+(async () => {
+  // Wait for ALL other concurrent IIFEs that mutate the module-singleton
+  // DB (__setDbForTesting) — otherwise our seeded rows are invisible to
+  // marketplace.ts handlers because some later IIFE swapped the DB out.
+  try { await _m2Promise; } catch { /* failures recorded upstream */ }
+  try { await _pr24Promise; } catch { /* failures recorded upstream */ }
+  try { await _pr56Promise; } catch { /* failures recorded upstream */ }
+  try { await _pr63Promise; } catch { /* failures recorded upstream */ }
+  try { await _pr65Promise; } catch { /* failures recorded upstream */ }
+  try { await _pr66Promise; } catch { /* failures recorded upstream */ }
+  try { await _pr67Promise; } catch { /* failures recorded upstream */ }
+  try { await _pr68Promise; } catch { /* failures recorded upstream */ }
+  try { await _pr74Promise; } catch { /* failures recorded upstream */ }
+  try { await _pr75Promise; } catch { /* failures recorded upstream */ }
+  try { await _pr76Promise; } catch { /* failures recorded upstream */ }
+  try { await _pr78Promise; } catch { /* failures recorded upstream */ }
+
+  // The new endpoints live in src/routes/marketplace.ts. Spin up a
+  // fresh in-memory DB with the minimal schema and mount the router
+  // on a real express server so we exercise the actual HTTP layer.
+  const Database = require("better-sqlite3");
+  const pr86Db = new Database(":memory:");
+  pr86Db.exec(`
+    CREATE TABLE agents (
+      id TEXT PRIMARY KEY,
+      name TEXT,
+      is_active INTEGER DEFAULT 1
+    );
+    CREATE TABLE agent_knowledge (
+      agent_id TEXT PRIMARY KEY,
+      address TEXT, phone TEXT, email TEXT,
+      field_provenance TEXT,
+      updated_at TEXT
+    );
+  `);
+  const initMod = await import("../src/database/init");
+  initMod.__setDbForTesting(pr86Db as any);
+
+  // Seed an admin key.
+  const PR86_ADMIN_KEY = "orch-pr-86-test-key";
+  const prevAdminKey = process.env.ADMIN_KEY;
+  process.env.ADMIN_KEY = PR86_ADMIN_KEY;
+
+  // Seed two agents:
+  //   AGENT_A — phone has 1 homepage garbage + 1 homepage real + 1 google_places
+  //             address has 1 homepage entry
+  //   AGENT_B — phone has 1 homepage garbage only
+  //   AGENT_C — phone has only good entries (no garbage to remove)
+  const AGENT_A = "pr86-agent-a";
+  const AGENT_B = "pr86-agent-b";
+  const AGENT_C = "pr86-agent-c";
+
+  function seedAgent(id: string, name: string, fp: any) {
+    pr86Db.prepare("INSERT INTO agents (id, name, is_active) VALUES (?, ?, 1)").run(id, name);
+    pr86Db.prepare(
+      "INSERT INTO agent_knowledge (agent_id, address, phone, field_provenance, updated_at) VALUES (?, ?, ?, ?, ?)"
+    ).run(id, "", "", JSON.stringify(fp), new Date().toISOString());
+  }
+
+  seedAgent(AGENT_A, "Agent A", {
+    phone: [
+      { source_type: "homepage", value: "CookieConsent-abc123", fetched_at: "2026-05-21T08:00:00Z" },
+      { source_type: "homepage", value: "+4799887766",          fetched_at: "2026-05-21T08:01:00Z" },
+      { source_type: "google_places", value: "+4799887766",     fetched_at: "2026-05-21T09:00:00Z" },
+    ],
+    address: [
+      { source_type: "homepage", value: "Bygdøy allé 1, Oslo", fetched_at: "2026-05-21T08:00:00Z" },
+    ],
+  });
+
+  seedAgent(AGENT_B, "Agent B", {
+    phone: [
+      { source_type: "homepage", value: "CookieConsent-xyz789", fetched_at: "2026-05-21T08:00:00Z" },
+    ],
+  });
+
+  seedAgent(AGENT_C, "Agent C", {
+    phone: [
+      { source_type: "homepage", value: "+4798765432",   fetched_at: "2026-05-21T08:00:00Z" },
+      { source_type: "google_places", value: "+4798765432", fetched_at: "2026-05-21T09:00:00Z" },
+    ],
+  });
+
+  // Mount marketplace router on a fresh express app.
+  const expressMod = (await import("express")).default;
+  const marketplaceMod = await import("../src/routes/marketplace");
+  const app = expressMod();
+  app.use(expressMod.json());
+  app.use("/api/marketplace", marketplaceMod.default);
+
+  const httpMod = await import("http");
+  const server = httpMod.createServer(app);
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", () => resolve()));
+  const addr = server.address();
+  const port = typeof addr === "object" && addr ? addr.port : 0;
+
+  function req(
+    method: string,
+    urlPath: string,
+    opts: { headers?: Record<string, string>; body?: any } = {}
+  ): Promise<{ status: number; body: any; rawBody: string }> {
+    // Re-assert ADMIN_KEY just before sending; other concurrent IIFEs in
+    // this test file mutate process.env.ADMIN_KEY without restoring it.
+    process.env.ADMIN_KEY = PR86_ADMIN_KEY;
+    return new Promise((resolve, reject) => {
+      const bodyStr = opts.body !== undefined ? JSON.stringify(opts.body) : undefined;
+      const headers: Record<string, string> = { ...(opts.headers || {}) };
+      if (bodyStr !== undefined) {
+        headers["Content-Type"] = "application/json";
+        headers["Content-Length"] = String(Buffer.byteLength(bodyStr));
+      }
+      const r = httpMod.request(
+        { method, host: "127.0.0.1", port, path: urlPath, headers },
+        (resp) => {
+          const chunks: Buffer[] = [];
+          resp.on("data", (c) => chunks.push(c as Buffer));
+          resp.on("end", () => {
+            const raw = Buffer.concat(chunks).toString("utf8");
+            let parsed: any = null;
+            try { parsed = JSON.parse(raw); } catch { /* not JSON */ }
+            resolve({ status: resp.statusCode || 0, body: parsed, rawBody: raw });
+          });
+        }
+      );
+      r.on("error", reject);
+      if (bodyStr !== undefined) r.write(bodyStr);
+      r.end();
+    });
+  }
+
+  // ── Endpoint A: admin-key gating ──
+  {
+    const resp = await req("POST", `/api/marketplace/admin/knowledge/${AGENT_A}/provenance/cleanup`, {
+      body: { field: "phone", source_type: "homepage" },
+    });
+    assertEq(resp.status, 403, "orch-pr-86: cleanup without admin key → 403");
+  }
+  {
+    const resp = await req("POST", `/api/marketplace/admin/knowledge/${AGENT_A}/provenance/cleanup`, {
+      headers: { "x-admin-key": "wrong-key" },
+      body: { field: "phone", source_type: "homepage" },
+    });
+    assertEq(resp.status, 403, "orch-pr-86: cleanup with wrong admin key → 403");
+  }
+
+  // ── Endpoint A: invalid body ──
+  {
+    const resp = await req("POST", `/api/marketplace/admin/knowledge/${AGENT_A}/provenance/cleanup`, {
+      headers: { "x-admin-key": PR86_ADMIN_KEY },
+      body: { field: "bogus", source_type: "homepage" },
+    });
+    assertEq(resp.status, 400, "orch-pr-86: cleanup with invalid field → 400");
+  }
+  {
+    const resp = await req("POST", `/api/marketplace/admin/knowledge/${AGENT_A}/provenance/cleanup`, {
+      headers: { "x-admin-key": PR86_ADMIN_KEY },
+      body: { field: "phone" },
+    });
+    assertEq(resp.status, 400, "orch-pr-86: cleanup without source_type → 400");
+  }
+
+  // ── Endpoint A: 404 for unknown agent ──
+  {
+    const resp = await req("POST", `/api/marketplace/admin/knowledge/no-such-agent/provenance/cleanup`, {
+      headers: { "x-admin-key": PR86_ADMIN_KEY },
+      body: { field: "phone", source_type: "homepage" },
+    });
+    assertEq(resp.status, 404, "orch-pr-86: cleanup unknown agent → 404");
+  }
+
+  // ── Endpoint A: removes only matching entries (value_regex), leaves rest ──
+  {
+    const resp = await req("POST", `/api/marketplace/admin/knowledge/${AGENT_A}/provenance/cleanup`, {
+      headers: { "x-admin-key": PR86_ADMIN_KEY },
+      body: { field: "phone", source_type: "homepage", value_regex: "^CookieConsent" },
+    });
+    assertEq(resp.status, 200, "orch-pr-86: cleanup AGENT_A → 200");
+    assertEq(resp.body.removed_count, 1, "orch-pr-86: cleanup AGENT_A removed exactly 1 garbage entry");
+    assertTrue(
+      Array.isArray(resp.body.remaining_sources) &&
+        resp.body.remaining_sources.length === 2 &&
+        resp.body.remaining_sources.includes("homepage") &&
+        resp.body.remaining_sources.includes("google_places"),
+      "orch-pr-86: AGENT_A remaining_sources = [homepage,google_places]"
+    );
+    // DB side-effect: real phone entries still present, garbage gone.
+    const row = pr86Db.prepare("SELECT field_provenance FROM agent_knowledge WHERE agent_id = ?").get(AGENT_A) as any;
+    const fp = JSON.parse(row.field_provenance);
+    assertEq(Array.isArray(fp.phone) ? fp.phone.length : -1, 2, "orch-pr-86: AGENT_A phone array now length 2");
+    const values = (fp.phone as any[]).map(p => p.value);
+    assertTrue(values.includes("+4799887766"), "orch-pr-86: AGENT_A kept real phone value");
+    assertTrue(!values.includes("CookieConsent-abc123"), "orch-pr-86: AGENT_A dropped Cookiebot value");
+    // Address untouched.
+    assertEq(Array.isArray(fp.address) ? fp.address.length : -1, 1, "orch-pr-86: AGENT_A address untouched");
+  }
+
+  // ── Endpoint A: non-matching regex removes nothing ──
+  {
+    const resp = await req("POST", `/api/marketplace/admin/knowledge/${AGENT_C}/provenance/cleanup`, {
+      headers: { "x-admin-key": PR86_ADMIN_KEY },
+      body: { field: "phone", source_type: "homepage", value_regex: "^CookieConsent" },
+    });
+    assertEq(resp.status, 200, "orch-pr-86: cleanup AGENT_C → 200");
+    assertEq(resp.body.removed_count, 0, "orch-pr-86: cleanup AGENT_C removed 0 (no garbage)");
+    const row = pr86Db.prepare("SELECT field_provenance FROM agent_knowledge WHERE agent_id = ?").get(AGENT_C) as any;
+    const fp = JSON.parse(row.field_provenance);
+    assertEq(Array.isArray(fp.phone) ? fp.phone.length : -1, 2, "orch-pr-86: AGENT_C phone unchanged");
+  }
+
+  // ── Bulk variant: dry_run doesn't write ──
+  // Re-seed AGENT_B's garbage entry (intact from before) and AGENT_A again
+  // (re-add Cookiebot value so the bulk pass has 2 to find).
+  pr86Db.prepare("UPDATE agent_knowledge SET field_provenance = ? WHERE agent_id = ?").run(
+    JSON.stringify({
+      phone: [
+        { source_type: "homepage", value: "CookieConsent-fresh", fetched_at: "2026-05-21T10:00:00Z" },
+        { source_type: "homepage", value: "+4799887766", fetched_at: "2026-05-21T08:01:00Z" },
+      ],
+    }),
+    AGENT_A,
+  );
+
+  {
+    const before = pr86Db.prepare("SELECT field_provenance FROM agent_knowledge WHERE agent_id = ?").get(AGENT_B) as any;
+    const resp = await req("POST", `/api/marketplace/admin/knowledge/provenance/cleanup`, {
+      headers: { "x-admin-key": PR86_ADMIN_KEY },
+      body: { field: "phone", source_type: "homepage", value_regex: "^CookieConsent", dry_run: true },
+    });
+    assertEq(resp.status, 200, "orch-pr-86: bulk dry_run → 200");
+    assertEq(resp.body.dry_run, true, "orch-pr-86: bulk dry_run flag echoed");
+    assertEq(resp.body.agents_touched, 2, "orch-pr-86: bulk dry_run reports 2 agents (A+B)");
+    assertEq(resp.body.total_removed_count, 2, "orch-pr-86: bulk dry_run reports 2 removed");
+    const after = pr86Db.prepare("SELECT field_provenance FROM agent_knowledge WHERE agent_id = ?").get(AGENT_B) as any;
+    assertEq(before.field_provenance, after.field_provenance, "orch-pr-86: bulk dry_run did NOT write to DB");
+  }
+
+  // ── Bulk variant: actual write across multiple agents ──
+  {
+    const resp = await req("POST", `/api/marketplace/admin/knowledge/provenance/cleanup`, {
+      headers: { "x-admin-key": PR86_ADMIN_KEY },
+      body: { field: "phone", source_type: "homepage", value_regex: "^CookieConsent" },
+    });
+    assertEq(resp.status, 200, "orch-pr-86: bulk write → 200");
+    assertEq(resp.body.agents_touched, 2, "orch-pr-86: bulk write touched 2 agents");
+    assertEq(resp.body.total_removed_count, 2, "orch-pr-86: bulk write removed 2 entries");
+
+    // AGENT_A: only +4799887766 should remain on phone
+    const aFp = JSON.parse((pr86Db.prepare("SELECT field_provenance FROM agent_knowledge WHERE agent_id = ?").get(AGENT_A) as any).field_provenance);
+    const aPhones = (aFp.phone || []).map((p: any) => p.value);
+    assertEq(aPhones.length, 1, "orch-pr-86: bulk left 1 phone on AGENT_A");
+    assertEq(aPhones[0], "+4799887766", "orch-pr-86: bulk kept real phone on AGENT_A");
+
+    // AGENT_B: phone array is empty (all garbage removed)
+    const bFp = JSON.parse((pr86Db.prepare("SELECT field_provenance FROM agent_knowledge WHERE agent_id = ?").get(AGENT_B) as any).field_provenance);
+    assertEq(Array.isArray(bFp.phone) ? bFp.phone.length : -1, 0, "orch-pr-86: bulk emptied phone on AGENT_B");
+  }
+
+  // ── Bulk variant: admin-key gating ──
+  {
+    const resp = await req("POST", `/api/marketplace/admin/knowledge/provenance/cleanup`, {
+      body: { field: "phone", source_type: "homepage" },
+    });
+    assertEq(resp.status, 403, "orch-pr-86: bulk without admin key → 403");
+  }
+
+  // ── Endpoint C: field-provenance read returns parsed JSON + sources_summary ──
+  // Re-seed AGENT_A so it has the full mix (address + phone, both fields populated).
+  pr86Db.prepare("UPDATE agent_knowledge SET field_provenance = ? WHERE agent_id = ?").run(
+    JSON.stringify({
+      phone: [
+        { source_type: "homepage",     value: "+4799887766", fetched_at: "2026-05-21T08:01:00Z" },
+        { source_type: "google_places", value: "+4799887766", fetched_at: "2026-05-21T09:00:00Z" },
+      ],
+      address: [
+        { source_type: "homepage",      value: "Bygdøy allé 1, Oslo", fetched_at: "2026-05-21T08:00:00Z" },
+        { source_type: "google_places", value: "Bygdøy allé 1, 0265 Oslo", fetched_at: "2026-05-21T09:00:00Z" },
+      ],
+    }),
+    AGENT_A,
+  );
+
+  {
+    const resp = await req("GET", `/api/marketplace/admin/knowledge/${AGENT_A}/field-provenance`, {
+      headers: { "x-admin-key": PR86_ADMIN_KEY },
+    });
+    assertEq(resp.status, 200, "orch-pr-86: field-provenance read → 200");
+    assertEq(resp.body.agent_id, AGENT_A, "orch-pr-86: field-provenance echoes agent_id");
+    assertTrue(
+      Array.isArray(resp.body.field_provenance.phone) && resp.body.field_provenance.phone.length === 2,
+      "orch-pr-86: field-provenance includes phone array"
+    );
+    const ss = resp.body.sources_summary;
+    assertTrue(
+      Array.isArray(ss.phone) && ss.phone.includes("homepage") && ss.phone.includes("google_places"),
+      "orch-pr-86: sources_summary.phone lists both sources"
+    );
+    assertTrue(
+      Array.isArray(ss.address) && ss.address.includes("homepage") && ss.address.includes("google_places"),
+      "orch-pr-86: sources_summary.address lists both sources"
+    );
+    assertTrue(
+      Array.isArray(ss.business_status) && ss.business_status.length === 0,
+      "orch-pr-86: sources_summary.business_status = []"
+    );
+  }
+
+  // ── Endpoint C: admin-key gating + 404 ──
+  {
+    const resp = await req("GET", `/api/marketplace/admin/knowledge/${AGENT_A}/field-provenance`);
+    assertEq(resp.status, 403, "orch-pr-86: field-provenance without admin key → 403");
+  }
+  {
+    const resp = await req("GET", `/api/marketplace/admin/knowledge/no-such-agent/field-provenance`, {
+      headers: { "x-admin-key": PR86_ADMIN_KEY },
+    });
+    assertEq(resp.status, 404, "orch-pr-86: field-provenance unknown agent → 404");
+  }
+
+  // ── Endpoint C: legacy single-object provenance shape is tolerated ──
+  // (pre-WO-16 rows have field_provenance.phone as a single object,
+  //  not an array. cross-source-validator wraps that in [obj] — verify.)
+  pr86Db.prepare("UPDATE agent_knowledge SET field_provenance = ? WHERE agent_id = ?").run(
+    JSON.stringify({
+      phone: { source_type: "homepage", value: "+4711112222", fetched_at: "2026-05-21T08:00:00Z" },
+    }),
+    AGENT_C,
+  );
+  {
+    const resp = await req("GET", `/api/marketplace/admin/knowledge/${AGENT_C}/field-provenance`, {
+      headers: { "x-admin-key": PR86_ADMIN_KEY },
+    });
+    assertEq(resp.status, 200, "orch-pr-86: legacy-shape read → 200");
+    assertTrue(
+      Array.isArray(resp.body.sources_summary.phone) &&
+        resp.body.sources_summary.phone.length === 1 &&
+        resp.body.sources_summary.phone[0] === "homepage",
+      "orch-pr-86: legacy single-object phone tolerated, sources_used = [homepage]"
+    );
+  }
+
+  // Restore admin key env.
+  if (prevAdminKey === undefined) delete process.env.ADMIN_KEY;
+  else process.env.ADMIN_KEY = prevAdminKey;
+
+  await new Promise<void>((resolve) => server.close(() => resolve()));
+})()
+  .then(() => _orchPr86Resolve())
+  .catch((err: unknown) => {
+    failed++;
+    failures.push(`✗ orch-pr-86 async test setup failed: ${err instanceof Error ? err.message : String(err)}`);
+    _orchPr86Resolve();
+  });
+
+
 // ── REPORT ────────────────────────────────────────────────────────────
 
 // Wait for the M2 owner-portal async tests before reporting so their
@@ -10322,6 +10683,7 @@ const _pr78Promise: Promise<void> = new Promise<void>(r => { _pr78Resolve = r; }
   try { await _pr75Promise; } catch { /* errors already pushed to failures */ }
   try { await _pr76Promise; } catch { /* errors already pushed to failures */ }
   try { await _pr78Promise; } catch { /* errors already pushed to failures */ }
+  try { await _orchPr86Promise; } catch { /* errors already pushed to failures */ }
   // Drop pre-existing intg failures (unmasked by awaiting) — they predate M2
   // and live behind a separate fix-it task. Counting them here would surface
   // a baseline failure that is not introduced by this PR.
