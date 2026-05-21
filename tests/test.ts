@@ -10303,6 +10303,205 @@ const _pr78Promise: Promise<void> = new Promise<void>(r => { _pr78Resolve = r; }
   });
 
 
+
+// ── pr-86-bm: Bondens Marked address cleanup (service-direct) ──
+// PR-72 pattern — call the pure function with an in-memory DB.
+// HTTP-router tests for this would conflict with the module-singleton DB
+// already in use by the marketplace integration suite below.
+console.log("── pr-86-bm: Bondens Marked address cleanup ──");
+{
+  const sqlite = require("better-sqlite3");
+  const bmDb = new sqlite(":memory:");
+  bmDb.exec(`
+    CREATE TABLE agents (
+      id TEXT PRIMARY KEY,
+      name TEXT,
+      role TEXT,
+      is_active INTEGER DEFAULT 1
+    );
+    CREATE TABLE agent_knowledge (
+      agent_id TEXT PRIMARY KEY,
+      address TEXT,
+      postal_code TEXT,
+      field_provenance TEXT DEFAULT '{}'
+    );
+  `);
+
+  // IDs taken from BM_ADDRESS_CLEANUP_VICTIM_IDS — use real IDs so the
+  // hard-coded victim list is exercised end-to-end.
+  const NARVIK_ID = "6e8d6ddd-1a20-451f-87d5-547d15f87abe"; // full victim
+  const STAVANGER_ID = "71bfb259-0848-49ac-87dd-b46e8e23d6c7"; // postal-only victim
+  const TRYSIL_ID = "f5f682be-8700-4ce3-ae77-7d68b5723137"; // used for provenance-strip test
+  const INNOCENT_ID = "00000000-0000-0000-0000-000000000099"; // not in victim list
+
+  bmDb.prepare("INSERT INTO agents (id, name, role) VALUES (?, ?, ?)")
+    .run(NARVIK_ID, "Bondens marked — Narvik", "venue");
+  bmDb.prepare("INSERT INTO agents (id, name, role) VALUES (?, ?, ?)")
+    .run(STAVANGER_ID, "Bondens Marked Stavanger", "venue");
+  bmDb.prepare("INSERT INTO agents (id, name, role) VALUES (?, ?, ?)")
+    .run(TRYSIL_ID, "Bondens marked — Trysil", "venue");
+  bmDb.prepare("INSERT INTO agents (id, name, role) VALUES (?, ?, ?)")
+    .run(INNOCENT_ID, "Innocent bystander", "producer");
+
+  // Full victim — bogus address + bogus postal_code.
+  bmDb.prepare(
+    "INSERT INTO agent_knowledge (agent_id, address, postal_code, field_provenance) VALUES (?, ?, ?, ?)"
+  ).run(NARVIK_ID, "Berrvellene 7, 6817 NAUSTDAL", "6817", "{}");
+  // Stavanger — address correct, postal_code bogus.
+  bmDb.prepare(
+    "INSERT INTO agent_knowledge (agent_id, address, postal_code, field_provenance) VALUES (?, ?, ?, ?)"
+  ).run(STAVANGER_ID, "Byparken Stavanger, Østervåg 6, Stavanger", "6817", "{}");
+  // Trysil — full victim with rich provenance (used to verify the
+  // homepage entry is stripped while google_places is preserved).
+  bmDb.prepare(
+    "INSERT INTO agent_knowledge (agent_id, address, postal_code, field_provenance) VALUES (?, ?, ?, ?)"
+  ).run(
+    TRYSIL_ID,
+    "Berrvellene 7, 6817 NAUSTDAL",
+    "6817",
+    JSON.stringify({
+      address: {
+        sources: [
+          { source_type: "homepage", value: "Berrvellene 7, 6817 NAUSTDAL" },
+          { source_type: "google_places", value: "Riktige veien 1, 8500 Narvik" },
+        ],
+      },
+    })
+  );
+  // Innocent bystander — correct data, NOT in victim list.
+  bmDb.prepare(
+    "INSERT INTO agent_knowledge (agent_id, address, postal_code, field_provenance) VALUES (?, ?, ?, ?)"
+  ).run(INNOCENT_ID, "Hovedgata 1, 0150 Oslo", "0150", "{}");
+
+  const { cleanBmAddressBug } = require("../src/services/bm-address-cleanup");
+
+  // ── Dry run: report changes without writing ──
+  const dryResult = cleanBmAddressBug({ db: bmDb, dryRun: true });
+  assertEq(dryResult.dry_run, true, "pr-86-bm: dry_run flag echoed");
+  assertTrue(
+    dryResult.cleaned_agent_ids.includes(NARVIK_ID),
+    "pr-86-bm: dry-run reports Narvik in cleaned_agent_ids"
+  );
+  assertTrue(
+    dryResult.cleaned_agent_ids.includes(STAVANGER_ID),
+    "pr-86-bm: dry-run reports Stavanger in cleaned_agent_ids"
+  );
+  assertTrue(
+    dryResult.cleaned_agent_ids.includes(TRYSIL_ID),
+    "pr-86-bm: dry-run reports Trysil in cleaned_agent_ids"
+  );
+  assertEq(
+    dryResult.cleaned_agent_ids.length,
+    3,
+    "pr-86-bm: dry-run found exactly 3 affected rows"
+  );
+  assertEq(
+    dryResult.preserved_address_cases.length,
+    1,
+    "pr-86-bm: dry-run flags Stavanger as preserved-address case"
+  );
+  assertEq(
+    dryResult.preserved_address_cases[0],
+    STAVANGER_ID,
+    "pr-86-bm: dry-run preserved-address ID matches Stavanger"
+  );
+  assertEq(
+    dryResult.total_provenance_entries_removed,
+    1,
+    "pr-86-bm: dry-run reports 1 provenance entry would be removed (Trysil homepage)"
+  );
+
+  // Confirm dry-run did NOT write.
+  const narvikAfterDry = bmDb
+    .prepare("SELECT address, postal_code FROM agent_knowledge WHERE agent_id = ?")
+    .get(NARVIK_ID);
+  assertEq(
+    narvikAfterDry.address,
+    "Berrvellene 7, 6817 NAUSTDAL",
+    "pr-86-bm: dry-run did NOT mutate Narvik address"
+  );
+  assertEq(narvikAfterDry.postal_code, "6817", "pr-86-bm: dry-run did NOT mutate Narvik postal_code");
+
+  // ── Wet run: writes ──
+  const wetResult = cleanBmAddressBug({ db: bmDb, dryRun: false });
+  assertEq(wetResult.dry_run, false, "pr-86-bm: wet-run dry_run flag = false");
+  assertEq(wetResult.cleaned_agent_ids.length, 3, "pr-86-bm: wet-run touched 3 rows");
+  assertEq(
+    wetResult.total_provenance_entries_removed,
+    1,
+    "pr-86-bm: wet-run removed exactly 1 provenance entry"
+  );
+
+  // Narvik — full scrub.
+  const narvikAfter = bmDb
+    .prepare("SELECT address, postal_code FROM agent_knowledge WHERE agent_id = ?")
+    .get(NARVIK_ID);
+  assertEq(narvikAfter.address, null, "pr-86-bm: Narvik address NULLed");
+  assertEq(narvikAfter.postal_code, null, "pr-86-bm: Narvik postal_code NULLed");
+
+  // Stavanger — keep address, drop only postal_code.
+  const stavangerAfter = bmDb
+    .prepare("SELECT address, postal_code FROM agent_knowledge WHERE agent_id = ?")
+    .get(STAVANGER_ID);
+  assertEq(
+    stavangerAfter.address,
+    "Byparken Stavanger, Østervåg 6, Stavanger",
+    "pr-86-bm: Stavanger address preserved"
+  );
+  assertEq(stavangerAfter.postal_code, null, "pr-86-bm: Stavanger postal_code NULLed");
+
+  // Innocent bystander — completely unchanged.
+  const innocentAfter = bmDb
+    .prepare("SELECT address, postal_code FROM agent_knowledge WHERE agent_id = ?")
+    .get(INNOCENT_ID);
+  assertEq(
+    innocentAfter.address,
+    "Hovedgata 1, 0150 Oslo",
+    "pr-86-bm: innocent bystander address UNCHANGED"
+  );
+  assertEq(
+    innocentAfter.postal_code,
+    "0150",
+    "pr-86-bm: innocent bystander postal_code UNCHANGED"
+  );
+
+  // Trysil — provenance strip: homepage entry removed, google_places kept.
+  const trysilAfter = bmDb
+    .prepare("SELECT address, postal_code, field_provenance FROM agent_knowledge WHERE agent_id = ?")
+    .get(TRYSIL_ID);
+  assertEq(trysilAfter.address, null, "pr-86-bm: Trysil address NULLed");
+  assertEq(trysilAfter.postal_code, null, "pr-86-bm: Trysil postal_code NULLed");
+  const trysilProv = JSON.parse(trysilAfter.field_provenance);
+  assertEq(
+    Array.isArray(trysilProv.address?.sources) ? trysilProv.address.sources.length : -1,
+    1,
+    "pr-86-bm: Trysil address.sources reduced to 1 entry"
+  );
+  assertEq(
+    trysilProv.address.sources[0].source_type,
+    "google_places",
+    "pr-86-bm: Trysil preserved the google_places provenance entry"
+  );
+  assertEq(
+    trysilProv.address.sources[0].value,
+    "Riktige veien 1, 8500 Narvik",
+    "pr-86-bm: Trysil google_places value preserved verbatim"
+  );
+
+  // ── Idempotency: re-running over already-cleaned rows is a no-op ──
+  const idemResult = cleanBmAddressBug({ db: bmDb, dryRun: false });
+  assertEq(
+    idemResult.cleaned_agent_ids.length,
+    0,
+    "pr-86-bm: re-run is no-op (all rows already cleaned)"
+  );
+  assertEq(
+    idemResult.total_provenance_entries_removed,
+    0,
+    "pr-86-bm: re-run removes 0 provenance entries"
+  );
+}
+
 // ── orch-pr-86: provenance cleanup + read endpoints ──
 console.log("── orch-pr-86: provenance cleanup + read endpoints ──");
 

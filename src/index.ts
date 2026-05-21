@@ -31,6 +31,7 @@ import { analyticsService } from "./services/analytics-service";
 import analyticsRoutes from "./routes/analytics";
 import agentStatsRoutes from "./routes/agent-stats";
 import adminRunsRoutes from "./routes/admin-runs";
+import adminBmCleanupRoutes from "./routes/admin-bm-cleanup";
 import adminOutreachPoolRoutes from "./routes/admin-outreach-pool";
 import adminRunVerifierRoutes from "./routes/admin-run-verifier";
 import ownerPortalRoutes from "./routes/owner-portal";
@@ -258,6 +259,7 @@ app.get("/health", (_req, res) => {
 // Analytics admin endpoints
 app.use("/admin/analytics", analyticsRoutes);
 app.use("/admin/runs", adminLimiter, adminRunsRoutes);
+app.use("/admin/bm-address-cleanup", adminLimiter, adminBmCleanupRoutes);
 app.use("/admin/outreach-ready-pool", adminLimiter, adminOutreachPoolRoutes);
 app.use("/admin/run-verifier", adminLimiter, adminRunVerifierRoutes);
 // ─── M1: Daniel-only agent audit trail (Phase 5.4a) ──────────
