@@ -13,7 +13,7 @@
 // All endpoints require X-Admin-Key.
 
 import { Router, Request, Response } from "express";
-import { runVerifierBatch, buildRunEnvelope, pickReviewQueueBatch } from "../agents/lokal-agent-verifier";
+import { runVerifierBatch, buildRunEnvelope, pickReviewQueueBatch, pickBatchBiased } from "../agents/lokal-agent-verifier";
 import { recordRun } from "../services/run-ledger";
 
 const router = Router();
@@ -73,11 +73,24 @@ router.post("/", async (req: Request, res: Response) => {
     req.query.reprocess_review_queue === "true" ||
     (req.body && (req.body.reprocess_review_queue === true || req.body.reprocess_review_queue === "1"));
 
+  // orch-pr-87: bias_growth flag (default 1) — use pickBatchBiased
+  // (70/30 growth-reservoir split) unless explicitly disabled with
+  // bias_growth=0 (falls back to legacy pickBatch oldest-first).
+  // Has no effect when reprocess_review_queue=1 (review-queue drain
+  // mode still uses pickReviewQueueBatch).
+  const biasGrowthRaw =
+    (req.body && req.body.bias_growth !== undefined ? req.body.bias_growth : req.query.bias_growth);
+  const biasGrowth = biasGrowthRaw === undefined
+    ? true
+    : !(biasGrowthRaw === "0" || biasGrowthRaw === 0 || biasGrowthRaw === false || biasGrowthRaw === "false");
+
   try {
     const batchResult = await runVerifierBatch(
       reprocessReviewQueue
         ? { batchSize, pickFn: pickReviewQueueBatch }
-        : { batchSize }
+        : biasGrowth
+          ? { batchSize, pickFn: pickBatchBiased }
+          : { batchSize }
     );
     const results = batchResult.results;
 
@@ -126,6 +139,7 @@ router.post("/", async (req: Request, res: Response) => {
       hour_utc: hourUTC,
       forced: !!force,
       reprocess_review_queue: !!reprocessReviewQueue,
+      bias_growth: !!biasGrowth,
     });
   } catch (err: any) {
     res.status(500).json({
