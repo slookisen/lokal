@@ -503,34 +503,38 @@ export function applyVerifierOutcome(
       outcome.url_last_status ?? null,
       agentId
     );
-    return;
+  } else {
+    db.prepare(
+      `UPDATE agent_knowledge SET
+         verification_status         = ?,
+         enrichment_status           = ?,
+         last_verified_at            = ?,
+         last_http_check_at          = ?,
+         last_http_status            = ?,
+         outreach_eligible_at        = COALESCE(?, outreach_eligible_at),
+         verification_review_reason  = ?
+       WHERE agent_id = ?`
+    ).run(
+      outcome.new_verification_status,
+      outcome.new_enrichment_status,
+      outcome.runStartedAt,
+      outcome.runStartedAt,
+      outcome.http_status,
+      outcome.eligibleAt,
+      JSON.stringify(outcome.cross_source_reason ?? {}),
+      agentId
+    );
   }
-  db.prepare(
-    `UPDATE agent_knowledge SET
-       verification_status         = ?,
-       enrichment_status           = ?,
-       last_verified_at            = ?,
-       last_http_check_at          = ?,
-       last_http_status            = ?,
-       outreach_eligible_at        = COALESCE(?, outreach_eligible_at),
-       verification_review_reason  = ?
-     WHERE agent_id = ?`
-  ).run(
-    outcome.new_verification_status,
-    outcome.new_enrichment_status,
-    outcome.runStartedAt,
-    outcome.runStartedAt,
-    outcome.http_status,
-    outcome.eligibleAt,
-    JSON.stringify(outcome.cross_source_reason ?? {}),
-    agentId
-  );
 
-  // orch-pr-87: sweep-round tracking. Best-effort — the column was
-  // added by an idempotent ALTER (see src/database/init.ts); in test
-  // harnesses that build a minimal agent_knowledge schema without
-  // running init(), the column may be missing. Wrap in try/catch so
-  // those tests continue to pass.
+  // orch-pr-87 (iter 2): sweep-round tracking. Runs unconditionally
+  // for BOTH branches above — iter 1 placed this after the fallthrough
+  // UPDATE only, which made it dead code in production (the prod
+  // caller `runVerifierBatch` always populates url_last_probed/_status,
+  // so the first branch always fires and used to `return` early).
+  // Best-effort — the column was added by an idempotent ALTER (see
+  // src/database/init.ts); in test harnesses that build a minimal
+  // agent_knowledge schema without running init(), the column may be
+  // missing. Wrap in try/catch so those tests continue to pass.
   try {
     db.prepare(
       `UPDATE agent_knowledge SET sweep_processed_at = ? WHERE agent_id = ?`

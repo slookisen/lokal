@@ -10687,7 +10687,9 @@ console.log("\n── orch-pr-87: pickBatchBiased + getSweepStatus ──");
         field_provenance TEXT NOT NULL DEFAULT '{}',
         verification_review_reason TEXT NOT NULL DEFAULT '{}',
         sweep_round INTEGER NOT NULL DEFAULT 0,
-        sweep_processed_at TEXT
+        sweep_processed_at TEXT,
+        url_last_probed TEXT,
+        url_last_status INTEGER
       );
     `);
     return db;
@@ -10793,6 +10795,57 @@ console.log("\n── orch-pr-87: pickBatchBiased + getSweepStatus ──");
     assertEq(status.agents_processed_this_round, 0, "orch-pr-87: empty-DB processed = 0");
     assertTrue(status.round_started_at === null, "orch-pr-87: empty-DB round_started_at is null");
     assertEq(status.remaining_this_round, 0, "orch-pr-87: empty-DB remaining = 0");
+    db.close();
+  }
+
+  // Test 6 (iter 2 — regression guard for dead-code bug): exercises the
+  // REAL prod write path. runVerifierBatch always passes url_last_probed
+  // (= startedAt) and url_last_status (number|null), so the first branch
+  // of applyVerifierOutcome fires. Iter 1 had `return;` at the end of
+  // that branch, making the sweep_processed_at write unreachable in prod.
+  // This test calls applyVerifierOutcome with the prod call-shape and
+  // asserts sweep_processed_at was written to runStartedAt.
+  {
+    const { applyVerifierOutcome } = require("../src/agents/lokal-agent-verifier");
+    const db = makeDb();
+    const insA = db.prepare("INSERT INTO agents (id,name,role,city) VALUES (?, ?, 'producer', 'Oslo')");
+    const insK = db.prepare(`INSERT INTO agent_knowledge (agent_id, email, website, verification_status)
+                             VALUES (?, ?, ?, ?)`);
+    insA.run("prod-shape-1", "Prod Shape 1");
+    insK.run("prod-shape-1", "ps1@x.no", "https://ps1.no", "pending_verify");
+
+    const runStartedAt = "2026-05-23T12:00:00.000Z";
+    applyVerifierOutcome(db, "prod-shape-1", {
+      new_verification_status: "verified",
+      new_enrichment_status: "partial",
+      http_status: 200,
+      runStartedAt,
+      eligibleAt: null,
+      cross_source_reason: {},
+      // Mirror runVerifierBatch's prod call shape — both fields set.
+      url_last_probed: runStartedAt,
+      url_last_status: 200,
+    });
+
+    const row = db
+      .prepare(`SELECT sweep_processed_at, url_last_probed, url_last_status, verification_status
+                FROM agent_knowledge WHERE agent_id = ?`)
+      .get("prod-shape-1") as any;
+    assertEq(row.sweep_processed_at, runStartedAt,
+      `orch-pr-87 iter2: sweep_processed_at written via prod-shape applyVerifierOutcome (got ${row.sweep_processed_at})`);
+    assertEq(row.url_last_probed, runStartedAt,
+      `orch-pr-87 iter2: url_last_probed still written (got ${row.url_last_probed})`);
+    assertEq(row.url_last_status, 200,
+      `orch-pr-87 iter2: url_last_status still written (got ${row.url_last_status})`);
+    assertEq(row.verification_status, "verified",
+      `orch-pr-87 iter2: verification_status still written (got ${row.verification_status})`);
+
+    // Now also confirm getSweepStatus sees the write end-to-end.
+    const status = getSweepStatus(db);
+    assertTrue(status.agents_processed_this_round >= 0,
+      "orch-pr-87 iter2: getSweepStatus runs without error after applyVerifierOutcome");
+    assertEq(status.newest_processed_at, runStartedAt,
+      `orch-pr-87 iter2: getSweepStatus.newest_processed_at == runStartedAt (got ${status.newest_processed_at})`);
     db.close();
   }
 }
