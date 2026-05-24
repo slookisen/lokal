@@ -10663,6 +10663,194 @@ const _orchPr86Promise: Promise<void> = new Promise<void>(r => { _orchPr86Resolv
   });
 
 
+// ── orch-pr-87: pickBatchBiased + getSweepStatus ──
+console.log("\n── orch-pr-87: pickBatchBiased + getSweepStatus ──");
+{
+  const {
+    pickBatchBiased,
+    getSweepStatus,
+  } = require("../src/agents/lokal-agent-verifier");
+  const sqlite = require("better-sqlite3");
+
+  function makeDb() {
+    const db = new sqlite(":memory:");
+    db.exec(`
+      CREATE TABLE agents (id TEXT PRIMARY KEY, name TEXT, role TEXT, city TEXT, url TEXT);
+      CREATE TABLE agent_knowledge (
+        agent_id TEXT PRIMARY KEY,
+        address TEXT, website TEXT, phone TEXT, email TEXT,
+        about TEXT, products TEXT DEFAULT '[]',
+        verification_status TEXT NOT NULL DEFAULT 'unverified',
+        enrichment_status TEXT NOT NULL DEFAULT 'thin',
+        outreach_eligible_at TEXT,
+        last_verified_at TEXT, last_http_check_at TEXT, last_http_status INTEGER,
+        field_provenance TEXT NOT NULL DEFAULT '{}',
+        verification_review_reason TEXT NOT NULL DEFAULT '{}',
+        sweep_round INTEGER NOT NULL DEFAULT 0,
+        sweep_processed_at TEXT,
+        url_last_probed TEXT,
+        url_last_status INTEGER
+      );
+    `);
+    return db;
+  }
+
+  function seedAgents(db: any, prefix: string, count: number, status: string, baseDate: string) {
+    const insA = db.prepare("INSERT INTO agents (id,name,role,city) VALUES (?, ?, 'producer', 'Oslo')");
+    const insK = db.prepare(`INSERT INTO agent_knowledge (agent_id, email, website, verification_status, last_verified_at)
+                             VALUES (?, ?, ?, ?, ?)`);
+    for (let i = 0; i < count; i++) {
+      const id = `${prefix}-${i}`;
+      insA.run(id, `Agent ${id}`);
+      // Stagger last_verified_at so ORDER BY is deterministic
+      const offsetMs = i * 60_000; // 1-minute steps
+      const ts = new Date(Date.parse(baseDate) + offsetMs).toISOString();
+      insK.run(id, `${id}@x.no`, `https://${id}.no`, status, ts);
+    }
+  }
+
+  // Test 1: 70/30 split when both buckets are full
+  {
+    const db = makeDb();
+    seedAgents(db, "growth", 100, "pending_verify", "2026-05-01T00:00:00Z");
+    seedAgents(db, "ver", 100, "verified", "2026-05-01T00:00:00Z");
+
+    const batch = pickBatchBiased(db, 30, 0.7);
+    const growthStatuses = new Set(["pending_verify", "review_required", "data_insufficient"]);
+    const growthCount = batch.filter((r: any) => growthStatuses.has(r.verification_status)).length;
+    const verifiedCount = batch.filter((r: any) => r.verification_status === "verified").length;
+
+    assertEq(batch.length, 30, `orch-pr-87: pickBatchBiased returns 30 rows (got ${batch.length})`);
+    assertEq(growthCount, 21, `orch-pr-87: 21 growth-reservoir rows (got ${growthCount})`);
+    assertEq(verifiedCount, 9, `orch-pr-87: 9 verified rows (got ${verifiedCount})`);
+    db.close();
+  }
+
+  // Test 2: fills from verified when growth-reservoir is empty
+  {
+    const db = makeDb();
+    seedAgents(db, "ver", 100, "verified", "2026-05-01T00:00:00Z");
+
+    const batch = pickBatchBiased(db, 30);
+    const verifiedCount = batch.filter((r: any) => r.verification_status === "verified").length;
+    assertEq(batch.length, 30, `orch-pr-87: fallback-to-verified returns 30 (got ${batch.length})`);
+    assertEq(verifiedCount, 30, `orch-pr-87: all 30 are verified (got ${verifiedCount})`);
+    db.close();
+  }
+
+  // Test 3: fills from growth when verified is empty
+  {
+    const db = makeDb();
+    seedAgents(db, "growth", 100, "pending_verify", "2026-05-01T00:00:00Z");
+
+    const batch = pickBatchBiased(db, 30);
+    const growthStatuses = new Set(["pending_verify", "review_required", "data_insufficient"]);
+    const growthCount = batch.filter((r: any) => growthStatuses.has(r.verification_status)).length;
+    assertEq(batch.length, 30, `orch-pr-87: fallback-to-growth returns 30 (got ${batch.length})`);
+    assertEq(growthCount, 30, `orch-pr-87: all 30 are growth-reservoir (got ${growthCount})`);
+    db.close();
+  }
+
+  // Test 4: getSweepStatus shape + processed-count math
+  {
+    const db = makeDb();
+    // 10 agents total (none opt_out), 5 with sweep_processed_at, 5 NULL.
+    const insA = db.prepare("INSERT INTO agents (id,name,role,city) VALUES (?, ?, 'producer', 'Oslo')");
+    const insK = db.prepare(`INSERT INTO agent_knowledge (agent_id, email, website, verification_status, last_verified_at, sweep_processed_at)
+                             VALUES (?, ?, ?, ?, ?, ?)`);
+    for (let i = 0; i < 5; i++) {
+      const id = `sw-proc-${i}`;
+      insA.run(id, id);
+      // Stagger timestamps: i=0 is the oldest (round_started_at),
+      // i=1..4 are strictly greater so they count as "processed this round".
+      const ts = `2026-05-2${i}T00:00:00.000Z`;
+      insK.run(id, `${id}@x.no`, `https://${id}.no`, "verified", ts, ts);
+    }
+    for (let i = 0; i < 5; i++) {
+      const id = `sw-null-${i}`;
+      insA.run(id, id);
+      insK.run(id, `${id}@x.no`, `https://${id}.no`, "pending_verify", null, null);
+    }
+
+    const status = getSweepStatus(db);
+    assertEq(status.agents_total, 10, `orch-pr-87: getSweepStatus.agents_total (got ${status.agents_total})`);
+    assertEq(status.agents_processed_this_round, 4,
+      `orch-pr-87: 4 agents processed strictly > round_started_at (got ${status.agents_processed_this_round})`);
+    assertEq(status.round_started_at, "2026-05-20T00:00:00.000Z",
+      `orch-pr-87: round_started_at == min(sweep_processed_at) (got ${status.round_started_at})`);
+    assertEq(status.newest_processed_at, "2026-05-24T00:00:00.000Z",
+      `orch-pr-87: newest_processed_at == max(sweep_processed_at) (got ${status.newest_processed_at})`);
+    assertEq(status.remaining_this_round, 6,
+      `orch-pr-87: remaining = 10 - 4 (got ${status.remaining_this_round})`);
+    assertEq(status.current_round, 0,
+      `orch-pr-87: current_round = 0 (v1 TODO) (got ${status.current_round})`);
+    db.close();
+  }
+
+  // Test 5: getSweepStatus on empty DB returns sane defaults
+  {
+    const db = makeDb();
+    const status = getSweepStatus(db);
+    assertEq(status.agents_total, 0, "orch-pr-87: empty-DB agents_total = 0");
+    assertEq(status.agents_processed_this_round, 0, "orch-pr-87: empty-DB processed = 0");
+    assertTrue(status.round_started_at === null, "orch-pr-87: empty-DB round_started_at is null");
+    assertEq(status.remaining_this_round, 0, "orch-pr-87: empty-DB remaining = 0");
+    db.close();
+  }
+
+  // Test 6 (iter 2 — regression guard for dead-code bug): exercises the
+  // REAL prod write path. runVerifierBatch always passes url_last_probed
+  // (= startedAt) and url_last_status (number|null), so the first branch
+  // of applyVerifierOutcome fires. Iter 1 had `return;` at the end of
+  // that branch, making the sweep_processed_at write unreachable in prod.
+  // This test calls applyVerifierOutcome with the prod call-shape and
+  // asserts sweep_processed_at was written to runStartedAt.
+  {
+    const { applyVerifierOutcome } = require("../src/agents/lokal-agent-verifier");
+    const db = makeDb();
+    const insA = db.prepare("INSERT INTO agents (id,name,role,city) VALUES (?, ?, 'producer', 'Oslo')");
+    const insK = db.prepare(`INSERT INTO agent_knowledge (agent_id, email, website, verification_status)
+                             VALUES (?, ?, ?, ?)`);
+    insA.run("prod-shape-1", "Prod Shape 1");
+    insK.run("prod-shape-1", "ps1@x.no", "https://ps1.no", "pending_verify");
+
+    const runStartedAt = "2026-05-23T12:00:00.000Z";
+    applyVerifierOutcome(db, "prod-shape-1", {
+      new_verification_status: "verified",
+      new_enrichment_status: "partial",
+      http_status: 200,
+      runStartedAt,
+      eligibleAt: null,
+      cross_source_reason: {},
+      // Mirror runVerifierBatch's prod call shape — both fields set.
+      url_last_probed: runStartedAt,
+      url_last_status: 200,
+    });
+
+    const row = db
+      .prepare(`SELECT sweep_processed_at, url_last_probed, url_last_status, verification_status
+                FROM agent_knowledge WHERE agent_id = ?`)
+      .get("prod-shape-1") as any;
+    assertEq(row.sweep_processed_at, runStartedAt,
+      `orch-pr-87 iter2: sweep_processed_at written via prod-shape applyVerifierOutcome (got ${row.sweep_processed_at})`);
+    assertEq(row.url_last_probed, runStartedAt,
+      `orch-pr-87 iter2: url_last_probed still written (got ${row.url_last_probed})`);
+    assertEq(row.url_last_status, 200,
+      `orch-pr-87 iter2: url_last_status still written (got ${row.url_last_status})`);
+    assertEq(row.verification_status, "verified",
+      `orch-pr-87 iter2: verification_status still written (got ${row.verification_status})`);
+
+    // Now also confirm getSweepStatus sees the write end-to-end.
+    const status = getSweepStatus(db);
+    assertTrue(status.agents_processed_this_round >= 0,
+      "orch-pr-87 iter2: getSweepStatus runs without error after applyVerifierOutcome");
+    assertEq(status.newest_processed_at, runStartedAt,
+      `orch-pr-87 iter2: getSweepStatus.newest_processed_at == runStartedAt (got ${status.newest_processed_at})`);
+    db.close();
+  }
+}
+
+
 // ── REPORT ────────────────────────────────────────────────────────────
 
 // Wait for the M2 owner-portal async tests before reporting so their

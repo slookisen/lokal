@@ -819,6 +819,28 @@ function initSchema(db: Database.Database): void {
   }
 
 
+  // ─── orch-pr-87 — agent_knowledge.sweep_round + sweep_processed_at ─
+  // Systematic-sweep observability (PHASE5: full-sweep design,
+  // 2026-05-23). `sweep_processed_at` is set on every verifier write
+  // (see applyVerifierOutcome in lokal-agent-verifier.ts). `sweep_round`
+  // is reserved for app-layer computation (current v1 leaves the column
+  // at its default of 0; the useful signal today is the min/max of
+  // sweep_processed_at, exposed via getSweepStatus() and the
+  // GET /admin/verifier/sweep-status endpoint).
+  //
+  // Both ALTERs are wrapped in try/catch — idempotent across re-runs.
+  try {
+    db.exec(`ALTER TABLE agent_knowledge ADD COLUMN sweep_round INTEGER NOT NULL DEFAULT 0`);
+  } catch {
+    // Column already exists — expected after first migration
+  }
+  try {
+    db.exec(`ALTER TABLE agent_knowledge ADD COLUMN sweep_processed_at TEXT`);
+  } catch {
+    // Column already exists — expected after first migration
+  }
+
+
   // ─── Phase 4.10c-2 Steg 1 — DB-trigger: auto-update last_outbound_at ─
   // Whenever a crm_messages row is INSERTed with direction='out' AND
   // delivery_status='sent', set the parent thread's last_outbound_at if

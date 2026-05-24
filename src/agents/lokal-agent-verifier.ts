@@ -305,6 +305,161 @@ export function pickReviewQueueBatch(db: any, limit = 30): any[] {
     .all(limit);
 }
 
+// orch-pr-87: 70/30 growth-biased picker. Default behaviour for
+// /admin/run-verifier going forward — keeps the systematic-sweep
+// guarantee for already-`verified` agents while biasing capacity
+// toward the growth-reservoir buckets (pending_verify, review_required,
+// data_insufficient) where actual pool-growth is unlocked.
+//
+// Split semantics:
+//   - growthCount = Math.floor(limit * growthRatio)   (default 21 of 30)
+//   - verifiedCount = limit - growthCount             (default 9 of 30)
+//   - growth sub-query: WHERE verification_status IN
+//       ('pending_verify','review_required','data_insufficient')
+//   - verified sub-query: WHERE verification_status = 'verified'
+//   - both ordered HTTP-failed-first then oldest last_verified_at first
+//     (matches pickBatch's existing front-bump behaviour).
+//
+// Fall-back: if one sub-query returns fewer rows than its target,
+// the deficit is filled from the other bucket so the caller always
+// gets up to `limit` candidates when any exist.
+//
+// opt_out agents are always excluded (matches pickBatch).
+export function pickBatchBiased(
+  db: any,
+  limit = 30,
+  growthRatio = 0.7
+): any[] {
+  const growthTarget = Math.floor(limit * growthRatio);
+  const verifiedTarget = limit - growthTarget;
+
+  const SELECT_COLS = `SELECT a.id, a.name, a.url AS agent_url, a.city AS location_city,
+              k.email, k.phone, k.address,
+              k.website, k.about, k.products, k.field_provenance,
+              k.verification_status, k.enrichment_status,
+              k.last_verified_at, k.last_http_check_at, k.last_http_status
+         FROM agents a
+   INNER JOIN agent_knowledge k ON k.agent_id = a.id`;
+
+  const ORDER = `ORDER BY CASE WHEN k.last_http_status >= 400 THEN 0 ELSE 1 END,
+              COALESCE(k.last_verified_at, '1970-01-01') ASC`;
+
+  const growthRows = growthTarget > 0
+    ? db.prepare(
+        `${SELECT_COLS}
+          WHERE k.verification_status IN ('pending_verify', 'review_required', 'data_insufficient')
+          ${ORDER}
+          LIMIT ?`
+      ).all(growthTarget)
+    : [];
+
+  const verifiedRows = verifiedTarget > 0
+    ? db.prepare(
+        `${SELECT_COLS}
+          WHERE k.verification_status = 'verified'
+          ${ORDER}
+          LIMIT ?`
+      ).all(verifiedTarget)
+    : [];
+
+  // Fall-back: backfill from the other bucket if one came up short.
+  const growthDeficit = growthTarget - growthRows.length;
+  const verifiedDeficit = verifiedTarget - verifiedRows.length;
+
+  let extraVerified: any[] = [];
+  if (growthDeficit > 0) {
+    extraVerified = db.prepare(
+      `${SELECT_COLS}
+        WHERE k.verification_status = 'verified'
+        ${ORDER}
+        LIMIT ?`
+    ).all(verifiedTarget + growthDeficit);
+    // Strip the rows we already have to avoid duplicates and cap total.
+    const haveIds = new Set(verifiedRows.map((r: any) => r.id));
+    extraVerified = extraVerified.filter((r: any) => !haveIds.has(r.id)).slice(0, growthDeficit);
+  }
+
+  let extraGrowth: any[] = [];
+  if (verifiedDeficit > 0) {
+    extraGrowth = db.prepare(
+      `${SELECT_COLS}
+        WHERE k.verification_status IN ('pending_verify', 'review_required', 'data_insufficient')
+        ${ORDER}
+        LIMIT ?`
+    ).all(growthTarget + verifiedDeficit);
+    const haveIds = new Set(growthRows.map((r: any) => r.id));
+    extraGrowth = extraGrowth.filter((r: any) => !haveIds.has(r.id)).slice(0, verifiedDeficit);
+  }
+
+  return [...growthRows, ...extraGrowth, ...verifiedRows, ...extraVerified].slice(0, limit);
+}
+
+// orch-pr-87: sweep-round observability. Returns aggregate counters
+// derived from agent_knowledge.sweep_processed_at. v1 keeps
+// `current_round = 0` (a TODO — round numbering is a nice-to-have we
+// can derive later from a sweep-history table); the useful signal
+// today is the processed/remaining split within the current window.
+export interface SweepStatus {
+  current_round: number;
+  round_started_at: string | null;
+  agents_processed_this_round: number;
+  agents_total: number;
+  remaining_this_round: number;
+  oldest_processed_at: string | null;
+  newest_processed_at: string | null;
+}
+
+export function getSweepStatus(db: any): SweepStatus {
+  const totalRow = db
+    .prepare(
+      `SELECT COUNT(*) AS n FROM agent_knowledge
+        WHERE verification_status NOT IN ('opt_out')`
+    )
+    .get() as { n: number } | undefined;
+  const agentsTotal = totalRow?.n ?? 0;
+
+  const boundsRow = db
+    .prepare(
+      `SELECT MIN(sweep_processed_at) AS oldest,
+              MAX(sweep_processed_at) AS newest
+         FROM agent_knowledge
+        WHERE verification_status NOT IN ('opt_out')
+          AND sweep_processed_at IS NOT NULL`
+    )
+    .get() as { oldest: string | null; newest: string | null } | undefined;
+
+  const roundStartedAt = boundsRow?.oldest ?? null;
+  const newest = boundsRow?.newest ?? null;
+
+  let agentsProcessedThisRound = 0;
+  if (roundStartedAt !== null) {
+    const procRow = db
+      .prepare(
+        `SELECT COUNT(*) AS n FROM agent_knowledge
+          WHERE verification_status NOT IN ('opt_out')
+            AND sweep_processed_at IS NOT NULL
+            AND sweep_processed_at > ?`
+      )
+      .get(roundStartedAt) as { n: number } | undefined;
+    agentsProcessedThisRound = procRow?.n ?? 0;
+  }
+
+  const remaining = Math.max(0, agentsTotal - agentsProcessedThisRound);
+
+  return {
+    // TODO(orch-pr-87): derive round number from sweep-history. v1
+    // exposes 0 so dashboards can render without crashing; the useful
+    // observability today is the processed/remaining split below.
+    current_round: 0,
+    round_started_at: roundStartedAt,
+    agents_processed_this_round: agentsProcessedThisRound,
+    agents_total: agentsTotal,
+    remaining_this_round: remaining,
+    oldest_processed_at: roundStartedAt,
+    newest_processed_at: newest,
+  };
+}
+
 // Apply verifier outcome to agent_knowledge. Pure DB write — caller
 // owns the transaction.
 export function applyVerifierOutcome(
@@ -348,28 +503,45 @@ export function applyVerifierOutcome(
       outcome.url_last_status ?? null,
       agentId
     );
-    return;
+  } else {
+    db.prepare(
+      `UPDATE agent_knowledge SET
+         verification_status         = ?,
+         enrichment_status           = ?,
+         last_verified_at            = ?,
+         last_http_check_at          = ?,
+         last_http_status            = ?,
+         outreach_eligible_at        = COALESCE(?, outreach_eligible_at),
+         verification_review_reason  = ?
+       WHERE agent_id = ?`
+    ).run(
+      outcome.new_verification_status,
+      outcome.new_enrichment_status,
+      outcome.runStartedAt,
+      outcome.runStartedAt,
+      outcome.http_status,
+      outcome.eligibleAt,
+      JSON.stringify(outcome.cross_source_reason ?? {}),
+      agentId
+    );
   }
-  db.prepare(
-    `UPDATE agent_knowledge SET
-       verification_status         = ?,
-       enrichment_status           = ?,
-       last_verified_at            = ?,
-       last_http_check_at          = ?,
-       last_http_status            = ?,
-       outreach_eligible_at        = COALESCE(?, outreach_eligible_at),
-       verification_review_reason  = ?
-     WHERE agent_id = ?`
-  ).run(
-    outcome.new_verification_status,
-    outcome.new_enrichment_status,
-    outcome.runStartedAt,
-    outcome.runStartedAt,
-    outcome.http_status,
-    outcome.eligibleAt,
-    JSON.stringify(outcome.cross_source_reason ?? {}),
-    agentId
-  );
+
+  // orch-pr-87 (iter 2): sweep-round tracking. Runs unconditionally
+  // for BOTH branches above — iter 1 placed this after the fallthrough
+  // UPDATE only, which made it dead code in production (the prod
+  // caller `runVerifierBatch` always populates url_last_probed/_status,
+  // so the first branch always fires and used to `return` early).
+  // Best-effort — the column was added by an idempotent ALTER (see
+  // src/database/init.ts); in test harnesses that build a minimal
+  // agent_knowledge schema without running init(), the column may be
+  // missing. Wrap in try/catch so those tests continue to pass.
+  try {
+    db.prepare(
+      `UPDATE agent_knowledge SET sweep_processed_at = ? WHERE agent_id = ?`
+    ).run(outcome.runStartedAt, agentId);
+  } catch {
+    // sweep_processed_at column not present in this DB — skip.
+  }
 }
 
 // ─── PR-21 / WO-19 (2026-05-10): standalone url_last_probe writer ──
