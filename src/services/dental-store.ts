@@ -157,6 +157,15 @@ function hydrateAgent(row: Record<string, unknown>): DentalAgent & {
 
 export function createDentalAgent(input: DentalAgent): string {
   const parsed = DentalAgentSchema.parse(input);
+
+  // EXCLUSION CHECK (PR-90): refuse insert if org_nr or hjemmeside
+  // is on the anti-rediscovery list. Prevents Brreg/discovery from
+  // re-inserting records we've already determined are not clinics.
+  const excl = isExcluded(parsed.org_nr ?? null, parsed.hjemmeside ?? null);
+  if (excl.excluded) {
+    throw new Error(`Refused: agent is excluded (reason=${excl.reason})`);
+  }
+
   const id = parsed.id ?? uuid();
   const db = getDb("dental");
 
@@ -534,10 +543,12 @@ export function updateDentalAgent(
 export function bulkInsertFromMerged(rows: MergedRow[]): {
   inserted: number;
   skipped: number;
+  excluded: number;
 } {
   const db = getDb("dental");
   let inserted = 0;
   let skipped = 0;
+  let excluded = 0;
 
   const insertOne = db.prepare(`
     INSERT OR IGNORE INTO dental_agents (
@@ -564,6 +575,13 @@ export function bulkInsertFromMerged(rows: MergedRow[]): {
       // Light-touch validation — bulk pipeline upstream owns shape.
       if (!row.navn) {
         skipped++;
+        continue;
+      }
+      // EXCLUSION CHECK (PR-90): skip rows whose org_nr or URL is on
+      // the anti-rediscovery list.
+      const excl = isExcluded(row.org_nr ?? null, row.hjemmeside ?? null);
+      if (excl.excluded) {
+        excluded++;
         continue;
       }
       const id = row.id ?? uuid();
@@ -600,5 +618,115 @@ export function bulkInsertFromMerged(rows: MergedRow[]): {
   });
 
   tx(rows);
-  return { inserted, skipped };
+  return { inserted, skipped, excluded };
+}
+
+
+// ─── Phase B exclusions (PR-90) ──────────────────────────────────────
+//
+// Anti-rediscovery: dental_exclusions records orgnrs / URLs we've
+// determined are NOT valid dental clinics (suppliers, dead domains,
+// booking portals misclassified under NACE 86.230, etc). createDentalAgent
+// and bulkInsertFromMerged consult this table before inserting.
+
+export type ExclusionReason =
+  | "not_a_clinic"
+  | "dead_domain"
+  | "robots_blocked_permanent"
+  | "supplier"
+  | "booking_portal"
+  | "duplicate_orgnr"
+  | "fylkeskommunal_dot"
+  | "manual_review";
+
+export interface IsExcludedResult {
+  excluded: boolean;
+  reason?: ExclusionReason;
+  notes?: string;
+}
+
+export function isExcluded(
+  orgnr?: string | null,
+  hjemmesideUrl?: string | null
+): IsExcludedResult {
+  const db = getDb("dental");
+  if (orgnr) {
+    const row = db
+      .prepare(
+        `SELECT reason, notes FROM dental_exclusions
+         WHERE org_nr = ?
+         AND (is_permanent = 1 OR reactivate_after IS NULL OR reactivate_after > datetime('now'))
+         LIMIT 1`
+      )
+      .get(orgnr) as { reason: ExclusionReason; notes?: string } | undefined;
+    if (row) return { excluded: true, reason: row.reason, notes: row.notes };
+  }
+  if (hjemmesideUrl) {
+    const row = db
+      .prepare(
+        `SELECT reason, notes FROM dental_exclusions
+         WHERE hjemmeside_url = ?
+         AND (is_permanent = 1 OR reactivate_after IS NULL OR reactivate_after > datetime('now'))
+         LIMIT 1`
+      )
+      .get(hjemmesideUrl) as { reason: ExclusionReason; notes?: string } | undefined;
+    if (row) return { excluded: true, reason: row.reason, notes: row.notes };
+  }
+  return { excluded: false };
+}
+
+export interface RecordExclusionInput {
+  orgnr?: string | null;
+  hjemmesideUrl?: string | null;
+  navnPattern?: string | null;
+  reason: ExclusionReason;
+  evidence?: string | null;
+  notes?: string | null;
+  excludedBy: string;
+  reactivateAfter?: string | null;
+  isPermanent?: boolean;
+}
+
+export function recordExclusion(args: RecordExclusionInput): string {
+  const id = "excl-" + uuid();
+  getDb("dental")
+    .prepare(
+      `INSERT INTO dental_exclusions
+       (id, org_nr, hjemmeside_url, navn_pattern, reason, evidence, notes, excluded_by, reactivate_after, is_permanent)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+    )
+    .run(
+      id,
+      args.orgnr ?? null,
+      args.hjemmesideUrl ?? null,
+      args.navnPattern ?? null,
+      args.reason,
+      args.evidence ?? null,
+      args.notes ?? null,
+      args.excludedBy,
+      args.reactivateAfter ?? null,
+      args.isPermanent ? 1 : 0
+    );
+  return id;
+}
+
+export interface ListExclusionsFilter {
+  reason?: ExclusionReason;
+  limit?: number;
+}
+
+export function listExclusions(
+  filter: ListExclusionsFilter = {}
+): Array<Record<string, unknown>> {
+  let sql = `SELECT * FROM dental_exclusions WHERE 1=1`;
+  const params: unknown[] = [];
+  if (filter.reason) {
+    sql += ` AND reason = ?`;
+    params.push(filter.reason);
+  }
+  sql += ` ORDER BY excluded_at DESC LIMIT ?`;
+  params.push(filter.limit ?? 100);
+  return getDb("dental")
+    .prepare(sql)
+    .all(...params) as Array<Record<string, unknown>>;
 }

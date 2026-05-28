@@ -23,6 +23,9 @@ import {
   updateDentalAgent,
   DentalAgentSchema,
   ListFilterSchema,
+  listExclusions,
+  recordExclusion,
+  ExclusionReason,
 } from "../services/dental-store";
 
 const router = Router();
@@ -207,6 +210,59 @@ router.get("/discover", (req: Request, res: Response) => {
     }
     console.error("[tannlege] /discover failed", err);
     res.status(500).json({ error: "Internal error" });
+  }
+});
+
+// ─── GET /api/tannlege/exclusions (admin) — PR-90 ───────────────────
+// List current anti-rediscovery exclusions. Filter by reason.
+router.get("/exclusions", requireAdmin, (req: Request, res: Response) => {
+  try {
+    const reason = req.query.reason as ExclusionReason | undefined;
+    const limit = Math.min(
+      500,
+      Math.max(1, parseInt((req.query.limit as string) || "100", 10) || 100)
+    );
+    const exclusions = listExclusions({ reason, limit });
+    res.json({ count: exclusions.length, exclusions });
+  } catch (err) {
+    console.error("[tannlege] GET /exclusions failed", err);
+    res.status(500).json({ error: "Internal error" });
+  }
+});
+
+// ─── POST /api/tannlege/exclusions (admin) — PR-90 ──────────────────
+// Record a new exclusion. Body shape:
+//   { orgnr?, hjemmesideUrl?, navnPattern?, reason, evidence?, notes?,
+//     excludedBy?, reactivateAfter?, isPermanent? }
+router.post("/exclusions", requireAdmin, (req: Request, res: Response) => {
+  try {
+    const body = req.body || {};
+    if (!body.reason) {
+      res.status(400).json({ error: "Missing required field: reason" });
+      return;
+    }
+    if (!body.orgnr && !body.hjemmesideUrl && !body.navnPattern) {
+      res
+        .status(400)
+        .json({ error: "Need at least one of orgnr, hjemmesideUrl, navnPattern" });
+      return;
+    }
+    const id = recordExclusion({
+      orgnr: body.orgnr,
+      hjemmesideUrl: body.hjemmesideUrl,
+      navnPattern: body.navnPattern,
+      reason: body.reason,
+      evidence: body.evidence,
+      notes: body.notes,
+      excludedBy: body.excludedBy || "admin-manual",
+      reactivateAfter: body.reactivateAfter,
+      isPermanent: !!body.isPermanent,
+    });
+    res.status(201).json({ id, excluded: true });
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error("[tannlege] POST /exclusions failed", err);
+    res.status(400).json({ error: msg });
   }
 });
 

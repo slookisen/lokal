@@ -155,6 +155,31 @@ export function initDentalSchema(db: Database.Database): void {
     console.log(`[dental] dental_verifier_findings init skipped: ${(e as Error).message}`);
   }
 
+  // dental_exclusions (PR-90): anti-rediscovery list. When Brreg
+  // discovery re-runs, this table tells us which org_nrs / URLs we
+  // have already determined are NOT valid dental clinics — so we
+  // don't re-insert them (suppliers, dead domains, booking portals
+  // misclassified under NACE 86.230, etc).
+  try {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS dental_exclusions (
+        id TEXT PRIMARY KEY,
+        org_nr TEXT,
+        hjemmeside_url TEXT,
+        navn_pattern TEXT,
+        reason TEXT NOT NULL,
+        evidence TEXT,
+        notes TEXT,
+        excluded_at TEXT DEFAULT (datetime('now')),
+        excluded_by TEXT NOT NULL,
+        reactivate_after TEXT,
+        is_permanent INTEGER DEFAULT 0
+      );
+    `);
+  } catch (e) {
+    console.log(`[dental] dental_exclusions init skipped: ${(e as Error).message}`);
+  }
+
   // Indexes — wrapped in try/catch so re-deploy is safe
   const indexes = [
     "CREATE INDEX IF NOT EXISTS idx_dental_org_nr ON dental_agents(org_nr)",
@@ -164,6 +189,9 @@ export function initDentalSchema(db: Database.Database): void {
     "CREATE INDEX IF NOT EXISTS idx_aff_person ON dental_clinic_affiliations(person_id)",
     "CREATE INDEX IF NOT EXISTS idx_aff_clinic ON dental_clinic_affiliations(clinic_agent_id)",
     "CREATE INDEX IF NOT EXISTS idx_persons_hpr ON dental_persons(hpr_nr)",
+    "CREATE INDEX IF NOT EXISTS idx_excl_orgnr ON dental_exclusions(org_nr)",
+    "CREATE INDEX IF NOT EXISTS idx_excl_url ON dental_exclusions(hjemmeside_url)",
+    "CREATE INDEX IF NOT EXISTS idx_excl_reason ON dental_exclusions(reason)",
   ];
   for (const stmt of indexes) {
     try {
