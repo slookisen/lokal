@@ -26,6 +26,7 @@ import {
   listExclusions,
   recordExclusion,
   ExclusionReason,
+  bulkInsertFromMerged,
 } from "../services/dental-store";
 
 const router = Router();
@@ -263,6 +264,33 @@ router.post("/exclusions", requireAdmin, (req: Request, res: Response) => {
     const msg = err instanceof Error ? err.message : String(err);
     console.error("[tannlege] POST /exclusions failed", err);
     res.status(400).json({ error: msg });
+  }
+});
+
+// ─── POST /api/tannlege/agents/bulk-import (admin) — PR-90b ─────────
+// Bulk-insert a large batch of agents in a single transaction. Used
+// for the Phase A enrichment pipeline (6974 rows). Excluded rows are
+// skipped via isExcluded(). Returns {inserted, skipped, excluded}.
+//
+// Body: { agents: MergedRow[] }
+router.post("/agents/bulk-import", requireAdmin, (req: Request, res: Response) => {
+  try {
+    const body = req.body || {};
+    const agents = body.agents;
+    if (!Array.isArray(agents)) {
+      res.status(400).json({ error: "Body must be { agents: [...] }" });
+      return;
+    }
+    if (agents.length > 10000) {
+      res.status(400).json({ error: "Max 10000 agents per call" });
+      return;
+    }
+    const result = bulkInsertFromMerged(agents);
+    res.json({ ok: true, ...result, total: agents.length });
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error("[tannlege] POST /agents/bulk-import failed", err);
+    res.status(500).json({ error: msg });
   }
 });
 
