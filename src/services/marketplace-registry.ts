@@ -787,7 +787,8 @@ class MarketplaceRegistry {
         },
       },
 
-      // ─── Distribution channels (Phase 5.11 — Smithery added 2026-05-16) ─
+      // ─── Distribution channels (Phase 5.11 — Smithery added 2026-05-16;
+      // Glama / mcp.so / Official MCP Registry added 2026-05-28 by visibility-agent) ─
       // External registries that index this server. Consumer agents that
       // discover us via these channels can verify they are talking to the
       // canonical Rett fra Bonden marketplace by cross-checking the homepage
@@ -815,6 +816,27 @@ class MarketplaceRegistry {
           install: `${baseUrl}/.well-known/agent-card.json`,
           status: "live",
           description: "A2A protocol registry listing — direct JSON-RPC at /a2a.",
+        },
+        {
+          channel: "official-mcp-registry",
+          url: "https://registry.modelcontextprotocol.io/v0/servers?search=lokal",
+          install: "npx lokal-mcp",
+          status: "live",
+          description: "Official Model Context Protocol Registry — io.github.slookisen/lokal-mcp@0.4.0 (isLatest=true).",
+        },
+        {
+          channel: "glama",
+          url: "https://glama.ai/mcp/servers/lokal-mcp",
+          install: "npx lokal-mcp",
+          status: "live",
+          description: "Glama MCP servers directory listing.",
+        },
+        {
+          channel: "mcp-so",
+          url: "https://mcp.so/server/lokal-mcp",
+          install: "npx lokal-mcp",
+          status: "live",
+          description: "mcp.so MCP servers directory listing.",
         },
       ],
 
