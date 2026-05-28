@@ -6395,13 +6395,13 @@ console.log("── PR-29 related-producers tests ──");
     const card = regMod56.marketplaceRegistry.getRegistryCard("https://rettfrabonden.com") as any;
     const dist = card["x-distribution"];
     assertTrue(
-      Array.isArray(dist) && dist.length === 3,
-      `pr-56: getRegistryCard() emits x-distribution with 3 entries (got ${Array.isArray(dist) ? dist.length : typeof dist})`
+      Array.isArray(dist) && dist.length === 6,
+      `pr-56: getRegistryCard() emits x-distribution with 6 entries (got ${Array.isArray(dist) ? dist.length : typeof dist})`
     );
     const channels = (dist || []).map((d: any) => d.channel).sort();
     assertTrue(
-      JSON.stringify(channels) === JSON.stringify(["a2a-registry", "npm", "smithery"]),
-      `pr-56: x-distribution channels are exactly [a2a-registry, npm, smithery] (got ${JSON.stringify(channels)})`
+      JSON.stringify(channels) === JSON.stringify(["a2a-registry", "glama", "mcp-so", "npm", "official-mcp-registry", "smithery"]),
+      `pr-56: x-distribution channels are exactly [a2a-registry, glama, mcp-so, npm, official-mcp-registry, smithery] (got ${JSON.stringify(channels)})`
     );
     const a2aEntry = (dist || []).find((d: any) => d.channel === "a2a-registry");
     assertTrue(
