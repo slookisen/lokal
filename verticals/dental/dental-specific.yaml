@@ -1,0 +1,69 @@
+# Dental-vertikal supplerende config (utenfor Zod-schema i vertical-config.ts)
+#
+# Disse feltene leses DIREKTE av dental-enrichment-agent og dental-verifier,
+# IKKE via getConfig() — Zod-schema strippet dem fra hovedconfig pga ukjente felt.
+#
+# Hvis vi senere ønsker dem typesikre, må vi utvide src/config/vertical-config.ts
+# med en VerticalConfigSchema.extend({ dental_specific: ..., brreg_nace_codes: ... })
+# eller bruke .passthrough() på hovedschemaet. Begge er Phase B-vurderinger.
+
+dental_specific_fields:
+  # Norge har 7 anerkjente ODONTOLOGISKE spesialiteter (Helsedirektoratet).
+  # NB: kjeve_og_ansiktskirurgi er MEDISINSK spesialitet (ikke odontologisk) og
+  # er derfor ikke inkludert her. A6 deep-dive 2026-05-27 bekreftet listen:
+  specialties:
+    - kjeveortopedi                 # orthodontics
+    - oral_kirurgi_og_oral_medisin  # oral surgery & oral medicine
+    - periodonti                    # periodontology
+    - endodonti                     # endodontics
+    - oral_protetikk                # prosthodontics
+    - pedodonti                     # pediatric dentistry
+    - kjeve_og_ansiktsradiologi     # oral and maxillofacial radiology
+  treatments:
+    - implantater
+    - invisalign
+    - bleking
+    - krone_og_bro
+    - tannregulering
+    - rotfylling
+    - sedasjonstannlege
+    - akuttvakt
+  languages_common:
+    - norwegian
+    - english
+    - polish
+    - swedish
+    - german
+    - russian
+    - arabic
+  price_bands:
+    - rimelig     # < 70% av Forbrukerrådets standard-priser
+    - standard    # 70-110%
+    - premium     # > 110%
+    - ukjent
+
+# NACE-koder vi sweeper i Brreg-discovery (Phase B).
+# A1-sweep 2026-05-27 bekreftet: 86.220 finnes IKKE — bruker 86.221 (somatisk
+# spesialistlege) + keyword-filter; 86.230 (tannhelsetjeneste) er hovedkilden.
+brreg_nace_codes:
+  primary: "86.230"           # Tannhelsetjeneste — alle vanlige tannleger
+  specialist: "86.221"        # Spesialisert legetjeneste — filtreres på dental-keywords
+  technician: "32.500"        # Produksjon av medisinsk/tannmedisinsk utstyr
+  specialist_filter_keywords:
+    - tann
+    - kjev
+    - orto
+    - odon
+    - periodont
+    - endodont
+    - protetik
+    - implant
+    - munn
+
+# Helfo-håndtering. A3 spawn 2026-05-27 fant ingen offentlig avtale-liste — default unknown.
+helfo:
+  default_state: unknown
+  source_options:
+    - "scrape klinikkens egne sider (Phase B)"
+    - "innsynsbegjæring til Helfo (2-4 ukers turnaround)"
+    - "monitor helsenorge.no/tannhelse for kommende behandler-liste"

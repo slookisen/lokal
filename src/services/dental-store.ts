@@ -1,0 +1,604 @@
+// ─── Dental Store — Phase 6 (PR-89) ─────────────────────────────────
+//
+// CRUD for the dental marketplace. ALL queries hit /data/dental.db
+// via getDb('dental') — NEVER references the rfb `agents` table.
+//
+// Mirrors the conventions of src/services/knowledge-service.ts:
+//   - uses better-sqlite3 prepared statements
+//   - uuid for primary keys
+//   - Zod for input validation
+//   - JSON-array fields are stored as TEXT (SQLite convention)
+//
+// AMBULANT MODEL: createAffiliation + recomputeAvailableSpecialties
+// keep dental_agents.available_specialties in sync with the
+// authoritative source (dental_clinic_affiliations).
+
+import { v4 as uuid } from "uuid";
+import { z } from "zod";
+import { getDb } from "../database/db-factory";
+
+// ─── Schemas (input validation) ─────────────────────────────────────
+
+const HelfoAgreementSchema = z.enum(["true", "false", "unknown"]);
+const VerificationStatusSchema = z.enum([
+  "pending_verify",
+  "verified",
+  "needs_review",
+  "rejected",
+]);
+
+export const DentalAgentSchema = z.object({
+  id: z.string().optional(), // generated if absent
+  org_nr: z.string().optional().nullable(),
+  navn: z.string().min(1),
+  postnummer: z.string().optional().nullable(),
+  poststed: z.string().optional().nullable(),
+  fylke: z.string().optional().nullable(),
+  adresse: z.string().optional().nullable(),
+  telefon: z.string().optional().nullable(),
+  mobil: z.string().optional().nullable(),
+  epost: z.string().email().optional().nullable(),
+  hjemmeside: z.string().optional().nullable(),
+  antall_ansatte: z.number().int().nonnegative().optional().nullable(),
+  organisasjonsform: z.string().optional().nullable(),
+  registreringsdato: z.string().optional().nullable(),
+  naeringskode: z.string().optional().nullable(),
+  treatments: z.array(z.string()).optional(),
+  helfo_agreement: HelfoAgreementSchema.optional(),
+  languages_spoken: z.array(z.string()).optional(),
+  acute_vakt: z.union([z.literal(0), z.literal(1)]).optional().nullable(),
+  price_band: z.string().optional().nullable(),
+  chain_brand: z.string().optional().nullable(),
+  is_chain_member: z.union([z.literal(0), z.literal(1)]).optional(),
+  chain_parent_orgnr: z.string().optional().nullable(),
+  available_specialties: z.array(z.string()).optional(),
+  enrichment_state: z.string().optional(),
+  verification_status: VerificationStatusSchema.optional(),
+});
+export type DentalAgent = z.infer<typeof DentalAgentSchema>;
+
+export const DentalPersonSchema = z.object({
+  id: z.string().optional(),
+  navn: z.string().min(1),
+  hpr_nr: z.string().optional().nullable(),
+  primary_specialty: z.string().optional().nullable(),
+  all_specialties: z.array(z.string()).optional(),
+  own_orgnr: z.string().optional().nullable(),
+  fylke_residence: z.string().optional().nullable(),
+  is_active: z.union([z.literal(0), z.literal(1)]).optional(),
+  source: z.string().optional().nullable(),
+});
+export type DentalPerson = z.infer<typeof DentalPersonSchema>;
+
+export const AffiliationSchema = z.object({
+  person_id: z.string().min(1),
+  clinic_agent_id: z.string().min(1),
+  affiliation_type: z.string().optional().nullable(),
+  role: z.string().optional().nullable(),
+  specialty_used_here: z.string().optional().nullable(),
+  schedule_pattern: z.string().optional().nullable(),
+  is_active: z.union([z.literal(0), z.literal(1)]).optional(),
+  source: z.string().optional().nullable(),
+  evidence_url: z.string().optional().nullable(),
+});
+export type Affiliation = z.infer<typeof AffiliationSchema>;
+
+export const ListFilterSchema = z.object({
+  fylke: z.string().optional(),
+  chain_brand: z.string().optional(),
+  specialty: z.string().optional(),
+  verification_status: VerificationStatusSchema.optional(),
+});
+export type ListFilter = z.infer<typeof ListFilterSchema>;
+
+// Loose schema for bulk-merged rows (Phase A.5 step 2). The merge
+// script produces a wider object than DentalAgentSchema; we accept
+// any superset and only persist the columns we recognise.
+export type MergedRow = Partial<DentalAgent> & {
+  navn: string;
+  org_nr?: string | null;
+};
+
+// ─── Helpers ────────────────────────────────────────────────────────
+
+function jsonOrNull(arr: string[] | undefined): string | null {
+  if (!arr || arr.length === 0) return null;
+  return JSON.stringify(arr);
+}
+
+function parseJsonArray(value: unknown): string[] {
+  if (!value || typeof value !== "string") return [];
+  try {
+    const parsed = JSON.parse(value);
+    return Array.isArray(parsed) ? parsed.map(String) : [];
+  } catch {
+    return [];
+  }
+}
+
+// Hydrate raw SQLite row into a typed DentalAgent (parses JSON cols).
+function hydrateAgent(row: Record<string, unknown>): DentalAgent & {
+  id: string;
+} {
+  return {
+    id: row.id as string,
+    org_nr: (row.org_nr as string | null) ?? null,
+    navn: row.navn as string,
+    postnummer: (row.postnummer as string | null) ?? null,
+    poststed: (row.poststed as string | null) ?? null,
+    fylke: (row.fylke as string | null) ?? null,
+    adresse: (row.adresse as string | null) ?? null,
+    telefon: (row.telefon as string | null) ?? null,
+    mobil: (row.mobil as string | null) ?? null,
+    epost: (row.epost as string | null) ?? null,
+    hjemmeside: (row.hjemmeside as string | null) ?? null,
+    antall_ansatte: (row.antall_ansatte as number | null) ?? null,
+    organisasjonsform: (row.organisasjonsform as string | null) ?? null,
+    registreringsdato: (row.registreringsdato as string | null) ?? null,
+    naeringskode: (row.naeringskode as string | null) ?? null,
+    treatments: parseJsonArray(row.treatments),
+    helfo_agreement:
+      (row.helfo_agreement as DentalAgent["helfo_agreement"]) ?? undefined,
+    languages_spoken: parseJsonArray(row.languages_spoken),
+    acute_vakt: (row.acute_vakt as 0 | 1 | null) ?? null,
+    price_band: (row.price_band as string | null) ?? null,
+    chain_brand: (row.chain_brand as string | null) ?? null,
+    is_chain_member: (row.is_chain_member as 0 | 1) ?? 0,
+    chain_parent_orgnr: (row.chain_parent_orgnr as string | null) ?? null,
+    available_specialties: parseJsonArray(row.available_specialties),
+    enrichment_state: (row.enrichment_state as string) ?? "raw",
+    verification_status:
+      (row.verification_status as DentalAgent["verification_status"]) ??
+      "pending_verify",
+  };
+}
+
+// ─── Public API ─────────────────────────────────────────────────────
+
+export function createDentalAgent(input: DentalAgent): string {
+  const parsed = DentalAgentSchema.parse(input);
+  const id = parsed.id ?? uuid();
+  const db = getDb("dental");
+
+  db.prepare(
+    `
+    INSERT INTO dental_agents (
+      id, org_nr, navn,
+      postnummer, poststed, fylke, adresse,
+      telefon, mobil, epost, hjemmeside,
+      antall_ansatte, organisasjonsform, registreringsdato, naeringskode,
+      treatments, helfo_agreement, languages_spoken, acute_vakt, price_band,
+      chain_brand, is_chain_member, chain_parent_orgnr,
+      available_specialties,
+      enrichment_state, verification_status
+    ) VALUES (
+      @id, @org_nr, @navn,
+      @postnummer, @poststed, @fylke, @adresse,
+      @telefon, @mobil, @epost, @hjemmeside,
+      @antall_ansatte, @organisasjonsform, @registreringsdato, @naeringskode,
+      @treatments, @helfo_agreement, @languages_spoken, @acute_vakt, @price_band,
+      @chain_brand, @is_chain_member, @chain_parent_orgnr,
+      @available_specialties,
+      @enrichment_state, @verification_status
+    )
+  `
+  ).run({
+    id,
+    org_nr: parsed.org_nr ?? null,
+    navn: parsed.navn,
+    postnummer: parsed.postnummer ?? null,
+    poststed: parsed.poststed ?? null,
+    fylke: parsed.fylke ?? null,
+    adresse: parsed.adresse ?? null,
+    telefon: parsed.telefon ?? null,
+    mobil: parsed.mobil ?? null,
+    epost: parsed.epost ?? null,
+    hjemmeside: parsed.hjemmeside ?? null,
+    antall_ansatte: parsed.antall_ansatte ?? null,
+    organisasjonsform: parsed.organisasjonsform ?? null,
+    registreringsdato: parsed.registreringsdato ?? null,
+    naeringskode: parsed.naeringskode ?? null,
+    treatments: jsonOrNull(parsed.treatments),
+    helfo_agreement: parsed.helfo_agreement ?? "unknown",
+    languages_spoken: jsonOrNull(parsed.languages_spoken),
+    acute_vakt: parsed.acute_vakt ?? null,
+    price_band: parsed.price_band ?? null,
+    chain_brand: parsed.chain_brand ?? null,
+    is_chain_member: parsed.is_chain_member ?? 0,
+    chain_parent_orgnr: parsed.chain_parent_orgnr ?? null,
+    available_specialties: jsonOrNull(parsed.available_specialties),
+    enrichment_state: parsed.enrichment_state ?? "raw",
+    verification_status: parsed.verification_status ?? "pending_verify",
+  });
+
+  return id;
+}
+
+export function getDentalAgentByOrgnr(
+  orgnr: string
+): (DentalAgent & { id: string }) | null {
+  const db = getDb("dental");
+  const row = db
+    .prepare("SELECT * FROM dental_agents WHERE org_nr = ?")
+    .get(orgnr) as Record<string, unknown> | undefined;
+  return row ? hydrateAgent(row) : null;
+}
+
+export function getDentalAgentById(
+  id: string
+): (DentalAgent & { id: string }) | null {
+  const db = getDb("dental");
+  const row = db
+    .prepare("SELECT * FROM dental_agents WHERE id = ?")
+    .get(id) as Record<string, unknown> | undefined;
+  return row ? hydrateAgent(row) : null;
+}
+
+export function listDentalAgents(
+  filter: ListFilter = {},
+  limit = 50,
+  offset = 0
+): Array<DentalAgent & { id: string }> {
+  const parsed = ListFilterSchema.parse(filter);
+  const db = getDb("dental");
+
+  const where: string[] = [];
+  const params: Record<string, unknown> = {};
+
+  if (parsed.fylke) {
+    where.push("fylke = @fylke");
+    params.fylke = parsed.fylke;
+  }
+  if (parsed.chain_brand) {
+    where.push("chain_brand = @chain_brand");
+    params.chain_brand = parsed.chain_brand;
+  }
+  if (parsed.verification_status) {
+    where.push("verification_status = @verification_status");
+    params.verification_status = parsed.verification_status;
+  }
+  if (parsed.specialty) {
+    // available_specialties is stored as JSON-array text — LIKE is the
+    // pragmatic match. For exact precision we'd need json_each() in a
+    // subquery; defer to Phase B if false-positives become a problem.
+    where.push("available_specialties LIKE @specialty");
+    params.specialty = `%"${parsed.specialty}"%`;
+  }
+
+  const sql =
+    "SELECT * FROM dental_agents" +
+    (where.length ? ` WHERE ${where.join(" AND ")}` : "") +
+    " ORDER BY navn ASC LIMIT @limit OFFSET @offset";
+
+  params.limit = Math.max(1, Math.min(500, limit));
+  params.offset = Math.max(0, offset);
+
+  const rows = db.prepare(sql).all(params) as Array<Record<string, unknown>>;
+  return rows.map(hydrateAgent);
+}
+
+export function upsertDentalPerson(input: DentalPerson): string {
+  const parsed = DentalPersonSchema.parse(input);
+  const db = getDb("dental");
+
+  // Try to find by hpr_nr first (unique), then by id.
+  let existing: { id: string } | undefined;
+  if (parsed.hpr_nr) {
+    existing = db
+      .prepare("SELECT id FROM dental_persons WHERE hpr_nr = ?")
+      .get(parsed.hpr_nr) as { id: string } | undefined;
+  } else if (parsed.id) {
+    existing = db
+      .prepare("SELECT id FROM dental_persons WHERE id = ?")
+      .get(parsed.id) as { id: string } | undefined;
+  }
+
+  const id = existing?.id ?? parsed.id ?? uuid();
+
+  if (existing) {
+    db.prepare(
+      `
+      UPDATE dental_persons SET
+        navn = @navn,
+        primary_specialty = @primary_specialty,
+        all_specialties = @all_specialties,
+        own_orgnr = @own_orgnr,
+        fylke_residence = @fylke_residence,
+        is_active = @is_active,
+        source = @source,
+        updated_at = datetime('now')
+      WHERE id = @id
+    `
+    ).run({
+      id,
+      navn: parsed.navn,
+      primary_specialty: parsed.primary_specialty ?? null,
+      all_specialties: jsonOrNull(parsed.all_specialties),
+      own_orgnr: parsed.own_orgnr ?? null,
+      fylke_residence: parsed.fylke_residence ?? null,
+      is_active: parsed.is_active ?? 1,
+      source: parsed.source ?? null,
+    });
+  } else {
+    db.prepare(
+      `
+      INSERT INTO dental_persons (
+        id, navn, hpr_nr, primary_specialty, all_specialties,
+        own_orgnr, fylke_residence, is_active, source
+      ) VALUES (
+        @id, @navn, @hpr_nr, @primary_specialty, @all_specialties,
+        @own_orgnr, @fylke_residence, @is_active, @source
+      )
+    `
+    ).run({
+      id,
+      navn: parsed.navn,
+      hpr_nr: parsed.hpr_nr ?? null,
+      primary_specialty: parsed.primary_specialty ?? null,
+      all_specialties: jsonOrNull(parsed.all_specialties),
+      own_orgnr: parsed.own_orgnr ?? null,
+      fylke_residence: parsed.fylke_residence ?? null,
+      is_active: parsed.is_active ?? 1,
+      source: parsed.source ?? null,
+    });
+  }
+
+  return id;
+}
+
+export function createAffiliation(input: Affiliation): string {
+  const parsed = AffiliationSchema.parse(input);
+  const id = uuid();
+  const db = getDb("dental");
+
+  db.prepare(
+    `
+    INSERT OR IGNORE INTO dental_clinic_affiliations (
+      id, person_id, clinic_agent_id,
+      affiliation_type, role, specialty_used_here,
+      schedule_pattern, is_active, source, evidence_url
+    ) VALUES (
+      @id, @person_id, @clinic_agent_id,
+      @affiliation_type, @role, @specialty_used_here,
+      @schedule_pattern, @is_active, @source, @evidence_url
+    )
+  `
+  ).run({
+    id,
+    person_id: parsed.person_id,
+    clinic_agent_id: parsed.clinic_agent_id,
+    affiliation_type: parsed.affiliation_type ?? null,
+    role: parsed.role ?? null,
+    specialty_used_here: parsed.specialty_used_here ?? null,
+    schedule_pattern: parsed.schedule_pattern ?? null,
+    is_active: parsed.is_active ?? 1,
+    source: parsed.source ?? null,
+    evidence_url: parsed.evidence_url ?? null,
+  });
+
+  // Keep denormalized read-side in sync.
+  recomputeAvailableSpecialties(parsed.clinic_agent_id);
+
+  return id;
+}
+
+export function recomputeAvailableSpecialties(clinic_id: string): void {
+  const db = getDb("dental");
+  const rows = db
+    .prepare(
+      `
+      SELECT DISTINCT specialty_used_here
+      FROM dental_clinic_affiliations
+      WHERE clinic_agent_id = ?
+        AND is_active = 1
+        AND specialty_used_here IS NOT NULL
+        AND specialty_used_here <> ''
+    `
+    )
+    .all(clinic_id) as Array<{ specialty_used_here: string }>;
+
+  const specialties = rows.map((r) => r.specialty_used_here).sort();
+  const json = specialties.length ? JSON.stringify(specialties) : null;
+
+  db.prepare(
+    "UPDATE dental_agents SET available_specialties = ?, updated_at = datetime('now') WHERE id = ?"
+  ).run(json, clinic_id);
+}
+
+export function listSpecialistsForClinic(
+  clinic_id: string
+): Array<DentalPerson & { id: string; specialty_used_here: string | null }> {
+  const db = getDb("dental");
+  const rows = db
+    .prepare(
+      `
+      SELECT p.*, a.specialty_used_here
+      FROM dental_persons p
+      JOIN dental_clinic_affiliations a ON a.person_id = p.id
+      WHERE a.clinic_agent_id = ? AND a.is_active = 1
+      ORDER BY p.navn ASC
+    `
+    )
+    .all(clinic_id) as Array<Record<string, unknown>>;
+
+  return rows.map((row) => ({
+    id: row.id as string,
+    navn: row.navn as string,
+    hpr_nr: (row.hpr_nr as string | null) ?? null,
+    primary_specialty: (row.primary_specialty as string | null) ?? null,
+    all_specialties: parseJsonArray(row.all_specialties),
+    own_orgnr: (row.own_orgnr as string | null) ?? null,
+    fylke_residence: (row.fylke_residence as string | null) ?? null,
+    is_active: (row.is_active as 0 | 1) ?? 1,
+    source: (row.source as string | null) ?? null,
+    specialty_used_here: (row.specialty_used_here as string | null) ?? null,
+  }));
+}
+
+export function listChains(): Array<{
+  id: string;
+  chain_brand: string;
+  parent_orgnr: string | null;
+  website: string | null;
+  num_locations_advertised: number | null;
+  tier: string | null;
+  confidence: string | null;
+}> {
+  const db = getDb("dental");
+  const rows = db
+    .prepare(
+      "SELECT id, chain_brand, parent_orgnr, website, num_locations_advertised, tier, confidence FROM dental_chains ORDER BY chain_brand ASC"
+    )
+    .all() as Array<Record<string, unknown>>;
+  return rows.map((r) => ({
+    id: r.id as string,
+    chain_brand: r.chain_brand as string,
+    parent_orgnr: (r.parent_orgnr as string | null) ?? null,
+    website: (r.website as string | null) ?? null,
+    num_locations_advertised:
+      (r.num_locations_advertised as number | null) ?? null,
+    tier: (r.tier as string | null) ?? null,
+    confidence: (r.confidence as string | null) ?? null,
+  }));
+}
+
+export function updateDentalAgent(
+  id: string,
+  patch: Partial<DentalAgent>
+): boolean {
+  const db = getDb("dental");
+  const existing = getDentalAgentById(id);
+  if (!existing) return false;
+
+  // Allow-list — never let an UPDATE touch id or vertical.
+  const allowed: Array<keyof DentalAgent> = [
+    "org_nr",
+    "navn",
+    "postnummer",
+    "poststed",
+    "fylke",
+    "adresse",
+    "telefon",
+    "mobil",
+    "epost",
+    "hjemmeside",
+    "antall_ansatte",
+    "organisasjonsform",
+    "registreringsdato",
+    "naeringskode",
+    "treatments",
+    "helfo_agreement",
+    "languages_spoken",
+    "acute_vakt",
+    "price_band",
+    "chain_brand",
+    "is_chain_member",
+    "chain_parent_orgnr",
+    "enrichment_state",
+    "verification_status",
+  ];
+
+  const sets: string[] = [];
+  const params: Record<string, unknown> = { id };
+
+  for (const key of allowed) {
+    if (!(key in patch)) continue;
+    const raw = patch[key];
+    if (key === "treatments" || key === "languages_spoken") {
+      sets.push(`${key} = @${key}`);
+      params[key] = jsonOrNull(raw as string[] | undefined);
+    } else {
+      sets.push(`${key} = @${key}`);
+      params[key] = raw ?? null;
+    }
+  }
+
+  if (sets.length === 0) return true; // nothing to do
+  sets.push("updated_at = datetime('now')");
+
+  db.prepare(`UPDATE dental_agents SET ${sets.join(", ")} WHERE id = @id`).run(
+    params
+  );
+  return true;
+}
+
+/**
+ * Bulk-insert from the Phase A.5 merged dataset.
+ *
+ * `INSERT OR IGNORE` on org_nr — if a row with the same org_nr already
+ * exists, we skip it (no clobber). Returns counts so the script can
+ * report how much new data was ingested.
+ *
+ * Wrapped in a single transaction for ~50x speedup on 7k rows.
+ */
+export function bulkInsertFromMerged(rows: MergedRow[]): {
+  inserted: number;
+  skipped: number;
+} {
+  const db = getDb("dental");
+  let inserted = 0;
+  let skipped = 0;
+
+  const insertOne = db.prepare(`
+    INSERT OR IGNORE INTO dental_agents (
+      id, org_nr, navn,
+      postnummer, poststed, fylke, adresse,
+      telefon, mobil, epost, hjemmeside,
+      antall_ansatte, organisasjonsform, registreringsdato, naeringskode,
+      treatments, helfo_agreement, languages_spoken, acute_vakt, price_band,
+      chain_brand, is_chain_member, chain_parent_orgnr,
+      enrichment_state, verification_status
+    ) VALUES (
+      @id, @org_nr, @navn,
+      @postnummer, @poststed, @fylke, @adresse,
+      @telefon, @mobil, @epost, @hjemmeside,
+      @antall_ansatte, @organisasjonsform, @registreringsdato, @naeringskode,
+      @treatments, @helfo_agreement, @languages_spoken, @acute_vakt, @price_band,
+      @chain_brand, @is_chain_member, @chain_parent_orgnr,
+      @enrichment_state, @verification_status
+    )
+  `);
+
+  const tx = db.transaction((batch: MergedRow[]) => {
+    for (const row of batch) {
+      // Light-touch validation — bulk pipeline upstream owns shape.
+      if (!row.navn) {
+        skipped++;
+        continue;
+      }
+      const id = row.id ?? uuid();
+      const result = insertOne.run({
+        id,
+        org_nr: row.org_nr ?? null,
+        navn: row.navn,
+        postnummer: row.postnummer ?? null,
+        poststed: row.poststed ?? null,
+        fylke: row.fylke ?? null,
+        adresse: row.adresse ?? null,
+        telefon: row.telefon ?? null,
+        mobil: row.mobil ?? null,
+        epost: row.epost ?? null,
+        hjemmeside: row.hjemmeside ?? null,
+        antall_ansatte: row.antall_ansatte ?? null,
+        organisasjonsform: row.organisasjonsform ?? null,
+        registreringsdato: row.registreringsdato ?? null,
+        naeringskode: row.naeringskode ?? null,
+        treatments: jsonOrNull(row.treatments),
+        helfo_agreement: row.helfo_agreement ?? "unknown",
+        languages_spoken: jsonOrNull(row.languages_spoken),
+        acute_vakt: row.acute_vakt ?? null,
+        price_band: row.price_band ?? null,
+        chain_brand: row.chain_brand ?? null,
+        is_chain_member: row.is_chain_member ?? 0,
+        chain_parent_orgnr: row.chain_parent_orgnr ?? null,
+        enrichment_state: row.enrichment_state ?? "raw",
+        verification_status: row.verification_status ?? "pending_verify",
+      });
+      if (result.changes > 0) inserted++;
+      else skipped++;
+    }
+  });
+
+  tx(rows);
+  return { inserted, skipped };
+}

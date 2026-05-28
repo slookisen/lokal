@@ -20,6 +20,7 @@ import scanRoutes from "./routes/scan";
 import a2aRoutes from "./routes/a2a";
 import reservationRoutes from "./routes/reservation";
 import marketplaceRoutes from "./routes/marketplace";
+import dentalRoutes from "./routes/dental";
 import mcpRoutes from "./routes/mcp";
 import seoRoutes from "./routes/seo";
 import discoveryRoutes from "./routes/discovery";
@@ -61,6 +62,14 @@ try { seedKnowledge = require("./_seeds/seed-knowledge").seedKnowledge; } catch 
 // if YAML is malformed or schema validation fails. Must run before
 // any service touches getConfig().
 loadConfigsAtBoot();
+
+if (process.env.ENABLE_DENTAL === "1") {
+  // Lazy require so the dental module isn't pulled into the bundle
+  // (and the dental.db file isn't opened) when the flag is off.
+  const { getDb: getVerticalDb } = require("./database/db-factory");
+  getVerticalDb("dental"); // triggers initDentalSchema(db) inside the factory
+  console.log("[boot] dental vertical enabled — /data/dental.db ready");
+}
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -142,6 +151,7 @@ app.use("/api/products", scanRoutes);
 app.use("/api", consumerRoutes);
 app.use("/api/reservations", reservationRoutes);
 app.use("/api/marketplace", marketplaceRoutes);
+app.use("/api/tannlege", dentalRoutes);
 app.use("/mcp", mcpRoutes);
 app.use("/", a2aRoutes);
 

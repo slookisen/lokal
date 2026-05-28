@@ -1,0 +1,31 @@
+# verticals/dental/kpis.yaml — managed by orchestrator, outside §P1.5 rule scope
+#
+# Leses DIREKTE av orchestrator (ikke via getConfig() — Zod-schema i
+# src/config/vertical-config.ts validerer ikke denne fila).
+#
+# Rationale: §P1.5 sier at endringer i Zod-validerte vertical-config-felt
+# krever Daniel-approval per cycle. KPI-tresholds må kunne tunes oftere
+# enn det, så de holdes utenfor schema-scope.
+#
+# Verdier her er START-tresholds for Finn-tannlege. Reevaluer etter
+# 30 dagers data fra Phase B-discovery + Phase C-enrichment.
+
+vertical_id: dental
+kpis:
+  marketing:
+    pool_depth_min: 100
+    reply_rate_min_pct: 1.5
+    strict_own_domain_min_pct: 70
+  enrichment:
+    cap_utilization_min_pct: 80
+    new_agents_per_week_min: 50
+    tier1_coverage_min_pct: 60
+  visibility:
+    well_known_uptime_min_pct: 99
+    ai_bot_visits_min_per_day: 5
+  customer_service:
+    response_within_hours_max: 24
+    p0_open_max_count: 0
+  platform:
+    verifier_backlog_max_pct: 25
+    failed_run_max_per_day: 5

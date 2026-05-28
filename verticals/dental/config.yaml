@@ -1,0 +1,59 @@
+# Finn-tannlege — dental-vertikal-konfig v2 (PR-89)
+#
+# Phase 6 scope: scaffold for dental marketplace.
+# Brand-arbeidsnavn: "Finn-tannlege" (Daniel kjøper finntannlege.no eller variant senere).
+# Alle agents er DISABLED initielt. Vi enabler hver enkelt etter Phase B-F lander.
+#
+# Endring fra v1.1 (PR-88 v2):
+#   - kpis-blokken er FJERNET herfra og flyttet til verticals/dental/kpis.yaml,
+#     iht. Daniel-direktiv §P1.5 (kpis utenfor Zod-skjema = utenfor approve-per-cycle-regel).
+#   - dental-spesifikke felt (NACE-koder, specialties-vokabular, helfo) ligger i
+#     verticals/dental/dental-specific.yaml — leses direkte av enrichment-agent,
+#     ikke via getConfig().
+
+vertical_id: dental
+display_name: Finn-tannlege
+domain: finntannlege.no  # arbeidsnavn — venter på Daniel-kjøp
+
+domain_dictionary:
+  entity: tannlege
+  entity_plural: tannleger
+  entity_plural_long: tannleger og tannklinikker
+  service: tannhelse
+  buyer: pasient
+
+agents:
+  marketing:
+    enabled: false
+    schedule: "30 7 * * *"
+    batch_size: 30
+  customer_service:
+    enabled: false
+    schedule: "0 * * * *"
+  enrichment:
+    enabled: false
+    schedule: "0 4 * * *"
+    cap_per_run: 30
+  discovery:
+    enabled: false
+    schedule: "0 5 * * *"
+    cap_per_run: 50
+  contact_verifier:
+    enabled: false
+    schedule: "0 10 * * *"
+  visibility:
+    enabled: false
+    schedule: "0 7 * * *"
+  supervisor:
+    enabled: false
+    schedule: "0 12 * * *"
+
+connectors:
+  github_repo: slookisen/lokal
+  fly_app: lokal
+  resend_domain: rettfrabonden.com  # midlertidig — bytter til finntannlege.no når domene er verifisert i Resend
+  # NB: dental gmail-alias er IKKE her (strippes av Zod) — håndteres via Gmail-label-filter
+  # på da.fredriksen@gmail.com inntil eget gmail er satt opp i Phase F.
+
+# NB: kpis-blokk er bevisst utelatt her. Se verticals/dental/kpis.yaml.
+# Hvis du legger den tilbake her, faller den under §P1.5 og krever Daniel-approval per cycle.
