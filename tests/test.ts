@@ -801,6 +801,68 @@ console.log("── Phase 4.10: verifier write-bug regression tests ──");
 }
 
 
+// ─── PR-91: defensive guard — pending rows with verifier_checked_at set ──
+// Rationale: an upstream bug (T1xxx, recurring 15x) caused rows to flip back
+// to verifier_state='pending' after the verifier had already touched them,
+// re-surfacing in /admin/runs/pending and triggering re-probe loops. The
+// defensive guard in listPendingVerification excludes any row whose
+// verifier_checked_at is set unless it predates the run's started_at
+// (i.e. a genuinely new run reusing a recycled run_id).
+console.log("── PR-91: listPendingVerification verifier_checked_at guard ──");
+{
+  const { listPendingVerification } = require("../src/services/run-ledger");
+  const memdbPR91 = new Database(":memory:");
+  // Mirror production schema for the runs table (see src/database/init.ts).
+  memdbPR91.exec(`
+    CREATE TABLE runs (
+      run_id TEXT PRIMARY KEY,
+      vertical TEXT NOT NULL DEFAULT 'rfb',
+      agent TEXT NOT NULL,
+      trigger_source TEXT NOT NULL DEFAULT 'cron',
+      started_at TEXT NOT NULL,
+      finished_at TEXT,
+      status TEXT NOT NULL,
+      claims TEXT NOT NULL DEFAULT '[]',
+      evidence TEXT NOT NULL DEFAULT '[]',
+      next_suggested TEXT,
+      errors TEXT,
+      notes TEXT,
+      verifier_state TEXT NOT NULL DEFAULT 'pending',
+      verifier_checked_at TEXT,
+      verifier_findings TEXT,
+      created_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+  `);
+
+  // Use a recent timestamp so the 48h maxAge window includes it.
+  const startedAt = new Date(Date.now() - 60_000).toISOString();        // 1 min ago
+  const checkedFuture = new Date(Date.now() + 60_000).toISOString();    // 1 min ahead of started_at
+  const checkedPast = new Date(Date.now() - 2 * 60_000).toISOString();  // before started_at
+
+  const ins = memdbPR91.prepare(`
+    INSERT INTO runs (run_id, agent, started_at, status, verifier_state, verifier_checked_at)
+    VALUES (?, 'a', ?, 'completed', 'pending', ?)
+  `);
+  // Row 1: pending + verifier_checked_at set AFTER started_at → must be FILTERED OUT
+  ins.run("pr91-checked-future", startedAt, checkedFuture);
+  // Row 2: pending + verifier_checked_at IS NULL → still surfaces (genuine pending)
+  ins.run("pr91-never-checked", startedAt, null);
+  // Row 3: pending + verifier_checked_at predates started_at → still surfaces
+  //        (e.g. recycled run_id; the new run is genuinely fresh)
+  ins.run("pr91-stale-check", startedAt, checkedPast);
+
+  const rows = listPendingVerification({ db: memdbPR91 });
+  const ids = rows.map((r: any) => r.run_id).sort();
+
+  assertEq(rows.length, 2, "PR-91: row with verifier_checked_at >= started_at is filtered out");
+  assertEq(ids.includes("pr91-checked-future"), false, "PR-91: 'checked-future' row does NOT re-surface as pending");
+  assertEq(ids.includes("pr91-never-checked"), true, "PR-91: never-checked pending row still surfaces");
+  assertEq(ids.includes("pr91-stale-check"), true, "PR-91: row with stale (pre-started_at) check still surfaces");
+
+  memdbPR91.close();
+}
+
+
 // ─── PHASE 4.10c-2 Steg 1: trigger auto-updates last_outbound_at ──────
 // Defense-in-depth: a DB trigger on crm_messages INSERT (direction=out,
 // delivery_status=sent) ensures that crm_threads.last_outbound_at is
