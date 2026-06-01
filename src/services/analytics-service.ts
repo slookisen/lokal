@@ -736,6 +736,65 @@ export class AnalyticsService {
   }
 
   /**
+   * PR-92: Structured prune helper used by the daily scheduled task and by
+   * the /admin/analytics/ops/prune route. Returns per-table delete counts
+   * plus the cutoff timestamp so callers can log usefully. The minimum of
+   * 7 days mirrors the /ops/prune route guard (privacy/audit trail).
+   */
+  runAutoPrune(opts: { daysToKeep: number }): {
+    daysKept: number;
+    cutoff: string;
+    deleted: { pageViews: number; queries: number; agentViews: number };
+  } {
+    const daysKept = Math.max(7, opts.daysToKeep || 60);
+    const db = getDb();
+    const cutoff = sqliteDatetime(new Date(Date.now() - daysKept * 24 * 60 * 60 * 1000));
+
+    const pvResult = db.prepare("DELETE FROM analytics_page_views WHERE created_at < ?").run(cutoff);
+    const qResult = db.prepare("DELETE FROM analytics_queries WHERE created_at < ?").run(cutoff);
+    const avResult = db.prepare("DELETE FROM analytics_agent_views WHERE created_at < ?").run(cutoff);
+
+    // Reclaim WAL space — mirrors the /ops/prune route.
+    try { db.pragma("wal_checkpoint(TRUNCATE)"); } catch { /* non-fatal */ }
+
+    return {
+      daysKept,
+      cutoff,
+      deleted: {
+        pageViews: pvResult.changes || 0,
+        queries: qResult.changes || 0,
+        agentViews: avResult.changes || 0,
+      },
+    };
+  }
+
+  /**
+   * PR-92: Run SQLite VACUUM to reclaim disk space. Locks the DB briefly,
+   * so the scheduled task only calls this once a week (Sundays at 03:00 UTC).
+   */
+  vacuumDatabase(): { sizeBeforeMb: number; sizeAfterMb: number; freedMb: number } {
+    const db = getDb();
+    const fs = require("fs");
+    const dbPath = process.env.DB_PATH || "./data/lokal.db";
+
+    let sizeBefore = 0;
+    try { sizeBefore = fs.statSync(dbPath).size; } catch { /* ok */ }
+
+    try { db.pragma("wal_checkpoint(TRUNCATE)"); } catch { /* non-fatal */ }
+    db.exec("VACUUM");
+
+    let sizeAfter = 0;
+    try { sizeAfter = fs.statSync(dbPath).size; } catch { /* ok */ }
+
+    const toMb = (b: number) => Math.round((b / 1024 / 1024) * 10) / 10;
+    return {
+      sizeBeforeMb: toMb(sizeBefore),
+      sizeAfterMb: toMb(sizeAfter),
+      freedMb: toMb(sizeBefore - sizeAfter),
+    };
+  }
+
+  /**
    * Helper: Get or create session ID from request/response
    * Used by middleware for backward compatibility
    */
@@ -847,3 +906,30 @@ export class AnalyticsService {
 export const analyticsService = new AnalyticsService();
 
 export default analyticsService;
+
+/**
+ * PR-92: Pure guard used by the daily auto-prune scheduled task.
+ * Decides whether the prune job should fire right now.
+ *
+ *   - We only want to fire inside a low-traffic UTC hour window
+ *     (default 03:00–03:59 UTC).
+ *   - At least 23h must have passed since the last successful run
+ *     so we don't re-trigger multiple times inside the same window.
+ *
+ * Exported as a pure function so tests can pin `now` / `lastRunAt`.
+ */
+export function shouldRunAutoPrune(opts: {
+  now: Date;
+  lastRunAt: Date | null;
+  windowHourUtc?: number;
+  minHoursBetween?: number;
+}): boolean {
+  const windowHourUtc = opts.windowHourUtc ?? 3;
+  const minHoursBetween = opts.minHoursBetween ?? 23;
+  if (opts.now.getUTCHours() !== windowHourUtc) return false;
+  if (opts.lastRunAt) {
+    const deltaMs = opts.now.getTime() - opts.lastRunAt.getTime();
+    if (deltaMs < minHoursBetween * 3600_000) return false;
+  }
+  return true;
+}

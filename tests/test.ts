@@ -10851,6 +10851,76 @@ console.log("\n── orch-pr-87: pickBatchBiased + getSweepStatus ──");
 }
 
 
+// ── orch-pr-92: daily auto-prune scheduled task ──
+console.log("── orch-pr-92: daily auto-prune scheduled task ──");
+{
+  const { shouldRunAutoPrune } = require("../src/services/analytics-service");
+
+  // 03:14 UTC, never run before → should fire.
+  assertEq(
+    shouldRunAutoPrune({
+      now: new Date(Date.UTC(2026, 5, 1, 3, 14, 0)),
+      lastRunAt: null,
+    }),
+    true,
+    "orch-pr-92: 03:14 UTC + lastRunAt=null → fires",
+  );
+
+  // 02:59 UTC, just outside window → should NOT fire.
+  assertEq(
+    shouldRunAutoPrune({
+      now: new Date(Date.UTC(2026, 5, 1, 2, 59, 59)),
+      lastRunAt: null,
+    }),
+    false,
+    "orch-pr-92: 02:59 UTC outside window → skip",
+  );
+
+  // 04:00 UTC, just past window → should NOT fire.
+  assertEq(
+    shouldRunAutoPrune({
+      now: new Date(Date.UTC(2026, 5, 1, 4, 0, 0)),
+      lastRunAt: null,
+    }),
+    false,
+    "orch-pr-92: 04:00 UTC past window → skip",
+  );
+
+  // 03:14 UTC, but lastRunAt was only 2 hours ago → should NOT fire (cooldown).
+  const twoHoursAgo = new Date(Date.UTC(2026, 5, 1, 1, 14, 0));
+  assertEq(
+    shouldRunAutoPrune({
+      now: new Date(Date.UTC(2026, 5, 1, 3, 14, 0)),
+      lastRunAt: twoHoursAgo,
+    }),
+    false,
+    "orch-pr-92: in-window but <23h since last → skip",
+  );
+
+  // 03:14 UTC, lastRunAt was 24h ago → should fire again.
+  const dayAgo = new Date(Date.UTC(2026, 4, 31, 3, 14, 0));
+  assertEq(
+    shouldRunAutoPrune({
+      now: new Date(Date.UTC(2026, 5, 1, 3, 14, 0)),
+      lastRunAt: dayAgo,
+    }),
+    true,
+    "orch-pr-92: in-window and >=23h since last → fires",
+  );
+
+  // Custom window hour respected.
+  assertEq(
+    shouldRunAutoPrune({
+      now: new Date(Date.UTC(2026, 5, 1, 5, 0, 0)),
+      lastRunAt: null,
+      windowHourUtc: 5,
+    }),
+    true,
+    "orch-pr-92: custom windowHourUtc respected",
+  );
+}
+
+
 // ── REPORT ────────────────────────────────────────────────────────────
 
 // Wait for the M2 owner-portal async tests before reporting so their

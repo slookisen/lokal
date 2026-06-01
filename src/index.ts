@@ -28,7 +28,7 @@ import conversationUiRoutes from "./routes/conversation-ui";
 import agentReadinessRoutes from "./routes/agent-readiness";
 import { linkHeaders, markdownNegotiation } from "./middleware/agent-discovery";
 import { langMiddleware } from "./i18n/middleware";
-import { analyticsService } from "./services/analytics-service";
+import { analyticsService, shouldRunAutoPrune } from "./services/analytics-service";
 import analyticsRoutes from "./routes/analytics";
 import agentStatsRoutes from "./routes/agent-stats";
 import adminRunsRoutes from "./routes/admin-runs";
@@ -219,7 +219,8 @@ app.get("/health", (_req, res) => {
     if (dbLatencyMs > 3000) { status = "critical"; warnings.push(`DB slow: ${dbLatencyMs}ms`); }
     else if (dbLatencyMs > 1000) { if (status !== "critical") status = "warning"; warnings.push(`DB latency elevated: ${dbLatencyMs}ms`); }
 
-    if (dbSizeMb > 200) { if (status !== "critical") status = "warning"; warnings.push(`DB large: ${dbSizeMb}MB`); }
+    // PR-92 (2026-06-01): raised 200 → 400 MB. Daily auto-prune now keeps DB bounded.
+    if (dbSizeMb > 400) { if (status !== "critical") status = "warning"; warnings.push(`DB large: ${dbSizeMb}MB`); }
 
     if (pvCount > 500000) { warnings.push(`analytics_page_views has ${pvCount} rows — consider pruning`); }
 
@@ -559,6 +560,49 @@ app.listen(Number(PORT), HOST, async () => {
           console.error("[enrichment-backfill] failed (non-fatal):", err);
         });
     }, 5000); // 5s delay — let health checks + trust recalc settle first
+  }
+
+  // ─── PR-92 (2026-06-01): daily analytics auto-prune ───────────────
+  // Keeps the DB from growing unbounded (analytics_page_views adds
+  // ~7–8 MB/day). Fires once per day inside the 03:00–03:59 UTC window
+  // and skips if we already ran in the last 23h. Once a week (Sundays)
+  // it also runs VACUUM to reclaim space SQLite can't reuse on its own.
+  //
+  // Disable on dev / CI with RFB_DISABLE_AUTO_PRUNE=1.
+  if (process.env.RFB_DISABLE_AUTO_PRUNE !== "1") {
+    let lastPruneAt: Date | null = null;
+    const AUTO_PRUNE_DAYS_TO_KEEP = parseInt(process.env.RFB_AUTO_PRUNE_DAYS || "60", 10);
+
+    const autoPruneTick = () => {
+      const now = new Date();
+      if (!shouldRunAutoPrune({ now, lastRunAt: lastPruneAt })) return;
+      try {
+        const result = analyticsService.runAutoPrune({ daysToKeep: AUTO_PRUNE_DAYS_TO_KEEP });
+        console.log(
+          `[auto-prune] daysToKeep=${result.daysKept} cutoff=${result.cutoff} ` +
+          `deleted=${JSON.stringify(result.deleted)}`
+        );
+        lastPruneAt = now;
+
+        // Weekly VACUUM — Sundays only. Briefly locks the DB.
+        if (now.getUTCDay() === 0) {
+          try {
+            const v = analyticsService.vacuumDatabase();
+            console.log(
+              `[auto-prune] weekly VACUUM: ${v.sizeBeforeMb}MB → ${v.sizeAfterMb}MB ` +
+              `(freed ${v.freedMb}MB)`
+            );
+          } catch (err) {
+            console.error("[auto-prune] VACUUM failed (non-fatal):", err);
+          }
+        }
+      } catch (err) {
+        console.error("[auto-prune] failed (non-fatal):", err);
+      }
+    };
+
+    // Check every hour. The shouldRunAutoPrune guard handles the rest.
+    setInterval(autoPruneTick, 60 * 60_000);
   }
 });
 
