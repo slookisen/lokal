@@ -5,8 +5,9 @@ import { DiscoveryQuerySchema } from "../models/marketplace";
 import { interactionLogger, InteractionEvent } from "../services/interaction-logger";
 import { conversationService } from "../services/conversation-service";
 import { discoveryService } from "../services/discovery-service";
-import { knowledgeService } from "../services/knowledge-service";
+import { knowledgeService, relabelCertifications } from "../services/knowledge-service";
 import { redactPII } from "../utils/pii-redact";
+import { getDb } from "../database/init";
 
 // ─── A2A Routes ──────────────────────────────────────────────
 // Two protocols served here:
@@ -479,6 +480,11 @@ router.get("/agents/:id/agent.json", (req: Request, res: Response) => {
   // Enrich with knowledge data so buyer-agents get the full picture
   const knowledge = knowledgeService.getKnowledge(req.params.id as string);
   if (knowledge) {
+    // PR-95: fetch debio_verified flag for cert-relabelling consistency
+    const debioRow = getDb()
+      .prepare("SELECT debio_verified FROM agents WHERE id = ?")
+      .get(req.params.id as string) as { debio_verified?: number } | undefined;
+    const isDebioVerified = debioRow?.debio_verified === 1;
     const enriched: Record<string, any> = { ...card };
     enriched["x-knowledge"] = {
       address: knowledge.address,
@@ -492,7 +498,7 @@ router.get("/agents/:id/agent.json", (req: Request, res: Response) => {
         price: p.price, priceUnit: p.priceUnit,
       })),
       specialties: knowledge.specialties,
-      certifications: knowledge.certifications,
+      certifications: relabelCertifications(knowledge.certifications, isDebioVerified),
       paymentMethods: knowledge.paymentMethods,
       deliveryOptions: knowledge.deliveryOptions,
       deliveryRadius: knowledge.deliveryRadius,

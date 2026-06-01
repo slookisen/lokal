@@ -53,6 +53,7 @@ import { seedData } from "./seed";
 // Seed files moved to src/_seeds/ — only loaded if DB is empty (see below).
 import { discoveryService } from "./services/discovery-service";
 import { trustScoreService } from "./services/trust-score-service";
+import { syncDebioVerifications } from "./services/debio-verification-service";
 
 // Seed-knowledge loaded dynamically — only used if DB is empty
 let seedKnowledge: (() => void) | undefined;
@@ -608,6 +609,40 @@ app.listen(Number(PORT), HOST, async () => {
     setInterval(autoPruneTick, 60 * 60_000);
   }
 });
+
+// ─── PR-95 (2026-06-01): daily Debio verification sync ──────────────
+//
+// Pulls https://finnoko.debio.no/api/acm/companies once per day (target:
+// 04:00 UTC = 06:00 CEST) and updates agents.debio_verified for any
+// producer that matches by website-domain or fuzzy-name.
+//
+// Implementation pattern mirrors PR-92's auto-prune scheduler: hourly
+// wakeup, only fires inside the target UTC hour, debounced by the
+// 23-hour gap so a server restart inside that hour doesn't double-run.
+//
+// Disable by setting RFB_DISABLE_DEBIO_SYNC=1 (e.g. on local dev / CI).
+let lastDebioSyncAt: Date | null = null;
+if (process.env.RFB_DISABLE_DEBIO_SYNC !== "1") {
+  setInterval(async () => {
+    const now = new Date();
+    if (now.getUTCHours() !== 4) return; // fire only during 04:00 UTC window
+    if (lastDebioSyncAt && (now.getTime() - lastDebioSyncAt.getTime()) < 23 * 3600_000) return;
+    try {
+      const result = await syncDebioVerifications();
+      console.log(
+        `[debio-sync] fetched=${result.fetched} matched=${result.matched} ` +
+        `updated=${result.updated} newly=${result.newly_verified} ` +
+        `still=${result.still_verified} errors=${result.errors.length}`,
+      );
+      if (result.errors.length > 0) {
+        for (const e of result.errors) console.warn(`[debio-sync] ${e}`);
+      }
+      lastDebioSyncAt = now;
+    } catch (err) {
+      console.error("[debio-sync] failed:", err);
+    }
+  }, 60 * 60_000); // hourly check
+}
 
 // ─── Graceful shutdown ───────────────────────────────────────
 process.on("SIGTERM", () => { discoveryService.shutdown(); closeDb(); process.exit(0); });

@@ -130,10 +130,21 @@ function detectSpecialties(name: string, desc: string): string[] {
 }
 
 // ─── Detect certifications ────────────────────────────────
+// PR-95 (2026-06-01): REMOVED the "organic"/"økologisk" → "Debio-sertifisert"
+// auto-inference. Mentioning "organic" in a description text does NOT prove
+// a producer is Debio-certified (audit: 73 producers tagged organic, ~10%
+// self-claim Debio in text, 0 verified against finnoko.debio.no umbrella).
+// The Debio label is now sourced exclusively from the verification sync
+// service (src/services/debio-verification-service.ts) which cross-checks
+// against the public finnoko.debio.no/api/acm/companies registry.
+//
+// Demeter biodynamic certification has no equivalent public registry yet
+// and remains text-inferred. Daniel-decision pending: same gap exists, but
+// scale is smaller (~5 producers, not 73).
 function detectCertifications(desc: string): string[] {
   const certs: string[] = [];
   const d = desc.toLowerCase();
-  if (d.includes("organic") || d.includes("økologisk")) certs.push("Debio-sertifisert");
+  // Debio-sertifisert auto-inference DELETED — see PR-95.
   if (d.includes("biodynamic")) certs.push("Demeter-sertifisert");
   return certs;
 }
