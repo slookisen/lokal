@@ -1886,6 +1886,32 @@ function initSchema(db: Database.Database): void {
   `);
   db.exec(`CREATE INDEX IF NOT EXISTS idx_debio_unmatched_last_seen ON debio_unmatched_operators(last_seen_at)`);
 
+  // ─── PR-95 (2026-06-01): Debio organic-cert verification flags ──────
+  // Daniel directive: only show "Debio" label when actually verified via
+  // finnoko.debio.no. These columns are populated by
+  // syncDebioVerifications() (src/services/debio-verification-service.ts)
+  // which runs daily at 04:00 UTC. They are NOT set by seed-data or
+  // text-inference; that source-of-truth was removed in PR-95 from
+  // src/_seeds/seed-knowledge.ts.
+  //   debio_verified         : 1 iff matched against the public
+  //                            finnoko.debio.no/api/acm/companies feed.
+  //   debio_verified_at      : ISO-8601 timestamp of last successful match.
+  //   debio_finnoko_id       : partner_sid from the finnoko record (stable
+  //                            numeric id, stored as text for column-type
+  //                            compatibility with other id columns).
+  // Additive — idempotent ALTERs, same defensive try/catch pattern as the
+  // PR-58/PR-68 migrations above.
+  for (const stmt of [
+    `ALTER TABLE agents ADD COLUMN debio_verified INTEGER NOT NULL DEFAULT 0`,
+    `ALTER TABLE agents ADD COLUMN debio_verified_at TEXT`,
+    `ALTER TABLE agents ADD COLUMN debio_finnoko_id TEXT`,
+  ]) {
+    try { db.exec(stmt); } catch { /* already exists — expected */ }
+  }
+  try {
+    db.exec(`CREATE INDEX IF NOT EXISTS idx_agents_debio_verified ON agents(debio_verified) WHERE debio_verified = 1`);
+  } catch { /* partial index unsupported or already created */ }
+
 }
 
 export function closeDb(): void {

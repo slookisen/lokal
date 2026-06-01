@@ -600,7 +600,11 @@ router.get("/agents/:id/card", (req: Request, res: Response) => {
     }
 
     // Certifications, specialties, payment, delivery
+    // PR-95: certifications list is already relabel-by-debio_verified in
+    // knowledgeService.getAgentInfo. Also expose `debioVerified` as a
+    // first-class boolean so the frontend can render the badge separately.
     if (k.certifications?.length) card.certifications = k.certifications;
+    if (info.agent.debioVerified === true) card.debioVerified = true;
     if (k.specialties?.length) card.specialties = k.specialties;
     if (k.paymentMethods?.length) card.paymentMethods = k.paymentMethods;
     if (k.deliveryOptions?.length) card.deliveryOptions = k.deliveryOptions;

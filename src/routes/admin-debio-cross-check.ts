@@ -44,6 +44,7 @@
 
 import { Router, Request, Response } from "express";
 import { runDebioCrossCheck, DEFAULT_SINCE_ISO, DebioSource } from "../services/debio-cross-check";
+import { syncDebioVerifications } from "../services/debio-verification-service";
 import { startJob } from "../services/job-tracker";
 
 const router = Router();
@@ -146,6 +147,44 @@ router.post("/cross-check", async (req: Request, res: Response) => {
     res.status(500).json({
       success: false,
       error: "Debio cross-check failed",
+      detail: err?.message || String(err),
+    });
+  }
+});
+
+
+// ─── POST /admin/debio/sync (PR-95, 2026-06-01) ──────────────────────
+//
+// Pulls the public finnoko.debio.no/api/acm/companies feed (~83 records)
+// and stamps debio_verified=1 on matched producer agents. Matching is
+// by website-domain first, name-similarity (Dice ≥ 0.85) as fallback.
+// See src/services/debio-verification-service.ts for details.
+//
+// Unlike POST /cross-check (which writes affiliation rows + may take
+// minutes when TRACES is involved), this endpoint is synchronous and
+// typically finishes in <2s (one HTTP GET + ~83 in-memory matches).
+//
+// Returns:
+//   {
+//     success: true,
+//     fetched: N,           // raw count from finnoko
+//     matched: N,           // unique agents matched
+//     updated: N,           // rows updated (newly_verified + still_verified)
+//     newly_verified: N,    // rows that flipped debio_verified 0 → 1
+//     still_verified: N,    // rows already at debio_verified=1 (timestamp refreshed)
+//     by_method: { domain: N, name: N },
+//     unmatched_finnoko_ids: [...],
+//     errors: [...]
+//   }
+router.post("/sync", async (req: Request, res: Response) => {
+  if (!requireAdmin(req, res)) return;
+  try {
+    const result = await syncDebioVerifications();
+    res.json({ success: true, ...result });
+  } catch (err: any) {
+    res.status(500).json({
+      success: false,
+      error: "Debio sync failed",
       detail: err?.message || String(err),
     });
   }

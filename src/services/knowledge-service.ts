@@ -2,6 +2,55 @@ import { v4 as uuid } from "uuid";
 import crypto from "crypto";
 import { getDb } from "../database/init";
 
+// ─── PR-95 (2026-06-01): Debio cert relabelling ──────────────────────
+//
+// Daniel-directive: only show a "Debio" / "Debio-sertifisert" label when
+// debio_verified=1 (i.e. the producer was matched against the public
+// finnoko.debio.no/api/acm/companies feed by
+// src/services/debio-verification-service.ts).
+//
+// Pre-PR-95 the seed-knowledge.ts auto-inferrer pushed "Debio-sertifisert"
+// onto certifications[] for any agent whose description contained
+// "organic"/"økologisk" — 73 agents on the platform, 0 actually verified.
+// That inference line was deleted in PR-95 but stale "Debio-sertifisert"
+// entries persist in agent_knowledge.certifications rows seeded prior to
+// the deploy.
+//
+// This helper rewrites the OUTGOING API representation so:
+//   - debio_verified=1 → ensure "✓ Debio-verifisert" appears in the list
+//                        (drop any stale "Debio-sertifisert" / "Debio")
+//   - debio_verified=0 → drop "Debio-sertifisert" / "Debio" and replace
+//                        with "Hevder økologisk" if the seed had marked
+//                        them organic. This downgrades the trust signal
+//                        without dropping the relevance signal for search.
+//
+// Pure function — does not mutate the input array.
+export function relabelCertifications(
+  raw: string[] | undefined | null,
+  debioVerified: boolean,
+): string[] {
+  const list = Array.isArray(raw) ? raw.slice() : [];
+  const isDebioClaim = (s: string) => /^debio(\b|[-_\s])|debio[-_ ]?sertifisert/i.test(s.trim());
+  const isOrganicClaim = (s: string) =>
+    /^øk(o(logisk)?)?\b/i.test(s.trim()) || /^organic\b/i.test(s.trim());
+  const out: string[] = [];
+  let hadDebioOrOrganicSeed = false;
+  for (const item of list) {
+    if (!item) continue;
+    if (isDebioClaim(item) || isOrganicClaim(item)) {
+      hadDebioOrOrganicSeed = true;
+      continue; // dropped — re-emitted below per verification status
+    }
+    out.push(item);
+  }
+  if (debioVerified) {
+    out.unshift("✓ Debio-verifisert");
+  } else if (hadDebioOrOrganicSeed) {
+    out.push("Hevder økologisk");
+  }
+  return out;
+}
+
 // ─── Agent Knowledge Service ──────────────────────────────────
 // The "Google My Business" layer for food agents.
 //
@@ -170,6 +219,8 @@ export interface AgentInfoResponse {
     languages: string[];
     schemaVersion: string;
     agentVersion: number;
+    /** PR-95: true iff matched against finnoko.debio.no/api/acm/companies */
+    debioVerified: boolean;
   };
   knowledge: {
     address?: string;
@@ -232,6 +283,12 @@ class KnowledgeService {
     const dataSource = knowledge?.dataSource || "auto";
     const lastUpdated = knowledge?.ownerUpdatedAt || knowledge?.lastEnrichedAt || agent.created_at;
 
+    // PR-95: debio_verified is set by the daily finnoko.debio.no sync
+    // service. Older databases pre-migration may not have the column —
+    // treat absence/NULL as 0.
+    const debioVerified =
+      agent.debio_verified === 1 || agent.debio_verified === "1";
+
     return {
       agent: {
         id: agent.id,
@@ -244,6 +301,7 @@ class KnowledgeService {
         languages: agent.languages ? JSON.parse(agent.languages) : ["no"],
         schemaVersion: agent.schema_version || "urn:a2a:1.0",
         agentVersion: agent.agent_version || 1,
+        debioVerified,
       },
       knowledge: {
         address: knowledge?.address,
@@ -256,7 +314,8 @@ class KnowledgeService {
         about: knowledge?.about || "",
         description: agent.description || "",
         specialties: knowledge?.specialties || [],
-        certifications: knowledge?.certifications || [],
+        // PR-95: rewrite certifications to reflect debio_verified flag.
+        certifications: relabelCertifications(knowledge?.certifications, debioVerified),
         paymentMethods: knowledge?.paymentMethods || [],
         deliveryOptions: knowledge?.deliveryOptions || [],
         images: knowledge?.images || [],
