@@ -167,6 +167,7 @@ export function listPendingVerification(opts: {
   const where: string[] = [
     "verifier_state = 'pending'",
     "started_at >= ?",
+    "(verifier_checked_at IS NULL OR verifier_checked_at < started_at)",
   ];
   const params: unknown[] = [cutoff];
   if (opts.vertical) {
