@@ -32,6 +32,7 @@ import { analyticsService } from "./services/analytics-service";
 import analyticsRoutes from "./routes/analytics";
 import agentStatsRoutes from "./routes/agent-stats";
 import adminRunsRoutes from "./routes/admin-runs";
+import adminAgentsRoutes from "./routes/admin-agents";
 import adminOutreachPoolRoutes from "./routes/admin-outreach-pool";
 import adminRunVerifierRoutes from "./routes/admin-run-verifier";
 import adminVerifierSweepStatusRouter from "./routes/admin-verifier-sweep-status";
@@ -269,6 +270,8 @@ app.get("/health", (_req, res) => {
 // Analytics admin endpoints
 app.use("/admin/analytics", analyticsRoutes);
 app.use("/admin/runs", adminLimiter, adminRunsRoutes);
+// PR-93: list agents by status + updated_since — unblocks verifier sweep
+app.use("/admin/agents", adminLimiter, adminAgentsRoutes);
 app.use("/admin/outreach-ready-pool", adminLimiter, adminOutreachPoolRoutes);
 app.use("/admin/run-verifier", adminLimiter, adminRunVerifierRoutes);
 app.use("/admin/verifier/sweep-status", adminLimiter, adminVerifierSweepStatusRouter);
