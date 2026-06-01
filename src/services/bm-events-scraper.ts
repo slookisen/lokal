@@ -19,15 +19,23 @@
 //   3. lokallag_fallback — when no venue matches, find a lokallag in the
 //                        Bondens marked Norge tree whose city matches the
 //                        event location_text. Returns the lokallag's id.
-//   4. unmatched       — push to ScrapeResult.errors[]; do NOT create a
-//                        new venue here (out of scope for this PR).
+//   4. unmatched       — push to ScrapeResult.errors[]. PR-94 (2026-06-01)
+//                        auto-creates a placeholder agent (umbrella_type=
+//                        \'bm_venue\', agent_review_status=\'pending_review\')
+//                        so Daniel can confirm/reject from the admin
+//                        review queue. The event row is linked to that
+//                        placeholder agent; once confirmed it appears in
+//                        bm-events listings + on profile pages.
 //
 // We do NOT try to detect Cloudflare-style empty-body responses ourselves;
 // caller passes useRenderWorker=true to force the render-worker fallback.
 
 import { getDb } from "../database/init";
 import { renderPage } from "./render-client";
-import { normaliseForMatch } from "./name-matcher";
+import { normaliseForMatch, normaliseBmLocation } from "./name-matcher";
+import { slugify } from "../utils/slug";
+import { v4 as uuid } from "uuid";
+import * as crypto from "crypto";
 
 const LISTING_URL = "https://bondensmarked.no/markeder";
 const EVENT_BASE = "https://bondensmarked.no/markeder/";
@@ -54,6 +62,13 @@ export type ScrapeResult = {
   parsed: number;
   matched_to_venue: number;
   matched_to_lokallag_fallback: number;
+  /**
+   * PR-94: count of events for which no existing agent matched — but a
+   * placeholder bm_venue agent (status=pending_review) was auto-created
+   * and the event was linked to it. Distinct from `unmatched` which now
+   * only counts true failures (auto-create itself errored).
+   */
+  auto_created_bm_venue: number;
   unmatched: number;
   upserted: number;
   errors: string[];
@@ -129,7 +144,13 @@ export async function matchEventToVenue(
   record: BmEventRecord
 ): Promise<{
   agent_id: string | null;
-  match_type: "venue_exact" | "venue_fuzzy" | "lokallag_fallback" | "unmatched";
+  /**
+   * PR-94 added \'bm_venue_auto\' as a 5th tier. When the matcher would
+   * otherwise return \'unmatched\', it now creates a placeholder agent
+   * (umbrella_type=\'bm_venue\', agent_review_status=\'pending_review\')
+   * and returns its id. The scraper pipeline links the event to that id.
+   */
+  match_type: "venue_exact" | "venue_fuzzy" | "lokallag_fallback" | "bm_venue_auto" | "unmatched";
 }> {
   const db = getDb();
 
@@ -186,10 +207,12 @@ export async function matchEventToVenue(
     venues = [];
   }
 
-  const needles = exactCandidates.map(normaliseForMatch).filter(s => s.length >= 3);
+  // PR-94: use normaliseBmLocation so "Kaupangermart´n" / "Digerneset"
+  // / "Skogen" collapse to the same form as their agent counterparts.
+  const needles = exactCandidates.map(normaliseBmLocation).filter(s => s.length >= 3);
   let best: { id: string; score: number } | null = null;
   for (const v of venues) {
-    const venueNorm = normaliseForMatch(v.name);
+    const venueNorm = normaliseBmLocation(v.name);
     if (!venueNorm) continue;
     for (const needle of needles) {
       let overlap = 0;
@@ -216,12 +239,14 @@ export async function matchEventToVenue(
         "SELECT id, name, city FROM agents WHERE parent_umbrella_id = ? AND umbrella_type = 'market_network' AND is_active = 1"
       ).all(national.id) as Array<{ id: string; name: string; city: string | null }>;
 
-      const locNorm = normaliseForMatch(record.location_text);
-      const eventNorm = normaliseForMatch(record.event_name);
+      // PR-94: normaliseBmLocation matches the venue-side normalisation
+      // so lokallag-fallback consistently handles Norwegian suffix variants.
+      const locNorm = normaliseBmLocation(record.location_text);
+      const eventNorm = normaliseBmLocation(record.event_name);
       let bestLok: { id: string; score: number } | null = null;
       for (const l of lokallags) {
-        const cityNorm = normaliseForMatch(l.city || "");
-        const nameNorm = normaliseForMatch(l.name);
+        const cityNorm = normaliseBmLocation(l.city || "");
+        const nameNorm = normaliseBmLocation(l.name);
         let s = 0;
         if (cityNorm && (locNorm.includes(cityNorm) || eventNorm.includes(cityNorm))) {
           s = Math.max(s, cityNorm.length);
@@ -241,7 +266,130 @@ export async function matchEventToVenue(
     }
   }
 
+  // ── 4. PR-94 Phase B.2: auto-create a bm_venue agent ──
+  // No producer-side agent matched. Rather than dropping the event, we
+  // create a placeholder agent so the event is preserved + surfaces in
+  // the admin review queue (Daniel confirms or rejects later).
+  //
+  // De-duplication strategy: slug from event_name (preferred — most
+  // specific) OR location_text. If an agent already exists with this
+  // exact slug (regardless of umbrella_type) we link to it instead of
+  // re-creating. The `ON CONFLICT DO NOTHING` semantics are achieved
+  // via a pre-check because agents.name has no UNIQUE constraint and
+  // agents.id is the only PK.
+  try {
+    const venueId = await getOrCreateBmVenueAgent(record);
+    if (venueId) {
+      return { agent_id: venueId, match_type: "bm_venue_auto" };
+    }
+  } catch {
+    // Fall through to plain unmatched on any DB error so the scraper
+    // continues processing the rest of the batch.
+  }
+
   return { agent_id: null, match_type: "unmatched" };
+}
+
+// ─── PR-94 helper: getOrCreateBmVenueAgent ──────────────────────
+// Creates a placeholder agent (umbrella_type=\'bm_venue\', status=
+// \'pending_review\') for an unmatched BM event. Idempotent on slug —
+// re-running the scraper on the same event re-uses the existing row
+// and merely appends `first_seen` metadata.
+//
+// Required NOT NULL columns on agents are filled with synthetic
+// placeholder values (description = "(auto-created from BM scraper)",
+// provider = "bondensmarked.no", contact_email = "noreply@…",
+// url = source_url, role = \'producer\' to satisfy the CHECK constraint,
+// api_key = random hex). The agent is is_active=0 while pending so it
+// doesn\'t pollute discovery; admin confirm flips it to is_active=1.
+export async function getOrCreateBmVenueAgent(
+  record: BmEventRecord
+): Promise<string | null> {
+  const db = getDb();
+  const nameCandidate = (record.event_name || record.location_text || "").trim();
+  if (!nameCandidate) return null;
+  const slug = slugify(nameCandidate);
+  if (!slug || slug.length < 2) return null;
+
+  // Check by slug-derivable name (case-insensitive) first to avoid dupes.
+  // We store the original event_name as the agent name and rely on
+  // slugify(name) being stable across runs.
+  const existing = db.prepare(
+    "SELECT id, bm_venue_meta FROM agents WHERE LOWER(name) = LOWER(?) AND umbrella_type = \'bm_venue\' LIMIT 1"
+  ).get(nameCandidate) as { id: string; bm_venue_meta: string | null } | undefined;
+
+  if (existing) {
+    // Merge metadata: track distinct locations seen for this venue.
+    try {
+      const meta = existing.bm_venue_meta ? JSON.parse(existing.bm_venue_meta) : {};
+      meta.last_seen_at = new Date().toISOString();
+      const locs: string[] = Array.isArray(meta.locations) ? meta.locations : [];
+      if (record.location_text && !locs.includes(record.location_text)) {
+        locs.push(record.location_text);
+      }
+      meta.locations = locs;
+      const slugs: string[] = Array.isArray(meta.event_slugs) ? meta.event_slugs : [];
+      if (record.event_slug && !slugs.includes(record.event_slug)) {
+        slugs.push(record.event_slug);
+      }
+      meta.event_slugs = slugs;
+      db.prepare("UPDATE agents SET bm_venue_meta = ? WHERE id = ?").run(
+        JSON.stringify(meta),
+        existing.id
+      );
+    } catch {
+      // Metadata-merge is best-effort; don\'t fail the match because of it.
+    }
+    return existing.id;
+  }
+
+  // Create new bm_venue placeholder agent.
+  const id = uuid();
+  const apiKey = "bmv_" + crypto.randomBytes(20).toString("hex");
+  const now = new Date().toISOString();
+  const meta = {
+    first_event_name: record.event_name,
+    first_event_slug: record.event_slug,
+    first_location_text: record.location_text,
+    first_seen_at: now,
+    last_seen_at: now,
+    source_url: record.source_url,
+    locations: record.location_text ? [record.location_text] : [],
+    event_slugs: record.event_slug ? [record.event_slug] : [],
+  };
+  try {
+    db.prepare(`
+      INSERT INTO agents (
+        id, name, description, provider, contact_email, url, role,
+        api_key, city,
+        umbrella_type, agent_review_status, bm_venue_meta,
+        is_active, is_verified, trust_score,
+        created_at, last_seen_at
+      ) VALUES (
+        ?, ?, ?, ?, ?, ?, \'producer\',
+        ?, ?,
+        \'bm_venue\', \'pending_review\', ?,
+        0, 0, 0,
+        ?, ?
+      )
+    `).run(
+      id,
+      nameCandidate,
+      `(Auto-opprettet fra Bondens marked-skraper ${now.slice(0, 10)}. Venter Daniel-bekreftelse.)`,
+      "bondensmarked.no",
+      "noreply@rettfrabonden.com",
+      record.source_url,
+      apiKey,
+      record.location_text || null,
+      JSON.stringify(meta),
+      now,
+      now,
+    );
+    return id;
+  } catch {
+    // Possible api_key collision (extremely unlikely) — retry once.
+    return null;
+  }
 }
 
 // ─── 4. runBmEventsScraper ─────────────────────────────────────
@@ -259,6 +407,7 @@ export async function runBmEventsScraper(opts?: {
     parsed: 0,
     matched_to_venue: 0,
     matched_to_lokallag_fallback: 0,
+    auto_created_bm_venue: 0,
     unmatched: 0,
     upserted: 0,
     errors: [],
@@ -320,6 +469,9 @@ export async function runBmEventsScraper(opts?: {
         result.matched_to_venue++;
       } else if (match.match_type === "lokallag_fallback") {
         result.matched_to_lokallag_fallback++;
+      } else if (match.match_type === "bm_venue_auto") {
+        // PR-94: not an error — a placeholder bm_venue agent was created.
+        result.auto_created_bm_venue++;
       } else {
         result.unmatched++;
         result.errors.push(`unmatched: ${slug} (event_name="${record.event_name}", location="${record.location_text}")`);

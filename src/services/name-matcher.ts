@@ -34,13 +34,28 @@
 // Identical semantics to the original private helper in
 // bm-events-scraper.ts (verified by the PR-56 behavioural tests).
 // Kept BM-prefix stripping for backward-compat, even though the
-// Hanen scraper won't hit BM-prefixed strings — extra cost is one
+// Hanen scraper won\'t hit BM-prefixed strings — extra cost is one
 // regex per call and the prefix would never accidentally collide.
+//
+// PR-94 (2026-06-01): hardened against non-ASCII apostrophe noise
+// seen on bondensmarked.no — U+00B4 acute, U+2019 right single
+// quote, U+0060 backtick, U+2032 prime, U+2018 left single quote,
+// U+0301 combining acute, U+00B7 middle dot. These are stripped
+// BEFORE the non-alphanumeric collapse so they don\'t survive as
+// spaces (which would split a single token in two and break Dice).
+//
+// Suffix stripping for BM events (`-et`/`-en`/`martn`→`marked`) is
+// in a separate function `normaliseBmLocation` below — applying it
+// here would over-strip Hanen producer names like "Stordalen Bruk AS"
+// (the "-en" rule would wrongly collapse "stordalen" → "stordal").
 export function normaliseForMatch(s: string): string {
   if (!s) return "";
   return s
     .normalize("NFC")
     .toLowerCase()
+    // PR-94: strip non-ASCII apostrophe/quote/prime variants up front
+    // so they don\'t survive into the non-alphanumeric collapse step.
+    .replace(/[\u00B4\u2018\u2019\u0060\u2032\u0301\u00B7]/g, "")
     .replace(/æ/g, "ae")
     .replace(/ø/g, "o")
     .replace(/å/g, "a")
@@ -51,6 +66,54 @@ export function normaliseForMatch(s: string): string {
     .replace(/[^\p{L}\p{N}\s]/gu, " ")
     .replace(/\s+/g, " ")
     .trim();
+}
+
+// ─── 1b. normaliseBmLocation (PR-94, 2026-06-01) ───────────────
+// Stronger normalisation used by the bm-events-scraper matcher.
+// Applies `normaliseForMatch` then strips Norwegian definite-suffix
+// patterns specific to place/venue names that appear on
+// bondensmarked.no:
+//
+//   - "martnan" / "martn" → "marked"  (dialect/colloquial form
+//                                      e.g. "kaupangermartn" → "kaupangermarked")
+//   - trailing "-et", "-en", "-an", "-a"  → stripped when the
+//                                            stem stays >= 3 chars
+//
+// Why a separate function (not folded into normaliseForMatch):
+// `nameVariants` and the Hanen matcher rely on the unstripped form
+// (Hanen producer names like "Stordalen Bruk AS" need "stordalen"
+// preserved as-is for the org/farm-suffix variant pipeline). Only
+// BM event/venue names need the place-name suffix stripping.
+//
+// Token-level stripping is conservative: stem must remain >= 3 chars
+// after the strip, so "Os" and "Bø" stay intact.
+export function normaliseBmLocation(s: string): string {
+  const base = normaliseForMatch(s);
+  if (!base) return "";
+
+  const tokens = base.split(" ");
+  for (let i = 0; i < tokens.length; i++) {
+    let t = tokens[i];
+    if (!t) continue;
+    // martnan / martn → marked
+    if (/martnan$/.test(t)) {
+      t = t.replace(/martnan$/, "marked");
+    } else if (/martn$/.test(t)) {
+      t = t.replace(/martn$/, "marked");
+    }
+    // Strip Norwegian definite-suffix. Order = longest first ("an"/"en"/"et" before "a")
+    // to avoid premature single-char strip on words like "tjern" (would lose "n").
+    // Guard: only strip if stem stays >= 3 chars.
+    const suffixOrdered = ["an", "en", "et", "a"];
+    for (const sfx of suffixOrdered) {
+      if (t.length > sfx.length + 2 && t.endsWith(sfx)) {
+        t = t.slice(0, -sfx.length);
+        break;
+      }
+    }
+    tokens[i] = t;
+  }
+  return tokens.join(" ").replace(/\s+/g, " ").trim();
 }
 
 // ─── 2. diceCoefficient ────────────────────────────────────────

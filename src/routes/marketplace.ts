@@ -2974,6 +2974,10 @@ router.get("/umbrellas", (req: Request, res: Response) => {
 
     const db = getDb();
     const wheres: string[] = ["umbrella_type IS NOT NULL", "is_active = 1"];
+    // PR-94: exclude unreviewed bm_venue placeholders from public umbrella
+    // listings. Confirmed bm_venues already have is_active=1 set during
+    // confirm, but the additional review-status filter is defensive.
+    wheres.push("(umbrella_type != \'bm_venue\' OR agent_review_status = \'confirmed\')");
     const params: any[] = [];
     if (umbrellaType) { wheres.push("umbrella_type = ?"); params.push(umbrellaType); }
     params.push(limit);
@@ -4011,6 +4015,11 @@ router.get("/bm-events", (req: Request, res: Response) => {
 
     const wheres: string[] = ["e.start_at >= ?", "e.start_at <= ?"];
     const params: any[] = [fromIso, toIso];
+
+    // PR-94: filter out bm_venue agents that are still pending review or
+    // explicitly rejected. Public-facing endpoint must not surface
+    // unreviewed placeholder venues to end users / AI agents.
+    wheres.push("(a.umbrella_type != \'bm_venue\' OR a.agent_review_status = \'confirmed\')");
 
     if (venue) {
       wheres.push("e.venue_agent_id = ?");

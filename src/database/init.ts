@@ -1790,6 +1790,36 @@ function initSchema(db: Database.Database): void {
   // SQLite's planner handles the range scan cheaply at this table size.
   db.exec(`CREATE INDEX IF NOT EXISTS idx_bm_events_start ON bm_market_events(start_at)`);
 
+  // ─── PR-94 (2026-06-01): Phase B.2 — bm_venue agents ────────────────
+  // Root-cause analysis 2026-06-01 found ~73% of unmatched BM events are
+  // festivals / town-squares / landmarks (not producers and not lokallag).
+  // The matcher\'s PR-56 premise — "every BM event matches an existing
+  // agent" — was wrong; these venues need their own agent rows.
+  //
+  // Design: extend the existing agents table (not a new table) with two
+  // nullable columns:
+  //   - agent_review_status TEXT  — only populated for umbrella_type=\'bm_venue\';
+  //                                  values \'pending_review\', \'confirmed\', \'rejected\'.
+  //                                  All existing rows stay NULL (no behavioural change).
+  //   - bm_venue_meta TEXT (JSON)  — first-seen event name + locations list +
+  //                                  first_seen_at; lets Daniel decide whether
+  //                                  to confirm the venue without re-scraping.
+  //
+  // umbrella_type=\'bm_venue\' is a new discriminator value (not added to a
+  // CHECK constraint — umbrella_type is a plain TEXT column). Marketplace
+  // search already filters umbrella_type IS NULL so public producer search
+  // is untouched. Profile/umbrella/bm-events endpoints filter out
+  // pending_review+rejected rows.
+  for (const stmt of [
+    `ALTER TABLE agents ADD COLUMN agent_review_status TEXT`,
+    `ALTER TABLE agents ADD COLUMN bm_venue_meta TEXT`,
+  ]) {
+    try { db.exec(stmt); } catch { /* already exists — expected on re-init */ }
+  }
+  // Partial index on the review-queue column so the admin "list pending"
+  // endpoint is cheap even when the agents table is large.
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_agents_review_status ON agents(agent_review_status) WHERE agent_review_status IS NOT NULL`);
+
   // ─── Phase 5.11 C.2 (2026-05-16): Hanen member-scraping unmatched log ──
   // hanen.no/medlemmer scraper (src/services/hanen-scraper.ts) writes one
   // row per parsed Hanen member that did NOT match any existing agent

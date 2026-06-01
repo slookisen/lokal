@@ -570,6 +570,8 @@ function registerTools(server: McpServer, getClientIdentity?: () => string | und
       const toIso = new Date(Date.now() + lookahead * 24 * 60 * 60 * 1000).toISOString();
 
       const wheres: string[] = ["e.start_at >= ?", "e.start_at <= ?"];
+      // PR-94: exclude unreviewed bm_venue placeholders from MCP output.
+      wheres.push("(a.umbrella_type != 'bm_venue' OR a.agent_review_status = 'confirmed')");
       const params: any[] = [fromIso, toIso];
 
       let lokallagId: string | null = null;

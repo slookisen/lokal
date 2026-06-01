@@ -2925,6 +2925,7 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
                      a.id AS venue_id, a.name AS venue_name
               FROM bm_market_events e INNER JOIN agents a ON a.id = e.venue_agent_id
               WHERE e.venue_agent_id = ? AND e.start_at >= ?
+                AND (a.umbrella_type != \'bm_venue\' OR a.agent_review_status = \'confirmed\')
               ORDER BY e.start_at ASC LIMIT 5
             `).all(agent.id, nowIso) as any[];
           } else if (isLokallag) {
@@ -2933,6 +2934,7 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
                      a.id AS venue_id, a.name AS venue_name
               FROM bm_market_events e INNER JOIN agents a ON a.id = e.venue_agent_id
               WHERE (a.parent_umbrella_id = ? OR e.venue_agent_id = ?) AND e.start_at >= ?
+                AND (a.umbrella_type != \'bm_venue\' OR a.agent_review_status = \'confirmed\')
               ORDER BY e.start_at ASC LIMIT 10
             `).all(agent.id, agent.id, nowIso) as any[];
           } else {
@@ -2942,6 +2944,7 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
                      a.id AS venue_id, a.name AS venue_name
               FROM bm_market_events e INNER JOIN agents a ON a.id = e.venue_agent_id
               WHERE e.start_at >= ?
+                AND (a.umbrella_type != \'bm_venue\' OR a.agent_review_status = \'confirmed\')
               ORDER BY e.start_at ASC LIMIT 5
             `).all(nowIso) as any[];
             const weekIso = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString();
