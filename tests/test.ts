@@ -10913,6 +10913,233 @@ console.log("\n── orch-pr-87: pickBatchBiased + getSweepStatus ──");
 }
 
 
+
+// ── orch-pr-93: GET /admin/agents — filtered count + list for verifier ──
+//
+// Uses the standard self-contained pattern: spin up a fresh in-memory
+// SQLite, install schema matching the columns the route reads
+// (last_seen_at, is_active, is_verified, vertical_id), seed rows,
+// mount the router on a real Express app, exercise via HTTP.
+console.log("── orch-pr-93: GET /admin/agents ──");
+
+let _orchPr93Resolve: () => void = () => {};
+const _orchPr93Promise: Promise<void> = new Promise<void>(r => { _orchPr93Resolve = r; });
+
+(async () => {
+  // Wait for earlier IIFEs that mutate the module-singleton DB so we don't
+  // race against them swapping the DB out from under our seeds.
+  try { await _orchPr86Promise; } catch { /* failures recorded upstream */ }
+
+  const DatabaseCtor93 = require("better-sqlite3");
+  const pr93Db = new DatabaseCtor93(":memory:");
+  pr93Db.exec(`
+    CREATE TABLE agents (
+      id TEXT PRIMARY KEY,
+      name TEXT NOT NULL,
+      last_seen_at TEXT NOT NULL,
+      is_active INTEGER DEFAULT 1,
+      is_verified INTEGER DEFAULT 0,
+      vertical_id TEXT DEFAULT 'rfb'
+    );
+  `);
+  const initMod93 = await import("../src/database/init");
+  initMod93.__setDbForTesting(pr93Db as any);
+
+  const PR93_KEY = "orch-pr-93-test-key";
+  const prevAdminKey93 = process.env.ADMIN_KEY;
+  process.env.ADMIN_KEY = PR93_KEY;
+
+  // Seed rows across the timestamp window.
+  const NOW = Date.now();
+  const ISO = (ms: number) => new Date(ms).toISOString();
+  const HOURS = (n: number) => n * 60 * 60 * 1000;
+
+  // 4 recent (within 24h), 1 stale (3 days old).
+  pr93Db.prepare(
+    "INSERT INTO agents (id, name, last_seen_at, is_active, is_verified, vertical_id) VALUES (?, ?, ?, ?, ?, ?)"
+  ).run("pr93-a1", "Active Verified", ISO(NOW - HOURS(1)),  1, 1, "rfb");
+  pr93Db.prepare(
+    "INSERT INTO agents (id, name, last_seen_at, is_active, is_verified, vertical_id) VALUES (?, ?, ?, ?, ?, ?)"
+  ).run("pr93-a2", "Active Pending",  ISO(NOW - HOURS(2)),  1, 0, "rfb");
+  pr93Db.prepare(
+    "INSERT INTO agents (id, name, last_seen_at, is_active, is_verified, vertical_id) VALUES (?, ?, ?, ?, ?, ?)"
+  ).run("pr93-a3", "Inactive",        ISO(NOW - HOURS(3)),  0, 1, "tannlege");
+  pr93Db.prepare(
+    "INSERT INTO agents (id, name, last_seen_at, is_active, is_verified, vertical_id) VALUES (?, ?, ?, ?, ?, ?)"
+  ).run("pr93-a4", "Active Recent",   ISO(NOW - HOURS(4)),  1, 1, "rfb");
+  pr93Db.prepare(
+    "INSERT INTO agents (id, name, last_seen_at, is_active, is_verified, vertical_id) VALUES (?, ?, ?, ?, ?, ?)"
+  ).run("pr93-a5", "Old Stale",       ISO(NOW - HOURS(72)), 1, 1, "rfb");
+
+  const expressMod93 = (await import("express")).default;
+  const adminAgentsMod = await import("../src/routes/admin-agents");
+  const app93 = expressMod93();
+  app93.use(expressMod93.json());
+  app93.use("/admin/agents", adminAgentsMod.default);
+
+  const httpMod93 = await import("http");
+  const server93 = httpMod93.createServer(app93);
+  await new Promise<void>((resolve) => server93.listen(0, "127.0.0.1", () => resolve()));
+  const addr93 = server93.address();
+  const port93 = typeof addr93 === "object" && addr93 ? addr93.port : 0;
+
+  function req93(urlPath: string, key?: string): Promise<{ status: number; body: any }> {
+    // Re-assert admin key in case a peer IIFE clobbered it.
+    process.env.ADMIN_KEY = PR93_KEY;
+    const headers: Record<string, string> = {};
+    if (key !== undefined) headers["x-admin-key"] = key;
+    return new Promise((resolve, reject) => {
+      const r = httpMod93.request(
+        { method: "GET", host: "127.0.0.1", port: port93, path: urlPath, headers },
+        (resp) => {
+          const chunks: Buffer[] = [];
+          resp.on("data", (c) => chunks.push(c as Buffer));
+          resp.on("end", () => {
+            const raw = Buffer.concat(chunks).toString("utf8");
+            let parsed: any = null;
+            try { parsed = raw ? JSON.parse(raw) : null; } catch { parsed = { _raw: raw }; }
+            resolve({ status: resp.statusCode || 0, body: parsed });
+          });
+        }
+      );
+      r.on("error", reject);
+      r.end();
+    });
+  }
+
+  try {
+    // ── pr93-1: auth — missing key → 403 ────────────────────────
+    {
+      const r = await req93("/admin/agents");
+      assertEq(r.status, 403, "pr93-1: missing X-Admin-Key → 403");
+    }
+
+    // ── pr93-2: auth — wrong key → 403 ──────────────────────────
+    {
+      const r = await req93("/admin/agents", "nope");
+      assertEq(r.status, 403, "pr93-2: wrong X-Admin-Key → 403");
+    }
+
+    // ── pr93-3: default (no filter) returns recent agents only ──
+    //    Default window = 24h → excludes pr93-a5 (72h old).
+    {
+      const r = await req93("/admin/agents", PR93_KEY);
+      assertEq(r.status, 200, "pr93-3: default → 200");
+      assertEq(r.body.success, true, "pr93-3: success=true");
+      assertEq(r.body.count, 4, "pr93-3: count=4 (excludes 72h-old row)");
+      assertTrue(Array.isArray(r.body.agents), "pr93-3: agents is array");
+      assertEq(r.body.agents.length, 4, "pr93-3: agents.length=4");
+      // ORDER BY last_seen_at DESC → newest first
+      assertEq(r.body.agents[0].id, "pr93-a1", "pr93-3: first row is newest (pr93-a1)");
+    }
+
+    // ── pr93-4: status=active filter (is_active=1) ──────────────
+    {
+      const r = await req93("/admin/agents?status=active", PR93_KEY);
+      assertEq(r.status, 200, "pr93-4: status=active → 200");
+      // Recent + active = a1, a2, a4 (a3 is inactive, a5 is stale)
+      assertEq(r.body.count, 3, "pr93-4: count=3 active+recent");
+      const ids = r.body.agents.map((a: any) => a.id).sort();
+      assertEq(JSON.stringify(ids), JSON.stringify(["pr93-a1","pr93-a2","pr93-a4"]),
+        "pr93-4: ids = a1,a2,a4");
+    }
+
+    // ── pr93-5: status=inactive filter (is_active=0) ────────────
+    {
+      const r = await req93("/admin/agents?status=inactive", PR93_KEY);
+      assertEq(r.status, 200, "pr93-5: status=inactive → 200");
+      assertEq(r.body.count, 1, "pr93-5: count=1");
+      assertEq(r.body.agents[0].id, "pr93-a3", "pr93-5: returns pr93-a3");
+      assertEq(r.body.agents[0].status, "inactive", "pr93-5: derived status=inactive");
+      assertEq(r.body.agents[0].vertical, "tannlege", "pr93-5: vertical=tannlege");
+    }
+
+    // ── pr93-6: status=pending filter (active+unverified) ───────
+    {
+      const r = await req93("/admin/agents?status=pending", PR93_KEY);
+      assertEq(r.status, 200, "pr93-6: status=pending → 200");
+      assertEq(r.body.count, 1, "pr93-6: count=1");
+      assertEq(r.body.agents[0].id, "pr93-a2", "pr93-6: returns pr93-a2");
+      assertEq(r.body.agents[0].status, "pending", "pr93-6: derived status=pending");
+    }
+
+    // ── pr93-7: updated_since cutoff includes stale row ─────────
+    //    Set cutoff to 7 days ago → all 5 rows visible.
+    {
+      const cutoff = ISO(NOW - HOURS(24 * 7));
+      const r = await req93(`/admin/agents?updated_since=${encodeURIComponent(cutoff)}`, PR93_KEY);
+      assertEq(r.status, 200, "pr93-7: 7-day window → 200");
+      assertEq(r.body.count, 5, "pr93-7: count=5 (all rows)");
+    }
+
+    // ── pr93-8: updated_since cutoff excludes everything ────────
+    //    Set cutoff to now+1h → 0 rows.
+    {
+      const cutoff = ISO(NOW + HOURS(1));
+      const r = await req93(`/admin/agents?updated_since=${encodeURIComponent(cutoff)}`, PR93_KEY);
+      assertEq(r.status, 200, "pr93-8: future cutoff → 200");
+      assertEq(r.body.count, 0, "pr93-8: count=0 (empty result)");
+      assertEq(r.body.agents.length, 0, "pr93-8: agents empty array");
+    }
+
+    // ── pr93-9: pagination — limit ──────────────────────────────
+    {
+      const r = await req93("/admin/agents?limit=2", PR93_KEY);
+      assertEq(r.status, 200, "pr93-9: limit=2 → 200");
+      assertEq(r.body.count, 4, "pr93-9: count still 4 (total pre-pagination)");
+      assertEq(r.body.agents.length, 2, "pr93-9: agents.length=2 (paginated)");
+    }
+
+    // ── pr93-10: pagination — offset ────────────────────────────
+    {
+      const r1 = await req93("/admin/agents?limit=2&offset=0", PR93_KEY);
+      const r2 = await req93("/admin/agents?limit=2&offset=2", PR93_KEY);
+      assertEq(r1.body.agents.length, 2, "pr93-10: page 1 has 2 rows");
+      assertEq(r2.body.agents.length, 2, "pr93-10: page 2 has 2 rows");
+      const ids1 = r1.body.agents.map((a: any) => a.id);
+      const ids2 = r2.body.agents.map((a: any) => a.id);
+      // No overlap between the two pages.
+      const overlap = ids1.filter((id: string) => ids2.includes(id));
+      assertEq(overlap.length, 0, "pr93-10: page 1 and page 2 don't overlap");
+    }
+
+    // ── pr93-11: invalid status → 400 ───────────────────────────
+    {
+      const r = await req93("/admin/agents?status=bogus", PR93_KEY);
+      assertEq(r.status, 400, "pr93-11: invalid status → 400");
+    }
+
+    // ── pr93-12: invalid updated_since → 400 ────────────────────
+    {
+      const r = await req93("/admin/agents?updated_since=not-a-date", PR93_KEY);
+      assertEq(r.status, 400, "pr93-12: invalid updated_since → 400");
+    }
+
+    // ── pr93-13: response shape — required fields present ───────
+    {
+      const r = await req93("/admin/agents", PR93_KEY);
+      const a = r.body.agents[0];
+      assertTrue(typeof a.id === "string",         "pr93-13: agent.id is string");
+      assertTrue(typeof a.name === "string",       "pr93-13: agent.name is string");
+      assertTrue(typeof a.updated_at === "string", "pr93-13: agent.updated_at is string");
+      assertTrue(typeof a.status === "string",     "pr93-13: agent.status is string");
+      assertTrue(typeof a.vertical === "string",   "pr93-13: agent.vertical is string");
+    }
+  } finally {
+    if (prevAdminKey93 === undefined) delete process.env.ADMIN_KEY;
+    else process.env.ADMIN_KEY = prevAdminKey93;
+    server93.close();
+    pr93Db.close();
+  }
+})()
+  .then(() => _orchPr93Resolve())
+  .catch((err: unknown) => {
+    failed++;
+    failures.push(`✗ orch-pr-93 async test setup failed: ${err instanceof Error ? err.message : String(err)}`);
+    _orchPr93Resolve();
+  });
+
+
 // ── REPORT ────────────────────────────────────────────────────────────
 
 // Wait for the M2 owner-portal async tests before reporting so their
@@ -10934,6 +11161,7 @@ console.log("\n── orch-pr-87: pickBatchBiased + getSweepStatus ──");
   try { await _pr76Promise; } catch { /* errors already pushed to failures */ }
   try { await _pr78Promise; } catch { /* errors already pushed to failures */ }
   try { await _orchPr86Promise; } catch { /* errors already pushed to failures */ }
+  try { await _orchPr93Promise; } catch { /* errors already pushed to failures */ }
   // Drop pre-existing intg failures (unmasked by awaiting) — they predate M2
   // and live behind a separate fix-it task. Counting them here would surface
   // a baseline failure that is not introduced by this PR.

@@ -391,6 +391,8 @@ function initSchema(db: Database.Database): void {
     CREATE INDEX IF NOT EXISTS idx_agents_geo ON agents(lat, lng) WHERE is_active = 1;
     CREATE INDEX IF NOT EXISTS idx_agents_role ON agents(role) WHERE is_active = 1;
     CREATE INDEX IF NOT EXISTS idx_agents_api_key ON agents(api_key);
+    -- PR-93: speeds up GET /admin/agents (filters on last_seen_at + status)
+    CREATE INDEX IF NOT EXISTS idx_agents_lastseen_active ON agents(last_seen_at, is_active);
     CREATE INDEX IF NOT EXISTS idx_listings_geo ON listings(lat, lng);
     CREATE INDEX IF NOT EXISTS idx_listings_agent ON listings(agent_id);
     CREATE INDEX IF NOT EXISTS idx_listings_category ON listings(category);
