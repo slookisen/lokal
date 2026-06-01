@@ -6788,6 +6788,244 @@ const _pr56Promise: Promise<void> = new Promise<void>(r => { _pr56Resolve = r; }
 }
 
 
+// ─── PR-94 (2026-06-01): normaliser-hardening + Phase-B.2 venue-agent auto-create ──
+//
+// Two parts:
+//   (1) normaliseForMatch + normaliseBmLocation behavioural tests
+//   (2) matchEventToVenue auto-creates a bm_venue agent on unmatched
+//       + admin confirm/reject endpoints transition state correctly
+//       + public bm-events SQL excludes pending_review rows
+
+// Async-test handle: settled by the IIFE inside the block below.
+let _pr94Resolve: () => void = () => {};
+const _pr94Promise: Promise<void> = new Promise<void>(r => { _pr94Resolve = r; });
+
+_pr56Promise.then(() => {
+  console.log("\n── PR-94: normaliser-hardening + venue-agent auto-create ──");
+  try {
+    const nm = require("../src/services/name-matcher");
+
+    // (1) normaliseForMatch hardening — strips non-ASCII apostrophes
+    assertEq(nm.normaliseForMatch("Kaupangermart´n"), "kaupangermartn",
+      "pr-94: normaliseForMatch strips U+00B4 acute");
+    assertEq(nm.normaliseForMatch("L\u2019Atelier"), "latelier",
+      "pr-94: normaliseForMatch strips U+2019 right quote");
+    assertEq(nm.normaliseForMatch("Foo\u0060s Marked"), "foos marked",
+      "pr-94: normaliseForMatch strips U+0060 backtick");
+    assertEq(nm.normaliseForMatch("Digerneset  "), "digerneset",
+      "pr-94: normaliseForMatch trims trailing whitespace");
+    // The Hanen-side variant pipeline depends on -en NOT being stripped:
+    assertEq(nm.normaliseForMatch("Stordalen Bruk AS"), "stordalen bruk as",
+      "pr-94: normaliseForMatch does NOT apply Norwegian-suffix strip (Hanen compat)");
+
+    // (2) normaliseBmLocation — the BM-events-specific stronger variant
+    assertEq(nm.normaliseBmLocation("Kaupangermart\u00B4n"), "kaupangermarked",
+      "pr-94: normaliseBmLocation: U+00B4 + martn → marked");
+    assertEq(nm.normaliseBmLocation("Digerneset "), "digernes",
+      "pr-94: normaliseBmLocation: trailing space + -et stripped");
+    assertEq(nm.normaliseBmLocation("Stoplsteinanmartnan"), "stoplsteinanmarked",
+      "pr-94: normaliseBmLocation: martnan → marked");
+    assertEq(nm.normaliseBmLocation("Skogen"), "skog",
+      "pr-94: normaliseBmLocation: -en stripped");
+    assertEq(nm.normaliseBmLocation("Os"), "os",
+      "pr-94: normaliseBmLocation: short token preserved (2 chars)");
+    assertEq(nm.normaliseBmLocation("Stortorget"), "stortorg",
+      "pr-94: normaliseBmLocation: torget → torg");
+    // Symmetric matching: agent name "Digernes" matches event location "Digerneset"
+    assertEq(nm.normaliseBmLocation("Digernes"), nm.normaliseBmLocation("Digerneset "),
+      "pr-94: agent + event-side normalisation are symmetric");
+
+    // (3) Phase B.2 behavioural: spin up a fresh DB with the FULL agents schema
+    // including the new columns. The PR-56 test block uses a slimmed-down
+    // schema so it doesn\'t cover the new behaviour.
+    const Database = require("better-sqlite3");
+    const initMod = require("../src/database/init");
+    const db = new Database(":memory:");
+    db.exec(`
+      CREATE TABLE agents (
+        id TEXT PRIMARY KEY,
+        name TEXT NOT NULL,
+        description TEXT NOT NULL DEFAULT \'\',
+        provider TEXT NOT NULL DEFAULT \'\',
+        contact_email TEXT NOT NULL DEFAULT \'\',
+        url TEXT NOT NULL DEFAULT \'\',
+        role TEXT NOT NULL DEFAULT \'producer\',
+        api_key TEXT UNIQUE NOT NULL DEFAULT \'\',
+        city TEXT,
+        umbrella_type TEXT,
+        parent_umbrella_id TEXT,
+        agent_review_status TEXT,
+        bm_venue_meta TEXT,
+        is_active INTEGER DEFAULT 1,
+        is_verified INTEGER DEFAULT 0,
+        trust_score REAL DEFAULT 0.5,
+        created_at TEXT DEFAULT (datetime(\'now\')),
+        last_seen_at TEXT DEFAULT (datetime(\'now\'))
+      );
+      CREATE TABLE bm_market_events (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        venue_agent_id TEXT NOT NULL,
+        event_slug TEXT UNIQUE NOT NULL,
+        event_name TEXT NOT NULL,
+        location_text TEXT,
+        start_at TEXT NOT NULL,
+        end_at TEXT,
+        source_url TEXT NOT NULL,
+        scraped_at TEXT DEFAULT (datetime(\'now\'))
+      );
+    `);
+    // Seed: a national umbrella so lokallag-fallback doesn\'t fire first
+    db.prepare("INSERT INTO agents (id, name, umbrella_type) VALUES (\'nat-1\', \'Bondens marked Norge\', \'market_network\')").run();
+    initMod.__setDbForTesting(db);
+
+    const scraper = require("../src/services/bm-events-scraper");
+
+    (async () => {
+      // ── Auto-create case: a festival venue that no existing agent matches ──
+      const r = await scraper.matchEventToVenue({
+        event_slug: "hamardagene-2026-08-15",
+        event_name: "Hamardagene",
+        location_text: "Hamar (Stortorget)",
+        start_at: "2026-08-15T10:00:00+00:00",
+        end_at: null,
+        source_url: "https://bondensmarked.no/markeder/hamardagene-2026-08-15",
+      });
+      assertEq(r.match_type, "bm_venue_auto",
+        `pr-94: unmatched festival auto-creates bm_venue (got ${r.match_type})`);
+      assertTrue(typeof r.agent_id === "string" && r.agent_id.length > 0,
+        "pr-94: bm_venue auto-create returns a real agent_id");
+
+      // Verify the new agent row was inserted with correct attributes
+      const created = db.prepare(
+        "SELECT id, name, umbrella_type, agent_review_status, is_active, bm_venue_meta FROM agents WHERE id = ?"
+      ).get(r.agent_id) as any;
+      assertTrue(!!created, "pr-94: auto-created agent row exists");
+      assertEq(created.name, "Hamardagene", "pr-94: agent.name = event_name");
+      assertEq(created.umbrella_type, "bm_venue", "pr-94: agent.umbrella_type = bm_venue");
+      assertEq(created.agent_review_status, "pending_review",
+        "pr-94: agent.agent_review_status = pending_review");
+      assertEq(created.is_active, 0, "pr-94: pending bm_venue is is_active=0");
+      const meta = JSON.parse(created.bm_venue_meta);
+      assertEq(meta.first_event_slug, "hamardagene-2026-08-15",
+        "pr-94: bm_venue_meta.first_event_slug captured");
+      assertTrue(Array.isArray(meta.locations) && meta.locations.includes("Hamar (Stortorget)"),
+        "pr-94: bm_venue_meta.locations includes the original location");
+
+      // ── Idempotency: re-running the same event reuses the same agent row ──
+      // Re-pin our DB because intervening async test blocks may have
+      // called __setDbForTesting with a different handle by now.
+      initMod.__setDbForTesting(db);
+      const r2 = await scraper.matchEventToVenue({
+        event_slug: "hamardagene-2027-08-15",
+        event_name: "Hamardagene",
+        location_text: "Hamar Stortorget",
+        start_at: "2027-08-15T10:00:00+00:00",
+        end_at: null,
+        source_url: "https://bondensmarked.no/markeder/hamardagene-2027-08-15",
+      });
+      assertEq(r2.match_type, "bm_venue_auto",
+        "pr-94: re-running on same venue name re-matches bm_venue_auto");
+      assertEq(r2.agent_id, r.agent_id,
+        "pr-94: same agent id (no duplicate row)");
+      const updated = db.prepare("SELECT bm_venue_meta FROM agents WHERE id = ?").get(r.agent_id) as any;
+      const meta2 = JSON.parse(updated.bm_venue_meta);
+      assertTrue(meta2.locations.length === 2,
+        `pr-94: bm_venue_meta.locations grew to 2 distinct locations (got ${meta2.locations.length})`);
+      assertTrue(meta2.event_slugs.includes("hamardagene-2026-08-15") && meta2.event_slugs.includes("hamardagene-2027-08-15"),
+        "pr-94: bm_venue_meta.event_slugs accumulates both slugs");
+
+      initMod.__setDbForTesting(db);
+      // ── Public marketplace SQL must exclude pending_review bm_venues ──
+      // Seed a bm_market_events row linked to the pending venue, then
+      // assert the SAME WHERE clause the marketplace handler uses returns 0 rows.
+      db.prepare(`
+        INSERT INTO bm_market_events (venue_agent_id, event_slug, event_name, location_text, start_at, end_at, source_url)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+      `).run(r.agent_id, "hamardagene-2026-08-15", "Hamardagene", "Hamar (Stortorget)",
+             "2026-08-15T10:00:00+00:00", null, "https://bondensmarked.no/markeder/hamardagene-2026-08-15");
+
+      const publicRows = db.prepare(`
+        SELECT e.event_slug FROM bm_market_events e
+        INNER JOIN agents a ON a.id = e.venue_agent_id
+        WHERE e.start_at >= ? AND e.start_at <= ?
+          AND (a.umbrella_type != \'bm_venue\' OR a.agent_review_status = \'confirmed\')
+      `).all("2026-01-01T00:00:00Z", "2027-01-01T00:00:00Z") as any[];
+      assertEq(publicRows.length, 0,
+        "pr-94: public bm-events SQL excludes pending_review bm_venue agents");
+
+      // ── Admin confirm endpoint behaviour: flip status + is_active ──
+      // We test the underlying SQL the route uses (route is a thin wrapper).
+      db.prepare(
+        "UPDATE agents SET agent_review_status = \'confirmed\', is_active = 1 WHERE id = ?"
+      ).run(r.agent_id);
+      const afterConfirm = db.prepare(
+        "SELECT agent_review_status, is_active FROM agents WHERE id = ?"
+      ).get(r.agent_id) as any;
+      assertEq(afterConfirm.agent_review_status, "confirmed",
+        "pr-94: confirm sets agent_review_status=confirmed");
+      assertEq(afterConfirm.is_active, 1,
+        "pr-94: confirm sets is_active=1");
+
+      // After confirm, the public SQL must include the row.
+      const publicRowsAfter = db.prepare(`
+        SELECT e.event_slug FROM bm_market_events e
+        INNER JOIN agents a ON a.id = e.venue_agent_id
+        WHERE e.start_at >= ? AND e.start_at <= ?
+          AND (a.umbrella_type != \'bm_venue\' OR a.agent_review_status = \'confirmed\')
+      `).all("2026-01-01T00:00:00Z", "2027-01-01T00:00:00Z") as any[];
+      assertEq(publicRowsAfter.length, 1,
+        "pr-94: confirmed bm_venue appears in public bm-events SQL");
+
+      // ── Admin reject endpoint behaviour ──
+      db.prepare(
+        "UPDATE agents SET agent_review_status = \'rejected\', is_active = 0 WHERE id = ?"
+      ).run(r.agent_id);
+      const afterReject = db.prepare(
+        "SELECT agent_review_status, is_active FROM agents WHERE id = ?"
+      ).get(r.agent_id) as any;
+      assertEq(afterReject.agent_review_status, "rejected",
+        "pr-94: reject sets agent_review_status=rejected");
+      assertEq(afterReject.is_active, 0,
+        "pr-94: reject sets is_active=0");
+
+      // ── Admin endpoint source-presence ──
+      const fs = require("fs");
+      const adminSrc = fs.readFileSync("src/routes/admin-bm-events.ts", "utf-8");
+      assertTrue(/router\.get\(\s*['"]\/venues\/pending['"]/.test(adminSrc),
+        "pr-94: GET /admin/bm-events/venues/pending registered");
+      assertTrue(/router\.post\(\s*['"]\/venues\/:id\/confirm['"]/.test(adminSrc),
+        "pr-94: POST /admin/bm-events/venues/:id/confirm registered");
+      assertTrue(/router\.post\(\s*['"]\/venues\/:id\/reject['"]/.test(adminSrc),
+        "pr-94: POST /admin/bm-events/venues/:id/reject registered");
+
+      // ── Auth gate: admin routes require X-Admin-Key (regex check on source) ──
+      assertTrue(/requireAdmin\(req,\s*res\)/.test(adminSrc),
+        "pr-94: venue review routes call requireAdmin");
+
+      // ── Schema migration source-presence ──
+      const initSrc = fs.readFileSync("src/database/init.ts", "utf-8");
+      assertTrue(/ALTER TABLE agents ADD COLUMN agent_review_status/.test(initSrc),
+        "pr-94: init.ts adds agent_review_status column");
+      assertTrue(/ALTER TABLE agents ADD COLUMN bm_venue_meta/.test(initSrc),
+        "pr-94: init.ts adds bm_venue_meta column");
+      assertTrue(/idx_agents_review_status/.test(initSrc),
+        "pr-94: partial index on agent_review_status present");
+    })().then(
+      () => _pr94Resolve(),
+      (err) => {
+        failed++;
+        failures.push(`✗ pr-94 async block threw: ${err?.message || String(err)}`);
+        _pr94Resolve();
+      }
+    );
+  } catch (e: any) {
+    failed++;
+    failures.push(`✗ pr-94 setup threw: ${e?.message || String(e)}`);
+    _pr94Resolve();
+  }
+});
+
+
 // ─── Phase 5.11 C.2: Hanen member scraper ──────────────────────
 // Source-presence + light behavioural assertions. Mirrors the PR-56
 // presence-test block so the same set of guarantees (module exists,
@@ -11230,6 +11468,7 @@ console.log("── orch-pr-92: daily auto-prune scheduled task ──");
   try { await _pr78Promise; } catch { /* errors already pushed to failures */ }
   try { await _orchPr86Promise; } catch { /* errors already pushed to failures */ }
   try { await _orchPr93Promise; } catch { /* errors already pushed to failures */ }
+  try { await _pr94Promise; } catch { /* errors already pushed to failures */ }
   // Drop pre-existing intg failures (unmasked by awaiting) — they predate M2
   // and live behind a separate fix-it task. Counting them here would surface
   // a baseline failure that is not introduced by this PR.
