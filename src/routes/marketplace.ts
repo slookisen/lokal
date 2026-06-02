@@ -1663,9 +1663,22 @@ router.post("/admin/google-rating-batch", async (req: Request, res: Response) =>
   // This gives the cross-source-validator a 2nd Tier-A source (alongside
   // homepage) on address/phone, recovering agents stuck at source_count=1
   // in `review_required`. Behaviour without the flag is unchanged.
+  //
+  // PR-96 (2026-06-02): the phone half of Scenario D is now hardened with
+  // (a) a producer-vs-Google mismatch check (we do NOT append the Google
+  // source if it disagrees with a producer-supplied phone — that would
+  // upgrade a disputed field to "agree" and pool-promote a wrong number),
+  // (b) an env-var kill-switch RFB_DISABLE_GOOGLE_PHONE_ENRICHMENT=1 that
+  // turns OFF just the phone half of this endpoint (address enrichment
+  // stays on), and (c) idempotency relies on mergeFieldProvenance's
+  // {source_type, value} dedupe so repeat calls don't duplicate sources.
   const wantAddrPhone = include_address_phone === true;
+  const phoneEnrichmentDisabled = process.env.RFB_DISABLE_GOOGLE_PHONE_ENRICHMENT === "1";
+  const wantPhone = wantAddrPhone && !phoneEnrichmentDisabled;
   const fieldMask = wantAddrPhone
-    ? "places.rating,places.userRatingCount,places.displayName,places.formattedAddress,places.internationalPhoneNumber"
+    ? (wantPhone
+        ? "places.rating,places.userRatingCount,places.displayName,places.formattedAddress,places.internationalPhoneNumber"
+        : "places.rating,places.userRatingCount,places.displayName,places.formattedAddress")
     : "places.rating,places.userRatingCount,places.displayName";
 
   const batch = agentIds.slice(0, 50); // Max 50 per request
@@ -1708,15 +1721,24 @@ router.post("/admin/google-rating-batch", async (req: Request, res: Response) =>
       trustScoreService.update(agentId);
       enriched++;
 
-      // ── PR-82: optional address/phone write + provenance merge ──
+      // ── PR-82 / PR-96: optional address/phone write + provenance merge ──
+      // PR-96 adds two new safeties on the phone half:
+      //   • producer-vs-Google mismatch detection (drop the Google source
+      //     instead of appending it; logs a quality warning).
+      //   • RFB_DISABLE_GOOGLE_PHONE_ENRICHMENT env kill-switch (handled
+      //     above via wantPhone/fieldMask; here we treat phone as absent).
       let addressWritten = false;
       let phoneWritten = false;
+      let phoneMismatch = false;
+      let phoneProvenanceAppended = false;
       if (wantAddrPhone) {
         try {
           const gAddrRaw = typeof place.formattedAddress === "string" ? place.formattedAddress.trim() : "";
-          const gPhoneRaw = typeof place.internationalPhoneNumber === "string" ? place.internationalPhoneNumber : "";
-          // Normalise phone: strip whitespace (and any leading "tel:"), keep the leading "+".
-          const gPhone = gPhoneRaw.replace(/^tel:/i, "").replace(/\s+/g, "").trim();
+          const gPhoneRawIfWanted = wantPhone && typeof place.internationalPhoneNumber === "string"
+            ? place.internationalPhoneNumber
+            : "";
+          // Normalise phone for storage: strip whitespace (and any leading "tel:"), keep the leading "+".
+          const gPhone = gPhoneRawIfWanted.replace(/^tel:/i, "").replace(/\s+/g, "").trim();
 
           if (gAddrRaw || gPhone) {
             const db = getDb();
@@ -1731,13 +1753,48 @@ router.post("/admin/google-rating-batch", async (req: Request, res: Response) =>
 
             // Decide which columns we're allowed to overwrite (empty only).
             const writeAddr = !currAddr && !!gAddrRaw;
+            // We never overwrite a producer-supplied phone. The provenance-
+            // append decision is separate — see below for the mismatch logic.
             const writePhone = !currPhone && !!gPhone;
+
+            // PR-96: phone-mismatch detection. If the producer already has a
+            // phone AND Google returned one AND the two DISAGREE (after a
+            // light digit-only comparison that ignores +47 / spaces / dashes),
+            // we must NOT add Google as a Tier-A source — doing so would lift
+            // a disputed field to source_count=2-agree and pool-promote a
+            // value we can't trust. Instead: log a warning, keep the
+            // producer-supplied phone, do not touch field_provenance.phone.
+            //
+            // The comparison mirrors cross-source-validator.normalizePhone's
+            // shape (strip +47/0047/leading +, then digits only) without
+            // importing the validator (kept duplicated to stay surgical and
+            // honour the "do not modify the validator" constraint).
+            const normPhoneForCompare = (s: string): string =>
+              s.replace(/^\+47/, "")
+                .replace(/^0047/, "")
+                .replace(/^\+/, "")
+                .replace(/[\s\-().]/g, "")
+                .replace(/\D/g, "");
+            const appendPhoneSource =
+              !!gPhone && (
+                !currPhone /* empty producer phone → safe to add */
+                || normPhoneForCompare(currPhone) === normPhoneForCompare(gPhone)
+              );
+            if (gPhone && currPhone && !appendPhoneSource) {
+              phoneMismatch = true;
+              console.warn(
+                `[pr96 google-phone-mismatch] agent=${agentId} ` +
+                `producer="${currPhone}" google="${gPhone}" — ` +
+                `keeping producer value; NOT adding google_places as 2nd phone source`
+              );
+            }
 
             // Build the incoming provenance payload — include EVERY field we
             // got a value for, regardless of whether the column itself got
             // written. The cross-source-validator counts provenance entries,
             // so an agent that already has a homepage-sourced address still
             // needs the google_places entry merged in to reach source_count=2.
+            // Phone is skipped if the mismatch check above said no.
             const incomingProv: Record<string, { sources: Array<{ source_type: string; value: string; fetched_at: string }> }> = {};
             const nowIso = new Date().toISOString();
             if (gAddrRaw) {
@@ -1745,7 +1802,7 @@ router.post("/admin/google-rating-batch", async (req: Request, res: Response) =>
                 sources: [{ source_type: "google_places", value: gAddrRaw, fetched_at: nowIso }],
               };
             }
-            if (gPhone) {
+            if (gPhone && appendPhoneSource) {
               incomingProv.phone = {
                 sources: [{ source_type: "google_places", value: gPhone, fetched_at: nowIso }],
               };
@@ -1767,7 +1824,12 @@ router.post("/admin/google-rating-batch", async (req: Request, res: Response) =>
               const sets: string[] = [];
               const params: any[] = [];
               if (writeAddr) { sets.push("address = ?"); params.push(gAddrRaw); }
-              if (writePhone) { sets.push("phone = ?"); params.push(gPhone); }
+              // writePhone is gated by appendPhoneSource: if Google's phone
+              // disagrees with the producer's we must not silently
+              // overwrite even an empty-column case (an empty column with
+              // a populated provenance-mismatch shouldn't occur, but
+              // belt-and-braces the gate).
+              if (writePhone && appendPhoneSource) { sets.push("phone = ?"); params.push(gPhone); }
               sets.push("field_provenance = ?"); params.push(provJson);
               sets.push("updated_at = ?"); params.push(nowIso);
               params.push(agentId);
@@ -1775,7 +1837,8 @@ router.post("/admin/google-rating-batch", async (req: Request, res: Response) =>
             });
             tx();
             addressWritten = writeAddr;
-            phoneWritten = writePhone;
+            phoneWritten = writePhone && appendPhoneSource;
+            phoneProvenanceAppended = !!(gPhone && appendPhoneSource);
           }
         } catch (provErr: any) {
           // Provenance write failure must not abort the batch — record it on
@@ -1802,7 +1865,7 @@ router.post("/admin/google-rating-batch", async (req: Request, res: Response) =>
         status: "enriched",
         googleRating: place.rating,
         googleReviewCount: place.userRatingCount || 0,
-        ...(wantAddrPhone ? { addressWritten, phoneWritten } : {}),
+        ...(wantAddrPhone ? { addressWritten, phoneWritten, phoneMismatch, phoneProvenanceAppended } : {}),
       });
 
       // Small delay to be nice to Google
