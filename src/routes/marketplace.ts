@@ -4077,4 +4077,122 @@ router.get("/bm-events", (req: Request, res: Response) => {
 });
 
 
+// --- GET /api/marketplace/markets/upcoming (PR-98, 2026-06-02) -----
+// Thin REST shadow of the MCP tool `lokal_bm_next_markets`. Lets the
+// Custom GPT (Lokalkjenneren) and any non-MCP client answer
+// "Naar er neste Bondens Marked i Oslo?" without speaking MCP.
+//
+// Mirrors the MCP tool's parameter set (region / lokallag_slug / days)
+// plus a `limit` clamp. Same DB-direct read pattern as /bm-events above;
+// no HTTP loopback. Shape of returned events is normalised to the
+// venue-first object the brief specifies (venue_id, venue_name,
+// venue_slug, venue_city, start_at, end_at, profile_url).
+//
+// Public endpoint -- no admin auth. Inherits generalLimiter via /api.
+router.get("/markets/upcoming", (req: Request, res: Response) => {
+  try {
+    // -- Param parsing + validation --
+    const region = typeof req.query.region === "string" ? req.query.region.trim() : "";
+    const lokallagSlug = typeof req.query.lokallag_slug === "string" ? req.query.lokallag_slug.trim() : "";
+
+    // days: default 30, hard cap 90, reject < 1 / NaN. The MCP tool
+    // clamps silently; here we return 400 so misbehaving clients see
+    // the problem rather than silently getting a different window.
+    const rawDays = req.query.days;
+    let days = 30;
+    if (rawDays !== undefined) {
+      const parsed = parseInt(String(rawDays), 10);
+      if (!Number.isFinite(parsed) || parsed < 1 || parsed > 90) {
+        res.status(400).json({
+          success: false,
+          error: "Invalid 'days' parameter - must be an integer between 1 and 90",
+        });
+        return;
+      }
+      days = parsed;
+    }
+
+    // limit: default 50, clamp to max 100 (silently - matches the
+    // umbrella endpoints' convention).
+    let limit = parseInt(String(req.query.limit ?? "50"), 10);
+    if (!Number.isFinite(limit) || limit < 1) limit = 50;
+    if (limit > 100) limit = 100;
+
+    const fromIso = new Date().toISOString();
+    const toIso = new Date(Date.now() + days * 24 * 60 * 60 * 1000).toISOString();
+
+    const wheres: string[] = ["e.start_at >= ?", "e.start_at <= ?"];
+    // PR-94: exclude unreviewed bm_venue placeholders from public output.
+    wheres.push("(a.umbrella_type != 'bm_venue' OR a.agent_review_status = 'confirmed')");
+    const params: any[] = [fromIso, toIso];
+
+    // -- Resolve lokallag_slug -> agent_id (small set, slugify-compare) --
+    // Same approach as the MCP tool: read the handful of lokallag/venue
+    // rows and match by slugify(name). Avoids needing a slug column.
+    let lokallagId: string | null = null;
+    if (lokallagSlug) {
+      try {
+        const db = getDb();
+        const lokallags = db.prepare(
+          "SELECT id, name FROM agents WHERE umbrella_type IN ('market_network','venue') AND is_active = 1"
+        ).all() as Array<{ id: string; name: string }>;
+        const wanted = lokallagSlug.toLowerCase();
+        const hit = lokallags.find(l => slugify(l.name) === wanted);
+        if (hit) lokallagId = hit.id;
+      } catch { /* table missing - leave null, falls through to empty result */ }
+    }
+    if (lokallagId) {
+      wheres.push("(e.venue_agent_id = ? OR a.parent_umbrella_id = ?)");
+      params.push(lokallagId, lokallagId);
+    }
+    if (region) {
+      wheres.push("LOWER(e.location_text) LIKE ?");
+      params.push(`%${region.toLowerCase()}%`);
+    }
+
+    // -- Query --
+    let rows: any[] = [];
+    try {
+      const db = getDb();
+      rows = db.prepare(`
+        SELECT e.event_slug, e.event_name, e.location_text, e.start_at, e.end_at, e.source_url,
+               a.id AS venue_agent_id, a.name AS venue_name, a.city AS venue_city
+        FROM bm_market_events e
+        INNER JOIN agents a ON a.id = e.venue_agent_id
+        WHERE ${wheres.join(" AND ")}
+        ORDER BY e.start_at ASC
+        LIMIT ?
+      `).all(...params, limit) as any[];
+    } catch {
+      // Mirror the MCP tool's behaviour: missing table / scraper hasn't
+      // run yet -> soft 200 + empty list with a Norwegian note. The
+      // Custom GPT can pass this note straight through to the user.
+      res.json({
+        success: true,
+        count: 0,
+        events: [],
+        note: "Bondens marked-arrangementer er ikke tilgjengelig ennå",
+      });
+      return;
+    }
+
+    const baseUrl = getBaseUrl(req);
+    const events = rows.map(r => ({
+      venue_id: r.venue_agent_id,
+      venue_name: r.venue_name,
+      venue_slug: slugify(r.venue_name),
+      venue_city: r.venue_city || null,
+      start_at: r.start_at,
+      end_at: r.end_at,
+      profile_url: `${baseUrl}/produsent/${slugify(r.venue_name)}`,
+    }));
+
+    res.json({ success: true, count: events.length, events });
+  } catch (err: any) {
+    console.error("[/markets/upcoming] Error:", err);
+    res.status(500).json({ success: false, error: err?.message || "Intern feil" });
+  }
+});
+
+
 export default router;

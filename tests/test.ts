@@ -11729,6 +11729,219 @@ console.log("\n── PR-95: Debio organic-cert verification ──");
 );
 
 
+// ─── PR-98 (2026-06-02): /api/marketplace/markets/upcoming REST endpoint ──
+//
+// Thin REST shadow of the MCP tool `lokal_bm_next_markets`. We spin up a
+// fresh in-memory DB (seeded with a venue + a few events), mount only the
+// marketplace router on a one-off Express app, and exercise the new
+// endpoint via real HTTP. Same pattern as the PR-74 analytics block above.
+//
+// We chain off _pr95Promise (the last block that swaps the global DB via
+// __setDbForTesting) so we get a clean DB to swap in afterwards.
+
+let _pr98Resolve: () => void = () => {};
+const _pr98Promise: Promise<void> = new Promise<void>(r => { _pr98Resolve = r; });
+
+Promise.allSettled([_pr94Promise, _pr95Promise, _pr56Promise, _pr74Promise, _orchPr86Promise, _orchPr93Promise, _pr67Promise, _pr68Promise]).then(async () => {
+  console.log("\n── PR-98: /api/marketplace/markets/upcoming REST shadow of lokal_bm_next_markets ──");
+  try {
+    const fs = require("fs");
+
+    // (1) Source-presence: route registered in marketplace.ts
+    const mpSrc = fs.readFileSync("src/routes/marketplace.ts", "utf-8");
+    assertTrue(
+      /router\.get\(\s*['"]\/markets\/upcoming['"]/.test(mpSrc),
+      "pr-98: GET /markets/upcoming route registered in marketplace.ts"
+    );
+    // (2) Source-presence: the MCP tool we are shadowing still exists.
+    //     We do NOT modify mcp.ts as part of this PR — only mirror it.
+    const mcpSrc = fs.readFileSync("src/routes/mcp.ts", "utf-8");
+    assertTrue(
+      /lokal_bm_next_markets/.test(mcpSrc),
+      "pr-98: existing MCP tool lokal_bm_next_markets is untouched (still present in mcp.ts)"
+    );
+
+    // (3) Behavioural: spin up a fresh DB and hit the endpoint over HTTP.
+    const Database = require("better-sqlite3");
+    const initMod = require("../src/database/init");
+    const db = new Database(":memory:");
+    db.exec(`
+      CREATE TABLE agents (
+        id TEXT PRIMARY KEY,
+        name TEXT NOT NULL,
+        description TEXT NOT NULL DEFAULT '',
+        provider TEXT NOT NULL DEFAULT '',
+        contact_email TEXT NOT NULL DEFAULT '',
+        url TEXT NOT NULL DEFAULT '',
+        role TEXT NOT NULL DEFAULT 'producer',
+        api_key TEXT UNIQUE NOT NULL DEFAULT '',
+        city TEXT,
+        umbrella_type TEXT,
+        parent_umbrella_id TEXT,
+        agent_review_status TEXT,
+        bm_venue_meta TEXT,
+        is_active INTEGER DEFAULT 1,
+        is_verified INTEGER DEFAULT 0,
+        trust_score REAL DEFAULT 0.5,
+        created_at TEXT DEFAULT (datetime('now')),
+        last_seen_at TEXT DEFAULT (datetime('now'))
+      );
+      CREATE TABLE bm_market_events (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        venue_agent_id TEXT NOT NULL,
+        event_slug TEXT UNIQUE NOT NULL,
+        event_name TEXT NOT NULL,
+        location_text TEXT,
+        start_at TEXT NOT NULL,
+        end_at TEXT,
+        source_url TEXT NOT NULL,
+        scraped_at TEXT DEFAULT (datetime('now'))
+      );
+    `);
+    // Tree: national → Bondens Marked Oslo (lokallag, city Oslo) → Birkelunden (venue)
+    // (api_key gets a unique value because the column is UNIQUE NOT NULL DEFAULT '')
+    db.prepare("INSERT INTO agents (id, name, api_key, umbrella_type, city) VALUES ('nat-1', 'Bondens marked Norge', 'k-nat-1', 'market_network', NULL)").run();
+    db.prepare("INSERT INTO agents (id, name, api_key, umbrella_type, parent_umbrella_id, city) VALUES ('lok-oslo', 'Bondens Marked Oslo', 'k-lok-oslo', 'market_network', 'nat-1', 'Oslo')").run();
+    db.prepare("INSERT INTO agents (id, name, api_key, umbrella_type, parent_umbrella_id, city) VALUES ('ven-birk', 'Bondens Marked Birkelunden', 'k-ven-birk', 'venue', 'lok-oslo', 'Oslo')").run();
+    db.prepare("INSERT INTO agents (id, name, api_key, umbrella_type, parent_umbrella_id, city) VALUES ('ven-bergen', 'Bondens Marked Bergen Torgallmenningen', 'k-ven-bergen', 'venue', NULL, 'Bergen')").run();
+
+    // Seed 3 upcoming Oslo events + 1 Bergen event. Using fixed future dates
+    // so the "start_at >= now" filter always includes them — the test runs
+    // at 2026-06-02, these events live in June/July 2026.
+    const futureA = "2026-06-15T08:00:00.000Z";
+    const futureB = "2026-06-22T08:00:00.000Z";
+    const futureC = "2026-06-29T08:00:00.000Z";
+    const futureBergen = "2026-06-20T09:00:00.000Z";
+    db.prepare("INSERT INTO bm_market_events (venue_agent_id, event_slug, event_name, location_text, start_at, end_at, source_url) VALUES (?, ?, ?, ?, ?, ?, ?)").run(
+      "ven-birk", "birkelunden-2026-06-15", "Bondens Marked Birkelunden", "Oslo", futureA, "2026-06-15T14:00:00.000Z", "https://bondensmarked.no/markeder/birkelunden-2026-06-15"
+    );
+    db.prepare("INSERT INTO bm_market_events (venue_agent_id, event_slug, event_name, location_text, start_at, end_at, source_url) VALUES (?, ?, ?, ?, ?, ?, ?)").run(
+      "ven-birk", "birkelunden-2026-06-22", "Bondens Marked Birkelunden", "Oslo", futureB, "2026-06-22T14:00:00.000Z", "https://bondensmarked.no/markeder/birkelunden-2026-06-22"
+    );
+    db.prepare("INSERT INTO bm_market_events (venue_agent_id, event_slug, event_name, location_text, start_at, end_at, source_url) VALUES (?, ?, ?, ?, ?, ?, ?)").run(
+      "ven-birk", "birkelunden-2026-06-29", "Bondens Marked Birkelunden", "Oslo", futureC, "2026-06-29T14:00:00.000Z", "https://bondensmarked.no/markeder/birkelunden-2026-06-29"
+    );
+    db.prepare("INSERT INTO bm_market_events (venue_agent_id, event_slug, event_name, location_text, start_at, end_at, source_url) VALUES (?, ?, ?, ?, ?, ?, ?)").run(
+      "ven-bergen", "bergen-torg-2026-06-20", "Bondens Marked Bergen", "Bergen", futureBergen, "2026-06-20T14:00:00.000Z", "https://bondensmarked.no/markeder/bergen-torg-2026-06-20"
+    );
+    initMod.__setDbForTesting(db);
+
+    // Mount only the marketplace router.
+    const marketplaceRouter = require("../src/routes/marketplace").default;
+    const expressMod = (await import("express")).default;
+    const app = expressMod();
+    app.use(expressMod.json());
+    app.use("/api/marketplace", marketplaceRouter);
+    const httpMod = await import("http");
+    const server = httpMod.createServer(app);
+    await new Promise<void>(r => server.listen(0, "127.0.0.1", () => r()));
+    const addr = server.address();
+    const port = typeof addr === "object" && addr ? addr.port : 0;
+
+    function call(urlPath: string): Promise<{ status: number; body: any }> {
+      // Defensive re-pin of the global DB on every call. Other async test
+      // blocks (PR-67 calls __setDbForTesting(null), PR-74/PR-86/PR-93 each
+      // pin their own DB) may run on different microtask ticks and steal
+      // the singleton between PR-98 calls. The pin is cheap; the race is
+      // expensive to debug otherwise.
+      initMod.__setDbForTesting(db);
+      return new Promise(resolve => {
+        const req = httpMod.request({
+          host: "127.0.0.1",
+          port,
+          path: urlPath,
+          method: "GET",
+        }, (res: any) => {
+          let buf = "";
+          res.on("data", (c: any) => buf += c);
+          res.on("end", () => {
+            let body: any = null;
+            try { body = JSON.parse(buf); } catch { body = buf; }
+            resolve({ status: res.statusCode, body });
+          });
+        });
+        req.on("error", () => resolve({ status: 0, body: null }));
+        req.end();
+      });
+    }
+
+    // We need to widen the look-ahead because the futureA/B/C dates are
+    // 13-27 days from 2026-06-02 (test "today"). Default days=30 covers
+    // them. Use days=90 for safety where appropriate.
+
+    // Test 1: region=Oslo returns 200 + 3 events with correct shape
+    const r1 = await call("/api/marketplace/markets/upcoming?region=Oslo&days=90");
+    assertEq(r1.status, 200, "pr-98: region=Oslo returns 200");
+    assertTrue(r1.body && r1.body.success === true, "pr-98: region=Oslo response.success === true");
+    assertEq(r1.body.count, 3, "pr-98: region=Oslo returns 3 Oslo events");
+    assertTrue(Array.isArray(r1.body.events), "pr-98: events is an array");
+    assertEq(r1.body.events.length, 3, "pr-98: events array has 3 entries");
+    // Shape: brief specifies venue_id, venue_name, venue_slug, venue_city, start_at, end_at, profile_url
+    const ev = r1.body.events[0];
+    assertEq(ev.venue_id, "ven-birk", "pr-98: event.venue_id wired from venue_agent_id");
+    assertEq(ev.venue_name, "Bondens Marked Birkelunden", "pr-98: event.venue_name wired from agents.name");
+    assertEq(ev.venue_slug, "bondens-marked-birkelunden", "pr-98: event.venue_slug derived via slugify(venue_name)");
+    assertEq(ev.venue_city, "Oslo", "pr-98: event.venue_city wired from agents.city");
+    assertEq(ev.start_at, futureA, "pr-98: events ordered by start_at ASC (earliest first)");
+    assertTrue(typeof ev.profile_url === "string" && /\/produsent\/bondens-marked-birkelunden/.test(ev.profile_url),
+      "pr-98: event.profile_url contains /produsent/<venue-slug>");
+    // Bergen event must NOT leak into Oslo region
+    assertTrue(
+      r1.body.events.every((e: any) => e.venue_city === "Oslo"),
+      "pr-98: region=Oslo never includes Bergen-city venues"
+    );
+
+    // Test 2: empty-result path returns 200 + count=0 + empty events array.
+    // Use a region that matches nothing.
+    const r2 = await call("/api/marketplace/markets/upcoming?region=NoSuchCityXYZ&days=90");
+    assertEq(r2.status, 200, "pr-98: no-data path returns 200 (soft-empty, not 404/500)");
+    assertEq(r2.body.success, true, "pr-98: no-data path keeps success:true");
+    assertEq(r2.body.count, 0, "pr-98: no-data path returns count=0");
+    assertTrue(Array.isArray(r2.body.events) && r2.body.events.length === 0,
+      "pr-98: no-data path returns empty events array");
+
+    // Test 3: invalid `days` parameter returns 400.
+    const r3a = await call("/api/marketplace/markets/upcoming?days=-5");
+    assertEq(r3a.status, 400, "pr-98: days=-5 returns 400");
+    assertEq(r3a.body.success, false, "pr-98: days=-5 response.success === false");
+    assertTrue(/days/.test(String(r3a.body.error || "")), "pr-98: days=-5 error mentions 'days'");
+    const r3b = await call("/api/marketplace/markets/upcoming?days=200");
+    assertEq(r3b.status, 400, "pr-98: days=200 (above max 90) returns 400");
+    const r3c = await call("/api/marketplace/markets/upcoming?days=notanumber");
+    assertEq(r3c.status, 400, "pr-98: days=notanumber returns 400");
+
+    // Test 4: limit is clamped to max 100 (silent clamp; not a 400).
+    // Seed 105 future events for a fresh venue and ask for limit=200.
+    db.prepare("INSERT INTO agents (id, name, api_key, umbrella_type, parent_umbrella_id, city) VALUES ('ven-clamp', 'Bondens Marked Clamp Test', 'k-ven-clamp', 'venue', 'lok-oslo', 'Oslo')").run();
+    const baseTs = Date.parse("2026-06-04T08:00:00.000Z");
+    const stmt = db.prepare("INSERT INTO bm_market_events (venue_agent_id, event_slug, event_name, location_text, start_at, end_at, source_url) VALUES (?, ?, ?, ?, ?, ?, ?)");
+    for (let i = 0; i < 105; i++) {
+      const startMs = baseTs + i * 60 * 60 * 1000; // 1 hour apart
+      const startIso = new Date(startMs).toISOString();
+      const endIso = new Date(startMs + 30 * 60 * 1000).toISOString();
+      stmt.run("ven-clamp", `clamp-${i}`, `Clamp Event ${i}`, "Oslo", startIso, endIso, `https://bondensmarked.no/markeder/clamp-${i}`);
+    }
+    const r4 = await call("/api/marketplace/markets/upcoming?region=Oslo&days=90&limit=200");
+    assertEq(r4.status, 200, "pr-98: limit=200 returns 200 (clamped silently)");
+    assertTrue(r4.body.count <= 100,
+      `pr-98: limit=200 is clamped to <=100 (got ${r4.body.count})`);
+    assertEq(r4.body.events.length, r4.body.count,
+      "pr-98: events.length === count after clamp");
+
+    server.close();
+  } catch (e: any) {
+    failed++;
+    failures.push(`✗ pr-98 block threw: ${e?.message || String(e)}`);
+  } finally {
+    _pr98Resolve();
+  }
+}).catch((err: any) => {
+  failed++;
+  failures.push(`✗ pr-98 chain threw: ${err?.message || String(err)}`);
+  _pr98Resolve();
+});
+
+
 // ── REPORT ────────────────────────────────────────────────────────────
 
 // Wait for the M2 owner-portal async tests before reporting so their
@@ -11753,6 +11966,7 @@ console.log("\n── PR-95: Debio organic-cert verification ──");
   try { await _orchPr93Promise; } catch { /* errors already pushed to failures */ }
   try { await _pr94Promise; } catch { /* errors already pushed to failures */ }
   try { await _pr95Promise; } catch { /* errors already pushed to failures */ }
+  try { await _pr98Promise; } catch { /* errors already pushed to failures */ }
   // Drop pre-existing intg failures (unmasked by awaiting) — they predate M2
   // and live behind a separate fix-it task. Counting them here would surface
   // a baseline failure that is not introduced by this PR.
