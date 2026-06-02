@@ -417,6 +417,22 @@ router.get("/.well-known/mcp", (_req: Request, res: Response) => {
 });
 
 // ═══════════════════════════════════════════════════════════════
+// GET /.well-known/openai-apps-challenge — OpenAI Apps Directory
+//
+// WHY: OpenAI's Apps Directory submission requires a static-string
+// domain-verification endpoint at this exact path. The token bytes
+// are the literal response body (no JSON wrapper, no whitespace).
+// PR-99 (2026-06-02) adds this to unblock directory submission.
+// ═══════════════════════════════════════════════════════════════
+
+router.get("/.well-known/openai-apps-challenge", (_req: Request, res: Response) => {
+  res.header("Content-Type", "text/plain");
+  res.header("Cache-Control", "public, max-age=300");
+  res.header("X-Content-Type-Options", "nosniff");
+  res.send("Q55WyxDBeeampevhr0r9mC_tm1KG7cmvE1229zI9Qng");
+});
+
+// ═══════════════════════════════════════════════════════════════
 // GET /.well-known/ai-plugin.json — ChatGPT plugin manifest
 //
 // WHY: although OpenAI deprecated plugins in favor of GPTs, the
