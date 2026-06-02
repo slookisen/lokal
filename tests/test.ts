@@ -11750,7 +11750,7 @@ console.log("\n── PR-99: openai-apps-challenge + read-only MCP annotations �
     "pr99-A: discovery.ts registers GET /.well-known/openai-apps-challenge"
   );
   assertTrue(
-    discSrcPr99.includes('"Q55WyxDBeeampevhr0r9mC_tm1KG7cmvE1229zI9Qng"'),
+    discSrcPr99.includes('"Q55WyxDBeeampevhr0r9mC_tm1KG7cmvEl229zI9Qng"'),
     "pr99-A: route returns the literal OpenAI Apps Directory verification token"
   );
 
@@ -11817,3 +11817,4 @@ console.log("\n── PR-99: openai-apps-challenge + read-only MCP annotations �
   // PR-32: explicit exit prevents CI hangs from dangling handles (e.g. seo router require)
   process.exit(0);
 })();
+
