@@ -429,7 +429,7 @@ router.get("/.well-known/openai-apps-challenge", (_req: Request, res: Response) 
   res.header("Content-Type", "text/plain");
   res.header("Cache-Control", "public, max-age=300");
   res.header("X-Content-Type-Options", "nosniff");
-  res.send("Q55WyxDBeeampevhr0r9mC_tm1KG7cmvE1229zI9Qng");
+  res.send("Q55WyxDBeeampevhr0r9mC_tm1KG7cmvEl229zI9Qng");
 });
 
 // ═══════════════════════════════════════════════════════════════
@@ -1072,3 +1072,4 @@ Operator: Daniel Fredriksen, Norway.</p>
 });
 
 export default router;
+
