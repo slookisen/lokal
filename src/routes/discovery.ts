@@ -429,6 +429,7 @@ router.get("/.well-known/openai-apps-challenge", (_req: Request, res: Response) 
   res.header("Content-Type", "text/plain");
   res.header("Cache-Control", "public, max-age=300");
   res.header("X-Content-Type-Options", "nosniff");
+  /* pr-99b-ci-retry-2026-06-02 */
   res.send("Q55WyxDBeeampevhr0r9mC_tm1KG7cmvEl229zI9Qng");
 });
 
