@@ -11729,6 +11729,51 @@ console.log("\n── PR-95: Debio organic-cert verification ──");
 );
 
 
+// ── PR-99: openai-apps-challenge + read-only MCP annotations ─────────
+// Source-presence assertions (same safe pattern as PR-73 above): we
+// assert the well-known route and tool annotations are present in
+// source. Booting an Express server inside this test file would race
+// the m2 owner-portal DB singleton (the exact pattern that broke PR-96
+// and PR-98 today, 2026-06-02). The live response is covered by the
+// post-deploy visibility-check task.
+console.log("\n── PR-99: openai-apps-challenge + read-only MCP annotations ──");
+{
+  const fsPr99 = require("fs") as typeof import("fs");
+  const discSrcPr99 = fsPr99.readFileSync("src/routes/discovery.ts", "utf8");
+  const mcpSrcPr99 = fsPr99.readFileSync("src/routes/mcp.ts", "utf8");
+
+  // Part A — /.well-known/openai-apps-challenge route exists, mounted
+  // under the same router as other well-known endpoints, and returns
+  // the static verification token verbatim.
+  assertTrue(
+    discSrcPr99.includes('router.get("/.well-known/openai-apps-challenge"'),
+    "pr99-A: discovery.ts registers GET /.well-known/openai-apps-challenge"
+  );
+  assertTrue(
+    discSrcPr99.includes('"Q55WyxDBeeampevhr0r9mC_tm1KG7cmvE1229zI9Qng"'),
+    "pr99-A: route returns the literal OpenAI Apps Directory verification token"
+  );
+
+  // Part B — lokal_search and lokal_discover must declare readOnlyHint:true.
+  // Both perform read-only DB queries; the previous 'false' value confused
+  // ChatGPT's Apps Directory tool-classifier into treating them as writes.
+  // Anchor each substring on the unique annotations-block opening so the
+  // grep can't accidentally match the outer tool-config `title:` line.
+  assertTrue(
+    mcpSrcPr99.includes(
+      'annotations: {\n        title: "Search local food producers",\n        readOnlyHint: true,'
+    ),
+    "pr99-B: lokal_search tool annotations declare readOnlyHint: true"
+  );
+  assertTrue(
+    mcpSrcPr99.includes(
+      'annotations: {\n        title: "Discover producers by filter",\n        readOnlyHint: true,'
+    ),
+    "pr99-B: lokal_discover tool annotations declare readOnlyHint: true"
+  );
+}
+
+
 // ── REPORT ────────────────────────────────────────────────────────────
 
 // Wait for the M2 owner-portal async tests before reporting so their

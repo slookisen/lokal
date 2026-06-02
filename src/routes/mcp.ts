@@ -117,7 +117,7 @@ function registerTools(server: McpServer, getClientIdentity?: () => string | und
       },
       annotations: {
         title: "Search local food producers",
-        readOnlyHint: false,
+        readOnlyHint: true,
         destructiveHint: false,
         idempotentHint: false,
         openWorldHint: false,
@@ -209,7 +209,7 @@ function registerTools(server: McpServer, getClientIdentity?: () => string | und
       },
       annotations: {
         title: "Discover producers by filter",
-        readOnlyHint: false,
+        readOnlyHint: true,
         destructiveHint: false,
         idempotentHint: false,
         openWorldHint: false,
