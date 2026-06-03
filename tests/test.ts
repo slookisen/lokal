@@ -11780,15 +11780,22 @@ console.log("\n── PR-99: openai-apps-challenge + read-only MCP annotations �
 // server, no __setDbForTesting, no race against rfb singletons.
 // Each test asserts (a) Zod validation, (b) round-trip through
 // updateDentalAgent + getDentalAgentById, (c) negative cases.
+//
+// Synchronous IIFE (no async) — better-sqlite3 is sync, and an async
+// block here would perturb the _m2Promise event-loop ordering and
+// surface the pre-existing magic_links race in CI (it doesn't hit
+// locally on every run, but CI's deterministic ordering makes it
+// reliable). Using require() + sync makes pr100 a strictly serial
+// extension to the existing top-level synchronous test block.
 console.log("\n── PR-100: dental schema extension ──");
-const _pr100Promise = (async () => {
+(() => {
   const prevPathPr100 = process.env.DENTAL_DB_PATH;
   process.env.DENTAL_DB_PATH = ":memory:";
 
-  const dbFactoryPr100 = await import("../src/database/db-factory");
+  const dbFactoryPr100 = require("../src/database/db-factory") as typeof import("../src/database/db-factory");
   dbFactoryPr100.__resetDbFactoryForTesting();
 
-  const storePr100 = await import("../src/services/dental-store");
+  const storePr100 = require("../src/services/dental-store") as typeof import("../src/services/dental-store");
   const {
     createDentalAgent,
     updateDentalAgent,
@@ -12068,10 +12075,7 @@ const _pr100Promise = (async () => {
     process.env.DENTAL_DB_PATH = prevPathPr100;
   }
   dbFactoryPr100.__resetDbFactoryForTesting();
-})().catch((e) => {
-  failed++;
-  failures.push(`✗ pr100: unexpected error: ${e instanceof Error ? e.message : String(e)}`);
-});
+})();
 
 
 // ── REPORT ────────────────────────────────────────────────────────────
@@ -12098,7 +12102,6 @@ const _pr100Promise = (async () => {
   try { await _orchPr93Promise; } catch { /* errors already pushed to failures */ }
   try { await _pr94Promise; } catch { /* errors already pushed to failures */ }
   try { await _pr95Promise; } catch { /* errors already pushed to failures */ }
-  try { await _pr100Promise; } catch { /* errors already pushed to failures */ }
   // Drop pre-existing intg failures (unmasked by awaiting) — they predate M2
   // and live behind a separate fix-it task. Counting them here would surface
   // a baseline failure that is not introduced by this PR.
