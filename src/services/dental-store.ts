@@ -54,6 +54,65 @@ export const DentalAgentSchema = z.object({
   available_specialties: z.array(z.string()).optional(),
   enrichment_state: z.string().optional(),
   verification_status: VerificationStatusSchema.optional(),
+
+  // ─── PR-100: geocoding fields (6) ──────────────────────────────────
+  lat: z.number().min(-90).max(90).optional().nullable(),
+  lng: z.number().min(-180).max(180).optional().nullable(),
+  geocode_source: z.enum(["kartverket", "google_places", "manual"]).optional().nullable(),
+  geocode_confidence: z.enum(["high", "medium", "low"]).optional().nullable(),
+  opening_hours: z
+    .array(
+      z.object({
+        day: z.enum(["mon", "tue", "wed", "thu", "fri", "sat", "sun"]),
+        open: z.string().regex(/^\d{2}:\d{2}$/),
+        close: z.string().regex(/^\d{2}:\d{2}$/),
+      })
+    )
+    .optional()
+    .nullable(),
+  field_provenance: z.record(z.string(), z.unknown()).optional().nullable(),
+
+  // ─── PR-100: deep-scrape fields (10) ───────────────────────────────
+  om_oss: z.string().max(2000).optional().nullable(),
+  specialists: z
+    .array(
+      z.object({
+        name: z.string(),
+        title: z.string().optional(),
+        specialty: z.string().optional(),
+      })
+    )
+    .optional()
+    .nullable(),
+  treatment_tech: z
+    .array(
+      z.enum([
+        "intraoral_camera",
+        "3d_scanner",
+        "laser",
+        "cad_cam",
+        "panorama_xray",
+        "cbct",
+        "sedation",
+        "microscope",
+      ])
+    )
+    .optional()
+    .nullable(),
+  equipment_brands: z.record(z.string(), z.array(z.string())).optional().nullable(),
+  patient_focus: z.array(z.string()).optional().nullable(),
+  accessibility: z.array(z.string()).optional().nullable(),
+  payment_options: z.array(z.string()).optional().nullable(),
+  online_booking_url: z.string().url().optional().nullable(),
+  social_media: z
+    .object({
+      facebook: z.string().url().optional().nullable(),
+      instagram: z.string().url().optional().nullable(),
+      linkedin: z.string().url().optional().nullable(),
+    })
+    .optional()
+    .nullable(),
+  treatments_subtypes: z.record(z.string(), z.array(z.string())).optional().nullable(),
 });
 export type DentalAgent = z.infer<typeof DentalAgentSchema>;
 
@@ -116,6 +175,28 @@ function parseJsonArray(value: unknown): string[] {
   }
 }
 
+// PR-100: parse arbitrary JSON column (object or array). Returns null
+// on missing / invalid input so the hydrated DentalAgent stays
+// well-typed. Used by all new JSON columns (specialists, opening_hours,
+// equipment_brands, social_media, field_provenance, treatments_subtypes,
+// treatment_tech, patient_focus, accessibility, payment_options).
+function parseJsonOrNull(value: unknown): unknown {
+  if (value === null || value === undefined || value === "") return null;
+  if (typeof value !== "string") return null;
+  try {
+    return JSON.parse(value);
+  } catch {
+    return null;
+  }
+}
+
+// PR-100: stringify a JS value for the JSON-typed columns above. null /
+// undefined → null (do NOT stringify "null" into the column).
+function stringifyJsonOrNull(value: unknown): string | null {
+  if (value === null || value === undefined) return null;
+  return JSON.stringify(value);
+}
+
 // Hydrate raw SQLite row into a typed DentalAgent (parses JSON cols).
 function hydrateAgent(row: Record<string, unknown>): DentalAgent & {
   id: string;
@@ -150,6 +231,28 @@ function hydrateAgent(row: Record<string, unknown>): DentalAgent & {
     verification_status:
       (row.verification_status as DentalAgent["verification_status"]) ??
       "pending_verify",
+
+    // ─── PR-100: geocoding fields ────────────────────────────────────
+    lat: (row.lat as number | null) ?? null,
+    lng: (row.lng as number | null) ?? null,
+    geocode_source:
+      (row.geocode_source as DentalAgent["geocode_source"]) ?? null,
+    geocode_confidence:
+      (row.geocode_confidence as DentalAgent["geocode_confidence"]) ?? null,
+    opening_hours: parseJsonOrNull(row.opening_hours) as DentalAgent["opening_hours"],
+    field_provenance: parseJsonOrNull(row.field_provenance) as DentalAgent["field_provenance"],
+
+    // ─── PR-100: deep-scrape fields ──────────────────────────────────
+    om_oss: (row.om_oss as string | null) ?? null,
+    specialists: parseJsonOrNull(row.specialists) as DentalAgent["specialists"],
+    treatment_tech: parseJsonOrNull(row.treatment_tech) as DentalAgent["treatment_tech"],
+    equipment_brands: parseJsonOrNull(row.equipment_brands) as DentalAgent["equipment_brands"],
+    patient_focus: parseJsonOrNull(row.patient_focus) as DentalAgent["patient_focus"],
+    accessibility: parseJsonOrNull(row.accessibility) as DentalAgent["accessibility"],
+    payment_options: parseJsonOrNull(row.payment_options) as DentalAgent["payment_options"],
+    online_booking_url: (row.online_booking_url as string | null) ?? null,
+    social_media: parseJsonOrNull(row.social_media) as DentalAgent["social_media"],
+    treatments_subtypes: parseJsonOrNull(row.treatments_subtypes) as DentalAgent["treatments_subtypes"],
   };
 }
 
@@ -505,7 +608,43 @@ export function updateDentalAgent(
     "chain_parent_orgnr",
     "enrichment_state",
     "verification_status",
+    // PR-100: geocoding (6)
+    "lat",
+    "lng",
+    "geocode_source",
+    "geocode_confidence",
+    "opening_hours",
+    "field_provenance",
+    // PR-100: deep-scrape (10)
+    "om_oss",
+    "specialists",
+    "treatment_tech",
+    "equipment_brands",
+    "patient_focus",
+    "accessibility",
+    "payment_options",
+    "online_booking_url",
+    "social_media",
+    "treatments_subtypes",
   ];
+
+  // PR-100: columns that must be JSON.stringify'd before SQL bind.
+  // Mirrors the existing pattern for treatments / languages_spoken.
+  const jsonCols = new Set<keyof DentalAgent>([
+    "treatments",
+    "languages_spoken",
+    // PR-100 JSON-typed columns
+    "opening_hours",
+    "field_provenance",
+    "specialists",
+    "treatment_tech",
+    "equipment_brands",
+    "patient_focus",
+    "accessibility",
+    "payment_options",
+    "social_media",
+    "treatments_subtypes",
+  ]);
 
   const sets: string[] = [];
   const params: Record<string, unknown> = { id };
@@ -516,6 +655,9 @@ export function updateDentalAgent(
     if (key === "treatments" || key === "languages_spoken") {
       sets.push(`${key} = @${key}`);
       params[key] = jsonOrNull(raw as string[] | undefined);
+    } else if (jsonCols.has(key)) {
+      sets.push(`${key} = @${key}`);
+      params[key] = stringifyJsonOrNull(raw);
     } else {
       sets.push(`${key} = @${key}`);
       params[key] = raw ?? null;

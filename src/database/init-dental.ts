@@ -201,5 +201,44 @@ export function initDentalSchema(db: Database.Database): void {
     }
   }
 
+  // ─── PR-100: additive schema extension for enrichment pipeline v1.3 ───
+  // Adds 16 columns to dental_agents (6 geocoding + 10 deep-scrape).
+  // Idempotent: PRAGMA table_info() gate ensures running twice is a no-op.
+  // ALL columns are nullable TEXT/REAL — no backfill required, no breaking
+  // change to existing reads. JSON columns are stored as TEXT.
+  try {
+    const existingColumns = new Set(
+      (db.prepare('PRAGMA table_info(dental_agents)').all() as Array<{ name: string }>)
+        .map((r) => r.name)
+    );
+    const newColumns: Array<[string, string]> = [
+      // Geocoding (6)
+      ['lat', 'REAL'],
+      ['lng', 'REAL'],
+      ['geocode_source', 'TEXT'],
+      ['geocode_confidence', 'TEXT'],
+      ['opening_hours', 'TEXT'],
+      ['field_provenance', 'TEXT'],
+      // Deep-scrape (10)
+      ['om_oss', 'TEXT'],
+      ['specialists', 'TEXT'],
+      ['treatment_tech', 'TEXT'],
+      ['equipment_brands', 'TEXT'],
+      ['patient_focus', 'TEXT'],
+      ['accessibility', 'TEXT'],
+      ['payment_options', 'TEXT'],
+      ['online_booking_url', 'TEXT'],
+      ['social_media', 'TEXT'],
+      ['treatments_subtypes', 'TEXT'],
+    ];
+    for (const [name, type] of newColumns) {
+      if (!existingColumns.has(name)) {
+        db.exec(`ALTER TABLE dental_agents ADD COLUMN ${name} ${type}`);
+      }
+    }
+  } catch (e) {
+    console.log(`[dental] PR-100 column extension skipped: ${(e as Error).message}`);
+  }
+
   console.log("[dental] schema initialized");
 }
