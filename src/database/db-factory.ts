@@ -7,9 +7,9 @@
 // CRITICAL ISOLATION INVARIANT (Daniel-req 2026-05-27):
 //   - `rfb` ALWAYS returns the existing rfb handle from src/database/init.ts.
 //     This module MUST NOT mutate, re-open, or alter that DB in any way.
-//   - Any other vertical opens its OWN file at /data/<vertical>.db.
+//   - Any other vertical opens its OWN file at /app/data/<vertical>.db.
 //     A code-bug in dental-store.ts can write/delete arbitrarily inside
-//     /data/dental.db, but cannot touch /data/lokal.db — they're physically
+//     /app/data/dental.db, but cannot touch /app/data/lokal.db — they're physically
 //     different files on the same volume.
 //
 // See PHASE6-ARCH-DECISION-SEPARATE-DB.md (Option B) for full rationale.
@@ -38,7 +38,7 @@ const handles = new Map<string, DbHandle>();
  * Return a DB handle for the given vertical.
  *
  * - `rfb` → delegates to src/database/init.ts (unchanged path).
- * - any other vertical → opens /data/<vertical>.db (or the path
+ * - any other vertical → opens /app/data/<vertical>.db (or the path
  *   from `<VERTICAL>_DB_PATH` env, useful in test/dev).
  *
  * First call for a non-rfb vertical triggers schema-init. Subsequent
@@ -54,11 +54,12 @@ export function getDb(vertical: string): DbHandle {
   const cached = handles.get(vertical);
   if (cached) return cached;
 
-  // Resolve path: env override first, otherwise /data/<vertical>.db.
+  // Resolve path: env override first, otherwise /app/data/<vertical>.db
+  // (the Fly persistent volume mount — see fly.toml [[mounts]] destination).
   // In dev/test you typically set DENTAL_DB_PATH=./data/dental.db
   // (or :memory: for unit tests).
   const envKey = `${vertical.toUpperCase()}_DB_PATH`;
-  const dbPath = process.env[envKey] || `/data/${vertical}.db`;
+  const dbPath = process.env[envKey] || `/app/data/${vertical}.db`;
 
   // Ensure parent dir exists (mirrors init.ts behaviour).
   // Skip for :memory: which has no filesystem path.
@@ -70,6 +71,7 @@ export function getDb(vertical: string): DbHandle {
   }
 
   const db = new Database(dbPath);
+  console.log(`[db-factory] vertical=${vertical} opened at ${dbPath}`);
 
   // Performance + safety pragmas. WAL falls back to DELETE on
   // filesystems that don't support it (Windows mount points etc.) —
