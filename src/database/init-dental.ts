@@ -240,5 +240,30 @@ export function initDentalSchema(db: Database.Database): void {
     console.log(`[dental] PR-100 column extension skipped: ${(e as Error).message}`);
   }
 
+  // ─── PR-104 (2026-06-03): Multi-worker record-claim infrastructure ───
+  //   - worker_id: which scheduled-task / process has claimed this record.
+  //   - claimed_at: Unix epoch ms when claim was made. Auto-released after
+  //     CLAIM_TIMEOUT_MS (30 min) so a crashed worker doesn't lock records
+  //     forever.
+  const pr104Cols = [
+    { name: "worker_id", sql: "ALTER TABLE dental_agents ADD COLUMN worker_id TEXT" },
+    { name: "claimed_at", sql: "ALTER TABLE dental_agents ADD COLUMN claimed_at INTEGER" },
+  ];
+  for (const { name, sql } of pr104Cols) {
+    try {
+      db.exec(sql);
+      console.log(`[init-dental] added column ${name}`);
+    } catch (err: any) {
+      if (!String(err.message ?? err).includes("duplicate column name")) throw err;
+    }
+  }
+
+  // Index for claim queries — speeds up SELECT WHERE worker_id IS NULL AND ...
+  try {
+    db.exec("CREATE INDEX IF NOT EXISTS idx_dental_claim ON dental_agents (worker_id, claimed_at)");
+  } catch (err) {
+    console.warn("[init-dental] PR-104 index creation warning:", err);
+  }
+
   console.log("[dental] schema initialized");
 }

@@ -294,4 +294,56 @@ router.post("/agents/bulk-import", requireAdmin, (req: Request, res: Response) =
   }
 });
 
+// ─── PR-104: Multi-worker record-claim endpoints ────────────────────
+// Mounted under /api/tannlege/admin/* (tannlege router is mounted at
+// /api/tannlege in src/index.ts). So full paths become:
+//   POST /api/tannlege/admin/claim-batch
+//   POST /api/tannlege/admin/release-batch
+//   GET  /api/tannlege/admin/claim-status
+
+// POST /api/tannlege/admin/claim-batch
+// Body: { worker_id: string, size: number, filter: {...} }
+// Returns: { claimed: ClaimedRecord[], count: number }
+router.post("/admin/claim-batch", requireAdmin, (req: Request, res: Response) => {
+  try {
+    const { claimBatch } = require("../services/dental-claim-service") as typeof import("../services/dental-claim-service");
+    const { worker_id, size, filter } = req.body ?? {};
+    if (typeof worker_id !== "string" || typeof size !== "number" || typeof filter !== "object") {
+      res.status(400).json({ error: "Invalid body: need {worker_id, size, filter}" });
+      return;
+    }
+    const claimed = claimBatch(worker_id, size, filter ?? {});
+    res.json({ claimed, count: claimed.length });
+  } catch (err: any) {
+    res.status(400).json({ error: err.message ?? "Internal error" });
+  }
+});
+
+// POST /api/tannlege/admin/release-batch
+// Body: { worker_id: string, ids: string[] }
+router.post("/admin/release-batch", requireAdmin, (req: Request, res: Response) => {
+  try {
+    const { releaseBatch } = require("../services/dental-claim-service") as typeof import("../services/dental-claim-service");
+    const { worker_id, ids } = req.body ?? {};
+    if (typeof worker_id !== "string" || !Array.isArray(ids)) {
+      res.status(400).json({ error: "Invalid body: need {worker_id, ids[]}" });
+      return;
+    }
+    const released = releaseBatch(worker_id, ids);
+    res.json({ released });
+  } catch (err: any) {
+    res.status(400).json({ error: err.message ?? "Internal error" });
+  }
+});
+
+// GET /api/tannlege/admin/claim-status
+router.get("/admin/claim-status", requireAdmin, (_req: Request, res: Response) => {
+  try {
+    const { claimStatus } = require("../services/dental-claim-service") as typeof import("../services/dental-claim-service");
+    res.json({ workers: claimStatus() });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message ?? "Internal error" });
+  }
+});
+
 export default router;

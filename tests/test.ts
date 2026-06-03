@@ -12182,6 +12182,183 @@ console.log("\n── PR-100b: Fly volume path hotfix ──");
 })();
 
 
+// ── PR-104: dental claim-batch service ──────────────────────────────
+// Multi-worker record-claim infrastructure. Uses :memory: + the
+// __resetDbFactoryForTesting() pattern proven by PR-100 / PR-100b
+// (NOT __setDbForTesting — that killed PR-96/98 in CI).
+//
+// Synchronous IIFE so we stay in the strictly-serial block before the
+// REPORT async coda (mirrors PR-100 / PR-100b).
+console.log("\n── PR-104: dental claim-batch service ──");
+(() => {
+  const prevPathPr104 = process.env.DENTAL_DB_PATH;
+  process.env.DENTAL_DB_PATH = ":memory:";
+
+  // PR-100b block 2 mutates require.cache for db-factory (deletes
+  // it on exit), which means the previously-cached dental-store
+  // module still holds a stale `getDb` reference into a different
+  // db-factory module instance with its own handle cache. Re-load
+  // both db-factory AND its dependents so they share one cache.
+  const dbFactoryPath = require.resolve("../src/database/db-factory");
+  const dentalStorePath = require.resolve("../src/services/dental-store");
+  const dentalClaimPath = require.resolve("../src/services/dental-claim-service");
+  delete require.cache[dbFactoryPath];
+  delete require.cache[dentalStorePath];
+  delete require.cache[dentalClaimPath];
+
+  const dbFactoryPr104 = require("../src/database/db-factory") as typeof import("../src/database/db-factory");
+  dbFactoryPr104.__resetDbFactoryForTesting();
+
+  const {
+    claimBatch,
+    releaseBatch,
+    claimStatus,
+    CLAIM_TIMEOUT_MS,
+  } = require("../src/services/dental-claim-service") as typeof import("../src/services/dental-claim-service");
+  const { createDentalAgent } =
+    require("../src/services/dental-store") as typeof import("../src/services/dental-store");
+
+  // Seed 10 records — 7 raw, 3 enriched; half with hjemmeside, half without.
+  const seedIds: string[] = [];
+  for (let i = 0; i < 10; i++) {
+    seedIds.push(
+      createDentalAgent({
+        org_nr: `${999999000 + i}`,
+        navn: `TEST CLINIC ${i}`,
+        adresse: `Storgata ${i + 1}`,
+        postnummer: "0001",
+        poststed: "OSLO",
+        hjemmeside: i % 2 === 0 ? "https://example.com" : null,
+        enrichment_state: i < 7 ? "raw" : "enriched",
+      } as any)
+    );
+  }
+
+  // T1: claim 3 raw records for worker-1
+  {
+    const claimed = claimBatch("worker-1", 3, { enrichment_state: "raw" });
+    assertTrue(claimed.length === 3, "pr104-01: claim 3 records returns 3");
+  }
+
+  // T2: parallel worker gets disjoint records
+  {
+    const w1Records = claimBatch("worker-1-test2", 3, { enrichment_state: "raw" });
+    const w2Records = claimBatch("worker-2-test2", 3, { enrichment_state: "raw" });
+    const w1Ids = new Set(w1Records.map((r) => r.id));
+    let disjoint = true;
+    for (const r of w2Records) if (w1Ids.has(r.id)) disjoint = false;
+    assertTrue(
+      disjoint,
+      "pr104-02: parallel worker gets different records (disjoint claim sets)"
+    );
+  }
+
+  // T3: filter has_hjemmeside=true returns only those with hjemmeside.
+  {
+    // Reset state so worker-3 can claim freely.
+    releaseBatch("worker-1", seedIds);
+    releaseBatch("worker-1-test2", seedIds);
+    releaseBatch("worker-2-test2", seedIds);
+    const claimed = claimBatch("worker-3", 10, {
+      enrichment_state: "raw",
+      has_hjemmeside: true,
+    });
+    let allHaveSite = claimed.length > 0;
+    for (const r of claimed) {
+      if (!(r.hjemmeside !== null && r.hjemmeside !== "")) allHaveSite = false;
+    }
+    assertTrue(allHaveSite, "pr104-03: filter has_hjemmeside=true returns only records with hjemmeside");
+  }
+
+  // T4: release frees records — claimStatus count drops for worker-3.
+  {
+    const status1 = claimStatus().find((s) => s.worker_id === "worker-3");
+    assertTrue(status1 !== undefined, "pr104-04a: worker-3 visible in claimStatus");
+    const countBefore = status1?.count ?? 0;
+    releaseBatch("worker-3", seedIds.slice(0, 3));
+    const status2 = claimStatus().find((s) => s.worker_id === "worker-3");
+    const countAfter = status2?.count ?? 0;
+    assertTrue(
+      countAfter < countBefore,
+      "pr104-04b: release frees records for re-claim (count drops)"
+    );
+  }
+
+  // T5: expired claim auto-released by next claim-batch.
+  {
+    // Free any leftovers so we have predictable state.
+    releaseBatch("worker-3", seedIds);
+    const dbPr104 = dbFactoryPr104.getDb("dental");
+    const claimed = claimBatch("worker-stale", 1, { enrichment_state: "enriched" });
+    if (claimed.length === 0) {
+      assertTrue(false, "pr104-05: precondition (could not claim an enriched record)");
+    } else {
+      const fakeOld = Date.now() - CLAIM_TIMEOUT_MS - 1000;
+      dbPr104
+        .prepare("UPDATE dental_agents SET claimed_at = ? WHERE id = ?")
+        .run(fakeOld, claimed[0].id);
+      const reclaimed = claimBatch("worker-fresh", 1, { enrichment_state: "enriched" });
+      assertTrue(
+        reclaimed.length > 0 && reclaimed.some((r) => r.id === claimed[0].id),
+        "pr104-05: expired claim auto-released by next claim-batch"
+      );
+    }
+  }
+
+  // T6: size > 500 rejected.
+  {
+    let threw = false;
+    let msg = "";
+    try {
+      claimBatch("worker-x", 1000, { enrichment_state: "raw" });
+    } catch (err: any) {
+      threw = true;
+      msg = err?.message ?? String(err);
+    }
+    assertTrue(threw && /size/.test(msg), "pr104-06: size > 500 rejected with /size/ error");
+  }
+
+  // T7: empty worker_id rejected.
+  {
+    let threw = false;
+    let msg = "";
+    try {
+      claimBatch("", 5, { enrichment_state: "raw" });
+    } catch (err: any) {
+      threw = true;
+      msg = err?.message ?? String(err);
+    }
+    assertTrue(
+      threw && /worker_id/.test(msg),
+      "pr104-07: empty worker_id rejected with /worker_id/ error"
+    );
+  }
+
+  // T8: claimStatus shape — per-worker counts with required fields.
+  {
+    const status = claimStatus();
+    let shapeOk = Array.isArray(status);
+    for (const s of status) {
+      if (typeof s.worker_id !== "string") shapeOk = false;
+      if (typeof s.count !== "number") shapeOk = false;
+      if (typeof s.oldest_claim_age_ms !== "number") shapeOk = false;
+    }
+    assertTrue(shapeOk, "pr104-08: claimStatus returns array of {worker_id, count, oldest_claim_age_ms}");
+  }
+
+  // Cleanup: free everything we claimed and reset env + factory cache.
+  for (const wid of ["worker-1", "worker-1-test2", "worker-2-test2", "worker-3", "worker-stale", "worker-fresh"]) {
+    try { releaseBatch(wid, seedIds); } catch { /* ignore */ }
+  }
+  if (prevPathPr104 === undefined) {
+    delete process.env.DENTAL_DB_PATH;
+  } else {
+    process.env.DENTAL_DB_PATH = prevPathPr104;
+  }
+  dbFactoryPr104.__resetDbFactoryForTesting();
+})();
+
+
 // ── REPORT ────────────────────────────────────────────────────────────
 
 // Wait for the M2 owner-portal async tests before reporting so their
