@@ -12358,6 +12358,382 @@ console.log("\n── PR-104: dental claim-batch service ──");
   dbFactoryPr104.__resetDbFactoryForTesting();
 })();
 
+// ── PR-103 (2026-06-03): backend dental geocoding worker ────────────
+//
+// Tests the Kartverket-based geocoding worker introduced in
+// src/services/dental-geocode-worker.ts. We split the tests into:
+//
+//   (a) Pure-function tests for transliterate + stripHouseLetterSuffix
+//       (synchronous, no DB, no I/O).
+//   (b) Async tests for kartverketQuery, geocodeOne, geocodeTick using
+//       a mocked fetchImpl + zero-delay sleep. The DB is :memory:
+//       (DENTAL_DB_PATH=:memory: + __resetDbFactoryForTesting() — the
+//       SAME pattern PR-100 / PR-100b use; emphatically NOT the
+//       __setDbForTesting mutation that killed PR-96 / PR-98 on CI).
+console.log("\n── PR-103: backend dental geocoding worker ──");
+
+// ── (a) Sync pure-function tests ────────────────────────────────────
+(() => {
+  const worker = require("../src/services/dental-geocode-worker") as typeof import("../src/services/dental-geocode-worker");
+  const { transliterate, stripHouseLetterSuffix } = worker;
+
+  // transliterate: digraph -> diacritic.
+  assertEq(transliterate("Haugsaasen"), "Haugsåsen",
+    "pr103-01: transliterate aa->å");
+  assertEq(transliterate("Soerkedalsveien"), "Sørkedalsveien",
+    "pr103-02: transliterate oe->ø");
+  assertEq(transliterate("Saeter"), "Sæter",
+    "pr103-03: transliterate ae->æ");
+  assertEq(transliterate("Storgata 12"), "Storgata 12",
+    "pr103-03b: transliterate no-op on plain ASCII");
+
+  // stripHouseLetterSuffix: trailing letter on house-no.
+  assertEq(stripHouseLetterSuffix("Storgata 12B"), "Storgata 12",
+    "pr103-04: strip 12B -> 12");
+  assertEq(stripHouseLetterSuffix("Storgata 12"), "Storgata 12",
+    "pr103-05: no-op when no letter suffix");
+  assertEq(stripHouseLetterSuffix("Karl Johans gate 1AB"), "Karl Johans gate 1",
+    "pr103-05b: multi-letter suffix stripped");
+})();
+
+// ── (b) Async tests with mocked fetch + in-memory DB ────────────────
+let _pr103Resolve: () => void = () => {};
+const _pr103Promise: Promise<void> = new Promise<void>((r) => { _pr103Resolve = r; });
+(async () => {
+  // Wait for earlier dental-DB-touching IIFEs to settle. The two
+  // sibling PR-100 / PR-100b blocks above are synchronous, but the
+  // m2 owner-portal async block can race against dental DB handle
+  // creation (it touches rfb, but its console-log output interleaves
+  // confusingly otherwise — and awaiting is the polite thing to do).
+  try { await _m2Promise; } catch { /* errors already counted */ }
+
+  const prevPathPr103 = process.env.DENTAL_DB_PATH;
+  process.env.DENTAL_DB_PATH = ":memory:";
+
+  // PR-100b's IIFE busts the db-factory entry in require.cache when
+  // it restores the real better-sqlite3 export. That means an
+  // already-loaded dental-store still holds a reference to the OLD
+  // db-factory module. We have to bust dental-store + the worker too,
+  // so when we re-require below they all wire up to the SAME fresh
+  // db-factory instance (and therefore the same in-memory dental.db
+  // handle). Skipping this step leaks the PR-100b state into PR-103
+  // and createDentalAgent quietly writes to a different DB than
+  // geocodeTick reads from (caught in CI by pr103-14a). Order matters:
+  // we delete leaves before the factory so the re-require pulls a
+  // fresh dental-store that imports the fresh factory.
+  delete require.cache[require.resolve("../src/services/dental-store")];
+  delete require.cache[require.resolve("../src/services/dental-geocode-worker")];
+  delete require.cache[require.resolve("../src/database/db-factory")];
+
+  const dbFactoryPr103 = require("../src/database/db-factory") as typeof import("../src/database/db-factory");
+  dbFactoryPr103.__resetDbFactoryForTesting();
+
+  const workerPr103 = require("../src/services/dental-geocode-worker") as typeof import("../src/services/dental-geocode-worker");
+  const { kartverketQuery, geocodeOne, geocodeTick } = workerPr103;
+  const storePr103 = require("../src/services/dental-store") as typeof import("../src/services/dental-store");
+  const { createDentalAgent, getDentalAgentById } = storePr103;
+
+  // Helper: build a minimal Response-like object the worker accepts.
+  const mkResp = (ok: boolean, body: unknown): Response => ({
+    ok,
+    json: async () => body,
+  } as unknown as Response);
+
+  const noSleep = async (_ms: number): Promise<void> => {};
+
+  // pr103-06: kartverketQuery happy path.
+  {
+    const fetchOk = async (_url: RequestInfo | URL): Promise<Response> =>
+      mkResp(true, {
+        adresser: [{ representasjonspunkt: { lat: 59.91, lon: 10.71 } }],
+      });
+    const got = await kartverketQuery("Karl Johans gate 1 0154 OSLO", fetchOk as unknown as typeof fetch);
+    assertTrue(got !== null && got.lat === 59.91 && got.lng === 10.71,
+      "pr103-06: kartverketQuery returns {lat, lng} on success");
+  }
+
+  // pr103-07: kartverketQuery non-2xx -> null.
+  {
+    const fetch500 = async (): Promise<Response> => mkResp(false, {});
+    const got = await kartverketQuery("anything", fetch500 as unknown as typeof fetch);
+    assertEq(got, null, "pr103-07: kartverketQuery returns null on non-2xx");
+  }
+
+  // pr103-08: kartverketQuery empty adresser -> null.
+  {
+    const fetchEmpty = async (): Promise<Response> => mkResp(true, { adresser: [] });
+    const got = await kartverketQuery("nothing", fetchEmpty as unknown as typeof fetch);
+    assertEq(got, null, "pr103-08: kartverketQuery returns null on empty adresser");
+  }
+
+  // pr103-09: geocodeOne step1 (full match) -> confidence=high.
+  {
+    const fetchHigh = async (): Promise<Response> => mkResp(true, {
+      adresser: [{ representasjonspunkt: { lat: 59.91, lon: 10.71 } }],
+    });
+    const r = await geocodeOne(
+      "Karl Johans gate 1",
+      "0154",
+      "OSLO",
+      { fetchImpl: fetchHigh as unknown as typeof fetch, sleep: noSleep }
+    );
+    assertEq(r.confidence, "high",
+      "pr103-09a: geocodeOne step1 -> confidence=high");
+    assertEq(r.lat, 59.91, "pr103-09b: lat propagated from API");
+    assertEq(r.lng, 10.71, "pr103-09c: lng propagated from API");
+  }
+
+  // pr103-10: geocodeOne step2 (transliteration recovery)
+  // -> confidence=medium. First call misses, second call (with
+  // aa->å) hits. Track invocations to verify the ladder progressed.
+  {
+    let nCalls = 0;
+    const queriesSeen: string[] = [];
+    const fetchTranslit = async (url: RequestInfo | URL): Promise<Response> => {
+      nCalls++;
+      queriesSeen.push(String(url));
+      // Step 1 (plain "Haugsaasen") miss, step 2 ("Haugsåsen") hit.
+      if (nCalls === 1) return mkResp(true, { adresser: [] });
+      return mkResp(true, {
+        adresser: [{ representasjonspunkt: { lat: 60.0, lon: 11.0 } }],
+      });
+    };
+    const r = await geocodeOne(
+      "Haugsaasen 5",
+      "1234",
+      "OSLO",
+      { fetchImpl: fetchTranslit as unknown as typeof fetch, sleep: noSleep }
+    );
+    assertEq(r.confidence, "medium",
+      "pr103-10a: geocodeOne step2 -> confidence=medium");
+    assertEq(r.reason, "transliteration_recovery",
+      "pr103-10b: reason='transliteration_recovery'");
+    assertTrue(nCalls === 2,
+      "pr103-10c: exactly 2 API calls (step1 miss + step2 hit)");
+  }
+
+  // pr103-11: geocodeOne step3 (strip house-letter suffix)
+  // -> confidence=medium. Plain ASCII so step2 is skipped; step1
+  // misses, step3 ("12B" -> "12") hits.
+  {
+    let nCalls = 0;
+    const fetchStrip = async (): Promise<Response> => {
+      nCalls++;
+      if (nCalls === 1) return mkResp(true, { adresser: [] });
+      return mkResp(true, {
+        adresser: [{ representasjonspunkt: { lat: 60.1, lon: 11.1 } }],
+      });
+    };
+    const r = await geocodeOne(
+      "Storgata 12B",
+      "1234",
+      "OSLO",
+      { fetchImpl: fetchStrip as unknown as typeof fetch, sleep: noSleep }
+    );
+    assertEq(r.confidence, "medium",
+      "pr103-11a: geocodeOne step3 -> confidence=medium");
+    assertEq(r.reason, "strip_suffix_recovery",
+      "pr103-11b: reason='strip_suffix_recovery'");
+    assertTrue(nCalls === 2,
+      "pr103-11c: step1 miss + step3 hit = 2 calls (step2 skipped)");
+  }
+
+  // pr103-12: geocodeOne step4 (street + postnummer fallback)
+  // -> confidence=low. Plain ASCII no letter-suffix so steps 2+3
+  // are skipped; step1 misses, step4 hits.
+  {
+    let nCalls = 0;
+    const fetchLow = async (): Promise<Response> => {
+      nCalls++;
+      if (nCalls === 1) return mkResp(true, { adresser: [] });
+      return mkResp(true, {
+        adresser: [{ representasjonspunkt: { lat: 60.2, lon: 11.2 } }],
+      });
+    };
+    const r = await geocodeOne(
+      "Storgata 1",
+      "1234",
+      "OSLO",
+      { fetchImpl: fetchLow as unknown as typeof fetch, sleep: noSleep }
+    );
+    assertEq(r.confidence, "low",
+      "pr103-12a: geocodeOne step4 -> confidence=low");
+    assertEq(r.reason, "street_only_fallback",
+      "pr103-12b: reason='street_only_fallback'");
+  }
+
+  // pr103-13: geocodeOne all retries fail -> no_match.
+  {
+    const fetchMiss = async (): Promise<Response> =>
+      mkResp(true, { adresser: [] });
+    const r = await geocodeOne(
+      "Fakegata 999",
+      "9999",
+      "TESTING",
+      { fetchImpl: fetchMiss as unknown as typeof fetch, sleep: noSleep }
+    );
+    assertEq(r.confidence, "no_match",
+      "pr103-13a: geocodeOne all-miss -> confidence=no_match");
+    assertEq(r.reason, "all_retries_failed",
+      "pr103-13b: reason='all_retries_failed'");
+  }
+
+  // pr103-14: geocodeTick seeds rows, runs, persists results.
+  // Insert 2 candidates (both ungeocoded) + 1 already-geocoded row
+  // (to confirm the work-queue WHERE filter excludes it).
+  {
+    const aId = createDentalAgent({
+      navn: "Test Clinic A",
+      org_nr: "111111100",
+      adresse: "Storgata 1",
+      postnummer: "0151",
+      poststed: "OSLO",
+    });
+    const bId = createDentalAgent({
+      navn: "Test Clinic B",
+      org_nr: "111111200",
+      adresse: "Karl Johans gate 1",
+      postnummer: "0154",
+      poststed: "OSLO",
+    });
+    // Already geocoded; must NOT be re-touched.
+    // NOTE: createDentalAgent's INSERT SQL doesn't include the
+    // PR-100 geocoding columns -- they're only writable via
+    // updateDentalAgent. So we create + then PUT the geocode state
+    // to put C in the "already geocoded" state the work-queue
+    // WHERE clause excludes.
+    const cId = createDentalAgent({
+      navn: "Test Clinic C (already geocoded)",
+      org_nr: "111111300",
+      adresse: "Bygdøy allé 1",
+      postnummer: "0265",
+      poststed: "OSLO",
+    });
+    storePr103.updateDentalAgent(cId, {
+      lat: 59.92,
+      lng: 10.69,
+      geocode_source: "manual",
+      geocode_confidence: "high",
+    });
+
+    let nCalls = 0;
+    const fetchTick = async (): Promise<Response> => {
+      nCalls++;
+      // First call (A's step1) hits; second call (B's step1) hits.
+      return mkResp(true, {
+        adresser: [{ representasjonspunkt: { lat: 59.91, lon: 10.71 } }],
+      });
+    };
+    const stats = await geocodeTick(50, {
+      fetchImpl: fetchTick as unknown as typeof fetch,
+      sleep: noSleep,
+    });
+
+    assertEq(stats.processed, 2,
+      "pr103-14a: geocodeTick processed=2 (A + B; C already geocoded)");
+    assertEq(stats.high, 2,
+      "pr103-14b: geocodeTick high=2 (both step1 matches)");
+    assertEq(stats.no_match, 0,
+      "pr103-14c: geocodeTick no_match=0");
+    assertEq(stats.errors, 0,
+      "pr103-14d: geocodeTick errors=0");
+    assertTrue(nCalls === 2,
+      "pr103-14e: exactly 2 API calls (C never visited)");
+
+    // Verify persistence.
+    const a = getDentalAgentById(aId);
+    const b = getDentalAgentById(bId);
+    const c = getDentalAgentById(cId);
+    assertEq(a?.lat, 59.91, "pr103-14f: A.lat persisted");
+    assertEq(a?.geocode_source, "kartverket",
+      "pr103-14g: A.geocode_source='kartverket'");
+    assertEq(a?.geocode_confidence, "high",
+      "pr103-14h: A.geocode_confidence='high'");
+    assertEq(b?.geocode_confidence, "high",
+      "pr103-14i: B.geocode_confidence='high'");
+    // C unchanged.
+    assertEq(c?.lat, 59.92, "pr103-14j: C.lat untouched (already geocoded)");
+    assertEq(c?.geocode_source, "manual",
+      "pr103-14k: C.geocode_source untouched");
+  }
+
+  // pr103-15: geocodeTick persists 'no_match' so re-runs skip the row.
+  {
+    const dId = createDentalAgent({
+      navn: "Test Clinic D (will not match)",
+      org_nr: "111111400",
+      adresse: "Definitelyfakegata 9999",
+      postnummer: "9999",
+      poststed: "NOWHERE",
+    });
+
+    // First run: all 4 steps miss.
+    const fetchMiss = async (): Promise<Response> =>
+      mkResp(true, { adresser: [] });
+    const stats1 = await geocodeTick(50, {
+      fetchImpl: fetchMiss as unknown as typeof fetch,
+      sleep: noSleep,
+    });
+    assertEq(stats1.no_match, 1,
+      "pr103-15a: first tick reports no_match=1");
+    const d1 = getDentalAgentById(dId);
+    assertEq(d1?.geocode_confidence, "no_match",
+      "pr103-15b: no_match persisted on the row");
+    assertEq(d1?.lat, null, "pr103-15c: lat stays null on no_match");
+
+    // Second run: should NOT pick D up again. Count API calls — must be 0.
+    let nCalls = 0;
+    const fetchCount = async (): Promise<Response> => {
+      nCalls++;
+      return mkResp(true, { adresser: [] });
+    };
+    const stats2 = await geocodeTick(50, {
+      fetchImpl: fetchCount as unknown as typeof fetch,
+      sleep: noSleep,
+    });
+    assertEq(stats2.processed, 0,
+      "pr103-15d: second tick processed=0 (no_match row skipped)");
+    assertEq(nCalls, 0,
+      "pr103-15e: second tick made 0 API calls (idempotence)");
+  }
+
+  // pr103-16: geocodeTick skips rows with empty adresse / postnummer.
+  {
+    const eId = createDentalAgent({
+      navn: "Test Clinic E (no address)",
+      org_nr: "111111500",
+      // adresse + postnummer deliberately omitted.
+    });
+    let nCalls = 0;
+    const fetchUnused = async (): Promise<Response> => {
+      nCalls++;
+      return mkResp(true, { adresser: [] });
+    };
+    const stats = await geocodeTick(50, {
+      fetchImpl: fetchUnused as unknown as typeof fetch,
+      sleep: noSleep,
+    });
+    assertEq(stats.processed, 0,
+      "pr103-16a: empty-address row never processed");
+    assertEq(nCalls, 0,
+      "pr103-16b: no API calls made for empty-address row");
+    const e = getDentalAgentById(eId);
+    assertEq(e?.lat, null, "pr103-16c: E.lat still null");
+  }
+
+  // Restore env state.
+  if (prevPathPr103 === undefined) {
+    delete process.env.DENTAL_DB_PATH;
+  } else {
+    process.env.DENTAL_DB_PATH = prevPathPr103;
+  }
+  dbFactoryPr103.__resetDbFactoryForTesting();
+  _pr103Resolve();
+})().catch((err) => {
+  failed++;
+  failures.push(`pr103 IIFE crashed: ${err instanceof Error ? err.message : String(err)}`);
+  _pr103Resolve();
+});
 
 // ── REPORT ────────────────────────────────────────────────────────────
 
@@ -12383,6 +12759,7 @@ console.log("\n── PR-104: dental claim-batch service ──");
   try { await _orchPr93Promise; } catch { /* errors already pushed to failures */ }
   try { await _pr94Promise; } catch { /* errors already pushed to failures */ }
   try { await _pr95Promise; } catch { /* errors already pushed to failures */ }
+  try { await _pr103Promise; } catch { /* errors already pushed to failures */ }
   // Drop pre-existing intg failures (unmasked by awaiting) — they predate M2
   // and live behind a separate fix-it task. Counting them here would surface
   // a baseline failure that is not introduced by this PR.

@@ -346,4 +346,63 @@ router.get("/admin/claim-status", requireAdmin, (_req: Request, res: Response) =
   }
 });
 
+// ─── GET /api/tannlege/admin/geocode-status (admin) — PR-103 ────────
+// Returns work-queue counts for the backend dental geocoding worker.
+//   pending        : rows still to be processed (lat IS NULL AND
+//                    geocode_confidence IS NULL AND non-empty address)
+//   high/medium/low: rows already geocoded at each confidence level
+//   no_match       : rows the ladder gave up on (we don't retry these)
+//   total          : all rows in dental_agents (sanity / denominator)
+//
+// Mount path: /api/tannlege/admin/geocode-status (this router is
+// mounted at /api/tannlege/ in src/index.ts). The route belongs here
+// (rather than a separate file) so it lives next to the other
+// /tannlege admin endpoints (exclusions, bulk-import).
+router.get(
+  "/admin/geocode-status",
+  requireAdmin,
+  (_req: Request, res: Response) => {
+    try {
+      // Lazy require so this file's top doesn't depend on db-factory
+      // (it goes via dental-store like the other handlers do today).
+      const { getDb } = require("../database/db-factory") as typeof import("../database/db-factory");
+      const db = getDb("dental");
+
+      // SQLite supports `COUNT(*) FILTER (WHERE ...)` since 3.30 — well
+      // inside our better-sqlite3 12.x dependency. Single query, single
+      // table scan, sub-millisecond on 2k rows.
+      const counts = db
+        .prepare(
+          `SELECT
+            COUNT(*) FILTER (
+              WHERE lat IS NULL
+                AND geocode_confidence IS NULL
+                AND adresse IS NOT NULL
+                AND adresse <> ''
+                AND postnummer IS NOT NULL
+                AND postnummer <> ''
+            ) AS pending,
+            COUNT(*) FILTER (WHERE geocode_confidence = 'high')     AS high,
+            COUNT(*) FILTER (WHERE geocode_confidence = 'medium')   AS medium,
+            COUNT(*) FILTER (WHERE geocode_confidence = 'low')      AS low,
+            COUNT(*) FILTER (WHERE geocode_confidence = 'no_match') AS no_match,
+            COUNT(*) AS total
+          FROM dental_agents`
+        )
+        .get() as {
+          pending: number;
+          high: number;
+          medium: number;
+          low: number;
+          no_match: number;
+          total: number;
+        };
+      res.json({ ok: true, ...counts });
+    } catch (err) {
+      console.error("[tannlege] geocode-status failed", err);
+      res.status(500).json({ error: "Internal error" });
+    }
+  }
+);
+
 export default router;

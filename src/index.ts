@@ -644,6 +644,52 @@ if (process.env.RFB_DISABLE_DEBIO_SYNC !== "1") {
   }, 60 * 60_000); // hourly check
 }
 
+// ─── PR-103 (2026-06-03): Backend dental geocoding worker ───────────
+//
+// Continuous Kartverket-based geocoding for dental_agents. First tick
+// fires 30s after boot (lets the Fly volume mount + db-factory init
+// settle); subsequent ticks run hourly. Each tick processes up to 50
+// ungeocoded records. Zero LLM cost; replaces the Claude-based Stage A
+// geocoding flow that never ran in prod due to a mode-selection bug.
+//
+// Disable on dev / CI with RFB_DISABLE_DENTAL_GEOCODE=1.
+// Only fires when the dental vertical is actually enabled, otherwise
+// the dental.db handle isn't open and we'd just be no-oping in a loop.
+if (
+  process.env.RFB_DISABLE_DENTAL_GEOCODE !== "1" &&
+  process.env.ENABLE_DENTAL === "1"
+) {
+  // First tick at boot + 30s (lets the volume mount and db-factory init).
+  setTimeout(async () => {
+    try {
+      const { geocodeTick } = await import("./services/dental-geocode-worker");
+      const r = await geocodeTick(50);
+      console.log(
+        `[dental-geocode] boot-tick processed=${r.processed} ` +
+        `high=${r.high} medium=${r.medium} low=${r.low} ` +
+        `no_match=${r.no_match} errors=${r.errors} duration_ms=${r.duration_ms}`
+      );
+    } catch (err) {
+      console.error("[dental-geocode] boot-tick failed:", err);
+    }
+  }, 30_000);
+
+  // Subsequent ticks hourly.
+  setInterval(async () => {
+    try {
+      const { geocodeTick } = await import("./services/dental-geocode-worker");
+      const r = await geocodeTick(50);
+      console.log(
+        `[dental-geocode] tick processed=${r.processed} ` +
+        `high=${r.high} medium=${r.medium} low=${r.low} ` +
+        `no_match=${r.no_match} errors=${r.errors} duration_ms=${r.duration_ms}`
+      );
+    } catch (err) {
+      console.error("[dental-geocode] tick failed:", err);
+    }
+  }, 60 * 60_000);
+}
+
 // ─── Graceful shutdown ───────────────────────────────────────
 process.on("SIGTERM", () => { discoveryService.shutdown(); closeDb(); process.exit(0); });
 process.on("SIGINT", () => { discoveryService.shutdown(); closeDb(); process.exit(0); });

@@ -59,7 +59,7 @@ export const DentalAgentSchema = z.object({
   lat: z.number().min(-90).max(90).optional().nullable(),
   lng: z.number().min(-180).max(180).optional().nullable(),
   geocode_source: z.enum(["kartverket", "google_places", "manual"]).optional().nullable(),
-  geocode_confidence: z.enum(["high", "medium", "low"]).optional().nullable(),
+  geocode_confidence: z.enum(["high", "medium", "low", "no_match"]).optional().nullable(),
   opening_hours: z
     .array(
       z.object({
