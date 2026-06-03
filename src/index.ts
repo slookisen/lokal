@@ -70,7 +70,7 @@ if (process.env.ENABLE_DENTAL === "1") {
   // (and the dental.db file isn't opened) when the flag is off.
   const { getDb: getVerticalDb } = require("./database/db-factory");
   getVerticalDb("dental"); // triggers initDentalSchema(db) inside the factory
-  console.log("[boot] dental vertical enabled — /data/dental.db ready");
+  console.log("[boot] dental vertical enabled — /app/data/dental.db ready");
 }
 
 const app = express();

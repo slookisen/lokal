@@ -12078,6 +12078,110 @@ console.log("\n── PR-100: dental schema extension ──");
 })();
 
 
+
+// ── PR-100b: Fly volume path hotfix ──────────────────────────────────
+// Verifies the dental DB now defaults to /app/data/ (the persistent
+// volume mount per fly.toml), NOT /data/ (ephemeral container disk
+// that gets wiped on every Fly deploy — root cause of the 6974 → 1
+// data loss across PR-99 + PR-100 deploys).
+//
+// Same sync-IIFE pattern as PR-100 above (NO __setDbForTesting, NO
+// async). Three checks:
+//   1. Env-var override (DENTAL_DB_PATH=:memory:) still wins — this
+//      is what PR-100's tests above rely on.
+//   2. The default fallback (env-var unset) resolves to /app/data/.
+//   3. getDb('rfb') still delegates to init.ts (no path change for rfb).
+console.log("\n── PR-100b: Fly volume path hotfix ──");
+(() => {
+  const prevPathPr100b = process.env.DENTAL_DB_PATH;
+
+  // ── 1. Env-var override still works: DENTAL_DB_PATH=:memory:
+  {
+    process.env.DENTAL_DB_PATH = ":memory:";
+    const dbFactory = require("../src/database/db-factory") as typeof import("../src/database/db-factory");
+    dbFactory.__resetDbFactoryForTesting();
+    const db = dbFactory.getDb("dental");
+    // :memory: DBs have no on-disk file. Quickest proof: PRAGMA
+    // database_list returns file='' for the main attached DB.
+    const rows = db.prepare("PRAGMA database_list").all() as Array<{ name: string; file: string }>;
+    const main = rows.find((r) => r.name === "main");
+    assertEq(main?.file, "", "pr100b-01: DENTAL_DB_PATH=:memory: opens in-memory (PRAGMA database_list file='')");
+    dbFactory.__resetDbFactoryForTesting();
+  }
+
+  // ── 2. Default path (env-var unset) resolves to /app/data/dental.db.
+  // CI doesn't have /app/data/ (no Fly volume), so we monkey-patch:
+  //   • fs.existsSync → true for the parent dir (skip mkdirSync)
+  //   • better-sqlite3 Database → capture path, return in-memory DB
+  // Restore both after the assertion so later tests are unaffected.
+  {
+    delete process.env.DENTAL_DB_PATH;
+    const dbFactoryPath = require.resolve("../src/database/db-factory");
+    delete require.cache[dbFactoryPath];
+    const sqliteId = require.resolve("better-sqlite3");
+    const realSqlite = require("better-sqlite3");
+    const fsMod = require("fs");
+    const realExistsSync = fsMod.existsSync;
+    let capturedPath: string | null = null;
+    function FakeDatabase(pth: string): any {
+      capturedPath = pth;
+      // Hand back an in-memory DB so initDentalSchema's CREATE
+      // TABLE etc. still succeed without touching the filesystem.
+      return new realSqlite(":memory:");
+    }
+    fsMod.existsSync = (p: string): boolean => {
+      // Pretend /app/data exists so db-factory skips mkdirSync.
+      if (typeof p === "string" && (p === "/app/data" || p.startsWith("/app/data"))) return true;
+      return realExistsSync(p);
+    };
+    require.cache[sqliteId]!.exports = FakeDatabase;
+    try {
+      const dbFactory2 = require("../src/database/db-factory") as typeof import("../src/database/db-factory");
+      dbFactory2.__resetDbFactoryForTesting();
+      dbFactory2.getDb("dental");
+      assertEq(capturedPath, "/app/data/dental.db",
+        "pr100b-02: default dental DB path is /app/data/dental.db (persistent Fly volume)");
+      dbFactory2.__resetDbFactoryForTesting();
+    } finally {
+      // Restore real better-sqlite3 + fs.existsSync; bust factory cache.
+      require.cache[sqliteId]!.exports = realSqlite;
+      fsMod.existsSync = realExistsSync;
+      delete require.cache[dbFactoryPath];
+    }
+  }
+
+  // ── 3. Backward-compat: getDb('rfb') still delegates to init.ts.
+  // We verify this WITHOUT opening any DB by inspecting the source of
+  // getDb — the first branch must early-return getRfbDb() for 'rfb'.
+  // (Calling getDb('rfb') from a test would mutate the singleton rfb
+  // handle the rest of the suite relies on, so we keep it source-level.)
+  {
+    const fs2 = require("fs");
+    const path2 = require("path");
+    const src = fs2.readFileSync(
+      path2.join(__dirname, "..", "src", "database", "db-factory.ts"),
+      "utf8"
+    );
+    assertTrue(
+      /if \(vertical === "rfb"\)[\s\S]{0,200}return getRfbDb\(\);/.test(src),
+      "pr100b-03: getDb('rfb') still delegates to init.ts's getRfbDb() (no path change for rfb)"
+    );
+    // And the rfb branch must NOT touch the /app/data/ path.
+    assertTrue(
+      !/\/app\/data\/\$\{vertical\}\.db[\s\S]{0,200}vertical === "rfb"/.test(src),
+      "pr100b-03b: rfb path is NOT joined with /app/data/ default"
+    );
+  }
+
+  // Restore env state.
+  if (prevPathPr100b === undefined) {
+    delete process.env.DENTAL_DB_PATH;
+  } else {
+    process.env.DENTAL_DB_PATH = prevPathPr100b;
+  }
+})();
+
+
 // ── REPORT ────────────────────────────────────────────────────────────
 
 // Wait for the M2 owner-portal async tests before reporting so their
