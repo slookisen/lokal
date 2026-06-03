@@ -11774,6 +11774,310 @@ console.log("\n── PR-99: openai-apps-challenge + read-only MCP annotations �
 }
 
 
+// ── PR-100: dental schema extension (16 new columns) ─────────────────
+// Strategy: drive the dental store directly against an in-memory
+// dental.db via DENTAL_DB_PATH=:memory: + db-factory reset. No HTTP
+// server, no __setDbForTesting, no race against rfb singletons.
+// Each test asserts (a) Zod validation, (b) round-trip through
+// updateDentalAgent + getDentalAgentById, (c) negative cases.
+//
+// Synchronous IIFE (no async) — better-sqlite3 is sync, and an async
+// block here would perturb the _m2Promise event-loop ordering and
+// surface the pre-existing magic_links race in CI (it doesn't hit
+// locally on every run, but CI's deterministic ordering makes it
+// reliable). Using require() + sync makes pr100 a strictly serial
+// extension to the existing top-level synchronous test block.
+console.log("\n── PR-100: dental schema extension ──");
+(() => {
+  const prevPathPr100 = process.env.DENTAL_DB_PATH;
+  process.env.DENTAL_DB_PATH = ":memory:";
+
+  const dbFactoryPr100 = require("../src/database/db-factory") as typeof import("../src/database/db-factory");
+  dbFactoryPr100.__resetDbFactoryForTesting();
+
+  const storePr100 = require("../src/services/dental-store") as typeof import("../src/services/dental-store");
+  const {
+    createDentalAgent,
+    updateDentalAgent,
+    getDentalAgentById,
+    DentalAgentSchema,
+  } = storePr100;
+
+  // ── Sanity: schema-init ran the PR-100 migration on this fresh DB.
+  const dbPr100 = dbFactoryPr100.getDb("dental");
+  const cols = new Set(
+    (dbPr100.prepare("PRAGMA table_info(dental_agents)").all() as Array<{ name: string }>)
+      .map((r) => r.name)
+  );
+  const expectedNew = [
+    "lat","lng","geocode_source","geocode_confidence","opening_hours","field_provenance",
+    "om_oss","specialists","treatment_tech","equipment_brands","patient_focus",
+    "accessibility","payment_options","online_booking_url","social_media","treatments_subtypes",
+  ];
+  for (const c of expectedNew) {
+    assertTrue(cols.has(c), `pr100-migration: dental_agents has column '${c}'`);
+  }
+
+  // ── Idempotency: re-running initDentalSchema must not throw.
+  {
+    let threw = false;
+    try { dbFactoryPr100.initDentalSchema(dbPr100); } catch { threw = true; }
+    assertTrue(!threw, "pr100-migration: re-running initDentalSchema is idempotent");
+  }
+
+  // Seed a single agent we mutate across tests.
+  const seededId = createDentalAgent({
+    navn: "PR-100 Test Clinic",
+    org_nr: "100100100",
+  });
+  assertTrue(!!seededId, "pr100-seed: createDentalAgent returns id");
+
+  // ── 1. lat — happy path
+  {
+    const ok = updateDentalAgent(seededId, { lat: 59.9139 });
+    assertTrue(ok, "pr100-01a: PUT lat=59.9139 returns true");
+    const got = getDentalAgentById(seededId);
+    assertEq(got?.lat, 59.9139, "pr100-01b: GET round-trips lat");
+  }
+
+  // ── 2. lng — happy path
+  {
+    const ok = updateDentalAgent(seededId, { lng: 10.7522 });
+    assertTrue(ok, "pr100-02a: PUT lng=10.7522 returns true");
+    const got = getDentalAgentById(seededId);
+    assertEq(got?.lng, 10.7522, "pr100-02b: GET round-trips lng");
+  }
+
+  // ── 2-neg. lat out of range → Zod 400
+  assertThrows(
+    () => DentalAgentSchema.partial().parse({ lat: 999 }),
+    /-90|less than or equal|too_big|Number/i,
+    "pr100-02neg: lat=999 rejected by Zod"
+  );
+  assertThrows(
+    () => DentalAgentSchema.partial().parse({ lng: -300 }),
+    /-180|greater than or equal|too_small|Number/i,
+    "pr100-02neg2: lng=-300 rejected by Zod"
+  );
+
+  // ── 3. geocode_source — happy path + enum reject
+  {
+    const ok = updateDentalAgent(seededId, { geocode_source: "kartverket" });
+    assertTrue(ok, "pr100-03a: PUT geocode_source=kartverket returns true");
+    const got = getDentalAgentById(seededId);
+    assertEq(got?.geocode_source, "kartverket", "pr100-03b: GET round-trips geocode_source");
+  }
+  assertThrows(
+    () => DentalAgentSchema.partial().parse({ geocode_source: "yelp" }),
+    /enum|invalid_value|kartverket/i,
+    "pr100-03neg: geocode_source=yelp rejected"
+  );
+
+  // ── 4. geocode_confidence — happy path + invalid enum
+  {
+    const ok = updateDentalAgent(seededId, { geocode_confidence: "high" });
+    assertTrue(ok, "pr100-04a: PUT geocode_confidence=high returns true");
+    const got = getDentalAgentById(seededId);
+    assertEq(got?.geocode_confidence, "high", "pr100-04b: GET round-trips geocode_confidence");
+  }
+  assertThrows(
+    () => DentalAgentSchema.partial().parse({ geocode_confidence: "wrong" }),
+    /enum|invalid_value|high/i,
+    "pr100-04neg: geocode_confidence=wrong rejected"
+  );
+
+  // ── 5. opening_hours — happy path (JSON-array round-trip)
+  {
+    const hours = [
+      { day: "mon" as const, open: "08:00", close: "17:00" },
+      { day: "tue" as const, open: "08:00", close: "17:00" },
+    ];
+    const ok = updateDentalAgent(seededId, { opening_hours: hours });
+    assertTrue(ok, "pr100-05a: PUT opening_hours returns true");
+    const got = getDentalAgentById(seededId);
+    assertEq(JSON.stringify(got?.opening_hours), JSON.stringify(hours),
+      "pr100-05b: GET round-trips opening_hours JSON");
+  }
+  // Invalid shape — bad time format
+  assertThrows(
+    () => DentalAgentSchema.partial().parse({
+      opening_hours: [{ day: "mon", open: "8am", close: "5pm" }],
+    }),
+    /regex|invalid_string|invalid_format|pattern/i,
+    "pr100-05neg: opening_hours with bad time format rejected"
+  );
+
+  // ── 6. field_provenance — happy path (JSON-object round-trip, mirrors
+  //      cross-source-validator pattern: per-field source tracking).
+  {
+    const prov = {
+      address: [{ value: "Storgata 1, 0001 Oslo", source_type: "kartverket", fetched_at: "2026-06-01T00:00:00Z" }],
+      phone: [{ value: "22000000", source_type: "homepage", fetched_at: "2026-06-01T00:00:00Z" }],
+    };
+    const ok = updateDentalAgent(seededId, { field_provenance: prov });
+    assertTrue(ok, "pr100-06a: PUT field_provenance returns true");
+    const got = getDentalAgentById(seededId);
+    assertEq(JSON.stringify(got?.field_provenance), JSON.stringify(prov),
+      "pr100-06b: GET round-trips field_provenance");
+  }
+
+  // ── 7. om_oss — happy path + max-length reject
+  {
+    const ok = updateDentalAgent(seededId, { om_oss: "Familiedrevet klinikk siden 1985." });
+    assertTrue(ok, "pr100-07a: PUT om_oss returns true");
+    const got = getDentalAgentById(seededId);
+    assertEq(got?.om_oss, "Familiedrevet klinikk siden 1985.", "pr100-07b: GET round-trips om_oss");
+  }
+  assertThrows(
+    () => DentalAgentSchema.partial().parse({ om_oss: "x".repeat(2001) }),
+    /too_big|max|2000|String|character/i,
+    "pr100-07neg: om_oss > 2000 chars rejected"
+  );
+
+  // ── 8. specialists — happy path (JSON-array of objects)
+  {
+    const specs = [
+      { name: "Dr. Kari Olsen", title: "Tannlege", specialty: "kjeveortopedi" },
+      { name: "Dr. Per Hansen", title: "Spesialist" },
+    ];
+    const ok = updateDentalAgent(seededId, { specialists: specs });
+    assertTrue(ok, "pr100-08a: PUT specialists returns true");
+    const got = getDentalAgentById(seededId);
+    assertEq(JSON.stringify(got?.specialists), JSON.stringify(specs),
+      "pr100-08b: GET round-trips specialists");
+  }
+  // Invalid shape — missing required 'name'
+  assertThrows(
+    () => DentalAgentSchema.partial().parse({ specialists: [{ title: "Tannlege" } as unknown as { name: string }] }),
+    /name|required|invalid_type|Required/i,
+    "pr100-08neg: specialists entry without name rejected"
+  );
+
+  // ── 9. treatment_tech — happy path + invalid enum
+  {
+    const tech = ["intraoral_camera" as const, "3d_scanner" as const, "cbct" as const];
+    const ok = updateDentalAgent(seededId, { treatment_tech: tech });
+    assertTrue(ok, "pr100-09a: PUT treatment_tech returns true");
+    const got = getDentalAgentById(seededId);
+    assertEq(JSON.stringify(got?.treatment_tech), JSON.stringify(tech),
+      "pr100-09b: GET round-trips treatment_tech");
+  }
+  assertThrows(
+    () => DentalAgentSchema.partial().parse({ treatment_tech: ["xray_v9000"] }),
+    /enum|invalid_value|intraoral_camera/i,
+    "pr100-09neg: treatment_tech with unknown value rejected"
+  );
+
+  // ── 10. equipment_brands — happy path (JSON-object of string arrays)
+  {
+    const brands = { implants: ["Straumann", "Nobel Biocare"], scanners: ["iTero"] };
+    const ok = updateDentalAgent(seededId, { equipment_brands: brands });
+    assertTrue(ok, "pr100-10a: PUT equipment_brands returns true");
+    const got = getDentalAgentById(seededId);
+    assertEq(JSON.stringify(got?.equipment_brands), JSON.stringify(brands),
+      "pr100-10b: GET round-trips equipment_brands");
+  }
+
+  // ── 11. patient_focus — happy path (JSON array)
+  {
+    const focus = ["barn", "voksen", "tannlegeskrekk"];
+    const ok = updateDentalAgent(seededId, { patient_focus: focus });
+    assertTrue(ok, "pr100-11a: PUT patient_focus returns true");
+    const got = getDentalAgentById(seededId);
+    assertEq(JSON.stringify(got?.patient_focus), JSON.stringify(focus),
+      "pr100-11b: GET round-trips patient_focus");
+  }
+
+  // ── 12. accessibility — happy path (JSON array)
+  {
+    const acc = ["rullestol", "heis", "handicap_toalett"];
+    const ok = updateDentalAgent(seededId, { accessibility: acc });
+    assertTrue(ok, "pr100-12a: PUT accessibility returns true");
+    const got = getDentalAgentById(seededId);
+    assertEq(JSON.stringify(got?.accessibility), JSON.stringify(acc),
+      "pr100-12b: GET round-trips accessibility");
+  }
+
+  // ── 13. payment_options — happy path (JSON array)
+  {
+    const pay = ["vipps", "kort", "kontant", "delbetaling"];
+    const ok = updateDentalAgent(seededId, { payment_options: pay });
+    assertTrue(ok, "pr100-13a: PUT payment_options returns true");
+    const got = getDentalAgentById(seededId);
+    assertEq(JSON.stringify(got?.payment_options), JSON.stringify(pay),
+      "pr100-13b: GET round-trips payment_options");
+  }
+
+  // ── 14. online_booking_url — happy path + invalid URL
+  {
+    const ok = updateDentalAgent(seededId, { online_booking_url: "https://book.example.no/klinikk" });
+    assertTrue(ok, "pr100-14a: PUT online_booking_url returns true");
+    const got = getDentalAgentById(seededId);
+    assertEq(got?.online_booking_url, "https://book.example.no/klinikk",
+      "pr100-14b: GET round-trips online_booking_url");
+  }
+  assertThrows(
+    () => DentalAgentSchema.partial().parse({ online_booking_url: "not-a-url" }),
+    /url|invalid_string|invalid_format/i,
+    "pr100-14neg: online_booking_url=not-a-url rejected"
+  );
+
+  // ── 15. social_media — happy path (JSON object) + invalid URL
+  {
+    const sm = {
+      facebook: "https://facebook.com/klinikk",
+      instagram: "https://instagram.com/klinikk",
+    };
+    const ok = updateDentalAgent(seededId, { social_media: sm });
+    assertTrue(ok, "pr100-15a: PUT social_media returns true");
+    const got = getDentalAgentById(seededId);
+    assertEq(got?.social_media?.facebook, sm.facebook,
+      "pr100-15b: GET round-trips social_media.facebook");
+    assertEq(got?.social_media?.instagram, sm.instagram,
+      "pr100-15c: GET round-trips social_media.instagram");
+  }
+  assertThrows(
+    () => DentalAgentSchema.partial().parse({ social_media: { facebook: "not-a-url" } }),
+    /url|invalid_string|invalid_format/i,
+    "pr100-15neg: social_media.facebook=not-a-url rejected"
+  );
+
+  // ── 16. treatments_subtypes — happy path (JSON object of arrays)
+  {
+    const sub = {
+      implantater: ["single_tooth", "all_on_four"],
+      kjeveortopedi: ["invisalign", "fast_regulering"],
+    };
+    const ok = updateDentalAgent(seededId, { treatments_subtypes: sub });
+    assertTrue(ok, "pr100-16a: PUT treatments_subtypes returns true");
+    const got = getDentalAgentById(seededId);
+    assertEq(JSON.stringify(got?.treatments_subtypes), JSON.stringify(sub),
+      "pr100-16b: GET round-trips treatments_subtypes");
+  }
+
+  // ── Per-field PUT independence: writing one new field must not
+  //    clobber another (SKILL v1.3 issues per-field PUTs in a loop).
+  {
+    // Re-read full row — all 16 fields should still be present.
+    const got = getDentalAgentById(seededId);
+    assertTrue(got?.lat === 59.9139, "pr100-iso: lat survived later PUTs");
+    assertTrue(got?.lng === 10.7522, "pr100-iso: lng survived later PUTs");
+    assertTrue(got?.om_oss === "Familiedrevet klinikk siden 1985.",
+      "pr100-iso: om_oss survived later PUTs");
+    assertTrue(Array.isArray(got?.specialists) && got!.specialists!.length === 2,
+      "pr100-iso: specialists survived later PUTs");
+  }
+
+  // Restore the env var so the next async test block doesn't leak.
+  if (prevPathPr100 === undefined) {
+    delete process.env.DENTAL_DB_PATH;
+  } else {
+    process.env.DENTAL_DB_PATH = prevPathPr100;
+  }
+  dbFactoryPr100.__resetDbFactoryForTesting();
+})();
+
+
 // ── REPORT ────────────────────────────────────────────────────────────
 
 // Wait for the M2 owner-portal async tests before reporting so their
