@@ -1,6 +1,6 @@
 import { Router, Request, Response } from "express";
 import { z } from "zod";
-import { crmService } from "../services/crm-service";
+import { crmService, CrmVertical } from "../services/crm-service";
 import { emailService } from "../services/email-service";
 import { getDb } from "../database/init";
 
@@ -21,6 +21,12 @@ function requireAdminAuth(req: Request, res: Response, next: Function): void {
 
 const router = Router();
 router.use(requireAdminAuth);
+
+// ?vertical=rfb|dental — anything else (or omitted) = all verticals.
+function parseVertical(req: Request): CrmVertical | undefined {
+  const v = String(req.query.vertical || "").toLowerCase();
+  return v === "rfb" || v === "dental" ? (v as CrmVertical) : undefined;
+}
 
 // ─── Schemas ─────────────────────────────────────────────────
 const messageSchema = z.object({
@@ -59,8 +65,8 @@ const sendSchema = z.object({
 });
 
 // ─── GET /admin/crm/summary ──────────────────────────────────
-router.get("/summary", (_req, res) => {
-  res.json(crmService.getDashboardSummary());
+router.get("/summary", (req, res) => {
+  res.json(crmService.getDashboardSummary(parseVertical(req)));
 });
 
 // ─── GET /admin/crm/contacts?type=producer ───────────────────
@@ -72,7 +78,7 @@ router.get("/contacts", (req, res) => {
   const limit = Math.min(parseInt(req.query.limit as string) || 100, 500);
   const offset = parseInt(req.query.offset as string) || 0;
   const search = (req.query.search as string) || undefined;
-  const contacts = crmService.listContacts(type as any, { limit, offset, search });
+  const contacts = crmService.listContacts(type as any, { limit, offset, search, vertical: parseVertical(req) });
   res.json({ contacts, type });
 });
 
@@ -127,7 +133,7 @@ router.get("/threads", (req, res) => {
   }
   const limit = Math.min(parseInt(req.query.limit as string) || 200, 500);
   const offset = parseInt(req.query.offset as string) || 0;
-  const threads = crmService.listThreadsByStatus(status as any, { limit, offset });
+  const threads = crmService.listThreadsByStatus(status as any, { limit, offset, vertical: parseVertical(req) });
   res.json({ threads, status, count: threads.length });
 });
 

@@ -8,6 +8,13 @@ import { getDb } from "../database/init";
 // and read queries for the dashboard UI.
 
 export type ContactType = "producer" | "marketing" | "vendor" | "unknown";
+// Vertical split: rfb = rettfrabonden.com, dental = finn-tannlege.com.
+// All CRM tables carry vertical_id (default 'rfb'). The closed union below
+// is interpolated directly into SQL fragments — never raw user input.
+export type CrmVertical = "rfb" | "dental";
+function vSql(column: string, vertical?: CrmVertical): string {
+  return vertical ? ` AND ${column} = '${vertical}'` : "";
+}
 export type ThreadStatus = "new" | "in_progress" | "awaiting_review" | "done" | "archived";
 export type ThreadCategory = "innkommende" | "system" | "marketing" | "leverandor" | "unknown";
 export type AssignedTo = "unassigned" | "claude" | "daniel";
@@ -491,7 +498,7 @@ class CrmService {
    * List contacts grouped by type with thread counts.
    * Used for the three-tab landing page.
    */
-  listContacts(type: ContactType, opts: { limit?: number; offset?: number; search?: string } = {}): any[] {
+  listContacts(type: ContactType, opts: { limit?: number; offset?: number; search?: string; vertical?: CrmVertical } = {}): any[] {
     const db = getDb();
     const limit = opts.limit ?? 100;
     const offset = opts.offset ?? 0;
@@ -516,17 +523,17 @@ class CrmService {
       FROM crm_contacts c
       LEFT JOIN crm_threads t ON t.contact_id = c.id
       LEFT JOIN agents a ON a.id = c.agent_id
-      WHERE c.type = ?${searchClause}
+      WHERE c.type = ?${searchClause}${vSql("c.vertical_id", opts.vertical)}
       GROUP BY c.id
       ORDER BY MAX(t.last_message_at) DESC NULLS LAST, c.last_seen_at DESC
       LIMIT ? OFFSET ?
     `).all(...params) as any[];
   }
 
-  countContactsByType(): Record<ContactType, number> {
+  countContactsByType(vertical?: CrmVertical): Record<ContactType, number> {
     const db = getDb();
     const rows = db.prepare(`
-      SELECT type, COUNT(*) as cnt FROM crm_contacts GROUP BY type
+      SELECT type, COUNT(*) as cnt FROM crm_contacts WHERE 1=1${vSql("vertical_id", vertical)} GROUP BY type
     `).all() as { type: ContactType; cnt: number }[];
     const result: Record<ContactType, number> = { producer: 0, marketing: 0, vendor: 0, unknown: 0 };
     for (const r of rows) result[r.type] = r.cnt;
@@ -594,7 +601,7 @@ class CrmService {
    */
   listThreadsByStatus(
     status: ThreadStatus,
-    opts: { limit?: number; offset?: number } = {}
+    opts: { limit?: number; offset?: number; vertical?: CrmVertical } = {}
   ): any[] {
     const db = getDb();
     const limit = Math.min(opts.limit ?? 200, 500);
@@ -634,7 +641,7 @@ class CrmService {
       FROM crm_threads t
       JOIN crm_contacts c ON c.id = t.contact_id
       LEFT JOIN agents a ON a.id = c.agent_id
-      WHERE t.status = ?
+      WHERE t.status = ?${vSql("t.vertical_id", opts.vertical)}
       ORDER BY t.last_message_at DESC NULLS LAST, t.created_at DESC
       LIMIT ? OFFSET ?
     `).all(status, limit, offset);
@@ -759,19 +766,21 @@ class CrmService {
   /**
    * Cross-tab summary for the dashboard header.
    */
-  getDashboardSummary(): any {
+  getDashboardSummary(vertical?: CrmVertical): any {
     const db = getDb();
-    const counts = this.countContactsByType();
-    const newThreads = (db.prepare("SELECT COUNT(*) AS c FROM crm_threads WHERE status = 'new'").get() as any).c;
-    const awaitingReview = (db.prepare("SELECT COUNT(*) AS c FROM crm_threads WHERE status = 'awaiting_review'").get() as any).c;
-    const inProgress = (db.prepare("SELECT COUNT(*) AS c FROM crm_threads WHERE status = 'in_progress'").get() as any).c;
-    const p0Open = (db.prepare("SELECT COUNT(*) AS c FROM crm_threads WHERE severity = 'p0' AND status NOT IN ('done','archived')").get() as any).c;
-    const pendingOutbox = (db.prepare("SELECT COUNT(*) AS c FROM crm_outbox WHERE status = 'pending'").get() as any).c;
+    const V = vSql("vertical_id", vertical);
+    const counts = this.countContactsByType(vertical);
+    const newThreads = (db.prepare(`SELECT COUNT(*) AS c FROM crm_threads WHERE status = 'new'${V}`).get() as any).c;
+    const awaitingReview = (db.prepare(`SELECT COUNT(*) AS c FROM crm_threads WHERE status = 'awaiting_review'${V}`).get() as any).c;
+    const inProgress = (db.prepare(`SELECT COUNT(*) AS c FROM crm_threads WHERE status = 'in_progress'${V}`).get() as any).c;
+    const p0Open = (db.prepare(`SELECT COUNT(*) AS c FROM crm_threads WHERE severity = 'p0' AND status NOT IN ('done','archived')${V}`).get() as any).c;
+    const pendingOutbox = (db.prepare(`SELECT COUNT(*) AS c FROM crm_outbox WHERE status = 'pending'${V}`).get() as any).c;
 
     return {
       contacts: counts,
       threads: { new: newThreads, in_progress: inProgress, awaiting_review: awaitingReview, p0_open: p0Open },
       outbox: { pending: pendingOutbox },
+      vertical: vertical || "all",
       generated_at: new Date().toISOString(),
     };
   }

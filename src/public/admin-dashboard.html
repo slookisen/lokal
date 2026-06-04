@@ -119,6 +119,37 @@
         .tab-btn { flex: 1; padding: 8px; text-align: center; font-size: 12px; font-weight: 500; color: var(--text-dim); border: none; background: none; cursor: pointer; border-radius: 6px; transition: all .2s; }
         .tab-btn.active { background: var(--surface2); color: var(--text); }
         .tab-btn:hover:not(.active) { color: var(--text); }
+
+        /* ─── Vertical switcher (RFB / Finn Tannlege / Begge) ─── */
+        .vertical-bar { display: flex; gap: 4px; background: var(--bg); border: 1px solid var(--border); border-radius: 10px; padding: 4px; }
+        .vertical-btn { padding: 8px 16px; font-size: 13px; font-weight: 600; color: var(--text-dim); border: none; background: none; cursor: pointer; border-radius: 7px; transition: all .2s; white-space: nowrap; }
+        .vertical-btn:hover:not(.active) { color: var(--text); }
+        .vertical-btn.active[data-v="rfb"] { background: #4ade8022; color: #4ade80; }
+        .vertical-btn.active[data-v="dental"] { background: #2dd4bf22; color: #2dd4bf; }
+        .vertical-btn.active[data-v="all"] { background: var(--surface2); color: var(--text); }
+        /* Dental theme: teal accent («Klinisk tillit»-paletten, lysnet for mørk bakgrunn) */
+        body[data-vertical="dental"] { --accent: #2dd4bf; }
+        body[data-vertical="dental"] .topbar { border-bottom: 2px solid #2dd4bf; }
+        body[data-vertical="rfb"] .topbar { border-bottom: 2px solid #4ade80; }
+        /* Paneler som kun gir mening for RFB skjules i dental-visning */
+        body[data-vertical="dental"] [data-rfb-only] { display: none; }
+        .vertical-banner { display: none; border-radius: 8px; padding: 10px 16px; margin-bottom: 16px; font-size: 0.85rem; font-weight: 600; }
+        body[data-vertical="rfb"] #verticalBanner { display: block; background: #4ade8015; border: 1px solid #4ade8055; color: #4ade80; }
+        body[data-vertical="dental"] #verticalBanner { display: block; background: #2dd4bf15; border: 1px solid #2dd4bf55; color: #2dd4bf; }
+        /* Sammenligningsstripe i «Begge»-visning */
+        #compareStrip { display: none; }
+        body[data-vertical="all"] #compareStrip { display: block; }
+        .compare-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+        @media (max-width: 800px) { .compare-grid { grid-template-columns: 1fr; } }
+        .compare-card { background: var(--surface); border-radius: var(--radius); padding: 16px 20px; }
+        .compare-card.rfb { border: 1px solid #4ade8055; border-left: 4px solid #4ade80; }
+        .compare-card.dental { border: 1px solid #2dd4bf55; border-left: 4px solid #2dd4bf; }
+        .compare-title { font-size: 14px; font-weight: 700; margin-bottom: 12px; }
+        .compare-card.rfb .compare-title { color: #4ade80; }
+        .compare-card.dental .compare-title { color: #2dd4bf; }
+        .compare-stats { display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px; }
+        .compare-stat-label { font-size: 10px; text-transform: uppercase; letter-spacing: 0.5px; color: var(--text-dim); }
+        .compare-stat-value { font-size: 22px; font-weight: 700; }
     </style>
 </head>
 <body>
@@ -137,8 +168,13 @@
 <!-- Dashboard -->
 <div id="dashboard" class="dashboard">
     <div class="topbar">
-        <h1>🌱 Rett fra Bonden — Analytics</h1>
+        <h1 id="dashTitle">🌱 Rett fra Bonden — Analytics</h1>
         <div class="topbar-actions">
+            <div class="vertical-bar" id="verticalBar">
+                <button class="vertical-btn" data-v="rfb">🌱 Rett fra Bonden</button>
+                <button class="vertical-btn" data-v="dental">🦷 Finn Tannlege</button>
+                <button class="vertical-btn active" data-v="all">Begge</button>
+            </div>
             <select id="timeSelect" class="time-select">
                 <option value="1">Siste time</option>
                 <option value="6">Siste 6 timer</option>
@@ -157,6 +193,21 @@
 
     <div class="content">
         <div id="lastUpdated" class="last-updated"></div>
+        <div id="verticalBanner" class="vertical-banner"></div>
+
+        <!-- «Begge»-visning: per-vertikal sammenligning side om side -->
+        <div id="compareStrip" style="margin-bottom: 28px;">
+            <div class="compare-grid">
+                <div class="compare-card rfb">
+                    <div class="compare-title">🌱 Rett fra Bonden — rettfrabonden.com</div>
+                    <div class="compare-stats" id="compareRfb"><div class="loading">Laster...</div></div>
+                </div>
+                <div class="compare-card dental">
+                    <div class="compare-title">🦷 Finn Tannlege — finn-tannlege.com</div>
+                    <div class="compare-stats" id="compareDental"><div class="loading">Laster...</div></div>
+                </div>
+            </div>
+        </div>
         <div id="ownerCookieBanner" style="display:none; background:#fef3c7; border:1px solid #f59e0b; border-radius:8px; padding:10px 16px; margin-bottom:16px; font-size:0.85rem; color:#92400e;">
             <strong>Eier-modus aktiv</strong> — din trafikk ekskluderes fra tallene. <a href="#" id="ownerCookieRemove" style="color:#b45309;">Fjern</a>
         </div>
@@ -251,7 +302,7 @@
                 <div class="panel-title">🔍 Topp søkeord</div>
                 <div id="searchTerms"><div class="loading"><div class="spinner"></div>Laster...</div></div>
             </div>
-            <div class="panel">
+            <div class="panel" data-rfb-only>
                 <div class="panel-title">🏙 Byer</div>
                 <div id="cityStats"><div class="loading"><div class="spinner"></div>Laster...</div></div>
             </div>
@@ -275,7 +326,7 @@
 
         <!-- Producers + Visitors Tables -->
         <div class="panel-grid">
-            <div class="panel panel-full">
+            <div class="panel panel-full" data-rfb-only>
                 <div class="panel-title">⭐ Mest besøkte produsenter</div>
                 <div id="producerTable"><div class="loading"><div class="spinner"></div>Laster...</div></div>
             </div>
@@ -286,7 +337,7 @@
         </div>
 
         <!-- Markedsnettverk-trafikk (PR-74) -->
-        <div class="panel-grid">
+        <div class="panel-grid" data-rfb-only>
             <div class="panel panel-full">
                 <div class="panel-title">🌐 Markedsnettverk-trafikk</div>
                 <div id="umbrellaTrafficTable"><div class="loading"><div class="spinner"></div>Laster...</div></div>
@@ -299,6 +350,37 @@
 <script>
     var API_KEY = "";
     var BASE = window.location.origin;
+
+    // ─── Vertical switcher state ─────────────────────
+    // 'rfb' = rettfrabonden.com, 'dental' = finn-tannlege.com, 'all' = begge.
+    var VERTICAL = "all";
+    try { VERTICAL = sessionStorage.getItem("rfb_vertical") || "all"; } catch(e) {}
+
+    var VERTICAL_META = {
+        rfb:    { title: "🌱 Rett fra Bonden — Analytics",  banner: "Viser kun trafikk for rettfrabonden.com" },
+        dental: { title: "🦷 Finn Tannlege — Analytics",    banner: "Viser kun trafikk for finn-tannlege.com" },
+        all:    { title: "📊 Analytics — begge vertikaler", banner: "" },
+    };
+
+    function setVertical(v) {
+        VERTICAL = v;
+        try { sessionStorage.setItem("rfb_vertical", v); } catch(e) {}
+        applyVerticalUi();
+        loadDashboard();
+    }
+
+    function applyVerticalUi() {
+        document.body.setAttribute("data-vertical", VERTICAL);
+        var meta = VERTICAL_META[VERTICAL] || VERTICAL_META.all;
+        document.getElementById("dashTitle").textContent = meta.title;
+        document.title = meta.title;
+        var banner = document.getElementById("verticalBanner");
+        banner.textContent = meta.banner;
+        var btns = document.querySelectorAll("#verticalBar .vertical-btn");
+        for (var i = 0; i < btns.length; i++) {
+            btns[i].classList.toggle("active", btns[i].getAttribute("data-v") === VERTICAL);
+        }
+    }
 
     // ─── Auth ────────────────────────────────────────
     function doLogin() {
@@ -382,6 +464,15 @@
         document.getElementById("refreshBtn").addEventListener("click", loadDashboard);
         document.getElementById("logoutBtn").addEventListener("click", doLogout);
 
+        // Vertical switcher buttons + initial UI state
+        var vbtns = document.querySelectorAll("#verticalBar .vertical-btn");
+        for (var i = 0; i < vbtns.length; i++) {
+            vbtns[i].addEventListener("click", function(e) {
+                setVertical(e.currentTarget.getAttribute("data-v"));
+            });
+        }
+        applyVerticalUi();
+
         // Auto-login from session
         try {
             var saved = sessionStorage.getItem("rfb_key");
@@ -393,7 +484,19 @@
     });
 
     // ─── API helper ──────────────────────────────────
+    // Appends ?vertical=rfb|dental automatically when a single vertical is
+    // selected. Endpoints that ignore the param (conversations, umbrella)
+    // are unaffected by the extra query string.
     function api(path) {
+        if (VERTICAL === "rfb" || VERTICAL === "dental") {
+            path += (path.indexOf("?") >= 0 ? "&" : "?") + "vertical=" + VERTICAL;
+        }
+        return apiRaw(path);
+    }
+
+    // Raw variant without auto-vertical — used by the «Begge»-comparison
+    // strip which always needs explicit per-vertical numbers.
+    function apiRaw(path) {
         return fetch(BASE + "/admin/analytics" + path, {
             headers: { "X-Admin-Key": API_KEY }
         }).then(function(r) {
@@ -460,6 +563,38 @@
         .catch(function(err) {
             console.error("Dashboard load failed:", err);
         });
+
+        // «Begge»-visning: hent eksplisitte per-vertikal-tall til
+        // sammenligningsstripen (uavhengig av hovedlastingen over).
+        if (VERTICAL === "all") {
+            Promise.all([
+                apiRaw("/summary/" + hours + "?vertical=rfb"),
+                apiRaw("/summary/" + hours + "?vertical=dental"),
+            ])
+            .then(function(res) {
+                renderCompareCard("compareRfb", res[0]);
+                renderCompareCard("compareDental", res[1]);
+            })
+            .catch(function(err) {
+                console.error("Compare strip load failed:", err);
+            });
+        }
+    }
+
+    // ─── «Begge»-sammenligningskort ──────────────────
+    function renderCompareCard(elId, s) {
+        var el = document.getElementById(elId);
+        if (!el) return;
+        var agentTotal = ((s.agentTraffic || {}).chatgpt || 0) + ((s.agentTraffic || {}).claude || 0) + ((s.agentTraffic || {}).other || 0);
+        var stats = [
+            { label: "Sidevisninger", value: s.pageViews },
+            { label: "Unike", value: s.uniqueVisitors },
+            { label: "Søk", value: s.totalQueries },
+            { label: "AI-trafikk", value: agentTotal },
+        ];
+        el.innerHTML = stats.map(function(st) {
+            return '<div><div class="compare-stat-label">' + st.label + '</div><div class="compare-stat-value">' + fmtNum(st.value) + '</div></div>';
+        }).join("");
     }
 
     // ─── Stat Cards ──────────────────────────────────
