@@ -151,6 +151,14 @@ if (process.env.ENABLE_DENTAL === "1") {
       return next();
     }
 
+    // /mcp endpoint → dental Streamable HTTP MCP router (PR-114)
+    // dentalMcpRouter applies its own rate limiting (dentalLimiter).
+    if (p === "/mcp" || p.startsWith("/mcp/")) {
+      // eslint-disable-next-line @typescript-eslint/no-var-requires
+      const dentalMcpRouter = require("./routes/dental-mcp").default;
+      return dentalMcpRouter(req, res, next);
+    }
+
     // /a2a endpoint → dental A2A JSON-RPC router (mounted before dental-seo below)
     // dentalA2aRouter handles the /a2a prefix and applies its own rate limiting.
     if (p === "/a2a" || p.startsWith("/a2a/")) {

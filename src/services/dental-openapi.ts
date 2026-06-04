@@ -221,6 +221,46 @@ export function getDentalOpenapi(): object {
           },
         },
       },
+      "/mcp": {
+        post: {
+          operationId: "dentalMcpStreamableHttp",
+          summary: "MCP Streamable HTTP endpoint (PR-114)",
+          description:
+            "Model Context Protocol (MCP) Streamable HTTP transport for finn-tannlege.com. " +
+            "Exposes 5 tools: tannlege_search, tannlege_info, tannlege_stats, tannlege_akutt, tannlege_kjeder. " +
+            "Compatible with ChatGPT (paste URL as MCP server), Claude Desktop, and any MCP client.",
+          externalDocs: {
+            description: "MCP Streamable HTTP spec",
+            url: "https://modelcontextprotocol.io/docs/concepts/transports",
+          },
+          requestBody: {
+            required: true,
+            content: {
+              "application/json": {
+                schema: { type: "object", description: "MCP JSON-RPC 2.0 message" },
+              },
+            },
+          },
+          responses: {
+            "200": {
+              description: "MCP JSON-RPC response or SSE stream",
+              content: {
+                "application/json": { schema: { type: "object" } },
+                "text/event-stream": { schema: { type: "string" } },
+              },
+            },
+          },
+        },
+        get: {
+          operationId: "dentalMcpSse",
+          summary: "MCP SSE notification stream",
+          description: "Server-Sent Events stream for MCP server-to-client notifications. Requires mcp-session-id header.",
+          responses: {
+            "200": { description: "SSE stream", content: { "text/event-stream": { schema: { type: "string" } } } },
+            "400": { description: "Missing or invalid mcp-session-id" },
+          },
+        },
+      },
     },
     components: {
       schemas: {

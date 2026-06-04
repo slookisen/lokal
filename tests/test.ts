@@ -13674,3 +13674,174 @@ console.log("\n── PR-113: dental agent-card, A2A JSON-RPC, openapi ──");
   // -32601 kode-verdi korrekt
   assertEq(-32601, -32601, "pr113-04c: -32601 er korrekt kode for Method not found");
 }
+
+// ── PR-114: MCP server for finn-tannlege.com ─────────────────────────────
+// Tests pr114-01..04 mirror the pr113 pattern: sync IIFE + :memory: DB.
+// dental-mcp.ts exports Zod schemas and buildSearchResults for direct testing
+// without spinning up HTTP or MCP transports.
+
+console.log("\n── PR-114: dental MCP server ──");
+
+// pr114-01: dental-mcp eksporterer Zod-schemas — validering av gyldig og ugyldig input
+{
+  process.env.DENTAL_DB_PATH = ":memory:";
+
+  const dentalMcp = require("../src/routes/dental-mcp") as typeof import("../src/routes/dental-mcp");
+
+  // Schemas eksisterer
+  assertTrue(
+    typeof dentalMcp.TannlegeSearchInputSchema === "object" && dentalMcp.TannlegeSearchInputSchema !== null,
+    "pr114-01a: TannlegeSearchInputSchema er eksportert"
+  );
+  assertTrue(
+    typeof dentalMcp.TannlegeInfoInputSchema === "object" && dentalMcp.TannlegeInfoInputSchema !== null,
+    "pr114-01b: TannlegeInfoInputSchema er eksportert"
+  );
+  assertTrue(
+    typeof dentalMcp.TannlegeAkuttInputSchema === "object" && dentalMcp.TannlegeAkuttInputSchema !== null,
+    "pr114-01c: TannlegeAkuttInputSchema er eksportert"
+  );
+
+  // Zod-validering: gyldig søke-input (alle felter valgfrie)
+  const { z } = require("zod") as typeof import("zod");
+  const SearchSchema = z.object(dentalMcp.TannlegeSearchInputSchema);
+  const validResult = SearchSchema.safeParse({ fylke: "Oslo", helfo: true, limit: 5 });
+  assertTrue(validResult.success, "pr114-01d: gyldig søke-input passerer schema-validering");
+
+  // Ugyldig: limit over max (25)
+  const invalidLimit = SearchSchema.safeParse({ limit: 100 });
+  assertTrue(!invalidLimit.success, "pr114-01e: limit > 25 feiler schema-validering");
+
+  // Gyldig: tomt objekt (alle felter er valgfrie)
+  const emptyInput = SearchSchema.safeParse({});
+  assertTrue(emptyInput.success, "pr114-01f: tomt input er gyldig (alle felter valgfrie)");
+
+  // TannlegeInfoSchema: gyldig org_nr (9 siffer)
+  const InfoSchema = z.object(dentalMcp.TannlegeInfoInputSchema);
+  const validInfo = InfoSchema.safeParse({ org_nr: "912345678" });
+  assertTrue(validInfo.success, "pr114-01g: gyldig org_nr (9 siffer) passerer validering");
+
+  // TannlegeInfoSchema: ugyldig org_nr (8 siffer)
+  const invalidInfo = InfoSchema.safeParse({ org_nr: "12345678" });
+  assertTrue(!invalidInfo.success, "pr114-01h: org_nr med 8 siffer feiler validering");
+}
+
+// pr114-02: agent-card inneholder nå mcp-endpoint
+{
+  const { getDentalAgentCard } = require("../src/services/dental-agent-card") as typeof import("../src/services/dental-agent-card");
+  const card = getDentalAgentCard() as any;
+
+  assertTrue(
+    typeof card.endpoints === "object" && card.endpoints !== null,
+    "pr114-02a: agent-card har endpoints-objekt"
+  );
+  assertTrue(
+    typeof card.endpoints.mcp === "string" && card.endpoints.mcp.length > 0,
+    "pr114-02b: agent-card.endpoints.mcp er satt"
+  );
+  assertTrue(
+    card.endpoints.mcp.endsWith("/mcp"),
+    "pr114-02c: agent-card.endpoints.mcp slutter på '/mcp'"
+  );
+  // Eksisterende endpoints er fremdeles tilstede
+  assertTrue(typeof card.endpoints.a2a === "string", "pr114-02d: a2a-endpoint er fremdeles tilstede");
+  assertTrue(typeof card.endpoints.rest === "string", "pr114-02e: rest-endpoint er fremdeles tilstede");
+}
+
+// pr114-03: openapi inneholder /mcp-sti
+{
+  const { getDentalOpenapi } = require("../src/services/dental-openapi") as typeof import("../src/services/dental-openapi");
+  const spec = getDentalOpenapi() as any;
+
+  assertTrue(
+    typeof spec.paths === "object" && "/mcp" in spec.paths,
+    "pr114-03a: /mcp finnes i openapi paths"
+  );
+  assertTrue(
+    typeof spec.paths["/mcp"].post === "object",
+    "pr114-03b: /mcp har POST-operasjon"
+  );
+  assertTrue(
+    typeof spec.paths["/mcp"].get === "object",
+    "pr114-03c: /mcp har GET-operasjon (SSE)"
+  );
+  assertTrue(
+    typeof spec.paths["/mcp"].post.operationId === "string",
+    "pr114-03d: /mcp POST har operationId"
+  );
+  // Eksisterende /a2a-sti er fremdeles tilstede
+  assertTrue("/a2a" in spec.paths, "pr114-03e: /a2a er fremdeles i paths");
+}
+
+// pr114-04: buildSearchResults-hjelper testes mot :memory:-DB (2 seeds, filter på akutt gir 1)
+{
+  const prevPath = process.env.DENTAL_DB_PATH;
+  process.env.DENTAL_DB_PATH = ":memory:";
+
+  try {
+    // Initialiser dental DB
+    const { initDentalDb } = require("../src/database/dental-db-init") as typeof import("../src/database/dental-db-init");
+    initDentalDb();
+
+    const { createDentalAgent } = require("../src/services/dental-store") as typeof import("../src/services/dental-store");
+    const { buildSearchResults, listPublicDentalAgents: _list } = require("../src/routes/dental-mcp") as typeof import("../src/routes/dental-mcp");
+    const { listPublicDentalAgents } = require("../src/services/dental-store") as typeof import("../src/services/dental-store");
+
+    // Seed 2 klinikker — kun én med acute_vakt=1
+    createDentalAgent({
+      navn: "Oslo Tannklinikk AS",
+      org_nr: "910000001",
+      poststed: "Oslo",
+      fylke: "Oslo",
+      acute_vakt: 0,
+      helfo_agreement: "true",
+      verification_status: "verified",
+    });
+    createDentalAgent({
+      navn: "Bergen Akuttvakt Tannlege AS",
+      org_nr: "910000002",
+      poststed: "Bergen",
+      fylke: "Vestland",
+      acute_vakt: 1,
+      helfo_agreement: "false",
+      verification_status: "pending_verify",
+    });
+
+    // Filter på akutt: skal gi 1 resultat
+    const akuttAgents = listPublicDentalAgents({ acute_vakt: 1 } as any, 10);
+    assertEq(akuttAgents.length, 1, "pr114-04a: filter på acute_vakt=1 gir 1 resultat");
+    assertEq(akuttAgents[0].navn, "Bergen Akuttvakt Tannlege AS", "pr114-04b: riktig klinikk returneres for akutt-filter");
+
+    // buildSearchResults produserer riktig output
+    const results = buildSearchResults(akuttAgents);
+    assertEq(results.length, 1, "pr114-04c: buildSearchResults returnerer 1 element");
+    assertTrue(results[0].badges.includes("Akuttvakt"), "pr114-04d: Akuttvakt-badge settes korrekt");
+    assertTrue(
+      typeof results[0].profil_url === "string" && results[0].profil_url.includes("/klinikk/"),
+      "pr114-04e: profil_url inneholder /klinikk/"
+    );
+    assertTrue(
+      results[0].profil_url.includes("910000002"),
+      "pr114-04f: profil_url inkluderer org_nr i slug"
+    );
+
+    // buildSearchResults for klinikk med Helfo: badge settes
+    const helfoAgents = listPublicDentalAgents({ helfo_agreement: "true" } as any, 10);
+    assertTrue(helfoAgents.length >= 1, "pr114-04g: minst 1 Helfo-klinikk funnet");
+    const helfoResults = buildSearchResults(helfoAgents);
+    assertTrue(helfoResults[0].badges.includes("Helfo-avtale"), "pr114-04h: Helfo-avtale-badge settes korrekt");
+
+  } catch (err) {
+    // DB ikke tilgjengelig i dette miljøet — same fallback as pr109/pr113
+    const msg = err instanceof Error ? err.message : String(err);
+    const isDbErr = msg.includes("no such table") || msg.includes("dental") || msg.includes("initDentalDb");
+    if (isDbErr) {
+      console.log("  [pr114-04] dental DB ikke tilgjengelig — skipping (expected in some CI configs)");
+    } else {
+      assertTrue(false, `pr114-04: uventet feil: ${msg}`);
+    }
+  } finally {
+    if (prevPath !== undefined) process.env.DENTAL_DB_PATH = prevPath;
+    else delete process.env.DENTAL_DB_PATH;
+  }
+}

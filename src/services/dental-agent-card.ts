@@ -96,6 +96,7 @@ export function getDentalAgentCard(): object {
     endpoints: {
       rest: `${url}/api/tannlege`,
       a2a: `${url}/a2a`,
+      mcp: `${url}/mcp`,
       openapi: `${url}/openapi.json`,
       llms: `${url}/llms.txt`,
     },
