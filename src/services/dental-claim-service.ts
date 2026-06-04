@@ -43,6 +43,18 @@ export function buildWhereClause(
   conditions.push("(worker_id IS NULL OR claimed_at < ?)");
   params.push(now - CLAIM_TIMEOUT_MS);
 
+  // PR-108 (2026-06-04): junk-exclusion. Records a worker has parked as
+  // needs_review or rejected (e.g. non-dental Brreg residue: HEPRO, DPCOM,
+  // LESS, dental labs, foreign pharma) must NOT re-enter the claim pool --
+  // workers were re-claiming the same junk every cycle (4+ consecutive
+  // cycles observed). Only applied when the caller does not explicitly
+  // filter on verification_status, so review-queues remain reachable.
+  if (filter.verification_status === undefined) {
+    conditions.push(
+      "(verification_status IS NULL OR verification_status NOT IN ('needs_review','rejected'))"
+    );
+  }
+
   if (filter.enrichment_state !== undefined) {
     conditions.push("enrichment_state = ?");
     params.push(filter.enrichment_state);

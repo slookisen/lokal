@@ -12516,6 +12516,110 @@ console.log("\n── PR-107: zombie-claim sweep fix ──");
   dbFactoryPr107.__resetDbFactoryForTesting();
 })();
 
+// ── PR-108 (2026-06-04): claim-pool junk-exclusion ───────────────────
+// buildWhereClause must exclude verification_status IN ('needs_review',
+// 'rejected') by default, so records parked by workers stay out of the
+// claim pool. Explicit verification_status filters still reach them.
+// Same sync-IIFE + :memory: pattern as PR-107 above.
+console.log("\n── PR-108: claim-pool junk-exclusion ──");
+(() => {
+  const prevPathPr108 = process.env.DENTAL_DB_PATH;
+  process.env.DENTAL_DB_PATH = ":memory:";
+
+  const dbFactoryPath108 = require.resolve("../src/database/db-factory");
+  const dentalStorePath108 = require.resolve("../src/services/dental-store");
+  const dentalClaimPath108 = require.resolve("../src/services/dental-claim-service");
+  delete require.cache[dbFactoryPath108];
+  delete require.cache[dentalStorePath108];
+  delete require.cache[dentalClaimPath108];
+
+  const dbFactoryPr108 = require("../src/database/db-factory") as typeof import("../src/database/db-factory");
+  dbFactoryPr108.__resetDbFactoryForTesting();
+
+  const { claimBatch: claimBatch108, releaseBatch: releaseBatch108 } =
+    require("../src/services/dental-claim-service") as typeof import("../src/services/dental-claim-service");
+  const { createDentalAgent: createAgent108 } =
+    require("../src/services/dental-store") as typeof import("../src/services/dental-store");
+
+  const db108 = dbFactoryPr108.getDb("dental");
+
+  // Seed 3 raw records: one clean, one needs_review, one rejected.
+  const cleanId = createAgent108({
+    org_nr: "777777001",
+    navn: "PR108 CLEAN CLINIC",
+    adresse: "Testgata 1",
+    postnummer: "0001",
+    poststed: "OSLO",
+    hjemmeside: null,
+    enrichment_state: "raw",
+  } as any);
+  const parkedId = createAgent108({
+    org_nr: "777777002",
+    navn: "PR108 PARKED JUNK",
+    adresse: "Testgata 2",
+    postnummer: "0001",
+    poststed: "OSLO",
+    hjemmeside: null,
+    enrichment_state: "raw",
+  } as any);
+  const rejectedId = createAgent108({
+    org_nr: "777777003",
+    navn: "PR108 REJECTED JUNK",
+    adresse: "Testgata 3",
+    postnummer: "0001",
+    poststed: "OSLO",
+    hjemmeside: null,
+    enrichment_state: "raw",
+  } as any);
+  db108
+    .prepare("UPDATE dental_agents SET verification_status = 'needs_review' WHERE id = ?")
+    .run(parkedId);
+  db108
+    .prepare("UPDATE dental_agents SET verification_status = 'rejected' WHERE id = ?")
+    .run(rejectedId);
+
+  // T1: default claim (no verification_status filter) skips parked + rejected.
+  {
+    const claimed = claimBatch108("worker-108-A", 10, { enrichment_state: "raw" });
+    const ids = claimed.map((r) => r.id);
+    assertTrue(ids.includes(cleanId), "pr108-01a: clean raw record is claimable");
+    assertTrue(!ids.includes(parkedId), "pr108-01b: needs_review record excluded from default claim");
+    assertTrue(!ids.includes(rejectedId), "pr108-01c: rejected record excluded from default claim");
+    releaseBatch108("worker-108-A", ids);
+  }
+
+  // T2: explicit verification_status filter still reaches parked records.
+  {
+    const claimed = claimBatch108("worker-108-B", 10, {
+      enrichment_state: "raw",
+      verification_status: "needs_review",
+    });
+    const ids = claimed.map((r) => r.id);
+    assertTrue(ids.includes(parkedId), "pr108-02a: explicit needs_review filter claims parked record");
+    assertTrue(!ids.includes(cleanId), "pr108-02b: explicit needs_review filter excludes clean record");
+    releaseBatch108("worker-108-B", ids);
+  }
+
+  // T3: regression -- pending_verify records remain claimable by default.
+  {
+    db108
+      .prepare("UPDATE dental_agents SET verification_status = 'pending_verify' WHERE id = ?")
+      .run(cleanId);
+    const claimed = claimBatch108("worker-108-C", 10, { enrichment_state: "raw" });
+    const ids = claimed.map((r) => r.id);
+    assertTrue(ids.includes(cleanId), "pr108-03: pending_verify record still claimable by default");
+    releaseBatch108("worker-108-C", ids);
+  }
+
+  // Cleanup.
+  if (prevPathPr108 === undefined) {
+    delete process.env.DENTAL_DB_PATH;
+  } else {
+    process.env.DENTAL_DB_PATH = prevPathPr108;
+  }
+  dbFactoryPr108.__resetDbFactoryForTesting();
+})();
+
 // ── PR-103 (2026-06-03): backend dental geocoding worker ────────────
 //
 // Tests the Kartverket-based geocoding worker introduced in
