@@ -13229,7 +13229,9 @@ console.log("\n── PR-109: finn-tannlege SSR + store extensions ──");
   // ── pr109-02: enrichment_state=raw filter
   {
     const raw = listDentalAgents({ enrichment_state: "raw" }, 100, 0);
-    assertTrue(raw.length === 2, "pr109-02: enrichment_state=raw returns 2 rows");
+    // 3 raw rows in seed: Bergen + Trondheim (pending) + Avvist (rejected) —
+    // listDentalAgents is the general pipeline lister and does NOT exclude rejected.
+    assertTrue(raw.length === 3, "pr109-02: enrichment_state=raw returns 3 rows");
     assertTrue(raw.every((r) => r.enrichment_state === "raw"),
       "pr109-02b: all returned rows have enrichment_state=raw");
   }
