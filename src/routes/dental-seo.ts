@@ -24,6 +24,8 @@ import {
   getDentalAgentById,
 } from "../services/dental-store";
 import type { DentalAgent } from "../services/dental-store";
+import { getDentalAgentCard } from "../services/dental-agent-card";
+import { getDentalOpenapi } from "../services/dental-openapi";
 
 const router = Router();
 
@@ -1306,9 +1308,24 @@ Finn-tannlege.com er en uavhengig søketjeneste for tannlegeklinikker i Norge.
 Databasen inneholder omtrent ${stats.total.toLocaleString("nb")} klinikker hentet fra
 Brønnøysundregistrene, HPR og klinikkenes egne nettsider.
 
-## API-endepunkt
+## A2A AI-discovery
 
-GET ${DENTAL_BASE_URL.replace("https://", "https://")}/api/tannlege/agents
+Agent Card (A2A-protokoll):   ${DENTAL_BASE_URL}/.well-known/agent-card.json
+Alias:                        ${DENTAL_BASE_URL}/agent-card.json
+A2A JSON-RPC 2.0 endepunkt:  ${DENTAL_BASE_URL}/a2a
+OpenAPI 3.1 spec:             ${DENTAL_BASE_URL}/openapi.json
+
+Støttede A2A JSON-RPC-metoder:
+- message/send  — søk klinikker med naturlig språk eller strukturerte filtre
+
+Eksempel (cURL):
+  curl -X POST ${DENTAL_BASE_URL}/a2a \\
+    -H "Content-Type: application/json" \\
+    -d '{"jsonrpc":"2.0","method":"message/send","params":{"message":{"text":"finn tannlege med helfo-avtale i Oslo"}},"id":"1"}'
+
+## REST API-endepunkt
+
+GET ${DENTAL_BASE_URL}/api/tannlege/agents
 
 Filterparametre (query string):
 - q             fritekst — matcher navn eller poststed
@@ -1327,6 +1344,20 @@ Respons: JSON-array med DentalAgent-objekter.
 ${DENTAL_BASE_URL}/klinikk/{navn-slugified}-{9-sifret-orgnr}
 
 Eksempel: ${DENTAL_BASE_URL}/klinikk/oslo-tannlegeklinikk-as-123456789
+
+## Spesialitet-sider
+
+${DENTAL_BASE_URL}/spesialitet/kjeveortopedi
+${DENTAL_BASE_URL}/spesialitet/oral-kirurgi-og-oral-medisin
+${DENTAL_BASE_URL}/spesialitet/periodonti
+${DENTAL_BASE_URL}/spesialitet/endodonti
+${DENTAL_BASE_URL}/spesialitet/pedodonti
+${DENTAL_BASE_URL}/spesialitet/oral-protetikk
+${DENTAL_BASE_URL}/spesialitet/kjeve-og-ansiktsradiologi
+
+## Slik fungerer det
+
+${DENTAL_BASE_URL}/hvordan-det-fungerer
 
 ## Lisens
 
@@ -1612,6 +1643,34 @@ router.get("/spesialitet/:slug", (req: Request, res: Response) => {
     canonical: canonicalUrl,
     jsonLd: itemList,
   }));
+});
+
+// ═══════════════════════════════════════════════════════════
+// PR-113: A2A discovery flater (FØR catch-all)
+// ═══════════════════════════════════════════════════════════
+
+// GET /.well-known/agent-card.json — A2A Agent Card (standard well-known path)
+router.get("/.well-known/agent-card.json", (_req: Request, res: Response) => {
+  res.header("Content-Type", "application/json; charset=utf-8");
+  res.header("Access-Control-Allow-Origin", "*");
+  res.header("Cache-Control", "public, max-age=300");
+  res.json(getDentalAgentCard());
+});
+
+// GET /agent-card.json — alias (some crawlers skip well-known prefix)
+router.get("/agent-card.json", (_req: Request, res: Response) => {
+  res.header("Content-Type", "application/json; charset=utf-8");
+  res.header("Access-Control-Allow-Origin", "*");
+  res.header("Cache-Control", "public, max-age=300");
+  res.json(getDentalAgentCard());
+});
+
+// GET /openapi.json — OpenAPI 3.1 spec for finn-tannlege.com
+router.get("/openapi.json", (_req: Request, res: Response) => {
+  res.header("Content-Type", "application/json; charset=utf-8");
+  res.header("Access-Control-Allow-Origin", "*");
+  res.header("Cache-Control", "public, max-age=300");
+  res.json(getDentalOpenapi());
 });
 
 // ═══════════════════════════════════════════════════════════

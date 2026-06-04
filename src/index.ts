@@ -130,6 +130,8 @@ if (process.env.ENABLE_DENTAL === "1") {
   const DENTAL_HOSTS = new Set(["finn-tannlege.com", "www.finn-tannlege.com"]);
   // eslint-disable-next-line @typescript-eslint/no-var-requires
   const dentalSeoRouter = require("./routes/dental-seo").default;
+  // eslint-disable-next-line @typescript-eslint/no-var-requires
+  const dentalA2aRouter = require("./routes/dental-a2a").default;
 
   app.use((req: any, res: any, next: any) => {
     const host = req.hostname;
@@ -140,10 +142,19 @@ if (process.env.ENABLE_DENTAL === "1") {
       return res.redirect(301, `https://finn-tannlege.com${req.originalUrl}`);
     }
 
-    // Pass API, health, and well-known through to existing routes
+    // Pass API and health through to existing rfb routes.
+    // NOTE: /.well-known/ is intentionally NOT passed through here —
+    // dental has its own well-known surfaces (agent-card.json, openapi.json)
+    // served by dental-seo and dental-a2a routers.
     const p = req.path;
-    if (p.startsWith("/api/") || p === "/health" || p.startsWith("/.well-known/")) {
+    if (p.startsWith("/api/") || p === "/health") {
       return next();
+    }
+
+    // /a2a endpoint → dental A2A JSON-RPC router (mounted before dental-seo below)
+    // dentalA2aRouter handles the /a2a prefix and applies its own rate limiting.
+    if (p === "/a2a" || p.startsWith("/a2a/")) {
+      return dentalA2aRouter(req, res, next);
     }
 
     // All other paths on dental hosts → dental-seo router
