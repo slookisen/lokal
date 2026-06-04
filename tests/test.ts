@@ -12735,6 +12735,167 @@ const _pr103Promise: Promise<void> = new Promise<void>((r) => { _pr103Resolve = 
   _pr103Resolve();
 });
 
+// ── PR-106: dental admin rate-limit raise ──────────────────────
+// Daniel asked for the per-IP rate limit on `/api/tannlege/*` to be
+// raised so 3 parallel dental-agent-enrichment workers can run
+// without hitting the 429-wall cascade. Implementation lives in:
+//   • src/middleware/security.ts → new `dentalLimiter` (max 1000/15min)
+//                                  + `skip` on generalLimiter for /api/tannlege
+//   • src/index.ts               → mounts dentalLimiter on /api/tannlege
+//                                  BEFORE the broad generalLimiter mount.
+//
+// These tests verify the configuration through source-inspection
+// (matches the PR-65 / PR-100b pattern used elsewhere in this file)
+// and through behavioural smoke-tests against the actual exported
+// limiter middleware via a tiny in-process Express app.
+console.log("\n── PR-106: dental admin rate-limit raise ──");
+(() => {
+  const fs6 = require("fs");
+  const path6 = require("path");
+
+  const secSrc = fs6.readFileSync(
+    path6.join(__dirname, "..", "src", "middleware", "security.ts"),
+    "utf8"
+  );
+  const idxSrc = fs6.readFileSync(
+    path6.join(__dirname, "..", "src", "index.ts"),
+    "utf8"
+  );
+
+  // pr106-01: dentalLimiter is exported with max=1000 + windowMs=15*60*1000.
+  assertTrue(
+    /export const dentalLimiter = rateLimit\(\{[\s\S]{0,400}max:\s*1000/.test(secSrc),
+    "pr106-01a: security.ts exports dentalLimiter with max: 1000"
+  );
+  assertTrue(
+    /export const dentalLimiter = rateLimit\(\{[\s\S]{0,400}windowMs:\s*15\s*\*\s*60\s*\*\s*1000/.test(secSrc),
+    "pr106-01b: dentalLimiter uses 15-minute window"
+  );
+
+  // pr106-02: generalLimiter has a `skip` callback that excludes /api/tannlege
+  // so the lower 300/15min general quota does not still gate dental requests.
+  assertTrue(
+    /export const generalLimiter = rateLimit\(\{[\s\S]{0,800}skip:[\s\S]{0,200}\/api\/tannlege/.test(secSrc),
+    "pr106-02: generalLimiter skips /api/tannlege so it does not double-cap dental requests"
+  );
+
+  // pr106-03: index.ts imports dentalLimiter and mounts it on /api/tannlege
+  // BEFORE the `app.use("/api", generalLimiter)` line (mount order matters —
+  // the dedicated limiter must run first when the route resolves).
+  assertTrue(
+    /dentalLimiter[\s\S]{0,200}from\s+["']\.\/middleware\/security["']/.test(idxSrc),
+    "pr106-03a: index.ts imports dentalLimiter from ./middleware/security"
+  );
+  assertTrue(
+    /app\.use\(["']\/api\/tannlege["'],\s*dentalLimiter\)/.test(idxSrc),
+    "pr106-03b: index.ts mounts dentalLimiter on /api/tannlege"
+  );
+  const idxDentalMountIdx = idxSrc.indexOf("app.use(\"/api/tannlege\", dentalLimiter)");
+  const idxGeneralMountIdx = idxSrc.indexOf("app.use(\"/api\", generalLimiter)");
+  assertTrue(
+    idxDentalMountIdx > -1 && idxGeneralMountIdx > -1 && idxDentalMountIdx < idxGeneralMountIdx,
+    "pr106-03c: dentalLimiter mount precedes generalLimiter mount in index.ts"
+  );
+
+  // pr106-04: rfb-side limiters left untouched. The other API limiters
+  // (general 300, jsonRpc 200, search 150, registration 50, admin 500)
+  // should keep their existing `max` values so PR-106 changes ONLY the
+  // dental vertical's quota.
+  assertTrue(
+    /export const generalLimiter = rateLimit\(\{[\s\S]{0,800}max:\s*300/.test(secSrc),
+    "pr106-04a: generalLimiter max still 300 (rfb unchanged)"
+  );
+  assertTrue(
+    /export const jsonRpcLimiter = rateLimit\(\{[\s\S]{0,400}max:\s*200/.test(secSrc),
+    "pr106-04b: jsonRpcLimiter max still 200 (rfb unchanged)"
+  );
+  assertTrue(
+    /export const searchLimiter = rateLimit\(\{[\s\S]{0,400}max:\s*150/.test(secSrc),
+    "pr106-04c: searchLimiter max still 150 (rfb unchanged)"
+  );
+  assertTrue(
+    /export const registrationLimiter = rateLimit\(\{[\s\S]{0,400}max:\s*50/.test(secSrc),
+    "pr106-04d: registrationLimiter max still 50 (rfb unchanged)"
+  );
+  assertTrue(
+    /export const adminLimiter = rateLimit\(\{[\s\S]{0,400}max:\s*500/.test(secSrc),
+    "pr106-04e: adminLimiter max still 500 (rfb unchanged)"
+  );
+})();
+
+// pr106-05/06: behavioural smoke-test — drive the real dentalLimiter
+// middleware with 100 successive synthetic requests from a unique IP
+// and assert NONE of them are rate-limited (well under the 1000 cap).
+// This proves the limiter is wired with the higher quota, not just
+// the source string. Uses a minimal in-process Express app on a
+// random port — no test DB involvement, no /api/tannlege routing,
+// just the middleware in isolation.
+let _pr106Resolve: () => void = () => {};
+const _pr106Promise: Promise<void> = new Promise<void>((r) => { _pr106Resolve = r; });
+(async () => {
+  try {
+    // Wait for any earlier IIFEs that pin the DB-singleton via
+    // __setDbForTesting (m2 owner-portal, pr103 dental geocode) to
+    // finish before we spin up our own Express server. The behavioural
+    // smoke-test does NOT touch any DB, but importing modules
+    // synchronously while m2 is mid-await can perturb event-loop
+    // ordering enough to make m2's HTTP-server requests race against
+    // its own seed inserts. Awaiting is cheap and removes the race.
+    try { await _m2Promise; } catch { /* failures already counted */ }
+    try { await _pr103Promise; } catch { /* failures already counted */ }
+    const express6 = require("express");
+    const http6 = require("http");
+    const sec6 = require("../src/middleware/security") as typeof import("../src/middleware/security");
+
+    const app6 = express6();
+    app6.set("trust proxy", true);
+    app6.use("/api/tannlege", sec6.dentalLimiter);
+    app6.get("/api/tannlege/ping", (_req: any, res: any) => res.status(200).json({ ok: true }));
+
+    const server6 = http6.createServer(app6);
+    await new Promise<void>((resolve) => server6.listen(0, "127.0.0.1", resolve));
+    const addr = server6.address();
+    const port6 = typeof addr === "object" && addr ? addr.port : 0;
+
+    // Use a unique X-Forwarded-For so the limiter's key for this test
+    // doesn't collide with anything else (and the limiter resets between
+    // test runs because each `npm test` boots a fresh process).
+    const testIp = "203.0.113." + Math.floor(Math.random() * 250 + 1);
+
+    // pr106-05: 100 successive requests all return 200.
+    let oks = 0;
+    let lastStatus = -1;
+    let lastRemaining = "?";
+    for (let i = 0; i < 100; i++) {
+      const r = await fetch(`http://127.0.0.1:${port6}/api/tannlege/ping`, {
+        headers: { "X-Forwarded-For": testIp },
+      });
+      lastStatus = r.status;
+      lastRemaining = r.headers.get("ratelimit-remaining") || "?";
+      if (r.status === 200) oks++;
+      await r.text(); // drain
+    }
+    assertEq(oks, 100, "pr106-05: 100 dental requests under the new 1000/15min cap all return 200");
+
+    // pr106-06: after 100 hits, ratelimit-remaining header reports we
+    // still have substantial room left. With max=1000 and 100 used,
+    // remaining should be ≈ 900 (express-rate-limit reports the
+    // standard-headers RateLimit-Remaining value as a string).
+    const remainingNum = Number(lastRemaining);
+    assertTrue(
+      Number.isFinite(remainingNum) && remainingNum >= 850 && remainingNum <= 999,
+      `pr106-06: ratelimit-remaining ~= 900 after 100 hits (got ${lastRemaining}, last status ${lastStatus})`
+    );
+
+    await new Promise<void>((resolve) => server6.close(() => resolve()));
+  } catch (err) {
+    failed++;
+    failures.push(`pr106 behavioural block crashed: ${err instanceof Error ? err.message : String(err)}`);
+  } finally {
+    _pr106Resolve();
+  }
+})();
+
 // ── REPORT ────────────────────────────────────────────────────────────
 
 // Wait for the M2 owner-portal async tests before reporting so their
@@ -12760,6 +12921,7 @@ const _pr103Promise: Promise<void> = new Promise<void>((r) => { _pr103Resolve = 
   try { await _pr94Promise; } catch { /* errors already pushed to failures */ }
   try { await _pr95Promise; } catch { /* errors already pushed to failures */ }
   try { await _pr103Promise; } catch { /* errors already pushed to failures */ }
+  try { await _pr106Promise; } catch { /* errors already pushed to failures */ }
   // Drop pre-existing intg failures (unmasked by awaiting) — they predate M2
   // and live behind a separate fix-it task. Counting them here would surface
   // a baseline failure that is not introduced by this PR.

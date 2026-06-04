@@ -13,6 +13,7 @@ import {
   corsOptions,
   MAX_REQUEST_SIZE,
   adminLimiter,
+  dentalLimiter,
 } from "./middleware/security";
 import producerRoutes from "./routes/producer";
 import consumerRoutes from "./routes/consumer";
@@ -143,6 +144,12 @@ app.use("/api/marketplace/discover", searchLimiter);
 app.use("/api/marketplace/admin", adminLimiter);
 app.delete("/api/marketplace/agents/:id", adminLimiter);
 app.post("/admin/analytics/prune", adminLimiter);
+// PR-106: dental vertical has its own per-IP quota (1000/15min) so
+// 3 parallel dental-agent-enrichment workers can run without hitting
+// the lower general-API limit. Must be mounted BEFORE generalLimiter
+// so it's the first quota tannlege requests are accounted against.
+// generalLimiter also `skip`s tannlege paths — see security.ts.
+app.use("/api/tannlege", dentalLimiter);
 // Everything else gets the general limiter
 app.use("/api", generalLimiter);
 

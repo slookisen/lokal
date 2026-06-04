@@ -100,13 +100,41 @@ const sharedValidate = { trustProxy: false } as const;
 // ─── Rate Limiters ───────────────────────────────────────────
 
 // General API limiter — raised to 300/15min for enrichment runs (200 agents × ~2 req each)
+//
+// PR-106: `/api/tannlege/*` is excluded via the `skip` callback below.
+// The dental vertical has its own dedicated `dentalLimiter` (1000/15min)
+// to support 3 parallel dental-agent-enrichment workers (~36 PUTs/min
+// sustained). Without this skip, the lower general limit would still
+// gate tannlege requests because both limiters would chain.
 export const generalLimiter = rateLimit({
   windowMs: 15 * 60 * 1000, // 15 minutes
   max: 300,
   standardHeaders: true,
   legacyHeaders: false,
   validate: sharedValidate,
+  skip: (req) => {
+    const fullPath = (req.baseUrl || "") + (req.path || "");
+    return fullPath.startsWith("/api/tannlege");
+  },
   message: { success: false, error: "For mange forespørsler. Prøv igjen senere." },
+});
+
+// PR-106: Dedicated limiter for /api/tannlege/* (dental vertical).
+// Sized to fit 3 parallel dental-agent-enrichment workers doing the
+// per-field-PUT model (~12-15 PUTs/min each = ~36-45/min combined),
+// plus headroom for the verifier, orchestrator, and manual probes.
+// 1000 per 15 minutes ≈ 66/min sustained.
+//
+// The dental admin endpoints already require an `X-Admin-Key` header,
+// so the limiter exists only as a defence-in-depth quota, not as the
+// primary auth boundary. Increasing it does not weaken auth.
+export const dentalLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 minutes
+  max: 1000,
+  standardHeaders: true,
+  legacyHeaders: false,
+  validate: sharedValidate,
+  message: { success: false, error: "For mange forespørsler mot tannlege-API. Prøv igjen senere." },
 });
 
 // JSON-RPC limiter (agents are chatty, so more generous)
