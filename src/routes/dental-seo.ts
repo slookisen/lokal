@@ -1832,7 +1832,8 @@ router.get("/sted/:stedSlug", (req: Request, res: Response) => {
   const poststeder = getCachedPoststeder();
   const stedMap = new Map<string, PoststedRow>();
   for (const p of poststeder) {
-    stedMap.set(slugifyText(p.poststed), p);
+    // first-write-wins: keeps the highest-count row when two poststeder slug to the same value
+    if (!stedMap.has(slugifyText(p.poststed))) stedMap.set(slugifyText(p.poststed), p);
   }
 
   const stedRow = stedMap.get(stedSlugParam);
