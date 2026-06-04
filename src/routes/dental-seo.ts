@@ -18,7 +18,7 @@
 import { Router, Request, Response } from "express";
 import {
   listPublicDentalAgents,
-  countDentalAgents,
+  countPublicDentalAgents,
   getDentalStats,
   getDentalAgentByOrgnr,
   getDentalAgentById,
@@ -30,6 +30,22 @@ const router = Router();
 const DENTAL_BASE_URL =
   process.env.DENTAL_BASE_URL || "https://finn-tannlege.com";
 
+// ─── Stats TTL cache (60 s) ──────────────────────────────────
+// Cache getDentalStats() results in this module. dental-store has no cache
+// so API consumers always get fresh data; only SSR pages use the cache.
+let _dentalStatsCache: { value: ReturnType<typeof getDentalStats>; expires: number } | null = null;
+const DENTAL_STATS_TTL_MS = 60_000;
+
+function getCachedDentalStats(): ReturnType<typeof getDentalStats> {
+  const now = Date.now();
+  if (_dentalStatsCache && now < _dentalStatsCache.expires) {
+    return _dentalStatsCache.value;
+  }
+  const value = getDentalStats();
+  _dentalStatsCache = { value, expires: now + DENTAL_STATS_TTL_MS };
+  return value;
+}
+
 // ─── Security: HTML escape ───────────────────────────────────
 function escapeHtml(text: unknown): string {
   if (text === null || text === undefined) return "";
@@ -39,6 +55,21 @@ function escapeHtml(text: unknown): string {
     .replace(/>/g, "&gt;")
     .replace(/"/g, "&quot;")
     .replace(/'/g, "&#39;");
+}
+
+// ─── Security: safeUrl — only allow http(s) URLs from DB data ────────────
+// Returns the URL unchanged if http:// or https://, otherwise "" (no link rendered).
+function safeUrl(u: string | null | undefined): string {
+  if (!u) return "";
+  return /^https?:\/\//i.test(u) ? u : "";
+}
+
+// ─── Security: safeTelHref — build tel: href from phone field ────────────
+// Strips everything except digits, +. Returns "" if result < 8 chars (no render).
+function safeTelHref(telefon: string | null | undefined): string {
+  if (!telefon) return "";
+  const stripped = telefon.replace(/[^+\d]/g, "");
+  return stripped.length >= 8 ? "tel:" + stripped : "";
 }
 
 // ─── Slug helpers ────────────────────────────────────────────
@@ -55,7 +86,7 @@ export function slugifyClinic(navn: string, orgNr?: string | null): string {
     .replace(/[^a-z0-9]+/g, "-")
     .replace(/^-+|-+$/g, "");
   if (orgNr && /^\d{9}$/.test(orgNr.replace(/\s/g, ""))) {
-    return `${slug}-${orgNr.replace(/\s/g, "")}`;
+    return `${slug}--${orgNr.replace(/\s/g, "")}`;
   }
   return slug;
 }
@@ -64,9 +95,13 @@ export function parseClinicSlug(
   slug: string
 ): { orgNr: string } | null {
   if (!slug) return null;
-  const m = slug.match(/-(\d{9})$/);
-  if (!m) return null;
-  return { orgNr: m[1]! };
+  // New separator: double dash (--) between name-slug and org_nr
+  const m = slug.match(/--(\d{9})$/);
+  if (m) return { orgNr: m[1]! };
+  // Backward-compat: single dash (old format, no live traffic yet)
+  const mOld = slug.match(/-(\d{9})$/);
+  if (mOld) return { orgNr: mOld[1]! };
+  return null;
 }
 
 // ─── "Åpent nå" helper ───────────────────────────────────────
@@ -90,6 +125,10 @@ function isOpenNow(
   const nowMin = now.getHours() * 60 + now.getMinutes();
   const openMin = (oh ?? 0) * 60 + (om ?? 0);
   const closeMin = (ch ?? 0) * 60 + (cm ?? 0);
+  // Handle overnight spans (e.g. 22:00–02:00)
+  if (closeMin <= openMin) {
+    return nowMin >= openMin || nowMin < closeMin;
+  }
   return nowMin >= openMin && nowMin < closeMin;
 }
 
@@ -328,7 +367,7 @@ function dentalShell(content: string, opts: ShellOptions): string {
     ? (Array.isArray(opts.jsonLd) ? opts.jsonLd : [opts.jsonLd])
     : [];
   const ldScripts = ldArr
-    .map((ld) => `<script type="application/ld+json">${JSON.stringify(ld)}</script>`)
+    .map((ld) => `<script type="application/ld+json">${JSON.stringify(ld).replace(/<\//g, "<\\/")}</script>`)
     .join("\n");
   return `<!DOCTYPE html>
 <html lang="nb">
@@ -384,8 +423,9 @@ function clinicCard(
       ? `<div style="margin-top:6px;font-size:.8rem;color:var(--g500)">${agent.available_specialties.map(escapeHtml).join(", ")}</div>`
       : "";
 
-  const phone = agent.telefon
-    ? `<div class="clinic-meta">${ICON_PHONE} <a href="tel:${escapeHtml(agent.telefon)}">${escapeHtml(agent.telefon)}</a></div>`
+  const _telHref = safeTelHref(agent.telefon);
+  const phone = _telHref
+    ? `<div class="clinic-meta">${ICON_PHONE} <a href="${_telHref}">${escapeHtml(agent.telefon)}</a></div>`
     : "";
 
   return `<article class="clinic-card">
@@ -432,7 +472,7 @@ function paginationHtml(
 
 router.get("/", (_req: Request, res: Response) => {
   let stats = { total: 0, per_fylke: [] as Array<{ fylke: string; count: number }>, helfo_count: 0, chain_count: 0, acute_count: 0, specialist_clinic_count: 0 };
-  try { stats = getDentalStats(); } catch { /* dental db may not be ready */ }
+  try { stats = getCachedDentalStats(); } catch { /* dental db may not be ready */ }
 
   const totalRounded = stats.total > 6000
     ? `over ${Math.floor(stats.total / 100) * 100}`
@@ -592,7 +632,7 @@ router.get("/sok", (req: Request, res: Response) => {
   let total = 0;
   try {
     agents = listPublicDentalAgents(filter as any, PAGE_SIZE, offset);
-    total = countDentalAgents(filter as any);
+    total = countPublicDentalAgents(filter as any);
   } catch { /* db not ready */ }
 
   const totalPages = Math.max(1, Math.ceil(total / PAGE_SIZE));
@@ -637,7 +677,7 @@ router.get("/sok", (req: Request, res: Response) => {
               <option value="">Alle fylker</option>
               ${(() => {
                 let stats2 = { per_fylke: [] as Array<{ fylke: string; count: number }> };
-                try { stats2 = getDentalStats(); } catch { /* ok */ }
+                try { stats2 = getCachedDentalStats(); } catch { /* ok */ }
                 return stats2.per_fylke
                   .map((f) => `<option value="${escapeHtml(f.fylke)}"${fylke === f.fylke ? " selected" : ""}>${escapeHtml(f.fylke)} (${f.count})</option>`)
                   .join("");
@@ -718,11 +758,13 @@ function renderClinicProfile(
     badges.push(`<span class="badge badge-chain">${escapeHtml(agent.chain_brand)}</span>`);
 
   // ── Action buttons
-  const callBtn = agent.telefon
-    ? `<a href="tel:${escapeHtml(agent.telefon)}" class="btn-call">${ICON_PHONE} Ring ${escapeHtml(agent.telefon)}</a>`
+  const _callTelHref = safeTelHref(agent.telefon);
+  const callBtn = _callTelHref
+    ? `<a href="${_callTelHref}" class="btn-call">${ICON_PHONE} Ring ${escapeHtml(agent.telefon)}</a>`
     : "";
-  const bookBtn = agent.online_booking_url
-    ? `<a href="${escapeHtml(agent.online_booking_url)}" rel="nofollow noopener" target="_blank" class="btn-book">Book time online</a>`
+  const _bookUrl = safeUrl(agent.online_booking_url);
+  const bookBtn = _bookUrl
+    ? `<a href="${escapeHtml(_bookUrl)}" rel="nofollow noopener" target="_blank" class="btn-book">Book time online</a>`
     : "";
 
   // ── Om oss
@@ -733,10 +775,10 @@ function renderClinicProfile(
   // ── Key info grid
   const infoItems: string[] = [];
   if (agent.adresse) infoItems.push(`<div class="info-item"><div class="info-label">Adresse</div><div class="info-value">${escapeHtml(agent.adresse)}${agent.postnummer ? `, ${escapeHtml(agent.postnummer)}` : ""}${agent.poststed ? ` ${escapeHtml(agent.poststed)}` : ""}</div></div>`);
-  if (agent.telefon) infoItems.push(`<div class="info-item"><div class="info-label">Telefon</div><div class="info-value"><a href="tel:${escapeHtml(agent.telefon)}">${escapeHtml(agent.telefon)}</a></div></div>`);
-  if (agent.mobil) infoItems.push(`<div class="info-item"><div class="info-label">Mobil</div><div class="info-value"><a href="tel:${escapeHtml(agent.mobil)}">${escapeHtml(agent.mobil)}</a></div></div>`);
+  { const h = safeTelHref(agent.telefon); if (h) infoItems.push(`<div class="info-item"><div class="info-label">Telefon</div><div class="info-value"><a href="${h}">${escapeHtml(agent.telefon)}</a></div></div>`); }
+  { const h = safeTelHref(agent.mobil); if (h) infoItems.push(`<div class="info-item"><div class="info-label">Mobil</div><div class="info-value"><a href="${h}">${escapeHtml(agent.mobil)}</a></div></div>`); }
   if (agent.epost) infoItems.push(`<div class="info-item"><div class="info-label">E-post</div><div class="info-value"><a href="mailto:${escapeHtml(agent.epost)}">${escapeHtml(agent.epost)}</a></div></div>`);
-  if (agent.hjemmeside) infoItems.push(`<div class="info-item"><div class="info-label">Hjemmeside</div><div class="info-value"><a href="${escapeHtml(agent.hjemmeside)}" rel="nofollow noopener" target="_blank">${escapeHtml(agent.hjemmeside.replace(/^https?:\/\//,""))}</a></div></div>`);
+  { const u = safeUrl(agent.hjemmeside); if (u) infoItems.push(`<div class="info-item"><div class="info-label">Hjemmeside</div><div class="info-value"><a href="${escapeHtml(u)}" rel="nofollow noopener" target="_blank">${escapeHtml(u.replace(/^https?:\/\//,""))}</a></div></div>`); }
   if (agent.org_nr) infoItems.push(`<div class="info-item"><div class="info-label">Organisasjonsnr.</div><div class="info-value">${escapeHtml(agent.org_nr)}</div></div>`);
   if (agent.registreringsdato) infoItems.push(`<div class="info-item"><div class="info-label">Registrert</div><div class="info-value">${escapeHtml(agent.registreringsdato)}</div></div>`);
   if (agent.antall_ansatte !== null && agent.antall_ansatte !== undefined) infoItems.push(`<div class="info-item"><div class="info-label">Antall ansatte</div><div class="info-value">${escapeHtml(String(agent.antall_ansatte))}</div></div>`);
@@ -813,7 +855,7 @@ function renderClinicProfile(
     name: agent.navn,
     url: canonical,
     ...(agent.telefon ? { telephone: agent.telefon } : {}),
-    ...(agent.hjemmeside ? { sameAs: agent.hjemmeside } : {}),
+    ...(safeUrl(agent.hjemmeside) ? { sameAs: safeUrl(agent.hjemmeside) } : {}),
     address: {
       "@type": "PostalAddress",
       ...(agent.adresse ? { streetAddress: agent.adresse } : {}),
@@ -922,7 +964,7 @@ router.get("/fylke/:fylke", (req: Request, res: Response) => {
   const fylkeParam = String(req.params.fylke);
 
   let stats = { per_fylke: [] as Array<{ fylke: string; count: number }> };
-  try { stats = getDentalStats(); } catch { /* ok */ }
+  try { stats = getCachedDentalStats(); } catch { /* ok */ }
 
   // Case-insensitive match
   const matchedFylke = stats.per_fylke.find(
@@ -944,7 +986,7 @@ router.get("/fylke/:fylke", (req: Request, res: Response) => {
   let total = 0;
   try {
     agents = listPublicDentalAgents({ fylke: matchedFylke.fylke }, PAGE_SIZE, offset);
-    total = countDentalAgents({ fylke: matchedFylke.fylke });
+    total = countPublicDentalAgents({ fylke: matchedFylke.fylke });
   } catch { /* ok */ }
 
   const totalPages = Math.max(1, Math.ceil(total / PAGE_SIZE));
@@ -1075,7 +1117,7 @@ router.get("/sitemap.xml", (_req: Request, res: Response) => {
   try {
     const today = new Date().toISOString().split("T")[0];
     let stats = { per_fylke: [] as Array<{ fylke: string; count: number }> };
-    try { stats = getDentalStats(); } catch { /* ok */ }
+    try { stats = getCachedDentalStats(); } catch { /* ok */ }
 
     let xml = `<?xml version="1.0" encoding="UTF-8"?>
 <urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">`;
@@ -1174,7 +1216,7 @@ Sitemap: ${DENTAL_BASE_URL}/sitemap.xml
 
 router.get("/llms.txt", (_req: Request, res: Response) => {
   let stats = { total: 0 };
-  try { stats = getDentalStats(); } catch { /* ok */ }
+  try { stats = getCachedDentalStats(); } catch { /* ok */ }
 
   res.setHeader("Content-Type", "text/plain; charset=utf-8");
   res.send(`# finn-tannlege.com — LLM-oversikt

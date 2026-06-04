@@ -129,6 +129,36 @@ app.use("/", agentReadinessRoutes);
 // Mounted at root because it serves both /api/agents/:id/* and /magic-link-verify.
 app.use("/", ownerPortalRoutes);
 
+// ─── PR-109: finn-tannlege.com host routing ───────────────────────────
+// Registered BEFORE express.static so dental-host requests never
+// hit rfb static assets. Security/analytics middleware above already
+// ran. API, health, and well-known paths pass through via next().
+// Lazy-require so dental-seo only loads when ENABLE_DENTAL=1.
+if (process.env.ENABLE_DENTAL === "1") {
+  const DENTAL_HOSTS = new Set(["finn-tannlege.com", "www.finn-tannlege.com"]);
+  // eslint-disable-next-line @typescript-eslint/no-var-requires
+  const dentalSeoRouter = require("./routes/dental-seo").default;
+
+  app.use((req: any, res: any, next: any) => {
+    const host = req.hostname;
+    if (!DENTAL_HOSTS.has(host)) return next();
+
+    // www → apex canonical redirect
+    if (host === "www.finn-tannlege.com") {
+      return res.redirect(301, `https://finn-tannlege.com${req.originalUrl}`);
+    }
+
+    // Pass API, health, and well-known through to existing routes
+    const p = req.path;
+    if (p.startsWith("/api/") || p === "/health" || p.startsWith("/.well-known/")) {
+      return next();
+    }
+
+    // All other paths on dental hosts → dental-seo router
+    return dentalSeoRouter(req, res, next);
+  });
+}
+
 // Serve the marketplace dashboard
 app.use(express.static(path.join(__dirname, "public"), { extensions: ["html"] }));
 
@@ -430,39 +460,6 @@ app.post("/admin/email-bounces", adminLimiter, express.json(), (req, res) => {
     res.status(500).json({ error: "Record failed", detail: err.message });
   }
 });
-
-// ─── PR-109: finn-tannlege.com host routing ───────────────────────────
-// Lazy-require so dental-seo only loads when ENABLE_DENTAL=1.
-// Gate: if hostname is finn-tannlege.com (or www.), intercept the request.
-//   a) www.finn-tannlege.com → 301 to apex (mirrors rfb www-redirect above)
-//   b) /api/*, /health, /.well-known/* → let existing routes handle them
-//   c) everything else → dental-seo router (has its own catch-all 404)
-// next() is called immediately when hostname does NOT match — zero overhead
-// for all rettfrabonden.com requests.
-if (process.env.ENABLE_DENTAL === "1") {
-  const DENTAL_HOSTS = new Set(["finn-tannlege.com", "www.finn-tannlege.com"]);
-  // eslint-disable-next-line @typescript-eslint/no-var-requires
-  const dentalSeoRouter = require("./routes/dental-seo").default;
-
-  app.use((req: any, res: any, next: any) => {
-    const host = req.hostname;
-    if (!DENTAL_HOSTS.has(host)) return next();
-
-    // www → apex canonical redirect
-    if (host === "www.finn-tannlege.com") {
-      return res.redirect(301, `https://finn-tannlege.com${req.originalUrl}`);
-    }
-
-    // Pass API, health, and well-known through to existing routes
-    const p = req.path;
-    if (p.startsWith("/api/") || p === "/health" || p.startsWith("/.well-known/")) {
-      return next();
-    }
-
-    // All other paths on dental hosts → dental-seo router
-    return dentalSeoRouter(req, res, next);
-  });
-}
 
 // Conversation UI — /samtaler and /samtale/:id (before SEO catch-all)
 app.use("/", conversationUiRoutes);

@@ -13183,6 +13183,7 @@ console.log("\n── PR-109: finn-tannlege SSR + store extensions ──");
     listDentalAgents,
     listPublicDentalAgents,
     countDentalAgents,
+    countPublicDentalAgents,
     getDentalStats,
   } = store109;
 
@@ -13277,10 +13278,20 @@ console.log("\n── PR-109: finn-tannlege SSR + store extensions ──");
     assertEq(countAll, listAll.length, "pr109-07a: countDentalAgents({}) matches listDentalAgents length");
 
     const countRaw = countDentalAgents({ enrichment_state: "raw" });
-    assertEq(countRaw, 2, "pr109-07b: countDentalAgents(raw) = 2");
+    // enrichment_state=raw has 3 rows total (incl. rejected): Bergen, Trondheim, Avvist
+    assertEq(countRaw, 3, "pr109-07b: countDentalAgents(raw) = 3 (includes rejected)");
 
     const countOslo = countDentalAgents({ q: "oslo" });
     assertTrue(countOslo >= 2, "pr109-07c: countDentalAgents(q=oslo) >= 2");
+  }
+
+  // ── pr109-07d/e: countPublicDentalAgents excludes rejected
+  {
+    const publicAll = countPublicDentalAgents({});
+    assertEq(publicAll, 5, "pr109-07d: countPublicDentalAgents({}) = 5 (excludes rejected)");
+
+    const publicRaw = countPublicDentalAgents({ enrichment_state: "raw" });
+    assertEq(publicRaw, 2, "pr109-07e: countPublicDentalAgents(raw) = 2 (Bergen+Trondheim, no rejected)");
   }
 
   // ── pr109-08: listPublicDentalAgents excludes rejected + sorts verified first
@@ -13320,18 +13331,18 @@ console.log("\n── PR-109: finn-tannlege SSR + store extensions ──");
     // Standard ASCII
     {
       const s = slugifyClinic("Oslo Tannklinikk AS", "912345678");
-      assertEq(s, "oslo-tannklinikk-as-912345678", "pr109-10a: basic slug");
+      assertEq(s, "oslo-tannklinikk-as--912345678", "pr109-10a: basic slug uses -- separator");
       const p = parseClinicSlug(s);
-      assertEq(p?.orgNr, "912345678", "pr109-10b: parse recovers orgNr");
+      assertEq(p?.orgNr, "912345678", "pr109-10b: parse recovers orgNr from -- slug");
     }
 
     // æøå → ae/oe/aa
     {
       const s = slugifyClinic("Tannlege Bø & Sønn AS", "912345678");
-      assertEq(s, "tannlege-boe-soenn-as-912345678",
-        "pr109-10c: æøå transliterated (Bø→boe, Sønn→soenn)");
+      assertEq(s, "tannlege-boe-soenn-as--912345678",
+        "pr109-10c: æøå transliterated (Bø→boe, Sønn→soenn), -- separator");
       const p = parseClinicSlug(s);
-      assertEq(p?.orgNr, "912345678", "pr109-10d: parse roundtrip for æøå slug");
+      assertEq(p?.orgNr, "912345678", "pr109-10d: parse roundtrip for æøå slug with -- separator");
     }
 
     // No org_nr → no suffix
@@ -13352,6 +13363,25 @@ console.log("\n── PR-109: finn-tannlege SSR + store extensions ──");
     {
       const p = parseClinicSlug("some-clinic-12345678");
       assertEq(p, null, "pr109-10h: 8-digit suffix → null (must be 9 digits)");
+    }
+
+    // Name-slug whose last word happens to be 9 digits but uses single dash (old format)
+    // should still parse via fallback. New -- format must not confuse single-dash names.
+    {
+      // Single-dash fallback still works (old format)
+      const p = parseClinicSlug("oslo-tannklinikk-912345678");
+      assertEq(p?.orgNr, "912345678", "pr109-10i: single-dash fallback still parses (backward compat)");
+    }
+
+    // Name slug that ends in 9 digits WITHOUT any separator that looks like org_nr
+    // but uses single-dash → still parsed by fallback (this is acceptable)
+    // The key protection is that names with -- only → exact match required
+    {
+      // A name that legitimately ends in 9 digits with single dash: parsed by fallback
+      const pAmbig = parseClinicSlug("klinikk-name-123456789");
+      // With the -- separator, ambiguous single-dash slugs still resolve via fallback.
+      // The real protection: new slugs always use -- so there is no false-positive for new URLs.
+      assertEq(pAmbig?.orgNr, "123456789", "pr109-10j: single-dash 9-digit suffix → parsed via fallback (expected behaviour)");
     }
   }
 

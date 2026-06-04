@@ -437,6 +437,36 @@ export function countDentalAgents(filter: ListFilter = {}): number {
 }
 
 /**
+ * Like countDentalAgents but always excludes verification_status='rejected'.
+ * Used by public-facing pages (/sok, /fylke) where rejected clinics
+ * must not appear in the total count shown to visitors.
+ */
+export function countPublicDentalAgents(filter: ListFilter = {}): number {
+  const parsed = ListFilterSchema.parse(filter);
+  const db = getDb("dental");
+
+  const where: string[] = ["verification_status != 'rejected'"];
+  const params: Record<string, unknown> = {};
+
+  if (parsed.fylke) { where.push("fylke = @fylke"); params.fylke = parsed.fylke; }
+  if (parsed.chain_brand) { where.push("chain_brand = @chain_brand"); params.chain_brand = parsed.chain_brand; }
+  if (parsed.verification_status && parsed.verification_status !== "rejected") {
+    where.push("verification_status = @verification_status");
+    params.verification_status = parsed.verification_status;
+  }
+  if (parsed.specialty) { where.push("available_specialties LIKE @specialty"); params.specialty = `%"${parsed.specialty}"%`; }
+  if (parsed.q) { where.push("(navn LIKE @q OR poststed LIKE @q)"); params.q = `%${parsed.q}%`; }
+  if (parsed.helfo_agreement !== undefined) { where.push("helfo_agreement = @helfo_agreement"); params.helfo_agreement = parsed.helfo_agreement; }
+  if (parsed.acute_vakt !== undefined) { where.push("acute_vakt = @acute_vakt"); params.acute_vakt = parsed.acute_vakt; }
+  if (parsed.enrichment_state !== undefined) { where.push("enrichment_state = @enrichment_state"); params.enrichment_state = parsed.enrichment_state; }
+
+  const sql = "SELECT COUNT(*) AS n FROM dental_agents" +
+    ` WHERE ${where.join(" AND ")}`;
+  const row = db.prepare(sql).get(params) as { n: number };
+  return row.n;
+}
+
+/**
  * Public-facing list: same WHERE building as listDentalAgents but
  * ALWAYS excludes verification_status='rejected', and applies a
  * quality-first sort: verified first, then enriched, then those with
