@@ -44,6 +44,59 @@ export function canonicalFylker(perFylke: Array<{ fylke: string; count: number }
   return perFylke.filter((f) => KNOWN_FYLKER_LC.has((f.fylke || "").toLowerCase()));
 }
 
+// ─── Brand / Logo constants (PR-112) ────────────────────────
+// Tooth SVG path — reused in nav logo, favicon, and future assets.
+const TOOTH_PATH = "M18 0 C8 0 2 7 2 16 C2 23 5 26 6 32 C7 39 9 46 12 46 C15 46 14 36 18 36 C22 36 21 46 24 46 C27 46 29 39 30 32 C31 26 34 23 34 16 C34 7 28 0 18 0 Z";
+
+// ─── Specialty pages (PR-112) ────────────────────────────────
+// 7 godkjente tannlegespesialiteter i Norge (Helsedirektoratets liste).
+// Slug bruker samme translittereringsprinsipper som slugifyClinic:
+// ae/oe/aa for aeoaa, mellomrom/spesialtegn → bindestreker.
+// Verdiene i "navn" MÅ samsvare nøyaktig med SPECIALTIES-listen under.
+export interface SpecialtyPage { slug: string; navn: string; beskrivelse: string; }
+export const SPECIALTY_PAGES: SpecialtyPage[] = [
+  {
+    slug: "kjeveortopedi",
+    navn: "kjeveortopedi",
+    beskrivelse: "Kjeveortopedi handler om å rette opp skjevstilte tenner og feilstilte kjever — oftest med tannregulering (bøyle), klarskinne eller andre apparater. Typiske henvisningsgrunner er trangstilte tenner, underbitt, overbitt og kjeveanomalier som påvirker tygging eller utseende.",
+  },
+  {
+    slug: "oral-kirurgi-og-oral-medisin",
+    navn: "oral kirurgi og oral medisin",
+    beskrivelse: "Oral kirurgi og oral medisin dekker kirurgiske inngrep i munn og kjeve samt diagnostikk og behandling av sykdommer i munnslimhinnen. Typiske henvisningsgrunner er visdomstannfjerning med komplikasjoner, kjevecyster, beinimplantater og sår i munnen som ikke gror.",
+  },
+  {
+    slug: "periodonti",
+    navn: "periodonti",
+    beskrivelse: "Periodonti er spesialiteten for tannkjøtt og det støttevevet som holder tennene på plass. Periodontitter (tannkjøttbetennelse som angriper beinvev) er den vanligste henvisningsårsaken, i tillegg til graftoperasjoner for å dekke eksponerte tannhalser.",
+  },
+  {
+    slug: "endodonti",
+    navn: "endodonti",
+    beskrivelse: "Endodonti er spesialiteten for rotbehandling — behandling av pulpa (nerven) og rotkanalene inne i tannen. Typiske henvisningsgrunner er kompliserte rotbehandlinger, re-behandling av tidligere mislykkede rotfyllinger og tannrot-kirurgi (apikal kirurgi).",
+  },
+  {
+    slug: "pedodonti",
+    navn: "pedodonti",
+    beskrivelse: "Pedodonti er spesialiteten for tannbehandling av barn og unge, inkludert pasienter med særlige behov. Typiske henvisninger: melketannproblemer, tannutviklingsforstyrrelser, odontofobi og behov for behandling i narkose.",
+  },
+  {
+    slug: "oral-protetikk",
+    navn: "oral protetikk",
+    beskrivelse: "Oral protetikk dekker erstatning av manglende tenner og gjenoppbygging av tannsettet med proteser, kroner, broer og implantatbaserte løsninger. Typiske henvisninger: store tap av tannsubstans, komplekse rehabiliteringer og behandling av bittproblemer.",
+  },
+  {
+    slug: "kjeve-og-ansiktsradiologi",
+    navn: "kjeve- og ansiktsradiologi",
+    beskrivelse: "Kjeve- og ansiktsradiologi er spesialiteten for bildediagnostikk av tenner, kjever og ansiktsskjelett ved hjelp av røntgen, CBCT og andre metoder. Typiske henvisninger: utredning av komplekse tann- og kjeveanomalier, implantatplanlegging og mistanke om svulster eller cyster.",
+  },
+];
+
+// Lookup-hjelpefunksjon for spesialitet-slug
+export function findSpecialtyBySlug(slug: string): SpecialtyPage | undefined {
+  return SPECIALTY_PAGES.find((s) => s.slug === slug);
+}
+
 // ─── Stats TTL cache (60 s) ──────────────────────────────────
 // Cache getDentalStats() results in this module. dental-store has no cache
 // so API consumers always get fresh data; only SSR pages use the cache.
@@ -316,6 +369,10 @@ a:hover{text-decoration:underline}
 .footer-col a:hover{color:var(--white)}
 .footer-bottom{max-width:1100px;margin:24px auto 0;padding-top:16px;border-top:1px solid rgba(255,255,255,.1);font-size:.78rem;color:rgba(255,255,255,.4)}
 
+/* SPECIALTY CHIPS */
+.spec-chip{display:inline-block;padding:7px 18px;border-radius:20px;background:var(--section-bg);border:1px solid var(--g200);color:var(--navy);font-size:.83rem;font-weight:500;text-decoration:none;transition:all .15s}
+.spec-chip:hover{background:var(--teal-700);color:var(--white);border-color:var(--teal-700);text-decoration:none}
+
 /* EMPTY STATE */
 .empty-state{text-align:center;padding:64px 24px}
 .empty-state h3{font-size:1.2rem;font-weight:700;color:var(--navy);margin-bottom:8px}
@@ -326,7 +383,7 @@ a:hover{text-decoration:underline}
 
 function dentalNav(): string {
   return `<nav class="nav" role="navigation" aria-label="Hovednavigasjon">
-  <a href="/" class="nav-logo">${ICON_TOOTH} Finn-tannlege</a>
+  <a href="/" class="nav-logo"><svg width="26" height="26" viewBox="0 0 72 72" aria-hidden="true"><circle cx="30" cy="30" r="24" fill="none" stroke="#0F766E" stroke-width="7"/><line x1="48" y1="48" x2="64" y2="64" stroke="#0F766E" stroke-width="9" stroke-linecap="round"/><g transform="translate(16,11) scale(0.78)"><path d="${TOOTH_PATH}" fill="#0F766E"/></g></svg> Finn-tannlege</a>
   <div class="nav-links">
     <a href="/sok">Søk</a>
     <a href="/#fylker">Fylker</a>
@@ -342,6 +399,7 @@ function dentalFooter(): string {
     <div class="footer-col">
       <h4>Tjeneste</h4>
       <a href="/om">Om finn-tannlege.com</a>
+      <a href="/hvordan-det-fungerer">Slik fungerer det</a>
       <a href="/personvern">Personvern</a>
       <a href="/sok">Søk etter tannlege</a>
     </div>
@@ -391,6 +449,7 @@ function dentalShell(content: string, opts: ShellOptions): string {
 <title>${escapeHtml(opts.title)}</title>
 <meta name="description" content="${escapeHtml(desc)}">
 <link rel="canonical" href="${escapeHtml(canonical)}">
+<link rel="icon" type="image/svg+xml" href="/favicon.svg">
 <meta property="og:title" content="${escapeHtml(opts.title)}">
 <meta property="og:description" content="${escapeHtml(desc)}">
 <meta property="og:url" content="${escapeHtml(canonical)}">
@@ -432,10 +491,16 @@ function clinicCard(
         : `<span class="badge badge-closed">${ICON_CLOCK} Stengt nå</span>`)
     : "";
 
-  const specialties =
-    agent.available_specialties && agent.available_specialties.length > 0
-      ? `<div style="margin-top:6px;font-size:.8rem;color:var(--g500)">${agent.available_specialties.map(escapeHtml).join(", ")}</div>`
-      : "";
+  const specialties = (() => {
+    if (!agent.available_specialties || agent.available_specialties.length === 0) return "";
+    const links = agent.available_specialties.map((s) => {
+      const sp = SPECIALTY_PAGES.find((p) => p.navn === s.toLowerCase());
+      return sp
+        ? `<a href="/spesialitet/${escapeHtml(sp.slug)}" class="spec-chip" style="padding:3px 10px;font-size:.75rem">${escapeHtml(s)}</a>`
+        : `<span style="font-size:.8rem;color:var(--g500)">${escapeHtml(s)}</span>`;
+    });
+    return `<div style="margin-top:6px;display:flex;flex-wrap:wrap;gap:4px">${links.join("")}</div>`;
+  })();
 
   const _telHref = safeTelHref(agent.telefon);
   const phone = _telHref
@@ -521,6 +586,13 @@ router.get("/", (_req: Request, res: Response) => {
         "query-input": "required name=search_term_string",
       },
     },
+    {
+      "@context": "https://schema.org",
+      "@type": "Organization",
+      name: "Finn-tannlege",
+      url: DENTAL_BASE_URL,
+      logo: DENTAL_BASE_URL + "/favicon.svg",
+    },
   ];
 
   const html = `
@@ -577,6 +649,7 @@ router.get("/", (_req: Request, res: Response) => {
         <h3>Hva er Helfo-avtale?</h3>
         <p>Klinikker med Helfo-direkteoppgjørsavtale sender regningen direkte til Helfo. Du betaler kun egenandelen selv &mdash; ikke full pris. Gjelder ved undersøkelse, akuttbehandling og visse tannbehandlinger som dekkes av lov om tannhelsetjenesten.</p>
       </div>
+      <p style="margin-top:16px;font-size:.92rem"><a href="/hvordan-det-fungerer">Les hele guiden om hvordan Finn-tannlege fungerer &rarr;</a></p>
     </div>
   </section>
 
@@ -586,6 +659,16 @@ router.get("/", (_req: Request, res: Response) => {
       <div class="section-sub">Velg ditt fylke for en oversikt over tannlegeklinikker i ditt område.</div>
       <div class="fylke-grid" role="list" aria-label="Fylker">
         ${fylkeGrid}
+      </div>
+    </div>
+  </section>
+
+  <section class="section">
+    <div class="container">
+      <div class="section-title">Finn spesialist</div>
+      <div class="section-sub">Tannlegespesialiteter i Norge &mdash; klikk for oversikt over spesialistklinikker</div>
+      <div style="display:flex;flex-wrap:wrap;gap:8px;margin-top:0">
+        ${SPECIALTY_PAGES.map((sp) => `<a href="/spesialitet/${escapeHtml(sp.slug)}" class="spec-chip">${escapeHtml(sp.navn.charAt(0).toUpperCase() + sp.navn.slice(1))}</a>`).join("")}
       </div>
     </div>
   </section>
@@ -824,7 +907,13 @@ function renderClinicProfile(
     specList.push(`<ul style="list-style:none;padding:0">${specRows}</ul>`);
   }
   if (agent.available_specialties && agent.available_specialties.length > 0) {
-    specList.push(`<div class="spec-list" style="margin-top:12px">${agent.available_specialties.map((s) => `<span class="spec-tag">${escapeHtml(s)}</span>`).join("")}</div>`);
+    const specTags = agent.available_specialties.map((s) => {
+      const sp = SPECIALTY_PAGES.find((p) => p.navn === s.toLowerCase());
+      return sp
+        ? `<a href="/spesialitet/${escapeHtml(sp.slug)}" class="spec-tag" style="text-decoration:none;color:var(--teal-700)">${escapeHtml(s)}</a>`
+        : `<span class="spec-tag">${escapeHtml(s)}</span>`;
+    });
+    specList.push(`<div class="spec-list" style="margin-top:12px">${specTags.join("")}</div>`);
   }
   if (specList.length > 0) {
     specialistSection = `<div class="section-box"><h2>Spesialister og spesialiteter</h2>${specList.join("")}</div>`;
@@ -833,7 +922,7 @@ function renderClinicProfile(
   // ── Treatments
   let treatmentsSection = "";
   if (agent.treatments && agent.treatments.length > 0) {
-    const tags = agent.treatments.map((t) => `<span class="spec-tag">${escapeHtml(t)}</span>`).join("");
+    const tags = agent.treatments.map((t) => `<a href="/sok?q=${encodeURIComponent(t)}" class="spec-tag" style="text-decoration:none;color:var(--navy)">${escapeHtml(t)}</a>`).join("");
     const subTypes = agent.treatments_subtypes
       ? Object.entries(agent.treatments_subtypes).map(([k, vs]) =>
           `<li style="font-size:.85rem;color:var(--g700)"><strong>${escapeHtml(k)}:</strong> ${(vs as string[]).map(escapeHtml).join(", ")}</li>`
@@ -1091,38 +1180,7 @@ router.get("/om", (_req: Request, res: Response) => {
   }));
 });
 
-// ═══════════════════════════════════════════════════════════
-// GET /personvern
-// ═══════════════════════════════════════════════════════════
 
-router.get("/personvern", (_req: Request, res: Response) => {
-  const html = `
-<main>
-  <div class="content-page">
-    <h1>Personvern</h1>
-    <p>Finn-tannlege.com behandler kun offentlig tilgjengelige virksomhetsdata. Vi behandler ingen pasientdata, ingen personopplysninger om enkeltpersoner utover det som fremgår av offentlige registre (f.eks. autoriserte helsepersonells tittel og spesialitet fra HPR).</p>
-
-    <h2>Informasjonskapsler (cookies)</h2>
-    <p>Vi bruker ingen markedsføringscookies. Tjenesten kan bruke én anonym sesjonscookie for teknisk drift, og eventuelt anonym trafikkstatistikk uten personidentifisering.</p>
-
-    <h2>Dine rettigheter</h2>
-    <p>Dersom du mener at opplysninger om deg eller din virksomhet er feil eller bør fjernes, kan du kontakte oss på <a href="mailto:kontakt@finn-tannlege.com">kontakt@finn-tannlege.com</a>. Vi behandler innsigelser innen 5 virkedager.</p>
-
-    <h2>Dataansvarlig</h2>
-    <p>Finn-tannlege.com er en del av A2A-agentplattformen drevet fra Norge. For spørsmål om personvern, send e-post til <a href="mailto:kontakt@finn-tannlege.com">kontakt@finn-tannlege.com</a>.</p>
-
-    <h2>Endringer i personvernerklæringen</h2>
-    <p>Vesentlige endringer vil bli varslet på denne siden. Sist oppdatert: ${new Date().toISOString().split("T")[0]}.</p>
-  </div>
-</main>`;
-
-  res.setHeader("Content-Type", "text/html; charset=utf-8");
-  res.send(dentalShell(html, {
-    title: "Personvern — Finn-tannlege.com",
-    description: "Personvernerklæring for Finn-tannlege.com. Kun offentlige virksomhetsdata, ingen pasientdata, ingen markedsføringscookies.",
-    canonical: `${DENTAL_BASE_URL}/personvern`,
-  }));
-});
 
 // ═══════════════════════════════════════════════════════════
 // GET /sitemap.xml
@@ -1141,11 +1199,17 @@ router.get("/sitemap.xml", (_req: Request, res: Response) => {
     const statics: Array<[string, string, string]> = [
       ["/", "daily", "1.0"],
       ["/sok", "daily", "0.9"],
+      ["/hvordan-det-fungerer", "monthly", "0.7"],
       ["/om", "monthly", "0.6"],
       ["/personvern", "monthly", "0.4"],
     ];
     for (const [p, freq, pri] of statics) {
       xml += `\n  <url><loc>${DENTAL_BASE_URL}${p === "/" ? "" : p}</loc><changefreq>${freq}</changefreq><priority>${pri}</priority><lastmod>${today}</lastmod></url>`;
+    }
+
+    // Specialty pages (PR-112)
+    for (const sp of SPECIALTY_PAGES) {
+      xml += `\n  <url><loc>${DENTAL_BASE_URL}/spesialitet/${sp.slug}</loc><changefreq>weekly</changefreq><priority>0.8</priority><lastmod>${today}</lastmod></url>`;
     }
 
     // Fylke pages (canonical only — PR-111)
@@ -1269,6 +1333,285 @@ Eksempel: ${DENTAL_BASE_URL}/klinikk/oslo-tannlegeklinikk-as-123456789
 Data fra Brønnøysundregistrene er CC0 (fri bruk). HPR-data er offentlig.
 Klinikkdata fra nettsider gjengis som faktaoppsummering.
 `);
+});
+
+// ═══════════════════════════════════════════════════════════
+// GET /favicon.svg  (PR-112)
+// ═══════════════════════════════════════════════════════════
+
+router.get("/favicon.svg", (_req: Request, res: Response) => {
+  const svg = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 96 96">
+  <rect width="96" height="96" rx="19.2" fill="#0F766E"/>
+  <circle cx="40" cy="40" r="20" fill="none" stroke="#fff" stroke-width="6"/>
+  <line x1="54" y1="54" x2="70" y2="70" stroke="#fff" stroke-width="8" stroke-linecap="round"/>
+  <g transform="translate(27,18) scale(0.72)">
+    <path d="${TOOTH_PATH}" fill="#fff"/>
+  </g>
+</svg>`;
+  res.setHeader("Content-Type", "image/svg+xml");
+  res.setHeader("Cache-Control", "public, max-age=86400");
+  res.send(svg);
+});
+
+// ═══════════════════════════════════════════════════════════
+// GET /hvordan-det-fungerer  (PR-112)
+// ═══════════════════════════════════════════════════════════
+
+router.get("/hvordan-det-fungerer", (_req: Request, res: Response) => {
+  const jsonLd = [
+    {
+      "@context": "https://schema.org",
+      "@type": "WebPage",
+      name: "Slik fungerer Finn-tannlege.com",
+      url: `${DENTAL_BASE_URL}/hvordan-det-fungerer`,
+      description: "Guide til pasienter, klinikker og AI-agenter om hvordan Finn-tannlege.com fungerer.",
+    },
+    {
+      "@context": "https://schema.org",
+      "@type": "FAQPage",
+      mainEntity: [
+        {
+          "@type": "Question",
+          name: "Hva betyr Helfo-avtale?",
+          acceptedAnswer: {
+            "@type": "Answer",
+            text: "Klinikker med Helfo-direkteoppgjørsavtale sender regningen direkte til Helfo. Du betaler kun egenandelen — ikke full pris. Gjelder ved undersøkelse, akuttbehandling og visse tilstander som dekkes av tannhelsetjenesteloven.",
+          },
+        },
+        {
+          "@type": "Question",
+          name: "Hva koster tannlege?",
+          acceptedAnswer: {
+            "@type": "Answer",
+            text: "Tannlegepriser varierer mye i Norge. Med Helfo-direkteoppgjørsavtale betaler du kun egenandelen for stønadspliktige behandlinger. Uten Helfo-avtale betaler du full pris. Sjekk klinikkens nettside for prisliste.",
+          },
+        },
+        {
+          "@type": "Question",
+          name: "Hva gjør jeg ved akutt tannverk?",
+          acceptedAnswer: {
+            "@type": "Answer",
+            text: "Søk etter klinikker med Akuttvakt-merke på Finn-tannlege.com. Mange kommuner har kommunal tannlegevakt — ring klinikken for informasjon om åpningstider.",
+          },
+        },
+        {
+          "@type": "Question",
+          name: "Hvordan oppdaterer jeg min klinikk?",
+          acceptedAnswer: {
+            "@type": "Answer",
+            text: "Send e-post til kontakt@finn-tannlege.com med navn, organisasjonsnummer og hva som skal endres. Vi svarer innen 5 virkedager. En selvbetjeningsportal er under utvikling.",
+          },
+        },
+      ],
+    },
+  ];
+
+  const html = `
+<main>
+  <div class="content-page">
+    <h1>Slik fungerer Finn-tannlege.com</h1>
+    <p>Her forklarer vi hvordan tjenesten fungerer &mdash; for pasienter, for klinikker og for AI-agenter og utviklere.</p>
+
+    <h2>For pasienter</h2>
+
+    <h3 style="font-size:1rem;font-weight:700;color:var(--navy);margin:20px 0 8px">Tre steg til riktig tannlege</h3>
+    <ol style="padding-left:20px;margin-bottom:16px">
+      <li style="font-size:.95rem;color:var(--g700);line-height:1.7;margin-bottom:8px"><strong>Søk</strong> &mdash; skriv inn by, poststed eller tannlegenavn i søkefeltet. Du kan filtrere på fylke, spesialitet, Helfo-avtale og akuttvakt.</li>
+      <li style="font-size:.95rem;color:var(--g700);line-height:1.7;margin-bottom:8px"><strong>Sammenlign</strong> &mdash; se Helfo-avtale, spesialiteter, åpningstider og kontaktinformasjon side om side for de klinikkene som passer deg.</li>
+      <li style="font-size:.95rem;color:var(--g700);line-height:1.7;margin-bottom:8px"><strong>Kontakt</strong> &mdash; ring klinikken direkte eller bruk online-booking der det finnes. Ingen mellomledd, ingen gebyrer fra vår side.</li>
+    </ol>
+
+    <h3 style="font-size:1rem;font-weight:700;color:var(--navy);margin:20px 0 8px">Hva betyr merkene?</h3>
+    <ul style="padding-left:0;list-style:none;margin-bottom:16px">
+      <li style="font-size:.95rem;color:var(--g700);line-height:1.7;margin-bottom:10px"><span class="badge badge-verified" style="margin-right:8px">Verifisert</span> Data er kryssjekket mot offentlige registre (Brønnøysundregistrene + HPR). Klinikkens navn, organisasjonsnummer og eventuelle spesialisttitler er bekreftet.</li>
+      <li style="font-size:.95rem;color:var(--g700);line-height:1.7;margin-bottom:10px"><span class="badge badge-helfo" style="margin-right:8px">Helfo-avtale</span> Klinikken har direkteoppgjørsavtale med Helfo. Du betaler kun egenandelen for stønadspliktige behandlinger &mdash; ikke full pris.</li>
+      <li style="font-size:.95rem;color:var(--g700);line-height:1.7;margin-bottom:10px"><span class="badge badge-akutt" style="margin-right:8px">Akuttvakt</span> Klinikken tilbyr akuttbehandling utenom ordinær arbeidstid. Ring alltid for å bekrefte åpningstider.</li>
+    </ul>
+
+    <h3 style="font-size:1rem;font-weight:700;color:var(--navy);margin:20px 0 8px">Helfo og tannhelsestønad</h3>
+    <p>Helfo (Helseøkonomiforvaltningen) administrerer statlig stønad til visse tannbehandlinger for voksne. Det gjelder ikke alle tannbehandlinger &mdash; stønad ytes for bestemte tilstander. De viktigste stønadspunktene er:</p>
+    <ul>
+      <li><strong>Periodontitt</strong> &mdash; alvorlig tannkjøttbetennelse med beinresorpsjon</li>
+      <li><strong>Oral kirurgi</strong> &mdash; bl.a. kjevecyster, odontoektomi og beinimplantater ved spesielle indikasjoner</li>
+      <li><strong>Bittavvik og kjeveortopedi</strong> &mdash; særlig ved store kjeveanomalier</li>
+      <li><strong>Tannutviklingsforstyrrelser</strong> &mdash; bl.a. amelogenesis imperfecta</li>
+    </ul>
+    <p style="margin-top:12px">Dette er ikke en uttømmende juridisk liste. Se <a href="https://www.helfo.no/tannlege" rel="nofollow noopener" target="_blank">helfo.no/tannlege</a> for fullstendig oversikt og vilkår.</p>
+
+    <h3 style="font-size:1rem;font-weight:700;color:var(--navy);margin:20px 0 8px">Akutt tannverk</h3>
+    <p>Tilbudet om kommunal tannlegevakt varierer mye fra kommune til kommune, og åpningstidene er som regel begrenset til kvelder og helger. Det beste rådet er å søke på klinikker med <span class="badge badge-akutt">Akuttvakt</span>-merke og ringe direkte. Mange klinikker setter av tid til akuttpasienter på kort varsel i ordinær åpningstid.</p>
+
+    <h2>For klinikker</h2>
+    <p>Finn-tannlege.com henter klinikkdata fra tre offentlige kilder:</p>
+    <ul>
+      <li><strong>Brønnøysundregistrene</strong> &mdash; grunnleggende foretaksopplysninger, adresse og kontaktinfo</li>
+      <li><strong>Offentlige helseregistre (HPR)</strong> &mdash; autorisasjons- og spesialistopplysninger</li>
+      <li><strong>Klinikkenes egne nettsider</strong> &mdash; åpningstider, behandlingstilbud og presentasjon</li>
+    </ul>
+    <p><strong>Oppføring er gratis.</strong> Vi tar ikke betalt for å vises i søkeresultatene.</p>
+    <p>For å rette feil, oppdatere kontaktinformasjon eller be om fjerning: send e-post til <a href="mailto:kontakt@finn-tannlege.com">kontakt@finn-tannlege.com</a> med klinikkens navn og organisasjonsnummer. Vi svarer innen 5 virkedager. En selvbetjeningsportal for klinikker er under utvikling &mdash; vi varsler registrerte klinikker når den lanseres.</p>
+
+    <h2 style="margin-top:32px;font-size:1rem;font-weight:600;color:var(--g500)">For AI-agenter og utviklere</h2>
+    <p style="font-size:.9rem;color:var(--g500)">Finn-tannlege.com tilbyr maskinlesbare endepunkter:</p>
+    <ul style="font-size:.9rem;color:var(--g500)">
+      <li><a href="/api/tannlege/agents">/api/tannlege</a> &mdash; REST API med JSON-svar (DentalAgent-objekter)</li>
+      <li><a href="/llms.txt">/llms.txt</a> &mdash; LLM-vennlig oversikt over API og datastruktur</li>
+      <li>A2A- og MCP-integrasjon er under utbygging</li>
+    </ul>
+  </div>
+</main>`;
+
+  res.setHeader("Content-Type", "text/html; charset=utf-8");
+  res.send(dentalShell(html, {
+    title: "Slik fungerer det — Finn-tannlege.com",
+    description: "Guide til pasienter, klinikker og utviklere: slik finner du riktig tannlege, hva Helfo-avtale og badges betyr, og hvordan klinikker kan oppdatere sin profil.",
+    canonical: `${DENTAL_BASE_URL}/hvordan-det-fungerer`,
+    jsonLd,
+  }));
+});
+
+// ═══════════════════════════════════════════════════════════
+// GET /personvern  (PR-112 — utvidet GDPR-side)
+// ═══════════════════════════════════════════════════════════
+
+router.get("/personvern", (_req: Request, res: Response) => {
+  const updatedDate = "2026-06-04";
+  const html = `
+<main>
+  <div class="content-page">
+    <h1>Personvernerklæring</h1>
+    <p style="font-size:.85rem;color:var(--g500)">Sist oppdatert: ${updatedDate}</p>
+
+    <h2>Behandlingsansvarlig</h2>
+    <p>Finn-tannlege.com er behandlingsansvarlig for personopplysninger behandlet på denne tjenesten. Kontakt oss på <a href="mailto:kontakt@finn-tannlege.com">kontakt@finn-tannlege.com</a>.</p>
+
+    <h2>Hvilke data behandler vi?</h2>
+    <p>Vi behandler <strong>utelukkende offentlig tilgjengelige virksomhetsdata</strong>:</p>
+    <ul>
+      <li><strong>Brønnøysundregistrene (Brreg)</strong> &mdash; foretaksnavn, organisasjonsnummer, adresse, kontaktinformasjon og næringsgruppekode for registrerte tannlegeklinikker</li>
+      <li><strong>Offentlige helseregistre (HPR)</strong> &mdash; autorisasjon og spesialisttittel for helsepersonell i yrkesutøvelse (offentlig informasjon etter helsepersonelloven)</li>
+      <li><strong>Klinikkenes egne offentlige nettsider</strong> &mdash; åpningstider, behandlingstilbud og presentasjonstekst</li>
+    </ul>
+    <p>Vi behandler <strong>ingen pasientdata</strong>, <strong>ingen helseopplysninger om enkeltpersoner</strong> og ingen sensitiv personinformasjon utover det som er offentlig tilgjengelig i kapasitet som yrkesutøver.</p>
+
+    <h2>Navngitte personer</h2>
+    <p>Tannleger og annet helsepersonell kan fremgå av profilene med navn og tittel/spesialitet. Dette er offentlig tilgjengelig informasjon knyttet til yrkesutøvelse og autorisasjon &mdash; ikke privat informasjon. Grunnlaget er at offentligheten har rett og behov for å kjenne til autorisert helsepersonells spesialkompetanse.</p>
+
+    <h2>Behandlingsgrunnlag</h2>
+    <p>Behandlingen er basert på <strong>berettiget interesse</strong>, jf. GDPR artikkel 6 (1) bokstav f. Det er et legitimt behov for at befolkningen enkelt kan finne og sammenligne tannlegeklinikker og verifisere helsepersonells autorisasjon. Behandlingen er begrenset til offentlig tilgjengelige data og medfører lav personvernrisiko.</p>
+
+    <h2>Dine rettigheter</h2>
+    <p>Du har rettigheter etter GDPR kapittel III, herunder:</p>
+    <ul>
+      <li><strong>Innsyn</strong> &mdash; be om innsyn i hvilke opplysninger vi har om deg</li>
+      <li><strong>Retting</strong> &mdash; be om korrigering av feilaktige opplysninger</li>
+      <li><strong>Sletting</strong> &mdash; be om sletting der vilkårene er oppfylt</li>
+      <li><strong>Innsigelse</strong> &mdash; protestere mot behandling basert på berettiget interesse</li>
+    </ul>
+    <p>Send forespørsel til <a href="mailto:kontakt@finn-tannlege.com">kontakt@finn-tannlege.com</a>. Vi svarer innen 30 dager.</p>
+
+    <h2>Informasjonskapsler (cookies)</h2>
+    <p>Vi bruker <strong>ingen sporingscookies</strong> og ingen markedsføringscookies. Tjenesten benytter kun anonym, aggregert, server-side trafikkstatistikk som ikke kan kobles til enkeltpersoner. Det lagres ingen cookies på din enhet for analyseformål.</p>
+
+    <h2>Tredjeparter</h2>
+    <p>Vi <strong>selger ikke</strong> og deler ikke personopplysninger med tredjeparter for kommersielle formål. Tjenesten driftes på Fly.io i EU-region (Frankfurt). Ingen persondata overføres til land utenfor EU/EØS-området.</p>
+
+    <h2>Endringer i erklæringen</h2>
+    <p>Vesentlige endringer vil bli varslet på denne siden med oppdatert dato. Sist oppdatert: ${updatedDate}.</p>
+  </div>
+</main>`;
+
+  res.setHeader("Content-Type", "text/html; charset=utf-8");
+  res.send(dentalShell(html, {
+    title: "Personvern og GDPR — Finn-tannlege.com",
+    description: "Personvernerklæring for Finn-tannlege.com: behandlingsansvarlig, hvilke data vi behandler, GDPR-rettigheter og informasjonskapsler.",
+    canonical: `${DENTAL_BASE_URL}/personvern`,
+  }));
+});
+
+// ═══════════════════════════════════════════════════════════
+// GET /spesialitet/:slug  (PR-112)
+// ═══════════════════════════════════════════════════════════
+
+router.get("/spesialitet/:slug", (req: Request, res: Response) => {
+  const slugParam = String(req.params.slug).toLowerCase();
+  const sp = findSpecialtyBySlug(slugParam);
+  if (!sp) {
+    res.status(404).send(dentalShell(
+      `<main><div class="container"><div class="empty-state" style="padding:80px 0"><h3>Spesialitet ikke funnet</h3><p>Vi kjenner ikke til spesialiteten «${escapeHtml(slugParam)}». <a href="/">Gå til forsiden</a>.</p></div></div></main>`,
+      { title: "Spesialitet ikke funnet — Finn-tannlege.com" }
+    ));
+    return;
+  }
+
+  const PAGE_SIZE = 50;
+  let agents: Array<DentalAgent & { id: string }> = [];
+  let total = 0;
+  try {
+    agents = listPublicDentalAgents({ specialty: sp.navn } as any, PAGE_SIZE, 0);
+    total = countPublicDentalAgents({ specialty: sp.navn } as any);
+  } catch { /* db not ready */ }
+
+  const canonicalUrl = `${DENTAL_BASE_URL}/spesialitet/${sp.slug}`;
+  const displayNavn = sp.navn.charAt(0).toUpperCase() + sp.navn.slice(1);
+
+  const itemList = {
+    "@context": "https://schema.org",
+    "@type": "ItemList",
+    name: `Tannlegespesialister: ${displayNavn}`,
+    url: canonicalUrl,
+    numberOfItems: Math.min(total, 50),
+    itemListElement: agents.slice(0, 50).map((a, i) => ({
+      "@type": "ListItem",
+      position: i + 1,
+      url: a.org_nr
+        ? `${DENTAL_BASE_URL}/klinikk/${slugifyClinic(a.navn, a.org_nr)}`
+        : `${DENTAL_BASE_URL}/klinikk/id/${a.id}`,
+      name: a.navn,
+    })),
+  };
+
+  const resultCards =
+    agents.length > 0
+      ? `<div class="clinic-list" role="list" aria-label="Spesialistklinikker">${agents.map(clinicCard).join("")}</div>`
+      : `<div class="empty-state"><h3>Ingen spesialistklinikker funnet</h3><p>Vi har ikke registrert klinikker med denne spesialiteten ennå. Prøv å <a href="/sok?spesialitet=${encodeURIComponent(sp.navn)}">søke etter ${escapeHtml(sp.navn)}</a>.</p></div>`;
+
+  const otherChips = SPECIALTY_PAGES
+    .filter((p) => p.slug !== sp.slug)
+    .map((p) => `<a href="/spesialitet/${escapeHtml(p.slug)}" class="spec-chip">${escapeHtml(p.navn.charAt(0).toUpperCase() + p.navn.slice(1))}</a>`)
+    .join("");
+
+  const html = `
+<main>
+  <div class="profile-header">
+    <div class="container">
+      <p style="font-size:.85rem;opacity:.7;margin-bottom:8px"><a href="/" style="color:rgba(255,255,255,.7)">&larr; Forsiden</a></p>
+      <h1 class="profile-name">${escapeHtml(displayNavn)}</h1>
+      <p style="opacity:.8;font-size:.95rem">${total.toLocaleString("nb")} spesialistklinikker registrert</p>
+    </div>
+  </div>
+  <div class="container" style="padding-top:32px;padding-bottom:48px">
+    <div class="section-box">
+      <h2>Om spesialiteten</h2>
+      <p style="font-size:.95rem;color:var(--g700);line-height:1.7">${escapeHtml(sp.beskrivelse)}</p>
+      <p style="margin-top:12px;font-size:.9rem"><a href="/sok?spesialitet=${encodeURIComponent(sp.navn)}">Se alle klinikker med ${escapeHtml(sp.navn)} i søket &rarr;</a></p>
+    </div>
+    <p class="result-meta" style="margin-bottom:20px">${total.toLocaleString("nb")} klinikker funnet</p>
+    ${resultCards}
+    <div style="margin-top:40px">
+      <div class="section-title" style="font-size:1.1rem;margin-bottom:12px">Andre spesialiteter</div>
+      <div style="display:flex;flex-wrap:wrap;gap:8px">${otherChips}</div>
+    </div>
+  </div>
+</main>`;
+
+  res.setHeader("Content-Type", "text/html; charset=utf-8");
+  res.send(dentalShell(html, {
+    title: `${displayNavn} — Tannlegespesialister i Norge | Finn-tannlege.com`,
+    description: `Oversikt over tannlegeklinikker med spesialitet i ${sp.navn} i Norge. ${sp.beskrivelse.split(".")[0]}.`,
+    canonical: canonicalUrl,
+    jsonLd: itemList,
+  }));
 });
 
 // ═══════════════════════════════════════════════════════════

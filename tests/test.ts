@@ -13509,3 +13509,66 @@ console.log("\n── PR-109: finn-tannlege SSR + store extensions ──");
   // PR-32: explicit exit prevents CI hangs from dangling handles (e.g. seo router require)
   process.exit(0);
 })();
+
+
+// ── pr112: logo + innholdssider + klikkbare flater (PR-112) ──────────────────
+console.log("\n── PR-112: søket-logo, hvordan-det-fungerer, utvidet personvern, spesialitet-sider ──");
+
+// pr112-01: SPECIALTY_PAGES har 7 unike slugs og navn
+{
+  const seo112 = require("../src/routes/dental-seo") as typeof import("../src/routes/dental-seo");
+  const { SPECIALTY_PAGES } = seo112;
+
+  assertEq(SPECIALTY_PAGES.length, 7, "pr112-01a: SPECIALTY_PAGES har nøyaktig 7 innslag");
+
+  const slugs = SPECIALTY_PAGES.map((s) => s.slug);
+  const uniqueSlugs = new Set(slugs);
+  assertEq(uniqueSlugs.size, 7, "pr112-01b: alle 7 slugs er unike");
+
+  const navns = SPECIALTY_PAGES.map((s) => s.navn);
+  const uniqueNavns = new Set(navns);
+  assertEq(uniqueNavns.size, 7, "pr112-01c: alle 7 navn er unike");
+}
+
+// pr112-02: alle slugs er URL-safe (lowercase, ingen æøå eller mellomrom)
+{
+  const seo112 = require("../src/routes/dental-seo") as typeof import("../src/routes/dental-seo");
+  const { SPECIALTY_PAGES } = seo112;
+
+  for (const sp of SPECIALTY_PAGES) {
+    const isUrlSafe = /^[a-z0-9-]+$/.test(sp.slug);
+    assertTrue(isUrlSafe, `pr112-02: slug "${sp.slug}" er URL-safe (kun a-z, 0-9, bindestreker)`);
+    const hasNoNorwegianChars = !/[æøå]/i.test(sp.slug);
+    assertTrue(hasNoNorwegianChars, `pr112-02: slug "${sp.slug}" inneholder ingen æøå`);
+  }
+}
+
+// pr112-03: findSpecialtyBySlug — lookup på kjent og ukjent slug
+{
+  const seo112 = require("../src/routes/dental-seo") as typeof import("../src/routes/dental-seo");
+  const { findSpecialtyBySlug, SPECIALTY_PAGES } = seo112;
+
+  // Kjent slug
+  const kjeveortopedi = findSpecialtyBySlug("kjeveortopedi");
+  assertTrue(kjeveortopedi !== undefined, "pr112-03a: findSpecialtyBySlug('kjeveortopedi') returnerer et objekt");
+  assertEq(kjeveortopedi?.slug, "kjeveortopedi", "pr112-03b: slug er korrekt");
+  assertEq(kjeveortopedi?.navn, "kjeveortopedi", "pr112-03c: navn er korrekt");
+
+  // Kjent slug med bindestrek
+  const oralKirurgi = findSpecialtyBySlug("oral-kirurgi-og-oral-medisin");
+  assertTrue(oralKirurgi !== undefined, "pr112-03d: findSpecialtyBySlug('oral-kirurgi-og-oral-medisin') returnerer et objekt");
+
+  // Ukjent slug → undefined
+  const ukjent = findSpecialtyBySlug("implantologi");
+  assertEq(ukjent, undefined, "pr112-03e: findSpecialtyBySlug('implantologi') returnerer undefined");
+
+  // Tom streng → undefined
+  const tom = findSpecialtyBySlug("");
+  assertEq(tom, undefined, "pr112-03f: findSpecialtyBySlug('') returnerer undefined");
+
+  // Alle slugs i SPECIALTY_PAGES er søkbare
+  for (const sp of SPECIALTY_PAGES) {
+    const found = findSpecialtyBySlug(sp.slug);
+    assertTrue(found !== undefined, `pr112-03g: alle slugs er søkbare — ${sp.slug}`);
+  }
+}
