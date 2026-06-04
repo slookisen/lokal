@@ -12358,6 +12358,164 @@ console.log("\n── PR-104: dental claim-batch service ──");
   dbFactoryPr104.__resetDbFactoryForTesting();
 })();
 
+// ── PR-107 (2026-06-04): zombie-claim sweep fix ──────────────────────
+// Tests for sweepExpiredClaims, zombie reclaim via claimBatch, truthful
+// claimStatus after timeout, and releaseBatch regression guard.
+// Uses DENTAL_DB_PATH=:memory: + __resetDbFactoryForTesting() -- the
+// synchronous IIFE pattern proven by PR-100 / PR-100b / PR-104.
+// NOT async (async IIFEs caused CI races that got PR-96/PR-98 reverted).
+console.log("\n── PR-107: zombie-claim sweep fix ──");
+(() => {
+  const prevPathPr107 = process.env.DENTAL_DB_PATH;
+  process.env.DENTAL_DB_PATH = ":memory:";
+
+  // Bust require cache so we get a fresh db-factory + fresh dental-claim-service
+  // bound to the :memory: instance (mirrors PR-104 pattern exactly).
+  const dbFactoryPath107 = require.resolve("../src/database/db-factory");
+  const dentalStorePath107 = require.resolve("../src/services/dental-store");
+  const dentalClaimPath107 = require.resolve("../src/services/dental-claim-service");
+  delete require.cache[dbFactoryPath107];
+  delete require.cache[dentalStorePath107];
+  delete require.cache[dentalClaimPath107];
+
+  const dbFactoryPr107 = require("../src/database/db-factory") as typeof import("../src/database/db-factory");
+  dbFactoryPr107.__resetDbFactoryForTesting();
+
+  const {
+    claimBatch: claimBatch107,
+    releaseBatch: releaseBatch107,
+    claimStatus: claimStatus107,
+    sweepExpiredClaims: sweepExpiredClaims107,
+    CLAIM_TIMEOUT_MS: TIMEOUT_107,
+  } = require("../src/services/dental-claim-service") as typeof import("../src/services/dental-claim-service");
+  const { createDentalAgent: createAgent107 } =
+    require("../src/services/dental-store") as typeof import("../src/services/dental-store");
+
+  const db107 = dbFactoryPr107.getDb("dental");
+
+  // Seed 5 raw records.
+  const seedIds107: string[] = [];
+  for (let i = 0; i < 5; i++) {
+    seedIds107.push(
+      createAgent107({
+        org_nr: `${888888000 + i}`,
+        navn: `PR107 CLINIC ${i}`,
+        adresse: `Testgata ${i + 1}`,
+        postnummer: "0001",
+        poststed: "OSLO",
+        hjemmeside: null,
+        enrichment_state: "raw",
+      } as any)
+    );
+  }
+
+  // T1: sweepExpiredClaims clears rows older than CLAIM_TIMEOUT_MS and returns count.
+  {
+    // Claim 3 records with worker-A.
+    const claimed = claimBatch107("worker-107-A", 3, { enrichment_state: "raw" });
+    assertTrue(claimed.length === 3, "pr107-01a: precondition: claimed 3 records");
+
+    // Age the claims past the timeout by setting claimed_at to an old timestamp.
+    const fakeOld = Date.now() - TIMEOUT_107 - 5000;
+    const placeholders = claimed.map(() => "?").join(",");
+    db107
+      .prepare(`UPDATE dental_agents SET claimed_at = ? WHERE id IN (${placeholders})`)
+      .run(fakeOld, ...claimed.map((r) => r.id));
+
+    // sweepExpiredClaims should clear exactly those 3 rows.
+    const swept = sweepExpiredClaims107();
+    assertEq(swept, 3, "pr107-01b: sweepExpiredClaims returns count of cleared rows (3)");
+
+    // After sweep, those rows have worker_id = NULL.
+    const row = db107
+      .prepare("SELECT COUNT(*) AS n FROM dental_agents WHERE worker_id IS NULL AND id IN (" + placeholders + ")")
+      .get(...claimed.map((r) => r.id)) as { n: number };
+    assertEq(row.n, 3, "pr107-01c: swept rows have worker_id = NULL");
+  }
+
+  // T2: claimBatch reclaims previously-expired-claimed rows (worker B gets worker A zombies).
+  {
+    // Release any live claims so we have a clean slate.
+    for (const wid of ["worker-107-A", "worker-107-B"]) {
+      try { releaseBatch107(wid, seedIds107); } catch { /* ignore */ }
+    }
+    // Worker A claims all 5 records.
+    const claimedA = claimBatch107("worker-107-A", 5, { enrichment_state: "raw" });
+    assertTrue(claimedA.length === 5, "pr107-02a: precondition: worker-A claimed all 5");
+
+    // Age the claims so they're expired.
+    const fakeOld2 = Date.now() - TIMEOUT_107 - 5000;
+    const phA = claimedA.map(() => "?").join(",");
+    db107
+      .prepare(`UPDATE dental_agents SET claimed_at = ? WHERE id IN (${phA})`)
+      .run(fakeOld2, ...claimedA.map((r) => r.id));
+
+    // Worker B calls claimBatch -- the sweep inside should clear worker A zombies
+    // and worker B should receive those records.
+    const claimedB = claimBatch107("worker-107-B", 5, { enrichment_state: "raw" });
+    assertTrue(
+      claimedB.length === 5,
+      "pr107-02b: worker-B reclaims all 5 zombie rows after sweep"
+    );
+    const bIds = new Set(claimedB.map((r) => r.id));
+    const aIds = claimedA.map((r) => r.id);
+    let allReclaimed = aIds.every((id) => bIds.has(id));
+    assertTrue(allReclaimed, "pr107-02c: worker-B gets exactly the expired worker-A ids");
+
+    // Worker A no longer appears in claimStatus (zombies gone).
+    const status = claimStatus107();
+    const workerAEntry = status.find((s) => s.worker_id === "worker-107-A");
+    assertTrue(
+      workerAEntry === undefined,
+      "pr107-02d: worker-A no longer in claimStatus after sweep (no zombie)"
+    );
+  }
+
+  // T3: claimStatus after timeout shows zero zombie claims.
+  {
+    // We already have worker-B holding 5 live claims from T2. Age them.
+    const fakeOld3 = Date.now() - TIMEOUT_107 - 5000;
+    const ph3 = seedIds107.map(() => "?").join(",");
+    db107
+      .prepare(`UPDATE dental_agents SET claimed_at = ? WHERE worker_id IS NOT NULL AND id IN (${ph3})`)
+      .run(fakeOld3, ...seedIds107);
+
+    // claimStatus should call sweepExpiredClaims internally and return empty.
+    const status = claimStatus107();
+    const zombies = status.filter((s) => s.count > 0);
+    assertTrue(
+      zombies.length === 0,
+      "pr107-03: claimStatus after timeout shows zero zombie claims"
+    );
+  }
+
+  // T4: releaseBatch still releases only own claims (regression guard).
+  {
+    // Worker C claims 2 records.
+    const claimedC = claimBatch107("worker-107-C", 2, { enrichment_state: "raw" });
+    assertTrue(claimedC.length >= 1, "pr107-04a: precondition: worker-C claimed at least 1");
+
+    // Worker D tries to release worker C's claims -- should release 0.
+    const released = releaseBatch107("worker-107-D", claimedC.map((r) => r.id));
+    assertEq(released, 0, "pr107-04b: worker-D cannot release worker-C claims (released=0)");
+
+    // Worker C releases its own claims -- should release the correct count.
+    const releasedOwn = releaseBatch107("worker-107-C", claimedC.map((r) => r.id));
+    assertTrue(releasedOwn === claimedC.length, "pr107-04c: worker-C can release its own claims");
+  }
+
+  // Cleanup.
+  for (const wid of ["worker-107-A", "worker-107-B", "worker-107-C", "worker-107-D"]) {
+    try { releaseBatch107(wid, seedIds107); } catch { /* ignore */ }
+  }
+  if (prevPathPr107 === undefined) {
+    delete process.env.DENTAL_DB_PATH;
+  } else {
+    process.env.DENTAL_DB_PATH = prevPathPr107;
+  }
+  dbFactoryPr107.__resetDbFactoryForTesting();
+})();
+
 // ── PR-103 (2026-06-03): backend dental geocoding worker ────────────
 //
 // Tests the Kartverket-based geocoding worker introduced in
