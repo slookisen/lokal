@@ -30,6 +30,20 @@ const router = Router();
 const DENTAL_BASE_URL =
   process.env.DENTAL_BASE_URL || "https://finn-tannlege.com";
 
+// PR-111: Canonical Norwegian fylker (15, post-2024 reform). The dental DB
+// contains a few non-canonical fylke values ("Ukjent", "TEST", legacy names)
+// from raw Brreg data and test probes. Public fylke navigation only exposes
+// canonical fylker; non-canonical rows remain reachable via /sok.
+const KNOWN_FYLKER = [
+  "Oslo", "Akershus", "\u00d8stfold", "Buskerud", "Innlandet", "Vestfold",
+  "Telemark", "Agder", "Rogaland", "Vestland", "M\u00f8re og Romsdal",
+  "Tr\u00f8ndelag", "Nordland", "Troms", "Finnmark",
+];
+const KNOWN_FYLKER_LC = new Set(KNOWN_FYLKER.map((f) => f.toLowerCase()));
+export function canonicalFylker(perFylke: Array<{ fylke: string; count: number }>): Array<{ fylke: string; count: number }> {
+  return perFylke.filter((f) => KNOWN_FYLKER_LC.has((f.fylke || "").toLowerCase()));
+}
+
 // ─── Stats TTL cache (60 s) ──────────────────────────────────
 // Cache getDentalStats() results in this module. dental-store has no cache
 // so API consumers always get fresh data; only SSR pages use the cache.
@@ -478,8 +492,9 @@ router.get("/", (_req: Request, res: Response) => {
     ? `over ${Math.floor(stats.total / 100) * 100}`
     : String(stats.total);
 
-  const fylkeGrid = stats.per_fylke.length > 0
-    ? stats.per_fylke
+  const fylkerKjent = canonicalFylker(stats.per_fylke);
+  const fylkeGrid = fylkerKjent.length > 0
+    ? fylkerKjent
         .map(
           (f) =>
             `<a href="/fylke/${encodeURIComponent(f.fylke)}" class="fylke-card">
@@ -530,7 +545,7 @@ router.get("/", (_req: Request, res: Response) => {
   <div class="stats-bar" aria-label="Statistikk">
     <div class="stats-inner">
       <div><div class="stat-val">${stats.total.toLocaleString("nb")}</div><div class="stat-lbl">Klinikker registrert</div></div>
-      <div><div class="stat-val">${stats.per_fylke.length}</div><div class="stat-lbl">Fylker dekket</div></div>
+      <div><div class="stat-val">${fylkerKjent.length}</div><div class="stat-lbl">Fylker dekket</div></div>
       <div><div class="stat-val">${stats.helfo_count.toLocaleString("nb")}</div><div class="stat-lbl">Med Helfo-avtale</div></div>
       <div><div class="stat-val">${stats.specialist_clinic_count.toLocaleString("nb")}</div><div class="stat-lbl">Spesialistklinikker</div></div>
     </div>
@@ -678,7 +693,7 @@ router.get("/sok", (req: Request, res: Response) => {
               ${(() => {
                 let stats2 = { per_fylke: [] as Array<{ fylke: string; count: number }> };
                 try { stats2 = getCachedDentalStats(); } catch { /* ok */ }
-                return stats2.per_fylke
+                return canonicalFylker(stats2.per_fylke)
                   .map((f) => `<option value="${escapeHtml(f.fylke)}"${fylke === f.fylke ? " selected" : ""}>${escapeHtml(f.fylke)} (${f.count})</option>`)
                   .join("");
               })()}
@@ -966,8 +981,8 @@ router.get("/fylke/:fylke", (req: Request, res: Response) => {
   let stats = { per_fylke: [] as Array<{ fylke: string; count: number }> };
   try { stats = getCachedDentalStats(); } catch { /* ok */ }
 
-  // Case-insensitive match
-  const matchedFylke = stats.per_fylke.find(
+  // Case-insensitive match — canonical fylker only (PR-111)
+  const matchedFylke = canonicalFylker(stats.per_fylke).find(
     (f) => f.fylke.toLowerCase() === fylkeParam.toLowerCase()
   );
   if (!matchedFylke) {
@@ -1133,8 +1148,8 @@ router.get("/sitemap.xml", (_req: Request, res: Response) => {
       xml += `\n  <url><loc>${DENTAL_BASE_URL}${p === "/" ? "" : p}</loc><changefreq>${freq}</changefreq><priority>${pri}</priority><lastmod>${today}</lastmod></url>`;
     }
 
-    // Fylke pages
-    for (const f of stats.per_fylke) {
+    // Fylke pages (canonical only — PR-111)
+    for (const f of canonicalFylker(stats.per_fylke)) {
       xml += `\n  <url><loc>${DENTAL_BASE_URL}/fylke/${encodeURIComponent(f.fylke)}</loc><changefreq>weekly</changefreq><priority>0.8</priority><lastmod>${today}</lastmod></url>`;
     }
 

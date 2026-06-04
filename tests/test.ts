@@ -13396,6 +13396,23 @@ console.log("\n── PR-109: finn-tannlege SSR + store extensions ──");
   dbFactory109.__resetDbFactoryForTesting();
 })();
 
+
+// ── pr111: canonical fylke filter (PR-111)
+{
+  const { canonicalFylker } = require("../src/routes/dental-seo");
+  const input = [
+    { fylke: "Oslo", count: 10 },
+    { fylke: "TEST", count: 1 },
+    { fylke: "Ukjent", count: 27 },
+    { fylke: "tr\u00f8ndelag", count: 5 },
+    { fylke: "", count: 2 },
+  ];
+  const out = canonicalFylker(input);
+  assertEq(out.length, 2, "pr111-01: only canonical fylker pass the filter");
+  assertTrue(out.some((f: any) => f.fylke === "Oslo") && out.some((f: any) => f.fylke === "tr\u00f8ndelag"),
+    "pr111-02: case-insensitive canonical match keeps Oslo + tr\u00f8ndelag");
+}
+
 // ── REPORT ────────────────────────────────────────────────────────────
 
 // Wait for the M2 owner-portal async tests before reporting so their
