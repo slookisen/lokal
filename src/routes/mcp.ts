@@ -104,6 +104,30 @@ function getAgentKnowledgeSummary(agentId: string): { contact?: any; productSumm
 // ─── Tool definitions (shared logic) ────────────────────────
 // These mirror the stdio MCP server tools but call services directly.
 
+// ─── PR-110 (2026-06-04): geocode-enrichment for MCP natural-language search ──
+// parseNaturalQuery deliberately skips geocoding (kept synchronous); the REST
+// search route adds it via geocodingService.extractAndGeocode — but the MCP
+// lokal_search handler never did. Result: every MCP search was nationwide
+// text-match ("poteter Bod\u00f8" returned Bryne/Levanger/Dr\u00f8bak instead of Bod\u00f8
+// Andelslandbruk 0.2 km away). This helper mirrors the REST route's step so
+// MCP clients (ChatGPT/Claude) get the same geo-filtered results as the web.
+// Exported for direct regression-testing.
+export async function enrichParsedWithGeo(
+  parsed: ReturnType<typeof marketplaceRegistry.parseNaturalQuery>,
+  query: string
+): Promise<void> {
+  if (parsed.location) return; // already resolved (e.g. explicit coords)
+  try {
+    const geo = await geocodingService.extractAndGeocode(query);
+    if (geo) {
+      parsed.location = { lat: geo.lat, lng: geo.lng };
+      parsed.maxDistanceKm = geo.radiusKm;
+    }
+  } catch {
+    // Geocode failure must never break search — fall back to nationwide text-match.
+  }
+}
+
 function registerTools(server: McpServer, getClientIdentity?: () => string | undefined) {
   // Tool 1: Natural language search
   server.registerTool(
@@ -125,6 +149,7 @@ function registerTools(server: McpServer, getClientIdentity?: () => string | und
     },
     async ({ query, limit }) => {
       const parsed = marketplaceRegistry.parseNaturalQuery(query);
+      await enrichParsedWithGeo(parsed, query);
       const results = marketplaceRegistry.discover({ ...parsed, limit: limit || 10, offset: 0 });
 
       if (!results?.length) {
