@@ -119,19 +119,11 @@ app.use(markdownNegotiation);
 // Detect /en prefix → req.lang. Must run before any HTML route.
 app.use(langMiddleware);
 
-// Well-known discovery endpoints (MCP Server Card, Agent Skills,
-// API Catalog, OAuth Protected Resource). Mounted BEFORE static
-// so the .well-known/* paths are served dynamically, not from disk.
-app.use("/", agentReadinessRoutes);
-
-// ─── Owner Portal Routes (M1, Phase 5.4a) ───────────────────
-// Magic-link auth + 7-field profile management for producers.
-// Mounted at root because it serves both /api/agents/:id/* and /magic-link-verify.
-app.use("/", ownerPortalRoutes);
-
 // ─── PR-109: finn-tannlege.com host routing ───────────────────────────
-// Registered BEFORE express.static so dental-host requests never
-// hit rfb static assets. Security/analytics middleware above already
+// Registered BEFORE agentReadinessRoutes, ownerPortalRoutes and
+// express.static so dental-host requests never hit rfb portal pages
+// or static assets (round-2 review fix: ownerPortal mounted at root
+// would otherwise answer /eier/* and /magic-link-verify on dental host). Security/analytics middleware above already
 // ran. API, health, and well-known paths pass through via next().
 // Lazy-require so dental-seo only loads when ENABLE_DENTAL=1.
 if (process.env.ENABLE_DENTAL === "1") {
@@ -158,6 +150,17 @@ if (process.env.ENABLE_DENTAL === "1") {
     return dentalSeoRouter(req, res, next);
   });
 }
+
+
+// Well-known discovery endpoints (MCP Server Card, Agent Skills,
+// API Catalog, OAuth Protected Resource). Mounted BEFORE static
+// so the .well-known/* paths are served dynamically, not from disk.
+app.use("/", agentReadinessRoutes);
+
+// ─── Owner Portal Routes (M1, Phase 5.4a) ───────────────────
+// Magic-link auth + 7-field profile management for producers.
+// Mounted at root because it serves both /api/agents/:id/* and /magic-link-verify.
+app.use("/", ownerPortalRoutes);
 
 // Serve the marketplace dashboard
 app.use(express.static(path.join(__dirname, "public"), { extensions: ["html"] }));
