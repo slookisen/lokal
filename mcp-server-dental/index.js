@@ -156,19 +156,15 @@ server.registerTool(
       return { content: [{ type: "text", text: "Feil: oppgi enten org_nr (9 siffer) eller id." }] };
     }
 
-    let agentId = id;
-    if (org_nr && !agentId) {
-      // Find by org_nr via list endpoint
-      const params = new URLSearchParams({ q: org_nr, limit: "1" });
-      const results = await fetchJSON(`${BASE_URL}/api/tannlege/agents?${params}`);
-      if (!Array.isArray(results) || results.length === 0) {
-        return { content: [{ type: "text", text: `Fant ikke klinikk med org_nr ${org_nr}.` }] };
-      }
-      agentId = results[0].id;
-    }
+    // Use the :id route directly — it accepts both UUID and 9-digit org_nr
+    // (GET /api/tannlege/agents/:id has a /^\d{9}$/ branch → getDentalAgentByOrgnr).
+    // This avoids a two-step free-text search that could match the wrong clinic
+    // when org_nr appears in another field (e.g. om_oss or name).
+    const lookupKey = org_nr ?? id;
 
-    const agent = await fetchJSON(`${BASE_URL}/api/tannlege/agents/${agentId}`);
-    const specialists = await fetchJSON(`${BASE_URL}/api/tannlege/agents/${agentId}/specialists`).catch(() => []);
+    const agent = await fetchJSON(`${BASE_URL}/api/tannlege/agents/${lookupKey}`);
+    // specialists endpoint requires UUID — use agent.id from the resolved agent
+    const specialists = await fetchJSON(`${BASE_URL}/api/tannlege/agents/${agent.id}/specialists`).catch(() => []);
 
     const sections = [`# ${agent.navn}`];
     if (agent.poststed) sections.push(`📍 ${agent.adresse || ""}${agent.adresse ? ", " : ""}${agent.postnummer || ""} ${agent.poststed}${agent.fylke ? `, ${agent.fylke}` : ""}`.trim());
