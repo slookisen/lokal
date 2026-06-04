@@ -28,6 +28,13 @@ COPY openapi.yaml ./
 # Vertical config bundles (Phase 4.1) — read at boot via loadConfigsAtBoot().
 # App refuses to start without verticals/rfb/config.yaml.
 COPY verticals/ ./verticals/
+# MCP stdio packages — server.json may be referenced by registry/build tooling.
+# Neither mcp-server/ nor mcp-server-dental/ are required at runtime (they are
+# npm packages published separately and invoked via npx by end users).
+# We COPY them for consistency with rfb pattern and to allow server.json to be
+# inspected from inside the container (e.g. by CI checks or registry validators).
+COPY mcp-server/ ./mcp-server/
+COPY mcp-server-dental/ ./mcp-server-dental/
 
 # SQLite data directory (mount a volume here for persistence)
 RUN mkdir -p /app/data

@@ -1323,6 +1323,28 @@ Eksempel (cURL):
     -H "Content-Type: application/json" \\
     -d '{"jsonrpc":"2.0","method":"message/send","params":{"message":{"text":"finn tannlege med helfo-avtale i Oslo"}},"id":"1"}'
 
+## MCP (Model Context Protocol)
+
+HTTP Streamable MCP:  ${DENTAL_BASE_URL}/mcp
+npm-pakke (stdio):    npx finn-tannlege-mcp
+
+Tilgjengelige MCP-tools:
+- tannlege_search   — søk klinikker (fritekst, fylke, spesialitet, Helfo, akutt)
+- tannlege_info     — full klinikkprofil via org_nr eller id
+- tannlege_stats    — aggregerte markedsstatistikker
+- tannlege_akutt    — finn akuttvakt-klinikker
+- tannlege_kjeder   — list alle tannlegekjeder med antall lokasjoner
+
+Claude Desktop-konfig:
+  {
+    "mcpServers": {
+      "finn-tannlege": {
+        "command": "npx",
+        "args": ["finn-tannlege-mcp"]
+      }
+    }
+  }
+
 ## REST API-endepunkt
 
 GET ${DENTAL_BASE_URL}/api/tannlege/agents
@@ -1487,7 +1509,9 @@ router.get("/hvordan-det-fungerer", (_req: Request, res: Response) => {
     <ul style="font-size:.9rem;color:var(--g500)">
       <li><a href="/api/tannlege/agents">/api/tannlege</a> &mdash; REST API med JSON-svar (DentalAgent-objekter)</li>
       <li><a href="/llms.txt">/llms.txt</a> &mdash; LLM-vennlig oversikt over API og datastruktur</li>
-      <li>A2A- og MCP-integrasjon er under utbygging</li>
+      <li><a href="/a2a">/a2a</a> &mdash; A2A JSON-RPC 2.0 endepunkt (message/send)</li>
+      <li><a href="/mcp">/mcp</a> &mdash; MCP Streamable HTTP (ChatGPT, Claude Desktop, Cursor)</li>
+      <li><code>npx finn-tannlege-mcp</code> &mdash; stdio MCP-pakke for lokal bruk</li>
     </ul>
   </div>
 </main>`;
