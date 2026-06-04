@@ -12620,6 +12620,55 @@ console.log("\n── PR-108: claim-pool junk-exclusion ──");
   dbFactoryPr108.__resetDbFactoryForTesting();
 })();
 
+// ── PR-110 (2026-06-04): MCP lokal_search geocode-enrichment ────────
+// Regression: MCP searches were nationwide text-match because the MCP
+// handler skipped the REST route's extractAndGeocode step. Tests call
+// the exported enrichParsedWithGeo helper directly. Uses the async
+// promise-await pattern (mirrors PR-103) — geocoding for major cities
+// (Oslo/Bergen/Bodø) is hardcoded in geocoding-service, no network I/O.
+console.log("\n── PR-110: MCP search geocode-enrichment ──");
+let _pr110Resolve: () => void = () => {};
+const _pr110Promise: Promise<void> = new Promise<void>((r) => { _pr110Resolve = r; });
+(async () => {
+  try {
+    const { enrichParsedWithGeo } = require("../src/routes/mcp") as typeof import("../src/routes/mcp");
+    const { marketplaceRegistry } = require("../src/services/marketplace-registry") as typeof import("../src/services/marketplace-registry");
+
+    // T1: place name in query -> location + radius get set (hardcoded city, no API call).
+    {
+      const parsed = marketplaceRegistry.parseNaturalQuery("poteter Bodø");
+      assertTrue(!parsed.location, "pr110-01a: parseNaturalQuery alone does NOT geocode (precondition)");
+      await enrichParsedWithGeo(parsed, "poteter Bodø");
+      assertTrue(!!parsed.location, "pr110-01b: enrichParsedWithGeo sets location for 'poteter Bodø'");
+      const lat = parsed.location ? parsed.location.lat : 0;
+      assertTrue(Math.abs(lat - 67.28) < 0.2, "pr110-01c: resolved location is Bodø (lat ~67.28)");
+      assertTrue(typeof parsed.maxDistanceKm === "number" && parsed.maxDistanceKm! > 0,
+        "pr110-01d: maxDistanceKm set from geocode radius");
+    }
+
+    // T2: query without place name -> no location, nationwide search preserved.
+    {
+      const parsed = marketplaceRegistry.parseNaturalQuery("økologisk honning");
+      await enrichParsedWithGeo(parsed, "økologisk honning");
+      assertTrue(!parsed.location, "pr110-02: no place name -> location stays unset (nationwide)");
+    }
+
+    // T3: pre-resolved location is never overwritten.
+    {
+      const parsed = marketplaceRegistry.parseNaturalQuery("ost Bergen");
+      (parsed as any).location = { lat: 1, lng: 2 };
+      await enrichParsedWithGeo(parsed, "ost Bergen");
+      assertTrue(parsed.location!.lat === 1 && parsed.location!.lng === 2,
+        "pr110-03: existing location not overwritten by enrichment");
+    }
+  } catch (err) {
+    failures.push("pr110: unexpected error: " + (err instanceof Error ? err.message : String(err)));
+    failed++;
+  } finally {
+    _pr110Resolve();
+  }
+})();
+
 // ── PR-103 (2026-06-03): backend dental geocoding worker ────────────
 //
 // Tests the Kartverket-based geocoding worker introduced in
@@ -13422,6 +13471,7 @@ console.log("\n── PR-109: finn-tannlege SSR + store extensions ──");
   try { await _pr95Promise; } catch { /* errors already pushed to failures */ }
   try { await _pr103Promise; } catch { /* errors already pushed to failures */ }
   try { await _pr106Promise; } catch { /* errors already pushed to failures */ }
+  try { await _pr110Promise; } catch { /* errors already pushed to failures */ }
   // PR-109 tests are synchronous (IIFE) — no promise needed
   // Drop pre-existing intg failures (unmasked by awaiting) — they predate M2
   // and live behind a separate fix-it task. Counting them here would surface

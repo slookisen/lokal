@@ -104,7 +104,7 @@ function getAgentKnowledgeSummary(agentId: string): { contact?: any; productSumm
 // ─── Tool definitions (shared logic) ────────────────────────
 // These mirror the stdio MCP server tools but call services directly.
 
-// ─── PR-109 (2026-06-04): geocode-enrichment for MCP natural-language search ──
+// ─── PR-110 (2026-06-04): geocode-enrichment for MCP natural-language search ──
 // parseNaturalQuery deliberately skips geocoding (kept synchronous); the REST
 // search route adds it via geocodingService.extractAndGeocode — but the MCP
 // lokal_search handler never did. Result: every MCP search was nationwide
