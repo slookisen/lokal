@@ -1,19 +1,11 @@
-// ─── Dental Claim Service — PR-104 (2026-06-03) ─────────────────────
+// --- Dental Claim Service PR-104 (2026-06-03) + PR-107 (2026-06-04) ---
 //
 // Multi-worker record-claim service for dental_agents.
 //
-// Each Claude-based scheduled task spawns with a unique worker_id (e.g.
-// "dental-worker-1", "dental-worker-2"). Workers call /admin/dental/claim-batch
-// to atomically reserve up to N records for processing. Records auto-release
-// after CLAIM_TIMEOUT_MS so a crashed worker can't lock them forever.
-//
-// Filter shapes (supported now):
-//   - { enrichment_state: "raw" }
-//   - { enrichment_state: "enriched", verification_status: "pending_verify" }
-//   - { enrichment_state: "raw", has_hjemmeside: true }
-//   - { enrichment_state: "raw", has_adresse: true, has_lat: false }
-//
-// More filters can be added — keep allow-listed to prevent SQL-injection.
+// PR-107: fix zombie-claim bug.
+//   sweepExpiredClaims() NULLs worker_id/claimed_at for expired rows so
+//   they become visible to ORDER BY id scans again. Called inside
+//   claimBatch transaction (before SELECT) and at top of claimStatus.
 
 import { getDb } from "../database/db-factory";
 
@@ -39,9 +31,7 @@ export type ClaimedRecord = {
   verification_status: string;
 };
 
-// Build a parameterised WHERE-clause from a filter spec. Returns
-// {clause, params}. Filter keys are allow-listed; any unknown key is
-// silently ignored (callers pass an allow-listed ClaimFilter type).
+// Build a parameterised WHERE-clause from a filter spec.
 export function buildWhereClause(
   filter: ClaimFilter,
   now: number
@@ -80,9 +70,32 @@ export function buildWhereClause(
   return { clause: conditions.join(" AND "), params };
 }
 
+// PR-107: Sweep expired claims -- NULL out worker_id/claimed_at for any
+// row whose claimed_at is older than CLAIM_TIMEOUT_MS. Returns the
+// number of rows cleared. Accepts an optional `now` timestamp so tests
+// can inject a synthetic clock without monkey-patching Date.now().
+//
+// This is the authoritative fix for the zombie-claim bug: after the
+// sweep, ORDER BY id scans see previously-stuck rows again, so
+// claimBatch naturally reclaims them without any special-case logic.
+export function sweepExpiredClaims(now: number = Date.now()): number {
+  const db = getDb("dental");
+  const cutoff = now - CLAIM_TIMEOUT_MS;
+  const result = db
+    .prepare(
+      `UPDATE dental_agents SET worker_id = NULL, claimed_at = NULL
+       WHERE worker_id IS NOT NULL AND claimed_at < ?`
+    )
+    .run(cutoff);
+  return result.changes;
+}
+
 // Atomically claim up to `size` records. Returns the claimed records.
-// Uses a single transaction so SELECT + UPDATE are atomic with respect
-// to other workers calling claimBatch concurrently.
+// Uses a single transaction so SELECT + UPDATE are atomic.
+//
+// PR-107: calls sweepExpiredClaims inside the transaction (before the
+// SELECT) so that expired zombie rows are visible to ORDER BY id scans
+// and can be reclaimed by any worker.
 export function claimBatch(
   workerId: string,
   size: number,
@@ -95,8 +108,11 @@ export function claimBatch(
   const now = Date.now();
   const { clause, params } = buildWhereClause(filter, now);
 
-  // Use a transaction so SELECT + UPDATE is atomic per worker.
   const claim = db.transaction(() => {
+    // PR-107: sweep expired claims first so zombie rows become
+    // unclaimed and are visible to the ORDER BY id scan below.
+    sweepExpiredClaims(now);
+
     const candidates = db
       .prepare(`SELECT id FROM dental_agents WHERE ${clause} ORDER BY id LIMIT ?`)
       .all(...params, size) as Array<{ id: string }>;
@@ -109,7 +125,6 @@ export function claimBatch(
       `UPDATE dental_agents SET worker_id = ?, claimed_at = ? WHERE id IN (${placeholders})`
     ).run(workerId, now, ...ids);
 
-    // Return the now-claimed records with full data needed for processing.
     const claimed = db
       .prepare(
         `SELECT id, navn, org_nr, adresse, postnummer, poststed, hjemmeside, enrichment_state, verification_status
@@ -122,10 +137,9 @@ export function claimBatch(
   return claim();
 }
 
-// Release a batch of records. Workers should call this after processing
-// to free records for re-claim (or immediately if processing fails).
-// Only records currently claimed by the supplied workerId are released —
-// a worker cannot release another worker's claims.
+// Release a batch of records. Only records currently claimed by the
+// supplied workerId are released -- a worker cannot release another
+// worker's claims. (PR-107: semantics unchanged.)
 export function releaseBatch(workerId: string, recordIds: string[]): number {
   if (!workerId) throw new Error("invalid worker_id");
   if (recordIds.length === 0) return 0;
@@ -143,6 +157,11 @@ export function releaseBatch(workerId: string, recordIds: string[]): number {
 
 // Status query: how many records are currently claimed by each worker,
 // and how old the oldest claim is (helps spot stuck workers).
+//
+// PR-107: calls sweepExpiredClaims before querying so the result
+// reflects only live (non-expired) claims. Without this, claimStatus
+// would keep reporting zombie workers even though their claims have
+// logically expired.
 export function claimStatus(): Array<{
   worker_id: string;
   count: number;
@@ -150,6 +169,10 @@ export function claimStatus(): Array<{
 }> {
   const db = getDb("dental");
   const now = Date.now();
+
+  // PR-107: clear zombies so the count below reflects only live claims.
+  sweepExpiredClaims(now);
+
   const rows = db
     .prepare(
       `SELECT worker_id, COUNT(*) AS count, MIN(claimed_at) AS oldest_claim_at
