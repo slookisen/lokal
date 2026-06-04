@@ -119,6 +119,39 @@ app.use(markdownNegotiation);
 // Detect /en prefix → req.lang. Must run before any HTML route.
 app.use(langMiddleware);
 
+// ─── PR-109: finn-tannlege.com host routing ───────────────────────────
+// Registered BEFORE agentReadinessRoutes, ownerPortalRoutes and
+// express.static so dental-host requests never hit rfb portal pages
+// or static assets (round-2 review fix: ownerPortal mounted at root
+// would otherwise answer /eier/* and /magic-link-verify on dental host). Security/analytics middleware above already
+// ran. API, health, and well-known paths pass through via next().
+// Lazy-require so dental-seo only loads when ENABLE_DENTAL=1.
+if (process.env.ENABLE_DENTAL === "1") {
+  const DENTAL_HOSTS = new Set(["finn-tannlege.com", "www.finn-tannlege.com"]);
+  // eslint-disable-next-line @typescript-eslint/no-var-requires
+  const dentalSeoRouter = require("./routes/dental-seo").default;
+
+  app.use((req: any, res: any, next: any) => {
+    const host = req.hostname;
+    if (!DENTAL_HOSTS.has(host)) return next();
+
+    // www → apex canonical redirect
+    if (host === "www.finn-tannlege.com") {
+      return res.redirect(301, `https://finn-tannlege.com${req.originalUrl}`);
+    }
+
+    // Pass API, health, and well-known through to existing routes
+    const p = req.path;
+    if (p.startsWith("/api/") || p === "/health" || p.startsWith("/.well-known/")) {
+      return next();
+    }
+
+    // All other paths on dental hosts → dental-seo router
+    return dentalSeoRouter(req, res, next);
+  });
+}
+
+
 // Well-known discovery endpoints (MCP Server Card, Agent Skills,
 // API Catalog, OAuth Protected Resource). Mounted BEFORE static
 // so the .well-known/* paths are served dynamically, not from disk.
