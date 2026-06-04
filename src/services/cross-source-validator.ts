@@ -343,6 +343,20 @@ export const KNOWN_DIRECTORY_HOSTS: ReadonlySet<string> = new Set([
   "visitnorway.no",
   "visittelemark.no",
   "xn--visitjren-w1a.com",
+  // Extended 2026-06-04 (lokal-agent-enrichment): tourism guides and
+  // local-food directories surfaced as domain-coherence false positives in
+  // the review queue (n≈19 agents blocked solely by these agentHost values).
+  "fjordnorway.com",
+  "ivaldres.no",
+  "matfatetringsaker.no",
+  "meny.no",
+  "smakavnordhordland.no",
+  "sorlandssenteret.no",
+  "statsforvalteren.no",
+  "vingelen.com",
+  "visitbo.no",
+  "visitfredrikskadhvaler.com",
+  "visitvestfold.com",
 ]);
 
 export function isKnownDirectoryHost(host: string): boolean {
