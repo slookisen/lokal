@@ -22,8 +22,11 @@ import {
   getDentalStats,
   getDentalAgentByOrgnr,
   getDentalAgentById,
+  listPoststeder,
+  listRelatedClinics,
+  getDentalAgentsForSitemap,
 } from "../services/dental-store";
-import type { DentalAgent } from "../services/dental-store";
+import type { DentalAgent, PoststedRow } from "../services/dental-store";
 import { getDentalAgentCard } from "../services/dental-agent-card";
 import { getDentalOpenapi } from "../services/dental-openapi";
 
@@ -171,6 +174,48 @@ export function parseClinicSlug(
   const mOld = slug.match(/-(\d{9})$/);
   if (mOld) return { orgNr: mOld[1]! };
   return null;
+}
+
+// ─── PR-116: shared text helpers ────────────────────────────
+
+/**
+ * Translitterate Norwegian text for URL slugs.
+ * æ→ae, ø→oe, å→aa, mellomrom/spesialtegn → bindestrek.
+ * Same rules as slugifyClinic but without the org_nr suffix.
+ */
+export function slugifyText(text: string): string {
+  return text
+    .toLowerCase()
+    .replace(/æ/g, "ae")
+    .replace(/ø/g, "oe")
+    .replace(/å/g, "aa")
+    .normalize("NFD")
+    .replace(/[̀-ͯ]/g, "")
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "");
+}
+
+/** Title-case a DB poststed value (stored uppercase, e.g. "OSLO" → "Oslo",
+ *  "MO I RANA" → "Mo i Rana"). Small Norwegian conjunctions stay lowercase
+ *  when not first word. */
+export function titleCasePoststed(s: string): string {
+  const SMALL = new Set(["i", "og", "på", "av", "ved", "for"]);
+  return s.toLowerCase().split(" ").map((word, idx) => {
+    if (idx > 0 && SMALL.has(word)) return word;
+    return word.charAt(0).toUpperCase() + word.slice(1);
+  }).join(" ");
+}
+
+// ─── Poststed cache (60 s, same TTL as stats) ────────────────
+let _poststedCache: { value: PoststedRow[]; expires: number } | null = null;
+
+function getCachedPoststeder(): PoststedRow[] {
+  const now = Date.now();
+  if (_poststedCache && now < _poststedCache.expires) return _poststedCache.value;
+  let value: PoststedRow[] = [];
+  try { value = listPoststeder(1); } catch { /* db not ready */ }
+  _poststedCache = { value, expires: now + DENTAL_STATS_TTL_MS };
+  return value;
 }
 
 // ─── "Åpent nå" helper ───────────────────────────────────────
@@ -683,6 +728,21 @@ router.get("/", (_req: Request, res: Response) => {
       </div>
     </div>
   </section>
+
+  ${(() => {
+    const topSteder = getCachedPoststeder().slice(0, 20);
+    if (topSteder.length === 0) return "";
+    const chips = topSteder.map((p) =>
+      `<a href="/sted/${escapeHtml(slugifyText(p.poststed))}" class="spec-chip">${escapeHtml(titleCasePoststed(p.poststed))}</a>`
+    ).join("");
+    return `<section class="section">
+    <div class="container">
+      <div class="section-title">Populære steder</div>
+      <div class="section-sub">Finn tannlege i din by</div>
+      <div style="display:flex;flex-wrap:wrap;gap:8px;margin-top:0">${chips}</div>
+    </div>
+  </section>`;
+  })()}
 </main>`;
 
   res.setHeader("Content-Type", "text/html; charset=utf-8");
@@ -827,6 +887,21 @@ router.get("/sok", (req: Request, res: Response) => {
 // ═══════════════════════════════════════════════════════════
 // GET /klinikk/:slug  +  GET /klinikk/id/:id
 // ═══════════════════════════════════════════════════════════
+
+// ─── PR-116: BreadcrumbList JSON-LD helper ───────────────────
+interface BreadcrumbItem { name: string; url: string; }
+function breadcrumbJsonLd(items: BreadcrumbItem[]): object {
+  return {
+    "@context": "https://schema.org",
+    "@type": "BreadcrumbList",
+    itemListElement: items.map((item, i) => ({
+      "@type": "ListItem",
+      position: i + 1,
+      name: item.name,
+      item: item.url,
+    })),
+  };
+}
 
 function renderClinicProfile(
   agent: DentalAgent & { id: string },
@@ -991,11 +1066,46 @@ function renderClinicProfile(
     ? `<p style="margin-top:32px;font-size:.9rem"><a href="/fylke/${encodeURIComponent(agent.fylke)}">&larr; Flere tannleger i ${escapeHtml(agent.fylke)}</a></p>`
     : "";
 
+  // ── PR-116: Related clinics (same poststed)
+  let relatedSection = "";
+  if (agent.poststed) {
+    let related: Array<DentalAgent & { id: string }> = [];
+    try { related = listRelatedClinics(agent, 6); } catch { /* db not ready */ }
+    if (related.length > 0) {
+      const stedSlug = slugifyText(agent.poststed);
+      const titledSted = titleCasePoststed(agent.poststed);
+      const relatedCards = related.map(clinicCard).join("");
+      relatedSection = `<div class="section-box" style="margin-top:20px">
+  <h2>Flere tannleger i ${escapeHtml(titledSted)}</h2>
+  <div class="clinic-list" role="list" style="margin-top:12px">${relatedCards}</div>
+  <p style="margin-top:16px;font-size:.9rem">
+    <a href="/sted/${escapeHtml(stedSlug)}">Se alle tannleger i ${escapeHtml(titledSted)} &rarr;</a>
+    ${agent.fylke ? `&ensp;&middot;&ensp;<a href="/fylke/${encodeURIComponent(agent.fylke)}">Se alle i ${escapeHtml(agent.fylke)} &rarr;</a>` : ""}
+  </p>
+</div>`;
+    }
+  }
+
   // ── Updated_at disclaimer
   const updatedAt = (agent as any).updated_at;
   const disclaimer = updatedAt
     ? `<p class="disclaimer">Informasjonen er hentet fra offentlige registre og klinikkens egne sider, sist oppdatert ${escapeHtml(String(updatedAt).split("T")[0] || String(updatedAt))}. Kontakt oss på <a href="mailto:kontakt@finn-tannlege.com">kontakt@finn-tannlege.com</a> ved feil.</p>`
     : `<p class="disclaimer">Informasjonen er hentet fra Brønnøysundregistrene og offentlig tilgjengelige kilder. Kontakt oss på <a href="mailto:kontakt@finn-tannlege.com">kontakt@finn-tannlege.com</a> ved feil.</p>`;
+
+  // ── PR-116: BreadcrumbList for profile
+  const profileBreadcrumbItems: BreadcrumbItem[] = [{ name: "Hjem", url: DENTAL_BASE_URL }];
+  if (agent.fylke) profileBreadcrumbItems.push({ name: agent.fylke, url: `${DENTAL_BASE_URL}/fylke/${encodeURIComponent(agent.fylke)}` });
+  if (agent.poststed) profileBreadcrumbItems.push({ name: titleCasePoststed(agent.poststed), url: `${DENTAL_BASE_URL}/sted/${slugifyText(agent.poststed)}` });
+  profileBreadcrumbItems.push({ name: agent.navn, url: canonical });
+  const jsonLdArr = [jsonLd, breadcrumbJsonLd(profileBreadcrumbItems)];
+
+  // ── PR-116: unique meta description
+  const metaDesc = [
+    `${agent.navn} — tannlegeklinikk${agent.poststed ? ` i ${titleCasePoststed(agent.poststed)}` : ""}${agent.fylke ? `, ${agent.fylke}` : ""}.`,
+    agent.helfo_agreement === "true" ? "Helfo-avtale." : "",
+    agent.acute_vakt === 1 ? "Akuttvakt." : "",
+    "Se åpningstider, behandlinger og kontaktinfo.",
+  ].filter(Boolean).join(" ");
 
   const html = `
 <main>
@@ -1015,6 +1125,7 @@ function renderClinicProfile(
     ${treatmentsSection}
     ${practicalSection}
     ${mapSection}
+    ${relatedSection}
     ${fylkeLink}
     ${disclaimer}
   </div>
@@ -1022,10 +1133,10 @@ function renderClinicProfile(
 
   res.setHeader("Content-Type", "text/html; charset=utf-8");
   res.send(dentalShell(html, {
-    title: `${agent.navn} — Tannlegeklinikk${agent.poststed ? ` i ${agent.poststed}` : ""} | Finn-tannlege.com`,
-    description: `${agent.navn}${agent.poststed ? ` i ${agent.poststed}` : ""}. ${agent.helfo_agreement === "true" ? "Har Helfo-direkteoppgjørsavtale. " : ""}${agent.telefon ? `Telefon: ${agent.telefon}.` : ""}`,
+    title: `${agent.navn} — Tannlegeklinikk${agent.poststed ? ` i ${titleCasePoststed(agent.poststed)}` : ""} | Finn-tannlege.com`,
+    description: metaDesc,
     canonical,
-    jsonLd,
+    jsonLd: jsonLdArr,
   }));
 }
 
@@ -1115,6 +1226,24 @@ router.get("/fylke/:fylke", (req: Request, res: Response) => {
     })),
   };
 
+  // PR-116: Poststed chips for this fylke (≥2 clinics, max 30)
+  const fylkePoststeder = getCachedPoststeder()
+    .filter((p) => p.fylke && p.fylke.toLowerCase() === matchedFylke.fylke.toLowerCase() && p.count >= 2)
+    .slice(0, 30);
+  const poststedChips = fylkePoststeder.length > 0
+    ? `<div style="margin-top:40px">
+  <div class="section-title" style="font-size:1rem;margin-bottom:10px">Steder i ${escapeHtml(matchedFylke.fylke)}</div>
+  <div style="display:flex;flex-wrap:wrap;gap:8px">
+    ${fylkePoststeder.map((p) => `<a href="/sted/${escapeHtml(slugifyText(p.poststed))}" class="spec-chip">${escapeHtml(titleCasePoststed(p.poststed))} <span style="font-size:.75em;opacity:.7">(${p.count})</span></a>`).join("")}
+  </div>
+</div>` : "";
+
+  // PR-116: BreadcrumbList
+  const fylkeBreadcrumb = breadcrumbJsonLd([
+    { name: "Hjem", url: DENTAL_BASE_URL },
+    { name: matchedFylke.fylke, url: `${DENTAL_BASE_URL}${baseUrl}` },
+  ]);
+
   const html = `
 <main>
   <div class="profile-header">
@@ -1130,6 +1259,7 @@ router.get("/fylke/:fylke", (req: Request, res: Response) => {
       ${agents.length > 0 ? agents.map(clinicCard).join("") : `<div class="empty-state"><h3>Ingen klinikker funnet</h3></div>`}
     </div>
     ${paginationHtml(page, totalPages, baseUrl)}
+    ${poststedChips}
   </div>
 </main>`;
 
@@ -1138,7 +1268,7 @@ router.get("/fylke/:fylke", (req: Request, res: Response) => {
     title: `Tannleger i ${escapeHtml(matchedFylke.fylke)} — Finn-tannlege.com`,
     description: `Oversikt over ${total} tannlegeklinikker i ${matchedFylke.fylke}. Finn klinikk med Helfo-avtale, spesialitet eller tannlegevakt.`,
     canonical: `${DENTAL_BASE_URL}${baseUrl}`,
-    jsonLd: itemList,
+    jsonLd: [itemList, fylkeBreadcrumb],
   }));
 });
 
@@ -1219,22 +1349,38 @@ router.get("/sitemap.xml", (_req: Request, res: Response) => {
       xml += `\n  <url><loc>${DENTAL_BASE_URL}/fylke/${encodeURIComponent(f.fylke)}</loc><changefreq>weekly</changefreq><priority>0.8</priority><lastmod>${today}</lastmod></url>`;
     }
 
-    // Clinic pages — stream from DB in batches to avoid loading ~7k rows at once
-    let batchOffset = 0;
-    const BATCH = 200;
-    while (true) {
-      let batch: Array<DentalAgent & { id: string }> = [];
-      try {
-        batch = listPublicDentalAgents({}, BATCH, batchOffset);
-      } catch { break; }
-      if (batch.length === 0) break;
-      for (const a of batch) {
-        if (!a.org_nr) continue; // skip rows without org_nr (can't form stable slug)
+    // Sted pages (PR-116) — all poststeder with ≥1 clinic
+    const sitemapSteder = getCachedPoststeder();
+    for (const p of sitemapSteder) {
+      xml += `\n  <url><loc>${DENTAL_BASE_URL}/sted/${slugifyText(p.poststed)}</loc><changefreq>weekly</changefreq><priority>0.75</priority><lastmod>${today}</lastmod></url>`;
+    }
+
+    // Clinic pages — getDentalAgentsForSitemap for lastmod support (PR-116)
+    let clinicRows: Array<{ org_nr: string; navn: string; updated_at: string | null }> = [];
+    try { clinicRows = getDentalAgentsForSitemap(); } catch { /* fallback to batch */ }
+
+    if (clinicRows.length > 0) {
+      for (const a of clinicRows) {
         const slug = slugifyClinic(a.navn, a.org_nr);
-        xml += `\n  <url><loc>${DENTAL_BASE_URL}/klinikk/${slug}</loc><changefreq>monthly</changefreq><priority>0.7</priority><lastmod>${today}</lastmod></url>`;
+        const lastmod = a.updated_at ? (a.updated_at.split("T")[0] || a.updated_at) : today;
+        xml += `\n  <url><loc>${DENTAL_BASE_URL}/klinikk/${slug}</loc><changefreq>monthly</changefreq><priority>0.7</priority><lastmod>${escapeHtml(lastmod)}</lastmod></url>`;
       }
-      batchOffset += BATCH;
-      if (batch.length < BATCH) break;
+    } else {
+      // Fallback: batch from listPublicDentalAgents
+      let batchOffset = 0;
+      const BATCH = 200;
+      while (true) {
+        let batch: Array<DentalAgent & { id: string }> = [];
+        try { batch = listPublicDentalAgents({}, BATCH, batchOffset); } catch { break; }
+        if (batch.length === 0) break;
+        for (const a of batch) {
+          if (!a.org_nr) continue;
+          const slug = slugifyClinic(a.navn, a.org_nr);
+          xml += `\n  <url><loc>${DENTAL_BASE_URL}/klinikk/${slug}</loc><changefreq>monthly</changefreq><priority>0.7</priority><lastmod>${today}</lastmod></url>`;
+        }
+        batchOffset += BATCH;
+        if (batch.length < BATCH) break;
+      }
     }
 
     xml += "\n</urlset>";
@@ -1660,12 +1806,117 @@ router.get("/spesialitet/:slug", (req: Request, res: Response) => {
   </div>
 </main>`;
 
+  const specBreadcrumb = breadcrumbJsonLd([
+    { name: "Hjem", url: DENTAL_BASE_URL },
+    { name: displayNavn, url: canonicalUrl },
+  ]);
+
   res.setHeader("Content-Type", "text/html; charset=utf-8");
   res.send(dentalShell(html, {
     title: `${displayNavn} — Tannlegespesialister i Norge | Finn-tannlege.com`,
     description: `Oversikt over tannlegeklinikker med spesialitet i ${sp.navn} i Norge. ${sp.beskrivelse.split(".")[0]}.`,
     canonical: canonicalUrl,
-    jsonLd: itemList,
+    jsonLd: [itemList, specBreadcrumb],
+  }));
+});
+
+// ═══════════════════════════════════════════════════════════
+// GET /sted/:stedSlug  (PR-116 — bysider)
+// ═══════════════════════════════════════════════════════════
+
+router.get("/sted/:stedSlug", (req: Request, res: Response) => {
+  const PAGE_SIZE = 50;
+  const stedSlugParam = String(req.params.stedSlug).toLowerCase().trim();
+
+  // Build poststed lookup map from cache (slug → PoststedRow)
+  const poststeder = getCachedPoststeder();
+  const stedMap = new Map<string, PoststedRow>();
+  for (const p of poststeder) {
+    // first-write-wins: keeps the highest-count row when two poststeder slug to the same value
+    if (!stedMap.has(slugifyText(p.poststed))) stedMap.set(slugifyText(p.poststed), p);
+  }
+
+  const stedRow = stedMap.get(stedSlugParam);
+  if (!stedRow) {
+    res.status(404).send(dentalShell(
+      `<main><div class="container"><div class="empty-state" style="padding:80px 0"><h3>Sted ikke funnet</h3><p>Vi fant ikke tannleger for «${escapeHtml(stedSlugParam)}».</p><a href="/" class="btn-secondary" style="margin-top:16px">Til forsiden</a></div></div></main>`,
+      { title: "Sted ikke funnet — Finn-tannlege.com" }
+    ));
+    return;
+  }
+
+  const titledSted = titleCasePoststed(stedRow.poststed);
+  const sideRaw = parseInt(String(req.query.side || "1"), 10);
+  const page = Number.isFinite(sideRaw) && sideRaw > 0 ? sideRaw : 1;
+  const offset = (page - 1) * PAGE_SIZE;
+
+  let agents: Array<DentalAgent & { id: string }> = [];
+  let total = 0;
+  try {
+    agents = listPublicDentalAgents({ poststed: stedRow.poststed } as any, PAGE_SIZE, offset);
+    total = countPublicDentalAgents({ poststed: stedRow.poststed } as any);
+  } catch { /* db not ready */ }
+
+  const totalPages = Math.max(1, Math.ceil(total / PAGE_SIZE));
+  const canonicalUrl = `${DENTAL_BASE_URL}/sted/${stedSlugParam}`;
+  const baseUrl = `/sted/${stedSlugParam}`;
+
+  // JSON-LD ItemList
+  const itemList = {
+    "@context": "https://schema.org",
+    "@type": "ItemList",
+    name: `Tannlege i ${titledSted}`,
+    url: canonicalUrl,
+    numberOfItems: Math.min(total, 25),
+    itemListElement: agents.slice(0, 25).map((a, i) => ({
+      "@type": "ListItem",
+      position: offset + i + 1,
+      url: a.org_nr
+        ? `${DENTAL_BASE_URL}/klinikk/${slugifyClinic(a.navn, a.org_nr)}`
+        : `${DENTAL_BASE_URL}/klinikk/id/${a.id}`,
+      name: a.navn,
+    })),
+  };
+
+  // BreadcrumbList
+  const breadcrumbItems: BreadcrumbItem[] = [{ name: "Hjem", url: DENTAL_BASE_URL }];
+  if (stedRow.fylke) breadcrumbItems.push({ name: stedRow.fylke, url: `${DENTAL_BASE_URL}/fylke/${encodeURIComponent(stedRow.fylke)}` });
+  breadcrumbItems.push({ name: titledSted, url: canonicalUrl });
+  const stedBreadcrumb = breadcrumbJsonLd(breadcrumbItems);
+
+  const fylkeLink = stedRow.fylke
+    ? `<p style="margin-top:16px;font-size:.9rem"><a href="/fylke/${encodeURIComponent(stedRow.fylke)}">&larr; Alle tannleger i ${escapeHtml(stedRow.fylke)}</a></p>`
+    : `<p style="margin-top:16px;font-size:.9rem"><a href="/#fylker">&larr; Velg fylke</a></p>`;
+
+  const resultCards = agents.length > 0
+    ? agents.map(clinicCard).join("")
+    : `<div class="empty-state"><h3>Ingen klinikker funnet</h3><p>Vi har ingen registrerte klinikker i ${escapeHtml(titledSted)} for øyeblikket.</p></div>`;
+
+  const html = `
+<main>
+  <div class="profile-header">
+    <div class="container">
+      ${stedRow.fylke ? `<p style="font-size:.85rem;opacity:.7;margin-bottom:8px"><a href="/fylke/${encodeURIComponent(stedRow.fylke)}" style="color:rgba(255,255,255,.7)">&larr; ${escapeHtml(stedRow.fylke)}</a></p>` : ""}
+      <h1 class="profile-name">Tannlege i ${escapeHtml(titledSted)}</h1>
+      <p style="opacity:.8;font-size:.95rem">${total.toLocaleString("nb")} klinikker registrert</p>
+    </div>
+  </div>
+  <div class="container" style="padding-top:28px;padding-bottom:48px">
+    <p class="result-meta">Side ${page} av ${totalPages}</p>
+    <div class="clinic-list" role="list" aria-label="Tannleger i ${escapeHtml(titledSted)}">
+      ${resultCards}
+    </div>
+    ${paginationHtml(page, totalPages, baseUrl)}
+    ${fylkeLink}
+  </div>
+</main>`;
+
+  res.setHeader("Content-Type", "text/html; charset=utf-8");
+  res.send(dentalShell(html, {
+    title: `Tannlege i ${escapeHtml(titledSted)} — Finn-tannlege.com`,
+    description: `Oversikt over ${total} tannlegeklinikker i ${titledSted}${stedRow.fylke ? `, ${stedRow.fylke}` : ""}. Finn klinikk med Helfo-avtale, spesialitet eller tannlegevakt.`,
+    canonical: canonicalUrl,
+    jsonLd: [itemList, stedBreadcrumb],
   }));
 });
 

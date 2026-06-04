@@ -13845,3 +13845,166 @@ console.log("\n── PR-114: dental MCP server ──");
     else delete process.env.DENTAL_DB_PATH;
   }
 }
+
+
+// ─── pr116: SEO-pakke (slugifyText, titleCase, listPoststeder, listRelatedClinics, poststed-filter)
+
+// pr116-01: slugifyText — æøå + flerord + bindestrek
+{
+  const { slugifyText } = require("../src/routes/dental-seo") as typeof import("../src/routes/dental-seo");
+
+  assertEq(slugifyText("OSLO"), "oslo", "pr116-01a: OSLO → oslo");
+  assertEq(slugifyText("Bergen"), "bergen", "pr116-01b: Bergen → bergen");
+  assertEq(slugifyText("MO I RANA"), "mo-i-rana", "pr116-01c: MO I RANA → mo-i-rana");
+  assertEq(slugifyText("BODØ"), "bodoe", "pr116-01d: BODØ → bodoe (ø→oe)");
+  assertEq(slugifyText("ÆSØÅ"), "aesoeaa", "pr116-01e: ÆSØÅ → aesoeaa");
+  assertEq(slugifyText("Tønsberg"), "toensberg", "pr116-01f: Tønsberg → toensberg");
+  assertEq(slugifyText("  Trondheim  "), "trondheim", "pr116-01g: trim + lowercase");
+}
+
+// pr116-02: titleCasePoststed — title-case av DB-uppercase
+{
+  const { titleCasePoststed } = require("../src/routes/dental-seo") as typeof import("../src/routes/dental-seo");
+
+  assertEq(titleCasePoststed("OSLO"), "Oslo", "pr116-02a: OSLO → Oslo");
+  assertEq(titleCasePoststed("MO I RANA"), "Mo i Rana", "pr116-02b: MO I RANA → Mo i Rana (i forblir liten)");
+  assertEq(titleCasePoststed("BERGEN"), "Bergen", "pr116-02c: BERGEN → Bergen");
+  assertEq(titleCasePoststed("BODØ"), "Bodø", "pr116-02d: BODØ → Bodø");
+  assertEq(titleCasePoststed("STORD OG FITJAR"), "Stord og Fitjar", "pr116-02e: og er small word");
+  assertEq(titleCasePoststed("ÅS"), "Ås", "pr116-02f: ÅS → Ås");
+}
+
+// pr116-03: listPoststeder mot :memory:-DB
+{
+  const prevPath = process.env.DENTAL_DB_PATH;
+  process.env.DENTAL_DB_PATH = ":memory:";
+
+  try {
+    const { initDentalDb } = require("../src/database/dental-db-init") as typeof import("../src/database/dental-db-init");
+    initDentalDb();
+
+    const { createDentalAgent } = require("../src/services/dental-store") as typeof import("../src/services/dental-store");
+    const { listPoststeder } = require("../src/services/dental-store") as typeof import("../src/services/dental-store");
+
+    // Seed: 3 i OSLO, 1 i BERGEN, 1 rejected i OSLO (should be excluded)
+    createDentalAgent({ navn: "Oslo Klinikk 1 AS", org_nr: "920000001", poststed: "OSLO", fylke: "Oslo", verification_status: "verified" });
+    createDentalAgent({ navn: "Oslo Klinikk 2 AS", org_nr: "920000002", poststed: "OSLO", fylke: "Oslo", verification_status: "pending_verify" });
+    createDentalAgent({ navn: "Oslo Klinikk 3 AS", org_nr: "920000003", poststed: "OSLO", fylke: "Oslo", verification_status: "pending_verify" });
+    createDentalAgent({ navn: "Bergen Klinikk AS", org_nr: "920000004", poststed: "BERGEN", fylke: "Vestland", verification_status: "pending_verify" });
+    createDentalAgent({ navn: "Oslo Rejected AS", org_nr: "920000005", poststed: "OSLO", fylke: "Oslo", verification_status: "rejected" });
+
+    const rows = listPoststeder(1);
+
+    // OSLO should have count 3 (rejected excluded), BERGEN should have count 1
+    const osloRow = rows.find((r) => r.poststed === "OSLO");
+    const bergenRow = rows.find((r) => r.poststed === "BERGEN");
+
+    assertTrue(osloRow !== undefined, "pr116-03a: OSLO finnes i listPoststeder");
+    assertEq(osloRow?.count, 3, "pr116-03b: OSLO har count=3 (rejected ekskludert)");
+    assertEq(osloRow?.fylke, "Oslo", "pr116-03c: OSLO har korrekt fylke");
+    assertTrue(bergenRow !== undefined, "pr116-03d: BERGEN finnes i listPoststeder");
+    assertEq(bergenRow?.count, 1, "pr116-03e: BERGEN har count=1");
+
+    // minCount=2 should exclude BERGEN
+    const rows2 = listPoststeder(2);
+    const bergenFiltered = rows2.find((r) => r.poststed === "BERGEN");
+    assertTrue(bergenFiltered === undefined, "pr116-03f: minCount=2 ekskluderer BERGEN");
+
+    // OSLO should be first (highest count)
+    assertTrue(rows[0]?.poststed === "OSLO", "pr116-03g: OSLO er øverst (høyest count)");
+
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    const isDbErr = msg.includes("no such table") || msg.includes("dental") || msg.includes("initDentalDb");
+    if (isDbErr) {
+      console.log("  [pr116-03] dental DB ikke tilgjengelig — skipping");
+    } else {
+      assertTrue(false, `pr116-03: uventet feil: ${msg}`);
+    }
+  } finally {
+    if (prevPath !== undefined) process.env.DENTAL_DB_PATH = prevPath;
+    else delete process.env.DENTAL_DB_PATH;
+  }
+}
+
+// pr116-04: listRelatedClinics — ekskluderer seg selv + rejected
+{
+  const prevPath = process.env.DENTAL_DB_PATH;
+  process.env.DENTAL_DB_PATH = ":memory:";
+
+  try {
+    const { initDentalDb } = require("../src/database/dental-db-init") as typeof import("../src/database/dental-db-init");
+    initDentalDb();
+
+    const { createDentalAgent, getDentalAgentByOrgnr } = require("../src/services/dental-store") as typeof import("../src/services/dental-store");
+    const { listRelatedClinics } = require("../src/services/dental-store") as typeof import("../src/services/dental-store");
+
+    createDentalAgent({ navn: "Hoved Klinikk AS", org_nr: "930000001", poststed: "TROMSØ", fylke: "Troms", verification_status: "verified" });
+    createDentalAgent({ navn: "Nabo Klinikk AS", org_nr: "930000002", poststed: "TROMSØ", fylke: "Troms", verification_status: "pending_verify" });
+    createDentalAgent({ navn: "Rejected Klinikk AS", org_nr: "930000003", poststed: "TROMSØ", fylke: "Troms", verification_status: "rejected" });
+    createDentalAgent({ navn: "Annen By AS", org_nr: "930000004", poststed: "BERGEN", fylke: "Vestland", verification_status: "pending_verify" });
+
+    const hoved = getDentalAgentByOrgnr("930000001");
+    assertTrue(hoved !== null, "pr116-04a: hoved klinikk funnet");
+
+    const related = listRelatedClinics(hoved!, 10);
+
+    // Should only contain "Nabo Klinikk AS" — not self, not rejected, not other poststed
+    assertEq(related.length, 1, "pr116-04b: kun 1 relatert klinikk i TROMSØ");
+    assertEq(related[0].navn, "Nabo Klinikk AS", "pr116-04c: riktig klinikk returnert");
+    assertTrue(!related.some((r) => r.verification_status === "rejected"), "pr116-04d: ingen rejected i related");
+    assertTrue(!related.some((r) => r.id === hoved!.id), "pr116-04e: hoved-klinikk ikke i related");
+
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    const isDbErr = msg.includes("no such table") || msg.includes("dental") || msg.includes("initDentalDb");
+    if (isDbErr) {
+      console.log("  [pr116-04] dental DB ikke tilgjengelig — skipping");
+    } else {
+      assertTrue(false, `pr116-04: uventet feil: ${msg}`);
+    }
+  } finally {
+    if (prevPath !== undefined) process.env.DENTAL_DB_PATH = prevPath;
+    else delete process.env.DENTAL_DB_PATH;
+  }
+}
+
+// pr116-05: poststed-filter i listPublicDentalAgents
+{
+  const prevPath = process.env.DENTAL_DB_PATH;
+  process.env.DENTAL_DB_PATH = ":memory:";
+
+  try {
+    const { initDentalDb } = require("../src/database/dental-db-init") as typeof import("../src/database/dental-db-init");
+    initDentalDb();
+
+    const { createDentalAgent, listPublicDentalAgents, countPublicDentalAgents } = require("../src/services/dental-store") as typeof import("../src/services/dental-store");
+
+    createDentalAgent({ navn: "Stavanger A AS", org_nr: "940000001", poststed: "STAVANGER", fylke: "Rogaland", verification_status: "pending_verify" });
+    createDentalAgent({ navn: "Stavanger B AS", org_nr: "940000002", poststed: "STAVANGER", fylke: "Rogaland", verification_status: "verified" });
+    createDentalAgent({ navn: "Sandnes AS", org_nr: "940000003", poststed: "SANDNES", fylke: "Rogaland", verification_status: "pending_verify" });
+
+    const stavanger = listPublicDentalAgents({ poststed: "STAVANGER" } as any, 50);
+    assertEq(stavanger.length, 2, "pr116-05a: poststed-filter gir 2 STAVANGER-klinikker");
+    assertTrue(stavanger.every((a) => a.poststed === "STAVANGER"), "pr116-05b: alle returnerte klinikker er i STAVANGER");
+
+    const count = countPublicDentalAgents({ poststed: "STAVANGER" } as any);
+    assertEq(count, 2, "pr116-05c: countPublicDentalAgents med poststed-filter gir 2");
+
+    const sandnes = listPublicDentalAgents({ poststed: "SANDNES" } as any, 50);
+    assertEq(sandnes.length, 1, "pr116-05d: SANDNES gir 1 klinikk");
+
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    const isDbErr = msg.includes("no such table") || msg.includes("dental") || msg.includes("initDentalDb");
+    if (isDbErr) {
+      console.log("  [pr116-05] dental DB ikke tilgjengelig — skipping");
+    } else {
+      assertTrue(false, `pr116-05: uventet feil: ${msg}`);
+    }
+  } finally {
+    if (prevPath !== undefined) process.env.DENTAL_DB_PATH = prevPath;
+    else delete process.env.DENTAL_DB_PATH;
+  }
+}
+

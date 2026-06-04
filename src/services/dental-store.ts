@@ -152,6 +152,8 @@ export const ListFilterSchema = z.object({
   helfo_agreement: z.enum(["true", "false", "unknown"]).optional(),
   acute_vakt: z.union([z.literal(0), z.literal(1)]).optional(),
   enrichment_state: z.enum(["raw", "enriched"]).optional(),
+  // PR-116: bysidesfilter
+  poststed: z.string().optional(),
 });
 export type ListFilter = z.infer<typeof ListFilterSchema>;
 
@@ -398,6 +400,7 @@ export function listDentalAgents(
     where.push("enrichment_state = @enrichment_state");
     params.enrichment_state = parsed.enrichment_state;
   }
+  if (parsed.poststed) { where.push("poststed = @poststed"); params.poststed = parsed.poststed; }
 
   const sql =
     "SELECT * FROM dental_agents" +
@@ -459,6 +462,7 @@ export function countPublicDentalAgents(filter: ListFilter = {}): number {
   if (parsed.helfo_agreement !== undefined) { where.push("helfo_agreement = @helfo_agreement"); params.helfo_agreement = parsed.helfo_agreement; }
   if (parsed.acute_vakt !== undefined) { where.push("acute_vakt = @acute_vakt"); params.acute_vakt = parsed.acute_vakt; }
   if (parsed.enrichment_state !== undefined) { where.push("enrichment_state = @enrichment_state"); params.enrichment_state = parsed.enrichment_state; }
+  if (parsed.poststed) { where.push("poststed = @poststed"); params.poststed = parsed.poststed; }
 
   const sql = "SELECT COUNT(*) AS n FROM dental_agents" +
     ` WHERE ${where.join(" AND ")}`;
@@ -494,6 +498,7 @@ export function listPublicDentalAgents(
   if (parsed.helfo_agreement !== undefined) { where.push("helfo_agreement = @helfo_agreement"); params.helfo_agreement = parsed.helfo_agreement; }
   if (parsed.acute_vakt !== undefined) { where.push("acute_vakt = @acute_vakt"); params.acute_vakt = parsed.acute_vakt; }
   if (parsed.enrichment_state !== undefined) { where.push("enrichment_state = @enrichment_state"); params.enrichment_state = parsed.enrichment_state; }
+  if (parsed.poststed) { where.push("poststed = @poststed"); params.poststed = parsed.poststed; }
 
   const sql =
     "SELECT * FROM dental_agents" +
@@ -1040,4 +1045,85 @@ export function listExclusions(
   return getDb("dental")
     .prepare(sql)
     .all(...params) as Array<Record<string, unknown>>;
+}
+
+
+// ─── PR-116: SEO helpers ─────────────────────────────────────────────────────
+
+/**
+ * Returns all distinct non-empty poststeder (cities) with a count of
+ * non-rejected clinics, ordered by count descending.
+ * poststed values are stored UPPERCASE in the DB (e.g. "OSLO").
+ */
+export interface PoststedRow {
+  poststed: string;
+  fylke: string | null;
+  count: number;
+}
+
+export function listPoststeder(minCount = 1): PoststedRow[] {
+  const db = getDb("dental");
+  // For each poststed, pick the most common fylke (subquery via GROUP BY + ORDER BY n DESC LIMIT 1)
+  const rows = db.prepare(`
+    SELECT poststed,
+           (SELECT fylke FROM dental_agents da2
+            WHERE da2.poststed = da.poststed
+              AND da2.verification_status != 'rejected'
+              AND da2.fylke IS NOT NULL AND da2.fylke != ''
+            GROUP BY fylke ORDER BY COUNT(*) DESC LIMIT 1) AS fylke,
+           COUNT(*) AS n
+    FROM dental_agents da
+    WHERE verification_status != 'rejected'
+      AND poststed IS NOT NULL AND poststed != ''
+    GROUP BY poststed
+    HAVING n >= ?
+    ORDER BY n DESC
+  `).all(minCount) as Array<{ poststed: string; fylke: string | null; n: number }>;
+
+  return rows.map((r) => ({
+    poststed: r.poststed,
+    fylke: r.fylke ?? null,
+    count: r.n,
+  }));
+}
+
+/**
+ * Related clinics in the same poststed, excluding the given agent id,
+ * not rejected, quality-sorted (same order as listPublicDentalAgents).
+ */
+export function listRelatedClinics(
+  agent: DentalAgent & { id: string },
+  limit = 6
+): Array<DentalAgent & { id: string }> {
+  if (!agent.poststed) return [];
+  const db = getDb("dental");
+  const rows = db.prepare(`
+    SELECT * FROM dental_agents
+    WHERE poststed = ?
+      AND id != ?
+      AND verification_status != 'rejected'
+    ORDER BY
+      CASE verification_status WHEN 'verified' THEN 0 ELSE 1 END ASC,
+      CASE enrichment_state WHEN 'enriched' THEN 0 ELSE 1 END ASC,
+      CASE WHEN hjemmeside IS NOT NULL OR telefon IS NOT NULL THEN 0 ELSE 1 END ASC,
+      navn ASC
+    LIMIT ?
+  `).all(agent.poststed, agent.id, Math.max(1, Math.min(20, limit))) as Array<Record<string, unknown>>;
+  return rows.map(hydrateAgent);
+}
+
+/**
+ * Minimal list for sitemap generation: org_nr, navn, updated_at.
+ * Only non-rejected rows with an org_nr (required for stable slug).
+ */
+export function getDentalAgentsForSitemap(): Array<{ org_nr: string; navn: string; updated_at: string | null }> {
+  const db = getDb("dental");
+  const rows = db.prepare(`
+    SELECT org_nr, navn, updated_at
+    FROM dental_agents
+    WHERE verification_status != 'rejected'
+      AND org_nr IS NOT NULL AND org_nr != ''
+    ORDER BY navn ASC
+  `).all() as Array<{ org_nr: string; navn: string; updated_at: string | null }>;
+  return rows;
 }
