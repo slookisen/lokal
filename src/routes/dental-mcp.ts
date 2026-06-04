@@ -468,7 +468,12 @@ async function getOrCreateDentalSession(
 // ─── Routes ─────────────────────────────────────────────────
 
 // POST /mcp — Main MCP message handler (JSON-RPC over HTTP)
-router.post("/", async (req: Request, res: Response) => {
+// PR-115: the dental host-gate in index.ts dispatches the UNstripped path
+// ("/mcp") into this router (no app.use prefix mounting, mirroring
+// dental-a2a.ts). Routes therefore match both "/" and "/mcp" so the router
+// works under either mounting style and never falls through (next()) to
+// rfb's /mcp router.
+router.post(["/", "/mcp"], async (req: Request, res: Response) => {
   try {
     const sessionId = req.headers["mcp-session-id"] as string | undefined;
     const { session } = await getOrCreateDentalSession(sessionId);
@@ -482,7 +487,7 @@ router.post("/", async (req: Request, res: Response) => {
 });
 
 // GET /mcp — SSE stream for server-to-client notifications
-router.get("/", async (req: Request, res: Response) => {
+router.get(["/", "/mcp"], async (req: Request, res: Response) => {
   const sessionId = req.headers["mcp-session-id"] as string | undefined;
   if (!sessionId || !dentalSessions.has(sessionId)) {
     res.status(400).json({ error: "Missing or invalid mcp-session-id header" });
@@ -494,7 +499,7 @@ router.get("/", async (req: Request, res: Response) => {
 });
 
 // DELETE /mcp — Session cleanup
-router.delete("/", async (req: Request, res: Response) => {
+router.delete(["/", "/mcp"], async (req: Request, res: Response) => {
   const sessionId = req.headers["mcp-session-id"] as string | undefined;
   if (sessionId && dentalSessions.has(sessionId)) {
     const session = dentalSessions.get(sessionId)!;
@@ -502,6 +507,12 @@ router.delete("/", async (req: Request, res: Response) => {
     dentalSessions.delete(sessionId);
   }
   res.status(200).json({ ok: true });
+});
+
+// PR-115: hard stop — any /mcp/* subpath that didn't match above must NOT
+// fall through to rfb's /mcp router via next().
+router.use((_req: Request, res: Response) => {
+  res.status(404).json({ error: "Not found on Finn-tannlege MCP endpoint" });
 });
 
 export default router;
