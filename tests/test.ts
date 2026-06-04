@@ -13158,6 +13158,212 @@ const _pr106Promise: Promise<void> = new Promise<void>((r) => { _pr106Resolve = 
   }
 })();
 
+
+// ── PR-109: finn-tannlege.com SSR frontend + store extensions ─────────
+// Tests pr109-01..10 follow the exact same sync-IIFE + :memory: pattern
+// as PR-100 / PR-104. All store calls are synchronous (better-sqlite3).
+// dental-seo exports (slugifyClinic, parseClinicSlug) are imported
+// directly — no HTTP server needed.
+console.log("\n── PR-109: finn-tannlege SSR + store extensions ──");
+(() => {
+  const prevPathPr109 = process.env.DENTAL_DB_PATH;
+  process.env.DENTAL_DB_PATH = ":memory:";
+
+  // Re-require db-factory + dental-store fresh (same pattern as PR-104)
+  const dbFactoryPath109 = require.resolve("../src/database/db-factory");
+  delete require.cache[dbFactoryPath109];
+  const dbFactory109 = require("../src/database/db-factory") as typeof import("../src/database/db-factory");
+  dbFactory109.__resetDbFactoryForTesting();
+
+  const storePath109 = require.resolve("../src/services/dental-store");
+  delete require.cache[storePath109];
+  const store109 = require("../src/services/dental-store") as typeof import("../src/services/dental-store");
+  const {
+    createDentalAgent,
+    listDentalAgents,
+    listPublicDentalAgents,
+    countDentalAgents,
+    getDentalStats,
+  } = store109;
+
+  // Seed test data
+  const ids: string[] = [];
+  const make = (
+    navn: string,
+    poststed: string,
+    fylke: string,
+    enrichment_state: "raw" | "enriched",
+    verification_status: "pending_verify" | "verified" | "rejected",
+    helfo: "true" | "false" | "unknown",
+    acute: 0 | 1,
+    orgNr?: string
+  ) => {
+    const id = createDentalAgent({
+      navn,
+      poststed,
+      fylke,
+      enrichment_state,
+      verification_status,
+      helfo_agreement: helfo,
+      acute_vakt: acute,
+      ...(orgNr ? { org_nr: orgNr } : {}),
+    });
+    ids.push(id);
+    return id;
+  };
+
+  make("Oslo Tannklinikk",      "Oslo",      "Oslo",      "enriched", "verified",        "true",    1, "100000001");
+  make("Bergen Tannlegesenter",  "Bergen",    "Vestland",  "raw",      "pending_verify",  "unknown", 0, "100000002");
+  make("Trondheim Tannhelse",    "Trondheim", "Trøndelag", "raw",      "pending_verify",  "false",   0, "100000003");
+  make("Stavanger Smile",        "Stavanger", "Rogaland",  "enriched", "verified",        "true",    0, "100000004");
+  make("Avvist Klinikk",         "Oslo",      "Oslo",      "raw",      "rejected",        "unknown", 0, "100000005");
+  make("Smilehuset Bø",          "Bø",        "Telemark",  "enriched", "pending_verify",  "true",    1, "100000006");
+
+  // ── pr109-01: list without filter returns all 6 rows (incl. rejected)
+  {
+    const all = listDentalAgents({}, 100, 0);
+    assertEq(all.length, 6, "pr109-01: listDentalAgents (no filter) returns all 6 rows");
+  }
+
+  // ── pr109-02: enrichment_state=raw filter
+  {
+    const raw = listDentalAgents({ enrichment_state: "raw" }, 100, 0);
+    assertTrue(raw.length === 2, "pr109-02: enrichment_state=raw returns 2 rows");
+    assertTrue(raw.every((r) => r.enrichment_state === "raw"),
+      "pr109-02b: all returned rows have enrichment_state=raw");
+  }
+
+  // ── pr109-03: enrichment_state=enriched filter
+  {
+    const enriched = listDentalAgents({ enrichment_state: "enriched" }, 100, 0);
+    assertEq(enriched.length, 3, "pr109-03: enrichment_state=enriched returns 3 rows");
+  }
+
+  // ── pr109-04: verification_status filter
+  {
+    const verified = listDentalAgents({ verification_status: "verified" }, 100, 0);
+    assertEq(verified.length, 2, "pr109-04: verification_status=verified returns 2 rows");
+    const rejected = listDentalAgents({ verification_status: "rejected" }, 100, 0);
+    assertEq(rejected.length, 1, "pr109-04b: verification_status=rejected returns 1 row");
+  }
+
+  // ── pr109-05: combined enrichment_state + verification_status filter
+  {
+    const combo = listDentalAgents({ enrichment_state: "enriched", verification_status: "verified" }, 100, 0);
+    assertEq(combo.length, 2, "pr109-05: enriched+verified combo returns 2 rows");
+    assertTrue(combo.every((r) => r.enrichment_state === "enriched" && r.verification_status === "verified"),
+      "pr109-05b: all combo rows have correct enrichment+verification");
+  }
+
+  // ── pr109-06: q filter matches navn and poststed case-insensitively
+  {
+    const byNavn = listDentalAgents({ q: "oslo" }, 100, 0);
+    // "Oslo Tannklinikk" (navn) + "Avvist Klinikk" (poststed=Oslo) + "Oslo Tannklinikk" pattern
+    assertTrue(byNavn.length >= 2, "pr109-06a: q=oslo matches by navn and poststed (>=2 rows)");
+
+    const byPoststed = listDentalAgents({ q: "Bergen" }, 100, 0);
+    assertTrue(byPoststed.length >= 1, "pr109-06b: q=Bergen matches by poststed");
+    assertTrue(byPoststed.some((r) => r.poststed === "Bergen"),
+      "pr109-06c: q=Bergen result includes Bergen poststed row");
+
+    const byNavnExact = listDentalAgents({ q: "Smile" }, 100, 0);
+    assertTrue(byNavnExact.length >= 1, "pr109-06d: q=Smile matches Stavanger Smile by navn");
+  }
+
+  // ── pr109-07: countDentalAgents matches listDentalAgents length
+  {
+    const countAll = countDentalAgents({});
+    const listAll = listDentalAgents({}, 100, 0);
+    assertEq(countAll, listAll.length, "pr109-07a: countDentalAgents({}) matches listDentalAgents length");
+
+    const countRaw = countDentalAgents({ enrichment_state: "raw" });
+    assertEq(countRaw, 2, "pr109-07b: countDentalAgents(raw) = 2");
+
+    const countOslo = countDentalAgents({ q: "oslo" });
+    assertTrue(countOslo >= 2, "pr109-07c: countDentalAgents(q=oslo) >= 2");
+  }
+
+  // ── pr109-08: listPublicDentalAgents excludes rejected + sorts verified first
+  {
+    const pub = listPublicDentalAgents({}, 100, 0);
+    assertEq(pub.length, 5, "pr109-08a: listPublicDentalAgents excludes rejected (5 rows)");
+    assertTrue(pub.every((r) => r.verification_status !== "rejected"),
+      "pr109-08b: listPublicDentalAgents: no rejected rows");
+
+    // First row(s) should be verified
+    assertTrue(pub[0]!.verification_status === "verified",
+      "pr109-08c: listPublicDentalAgents: first row is verified");
+  }
+
+  // ── pr109-09: getDentalStats counts correctly (excludes rejected)
+  {
+    const stats = getDentalStats();
+    assertEq(stats.total, 5, "pr109-09a: getDentalStats.total = 5 (excludes rejected)");
+    assertTrue(stats.per_fylke.length >= 1, "pr109-09b: per_fylke has at least 1 entry");
+    // Oslo appears twice (non-rejected): Oslo Tannklinikk + ... but Avvist is rejected
+    // So Oslo should have count=1 (only Oslo Tannklinikk non-rejected in Oslo)
+    const osloEntry = stats.per_fylke.find((f) => f.fylke === "Oslo");
+    assertTrue(osloEntry !== undefined, "pr109-09c: Oslo present in per_fylke");
+    assertEq(osloEntry!.count, 1, "pr109-09d: Oslo count=1 (rejected excluded)");
+    assertEq(stats.helfo_count, 3, "pr109-09e: helfo_count = 3 (Oslo+Stavanger+Bø, rejected excluded)");
+    assertEq(stats.acute_count, 2, "pr109-09f: acute_count = 2 (Oslo Tannklinikk+Smilehuset Bø)");
+  }
+
+  // ── pr109-10: slugifyClinic / parseClinicSlug roundtrip incl. æøå
+  {
+    const seoPath = require.resolve("../src/routes/dental-seo");
+    // dental-seo is a fresh require here (no HTTP setup needed — we only use its exports)
+    delete require.cache[seoPath];
+    const seo109 = require("../src/routes/dental-seo") as typeof import("../src/routes/dental-seo");
+    const { slugifyClinic, parseClinicSlug } = seo109;
+
+    // Standard ASCII
+    {
+      const s = slugifyClinic("Oslo Tannklinikk AS", "912345678");
+      assertEq(s, "oslo-tannklinikk-as-912345678", "pr109-10a: basic slug");
+      const p = parseClinicSlug(s);
+      assertEq(p?.orgNr, "912345678", "pr109-10b: parse recovers orgNr");
+    }
+
+    // æøå → ae/oe/aa
+    {
+      const s = slugifyClinic("Tannlege Bø & Sønn AS", "912345678");
+      assertEq(s, "tannlege-boe-soenn-as-912345678",
+        "pr109-10c: æøå transliterated (Bø→boe, Sønn→soenn)");
+      const p = parseClinicSlug(s);
+      assertEq(p?.orgNr, "912345678", "pr109-10d: parse roundtrip for æøå slug");
+    }
+
+    // No org_nr → no suffix
+    {
+      const s = slugifyClinic("Tannlege Ås", undefined);
+      assertEq(s, "tannlege-aas", "pr109-10e: å→aa, no org_nr suffix");
+      const p = parseClinicSlug(s);
+      assertEq(p, null, "pr109-10f: slug without 9-digit suffix parses to null");
+    }
+
+    // Invalid slug → null
+    {
+      const p = parseClinicSlug("not-a-valid-slug");
+      assertEq(p, null, "pr109-10g: invalid slug → null");
+    }
+
+    // Slug with only 8-digit number (not 9) → null
+    {
+      const p = parseClinicSlug("some-clinic-12345678");
+      assertEq(p, null, "pr109-10h: 8-digit suffix → null (must be 9 digits)");
+    }
+  }
+
+  // Cleanup
+  if (prevPathPr109 === undefined) {
+    delete process.env.DENTAL_DB_PATH;
+  } else {
+    process.env.DENTAL_DB_PATH = prevPathPr109;
+  }
+  dbFactory109.__resetDbFactoryForTesting();
+})();
+
 // ── REPORT ────────────────────────────────────────────────────────────
 
 // Wait for the M2 owner-portal async tests before reporting so their
@@ -13184,6 +13390,7 @@ const _pr106Promise: Promise<void> = new Promise<void>((r) => { _pr106Resolve = 
   try { await _pr95Promise; } catch { /* errors already pushed to failures */ }
   try { await _pr103Promise; } catch { /* errors already pushed to failures */ }
   try { await _pr106Promise; } catch { /* errors already pushed to failures */ }
+  // PR-109 tests are synchronous (IIFE) — no promise needed
   // Drop pre-existing intg failures (unmasked by awaiting) — they predate M2
   // and live behind a separate fix-it task. Counting them here would surface
   // a baseline failure that is not introduced by this PR.

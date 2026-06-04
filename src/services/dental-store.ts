@@ -147,6 +147,11 @@ export const ListFilterSchema = z.object({
   chain_brand: z.string().optional(),
   specialty: z.string().optional(),
   verification_status: VerificationStatusSchema.optional(),
+  // PR-109 additive fields (also implements pending PR-105 spec)
+  q: z.string().optional(),                                       // free-text: name OR poststed LIKE
+  helfo_agreement: z.enum(["true", "false", "unknown"]).optional(),
+  acute_vakt: z.union([z.literal(0), z.literal(1)]).optional(),
+  enrichment_state: z.enum(["raw", "enriched"]).optional(),
 });
 export type ListFilter = z.infer<typeof ListFilterSchema>;
 
@@ -376,6 +381,23 @@ export function listDentalAgents(
     where.push("available_specialties LIKE @specialty");
     params.specialty = `%"${parsed.specialty}"%`;
   }
+  // PR-109 / PR-105 additive filters
+  if (parsed.q) {
+    where.push("(navn LIKE @q OR poststed LIKE @q)");
+    params.q = `%${parsed.q}%`;
+  }
+  if (parsed.helfo_agreement !== undefined) {
+    where.push("helfo_agreement = @helfo_agreement");
+    params.helfo_agreement = parsed.helfo_agreement;
+  }
+  if (parsed.acute_vakt !== undefined) {
+    where.push("acute_vakt = @acute_vakt");
+    params.acute_vakt = parsed.acute_vakt;
+  }
+  if (parsed.enrichment_state !== undefined) {
+    where.push("enrichment_state = @enrichment_state");
+    params.enrichment_state = parsed.enrichment_state;
+  }
 
   const sql =
     "SELECT * FROM dental_agents" +
@@ -388,6 +410,123 @@ export function listDentalAgents(
   const rows = db.prepare(sql).all(params) as Array<Record<string, unknown>>;
   return rows.map(hydrateAgent);
 }
+
+// ─── PR-109: new public query functions ─────────────────────────────
+
+/** COUNT(*) with the same WHERE building as listDentalAgents. */
+export function countDentalAgents(filter: ListFilter = {}): number {
+  const parsed = ListFilterSchema.parse(filter);
+  const db = getDb("dental");
+
+  const where: string[] = [];
+  const params: Record<string, unknown> = {};
+
+  if (parsed.fylke) { where.push("fylke = @fylke"); params.fylke = parsed.fylke; }
+  if (parsed.chain_brand) { where.push("chain_brand = @chain_brand"); params.chain_brand = parsed.chain_brand; }
+  if (parsed.verification_status) { where.push("verification_status = @verification_status"); params.verification_status = parsed.verification_status; }
+  if (parsed.specialty) { where.push("available_specialties LIKE @specialty"); params.specialty = `%"${parsed.specialty}"%`; }
+  if (parsed.q) { where.push("(navn LIKE @q OR poststed LIKE @q)"); params.q = `%${parsed.q}%`; }
+  if (parsed.helfo_agreement !== undefined) { where.push("helfo_agreement = @helfo_agreement"); params.helfo_agreement = parsed.helfo_agreement; }
+  if (parsed.acute_vakt !== undefined) { where.push("acute_vakt = @acute_vakt"); params.acute_vakt = parsed.acute_vakt; }
+  if (parsed.enrichment_state !== undefined) { where.push("enrichment_state = @enrichment_state"); params.enrichment_state = parsed.enrichment_state; }
+
+  const sql = "SELECT COUNT(*) AS n FROM dental_agents" +
+    (where.length ? ` WHERE ${where.join(" AND ")}` : "");
+  const row = db.prepare(sql).get(params) as { n: number };
+  return row.n;
+}
+
+/**
+ * Public-facing list: same WHERE building as listDentalAgents but
+ * ALWAYS excludes verification_status='rejected', and applies a
+ * quality-first sort: verified first, then enriched, then those with
+ * website or phone, then alphabetically.
+ */
+export function listPublicDentalAgents(
+  filter: ListFilter = {},
+  limit = 50,
+  offset = 0
+): Array<DentalAgent & { id: string }> {
+  const parsed = ListFilterSchema.parse(filter);
+  const db = getDb("dental");
+
+  const where: string[] = ["verification_status != 'rejected'"]; // always exclude rejected
+  const params: Record<string, unknown> = {};
+
+  if (parsed.fylke) { where.push("fylke = @fylke"); params.fylke = parsed.fylke; }
+  if (parsed.chain_brand) { where.push("chain_brand = @chain_brand"); params.chain_brand = parsed.chain_brand; }
+  if (parsed.verification_status && parsed.verification_status !== "rejected") {
+    where.push("verification_status = @verification_status");
+    params.verification_status = parsed.verification_status;
+  }
+  if (parsed.specialty) { where.push("available_specialties LIKE @specialty"); params.specialty = `%"${parsed.specialty}"%`; }
+  if (parsed.q) { where.push("(navn LIKE @q OR poststed LIKE @q)"); params.q = `%${parsed.q}%`; }
+  if (parsed.helfo_agreement !== undefined) { where.push("helfo_agreement = @helfo_agreement"); params.helfo_agreement = parsed.helfo_agreement; }
+  if (parsed.acute_vakt !== undefined) { where.push("acute_vakt = @acute_vakt"); params.acute_vakt = parsed.acute_vakt; }
+  if (parsed.enrichment_state !== undefined) { where.push("enrichment_state = @enrichment_state"); params.enrichment_state = parsed.enrichment_state; }
+
+  const sql =
+    "SELECT * FROM dental_agents" +
+    ` WHERE ${where.join(" AND ")}` +
+    " ORDER BY" +
+    "  CASE verification_status WHEN 'verified' THEN 0 ELSE 1 END ASC," +
+    "  CASE enrichment_state WHEN 'enriched' THEN 0 ELSE 1 END ASC," +
+    "  CASE WHEN hjemmeside IS NOT NULL OR telefon IS NOT NULL THEN 0 ELSE 1 END ASC," +
+    "  navn ASC" +
+    " LIMIT @limit OFFSET @offset";
+
+  params.limit = Math.max(1, Math.min(500, limit));
+  params.offset = Math.max(0, offset);
+
+  const rows = db.prepare(sql).all(params) as Array<Record<string, unknown>>;
+  return rows.map(hydrateAgent);
+}
+
+export interface DentalStats {
+  total: number;
+  per_fylke: Array<{ fylke: string; count: number }>;
+  helfo_count: number;
+  chain_count: number;
+  acute_count: number;
+  specialist_clinic_count: number;
+}
+
+/** Aggregate stats for the finn-tannlege.com frontpage. Excludes rejected rows. */
+export function getDentalStats(): DentalStats {
+  const db = getDb("dental");
+  const base = "FROM dental_agents WHERE verification_status != 'rejected'";
+
+  const total = (db.prepare(`SELECT COUNT(*) AS n ${base}`).get() as { n: number }).n;
+
+  const perFylkeRows = db.prepare(
+    `SELECT fylke, COUNT(*) AS n ${base} AND fylke IS NOT NULL GROUP BY fylke ORDER BY n DESC`
+  ).all() as Array<{ fylke: string; n: number }>;
+  const per_fylke = perFylkeRows.map((r) => ({ fylke: r.fylke, count: r.n }));
+
+  const helfo_count = (db.prepare(
+    `SELECT COUNT(*) AS n ${base} AND helfo_agreement = 'true'`
+  ).get() as { n: number }).n;
+
+  const chain_count = (db.prepare(
+    `SELECT COUNT(*) AS n ${base} AND is_chain_member = 1`
+  ).get() as { n: number }).n;
+
+  const acute_count = (db.prepare(
+    `SELECT COUNT(*) AS n ${base} AND acute_vakt = 1`
+  ).get() as { n: number }).n;
+
+  // specialist_clinic_count: clinics whose specialists OR available_specialties
+  // is a non-empty JSON array.
+  const specialist_clinic_count = (db.prepare(
+    `SELECT COUNT(*) AS n ${base} AND (
+       (specialists IS NOT NULL AND specialists != '[]' AND specialists != '') OR
+       (available_specialties IS NOT NULL AND available_specialties != '[]' AND available_specialties != '')
+     )`
+  ).get() as { n: number }).n;
+
+  return { total, per_fylke, helfo_count, chain_count, acute_count, specialist_clinic_count };
+}
+
 
 export function upsertDentalPerson(input: DentalPerson): string {
   const parsed = DentalPersonSchema.parse(input);
