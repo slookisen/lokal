@@ -54,11 +54,13 @@ const RpcEnvelopeSchema = z.object({
 
 // ─── Text extractor (mirrors rfb a2a.ts approach) ────────────
 
+const MAX_MESSAGE_TEXT = 2000; // review note #1: cap free-text length (DoS hygiene)
+
 function extractText(msg: unknown): string | null {
-  if (typeof msg === "string") return msg;
+  if (typeof msg === "string") return msg.slice(0, MAX_MESSAGE_TEXT);
   if (msg && typeof msg === "object") {
     const m = msg as Record<string, unknown>;
-    if (typeof m.text === "string" && m.text) return m.text;
+    if (typeof m.text === "string" && m.text) return m.text.slice(0, MAX_MESSAGE_TEXT);
     if (Array.isArray(m.parts)) {
       for (const p of m.parts) {
         if (!p || typeof p !== "object") continue;
@@ -66,7 +68,7 @@ function extractText(msg: unknown): string | null {
         if (typeof part.text === "string" && part.text) {
           if (part.type !== undefined && part.type !== "text") continue;
           if (part.kind !== undefined && part.kind !== "text") continue;
-          return part.text;
+          return part.text.slice(0, MAX_MESSAGE_TEXT);
         }
       }
     }
