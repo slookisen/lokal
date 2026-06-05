@@ -1659,6 +1659,12 @@ router.get("/hvordan-det-fungerer", (_req: Request, res: Response) => {
       <li><a href="/mcp">/mcp</a> &mdash; MCP Streamable HTTP (ChatGPT, Claude Desktop, Cursor)</li>
       <li><code>npx finn-tannlege-mcp</code> &mdash; stdio MCP-pakke for lokal bruk</li>
     </ul>
+    <p style="margin-top:20px">
+      <a href="https://chatgpt.com/g/g-6a21e79241cc8191a04642bda508e42b-finn-tannlege-i-norge" target="_blank" rel="noopener"
+         style="display:inline-block;background:var(--navy,#1a3a5c);color:#fff;padding:10px 18px;border-radius:6px;font-size:.95rem;font-weight:600;text-decoration:none">
+        Pr&oslash;v v&aring;r ChatGPT-assistent: Finn tannlege i Norge &rarr;
+      </a>
+    </p>
   </div>
 </main>`;
 

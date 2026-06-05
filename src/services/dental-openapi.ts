@@ -194,7 +194,7 @@ export function getDentalOpenapi(): object {
                       jsonrpc: { type: "string" },
                       result: { type: "object" },
                       error: { type: "object" },
-                      id: {},
+                      id: { type: ["string", "number"] },
                     },
                   },
                 },
