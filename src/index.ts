@@ -234,6 +234,18 @@ app.get("/openapi.yaml", (_req, res) => {
 // ─── Health check ────────────────────────────────────────────
 const BOOT_TIME = new Date().toISOString();
 
+// Dynamic memory limit: reads MEMORY_LIMIT_MB env var first,
+// then falls back to cgroup memory.max (Fly.io/container), then 512 MB.
+const MEMORY_LIMIT_MB = (() => {
+  const env = Number(process.env.MEMORY_LIMIT_MB);
+  if (env > 0) return env;
+  try {
+    const raw = require("fs").readFileSync("/sys/fs/cgroup/memory.max", "utf8").trim();
+    if (raw !== "max") { const mb = Math.round(Number(raw) / 1024 / 1024); if (mb > 0) return mb; }
+  } catch {}
+  return 512;
+})();
+
 app.get("/health", (_req, res) => {
   const startMs = Date.now();
   try {
@@ -274,8 +286,8 @@ app.get("/health", (_req, res) => {
     let status: "healthy" | "warning" | "critical" = "healthy";
     const warnings: string[] = [];
 
-    if (memUsedMb > 420) { status = "critical"; warnings.push(`Memory critical: ${memUsedMb}MB / 512MB`); }
-    else if (memUsedMb > 350) { status = "warning"; warnings.push(`Memory high: ${memUsedMb}MB / 512MB`); }
+    if (memUsedMb > 420) { status = "critical"; warnings.push(`Memory critical: ${memUsedMb}MB / ${MEMORY_LIMIT_MB}MB`); }
+    else if (memUsedMb > 350) { status = "warning"; warnings.push(`Memory high: ${memUsedMb}MB / ${MEMORY_LIMIT_MB}MB`); }
 
     if (dbLatencyMs > 3000) { status = "critical"; warnings.push(`DB slow: ${dbLatencyMs}ms`); }
     else if (dbLatencyMs > 1000) { if (status !== "critical") status = "warning"; warnings.push(`DB latency elevated: ${dbLatencyMs}ms`); }
@@ -301,8 +313,8 @@ app.get("/health", (_req, res) => {
         rssMb: memUsedMb,
         heapUsedMb,
         heapTotalMb,
-        limitMb: 512,
-        pct: Math.round(memUsedMb / 512 * 100),
+        limitMb: MEMORY_LIMIT_MB,
+        pct: Math.round(memUsedMb / MEMORY_LIMIT_MB * 100),
       },
       database: {
         latencyMs: dbLatencyMs,
