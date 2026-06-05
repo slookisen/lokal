@@ -37,7 +37,7 @@ export function getDentalOpenapi(): object {
             { name: "specialty", in: "query", description: "Specialty slug (e.g. «kjeveortopedi», «endodonti»)", schema: { type: "string" }, example: "kjeveortopedi" },
             { name: "helfo", in: "query", description: "\"true\" to include only Helfo-agreement clinics", schema: { type: "string", enum: ["true", "false"] } },
             { name: "acute_vakt", in: "query", description: "1 to include only emergency-duty clinics", schema: { type: "integer", enum: [0, 1] } },
-            { name: "enrichment_state", in: "query", description: "Filter by enrichment state", schema: { type: "string", enum: ["raw", "enriched"] } },
+            { name: "enrichment_state", in: "query", description: "Filter by enrichment state", schema: { type: "string", enum: ["raw", "enriched", "thin_site"] } },
             { name: "limit", in: "query", description: "Max results (default 50, max 500)", schema: { type: "integer", default: 50, minimum: 1, maximum: 500 } },
             { name: "offset", in: "query", description: "Pagination offset", schema: { type: "integer", default: 0, minimum: 0 } },
           ],
