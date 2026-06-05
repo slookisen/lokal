@@ -54,17 +54,52 @@ function requireAdmin(req: Request, res: Response, next: NextFunction): void {
 //   ?chain_brand=Volvat
 //   ?specialty=kjeveortopedi
 //   ?verification_status=verified
+//   ?enrichment_state=raw|enriched|thin_site
 //   ?limit=50&offset=0
+//
+// PR-120: enrichment_state is now extracted from query params (was silently
+// dropped before). Unknown enum values (for forward-compat) are silently
+// ignored via safeParse — we strip failing fields and re-parse rather than
+// returning 400, keeping the endpoint backward-compatible.
 router.get("/agents", (req: Request, res: Response) => {
   try {
-    const filter = ListFilterSchema.parse({
+    // Build raw input from all supported query params (PR-120 adds enrichment_state).
+    const rawFilter = {
       fylke: req.query.fylke as string | undefined,
       chain_brand: req.query.chain_brand as string | undefined,
       specialty: req.query.specialty as string | undefined,
-      verification_status: req.query.verification_status as
-        | string
-        | undefined,
-    });
+      verification_status: req.query.verification_status as string | undefined,
+      enrichment_state: req.query.enrichment_state as string | undefined,
+      q: req.query.q as string | undefined,
+      helfo_agreement: req.query.helfo_agreement as string | undefined,
+      poststed: req.query.poststed as string | undefined,
+      // acute_vakt: parse to number so z.literal(0|1) validates correctly
+      acute_vakt: req.query.acute_vakt !== undefined
+        ? (parseInt(req.query.acute_vakt as string, 10) as 0 | 1)
+        : undefined,
+    };
+    // safeParse first; if enum fields hold unknown values strip them and
+    // retry so the endpoint never 400s on unknown-but-harmless query values.
+    let filterResult = ListFilterSchema.safeParse(rawFilter);
+    if (!filterResult.success) {
+      const badKeys = new Set(
+        filterResult.error.issues
+          .filter((i) => i.code === "invalid_value")
+          .map((i) => i.path[0] as string)
+      );
+      if (badKeys.size > 0) {
+        const stripped = Object.fromEntries(
+          Object.entries(rawFilter).filter(([k]) => !badKeys.has(k))
+        );
+        filterResult = ListFilterSchema.safeParse(stripped);
+      }
+    }
+    if (!filterResult.success) {
+      // Remaining errors are genuinely invalid (e.g. type mismatches).
+      res.status(400).json({ error: "Invalid query", details: filterResult.error.issues });
+      return;
+    }
+    const filter = filterResult.data;
     const limit = Math.min(
       500,
       Math.max(1, parseInt((req.query.limit as string) || "50", 10) || 50)

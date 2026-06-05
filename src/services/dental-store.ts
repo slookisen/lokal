@@ -151,7 +151,8 @@ export const ListFilterSchema = z.object({
   q: z.string().optional(),                                       // free-text: name OR poststed LIKE
   helfo_agreement: z.enum(["true", "false", "unknown"]).optional(),
   acute_vakt: z.union([z.literal(0), z.literal(1)]).optional(),
-  enrichment_state: z.enum(["raw", "enriched"]).optional(),
+  // PR-120: thin_site added as a valid enrichment_state filter value.
+  enrichment_state: z.enum(["raw", "enriched", "thin_site"]).optional(),
   // PR-116: bysidesfilter
   poststed: z.string().optional(),
 });

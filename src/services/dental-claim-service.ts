@@ -12,7 +12,8 @@ import { getDb } from "../database/db-factory";
 export const CLAIM_TIMEOUT_MS = 30 * 60 * 1000; // 30 minutes
 
 export type ClaimFilter = {
-  enrichment_state?: "raw" | "enriched";
+  // PR-120: thin_site is a valid enrichment_state; excluded from default pool below.
+  enrichment_state?: "raw" | "enriched" | "thin_site";
   verification_status?: "pending_verify" | "verified" | "needs_review" | "rejected";
   has_hjemmeside?: boolean;
   has_adresse?: boolean;
@@ -53,6 +54,15 @@ export function buildWhereClause(
     conditions.push(
       "(verification_status IS NULL OR verification_status NOT IN ('needs_review','rejected'))"
     );
+  }
+
+  // PR-120: thin_site parking exclusion. Records whose enrichment_state has
+  // been set to thin_site (yielded <3 committable fields every cycle) are
+  // excluded from the default claim pool -- workers kept re-claiming the same
+  // records on every cycle. Only excluded when the caller does NOT explicitly
+  // request thin_site records, so parked records remain reachable on demand.
+  if (filter.enrichment_state !== "thin_site") {
+    conditions.push("(enrichment_state IS NULL OR enrichment_state != 'thin_site')");
   }
 
   if (filter.enrichment_state !== undefined) {

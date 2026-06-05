@@ -12630,6 +12630,126 @@ console.log("\n── PR-108: claim-pool junk-exclusion ──");
   dbFactoryPr108.__resetDbFactoryForTesting();
 })();
 
+// ── PR-120 (2026-06-05): list-endpoint enrichment_state filter + thin_site ──
+// Three tests:
+//   (a) GET /agents-like filter via listDentalAgents respects enrichment_state
+//   (b) thin_site excluded from default claimBatch pool
+//   (c) PUT /api/tannlege/agents/:id accepts thin_site as enrichment_state
+//
+// Uses :memory: + __resetDbFactoryForTesting() — the sync-IIFE pattern
+// proven by PR-104 / PR-107 / PR-108. No async, no HTTP server.
+console.log("\n── PR-120: list enrichment_state filter + thin_site parking ──");
+(() => {
+  const prevPathPr120 = process.env.DENTAL_DB_PATH;
+  process.env.DENTAL_DB_PATH = ":memory:";
+
+  const dbFactoryPath120 = require.resolve("../src/database/db-factory");
+  const dentalStorePath120 = require.resolve("../src/services/dental-store");
+  const dentalClaimPath120 = require.resolve("../src/services/dental-claim-service");
+  delete require.cache[dbFactoryPath120];
+  delete require.cache[dentalStorePath120];
+  delete require.cache[dentalClaimPath120];
+
+  const dbFactoryPr120 = require("../src/database/db-factory") as typeof import("../src/database/db-factory");
+  dbFactoryPr120.__resetDbFactoryForTesting();
+
+  const { claimBatch: claimBatch120, releaseBatch: releaseBatch120 } =
+    require("../src/services/dental-claim-service") as typeof import("../src/services/dental-claim-service");
+  const {
+    createDentalAgent: createAgent120,
+    listDentalAgents: listAgents120,
+    updateDentalAgent: updateAgent120,
+  } = require("../src/services/dental-store") as typeof import("../src/services/dental-store");
+
+  const db120 = dbFactoryPr120.getDb("dental");
+
+  // Seed records: 3 raw, 2 enriched, 1 thin_site.
+  const rawId1 = createAgent120({ org_nr: "120000001", navn: "RAW KLINIKK 1", postnummer: "0001", poststed: "OSLO", enrichment_state: "raw" } as any);
+  const rawId2 = createAgent120({ org_nr: "120000002", navn: "RAW KLINIKK 2", postnummer: "0001", poststed: "OSLO", enrichment_state: "raw" } as any);
+  const rawId3 = createAgent120({ org_nr: "120000003", navn: "RAW KLINIKK 3", postnummer: "0001", poststed: "OSLO", enrichment_state: "raw" } as any);
+  const enrichedId = createAgent120({ org_nr: "120000004", navn: "ENRICHED KLINIKK", postnummer: "0001", poststed: "OSLO", enrichment_state: "enriched" } as any);
+  const enrichedId2 = createAgent120({ org_nr: "120000005", navn: "ENRICHED KLINIKK 2", postnummer: "0001", poststed: "OSLO", enrichment_state: "enriched" } as any);
+  const thinSiteId = createAgent120({ org_nr: "120000006", navn: "THIN SITE KLINIKK", postnummer: "0001", poststed: "OSLO", enrichment_state: "thin_site" } as any);
+
+  // (a) list-endpoint filter: enrichment_state=enriched returns only enriched rows.
+  {
+    const enriched = listAgents120({ enrichment_state: "enriched" } as any, 50, 0);
+    const enrichedIds = enriched.map((r: any) => r.id);
+    assertTrue(enrichedIds.includes(enrichedId), "pr120-01a: enriched record in enriched-filter result");
+    assertTrue(enrichedIds.includes(enrichedId2), "pr120-01b: second enriched record in enriched-filter result");
+    assertTrue(!enrichedIds.includes(rawId1), "pr120-01c: raw record excluded from enriched-filter result");
+    assertTrue(!enrichedIds.includes(thinSiteId), "pr120-01d: thin_site record excluded from enriched-filter result");
+  }
+
+  // (a2) list-endpoint filter: enrichment_state=thin_site returns only the thin_site row.
+  {
+    const thinOnly = listAgents120({ enrichment_state: "thin_site" } as any, 50, 0);
+    const ids = thinOnly.map((r: any) => r.id);
+    assertTrue(ids.includes(thinSiteId), "pr120-02a: thin_site record visible when filtering by enrichment_state=thin_site");
+    assertTrue(ids.length === 1, "pr120-02b: only thin_site record returned (no raw/enriched bleed-through)");
+  }
+
+  // (a3) list-endpoint filter: enrichment_state=raw returns only raw rows.
+  {
+    const rawOnly = listAgents120({ enrichment_state: "raw" } as any, 50, 0);
+    const ids = rawOnly.map((r: any) => r.id);
+    assertTrue(ids.includes(rawId1) && ids.includes(rawId2) && ids.includes(rawId3),
+      "pr120-03a: all raw records returned when filtering enrichment_state=raw");
+    assertTrue(!ids.includes(thinSiteId), "pr120-03b: thin_site record excluded from raw-filter result");
+    assertTrue(!ids.includes(enrichedId), "pr120-03c: enriched record excluded from raw-filter result");
+  }
+
+  // (b) thin_site excluded from default claimBatch pool.
+  {
+    const claimed = claimBatch120("worker-120-A", 20, {});
+    const claimedIds = claimed.map((r: any) => r.id);
+    assertTrue(!claimedIds.includes(thinSiteId),
+      "pr120-04a: thin_site record excluded from default claimBatch (no enrichment_state filter)");
+    assertTrue(claimedIds.includes(rawId1) || claimedIds.includes(rawId2) || claimedIds.includes(rawId3),
+      "pr120-04b: raw records still claimable from default claimBatch");
+    releaseBatch120("worker-120-A", claimedIds);
+  }
+
+  // (b2) explicit thin_site enrichment_state filter in claimBatch reaches parked records.
+  {
+    const claimed = claimBatch120("worker-120-B", 10, { enrichment_state: "thin_site" });
+    const ids = claimed.map((r: any) => r.id);
+    assertTrue(ids.includes(thinSiteId),
+      "pr120-05: explicit enrichment_state=thin_site claimBatch reaches thin_site record");
+    releaseBatch120("worker-120-B", ids);
+  }
+
+  // (c) updateDentalAgent accepts thin_site as enrichment_state (simulates the PUT path).
+  {
+    // Start as raw, update to thin_site via the updateDentalAgent function that
+    // backs PUT /api/tannlege/agents/:id (same path workers use for needs_review).
+    const updated = updateAgent120(rawId1, { enrichment_state: "thin_site" } as any);
+    assertTrue(updated, "pr120-06a: updateDentalAgent returns true for thin_site enrichment_state");
+    const row = db120
+      .prepare("SELECT enrichment_state FROM dental_agents WHERE id = ?")
+      .get(rawId1) as { enrichment_state: string } | undefined;
+    assertEq(row?.enrichment_state, "thin_site",
+      "pr120-06b: enrichment_state persisted as thin_site after update");
+    // Verify the updated record is now excluded from default claim pool.
+    const claimed = claimBatch120("worker-120-C", 20, {});
+    const ids = claimed.map((r: any) => r.id);
+    assertTrue(!ids.includes(rawId1),
+      "pr120-06c: record updated to thin_site is excluded from subsequent default claimBatch");
+    releaseBatch120("worker-120-C", ids);
+  }
+
+  // Cleanup.
+  for (const wid of ["worker-120-A", "worker-120-B", "worker-120-C"]) {
+    try { releaseBatch120(wid, [rawId1, rawId2, rawId3, enrichedId, enrichedId2, thinSiteId]); } catch { /* ignore */ }
+  }
+  if (prevPathPr120 === undefined) {
+    delete process.env.DENTAL_DB_PATH;
+  } else {
+    process.env.DENTAL_DB_PATH = prevPathPr120;
+  }
+  dbFactoryPr120.__resetDbFactoryForTesting();
+})();
+
 // ── PR-110 (2026-06-04): MCP lokal_search geocode-enrichment ────────
 // Regression: MCP searches were nationwide text-match because the MCP
 // handler skipped the REST route's extractAndGeocode step. Tests call
