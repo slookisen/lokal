@@ -50,6 +50,17 @@ function isOwnerRequest(req: Request): boolean {
   return OWNER_UA_MARKERS_LC.some(m => ua.includes(m));
 }
 
+// ─── Helper: Vertical from request host ──────────────────────
+// Both verticals run on the same Fly app (PR-109 host routing in index.ts).
+// The analytics middleware runs BEFORE the dental host gate, so every
+// finn-tannlege.com page view lands here too — stamp vertical_id from the
+// Host header so dashboards can split rfb vs dental traffic. Default 'rfb'
+// keeps legacy callers and neutral hosts (lokal.fly.dev, localhost) unchanged.
+export type VerticalId = "rfb" | "dental";
+export function getVerticalFromHost(hostname: string | undefined | null): VerticalId {
+  return hostname && hostname.toLowerCase().includes("finn-tannlege") ? "dental" : "rfb";
+}
+
 // ─── Helper: Privacy-safe IP hashing ─────────────────────────
 function hashIP(ip: string): string {
   return crypto.createHash("sha256").update(ip).digest("hex").slice(0, 16);
@@ -154,8 +165,8 @@ function inferReferrerSource(
     return "social";
   }
 
-  // Own domain = direct
-  if (ref.includes("rettfrabonden.com")) return "direct";
+  // Own domains = direct (both verticals)
+  if (ref.includes("rettfrabonden.com") || ref.includes("finn-tannlege.com")) return "direct";
 
   // Generic referral
   return "referral";
@@ -277,9 +288,9 @@ export class AnalyticsService {
       const sessionId = sessionManager.getOrCreate(ipHash, userAgent);
 
       db.prepare(`
-        INSERT INTO analytics_page_views (path, referrer, source, user_agent_hash, session_id, is_owner, status_code)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
-      `).run(path, referrer || null, source, userAgentHash, sessionId, isOwner ? 1 : 0, statusCode ?? null);
+        INSERT INTO analytics_page_views (path, referrer, source, user_agent_hash, session_id, is_owner, status_code, vertical_id)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      `).run(path, referrer || null, source, userAgentHash, sessionId, isOwner ? 1 : 0, statusCode ?? null, getVerticalFromHost(req.hostname));
     } catch (err) {
       console.error("[analytics] Failed to track page view:", err);
     }
@@ -324,8 +335,8 @@ export class AnalyticsService {
       const ipHash = hashIP(clientIp);
 
       db.prepare(`
-        INSERT INTO analytics_queries (protocol, query, categories, city, result_count, response_time_ms, agent_id, client_ip_hash, is_owner)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO analytics_queries (protocol, query, categories, city, result_count, response_time_ms, agent_id, client_ip_hash, is_owner, vertical_id)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `).run(
         protocol,
         String(query),
@@ -335,7 +346,8 @@ export class AnalyticsService {
         responseTimeMs,
         uaParse.clientName || null,
         ipHash,
-        isOwner ? 1 : 0
+        isOwner ? 1 : 0,
+        getVerticalFromHost(req.hostname)
       );
     } catch (err) {
       console.error("[analytics] Failed to track search query:", err);
@@ -346,13 +358,13 @@ export class AnalyticsService {
    * Track when a producer/agent profile is viewed
    * Call from SEO routes when /produsent/:id is loaded
    */
-  trackAgentView(agentId: string, agentName: string, city: string | undefined, source: "search" | "direct" | "discovery" | "seo"): void {
+  trackAgentView(agentId: string, agentName: string, city: string | undefined, source: "search" | "direct" | "discovery" | "seo", vertical: VerticalId = "rfb"): void {
     try {
       const db = getDb();
       db.prepare(`
-        INSERT INTO analytics_agent_views (agent_id, agent_name, city, view_source)
-        VALUES (?, ?, ?, ?)
-      `).run(agentId, agentName, city || null, source);
+        INSERT INTO analytics_agent_views (agent_id, agent_name, city, view_source, vertical_id)
+        VALUES (?, ?, ?, ?, ?)
+      `).run(agentId, agentName, city || null, source, vertical);
     } catch (err) {
       console.error("[analytics] Failed to track agent view:", err);
     }
@@ -389,13 +401,14 @@ export class AnalyticsService {
 
   // ─── Summary cache ───────────────────────────────────────────
   // Public so ops agent can clear it via /ops/clear-cache.
-  _summaryCache: Map<number, { data: any; time: number }> = new Map();
+  _summaryCache: Map<string, { data: any; time: number }> = new Map();
   private static SUMMARY_CACHE_TTL = 120_000; // 2 minutes
 
   /**
    * Get analytics summary for a time range (cached 2 min)
+   * @param vertical Optional vertical filter ('rfb' | 'dental'). Undefined = all verticals combined.
    */
-  getSummary(hoursBack: number = 24): {
+  getSummary(hoursBack: number = 24, vertical?: VerticalId): {
     pageViews: number;
     uniqueVisitors: number;
     avgTimeOnSite: number;
@@ -405,8 +418,9 @@ export class AnalyticsService {
     agentTraffic: { chatgpt: number; claude: number; other: number };
     ownerStats: { pageViews: number; queries: number };
   } {
-    // Check cache first
-    const cached = this._summaryCache.get(hoursBack);
+    // Check cache first (key includes vertical so rfb/dental/all don't collide)
+    const cacheKey = `${hoursBack}:${vertical || "all"}`;
+    const cached = this._summaryCache.get(cacheKey);
     if (cached && (Date.now() - cached.time) < AnalyticsService.SUMMARY_CACHE_TTL) {
       return cached.data;
     }
@@ -414,29 +428,33 @@ export class AnalyticsService {
       const db = getDb();
       const cutoff = sqliteDatetime(new Date(Date.now() - hoursBack * 60 * 60 * 1000));
 
+      // Vertical filter fragment — appended to every per-table WHERE clause.
+      const V = vertical ? " AND vertical_id = ?" : "";
+      const vp: string[] = vertical ? [vertical] : [];
+
       // Page views (excluding owner)
       const pvResult = db.prepare(`
-        SELECT COUNT(*) as count FROM analytics_page_views WHERE created_at > ? AND (is_owner IS NULL OR is_owner = 0)
-      `).get(cutoff) as any;
+        SELECT COUNT(*) as count FROM analytics_page_views WHERE created_at > ? AND (is_owner IS NULL OR is_owner = 0)${V}
+      `).get(cutoff, ...vp) as any;
       const pageViews = pvResult.count;
 
       // Owner page views
       const ownerPvResult = db.prepare(`
-        SELECT COUNT(*) as count FROM analytics_page_views WHERE created_at > ? AND is_owner = 1
-      `).get(cutoff) as any;
+        SELECT COUNT(*) as count FROM analytics_page_views WHERE created_at > ? AND is_owner = 1${V}
+      `).get(cutoff, ...vp) as any;
       const ownerPageViews = ownerPvResult.count;
 
       // Unique visitors (excluding owner)
       const uvResult = db.prepare(`
-        SELECT COUNT(DISTINCT session_id) as count FROM analytics_page_views WHERE created_at > ? AND (is_owner IS NULL OR is_owner = 0)
-      `).get(cutoff) as any;
+        SELECT COUNT(DISTINCT session_id) as count FROM analytics_page_views WHERE created_at > ? AND (is_owner IS NULL OR is_owner = 0)${V}
+      `).get(cutoff, ...vp) as any;
       const uniqueVisitors = uvResult.count;
 
       // Traffic by source (excluding owner)
       const sourceResult = db.prepare(`
-        SELECT source, COUNT(*) as count FROM analytics_page_views WHERE created_at > ? AND (is_owner IS NULL OR is_owner = 0)
+        SELECT source, COUNT(*) as count FROM analytics_page_views WHERE created_at > ? AND (is_owner IS NULL OR is_owner = 0)${V}
         GROUP BY source
-      `).all(cutoff) as any[];
+      `).all(cutoff, ...vp) as any[];
       const trafficBySource: Record<string, number> = {};
       sourceResult.forEach(row => {
         trafficBySource[row.source] = row.count;
@@ -444,14 +462,14 @@ export class AnalyticsService {
 
       // Total queries (excluding owner)
       const qResult = db.prepare(`
-        SELECT COUNT(*) as count FROM analytics_queries WHERE created_at > ? AND (is_owner IS NULL OR is_owner = 0)
-      `).get(cutoff) as any;
+        SELECT COUNT(*) as count FROM analytics_queries WHERE created_at > ? AND (is_owner IS NULL OR is_owner = 0)${V}
+      `).get(cutoff, ...vp) as any;
       const totalQueries = qResult.count;
 
       // Owner queries
       const ownerQResult = db.prepare(`
-        SELECT COUNT(*) as count FROM analytics_queries WHERE created_at > ? AND is_owner = 1
-      `).get(cutoff) as any;
+        SELECT COUNT(*) as count FROM analytics_queries WHERE created_at > ? AND is_owner = 1${V}
+      `).get(cutoff, ...vp) as any;
       const ownerQueries = ownerQResult.count;
 
       // Top search terms (excluding owner, excluding single-char autocomplete noise)
@@ -460,11 +478,11 @@ export class AnalyticsService {
         WHERE created_at > ?
           AND query IS NOT NULL
           AND LENGTH(TRIM(query)) >= 2
-          AND (is_owner IS NULL OR is_owner = 0)
+          AND (is_owner IS NULL OR is_owner = 0)${V}
         GROUP BY query
         ORDER BY count DESC
         LIMIT 10
-      `).all(cutoff) as any[];
+      `).all(cutoff, ...vp) as any[];
       const topSearchTerms = topQueriesResult.map(r => ({ query: r.query, count: r.count }));
 
       // AI agent traffic breakdown
@@ -479,16 +497,16 @@ export class AnalyticsService {
       const chatgptRow = db.prepare(`
         SELECT COUNT(*) as count FROM analytics_page_views
         WHERE created_at > ? AND ${"(is_owner IS NULL OR is_owner = 0)"}
-          AND (session_id LIKE '%GPTBot%' OR session_id LIKE '%ChatGPT%' OR session_id LIKE '%OAI-SearchBot%')
-      `).get(cutoff) as any;
+          AND (session_id LIKE '%GPTBot%' OR session_id LIKE '%ChatGPT%' OR session_id LIKE '%OAI-SearchBot%')${V}
+      `).get(cutoff, ...vp) as any;
       agentTraffic.chatgpt = chatgptRow?.count || 0;
 
       // Claude family: ClaudeBot crawler and Claude-User browsing agent.
       const claudeRow = db.prepare(`
         SELECT COUNT(*) as count FROM analytics_page_views
         WHERE created_at > ? AND ${"(is_owner IS NULL OR is_owner = 0)"}
-          AND (session_id LIKE '%ClaudeBot%' OR session_id LIKE '%Claude-User%' OR session_id LIKE '%Anthropic%')
-      `).get(cutoff) as any;
+          AND (session_id LIKE '%ClaudeBot%' OR session_id LIKE '%Claude-User%' OR session_id LIKE '%Anthropic%')${V}
+      `).get(cutoff, ...vp) as any;
       agentTraffic.claude = claudeRow?.count || 0;
 
       // Other AI / non-human retrievers — Gemini, Perplexity, Google-Extended,
@@ -506,8 +524,8 @@ export class AnalyticsService {
             OR session_id LIKE '%Applebot-Extended%' OR session_id LIKE '%YandexAdditional%'
             OR session_id LIKE '%NotHumanSearch%' OR session_id LIKE '%DuckDuckBot%'
             OR session_id LIKE '%Googlebot%'
-          )
-      `).get(cutoff) as any;
+          )${V}
+      `).get(cutoff, ...vp) as any;
       agentTraffic.other = otherRow?.count || 0;
 
       // Back-compat: if the analytics_queries table has search-query hits from
@@ -515,9 +533,9 @@ export class AnalyticsService {
       // under-count real search-query traffic that also happens to be AI.
       const agentQueryResult = db.prepare(`
         SELECT agent_id, COUNT(*) as count FROM analytics_queries
-        WHERE created_at > ? AND agent_id IS NOT NULL
+        WHERE created_at > ? AND agent_id IS NOT NULL${V}
         GROUP BY agent_id
-      `).all(cutoff) as any[];
+      `).all(cutoff, ...vp) as any[];
       agentQueryResult.forEach(row => {
         if (row.agent_id === "ChatGPT") agentTraffic.chatgpt += row.count;
         else if (row.agent_id === "Claude") agentTraffic.claude += row.count;
@@ -553,11 +571,11 @@ export class AnalyticsService {
               AND session_id NOT LIKE '%bot%'
               AND session_id NOT LIKE '%Bot%'
               AND session_id NOT LIKE '%crawler%'
-              AND session_id NOT LIKE '%spider%'
+              AND session_id NOT LIKE '%spider%'${V}
             GROUP BY session_id
             HAVING COUNT(*) >= 2
           )
-        `).get(cutoff) as any;
+        `).get(cutoff, ...vp) as any;
         avgTimeOnSite = Math.round(durRow?.avg_dur || 0);
       } catch (e) {
         // Non-fatal: keep avgTimeOnSite at 0 rather than failing the whole summary.
@@ -574,7 +592,7 @@ export class AnalyticsService {
         agentTraffic,
         ownerStats: { pageViews: ownerPageViews, queries: ownerQueries },
       };
-      this._summaryCache.set(hoursBack, { data: result, time: Date.now() });
+      this._summaryCache.set(cacheKey, { data: result, time: Date.now() });
       return result;
     } catch (err) {
       console.error("[analytics] Failed to get summary:", err);
@@ -594,7 +612,7 @@ export class AnalyticsService {
   /**
    * Get top producers by view count
    */
-  getTopProducers(limit: number = 20, hoursBack: number = 24): Array<{
+  getTopProducers(limit: number = 20, hoursBack: number = 24, vertical?: VerticalId): Array<{
     agentId: string;
     agentName: string;
     city?: string;
@@ -604,6 +622,8 @@ export class AnalyticsService {
     try {
       const db = getDb();
       const cutoff = sqliteDatetime(new Date(Date.now() - hoursBack * 60 * 60 * 1000));
+      const V = vertical ? " AND vertical_id = ?" : "";
+      const vp: string[] = vertical ? [vertical] : [];
 
       const results = db.prepare(`
         SELECT
@@ -617,11 +637,11 @@ export class AnalyticsService {
            ORDER BY COUNT(*) DESC
            LIMIT 1) as top_source
         FROM analytics_agent_views aav
-        WHERE created_at > ?
+        WHERE created_at > ?${V}
         GROUP BY agent_id, agent_name, city
         ORDER BY view_count DESC
         LIMIT ?
-      `).all(cutoff, limit) as any[];
+      `).all(cutoff, ...vp, limit) as any[];
 
       return results.map(r => ({
         agentId: r.agent_id,
@@ -639,7 +659,7 @@ export class AnalyticsService {
   /**
    * Get city-level analytics
    */
-  getCityStats(hoursBack: number = 24): Array<{
+  getCityStats(hoursBack: number = 24, vertical?: VerticalId): Array<{
     city: string;
     viewCount: number;
     searchQueries: number;
@@ -648,19 +668,23 @@ export class AnalyticsService {
     try {
       const db = getDb();
       const cutoff = sqliteDatetime(new Date(Date.now() - hoursBack * 60 * 60 * 1000));
+      // Literal interpolation is safe here — `vertical` is a closed union
+      // ('rfb' | 'dental'), never raw user input. Keeps the 3x positional
+      // cutoff params unambiguous across the correlated subqueries.
+      const V = vertical ? ` AND vertical_id = '${vertical}'` : "";
 
       const results = db.prepare(`
         SELECT
           aav.city,
           COUNT(DISTINCT aav.id) as view_count,
-          (SELECT COUNT(*) FROM analytics_queries aq WHERE aq.city = aav.city AND aq.created_at > ? AND (aq.is_owner IS NULL OR aq.is_owner = 0)) as search_queries,
+          (SELECT COUNT(*) FROM analytics_queries aq WHERE aq.city = aav.city AND aq.created_at > ? AND (aq.is_owner IS NULL OR aq.is_owner = 0)${V.replace(/vertical_id/g, "aq.vertical_id")}) as search_queries,
           (SELECT json_extract(aq.categories, '$[0]') FROM analytics_queries aq
-           WHERE aq.city = aav.city AND aq.created_at > ? AND aq.categories IS NOT NULL AND (aq.is_owner IS NULL OR aq.is_owner = 0)
+           WHERE aq.city = aav.city AND aq.created_at > ? AND aq.categories IS NOT NULL AND (aq.is_owner IS NULL OR aq.is_owner = 0)${V.replace(/vertical_id/g, "aq.vertical_id")}
            GROUP BY json_extract(aq.categories, '$[0]')
            ORDER BY COUNT(*) DESC
            LIMIT 1) as top_category
         FROM analytics_agent_views aav
-        WHERE aav.created_at > ? AND aav.city IS NOT NULL
+        WHERE aav.created_at > ? AND aav.city IS NOT NULL${V.replace(/vertical_id/g, "aav.vertical_id")}
         GROUP BY aav.city
         ORDER BY view_count DESC
       `).all(cutoff, cutoff, cutoff) as any[];

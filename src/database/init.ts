@@ -799,6 +799,55 @@ function initSchema(db: Database.Database): void {
     // Index already exists
   }
 
+  // Dashboards filter analytics by vertical_id (rfb vs dental) — index the
+  // analytics tables so the per-vertical WHERE clauses stay cheap.
+  for (const [idx, tbl] of [
+    ["idx_analytics_page_views_vertical", "analytics_page_views"],
+    ["idx_analytics_queries_vertical", "analytics_queries"],
+    ["idx_analytics_agent_views_vertical", "analytics_agent_views"],
+  ]) {
+    try {
+      db.exec(`CREATE INDEX IF NOT EXISTS ${idx} ON ${tbl}(vertical_id, created_at)`);
+    } catch {
+      // Index already exists
+    }
+  }
+
+  // ─── Backfill: dental page views misattributed as 'rfb' ───────
+  // finn-tannlege.com went live 2026-06-04, but the analytics middleware
+  // didn't stamp vertical_id until the vertical-split PR — so every dental
+  // page view between launch and deploy sits with the default 'rfb'.
+  // Best-effort re-tag: these path prefixes are served ONLY by the dental
+  // SEO router (dental-seo.ts) and can't be rfb traffic. Shared paths
+  // ("/", "/sok", "/om", sitemap/robots/llms) are ambiguous without the
+  // Host header and intentionally stay as-is.
+  // Migration-flagged: runs once, safe on fresh DBs (0 rows updated).
+  try {
+    db.exec(`CREATE TABLE IF NOT EXISTS migrations (name TEXT PRIMARY KEY, applied_at TEXT DEFAULT (datetime('now')))`);
+    const alreadyRan = db.prepare("SELECT 1 FROM migrations WHERE name = 'backfill_dental_vertical_v1'").get();
+    if (!alreadyRan) {
+      const result = db.prepare(`
+        UPDATE analytics_page_views
+        SET vertical_id = 'dental'
+        WHERE vertical_id = 'rfb'
+          AND (
+            path LIKE '/klinikk/%'
+            OR path LIKE '/fylke/%'
+            OR path LIKE '/spesialitet/%'
+            OR path LIKE '/sted/%'
+            OR path = '/hvordan-det-fungerer'
+            OR path LIKE '/api/tannlege%'
+          )
+      `).run();
+      db.prepare("INSERT INTO migrations (name) VALUES ('backfill_dental_vertical_v1')").run();
+      if (result.changes > 0) {
+        console.log(`\u{1F9F9} Migration backfill_dental_vertical_v1: re-tagged ${result.changes} page view(s) as dental`);
+      }
+    }
+  } catch (err) {
+    console.error("Migration backfill_dental_vertical_v1 failed:", err);
+  }
+
 
   // ─── Phase 4.9a — agent_knowledge.curated_fields ──────────────
   // Customer-curated content protection: when CS-agent applies a

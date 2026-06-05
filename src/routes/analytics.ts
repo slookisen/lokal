@@ -1,7 +1,7 @@
 import { Router, Request, Response } from "express";
 import path from "path";
 import { getDb } from "../database/init";
-import { analyticsService } from "../services/analytics-service";
+import { analyticsService, VerticalId } from "../services/analytics-service";
 
 // SQLite stores datetimes as "YYYY-MM-DD HH:MM:SS" (space-separated).
 // JS .toISOString() uses "T" separator which breaks SQLite string comparison.
@@ -11,6 +11,20 @@ function sqliteDatetime(date: Date): string {
 
 // Reusable SQL fragment: exclude owner traffic from analytics
 const NOT_OWNER = "(is_owner IS NULL OR is_owner = 0)";
+
+// ─── Vertical filter (?vertical=rfb|dental) ─────────────────────
+// Both verticals (rettfrabonden.com + finn-tannlege.com) run on the same
+// app and write to the same analytics tables, separated by vertical_id.
+// Endpoints accept ?vertical=rfb|dental to split traffic per site;
+// anything else (or omitted) = all traffic combined.
+function parseVertical(req: Request): VerticalId | undefined {
+  const v = String(req.query.vertical || "").toLowerCase();
+  return v === "rfb" || v === "dental" ? (v as VerticalId) : undefined;
+}
+function verticalFilter(req: Request): { sql: string; params: string[] } {
+  const v = parseVertical(req);
+  return v ? { sql: " AND vertical_id = ?", params: [v] } : { sql: "", params: [] };
+}
 
 /**
  * Analytics Admin Routes
@@ -153,10 +167,12 @@ router.post("/tag-owner", (req: Request, res: Response) => {
  * GET /admin/analytics/summary
  * High-level analytics for the last 24 hours
  */
-router.get("/summary", (_req: Request, res: Response) => {
-  const summary = analyticsService.getSummary(24);
+router.get("/summary", (req: Request, res: Response) => {
+  const vertical = parseVertical(req);
+  const summary = analyticsService.getSummary(24, vertical);
   res.json({
     timeframe: "last 24 hours",
+    vertical: vertical || "all",
     timestamp: new Date().toISOString(),
     ...summary,
   });
@@ -169,9 +185,11 @@ router.get("/summary", (_req: Request, res: Response) => {
 router.get("/summary/:hours", (req: Request, res: Response) => {
   const hoursParam = req.params.hours as string;
   const hours = Math.max(1, Math.min(87600, parseInt(hoursParam) || 24));
-  const summary = analyticsService.getSummary(hours);
+  const vertical = parseVertical(req);
+  const summary = analyticsService.getSummary(hours, vertical);
   res.json({
     timeframe: `last ${hours} hours`,
+    vertical: vertical || "all",
     timestamp: new Date().toISOString(),
     ...summary,
   });
@@ -188,7 +206,7 @@ router.get("/producers", (req: Request, res: Response) => {
   const limit = Math.min(100, parseInt(req.query.limit as string) || 20);
   const hours = Math.max(1, Math.min(87600, parseInt(req.query.hours as string) || 24));
 
-  const producers = analyticsService.getTopProducers(limit, hours);
+  const producers = analyticsService.getTopProducers(limit, hours, parseVertical(req));
   res.json({
     timeframe: `last ${hours} hours`,
     count: producers.length,
@@ -207,7 +225,7 @@ router.get("/producers", (req: Request, res: Response) => {
 router.get("/cities", (req: Request, res: Response) => {
   const hours = Math.max(1, Math.min(87600, parseInt(req.query.hours as string) || 24));
 
-  const cities = analyticsService.getCityStats(hours);
+  const cities = analyticsService.getCityStats(hours, parseVertical(req));
   res.json({
     timeframe: `last ${hours} hours`,
     count: cities.length,
@@ -318,11 +336,11 @@ router.get("/visitors", (req: Request, res: Response) => {
           ELSE 'desktop'
         END as device
       FROM analytics_page_views
-      WHERE created_at > ? AND ${NOT_OWNER}
+      WHERE created_at > ? AND ${NOT_OWNER}${verticalFilter(req).sql}
       GROUP BY session_id
       ORDER BY pageViews DESC
       LIMIT ?
-    `).all(cutoff, limit) as any[];
+    `).all(cutoff, ...verticalFilter(req).params, limit) as any[];
 
     res.json({ visitors });
   } catch (err) {
@@ -348,10 +366,10 @@ router.get("/hourly", (req: Request, res: Response) => {
         COUNT(*) as views,
         COUNT(DISTINCT session_id) as visitors
       FROM analytics_page_views
-      WHERE created_at > ? AND ${NOT_OWNER}
+      WHERE created_at > ? AND ${NOT_OWNER}${verticalFilter(req).sql}
       GROUP BY hour
       ORDER BY hour ASC
-    `).all(cutoff) as any[];
+    `).all(cutoff, ...verticalFilter(req).params) as any[];
 
     res.json({ hourly });
   } catch (err) {
@@ -389,12 +407,12 @@ router.get("/pages", (req: Request, res: Response) => {
         COUNT(*) as views,
         COUNT(DISTINCT session_id) as visitors
       FROM analytics_page_views
-      WHERE created_at > ? AND ${NOT_OWNER}
+      WHERE created_at > ? AND ${NOT_OWNER}${verticalFilter(req).sql}
         AND (${scannerExclusion})
       GROUP BY path
       ORDER BY views DESC
       LIMIT ?
-    `).all(cutoff, ...SCANNER_PATTERNS, limit) as any[];
+    `).all(cutoff, ...verticalFilter(req).params, ...SCANNER_PATTERNS, limit) as any[];
 
     res.json({ pages });
   } catch (err) {
@@ -434,9 +452,9 @@ router.get("/devices", (req: Request, res: Response) => {
         AND session_id NOT LIKE '%aiohttp%'
         AND session_id NOT LIKE '%Lokal/%'
         AND session_id NOT LIKE '%node-fetch%'
-        AND session_id NOT LIKE '%axios/%'
+        AND session_id NOT LIKE '%axios/%'${verticalFilter(req).sql}
       GROUP BY session_id
-    `).all(cutoff) as any[];
+    `).all(cutoff, ...verticalFilter(req).params) as any[];
 
     const buckets: Record<string, { count: number; visitors: number }> = {
       desktop: { count: 0, visitors: 0 },
@@ -522,9 +540,9 @@ router.get("/traffic-classification", (req: Request, res: Response) => {
         MIN(created_at) as first_seen,
         MAX(created_at) as last_seen
       FROM analytics_page_views
-      WHERE created_at > ? AND ${NOT_OWNER}
+      WHERE created_at > ? AND ${NOT_OWNER}${verticalFilter(req).sql}
       GROUP BY session_id
-    `).all(cutoff) as any[];
+    `).all(cutoff, ...verticalFilter(req).params) as any[];
 
     // Classification patterns
     // Bot detection: UA contains "bot"/"spider"/"crawl" as whole-ish word (not
@@ -565,9 +583,9 @@ router.get("/traffic-classification", (req: Request, res: Response) => {
     // Also get scanner paths
     const scannerHits = db.prepare(`
       SELECT session_id FROM analytics_page_views
-      WHERE created_at > ? AND ${NOT_OWNER} AND (${scannerPaths.map(() => 'path LIKE ?').join(' OR ')})
+      WHERE created_at > ? AND ${NOT_OWNER}${verticalFilter(req).sql} AND (${scannerPaths.map(() => 'path LIKE ?').join(' OR ')})
       GROUP BY session_id
-    `).all(cutoff, ...scannerPaths.map(p => `%${p}%`)) as any[];
+    `).all(cutoff, ...verticalFilter(req).params, ...scannerPaths.map(p => `%${p}%`)) as any[];
     const scannerSessionIds = new Set(scannerHits.map((r: any) => r.session_id));
 
     const classification = { human: { views: 0, sessions: 0 }, bot: { views: 0, sessions: 0 }, dev: { views: 0, sessions: 0 }, scanner: { views: 0, sessions: 0 } };
@@ -668,11 +686,11 @@ router.get("/referrers", (req: Request, res: Response) => {
         COUNT(DISTINCT session_id) as unique_visitors,
         GROUP_CONCAT(DISTINCT path) as paths
       FROM analytics_page_views
-      WHERE created_at > ? AND ${NOT_OWNER} AND referrer IS NOT NULL AND referrer != ''
+      WHERE created_at > ? AND ${NOT_OWNER}${verticalFilter(req).sql} AND referrer IS NOT NULL AND referrer != ''
       GROUP BY referrer
       ORDER BY visits DESC
       LIMIT 30
-    `).all(cutoff) as any[];
+    `).all(cutoff, ...verticalFilter(req).params) as any[];
 
     res.json({
       timeframe: `last ${hours} hours`,

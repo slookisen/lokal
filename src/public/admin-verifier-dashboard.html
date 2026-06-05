@@ -93,6 +93,17 @@ tr.row-clickable:hover { background: var(--surface2); }
 .conflict-detail { font-family: ui-monospace, "SF Mono", Menlo, monospace; font-size: 11px; color: var(--text-dim); white-space: pre-wrap; word-break: break-word; }
 .conflict-field { margin-top: 4px; }
 .conflict-field strong { color: var(--warn); }
+
+/* ─── Vertikal-switcher (RFB / Finn Tannlege / Alle) ─── */
+.vertical-bar { display: flex; gap: 4px; background: var(--surface); border: 1px solid var(--border); border-radius: 10px; padding: 4px; }
+.vertical-btn { padding: 7px 14px; font-size: 13px; font-weight: 600; color: var(--text-dim); border: none; background: none; cursor: pointer; border-radius: 7px; white-space: nowrap; }
+.vertical-btn:hover:not(.active) { color: var(--text); }
+.vertical-btn.active[data-v="rfb"] { background: #4ade8022; color: #4ade80; }
+.vertical-btn.active[data-v="dental"] { background: #2dd4bf22; color: #2dd4bf; }
+.vertical-btn.active[data-v="all"] { background: var(--surface2); color: var(--text); }
+body[data-vertical="dental"] { --accent: #2dd4bf; }
+body[data-vertical="dental"] header { border-left: 4px solid #2dd4bf; padding-left: 12px; }
+body[data-vertical="rfb"] header { border-left: 4px solid #4ade80; padding-left: 12px; }
 </style>
 </head>
 <body>
@@ -110,10 +121,15 @@ tr.row-clickable:hover { background: var(--surface2); }
   <div id="dashboard">
     <header>
       <div>
-        <h1>Verifier Dashboard</h1>
+        <h1 id="dashTitle">Verifier Dashboard</h1>
         <div class="muted">Run-ledger oversikt over alle planlagte agenter — Phase 2.3</div>
       </div>
       <div style="display:flex;align-items:center;gap:12px;">
+        <div class="vertical-bar" id="verticalBar">
+          <button class="vertical-btn" data-v="rfb">🌱 RFB</button>
+          <button class="vertical-btn" data-v="dental">🦷 Tannlege</button>
+          <button class="vertical-btn active" data-v="all">Alle</button>
+        </div>
         <span class="refresh-info" id="refreshInfo"></span>
         <button id="refreshBtn">Oppdater</button>
       </div>
@@ -201,6 +217,34 @@ var BASE = window.location.origin;
 var REFRESH_INTERVAL_MS = 30000;
 var refreshTimer = null;
 
+// ─── Vertikal-switcher ───────────────────────────
+// 'rfb' | 'dental' | 'all'. /admin/runs støtter ?vertical= direkte.
+var VERTICAL = "all";
+try { VERTICAL = sessionStorage.getItem("rfb_verifier_vertical") || "all"; } catch(e) {}
+
+function verticalQuery() {
+  return (VERTICAL === "rfb" || VERTICAL === "dental") ? "&vertical=" + VERTICAL : "";
+}
+
+function applyVerticalUi() {
+  document.body.setAttribute("data-vertical", VERTICAL);
+  var titles = { rfb: "Verifier — Rett fra Bonden", dental: "Verifier — Finn Tannlege", all: "Verifier Dashboard" };
+  document.getElementById("dashTitle").textContent = titles[VERTICAL] || titles.all;
+  document.querySelectorAll("#verticalBar .vertical-btn").forEach(function(b) {
+    b.classList.toggle("active", b.getAttribute("data-v") === VERTICAL);
+  });
+}
+
+document.querySelectorAll("#verticalBar .vertical-btn").forEach(function(btn) {
+  btn.addEventListener("click", function() {
+    VERTICAL = btn.getAttribute("data-v");
+    try { sessionStorage.setItem("rfb_verifier_vertical", VERTICAL); } catch(e) {}
+    applyVerticalUi();
+    if (API_KEY) load();
+  });
+});
+applyVerticalUi();
+
 // ─── Tab switching ────────────────────────────────
 document.querySelectorAll(".tab-btn").forEach(function(btn) {
   btn.addEventListener("click", function() {
@@ -270,8 +314,8 @@ function api(path) {
 function load() {
   document.getElementById("refreshInfo").textContent = "Henter…";
   Promise.all([
-    api("/admin/runs/summary?since_hours=48"),
-    api("/admin/runs?limit=50&since_hours=48"),
+    api("/admin/runs/summary?since_hours=48" + verticalQuery()),
+    api("/admin/runs?limit=50&since_hours=48" + verticalQuery()),
   ])
     .then(function(results) {
       renderStats(results[0]);
