@@ -2676,6 +2676,16 @@ console.log("\n── Phase 5.4a M2: owner-portal frontend tests ──");
 
 const _m2Promise = (async function runOwnerPortalTests() {
   try {
+    // Wait for the WO-16 integration tests (_intgPromise) to complete before
+    // touching __setDbForTesting. The intg fixtures call __setDbForTesting()
+    // repeatedly with minimal DBs (no magic_links). Without this await,
+    // an intg fixture can overwrite the module-level db singleton *after*
+    // __setDbForTesting(portalDb) but *before* the HTTP request lands in the
+    // route handler — causing "SqliteError: no such table: magic_links".
+    // Fix: serialize _m2Promise after _intgPromise so no intg fixture can
+    // race us. (_intgPromise errors are already counted upstream.)
+    try { await _intgPromise; } catch { /* intg owns its own failures */ }
+
     // Static-source assertions for Variant A claim-CTA (E1: "Hero claim-CTA
     // renders for unclaimed agents" + "footer claim-CTA renders for claimed").
     // Done via source-grep so we don't need to spin up the full SEO stack
@@ -13671,8 +13681,42 @@ console.log("\n── PR-113: dental agent-card, A2A JSON-RPC, openapi ──");
   const dentalA2a = require("../src/routes/dental-a2a") as typeof import("../src/routes/dental-a2a");
   assertTrue(typeof dentalA2a.handleDentalMessageSend === "function", "pr113-04a: handleDentalMessageSend er eksportert");
   assertTrue(typeof dentalA2a.parseIntent === "function", "pr113-04b: parseIntent er eksportert");
-  // -32601 kode-verdi korrekt
-  assertEq(-32601, -32601, "pr113-04c: -32601 er korrekt kode for Method not found");
+  // pr113-04c: POST an unknown JSON-RPC method through the router's POST /a2a
+  // handler and verify the *actual* response object carries error.code === -32601
+  // (Method not found). We exercise the switch-default branch directly by
+  // invoking the router's route handler with a mock req/res pair — no HTTP
+  // loopback needed, so this stays synchronous (top-level await is banned in
+  // CJS mode and async IIFEs cause CI race conditions; see comment ~line 12376).
+  {
+    // Grab the router's internal POST /a2a handler by constructing a minimal
+    // mock: a fake req with the unknown-method envelope and a fake res that
+    // captures the argument passed to res.json(). The router uses req.body
+    // directly (already parsed by express.json() in production; we supply it).
+    const dentalA2aModule = require("../src/routes/dental-a2a") as typeof import("../src/routes/dental-a2a");
+    const router04c = dentalA2aModule.default as any;
+    // Find the POST /a2a layer in the router stack
+    const postLayer04c = (router04c.stack as any[]).find(
+      (l: any) => l.route && l.route.path === "/a2a" && l.route.methods?.post
+    );
+    assertTrue(!!postLayer04c, "pr113-04c: router has a POST /a2a layer");
+    // Build mock req / res
+    const mockReq04c = {
+      body: { jsonrpc: "2.0", method: "unknown/method", params: {}, id: "pr113-04c" },
+    } as any;
+    let captured04c: any = undefined;
+    const mockRes04c = {
+      json: (obj: unknown) => { captured04c = obj; },
+      status: (_code: number) => mockRes04c,
+    } as any;
+    // Invoke the handler (synchronous in the default branch)
+    const handler04c = postLayer04c.route.stack[postLayer04c.route.stack.length - 1].handle;
+    handler04c(mockReq04c, mockRes04c, () => {});
+    assertEq(
+      (captured04c as any)?.error?.code,
+      -32601,
+      "pr113-04c: ukjent JSON-RPC-metode gir faktisk feilkode -32601 fra dispatcher"
+    );
+  }
 }
 
 // ── PR-114: MCP server for finn-tannlege.com ─────────────────────────────
