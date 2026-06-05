@@ -292,6 +292,28 @@ const FREE_MAIL_DOMAINS: readonly string[] = [
   "icloud.com",
   "live.com",
   "msn.com",
+  // Extended 2026-06-05 (lokal-agent-enrichment): Norwegian ISP / freemail
+  // hosts surfaced as domain-coherence false positives in the review queue
+  // (n=14 agents blocked solely by a personal email at one of these hosts;
+  // online.no alone accounted for 12). A producer using a personal ISP
+  // mailbox is not a distributor-misattribution signal.
+  "online.no",
+  "live.no",
+  "hotmail.no",
+  "yahoo.no",
+  "outlook.no",
+  "me.com",
+  "mac.com",
+  "posteo.no",
+  "posteo.de",
+  "frisurf.no",
+  "altibox.no",
+  "lyse.net",
+  "c2i.net",
+  "epost.no",
+  "start.no",
+  "broadpark.no",
+  "getmail.no",
 ];
 
 // Directory / aggregator hosts that frequently end up saved as `agents.url`
@@ -381,6 +403,18 @@ function hostFromUrlLike(raw: string): string | null {
   // Drop userinfo / port
   s = s.split("@").pop()!.split(":")[0]!;
   s = s.replace(/^www\./i, "").toLowerCase();
+  if (!s) return null;
+  // IDN normalization (2026-06-05, lokal-agent-enrichment): unicode and
+  // punycode forms of the same host must compare equal (svanøylaks.no vs
+  // svanoylaks.no false positives in the review queue). URL() converts
+  // unicode hostnames to their punycode (ASCII) form.
+  if (/[^\x00-\x7f]/.test(s)) {
+    try {
+      s = new URL(`http://${s}`).hostname.replace(/^www\./i, "");
+    } catch {
+      /* keep the raw lowercase host if it cannot be parsed */
+    }
+  }
   return s || null;
 }
 
