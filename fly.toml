@@ -12,6 +12,7 @@ primary_region = 'arn'
 [env]
   NODE_ENV = 'production'
   PORT = '3000'
+  MEMORY_LIMIT_MB = '1024'
 
 [[mounts]]
   source = 'lokal_data'
