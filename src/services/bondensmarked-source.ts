@@ -1,4 +1,4 @@
-// ─── bondensmarked-source.ts (orchestrator PR-123, 2026-06-06) ────────────────
+// ─── bondensmarked-source.ts (orchestrator PR-123/PR-124, 2026-06-06) ─────────
 //
 // Server-side canonical-source module for Bondens marked (BM).
 //
@@ -9,9 +9,10 @@
 // Parsing uses the same regex/string approach as bm-events-scraper.ts.
 //
 // The live fetch will work in prod (not sandbox-restricted). For dev/tests,
-// validate by passing saved HTML directly to parseBmLokallagHtml().
+// validate by passing saved HTML directly to parseBmLokallagHtml() or
+// parseBmLokallagDetailHtml().
 //
-// Structural anchors keyed on from the real /lokallag sample HTML:
+// ─── Structural anchors (INDEX page /lokallag) ────────────────────────────────
 //   NAME  : <p class="font-semibold leading-tight line-clamp-1">NAME</p>
 //   SLUG  : <a … href="/lokallag/SLUG">
 //   COUNTS: (\d+)<!-- --> <!-- -->(markeder|markedsplasser|produsenter|marked)
@@ -21,14 +22,30 @@
 //            + <p class="text-sm font-medium line-clamp-1">VENUE NAME</p>
 //   PAUSED: body text contains "legge driften på is" (Telemark)
 //
-// TODO PR-124: per-lokallag DETAIL-page parsing (full market-day times,
-//   individual markedsplasser lists). We don't have a detail-page HTML
-//   sample yet — slot parser here once the sample is available.
+// ─── Structural anchors (DETAIL page /lokallag/<slug>) ────────────────────────
+//   MARKET DAYS:
+//     anchor href : href="/markeder/TITLE-YYYY-MM-DD"  (ISO date in slug)
+//     time        : class="text-base font-bold text-muted-foreground">10:00<!-- --> – <!-- -->17:00
+//     title       : class="font-semibold tracking-tight line-clamp-1 text-lg">TITLE</h3>
+//     place       : class="line-clamp-1">PLACE</span>  (first span after h3 in card)
+//   MARKEDSPLASSER (preview, 3 shown on detail page):
+//     href="/markedsplasser/SLUG", name class="font-semibold leading-tight line-clamp-1">NAME
+//   LOKALLAG UUID (for full markedsplasser fetch):
+//     href="/markedsplasser?lokallag=UUID"  (extracted to build full-list URL)
+//   FULL MARKEDSPLASSER (/markedsplasser?lokallag=UUID page):
+//     same card structure: class="font-semibold leading-tight line-clamp-1">NAME
+//   PRODUSENTER count:
+//     Produsenter (<!-- -->N<!-- -->) in rendered HTML
+//
+// TODO PR-125: wire fetchBmLokallagDetail() into the daily bm-events-scraper
+//   to auto-correct event start/end times and auto-create missing markedsplasser.
+//   The mutations belong in the scraper, not here — this module stays read-only.
 
-const BM_LOKALLAG_URL = "https://bondensmarked.no/lokallag";
+const BM_BASE_URL = "https://bondensmarked.no";
+const BM_LOKALLAG_URL = `${BM_BASE_URL}/lokallag`;
 const FETCH_TIMEOUT_MS = 15_000;
 
-// ─── Public interface ─────────────────────────────────────────────────────────
+// ─── Public interfaces ────────────────────────────────────────────────────────
 
 export interface BmLokallag {
   /** Display name exactly as shown on bondensmarked.no */
@@ -55,7 +72,40 @@ export interface BmLokallag {
   paused: boolean;
 }
 
-// ─── Fetch + parse ────────────────────────────────────────────────────────────
+/** A single upcoming market day parsed from a lokallag detail page. */
+export interface BmMarketDay {
+  /** ISO date string, e.g. "2026-07-04" — extracted from the /markeder/SLUG href. */
+  date: string;
+  /**
+   * Market-place / venue name as shown, e.g. "Arendal - Torvet, ARENDAL".
+   * May include city suffix in all-caps separated by comma.
+   */
+  place: string;
+  /** Start time, e.g. "10:00". Parsed from the rendered time element. */
+  startTime?: string;
+  /** End time, e.g. "15:00". Parsed from the rendered time element. */
+  endTime?: string;
+  /** Market event title, e.g. "Torvet i Arendal". */
+  title?: string;
+}
+
+/** Per-lokallag detail parsed from bondensmarked.no/lokallag/<slug>. */
+export interface BmLokallagDetail {
+  /** The lokallag URL slug, e.g. "agder". */
+  slug: string;
+  /**
+   * Full list of markedsplass names for this lokallag.
+   * Populated by a second fetch to /markedsplasser?lokallag=<uuid>.
+   * Falls back to the 3-item preview on the detail page if the second fetch fails.
+   */
+  markedsplasser: string[];
+  /** All upcoming market days listed on the detail page, with real start/end times. */
+  marketDays: BmMarketDay[];
+  /** Number of produsenter as shown on the detail page. */
+  produsenter?: number;
+}
+
+// ─── Fetch + parse: INDEX page ────────────────────────────────────────────────
 
 /**
  * Fetches https://bondensmarked.no/lokallag server-side and returns the 14
@@ -66,18 +116,7 @@ export interface BmLokallag {
  * directly in tests/dev with a saved HTML string.
  */
 export async function fetchBmLokallag(): Promise<BmLokallag[]> {
-  const res = await fetch(BM_LOKALLAG_URL, {
-    redirect: "follow",
-    headers: {
-      "User-Agent": "Lokal-RFB-Scraper/1.0 (+https://rettfrabonden.com)",
-      "Accept": "text/html,application/xhtml+xml",
-    },
-    signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
-  });
-  if (!res.ok) {
-    throw new Error(`fetchBmLokallag: HTTP ${res.status} from ${BM_LOKALLAG_URL}`);
-  }
-  const html = await res.text();
+  const html = await bmFetch(BM_LOKALLAG_URL);
   return parseBmLokallagHtml(html);
 }
 
@@ -168,7 +207,7 @@ export function parseBmLokallagHtml(html: string): BmLokallag[] {
       results.push({
         name,
         slug,
-        url: `https://bondensmarked.no/lokallag/${slug}`,
+        url: `${BM_BASE_URL}/lokallag/${slug}`,
         markeder,
         produsenter,
         markedsplasser,
@@ -186,7 +225,199 @@ export function parseBmLokallagHtml(html: string): BmLokallag[] {
   return results;
 }
 
+// ─── Fetch + parse: DETAIL page ───────────────────────────────────────────────
+
+/**
+ * Fetches https://bondensmarked.no/lokallag/<slug> server-side and returns the
+ * full set of upcoming market days (with real start/end times) plus the
+ * complete list of markedsplasser for that lokallag.
+ *
+ * Two HTTP GETs are made:
+ *   1. https://bondensmarked.no/lokallag/<slug>          — market days + UUID
+ *   2. https://bondensmarked.no/markedsplasser?lokallag=<uuid>  — full MP list
+ *
+ * Each section is wrapped in its own try/catch so a parsing failure in one
+ * section never suppresses data from the other. Anomalies are console.warn'd.
+ *
+ * Returns a partial result (empty arrays / undefined) on shape change rather
+ * than throwing — callers should check array lengths and log deviations.
+ *
+ * NOT safe to call from a sandboxed environment — use parseBmLokallagDetailHtml()
+ * directly in tests/dev with a saved HTML string.
+ */
+export async function fetchBmLokallagDetail(slug: string): Promise<BmLokallagDetail> {
+  const url = `${BM_BASE_URL}/lokallag/${slug}`;
+  const html = await bmFetch(url);
+  return parseBmLokallagDetailHtml(slug, html);
+}
+
+/**
+ * Pure parser for the lokallag detail page — exposed for testing without a
+ * live fetch. Pass the saved HTML and the expected slug.
+ *
+ * When fullMpHtml is provided it is used for markedsplasser parsing instead
+ * of making a second live fetch (useful in tests / CI).
+ */
+export async function parseBmLokallagDetailHtml(
+  slug: string,
+  html: string,
+  fullMpHtml?: string,
+): Promise<BmLokallagDetail> {
+  // ── Section 1: Market days ──────────────────────────────────────────────────
+  // Structural anchors (real Agder sample, 2026-06-07):
+  //   href="/markeder/TITLE-YYYY-MM-DD" — ISO date embedded in URL slug
+  //   class="text-base font-bold text-muted-foreground">10:00<!-- --> – <!-- -->17:00</p>
+  //   class="font-semibold tracking-tight line-clamp-1 text-lg">TITLE</h3>
+  //   class="line-clamp-1">PLACE, CITY</span>  (first match after h3 within card)
+  const marketDays: BmMarketDay[] = [];
+  try {
+    // Each market event card is an <a href="/markeder/..."> anchor.
+    // We capture: ISO date from href, time string, title, and place in one pass.
+    const eventRe =
+      /href="\/markeder\/[^"]*?(\d{4}-\d{2}-\d{2})"[^>]*>[\s\S]*?class="text-base font-bold text-muted-foreground">([\s\S]*?)<\/p>[\s\S]*?class="font-semibold tracking-tight line-clamp-1 text-lg">([\s\S]*?)<\/h3>[\s\S]*?class="line-clamp-1">([\s\S]*?)<\/span>/g;
+    let em: RegExpExecArray | null;
+    while ((em = eventRe.exec(html)) !== null) {
+      const date = em[1];
+      const rawTime = em[2];
+      const title = decodeHtmlEntities(stripHtmlTags(em[3]).trim());
+      const place = decodeHtmlEntities(stripHtmlTags(em[4]).trim());
+
+      // Extract HH:MM times — strips React HTML comments (<!-- -->) reliably
+      const times = rawTime.match(/\d{2}:\d{2}/g) ?? [];
+      const startTime = times[0];
+      const endTime = times[1];
+
+      if (!date) continue; // paranoia guard
+      marketDays.push({ date, place, startTime, endTime, title: title || undefined });
+    }
+
+    if (marketDays.length === 0) {
+      console.warn(`[bondensmarked-source] detail(${slug}): no market days found — page structure may have changed`);
+    }
+  } catch (err) {
+    console.warn(`[bondensmarked-source] detail(${slug}): market-day parsing failed:`, err instanceof Error ? err.message : String(err));
+  }
+
+  // ── Section 2: Produsenter count ───────────────────────────────────────────
+  // Rendered: "Produsenter (<!-- -->19<!-- -->)" from React children array
+  let produsenter: number | undefined;
+  try {
+    const prodM = /Produsenter \(<!-- -->(\d+)<!-- -->\)/.exec(html);
+    if (prodM) {
+      produsenter = parseInt(prodM[1], 10);
+    } else {
+      console.warn(`[bondensmarked-source] detail(${slug}): produsenter count not found`);
+    }
+  } catch (err) {
+    console.warn(`[bondensmarked-source] detail(${slug}): produsenter extraction failed:`, err instanceof Error ? err.message : String(err));
+  }
+
+  // ── Section 3: Markedsplasser (full list via lokallag UUID) ────────────────
+  // The detail page previews only ~3 markedsplasser. The full list lives at:
+  //   /markedsplasser?lokallag=<uuid>
+  // The UUID is embedded in the "Se alle" button:
+  //   href="/markedsplasser?lokallag=UUID"
+  let markedsplasser: string[] = [];
+  try {
+    // Extract lokallag UUID from the "Se alle" markedsplasser link
+    const uuidM = /href="\/markedsplasser\?lokallag=([a-f0-9-]{36})"/.exec(html);
+    const lokallagUuid = uuidM?.[1];
+
+    if (lokallagUuid) {
+      // Fetch the full markedsplasser list (second request)
+      let mpHtml: string;
+      if (fullMpHtml) {
+        mpHtml = fullMpHtml; // test override
+      } else {
+        try {
+          mpHtml = await bmFetch(`${BM_BASE_URL}/markedsplasser?lokallag=${lokallagUuid}`);
+        } catch (fetchErr) {
+          console.warn(
+            `[bondensmarked-source] detail(${slug}): markedsplasser fetch failed, falling back to preview:`,
+            fetchErr instanceof Error ? fetchErr.message : String(fetchErr)
+          );
+          // Fall back to the preview names on the detail page itself
+          markedsplasser = parseMpPreviewFromDetailHtml(html);
+          return { slug, markedsplasser, marketDays, produsenter };
+        }
+        markedsplasser = parseMpListHtml(mpHtml);
+      }
+      markedsplasser = parseMpListHtml(mpHtml ?? fullMpHtml ?? "");
+      if (markedsplasser.length === 0) {
+        console.warn(`[bondensmarked-source] detail(${slug}): full markedsplasser list empty — falling back to preview`);
+        markedsplasser = parseMpPreviewFromDetailHtml(html);
+      }
+    } else {
+      console.warn(`[bondensmarked-source] detail(${slug}): lokallag UUID not found, falling back to preview markedsplasser`);
+      markedsplasser = parseMpPreviewFromDetailHtml(html);
+    }
+  } catch (err) {
+    console.warn(`[bondensmarked-source] detail(${slug}): markedsplasser section failed:`, err instanceof Error ? err.message : String(err));
+    try {
+      markedsplasser = parseMpPreviewFromDetailHtml(html);
+    } catch { /* ignore secondary failure */ }
+  }
+
+  return { slug, markedsplasser, marketDays, produsenter };
+}
+
 // ─── Internal helpers ─────────────────────────────────────────────────────────
+
+/**
+ * Shared fetch helper — sets User-Agent + timeout, throws on non-2xx.
+ * All fetches in this module go through here so no new deps are needed.
+ */
+async function bmFetch(url: string): Promise<string> {
+  const res = await fetch(url, {
+    redirect: "follow",
+    headers: {
+      "User-Agent": "Lokal-RFB-Scraper/1.0 (+https://rettfrabonden.com)",
+      "Accept": "text/html,application/xhtml+xml",
+    },
+    signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
+  });
+  if (!res.ok) {
+    throw new Error(`bmFetch: HTTP ${res.status} from ${url}`);
+  }
+  return res.text();
+}
+
+/**
+ * Parses the full markedsplasser list from the /markedsplasser?lokallag=<uuid> page.
+ * Cards share the same structure as the preview on the detail page.
+ * Anchor: <p class="font-semibold leading-tight line-clamp-1">NAME</p>
+ */
+function parseMpListHtml(html: string): string[] {
+  const names: string[] = [];
+  // Same card title class as index page lokallag names, but scoped to marketplace cards
+  const mpRe = /href="\/markedsplasser\/[^"]*"[\s\S]*?class="font-semibold leading-tight line-clamp-1">([\s\S]*?)<\/p>/g;
+  let m: RegExpExecArray | null;
+  while ((m = mpRe.exec(html)) !== null) {
+    const name = decodeHtmlEntities(stripHtmlTags(m[1]).trim());
+    if (name && !names.includes(name)) names.push(name);
+  }
+  return names;
+}
+
+/**
+ * Parses the 3-item markedsplasser preview embedded in the lokallag detail page.
+ * Used as fallback when the full /markedsplasser?lokallag= fetch fails.
+ */
+function parseMpPreviewFromDetailHtml(html: string): string[] {
+  const names: string[] = [];
+  const mpRe = /href="\/markedsplasser\/[^"]*"[\s\S]*?class="font-semibold leading-tight line-clamp-1">([\s\S]*?)<\/p>/g;
+  let m: RegExpExecArray | null;
+  while ((m = mpRe.exec(html)) !== null) {
+    const name = decodeHtmlEntities(stripHtmlTags(m[1]).trim());
+    if (name && !names.includes(name)) names.push(name);
+  }
+  return names;
+}
+
+/** Strip HTML tags (for cleaning RSC-generated text fragments). */
+function stripHtmlTags(s: string): string {
+  return s.replace(/<[^>]+>/g, "").replace(/<!--.*?-->/gs, "");
+}
 
 function decodeHtmlEntities(s: string): string {
   return s
