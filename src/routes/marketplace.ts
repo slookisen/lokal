@@ -4077,4 +4077,345 @@ router.get("/bm-events", (req: Request, res: Response) => {
 });
 
 
+// ─── POST /admin/homepage-provenance-batch — Server-side homepage crawl ──────
+//
+// Fetches each producer's own homepage server-side (bypasses sandbox
+// allowlist restrictions), extracts contact fields (email, phone, address),
+// and merges provenance entries with source_type:"homepage" (Tier-A) into
+// field_provenance — giving the cross-source-validator a 2nd independent
+// source alongside google_places so stranded TIER-1 agents can reach
+// source_count≥2 and be promoted to the outreach pool.
+//
+// Auth: same x-admin-key as google-rating-batch.
+// Body: { agentIds?: string[], limit?: number }  (all optional)
+//   - agentIds: process exactly these agents.
+//   - else auto-select: TIER-1 agents with a website, some enrichment, but
+//     field_provenance empty/{} OR lacking a 2nd source for address/phone,
+//     with verification_status IN (data_insufficient, review_required,
+//     pending_verify). Default limit 25, hard cap 100.
+//
+// Provenance shape written is byte-compatible with ProvenanceRecord in
+// cross-source-validator.ts: { value, source_type, source_url, fetched_at }.
+// Merged via mergeFieldProvenance (same helper used by google-rating-batch).
+//
+// orch-pr-122 (2026-06-06)
+
+router.post("/admin/homepage-provenance-batch", async (req: Request, res: Response) => {
+  const adminKey = req.headers["x-admin-key"] as string;
+  const expectedKey = getAdminKey();
+  if (!expectedKey || !adminKey || adminKey !== expectedKey) {
+    res.status(403).json({ error: "Krever X-Admin-Key header" });
+    return;
+  }
+
+  const { agentIds: bodyAgentIds, limit: limitRaw } = req.body as {
+    agentIds?: unknown;
+    limit?: unknown;
+  };
+  const limit = Math.min(
+    typeof limitRaw === "number" && limitRaw > 0 ? Math.floor(limitRaw) : 25,
+    100
+  );
+
+  const db = getDb();
+  let targetIds: string[];
+
+  if (Array.isArray(bodyAgentIds) && bodyAgentIds.length > 0) {
+    // Explicit list — trust the caller, just cap it.
+    targetIds = (bodyAgentIds as unknown[])
+      .filter((id): id is string => typeof id === "string" && id.trim().length > 0)
+      .map((id) => id.trim())
+      .slice(0, limit);
+  } else {
+    // Auto-select: agents with a website, some enrichment data, but
+    // field_provenance is empty/{} or lacks a homepage Tier-A source, and
+    // whose verification_status indicates they need more enrichment.
+    const rows = db
+      .prepare(
+        `SELECT k.agent_id, COALESCE(k.website, a.url) AS homepage_url
+           FROM agent_knowledge k
+           JOIN agents a ON a.id = k.agent_id
+          WHERE k.verification_status IN ('data_insufficient', 'review_required', 'pending_verify')
+            AND (k.website IS NOT NULL AND k.website != '' OR a.url IS NOT NULL AND a.url != '')
+            AND k.about IS NOT NULL AND k.about != ''
+            AND (
+              k.field_provenance IS NULL
+              OR k.field_provenance = '{}'
+              OR k.field_provenance NOT LIKE '%"homepage"%'
+            )
+          ORDER BY k.updated_at ASC
+          LIMIT ?`
+      )
+      .all(limit) as Array<{ agent_id: string; homepage_url: string | null }>;
+    targetIds = rows
+      .filter((r) => r.homepage_url && r.homepage_url.trim())
+      .map((r) => r.agent_id);
+  }
+
+  // ── Norwegian contact-field extractors ───────────────────────────────────
+
+  /** Extract the best email address from HTML. Prefers non-generic domains. */
+  function extractEmail(html: string): string | null {
+    // Collect mailto: links first (most reliable).
+    const mailtoRe = /mailto:([a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,})/gi;
+    const candidates: string[] = [];
+    let m: RegExpExecArray | null;
+    while ((m = mailtoRe.exec(html)) !== null) {
+      candidates.push(m[1].toLowerCase());
+    }
+    // Fallback: bare email pattern in text.
+    if (candidates.length === 0) {
+      const bareRe = /\b([a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,})\b/g;
+      while ((m = bareRe.exec(html)) !== null) {
+        candidates.push(m[1].toLowerCase());
+      }
+    }
+    if (candidates.length === 0) return null;
+    // Prefer non-generic (not gmail/outlook/etc.).
+    const genericDomains = new Set([
+      "gmail.com", "outlook.com", "hotmail.com", "yahoo.com", "live.com",
+      "icloud.com", "me.com", "msn.com", "proton.me", "protonmail.com",
+      "online.no", "live.no", "hotmail.no",
+    ]);
+    const branded = candidates.find((e) => {
+      const domain = e.split("@")[1] ?? "";
+      return !genericDomains.has(domain);
+    });
+    return branded ?? candidates[0] ?? null;
+  }
+
+  /** Normalise a Norwegian phone number to digits only (no country code). */
+  function normalisePhone(raw: string): string {
+    return raw
+      .replace(/^\+47/, "")
+      .replace(/^0047/, "")
+      .replace(/^\+/, "")
+      .replace(/[\s\-().]/g, "")
+      .replace(/\D/g, "");
+  }
+
+  /** Extract a Norwegian phone number from HTML text. */
+  function extractPhone(html: string): string | null {
+    // Strip HTML tags for cleaner matching.
+    const text = html.replace(/<[^>]+>/g, " ").replace(/&nbsp;/g, " ");
+    // Match: optional +47 / 0047 / 47, then 8 digits possibly grouped.
+    const re = /(?:\+47|0047|47[\s\-])?(\d{2}[\s\-]?\d{2}[\s\-]?\d{2}[\s\-]?\d{2})\b/g;
+    let m: RegExpExecArray | null;
+    while ((m = re.exec(text)) !== null) {
+      const digits = normalisePhone(m[0]);
+      // Valid Norwegian mobile/landline: 8 digits, not all same.
+      if (digits.length === 8 && !/^(\d)\1{7}$/.test(digits)) {
+        return digits;
+      }
+    }
+    return null;
+  }
+
+  /**
+   * Extract a Norwegian postal address: street name + number + 4-digit
+   * postal code + poststed. Conservative — only returns a result if both
+   * the postal code and a poststed are found close together.
+   */
+  function extractAddress(html: string): string | null {
+    const text = html.replace(/<[^>]+>/g, " ").replace(/\s+/g, " ");
+    // Pattern: <words> <number> <optional comma/space> <4 digits> <CAPS/title word>
+    const re =
+      /([A-ZÆØÅ][a-zæøåA-ZÆØÅ\s]{2,40}?\s+\d+[A-Za-z]?),?\s+(\d{4})\s+([A-ZÆØÅ][a-zæøå]+(?:\s+[A-ZÆØÅ][a-zæøå]+)?)/g;
+    let m: RegExpExecArray | null;
+    while ((m = re.exec(text)) !== null) {
+      const candidate = `${m[1].trim()}, ${m[2]} ${m[3].trim()}`;
+      // Sanity: skip obviously bad matches (< 10 chars of street part).
+      if (m[1].trim().length >= 6) return candidate;
+    }
+    return null;
+  }
+
+  // ── Per-agent processing ─────────────────────────────────────────────────
+
+  const CONCURRENCY = 3;
+  const FETCH_TIMEOUT_MS = 10_000;
+
+  type AgentOutcome =
+    | { agentId: string; status: "enriched"; fieldsFound: string[]; provenanceWritten: boolean }
+    | { agentId: string; status: "no_data" }
+    | { agentId: string; status: "fetch_error"; error: string }
+    | { agentId: string; status: "not_found" };
+
+  async function processAgent(agentId: string): Promise<AgentOutcome> {
+    // Look up homepage URL (prefer agent_knowledge.website, fall back to agents.url).
+    const kRow = db
+      .prepare(
+        "SELECT website, address, phone, field_provenance FROM agent_knowledge WHERE agent_id = ?"
+      )
+      .get(agentId) as
+      | { website: string | null; address: string | null; phone: string | null; field_provenance: string | null }
+      | undefined;
+
+    const agentRow = db
+      .prepare("SELECT url FROM agents WHERE id = ?")
+      .get(agentId) as { url: string | null } | undefined;
+
+    if (!kRow) return { agentId, status: "not_found" };
+
+    const homepageUrl = (kRow.website && kRow.website.trim())
+      ? kRow.website.trim()
+      : (agentRow?.url && agentRow.url.trim() ? agentRow.url.trim() : null);
+
+    if (!homepageUrl) return { agentId, status: "no_data" };
+
+    // Ensure URL has a scheme.
+    const fetchUrl = /^https?:\/\//i.test(homepageUrl)
+      ? homepageUrl
+      : `https://${homepageUrl}`;
+
+    // Fetch homepage HTML server-side.
+    let html: string;
+    try {
+      const resp = await fetch(fetchUrl, {
+        redirect: "follow",
+        headers: {
+          "User-Agent": "Lokal-RFB-Scraper/1.0 (+https://rettfrabonden.com)",
+          Accept: "text/html,application/xhtml+xml",
+        },
+        signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
+      });
+      if (!resp.ok) {
+        return {
+          agentId,
+          status: "fetch_error",
+          error: `HTTP ${resp.status} for ${fetchUrl}`,
+        };
+      }
+      html = await resp.text();
+    } catch (fetchErr: any) {
+      return {
+        agentId,
+        status: "fetch_error",
+        error: fetchErr?.message ?? String(fetchErr),
+      };
+    }
+
+    // Extract contact fields.
+    const extractedEmail = extractEmail(html);
+    const extractedPhone = extractPhone(html);
+    const extractedAddress = extractAddress(html);
+
+    const nowIso = new Date().toISOString();
+
+    // Build the incoming provenance payload (wrapped shape accepted by mergeFieldProvenance).
+    const incomingProv: Record<string, { sources: Array<{ source_type: string; value: string; fetched_at: string; source_url: string }> }> = {};
+
+    if (extractedEmail) {
+      incomingProv.email = {
+        sources: [{ source_type: "homepage", value: extractedEmail, fetched_at: nowIso, source_url: fetchUrl }],
+      };
+    }
+    if (extractedPhone) {
+      incomingProv.phone = {
+        sources: [{ source_type: "homepage", value: extractedPhone, fetched_at: nowIso, source_url: fetchUrl }],
+      };
+    }
+    if (extractedAddress) {
+      incomingProv.address = {
+        sources: [{ source_type: "homepage", value: extractedAddress, fetched_at: nowIso, source_url: fetchUrl }],
+      };
+    }
+
+    const fieldsFound = Object.keys(incomingProv);
+    if (fieldsFound.length === 0) return { agentId, status: "no_data" };
+
+    // Parse existing provenance, merge, write back.
+    let existingProv: Record<string, unknown> = {};
+    if (kRow.field_provenance) {
+      try {
+        const parsed = JSON.parse(kRow.field_provenance);
+        if (parsed && typeof parsed === "object") existingProv = parsed as Record<string, unknown>;
+      } catch { /* tolerate junk */ }
+    }
+
+    const mergedProv = mergeFieldProvenance(existingProv, incomingProv);
+    const provJson = JSON.stringify(mergedProv);
+
+    // Optionally back-fill empty columns (mirrors google-rating-batch: only write if column empty).
+    const tx = db.transaction(() => {
+      const sets: string[] = [];
+      const params: unknown[] = [];
+
+      const currPhone = (kRow.phone ?? "").toString().trim();
+      const currAddr = (kRow.address ?? "").toString().trim();
+
+      if (!currPhone && extractedPhone) {
+        sets.push("phone = ?");
+        params.push(extractedPhone);
+      }
+      if (!currAddr && extractedAddress) {
+        sets.push("address = ?");
+        params.push(extractedAddress);
+      }
+      sets.push("field_provenance = ?");
+      params.push(provJson);
+      sets.push("updated_at = ?");
+      params.push(nowIso);
+      params.push(agentId);
+
+      db.prepare(
+        `UPDATE agent_knowledge SET ${sets.join(", ")} WHERE agent_id = ?`
+      ).run(...params);
+    });
+    tx();
+
+    return { agentId, status: "enriched", fieldsFound, provenanceWritten: true };
+  }
+
+  // Run with limited concurrency (≤3 at a time).
+  const outcomes: AgentOutcome[] = [];
+  for (let i = 0; i < targetIds.length; i += CONCURRENCY) {
+    const slice = targetIds.slice(i, i + CONCURRENCY);
+    const settled = await Promise.allSettled(slice.map((id) => processAgent(id)));
+    for (const result of settled) {
+      if (result.status === "fulfilled") {
+        outcomes.push(result.value);
+      } else {
+        // Should not happen (processAgent catches internally), but guard anyway.
+        outcomes.push({
+          agentId: "unknown",
+          status: "fetch_error",
+          error: result.reason?.message ?? String(result.reason),
+        });
+      }
+    }
+  }
+
+  // Summarise.
+  const processed = outcomes.length;
+  const enriched = outcomes.filter((o) => o.status === "enriched").length;
+  const provenanceWritten = outcomes.filter(
+    (o): o is Extract<AgentOutcome, { status: "enriched" }> => o.status === "enriched"
+  ).reduce((acc, o) => acc + (o.provenanceWritten ? 1 : 0), 0);
+
+  const byField: Record<string, number> = {};
+  for (const o of outcomes) {
+    if (o.status === "enriched") {
+      for (const f of o.fieldsFound) {
+        byField[f] = (byField[f] ?? 0) + 1;
+      }
+    }
+  }
+
+  const errors = outcomes
+    .filter((o): o is Extract<AgentOutcome, { status: "fetch_error" }> => o.status === "fetch_error")
+    .map((o) => ({ agentId: o.agentId, error: o.error }));
+
+  res.json({
+    success: true,
+    data: {
+      processed,
+      enriched,
+      provenance_written: provenanceWritten,
+      by_field: byField,
+      errors,
+    },
+  });
+});
+
 export default router;
