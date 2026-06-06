@@ -43,6 +43,7 @@ import adminVerifierReviewQueueRoutes from "./routes/admin-verifier-review-queue
 import adminKnowledgeRoutes from "./routes/admin-knowledge";
 import adminAffiliationsRoutes from "./routes/admin-affiliations";
 import adminBmEventsRoutes from "./routes/admin-bm-events";
+import adminBmReconcileRoutes from "./routes/admin-bm-reconcile";
 import adminHanenRoutes, { publicRouter as publicHanenRoutes } from "./routes/admin-hanen";
 import adminDebioCrossCheckRoutes from "./routes/admin-debio-cross-check";
 import adminJobsRoutes from "./routes/admin-jobs";
@@ -357,6 +358,8 @@ app.use("/admin/knowledge", adminLimiter, adminKnowledgeRoutes);
 app.use("/admin/affiliations", adminLimiter, adminAffiliationsRoutes);
 // PR-56 (2026-05-16): Bondens marked events scraper — POST /admin/bm-events/scrape
 app.use("/admin/bm-events", adminLimiter, adminBmEventsRoutes);
+// PR-123 (2026-06-06): BM canonical reconcile — GET /admin/bm-reconcile
+app.use("/admin/bm-reconcile", adminLimiter, adminBmReconcileRoutes);
 // Phase 5.11 C.2 (2026-05-16): Hanen member-scraping — POST /admin/hanen/scrape
 app.use("/admin/hanen", adminLimiter, adminHanenRoutes);
 // Phase 5.11 C.2 (2026-05-16): public Hanen members list — GET /api/marketplace/hanen/members
