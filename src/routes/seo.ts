@@ -24,6 +24,7 @@ import { analyticsService } from "../services/analytics-service";
 import { DiscoveryQuerySchema } from "../models/marketplace";
 import { getDb } from "../database/init";
 import { conversationService } from "../services/conversation-service";
+import { getTrafficStats } from "../services/traffic-stats";
 import { slugify } from "../utils/slug";
 import { addUtmParams } from "../utils/url-utm";
 import { t, htmlLangAttr, ogLocale, localizedPath, type Lang } from "../i18n/t";
@@ -545,78 +546,6 @@ function producerCardMediumRich(a: any, knowledge: any, lang: Lang = "no"): stri
   </a>`;
 }
 
-// ─── Traffic stats helper ───────────────────────────────────────
-
-function sqlDate(date: Date): string {
-  return date.toISOString().replace("T", " ").replace(/\.\d{3}Z$/, "");
-}
-
-interface TrafficStats {
-  pageViews: number;
-  uniqueVisitors: number;
-  realHumans: number;
-  botAndAi: number;
-  aiQueries: number;
-}
-
-// Bot detection patterns (same as analytics.ts traffic-classification)
-const BOT_PATTERNS = ['bot', 'Bot', 'spider', 'crawl', 'serpstat', 'GPTBot', 'ClaudeBot', 'Chiark', 'Go-http-client', 'Dataprovider', 'NotHumanSearch', 'DuckDuck', 'Googlebot', 'GoogleOther', 'Bytespider', 'Applebot', 'YandexBot', 'BingPreview', 'facebookexternal', 'Twitterbot'];
-const DEV_PATTERNS = ['curl/', 'Python/', 'aiohttp', 'Lokal/', 'Lokal-Enricher', 'Claude-User', 'Python-urllib', 'node-fetch', 'axios/'];
-
-let _trafficCache: TrafficStats | null = null;
-let _trafficCacheTime = 0;
-const TRAFFIC_CACHE_TTL = 120_000; // 2 minutes
-
-function getTrafficStats(): TrafficStats {
-  const now = Date.now();
-  if (_trafficCache && (now - _trafficCacheTime) < TRAFFIC_CACHE_TTL) {
-    return _trafficCache;
-  }
-  try {
-    const db = getDb();
-    const notOwner = "(is_owner IS NULL OR is_owner = 0)";
-
-    // Total page views (excluding owner)
-    const pageViews = (db.prepare(`SELECT COUNT(*) as n FROM analytics_page_views WHERE ${notOwner}`).get() as any)?.n ?? 0;
-
-    // Session-based classification: group by session_id, check UA for bots
-    const sessions = db.prepare(`
-      SELECT session_id, COUNT(*) as views
-      FROM analytics_page_views
-      WHERE ${notOwner}
-      GROUP BY session_id
-    `).all() as any[];
-
-    let realHumans = 0;
-    let botViews = 0;
-    for (const s of sessions) {
-      const ua = s.session_id.includes(':') ? s.session_id.split(':').slice(1).join(':') : '';
-      const isBot = BOT_PATTERNS.some(p => ua.includes(p));
-      const isDev = DEV_PATTERNS.some(p => ua.includes(p));
-      if (isBot || isDev) {
-        botViews += s.views;
-      } else {
-        realHumans += s.views;
-      }
-    }
-
-    // AI queries from analytics_queries
-    const aiQueries = (db.prepare(`SELECT COUNT(*) as n FROM analytics_queries WHERE ${notOwner}`).get() as any)?.n ?? 0;
-
-    _trafficCache = {
-      pageViews,
-      uniqueVisitors: sessions.length,
-      realHumans,
-      botAndAi: botViews + aiQueries,
-      aiQueries,
-    };
-    _trafficCacheTime = Date.now();
-    return _trafficCache;
-  } catch {
-    return { pageViews: 0, uniqueVisitors: 0, realHumans: 0, botAndAi: 0, aiQueries: 0 };
-  }
-}
-
 // ─── Live conversation showcase for landing page ────────────
 
 function buildConversationShowcase(_lang: Lang = "no"): string {
@@ -688,7 +617,7 @@ function formatConvTime(iso: string): string {
 // ═══════════════════════════════════════════════════════════════
 
 router.get("/api/traffic-stats", (_req: Request, res: Response) => {
-  const s = getTrafficStats();
+  const s = getTrafficStats("rfb");
   res.json({
     pageViews: s.pageViews,
     uniqueVisitors: s.uniqueVisitors,
@@ -846,7 +775,7 @@ router.get("/", (req: Request, res: Response) => {
     const stats = marketplaceRegistry.getStats();
     const agents = marketplaceRegistry.getActiveAgents();
     const totalAgents = stats.totalAgents || agents.length;
-    const traffic = getTrafficStats();
+    const traffic = getTrafficStats("rfb");
 
     const cityCounts: Record<string, number> = {};
     const categoryCounts: Record<string, number> = {};

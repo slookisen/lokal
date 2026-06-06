@@ -29,6 +29,7 @@ import {
 import type { DentalAgent, PoststedRow } from "../services/dental-store";
 import { getDentalAgentCard } from "../services/dental-agent-card";
 import { getDentalOpenapi } from "../services/dental-openapi";
+import { getTrafficStats } from "../services/traffic-stats";
 
 const router = Router();
 
@@ -303,6 +304,14 @@ a:hover{text-decoration:underline}
 @media(max-width:640px){.stats-inner{grid-template-columns:repeat(2,1fr)}}
 .stat-val{font-size:1.6rem;font-weight:800;line-height:1}
 .stat-lbl{font-size:.78rem;opacity:.8;margin-top:4px}
+
+/* PROOF BAR (traffic stats) */
+.proof-bar{background:var(--g100);padding:20px 24px}
+.proof-inner{max-width:1100px;margin:0 auto;display:grid;grid-template-columns:repeat(4,1fr);gap:16px;text-align:center}
+@media(max-width:640px){.proof-inner{grid-template-columns:repeat(2,1fr)}}
+.proof-val{font-size:1.4rem;font-weight:800;line-height:1;color:var(--navy)}
+.proof-lbl{font-size:.78rem;color:var(--g500);margin-top:4px}
+.proof-val-muted{color:var(--teal-400)}
 
 /* SECTIONS */
 .section{padding:64px 0}
@@ -599,6 +608,7 @@ function paginationHtml(
 router.get("/", (_req: Request, res: Response) => {
   let stats = { total: 0, per_fylke: [] as Array<{ fylke: string; count: number }>, helfo_count: 0, chain_count: 0, acute_count: 0, specialist_clinic_count: 0 };
   try { stats = getCachedDentalStats(); } catch { /* dental db may not be ready */ }
+  const traffic = getTrafficStats("dental");
 
   const totalRounded = stats.total > 6000
     ? `over ${Math.floor(stats.total / 100) * 100}`
@@ -667,6 +677,15 @@ router.get("/", (_req: Request, res: Response) => {
       <div><div class="stat-val">${fylkerKjent.length}</div><div class="stat-lbl">Fylker dekket</div></div>
       <div><div class="stat-val">${stats.helfo_count.toLocaleString("nb")}</div><div class="stat-lbl">Med Helfo-avtale</div></div>
       <div><div class="stat-val">${stats.specialist_clinic_count.toLocaleString("nb")}</div><div class="stat-lbl">Spesialistklinikker</div></div>
+    </div>
+  </div>
+
+  <div class="proof-bar" aria-label="Trafikk">
+    <div class="proof-inner">
+      <div><div class="proof-val">${traffic.pageViews.toLocaleString("nb")}</div><div class="proof-lbl">Sidevisninger</div></div>
+      <div><div class="proof-val">${traffic.uniqueVisitors.toLocaleString("nb")}</div><div class="proof-lbl">Unike besøkende</div></div>
+      <div><div class="proof-val">${traffic.realHumans.toLocaleString("nb")}</div><div class="proof-lbl">Ekte mennesker</div></div>
+      <div><div class="proof-val proof-val-muted">${traffic.botAndAi.toLocaleString("nb")}</div><div class="proof-lbl">Bot & AI-trafikk</div></div>
     </div>
   </div>
 
@@ -767,6 +786,21 @@ const SPECIALTIES = [
   "oral protetikk",
   "kjeve- og ansiktsradiologi",
 ];
+
+// ═══════════════════════════════════════════════════════════
+// GET /api/traffic-stats — Public dental traffic stats
+// ═══════════════════════════════════════════════════════════
+
+router.get("/api/traffic-stats", (_req: Request, res: Response) => {
+  const s = getTrafficStats("dental");
+  res.json({
+    pageViews: s.pageViews,
+    uniqueVisitors: s.uniqueVisitors,
+    realHumans: s.realHumans,
+    botAndAi: s.botAndAi,
+    aiQueries: s.aiQueries,
+  });
+});
 
 router.get("/sok", (req: Request, res: Response) => {
   const PAGE_SIZE = 50;
