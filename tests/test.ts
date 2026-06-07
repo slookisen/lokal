@@ -2115,6 +2115,36 @@ function prov(value: string, source_type: string): ProvenanceRecord {
   assertEq(r2.conflict!.severity, "major", "cs: business_status disagreement → severity=major");
 }
 
+// 10b. PR-126: business_status "active" vs "OPERATIONAL" → synonyms → agree=true
+{
+  const r = crossSourceAgreement(
+    {
+      business_status: [
+        prov("active", "google_places"),
+        prov("OPERATIONAL", "homepage"),
+      ],
+    },
+    "business_status"
+  );
+  assertEq(r.agree, true, "cs: business_status active vs OPERATIONAL synonyms → agree=true (PR-126)");
+  assertEq(r.verdict, "pool_eligible", "cs: active/OPERATIONAL → pool_eligible (PR-126)");
+  assertTrue(!r.conflict, "cs: active/OPERATIONAL → no conflict (PR-126)");
+}
+// 10c. PR-126: closure synonyms collapse; open vs closed still conflicts
+{
+  const open = crossSourceAgreement(
+    { business_status: [prov("open", "google_places"), prov("active", "brreg")] },
+    "business_status"
+  );
+  assertEq(open.agree, true, "cs: business_status open vs active synonyms → agree=true (PR-126)");
+  const conflict = crossSourceAgreement(
+    { business_status: [prov("operational", "google_places"), prov("permanently_closed", "brreg")] },
+    "business_status"
+  );
+  assertEq(conflict.agree, false, "cs: operational vs permanently_closed → agree=false (PR-126)");
+  assertEq(conflict.conflict!.severity, "major", "cs: operational vs closed → major (PR-126)");
+}
+
 // 11. Tier-C only sources (aggregator + instagram) → agree=false even if they agree
 {
   const r = crossSourceAgreement(
@@ -2448,6 +2478,28 @@ console.log("\n── cross-source-validator: domainCoherenceCheck ──");
   // Negative: non-whitelisted host with mismatch still flagged (Eidsmo protection preserved)
   const r = domainCoherenceCheck("https://eidsmokjott.no/", "https://slakthuset.no", "post@slakthuset.no");
   assertEq(r.coherent, false, "dc: non-whitelisted mismatch still flagged after PR-81 (Eidsmo protection preserved)");
+}
+
+// PR-126: hyphen/separator-insensitive domain equivalence (Lia Gard fix)
+{
+  // Email at a hyphenated alias of the agent's own domain → coherent
+  const r = domainCoherenceCheck("https://liagard.no/", "https://liagard.no", "post@lia-gard.no");
+  assertEq(r.coherent, true, "dc: lia-gard.no email vs liagard.no site → coherent (PR-126 hyphen-insensitive)");
+}
+{
+  // Hyphen variance on the website side too → coherent
+  const r = domainCoherenceCheck("https://lia-gard.no/", "https://liagard.no", "post@liagard.no");
+  assertEq(r.coherent, true, "dc: lia-gard.no agent vs liagard.no website → coherent (PR-126)");
+}
+{
+  // Regression guard: genuinely different companies still flagged after PR-126
+  const r = domainCoherenceCheck("https://eidsmokjott.no/", "https://eidsmokjott.no", "post@slakthuset.no");
+  assertEq(r.coherent, false, "dc: eidsmokjott site + slakthuset email still incoherent (PR-126 preserves Eidsmo email gate)");
+}
+{
+  // Regression guard: website mismatch between different entities still flagged
+  const r = domainCoherenceCheck("https://eidsmokjott.no/", "https://slakthuset.no", "post@eidsmokjott.no");
+  assertEq(r.coherent, false, "dc: eidsmokjott agent vs slakthuset website still incoherent (PR-126)");
 }
 
 // ── WO-16: Integration tests (runVerifierBatch with cross-source gate) ───────
