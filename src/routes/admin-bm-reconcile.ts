@@ -1,4 +1,4 @@
-// ─── Admin: bondensmarked.no canonical reconcile (orchestrator PR-123) ────────
+// ─── Admin: bondensmarked.no canonical reconcile (orchestrator PR-123/PR-124) ──
 //
 // GET /admin/bm-reconcile
 //
@@ -6,9 +6,16 @@
 //   BM lokallag umbrella agents. REPORT ONLY — read-only diagnostics.
 //   The orchestrator / Daniel acts on the output manually.
 //
+// GET /admin/bm-reconcile?detail=<slug>
+//
+//   When ?detail=<slug> is provided, additionally fetches the per-lokallag
+//   detail page for that slug and includes parsed market-day times + full
+//   markedsplasser list. Use this to verify times/counts against what we store.
+//   Still READ-ONLY — no mutations.
+//
 // Auth: X-Admin-Key (same key used by /admin/bm-events and /admin/runs).
 //
-// Response shape:
+// Response shape (base):
 //   {
 //     fetched_at: ISO string,
 //     canonical: BmLokallag[],           // 14 entries from bondensmarked.no
@@ -18,6 +25,7 @@
 //     name_mismatches:   NameMismatch[], // same slug, different display name
 //     count_deltas:      CountDelta[],   // canonical vs ours numeric counts
 //     deviations:        Deviation[],    // upcoming-event count vs canonical markeder
+//     detail?:           BmLokallagDetail, // only when ?detail=<slug> supplied
 //   }
 //
 // TODO (daily skill): call GET /admin/bm-reconcile and include `deviations`
@@ -27,7 +35,12 @@
 
 import { Router, Request, Response } from "express";
 import { getDb } from "../database/init";
-import { fetchBmLokallag, BmLokallag } from "../services/bondensmarked-source";
+import {
+  fetchBmLokallag,
+  fetchBmLokallagDetail,
+  BmLokallag,
+  BmLokallagDetail,
+} from "../services/bondensmarked-source";
 
 const router = Router();
 
@@ -280,6 +293,28 @@ router.get("/", async (req: Request, res: Response) => {
       return !matchedBySlug && !matchedByName;
     });
 
+    // 6. Optional per-lokallag detail (read-only diagnostic)
+    // Triggered by ?detail=<slug> — fetches the canonical detail page and returns
+    // real market-day times + the full markedsplasser list for verification.
+    // TODO PR-125: the daily bm-events-scraper should consume fetchBmLokallagDetail()
+    //   here to auto-correct event times and auto-create the full markedsplasser set.
+    let detail: BmLokallagDetail | undefined;
+    const detailSlug = typeof req.query.detail === "string" ? req.query.detail.trim() : "";
+    if (detailSlug) {
+      try {
+        detail = await fetchBmLokallagDetail(detailSlug);
+      } catch (err: any) {
+        // Non-fatal: include error info in the response rather than 500ing the whole endpoint
+        console.warn("[bm-reconcile] detail fetch failed:", err?.message || String(err));
+        detail = {
+          slug: detailSlug,
+          markedsplasser: [],
+          marketDays: [],
+          produsenter: undefined,
+        };
+      }
+    }
+
     res.json({
       fetched_at: new Date().toISOString(),
       national_umbrella_id: national?.id ?? null,
@@ -290,6 +325,7 @@ router.get("/", async (req: Request, res: Response) => {
       name_mismatches,
       count_deltas,
       deviations,
+      ...(detail !== undefined ? { detail } : {}),
     });
   } catch (err: any) {
     res.status(500).json({
