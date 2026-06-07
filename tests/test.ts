@@ -13644,6 +13644,76 @@ console.log("\n── PR-109: finn-tannlege SSR + store extensions ──");
     "pr111-02: case-insensitive canonical match keeps Oslo + tr\u00f8ndelag");
 }
 
+// ── PR-125: BM slug guard + lokallag-fasit time correction ───────────────────
+console.log("\n── PR-125: bondensmarked slug guard + time correction ──");
+{
+  const { isValidLokallagSlug } = require("../src/services/bondensmarked-source");
+  assertEq(isValidLokallagSlug("agder"), true, "pr125: valid slug 'agder'");
+  assertEq(isValidLokallagSlug("oslo-og-omegn"), true, "pr125: valid hyphenated slug");
+  assertEq(isValidLokallagSlug("../etc/passwd"), false, "pr125: path-traversal slug rejected");
+  assertEq(isValidLokallagSlug("a b"), false, "pr125: slug with space rejected");
+  assertEq(isValidLokallagSlug("UPPER"), false, "pr125: uppercase slug rejected");
+  assertEq(isValidLokallagSlug(""), false, "pr125: empty slug rejected");
+  assertEq(isValidLokallagSlug("x?lokallag=y"), false, "pr125: query-string slug rejected");
+}
+{
+  const { spliceTimeOfDay } = require("../src/services/bm-events-scraper");
+  assertEq(spliceTimeOfDay("2026-07-04T08:00:00+00:00", "10:00"), "2026-07-04T10:00:00+00:00", "pr125: splice keeps seconds+offset");
+  assertEq(spliceTimeOfDay("2026-07-04T08:00:00+02:00", "10:00"), "2026-07-04T10:00:00+02:00", "pr125: splice preserves +02:00 offset");
+  assertEq(spliceTimeOfDay("2026-07-04T08:00", "15:00"), "2026-07-04T15:00", "pr125: splice on short HH:MM form");
+  assertEq(spliceTimeOfDay("2026-07-04", "10:00"), null, "pr125: date-only input -> null (no time fabricated)");
+  assertEq(spliceTimeOfDay("2026-07-04T08:00:00Z", "bad"), null, "pr125: bad hhmm -> null");
+  assertEq(spliceTimeOfDay(null, "10:00"), null, "pr125: null input -> null");
+}
+{
+  // DB mutation test — capture/restore the shared test DB so we leave global state
+  // exactly as found (avoids racing the other async test blocks).
+  const Database = require("better-sqlite3");
+  const initMod = require("../src/database/init");
+  const { applyMarketDayTimeCorrections } = require("../src/services/bm-events-scraper");
+  let prevDb: any = null;
+  try { prevDb = initMod.getDb(); } catch { prevDb = null; }
+  const db = new Database(":memory:");
+  db.exec(`CREATE TABLE bm_market_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT, venue_agent_id TEXT NOT NULL,
+    event_slug TEXT UNIQUE NOT NULL, event_name TEXT NOT NULL, location_text TEXT,
+    start_at TEXT NOT NULL, end_at TEXT, source_url TEXT NOT NULL,
+    scraped_at TEXT DEFAULT (datetime('now')));`);
+  db.prepare("INSERT INTO bm_market_events (venue_agent_id,event_slug,event_name,location_text,start_at,end_at,source_url) VALUES (?,?,?,?,?,?,?)")
+    .run("ven-1","torvet-i-arendal-2026-07-04","Torvet i Arendal","Arendal","2026-07-04T08:00:00+00:00","2026-07-04T13:00:00+00:00","u");
+  initMod.__setDbForTesting(db);
+  const md = [
+    { date:"2026-07-04", eventSlug:"torvet-i-arendal-2026-07-04", place:"Arendal", startTime:"10:00", endTime:"15:00" },
+    { date:"2026-07-11", eventSlug:"missing-2026-07-11", place:"X", startTime:"10:00", endTime:"15:00" },
+  ];
+  const r = applyMarketDayTimeCorrections(md);
+  assertEq(r.checked, 2, "pr125: checked both market days");
+  assertEq(r.corrected, 1, "pr125: corrected the one matching event_slug");
+  assertEq(r.skipped_no_row, 1, "pr125: skipped the non-matching slug (no insert)");
+  const row = db.prepare("SELECT start_at, end_at FROM bm_market_events WHERE event_slug=?").get("torvet-i-arendal-2026-07-04") as any;
+  assertEq(row.start_at, "2026-07-04T10:00:00+00:00", "pr125: start time corrected 08->10 (date+offset preserved)");
+  assertEq(row.end_at, "2026-07-04T15:00:00+00:00", "pr125: end time corrected 13->15");
+  const before = db.prepare("SELECT COUNT(*) c FROM bm_market_events").get() as any;
+  const r2 = applyMarketDayTimeCorrections(md);
+  assertEq(r2.corrected, 0, "pr125: second run corrects nothing (idempotent)");
+  const after = db.prepare("SELECT COUNT(*) c FROM bm_market_events").get() as any;
+  assertEq(after.c, before.c, "pr125: correction never inserts/deletes rows");
+  if (prevDb) initMod.__setDbForTesting(prevDb);
+}
+const _pr125Promise = (async () => {
+  const { parseBmLokallagDetailHtml } = require("../src/services/bondensmarked-source");
+  const html = `<a href="/markeder/torvet-i-arendal-2026-07-04" class="card">
+    <p class="text-base font-bold text-muted-foreground">10:00<!-- --> &#8211; <!-- -->15:00</p>
+    <h3 class="font-semibold tracking-tight line-clamp-1 text-lg">Torvet i Arendal</h3>
+    <span class="line-clamp-1">Arendal - Torvet, ARENDAL</span></a>`;
+  const detail = await parseBmLokallagDetailHtml("agder", html, "<html></html>");
+  const day = detail.marketDays.find((d: any) => d.date === "2026-07-04");
+  assertTrue(!!day, "pr125: parser found the 2026-07-04 market day");
+  assertEq(day?.eventSlug, "torvet-i-arendal-2026-07-04", "pr125: parser captured full eventSlug from /markeder href");
+  assertEq(day?.startTime, "10:00", "pr125: parser captured startTime 10:00");
+  assertEq(day?.endTime, "15:00", "pr125: parser captured endTime 15:00");
+})();
+
 // ── REPORT ────────────────────────────────────────────────────────────
 
 // Wait for the M2 owner-portal async tests before reporting so their
@@ -13671,6 +13741,7 @@ console.log("\n── PR-109: finn-tannlege SSR + store extensions ──");
   try { await _pr103Promise; } catch { /* errors already pushed to failures */ }
   try { await _pr106Promise; } catch { /* errors already pushed to failures */ }
   try { await _pr110Promise; } catch { /* errors already pushed to failures */ }
+  try { await _pr125Promise; } catch { /* errors already pushed to failures */ }
   // PR-109 tests are synchronous (IIFE) — no promise needed
   // Drop pre-existing intg failures (unmasked by awaiting) — they predate M2
   // and live behind a separate fix-it task. Counting them here would surface

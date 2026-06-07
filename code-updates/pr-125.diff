@@ -1,0 +1,342 @@
+diff --git a/src/routes/admin-bm-events.ts b/src/routes/admin-bm-events.ts
+index 9025a9b..0e88ea3 100644
+--- a/src/routes/admin-bm-events.ts
++++ b/src/routes/admin-bm-events.ts
+@@ -40,14 +40,15 @@ function requireAdmin(req: Request, res: Response): boolean {
+ router.post("/scrape", async (req: Request, res: Response) => {
+   if (!requireAdmin(req, res)) return;
+ 
+-  const body = (req.body || {}) as { maxEvents?: number; useRenderWorker?: boolean };
++  const body = (req.body || {}) as { maxEvents?: number; useRenderWorker?: boolean; correctTimes?: boolean };
+   const maxEvents = typeof body.maxEvents === "number" && body.maxEvents > 0
+     ? Math.min(body.maxEvents, 1000)
+     : undefined;
+   const useRenderWorker = body.useRenderWorker === true;
++  const correctTimes = body.correctTimes !== false; // PR-125: default on
+ 
+   try {
+-    const result = await runBmEventsScraper({ maxEvents, useRenderWorker });
++    const result = await runBmEventsScraper({ maxEvents, useRenderWorker, correctTimes });
+     res.json({ success: true, ...result });
+   } catch (err: any) {
+     res.status(500).json({
+diff --git a/src/routes/admin-bm-reconcile.ts b/src/routes/admin-bm-reconcile.ts
+index 0ab8d0a..d543fc6 100644
+--- a/src/routes/admin-bm-reconcile.ts
++++ b/src/routes/admin-bm-reconcile.ts
+@@ -38,6 +38,7 @@ import { getDb } from "../database/init";
+ import {
+   fetchBmLokallag,
+   fetchBmLokallagDetail,
++  isValidLokallagSlug,
+   BmLokallag,
+   BmLokallagDetail,
+ } from "../services/bondensmarked-source";
+@@ -300,6 +301,11 @@ router.get("/", async (req: Request, res: Response) => {
+     //   here to auto-correct event times and auto-create the full markedsplasser set.
+     let detail: BmLokallagDetail | undefined;
+     const detailSlug = typeof req.query.detail === "string" ? req.query.detail.trim() : "";
++    if (detailSlug && !isValidLokallagSlug(detailSlug)) {
++      // PR-125: defense-in-depth — reject malformed slugs at the route boundary
++      // (fetchBmLokallagDetail also guards, but fail fast with a 400 here).
++      return res.status(400).json({ error: "invalid detail slug (expected ^[a-z0-9][a-z0-9-]{0,60}$)" });
++    }
+     if (detailSlug) {
+       try {
+         detail = await fetchBmLokallagDetail(detailSlug);
+diff --git a/src/services/bm-events-scraper.ts b/src/services/bm-events-scraper.ts
+index 8158096..37e3bde 100644
+--- a/src/services/bm-events-scraper.ts
++++ b/src/services/bm-events-scraper.ts
+@@ -32,6 +32,12 @@
+ 
+ import { getDb } from "../database/init";
+ import { renderPage } from "./render-client";
++import {
++  fetchBmLokallag,
++  fetchBmLokallagDetail,
++  isValidLokallagSlug,
++  type BmMarketDay,
++} from "./bondensmarked-source";
+ import { normaliseForMatch, normaliseBmLocation } from "./name-matcher";
+ import { slugify } from "../utils/slug";
+ import { v4 as uuid } from "uuid";
+@@ -71,6 +77,10 @@ export type ScrapeResult = {
+   auto_created_bm_venue: number;
+   unmatched: number;
+   upserted: number;
++  /** PR-125: bm_market_events rows whose times were checked against the lokallag fasit. */
++  event_times_checked: number;
++  /** PR-125: bm_market_events rows whose start/end times were corrected from the fasit. */
++  event_times_corrected: number;
+   errors: string[];
+ };
+ 
+@@ -398,9 +408,11 @@ export async function getOrCreateBmVenueAgent(
+ export async function runBmEventsScraper(opts?: {
+   maxEvents?: number;
+   useRenderWorker?: boolean;
++  correctTimes?: boolean;
+ }): Promise<ScrapeResult> {
+   const maxEvents = opts?.maxEvents ?? 600;
+   const useRenderWorker = opts?.useRenderWorker ?? false;
++  const correctTimes = opts?.correctTimes ?? true;
+ 
+   const result: ScrapeResult = {
+     fetched: 0,
+@@ -410,6 +422,8 @@ export async function runBmEventsScraper(opts?: {
+     auto_created_bm_venue: 0,
+     unmatched: 0,
+     upserted: 0,
++    event_times_checked: 0,
++    event_times_corrected: 0,
+     errors: [],
+   };
+ 
+@@ -495,9 +509,143 @@ export async function runBmEventsScraper(opts?: {
+     }
+   }
+ 
++  // ── PR-125: correct stored event times from the lokallag fasit ──
++  // bondensmarked.no/lokallag detail pages are Daniel-declared source of truth
++  // for market-day times (Randi: shown 08:00-13:00, real 10:00-15:00/17:00).
++  // The per-event JSON-LD can carry stale times, so after upserting we splice
++  // the fasit HH:MM onto matching rows (joined by event_slug; idempotent —
++  // only writes when the time actually differs). Never inserts/deletes.
++  if (correctTimes) {
++    try {
++      const corr = await correctEventTimesFromCanonical({ useRenderWorker });
++      result.event_times_checked = corr.checked;
++      result.event_times_corrected = corr.corrected;
++      if (corr.errors.length) {
++        result.errors.push(...corr.errors.slice(0, 20).map((e) => `time-correct: ${e}`));
++      }
++    } catch (e) {
++      result.errors.push(`time-correction step failed: ${e instanceof Error ? e.message : String(e)}`);
++    }
++  }
++
+   return result;
+ }
+ 
++// ─── PR-125: lokallag-fasit time correction ─────────────────────────────────
++
++/**
++ * Replace the HH:MM time-of-day in an ISO-like timestamp while preserving the
++ * date, any seconds, and the timezone offset. Returns null when the input has
++ * no parseable `YYYY-MM-DDTHH:MM` component, so we never fabricate a time onto
++ * a date-only or malformed value.
++ *
++ * LOAD-BEARING ASSUMPTION: the stored `start_at` (raw BM per-event JSON-LD
++ * `startDate`) and the lokallag-detail fasit HH:MM express the SAME wall-clock
++ * local time. We swap only HH:MM and keep the original offset verbatim, so the
++ * two stay internally consistent. If BM ever changes its JSON-LD to emit true
++ * UTC while the detail page keeps wall-clock, this would write a skewed time —
++ * the date-match guard in applyMarketDayTimeCorrections bounds the blast radius
++ * (a day shift would be skipped), but a same-day hour skew would not be caught.
++ */
++export function spliceTimeOfDay(existing: string | null | undefined, hhmm: string): string | null {
++  if (!existing || !/^\d{2}:\d{2}$/.test(hhmm)) return null;
++  const m = /^(\d{4}-\d{2}-\d{2}T)\d{2}:\d{2}(.*)$/.exec(existing);
++  if (!m) return null;
++  return `${m[1]}${hhmm}${m[2]}`;
++}
++
++export type BmTimeCorrectionResult = {
++  checked: number;
++  corrected: number;
++  skipped_no_row: number;
++  /** PR-125: rows whose stored date != the fasit market-day date (collision guard; never written). */
++  skipped_date_mismatch: number;
++  errors: string[];
++};
++
++/**
++ * Apply fasit market-day times onto existing bm_market_events rows, joined by
++ * event_slug (UNIQUE natural key). Idempotent: only UPDATEs when the spliced
++ * time differs. Pure mutation on existing rows — never inserts or deletes.
++ * Testable directly with an in-memory DB (no network).
++ */
++export function applyMarketDayTimeCorrections(marketDays: BmMarketDay[]): BmTimeCorrectionResult {
++  const db = getDb();
++  const sel = db.prepare("SELECT start_at, end_at FROM bm_market_events WHERE event_slug = ?");
++  const upd = db.prepare("UPDATE bm_market_events SET start_at = ?, end_at = ? WHERE event_slug = ?");
++  const res: BmTimeCorrectionResult = { checked: 0, corrected: 0, skipped_no_row: 0, skipped_date_mismatch: 0, errors: [] };
++  // Wrap the batch in a single transaction — all-or-nothing, and faster than N
++  // autocommits. better-sqlite3 transactions are synchronous (this fn is sync).
++  const applyAll = db.transaction((days: BmMarketDay[]) => {
++    for (const md of days) {
++      if (!md.eventSlug || !md.startTime) continue;
++      res.checked++;
++      try {
++        const row = sel.get(md.eventSlug) as { start_at: string; end_at: string | null } | undefined;
++        if (!row) { res.skipped_no_row++; continue; }
++        // Date-match guard: only ever correct a row whose stored calendar date
++        // equals the fasit market-day date. event_slug already encodes the date,
++        // so a mismatch means a slug collision / unexpected data — skip, never write.
++        if (md.date && row.start_at.slice(0, 10) !== md.date) { res.skipped_date_mismatch++; continue; }
++        const newStart = spliceTimeOfDay(row.start_at, md.startTime) ?? row.start_at;
++        // end_at: when the fasit has an end time we splice it onto the existing
++        // end (or the start's date if end_at is null). Daytime markets never cross
++        // midnight, so deriving the end date from the start date is safe here.
++        const newEnd = md.endTime
++          ? (spliceTimeOfDay(row.end_at ?? row.start_at, md.endTime) ?? row.end_at)
++          : row.end_at;
++        if (newStart !== row.start_at || newEnd !== row.end_at) {
++          upd.run(newStart, newEnd, md.eventSlug);
++          res.corrected++;
++        }
++      } catch (e) {
++        res.errors.push(`${md.eventSlug}: ${e instanceof Error ? e.message : String(e)}`);
++      }
++    }
++  });
++  applyAll(marketDays);
++  return res;
++}
++
++/**
++ * Daily-scraper step: fetch the lokallag index + each lokallag detail page
++ * (the fasit) and apply time corrections to stored events. Live-fetch — not
++ * unit-tested (sandbox-restricted); the pure DB step above carries the tests.
++ */
++export async function correctEventTimesFromCanonical(
++  opts?: { useRenderWorker?: boolean }
++): Promise<{ lokallag_processed: number; checked: number; corrected: number; errors: string[] }> {
++  void opts; // reserved (render-worker fallback not needed for server-side fetch)
++  const out = { lokallag_processed: 0, checked: 0, corrected: 0, errors: [] as string[] };
++  let lokallag: Awaited<ReturnType<typeof fetchBmLokallag>>;
++  try {
++    lokallag = await fetchBmLokallag();
++  } catch (e) {
++    out.errors.push(`fetchBmLokallag failed: ${e instanceof Error ? e.message : String(e)}`);
++    return out;
++  }
++  for (const lok of lokallag) {
++    if (!isValidLokallagSlug(lok.slug)) {
++      out.errors.push(`skip invalid slug: ${JSON.stringify(lok.slug)}`);
++      continue;
++    }
++    try {
++      const detail = await fetchBmLokallagDetail(lok.slug);
++      const r = applyMarketDayTimeCorrections(detail.marketDays);
++      out.lokallag_processed++;
++      // Polite ~150ms gap between lokallag so the ~14 detail (+ markedsplasser)
++      // fetches don't burst bondensmarked.no within one scrape cycle.
++      await new Promise((resolve) => setTimeout(resolve, 150));
++      out.checked += r.checked;
++      out.corrected += r.corrected;
++      if (r.errors.length) out.errors.push(...r.errors);
++    } catch (e) {
++      out.errors.push(`detail(${lok.slug}): ${e instanceof Error ? e.message : String(e)}`);
++    }
++  }
++  return out;
++}
++
+ // ─── helpers ────────────────────────────────────────────────────
+ 
+ async function fetchHtml(url: string): Promise<string> {
+diff --git a/src/services/bondensmarked-source.ts b/src/services/bondensmarked-source.ts
+index 309b099..a570feb 100644
+--- a/src/services/bondensmarked-source.ts
++++ b/src/services/bondensmarked-source.ts
+@@ -45,6 +45,14 @@ const BM_BASE_URL = "https://bondensmarked.no";
+ const BM_LOKALLAG_URL = `${BM_BASE_URL}/lokallag`;
+ const FETCH_TIMEOUT_MS = 15_000;
+ 
++// PR-125: lokallag slugs are interpolated into bondensmarked.no URLs. Validate
++// before any fetch to prevent path-traversal / URL injection once the daily
++// scraper starts calling fetchBmLokallagDetail() with slugs from the index page.
++const LOKALLAG_SLUG_RE = /^[a-z0-9][a-z0-9-]{0,60}$/;
++export function isValidLokallagSlug(slug: unknown): slug is string {
++  return typeof slug === "string" && LOKALLAG_SLUG_RE.test(slug);
++}
++
+ // ─── Public interfaces ────────────────────────────────────────────────────────
+ 
+ export interface BmLokallag {
+@@ -76,6 +84,13 @@ export interface BmLokallag {
+ export interface BmMarketDay {
+   /** ISO date string, e.g. "2026-07-04" — extracted from the /markeder/SLUG href. */
+   date: string;
++  /**
++   * PR-125: the full event slug from the /markeder/<slug> href, e.g.
++   * "torvet-i-arendal-2026-07-04". This is the UNIQUE natural key the
++   * bm-events scraper stores in bm_market_events.event_slug, so the daily
++   * time-correction step can join exactly (no fuzzy matching).
++   */
++  eventSlug?: string;
+   /**
+    * Market-place / venue name as shown, e.g. "Arendal - Torvet, ARENDAL".
+    * May include city suffix in all-caps separated by comma.
+@@ -246,6 +261,10 @@ export function parseBmLokallagHtml(html: string): BmLokallag[] {
+  * directly in tests/dev with a saved HTML string.
+  */
+ export async function fetchBmLokallagDetail(slug: string): Promise<BmLokallagDetail> {
++  // PR-125: reject malformed slugs before URL interpolation (path-traversal guard).
++  if (!isValidLokallagSlug(slug)) {
++    throw new Error(`fetchBmLokallagDetail: invalid lokallag slug ${JSON.stringify(slug)}`);
++  }
+   const url = `${BM_BASE_URL}/lokallag/${slug}`;
+   const html = await bmFetch(url);
+   return parseBmLokallagDetailHtml(slug, html);
+@@ -274,13 +293,14 @@ export async function parseBmLokallagDetailHtml(
+     // Each market event card is an <a href="/markeder/..."> anchor.
+     // We capture: ISO date from href, time string, title, and place in one pass.
+     const eventRe =
+-      /href="\/markeder\/[^"]*?(\d{4}-\d{2}-\d{2})"[^>]*>[\s\S]*?class="text-base font-bold text-muted-foreground">([\s\S]*?)<\/p>[\s\S]*?class="font-semibold tracking-tight line-clamp-1 text-lg">([\s\S]*?)<\/h3>[\s\S]*?class="line-clamp-1">([\s\S]*?)<\/span>/g;
++      /href="\/markeder\/([^"]*?(\d{4}-\d{2}-\d{2}))"[^>]*>[\s\S]*?class="text-base font-bold text-muted-foreground">([\s\S]*?)<\/p>[\s\S]*?class="font-semibold tracking-tight line-clamp-1 text-lg">([\s\S]*?)<\/h3>[\s\S]*?class="line-clamp-1">([\s\S]*?)<\/span>/g;
+     let em: RegExpExecArray | null;
+     while ((em = eventRe.exec(html)) !== null) {
+-      const date = em[1];
+-      const rawTime = em[2];
+-      const title = decodeHtmlEntities(stripHtmlTags(em[3]).trim());
+-      const place = decodeHtmlEntities(stripHtmlTags(em[4]).trim());
++      const eventSlug = em[1];
++      const date = em[2];
++      const rawTime = em[3];
++      const title = decodeHtmlEntities(stripHtmlTags(em[4]).trim());
++      const place = decodeHtmlEntities(stripHtmlTags(em[5]).trim());
+ 
+       // Extract HH:MM times — strips React HTML comments (<!-- -->) reliably
+       const times = rawTime.match(/\d{2}:\d{2}/g) ?? [];
+@@ -288,7 +308,7 @@ export async function parseBmLokallagDetailHtml(
+       const endTime = times[1];
+ 
+       if (!date) continue; // paranoia guard
+-      marketDays.push({ date, place, startTime, endTime, title: title || undefined });
++      marketDays.push({ date, eventSlug, place, startTime, endTime, title: title || undefined });
+     }
+ 
+     if (marketDays.length === 0) {
+@@ -340,8 +360,9 @@ export async function parseBmLokallagDetailHtml(
+           markedsplasser = parseMpPreviewFromDetailHtml(html);
+           return { slug, markedsplasser, marketDays, produsenter };
+         }
+-        markedsplasser = parseMpListHtml(mpHtml);
+       }
++      // PR-125: single parse covers both the test override (fullMpHtml) and the
++      // live-fetch path; the earlier in-branch parse was dead (immediately overwritten).
+       markedsplasser = parseMpListHtml(mpHtml ?? fullMpHtml ?? "");
+       if (markedsplasser.length === 0) {
+         console.warn(`[bondensmarked-source] detail(${slug}): full markedsplasser list empty — falling back to preview`);
+@@ -404,14 +425,10 @@ function parseMpListHtml(html: string): string[] {
+  * Used as fallback when the full /markedsplasser?lokallag= fetch fails.
+  */
+ function parseMpPreviewFromDetailHtml(html: string): string[] {
+-  const names: string[] = [];
+-  const mpRe = /href="\/markedsplasser\/[^"]*"[\s\S]*?class="font-semibold leading-tight line-clamp-1">([\s\S]*?)<\/p>/g;
+-  let m: RegExpExecArray | null;
+-  while ((m = mpRe.exec(html)) !== null) {
+-    const name = decodeHtmlEntities(stripHtmlTags(m[1]).trim());
+-    if (name && !names.includes(name)) names.push(name);
+-  }
+-  return names;
++  // PR-125: the detail-page preview cards share the exact card structure as the
++  // full /markedsplasser?lokallag= list, so delegate to the shared parser
++  // instead of duplicating the regex (was byte-identical to parseMpListHtml).
++  return parseMpListHtml(html);
+ }
+ 
+ /** Strip HTML tags (for cleaning RSC-generated text fragments). */

@@ -32,6 +32,12 @@
 
 import { getDb } from "../database/init";
 import { renderPage } from "./render-client";
+import {
+  fetchBmLokallag,
+  fetchBmLokallagDetail,
+  isValidLokallagSlug,
+  type BmMarketDay,
+} from "./bondensmarked-source";
 import { normaliseForMatch, normaliseBmLocation } from "./name-matcher";
 import { slugify } from "../utils/slug";
 import { v4 as uuid } from "uuid";
@@ -71,6 +77,10 @@ export type ScrapeResult = {
   auto_created_bm_venue: number;
   unmatched: number;
   upserted: number;
+  /** PR-125: bm_market_events rows whose times were checked against the lokallag fasit. */
+  event_times_checked: number;
+  /** PR-125: bm_market_events rows whose start/end times were corrected from the fasit. */
+  event_times_corrected: number;
   errors: string[];
 };
 
@@ -398,9 +408,11 @@ export async function getOrCreateBmVenueAgent(
 export async function runBmEventsScraper(opts?: {
   maxEvents?: number;
   useRenderWorker?: boolean;
+  correctTimes?: boolean;
 }): Promise<ScrapeResult> {
   const maxEvents = opts?.maxEvents ?? 600;
   const useRenderWorker = opts?.useRenderWorker ?? false;
+  const correctTimes = opts?.correctTimes ?? true;
 
   const result: ScrapeResult = {
     fetched: 0,
@@ -410,6 +422,8 @@ export async function runBmEventsScraper(opts?: {
     auto_created_bm_venue: 0,
     unmatched: 0,
     upserted: 0,
+    event_times_checked: 0,
+    event_times_corrected: 0,
     errors: [],
   };
 
@@ -495,7 +509,141 @@ export async function runBmEventsScraper(opts?: {
     }
   }
 
+  // ── PR-125: correct stored event times from the lokallag fasit ──
+  // bondensmarked.no/lokallag detail pages are Daniel-declared source of truth
+  // for market-day times (Randi: shown 08:00-13:00, real 10:00-15:00/17:00).
+  // The per-event JSON-LD can carry stale times, so after upserting we splice
+  // the fasit HH:MM onto matching rows (joined by event_slug; idempotent —
+  // only writes when the time actually differs). Never inserts/deletes.
+  if (correctTimes) {
+    try {
+      const corr = await correctEventTimesFromCanonical({ useRenderWorker });
+      result.event_times_checked = corr.checked;
+      result.event_times_corrected = corr.corrected;
+      if (corr.errors.length) {
+        result.errors.push(...corr.errors.slice(0, 20).map((e) => `time-correct: ${e}`));
+      }
+    } catch (e) {
+      result.errors.push(`time-correction step failed: ${e instanceof Error ? e.message : String(e)}`);
+    }
+  }
+
   return result;
+}
+
+// ─── PR-125: lokallag-fasit time correction ─────────────────────────────────
+
+/**
+ * Replace the HH:MM time-of-day in an ISO-like timestamp while preserving the
+ * date, any seconds, and the timezone offset. Returns null when the input has
+ * no parseable `YYYY-MM-DDTHH:MM` component, so we never fabricate a time onto
+ * a date-only or malformed value.
+ *
+ * LOAD-BEARING ASSUMPTION: the stored `start_at` (raw BM per-event JSON-LD
+ * `startDate`) and the lokallag-detail fasit HH:MM express the SAME wall-clock
+ * local time. We swap only HH:MM and keep the original offset verbatim, so the
+ * two stay internally consistent. If BM ever changes its JSON-LD to emit true
+ * UTC while the detail page keeps wall-clock, this would write a skewed time —
+ * the date-match guard in applyMarketDayTimeCorrections bounds the blast radius
+ * (a day shift would be skipped), but a same-day hour skew would not be caught.
+ */
+export function spliceTimeOfDay(existing: string | null | undefined, hhmm: string): string | null {
+  if (!existing || !/^\d{2}:\d{2}$/.test(hhmm)) return null;
+  const m = /^(\d{4}-\d{2}-\d{2}T)\d{2}:\d{2}(.*)$/.exec(existing);
+  if (!m) return null;
+  return `${m[1]}${hhmm}${m[2]}`;
+}
+
+export type BmTimeCorrectionResult = {
+  checked: number;
+  corrected: number;
+  skipped_no_row: number;
+  /** PR-125: rows whose stored date != the fasit market-day date (collision guard; never written). */
+  skipped_date_mismatch: number;
+  errors: string[];
+};
+
+/**
+ * Apply fasit market-day times onto existing bm_market_events rows, joined by
+ * event_slug (UNIQUE natural key). Idempotent: only UPDATEs when the spliced
+ * time differs. Pure mutation on existing rows — never inserts or deletes.
+ * Testable directly with an in-memory DB (no network).
+ */
+export function applyMarketDayTimeCorrections(marketDays: BmMarketDay[]): BmTimeCorrectionResult {
+  const db = getDb();
+  const sel = db.prepare("SELECT start_at, end_at FROM bm_market_events WHERE event_slug = ?");
+  const upd = db.prepare("UPDATE bm_market_events SET start_at = ?, end_at = ? WHERE event_slug = ?");
+  const res: BmTimeCorrectionResult = { checked: 0, corrected: 0, skipped_no_row: 0, skipped_date_mismatch: 0, errors: [] };
+  // Wrap the batch in a single transaction — all-or-nothing, and faster than N
+  // autocommits. better-sqlite3 transactions are synchronous (this fn is sync).
+  const applyAll = db.transaction((days: BmMarketDay[]) => {
+    for (const md of days) {
+      if (!md.eventSlug || !md.startTime) continue;
+      res.checked++;
+      try {
+        const row = sel.get(md.eventSlug) as { start_at: string; end_at: string | null } | undefined;
+        if (!row) { res.skipped_no_row++; continue; }
+        // Date-match guard: only ever correct a row whose stored calendar date
+        // equals the fasit market-day date. event_slug already encodes the date,
+        // so a mismatch means a slug collision / unexpected data — skip, never write.
+        if (md.date && row.start_at.slice(0, 10) !== md.date) { res.skipped_date_mismatch++; continue; }
+        const newStart = spliceTimeOfDay(row.start_at, md.startTime) ?? row.start_at;
+        // end_at: when the fasit has an end time we splice it onto the existing
+        // end (or the start's date if end_at is null). Daytime markets never cross
+        // midnight, so deriving the end date from the start date is safe here.
+        const newEnd = md.endTime
+          ? (spliceTimeOfDay(row.end_at ?? row.start_at, md.endTime) ?? row.end_at)
+          : row.end_at;
+        if (newStart !== row.start_at || newEnd !== row.end_at) {
+          upd.run(newStart, newEnd, md.eventSlug);
+          res.corrected++;
+        }
+      } catch (e) {
+        res.errors.push(`${md.eventSlug}: ${e instanceof Error ? e.message : String(e)}`);
+      }
+    }
+  });
+  applyAll(marketDays);
+  return res;
+}
+
+/**
+ * Daily-scraper step: fetch the lokallag index + each lokallag detail page
+ * (the fasit) and apply time corrections to stored events. Live-fetch — not
+ * unit-tested (sandbox-restricted); the pure DB step above carries the tests.
+ */
+export async function correctEventTimesFromCanonical(
+  opts?: { useRenderWorker?: boolean }
+): Promise<{ lokallag_processed: number; checked: number; corrected: number; errors: string[] }> {
+  void opts; // reserved (render-worker fallback not needed for server-side fetch)
+  const out = { lokallag_processed: 0, checked: 0, corrected: 0, errors: [] as string[] };
+  let lokallag: Awaited<ReturnType<typeof fetchBmLokallag>>;
+  try {
+    lokallag = await fetchBmLokallag();
+  } catch (e) {
+    out.errors.push(`fetchBmLokallag failed: ${e instanceof Error ? e.message : String(e)}`);
+    return out;
+  }
+  for (const lok of lokallag) {
+    if (!isValidLokallagSlug(lok.slug)) {
+      out.errors.push(`skip invalid slug: ${JSON.stringify(lok.slug)}`);
+      continue;
+    }
+    try {
+      const detail = await fetchBmLokallagDetail(lok.slug);
+      const r = applyMarketDayTimeCorrections(detail.marketDays);
+      out.lokallag_processed++;
+      // Polite ~150ms gap between lokallag so the ~14 detail (+ markedsplasser)
+      // fetches don't burst bondensmarked.no within one scrape cycle.
+      await new Promise((resolve) => setTimeout(resolve, 150));
+      out.checked += r.checked;
+      out.corrected += r.corrected;
+      if (r.errors.length) out.errors.push(...r.errors);
+    } catch (e) {
+      out.errors.push(`detail(${lok.slug}): ${e instanceof Error ? e.message : String(e)}`);
+    }
+  }
+  return out;
 }
 
 // ─── helpers ────────────────────────────────────────────────────

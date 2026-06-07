@@ -38,6 +38,7 @@ import { getDb } from "../database/init";
 import {
   fetchBmLokallag,
   fetchBmLokallagDetail,
+  isValidLokallagSlug,
   BmLokallag,
   BmLokallagDetail,
 } from "../services/bondensmarked-source";
@@ -300,6 +301,11 @@ router.get("/", async (req: Request, res: Response) => {
     //   here to auto-correct event times and auto-create the full markedsplasser set.
     let detail: BmLokallagDetail | undefined;
     const detailSlug = typeof req.query.detail === "string" ? req.query.detail.trim() : "";
+    if (detailSlug && !isValidLokallagSlug(detailSlug)) {
+      // PR-125: defense-in-depth — reject malformed slugs at the route boundary
+      // (fetchBmLokallagDetail also guards, but fail fast with a 400 here).
+      return res.status(400).json({ error: "invalid detail slug (expected ^[a-z0-9][a-z0-9-]{0,60}$)" });
+    }
     if (detailSlug) {
       try {
         detail = await fetchBmLokallagDetail(detailSlug);

@@ -40,14 +40,15 @@ function requireAdmin(req: Request, res: Response): boolean {
 router.post("/scrape", async (req: Request, res: Response) => {
   if (!requireAdmin(req, res)) return;
 
-  const body = (req.body || {}) as { maxEvents?: number; useRenderWorker?: boolean };
+  const body = (req.body || {}) as { maxEvents?: number; useRenderWorker?: boolean; correctTimes?: boolean };
   const maxEvents = typeof body.maxEvents === "number" && body.maxEvents > 0
     ? Math.min(body.maxEvents, 1000)
     : undefined;
   const useRenderWorker = body.useRenderWorker === true;
+  const correctTimes = body.correctTimes !== false; // PR-125: default on
 
   try {
-    const result = await runBmEventsScraper({ maxEvents, useRenderWorker });
+    const result = await runBmEventsScraper({ maxEvents, useRenderWorker, correctTimes });
     res.json({ success: true, ...result });
   } catch (err: any) {
     res.status(500).json({
