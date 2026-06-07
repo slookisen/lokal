@@ -1,0 +1,77 @@
+diff --git a/src/services/cross-source-validator.ts b/src/services/cross-source-validator.ts
+index 1385d1a..96b89f9 100644
+--- a/src/services/cross-source-validator.ts
++++ b/src/services/cross-source-validator.ts
+@@ -72,7 +72,27 @@ function normalizePhone(raw: string): string {
+ }
+ 
+ function normalizeBusinessStatus(raw: string): string {
+-  return raw.toLowerCase().trim();
++  const v = raw.toLowerCase().trim().replace(/[\s-]+/g, "_");
++  // PR-126: canonicalize business-status synonyms so that values describing
++  // the SAME real-world state compare equal. The recurring false positive
++  // (n=46 agents): Google-Places enrichment writes business_status
++  // "OPERATIONAL" while the is_active-synthesized provenance writes "active".
++  // Both mean "open for business" and both originate from google_places, yet
++  // a raw lowercase compare flagged them as a MAJOR conflict and forced
++  // review_required. PR-26 made business_status non-gating at the aggregate
++  // level, but the per-field conflict still surfaced to downstream consumers
++  // (enrichment worker, review-queue). Collapsing synonyms removes the
++  // phantom conflict at the source so every consumer agrees.
++  const OPEN = new Set(["active", "operational", "open", "open_now", "in_business", "aktiv"]);
++  const TEMP_CLOSED = new Set(["closed_temporarily", "temporarily_closed", "midlertidig_stengt"]);
++  const PERM_CLOSED = new Set([
++    "closed", "inactive", "closed_permanently", "permanently_closed",
++    "shut", "shutdown", "konkurs", "avviklet", "stengt",
++  ]);
++  if (OPEN.has(v)) return "operational";
++  if (TEMP_CLOSED.has(v)) return "closed_temporarily";
++  if (PERM_CLOSED.has(v)) return "closed_permanently";
++  return v;
+ }
+ 
+ function normalizeValue(fieldName: FieldName, value: string): string {
+@@ -436,6 +456,25 @@ function registrableDomain(host: string): string {
+   return lastTwo;
+ }
+ 
++// PR-126: hyphen/separator-insensitive registrable-domain equality. The
++// recurring false positive (n=38 agents): a producer whose homepage/website
++// is `liagard.no` but whose contact email is `post@lia-gard.no` (Lia Gard) —
++// the same company using a cosmetic hyphenated alias of its own domain. A
++// strict `!==` compare flagged this as distributor-misattribution and forced
++// review_required. Collapsing separators before comparison treats
++// `lia-gard.no` and `liagard.no` as the same registrable entity, while
++// genuinely different domains (slakthuset.no vs eidsmokjott.no — the Eidsmo
++// case) remain non-equivalent and stay gated.
++function collapseDomain(root: string): string {
++  // Strip hyphens from labels; keep dots (label/TLD separators) intact.
++  return root.replace(/-/g, "");
++}
++
++function domainsEquivalent(a: string, b: string): boolean {
++  if (a === b) return true;
++  return collapseDomain(a) === collapseDomain(b);
++}
++
+ export function domainCoherenceCheck(
+   agentUrl: string | null | undefined,
+   knowledgeWebsite: string | null | undefined,
+@@ -471,7 +510,7 @@ export function domainCoherenceCheck(
+   // Website check (stronger signal — checked first so it takes precedence).
+   if (websiteHost) {
+     const websiteRoot = registrableDomain(websiteHost);
+-    if (websiteRoot !== agentRoot) {
++    if (!domainsEquivalent(websiteRoot, agentRoot)) {
+       return {
+         coherent: false,
+         reason: `knowledge.website host ${websiteHost} != agents.url host ${agentHost}`,
+@@ -487,7 +526,7 @@ export function domainCoherenceCheck(
+   if (emailHost) {
+     if (!FREE_MAIL_DOMAINS.includes(emailHost)) {
+       const emailRoot = registrableDomain(emailHost);
+-      if (emailRoot !== agentRoot) {
++      if (!domainsEquivalent(emailRoot, agentRoot)) {
+         return {
+           coherent: false,
+           reason: `knowledge.email host ${emailHost} != agents.url host ${agentHost}`,
