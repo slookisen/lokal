@@ -3558,6 +3558,81 @@ const _pr24Promise = (async function runPr24Tests() {
         assertEq(threw, false, "pr28-4: dedupKey gracefully handles null/undefined/non-string fields");
       }
 
+      // ─── PR-127 (2026-06-08): replace-mode purges un-evictable garbage ──
+      // Option (a) from the 2026-06-08 enrichment report: a clean re-crawl
+      // can REPLACE a field's provenance so garbage sources (award text /
+      // prose mis-captured as address) are removed. Default stays merge.
+
+      // ── pr127-1: replace-mode drops existing garbage, keeps only incoming
+      {
+        const merged = adminKnowledgeMod.mergeFieldProvenance(
+          {
+            address: [
+              { value: "Nygårdsveien 10", source_type: "homepage", fetched_at: "t1" },
+              { value: "2023 Orkladal Ysteri bottom of page", source_type: "homepage", fetched_at: "t1" },
+            ],
+          },
+          {
+            address: {
+              sources: [
+                { source_type: "homepage", raw_value: "Nygårdsveien 10", captured_at: "t2" },
+                { source_type: "google_places", raw_value: "Nygårdsvegen 10, 7310", captured_at: "t2" },
+              ],
+            },
+          },
+          new Set(["address"]),
+        );
+        assertEq(merged.address.length, 2, "pr127-1: replace keeps only the 2 fresh sources (garbage purged)");
+        const vals = merged.address.map((r) => r.value).sort();
+        assertEq(vals[0], "Nygårdsveien 10", "pr127-1: clean homepage value retained");
+        assertEq(
+          merged.address.some((r) => r.value.includes("bottom of page")),
+          false,
+          "pr127-1: garbage 'bottom of page' source removed",
+        );
+      }
+
+      // ── pr127-2: replace only affects listed fields; others still merge
+      {
+        const merged = adminKnowledgeMod.mergeFieldProvenance(
+          {
+            address: [{ value: "OldAddr", source_type: "homepage", fetched_at: "t1" }],
+            phone: [{ value: "11111111", source_type: "homepage", fetched_at: "t1" }],
+          },
+          {
+            address: { sources: [{ source_type: "google_places", raw_value: "NewAddr", captured_at: "t2" }] },
+            phone: { sources: [{ source_type: "google_places", raw_value: "22222222", captured_at: "t2" }] },
+          },
+          new Set(["address"]),
+        );
+        // address replaced → only the new source
+        assertEq(merged.address.length, 1, "pr127-2: replaced field has only incoming source");
+        assertEq(merged.address[0].value, "NewAddr", "pr127-2: replaced field value is the fresh one");
+        // phone NOT in replace set → merged (old + new)
+        assertEq(merged.phone.length, 2, "pr127-2: non-replaced field still merges (old + new)");
+      }
+
+      // ── pr127-3: default (no replaceFields) is unchanged merge behaviour
+      {
+        const merged = adminKnowledgeMod.mergeFieldProvenance(
+          { address: [{ value: "X", source_type: "homepage", fetched_at: "t1" }] },
+          { address: { sources: [{ source_type: "google_places", raw_value: "Y", captured_at: "t2" }] } },
+        );
+        assertEq(merged.address.length, 2, "pr127-3: default still appends (backwards-compatible)");
+      }
+
+      // ── pr127-4: replace-field with NO incoming sources is a no-op (no purge)
+      {
+        const merged = adminKnowledgeMod.mergeFieldProvenance(
+          { address: [{ value: "KeepMe", source_type: "homepage", fetched_at: "t1" }] },
+          { phone: { sources: [{ source_type: "homepage", raw_value: "99999999", captured_at: "t2" }] } },
+          new Set(["address"]),
+        );
+        assertEq(merged.address.length, 1, "pr127-4: replace-listed field w/o incoming is preserved (no purge)");
+        assertEq(merged.address[0].value, "KeepMe", "pr127-4: existing address value untouched");
+        assertEq(merged.phone.length, 1, "pr127-4: unrelated incoming field still written");
+      }
+
       // ── pr28-5: dedupKey filters non-string value (e.g. null)
       {
         const r = adminKnowledgeMod.dedupKey({ value: null, source_type: "homepage" } as any);

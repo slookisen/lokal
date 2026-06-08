@@ -30,6 +30,13 @@
 //        { address: [{value, source_type, fetched_at, source_url?}, ...] }
 //      Matches what the validator reads. Either works.
 //
+// PR-127 (2026-06-08): replace-mode. Body may include provenance_replace_fields:
+//   string[] — for those fields the incoming sources REPLACE the existing
+//   provenance array instead of appending. This is option (a) from the
+//   2026-06-08 enrichment report: a clean re-crawl can purge garbage sources
+//   (award text / prose mis-captured as address/phone) that the additive merge
+//   could never evict. Default (omitted/empty) = merge, fully backwards-compatible.
+//
 // Merge semantics:
 //   - For each tracked field, append new sources to the existing array.
 //   - Dedupe by {source_type, normalised value}: same pair = no-op.
@@ -175,6 +182,7 @@ function isWellFormedRecord(r: unknown): r is ProvenanceRecord {
 export function mergeFieldProvenance(
   existing: Record<string, unknown>,
   incoming: IncomingProvenance,
+  replaceFields?: Set<string>,
 ): Record<string, ProvenanceRecord[]> {
   // Start from a shallow copy of existing — coerce legacy single-record
   // shape into arrays, then drop malformed entries (PR-28 defensive
@@ -197,8 +205,14 @@ export function mergeFieldProvenance(
 
   for (const [field, entry] of Object.entries(incoming)) {
     const incomingSources = extractSources(entry);
+    // Note: a replace-listed field with NO incoming sources is a no-op here
+    // (existing provenance is preserved) — replace requires fresh sources;
+    // it never purges to empty. Conservative by design (no silent data loss).
     if (incomingSources.length === 0) continue;
-    const existingForField = out[field] ?? [];
+    // PR-127: replace-mode starts the field clean so incoming sources fully
+    // overwrite the existing array (purges un-evictable garbage). Default merge
+    // keeps existing and appends de-duped.
+    const existingForField = replaceFields?.has(field) ? [] : (out[field] ?? []);
     // Seed seen-set from well-formed existing records. dedupKey now
     // returns null on malformed inputs — they were already filtered
     // above, but the null-guard keeps belt-and-braces.
@@ -238,6 +252,11 @@ type IncomingBody = {
   postalCode?: string;
   website?: string;
   field_provenance?: IncomingProvenance;
+  // PR-127 (2026-06-08): fields listed here have their provenance REPLACED by
+  // the incoming sources instead of appended. Lets a clean re-crawl purge
+  // garbage sources (e.g. award text / prose captured as an address) that the
+  // additive merge can never evict. Omitted/empty = merge (default).
+  provenance_replace_fields?: string[];
 };
 
 router.put("/", (req: Request, res: Response) => {
@@ -281,6 +300,15 @@ router.put("/", (req: Request, res: Response) => {
   // a structured 500 JSON instead of letting the throw escape to express's
   // default HTML handler.
   let provenanceMerged: Record<string, ProvenanceRecord[]> | null = null;
+  // PR-127: optional per-field replace set (default merge).
+  let replaceFields: Set<string> | undefined;
+  if (Array.isArray(body.provenance_replace_fields)) {
+    replaceFields = new Set(
+      body.provenance_replace_fields.filter(
+        (f): f is string => typeof f === "string" && f.trim().length > 0,
+      ),
+    );
+  }
   if (body.field_provenance && typeof body.field_provenance === "object") {
     const existingRow = db
       .prepare("SELECT field_provenance FROM agent_knowledge WHERE agent_id = ?")
@@ -295,7 +323,7 @@ router.put("/", (req: Request, res: Response) => {
       }
     }
     try {
-      provenanceMerged = mergeFieldProvenance(existing, body.field_provenance);
+      provenanceMerged = mergeFieldProvenance(existing, body.field_provenance, replaceFields);
     } catch (mergeErr: any) {
       res.status(500).json({
         error: "field_provenance_merge_failed",
@@ -357,6 +385,7 @@ router.put("/", (req: Request, res: Response) => {
     agent_id: agentId,
     columns_updated: columnUpdates.map((u) => u.col),
     field_provenance_counts: summary,
+    provenance_replaced_fields: replaceFields ? [...replaceFields] : [],
   });
 });
 
