@@ -45,6 +45,14 @@ const BM_BASE_URL = "https://bondensmarked.no";
 const BM_LOKALLAG_URL = `${BM_BASE_URL}/lokallag`;
 const FETCH_TIMEOUT_MS = 15_000;
 
+// PR-125: lokallag slugs are interpolated into bondensmarked.no URLs. Validate
+// before any fetch to prevent path-traversal / URL injection once the daily
+// scraper starts calling fetchBmLokallagDetail() with slugs from the index page.
+const LOKALLAG_SLUG_RE = /^[a-z0-9][a-z0-9-]{0,60}$/;
+export function isValidLokallagSlug(slug: unknown): slug is string {
+  return typeof slug === "string" && LOKALLAG_SLUG_RE.test(slug);
+}
+
 // ─── Public interfaces ────────────────────────────────────────────────────────
 
 export interface BmLokallag {
@@ -76,6 +84,13 @@ export interface BmLokallag {
 export interface BmMarketDay {
   /** ISO date string, e.g. "2026-07-04" — extracted from the /markeder/SLUG href. */
   date: string;
+  /**
+   * PR-125: the full event slug from the /markeder/<slug> href, e.g.
+   * "torvet-i-arendal-2026-07-04". This is the UNIQUE natural key the
+   * bm-events scraper stores in bm_market_events.event_slug, so the daily
+   * time-correction step can join exactly (no fuzzy matching).
+   */
+  eventSlug?: string;
   /**
    * Market-place / venue name as shown, e.g. "Arendal - Torvet, ARENDAL".
    * May include city suffix in all-caps separated by comma.
@@ -246,6 +261,10 @@ export function parseBmLokallagHtml(html: string): BmLokallag[] {
  * directly in tests/dev with a saved HTML string.
  */
 export async function fetchBmLokallagDetail(slug: string): Promise<BmLokallagDetail> {
+  // PR-125: reject malformed slugs before URL interpolation (path-traversal guard).
+  if (!isValidLokallagSlug(slug)) {
+    throw new Error(`fetchBmLokallagDetail: invalid lokallag slug ${JSON.stringify(slug)}`);
+  }
   const url = `${BM_BASE_URL}/lokallag/${slug}`;
   const html = await bmFetch(url);
   return parseBmLokallagDetailHtml(slug, html);
@@ -274,13 +293,14 @@ export async function parseBmLokallagDetailHtml(
     // Each market event card is an <a href="/markeder/..."> anchor.
     // We capture: ISO date from href, time string, title, and place in one pass.
     const eventRe =
-      /href="\/markeder\/[^"]*?(\d{4}-\d{2}-\d{2})"[^>]*>[\s\S]*?class="text-base font-bold text-muted-foreground">([\s\S]*?)<\/p>[\s\S]*?class="font-semibold tracking-tight line-clamp-1 text-lg">([\s\S]*?)<\/h3>[\s\S]*?class="line-clamp-1">([\s\S]*?)<\/span>/g;
+      /href="\/markeder\/([^"]*?(\d{4}-\d{2}-\d{2}))"[^>]*>[\s\S]*?class="text-base font-bold text-muted-foreground">([\s\S]*?)<\/p>[\s\S]*?class="font-semibold tracking-tight line-clamp-1 text-lg">([\s\S]*?)<\/h3>[\s\S]*?class="line-clamp-1">([\s\S]*?)<\/span>/g;
     let em: RegExpExecArray | null;
     while ((em = eventRe.exec(html)) !== null) {
-      const date = em[1];
-      const rawTime = em[2];
-      const title = decodeHtmlEntities(stripHtmlTags(em[3]).trim());
-      const place = decodeHtmlEntities(stripHtmlTags(em[4]).trim());
+      const eventSlug = em[1];
+      const date = em[2];
+      const rawTime = em[3];
+      const title = decodeHtmlEntities(stripHtmlTags(em[4]).trim());
+      const place = decodeHtmlEntities(stripHtmlTags(em[5]).trim());
 
       // Extract HH:MM times — strips React HTML comments (<!-- -->) reliably
       const times = rawTime.match(/\d{2}:\d{2}/g) ?? [];
@@ -288,7 +308,7 @@ export async function parseBmLokallagDetailHtml(
       const endTime = times[1];
 
       if (!date) continue; // paranoia guard
-      marketDays.push({ date, place, startTime, endTime, title: title || undefined });
+      marketDays.push({ date, eventSlug, place, startTime, endTime, title: title || undefined });
     }
 
     if (marketDays.length === 0) {
@@ -340,8 +360,9 @@ export async function parseBmLokallagDetailHtml(
           markedsplasser = parseMpPreviewFromDetailHtml(html);
           return { slug, markedsplasser, marketDays, produsenter };
         }
-        markedsplasser = parseMpListHtml(mpHtml);
       }
+      // PR-125: single parse covers both the test override (fullMpHtml) and the
+      // live-fetch path; the earlier in-branch parse was dead (immediately overwritten).
       markedsplasser = parseMpListHtml(mpHtml ?? fullMpHtml ?? "");
       if (markedsplasser.length === 0) {
         console.warn(`[bondensmarked-source] detail(${slug}): full markedsplasser list empty — falling back to preview`);
@@ -404,14 +425,10 @@ function parseMpListHtml(html: string): string[] {
  * Used as fallback when the full /markedsplasser?lokallag= fetch fails.
  */
 function parseMpPreviewFromDetailHtml(html: string): string[] {
-  const names: string[] = [];
-  const mpRe = /href="\/markedsplasser\/[^"]*"[\s\S]*?class="font-semibold leading-tight line-clamp-1">([\s\S]*?)<\/p>/g;
-  let m: RegExpExecArray | null;
-  while ((m = mpRe.exec(html)) !== null) {
-    const name = decodeHtmlEntities(stripHtmlTags(m[1]).trim());
-    if (name && !names.includes(name)) names.push(name);
-  }
-  return names;
+  // PR-125: the detail-page preview cards share the exact card structure as the
+  // full /markedsplasser?lokallag= list, so delegate to the shared parser
+  // instead of duplicating the regex (was byte-identical to parseMpListHtml).
+  return parseMpListHtml(html);
 }
 
 /** Strip HTML tags (for cleaning RSC-generated text fragments). */
