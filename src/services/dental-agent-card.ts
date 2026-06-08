@@ -21,7 +21,8 @@ export function getDentalAgentCard(): object {
     description:
       "A2A-markedsplass for norske tannlegeklinikker — ~6 900 klinikker med Helfo-avtale-, spesialitet- og akuttvakt-data. " +
       "A2A marketplace for Norwegian dental clinics — ~6,900 clinics with Helfo-agreement, speciality, and emergency-duty data.",
-    url,
+    url: `${url}/a2a`,
+    protocolVersion: "0.3.0",
     provider: {
       organization: "Finn-tannlege",
       url,
