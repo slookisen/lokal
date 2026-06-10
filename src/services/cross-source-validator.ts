@@ -61,6 +61,26 @@ function normalizeAddress(raw: string): string {
     .trim();
 }
 
+// PR-130 (2026-06-10): parse a Norwegian address into a { core, postcode } pair
+// for subset-aware agreement. The recurring false positive (~60+ review_required
+// producers): a homepage gives a street-only address ("Nygårdsveien 10") while
+// google_places gives the full form ("Nygårdsveien 10, 7320 Fannrem"). These are
+// the SAME place but normalizeAddress() keyed them differently, so they never
+// grouped and the agent stayed review_required despite 2 agreeing Tier-A sources.
+// core = the first comma-segment (street + house number), space/punct-normalized.
+// postcode = the first standalone 4-digit token anywhere (Norwegian postnummer).
+export function parseAddressCore(raw: string): { core: string; postcode: string | null } {
+  const lower = (raw || "").toLowerCase().trim();
+  const firstSeg = lower.split(",")[0] ?? lower;
+  const core = firstSeg
+    .replace(/[^\p{L}\p{N}\s/.-]/gu, " ")
+    .replace(/\s+/g, " ")
+    .replace(/^[\s.,-]+|[\s.,-]+$/g, "")
+    .trim();
+  const pcMatch = lower.match(/(?<!\d)(\d{4})(?!\d)/);
+  return { core, postcode: pcMatch ? pcMatch[1] : null };
+}
+
 function normalizePhone(raw: string): string {
   // Strip +47, 0047, leading +, then remove all non-digit characters
   return raw
@@ -195,18 +215,48 @@ export function crossSourceAgreement(
     norm: normalizeValue(fieldName, r.value),
   }));
 
-  // Find groups of sources that share the same normalized value
-  const groups = new Map<string, string[]>(); // norm → [source_types]
-  for (const n of normalized) {
-    const existing = groups.get(n.norm) ?? [];
-    existing.push(n.source);
-    groups.set(n.norm, existing);
-  }
-
-  // Check if any normalized value has >=2 agreeing Tier-A/B sources
+  // Check if any normalized value has >=2 agreeing Tier-A/B sources.
   let bestGroupCount = 0;
-  for (const srcs of groups.values()) {
-    if (srcs.length > bestGroupCount) bestGroupCount = srcs.length;
+  if (fieldName === "address") {
+    // PR-130: subset-aware address agreement. Group by street+number core; within
+    // a core group the records agree only if their PRESENT postcodes do not
+    // conflict (<=1 distinct postcode). So "Nygårdsveien 10" + "Nygårdsveien 10,
+    // 7320 Fannrem" agree (one omits the postcode), while "Storgata 1, 0150 Oslo"
+    // + "Storgata 1, 5003 Bergen" stay gated (two distinct postcodes = different
+    // place). Exact street-core equality only — no prefix matching, so "Storgata 1"
+    // never matches "Storgata 10".
+    const byCore = new Map<string, { sources: string[]; postcodes: Set<string>; norms: Set<string> }>();
+    for (const n of normalized) {
+      const { core, postcode } = parseAddressCore(n.value);
+      if (!core) continue;
+      const g = byCore.get(core) ?? { sources: [], postcodes: new Set<string>(), norms: new Set<string>() };
+      g.sources.push(n.source);
+      if (postcode) g.postcodes.add(postcode);
+      g.norms.add(n.norm);
+      byCore.set(core, g);
+    }
+    for (const g of byCore.values()) {
+      if (g.sources.length < 2 || g.postcodes.size > 1) continue;
+      // PR-130 review hardening (finding 1): the subset merge (street-only ⊂
+      // street+postcode) is only allowed when a postcode is actually present to
+      // disambiguate. If NO postcode appears anywhere in the group, fall back to
+      // the pre-PR-130 behaviour — agree only if the raw values are identical —
+      // so two different "Storgata 1"-type addresses in different towns (neither
+      // carrying a postcode) are NOT vacuously merged.
+      if (g.postcodes.size === 0 && g.norms.size !== 1) continue;
+      if (g.sources.length > bestGroupCount) bestGroupCount = g.sources.length;
+    }
+  } else {
+    // Exact normalized-value grouping (unchanged) for phone / business_status.
+    const groups = new Map<string, string[]>(); // norm → [source_types]
+    for (const n of normalized) {
+      const existing = groups.get(n.norm) ?? [];
+      existing.push(n.source);
+      groups.set(n.norm, existing);
+    }
+    for (const srcs of groups.values()) {
+      if (srcs.length > bestGroupCount) bestGroupCount = srcs.length;
+    }
   }
 
   if (bestGroupCount >= 2) {

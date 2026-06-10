@@ -1946,6 +1946,7 @@ console.log("── PR-21 / WO-19: outreach_ready_pool freshness gate ──");
 // ── WO-16 / Phase 5.3: cross-source-validator unit tests ─────────────────────
 import {
   crossSourceAgreement,
+  parseAddressCore,
   tierForSource,
   coerceProvenanceToArrayShape,
   aggregateVerdict,
@@ -14599,4 +14600,74 @@ console.log("\n── PR-127: normalizeOpeningHours ──");
   assertTrue(!isValidHttpUrl("ftp://klinikk.no"), "pr128-19: ftp invalid");
   assertTrue(!isValidHttpUrl("not a url"), "pr128-20: garbage invalid");
   assertTrue(!isValidHttpUrl(""), "pr128-21: empty invalid");
+}
+
+
+// ── PR-130: subset-aware address agreement (street-only ⊂ street+postcode) ──
+console.log("\n── cross-source-validator: PR-130 address-core agreement ──");
+{
+  const provA = (value: string, source: string): ProvenanceRecord =>
+    ({ value, source_type: source, fetched_at: "2026-06-10T00:00:00Z" } as ProvenanceRecord);
+
+  // parseAddressCore basics
+  assertEq(parseAddressCore("Nygårdsveien 10").core, "nygårdsveien 10", "pr130-00a: street-only core");
+  assertEq(parseAddressCore("Nygårdsveien 10, 7320 Fannrem").core, "nygårdsveien 10", "pr130-00b: street+city → same core");
+  assertEq(parseAddressCore("Nygårdsveien 10, 7320 Fannrem").postcode, "7320", "pr130-00c: postcode extracted");
+  assertEq(parseAddressCore("Storgata 1, 5003 Bergen").postcode, "5003", "pr130-00d");
+
+  // THE FIX: homepage street-only + google street+postcode → pool_eligible
+  {
+    const r = crossSourceAgreement({ address: [
+      provA("Nygårdsveien 10", "homepage"),
+      provA("Nygårdsveien 10, 7320 Fannrem", "google_places"),
+    ]}, "address");
+    assertEq(r.verdict, "pool_eligible", "pr130-01: street-only + street+postcode → pool_eligible");
+    assertEq(r.agree, true, "pr130-01b: agree=true");
+  }
+
+  // FALSE-MERGE GUARD: same street+number, DIFFERENT postcodes → still gated
+  {
+    const r = crossSourceAgreement({ address: [
+      provA("Storgata 1, 0150 Oslo", "homepage"),
+      provA("Storgata 1, 5003 Bergen", "google_places"),
+    ]}, "address");
+    assertEq(r.verdict, "review_required", "pr130-02: same street, different postcode → review_required (different place)");
+  }
+
+  // Different street core → gated
+  {
+    const r = crossSourceAgreement({ address: [
+      provA("Storgata 1", "homepage"),
+      provA("Lillevegen 5, 5003 Bergen", "google_places"),
+    ]}, "address");
+    assertEq(r.verdict, "review_required", "pr130-03: different street core → review_required");
+  }
+
+  // No prefix trap: "Storgata 1" must NOT match "Storgata 10"
+  {
+    const r = crossSourceAgreement({ address: [
+      provA("Storgata 1", "homepage"),
+      provA("Storgata 10, 0150 Oslo", "google_places"),
+    ]}, "address");
+    assertEq(r.verdict, "review_required", "pr130-04: 'Storgata 1' must not match 'Storgata 10'");
+  }
+
+  // Both street-only, same core → agree (corroborated)
+  {
+    const r = crossSourceAgreement({ address: [
+      provA("Nygårdsveien 10", "homepage"),
+      provA("nygårdsveien 10", "brreg"),
+    ]}, "address");
+    assertEq(r.verdict, "pool_eligible", "pr130-05: both street-only same core → pool_eligible");
+  }
+
+  // Finding-1 hardening: same street, NO postcode anywhere, non-identical raw
+  // ("Storgata 1" vs "Storgata 1, Oslo") → must stay gated (could be different towns).
+  {
+    const r = crossSourceAgreement({ address: [
+      provA("Storgata 1", "homepage"),
+      provA("Storgata 1, Oslo", "google_places"),
+    ]}, "address");
+    assertEq(r.verdict, "review_required", "pr130-06: same street, no postcode, differing raw → gated (anti-vacuous-merge)");
+  }
 }
