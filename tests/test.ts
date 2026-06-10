@@ -14295,3 +14295,187 @@ console.log("\n── PR-114: dental MCP server ──");
   }
 }
 
+
+// ─── PR-128: dental Google-Places batch pure helpers ───────────────────
+// Unit tests for the data-quality logic factored into
+// src/services/dental-places.ts (no DB, no network).
+{
+  const {
+    placesPeriodsToOpeningHours,
+    isConfidentPlaceMatch,
+    normalizePlacePhone,
+    isValidHttpUrl,
+  } = require("../src/services/dental-places") as typeof import("../src/services/dental-places");
+
+  // ── placesPeriodsToOpeningHours ──
+  // Mon 08:00–16:00 (Places day 1 = Monday).
+  const mon = placesPeriodsToOpeningHours([
+    { open: { day: 1, hour: 8, minute: 0 }, close: { day: 1, hour: 16, minute: 0 } },
+  ]);
+  assertEq(JSON.stringify(mon), JSON.stringify([{ day: "mon", open: "08:00", close: "16:00" }]),
+    "pr128-01: Mon 08:00-16:00 → [{mon,08:00,16:00}]");
+
+  // Sunday day=0 → "sun", zero-padding of single-digit hour/minute.
+  const sun = placesPeriodsToOpeningHours([
+    { open: { day: 0, hour: 9, minute: 5 }, close: { day: 0, hour: 14, minute: 30 } },
+  ]);
+  assertEq(sun.length, 1, "pr128-02a: one sunday period survives");
+  assertEq(sun[0]!.day, "sun", "pr128-02b: day=0 → sun");
+  assertEq(sun[0]!.open, "09:05", "pr128-02c: open zero-padded");
+  assertEq(sun[0]!.close, "14:30", "pr128-02d: close formatted");
+
+  // minute omitted → defaults to :00.
+  const noMin = placesPeriodsToOpeningHours([
+    { open: { day: 2, hour: 7 }, close: { day: 2, hour: 15 } },
+  ]);
+  assertEq(JSON.stringify(noMin), JSON.stringify([{ day: "tue", open: "07:00", close: "15:00" }]),
+    "pr128-03: missing minute defaults to :00, day 2 → tue");
+
+  // Period missing close → skipped.
+  const noClose = placesPeriodsToOpeningHours([
+    { open: { day: 1, hour: 0, minute: 0 } },
+  ]);
+  assertEq(noClose.length, 0, "pr128-04: period missing close is skipped");
+
+  // Midnight-spanning (open.day !== close.day) → skipped (conservative).
+  const spans = placesPeriodsToOpeningHours([
+    { open: { day: 5, hour: 22, minute: 0 }, close: { day: 6, hour: 2, minute: 0 } },
+  ]);
+  assertEq(spans.length, 0, "pr128-05: midnight-spanning period skipped");
+
+  // Empty / undefined input → [].
+  assertEq(placesPeriodsToOpeningHours([]).length, 0, "pr128-06a: empty array → []");
+  assertEq(placesPeriodsToOpeningHours(undefined).length, 0, "pr128-06b: undefined → []");
+
+  // Mixed: one valid Mon + one bad (no close) → only the valid one.
+  const mixed = placesPeriodsToOpeningHours([
+    { open: { day: 1, hour: 8 }, close: { day: 1, hour: 16 } },
+    { open: { day: 3, hour: 9 } },
+  ]);
+  assertEq(mixed.length, 1, "pr128-07: mixed valid+invalid → only valid kept");
+
+  // ── isConfidentPlaceMatch ──
+  // Exact name + matching postnummer in addressComponents → true.
+  const placeGood: import("../src/services/dental-places").PlacesPlace = {
+    displayName: { text: "Tannlege Oslo Sentrum AS" },
+    formattedAddress: "Storgata 1, 0155 Oslo, Norway",
+    addressComponents: [
+      { longText: "0155", shortText: "0155", types: ["postal_code"] },
+      { longText: "Oslo", shortText: "Oslo", types: ["postal_town"] },
+    ],
+  };
+  assertTrue(
+    isConfidentPlaceMatch(
+      { navn: "Tannlege Oslo Sentrum AS", postnummer: "0155", poststed: "OSLO" },
+      placeGood
+    ),
+    "pr128-08: exact name + matching postnummer → true"
+  );
+
+  // Unrelated name (low similarity) → false even with matching postnummer.
+  assertTrue(
+    !isConfidentPlaceMatch(
+      { navn: "Bergen Kjeveortopedi Klinikk", postnummer: "0155", poststed: "OSLO" },
+      placeGood
+    ),
+    "pr128-09: unrelated name → false"
+  );
+
+  // Right name but WRONG poststed and NO postnummer match → false.
+  const placeWrongTown: import("../src/services/dental-places").PlacesPlace = {
+    displayName: { text: "Tannlege Oslo Sentrum AS" },
+    formattedAddress: "Strandgaten 5, 5004 Bergen, Norway",
+    addressComponents: [
+      { longText: "5004", shortText: "5004", types: ["postal_code"] },
+    ],
+  };
+  assertTrue(
+    !isConfidentPlaceMatch(
+      { navn: "Tannlege Oslo Sentrum AS", postnummer: null, poststed: "OSLO" },
+      placeWrongTown
+    ),
+    "pr128-10: right name, wrong poststed, no postnummer match → false"
+  );
+
+  // Right name, no postnummer, but poststed present in formattedAddress → true.
+  assertTrue(
+    isConfidentPlaceMatch(
+      { navn: "Tannlege Oslo Sentrum AS", postnummer: null, poststed: "Oslo" },
+      placeGood
+    ),
+    "pr128-11: name + poststed-in-address fallback → true"
+  );
+
+  // null place → false.
+  assertTrue(
+    !isConfidentPlaceMatch({ navn: "Whatever", postnummer: "0155", poststed: "OSLO" }, null),
+    "pr128-12: null place → false"
+  );
+
+  // ── PR-128b: hardened match guard (review fixes) ──
+  // Same-city sibling chain branch must NOT match: similar name + same town,
+  // but the postnummer differs → hard-fail on postal_code mismatch.
+  const placeSiblingBranch: import("../src/services/dental-places").PlacesPlace = {
+    displayName: { text: "Oris Dental Lambertseter" },
+    formattedAddress: "Cecilie Thoresens vei 5, 1153 Oslo, Norway",
+    addressComponents: [
+      { longText: "1153", shortText: "1153", types: ["postal_code"] },
+      { longText: "Oslo", shortText: "Oslo", types: ["postal_town"] },
+    ],
+  };
+  assertTrue(
+    !isConfidentPlaceMatch(
+      { navn: "Oris Dental Storo", postnummer: "0484", poststed: "OSLO" },
+      placeSiblingBranch
+    ),
+    "pr128b-01: same-city sibling branch (postnummer mismatch) → false"
+  );
+
+  // Short poststed must not substring-match a different town.
+  const placeMoss: import("../src/services/dental-places").PlacesPlace = {
+    displayName: { text: "Tannklinikk Mo AS" },
+    formattedAddress: "Storgata 1, 1531 Moss, Norway",
+    addressComponents: [
+      { longText: "1531", shortText: "1531", types: ["postal_code"] },
+      { longText: "Moss", shortText: "Moss", types: ["postal_town"] },
+    ],
+  };
+  assertTrue(
+    !isConfidentPlaceMatch(
+      { navn: "Tannklinikk Mo AS", postnummer: null, poststed: "Mo" },
+      placeMoss
+    ),
+    "pr128b-02: short poststed 'Mo' must NOT match town 'Moss' → false"
+  );
+
+  // postnummer must match exactly, not as a substring.
+  assertTrue(
+    !isConfidentPlaceMatch(
+      { navn: "Tannlege Oslo Sentrum AS", postnummer: "015", poststed: "OSLO" },
+      placeGood
+    ),
+    "pr128b-03: substring postnummer '015' vs '0155' → false (exact match required)"
+  );
+
+  // postnummer absent but exact town equality + high name sim → true.
+  assertTrue(
+    isConfidentPlaceMatch(
+      { navn: "Tannklinikk Mo AS", postnummer: null, poststed: "Moss" },
+      placeMoss
+    ),
+    "pr128b-04: no postnummer + exact town equality + high name sim → true"
+  );
+
+  // ── normalizePlacePhone ──
+  assertEq(normalizePlacePhone("+47 22 33 44 55"), "+4722334455", "pr128-13: strip spaces keep +");
+  assertEq(normalizePlacePhone("tel:+47 22334455"), "+4722334455", "pr128-14: strip tel: prefix");
+  assertEq(normalizePlacePhone("TEL:22 33 44 55"), "22334455", "pr128-15: case-insensitive tel:, no +");
+  assertEq(normalizePlacePhone(undefined as unknown as string), "", "pr128-16: non-string → empty");
+
+  // ── isValidHttpUrl ──
+  assertTrue(isValidHttpUrl("https://klinikk.no"), "pr128-17: https valid");
+  assertTrue(isValidHttpUrl("http://klinikk.no/path"), "pr128-18: http valid");
+  assertTrue(!isValidHttpUrl("ftp://klinikk.no"), "pr128-19: ftp invalid");
+  assertTrue(!isValidHttpUrl("not a url"), "pr128-20: garbage invalid");
+  assertTrue(!isValidHttpUrl(""), "pr128-21: empty invalid");
+}

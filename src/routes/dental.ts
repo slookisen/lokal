@@ -28,6 +28,16 @@ import {
   ExclusionReason,
   bulkInsertFromMerged,
 } from "../services/dental-store";
+import { getDb } from "../database/db-factory";
+import { mergeFieldProvenance } from "./admin-knowledge";
+import {
+  placesPeriodsToOpeningHours,
+  isConfidentPlaceMatch,
+  normalizePlacePhone,
+  isValidHttpUrl,
+  type PlacesPlace,
+} from "../services/dental-places";
+import { nameSimilarity } from "../services/name-matcher";
 
 const router = Router();
 
@@ -437,6 +447,378 @@ router.get(
       console.error("[tannlege] geocode-status failed", err);
       res.status(500).json({ error: "Internal error" });
     }
+  }
+);
+
+
+// ─── POST /api/tannlege/admin/google-places-batch (admin) — PR-128 ──────
+//
+// Dental Google-Places enrichment batch. THE KEY UNLOCK: backfill missing
+// `hjemmeside` (homepage) so thin_site records re-enter the homepage-crawl
+// pool, plus opportunistic fill of adresse / telefon / opening_hours.
+//
+// Mirrors the rfb google-rating-batch Places call pattern
+// (places:searchText, X-Goog-Api-Key, X-Goog-FieldMask, body
+// {textQuery,languageCode:"no"}) BUT fixes that endpoint's data-quality
+// flaw: it blindly took data.places[0] with NO match validation, risking
+// pulling a DIFFERENT clinic's data. Here every place must pass
+// isConfidentPlaceMatch (name-similarity >= 0.55 AND a postnummer/poststed
+// location cross-check) before we write anything.
+//
+// Write policy: FILL-ONLY. We never overwrite a non-empty column
+// (Brreg-wins on adresse/telefon). field_provenance gets a google_places
+// (Tier-A) entry for EVERY real value we got — even when the column was
+// already populated — so the cross-source-validator can reach
+// source_count>=2 (same rationale as the rfb endpoint's provenance merge).
+//
+// Body (all optional): { agentIds?: string[], limit?: number, write?: boolean }
+//   write defaults to true; write=false → dry-run (lookup + decision, no DB write).
+//
+// Auth: requireAdmin.
+const GooglePlacesBatchBodySchema = z.object({
+  agentIds: z.array(z.string()).optional(),
+  limit: z.number().int().positive().optional(),
+  write: z.boolean().optional(),
+});
+
+// Local validation schema mirroring the dental-store opening_hours schema
+// (kept private to dental-store, so re-declared here for the post-convert
+// safety check before we write the column).
+const OpeningHoursArraySchema = z.array(
+  z.object({
+    day: z.enum(["mon", "tue", "wed", "thu", "fri", "sat", "sun"]),
+    open: z.string().regex(/^\d{2}:\d{2}$/),
+    close: z.string().regex(/^\d{2}:\d{2}$/),
+  })
+);
+
+const PLACES_FIELD_MASK =
+  "places.displayName,places.formattedAddress,places.internationalPhoneNumber,places.websiteUri,places.regularOpeningHours,places.businessStatus,places.addressComponents";
+
+interface PlacesAgentRow {
+  id: string;
+  navn: string;
+  postnummer: string | null;
+  poststed: string | null;
+  adresse: string | null;
+  telefon: string | null;
+  hjemmeside: string | null;
+  opening_hours: string | null;
+  field_provenance: string | null;
+  enrichment_state: string | null;
+}
+
+function isEmptyCol(v: string | null | undefined): boolean {
+  return v === null || v === undefined || String(v).trim() === "";
+}
+
+router.post(
+  "/admin/google-places-batch",
+  requireAdmin,
+  async (req: Request, res: Response) => {
+    const placesKey = process.env.GOOGLE_PLACES_API_KEY;
+    if (!placesKey) {
+      res
+        .status(503)
+        .json({ success: false, error: "GOOGLE_PLACES_API_KEY not configured" });
+      return;
+    }
+
+    let body: z.infer<typeof GooglePlacesBatchBodySchema>;
+    try {
+      body = GooglePlacesBatchBodySchema.parse(req.body ?? {});
+    } catch (err) {
+      if (err instanceof z.ZodError) {
+        res.status(400).json({ error: "Invalid body", details: err.issues });
+        return;
+      }
+      throw err;
+    }
+
+    const write = body.write !== false; // default true
+    const HARD_CAP = 50;
+    const limit = Math.max(
+      1,
+      Math.min(HARD_CAP, body.limit ?? 20)
+    );
+
+    const db = getDb("dental");
+
+    // ── Selection ──────────────────────────────────────────────────────
+    let rows: PlacesAgentRow[];
+    if (Array.isArray(body.agentIds) && body.agentIds.length > 0) {
+      const ids = body.agentIds.slice(0, limit);
+      const placeholders = ids.map(() => "?").join(",");
+      rows = db
+        .prepare(
+          `SELECT id, navn, postnummer, poststed, adresse, telefon, hjemmeside,
+                  opening_hours, field_provenance, enrichment_state
+             FROM dental_agents
+            WHERE id IN (${placeholders})`
+        )
+        .all(...ids) as PlacesAgentRow[];
+    } else {
+      // Auto-select rows that NEED Places help. Priority: missing homepage
+      // first (the key unlock), then missing addr/phone/opening_hours.
+      // Restricted to the enrichment states that can still benefit and
+      // never rejected.
+      rows = db
+        .prepare(
+          `SELECT id, navn, postnummer, poststed, adresse, telefon, hjemmeside,
+                  opening_hours, field_provenance, enrichment_state
+             FROM dental_agents
+            WHERE enrichment_state IN ('raw','thin_site','enriched')
+              AND verification_status != 'rejected'
+              AND (
+                    hjemmeside IS NULL OR hjemmeside = ''
+                 OR adresse    IS NULL OR adresse    = ''
+                 OR telefon    IS NULL OR telefon    = ''
+                 OR opening_hours IS NULL OR opening_hours = ''
+              )
+            ORDER BY
+              CASE WHEN hjemmeside IS NULL OR hjemmeside = '' THEN 0 ELSE 1 END ASC,
+              CASE WHEN (adresse IS NULL OR adresse = '')
+                     OR (telefon IS NULL OR telefon = '')
+                     OR (opening_hours IS NULL OR opening_hours = '') THEN 0 ELSE 1 END ASC,
+              navn ASC
+            LIMIT ?`
+        )
+        .all(limit) as PlacesAgentRow[];
+    }
+
+    const results: Array<{
+      agentId: string;
+      navn: string;
+      status: "matched" | "no_confident_match" | "no_place" | "api_error";
+      nameSim: number;
+      fields_written: string[];
+      homepage_backfilled: boolean;
+      place?: string;
+    }> = [];
+
+    let processed = 0;
+    let matched = 0;
+    let no_match = 0;
+    let homepages_backfilled = 0;
+    const by_field = { hjemmeside: 0, adresse: 0, telefon: 0, opening_hours: 0 };
+
+    for (let i = 0; i < rows.length; i++) {
+      const row = rows[i];
+      if (!row) continue;
+      processed++;
+
+      // Rate-limit politely between Places calls (~150ms), not before first.
+      if (i > 0) await new Promise((r) => setTimeout(r, 150));
+
+      const query = `${row.navn} ${row.poststed ?? ""} Norway`
+        .replace(/\s*[—–-]\s*/g, " ")
+        .replace(/\s+/g, " ")
+        .trim();
+
+      let place: PlacesPlace | undefined;
+      try {
+        const resp = await fetch(
+          "https://places.googleapis.com/v1/places:searchText",
+          {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              "X-Goog-Api-Key": placesKey,
+              "X-Goog-FieldMask": PLACES_FIELD_MASK,
+            },
+            body: JSON.stringify({ textQuery: query, languageCode: "no" }),
+          }
+        );
+        if (!resp.ok) {
+          results.push({
+            agentId: row.id,
+            navn: row.navn,
+            status: "api_error",
+            nameSim: 0,
+            fields_written: [],
+            homepage_backfilled: false,
+          });
+          continue;
+        }
+        const data = (await resp.json()) as { places?: PlacesPlace[] };
+        place = (data.places || [])[0];
+      } catch {
+        results.push({
+          agentId: row.id,
+          navn: row.navn,
+          status: "api_error",
+          nameSim: 0,
+          fields_written: [],
+          homepage_backfilled: false,
+        });
+        continue;
+      }
+
+      if (!place) {
+        results.push({
+          agentId: row.id,
+          navn: row.navn,
+          status: "no_place",
+          nameSim: 0,
+          fields_written: [],
+          homepage_backfilled: false,
+        });
+        continue;
+      }
+
+      const nameSim = nameSimilarity(row.navn, place.displayName?.text ?? "");
+
+      // ── MATCH VALIDATION (mandatory data-quality guard) ──────────────
+      const confident = isConfidentPlaceMatch(
+        { navn: row.navn, postnummer: row.postnummer, poststed: row.poststed },
+        place
+      );
+      if (!confident) {
+        no_match++;
+        results.push({
+          agentId: row.id,
+          navn: row.navn,
+          status: "no_confident_match",
+          nameSim,
+          fields_written: [],
+          homepage_backfilled: false,
+          place: place.displayName?.text,
+        });
+        continue;
+      }
+
+      // ── Confident match — compute FILL-ONLY column writes ────────────
+      matched++;
+      const nowIso = new Date().toISOString();
+      const patch: Record<string, unknown> = {};
+      const fields_written: string[] = [];
+      let homepage_backfilled = false;
+
+      // Real values from Places (for provenance, regardless of column write).
+      const gAddr =
+        typeof place.formattedAddress === "string"
+          ? place.formattedAddress.trim()
+          : "";
+      const gPhone = normalizePlacePhone(place.internationalPhoneNumber);
+      const gWebsite =
+        typeof place.websiteUri === "string" ? place.websiteUri.trim() : "";
+      const gWebsiteValid = isValidHttpUrl(gWebsite);
+      const ohConverted = placesPeriodsToOpeningHours(
+        place.regularOpeningHours?.periods
+      );
+      let ohValid = false;
+      if (ohConverted.length > 0) {
+        ohValid = OpeningHoursArraySchema.safeParse(ohConverted).success;
+      }
+
+      // hjemmeside — fill only, and re-pool thin_site on backfill.
+      if (isEmptyCol(row.hjemmeside) && gWebsiteValid) {
+        patch.hjemmeside = gWebsite;
+        fields_written.push("hjemmeside");
+        by_field.hjemmeside++;
+        homepage_backfilled = true;
+        homepages_backfilled++;
+        if ((row.enrichment_state ?? "") === "thin_site") {
+          patch.enrichment_state = "raw";
+        }
+      }
+
+      // adresse — fill only (Brreg-wins).
+      if (isEmptyCol(row.adresse) && gAddr) {
+        patch.adresse = gAddr;
+        fields_written.push("adresse");
+        by_field.adresse++;
+      }
+
+      // telefon — fill only (Brreg-wins), normalized.
+      if (isEmptyCol(row.telefon) && gPhone) {
+        patch.telefon = gPhone;
+        fields_written.push("telefon");
+        by_field.telefon++;
+      }
+
+      // opening_hours — fill only, must pass our schema.
+      if (isEmptyCol(row.opening_hours) && ohValid) {
+        patch.opening_hours = ohConverted;
+        fields_written.push("opening_hours");
+        by_field.opening_hours++;
+      }
+
+      // ── field_provenance — google_places (Tier-A) for every real value ──
+      const incomingProv: Record<
+        string,
+        { sources: Array<{ source_type: string; value: string; fetched_at: string }> }
+      > = {};
+      if (gAddr) {
+        incomingProv.address = {
+          sources: [{ source_type: "google_places", value: gAddr, fetched_at: nowIso }],
+        };
+      }
+      if (gPhone) {
+        incomingProv.phone = {
+          sources: [{ source_type: "google_places", value: gPhone, fetched_at: nowIso }],
+        };
+      }
+      if (gWebsiteValid) {
+        incomingProv.website = {
+          sources: [{ source_type: "google_places", value: gWebsite, fetched_at: nowIso }],
+        };
+      }
+      if (ohValid) {
+        incomingProv.opening_hours = {
+          sources: [
+            {
+              source_type: "google_places",
+              value: JSON.stringify(ohConverted),
+              fetched_at: nowIso,
+            },
+          ],
+        };
+      }
+
+      if (Object.keys(incomingProv).length > 0) {
+        let existingProv: Record<string, unknown> = {};
+        if (row.field_provenance) {
+          try {
+            const parsed = JSON.parse(row.field_provenance);
+            if (parsed && typeof parsed === "object") {
+              existingProv = parsed as Record<string, unknown>;
+            }
+          } catch {
+            /* tolerate junk */
+          }
+        }
+        patch.field_provenance = mergeFieldProvenance(existingProv, incomingProv);
+      }
+
+      // ── Apply (single updateDentalAgent call) unless dry-run ─────────
+      if (write && Object.keys(patch).length > 0) {
+        updateDentalAgent(row.id, patch as any);
+      }
+
+      results.push({
+        agentId: row.id,
+        navn: row.navn,
+        status: "matched",
+        nameSim,
+        fields_written,
+        homepage_backfilled,
+        place: place.displayName?.text,
+      });
+    }
+
+    res.json({
+      success: true,
+      data: {
+        processed,
+        matched,
+        no_match,
+        homepages_backfilled,
+        by_field,
+        write,
+        results,
+      },
+    });
   }
 );
 
