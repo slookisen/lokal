@@ -2414,6 +2414,52 @@ console.log("\n── cross-source-validator: domainCoherenceCheck ──");
   );
 }
 
+// ── PR-129: cross-TLD same-brand equivalence (Eidsmo-safe) ──
+{
+  // Same brand, different TLD on the EMAIL → now coherent (was a false positive).
+  const r = domainCoherenceCheck("https://vesteraalens.no/", "https://vesteraalens.no", "post@vesteraalens.com");
+  assertEq(r.coherent, true, "pr129-01: vesteraalens.no website + .com email → coherent (same brand cross-TLD)");
+}
+{
+  // Same brand, different TLD on the WEBSITE → coherent.
+  const r = domainCoherenceCheck("https://teksloseafood.no/", "https://teksloseafood.com", "post@teksloseafood.com");
+  assertEq(r.coherent, true, "pr129-02: teksloseafood .no agent vs .com website+email → coherent");
+}
+{
+  // CRITICAL Eidsmo guard preserved: different companies (different labels) stay gated
+  // even though only the TLD-insensitivity rule is new.
+  const r = domainCoherenceCheck("https://eidsmokjott.no/", "https://eidsmokjott.no", "post@slakthuset.no");
+  assertEq(r.coherent, false, "pr129-03: eidsmokjott website + slakthuset email → STILL incoherent (Eidsmo protected)");
+}
+{
+  // Short generic labels must NOT collapse across TLDs (len < 4 guard).
+  const r = domainCoherenceCheck("https://mat.no/", "https://mat.no", "post@mat.com");
+  assertEq(r.coherent, false, "pr129-04: short generic label mat.no vs mat.com → NOT auto-equated (stays gated)");
+}
+{
+  // Cross-company different-TLD must stay gated (distinct labels).
+  const r = domainCoherenceCheck("https://norwaykingcrab.no/", "https://norwaykingcrab.no", "post@kongekrabbe.com");
+  assertEq(r.coherent, false, "pr129-05: distinct-label .com email → still gated");
+}
+{
+  // Generic short labels (<6) must stay gated across TLDs.
+  const r = domainCoherenceCheck("https://gard.no/", "https://gard.no", "post@gard.com");
+  assertEq(r.coherent, false, "pr129-06: generic 'gard' .no/.com → gated (len<6)");
+  const r2 = domainCoherenceCheck("https://fisk.no/", "https://fisk.no", "post@fisk.com");
+  assertEq(r2.coherent, false, "pr129-07: generic 'fisk' .no/.com → gated");
+}
+{
+  // Generic 6+ char stem on the denylist must stay gated (use 'bakeri' — not a
+  // directory host, so it reaches the domainsEquivalent denylist path).
+  const r = domainCoherenceCheck("https://bakeri.no/", "https://bakeri.no", "post@bakeri.com");
+  assertEq(r.coherent, false, "pr129-08: denylisted 'bakeri' .no/.com → gated");
+}
+{
+  // Distinctive long brand still passes (regression guard for the real fix).
+  const r = domainCoherenceCheck("https://vesteraalens.no/", "https://vesteraalens.no", "post@vesteraalens.com");
+  assertEq(r.coherent, true, "pr129-09: distinctive 'vesteraalens' cross-TLD still coherent");
+}
+
 // orch-PR-20260512-33 iteration 2: directory-host bypass
 {
   const r = domainCoherenceCheck("https://hanen.no/produsent/foo", "https://realproducer.no", "post@realproducer.no");
