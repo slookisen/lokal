@@ -27,6 +27,7 @@ import {
   recordExclusion,
   ExclusionReason,
   bulkInsertFromMerged,
+  normalizeOpeningHours,
 } from "../services/dental-store";
 
 const router = Router();
@@ -187,13 +188,54 @@ router.put("/agents/:id", requireAdmin, (req: Request, res: Response) => {
   try {
     // Partial schema — every field optional. Casts to Partial<DentalAgent>.
     const PartialSchema = DentalAgentSchema.partial();
-    const parsed = PartialSchema.parse(req.body);
-    const ok = updateDentalAgent(id, parsed);
+    const body: Record<string, unknown> =
+      req.body && typeof req.body === "object" ? { ...(req.body as Record<string, unknown>) } : {};
+
+    // PR-127: pre-normalize opening_hours (messy real-world hours) before
+    // validation so a sloppy entry no longer 400s the whole record.
+    let openingHoursDropped = 0;
+    if ("opening_hours" in body && body.opening_hours != null) {
+      const norm = normalizeOpeningHours(body.opening_hours);
+      openingHoursDropped = norm.dropped;
+      if (norm.value && norm.value.length) body.opening_hours = norm.value;
+      else delete body.opening_hours; // nothing salvageable — don't fail the PUT
+    }
+
+    // PR-127: tolerant parse — strip any still-invalid top-level fields and
+    // re-parse, mirroring the list-endpoint philosophy (never 400 a whole
+    // enrichment PUT over one bad field). 422 only if NOTHING is valid.
+    const strippedFields: string[] = [];
+    let result = PartialSchema.safeParse(body);
+    if (!result.success) {
+      for (const issue of result.error.issues) {
+        const key = issue.path[0];
+        if (typeof key === "string" && key in body) {
+          delete body[key];
+          if (!strippedFields.includes(key)) strippedFields.push(key);
+        }
+      }
+      result = PartialSchema.safeParse(body);
+    }
+    if (!result.success) {
+      res.status(422).json({ error: "No valid fields in body", details: result.error.issues });
+      return;
+    }
+    if (Object.keys(result.data).length === 0) {
+      res.status(422).json({ error: "No valid fields in body", stripped_fields: strippedFields });
+      return;
+    }
+
+    const ok = updateDentalAgent(id, result.data);
     if (!ok) {
       res.status(404).json({ error: "Not found" });
       return;
     }
-    res.json({ id, updated: true });
+    res.json({
+      id,
+      updated: true,
+      ...(strippedFields.length ? { stripped_fields: strippedFields } : {}),
+      ...(openingHoursDropped ? { opening_hours_dropped: openingHoursDropped } : {}),
+    });
   } catch (err) {
     if (err instanceof z.ZodError) {
       res.status(400).json({ error: "Invalid body", details: err.issues });

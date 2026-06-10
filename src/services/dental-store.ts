@@ -1128,3 +1128,129 @@ export function getDentalAgentsForSitemap(): Array<{ org_nr: string; navn: strin
   `).all() as Array<{ org_nr: string; navn: string; updated_at: string | null }>;
   return rows;
 }
+
+// ─── PR-127: opening_hours normalization (tolerant ingest) ───────────────────
+//
+// Real-world clinic hours are messy ("9–15.30", "Man-Tor 08-16", "mandag",
+// "stengt", "etter avtale"). The opening_hours zod schema is strict
+// (array of { day: mon..sun, open:"HH:MM", close:"HH:MM" }), and PUT /agents/:id
+// hard-400s the WHOLE body on any invalid field — so one malformed hours entry
+// dropped every other field in the same enrichment PUT (observed:
+// opening_hours_shape_failures + stage_x_field_puts_failed in dental worker
+// envelopes). This helper salvages what it can and drops the rest, so a best-
+// effort hours array reaches the DB instead of nuking the record.
+
+const _DAY_MAP: Record<string, "mon" | "tue" | "wed" | "thu" | "fri" | "sat" | "sun"> = {
+  mon: "mon", monday: "mon", man: "mon", mandag: "mon", må: "mon",
+  tue: "tue", tues: "tue", tuesday: "tue", tir: "tue", tirsdag: "tue", ti: "tue",
+  wed: "wed", weds: "wed", wednesday: "wed", ons: "wed", onsdag: "wed", on: "wed",
+  thu: "thu", thur: "thu", thurs: "thu", thursday: "thu", tor: "thu", torsdag: "thu", to: "thu",
+  fri: "fri", friday: "fri", fre: "fri", fredag: "fri", fr: "fri",
+  sat: "sat", saturday: "sat", lor: "sat", "lør": "sat", lordag: "sat", "lørdag": "sat", la: "sat",
+  sun: "sun", sunday: "sun", son: "sun", "søn": "sun", sondag: "sun", "søndag": "sun", "sø": "sun",
+};
+
+/** Normalize a single day token to mon..sun, or null if unrecognized. */
+export function normalizeDayToken(raw: unknown): "mon" | "tue" | "wed" | "thu" | "fri" | "sat" | "sun" | null {
+  if (typeof raw !== "string") return null;
+  const k = raw.trim().toLowerCase().replace(/\.$/, "");
+  // Prototype-safe lookup: reserved keys ("constructor", "__proto__") must
+  // resolve to null, not inherited Object.prototype members (PR-127 review).
+  return Object.prototype.hasOwnProperty.call(_DAY_MAP, k) ? _DAY_MAP[k] : null;
+}
+
+/** Normalize a clock token to zero-padded "HH:MM", or null if unparseable. */
+export function normalizeTimeToken(raw: unknown): string | null {
+  if (typeof raw === "number" && Number.isFinite(raw)) raw = String(raw);
+  if (typeof raw !== "string") return null;
+  const s = raw.trim();
+  if (!s) return null;
+  // Accept "8", "8:30", "08.30", "0830", "8 30".
+  let m = s.match(/^(\d{1,2})\s*[:.\s]\s*(\d{2})$/);
+  if (!m) {
+    const only = s.match(/^(\d{1,2})$/);
+    if (only) m = [s, only[1], "00"] as unknown as RegExpMatchArray;
+  }
+  if (!m) {
+    const four = s.match(/^(\d{2})(\d{2})$/);
+    if (four) m = [s, four[1], four[2]] as unknown as RegExpMatchArray;
+  }
+  if (!m) return null;
+  const h = parseInt(m[1], 10);
+  const min = parseInt(m[2], 10);
+  if (!Number.isFinite(h) || !Number.isFinite(min) || h < 0 || h > 23 || min < 0 || min > 59) return null;
+  return `${String(h).padStart(2, "0")}:${String(min).padStart(2, "0")}`;
+}
+
+export interface OpeningHoursEntry { day: "mon" | "tue" | "wed" | "thu" | "fri" | "sat" | "sun"; open: string; close: string; }
+
+/**
+ * Best-effort normalize an opening_hours value into the strict schema shape.
+ * Accepts the canonical array, an array with sloppy day/time tokens, a
+ * range string per entry ("08:00-16:00"), or a day-keyed object map
+ * ({ mon: "08-16" } / { monday: { open, close } }). Unsalvageable entries
+ * (closed / "etter avtale" / bad times / unknown day) are dropped.
+ * Returns { value, dropped } — value is null when nothing survived.
+ */
+export function normalizeOpeningHours(
+  input: unknown
+): { value: OpeningHoursEntry[] | null; dropped: number } {
+  let dropped = 0;
+  const out: OpeningHoursEntry[] = [];
+
+  const pushFrom = (dayRaw: unknown, openRaw: unknown, closeRaw: unknown): void => {
+    const day = normalizeDayToken(dayRaw);
+    const open = normalizeTimeToken(openRaw);
+    const close = normalizeTimeToken(closeRaw);
+    if (typeof day === "string" && open && close) out.push({ day, open, close });
+    else dropped++;
+  };
+
+  // Split a value that may be a range string ("08:00-16:00", "8–16") into [open, close].
+  const splitRange = (v: unknown): [unknown, unknown] => {
+    if (typeof v === "string") {
+      const parts = v.split(/[-–—to]+/i).map((p) => p.trim()).filter(Boolean);
+      if (parts.length >= 2) return [parts[0], parts[1]];
+      return [v, undefined];
+    }
+    return [v, undefined];
+  };
+
+  if (Array.isArray(input)) {
+    for (const e of input) {
+      if (e && typeof e === "object" && !Array.isArray(e)) {
+        const obj = e as Record<string, unknown>;
+        if (obj.open !== undefined || obj.close !== undefined) {
+          pushFrom(obj.day, obj.open, obj.close);
+        } else if (typeof obj.hours === "string" || typeof obj.time === "string") {
+          const [o, c] = splitRange(obj.hours ?? obj.time);
+          pushFrom(obj.day, o, c);
+        } else {
+          dropped++;
+        }
+      } else {
+        dropped++;
+      }
+    }
+  } else if (input && typeof input === "object") {
+    // Day-keyed object map.
+    for (const [k, v] of Object.entries(input as Record<string, unknown>)) {
+      if (v && typeof v === "object" && !Array.isArray(v)) {
+        const o = (v as Record<string, unknown>).open;
+        const c = (v as Record<string, unknown>).close;
+        pushFrom(k, o, c);
+      } else if (typeof v === "string") {
+        const [o, c] = splitRange(v);
+        pushFrom(k, o, c);
+      } else {
+        dropped++;
+      }
+    }
+  } else if (input == null) {
+    return { value: null, dropped: 0 };
+  } else {
+    return { value: null, dropped: 1 };
+  }
+
+  return { value: out.length ? out : null, dropped };
+}

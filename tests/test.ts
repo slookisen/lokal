@@ -14295,3 +14295,78 @@ console.log("\n── PR-114: dental MCP server ──");
   }
 }
 
+
+// ── PR-127: opening_hours normalization (tolerant ingest) ────────────────────
+console.log("\n── PR-127: normalizeOpeningHours ──");
+{
+  const { normalizeOpeningHours, normalizeDayToken, normalizeTimeToken } =
+    require("../src/services/dental-store") as typeof import("../src/services/dental-store");
+
+  // Day tokens: Norwegian + English + abbreviations
+  assertEq(normalizeDayToken("mandag"), "mon", "pr127-01a: mandag → mon");
+  assertEq(normalizeDayToken("Tirsdag"), "tue", "pr127-01b: Tirsdag → tue");
+  assertEq(normalizeDayToken("lør"), "sat", "pr127-01c: lør → sat");
+  assertEq(normalizeDayToken("søndag"), "sun", "pr127-01d: søndag → sun");
+  assertEq(normalizeDayToken("Friday"), "fri", "pr127-01e: Friday → fri");
+  assertEq(normalizeDayToken("mon"), "mon", "pr127-01f: mon → mon (passthrough)");
+  assertEq(normalizeDayToken("xyz"), null, "pr127-01g: unknown → null");
+
+  // Time tokens: padding + separators
+  assertEq(normalizeTimeToken("9:00"), "09:00", "pr127-02a: 9:00 → 09:00");
+  assertEq(normalizeTimeToken("08.30"), "08:30", "pr127-02b: 08.30 → 08:30");
+  assertEq(normalizeTimeToken("8"), "08:00", "pr127-02c: 8 → 08:00");
+  assertEq(normalizeTimeToken("0830"), "08:30", "pr127-02d: 0830 → 08:30");
+  assertEq(normalizeTimeToken("25:00"), null, "pr127-02e: 25:00 → null (out of range)");
+  assertEq(normalizeTimeToken("stengt"), null, "pr127-02f: stengt → null");
+
+  // Canonical array passes through unchanged
+  const canonical = normalizeOpeningHours([{ day: "mon", open: "09:00", close: "17:00" }]);
+  assertEq(canonical.dropped, 0, "pr127-03a: canonical array → 0 dropped");
+  assertEq(JSON.stringify(canonical.value), JSON.stringify([{ day: "mon", open: "09:00", close: "17:00" }]),
+    "pr127-03b: canonical array preserved");
+
+  // Sloppy array: pads times + maps Norwegian day, drops the closed entry
+  const sloppy = normalizeOpeningHours([
+    { day: "mandag", open: "9", close: "15.30" },
+    { day: "stengt", open: "x", close: "y" },
+  ]);
+  assertEq(JSON.stringify(sloppy.value), JSON.stringify([{ day: "mon", open: "09:00", close: "15:30" }]),
+    "pr127-04a: sloppy entry normalized");
+  assertEq(sloppy.dropped, 1, "pr127-04b: unparseable entry dropped");
+
+  // Range string per entry
+  const range = normalizeOpeningHours([{ day: "fre", hours: "08:00-16:00" }]);
+  assertEq(JSON.stringify(range.value), JSON.stringify([{ day: "fri", open: "08:00", close: "16:00" }]),
+    "pr127-05: range string split into open/close");
+
+  // Day-keyed object map
+  const mapShape = normalizeOpeningHours({ mon: "08-16", tirsdag: { open: "9", close: "17" } });
+  assertEq(mapShape.value!.length, 2, "pr127-06a: object map → 2 entries");
+  assertTrue(mapShape.value!.some((e) => e.day === "mon" && e.open === "08:00" && e.close === "16:00"),
+    "pr127-06b: map string entry normalized");
+  assertTrue(mapShape.value!.some((e) => e.day === "tue" && e.open === "09:00" && e.close === "17:00"),
+    "pr127-06c: map object entry normalized");
+
+  // Nothing salvageable → value null (handler will drop field, not 400)
+  const empty = normalizeOpeningHours([{ day: "??", open: "etter", close: "avtale" }]);
+  assertEq(empty.value, null, "pr127-07a: unsalvageable → null value");
+  assertEq(empty.dropped, 1, "pr127-07b: unsalvageable → dropped counted");
+
+  // null / garbage input
+  assertEq(normalizeOpeningHours(null).value, null, "pr127-08a: null → null");
+  assertEq(normalizeOpeningHours("garbage").dropped, 1, "pr127-08b: scalar → dropped 1");
+}
+
+// ── PR-127b: prototype-safe day lookup (review fix) ──────────────────────────
+{
+  const { normalizeOpeningHours, normalizeDayToken } =
+    require("../src/services/dental-store") as typeof import("../src/services/dental-store");
+  assertEq(normalizeDayToken("constructor"), null, "pr127b-01: 'constructor' → null (not prototype fn)");
+  assertEq(normalizeDayToken("__proto__"), null, "pr127b-02: '__proto__' → null");
+  assertEq(normalizeDayToken("hasOwnProperty"), null, "pr127b-03: 'hasOwnProperty' → null");
+  // A reserved-word key in an object map must be dropped, valid entries preserved.
+  const r = normalizeOpeningHours({ ["__proto__"]: "08-16", constructor: "09-17", mon: "08-16" });
+  assertEq(JSON.stringify(r.value), JSON.stringify([{ day: "mon", open: "08:00", close: "16:00" }]),
+    "pr127b-04: reserved keys dropped, valid mon entry preserved");
+  assertTrue(r.dropped >= 1, "pr127b-05: reserved-key entries counted as dropped");
+}
