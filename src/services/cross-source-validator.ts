@@ -470,10 +470,49 @@ function collapseDomain(root: string): string {
   return root.replace(/-/g, "");
 }
 
+// PR-129 (2026-06-10): the registrable label without its public suffix, with
+// hyphens stripped. "vesteraalens.no" -> "vesteraalens", "brand.co.uk" -> "brand".
+// Used for cross-TLD same-brand equivalence below.
+function registrableLabel(root: string): string {
+  const first = (root.split(".")[0] ?? root);
+  return first.replace(/-/g, "");
+}
+
 function domainsEquivalent(a: string, b: string): boolean {
   if (a === b) return true;
-  return collapseDomain(a) === collapseDomain(b);
+  if (collapseDomain(a) === collapseDomain(b)) return true;
+  // PR-129: cross-TLD same-brand equality. A producer using the same brand on a
+  // different TLD (vesteraalens.no website vs post@vesteraalens.com email;
+  // teksloseafood.no/.com) is the SAME company — these were stuck in
+  // review_required as domain-coherence false positives. We treat the registrable
+  // LABELS as equal only when they are identical AND distinctive (length >= 4),
+  // so genuinely different companies (eidsmokjott.no vs slakthuset.no — the
+  // Eidsmo contamination case) stay gated, and short generic labels
+  // (mat.no vs mat.com) are NOT collapsed.
+  const la = registrableLabel(a);
+  const lb = registrableLabel(b);
+  // Require an identical, distinctive label (>=6 chars) that is NOT a generic
+  // local-food common noun — two different producers can each own e.g. gard.no
+  // and gard.com, so generic stems must NOT collapse across TLDs (PR-129 review).
+  if (la.length >= 6 && la === lb && !GENERIC_DOMAIN_LABELS.has(la)) return true;
+  return false;
 }
+
+// Generic local-food / geography stems that are too common to treat as a unique
+// brand across TLDs. Stored hyphen-stripped + lowercase (registrableLabel form).
+const GENERIC_DOMAIN_LABELS: ReadonlySet<string> = new Set([
+  "lokalmat", "kortreist", "kortreistmat", "produsent", "produsenter",
+  "gardsmat", "gaardsmat", "bondensmarked", "bondemat", "norskmat",
+  "bakeri", "bakeriet", "ysteri", "ysteriet", "bryggeri", "bryggeriet",
+  "gartneri", "slakteri", "honning", "frukthage", "fiskemat", "sjomat",
+  "kjottmat", "spekemat", "okologisk", "naturmat", "fjordmat", "fjellmat",
+  // PR-129 review round 2 — compound generic food/geo stems that can collide
+  // across TLDs between unrelated producers (false-positive direction).
+  "fjordlaks", "fjellaks", "sjokolade", "villsau", "reinsdyr", "fjordrein",
+  "gardsbakeri", "gardsysteri", "gardsost", "gardsmeieri", "bondegard",
+  "fjellgard", "ostegard", "seterhonning", "gardshonning", "fjordfisk",
+  "lokalmaten", "kortreistmat", "andelslandbruk", "selvplukk",
+]);
 
 export function domainCoherenceCheck(
   agentUrl: string | null | undefined,
