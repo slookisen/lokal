@@ -20,6 +20,7 @@ import {
   listPublicDentalAgents,
   countPublicDentalAgents,
   getDentalStats,
+  getAvailableSpecialties,
   getDentalAgentByOrgnr,
   getDentalAgentById,
   listPoststeder,
@@ -841,10 +842,23 @@ router.get("/sok", (req: Request, res: Response) => {
   if (kjede) filterParams.set("kjede", kjede);
   const baseUrl = "/sok?" + filterParams.toString();
 
-  const specialtyOptions = SPECIALTIES.map(
-    (s) =>
-      `<option value="${escapeHtml(s)}"${spesialitet === s ? " selected" : ""}>${escapeHtml(s)}</option>`
-  ).join("");
+  // Only offer specialties that actually have at least one clinic, so a
+  // user can never pick a value that zeroes-out the result list. The
+  // currently-selected value is always kept (even if it has no clinics now)
+  // so the form round-trips correctly and the result count stays truthful.
+  let specialtyChoices: string[] = SPECIALTIES;
+  try {
+    const withClinics = getAvailableSpecialties(SPECIALTIES);
+    const set = new Set(withClinics);
+    if (spesialitet) set.add(spesialitet);
+    specialtyChoices = SPECIALTIES.filter((s) => set.has(s));
+  } catch { /* db not ready — fall back to full list */ }
+  const specialtyOptions = specialtyChoices
+    .map(
+      (s) =>
+        `<option value="${escapeHtml(s)}"${spesialitet === s ? " selected" : ""}>${escapeHtml(s)}</option>`
+    )
+    .join("");
 
   const resultCards =
     agents.length > 0

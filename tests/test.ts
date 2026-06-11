@@ -12186,6 +12186,141 @@ console.log("\n── PR-100: dental schema extension ──");
   dbFactoryPr100.__resetDbFactoryForTesting();
 })();
 
+// ── FIX finn-tannlege search: filters + sparse-specialty handling ────
+// Root cause: the /sok specialty filter only matched the sparse
+// `available_specialties` JSON column (~2% populated), so selecting any
+// specialty zeroed-out results; and clinics carrying the specialty in
+// their `specialists[]` array were never matched. This block drives the
+// dental store directly (same :memory: pattern as PR-100) and asserts
+// the search behaviour the public /sok page depends on.
+console.log("\n── FIX finn-tannlege: search filters + sparse-specialty ──");
+(() => {
+  const prevPath = process.env.DENTAL_DB_PATH;
+  process.env.DENTAL_DB_PATH = ":memory:";
+
+  const dbFactory = require("../src/database/db-factory") as typeof import("../src/database/db-factory");
+  dbFactory.__resetDbFactoryForTesting();
+
+  const store = require("../src/services/dental-store") as typeof import("../src/services/dental-store");
+  const {
+    createDentalAgent,
+    updateDentalAgent,
+    countPublicDentalAgents,
+    listPublicDentalAgents,
+    getAvailableSpecialties,
+  } = store;
+
+  const SPECIALTIES_FIXTURE = [
+    "kjeveortopedi",
+    "oral kirurgi og oral medisin",
+    "periodonti",
+    "endodonti",
+    "pedodonti",
+    "oral protetikk",
+    "kjeve- og ansiktsradiologi",
+  ];
+
+  // Realistic data: a pile of solo GPs with NO specialty recorded …
+  for (let i = 0; i < 20; i++) {
+    createDentalAgent({
+      navn: `Sok Solo Tannlege ${i}`,
+      poststed: "OSLO",
+      fylke: "Oslo",
+      helfo_agreement: i % 2 === 0 ? "true" : "false",
+    });
+  }
+  // … one clinic in another fylke/poststed for name+poststed matching …
+  createDentalAgent({ navn: "Sok Bergen Tann", poststed: "BERGEN", fylke: "Vestland", helfo_agreement: "true" });
+  // … one specialist clinic whose specialty is on available_specialties …
+  createDentalAgent({
+    navn: "Sok Oslo Kjevekirurgi",
+    poststed: "OSLO",
+    fylke: "Oslo",
+    available_specialties: ["oral kirurgi og oral medisin"],
+  });
+  // … and one whose specialty ONLY lives in specialists[] (the case the
+  //    old available_specialties-only filter silently dropped).
+  const personOnlyId = createDentalAgent({ navn: "Sok Spesialist Senter", poststed: "OSLO", fylke: "Oslo" });
+  updateDentalAgent(personOnlyId, {
+    specialists: [{ name: "Dr Kirurg", specialty: "oral kirurgi og oral medisin" }],
+  });
+
+  // 1. Empty search must return clinics (not zero).
+  assertTrue(countPublicDentalAgents({}) >= 23, "sok-fix: empty search returns all non-rejected clinics");
+  assertTrue(listPublicDentalAgents({}, 50, 0).length >= 23, "sok-fix: empty search list non-empty");
+
+  // 2. Free-text name match.
+  assertTrue(countPublicDentalAgents({ q: "Solo Tannlege" }) === 20, "sok-fix: q matches clinic name");
+
+  // 3. Free-text poststed match (and case-insensitive — SQLite LIKE).
+  assertTrue(countPublicDentalAgents({ q: "BERGEN" }) === 1, "sok-fix: q matches poststed (upper)");
+  assertTrue(countPublicDentalAgents({ q: "bergen" }) === 1, "sok-fix: q matches poststed case-insensitively");
+
+  // 4. q matches name OR poststed (Oslo poststed on the 20 solos + 2 specialist clinics).
+  assertTrue(countPublicDentalAgents({ q: "OSLO" }) === 22, "sok-fix: q matches name OR poststed (Oslo rows)");
+
+  // 5. Fylke filter.
+  assertTrue(countPublicDentalAgents({ fylke: "Oslo" }) === 22, "sok-fix: fylke filter applies");
+  assertTrue(countPublicDentalAgents({ fylke: "Vestland" }) === 1, "sok-fix: fylke filter Vestland");
+
+  // 6. Helfo filter.
+  assertTrue(countPublicDentalAgents({ helfo_agreement: "true" }) === 11, "sok-fix: helfo filter applies (10 even solos + Bergen)");
+
+  // 7. CORE FIX — specialty filter matches BOTH available_specialties AND
+  //    specialists[]; the person-only clinic is no longer dropped.
+  assertTrue(
+    countPublicDentalAgents({ specialty: "oral kirurgi og oral medisin" }) === 2,
+    "sok-fix: specialty matches available_specialties OR specialists[] (2 clinics)"
+  );
+  {
+    const names = listPublicDentalAgents({ specialty: "oral kirurgi og oral medisin" }, 50, 0)
+      .map((a) => a.navn)
+      .sort();
+    assertTrue(
+      names.includes("Sok Spesialist Senter"),
+      "sok-fix: specialists-only clinic appears in specialty results"
+    );
+    assertTrue(
+      names.includes("Sok Oslo Kjevekirurgi"),
+      "sok-fix: available_specialties clinic appears in specialty results"
+    );
+  }
+
+  // 8. A sparse specialty does NOT zero-out everything: clinics WITHOUT
+  //    a specialty are still reachable via every other filter (they are
+  //    general dentists and only excluded when a specialty is requested).
+  assertTrue(
+    countPublicDentalAgents({ fylke: "Oslo" }) > countPublicDentalAgents({ specialty: "oral kirurgi og oral medisin" }),
+    "sok-fix: requesting a specialty narrows results but other searches stay full"
+  );
+
+  // 9. A specialty with zero coverage returns 0 (correct) — and is hidden
+  //    from the dropdown so users can't pick it.
+  assertTrue(countPublicDentalAgents({ specialty: "periodonti" }) === 0, "sok-fix: zero-coverage specialty returns 0");
+  {
+    const offered = getAvailableSpecialties(SPECIALTIES_FIXTURE);
+    assertTrue(offered.includes("oral kirurgi og oral medisin"), "sok-fix: dropdown offers covered specialty");
+    assertTrue(!offered.includes("periodonti"), "sok-fix: dropdown hides zero-coverage specialty");
+    assertTrue(offered.length === 1, "sok-fix: dropdown only offers specialties with clinics");
+  }
+
+  // 10. Combined filters AND correctly (fylke + specialty).
+  assertTrue(
+    countPublicDentalAgents({ fylke: "Oslo", specialty: "oral kirurgi og oral medisin" }) === 2,
+    "sok-fix: fylke + specialty combine (both specialist clinics are in Oslo)"
+  );
+  assertTrue(
+    countPublicDentalAgents({ fylke: "Vestland", specialty: "oral kirurgi og oral medisin" }) === 0,
+    "sok-fix: fylke + specialty combine (none in Vestland)"
+  );
+
+  // Restore env so the next async block doesn't leak the :memory: path.
+  if (prevPath === undefined) delete process.env.DENTAL_DB_PATH;
+  else process.env.DENTAL_DB_PATH = prevPath;
+  dbFactory.__resetDbFactoryForTesting();
+})();
+
+
 
 
 // ── PR-100b: Fly volume path hotfix ──────────────────────────────────
