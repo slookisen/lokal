@@ -36,6 +36,7 @@ import adminRunsRoutes from "./routes/admin-runs";
 import adminAgentsRoutes from "./routes/admin-agents";
 import adminOutreachPoolRoutes from "./routes/admin-outreach-pool";
 import adminRunVerifierRoutes from "./routes/admin-run-verifier";
+import adminRunPlatformVerifierRoutes from "./routes/admin-run-platform-verifier";
 import adminVerifierSweepStatusRouter from "./routes/admin-verifier-sweep-status";
 import ownerPortalRoutes from "./routes/owner-portal";
 import adminAgentAuditRoutes from "./routes/admin-agent-audit";
@@ -348,6 +349,8 @@ app.use("/admin/runs", adminLimiter, adminRunsRoutes);
 app.use("/admin/agents", adminLimiter, adminAgentsRoutes);
 app.use("/admin/outreach-ready-pool", adminLimiter, adminOutreachPoolRoutes);
 app.use("/admin/run-verifier", adminLimiter, adminRunVerifierRoutes);
+// Phase 2: server-side platform-verifier (deterministic probe loop, dry_run default)
+app.use("/admin/run-platform-verifier", adminLimiter, adminRunPlatformVerifierRoutes);
 app.use("/admin/verifier/sweep-status", adminLimiter, adminVerifierSweepStatusRouter);
 // ─── M1: Daniel-only agent audit trail (Phase 5.4a) ──────────
 app.use("/admin/agent-audit", adminLimiter, adminAgentAuditRoutes);

@@ -13761,6 +13761,413 @@ const _pr125Promise = (async () => {
   assertEq(day?.endTime, "15:00", "pr125: parser captured endTime 15:00");
 })();
 
+
+// ─── orch-PR Phase 2: platform-verifier server-side port ──────────────────
+// Covers the deterministic probe loop ported from the Cowork platform-verifier
+// (skill: platform-verifier/SKILL.md). Tests each claim-type verdict path,
+// the fail-safe (probe error → skipped, NEVER matched), dry_run-does-not-write,
+// and admin-auth rejection. Runs against an in-memory SQLite ledger with an
+// injected mock fetch — no real network, no prod DB.
+console.log("── orch-PR Phase 2: platform-verifier (run-platform-verifier) ──");
+const _platformVerifierPromise = (async () => {
+  const Database = require("better-sqlite3");
+  const {
+    runPlatformVerifier,
+    probeClaim,
+    rollUpRunState,
+    buildParityLine,
+  } = require("../src/services/platform-verifier");
+
+  // A mock fetch keyed by URL → status. Records every URL it was asked for.
+  function mockFetch(map: Record<string, number>, opts: { throwOn?: string } = {}) {
+    const calls: string[] = [];
+    const fn = async (url: string) => {
+      calls.push(url);
+      if (opts.throwOn && url.includes(opts.throwOn)) {
+        throw new Error("injected network failure");
+      }
+      const status = map[url];
+      if (status === undefined) return { status: 0 }; // unknown → unreachable
+      return { status };
+    };
+    return { fn, calls };
+  }
+
+  const fixedNow = () => Date.parse("2026-06-11T12:00:00Z");
+
+  // Production-shaped runs table, mirrors src/database/init.ts.
+  function freshDb() {
+    const db = new Database(":memory:");
+    db.exec(`
+      CREATE TABLE runs (
+        run_id TEXT PRIMARY KEY,
+        vertical TEXT NOT NULL DEFAULT 'rfb',
+        agent TEXT NOT NULL,
+        trigger_source TEXT NOT NULL DEFAULT 'cron',
+        started_at TEXT NOT NULL,
+        finished_at TEXT,
+        status TEXT NOT NULL,
+        claims TEXT NOT NULL DEFAULT '[]',
+        evidence TEXT NOT NULL DEFAULT '[]',
+        next_suggested TEXT,
+        errors TEXT,
+        notes TEXT,
+        verifier_state TEXT NOT NULL DEFAULT 'pending',
+        verifier_checked_at TEXT,
+        verifier_findings TEXT,
+        created_at TEXT NOT NULL DEFAULT (datetime('now'))
+      );
+    `);
+    return db;
+  }
+
+  function seedRun(db: any, runId: string, claims: any[], evidence: any[] = []) {
+    const startedAt = new Date(Date.now() - 60_000).toISOString(); // 1 min ago
+    db.prepare(`
+      INSERT INTO runs (run_id, agent, started_at, status, claims, evidence, verifier_state)
+      VALUES (?, 'test-agent', ?, 'completed', ?, ?, 'pending')
+    `).run(runId, startedAt, JSON.stringify(claims), JSON.stringify(evidence));
+  }
+
+  // ── probeClaim: file_deployed 200 → matched ──
+  {
+    const { fn } = mockFetch({ "https://rettfrabonden.com/llms.txt": 200 });
+    const f = await probeClaim({
+      claim: { type: "file_deployed", value: "https://rettfrabonden.com/llms.txt" },
+      claimIdx: 0, evidence: [], fetchImpl: fn, timeoutMs: 1000, now: fixedNow,
+    });
+    assertEq(f.matched, true, "pv: file_deployed 200 → matched");
+    assertEq(f.skipped, undefined, "pv: file_deployed 200 finding not marked skipped");
+  }
+
+  // ── probeClaim: file_deployed 404 → failed (probe ran, disagreed) ──
+  {
+    const { fn } = mockFetch({ "https://rettfrabonden.com/missing.txt": 404 });
+    const f = await probeClaim({
+      claim: { type: "file_deployed", value: "https://rettfrabonden.com/missing.txt" },
+      claimIdx: 0, evidence: [], fetchImpl: fn, timeoutMs: 1000, now: fixedNow,
+    });
+    assertEq(f.matched, false, "pv: file_deployed 404 → not matched");
+    assertEq(f.skipped, false, "pv: file_deployed 404 → failed (not skipped)");
+  }
+
+  // ── probeClaim: file_deployed network error → skipped (fail-safe) ──
+  {
+    const { fn } = mockFetch({}, { throwOn: "rettfrabonden" });
+    const f = await probeClaim({
+      claim: { type: "file_deployed", value: "https://rettfrabonden.com/x.txt" },
+      claimIdx: 0, evidence: [], fetchImpl: fn, timeoutMs: 1000, now: fixedNow,
+    });
+    assertEq(f.skipped, true, "pv: file_deployed network error → skipped");
+    assertEq(f.matched, false, "pv: file_deployed network error → never matched (fail-safe)");
+  }
+
+  // ── probeClaim: file_deployed GitHub blob URL converts to raw before probing ──
+  {
+    const rawUrl = "https://raw.githubusercontent.com/slookisen/lokal/main/server.json";
+    const { fn, calls } = mockFetch({ [rawUrl]: 200 });
+    const f = await probeClaim({
+      claim: { type: "file_deployed", value: "https://github.com/slookisen/lokal/blob/main/server.json" },
+      claimIdx: 0, evidence: [], fetchImpl: fn, timeoutMs: 1000, now: fixedNow,
+    });
+    assertEq(f.matched, true, "pv: github blob URL probed as raw → matched");
+    assertTrue(calls.includes(rawUrl), "pv: blob→raw conversion applied before fetch");
+  }
+
+  // ── probeClaim: http_endpoint expected status match → matched ──
+  {
+    const { fn } = mockFetch({ "https://rettfrabonden.com/health": 200 });
+    const f = await probeClaim({
+      claim: { type: "http_endpoint", value: "https://rettfrabonden.com/health", meta: { expected_status: 200 } },
+      claimIdx: 0, evidence: [], fetchImpl: fn, timeoutMs: 1000, now: fixedNow,
+    });
+    assertEq(f.matched, true, "pv: http_endpoint expected 200 → matched");
+  }
+
+  // ── probeClaim: http_endpoint wrong status → failed ──
+  {
+    const { fn } = mockFetch({ "https://rettfrabonden.com/health": 500 });
+    const f = await probeClaim({
+      claim: { type: "http_endpoint", value: "https://rettfrabonden.com/health" },
+      claimIdx: 0, evidence: [], fetchImpl: fn, timeoutMs: 1000, now: fixedNow,
+    });
+    assertEq(f.matched, false, "pv: http_endpoint 500 vs expected 200 → not matched");
+    assertEq(f.skipped, false, "pv: http_endpoint status-mismatch → failed");
+  }
+
+  // ── probeClaim: http_endpoint unreachable → skipped (fail-safe) ──
+  {
+    const { fn } = mockFetch({}); // unknown URL → status 0
+    const f = await probeClaim({
+      claim: { type: "http_endpoint", value: "https://down.example.com/x" },
+      claimIdx: 0, evidence: [], fetchImpl: fn, timeoutMs: 1000, now: fixedNow,
+    });
+    assertEq(f.skipped, true, "pv: http_endpoint unreachable → skipped");
+    assertEq(f.matched, false, "pv: http_endpoint unreachable → never matched");
+  }
+
+  // ── probeClaim: db_state_change trivially-true (alerts_drafted=0) → matched ──
+  {
+    const { fn } = mockFetch({});
+    const f = await probeClaim({
+      claim: { type: "db_state_change", value: 0, meta: { kind: "alerts_drafted" } },
+      claimIdx: 0, evidence: [], fetchImpl: fn, timeoutMs: 1000, now: fixedNow,
+    });
+    assertEq(f.matched, true, "pv: db_state_change alerts_drafted=0 → matched (trivial)");
+  }
+
+  // ── probeClaim: db_state_change alert_level=none → matched ──
+  {
+    const { fn } = mockFetch({});
+    const f = await probeClaim({
+      claim: { type: "db_state_change", value: 3, meta: { alert_level: "none" } },
+      claimIdx: 0, evidence: [], fetchImpl: fn, timeoutMs: 1000, now: fixedNow,
+    });
+    assertEq(f.matched, true, "pv: db_state_change alert_level=none → matched (trivial)");
+  }
+
+  // ── probeClaim: db_state_change cross-source kind, no evidence → skipped ──
+  {
+    const { fn } = mockFetch({});
+    const f = await probeClaim({
+      claim: { type: "db_state_change", value: 5, meta: { kind: "outreach_log_inserted" } },
+      claimIdx: 0, evidence: [], fetchImpl: fn, timeoutMs: 1000, now: fixedNow,
+    });
+    assertEq(f.skipped, true, "pv: db_state_change cross-source w/o evidence → skipped (backend-pending)");
+    assertEq(f.matched, false, "pv: db_state_change cross-source → never matched without a probe");
+  }
+
+  // ── probeClaim: unknown claim.type → skipped ──
+  {
+    const { fn } = mockFetch({});
+    const f = await probeClaim({
+      claim: { type: "totally_unknown_type" as any, value: "x" },
+      claimIdx: 0, evidence: [], fetchImpl: fn, timeoutMs: 1000, now: fixedNow,
+    });
+    assertEq(f.skipped, true, "pv: unknown claim.type → skipped");
+  }
+
+  // ── probeClaim: custom shell snippet → skipped (never executed) ──
+  {
+    const { fn } = mockFetch({});
+    const f = await probeClaim({
+      claim: { type: "custom", value: "x", meta: { probe: "rm -rf /" } },
+      claimIdx: 0, evidence: [], fetchImpl: fn, timeoutMs: 1000, now: fixedNow,
+    });
+    assertEq(f.skipped, true, "pv: custom shell snippet → skipped (security: never executed)");
+  }
+
+  // ── probeClaim: custom URL probe 200 → matched ──
+  {
+    const { fn } = mockFetch({ "https://api.example.com/ping": 200 });
+    const f = await probeClaim({
+      claim: { type: "custom", value: "x", meta: { probe: "https://api.example.com/ping" } },
+      claimIdx: 0, evidence: [], fetchImpl: fn, timeoutMs: 1000, now: fixedNow,
+    });
+    assertEq(f.matched, true, "pv: custom URL probe 200 → matched");
+  }
+
+  // ── probeClaim: commit type with evidence URL 200 → matched via fallback ──
+  {
+    const ev = "https://github.com/slookisen/lokal/commit/abc123";
+    const { fn } = mockFetch({ [ev]: 200 });
+    const f = await probeClaim({
+      claim: { type: "commit", value: "abc1234" },
+      claimIdx: 0,
+      evidence: [{ claim_idx: 0, url: ev }],
+      fetchImpl: fn, timeoutMs: 1000, now: fixedNow,
+    });
+    assertEq(f.matched, true, "pv: commit with reachable evidence URL → matched (fallback)");
+  }
+
+  // ── probeClaim: commit, evidence URL 404 → skipped (unreachable ev = unknown) ──
+  {
+    const ev = "https://github.com/slookisen/lokal/commit/missing";
+    const { fn } = mockFetch({ [ev]: 404 });
+    const f = await probeClaim({
+      claim: { type: "commit", value: "deadbeef" },
+      claimIdx: 0,
+      evidence: [{ claim_idx: 0, url: ev }],
+      fetchImpl: fn, timeoutMs: 1000, now: fixedNow,
+    });
+    assertEq(f.skipped, true, "pv: commit with 4xx evidence URL → skipped (never failed)");
+    assertEq(f.matched, false, "pv: commit with 4xx evidence URL → never matched");
+  }
+
+  // ── probeClaim: thrown error inside probe → skipped (absolute fail-safe) ──
+  {
+    const throwingFetch = async () => { throw new Error("boom"); };
+    const f = await probeClaim({
+      claim: { type: "http_endpoint", value: "https://x.example.com/y" },
+      claimIdx: 0, evidence: [], fetchImpl: throwingFetch as any, timeoutMs: 1000, now: fixedNow,
+    });
+    // httpStatus swallows fetch errors → status 0 → skipped
+    assertEq(f.skipped, true, "pv: probe fetch throws → skipped (fail-safe)");
+    assertEq(f.matched, false, "pv: probe fetch throws → never matched");
+  }
+
+  // ── rollUpRunState ──
+  assertEq(rollUpRunState([]), "skipped", "pv: rollUp empty → skipped");
+  assertEq(
+    rollUpRunState([{ claim_idx: 0, probe_kind: "x", matched: true, reason: "", probed_at: "" }]),
+    "verified", "pv: rollUp all matched → verified");
+  assertEq(
+    rollUpRunState([
+      { claim_idx: 0, probe_kind: "x", matched: true, reason: "", probed_at: "" },
+      { claim_idx: 1, probe_kind: "x", matched: false, reason: "", probed_at: "" },
+    ]),
+    "failed", "pv: rollUp any failed → failed");
+  assertEq(
+    rollUpRunState([
+      { claim_idx: 0, probe_kind: "x", matched: false, skipped: true, reason: "", probed_at: "" },
+      { claim_idx: 1, probe_kind: "x", matched: false, skipped: true, reason: "", probed_at: "" },
+    ]),
+    "skipped", "pv: rollUp all skipped → skipped (neutral, not failed)");
+
+  // ── runPlatformVerifier: dry_run=true does NOT write the ledger ──
+  {
+    const db = freshDb();
+    seedRun(db, "pv-dry-1", [
+      { type: "file_deployed", value: "https://rettfrabonden.com/llms.txt" },
+    ]);
+    const { fn } = mockFetch({ "https://rettfrabonden.com/llms.txt": 200 });
+    const res = await runPlatformVerifier({ db, dryRun: true, fetchImpl: fn, now: fixedNow });
+    assertEq(res.dry_run, true, "pv: dry_run flag echoed true");
+    assertEq(res.processed, 1, "pv: dry_run processed 1 run");
+    assertEq(res.matched, 1, "pv: dry_run computed 1 matched verdict");
+    // Ledger must be UNTOUCHED.
+    const row = db.prepare("SELECT verifier_state, verifier_checked_at, verifier_findings FROM runs WHERE run_id = ?").get("pv-dry-1") as any;
+    assertEq(row.verifier_state, "pending", "pv: dry_run did NOT change verifier_state");
+    assertEq(row.verifier_checked_at, null, "pv: dry_run did NOT set verifier_checked_at");
+    assertEq(row.verifier_findings, null, "pv: dry_run did NOT write findings");
+    assertEq(res.runs[0].written, false, "pv: dry_run reports written=false");
+    db.close();
+  }
+
+  // ── runPlatformVerifier: dry_run=false WRITES findings back ──
+  {
+    const db = freshDb();
+    seedRun(db, "pv-live-1", [
+      { type: "file_deployed", value: "https://rettfrabonden.com/llms.txt" },
+      { type: "file_deployed", value: "https://rettfrabonden.com/missing.txt" },
+    ]);
+    const { fn } = mockFetch({
+      "https://rettfrabonden.com/llms.txt": 200,
+      "https://rettfrabonden.com/missing.txt": 404,
+    });
+    const res = await runPlatformVerifier({ db, dryRun: false, fetchImpl: fn, now: fixedNow });
+    assertEq(res.dry_run, false, "pv: live flag echoed false");
+    assertEq(res.matched, 1, "pv: live computed 1 matched");
+    assertEq(res.failed, 1, "pv: live computed 1 failed");
+    const row = db.prepare("SELECT verifier_state, verifier_checked_at, verifier_findings FROM runs WHERE run_id = ?").get("pv-live-1") as any;
+    assertEq(row.verifier_state, "failed", "pv: live wrote verifier_state=failed (one claim 404)");
+    assertTrue(typeof row.verifier_checked_at === "string", "pv: live set verifier_checked_at");
+    const findings = JSON.parse(row.verifier_findings);
+    assertEq(findings.length, 2, "pv: live persisted both findings");
+    assertEq(res.runs[0].written, true, "pv: live reports written=true");
+    db.close();
+  }
+
+  // ── runPlatformVerifier: idempotent — second live run re-marks identically ──
+  {
+    const db = freshDb();
+    seedRun(db, "pv-idem-1", [
+      { type: "db_state_change", value: 0, meta: { kind: "alerts_drafted" } },
+    ]);
+    const { fn } = mockFetch({});
+    const r1 = await runPlatformVerifier({ db, dryRun: false, fetchImpl: fn, now: fixedNow });
+    // After the first write the run is no longer 'pending', so a second pass
+    // sees no pending runs (no double-marking).
+    const r2 = await runPlatformVerifier({ db, dryRun: false, fetchImpl: fn, now: fixedNow });
+    assertEq(r1.processed, 1, "pv: idempotency first pass processes the run");
+    assertEq(r2.processed, 0, "pv: idempotency second pass sees no pending (no double-mark)");
+    db.close();
+  }
+
+  // ── runPlatformVerifier: limit caps runs probed ──
+  {
+    const db = freshDb();
+    for (let i = 0; i < 5; i++) {
+      seedRun(db, `pv-lim-${i}`, [{ type: "db_state_change", value: 0, meta: { kind: "alerts_drafted" } }]);
+    }
+    const { fn } = mockFetch({});
+    const res = await runPlatformVerifier({ db, dryRun: true, limit: 2, fetchImpl: fn, now: fixedNow });
+    assertEq(res.processed, 2, "pv: limit=2 caps processed to 2");
+    db.close();
+  }
+
+  // ── buildParityLine: shape the comparator consumes ──
+  {
+    const db = freshDb();
+    seedRun(db, "pv-parity-1", [
+      { type: "file_deployed", value: "https://rettfrabonden.com/llms.txt" },
+    ]);
+    const { fn } = mockFetch({ "https://rettfrabonden.com/llms.txt": 200 });
+    const res = await runPlatformVerifier({ db, dryRun: true, fetchImpl: fn, now: fixedNow });
+    const parity = JSON.parse(res.parityLine);
+    assertEq(parity.source, "fly-shadow", "pv: parity line tagged source=fly-shadow");
+    assertEq(parity.processed, 1, "pv: parity line carries processed count");
+    assertEq(parity.claims.length, 1, "pv: parity line lists per-claim verdicts");
+    assertEq(parity.claims[0].run_id, "pv-parity-1", "pv: parity claim carries run_id");
+    assertEq(parity.claims[0].verdict, "matched", "pv: parity claim carries verdict");
+    assertTrue(typeof parity.claims[0].claim_id === "number", "pv: parity claim carries claim_id");
+    db.close();
+  }
+
+  // ── AUTH: route requireAdmin rejects missing / zero key ──
+  // Exercise the route's gate directly (no HTTP server): build a fake req/res
+  // and assert the handler refuses without a valid X-Admin-Key.
+  {
+    const prevAdmin = process.env.ADMIN_KEY;
+    const prevAnalytics = process.env.ANALYTICS_ADMIN_KEY;
+    process.env.ADMIN_KEY = "secret-key";
+    delete process.env.ANALYTICS_ADMIN_KEY;
+    // Re-require the route module fresh so it reads the env we just set.
+    const routePath = require.resolve("../src/routes/admin-run-platform-verifier");
+    delete require.cache[routePath];
+    const routerModule = require("../src/routes/admin-run-platform-verifier").default;
+
+    // Find the POST "/" layer in the express router stack.
+    const layer = routerModule.stack.find(
+      (l: any) => l.route && l.route.path === "/" && l.route.methods && l.route.methods.post,
+    );
+    assertTrue(!!layer, "pv-auth: POST / handler is registered on the router");
+    const handler = layer.route.stack[0].handle;
+
+    function fakeRes() {
+      const r: any = { statusCode: 200, body: undefined };
+      r.status = (c: number) => { r.statusCode = c; return r; };
+      r.json = (b: any) => { r.body = b; return r; };
+      return r;
+    }
+
+    // Missing key → 403 (repo convention; rejects non-2xx).
+    {
+      const res = fakeRes();
+      await handler({ headers: {}, body: {}, query: {} } as any, res as any);
+      assertEq(res.statusCode, 403, "pv-auth: missing X-Admin-Key → 403 (rejected)");
+      assertTrue(res.statusCode >= 400, "pv-auth: missing key is a rejection (non-2xx)");
+    }
+    // Empty/zero key → 403.
+    {
+      const res = fakeRes();
+      await handler({ headers: { "x-admin-key": "" }, body: {}, query: {} } as any, res as any);
+      assertEq(res.statusCode, 403, "pv-auth: empty X-Admin-Key → 403 (rejected)");
+    }
+    // Wrong key → 403.
+    {
+      const res = fakeRes();
+      await handler({ headers: { "x-admin-key": "nope" }, body: {}, query: {} } as any, res as any);
+      assertEq(res.statusCode, 403, "pv-auth: wrong X-Admin-Key → 403 (rejected)");
+    }
+
+    // restore env
+    if (prevAdmin === undefined) delete process.env.ADMIN_KEY; else process.env.ADMIN_KEY = prevAdmin;
+    if (prevAnalytics === undefined) delete process.env.ANALYTICS_ADMIN_KEY; else process.env.ANALYTICS_ADMIN_KEY = prevAnalytics;
+    delete require.cache[routePath];
+  }
+})();
+
 // ── REPORT ────────────────────────────────────────────────────────────
 
 // Wait for the M2 owner-portal async tests before reporting so their
@@ -13789,6 +14196,7 @@ const _pr125Promise = (async () => {
   try { await _pr106Promise; } catch { /* errors already pushed to failures */ }
   try { await _pr110Promise; } catch { /* errors already pushed to failures */ }
   try { await _pr125Promise; } catch { /* errors already pushed to failures */ }
+  try { await _platformVerifierPromise; } catch { /* errors already pushed to failures */ }
   // PR-109 tests are synchronous (IIFE) — no promise needed
   // Drop pre-existing intg failures (unmasked by awaiting) — they predate M2
   // and live behind a separate fix-it task. Counting them here would surface
