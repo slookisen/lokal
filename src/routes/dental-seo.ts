@@ -498,6 +498,9 @@ function dentalShell(content: string, opts: ShellOptions): string {
   const ldScripts = ldArr
     .map((ld) => `<script type="application/ld+json">${JSON.stringify(ld).replace(/<\//g, "<\\/")}</script>`)
     .join("\n");
+  // OG/Twitter share image. SVG favicon is the only platform-owned visual asset
+  // we ship, so it doubles as the default share image (overridable via opts.ogImage).
+  const ogImage = opts.ogImage || `${DENTAL_BASE_URL}/favicon.svg`;
   return `<!DOCTYPE html>
 <html lang="nb">
 <head>
@@ -505,12 +508,21 @@ function dentalShell(content: string, opts: ShellOptions): string {
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>${escapeHtml(opts.title)}</title>
 <meta name="description" content="${escapeHtml(desc)}">
+<meta name="robots" content="index, follow, max-snippet:-1, max-image-preview:large">
 <link rel="canonical" href="${escapeHtml(canonical)}">
 <link rel="icon" type="image/svg+xml" href="/favicon.svg">
 <meta property="og:title" content="${escapeHtml(opts.title)}">
 <meta property="og:description" content="${escapeHtml(desc)}">
 <meta property="og:url" content="${escapeHtml(canonical)}">
 <meta property="og:type" content="website">
+<meta property="og:locale" content="nb_NO">
+<meta property="og:site_name" content="Finn-tannlege.com">
+<meta property="og:image" content="${escapeHtml(ogImage)}">
+<meta property="og:image:alt" content="Finn-tannlege.com — uavhengig oversikt over tannleger i Norge">
+<meta name="twitter:card" content="summary">
+<meta name="twitter:title" content="${escapeHtml(opts.title)}">
+<meta name="twitter:description" content="${escapeHtml(desc)}">
+<meta name="twitter:image" content="${escapeHtml(ogImage)}">
 ${ldScripts}
 ${DENTAL_CSS}
 </head>
@@ -1078,24 +1090,43 @@ function renderClinicProfile(
     : "";
 
   // ── JSON-LD Dentist
+  const clinicJsonLdDesc = agent.om_oss
+    ? agent.om_oss
+    : `Tannlegeklinikk${agent.poststed ? ` i ${titleCasePoststed(agent.poststed)}` : ""}${agent.fylke ? `, ${agent.fylke}` : ""}.`;
   const jsonLd: Record<string, unknown> = {
     "@context": "https://schema.org",
     "@type": "Dentist",
+    // @id makes the node referenceable and de-dupes across pages (mirrors rfb LocalBusiness).
+    "@id": `${canonical}#dentist`,
     name: agent.navn,
+    description: clinicJsonLdDesc,
     url: canonical,
+    // Google requires an image for LocalBusiness rich results — fall back to platform mark.
+    image: `${DENTAL_BASE_URL}/favicon.svg`,
     ...(agent.telefon ? { telephone: agent.telefon } : {}),
+    ...(agent.epost ? { email: agent.epost } : {}),
     ...(safeUrl(agent.hjemmeside) ? { sameAs: safeUrl(agent.hjemmeside) } : {}),
     address: {
       "@type": "PostalAddress",
       ...(agent.adresse ? { streetAddress: agent.adresse } : {}),
       ...(agent.postnummer ? { postalCode: agent.postnummer } : {}),
       ...(agent.poststed ? { addressLocality: agent.poststed } : {}),
+      ...(agent.fylke ? { addressRegion: agent.fylke } : {}),
       addressCountry: "NO",
     },
+    ...(agent.poststed || agent.fylke
+      ? { areaServed: { "@type": "City", name: agent.poststed ? titleCasePoststed(agent.poststed) : agent.fylke } }
+      : {}),
     ...(agent.lat && agent.lng
       ? { geo: { "@type": "GeoCoordinates", latitude: agent.lat, longitude: agent.lng } }
       : {}),
   };
+  // medicalSpecialty — only emit fields that exist (Schema.org MedicalSpecialty as free text).
+  if (agent.available_specialties && agent.available_specialties.length > 0) {
+    jsonLd.medicalSpecialty = agent.available_specialties.length === 1
+      ? agent.available_specialties[0]
+      : agent.available_specialties;
+  }
   if (agent.opening_hours && agent.opening_hours.length > 0) {
     const dayMap: Record<string, string> = {
       mon: "Monday", tue: "Tuesday", wed: "Wednesday", thu: "Thursday",

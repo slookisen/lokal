@@ -13904,6 +13904,157 @@ const _pr125Promise = (async () => {
 // and admin-auth rejection. Runs against an in-memory SQLite ledger with an
 // injected mock fetch — no real network, no prod DB.
 console.log("── orch-PR Phase 2: platform-verifier (run-platform-verifier) ──");
+// ── orch-pr: finn-tannlege SEO — per-clinic SSR, Dentist JSON-LD, sitemap, robots ──
+// Boots the dental-seo router against an in-memory dental DB and asserts the
+// crawlable per-clinic page, sitemap, and robots.txt expose the right SEO surface.
+const _seoDentalPromise = (async () => {
+  // Serialize after the owner-portal (M2) + integration tests so our fresh
+  // module re-requires + db-factory reset cannot race their shared init DB
+  // (same protocol as _m2Promise awaiting _intgPromise).
+  try { await _intgPromise; } catch { /* owns its own failures */ }
+  try { await _m2Promise; } catch { /* owns its own failures */ }
+  const prevDentalPath = process.env.DENTAL_DB_PATH;
+  process.env.DENTAL_DB_PATH = ":memory:";
+  const prevBase = process.env.DENTAL_BASE_URL;
+  process.env.DENTAL_BASE_URL = "https://finn-tannlege.com";
+
+  // Fresh db-factory + store + router (mirror PR-109 reset pattern).
+  const dbFactoryPathSeo = require.resolve("../src/database/db-factory");
+  delete require.cache[dbFactoryPathSeo];
+  const dbFactorySeo = require("../src/database/db-factory") as typeof import("../src/database/db-factory");
+  dbFactorySeo.__resetDbFactoryForTesting();
+
+  const storePathSeo = require.resolve("../src/services/dental-store");
+  delete require.cache[storePathSeo];
+  const storeSeo = require("../src/services/dental-store") as typeof import("../src/services/dental-store");
+  const { createDentalAgent, slugifyClinic } = {
+    ...storeSeo,
+    slugifyClinic: (require("../src/routes/dental-seo") as typeof import("../src/routes/dental-seo")).slugifyClinic,
+  } as any;
+
+  // Seed one rich, verified clinic with a 9-digit org_nr so it gets a /klinikk/<slug> URL.
+  const ORG = "100200300";
+  const NAVN = "Testbyen Tannklinikk AS";
+  createDentalAgent({
+    navn: NAVN,
+    org_nr: ORG,
+    adresse: "Storgata 1",
+    postnummer: "0150",
+    poststed: "Oslo",
+    fylke: "Oslo",
+    telefon: "22 33 44 55",
+    epost: "post@testbyen-tann.example",
+    helfo_agreement: "true",
+    available_specialties: ["endodonti", "kjeveortopedi"],
+    enrichment_state: "enriched",
+    verification_status: "verified",
+  } as any);
+
+  // Deep-scrape fields (om_oss, opening_hours) are written by the enrichment
+  // worker, not createDentalAgent's INSERT — set them directly to exercise the
+  // full JSON-LD (openingHoursSpecification) + om_oss render paths.
+  {
+    const seoDentalDb = dbFactorySeo.getDb("dental");
+    seoDentalDb.prepare(
+      "UPDATE dental_agents SET opening_hours = ?, om_oss = ? WHERE org_nr = ?"
+    ).run(
+      JSON.stringify([{ day: "mon", open: "08:00", close: "16:00" }]),
+      "Moderne tannlegeklinikk i hjertet av Oslo.",
+      ORG
+    );
+  }
+
+  const seoSlug = slugifyClinic(NAVN, ORG);
+
+  // Fresh dental-seo router bound to this in-memory DB.
+  const seoRouterPath = require.resolve("../src/routes/dental-seo");
+  delete require.cache[seoRouterPath];
+  const dentalSeoRouter = (require("../src/routes/dental-seo") as any).default;
+
+  const expressMod = (await import("express")).default;
+  const app = expressMod();
+  app.use("/", dentalSeoRouter);
+
+  const httpMod = await import("http");
+  const server = httpMod.createServer(app);
+  await new Promise<void>((r) => server.listen(0, "127.0.0.1", () => r()));
+  const addr = server.address();
+  const port = typeof addr === "object" && addr ? addr.port : 0;
+
+  function get(urlPath: string): Promise<{ status: number; body: string }> {
+    return new Promise((resolve) => {
+      const req = httpMod.request(
+        { host: "127.0.0.1", port, path: urlPath, method: "GET" },
+        (res: any) => {
+          let buf = "";
+          res.on("data", (c: any) => (buf += c));
+          res.on("end", () => resolve({ status: res.statusCode, body: buf }));
+        }
+      );
+      req.on("error", () => resolve({ status: 0, body: "" }));
+      req.end();
+    });
+  }
+
+  // ── Clinic page returns 200 + crawlable HTML
+  const clinic = await get(`/klinikk/${seoSlug}`);
+  assertEq(clinic.status, 200, "seo-dental: /klinikk/<slug> returns 200");
+  assertTrue(clinic.body.includes(NAVN), "seo-dental: clinic page renders the clinic name (SSR, no JS)");
+  assertTrue(clinic.body.includes("Storgata 1"), "seo-dental: clinic page renders the street address");
+  assertTrue(clinic.body.includes("Tannlegeklinikk i Oslo"),
+    "seo-dental: <title> includes geo-local 'Tannlegeklinikk i Oslo'");
+  assertTrue(/<link rel="canonical" href="https:\/\/finn-tannlege\.com\/klinikk\//.test(clinic.body),
+    "seo-dental: clinic page has canonical to /klinikk/<slug>");
+  assertTrue(clinic.body.includes('property="og:title"') && clinic.body.includes('name="twitter:card"'),
+    "seo-dental: clinic page has OG + Twitter card meta");
+
+  // ── JSON-LD with @type Dentist + clinic name + areaServed + medicalSpecialty
+  const ldMatch = clinic.body.match(/<script type="application\/ld\+json">(.*?)<\/script>/g) || [];
+  assertTrue(ldMatch.length >= 1, "seo-dental: clinic page emits at least one JSON-LD block");
+  const dentistLd = ldMatch
+    .map((m) => m.replace(/^<script[^>]*>/, "").replace(/<\/script>$/, "").replace(/<\\\//g, "</"))
+    .map((j) => { try { return JSON.parse(j); } catch { return null; } })
+    .find((o) => o && o["@type"] === "Dentist");
+  assertTrue(!!dentistLd, "seo-dental: a JSON-LD block has @type Dentist");
+  assertEq(dentistLd && dentistLd.name, NAVN, "seo-dental: Dentist JSON-LD name = clinic name");
+  assertTrue(!!(dentistLd && dentistLd.address && dentistLd.address["@type"] === "PostalAddress"),
+    "seo-dental: Dentist JSON-LD has PostalAddress");
+  assertEq(dentistLd && dentistLd.telephone, "22 33 44 55", "seo-dental: Dentist JSON-LD has telephone");
+  assertTrue(!!(dentistLd && dentistLd.areaServed), "seo-dental: Dentist JSON-LD has areaServed");
+  assertTrue(!!(dentistLd && dentistLd.medicalSpecialty), "seo-dental: Dentist JSON-LD has medicalSpecialty");
+  assertTrue(!!(dentistLd && dentistLd.openingHoursSpecification),
+    "seo-dental: Dentist JSON-LD has openingHoursSpecification");
+  assertTrue(!!(dentistLd && dentistLd.image), "seo-dental: Dentist JSON-LD has image (rich-result fallback)");
+
+  // ── Sitemap includes the clinic URL
+  const sitemap = await get("/sitemap.xml");
+  assertEq(sitemap.status, 200, "seo-dental: /sitemap.xml returns 200");
+  assertTrue(sitemap.body.includes(`/klinikk/${seoSlug}`),
+    "seo-dental: sitemap lists the clinic's /klinikk/<slug> URL");
+
+  // ── robots.txt references the sitemap + allows AI crawlers
+  const robots = await get("/robots.txt");
+  assertEq(robots.status, 200, "seo-dental: /robots.txt returns 200");
+  assertTrue(robots.body.includes("Sitemap: https://finn-tannlege.com/sitemap.xml"),
+    "seo-dental: robots.txt references the dental sitemap");
+  assertTrue(robots.body.includes("GPTBot") && robots.body.includes("ClaudeBot"),
+    "seo-dental: robots.txt lists AI crawlers (GPTBot, ClaudeBot)");
+
+  // ── llms.txt present for LLM discovery
+  const llms = await get("/llms.txt");
+  assertEq(llms.status, 200, "seo-dental: /llms.txt returns 200");
+  assertTrue(llms.body.includes("/klinikk/"), "seo-dental: llms.txt documents the clinic profile URL pattern");
+
+  server.close();
+
+  // Restore env + reset factory so we don't leak into later blocks.
+  if (prevDentalPath === undefined) delete process.env.DENTAL_DB_PATH;
+  else process.env.DENTAL_DB_PATH = prevDentalPath;
+  if (prevBase === undefined) delete process.env.DENTAL_BASE_URL;
+  else process.env.DENTAL_BASE_URL = prevBase;
+  dbFactorySeo.__resetDbFactoryForTesting();
+})();
+
 const _platformVerifierPromise = (async () => {
   const Database = require("better-sqlite3");
   const {
@@ -14331,6 +14482,7 @@ const _platformVerifierPromise = (async () => {
   try { await _pr106Promise; } catch { /* errors already pushed to failures */ }
   try { await _pr110Promise; } catch { /* errors already pushed to failures */ }
   try { await _pr125Promise; } catch { /* errors already pushed to failures */ }
+  try { await _seoDentalPromise; } catch { /* errors already pushed to failures */ }
   try { await _platformVerifierPromise; } catch { /* errors already pushed to failures */ }
   // PR-109 tests are synchronous (IIFE) — no promise needed
   // Drop pre-existing intg failures (unmasked by awaiting) — they predate M2
