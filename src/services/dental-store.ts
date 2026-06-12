@@ -354,6 +354,32 @@ export function getDentalAgentById(
   return row ? hydrateAgent(row) : null;
 }
 
+// ─── Specialty filter helper (PR: finn-tannlege search) ─────────────
+// Specialty data is sparse on dental_agents.available_specialties (the
+// clinic-level JSON array is populated for only ~2% of rows). The same
+// information frequently lives in the `specialists` JSON array
+// (objects with a "specialty" field) that PR-100 deep-scrape fills.
+// To make the specialty filter useful instead of zeroing-out results,
+// match the requested specialty against EITHER column. Both columns are
+// JSON-array text, so a LIKE on the quoted specialty value is the
+// pragmatic match (json_each() would be exact but heavier; revisit if
+// false-positives appear). Returns a SQL fragment + binds the params.
+function pushSpecialtyClause(
+  where: string[],
+  params: Record<string, unknown>,
+  specialty: string
+): void {
+  where.push(
+    "(available_specialties LIKE @specialty OR specialists LIKE @specialtyPerson)"
+  );
+  // available_specialties: ["oral kirurgi og oral medisin"]  → match %"<value>"%
+  params.specialty = `%"${specialty}"%`;
+  // specialists: [{"name":"...","specialty":"oral kirurgi og oral medisin"}]
+  //   → match %"specialty":"<value>"%  (tolerant of whitespace via the
+  //   colon-space variant; JSON.stringify emits no space, so this is exact).
+  params.specialtyPerson = `%"specialty":"${specialty}"%`;
+}
+
 export function listDentalAgents(
   filter: ListFilter = {},
   limit = 50,
@@ -378,11 +404,7 @@ export function listDentalAgents(
     params.verification_status = parsed.verification_status;
   }
   if (parsed.specialty) {
-    // available_specialties is stored as JSON-array text — LIKE is the
-    // pragmatic match. For exact precision we'd need json_each() in a
-    // subquery; defer to Phase B if false-positives become a problem.
-    where.push("available_specialties LIKE @specialty");
-    params.specialty = `%"${parsed.specialty}"%`;
+    pushSpecialtyClause(where, params, parsed.specialty);
   }
   // PR-109 / PR-105 additive filters
   if (parsed.q) {
@@ -428,7 +450,7 @@ export function countDentalAgents(filter: ListFilter = {}): number {
   if (parsed.fylke) { where.push("fylke = @fylke"); params.fylke = parsed.fylke; }
   if (parsed.chain_brand) { where.push("chain_brand = @chain_brand"); params.chain_brand = parsed.chain_brand; }
   if (parsed.verification_status) { where.push("verification_status = @verification_status"); params.verification_status = parsed.verification_status; }
-  if (parsed.specialty) { where.push("available_specialties LIKE @specialty"); params.specialty = `%"${parsed.specialty}"%`; }
+  if (parsed.specialty) { pushSpecialtyClause(where, params, parsed.specialty); }
   if (parsed.q) { where.push("(navn LIKE @q OR poststed LIKE @q)"); params.q = `%${parsed.q}%`; }
   if (parsed.helfo_agreement !== undefined) { where.push("helfo_agreement = @helfo_agreement"); params.helfo_agreement = parsed.helfo_agreement; }
   if (parsed.acute_vakt !== undefined) { where.push("acute_vakt = @acute_vakt"); params.acute_vakt = parsed.acute_vakt; }
@@ -458,7 +480,7 @@ export function countPublicDentalAgents(filter: ListFilter = {}): number {
     where.push("verification_status = @verification_status");
     params.verification_status = parsed.verification_status;
   }
-  if (parsed.specialty) { where.push("available_specialties LIKE @specialty"); params.specialty = `%"${parsed.specialty}"%`; }
+  if (parsed.specialty) { pushSpecialtyClause(where, params, parsed.specialty); }
   if (parsed.q) { where.push("(navn LIKE @q OR poststed LIKE @q)"); params.q = `%${parsed.q}%`; }
   if (parsed.helfo_agreement !== undefined) { where.push("helfo_agreement = @helfo_agreement"); params.helfo_agreement = parsed.helfo_agreement; }
   if (parsed.acute_vakt !== undefined) { where.push("acute_vakt = @acute_vakt"); params.acute_vakt = parsed.acute_vakt; }
@@ -494,7 +516,7 @@ export function listPublicDentalAgents(
     where.push("verification_status = @verification_status");
     params.verification_status = parsed.verification_status;
   }
-  if (parsed.specialty) { where.push("available_specialties LIKE @specialty"); params.specialty = `%"${parsed.specialty}"%`; }
+  if (parsed.specialty) { pushSpecialtyClause(where, params, parsed.specialty); }
   if (parsed.q) { where.push("(navn LIKE @q OR poststed LIKE @q)"); params.q = `%${parsed.q}%`; }
   if (parsed.helfo_agreement !== undefined) { where.push("helfo_agreement = @helfo_agreement"); params.helfo_agreement = parsed.helfo_agreement; }
   if (parsed.acute_vakt !== undefined) { where.push("acute_vakt = @acute_vakt"); params.acute_vakt = parsed.acute_vakt; }
@@ -516,6 +538,29 @@ export function listPublicDentalAgents(
 
   const rows = db.prepare(sql).all(params) as Array<Record<string, unknown>>;
   return rows.map(hydrateAgent);
+}
+
+/**
+ * Returns the subset of `candidates` (canonical specialty names) for which
+ * at least one non-rejected clinic exists — matching the SAME logic the
+ * /sok specialty filter uses (available_specialties OR specialists JSON).
+ *
+ * The public search dropdown is populated from this so users can only pick
+ * specialties that actually return clinics; a specialty with zero coverage
+ * is hidden rather than silently zeroing-out the result list.
+ */
+export function getAvailableSpecialties(candidates: string[]): string[] {
+  const db = getDb("dental");
+  const stmt = db.prepare(
+    `SELECT 1 FROM dental_agents
+     WHERE verification_status != 'rejected'
+       AND (available_specialties LIKE @s OR specialists LIKE @p)
+     LIMIT 1`
+  );
+  return candidates.filter((name) => {
+    const row = stmt.get({ s: `%"${name}"%`, p: `%"specialty":"${name}"%` });
+    return !!row;
+  });
 }
 
 export interface DentalStats {
