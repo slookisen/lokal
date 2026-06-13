@@ -14230,7 +14230,9 @@ const _seoDentalPromise = (async () => {
   assertTrue(!!(dentistLd && dentistLd.medicalSpecialty), "seo-dental: Dentist JSON-LD has medicalSpecialty");
   assertTrue(!!(dentistLd && dentistLd.openingHoursSpecification),
     "seo-dental: Dentist JSON-LD has openingHoursSpecification");
-  assertTrue(!!(dentistLd && dentistLd.image), "seo-dental: Dentist JSON-LD has image (rich-result fallback)");
+  // orch-PR-20260613: favicon is no longer used as image in JSON-LD (quality negative);
+  // image is only emitted when a real image URL exists. This clinic has no image, so absent is correct.
+  assertTrue(!(dentistLd && dentistLd.image), "seo-dental: Dentist JSON-LD omits image when no real URL (orch-PR-20260613)");
 
   // ── Sitemap includes the clinic URL
   const sitemap = await get("/sitemap.xml");
@@ -14250,6 +14252,109 @@ const _seoDentalPromise = (async () => {
   const llms = await get("/llms.txt");
   assertEq(llms.status, 200, "seo-dental: /llms.txt returns 200");
   assertTrue(llms.body.includes("/klinikk/"), "seo-dental: llms.txt documents the clinic profile URL pattern");
+
+  // ── orch-PR-20260613: description builder unit tests ────────────────────────
+  // Import the helpers from the already-loaded dental-seo module.
+  const {
+    isPlaceholderDescription,
+    isValidLocality,
+    buildClinicDescription,
+  } = require("../src/routes/dental-seo") as typeof import("../src/routes/dental-seo");
+
+  // (a) clinic with rich enriched description → uses it verbatim (not replaced by template)
+  {
+    const richAgent = {
+      navn: "CALMA Tannklinikk", poststed: "OSLO", fylke: "Oslo",
+      om_oss: "CALMA er en moderne tannlegeklinikk i Oslo sentrum med spesialisering i estetisk tannbehandling og implantatkirurgi. Vi tilbyr rolig og trygg behandling for alle aldersgrupper.",
+      helfo_agreement: "true", available_specialties: ["endodonti"],
+      acute_vakt: null, opening_hours: [{ day: "mon", open: "08:00", close: "17:00" }],
+    } as any;
+    assertEq(
+      isPlaceholderDescription(richAgent.om_oss), false,
+      "orch-PR-20260613-a: non-placeholder description → isPlaceholderDescription returns false"
+    );
+    // buildClinicDescription falls through to template when no om_oss; the rendering
+    // code uses richDesc directly. Just verify the template is NOT returned for this.
+    const desc = buildClinicDescription(richAgent, 0, true);
+    // The structured desc should still be differentiated — contains clinic name
+    assertTrue(desc.includes("CALMA"), "orch-PR-20260613-a: buildClinicDescription includes clinic name");
+  }
+
+  // (b) two clinics with only structured fields → produce distinct non-generic summaries
+  {
+    const agentOslo = {
+      navn: "Oslo Sentralklinikk AS", poststed: "OSLO", fylke: "Oslo",
+      om_oss: null, helfo_agreement: "true", acute_vakt: 1 as 0|1,
+      available_specialties: ["periodonti"], opening_hours: [
+        { day: "mon", open: "08:00", close: "16:00" },
+        { day: "tue", open: "08:00", close: "16:00" },
+        { day: "wed", open: "08:00", close: "16:00" },
+      ],
+    } as any;
+    const agentBergen = {
+      navn: "Bergen Familietannlege", poststed: "BERGEN", fylke: "Vestland",
+      om_oss: null, helfo_agreement: null, acute_vakt: null,
+      available_specialties: [], opening_hours: [],
+    } as any;
+    const descOslo = buildClinicDescription(agentOslo, 5, true);
+    const descBergen = buildClinicDescription(agentBergen, 0, true);
+    assertTrue(descOslo !== descBergen,
+      "orch-PR-20260613-b: two clinics in different cities → distinct descriptions");
+    assertTrue(descOslo.toLowerCase().includes("oslo"),
+      "orch-PR-20260613-b: Oslo clinic description mentions Oslo");
+    assertTrue(descBergen.toLowerCase().includes("bergen"),
+      "orch-PR-20260613-b: Bergen clinic description mentions Bergen");
+    // Must not be the generic template
+    assertTrue(!descOslo.startsWith("Tannlegeklinikk i"),
+      "orch-PR-20260613-b: Oslo description is not the old generic template");
+  }
+
+  // (c) placeholder "test probe" / empty → isPlaceholderDescription returns true
+  {
+    assertEq(isPlaceholderDescription("test probe"), true,
+      "orch-PR-20260613-c: 'test probe' → isPlaceholderDescription true");
+    assertEq(isPlaceholderDescription(""), true,
+      "orch-PR-20260613-c: empty string → isPlaceholderDescription true");
+    assertEq(isPlaceholderDescription(null), true,
+      "orch-PR-20260613-c: null → isPlaceholderDescription true");
+    assertEq(isPlaceholderDescription("Tannlegeklinikk i Oslo."), true,
+      "orch-PR-20260613-c: generic template → isPlaceholderDescription true");
+    // And the rendered page for a placeholder clinic should use structured fallback
+    const placeholderAgent = {
+      navn: "Testby Tannklinikk AS", poststed: "STAVANGER", fylke: "Rogaland",
+      om_oss: "test probe", helfo_agreement: null, acute_vakt: null,
+      available_specialties: [], opening_hours: [],
+    } as any;
+    assertTrue(isPlaceholderDescription(placeholderAgent.om_oss),
+      "orch-PR-20260613-c: clinic with 'test probe' om_oss → treated as absent");
+    const fallbackDesc = buildClinicDescription(placeholderAgent, 0, true);
+    assertTrue(!fallbackDesc.includes("test probe"),
+      "orch-PR-20260613-c: structured fallback does not echo 'test probe'");
+    assertTrue(fallbackDesc.includes("Stavanger"),
+      "orch-PR-20260613-c: structured fallback mentions Stavanger");
+  }
+
+  // (d) malformed locality ("Ukjent", "Se-44338 Lerum") → isValidLocality returns false
+  {
+    assertEq(isValidLocality("Ukjent"), false,
+      "orch-PR-20260613-d: 'Ukjent' → isValidLocality false");
+    assertEq(isValidLocality("Se-44338 Lerum"), false,
+      "orch-PR-20260613-d: 'Se-44338 Lerum' → isValidLocality false (foreign prefix)");
+    assertEq(isValidLocality(null), false,
+      "orch-PR-20260613-d: null → isValidLocality false");
+    assertEq(isValidLocality("Oslo"), true,
+      "orch-PR-20260613-d: 'Oslo' → isValidLocality true");
+    // A clinic with malformed poststed should NOT print it in its description
+    const badLocalityAgent = {
+      navn: "Tannklinikken Lerum AB", poststed: "Se-44338 Lerum", fylke: "Ukjent",
+      om_oss: null, helfo_agreement: null, acute_vakt: null,
+      available_specialties: [], opening_hours: [],
+    } as any;
+    const badDesc = buildClinicDescription(badLocalityAgent, 0, true);
+    assertTrue(!badDesc.includes("Se-44338"), "orch-PR-20260613-d: malformed poststed not in description");
+    assertTrue(!badDesc.includes("Ukjent"), "orch-PR-20260613-d: 'Ukjent' fylke not in description");
+  }
+  // ── end orch-PR-20260613 tests ────────────────────────────────────────────
 
   server.close();
 

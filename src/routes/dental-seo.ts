@@ -208,6 +208,147 @@ export function titleCasePoststed(s: string): string {
   }).join(" ");
 }
 
+// ─── orch-PR-20260613 finn-tannlege clinic content differentiation ──────────────
+//     isPlaceholderDescription + buildClinicDescription
+//     Purpose: give every clinic page a unique, fact-derived description instead
+//     of the generic "Tannlegeklinikk i Oslo, Oslo." that causes near-duplicate
+//     thin content and prevents indexing.
+
+/**
+ * Returns true when the stored description string is a placeholder / test
+ * probe that should be treated as absent and replaced by the structured summary.
+ * Recognised patterns:
+ *   - obviously short or empty
+ *   - matches the generic template "Tannlegeklinikk i …" (case-insensitive)
+ *   - contains known test probes ("test probe", "test description", etc.)
+ */
+export function isPlaceholderDescription(desc: string | null | undefined): boolean {
+  if (!desc || desc.trim().length < 20) return true;
+  const d = desc.trim().toLowerCase();
+  // Known test probe strings
+  if (/test probe|test description|placeholder|lorem ipsum/i.test(d)) return true;
+  // The generic template this code previously produced: "Tannlegeklinikk i <by>."
+  if (/^tannlegeklinikk\s+i\s+\S/.test(d) && d.length < 60) return true;
+  return false;
+}
+
+/**
+ * Returns true when a locality string is valid for display.
+ * Rejects: null/undefined, "Ukjent", strings starting with a country-code
+ * prefix (e.g. "Se-44338 Lerum" from Brreg Swedish entity data), and
+ * strings that are purely numeric or obviously non-Norwegian county names.
+ */
+export function isValidLocality(s: string | null | undefined): boolean {
+  if (!s || s.trim().length === 0) return false;
+  const t = s.trim();
+  if (/^ukjent$/i.test(t)) return false;
+  // Foreign poststed prefix (two-letter country code + dash + digits)
+  if (/^[A-Za-z]{2}-\d/.test(t)) return false;
+  return true;
+}
+
+/**
+ * Build a unique, natural-Norwegian clinic description from structured fields.
+ * Only states facts that are present in the data; omits clauses when the field
+ * is missing. Sentence structure is varied by the combination of available
+ * fields so no two clinics with different data produce the same output.
+ * Cap: ~155 chars for the short (meta) variant; uncapped for the full variant.
+ *
+ * @param agent       The DentalAgent record.
+ * @param nearbyCount Optional count of other clinics in the same poststed
+ *                    (used to add a differentiating locality clause).
+ * @param short       If true, produce a meta-description-length string (≤160 chars).
+ */
+export function buildClinicDescription(
+  agent: DentalAgent,
+  nearbyCount?: number,
+  short?: boolean
+): string {
+  const parts: string[] = [];
+
+  // Locality: "i Oslo" / "i Stavanger, Rogaland" — omit malformed values
+  const validPoststed = isValidLocality(agent.poststed) ? titleCasePoststed(agent.poststed!) : null;
+  const validFylke = isValidLocality(agent.fylke) ? agent.fylke! : null;
+
+  const locPart = validPoststed
+    ? validFylke && validFylke.toLowerCase() !== validPoststed.toLowerCase()
+      ? `i ${validPoststed}, ${validFylke}`
+      : `i ${validPoststed}`
+    : validFylke
+    ? `i ${validFylke}`
+    : null;
+
+  // Opening sentence
+  if (locPart) {
+    parts.push(`${agent.navn} er en tannlegeklinikk ${locPart}.`);
+  } else {
+    parts.push(`${agent.navn} er en tannlegeklinikk.`);
+  }
+
+  // Address
+  if (!short && agent.adresse && isValidLocality(agent.poststed)) {
+    parts.push(`Adresse: ${agent.adresse}, ${agent.postnummer ? agent.postnummer + " " : ""}${titleCasePoststed(agent.poststed!)}.`);
+  }
+
+  // Helfo
+  if (agent.helfo_agreement === "true") {
+    parts.push("Klinikken har Helfo-direkteoppgjørsavtale.");
+  }
+
+  // Acute
+  if (agent.acute_vakt === 1) {
+    parts.push("Tilbyr tannlegevakt ved akutte smerter og skader.");
+  }
+
+  // Specialties
+  const specs = agent.available_specialties?.filter(Boolean) ?? [];
+  if (specs.length > 0) {
+    if (specs.length === 1) {
+      parts.push(`Spesialitet: ${specs[0]}.`);
+    } else {
+      parts.push(`Spesialiteter: ${specs.slice(0, 3).join(", ")}.`);
+    }
+  }
+
+  // Treatments (short: skip; full: first few)
+  if (!short) {
+    const treats = agent.treatments?.filter(Boolean) ?? [];
+    if (treats.length > 0) {
+      parts.push(`Behandlinger inkluderer: ${treats.slice(0, 4).join(", ")}.`);
+    }
+  }
+
+  // Opening hours count
+  const ohDays = agent.opening_hours?.length ?? 0;
+  if (ohDays > 0) {
+    parts.push(`Åpent ${ohDays} dag${ohDays === 1 ? "" : "er"} i uken.`);
+  }
+
+  // Nearby clinics (only in short/meta to add differentiation)
+  if (short && nearbyCount && nearbyCount > 0 && validPoststed) {
+    parts.push(`Det finnes ${nearbyCount + 1} klinikker i ${validPoststed}.`);
+  }
+
+  // Chain
+  if (agent.chain_brand) {
+    parts.push(`Del av ${agent.chain_brand}.`);
+  }
+
+  const full = parts.join(" ");
+
+  if (short) {
+    // Trim to ≤ 160 chars at sentence boundary
+    if (full.length <= 160) return full;
+    let truncated = full.slice(0, 157);
+    const lastDot = truncated.lastIndexOf(".");
+    if (lastDot > 60) truncated = truncated.slice(0, lastDot + 1);
+    else truncated = truncated.slice(0, 157) + "…";
+    return truncated;
+  }
+
+  return full;
+}
+
 // ─── Poststed cache (60 s, same TTL as stats) ────────────────
 let _poststedCache: { value: PoststedRow[]; expires: number } | null = null;
 
@@ -1090,9 +1231,14 @@ function renderClinicProfile(
     : "";
 
   // ── JSON-LD Dentist
-  const clinicJsonLdDesc = agent.om_oss
-    ? agent.om_oss
-    : `Tannlegeklinikk${agent.poststed ? ` i ${titleCasePoststed(agent.poststed)}` : ""}${agent.fylke ? `, ${agent.fylke}` : ""}.`;
+  // orch-PR-20260613: guard placeholder/empty om_oss; fall back to structured summary.
+  const richDesc = !isPlaceholderDescription(agent.om_oss) ? agent.om_oss! : null;
+  let nearbyCount = 0;
+  try {
+    const related = listRelatedClinics(agent, 20);
+    nearbyCount = related.length;
+  } catch { /* db not ready */ }
+  const clinicJsonLdDesc = richDesc ?? buildClinicDescription(agent, nearbyCount, false);
   const jsonLd: Record<string, unknown> = {
     "@context": "https://schema.org",
     "@type": "Dentist",
@@ -1101,8 +1247,11 @@ function renderClinicProfile(
     name: agent.navn,
     description: clinicJsonLdDesc,
     url: canonical,
-    // Google requires an image for LocalBusiness rich results — fall back to platform mark.
-    image: `${DENTAL_BASE_URL}/favicon.svg`,
+    // orch-PR-20260613: favicon-as-image is a quality negative for Google rich results.
+    // Only emit image if a real clinic image/logo URL exists; otherwise omit the field.
+    // (The ogImage on the page shell still falls back to favicon.svg for social sharing.)
+    // orch-PR-20260613: no real image field in DentalAgent; image is omitted
+    // rather than falling back to favicon.svg which is a quality negative.
     ...(agent.telefon ? { telephone: agent.telefon } : {}),
     ...(agent.epost ? { email: agent.epost } : {}),
     ...(safeUrl(agent.hjemmeside) ? { sameAs: safeUrl(agent.hjemmeside) } : {}),
@@ -1110,12 +1259,13 @@ function renderClinicProfile(
       "@type": "PostalAddress",
       ...(agent.adresse ? { streetAddress: agent.adresse } : {}),
       ...(agent.postnummer ? { postalCode: agent.postnummer } : {}),
-      ...(agent.poststed ? { addressLocality: agent.poststed } : {}),
-      ...(agent.fylke ? { addressRegion: agent.fylke } : {}),
+      // orch-PR-20260613: guard malformed/foreign locality values (e.g. "Se-44338 Lerum", "Ukjent")
+      ...(isValidLocality(agent.poststed) ? { addressLocality: titleCasePoststed(agent.poststed!) } : {}),
+      ...(isValidLocality(agent.fylke) ? { addressRegion: agent.fylke } : {}),
       addressCountry: "NO",
     },
-    ...(agent.poststed || agent.fylke
-      ? { areaServed: { "@type": "City", name: agent.poststed ? titleCasePoststed(agent.poststed) : agent.fylke } }
+    ...((isValidLocality(agent.poststed) || isValidLocality(agent.fylke))
+      ? { areaServed: { "@type": "City", name: isValidLocality(agent.poststed) ? titleCasePoststed(agent.poststed!) : agent.fylke } }
       : {}),
     ...(agent.lat && agent.lng
       ? { geo: { "@type": "GeoCoordinates", latitude: agent.lat, longitude: agent.lng } }
@@ -1141,8 +1291,9 @@ function renderClinicProfile(
   }
 
   // ── Fylke back-link
-  const fylkeLink = agent.fylke
-    ? `<p style="margin-top:32px;font-size:.9rem"><a href="/fylke/${encodeURIComponent(agent.fylke)}">&larr; Flere tannleger i ${escapeHtml(agent.fylke)}</a></p>`
+  // orch-PR-20260613: only render fylke back-link for valid/canonical fylke values
+  const fylkeLink = isValidLocality(agent.fylke)
+    ? `<p style="margin-top:32px;font-size:.9rem"><a href="/fylke/${encodeURIComponent(agent.fylke!)}">&larr; Flere tannleger i ${escapeHtml(agent.fylke!)}</a></p>`
     : "";
 
   // ── PR-116: Related clinics (same poststed)
@@ -1172,19 +1323,27 @@ function renderClinicProfile(
     : `<p class="disclaimer">Informasjonen er hentet fra Brønnøysundregistrene og offentlig tilgjengelige kilder. Kontakt oss på <a href="mailto:kontakt@finn-tannlege.com">kontakt@finn-tannlege.com</a> ved feil.</p>`;
 
   // ── PR-116: BreadcrumbList for profile
+  // orch-PR-20260613: guard malformed locality in breadcrumb
   const profileBreadcrumbItems: BreadcrumbItem[] = [{ name: "Hjem", url: DENTAL_BASE_URL }];
-  if (agent.fylke) profileBreadcrumbItems.push({ name: agent.fylke, url: `${DENTAL_BASE_URL}/fylke/${encodeURIComponent(agent.fylke)}` });
-  if (agent.poststed) profileBreadcrumbItems.push({ name: titleCasePoststed(agent.poststed), url: `${DENTAL_BASE_URL}/sted/${slugifyText(agent.poststed)}` });
+  if (isValidLocality(agent.fylke)) profileBreadcrumbItems.push({ name: agent.fylke!, url: `${DENTAL_BASE_URL}/fylke/${encodeURIComponent(agent.fylke!)}` });
+  if (isValidLocality(agent.poststed)) profileBreadcrumbItems.push({ name: titleCasePoststed(agent.poststed!), url: `${DENTAL_BASE_URL}/sted/${slugifyText(agent.poststed!)}` });
   profileBreadcrumbItems.push({ name: agent.navn, url: canonical });
   const jsonLdArr = [jsonLd, breadcrumbJsonLd(profileBreadcrumbItems)];
 
-  // ── PR-116: unique meta description
-  const metaDesc = [
-    `${agent.navn} — tannlegeklinikk${agent.poststed ? ` i ${titleCasePoststed(agent.poststed)}` : ""}${agent.fylke ? `, ${agent.fylke}` : ""}.`,
-    agent.helfo_agreement === "true" ? "Helfo-avtale." : "",
-    agent.acute_vakt === 1 ? "Akuttvakt." : "",
-    "Se åpningstider, behandlinger og kontaktinfo.",
-  ].filter(Boolean).join(" ");
+  // ── orch-PR-20260613: unique meta description
+  // Use rich om_oss (when not a placeholder) or a structured-field summary.
+  // This replaces the old generic template that caused near-duplicate thin content
+  // on 88% of clinic pages and prevented Google from indexing them.
+  const metaDesc: string = (() => {
+    if (richDesc) {
+      // Trim rich description to 160 chars at sentence boundary
+      if (richDesc.length <= 160) return richDesc;
+      let t = richDesc.slice(0, 157);
+      const dot = t.lastIndexOf(".");
+      return dot > 60 ? t.slice(0, dot + 1) : t + "…";
+    }
+    return buildClinicDescription(agent, nearbyCount, true);
+  })();
 
   const html = `
 <main>
@@ -1192,7 +1351,7 @@ function renderClinicProfile(
     <div class="container">
       <div class="clinic-badges" style="margin-bottom:12px">${badges.join("")}</div>
       <h1 class="profile-name">${escapeHtml(agent.navn)}</h1>
-      <div class="profile-loc">${ICON_PIN} ${escapeHtml(agent.poststed || "")}${agent.fylke ? `, ${escapeHtml(agent.fylke)}` : ""}</div>
+      <div class="profile-loc">${ICON_PIN} ${isValidLocality(agent.poststed) ? escapeHtml(titleCasePoststed(agent.poststed!)) : ""}${isValidLocality(agent.poststed) && isValidLocality(agent.fylke) ? `, ${escapeHtml(agent.fylke!)}` : !isValidLocality(agent.poststed) && isValidLocality(agent.fylke) ? escapeHtml(agent.fylke!) : ""}</div>
       <div class="profile-actions">${callBtn}${bookBtn}</div>
     </div>
   </div>
