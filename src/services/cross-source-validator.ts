@@ -408,6 +408,7 @@ export const KNOWN_DIRECTORY_HOSTS: ReadonlySet<string> = new Set([
   "bondesmarked.no",
   "brreg.no",
   "facebook.com",
+  "gettyourguide.com",
   "godtlokalt.no",
   "gronnguidetrondheim.no",
   "gulesider.no",
@@ -528,6 +529,163 @@ function registrableLabel(root: string): string {
   return first.replace(/-/g, "");
 }
 
+// ─── orch-PR-20260613-domain-coherence FP reduction ──────────────────────────
+//
+// Problem: 93 of 124 review_required agents in the production queue are held by
+// domain_coherence.coherent=false, many as FALSE POSITIVES caused by same-entity
+// domain variants: IDN/punycode encoding, Norwegian char transliteration
+// (æ↔ae, ø↔oe, å↔aa), www/shop prefixes (stripped earlier), hyphenation
+// (handled by collapseDomain), possessive-s / definite-article suffix.
+//
+// Solution: add a host-normalization + similarity step that recognises same-entity
+// variants while keeping real misattributions (aggregators, directories,
+// municipalities) blocked. The denylist below ensures known aggregator labels
+// are NEVER coerced to coherent by the new rules.
+
+// Minimal RFC-3492 Bootstring decoder — decodes a single `xn--` ACE label to
+// the unicode string it encodes. Only the label (without the `xn--` prefix) is
+// passed in. Avoids the deprecated `node:punycode` module.
+function decodePunycodeLabel(label: string): string {
+  if (!label.startsWith("xn--")) return label;
+  const BASE = 36, TMIN = 1, TMAX = 26, SKEW = 38, DAMP = 700;
+  const INITIAL_BIAS = 72, INITIAL_N = 128;
+  const input = label.slice(4); // strip "xn--"
+  const output: number[] = [];
+  let n = INITIAL_N, idx = 0, bias = INITIAL_BIAS;
+  const dash = input.lastIndexOf("-");
+  if (dash > 0) {
+    for (let j = 0; j < dash; j++) output.push(input.charCodeAt(j));
+  }
+  let pos = dash > 0 ? dash + 1 : 0;
+  const decodeDigit = (cp: number): number =>
+    cp - 48 < 10 ? cp - 22 : cp - 65 < 26 ? cp - 65 : cp - 97 < 26 ? cp - 97 : BASE;
+  const adaptBias = (delta: number, numPoints: number, first: boolean): number => {
+    delta = first ? Math.floor(delta / DAMP) : delta >> 1;
+    delta += Math.floor(delta / numPoints);
+    let k = 0;
+    while (delta > ((BASE - TMIN) * TMAX) >> 1) { delta = Math.floor(delta / (BASE - TMIN)); k += BASE; }
+    return Math.floor(k + (BASE - TMIN + 1) * delta / (delta + SKEW));
+  };
+  while (pos < input.length) {
+    const oldi = idx; let w = 1;
+    for (let k = BASE; ; k += BASE) {
+      if (pos >= input.length) return label; // malformed/truncated — fail safe
+      const digit = decodeDigit(input.charCodeAt(pos++));
+      idx += digit * w;
+      const t = k <= bias ? TMIN : k >= bias + TMAX ? TMAX : k - bias;
+      if (digit < t) break;
+      w *= BASE - t;
+    }
+    const out = output.length + 1;
+    bias = adaptBias(idx - oldi, out, oldi === 0);
+    n += Math.floor(idx / out);
+    idx %= out;
+    output.splice(idx, 0, n);
+    idx++;
+  }
+  try { return String.fromCodePoint(...output); } catch { return label; }
+}
+
+// Transliterate Norwegian/Nordic unicode characters to their ASCII equivalents.
+// Handles both directions of the common mappings used by Norwegian domain registrants:
+//   æ → ae   ø → oe   å → aa
+// (ø→o is not applied globally as it can cause spurious collapses)
+function transliterateNorwegian(s: string): string {
+  return s
+    .replace(/æ/g, "ae")
+    .replace(/ø/g, "oe")
+    .replace(/å/g, "aa");
+}
+
+// Compute the normalized brand token for similarity comparison.
+// Steps: decode IDN label → transliterate Norwegian → strip hyphens →
+// collapse double-a (aa→a) to unify å→aa vs å→a variants → lowercase.
+// Input: a registrable-domain string like "xn--strehonning-98a.no" or "aakre-gard.no".
+function normalizedBrandToken(root: string): string {
+  const firstLabel = root.split(".")[0] ?? root;
+  // Decode punycode if this label uses ACE encoding
+  const unicode = decodePunycodeLabel(firstLabel);
+  // Strip hyphens, lowercase
+  let token = unicode.replace(/-/g, "").toLowerCase();
+  // Transliterate Norwegian unicode → ASCII
+  token = transliterateNorwegian(token);
+  // Normalize double-a to single-a: catches "åkre→aakre" vs "åkre→akre" variants.
+  // Limited to 'aa' sequences (not 'aaa') to avoid over-collapsing.
+  token = token.replace(/(?<!a)aa(?!a)/g, "a");
+  return token;
+}
+
+// Levenshtein edit distance (character-level), bounded to avoid O(n²) on long strings.
+function levenshteinDistance(a: string, b: string): number {
+  if (a === b) return 0;
+  if (a.length > 40 || b.length > 40) return Infinity; // safety guard
+  const m = a.length, n = b.length;
+  // Use a rolling two-row DP for space efficiency
+  let prev = Array.from({ length: n + 1 }, (_, j) => j);
+  for (let i = 1; i <= m; i++) {
+    const curr = [i, ...Array(n).fill(0)];
+    for (let j = 1; j <= n; j++) {
+      curr[j] = a[i - 1] === b[j - 1]
+        ? prev[j - 1]!
+        : 1 + Math.min(prev[j]!, curr[j - 1]!, prev[j - 1]!);
+    }
+    prev = curr;
+  }
+  return prev[n]!;
+}
+
+// Aggregator / directory / municipality labels that must NEVER be coerced
+// coherent by the new normalization-similarity rules, even if their normalized
+// token happens to be close to a legitimate brand token. This is a defence-in-
+// depth guard: the registrable-domain mismatch check already catches most of
+// these, but belt-and-suspenders protection is warranted here.
+const SIMILARITY_DENYLIST: ReadonlySet<string> = new Set([
+  // Social / travel aggregators
+  "yelp", "facebook", "instagram", "gettyourguide", "tripadvisor",
+  "airbnb", "booking", "visitnorway", "visitnorwayno",
+  // Norwegian directories / platforms
+  "rettfrabonden", "bondensmarked", "bondensmarkedtroms", "lokalmat",
+  "lokalmaten", "hanen", "rekonorge", "rekoring", "reko",
+  "kortreist", "kortreistmat", "mathallenoslo", "godtlokalt",
+  "selvplukk", "rensmak", "ostelandet", "siderlandet", "siderruta",
+  "gronnguidetrondheim", "dehistoriske", "compassgroup",
+  // Municipality / government
+  "kommune", "statsforvalteren", "fylkeskommune",
+  // Cooperatives / retailers
+  "coop", "kiwi", "rema", "rema1000", "meny", "extra",
+]);
+
+// Return true when two normalized brand tokens are same-entity variants.
+// Criteria (applied after denylist guard):
+//   1. Exact match after normalization (catches IDN/punycode + transliteration variants)
+//   2. One token is a substring of the other, both tokens ≥4 chars
+//      (catches brand+suffix like kaffebrenneriet vs kaffebrenneriet-pv,
+//       or eidsmo vs eidsmokjott — same Eidsmo company, different domains)
+//   3. Edit distance ≤ 2, both tokens ≥6 chars
+//      (catches single-char transliteration residuals like kraneskjokken vs kranekjokken,
+//       bringebarlandet vs bringebaerlandet — the ae vs aer variant)
+function brandTokensSimilar(ta: string, tb: string): boolean {
+  if (!ta || !tb) return false;
+  // Denylist: known aggregator / directory / municipality tokens must never be
+  // coerced coherent by these rules (belt-and-suspenders on top of the
+  // registrable-domain mismatch check that already blocks these).
+  if (SIMILARITY_DENYLIST.has(ta) || SIMILARITY_DENYLIST.has(tb)) return false;
+  // Generic domain stems (from GENERIC_DOMAIN_LABELS) must also not be coerced
+  // coherent — two different producers can each own gard.no and gard.com.
+  // (PR-129 already blocks this in the registrableLabel path; guard here too.)
+  if (GENERIC_DOMAIN_LABELS.has(ta) || GENERIC_DOMAIN_LABELS.has(tb)) return false;
+  // Short tokens (< 6 chars) risk false-positive collapses — e.g. "mat", "gard",
+  // "fisk" — skip all similarity rules for them.
+  if (ta.length < 6 || tb.length < 6) return false;
+  if (ta === tb) return true;
+  // Substring: one token wholly contains the other (brand + suffix / compound).
+  // Both must be >= 4 chars (already satisfied by the len-6 guard above).
+  if (ta.includes(tb) || tb.includes(ta)) return true;
+  // Edit distance: normalisation residuals (ae/a variants, possessive-s, etc.).
+  if (levenshteinDistance(ta, tb) <= 2) return true;
+  return false;
+}
+
 function domainsEquivalent(a: string, b: string): boolean {
   if (a === b) return true;
   if (collapseDomain(a) === collapseDomain(b)) return true;
@@ -545,6 +703,12 @@ function domainsEquivalent(a: string, b: string): boolean {
   // local-food common noun — two different producers can each own e.g. gard.no
   // and gard.com, so generic stems must NOT collapse across TLDs (PR-129 review).
   if (la.length >= 6 && la === lb && !GENERIC_DOMAIN_LABELS.has(la)) return true;
+  // orch-PR-20260613: Norwegian-variant / IDN-variant same-entity check.
+  // After all exact/hyphen/TLD equivalences have been tried, compute the
+  // normalised brand tokens (IDN-decoded, Norwegian-transliterated, aa-collapsed)
+  // and apply the similarity rules. Genuine misattributions stay incoherent
+  // because their brand tokens are far apart and not on the denylist.
+  if (brandTokensSimilar(normalizedBrandToken(a), normalizedBrandToken(b))) return true;
   return false;
 }
 
@@ -562,6 +726,10 @@ const GENERIC_DOMAIN_LABELS: ReadonlySet<string> = new Set([
   "gardsbakeri", "gardsysteri", "gardsost", "gardsmeieri", "bondegard",
   "fjellgard", "ostegard", "seterhonning", "gardshonning", "fjordfisk",
   "lokalmaten", "kortreistmat", "andelslandbruk", "selvplukk",
+  // Norwegian geographic region stems — must NOT collapse unrelated entities sharing a region name
+  "lofoten", "hardanger", "valdres", "setesdal", "sunnmore",
+  "nordland", "telemark", "vestland", "trondelag", "sorlandet",
+  "finnmark", "gudbrandsdalen",
 ]);
 
 export function domainCoherenceCheck(

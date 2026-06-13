@@ -2549,6 +2549,212 @@ console.log("\n── cross-source-validator: domainCoherenceCheck ──");
   assertEq(r.coherent, false, "dc: eidsmokjott agent vs slakthuset website still incoherent (PR-126)");
 }
 
+// ── orch-PR-20260613: Norwegian-variant / IDN-variant false-positive reduction ──
+// Tests cover all 8 false-positive pairs that must now be COHERENT, plus 6
+// true-positive pairs that must STAY incoherent.
+console.log("\n── cross-source-validator: domainCoherenceCheck (orch-PR-20260613 FP reduction) ──");
+
+// ── FALSE-POSITIVE pairs: same entity, different domain variant → must be COHERENT ──
+{
+  // IDN punycode (xn--strehonning-98a) vs ASCII transliteration (saetrehonning):
+  // both encode "sætrehonning" — same producer, different encoding of the domain.
+  const r = domainCoherenceCheck(
+    "https://xn--strehonning-98a.no/",
+    "https://saetrehonning.no",
+    "post@saetrehonning.no",
+  );
+  assertEq(r.coherent, true, "fp01: xn--strehonning-98a.no / saetrehonning.no → coherent (IDN vs ae-transliteration)");
+}
+{
+  // Norwegian bær→baer vs bær→bar transliteration variants for the same domain.
+  const r = domainCoherenceCheck(
+    "https://bringebarlandet.no/",
+    "https://bringebaerlandet.no",
+    "post@bringebaerlandet.no",
+  );
+  assertEq(r.coherent, true, "fp02: bringebarlandet.no / bringebaerlandet.no → coherent (ae vs a transliteration)");
+}
+{
+  // å→aa (aakre) vs å→a (akre) transliteration variants, with hyphen cosmetic difference.
+  const r = domainCoherenceCheck(
+    "https://aakre-gard.no/",
+    "https://akregard.no",
+    "post@akregard.no",
+  );
+  assertEq(r.coherent, true, "fp03: aakre-gard.no / akregard.no → coherent (aa/a å-variant + hyphen)");
+}
+{
+  // Definite-article suffix: husebygaarden (with Norwegian -en suffix) vs husebygaard.
+  const r = domainCoherenceCheck(
+    "https://husebygaarden.no/",
+    "https://husebygaard.no",
+    "post@husebygaard.no",
+  );
+  assertEq(r.coherent, true, "fp04: husebygaarden.no / husebygaard.no → coherent (definite-article suffix)");
+}
+{
+  // Brand + hyphenated qualifier suffix (kaffebrenneriet-pv = Pilen Vertikalt location).
+  const r = domainCoherenceCheck(
+    "https://kaffebrenneriet.no/",
+    "https://kaffebrenneriet-pv.no",
+    "post@kaffebrenneriet-pv.no",
+  );
+  assertEq(r.coherent, true, "fp05: kaffebrenneriet.no / kaffebrenneriet-pv.no → coherent (brand + location suffix)");
+}
+{
+  // Short brand (eidsmo.no) vs brand+product compound (eidsmokjott.no) — same Eidsmo Kjøtt company
+  // using its short vanity domain alongside its full trading name domain.
+  const r = domainCoherenceCheck(
+    "https://eidsmo.no/",
+    "https://eidsmokjott.no",
+    "post@eidsmokjott.no",
+  );
+  assertEq(r.coherent, true, "fp06: eidsmo.no / eidsmokjott.no → coherent (short-brand substring of compound)");
+}
+{
+  // One-char edit distance (kranes vs krane): same producer, different apostrophe-s spelling.
+  const r = domainCoherenceCheck(
+    "https://kraneskjokken.no/",
+    "https://kranekjokken.no",
+    "post@kranekjokken.no",
+  );
+  assertEq(r.coherent, true, "fp07: kraneskjokken.no / kranekjokken.no → coherent (possessive-s edit distance)");
+}
+{
+  // IDN punycode (xn--kerkvinnene-w8a) encodes åkerkvinnene;
+  // akerkvinnene is the same name with å→a (single-a) simplification.
+  const r = domainCoherenceCheck(
+    "https://akerkvinnene.no/",
+    "https://xn--kerkvinnene-w8a.no",
+    "post@xn--kerkvinnene-w8a.no",
+  );
+  assertEq(r.coherent, true, "fp08: akerkvinnene.no / xn--kerkvinnene-w8a.no → coherent (IDN å-variant)");
+}
+
+// ── TRUE-POSITIVE pairs: genuinely different entities → must STAY INCOHERENT ──
+{
+  // Municipality domain must never be coerced coherent with a producer domain.
+  const r = domainCoherenceCheck(
+    "https://loseter.no/",
+    "https://oslo.kommune.no",
+    "post@oslo.kommune.no",
+  );
+  assertEq(r.coherent, false, "tp01: loseter.no / oslo.kommune.no → incoherent (municipality guard)");
+}
+{
+  // Cooperative/distributor domain (lokalmat.coop.no) must stay incoherent.
+  const r = domainCoherenceCheck(
+    "https://arvolanes.com/",
+    "https://lokalmat.coop.no",
+    "post@lokalmat.coop.no",
+  );
+  assertEq(r.coherent, false, "tp02: arvolanes.com / lokalmat.coop.no → incoherent (coop distributor)");
+}
+{
+  // Travel aggregator yelp.com must stay incoherent with any producer.
+  const r = domainCoherenceCheck(
+    "https://oppsalsenter.no/",
+    "https://yelp.com",
+    "post@yelp.com",
+  );
+  assertEq(r.coherent, false, "tp03: oppsalsenter.no / yelp.com → incoherent (aggregator guard)");
+}
+{
+  // Travel aggregator gettyourguide.com must stay incoherent.
+  const r = domainCoherenceCheck(
+    "https://aimeesfarm.no/",
+    "https://gettyourguide.com",
+    "post@gettyourguide.com",
+  );
+  assertEq(r.coherent, false, "tp04: aimeesfarm.no / gettyourguide.com → incoherent (aggregator guard)");
+}
+{
+  // Platform domain (rettfrabonden.no) misattributed as producer website must stay incoherent.
+  const r = domainCoherenceCheck(
+    "https://bondens-kolonial.no/",
+    "https://rettfrabonden.no",
+    "post@rettfrabonden.no",
+  );
+  assertEq(r.coherent, false, "tp05: bondens-kolonial.no / rettfrabonden.no → incoherent (platform denylist)");
+}
+{
+  // Original Eidsmo TRUE-POSITIVE: slakthuset.no and eidsmokjott.no are genuinely
+  // DIFFERENT companies (Slakthuset Eidsmo Dullum AS vs Eidsmo Kjøtt AS) that
+  // share a physical address. This must ALWAYS stay incoherent regardless of any
+  // normalization rules (the whole point of the original PR-20260512-33 fix).
+  const r = domainCoherenceCheck(
+    "https://eidsmokjott.no/",
+    "https://slakthuset.no",
+    "post@slakthuset.no",
+  );
+  assertEq(r.coherent, false, "tp06: slakthuset.no / eidsmokjott.no → incoherent (original Eidsmo TRUE-POSITIVE preserved)");
+}
+
+// ── orch-PR-20260613 iteration-2: punycode fail-safe + geographic stem guard ──
+
+console.log("\n── cross-source-validator: iteration-2 fixes (punycode fail-safe + geo-stem guard) ──");
+
+{
+  // xn--x is a malformed/truncated punycode label — the decoder must return the
+  // original label unchanged without hanging. We test this through the public
+  // domainCoherenceCheck API (decodePunycodeLabel is internal) by giving both
+  // sides the same malformed xn-- host; the function must return a verdict
+  // (coherent:true — same host both sides) and must NOT hang.
+  const r = domainCoherenceCheck(
+    "https://xn--x.no/",
+    "https://xn--x.no",
+    "post@xn--x.no",
+  );
+  assertEq(r.coherent, true, "punycode-failsafe-01: malformed xn--x host — returns verdict, no hang (coherent=same host)");
+}
+
+{
+  // A second malformed label on one side and a normal host on the other — must
+  // return incoherent (different domains) without hanging.
+  const r = domainCoherenceCheck(
+    "https://xn--x.no/",
+    "https://normalproducer.no",
+    "post@normalproducer.no",
+  );
+  assertEq(r.coherent, false, "punycode-failsafe-02: malformed xn--x vs normal host → incoherent, no hang");
+}
+
+{
+  // A valid punycode label (xn--strehonning-98a decodes to "sætrehonning")
+  // should still decode correctly (existing fp01 covers this; this is a
+  // belt-and-suspenders check from the same-section perspective).
+  const r = domainCoherenceCheck(
+    "https://xn--strehonning-98a.no/",
+    "https://saetrehonning.no",
+    "post@saetrehonning.no",
+  );
+  assertEq(r.coherent, true, "punycode-valid-01: well-formed xn--strehonning-98a still decodes correctly → coherent");
+}
+
+{
+  // Geographic stem TRUE-POSITIVE guard: lofoten.no and lofotenmat.no share
+  // the region name "lofoten" but represent different legal entities.
+  // "lofoten" is in GENERIC_DOMAIN_LABELS, so the >= 6-char identical-label
+  // shortcut must NOT fire, and they must remain INCOHERENT.
+  const r = domainCoherenceCheck(
+    "https://lofoten.no/",
+    "https://lofotenmat.no",
+    "post@lofotenmat.no",
+  );
+  assertEq(r.coherent, false, "geo-stem-tp01: lofoten.no / lofotenmat.no → incoherent (GENERIC_DOMAIN_LABELS guard is load-bearing)");
+}
+
+{
+  // Additional geographic stem: hardanger — two different producers in the
+  // Hardanger region must not be coerced to coherent by the brand-token path.
+  const r = domainCoherenceCheck(
+    "https://hardangersider.no/",
+    "https://hardangermat.no",
+    "post@hardangermat.no",
+  );
+  assertEq(r.coherent, false, "geo-stem-tp02: hardangersider.no / hardangermat.no → incoherent (hardanger is a generic geo stem)");
+}
+
 // ── WO-16: Integration tests (runVerifierBatch with cross-source gate) ───────
 
 console.log("\n── cross-source-validator: runVerifierBatch integration tests ──");
