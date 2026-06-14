@@ -164,3 +164,62 @@ router.get("/", (req: Request, res: Response) => {
 });
 
 export default router;
+
+// ─── Bulk pending_verify sweep endpoints (orch-pr-20260614-2) ─────────────
+//
+// POST /admin/run-verifier/sweep
+//   Triggers a background sweep over all pending_verify agents. Returns
+//   immediately (the loop runs for 15-40 min in the background). Not
+//   night-gated — explicit admin one-off, intended to drain the backlog.
+//   Rejects 409 if a sweep is already running.
+//
+// GET /admin/run-verifier/sweep
+//   Returns the current (or last) sweep job state plus how many
+//   pending_verify agents remain.
+
+import { startSweep, getSweepJob } from "../services/verifier-sweep";
+import { countPendingVerify } from "../agents/lokal-agent-verifier";
+import { getDb } from "../database/init";
+
+router.post("/sweep", async (req: Request, res: Response) => {
+  if (!requireAdmin(req, res)) return;
+
+  const db = getDb();
+  const chunkSizeRaw = (req.body && req.body.chunkSize) || req.query.chunkSize;
+  const chunkSize = chunkSizeRaw ? Math.min(Math.max(parseInt(String(chunkSizeRaw), 10) || 50, 1), 200) : 50;
+
+  const maxAgentsRaw = (req.body && req.body.maxAgents) || req.query.maxAgents;
+  const maxAgents = maxAgentsRaw ? parseInt(String(maxAgentsRaw), 10) : undefined;
+
+  const result = startSweep({ chunkSize, maxAgents, db });
+
+  if (!result.started) {
+    // A sweep is already in flight — surface current job for observability.
+    res.status(409).json({
+      success: false,
+      started: false,
+      reason: result.reason,
+      job: getSweepJob(),
+      pending_verify_remaining: countPendingVerify(db),
+    });
+    return;
+  }
+
+  res.json({
+    success: true,
+    started: true,
+    job_id: result.jobId,
+    pending_verify_remaining: countPendingVerify(db),
+    note: "Sweep running in background. Poll GET /admin/run-verifier/sweep for progress.",
+  });
+});
+
+router.get("/sweep", (req: Request, res: Response) => {
+  if (!requireAdmin(req, res)) return;
+  const db = getDb();
+  res.json({
+    success: true,
+    job: getSweepJob(),
+    pending_verify_remaining: countPendingVerify(db),
+  });
+});

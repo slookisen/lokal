@@ -14805,6 +14805,229 @@ const _platformVerifierPromise = (async () => {
   }
 })();
 
+
+// ── orch-pr-20260614-2: pickPendingVerifyBatch + verifier-sweep ──────────────
+console.log("\n── orch-pr-20260614-2: pickPendingVerifyBatch + verifier-sweep ──");
+const _orchPr20260614_2Promise = (async () => {
+  const sqlite = require("better-sqlite3");
+  const {
+    pickPendingVerifyBatch,
+    countPendingVerify,
+  } = require("../src/agents/lokal-agent-verifier");
+
+  // ── Test 1: pickPendingVerifyBatch DB schema + seeding ─────────────────────
+  const pvdb = new sqlite(":memory:");
+  pvdb.exec(`
+    CREATE TABLE agents (
+      id TEXT PRIMARY KEY, name TEXT, url TEXT, city TEXT, role TEXT
+    );
+    CREATE TABLE agent_knowledge (
+      agent_id TEXT PRIMARY KEY,
+      address TEXT, website TEXT, phone TEXT, email TEXT,
+      about TEXT, products TEXT DEFAULT '[]',
+      verification_status TEXT NOT NULL DEFAULT 'unverified',
+      enrichment_status TEXT NOT NULL DEFAULT 'thin',
+      outreach_eligible_at TEXT,
+      last_verified_at TEXT, last_http_check_at TEXT, last_http_status INTEGER,
+      sweep_processed_at TEXT,
+      field_provenance TEXT NOT NULL DEFAULT '{}',
+      verification_review_reason TEXT NOT NULL DEFAULT '{}'
+    );
+  `);
+
+  // Insert agents with various verification statuses
+  pvdb.prepare("INSERT INTO agents (id,name,role) VALUES (?,?,?)").run("pv-pending1", "Pending 1", "producer");
+  pvdb.prepare("INSERT INTO agents (id,name,role) VALUES (?,?,?)").run("pv-pending2", "Pending 2", "producer");
+  pvdb.prepare("INSERT INTO agents (id,name,role) VALUES (?,?,?)").run("pv-pending3", "Pending 3", "producer");
+  pvdb.prepare("INSERT INTO agents (id,name,role) VALUES (?,?,?)").run("pv-verified", "Verified", "producer");
+  pvdb.prepare("INSERT INTO agents (id,name,role) VALUES (?,?,?)").run("pv-review", "Review Required", "producer");
+  pvdb.prepare("INSERT INTO agents (id,name,role) VALUES (?,?,?)").run("pv-opt", "Opt Out", "producer");
+
+  const ins = pvdb.prepare(`INSERT INTO agent_knowledge
+    (agent_id, verification_status, last_verified_at, sweep_processed_at)
+    VALUES (?, ?, ?, ?)`);
+  // pending_verify — oldest first by sweep_processed_at
+  ins.run("pv-pending1", "pending_verify", "2026-01-01T00:00:00Z", null);           // oldest (no sweep)
+  ins.run("pv-pending2", "pending_verify", "2026-03-01T00:00:00Z", "2026-02-01T00:00:00Z"); // mid
+  ins.run("pv-pending3", "pending_verify", "2026-05-01T00:00:00Z", "2026-04-01T00:00:00Z"); // newest
+  // Other statuses — must be excluded
+  ins.run("pv-verified", "verified", "2026-04-01T00:00:00Z", null);
+  ins.run("pv-review",   "review_required", "2026-04-01T00:00:00Z", null);
+  ins.run("pv-opt",      "opt_out", "2026-01-01T00:00:00Z", null);
+
+  // Test 1a: only pending_verify rows returned
+  const batch = pickPendingVerifyBatch(pvdb, 50);
+  const ids = batch.map((r: any) => r.id);
+  assertEq(batch.length, 3, `pv-picker: returns 3 pending_verify rows (got ${batch.length})`);
+  assertTrue(ids.includes("pv-pending1"), "pv-picker: includes pv-pending1");
+  assertTrue(ids.includes("pv-pending2"), "pv-picker: includes pv-pending2");
+  assertTrue(ids.includes("pv-pending3"), "pv-picker: includes pv-pending3");
+  assertTrue(!ids.includes("pv-verified"), "pv-picker: excludes verified");
+  assertTrue(!ids.includes("pv-review"),   "pv-picker: excludes review_required");
+  assertTrue(!ids.includes("pv-opt"),      "pv-picker: excludes opt_out");
+
+  // Test 1b: oldest sweep_processed_at (COALESCE → 1970-01-01 for nulls) first
+  assertEq(batch[0].id, "pv-pending1", "pv-picker: pv-pending1 (no sweep) comes first");
+  assertEq(batch[1].id, "pv-pending2", "pv-picker: pv-pending2 (2026-02) second");
+  assertEq(batch[2].id, "pv-pending3", "pv-picker: pv-pending3 (2026-04) last");
+
+  // Test 1c: LIMIT honored
+  const limited = pickPendingVerifyBatch(pvdb, 2);
+  assertEq(limited.length, 2, "pv-picker: LIMIT param honored");
+
+  // Test 1d: countPendingVerify
+  assertEq(countPendingVerify(pvdb), 3, "pv-count: returns 3 pending_verify");
+
+  pvdb.close();
+
+  // ── Test 2: startSweep — happy-path, 2 chunks then empty ───────────────────
+  const { startSweep, getSweepJob } = require("../src/services/verifier-sweep");
+
+  // Injected runBatch: returns N fake results for the first 2 calls, then 0.
+  const sweepDb2 = new sqlite(":memory:");
+  sweepDb2.exec(`
+    CREATE TABLE agent_knowledge (
+      agent_id TEXT PRIMARY KEY,
+      verification_status TEXT NOT NULL DEFAULT 'pending_verify'
+    );
+  `);
+  sweepDb2.prepare("INSERT INTO agent_knowledge (agent_id) VALUES (?)").run("sw-1");
+  sweepDb2.prepare("INSERT INTO agent_knowledge (agent_id) VALUES (?)").run("sw-2");
+
+  let callCount = 0;
+  function fakeRunBatch(_opts: any) {
+    callCount++;
+    if (callCount <= 2) {
+      // Simulate a chunk of 3 results: 2 verified, 1 review_required
+      return Promise.resolve({
+        run_id: `run-fake-${callCount}`,
+        started_at: new Date().toISOString(),
+        finished_at: new Date().toISOString(),
+        results: [
+          { agent_id: "sw-1", passed: true, flags: [], fields_verified: [], fields_failed: [],
+            http_status: 200, brreg_status: null, new_verification_status: "verified",
+            new_enrichment_status: "partial", outreach_eligible_at: null,
+            cross_source_reason: {}, url_last_probed: null, url_last_status: null,
+            url_demoted: false, domain_incoherent: false },
+          { agent_id: "sw-2", passed: true, flags: [], fields_verified: [], fields_failed: [],
+            http_status: 200, brreg_status: null, new_verification_status: "verified",
+            new_enrichment_status: "partial", outreach_eligible_at: null,
+            cross_source_reason: {}, url_last_probed: null, url_last_status: null,
+            url_demoted: false, domain_incoherent: false },
+          { agent_id: "sw-3", passed: false, flags: ["http_404"], fields_verified: [], fields_failed: [],
+            http_status: 404, brreg_status: null, new_verification_status: "review_required",
+            new_enrichment_status: "thin", outreach_eligible_at: null,
+            cross_source_reason: {}, url_last_probed: null, url_last_status: null,
+            url_demoted: false, domain_incoherent: false },
+        ],
+      });
+    }
+    // Chunk 3: empty → sweep should stop
+    return Promise.resolve({
+      run_id: "run-fake-empty",
+      started_at: new Date().toISOString(),
+      finished_at: new Date().toISOString(),
+      results: [],
+    });
+  }
+
+  const noSleep = () => Promise.resolve();
+  callCount = 0;
+
+  const result2 = startSweep({
+    chunkSize: 3,
+    runBatch: fakeRunBatch,
+    sleep: noSleep,
+    db: sweepDb2,
+  });
+
+  assertTrue(result2.started === true, "sweep-happy: startSweep returns started=true");
+  assertTrue(typeof result2.jobId === "string", "sweep-happy: returns jobId string");
+  assertEq(getSweepJob().status, "running", "sweep-happy: job status=running immediately");
+
+  // Wait for the background loop to finish (it is truly async but uses
+  // resolved promises so it drains in the next micro-task batch).
+  await new Promise<void>((resolve) => {
+    const interval = setInterval(() => {
+      if (getSweepJob().status !== "running") {
+        clearInterval(interval);
+        resolve();
+      }
+    }, 10);
+    // Safety timeout — if job never finishes, fail after 2 seconds
+    setTimeout(() => { clearInterval(interval); resolve(); }, 2000);
+  });
+
+  const job2 = getSweepJob();
+  assertEq(job2.status, "done", "sweep-happy: job.status=done after loop");
+  assertEq(job2.processed, 6, `sweep-happy: processed=6 (2 chunks × 3) got ${job2.processed}`);
+  assertEq(job2.verified, 4, `sweep-happy: verified=4 (2 chunks × 2 verified) got ${job2.verified}`);
+  assertEq(job2.review_required, 2, `sweep-happy: review_required=2 (2 chunks × 1) got ${job2.review_required}`);
+  assertEq(job2.data_insufficient, 0, "sweep-happy: data_insufficient=0");
+  assertEq(callCount, 3, `sweep-happy: runBatch called 3 times (2 chunks + 1 empty) got ${callCount}`);
+  sweepDb2.close();
+
+  // ── Test 3: concurrency guard ───────────────────────────────────────────────
+  // We need a new sweep module instance since module state is singleton.
+  // Use require.cache trick: delete the cached module and reload it so each
+  // test gets a fresh _sweepJob singleton.
+  const sweepPath = require.resolve("../src/services/verifier-sweep");
+  delete require.cache[sweepPath];
+  const sweepMod = require("../src/services/verifier-sweep");
+
+  const sweepDb3 = new sqlite(":memory:");
+  sweepDb3.exec(`CREATE TABLE agent_knowledge (agent_id TEXT PRIMARY KEY, verification_status TEXT NOT NULL DEFAULT 'pending_verify');`);
+
+  // Slow runBatch that never resolves during our test window
+  let slowResolve: () => void = () => {};
+  const slowBatch = () => new Promise<{ run_id: string; started_at: string; finished_at: string; results: any[] }>(
+    (resolve) => { slowResolve = () => resolve({ run_id: "x", started_at: "", finished_at: "", results: [] }); }
+  );
+
+  const r3a = sweepMod.startSweep({ runBatch: slowBatch, sleep: noSleep, db: sweepDb3 });
+  assertTrue(r3a.started === true, "sweep-concurrency: first startSweep returns started=true");
+  assertEq(sweepMod.getSweepJob().status, "running", "sweep-concurrency: job is running");
+
+  // Second startSweep while first is in flight
+  const r3b = sweepMod.startSweep({ runBatch: slowBatch, sleep: noSleep, db: sweepDb3 });
+  assertEq(r3b.started, false, "sweep-concurrency: second startSweep returns started=false");
+  assertEq(r3b.reason, "already_running", "sweep-concurrency: reason='already_running'");
+
+  // Unblock the slow batch so the IIFE can proceed and the test finishes
+  slowResolve();
+  sweepDb3.close();
+
+  // ── Test 4: error resilience — 3 consecutive errors → status='error' ────────
+  delete require.cache[require.resolve("../src/services/verifier-sweep")];
+  const sweepMod4 = require("../src/services/verifier-sweep");
+
+  const sweepDb4 = new sqlite(":memory:");
+  sweepDb4.exec(`CREATE TABLE agent_knowledge (agent_id TEXT PRIMARY KEY, verification_status TEXT NOT NULL DEFAULT 'pending_verify');`);
+
+  let errCallCount4 = 0;
+  function alwaysThrows(_opts: any): Promise<any> {
+    errCallCount4++;
+    return Promise.reject(new Error("simulated I/O failure"));
+  }
+
+  const r4 = sweepMod4.startSweep({ runBatch: alwaysThrows, sleep: noSleep, db: sweepDb4 });
+  assertTrue(r4.started === true, "sweep-errors: startSweep starts ok");
+
+  await new Promise<void>((resolve) => {
+    const interval = setInterval(() => {
+      const s = sweepMod4.getSweepJob().status;
+      if (s === "error" || s === "done") { clearInterval(interval); resolve(); }
+    }, 10);
+    setTimeout(() => { clearInterval(interval); resolve(); }, 2000);
+  });
+
+  const job4 = sweepMod4.getSweepJob();
+  assertEq(job4.status, "error", "sweep-errors: job.status=error after 3 consecutive failures");
+  assertEq(job4.errors, 3, `sweep-errors: errors=3 (got ${job4.errors})`);
+  assertTrue(job4.lastError !== null, "sweep-errors: lastError is set");
+  sweepDb4.close();
+})();
+
 // ── REPORT ────────────────────────────────────────────────────────────
 
 // Wait for the M2 owner-portal async tests before reporting so their
@@ -14835,6 +15058,7 @@ const _platformVerifierPromise = (async () => {
   try { await _pr125Promise; } catch { /* errors already pushed to failures */ }
   try { await _seoDentalPromise; } catch { /* errors already pushed to failures */ }
   try { await _platformVerifierPromise; } catch { /* errors already pushed to failures */ }
+  try { await _orchPr20260614_2Promise; } catch { /* errors already pushed to failures */ }
   // PR-109 tests are synchronous (IIFE) — no promise needed
   // Drop pre-existing intg failures (unmasked by awaiting) — they predate M2
   // and live behind a separate fix-it task. Counting them here would surface

@@ -305,6 +305,51 @@ export function pickReviewQueueBatch(db: any, limit = 30): any[] {
     .all(limit);
 }
 
+
+// ─── orch-pr-20260614-2: bulk pending_verify picker ────────────────────────
+//
+// Dedicated picker for the bulk-sweep job (src/services/verifier-sweep.ts).
+// Unlike pickBatchBiased (70/30 split), this scopes EXCLUSIVELY to
+// `pending_verify` agents so the sweep makes monotone progress draining
+// the backlog without interleaving other status buckets.
+//
+// Order: oldest COALESCE(sweep_processed_at, last_verified_at, '1970-01-01')
+// first — ensures agents that haven't been touched by any sweep run come first,
+// then falls back to last_verified_at for agents that were verified once but
+// slipped back to pending.
+//
+// opt_out is explicitly excluded even though pending_verify and opt_out are
+// mutually exclusive in practice — defensive filter matches all other pickers.
+export function pickPendingVerifyBatch(db: any, limit = 50): any[] {
+  return db
+    .prepare(
+      `SELECT a.id, a.name, a.url AS agent_url, a.city AS location_city,
+              k.email, k.phone, k.address,
+              k.website, k.about, k.products, k.field_provenance,
+              k.verification_status, k.enrichment_status,
+              k.last_verified_at, k.last_http_check_at, k.last_http_status
+         FROM agents a
+   INNER JOIN agent_knowledge k ON k.agent_id = a.id
+        WHERE k.verification_status = 'pending_verify'
+          AND k.verification_status NOT IN ('opt_out')
+     ORDER BY COALESCE(k.sweep_processed_at, k.last_verified_at, '1970-01-01') ASC
+        LIMIT ?`
+    )
+    .all(limit);
+}
+
+// Count remaining pending_verify agents. Used by the sweep endpoints to
+// report how much backlog is left after each API call.
+export function countPendingVerify(db: any): number {
+  const row = db
+    .prepare(
+      `SELECT COUNT(*) AS n FROM agent_knowledge
+        WHERE verification_status = 'pending_verify'`
+    )
+    .get() as { n: number } | undefined;
+  return row?.n ?? 0;
+}
+
 // orch-pr-87: 70/30 growth-biased picker. Default behaviour for
 // /admin/run-verifier going forward — keeps the systematic-sweep
 // guarantee for already-`verified` agents while biasing capacity
