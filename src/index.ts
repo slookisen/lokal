@@ -44,7 +44,7 @@ import adminVerifierSweepStatusRouter from "./routes/admin-verifier-sweep-status
 import ownerPortalRoutes from "./routes/owner-portal";
 import adminAgentAuditRoutes from "./routes/admin-agent-audit";
 import adminVerifierReviewQueueRoutes from "./routes/admin-verifier-review-queue";
-import adminKnowledgeRoutes from "./routes/admin-knowledge";
+import adminKnowledgeRoutes, { pruneUrlsRouter } from "./routes/admin-knowledge";
 import adminAffiliationsRoutes from "./routes/admin-affiliations";
 import adminBmEventsRoutes from "./routes/admin-bm-events";
 import adminBmReconcileRoutes from "./routes/admin-bm-reconcile";
@@ -367,6 +367,8 @@ app.use("/admin/agent-audit", adminLimiter, adminAgentAuditRoutes);
 app.use("/admin/verifier-review-queue", adminLimiter, adminVerifierReviewQueueRoutes);
 // PR-24 (2026-05-11): enrichment write surface accepts field_provenance
 app.use("/admin/knowledge", adminLimiter, adminKnowledgeRoutes);
+// orch-pr-9 (2026-06-14): dead/junk URL prune — POST /admin/prune-dead-urls
+app.use("/admin", adminLimiter, pruneUrlsRouter);
 // PR-58 (2026-05-16): C.1-C auto-tag enrichment — POST /admin/affiliations/auto-create
 app.use("/admin/affiliations", adminLimiter, adminAffiliationsRoutes);
 // PR-56 (2026-05-16): Bondens marked events scraper — POST /admin/bm-events/scrape

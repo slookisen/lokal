@@ -16411,6 +16411,7 @@ const _orchPr20260614_6Promise: Promise<void> = new Promise<void>(r => { _orchPr
   try { await _orchPr20260614Promise; } catch { /* errors already pushed to failures */ }
   try { await _orchPr20260614_5Promise; } catch { /* errors already pushed to failures */ }
   try { await _orchPr20260614_6Promise; } catch { /* errors already pushed to failures */ }
+  try { await _orchPr9PruneDeadUrlsPromise; } catch { /* errors already pushed to failures */ }
   // PR-109 tests are synchronous (IIFE) — no promise needed
   // Drop pre-existing intg failures (unmasked by awaiting) — they predate M2
   // and live behind a separate fix-it task. Counting them here would surface
@@ -17342,3 +17343,209 @@ console.log("\n── orch-PR-20260614-7: isAcceptableHomepageEmail ──");
     "orch-pr-20260614-7-t7: outlook.com freemail on own site → ACCEPTED"
   );
 }
+
+
+// ── orch-pr-9: prune-dead-urls endpoint ──────────────────────────────────────
+console.log("\n── orch-pr-9: POST /admin/prune-dead-urls ──");
+
+let _orchPr9PruneDeadUrlsResolve: () => void = () => {};
+const _orchPr9PruneDeadUrlsPromise: Promise<void> = new Promise<void>(r => {
+  _orchPr9PruneDeadUrlsResolve = r;
+});
+
+(async () => {
+  // Wait for all prior DB-mutating IIFEs to complete
+  try { await _orchPr20260614_6Promise; } catch { /* upstream */ }
+
+  try {
+    const Database4 = (await import("better-sqlite3")).default;
+    const pruneDb = new Database4(":memory:");
+    pruneDb.pragma("journal_mode = DELETE");
+    pruneDb.exec(`
+      CREATE TABLE agents (
+        id TEXT PRIMARY KEY,
+        name TEXT,
+        slug TEXT,
+        role TEXT,
+        api_key TEXT
+      );
+      CREATE TABLE agent_knowledge (
+        agent_id TEXT PRIMARY KEY,
+        website TEXT,
+        updated_at TEXT
+      );
+    `);
+
+    const initMod3 = await import("../src/database/init");
+    initMod3.__setDbForTesting(pruneDb as any);
+
+    // Seed agents
+    const agents = [
+      { id: "prune-placeholder-1", name: "Prune Placeholder 1", website: "https://Not available" },
+      { id: "prune-placeholder-2", name: "Prune Placeholder 2", website: "N/A" },
+      { id: "prune-placeholder-3", name: "Prune Placeholder 3", website: "n/a" },
+      { id: "prune-aggregator-yelp", name: "Prune Aggregator Yelp", website: "https://www.yelp.com/search?find_desc=farmers+market" },
+      { id: "prune-aggregator-bm", name: "Prune Aggregator BM", website: "https://bondensmarked.no/produsent/x" },
+      { id: "prune-real-domain", name: "Prune Real Domain", website: "https://gard.no" },
+    ];
+
+    for (const a of agents) {
+      pruneDb.prepare("INSERT INTO agents (id, name, slug, role, api_key) VALUES (?, ?, ?, 'producer', 'k')").run(a.id, a.name, a.id);
+      pruneDb.prepare("INSERT INTO agent_knowledge (agent_id, website, updated_at) VALUES (?, ?, datetime('now'))").run(a.id, a.website);
+    }
+
+    // Mount the pruneUrlsRouter on a minimal Express app
+    const expressMod4 = (await import("express")).default;
+    const adminKnowledgeMod2 = await import("../src/routes/admin-knowledge");
+    const app4 = expressMod4();
+    app4.use(expressMod4.json());
+    app4.use("/admin", adminKnowledgeMod2.pruneUrlsRouter);
+
+    const httpMod4 = await import("http");
+    const server4 = httpMod4.createServer(app4);
+    await new Promise<void>((resolve) => server4.listen(0, "127.0.0.1", () => resolve()));
+    const addr4 = server4.address();
+    const port4 = typeof addr4 === "object" && addr4 ? addr4.port : 0;
+
+    const PRUNE_KEY = "prune-test-admin-key-9";
+    const prevKey2 = process.env.ADMIN_KEY;
+    process.env.ADMIN_KEY = PRUNE_KEY;
+
+    function pruneReq(
+      method: string,
+      urlPath: string,
+      body?: Record<string, unknown>,
+      key?: string
+    ): Promise<{ status: number; body: unknown }> {
+      const payload = body ? JSON.stringify(body) : "";
+      const headers: Record<string, string> = {};
+      if (key !== undefined) headers["x-admin-key"] = key;
+      if (payload) {
+        headers["content-type"] = "application/json";
+        headers["content-length"] = String(Buffer.byteLength(payload));
+      }
+      return new Promise((resolve, reject) => {
+        const r = httpMod4.request(
+          { method, host: "127.0.0.1", port: port4, path: urlPath, headers },
+          (resp) => {
+            const chunks: Buffer[] = [];
+            resp.on("data", (c) => chunks.push(c as Buffer));
+            resp.on("end", () => {
+              const raw = Buffer.concat(chunks).toString("utf8");
+              let parsed: unknown = null;
+              try { parsed = raw ? JSON.parse(raw) : null; } catch { parsed = { _raw: raw }; }
+              resolve({ status: resp.statusCode || 0, body: parsed });
+            });
+          }
+        );
+        r.on("error", reject);
+        if (payload) r.write(payload);
+        r.end();
+      });
+    }
+
+    function getWebsite(agentId: string): string | null {
+      const row = pruneDb.prepare("SELECT website FROM agent_knowledge WHERE agent_id = ?").get(agentId) as { website: string | null } | undefined;
+      return row?.website ?? null;
+    }
+
+    // ── prune-1: admin gate — missing key → 403 ──────────────────────────────
+    {
+      const r = await pruneReq("POST", "/admin/prune-dead-urls");
+      assertEq(r.status, 403, "prune-1: no key → 403");
+    }
+
+    // ── prune-2: admin gate — wrong key → 403 ────────────────────────────────
+    {
+      const r = await pruneReq("POST", "/admin/prune-dead-urls", undefined, "wrong-key");
+      assertEq(r.status, 403, "prune-2: wrong key → 403");
+    }
+
+    // ── prune-3: dry-run — placeholder websites are classified but NOT written ──
+    {
+      const r = await pruneReq("POST", "/admin/prune-dead-urls", undefined, PRUNE_KEY);
+      assertEq(r.status, 200, "prune-3: dry-run → 200");
+      const b = r.body as Record<string, unknown>;
+      assertEq(b.dry_run, true, "prune-3: dry_run=true");
+      assertEq(b.success, true, "prune-3: success=true");
+      const wp = b.would_prune as Record<string, number>;
+      assertTrue(wp.placeholder >= 2, "prune-3: at least 2 placeholder websites found");
+      assertTrue(wp.aggregator >= 2, "prune-3: at least 2 aggregator websites found");
+      assertTrue(wp.total >= 4, "prune-3: total >= 4");
+      // Dry-run must NOT write anything
+      assertEq(getWebsite("prune-placeholder-1"), "https://Not available", "prune-3: dry-run did NOT null placeholder");
+      assertEq(getWebsite("prune-aggregator-yelp"), "https://www.yelp.com/search?find_desc=farmers+market", "prune-3: dry-run did NOT null aggregator");
+    }
+
+    // ── prune-4: classification details in sample ─────────────────────────────
+    {
+      const r = await pruneReq("POST", "/admin/prune-dead-urls", undefined, PRUNE_KEY);
+      const b = r.body as Record<string, unknown>;
+      const sample = b.sample as Array<{ agent_id: string; website: string; reason: string }>;
+      assertTrue(Array.isArray(sample), "prune-4: sample is array");
+      const placeholder1 = sample.find((s) => s.agent_id === "prune-placeholder-1");
+      assertTrue(placeholder1 !== undefined, "prune-4: placeholder-1 in sample");
+      assertEq(placeholder1?.reason, "placeholder", "prune-4: placeholder-1 reason=placeholder");
+      const yelpEntry = sample.find((s) => s.agent_id === "prune-aggregator-yelp");
+      assertTrue(yelpEntry !== undefined, "prune-4: yelp in sample");
+      assertEq(yelpEntry?.reason, "aggregator", "prune-4: yelp reason=aggregator");
+      const bmEntry = sample.find((s) => s.agent_id === "prune-aggregator-bm");
+      assertTrue(bmEntry !== undefined, "prune-4: bondensmarked in sample");
+      assertEq(bmEntry?.reason, "aggregator", "prune-4: bondensmarked reason=aggregator");
+    }
+
+    // ── prune-5: real domain NOT pruned in dry-run ────────────────────────────
+    {
+      const r = await pruneReq("POST", "/admin/prune-dead-urls", undefined, PRUNE_KEY);
+      const b = r.body as Record<string, unknown>;
+      const sample = b.sample as Array<{ agent_id: string }>;
+      const realEntry = sample.find((s) => s.agent_id === "prune-real-domain");
+      assertTrue(realEntry === undefined, "prune-5: gard.no (real domain) NOT in sample");
+    }
+
+    // ── prune-6: apply=1 actually nulls junk websites ─────────────────────────
+    {
+      const r = await pruneReq("POST", "/admin/prune-dead-urls?apply=1", undefined, PRUNE_KEY);
+      assertEq(r.status, 200, "prune-6: apply → 200");
+      const b = r.body as Record<string, unknown>;
+      assertEq(b.dry_run, false, "prune-6: dry_run=false");
+      const pruned = b.pruned as number;
+      assertTrue(pruned >= 4, "prune-6: pruned >= 4");
+      // Verify DB was actually updated
+      assertEq(getWebsite("prune-placeholder-1"), null, "prune-6: placeholder-1 website now NULL");
+      assertEq(getWebsite("prune-placeholder-2"), null, "prune-6: placeholder-2 (N/A) website now NULL");
+      assertEq(getWebsite("prune-aggregator-yelp"), null, "prune-6: yelp website now NULL");
+      assertEq(getWebsite("prune-aggregator-bm"), null, "prune-6: bondensmarked website now NULL");
+      // Real domain must NOT be touched
+      assertEq(getWebsite("prune-real-domain"), "https://gard.no", "prune-6: real domain gard.no untouched");
+    }
+
+    // ── prune-7: second apply=1 is idempotent — pruned=0 ─────────────────────
+    {
+      const r = await pruneReq("POST", "/admin/prune-dead-urls?apply=1", undefined, PRUNE_KEY);
+      const b = r.body as Record<string, unknown>;
+      assertEq(b.pruned, 0, "prune-7: second apply pruned=0 (idempotent)");
+      assertEq(b.scanned, 1, "prune-7: only 1 row still has a website (the real domain)");
+    }
+
+    // ── prune-8: apply via body { apply: true } ───────────────────────────────
+    // Seed a new agent to verify body-flag path works
+    pruneDb.prepare("INSERT INTO agents (id, name, slug, role, api_key) VALUES ('prune-body-test', 'Body Test', 'prune-body-test', 'producer', 'k')").run();
+    pruneDb.prepare("INSERT INTO agent_knowledge (agent_id, website, updated_at) VALUES ('prune-body-test', 'N/A', datetime('now'))").run();
+    {
+      const r = await pruneReq("POST", "/admin/prune-dead-urls", { apply: true }, PRUNE_KEY);
+      const b = r.body as Record<string, unknown>;
+      assertEq(b.dry_run, false, "prune-8: body apply:true → dry_run=false");
+      assertTrue((b.pruned as number) >= 1, "prune-8: body apply pruned >= 1");
+      assertEq(getWebsite("prune-body-test"), null, "prune-8: N/A website nulled via body apply");
+    }
+
+    process.env.ADMIN_KEY = prevKey2;
+    await new Promise<void>((resolve) => server4.close(() => resolve()));
+  } catch (err) {
+    failed++;
+    failures.push("orch-pr-9-prune: unexpected error: " + String(err));
+  } finally {
+    _orchPr9PruneDeadUrlsResolve();
+  }
+})();

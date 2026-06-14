@@ -1,0 +1,240 @@
+
+> lokal@1.0.0 test
+> tsx tests/test.ts
+
+[Email] ⚠️  SMTP not configured. Email service in dry-run mode. 
+── pii-redact tests ──
+── trust-score community signal tests ──
+[Email] ⚠️  SMTP not configured. Email service in dry-run mode. 
+[Email] ⚠️  SMTP not configured. Email service in dry-run mode. 
+[Email] ⚠️  SMTP not configured. Email service in dry-run mode. 
+── Phase 4.10: verifier write-bug regression tests ──
+── PR-91: listPendingVerification verifier_checked_at guard ──
+── Phase 4.10c-2 Steg 1: thread.last_outbound_at trigger ──
+── Phase 4.10c-2 Steg 3: compose rate-limit query ──
+── agent-stats: per-agent stats endpoint logic ──
+
+── PR-27: pickReviewQueueBatch unit tests ──
+
+── PR-21 / WO-19: probeAgentUrl unit tests ──
+── PR-21 / WO-19: outreach_ready_pool freshness gate ──
+
+── cross-source-validator: tierForSource ──
+
+── cross-source-validator: crossSourceAgreement unit tests ──
+
+── cross-source-validator: PR-19 verdict split ──
+
+── cross-source-validator: domainCoherenceCheck ──
+
+── cross-source-validator: domainCoherenceCheck (orch-PR-20260614-1 email-anchor) ──
+
+── cross-source-validator: domainCoherenceCheck (orch-PR-20260613 FP reduction) ──
+
+── cross-source-validator: iteration-2 fixes (punycode fail-safe + geo-stem guard) ──
+
+── cross-source-validator: runVerifierBatch integration tests ──
+
+── Phase 5.4a M2: owner-portal frontend tests ──
+
+── PR-24: /admin/knowledge field_provenance merge tests ──
+
+── PR-23: field_provenance backfill ──
+
+── PR-25: relaxed homepage-source backfill ──
+
+── PR-30: freshness signals (helpers) ──
+
+── PR-30: source-presence checks on seo.ts ──
+
+── WO-17: seo.ts source-presence (JSON-LD + sitemap) ──
+
+── PR-56 note 3: init.ts comment accuracy ──
+── PR-29 related-producers tests ──
+
+── Phase 5.11 A1: umbrella schema migration ──
+
+── Phase 5.11 A2: producer/umbrella rendering ──
+
+── Phase 5.11 A3: admin endpoints ──
+
+── Phase 5.11 A2.5: A2A agent-card + MCP discovery ──
+
+── Phase 5.11 A4.1: umbrella exclusion from producer surfaces ──
+
+── Phase 5.11 A4.3: Bondens marked migration admin endpoint ──
+
+── Phase 5.11 A4.4 (PR-50): /produsent/:slug umbrella fix + Sogn backfill ──
+
+── Phase 5.11 A5 (PR-51): umbrella profile polish ──
+
+── Phase 5.11 A6 (PR-52): homepage umbrella shortcut ──
+
+── PR-53: homepage Claude MCP link to setup guide ──
+
+── Phase 5.11 A7 (PR-54): MCP HTTP endpoint umbrella tools ──
+
+── PR-56: Smithery distribution wiring ──
+
+── PR-58: Debio auto-tag enrichment ──
+
+── PR-57: Playwright render-worker scaffolding ──
+
+── PR-56: Bondens marked events scraper ──
+
+── Phase 5.11 C.2: Hanen member scraper ──
+
+── PR-64: Hanen matcher v2 ──
+
+── C.1-A: Debio TRACES + Brreg cross-check ──
+
+── PR-65: async + offset (Option D) ──
+
+── PR-66: TRACES POST-body filter + GET fallback ──
+
+── PR-67: Hanen matcher v3 (medium→high promote) ──
+
+── PR-68: verifier-review-queue umbrella filter + Hanen batch import ──
+
+── PR-72: search relevance — category beats city ──
+
+── PR-73: addUtmParams (outbound producer-link UTM tagging) ──
+
+── PR-73: /llms.txt expanded content ──
+
+── PR-74: umbrella-traffic aggregation + endpoint ──
+
+── PR-75: MAJOR_CITIES expansion ──
+
+── PR-78: Storby-bydeler (Oppsal disambiguation) ──
+── orch-pr-86: provenance cleanup + read endpoints ──
+
+── orch-pr-87: pickBatchBiased + getSweepStatus ──
+── orch-pr-93: GET /admin/agents ──
+── orch-pr-92: daily auto-prune scheduled task ──
+
+── PR-95: Debio organic-cert verification ──
+
+── PR-99: openai-apps-challenge + read-only MCP annotations ──
+
+── PR-100: dental schema extension ──
+[db-factory] vertical=dental opened at :memory:
+[init-dental] added column worker_id
+[init-dental] added column claimed_at
+[dental] schema initialized
+[dental] schema initialized
+
+── FIX finn-tannlege: search filters + sparse-specialty ──
+[db-factory] vertical=dental opened at :memory:
+[init-dental] added column worker_id
+[init-dental] added column claimed_at
+[dental] schema initialized
+
+── PR-100b: Fly volume path hotfix ──
+[db-factory] vertical=dental opened at :memory:
+[init-dental] added column worker_id
+[init-dental] added column claimed_at
+[dental] schema initialized
+[db-factory] vertical=dental opened at /app/data/dental.db
+[init-dental] added column worker_id
+[init-dental] added column claimed_at
+[dental] schema initialized
+
+── PR-104: dental claim-batch service ──
+[db-factory] vertical=dental opened at :memory:
+[init-dental] added column worker_id
+[init-dental] added column claimed_at
+[dental] schema initialized
+
+── PR-107: zombie-claim sweep fix ──
+[db-factory] vertical=dental opened at :memory:
+[init-dental] added column worker_id
+[init-dental] added column claimed_at
+[dental] schema initialized
+
+── PR-108: claim-pool junk-exclusion ──
+[db-factory] vertical=dental opened at :memory:
+[init-dental] added column worker_id
+[init-dental] added column claimed_at
+[dental] schema initialized
+
+── PR-120: list enrichment_state filter + thin_site parking ──
+[db-factory] vertical=dental opened at :memory:
+[init-dental] added column worker_id
+[init-dental] added column claimed_at
+[dental] schema initialized
+
+── PR-110: MCP search geocode-enrichment ──
+
+── PR-103: backend dental geocoding worker ──
+
+── PR-106: dental admin rate-limit raise ──
+
+── PR-109: finn-tannlege SSR + store extensions ──
+[db-factory] vertical=dental opened at :memory:
+[init-dental] added column worker_id
+[init-dental] added column claimed_at
+[dental] schema initialized
+
+── PR-125: bondensmarked slug guard + time correction ──
+[bondensmarked-source] detail(agder): produsenter count not found
+[bondensmarked-source] detail(agder): lokallag UUID not found, falling back to preview markedsplasser
+── orch-PR Phase 2: platform-verifier (run-platform-verifier) ──
+
+── orch-pr-20260614-2: pickPendingVerifyBatch + verifier-sweep ──
+── orch-pr-20260614-3: outreach suppression gate ──
+
+── orch-pr-20260614-5: Phase 0 product catalog ──
+
+── orch-pr-20260614-6: Phase 1 cart MVP ──
+
+── PR-112: søket-logo, hvordan-det-fungerer, utvidet personvern, spesialitet-sider ──
+
+── PR-113: dental agent-card, A2A JSON-RPC, openapi ──
+
+── PR-114: dental MCP server ──
+  [pr114-04] dental DB ikke tilgjengelig — skipping (expected in some CI configs)
+  [pr116-03] dental DB ikke tilgjengelig — skipping
+  [pr116-04] dental DB ikke tilgjengelig — skipping
+  [pr116-05] dental DB ikke tilgjengelig — skipping
+
+── PR-127: normalizeOpeningHours ──
+
+── cross-source-validator: PR-130 address-core agreement ──
+
+── orch-PR-20260614-7: isAcceptableHomepageEmail ──
+
+── orch-pr-9: POST /admin/prune-dead-urls ──
+[verifier-sweep] sweep-2026-06-14T1816: chunk done — processed=3 verified=2 review=1 data_insuff=0 errors=0
+[verifier-sweep] sweep-2026-06-14T1816: chunk done — processed=6 verified=4 review=2 data_insuff=0 errors=0
+[verifier-sweep] sweep-2026-06-14T1816: empty chunk — backlog exhausted after 6 agents
+[verifier-sweep] sweep-2026-06-14T1816: COMPLETE — processed=6 verified=4 still_pending=2 took=0s
+[verifier-sweep] sweep-2026-06-14T1816: run-ledger record failed: no such table: runs
+[traces-client] POST /for/query returned 405; falling back to GET with country/competentAuthority query params.
+[traces-client] POST /for/query returned 404; falling back to GET with country/competentAuthority query params.
+[traces-client] POST /for/query returned 501; falling back to GET with country/competentAuthority query params.
+
+── PR-94: normaliser-hardening + venue-agent auto-create ──
+[verifier-sweep] sweep-2026-06-14T1816: empty chunk — backlog exhausted after 0 agents
+[verifier-sweep] sweep-2026-06-14T1816: unexpected outer error: The database connection is not open
+[verifier-sweep] sweep-2026-06-14T1816: chunk error (consecutive=1): simulated I/O failure
+[verifier-sweep] sweep-2026-06-14T1816: chunk error (consecutive=2): simulated I/O failure
+[verifier-sweep] sweep-2026-06-14T1816: chunk error (consecutive=3): simulated I/O failure
+[verifier-sweep] sweep-2026-06-14T1816: 3 consecutive errors — aborting sweep
+[db-factory] vertical=dental opened at :memory:
+[init-dental] added column worker_id
+[init-dental] added column claimed_at
+[dental] schema initialized
+
+── PR-76: lokal_geocode MCP tool ──
+[db-factory] vertical=dental opened at :memory:
+[init-dental] added column worker_id
+[init-dental] added column claimed_at
+[dental] schema initialized
+[prune-dead-urls] scanned=6 pruned=5 (placeholder=3 aggregator=2)
+[prune-dead-urls] scanned=1 pruned=0 (placeholder=0 aggregator=0)
+[prune-dead-urls] scanned=2 pruned=1 (placeholder=1 aggregator=0)
+
+2475 passed, 0 failed
+
+✓ all tests passed

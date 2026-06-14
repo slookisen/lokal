@@ -61,6 +61,7 @@
 
 import { Router, Request, Response } from "express";
 import { getDb } from "../database/init";
+import { isKnownDirectoryHost } from "../services/cross-source-validator";
 
 const router = Router();
 
@@ -360,4 +361,182 @@ router.put("/", (req: Request, res: Response) => {
   });
 });
 
+
 export default router;
+
+// ─── POST /admin/prune-dead-urls (orch-pr-9, 2026-06-14) ─────────────────────
+//
+// Scans agent_knowledge.website for junk/dead values and optionally nulls them.
+// Two categories are pruned:
+//   1. placeholder/non-URL — does not parse as a valid URL with a host, or
+//      matches placeholder patterns (case-insensitive).
+//   2. aggregator/directory host — the registrable host is in
+//      KNOWN_DIRECTORY_HOSTS via isKnownDirectoryHost().
+//
+// Everything else is left alone (a real-looking domain is kept even if its
+// last probe failed — "blank is worse than stale" per enrichment policy).
+//
+// Params:
+//   ?apply=1  or  body { apply: true }  — write to DB; default = dry-run.
+//   ?limit=N                            — cap rows scanned.
+//
+// Returns:
+//   { success, dry_run, scanned, would_prune: { placeholder, aggregator, total },
+//     sample: [{agent_id, website, reason}], pruned: <n when apply> }
+
+// Placeholder strings that are never real URLs.
+const PLACEHOLDER_PATTERNS: ReadonlyArray<RegExp> = [
+  /^not available$/i,
+  /^n\/a$/i,
+  /^none$/i,
+  /^tbd$/i,
+  /^ukjent$/i,
+  /^ingen$/i,
+  /^-+$/,
+];
+
+// Return the registrable domain (last two labels, with www stripped) for a
+// parsed URL host, or null if it cannot be determined.
+function registrableHostForUrl(raw: string): string | null {
+  let parsed: URL;
+  try {
+    // Ensure scheme is present so URL() can parse it.
+    const withScheme = /^https?:\/\//i.test(raw) ? raw : `http://${raw}`;
+    parsed = new URL(withScheme);
+  } catch {
+    return null;
+  }
+  const host = parsed.hostname.toLowerCase().replace(/^www\./, "");
+  if (!host) return null;
+  const labels = host.split(".").filter(Boolean);
+  if (labels.length < 2) return null;
+  // Simple eTLD+1: last two labels (sufficient for .no, .com, .net, etc.)
+  return labels.slice(-2).join(".");
+}
+
+type PruneReason = "placeholder" | "aggregator";
+
+interface PruneSample {
+  agent_id: string;
+  website: string;
+  reason: PruneReason;
+}
+
+function classifyWebsite(website: string): PruneReason | null {
+  const trimmed = website.trim();
+  if (!trimmed) return "placeholder"; // empty → placeholder
+
+  // Check placeholder patterns
+  for (const pat of PLACEHOLDER_PATTERNS) {
+    if (pat.test(trimmed)) return "placeholder";
+  }
+
+  // Try to parse as a URL and get registrable host
+  const host = registrableHostForUrl(trimmed);
+  if (!host) {
+    // Cannot be parsed as a URL with a host → treat as placeholder
+    return "placeholder";
+  }
+
+  // Check directory/aggregator host
+  if (isKnownDirectoryHost(host)) return "aggregator";
+
+  // Real-looking domain — keep it
+  return null;
+}
+
+export const pruneUrlsRouter = Router();
+
+pruneUrlsRouter.post("/prune-dead-urls", (req: Request, res: Response) => {
+  if (!requireAdmin(req, res)) return;
+
+  const db = getDb();
+
+  // Determine apply mode from query string or body
+  const applyFromQuery = req.query["apply"] === "1" || req.query["apply"] === "true";
+  const bodyApply = (req.body as Record<string, unknown> | undefined)?.apply;
+  const applyFromBody =
+    typeof bodyApply === "boolean"
+      ? bodyApply
+      : bodyApply === "1" || bodyApply === "true";
+  const apply = applyFromQuery || applyFromBody;
+  const dryRun = !apply;
+
+  // Optional row limit
+  const limitParam = req.query["limit"];
+  const limit =
+    limitParam !== undefined && !isNaN(Number(limitParam)) && Number(limitParam) > 0
+      ? Number(limitParam)
+      : null;
+
+  // Fetch all non-empty websites
+  const query = limit !== null
+    ? "SELECT ak.agent_id, ak.website FROM agent_knowledge ak WHERE ak.website IS NOT NULL AND trim(ak.website) != '' LIMIT ?"
+    : "SELECT ak.agent_id, ak.website FROM agent_knowledge ak WHERE ak.website IS NOT NULL AND trim(ak.website) != ''";
+
+  const rows = (limit !== null
+    ? db.prepare(query).all(limit)
+    : db.prepare(query).all()
+  ) as { agent_id: string; website: string }[];
+
+  const scanned = rows.length;
+  let placeholder = 0;
+  let aggregator = 0;
+  const sample: PruneSample[] = [];
+  const toPrune: { agent_id: string; reason: PruneReason }[] = [];
+
+  for (const row of rows) {
+    const reason = classifyWebsite(row.website);
+    if (reason === null) continue; // keep
+
+    if (reason === "placeholder") placeholder++;
+    else aggregator++;
+
+    toPrune.push({ agent_id: row.agent_id, reason });
+    if (sample.length < 20) {
+      sample.push({ agent_id: row.agent_id, website: row.website, reason });
+    }
+  }
+
+  const total = placeholder + aggregator;
+
+  if (dryRun) {
+    res.json({
+      success: true,
+      dry_run: true,
+      scanned,
+      would_prune: { placeholder, aggregator, total },
+      sample,
+    });
+    return;
+  }
+
+  // Apply: null the website for each matched agent (parameterized, idempotent).
+  // The WHERE website IS NOT NULL guard makes re-runs report pruned=0.
+  let pruned = 0;
+  if (toPrune.length > 0) {
+    const updateStmt = db.prepare(
+      "UPDATE agent_knowledge SET website = NULL, updated_at = datetime('now') WHERE agent_id = ? AND website IS NOT NULL"
+    );
+    const tx = db.transaction(() => {
+      for (const item of toPrune) {
+        const info = updateStmt.run(item.agent_id);
+        pruned += info.changes;
+      }
+    });
+    tx();
+  }
+
+  console.log(
+    `[prune-dead-urls] scanned=${scanned} pruned=${pruned} (placeholder=${placeholder} aggregator=${aggregator})`
+  );
+
+  res.json({
+    success: true,
+    dry_run: false,
+    scanned,
+    would_prune: { placeholder, aggregator, total },
+    sample,
+    pruned,
+  });
+});

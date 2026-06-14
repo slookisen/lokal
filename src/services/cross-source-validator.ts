@@ -450,6 +450,12 @@ export const KNOWN_DIRECTORY_HOSTS: ReadonlySet<string> = new Set([
   "visitbo.no",
   "visitfredrikskadhvaler.com",
   "visitvestfold.com",
+  // Extended orch-pr-9 (2026-06-14): global consumer-review / listing
+  // aggregators that surface in agent_knowledge.website from enrichment
+  // runs that scraped a directory page rather than the producer's real site.
+  // These are never a producer's own website.
+  "tripadvisor.com",
+  "yelp.com",
 ]);
 
 export function isKnownDirectoryHost(host: string): boolean {
