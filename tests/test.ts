@@ -1563,7 +1563,9 @@ console.log("── agent-stats: per-agent stats endpoint logic ──");
   assertEq(deriveVerificationStatus(gateKonkurs.passes, gateKonkurs.flags), "review_required",
     "wo8: konkurs → review_required");
 
-  // Test 5: email-domain mismatch flagged
+  // Test 5 (updated orch-pr-20260614-4): free-mail email no longer fails the gate.
+  // Pre-fix: gmail.com on gard.no → email_domain_mismatch → gate fails → pending forever.
+  // Post-fix: gmail.com is a FREE_MAIL_DOMAINS entry → exempt → no flag → gate passes.
   const gateEmail = computeKvalitetsGate({
     http_status: 200,
     email: "post@gmail.com",
@@ -1572,8 +1574,57 @@ console.log("── agent-stats: per-agent stats endpoint logic ──");
     products: [{ name: "melk" }, { name: "ost" }, { name: "kjøtt" }],
     brreg: null,
   });
-  assertTrue(gateEmail.flags.includes("email_domain_mismatch"), "wo8: gmail-on-gard.no email flagged");
-  assertTrue(!gateEmail.passes, "wo8: email_domain_mismatch fails gate");
+  assertTrue(!gateEmail.flags.includes("email_domain_mismatch"), "orch-pr-20260614-4: gmail on gard.no is free-mail → no email_domain_mismatch flag");
+  assertTrue(gateEmail.passes, "orch-pr-20260614-4: free-mail email passes gate (was failing before fix)");
+
+  // Test 5b: Norwegian ISP email (online.no) also exempt
+  const gateEmailNorwegianISP = computeKvalitetsGate({
+    http_status: 200,
+    email: "bonde@online.no",
+    website: "https://gard.no",
+    about: "Vi driver et lite småbruk på Vestlandet. Vi selger melk, ost og kjøtt direkte fra gården.",
+    products: [{ name: "melk" }, { name: "ost" }, { name: "kjøtt" }],
+    brreg: null,
+  });
+  assertTrue(!gateEmailNorwegianISP.flags.includes("email_domain_mismatch"), "orch-pr-20260614-4: online.no (ISP) on gard.no is free-mail → no flag");
+  assertTrue(gateEmailNorwegianISP.passes, "orch-pr-20260614-4: online.no ISP email passes gate");
+
+  // Test 5c: genuine mismatch (non-free-mail third-party domain) still fails
+  const gateEmailGenuineMismatch = computeKvalitetsGate({
+    http_status: 200,
+    email: "post@other.no",
+    website: "https://gard.no",
+    about: "Vi driver et lite småbruk på Vestlandet. Vi selger melk, ost og kjøtt direkte fra gården.",
+    products: [{ name: "melk" }, { name: "ost" }, { name: "kjøtt" }],
+    brreg: null,
+  });
+  assertTrue(gateEmailGenuineMismatch.flags.includes("email_domain_mismatch"), "orch-pr-20260614-4: other.no on gard.no is genuine mismatch → flag present");
+  assertTrue(!gateEmailGenuineMismatch.passes, "orch-pr-20260614-4: genuine non-free-mail mismatch still fails gate");
+
+  // Test 5d: matching email still passes (unchanged)
+  const gateEmailMatch = computeKvalitetsGate({
+    http_status: 200,
+    email: "post@gard.no",
+    website: "https://gard.no",
+    about: "Vi driver et lite småbruk på Vestlandet. Vi selger melk, ost og kjøtt direkte fra gården.",
+    products: [{ name: "melk" }, { name: "ost" }, { name: "kjøtt" }],
+    brreg: null,
+  });
+  assertTrue(!gateEmailMatch.flags.includes("email_domain_mismatch"), "orch-pr-20260614-4: matching email (post@gard.no on gard.no) → no flag");
+  assertTrue(gateEmailMatch.passes, "orch-pr-20260614-4: matching email still passes gate");
+
+  // Test 5e: no-email case unchanged — email_own_domain=false, gate fails
+  const gateNoEmail = computeKvalitetsGate({
+    http_status: 200,
+    email: null,
+    website: "https://gard.no",
+    about: "Vi driver et lite småbruk på Vestlandet. Vi selger melk, ost og kjøtt direkte fra gården.",
+    products: [{ name: "melk" }, { name: "ost" }, { name: "kjøtt" }],
+    brreg: null,
+  });
+  assertTrue(!gateNoEmail.reasons.email_own_domain, "orch-pr-20260614-4: no email → email_own_domain=false (unchanged)");
+  assertTrue(!gateNoEmail.passes, "orch-pr-20260614-4: no email still fails gate (pool requires email)");
+  assertTrue(!gateNoEmail.flags.includes("email_domain_mismatch"), "orch-pr-20260614-4: no email → no email_domain_mismatch flag (no email to mismatch)");
 
   // Test 6: enrichment-status logic
   assertEq(computeEnrichmentStatus({ about: "x".repeat(200), products: [1,2,3,4], address: "Vei 1" }),
@@ -14964,6 +15015,10 @@ const _orchPr20260614_2Promise = (async () => {
   assertEq(job2.verified, 4, `sweep-happy: verified=4 (2 chunks × 2 verified) got ${job2.verified}`);
   assertEq(job2.review_required, 2, `sweep-happy: review_required=2 (2 chunks × 1) got ${job2.review_required}`);
   assertEq(job2.data_insufficient, 0, "sweep-happy: data_insufficient=0");
+  // orch-pr-20260614-4: new flag counters present and aggregated correctly.
+  // Fake results have flags=[] / flags=["http_404"] — neither triggers the new counters.
+  assertEq(job2.email_domain_mismatch, 0, "sweep-happy: email_domain_mismatch=0 (no mismatch flags in fake results)");
+  assertEq(job2.thin_content, 0, "sweep-happy: thin_content=0 (no thin_content flags in fake results)");
   assertEq(callCount, 3, `sweep-happy: runBatch called 3 times (2 chunks + 1 empty) got ${callCount}`);
   sweepDb2.close();
 

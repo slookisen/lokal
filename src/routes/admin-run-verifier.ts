@@ -105,6 +105,10 @@ router.post("/", async (req: Request, res: Response) => {
     // orch-PR-20260512-33: domain-coherence overrides (Eidsmo fix)
     const domainIncoherent = results.filter((r) => r.domain_incoherent).length;
     const pooledNew = results.filter((r) => r.outreach_eligible_at !== null).length;
+    // orch-pr-20260614-4: flag-level observability so operators can measure
+    // the free-mail exemption effect and track thin-content prevalence.
+    const email_domain_mismatch = results.filter((r) => r.flags.includes("email_domain_mismatch")).length;
+    const thin_content = results.filter((r) => r.flags.includes("thin_content")).length;
 
     // Build envelope and record directly via service (no HTTP roundtrip)
     const envelope: any = buildRunEnvelope({
@@ -134,6 +138,8 @@ router.post("/", async (req: Request, res: Response) => {
       http_unreachable: httpUnreachable,
       brreg_inactive: brregInactive,
       domain_incoherent: domainIncoherent,
+      email_domain_mismatch,
+      thin_content,
       pool_added: pooledNew,
       envelope_recorded: envelopeRecorded,
       hour_utc: hourUTC,

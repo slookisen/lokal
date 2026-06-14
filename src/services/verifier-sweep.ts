@@ -57,6 +57,11 @@ export interface SweepJobState {
   errors: number;
   lastError: string | null;
   lastChunkAt: string | null;
+  // orch-pr-20260614-4: flag-level counters for observability.
+  // Lets operators measure the free-mail exemption effect and thin-content
+  // prevalence across the bulk sweep without querying the DB directly.
+  email_domain_mismatch: number;
+  thin_content: number;
 }
 
 // ─── Singleton state ─────────────────────────────────────────────────────────
@@ -78,6 +83,8 @@ let _sweepJob: SweepJobState = {
   errors: 0,
   lastError: null,
   lastChunkAt: null,
+  email_domain_mismatch: 0,
+  thin_content: 0,
 };
 
 export function getSweepJob(): Readonly<SweepJobState> {
@@ -173,6 +180,8 @@ export function startSweep(opts: StartSweepOpts = {}): StartSweepResult {
     errors: 0,
     lastError: null,
     lastChunkAt: null,
+    email_domain_mismatch: 0,
+    thin_content: 0,
   };
 
   // ── Background loop (fire-and-forget) ──────────────────────────────────────
@@ -236,6 +245,9 @@ export function startSweep(opts: StartSweepOpts = {}): StartSweepResult {
         _sweepJob.verified += results.filter((r) => r.new_verification_status === "verified").length;
         _sweepJob.review_required += results.filter((r) => r.new_verification_status === "review_required").length;
         _sweepJob.data_insufficient += results.filter((r) => r.new_verification_status === "data_insufficient").length;
+        // orch-pr-20260614-4: flag-level counters (single source of truth in VerifierResult.flags).
+        _sweepJob.email_domain_mismatch += results.filter((r) => r.flags.includes("email_domain_mismatch")).length;
+        _sweepJob.thin_content += results.filter((r) => r.flags.includes("thin_content")).length;
         _sweepJob.lastChunkAt = new Date().toISOString();
 
         console.log(

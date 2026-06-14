@@ -22,6 +22,7 @@ import {
   crossSourceAgreement,
   aggregateVerdict,
   domainCoherenceCheck,
+  FREE_MAIL_DOMAINS,
   type FieldName,
   type ProvenanceRecord,
   type CrossSourceResult,
@@ -208,10 +209,29 @@ export function computeKvalitetsGate(input: {
   else if (input.http_status >= 400) flags.push(`http_${input.http_status}`);
 
   // email_own_domain
+  //
+  // Free-mail/ISP exemption (orch-pr-20260614-4):
+  // Small Norwegian producers commonly use personal email addresses (gmail.com,
+  // online.no, etc.) that share no domain with their website. This is a normal
+  // operating pattern — not a data-quality failure. The domain-coherence layer
+  // already treats free-mail hosts as neutral (FREE_MAIL_DOMAINS in
+  // cross-source-validator.ts); we mirror that logic here so the kvalitets-gate
+  // doesn't block producers solely because they use a personal mailbox.
+  //
+  // Behaviour:
+  //   - emailMatchesSite: the existing host-match test (unchanged).
+  //   - isFreeMail: eDom is a known free-mail/ISP provider.
+  //   - email_own_domain = emailMatchesSite OR isFreeMail.
+  //   - email_domain_mismatch flag only when a real (non-free-mail) address
+  //     genuinely disagrees with the website host.
+  //   - No-email case unchanged: email=null → email_own_domain=false (gate
+  //     still requires an email; this fix only exempts free-mail addresses).
   const websiteHost = hostnameFromUrl(input.website);
   const eDom = emailDomain(input.email);
-  const email_own_domain = !!(websiteHost && eDom && (eDom === websiteHost || eDom.endsWith("." + websiteHost) || websiteHost.endsWith("." + eDom)));
-  if (!email_own_domain && input.email) flags.push("email_domain_mismatch");
+  const emailMatchesSite = !!(websiteHost && eDom && (eDom === websiteHost || eDom.endsWith("." + websiteHost) || websiteHost.endsWith("." + eDom)));
+  const isFreeMail = !!(eDom && FREE_MAIL_DOMAINS.includes(eDom));
+  const email_own_domain = emailMatchesSite || isFreeMail;
+  if (input.email && !emailMatchesSite && !isFreeMail) flags.push("email_domain_mismatch");
 
   // no_wrong_fit (NACE-blacklist)
   let no_wrong_fit = true;

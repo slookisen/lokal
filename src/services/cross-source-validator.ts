@@ -352,7 +352,7 @@ export type DomainCoherenceResult = {
   knowledgeEmailHost?: string;
 };
 
-const FREE_MAIL_DOMAINS: readonly string[] = [
+export const FREE_MAIL_DOMAINS: readonly string[] = [
   "gmail.com",
   "outlook.com",
   "hotmail.com",
