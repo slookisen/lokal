@@ -2003,6 +2003,7 @@ import {
   aggregateVerdict,
   domainCoherenceCheck,
   isKnownDirectoryHost,
+  isAcceptableHomepageEmail,
   type ProvenanceRecord,
   type CrossSourceResult,
 } from "../src/services/cross-source-validator";
@@ -17149,4 +17150,53 @@ console.log("\n── cross-source-validator: PR-130 address-core agreement ─�
     ]}, "address");
     assertEq(r.verdict, "review_required", "pr130-06: same street, no postcode, differing raw → gated (anti-vacuous-merge)");
   }
+}
+
+// ── orch-PR-20260614-7: isAcceptableHomepageEmail — homepage-email acceptance gate ──
+console.log("\n── orch-PR-20260614-7: isAcceptableHomepageEmail ──");
+{
+  // Test 1: free-mail (gmail.com) on own site gard.no → ACCEPTED
+  // Was previously rejected because gmail.com !== gard.no; this PR allows it.
+  assertTrue(
+    isAcceptableHomepageEmail("gardsbruket@gmail.com", "https://gard.no"),
+    "orch-pr-20260614-7-t1: free-mail gmail.com on own site gard.no → ACCEPTED"
+  );
+
+  // Test 2: aggregator/directory email (bondensmarked.no) on own site gard.no → REJECTED
+  // A page at gard.no may embed a bondensmarked.no link with their address; must not write it.
+  assertTrue(
+    !isAcceptableHomepageEmail("post@bondensmarked.no", "https://gard.no"),
+    "orch-pr-20260614-7-t2: aggregator bondensmarked.no on gard.no → REJECTED"
+  );
+
+  // Test 3: different non-free company domain (importer.no) on gard.no → REJECTED
+  // Distributor/Eidsmo-contamination case: a third-party company email on the producer's page.
+  assertTrue(
+    !isAcceptableHomepageEmail("post@importer.no", "https://gard.no"),
+    "orch-pr-20260614-7-t3: different company importer.no on gard.no → REJECTED"
+  );
+
+  // Test 4: own domain (post@gard.no) on gard.no → ACCEPTED (unchanged behaviour)
+  assertTrue(
+    isAcceptableHomepageEmail("post@gard.no", "https://gard.no"),
+    "orch-pr-20260614-7-t4: own domain post@gard.no on gard.no → ACCEPTED"
+  );
+
+  // Test 5: Norwegian ISP freemail (online.no) on own site → ACCEPTED
+  assertTrue(
+    isAcceptableHomepageEmail("bonde@online.no", "https://gard.no"),
+    "orch-pr-20260614-7-t5: ISP freemail online.no on own site → ACCEPTED"
+  );
+
+  // Test 6: hanen.no directory email on any site → REJECTED (known directory)
+  assertTrue(
+    !isAcceptableHomepageEmail("info@hanen.no", "https://gard.no"),
+    "orch-pr-20260614-7-t6: hanen.no directory email → REJECTED"
+  );
+
+  // Test 7: outlook.com freemail on own site → ACCEPTED
+  assertTrue(
+    isAcceptableHomepageEmail("ola@outlook.com", "https://mjolkebruk.no"),
+    "orch-pr-20260614-7-t7: outlook.com freemail on own site → ACCEPTED"
+  );
 }
