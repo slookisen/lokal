@@ -136,6 +136,25 @@ console.log("\n── orch-pr-10: search-enrich pure decision logic ──");
   console.log(`  search-enrich: ${r.passed} passed, ${r.failed} failed`);
 }
 
+// ── orch-pr-12: search-enrich background sweep + findings + apply-findings ──
+// Async (fire-and-forget sweep loop). Kicked off here; awaited in the REPORT
+// block so its pass/fail counts fold into the `npm test` summary.
+console.log("── orch-pr-12: search-enrich sweep + findings + apply-findings ──");
+const _orchPr12SweepPromise: Promise<void> = (async () => {
+  try {
+    const { runSearchEnrichSweepTests } = require("../src/services/search-enrich-sweep.test") as
+      typeof import("../src/services/search-enrich-sweep.test");
+    const sr = await runSearchEnrichSweepTests({ log: false });
+    passed += sr.passed;
+    failed += sr.failed;
+    for (const f of sr.failures) failures.push("search-enrich-sweep: " + f);
+    console.log(`  search-enrich-sweep: ${sr.passed} passed, ${sr.failed} failed`);
+  } catch (err) {
+    failed++;
+    failures.push("search-enrich-sweep: unexpected error: " + String(err));
+  }
+})();
+
 // ── trust-score community signal tests ──
 console.log("── trust-score community signal tests ──");
 
@@ -16427,6 +16446,7 @@ const _orchPr20260614_6Promise: Promise<void> = new Promise<void>(r => { _orchPr
   try { await _orchPr20260614_5Promise; } catch { /* errors already pushed to failures */ }
   try { await _orchPr20260614_6Promise; } catch { /* errors already pushed to failures */ }
   try { await _orchPr9PruneDeadUrlsPromise; } catch { /* errors already pushed to failures */ }
+  try { await _orchPr12SweepPromise; } catch { /* errors already pushed to failures */ }
   // PR-109 tests are synchronous (IIFE) — no promise needed
   // Drop pre-existing intg failures (unmasked by awaiting) — they predate M2
   // and live behind a separate fix-it task. Counting them here would surface

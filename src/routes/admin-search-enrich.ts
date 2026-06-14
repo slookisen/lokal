@@ -25,15 +25,21 @@
 
 import { Router, Request, Response } from "express";
 import { getDb } from "../database/init";
-import { mergeFieldProvenance } from "./admin-knowledge";
+import {
+  applyEnrichWrite,
+  startSearchEnrichSweep,
+  getSearchEnrichSweepJob,
+  ensureFindingsTable,
+  applyFindings,
+} from "../services/search-enrich-sweep";
 import {
   braveSearch,
-  rankCandidates,
-  confirmProducerPage,
-  pickProducerEmail,
   nameStems,
-  type PageEvidence,
+  buildPageEvidence,
+  registrableHostFromUrl,
+  enrichOneAgent,
   type StoredProducer,
+  type EnrichDeps,
 } from "../services/search-enrich";
 
 const router = Router();
@@ -60,177 +66,13 @@ function requireAdmin(req: Request, res: Response): boolean {
 // ─── Tunables ─────────────────────────────────────────────────────────────────
 const DEFAULT_LIMIT = 25;
 const HARD_CAP = 50;
-const FETCH_TIMEOUT_MS = 8_000;
 const PACE_MS = 1_100; // ~1.1s between agents → respect Brave's ~1 req/sec free tier
-const UA = "Lokal-RFB-Scraper/1.0 (+https://rettfrabonden.com)";
 
 const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 
-// ─── Email / phone / title extraction (mirrors marketplace.ts processAgent) ───
-
-/** Collect ALL candidate emails from HTML (mailto: links first, then bare). */
-function extractEmails(html: string): string[] {
-  const out: string[] = [];
-  const seen = new Set<string>();
-  const push = (e: string) => {
-    const lc = e.toLowerCase();
-    if (!seen.has(lc)) {
-      seen.add(lc);
-      out.push(lc);
-    }
-  };
-  const mailtoRe = /mailto:([a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,})/gi;
-  let m: RegExpExecArray | null;
-  while ((m = mailtoRe.exec(html)) !== null) push(m[1]!);
-  const bareRe = /\b([a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,})\b/g;
-  while ((m = bareRe.exec(html)) !== null) push(m[1]!);
-  return out;
-}
-
-/** Normalise a Norwegian phone to 8 digits (mirrors marketplace.normalisePhone). */
-function normalisePhone(raw: string): string {
-  return raw
-    .replace(/^\+47/, "")
-    .replace(/^0047/, "")
-    .replace(/^\+/, "")
-    .replace(/[\s\-().]/g, "")
-    .replace(/\D/g, "");
-}
-
-/** Collect ALL candidate phone numbers from HTML (mirrors marketplace.extractPhone). */
-function extractPhones(html: string): string[] {
-  const text = html.replace(/<[^>]+>/g, " ").replace(/&nbsp;/g, " ");
-  const re = /(?:\+47|0047|47[\s\-])?(\d{2}[\s\-]?\d{2}[\s\-]?\d{2}[\s\-]?\d{2})\b/g;
-  const out: string[] = [];
-  const seen = new Set<string>();
-  let m: RegExpExecArray | null;
-  while ((m = re.exec(text)) !== null) {
-    const digits = normalisePhone(m[0]);
-    if (digits.length === 8 && !/^(\d)\1{7}$/.test(digits) && !seen.has(digits)) {
-      seen.add(digits);
-      out.push(digits);
-    }
-  }
-  return out;
-}
-
-/** Extract a page title from <title> or og:title. */
-function extractTitle(html: string): string {
-  const og = html.match(
-    /<meta[^>]+property=["']og:title["'][^>]+content=["']([^"']+)["']/i,
-  );
-  if (og && og[1]) return og[1].trim();
-  const t = html.match(/<title[^>]*>([\s\S]*?)<\/title>/i);
-  if (t && t[1]) return t[1].replace(/\s+/g, " ").trim();
-  return "";
-}
-
-/** SSRF guard: allow only http(s) to public hosts; block localhost, link-local,
- * private/CGNAT ranges and cloud-metadata (169.254.0.0/16). Domain names are allowed
- * (DNS-rebinding is out of scope for this admin-gated, dry-run-by-default endpoint). */
-function isSafeFetchUrl(raw: string): boolean {
-  let u: URL;
-  try {
-    u = new URL(/^https?:\/\//i.test(raw) ? raw : `https://${raw}`);
-  } catch {
-    return false;
-  }
-  if (u.protocol !== "http:" && u.protocol !== "https:") return false;
-  const host = u.hostname.toLowerCase().replace(/^\[|\]$/g, "");
-  if (
-    host === "localhost" ||
-    host.endsWith(".localhost") ||
-    host.endsWith(".internal") ||
-    host.endsWith(".local")
-  )
-    return false;
-  if (host.includes(":")) {
-    // IPv6 literal: block loopback (::1), unique-local (fc00::/7), link-local (fe80::/10)
-    if (host === "::1" || /^f[cd]/.test(host) || /^fe[89ab]/.test(host)) return false;
-    return true;
-  }
-  const m = host.match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/);
-  if (m) {
-    const o = m.slice(1, 5).map(Number);
-    if (o.some((x) => x > 255)) return false;
-    const [a, b] = o;
-    if (a === 0 || a === 10 || a === 127) return false;
-    if (a === 169 && b === 254) return false; // link-local incl. cloud metadata
-    if (a === 172 && b >= 16 && b <= 31) return false;
-    if (a === 192 && b === 168) return false;
-    if (a === 100 && b >= 64 && b <= 127) return false; // CGNAT
-  }
-  return true;
-}
-
-async function fetchHtml(url: string): Promise<string | null> {
-  if (!isSafeFetchUrl(url)) return null;
-  const fetchUrl = /^https?:\/\//i.test(url) ? url : `https://${url}`;
-  try {
-    const resp = await fetch(fetchUrl, {
-      redirect: "follow",
-      headers: { "User-Agent": UA, Accept: "text/html,application/xhtml+xml" },
-      signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
-    });
-    if (!resp.ok) return null;
-    return await resp.text();
-  } catch {
-    return null;
-  }
-}
-
-/**
- * Crawl the chosen candidate URL plus same-host /kontakt and /om-oss, and merge
- * all extracted emails/phones into one PageEvidence (title from the primary page).
- */
-async function buildPageEvidence(primaryUrl: string): Promise<PageEvidence | null> {
-  const primaryHtml = await fetchHtml(primaryUrl);
-  if (primaryHtml === null) return null;
-
-  const emails = new Set<string>(extractEmails(primaryHtml));
-  const phones = new Set<string>(extractPhones(primaryHtml));
-  let combinedHtml = primaryHtml;
-  const title = extractTitle(primaryHtml);
-
-  // Try same-host /kontakt and /om-oss for additional contact details.
-  try {
-    const u = new URL(/^https?:\/\//i.test(primaryUrl) ? primaryUrl : `https://${primaryUrl}`);
-    const base = `${u.protocol}//${u.host}`;
-    for (const path of ["/kontakt", "/om-oss"]) {
-      const subHtml = await fetchHtml(`${base}${path}`);
-      if (subHtml) {
-        for (const e of extractEmails(subHtml)) emails.add(e);
-        for (const p of extractPhones(subHtml)) phones.add(p);
-        combinedHtml += "\n" + subHtml;
-      }
-    }
-  } catch {
-    /* malformed URL — primary page evidence still stands */
-  }
-
-  return {
-    url: primaryUrl,
-    title,
-    html: combinedHtml,
-    emails: Array.from(emails),
-    phones: Array.from(phones),
-  };
-}
-
-// ─── helpers ──────────────────────────────────────────────────────────────────
-
-function registrableHostFromUrl(raw: string): string | null {
-  try {
-    const withScheme = /^https?:\/\//i.test(raw) ? raw : `https://${raw}`;
-    const host = new URL(withScheme).hostname.toLowerCase().replace(/^www\./, "");
-    const labels = host.split(".").filter(Boolean);
-    if (labels.length < 2) return null;
-    return labels.slice(-2).join(".");
-  } catch {
-    return null;
-  }
-}
-
+// Crawl helpers (fetchHtml / extract* / isSafeFetchUrl / buildPageEvidence /
+// registrableHostFromUrl) moved to services/search-enrich.ts (orchestrator-pr-12)
+// so the route + sweep share an identical default crawl path. Imported above.
 type Tier = "write" | "queue" | "none";
 
 interface ResultRow {
@@ -362,12 +204,20 @@ router.post("/", async (req: Request, res: Response) => {
     ? db.prepare("UPDATE agent_knowledge SET last_search_at = ?, updated_at = ? WHERE agent_id = ?")
     : null;
 
+  // Real deps for enrichOneAgent: Brave search (env key) + same-host crawler.
+  const deps: EnrichDeps = {
+    search: (q) => braveSearch(q, braveKey, 5),
+    crawl: (url) => buildPageEvidence(url),
+  };
+
   for (let i = 0; i < targets.length; i++) {
     const t = targets[i]!;
+    const geo = (t.city ?? "").trim();
+    const query = `"${t.name}" ${geo}`.trim();
     let row: ResultRow = {
       agent_id: t.agent_id,
       name: t.name,
-      query: "",
+      query,
       chosen_url: null,
       confirm: { confirmed: false, strength: "none", signals: [] },
       candidate_email: null,
@@ -379,16 +229,11 @@ router.post("/", async (req: Request, res: Response) => {
       // pace between agents (skip the wait before the first one)
       if (i > 0) await sleep(PACE_MS);
 
-      const geo = (t.city ?? "").trim();
-      const query = `"${t.name}" ${geo}`.trim();
-      row.query = query;
-
-      const results = await braveSearch(query, braveKey, 5);
-      const urls = rankCandidates(results, t.name);
-
       const siteRoot = t.website ? registrableHostFromUrl(t.website) : null;
-      const stored: StoredProducer = {
+      const stored: StoredProducer & { agent_id: string; name: string; query: string } = {
+        agent_id: t.agent_id,
         name: t.name,
+        query,
         phone: t.phone,
         postcode: t.postcode,
         street: t.address,
@@ -396,60 +241,16 @@ router.post("/", async (req: Request, res: Response) => {
         siteRoot,
       };
 
-      let bestConfirm = row.confirm;
-      let bestUrl: string | null = null;
-      let bestEvidence: PageEvidence | null = null;
-
-      // Crawl the top ≤2 candidates; keep the strongest confirmation.
-      for (const url of urls) {
-        const evidence = await buildPageEvidence(url);
-        if (!evidence) continue;
-        const conf = confirmProducerPage(stored, evidence);
-        const rank = (s: string) => (s === "strong" ? 2 : s === "medium" ? 1 : 0);
-        if (bestUrl === null || rank(conf.strength) > rank(bestConfirm.strength)) {
-          bestConfirm = conf;
-          bestUrl = url;
-          bestEvidence = evidence;
-          if (conf.strength === "strong") break; // can't do better
-        }
-      }
-
-      row.chosen_url = bestUrl;
-      row.confirm = bestConfirm;
-
-      let pickedEmail: string | null = null;
-      let emailReason = bestUrl ? "no_acceptable_email" : "no_candidate_url";
-
-      if (bestConfirm.confirmed && bestEvidence) {
-        const pick = pickProducerEmail(bestEvidence.emails, t.name, siteRoot);
-        pickedEmail = pick.email;
-        emailReason = pick.reason;
-      } else if (bestUrl) {
-        emailReason = "page_not_confirmed";
-      }
-      row.candidate_email = pickedEmail;
-      row.email_reason = emailReason;
-
-      // ── tier decision ──
-      let tier: Tier = "none";
-      if (bestConfirm.strength === "strong" && pickedEmail) {
-        tier = "write";
-      } else if (
-        (bestConfirm.confirmed && pickedEmail) || // confirmed (medium) + email
-        (bestConfirm.confirmed && !pickedEmail) || // confirmed but no usable email
-        (bestUrl !== null && bestConfirm.strength === "medium") // website found, medium
-      ) {
-        tier = "queue";
-      }
-      row.tier = tier;
+      // Shared per-agent processing (search→crawl→confirm→pick→tier).
+      row = await enrichOneAgent(stored, deps);
 
       // ── apply writes (write-tier only) ──
-      if (apply && tier === "write" && pickedEmail) {
+      if (apply && row.tier === "write" && row.candidate_email) {
         try {
-          applyWrite(db, t, pickedEmail, bestUrl, now);
+          applyWrite(db, t, row.candidate_email, row.chosen_url, now);
         } catch (writeErr: any) {
           // surface write failure in the row but don't abort the batch
-          row.email_reason = `${emailReason};write_failed:${writeErr?.message ?? String(writeErr)}`;
+          row.email_reason = `${row.email_reason};write_failed:${writeErr?.message ?? String(writeErr)}`;
         }
       }
     } catch (agentErr: any) {
@@ -485,6 +286,130 @@ router.post("/", async (req: Request, res: Response) => {
   });
 });
 
+// ─── Background full-cohort sweep + findings review + gated apply (orch-pr-12) ─
+//
+// POST /admin/search-enrich/sweep   { apply?: boolean }  (default dry-run)
+//   Fire-and-forget sweep over the WHOLE missing-email cohort (~700 agents).
+//   Dry-run records every finding to search_enrich_findings and writes NOTHING
+//   to contact data. apply=true additionally writes ONLY write-tier rows
+//   (fill-empty-only). 503 if no Brave key; 409 if a sweep is already running.
+// GET  /admin/search-enrich/sweep            → job status + counts + processed/total
+// GET  /admin/search-enrich/findings         → page the findings table for review
+// POST /admin/search-enrich/apply-findings   → write ONLY write-tier findings (gated)
+
+router.post("/sweep", async (req: Request, res: Response) => {
+  if (!requireAdmin(req, res)) return;
+
+  const body = (req.body ?? {}) as Record<string, unknown>;
+  const applyRaw = body["apply"] ?? req.query["apply"];
+  const apply =
+    applyRaw === true || applyRaw === "1" || applyRaw === "true";
+
+  const result = startSearchEnrichSweep({ apply, db: getDb() });
+
+  if (!result.started) {
+    if (result.reason === "no_brave_key") {
+      res.status(503).json({ error: "BRAVE_API_KEY not configured" });
+      return;
+    }
+    // already_running → 409 with the current job for observability.
+    res.status(409).json({
+      error: "search-enrich sweep already running",
+      reason: result.reason,
+      job: getSearchEnrichSweepJob(),
+    });
+    return;
+  }
+
+  res.json({
+    run_id: result.run_id,
+    total: result.total,
+    status: result.status,
+    apply,
+    note: "Sweep running in background. Poll GET /admin/search-enrich/sweep for progress.",
+  });
+});
+
+router.get("/sweep", (req: Request, res: Response) => {
+  if (!requireAdmin(req, res)) return;
+  res.json({ job: getSearchEnrichSweepJob() });
+});
+
+router.get("/findings", (req: Request, res: Response) => {
+  if (!requireAdmin(req, res)) return;
+  const db = getDb();
+  ensureFindingsTable(db);
+
+  const tierRaw = String(req.query["tier"] ?? "").toLowerCase();
+  const tier =
+    tierRaw === "write" || tierRaw === "queue" || tierRaw === "none" ? tierRaw : null;
+
+  const FINDINGS_DEFAULT_LIMIT = 100;
+  const FINDINGS_MAX_LIMIT = 500;
+  let limit = FINDINGS_DEFAULT_LIMIT;
+  const rawLimit = req.query["limit"];
+  if (rawLimit !== undefined && !isNaN(Number(rawLimit)) && Number(rawLimit) > 0) {
+    limit = Math.min(Math.floor(Number(rawLimit)), FINDINGS_MAX_LIMIT);
+  }
+  let offset = 0;
+  const rawOffset = req.query["offset"];
+  if (rawOffset !== undefined && !isNaN(Number(rawOffset)) && Number(rawOffset) >= 0) {
+    offset = Math.floor(Number(rawOffset));
+  }
+
+  const where = tier ? "WHERE tier = ?" : "";
+  const rows = db
+    .prepare(
+      `SELECT agent_id, name, query, tier, candidate_email, source_url,
+              confirm_strength, signals, email_reason, run_id, created_at
+         FROM search_enrich_findings
+         ${where}
+         ORDER BY created_at DESC, agent_id ASC
+         LIMIT ? OFFSET ?`,
+    )
+    .all(...(tier ? [tier, limit, offset] : [limit, offset])) as Array<Record<string, unknown>>;
+
+  // Parse signals JSON for the caller's convenience.
+  const parsed = rows.map((r) => {
+    let signals: unknown = [];
+    try {
+      signals = JSON.parse(String(r["signals"] ?? "[]"));
+    } catch {
+      signals = [];
+    }
+    return { ...r, signals };
+  });
+
+  const total = (
+    db
+      .prepare(`SELECT COUNT(*) AS n FROM search_enrich_findings ${where}`)
+      .get(...(tier ? [tier] : [])) as { n: number }
+  ).n;
+
+  // Per-tier totals for the review dashboard.
+  const byTierRows = db
+    .prepare(`SELECT tier, COUNT(*) AS n FROM search_enrich_findings GROUP BY tier`)
+    .all() as Array<{ tier: string; n: number }>;
+  const totals_by_tier: Record<string, number> = { write: 0, queue: 0, none: 0 };
+  for (const r of byTierRows) totals_by_tier[r.tier] = r.n;
+
+  res.json({
+    tier: tier ?? "all",
+    limit,
+    offset,
+    total,
+    totals_by_tier,
+    rows: parsed,
+  });
+});
+
+router.post("/apply-findings", (req: Request, res: Response) => {
+  if (!requireAdmin(req, res)) return;
+  const db = getDb();
+  const result = applyFindings(db);
+  res.json(result);
+});
+
 // ─── provenance write (mirrors PR-7 homepage-provenance + admin-knowledge) ────
 //
 // Writes the producer email (and website=chosen_url when website is empty) using
@@ -497,73 +422,9 @@ function applyWrite(
   chosenUrl: string | null,
   nowIso: string,
 ): void {
-  // Re-read current values inside the txn for a fresh non-empty guard.
-  const tx = db.transaction(() => {
-    // Ensure a knowledge row exists.
-    const exists = db
-      .prepare("SELECT email, website FROM agent_knowledge WHERE agent_id = ?")
-      .get(t.agent_id) as { email: string | null; website: string | null } | undefined;
-
-    if (!exists) {
-      db.prepare(
-        "INSERT INTO agent_knowledge (agent_id, field_provenance, updated_at) VALUES (?, '{}', ?)",
-      ).run(t.agent_id, nowIso);
-    }
-
-    const curEmail = exists?.email ?? null;
-    const curWebsite = exists?.website ?? null;
-
-    const emailDomain = (email.split("@")[1] ?? "").toLowerCase();
-    const sourceType = `web_search:${emailDomain}`;
-
-    // Column writes — only fill empties (never overwrite non-empty).
-    const colSets: string[] = [];
-    const colVals: unknown[] = [];
-    if (!curEmail || !curEmail.trim()) {
-      colSets.push("email = ?");
-      colVals.push(email);
-    }
-    if (chosenUrl && (!curWebsite || !curWebsite.trim())) {
-      colSets.push("website = ?");
-      colVals.push(chosenUrl);
-    }
-    if (colSets.length > 0) {
-      colVals.push(nowIso, t.agent_id);
-      db.prepare(
-        `UPDATE agent_knowledge SET ${colSets.join(", ")}, updated_at = ? WHERE agent_id = ?`,
-      ).run(...colVals);
-    }
-
-    // Provenance merge — append an email source (idempotent via dedupKey).
-    const provRow = db
-      .prepare("SELECT field_provenance FROM agent_knowledge WHERE agent_id = ?")
-      .get(t.agent_id) as { field_provenance?: string } | undefined;
-    let existingProv: Record<string, unknown> = {};
-    if (provRow?.field_provenance) {
-      try {
-        const parsed = JSON.parse(provRow.field_provenance);
-        if (parsed && typeof parsed === "object") existingProv = parsed as Record<string, unknown>;
-      } catch {
-        existingProv = {};
-      }
-    }
-    const merged = mergeFieldProvenance(existingProv, {
-      email: {
-        sources: [
-          {
-            source_type: sourceType,
-            value: email,
-            fetched_at: nowIso,
-            source_url: chosenUrl ?? undefined,
-          },
-        ],
-      },
-    });
-    db.prepare(
-      "UPDATE agent_knowledge SET field_provenance = ?, updated_at = ? WHERE agent_id = ?",
-    ).run(JSON.stringify(merged), nowIso, t.agent_id);
-  });
-  tx();
+  // Delegates to the shared fill-empty-only + provenance write path used by the
+  // sweep and apply-findings, so there is a single source of truth for writes.
+  applyEnrichWrite(db, t.agent_id, email, chosenUrl, nowIso);
 }
 
 export default router;

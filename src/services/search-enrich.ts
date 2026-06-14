@@ -484,3 +484,293 @@ export function rankCandidates(
 
   return scored.slice(0, 2).map((s) => s.url);
 }
+
+// ─── Crawl layer (orchestrator-pr-12) ───────────────────────────────────────
+//
+// MOVED here from routes/admin-search-enrich.ts so the same crawl path can be
+// the default `crawl` dependency for BOTH the inline route and the background
+// sweep. The SSRF guard + same-host /kontakt + /om-oss behaviour are preserved
+// EXACTLY as in the route (do not weaken them).
+
+const FETCH_TIMEOUT_MS = 8_000;
+const UA = "Lokal-RFB-Scraper/1.0 (+https://rettfrabonden.com)";
+
+/** Collect ALL candidate emails from HTML (mailto: links first, then bare). */
+export function extractEmails(html: string): string[] {
+  const out: string[] = [];
+  const seen = new Set<string>();
+  const push = (e: string) => {
+    const lc = e.toLowerCase();
+    if (!seen.has(lc)) {
+      seen.add(lc);
+      out.push(lc);
+    }
+  };
+  const mailtoRe = /mailto:([a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,})/gi;
+  let m: RegExpExecArray | null;
+  while ((m = mailtoRe.exec(html)) !== null) push(m[1]!);
+  const bareRe = /\b([a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,})\b/g;
+  while ((m = bareRe.exec(html)) !== null) push(m[1]!);
+  return out;
+}
+
+/** Normalise a Norwegian phone to 8 digits (mirrors marketplace.normalisePhone). */
+function normalisePhoneHtml(raw: string): string {
+  return raw
+    .replace(/^\+47/, "")
+    .replace(/^0047/, "")
+    .replace(/^\+/, "")
+    .replace(/[\s\-().]/g, "")
+    .replace(/\D/g, "");
+}
+
+/** Collect ALL candidate phone numbers from HTML (mirrors marketplace.extractPhone). */
+export function extractPhones(html: string): string[] {
+  const text = html.replace(/<[^>]+>/g, " ").replace(/&nbsp;/g, " ");
+  const re = /(?:\+47|0047|47[\s\-])?(\d{2}[\s\-]?\d{2}[\s\-]?\d{2}[\s\-]?\d{2})\b/g;
+  const out: string[] = [];
+  const seen = new Set<string>();
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(text)) !== null) {
+    const digits = normalisePhoneHtml(m[0]);
+    if (digits.length === 8 && !/^(\d)\1{7}$/.test(digits) && !seen.has(digits)) {
+      seen.add(digits);
+      out.push(digits);
+    }
+  }
+  return out;
+}
+
+/** Extract a page title from <title> or og:title. */
+export function extractTitle(html: string): string {
+  const og = html.match(
+    /<meta[^>]+property=["']og:title["'][^>]+content=["']([^"']+)["']/i,
+  );
+  if (og && og[1]) return og[1].trim();
+  const t = html.match(/<title[^>]*>([\s\S]*?)<\/title>/i);
+  if (t && t[1]) return t[1].replace(/\s+/g, " ").trim();
+  return "";
+}
+
+/** SSRF guard: allow only http(s) to public hosts; block localhost, link-local,
+ * private/CGNAT ranges and cloud-metadata (169.254.0.0/16). Domain names are allowed
+ * (DNS-rebinding is out of scope for this admin-gated, dry-run-by-default endpoint). */
+export function isSafeFetchUrl(raw: string): boolean {
+  let u: URL;
+  try {
+    u = new URL(/^https?:\/\//i.test(raw) ? raw : `https://${raw}`);
+  } catch {
+    return false;
+  }
+  if (u.protocol !== "http:" && u.protocol !== "https:") return false;
+  const host = u.hostname.toLowerCase().replace(/^\[|\]$/g, "");
+  if (
+    host === "localhost" ||
+    host.endsWith(".localhost") ||
+    host.endsWith(".internal") ||
+    host.endsWith(".local")
+  )
+    return false;
+  if (host.includes(":")) {
+    // IPv6 literal: block loopback (::1), unique-local (fc00::/7), link-local (fe80::/10)
+    if (host === "::1" || /^f[cd]/.test(host) || /^fe[89ab]/.test(host)) return false;
+    return true;
+  }
+  const m = host.match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/);
+  if (m) {
+    const o = m.slice(1, 5).map(Number);
+    if (o.some((x) => x > 255)) return false;
+    const [a, b] = o;
+    if (a === 0 || a === 10 || a === 127) return false;
+    if (a === 169 && b === 254) return false; // link-local incl. cloud metadata
+    if (a === 172 && b! >= 16 && b! <= 31) return false;
+    if (a === 192 && b === 168) return false;
+    if (a === 100 && b! >= 64 && b! <= 127) return false; // CGNAT
+  }
+  return true;
+}
+
+async function fetchHtml(url: string): Promise<string | null> {
+  if (!isSafeFetchUrl(url)) return null;
+  const fetchUrl = /^https?:\/\//i.test(url) ? url : `https://${url}`;
+  try {
+    const resp = await fetch(fetchUrl, {
+      redirect: "follow",
+      headers: { "User-Agent": UA, Accept: "text/html,application/xhtml+xml" },
+      signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
+    });
+    if (!resp.ok) return null;
+    return await resp.text();
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Crawl the chosen candidate URL plus same-host /kontakt and /om-oss, and merge
+ * all extracted emails/phones into one PageEvidence (title from the primary page).
+ * This is the DEFAULT `crawl` dependency for enrichOneAgent.
+ */
+export async function buildPageEvidence(primaryUrl: string): Promise<PageEvidence | null> {
+  const primaryHtml = await fetchHtml(primaryUrl);
+  if (primaryHtml === null) return null;
+
+  const emails = new Set<string>(extractEmails(primaryHtml));
+  const phones = new Set<string>(extractPhones(primaryHtml));
+  let combinedHtml = primaryHtml;
+  const title = extractTitle(primaryHtml);
+
+  // Try same-host /kontakt and /om-oss for additional contact details.
+  try {
+    const u = new URL(/^https?:\/\//i.test(primaryUrl) ? primaryUrl : `https://${primaryUrl}`);
+    const base = `${u.protocol}//${u.host}`;
+    for (const path of ["/kontakt", "/om-oss"]) {
+      const subHtml = await fetchHtml(`${base}${path}`);
+      if (subHtml) {
+        for (const e of extractEmails(subHtml)) emails.add(e);
+        for (const p of extractPhones(subHtml)) phones.add(p);
+        combinedHtml += "\n" + subHtml;
+      }
+    }
+  } catch {
+    /* malformed URL — primary page evidence still stands */
+  }
+
+  return {
+    url: primaryUrl,
+    title,
+    html: combinedHtml,
+    emails: Array.from(emails),
+    phones: Array.from(phones),
+  };
+}
+
+/** Registrable host (last two labels) from a raw URL/host string. PURE. */
+export function registrableHostFromUrl(raw: string): string | null {
+  try {
+    const withScheme = /^https?:\/\//i.test(raw) ? raw : `https://${raw}`;
+    const host = new URL(withScheme).hostname.toLowerCase().replace(/^www\./, "");
+    const labels = host.split(".").filter(Boolean);
+    if (labels.length < 2) return null;
+    return labels.slice(-2).join(".");
+  } catch {
+    return null;
+  }
+}
+
+// ─── enrichOneAgent — shared per-agent processing (orchestrator-pr-12) ───────
+//
+// The per-agent search→crawl→confirm→pick→tier decision, factored out of the
+// inline POST /admin/search-enrich loop so the route AND the background sweep
+// run IDENTICAL logic. All I/O is injected via `deps` so unit tests can stub
+// search + crawl with zero network access.
+
+export type EnrichTier = "write" | "queue" | "none";
+
+export interface EnrichDeps {
+  /** Web search — default: (q) => braveSearch(q, key, 5). */
+  search: (query: string) => Promise<BraveResult[]>;
+  /** Crawl a candidate URL into PageEvidence — default: buildPageEvidence. */
+  crawl: (url: string) => Promise<PageEvidence | null>;
+}
+
+/** Input to enrichOneAgent: the stored producer plus identity + query fields. */
+export type EnrichInput = StoredProducer & {
+  agent_id: string;
+  name: string;
+  query: string;
+};
+
+export interface EnrichRow {
+  agent_id: string;
+  name: string;
+  query: string;
+  chosen_url: string | null;
+  confirm: ConfirmResult;
+  candidate_email: string | null;
+  email_reason: string;
+  tier: EnrichTier;
+}
+
+/**
+ * Process ONE agent: search the web, rank candidates, crawl the top ≤2 (via the
+ * injected `crawl`), keep the strongest confirmation, pick the producer's own
+ * email, and decide the tier. PURE w.r.t. the DB — it only reads `stored` and
+ * the injected deps and returns a row. The caller persists / applies.
+ *
+ * Tier decision (identical to the original inline route):
+ *   - write : strength === 'strong' AND an unambiguous producer email picked
+ *   - queue : confirmed (medium) +/- email, OR a website found at medium strength
+ *   - none  : everything else (no candidate, not confirmed, no usable email)
+ *
+ * A throw from `deps.search`/`deps.crawl` propagates to the caller, which is
+ * responsible for the per-agent try/catch (one failure never aborts a batch).
+ */
+export async function enrichOneAgent(
+  stored: EnrichInput,
+  deps: EnrichDeps,
+): Promise<EnrichRow> {
+  const row: EnrichRow = {
+    agent_id: stored.agent_id,
+    name: stored.name,
+    query: stored.query,
+    chosen_url: null,
+    confirm: { confirmed: false, strength: "none", signals: [] },
+    candidate_email: null,
+    email_reason: "no_candidate_url",
+    tier: "none",
+  };
+
+  const results = await deps.search(stored.query);
+  const urls = rankCandidates(results, stored.name);
+  const siteRoot = stored.siteRoot ?? null;
+
+  let bestConfirm: ConfirmResult = row.confirm;
+  let bestUrl: string | null = null;
+  let bestEvidence: PageEvidence | null = null;
+
+  // Crawl the top ≤2 candidates; keep the strongest confirmation.
+  for (const url of urls) {
+    const evidence = await deps.crawl(url);
+    if (!evidence) continue;
+    const conf = confirmProducerPage(stored, evidence);
+    const rank = (s: string) => (s === "strong" ? 2 : s === "medium" ? 1 : 0);
+    if (bestUrl === null || rank(conf.strength) > rank(bestConfirm.strength)) {
+      bestConfirm = conf;
+      bestUrl = url;
+      bestEvidence = evidence;
+      if (conf.strength === "strong") break; // can't do better
+    }
+  }
+
+  row.chosen_url = bestUrl;
+  row.confirm = bestConfirm;
+
+  let pickedEmail: string | null = null;
+  let emailReason = bestUrl ? "no_acceptable_email" : "no_candidate_url";
+
+  if (bestConfirm.confirmed && bestEvidence) {
+    const pick = pickProducerEmail(bestEvidence.emails, stored.name, siteRoot);
+    pickedEmail = pick.email;
+    emailReason = pick.reason;
+  } else if (bestUrl) {
+    emailReason = "page_not_confirmed";
+  }
+  row.candidate_email = pickedEmail;
+  row.email_reason = emailReason;
+
+  // ── tier decision (identical to the original inline route) ──
+  let tier: EnrichTier = "none";
+  if (bestConfirm.strength === "strong" && pickedEmail) {
+    tier = "write";
+  } else if (
+    (bestConfirm.confirmed && pickedEmail) || // confirmed (medium) + email
+    (bestConfirm.confirmed && !pickedEmail) || // confirmed but no usable email
+    (bestUrl !== null && bestConfirm.strength === "medium") // website found, medium
+  ) {
+    tier = "queue";
+  }
+  row.tier = tier;
+
+  return row;
+}
