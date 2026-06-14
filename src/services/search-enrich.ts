@@ -403,7 +403,7 @@ export interface BraveResult {
 
 /**
  * Call the Brave Web Search API. Network — NOT covered by unit tests.
- * GET https://api.search.brave.com/res/v1/web/search?q=...&count=...&country=no&search_lang=no
+ * GET https://api.search.brave.com/res/v1/web/search?q=...&count=...&country=NO
  * Headers: Accept: application/json, X-Subscription-Token: <key>.
  * Parses web.results[] → {title, url, description}. Throws on non-200.
  * (Free tier is ~1 req/sec — the caller paces.)
@@ -417,7 +417,7 @@ export async function braveSearch(
     "https://api.search.brave.com/res/v1/web/search" +
     `?q=${encodeURIComponent(query)}` +
     `&count=${encodeURIComponent(String(count))}` +
-    "&country=no&search_lang=no";
+    "&country=NO";
 
   const resp = await fetch(url, {
     method: "GET",
@@ -429,7 +429,10 @@ export async function braveSearch(
   });
 
   if (!resp.ok) {
-    throw new Error(`Brave search failed: HTTP ${resp.status}`);
+    const body = await resp.text().catch(() => "");
+    throw new Error(
+      `Brave search failed: HTTP ${resp.status}${body ? ` ${body.slice(0, 200)}` : ""}`,
+    );
   }
 
   const data = (await resp.json()) as {
