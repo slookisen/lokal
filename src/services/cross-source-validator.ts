@@ -768,13 +768,34 @@ export function domainCoherenceCheck(
   if (websiteHost) {
     const websiteRoot = registrableDomain(websiteHost);
     if (!domainsEquivalent(websiteRoot, agentRoot)) {
-      return {
-        coherent: false,
-        reason: `knowledge.website host ${websiteHost} != agents.url host ${agentHost}`,
-        agentHost,
-        knowledgeWebsiteHost: websiteHost,
-        knowledgeEmailHost: emailHost ?? undefined,
-      };
+      // orch-PR-20260614-1 (Option A / email-anchor): website-host mismatch is
+      // non-blocking when the contact email host is equivalent to the agent host
+      // (the deliverable contact confirms identity). Eidsmo-type cases (email host
+      // != agent host) stay blocked.
+      //
+      // Real false-positive examples rescued by this rule:
+      //   Gangstad Gårdsysteri: agent=ysteri.no, website=gangstad.no, email=post@ysteri.no
+      //   Macks Ølbryggeri:     agent=mack.no,   website=mfrp.no,     email=kontakt@mack.no
+      //   Domstein Sjømat:      agent=domstein.no,website=enghav.no,   email=post@domstein.no
+      //
+      // Must NOT rescue Eidsmo contamination:
+      //   agent=eidsmokjott.no, website=slakthuset.no, email=post@slakthuset.no
+      //   → email host (slakthuset.no) != agent host → no rescue → stays blocked.
+      const emailAnchorsSite =
+        emailHost !== null &&
+        !FREE_MAIL_DOMAINS.includes(emailHost) &&
+        domainsEquivalent(registrableDomain(emailHost), agentRoot);
+      if (!emailAnchorsSite) {
+        return {
+          coherent: false,
+          reason: `knowledge.website host ${websiteHost} != agents.url host ${agentHost}`,
+          agentHost,
+          knowledgeWebsiteHost: websiteHost,
+          knowledgeEmailHost: emailHost ?? undefined,
+        };
+      }
+      // Email anchors the agent identity — fall through to the email check below,
+      // which will confirm consistency and return coherent: true.
     }
   }
 

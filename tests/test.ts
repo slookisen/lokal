@@ -2378,9 +2378,11 @@ console.log("\n── cross-source-validator: domainCoherenceCheck ──");
   assertEq(r.coherent, true, "dc: subdomains under same root → coherent");
 }
 {
+  // orch-PR-20260614-1: email-anchor rule now rescues this — email host (eidsmokjott.no)
+  // matches agent host, so the slakthuset.no website mismatch is non-blocking.
+  // (Was coherent:false before email-anchor; now coherent:true.)
   const r = domainCoherenceCheck("https://eidsmokjott.no/", "https://slakthuset.no", "post@eidsmokjott.no");
-  assertEq(r.coherent, false, "dc: website mismatch → incoherent");
-  assertTrue(/knowledge\.website/.test(r.reason || ""), "dc: website-mismatch reason mentions website");
+  assertEq(r.coherent, true, "dc: website mismatch + email anchors agent → coherent (email-anchor rule)");
 }
 {
   const r = domainCoherenceCheck("https://eidsmokjott.no/", "https://eidsmokjott.no", "post@slakthuset.no");
@@ -2544,9 +2546,47 @@ console.log("\n── cross-source-validator: domainCoherenceCheck ──");
   assertEq(r.coherent, false, "dc: eidsmokjott site + slakthuset email still incoherent (PR-126 preserves Eidsmo email gate)");
 }
 {
-  // Regression guard: website mismatch between different entities still flagged
+  // orch-PR-20260614-1: email-anchor rule rescues this scenario (email=post@eidsmokjott.no
+  // confirms the agent's identity, so the slakthuset.no website mismatch is non-blocking).
+  // The TRUE Eidsmo false-positive (post@slakthuset.no) is still blocked (see test at ~2526).
   const r = domainCoherenceCheck("https://eidsmokjott.no/", "https://slakthuset.no", "post@eidsmokjott.no");
-  assertEq(r.coherent, false, "dc: eidsmokjott agent vs slakthuset website still incoherent (PR-126)");
+  assertEq(r.coherent, true, "dc: eidsmokjott agent, slakthuset website, eidsmokjott email → coherent (email-anchor rescue, PR-20260614-1)");
+}
+
+// ── orch-PR-20260614-1 (Option A / email-anchor): website-mismatch rescue ────────
+// Tests for the new rule: when the contact email host matches the agent host,
+// a mismatching knowledge.website is non-blocking (email anchors identity).
+// Eidsmo-type cases (email host != agent host) must STAY blocked.
+console.log("\n── cross-source-validator: domainCoherenceCheck (orch-PR-20260614-1 email-anchor) ──");
+{
+  // 1. Gangstad Gårdsysteri: email anchors ysteri.no → rescue website mismatch
+  const r = domainCoherenceCheck("https://ysteri.no", "https://gangstad.no", "post@ysteri.no");
+  assertEq(r.coherent, true, "ea-01: email-anchor rescue — ysteri.no agent, gangstad.no website, post@ysteri.no email → coherent");
+}
+{
+  // 2. Macks Ølbryggeri variant: email anchors mack.no → rescue mfrp.no website
+  const r = domainCoherenceCheck("https://mack.no", "https://mfrp.no", "kontakt@mack.no");
+  assertEq(r.coherent, true, "ea-02: email-anchor rescue — mack.no agent, mfrp.no website, kontakt@mack.no email → coherent");
+}
+{
+  // 3. Eidsmo stays blocked: email host (slakthuset.no) != agent host (eidsmokjott.no) → no rescue
+  const r = domainCoherenceCheck("https://eidsmokjott.no", "https://slakthuset.no", "post@slakthuset.no");
+  assertEq(r.coherent, false, "ea-03: Eidsmo contamination — email host != agent host → stays blocked");
+}
+{
+  // 4. Website mismatch + free-mail email does NOT rescue (gmail doesn't prove identity)
+  const r = domainCoherenceCheck("https://produsenten.no", "https://annet.no", "produsenten@gmail.com");
+  assertEq(r.coherent, false, "ea-04: website mismatch + free-mail email → NOT rescued (stays blocked)");
+}
+{
+  // 5. Website mismatch + no email stays blocked
+  const r = domainCoherenceCheck("https://produsenten.no", "https://annet.no", null);
+  assertEq(r.coherent, false, "ea-05: website mismatch + no email → stays blocked");
+}
+{
+  // 6. Regression: matching website still coherent (aakre-gard.no ≈ akregard.no via brand-token)
+  const r = domainCoherenceCheck("https://aakre-gard.no", "https://aakregard.no", "post@aakregard.no");
+  assertEq(r.coherent, true, "ea-06: regression — website equivalent to agent (brand-token match) → still coherent");
 }
 
 // ── orch-PR-20260613: Norwegian-variant / IDN-variant false-positive reduction ──
