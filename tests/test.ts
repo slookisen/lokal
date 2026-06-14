@@ -15034,6 +15034,456 @@ const _orchPr20260614_2Promise = (async () => {
 // pass/fail counts are included. (Pre-existing async integration tests
 // run without await per their original design; swallowed errors there
 // remain swallowed — out of scope for M2.)
+
+// ── orch-pr-20260614-3: outreach suppression gate + sent-log import ──────────
+console.log("── orch-pr-20260614-3: outreach suppression gate ──");
+
+let _orchPr20260614Resolve: () => void = () => {};
+const _orchPr20260614Promise: Promise<void> = new Promise<void>(r => { _orchPr20260614Resolve = r; });
+
+(async () => {
+  // Wait for all prior DB-mutating IIFEs to finish
+  try { await _orchPr86Promise; } catch { /* recorded upstream */ }
+  try { await _orchPr93Promise; } catch { /* recorded upstream */ }
+
+  const Database = require("better-sqlite3");
+  const orchDb = new Database(":memory:");
+
+  // ── Minimal schema ───────────────────────────────────────────────────────────
+  // agents, agent_knowledge (with all outreach_ready_pool columns),
+  // outreach_sent_log, crm_contacts, crm_threads, crm_messages,
+  // email_bounces, analytics_agent_views (VIEW dependency)
+  orchDb.exec(`
+    CREATE TABLE agents (
+      id TEXT PRIMARY KEY,
+      name TEXT NOT NULL,
+      description TEXT NOT NULL DEFAULT '',
+      provider TEXT NOT NULL DEFAULT '',
+      contact_email TEXT NOT NULL DEFAULT '',
+      url TEXT NOT NULL DEFAULT '',
+      role TEXT NOT NULL DEFAULT 'producer',
+      api_key TEXT UNIQUE NOT NULL DEFAULT (hex(randomblob(8))),
+      is_active INTEGER DEFAULT 1,
+      is_verified INTEGER DEFAULT 0,
+      trust_score REAL DEFAULT 0.5,
+      city TEXT,
+      umbrella_type TEXT,
+      claimed_at TEXT,
+      created_at TEXT DEFAULT (datetime('now')),
+      last_seen_at TEXT DEFAULT (datetime('now'))
+    );
+
+    CREATE TABLE agent_knowledge (
+      agent_id TEXT PRIMARY KEY,
+      email TEXT,
+      phone TEXT,
+      website TEXT,
+      address TEXT,
+      google_rating REAL,
+      google_review_count INTEGER,
+      about TEXT,
+      verification_status TEXT NOT NULL DEFAULT 'unverified',
+      enrichment_status TEXT NOT NULL DEFAULT 'thin',
+      outreach_eligible_at TEXT,
+      last_verified_at TEXT,
+      url_last_probed TEXT,
+      url_last_status INTEGER,
+      field_provenance TEXT NOT NULL DEFAULT '{}',
+      updated_at TEXT
+    );
+
+    CREATE TABLE outreach_sent_log (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      agent_id TEXT NOT NULL,
+      sent_at TEXT NOT NULL DEFAULT (datetime('now')),
+      channel TEXT NOT NULL DEFAULT 'email',
+      message_id TEXT,
+      notes TEXT
+    );
+
+    CREATE TABLE crm_contacts (
+      id TEXT PRIMARY KEY,
+      type TEXT NOT NULL DEFAULT 'producer',
+      agent_id TEXT,
+      email TEXT NOT NULL,
+      name TEXT,
+      status TEXT DEFAULT 'active',
+      first_seen_at TEXT DEFAULT (datetime('now')),
+      last_seen_at TEXT DEFAULT (datetime('now')),
+      metadata TEXT DEFAULT '{}'
+    );
+
+    CREATE TABLE crm_threads (
+      id TEXT PRIMARY KEY,
+      contact_id TEXT NOT NULL,
+      subject TEXT,
+      status TEXT DEFAULT 'new',
+      message_count INTEGER DEFAULT 0,
+      last_message_at TEXT,
+      created_at TEXT DEFAULT (datetime('now')),
+      updated_at TEXT DEFAULT (datetime('now'))
+    );
+
+    CREATE TABLE crm_messages (
+      id TEXT PRIMARY KEY,
+      thread_id TEXT NOT NULL,
+      direction TEXT NOT NULL,
+      from_email TEXT NOT NULL,
+      sent_at TEXT,
+      received_at TEXT DEFAULT (datetime('now')),
+      delivery_status TEXT NOT NULL DEFAULT 'sent'
+    );
+
+    CREATE TABLE email_bounces (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      email TEXT NOT NULL,
+      bounced_at TEXT NOT NULL,
+      resend_email_id TEXT,
+      bounce_type TEXT,
+      reason TEXT,
+      agent_id_at_send TEXT,
+      batch_id TEXT,
+      investigated INTEGER DEFAULT 0,
+      created_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+
+    CREATE TABLE analytics_agent_views (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      agent_id TEXT,
+      created_at TEXT DEFAULT (datetime('now'))
+    );
+
+    -- outreach_ready_pool VIEW (mirrors production definition)
+    CREATE VIEW outreach_ready_pool AS
+    SELECT
+      a.id AS agent_id,
+      a.name,
+      a.role,
+      a.city AS location_city,
+      k.email,
+      k.phone,
+      k.verification_status,
+      k.enrichment_status,
+      k.outreach_eligible_at,
+      k.last_verified_at,
+      k.url_last_probed,
+      k.url_last_status
+    FROM agents a
+    INNER JOIN agent_knowledge k ON k.agent_id = a.id
+    WHERE
+      k.email IS NOT NULL
+      AND k.email != ''
+      AND a.umbrella_type IS NULL
+      AND k.verification_status = 'verified'
+      AND k.enrichment_status IN ('partial', 'rich')
+      AND k.url_last_status IS NOT NULL
+      AND k.url_last_status >= 200
+      AND k.url_last_status < 400
+      AND k.url_last_probed IS NOT NULL
+      AND k.url_last_probed > datetime('now', '-30 days')
+      AND NOT EXISTS (
+        SELECT 1 FROM outreach_sent_log o WHERE o.agent_id = a.id
+      );
+  `);
+
+  const initMod = await import("../src/database/init");
+  initMod.__setDbForTesting(orchDb as any);
+
+  const ORCH_ADMIN_KEY = "orch-pr-20260614-3-test-key";
+  const prevAdminKey = process.env.ADMIN_KEY;
+  process.env.ADMIN_KEY = ORCH_ADMIN_KEY;
+
+  // ── Helper: seed a pool-eligible agent ───────────────────────────────────────
+  function seedPoolAgent(id: string, email: string, name: string) {
+    orchDb.prepare(`
+      INSERT INTO agents (id, name, is_active) VALUES (?, ?, 1)
+    `).run(id, name);
+    orchDb.prepare(`
+      INSERT INTO agent_knowledge
+        (agent_id, email, verification_status, enrichment_status,
+         url_last_status, url_last_probed, outreach_eligible_at)
+      VALUES (?, ?, 'verified', 'rich', 200, datetime('now'), datetime('now'))
+    `).run(id, email);
+  }
+
+  // Seed 6 agents with distinct suppression scenarios:
+  //   A - clean (should appear in first and second after cooldown)
+  //   B - in outreach_sent_log (recent) → suppressed in first, suppressed in second (within cooldown)
+  //   C - in outreach_sent_log OLD (>60d) → suppressed in first, eligible in second
+  //   D - has inbound CRM reply → suppressed in both
+  //   E - crm_contacts.status = 'blocked' → suppressed in both (opted-out)
+  //   F - claimed_at is set → suppressed in both (customer)
+
+  seedPoolAgent("oa-A", "clean@test.no", "Agent A Clean");
+  seedPoolAgent("oa-B", "recent@test.no", "Agent B Recent");
+  seedPoolAgent("oa-C", "old@test.no", "Agent C Old");
+  seedPoolAgent("oa-D", "replied@test.no", "Agent D Replied");
+  seedPoolAgent("oa-E", "optout@test.no", "Agent E OptOut");
+  seedPoolAgent("oa-F", "customer@test.no", "Agent F Customer");
+
+  // B: recent log entry (1 day ago — within 60d cooldown)
+  orchDb.prepare(`
+    INSERT INTO outreach_sent_log (agent_id, sent_at, channel, message_id)
+    VALUES ('oa-B', datetime('now', '-1 day'), 'email', 'msg-b-1')
+  `).run();
+
+  // C: old log entry (90 days ago — outside 60d cooldown)
+  orchDb.prepare(`
+    INSERT INTO outreach_sent_log (agent_id, sent_at, channel, message_id)
+    VALUES ('oa-C', datetime('now', '-90 days'), 'email', 'msg-c-1')
+  `).run();
+
+  // D: crm_contact with inbound message
+  orchDb.prepare(`INSERT INTO crm_contacts (id, type, agent_id, email, name) VALUES ('cc-D', 'producer', 'oa-D', 'replied@test.no', 'D')`).run();
+  orchDb.prepare(`INSERT INTO crm_threads (id, contact_id) VALUES ('ct-D', 'cc-D')`).run();
+  orchDb.prepare(`INSERT INTO crm_messages (id, thread_id, direction, from_email) VALUES ('cm-D', 'ct-D', 'in', 'replied@test.no')`).run();
+
+  // E: crm_contact with blocked status
+  orchDb.prepare(`INSERT INTO crm_contacts (id, type, agent_id, email, name, status) VALUES ('cc-E', 'producer', 'oa-E', 'optout@test.no', 'E', 'blocked')`).run();
+
+  // F: customer (claimed_at set)
+  orchDb.prepare(`UPDATE agents SET claimed_at = datetime('now') WHERE id = 'oa-F'`).run();
+
+  // Mount the route on a real express app
+  const expressMod = (await import("express")).default;
+  const routeMod = await import("../src/routes/admin-outreach-candidates");
+  const app3 = expressMod();
+  app3.use(expressMod.json());
+  // Candidates at /
+  app3.use("/admin/outreach-candidates", routeMod.default);
+  // Import at /admin/outreach-sent-log
+  app3.use("/admin/outreach-sent-log", routeMod.default);
+
+  const httpMod3 = await import("http");
+  const server3 = httpMod3.createServer(app3);
+  await new Promise<void>((resolve) => server3.listen(0, "127.0.0.1", () => resolve()));
+  const addr3 = server3.address();
+  const port3 = typeof addr3 === "object" && addr3 ? addr3.port : 0;
+
+  function req3(
+    method: string,
+    urlPath: string,
+    opts: { headers?: Record<string, string>; body?: any } = {}
+  ): Promise<{ status: number; body: any }> {
+    process.env.ADMIN_KEY = ORCH_ADMIN_KEY;
+    return new Promise((resolve, reject) => {
+      const bodyStr = opts.body !== undefined ? JSON.stringify(opts.body) : undefined;
+      const headers: Record<string, string> = { "x-admin-key": ORCH_ADMIN_KEY, ...(opts.headers || {}) };
+      if (bodyStr !== undefined) {
+        headers["Content-Type"] = "application/json";
+        headers["Content-Length"] = String(Buffer.byteLength(bodyStr));
+      }
+      const r = httpMod3.request(
+        { method, host: "127.0.0.1", port: port3, path: urlPath, headers },
+        (resp) => {
+          const chunks: Buffer[] = [];
+          resp.on("data", (c) => chunks.push(c as Buffer));
+          resp.on("end", () => {
+            const raw = Buffer.concat(chunks).toString("utf8");
+            let parsed: any = null;
+            try { parsed = JSON.parse(raw); } catch { /* not JSON */ }
+            resolve({ status: resp.statusCode || 0, body: parsed });
+          });
+        }
+      );
+      r.on("error", reject);
+      if (bodyStr) r.write(bodyStr);
+      r.end();
+    });
+  }
+
+  // ── Test 1: mode=first — only clean agent A returned ─────────────────────────
+  // NOTE: outreach_ready_pool VIEW itself excludes agents in outreach_sent_log (B, C).
+  // So from the VIEW: A, D, E, F are present (B and C are excluded by the VIEW).
+  // The endpoint's suppression further removes: D (replied), E (opted-out), F (customer).
+  // Expected candidates: A only.
+  {
+    const r = await req3("GET", "/admin/outreach-candidates?mode=first");
+    assertTrue(r.status === 200, "orch20260614-01: mode=first → 200");
+    if (r.status !== 200 || !r.body) {
+      failed++; failures.push("orch20260614-01-debug: body=" + JSON.stringify(r.body));
+      _orchPr20260614Resolve(); return;
+    }
+    assertTrue(r.body.success === true, "orch20260614-02: mode=first → success");
+    const ids = (r.body.candidates as any[]).map((c: any) => c.agent_id);
+    assertTrue(ids.includes("oa-A"), "orch20260614-03: mode=first → A in candidates");
+    assertTrue(!ids.includes("oa-B"), "orch20260614-04: mode=first → B excluded (in sent_log)");
+    assertTrue(!ids.includes("oa-C"), "orch20260614-05: mode=first → C excluded (in sent_log)");
+    assertTrue(!ids.includes("oa-D"), "orch20260614-06: mode=first → D excluded (replied)");
+    assertTrue(!ids.includes("oa-E"), "orch20260614-07: mode=first → E excluded (opted-out)");
+    assertTrue(!ids.includes("oa-F"), "orch20260614-08: mode=first → F excluded (customer)");
+    assertTrue(r.body.suppressed_counts.replied >= 1, "orch20260614-09: replied suppression counted");
+    assertTrue(r.body.suppressed_counts.opted_out >= 1, "orch20260614-10: opted_out suppression counted");
+    assertTrue(r.body.suppressed_counts.customer >= 1, "orch20260614-11: customer suppression counted");
+  }
+
+  // ── Test 2: mode=second — C (90d old sent_log) eligible; others excluded ──────
+  // The VIEW excludes agents with any sent_log entry, so for mode=second the route
+  // uses the underlying pool conditions WITHOUT the sent_log exclusion. This lets
+  // previously-contacted agents who are past their cooldown period appear.
+  //
+  // Expected for mode=second with 60d cooldown:
+  //   A — never contacted → excluded (mode=second requires prior contact)
+  //   B — contacted 1d ago → within cooldown → excluded
+  //   C — contacted 90d ago → past 60d cooldown → ELIGIBLE
+  //   D — contacted (n/a, no sent_log) + has inbound reply → suppressed by reply check
+  //   E — opted-out → suppressed
+  //   F — customer → suppressed
+  {
+    const r = await req3("GET", "/admin/outreach-candidates?mode=second&cooldown_days=60");
+    assertTrue(r.status === 200, "orch20260614-12: mode=second → 200");
+    if (r.status !== 200 || !r.body) {
+      failed++; failures.push("orch20260614-12-debug: body=" + JSON.stringify(r.body));
+      _orchPr20260614Resolve(); return;
+    }
+    assertTrue(r.body.success === true, "orch20260614-13: mode=second → success");
+    assertEq(r.body.mode, "second", "orch20260614-14: mode reflected in response");
+    assertEq(r.body.cooldown_days, 60, "orch20260614-15: cooldown_days reflected");
+    const ids2 = (r.body.candidates as any[]).map((c: any) => c.agent_id);
+    // C has sent_log entry 90d ago (> 60d cooldown) → eligible for second outreach
+    assertTrue(ids2.includes("oa-C"), "orch20260614-16: mode=second → C eligible (90d old sent_log > 60d cooldown)");
+    // A was never contacted → not eligible for second outreach
+    assertTrue(!ids2.includes("oa-A"), "orch20260614-17b: mode=second → A excluded (never contacted)");
+    // B was contacted 1d ago → within 60d cooldown
+    assertTrue(!ids2.includes("oa-B"), "orch20260614-17c: mode=second → B excluded (within cooldown)");
+    // D is suppressed by reply check (if D has a sent_log entry; it doesn't in our seed,
+    // so D would be excluded by mode=second as "never contacted" anyway)
+    assertTrue(!ids2.includes("oa-D"), "orch20260614-17d: mode=second → D excluded");
+  }
+
+  // ── Test 3: replied exclusion — D not in candidates ────────────────────────
+  // Already tested in test 1 above. Extra assertion for clarity:
+  {
+    const r = await req3("GET", "/admin/outreach-candidates?mode=first");
+    const ids = (r.body.candidates as any[]).map((c: any) => c.agent_id);
+    assertTrue(!ids.includes("oa-D"), "orch20260614-17: replied agent D excluded");
+  }
+
+  // ── Test 4: opted-out (crm status != active) exclusion ─────────────────────
+  {
+    const r = await req3("GET", "/admin/outreach-candidates?mode=first");
+    const ids = (r.body.candidates as any[]).map((c: any) => c.agent_id);
+    assertTrue(!ids.includes("oa-E"), "orch20260614-18: opted-out agent E excluded (crm blocked)");
+  }
+
+  // ── Test 5: customer exclusion (claimed_at not null) ────────────────────────
+  {
+    const r = await req3("GET", "/admin/outreach-candidates?mode=first");
+    const ids = (r.body.candidates as any[]).map((c: any) => c.agent_id);
+    assertTrue(!ids.includes("oa-F"), "orch20260614-19: customer agent F excluded (claimed_at set)");
+  }
+
+  // ── Test 6: mode validation ──────────────────────────────────────────────────
+  {
+    const r = await req3("GET", "/admin/outreach-candidates?mode=bogus");
+    assertEq(r.status, 400, "orch20260614-20: invalid mode → 400");
+  }
+
+  // ── Test 7: admin gate ───────────────────────────────────────────────────────
+  {
+    const r = await req3("GET", "/admin/outreach-candidates?mode=first", {
+      headers: { "x-admin-key": "wrong-key" }
+    });
+    assertEq(r.status, 403, "orch20260614-21: wrong admin key → 403");
+  }
+
+  // ── Test 8: import endpoint — upsert and idempotency ────────────────────────
+  // Seed agent G for import testing
+  seedPoolAgent("oa-G", "import-test@test.no", "Agent G Import");
+
+  const importBody = {
+    entries: [
+      {
+        email: "import-test@test.no",
+        name: "Agent G Import",
+        sentAt: new Date(Date.now() - 90 * 86400 * 1000).toISOString(),
+        batch: "batch-2025-01",
+        messageId: "msg-import-001",
+      },
+      {
+        email: "no-such-email@nowhere.no",
+        name: "Unknown",
+        sentAt: new Date().toISOString(),
+        batch: "batch-2025-01",
+        messageId: "msg-import-002",
+      },
+    ],
+  };
+
+  {
+    const r = await req3("POST", "/admin/outreach-sent-log/import", { body: importBody });
+    assertTrue(r.status === 200, "orch20260614-22: import → 200");
+    assertTrue(r.body.success === true, "orch20260614-23: import → success");
+    assertEq(r.body.inserted, 1, "orch20260614-24: import → 1 inserted (G)");
+    assertEq(r.body.skipped, 0, "orch20260614-25: import first run → 0 skipped");
+    assertTrue(
+      Array.isArray(r.body.unmatched_emails) && r.body.unmatched_emails.includes("no-such-email@nowhere.no"),
+      "orch20260614-26: import → unmatched email listed"
+    );
+  }
+
+  // Re-import the same entries → idempotent (same messageId → skipped)
+  {
+    const r = await req3("POST", "/admin/outreach-sent-log/import", { body: importBody });
+    assertTrue(r.status === 200, "orch20260614-27: re-import → 200");
+    assertEq(r.body.inserted, 0, "orch20260614-28: re-import → 0 inserted (idempotent)");
+    assertEq(r.body.skipped, 1, "orch20260614-29: re-import → 1 skipped (same messageId)");
+  }
+
+  // ── Test 9: hard-bounce exclusion ───────────────────────────────────────────
+  // Seed agent H (clean), then hard-bounce its email
+  seedPoolAgent("oa-H", "bounced@test.no", "Agent H Bounced");
+  orchDb.prepare(`
+    INSERT INTO email_bounces (email, bounced_at, bounce_type)
+    VALUES ('bounced@test.no', datetime('now'), 'hard')
+  `).run();
+  {
+    const r = await req3("GET", "/admin/outreach-candidates?mode=first");
+    const ids = (r.body.candidates as any[]).map((c: any) => c.agent_id);
+    assertTrue(!ids.includes("oa-H"), "orch20260614-30: hard-bounced agent H excluded");
+    assertTrue(r.body.suppressed_counts.hard_bounced >= 1, "orch20260614-31: hard_bounced suppression counted");
+  }
+
+  // ── Test 10: verification_status=opt_out → excluded ────────────────────────
+  // Seed agent I with opt_out verification_status
+  orchDb.prepare(`INSERT INTO agents (id, name, is_active) VALUES ('oa-I', 'Agent I OptOut', 1)`).run();
+  orchDb.prepare(`
+    INSERT INTO agent_knowledge
+      (agent_id, email, verification_status, enrichment_status,
+       url_last_status, url_last_probed, outreach_eligible_at)
+    VALUES ('oa-I', 'kopt@test.no', 'opt_out', 'rich', 200, datetime('now'), datetime('now'))
+  `).run();
+  // Note: opt_out means verification_status != 'verified' so the VIEW already excludes it.
+  // But the endpoint also explicitly checks verification_status = 'opt_out'.
+  // This test verifies opt_out agents aren't in candidates regardless.
+  {
+    const r = await req3("GET", "/admin/outreach-candidates?mode=first");
+    const ids = (r.body.candidates as any[]).map((c: any) => c.agent_id);
+    assertTrue(!ids.includes("oa-I"), "orch20260614-32: opt_out agent I excluded");
+  }
+
+  // ── Test 11: limit parameter is respected ───────────────────────────────────
+  {
+    const r = await req3("GET", "/admin/outreach-candidates?mode=first&limit=1");
+    assertTrue(r.status === 200, "orch20260614-33: limit=1 → 200");
+    assertTrue((r.body.candidates as any[]).length <= 1, "orch20260614-34: limit=1 caps output");
+  }
+
+  // ── Test 12: import body validation ─────────────────────────────────────────
+  {
+    const r = await req3("POST", "/admin/outreach-sent-log/import", { body: { not_entries: [] } });
+    assertEq(r.status, 400, "orch20260614-35: import missing entries → 400");
+  }
+
+  // Cleanup
+  server3.close();
+  if (prevAdminKey === undefined) delete process.env.ADMIN_KEY;
+  else process.env.ADMIN_KEY = prevAdminKey;
+
+  _orchPr20260614Resolve();
+})();
+
+
 (async () => {
   try { await Promise.all(_pr21Promises); } catch { /* errors already pushed to failures */ }
   try { await _m2Promise; } catch { /* errors already pushed to failures */ }
@@ -15059,6 +15509,7 @@ const _orchPr20260614_2Promise = (async () => {
   try { await _seoDentalPromise; } catch { /* errors already pushed to failures */ }
   try { await _platformVerifierPromise; } catch { /* errors already pushed to failures */ }
   try { await _orchPr20260614_2Promise; } catch { /* errors already pushed to failures */ }
+  try { await _orchPr20260614Promise; } catch { /* errors already pushed to failures */ }
   // PR-109 tests are synchronous (IIFE) — no promise needed
   // Drop pre-existing intg failures (unmasked by awaiting) — they predate M2
   // and live behind a separate fix-it task. Counting them here would surface

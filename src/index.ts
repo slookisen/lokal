@@ -35,6 +35,7 @@ import agentStatsRoutes from "./routes/agent-stats";
 import adminRunsRoutes from "./routes/admin-runs";
 import adminAgentsRoutes from "./routes/admin-agents";
 import adminOutreachPoolRoutes from "./routes/admin-outreach-pool";
+import adminOutreachCandidatesRoutes from "./routes/admin-outreach-candidates";
 import adminRunVerifierRoutes from "./routes/admin-run-verifier";
 import adminRunPlatformVerifierRoutes from "./routes/admin-run-platform-verifier";
 import adminVerifierSweepStatusRouter from "./routes/admin-verifier-sweep-status";
@@ -348,6 +349,9 @@ app.use("/admin/runs", adminLimiter, adminRunsRoutes);
 // PR-93: list agents by status + updated_since — unblocks verifier sweep
 app.use("/admin/agents", adminLimiter, adminAgentsRoutes);
 app.use("/admin/outreach-ready-pool", adminLimiter, adminOutreachPoolRoutes);
+// orch-pr-20260614-3: suppression-gate candidates endpoint + sent-log backfill import
+app.use("/admin/outreach-candidates", adminLimiter, adminOutreachCandidatesRoutes);
+app.use("/admin/outreach-sent-log", adminLimiter, adminOutreachCandidatesRoutes);
 app.use("/admin/run-verifier", adminLimiter, adminRunVerifierRoutes);
 // Phase 2: server-side platform-verifier (deterministic probe loop, dry_run default)
 app.use("/admin/run-platform-verifier", adminLimiter, adminRunPlatformVerifierRoutes);
