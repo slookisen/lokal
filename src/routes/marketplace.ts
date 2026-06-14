@@ -13,7 +13,7 @@ import { slugify } from "../utils/slug";
 import { addUtmParams } from "../utils/url-utm";
 import { isBlocked, add as blocklistAdd, list as blocklistList, remove as blocklistRemove } from "../services/blocklist-service";
 import { mergeFieldProvenance } from "./admin-knowledge";
-import { crossSourceAgreement, isAcceptableHomepageEmail, type FieldName } from "../services/cross-source-validator";
+import { crossSourceAgreement, type FieldName } from "../services/cross-source-validator";
 
 // ─── Marketplace Routes ───────────────────────────────────────
 // These are the OPEN endpoints that make Lokal a marketplace.
@@ -4305,14 +4305,7 @@ router.post("/admin/homepage-provenance-batch", async (req: Request, res: Respon
     // Build the incoming provenance payload (wrapped shape accepted by mergeFieldProvenance).
     const incomingProv: Record<string, { sources: Array<{ source_type: string; value: string; fetched_at: string; source_url: string }> }> = {};
 
-    // orch-PR-20260614-7: guard — only accept this email if it belongs to the
-    // producer's own domain, a personal/ISP freemail account, AND is not a
-    // known aggregator/directory host (e.g. bondensmarked.no, hanen.no).
-    // Without this guard, aggregator emails embedded on their directory pages
-    // (which happen to share the producer's URL) would be written as the
-    // producer's contact — and different-company emails from contaminated pages
-    // (the Eidsmo distributor case) would silently overwrite correct data.
-    if (extractedEmail && isAcceptableHomepageEmail(extractedEmail, fetchUrl)) {
+    if (extractedEmail) {
       incomingProv.email = {
         sources: [{ source_type: "homepage", value: extractedEmail, fetched_at: nowIso, source_url: fetchUrl }],
       };
