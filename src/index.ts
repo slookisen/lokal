@@ -22,6 +22,7 @@ import a2aRoutes from "./routes/a2a";
 import reservationRoutes from "./routes/reservation";
 import marketplaceRoutes from "./routes/marketplace";
 import { catalogRouter as marketplaceCatalogRouter, adminCatalogRouter } from "./routes/marketplace-catalog";
+import { cartRouter, adminOrderRouter } from "./routes/marketplace-cart";
 import dentalRoutes from "./routes/dental";
 import mcpRoutes from "./routes/mcp";
 import seoRoutes from "./routes/seo";
@@ -218,6 +219,8 @@ app.use("/api/reservations", reservationRoutes);
 app.use("/api/marketplace", marketplaceRoutes);
 // Phase 0: product catalog feed + per-agent products (public) + backfill (admin)
 app.use("/api/marketplace/catalog", marketplaceCatalogRouter);
+// Phase 1: cart + order REST routes
+app.use("/api/marketplace", cartRouter);
 app.use("/api/tannlege", dentalRoutes);
 app.use("/mcp", mcpRoutes);
 app.use("/", a2aRoutes);
@@ -380,6 +383,8 @@ app.use("/admin/debio", adminLimiter, adminDebioCrossCheckRoutes);
 app.use("/admin", adminLimiter, adminJobsRoutes);
 // Phase 0: admin product backfill endpoint
 app.use("/admin/products", adminLimiter, adminCatalogRouter);
+// Phase 1: admin order lifecycle transitions
+app.use("/admin/marketplace", adminLimiter, adminOrderRouter);
 
 // Platform triggers — public webhook receiver + admin queue access.
 // /platform/triggers/* uses HMAC (no admin-key); /admin/triggers/* uses admin-key.
