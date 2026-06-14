@@ -732,6 +732,49 @@ const GENERIC_DOMAIN_LABELS: ReadonlySet<string> = new Set([
   "finnmark", "gudbrandsdalen",
 ]);
 
+// ─── Homepage-email acceptance gate (orch-PR-20260614-7) ─────────────────────
+//
+// Decides whether an email address extracted from a producer's OWN verified
+// website should be accepted as that producer's contact email.
+//
+// Rule (applied during homepage-provenance enrichment, NOT domain-coherence):
+//   ACCEPT iff:
+//     (a) emailRoot === siteRoot  (own branded domain)
+//       OR
+//     (b) emailRoot is in FREE_MAIL_DOMAINS  (personal/ISP mailbox — normal for
+//         small Norwegian producers)
+//   AND
+//     (c) isKnownDirectoryHost(emailRoot) === false
+//         (never accept an aggregator/market/directory address such as
+//          post@bondensmarked.no or post@hanen.no regardless of (a)/(b))
+//
+// The guard keeps the Eidsmo/Heimstølen distributor-contamination case blocked
+// because a different-company non-free-mail domain satisfies neither (a) nor (b).
+//
+// siteUrl may be a full URL or a bare hostname — parsed the same way as
+// agents.url in domainCoherenceCheck.
+export function isAcceptableHomepageEmail(email: string, siteUrl: string): boolean {
+  if (!email || !email.includes("@")) return false;
+  const emailHost = hostFromEmail(email);
+  if (!emailHost) return false;
+  const emailRoot = registrableDomain(emailHost);
+
+  // (c) Never accept known aggregator/directory addresses.
+  if (isKnownDirectoryHost(emailRoot)) return false;
+
+  const siteHost = hostFromUrlLike(siteUrl);
+  const siteRoot = siteHost ? registrableDomain(siteHost) : null;
+
+  // (a) Own domain match.
+  if (siteRoot && emailRoot === siteRoot) return true;
+
+  // (b) Personal/ISP freemail — producer's own mailbox, not a company domain.
+  if (FREE_MAIL_DOMAINS.includes(emailRoot)) return true;
+
+  // Otherwise: different real company domain — reject.
+  return false;
+}
+
 export function domainCoherenceCheck(
   agentUrl: string | null | undefined,
   knowledgeWebsite: string | null | undefined,
