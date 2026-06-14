@@ -6783,9 +6783,11 @@ console.log("── PR-29 related-producers tests ──");
     "phase5.11-a7: lokal_get_producer_affiliations tool registered"
   );
 
-  // (3) Exactly 9 tool registrations (4 base + 3 umbrella + 1 BM events from PR-56 + 1 geocode from PR-76)
+  // (3) Tool registrations: 9 original + 5 cart tools added in Phase 1 (orch-pr-20260614-6)
+  // Updated from 9 → 14: lokal_cart_create, lokal_cart_add_item, lokal_cart_view,
+  // lokal_cart_submit, lokal_order_status.
   const toolCount = (mcpSrc.match(/server\.registerTool\(/g) || []).length;
-  assertEq(toolCount, 9,
+  assertEq(toolCount, 14,
     "phase5.11-a7: src/routes/mcp.ts registers exactly 9 tools (4 base + 3 umbrella + 1 BM events from PR-56 + 1 geocode from PR-76)");
 
   // (4) DB-direct pattern: getDb() imported (no HTTP loopback for new tools)
@@ -15911,6 +15913,476 @@ const _orchPr20260614_5Promise: Promise<void> = new Promise<void>(r => { _orchPr
 })();
 
 
+
+// ── orch-pr-20260614-6: Phase 1 cart MVP ────────────────────────────────────
+console.log("\n── orch-pr-20260614-6: Phase 1 cart MVP ──");
+
+let _orchPr20260614_6Resolve: () => void = () => {};
+const _orchPr20260614_6Promise: Promise<void> = new Promise<void>(r => { _orchPr20260614_6Resolve = r; });
+
+(async () => {
+  // Wait for Phase 0 to finish so we know __setDbForTesting works
+  try { await _orchPr20260614_5Promise; } catch { /* recorded upstream */ }
+
+  const sqlite = require("better-sqlite3");
+  const cartDb = new sqlite(":memory:");
+
+  // ── Minimal schema (cart tables + dependencies) ───────────────────────────
+  cartDb.exec(`
+    CREATE TABLE agents (
+      id TEXT PRIMARY KEY,
+      name TEXT NOT NULL,
+      description TEXT NOT NULL DEFAULT '',
+      provider TEXT NOT NULL DEFAULT '',
+      contact_email TEXT NOT NULL DEFAULT '',
+      url TEXT NOT NULL DEFAULT '',
+      role TEXT NOT NULL DEFAULT 'producer',
+      api_key TEXT UNIQUE NOT NULL DEFAULT (hex(randomblob(8))),
+      is_active INTEGER DEFAULT 1,
+      city TEXT,
+      umbrella_type TEXT
+    );
+    CREATE TABLE agent_knowledge (
+      agent_id TEXT PRIMARY KEY,
+      products TEXT DEFAULT '[]',
+      verification_status TEXT NOT NULL DEFAULT 'unverified'
+    );
+    CREATE TABLE products (
+      id TEXT PRIMARY KEY,
+      agent_id TEXT NOT NULL,
+      name TEXT NOT NULL,
+      name_norm TEXT NOT NULL,
+      description TEXT,
+      unit TEXT,
+      price_nok REAL,
+      currency TEXT NOT NULL DEFAULT 'NOK',
+      availability TEXT NOT NULL DEFAULT 'in_stock',
+      stock_qty INTEGER,
+      category TEXT,
+      image_url TEXT,
+      source TEXT NOT NULL DEFAULT 'enrichment',
+      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+      UNIQUE(agent_id, name_norm)
+    );
+    CREATE TABLE carts (
+      id TEXT PRIMARY KEY,
+      buyer_ref TEXT NOT NULL,
+      buyer_kind TEXT NOT NULL DEFAULT 'platform_agent',
+      status TEXT NOT NULL DEFAULT 'open'
+                 CHECK(status IN ('open','submitted','cancelled','expired')),
+      currency TEXT NOT NULL DEFAULT 'NOK',
+      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+      expires_at TEXT
+    );
+    CREATE INDEX IF NOT EXISTS idx_carts_buyer_ref ON carts(buyer_ref);
+    CREATE TABLE cart_items (
+      id TEXT PRIMARY KEY,
+      cart_id TEXT NOT NULL REFERENCES carts(id) ON DELETE CASCADE,
+      product_id TEXT NOT NULL,
+      agent_id TEXT NOT NULL,
+      qty INTEGER NOT NULL CHECK(qty > 0),
+      unit_price_snapshot REAL,
+      line_note TEXT,
+      added_at TEXT NOT NULL DEFAULT (datetime('now')),
+      UNIQUE(cart_id, product_id)
+    );
+    CREATE INDEX IF NOT EXISTS idx_cart_items_cart_id ON cart_items(cart_id);
+    CREATE TABLE orders (
+      id TEXT PRIMARY KEY,
+      cart_id TEXT,
+      agent_id TEXT NOT NULL,
+      buyer_ref TEXT NOT NULL,
+      status TEXT NOT NULL DEFAULT 'pending'
+               CHECK(status IN ('pending','confirmed','declined','ready','completed','cancelled')),
+      fulfilment TEXT NOT NULL DEFAULT 'pickup',
+      pickup_time TEXT,
+      total_nok REAL,
+      confirm_token TEXT,
+      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+    CREATE INDEX IF NOT EXISTS idx_orders_cart_id  ON orders(cart_id);
+    CREATE INDEX IF NOT EXISTS idx_orders_agent_id ON orders(agent_id);
+    CREATE TABLE order_items (
+      id TEXT PRIMARY KEY,
+      order_id TEXT NOT NULL REFERENCES orders(id) ON DELETE CASCADE,
+      product_id TEXT,
+      name_snapshot TEXT,
+      qty INTEGER,
+      unit_price_snapshot REAL,
+      line_total REAL
+    );
+    CREATE INDEX IF NOT EXISTS idx_order_items_order_id ON order_items(order_id);
+  `);
+
+  // Set the shared DB singleton to our test DB
+  const initMod6 = await import("../src/database/init");
+  initMod6.__setDbForTesting(cartDb as any);
+  // Pin the module-local cart-service DB handle — this is the race-proof fix:
+  // concurrent test blocks re-pinning the global __setDbForTesting cannot
+  // clobber this handle, so every await inside the cart block is safe.
+  const { __setCartTestDb } = await import("../src/services/cart-service");
+  __setCartTestDb(cartDb as any);
+
+  // ── Seed two verified producers with products ─────────────────────────────
+  cartDb.prepare("INSERT INTO agents (id, name, city) VALUES (?, ?, ?)").run("ag-carrot", "Gangstad Gård", "Trondheim");
+  cartDb.prepare("INSERT INTO agent_knowledge (agent_id, verification_status) VALUES (?, 'verified')").run("ag-carrot");
+  cartDb.prepare("INSERT INTO products (id, agent_id, name, name_norm, price_nok, unit, availability) VALUES (?,?,?,?,?,?,?)").run(
+    "prod-carrot", "ag-carrot", "Gulrøtter", "gulrøtter", 30.0, "kg", "in_stock"
+  );
+
+  cartDb.prepare("INSERT INTO agents (id, name, city) VALUES (?, ?, ?)").run("ag-honey", "Biene Honning", "Bergen");
+  cartDb.prepare("INSERT INTO agent_knowledge (agent_id, verification_status) VALUES (?, 'verified')").run("ag-honey");
+  cartDb.prepare("INSERT INTO products (id, agent_id, name, name_norm, price_nok, unit, availability) VALUES (?,?,?,?,?,?,?)").run(
+    "prod-honey", "ag-honey", "Honning", "honning", 150.0, "glass", "in_stock"
+  );
+
+  // Seed an unverified producer and product
+  cartDb.prepare("INSERT INTO agents (id, name, city) VALUES (?, ?, ?)").run("ag-unverf", "Uverifisert Gård", "Oslo");
+  cartDb.prepare("INSERT INTO agent_knowledge (agent_id, verification_status) VALUES (?, 'unverified')").run("ag-unverf");
+  cartDb.prepare("INSERT INTO products (id, agent_id, name, name_norm, price_nok, availability) VALUES (?,?,?,?,?,?)").run(
+    "prod-unverf", "ag-unverf", "Urter", "urter", 50.0, "in_stock"
+  );
+
+  // Seed an umbrella producer
+  cartDb.prepare("INSERT INTO agents (id, name, city, umbrella_type) VALUES (?, ?, ?, ?)").run("ag-umbrella", "REKO Ring Test", "Oslo", "reko");
+  cartDb.prepare("INSERT INTO agent_knowledge (agent_id, verification_status) VALUES (?, 'verified')").run("ag-umbrella");
+  cartDb.prepare("INSERT INTO products (id, agent_id, name, name_norm, price_nok, availability) VALUES (?,?,?,?,?,?)").run(
+    "prod-umbrella", "ag-umbrella", "Noe", "noe", 100.0, "in_stock"
+  );
+
+  // Seed an out_of_stock product
+  cartDb.prepare("INSERT INTO products (id, agent_id, name, name_norm, price_nok, availability) VALUES (?,?,?,?,?,?)").run(
+    "prod-oos", "ag-carrot", "Tomater", "tomater", 25.0, "out_of_stock"
+  );
+
+  const ADMIN_KEY_6 = "test-cart-admin-key-phase1";
+  const prevAdminKey6 = process.env.ADMIN_KEY;
+  process.env.ADMIN_KEY = ADMIN_KEY_6;
+
+  // Build express app with cart routes
+  const expressMod6 = await import("express");
+  const cartMod = await import("../src/routes/marketplace-cart");
+  const http6 = await import("http");
+
+  const app6 = expressMod6.default();
+  app6.use(expressMod6.default.json());
+  app6.use("/api/marketplace", cartMod.cartRouter);
+  app6.use("/admin/marketplace", cartMod.adminOrderRouter);
+
+  const server6 = http6.createServer(app6);
+  await new Promise<void>((resolve) => server6.listen(0, "127.0.0.1", () => resolve()));
+  const addr6 = server6.address();
+  const port6 = typeof addr6 === "object" && addr6 ? addr6.port : 0;
+
+  function req6(
+    method: string,
+    urlPath: string,
+    opts: { headers?: Record<string, string>; body?: any } = {}
+  ): Promise<{ status: number; body: any }> {
+    return new Promise((resolve, reject) => {
+      const bodyStr = opts.body !== undefined ? JSON.stringify(opts.body) : undefined;
+      const headers: Record<string, string> = { ...(opts.headers || {}) };
+      if (bodyStr !== undefined) {
+        headers["Content-Type"] = "application/json";
+        headers["Content-Length"] = String(Buffer.byteLength(bodyStr));
+      }
+      const r = http6.request(
+        { method, host: "127.0.0.1", port: port6, path: urlPath, headers },
+        (resp) => {
+          const chunks: Buffer[] = [];
+          resp.on("data", (c) => chunks.push(c as Buffer));
+          resp.on("end", () => {
+            const raw = Buffer.concat(chunks).toString("utf8");
+            let parsed: any = null;
+            try { parsed = JSON.parse(raw); } catch { /* not JSON */ }
+            resolve({ status: resp.statusCode || 0, body: parsed });
+          });
+        }
+      );
+      r.on("error", reject);
+      if (bodyStr) r.write(bodyStr);
+      r.end();
+    });
+  }
+
+  // ── Test: create cart ────────────────────────────────────────────────────────
+  let cartId6 = "";
+  let buyerRef6 = "";
+  {
+    const r = await req6("POST", "/api/marketplace/cart");
+    assertEq(r.status, 201, "cart-01: create cart returns 201");
+    assertEq(r.body.success, true, "cart-02: create cart success=true");
+    assertTrue(typeof r.body.cart_id === "string" && r.body.cart_id.length > 0, "cart-03: cart_id is non-empty string");
+    assertTrue(typeof r.body.buyer_ref === "string" && r.body.buyer_ref.startsWith("bref_"), "cart-04: buyer_ref starts with bref_");
+    cartId6 = r.body.cart_id;
+    buyerRef6 = r.body.buyer_ref;
+  }
+
+  // ── Test: add 2 products from 2 producers ────────────────────────────────────
+  {
+    const r = await req6("POST", `/api/marketplace/cart/${cartId6}/items`, {
+      body: { product_id: "prod-carrot", qty: 2, buyer_ref: buyerRef6 },
+    });
+    assertEq(r.status, 200, "cart-05: add carrot item returns 200");
+    assertEq(r.body.success, true, "cart-06: add carrot success=true");
+  }
+  {
+    const r = await req6("POST", `/api/marketplace/cart/${cartId6}/items`, {
+      body: { product_id: "prod-honey", qty: 1, buyer_ref: buyerRef6 },
+    });
+    assertEq(r.status, 200, "cart-07: add honey item returns 200");
+    assertEq(r.body.success, true, "cart-08: add honey success=true");
+  }
+
+  // ── Test: view shows 2 groups + correct totals ───────────────────────────────
+  {
+    const r = await req6("GET", `/api/marketplace/cart/${cartId6}?buyer_ref=${buyerRef6}`);
+    assertEq(r.status, 200, "cart-09: view cart returns 200");
+    assertEq(r.body.success, true, "cart-10: view success=true");
+    assertEq(r.body.cart_id, cartId6, "cart-11: cart_id matches");
+    assertEq(r.body.item_count, 2, "cart-12: item_count is 2");
+    assertEq(r.body.groups.length, 2, `cart-13: 2 groups (got ${r.body.groups.length})`);
+    // total: 2*30 + 1*150 = 210
+    assertEq(r.body.total_nok, 210, `cart-14: total_nok is 210 (got ${r.body.total_nok})`);
+    // Carrot group: subtotal = 60
+    const carrotGroup = r.body.groups.find((g: any) => g.agent_id === "ag-carrot");
+    assertTrue(carrotGroup !== undefined, "cart-15: carrot group exists");
+    if (carrotGroup) assertEq(carrotGroup.subtotal_nok, 60, `cart-16: carrot subtotal is 60 (got ${carrotGroup.subtotal_nok})`);
+    // Honey group: subtotal = 150
+    const honeyGroup = r.body.groups.find((g: any) => g.agent_id === "ag-honey");
+    assertTrue(honeyGroup !== undefined, "cart-17: honey group exists");
+    if (honeyGroup) assertEq(honeyGroup.subtotal_nok, 150, `cart-18: honey subtotal is 150 (got ${honeyGroup.subtotal_nok})`);
+  }
+
+  // ── Test: add product from unverified producer → rejected ────────────────────
+  {
+    const r = await req6("POST", `/api/marketplace/cart/${cartId6}/items`, {
+      body: { product_id: "prod-unverf", qty: 1, buyer_ref: buyerRef6 },
+    });
+    assertEq(r.status, 403, `cart-19: unverified producer → 403 (got ${r.status})`);
+    assertEq(r.body.success, false, "cart-20: unverified producer success=false");
+  }
+
+  // ── Test: add product from umbrella → rejected ───────────────────────────────
+  {
+    const r = await req6("POST", `/api/marketplace/cart/${cartId6}/items`, {
+      body: { product_id: "prod-umbrella", qty: 1, buyer_ref: buyerRef6 },
+    });
+    assertEq(r.status, 403, `cart-21: umbrella producer → 403 (got ${r.status})`);
+  }
+
+  // ── Test: add out_of_stock product → rejected ────────────────────────────────
+  {
+    const r = await req6("POST", `/api/marketplace/cart/${cartId6}/items`, {
+      body: { product_id: "prod-oos", qty: 1, buyer_ref: buyerRef6 },
+    });
+    assertEq(r.status, 409, `cart-22: out_of_stock product → 409 (got ${r.status})`);
+    assertEq(r.body.success, false, "cart-23: out_of_stock success=false");
+  }
+
+  // ── Test: wrong token → 403 ──────────────────────────────────────────────────
+  {
+    const r = await req6("GET", `/api/marketplace/cart/${cartId6}?buyer_ref=wrong-token`);
+    assertEq(r.status, 403, `cart-24: wrong token on GET → 403 (got ${r.status})`);
+  }
+  {
+    const r = await req6("POST", `/api/marketplace/cart/${cartId6}/items`, {
+      body: { product_id: "prod-carrot", qty: 1, buyer_ref: "bad-token" },
+    });
+    assertEq(r.status, 403, `cart-25: wrong token on POST → 403 (got ${r.status})`);
+  }
+  {
+    const r = await req6("POST", `/api/marketplace/cart/${cartId6}/submit`, {
+      body: { buyer_ref: "bad-token" },
+    });
+    assertEq(r.status, 403, `cart-26: wrong token on submit → 403 (got ${r.status})`);
+  }
+
+  // ── Test: missing token → 403 ────────────────────────────────────────────────
+  {
+    const r = await req6("POST", `/api/marketplace/cart/${cartId6}/submit`);
+    assertEq(r.status, 403, `cart-27: missing token on submit → 403 (got ${r.status})`);
+  }
+
+  // ── Test: submit → creates one order per producer with correct totals ─────────
+  let order1Id = "";
+  let order2Id = "";
+  {
+    const r = await req6("POST", `/api/marketplace/cart/${cartId6}/submit`, {
+      body: { buyer_ref: buyerRef6 },
+    });
+    assertEq(r.status, 201, `cart-28: submit returns 201 (got ${r.status})`);
+    assertEq(r.body.success, true, "cart-29: submit success=true");
+    assertTrue(Array.isArray(r.body.orders), "cart-30: submit returns orders array");
+    assertEq(r.body.orders.length, 2, `cart-31: 2 orders created (got ${r.body.orders.length})`);
+
+    const carrotOrder = r.body.orders.find((o: any) => o.agent_id === "ag-carrot");
+    const honeyOrder  = r.body.orders.find((o: any) => o.agent_id === "ag-honey");
+    assertTrue(carrotOrder !== undefined, "cart-32: carrot order exists");
+    assertTrue(honeyOrder !== undefined, "cart-33: honey order exists");
+    if (carrotOrder) {
+      assertEq(carrotOrder.total_nok, 60, `cart-34: carrot order total is 60 (got ${carrotOrder.total_nok})`);
+      assertEq(carrotOrder.status, "pending", "cart-35: carrot order status=pending");
+      order1Id = carrotOrder.order_id;
+    }
+    if (honeyOrder) {
+      assertEq(honeyOrder.total_nok, 150, `cart-36: honey order total is 150 (got ${honeyOrder.total_nok})`);
+      order2Id = honeyOrder.order_id;
+    }
+
+    // Verify cart is now submitted
+    const cartRow = cartDb.prepare("SELECT status FROM carts WHERE id = ?").get(cartId6) as any;
+    assertEq(cartRow?.status, "submitted", "cart-37: cart status=submitted after submit");
+
+    // Verify order_items exist
+    const items1 = cartDb.prepare("SELECT * FROM order_items WHERE order_id = ?").all(order1Id) as any[];
+    assertEq(items1.length, 1, `cart-38: carrot order has 1 item (got ${items1.length})`);
+    if (items1[0]) {
+      assertEq(items1[0].qty, 2, `cart-39: carrot order_item qty=2 (got ${items1[0].qty})`);
+      assertEq(items1[0].name_snapshot, "Gulrøtter", `cart-40: name_snapshot captured (got ${items1[0].name_snapshot})`);
+      assertEq(items1[0].line_total, 60, `cart-41: carrot line_total=60 (got ${items1[0].line_total})`);
+    }
+  }
+
+  // ── Test: re-check at submit — mark product OOS after add, then submit ────────
+  {
+    // Create fresh cart
+    const c2 = await req6("POST", "/api/marketplace/cart");
+    const cartId2 = c2.body.cart_id;
+    const buyerRef2 = c2.body.buyer_ref;
+
+    // Add carrot (in_stock at add time)
+    await req6("POST", `/api/marketplace/cart/${cartId2}/items`, {
+      body: { product_id: "prod-carrot", qty: 1, buyer_ref: buyerRef2 },
+    });
+
+    // Mark it out_of_stock AFTER adding
+    cartDb.prepare("UPDATE products SET availability = 'out_of_stock' WHERE id = 'prod-carrot'").run();
+
+    // Submit should fail with clear unavailability message
+    const r = await req6("POST", `/api/marketplace/cart/${cartId2}/submit`, {
+      body: { buyer_ref: buyerRef2 },
+    });
+    assertEq(r.status, 409, `cart-42: submit rejects OOS product (got ${r.status})`);
+    assertEq(r.body.success, false, "cart-43: submit OOS success=false");
+    assertTrue(Array.isArray(r.body.unavailable), "cart-44: submit returns unavailable array");
+    assertEq(r.body.unavailable.length, 1, `cart-45: 1 unavailable item (got ${(r.body.unavailable || []).length})`);
+    const ua = r.body.unavailable[0];
+    if (ua) {
+      assertEq(ua.product_id, "prod-carrot", "cart-46: correct product_id in unavailable");
+      assertEq(ua.product_name, "Gulrøtter", "cart-47: correct product_name in unavailable");
+    }
+
+    // Restore availability for future tests
+    cartDb.prepare("UPDATE products SET availability = 'in_stock' WHERE id = 'prod-carrot'").run();
+  }
+
+  // ── Test: order status endpoint ──────────────────────────────────────────────
+  if (order1Id) {
+    const r = await req6("GET", `/api/marketplace/orders/${order1Id}?buyer_ref=${buyerRef6}`);
+    assertEq(r.status, 200, `cart-48: order status returns 200 (got ${r.status})`);
+    assertEq(r.body.success, true, "cart-49: order status success=true");
+    assertEq(r.body.order_id, order1Id, "cart-50: order_id matches");
+    assertEq(r.body.status, "pending", "cart-51: order status=pending");
+    assertEq(r.body.agent_id, "ag-carrot", "cart-52: order agent_id=ag-carrot");
+    assertTrue(Array.isArray(r.body.items), "cart-53: order has items array");
+    assertEq(r.body.items.length, 1, `cart-54: 1 order item (got ${r.body.items.length})`);
+  }
+
+  // ── Test: order status with wrong token → 403 ────────────────────────────────
+  if (order1Id) {
+    const r = await req6("GET", `/api/marketplace/orders/${order1Id}?buyer_ref=wrong-token`);
+    assertEq(r.status, 403, `cart-55: order status wrong token → 403 (got ${r.status})`);
+  }
+
+  // ── Test: admin lifecycle — confirm / decline transitions ────────────────────
+  if (order1Id) {
+    // confirm
+    const r1 = await req6("POST", `/admin/marketplace/orders/${order1Id}/confirm`, {
+      headers: { "x-admin-key": ADMIN_KEY_6 },
+    });
+    assertEq(r1.status, 200, `cart-56: admin confirm returns 200 (got ${r1.status})`);
+    assertEq(r1.body.success, true, "cart-57: confirm success=true");
+    assertEq(r1.body.status, "confirmed", `cart-58: status=confirmed (got ${r1.body.status})`);
+
+    const r2 = await req6("POST", `/admin/marketplace/orders/${order1Id}/ready`, {
+      headers: { "x-admin-key": ADMIN_KEY_6 },
+    });
+    assertEq(r2.status, 200, `cart-59: admin ready returns 200 (got ${r2.status})`);
+    assertEq(r2.body.status, "ready", `cart-60: status=ready (got ${r2.body.status})`);
+  }
+
+  if (order2Id) {
+    // decline
+    const r = await req6("POST", `/admin/marketplace/orders/${order2Id}/decline`, {
+      headers: { "x-admin-key": ADMIN_KEY_6 },
+    });
+    assertEq(r.status, 200, `cart-61: admin decline returns 200 (got ${r.status})`);
+    assertEq(r.body.status, "declined", `cart-62: status=declined (got ${r.body.status})`);
+
+    // declined → confirm should fail (invalid transition)
+    const r2 = await req6("POST", `/admin/marketplace/orders/${order2Id}/confirm`, {
+      headers: { "x-admin-key": ADMIN_KEY_6 },
+    });
+    assertEq(r2.status, 409, `cart-63: invalid transition declined→confirmed → 409 (got ${r2.status})`);
+  }
+
+  // ── Test: admin routes require admin key ─────────────────────────────────────
+  if (order1Id) {
+    const r = await req6("POST", `/admin/marketplace/orders/${order1Id}/complete`, {
+      headers: { "x-admin-key": "wrong-key" },
+    });
+    assertEq(r.status, 403, `cart-64: admin without key → 403 (got ${r.status})`);
+  }
+
+  // ── Forced-concurrency regression test ─────────────────────────────────────
+  // Prove that cart-service is immune to concurrent global __setDbForTesting
+  // re-pins. We deliberately re-pin the GLOBAL singleton to a fresh in-memory
+  // DB that has NO carts table (simulating another test block's interference),
+  // then run a full cart HTTP cycle through cart-service.  Because cart-service
+  // now reads _cartTestDb (our private module var) instead of getDb(), the
+  // global re-pin is irrelevant — all calls still hit cartDb.
+  // This test would FAIL on the old code and MUST PASS now.
+  {
+    const raceDb = new sqlite(":memory:");  // intentionally empty — no carts table
+    initMod6.__setDbForTesting(raceDb as any);  // simulate concurrent re-pin
+
+    // Create a fresh cart — goes through createCart() → _cartTestDb (cartDb)
+    const raceCreateR = await req6("POST", "/api/marketplace/cart");
+    assertEq(raceCreateR.status, 201, "cart-race-01: create cart still works after global re-pin (status 201)");
+    assertEq(raceCreateR.body.success, true, "cart-race-02: create cart success=true under global re-pin");
+    const raceCartId = raceCreateR.body.cart_id;
+    const raceBuyerRef = raceCreateR.body.buyer_ref;
+
+    // Add an item — exercises checkCartToken + addCartItem → _cartTestDb (cartDb)
+    const raceAddR = await req6("POST", `/api/marketplace/cart/${raceCartId}/items`, {
+      body: { product_id: "prod-carrot", qty: 1, buyer_ref: raceBuyerRef },
+    });
+    assertEq(raceAddR.status, 200, "cart-race-03: add item still works after global re-pin (status 200)");
+    assertEq(raceAddR.body.success, true, "cart-race-04: add item success=true under global re-pin");
+
+    // View cart — exercises viewCart → _cartTestDb (cartDb)
+    const raceViewR = await req6("GET", `/api/marketplace/cart/${raceCartId}?buyer_ref=${raceBuyerRef}`);
+    assertEq(raceViewR.status, 200, "cart-race-05: view cart still works after global re-pin (status 200)");
+    assertEq(raceViewR.body.item_count, 1, "cart-race-06: view cart shows 1 item under global re-pin");
+
+    // Restore the global pin so subsequent cleanup is consistent
+    initMod6.__setDbForTesting(cartDb as any);
+  }
+
+  server6.close();
+  // Reset the module-local cart-service DB handle so it does not affect
+  // any later test blocks that might dynamically import cart-service.
+  __setCartTestDb(null);
+  if (prevAdminKey6 === undefined) delete process.env.ADMIN_KEY;
+  else process.env.ADMIN_KEY = prevAdminKey6;
+
+  _orchPr20260614_6Resolve();
+})();
+
 (async () => {
   try { await Promise.all(_pr21Promises); } catch { /* errors already pushed to failures */ }
   try { await _m2Promise; } catch { /* errors already pushed to failures */ }
@@ -15938,6 +16410,7 @@ const _orchPr20260614_5Promise: Promise<void> = new Promise<void>(r => { _orchPr
   try { await _orchPr20260614_2Promise; } catch { /* errors already pushed to failures */ }
   try { await _orchPr20260614Promise; } catch { /* errors already pushed to failures */ }
   try { await _orchPr20260614_5Promise; } catch { /* errors already pushed to failures */ }
+  try { await _orchPr20260614_6Promise; } catch { /* errors already pushed to failures */ }
   // PR-109 tests are synchronous (IIFE) — no promise needed
   // Drop pre-existing intg failures (unmasked by awaiting) — they predate M2
   // and live behind a separate fix-it task. Counting them here would surface

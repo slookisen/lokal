@@ -89,6 +89,7 @@ router.get("/a2a", (_req: Request, res: Response) => {
       skills: [
         { id: "discover-local-food-agents", name: "Discover Local Food Agents", description: `Search ${agents.length}+ verified local food producers in Norway`, tags: ["local food", "organic", "farm direct", "Norway"], examples: ["Find organic farms near Oslo", "finn grønnsaker i Bergen"] },
         { id: "agent-conversation", name: "Start Agent Negotiation", description: "Initiate buyer-seller conversation between agents", tags: ["negotiate", "order", "transaction"], examples: ["negotiate delivery of tomatoes"] },
+        { id: "build-shopping-cart", name: "Build a shopping cart", description: "Add local-food products from one or more producers to a cart and place a pickup order (no payment yet).", tags: ["cart", "order", "local food", "pickup"], examples: ["legg 2 kg gulrøtter fra Gangstad i handlekurven", "place a pickup order for honning"] },
       ],
       "x-lokal": { type: "registry", region: "Norway", stats: { totalAgents: agents.length, cities: cities.slice(0, 30) } },
     };
