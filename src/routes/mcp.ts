@@ -24,6 +24,14 @@ import { slugify } from "../utils/slug";
 import { addAiUtmParams } from "../utils/url-utm";
 import { getDb } from "../database/init";
 import { geocodingService } from "../services/geocoding-service";
+import {
+  createCart as svcCreateCart,
+  checkCartToken as svcCheckCartToken,
+  addCartItem as svcAddCartItem,
+  viewCart as svcViewCart,
+  submitCart as svcSubmitCart,
+  getOrder as svcGetOrder,
+} from "../services/cart-service";
 
 
 import { conversationService } from "../services/conversation-service";
@@ -697,6 +705,164 @@ function registerTools(server: McpServer, getClientIdentity?: () => string | und
           text: `📍 ${result.name}\nlat: ${result.lat}\nlng: ${result.lng}\nradius_km: ${result.radiusKm}\nsource: ${result.source}`,
         }],
       };
+    }
+  );
+
+  // ─── Cart tools (Phase 1) ────────────────────────────────────
+  // Tools 10-14: shopping cart ("handleliste") for local food pickup orders.
+  // No payment. No seller notification. Anonymous buyer (buyer_ref token).
+
+  // Tool 10: Create a cart
+  server.registerTool(
+    "lokal_cart_create",
+    {
+      title: "Create a shopping cart",
+      description: "Create a new anonymous shopping cart ('handleliste'). Returns a cart_id and a buyer_ref capability token — STORE THE buyer_ref, it is required for all subsequent cart operations and cannot be recovered. Each cart is valid for 7 days. Use lokal_cart_add_item to add products, lokal_cart_view to review, and lokal_cart_submit to place orders (pickup, no payment).",
+      inputSchema: {},
+      annotations: {
+        title: "Create shopping cart",
+        readOnlyHint: false,
+        destructiveHint: false,
+        idempotentHint: false,
+        openWorldHint: false,
+      },
+    },
+    async () => {
+      try {
+        const result = svcCreateCart();
+        return {
+          content: [{
+            type: "text" as const,
+            text: JSON.stringify({ success: true, ...result }, null, 2),
+          }],
+        };
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        return { content: [{ type: "text" as const, text: JSON.stringify({ success: false, error: msg }) }] };
+      }
+    }
+  );
+
+  // Tool 11: Add item to cart
+  server.registerTool(
+    "lokal_cart_add_item",
+    {
+      title: "Add item to shopping cart",
+      description: "Add a product to the cart or update its quantity (re-adding the same product_id updates qty). Product must be in_stock and from a verified non-umbrella producer (use lokal_search / catalog feed to find eligible products and their IDs). Requires cart_id and buyer_ref from lokal_cart_create.",
+      inputSchema: {
+        cart_id:    z.string().describe("Cart ID from lokal_cart_create"),
+        buyer_ref:  z.string().describe("Buyer capability token from lokal_cart_create"),
+        product_id: z.string().describe("Product ID from the catalog (products.id)"),
+        qty:        z.number().int().positive().describe("Quantity to set for this product in the cart"),
+        note:       z.string().optional().describe("Optional line note for this item (e.g. 'please keep cold')"),
+      },
+      annotations: {
+        title: "Add cart item",
+        readOnlyHint: false,
+        destructiveHint: false,
+        idempotentHint: false,
+        openWorldHint: false,
+      },
+    },
+    async ({ cart_id, buyer_ref, product_id, qty, note }) => {
+      const check = svcCheckCartToken(cart_id, buyer_ref);
+      if (!check.ok) {
+        return { content: [{ type: "text" as const, text: JSON.stringify({ success: false, error: check.error }) }] };
+      }
+      const result = svcAddCartItem(cart_id, product_id, qty, note);
+      if (!result.success) {
+        return { content: [{ type: "text" as const, text: JSON.stringify({ success: false, error: result.error }) }] };
+      }
+      const cart = svcViewCart(cart_id);
+      return {
+        content: [{
+          type: "text" as const,
+          text: JSON.stringify({ success: true, item: result.item, cart }, null, 2),
+        }],
+      };
+    }
+  );
+
+  // Tool 12: View cart
+  server.registerTool(
+    "lokal_cart_view",
+    {
+      title: "View shopping cart",
+      description: "View the current contents of a cart, grouped by producer, with subtotals and a total. Use this before submitting to review what is in the cart. Requires cart_id and buyer_ref.",
+      inputSchema: {
+        cart_id:   z.string().describe("Cart ID from lokal_cart_create"),
+        buyer_ref: z.string().describe("Buyer capability token from lokal_cart_create"),
+      },
+      annotations: {
+        title: "View cart",
+        readOnlyHint: true,
+        destructiveHint: false,
+        idempotentHint: true,
+        openWorldHint: false,
+      },
+    },
+    async ({ cart_id, buyer_ref }) => {
+      const check = svcCheckCartToken(cart_id, buyer_ref);
+      if (!check.ok) {
+        return { content: [{ type: "text" as const, text: JSON.stringify({ success: false, error: check.error }) }] };
+      }
+      const cart = svcViewCart(cart_id);
+      if (!cart) {
+        return { content: [{ type: "text" as const, text: JSON.stringify({ success: false, error: "Cart not found" }) }] };
+      }
+      return { content: [{ type: "text" as const, text: JSON.stringify(cart, null, 2) }] };
+    }
+  );
+
+  // Tool 13: Submit cart → place pickup orders
+  server.registerTool(
+    "lokal_cart_submit",
+    {
+      title: "Submit cart and place pickup orders",
+      description: "Submit the cart to create pickup orders — one order per producer. Re-checks availability of every item at submit time; if any item is no longer in_stock, submit is rejected with a clear per-item message. No payment is charged. Sellers are not notified (Phase 1 internal-only). Returns a list of order IDs per producer. Use lokal_order_status to check order status.",
+      inputSchema: {
+        cart_id:   z.string().describe("Cart ID to submit"),
+        buyer_ref: z.string().describe("Buyer capability token"),
+      },
+      annotations: {
+        title: "Submit cart",
+        readOnlyHint: false,
+        destructiveHint: false,
+        idempotentHint: false,
+        openWorldHint: false,
+      },
+    },
+    async ({ cart_id, buyer_ref }) => {
+      const check = svcCheckCartToken(cart_id, buyer_ref);
+      if (!check.ok) {
+        return { content: [{ type: "text" as const, text: JSON.stringify({ success: false, error: check.error }) }] };
+      }
+      const result = svcSubmitCart(cart_id);
+      return { content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }] };
+    }
+  );
+
+  // Tool 14: Order status
+  server.registerTool(
+    "lokal_order_status",
+    {
+      title: "Get order status",
+      description: "Fetch the status and items of a pickup order created by lokal_cart_submit. Requires the order_id returned by submit and the buyer_ref token. Status: pending → confirmed → ready → completed (or declined/cancelled).",
+      inputSchema: {
+        order_id:  z.string().describe("Order ID from lokal_cart_submit"),
+        buyer_ref: z.string().describe("Buyer capability token (same as used for the cart)"),
+      },
+      annotations: {
+        title: "Order status",
+        readOnlyHint: true,
+        destructiveHint: false,
+        idempotentHint: true,
+        openWorldHint: false,
+      },
+    },
+    async ({ order_id, buyer_ref }) => {
+      const result = svcGetOrder(order_id, buyer_ref);
+      return { content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }] };
     }
   );
 
