@@ -1961,6 +1961,36 @@ function initSchema(db: Database.Database): void {
     db.exec(`CREATE INDEX IF NOT EXISTS idx_agents_debio_verified ON agents(debio_verified) WHERE debio_verified = 1`);
   } catch { /* partial index unsupported or already created */ }
 
+
+  // ─── Phase 0 (orch-pr-20260614-5): products catalog table ────────────────
+  // Queryable product catalog seeded from agent_knowledge.products via
+  // POST /admin/products/backfill. Availability field defaults to 'in_stock'
+  // for backfill rows; Phase 1 will add cart + delivery windows.
+  //
+  // UNIQUE(agent_id, name_norm) ensures idempotent upserts: re-running
+  // backfill updates price/category but never creates duplicate rows.
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS products (
+      id           TEXT PRIMARY KEY,
+      agent_id     TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+      name         TEXT NOT NULL,
+      name_norm    TEXT NOT NULL,
+      description  TEXT,
+      unit         TEXT,
+      price_nok    REAL,
+      currency     TEXT NOT NULL DEFAULT 'NOK',
+      availability TEXT NOT NULL DEFAULT 'in_stock',
+      stock_qty    INTEGER,
+      category     TEXT,
+      image_url    TEXT,
+      source       TEXT NOT NULL DEFAULT 'enrichment',
+      created_at   TEXT NOT NULL DEFAULT (datetime('now')),
+      updated_at   TEXT NOT NULL DEFAULT (datetime('now'))
+    )
+  `);
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_products_agent_id ON products(agent_id)`);
+  db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_products_agent_name_norm ON products(agent_id, name_norm)`);
+
 }
 
 export function closeDb(): void {

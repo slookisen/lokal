@@ -15539,6 +15539,274 @@ const _orchPr20260614Promise: Promise<void> = new Promise<void>(r => { _orchPr20
 })();
 
 
+// ── orch-pr-20260614-5: Phase 0 product catalog ──────────────────────────────
+console.log("\n── orch-pr-20260614-5: Phase 0 product catalog ──");
+
+let _orchPr20260614_5Resolve: () => void = () => {};
+const _orchPr20260614_5Promise: Promise<void> = new Promise<void>(r => { _orchPr20260614_5Resolve = r; });
+
+(async () => {
+  // Wait for prior DB-mutating IIFEs to finish before taking the DB singleton
+  try { await _orchPr86Promise; } catch { /* recorded upstream */ }
+  try { await _orchPr93Promise; } catch { /* recorded upstream */ }
+  try { await _orchPr20260614Promise; } catch { /* recorded upstream */ }
+  try { await _orchPr20260614_2Promise; } catch { /* recorded upstream */ }
+
+  const sqlite = require("better-sqlite3");
+  const catDb = new sqlite(":memory:");
+
+  // ── Minimal schema for catalog tests ─────────────────────────────────────────
+  catDb.exec(`
+    CREATE TABLE agents (
+      id TEXT PRIMARY KEY,
+      name TEXT NOT NULL,
+      description TEXT NOT NULL DEFAULT '',
+      provider TEXT NOT NULL DEFAULT '',
+      contact_email TEXT NOT NULL DEFAULT '',
+      url TEXT NOT NULL DEFAULT '',
+      role TEXT NOT NULL DEFAULT 'producer',
+      api_key TEXT UNIQUE NOT NULL DEFAULT (hex(randomblob(8))),
+      is_active INTEGER DEFAULT 1,
+      city TEXT,
+      umbrella_type TEXT
+    );
+    CREATE TABLE agent_knowledge (
+      agent_id TEXT PRIMARY KEY,
+      products TEXT DEFAULT '[]',
+      verification_status TEXT NOT NULL DEFAULT 'unverified'
+    );
+    CREATE TABLE products (
+      id TEXT PRIMARY KEY,
+      agent_id TEXT NOT NULL,
+      name TEXT NOT NULL,
+      name_norm TEXT NOT NULL,
+      description TEXT,
+      unit TEXT,
+      price_nok REAL,
+      currency TEXT NOT NULL DEFAULT 'NOK',
+      availability TEXT NOT NULL DEFAULT 'in_stock',
+      stock_qty INTEGER,
+      category TEXT,
+      image_url TEXT,
+      source TEXT NOT NULL DEFAULT 'enrichment',
+      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+      UNIQUE(agent_id, name_norm)
+    );
+    CREATE INDEX IF NOT EXISTS idx_products_agent_id ON products(agent_id);
+  `);
+
+  // Set the shared DB to our in-memory db
+  const initMod5 = await import("../src/database/init");
+  initMod5.__setDbForTesting(catDb as any);
+
+  const ADMIN_KEY_5 = "test-catalog-admin-key-phase0";
+  const prevAdminKey5 = process.env.ADMIN_KEY;
+  process.env.ADMIN_KEY = ADMIN_KEY_5;
+
+  // ── Seed data ────────────────────────────────────────────────────────────────
+  // agent-verified: verified, no umbrella — should appear in feed
+  catDb.prepare("INSERT INTO agents (id, name, city, umbrella_type) VALUES (?, ?, ?, ?)").run(
+    "cat-verified", "Hjortegården Gård", "Hamar", null
+  );
+  catDb.prepare("INSERT INTO agent_knowledge (agent_id, products, verification_status) VALUES (?, ?, ?)").run(
+    "cat-verified",
+    JSON.stringify([
+      { name: "Lammelår – kr 275/kg", category: "meat" },
+      { name: "Lammekjøttdeig – kr 185/kg", category: "meat" },
+      { name: "HODER OG BEN", category: "other" },  // header — should be skipped
+      { name: "❌ Tomt for lam", category: "other" }, // noise — should be skipped
+    ]),
+    "verified"
+  );
+
+  // agent-unverified: unverified — should NOT appear in feed
+  catDb.prepare("INSERT INTO agents (id, name, city, umbrella_type) VALUES (?, ?, ?, ?)").run(
+    "cat-unverified", "Uverifisert Gård", "Oslo", null
+  );
+  catDb.prepare("INSERT INTO agent_knowledge (agent_id, products, verification_status) VALUES (?, ?, ?)").run(
+    "cat-unverified",
+    JSON.stringify([{ name: "Ost", category: "dairy", price: "150" }]),
+    "unverified"
+  );
+
+  // agent-umbrella: verified but has umbrella_type — should NOT appear in feed
+  catDb.prepare("INSERT INTO agents (id, name, city, umbrella_type) VALUES (?, ?, ?, ?)").run(
+    "cat-umbrella", "REKO-ring Oslo", "Oslo", "reko"
+  );
+  catDb.prepare("INSERT INTO agent_knowledge (agent_id, products, verification_status) VALUES (?, ?, ?)").run(
+    "cat-umbrella",
+    JSON.stringify([{ name: "Bær", category: "berries", price: "90" }]),
+    "verified"
+  );
+
+  // Build express app with catalog routes
+  const expressMod5 = await import("express");
+  const catalogMod = await import("../src/routes/marketplace-catalog");
+  const http5 = await import("http");
+
+  const app5 = expressMod5.default();
+  app5.use(expressMod5.default.json());
+  app5.use("/api/marketplace/catalog", catalogMod.catalogRouter);
+  app5.use("/admin/products", catalogMod.adminCatalogRouter);
+
+  const server5 = http5.createServer(app5);
+  await new Promise<void>((resolve) => server5.listen(0, "127.0.0.1", () => resolve()));
+  const addr5 = server5.address();
+  const port5 = typeof addr5 === "object" && addr5 ? addr5.port : 0;
+
+  function req5(
+    method: string,
+    urlPath: string,
+    opts: { headers?: Record<string, string>; body?: any } = {}
+  ): Promise<{ status: number; body: any }> {
+    return new Promise((resolve, reject) => {
+      const bodyStr = opts.body !== undefined ? JSON.stringify(opts.body) : undefined;
+      const headers: Record<string, string> = { "x-admin-key": ADMIN_KEY_5, ...(opts.headers || {}) };
+      if (bodyStr !== undefined) {
+        headers["Content-Type"] = "application/json";
+        headers["Content-Length"] = String(Buffer.byteLength(bodyStr));
+      }
+      const r = http5.request(
+        { method, host: "127.0.0.1", port: port5, path: urlPath, headers },
+        (resp) => {
+          const chunks: Buffer[] = [];
+          resp.on("data", (c) => chunks.push(c as Buffer));
+          resp.on("end", () => {
+            const raw = Buffer.concat(chunks).toString("utf8");
+            let parsed: any = null;
+            try { parsed = JSON.parse(raw); } catch { /* not JSON */ }
+            resolve({ status: resp.statusCode || 0, body: parsed });
+          });
+        }
+      );
+      r.on("error", reject);
+      if (bodyStr) r.write(bodyStr);
+      r.end();
+    });
+  }
+
+  // ── Test 1: backfill inserts rows ────────────────────────────────────────────
+  {
+    const r = await req5("POST", "/admin/products/backfill");
+    assertEq(r.status, 200, "cat-01: backfill returns 200");
+    assertEq(r.body.success, true, "cat-02: backfill success=true");
+    // 3 agents have products: verified (2 real + 1 header + 1 noise), unverified (1), umbrella (1)
+    // skipped: header + noise = 2; inserted: 2+1+1 = 4 real products
+    assertTrue(r.body.agents_processed >= 3, `cat-03: agents_processed >= 3 (got ${r.body.agents_processed})`);
+    assertTrue(r.body.inserted >= 4, `cat-04: inserted >= 4 (got ${r.body.inserted})`);
+    assertEq(r.body.skipped >= 2, true, `cat-05: skipped >= 2 (header+noise, got ${r.body.skipped})`);
+  }
+
+  // ── Test 2: backfill is idempotent — re-run doesn't duplicate ───────────────
+  {
+    const countBefore = (catDb.prepare("SELECT COUNT(*) AS c FROM products").get() as { c: number }).c;
+    const r = await req5("POST", "/admin/products/backfill");
+    assertEq(r.status, 200, "cat-06: idempotent backfill returns 200");
+    assertEq(r.body.success, true, "cat-07: idempotent backfill success=true");
+    const countAfter = (catDb.prepare("SELECT COUNT(*) AS c FROM products").get() as { c: number }).c;
+    assertEq(countBefore, countAfter, `cat-08: row count stable after re-run (${countBefore} == ${countAfter})`);
+    assertEq(r.body.inserted, 0, `cat-09: re-run inserted=0 (all were updates, got ${r.body.inserted})`);
+  }
+
+  // ── Test 3: name_norm dedupe — same name different case → one row ────────────
+  {
+    // Seed extra agent with same product in different case
+    catDb.prepare("INSERT INTO agents (id, name, city, umbrella_type) VALUES (?, ?, ?, ?)").run(
+      "cat-dedup", "Deduplicated Gård", "Bergen", null
+    );
+    catDb.prepare("INSERT INTO agent_knowledge (agent_id, products, verification_status) VALUES (?, ?, ?)").run(
+      "cat-dedup",
+      JSON.stringify([
+        { name: "Villaks", category: "fish", price: "200" },
+        { name: "VILLAKS", category: "fish", price: "210" },   // same name, different case
+        { name: "villaks", category: "fish", price: "220" },   // same name, all lower
+      ]),
+      "verified"
+    );
+    const r = await req5("POST", "/admin/products/backfill");
+    assertEq(r.status, 200, "cat-10: dedup backfill returns 200");
+    const dedup_rows = catDb.prepare("SELECT COUNT(*) AS c FROM products WHERE agent_id = 'cat-dedup'").get() as { c: number };
+    assertEq(dedup_rows.c, 1, `cat-11: only 1 product row for cat-dedup (name_norm dedupe, got ${dedup_rows.c})`);
+  }
+
+  // ── Test 4: feed returns only verified non-umbrella products ─────────────────
+  {
+    const r = await req5("GET", "/api/marketplace/catalog/feed");
+    assertEq(r.status, 200, "cat-12: feed returns 200");
+    assertEq(r.body.success, true, "cat-13: feed success=true");
+    assertTrue(typeof r.body.count === "number", "cat-14: feed has count");
+    assertTrue(Array.isArray(r.body.items), "cat-15: feed has items array");
+
+    const agentIds = r.body.items.map((i: any) => i.seller?.agent_id);
+    assertTrue(agentIds.includes("cat-verified"), "cat-16: verified agent in feed");
+    assertTrue(!agentIds.includes("cat-unverified"), "cat-17: unverified agent excluded from feed");
+    assertTrue(!agentIds.includes("cat-umbrella"), "cat-18: umbrella agent excluded from feed");
+  }
+
+  // ── Test 5: feed item shape matches ACP spec ─────────────────────────────────
+  {
+    const r = await req5("GET", "/api/marketplace/catalog/feed");
+    const item = r.body.items.find((i: any) => i.seller?.agent_id === "cat-verified");
+    assertTrue(item !== undefined, "cat-19: verified agent product found in feed");
+    if (item) {
+      assertTrue(typeof item.id === "string", "cat-20: item has string id");
+      assertTrue(typeof item.title === "string", "cat-21: item has title");
+      assertTrue(item.price !== undefined, "cat-22: item has price object");
+      assertTrue(item.price.currency === "NOK", "cat-23: price.currency is NOK");
+      assertTrue(item.seller !== undefined, "cat-24: item has seller");
+      assertTrue(typeof item.seller.agent_id === "string", "cat-25: seller.agent_id is string");
+      assertTrue(typeof item.seller.name === "string", "cat-26: seller.name is string");
+      assertTrue(typeof item.seller.profile_url === "string", "cat-27: seller.profile_url is string");
+      assertTrue(item.seller.profile_url.includes("/produsent/"), "cat-28: profile_url contains /produsent/");
+      assertTrue("availability" in item, "cat-29: item has availability");
+      assertTrue("category" in item, "cat-30: item has category field");
+    }
+  }
+
+  // ── Test 6: feed respects limit/offset ───────────────────────────────────────
+  {
+    const r = await req5("GET", "/api/marketplace/catalog/feed?limit=1&offset=0");
+    assertEq(r.status, 200, "cat-31: feed with limit=1 returns 200");
+    assertEq(r.body.items.length, 1, `cat-32: limit=1 returns exactly 1 item (got ${r.body.items.length})`);
+    assertTrue(r.body.total >= 1, "cat-33: total >= 1");
+    assertEq(r.body.count, 1, "cat-34: count matches items.length");
+  }
+
+  // ── Test 7: per-agent products endpoint ──────────────────────────────────────
+  {
+    const r = await req5("GET", "/api/marketplace/catalog/agents/cat-verified/products");
+    assertEq(r.status, 200, "cat-35: per-agent products returns 200");
+    assertEq(r.body.success, true, "cat-36: per-agent success=true");
+    assertEq(r.body.agent_id, "cat-verified", "cat-37: agent_id matches");
+    assertTrue(typeof r.body.count === "number", "cat-38: per-agent has count");
+    assertTrue(Array.isArray(r.body.products), "cat-39: per-agent has products array");
+    assertEq(r.body.count, r.body.products.length, "cat-40: count matches products.length");
+    // The 2 real products from Hjortegården should be there
+    assertEq(r.body.count, 2, `cat-41: cat-verified has 2 products (got ${r.body.count})`);
+  }
+
+  // ── Test 8: per-agent products for unknown agent → 404 ───────────────────────
+  {
+    const r = await req5("GET", "/api/marketplace/catalog/agents/nonexistent-id/products");
+    assertEq(r.status, 404, "cat-42: unknown agent → 404");
+    assertEq(r.body.success, false, "cat-43: unknown agent success=false");
+  }
+
+  // ── Test 9: backfill requires admin key ──────────────────────────────────────
+  {
+    const r = await req5("POST", "/admin/products/backfill", { headers: { "x-admin-key": "wrong-key" } });
+    assertEq(r.status, 403, "cat-44: backfill without valid admin key → 403");
+  }
+
+  server5.close();
+  if (prevAdminKey5 === undefined) delete process.env.ADMIN_KEY;
+  else process.env.ADMIN_KEY = prevAdminKey5;
+
+  _orchPr20260614_5Resolve();
+})();
+
+
 (async () => {
   try { await Promise.all(_pr21Promises); } catch { /* errors already pushed to failures */ }
   try { await _m2Promise; } catch { /* errors already pushed to failures */ }
@@ -15565,6 +15833,7 @@ const _orchPr20260614Promise: Promise<void> = new Promise<void>(r => { _orchPr20
   try { await _platformVerifierPromise; } catch { /* errors already pushed to failures */ }
   try { await _orchPr20260614_2Promise; } catch { /* errors already pushed to failures */ }
   try { await _orchPr20260614Promise; } catch { /* errors already pushed to failures */ }
+  try { await _orchPr20260614_5Promise; } catch { /* errors already pushed to failures */ }
   // PR-109 tests are synchronous (IIFE) — no promise needed
   // Drop pre-existing intg failures (unmasked by awaiting) — they predate M2
   // and live behind a separate fix-it task. Counting them here would surface
