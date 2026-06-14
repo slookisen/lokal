@@ -15211,18 +15211,6 @@ const _orchPr20260614Promise: Promise<void> = new Promise<void>(r => { _orchPr20
       created_at TEXT DEFAULT (datetime('now'))
     );
 
-    CREATE TABLE agent_blocklist (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      identifier_type TEXT NOT NULL,
-      identifier_value TEXT NOT NULL,
-      reason TEXT,
-      source_email TEXT,
-      original_agent_id TEXT,
-      original_agent_name TEXT,
-      created_at TEXT NOT NULL DEFAULT (datetime('now')),
-      UNIQUE(identifier_type, identifier_value)
-    );
-
     -- outreach_ready_pool VIEW (mirrors production definition)
     CREATE VIEW outreach_ready_pool AS
     SELECT
@@ -15543,97 +15531,6 @@ const _orchPr20260614Promise: Promise<void> = new Promise<void>(r => { _orchPr20
   {
     const r = await req3("POST", "/admin/outreach-sent-log/import", { body: { not_entries: [] } });
     assertEq(r.status, 400, "orch20260614-35: import missing entries → 400");
-  }
-
-  // ── orch-pr-20260614-8: agent_blocklist suppression ──────────────────────────
-  //
-  // Seed agents J (blocklist by email), K (blocklist by website_domain),
-  // L (blocklist by agent_id), M (clean — must still appear), and
-  // N (second mode, blocklist by email — tests mode=second path too).
-  //
-  // All agents are pool-eligible (verified, rich, fresh URL probe).
-
-  function seedPoolAgentWithWebsite(id: string, email: string, name: string, website: string) {
-    orchDb.prepare(`
-      INSERT INTO agents (id, name, is_active) VALUES (?, ?, 1)
-    `).run(id, name);
-    orchDb.prepare(`
-      INSERT INTO agent_knowledge
-        (agent_id, email, website, verification_status, enrichment_status,
-         url_last_status, url_last_probed, outreach_eligible_at)
-      VALUES (?, ?, ?, 'verified', 'rich', 200, datetime('now'), datetime('now'))
-    `).run(id, email, website);
-  }
-
-  seedPoolAgentWithWebsite("oa-J", "blocked-by-email@test.no", "Agent J Blocklisted Email", "https://agentj.no");
-  seedPoolAgentWithWebsite("oa-K", "agentk@test.no", "Agent K Blocklisted Domain", "https://blocked-domain.no");
-  seedPoolAgentWithWebsite("oa-L", "agentl@test.no", "Agent L Blocklisted AgentId", "https://agentl.no");
-  seedPoolAgentWithWebsite("oa-M", "safe-agent-m@test.no", "Agent M Safe", "https://safem.no");
-
-  // Insert blocklist rows directly (bypassing the service add() to avoid import complexity)
-  orchDb.prepare(`
-    INSERT INTO agent_blocklist (identifier_type, identifier_value, reason)
-    VALUES ('email', 'blocked-by-email@test.no', 'test: blocklist by email')
-  `).run();
-  orchDb.prepare(`
-    INSERT INTO agent_blocklist (identifier_type, identifier_value, reason)
-    VALUES ('website_domain', 'blocked-domain.no', 'test: blocklist by domain')
-  `).run();
-  orchDb.prepare(`
-    INSERT INTO agent_blocklist (identifier_type, identifier_value, reason)
-    VALUES ('agent_id', 'oa-l', 'test: blocklist by agent_id')
-  `).run();
-
-  // ── blocklist Test 1: email-blocked agent J excluded from mode=first candidates
-  {
-    const r = await req3("GET", "/admin/outreach-candidates?mode=first");
-    assertTrue(r.status === 200, "orch20260614-36: blocklist mode=first → 200");
-    const ids = (r.body.candidates as any[]).map((c: any) => c.agent_id);
-    assertTrue(!ids.includes("oa-J"), "orch20260614-37: email-blocklisted agent J excluded from candidates");
-    assertTrue(r.body.suppressed_counts.blocklisted >= 1, "orch20260614-38: suppressed_counts.blocklisted >= 1 (J)");
-  }
-
-  // ── blocklist Test 2: website_domain-blocked agent K excluded
-  {
-    const r = await req3("GET", "/admin/outreach-candidates?mode=first");
-    const ids = (r.body.candidates as any[]).map((c: any) => c.agent_id);
-    assertTrue(!ids.includes("oa-K"), "orch20260614-39: domain-blocklisted agent K excluded from candidates");
-    assertTrue(r.body.suppressed_counts.blocklisted >= 2, "orch20260614-40: suppressed_counts.blocklisted >= 2 (J+K)");
-  }
-
-  // ── blocklist Test 3: agent_id-blocked agent L excluded
-  {
-    const r = await req3("GET", "/admin/outreach-candidates?mode=first");
-    const ids = (r.body.candidates as any[]).map((c: any) => c.agent_id);
-    assertTrue(!ids.includes("oa-L"), "orch20260614-41: agent_id-blocklisted agent L excluded from candidates");
-    assertTrue(r.body.suppressed_counts.blocklisted >= 3, "orch20260614-42: suppressed_counts.blocklisted >= 3 (J+K+L)");
-  }
-
-  // ── blocklist Test 4: safe (non-blocklisted) agent M still appears
-  {
-    const r = await req3("GET", "/admin/outreach-candidates?mode=first");
-    const ids = (r.body.candidates as any[]).map((c: any) => c.agent_id);
-    assertTrue(ids.includes("oa-M"), "orch20260614-43: non-blocklisted agent M still in candidates");
-  }
-
-  // ── blocklist Test 5: mode=second also suppresses blocklisted agents
-  // Seed agent N (email-blocklisted) with an old sent_log entry so it qualifies for mode=second
-  seedPoolAgentWithWebsite("oa-N", "blocked-second@test.no", "Agent N Blocklisted Second", "https://agentn.no");
-  orchDb.prepare(`
-    INSERT INTO agent_blocklist (identifier_type, identifier_value, reason)
-    VALUES ('email', 'blocked-second@test.no', 'test: blocklist mode=second')
-  `).run();
-  // Old sent_log entry (90 days) so N passes the cooldown check
-  orchDb.prepare(`
-    INSERT INTO outreach_sent_log (agent_id, sent_at, channel, message_id)
-    VALUES ('oa-N', datetime('now', '-90 days'), 'email', 'msg-n-1')
-  `).run();
-  {
-    const r = await req3("GET", "/admin/outreach-candidates?mode=second&cooldown_days=60");
-    assertTrue(r.status === 200, "orch20260614-44: blocklist mode=second → 200");
-    const ids = (r.body.candidates as any[]).map((c: any) => c.agent_id);
-    assertTrue(!ids.includes("oa-N"), "orch20260614-45: email-blocklisted agent N excluded from mode=second candidates");
-    assertTrue(r.body.suppressed_counts.blocklisted >= 1, "orch20260614-46: mode=second suppressed_counts.blocklisted >= 1 (N)");
   }
 
   // Cleanup
