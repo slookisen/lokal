@@ -13,6 +13,8 @@
 //                          agent_knowledge.verification_status = 'opt_out')
 //        5. not a customer (agents.claimed_at IS NOT NULL)
 //        6. hard-bounced (email_bounces table, Phase 4.14 / WO #6)
+//        7. not on agent_blocklist (orch-pr-20260614-8) — JS post-filter via
+//           isBlocked() to guarantee identical normalization to the write path
 //
 // POST /admin/outreach-sent-log/import
 //      Backfill outreach_sent_log from legacy file-based contacted history.
@@ -20,6 +22,7 @@
 
 import { Router, Request, Response } from "express";
 import { getDb } from "../database/init";
+import { isBlocked } from "../services/blocklist-service";
 
 const router = Router();
 
@@ -113,6 +116,7 @@ router.get("/", (req: Request, res: Response) => {
       agent_id: string;
       name: string;
       email: string;
+      website: string | null;
       outreach_eligible_at: string | null;
       has_replied: number;
       is_opted_out: number;
@@ -129,6 +133,7 @@ router.get("/", (req: Request, res: Response) => {
           p.agent_id,
           p.name,
           p.email,
+          k.website,
           p.outreach_eligible_at,
           ${suppressionCols}
         FROM outreach_ready_pool p
@@ -144,6 +149,7 @@ router.get("/", (req: Request, res: Response) => {
           a.id AS agent_id,
           a.name,
           k.email,
+          k.website,
           k.outreach_eligible_at,
           ${suppressionCols}
         FROM agents a
@@ -199,6 +205,7 @@ router.get("/", (req: Request, res: Response) => {
     let optedOutCount = 0;
     let customerCount = 0;
     let hardBouncedCount = 0;
+    let blocklistedCount = 0;
 
     for (const row of rows) {
       let isContactedOrCooldown = false;
@@ -225,19 +232,30 @@ router.get("/", (req: Request, res: Response) => {
       const suppressedForOptOut = row.is_opted_out === 1;
       const suppressedForCustomer = row.is_customer === 1;
       const suppressedForBounce = row.is_hard_bounced === 1;
+      // Blocklist check: JS post-filter via isBlocked() to guarantee the same
+      // normalization (normalizeDomain, normalizeName) as the write path. The
+      // candidate set is small at this point so the per-row SELECT is cheap.
+      const suppressedForBlocklist = isBlocked({
+        agentId: row.agent_id,
+        name: row.name,
+        email: row.email,
+        website: row.website ?? undefined,
+      }).blocked;
 
       if (suppressedForContacted) contactedOrCooldownCount++;
       if (suppressedForReplied) repliedCount++;
       if (suppressedForOptOut) optedOutCount++;
       if (suppressedForCustomer) customerCount++;
       if (suppressedForBounce) hardBouncedCount++;
+      if (suppressedForBlocklist) blocklistedCount++;
 
       if (
         !suppressedForContacted &&
         !suppressedForReplied &&
         !suppressedForOptOut &&
         !suppressedForCustomer &&
-        !suppressedForBounce
+        !suppressedForBounce &&
+        !suppressedForBlocklist
       ) {
         candidates.push({
           agent_id: row.agent_id,
@@ -262,6 +280,7 @@ router.get("/", (req: Request, res: Response) => {
         opted_out: optedOutCount,
         customer: customerCount,
         hard_bounced: hardBouncedCount,
+        blocklisted: blocklistedCount,
       },
     });
   } catch (err: any) {
