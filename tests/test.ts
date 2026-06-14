@@ -121,6 +121,21 @@ assertEq(
   "actual PII search term from query logs (the one that triggered this work)",
 );
 
+// ── orch-pr-10: search-enrich pure decision logic ──
+// The full suite lives in src/services/search-enrich.test.ts (also runnable
+// standalone via `npx tsx`). We fold its pass/fail counts into this gate so
+// the anti-contamination invariants are enforced by `npm test`.
+console.log("\n── orch-pr-10: search-enrich pure decision logic ──");
+{
+  const { runSearchEnrichTests } = require("../src/services/search-enrich.test") as
+    typeof import("../src/services/search-enrich.test");
+  const r = runSearchEnrichTests({ log: false });
+  passed += r.passed;
+  failed += r.failed;
+  for (const f of r.failures) failures.push("search-enrich: " + f);
+  console.log(`  search-enrich: ${r.passed} passed, ${r.failed} failed`);
+}
+
 // ── trust-score community signal tests ──
 console.log("── trust-score community signal tests ──");
 

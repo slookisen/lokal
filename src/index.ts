@@ -45,6 +45,7 @@ import ownerPortalRoutes from "./routes/owner-portal";
 import adminAgentAuditRoutes from "./routes/admin-agent-audit";
 import adminVerifierReviewQueueRoutes from "./routes/admin-verifier-review-queue";
 import adminKnowledgeRoutes, { pruneUrlsRouter } from "./routes/admin-knowledge";
+import adminSearchEnrichRoutes from "./routes/admin-search-enrich";
 import adminAffiliationsRoutes from "./routes/admin-affiliations";
 import adminBmEventsRoutes from "./routes/admin-bm-events";
 import adminBmReconcileRoutes from "./routes/admin-bm-reconcile";
@@ -369,6 +370,8 @@ app.use("/admin/verifier-review-queue", adminLimiter, adminVerifierReviewQueueRo
 app.use("/admin/knowledge", adminLimiter, adminKnowledgeRoutes);
 // orch-pr-9 (2026-06-14): dead/junk URL prune — POST /admin/prune-dead-urls
 app.use("/admin", adminLimiter, pruneUrlsRouter);
+// orch-pr-10 (2026-06-14): per-producer Brave search→crawl→confirm→email — POST /admin/search-enrich (dry-run default)
+app.use("/admin/search-enrich", adminLimiter, express.json(), adminSearchEnrichRoutes);
 // PR-58 (2026-05-16): C.1-C auto-tag enrichment — POST /admin/affiliations/auto-create
 app.use("/admin/affiliations", adminLimiter, adminAffiliationsRoutes);
 // PR-56 (2026-05-16): Bondens marked events scraper — POST /admin/bm-events/scrape
