@@ -380,3 +380,33 @@ export function bulkInsertExperiences(rows: HarvestRow[]): { inserted: number; s
   tx(rows);
   return { inserted, skipped };
 }
+
+// ─── Idempotency helper (orchestrator-pr-18 bulk-load) ──────────────
+/**
+ * True if an experience with this (provider_id, title) already exists.
+ * Used by the admin bulk-load to skip re-inserting a row on a re-run.
+ * Title match is case-insensitive/trim-insensitive to absorb harvest noise.
+ */
+export function experienceExistsForProvider(providerId: string, title: string): boolean {
+  const db = getDb(VERTICAL);
+  const row = db
+    .prepare(
+      "SELECT 1 FROM experiences WHERE provider_id = ? AND lower(trim(title)) = lower(trim(?)) LIMIT 1"
+    )
+    .get(providerId, title);
+  return !!row;
+}
+
+/**
+ * Find a provider by exact (case-insensitive/trim) name. Used by bulk-load
+ * to dedup `unverified` providers that have no org_nr (so getProviderByOrgnr
+ * can't catch them) on a re-run.
+ */
+export function getProviderByName(navn: string): Record<string, unknown> | null {
+  const db = getDb(VERTICAL);
+  return (
+    (db
+      .prepare("SELECT * FROM experience_providers WHERE lower(trim(navn)) = lower(trim(?)) LIMIT 1")
+      .get(navn) as Record<string, unknown>) ?? null
+  );
+}
