@@ -456,6 +456,28 @@ export const KNOWN_DIRECTORY_HOSTS: ReadonlySet<string> = new Set([
   // These are never a producer's own website.
   "tripadvisor.com",
   "yelp.com",
+  // Extended 2026-06-15 (lokal-agent-enrichment): tourism guides, shared
+  // food-hall venues, andelslandbruk/CSA networks and farm-shop e-com
+  // platforms surfaced as domain-coherence false positives in the review
+  // queue (n=13 producers blocked SOLELY by these agentHost values, each
+  // with knowledge.website correctly set to the producer's own domain, e.g.
+  // dirdalstraen.no, ranasgard.no, kilnesgard.no). Whitelisting only makes
+  // the verifier trust the already-correct knowledge.website, so it cannot
+  // cause a misattributed promotion. NB: "xn--visitjren-l3a.com" is the
+  // correct punycode for visitjæren.com — the pre-existing
+  // "xn--visitjren-w1a.com" decodes to "visitjràen" (a typo encoding).
+  "dyperoetter.org",
+  "fuud.no",
+  "gaardsbutikken.net",
+  "husetsandefjord.no",
+  "hvalerguide.no",
+  "lokalmat.coop.no",
+  "posebyhaven.no",
+  "route26.no",
+  "stuttreist.is",
+  "visit.kongsvingerregionen.no",
+  "visitsorlandet.com",
+  "xn--visitjren-l3a.com",
 ]);
 
 export function isKnownDirectoryHost(host: string): boolean {
