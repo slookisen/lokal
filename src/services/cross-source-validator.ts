@@ -1001,33 +1001,47 @@ export function coerceProvenanceToArrayShape(
 //   • "Lega — Rauland" → lega.no  (their real site) — CORRECT, stem "lega" is
 //     the whole domain label.
 //
-// The distinguishing signal is the *business-type token in the domain*:
-//   grettegaard = "grette" + "gaard". The producer is an *andelslandbruk*, NOT
-//   a *gård*. The domain advertises a business-type word ("gaard"/"gård") that
-//   the producer's own name does NOT carry → the domain names a DIFFERENT
-//   entity-type → ownership is NOT confirmed by the host, and we additionally
-//   refuse to let a shared bare stem on the page rescue it.
-//   lega = "lega" with NO leftover business-type token → the domain label is
-//   fully explained by the producer's name → ownership confirmed.
+// CALIBRATION (orchestrator-pr-16 review): the discriminator is the DISTINCTIVE
+// SPECIALIST token, NOT any business-type token. The "gård" family (gard, gaard,
+// gardsmat, mat, frukt, bruk, …) is NON-distinctive — practically every Norwegian
+// farm domain can legitimately carry it — so a leftover gård-family token must
+// NEVER be read as "different entity-type". Treating it as a contradiction was
+// wrongly quarantining the very common <navn>gard.no pattern (Sætre@satregard.no,
+// Brekke@brekkegard.no, Moen@moengard.no, Bjørke Frukt@bjorkegard.no, …). Only the
+// RARE specialist tokens (ysteri, meieri, bakeri, bryggeri, brenneri, slakteri,
+// gartneri, andelslandbruk, vingård, kjøtt, fisk, sjokolade, kafe, kro) discriminate.
+//   grettegaard = "grette" + "gaard": "gaard" is gård-family (benign), so the
+//     HOST no longer contradicts. But the producer's NAME carries the distinctive
+//     "andelslandbruk", which appears in neither the domain nor the page → the
+//     name-driven specialist check fires → ownership UNVERIFIED (still caught).
+//   lega = "lega" with no leftover at all → label fully explained → confirmed.
+//   satregard = "satre"/"saetre" + "gaard": leftover is benign gård-family, the
+//     name carries NO distinctive token → confirmed (no longer over-gated).
 //
 // Exact rule implemented by pageMentionsProducer(producerName, signals):
-//   stems = nameStems(producerName)   (≥4-char identity tokens, accent-stripped,
-//                                       business-type/stopwords removed)
-//   1. If there are no usable stems → return true (cannot judge; be conservative,
-//      never downgrade a producer we can't evaluate).
-//   2. HOST check: take the registrable label (e.g. "grettegaard", "lega"),
-//      greedily remove every stem occurrence. Classify the leftover:
-//        - leftover empty / only tiny (<3) fragments  → host CONFIRMS ownership.
-//        - leftover is a BUSINESS-TYPE word the producer's own name does NOT
-//          contain (gaard/gard/ysteri/bakeri/…)        → host CONTRADICTS
-//          (different entity-type) — this is the grettegaard case.
-//        - any other leftover                          → host is INCONCLUSIVE.
-//   3. PAGE-TEXT check: a stem appears as a whole word in the page text.
-//        - Accept UNLESS the host CONTRADICTS (step 2). When the domain itself
-//          names a different business-type, a shared bare stem on that page is
-//          exactly the Grette trap, so we do NOT let it rescue ownership.
-//   Result: confirmed iff host CONFIRMS, OR (page-text stem hit AND host does
-//   not CONTRADICT).
+//   stems       = identity tokens (≥4-char, accent-stripped, stopwords removed)
+//   nameTokens  = all ≥3-char name tokens (incl. business-type words)
+//   1. DISTINCTIVE-SPECIALIST check (name-driven): if the NAME carries one or
+//      more distinctive specialist tokens, EACH must appear in the domain label
+//      OR the page text, AND the domain must not carry a DIFFERENT distinctive
+//      token. If violated → UNVERIFIED (Grette Andelslandbruk; Vik Ysteri @
+//      vikbakeri.no). gård-family tokens are NOT in this set, so plainly-named
+//      farms are never flagged here.
+//   2. If there are no usable stems → return true (conservative; the distinctive
+//      check above, if any, already ran — e.g. "Vik Ysteri" with empty stems is
+//      still evaluated by step 1).
+//   3. HOST check: take the registrable label, greedily remove every stem
+//      occurrence, classify the leftover:
+//        - leftover empty / only tiny (<3) fragments        → host CONFIRMS.
+//        - leftover is a DISTINCTIVE specialist word the name does NOT carry
+//                                                            → host CONTRADICTS.
+//        - a stem appeared AND every leftover frag is benign gård-family
+//                                                            → host CONFIRMS.
+//        - any other leftover                               → INCONCLUSIVE.
+//   4. PAGE-TEXT check: a stem appears as a whole word in the page text.
+//        - Accept UNLESS the host CONTRADICTS (a different distinctive domain).
+//   Result: confirmed iff step 1 passes AND (host CONFIRMS, OR page-text stem
+//   hit AND host does not CONTRADICT).
 //
 // This is intentionally simple and advisory: when it returns false the caller
 // records the website ownership as `unverified` (omits the Tier-A homepage
@@ -1071,21 +1085,43 @@ function producerNameStems(name: string): string[] {
 }
 
 // Business-type / legal-form tokens that commonly appear in Norwegian producer
-// domains and names. Stored accent-stripped + lowercase. A leftover domain
-// fragment that is one of these — and that the producer's OWN name does not
-// also contain — signals the domain belongs to a different entity-type.
-const BUSINESS_TYPE_TOKENS: ReadonlySet<string> = new Set([
+// domains and names. Stored accent-stripped + lowercase.
+//
+// CALIBRATION (orchestrator-pr-16 review): these tokens split into two classes
+// by how much entity-type signal a *domain leftover* actually carries. The
+// "gård" family is NON-distinctive — practically every Norwegian farm domain
+// can legitimately contain it (<navn>gard.no, <navn>gardsmat.no, …), so a
+// leftover from that family must NEVER be read as "different entity-type". Only
+// the RARE specialist tokens (ysteri, bakeri, …) are discriminating enough that
+// a domain carrying one the producer's own name lacks signals a wrong entity.
+//
+// BENIGN (gård-family) — NON-distinctive, never a contradiction on its own. A
+// leftover domain fragment from this set is fully expected on a farm's own site
+// and must NOT downgrade ownership.
+const BENIGN_BUSINESS_TOKENS: ReadonlySet<string> = new Set([
   "gard", "gaard", "gards", "gaards",
+  "gardsmat", "gaardsmat", "gardsutsalg", "gaardsutsalg",
+  "mat", "frukt", "bruk",
+]);
+
+// DISTINCTIVE specialist tokens — discriminating. When the producer's OWN name
+// carries one of these but the domain (and page) does not — or the domain
+// carries a DIFFERENT one — the site plausibly belongs to a different entity.
+const DISTINCTIVE_SPECIALIST_TOKENS: ReadonlySet<string> = new Set([
   "ysteri", "ysteriet", "meieri", "meieriet",
   "bakeri", "bakeriet", "bryggeri", "bryggeriet",
-  "gartneri", "slakteri", "slakthus", "slakthuset",
-  "andelslandbruk", "samvirke", "kooperativ",
-  "honning", "biri", "frukthage", "frukt",
-  "saft", "safteri", "cideri", "destilleri",
-  "mat", "gardsmat", "gaardsmat", "lokalmat",
-  "fisk", "sjomat", "laks", "villsau",
-  "farm", "farms", "dairy", "creamery",
+  "brenneri", "brenneriet", "slakteri", "gartneri",
+  "andelslandbruk", "vingard", "vingaard",
+  "kjott", "fisk", "sjokolade", "kafe", "kro",
 ]);
+
+// Helper predicates (compare under aa-collapse so "gaard" ≡ "gård"→"gard").
+function isBenignBusinessToken(tok: string): boolean {
+  return BENIGN_BUSINESS_TOKENS.has(tok) || BENIGN_BUSINESS_TOKENS.has(collapseAa(tok));
+}
+function isDistinctiveSpecialistToken(tok: string): boolean {
+  return DISTINCTIVE_SPECIALIST_TOKENS.has(tok) || DISTINCTIVE_SPECIALIST_TOKENS.has(collapseAa(tok));
+}
 
 // Same accent-stripping the existing name/email matchers use (search-enrich's
 // stripNorwegianAccents is not exported, so we keep a local copy aligned with
@@ -1153,27 +1189,39 @@ function classifyHost(
   // Split leftover into fragments; drop tiny (<3) noise fragments.
   const frags = leftover.split(/[^a-z0-9]+/).filter((f) => f.length >= 3);
 
+  const anyStemInLabel = stems.some((st) => st && label.includes(st));
+
   if (frags.length === 0) {
     // Nothing meaningful left → label is fully explained by the producer name.
     // But only COUNT as confirms if at least one stem actually appeared in the
     // label (avoid vacuously confirming a label that shares no stem at all).
-    const anyStemInLabel = stems.some((st) => st && label.includes(st));
     return anyStemInLabel ? "confirms" : "inconclusive";
   }
 
-  // Leftover fragments exist. If any leftover fragment is a business-type word
-  // that the producer's OWN name does not contain, the domain advertises a
-  // different entity-type → contradiction (the grettegaard case). Compare under
-  // aa-collapse so "gaard" (domain) and "gard" (name) are recognised as the
-  // same business-type word.
+  // Leftover fragments exist. CALIBRATION (orchestrator-pr-16 review): only a
+  // DISTINCTIVE specialist leftover that the producer's OWN name does not carry
+  // signals a different entity-type → contradiction (e.g. domain advertises
+  // "bakeri" but the name is a "ysteri"). The gård-family (gard/gaard/gardsmat/
+  // mat/frukt/…) is NON-distinctive: practically every farm domain carries it,
+  // so it must NEVER contradict — that was over-gating plainly-named farms on
+  // <navn>gard.no (Sætre/Brekke/Moen/Bjørke). Compare under aa-collapse so
+  // "gaard" (domain) and "gard" (name) are the same token.
   for (const f of frags) {
     const fc = collapseAa(f);
-    const isBusinessType = BUSINESS_TYPE_TOKENS.has(f) || BUSINESS_TYPE_TOKENS.has(fc);
     const inOwnName = nameTokens.has(f) || nameTokens.has(fc);
-    if (isBusinessType && !inOwnName) {
+    if (isDistinctiveSpecialistToken(f) && !inOwnName) {
       return "contradicts";
     }
   }
+
+  // No distinctive contradiction. If a stem actually appeared in the label AND
+  // every leftover fragment is a benign gård-family token, the label is fully
+  // explained by "<producer> + gård-family" → host CONFIRMS ownership (this is
+  // the Sætre/Brekke/Moen/Bjørke <navn>gard.no pattern, even domain-only).
+  if (anyStemInLabel && frags.every((f) => isBenignBusinessToken(f))) {
+    return "confirms";
+  }
+
   // Otherwise inconclusive (leftover is some other word — e.g. a region the
   // page-text check can still confirm via a stem hit).
   return "inconclusive";
@@ -1206,12 +1254,58 @@ export function pageMentionsProducer(
     typeof signals === "string" ? { pageText: signals } : (signals || {});
 
   const stems = producerNameStems(producerName);
+  const nameTokens = allNameTokens(producerName);
+
+  // Normalised domain label (IDN-decode → accent-strip → drop hyphens), aligned
+  // with classifyHost, so distinctive-token substring checks see the same text.
+  const hostLabel = registrableLabelOf(sig.host);
+  // Normalised page-text haystack (accent-stripped, aa-collapsed) for token
+  // membership checks.
+  const pageHayC =
+    sig.pageText && sig.pageText.trim()
+      ? collapseAa(stripAccentsLocal(sig.pageText.toLowerCase()))
+      : "";
+  const hostLabelC = collapseAa(hostLabel);
+
+  // ── DISTINCTIVE-SPECIALIST LAYER (orchestrator-pr-16 calibration) ──────────
+  // The ONLY name-driven contradiction. If the producer's NAME carries a
+  // distinctive specialist token (ysteri/bakeri/bryggeri/andelslandbruk/…), the
+  // site must reflect that specialty: the token must appear in the domain OR the
+  // page text, and the domain must NOT advertise a DIFFERENT distinctive token.
+  // Otherwise the page plausibly belongs to a different entity → UNVERIFIED.
+  //   • Grette Andelslandbruk @ grettegaard.no — "andelslandbruk" is in neither
+  //     the domain nor the page → UNVERIFIED (still caught).
+  //   • Vik Ysteri @ vikbakeri.no — domain carries a DIFFERENT distinctive token
+  //     ("bakeri" ≠ "ysteri") → UNVERIFIED.
+  // The gård-family is NOT in the distinctive set, so plainly-named farms on
+  // <navn>gard.no are never flagged here.
+  const nameDistinctive = new Set<string>();
+  for (const t of nameTokens) {
+    const tc = collapseAa(t);
+    if (isDistinctiveSpecialistToken(t)) nameDistinctive.add(tc);
+  }
+  if (nameDistinctive.size > 0) {
+    const labelDistinctive: string[] = [];
+    for (const d of DISTINCTIVE_SPECIALIST_TOKENS) {
+      if (hostLabelC.includes(d)) labelDistinctive.push(d);
+    }
+    for (const d of nameDistinctive) {
+      const inDomain = hostLabelC.includes(d);
+      const inPage = pageHayC.includes(d);
+      const domainHasDifferent = labelDistinctive.some((x) => x !== d);
+      if ((!inDomain && !inPage) || domainHasDifferent) {
+        return false; // ownership UNVERIFIED — specialist mismatch.
+      }
+    }
+  }
+
   if (stems.length === 0) {
-    // No usable identity stem (e.g. name is only "Gård AS") → cannot judge.
+    // No usable identity stem (e.g. name is only "Gård AS"). The distinctive
+    // layer above (if any) already passed → cannot judge further, be
+    // conservative and never downgrade what we can't read.
     return true;
   }
 
-  const nameTokens = allNameTokens(producerName);
   const hostVerdict = classifyHost(sig.host, stems, nameTokens);
 
   if (hostVerdict === "confirms") return true;
@@ -1230,9 +1324,23 @@ export function pageMentionsProducer(
 
   if (pageHasStem && hostVerdict !== "contradicts") return true;
 
-  // Either no stem on the page, or the host actively contradicts (different
-  // business-type domain) and only a shared bare stem appears → UNVERIFIED.
+  // Either no stem on the page, or the host actively contradicts (a different
+  // DISTINCTIVE specialist domain) and only a shared bare stem appears →
+  // UNVERIFIED.
   return false;
+}
+
+// Registrable label of a host/URL, normalised identically to classifyHost:
+// IDN-decode (punycode -> unicode), accent-strip, drop hyphens, lowercase.
+// Returns "" when the host is missing/unparseable.
+function registrableLabelOf(host: string | null | undefined): string {
+  if (!host || !host.trim()) return "";
+  const parsed = hostFromUrlLike(host);
+  if (!parsed) return "";
+  const root = registrableDomain(parsed);
+  return stripAccentsLocal(decodePunycodeLabel(root.split(".")[0] ?? root))
+    .replace(/-/g, "")
+    .toLowerCase();
 }
 
 function escapeRegExp(s: string): string {

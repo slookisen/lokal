@@ -2979,6 +2979,83 @@ console.log("\n── orch-pr-16: pageMentionsProducer (website-ownership name-m
   );
 }
 
+// ── orch-pr-16 CALIBRATION: gård-family non-distinctive, only specialist tokens contradict ──
+// Review nit: Guard #1 over-flagged the very common <navn>gard.no pattern by
+// treating any leftover business-type token (incl. the gård family) as a
+// contradiction. After calibration only DISTINCTIVE specialist tokens
+// (ysteri/bakeri/bryggeri/andelslandbruk/…) discriminate; gard/gaard/gardsmat/
+// mat/frukt/bruk are benign and must NEVER quarantine a plainly-named farm.
+console.log("\n── orch-pr-16: Guard #1 calibration (gård-family non-distinctive) ──");
+
+{
+  // STILL CAUGHT: name carries the DISTINCTIVE "andelslandbruk", which is absent
+  // from both the domain (grettegaard) and the page text (says "Grette Gård",
+  // no "andelslandbruk") → ownership UNVERIFIED via the specialist check.
+  assertEq(
+    pageMentionsProducer("Grette Andelslandbruk", {
+      host: "grettegaard.no",
+      pageText: "Velkommen til Grette Gård — vi driver med korn og gris",
+    }),
+    false,
+    "g1-cal: Grette Andelslandbruk @ grettegaard.no (page lacks 'andelslandbruk') → UNVERIFIED (specialist absent)",
+  );
+  // The matching bare-name farm on the SAME domain → CONFIRMED (gård-family
+  // leftover is benign; name carries no distinctive token).
+  assertEq(
+    pageMentionsProducer("Grette Gård", { host: "grettegaard.no" }),
+    true,
+    "g1-cal: Grette Gård @ grettegaard.no → CONFIRMED (gård-family benign, domain-only)",
+  );
+
+  // The over-gated pattern the calibration fixes: plainly-named farm owns
+  // <navn>gard.no. Leftover after the name stem is the benign "gard"/"gaard" →
+  // must be CONFIRMED, not flagged.
+  assertEq(
+    pageMentionsProducer("Sætre", { host: "satregard.no", pageText: "Sætre" }),
+    true,
+    "g1-cal: Sætre @ satregard.no (page 'Sætre') → CONFIRMED (gård-family leftover benign)",
+  );
+  assertEq(
+    pageMentionsProducer("Brekke", { host: "brekkegard.no" }),
+    true,
+    "g1-cal: Brekke @ brekkegard.no → CONFIRMED",
+  );
+  assertEq(
+    pageMentionsProducer("Moen", { host: "moengard.no" }),
+    true,
+    "g1-cal: Moen @ moengard.no → CONFIRMED",
+  );
+  // "Frukt" / "Gårdsmat" in the name are NON-distinctive (gård-family / benign)
+  // → never trigger a specialist mismatch on a gård domain.
+  assertEq(
+    pageMentionsProducer("Bjørke Frukt", { host: "bjorkegard.no", pageText: "Bjørke Frukt" }),
+    true,
+    "g1-cal: Bjørke Frukt @ bjorkegard.no → CONFIRMED ('frukt' non-distinctive)",
+  );
+  assertEq(
+    pageMentionsProducer("Bjørke Gårdsmat", { host: "bjorkegard.no" }),
+    true,
+    "g1-cal: Bjørke Gårdsmat @ bjorkegard.no → CONFIRMED ('gardsmat' non-distinctive)",
+  );
+
+  // Clean real site — stem is the whole label, no leftover at all.
+  assertEq(
+    pageMentionsProducer("Lega — Rauland", { host: "lega.no" }),
+    true,
+    "g1-cal: Lega — Rauland @ lega.no → CONFIRMED",
+  );
+
+  // GENUINE specialist wrong-entity: the domain advertises a DIFFERENT
+  // distinctive specialist token ("bakeri") than the producer's ("ysteri") →
+  // UNVERIFIED. (Note: "Vik Ysteri" has no usable identity stem, so this is
+  // caught purely by the distinctive-specialist layer.)
+  assertEq(
+    pageMentionsProducer("Vik Ysteri", { host: "vikbakeri.no" }),
+    false,
+    "g1-cal: Vik Ysteri @ vikbakeri.no → UNVERIFIED (ysteri vs bakeri — different distinctive tokens)",
+  );
+}
+
 // ── orchestrator-pr-16: Guard #2 (inference-source deny-list) ───────────────
 console.log("\n── orch-pr-16: inference-source deny-list (factual fields) ──");
 
