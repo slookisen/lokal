@@ -1,0 +1,91 @@
+# Opplevelser-vertikal supplerende config (utenfor Zod-schema i vertical-config.ts)
+#
+# Leses DIREKTE av harvest-agent, brreg-verifier og opplevelses-verifier —
+# IKKE via getConfig(). Hvis vi vil ha dem typesikre senere: utvid
+# VerticalConfigSchema med .extend({...}) eller .passthrough().
+
+# ─── Taksonomi (kategori → eksempel-tags). Raffineres mot høstede data. ───
+taxonomy:
+  natur_friluft:        [fottur, kajakk, brevandring, fiske, sykkel, rafting, klatring]
+  dyreliv_safari:       [hvalsafari, havornsafari, hundekjoring, dyrepark, ridning, seleksjon]
+  vann_sjo:             [fjordcruise, rib, dykking, surfing, sup, batutleie]
+  vinter_sno:           [ski, truger, snoscooter, nordlys, ishotell, skiskole]
+  adrenalin_action:     [lasertag, paintball, gokart, zipline, via_ferrata, klatrepark, bungee]
+  kultur_historie:      [museum, omvisning, galleri, kulturarv, teater]
+  mat_drikke:           [matvandring, bryggeri, destilleri, smaking]   # NB: overlapp m/ rfb
+  familie_lek:          [fornoyelsespark, vitensenter, trampolinepark, minigolf, escape_room]
+  velvaere_spa:         [spa, badstue, flyteterapi]
+  overnatting_opplevelse: [trehytte, glamping, fyrtarn, gardsovernatting]
+  sightseeing_transport: [turtog, sightseeingbuss, hop_on_hop_off, panoramatur]
+  verksted_kurs:        [keramikk, matlagingskurs, husflid, foto]
+  arrangementer:        [festival, konsert, marked, sesongbegivenhet]   # tidsbundet
+
+price_bands: [gratis, rimelig, standard, premium, ukjent]
+seasons:     [spring, summer, autumn, winter, year_round]
+indoor_outdoor: [indoor, outdoor, both]
+
+# ─── Høste-kilder (PRIMÆR oppdagelse). Bygges ut i Phase A. ───
+# VIKTIG juridisk linje (PHASE7 §5): høst FAKTA som leads (navn/tilbyder/sted/
+# kategori/kilde-URL). IKKE verbatim beskrivelser, bilder eller anmeldelser.
+# Respekter robots.txt + ToS. TripAdvisor = kun signal, aldri innholdskilde.
+harvest_sources:
+  national:
+    - name: Visit Norway
+      type: national_board
+      note: "matet av tellUs/CBIS — rikest produktkilde. Fakta som leads, re-source innhold fra tilbyder."
+  destination_companies:   # fylles av Phase A kildekart
+    - { name: VisitOSLO, region: Oslo }
+    - { name: Visit Bergen, region: Vestland }
+    - { name: Fjord Norway, region: Vestland }
+    - { name: Visit Tromso, region: Troms }
+    - { name: Visit Lofoten, region: Nordland }
+    - { name: Visit Trondheim, region: Trondelag }
+    - { name: Visit Sorlandet, region: Agder }
+  industry_assoc:
+    - { name: NHO Reiseliv, type: industry_assoc }
+  signal_only:
+    - { name: TripAdvisor, use: existence_popularity_signal_only }
+
+# ─── Brreg-koder for VERIFIKATOR-rollen (ikke primær oppdagelse). ───
+# SN2025 aktiv (fra 2026-09-01). API: data.brreg.no, param naeringskode=
+# gjør PREFIKS-match (bruk 4-sifret gruppe). Tall hentet 2026-06-14.
+brreg_verification_codes:
+  "79.12": { desc: "Reisearrangor (utflukts-/eventarrangorer)", count_2026_06: 3511 }
+  "93.29": { desc: "Fornoyelses-/fritidsaktiviteter ellers",    count_2026_06: 2966 }
+  "93.19": { desc: "Sportsaktiviteter ikke nevnt annet sted",   count_2026_06: 2759 }
+  "55.30": { desc: "Campingplasser",                            count_2026_06: 1390 }
+  "50.10": { desc: "Sjotransport passasjerer",                  count_2026_06: 620 }
+  "93.21": { desc: "Fornoyelses-/temaparker",                   count_2026_06: 149 }
+  "93.11": { desc: "Drift av sportsanlegg",   count_2026_06: null }
+  "77.21": { desc: "Utleie sport-/fritidsutstyr", count_2026_06: null }
+  "49.39": { desc: "Annen landtransport passasjerer", count_2026_06: null }
+  "91.21": { desc: "Museer (91.211 kunst-/kunstindustrimuseer m.fl.)", count_2026_06: null }  # SN2025-erstatter for gamle 91.02
+# Bekreftede RENE opplevelses-leaf-koder (fra verifier-sample 2026-06-14) — prioriteres i plausibilitets-gate:
+brreg_clean_leaf_codes:
+  "93.291": "Opplevelsesaktiviteter"     # f.eks. Whale2Sea AS
+  "93.292": "Fritidsvirksomhet ellers"
+  "79.121": "Aktiviteter utfort av utflukts- og eventarrangorer"
+  "79.122": "Reisearrangorvirksomhet ellers"
+  "50.109": "Kysttrafikk med passasjerer ikke nevnt annet sted"  # hvalsafari/RIB/fjordcruise
+  "91.211": "Drift av kunst- og kunstindustrimuseer"
+  "49.340": "Passasjertransport kabelbaner/skiheiser"  # Fløibanen-funicular — oppdaget 2026-06-14
+  "55.200": "Drift av vandrerhjem og ferieleiligheter"  # rorbuer/glamping (Å Rorbuer AS)
+
+brreg_notes:
+  - "VERIFY-RUN 18 tilbydere (2026-06-14): ~61% rene aktive treff. Holding/IP-selskap (Megazone Holding, Woodnest Global) treffes i brand-sok i stedet for lokal driftsenhet -> website-orgnr-fallback nodvendig for kjeder/merker. NACE 00.000 'Uoppgitt' + lokasjons-mismatch avslorer feil enhet (Eliassen Rorbuer)."
+  - "Museer ligger under 91.21x i SN2025 (bekreftet 2026-06-14: Nasjonalmuseet = 91.211). Gamle 91.02 ga 0 treff."
+  - "Koder er stoyete (et 93.19-treff var et drag race-lag) — brukes til match+aktiv-sjekk, ikke oppdagelse."
+  - "Dental-vertikalens koder bor re-verifiseres mot SN2025 ved neste sweep."
+  - "VERIFIER-REGEL (sample 2026-06-14): aldri blind-aksepter Brreg navnesok-topptreff — fuzzy stoy (Go Fjords->filmselskap, Folgefonna Husky->klesbutikk). Krev navnelikhet >=0.6 OG NACE i allowlist OG (helst) kommune-match. Handelsnavn som feiler -> website-orgnr-fallback."
+  - "Aktiv-sjekk fanget Glaciertour AS (underAvvikling 2025-10-20) -> ekskluder."
+
+# ─── Verifikasjon ───
+verification:
+  show_in_search_requires:
+    - "experience.verification_status = verified"
+    - "provider.brreg_active = 1"
+    - "experience.confidence in (high, medium)"
+  confidence_rules:
+    high:   "fra tilbyders egen booking-side"
+    medium: "paraply-/Visit Norway-fakta, ikke bekreftet mot tilbyder"
+    low:    "aggregator-inferens (vises aldri umerket)"

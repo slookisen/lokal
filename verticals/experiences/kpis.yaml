@@ -1,0 +1,29 @@
+# verticals/opplevelser/kpis.yaml — managed by orchestrator, outside §P1.5 scope
+#
+# Leses DIREKTE av orchestrator (ikke via getConfig()). KPI-tresholds må
+# kunne tunes oftere enn §P1.5-approve-per-cycle tillater.
+#
+# START-tresholds for Skjer. Reevaluer etter 30 dagers data fra Phase A-D.
+
+vertical_id: experiences
+kpis:
+  harvest:
+    sources_mapped_min: 10              # destinasjonsselskaper + paraplyer kartlagt
+    new_experiences_per_week_min: 200
+    provider_match_rate_min_pct: 60     # andel høstede opplevelser matchet til org_nr
+  brreg_verifier:
+    active_rate_min_pct: 85             # andel matchede providers bekreftet aktive
+    backlog_max_pct: 25
+  enrichment:
+    cap_utilization_min_pct: 80
+    content_from_provider_min_pct: 70   # andel opplevelser m/ innhold fra tilbyders egen side
+  visibility:
+    well_known_uptime_min_pct: 99
+    ai_bot_visits_min_per_day: 5
+  customer_service:
+    response_within_hours_max: 24
+    p0_open_max_count: 0
+  platform:
+    verifier_backlog_max_pct: 25
+    failed_run_max_per_day: 5
+    stale_experiences_max_pct: 15       # opplevelser m/ utløpt sesong/død lenke
