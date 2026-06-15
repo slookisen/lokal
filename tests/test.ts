@@ -13810,6 +13810,295 @@ console.log("\n── experiences scaffold: experience-store ──");
   dbFactoryExp.__resetDbFactoryForTesting();
 })();
 
+
+// ── orch-pr-18: POST /api/opplevelser/admin/bulk-load ────────────────
+// Admin bulk-load for the experiences (Skjer) vertical with SERVER-SIDE
+// Brreg verification. Drives the REAL opplevelser router over HTTP against
+// an in-memory experiences.db (EXPERIENCES_DB_PATH=:memory: + factory reset),
+// with the Brreg fetch STUBBED via __setBrregFetchForTesting — NO real
+// network in the suite. Async-IIFE pattern mirrors orch-pr-9 (prune-dead-urls).
+// Covers: admin gate, dry-run classifies verified-active/inactive/unverified
+// and writes NOTHING, apply inserts only non-inactive (Glaciertour excluded),
+// unverified-without-evidence skipped, idempotent re-run inserts 0.
+console.log("\n── orch-pr-18: POST /api/opplevelser/admin/bulk-load ──");
+
+let _orchPr18BulkLoadResolve: () => void = () => {};
+const _orchPr18BulkLoadPromise: Promise<void> = new Promise<void>((r) => {
+  _orchPr18BulkLoadResolve = r;
+});
+
+(async () => {
+  // Run after all prior DB-mutating IIFEs that touch the db-factory cache.
+  try { await _orchPr20260614_6Promise; } catch { /* upstream */ }
+  try { await _orchPr9PruneDeadUrlsPromise; } catch { /* upstream */ }
+
+  const prevPathExp18 = process.env.EXPERIENCES_DB_PATH;
+  const prevAdminKey18 = process.env.ADMIN_KEY;
+  let server18: import("http").Server | null = null;
+  try {
+    process.env.EXPERIENCES_DB_PATH = ":memory:";
+
+    // Bust require cache for db-factory + experience-store + experience-brreg
+    // + the opplevelser route TOGETHER so the route binds to the fresh,
+    // :memory:-backed store/brreg instances (mirrors the exp-store scaffold).
+    const dbFactoryPath18 = require.resolve("../src/database/db-factory");
+    const expStorePath18 = require.resolve("../src/services/experience-store");
+    const expBrregPath18 = require.resolve("../src/services/experience-brreg");
+    const opplevelserPath18 = require.resolve("../src/routes/opplevelser");
+    delete require.cache[dbFactoryPath18];
+    delete require.cache[expStorePath18];
+    delete require.cache[expBrregPath18];
+    delete require.cache[opplevelserPath18];
+
+    const dbFactory18 = require("../src/database/db-factory") as typeof import("../src/database/db-factory");
+    dbFactory18.__resetDbFactoryForTesting();
+    const expStore18 = require("../src/services/experience-store") as typeof import("../src/services/experience-store");
+    const expBrreg18 = require("../src/services/experience-brreg") as typeof import("../src/services/experience-brreg");
+    const opplevelser18 = require("../src/routes/opplevelser") as { default: import("express").Router };
+
+    // Pin the in-memory experiences DB (so assertions can query it directly).
+    const dbExp18 = dbFactory18.getDb("experiences");
+
+    // ── Stub Brreg by interpreting the `navn=` query param. ────────────
+    // verified-active → Tromsø Opplevelser AS (NACE 93.291, not deleted)
+    // inactive        → Glaciertour AS (NACE 93.291 but slettedato set)
+    // unverified      → anything else (empty result set)
+    const brregCalls: string[] = [];
+    expBrreg18.__setBrregFetchForTesting(async (url: string) => {
+      const navn = decodeURIComponent(new URL(url).searchParams.get("navn") || "");
+      brregCalls.push(navn);
+      const lc = navn.toLowerCase();
+      let enheter: unknown[] = [];
+      if (lc.includes("tromsø opplevelser") || lc.includes("tromso opplevelser")) {
+        enheter = [{
+          organisasjonsnummer: "912345678",
+          navn: "TROMSØ OPPLEVELSER AS",
+          naeringskode1: { kode: "93.291" },
+          forretningsadresse: { kommune: "Tromsø" },
+          konkurs: false,
+          underAvvikling: false,
+          underTvangsavviklingEllerTvangsopplosning: false,
+          slettedato: null,
+        }];
+      } else if (lc.includes("glaciertour")) {
+        enheter = [{
+          organisasjonsnummer: "998877665",
+          navn: "GLACIERTOUR AS",
+          naeringskode1: { kode: "93.291" },
+          forretningsadresse: { kommune: "Luster" },
+          konkurs: false,
+          underAvvikling: true,         // under avvikling ⇒ inactive
+          underTvangsavviklingEllerTvangsopplosning: false,
+          slettedato: "2025-02-01",     // and deleted
+        }];
+      }
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({ _embedded: { enheter } }),
+      };
+    });
+
+    // ── Mount the REAL router on a minimal Express app. ────────────────
+    const expressMod18 = (await import("express")).default;
+    const app18 = expressMod18();
+    app18.use(expressMod18.json());
+    // (router mounted below, after the admin-key pin middleware)
+
+    const httpMod18 = await import("http");
+    server18 = httpMod18.createServer(app18);
+    await new Promise<void>((resolve) => server18!.listen(0, "127.0.0.1", () => resolve()));
+    const addr18 = server18.address();
+    const port18 = typeof addr18 === "object" && addr18 ? addr18.port : 0;
+
+    const ADMIN_KEY_18 = "bulkload-test-admin-key-18";
+    process.env.ADMIN_KEY = ADMIN_KEY_18;
+
+    // NB: process.env.ADMIN_KEY is a shared global that OTHER concurrently-
+    // running async tests mutate at their own await points. To make THIS
+    // test's admin gate deterministic, pin the key SYNCHRONOUSLY at the top
+    // of every request's middleware chain — Express runs middlewares in-order
+    // with no yield, so requireAdmin (mounted just below) always reads our
+    // value, regardless of what another test set between our HTTP calls.
+    app18.use("/api/opplevelser/admin", (_req, _res, next) => {
+      process.env.ADMIN_KEY = ADMIN_KEY_18;
+      next();
+    });
+    app18.use("/api/opplevelser", opplevelser18.default);
+
+    function bulkReq(
+      body?: Record<string, unknown>,
+      key?: string
+    ): Promise<{ status: number; body: any }> {
+      const payload = body ? JSON.stringify(body) : "";
+      const headers: Record<string, string> = {};
+      if (key !== undefined) headers["x-admin-key"] = key;
+      if (payload) {
+        headers["content-type"] = "application/json";
+        headers["content-length"] = String(Buffer.byteLength(payload));
+      }
+      return new Promise((resolve, reject) => {
+        const r = httpMod18.request(
+          { method: "POST", host: "127.0.0.1", port: port18, path: "/api/opplevelser/admin/bulk-load", headers },
+          (resp) => {
+            const chunks: Buffer[] = [];
+            resp.on("data", (c) => chunks.push(c as Buffer));
+            resp.on("end", () => {
+              const raw = Buffer.concat(chunks).toString("utf8");
+              let parsed: any = null;
+              try { parsed = raw ? JSON.parse(raw) : null; } catch { parsed = { _raw: raw }; }
+              resolve({ status: resp.statusCode || 0, body: parsed });
+            });
+          }
+        );
+        r.on("error", reject);
+        if (payload) r.write(payload);
+        r.end();
+      });
+    }
+
+    const countProviders = () =>
+      (dbExp18.prepare("SELECT COUNT(*) AS n FROM experience_providers").get() as { n: number }).n;
+    const countExperiences = () =>
+      (dbExp18.prepare("SELECT COUNT(*) AS n FROM experiences").get() as { n: number }).n;
+
+    // Payload: 1 verified-active provider (2 experiences), 1 inactive
+    // (Glaciertour, 1 experience), 1 unverified WITH evidence (1 experience),
+    // 1 unverified WITHOUT evidence (1 experience).
+    const PAYLOAD = {
+      experiences: [
+        { title: "Hvalsafari fra Tromsø", provider_name: "Tromsø Opplevelser AS", category: "dyreliv_safari",
+          kommune: "Tromsø", fylke: "Troms", indoor_outdoor: "outdoor", price_from: 1290,
+          evidence_url: "https://tromso-opplevelser.no/hvalsafari", confidence: "high" },
+        { title: "Nordlystur med RIB", provider_name: "Tromsø Opplevelser AS", category: "natur_friluft",
+          kommune: "Tromsø", fylke: "Troms", indoor_outdoor: "outdoor", price_from: 1490,
+          evidence_url: "https://tromso-opplevelser.no/nordlys", confidence: "high" },
+        { title: "Brevandring på Folgefonna", provider_name: "Glaciertour AS", category: "natur_friluft",
+          kommune: "Luster", fylke: "Vestland", indoor_outdoor: "outdoor", price_from: 990,
+          evidence_url: "https://glaciertour.no/bre", confidence: "medium" },
+        { title: "Guidet byvandring", provider_name: "Mystery Trade Co", category: "kultur_historie",
+          kommune: "Bergen", fylke: "Vestland", indoor_outdoor: "outdoor",
+          evidence_url: "https://mysterytrade.example/tour", confidence: "medium" },
+        { title: "Hemmelig tur uten kilde", provider_name: "No Evidence Provider", category: "annet",
+          kommune: "Oslo", fylke: "Oslo", indoor_outdoor: "both", confidence: "low" },
+      ],
+    };
+
+    // ── bl-1: admin gate — missing key → 403. ──────────────────────────
+    {
+      const r = await bulkReq(PAYLOAD);
+      assertEq(r.status, 403, "bl-1: missing X-Admin-Key → 403");
+    }
+    // ── bl-2: wrong key → 403. ─────────────────────────────────────────
+    {
+      const r = await bulkReq(PAYLOAD, "wrong-key");
+      assertEq(r.status, 403, "bl-2: wrong X-Admin-Key → 403");
+    }
+
+    // ── bl-3: DRY-RUN (apply omitted) classifies and writes NOTHING. ───
+    {
+      const r = await bulkReq(PAYLOAD, ADMIN_KEY_18);
+      assertEq(r.status, 200, "bl-3a: dry-run → 200");
+      assertEq(r.body.dry_run, true, "bl-3b: apply omitted ⇒ dry_run=true");
+      assertEq(r.body.providers.verified_active, 1, "bl-3c: 1 verified_active provider");
+      assertEq(r.body.providers.inactive, 1, "bl-3d: 1 inactive provider");
+      assertEq(r.body.providers.unverified, 2, "bl-3e: 2 unverified providers (evidence + no-evidence)");
+      // Glaciertour excluded by name.
+      assertTrue(
+        Array.isArray(r.body.excluded_inactive) && r.body.excluded_inactive.includes("Glaciertour AS"),
+        "bl-3f: Glaciertour AS in excluded_inactive"
+      );
+      // WOULD insert: verified-active (2 exp) + unverified-with-evidence (1 exp) = 3 exp, 2 providers.
+      assertEq(r.body.experiences_inserted, 3, "bl-3g: dry-run reports 3 experiences WOULD insert");
+      assertEq(r.body.providers_inserted, 2, "bl-3h: dry-run reports 2 providers WOULD insert");
+      // Critically: NOTHING written.
+      assertEq(countProviders(), 0, "bl-3i: dry-run wrote 0 providers to DB");
+      assertEq(countExperiences(), 0, "bl-3j: dry-run wrote 0 experiences to DB");
+    }
+
+    // ── bl-4: APPLY inserts only non-inactive; Glaciertour NEVER inserted. ─
+    {
+      const r = await bulkReq({ ...PAYLOAD, apply: true }, ADMIN_KEY_18);
+      assertEq(r.status, 200, "bl-4a: apply → 200");
+      assertEq(r.body.dry_run, false, "bl-4b: apply:true ⇒ dry_run=false");
+      assertEq(r.body.providers_inserted, 2, "bl-4c: inserted 2 providers (verified_active + unverified-evidence)");
+      assertEq(r.body.experiences_inserted, 3, "bl-4d: inserted 3 experiences");
+      assertTrue(
+        r.body.excluded_inactive.includes("Glaciertour AS"),
+        "bl-4e: Glaciertour AS excluded on apply too"
+      );
+      // DB reflects exactly the non-inactive inserts.
+      assertEq(countProviders(), 2, "bl-4f: DB has 2 providers");
+      assertEq(countExperiences(), 3, "bl-4g: DB has 3 experiences");
+      // Glaciertour provider + its experience must be ABSENT.
+      const glac = dbExp18
+        .prepare("SELECT COUNT(*) AS n FROM experience_providers WHERE navn = 'Glaciertour AS'")
+        .get() as { n: number };
+      assertEq(glac.n, 0, "bl-4h: Glaciertour provider NOT in DB (inactive excluded)");
+      const breExp = dbExp18
+        .prepare("SELECT COUNT(*) AS n FROM experiences WHERE title = 'Brevandring på Folgefonna'")
+        .get() as { n: number };
+      assertEq(breExp.n, 0, "bl-4i: Glaciertour's experience NOT in DB");
+      // No-evidence unverified provider must be ABSENT (skipped, not inserted).
+      const noEv = dbExp18
+        .prepare("SELECT COUNT(*) AS n FROM experience_providers WHERE navn = 'No Evidence Provider'")
+        .get() as { n: number };
+      assertEq(noEv.n, 0, "bl-4j: unverified-without-evidence provider skipped (not inserted)");
+      // verified_active provider stamped brreg_verified=1, brreg_active=1, org_nr.
+      const tos = dbExp18
+        .prepare("SELECT org_nr, brreg_verified, brreg_active, verification_status FROM experience_providers WHERE navn = 'Tromsø Opplevelser AS'")
+        .get() as { org_nr: string; brreg_verified: number; brreg_active: number; verification_status: string };
+      assertEq(tos.org_nr, "912345678", "bl-4k: verified provider stamped org_nr from Brreg");
+      assertEq(tos.brreg_verified, 1, "bl-4l: brreg_verified=1");
+      assertEq(tos.brreg_active, 1, "bl-4m: brreg_active=1");
+      assertEq(tos.verification_status, "verified", "bl-4n: verified_active ⇒ verification_status=verified");
+      // unverified-with-evidence provider stored brreg_verified=0, needs_review.
+      const myc = dbExp18
+        .prepare("SELECT brreg_verified, verification_status FROM experience_providers WHERE navn = 'Mystery Trade Co'")
+        .get() as { brreg_verified: number; verification_status: string };
+      assertEq(myc.brreg_verified, 0, "bl-4o: unverified provider brreg_verified=0 (website-fallback)");
+      assertEq(myc.verification_status, "needs_review", "bl-4p: unverified ⇒ needs_review");
+    }
+
+    // ── bl-5: idempotent re-run (apply) inserts 0. ─────────────────────
+    {
+      const r = await bulkReq({ ...PAYLOAD, apply: true }, ADMIN_KEY_18);
+      assertEq(r.status, 200, "bl-5a: re-run → 200");
+      assertEq(r.body.providers_inserted, 0, "bl-5b: re-run inserts 0 providers (idempotent)");
+      assertEq(r.body.experiences_inserted, 0, "bl-5c: re-run inserts 0 experiences (idempotent)");
+      assertTrue((r.body.skipped as number) >= 3, "bl-5d: re-run skipped the already-present experiences");
+      // DB counts unchanged.
+      assertEq(countProviders(), 2, "bl-5e: still 2 providers after re-run");
+      assertEq(countExperiences(), 3, "bl-5f: still 3 experiences after re-run");
+    }
+
+    // ── bl-6: empty experiences array → 400 (Zod). ─────────────────────
+    {
+      const r = await bulkReq({ experiences: [] }, ADMIN_KEY_18);
+      assertEq(r.status, 400, "bl-6: empty experiences[] → 400");
+    }
+
+    // Sanity: the Brreg fetch was actually exercised (stub, not network).
+    assertTrue(brregCalls.length > 0, "bl-7: Brreg fetch stub was called (no real network)");
+
+    // ── Cleanup ───────────────────────────────────────────────────────
+    expBrreg18.__setBrregFetchForTesting(null);
+    dbFactory18.__resetDbFactoryForTesting();
+  } catch (err) {
+    failed++;
+    failures.push("orch-pr-18-bulkload: unexpected error: " + String(err));
+  } finally {
+    if (server18) {
+      await new Promise<void>((resolve) => server18!.close(() => resolve()));
+    }
+    if (prevPathExp18 === undefined) delete process.env.EXPERIENCES_DB_PATH;
+    else process.env.EXPERIENCES_DB_PATH = prevPathExp18;
+    if (prevAdminKey18 === undefined) delete process.env.ADMIN_KEY;
+    else process.env.ADMIN_KEY = prevAdminKey18;
+    _orchPr18BulkLoadResolve();
+  }
+})();
+
 // ── PR-107 (2026-06-04): zombie-claim sweep fix ──────────────────────
 // Tests for sweepExpiredClaims, zombie reclaim via claimBatch, truthful
 // claimStatus after timeout, and releaseBatch regression guard.
@@ -17532,6 +17821,7 @@ console.log("\n── orch-pr-14: MCP discovery product_id surfacing ──");
   try { await _orchPr20260614_6Promise; } catch { /* errors already pushed to failures */ }
   try { await _orchPr14ProductIdPromise; } catch { /* errors already pushed to failures */ }
   try { await _orchPr9PruneDeadUrlsPromise; } catch { /* errors already pushed to failures */ }
+  try { await _orchPr18BulkLoadPromise; } catch { /* errors already pushed to failures */ }
   try { await _orchPr12SweepPromise; } catch { /* errors already pushed to failures */ }
   // PR-109 tests are synchronous (IIFE) — no promise needed
   // Drop pre-existing intg failures (unmasked by awaiting) — they predate M2
