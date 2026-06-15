@@ -136,6 +136,20 @@ console.log("\n── orch-pr-10: search-enrich pure decision logic ──");
   console.log(`  search-enrich: ${r.passed} passed, ${r.failed} failed`);
 }
 
+// ── orchestrator-pr-13: conservative address/phone contact-normalizer ──
+// Pins the formatting-only relaxation in cross-source-validator (clears
+// formatting-only review_required) while keeping genuine conflicts gated.
+console.log("\n── orch-pr-13: contact-normalizer (address/phone) ──");
+{
+  const { runContactNormalizerTests } = require("../src/services/contact-normalizer.test") as
+    typeof import("../src/services/contact-normalizer.test");
+  const r = runContactNormalizerTests({ log: false });
+  passed += r.passed;
+  failed += r.failed;
+  for (const f of r.failures) failures.push("contact-normalizer: " + f);
+  console.log(`  contact-normalizer: ${r.passed} passed, ${r.failed} failed`);
+}
+
 // ── orch-pr-12: search-enrich background sweep + findings + apply-findings ──
 // Async (fire-and-forget sweep loop). Kicked off here; awaited in the REPORT
 // block so its pass/fail counts fold into the `npm test` summary.
