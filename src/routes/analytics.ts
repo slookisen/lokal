@@ -15,11 +15,11 @@ const NOT_OWNER = "(is_owner IS NULL OR is_owner = 0)";
 // ─── Vertical filter (?vertical=rfb|dental) ─────────────────────
 // Both verticals (rettfrabonden.com + finn-tannlege.com) run on the same
 // app and write to the same analytics tables, separated by vertical_id.
-// Endpoints accept ?vertical=rfb|dental to split traffic per site;
+// Endpoints accept ?vertical=rfb|dental|experiences to split traffic per site;
 // anything else (or omitted) = all traffic combined.
 function parseVertical(req: Request): VerticalId | undefined {
   const v = String(req.query.vertical || "").toLowerCase();
-  return v === "rfb" || v === "dental" ? (v as VerticalId) : undefined;
+  return v === "rfb" || v === "dental" || v === "experiences" ? (v as VerticalId) : undefined;
 }
 function verticalFilter(req: Request): { sql: string; params: string[] } {
   const v = parseVertical(req);

@@ -51,14 +51,21 @@ function isOwnerRequest(req: Request): boolean {
 }
 
 // ─── Helper: Vertical from request host ──────────────────────
-// Both verticals run on the same Fly app (PR-109 host routing in index.ts).
-// The analytics middleware runs BEFORE the dental host gate, so every
-// finn-tannlege.com page view lands here too — stamp vertical_id from the
-// Host header so dashboards can split rfb vs dental traffic. Default 'rfb'
-// keeps legacy callers and neutral hosts (lokal.fly.dev, localhost) unchanged.
-export type VerticalId = "rfb" | "dental";
+// All three verticals run on the same Fly app (host routing in index.ts).
+// The analytics middleware runs BEFORE the per-vertical host gates, so every
+// finn-tannlege.com / opplevagent.no page view lands here too — stamp
+// vertical_id from the Host header so dashboards can split rfb vs dental vs
+// experiences traffic. Default 'rfb' keeps legacy callers and neutral hosts
+// (lokal.fly.dev, localhost) unchanged.
+//   finn-tannlege.com  → dental
+//   opplevagent.no     → experiences   (orchestrator-pr-19 host-gate)
+//   everything else    → rfb
+export type VerticalId = "rfb" | "dental" | "experiences";
 export function getVerticalFromHost(hostname: string | undefined | null): VerticalId {
-  return hostname && hostname.toLowerCase().includes("finn-tannlege") ? "dental" : "rfb";
+  const h = hostname ? hostname.toLowerCase() : "";
+  if (h.includes("finn-tannlege")) return "dental";
+  if (h.includes("opplevagent")) return "experiences";
+  return "rfb";
 }
 
 // ─── Helper: Privacy-safe IP hashing ─────────────────────────
