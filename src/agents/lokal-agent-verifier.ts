@@ -22,6 +22,7 @@ import {
   crossSourceAgreement,
   aggregateVerdict,
   domainCoherenceCheck,
+  factualFieldsWithOnlyInference,
   FREE_MAIL_DOMAINS,
   type FieldName,
   type ProvenanceRecord,
@@ -760,6 +761,38 @@ export async function runVerifierBatch(opts: {
       );
     }
 
+    // ── Guard #2: inference-source deny-list for factual fields (orch-pr-16) ──
+    // A factual field (products / address / phone) sourced SOLELY from AI
+    // inference (category_inference, seasonal_knowledge, name_analysis,
+    // web_search, …) is a fabricated guess, not evidence. Real failure
+    // (2026-06-15): Bærsentralen got product "jordbær" from seasonal_knowledge
+    // / category_inference; they actually do *multer*. We raise an advisory
+    // `inference_only_field:<field>` flag and quarantine the agent from the
+    // pool (review_required) so it is re-enriched rather than promoted. This is
+    // factual-fields only — it never touches how (free-mail) emails are handled.
+    const inferenceOnlyFields = factualFieldsWithOnlyInference(fieldProv);
+    for (const f of inferenceOnlyFields) {
+      gate.flags.push(`inference_only_field:${f}`);
+    }
+
+    // ── Guard #1 (verifier side): website-ownership marker (orch-pr-16) ───────
+    // The homepage-provenance crawl stamps field_provenance.website_ownership =
+    // { status: "unverified", ... } when the fetched site did not mention the
+    // producer (the Grette/grettegaard wrong-entity case). Such an agent must
+    // not sit in the pool on the strength of a mis-anchored site. Raise an
+    // advisory flag and quarantine (review_required) so the site is re-checked.
+    // Omitting the homepage Tier-A source already prevents NEW promotions; this
+    // also actively pulls back an agent that was verified before the mismatch
+    // was detected. Advisory only — never deletes the producer.
+    let websiteOwnershipUnverified = false;
+    {
+      const wo = (fieldProv as Record<string, unknown>)?.website_ownership;
+      if (wo && typeof wo === "object" && (wo as Record<string, unknown>).status === "unverified") {
+        websiteOwnershipUnverified = true;
+        gate.flags.push("website_ownership_unverified");
+      }
+    }
+
     // ── Domain-coherence check (orch-PR-20260512-33 / Eidsmo fix) ──────────
     // Even when per-field cross-source agreement passes, if the homepage
     // URL discovered for the agent disagrees with the website/email stored
@@ -772,6 +805,23 @@ export async function runVerifierBatch(opts: {
       agent.email,
     );
     let newVerification = deriveVerificationStatus(gate.passes, gate.flags, agentVerdict);
+    if (inferenceOnlyFields.length > 0) {
+      // Quarantine: a factual field has only inference sources. Never promote
+      // to the pool; downgrade `verified`/`pool_eligible` to review_required so
+      // it is re-enriched. (Leaves already-worse statuses untouched.)
+      if (newVerification === "verified") newVerification = "review_required";
+      (crossSourceResults as Record<string, unknown>).inference_only_fields = inferenceOnlyFields;
+      console.log(
+        `[verifier] ${agent.id} (${agent.name ?? "?"}) inference-only factual field(s): ${inferenceOnlyFields.join(", ")} — quarantined from pool`,
+      );
+    }
+    if (websiteOwnershipUnverified) {
+      // Quarantine: the producer's site could not be confirmed as theirs.
+      if (newVerification === "verified") newVerification = "review_required";
+      console.log(
+        `[verifier] ${agent.id} (${agent.name ?? "?"}) website_ownership=unverified — quarantined from pool`,
+      );
+    }
     if (!coherence.coherent) {
       console.log(
         `[verifier] ${agent.id} (${agent.name ?? "?"}) domain-incoherent: ${coherence.reason}`,

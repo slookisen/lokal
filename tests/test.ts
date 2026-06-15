@@ -2052,6 +2052,10 @@ import {
   domainCoherenceCheck,
   isKnownDirectoryHost,
   isAcceptableHomepageEmail,
+  isInferenceSource,
+  pageMentionsProducer,
+  fieldHasOnlyInferenceSources,
+  factualFieldsWithOnlyInference,
   type ProvenanceRecord,
   type CrossSourceResult,
 } from "../src/services/cross-source-validator";
@@ -2895,12 +2899,287 @@ console.log("\n── cross-source-validator: iteration-2 fixes (punycode fail-s
   assertEq(r.coherent, false, "geo-stem-tp02: hardangersider.no / hardangermat.no → incoherent (hardanger is a generic geo stem)");
 }
 
+// ── orchestrator-pr-16: Guard #1 (website-ownership name-match) ─────────────
+console.log("\n── orch-pr-16: pageMentionsProducer (website-ownership name-match) ──");
+
+{
+  // POSITIVE: producer's real site — stem "lega" is the whole domain label,
+  // page text says their name → ownership confirmed.
+  assertEq(
+    pageMentionsProducer("Lega — Rauland", { host: "lega.no", pageText: "Lega Rauland — gardsmat frå Telemark" }),
+    true,
+    "g1: Lega — Rauland on lega.no → owned (verified)",
+  );
+  // POSITIVE: even with NO page text, the domain label fully equals the stem.
+  assertEq(
+    pageMentionsProducer("Lega — Rauland", { host: "lega.no" }),
+    true,
+    "g1: Lega on lega.no domain-only → owned",
+  );
+}
+
+{
+  // THE WRONG-ENTITY CASE: "Grette Andelslandbruk" anchored to grettegaard.no
+  // (Grette *Gård*). The domain leftover after removing stem "grette" is
+  // "gaard" — a business-type token the producer's name does NOT carry (they're
+  // an *andelslandbruk*). Even though the page literally says "Grette" (it's
+  // Grette Gård), the host CONTRADICTS → ownership UNVERIFIED.
+  assertEq(
+    pageMentionsProducer("Grette Andelslandbruk", {
+      host: "grettegaard.no",
+      pageText: "Velkommen til Grette Gård — vi driver med korn og gris",
+    }),
+    false,
+    "g1: Grette Andelslandbruk on grettegaard.no → UNVERIFIED (gaard != andelslandbruk)",
+  );
+  // Same, domain-only — still unverified.
+  assertEq(
+    pageMentionsProducer("Grette Andelslandbruk", { host: "grettegaard.no" }),
+    false,
+    "g1: Grette Andelslandbruk on grettegaard.no domain-only → UNVERIFIED",
+  );
+}
+
+{
+  // Discriminator proof — if the producer ACTUALLY were "Grette Gård", the
+  // gaard token is in its own name, so the same domain is NOT contradicted.
+  assertEq(
+    pageMentionsProducer("Grette Gård", { host: "grettegaard.no", pageText: "Grette Gård" }),
+    true,
+    "g1: Grette Gård on grettegaard.no → owned (gaard is in the producer's own name)",
+  );
+}
+
+{
+  // Normal happy path: page text mentions the producer stem, clean domain.
+  assertEq(
+    pageMentionsProducer("Stordalen Gård", { host: "stordalen.no", pageText: "Stordalen Gård sel egg og grønsaker" }),
+    true,
+    "g1: Stordalen Gård + stordalen.no + page mentions → owned",
+  );
+  // Genitive/possessive form on the domain ("nalums") still matches.
+  assertEq(
+    pageMentionsProducer("Nalums Gårdsbutikk", { host: "nalums.no", pageText: "Nalums Gårdsbutikk" }),
+    true,
+    "g1: Nalums Gårdsbutikk + nalums.no → owned (genitive stem)",
+  );
+}
+
+{
+  // Page text shares ONLY a generic/region word, not the producer's identity
+  // stem, and the host is unrelated → unverified.
+  assertEq(
+    pageMentionsProducer("Tindved Gårdbryggeri", {
+      host: "annenbedrift.no",
+      pageText: "Dette er en helt annen bedrift som selger klær",
+    }),
+    false,
+    "g1: producer stem absent from page + unrelated host → UNVERIFIED",
+  );
+}
+
+{
+  // Conservative: a name with no usable >=4-char stem (only stopwords/short
+  // tokens) cannot be judged → return true (never downgrade what we can't read).
+  assertEq(
+    pageMentionsProducer("Gård AS", { host: "noeheltannet.no", pageText: "ingenting" }),
+    true,
+    "g1: no usable stem → conservative true (not downgraded)",
+  );
+  assertEq(
+    pageMentionsProducer("", { host: "x.no" }),
+    true,
+    "g1: empty producer name → conservative true",
+  );
+}
+
+// ── orch-pr-16 CALIBRATION: gård-family non-distinctive, only specialist tokens contradict ──
+// Review nit: Guard #1 over-flagged the very common <navn>gard.no pattern by
+// treating any leftover business-type token (incl. the gård family) as a
+// contradiction. After calibration only DISTINCTIVE specialist tokens
+// (ysteri/bakeri/bryggeri/andelslandbruk/…) discriminate; gard/gaard/gardsmat/
+// mat/frukt/bruk are benign and must NEVER quarantine a plainly-named farm.
+console.log("\n── orch-pr-16: Guard #1 calibration (gård-family non-distinctive) ──");
+
+{
+  // STILL CAUGHT: name carries the DISTINCTIVE "andelslandbruk", which is absent
+  // from both the domain (grettegaard) and the page text (says "Grette Gård",
+  // no "andelslandbruk") → ownership UNVERIFIED via the specialist check.
+  assertEq(
+    pageMentionsProducer("Grette Andelslandbruk", {
+      host: "grettegaard.no",
+      pageText: "Velkommen til Grette Gård — vi driver med korn og gris",
+    }),
+    false,
+    "g1-cal: Grette Andelslandbruk @ grettegaard.no (page lacks 'andelslandbruk') → UNVERIFIED (specialist absent)",
+  );
+  // The matching bare-name farm on the SAME domain → CONFIRMED (gård-family
+  // leftover is benign; name carries no distinctive token).
+  assertEq(
+    pageMentionsProducer("Grette Gård", { host: "grettegaard.no" }),
+    true,
+    "g1-cal: Grette Gård @ grettegaard.no → CONFIRMED (gård-family benign, domain-only)",
+  );
+
+  // The over-gated pattern the calibration fixes: plainly-named farm owns
+  // <navn>gard.no. Leftover after the name stem is the benign "gard"/"gaard" →
+  // must be CONFIRMED, not flagged.
+  assertEq(
+    pageMentionsProducer("Sætre", { host: "satregard.no", pageText: "Sætre" }),
+    true,
+    "g1-cal: Sætre @ satregard.no (page 'Sætre') → CONFIRMED (gård-family leftover benign)",
+  );
+  assertEq(
+    pageMentionsProducer("Brekke", { host: "brekkegard.no" }),
+    true,
+    "g1-cal: Brekke @ brekkegard.no → CONFIRMED",
+  );
+  assertEq(
+    pageMentionsProducer("Moen", { host: "moengard.no" }),
+    true,
+    "g1-cal: Moen @ moengard.no → CONFIRMED",
+  );
+  // "Frukt" / "Gårdsmat" in the name are NON-distinctive (gård-family / benign)
+  // → never trigger a specialist mismatch on a gård domain.
+  assertEq(
+    pageMentionsProducer("Bjørke Frukt", { host: "bjorkegard.no", pageText: "Bjørke Frukt" }),
+    true,
+    "g1-cal: Bjørke Frukt @ bjorkegard.no → CONFIRMED ('frukt' non-distinctive)",
+  );
+  assertEq(
+    pageMentionsProducer("Bjørke Gårdsmat", { host: "bjorkegard.no" }),
+    true,
+    "g1-cal: Bjørke Gårdsmat @ bjorkegard.no → CONFIRMED ('gardsmat' non-distinctive)",
+  );
+
+  // Clean real site — stem is the whole label, no leftover at all.
+  assertEq(
+    pageMentionsProducer("Lega — Rauland", { host: "lega.no" }),
+    true,
+    "g1-cal: Lega — Rauland @ lega.no → CONFIRMED",
+  );
+
+  // GENUINE specialist wrong-entity: the domain advertises a DIFFERENT
+  // distinctive specialist token ("bakeri") than the producer's ("ysteri") →
+  // UNVERIFIED. (Note: "Vik Ysteri" has no usable identity stem, so this is
+  // caught purely by the distinctive-specialist layer.)
+  assertEq(
+    pageMentionsProducer("Vik Ysteri", { host: "vikbakeri.no" }),
+    false,
+    "g1-cal: Vik Ysteri @ vikbakeri.no → UNVERIFIED (ysteri vs bakeri — different distinctive tokens)",
+  );
+}
+
+// ── orchestrator-pr-16: Guard #2 (inference-source deny-list) ───────────────
+console.log("\n── orch-pr-16: inference-source deny-list (factual fields) ──");
+
+{
+  // isInferenceSource: bare + prefixed forms.
+  assertEq(isInferenceSource("category_inference"), true, "g2: category_inference is inference");
+  assertEq(isInferenceSource("seasonal_knowledge"), true, "g2: seasonal_knowledge is inference");
+  assertEq(isInferenceSource("name_analysis"), true, "g2: name_analysis is inference");
+  assertEq(isInferenceSource("name-analysis"), true, "g2: name-analysis (hyphen) is inference");
+  assertEq(isInferenceSource("web_search"), true, "g2: web_search is inference");
+  assertEq(isInferenceSource("web_search:gmail.com"), true, "g2: web_search:<domain> prefixed form is inference");
+  assertEq(isInferenceSource("web-search"), true, "g2: web-search (hyphen) is inference");
+  // Real evidence types are NOT inference.
+  assertEq(isInferenceSource("homepage"), false, "g2: homepage is NOT inference");
+  assertEq(isInferenceSource("google_places"), false, "g2: google_places is NOT inference");
+  assertEq(isInferenceSource("brreg"), false, "g2: brreg is NOT inference");
+  assertEq(isInferenceSource("owner"), false, "g2: owner is NOT inference");
+  assertEq(isInferenceSource(null), false, "g2: null is NOT inference");
+}
+
+function provR(value: string, source_type: string): ProvenanceRecord {
+  return { value, source_type, fetched_at: "2026-06-15T10:00Z" };
+}
+
+{
+  // Bærsentralen case: product "jordbær" from seasonal_knowledge + category_inference
+  // ONLY → inference-only → flagged.
+  assertEq(
+    fieldHasOnlyInferenceSources([
+      provR("jordbær", "seasonal_knowledge"),
+      provR("jordbær", "category_inference"),
+    ]),
+    true,
+    "g2: products from seasonal_knowledge+category_inference only → inference-only=true (Bærsentralen)",
+  );
+  // One real source mixed in → NOT inference-only.
+  assertEq(
+    fieldHasOnlyInferenceSources([
+      provR("multer", "homepage"),
+      provR("jordbær", "category_inference"),
+    ]),
+    false,
+    "g2: products with a homepage source present → inference-only=false",
+  );
+  // No values at all → false (that's the data_insufficient case, handled elsewhere).
+  assertEq(
+    fieldHasOnlyInferenceSources([]),
+    false,
+    "g2: empty records → inference-only=false",
+  );
+  // web_search prefixed form alone → inference-only.
+  assertEq(
+    fieldHasOnlyInferenceSources([provR("post@x.no", "web_search:x.no")]),
+    true,
+    "g2: web_search:<domain> only → inference-only=true",
+  );
+}
+
+{
+  // factualFieldsWithOnlyInference: scans products/address/phone.
+  const fp = {
+    products: [provR("jordbær", "seasonal_knowledge")],          // inference-only
+    address: [provR("Vegen 1, 0001 Oslo", "homepage"), provR("Vegen 1, 0001 Oslo", "google_places")], // real
+    phone: [provR("90000000", "name_analysis")],                  // inference-only
+  };
+  const flagged = factualFieldsWithOnlyInference(fp);
+  assertTrue(flagged.includes("products"), "g2: products flagged inference-only");
+  assertTrue(flagged.includes("phone"), "g2: phone flagged inference-only");
+  assertTrue(!flagged.includes("address"), "g2: address NOT flagged (has homepage+google_places)");
+}
+
+{
+  // crossSourceAgreement: inference sources do NOT count toward source_count and
+  // never make a field pool_eligible. (address has 2 inference 'sources'.)
+  const r = crossSourceAgreement(
+    { address: [provR("Vegen 1, 0001 Oslo", "web_search:x.no"), provR("Vegen 1, 0001 Oslo", "category_inference")] },
+    "address",
+  );
+  assertEq(r.source_count, 0, "g2: 2 inference sources → source_count=0 (not counted)");
+  assertEq(r.verdict, "review_required", "g2: inference-only field → verdict review_required (not pool_eligible)");
+  assertEq(r.agree, false, "g2: inference-only field → agree=false");
+}
+
+{
+  // Mixed: 1 real homepage + 1 inference → source_count counts only the real one (1),
+  // still below the 2-high-quality bar → review_required (NOT promoted on the guess).
+  const r = crossSourceAgreement(
+    { phone: [provR("91193602", "homepage"), provR("91193602", "seasonal_knowledge")] },
+    "phone",
+  );
+  assertEq(r.source_count, 1, "g2: 1 homepage + 1 inference → source_count=1 (inference excluded)");
+  assertEq(r.verdict, "review_required", "g2: single real source + inference → review_required");
+}
+
+{
+  // Regression: a genuine homepage+google_places field is UNAFFECTED by Guard #2.
+  const r = crossSourceAgreement(
+    { phone: [provR("91193602", "homepage"), provR("91193602", "google_places")] },
+    "phone",
+  );
+  assertEq(r.source_count, 2, "g2: homepage+google_places → source_count=2 (unaffected)");
+  assertEq(r.verdict, "pool_eligible", "g2: homepage+google_places agreeing → pool_eligible (unaffected)");
+}
+
 // ── WO-16: Integration tests (runVerifierBatch with cross-source gate) ───────
 
 console.log("\n── cross-source-validator: runVerifierBatch integration tests ──");
 
 import Database from "better-sqlite3";
-import { __setDbForTesting } from "../src/database/init";
+import { __setDbForTesting, __initSchemaForTesting } from "../src/database/init";
 import { runVerifierBatch, computeKvalitetsGate } from "../src/agents/lokal-agent-verifier";
 
 // Build an isolated in-memory DB for integration tests
@@ -2909,7 +3188,10 @@ function buildTestDb(): Database.Database {
   testDb.pragma("journal_mode = DELETE");
   testDb.pragma("foreign_keys = ON");
   __setDbForTesting(testDb);
-  // Import initSchema by re-calling getDb (which calls initSchema)
+  // getDb() only runs initSchema when its module-level db is null; since we just
+  // injected testDb, we must initialize the schema explicitly or the tables
+  // (agents, agent_knowledge, outreach_ready_pool VIEW, …) won't exist.
+  __initSchemaForTesting(testDb);
   return testDb;
 }
 
@@ -3102,6 +3384,196 @@ async function runIntegrationTests(): Promise<void> {
 
     const poolRow = db.prepare("SELECT * FROM outreach_ready_pool WHERE agent_id = 'agent-partial-owner'").get();
     assertTrue(!poolRow, "intg-3: partial-owner agent not in outreach_ready_pool");
+  }
+
+  // ── orch-pr-16 Fixture A: free-mail (gmail) producer is NOT downgraded ──────
+  // A producer using gmail.com with otherwise solid data (homepage+google_places
+  // agreeing on address AND phone) must reach `verified` and the pool. Guards
+  // #1/#2 must not touch free-mail handling.
+  {
+    const db = buildTestDb();
+    const { getDb } = await import("../src/database/init");
+    __setDbForTesting(db);
+    getDb();
+
+    insertTestAgent(db, "agent-gmail-ok", "Bjørkheim Gård", {
+      email: "bjorkheim.gard@gmail.com",
+      website: "https://bjorkheim.no",
+      about: "Familiedrevet gård i Telemark som sel grønsaker, egg og honning på REKO-ring og frå garden.",
+      products: JSON.stringify([{name:"Egg"},{name:"Honning"},{name:"Grønsaker"},{name:"Poteter"}]),
+      field_provenance: {
+        address: [
+          { value: "Bjørkheimvegen 4, 3812 Akkerhaugen", source_type: "homepage", fetched_at: "2026-06-10T07:25Z" },
+          { value: "Bjørkheimvegen 4, 3812 Akkerhaugen", source_type: "google_places", fetched_at: "2026-06-10T07:30Z" },
+        ],
+        phone: [
+          { value: "95011022", source_type: "homepage", fetched_at: "2026-06-10T07:25Z" },
+          { value: "95011022", source_type: "google_places", fetched_at: "2026-06-10T07:30Z" },
+        ],
+      },
+    });
+
+    const mockHeadProbe = async (_url: string) => 200 as number | null;
+    const result = await runVerifierBatch({ db, batchSize: 10, brregLookup: null, headProbe: mockHeadProbe });
+    const ar = result.results.find((r) => r.agent_id === "agent-gmail-ok");
+    assertTrue(!!ar, "intg-g16A: gmail agent found");
+    assertTrue(
+      !ar!.flags.includes("email_domain_mismatch"),
+      "intg-g16A: gmail producer NOT flagged email_domain_mismatch (free-mail exempt)",
+    );
+    assertTrue(
+      !ar!.flags.some((f) => f.startsWith("inference_only_field")),
+      "intg-g16A: gmail producer has no inference-only flag",
+    );
+    assertEq(
+      ar?.new_verification_status,
+      "verified",
+      "intg-g16A: gmail + homepage/google_places agreeing → verified (NOT downgraded for free-mail)",
+    );
+  }
+
+  // ── orch-pr-16 Fixture B: inference-only factual field → quarantined ────────
+  // products + phone come ONLY from inference (seasonal_knowledge / web_search).
+  // The agent must be quarantined (review_required, not in pool) with an
+  // inference_only_field flag — the Bærsentralen-style fabrication.
+  {
+    const db = buildTestDb();
+    const { getDb } = await import("../src/database/init");
+    __setDbForTesting(db);
+    getDb();
+
+    insertTestAgent(db, "agent-inference-only", "Bærsentralen", {
+      email: "post@baersentralen.no",
+      website: "https://baersentralen.no",
+      about: "Vi sankar og sel bær frå fjellet i Trøndelag — kortreist og handplukka kvar haust.",
+      products: JSON.stringify([{name:"Jordbær"}]),
+      field_provenance: {
+        // address is solid (2 real sources) so the agent passes basic+cross-source,
+        // isolating the inference-only flag as the reason for quarantine.
+        address: [
+          { value: "Bærvegen 2, 7100 Rissa", source_type: "homepage", fetched_at: "2026-06-10T07:25Z" },
+          { value: "Bærvegen 2, 7100 Rissa", source_type: "google_places", fetched_at: "2026-06-10T07:30Z" },
+        ],
+        phone: [
+          { value: "73000111", source_type: "homepage", fetched_at: "2026-06-10T07:25Z" },
+          { value: "73000111", source_type: "google_places", fetched_at: "2026-06-10T07:30Z" },
+        ],
+        // products fabricated from inference only → must quarantine.
+        products: [
+          { value: "jordbær", source_type: "seasonal_knowledge", fetched_at: "2026-06-10T07:25Z" },
+          { value: "jordbær", source_type: "category_inference", fetched_at: "2026-06-10T07:25Z" },
+        ],
+      },
+    });
+
+    const mockHeadProbe = async (_url: string) => 200 as number | null;
+    const result = await runVerifierBatch({ db, batchSize: 10, brregLookup: null, headProbe: mockHeadProbe });
+    const ar = result.results.find((r) => r.agent_id === "agent-inference-only");
+    assertTrue(!!ar, "intg-g16B: inference-only agent found");
+    assertTrue(
+      ar!.flags.includes("inference_only_field:products"),
+      "intg-g16B: products inference-only → flag inference_only_field:products raised",
+    );
+    assertEq(
+      ar?.new_verification_status,
+      "review_required",
+      "intg-g16B: inference-only factual field → review_required (quarantined, NOT verified)",
+    );
+    const poolRow = db.prepare("SELECT * FROM outreach_ready_pool WHERE agent_id = 'agent-inference-only'").get();
+    assertTrue(!poolRow, "intg-g16B: inference-only agent NOT in outreach_ready_pool");
+
+    // The producer is NOT deleted — still present in agents + agent_knowledge.
+    const stillThere = db.prepare("SELECT 1 FROM agents WHERE id = 'agent-inference-only'").get();
+    assertTrue(!!stillThere, "intg-g16B: producer NOT deleted (advisory quarantine only)");
+  }
+
+  // ── orch-pr-16 Fixture C: real homepage+google_places field still passes ────
+  // Regression: an agent with NO inference sources and 2 agreeing real Tier-A
+  // sources on the gating fields is verified and pooled, unchanged by the guards.
+  {
+    const db = buildTestDb();
+    const { getDb } = await import("../src/database/init");
+    __setDbForTesting(db);
+    getDb();
+
+    insertTestAgent(db, "agent-real-twosource", "Kvelde Frukt", {
+      email: "post@kveldefrukt.no",
+      website: "https://kveldefrukt.no",
+      about: "Fruktgard i Vestfold med eple, pære og plomme — sel saft og frukt i sesong frå garden.",
+      products: JSON.stringify([{name:"Eple"},{name:"Pære"},{name:"Plomme"},{name:"Saft"}]),
+      field_provenance: {
+        address: [
+          { value: "Kveldevegen 10, 3282 Kvelde", source_type: "homepage", fetched_at: "2026-06-10T07:25Z" },
+          { value: "Kveldevegen 10, 3282 Kvelde", source_type: "google_places", fetched_at: "2026-06-10T07:30Z" },
+        ],
+        phone: [
+          { value: "33110022", source_type: "homepage", fetched_at: "2026-06-10T07:25Z" },
+          { value: "33110022", source_type: "google_places", fetched_at: "2026-06-10T07:30Z" },
+        ],
+      },
+    });
+
+    const mockHeadProbe = async (_url: string) => 200 as number | null;
+    const result = await runVerifierBatch({ db, batchSize: 10, brregLookup: null, headProbe: mockHeadProbe });
+    const ar = result.results.find((r) => r.agent_id === "agent-real-twosource");
+    assertTrue(!!ar, "intg-g16C: real-twosource agent found");
+    assertTrue(
+      !ar!.flags.some((f) => f.startsWith("inference_only_field")),
+      "intg-g16C: no inference-only flag on a real two-source agent",
+    );
+    assertEq(
+      ar?.new_verification_status,
+      "verified",
+      "intg-g16C: homepage+google_places on address+phone → verified (guards do not regress)",
+    );
+  }
+
+  // ── orch-pr-16 Fixture D: website_ownership=unverified marker → quarantined ──
+  // The homepage crawl (Guard #1) stamped field_provenance.website_ownership =
+  // unverified (Grette/grettegaard wrong-entity). The verifier must flag
+  // website_ownership_unverified and pull the agent back to review_required —
+  // even though its address/phone otherwise agree across two sources.
+  {
+    const db = buildTestDb();
+    const { getDb } = await import("../src/database/init");
+    __setDbForTesting(db);
+    getDb();
+
+    insertTestAgent(db, "agent-ownership-unverified", "Grette Andelslandbruk", {
+      email: "post@grette-andelslandbruk.no",
+      website: "https://grettegaard.no",
+      about: "Andelslandbruk på Romerike der medlemmer dyrkar grønsaker saman gjennom heile sesongen.",
+      products: JSON.stringify([{name:"Grønsaker"},{name:"Poteter"},{name:"Kål"}]),
+      field_provenance: {
+        address: [
+          { value: "Gretteveien 5, 2080 Eidsvoll", source_type: "homepage", fetched_at: "2026-06-10T07:25Z" },
+          { value: "Gretteveien 5, 2080 Eidsvoll", source_type: "google_places", fetched_at: "2026-06-10T07:30Z" },
+        ],
+        phone: [
+          { value: "63000222", source_type: "homepage", fetched_at: "2026-06-10T07:25Z" },
+          { value: "63000222", source_type: "google_places", fetched_at: "2026-06-10T07:30Z" },
+        ],
+        website_ownership: { status: "unverified", reason: "homepage_name_mismatch", url: "https://grettegaard.no", checked_at: "2026-06-10T07:25Z" },
+      },
+    });
+
+    const mockHeadProbe = async (_url: string) => 200 as number | null;
+    const result = await runVerifierBatch({ db, batchSize: 10, brregLookup: null, headProbe: mockHeadProbe });
+    const ar = result.results.find((r) => r.agent_id === "agent-ownership-unverified");
+    assertTrue(!!ar, "intg-g16D: ownership-unverified agent found");
+    assertTrue(
+      ar!.flags.includes("website_ownership_unverified"),
+      "intg-g16D: website_ownership unverified marker → flag raised",
+    );
+    assertEq(
+      ar?.new_verification_status,
+      "review_required",
+      "intg-g16D: unverified website ownership → review_required (quarantined despite agreeing address/phone)",
+    );
+    const poolRow = db.prepare("SELECT * FROM outreach_ready_pool WHERE agent_id = 'agent-ownership-unverified'").get();
+    assertTrue(!poolRow, "intg-g16D: ownership-unverified agent NOT in outreach_ready_pool");
+    const stillThere = db.prepare("SELECT 1 FROM agents WHERE id = 'agent-ownership-unverified'").get();
+    assertTrue(!!stillThere, "intg-g16D: producer NOT deleted (advisory quarantine only)");
   }
 
 }

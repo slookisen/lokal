@@ -23,6 +23,15 @@ export function __setDbForTesting(injected: Database.Database): void {
   db = injected;
 }
 
+// Test-only: run the full production schema initialization (CREATE TABLE …,
+// migrations, VIEWs) on an injected in-memory DB. `getDb()` only calls
+// initSchema when the module-level `db` is null, so a test that injects its own
+// DB via __setDbForTesting must call this to actually create the tables.
+// Never call from production code.
+export function __initSchemaForTesting(injected: Database.Database): void {
+  initSchema(injected);
+}
+
 export function getDb(): Database.Database {
   if (!db) {
     // Ensure data directory exists
