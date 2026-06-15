@@ -26,6 +26,7 @@ import { getDb as getRfbDb } from "./init";
 // Schema-initialiser for the dental DB. Lazy-required below to avoid
 // pulling in dental schema code when only rfb is requested.
 import { initDentalSchema } from "./init-dental";
+import { initExperiencesSchema } from "./init-experiences";
 
 export type DbBackend = "sqlite"; // 'postgres' later
 export type DbHandle = Database.Database;
@@ -91,6 +92,8 @@ export function getDb(vertical: string): DbHandle {
   // Vertical-specific schema-init. Add new verticals here.
   if (vertical === "dental") {
     initDentalSchema(db);
+  } else if (vertical === "experiences") {
+    initExperiencesSchema(db);
   } else {
     // Defensive: unknown verticals get an empty DB. We log so it's
     // obvious in boot logs if someone calls getDb('xyz') by mistake.
@@ -122,3 +125,4 @@ export function __resetDbFactoryForTesting(): void {
 // on boot when ENABLE_DENTAL=1 (defence-in-depth: dental.db doesn't
 // even get opened unless explicitly enabled).
 export { initDentalSchema };
+export { initExperiencesSchema };

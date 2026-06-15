@@ -1,0 +1,55 @@
+# Skjer — opplevelser-vertikal-konfig (Phase 7 scaffold)
+#
+# Brand-arbeidsnavn: "Skjer" (domene skjer.org sikres nå; skjer.no foretrukket hvis ledig).
+# Intern vertical_id = experiences (brand ≠ intern id, jf. rfb/dental).
+# Alle agenter er DISABLED initielt — enables én og én etter Phase A-F lander.
+#
+# Opplevelses-spesifikke felt (taksonomi, høste-kilder, SN2025-koder) ligger i
+# verticals/opplevelser/opplevelser-specific.yaml (leses direkte, ikke via getConfig()).
+# KPI-tresholds ligger i verticals/opplevelser/kpis.yaml (utenfor §P1.5-scope).
+
+vertical_id: experiences
+display_name: Skjer
+domain: skjer.org  # arbeidsnavn — bekreft skjer.no i registrar
+
+domain_dictionary:
+  entity: opplevelse
+  entity_plural: opplevelser
+  entity_plural_long: opplevelser og aktiviteter
+  service: opplevelser
+  buyer: besøkende
+
+agents:
+  marketing:
+    enabled: false
+    schedule: "30 7 * * *"
+    batch_size: 30
+  customer_service:
+    enabled: false
+    schedule: "0 * * * *"
+  enrichment:
+    enabled: false
+    schedule: "0 4 * * *"
+    cap_per_run: 40
+  harvest:                     # NB: høste-sweep (erstatter dental "discovery" Brreg-sweep)
+    enabled: false
+    schedule: "0 3 * * *"
+    cap_per_run: 100
+  brreg_verifier:              # match + aktiv-sjekk mot Brreg (verifikator-rolle)
+    enabled: false
+    schedule: "0 5 * * *"
+    cap_per_run: 100
+  contact_verifier:
+    enabled: false
+    schedule: "0 10 * * *"
+  visibility:
+    enabled: false
+    schedule: "0 7 * * *"
+  supervisor:
+    enabled: false
+    schedule: "0 12 * * *"
+
+connectors:
+  github_repo: slookisen/lokal
+  fly_app: lokal
+  resend_domain: rettfrabonden.com  # midlertidig — bytter til skjer-domenet når verifisert i Resend

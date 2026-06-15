@@ -12936,6 +12936,199 @@ console.log("\n── PR-104: dental claim-batch service ──");
   dbFactoryPr104.__resetDbFactoryForTesting();
 })();
 
+// ── Experiences scaffold (orchestrator-pr-15): experience-store ──────
+// Drives the experiences store directly against an in-memory
+// experiences.db via EXPERIENCES_DB_PATH=:memory: + db-factory reset.
+// Mirrors the synchronous-IIFE pattern proven by PR-100 / PR-104
+// (NOT async, NOT __setDbForTesting — those caused CI races).
+// Covers: schema init, insert+get an experience, discoverExperiences()
+// surfaces inserted rows, and the provider vertical-isolation CHECK
+// (vertical='experiences').
+console.log("\n── experiences scaffold: experience-store ──");
+(() => {
+  const prevPathExp = process.env.EXPERIENCES_DB_PATH;
+  process.env.EXPERIENCES_DB_PATH = ":memory:";
+
+  // Prior IIFEs (PR-100b / PR-104) mutate require.cache for db-factory;
+  // re-load db-factory AND experience-store together so they share one
+  // handle cache and a single :memory: DB.
+  const dbFactoryPathExp = require.resolve("../src/database/db-factory");
+  const expStorePathExp = require.resolve("../src/services/experience-store");
+  delete require.cache[dbFactoryPathExp];
+  delete require.cache[expStorePathExp];
+
+  const dbFactoryExp = require("../src/database/db-factory") as typeof import("../src/database/db-factory");
+  dbFactoryExp.__resetDbFactoryForTesting();
+
+  const expStore = require("../src/services/experience-store") as typeof import("../src/services/experience-store");
+  const {
+    createExperience,
+    getExperienceById,
+    discoverExperiences,
+    createProvider,
+    listCategories,
+    ExperienceSchema,
+  } = expStore;
+
+  // ── 1. Schema init: getDb('experiences') creates the experiences tables.
+  const dbExp = dbFactoryExp.getDb("experiences");
+  const tables = new Set(
+    (dbExp
+      .prepare("SELECT name FROM sqlite_master WHERE type='table'")
+      .all() as Array<{ name: string }>).map((r) => r.name)
+  );
+  for (const t of [
+    "experience_providers",
+    "experiences",
+    "experience_umbrellas",
+    "provider_umbrella_affiliations",
+    "experience_verifier_findings",
+  ]) {
+    assertTrue(tables.has(t), `exp-store-01: schema-init created table '${t}'`);
+  }
+
+  // ── 1b. Idempotency: re-running initExperiencesSchema must not throw.
+  {
+    let threw = false;
+    try {
+      dbFactoryExp.initExperiencesSchema(dbExp);
+    } catch {
+      threw = true;
+    }
+    assertTrue(!threw, "exp-store-01b: re-running initExperiencesSchema is idempotent");
+  }
+
+  // ── 2. Insert + get round-trip a single experience.
+  const expId = createExperience({
+    title: "Hvalsafari fra Tromsø",
+    category: "dyreliv_safari",
+    fylke: "Troms",
+    kommune: "Tromsø",
+    indoor_outdoor: "outdoor",
+    activity_tags: ["hvalsafari", "rib"],
+    season: ["winter"],
+    price_from: 1290,
+    confidence: "high",
+    verification_status: "verified",
+  });
+  assertTrue(!!expId, "exp-store-02a: createExperience returns an id");
+  {
+    const got = getExperienceById(expId);
+    assertTrue(got !== null, "exp-store-02b: getExperienceById finds the inserted row");
+    assertEq(got?.title, "Hvalsafari fra Tromsø", "exp-store-02c: title round-trips");
+    assertEq(got?.category, "dyreliv_safari", "exp-store-02d: category round-trips");
+    assertEq(got?.fylke, "Troms", "exp-store-02e: fylke round-trips");
+    // JSON-array fields hydrate back to arrays.
+    assertTrue(
+      Array.isArray(got?.activity_tags) && got!.activity_tags.includes("hvalsafari"),
+      "exp-store-02f: activity_tags JSON-array hydrates"
+    );
+    assertTrue(
+      Array.isArray(got?.season) && got!.season.includes("winter"),
+      "exp-store-02g: season JSON-array hydrates"
+    );
+    // A slug is auto-generated when none supplied.
+    assertTrue(typeof got?.slug === "string" && got!.slug!.length > 0, "exp-store-02h: slug auto-generated");
+  }
+
+  // ── 3. discoverExperiences() returns publishable inserted rows.
+  {
+    // Insert a second NON-publishable row (pending_verify) that must be filtered out.
+    createExperience({
+      title: "Uverifisert kajakktur",
+      category: "natur_friluft",
+      fylke: "Troms",
+      indoor_outdoor: "outdoor",
+      verification_status: "pending_verify", // not 'verified' → excluded
+      confidence: "high",
+    });
+
+    const all = discoverExperiences();
+    assertTrue(all.length >= 1, "exp-store-03a: discoverExperiences returns at least the verified row");
+    assertTrue(
+      all.some((e) => e.id === expId),
+      "exp-store-03b: discoverExperiences includes the inserted verified experience"
+    );
+    assertTrue(
+      all.every((e) => e.verification_status === "verified"),
+      "exp-store-03c: discoverExperiences only surfaces verified rows (pending_verify excluded)"
+    );
+
+    // Filter narrows by fylke.
+    const inTroms = discoverExperiences({ fylke: "Troms" });
+    assertTrue(
+      inTroms.some((e) => e.id === expId),
+      "exp-store-03d: discoverExperiences({fylke:'Troms'}) includes the row"
+    );
+    const inOslo = discoverExperiences({ fylke: "Oslo" });
+    assertTrue(
+      !inOslo.some((e) => e.id === expId),
+      "exp-store-03e: discoverExperiences({fylke:'Oslo'}) excludes the Troms row"
+    );
+
+    // listCategories aggregates verified rows.
+    const cats = listCategories();
+    assertTrue(
+      cats.some((c) => c.category === "dyreliv_safari" && c.count >= 1),
+      "exp-store-03f: listCategories counts the verified experience's category"
+    );
+  }
+
+  // ── 4. Vertical-isolation CHECK: provider table rejects vertical != 'experiences'.
+  {
+    // Happy path: a row with the default vertical inserts fine.
+    const provId = createProvider({ navn: "Tromsø Opplevelser AS", fylke: "Troms" });
+    assertTrue(!!provId, "exp-store-04a: createProvider inserts with default vertical='experiences'");
+    const provVertical = (
+      dbExp.prepare("SELECT vertical FROM experience_providers WHERE id = ?").get(provId) as
+        | { vertical: string }
+        | undefined
+    )?.vertical;
+    assertEq(provVertical, "experiences", "exp-store-04b: stored provider.vertical defaults to 'experiences'");
+
+    // Negative: a direct INSERT with vertical='dental' must violate the CHECK constraint.
+    assertThrows(
+      () =>
+        dbExp
+          .prepare(
+            "INSERT INTO experience_providers (id, navn, vertical) VALUES ('x-cross-vertical', 'Bad', 'dental')"
+          )
+          .run(),
+      /CHECK constraint|constraint failed/i,
+      "exp-store-04c: provider INSERT with vertical='dental' rejected by CHECK(vertical='experiences')"
+    );
+  }
+
+  // ── 5. UPDATE field allow-list: setBrregVerification never mutates id/vertical.
+  {
+    const provId2 = createProvider({ navn: "Allow-list Test AS", org_nr: "999000111", fylke: "Oslo" });
+    const ok = expStore.setBrregVerification(provId2, 1);
+    assertTrue(ok, "exp-store-05a: setBrregVerification returns true (row updated)");
+    const row = dbExp
+      .prepare("SELECT id, vertical, brreg_verified, brreg_active FROM experience_providers WHERE id = ?")
+      .get(provId2) as { id: string; vertical: string; brreg_verified: number; brreg_active: number };
+    assertEq(row.id, provId2, "exp-store-05b: id is unchanged by the UPDATE (not in allow-list)");
+    assertEq(row.vertical, "experiences", "exp-store-05c: vertical is unchanged by the UPDATE (not in allow-list)");
+    assertEq(row.brreg_verified, 1, "exp-store-05d: brreg_verified flipped to 1");
+    assertEq(row.brreg_active, 1, "exp-store-05e: brreg_active set to 1");
+  }
+
+  // ── 6. Zod validation rejects bad input (defence at the store boundary).
+  assertThrows(
+    () => ExperienceSchema.parse({ title: "", category: "x" }),
+    /title|too_small|String must contain|at least/i,
+    "exp-store-06: ExperienceSchema rejects empty title"
+  );
+
+  // Restore env state and reset factory so later tests start clean.
+  if (prevPathExp === undefined) {
+    delete process.env.EXPERIENCES_DB_PATH;
+  } else {
+    process.env.EXPERIENCES_DB_PATH = prevPathExp;
+  }
+  dbFactoryExp.__resetDbFactoryForTesting();
+})();
+
 // ── PR-107 (2026-06-04): zombie-claim sweep fix ──────────────────────
 // Tests for sweepExpiredClaims, zombie reclaim via claimBatch, truthful
 // claimStatus after timeout, and releaseBatch regression guard.

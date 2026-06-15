@@ -24,6 +24,7 @@ import marketplaceRoutes from "./routes/marketplace";
 import { catalogRouter as marketplaceCatalogRouter, adminCatalogRouter } from "./routes/marketplace-catalog";
 import { cartRouter, adminOrderRouter } from "./routes/marketplace-cart";
 import dentalRoutes from "./routes/dental";
+import opplevelserRoutes from "./routes/opplevelser";
 import mcpRoutes from "./routes/mcp";
 import seoRoutes from "./routes/seo";
 import discoveryRoutes from "./routes/discovery";
@@ -78,6 +79,12 @@ if (process.env.ENABLE_DENTAL === "1") {
   const { getDb: getVerticalDb } = require("./database/db-factory");
   getVerticalDb("dental"); // triggers initDentalSchema(db) inside the factory
   console.log("[boot] dental vertical enabled — /app/data/dental.db ready");
+}
+
+if (process.env.ENABLE_EXPERIENCES === "1") {
+  const { getDb: getVerticalDb } = require("./database/db-factory");
+  getVerticalDb("experiences"); // triggers initExperiencesSchema inside the factory
+  console.log("[boot] experiences vertical enabled — /data/experiences.db ready");
 }
 
 const app = express();
@@ -223,6 +230,7 @@ app.use("/api/marketplace/catalog", marketplaceCatalogRouter);
 // Phase 1: cart + order REST routes
 app.use("/api/marketplace", cartRouter);
 app.use("/api/tannlege", dentalRoutes);
+app.use("/api/opplevelser", opplevelserRoutes);
 app.use("/mcp", mcpRoutes);
 app.use("/", a2aRoutes);
 
