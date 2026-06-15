@@ -6,6 +6,18 @@
 // Reference: supervisor-inbox/2026-05-07-work-order-16-phase5.3-cross-source.md
 // PR-19 (2026-05-10): added per-field verdict so the verifier can split the
 // gate into three buckets — pool_eligible / review_required / data_insufficient.
+//
+// orchestrator-pr-13 (2026-06-15): consult the conservative contact-normalizer
+// as an ADDITIVE relaxation step for the address/phone axes so that two
+// high-quality sources whose values differ only in FORMATTING (e.g.
+// "+47 911 22 333" vs "91122333", or "Bjørkeveien 20B" vs
+// "Bjørkeveien 20B, 1940 Bjørkelangen") are counted as AGREEING rather than
+// forced into review_required. This never overrides a genuine disagreement
+// and is not applied to the website / domain-coherence axis.
+import {
+  addressesMatch as contactAddressesMatch,
+  phonesMatch as contactPhonesMatch,
+} from "./contact-normalizer";
 
 export type FieldName = "address" | "phone" | "business_status";
 export type SourceTier = "S" | "A" | "B" | "C";
@@ -266,6 +278,45 @@ export function crossSourceAgreement(
       sources_used,
       verdict: "pool_eligible",
     };
+  }
+
+  // ── orchestrator-pr-13: conservative formatting-only relaxation ───────────
+  // ADDITIVE. Only reached when the grouping above did NOT already find ≥2
+  // agreeing high-quality sources. For the address/phone axes only, consult
+  // the conservative contact-normalizer predicates: two sources AGREE when
+  // their values are formatting-equivalent, one is a clean whole-token prefix
+  // of the other (address), or they differ only by an appended postal tail
+  // (address). The predicates reject genuinely different street/number/phone
+  // values and conflicting postcodes, so this can only clear formatting-only
+  // false positives — it can never make two clearly-different values agree.
+  // business_status is intentionally excluded (its synonym handling lives in
+  // normalizeBusinessStatus); the website/domain-coherence axis is untouched.
+  if (fieldName === "address" || fieldName === "phone") {
+    const match = (a: string, b: string): boolean =>
+      fieldName === "address"
+        ? contactAddressesMatch(a, b)
+        : contactPhonesMatch(a, b);
+    // A group AGREES when some anchor record is matched by ≥1 OTHER
+    // high-quality record (≥2 sources total clustering on that anchor).
+    // Pairwise against a fixed anchor — no transitive chaining — so the
+    // built-in postcode-conflict / different-number guards always apply.
+    let relaxedGroupCount = 0;
+    for (let i = 0; i < normalized.length; i++) {
+      let count = 1; // the anchor itself
+      for (let j = 0; j < normalized.length; j++) {
+        if (i === j) continue;
+        if (match(normalized[i].value, normalized[j].value)) count++;
+      }
+      if (count > relaxedGroupCount) relaxedGroupCount = count;
+    }
+    if (relaxedGroupCount >= 2) {
+      return {
+        agree: true,
+        source_count: valid.length,
+        sources_used,
+        verdict: "pool_eligible",
+      };
+    }
   }
 
   // ── Disagreement among all high-quality sources ───────────────────────────
