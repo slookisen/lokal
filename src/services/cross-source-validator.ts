@@ -50,6 +50,49 @@ export function tierForSource(sourceType: string): SourceTier {
   return "C";
 }
 
+// ─── Inference-source deny-list (orchestrator-pr-16, Guard #2) ───────────────
+//
+// AI/heuristic "sources" that are NOT real evidence of a producer's factual
+// data. They are inferences (category guessing, seasonal priors, name analysis,
+// generic web-search snippets) and must NEVER, on their own, make a factual
+// field (products / address / phone / about-specifics) trustworthy enough for
+// the outreach pool.
+//
+// Real failure that motivated this (2026-06-15): Bærsentralen got the product
+// "jordbær" written from `seasonal_knowledge` / `category_inference` — they
+// actually do *multer*. Fabricated factual content sourced solely from a guess.
+//
+// These types are already Tier-C (tierForSource → "C") and Tier-C is excluded
+// from the >=2-high-quality-source agreement path, so they can never make a
+// field `pool_eligible` by themselves. This deny-list makes that explicit and
+// adds two things on top:
+//   1. inference records do NOT count toward `source_count` (honest counting —
+//      a field with 3 inference guesses is not "well-sourced").
+//   2. a verifier flag is raised when a factual field has ONLY inference
+//      sources (factualFieldHasOnlyInference) so it is quarantined/re-enriched
+//      rather than silently promoted.
+//
+// NB: this is a FACTUAL-FIELD guard only. It deliberately does not touch how
+// emails (incl. free-mail gmail/hotmail) are handled — see Guard notes.
+const INFERENCE_SOURCE_TYPES: ReadonlySet<string> = new Set([
+  "category_inference",
+  "seasonal_knowledge",
+  "name_analysis",
+  "name-analysis",
+  "web_search",
+  "web-search",
+]);
+
+// True when a provenance source_type is an AI/heuristic inference rather than
+// real evidence. Matches both the bare token ("web_search") and the prefixed
+// form the enrichment pipeline writes ("web_search:gmail.com") — the part
+// before the first ':' is compared against the deny-list.
+export function isInferenceSource(sourceType: string | null | undefined): boolean {
+  if (!sourceType) return false;
+  const head = String(sourceType).trim().toLowerCase().split(":")[0]!;
+  return INFERENCE_SOURCE_TYPES.has(head);
+}
+
 // ─── Field-specific value normalization ────────────────────────────────────
 
 function normalizeAddress(raw: string): string {
@@ -160,14 +203,38 @@ export function crossSourceAgreement(
   }
 
   // Filter out records without a usable value
-  const valid = records.filter((r) => typeof r.value === "string" && r.value.trim() !== "");
+  const allValid = records.filter((r) => typeof r.value === "string" && r.value.trim() !== "");
 
-  if (valid.length === 0) {
+  // Guard #2 (orchestrator-pr-16): inference source_types (category_inference,
+  // seasonal_knowledge, name_analysis, web_search, …) are NOT real evidence.
+  // They must not count toward source_count nor toward agreement. We keep them
+  // out of `valid` entirely so every downstream count (source_count, the
+  // Tier-S/A/B partitions, conflict listing) ignores them. They remain visible
+  // in `sources_used` for observability/debugging only.
+  const valid = allValid.filter((r) => !isInferenceSource(r.source_type));
+
+  if (allValid.length === 0) {
     // PR-19: 0 sources → the back-catalogue case. Cannot review without data.
     return { agree: false, source_count: 0, sources_used: [], verdict: "data_insufficient" };
   }
 
-  const sources_used = valid.map((r) => r.source_type);
+  // sources_used lists EVERY source we saw (incl. inference) so the review
+  // queue can show "only had a web_search guess"; source_count below counts
+  // evidence only.
+  const sources_used = allValid.map((r) => r.source_type);
+
+  if (valid.length === 0) {
+    // Only inference "sources" present → no real evidence. Treat exactly like
+    // the 1-source-but-unconfirmable case so the field stays out of the pool
+    // (review_required, not data_insufficient — we DO have a guessed value a
+    // human could check / re-enrich).
+    return {
+      agree: false,
+      source_count: 0,
+      sources_used,
+      verdict: "review_required",
+    };
+  }
 
   // ── Tier-S override ───────────────────────────────────────────────────────
   const tierSRecord = valid.find((r) => tierForSource(r.source_type) === "S");
@@ -912,4 +979,310 @@ export function coerceProvenanceToArrayShape(
     // null / primitive / undefined → skip (treated as [] by crossSourceAgreement)
   }
   return result;
+}
+
+// ─── Guard #1 — website-ownership name-match (orchestrator-pr-16) ─────────────
+//
+// The wrong-entity fix. When the pipeline extracts contact/about data from a
+// producer's homepage, it currently trusts whatever site is stored as the
+// producer's own (recording Tier-A `homepage` provenance). That is how
+// "Grette Andelslandbruk" ended up anchored to grettegaard.no — which is a
+// DIFFERENT business (Grette *Gård*). Before trusting a fetched page as the
+// producer's own site we require the producer's name to actually be reflected
+// by the page/host.
+//
+// ── The Grette-vs-Lega discriminator (read carefully) ────────────────────────
+// A bare name-stem match is NOT enough, because two unrelated businesses can
+// share a surname/place stem:
+//   • "Grette Andelslandbruk" → grettegaard.no  (Grette *Gård*) — WRONG entity,
+//     yet the stem "grette" appears both in the domain label ("grettegaard")
+//     AND on the page (it's literally Grette Gård's site). A stem check alone
+//     would WRONGLY accept it.
+//   • "Lega — Rauland" → lega.no  (their real site) — CORRECT, stem "lega" is
+//     the whole domain label.
+//
+// The distinguishing signal is the *business-type token in the domain*:
+//   grettegaard = "grette" + "gaard". The producer is an *andelslandbruk*, NOT
+//   a *gård*. The domain advertises a business-type word ("gaard"/"gård") that
+//   the producer's own name does NOT carry → the domain names a DIFFERENT
+//   entity-type → ownership is NOT confirmed by the host, and we additionally
+//   refuse to let a shared bare stem on the page rescue it.
+//   lega = "lega" with NO leftover business-type token → the domain label is
+//   fully explained by the producer's name → ownership confirmed.
+//
+// Exact rule implemented by pageMentionsProducer(producerName, signals):
+//   stems = nameStems(producerName)   (≥4-char identity tokens, accent-stripped,
+//                                       business-type/stopwords removed)
+//   1. If there are no usable stems → return true (cannot judge; be conservative,
+//      never downgrade a producer we can't evaluate).
+//   2. HOST check: take the registrable label (e.g. "grettegaard", "lega"),
+//      greedily remove every stem occurrence. Classify the leftover:
+//        - leftover empty / only tiny (<3) fragments  → host CONFIRMS ownership.
+//        - leftover is a BUSINESS-TYPE word the producer's own name does NOT
+//          contain (gaard/gard/ysteri/bakeri/…)        → host CONTRADICTS
+//          (different entity-type) — this is the grettegaard case.
+//        - any other leftover                          → host is INCONCLUSIVE.
+//   3. PAGE-TEXT check: a stem appears as a whole word in the page text.
+//        - Accept UNLESS the host CONTRADICTS (step 2). When the domain itself
+//          names a different business-type, a shared bare stem on that page is
+//          exactly the Grette trap, so we do NOT let it rescue ownership.
+//   Result: confirmed iff host CONFIRMS, OR (page-text stem hit AND host does
+//   not CONTRADICT).
+//
+// This is intentionally simple and advisory: when it returns false the caller
+// records the website ownership as `unverified` (omits the Tier-A homepage
+// provenance) so the verifier quarantines the agent from the pool — it never
+// deletes the producer or blocks contactability.
+
+
+// Local producer-name stemmer (kept dependency-free so cross-source-validator
+// does not import search-enrich, which already imports FROM this module).
+// Aligned with search-enrich.nameStems: lowercase → accent-strip → split on
+// non-alphanumerics → drop generic business/legal stopwords → keep tokens
+// length >= 4, plus a trailing-'s'-stripped (genitive) variant.
+//   "Grette Andelslandbruk" → ["grette"]   (andelslandbruk is a stopword)
+//   "Lega — Rauland"        → ["lega", "rauland"]
+//   "Nalums Gardsbutikk"    → ["nalums", "nalum"]
+const NAME_STEM_STOPWORDS: ReadonlySet<string> = new Set([
+  "gard", "gaard", "gardsbutikk", "gaardsbutikk",
+  "as", "sa", "og", "the", "ad", "da",
+  // business-type / legal-form words carry no entity identity for a stem.
+  "andelslandbruk", "ysteri", "ysteriet", "bakeri", "bakeriet",
+  "bryggeri", "bryggeriet", "gartneri", "meieri", "meieriet",
+  "samvirke", "kooperativ",
+]);
+
+function producerNameStems(name: string): string[] {
+  if (!name) return [];
+  const lowered = stripAccentsLocal(name.toLowerCase());
+  const rawTokens = lowered.split(/[^a-z0-9]+/).filter(Boolean);
+  const out: string[] = [];
+  const seen = new Set<string>();
+  for (const tok of rawTokens) {
+    if (NAME_STEM_STOPWORDS.has(tok)) continue;
+    if (tok.length < 4) continue;
+    if (!seen.has(tok)) { seen.add(tok); out.push(tok); }
+    if (tok.endsWith("s")) {
+      const stripped = tok.slice(0, -1);
+      if (stripped.length >= 3 && !seen.has(stripped)) { seen.add(stripped); out.push(stripped); }
+    }
+  }
+  return out;
+}
+
+// Business-type / legal-form tokens that commonly appear in Norwegian producer
+// domains and names. Stored accent-stripped + lowercase. A leftover domain
+// fragment that is one of these — and that the producer's OWN name does not
+// also contain — signals the domain belongs to a different entity-type.
+const BUSINESS_TYPE_TOKENS: ReadonlySet<string> = new Set([
+  "gard", "gaard", "gards", "gaards",
+  "ysteri", "ysteriet", "meieri", "meieriet",
+  "bakeri", "bakeriet", "bryggeri", "bryggeriet",
+  "gartneri", "slakteri", "slakthus", "slakthuset",
+  "andelslandbruk", "samvirke", "kooperativ",
+  "honning", "biri", "frukthage", "frukt",
+  "saft", "safteri", "cideri", "destilleri",
+  "mat", "gardsmat", "gaardsmat", "lokalmat",
+  "fisk", "sjomat", "laks", "villsau",
+  "farm", "farms", "dairy", "creamery",
+]);
+
+// Same accent-stripping the existing name/email matchers use (search-enrich's
+// stripNorwegianAccents is not exported, so we keep a local copy aligned with
+// it: å→a, æ→ae, ø→o, plus NFD diacritic strip).
+function stripAccentsLocal(s: string): string {
+  return s
+    .replace(/å/g, "a").replace(/Å/g, "a")
+    .replace(/æ/g, "ae").replace(/Æ/g, "ae")
+    .replace(/ø/g, "o").replace(/Ø/g, "o")
+    .normalize("NFD")
+    .replace(/[̀-ͯ]/g, "");
+}
+
+// Collapse the "aa" digraph to a single "a" so the two common ASCII renderings
+// of Norwegian "å" compare equal: domain "grettegaard" vs name "Grette Gård"
+// (→ "gard"), "aakre" vs "akre", etc. Limited to 'aa' (not 'aaa') to avoid
+// over-collapsing. Mirrors normalizedBrandToken's aa-normalization.
+function collapseAa(s: string): string {
+  return s.replace(/(?<!a)aa(?!a)/g, "a");
+}
+
+// All accent-stripped name tokens (length >= 3), INCLUDING business-type/legal
+// words — used to know which business-type word (if any) the producer's name
+// itself carries, so "Grette Gård" + gard.no is NOT contradicted while
+// "Grette Andelslandbruk" + grettegaard.no IS.
+function allNameTokens(name: string): Set<string> {
+  const lowered = stripAccentsLocal((name || "").toLowerCase());
+  const toks = lowered.split(/[^a-z0-9]+/).filter((t) => t.length >= 3);
+  const out = new Set<string>();
+  for (const t of toks) {
+    out.add(t);
+    out.add(collapseAa(t)); // gard ≡ gaard, akre ≡ aakre
+  }
+  return out;
+}
+
+type HostOwnership = "confirms" | "contradicts" | "inconclusive";
+
+// Classify what the registrable host label tells us about ownership.
+function classifyHost(
+  host: string | null | undefined,
+  stems: string[],
+  nameTokens: Set<string>
+): HostOwnership {
+  if (!host || !host.trim()) return "inconclusive";
+  const parsed = hostFromUrlLike(host);
+  if (!parsed) return "inconclusive";
+  // Derive the registrable label on the SAME normalization ground as the stems:
+  // IDN-decode (punycode -> unicode), accent-strip, drop hyphens, lowercase.
+  // This lets us subtract the (accent-stripped) producer stems from the label
+  // and inspect what business-type word, if any, is left over.
+  const root = registrableDomain(parsed);
+  const label = stripAccentsLocal(decodePunycodeLabel(root.split(".")[0] ?? root))
+    .replace(/-/g, "")
+    .toLowerCase();
+  if (!label) return "inconclusive";
+
+  // Greedily remove every stem occurrence from the label.
+  let leftover = label;
+  for (const st of stems) {
+    if (!st) continue;
+    // remove all occurrences of the stem
+    leftover = leftover.split(st).join(" ");
+  }
+  // Split leftover into fragments; drop tiny (<3) noise fragments.
+  const frags = leftover.split(/[^a-z0-9]+/).filter((f) => f.length >= 3);
+
+  if (frags.length === 0) {
+    // Nothing meaningful left → label is fully explained by the producer name.
+    // But only COUNT as confirms if at least one stem actually appeared in the
+    // label (avoid vacuously confirming a label that shares no stem at all).
+    const anyStemInLabel = stems.some((st) => st && label.includes(st));
+    return anyStemInLabel ? "confirms" : "inconclusive";
+  }
+
+  // Leftover fragments exist. If any leftover fragment is a business-type word
+  // that the producer's OWN name does not contain, the domain advertises a
+  // different entity-type → contradiction (the grettegaard case). Compare under
+  // aa-collapse so "gaard" (domain) and "gard" (name) are recognised as the
+  // same business-type word.
+  for (const f of frags) {
+    const fc = collapseAa(f);
+    const isBusinessType = BUSINESS_TYPE_TOKENS.has(f) || BUSINESS_TYPE_TOKENS.has(fc);
+    const inOwnName = nameTokens.has(f) || nameTokens.has(fc);
+    if (isBusinessType && !inOwnName) {
+      return "contradicts";
+    }
+  }
+  // Otherwise inconclusive (leftover is some other word — e.g. a region the
+  // page-text check can still confirm via a stem hit).
+  return "inconclusive";
+}
+
+export interface PageMentionSignals {
+  /** Visible page text (title + h1 + body) fetched from the candidate site. */
+  pageText?: string | null;
+  /** The candidate site host or URL (e.g. "grettegaard.no" or full URL). */
+  host?: string | null;
+}
+
+/**
+ * Guard #1 — does this page/host plausibly belong to `producerName`?
+ *
+ * Returns true when ownership is CONFIRMED (safe to record a Tier-A `homepage`
+ * source), false when it is UNVERIFIED (caller should mark website ownership
+ * unverified / omit the homepage provenance so the verifier quarantines it).
+ *
+ * PURE. Conservative: unknown/unjudgeable inputs return true (never downgrade
+ * a producer we cannot evaluate). See the module header for the full rule and
+ * the Grette-vs-Lega discriminator.
+ */
+export function pageMentionsProducer(
+  producerName: string,
+  signals: PageMentionSignals | string
+): boolean {
+  // Convenience: a bare string is treated as page text.
+  const sig: PageMentionSignals =
+    typeof signals === "string" ? { pageText: signals } : (signals || {});
+
+  const stems = producerNameStems(producerName);
+  if (stems.length === 0) {
+    // No usable identity stem (e.g. name is only "Gård AS") → cannot judge.
+    return true;
+  }
+
+  const nameTokens = allNameTokens(producerName);
+  const hostVerdict = classifyHost(sig.host, stems, nameTokens);
+
+  if (hostVerdict === "confirms") return true;
+
+  // Page-text whole-word stem hit.
+  let pageHasStem = false;
+  if (sig.pageText && sig.pageText.trim()) {
+    const hay = stripAccentsLocal(sig.pageText.toLowerCase());
+    pageHasStem = stems.some((st) => {
+      if (!st) return false;
+      // whole-word-ish match: stem bounded by non-alphanumerics or string ends.
+      const re = new RegExp(`(^|[^a-z0-9])${escapeRegExp(st)}([^a-z0-9]|$)`);
+      return re.test(hay);
+    });
+  }
+
+  if (pageHasStem && hostVerdict !== "contradicts") return true;
+
+  // Either no stem on the page, or the host actively contradicts (different
+  // business-type domain) and only a shared bare stem appears → UNVERIFIED.
+  return false;
+}
+
+function escapeRegExp(s: string): string {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+// ─── Guard #2 — verifier flag: factual field has ONLY inference sources ──────
+//
+// Factual fields that must not be promoted on AI inference alone. (about is a
+// long-form description; its FACTUAL specifics are captured via products/
+// address/phone — the cross-checkable fields — so we gate those.)
+export const FACTUAL_FIELDS: readonly string[] = ["products", "address", "phone"];
+
+/**
+ * True when `records` for a factual field contain at least one usable value
+ * but EVERY usable source is an inference type (category_inference,
+ * seasonal_knowledge, name_analysis, web_search, …). Such a field was
+ * fabricated from a guess and should be quarantined / re-enriched, not
+ * promoted. Returns false when there are no values at all (that is the
+ * data_insufficient case, handled elsewhere) or when ≥1 real source exists.
+ */
+export function fieldHasOnlyInferenceSources(
+  records: ProvenanceRecord[] | ProvenanceRecord | unknown
+): boolean {
+  let arr: ProvenanceRecord[];
+  if (!records) arr = [];
+  else if (Array.isArray(records)) arr = records as ProvenanceRecord[];
+  else if (typeof records === "object") arr = [records as ProvenanceRecord];
+  else arr = [];
+
+  const withValue = arr.filter(
+    (r) => r && typeof r.value === "string" && r.value.trim() !== ""
+  );
+  if (withValue.length === 0) return false; // no data → not an inference-only case
+  return withValue.every((r) => isInferenceSource(r.source_type));
+}
+
+/**
+ * Scan an agent's field_provenance and return the list of FACTUAL fields that
+ * are sourced SOLELY from inference. Empty array → no inference-only factual
+ * fields. Used by the verifier to raise an advisory `inference_only_field:<f>`
+ * flag and quarantine the agent from the pool.
+ */
+export function factualFieldsWithOnlyInference(
+  fieldProvenance: Record<string, ProvenanceRecord[] | ProvenanceRecord | unknown>
+): string[] {
+  const out: string[] = [];
+  if (!fieldProvenance || typeof fieldProvenance !== "object") return out;
+  for (const field of FACTUAL_FIELDS) {
+    if (fieldHasOnlyInferenceSources(fieldProvenance[field])) out.push(field);
+  }
+  return out;
 }

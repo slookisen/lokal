@@ -13,7 +13,7 @@ import { slugify } from "../utils/slug";
 import { addUtmParams } from "../utils/url-utm";
 import { isBlocked, add as blocklistAdd, list as blocklistList, remove as blocklistRemove } from "../services/blocklist-service";
 import { mergeFieldProvenance } from "./admin-knowledge";
-import { crossSourceAgreement, isAcceptableHomepageEmail, type FieldName } from "../services/cross-source-validator";
+import { crossSourceAgreement, isAcceptableHomepageEmail, pageMentionsProducer, type FieldName } from "../services/cross-source-validator";
 
 // ─── Marketplace Routes ───────────────────────────────────────
 // These are the OPEN endpoints that make Lokal a marketplace.
@@ -4230,6 +4230,29 @@ router.post("/admin/homepage-provenance-batch", async (req: Request, res: Respon
     return null;
   }
 
+  /**
+   * Extract visible page text (title + headings + de-tagged body) for the
+   * website-ownership name-match (Guard #1). Strips <script>/<style>, decodes a
+   * few common entities, collapses whitespace, and caps length so a huge page
+   * doesn't blow up the regex check.
+   */
+  function extractPageText(rawHtml: string): string {
+    let h = rawHtml;
+    // Pull the <title> explicitly so it survives tag-stripping prominence.
+    const titleMatch = h.match(/<title[^>]*>([\s\S]*?)<\/title>/i);
+    const title = titleMatch ? titleMatch[1] : "";
+    // Drop script/style blocks entirely.
+    h = h.replace(/<script[\s\S]*?<\/script>/gi, " ")
+         .replace(/<style[\s\S]*?<\/style>/gi, " ");
+    const body = h
+      .replace(/<[^>]+>/g, " ")
+      .replace(/&nbsp;/gi, " ")
+      .replace(/&amp;/gi, "&")
+      .replace(/&aelig;/gi, "æ").replace(/&oslash;/gi, "ø").replace(/&aring;/gi, "å")
+      .replace(/\s+/g, " ");
+    return `${title} ${body}`.slice(0, 200_000);
+  }
+
   // ── Per-agent processing ─────────────────────────────────────────────────
 
   const CONCURRENCY = 3;
@@ -4238,6 +4261,7 @@ router.post("/admin/homepage-provenance-batch", async (req: Request, res: Respon
   type AgentOutcome =
     | { agentId: string; status: "enriched"; fieldsFound: string[]; provenanceWritten: boolean }
     | { agentId: string; status: "no_data" }
+    | { agentId: string; status: "ownership_unverified" }
     | { agentId: string; status: "fetch_error"; error: string }
     | { agentId: string; status: "not_found" };
 
@@ -4252,8 +4276,8 @@ router.post("/admin/homepage-provenance-batch", async (req: Request, res: Respon
       | undefined;
 
     const agentRow = db
-      .prepare("SELECT url FROM agents WHERE id = ?")
-      .get(agentId) as { url: string | null } | undefined;
+      .prepare("SELECT url, name FROM agents WHERE id = ?")
+      .get(agentId) as { url: string | null; name: string | null } | undefined;
 
     if (!kRow) return { agentId, status: "not_found" };
 
@@ -4299,6 +4323,48 @@ router.post("/admin/homepage-provenance-batch", async (req: Request, res: Respon
     const extractedEmail = extractEmail(html);
     const extractedPhone = extractPhone(html);
     const extractedAddress = extractAddress(html);
+
+    // ── Guard #1: website-ownership name-match (orchestrator-pr-16) ──────────
+    // Before recording ANY homepage (Tier-A) provenance from this page, verify
+    // the producer's own name is actually reflected by the page/host. This is
+    // the wrong-entity fix: "Grette Andelslandbruk" was anchored to
+    // grettegaard.no (Grette *Gård* — a different business). When the page does
+    // not mention the producer, we do NOT trust it as the producer's own site:
+    // we omit the homepage provenance and stamp website_ownership:"unverified"
+    // so the verifier quarantines the agent from the pool (advisory — the
+    // producer is never deleted and contactability is untouched).
+    const producerName = (agentRow?.name ?? "").toString().trim();
+    const pageText = extractPageText(html);
+    const ownershipVerified = producerName
+      ? pageMentionsProducer(producerName, { pageText, host: fetchUrl })
+      : true; // no name on file → cannot judge → conservative (do not downgrade)
+
+    if (!ownershipVerified) {
+      // Record an advisory marker (no homepage provenance written). Merge into
+      // the existing field_provenance under a reserved key so the verifier /
+      // admin tooling can see why this site was not trusted.
+      const nowIsoU = new Date().toISOString();
+      let existingProvU: Record<string, unknown> = {};
+      if (kRow.field_provenance) {
+        try {
+          const parsed = JSON.parse(kRow.field_provenance);
+          if (parsed && typeof parsed === "object") existingProvU = parsed as Record<string, unknown>;
+        } catch { /* tolerate junk */ }
+      }
+      existingProvU.website_ownership = {
+        status: "unverified",
+        reason: "homepage_name_mismatch",
+        url: fetchUrl,
+        checked_at: nowIsoU,
+      };
+      db.prepare(
+        "UPDATE agent_knowledge SET field_provenance = ?, updated_at = ? WHERE agent_id = ?"
+      ).run(JSON.stringify(existingProvU), nowIsoU, agentId);
+      console.log(
+        `[homepage-provenance] ${agentId} (${producerName}) website ownership UNVERIFIED for ${fetchUrl} — page does not mention producer; homepage source NOT recorded`
+      );
+      return { agentId, status: "ownership_unverified" };
+    }
 
     const nowIso = new Date().toISOString();
 
@@ -4396,6 +4462,9 @@ router.post("/admin/homepage-provenance-batch", async (req: Request, res: Respon
   // Summarise.
   const processed = outcomes.length;
   const enriched = outcomes.filter((o) => o.status === "enriched").length;
+  // Guard #1: producers whose fetched site did not mention them — homepage
+  // source withheld, website_ownership stamped unverified.
+  const ownershipUnverified = outcomes.filter((o) => o.status === "ownership_unverified").length;
   const provenanceWritten = outcomes.filter(
     (o): o is Extract<AgentOutcome, { status: "enriched" }> => o.status === "enriched"
   ).reduce((acc, o) => acc + (o.provenanceWritten ? 1 : 0), 0);
@@ -4418,6 +4487,7 @@ router.post("/admin/homepage-provenance-batch", async (req: Request, res: Respon
     data: {
       processed,
       enriched,
+      ownership_unverified: ownershipUnverified,
       provenance_written: provenanceWritten,
       by_field: byField,
       errors,

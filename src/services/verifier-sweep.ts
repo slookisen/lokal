@@ -62,6 +62,13 @@ export interface SweepJobState {
   // prevalence across the bulk sweep without querying the DB directly.
   email_domain_mismatch: number;
   thin_content: number;
+  // orchestrator-pr-16: factual fields sourced solely from AI inference
+  // (category_inference/seasonal_knowledge/name_analysis/web_search) — these
+  // agents were quarantined from the pool, not promoted.
+  inference_only_field: number;
+  // orchestrator-pr-16: website-ownership unverified (homepage name-mismatch)
+  // surfaced by Guard #1 at crawl time; counted here when the flag is present.
+  website_ownership_unverified: number;
 }
 
 // ─── Singleton state ─────────────────────────────────────────────────────────
@@ -85,6 +92,8 @@ let _sweepJob: SweepJobState = {
   lastChunkAt: null,
   email_domain_mismatch: 0,
   thin_content: 0,
+  inference_only_field: 0,
+  website_ownership_unverified: 0,
 };
 
 export function getSweepJob(): Readonly<SweepJobState> {
@@ -182,6 +191,8 @@ export function startSweep(opts: StartSweepOpts = {}): StartSweepResult {
     lastChunkAt: null,
     email_domain_mismatch: 0,
     thin_content: 0,
+    inference_only_field: 0,
+    website_ownership_unverified: 0,
   };
 
   // ── Background loop (fire-and-forget) ──────────────────────────────────────
@@ -248,6 +259,8 @@ export function startSweep(opts: StartSweepOpts = {}): StartSweepResult {
         // orch-pr-20260614-4: flag-level counters (single source of truth in VerifierResult.flags).
         _sweepJob.email_domain_mismatch += results.filter((r) => r.flags.includes("email_domain_mismatch")).length;
         _sweepJob.thin_content += results.filter((r) => r.flags.includes("thin_content")).length;
+        _sweepJob.inference_only_field += results.filter((r) => r.flags.some((f) => f.startsWith("inference_only_field"))).length;
+        _sweepJob.website_ownership_unverified += results.filter((r) => r.flags.includes("website_ownership_unverified")).length;
         _sweepJob.lastChunkAt = new Date().toISOString();
 
         console.log(
