@@ -50,6 +50,17 @@
 // undefined, and (3) wrap mergeFieldProvenance + parse in try/catch so
 // any unexpected shape returns a 500 JSON instead of crashing express.
 //
+// orch-pr-17 (2026-06-15): SAFE correct-not-just-add. Opt-in via
+// ?allow_correct=1 (or body { allow_correct: true }). When ON, a factual
+// column (products/address/phone/about) that would OVERWRITE a populated,
+// differing legacy value is gated by canCorrectFactualField(): allowed ONLY
+// when the existing value is known-bad legacy (inference-only provenance OR
+// website_ownership=unverified) AND the new value has >=2 Tier-A sources or
+// is owner-attested (Tier-S); never when the field is curated/locked, the
+// existing value already has >=2 Tier-A, or the new value is inference-sourced.
+// Unsafe overwrites are dropped (legacy preserved) and reported in
+// response.corrections. Default OFF leaves write behaviour byte-for-byte unchanged.
+//
 // Auth: X-Admin-Key (same pattern as admin-outreach-pool).
 //
 // Reference:
@@ -223,6 +234,167 @@ export function mergeFieldProvenance(
   return out;
 }
 
+// ─── orch-pr-17: SAFE "correct-not-just-add" overwrite guard ─────────────────
+//
+// Enrichment is additive by default — it fills MISSING factual fields but never
+// overwrites a populated legacy value, so a *wrong* legacy value (e.g. a product
+// list fabricated from category_inference, or contact data scraped off a
+// wrong-entity site) persists forever. This guard adds a narrowly-scoped,
+// OPT-IN ("?allow_correct=1" / body { allow_correct: true }) overwrite path for
+// the factual fields products / address / phone / about.
+//
+// A factual field's populated legacy value MAY be overwritten ONLY when BOTH:
+//   (1) the EXISTING value is KNOWN-BAD legacy — its provenance is inference-only
+//       (no real Tier-A/B/S source, just category_inference / seasonal_knowledge
+//       / name_analysis / web_search), OR the producer's website was flagged
+//       website_ownership.status == "unverified" (wrong-entity), AND
+//   (2) the NEW value is well-sourced — >=2 distinct Tier-A sources
+//       (homepage + google_places) agree, OR it is owner-attested (Tier-S).
+//
+// And NEVER overwrite when ANY of these hold (hard refusals, checked first):
+//   - the field is owner-curated / locked (curatedFields[field]).
+//   - the existing value already has >=2 distinct Tier-A sources (already
+//     well-sourced — not "known-bad legacy").
+//   - the NEW value is inference-sourced (its incoming provenance carries no
+//     Tier-A/Tier-S evidence — only inference guesses).
+//
+// Default OFF: without the opt-in flag this guard never runs and the endpoint's
+// column-write behaviour is byte-for-byte unchanged. The guard also only ever
+// REMOVES an unsafe overwrite from the write set — it never adds or fabricates a
+// write — so the worst case is "legacy value preserved", never data loss.
+
+// Factual fields eligible for correction. Keyed identically in body columns and
+// in field_provenance (address/phone/products/about).
+export const CORRECTABLE_FACTUAL_FIELDS: readonly string[] = ["products", "address", "phone", "about"];
+
+// Inference "source_types" that are NOT real evidence (aligned with PR-16's
+// deny-list). Kept local so this guard does not depend on PR-16 being merged.
+const INFERENCE_SOURCE_TYPES: ReadonlySet<string> = new Set([
+  "category_inference",
+  "seasonal_knowledge",
+  "name_analysis",
+  "name-analysis",
+  "web_search",
+  "web-search",
+]);
+
+// True when a provenance source_type is an AI/heuristic inference rather than
+// real evidence. Matches the bare token ("web_search") and the prefixed form the
+// pipeline writes ("web_search:gmail.com") — compares the part before the ':'.
+export function isInferenceSourceType(sourceType: string | null | undefined): boolean {
+  if (!sourceType) return false;
+  const head = String(sourceType).trim().toLowerCase().split(":")[0]!;
+  return INFERENCE_SOURCE_TYPES.has(head);
+}
+
+// Tier classification for the correction guard — local + dependency-free so it
+// stays aligned with the validator's TIER_A/TIER_S without importing extra
+// surface. Compares the head token before ':' so "homepage:..." still counts.
+const CORRECT_TIER_A: ReadonlySet<string> = new Set(["homepage", "google_places"]);
+const CORRECT_TIER_S: ReadonlySet<string> = new Set(["owner"]);
+function correctTierHead(sourceType: string | null | undefined): string {
+  return String(sourceType ?? "").trim().toLowerCase().split(":")[0]!;
+}
+
+// Count DISTINCT Tier-A source_types and detect any Tier-S record in a
+// provenance array. Distinctness mirrors the validator (two homepage records do
+// not count as two independent Tier-A sources). Records without a usable value
+// are ignored, matching the validator's filter.
+function summariseProvenance(records: unknown): {
+  tierADistinct: number;
+  hasTierS: boolean;
+  realSourceCount: number;
+  total: number;
+} {
+  const tierA = new Set<string>();
+  let hasTierS = false;
+  let realSourceCount = 0;
+  let total = 0;
+  if (Array.isArray(records)) {
+    for (const r of records) {
+      if (!r || typeof r !== "object") continue;
+      const o = r as Record<string, unknown>;
+      const st = typeof o.source_type === "string" ? o.source_type : "";
+      const val = typeof o.value === "string" ? o.value : "";
+      if (!st || !val.trim()) continue; // unusable record
+      total++;
+      const head = correctTierHead(st);
+      if (CORRECT_TIER_S.has(head)) hasTierS = true;
+      if (CORRECT_TIER_A.has(head)) tierA.add(head);
+      if (!isInferenceSourceType(st)) realSourceCount++;
+    }
+  }
+  return { tierADistinct: tierA.size, hasTierS, realSourceCount, total };
+}
+
+export type CorrectDecision = { allowed: boolean; reason: string };
+
+/**
+ * Decide whether a factual field's populated legacy value may be SAFELY
+ * overwritten by an incoming value. Pure function — exported for unit-testing.
+ *
+ * Only call this for an OVERWRITE (existing populated value differs from the new
+ * value). A pure ADD (existing field empty) is normal additive enrichment and
+ * does not go through this guard.
+ *
+ * @param opts.field                       factual field name (products/address/phone/about)
+ * @param opts.existingFieldProvenance     parsed field_provenance[field] (array) or undefined
+ * @param opts.websiteOwnershipUnverified  true iff field_provenance.website_ownership.status == "unverified"
+ * @param opts.incomingFieldProvenance     parsed incoming provenance[field] (array) or undefined
+ * @param opts.isCurated                   true iff curatedFields[field] is set (locked)
+ */
+export function canCorrectFactualField(opts: {
+  field: string;
+  existingFieldProvenance: unknown;
+  websiteOwnershipUnverified: boolean;
+  incomingFieldProvenance: unknown;
+  isCurated: boolean;
+}): CorrectDecision {
+  const { field, existingFieldProvenance, websiteOwnershipUnverified, incomingFieldProvenance, isCurated } = opts;
+
+  if (!CORRECTABLE_FACTUAL_FIELDS.includes(field)) {
+    return { allowed: false, reason: "field_not_correctable" };
+  }
+
+  // ── Hard refusals (checked first; any one blocks the overwrite) ────────────
+  // 1. Owner-curated / locked field — never touch.
+  if (isCurated) return { allowed: false, reason: "curated_locked" };
+
+  const existing = summariseProvenance(existingFieldProvenance);
+  const incoming = summariseProvenance(incomingFieldProvenance);
+
+  // 2. Existing value already well-sourced (>=2 distinct Tier-A) — not legacy-bad.
+  if (existing.tierADistinct >= 2) {
+    return { allowed: false, reason: "existing_already_two_tierA" };
+  }
+
+  // 3. New value must NOT be inference-sourced — it must carry real Tier-A/Tier-S
+  //    evidence. (A value whose incoming provenance has no Tier-A and no Tier-S is
+  //    inference/low-trust and can never overwrite.)
+  const newQualifies = incoming.tierADistinct >= 2 || incoming.hasTierS;
+  if (!newQualifies) {
+    return { allowed: false, reason: "new_not_two_tierA_or_owner" };
+  }
+
+  // ── Required condition (1): existing is KNOWN-BAD legacy ───────────────────
+  // inference-only = it has NO real (non-inference) source, OR website ownership
+  // was flagged unverified (wrong-entity). existing.total===0 (no provenance at
+  // all) is NOT treated as known-bad here — that is a pure ADD, handled upstream.
+  const existingInferenceOnly = existing.total > 0 && existing.realSourceCount === 0;
+  const existingKnownBad = existingInferenceOnly || websiteOwnershipUnverified;
+  if (!existingKnownBad) {
+    return { allowed: false, reason: "existing_not_known_bad" };
+  }
+
+  // Both conditions met → safe to correct.
+  return {
+    allowed: true,
+    reason: websiteOwnershipUnverified && !existingInferenceOnly
+      ? "ok_existing_website_unverified"
+      : "ok_existing_inference_only",
+  };
+}
+
 // ─── Column write — body fields → agent_knowledge ──────────────────────
 //
 // We do the provenance update in a single transaction with the column
@@ -239,6 +411,9 @@ type IncomingBody = {
   postalCode?: string;
   website?: string;
   field_provenance?: IncomingProvenance;
+  // orch-pr-17: opt-in flag to enable the SAFE correct-not-just-add overwrite
+  // path for factual fields. Default OFF (also accepted as ?allow_correct=1).
+  allow_correct?: boolean;
 };
 
 router.put("/", (req: Request, res: Response) => {
@@ -259,6 +434,14 @@ router.put("/", (req: Request, res: Response) => {
     res.status(404).json({ error: "agent not found" });
     return;
   }
+
+  // orch-pr-17: opt-in "correct-not-just-add" flag. Default OFF — when off, the
+  // factual-column overwrite gating below is skipped entirely and the endpoint's
+  // write behaviour is unchanged. Accepts ?allow_correct=1|true or body flag.
+  const allowCorrect =
+    body.allow_correct === true ||
+    req.query?.allow_correct === "1" ||
+    req.query?.allow_correct === "true";
 
   // ── Build the column-write piece ──────────────────────────────────────
   // Only touch columns the caller actually provided (matching the spirit
@@ -304,6 +487,119 @@ router.put("/", (req: Request, res: Response) => {
       });
       return;
     }
+  }
+
+  // ── orch-pr-17: SAFE correct-not-just-add gating (opt-in) ─────────────────
+  // When allow_correct is ON, each FACTUAL column being written (products /
+  // address / phone / about) that would OVERWRITE a populated, differing legacy
+  // value is gated through canCorrectFactualField(). Unsafe overwrites are
+  // dropped from the write set (legacy value preserved) and reported. Pure ADDs
+  // (no existing value) and non-factual columns are never gated, so additive
+  // enrichment is unchanged. When allow_correct is OFF this block does nothing.
+  const corrections: Array<{ field: string; action: "applied" | "refused" | "added" | "noop"; reason: string }> = [];
+  if (allowCorrect && columnUpdates.length > 0) {
+    // Parse existing row: current factual column values + field_provenance + curated_fields.
+    const existingRow = db
+      .prepare(
+        "SELECT about, address, phone, products, field_provenance, curated_fields FROM agent_knowledge WHERE agent_id = ?",
+      )
+      .get(agentId) as
+      | {
+          about?: string | null;
+          address?: string | null;
+          phone?: string | null;
+          products?: string | null;
+          field_provenance?: string | null;
+          curated_fields?: string | null;
+        }
+      | undefined;
+
+    // Parse existing field_provenance (for per-field provenance + website_ownership).
+    let existingProv: Record<string, unknown> = {};
+    if (existingRow?.field_provenance) {
+      try {
+        const parsed = JSON.parse(existingRow.field_provenance);
+        if (parsed && typeof parsed === "object") existingProv = parsed as Record<string, unknown>;
+      } catch {
+        existingProv = {};
+      }
+    }
+    const woUnverified =
+      !!existingProv.website_ownership &&
+      typeof existingProv.website_ownership === "object" &&
+      (existingProv.website_ownership as Record<string, unknown>).status === "unverified";
+
+    // Parse curated_fields (locked fields enrichment must never touch).
+    let curated: Record<string, unknown> = {};
+    if (existingRow?.curated_fields) {
+      try {
+        const parsed = JSON.parse(existingRow.curated_fields);
+        if (parsed && typeof parsed === "object") curated = parsed as Record<string, unknown>;
+      } catch {
+        curated = {};
+      }
+    }
+
+    // Normalise the INCOMING provenance on its own (existing={}) so we can judge
+    // the NEW value's source tiers per field.
+    let incomingProv: Record<string, ProvenanceRecord[]> = {};
+    if (body.field_provenance && typeof body.field_provenance === "object") {
+      try {
+        incomingProv = mergeFieldProvenance({}, body.field_provenance);
+      } catch {
+        incomingProv = {};
+      }
+    }
+
+    // Map column-name → existing stored value (raw column string).
+    const existingColVal: Record<string, string | null | undefined> = {
+      about: existingRow?.about,
+      address: existingRow?.address,
+      phone: existingRow?.phone,
+      products: existingRow?.products,
+    };
+
+    // Filter columnUpdates: drop unsafe factual overwrites.
+    const keptUpdates: typeof columnUpdates = [];
+    for (const u of columnUpdates) {
+      if (!CORRECTABLE_FACTUAL_FIELDS.includes(u.col)) {
+        keptUpdates.push(u); // non-factual column — never gated.
+        continue;
+      }
+      const oldVal = existingColVal[u.col];
+      const oldPopulated = typeof oldVal === "string" && oldVal.trim() !== "" && oldVal.trim() !== "[]";
+      const newStr = u.val == null ? "" : String(u.val);
+      if (!oldPopulated) {
+        // Pure ADD (no real legacy value) — normal additive write, always allowed.
+        keptUpdates.push(u);
+        corrections.push({ field: u.col, action: "added", reason: "no_existing_value" });
+        continue;
+      }
+      if (String(oldVal) === newStr) {
+        // Unchanged — no overwrite happening.
+        keptUpdates.push(u);
+        corrections.push({ field: u.col, action: "noop", reason: "unchanged" });
+        continue;
+      }
+      // Real overwrite of a populated, differing legacy value → gate it.
+      const decision = canCorrectFactualField({
+        field: u.col,
+        existingFieldProvenance: existingProv[u.col],
+        websiteOwnershipUnverified: woUnverified,
+        incomingFieldProvenance: incomingProv[u.col],
+        isCurated: !!curated[u.col],
+      });
+      if (decision.allowed) {
+        keptUpdates.push(u);
+        corrections.push({ field: u.col, action: "applied", reason: decision.reason });
+      } else {
+        // Refused — drop this column from the write set; legacy value preserved.
+        corrections.push({ field: u.col, action: "refused", reason: decision.reason });
+      }
+    }
+    // Replace the write set with the gated one.
+    columnUpdates.length = 0;
+    columnUpdates.push(...keptUpdates);
   }
 
   // ── Apply ─────────────────────────────────────────────────────────────
@@ -358,6 +654,9 @@ router.put("/", (req: Request, res: Response) => {
     agent_id: agentId,
     columns_updated: columnUpdates.map((u) => u.col),
     field_provenance_counts: summary,
+    // orch-pr-17: present only when allow_correct was on — per-field outcome of
+    // the correct-not-just-add guard (applied / refused / added / noop).
+    ...(allowCorrect ? { allow_correct: true, corrections } : {}),
   });
 });
 

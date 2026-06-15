@@ -4093,6 +4093,8 @@ const _pr24Promise = (async function runPr24Tests() {
         about TEXT,
         products TEXT,
         field_provenance TEXT DEFAULT '{}',
+        verification_review_reason TEXT DEFAULT '{}',
+        curated_fields TEXT,
         verification_status TEXT DEFAULT 'unverified',
         enrichment_status TEXT DEFAULT 'partial',
         updated_at TEXT
@@ -4524,6 +4526,199 @@ const _pr24Promise = (async function runPr24Tests() {
         // Existing was 1 OPERATIONAL/google_places — re-PUT dedupes → still 1.
         assertEq(provAfterBs.business_status?.length, 1, "pr28-6: business_status dedup still 1");
       }
+      // ── orch-pr-17 (Part B): SAFE correct-not-just-add overwrite guard ──────
+      //
+      // Unit tests on the pure guard canCorrectFactualField(), then endpoint
+      // tests on the opt-in allow_correct gating via PUT /admin/knowledge.
+      {
+        const canCorrect = adminKnowledgeMod.canCorrectFactualField;
+        const homepageRec = (v: string) => ({ value: v, source_type: "homepage", fetched_at: "2026-06-15T00:00:00Z" });
+        const gplacesRec = (v: string) => ({ value: v, source_type: "google_places", fetched_at: "2026-06-15T00:00:00Z" });
+        const ownerRec = (v: string) => ({ value: v, source_type: "owner", fetched_at: "2026-06-15T00:00:00Z" });
+        const inferRec = (v: string) => ({ value: v, source_type: "category_inference", fetched_at: "2026-06-15T00:00:00Z" });
+        const twoTierA = (v: string) => [homepageRec(v), gplacesRec(v)];
+
+        // B1: ALLOWED — old=inference-only, new=2×Tier-A.
+        {
+          const d = canCorrect({
+            field: "products",
+            existingFieldProvenance: [inferRec("jordbær")],
+            websiteOwnershipUnverified: false,
+            incomingFieldProvenance: twoTierA("multer"),
+            isCurated: false,
+          });
+          assertTrue(d.allowed === true, "orch-pr-17-B1: ALLOWED when old=inference-only & new=2xTierA");
+        }
+
+        // B2: ALLOWED — old website was unverified (wrong-entity), new=Tier-S (owner).
+        {
+          const d = canCorrect({
+            field: "address",
+            existingFieldProvenance: [homepageRec("Feil vei 1")],
+            websiteOwnershipUnverified: true,
+            incomingFieldProvenance: [ownerRec("Riktig vei 2")],
+            isCurated: false,
+          });
+          assertTrue(d.allowed === true, "orch-pr-17-B2: ALLOWED when old website unverified & new=Tier-S owner");
+        }
+
+        // B3: REFUSED — old already has 2×Tier-A (well-sourced, not legacy-bad).
+        {
+          const d = canCorrect({
+            field: "products",
+            existingFieldProvenance: twoTierA("epler"),
+            websiteOwnershipUnverified: false,
+            incomingFieldProvenance: twoTierA("pærer"),
+            isCurated: false,
+          });
+          assertTrue(d.allowed === false, "orch-pr-17-B3: REFUSED when old already has 2xTierA");
+          assertEq(d.reason, "existing_already_two_tierA", "orch-pr-17-B3b: reason existing_already_two_tierA");
+        }
+
+        // B4: REFUSED — new value is inference-sourced (no Tier-A/Tier-S evidence).
+        {
+          const d = canCorrect({
+            field: "products",
+            existingFieldProvenance: [inferRec("jordbær")],
+            websiteOwnershipUnverified: false,
+            incomingFieldProvenance: [inferRec("multer")],
+            isCurated: false,
+          });
+          assertTrue(d.allowed === false, "orch-pr-17-B4: REFUSED when new value is inference-sourced");
+          assertEq(d.reason, "new_not_two_tierA_or_owner", "orch-pr-17-B4b: reason new_not_two_tierA_or_owner");
+        }
+
+        // B5: REFUSED — curated/locked field, even with perfect new sources & bad old.
+        {
+          const d = canCorrect({
+            field: "about",
+            existingFieldProvenance: [inferRec("guess")],
+            websiteOwnershipUnverified: true,
+            incomingFieldProvenance: twoTierA("real about"),
+            isCurated: true,
+          });
+          assertTrue(d.allowed === false, "orch-pr-17-B5: REFUSED on curated/locked field");
+          assertEq(d.reason, "curated_locked", "orch-pr-17-B5b: reason curated_locked");
+        }
+
+        // B6: REFUSED — old is well-sourced (1×Tier-A + real) and NOT known-bad:
+        //     existing has a single homepage source (not inference-only, site OK).
+        {
+          const d = canCorrect({
+            field: "phone",
+            existingFieldProvenance: [homepageRec("+47 11111111")],
+            websiteOwnershipUnverified: false,
+            incomingFieldProvenance: twoTierA("+47 22222222"),
+            isCurated: false,
+          });
+          assertTrue(d.allowed === false, "orch-pr-17-B6: REFUSED when existing not known-bad (real source, site ok)");
+          assertEq(d.reason, "existing_not_known_bad", "orch-pr-17-B6b: reason existing_not_known_bad");
+        }
+
+        // B7: only-one-Tier-A new value is NOT enough (need >=2 Tier-A or owner).
+        {
+          const d = canCorrect({
+            field: "products",
+            existingFieldProvenance: [inferRec("jordbær")],
+            websiteOwnershipUnverified: false,
+            incomingFieldProvenance: [homepageRec("multer")],
+            isCurated: false,
+          });
+          assertTrue(d.allowed === false, "orch-pr-17-B7: REFUSED when new has only 1 Tier-A source");
+        }
+      }
+
+      // ── Endpoint gating: default OFF leaves behaviour unchanged ─────────────
+      {
+        // Seed pr17-def with a legacy products value + 2×Tier-A provenance (so a
+        // correction WOULD be refused if gated). Without allow_correct, the
+        // endpoint overwrites the column exactly as before (default behaviour).
+        pr24db.prepare(
+          "INSERT INTO agents (id, name, slug, role, api_key) VALUES ('pr17-def', 'PR17 Default', 'pr17-def', 'producer', 'k')"
+        ).run();
+        pr24db.prepare(
+          `INSERT INTO agent_knowledge (agent_id, products, field_provenance) VALUES ('pr17-def', ?, ?)`
+        ).run(
+          JSON.stringify([{ name: "old-products" }]),
+          JSON.stringify({ products: [
+            { value: "old", source_type: "homepage", fetched_at: "2026-06-15T00:00:00Z" },
+            { value: "old", source_type: "google_places", fetched_at: "2026-06-15T00:00:00Z" },
+          ] }),
+        );
+        const resp = await pr24Req("PUT", "/admin/knowledge", {
+          agent_id: "pr17-def",
+          products: [{ name: "new-products" }],
+        }, PR24_KEY);
+        assertEq(resp.status, 200, "orch-pr-17-B8: default-off PUT → 200");
+        assertTrue(resp.body.allow_correct === undefined, "orch-pr-17-B9: default-off response has no allow_correct/corrections");
+        const row = pr24db.prepare("SELECT products FROM agent_knowledge WHERE agent_id = 'pr17-def'").get() as any;
+        assertTrue(String(row.products).includes("new-products"), "orch-pr-17-B10: default-off OVERWRITES column (behaviour unchanged)");
+      }
+
+      // ── Endpoint gating: allow_correct ALLOWS a safe correction ─────────────
+      {
+        // Seed pr17-ok: legacy products from inference-only provenance (known-bad),
+        // and PUT a new products value with 2×Tier-A provenance + allow_correct.
+        pr24db.prepare(
+          "INSERT INTO agents (id, name, slug, role, api_key) VALUES ('pr17-ok', 'PR17 Correct OK', 'pr17-ok', 'producer', 'k')"
+        ).run();
+        pr24db.prepare(
+          `INSERT INTO agent_knowledge (agent_id, products, field_provenance) VALUES ('pr17-ok', ?, ?)`
+        ).run(
+          JSON.stringify([{ name: "jordbaer-guess" }]),
+          JSON.stringify({ products: [
+            { value: "jordbær", source_type: "category_inference", fetched_at: "2026-06-15T00:00:00Z" },
+          ] }),
+        );
+        const resp = await pr24Req("PUT", "/admin/knowledge?allow_correct=1", {
+          agent_id: "pr17-ok",
+          products: [{ name: "multer-real" }],
+          field_provenance: {
+            products: [
+              { value: "multer", source_type: "homepage", fetched_at: "2026-06-15T00:00:00Z" },
+              { value: "multer", source_type: "google_places", fetched_at: "2026-06-15T00:00:00Z" },
+            ],
+          },
+        }, PR24_KEY);
+        assertEq(resp.status, 200, "orch-pr-17-B11: allow_correct PUT → 200");
+        assertTrue(resp.body.allow_correct === true, "orch-pr-17-B12: response flags allow_correct=true");
+        const applied = (resp.body.corrections as any[]).find((c) => c.field === "products");
+        assertTrue(applied && applied.action === "applied", "orch-pr-17-B13: products correction applied");
+        const row = pr24db.prepare("SELECT products FROM agent_knowledge WHERE agent_id = 'pr17-ok'").get() as any;
+        assertTrue(String(row.products).includes("multer-real"), "orch-pr-17-B14: legacy value corrected to new value");
+      }
+
+      // ── Endpoint gating: allow_correct REFUSES (old already 2×Tier-A) ───────
+      {
+        pr24db.prepare(
+          "INSERT INTO agents (id, name, slug, role, api_key) VALUES ('pr17-ref', 'PR17 Refuse', 'pr17-ref', 'producer', 'k')"
+        ).run();
+        pr24db.prepare(
+          `INSERT INTO agent_knowledge (agent_id, products, field_provenance) VALUES ('pr17-ref', ?, ?)`
+        ).run(
+          JSON.stringify([{ name: "well-sourced-old" }]),
+          JSON.stringify({ products: [
+            { value: "old", source_type: "homepage", fetched_at: "2026-06-15T00:00:00Z" },
+            { value: "old", source_type: "google_places", fetched_at: "2026-06-15T00:00:00Z" },
+          ] }),
+        );
+        const resp = await pr24Req("PUT", "/admin/knowledge?allow_correct=1", {
+          agent_id: "pr17-ref",
+          products: [{ name: "should-not-apply" }],
+          field_provenance: {
+            products: [
+              { value: "x", source_type: "homepage", fetched_at: "2026-06-15T00:00:00Z" },
+              { value: "x", source_type: "google_places", fetched_at: "2026-06-15T00:00:00Z" },
+            ],
+          },
+        }, PR24_KEY);
+        assertEq(resp.status, 200, "orch-pr-17-B15: refuse-case PUT → 200");
+        const ref = (resp.body.corrections as any[]).find((c) => c.field === "products");
+        assertTrue(ref && ref.action === "refused" && ref.reason === "existing_already_two_tierA", "orch-pr-17-B16: products correction refused (existing_already_two_tierA)");
+        const row = pr24db.prepare("SELECT products FROM agent_knowledge WHERE agent_id = 'pr17-ref'").get() as any;
+        assertTrue(String(row.products).includes("well-sourced-old"), "orch-pr-17-B17: legacy value PRESERVED on refusal");
+      }
+
     } finally {
       // Restore admin-key + close server
       if (prevAdminKey === undefined) delete process.env.ADMIN_KEY;
@@ -15860,6 +16055,9 @@ const _orchPr20260614Promise: Promise<void> = new Promise<void>(r => { _orchPr20
       url_last_probed TEXT,
       url_last_status INTEGER,
       field_provenance TEXT NOT NULL DEFAULT '{}',
+      verification_review_reason TEXT NOT NULL DEFAULT '{}',
+      curated_fields TEXT,
+      products TEXT,
       updated_at TEXT
     );
 
@@ -16347,6 +16545,90 @@ const _orchPr20260614Promise: Promise<void> = new Promise<void>(r => { _orchPr20
     const ids = (r.body.candidates as any[]).map((c: any) => c.agent_id);
     assertTrue(!ids.includes("oa-N"), "orch20260614-45: email-blocklisted agent N excluded from mode=second candidates");
     assertTrue(r.body.suppressed_counts.blocklisted >= 1, "orch20260614-46: mode=second suppressed_counts.blocklisted >= 1 (N)");
+  }
+
+  // ── orch-pr-17 (Part A): data-quality suppression — wrong-entity + inference-only
+  //
+  // Seed three NEW pool-eligible agents:
+  //   P  — gmail producer, website_ownership VERIFIED, real Tier-A products
+  //        provenance → must STAY a candidate (free-mail is NOT a suppression
+  //        reason; this is the whole point of orch-pr-17).
+  //   Q  — field_provenance.website_ownership.status = "unverified" (wrong-entity)
+  //        → suppressed + counted under suppressed_counts.website_unverified.
+  //   R  — verification_review_reason.inference_only_fields = ["products"]
+  //        → suppressed + counted under suppressed_counts.inference_only.
+  seedPoolAgent("oa-P", "gmail-producer@gmail.com", "Agent P Gmail Verified Site");
+  seedPoolAgent("oa-Q", "q@bondegard.no", "Agent Q Wrong Entity Site");
+  seedPoolAgent("oa-R", "r@bondegard.no", "Agent R Inference Products");
+
+  // P: a VERIFIED own-site + real Tier-A products provenance. website_ownership
+  //    is present with status:"verified" (NOT "unverified") so it is never a
+  //    suppression reason; free-mail (gmail) must not matter.
+  orchDb.prepare(`UPDATE agent_knowledge SET field_provenance = ? WHERE agent_id = 'oa-P'`).run(
+    JSON.stringify({
+      website_ownership: { status: "verified" },
+      products: [
+        { value: "epler", source_type: "homepage", fetched_at: "2026-06-15T00:00:00Z" },
+        { value: "epler", source_type: "google_places", fetched_at: "2026-06-15T00:00:00Z" },
+      ],
+    }),
+  );
+
+  // Q: wrong-entity — website_ownership.status = "unverified".
+  orchDb.prepare(`UPDATE agent_knowledge SET field_provenance = ? WHERE agent_id = 'oa-Q'`).run(
+    JSON.stringify({ website_ownership: { status: "unverified" } }),
+  );
+
+  // R: verifier flagged products as inference-only (PR-16 signal lives in
+  //    verification_review_reason.inference_only_fields).
+  orchDb.prepare(`UPDATE agent_knowledge SET verification_review_reason = ? WHERE agent_id = 'oa-R'`).run(
+    JSON.stringify({ inference_only_fields: ["products"] }),
+  );
+
+  // A1: gmail producer with verified own-site is STILL a candidate (not suppressed).
+  {
+    const r = await req3("GET", "/admin/outreach-candidates?mode=first");
+    assertTrue(r.status === 200, "orch-pr-17-A0: mode=first → 200");
+    const ids = (r.body.candidates as any[]).map((c: any) => c.agent_id);
+    assertTrue(ids.includes("oa-P"), "orch-pr-17-A1: gmail producer w/ verified own-site NOT suppressed (still candidate)");
+  }
+
+  // A2: website_ownership=unverified agent Q is suppressed + counted.
+  {
+    const r = await req3("GET", "/admin/outreach-candidates?mode=first");
+    const ids = (r.body.candidates as any[]).map((c: any) => c.agent_id);
+    assertTrue(!ids.includes("oa-Q"), "orch-pr-17-A2: website_ownership=unverified agent Q suppressed");
+    assertTrue(r.body.suppressed_counts.website_unverified >= 1, "orch-pr-17-A3: suppressed_counts.website_unverified >= 1 (Q)");
+  }
+
+  // A3: inference-only-products agent R is suppressed + counted.
+  {
+    const r = await req3("GET", "/admin/outreach-candidates?mode=first");
+    const ids = (r.body.candidates as any[]).map((c: any) => c.agent_id);
+    assertTrue(!ids.includes("oa-R"), "orch-pr-17-A4: inference-only-products agent R suppressed");
+    assertTrue(r.body.suppressed_counts.inference_only >= 1, "orch-pr-17-A5: suppressed_counts.inference_only >= 1 (R)");
+  }
+
+  // A4: free-mail is NOT a suppression reason on its own — both the gmail
+  //     control (P) is in candidates AND the new counts never count P.
+  {
+    const r = await req3("GET", "/admin/outreach-candidates?mode=first");
+    const ids = (r.body.candidates as any[]).map((c: any) => c.agent_id);
+    // P (gmail) present; clean baseline agent A (test.no) also present → free-mail
+    // and non-free-mail both pass when data-quality is clean.
+    assertTrue(ids.includes("oa-P") && ids.includes("oa-A"), "orch-pr-17-A6: free-mail not downgraded — gmail P and A both candidates");
+  }
+
+  // A5: a non-factual inference flag does NOT suppress (only products/address/phone do).
+  //     Seed S with inference_only_fields=["about"] — must STAY a candidate.
+  seedPoolAgent("oa-S", "s@bondegard.no", "Agent S Inference About Only");
+  orchDb.prepare(`UPDATE agent_knowledge SET verification_review_reason = ? WHERE agent_id = 'oa-S'`).run(
+    JSON.stringify({ inference_only_fields: ["about"] }),
+  );
+  {
+    const r = await req3("GET", "/admin/outreach-candidates?mode=first");
+    const ids = (r.body.candidates as any[]).map((c: any) => c.agent_id);
+    assertTrue(ids.includes("oa-S"), "orch-pr-17-A7: inference-only on non-factual field (about) does NOT suppress");
   }
 
   // Cleanup
