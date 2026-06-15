@@ -14099,6 +14099,297 @@ const _orchPr18BulkLoadPromise: Promise<void> = new Promise<void>((r) => {
   }
 })();
 
+// ── orchestrator-pr-19: opplevagent.no → Opplevagent (experiences) host-gate ──
+// Mirrors the pr113 dental discovery tests. Covers: host→vertical recognition
+// (getVerticalFromHost), the Opplevagent agent-card (+ host isolation vs the
+// rfb & dental cards), the experiences OpenAPI spec, the experiences A2A
+// handler (parseExperiencesIntent + handleExperiencesMessageSend incl. error
+// codes), and the experiences-seo router surfaces (landing is NOT the rfb
+// homepage; llms.txt / robots / agent-card / openapi route to experiences).
+// Router-testing without HTTP: we exercise exported handlers + the router's
+// internal route layers directly (sync, no HTTP loopback), exactly like
+// pr113-04c. discoverExperiences() runs against an isolated :memory:
+// experiences.db so the A2A search path is real, not mocked.
+console.log("\n── orch-pr-19: opplevagent.no host-gate (experiences) ──");
+
+// orch19-01: getVerticalFromHost maps opplevagent → experiences; rfb/dental unchanged
+{
+  const { getVerticalFromHost } = require("../src/services/analytics-service") as typeof import("../src/services/analytics-service");
+
+  // experiences host (apex, www, mixed-case, with port-style suffix)
+  assertEq(getVerticalFromHost("opplevagent.no"), "experiences", "orch19-01a: opplevagent.no → experiences");
+  assertEq(getVerticalFromHost("www.opplevagent.no"), "experiences", "orch19-01b: www.opplevagent.no → experiences");
+  assertEq(getVerticalFromHost("OPPLEVAGENT.NO"), "experiences", "orch19-01c: OPPLEVAGENT.NO (mixed case) → experiences");
+
+  // dental host UNCHANGED
+  assertEq(getVerticalFromHost("finn-tannlege.com"), "dental", "orch19-01d: finn-tannlege.com still → dental (unchanged)");
+  assertEq(getVerticalFromHost("www.finn-tannlege.com"), "dental", "orch19-01e: www.finn-tannlege.com still → dental (unchanged)");
+
+  // rfb / neutral hosts UNCHANGED (default rfb)
+  assertEq(getVerticalFromHost("rettfrabonden.com"), "rfb", "orch19-01f: rettfrabonden.com still → rfb (unchanged)");
+  assertEq(getVerticalFromHost("www.rettfrabonden.com"), "rfb", "orch19-01g: www.rettfrabonden.com still → rfb (unchanged)");
+  assertEq(getVerticalFromHost("lokal.fly.dev"), "rfb", "orch19-01h: lokal.fly.dev → rfb (neutral host unchanged)");
+  assertEq(getVerticalFromHost("localhost"), "rfb", "orch19-01i: localhost → rfb (neutral host unchanged)");
+  assertEq(getVerticalFromHost(undefined), "rfb", "orch19-01j: undefined host → rfb (default unchanged)");
+  assertEq(getVerticalFromHost(null), "rfb", "orch19-01k: null host → rfb (default unchanged)");
+}
+
+// orch19-02: getExperiencesAgentCard — Opplevagent card shape per A2A spec
+{
+  const { getExperiencesAgentCard } = require("../src/services/experiences-agent-card") as typeof import("../src/services/experiences-agent-card");
+  const card = getExperiencesAgentCard() as any;
+
+  assertEq(card.name, "Opplevagent", "orch19-02a: name is 'Opplevagent'");
+  assertEq(card.protocolVersion, "0.3.0", "orch19-02b: protocolVersion is '0.3.0'");
+  assertTrue(typeof card.url === "string" && card.url.length > 0, "orch19-02c: url is a string");
+  assertTrue(card.url.endsWith("/a2a"), "orch19-02d: url ends with '/a2a'");
+  assertTrue(!card.url.replace(/\/a2a$/, "").endsWith("/"), "orch19-02e: base url has NO double trailing slash");
+  assertTrue(typeof card.description === "string" && /opplevelser|experiences|aktiviteter|activit/i.test(card.description),
+    "orch19-02f: description mentions experiences/activities marketplace");
+  assertTrue(Array.isArray(card.skills) && card.skills.length >= 1, "orch19-02g: skills is a non-empty array");
+
+  const skillIds = card.skills.map((s: any) => s.id);
+  assertTrue(skillIds.includes("opplevelser_discover"), "orch19-02h: skill opplevelser_discover present");
+  for (const skill of card.skills) {
+    assertTrue(typeof skill.id === "string" && skill.id.length > 0, `orch19-02i: skill.id set (${skill.id})`);
+    assertTrue(typeof skill.name === "string" && skill.name.length > 0, `orch19-02j: skill.name set (${skill.id})`);
+  }
+  // The discover skill references the /api/opplevelser/discover API.
+  const discoverSkill = card.skills.find((s: any) => s.id === "opplevelser_discover");
+  assertTrue(!!discoverSkill && /\/api\/opplevelser\/discover/.test(JSON.stringify(discoverSkill)),
+    "orch19-02k: discover skill references /api/opplevelser/discover");
+  // Endpoints block points at the experiences surfaces.
+  assertTrue(typeof card.endpoints?.a2a === "string" && card.endpoints.a2a.endsWith("/a2a"),
+    "orch19-02l: endpoints.a2a ends with /a2a");
+  assertTrue(typeof card.endpoints?.discover === "string" && card.endpoints.discover.endsWith("/api/opplevelser/discover"),
+    "orch19-02m: endpoints.discover is the discover API");
+}
+
+// orch19-03: HOST ISOLATION — the three vertical agent-cards are distinct
+//   opplevagent.no  → "Opplevagent"      (never rfb/producer or dental card)
+//   finn-tannlege   → "Finn-tannlege"    (unchanged)
+//   rettfrabonden   → "Rett fra Bonden"  (unchanged)
+{
+  const { getExperiencesAgentCard } = require("../src/services/experiences-agent-card") as typeof import("../src/services/experiences-agent-card");
+  const { getDentalAgentCard } = require("../src/services/dental-agent-card") as typeof import("../src/services/dental-agent-card");
+
+  const expCard = getExperiencesAgentCard() as any;
+  const dentalCard = getDentalAgentCard() as any;
+  const expJson = JSON.stringify(expCard);
+
+  // Experiences card is its own identity, NOT dental.
+  assertEq(expCard.name, "Opplevagent", "orch19-03a: experiences card name is Opplevagent");
+  assertTrue(expCard.name !== dentalCard.name, "orch19-03b: experiences card name != dental card name");
+
+  // Experiences card must NOT leak rfb/producer identity.
+  assertTrue(!/Rett fra Bonden/i.test(expJson), "orch19-03c: experiences card does NOT contain 'Rett fra Bonden'");
+  // Experiences card must NOT leak dental identity / dental-only API paths.
+  assertTrue(!/Finn-tannlege/i.test(expJson), "orch19-03d: experiences card does NOT contain 'Finn-tannlege'");
+  assertTrue(!/\/api\/tannlege/i.test(expJson), "orch19-03e: experiences card does NOT reference /api/tannlege");
+  assertTrue(!/tannlege_/i.test(expJson), "orch19-03f: experiences card does NOT contain dental skill ids (tannlege_*)");
+
+  // Dental card stays the dental identity (regression: unchanged by this PR).
+  assertEq(dentalCard.name, "Finn-tannlege", "orch19-03g: dental card name STILL 'Finn-tannlege' (unchanged)");
+  assertTrue(!/Opplevagent/i.test(JSON.stringify(dentalCard)), "orch19-03h: dental card does NOT contain 'Opplevagent'");
+}
+
+// orch19-04: getExperiencesOpenapi — 3.1 spec, server url, experiences paths
+{
+  const { getExperiencesOpenapi } = require("../src/services/experiences-openapi") as typeof import("../src/services/experiences-openapi");
+  const spec = getExperiencesOpenapi() as any;
+
+  assertTrue(typeof spec.openapi === "string" && spec.openapi.startsWith("3."), "orch19-04a: openapi version starts with '3.'");
+  assertTrue(Array.isArray(spec.servers) && spec.servers.length > 0, "orch19-04b: servers is non-empty array");
+  assertTrue(typeof spec.servers[0].url === "string" && !spec.servers[0].url.endsWith("/"), "orch19-04c: servers[0].url has NO trailing slash");
+  assertTrue(typeof spec.paths === "object" && spec.paths !== null, "orch19-04d: paths is an object");
+  assertTrue("/api/opplevelser/discover" in spec.paths, "orch19-04e: /api/opplevelser/discover in paths");
+  assertTrue("/a2a" in spec.paths, "orch19-04f: /a2a in paths");
+  // Isolation: experiences openapi must NOT carry dental paths.
+  assertTrue(!("/api/tannlege/agents" in spec.paths), "orch19-04g: experiences openapi does NOT contain /api/tannlege/agents");
+  assertTrue(/Opplevagent/i.test(spec.info?.title || ""), "orch19-04h: openapi info.title mentions Opplevagent");
+}
+
+// orch19-05: experiences-a2a parseExperiencesIntent + handleExperiencesMessageSend
+// Runs the real discover path against an isolated :memory: experiences.db.
+(() => {
+  const prevPath19 = process.env.EXPERIENCES_DB_PATH;
+  process.env.EXPERIENCES_DB_PATH = ":memory:";
+
+  // Re-load db-factory + experience-store + experiences-a2a together so they
+  // share a single :memory: handle (same require-cache discipline as the
+  // experiences scaffold IIFE above).
+  const dbFactoryPath19 = require.resolve("../src/database/db-factory");
+  const expStorePath19 = require.resolve("../src/services/experience-store");
+  const expA2aPath19 = require.resolve("../src/routes/experiences-a2a");
+  delete require.cache[dbFactoryPath19];
+  delete require.cache[expStorePath19];
+  delete require.cache[expA2aPath19];
+
+  const dbFactory19 = require("../src/database/db-factory") as typeof import("../src/database/db-factory");
+  dbFactory19.__resetDbFactoryForTesting();
+  const expStore19 = require("../src/services/experience-store") as typeof import("../src/services/experience-store");
+  const expA2a19 = require("../src/routes/experiences-a2a") as typeof import("../src/routes/experiences-a2a");
+  const { parseExperiencesIntent, handleExperiencesMessageSend } = expA2a19;
+
+  // Ensure schema + seed one publishable Oslo + one Troms experience.
+  dbFactory19.getDb("experiences");
+  expStore19.createExperience({
+    title: "Innendørs klatring i Oslo", category: "natur_friluft",
+    fylke: "Oslo", kommune: "Oslo", indoor_outdoor: "indoor",
+    weather_dependent: 0, confidence: "high", verification_status: "verified",
+  });
+  expStore19.createExperience({
+    title: "Hvalsafari fra Tromsø", category: "dyreliv_safari",
+    fylke: "Troms", kommune: "Tromsø", indoor_outdoor: "outdoor",
+    season: ["winter"], confidence: "high", verification_status: "verified",
+  });
+
+  // parseExperiencesIntent: fylke detection
+  assertEq(parseExperiencesIntent("hva kan vi finne på i Oslo").fylke, "Oslo",
+    "orch19-05a: parseExperiencesIntent recognises Oslo");
+  // parseExperiencesIntent: weather=rain
+  assertEq(parseExperiencesIntent("noe å gjøre når det regner").weather, "rain",
+    "orch19-05b: parseExperiencesIntent sets weather='rain' for 'regner'");
+  // parseExperiencesIntent: season=winter
+  assertEq(parseExperiencesIntent("aktiviteter til vinteren").season, "winter",
+    "orch19-05c: parseExperiencesIntent sets season='winter'");
+  // parseExperiencesIntent: outdoor
+  assertEq(parseExperiencesIntent("utendørs aktiviteter").indoor_outdoor, "outdoor",
+    "orch19-05d: parseExperiencesIntent sets indoor_outdoor='outdoor'");
+
+  // handleExperiencesMessageSend: missing message → -32602
+  const noMsg19 = handleExperiencesMessageSend({}, "orch19-id") as any;
+  assertEq(noMsg19.error?.code, -32602, "orch19-05e: missing message → error code -32602");
+  assertEq(noMsg19.id, "orch19-id", "orch19-05f: id reflected in error response");
+
+  // handleExperiencesMessageSend: rain query → real discover, returns result with artifacts
+  {
+    const resp = handleExperiencesMessageSend(
+      { message: { text: "hva kan vi finne på i Oslo når det regner" } }, "orch19-discover"
+    ) as any;
+    assertTrue(resp.result !== undefined && resp.id === "orch19-discover",
+      "orch19-05g: discover query returns a result envelope");
+    assertEq(resp.result?.metadata?.skill, "opplevelser_discover",
+      "orch19-05h: discover result metadata.skill is opplevelser_discover");
+    // The Oslo indoor/weather-independent experience must be surfaced; the
+    // Troms outdoor one must NOT (rain prefers indoor/weather-independent).
+    const dataArtifact = (resp.result?.artifacts || []).find((a: any) => a.artifactId === "discover-results");
+    const found = dataArtifact?.parts?.[0]?.data;
+    assertTrue(!!found && typeof found.count === "number", "orch19-05i: discover-results artifact carries a count");
+    const titles = (found?.experiences || []).map((e: any) => e.title);
+    assertTrue(titles.includes("Innendørs klatring i Oslo"),
+      "orch19-05j: Oslo indoor experience surfaced for rain query");
+    assertTrue(!titles.includes("Hvalsafari fra Tromsø"),
+      "orch19-05k: Troms outdoor experience NOT surfaced (Oslo+rain filter)");
+  }
+
+  // handleExperiencesMessageSend: categories intent → opplevelser_categories
+  {
+    const resp = handleExperiencesMessageSend(
+      { message: { text: "hvilke kategorier finnes" } }, "orch19-cats"
+    ) as any;
+    assertEq(resp.result?.metadata?.skill, "opplevelser_categories",
+      "orch19-05l: 'kategorier' query routes to opplevelser_categories skill");
+  }
+
+  // POST /a2a dispatcher: unknown method → -32601 (sync default branch, mock req/res)
+  {
+    const router19 = expA2a19.default as any;
+    const postLayer19 = (router19.stack as any[]).find(
+      (l: any) => l.route && l.route.path === "/a2a" && l.route.methods?.post
+    );
+    assertTrue(!!postLayer19, "orch19-05m: experiences-a2a router has a POST /a2a layer");
+    const mockReq19 = { body: { jsonrpc: "2.0", method: "unknown/method", params: {}, id: "orch19-unknown" } } as any;
+    let captured19: any = undefined;
+    const mockRes19 = { json: (o: unknown) => { captured19 = o; }, status: (_c: number) => mockRes19 } as any;
+    const handler19 = postLayer19.route.stack[postLayer19.route.stack.length - 1].handle;
+    handler19(mockReq19, mockRes19, () => {});
+    assertEq((captured19 as any)?.error?.code, -32601, "orch19-05n: unknown JSON-RPC method → -32601 from dispatcher");
+  }
+
+  // tasks/send compat alias: routes to the same handler (message/send) → -32602 on missing message
+  {
+    const router19 = expA2a19.default as any;
+    const postLayer19 = (router19.stack as any[]).find(
+      (l: any) => l.route && l.route.path === "/a2a" && l.route.methods?.post
+    );
+    const mockReq19 = { body: { jsonrpc: "2.0", method: "tasks/send", params: {}, id: "orch19-taskssend" } } as any;
+    let captured19: any = undefined;
+    const mockRes19 = { json: (o: unknown) => { captured19 = o; }, status: (_c: number) => mockRes19 } as any;
+    const handler19 = postLayer19.route.stack[postLayer19.route.stack.length - 1].handle;
+    handler19(mockReq19, mockRes19, () => {});
+    assertEq((captured19 as any)?.error?.code, -32602,
+      "orch19-05o: tasks/send compat alias reaches message/send handler (missing message → -32602)");
+  }
+
+  // Restore env + reset factory so later tests start clean.
+  if (prevPath19 === undefined) delete process.env.EXPERIENCES_DB_PATH;
+  else process.env.EXPERIENCES_DB_PATH = prevPath19;
+  dbFactory19.__resetDbFactoryForTesting();
+})();
+
+// orch19-06: experiences-seo router — landing is NOT the rfb homepage;
+// llms.txt / robots.txt / agent-card.json / openapi.json route to experiences.
+// We invoke the router's internal GET layers directly (sync, mock req/res).
+{
+  const expSeo = require("../src/routes/experiences-seo") as typeof import("../src/routes/experiences-seo");
+  const seoRouter = expSeo.default as any;
+
+  function invokeGet(path: string): { status: number; body: string; headers: Record<string, string> } {
+    const layer = (seoRouter.stack as any[]).find(
+      (l: any) => l.route && l.route.path === path && l.route.methods?.get
+    );
+    assertTrue(!!layer, `orch19-06: router has a GET ${path} layer`);
+    let status = 200;
+    let body = "";
+    const headers: Record<string, string> = {};
+    const res: any = {
+      statusCode: 200,
+      setHeader: (k: string, v: string) => { headers[k.toLowerCase()] = String(v); },
+      header: (k: string, v: string) => { headers[k.toLowerCase()] = String(v); return res; },
+      status: (c: number) => { status = c; res.statusCode = c; return res; },
+      send: (b: unknown) => { body = typeof b === "string" ? b : String(b); return res; },
+      json: (o: unknown) => { body = JSON.stringify(o); headers["content-type"] = headers["content-type"] || "application/json"; return res; },
+    };
+    const req: any = { path, hostname: "opplevagent.no", query: {} };
+    const handler = layer.route.stack[layer.route.stack.length - 1].handle;
+    handler(req, res, () => {});
+    return { status, body, headers };
+  }
+
+  // Landing (/) — Opplevagent identity, NOT the rfb homepage.
+  const landing = invokeGet("/");
+  assertTrue(/Opplevagent/.test(landing.body), "orch19-06a: landing mentions Opplevagent");
+  assertTrue(!/Rett fra Bonden/i.test(landing.body), "orch19-06b: landing is NOT the rfb homepage (no 'Rett fra Bonden')");
+  assertTrue(/\/api\/opplevelser\/discover/.test(landing.body), "orch19-06c: landing links the discover API");
+  assertTrue(/text\/html/.test(landing.headers["content-type"] || ""), "orch19-06d: landing Content-Type is text/html");
+
+  // llms.txt — experiences overview (Norwegian) referencing the discover API.
+  const llms = invokeGet("/llms.txt");
+  assertTrue(/opplevagent\.no/.test(llms.body), "orch19-06e: llms.txt mentions opplevagent.no");
+  assertTrue(/\/api\/opplevelser\/discover/.test(llms.body), "orch19-06f: llms.txt documents the discover API");
+  assertTrue(!/\/api\/tannlege/.test(llms.body), "orch19-06g: llms.txt does NOT leak dental /api/tannlege");
+  assertTrue(/text\/plain/.test(llms.headers["content-type"] || ""), "orch19-06h: llms.txt Content-Type is text/plain");
+
+  // robots.txt — points sitemap at opplevagent.no.
+  const robots = invokeGet("/robots.txt");
+  assertTrue(/Sitemap: https?:\/\/opplevagent\.no\/sitemap\.xml/.test(robots.body),
+    "orch19-06i: robots.txt Sitemap points at opplevagent.no");
+
+  // agent-card.json (well-known) — serves the Opplevagent card, not rfb/dental.
+  const wellKnownCard = invokeGet("/.well-known/agent-card.json");
+  const wkParsed = JSON.parse(wellKnownCard.body);
+  assertEq(wkParsed.name, "Opplevagent", "orch19-06j: /.well-known/agent-card.json serves the Opplevagent card");
+  assertTrue(!/Rett fra Bonden|Finn-tannlege/i.test(wellKnownCard.body),
+    "orch19-06k: well-known card does NOT leak rfb/dental identity");
+
+  // openapi.json — experiences spec.
+  const openapi = invokeGet("/openapi.json");
+  const oaParsed = JSON.parse(openapi.body);
+  assertTrue("/api/opplevelser/discover" in oaParsed.paths, "orch19-06l: openapi.json carries the experiences discover path");
+  assertTrue(!("/api/tannlege/agents" in oaParsed.paths), "orch19-06m: openapi.json does NOT carry dental paths");
+}
+
 // ── PR-107 (2026-06-04): zombie-claim sweep fix ──────────────────────
 // Tests for sweepExpiredClaims, zombie reclaim via claimBatch, truthful
 // claimStatus after timeout, and releaseBatch regression guard.

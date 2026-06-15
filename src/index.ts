@@ -183,6 +183,54 @@ if (process.env.ENABLE_DENTAL === "1") {
   });
 }
 
+// ─── orchestrator-pr-19: opplevagent.no host routing (experiences) ─────
+// Mirrors the PR-109 dental host-gate exactly, for the experiences vertical.
+// Registered BEFORE agentReadinessRoutes, ownerPortalRoutes and
+// express.static so opplevagent-host requests never hit rfb portal pages
+// or static assets (and never the rfb a2a/discovery routers mounted at root
+// later). Security/analytics middleware above already ran. API and health
+// paths pass through via next(); every other path is served by the
+// experiences routers so NO rfb/dental content can leak onto opplevagent.no.
+// Lazy-require so experiences-seo/-a2a only load when ENABLE_EXPERIENCES=1.
+if (process.env.ENABLE_EXPERIENCES === "1") {
+  const EXPERIENCES_HOSTS = new Set(["opplevagent.no", "www.opplevagent.no"]);
+  // eslint-disable-next-line @typescript-eslint/no-var-requires
+  const experiencesSeoRouter = require("./routes/experiences-seo").default;
+  // eslint-disable-next-line @typescript-eslint/no-var-requires
+  const experiencesA2aRouter = require("./routes/experiences-a2a").default;
+
+  app.use((req: any, res: any, next: any) => {
+    const host = req.hostname;
+    if (!EXPERIENCES_HOSTS.has(host)) return next();
+
+    // www → apex canonical redirect
+    if (host === "www.opplevagent.no") {
+      return res.redirect(301, `https://opplevagent.no${req.originalUrl}`);
+    }
+
+    // Pass API and health through to existing routes (incl. /api/opplevelser/*).
+    // NOTE: /.well-known/ is intentionally NOT passed through here —
+    // experiences has its own well-known surfaces (agent-card.json) served
+    // by experiences-seo and experiences-a2a routers.
+    const p = req.path;
+    if (p.startsWith("/api/") || p === "/health") {
+      return next();
+    }
+
+    // /a2a endpoint → experiences A2A JSON-RPC router (mounted before
+    // experiences-seo below). experiencesA2aRouter handles the /a2a prefix
+    // and applies its own rate limiting (jsonRpcLimiter).
+    if (p === "/a2a" || p.startsWith("/a2a/")) {
+      return experiencesA2aRouter(req, res, next);
+    }
+
+    // All other paths on opplevagent hosts → experiences-seo router
+    // (landing, llms.txt, robots.txt, sitemap.xml, agents.txt,
+    //  agent-card.json, openapi.json, 404).
+    return experiencesSeoRouter(req, res, next);
+  });
+}
+
 
 // Well-known discovery endpoints (MCP Server Card, Agent Skills,
 // API Catalog, OAuth Protected Resource). Mounted BEFORE static
