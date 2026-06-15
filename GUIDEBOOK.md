@@ -3557,6 +3557,201 @@ The rfb owner-portal `m2-*` tests flaked repeatedly across this batch (≥3 retr
 
 ---
 
+<a id="phase-24"></a>
+## Phase 24: Marketplace Transactions (Cart MVP), Search-Enrich Pipeline, Outreach Suppression Gate & Verifier Industrialization
+
+Phase 24 (2026-06-09 → 2026-06-15) turns rfb from a discovery-only catalogue into one that can also (a) hold a structured **product catalogue** and accept **agent-driven pickup orders**, (b) **self-enrich** missing producer emails from the open web with a safe, gated pipeline, and (c) run **outreach and verification at scale** behind server-side suppression and bulk-sweep endpoints. Everything ships commit-only; the supervisor deploys (model unchanged since 2026-04-25 PM).
+
+Churn note: the cart MVP and the outreach/enrichment batch were merged, reverted, and re-merged on 2026-06-14 (`pr-6 → pr-6b → pr-6c`; `pr-7`/`pr-8` reverted then re-applied) while a CI/test-ordering issue was cleared. The landed state described below is the final one (`ba3db9c`, `41f0d81`, `28e2353`).
+
+### 24.1 Marketplace Phase 0 — product catalogue + ACP feed (PR-5, `4c4a2d0`)
+
+First structured product data. New `products` table:
+
+```sql
+CREATE TABLE IF NOT EXISTS products (
+  id           TEXT PRIMARY KEY,
+  agent_id     TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+  name         TEXT NOT NULL,
+  name_norm    TEXT NOT NULL,            -- normalised for dedupe/search
+  description  TEXT,
+  unit         TEXT,                     -- e.g. "kg", "stk", "boks"
+  price_nok    REAL,
+  currency     TEXT NOT NULL DEFAULT 'NOK',
+  availability TEXT NOT NULL DEFAULT 'in_stock',
+  stock_qty    INTEGER,
+  category     TEXT,
+  image_url    TEXT,
+  source       TEXT NOT NULL DEFAULT 'enrichment',
+  created_at   TEXT NOT NULL DEFAULT (datetime('now')),
+  updated_at   TEXT NOT NULL DEFAULT (datetime('now'))
+);
+-- INDEX idx_products_agent_id ON products(agent_id)
+```
+
+Endpoints (`src/routes/marketplace-catalog.ts`):
+
+```bash
+# Public ACP-style catalogue feed (paginated), one row per product
+curl "https://rettfrabonden.com/api/marketplace/catalog/feed?limit=100&offset=0"
+
+# Products for a single producer
+curl "https://rettfrabonden.com/api/marketplace/catalog/agents/<AGENT_ID>/products"
+
+# Admin: backfill product rows from existing enrichment data (admin-key gated)
+curl -X POST "https://rettfrabonden.com/admin/products/backfill" -H "x-admin-key: <YOUR_ADMIN_KEY>"
+```
+
+The feed is the machine-readable surface an external commerce agent reads to learn what is purchasable; `name_norm` de-dupes near-identical names at backfill time.
+
+### 24.2 Marketplace Phase 1 — cart MVP + 5 MCP cart tools (PR-6c, `ba3db9c`)
+
+The first **transactional** capability: an agent can build a cart and place **pickup orders** (no payment, no card). Four new tables:
+
+- `carts` — `status IN ('open','submitted','cancelled','expired')`, `buyer_ref` capability token, `expires_at` (7-day validity).
+- `cart_items` — `UNIQUE(cart_id, product_id)` (re-adding a product updates qty), `qty > 0` CHECK, `unit_price_snapshot`.
+- `orders` — `status IN ('pending','confirmed','declined','ready','completed','cancelled')`, `fulfilment` default `pickup`, `pickup_time`, `total_nok`, `confirm_token`.
+- `order_items` — line snapshots (`name_snapshot`, `qty`, `unit_price_snapshot`, `line_total`).
+
+REST (`src/routes/marketplace-cart.ts`, mounted at `/api/marketplace`):
+
+```
+POST   /cart                       create cart  → { cart_id, buyer_ref }
+POST   /cart/:id/items             add/update item (body: product_id, qty, line_note)
+PATCH  /cart/:id/items/:itemId     change qty
+DELETE /cart/:id/items/:itemId     remove item
+GET    /cart/:id                   view (grouped by producer, subtotals + total)
+POST   /cart/:id/submit            → one order per producer (re-checks availability)
+GET    /orders/:id                 order status (needs buyer_ref)
+```
+
+Admin order transitions live at `/admin/marketplace/orders/:id/<action>` (admin-key gated) and drive an order through `confirmed/ready/completed/declined/cancelled`.
+
+Five MCP tools (`src/routes/mcp.ts`) expose the same flow to AI assistants:
+
+| Tool | Purpose |
+|---|---|
+| `lokal_cart_create` | Create cart; returns `cart_id` + `buyer_ref` token (store it — not recoverable; 7-day TTL) |
+| `lokal_cart_add_item` | Add/update item; product must be `in_stock` from a **verified, non-umbrella** producer |
+| `lokal_cart_view` | View contents grouped by producer with subtotals/total |
+| `lokal_cart_submit` | Submit → one pickup order per producer; re-checks availability at submit; **no payment**; sellers **not** notified (Phase 1 internal-only) |
+| `lokal_order_status` | Fetch order status/items (`pending → confirmed → ready → completed`, or `declined/cancelled`) |
+
+Patterns worth copying: `buyer_ref` is an opaque capability token (no accounts), availability is **re-validated at submit** (not just at add-time), and a multi-producer cart fans out into **one order per producer** so each seller owns their own fulfilment.
+
+### 24.3 Search-enrich pipeline — fill missing producer emails from the open web (PR-10/11/12)
+
+A safe, gated pipeline that finds a producer's real contact email when we do not have one. Per producer: **Brave web search → crawl candidate page → confirm it is really this producer → extract a producer email**. Files: `src/services/search-enrich.ts` (decision logic is pure; only `braveSearch()` does I/O), `src/services/search-enrich-sweep.ts`, `src/routes/admin-search-enrich.ts`.
+
+Single-producer run (PR-10, `0256cf6`) — **dry-run by default**:
+
+```bash
+# Dry-run: returns what it WOULD write, writes nothing
+curl -X POST "https://rettfrabonden.com/admin/search-enrich" \
+  -H "x-admin-key: <YOUR_ADMIN_KEY>" -H "content-type: application/json" \
+  -d '{"agent_id":"<AGENT_ID>"}'
+
+# Apply (fill-empty-only)
+curl -X POST "https://rettfrabonden.com/admin/search-enrich?apply=1" -H "x-admin-key: <KEY>" ...
+```
+
+Env: `BRAVE_API_KEY` (or `BRAVE_SEARCH_API_KEY`); admin gate `ADMIN_KEY` (or `ANALYTICS_ADMIN_KEY`).
+
+Brave call shape (PR-11 `f9940ef` fixed an **HTTP 422**):
+
+```
+GET https://api.search.brave.com/res/v1/web/search?q=<q>&count=<n>&country=NO
+Headers: Accept: application/json, X-Subscription-Token: <key>
+```
+
+The 422 came from `search_lang=no` (invalid) plus a lowercase country; fix = `country=NO` (uppercase ISO) and **drop** `search_lang`. Always capture the upstream error body — that is how the bad param was found.
+
+SSRF hardening (PR-10 review nit, `d94b11f`): the crawler follows only **http(s) to public hosts** — it blocks `localhost`/`*.localhost`, link-local `169.254.0.0/16` (cloud metadata), private ranges, and CGNAT `100.64.0.0/10`.
+
+Confirmation + write rules:
+
+- `confirmProducerPage()` → `confirmed = (any STRONG signal) OR (mediumCount ≥ 2)`; `strength ∈ strong | medium | none`.
+- `applyEnrichWrite()` is **fill-empty-only** (never overwrites a non-empty value) and idempotent; it records `source_type`. This single helper is shared by the single-run route, the sweep, and apply-findings.
+
+Background full-cohort sweep + gated apply (PR-12, `c0ff7b0`):
+
+```bash
+# Dry-run sweep over the whole cohort (paced >=1.1s/req for Brave free tier ~ 1 min / 50)
+curl -X POST "https://rettfrabonden.com/admin/search-enrich/sweep" -H "x-admin-key: <KEY>"
+curl      "https://rettfrabonden.com/admin/search-enrich/sweep" -H "x-admin-key: <KEY>"   # job state
+# Review findings by tier (write = strong-confirmed, queue = needs review, none)
+curl "https://rettfrabonden.com/admin/search-enrich/findings?tier=write&limit=50" -H "x-admin-key: <KEY>"
+# Daniel-gated apply: replays ONLY write-tier findings from the table
+curl -X POST "https://rettfrabonden.com/admin/search-enrich/apply-findings" -H "x-admin-key: <KEY>"
+```
+
+Every finding is upserted (by `agent_id`) into a new `search_enrich_findings` table — both the review record and the source of truth for `apply-findings`. The sweep is dry-run by default; a crash mid-sweep loses only job state (findings already persisted, writes idempotent). Key decoupling: the sweep **discovers and records**, a separate human-gated endpoint **applies**.
+
+### 24.4 Outreach suppression gate — server-side, verified-only (PR-3 `2fc5958`, PR-8 `28e2353`)
+
+Cold-outreach candidate selection moved **server-side** so suppression rules cannot be forgotten by a client. `GET /admin/outreach-candidates` starts from the `outreach_ready_pool` VIEW (verified + correct info) and suppresses anyone who is:
+
+1. not verified (the VIEW already enforces this);
+2. within cooldown — `outreach_sent_log`, `cooldown_days` default **60** (`mode=first` = never contacted; `mode=second` = earliest send older than cooldown);
+3. already replied — inbound `crm_messages` (`direction='in'`) via contact → thread;
+4. opted out — CRM blocked/archived OR `agent_knowledge.verification_status='opt_out'`;
+5. a customer — `agents.claimed_at IS NOT NULL`;
+6. hard-bounced — `email_bounces.bounce_type IN ('hard','complaint')`;
+7. on `agent_blocklist` (PR-8) — JS post-filter via `isBlocked()`.
+
+A companion `/admin/outreach-sent-log` import folds historical sends into the ledger so cooldown math is correct from day one. Related enrichment policy (PR-7, `41f0d81`): a homepage email is accepted when it is free-mail **or** on the producer's own domain, and rejected when it belongs to an aggregator/other company.
+
+### 24.5 Verifier industrialization — bulk sweep + in-process platform-verifier + coherence refinements
+
+**Bulk `pending_verify` drain (PR-2, `0d55939`).** With ~843 agents stuck in `pending_verify`, `src/services/verifier-sweep.ts` runs a chunked **background** job (`startSweep`) that drains the whole pool without blocking HTTP; `POST /admin/run-verifier/sweep` launches it and `GET /admin/run-verifier/sweep` reports `{processed, verified, still_pending, …}`. Crash-safe: findings persist per chunk.
+
+**Server-side platform-verifier (`platform-verifier.ts` + `admin-run-platform-verifier.ts`).** An in-app deterministic port of the Cowork `platform-verifier` skill. It reads the **run-ledger** for unverified runs, probes each claim against reality, and writes a per-claim verdict plus a per-run `verifier_state`. Two invariants to copy verbatim:
+
+- **FAIL-SAFE:** a false `matched` is the dangerous outcome, so **any** probe error / ambiguity / missing credential / unknown kind / unreachable evidence URL → `skipped`, never `matched`. `failed` is reserved for "probe ran cleanly and reality DISAGREED."
+- **In-process, not a separate machine:** it runs against the app's own `getDb()` handle so it shares the volume-mounted SQLite — avoiding the "Fly volume not shared between machines" trap (C.52) an out-of-process verifier hit. `POST /admin/run-platform-verifier` is `dry_run` by default; `GET` returns the last result.
+
+**Coherence refinements (fewer false blocks):**
+
+- Email-anchor rule (PR-1, `ea36602`): a website/agent-host mismatch is **non-blocking** when the contact email host equals the agent host.
+- Free-mail/ISP exemption (PR-4, `987aa72`): `email_own_domain = emailMatchesSite OR isFreeMail` (`FREE_MAIL_DOMAINS`); the `email_domain_mismatch` flag now fires only for a **real** (non-free-mail) mismatch. Adds flag-count observability.
+- Directory/venue host whitelist (`7cfb7b2`): 12 hosts that had been scraped instead of the producer's own site — `fuud.no`, `husetsandefjord.no`, `hvalerguide.no`, `lokalmat.coop.no`, `posebyhaven.no`, `route26.no`, `visit.kongsvingerregionen.no`, `visitsorlandet.com`, `xn--visitjren-l3a.com`, `gettyourguide.com`, `tripadvisor.com`, `yelp.com` — were unblocking 13 pool-ready producers stuck solely on domain-coherence. (`xn--visitjren-l3a.com` is the **correct** punycode for `visitjæren.com`; the pre-existing `xn--visitjren-w1a.com` decodes to a typo.)
+
+### 24.6 Admin: prune dead / junk producer URLs (PR-9, `0e3eb05`)
+
+`POST /admin/prune-dead-urls` scans `agent_knowledge.website` and (optionally) nulls junk values in two categories — `placeholder` and `aggregator` — via a pure `classifyWebsite()`:
+
+```bash
+# Dry-run (default): report only
+curl -X POST "https://rettfrabonden.com/admin/prune-dead-urls" -H "x-admin-key: <KEY>"
+# → { success, dry_run:true, scanned, would_prune:{placeholder,aggregator,total}, sample:[...] }
+
+# Apply
+curl -X POST "https://rettfrabonden.com/admin/prune-dead-urls?apply=1" -H "x-admin-key: <KEY>"
+```
+
+The `WHERE website IS NOT NULL` guard makes re-runs idempotent (a second run reports `pruned=0`). This keeps junk URLs from re-entering the verifier/enrichment loop and skewing domain-coherence.
+
+### 24.7 Build config: co-located tests excluded from `tsc`
+
+New `*.test.ts` files now live **next to the source** they cover (e.g. `src/services/search-enrich.test.ts`). `tsconfig.json` adds `"src/**/*.test.ts"` to `exclude` so the production build never compiles test files (the test runner still picks them up). If you add co-located tests and `tsc` suddenly tries to typecheck test-only imports, this is the line to check.
+
+### 24.8 Operational state at end of Phase 24
+
+| Metric | Value | Source |
+|---|---|---|
+| Verticals live | 2 (rfb `rettfrabonden.com` + dental `finn-tannlege.com`) | host-routed, single process |
+| Agents (rfb) | **1,480 total / 1,344 active** | live `lokal_info` 2026-06-15 |
+| New capability | **Marketplace cart → pickup orders** (no payment) + product catalogue / ACP feed | PR-5, PR-6c |
+| New MCP tools | `lokal_cart_create` / `add_item` / `view` / `submit` + `lokal_order_status` (5 cart tools on top of search/discover/geocode/…) | PR-6c |
+| Self-enrichment | Brave search → crawl → confirm → email, dry-run default, findings table + gated apply | PR-10/11/12 |
+| Outreach | server-side suppression gate (verified-only / cooldown / replied / opt-out / customer / bounce / blocklist) | PR-3, PR-8 |
+| Verifier | bulk `pending_verify` sweep + in-process platform-verifier (fail-safe) + free-mail/email-anchor coherence | PR-1/2/4, `7cfb7b2` |
+| Tests | **2,475 passing** | `.test-out.txt` this clone |
+| Last commit at write-time | `7cfb7b2` (verifier host whitelist) | git log main 2026-06-15 |
+| Deploy model | **Supervisor-only** (since 2026-04-25 PM) | guidebook commits + pushes only |
+
+---
+
 <a id="appendix-a"></a>
 ## Appendix A: Tech Stack Reference
 
@@ -3814,6 +4009,26 @@ Post-deploy:
 109. **MCP tool query-understanding must match the REST route it shadows** — `lokal_search` (MCP) returned raw name-matches for `"fersk fisk i Bergen"` while the REST `/api/marketplace/search` geocode-enriched the same query into a geo-filtered result. AI clients hitting the MCP tool got measurably worse answers than browser users for identical queries. Fix: route the MCP tool through the same geocode-enrichment step as the REST handler (PR-109/110) and add regression tests pinning the parity. **Rule:** when the same capability is exposed via both a REST route and an MCP tool, they must share the query-understanding pipeline — divergence means your AI surface (the whole point of an A2A platform) silently underperforms the human surface. Commits: `2a85900`, `28a0988`, `56e4099`. See Phase 23.4.
 
 
+110. **A multi-producer cart must fan out into one order per producer, and re-check availability at submit (not just at add-time)** — `lokal_cart_submit` creates a *separate* order per producer in the cart, and re-reads each line's `availability` at submit time; if anything has gone out of `in_stock` since it was added, submit is rejected with a per-item message rather than silently shipping a stale order. **Rule:** in any cart that spans multiple sellers, the order is the per-seller unit (each owns its own fulfilment), and stock must be validated at the commit boundary because the add-to-cart snapshot is already stale by the time the buyer submits. Commit: `ba3db9c`. See Phase 24.2.
+
+111. **Issue the buyer an opaque capability token instead of requiring accounts — but make "store it, it is unrecoverable" explicit in the tool description** — carts use a `buyer_ref` capability token (no login, no PII); whoever holds it can act on the cart/order. The MCP `lokal_cart_create` description spells out that the token cannot be recovered and is required for every subsequent call, because an AI client that discards it has stranded the cart with no way back in. **Rule:** capability-token flows are the right fit for agent-to-agent commerce (no account system needed), but the "save this, it cannot be re-issued" contract has to be stated where the caller actually reads it — in the tool/endpoint description — or you will leak orphaned carts. Commit: `ba3db9c`. See Phase 24.2.
+
+112. **Brave Search returns HTTP 422 on `search_lang=no` and a lowercase country — use `country=NO` (uppercase ISO) and drop `search_lang`** — the first search-enrich integration silently 422'd because it sent `search_lang=no` (not a valid Brave value) and a lowercase country code. The fix was to send `country=NO` (uppercase ISO-3166) and omit `search_lang` entirely. The only reason it was diagnosable: the client was changed to **capture and log the upstream error body** instead of just the status. **Rule:** when integrating a third-party search/LLM API, log the response body on non-2xx from day one — the status code alone (`422`) tells you nothing, the body names the offending parameter. Commit: `f9940ef` (PR-11). See Phase 24.3.
+
+113. **Any server-side fetch that follows a URL discovered from search MUST sit behind an SSRF guard** — the search-enrich crawler takes a URL from Brave results and fetches it; without a guard, a poisoned result (or a producer-supplied homepage) could point at `http://169.254.169.254/…` (cloud metadata) or an internal address. The guard allows only `http(s)` to **public** hosts and blocks `localhost`/`*.localhost`, link-local `169.254.0.0/16`, RFC-1918 private ranges, and CGNAT `100.64.0.0/10`. **Rule:** "fetch a URL we did not author" is the textbook SSRF entry point — gate every such fetch on a scheme+host allowlist that rejects loopback, link-local, private, and CGNAT space, and remember `169.254.169.254` is the cloud-metadata endpoint that turns SSRF into credential theft. Commit: `d94b11f` (PR-10). See Phase 24.3.
+
+114. **Decouple "discover & record" from "apply" in any web-enrichment sweep, and make the write fill-empty-only + idempotent** — the search-enrich sweep is dry-run by default: it writes every per-agent result to the `search_enrich_findings` table (tiered `write`/`queue`/`none`) but touches no contact data; a separate, human-gated `apply-findings` endpoint replays only the strong-confirmed `write` tier. The shared `applyEnrichWrite()` never overwrites a non-empty field and is idempotent, so a crash mid-sweep or a double-apply cannot corrupt data. **Rule:** for any pipeline that scrapes the open web and proposes writes to your source-of-truth, split it into (a) a recording pass that is safe to run unattended and (b) a gated apply that a human triggers; back both with a findings table so the apply is a replay, not a re-scrape, and make the write fill-empty-only so re-runs converge. Commits: `0256cf6`, `c0ff7b0` (PR-10/12). See Phase 24.3.
+
+115. **Cold-outreach candidate selection belongs server-side behind every suppression rule — a client-side filter will eventually forget one** — `GET /admin/outreach-candidates` enforces seven suppression conditions in SQL/JS (not-verified, cooldown, already-replied, opted-out, is-customer, hard-bounced, blocklisted) so no caller can accidentally email someone who replied, opted out, or already bounced. Moving the gate server-side also means the cooldown clock (`outreach_sent_log`, 60-day default) and the sent-log importer share one definition of "recently contacted." **Rule:** suppression logic for outreach is compliance-critical and must live at the data boundary that every caller goes through — if each client re-implements "who is eligible," one of them drops a rule and you mail an opted-out contact. Commits: `2fc5958`, `28e2353` (PR-3/8). See Phase 24.4.
+
+116. **Port an out-of-process verifier back in-process so it shares the volume-mounted DB, and make the verdict fail-safe (unknown → skipped, never matched)** — the platform-verifier was moved from a separate Cowork agent into the app itself precisely so it runs against the same `getDb()` handle that owns the Fly-volume SQLite — an out-of-process verifier on a second machine hit the "volume not shared between machines" trap (C.52). Its verdict logic is deliberately asymmetric: a false `matched` would tell the platform a broken claim is fine, so **any** error/ambiguity/missing-credential/unreachable-evidence resolves to `skipped`, and `failed` is reserved for "probe ran cleanly and reality disagreed." **Rule:** a verifier that can write "this is fine" must treat uncertainty as `skipped` (neutral), never as `matched` (positive); and if it needs the production DB, run it in the process that already holds the volume rather than standing up a second machine that cannot see the data. See Phase 24.5.
+
+117. **Domain-coherence verifiers over-block on three recurring patterns — contact email on the agent's own host, free-mail/ISP addresses, and directory/venue hosts — exempt all three** — across this phase the coherence gate was relaxed three times for the same root cause (treating a legitimate operating pattern as a data-quality failure): (a) a website/host mismatch is non-blocking when the contact-email host equals the agent host (email-anchor, `ea36602`); (b) free-mail/ISP senders satisfy `email_own_domain` instead of tripping `email_domain_mismatch` (`987aa72`); (c) a curated whitelist of directory/venue hosts (`visit*`, `tripadvisor.com`, `lokalmat.coop.no`, …) is exempt because the producer legitimately lives on a hub page (`7cfb7b2`). **Rule:** a coherence check tuned only on "domains must match" will block real small producers who use Gmail, a tourism-directory page, or an email on their own domain that differs from a scraped site — enumerate the legitimate-but-incoherent patterns and exempt them explicitly, with observability on which flag fired. Commits: `ea36602`, `987aa72`, `7cfb7b2` (PR-1/4). See Phase 24.5.
+
+118. **Junk URL pruning must be idempotent via a `WHERE col IS NOT NULL` guard so re-runs are safe and the verifier stops re-chewing dead links** — `POST /admin/prune-dead-urls` classifies `agent_knowledge.website` into `placeholder`/`aggregator` junk and nulls it; the `WHERE website IS NOT NULL` precondition means a second run reports `pruned=0` instead of thrashing. Leaving junk URLs in place is not benign — they re-enter the verifier/enrichment loop every cycle and generate domain-coherence false positives. **Rule:** data-cleanup endpoints should be dry-run-by-default AND idempotent (guard the mutate on the not-yet-cleaned predicate), so an operator can run them repeatedly without side effects and so downstream loops are not fighting the same bad rows forever. Commit: `0e3eb05` (PR-9). See Phase 24.6.
+
+119. **IDN punycode is easy to get subtly wrong — decode it and eyeball the result before adding it to an allow/deny list** — the verifier host whitelist carried a pre-existing `xn--visitjren-w1a.com` that decodes to `visitjràen` (a typo encoding); the correct punycode for `visitjæren.com` is `xn--visitjren-l3a.com`. A one-character difference in the encoded form is a completely different domain, so the typo'd entry whitelisted nothing real. **Rule:** when you hardcode an internationalized-domain host (whitelist, denylist, redirect map), round-trip it through a punycode decoder and confirm the Unicode it produces is the domain you meant — store the human-readable form in a comment next to the `xn--` literal. Commit: `7cfb7b2`. See Phase 24.5.
+
 ### C.2 Architecture Decisions
 
 1. **SQLite over PostgreSQL** — Zero ops, single file, perfect for solo developer. Good up to ~10K agents.
@@ -4008,7 +4223,8 @@ to build the same platform for a different vertical.
 | 2026-05-29 to 2026-06-04 | 6 (vertical), 7, 11, 12, 16, 18, C | Dental enrichment v1.3 infrastructure + ops batch PR-91–95 + ChatGPT Apps Directory unblock. **Ops batch (supervisor deploy 2026-06-01, refs `supervisor-inbox/2026-06-01-orchestrator-deploy-batch-pr91-94.md`):** PR-91 (`6aaa311`) run-ledger 1-line SQL WHERE guard against stale pending recurrence (+4 tests). PR-92 (`2c03870`) analytics daily auto-prune at 03:00 UTC + DB threshold raised to 400 MB; disable via `RFB_DISABLE_AUTO_PRUNE=1`, tune via `RFB_AUTO_PRUNE_DAYS`. PR-93 (`c13ce36`) paginated `GET /admin/agents?status=&updated_since=` — ends the lokal-agent-verifier's 8-day SKIPPED streak; the `agents` table has no `status`/`updated_at` columns, so the route maps `updated_since`→`last_seen_at` and `status`→`(is_active, is_verified)` normalised to `inactive|pending|active`. PR-94 (`10acac3`) bm-events normaliser-hardening — strips non-ASCII apostrophe variants (U+00B4/U+2019/U+0060/U+2032/U+2018/U+0301/U+00B7) before punctuation collapse; new BM-only `normaliseBmLocation` additionally strips Norwegian definite suffixes `-et/-en/-an/-a` (token-level, ≥3-char stem guard) and rewrites `martn(an)`→`marked` while leaving the Hanen `nameVariants` pipeline untouched — plus Phase B.2 `bm_venue_auto` 5th matcher tier: `getOrCreateBmVenueAgent()` creates placeholder venue agents (`umbrella_type='bm_venue'`, `agent_review_status='pending_review'`, `is_active=0`, idempotent on name), admin confirm/reject routes under `/admin/bm-events/venues/*`, and every public-facing query (marketplace/MCP/SEO + `/umbrellas`) appends `(a.umbrella_type != 'bm_venue' OR a.agent_review_status = 'confirmed')` so unreviewed placeholders never leak; lifts match-rate from the 57.9% baseline by ~+36pp (+4pp normaliser, +32pp venue auto-create). PR-95 (`1f13fe8`, Daniel-directive 2026-06-01) Debio cert-verification: 3 new `agents` columns (`debio_verified INTEGER NOT NULL DEFAULT 0`, `debio_verified_at`, `debio_finnoko_id`), daily 04:00-UTC-window sync (`RFB_DISABLE_DEBIO_SYNC=1` to disable) against `https://finnoko.debio.no/api/acm/companies` — website-domain match first (canonicalised, social-host blocklist), Dice ≥0.85 name-similarity fallback, never auto-clears previously verified rows — `POST /admin/debio/sync` for manual runs; deletes the seed-time substring auto-inference (`'organic'/'økologisk'` → 73 agents tagged, 0 verified pre-PR) and `relabelCertifications()` rewrites the OUTGOING array (`✓ Debio-verifisert` when verified, `Hevder økologisk` otherwise) with `debioVerified: boolean` on `AgentInfoResponse`; tests 1544→1588. **CI race-class strikes again:** PR-96 (google-places phone-enrichment Scenario D, `90e2e0d`) and PR-98 (`GET /api/marketplace/markets/upcoming` REST wrapper, `9eb764d`) merged then REVERTED same day (`0daf2e2`, `3b94626`) on the `__setDbForTesting` singleton-mutation test pattern (C.79/C.82) — both await re-land with safe patterns. PR-99 (`8451b90`) shipped clean using source-presence assertions: auth-free `GET /.well-known/openai-apps-challenge` (static verification token, `text/plain`, `max-age=300`, nosniff) + `readOnlyHint:true` on `lokal_search`/`lokal_discover` whose annotations falsely declared writes and confused ChatGPT's Apps Directory tool-classifier. **Dental enrichment v1.3 infra (all behind `ENABLE_DENTAL=1`, vertical-DB isolation per C.93):** PR-100 (`f803cb7`) +16 NULLABLE columns on `dental_agents` — 6 geocoding (`lat`, `lng`, `geocode_source`, `geocode_confidence`, `opening_hours`, `field_provenance`) + 10 deep-scrape JSON (`om_oss`, `specialists`, `treatment_tech`, `equipment_brands`, `patient_focus`, `accessibility`, `payment_options`, `online_booking_url`, `social_media`, `treatments_subtypes`) — idempotent PRAGMA-gated ALTERs, `parseJsonOrNull`/`stringifyJsonOrNull` hydration in `dental-store.ts`, 49 tests on the `DENTAL_DB_PATH=:memory:` + `__resetDbFactoryForTesting()` pattern. **PR-100b hotfix (`414454c`): vertical DBs defaulted to a non-volume container path, so dental data was WIPED on every deploy — path now resolves to `/app/data/<vertical>.db` (persistent Fly volume mount).** PR-103 (`f0079cd`) backend Kartverket geocoding worker (`src/services/dental-geocode-worker.ts`): deterministic 4-step retry ladder (full → transliterate → strip-house-letter-suffix → street-only) with `high/medium/low/no_match` confidence labels; `geocodeTick(50)` on setTimeout(30s)+hourly setInterval (PR-92/95 scheduler pattern), opt-out `RFB_DISABLE_DENTAL_GEOCODE=1`; the `no_match` sentinel (added to the `geocode_confidence` Zod enum) stops dead rows from retrying every hour; `GET /api/tannlege/admin/geocode-status` returns work-queue counts — eliminates LLM spend on the 2,159 ungeocoded deterministic Norwegian-address lookups. PR-104 (`45308d6`) multi-worker record-claim: `worker_id TEXT` + `claimed_at INTEGER` columns + `idx_dental_claim`; `dental-claim-service.ts` exposes `claimBatch(workerId, size, filter)` (atomic SELECT+UPDATE in one `db.transaction()`, allow-listed filter keys, fully parameterised), `releaseBatch` (own-claims only), `claimStatus` (per-worker counts + `oldest_claim_age_ms`), 30-min crashed-worker auto-release; admin routes `POST /api/tannlege/admin/claim-batch|release-batch` + `GET .../claim-status` — targets ~3× enrichment throughput with 2-3 parallel workers. PR-106 (`d25e8e4`) dedicated `dentalLimiter` (1000/15min ≈ 66/min) mounted on `/api/tannlege` BEFORE the generic `/api` `generalLimiter` mount, plus `generalLimiter.skip()` for tannlege paths so caps don't chain — 3 parallel per-field-PUT workers (~12-15 PUTs/min each) had saturated the 300/15min general limiter and 6 enrichment cycles 04:00–05:47Z 2026-06-04 produced ZERO output; rfb-facing limiters unchanged. PR-107 (`65ad4ca` + `b05f234`) zombie-claim sweep: exported `sweepExpiredClaims(now?)` UPDATE-clears expired claims inside the `claimBatch` transaction BEFORE the candidate SELECT and at the top of `claimStatus` — WHERE-filtering alone left ~83 expired zombie rows invisible behind the ~6,800-row fresh pool (`ORDER BY id` never reached them) and `claimStatus` reported dead workers indefinitely; returns `result.changes` for observability. **Verifier:** `04f1ccc` extends `KNOWN_DIRECTORY_HOSTS` by 11 tourism/food-directory hosts (fjordnorway.com, visitvestfold.com, visitbo.no, meny.no, statsforvalteren.no, smakavnordhordland.no, …) — unblocks ~19 review_required agents stuck on domain-coherence false positives; list now 45 hosts. Appendix C: C.98 (the proven CI-safe test patterns are source-presence assertions (PR-99) or `<VERTICAL>_DB_PATH=:memory:` + `__resetDbFactoryForTesting()` (PR-100/103/104/107) — never `__setDbForTesting` singleton mutation, which has now killed PR-69/70/71/77/79/96/98), C.99 (vertical DB files MUST default to the Fly volume mount `/app/data/` — a bare container path means a full data wipe on every deploy; rfb's `lokal.db` was already volume-mounted but the new db-factory default wasn't), C.100 (per-field-PUT enrichment fleets need a dedicated rate limiter mounted before the general one AND a `skip()` on the general limiter so the caps don't stack; size it for fleet-size × per-worker rate + verifier/orchestrator/manual headroom), C.101 (claim-lease systems: merely WHERE-filtering expired leases hides them from the candidate scan and poisons status reporting forever — sweep/clear expired leases transactionally before the SELECT, and have the sweep return `changes` for observability), C.102 (prefer deterministic national-registry APIs (Kartverket adresser) over LLM calls for lookups with a closed answer space — cheaper, reproducible, testable; persist a `no_match` sentinel so the work queue converges instead of re-trying dead rows every tick), C.103 (certification badges must be backed by registry verification, not substring inference — the deleted seed line had tagged 73 agents organic with 0 verified; relabel at the output boundary via a single helper and never auto-clear verified rows when an upstream sync misses them), C.104 (auto-created placeholder agents must be born `is_active=0` + human-review-gated, and EVERY public surface — REST, MCP, SEO, umbrella listings — must filter unconfirmed rows; one missed query leaks unreviewed entities straight into AI-assistant answers). |
 
 | 2026-06-04 to 2026-06-08 | 23 (new), 6 (vertical), 7, 12, 16, C | **Phase 23 — finn-tannlege.com public launch (2nd vertical, host-routed in the same Fly process).** Dental SSR site `Forside`/`/sok`/`/klinikk/:slug`/`/fylke`/sitemap/robots/llms (PR-109 `3571ac6`), `søket-logo`+`/hvordan-det-fungerer`+`/personvern`+spesialitet-sider (PR-112 `4be7c3e`), canonical-fylke whitelist (PR-111 `3c5af85`), SEO-pakke sted-sider+breadcrumbs+relaterte+sitemap-lastmod with first-write-wins slug map (PR-116 `4cb0dec`). Host-aware agent-card + A2A JSON-RPC + OpenAPI, A2A text capped 2000 chars (PR-113 `06adc80`); MCP server `src/routes/dental-mcp.ts` (Streamable-HTTP, 5 `tannlege_*` tools, per-session 30-min TTL) + npm `finn-tannlege-mcp` 0.1.0 (PR-114 `bf9dab3`), `/mcp` host-dispatch hotfix (PR-115 `3b06183`); dental AgentCard brought to A2A parity — `protocolVersion=0.3.0` + `url`→`/a2a` (`5cc91ce`). `lokal_search` MCP geocode-enrichment to match REST (PR-109/110 `2a85900`/`28a0988`/`56e4099`). Analytics vertical-split `?vertical=rfb\|dental` + CRM + dashboard switcher + `vertical_id` backfill (PR-117 `5219a09`); rfb-only homepage traffic + finn-tannlege proof-bar via new `traffic-stats.ts` (PR-121 `edec692`). Dental claim-pool excludes needs_review/rejected (PR-108 `faf9814`) + thin_site parking + list-endpoint filters (PR-120 `ee531ef`). BM canonical-source arc: `bondensmarked.no` parser + read-only `/admin/bm-reconcile` (PR-123 `9b8a905`), per-lokallag detail parser (PR-124 `363dd60`), live time-correction in daily scraper — idempotent/transactional/date-guarded (PR-125 `485b48c`). Verifier: NO ISP/freemail whitelist + IDN-normalize (`7ee25ef`), business_status synonyms + hyphen-insensitive domain coherence with Eidsmo guard (PR-126 `c77ba19`). Server-side `/admin/homepage-provenance-batch` Tier-A merge (PR-122 `b6a5f1a`). Infra: durable 1024 MB in `fly.toml` + `MEMORY_LIMIT_MB` env, dynamic `/health` limitMb (PR-118 `837c253`/`af10d12`/`42789fb`). CI: m2-* magic_links race deflaked (PR-119 `49bd775`). Appendix C: C.105 (frequency-sorted slug maps → first-write-wins), C.106 (serialize test-setup promise chains sharing a table), C.107 (2nd vertical = branch at router, not data layer or deploy), C.108 (Fly Machines-API upscale reverts on next `fly.toml` deploy; read memory from env not cgroup), C.109 (MCP tool query-understanding must match the REST route it shadows). |
+| 2026-06-09 to 2026-06-15 | 24 (new), 3, 7, 8, 11, 12, 16, C | **Phase 24 — marketplace transactions (cart MVP) + search-enrich pipeline + outreach suppression gate + verifier industrialization.** Marketplace Phase 0 `products` table + ACP `/api/marketplace/catalog/feed` + `/admin/products/backfill` (PR-5 `4c4a2d0`); Phase 1 cart MVP — `carts`/`cart_items`/`orders`/`order_items` + REST `/api/marketplace/cart*` + 5 MCP tools (`lokal_cart_create`/`add_item`/`view`/`submit`, `lokal_order_status`) + agent-card skill; pickup-only, no payment, one order per producer, availability re-checked at submit (PR-6c `ba3db9c`; merged→reverted→re-merged via pr-6/6b/6c same day). Search-enrich: per-producer `POST /admin/search-enrich` Brave→crawl→confirm→producer-email, dry-run default + fill-empty-only `applyEnrichWrite` (PR-10 `0256cf6`); SSRF guard http(s)+public-host only, blocks localhost/private/CGNAT/169.254 metadata (PR-10 `d94b11f`); Brave param fix `country=NO` uppercase + drop `search_lang` → fixes HTTP 422 (PR-11 `f9940ef`); background full-cohort sweep + `search_enrich_findings` table + tiered `/findings` + Daniel-gated `/apply-findings` (PR-12 `c0ff7b0`). Outreach: server-side `/admin/outreach-candidates` suppression gate (verified-only/cooldown-60d/replied/opt-out/customer/hard-bounce) + sent-log import (PR-3 `2fc5958`) + `agent_blocklist` post-filter (PR-8 `28e2353`); enrichment accepts free-mail/own-domain homepage email, rejects aggregator/other-company (PR-7 `41f0d81`). Verifier: bulk `pending_verify` background sweep `/admin/run-verifier/sweep` (PR-2 `0d55939`); in-process platform-verifier port (fail-safe unknown→skipped, run-ledger probe) `/admin/run-platform-verifier` dry-run default; email-anchor domain-coherence (PR-1 `ea36602`); free-mail/ISP kvalitetsgate exemption + flag-count (PR-4 `987aa72`); +12 directory/venue host whitelist unblocking 13 pool-ready producers (`7cfb7b2`). Admin `POST /admin/prune-dead-urls` placeholder+aggregator junk-URL pruner, idempotent (PR-9 `0e3eb05`). Build: `tsconfig.json` excludes co-located `src/**/*.test.ts`. Tests 2014→2475. Appendix C: C.110 (cart fan-out + submit-time availability), C.111 (opaque buyer_ref capability token), C.112 (Brave 422 on search_lang/lowercase country), C.113 (SSRF guard on search-discovered crawls), C.114 (decouple discover/apply + fill-empty-only idempotent writes), C.115 (server-side outreach suppression), C.116 (in-process fail-safe verifier), C.117 (domain-coherence over-blocks: email-anchor/free-mail/directory hosts), C.118 (idempotent junk-URL prune), C.119 (verify IDN punycode decode). |
 ---
 
-*Last updated: 2026-06-08 (14:00 CEST) by rfb-guidebook agent*
-*Guide version: 1.13.0*
+*Last updated: 2026-06-15 (14:00 CEST) by rfb-guidebook agent*
+*Guide version: 1.14.0*
