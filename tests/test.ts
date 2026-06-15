@@ -15948,6 +15948,11 @@ const _orchPr20260614_5Promise: Promise<void> = new Promise<void>(r => { _orchPr
 
 
 
+// ── orch-pr-14: MCP discovery surfaces catalog product_id ───────────────────
+// Declared here (resolver), exercised in the IIFE after the cart MVP section.
+let _orchPr14ProductIdResolve: () => void = () => {};
+const _orchPr14ProductIdPromise: Promise<void> = new Promise<void>(r => { _orchPr14ProductIdResolve = r; });
+
 // ── orch-pr-20260614-6: Phase 1 cart MVP ────────────────────────────────────
 console.log("\n── orch-pr-20260614-6: Phase 1 cart MVP ──");
 
@@ -16417,6 +16422,125 @@ const _orchPr20260614_6Promise: Promise<void> = new Promise<void>(r => { _orchPr
   _orchPr20260614_6Resolve();
 })();
 
+// ── orch-pr-14: MCP discovery tools surface catalog product_id ──────────────
+// The MCP cart flow was unusable for a pure-MCP agent: lokal_cart_add_item
+// needs products.id, but no discovery tool exposed it. This proves the new
+// join (getCatalogProductIdMap) + formatter (formatProductsForMcp) attach the
+// SAME products.id that cart-service.addCartItem validates, keyed by the same
+// name_norm the catalog backfill writes.
+console.log("\n── orch-pr-14: MCP discovery product_id surfacing ──");
+
+(async () => {
+  // Order after cart MVP for readability; this section is fully DB-isolated
+  // (handles injected directly) so it cannot race other sections' DB pins.
+  try { await _orchPr20260614_6Promise; } catch { /* recorded upstream */ }
+
+  try {
+    const sqlite = require("better-sqlite3");
+    const pidDb = new sqlite(":memory:");
+
+    // Minimal products schema — byte-identical columns to src/database/init.ts
+    // (only what getCatalogProductIdMap reads: id, agent_id, name_norm, availability).
+    pidDb.exec(`
+      CREATE TABLE products (
+        id           TEXT PRIMARY KEY,
+        agent_id     TEXT NOT NULL,
+        name         TEXT NOT NULL,
+        name_norm    TEXT NOT NULL,
+        price_nok    REAL,
+        availability TEXT NOT NULL DEFAULT 'in_stock',
+        UNIQUE(agent_id, name_norm)
+      );
+    `);
+
+    // NOTE: we deliberately do NOT call __setDbForTesting here. Pinning the
+    // global getDb() singleton races with other concurrent IIFE sections (e.g.
+    // orch-pr-9 prune) that pin their own DB. Instead we pass the pidDb handle
+    // straight into getCatalogProductIdMap(agentId, db) — the same injection
+    // philosophy cart-service uses via __setCartTestDb. Fully isolated.
+    const mcpMod = await import("../src/routes/mcp");
+
+    // Seed the catalog the way backfill would: name_norm = lowercased/space-collapsed
+    // clean name. These ids are what lokal_cart_add_item expects (products.id).
+    const PID_LAMMELAR = "11111111-1111-1111-1111-111111111111";
+    const PID_DEIG     = "22222222-2222-2222-2222-222222222222";
+    const PID_SOLDOUT  = "33333333-3333-3333-3333-333333333333";
+    pidDb.prepare("INSERT INTO products (id, agent_id, name, name_norm, price_nok, availability) VALUES (?,?,?,?,?,?)")
+      .run(PID_LAMMELAR, "pid-agent", "Lammelår", "lammelår", 275, "in_stock");
+    pidDb.prepare("INSERT INTO products (id, agent_id, name, name_norm, price_nok, availability) VALUES (?,?,?,?,?,?)")
+      .run(PID_DEIG, "pid-agent", "Lammekjøttdeig", "lammekjøttdeig", 185, "in_stock");
+    // Out-of-stock row must NOT be advertised (cart would reject it).
+    pidDb.prepare("INSERT INTO products (id, agent_id, name, name_norm, price_nok, availability) VALUES (?,?,?,?,?,?)")
+      .run(PID_SOLDOUT, "pid-agent", "Pinnekjøtt", "pinnekjøtt", 320, "sold_out");
+    // A different agent's product — must never leak into pid-agent's map.
+    pidDb.prepare("INSERT INTO products (id, agent_id, name, name_norm, price_nok, availability) VALUES (?,?,?,?,?,?)")
+      .run("99999999-9999-9999-9999-999999999999", "other-agent", "Egg", "egg", 60, "in_stock");
+
+    // ── Test 1: getCatalogProductIdMap returns only this agent's in_stock rows ──
+    const map = mcpMod.getCatalogProductIdMap("pid-agent", pidDb);
+    assertEq(map.size, 2, `pid-01: map has exactly 2 in_stock products (got ${map.size})`);
+    assertEq(map.get("lammelår"), PID_LAMMELAR, "pid-02: lammelår → correct products.id");
+    assertEq(map.get("lammekjøttdeig"), PID_DEIG, "pid-03: lammekjøttdeig → correct products.id");
+    assertEq(map.get("pinnekjøtt"), undefined, "pid-04: sold_out product excluded from map");
+    assertEq(map.get("egg"), undefined, "pid-05: other agent's product not in this agent's map");
+
+    // ── Test 2: formatProductsForMcp appends `· id:` for matched in_stock items ─
+    // Knowledge products carry name (sometimes with embedded price) but NO id —
+    // mirrors agent_knowledge.products JSON shape.
+    const knowledgeProducts = [
+      { name: "Lammelår – kr 275/kg", category: "meat" },
+      { name: "Lammekjøttdeig", price: "185", category: "meat" },
+      { name: "Pinnekjøtt", price: "320", category: "meat" },   // sold_out in catalog
+      { name: "Honning", price: "120", category: "honey" },     // not in catalog at all
+      { name: "HODER OG BEN", category: "other" },               // header → skipped
+    ];
+    const out = mcpMod.formatProductsForMcp(knowledgeProducts, map);
+
+    assertTrue(out.includes(`Lammelår`), "pid-06: output lists Lammelår");
+    assertTrue(out.includes(`· id: ${PID_LAMMELAR}`), "pid-07: matched in_stock product carries its catalog product_id");
+    assertTrue(out.includes(`· id: ${PID_DEIG}`), "pid-08: second matched product carries its product_id (price parsed from name normalized to match)");
+    // Sold-out and unknown products must show price but NOT an id (cart would reject).
+    assertTrue(!out.includes(PID_SOLDOUT), "pid-09: sold_out product gets no id in output");
+    assertTrue(out.includes("Honning"), "pid-10: honning (no catalog row) still listed with its price");
+    // Honning has no catalog row → its line must not gain an id. Verify by counting ids.
+    const idCount = (out.match(/· id: /g) || []).length;
+    assertEq(idCount, 2, `pid-11: exactly 2 product_id annotations emitted (only the matched in_stock rows), got ${idCount}`);
+
+    // ── Test 3: lineage — the surfaced id is the SAME column addCartItem checks ──
+    // cart-service.addCartItem does `SELECT p.id FROM products p WHERE p.id = ?`
+    // then requires availability='in_stock'. Confirm the id we surfaced resolves
+    // there and is in_stock, while the sold_out id would be rejected.
+    const cartRow = pidDb.prepare("SELECT id, availability FROM products WHERE id = ?").get(PID_LAMMELAR) as any;
+    assertEq(cartRow.id, PID_LAMMELAR, "pid-12: surfaced id resolves to a products row by primary key (same lookup as addCartItem)");
+    assertEq(cartRow.availability, "in_stock", "pid-13: surfaced id is in_stock → addCartItem would accept it");
+
+    // ── Test 4: backward-compat — no map passed → no ids, original shape intact ─
+    const legacy = mcpMod.formatProductsForMcp(knowledgeProducts);
+    assertTrue(!legacy.includes("· id:"), "pid-14: omitting the id map yields the original (id-free) output — additive change");
+    assertTrue(legacy.includes("Lammelår"), "pid-15: legacy output still lists products");
+
+    // ── Test 5: graceful degradation — missing products table never throws ──────
+    const bareDb = new sqlite(":memory:");
+    const emptyMap = mcpMod.getCatalogProductIdMap("pid-agent", bareDb);
+    assertEq(emptyMap.size, 0, "pid-16: no products table → empty map, no throw (discovery degrades to name-only)");
+
+    // ── Test 6 (source wiring): both lokal_info AND lokal_search pass the map ────
+    const fs = require("fs");
+    const mcpSrc = fs.readFileSync("src/routes/mcp.ts", "utf8");
+    const wiredCalls = (mcpSrc.match(/formatProductsForMcp\(k\.products, getCatalogProductIdMap\(agent\.id\)\)/g) || []).length;
+    assertEq(wiredCalls, 2, `pid-17: both MCP product call sites (lokal_info + lokal_search) wire the catalog id map (got ${wiredCalls})`);
+  } catch (err) {
+    failed++;
+    failures.push("orch-pr-14-productid: unexpected error: " + String(err));
+  } finally {
+    // No global DB pin was taken (handles are injected directly), so there is
+    // nothing to reset — and crucially we must NOT call __setDbForTesting(null)
+    // here, which would clobber any concurrently-running section's pinned DB.
+    _orchPr14ProductIdResolve();
+  }
+})();
+
+
 (async () => {
   try { await Promise.all(_pr21Promises); } catch { /* errors already pushed to failures */ }
   try { await _m2Promise; } catch { /* errors already pushed to failures */ }
@@ -16445,6 +16569,7 @@ const _orchPr20260614_6Promise: Promise<void> = new Promise<void>(r => { _orchPr
   try { await _orchPr20260614Promise; } catch { /* errors already pushed to failures */ }
   try { await _orchPr20260614_5Promise; } catch { /* errors already pushed to failures */ }
   try { await _orchPr20260614_6Promise; } catch { /* errors already pushed to failures */ }
+  try { await _orchPr14ProductIdPromise; } catch { /* errors already pushed to failures */ }
   try { await _orchPr9PruneDeadUrlsPromise; } catch { /* errors already pushed to failures */ }
   try { await _orchPr12SweepPromise; } catch { /* errors already pushed to failures */ }
   // PR-109 tests are synchronous (IIFE) — no promise needed

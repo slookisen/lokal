@@ -41,7 +41,39 @@ const router = Router();
 // ─── Product formatting for MCP ────────────────────────────
 // Uses shared parseProductPrice() from knowledge-service.
 
-function formatProductsForMcp(products: any[]): string {
+// orch-pr-14: normalize a product's clean name exactly like the catalog
+// backfill writer (src/routes/marketplace-catalog.ts → normalizeName) does
+// when it computes products.name_norm. Keeping this byte-identical is what
+// lets us join the knowledge-products (name only) back to the catalog rows
+// that actually carry the product_id consumed by lokal_cart_add_item.
+export function normalizeProductName(name: string): string {
+  return name.toLowerCase().trim().replace(/\s+/g, " ");
+}
+
+// orch-pr-14: build a name_norm → catalog product_id map for one agent.
+// The id surfaced here is `products.id` — the SAME column lokal_cart_add_item
+// validates via cart-service.addCartItem (`SELECT p.id FROM products p WHERE
+// p.id = ?`). Only in_stock rows are included so we never advertise an id the
+// cart would reject. Returns an empty map if the catalog has no rows for this
+// agent (e.g. backfill not yet run) — callers then format products as before.
+export function getCatalogProductIdMap(agentId: string, db?: any): Map<string, string> {
+  const map = new Map<string, string>();
+  try {
+    const conn = db ?? getDb();
+    const rows = conn.prepare(
+      "SELECT id, name_norm FROM products WHERE agent_id = ? AND availability = 'in_stock'"
+    ).all(agentId) as Array<{ id: string; name_norm: string }>;
+    for (const r of rows) {
+      // First write wins; UNIQUE(agent_id, name_norm) means at most one row anyway.
+      if (!map.has(r.name_norm)) map.set(r.name_norm, r.id);
+    }
+  } catch {
+    // Never let a catalog lookup break discovery output — degrade to name-only.
+  }
+  return map;
+}
+
+export function formatProductsForMcp(products: any[], productIdByNorm?: Map<string, string>): string {
   if (!products?.length) return "";
 
   const lines: string[] = [];
@@ -67,7 +99,14 @@ function formatProductsForMcp(products: any[]): string {
     const cat = p.category && p.category !== "other" ? ` [${p.category}]` : "";
     const priceStr = price ? ` — ${price}` : "";
     const seasonal = p.seasonal ? " 🌿sesong" : "";
-    lines.push(`- ${cleanName}${cat}${priceStr}${seasonal}`);
+    // orch-pr-14: append the catalog product_id when this product exists in the
+    // products table (in_stock). This is the id an MCP-only agent passes to
+    // lokal_cart_add_item — without it, a pure-MCP buyer could see prices but
+    // had no way to reference a product for the cart. `· id: <uuid>` is both
+    // human-readable and trivially machine-parseable.
+    const pid = productIdByNorm?.get(normalizeProductName(cleanName));
+    const idStr = pid ? `  · id: ${pid}` : "";
+    lines.push(`- ${cleanName}${cat}${priceStr}${seasonal}${idStr}`);
     productCount++;
   }
 
@@ -197,9 +236,10 @@ function registerTools(server: McpServer, getClientIdentity?: () => string | und
           const k = info?.knowledge || {} as any;
           const sections = [formatAgentCompact(agent, i + 1, summary.contact, undefined, getClientIdentity?.()) + dist];
 
-          // Full product list
+          // Full product list — orch-pr-14: pass catalog id map so each
+          // priced/in-stock product line carries its product_id for cart use.
           if (k.products?.length) {
-            sections.push(formatProductsForMcp(k.products));
+            sections.push(formatProductsForMcp(k.products, getCatalogProductIdMap(agent.id)));
           }
 
           // Extra details
@@ -339,9 +379,11 @@ function registerTools(server: McpServer, getClientIdentity?: () => string | und
         sections.push(`\n## Åpningstider\n${hours}`);
       }
 
-      // Products — structured with parsed prices
+      // Products — structured with parsed prices.
+      // orch-pr-14: attach catalog product_id (products.id) to each in-stock
+      // product so an MCP-only agent can pass it straight to lokal_cart_add_item.
       if (k.products?.length) {
-        const productSection = formatProductsForMcp(k.products);
+        const productSection = formatProductsForMcp(k.products, getCatalogProductIdMap(agent.id));
         if (productSection) sections.push(productSection);
       }
 
