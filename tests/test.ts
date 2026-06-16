@@ -18147,6 +18147,7 @@ console.log("\n── orch-pr-14: MCP discovery product_id surfacing ──");
   try { await _orchPr18BulkLoadPromise; } catch { /* errors already pushed to failures */ }
   try { await _orchPr12SweepPromise; } catch { /* errors already pushed to failures */ }
   try { await _orchPr20BmEventsPromise; } catch { /* errors already pushed to failures */ }
+  try { await _orchPr21SentLogActorPromise; } catch { /* errors already pushed to failures */ }
   // PR-109 tests are synchronous (IIFE) — no promise needed
   // Drop pre-existing intg failures (unmasked by awaiting) — they predate M2
   // and live behind a separate fix-it task. Counting them here would surface
@@ -19284,3 +19285,175 @@ const _orchPr9PruneDeadUrlsPromise: Promise<void> = new Promise<void>(r => {
     _orchPr9PruneDeadUrlsResolve();
   }
 })();
+
+
+// ── orch-pr-21: sent-log actor/channel resolution from composed action ───────
+// This test MUST FAIL on origin/main (only 'sent' type + internalMessageId is
+// matched) and PASS with the fix (also matches 'composed' type + messageId,
+// with compose-origin channel fallback to 'resend_smtp').
+//
+// Race-free serialization: chained off _orchPr20BmEventsPromise so it runs
+// AFTER that block (and transitively after _pr94Promise → _pr56Promise) — the
+// same pattern PR-20 uses. Each sub-block also saves the current getDb()
+// singleton before calling __setDbForTesting() and restores it in a finally,
+// so the global is never left swapped even if an assertion throws.
+console.log("\n── orch-pr-21: sent-log actor/channel from composed action ──");
+
+let _orchPr21SentLogActorResolve: () => void = () => {};
+const _orchPr21SentLogActorPromise: Promise<void> = new Promise<void>(r => {
+  _orchPr21SentLogActorResolve = r;
+});
+
+_orchPr20BmEventsPromise.then(async () => {
+  try {
+    const Database = require("better-sqlite3");
+    const { __setDbForTesting, __initSchemaForTesting, getDb } = require("../src/database/init");
+    const { crmService } = require("../src/services/crm-service");
+
+    // ── Test A: compose-origin outbound by claude, delivery_status=sent ──────
+    // Mirrors exactly what happens when the CS-agent calls composeNewThread
+    // with deliveryStatus='sent' (back-compat synchronous path): only a
+    // 'composed' action with payload.messageId is written; no 'sent' action exists.
+    {
+      const prevDb = getDb();
+      const db = new Database(":memory:");
+      db.pragma("journal_mode = DELETE");
+      db.pragma("foreign_keys = OFF");
+      try {
+        __setDbForTesting(db);
+        __initSchemaForTesting(db);
+
+        const { threadId, messageId } = crmService.composeNewThread({
+          toEmail: "kunde@example.com",
+          subject: "Hei fra Rett fra Bonden",
+          bodyText: "Takk for henvendelsen!",
+          createdBy: "claude",
+          deliveryStatus: "sent",
+        });
+
+        // Verify the action logged is 'composed', not 'sent'
+        const action = db.prepare(
+          "SELECT type, actor, payload FROM crm_actions WHERE thread_id = ? ORDER BY created_at DESC LIMIT 1"
+        ).get(threadId) as { type: string; actor: string; payload: string } | undefined;
+        assertEq(action?.type, "composed", "pr21-A: composeNewThread logs type=composed (pre-condition)");
+        assertEq(action?.actor, "claude", "pr21-A: action.actor=claude (pre-condition)");
+
+        const payload = action ? JSON.parse(action.payload) : {};
+        assertTrue(payload.messageId === messageId, "pr21-A: action payload.messageId matches crm_messages.id (pre-condition)");
+        assertTrue(!payload.internalMessageId, "pr21-A: no internalMessageId in composed action (confirms the bug condition)");
+
+        // Now call listSentMessages — with the fix, actor and channel must be populated
+        const rows = crmService.listSentMessages({ deliveryStatus: "sent" });
+        const row = rows.find((m: any) => m.thread_id === threadId);
+
+        assertTrue(!!row, "pr21-A: listSentMessages returns the compose-origin sent message");
+        assertEq(row?.actor, "claude", "pr21-A: actor resolved to 'claude' from composed action");
+        assertTrue(!!row?.channel, "pr21-A: channel is non-null for compose-origin sent message");
+        assertEq(row?.channel, "resend_smtp", "pr21-A: channel falls back to resend_smtp for compose-origin sent message");
+        assertEq(row?.thread_origin, "compose", "pr21-A: thread_origin=compose (compose- prefix intact)");
+      } finally {
+        __setDbForTesting(prevDb);
+      }
+    }
+
+    // ── Test B: actor filter returns the compose-origin row ──────────────────
+    // Mirrors the platform-verifier probe:
+    //   GET /admin/crm/sent-log?since_hours=...&actor=claude&status=sent
+    // which was returning count=0 before the fix.
+    {
+      const prevDb = getDb();
+      const db = new Database(":memory:");
+      db.pragma("journal_mode = DELETE");
+      db.pragma("foreign_keys = OFF");
+      try {
+        __setDbForTesting(db);
+        __initSchemaForTesting(db);
+
+        // Two compose-sends: one by claude, one by daniel
+        const r1 = crmService.composeNewThread({
+          toEmail: "kunde1@example.com",
+          subject: "Claude melding",
+          bodyText: "Tekst fra claude",
+          createdBy: "claude",
+          deliveryStatus: "sent",
+        });
+        const r2 = crmService.composeNewThread({
+          toEmail: "kunde2@example.com",
+          subject: "Daniel melding",
+          bodyText: "Tekst fra daniel",
+          createdBy: "daniel",
+          deliveryStatus: "sent",
+        });
+
+        const allRows = crmService.listSentMessages({ deliveryStatus: "sent" });
+        const claudeRows = allRows.filter((m: any) => m.actor === "claude");
+        const danielRows = allRows.filter((m: any) => m.actor === "daniel");
+
+        assertEq(allRows.length, 2, "pr21-B: two sent messages total");
+        assertEq(claudeRows.length, 1, "pr21-B: actor filter: exactly 1 claude row (verifier probe)");
+        assertEq(danielRows.length, 1, "pr21-B: actor filter: exactly 1 daniel row");
+        assertEq(claudeRows[0]?.thread_id, r1.threadId, "pr21-B: claude row is the correct thread");
+        assertEq(claudeRows[0]?.channel, "resend_smtp", "pr21-B: claude row has channel=resend_smtp");
+        assertEq(danielRows[0]?.channel, "resend_smtp", "pr21-B: daniel row has channel=resend_smtp");
+
+        // Simulate the verifier probe: filter by actor=claude and status=sent
+        // (the in-memory filter in the route does this; replicate here)
+        const verifierResult = allRows.filter(
+          (m: any) => m.actor === "claude" && m.delivery_status === "sent"
+        );
+        assertTrue(verifierResult.length > 0, "pr21-B: verifier probe returns count>0 (was 0 before fix)");
+      } finally {
+        __setDbForTesting(prevDb);
+      }
+    }
+
+    // ── Test C: full route via Resend (type='sent' + internalMessageId) ────
+    // Confirms that the fix does NOT break the existing happy-path where the
+    // route already logs a 'sent' action with internalMessageId and channel.
+    {
+      const prevDb = getDb();
+      const db = new Database(":memory:");
+      db.pragma("journal_mode = DELETE");
+      db.pragma("foreign_keys = OFF");
+      try {
+        __setDbForTesting(db);
+        __initSchemaForTesting(db);
+
+        // Simulate what the compose route does on Resend success:
+        // 1. composeNewThread (deliveryStatus='queued')
+        // 2. updateMessageDeliveryStatus → 'sent'
+        // 3. logAction type='sent' with internalMessageId + channel
+        const r = crmService.composeNewThread({
+          toEmail: "fullpath@example.com",
+          subject: "Full route test",
+          bodyText: "Body",
+          createdBy: "claude",
+          deliveryStatus: "queued",
+        });
+        crmService.updateMessageDeliveryStatus(r.messageId, "sent");
+        crmService.logAction({
+          threadId: r.threadId,
+          contactId: r.contactId,
+          type: "sent",
+          actor: "claude",
+          payload: { outboxId: "ob-1", messageId: "resend-msg-id", channel: "resend_smtp", composedNew: true, internalMessageId: r.messageId },
+        });
+
+        const rows = crmService.listSentMessages({ deliveryStatus: "sent" });
+        const row = rows.find((m: any) => m.thread_id === r.threadId);
+
+        assertTrue(!!row, "pr21-C: full route path (sent action + internalMessageId) still works");
+        assertEq(row?.actor, "claude", "pr21-C: actor=claude from sent action");
+        assertEq(row?.channel, "resend_smtp", "pr21-C: channel=resend_smtp from sent action payload");
+      } finally {
+        __setDbForTesting(prevDb);
+      }
+    }
+
+  } catch (err) {
+    failed++;
+    failures.push("orch-pr-21-sentlog-actor: unexpected error: " + String(err));
+  } finally {
+    _orchPr21SentLogActorResolve();
+  }
+});

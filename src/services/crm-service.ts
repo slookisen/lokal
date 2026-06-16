@@ -710,18 +710,48 @@ class CrmService {
         c.name            AS contact_name,
         c.organization    AS contact_organization,
         (
+          -- Resolve actor from the action that actually exists for this message.
+          -- The compose route logs type='sent' with internalMessageId; back-compat
+          -- callers that skip the route log type='composed' with messageId only.
+          -- Prefer 'sent' when both exist (ORDER BY CASE ensures it ranks first).
           SELECT a.actor
           FROM crm_actions a
-          WHERE a.thread_id = m.thread_id AND a.type = 'sent'
-            AND json_extract(a.payload, '$.internalMessageId') = m.id
-          ORDER BY a.created_at DESC LIMIT 1
+          WHERE a.thread_id = m.thread_id
+            AND a.type IN ('sent', 'composed')
+            AND (
+              json_extract(a.payload, '$.internalMessageId') = m.id
+              OR json_extract(a.payload, '$.messageId') = m.id
+            )
+          ORDER BY
+            CASE a.type WHEN 'sent' THEN 0 ELSE 1 END ASC,
+            a.created_at DESC
+          LIMIT 1
         ) AS sent_actor,
         (
-          SELECT json_extract(a.payload, '$.channel')
+          -- Channel: prefer action payload's $.channel (set by sent-path).
+          -- For compose-origin messages (thread_id starts with 'compose-') that
+          -- reached delivery_status='sent' but have no channel in the action,
+          -- fall back to 'resend_smtp' — these go out exclusively via Resend.
+          SELECT COALESCE(
+            json_extract(a.payload, '$.channel'),
+            CASE
+              WHEN m.delivery_status = 'sent'
+                AND m.thread_id LIKE 'compose-%'
+              THEN 'resend_smtp'
+              ELSE NULL
+            END
+          )
           FROM crm_actions a
-          WHERE a.thread_id = m.thread_id AND a.type = 'sent'
-            AND json_extract(a.payload, '$.internalMessageId') = m.id
-          ORDER BY a.created_at DESC LIMIT 1
+          WHERE a.thread_id = m.thread_id
+            AND a.type IN ('sent', 'composed')
+            AND (
+              json_extract(a.payload, '$.internalMessageId') = m.id
+              OR json_extract(a.payload, '$.messageId') = m.id
+            )
+          ORDER BY
+            CASE a.type WHEN 'sent' THEN 0 ELSE 1 END ASC,
+            a.created_at DESC
+          LIMIT 1
         ) AS sent_channel
       FROM crm_messages m
       JOIN crm_threads t ON t.id = m.thread_id
@@ -735,12 +765,19 @@ class CrmService {
 
     return rows.map((r: any) => {
       let actor: string | null = r.sent_actor ?? null;
-      // Fallback: parse from raw_metadata.createdBy if no sent-action found
+      // Fallback: parse from raw_metadata.createdBy if no action found for actor
       if (!actor && r.raw_metadata) {
         try {
           const meta = JSON.parse(r.raw_metadata);
           actor = meta?.createdBy ?? null;
         } catch { /* ignore */ }
+      }
+      // channel: SQL subquery handles the primary lookup + compose-origin fallback.
+      // TypeScript-level safety net: if subquery returned null for a compose-origin
+      // sent message (e.g. very old row before action logging was added), fall back.
+      let channel: string | null = r.sent_channel ?? null;
+      if (!channel && r.delivery_status === 'sent' && String(r.thread_id).startsWith('compose-')) {
+        channel = 'resend_smtp';
       }
       return {
         message_id: r.message_id,
@@ -752,7 +789,7 @@ class CrmService {
         to_emails: r.to_emails,
         subject: r.subject,
         actor,
-        channel: r.sent_channel ?? null,
+        channel,
         contact_email: r.contact_email,
         contact_name: r.contact_name,
         contact_organization: r.contact_organization,
