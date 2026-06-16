@@ -136,6 +136,62 @@ console.log("\n── orch-pr-10: search-enrich pure decision logic ──");
   console.log(`  search-enrich: ${r.passed} passed, ${r.failed} failed`);
 }
 
+// ── PR-B: content-coherence pure gate (profile-vs-homepage) ──────────────────
+// The full table-driven suite lives in src/services/content-coherence.test.ts
+// (also runnable standalone). Folded into this gate so the 4-complaint conflict
+// cases + benign/empty cases are enforced by `npm test`.
+console.log("\n── PR-B: content-coherence pure gate ──");
+{
+  const { runContentCoherenceTests } = require("../src/services/content-coherence.test") as
+    typeof import("../src/services/content-coherence.test");
+  const r = runContentCoherenceTests({ log: false });
+  passed += r.passed;
+  failed += r.failed;
+  for (const f of r.failures) failures.push("content-coherence: " + f);
+  console.log(`  content-coherence: ${r.passed} passed, ${r.failed} failed`);
+}
+
+// ── PR-B: outreach hasContentConflict() helper (pure, true/false/malformed) ──
+// Mirrors the hasInferenceOnlyFactualField defensive contract: only a persisted
+// content_coherence.verdict === "conflict" suppresses; no_homepage_signal,
+// coherent, absent, and malformed all yield false (no suppression).
+console.log("\n── PR-B: outreach hasContentConflict() ──");
+{
+  const { hasContentConflict } = require("../src/routes/admin-outreach-candidates") as
+    typeof import("../src/routes/admin-outreach-candidates");
+  // TRUE — verdict conflict.
+  assertTrue(
+    hasContentConflict(JSON.stringify({ content_coherence: { verdict: "conflict", conflicts: ["meat≠plant"] } })),
+    "PR-B hasContentConflict: verdict=conflict → true",
+  );
+  // FALSE — no_homepage_signal is advisory, never suppresses.
+  assertTrue(
+    !hasContentConflict(JSON.stringify({ content_coherence: { verdict: "no_homepage_signal", conflicts: [] } })),
+    "PR-B hasContentConflict: verdict=no_homepage_signal → false (advisory only)",
+  );
+  // FALSE — coherent.
+  assertTrue(
+    !hasContentConflict(JSON.stringify({ content_coherence: { verdict: "coherent", conflicts: [] } })),
+    "PR-B hasContentConflict: verdict=coherent → false",
+  );
+  // FALSE — content_coherence absent entirely.
+  assertTrue(
+    !hasContentConflict(JSON.stringify({ inference_only_fields: ["products"] })),
+    "PR-B hasContentConflict: content_coherence absent → false",
+  );
+  // FALSE — empty object / empty string / null / undefined.
+  assertTrue(!hasContentConflict("{}"), "PR-B hasContentConflict: '{}' → false");
+  assertTrue(!hasContentConflict(""), "PR-B hasContentConflict: '' → false");
+  assertTrue(!hasContentConflict(null), "PR-B hasContentConflict: null → false");
+  assertTrue(!hasContentConflict(undefined), "PR-B hasContentConflict: undefined → false");
+  // FALSE — malformed JSON (not throwing).
+  assertTrue(!hasContentConflict("{not valid json"), "PR-B hasContentConflict: malformed JSON → false (no throw)");
+  // FALSE — content_coherence present but not an object.
+  assertTrue(!hasContentConflict(JSON.stringify({ content_coherence: "conflict" })), "PR-B hasContentConflict: content_coherence non-object → false");
+  // FALSE — verdict missing.
+  assertTrue(!hasContentConflict(JSON.stringify({ content_coherence: { conflicts: [] } })), "PR-B hasContentConflict: verdict missing → false");
+}
+
 // ── orchestrator-pr-13: conservative address/phone contact-normalizer ──
 // Pins the formatting-only relaxation in cross-source-validator (clears
 // formatting-only review_required) while keeping genuine conflicts gated.
@@ -2371,15 +2427,28 @@ console.log("\n── PR-A: address/phone cross-source math unchanged (regressio
   assertEq(pAgree.agree, true, "PR-A regression: phone normalized pair → agree=true (unchanged)");
   assertEq(pAgree.source_count, 2, "PR-A regression: phone 2 Tier-A → source_count=2 (unchanged)");
 
-  // Even if a website_homepage record were (wrongly) present on phone, it must
-  // NOT manufacture agreement on its own — a single source never agrees. This
-  // confirms website_homepage joining Tier-A can't fabricate a 2-source pass.
+  // nit (PR-A review #2, folded into PR-B): a website_homepage record is a
+  // CONTENT-only source and must NEVER count toward a FACTUAL field's agreement.
+  // Even if one is (wrongly) present on phone, it is filtered OUT of the
+  // agreement math entirely — agree=false AND source_count=0 (not 1) — while
+  // still appearing in sources_used for observability. This makes PR-A's
+  // "website_homepage is never written for address/phone" invariant defensive.
   const pHomepageOnly = crossSourceAgreement(
     { phone: [prov("91193602", "website_homepage")] },
     "phone",
   );
-  assertEq(pHomepageOnly.agree, false, "PR-A regression: single website_homepage phone → agree=false (no phantom pass)");
-  assertEq(pHomepageOnly.source_count, 1, "PR-A regression: single website_homepage phone → source_count=1");
+  assertEq(pHomepageOnly.agree, false, "nit#2: single website_homepage phone → agree=false (no phantom pass)");
+  assertEq(pHomepageOnly.source_count, 0, "nit#2: website_homepage filtered from FACTUAL agreement → source_count=0");
+  assertTrue(pHomepageOnly.sources_used.includes("website_homepage"), "nit#2: website_homepage still visible in sources_used (observability)");
+  // And it must NOT inflate a real google_places pair into a phantom 3-source
+  // pass nor change the existing 2-source agreement: a genuine homepage+
+  // google_places phone still agrees with source_count=2, content source ignored.
+  const pMixed = crossSourceAgreement(
+    { phone: [prov("91193602", "homepage"), prov("91193602", "google_places"), prov("91193602", "website_homepage")] },
+    "phone",
+  );
+  assertEq(pMixed.agree, true, "nit#2: homepage+google_places phone still agree (content source ignored)");
+  assertEq(pMixed.source_count, 2, "nit#2: content source not counted → source_count stays 2 (not 3)");
 }
 
 // ── PR-19 (gate-split): per-field verdict + aggregateVerdict ────────────────
@@ -3641,6 +3710,127 @@ async function runIntegrationTests(): Promise<void> {
     assertTrue(!poolRow, "intg-g16D: ownership-unverified agent NOT in outreach_ready_pool");
     const stillThere = db.prepare("SELECT 1 FROM agents WHERE id = 'agent-ownership-unverified'").get();
     assertTrue(!!stillThere, "intg-g16D: producer NOT deleted (advisory quarantine only)");
+  }
+
+  // ── PR-B Fixture A: content conflict (profile meat vs homepage andelslandbruk) ──
+  // Address + phone agree across two Tier-A sources (would normally → verified +
+  // pool), but the producer's STORED content says MEAT while a website_homepage
+  // provenance entry (PR-A's persisted homepage content) distinctively says
+  // andelslandbruk/vegetables. The content-coherence gate must flag
+  // content_conflict and pull the agent back to review_required — ABSENT from the
+  // outreach pool — without deleting it (advisory quarantine, like g16D).
+  {
+    const db = buildTestDb();
+    const { getDb } = await import("../src/database/init");
+    __setDbForTesting(db);
+    getDb();
+
+    insertTestAgent(db, "agent-content-conflict", "Grette Andelslandbruk", {
+      email: "post@grette.no",
+      website: "https://grette.no",
+      // Stored content distinctively says MEAT (about + products).
+      about: "Vi selger kjøtt og spekemat fra egen gård, kortreist og av høy kvalitet til lokale kunder.",
+      products: JSON.stringify([{ name: "Kjøtt" }, { name: "Spekemat" }, { name: "Pølser" }]),
+      field_provenance: {
+        // Address + phone agree across 2 Tier-A sources → cross-source pool_eligible.
+        address: [
+          { value: "Gretteveien 5, 2080 Eidsvoll", source_type: "homepage", fetched_at: "2026-06-10T07:25Z" },
+          { value: "Gretteveien 5, 2080 Eidsvoll", source_type: "google_places", fetched_at: "2026-06-10T07:30Z" },
+        ],
+        phone: [
+          { value: "63000222", source_type: "homepage", fetched_at: "2026-06-10T07:25Z" },
+          { value: "63000222", source_type: "google_places", fetched_at: "2026-06-10T07:30Z" },
+        ],
+        business_status: [
+          { value: "active", source_type: "homepage", fetched_at: "2026-06-10T07:25Z" },
+          { value: "active", source_type: "google_places", fetched_at: "2026-06-10T07:30Z" },
+        ],
+        // PR-A homepage CONTENT provenance: the producer's OWN site distinctively
+        // says andelslandbruk/vegetables — contradicting the stored MEAT content.
+        about: [
+          { value: "Andelslandbruk på Romerike der medlemmer dyrker grønnsaker sammen gjennom hele sesongen.", source_type: "website_homepage", source_url: "https://grette.no", fetched_at: "2026-06-10T07:25Z" },
+        ],
+        categories: [
+          { value: "vegetables", source_type: "website_homepage", source_url: "https://grette.no", fetched_at: "2026-06-10T07:25Z" },
+        ],
+      },
+    });
+
+    const mockHeadProbe = async (_url: string) => 200 as number | null;
+    const result = await runVerifierBatch({ db, batchSize: 10, brregLookup: null, headProbe: mockHeadProbe });
+    const ar = result.results.find((r) => r.agent_id === "agent-content-conflict");
+    assertTrue(!!ar, "intg-PRB-A: content-conflict agent found in results");
+    assertTrue(
+      ar!.flags.some((f) => f.startsWith("content_conflict")),
+      "intg-PRB-A: content_conflict flag raised",
+    );
+    assertEq(
+      ar?.new_verification_status,
+      "review_required",
+      "intg-PRB-A: content conflict → review_required (quarantined despite agreeing address/phone)",
+    );
+    // The full content_coherence result is persisted on cross_source_reason JSON.
+    const reasonRow = db.prepare("SELECT verification_review_reason FROM agent_knowledge WHERE agent_id = 'agent-content-conflict'").get() as any;
+    const reason = JSON.parse(reasonRow.verification_review_reason);
+    assertEq(reason.content_coherence?.verdict, "conflict", "intg-PRB-A: content_coherence.verdict=conflict persisted");
+    const poolRow = db.prepare("SELECT * FROM outreach_ready_pool WHERE agent_id = 'agent-content-conflict'").get();
+    assertTrue(!poolRow, "intg-PRB-A: content-conflict agent NOT in outreach_ready_pool");
+    const stillThere2 = db.prepare("SELECT 1 FROM agents WHERE id = 'agent-content-conflict'").get();
+    assertTrue(!!stillThere2, "intg-PRB-A: producer NOT deleted (advisory quarantine only)");
+  }
+
+  // ── PR-B Fixture B: no_homepage_signal control (must NOT be suppressed) ─────
+  // Same agreeing address/phone, good stored content, but NO website_homepage
+  // content provenance → the gate yields no_homepage_signal (advisory). The agent
+  // must STAY verified and REACH the outreach pool — a producer with good content
+  // and no readable homepage signal is never quarantined by this gate.
+  {
+    const db = buildTestDb();
+    const { getDb } = await import("../src/database/init");
+    __setDbForTesting(db);
+    getDb();
+
+    insertTestAgent(db, "agent-no-homepage-signal", "Lingebakken Gård", {
+      email: "post@lingebakken.no",
+      website: "https://lingebakken.no",
+      about: "Familiedrevet gård med fokus på kvalitet og kortreist mat til Oslofjordregionen i mange år.",
+      products: JSON.stringify([{ name: "Epler" }, { name: "Poteter" }, { name: "Gulrøtter" }]),
+      field_provenance: {
+        address: [
+          { value: "Lingebakken 12, 1400 Ski", source_type: "homepage", fetched_at: "2026-06-10T07:25Z" },
+          { value: "Lingebakken 12, 1400 Ski", source_type: "google_places", fetched_at: "2026-06-10T07:30Z" },
+        ],
+        phone: [
+          { value: "93456789", source_type: "homepage", fetched_at: "2026-06-10T07:25Z" },
+          { value: "93456789", source_type: "google_places", fetched_at: "2026-06-10T07:30Z" },
+        ],
+        business_status: [
+          { value: "active", source_type: "homepage", fetched_at: "2026-06-10T07:25Z" },
+          { value: "active", source_type: "google_places", fetched_at: "2026-06-10T07:30Z" },
+        ],
+        // NO website_homepage content provenance present.
+      },
+    });
+
+    const mockHeadProbe = async (_url: string) => 200 as number | null;
+    const result = await runVerifierBatch({ db, batchSize: 10, brregLookup: null, headProbe: mockHeadProbe });
+    const ar = result.results.find((r) => r.agent_id === "agent-no-homepage-signal");
+    assertTrue(!!ar, "intg-PRB-B: no-homepage-signal agent found in results");
+    assertTrue(
+      ar!.flags.includes("content_unverified"),
+      "intg-PRB-B: content_unverified advisory flag raised",
+    );
+    assertTrue(
+      !ar!.flags.some((f) => f.startsWith("content_conflict")),
+      "intg-PRB-B: NO content_conflict flag (no_homepage_signal is advisory only)",
+    );
+    assertEq(
+      ar?.new_verification_status,
+      "verified",
+      "intg-PRB-B: no_homepage_signal does NOT downgrade → stays verified",
+    );
+    const poolRow = db.prepare("SELECT * FROM outreach_ready_pool WHERE agent_id = 'agent-no-homepage-signal'").get();
+    assertTrue(!!poolRow, "intg-PRB-B: no_homepage_signal agent REACHES the outreach pool (not suppressed)");
   }
 
 }
@@ -17466,6 +17656,27 @@ const _orchPr20260614Promise: Promise<void> = new Promise<void>(r => { _orchPr20
     const r = await req3("GET", "/admin/outreach-candidates?mode=first");
     const ids = (r.body.candidates as any[]).map((c: any) => c.agent_id);
     assertTrue(ids.includes("oa-S"), "orch-pr-17-A7: inference-only on non-factual field (about) does NOT suppress");
+  }
+
+  // ── PR-B: content-coherence suppression (conflict suppresses; no_homepage_signal does NOT) ──
+  //   T — verification_review_reason.content_coherence.verdict = "conflict"
+  //       → suppressed + counted under suppressed_counts.content_conflict.
+  //   U — verification_review_reason.content_coherence.verdict = "no_homepage_signal"
+  //       → NOT suppressed (advisory only) → must STAY a candidate.
+  seedPoolAgent("oa-T", "t@bondegard.no", "Agent T Content Conflict");
+  seedPoolAgent("oa-U", "u@bondegard.no", "Agent U No Homepage Signal");
+  orchDb.prepare(`UPDATE agent_knowledge SET verification_review_reason = ? WHERE agent_id = 'oa-T'`).run(
+    JSON.stringify({ content_coherence: { verdict: "conflict", conflicts: ["meat≠plant"], corroborated: [] } }),
+  );
+  orchDb.prepare(`UPDATE agent_knowledge SET verification_review_reason = ? WHERE agent_id = 'oa-U'`).run(
+    JSON.stringify({ content_coherence: { verdict: "no_homepage_signal", conflicts: [], corroborated: [] } }),
+  );
+  {
+    const r = await req3("GET", "/admin/outreach-candidates?mode=first");
+    const ids = (r.body.candidates as any[]).map((c: any) => c.agent_id);
+    assertTrue(!ids.includes("oa-T"), "PR-B-A8: content_coherence=conflict agent T suppressed");
+    assertTrue(r.body.suppressed_counts.content_conflict >= 1, "PR-B-A9: suppressed_counts.content_conflict >= 1 (T)");
+    assertTrue(ids.includes("oa-U"), "PR-B-A10: content_coherence=no_homepage_signal agent U NOT suppressed (advisory only)");
   }
 
   // Cleanup
