@@ -19766,6 +19766,13 @@ const _orchPr21SentLogActorPromise: Promise<void> = new Promise<void>(r => {
 
 _orchPr20BmEventsPromise.then(async () => {
   try {
+    // PR-23 v3 (targeted race fix): run AFTER the blocklist/outreach blocks so this
+    // block's __setDbForTesting swap can never overlap their global-DB reads — the CI
+    // race that flipped orch20260614-37..46. Awaiting earlier-defined promises = no deadlock.
+    try { await _orchPr20260614_2Promise; } catch { /* owns its failures */ }
+    try { await _orchPr20260614Promise; } catch { /* owns its failures */ }
+    try { await _orchPr20260614_5Promise; } catch { /* owns its failures */ }
+    try { await _orchPr20260614_6Promise; } catch { /* owns its failures */ }
     const Database = require("better-sqlite3");
     const { __setDbForTesting, __initSchemaForTesting, getDb } = require("../src/database/init");
     const { crmService } = require("../src/services/crm-service");
