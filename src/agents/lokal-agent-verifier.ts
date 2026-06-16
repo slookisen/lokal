@@ -23,8 +23,6 @@ import {
   aggregateVerdict,
   domainCoherenceCheck,
   factualFieldsWithOnlyInference,
-  isContentOnlySourceType,
-  CONTENT_FIELDS,
   FREE_MAIL_DOMAINS,
   type FieldName,
   type ProvenanceRecord,
@@ -32,13 +30,6 @@ import {
   type CrossSourceVerdict,
   type DomainCoherenceResult,
 } from "../services/cross-source-validator";
-import {
-  contentCoherenceCheck,
-  extractBusinessTypeTokensForCoherence,
-  extractProductCategoriesForCoherence,
-  type ContentCoherenceResult,
-  type HomepageContentSignals,
-} from "../services/content-coherence";
 
 export interface VerifierResult {
   agent_id: string;
@@ -694,92 +685,6 @@ export function deriveVerificationStatus(
   return "verified";
 }
 
-// ── PR-B: reconstruct homepage CONTENT signals from field_provenance ─────────
-//
-// PR-A persists the producer's OWN homepage content as field_provenance entries
-// with source_type "website_homepage" on the CONTENT fields (about / products /
-// description / categories). The verifier does not have PR-A's in-memory
-// `content_signals`, so it rebuilds the homepage-side signal for the
-// content-coherence gate from those persisted entries:
-//   - aboutSummary       ← the website_homepage value of about / description
-//   - businessTypeTokens ← distinctive/benign tokens in those about/description
-//                          values (via the gate's own lexicon)
-//   - productMentions    ← normalized categories from the website_homepage
-//                          values of categories / products (and the about text)
-// Returns null when NO website_homepage content evidence exists at all, so the
-// gate yields `no_homepage_signal` (advisory only). PURE.
-export function reconstructHomepageSignals(
-  fieldProvenance: Record<string, unknown>,
-): HomepageContentSignals | null {
-  if (!fieldProvenance || typeof fieldProvenance !== "object") return null;
-
-  // Collect the website_homepage-sourced VALUE for each content field.
-  const homepageValues: Record<string, string[]> = {};
-  let anyHomepage = false;
-  for (const field of CONTENT_FIELDS) {
-    const raw = (fieldProvenance as Record<string, unknown>)[field];
-    const records: unknown[] = Array.isArray(raw) ? raw : raw && typeof raw === "object" ? [raw] : [];
-    const vals: string[] = [];
-    for (const r of records) {
-      if (!r || typeof r !== "object") continue;
-      const rec = r as Record<string, unknown>;
-      const st = rec.source_type;
-      // website_homepage is the ONLY content-only source; isContentOnlySourceType
-      // matches the bare and prefixed ("website_homepage:host") forms.
-      if (typeof st === "string" && isContentOnlySourceType(st)) {
-        const v = rec.value;
-        if (typeof v === "string" && v.trim() !== "") {
-          vals.push(v);
-          anyHomepage = true;
-        }
-      }
-    }
-    homepageValues[field] = vals;
-  }
-
-  if (!anyHomepage) return null;
-
-  const aboutText = [...(homepageValues.about ?? []), ...(homepageValues.description ?? [])].join(" \n ");
-  const productText = [
-    ...(homepageValues.categories ?? []),
-    ...(homepageValues.products ?? []),
-    aboutText,
-  ].join(" \n ");
-
-  return {
-    businessTypeTokens: extractBusinessTypeTokensForCoherence(aboutText + " \n " + productText),
-    productMentions: extractProductCategoriesForCoherence(productText),
-    aboutSummary: aboutText.trim() || undefined,
-  };
-}
-
-// ── PR-B: read a content field's STORED value from field_provenance ──────────
-//
-// description/categories live on the `agents` table, which the verifier does not
-// SELECT (and which some minimal test schemas omit). For the content-coherence
-// gate's STORED side we therefore read the field's value from field_provenance,
-// EXCLUDING website_homepage records (that source is the homepage side we are
-// comparing against). Returns the joined non-homepage values, or undefined when
-// there are none. PURE.
-function storedContentValueFromProvenance(
-  fieldProvenance: Record<string, unknown>,
-  field: string,
-): string | undefined {
-  if (!fieldProvenance || typeof fieldProvenance !== "object") return undefined;
-  const raw = (fieldProvenance as Record<string, unknown>)[field];
-  const records: unknown[] = Array.isArray(raw) ? raw : raw && typeof raw === "object" ? [raw] : [];
-  const vals: string[] = [];
-  for (const r of records) {
-    if (!r || typeof r !== "object") continue;
-    const rec = r as Record<string, unknown>;
-    const st = rec.source_type;
-    if (typeof st === "string" && isContentOnlySourceType(st)) continue; // skip homepage side
-    const v = rec.value;
-    if (typeof v === "string" && v.trim() !== "") vals.push(v);
-  }
-  return vals.length > 0 ? vals.join(" \n ") : undefined;
-}
-
 // Main loop. Caller (Fly Machine job, test, or manual) provides a
 // brregLookup function (or null to skip Brreg).
 export async function runVerifierBatch(opts: {
@@ -888,38 +793,6 @@ export async function runVerifierBatch(opts: {
       }
     }
 
-    // ── Content-coherence check (PR-B) ─────────────────────────────────────
-    // A SEPARATE axis from the address/phone domain_coherence below: this asks
-    // whether the producer's STORED content (about/products/categories/
-    // description) CONTRADICTS its OWN homepage. The homepage signals are
-    // reconstructed from the website_homepage entries in field_provenance (the
-    // persisted form of PR-A's content_signals); the stored content comes from
-    // the agent/agent_knowledge columns. Mirrors the website_ownership /
-    // inference_only quarantine flow:
-    //   - conflict          → flag `content_conflict:<field>` + downgrade verified
-    //                         → review_required (persisted via the existing
-    //                         verification_review_reason write; no schema change).
-    //   - no_homepage_signal → advisory flag `content_unverified` ONLY (NEVER a
-    //                         downgrade — must not mass-quarantine producers that
-    //                         legitimately have no homepage signal).
-    // Conservative by default (unjudgeable → coherent), so it cannot widen the
-    // existing 24 domain_coherence false-positives.
-    const homepageSignals = reconstructHomepageSignals(fieldProv);
-    // Stored content. about/products come straight off the selected columns;
-    // description/categories live on the `agents` table (not selected here, and
-    // absent in some minimal test schemas) so we read their STORED value from
-    // field_provenance, EXCLUDING the website_homepage source (that is the
-    // homepage side we are comparing AGAINST). This keeps the gate driven purely
-    // off the already-available columns + the field_provenance JSON — no extra
-    // SELECT column and no schema coupling.
-    const storedContent = {
-      about: typeof agent.about === "string" ? agent.about : undefined,
-      products: typeof agent.products === "string" ? agent.products : undefined,
-      description: storedContentValueFromProvenance(fieldProv, "description"),
-      categories: storedContentValueFromProvenance(fieldProv, "categories"),
-    };
-    const contentCoherence: ContentCoherenceResult = contentCoherenceCheck(storedContent, homepageSignals);
-
     // ── Domain-coherence check (orch-PR-20260512-33 / Eidsmo fix) ──────────
     // Even when per-field cross-source agreement passes, if the homepage
     // URL discovered for the agent disagrees with the website/email stored
@@ -948,26 +821,6 @@ export async function runVerifierBatch(opts: {
       console.log(
         `[verifier] ${agent.id} (${agent.name ?? "?"}) website_ownership=unverified — quarantined from pool`,
       );
-    }
-    if (contentCoherence.verdict === "conflict") {
-      // Quarantine: stored content distinctively contradicts the producer's own
-      // homepage. Flag every conflicting field, surface the full result on the
-      // persisted cross_source_reason JSON, and downgrade verified → review_required
-      // (mirrors the inferenceOnly / websiteOwnership quarantine; leaves already-
-      // worse statuses untouched).
-      for (const c of contentCoherence.conflicts) {
-        gate.flags.push(`content_conflict:${c}`);
-      }
-      (crossSourceResults as Record<string, unknown>).content_coherence = contentCoherence;
-      if (newVerification === "verified") newVerification = "review_required";
-      console.log(
-        `[verifier] ${agent.id} (${agent.name ?? "?"}) content conflicts with homepage (${contentCoherence.conflicts.join(", ")}) — quarantined from pool`,
-      );
-    } else if (contentCoherence.verdict === "no_homepage_signal") {
-      // Advisory ONLY — never a downgrade. We could not read a homepage content
-      // signal, so we cannot judge coherence; a producer with good content and no
-      // homepage signal must still reach the pool.
-      gate.flags.push("content_unverified");
     }
     if (!coherence.coherent) {
       console.log(
