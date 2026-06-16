@@ -919,6 +919,120 @@ export function meetsAboutQualityBar(text: string | null | undefined, minLen = 8
   return true;
 }
 
+// ─── EXPERIENCES vertical: homepage CONTENT → experience-category mapper ──────
+//
+// orch-experiences-content-refresh (2026-06-17). The experiences vertical
+// (opplevagent.no, experiences.db) classifies things-to-do by ACTIVITY, not by
+// food product — so the food-oriented mapToPlatformCategories() above is the
+// WRONG vocabulary for it. This mapper is its experiences-vertical twin: it
+// turns a provider's own homepage visible text into the experiences-DB category
+// SLUGS that `experiences.category` stores and `/api/opplevelser/discover?category=`
+// filters on. PURE — no LLM, no I/O. Reuses extractVisibleText/summarizeAbout/
+// meetsAboutQualityBar (above) unchanged; only the category vocabulary differs.
+//
+// The slug set MUST match what the experiences harvest/seed already writes (see
+// experiences-openapi.ts + the exp-store fixtures: dyreliv_safari, natur_friluft,
+// kultur_historie, …). Kept here as a leaf, dependency-free lexicon so the
+// experiences endpoint can REUSE this module rather than duplicating extractors.
+
+/**
+ * The experiences-vertical category vocabulary — the canonical slugs the
+ * `experiences.category` column stores and the `/api/opplevelser/discover`
+ * category filter understands. Aligned with the harvest/seed slugs documented
+ * in experiences-openapi.ts and exercised by the exp-store fixtures.
+ */
+export const EXPERIENCE_CATEGORIES: readonly string[] = [
+  "natur_friluft",     // hiking, kayak, climbing, glacier, outdoor nature
+  "dyreliv_safari",    // whale/bird/wildlife safaris, animal encounters
+  "vannaktivitet",     // water-based: rafting, diving, fishing trips, boat
+  "vinteraktivitet",   // winter: ski, dog-sled, snowmobile, northern lights
+  "kultur_historie",   // museums, guided town/heritage walks, history
+  "mat_drikke",        // food/drink experiences, tastings, breweries, courses
+  "gardsbesok",        // farm visits, petting farms, gård experiences
+  "wellness_spa",      // spa, sauna, yoga, retreat, wellness
+];
+
+// Norwegian (accent-stripped, word-boundary) keyword → experience-category slug.
+// Curated, small, deterministic. A page that says "hvalsafari" is dyreliv_safari;
+// "brevandring"/"fjelltur" is natur_friluft; "rafting"/"kajakk" is vannaktivitet;
+// "hundekjoring"/"nordlys" is vinteraktivitet; "museum"/"byvandring" is
+// kultur_historie; "olsmaking"/"bryggeri"/"matkurs" is mat_drikke; "gardsbesok"/
+// "besoksgard" is gardsbesok; "spa"/"sauna"/"yoga" is wellness_spa.
+const EXPERIENCE_CATEGORY_LEXICON: ReadonlyArray<readonly [string, readonly string[]]> = [
+  ["natur_friluft", [
+    "friluft", "friluftsliv", "fjelltur", "fjelltmarsj", "vandring", "vandretur",
+    "fottur", "tur i naturen", "naturopplevelse", "brevandring", "isbre", "isbreen",
+    "klatring", "klatretur", "via ferrata", "topptur", "sykkeltur", "terrengsykling",
+    "padletur", "natursti", "hiking", "trekking", "glacier",
+  ]],
+  ["dyreliv_safari", [
+    "hvalsafari", "hval", "safari", "dyreliv", "fuglesafari", "fugletitting",
+    "selsafari", "moskussafari", "elgsafari", "dyrepark", "wildlife", "whale",
+  ]],
+  ["vannaktivitet", [
+    "rafting", "elvepadling", "kajakk", "kajakktur", "kano", "kanotur", "padling",
+    "dykking", "snorkling", "fisketur", "havfiske", "deepseafishing", "rib", "ribtur",
+    "bottur", "seiltur", "stand up paddle", "sup", "rafting",
+  ]],
+  ["vinteraktivitet", [
+    "hundekjoring", "hundeslede", "sledehund", "snoskuter", "snowmobile",
+    "skitur", "langrenn", "telemark", "truger", "trugetur", "nordlys",
+    "nordlystur", "aurora", "northern lights", "skigaring", "vinteraktivitet",
+  ]],
+  ["kultur_historie", [
+    "museum", "museet", "byvandring", "guidet tur", "historie", "historisk",
+    "kulturminne", "kulturarv", "stavkirke", "festning", "krigshistorie",
+    "kulturopplevelse", "kunst", "galleri", "heritage", "city walk",
+  ]],
+  ["mat_drikke", [
+    "olsmaking", "vinsmaking", "smaking", "bryggeri", "bryggerier", "brenneri",
+    "destilleri", "matkurs", "matopplevelse", "kortreist mat", "gardsmat",
+    "ysteri", "ostesmaking", "food tour", "matvandring", "kafe", "restaurantbesok",
+  ]],
+  ["gardsbesok", [
+    "gardsbesok", "besoksgard", "besoeksgaard", "gardsopplevelse", "dyra pa garden",
+    "kose med dyr", "gardsdyr", "ridning", "rideskole", "ridetur", "ponniridning",
+    "farm visit", "petting",
+  ]],
+  ["wellness_spa", [
+    "spa", "wellness", "sauna", "badstu", "yoga", "retreat", "massasje",
+    "velvaere", "velvere", "avslapning", "meditasjon", "isbad",
+  ]],
+];
+
+/**
+ * Map a provider's homepage VISIBLE TEXT to the experiences-vertical category
+ * slugs. PURE — accent-stripped, word-boundary matching over the curated
+ * EXPERIENCE_CATEGORY_LEXICON. Returns the matched slugs in EXPERIENCE_CATEGORIES
+ * canonical order (deterministic regardless of input order), deduped. Returns []
+ * when nothing maps so the writer never writes a guessed category.
+ *
+ *   "Bli med på hvalsafari fra Tromsø"            → ["dyreliv_safari"]
+ *   "Brevandring på Folgefonna og fjelltur"       → ["natur_friluft"]
+ *   "Rafting i Sjoa — elvepadling for hele familien" → ["vannaktivitet"]
+ *   "Hundekjøring under nordlyset"                → ["vinteraktivitet"]
+ *   "Vi tilbyr overnatting og parkering"          → []
+ */
+export function mapToExperienceCategories(text: string | null | undefined): string[] {
+  if (!text) return [];
+  const hay = stripNorwegianAccents(String(text).toLowerCase());
+  const hits = new Set<string>();
+  for (const [slug, keywords] of EXPERIENCE_CATEGORY_LEXICON) {
+    for (const kw of keywords) {
+      const norm = stripNorwegianAccents(kw.toLowerCase());
+      // Multi-word phrases: substring match; single tokens: word-boundary match.
+      const matched = norm.includes(" ")
+        ? hay.includes(norm)
+        : new RegExp(`\\b${norm.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\b`).test(hay);
+      if (matched) {
+        hits.add(slug);
+        break; // one keyword hit is enough to include the slug
+      }
+    }
+  }
+  return EXPERIENCE_CATEGORIES.filter((c) => hits.has(c));
+}
+
 /** SSRF guard: allow only http(s) to public hosts; block localhost, link-local,
  * private/CGNAT ranges and cloud-metadata (169.254.0.0/16). Domain names are allowed
  * (DNS-rebinding is out of scope for this admin-gated, dry-run-by-default endpoint). */

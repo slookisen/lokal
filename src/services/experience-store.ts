@@ -410,3 +410,179 @@ export function getProviderByName(navn: string): Record<string, unknown> | null 
       .get(navn) as Record<string, unknown>) ?? null
   );
 }
+
+// ─── Homepage-content enrichment (orch-experiences-content-refresh) ──
+//
+// Mirrors the rfb `POST /admin/homepage-content-refresh` writer, adapted to the
+// experiences data model. In experiences, the human-readable "about" content
+// lives on the `experiences.description` column (providers carry no about field)
+// and the activity classification lives on `experiences.category`. So the
+// content-refresh writer enriches a provider's EXPERIENCES (description +
+// category) from that provider's own homepage, and stamps provider enrichment
+// metadata — it NEVER touches contact/orgnr/Brreg-verification fields.
+//
+// LOCK MODEL (experiences-native; there is no rfb-style field_provenance here):
+//   - an experience is LOCKED for content writes when it is owner/curator/claim
+//     sourced or already verified — i.e. verification_status='verified' OR
+//     content_source IN ('manual','claim'). Those are human/owner-authored and
+//     must never be overwritten by a homepage scrape.
+//   - within an UNLOCKED experience, a field is only written when it is THIN:
+//     description is written only if currently empty/blank; category is written
+//     only if currently empty. We never overwrite an existing non-empty value
+//     (blank beats wrong), matching the rfb "only fill google-sourced/empty" gate.
+
+export type ContentRefreshTarget = {
+  id: string;
+  navn: string;
+  hjemmeside: string;
+};
+
+/**
+ * Auto-select providers eligible for a homepage content-refresh: providers that
+ * HAVE a website (hjemmeside) AND own ≥1 experience whose content is THIN
+ * (description empty OR category empty) and NOT locked (not verified, not
+ * manual/claim-sourced). Ordered oldest-enriched first (last_enriched_at NULLs
+ * first) so a sweep makes progress. Capped by `limit`.
+ */
+export function selectProvidersForContentRefresh(limit = 25): ContentRefreshTarget[] {
+  const db = getDb(VERTICAL);
+  const cap = Math.max(1, Math.min(100, limit));
+  const rows = db
+    .prepare(
+      `SELECT p.id AS id, p.navn AS navn, TRIM(p.hjemmeside) AS hjemmeside
+         FROM experience_providers p
+        WHERE p.hjemmeside IS NOT NULL AND TRIM(p.hjemmeside) != ''
+          AND EXISTS (
+            SELECT 1 FROM experiences e
+             WHERE e.provider_id = p.id
+               AND e.verification_status != 'verified'
+               AND (e.content_source IS NULL OR e.content_source NOT IN ('manual','claim'))
+               AND (
+                     e.description IS NULL OR TRIM(e.description) = ''
+                  OR e.category    IS NULL OR TRIM(e.category)    = ''
+                   )
+          )
+        ORDER BY (p.last_enriched_at IS NOT NULL), p.last_enriched_at ASC, p.created_at ASC
+        LIMIT ?`
+    )
+    .all(cap) as Array<{ id: string; navn: string; hjemmeside: string }>;
+  return rows.filter((r) => r.hjemmeside && r.hjemmeside.trim().length > 0);
+}
+
+/**
+ * Resolve an explicit providerId for content-refresh. Returns the target shape
+ * only when the provider exists AND has a usable website; otherwise null (the
+ * caller records it as skipped/no-website).
+ */
+export function getProviderContentTarget(providerId: string): ContentRefreshTarget | null {
+  const db = getDb(VERTICAL);
+  const row = db
+    .prepare(
+      `SELECT id, navn, TRIM(hjemmeside) AS hjemmeside
+         FROM experience_providers WHERE id = ?`
+    )
+    .get(providerId) as { id: string; navn: string; hjemmeside: string | null } | undefined;
+  if (!row || !row.hjemmeside || row.hjemmeside.trim().length === 0) return null;
+  return { id: row.id, navn: row.navn, hjemmeside: row.hjemmeside.trim() };
+}
+
+/** A provider's experiences, with only the columns the content gate needs. */
+export type ExperienceContentRow = {
+  id: string;
+  title: string;
+  description: string | null;
+  category: string | null;
+  content_source: string | null;
+  verification_status: string | null;
+};
+
+export function getExperiencesForProvider(providerId: string): ExperienceContentRow[] {
+  const db = getDb(VERTICAL);
+  return db
+    .prepare(
+      `SELECT id, title, description, category, content_source, verification_status
+         FROM experiences WHERE provider_id = ? ORDER BY created_at ASC`
+    )
+    .all(providerId) as ExperienceContentRow[];
+}
+
+/**
+ * True when an experience is LOCKED against homepage content writes: it is
+ * owner/curator/claim authored or already verified. Such rows are never
+ * overwritten by a scrape (PURE-ish — reads only the passed row).
+ */
+export function isExperienceContentLocked(row: {
+  content_source?: string | null;
+  verification_status?: string | null;
+}): boolean {
+  if (row.verification_status === "verified") return true;
+  if (row.content_source === "manual" || row.content_source === "claim") return true;
+  return false;
+}
+
+/**
+ * Apply homepage-sourced content to ONE experience, respecting locks + thin-only
+ * gate. Writes `description` only if currently blank, `category` only if
+ * currently empty; stamps content_source='provider_site', enrichment_state and
+ * updated_at when anything changed. Returns the field names actually written
+ * (empty array = nothing written: locked, or no thin field, or no candidates).
+ * NEVER touches contact/orgnr/Brreg fields. Idempotent: a second run finds the
+ * fields populated and writes nothing.
+ */
+export function applyExperienceContent(
+  experienceId: string,
+  candidate: { description?: string | null; category?: string | null }
+): string[] {
+  const db = getDb(VERTICAL);
+  const row = db
+    .prepare(
+      `SELECT id, description, category, content_source, verification_status
+         FROM experiences WHERE id = ?`
+    )
+    .get(experienceId) as ExperienceContentRow | undefined;
+  if (!row) return [];
+  if (isExperienceContentLocked(row)) return [];
+
+  const sets: string[] = [];
+  const params: Record<string, unknown> = { id: experienceId };
+  const written: string[] = [];
+
+  const descBlank = !row.description || String(row.description).trim() === "";
+  if (descBlank && candidate.description && candidate.description.trim().length > 0) {
+    sets.push("description = @description");
+    params.description = candidate.description.trim();
+    written.push("description");
+  }
+
+  const catBlank = !row.category || String(row.category).trim() === "";
+  if (catBlank && candidate.category && candidate.category.trim().length > 0) {
+    sets.push("category = @category");
+    params.category = candidate.category.trim();
+    written.push("category");
+  }
+
+  if (sets.length === 0) return [];
+
+  // Mark provenance + enrichment state on any successful content write.
+  sets.push("content_source = 'provider_site'");
+  sets.push("enrichment_state = 'enriched'");
+  sets.push("updated_at = datetime('now')");
+
+  db.prepare(`UPDATE experiences SET ${sets.join(", ")} WHERE id = @id`).run(params);
+  return written;
+}
+
+/** Stamp a provider's enrichment metadata after a content-refresh pass (no
+ * contact/Brreg fields touched). Best-effort; returns true if a row changed. */
+export function markProviderEnriched(providerId: string): boolean {
+  const db = getDb(VERTICAL);
+  const res = db
+    .prepare(
+      `UPDATE experience_providers
+          SET enrichment_state = 'enriched', last_enriched_at = datetime('now'),
+              updated_at = datetime('now')
+        WHERE id = ?`
+    )
+    .run(providerId);
+  return res.changes > 0;
+}

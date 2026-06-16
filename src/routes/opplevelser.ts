@@ -25,7 +25,24 @@ import {
   experienceExistsForProvider,
   ExperienceSchema,
   DiscoverFilterSchema,
+  // orch-experiences-content-refresh — homepage→content writer
+  selectProvidersForContentRefresh,
+  getProviderContentTarget,
+  getExperiencesForProvider,
+  applyExperienceContent,
+  markProviderEnriched,
+  type ContentRefreshTarget,
 } from "../services/experience-store";
+// PURE homepage extractors + SSRF guard — REUSED from the rfb search-enrich
+// module (same code the rfb POST /admin/homepage-content-refresh uses). Only the
+// category mapper differs (experiences vocab, not the food vocab).
+import {
+  isSafeFetchUrl,
+  extractVisibleText,
+  summarizeAbout,
+  meetsAboutQualityBar,
+  mapToExperienceCategories,
+} from "../services/search-enrich";
 import { classifyProvider, sleep, BrregClass } from "../services/experience-brreg";
 
 const router = Router();
@@ -297,6 +314,228 @@ router.post("/admin/bulk-load", requireAdmin, async (req: Request, res: Response
     skipped,
     excluded_inactive: excludedInactive,
     ...(cappedProviders > 0 ? { capped_providers: cappedProviders } : {}),
+  });
+});
+
+// ─── POST /api/opplevelser/admin/content-refresh (admin) ────────────
+//
+// orch-experiences-content-refresh (2026-06-17). The experiences twin of the
+// rfb `POST /admin/homepage-content-refresh` (orch-pr-24a). The experiences
+// vertical has 41 bulk-loaded providers but NO enrichment pipeline — their
+// experiences' content isn't sourced from the providers' OWN homepages. This
+// endpoint is that writer: for targeted/auto-selected providers WITH a website,
+// it fetches the homepage server-side (SSRF-guarded, timeout, + /om-oss /about),
+// runs the SHARED PR-22 extractors (extractVisibleText/summarizeAbout) plus the
+// experiences-vocab category mapper (mapToExperienceCategories), and writes
+// description/category onto that provider's EXPERIENCES through a gate that
+// respects owner/curated/verified locks. Dry-run by default; apply=1 writes.
+//
+// SAFETY: writes ONLY to experiences.db via experience-store. NEVER touches
+// contact/orgnr/Brreg-verification fields; never overwrites a verified/manual/
+// claim-sourced row; only fills THIN (empty) description/category. Reuses the
+// rfb SSRF guard + extractors verbatim. Auth: same X-Admin-Key (requireAdmin).
+//
+// NB: MUST come before "/:id" so "admin" isn't swallowed as an id param.
+
+const CR_FETCH_TIMEOUT_MS = 10_000;
+const CR_UA = "Lokal-Experiences-Scraper/1.0 (+https://opplevagent.no)";
+// Same-host sub-pages worth crawling for content (mirrors the rfb writer).
+const CR_CONTENT_PATHS: readonly string[] = ["/om-oss", "/about"];
+const CR_DEFAULT_LIMIT = 25;
+const CR_HARD_CAP = 100;
+const CR_CONCURRENCY = 3;
+
+/** Fetch one URL's HTML server-side (SSRF-guarded). Returns null on any failure. */
+async function crFetchHtml(url: string): Promise<string | null> {
+  if (!isSafeFetchUrl(url)) return null;
+  const fetchUrl = /^https?:\/\//i.test(url) ? url : `https://${url}`;
+  try {
+    const resp = await fetch(fetchUrl, {
+      redirect: "follow",
+      headers: { "User-Agent": CR_UA, Accept: "text/html,application/xhtml+xml" },
+      signal: AbortSignal.timeout(CR_FETCH_TIMEOUT_MS),
+    });
+    if (!resp.ok) return null;
+    return await resp.text();
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Fetch a provider's homepage + same-host content sub-pages, concatenated. The
+ * primary page's HTML is returned first (so summarizeAbout's og/meta lookups hit
+ * the homepage), with sub-page HTML appended for the category-token scan. Returns
+ * null only if the primary homepage cannot be fetched.
+ */
+async function crFetchHomepageContent(
+  homepageUrl: string
+): Promise<{ primaryHtml: string; combinedHtml: string; fetchUrl: string } | null> {
+  const fetchUrl = /^https?:\/\//i.test(homepageUrl) ? homepageUrl : `https://${homepageUrl}`;
+  const primaryHtml = await crFetchHtml(fetchUrl);
+  if (primaryHtml === null) return null;
+  let combinedHtml = primaryHtml;
+  try {
+    const u = new URL(fetchUrl);
+    const base = `${u.protocol}//${u.host}`;
+    for (const path of CR_CONTENT_PATHS) {
+      const sub = await crFetchHtml(`${base}${path}`);
+      if (sub) combinedHtml += "\n" + sub;
+    }
+  } catch {
+    /* malformed URL — primary homepage content still stands */
+  }
+  return { primaryHtml, combinedHtml, fetchUrl };
+}
+
+router.post("/admin/content-refresh", requireAdmin, async (req: Request, res: Response) => {
+  const body = (req.body ?? {}) as { providerIds?: unknown; limit?: unknown; apply?: unknown };
+
+  // apply: dry-run by default. apply=1/"1"/true (body) or ?apply=1.
+  const apply =
+    body.apply === true ||
+    body.apply === 1 ||
+    body.apply === "1" ||
+    body.apply === "true" ||
+    req.query?.apply === "1" ||
+    req.query?.apply === "true";
+  const dryRun = !apply;
+
+  // limit: default 25, hard cap 100.
+  const limit = Math.min(
+    typeof body.limit === "number" && body.limit > 0 ? Math.floor(body.limit) : CR_DEFAULT_LIMIT,
+    CR_HARD_CAP
+  );
+
+  // ── Target selection ──────────────────────────────────────────────
+  let targets: ContentRefreshTarget[];
+  if (Array.isArray(body.providerIds) && body.providerIds.length > 0) {
+    const ids = (body.providerIds as unknown[])
+      .filter((id): id is string => typeof id === "string" && id.trim().length > 0)
+      .map((id) => id.trim())
+      .slice(0, limit);
+    targets = ids
+      .map((id) => getProviderContentTarget(id))
+      .filter((t): t is ContentRefreshTarget => t !== null);
+  } else {
+    targets = selectProvidersForContentRefresh(limit);
+  }
+
+  let scanned = 0;
+  const byField: Record<string, number> = { description: 0, category: 0 };
+  const changed: Array<{ provider_id: string; fields: string[] }> = [];
+  const skippedLocked: Array<{ provider_id: string; experience_ids: string[] }> = [];
+  const errors: Array<{ provider_id: string; error: string }> = [];
+
+  async function processOne(t: ContentRefreshTarget): Promise<void> {
+    const providerId = t.id;
+
+    // Fetch homepage content server-side (SSRF-guarded).
+    let fetched: { primaryHtml: string; combinedHtml: string; fetchUrl: string } | null;
+    try {
+      fetched = await crFetchHomepageContent(t.hjemmeside);
+    } catch (e: any) {
+      errors.push({ provider_id: providerId, error: e?.message ?? String(e) });
+      return;
+    }
+    if (!fetched) {
+      errors.push({ provider_id: providerId, error: `fetch_failed for ${t.hjemmeside}` });
+      return;
+    }
+    const { primaryHtml, combinedHtml } = fetched;
+
+    // Run the SHARED extractors + the experiences-vocab category mapper.
+    const contentText = extractVisibleText(combinedHtml);
+    const aboutSummary = summarizeAbout(primaryHtml);
+    const expCategories = mapToExperienceCategories(contentText);
+
+    // Build candidate content: about → description (quality-gated), first mapped
+    // slug → category. Both are only WRITTEN onto thin/empty fields by the store.
+    const candidateDescription = meetsAboutQualityBar(aboutSummary) ? aboutSummary : null;
+    const candidateCategory = expCategories.length > 0 ? expCategories[0] : null;
+
+    scanned++;
+    if (!candidateDescription && !candidateCategory) return; // nothing extractable
+
+    // Gate per experience through the store (respects locks + thin-only).
+    const expRows = getExperiencesForProvider(providerId);
+    const writtenFields = new Set<string>();
+    const lockedExpIds: string[] = [];
+    const toApply: Array<{ id: string }> = [];
+
+    for (const e of expRows) {
+      // Reportable lock detection (mirrors the store's gate) so the response can
+      // surface skipped_locked even on a dry-run.
+      if (e.verification_status === "verified" || e.content_source === "manual" || e.content_source === "claim") {
+        // Only count it as "skipped_locked" if it WOULD otherwise have been a
+        // write target (has a thin field this run could have filled).
+        const descBlank = !e.description || String(e.description).trim() === "";
+        const catBlank = !e.category || String(e.category).trim() === "";
+        if ((candidateDescription && descBlank) || (candidateCategory && catBlank)) {
+          lockedExpIds.push(e.id);
+        }
+        continue;
+      }
+      toApply.push({ id: e.id });
+    }
+
+    if (lockedExpIds.length > 0) {
+      skippedLocked.push({ provider_id: providerId, experience_ids: lockedExpIds });
+    }
+
+    if (dryRun) {
+      // Report what WOULD be written, write nothing. Recompute thin-only here.
+      for (const e of expRows) {
+        if (e.verification_status === "verified" || e.content_source === "manual" || e.content_source === "claim") {
+          continue;
+        }
+        const descBlank = !e.description || String(e.description).trim() === "";
+        const catBlank = !e.category || String(e.category).trim() === "";
+        if (candidateDescription && descBlank) writtenFields.add("description");
+        if (candidateCategory && catBlank) writtenFields.add("category");
+      }
+    } else {
+      // Apply through the lock-respecting store writer.
+      for (const a of toApply) {
+        try {
+          const fields = applyExperienceContent(a.id, {
+            description: candidateDescription,
+            category: candidateCategory,
+          });
+          for (const f of fields) writtenFields.add(f);
+        } catch (e: any) {
+          errors.push({ provider_id: providerId, error: `write_failed ${a.id}: ${e?.message ?? String(e)}` });
+        }
+      }
+      if (writtenFields.size > 0) {
+        try {
+          markProviderEnriched(providerId);
+        } catch {
+          /* best-effort enrichment stamp */
+        }
+      }
+    }
+
+    if (writtenFields.size > 0) {
+      const fieldList = Array.from(writtenFields);
+      for (const f of fieldList) if (f in byField) byField[f] += 1;
+      changed.push({ provider_id: providerId, fields: fieldList });
+    }
+  }
+
+  // Bounded concurrency for the network fetches.
+  for (let i = 0; i < targets.length; i += CR_CONCURRENCY) {
+    const slice = targets.slice(i, i + CR_CONCURRENCY);
+    await Promise.all(slice.map((t) => processOne(t)));
+  }
+
+  res.json({
+    dry_run: dryRun,
+    scanned,
+    by_field: byField,
+    changed,
+    skipped_locked: skippedLocked,
+    errors,
   });
 });
 

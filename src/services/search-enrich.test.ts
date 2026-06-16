@@ -27,6 +27,9 @@ import {
   mapToPlatformCategories,
   meetsAboutQualityBar,
   PLATFORM_CATEGORIES,
+  // orch-experiences-content-refresh: experiences-vertical category mapper (PURE).
+  mapToExperienceCategories,
+  EXPERIENCE_CATEGORIES,
   type PageEvidence,
   type StoredProducer,
   type BraveResult,
@@ -430,6 +433,104 @@ export function runSearchEnrichTests(opts: { log?: boolean } = {}): TestSummary 
     assertTrue(meetsAboutQualityBar(noLetters), "quality: Norwegian via function words (no æøå) passes");
     // minLen override is honoured.
     assertTrue(meetsAboutQualityBar("Kort tekst på gården.", 10), "quality: minLen override honoured");
+  }
+
+  // ── orch-experiences-content-refresh: mapToExperienceCategories (PURE) ──────
+  // The experiences-vertical twin of mapToPlatformCategories — maps a provider's
+  // homepage visible text onto the experiences-DB category SLUGS (activity-based,
+  // NOT the food vocab). Pins the slug vocabulary + word-boundary matching the
+  // content-refresh writer depends on.
+  {
+    // Single-activity pages → the right slug.
+    assertEq(
+      mapToExperienceCategories("Bli med på hvalsafari fra Tromsø — se hval på nært hold."),
+      ["dyreliv_safari"],
+      "exp-cat: hvalsafari → dyreliv_safari"
+    );
+    assertEq(
+      mapToExperienceCategories("Brevandring på Folgefonna og guidet fjelltur i naturen."),
+      ["natur_friluft"],
+      "exp-cat: brevandring/fjelltur → natur_friluft"
+    );
+    assertEq(
+      mapToExperienceCategories("Rafting i Sjoa — elvepadling og kajakk for hele familien."),
+      ["vannaktivitet"],
+      "exp-cat: rafting/kajakk → vannaktivitet"
+    );
+    assertEq(
+      mapToExperienceCategories("Opplev hundekjøring under nordlyset en vinterkveld."),
+      ["vinteraktivitet"],
+      "exp-cat: hundekjøring/nordlys → vinteraktivitet"
+    );
+    assertEq(
+      mapToExperienceCategories("Guidet byvandring i den historiske bydelen, besøk museet."),
+      ["kultur_historie"],
+      "exp-cat: byvandring/museum → kultur_historie"
+    );
+    assertEq(
+      mapToExperienceCategories("Ølsmaking på vårt lokale bryggeri, med matkurs etterpå."),
+      ["mat_drikke"],
+      "exp-cat: ølsmaking/bryggeri → mat_drikke"
+    );
+    assertEq(
+      mapToExperienceCategories("Gårdsbesøk: kos med dyra på garden og ponniridning for barna."),
+      ["gardsbesok"],
+      "exp-cat: gårdsbesøk/ridning → gardsbesok"
+    );
+    assertEq(
+      mapToExperienceCategories("Slapp av i vår spa og badstu, prøv yoga og isbad."),
+      ["wellness_spa"],
+      "exp-cat: spa/sauna/yoga → wellness_spa"
+    );
+  }
+  {
+    // Multi-category page → canonical EXPERIENCE_CATEGORIES order, deduped.
+    const cats = mapToExperienceCategories(
+      "Vi tilbyr både hvalsafari og rafting, samt en avsluttende ølsmaking."
+    );
+    assertEq(
+      cats,
+      ["dyreliv_safari", "vannaktivitet", "mat_drikke"],
+      "exp-cat: multi-category emitted in canonical order, deduped"
+    );
+    // Result order is independent of mention order.
+    const cats2 = mapToExperienceCategories(
+      "Først ølsmaking, så rafting, til slutt en hvalsafari."
+    );
+    assertEq(cats2, cats, "exp-cat: order-independent (same set regardless of input order)");
+  }
+  {
+    // No activity nouns → [] (writer never guesses a category).
+    assertEq(
+      mapToExperienceCategories("Vi tilbyr overnatting og gratis parkering ved anlegget."),
+      [],
+      "exp-cat: no activity nouns → []"
+    );
+    assertEq(mapToExperienceCategories(""), [], "exp-cat: empty → []");
+    assertEq(mapToExperienceCategories(null), [], "exp-cat: null → []");
+    assertEq(mapToExperienceCategories(undefined), [], "exp-cat: undefined → []");
+  }
+  {
+    // Vocabulary alignment with the experiences-DB slugs + no food-vocab leakage.
+    assertTrue(
+      EXPERIENCE_CATEGORIES.includes("dyreliv_safari") &&
+        EXPERIENCE_CATEGORIES.includes("natur_friluft") &&
+        EXPERIENCE_CATEGORIES.includes("kultur_historie"),
+      "exp-cat: vocab includes the harvest/seed slugs"
+    );
+    // Every emitted slug is a member of the declared vocabulary.
+    const out = mapToExperienceCategories(
+      "hvalsafari, brevandring, rafting, hundekjøring, museum, ølsmaking, gårdsbesøk, spa"
+    );
+    assertTrue(
+      out.every((c) => EXPERIENCE_CATEGORIES.includes(c)),
+      "exp-cat: every emitted slug is in EXPERIENCE_CATEGORIES"
+    );
+    // The food vocab must NOT leak into experiences categories.
+    assertTrue(
+      !out.includes("meat") && !out.includes("dairy") && !out.includes("vegetables"),
+      "exp-cat: food-vocab keys never appear in experiences categories"
+    );
   }
 
   return { passed, failed, failures };
