@@ -23,6 +23,10 @@ import {
   extractBusinessTypeTokens,
   extractProductMentions,
   summarizeAbout,
+  // PR-24a: homepage CONTENT → platform write helpers (PURE).
+  mapToPlatformCategories,
+  meetsAboutQualityBar,
+  PLATFORM_CATEGORIES,
   type PageEvidence,
   type StoredProducer,
   type BraveResult,
@@ -331,6 +335,101 @@ export function runSearchEnrichTests(opts: { log?: boolean } = {}): TestSummary 
     const sum = summarizeAbout(html);
     assertTrue(sum.length <= 300, "summarizeAbout: caps at ~300 chars");
     assertEq(summarizeAbout(""), "", "summarizeAbout: empty → empty");
+  }
+
+  // ── PR-24a: mapToPlatformCategories — extractor output → platform vocab ─────
+  // Built from the live profile-removal complaints. Each case runs the SAME
+  // extractors the writer uses, then maps to the platform category vocabulary,
+  // pinning that the producer's REAL category wins over the wrong google_places one.
+  {
+    // COMPLAINT — Grette Andelslandbruk: a CSA VEGETABLE farm, mislabelled meat.
+    const text = extractVisibleText(
+      "<h1>Grette Andelslandbruk</h1><p>Vi dyrker økologiske grønnsaker, poteter og " +
+      "kål i vårt andelslandbruk. Bli andelshaver!</p>",
+    );
+    const cats = mapToPlatformCategories(
+      extractProductMentions(text),
+      extractBusinessTypeTokens(text),
+    );
+    assertEq(cats, ["vegetables"], "map/Grette: → ['vegetables'] (andelslandbruk + grønnsaker)");
+    assertTrue(!cats.includes("meat"), "map/Grette: NOT meat");
+  }
+  {
+    // COMPLAINT — Fløy Bakeri: a bakery → platform 'bakery' (NOT lexicon 'bread').
+    const text = extractVisibleText(
+      "<h1>Fløy Bakeri</h1><p>Håndverksbakeri med surdeigsbrød, rundstykker og " +
+      "kanelboller. Bakt ferskt hver dag.</p>",
+    );
+    const cats = mapToPlatformCategories(
+      extractProductMentions(text),
+      extractBusinessTypeTokens(text),
+    );
+    assertEq(cats, ["bakery"], "map/Fløy: → ['bakery'] (bakeri + surdeig/boller; bread→bakery)");
+    assertTrue(!text.toLowerCase().includes("lefse"), "map/Fløy: no fabricated lefser on page");
+  }
+  {
+    // COMPLAINT — Bomstad: a goat farm (meat + dairy), mislabelled fish/shrimp.
+    const text = extractVisibleText(
+      "<h1>Bomstad Gård</h1><p>Vi driver med geit og selger geitekjøtt og geitost " +
+      "fra egen besetning.</p>",
+    );
+    const cats = mapToPlatformCategories(
+      extractProductMentions(text),
+      extractBusinessTypeTokens(text),
+    );
+    assertEq(cats, ["meat", "dairy"], "map/Bomstad: → ['meat','dairy'] (geitekjøtt + geitost)");
+    assertTrue(!cats.includes("fish"), "map/Bomstad: NOT fish/shrimp");
+  }
+  // mapToPlatformCategories: lexicon-key normalisation + ordering + dedupe.
+  {
+    // bread→bakery, berries→fruit; output is canonical PLATFORM_CATEGORIES order.
+    assertEq(mapToPlatformCategories(["bread"]), ["bakery"], "map: lexicon 'bread' → platform 'bakery'");
+    assertEq(mapToPlatformCategories(["berries"]), ["fruit"], "map: lexicon 'berries' → platform 'fruit'");
+    assertEq(
+      mapToPlatformCategories(["fish", "meat", "dairy"]),
+      ["meat", "dairy", "fish"],
+      "map: result is canonical platform order, not input order",
+    );
+    assertEq(
+      mapToPlatformCategories(["fruit", "berries"]),
+      ["fruit"],
+      "map: berries+fruit dedupe to single 'fruit'",
+    );
+    // business-type tokens alone can yield a category (beverages from bryggeri).
+    assertEq(mapToPlatformCategories([], ["bryggeri"]), ["beverages"], "map: bryggeri token → beverages");
+    assertEq(mapToPlatformCategories([], ["ysteri"]), ["dairy"], "map: ysteri token → dairy");
+    // no mappable signal → [] (writer leaves categories untouched, never guesses).
+    assertEq(mapToPlatformCategories([], []), [], "map: empty in → []");
+    assertEq(mapToPlatformCategories([], ["besokshage", "gard"]), [], "map: non-food business tokens → [] (never 'other')");
+    assertTrue(!mapToPlatformCategories(["meat"]).includes("other"), "map: 'other' is never auto-inferred");
+    // every emitted category is a real platform key.
+    const allOut = mapToPlatformCategories(["vegetables", "fruit", "meat", "dairy", "fish", "honey", "eggs", "herbs", "bread"]);
+    assertTrue(allOut.every((c) => PLATFORM_CATEGORIES.includes(c)), "map: every output is a platform category key");
+  }
+
+  // ── PR-24a: meetsAboutQualityBar — the writer's about/description gate ───────
+  {
+    // Substantive Norwegian prose (≥80 chars, æ/ø/å) → passes.
+    const good = "Familiedrevet gård på Toten som dyrker økologiske grønnsaker og bær, og selger direkte fra gårdsbutikken.";
+    assertTrue(meetsAboutQualityBar(good), "quality: substantive Norwegian about passes");
+    // Too short → fails (tagline/fragment).
+    assertTrue(!meetsAboutQualityBar("Gårdsbutikk på Toten."), "quality: <80 chars fails");
+    assertTrue(!meetsAboutQualityBar(""), "quality: empty fails");
+    assertTrue(!meetsAboutQualityBar(null), "quality: null fails");
+    // English snippet of sufficient length but not Norwegian → fails.
+    const english = "Welcome to our family farm shop where we sell fresh produce, eggs and homemade jam every weekend.";
+    assertTrue(!meetsAboutQualityBar(english), "quality: long English snippet fails (not Norwegian)");
+    // Cookie/consent boilerplate (long, Norwegian-ish) → fails.
+    const cookie = "Vi bruker informasjonskapsler (cookies) for å gi deg en bedre opplevelse. Ved å fortsette godtar du vår personvern.";
+    assertTrue(!meetsAboutQualityBar(cookie), "quality: cookie/consent boilerplate fails");
+    // Placeholder under-construction → fails.
+    const placeholder = "Denne siden er under konstruksjon. Nettsiden kommer snart med mer informasjon om gården vår og produktene.";
+    assertTrue(!meetsAboutQualityBar(placeholder), "quality: under-construction placeholder fails");
+    // Norwegian without nordic letters but with function words → passes.
+    const noLetters = "Vi driver en liten gard og selger ferske produkter fra egen produksjon til lokalsamfunnet her.";
+    assertTrue(meetsAboutQualityBar(noLetters), "quality: Norwegian via function words (no æøå) passes");
+    // minLen override is honoured.
+    assertTrue(meetsAboutQualityBar("Kort tekst på gården.", 10), "quality: minLen override honoured");
   }
 
   return { passed, failed, failures };

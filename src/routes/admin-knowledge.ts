@@ -89,6 +89,16 @@
 import { Router, Request, Response } from "express";
 import { getDb } from "../database/init";
 import { isKnownDirectoryHost } from "../services/cross-source-validator";
+// PR-24a: homepage CONTENT extractors (PR-22) + write helpers (PURE).
+import {
+  isSafeFetchUrl,
+  extractVisibleText,
+  extractBusinessTypeTokens,
+  extractProductMentions,
+  summarizeAbout,
+  mapToPlatformCategories,
+  meetsAboutQualityBar,
+} from "../services/search-enrich";
 
 const router = Router();
 
@@ -986,3 +996,432 @@ pruneUrlsRouter.post("/prune-dead-urls", (req: Request, res: Response) => {
     pruned,
   });
 });
+
+// ─── POST /admin/homepage-content-refresh (PR-24a, 2026-06-16) ───────────────
+//
+// WHY: producer profiles show WRONG content (business type / products) because
+// about/products/categories were taken from google_places, not the producer's
+// own homepage — which triggers profile-removal requests (Grette shown as meat
+// not vegetables, Fløy listing lefser it doesn't make, Bomstad shown as fish not
+// goat). PR-22 (live) added the homepage CONTENT extractors (extractVisibleText
+// / extractBusinessTypeTokens / extractProductMentions / summarizeAbout) and
+// made the write-path PREFER homepage (canCorrectFactualField lets a single
+// website_homepage source overwrite google_places content) — but nothing wired
+// them to actually WRITE content. This endpoint is that writer.
+//
+// WHAT: for targeted/auto-selected producers, fetch their OWN homepage
+// server-side (same bypass-the-sandbox approach as /admin/homepage-provenance-
+// batch), run the PR-22 extractors, build candidate about/description/products/
+// categories, and write each ONLY through canCorrectFactualField() — so curated/
+// locked fields are never touched and website_homepage overwrites google_places.
+// On each allowed field we update the column AND merge field_provenance with a
+// {source_type:"website_homepage", source_url, fetched_at, value} record via
+// mergeFieldProvenance. Dry-run by default; apply=1 to write.
+//
+// SAFETY: NEVER touches contact fields (email/phone/address). NEVER deletes a
+// producer. Excludes umbrella-tagged agents. Reuses the SSRF guard + the gate.
+//
+// Auth: same x-admin-key pattern as /admin/homepage-provenance-batch.
+
+export const homepageContentRefreshRouter = Router();
+
+// Norwegian display label per platform category (for the products[].name field;
+// products is stored as ProductInfo[] = [{name, category, seasonal}]). Aligned
+// with routes/seo.ts CATEGORY_LABELS_NO.
+const CATEGORY_LABEL_NO: Readonly<Record<string, string>> = {
+  meat: "Kjøtt",
+  dairy: "Meieri",
+  vegetables: "Grønnsaker",
+  fruit: "Frukt",
+  bakery: "Bakervarer",
+  beverages: "Drikke",
+  honey: "Honning",
+  eggs: "Egg",
+  fish: "Fisk",
+  preserves: "Syltetøy",
+  herbs: "Urter",
+  other: "Annet",
+};
+
+const HCR_FETCH_TIMEOUT_MS = 10_000;
+const HCR_UA = "Lokal-RFB-Scraper/1.0 (+https://rettfrabonden.com)";
+// Same-host sub-pages worth crawling for content (mirrors the search-enrich
+// crawl's /om-oss, plus /about and /produkter per spec).
+const HCR_CONTENT_PATHS: readonly string[] = ["/om-oss", "/about", "/produkter"];
+
+/** Fetch one URL's HTML server-side (SSRF-guarded). Returns null on any failure. */
+async function hcrFetchHtml(url: string): Promise<string | null> {
+  if (!isSafeFetchUrl(url)) return null;
+  const fetchUrl = /^https?:\/\//i.test(url) ? url : `https://${url}`;
+  try {
+    const resp = await fetch(fetchUrl, {
+      redirect: "follow",
+      headers: { "User-Agent": HCR_UA, Accept: "text/html,application/xhtml+xml" },
+      signal: AbortSignal.timeout(HCR_FETCH_TIMEOUT_MS),
+    });
+    if (!resp.ok) return null;
+    return await resp.text();
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Fetch a producer's homepage + same-host content sub-pages, concatenated. The
+ * primary page's HTML is returned first (so summarizeAbout's og/meta lookups hit
+ * the homepage), with sub-page HTML appended for the token/product scans. Returns
+ * null only if the primary homepage cannot be fetched.
+ */
+async function hcrFetchHomepageContent(
+  homepageUrl: string,
+): Promise<{ primaryHtml: string; combinedHtml: string; fetchUrl: string } | null> {
+  const fetchUrl = /^https?:\/\//i.test(homepageUrl) ? homepageUrl : `https://${homepageUrl}`;
+  const primaryHtml = await hcrFetchHtml(fetchUrl);
+  if (primaryHtml === null) return null;
+  let combinedHtml = primaryHtml;
+  try {
+    const u = new URL(fetchUrl);
+    const base = `${u.protocol}//${u.host}`;
+    for (const path of HCR_CONTENT_PATHS) {
+      const sub = await hcrFetchHtml(`${base}${path}`);
+      if (sub) combinedHtml += "\n" + sub;
+    }
+  } catch {
+    /* malformed URL — primary homepage content still stands */
+  }
+  return { primaryHtml, combinedHtml, fetchUrl };
+}
+
+type HcrTargetRow = {
+  agent_id: string;
+  name: string | null;
+  homepage_url: string | null;
+};
+
+type HcrFieldWrite = { field: string; value: string; columnVal: unknown; onAgents: boolean };
+
+homepageContentRefreshRouter.post(
+  "/homepage-content-refresh",
+  async (req: Request, res: Response) => {
+    if (!requireAdmin(req, res)) return;
+
+    const body = (req.body ?? {}) as {
+      agentIds?: unknown;
+      limit?: unknown;
+      apply?: unknown;
+    };
+
+    // apply: dry-run by default. apply=1 / "1" / true (body) or ?apply=1.
+    const apply =
+      body.apply === true ||
+      body.apply === 1 ||
+      body.apply === "1" ||
+      body.apply === "true" ||
+      req.query?.apply === "1" ||
+      req.query?.apply === "true";
+    const dryRun = !apply;
+
+    // limit: default 25, hard cap 100.
+    const limit = Math.min(
+      typeof body.limit === "number" && body.limit > 0 ? Math.floor(body.limit) : 25,
+      100,
+    );
+
+    const db = getDb();
+
+    // ── Target selection ─────────────────────────────────────────────────────
+    let targets: HcrTargetRow[];
+    if (Array.isArray(body.agentIds) && body.agentIds.length > 0) {
+      // Explicit list — trust the caller, cap by limit, still exclude umbrellas
+      // and require a usable homepage (website || agents.url).
+      const ids = (body.agentIds as unknown[])
+        .filter((id): id is string => typeof id === "string" && id.trim().length > 0)
+        .map((id) => id.trim())
+        .slice(0, limit);
+      targets = ids
+        .map((id) => {
+          const row = db
+            .prepare(
+              `SELECT a.id AS agent_id, a.name AS name, a.umbrella_type AS umbrella_type,
+                      COALESCE(NULLIF(TRIM(k.website), ''), NULLIF(TRIM(a.url), '')) AS homepage_url
+                 FROM agents a
+                 LEFT JOIN agent_knowledge k ON k.agent_id = a.id
+                WHERE a.id = ?`,
+            )
+            .get(id) as
+            | { agent_id: string; name: string | null; umbrella_type: string | null; homepage_url: string | null }
+            | undefined;
+          return row;
+        })
+        .filter(
+          (r): r is { agent_id: string; name: string | null; umbrella_type: string | null; homepage_url: string | null } =>
+            !!r && r.umbrella_type == null && !!r.homepage_url && r.homepage_url.trim().length > 0,
+        )
+        .map((r) => ({ agent_id: r.agent_id, name: r.name, homepage_url: r.homepage_url }));
+    } else {
+      // Auto-select: producers (non-umbrella) WITH a website AND existing
+      // about/products, whose CONTENT provenance does NOT yet carry a
+      // website_homepage source for about/products/description/categories — i.e.
+      // their content is still google-sourced (the potentially-wrong ones).
+      const rows = db
+        .prepare(
+          `SELECT a.id AS agent_id, a.name AS name,
+                  COALESCE(NULLIF(TRIM(k.website), ''), NULLIF(TRIM(a.url), '')) AS homepage_url
+             FROM agents a
+             JOIN agent_knowledge k ON k.agent_id = a.id
+            WHERE a.umbrella_type IS NULL
+              AND (
+                    (k.website IS NOT NULL AND TRIM(k.website) != '')
+                 OR (a.url IS NOT NULL AND TRIM(a.url) != '')
+                  )
+              AND (
+                    (k.about IS NOT NULL AND TRIM(k.about) != '')
+                 OR (k.products IS NOT NULL AND TRIM(k.products) != '' AND TRIM(k.products) != '[]')
+                  )
+              AND (
+                    k.field_provenance IS NULL
+                 OR k.field_provenance = '{}'
+                 OR k.field_provenance NOT LIKE '%"website_homepage"%'
+                  )
+            ORDER BY k.updated_at ASC
+            LIMIT ?`,
+        )
+        .all(limit) as HcrTargetRow[];
+      targets = rows.filter((r) => r.homepage_url && r.homepage_url.trim().length > 0);
+    }
+
+    // ── Per-agent processing ──────────────────────────────────────────────────
+    const nowIso = new Date().toISOString();
+    let scanned = 0;
+    const byField: Record<string, number> = { about: 0, products: 0, categories: 0, description: 0 };
+    const changed: Array<{ agent_id: string; fields: string[] }> = [];
+    const skippedCurated: Array<{ agent_id: string; fields: string[] }> = [];
+    const errors: Array<{ agent_id: string; error: string }> = [];
+
+    // Bounded concurrency for the network fetches (mirrors homepage-provenance-batch).
+    const HCR_CONCURRENCY = 3;
+
+    async function processOne(t: HcrTargetRow): Promise<void> {
+      const agentId = t.agent_id;
+      if (!t.homepage_url) {
+        errors.push({ agent_id: agentId, error: "no_homepage_url" });
+        return;
+      }
+
+      // Fetch homepage content server-side.
+      let fetched: { primaryHtml: string; combinedHtml: string; fetchUrl: string } | null;
+      try {
+        fetched = await hcrFetchHomepageContent(t.homepage_url);
+      } catch (e: any) {
+        errors.push({ agent_id: agentId, error: e?.message ?? String(e) });
+        return;
+      }
+      if (!fetched) {
+        errors.push({ agent_id: agentId, error: `fetch_failed for ${t.homepage_url}` });
+        return;
+      }
+      const { primaryHtml, combinedHtml, fetchUrl } = fetched;
+
+      // Run the PR-22 extractors on the fetched HTML.
+      const contentText = extractVisibleText(combinedHtml);
+      const businessTokens = extractBusinessTypeTokens(contentText);
+      const productCats = extractProductMentions(contentText);
+      const platformCategories = mapToPlatformCategories(productCats, businessTokens);
+      const aboutSummary = summarizeAbout(primaryHtml);
+
+      // Build candidate content fields.
+      const candidates: HcrFieldWrite[] = [];
+
+      // about / description from summarizeAbout — only if it clears the quality bar.
+      if (meetsAboutQualityBar(aboutSummary)) {
+        candidates.push({ field: "about", value: aboutSummary, columnVal: aboutSummary, onAgents: false });
+        candidates.push({ field: "description", value: aboutSummary, columnVal: aboutSummary, onAgents: true });
+      }
+
+      // products from the detected platform categories → ProductInfo[] shape.
+      if (platformCategories.length > 0) {
+        const productObjs = platformCategories.map((cat) => ({
+          name: CATEGORY_LABEL_NO[cat] ?? cat,
+          category: cat,
+          seasonal: false,
+        }));
+        candidates.push({
+          field: "products",
+          // Stable provenance value: canonical category list (order-independent).
+          value: platformCategories.join(","),
+          columnVal: JSON.stringify(productObjs),
+          onAgents: false,
+        });
+        // categories (agents table) — JSON array of platform category keys.
+        candidates.push({
+          field: "categories",
+          value: platformCategories.join(","),
+          columnVal: JSON.stringify(platformCategories),
+          onAgents: true,
+        });
+      }
+
+      scanned++;
+      if (candidates.length === 0) return; // nothing extractable — leave as-is.
+
+      // Load existing provenance + curated locks + current column values.
+      const kRow = db
+        .prepare(
+          "SELECT about, products, field_provenance, curated_fields FROM agent_knowledge WHERE agent_id = ?",
+        )
+        .get(agentId) as
+        | {
+            about?: string | null;
+            products?: string | null;
+            field_provenance?: string | null;
+            curated_fields?: string | null;
+          }
+        | undefined;
+      let existingProv: Record<string, unknown> = {};
+      if (kRow?.field_provenance) {
+        try {
+          const parsed = JSON.parse(kRow.field_provenance);
+          if (parsed && typeof parsed === "object") existingProv = parsed as Record<string, unknown>;
+        } catch {
+          /* tolerate junk */
+        }
+      }
+      const woUnverified =
+        !!existingProv.website_ownership &&
+        typeof existingProv.website_ownership === "object" &&
+        (existingProv.website_ownership as Record<string, unknown>).status === "unverified";
+
+      let curated: Record<string, unknown> = {};
+      if (kRow?.curated_fields) {
+        try {
+          const parsed = JSON.parse(kRow.curated_fields);
+          if (parsed && typeof parsed === "object") curated = parsed as Record<string, unknown>;
+        } catch {
+          /* tolerate junk */
+        }
+      }
+
+      // Decide each field through the gate. Build the write set + provenance.
+      const fieldsToWrite: HcrFieldWrite[] = [];
+      const incomingProvForMerge: Record<
+        string,
+        { sources: Array<{ source_type: string; value: string; fetched_at: string; source_url: string }> }
+      > = {};
+      const curatedSkipped: string[] = [];
+
+      for (const cand of candidates) {
+        // Incoming provenance for THIS field carries a single website_homepage
+        // source — that is what makes canCorrectFactualField allow overwriting a
+        // google_places value (and a pure-add when the field is empty).
+        const incomingFieldProv = [
+          { source_type: "website_homepage", value: cand.value, fetched_at: nowIso, source_url: fetchUrl },
+        ];
+        const decision = canCorrectFactualField({
+          field: cand.field,
+          existingFieldProvenance: existingProv[cand.field],
+          websiteOwnershipUnverified: woUnverified,
+          incomingFieldProvenance: incomingFieldProv,
+          isCurated: !!curated[cand.field],
+        });
+        if (decision.allowed) {
+          fieldsToWrite.push(cand);
+          incomingProvForMerge[cand.field] = { sources: incomingFieldProv };
+        } else if (decision.reason === "curated_locked") {
+          curatedSkipped.push(cand.field);
+        }
+        // Other refusals (e.g. existing already homepage-sourced) are silently
+        // skipped — we never overwrite a non-google_places content value.
+      }
+
+      if (curatedSkipped.length > 0) {
+        skippedCurated.push({ agent_id: agentId, fields: Array.from(new Set(curatedSkipped)) });
+      }
+      if (fieldsToWrite.length === 0) return;
+
+      const writtenFields = Array.from(new Set(fieldsToWrite.map((f) => f.field)));
+      for (const f of writtenFields) {
+        if (f in byField) byField[f] = (byField[f] ?? 0) + 1;
+      }
+      changed.push({ agent_id: agentId, fields: writtenFields });
+
+      if (dryRun) return; // dry-run: report only, write nothing.
+
+      // ── Apply: column writes + provenance merge in one transaction ───────────
+      let mergedProv: Record<string, unknown>;
+      try {
+        mergedProv = mergeFieldProvenance(existingProv, incomingProvForMerge);
+      } catch (mergeErr: any) {
+        errors.push({ agent_id: agentId, error: `provenance_merge_failed: ${mergeErr?.message ?? String(mergeErr)}` });
+        return;
+      }
+      const provJson = JSON.stringify(mergedProv);
+
+      const akUpdates = fieldsToWrite.filter((f) => !f.onAgents); // about / products
+      const agentUpdates = fieldsToWrite.filter((f) => f.onAgents); // description / categories
+
+      try {
+        const tx = db.transaction(() => {
+          // Ensure an agent_knowledge row exists (auto-created agents may lack one).
+          const exists = db
+            .prepare("SELECT 1 AS one FROM agent_knowledge WHERE agent_id = ?")
+            .get(agentId) as { one: number } | undefined;
+          if (!exists) {
+            db.prepare(
+              "INSERT INTO agent_knowledge (agent_id, field_provenance, updated_at) VALUES (?, '{}', ?)",
+            ).run(agentId, nowIso);
+          }
+
+          // agent_knowledge content columns (about/products) — never contact fields.
+          if (akUpdates.length > 0) {
+            const setClause = akUpdates.map((u) => `${u.field} = ?`).join(", ");
+            const params: unknown[] = akUpdates.map((u) => u.columnVal);
+            params.push(provJson, nowIso, agentId);
+            db.prepare(
+              `UPDATE agent_knowledge SET ${setClause}, field_provenance = ?, updated_at = ? WHERE agent_id = ?`,
+            ).run(...params);
+          } else {
+            // Only agents-table fields changed — still persist provenance.
+            db.prepare(
+              "UPDATE agent_knowledge SET field_provenance = ?, updated_at = ? WHERE agent_id = ?",
+            ).run(provJson, nowIso, agentId);
+          }
+
+          // agents-table content columns (description/categories). Column names
+          // come from a fixed allow-list (description/categories), never user
+          // input, so the dynamic SET is injection-safe. No updated_at on agents.
+          if (agentUpdates.length > 0) {
+            const aSet = agentUpdates.map((u) => `${u.field} = ?`).join(", ");
+            const aParams: unknown[] = agentUpdates.map((u) => u.columnVal);
+            aParams.push(agentId);
+            db.prepare(`UPDATE agents SET ${aSet} WHERE id = ?`).run(...aParams);
+          }
+        });
+        tx();
+      } catch (writeErr: any) {
+        errors.push({ agent_id: agentId, error: `write_failed: ${writeErr?.message ?? String(writeErr)}` });
+        // Roll the reporting back for this agent — the tx aborted atomically.
+        const idx = changed.findIndex((c) => c.agent_id === agentId);
+        if (idx >= 0) {
+          for (const f of changed[idx].fields) {
+            if (f in byField && byField[f] > 0) byField[f] -= 1;
+          }
+          changed.splice(idx, 1);
+        }
+      }
+    }
+
+    for (let i = 0; i < targets.length; i += HCR_CONCURRENCY) {
+      const slice = targets.slice(i, i + HCR_CONCURRENCY);
+      await Promise.all(slice.map((t) => processOne(t)));
+    }
+
+    res.json({
+      dry_run: dryRun,
+      scanned,
+      by_field: byField,
+      changed,
+      skipped_curated: skippedCurated,
+      errors,
+    });
+  },
+);

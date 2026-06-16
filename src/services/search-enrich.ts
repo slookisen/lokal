@@ -761,6 +761,164 @@ export function summarizeAbout(html: string): string {
   return cap(visible);
 }
 
+// ─── homepage CONTENT → platform write helpers (PR-24a, 2026-06-16) ──────────
+//
+// PURE helpers that turn the raw extractor output (extractProductMentions /
+// extractBusinessTypeTokens / summarizeAbout) into something the writer can
+// safely PUT as website_homepage-sourced content over a wrong google_places
+// value. Two concerns:
+//   1. mapToPlatformCategories — collapse the extractor's category keys + the
+//      distinctive business-type tokens onto the PLATFORM's category vocabulary
+//      (the 12-key set the `agents.categories` column + /sok filter use), so the
+//      categories we write match what discovery understands.
+//   2. meetsAboutQualityBar — the gate the writer applies before writing an
+//      about/description: only a substantive, Norwegian, non-boilerplate summary
+//      is good enough to overwrite a value (a thin/cookie-banner/English snippet
+//      is worse than the existing one, so we keep the old one and skip).
+// Both are exported and unit-tested in search-enrich.test.ts. NO LLM, NO I/O.
+
+/**
+ * The platform's category vocabulary — the canonical keys the `agents.categories`
+ * column stores and the /sok category filter understands. MUST stay aligned with
+ * routes/seo.ts CATEGORY_LABELS_NO + services/marketplace-registry.ts categoryMap.
+ * `other` is the catch-all when a producer is clearly a food producer but no
+ * specific category matched (kept last; only used as a fallback, never mixed in).
+ */
+export const PLATFORM_CATEGORIES: readonly string[] = [
+  "meat", "dairy", "vegetables", "fruit", "bakery", "beverages",
+  "honey", "eggs", "fish", "preserves", "herbs", "other",
+];
+
+// extractProductMentions() returns the search-enrich lexicon's own category
+// keys (which include "bread" and "berries"); map those onto the platform
+// vocabulary above. "bread" → "bakery"; "berries" → "fruit" (the platform set
+// has no separate berries key — berries are sold under fruit). Everything else
+// is already a platform key and passes through unchanged.
+const PRODUCT_KEY_TO_PLATFORM: Readonly<Record<string, string>> = {
+  vegetables: "vegetables",
+  fruit: "fruit",
+  berries: "fruit",
+  dairy: "dairy",
+  eggs: "eggs",
+  meat: "meat",
+  fish: "fish",
+  bread: "bakery",
+  honey: "honey",
+  herbs: "herbs",
+};
+
+// Distinctive business-type tokens (from extractBusinessTypeTokens) → the
+// platform category they imply. This is what fixes the wrong-business-type
+// complaints: a page that says "andelslandbruk" is a VEGETABLE producer (not
+// meat), a "ysteri"/"meieri" is dairy, a "bakeri" is bakery, a "bryggeri"/
+// "brenneri"/"vingård" is beverages, a "slakteri" is meat, a "gartneri" is
+// vegetables. Tokens that carry no clean food category (besøkshage,
+// hagekonsulent, kafe, kro, the gård-family benign tokens, generic "mat"/"bruk")
+// are intentionally absent — they contribute no category. "frukt"/"fisk"/"kjøtt"
+// as business-type words map to the obvious category too.
+const BUSINESS_TOKEN_TO_PLATFORM: Readonly<Record<string, string>> = {
+  ysteri: "dairy", ysteriet: "dairy", meieri: "dairy", meieriet: "dairy",
+  bakeri: "bakery", bakeriet: "bakery",
+  bryggeri: "beverages", bryggeriet: "beverages",
+  brenneri: "beverages", brenneriet: "beverages",
+  vingard: "beverages", vingaard: "beverages",
+  slakteri: "meat", kjott: "meat",
+  gartneri: "vegetables", andelslandbruk: "vegetables",
+  fisk: "fish",
+  frukt: "fruit",
+};
+
+/**
+ * Map raw extractor output to the PLATFORM category vocabulary. PURE.
+ *
+ * Combines the product-mention category hits (extractProductMentions) and the
+ * distinctive business-type tokens (extractBusinessTypeTokens) into a deduped,
+ * canonical-order list of platform categories. Returns [] when nothing maps
+ * (the writer then leaves `categories` untouched — never writes a guess).
+ *
+ * Order is PLATFORM_CATEGORIES order so the result is deterministic regardless
+ * of input order. "other" is NEVER auto-added here (it is a human/catch-all
+ * value, not something we infer from a homepage).
+ *
+ * Examples (the live complaints):
+ *   Grette : products=[vegetables], tokens=[andelslandbruk] → ["vegetables"]
+ *   Fløy   : products=[bread],      tokens=[bakeri]         → ["bakery"]
+ *   Bomstad: products=[meat,dairy], tokens=[]               → ["meat","dairy"]
+ */
+export function mapToPlatformCategories(
+  productMentions: readonly string[],
+  businessTypeTokens: readonly string[] = [],
+): string[] {
+  const hits = new Set<string>();
+  for (const p of productMentions) {
+    const mapped = PRODUCT_KEY_TO_PLATFORM[p];
+    if (mapped) hits.add(mapped);
+  }
+  for (const t of businessTypeTokens) {
+    const mapped = BUSINESS_TOKEN_TO_PLATFORM[t];
+    if (mapped) hits.add(mapped);
+  }
+  // Emit in canonical platform order (drop the "other" catch-all — never inferred).
+  return PLATFORM_CATEGORIES.filter((c) => c !== "other" && hits.has(c));
+}
+
+// Generic boilerplate that is NOT a real "about" — cookie/consent banners,
+// navigation chrome, placeholder copy. If the candidate summary is dominated by
+// one of these, it is worse than whatever we already have, so we skip the write.
+// Accent-stripped, lowercase substrings.
+const GENERIC_ABOUT_MARKERS: readonly string[] = [
+  "cookie", "informasjonskapsler", "samtykke", "personvern",
+  "lorem ipsum", "javascript", "aktiver javascript",
+  "siden er under", "under construction", "kommer snart", "coming soon",
+  "all rights reserved", "alle rettigheter",
+];
+
+// Letters that signal the text is Norwegian (or at least Scandinavian) prose
+// rather than an English/other-language snippet: the æ/ø/å family plus a small
+// set of very common Norwegian function words. The homepage content we want to
+// surface is Norwegian; an English cookie/marketing blurb should NOT overwrite a
+// producer's about. PURE check, no network, no language library.
+const NORWEGIAN_WORD_MARKERS: readonly string[] = [
+  " og ", " er ", " på ", " vi ", " med ", " for ", " til ", " som ",
+  " av ", " har ", " vår ", " våre ", " gård", " fra ",
+];
+
+/**
+ * Quality bar a candidate `about`/`description` summary must clear before the
+ * writer is allowed to overwrite an existing value with it. PURE.
+ *
+ * Requires ALL of:
+ *   - length ≥ 80 chars (a real description, not a tagline/fragment),
+ *   - looks Norwegian — contains an æ/ø/å letter OR a common Norwegian function
+ *     word (rejects an English cookie/marketing snippet),
+ *   - is NOT dominated by generic boilerplate (cookie/consent/placeholder).
+ *
+ * Returns false for empty/short/foreign/boilerplate text so the caller keeps the
+ * existing value (blank or stale beats wrong). minLen is overridable for tests.
+ */
+export function meetsAboutQualityBar(text: string | null | undefined, minLen = 80): boolean {
+  if (!text) return false;
+  const trimmed = String(text).replace(/\s+/g, " ").trim();
+  if (trimmed.length < minLen) return false;
+
+  const lower = trimmed.toLowerCase();
+  const lowerAscii = stripNorwegianAccents(lower);
+
+  // Reject boilerplate (cookie/consent/placeholder dominates the snippet).
+  for (const marker of GENERIC_ABOUT_MARKERS) {
+    if (lowerAscii.includes(marker)) return false;
+  }
+
+  // Must look Norwegian: an æ/ø/å letter, OR a common Norwegian function word.
+  // (Pad with spaces so word-markers match at the string edges too.)
+  const hasNordicLetter = /[æøåÆØÅ]/.test(trimmed);
+  const padded = ` ${lower} `;
+  const hasNorwegianWord = NORWEGIAN_WORD_MARKERS.some((w) => padded.includes(w));
+  if (!hasNordicLetter && !hasNorwegianWord) return false;
+
+  return true;
+}
+
 /** SSRF guard: allow only http(s) to public hosts; block localhost, link-local,
  * private/CGNAT ranges and cloud-metadata (169.254.0.0/16). Domain names are allowed
  * (DNS-rebinding is out of scope for this admin-gated, dry-run-by-default endpoint). */
