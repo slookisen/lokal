@@ -52,7 +52,14 @@ export type CrossSourceResult = {
 // ─── Tier classification ────────────────────────────────────────────────────
 
 const TIER_S: readonly string[] = ["owner"];
-const TIER_A: readonly string[] = ["homepage", "google_places"];
+// "website_homepage" (PR-A, 2026-06-16): the producer's OWN homepage as the
+// source of CONTENT fields (about/products/description/categories). It is added
+// to Tier-A as owner-published, high-trust evidence. This is SAFE for the
+// address/phone agreement math (and the domain_coherence gate it feeds):
+// website_homepage is only ever written for CONTENT fields, never for
+// address/phone — those continue to use "homepage"/"google_places" — so no
+// existing address/phone provenance record's tier or count changes.
+const TIER_A: readonly string[] = ["homepage", "website_homepage", "google_places"];
 const TIER_B: readonly string[] = ["brreg", "facebook_official_page"];
 
 export function tierForSource(sourceType: string): SourceTier {
@@ -60,6 +67,26 @@ export function tierForSource(sourceType: string): SourceTier {
   if (TIER_A.includes(sourceType)) return "A";
   if (TIER_B.includes(sourceType)) return "B";
   return "C";
+}
+
+// ─── PR-A: preferred CONTENT source (Option A, surgical) ─────────────────────
+//
+// For CONTENT fields (about / products / description / categories) the
+// producer's OWN homepage is the highest-trust source and must be PREFERRED over
+// google_places. This helper marks the source_types that may, on their own,
+// override google_places content. Deliberately NOT wired into the FieldName
+// (address/phone/business_status) agreement math or the domain_coherence gate —
+// it is consulted only by the content-write path (routes/admin-knowledge.ts).
+//
+//   website_homepage → producer's own published homepage content (PR-A).
+//   owner            → owner-attested (Tier-S); already the top of every tier.
+//
+// Matches the bare token and the prefixed form ("website_homepage:rfb.no"):
+// compares the part before the first ':'.
+export function isPreferredContentSource(sourceType: string | null | undefined): boolean {
+  if (!sourceType) return false;
+  const head = String(sourceType).trim().toLowerCase().split(":")[0]!;
+  return head === "website_homepage" || head === "owner";
 }
 
 // ─── Inference-source deny-list (orchestrator-pr-16, Guard #2) ───────────────
@@ -1149,7 +1176,7 @@ function producerNameStems(name: string): string[] {
 // BENIGN (gård-family) — NON-distinctive, never a contradiction on its own. A
 // leftover domain fragment from this set is fully expected on a farm's own site
 // and must NOT downgrade ownership.
-const BENIGN_BUSINESS_TOKENS: ReadonlySet<string> = new Set([
+export const BENIGN_BUSINESS_TOKENS: ReadonlySet<string> = new Set([
   "gard", "gaard", "gards", "gaards",
   "gardsmat", "gaardsmat", "gardsutsalg", "gaardsutsalg",
   "mat", "frukt", "bruk",
@@ -1158,12 +1185,19 @@ const BENIGN_BUSINESS_TOKENS: ReadonlySet<string> = new Set([
 // DISTINCTIVE specialist tokens — discriminating. When the producer's OWN name
 // carries one of these but the domain (and page) does not — or the domain
 // carries a DIFFERENT one — the site plausibly belongs to a different entity.
-const DISTINCTIVE_SPECIALIST_TOKENS: ReadonlySet<string> = new Set([
+export const DISTINCTIVE_SPECIALIST_TOKENS: ReadonlySet<string> = new Set([
   "ysteri", "ysteriet", "meieri", "meieriet",
   "bakeri", "bakeriet", "bryggeri", "bryggeriet",
   "brenneri", "brenneriet", "slakteri", "gartneri",
   "andelslandbruk", "vingard", "vingaard",
   "kjott", "fisk", "sjokolade", "kafe", "kro",
+  // PR-A (2026-06-16): added distinctions behind today's WRONG-business-type
+  // complaints, where google_places mislabelled the producer's own type:
+  //   - "besøkshage" (a visiting garden / pick-your-own) ≠ "hagekonsulent"
+  //     (a garden-consultancy service). Ingunnshage is a besøkshage.
+  //   - "andelslandbruk" (CSA — community-supported vegetable farming) ≠ a
+  //     meat ("kjøtt") producer. Grette is an andelslandbruk.
+  "besokshage", "hagekonsulent",
 ]);
 
 // Helper predicates (compare under aa-collapse so "gaard" ≡ "gård"→"gard").

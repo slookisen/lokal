@@ -2047,6 +2047,7 @@ import {
   crossSourceAgreement,
   parseAddressCore,
   tierForSource,
+  isPreferredContentSource,
   coerceProvenanceToArrayShape,
   aggregateVerdict,
   domainCoherenceCheck,
@@ -2069,6 +2070,17 @@ assertEq(tierForSource("facebook_official_page"), "B", "tier: facebook_official_
 assertEq(tierForSource("aggregator"), "C", "tier: aggregator=C");
 assertEq(tierForSource("instagram"), "C", "tier: instagram=C");
 assertEq(tierForSource("unknown_source"), "C", "tier: unknown defaults to C");
+// PR-A: website_homepage is Tier-A (producer's own published content).
+assertEq(tierForSource("website_homepage"), "A", "PR-A tier: website_homepage=A");
+
+console.log("\n── PR-A: isPreferredContentSource ──");
+assertTrue(isPreferredContentSource("website_homepage"), "PR-A: website_homepage is preferred content source");
+assertTrue(isPreferredContentSource("owner"), "PR-A: owner is preferred content source");
+assertTrue(isPreferredContentSource("website_homepage:rfb.no"), "PR-A: prefixed website_homepage still preferred");
+assertTrue(!isPreferredContentSource("google_places"), "PR-A: google_places is NOT preferred (homepage must win)");
+assertTrue(!isPreferredContentSource("homepage"), "PR-A: contact 'homepage' source is NOT a preferred CONTENT source");
+assertTrue(!isPreferredContentSource(""), "PR-A: empty → not preferred");
+assertTrue(!isPreferredContentSource(undefined), "PR-A: undefined → not preferred");
 
 console.log("\n── cross-source-validator: crossSourceAgreement unit tests ──");
 
@@ -2313,6 +2325,61 @@ function prov(value: string, source_type: string): ProvenanceRecord {
   );
   assertEq(r.agree, true, "cs: Tier-S + conflicting Tier-A → agree=true (owner overrides)");
   assertEq(r.source_count, 2, "cs: Tier-S override → still reports source_count=2");
+}
+
+// ── PR-A REGRESSION: address/phone cross-source agreement math is UNCHANGED ───
+// Hard constraint: adding website_homepage to TIER_A must NOT perturb the
+// address/phone agreement math (it feeds the domain_coherence gate and its 24
+// false-positives). website_homepage is only ever written for CONTENT fields,
+// never address/phone, so every existing address/phone scenario must produce the
+// SAME agree/source_count/verdict it did before PR-A. These pin that invariant.
+console.log("\n── PR-A: address/phone cross-source math unchanged (regression) ──");
+{
+  // The canonical 2×Tier-A agreeing case → pool_eligible, count 2 (unchanged).
+  const a2 = crossSourceAgreement(
+    { address: [prov("Haugerudveien 17, 3302 Hokksund", "homepage"),
+                prov("Haugerudveien 17, 3302 Hokksund", "google_places")] },
+    "address",
+  );
+  assertEq(a2.agree, true, "PR-A regression: addr homepage+google_places still agree=true");
+  assertEq(a2.source_count, 2, "PR-A regression: addr 2 Tier-A → source_count=2 (unchanged)");
+  assertEq(a2.verdict, "pool_eligible", "PR-A regression: addr 2 Tier-A → pool_eligible (unchanged)");
+
+  // 1-source still review_required (unchanged) — proves website_homepage did not
+  // silently appear as a phantom 2nd source.
+  const a1 = crossSourceAgreement(
+    { address: [prov("Haugerudveien 17, 3302 Hokksund", "google_places")] },
+    "address",
+  );
+  assertEq(a1.source_count, 1, "PR-A regression: addr 1 google_places → source_count=1 (unchanged)");
+  assertEq(a1.verdict, "review_required", "PR-A regression: addr 1 source → review_required (unchanged)");
+
+  // Disagreeing pair still conflicts (unchanged).
+  const aConf = crossSourceAgreement(
+    { address: [prov("Haugerudveien 17, 3302 Hokksund", "homepage"),
+                prov("Norderhovgata 5, 3511 Hønefoss", "google_places")] },
+    "address",
+  );
+  assertEq(aConf.agree, false, "PR-A regression: addr disagreeing pair → agree=false (unchanged)");
+  assertEq(aConf.conflict!.severity, "major", "PR-A regression: addr disagreement → major (unchanged)");
+
+  // Phone normalization pair still agrees (unchanged).
+  const pAgree = crossSourceAgreement(
+    { phone: [prov("+47 911 93 602", "homepage"), prov("91193602", "google_places")] },
+    "phone",
+  );
+  assertEq(pAgree.agree, true, "PR-A regression: phone normalized pair → agree=true (unchanged)");
+  assertEq(pAgree.source_count, 2, "PR-A regression: phone 2 Tier-A → source_count=2 (unchanged)");
+
+  // Even if a website_homepage record were (wrongly) present on phone, it must
+  // NOT manufacture agreement on its own — a single source never agrees. This
+  // confirms website_homepage joining Tier-A can't fabricate a 2-source pass.
+  const pHomepageOnly = crossSourceAgreement(
+    { phone: [prov("91193602", "website_homepage")] },
+    "phone",
+  );
+  assertEq(pHomepageOnly.agree, false, "PR-A regression: single website_homepage phone → agree=false (no phantom pass)");
+  assertEq(pHomepageOnly.source_count, 1, "PR-A regression: single website_homepage phone → source_count=1");
 }
 
 // ── PR-19 (gate-split): per-field verdict + aggregateVerdict ────────────────
@@ -4075,6 +4142,7 @@ const _pr24Promise = (async function runPr24Tests() {
         name TEXT,
         slug TEXT,
         description TEXT,
+        categories TEXT DEFAULT '[]',
         provider TEXT,
         contact_email TEXT,
         url TEXT,
@@ -4626,6 +4694,67 @@ const _pr24Promise = (async function runPr24Tests() {
           });
           assertTrue(d.allowed === false, "orch-pr-17-B7: REFUSED when new has only 1 Tier-A source");
         }
+
+        // ── PR-A: homepage-preferred CONTENT override (single website_homepage) ──
+        const whpRec = (v: string) => ({ value: v, source_type: "website_homepage", fetched_at: "2026-06-16T00:00:00Z" });
+
+        // PRA-G1: ALLOWED — a SINGLE website_homepage overwrites google_places
+        // content for a CONTENT field (about). This is the core fix: homepage
+        // (owner-published) must win over google_places content.
+        for (const field of ["about", "products", "description", "categories"]) {
+          const d = canCorrect({
+            field,
+            existingFieldProvenance: [gplacesRec("wrong from google places")],
+            websiteOwnershipUnverified: false,
+            incomingFieldProvenance: [whpRec("right from homepage")],
+            isCurated: false,
+          });
+          assertTrue(d.allowed === true, `PR-A-G1[${field}]: single website_homepage OVERWRITES google_places content`);
+          assertEq(d.reason, "ok_homepage_preferred_over_google_places", `PR-A-G1b[${field}]: reason is homepage-preferred`);
+        }
+
+        // PRA-G2: REFUSED ABSOLUTELY — curated/locked CONTENT field is never
+        // overwritten, even by a website_homepage source. (curated_lock first.)
+        {
+          const d = canCorrect({
+            field: "about",
+            existingFieldProvenance: [gplacesRec("curated value")],
+            websiteOwnershipUnverified: false,
+            incomingFieldProvenance: [whpRec("homepage value")],
+            isCurated: true,
+          });
+          assertTrue(d.allowed === false, "PR-A-G2: curated/locked CONTENT field NEVER overwritten by homepage");
+          assertEq(d.reason, "curated_locked", "PR-A-G2b: reason curated_locked (absolute, checked first)");
+        }
+
+        // PRA-G3: existing already homepage-sourced → homepage override does NOT
+        // demote it (we only override google_places-or-weaker content).
+        {
+          const d = canCorrect({
+            field: "about",
+            existingFieldProvenance: [whpRec("existing homepage value")],
+            websiteOwnershipUnverified: false,
+            incomingFieldProvenance: [whpRec("new homepage value")],
+            isCurated: false,
+          });
+          // Falls through to generic factual math: a single Tier-A new value is
+          // not >=2 Tier-A nor owner → refused (no demotion of existing homepage).
+          assertTrue(d.allowed === false, "PR-A-G3: existing homepage content not demoted by another single homepage");
+        }
+
+        // PRA-G4: address/phone are NOT content fields → homepage-preferred branch
+        // does NOT apply; the existing factual math governs them unchanged. A
+        // single website_homepage must NOT overwrite a google_places address.
+        {
+          const d = canCorrect({
+            field: "address",
+            existingFieldProvenance: [gplacesRec("Gamleveien 1, 1234 Sted")],
+            websiteOwnershipUnverified: false,
+            incomingFieldProvenance: [whpRec("Nyveien 2, 5678 Annet")],
+            isCurated: false,
+          });
+          assertTrue(d.allowed === false, "PR-A-G4: address is NOT content-preferred (single homepage cannot overwrite google_places address)");
+        }
       }
 
       // ── Endpoint gating: default OFF leaves behaviour unchanged ─────────────
@@ -4717,6 +4846,102 @@ const _pr24Promise = (async function runPr24Tests() {
         assertTrue(ref && ref.action === "refused" && ref.reason === "existing_already_two_tierA", "orch-pr-17-B16: products correction refused (existing_already_two_tierA)");
         const row = pr24db.prepare("SELECT products FROM agent_knowledge WHERE agent_id = 'pr17-ref'").get() as any;
         assertTrue(String(row.products).includes("well-sourced-old"), "orch-pr-17-B17: legacy value PRESERVED on refusal");
+      }
+
+      // ── PR-A endpoint: write description/categories to the agents table ──────
+      // Additive write: a plain PUT (no allow_correct) writes description +
+      // categories onto the `agents` table (NOT agent_knowledge) and records
+      // website_homepage provenance for all four content fields in
+      // agent_knowledge.field_provenance via mergeFieldProvenance.
+      {
+        pr24db.prepare(
+          "INSERT INTO agents (id, name, slug, role, api_key) VALUES ('prA-desc', 'PR-A Desc Gård', 'pra-desc', 'producer', 'k')"
+        ).run();
+        const resp = await pr24Req("PUT", "/admin/knowledge", {
+          agent_id: "prA-desc",
+          about: "Familiedrevet besøkshage.",
+          products: ["vegetables"],
+          description: "Besøkshage med stauder og roser.",
+          categories: ["vegetables", "herbs"],
+          field_provenance: {
+            about: [{ value: "Familiedrevet besøkshage.", source_type: "website_homepage", source_url: "https://pra-desc.no", fetched_at: "2026-06-16T00:00:00Z" }],
+            products: [{ value: "vegetables", source_type: "website_homepage", source_url: "https://pra-desc.no", fetched_at: "2026-06-16T00:00:00Z" }],
+            description: [{ value: "Besøkshage med stauder og roser.", source_type: "website_homepage", source_url: "https://pra-desc.no", fetched_at: "2026-06-16T00:00:00Z" }],
+            categories: [{ value: "vegetables", source_type: "website_homepage", source_url: "https://pra-desc.no", fetched_at: "2026-06-16T00:00:00Z" }],
+          },
+        }, PR24_KEY);
+        assertEq(resp.status, 200, "PR-A-E1: description/categories PUT → 200");
+        assertTrue((resp.body.columns_updated as string[]).includes("description"), "PR-A-E2: response columns_updated includes description");
+        assertTrue((resp.body.columns_updated as string[]).includes("categories"), "PR-A-E3: response columns_updated includes categories");
+        const aRow = pr24db.prepare("SELECT description, categories FROM agents WHERE id = 'prA-desc'").get() as any;
+        assertEq(aRow.description, "Besøkshage med stauder og roser.", "PR-A-E4: agents.description written");
+        assertEq(aRow.categories, JSON.stringify(["vegetables", "herbs"]), "PR-A-E5: agents.categories written as JSON array");
+        // about/products still land on agent_knowledge (unchanged behaviour).
+        const kRow = pr24db.prepare("SELECT about, products FROM agent_knowledge WHERE agent_id = 'prA-desc'").get() as any;
+        assertEq(kRow.about, "Familiedrevet besøkshage.", "PR-A-E6: agent_knowledge.about still written");
+        // provenance recorded for ALL FOUR content fields with website_homepage.
+        const prov = getProv("prA-desc");
+        for (const f of ["about", "products", "description", "categories"]) {
+          assertTrue(Array.isArray(prov[f]) && prov[f].some((r: any) => r.source_type === "website_homepage"), `PR-A-E7[${f}]: website_homepage provenance recorded`);
+          assertTrue(prov[f].some((r: any) => r.source_url === "https://pra-desc.no"), `PR-A-E7b[${f}]: source_url recorded`);
+        }
+      }
+
+      // ── PR-A endpoint: homepage OVERWRITES google_places description ─────────
+      // With allow_correct, a single website_homepage source corrects a legacy
+      // google_places description/categories on the agents table.
+      {
+        pr24db.prepare(
+          "INSERT INTO agents (id, name, slug, role, api_key, description, categories) VALUES ('prA-ovr', 'PR-A Override', 'pra-ovr', 'producer', 'k', ?, ?)"
+        ).run("WRONG google places desc", JSON.stringify(["meat"]));
+        pr24db.prepare(
+          "INSERT INTO agent_knowledge (agent_id, field_provenance) VALUES ('prA-ovr', ?)"
+        ).run(JSON.stringify({
+          description: [{ value: "WRONG google places desc", source_type: "google_places", fetched_at: "2026-06-15T00:00:00Z" }],
+          categories: [{ value: "meat", source_type: "google_places", fetched_at: "2026-06-15T00:00:00Z" }],
+        }));
+        const resp = await pr24Req("PUT", "/admin/knowledge?allow_correct=1", {
+          agent_id: "prA-ovr",
+          description: "Andelslandbruk med grønnsaker.",
+          categories: ["vegetables"],
+          field_provenance: {
+            description: [{ value: "Andelslandbruk med grønnsaker.", source_type: "website_homepage", source_url: "https://pra-ovr.no", fetched_at: "2026-06-16T00:00:00Z" }],
+            categories: [{ value: "vegetables", source_type: "website_homepage", source_url: "https://pra-ovr.no", fetched_at: "2026-06-16T00:00:00Z" }],
+          },
+        }, PR24_KEY);
+        assertEq(resp.status, 200, "PR-A-E8: homepage-correct PUT → 200");
+        const descCorr = (resp.body.corrections as any[]).find((c) => c.field === "description");
+        assertTrue(descCorr && descCorr.action === "applied" && descCorr.reason === "ok_homepage_preferred_over_google_places", "PR-A-E9: description correction applied (homepage preferred over google_places)");
+        const aRow = pr24db.prepare("SELECT description, categories FROM agents WHERE id = 'prA-ovr'").get() as any;
+        assertEq(aRow.description, "Andelslandbruk med grønnsaker.", "PR-A-E10: google_places description OVERWRITTEN by homepage");
+        assertEq(aRow.categories, JSON.stringify(["vegetables"]), "PR-A-E11: google_places categories OVERWRITTEN by homepage");
+      }
+
+      // ── PR-A endpoint: curated-lock REFUSAL (description never overwritten) ──
+      // HARD CONSTRAINT: a curated/locked content field is NEVER overwritten,
+      // even by a website_homepage source. Legacy curated value is preserved.
+      {
+        pr24db.prepare(
+          "INSERT INTO agents (id, name, slug, role, api_key, description) VALUES ('prA-lock', 'PR-A Locked', 'pra-lock', 'producer', 'k', ?)"
+        ).run("CURATED description — do not touch");
+        pr24db.prepare(
+          "INSERT INTO agent_knowledge (agent_id, field_provenance, curated_fields) VALUES ('prA-lock', ?, ?)"
+        ).run(
+          JSON.stringify({ description: [{ value: "CURATED description — do not touch", source_type: "owner", fetched_at: "2026-06-15T00:00:00Z" }] }),
+          JSON.stringify({ description: true }),
+        );
+        const resp = await pr24Req("PUT", "/admin/knowledge?allow_correct=1", {
+          agent_id: "prA-lock",
+          description: "Homepage tried to overwrite curated.",
+          field_provenance: {
+            description: [{ value: "Homepage tried to overwrite curated.", source_type: "website_homepage", source_url: "https://pra-lock.no", fetched_at: "2026-06-16T00:00:00Z" }],
+          },
+        }, PR24_KEY);
+        assertEq(resp.status, 200, "PR-A-E12: curated-lock PUT → 200");
+        const lockCorr = (resp.body.corrections as any[]).find((c) => c.field === "description");
+        assertTrue(lockCorr && lockCorr.action === "refused" && lockCorr.reason === "curated_locked", "PR-A-E13: curated description REFUSED (curated_locked, absolute)");
+        const aRow = pr24db.prepare("SELECT description FROM agents WHERE id = 'prA-lock'").get() as any;
+        assertEq(aRow.description, "CURATED description — do not touch", "PR-A-E14: curated description PRESERVED (never overwritten by homepage)");
       }
 
     } finally {

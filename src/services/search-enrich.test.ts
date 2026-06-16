@@ -18,6 +18,11 @@ import {
   confirmProducerPage,
   pickProducerEmail,
   rankCandidates,
+  // PR-A: homepage CONTENT extraction (PURE).
+  extractVisibleText,
+  extractBusinessTypeTokens,
+  extractProductMentions,
+  summarizeAbout,
   type PageEvidence,
   type StoredProducer,
   type BraveResult,
@@ -192,6 +197,140 @@ export function runSearchEnrichTests(opts: { log?: boolean } = {}): TestSummary 
       "AS SA OG", // all stopwords → no stems
     );
     assertEq(ranked, [], "rankCandidates: name with only stopwords → []");
+  }
+
+  // ── PR-A: homepage CONTENT extraction (PURE) ───────────────────────────────
+  // These pin the 4 REAL wrong-business-type/products complaints that motivated
+  // PR-A. Each builds a tiny homepage snippet and asserts the extractors surface
+  // the producer's OWN business-type/products (and NOT the wrong google_places
+  // ones). Table-driven so the next complaint is one row.
+
+  // extractVisibleText: strips scripts/styles/tags, collapses ws, caps length.
+  {
+    const html =
+      "<html><head><title>X</title><style>.a{color:red}</style>" +
+      "<script>var x = 'kjøtt og fisk';</script></head>" +
+      "<body><h1>Velkommen</h1><p>Vi har&nbsp;grønnsaker</p></body></html>";
+    const txt = extractVisibleText(html);
+    assertTrue(txt.includes("Velkommen"), "extractVisibleText: keeps visible heading");
+    assertTrue(txt.includes("grønnsaker"), "extractVisibleText: decodes &nbsp; and keeps body text");
+    assertTrue(!txt.includes("color:red"), "extractVisibleText: drops <style> contents");
+    assertTrue(!txt.toLowerCase().includes("var x"), "extractVisibleText: drops <script> contents (no false 'kjøtt' leak)");
+    assertTrue(!txt.includes("<"), "extractVisibleText: no residual tags");
+  }
+  {
+    const big = "ord ".repeat(20000); // ~80k chars
+    assertTrue(extractVisibleText(big).length <= 20000, "extractVisibleText: caps at ~20k chars");
+    assertEq(extractVisibleText(""), "", "extractVisibleText: empty in → empty out");
+  }
+
+  // ── COMPLAINT 1 — Ingunnshage: besøkshage, NOT hagekonsulent ───────────────
+  {
+    const text = extractVisibleText(
+      "<h1>Ingunns Hage</h1><p>Velkommen til vår besøkshage med stauder og roser. " +
+      "Åpen for besøk i sommerhalvåret.</p>",
+    );
+    const tokens = extractBusinessTypeTokens(text);
+    assertTrue(tokens.includes("besokshage"), "complaint/Ingunnshage: besøkshage detected as business-type");
+    assertTrue(!tokens.includes("hagekonsulent"), "complaint/Ingunnshage: NOT mislabelled hagekonsulent");
+  }
+  // Counterpart: a real hagekonsulent page is distinguished from a besøkshage.
+  {
+    const text = "Vi tilbyr hagekonsulent-tjenester og hageplanlegging for private hager.";
+    const tokens = extractBusinessTypeTokens(text);
+    assertTrue(tokens.includes("hagekonsulent"), "complaint/Ingunnshage: hagekonsulent page detected when truly a consultancy");
+    assertTrue(!tokens.includes("besokshage"), "complaint/Ingunnshage: consultancy not mislabelled besøkshage");
+  }
+
+  // ── COMPLAINT 2 — Grette: andelslandbruk/vegetables, NOT meat ──────────────
+  {
+    const text = extractVisibleText(
+      "<h1>Grette Andelslandbruk</h1><p>Bli andelshaver og høst ferske grønnsaker, " +
+      "poteter og kål gjennom hele sesongen.</p>",
+    );
+    const tokens = extractBusinessTypeTokens(text);
+    const products = extractProductMentions(text);
+    assertTrue(tokens.includes("andelslandbruk"), "complaint/Grette: andelslandbruk detected as business-type");
+    assertTrue(products.includes("vegetables"), "complaint/Grette: vegetables detected from grønnsaker/poteter/kål");
+    assertTrue(!products.includes("meat"), "complaint/Grette: NOT mislabelled as meat producer");
+  }
+
+  // ── COMPLAINT 3 — Fløy Bakeri: bakery, but NO lefser ───────────────────────
+  {
+    const text = extractVisibleText(
+      "<h1>Fløy Bakeri</h1><p>Håndverksbakeri med surdeigsbrød, rundstykker og " +
+      "kanelboller. Bakt ferskt hver dag.</p>",
+    );
+    const products = extractProductMentions(text);
+    const tokens = extractBusinessTypeTokens(text);
+    assertTrue(products.includes("bread"), "complaint/FløyBakeri: bread detected (surdeig/rundstykker/boller)");
+    assertTrue(tokens.includes("bakeri"), "complaint/FløyBakeri: bakeri detected as business-type");
+    // The page does NOT mention lefse, so 'lefse' must not appear in the text we
+    // would summarize/extract — guards against fabricating a product they don't make.
+    assertTrue(!text.toLowerCase().includes("lefse"), "complaint/FløyBakeri: no lefser fabricated (not on page)");
+  }
+  // Counterpart: a page that DOES sell lefse still maps to bread (lexicon has it),
+  // proving the absence above is real, not a missing keyword.
+  {
+    const products = extractProductMentions("Tradisjonell lefse og flatbrød til salgs.");
+    assertTrue(products.includes("bread"), "complaint/FløyBakeri: lefse IS in lexicon → bread (absence above is genuine)");
+  }
+
+  // ── COMPLAINT 4 — Bomstad: goat, NOT shrimp ───────────────────────────────
+  {
+    const text = extractVisibleText(
+      "<h1>Bomstad Gård</h1><p>Vi driver med geit og selger geitekjøtt og geitost " +
+      "fra egen besetning.</p>",
+    );
+    const products = extractProductMentions(text);
+    assertTrue(products.includes("meat"), "complaint/Bomstad: meat detected from geit/geitekjøtt");
+    assertTrue(products.includes("dairy"), "complaint/Bomstad: dairy detected from geitost");
+    assertTrue(!products.includes("fish"), "complaint/Bomstad: NOT mislabelled fish/shrimp (no reker on page)");
+  }
+  // Counterpart: a page that genuinely sells reker maps to fish — proves the
+  // Bomstad 'no fish' result is because the page has no shrimp, not a gap.
+  {
+    const products = extractProductMentions("Ferske reker og krabbe rett fra båten.");
+    assertTrue(products.includes("fish"), "complaint/Bomstad: reker IS in lexicon → fish (Bomstad absence is genuine)");
+  }
+
+  // extractProductMentions: empty / no-hit cases.
+  {
+    assertEq(extractProductMentions(""), [], "extractProductMentions: empty → []");
+    assertEq(extractProductMentions("Vi tilbyr overnatting og opplevelser."), [], "extractProductMentions: no food nouns → []");
+  }
+  // extractBusinessTypeTokens: empty / benign-only.
+  {
+    assertEq(extractBusinessTypeTokens(""), [], "extractBusinessTypeTokens: empty → []");
+    const benign = extractBusinessTypeTokens("Velkommen til vår gård og gårdsbutikk.");
+    assertTrue(benign.includes("gard"), "extractBusinessTypeTokens: benign gård-family token detected");
+  }
+
+  // summarizeAbout: prefers og:description, then meta description, then 1st para.
+  {
+    const html =
+      '<html><head><meta property="og:description" content="Familiedrevet gård med økologiske grønnsaker siden 1998."></head>' +
+      "<body><p>Noe annet helt nede på siden.</p></body></html>";
+    const sum = summarizeAbout(html);
+    assertEq(sum, "Familiedrevet gård med økologiske grønnsaker siden 1998.", "summarizeAbout: uses og:description");
+  }
+  {
+    const html =
+      '<html><head><meta name="description" content="Vårt andelslandbruk dyrker grønnsaker til lokalsamfunnet."></head><body></body></html>';
+    assertEq(summarizeAbout(html), "Vårt andelslandbruk dyrker grønnsaker til lokalsamfunnet.", "summarizeAbout: falls back to meta description");
+  }
+  {
+    const html = "<body><nav>Meny</nav><p>Vi er et lite familiebakeri som baker surdeigsbrød hver morgen.</p></body>";
+    const sum = summarizeAbout(html);
+    assertTrue(sum.includes("familiebakeri"), "summarizeAbout: falls back to first meaningful paragraph");
+  }
+  {
+    // ~300-char cap, deterministic (no generative text).
+    const long = "ord ".repeat(200); // 800 chars of visible text
+    const html = `<body><p>${long}</p></body>`;
+    const sum = summarizeAbout(html);
+    assertTrue(sum.length <= 300, "summarizeAbout: caps at ~300 chars");
+    assertEq(summarizeAbout(""), "", "summarizeAbout: empty → empty");
   }
 
   return { passed, failed, failures };

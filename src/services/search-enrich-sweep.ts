@@ -468,6 +468,7 @@ export function startSearchEnrichSweep(
                 candidate_email: null,
                 email_reason: `error:${agentErr?.message ?? String(agentErr)}`,
                 tier: "none",
+                content_signals: null,
               },
               runId,
               nowIso,
