@@ -61,6 +61,22 @@
 // Unsafe overwrites are dropped (legacy preserved) and reported in
 // response.corrections. Default OFF leaves write behaviour byte-for-byte unchanged.
 //
+// PR-A (2026-06-16): homepage-preferred CONTENT writes + provenance.
+//   - canCorrectFactualField now lets a SINGLE website_homepage source overwrite
+//     google_places content for the CONTENT fields (about/products/description/
+//     categories) — the homepage is owner-published, the highest-trust source
+//     for what a producer is/sells (fixes the wrong business-type/products
+//     complaints). The curated_locked refusal stays the FIRST, ABSOLUTE check, so
+//     a CS/owner-locked field is never overwritten. All existing google_places-
+//     vs-google_places math is unchanged.
+//   - PUT /admin/knowledge now also accepts + writes description/categories,
+//     which live on the `agents` table (not agent_knowledge), in the SAME
+//     transaction (additive, backward-compatible). field_provenance for all four
+//     content fields is recorded via the existing mergeFieldProvenance (the same
+//     provenance mechanism the /admin/homepage-provenance-batch endpoint uses),
+//     with source_type:"website_homepage", source_url, fetched_at supplied by the
+//     caller. No schema migration — provenance rides the existing JSON column.
+//
 // Auth: X-Admin-Key (same pattern as admin-outreach-pool).
 //
 // Reference:
@@ -290,7 +306,7 @@ export function isInferenceSourceType(sourceType: string | null | undefined): bo
 // Tier classification for the correction guard — local + dependency-free so it
 // stays aligned with the validator's TIER_A/TIER_S without importing extra
 // surface. Compares the head token before ':' so "homepage:..." still counts.
-const CORRECT_TIER_A: ReadonlySet<string> = new Set(["homepage", "google_places"]);
+const CORRECT_TIER_A: ReadonlySet<string> = new Set(["homepage", "website_homepage", "google_places"]);
 const CORRECT_TIER_S: ReadonlySet<string> = new Set(["owner"]);
 function correctTierHead(sourceType: string | null | undefined): string {
   return String(sourceType ?? "").trim().toLowerCase().split(":")[0]!;
@@ -305,11 +321,20 @@ function summariseProvenance(records: unknown): {
   hasTierS: boolean;
   realSourceCount: number;
   total: number;
+  /** PR-A: a preferred CONTENT source present (website_homepage / owner). */
+  hasPreferredContent: boolean;
+  /** PR-A: at least one google_places record present. */
+  hasGooglePlaces: boolean;
+  /** PR-A: every usable record is google_places (no other real source). */
+  googlePlacesOnly: boolean;
 } {
   const tierA = new Set<string>();
   let hasTierS = false;
   let realSourceCount = 0;
   let total = 0;
+  let hasPreferredContent = false;
+  let hasGooglePlaces = false;
+  let nonGooglePlaces = 0;
   if (Array.isArray(records)) {
     for (const r of records) {
       if (!r || typeof r !== "object") continue;
@@ -322,10 +347,27 @@ function summariseProvenance(records: unknown): {
       if (CORRECT_TIER_S.has(head)) hasTierS = true;
       if (CORRECT_TIER_A.has(head)) tierA.add(head);
       if (!isInferenceSourceType(st)) realSourceCount++;
+      if (head === "website_homepage" || head === "owner") hasPreferredContent = true;
+      if (head === "google_places") hasGooglePlaces = true;
+      else nonGooglePlaces++;
     }
   }
-  return { tierADistinct: tierA.size, hasTierS, realSourceCount, total };
+  return {
+    tierADistinct: tierA.size,
+    hasTierS,
+    realSourceCount,
+    total,
+    hasPreferredContent,
+    hasGooglePlaces,
+    googlePlacesOnly: total > 0 && hasGooglePlaces && nonGooglePlaces === 0,
+  };
 }
+
+// PR-A: CONTENT fields whose preferred source is the producer's OWN homepage.
+// A single website_homepage source may overwrite google_places content for
+// these (homepage = owner-published, highest trust). address/phone are NOT here
+// — their cross-source agreement math is untouched.
+export const CONTENT_FIELDS: readonly string[] = ["about", "products", "description", "categories"];
 
 export type CorrectDecision = { allowed: boolean; reason: string };
 
@@ -352,16 +394,34 @@ export function canCorrectFactualField(opts: {
 }): CorrectDecision {
   const { field, existingFieldProvenance, websiteOwnershipUnverified, incomingFieldProvenance, isCurated } = opts;
 
-  if (!CORRECTABLE_FACTUAL_FIELDS.includes(field)) {
+  const isContentField = CONTENT_FIELDS.includes(field);
+  if (!CORRECTABLE_FACTUAL_FIELDS.includes(field) && !isContentField) {
     return { allowed: false, reason: "field_not_correctable" };
   }
 
-  // ── Hard refusals (checked first; any one blocks the overwrite) ────────────
-  // 1. Owner-curated / locked field — never touch.
+  // ── Hard refusal #1 — ABSOLUTE, checked FIRST (PR-A keeps this first) ───────
+  // Owner-curated / locked field — NEVER overwrite a CS/owner-locked field, not
+  // even with a homepage source. This guards content fields too.
   if (isCurated) return { allowed: false, reason: "curated_locked" };
 
   const existing = summariseProvenance(existingFieldProvenance);
   const incoming = summariseProvenance(incomingFieldProvenance);
+
+  // ── PR-A: preferred homepage CONTENT override ──────────────────────────────
+  // For CONTENT fields (about/products/description/categories), a single
+  // website_homepage source MAY overwrite google_places content — the homepage
+  // is owner-published, the highest-trust source for what a producer is and
+  // sells, so it must win over a google_places-derived value (the source of
+  // today's wrong business-type/products complaints). Conditions:
+  //   - field is a CONTENT field, AND
+  //   - the NEW value carries a preferred content source (website_homepage/owner), AND
+  //   - the EXISTING value is NOT already homepage/owner-sourced (i.e. it is
+  //     google_places or weaker) — we never demote an existing homepage value.
+  // The curated_locked refusal above still wins absolutely. All existing
+  // google_places-vs-google_places math below is left unchanged.
+  if (isContentField && incoming.hasPreferredContent && !existing.hasPreferredContent) {
+    return { allowed: true, reason: "ok_homepage_preferred_over_google_places" };
+  }
 
   // 2. Existing value already well-sourced (>=2 distinct Tier-A) — not legacy-bad.
   if (existing.tierADistinct >= 2) {
@@ -410,6 +470,12 @@ type IncomingBody = {
   email?: string;
   postalCode?: string;
   website?: string;
+  // PR-A: CONTENT fields that live on the `agents` table (not agent_knowledge).
+  // Additive + backward-compatible — omitting them preserves existing values.
+  // `description` is a string; `categories` is a JSON array (string[] preferred;
+  // a pre-serialized JSON string is also accepted).
+  description?: string;
+  categories?: unknown;
   field_provenance?: IncomingProvenance;
   // orch-pr-17: opt-in flag to enable the SAFE correct-not-just-add overwrite
   // path for factual fields. Default OFF (also accepted as ?allow_correct=1).
@@ -460,6 +526,29 @@ router.put("/", (req: Request, res: Response) => {
   if (body.openingHours !== undefined)
     columnUpdates.push({ col: "opening_hours", val: JSON.stringify(body.openingHours) });
 
+  // ── PR-A: CONTENT columns that live on the `agents` table ─────────────────
+  // description (string) and categories (JSON array) are NOT agent_knowledge
+  // columns, so they go through a separate write set applied to `agents` in the
+  // SAME transaction. Additive: only provided keys are touched. categories is
+  // normalized to a JSON-array string (accepts string[] or a pre-serialized
+  // JSON string; a non-array primitive is wrapped defensively as []).
+  const agentColumnUpdates: { col: string; val: unknown }[] = [];
+  if (typeof body.description === "string")
+    agentColumnUpdates.push({ col: "description", val: body.description });
+  if (body.categories !== undefined) {
+    let catVal: string;
+    if (typeof body.categories === "string") {
+      // Trust a pre-serialized JSON array string; otherwise wrap the raw string.
+      const trimmed = body.categories.trim();
+      catVal = trimmed.startsWith("[") ? trimmed : JSON.stringify([trimmed]);
+    } else if (Array.isArray(body.categories)) {
+      catVal = JSON.stringify(body.categories);
+    } else {
+      catVal = "[]";
+    }
+    agentColumnUpdates.push({ col: "categories", val: catVal });
+  }
+
   // ── Build the field_provenance piece ──────────────────────────────────
   // PR-28: wrap merge in try/catch so an unexpected on-disk shape returns
   // a structured 500 JSON instead of letting the throw escape to express's
@@ -497,7 +586,7 @@ router.put("/", (req: Request, res: Response) => {
   // (no existing value) and non-factual columns are never gated, so additive
   // enrichment is unchanged. When allow_correct is OFF this block does nothing.
   const corrections: Array<{ field: string; action: "applied" | "refused" | "added" | "noop"; reason: string }> = [];
-  if (allowCorrect && columnUpdates.length > 0) {
+  if (allowCorrect && (columnUpdates.length > 0 || agentColumnUpdates.length > 0)) {
     // Parse existing row: current factual column values + field_provenance + curated_fields.
     const existingRow = db
       .prepare(
@@ -551,12 +640,20 @@ router.put("/", (req: Request, res: Response) => {
       }
     }
 
-    // Map column-name → existing stored value (raw column string).
+    // PR-A: existing CONTENT values from the `agents` table (description/categories).
+    const agentExistingRow = db
+      .prepare("SELECT description, categories FROM agents WHERE id = ?")
+      .get(agentId) as { description?: string | null; categories?: string | null } | undefined;
+
+    // Map column-name → existing stored value (raw column string). Includes the
+    // agents-table content columns so the same gating loop logic can run on them.
     const existingColVal: Record<string, string | null | undefined> = {
       about: existingRow?.about,
       address: existingRow?.address,
       phone: existingRow?.phone,
       products: existingRow?.products,
+      description: agentExistingRow?.description,
+      categories: agentExistingRow?.categories,
     };
 
     // Filter columnUpdates: drop unsafe factual overwrites.
@@ -600,6 +697,42 @@ router.put("/", (req: Request, res: Response) => {
     // Replace the write set with the gated one.
     columnUpdates.length = 0;
     columnUpdates.push(...keptUpdates);
+
+    // PR-A: gate the agents-table CONTENT columns (description/categories) with
+    // the SAME logic. canCorrectFactualField treats them as CONTENT fields, so a
+    // single website_homepage source overwrites google_places content, while
+    // curated_locked refuses absolutely. Pure ADDs and unchanged values pass.
+    const keptAgentUpdates: typeof agentColumnUpdates = [];
+    for (const u of agentColumnUpdates) {
+      const oldVal = existingColVal[u.col];
+      const oldPopulated = typeof oldVal === "string" && oldVal.trim() !== "" && oldVal.trim() !== "[]";
+      const newStr = u.val == null ? "" : String(u.val);
+      if (!oldPopulated) {
+        keptAgentUpdates.push(u);
+        corrections.push({ field: u.col, action: "added", reason: "no_existing_value" });
+        continue;
+      }
+      if (String(oldVal) === newStr) {
+        keptAgentUpdates.push(u);
+        corrections.push({ field: u.col, action: "noop", reason: "unchanged" });
+        continue;
+      }
+      const decision = canCorrectFactualField({
+        field: u.col,
+        existingFieldProvenance: existingProv[u.col],
+        websiteOwnershipUnverified: woUnverified,
+        incomingFieldProvenance: incomingProv[u.col],
+        isCurated: !!curated[u.col],
+      });
+      if (decision.allowed) {
+        keptAgentUpdates.push(u);
+        corrections.push({ field: u.col, action: "applied", reason: decision.reason });
+      } else {
+        corrections.push({ field: u.col, action: "refused", reason: decision.reason });
+      }
+    }
+    agentColumnUpdates.length = 0;
+    agentColumnUpdates.push(...keptAgentUpdates);
   }
 
   // ── Apply ─────────────────────────────────────────────────────────────
@@ -624,6 +757,18 @@ router.put("/", (req: Request, res: Response) => {
       db.prepare(
         `UPDATE agent_knowledge SET ${setClause}, updated_at = ? WHERE agent_id = ?`,
       ).run(...params);
+    }
+
+    // PR-A: write CONTENT columns that live on the `agents` table in the SAME
+    // transaction (description/categories). The agents table has no updated_at
+    // column, so we only set the provided columns. Column names are from a fixed
+    // allow-list (description/categories), never user input, so the dynamic SET
+    // clause is injection-safe.
+    if (agentColumnUpdates.length > 0) {
+      const aSet = agentColumnUpdates.map((u) => `${u.col} = ?`).join(", ");
+      const aParams = agentColumnUpdates.map((u) => u.val);
+      aParams.push(agentId);
+      db.prepare(`UPDATE agents SET ${aSet} WHERE id = ?`).run(...aParams);
     }
 
     if (provenanceMerged !== null) {
@@ -652,7 +797,9 @@ router.put("/", (req: Request, res: Response) => {
   res.json({
     success: true,
     agent_id: agentId,
-    columns_updated: columnUpdates.map((u) => u.col),
+    // PR-A: include agents-table content columns (description/categories) in the
+    // echoed set alongside the agent_knowledge columns.
+    columns_updated: [...columnUpdates.map((u) => u.col), ...agentColumnUpdates.map((u) => u.col)],
     field_provenance_counts: summary,
     // orch-pr-17: present only when allow_correct was on — per-field outcome of
     // the correct-not-just-add guard (applied / refused / added / noop).

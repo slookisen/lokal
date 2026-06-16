@@ -25,6 +25,8 @@
 import {
   isKnownDirectoryHost,
   FREE_MAIL_DOMAINS,
+  DISTINCTIVE_SPECIALIST_TOKENS,
+  BENIGN_BUSINESS_TOKENS,
 } from "./cross-source-validator";
 
 // ─── name stemming ───────────────────────────────────────────────────────────
@@ -126,6 +128,14 @@ export interface PageEvidence {
   html: string;
   emails: string[];
   phones: string[];
+  /**
+   * Visible page text (script/style/tags stripped, whitespace collapsed, capped
+   * ~20k chars), extracted by extractVisibleText() from the SAME already-fetched
+   * html. Populated by buildPageEvidence(); used downstream to extract CONTENT
+   * (business-type / product / about) from a CONFIRMED producer homepage so
+   * profile content comes from the producer's own site rather than google_places.
+   */
+  contentText?: string;
 }
 
 export interface StoredProducer {
@@ -552,6 +562,205 @@ export function extractTitle(html: string): string {
   return "";
 }
 
+// ─── homepage CONTENT extraction (PR-A, 2026-06-16) ──────────────────────────
+//
+// PURE functions that extract the producer's OWN content from the confirmed
+// homepage HTML the crawler already fetched. Today's customer complaints are
+// because profile content (about / products / categories / business-type) is
+// taken from google_places, not the producer's homepage — so Ingunnshage shows
+// as "hagekonsulent" not a "besøkshage", Grette as a meat producer not an
+// andelslandbruk (vegetables), Fløy Bakeri lists "lefser" it does not make, and
+// Bomstad shows shrimp not goat. These extractors give the writer a HOMEPAGE
+// source for content so it can be PREFERRED over google_places. No LLM, no new
+// network — they read the same `html`/`contentText` the crawler already has, and
+// only run on a CONFIRMED producer page (provenance guaranteed by the caller).
+
+/**
+ * Strip a page to its visible text: drop <script>/<style>/<noscript>/<template>
+ * blocks, remove all remaining tags, decode the handful of entities the contact
+ * extractors already special-case, collapse whitespace, and cap at ~20k chars so
+ * a huge page can't blow up downstream token scans. PURE.
+ */
+export function extractVisibleText(html: string): string {
+  if (!html) return "";
+  let h = html;
+  // Drop non-visible blocks entirely (content inside them is never page copy).
+  h = h
+    .replace(/<script[\s\S]*?<\/script>/gi, " ")
+    .replace(/<style[\s\S]*?<\/style>/gi, " ")
+    .replace(/<noscript[\s\S]*?<\/noscript>/gi, " ")
+    .replace(/<template[\s\S]*?<\/template>/gi, " ");
+  // Strip remaining tags, decode common entities, collapse whitespace.
+  const text = h
+    .replace(/<[^>]+>/g, " ")
+    .replace(/&nbsp;/gi, " ")
+    .replace(/&amp;/gi, "&")
+    .replace(/&aelig;/gi, "æ").replace(/&oslash;/gi, "ø").replace(/&aring;/gi, "å")
+    .replace(/&AElig;/g, "Æ").replace(/&Oslash;/g, "Ø").replace(/&Aring;/g, "Å")
+    .replace(/\s+/g, " ")
+    .trim();
+  return text.slice(0, 20_000);
+}
+
+// Norwegian → category vocabulary, mirroring the platform's canonical map in
+// services/marketplace-registry.ts (categoryMap) and routes/seo.ts
+// (CATEGORY_MAP). Kept local (dependency-free, accent-stripped at match time)
+// so this module stays a leaf importer of cross-source-validator only. The 10
+// category keys MUST match the platform set: vegetables, fruit, berries, dairy,
+// eggs, meat, fish, bread, honey, herbs.
+const CONTENT_CATEGORY_LEXICON: ReadonlyArray<readonly [string, readonly string[]]> = [
+  ["vegetables", [
+    "gronnsaker", "gronnsak", "gront", "vegetables", "poteter", "potet",
+    "gulrotter", "gulrot", "lok", "kal", "tomat", "tomater", "agurk",
+    "brokkoli", "blomkal", "squash", "paprika", "selleri", "purre", "spinat",
+    "salat", "reddik", "gresskar", "mais", "erter", "bonner", "rodbeter",
+    "nepe", "pastinakk", "andelslandbruk",
+  ]],
+  ["fruit", [
+    "frukt", "fruit", "epler", "eple", "parer", "pare", "plommer", "plomme",
+    "kirsebar", "moreller", "rips", "stikkelsbar", "druer",
+  ]],
+  ["berries", [
+    "bar", "berries", "jordbar", "blabar", "bringebar", "tyttebar",
+    "solbar", "multe", "multer", "markjordbar",
+  ]],
+  ["dairy", [
+    "meieri", "dairy", "melk", "ost", "smor", "yoghurt", "flote", "romme",
+    "brunost", "hvitost", "geitost", "pultost", "gamalost", "smoreost",
+    "ysteri", "ysteriet",
+  ]],
+  ["eggs", ["egg", "eggs", "frittgaende"]],
+  ["meat", [
+    "kjott", "meat", "lam", "lammekjott", "svin", "svinekjott", "storfe",
+    "storfekjott", "kylling", "vilt", "elg", "hjort", "rein", "reinsdyr",
+    "polser", "spekemat", "fenalar", "ribbe", "pinnekjott", "geit", "geitekjott",
+  ]],
+  ["fish", [
+    "fisk", "fish", "sjomat", "laks", "torsk", "reker", "krabbe", "blaskjell",
+    "orret", "roye", "sei", "hyse", "kveite", "steinbit", "torrfisk",
+    "klippfisk", "lutefisk", "rakfisk", "gravlaks",
+  ]],
+  ["bread", [
+    "brod", "bread", "bakervarer", "bakeri", "lefse", "lefser", "flatbrod",
+    "rundstykker", "boller", "kanelboller", "surdeig", "grovbrod",
+  ]],
+  ["honey", ["honning", "honey", "birokt"]],
+  ["herbs", ["urter", "herbs", "krydder", "dill", "persille", "basilikum", "timian"]],
+];
+
+/**
+ * Detect distinctive Norwegian BUSINESS-TYPE tokens that appear in the page
+ * text. Reuses the curated lexicon from cross-source-validator
+ * (DISTINCTIVE_SPECIALIST_TOKENS plus the gård-family BENIGN_BUSINESS_TOKENS),
+ * matched on accent-stripped, word-boundary terms. Returns the distinct tokens
+ * found, in lexicon order. Small curated lexicon — NO LLM. PURE.
+ *
+ * This is the signal that fixes the wrong-business-type complaints: a page that
+ * says "besøkshage" / "andelslandbruk" / "ysteri" tells the writer the real
+ * business type so it can override a wrong google_places category.
+ */
+export function extractBusinessTypeTokens(text: string): string[] {
+  if (!text) return [];
+  const hay = stripNorwegianAccents(text.toLowerCase());
+  const out: string[] = [];
+  const seen = new Set<string>();
+  // DISTINCTIVE first (high-signal), then BENIGN gård-family (low-signal but
+  // still useful provenance that the page is a farm's own site).
+  for (const set of [DISTINCTIVE_SPECIALIST_TOKENS, BENIGN_BUSINESS_TOKENS]) {
+    for (const tok of set) {
+      if (seen.has(tok)) continue;
+      // Whole-word match (tokens are already accent-stripped/lowercase).
+      const re = new RegExp(`\\b${tok.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\b`);
+      if (re.test(hay)) {
+        seen.add(tok);
+        out.push(tok);
+      }
+    }
+  }
+  return out;
+}
+
+/**
+ * Match product/category nouns in the page text against the platform's category
+ * vocabulary and return the NORMALIZED category hits (e.g. "vegetables",
+ * "meat"), in canonical order, deduped. Word-boundary, accent-stripped matching
+ * mirrors marketplace-registry's category detection. PURE.
+ *
+ * "vi dyrker grønnsaker i vårt andelslandbruk" → ["vegetables"]
+ * "ferskt geitekjøtt fra egen gård"            → ["meat"]
+ */
+export function extractProductMentions(text: string): string[] {
+  if (!text) return [];
+  const hay = stripNorwegianAccents(text.toLowerCase());
+  const out: string[] = [];
+  for (const [category, keywords] of CONTENT_CATEGORY_LEXICON) {
+    for (const kw of keywords) {
+      const re = new RegExp(`\\b${kw.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\b`);
+      if (re.test(hay)) {
+        if (!out.includes(category)) out.push(category);
+        break; // one hit is enough to include the category
+      }
+    }
+  }
+  return out;
+}
+
+/**
+ * Produce a DETERMINISTIC extractive "about" summary from the page HTML:
+ *   1. prefer og:description, else <meta name="description">,
+ *   2. else the first meaningful visible paragraph (≥40 chars) of body text.
+ * Whitespace-collapsed, decoded, capped at ~300 chars (cut on a word boundary).
+ * No generative text — purely extractive. PURE.
+ */
+export function summarizeAbout(html: string): string {
+  if (!html) return "";
+  const cap = (s: string): string => {
+    const t = s.replace(/\s+/g, " ").trim();
+    if (t.length <= 300) return t;
+    const slice = t.slice(0, 300);
+    const lastSpace = slice.lastIndexOf(" ");
+    return (lastSpace > 200 ? slice.slice(0, lastSpace) : slice).trim();
+  };
+  const decode = (s: string): string =>
+    s
+      .replace(/&nbsp;/gi, " ")
+      .replace(/&amp;/gi, "&")
+      .replace(/&aelig;/gi, "æ").replace(/&oslash;/gi, "ø").replace(/&aring;/gi, "å")
+      .replace(/&AElig;/g, "Æ").replace(/&Oslash;/g, "Ø").replace(/&Aring;/g, "Å")
+      .replace(/&quot;/gi, '"').replace(/&#39;/g, "'");
+
+  // (1) og:description (property OR name, attribute order tolerant).
+  const ogContentFirst = html.match(
+    /<meta[^>]+content=["']([^"']+)["'][^>]+(?:property|name)=["']og:description["']/i,
+  );
+  const ogPropFirst = html.match(
+    /<meta[^>]+(?:property|name)=["']og:description["'][^>]+content=["']([^"']+)["']/i,
+  );
+  const og = ogPropFirst?.[1] ?? ogContentFirst?.[1];
+  if (og && og.trim()) return cap(decode(og));
+
+  // (2) <meta name="description">.
+  const mdPropFirst = html.match(
+    /<meta[^>]+name=["']description["'][^>]+content=["']([^"']+)["']/i,
+  );
+  const mdContentFirst = html.match(
+    /<meta[^>]+content=["']([^"']+)["'][^>]+name=["']description["']/i,
+  );
+  const md = mdPropFirst?.[1] ?? mdContentFirst?.[1];
+  if (md && md.trim()) return cap(decode(md));
+
+  // (3) first meaningful visible paragraph of body text.
+  const visible = extractVisibleText(html);
+  if (!visible) return "";
+  // Split into sentence-ish chunks and take the first that is substantive.
+  for (const chunk of visible.split(/(?<=[.!?])\s+/)) {
+    const c = chunk.trim();
+    if (c.length >= 40) return cap(c);
+  }
+  // Fallback: the leading slice of visible text.
+  return cap(visible);
+}
+
 /** SSRF guard: allow only http(s) to public hosts; block localhost, link-local,
  * private/CGNAT ranges and cloud-metadata (169.254.0.0/16). Domain names are allowed
  * (DNS-rebinding is out of scope for this admin-gated, dry-run-by-default endpoint). */
@@ -642,6 +851,10 @@ export async function buildPageEvidence(primaryUrl: string): Promise<PageEvidenc
     html: combinedHtml,
     emails: Array.from(emails),
     phones: Array.from(phones),
+    // PR-A: visible text from the SAME already-fetched html (zero new fetches,
+    // zero new Brave queries). Used downstream to extract CONTENT signals when
+    // the page is confirmed as the producer's own.
+    contentText: extractVisibleText(combinedHtml),
   };
 }
 
@@ -681,6 +894,27 @@ export type EnrichInput = StoredProducer & {
   query: string;
 };
 
+/**
+ * CONTENT signals extracted from a CONFIRMED producer homepage (PR-A). Present
+ * on an EnrichRow ONLY when the chosen page was confirmed as the producer's own
+ * (bestConfirm.confirmed) — so its presence is itself a provenance guarantee
+ * that the content came from the producer's homepage, not google_places. The
+ * downstream writer maps these to website_homepage-sourced about/products/
+ * description/categories.
+ */
+export interface ContentSignals {
+  /** Distinctive business-type tokens found on the page (besøkshage, ysteri…). */
+  businessTypeTokens: string[];
+  /** Normalized platform category hits (vegetables, meat…). */
+  productMentions: string[];
+  /** Deterministic extractive about summary (≤300 chars), or "" if none. */
+  aboutSummary: string;
+  /** The confirmed page URL the signals were extracted from (provenance). */
+  sourceUrl: string;
+  /** ISO timestamp the signals were extracted. */
+  extractedAt: string;
+}
+
 export interface EnrichRow {
   agent_id: string;
   name: string;
@@ -690,6 +924,13 @@ export interface EnrichRow {
   candidate_email: string | null;
   email_reason: string;
   tier: EnrichTier;
+  /**
+   * PR-A: homepage CONTENT signals — populated ONLY when bestConfirm.confirmed
+   * (page is the producer's own). null on unconfirmed/no-candidate rows, so
+   * producers with no usable homepage simply fall back to google_places (no
+   * regression).
+   */
+  content_signals: ContentSignals | null;
 }
 
 /**
@@ -719,6 +960,7 @@ export async function enrichOneAgent(
     candidate_email: null,
     email_reason: "no_candidate_url",
     tier: "none",
+    content_signals: null,
   };
 
   const results = await deps.search(stored.query);
@@ -753,6 +995,19 @@ export async function enrichOneAgent(
     const pick = pickProducerEmail(bestEvidence.emails, stored.name, siteRoot);
     pickedEmail = pick.email;
     emailReason = pick.reason;
+
+    // PR-A: extract CONTENT signals from the CONFIRMED page only. Doing this
+    // exclusively on a confirmed producer page is what guarantees provenance —
+    // the writer can treat these as website_homepage-sourced (preferred over
+    // google_places) precisely because we know the page is the producer's own.
+    const contentText = bestEvidence.contentText ?? "";
+    row.content_signals = {
+      businessTypeTokens: extractBusinessTypeTokens(contentText),
+      productMentions: extractProductMentions(contentText),
+      aboutSummary: summarizeAbout(bestEvidence.html),
+      sourceUrl: bestEvidence.url,
+      extractedAt: new Date().toISOString(),
+    };
   } else if (bestUrl) {
     emailReason = "page_not_confirmed";
   }
