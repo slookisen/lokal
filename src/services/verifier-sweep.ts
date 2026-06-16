@@ -69,10 +69,6 @@ export interface SweepJobState {
   // orchestrator-pr-16: website-ownership unverified (homepage name-mismatch)
   // surfaced by Guard #1 at crawl time; counted here when the flag is present.
   website_ownership_unverified: number;
-  // PR-B: stored content distinctively conflicts with the producer's own
-  // homepage — agent was quarantined (review_required), not promoted. Counts
-  // every result whose flags carry a `content_conflict:<field>` tag.
-  content_conflict: number;
 }
 
 // ─── Singleton state ─────────────────────────────────────────────────────────
@@ -98,7 +94,6 @@ let _sweepJob: SweepJobState = {
   thin_content: 0,
   inference_only_field: 0,
   website_ownership_unverified: 0,
-  content_conflict: 0,
 };
 
 export function getSweepJob(): Readonly<SweepJobState> {
@@ -198,7 +193,6 @@ export function startSweep(opts: StartSweepOpts = {}): StartSweepResult {
     thin_content: 0,
     inference_only_field: 0,
     website_ownership_unverified: 0,
-    content_conflict: 0,
   };
 
   // ── Background loop (fire-and-forget) ──────────────────────────────────────
@@ -267,7 +261,6 @@ export function startSweep(opts: StartSweepOpts = {}): StartSweepResult {
         _sweepJob.thin_content += results.filter((r) => r.flags.includes("thin_content")).length;
         _sweepJob.inference_only_field += results.filter((r) => r.flags.some((f) => f.startsWith("inference_only_field"))).length;
         _sweepJob.website_ownership_unverified += results.filter((r) => r.flags.includes("website_ownership_unverified")).length;
-        _sweepJob.content_conflict += results.filter((r) => r.flags.some((f) => f.startsWith("content_conflict"))).length;
         _sweepJob.lastChunkAt = new Date().toISOString();
 
         console.log(
