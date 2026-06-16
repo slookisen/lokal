@@ -9,6 +9,28 @@ let passed = 0;
 let failed = 0;
 const failures: string[] = [];
 
+// ── Race-free serialization harness (test-only) ─────────────────────────────
+// A single linear promise chain. Blocks registered via runSerial() each run to
+// full settlement before the next link starts, so a serialized block never
+// observes a foreign block mutating shared test state mid-flight.
+//
+// IMPORTANT (PR-25 v2): we ONLY route through this chain the blocks that are
+// *truly independent* of the pre-existing resolver-handle coordination — i.e.
+// blocks that pass their own DB handle directly and never read the module
+// getDb() singleton (src/database/init.ts) nor schedule a fire-and-forget job
+// that would. The blocks that DO swap the global singleton are already
+// serialized among themselves by their _prNNResolve / await _prNNPromise
+// handles; mixing the two mechanisms is what tore the singleton under CI in
+// v1, so those blocks are left exactly as they are. The REPORT block drains
+// _serialChain (in addition to the existing per-handle awaits) so every
+// serialized link's pass/fail counts fold into the npm test summary.
+let _serialChain: Promise<void> = Promise.resolve();
+function runSerial(fn: () => Promise<void> | void): Promise<void> {
+  const next = _serialChain.then(fn, fn);
+  _serialChain = next.then(() => {}, () => {});
+  return next;
+}
+
 function assertEq(actual: unknown, expected: unknown, label: string): void {
   if (actual === expected) {
     passed++;
@@ -16205,7 +16227,7 @@ const _seoDentalPromise = (async () => {
   dbFactorySeo.__resetDbFactoryForTesting();
 })();
 
-const _platformVerifierPromise = (async () => {
+const _platformVerifierPromise = runSerial(async () => {
   const Database = require("better-sqlite3");
   const {
     runPlatformVerifier,
@@ -16602,7 +16624,7 @@ const _platformVerifierPromise = (async () => {
     if (prevAnalytics === undefined) delete process.env.ANALYTICS_ADMIN_KEY; else process.env.ANALYTICS_ADMIN_KEY = prevAnalytics;
     delete require.cache[routePath];
   }
-})();
+});
 
 
 // ── orch-pr-20260614-2: pickPendingVerifyBatch + verifier-sweep ──────────────
@@ -18340,6 +18362,11 @@ console.log("\n── orch-pr-14: MCP discovery product_id surfacing ──");
 
 
 (async () => {
+  // Drain the serial chain first. A setImmediate flush guarantees every
+  // runSerial(...) registration above has executed before we await the tail,
+  // so all serialized links' pass/fail counts are folded into the summary.
+  await new Promise(r => setImmediate(r));
+  try { await _serialChain; } catch { /* link errors already pushed to failures */ }
   try { await Promise.all(_pr21Promises); } catch { /* errors already pushed to failures */ }
   try { await _m2Promise; } catch { /* errors already pushed to failures */ }
   try { await _pr24Promise; } catch { /* errors already pushed to failures */ }
