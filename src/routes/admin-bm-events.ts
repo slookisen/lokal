@@ -1,9 +1,18 @@
 // ─── Admin: Bondens marked events scraper endpoint (PR-56) ──────
 //
 // POST /admin/bm-events/scrape
-//   Synchronously runs the scraper pipeline and returns a ScrapeResult JSON.
+//   DEFAULT (backward-compatible): synchronously runs the scraper pipeline and
+//   returns a ScrapeResult JSON (unchanged — callers that want the result
+//   inline still get it).
+//   ?async=1  /  { async: true }  (orch-pr-20): fires the scrape as a
+//   fire-and-forget background job and returns { run_id, status:"started" } in
+//   <1s (409 if a scrape is already running). The bm-events worker uses this to
+//   dodge the >120s synchronous-request timeout, then polls GET to completion.
+// GET /admin/bm-events/scrape  (orch-pr-20)
+//   Background-job status + counts (fetched/parsed/matched/upserted/unmatched/
+//   match_rate, started_at, finished_at, last_error).
 //   Used by:
-//     - Cowork scheduled-task (daily 05:00 UTC)
+//     - Cowork scheduled-task (daily 05:00 UTC) — now fires ?async=1 then polls
 //     - Daniel for ad-hoc runs
 //
 // PR-94 (2026-06-01) — added Phase B.2 venue-review endpoints:
@@ -15,6 +24,10 @@
 
 import { Router, Request, Response } from "express";
 import { runBmEventsScraper } from "../services/bm-events-scraper";
+import {
+  startBmEventsScrapeJob,
+  getBmEventsScrapeJob,
+} from "../services/bm-events-scrape-job";
 import { getDb } from "../database/init";
 
 const router = Router();
@@ -40,13 +53,44 @@ function requireAdmin(req: Request, res: Response): boolean {
 router.post("/scrape", async (req: Request, res: Response) => {
   if (!requireAdmin(req, res)) return;
 
-  const body = (req.body || {}) as { maxEvents?: number; useRenderWorker?: boolean; correctTimes?: boolean };
+  const body = (req.body || {}) as { maxEvents?: number; useRenderWorker?: boolean; correctTimes?: boolean; async?: boolean };
   const maxEvents = typeof body.maxEvents === "number" && body.maxEvents > 0
     ? Math.min(body.maxEvents, 1000)
     : undefined;
   const useRenderWorker = body.useRenderWorker === true;
   const correctTimes = body.correctTimes !== false; // PR-125: default on
 
+  // orch-pr-20: opt-in async mode (?async=1 or { async: true }). When set, the
+  // scrape runs as a fire-and-forget background job so the request returns in
+  // <1s — the bm-events worker fires this then polls GET /admin/bm-events/scrape
+  // to completion, dodging the >120s synchronous-request timeout. The scrape
+  // logic is identical (same runBmEventsScraper call, same opts) — only the
+  // delivery is async.
+  const asyncRaw = body.async ?? req.query["async"];
+  const wantAsync = asyncRaw === true || asyncRaw === "1" || asyncRaw === "true";
+
+  if (wantAsync) {
+    const started = startBmEventsScrapeJob({ maxEvents, useRenderWorker, correctTimes });
+    if (!started.started) {
+      // already_running → 409 with the current job for observability.
+      res.status(409).json({
+        success: false,
+        error: "bm-events scrape already running",
+        reason: started.reason,
+        job: getBmEventsScrapeJob(),
+      });
+      return;
+    }
+    res.json({
+      success: true,
+      run_id: started.run_id,
+      status: "started",
+      note: "Scrape running in background. Poll GET /admin/bm-events/scrape for progress.",
+    });
+    return;
+  }
+
+  // Synchronous mode (default — unchanged backward-compatible behaviour).
   try {
     const result = await runBmEventsScraper({ maxEvents, useRenderWorker, correctTimes });
     res.json({ success: true, ...result });
@@ -57,6 +101,14 @@ router.post("/scrape", async (req: Request, res: Response) => {
       detail: err?.message || String(err),
     });
   }
+});
+
+// GET /admin/bm-events/scrape (orch-pr-20)
+//   Returns the background scrape job's status + counts so the worker can poll
+//   to completion. status is one of idle|running|done|error.
+router.get("/scrape", (req: Request, res: Response) => {
+  if (!requireAdmin(req, res)) return;
+  res.json({ success: true, job: getBmEventsScrapeJob() });
 });
 
 // ─── PR-94 Phase B.2: bm_venue review queue ─────────────────────

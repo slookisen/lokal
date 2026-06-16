@@ -8150,6 +8150,38 @@ _pr56Promise.then(() => {
 });
 
 
+// ─── orch-pr-20 (2026-06-15): bm-events async fire-and-forget scrape job ──────
+//
+// Tests the in-memory singleton job behind POST/GET /admin/bm-events/scrape:
+// async start is non-blocking + returns run_id; 409 while running; GET reports
+// status+counts; the job runs the real scraper (stubbed fetch) and upserts
+// idempotently; synchronous mode still works. The job test stubs globalThis.fetch
+// AND injects a test DB (__setDbForTesting), so — like PR-94 — it is CHAINED off
+// _pr94Promise (which itself chains off _pr56Promise) to serialize after the
+// other bm-events fetch-stub/DB blocks and avoid stub collisions / DB races.
+// Settled by the chain below; awaited in the REPORT block.
+let _orchPr20BmEventsResolve: () => void = () => {};
+const _orchPr20BmEventsPromise: Promise<void> = new Promise<void>(r => { _orchPr20BmEventsResolve = r; });
+
+_pr94Promise.then(async () => {
+  console.log("\n── orch-pr-20: bm-events async scrape job ──");
+  try {
+    const { runBmEventsScrapeJobTests } = require("../src/services/bm-events-scrape-job.test") as
+      typeof import("../src/services/bm-events-scrape-job.test");
+    const jr = await runBmEventsScrapeJobTests({ log: false });
+    passed += jr.passed;
+    failed += jr.failed;
+    for (const f of jr.failures) failures.push("bm-events-scrape-job: " + f);
+    console.log(`  bm-events-scrape-job: ${jr.passed} passed, ${jr.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("bm-events-scrape-job: unexpected error: " + String(err?.message || err));
+  } finally {
+    _orchPr20BmEventsResolve();
+  }
+});
+
+
 // ─── Phase 5.11 C.2: Hanen member scraper ──────────────────────
 // Source-presence + light behavioural assertions. Mirrors the PR-56
 // presence-test block so the same set of guarantees (module exists,
@@ -18114,6 +18146,7 @@ console.log("\n── orch-pr-14: MCP discovery product_id surfacing ──");
   try { await _orchPr9PruneDeadUrlsPromise; } catch { /* errors already pushed to failures */ }
   try { await _orchPr18BulkLoadPromise; } catch { /* errors already pushed to failures */ }
   try { await _orchPr12SweepPromise; } catch { /* errors already pushed to failures */ }
+  try { await _orchPr20BmEventsPromise; } catch { /* errors already pushed to failures */ }
   // PR-109 tests are synchronous (IIFE) — no promise needed
   // Drop pre-existing intg failures (unmasked by awaiting) — they predate M2
   // and live behind a separate fix-it task. Counting them here would surface
