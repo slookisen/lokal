@@ -88,7 +88,7 @@
 
 import { Router, Request, Response } from "express";
 import { getDb } from "../database/init";
-import { isKnownDirectoryHost } from "../services/cross-source-validator";
+import { isKnownDirectoryHost, CONTENT_FIELDS } from "../services/cross-source-validator";
 
 const router = Router();
 
@@ -367,7 +367,10 @@ function summariseProvenance(records: unknown): {
 // A single website_homepage source may overwrite google_places content for
 // these (homepage = owner-published, highest trust). address/phone are NOT here
 // — their cross-source agreement math is untouched.
-export const CONTENT_FIELDS: readonly string[] = ["about", "products", "description", "categories"];
+// PR-B: the canonical definition now lives in cross-source-validator (single
+// source of truth, shared with the content-coherence gate). Re-exported here so
+// existing importers of this module are unaffected.
+export { CONTENT_FIELDS };
 
 export type CorrectDecision = { allowed: boolean; reason: string };
 

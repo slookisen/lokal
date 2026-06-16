@@ -89,6 +89,34 @@ export function isPreferredContentSource(sourceType: string | null | undefined):
   return head === "website_homepage" || head === "owner";
 }
 
+// ─── CONTENT fields (PR-B) ───────────────────────────────────────────────────
+//
+// The four CONTENT fields whose preferred source is the producer's OWN homepage
+// (about / products / description / categories). This is the single source of
+// truth — routes/admin-knowledge.ts re-exports it. Deliberately SEPARATE from
+// FieldName (address/phone/business_status): content is NEVER added to the
+// address/phone cross-source agreement math or the domain_coherence gate.
+export const CONTENT_FIELDS: readonly string[] = ["about", "products", "description", "categories"];
+
+// ─── nit (PR-A review #2): content-only source-types ──────────────────────────
+//
+// "website_homepage" is added to Tier-A by PR-A, but it is ONLY ever written for
+// CONTENT fields — never for a FACTUAL field (address/phone/business_status).
+// To make that invariant defensive rather than a comment, these source-types are
+// filtered OUT of crossSourceAgreement() so a content-source record can NEVER be
+// counted toward a FACTUAL field's cross-source agreement (which would inflate
+// the agreement count and the domain_coherence gate it feeds). NOTE: "owner" is
+// deliberately NOT here — owner is a legitimate Tier-S factual source (owner-
+// attested address/phone) and must keep counting for factual agreement.
+const CONTENT_ONLY_SOURCE_TYPES: ReadonlySet<string> = new Set(["website_homepage"]);
+
+/** True iff `sourceType` is a CONTENT-only source (compares the head before ':'). */
+export function isContentOnlySourceType(sourceType: string | null | undefined): boolean {
+  if (!sourceType) return false;
+  const head = String(sourceType).trim().toLowerCase().split(":")[0]!;
+  return CONTENT_ONLY_SOURCE_TYPES.has(head);
+}
+
 // ─── Inference-source deny-list (orchestrator-pr-16, Guard #2) ───────────────
 //
 // AI/heuristic "sources" that are NOT real evidence of a producer's factual
@@ -250,7 +278,14 @@ export function crossSourceAgreement(
   // out of `valid` entirely so every downstream count (source_count, the
   // Tier-S/A/B partitions, conflict listing) ignores them. They remain visible
   // in `sources_used` for observability/debugging only.
-  const valid = allValid.filter((r) => !isInferenceSource(r.source_type));
+  // nit (PR-A review #2): a CONTENT-only source (website_homepage) must NEVER
+  // count toward a FACTUAL field's agreement. crossSourceAgreement only ever runs
+  // on FieldName (address/phone/business_status), so we drop content-only sources
+  // here unconditionally — they keep their place in `sources_used` (observability)
+  // but cannot inflate source_count, the tier partitions, or the agreement math.
+  const valid = allValid.filter(
+    (r) => !isInferenceSource(r.source_type) && !isContentOnlySourceType(r.source_type),
+  );
 
   if (allValid.length === 0) {
     // PR-19: 0 sources → the back-catalogue case. Cannot review without data.
