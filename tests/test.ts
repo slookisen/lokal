@@ -9,22 +9,6 @@ let passed = 0;
 let failed = 0;
 const failures: string[] = [];
 
-// ── Race-free serialization harness (test-only) ──────────────────────────────
-// All DB-touching top-level blocks below are registered as links in this single
-// linear chain via runSerial(). Each link's body fully settles before the next
-// link starts (JS is single-threaded + the chain is linear), so no block ever
-// observes the module-singleton DB (src/database/init.ts getDb/__setDbForTesting)
-// swapped mid-flight by a foreign block. This eliminates the DB-singleton race
-// by construction. The links are registered in dependency-topological order
-// (only the orch-pr-18 bulk-load block is registered out of source order — it
-// awaits the prune-dead-urls block which appears later in the file).
-let _serialChain: Promise<void> = Promise.resolve();
-function runSerial(fn: () => Promise<void> | void): Promise<void> {
-  const next = _serialChain.then(fn, fn);
-  _serialChain = next.then(() => {}, () => {});
-  return next;
-}
-
 function assertEq(actual: unknown, expected: unknown, label: string): void {
   if (actual === expected) {
     passed++;
@@ -170,7 +154,7 @@ console.log("\n── orch-pr-13: contact-normalizer (address/phone) ──");
 // Async (fire-and-forget sweep loop). Kicked off here; awaited in the REPORT
 // block so its pass/fail counts fold into the `npm test` summary.
 console.log("── orch-pr-12: search-enrich sweep + findings + apply-findings ──");
-const _orchPr12SweepPromise: Promise<void> = runSerial(async () => {
+const _orchPr12SweepPromise: Promise<void> = (async () => {
   try {
     const { runSearchEnrichSweepTests } = require("../src/services/search-enrich-sweep.test") as
       typeof import("../src/services/search-enrich-sweep.test");
@@ -183,7 +167,7 @@ const _orchPr12SweepPromise: Promise<void> = runSerial(async () => {
     failed++;
     failures.push("search-enrich-sweep: unexpected error: " + String(err));
   }
-});
+})();
 
 // ── trust-score community signal tests ──
 console.log("── trust-score community signal tests ──");
@@ -3662,10 +3646,10 @@ async function runIntegrationTests(): Promise<void> {
 }
 
 
-const _intgPromise = runSerial(() => runIntegrationTests().catch((err) => {
+const _intgPromise = runIntegrationTests().catch((err) => {
   failed++;
   failures.push(`intg: unexpected error: ${err?.message || err}`);
-}));
+});
 
 // ── Phase 5.4a M2: owner-portal frontend tests ───────────────────────────
 // These tests verify the new selger-portal HTML pages, magic-link email
@@ -3674,7 +3658,7 @@ const _intgPromise = runSerial(() => runIntegrationTests().catch((err) => {
 
 console.log("\n── Phase 5.4a M2: owner-portal frontend tests ──");
 
-const _m2Promise = runSerial(async function runOwnerPortalTests() {
+const _m2Promise = (async function runOwnerPortalTests() {
   try {
     // Wait for the WO-16 integration tests (_intgPromise) to complete before
     // touching __setDbForTesting. The intg fixtures call __setDbForTesting()
@@ -3958,7 +3942,7 @@ const _m2Promise = runSerial(async function runOwnerPortalTests() {
     failed++;
     failures.push(`m2 owner-portal: unexpected error: ${(err as any)?.message || err}`);
   }
-});
+})();
 
 
 
@@ -4143,7 +4127,7 @@ const _m2Promise = runSerial(async function runOwnerPortalTests() {
 // All async, awaited in REPORT block via _pr24Promise.
 console.log("\n── PR-24: /admin/knowledge field_provenance merge tests ──");
 
-const _pr24Promise = runSerial(async function runPr24Tests() {
+const _pr24Promise = (async function runPr24Tests() {
   // Wait for M2 owner-portal tests to finish first — they also use
   // __setDbForTesting and would race with our pinned DB otherwise.
   try { await _m2Promise; } catch { /* their failures are already recorded */ }
@@ -4971,7 +4955,7 @@ const _pr24Promise = runSerial(async function runPr24Tests() {
     failed++;
     failures.push(`✗ pr24: unexpected error: ${err instanceof Error ? err.stack || err.message : String(err)}`);
   }
-});
+})();
 // ── PR-23 (2026-05-11): backfill field_provenance for stranded agents ──
 console.log("\n── PR-23: field_provenance backfill ──");
 {
@@ -7954,7 +7938,7 @@ const _pr56Promise: Promise<void> = new Promise<void>(r => { _pr56Resolve = r; }
 // Behavioural tests: matcher (with stubbed agents) + scraper pipeline (with
 // stubbed global fetch). Source-presence tests confirm endpoints/MCP-tool
 // are wired in and the new bm_market_events table is in init.ts.
-runSerial(async () => {
+{
   console.log("\n── PR-56: Bondens marked events scraper ──");
   const fs = require("fs");
 
@@ -8150,9 +8134,7 @@ runSerial(async () => {
       }
     );
   }
-
-  try { await _pr56Promise; } catch { /* nested IIFE owns its own failures */ }
-});
+}
 
 
 // ─── PR-94 (2026-06-01): normaliser-hardening + Phase-B.2 venue-agent auto-create ──
@@ -8167,7 +8149,7 @@ runSerial(async () => {
 let _pr94Resolve: () => void = () => {};
 const _pr94Promise: Promise<void> = new Promise<void>(r => { _pr94Resolve = r; });
 
-runSerial(() => _pr56Promise.then(() => {
+_pr56Promise.then(() => {
   console.log("\n── PR-94: normaliser-hardening + venue-agent auto-create ──");
   try {
     const nm = require("../src/services/name-matcher");
@@ -8390,7 +8372,7 @@ runSerial(() => _pr56Promise.then(() => {
     failures.push(`✗ pr-94 setup threw: ${e?.message || String(e)}`);
     _pr94Resolve();
   }
-}));
+});
 
 
 // ─── orch-pr-20 (2026-06-15): bm-events async fire-and-forget scrape job ──────
@@ -8406,7 +8388,7 @@ runSerial(() => _pr56Promise.then(() => {
 let _orchPr20BmEventsResolve: () => void = () => {};
 const _orchPr20BmEventsPromise: Promise<void> = new Promise<void>(r => { _orchPr20BmEventsResolve = r; });
 
-runSerial(() => _pr94Promise.then(async () => {
+_pr94Promise.then(async () => {
   console.log("\n── orch-pr-20: bm-events async scrape job ──");
   try {
     const { runBmEventsScrapeJobTests } = require("../src/services/bm-events-scrape-job.test") as
@@ -8422,7 +8404,7 @@ runSerial(() => _pr94Promise.then(async () => {
   } finally {
     _orchPr20BmEventsResolve();
   }
-}));
+});
 
 
 // ─── Phase 5.11 C.2: Hanen member scraper ──────────────────────
@@ -9140,7 +9122,7 @@ let _pr63Resolve: () => void = () => {};
 const _pr63Promise: Promise<void> = new Promise<void>(r => { _pr63Resolve = r; });
 
 // ─── C.1-A: Debio TRACES + Brreg cross-check (Phase 5.11) ─────────────
-runSerial(async () => {
+{
   console.log("\n── C.1-A: Debio TRACES + Brreg cross-check ──");
   const fs = require("fs");
 
@@ -9414,9 +9396,7 @@ runSerial(async () => {
       _pr63Resolve();
     }
   );
-
-  try { await _pr63Promise; } catch { /* nested IIFE owns its own failures */ }
-});
+}
 
 
 // PR-65 async-test handle (job-tracker uses setImmediate so completion
@@ -9555,7 +9535,7 @@ const _pr65Promise: Promise<void> = new Promise<void>(r => { _pr65Resolve = r; }
 }
 
 // Async block: must await setImmediate completion to see status transitions.
-runSerial(async () => {
+{
   (async () => {
     const jt = require("../src/services/job-tracker");
     jt._clearJobsForTesting();
@@ -9970,9 +9950,7 @@ runSerial(async () => {
       _pr65Resolve();
     }
   );
-
-  try { await _pr65Promise; } catch { /* nested IIFE owns its own failures */ }
-});
+}
 
 
 // PR-66 async-test handle — settled by the IIFE inside the block below.
@@ -9980,7 +9958,7 @@ let _pr66Resolve: () => void = () => {};
 const _pr66Promise: Promise<void> = new Promise<void>(r => { _pr66Resolve = r; });
 
 // ─── PR-66: TRACES POST-body country/competentAuthority filter ────────
-runSerial(async () => {
+{
   console.log("\n── PR-66: TRACES POST-body filter + GET fallback ──");
   const fs = require("fs");
 
@@ -10224,9 +10202,7 @@ runSerial(async () => {
       _pr66Resolve();
     }
   );
-
-  try { await _pr66Promise; } catch { /* nested IIFE owns its own failures */ }
-});
+}
 
 // PR-67 async handle (DB-bound section awaits PR-56's in-memory
 // DB to settle before swapping the singleton via __setDbForTesting).
@@ -10239,7 +10215,7 @@ const _pr67Promise: Promise<void> = new Promise<void>(r => { _pr67Resolve = r; }
 //   - matchHanenMemberToAgent decision tree for the four new methods
 //   - admin-hanen ?re_classify_only=1 mode
 //   - reclassifyHanenAffiliations re-evaluates review_required rows
-runSerial(async () => {
+{
   console.log("\n── PR-67: Hanen matcher v3 (medium→high promote) ──");
   const fs = require("fs");
 
@@ -10763,9 +10739,7 @@ runSerial(async () => {
     failures.push("✗ pr67 behavioural: " + (e?.message || String(e)));
     _pr67Resolve();
   }
-
-  try { await _pr67Promise; } catch { /* nested IIFE owns its own failures */ }
-});
+}
 
 
 // ════════════════════════════════════════════════════════════════════
@@ -10815,7 +10789,7 @@ const _pr68Promise: Promise<void> = new Promise<void>(r => { _pr68Resolve = r; }
 
 // ── Behavioural tests run LAST — wait for the other async DB-using
 //    blocks (PR-56, PR-65) to finish before we steal the global DB.
-runSerial(async () => {
+(async () => {
   try { await _pr56Promise; } catch { /* errors already counted */ }
   try { await _pr65Promise; } catch { /* errors already counted */ }
 
@@ -11011,7 +10985,7 @@ runSerial(async () => {
   } finally {
     _pr68Resolve();
   }
-});
+})();
 
 
 // ════════════════════════════════════════════════════════════════════
@@ -11397,7 +11371,7 @@ console.log("\n── PR-73: /llms.txt expanded content ──");
 // fresh in-memory DB injected via __setDbForTesting, then mount the real
 // Express router so we exercise the exact code path production runs.
 console.log("\n── PR-74: umbrella-traffic aggregation + endpoint ──");
-const _pr74Promise = runSerial(() => (async () => {
+const _pr74Promise = (async () => {
   // Wait for all prior async blocks that also steal the global DB singleton.
   // PR-68 is the last sequential block but the M2 portal IIFE and the PR-21
   // collection run in parallel — any of them can race PR-74's __setDbForTesting
@@ -11636,7 +11610,7 @@ const _pr74Promise = runSerial(() => (async () => {
 })().catch(err => {
   failed++;
   failures.push(`✗ pr-74 async test setup failed: ${err instanceof Error ? err.message : String(err)}`);
-}));
+});
 
 
 
@@ -11648,7 +11622,7 @@ const _pr74Promise = runSerial(() => (async () => {
 // lookupKartverket are never reached, so this is fully sync-safe and
 // doesn't race the global DB singleton.
 console.log("\n── PR-75: MAJOR_CITIES expansion ──");
-const _pr75Promise = runSerial(() => (async () => {
+const _pr75Promise = (async () => {
   const { geocodingService } = require("../src/services/geocoding-service");
 
   // Helper — assert a city resolves via the hardcoded table.
@@ -11757,7 +11731,7 @@ const _pr75Promise = runSerial(() => (async () => {
 })().catch((err: unknown) => {
   failed++;
   failures.push(`✗ pr-75 async test setup failed: ${err instanceof Error ? err.message : String(err)}`);
-}));
+});
 // ── PR-76: lokal_geocode MCP tool ────────────────────────────────────
 // Behavioural tests on the geocodingService (which the new MCP tool calls
 // directly) + source-grep tests confirming the tool wiring is in place in
@@ -11766,7 +11740,7 @@ const _pr75Promise = runSerial(() => (async () => {
 let _pr76Resolve: () => void = () => {};
 const _pr76Promise: Promise<void> = new Promise<void>(r => { _pr76Resolve = r; });
 
-runSerial(() => (async () => {
+(async () => {
   // Serialize against prior PR setup so schema & DB singletons are ready
   // in CI's scheduler. Without these awaits, m2 owner-portal tests can
   // race PR-76's DB-touching geocode calls and surface CI-only failures
@@ -11896,7 +11870,7 @@ runSerial(() => (async () => {
     failed++;
     failures.push(`✗ pr-76 async test setup failed: ${err instanceof Error ? err.message : String(err)}`);
     _pr76Resolve();
-  }));
+  });
 
 
 // ─── PR-78: Storby-bydeler in MAJOR_CITIES (Oppsal disambiguation fix) ──
@@ -11907,7 +11881,7 @@ runSerial(() => (async () => {
 console.log("\n── PR-78: Storby-bydeler (Oppsal disambiguation) ──");
 let _pr78Resolve: () => void = () => {};
 const _pr78Promise: Promise<void> = new Promise<void>(r => { _pr78Resolve = r; });
-runSerial(() => (async () => {
+(async () => {
   const { geocodingService } = require("../src/services/geocoding-service");
 
   async function expectHardcoded(name: string, expLat: number, expLng: number, label: string) {
@@ -12007,7 +11981,7 @@ runSerial(() => (async () => {
     failed++;
     failures.push(`✗ pr-78 async test setup failed: ${err instanceof Error ? err.message : String(err)}`);
     _pr78Resolve();
-  }));
+  });
 
 
 // ── orch-pr-86: provenance cleanup + read endpoints ──
@@ -12016,7 +11990,7 @@ console.log("── orch-pr-86: provenance cleanup + read endpoints ──");
 let _orchPr86Resolve: () => void = () => {};
 const _orchPr86Promise: Promise<void> = new Promise<void>(r => { _orchPr86Resolve = r; });
 
-runSerial(() => (async () => {
+(async () => {
   // Wait for ALL other concurrent IIFEs that mutate the module-singleton
   // DB (__setDbForTesting) — otherwise our seeded rows are invisible to
   // marketplace.ts handlers because some later IIFE swapped the DB out.
@@ -12367,7 +12341,7 @@ runSerial(() => (async () => {
     failed++;
     failures.push(`✗ orch-pr-86 async test setup failed: ${err instanceof Error ? err.message : String(err)}`);
     _orchPr86Resolve();
-  }));
+  });
 
 
 // ── orch-pr-87: pickBatchBiased + getSweepStatus ──
@@ -12570,7 +12544,7 @@ console.log("── orch-pr-93: GET /admin/agents ──");
 let _orchPr93Resolve: () => void = () => {};
 const _orchPr93Promise: Promise<void> = new Promise<void>(r => { _orchPr93Resolve = r; });
 
-runSerial(() => (async () => {
+(async () => {
   // Wait for earlier IIFEs that mutate the module-singleton DB so we don't
   // race against them swapping the DB out from under our seeds.
   try { await _orchPr86Promise; } catch { /* failures recorded upstream */ }
@@ -12782,7 +12756,7 @@ runSerial(() => (async () => {
     failed++;
     failures.push(`✗ orch-pr-93 async test setup failed: ${err instanceof Error ? err.message : String(err)}`);
     _orchPr93Resolve();
-  }));
+  });
 // ── orch-pr-92: daily auto-prune scheduled task ──
 console.log("── orch-pr-92: daily auto-prune scheduled task ──");
 {
@@ -12962,7 +12936,7 @@ console.log("\n── PR-95: Debio organic-cert verification ──");
 }
 
 // ─── Async block: end-to-end sync against in-memory DB + stub fetch ──
-runSerial(() => (async () => {
+(async () => {
   const Database = require("better-sqlite3");
   const initMod = require("../src/database/init");
   const { syncDebioVerifications, matchFinnokoCompany, canonicaliseDomain } =
@@ -13133,7 +13107,7 @@ runSerial(() => (async () => {
     failures.push(`✗ pr95 async block threw: ${err?.message || String(err)}`);
     _pr95Resolve();
   }
-));
+);
 
 
 // ── PR-99: openai-apps-challenge + read-only MCP annotations ─────────
@@ -14110,7 +14084,7 @@ const _orchPr18BulkLoadPromise: Promise<void> = new Promise<void>((r) => {
   _orchPr18BulkLoadResolve = r;
 });
 
-const __orchPr18BulkLoadThunk__ = async () => {
+(async () => {
   // Run after all prior DB-mutating IIFEs that touch the db-factory cache.
   try { await _orchPr20260614_6Promise; } catch { /* upstream */ }
   try { await _orchPr9PruneDeadUrlsPromise; } catch { /* upstream */ }
@@ -14380,7 +14354,7 @@ const __orchPr18BulkLoadThunk__ = async () => {
     else process.env.ADMIN_KEY = prevAdminKey18;
     _orchPr18BulkLoadResolve();
   }
-};
+})();
 
 // ── orchestrator-pr-19: opplevagent.no → Opplevagent (experiences) host-gate ──
 // Mirrors the pr113 dental discovery tests. Covers: host→vertical recognition
@@ -15064,7 +15038,7 @@ console.log("\n── PR-120: list enrichment_state filter + thin_site parking �
 console.log("\n── PR-110: MCP search geocode-enrichment ──");
 let _pr110Resolve: () => void = () => {};
 const _pr110Promise: Promise<void> = new Promise<void>((r) => { _pr110Resolve = r; });
-runSerial(async () => {
+(async () => {
   try {
     const { enrichParsedWithGeo } = require("../src/routes/mcp") as typeof import("../src/routes/mcp");
     const { marketplaceRegistry } = require("../src/services/marketplace-registry") as typeof import("../src/services/marketplace-registry");
@@ -15102,7 +15076,7 @@ runSerial(async () => {
   } finally {
     _pr110Resolve();
   }
-});
+})();
 
 // ── PR-103 (2026-06-03): backend dental geocoding worker ────────────
 //
@@ -15145,7 +15119,7 @@ console.log("\n── PR-103: backend dental geocoding worker ──");
 // ── (b) Async tests with mocked fetch + in-memory DB ────────────────
 let _pr103Resolve: () => void = () => {};
 const _pr103Promise: Promise<void> = new Promise<void>((r) => { _pr103Resolve = r; });
-runSerial(() => (async () => {
+(async () => {
   // Wait for earlier dental-DB-touching IIFEs to settle. The two
   // sibling PR-100 / PR-100b blocks above are synchronous, but the
   // m2 owner-portal async block can race against dental DB handle
@@ -15479,7 +15453,7 @@ runSerial(() => (async () => {
   failed++;
   failures.push(`pr103 IIFE crashed: ${err instanceof Error ? err.message : String(err)}`);
   _pr103Resolve();
-}));
+});
 
 // ── PR-106: dental admin rate-limit raise ──────────────────────
 // Daniel asked for the per-IP rate limit on `/api/tannlege/*` to be
@@ -15578,7 +15552,7 @@ console.log("\n── PR-106: dental admin rate-limit raise ──");
 // just the middleware in isolation.
 let _pr106Resolve: () => void = () => {};
 const _pr106Promise: Promise<void> = new Promise<void>((r) => { _pr106Resolve = r; });
-runSerial(async () => {
+(async () => {
   try {
     // Wait for any earlier IIFEs that pin the DB-singleton via
     // __setDbForTesting (m2 owner-portal, pr103 dental geocode) to
@@ -15640,7 +15614,7 @@ runSerial(async () => {
   } finally {
     _pr106Resolve();
   }
-});
+})();
 
 
 // ── PR-109: finn-tannlege.com SSR frontend + store extensions ─────────
@@ -15953,7 +15927,7 @@ console.log("\n── PR-125: bondensmarked slug guard + time correction ──"
   assertEq(after.c, before.c, "pr125: correction never inserts/deletes rows");
   if (prevDb) initMod.__setDbForTesting(prevDb);
 }
-const _pr125Promise = runSerial(async () => {
+const _pr125Promise = (async () => {
   const { parseBmLokallagDetailHtml } = require("../src/services/bondensmarked-source");
   const html = `<a href="/markeder/torvet-i-arendal-2026-07-04" class="card">
     <p class="text-base font-bold text-muted-foreground">10:00<!-- --> &#8211; <!-- -->15:00</p>
@@ -15965,7 +15939,7 @@ const _pr125Promise = runSerial(async () => {
   assertEq(day?.eventSlug, "torvet-i-arendal-2026-07-04", "pr125: parser captured full eventSlug from /markeder href");
   assertEq(day?.startTime, "10:00", "pr125: parser captured startTime 10:00");
   assertEq(day?.endTime, "15:00", "pr125: parser captured endTime 15:00");
-});
+})();
 
 
 // ─── orch-PR Phase 2: platform-verifier server-side port ──────────────────
@@ -15978,7 +15952,7 @@ console.log("── orch-PR Phase 2: platform-verifier (run-platform-verifier) �
 // ── orch-pr: finn-tannlege SEO — per-clinic SSR, Dentist JSON-LD, sitemap, robots ──
 // Boots the dental-seo router against an in-memory dental DB and asserts the
 // crawlable per-clinic page, sitemap, and robots.txt expose the right SEO surface.
-const _seoDentalPromise = runSerial(async () => {
+const _seoDentalPromise = (async () => {
   // Serialize after the owner-portal (M2) + integration tests so our fresh
   // module re-requires + db-factory reset cannot race their shared init DB
   // (same protocol as _m2Promise awaiting _intgPromise).
@@ -16229,9 +16203,9 @@ const _seoDentalPromise = runSerial(async () => {
   if (prevBase === undefined) delete process.env.DENTAL_BASE_URL;
   else process.env.DENTAL_BASE_URL = prevBase;
   dbFactorySeo.__resetDbFactoryForTesting();
-});
+})();
 
-const _platformVerifierPromise = runSerial(async () => {
+const _platformVerifierPromise = (async () => {
   const Database = require("better-sqlite3");
   const {
     runPlatformVerifier,
@@ -16628,12 +16602,12 @@ const _platformVerifierPromise = runSerial(async () => {
     if (prevAnalytics === undefined) delete process.env.ANALYTICS_ADMIN_KEY; else process.env.ANALYTICS_ADMIN_KEY = prevAnalytics;
     delete require.cache[routePath];
   }
-});
+})();
 
 
 // ── orch-pr-20260614-2: pickPendingVerifyBatch + verifier-sweep ──────────────
 console.log("\n── orch-pr-20260614-2: pickPendingVerifyBatch + verifier-sweep ──");
-const _orchPr20260614_2Promise = runSerial(async () => {
+const _orchPr20260614_2Promise = (async () => {
   const sqlite = require("better-sqlite3");
   const {
     pickPendingVerifyBatch,
@@ -16855,7 +16829,7 @@ const _orchPr20260614_2Promise = runSerial(async () => {
   assertEq(job4.errors, 3, `sweep-errors: errors=3 (got ${job4.errors})`);
   assertTrue(job4.lastError !== null, "sweep-errors: lastError is set");
   sweepDb4.close();
-});
+})();
 
 // ── REPORT ────────────────────────────────────────────────────────────
 
@@ -16870,7 +16844,7 @@ console.log("── orch-pr-20260614-3: outreach suppression gate ──");
 let _orchPr20260614Resolve: () => void = () => {};
 const _orchPr20260614Promise: Promise<void> = new Promise<void>(r => { _orchPr20260614Resolve = r; });
 
-runSerial(async () => {
+(async () => {
   // Wait for all prior DB-mutating IIFEs to finish
   try { await _orchPr86Promise; } catch { /* recorded upstream */ }
   try { await _orchPr93Promise; } catch { /* recorded upstream */ }
@@ -17500,7 +17474,7 @@ runSerial(async () => {
   else process.env.ADMIN_KEY = prevAdminKey;
 
   _orchPr20260614Resolve();
-});
+})();
 
 
 // ── orch-pr-20260614-5: Phase 0 product catalog ──────────────────────────────
@@ -17509,7 +17483,7 @@ console.log("\n── orch-pr-20260614-5: Phase 0 product catalog ──");
 let _orchPr20260614_5Resolve: () => void = () => {};
 const _orchPr20260614_5Promise: Promise<void> = new Promise<void>(r => { _orchPr20260614_5Resolve = r; });
 
-runSerial(async () => {
+(async () => {
   // Wait for prior DB-mutating IIFEs to finish before taking the DB singleton
   try { await _orchPr86Promise; } catch { /* recorded upstream */ }
   try { await _orchPr93Promise; } catch { /* recorded upstream */ }
@@ -17768,7 +17742,7 @@ runSerial(async () => {
   else process.env.ADMIN_KEY = prevAdminKey5;
 
   _orchPr20260614_5Resolve();
-});
+})();
 
 
 
@@ -17783,7 +17757,7 @@ console.log("\n── orch-pr-20260614-6: Phase 1 cart MVP ──");
 let _orchPr20260614_6Resolve: () => void = () => {};
 const _orchPr20260614_6Promise: Promise<void> = new Promise<void>(r => { _orchPr20260614_6Resolve = r; });
 
-runSerial(async () => {
+(async () => {
   // Wait for Phase 0 to finish so we know __setDbForTesting works
   try { await _orchPr20260614_5Promise; } catch { /* recorded upstream */ }
 
@@ -18244,7 +18218,7 @@ runSerial(async () => {
   else process.env.ADMIN_KEY = prevAdminKey6;
 
   _orchPr20260614_6Resolve();
-});
+})();
 
 // ── orch-pr-14: MCP discovery tools surface catalog product_id ──────────────
 // The MCP cart flow was unusable for a pure-MCP agent: lokal_cart_add_item
@@ -18254,7 +18228,7 @@ runSerial(async () => {
 // name_norm the catalog backfill writes.
 console.log("\n── orch-pr-14: MCP discovery product_id surfacing ──");
 
-runSerial(async () => {
+(async () => {
   // Order after cart MVP for readability; this section is fully DB-isolated
   // (handles injected directly) so it cannot race other sections' DB pins.
   try { await _orchPr20260614_6Promise; } catch { /* recorded upstream */ }
@@ -18362,14 +18336,10 @@ runSerial(async () => {
     // here, which would clobber any concurrently-running section's pinned DB.
     _orchPr14ProductIdResolve();
   }
-});
+})();
 
 
 (async () => {
-  // Wait for every serialized DB-touching link to settle before reporting.
-  // setImmediate ensures all runSerial(...) registrations above have run.
-  await new Promise(r => setImmediate(r));
-  try { await _serialChain; } catch { /* link errors already pushed to failures */ }
   try { await Promise.all(_pr21Promises); } catch { /* errors already pushed to failures */ }
   try { await _m2Promise; } catch { /* errors already pushed to failures */ }
   try { await _pr24Promise; } catch { /* errors already pushed to failures */ }
@@ -19344,7 +19314,7 @@ const _orchPr9PruneDeadUrlsPromise: Promise<void> = new Promise<void>(r => {
   _orchPr9PruneDeadUrlsResolve = r;
 });
 
-runSerial(async () => {
+(async () => {
   // Wait for all prior DB-mutating IIFEs to complete
   try { await _orchPr20260614_6Promise; } catch { /* upstream */ }
 
@@ -19539,11 +19509,7 @@ runSerial(async () => {
   } finally {
     _orchPr9PruneDeadUrlsResolve();
   }
-});
-
-// orch-pr-18 bulk-load: registered here (out of source order) because it awaits
-// the prune-dead-urls block above — keeps the serial chain dependency-correct.
-runSerial(__orchPr18BulkLoadThunk__);
+})();
 
 
 // ── orch-pr-21: sent-log actor/channel resolution from composed action ───────
@@ -19563,7 +19529,7 @@ const _orchPr21SentLogActorPromise: Promise<void> = new Promise<void>(r => {
   _orchPr21SentLogActorResolve = r;
 });
 
-runSerial(() => _orchPr20BmEventsPromise.then(async () => {
+_orchPr20BmEventsPromise.then(async () => {
   try {
     const Database = require("better-sqlite3");
     const { __setDbForTesting, __initSchemaForTesting, getDb } = require("../src/database/init");
@@ -19715,4 +19681,4 @@ runSerial(() => _orchPr20BmEventsPromise.then(async () => {
   } finally {
     _orchPr21SentLogActorResolve();
   }
-}));
+});
