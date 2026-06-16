@@ -121,35 +121,6 @@ export function hasInferenceOnlyFactualField(
   return false;
 }
 
-// ── PR-B: content-coherence conflict suppression ─────────────────────────────
-//
-// True iff the verifier recorded a content-coherence CONFLICT — i.e. the
-// producer's stored content (about/products/categories/description) distinctively
-// contradicts its OWN homepage. Reads PR-B's `content_coherence.verdict` out of
-// the agent_knowledge.verification_review_reason TEXT column (the persisted
-// cross_source_reason JSON, written by the verifier). Mirrors
-// hasInferenceOnlyFactualField: robust to the column being absent ('{}' / null /
-// malformed) — returns false in every such case (NO suppression).
-//
-// IMPORTANT: only verdict === "conflict" suppresses. "no_homepage_signal" is an
-// advisory verdict and is NEVER a suppression reason here (a producer with good
-// content but no readable homepage signal must still reach the pool).
-export function hasContentConflict(
-  verificationReviewReasonJson: string | null | undefined,
-): boolean {
-  if (!verificationReviewReasonJson) return false;
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(verificationReviewReasonJson);
-  } catch {
-    return false;
-  }
-  if (!parsed || typeof parsed !== "object") return false;
-  const cc = (parsed as Record<string, unknown>).content_coherence;
-  if (!cc || typeof cc !== "object") return false;
-  return (cc as Record<string, unknown>).verdict === "conflict";
-}
-
 // ── GET /admin/outreach-candidates ───────────────────────────────────────────
 //
 // Query params:
@@ -323,7 +294,6 @@ router.get("/", (req: Request, res: Response) => {
     // orch-pr-17 data-quality counters
     let websiteUnverifiedCount = 0;
     let inferenceOnlyCount = 0;
-    let contentConflictCount = 0;
 
     for (const row of rows) {
       let isContactedOrCooldown = false;
@@ -367,10 +337,6 @@ router.get("/", (req: Request, res: Response) => {
       // Read-only on PR-16's verification_review_reason.inference_only_fields;
       // absent/malformed → false. Free-mail is NEVER a reason here.
       const suppressedForInferenceOnly = hasInferenceOnlyFactualField(row.verification_review_reason);
-      // ── PR-B: content-coherence conflict (profile contradicts homepage) ─────
-      // Read-only on the verifier's verification_review_reason.content_coherence;
-      // absent/malformed → false. no_homepage_signal is NOT a suppression reason.
-      const suppressedForContentConflict = hasContentConflict(row.verification_review_reason);
 
       if (suppressedForContacted) contactedOrCooldownCount++;
       if (suppressedForReplied) repliedCount++;
@@ -380,7 +346,6 @@ router.get("/", (req: Request, res: Response) => {
       if (suppressedForBlocklist) blocklistedCount++;
       if (suppressedForWebsiteUnverified) websiteUnverifiedCount++;
       if (suppressedForInferenceOnly) inferenceOnlyCount++;
-      if (suppressedForContentConflict) contentConflictCount++;
 
       if (
         !suppressedForContacted &&
@@ -390,8 +355,7 @@ router.get("/", (req: Request, res: Response) => {
         !suppressedForBounce &&
         !suppressedForBlocklist &&
         !suppressedForWebsiteUnverified &&
-        !suppressedForInferenceOnly &&
-        !suppressedForContentConflict
+        !suppressedForInferenceOnly
       ) {
         candidates.push({
           agent_id: row.agent_id,
@@ -420,9 +384,6 @@ router.get("/", (req: Request, res: Response) => {
         // orch-pr-17: new data-quality suppression reasons
         website_unverified: websiteUnverifiedCount,
         inference_only: inferenceOnlyCount,
-        // PR-B: profile content distinctively conflicts with the producer's
-        // homepage (no_homepage_signal is NOT counted/suppressed here).
-        content_conflict: contentConflictCount,
       },
     });
   } catch (err: any) {
