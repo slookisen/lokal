@@ -88,7 +88,7 @@
 
 import { Router, Request, Response } from "express";
 import { getDb } from "../database/init";
-import { isKnownDirectoryHost } from "../services/cross-source-validator";
+import { isDirectoryOrAggregatorHost } from "../services/cross-source-validator";
 // PR-24a: homepage CONTENT extractors (PR-22) + write helpers (PURE).
 import {
   isSafeFetchUrl,
@@ -834,7 +834,15 @@ export default router;
 //
 // Params:
 //   ?apply=1  or  body { apply: true }  — write to DB; default = dry-run.
-//   ?limit=N                            — cap rows scanned.
+//   ?limit=N                            — cap rows scanned (omit = whole table).
+//   ?offset=N                           — DRY-RUN ONLY: skip N rows (deterministic
+//                                         ORDER BY agent_id) to inspect the whole
+//                                         table past the first batch (orch-pr-27).
+//                                         REJECTED (400) together with apply: on
+//                                         apply, NULLed rows leave the candidate
+//                                         set, so offset would skip survivors. To
+//                                         apply across the whole table, loop
+//                                         ?apply=1&limit=500 until pruned=0.
 //
 // Returns:
 //   { success, dry_run, scanned, would_prune: { placeholder, aggregator, total },
@@ -851,9 +859,12 @@ const PLACEHOLDER_PATTERNS: ReadonlyArray<RegExp> = [
   /^-+$/,
 ];
 
-// Return the registrable domain (last two labels, with www stripped) for a
-// parsed URL host, or null if it cannot be determined.
-function registrableHostForUrl(raw: string): string | null {
+// Return the full lowercased host (www stripped, e.g. "lokalmat.coop.no") for a
+// parsed URL, or null if it cannot be determined. orch-pr-27: we now classify
+// against the FULL host (not just the eTLD+1) so multi-label aggregator hosts
+// like lokalmat.coop.no / oslo.kommune.no are caught by
+// isDirectoryOrAggregatorHost (which suffix-walks + matches host families).
+function parsedHostForUrl(raw: string): string | null {
   let parsed: URL;
   try {
     // Ensure scheme is present so URL() can parse it.
@@ -866,8 +877,7 @@ function registrableHostForUrl(raw: string): string | null {
   if (!host) return null;
   const labels = host.split(".").filter(Boolean);
   if (labels.length < 2) return null;
-  // Simple eTLD+1: last two labels (sufficient for .no, .com, .net, etc.)
-  return labels.slice(-2).join(".");
+  return host;
 }
 
 type PruneReason = "placeholder" | "aggregator";
@@ -887,15 +897,15 @@ function classifyWebsite(website: string): PruneReason | null {
     if (pat.test(trimmed)) return "placeholder";
   }
 
-  // Try to parse as a URL and get registrable host
-  const host = registrableHostForUrl(trimmed);
+  // Parse as a URL and get the FULL host (e.g. "lokalmat.coop.no").
+  const host = parsedHostForUrl(trimmed);
   if (!host) {
     // Cannot be parsed as a URL with a host → treat as placeholder
     return "placeholder";
   }
 
-  // Check directory/aggregator host
-  if (isKnownDirectoryHost(host)) return "aggregator";
+  // Directory / aggregator / municipal / placeholder host (broadened matcher).
+  if (isDirectoryOrAggregatorHost(host)) return "aggregator";
 
   // Real-looking domain — keep it
   return null;
@@ -918,6 +928,21 @@ pruneUrlsRouter.post("/prune-dead-urls", (req: Request, res: Response) => {
   const apply = applyFromQuery || applyFromBody;
   const dryRun = !apply;
 
+  // orch-pr-27: offset is a DRY-RUN inspection aid only. On apply, pruned rows
+  // drop out of the WHERE filter, so a non-zero offset would skip surviving
+  // candidates (silent under-prune). Reject the combination explicitly; callers
+  // page an apply by looping ?apply=1&limit=N until pruned=0.
+  const offsetRaw = req.query["offset"];
+  const offsetRequested =
+    offsetRaw !== undefined && !isNaN(Number(offsetRaw)) && Number(offsetRaw) > 0;
+  if (apply && offsetRequested) {
+    res.status(400).json({
+      success: false,
+      error: "offset is not allowed with apply=1; loop ?apply=1&limit=N until pruned=0",
+    });
+    return;
+  }
+
   // Optional row limit
   const limitParam = req.query["limit"];
   const limit =
@@ -925,15 +950,29 @@ pruneUrlsRouter.post("/prune-dead-urls", (req: Request, res: Response) => {
       ? Number(limitParam)
       : null;
 
-  // Fetch all non-empty websites
-  const query = limit !== null
-    ? "SELECT ak.agent_id, ak.website FROM agent_knowledge ak WHERE ak.website IS NOT NULL AND trim(ak.website) != '' LIMIT ?"
-    : "SELECT ak.agent_id, ak.website FROM agent_knowledge ak WHERE ak.website IS NOT NULL AND trim(ak.website) != ''";
+  // Deterministic paging offset (validated above; 0 unless a positive dry-run offset).
+  const offset = offsetRequested ? Math.floor(Number(offsetRaw)) : 0;
 
-  const rows = (limit !== null
-    ? db.prepare(query).all(limit)
-    : db.prepare(query).all()
-  ) as { agent_id: string; website: string }[];
+  // Fetch non-empty websites, deterministically ordered so limit/offset paging
+  // is stable across calls. SQLite needs a LIMIT before OFFSET, so when no limit
+  // is given but an offset is, we pass LIMIT -1 (= unbounded) OFFSET N.
+  const base =
+    "SELECT ak.agent_id, ak.website FROM agent_knowledge ak " +
+    "WHERE ak.website IS NOT NULL AND trim(ak.website) != '' ORDER BY ak.agent_id";
+  let rows: { agent_id: string; website: string }[];
+  if (limit !== null) {
+    rows = db.prepare(base + " LIMIT ? OFFSET ?").all(limit, offset) as {
+      agent_id: string;
+      website: string;
+    }[];
+  } else if (offset > 0) {
+    rows = db.prepare(base + " LIMIT -1 OFFSET ?").all(offset) as {
+      agent_id: string;
+      website: string;
+    }[];
+  } else {
+    rows = db.prepare(base).all() as { agent_id: string; website: string }[];
+  }
 
   const scanned = rows.length;
   let placeholder = 0;
@@ -961,6 +1000,8 @@ pruneUrlsRouter.post("/prune-dead-urls", (req: Request, res: Response) => {
       success: true,
       dry_run: true,
       scanned,
+      limit,
+      offset,
       would_prune: { placeholder, aggregator, total },
       sample,
     });
@@ -991,6 +1032,8 @@ pruneUrlsRouter.post("/prune-dead-urls", (req: Request, res: Response) => {
     success: true,
     dry_run: false,
     scanned,
+    limit,
+    offset,
     would_prune: { placeholder, aggregator, total },
     sample,
     pruned,

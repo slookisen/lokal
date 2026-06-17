@@ -623,10 +623,60 @@ export const KNOWN_DIRECTORY_HOSTS: ReadonlySet<string> = new Set([
   "visit.kongsvingerregionen.no",
   "visitsorlandet.com",
   "xn--visitjren-l3a.com",
+  // Extended orch-pr-27 (2026-06-17, controller-handoff lokal-agent-enrichment-1):
+  // confirmed dead-URL/aggregator misses that kept tripping http_unreachable_per_run
+  // (28d mean 49 vs guardrail 25). matfra.no is a defunct local-food directory whose
+  // listing pages were being stored as producer "websites".
+  "matfra.no",
 ]);
 
 export function isKnownDirectoryHost(host: string): boolean {
   return KNOWN_DIRECTORY_HOSTS.has(host);
+}
+
+// ─── orch-pr-27 (2026-06-17): broadened aggregator/directory matcher ──────────
+// Host *families* where EVERY subdomain is an aggregator/municipal/placeholder
+// host and therefore never a producer's own website. Used ONLY by the
+// dead-URL prune classifier (admin-knowledge.ts) — NOT by isKnownDirectoryHost
+// above, so the verifier's domain-coherence bypass is left byte-unchanged
+// (this change cannot alter producer promotion, only what /admin/prune-dead-urls
+// nulls). Kept deliberately small + unambiguous to keep wrong_contact_rate ~0.
+const AGGREGATOR_FAMILY_SUFFIXES: ReadonlyArray<string> = [
+  "kommune.no",        // *.kommune.no — municipal sites (oslo.kommune.no, …)
+  "fylkeskommune.no",  // county sites
+  "business.site",     // Google "business.site" page-builder placeholders
+];
+
+// True when `host` is a directory/aggregator/municipal/placeholder host and so
+// must never be stored as a producer's own website. Unlike isKnownDirectoryHost
+// (exact-match only), this:
+//   (1) suffix-walks the host so multi-label entries already in
+//       KNOWN_DIRECTORY_HOSTS match (e.g. lokalmat.coop.no, whose eTLD+1
+//       "coop.no" is NOT in the set but whose full host IS);
+//   (2) matches the explicit family suffixes above (any subdomain).
+//   Tourism-board hosts are NOT pattern-matched (false-positive risk on an
+//   irreversible NULL): the real ones are explicit entries in the set above,
+//   and new ones are added there as enrichment surfaces them.
+// Input may be a bare host ("lokalmat.coop.no") — caller passes the parsed host.
+export function isDirectoryOrAggregatorHost(host: string): boolean {
+  if (!host) return false;
+  const h = host.toLowerCase().replace(/^www\./, "").replace(/\.$/, "");
+  if (!h) return false;
+  const labels = h.split(".").filter(Boolean);
+  if (labels.length < 2) return false;
+
+  // (1) suffix-walk: full host down to the eTLD+1 (each suffix has >= 2 labels)
+  for (let i = 0; i + 2 <= labels.length; i++) {
+    if (KNOWN_DIRECTORY_HOSTS.has(labels.slice(i).join("."))) return true;
+  }
+
+  // (2) family suffixes
+  for (const fam of AGGREGATOR_FAMILY_SUFFIXES) {
+    if (h === fam || h.endsWith("." + fam)) return true;
+  }
+
+
+  return false;
 }
 
 // Multi-label public suffixes — kept tiny on purpose. For .co.uk / .com.au

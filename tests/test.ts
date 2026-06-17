@@ -19333,6 +19333,61 @@ console.log("\n── orch-PR-20260614-7: isAcceptableHomepageEmail ──");
 }
 
 
+// ── orch-pr-27: broadened dead-URL/aggregator host matcher ───────────────────
+// Pure-function coverage for isDirectoryOrAggregatorHost (cross-source-validator),
+// the matcher /admin/prune-dead-urls now classifies against. Proves the
+// controller-handoff misses are caught WITHOUT nulling real producer domains.
+// Synchronous + no DB → race-free.
+console.log("\n── orch-pr-27: isDirectoryOrAggregatorHost matcher ──");
+{
+  const { isDirectoryOrAggregatorHost } =
+    require("../src/services/cross-source-validator") as typeof import("../src/services/cross-source-validator");
+
+  // POSITIVE — previously-missed aggregator / municipal / placeholder hosts
+  assertEq(isDirectoryOrAggregatorHost("lokalmat.coop.no"), true,
+    "pr27: lokalmat.coop.no (multi-label set entry, eTLD+1 coop.no not in set) → aggregator");
+  assertEq(isDirectoryOrAggregatorHost("oslo.kommune.no"), true,
+    "pr27: oslo.kommune.no → aggregator (kommune.no family)");
+  assertEq(isDirectoryOrAggregatorHost("vestland.fylkeskommune.no"), true,
+    "pr27: *.fylkeskommune.no → aggregator");
+  assertEq(isDirectoryOrAggregatorHost("mittutsalg.business.site"), true,
+    "pr27: *.business.site placeholder → aggregator");
+  assertEq(isDirectoryOrAggregatorHost("matfra.no"), true,
+    "pr27: matfra.no (newly added to set) → aggregator");
+  assertEq(isDirectoryOrAggregatorHost("visit.kongsvingerregionen.no"), true,
+    "pr27: visit.kongsvingerregionen.no (multi-label set entry; eTLD+1 not in set) → aggregator (proves suffix-walk)");
+  assertEq(isDirectoryOrAggregatorHost("baerum.kommune.no"), true,
+    "pr27: arbitrary <x>.kommune.no NOT in set → aggregator (proves family match)");
+  assertEq(isDirectoryOrAggregatorHost("yelp.com"), true,
+    "pr27: yelp.com (already in set, still matched) → aggregator");
+
+  // NEGATIVE — real producer domains MUST be kept (never nulled)
+  assertEq(isDirectoryOrAggregatorHost("gard.no"), false,
+    "pr27: gard.no (real producer) → kept");
+  assertEq(isDirectoryOrAggregatorHost("dirdalstraen.no"), false,
+    "pr27: dirdalstraen.no (real producer) → kept");
+  assertEq(isDirectoryOrAggregatorHost("ranasgard.no"), false,
+    "pr27: ranasgard.no (real producer) → kept");
+  assertEq(isDirectoryOrAggregatorHost("grettegaard.no"), false,
+    "pr27: grettegaard.no (real producer) → kept");
+  assertEq(isDirectoryOrAggregatorHost("kilnesgard.no"), false,
+    "pr27: kilnesgard.no (real producer) → kept");
+  // a real producer that merely CONTAINS 'coop' as a brand token, not *.coop.no
+  assertEq(isDirectoryOrAggregatorHost("coopgarden.no"), false,
+    "pr27: coopgarden.no (brand token, not coop.no family) → kept");
+  // visit* is NOT pattern-matched (false-positive risk): a producer domain that
+  // merely starts with "visit" and is not an allow-listed board MUST be kept.
+  assertEq(isDirectoryOrAggregatorHost("visitgarden.no"), false,
+    "pr27: visitgarden.no (not in set; visit* regex removed) → kept");
+  // a real producer on a .coop.no-looking but distinct domain is kept (coop.no
+  // family removed; only the exact set entry lokalmat.coop.no is an aggregator)
+  assertEq(isDirectoryOrAggregatorHost("lokalmat.coop.no"), true,
+    "pr27: lokalmat.coop.no still caught via the exact set entry (suffix-walk), not a coop.no family");
+  // guards
+  assertEq(isDirectoryOrAggregatorHost(""), false, "pr27: empty host → false");
+  assertEq(isDirectoryOrAggregatorHost("localhost"), false, "pr27: single-label host → false");
+}
+
 // ── orch-pr-9: prune-dead-urls endpoint ──────────────────────────────────────
 console.log("\n── orch-pr-9: POST /admin/prune-dead-urls ──");
 
@@ -19526,6 +19581,22 @@ const _orchPr9PruneDeadUrlsPromise: Promise<void> = new Promise<void>(r => {
       assertEq(b.dry_run, false, "prune-8: body apply:true → dry_run=false");
       assertTrue((b.pruned as number) >= 1, "prune-8: body apply pruned >= 1");
       assertEq(getWebsite("prune-body-test"), null, "prune-8: N/A website nulled via body apply");
+    }
+
+    // ── prune-9 (orch-pr-27): offset together with apply → 400 ───────────────
+    {
+      const r = await pruneReq("POST", "/admin/prune-dead-urls?apply=1&offset=10", undefined, PRUNE_KEY);
+      assertEq(r.status, 400, "prune-9: apply + offset → 400");
+      const b = r.body as Record<string, unknown>;
+      assertEq(b.success, false, "prune-9: success=false on rejected offset+apply");
+    }
+
+    // ── prune-10 (orch-pr-27): offset on dry-run is accepted ─────────────────
+    {
+      const r = await pruneReq("POST", "/admin/prune-dead-urls?offset=0", undefined, PRUNE_KEY);
+      assertEq(r.status, 200, "prune-10: dry-run with offset=0 → 200");
+      const b = r.body as Record<string, unknown>;
+      assertEq(b.offset, 0, "prune-10: response echoes offset=0");
     }
 
     process.env.ADMIN_KEY = prevKey2;
