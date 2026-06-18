@@ -931,7 +931,7 @@ router.get("/", (req: Request, res: Response) => {
         </div>
         <div class="hero-chips">
           <a href="${localizedPath("/sok", lang)}?q=${encodeURIComponent(lang === "en" ? "vegetables oslo" : "gr\u00f8nnsaker oslo")}" class="chip">\u{1F955} ${escapeHtml(t(lang, "home.chip_vegetables_oslo"))}</a>
-          <a href="${localizedPath("/sok", lang)}?q=${encodeURIComponent(lang === "en" ? "honey bergen" : "honning bergen")}" class="chip">\u{1F36F} ${escapeHtml(t(lang, "home.chip_honey_bergen"))}</a>
+          <a href="${localizedPath("/sok", lang)}?q=${encodeURIComponent(lang === "en" ? "honey oslo" : "honning oslo")}" class="chip">\u{1F36F} ${escapeHtml(t(lang, "home.chip_honey_bergen"))}</a>
           <a href="${localizedPath("/sok", lang)}?q=${encodeURIComponent(lang === "en" ? "organic meat" : "\u00f8kologisk kj\u00f8tt")}" class="chip">\u{1F969} ${escapeHtml(t(lang, "home.chip_organic_meat"))}</a>
           <a href="${localizedPath("/sok", lang)}?q=${encodeURIComponent(lang === "en" ? "farm shop" : "g\u00e5rdsbutikk")}" class="chip">\u{1F33F} ${escapeHtml(t(lang, "home.chip_farm_shops"))}</a>
         </div>
@@ -1074,7 +1074,7 @@ router.get("/sok", async (req: Request, res: Response) => {
     const parsed = marketplaceRegistry.parseNaturalQuery(q);
     const heleNorge = req.query.heleNorge === "true";
 
-    // Geocode location from query text (e.g. "honning bergen" → Bergen coords)
+    // Geocode location from query text (e.g. "honning oslo" → Oslo coords)
     if (!heleNorge && !parsed.location) {
       const frontendLat = parseFloat(req.query.lat as string);
       const frontendLng = parseFloat(req.query.lng as string);
