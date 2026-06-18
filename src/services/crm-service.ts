@@ -709,49 +709,88 @@ class CrmService {
         c.email           AS contact_email,
         c.name            AS contact_name,
         c.organization    AS contact_organization,
-        (
-          -- Resolve actor from the action that actually exists for this message.
+        COALESCE(
+          -- (1) Primary: the per-message action that carries this exact id.
           -- The compose route logs type='sent' with internalMessageId; back-compat
           -- callers that skip the route log type='composed' with messageId only.
           -- Prefer 'sent' when both exist (ORDER BY CASE ensures it ranks first).
-          SELECT a.actor
-          FROM crm_actions a
-          WHERE a.thread_id = m.thread_id
-            AND a.type IN ('sent', 'composed')
-            AND (
-              json_extract(a.payload, '$.internalMessageId') = m.id
-              OR json_extract(a.payload, '$.messageId') = m.id
-            )
-          ORDER BY
-            CASE a.type WHEN 'sent' THEN 0 ELSE 1 END ASC,
-            a.created_at DESC
-          LIMIT 1
-        ) AS sent_actor,
-        (
-          -- Channel: prefer action payload's $.channel (set by sent-path).
-          -- For compose-origin messages (thread_id starts with 'compose-') that
-          -- reached delivery_status='sent' but have no channel in the action,
-          -- fall back to 'resend_smtp' — these go out exclusively via Resend.
-          SELECT COALESCE(
-            json_extract(a.payload, '$.channel'),
-            CASE
-              WHEN m.delivery_status = 'sent'
-                AND m.thread_id LIKE 'compose-%'
-              THEN 'resend_smtp'
-              ELSE NULL
-            END
+          (
+            SELECT a.actor
+            FROM crm_actions a
+            WHERE a.thread_id = m.thread_id
+              AND a.type IN ('sent', 'composed')
+              AND (
+                json_extract(a.payload, '$.internalMessageId') = m.id
+                OR json_extract(a.payload, '$.messageId') = m.id
+              )
+            ORDER BY
+              CASE a.type WHEN 'sent' THEN 0 ELSE 1 END ASC,
+              a.created_at DESC
+            LIMIT 1
+          ),
+          -- (2) PR-B3 fix: rows ingested from Gmail by ingestThread() are keyed by
+          -- the Gmail messageId, so no 'sent'/'composed' action's payload id ever
+          -- equals m.id (the route logs the EXTERNAL Resend id, never the Gmail id).
+          -- These dominate the sent-log, which is why actor was null platform-wide
+          -- and PR-21-v2's compose-only repair never reached them. Bridge via the
+          -- outbox, which records the authoritative actor (created_by) at send time.
+          -- (2a) Precise: an outbox row whose result_id == this message id.
+          (
+            SELECT o.created_by FROM crm_outbox o
+            WHERE o.thread_id = m.thread_id AND o.result_id = m.id
+              AND o.created_by IS NOT NULL
+            ORDER BY o.processed_at DESC LIMIT 1
+          ),
+          -- (2b) Thread-level: most recent completed outbox send on this thread.
+          -- Outbound on a CRM thread is single-identity (kontakt@), and created_by
+          -- distinguishes claude vs daniel, so thread-level attribution is sound
+          -- when no precise id match exists.
+          (
+            SELECT o.created_by FROM crm_outbox o
+            WHERE o.thread_id = m.thread_id AND o.status = 'completed'
+              AND o.created_by IS NOT NULL
+            ORDER BY o.processed_at DESC, o.created_at DESC LIMIT 1
           )
-          FROM crm_actions a
-          WHERE a.thread_id = m.thread_id
-            AND a.type IN ('sent', 'composed')
-            AND (
-              json_extract(a.payload, '$.internalMessageId') = m.id
-              OR json_extract(a.payload, '$.messageId') = m.id
-            )
-          ORDER BY
-            CASE a.type WHEN 'sent' THEN 0 ELSE 1 END ASC,
-            a.created_at DESC
-          LIMIT 1
+        ) AS sent_actor,
+        COALESCE(
+          -- Channel: prefer action payload's $.channel (set by sent-path).
+          (
+            SELECT json_extract(a.payload, '$.channel')
+            FROM crm_actions a
+            WHERE a.thread_id = m.thread_id
+              AND a.type IN ('sent', 'composed')
+              AND (
+                json_extract(a.payload, '$.internalMessageId') = m.id
+                OR json_extract(a.payload, '$.messageId') = m.id
+              )
+            ORDER BY
+              CASE a.type WHEN 'sent' THEN 0 ELSE 1 END ASC,
+              a.created_at DESC
+            LIMIT 1
+          ),
+          -- PR-B3: derive channel from the bridging outbox row (see actor above).
+          -- resend_send -> resend_smtp, gmail_draft -> gmail.
+          (
+            SELECT CASE o.intent WHEN 'resend_send' THEN 'resend_smtp' WHEN 'gmail_draft' THEN 'gmail' END
+            FROM crm_outbox o
+            WHERE o.thread_id = m.thread_id AND o.result_id = m.id
+            ORDER BY o.processed_at DESC LIMIT 1
+          ),
+          (
+            SELECT CASE o.intent WHEN 'resend_send' THEN 'resend_smtp' WHEN 'gmail_draft' THEN 'gmail' END
+            FROM crm_outbox o
+            WHERE o.thread_id = m.thread_id AND o.status = 'completed'
+            ORDER BY o.processed_at DESC, o.created_at DESC LIMIT 1
+          ),
+          -- For compose-origin messages (thread_id starts with 'compose-') that
+          -- reached delivery_status='sent' but have no channel anywhere,
+          -- fall back to 'resend_smtp' — these go out exclusively via Resend.
+          CASE
+            WHEN m.delivery_status = 'sent'
+              AND m.thread_id LIKE 'compose-%'
+            THEN 'resend_smtp'
+            ELSE NULL
+          END
         ) AS sent_channel
       FROM crm_messages m
       JOIN crm_threads t ON t.id = m.thread_id
