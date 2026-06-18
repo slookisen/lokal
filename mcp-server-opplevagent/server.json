@@ -1,0 +1,34 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.slookisen/opplevagent-mcp",
+  "description": "Norwegian experiences marketplace MCP: curated activities with county, category, weather, season, and group-size filters.",
+  "repository": {
+    "url": "https://github.com/slookisen/lokal",
+    "source": "github",
+    "subfolder": "mcp-server-opplevagent"
+  },
+  "version": "0.1.0",
+  "packages": [
+    {
+      "registryType": "npm",
+      "identifier": "opplevagent-mcp",
+      "version": "0.1.0",
+      "transport": {
+        "type": "stdio"
+      },
+      "environmentVariables": [
+        {
+          "name": "OPPLEVAGENT_URL",
+          "description": "Override API base URL (default: https://opplevagent.no)",
+          "required": false
+        }
+      ]
+    }
+  ],
+  "remotes": [
+    {
+      "type": "streamable-http",
+      "url": "https://opplevagent.no/mcp"
+    }
+  ]
+}
