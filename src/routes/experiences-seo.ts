@@ -458,6 +458,7 @@ ${ldScripts}
             <p>Opplevagent eksponerer åpne, maskinlesbare flater etter A2A-protokollen. Agenter kan oppdage tilbudet, lese kontrakten og kjøre intent-søk &mdash; uten skraping.</p>
             <ul class="endpoints" aria-label="Endepunkter for agenter">
               <li><a href="/.well-known/agent-card.json"><svg viewBox="0 0 24 24" width="15" height="15" aria-hidden="true"><rect x="4" y="3" width="16" height="18" rx="2" fill="none" stroke="currentColor" stroke-width="2"/><path d="M8 8 H16 M8 12 H16 M8 16 H13" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg> Agent Card</a></li>
+              <li><a href="/mcp"><svg viewBox="0 0 24 24" width="15" height="15" aria-hidden="true"><circle cx="12" cy="12" r="9" fill="none" stroke="currentColor" stroke-width="2"/><path d="M8 12 H16 M12 8 V16" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg> MCP</a></li>
               <li><a href="/openapi.json"><svg viewBox="0 0 24 24" width="15" height="15" aria-hidden="true"><circle cx="12" cy="12" r="9" fill="none" stroke="currentColor" stroke-width="2"/><path d="M3 12 H21 M12 3 C15 6 15 18 12 21 C9 18 9 6 12 3" fill="none" stroke="currentColor" stroke-width="2"/></svg> OpenAPI 3.1</a></li>
               <li><a href="/llms.txt"><svg viewBox="0 0 24 24" width="15" height="15" aria-hidden="true"><path d="M6 3 H14 L19 8 V21 H6 Z" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"/><path d="M14 3 V8 H19" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"/></svg> llms.txt</a></li>
               <li><a href="/.well-known/agents.txt"><svg viewBox="0 0 24 24" width="15" height="15" aria-hidden="true"><circle cx="9" cy="8" r="3.2" fill="none" stroke="currentColor" stroke-width="2"/><path d="M3.5 20 C3.5 16 6 14 9 14 C12 14 14.5 16 14.5 20 M16 12 L18 14 L22 9" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg> agents.txt</a></li>
@@ -501,6 +502,7 @@ ${ldScripts}
       <h4>For agenter</h4>
       <a href="/llms.txt"><code>llms.txt</code></a>
       <a href="/.well-known/agent-card.json"><code>agent-card.json</code></a>
+      <a href="/mcp"><code>/mcp</code> (MCP)</a>
       <a href="/openapi.json"><code>openapi.json</code></a>
       <a href="/api/opplevelser/discover"><code>/api/opplevelser</code></a>
     </div>
@@ -635,6 +637,21 @@ Opplevagent er en A2A-markedsplass for norske opplevelser og aktiviteter,
 bygget for å bli oppdaget og spurt av AI-agenter. Tjenesten lar agenter finne
 turer, kurs og opplevelser filtrert på fylke, kommune, kategori, vær, sesong,
 gruppestørrelse, alder, pris, varighet og språk.
+
+## MCP (Model Context Protocol) — Streamable HTTP
+
+MCP-endepunkt (Streamable HTTP):  ${url}/mcp
+Koble til: lim inn https://opplevagent.no/mcp i Claude Desktop / ChatGPT som MCP-URL.
+
+Tilgjengelige MCP-verktøy:
+- discover_experiences         — finn opplevelser etter fylke, kategori, vær, sesong, pris m.m.
+- list_experience_categories   — hent alle kategorier med antall verifiserte opplevelser
+- get_experience               — hent fullstendig detalj for én opplevelse via UUID
+
+Eksempel (tools/call — discover):
+  curl -X POST ${url}/mcp \\
+    -H "Content-Type: application/json" \\
+    -d '{"jsonrpc":"2.0","method":"tools/call","params":{"name":"discover_experiences","arguments":{"fylke":"Oslo","weather":"rain","limit":5}},"id":"1"}'
 
 ## A2A AI-discovery
 

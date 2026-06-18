@@ -217,6 +217,16 @@ if (process.env.ENABLE_EXPERIENCES === "1") {
       return next();
     }
 
+    // /mcp endpoint → experiences Streamable HTTP MCP router (orchestrator-pr-33)
+    // experiencesMcpRouter applies its own rate limiting (jsonRpcLimiter).
+    // Mounted BEFORE /a2a so a dental-style host-dispatch ordering is preserved
+    // and opplevagent /mcp requests never fall through to rfb's /mcp router.
+    if (p === "/mcp" || p.startsWith("/mcp/")) {
+      // eslint-disable-next-line @typescript-eslint/no-var-requires
+      const experiencesMcpRouter = require("./routes/experiences-mcp").default;
+      return experiencesMcpRouter(req, res, next);
+    }
+
     // /a2a endpoint → experiences A2A JSON-RPC router (mounted before
     // experiences-seo below). experiencesA2aRouter handles the /a2a prefix
     // and applies its own rate limiting (jsonRpcLimiter).
