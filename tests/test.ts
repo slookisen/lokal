@@ -19780,36 +19780,3 @@ _orchPr20BmEventsPromise.then(async () => {
     _orchPr21SentLogActorResolve();
   }
 });
-
-// ── PR-29 v3: buildPlaceDetailsRequest unit tests ─────────────────────────────
-// Pure synchronous assertions — no DB, no fetch stubs, no runSerial.
-console.log("── PR-29 v3: buildPlaceDetailsRequest ──");
-{
-  // eslint-disable-next-line @typescript-eslint/no-var-requires
-  const { buildPlaceDetailsRequest } = require("../src/routes/marketplace");
-
-  assertEq(
-    buildPlaceDetailsRequest("ChIJxyz", { addr: false, phone: true }).url,
-    "https://places.googleapis.com/v1/places/ChIJxyz",
-    "PR-29 Details URL uses /v1/places/{id}",
-  );
-  assertEq(
-    buildPlaceDetailsRequest("ChIJxyz", { addr: false, phone: true }).fieldMask,
-    "internationalPhoneNumber",
-    "PR-29 fieldMask: phone-only → internationalPhoneNumber",
-  );
-  assertEq(
-    buildPlaceDetailsRequest("X", { addr: true, phone: false }).fieldMask,
-    "formattedAddress",
-    "PR-29 fieldMask: addr-only → formattedAddress",
-  );
-  assertEq(
-    buildPlaceDetailsRequest("X", { addr: true, phone: true }).fieldMask,
-    "formattedAddress,internationalPhoneNumber",
-    "PR-29 fieldMask: both → formattedAddress,internationalPhoneNumber",
-  );
-  assertTrue(
-    buildPlaceDetailsRequest("X", { addr: false, phone: true }).url.includes("/v1/places/"),
-    "PR-29 URL regression guard",
-  );
-}

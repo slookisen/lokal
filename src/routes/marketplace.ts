@@ -15,21 +15,6 @@ import { isBlocked, add as blocklistAdd, list as blocklistList, remove as blockl
 import { mergeFieldProvenance } from "./admin-knowledge";
 import { crossSourceAgreement, isAcceptableHomepageEmail, pageMentionsProducer, type FieldName } from "../services/cross-source-validator";
 
-// ── PR-29 v3: pure helper for Place Details (New) request params ──────────────
-// Exported so tests can assert the URL structure without touching the handler.
-export function buildPlaceDetailsRequest(
-  placeId: string,
-  need: { addr: boolean; phone: boolean },
-): { url: string; fieldMask: string } {
-  const parts: string[] = [];
-  if (need.addr) parts.push("formattedAddress");
-  if (need.phone) parts.push("internationalPhoneNumber");
-  return {
-    url: `https://places.googleapis.com/v1/places/${placeId}`,
-    fieldMask: parts.join(","),
-  };
-}
-
 // ─── Marketplace Routes ───────────────────────────────────────
 // These are the OPEN endpoints that make Lokal a marketplace.
 // Any agent in the world can:
@@ -41,9 +26,6 @@ export function buildPlaceDetailsRequest(
 // AI agents (ChatGPT, Claude, Gemini plugins) will call.
 
 const router = Router();
-
-// ── PR-29 v3: per-run cap on Place Details (New) calls to bound approved cost ─
-const MAX_DETAILS_CALLS_PER_RUN = 50; // 50 = existing batch slice max → worst-case unchanged
 
 // ─── Admin key helper ────────────────────────────────────────
 // Accepts ADMIN_KEY or ANALYTICS_ADMIN_KEY so the enrichment
@@ -1668,7 +1650,7 @@ router.post("/admin/google-rating-batch", async (req: Request, res: Response) =>
     return;
   }
 
-  const { agentIds, include_address_phone, max_details_calls } = req.body;
+  const { agentIds, include_address_phone } = req.body;
   if (!Array.isArray(agentIds) || agentIds.length === 0) {
     res.status(400).json({ success: false, error: "Forventer { agentIds: string[] }" });
     return;
@@ -1683,22 +1665,12 @@ router.post("/admin/google-rating-batch", async (req: Request, res: Response) =>
   // in `review_required`. Behaviour without the flag is unchanged.
   const wantAddrPhone = include_address_phone === true;
   const fieldMask = wantAddrPhone
-    ? "places.id,places.rating,places.userRatingCount,places.displayName,places.formattedAddress,places.internationalPhoneNumber"
+    ? "places.rating,places.userRatingCount,places.displayName,places.formattedAddress,places.internationalPhoneNumber"
     : "places.rating,places.userRatingCount,places.displayName";
 
   const batch = agentIds.slice(0, 50); // Max 50 per request
   const results: any[] = [];
   let enriched = 0;
-
-  // PR-29 v3: compute effective Details-call cap for this run.
-  // Caller may pass max_details_calls to tighten the cap (e.g. for testing or
-  // cost control). We clamp to [0, MAX_DETAILS_CALLS_PER_RUN] so the approved
-  // worst-case is never exceeded regardless of what the caller sends.
-  const effectiveCap: number =
-    typeof max_details_calls === "number" && Number.isFinite(max_details_calls)
-      ? Math.max(0, Math.min(MAX_DETAILS_CALLS_PER_RUN, Math.trunc(max_details_calls)))
-      : MAX_DETAILS_CALLS_PER_RUN;
-  let detailsCalls = 0;
 
   for (const agentId of batch) {
     const info = knowledgeService.getAgentInfo(agentId);
@@ -1735,43 +1707,6 @@ router.post("/admin/google-rating-batch", async (req: Request, res: Response) =>
       } as any);
       trustScoreService.update(agentId);
       enriched++;
-
-      // ── PR-29 v3: Place Details (New) fallback for missing address/phone ──
-      // Proto3 omits empty scalars, so Text Search may return no formattedAddress
-      // / internationalPhoneNumber even when the place has them. We do ONE
-      // Details call per agent (bounded by effectiveCap) to back-fill the gaps.
-      if (wantAddrPhone && place.id) {
-        const needAddr = typeof place.formattedAddress !== "string" || place.formattedAddress.trim() === "";
-        const needPhone = typeof place.internationalPhoneNumber !== "string" || place.internationalPhoneNumber.trim() === "";
-        if ((needAddr || needPhone) && detailsCalls < effectiveCap) {
-          detailsCalls++;
-          try {
-            const { url: detailsUrl, fieldMask: detailsMask } = buildPlaceDetailsRequest(
-              place.id,
-              { addr: needAddr, phone: needPhone },
-            );
-            const detResp = await fetch(detailsUrl, {
-              headers: {
-                "X-Goog-FieldMask": detailsMask,
-                "X-Goog-Api-Key": placesKey,
-              },
-            });
-            if (detResp.ok) {
-              const det = await detResp.json() as any;
-              // Only back-fill — never overwrite what Text Search already returned.
-              if (needAddr && typeof det.formattedAddress === "string" && det.formattedAddress.trim() !== "") {
-                place.formattedAddress = det.formattedAddress;
-              }
-              if (needPhone && typeof det.internationalPhoneNumber === "string" && det.internationalPhoneNumber.trim() !== "") {
-                place.internationalPhoneNumber = det.internationalPhoneNumber;
-              }
-            }
-          } catch {
-            // Details failure is non-fatal: PR-82 block below will just write
-            // whatever Text Search returned (possibly empty).
-          }
-        }
-      }
 
       // ── PR-82: optional address/phone write + provenance merge ──
       let addressWritten = false;
