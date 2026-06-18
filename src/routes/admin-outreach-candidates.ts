@@ -489,4 +489,143 @@ router.post("/import", (req: Request, res: Response) => {
   }
 });
 
+// ── POST /admin/outreach-sent-log/reconcile ───────────────────────────────────
+//
+// File→DB reconciliation: the historical outreach_sent_log.json (~770 sends)
+// never made it into the DB table, so the outreach_ready_pool VIEW's sent_log
+// exclusion is blind to those sends. This endpoint makes the table reflect truth
+// without touching the file.
+//
+// Accepts JSON body: array of records from outreach_sent_log.json.  Each record
+// must have `agent_id` OR `agentId` (preferred, maps directly) or `email`
+// (resolved via agent_knowledge). `sent_at` OR `sentAt` required.
+// Optional: `message_id`/`messageId`, `batch`, `channel` (default 'email').
+//
+// Dedup strategy (natural key, idempotent re-runs):
+//   - If message_id present: skip row if message_id already in table.
+//   - If no message_id: skip row if (agent_id, sent_at, channel) already in table.
+// Both paths guarantee ?apply=1 re-runs produce zero new inserts.
+//
+// Query param:
+//   apply=1  → actually write; default is dry-run.
+//
+// Returns: { success, dry_run, would_insert, inserted, skipped_existing, invalid }
+router.post("/reconcile", (req: Request, res: Response) => {
+  if (!requireAdmin(req, res)) return;
+  try {
+    const db = getDb();
+    const dryRun = req.query.apply !== "1";
+
+    const body = req.body;
+    if (!body || !Array.isArray(body)) {
+      res.status(400).json({
+        success: false,
+        error: "Body must be a JSON array of outreach_sent_log entries",
+      });
+      return;
+    }
+
+    const entries = body as Record<string, unknown>[];
+
+    let wouldInsert = 0;
+    let inserted = 0;
+    let skippedExisting = 0;
+    let invalid = 0;
+
+    for (const entry of entries) {
+      // ── Resolve agent_id ──────────────────────────────────────────────────
+      // Accept agent_id / agentId directly, or fall back to email→lookup.
+      const rawAgentId =
+        (entry.agent_id as string | undefined) ||
+        (entry.agentId as string | undefined) ||
+        null;
+
+      let agentId: string | null = rawAgentId ?? null;
+
+      if (!agentId) {
+        const email = (entry.email as string | undefined)?.toString().toLowerCase().trim() || "";
+        if (!email) {
+          invalid++;
+          continue;
+        }
+        const agentRow = db
+          .prepare(
+            `SELECT ak.agent_id FROM agent_knowledge ak
+             WHERE LOWER(ak.email) = ? LIMIT 1`
+          )
+          .get(email) as { agent_id: string } | undefined;
+        if (!agentRow) {
+          invalid++;
+          continue;
+        }
+        agentId = agentRow.agent_id;
+      }
+
+      // ── Resolve sent_at ───────────────────────────────────────────────────
+      const rawSentAt =
+        (entry.sent_at as string | undefined) || (entry.sentAt as string | undefined) || "";
+      if (!rawSentAt) {
+        invalid++;
+        continue;
+      }
+      const sentAt = String(rawSentAt);
+
+      const messageId =
+        (entry.message_id as string | undefined) ||
+        (entry.messageId as string | undefined) ||
+        null;
+      const channel =
+        (entry.channel as string | undefined) || "email";
+      const batch = (entry.batch as string | undefined) || null;
+      const notes = batch ? `reconcile:${batch}` : "reconcile";
+
+      // ── Idempotency check ─────────────────────────────────────────────────
+      if (messageId) {
+        const existing = db
+          .prepare(`SELECT 1 FROM outreach_sent_log WHERE message_id = ? LIMIT 1`)
+          .get(messageId);
+        if (existing) {
+          skippedExisting++;
+          continue;
+        }
+      } else {
+        // Natural key: (agent_id, sent_at, channel)
+        const existing = db
+          .prepare(
+            `SELECT 1 FROM outreach_sent_log
+             WHERE agent_id = ? AND sent_at = ? AND channel = ?
+               AND message_id IS NULL
+             LIMIT 1`
+          )
+          .get(agentId, sentAt, channel);
+        if (existing) {
+          skippedExisting++;
+          continue;
+        }
+      }
+
+      // ── Write or count ────────────────────────────────────────────────────
+      wouldInsert++;
+      if (!dryRun) {
+        db.prepare(
+          `INSERT INTO outreach_sent_log (agent_id, sent_at, channel, message_id, notes)
+           VALUES (?, ?, ?, ?, ?)`
+        ).run(agentId, sentAt, channel, messageId, notes);
+        inserted++;
+      }
+    }
+
+    res.json({
+      success: true,
+      dry_run: dryRun,
+      would_insert: dryRun ? wouldInsert : inserted,
+      inserted: dryRun ? 0 : inserted,
+      skipped_existing: skippedExisting,
+      invalid,
+    });
+  } catch (err: any) {
+    res.status(500).json({ success: false, error: String(err?.message || err) });
+  }
+});
+
 export default router;
