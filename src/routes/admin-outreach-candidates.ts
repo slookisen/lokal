@@ -532,6 +532,7 @@ router.post("/reconcile", (req: Request, res: Response) => {
     let skippedExisting = 0;
     let invalid = 0;
 
+    const processEntries = () => {
     for (const entry of entries) {
       // ── Resolve agent_id ──────────────────────────────────────────────────
       // Accept agent_id / agentId directly, or fall back to email→lookup.
@@ -559,6 +560,15 @@ router.post("/reconcile", (req: Request, res: Response) => {
           continue;
         }
         agentId = agentRow.agent_id;
+      }
+
+      // ── Guard: agent_id must exist in agents table ──────────────────────────
+      const agentExists = db
+        .prepare(`SELECT 1 FROM agents WHERE id = ? LIMIT 1`)
+        .get(agentId as string);
+      if (!agentExists) {
+        invalid++;
+        continue;
       }
 
       // ── Resolve sent_at ───────────────────────────────────────────────────
@@ -613,6 +623,14 @@ router.post("/reconcile", (req: Request, res: Response) => {
         ).run(agentId, sentAt, channel, messageId, notes);
         inserted++;
       }
+    } // end for
+
+    }; // end processEntries
+
+    if (!dryRun) {
+      db.transaction(processEntries)();
+    } else {
+      processEntries();
     }
 
     res.json({
