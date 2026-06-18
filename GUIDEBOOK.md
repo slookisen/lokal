@@ -3557,6 +3557,37 @@ The rfb owner-portal `m2-*` tests flaked repeatedly across this batch (≥3 retr
 
 ---
 
+### 23.13 Opplevagent / Experiences MCP Server (orchestrator-pr-33)
+
+`src/routes/experiences-mcp.ts` (NEW): Streamable-HTTP MCP router for `opplevagent.no`, mirroring `dental-mcp.ts` exactly. Per-session `StreamableHTTPServerTransport` + `McpServer` pairs in an `experiencesSessions` Map, 30-min TTL + 5-min idle cleanup. Three tools registered via `registerExperienceTools(server)`, all calling `experience-store.ts` directly (no HTTP round-trip). `jsonRpcLimiter` applied (same limiter as `experiences-a2a.ts`).
+
+**MCP endpoint:** `POST https://opplevagent.no/mcp`
+
+**Connect:** paste `https://opplevagent.no/mcp` as the MCP URL in Claude Desktop or ChatGPT.
+
+**Three tools:**
+
+| Tool | Store function | Key inputs |
+|---|---|---|
+| `discover_experiences` | `discoverExperiences(filter, limit)` | `fylke?`, `kommune?`, `category?`, `weather?` (rain/snow/clear/any), `season?`, `indoor_outdoor?`, `group_size?`, `age?`, `max_price?`, `duration_max?`, `language?`, `limit?` (default 20, max 50) |
+| `list_experience_categories` | `listCategories()` | no inputs |
+| `get_experience` | `getExperienceById(id)` | `id` (UUID) |
+
+**Example `tools/call` request:**
+```bash
+curl -X POST https://opplevagent.no/mcp \
+  -H "Content-Type: application/json" \
+  -d '{"jsonrpc":"2.0","method":"tools/call","params":{"name":"discover_experiences","arguments":{"fylke":"Oslo","weather":"rain","limit":5}},"id":"1"}'
+```
+
+**Host-gate wiring (`src/index.ts`):** inside the `ENABLE_EXPERIENCES === "1"` block, a new `/mcp` branch is inserted **before** the existing `/a2a` branch — same ordering discipline as dental (PR-115 lesson: `/mcp` must be dispatched before `/a2a` so opplevagent `/mcp` requests never fall through to rfb's `/mcp` router). Lazy-`require` pattern: `const experiencesMcpRouter = require("./routes/experiences-mcp").default`.
+
+**Defensive DB handling:** if the experiences DB isn't open, every tool returns a graceful `"Ingen data tilgjengelig / No experience data available at this time."` text result — never throws. Mirrors `safeCategories()` in `experiences-seo.ts`.
+
+**Discoverability:** `experiences-seo.ts` `llms.txt` gains an MCP section (endpoint URL, 3 tool names, example `tools/call` cURL). The landing's "For AI-agenter" endpoint list and footer "For agenter" column both gain a `/mcp` link.
+
+---
+
 <a id="phase-24"></a>
 ## Phase 24: Marketplace Transactions (Cart MVP), Search-Enrich Pipeline, Outreach Suppression Gate & Verifier Industrialization
 
