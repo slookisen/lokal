@@ -30,6 +30,7 @@
 import { Router, Request, Response } from "express";
 import { getDb } from "../database/init";
 import { isBlocked } from "../services/blocklist-service";
+import { dedupeByEmail } from "../services/marketing-dedupe";
 
 const router = Router();
 
@@ -365,8 +366,18 @@ router.get("/", (req: Request, res: Response) => {
       }
     }
 
-    // Cap by limit AFTER suppression
-    const cappedCandidates = candidates.slice(0, limit);
+    // ── Email-level dedupe (parity with /admin/outreach-ready-pool, WO-20/PR-21).
+    // Two DISTINCT agent records can share one recipient email (e.g. duplicate
+    // producer rows "Finnskoghonning" + "Finnskogen Honning" both → post@finnskoghonning.no).
+    // The suppression gate above is keyed per agent_id, so both pass and the human
+    // receives two "Hei <agent>!" mails in a single batch (e48 incident 2026-06-20).
+    // Collapse to one winner per email (highest views > Google score > name asc);
+    // the rest stay eligible next batch. Pure in-memory selection, no DB write —
+    // mirrors the outreach-ready-pool endpoint exactly.
+    const deduped = dedupeByEmail(candidates);
+
+    // Cap by limit AFTER suppression + dedupe
+    const cappedCandidates = deduped.selected.slice(0, limit);
 
     res.json({
       success: true,
@@ -374,6 +385,9 @@ router.get("/", (req: Request, res: Response) => {
       cooldown_days: cooldownDays,
       count: cappedCandidates.length,
       candidates: cappedCandidates,
+      dedupe_by_email: true,
+      dedupe_suppressed_count: deduped.suppressed.length,
+      dedupe_email_collision_groups: deduped.emails_with_collisions,
       suppressed_counts: {
         contacted_or_cooldown: contactedOrCooldownCount,
         replied: repliedCount,
