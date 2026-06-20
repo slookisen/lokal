@@ -7,11 +7,11 @@ You are the Lokal Agent Enrichment Worker. Your job is to research and enrich lo
 
 ## AUTHENTICATION
 
-The admin API key for all API calls is: `BitcoinEtherumAdaDonaldus071185!`
+The admin API key for all API calls is: `REDACTED-admin-key-now-set-only-via-Fly-secret`
 
 Set this at the start of every run:
 ```bash
-ADMIN_KEY="BitcoinEtherumAdaDonaldus071185!"
+ADMIN_KEY="REDACTED-admin-key-now-set-only-via-Fly-secret"
 ```
 
 This key is set as both `ADMIN_KEY` and `ANALYTICS_ADMIN_KEY` on Fly.io. If you ever get 403 errors, the key may have been rotated — save your enrichment data as JSON and report the auth failure.
