@@ -14339,6 +14339,51 @@ const _orchPr18BulkLoadPromise: Promise<void> = new Promise<void>((r) => {
       assertEq(myc.verification_status, "needs_review", "bl-4p: unverified ⇒ needs_review");
     }
 
+    // ── bl-disc: GET /discover EXPOSES slug (slug-API prereq for detail pages). ─
+    // After bl-4 the DB has 2 verified Tromsø experiences (each with a slug).
+    // The /discover list endpoint must surface that slug so category/fylke/
+    // index templates can link to /opplevelse/<slug>. Regression-guards the
+    // P0 prerequisite from the opplevagent front-end build-out work-order.
+    {
+      const discoverGet = (): Promise<{ status: number; body: any }> =>
+        new Promise((resolve, reject) => {
+          const rq = httpMod18.request(
+            { method: "GET", host: "127.0.0.1", port: port18, path: "/api/opplevelser/discover?limit=100" },
+            (resp) => {
+              const chunks: Buffer[] = [];
+              resp.on("data", (c) => chunks.push(c as Buffer));
+              resp.on("end", () => {
+                const raw = Buffer.concat(chunks).toString("utf8");
+                let parsed: any = null;
+                try { parsed = raw ? JSON.parse(raw) : null; } catch { parsed = { _raw: raw }; }
+                resolve({ status: resp.statusCode || 0, body: parsed });
+              });
+            }
+          );
+          rq.on("error", reject);
+          rq.end();
+        });
+      const r = await discoverGet();
+      assertEq(r.status, 200, "bl-disc-a: GET /discover -> 200");
+      assertTrue(
+        Array.isArray(r.body.results) && r.body.results.length >= 1,
+        "bl-disc-b: discover returns >=1 verified result"
+      );
+      const first = r.body.results[0];
+      assertTrue(
+        typeof first.slug === "string" && first.slug.length > 0,
+        "bl-disc-c: discover result exposes non-empty slug (detail-page addressing)"
+      );
+      assertTrue(
+        typeof first.id === "string" && first.id.length > 0,
+        "bl-disc-d: discover result still exposes id (no regression)"
+      );
+      const detail = dbExp18
+        .prepare("SELECT slug FROM experiences WHERE id = ?")
+        .get(first.id) as { slug: string };
+      assertEq(first.slug, detail.slug, "bl-disc-e: discover slug matches stored canonical slug");
+    }
+
     // ── bl-5: idempotent re-run (apply) inserts 0. ─────────────────────
     {
       const r = await bulkReq({ ...PAYLOAD, apply: true }, ADMIN_KEY_18);

@@ -94,6 +94,7 @@ router.get("/discover", (req: Request, res: Response) => {
       count: results.length,
       results: results.map((e) => ({
         id: e.id,
+        slug: e.slug,
         title: e.title,
         category: e.category,
         fylke: e.fylke,
