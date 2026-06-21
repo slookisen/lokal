@@ -14853,6 +14853,192 @@ console.log("\n── site-quality: /opplevelse/<slug> detail page (experiences)
   dbFactorySQ.__resetDbFactoryForTesting();
 })();
 
+// ── Phase 2 (feat/opplevagent-p2-browse-pages): human-browse subpages ────────
+// /opplevelser, /kategori/:c, /fylke/:f, /tilbyder/:id, /sok + DB-driven sitemap
+// + homepage relink. Same isolated :memory: experiences.db + sync mock req/res
+// pattern as the site-quality block above. Host-isolated: every page is on the
+// Opplevagent brand and must not leak rfb/dental identity. Unknown
+// category/fylke/provider must 404 (router calls next()).
+console.log("\n── opplevagent P2: human-browse subpages (experiences) ──");
+(() => {
+  const prevPathP2 = process.env.EXPERIENCES_DB_PATH;
+  process.env.EXPERIENCES_DB_PATH = ":memory:";
+
+  const dbFactoryPathP2 = require.resolve("../src/database/db-factory");
+  const expStorePathP2 = require.resolve("../src/services/experience-store");
+  const expSeoPathP2 = require.resolve("../src/routes/experiences-seo");
+  delete require.cache[dbFactoryPathP2];
+  delete require.cache[expStorePathP2];
+  delete require.cache[expSeoPathP2];
+
+  const dbFactoryP2 = require("../src/database/db-factory") as typeof import("../src/database/db-factory");
+  dbFactoryP2.__resetDbFactoryForTesting();
+  const expStoreP2 = require("../src/services/experience-store") as typeof import("../src/services/experience-store");
+  const seoRouterP2 = (require("../src/routes/experiences-seo") as typeof import("../src/routes/experiences-seo")).default as any;
+
+  // Seed: a Brreg-verified provider + several publishable experiences across two
+  // categories/fylker, plus an unpublished draft (must never surface anywhere).
+  dbFactoryP2.getDb("experiences");
+  const provP2 = expStoreP2.createProvider({
+    navn: "Tromsø Villmark AS", org_nr: "919191919",
+    fylke: "Troms", kommune: "Tromsø", hjemmeside: "https://example-tromso.no",
+    brreg_verified: 1, brreg_active: 1, verification_status: "verified",
+  });
+  const prov2P2 = expStoreP2.createProvider({
+    navn: "Oslo Opplevelser AS", org_nr: "828282828",
+    fylke: "Oslo", kommune: "Oslo", brreg_verified: 1, brreg_active: 1,
+    verification_status: "verified",
+  });
+  const whaleId = expStoreP2.createExperience({
+    title: "Hvalsafari i Tromsø", provider_id: provP2, provider_match_status: "matched",
+    category: "dyreliv_safari", fylke: "Troms", kommune: "Tromsø",
+    indoor_outdoor: "outdoor", season: ["winter"], price_from: 1290, price_unit: "per_person",
+    description: "Se hval på nært hold i Tromsø-området.",
+    confidence: "high", verification_status: "verified",
+  });
+  expStoreP2.createExperience({
+    title: "Nordlysjakt med buss", provider_id: provP2, provider_match_status: "matched",
+    category: "dyreliv_safari", fylke: "Troms", kommune: "Tromsø", indoor_outdoor: "outdoor",
+    season: ["winter"], confidence: "medium", verification_status: "verified",
+  });
+  expStoreP2.createExperience({
+    title: "Tapasvandring i Oslo", provider_id: prov2P2, provider_match_status: "matched",
+    category: "mat_drikke", fylke: "Oslo", kommune: "Oslo", indoor_outdoor: "both",
+    description: "Smak deg gjennom Oslos matscene.",
+    confidence: "high", verification_status: "verified",
+  });
+  const draftP2 = expStoreP2.createExperience({
+    title: "Hemmelig utkast", provider_id: provP2, category: "dyreliv_safari",
+    fylke: "Troms", kommune: "Tromsø", confidence: "high", verification_status: "pending_verify",
+  });
+  const draftSlugP2 = (expStoreP2.getExperienceById(draftP2) as any).slug as string;
+  const whaleSlugP2 = (expStoreP2.getExperienceById(whaleId) as any).slug as string;
+
+  // invokeSeo — same helper shape as the site-quality block, but lets the caller
+  // pass query params (?page=, ?q=).
+  function invokeSeo(
+    routePath: string,
+    params: Record<string, string>,
+    reqPath: string,
+    query: Record<string, string> = {}
+  ): { status: number; body: string; headers: Record<string, string> } {
+    const layer = (seoRouterP2.stack as any[]).find(
+      (l: any) => l.route && l.route.path === routePath && l.route.methods?.get
+    );
+    assertTrue(!!layer, `p2-browse: router has GET ${routePath} layer`);
+    if (!layer) return { status: 0, body: "", headers: {} };
+    let status = 200; let body = ""; let nexted = false;
+    const headers: Record<string, string> = {};
+    const res: any = {
+      statusCode: 200,
+      setHeader: (k: string, v: string) => { headers[k.toLowerCase()] = String(v); },
+      status: (c: number) => { status = c; res.statusCode = c; return res; },
+      send: (b: unknown) => { body = typeof b === "string" ? b : String(b); return res; },
+      json: (o: unknown) => { body = JSON.stringify(o); return res; },
+    };
+    const req: any = { path: reqPath, hostname: "opplevagent.no", params, query };
+    const handler = layer.route.stack[layer.route.stack.length - 1].handle;
+    handler(req, res, () => { nexted = true; });
+    if (nexted) status = 404; // route called next() → would hit 404 catch-all
+    return { status, body, headers };
+  }
+
+  // p2-01: /opplevelser index → 200, lists all published, excludes draft, on-brand.
+  const idxP2 = invokeSeo("/opplevelser", {}, "/opplevelser");
+  assertEq(idxP2.status, 200, "p2-01a: GET /opplevelser → 200");
+  assertTrue(/text\/html/.test(idxP2.headers["content-type"] || ""), "p2-01b: index Content-Type text/html");
+  assertTrue(/Hvalsafari i Tromsø/.test(idxP2.body) && /Tapasvandring i Oslo/.test(idxP2.body),
+    "p2-01c: index lists published experiences across providers");
+  assertTrue(!new RegExp(draftSlugP2).test(idxP2.body) && !/Hemmelig utkast/.test(idxP2.body),
+    "p2-01d: index excludes the unpublished draft");
+  assertTrue(idxP2.body.includes(`/opplevelse/${whaleSlugP2}`), "p2-01e: index cards link to live detail pages");
+  assertTrue(idxP2.body.includes('"@type":"CollectionPage"') && idxP2.body.includes('"@type":"ItemList"'),
+    "p2-01f: index emits CollectionPage + ItemList JSON-LD");
+  assertTrue(idxP2.body.includes('href="/kategori/dyreliv_safari"') && idxP2.body.includes('href="/fylke/Troms"'),
+    "p2-01g: index renders category + fylke facet chips");
+  assertTrue(idxP2.body.includes('action="/sok"'), "p2-01h: index search box posts to /sok");
+  assertTrue(idxP2.body.includes('<link rel="canonical" href="https://opplevagent.no/opplevelser"'),
+    "p2-01i: index canonical is the absolute opplevagent URL");
+  assertTrue(!/Rett fra Bonden/i.test(idxP2.body) && !/tannlege/i.test(idxP2.body),
+    "p2-01j: index does NOT leak rfb/dental identity");
+
+  // p2-02: /kategori/:category → 200 only contains that category; unknown → 404.
+  const catP2 = invokeSeo("/kategori/:category", { category: "dyreliv_safari" }, "/kategori/dyreliv_safari");
+  assertEq(catP2.status, 200, "p2-02a: GET /kategori/dyreliv_safari → 200");
+  assertTrue(/Hvalsafari i Tromsø/.test(catP2.body) && /Nordlysjakt med buss/.test(catP2.body),
+    "p2-02b: category page lists its experiences");
+  assertTrue(!/Tapasvandring i Oslo/.test(catP2.body), "p2-02c: category page excludes other categories");
+  assertTrue(catP2.body.includes('"@type":"CollectionPage"'), "p2-02d: category page emits CollectionPage JSON-LD");
+  const catMissP2 = invokeSeo("/kategori/:category", { category: "finnes_ikke" }, "/kategori/finnes_ikke");
+  assertEq(catMissP2.status, 404, "p2-02e: unknown category → 404 (next())");
+
+  // p2-03: /fylke/:fylke → 200 scoped to county; unknown → 404.
+  const fylkeP2 = invokeSeo("/fylke/:fylke", { fylke: "Troms" }, "/fylke/Troms");
+  assertEq(fylkeP2.status, 200, "p2-03a: GET /fylke/Troms → 200");
+  assertTrue(/Hvalsafari i Tromsø/.test(fylkeP2.body), "p2-03b: fylke page lists county experiences");
+  assertTrue(!/Tapasvandring i Oslo/.test(fylkeP2.body), "p2-03c: fylke page excludes other counties");
+  const fylkeMissP2 = invokeSeo("/fylke/:fylke", { fylke: "Atlantis" }, "/fylke/Atlantis");
+  assertEq(fylkeMissP2.status, 404, "p2-03d: unknown fylke → 404 (next())");
+
+  // p2-04: /tilbyder/:providerId → 200 scoped to provider; unknown → 404.
+  const provPageP2 = invokeSeo("/tilbyder/:providerId", { providerId: provP2 }, `/tilbyder/${provP2}`);
+  assertEq(provPageP2.status, 200, "p2-04a: GET /tilbyder/<id> → 200");
+  assertTrue(/Tromsø Villmark AS/.test(provPageP2.body), "p2-04b: provider page shows provider name");
+  assertTrue(/Hvalsafari i Tromsø/.test(provPageP2.body) && !/Tapasvandring i Oslo/.test(provPageP2.body),
+    "p2-04c: provider page lists only that provider's experiences");
+  assertTrue(/Brønnøysundregistrene/.test(provPageP2.body), "p2-04d: verified provider page shows Brreg note");
+  const provMissP2 = invokeSeo("/tilbyder/:providerId", { providerId: "00000000-dead-beef" }, "/tilbyder/00000000-dead-beef");
+  assertEq(provMissP2.status, 404, "p2-04e: unknown provider → 404 (next())");
+
+  // p2-05: /sok?q= → 200 results; empty + no-match handled gracefully (200, noindex).
+  const sokP2 = invokeSeo("/sok", {}, "/sok", { q: "hval" });
+  assertEq(sokP2.status, 200, "p2-05a: GET /sok?q=hval → 200");
+  assertTrue(/Hvalsafari i Tromsø/.test(sokP2.body), "p2-05b: search finds matching experience by title");
+  assertTrue(!/Tapasvandring i Oslo/.test(sokP2.body), "p2-05c: search excludes non-matching rows");
+  assertTrue(sokP2.body.includes(`/opplevelse/${whaleSlugP2}`), "p2-05d: search results link to live detail pages");
+  assertTrue(/noindex/.test(sokP2.body), "p2-05e: search page is noindex (thin/duplicative)");
+  const sokPlaceP2 = invokeSeo("/sok", {}, "/sok", { q: "Oslo" });
+  assertTrue(/Tapasvandring i Oslo/.test(sokPlaceP2.body), "p2-05f: search matches on place (Oslo)");
+  const sokMissP2 = invokeSeo("/sok", {}, "/sok", { q: "zzzznotfound" });
+  assertEq(sokMissP2.status, 200, "p2-05g: no-match search still → 200");
+  assertTrue(/Ingen treff/.test(sokMissP2.body), "p2-05h: no-match search shows empty-state");
+  const sokEmptyP2 = invokeSeo("/sok", {}, "/sok", {});
+  assertEq(sokEmptyP2.status, 200, "p2-05i: empty /sok (no q) → 200 prompt page");
+  assertTrue(!/Hemmelig utkast/.test(sokP2.body) && !/Hemmelig utkast/.test(sokPlaceP2.body),
+    "p2-05j: search never surfaces the unpublished draft");
+
+  // p2-06: sitemap.xml now weaves category/fylke/provider/index URLs (DB-driven),
+  // and still excludes the unpublished draft.
+  const smP2 = invokeSeo("/sitemap.xml", {}, "/sitemap.xml");
+  assertEq(smP2.status, 200, "p2-06a: sitemap.xml → 200");
+  assertTrue(smP2.body.includes("https://opplevagent.no/opplevelser<") ||
+    smP2.body.includes("<loc>https://opplevagent.no/opplevelser</loc>"),
+    "p2-06b: sitemap includes the /opplevelser index");
+  assertTrue(smP2.body.includes("/kategori/dyreliv_safari"), "p2-06c: sitemap includes category URLs");
+  assertTrue(smP2.body.includes("/fylke/Troms"), "p2-06d: sitemap includes fylke URLs");
+  assertTrue(smP2.body.includes(`/tilbyder/${provP2}`), "p2-06e: sitemap includes provider URLs");
+  assertTrue(smP2.body.includes(`/opplevelse/${whaleSlugP2}`), "p2-06f: sitemap includes published detail URLs");
+  assertTrue(!smP2.body.includes(`/opplevelse/${draftSlugP2}`), "p2-06g: sitemap excludes the unpublished draft");
+
+  // p2-07: homepage relink — category cards → /kategori/, search → /sok, and the
+  // human nav links to /opplevelser. The discover JSON contract is NOT linked
+  // from the human category cards anymore (still referenced for agents).
+  const homeP2 = invokeSeo("/", {}, "/");
+  assertEq(homeP2.status, 200, "p2-07a: GET / (homepage) → 200");
+  assertTrue(homeP2.body.includes('href="/kategori/dyreliv_safari"'),
+    "p2-07b: homepage category cards link to /kategori/<x> (HTML page)");
+  assertTrue(homeP2.body.includes('action="/sok"'), "p2-07c: homepage search posts to /sok");
+  assertTrue(homeP2.body.includes('href="/opplevelser"'), "p2-07d: homepage links to the /opplevelser index");
+  assertTrue(!/href="\/api\/opplevelser\/discover\?category=/.test(homeP2.body),
+    "p2-07e: homepage no longer points human category cards at the discover JSON API");
+  assertTrue(homeP2.body.includes("/sok?q={search_term_string}"),
+    "p2-07f: homepage WebSite SearchAction points at the HTML /sok page");
+
+  if (prevPathP2 === undefined) delete process.env.EXPERIENCES_DB_PATH;
+  else process.env.EXPERIENCES_DB_PATH = prevPathP2;
+  dbFactoryP2.__resetDbFactoryForTesting();
+})();
+
 // ── PR-107 (2026-06-04): zombie-claim sweep fix ──────────────────────
 // Tests for sweepExpiredClaims, zombie reclaim via claimBatch, truthful
 // claimStatus after timeout, and releaseBatch regression guard.

@@ -32,7 +32,15 @@ import {
   getProviderById,
   getRelatedPublishedExperiences,
   listPublishedExperienceSlugs,
+  countPublishedExperiences,
+  listPublishedExperiences,
+  listPublishedCategories,
+  listPublishedFylker,
+  listPublishedProviders,
+  getPublishedProviderById,
+  searchPublishedExperiences,
   type RelatedExperienceRow,
+  type ExperienceCardRow,
 } from "../services/experience-store";
 
 const router = Router();
@@ -116,9 +124,12 @@ router.get("/", (_req: Request, res: Response) => {
         !usingFallbackCats && Number.isFinite(c.count) && c.count > 0
           ? `<span class="cat-count">${c.count} opplevelser</span>`
           : `<span class="cat-count cat-count-soon">Kommer snart</span>`;
+      // Phase 2: human-facing category cards link to the server-rendered
+      // /kategori/<x> HTML page (not the raw discover JSON). Pre-data fallback
+      // cards point at the index so the grid still leads somewhere sensible.
       const href = usingFallbackCats
-        ? `/api/opplevelser/discover`
-        : `/api/opplevelser/discover?category=${encodeURIComponent(c.category)}`;
+        ? `/opplevelser`
+        : `/kategori/${encodeURIComponent(c.category)}`;
       return `<a class="cat-card" href="${href}">
         <span class="cat-ico" aria-hidden="true">${catIcon(c.category)}</span>
         <span class="cat-body">
@@ -148,7 +159,7 @@ router.get("/", (_req: Request, res: Response) => {
         "@type": "SearchAction",
         target: {
           "@type": "EntryPoint",
-          urlTemplate: `${url}/api/opplevelser/discover?fylke={search_term_string}`,
+          urlTemplate: `${url}/sok?q={search_term_string}`,
         },
         "query-input": "required name=search_term_string",
       },
@@ -362,10 +373,11 @@ ${ldScripts}
       Opplevagent
     </a>
     <nav class="nav-links" aria-label="Hovednavigasjon">
+      <a href="/opplevelser">Alle opplevelser</a>
       <a href="#kategorier">Kategorier</a>
       <a href="#slik-funker-det">Slik funker det</a>
       <a href="#for-agenter">For AI-agenter</a>
-      <a class="nav-cta" href="/api/opplevelser/discover">Discovery-API</a>
+      <a class="nav-cta" href="/opplevelser">Utforsk</a>
     </nav>
   </div>
 </header>
@@ -382,20 +394,20 @@ ${ldScripts}
       <p class="hero-sub">Fra hvalsafari og trehytter til guidede fjellturer, matopplevelser og lasertag &mdash; en kuratert oversikt over norske opplevelser, bygget for å bli oppdaget og spurt av AI-agenter.</p>
 
       <div class="discover">
-        <form class="discover-form" action="/api/opplevelser/discover" method="GET" role="search" aria-label="Finn opplevelser" id="discover-form">
+        <form class="discover-form" action="/sok" method="GET" role="search" aria-label="Finn opplevelser" id="discover-form">
           <span class="field">
             <svg viewBox="0 0 24 24" width="20" height="20" aria-hidden="true"><circle cx="11" cy="11" r="7" fill="none" stroke="currentColor" stroke-width="2"/><path d="M16.5 16.5 L21 21" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>
             <label for="discover-q" class="visually-hidden" style="position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0 0 0 0);white-space:nowrap">Beskriv hva du vil finne på, eller skriv et sted</label>
-            <input id="discover-q" name="fylke" type="search" autocomplete="off" placeholder="Hva kan vi finne på i Oslo når det regner?">
+            <input id="discover-q" name="q" type="search" autocomplete="off" placeholder="Søk: hvalsafari, Oslo, mat …">
           </span>
           <button type="submit">Finn opplevelser</button>
         </form>
-        <p class="discover-hint">Søk på fylke, eller still spørsmål &mdash; agenter kan også kalle <code>GET /api/opplevelser/discover</code> direkte.</p>
+        <p class="discover-hint">Søk på sted, kategori eller aktivitet &mdash; eller <a href="/opplevelser" style="color:#fff;text-decoration:underline">bla i alle opplevelser</a>. Agenter kan kalle <code>GET /api/opplevelser/discover</code> direkte.</p>
         <div class="quick" role="list" aria-label="Hurtigsøk">
-          <a role="listitem" href="/api/opplevelser/discover?fylke=Oslo&amp;weather=rain">Oslo i regnvær</a>
-          <a role="listitem" href="/api/opplevelser/discover?fylke=Troms&amp;season=winter">Troms om vinteren</a>
-          <a role="listitem" href="/api/opplevelser/discover?indoor_outdoor=outdoor">Ute i naturen</a>
-          <a role="listitem" href="/api/opplevelser/discover?group_size=8">For gjengen (8 stk)</a>
+          <a role="listitem" href="/fylke/Oslo">Oslo</a>
+          <a role="listitem" href="/fylke/Troms">Troms</a>
+          <a role="listitem" href="/sok?q=natur">Ute i naturen</a>
+          <a role="listitem" href="/opplevelser">Alle opplevelser</a>
         </div>
       </div>
     </div>
@@ -501,9 +513,9 @@ ${ldScripts}
     </div>
     <div class="footer-col">
       <h4>Utforsk</h4>
+      <a href="/opplevelser">Alle opplevelser</a>
       <a href="#kategorier">Kategorier</a>
       <a href="#slik-funker-det">Slik funker det</a>
-      <a href="/api/opplevelser/discover">Discovery-API</a>
     </div>
     <div class="footer-col">
       <h4>For agenter</h4>
@@ -521,39 +533,18 @@ ${ldScripts}
 </footer>
 
 <script>
-/* Progressive enhancement: turn the free-text prompt into the right query
-   param. With JS disabled the form still submits ?fylke=<text> as a plain GET
-   to the discovery API, and every quick-link is a normal href — so the page is
-   fully functional without this script. */
+/* Progressive enhancement: an empty search should land on the full index rather
+   than an empty /sok page. With JS disabled the form still submits ?q=<text> as
+   a plain GET to /sok (the HTML search page), and every quick-link is a normal
+   href — so the page is fully functional without this script. */
 (function(){
   var form = document.getElementById('discover-form');
   var input = document.getElementById('discover-q');
   if(!form || !input) return;
-  var FYLKER = ['oslo','viken','innlandet','vestfold','telemark','agder','rogaland','vestland','more og romsdal','trondelag','nordland','troms','finnmark','akershus','buskerud','ostfold','hordaland','sogn og fjordane','tromso'];
   form.addEventListener('submit', function(e){
     var raw = (input.value || '').trim();
-    if(!raw) return; // empty -> let it submit bare (lists everything)
-    e.preventDefault();
-    var low = raw.toLowerCase();
-    var params = new URLSearchParams();
-    // weather / season hints from free text
-    if(/regn|regnv|pøs|dårlig vær|innend/.test(low)) params.set('weather','rain');
-    else if(/snø|sno /.test(low)) params.set('weather','snow');
-    else if(/sol|fint vær|klart/.test(low)) params.set('weather','clear');
-    if(/vinter/.test(low)) params.set('season','winter');
-    else if(/sommer/.test(low)) params.set('season','summer');
-    var foundFylke = null;
-    for(var i=0;i<FYLKER.length;i++){ if(low.indexOf(FYLKER[i])!==-1){ foundFylke = FYLKER[i]; break; } }
-    if(foundFylke){
-      // Title-case the matched fylke for the API.
-      var f = foundFylke.replace(/\b\w/g, function(m){ return m.toUpperCase(); });
-      if(f === 'Tromso') f = 'Tromsø';
-      params.set('fylke', f);
-    } else {
-      // No recognised fylke -> pass the whole phrase as a free-text query.
-      params.set('q', raw);
-    }
-    window.location.href = '/api/opplevelser/discover?' + params.toString();
+    if(!raw){ e.preventDefault(); window.location.href = '/opplevelser'; }
+    // non-empty -> let the native GET /sok?q=<text> submission proceed.
   });
 })();
 </script>
@@ -617,6 +608,7 @@ router.get("/sitemap.xml", (_req: Request, res: Response) => {
   res.setHeader("Content-Type", "application/xml; charset=utf-8");
   const paths: Array<{ p: string; freq: string; pri: string }> = [
     { p: "/", freq: "daily", pri: "1.0" },
+    { p: "/opplevelser", freq: "daily", pri: "0.9" },
     { p: "/llms.txt", freq: "weekly", pri: "0.8" },
     { p: "/openapi.json", freq: "weekly", pri: "0.7" },
   ];
@@ -625,9 +617,29 @@ router.get("/sitemap.xml", (_req: Request, res: Response) => {
   for (const { p, freq, pri } of paths) {
     xml += `\n  <url><loc>${url}${p === "/" ? "" : p}</loc><changefreq>${freq}</changefreq><priority>${pri}</priority><lastmod>${today}</lastmod></url>`;
   }
-  // DB-driven weave: one <url> per published experience detail page
-  // (opplevagent-site-quality increment #2). Defensive — if the experiences
-  // DB is not open we just emit the static URLs above.
+  // DB-driven weave (Phase 2): one <url> per published experience detail page
+  // PLUS one per category / fylke / provider index that has ≥1 published
+  // experience. All read through the same publish gate the pages use, so the
+  // sitemap lists exactly the URLs that render 200 — zero orphan/dead entries.
+  // Defensive — if the experiences DB is not open we just emit the static URLs.
+  try {
+    for (const row of listPublishedCategories()) {
+      if (!row.category) continue;
+      xml += `\n  <url><loc>${url}/kategori/${encodeURIComponent(row.category)}</loc><changefreq>weekly</changefreq><priority>0.7</priority><lastmod>${today}</lastmod></url>`;
+    }
+  } catch { /* experiences DB not open */ }
+  try {
+    for (const row of listPublishedFylker()) {
+      if (!row.fylke) continue;
+      xml += `\n  <url><loc>${url}/fylke/${encodeURIComponent(row.fylke)}</loc><changefreq>weekly</changefreq><priority>0.7</priority><lastmod>${today}</lastmod></url>`;
+    }
+  } catch { /* experiences DB not open */ }
+  try {
+    for (const row of listPublishedProviders()) {
+      if (!row.id) continue;
+      xml += `\n  <url><loc>${url}/tilbyder/${encodeURIComponent(row.id)}</loc><changefreq>weekly</changefreq><priority>0.6</priority><lastmod>${today}</lastmod></url>`;
+    }
+  } catch { /* experiences DB not open */ }
   try {
     for (const row of listPublishedExperienceSlugs()) {
       if (!row.slug) continue;
@@ -1169,6 +1181,536 @@ ${ldScripts}
 </body>
 </html>`;
 }
+
+// ═══════════════════════════════════════════════════════════
+// Phase 2 — human-browse subpages (opplevagent.no)
+//   /opplevelser          index/listing of all experiences (paginated)
+//   /kategori/:category    experiences in a category
+//   /fylke/:fylke          experiences in a county
+//   /tilbyder/:providerId  one provider's experiences
+//   /sok?q=                HTML search-results page
+//
+// All server-rendered on the Opplevagent brand, DB-template-driven (a new
+// published row auto-appears in the right index + the sitemap, no code change),
+// host-gated (mounted only behind the opplevagent.no gate), each with
+// breadcrumbs + CollectionPage/ItemList JSON-LD + a graceful empty-state. Every
+// card links to a /opplevelse/<slug> page that is guaranteed live (same publish
+// gate), so there are zero dead links. These reuse the experience-store reads,
+// NOT the /api/opplevelser/discover JSON contract (which is unchanged).
+// ═══════════════════════════════════════════════════════════
+
+const BROWSE_PAGE_SIZE = 24;
+
+// Shared minimal CSS for every browse page — same brand tokens as the landing /
+// detail pages, kept compact since these are list views.
+const BROWSE_CSS = `
+  *{margin:0;padding:0;box-sizing:border-box}
+  :root{
+    --fjord-900:#072a20;--fjord-800:#0b3d2e;--fjord-700:#0f5132;--fjord-600:#147a4d;
+    --teal-500:#14b8a6;--teal-400:#2dd4bf;--amber-500:#f59e0b;--coral-500:#ff7a45;
+    --ink:#10231b;--ink-soft:#3c5249;--mist:#6b8178;
+    --surface:#fff;--canvas:#f4f8f4;--canvas-2:#eaf2ec;--line:#dde9e0;
+    --r-sm:8px;--r-md:14px;--r-lg:20px;--r-pill:999px;
+    --sh-sm:0 1px 2px rgba(7,42,32,.06),0 2px 6px rgba(7,42,32,.05);
+    --sh-md:0 6px 18px rgba(7,42,32,.10);--maxw:1120px;
+  }
+  body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;color:var(--ink);background:var(--canvas);line-height:1.6;-webkit-font-smoothing:antialiased}
+  a{color:var(--fjord-600);text-decoration:none}
+  a:hover{text-decoration:underline}
+  :focus-visible{outline:3px solid var(--amber-500);outline-offset:2px;border-radius:4px}
+  svg{display:block}
+  .container{max-width:var(--maxw);margin:0 auto;padding:0 24px}
+  @media(max-width:560px){.container{padding:0 16px}}
+  .skip-link{position:absolute;left:-9999px;top:0;background:var(--fjord-800);color:#fff;padding:10px 16px;z-index:200}
+  .skip-link:focus{left:0}
+  .site-nav{position:sticky;top:0;z-index:100;background:rgba(244,248,244,.9);backdrop-filter:saturate(160%) blur(12px);border-bottom:1px solid var(--line)}
+  .nav-inner{max-width:var(--maxw);margin:0 auto;padding:0 24px;height:58px;display:flex;align-items:center;justify-content:space-between}
+  @media(max-width:560px){.nav-inner{padding:0 16px}}
+  .brand{display:flex;align-items:center;gap:10px;font-weight:800;font-size:1.12rem;color:var(--fjord-800)}
+  .brand:hover{text-decoration:none}
+  .brand .mark{width:32px;height:32px;border-radius:9px;background:linear-gradient(150deg,var(--fjord-700),var(--teal-500));display:flex;align-items:center;justify-content:center}
+  .brand .mark svg{color:#fff}
+  .nav-links a{font-size:.86rem;font-weight:600;color:var(--ink-soft);margin-left:22px}
+  .breadcrumb{padding:18px 0 4px;font-size:.84rem;color:var(--mist)}
+  .breadcrumb a{color:var(--ink-soft)}
+  .breadcrumb .sep{margin:0 8px;color:var(--line)}
+  .head{padding:14px 0 6px}
+  .head h1{font-size:clamp(1.5rem,3.4vw,2.3rem);font-weight:800;letter-spacing:-.025em;line-height:1.14;color:var(--fjord-900)}
+  .head .lede{margin-top:8px;color:var(--ink-soft);font-size:1rem;max-width:60ch}
+  .count{margin-top:6px;font-size:.86rem;color:var(--mist)}
+  .searchbar{margin:18px 0 4px}
+  .searchbar form{display:flex;gap:0;background:#fff;border:1px solid var(--line);border-radius:var(--r-pill);padding:5px 5px 5px 8px;box-shadow:var(--sh-sm);align-items:center;max-width:560px}
+  .searchbar .field{display:flex;align-items:center;gap:9px;flex:1;padding-left:10px;min-width:0}
+  .searchbar .field svg{color:var(--mist);flex:0 0 18px}
+  .searchbar input{flex:1;border:none;outline:none;font-size:1rem;color:var(--ink);background:transparent;padding:11px 4px;min-width:0}
+  .searchbar button{flex:0 0 auto;border:none;cursor:pointer;background:var(--fjord-800);color:#fff;font-weight:700;font-size:.9rem;padding:11px 20px;border-radius:var(--r-pill)}
+  .searchbar button:hover{background:var(--fjord-700)}
+  .chips{display:flex;flex-wrap:wrap;gap:8px;margin:18px 0 4px}
+  .chip{display:inline-flex;align-items:center;gap:6px;padding:6px 13px;border-radius:var(--r-pill);background:var(--canvas-2);color:var(--ink-soft);font-size:.82rem;font-weight:600;border:1px solid var(--line)}
+  .chip:hover{text-decoration:none;border-color:var(--teal-400);color:var(--fjord-700)}
+  .chip .n{color:var(--mist);font-weight:600}
+  .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(260px,1fr));gap:16px;margin:22px 0 8px}
+  .card{display:flex;flex-direction:column;gap:8px;background:var(--surface);border:1px solid var(--line);border-radius:var(--r-md);padding:18px 18px;box-shadow:var(--sh-sm);transition:transform .14s ease,box-shadow .14s ease,border-color .14s ease}
+  .card:hover{transform:translateY(-3px);box-shadow:var(--sh-md);border-color:var(--teal-400);text-decoration:none}
+  .card .c-title{font-weight:700;color:var(--ink);font-size:1.04rem;letter-spacing:-.01em;line-height:1.25}
+  .card .c-place{font-size:.84rem;color:var(--mist);display:flex;align-items:center;gap:6px}
+  .card .c-place svg{flex:0 0 14px;color:var(--fjord-600)}
+  .card .c-desc{font-size:.9rem;color:var(--ink-soft);display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
+  .card .c-meta{margin-top:auto;display:flex;flex-wrap:wrap;gap:6px;padding-top:4px}
+  .tag{display:inline-flex;align-items:center;padding:3px 10px;border-radius:var(--r-pill);background:var(--canvas-2);color:var(--ink-soft);font-size:.74rem;font-weight:600;border:1px solid var(--line)}
+  .tag-cat{background:var(--fjord-800);color:#fff;border-color:var(--fjord-800)}
+  .empty{margin:30px 0;background:var(--surface);border:1px dashed var(--line);border-radius:var(--r-lg);padding:40px 28px;text-align:center;color:var(--ink-soft)}
+  .empty h2{font-size:1.15rem;color:var(--fjord-900);margin-bottom:8px}
+  .empty p{font-size:.95rem;max-width:46ch;margin:0 auto}
+  .empty .cta{display:inline-block;margin-top:16px;background:var(--fjord-800);color:#fff;font-weight:700;padding:10px 18px;border-radius:var(--r-pill)}
+  .empty .cta:hover{text-decoration:none;background:var(--fjord-700)}
+  .pager{display:flex;align-items:center;justify-content:space-between;gap:12px;margin:24px 0 8px;flex-wrap:wrap}
+  .pager a,.pager span{font-size:.9rem;font-weight:700}
+  .pager .btn{display:inline-flex;align-items:center;gap:7px;padding:9px 16px;border-radius:var(--r-pill);background:var(--surface);border:1px solid var(--line);color:var(--fjord-700)}
+  .pager .btn:hover{text-decoration:none;border-color:var(--fjord-600)}
+  .pager .btn[aria-disabled="true"]{opacity:.4;pointer-events:none}
+  .pager .pos{color:var(--mist);font-weight:600}
+  .site-foot{margin-top:48px;border-top:1px solid var(--line);background:var(--canvas-2)}
+  .foot-inner{max-width:var(--maxw);margin:0 auto;padding:26px 24px;font-size:.84rem;color:var(--mist);display:flex;flex-wrap:wrap;gap:16px;justify-content:space-between}
+  .foot-inner a{color:var(--ink-soft)}
+`;
+
+// Brand nav + footer shared by every browse page.
+const BROWSE_NAV = `<a class="skip-link" href="#main">Hopp til innhold</a>
+<nav class="site-nav"><div class="nav-inner">
+  <a class="brand" href="/"><span class="mark"><svg viewBox="0 0 24 24" width="20" height="20" aria-hidden="true"><path d="M3 18 L9 7 L13 13 L16 9 L21 18 Z" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round"/></svg></span>Opplevagent</a>
+  <span class="nav-links"><a href="/opplevelser">Alle opplevelser</a><a href="/#kategorier">Kategorier</a></span>
+</div></nav>`;
+
+function browseFooter(): string {
+  return `<footer class="site-foot"><div class="foot-inner">
+  <span>© ${new Date().getFullYear()} Opplevagent — kuratert markedsplass for norske opplevelser.</span>
+  <span><a href="/opplevelser">Alle opplevelser</a> · <a href="/llms.txt">llms.txt</a> · <a href="/sitemap.xml">Sitemap</a></span>
+</div></footer>`;
+}
+
+function placeOf(row: { kommune?: string | null; fylke?: string | null }): string {
+  return [row.kommune, row.fylke].filter(Boolean).join(", ");
+}
+
+const PIN_SVG =
+  '<svg viewBox="0 0 24 24" width="14" height="14" aria-hidden="true"><path d="M12 2a7 7 0 0 0-7 7c0 5 7 13 7 13s7-8 7-13a7 7 0 0 0-7-7z" fill="none" stroke="currentColor" stroke-width="1.7"/><circle cx="12" cy="9" r="2.3" fill="currentColor"/></svg>';
+
+// Render one experience card. Title links to the guaranteed-live detail page.
+function renderCard(row: ExperienceCardRow): string {
+  const place = placeOf(row);
+  const desc = row.description
+    ? `<p class="c-desc">${escapeHtml(row.description)}</p>`
+    : "";
+  const tags: string[] = [];
+  if (row.category) tags.push(`<span class="tag tag-cat">${escapeHtml(catLabel(row.category))}</span>`);
+  if (row.indoor_outdoor) tags.push(`<span class="tag">${escapeHtml(ioLabel(row.indoor_outdoor))}</span>`);
+  if (row.price_from) tags.push(`<span class="tag">fra ${row.price_from} kr</span>`);
+  else if (row.price_band && PRICE_BAND_LABELS[row.price_band]) tags.push(`<span class="tag">${escapeHtml(PRICE_BAND_LABELS[row.price_band] as string)}</span>`);
+  return `<a class="card" href="/opplevelse/${encodeURIComponent(row.slug)}">
+    <span class="c-title">${escapeHtml(row.title)}</span>
+    ${place ? `<span class="c-place">${PIN_SVG}${escapeHtml(place)}</span>` : ""}
+    ${desc}
+    <span class="c-meta">${tags.join("")}</span>
+  </a>`;
+}
+
+type BreadcrumbCrumb = { name: string; href?: string };
+
+// Assemble a full browse page: meta + JSON-LD (CollectionPage with an ItemList of
+// the cards on THIS page + BreadcrumbList) + breadcrumbs + grid (or empty-state)
+// + pager. `canonicalPath` is the path WITHOUT query (so canonical is stable).
+function renderBrowsePage(opts: {
+  title: string;
+  h1: string;
+  metaDesc: string;
+  lede?: string;
+  canonicalPath: string;
+  crumbs: BreadcrumbCrumb[];
+  rows: ExperienceCardRow[];
+  total: number;
+  page: number;          // 1-based
+  pageSize: number;
+  pagerBase?: string;    // path used for ?page= links (defaults to canonicalPath)
+  extraTopHtml?: string; // e.g. search box / facet chips, rendered above the grid
+  emptyTitle?: string;
+  emptyBody?: string;
+}): string {
+  const url = baseUrl();
+  const canonical = `${url}${opts.canonicalPath}`;
+  const totalPages = Math.max(1, Math.ceil(opts.total / opts.pageSize));
+  const page = Math.min(Math.max(1, opts.page), totalPages);
+  const pagerBase = opts.pagerBase ?? opts.canonicalPath;
+
+  const itemList = opts.rows.map((r, i) => ({
+    "@type": "ListItem",
+    position: (page - 1) * opts.pageSize + i + 1,
+    url: `${url}/opplevelse/${encodeURIComponent(r.slug)}`,
+    name: r.title,
+  }));
+  const collectionLd = {
+    "@context": "https://schema.org",
+    "@type": "CollectionPage",
+    name: opts.h1,
+    description: opts.metaDesc,
+    url: canonical,
+    inLanguage: "nb-NO",
+    isPartOf: { "@type": "WebSite", name: "Opplevagent", url },
+    mainEntity: {
+      "@type": "ItemList",
+      numberOfItems: opts.total,
+      itemListElement: itemList,
+    },
+  };
+  const breadcrumbLd = {
+    "@context": "https://schema.org",
+    "@type": "BreadcrumbList",
+    itemListElement: opts.crumbs.map((c, i) => ({
+      "@type": "ListItem",
+      position: i + 1,
+      name: c.name,
+      ...(c.href ? { item: c.href.startsWith("http") ? c.href : `${url}${c.href}` } : {}),
+    })),
+  };
+  const ldScripts = [collectionLd, breadcrumbLd]
+    .map((o) => `<script type="application/ld+json">${JSON.stringify(o).replace(/<\//g, "<\\/")}</script>`)
+    .join("\n");
+
+  const crumbHtml = opts.crumbs
+    .map((c, i) =>
+      i < opts.crumbs.length - 1 && c.href
+        ? `<a href="${escapeHtml(c.href)}">${escapeHtml(c.name)}</a><span class="sep">/</span>`
+        : `<span aria-current="page">${escapeHtml(c.name)}</span>`
+    )
+    .join("");
+
+  const grid =
+    opts.rows.length > 0
+      ? `<div class="grid" role="list">${opts.rows.map(renderCard).join("")}</div>`
+      : `<div class="empty"><h2>${escapeHtml(opts.emptyTitle || "Ingen opplevelser her ennå")}</h2>
+         <p>${escapeHtml(opts.emptyBody || "Vi publiserer nye opplevelser fortløpende. Se alle opplevelser i mellomtiden.")}</p>
+         <a class="cta" href="/opplevelser">Se alle opplevelser</a></div>`;
+
+  // Pager — only shown when there's more than one page. rel=prev/next help crawlers.
+  let pager = "";
+  if (totalPages > 1) {
+    const sep = pagerBase.includes("?") ? "&" : "?";
+    const prevHref = page > 1 ? `${pagerBase}${sep}page=${page - 1}` : "";
+    const nextHref = page < totalPages ? `${pagerBase}${sep}page=${page + 1}` : "";
+    pager = `<nav class="pager" aria-label="Sidenavigasjon">
+      <a class="btn" href="${escapeHtml(prevHref || "#")}" ${prevHref ? "" : 'aria-disabled="true"'} rel="prev">← Forrige</a>
+      <span class="pos">Side ${page} av ${totalPages}</span>
+      <a class="btn" href="${escapeHtml(nextHref || "#")}" ${nextHref ? "" : 'aria-disabled="true"'} rel="next">Neste →</a>
+    </nav>`;
+  }
+  const linkRels =
+    (page > 1 ? `<link rel="prev" href="${escapeHtml(`${url}${pagerBase}${pagerBase.includes("?") ? "&" : "?"}page=${page - 1}`)}">\n` : "") +
+    (page < totalPages ? `<link rel="next" href="${escapeHtml(`${url}${pagerBase}${pagerBase.includes("?") ? "&" : "?"}page=${page + 1}`)}">\n` : "");
+
+  return `<!doctype html>
+<html lang="nb">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>${escapeHtml(opts.title)}</title>
+<meta name="description" content="${escapeHtml(opts.metaDesc)}">
+<meta name="robots" content="index, follow, max-snippet:-1, max-image-preview:large">
+<meta name="theme-color" content="#0b3d2e">
+<link rel="canonical" href="${canonical}">
+${linkRels}<link rel="icon" type="image/svg+xml" href="/favicon.svg">
+<meta property="og:title" content="${escapeHtml(opts.h1)}">
+<meta property="og:description" content="${escapeHtml(opts.metaDesc)}">
+<meta property="og:type" content="website">
+<meta property="og:url" content="${canonical}">
+<meta property="og:locale" content="nb_NO">
+<meta property="og:site_name" content="Opplevagent">
+<meta property="og:image" content="${url}/favicon.svg">
+<meta name="twitter:card" content="summary">
+${ldScripts}
+<style>${BROWSE_CSS}</style>
+</head>
+<body>
+${BROWSE_NAV}
+<main id="main" class="container">
+  <nav class="breadcrumb" aria-label="Brødsmuler">${crumbHtml}</nav>
+  <header class="head">
+    <h1>${escapeHtml(opts.h1)}</h1>
+    ${opts.lede ? `<p class="lede">${escapeHtml(opts.lede)}</p>` : ""}
+    <p class="count">${opts.total} ${opts.total === 1 ? "opplevelse" : "opplevelser"}</p>
+  </header>
+  ${opts.extraTopHtml || ""}
+  ${grid}
+  ${pager}
+</main>
+${browseFooter()}
+</body>
+</html>`;
+}
+
+// Parse ?page= into a 1-based page number (defensive; defaults to 1).
+function parsePage(q: unknown): number {
+  const n = parseInt(String(q ?? "1"), 10);
+  return Number.isFinite(n) && n > 0 ? n : 1;
+}
+
+// Facet chips (categories + fylker) for the index page top.
+function facetChips(): string {
+  let cats: Array<{ category: string; count: number }> = [];
+  let fylker: Array<{ fylke: string; count: number }> = [];
+  try { cats = listPublishedCategories(); } catch { cats = []; }
+  try { fylker = listPublishedFylker(); } catch { fylker = []; }
+  if (cats.length === 0 && fylker.length === 0) return "";
+  const catChips = cats
+    .map((c) => `<a class="chip" href="/kategori/${encodeURIComponent(c.category)}">${escapeHtml(catLabel(c.category))} <span class="n">${c.count}</span></a>`)
+    .join("");
+  const fylkeChips = fylker
+    .map((f) => `<a class="chip" href="/fylke/${encodeURIComponent(f.fylke)}">${escapeHtml(f.fylke)} <span class="n">${f.count}</span></a>`)
+    .join("");
+  let out = "";
+  if (catChips) out += `<div class="chips" role="list" aria-label="Kategorier">${catChips}</div>`;
+  if (fylkeChips) out += `<div class="chips" role="list" aria-label="Fylker">${fylkeChips}</div>`;
+  return out;
+}
+
+const SEARCH_SVG =
+  '<svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true"><circle cx="11" cy="11" r="7" fill="none" stroke="currentColor" stroke-width="2"/><path d="M16.5 16.5 L21 21" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>';
+
+function searchBox(currentQ: string): string {
+  return `<div class="searchbar">
+    <form action="/sok" method="GET" role="search" aria-label="Søk i opplevelser">
+      <span class="field">${SEARCH_SVG}
+        <label for="sok-q" class="skip-link">Søk i opplevelser</label>
+        <input id="sok-q" name="q" type="search" autocomplete="off" placeholder="Søk: hvalsafari, Tromsø, mat …" value="${escapeHtml(currentQ)}">
+      </span>
+      <button type="submit">Søk</button>
+    </form>
+  </div>`;
+}
+
+// ─── GET /opplevelser — paginated index of all published experiences ─────────
+router.get("/opplevelser", (req: Request, res: Response) => {
+  const page = parsePage(req.query.page);
+  let total = 0;
+  let rows: ExperienceCardRow[] = [];
+  try {
+    total = countPublishedExperiences();
+    rows = listPublishedExperiences({}, BROWSE_PAGE_SIZE, (page - 1) * BROWSE_PAGE_SIZE);
+  } catch { total = 0; rows = []; }
+
+  const html = renderBrowsePage({
+    title: "Alle opplevelser | Opplevagent",
+    h1: "Alle opplevelser",
+    metaDesc:
+      "Bla i alle kuraterte norske opplevelser på Opplevagent — hvalsafari, trehytter, guidede turer, mat og mer. Tilbydere verifisert mot Brønnøysundregistrene.",
+    lede: "Kuratert oversikt over norske opplevelser og aktiviteter. Filtrer på kategori eller fylke, eller søk fritt.",
+    canonicalPath: "/opplevelser",
+    crumbs: [{ name: "Forsiden", href: "/" }, { name: "Alle opplevelser" }],
+    rows,
+    total,
+    page,
+    pageSize: BROWSE_PAGE_SIZE,
+    extraTopHtml: searchBox("") + facetChips(),
+    emptyTitle: "Ingen publiserte opplevelser ennå",
+    emptyBody: "Vi verifiserer og publiserer nye opplevelser fortløpende. Kom gjerne tilbake snart.",
+  });
+  res.setHeader("Content-Type", "text/html; charset=utf-8");
+  res.setHeader("Cache-Control", "public, max-age=300");
+  res.send(html);
+});
+
+// ─── GET /kategori/:category — experiences in a category ─────────────────────
+router.get("/kategori/:category", (req: Request, res: Response, next: NextFunction) => {
+  const category = String(req.params.category || "");
+  if (!category) return next();
+  let total = 0;
+  let rows: ExperienceCardRow[] = [];
+  const page = parsePage(req.query.page);
+  try {
+    total = countPublishedExperiences({ category });
+    if (total === 0) return next(); // unknown/empty category → 404 (no orphan page)
+    rows = listPublishedExperiences({ category }, BROWSE_PAGE_SIZE, (page - 1) * BROWSE_PAGE_SIZE);
+  } catch {
+    return next();
+  }
+
+  const label = catLabel(category);
+  const html = renderBrowsePage({
+    title: `${label} | Opplevagent`,
+    h1: label,
+    metaDesc: `${label} i Norge — kuraterte opplevelser på Opplevagent med Brreg-verifiserte tilbydere. ${total} ${total === 1 ? "opplevelse" : "opplevelser"} i kategorien.`,
+    lede: `Opplevelser i kategorien ${label.toLowerCase()}.`,
+    canonicalPath: `/kategori/${encodeURIComponent(category)}`,
+    crumbs: [{ name: "Forsiden", href: "/" }, { name: "Alle opplevelser", href: "/opplevelser" }, { name: label }],
+    rows,
+    total,
+    page,
+    pageSize: BROWSE_PAGE_SIZE,
+    extraTopHtml: searchBox(""),
+  });
+  res.setHeader("Content-Type", "text/html; charset=utf-8");
+  res.setHeader("Cache-Control", "public, max-age=300");
+  res.send(html);
+});
+
+// ─── GET /fylke/:fylke — experiences in a county ─────────────────────────────
+router.get("/fylke/:fylke", (req: Request, res: Response, next: NextFunction) => {
+  const fylke = String(req.params.fylke || "");
+  if (!fylke) return next();
+  let total = 0;
+  let rows: ExperienceCardRow[] = [];
+  const page = parsePage(req.query.page);
+  try {
+    total = countPublishedExperiences({ fylke });
+    if (total === 0) return next(); // unknown/empty fylke → 404 (no orphan page)
+    rows = listPublishedExperiences({ fylke }, BROWSE_PAGE_SIZE, (page - 1) * BROWSE_PAGE_SIZE);
+  } catch {
+    return next();
+  }
+
+  const html = renderBrowsePage({
+    title: `Opplevelser i ${fylke} | Opplevagent`,
+    h1: `Opplevelser i ${fylke}`,
+    metaDesc: `Kuraterte opplevelser og aktiviteter i ${fylke} — verifiserte tilbydere på Opplevagent. ${total} ${total === 1 ? "opplevelse" : "opplevelser"}.`,
+    lede: `Hva kan du finne på i ${fylke}? Kuratert oversikt over opplevelser i fylket.`,
+    canonicalPath: `/fylke/${encodeURIComponent(fylke)}`,
+    crumbs: [{ name: "Forsiden", href: "/" }, { name: "Alle opplevelser", href: "/opplevelser" }, { name: fylke }],
+    rows,
+    total,
+    page,
+    pageSize: BROWSE_PAGE_SIZE,
+    extraTopHtml: searchBox(""),
+  });
+  res.setHeader("Content-Type", "text/html; charset=utf-8");
+  res.setHeader("Cache-Control", "public, max-age=300");
+  res.send(html);
+});
+
+// ─── GET /tilbyder/:providerId — one provider's experiences ──────────────────
+// providerId is the provider's UUID (experience_providers.id) — the same key
+// the detail page's "Alle opplevelser fra denne tilbyderen" link already uses,
+// so those links resolve. Providers with no PUBLISHED experience 404.
+router.get("/tilbyder/:providerId", (req: Request, res: Response, next: NextFunction) => {
+  const providerId = String(req.params.providerId || "");
+  if (!providerId) return next();
+  let provider: Record<string, unknown> | null = null;
+  try {
+    provider = getPublishedProviderById(providerId);
+  } catch {
+    provider = null;
+  }
+  if (!provider) return next(); // unknown provider / no live experiences → 404
+
+  const page = parsePage(req.query.page);
+  let total = 0;
+  let rows: ExperienceCardRow[] = [];
+  try {
+    total = countPublishedExperiences({ providerId });
+    rows = listPublishedExperiences({ providerId }, BROWSE_PAGE_SIZE, (page - 1) * BROWSE_PAGE_SIZE);
+  } catch { total = 0; rows = []; }
+
+  const navn = String(provider.navn || "Tilbyder");
+  const brregVerified = Number(provider.brreg_verified) === 1;
+  const provSite = safeHttpUrl(provider.hjemmeside);
+  const place = placeOf({ kommune: provider.kommune as string | null, fylke: provider.fylke as string | null });
+  let ledeBits = `Alle kuraterte opplevelser fra ${navn}`;
+  if (place) ledeBits += ` (${place})`;
+  ledeBits += ".";
+  const verifiedNote = brregVerified
+    ? `<div class="chips"><span class="chip">✓ Verifisert mot Brønnøysundregistrene</span>${provSite ? `<a class="chip" href="${escapeHtml(provSite)}" target="_blank" rel="noopener nofollow">Tilbyderens nettside →</a>` : ""}</div>`
+    : provSite ? `<div class="chips"><a class="chip" href="${escapeHtml(provSite)}" target="_blank" rel="noopener nofollow">Tilbyderens nettside →</a></div>` : "";
+
+  const html = renderBrowsePage({
+    title: `${navn} | Opplevagent`,
+    h1: navn,
+    metaDesc: `Opplevelser fra ${navn}${place ? " i " + place : ""} på Opplevagent. ${total} ${total === 1 ? "opplevelse" : "opplevelser"}.${brregVerified ? " Tilbyder verifisert mot Brønnøysundregistrene." : ""}`,
+    lede: ledeBits,
+    canonicalPath: `/tilbyder/${encodeURIComponent(providerId)}`,
+    crumbs: [{ name: "Forsiden", href: "/" }, { name: "Alle opplevelser", href: "/opplevelser" }, { name: navn }],
+    rows,
+    total,
+    page,
+    pageSize: BROWSE_PAGE_SIZE,
+    extraTopHtml: verifiedNote,
+  });
+  res.setHeader("Content-Type", "text/html; charset=utf-8");
+  res.setHeader("Cache-Control", "public, max-age=300");
+  res.send(html);
+});
+
+// ─── GET /sok?q= — HTML search-results page ──────────────────────────────────
+// Human-facing twin of the discover query. Reuses the publish gate so every
+// result links to a live detail page. Not paginated (capped result set); the
+// search box re-renders the current query.
+router.get("/sok", (req: Request, res: Response) => {
+  const q = String(req.query.q ?? "").trim();
+  let rows: ExperienceCardRow[] = [];
+  if (q) {
+    try {
+      rows = searchPublishedExperiences(q, 60);
+    } catch {
+      rows = [];
+    }
+  }
+
+  const h1 = q ? `Søk: «${q}»` : "Søk i opplevelser";
+  const metaDesc = q
+    ? `Søkeresultater for «${q}» på Opplevagent — kuraterte norske opplevelser med verifiserte tilbydere.`
+    : "Søk blant kuraterte norske opplevelser på Opplevagent — etter sted, kategori eller aktivitet.";
+  const emptyTitle = q ? `Ingen treff for «${q}»` : "Skriv inn et søk";
+  const emptyBody = q
+    ? "Prøv et annet søkeord, et stedsnavn eller en kategori. Du kan også bla i alle opplevelser."
+    : "Søk etter sted, kategori eller aktivitet — for eksempel «hvalsafari», «Tromsø» eller «mat».";
+
+  // Search pages are not indexed individually (thin/duplicative); the results
+  // still link to indexable detail pages.
+  const url = baseUrl();
+  const canonical = `${url}/sok`;
+  const cards =
+    rows.length > 0
+      ? `<div class="grid" role="list">${rows.map(renderCard).join("")}</div>`
+      : `<div class="empty"><h2>${escapeHtml(emptyTitle)}</h2><p>${escapeHtml(emptyBody)}</p><a class="cta" href="/opplevelser">Se alle opplevelser</a></div>`;
+
+  const breadcrumbLd = {
+    "@context": "https://schema.org",
+    "@type": "BreadcrumbList",
+    itemListElement: [
+      { "@type": "ListItem", position: 1, name: "Forsiden", item: url },
+      { "@type": "ListItem", position: 2, name: "Søk", item: canonical },
+    ],
+  };
+  const ldScript = `<script type="application/ld+json">${JSON.stringify(breadcrumbLd).replace(/<\//g, "<\\/")}</script>`;
+
+  const html = `<!doctype html>
+<html lang="nb">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>${escapeHtml(h1)} | Opplevagent</title>
+<meta name="description" content="${escapeHtml(metaDesc)}">
+<meta name="robots" content="noindex, follow">
+<meta name="theme-color" content="#0b3d2e">
+<link rel="canonical" href="${canonical}">
+<link rel="icon" type="image/svg+xml" href="/favicon.svg">
+${ldScript}
+<style>${BROWSE_CSS}</style>
+</head>
+<body>
+${BROWSE_NAV}
+<main id="main" class="container">
+  <nav class="breadcrumb" aria-label="Brødsmuler"><a href="/">Forsiden</a><span class="sep">/</span><span aria-current="page">Søk</span></nav>
+  <header class="head">
+    <h1>${escapeHtml(h1)}</h1>
+    ${q ? `<p class="count">${rows.length} ${rows.length === 1 ? "treff" : "treff"}</p>` : ""}
+  </header>
+  ${searchBox(q)}
+  ${cards}
+</main>
+${browseFooter()}
+</body>
+</html>`;
+  res.setHeader("Content-Type", "text/html; charset=utf-8");
+  res.send(html);
+});
 
 router.get("/opplevelse/:slug", (req: Request, res: Response, next: NextFunction) => {
   const slug = String(req.params.slug || "");
