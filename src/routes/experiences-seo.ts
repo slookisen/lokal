@@ -406,7 +406,7 @@ ${ldScripts}
         <p class="discover-hint">Søk på sted, kategori eller aktivitet &mdash; eller <a href="/opplevelser" style="color:#fff;text-decoration:underline">bla i alle opplevelser</a>. Agenter kan kalle <code>GET /api/opplevelser/discover</code> direkte.</p>
         <div class="quick" role="list" aria-label="Hurtigsøk">
           <a role="listitem" href="/fylke/Oslo">Oslo</a>
-          <a role="listitem" href="/fylke/Troms">Troms</a>
+          <a role="listitem" href="/fylke/Troms%20og%20Finnmark">Troms og Finnmark</a>
           <a role="listitem" href="/sok?q=natur">Ute i naturen</a>
           <a role="listitem" href="/opplevelser">Alle opplevelser</a>
         </div>
@@ -1804,6 +1804,84 @@ router.get("/opplevelse/:slug", (req: Request, res: Response, next: NextFunction
   res.send(renderOpplevelseDetail(exp, provider, related, baseUrl()));
 });
 
+
+
+
+// ═══════════════════════════════════════════════════════════
+// GET /favicon.svg — site icon for Opplevagent
+// express.static is bypassed by the opplevagent host-gate in index.ts,
+// so static assets must be served explicitly from this router.
+// Mirrors the dental-seo.ts pattern (dental PR-112).
+// ═══════════════════════════════════════════════════════════
+router.get("/favicon.svg", (_req: Request, res: Response) => {
+  res.setHeader("Content-Type", "image/svg+xml");
+  res.setHeader("Cache-Control", "public, max-age=86400");
+  res.send(`<svg width="1024" height="1024" viewBox="0 0 1024 1024" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#7AB83A"/>
+      <stop offset="55%" stop-color="#5A9A2E"/>
+      <stop offset="100%" stop-color="#3E7A1E"/>
+    </linearGradient>
+    <radialGradient id="sheen" cx="0.3" cy="0.25" r="0.8">
+      <stop offset="0%" stop-color="#ffffff" stop-opacity="0.22"/>
+      <stop offset="60%" stop-color="#ffffff" stop-opacity="0"/>
+    </radialGradient>
+    <linearGradient id="leafShade" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#ffffff"/>
+      <stop offset="100%" stop-color="#e8f5dc"/>
+    </linearGradient>
+    <filter id="softShadow" x="-20%" y="-20%" width="140%" height="140%">
+      <feGaussianBlur in="SourceAlpha" stdDeviation="8"/>
+      <feOffset dx="0" dy="6" result="offsetblur"/>
+      <feComponentTransfer>
+        <feFuncA type="linear" slope="0.30"/>
+      </feComponentTransfer>
+      <feMerge>
+        <feMergeNode/>
+        <feMergeNode in="SourceGraphic"/>
+      </feMerge>
+    </filter>
+  </defs>
+
+  <!-- Rounded-square background (iOS-style corner radius ~22%) -->
+  <rect x="0" y="0" width="1024" height="1024" rx="228" ry="228" fill="url(#bg)"/>
+  <rect x="0" y="0" width="1024" height="1024" rx="228" ry="228" fill="url(#sheen)"/>
+
+  <!-- Sprout group, centered -->
+  <g filter="url(#softShadow)">
+    <!-- Stem: gentle curve from bottom up to leaf junction -->
+    <path d="M 512 820
+             C 512 760, 512 680, 512 580"
+          stroke="#ffffff" stroke-width="42"
+          stroke-linecap="round" fill="none"/>
+
+    <!-- Left leaf: rounded teardrop curving up-and-out, tip pointing up-left -->
+    <path d="M 512 580
+             C 420 620, 280 560, 220 380
+             C 320 360, 470 430, 512 580 Z"
+          fill="url(#leafShade)"/>
+
+    <!-- Right leaf: mirrored teardrop, tip up-and-right -->
+    <path d="M 512 580
+             C 604 620, 744 560, 804 380
+             C 704 360, 554 430, 512 580 Z"
+          fill="url(#leafShade)"/>
+
+    <!-- Left leaf vein (subtle) -->
+    <path d="M 500 570
+             C 420 540, 340 480, 280 400"
+          stroke="#c8e3a8" stroke-width="7"
+          stroke-linecap="round" fill="none" opacity="0.6"/>
+
+    <!-- Right leaf vein (subtle) -->
+    <path d="M 524 570
+             C 604 540, 684 480, 744 400"
+          stroke="#c8e3a8" stroke-width="7"
+          stroke-linecap="round" fill="none" opacity="0.6"/>
+  </g>
+</svg>`);
+});
 
 // ═══════════════════════════════════════════════════════════
 // Catch-all 404 — norsk side (forhindrer rfb/dental-innhold på opplevagent-host)
