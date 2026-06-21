@@ -55,23 +55,60 @@ interface RoutineRef {
   token: string;
 }
 
-/** Parse `FIRE_ROUTINES` (a JSON map agent → {trig, token}). Empty/invalid → {}. */
-function getRoutineMap(): Record<string, RoutineRef> {
+/** Short keys → canonical agent names (the names that appear in next_suggested). */
+const ROUTINE_ALIAS: Record<string, string> = {
+  controller: "orchestrator-v3-controller",
+  orchestrator: "platform-orchestrator",
+  supervisor: "rfb-supervisor",
+  verifier: "platform-verifier",
+};
+
+/** Non-secret-leaking parse diagnostic for the GET endpoint (NEVER includes trig/token values). */
+interface RoutineDiag {
+  present: boolean;
+  length: number;
+  parse_ok: boolean;
+  parse_error: string | null;
+  raw_keys: string[];
+  mapped_keys: string[];
+}
+
+/**
+ * Parse `FIRE_ROUTINES` (a JSON map agent → {trig, token}) into a canonical map + a
+ * diagnostic. Short keys (controller/orchestrator/supervisor/verifier) are normalised to the
+ * full agent names so the dispatch lookup (which keys off next_suggested) matches. The diag
+ * exposes only presence/length/parse-state/key-NAMES — never the trig/token values.
+ */
+function parseRoutines(): { map: Record<string, RoutineRef>; diag: RoutineDiag } {
   const raw = process.env.FIRE_ROUTINES;
-  if (!raw) return {};
+  const diag: RoutineDiag = {
+    present: !!raw,
+    length: raw ? raw.length : 0,
+    parse_ok: false,
+    parse_error: null,
+    raw_keys: [],
+    mapped_keys: [],
+  };
+  const map: Record<string, RoutineRef> = {};
+  if (!raw) return { map, diag };
+  let parsed: Record<string, unknown>;
   try {
-    const parsed = JSON.parse(raw) as Record<string, unknown>;
-    const out: Record<string, RoutineRef> = {};
-    for (const [agent, v] of Object.entries(parsed)) {
-      const ref = v as { trig?: unknown; token?: unknown };
-      if (ref && typeof ref.trig === "string" && typeof ref.token === "string") {
-        out[agent] = { trig: ref.trig, token: ref.token };
-      }
-    }
-    return out;
-  } catch {
-    return {};
+    parsed = JSON.parse(raw) as Record<string, unknown>;
+    diag.parse_ok = true;
+  } catch (err: any) {
+    diag.parse_error = String(err?.message || err).slice(0, 120);
+    return { map, diag };
   }
+  for (const [agent, v] of Object.entries(parsed)) {
+    diag.raw_keys.push(agent);
+    const ref = v as { trig?: unknown; token?: unknown };
+    if (ref && typeof ref.trig === "string" && typeof ref.token === "string") {
+      const canonical = ROUTINE_ALIAS[agent] || agent;
+      map[canonical] = { trig: ref.trig, token: ref.token };
+    }
+  }
+  diag.mapped_keys = Object.keys(map);
+  return { map, diag };
 }
 
 async function fireRoutine(
@@ -123,7 +160,7 @@ router.post("/", async (req: Request, res: Response) => {
   const startedAt = new Date().toISOString();
   try {
     const plan = planNow();
-    const routines = getRoutineMap();
+    const { map: routines, diag: routineDiag } = parseRoutines();
     const envMode = (process.env.DISPATCH_FIRE_MODE || "shadow").toLowerCase();
     const mode =
       String(req.query.mode || envMode).toLowerCase() === "active" ? "active" : "shadow";
@@ -184,6 +221,7 @@ router.post("/", async (req: Request, res: Response) => {
       mode,
       ...plan,
       routines: Object.keys(routines),
+      fire_routines: routineDiag,
       fired,
       deferred,
       envelope_run_id: envelope.run_id,
@@ -197,7 +235,8 @@ router.post("/", async (req: Request, res: Response) => {
 router.get("/", (req: Request, res: Response) => {
   if (!requireAdmin(req, res)) return;
   try {
-    res.json({ success: true, mode: "preview", ...planNow(), routines: Object.keys(getRoutineMap()) });
+    const { map, diag } = parseRoutines();
+    res.json({ success: true, mode: "preview", ...planNow(), routines: Object.keys(map), fire_routines: diag });
   } catch (err: any) {
     res.status(500).json({ success: false, error: String(err?.message || err) });
   }
