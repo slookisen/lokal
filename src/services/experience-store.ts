@@ -380,6 +380,190 @@ export function getRelatedPublishedExperiences(
     }) as RelatedExperienceRow[];
 }
 
+// ─── Phase 2: human-browse listing reads (opplevagent.no) ───────────────────
+// The browse subpages (/opplevelser, /kategori/:c, /fylke/:f, /tilbyder/:id,
+// /sok) plus the DB-driven sitemap all read through these. EVERY query reuses
+// the SAME PUBLISH_GATE_SQL the detail page + /discover use, so the set of rows
+// reachable from any index page == the set with a live detail page == the set
+// in the sitemap (100% weave, zero orphan/dead links — the work-order's core
+// requirement). Read-only; no schema change.
+
+// One card's worth of columns — the shared listing-row shape used by every
+// browse page (index/category/fylke/provider/search).
+export type ExperienceCardRow = {
+  slug: string;
+  title: string;
+  description: string | null;
+  category: string | null;
+  fylke: string | null;
+  kommune: string | null;
+  indoor_outdoor: string | null;
+  duration_min: number | null;
+  price_from: number | null;
+  price_band: string | null;
+  confidence: string | null;
+};
+
+const CARD_COLS =
+  "e.slug AS slug, e.title AS title, e.description AS description, " +
+  "e.category AS category, e.fylke AS fylke, e.kommune AS kommune, " +
+  "e.indoor_outdoor AS indoor_outdoor, e.duration_min AS duration_min, " +
+  "e.price_from AS price_from, e.price_band AS price_band, e.confidence AS confidence";
+
+// Confidence-then-title ordering, identical to /discover, so listings rank the
+// same way the agent surface does.
+const CARD_ORDER =
+  "ORDER BY CASE e.confidence WHEN 'high' THEN 0 WHEN 'medium' THEN 1 ELSE 2 END, e.title ASC";
+
+export type BrowseFilter = {
+  category?: string | null;
+  fylke?: string | null;
+  providerId?: string | null;
+};
+
+function browseWhere(filter: BrowseFilter): { sql: string; params: Record<string, unknown> } {
+  const where: string[] = [`e.slug IS NOT NULL`, PUBLISH_GATE_SQL];
+  const params: Record<string, unknown> = {};
+  if (filter.category) { where.push("e.category = @category"); params.category = filter.category; }
+  if (filter.fylke) { where.push("e.fylke = @fylke"); params.fylke = filter.fylke; }
+  if (filter.providerId) { where.push("e.provider_id = @providerId"); params.providerId = filter.providerId; }
+  return { sql: where.join(" AND "), params };
+}
+
+/** Count published experiences matching an optional category/fylke/provider filter. */
+export function countPublishedExperiences(filter: BrowseFilter = {}): number {
+  const db = getDb(VERTICAL);
+  const { sql, params } = browseWhere(filter);
+  const row = db
+    .prepare(
+      `SELECT COUNT(*) AS c FROM experiences e
+       LEFT JOIN experience_providers p ON p.id = e.provider_id
+       WHERE ${sql}`
+    )
+    .get(params) as { c: number };
+  return row.c;
+}
+
+/** A page of published experience cards (paginated), optionally filtered. */
+export function listPublishedExperiences(
+  filter: BrowseFilter = {},
+  limit = 24,
+  offset = 0
+): ExperienceCardRow[] {
+  const db = getDb(VERTICAL);
+  const { sql, params } = browseWhere(filter);
+  params.limit = Math.max(1, Math.min(100, limit));
+  params.offset = Math.max(0, offset);
+  return db
+    .prepare(
+      `SELECT ${CARD_COLS} FROM experiences e
+       LEFT JOIN experience_providers p ON p.id = e.provider_id
+       WHERE ${sql}
+       ${CARD_ORDER}
+       LIMIT @limit OFFSET @offset`
+    )
+    .all(params) as ExperienceCardRow[];
+}
+
+/** Distinct categories that have ≥1 PUBLISHED experience (with counts). Drives
+ *  the homepage cards, the /opplevelser facet list, and the sitemap category
+ *  URLs — so every linked category page is guaranteed non-empty. */
+export function listPublishedCategories(): Array<{ category: string; count: number }> {
+  const db = getDb(VERTICAL);
+  return db
+    .prepare(
+      `SELECT e.category AS category, COUNT(*) AS count FROM experiences e
+       LEFT JOIN experience_providers p ON p.id = e.provider_id
+       WHERE e.category IS NOT NULL AND e.category != '' AND ${PUBLISH_GATE_SQL}
+       GROUP BY e.category ORDER BY count DESC, e.category ASC`
+    )
+    .all() as Array<{ category: string; count: number }>;
+}
+
+/** Distinct fylker that have ≥1 PUBLISHED experience (with counts). */
+export function listPublishedFylker(): Array<{ fylke: string; count: number }> {
+  const db = getDb(VERTICAL);
+  return db
+    .prepare(
+      `SELECT e.fylke AS fylke, COUNT(*) AS count FROM experiences e
+       LEFT JOIN experience_providers p ON p.id = e.provider_id
+       WHERE e.fylke IS NOT NULL AND e.fylke != '' AND ${PUBLISH_GATE_SQL}
+       GROUP BY e.fylke ORDER BY count DESC, e.fylke ASC`
+    )
+    .all() as Array<{ fylke: string; count: number }>;
+}
+
+/** Distinct providers that have ≥1 PUBLISHED experience (id, name, counts). */
+export type PublishedProviderRow = {
+  id: string;
+  navn: string;
+  fylke: string | null;
+  kommune: string | null;
+  count: number;
+};
+export function listPublishedProviders(): PublishedProviderRow[] {
+  const db = getDb(VERTICAL);
+  return db
+    .prepare(
+      `SELECT p.id AS id, p.navn AS navn, p.fylke AS fylke, p.kommune AS kommune,
+              COUNT(*) AS count
+       FROM experiences e
+       JOIN experience_providers p ON p.id = e.provider_id
+       WHERE e.slug IS NOT NULL AND ${PUBLISH_GATE_SQL}
+       GROUP BY p.id ORDER BY count DESC, p.navn ASC`
+    )
+    .all() as PublishedProviderRow[];
+}
+
+/** A provider row, but only if it currently has ≥1 PUBLISHED experience. Used by
+ *  the /tilbyder/:id page so providers with no live experience 404 (no orphan). */
+export function getPublishedProviderById(id: string): Record<string, unknown> | null {
+  if (!id) return null;
+  const db = getDb(VERTICAL);
+  const row = db
+    .prepare(
+      `SELECT p.* FROM experience_providers p
+       WHERE p.id = @id AND EXISTS (
+         SELECT 1 FROM experiences e
+         WHERE e.provider_id = p.id AND e.slug IS NOT NULL AND ${PUBLISH_GATE_SQL}
+       )`
+    )
+    .get({ id }) as Record<string, unknown> | undefined;
+  return row ?? null;
+}
+
+/** Free-text search over PUBLISHED experiences (title/description/category/place).
+ *  Reuses the publish gate so search only ever returns rows that have a live
+ *  detail page. Tokenised AND match — every whitespace-separated term must hit
+ *  at least one searchable column. */
+export function searchPublishedExperiences(query: string, limit = 30): ExperienceCardRow[] {
+  const q = String(query || "").trim();
+  if (!q) return [];
+  const terms = q.split(/\s+/).filter((t) => t.length > 0).slice(0, 8);
+  if (terms.length === 0) return [];
+  const db = getDb(VERTICAL);
+  const params: Record<string, unknown> = { limit: Math.max(1, Math.min(100, limit)) };
+  const termClauses = terms.map((t, i) => {
+    const key = `t${i}`;
+    params[key] = `%${t.toLowerCase()}%`;
+    return (
+      `(lower(e.title) LIKE @${key} OR lower(COALESCE(e.description,'')) LIKE @${key} ` +
+      `OR lower(COALESCE(e.category,'')) LIKE @${key} OR lower(COALESCE(e.fylke,'')) LIKE @${key} ` +
+      `OR lower(COALESCE(e.kommune,'')) LIKE @${key})`
+    );
+  });
+  return db
+    .prepare(
+      `SELECT ${CARD_COLS} FROM experiences e
+       LEFT JOIN experience_providers p ON p.id = e.provider_id
+       WHERE e.slug IS NOT NULL AND ${PUBLISH_GATE_SQL}
+         AND ${termClauses.join(" AND ")}
+       ${CARD_ORDER}
+       LIMIT @limit`
+    )
+    .all(params) as ExperienceCardRow[];
+}
+
 
 /**
  * Intent-discovery query — the heart of "Hva kan vi finne på i [sted]".
