@@ -827,6 +827,52 @@ function numOrNull(v: unknown): number | null {
   return Number.isFinite(n) ? n : null;
 }
 
+// Category → inline SVG glyph for the hero placeholder. Mirrors the homepage
+// glyph set but keys on the internal category CODE (e.g. "vinter_sno") rather
+// than a display label, so it works directly off exp.category.
+const DETAIL_GLYPHS: Record<string, string> = {
+  peak: '<path d="M3 18 L9 7 L13 13 L16 9 L21 18 Z" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round"/>',
+  wave: '<path d="M3 9 Q6 6 9 9 T15 9 T21 9 M3 14 Q6 11 9 14 T15 14 T21 14" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/>',
+  cup: '<path d="M6 4 H16 V11 A5 5 0 0 1 6 11 Z M16 6 H18.5 A2 2 0 0 1 18.5 10 H16 M5 20 H17" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round" stroke-linecap="round"/>',
+  snow: '<path d="M12 3 V21 M4.5 7.5 L19.5 16.5 M19.5 7.5 L4.5 16.5" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/>',
+  frame: '<rect x="4" y="5" width="16" height="14" rx="1.5" fill="none" stroke="currentColor" stroke-width="1.4"/><path d="M4 15 L9 10 L13 14 L16 11 L20 15" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round"/>',
+  spark: '<path d="M12 3 L14 10 L21 12 L14 14 L12 21 L10 14 L3 12 L10 10 Z" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round"/>',
+  bed: '<path d="M3 17 V9 H13 A4 4 0 0 1 17 13 H21 V17 M3 13 H21 M3 17 V19 M21 17 V19" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/>',
+  spa: '<path d="M12 21 C7 17 5 13 8 10 C10 8 12 10 12 12 C12 10 14 8 16 10 C19 13 17 17 12 21 Z M12 12 V3" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round"/>',
+  compass: '<circle cx="12" cy="12" r="9" fill="none" stroke="currentColor" stroke-width="1.4"/><path d="M15.5 8.5 L11 11 L8.5 15.5 L13 13 Z" fill="currentColor"/>',
+};
+function detailGlyphKey(cat: string | null | undefined): string {
+  const c = String(cat ?? "").toLowerCase();
+  // Order matters: winter ("vinter") is checked before food so the "vin"
+  // substring in "vinter" doesn't get mis-routed to the wine/cup glyph.
+  if (/(vinter|ski|_sno|snø|aking|skøyte)/.test(c)) return "snow";
+  if (/(vann|safari|hval|kajakk|fjord|båt|seil|dykk|fiske|dyreliv)/.test(c)) return "wave";
+  if (/(overnatting|hytte|telt|camp)/.test(c)) return "bed";
+  if (/(velvaere|velvære|spa|wellness)/.test(c)) return "spa";
+  if (/(kultur|museum|kunst|historie|teater)/.test(c)) return "frame";
+  if (/(adrenalin|action|familie|barn|lek|park|laser)/.test(c)) return "spark";
+  if (/(natur|friluft|fjell|tur|hike|vandr|klatr|sightseeing|transport)/.test(c)) return "peak";
+  if (/(mat|drikke|smak|øl|vin|gård|food)/.test(c)) return "cup";
+  return "compass";
+}
+
+// Hero media: render a real photo if the row carries one (future enrichment),
+// otherwise a branded, category-themed SVG placeholder. The typed Experience
+// schema has no image column today, so we read image_url/image/hero_image
+// defensively — when enrichment adds one, this lights up with no code change.
+function renderHeroMedia(exp: Record<string, unknown>, cat: string | null, place: string): string {
+  const img = safeHttpUrl(exp.image_url ?? exp.image ?? exp.hero_image);
+  if (img) {
+    const alt = `${String(exp.title ?? "Opplevelse")}${place ? " – " + place : ""}`;
+    return `<figure class="hero-media"><img src="${escapeHtml(img)}" alt="${escapeHtml(alt)}" loading="lazy" decoding="async" width="1080" height="540"></figure>`;
+  }
+  const glyph = DETAIL_GLYPHS[detailGlyphKey(cat)];
+  return `<figure class="hero-media hero-placeholder" role="img" aria-label="${escapeHtml(catLabel(cat))} — illustrasjon">
+      <svg class="hero-glyph" viewBox="0 0 24 24" width="72" height="72" aria-hidden="true">${glyph}</svg>
+      <figcaption class="hero-cap">${escapeHtml(catLabel(cat))}</figcaption>
+    </figure>`;
+}
+
 function renderOpplevelseDetail(
   exp: ReturnType<typeof getPublishedExperienceBySlug>,
   provider: Record<string, unknown> | null,
@@ -885,6 +931,10 @@ function renderOpplevelseDetail(
   if ((exp.accessibility || []).length) facts.push(["Tilgjengelighet", escapeHtml((exp.accessibility || []).join(", "))]);
   if (exp.meeting_point) facts.push(["Oppmøte", escapeHtml(exp.meeting_point)]);
   const factsRows = facts.map(([k, v]) => `<tr><th scope="row">${escapeHtml(k)}</th><td>${v}</td></tr>`).join("");
+
+  // Hero media — real photo when the row has one (enrichment-gated), else a
+  // branded category placeholder. exp is typed without an image column today.
+  const heroMedia = renderHeroMedia(exp as unknown as Record<string, unknown>, cat, place);
 
   // Description block (graceful fallback when no own summary yet).
   const descBlock = exp.description
@@ -950,6 +1000,19 @@ function renderOpplevelseDetail(
     address: { "@type": "PostalAddress", addressLocality: exp.kommune || undefined, addressRegion: exp.fylke || undefined, addressCountry: "NO" },
   };
   if (lat !== null && lon !== null) ld.geo = { "@type": "GeoCoordinates", latitude: lat, longitude: lon };
+  // Offer — only when there is a concrete starting price. Price bands alone are
+  // too coarse for a valid schema.org Offer (no numeric price), so band-only
+  // rows are intentionally left without an Offer node.
+  if (exp.price_from) {
+    const offer: Record<string, unknown> = {
+      "@type": "Offer",
+      price: exp.price_from,
+      priceCurrency: "NOK",
+      availability: "https://schema.org/InStock",
+    };
+    if (bookingUrl || provSite) offer.url = bookingUrl || provSite;
+    ld.offers = offer;
+  }
   if (provName) ld.provider = { "@type": "Organization", name: provName, ...(provSite ? { url: provSite } : {}) };
   const breadcrumb = {
     "@context": "https://schema.org",
@@ -1029,6 +1092,12 @@ ${ldScripts}
   @media(max-width:860px){.layout{grid-template-columns:1fr;gap:22px}}
   .lede{font-size:1.08rem;color:var(--ink);margin-bottom:22px}
   .lede-soft{color:var(--ink-soft)}
+  .hero-media{margin:0 0 24px;border-radius:var(--r-lg);overflow:hidden;border:1px solid var(--line);box-shadow:var(--sh-sm)}
+  .hero-media img{display:block;width:100%;height:auto;aspect-ratio:2/1;object-fit:cover}
+  .hero-placeholder{position:relative;aspect-ratio:2/1;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:12px;background:linear-gradient(150deg,var(--canvas-2),var(--canvas));color:var(--fjord-600)}
+  .hero-placeholder::after{content:"";position:absolute;inset:0;background-image:radial-gradient(circle at 1px 1px,rgba(15,81,50,.10) 1px,transparent 0);background-size:18px 18px;pointer-events:none}
+  .hero-glyph{position:relative;z-index:1;opacity:.85}
+  .hero-cap{position:relative;z-index:1;font-size:.82rem;font-weight:700;letter-spacing:.04em;text-transform:uppercase;color:var(--mist)}
   .facts{width:100%;border-collapse:collapse;background:var(--surface);border:1px solid var(--line);border-radius:var(--r-md);overflow:hidden}
   .facts th,.facts td{text-align:left;padding:12px 16px;font-size:.92rem;border-bottom:1px solid var(--line);vertical-align:top}
   .facts tr:last-child th,.facts tr:last-child td{border-bottom:none}
@@ -1080,6 +1149,7 @@ ${ldScripts}
   </header>
   <div class="layout">
     <article>
+      ${heroMedia}
       ${descBlock}
       <table class="facts"><caption class="skip-link">Fakta om opplevelsen</caption><tbody>${factsRows}</tbody></table>
       ${evBlock}
