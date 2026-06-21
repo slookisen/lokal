@@ -5,6 +5,7 @@
 
 import { redactPII, isValidFodselsnummer } from "../src/utils/pii-redact";
 import { computeLoopHealth } from "../src/services/loop-health";
+import { computeWakeList } from "../src/services/loop-dispatch";
 
 let passed = 0;
 let failed = 0;
@@ -17275,6 +17276,58 @@ const _orchPr20260614_2Promise = (async () => {
   const h4 = computeLoopHealth([], { nowMs: nightUTC });
   assertEq(h4.status, "paused", "heartbeat: outside active window -> paused");
   assertEq(h4.stalledAgents.length, 0, "heartbeat: paused has no stalled agents");
+}
+
+// -- P2.5 loop-dispatch (computeWakeList, pure) --
+{
+  const MIN = 60_000;
+  const baseUTC = Date.parse("2026-06-22T10:00:00Z");
+  const mk = (run_id: string, agent: string, agoMin: number, next_suggested: string[] = []) => ({
+    run_id,
+    agent,
+    started_at: new Date(baseUTC - agoMin * MIN).toISOString(),
+    finished_at: new Date(baseUTC - agoMin * MIN).toISOString(),
+    next_suggested,
+  });
+
+  // Fresh run suggests an allowlisted, non-cooled agent -> exactly one wake.
+  const p1 = computeWakeList([mk("r1", "rfb-supervisor", 2, ["orchestrator-v3-controller"])], { nowMs: baseUTC });
+  assertEq(p1.wake.length, 1, "dispatch: fresh suggestion -> 1 wake");
+  assertEq(p1.wake[0]!.agent, "orchestrator-v3-controller", "dispatch: wakes the suggested agent");
+  assertEq(p1.wake[0]!.reason, "r1", "dispatch: reason is the source run_id");
+
+  // Target ran 5 min ago (< 25 cooldown) -> skipped on cooldown.
+  const p2 = computeWakeList(
+    [mk("r2", "rfb-supervisor", 2, ["platform-orchestrator"]), mk("r3", "platform-orchestrator", 5, [])],
+    { nowMs: baseUTC },
+  );
+  assertEq(p2.wake.length, 0, "dispatch: cooled-down target -> no wake");
+  assertTrue(p2.skip.some((s) => s.agent === "platform-orchestrator" && /cooldown/.test(s.reason)), "dispatch: cooldown skip recorded");
+
+  // Non-allowlisted suggestion -> skipped.
+  const p3 = computeWakeList([mk("r4", "rfb-supervisor", 2, ["marketing-comms-agent"])], { nowMs: baseUTC });
+  assertEq(p3.wake.length, 0, "dispatch: non-allowlisted -> no wake");
+  assertTrue(p3.skip.some((s) => s.agent === "marketing-comms-agent" && /allowlist/.test(s.reason)), "dispatch: allowlist skip recorded");
+
+  // Stale run (20 min > 12 window) -> not a candidate.
+  const p4 = computeWakeList([mk("r5", "rfb-supervisor", 20, ["platform-verifier"])], { nowMs: baseUTC });
+  assertEq(p4.candidates, 0, "dispatch: stale run is not a candidate");
+  assertEq(p4.wake.length, 0, "dispatch: stale run -> no wake");
+
+  // Same target suggested by two fresh runs -> woken at most once.
+  const p5 = computeWakeList(
+    [mk("r6", "rfb-supervisor", 1, ["platform-verifier"]), mk("r7", "platform-orchestrator", 1, ["platform-verifier"])],
+    { nowMs: baseUTC, cooldownMin: 0 },
+  );
+  assertEq(p5.wake.filter((w) => w.agent === "platform-verifier").length, 1, "dispatch: one wake per agent per cycle");
+
+  // Outside active window (02:00 UTC) -> paused, nothing woken.
+  const p6 = computeWakeList([mk("r8", "rfb-supervisor", 1, ["orchestrator-v3-controller"])], {
+    nowMs: Date.parse("2026-06-22T02:00:00Z"),
+    cooldownMin: 0,
+  });
+  assertTrue(!p6.inActiveWindow, "dispatch: 02:00 UTC is outside active window");
+  assertEq(p6.wake.length, 0, "dispatch: paused window -> no wake");
 }
 
 // Wait for the M2 owner-portal async tests before reporting so their
