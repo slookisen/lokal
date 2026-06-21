@@ -15034,6 +15034,33 @@ console.log("\n── opplevagent P2: human-browse subpages (experiences) ──
   assertTrue(homeP2.body.includes("/sok?q={search_term_string}"),
     "p2-07f: homepage WebSite SearchAction points at the HTML /sok page");
 
+  // p2-08: /kommune/:kommune — place pages mirroring /fylke. Closes the dead
+  // /kommune/<x> links every detail page already emits ("Kommune" fact row).
+  // Unknown/empty kommune → 404; on-brand; excludes drafts + other municipalities.
+  const kommP2 = invokeSeo("/kommune/:kommune", { kommune: "Tromsø" }, "/kommune/Tromsø");
+  assertEq(kommP2.status, 200, "p2-08a: GET /kommune/Tromsø → 200");
+  assertTrue(/Hvalsafari i Tromsø/.test(kommP2.body) && /Nordlysjakt med buss/.test(kommP2.body),
+    "p2-08b: kommune page lists that municipality's experiences");
+  assertTrue(!/Tapasvandring i Oslo/.test(kommP2.body), "p2-08c: kommune page excludes other municipalities");
+  assertTrue(kommP2.body.includes(`/opplevelse/${whaleSlugP2}`), "p2-08d: kommune cards link to live detail pages");
+  assertTrue(kommP2.body.includes('"@type":"CollectionPage"'), "p2-08e: kommune page emits CollectionPage JSON-LD");
+  assertTrue(kommP2.body.includes('href="/fylke/Troms"'), "p2-08f: kommune breadcrumb up-links to its fylke");
+  assertTrue(kommP2.body.includes('<link rel="canonical" href="https://opplevagent.no/kommune/Troms'),
+    "p2-08g: kommune canonical is the absolute opplevagent URL");
+  assertTrue(!new RegExp(draftSlugP2).test(kommP2.body) && !/Hemmelig utkast/.test(kommP2.body),
+    "p2-08h: kommune page excludes the unpublished draft");
+  const kommMissP2 = invokeSeo("/kommune/:kommune", { kommune: "Nowhereville" }, "/kommune/Nowhereville");
+  assertEq(kommMissP2.status, 404, "p2-08i: unknown kommune → 404 (next())");
+  assertTrue(!/Rett fra Bonden/i.test(kommP2.body) && !/tannlege/i.test(kommP2.body),
+    "p2-08j: kommune page does NOT leak rfb/dental identity");
+  // p2-08k: sitemap now weaves kommune URLs (DB-driven, through the publish gate).
+  const smKommP2 = invokeSeo("/sitemap.xml", {}, "/sitemap.xml");
+  assertTrue(smKommP2.body.includes("/kommune/Troms"), "p2-08k: sitemap includes kommune URLs");
+  // p2-08l: /fylke/:fylke now cross-links its kommuner (place hierarchy crawlable).
+  const fylkeKommP2 = invokeSeo("/fylke/:fylke", { fylke: "Troms" }, "/fylke/Troms");
+  assertTrue(fylkeKommP2.body.includes('href="/kommune/Troms'),
+    "p2-08l: fylke page renders kommune chips linking to /kommune/<x>");
+
   if (prevPathP2 === undefined) delete process.env.EXPERIENCES_DB_PATH;
   else process.env.EXPERIENCES_DB_PATH = prevPathP2;
   dbFactoryP2.__resetDbFactoryForTesting();

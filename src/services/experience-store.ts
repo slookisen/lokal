@@ -418,6 +418,7 @@ const CARD_ORDER =
 export type BrowseFilter = {
   category?: string | null;
   fylke?: string | null;
+  kommune?: string | null;
   providerId?: string | null;
 };
 
@@ -426,6 +427,7 @@ function browseWhere(filter: BrowseFilter): { sql: string; params: Record<string
   const params: Record<string, unknown> = {};
   if (filter.category) { where.push("e.category = @category"); params.category = filter.category; }
   if (filter.fylke) { where.push("e.fylke = @fylke"); params.fylke = filter.fylke; }
+  if (filter.kommune) { where.push("e.kommune = @kommune"); params.kommune = filter.kommune; }
   if (filter.providerId) { where.push("e.provider_id = @providerId"); params.providerId = filter.providerId; }
   return { sql: where.join(" AND "), params };
 }
@@ -491,6 +493,23 @@ export function listPublishedFylker(): Array<{ fylke: string; count: number }> {
        GROUP BY e.fylke ORDER BY count DESC, e.fylke ASC`
     )
     .all() as Array<{ fylke: string; count: number }>;
+}
+
+/** Distinct kommuner that have ≥1 PUBLISHED experience — with the fylke they sit
+ *  in + counts. Drives the /kommune/<x> place pages, the kommune cross-links on
+ *  /fylke/<x>, and the sitemap kommune URLs, so every linked kommune page is
+ *  guaranteed non-empty (zero orphan/dead entries). One row per distinct kommune
+ *  name (MAX(fylke) picks a representative fylke for the breadcrumb/up-link). */
+export function listPublishedKommuner(): Array<{ kommune: string; fylke: string | null; count: number }> {
+  const db = getDb(VERTICAL);
+  return db
+    .prepare(
+      `SELECT e.kommune AS kommune, MAX(e.fylke) AS fylke, COUNT(*) AS count FROM experiences e
+       LEFT JOIN experience_providers p ON p.id = e.provider_id
+       WHERE e.kommune IS NOT NULL AND e.kommune != '' AND ${PUBLISH_GATE_SQL}
+       GROUP BY e.kommune ORDER BY count DESC, e.kommune ASC`
+    )
+    .all() as Array<{ kommune: string; fylke: string | null; count: number }>;
 }
 
 /** Distinct providers that have ≥1 PUBLISHED experience (id, name, counts). */

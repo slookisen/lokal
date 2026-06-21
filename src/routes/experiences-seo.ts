@@ -36,6 +36,7 @@ import {
   listPublishedExperiences,
   listPublishedCategories,
   listPublishedFylker,
+  listPublishedKommuner,
   listPublishedProviders,
   getPublishedProviderById,
   searchPublishedExperiences,
@@ -632,6 +633,12 @@ router.get("/sitemap.xml", (_req: Request, res: Response) => {
     for (const row of listPublishedFylker()) {
       if (!row.fylke) continue;
       xml += `\n  <url><loc>${url}/fylke/${encodeURIComponent(row.fylke)}</loc><changefreq>weekly</changefreq><priority>0.7</priority><lastmod>${today}</lastmod></url>`;
+    }
+  } catch { /* experiences DB not open */ }
+  try {
+    for (const row of listPublishedKommuner()) {
+      if (!row.kommune) continue;
+      xml += `\n  <url><loc>${url}/kommune/${encodeURIComponent(row.kommune)}</loc><changefreq>weekly</changefreq><priority>0.6</priority><lastmod>${today}</lastmod></url>`;
     }
   } catch { /* experiences DB not open */ }
   try {
@@ -1453,6 +1460,20 @@ function parsePage(q: unknown): number {
   return Number.isFinite(n) && n > 0 ? n : 1;
 }
 
+// Kommune chips for a fylke page -- the kommuner *within this fylke* that have a
+// live page, so the place hierarchy (Forsiden -> fylke -> kommune) is crawlable
+// from listing pages, not only from individual detail pages. Defensive: returns
+// an empty string if the DB isn't open or the fylke has no sub-kommuner.
+function kommuneChips(fylke: string): string {
+  let komm: Array<{ kommune: string; fylke: string | null; count: number }> = [];
+  try { komm = listPublishedKommuner().filter((k) => k.fylke === fylke); } catch { komm = []; }
+  if (komm.length === 0) return "";
+  const chips = komm
+    .map((k) => `<a class="chip" href="/kommune/${encodeURIComponent(k.kommune)}">${escapeHtml(k.kommune)} <span class="n">${k.count}</span></a>`)
+    .join("");
+  return `<div class="chips" role="list" aria-label="Kommuner i ${escapeHtml(fylke)}">${chips}</div>`;
+}
+
 // Facet chips (categories + fylker) for the index page top.
 function facetChips(): string {
   let cats: Array<{ category: string; count: number }> = [];
@@ -1578,6 +1599,52 @@ router.get("/fylke/:fylke", (req: Request, res: Response, next: NextFunction) =>
     total,
     page,
     pageSize: BROWSE_PAGE_SIZE,
+    extraTopHtml: searchBox("") + kommuneChips(fylke),
+  });
+  res.setHeader("Content-Type", "text/html; charset=utf-8");
+  res.setHeader("Cache-Control", "public, max-age=300");
+  res.send(html);
+});
+
+// GET /kommune/:kommune -- experiences in a municipality. Mirrors /fylke/:fylke.
+// The detail page's "Kommune" fact already links here (/kommune/<navn>), so
+// before this route those links 404'd -- this closes that dead-link + place-weave
+// gap. Unknown/empty kommune -> next() -> 404 (no orphan page).
+router.get("/kommune/:kommune", (req: Request, res: Response, next: NextFunction) => {
+  const kommune = String(req.params.kommune || "");
+  if (!kommune) return next();
+  let total = 0;
+  let rows: ExperienceCardRow[] = [];
+  const page = parsePage(req.query.page);
+  try {
+    total = countPublishedExperiences({ kommune });
+    if (total === 0) return next(); // unknown/empty kommune -> 404 (no orphan page)
+    rows = listPublishedExperiences({ kommune }, BROWSE_PAGE_SIZE, (page - 1) * BROWSE_PAGE_SIZE);
+  } catch {
+    return next();
+  }
+
+  // The fylke this kommune sits in (rows share it) -- used for the breadcrumb
+  // up-link so the place hierarchy reads Forsiden -> Alle -> <fylke> -> <kommune>.
+  const fylke = (rows[0]?.fylke as string | null) || null;
+  const crumbs: BreadcrumbCrumb[] = [
+    { name: "Forsiden", href: "/" },
+    { name: "Alle opplevelser", href: "/opplevelser" },
+    ...(fylke ? [{ name: fylke, href: `/fylke/${encodeURIComponent(fylke)}` }] : []),
+    { name: kommune },
+  ];
+
+  const html = renderBrowsePage({
+    title: `Opplevelser i ${kommune} | Opplevagent`,
+    h1: `Opplevelser i ${kommune}`,
+    metaDesc: `Kuraterte opplevelser og aktiviteter i ${kommune}${fylke ? ", " + fylke : ""} — verifiserte tilbydere på Opplevagent. ${total} ${total === 1 ? "opplevelse" : "opplevelser"}.`,
+    lede: `Hva kan du finne på i ${kommune}? Kuratert oversikt over opplevelser i kommunen.`,
+    canonicalPath: `/kommune/${encodeURIComponent(kommune)}`,
+    crumbs,
+    rows,
+    total,
+    page,
+    pageSize: BROWSE_PAGE_SIZE,
     extraTopHtml: searchBox(""),
   });
   res.setHeader("Content-Type", "text/html; charset=utf-8");
@@ -1585,10 +1652,7 @@ router.get("/fylke/:fylke", (req: Request, res: Response, next: NextFunction) =>
   res.send(html);
 });
 
-// ─── GET /tilbyder/:providerId — one provider's experiences ──────────────────
-// providerId is the provider's UUID (experience_providers.id) — the same key
-// the detail page's "Alle opplevelser fra denne tilbyderen" link already uses,
-// so those links resolve. Providers with no PUBLISHED experience 404.
+// providerId is the provider's UUID -- one provider's experiences.
 router.get("/tilbyder/:providerId", (req: Request, res: Response, next: NextFunction) => {
   const providerId = String(req.params.providerId || "");
   if (!providerId) return next();
