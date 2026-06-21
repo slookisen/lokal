@@ -4,6 +4,7 @@
  */
 
 import { redactPII, isValidFodselsnummer } from "../src/utils/pii-redact";
+import { computeLoopHealth } from "../src/services/loop-health";
 
 let passed = 0;
 let failed = 0;
@@ -16899,6 +16900,31 @@ const _orchPr20260614_2Promise = (async () => {
 })();
 
 // ── REPORT ────────────────────────────────────────────────────────────
+
+// -- P1 loop-heartbeat (computeLoopHealth, pure) --
+{
+  const MIN = 60_000;
+  const baseUTC = Date.parse("2026-06-22T10:00:00Z");
+  const mk = (agent: string, agoMin: number) => ({
+    agent,
+    started_at: new Date(baseUTC - agoMin * MIN).toISOString(),
+    finished_at: new Date(baseUTC - agoMin * MIN).toISOString(),
+  });
+  const h1 = computeLoopHealth([mk("loop-dispatcher", 8), mk("platform-verifier", 12)], { nowMs: baseUTC });
+  assertEq(h1.status, "healthy", "heartbeat: fresh watchers -> healthy");
+  assertEq(h1.stalledAgents.length, 0, "heartbeat: healthy has no stalled agents");
+  assertTrue(h1.inActiveWindow, "heartbeat: 10:00 UTC is in active window");
+  const h2 = computeLoopHealth([mk("loop-dispatcher", 60), mk("platform-verifier", 10)], { nowMs: baseUTC });
+  assertEq(h2.status, "stalled", "heartbeat: dispatcher silent 60min -> stalled");
+  assertTrue(h2.stalledAgents.includes("loop-dispatcher"), "heartbeat: dispatcher flagged stalled");
+  const h3 = computeLoopHealth([], { nowMs: baseUTC });
+  assertEq(h3.status, "stalled", "heartbeat: empty ledger in active hours -> stalled");
+  assertEq(h3.watchers[0]!.ageMin, null, "heartbeat: absent watcher has null age");
+  const nightUTC = Date.parse("2026-06-22T02:00:00Z");
+  const h4 = computeLoopHealth([], { nowMs: nightUTC });
+  assertEq(h4.status, "paused", "heartbeat: outside active window -> paused");
+  assertEq(h4.stalledAgents.length, 0, "heartbeat: paused has no stalled agents");
+}
 
 // Wait for the M2 owner-portal async tests before reporting so their
 // pass/fail counts are included. (Pre-existing async integration tests
