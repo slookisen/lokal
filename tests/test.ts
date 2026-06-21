@@ -14669,6 +14669,144 @@ console.log("\n── orch-pr-19: opplevagent.no host-gate (experiences) ──"
   assertTrue(!("/api/tannlege/agents" in oaParsed.paths), "orch19-06m: openapi.json does NOT carry dental paths");
 }
 
+
+// ── site-quality (opplevagent-site-quality loop, work-order 2026-06-20) ──────
+// Increment #2: /opplevelse/<slug> — server-rendered, DB-driven experience
+// detail page + DB-driven sitemap weave. Isolated :memory: experiences.db
+// (same require-cache discipline as orch19-05); seed a Brreg-verified provider
+// + a publishable experience, then invoke the experiences-seo detail route +
+// sitemap layer directly (sync mock req/res, like orch19-06). Host-isolated:
+// asserts NO rfb/dental identity leaks onto the opplevagent detail page.
+console.log("\n── site-quality: /opplevelse/<slug> detail page (experiences) ──");
+(() => {
+  const prevPathSQ = process.env.EXPERIENCES_DB_PATH;
+  process.env.EXPERIENCES_DB_PATH = ":memory:";
+
+  const dbFactoryPathSQ = require.resolve("../src/database/db-factory");
+  const expStorePathSQ = require.resolve("../src/services/experience-store");
+  const expSeoPathSQ = require.resolve("../src/routes/experiences-seo");
+  delete require.cache[dbFactoryPathSQ];
+  delete require.cache[expStorePathSQ];
+  delete require.cache[expSeoPathSQ];
+
+  const dbFactorySQ = require("../src/database/db-factory") as typeof import("../src/database/db-factory");
+  dbFactorySQ.__resetDbFactoryForTesting();
+  const expStoreSQ = require("../src/services/experience-store") as typeof import("../src/services/experience-store");
+  const seoRouterSQ = (require("../src/routes/experiences-seo") as typeof import("../src/routes/experiences-seo")).default as any;
+
+  // Schema + seed: a Brreg-verified provider and a publishable experience.
+  dbFactorySQ.getDb("experiences");
+  const provIdSQ = expStoreSQ.createProvider({
+    navn: "Sauda Skisenter AS", org_nr: "999000111",
+    fylke: "Rogaland", kommune: "Sauda", hjemmeside: "https://example-sauda.no",
+    brreg_verified: 1, brreg_active: 1, verification_status: "verified",
+  });
+  const expIdSQ = expStoreSQ.createExperience({
+    title: "Alpint i Svandalen", provider_id: provIdSQ, provider_match_status: "matched",
+    category: "vinter_sno", subcategory: "alpine_skiing", fylke: "Rogaland", kommune: "Sauda",
+    indoor_outdoor: "outdoor", season: ["winter"], price_band: "standard", price_from: 450,
+    price_unit: "per_person", booking_url: "https://example-sauda.no/book",
+    evidence_url: "https://www.visitnorway.com/listings/sauda/239381/",
+    description: "Alpint og langrenn i Svandalen, familievennlig skisenter.",
+    confidence: "high", verification_status: "verified",
+  });
+  // A second publishable vinter_sno experience → exercises the "related" grid.
+  expStoreSQ.createExperience({
+    title: "Langrenn i Sirdal", provider_id: provIdSQ, provider_match_status: "matched",
+    category: "vinter_sno", fylke: "Agder", kommune: "Sirdal", indoor_outdoor: "outdoor",
+    season: ["winter"], confidence: "high", verification_status: "verified",
+  });
+  const seededSQ = expStoreSQ.getExperienceById(expIdSQ);
+  assertTrue(!!seededSQ && typeof seededSQ.slug === "string" && seededSQ.slug.length > 0,
+    "sq-detail-00: seeded experience has a slug");
+  const slugSQ = (seededSQ as any).slug as string;
+
+  // Invoke a GET layer on the experiences-seo router (sync mock req/res),
+  // supplying req.params since Express param-extraction is bypassed here.
+  function invokeSeo(routePath: string, params: Record<string, string>, reqPath: string): { status: number; body: string; headers: Record<string, string> } {
+    const layer = (seoRouterSQ.stack as any[]).find(
+      (l: any) => l.route && l.route.path === routePath && l.route.methods?.get
+    );
+    assertTrue(!!layer, `sq-detail: router has GET ${routePath} layer`);
+    let status = 200; let body = ""; let nexted = false;
+    const headers: Record<string, string> = {};
+    const res: any = {
+      statusCode: 200,
+      setHeader: (k: string, v: string) => { headers[k.toLowerCase()] = String(v); },
+      status: (c: number) => { status = c; res.statusCode = c; return res; },
+      send: (b: unknown) => { body = typeof b === "string" ? b : String(b); return res; },
+      json: (o: unknown) => { body = JSON.stringify(o); return res; },
+    };
+    const req: any = { path: reqPath, hostname: "opplevagent.no", params, query: {} };
+    const handler = layer.route.stack[layer.route.stack.length - 1].handle;
+    handler(req, res, () => { nexted = true; });
+    if (nexted) status = 404; // route called next() → 404 catch-all
+    return { status, body, headers };
+  }
+
+  // sq-detail-01: existing slug → 200 + Opplevagent detail content.
+  const okSQ = invokeSeo("/opplevelse/:slug", { slug: slugSQ }, `/opplevelse/${slugSQ}`);
+  assertEq(okSQ.status, 200, "sq-detail-01a: GET /opplevelse/<slug> → 200");
+  assertTrue(/text\/html/.test(okSQ.headers["content-type"] || ""), "sq-detail-01b: detail Content-Type text/html");
+  assertTrue(/Alpint i Svandalen/.test(okSQ.body), "sq-detail-01c: detail renders the experience title");
+  assertTrue(/Sauda Skisenter AS/.test(okSQ.body), "sq-detail-01d: detail renders the provider name");
+  assertTrue(/Brreg-verifisert/.test(okSQ.body), "sq-detail-01e: detail shows the Brreg-verified badge");
+  assertTrue(okSQ.body.includes("/kategori/vinter_sno") && okSQ.body.includes("/fylke/Rogaland"),
+    "sq-detail-01f: detail cross-links category + fylke (HTML routes)");
+  assertTrue(okSQ.body.includes(`<link rel="canonical" href="https://opplevagent.no/opplevelse/${slugSQ}"`),
+    "sq-detail-01g: canonical self URL present");
+  assertTrue(/Langrenn i Sirdal/.test(okSQ.body), "sq-detail-01h: related grid surfaces same-category experience");
+  assertTrue(/example-sauda\.no\/book/.test(okSQ.body), "sq-detail-01i: booking CTA points at the booking_url");
+
+  // sq-detail-01j: HOST ISOLATION — no rfb/dental identity on the detail page.
+  assertTrue(!/Rett fra Bonden/i.test(okSQ.body), "sq-detail-01j: detail does NOT contain 'Rett fra Bonden'");
+  assertTrue(!/Finn-tannlege|\/api\/tannlege/i.test(okSQ.body), "sq-detail-01k: detail does NOT leak dental identity/paths");
+
+  // sq-detail-01l/m/n: geo-less experience must NOT emit 0,0 — Number(null)===0
+  // regression guard. The "Alpint i Svandalen" seed has no loc_lat/lon.
+  assertTrue(!okSQ.body.includes("mlat=0&mlon=0"), "sq-detail-01l: geo-less page does NOT link to 0,0 map");
+  assertTrue(!/"latitude":0,"longitude":0/.test(okSQ.body), "sq-detail-01m: geo-less page does NOT emit 0,0 JSON-LD geo");
+  assertTrue(/ikke registrert/.test(okSQ.body), "sq-detail-01n: geo-less page shows the no-geo fallback");
+
+  // sq-detail-01p/q/r: an experience WITH coordinates renders a real map link + JSON-LD geo.
+  const geoIdSQ = expStoreSQ.createExperience({
+    title: "Fjordtur med koordinater", provider_id: provIdSQ, provider_match_status: "matched",
+    category: "sightseeing_transport", fylke: "Vestland", kommune: "Bergen", indoor_outdoor: "outdoor",
+    loc_lat: 60.39, loc_lon: 5.32, confidence: "high", verification_status: "verified",
+  });
+  const geoSlugSQ = (expStoreSQ.getExperienceById(geoIdSQ) as any).slug as string;
+  const geoSQ = invokeSeo("/opplevelse/:slug", { slug: geoSlugSQ }, `/opplevelse/${geoSlugSQ}`);
+  assertEq(geoSQ.status, 200, "sq-detail-01p: experience with geo → 200");
+  assertTrue(geoSQ.body.includes("mlat=60.39") && geoSQ.body.includes("mlon=5.32"),
+    "sq-detail-01q: map link carries the real coordinates");
+  assertTrue(/"latitude":60\.39,"longitude":5\.32/.test(geoSQ.body),
+    "sq-detail-01r: JSON-LD geo carries the real coordinates");
+
+  // sq-detail-02: unknown slug → route calls next() (→ 404 catch-all), no crash.
+  const missSQ = invokeSeo("/opplevelse/:slug", { slug: "does-not-exist-xyz" }, "/opplevelse/does-not-exist-xyz");
+  assertEq(missSQ.status, 404, "sq-detail-02: unknown slug falls through to 404");
+
+  // sq-detail-03: unpublished (pending_verify) slug must NOT get a public page.
+  const draftIdSQ = expStoreSQ.createExperience({
+    title: "Uverifisert utkast", provider_id: provIdSQ, category: "vinter_sno",
+    fylke: "Rogaland", kommune: "Sauda", confidence: "high", verification_status: "pending_verify",
+  });
+  const draftSlugSQ = (expStoreSQ.getExperienceById(draftIdSQ) as any).slug as string;
+  const draftSQ = invokeSeo("/opplevelse/:slug", { slug: draftSlugSQ }, `/opplevelse/${draftSlugSQ}`);
+  assertEq(draftSQ.status, 404, "sq-detail-03: unverified experience is NOT published (404)");
+
+  // sq-detail-04: sitemap.xml now weaves published detail URLs (DB-driven).
+  const smSQ = invokeSeo("/sitemap.xml", {}, "/sitemap.xml");
+  assertEq(smSQ.status, 200, "sq-detail-04a: sitemap.xml → 200");
+  assertTrue(smSQ.body.includes(`/opplevelse/${slugSQ}`), "sq-detail-04b: sitemap includes the published detail URL");
+  assertTrue(!smSQ.body.includes(`/opplevelse/${draftSlugSQ}`), "sq-detail-04c: sitemap excludes the unpublished draft");
+  assertTrue(/<loc>https:\/\/opplevagent\.no\/opplevelse\//.test(smSQ.body), "sq-detail-04d: sitemap detail loc is an absolute opplevagent URL");
+
+  if (prevPathSQ === undefined) delete process.env.EXPERIENCES_DB_PATH;
+  else process.env.EXPERIENCES_DB_PATH = prevPathSQ;
+  dbFactorySQ.__resetDbFactoryForTesting();
+})();
+
 // ── PR-107 (2026-06-04): zombie-claim sweep fix ──────────────────────
 // Tests for sweepExpiredClaims, zombie reclaim via claimBatch, truthful
 // claimStatus after timeout, and releaseBatch regression guard.
