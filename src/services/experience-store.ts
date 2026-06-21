@@ -298,6 +298,88 @@ export function getExperienceById(id: string): (Experience & { id: string }) | n
   const row = db.prepare("SELECT * FROM experiences WHERE id = ?").get(id) as Record<string, unknown> | undefined;
   return row ? hydrateExperience(row) : null;
 }
+// ─── Site-quality: server-rendered detail-page reads (opplevagent.no) ──────
+// Added by the opplevagent-site-quality loop (work-order 2026-06-20,
+// increment #2: /opplevelse/<slug>). These mirror the discoverExperiences()
+// publish-gate (verified + confidence>=medium + provider brreg_active) so the
+// set of live HTML detail pages == the set surfaced by /discover (100% weave,
+// zero orphan/dead pages). Read-only; no schema change.
+const PUBLISH_GATE_SQL =
+  "e.verification_status = 'verified' " +
+  "AND (e.confidence IS NULL OR e.confidence IN ('high','medium')) " +
+  "AND (p.id IS NULL OR p.brreg_active = 1)";
+
+export function getPublishedExperienceBySlug(
+  slug: string
+): (Experience & { id: string }) | null {
+  if (!slug) return null;
+  const db = getDb(VERTICAL);
+  const row = db
+    .prepare(
+      `SELECT e.* FROM experiences e
+       LEFT JOIN experience_providers p ON p.id = e.provider_id
+       WHERE e.slug = @slug AND ${PUBLISH_GATE_SQL}`
+    )
+    .get({ slug }) as Record<string, unknown> | undefined;
+  return row ? hydrateExperience(row) : null;
+}
+
+export function getProviderById(id: string): Record<string, unknown> | null {
+  if (!id) return null;
+  const db = getDb(VERTICAL);
+  return (
+    (db
+      .prepare("SELECT * FROM experience_providers WHERE id = ?")
+      .get(id) as Record<string, unknown>) ?? null
+  );
+}
+
+export type PublishedSlugRow = { slug: string; updated_at: string | null };
+export function listPublishedExperienceSlugs(): PublishedSlugRow[] {
+  const db = getDb(VERTICAL);
+  return db
+    .prepare(
+      `SELECT e.slug AS slug, e.updated_at AS updated_at
+       FROM experiences e
+       LEFT JOIN experience_providers p ON p.id = e.provider_id
+       WHERE e.slug IS NOT NULL AND ${PUBLISH_GATE_SQL}
+       ORDER BY e.updated_at DESC, e.title ASC`
+    )
+    .all() as PublishedSlugRow[];
+}
+
+export type RelatedExperienceRow = {
+  slug: string;
+  title: string;
+  category: string | null;
+  fylke: string | null;
+  kommune: string | null;
+};
+export function getRelatedPublishedExperiences(
+  category: string | null,
+  excludeId: string,
+  limit = 6
+): RelatedExperienceRow[] {
+  if (!category) return [];
+  const db = getDb(VERTICAL);
+  return db
+    .prepare(
+      `SELECT e.slug AS slug, e.title AS title, e.category AS category,
+              e.fylke AS fylke, e.kommune AS kommune
+       FROM experiences e
+       LEFT JOIN experience_providers p ON p.id = e.provider_id
+       WHERE e.category = @category AND e.id != @excludeId
+         AND e.slug IS NOT NULL AND ${PUBLISH_GATE_SQL}
+       ORDER BY CASE e.confidence WHEN 'high' THEN 0 WHEN 'medium' THEN 1 ELSE 2 END, e.title ASC
+       LIMIT @limit`
+    )
+    .all({
+      category,
+      excludeId,
+      limit: Math.max(1, Math.min(24, limit)),
+    }) as RelatedExperienceRow[];
+}
+
 
 /**
  * Intent-discovery query — the heart of "Hva kan vi finne på i [sted]".

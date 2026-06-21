@@ -23,10 +23,17 @@
  * src/index.ts, so rettfrabonden.com and finn-tannlege.com never reach it.
  */
 
-import { Router, Request, Response } from "express";
+import { Router, Request, Response, NextFunction } from "express";
 import { getExperiencesAgentCard } from "../services/experiences-agent-card";
 import { getExperiencesOpenapi } from "../services/experiences-openapi";
-import { listCategories } from "../services/experience-store";
+import {
+  listCategories,
+  getPublishedExperienceBySlug,
+  getProviderById,
+  getRelatedPublishedExperiences,
+  listPublishedExperienceSlugs,
+  type RelatedExperienceRow,
+} from "../services/experience-store";
 
 const router = Router();
 
@@ -618,6 +625,16 @@ router.get("/sitemap.xml", (_req: Request, res: Response) => {
   for (const { p, freq, pri } of paths) {
     xml += `\n  <url><loc>${url}${p === "/" ? "" : p}</loc><changefreq>${freq}</changefreq><priority>${pri}</priority><lastmod>${today}</lastmod></url>`;
   }
+  // DB-driven weave: one <url> per published experience detail page
+  // (opplevagent-site-quality increment #2). Defensive — if the experiences
+  // DB is not open we just emit the static URLs above.
+  try {
+    for (const row of listPublishedExperienceSlugs()) {
+      if (!row.slug) continue;
+      const lastmod = (row.updated_at || today).slice(0, 10);
+      xml += `\n  <url><loc>${url}/opplevelse/${encodeURIComponent(row.slug)}</loc><changefreq>weekly</changefreq><priority>0.6</priority><lastmod>${lastmod}</lastmod></url>`;
+    }
+  } catch { /* experiences DB not open — static sitemap only */ }
   xml += `\n</urlset>\n`;
   res.send(xml);
 });
@@ -754,6 +771,363 @@ router.get("/openapi.json", (_req: Request, res: Response) => {
   res.header("Cache-Control", "public, max-age=300");
   res.json(getExperiencesOpenapi());
 });
+
+// ═══════════════════════════════════════════════════════════
+// GET /opplevelse/:slug — server-rendered, DB-driven experience detail
+// (opplevagent-site-quality loop, work-order 2026-06-20 increment #2).
+// DB-template-driven: every published experience automatically gets this
+// page + a sitemap entry — no manual step (the "auto-weave" requirement).
+// Only publishable rows (verified + confidence>=medium + provider
+// brreg_active) render; anything else falls through to the 404 catch-all.
+// ═══════════════════════════════════════════════════════════
+const CATEGORY_LABELS: Record<string, string> = {
+  vinter_sno: "Vinter & snø",
+  sightseeing_transport: "Sightseeing & transport",
+  dyreliv_safari: "Dyreliv & safari",
+  natur_friluft: "Natur & friluft",
+  kultur_historie: "Kultur & historie",
+  overnatting_opplevelse: "Overnatting & opplevelse",
+  adrenalin_action: "Adrenalin & action",
+  velvaere_spa: "Velvære & spa",
+  mat_drikke: "Mat & drikke",
+};
+function catLabel(c: string | null | undefined): string {
+  if (!c) return "Opplevelse";
+  return CATEGORY_LABELS[c] || c.replace(/_/g, " ");
+}
+const SEASON_LABELS: Record<string, string> = {
+  summer: "Sommer", winter: "Vinter", spring: "Vår",
+  autumn: "Høst", fall: "Høst", year_round: "Hele året",
+};
+function seasonLabel(s: string): string {
+  return SEASON_LABELS[s] || s;
+}
+function ioLabel(io: string | null | undefined): string {
+  return io === "indoor" ? "Innendørs" : io === "outdoor" ? "Utendørs" : io === "both" ? "Inne og ute" : "";
+}
+const PRICE_BAND_LABELS: Record<string, string> = {
+  gratis: "Gratis", rimelig: "Rimelig", standard: "Standard",
+  premium: "Premium", ukjent: "Pris ikke oppgitt",
+};
+// Only accept http(s) URLs from data — never render javascript:/data: URIs.
+function safeHttpUrl(u: unknown): string | null {
+  const s = String(u ?? "").trim();
+  return /^https?:\/\//i.test(s) ? s : null;
+}
+function hostOf(u: string): string {
+  try { return new URL(u).host.replace(/^www\./, ""); } catch { return "kilde"; }
+}
+// Null-aware numeric coercion — Number(null)===0, so a naive Number()+isFinite
+// guard would turn missing coordinates into 0,0 (Gulf of Guinea). This keeps
+// genuine finite numbers (incl. 0) and maps null/undefined/"" → null so the
+// no-geo map fallback actually triggers (most rows have null loc_lat/lon).
+function numOrNull(v: unknown): number | null {
+  if (v === null || v === undefined || v === "") return null;
+  const n = Number(v);
+  return Number.isFinite(n) ? n : null;
+}
+
+function renderOpplevelseDetail(
+  exp: ReturnType<typeof getPublishedExperienceBySlug>,
+  provider: Record<string, unknown> | null,
+  related: RelatedExperienceRow[],
+  url: string
+): string {
+  if (!exp) return "";
+  const slug = exp.slug || "";
+  const canonical = `${url}/opplevelse/${encodeURIComponent(slug)}`;
+  const cat = exp.category || null;
+  const place = [exp.kommune, exp.fylke].filter(Boolean).join(", ");
+  const provName = provider ? String(provider.navn || "") : "";
+  const provSite = provider ? safeHttpUrl(provider.hjemmeside) : null;
+  const brregVerified = !!(provider && Number(provider.brreg_verified) === 1);
+  const orgNr = provider ? String(provider.org_nr || "") : "";
+
+  // Meta description: own summary if present, else a generated one.
+  const metaDescRaw = exp.description
+    ? String(exp.description)
+    : `${exp.title}${place ? " i " + place : ""}. ${catLabel(cat)} på Opplevagent — kuratert markedsplass for norske opplevelser med Brreg-verifiserte tilbydere.`;
+  const metaDesc = metaDescRaw.length > 155 ? metaDescRaw.slice(0, 152).trim() + "…" : metaDescRaw;
+
+  // Badges row.
+  const badges: string[] = [];
+  if (cat) badges.push(`<a class="badge badge-cat" href="/kategori/${encodeURIComponent(cat)}">${escapeHtml(catLabel(cat))}</a>`);
+  if (exp.indoor_outdoor) badges.push(`<span class="badge">${escapeHtml(ioLabel(exp.indoor_outdoor))}</span>`);
+  for (const s of exp.season || []) badges.push(`<span class="badge">${escapeHtml(seasonLabel(s))}</span>`);
+  if (brregVerified) badges.push(`<span class="badge badge-verified" title="Tilbyder verifisert mot Brønnøysundregistrene">✓ Brreg-verifisert</span>`);
+
+  // Facts table.
+  const facts: Array<[string, string]> = [];
+  if (cat) facts.push(["Kategori", `<a href="/kategori/${encodeURIComponent(cat)}">${escapeHtml(catLabel(cat))}</a>`]);
+  if (exp.fylke) facts.push(["Fylke", `<a href="/fylke/${encodeURIComponent(exp.fylke)}">${escapeHtml(exp.fylke)}</a>`]);
+  if (exp.kommune) facts.push(["Kommune", `<a href="/kommune/${encodeURIComponent(exp.kommune)}">${escapeHtml(exp.kommune)}</a>`]);
+  if (exp.indoor_outdoor) facts.push(["Inne / ute", escapeHtml(ioLabel(exp.indoor_outdoor))]);
+  if ((exp.season || []).length) facts.push(["Sesong", escapeHtml((exp.season || []).map(seasonLabel).join(", "))]);
+  if (exp.duration_min || exp.duration_max) {
+    const d = exp.duration_min && exp.duration_max && exp.duration_min !== exp.duration_max
+      ? `${exp.duration_min}–${exp.duration_max} min`
+      : `ca. ${exp.duration_min || exp.duration_max} min`;
+    facts.push(["Varighet", escapeHtml(d)]);
+  }
+  if (exp.group_min || exp.group_max) {
+    const g = exp.group_min && exp.group_max ? `${exp.group_min}–${exp.group_max} personer`
+      : exp.group_max ? `inntil ${exp.group_max} personer` : `fra ${exp.group_min} personer`;
+    facts.push(["Gruppe", escapeHtml(g)]);
+  }
+  if (exp.price_from || exp.price_band) {
+    const unit = exp.price_unit === "per_person" ? " pr. person" : exp.price_unit === "per_group" ? " pr. gruppe" : "";
+    const pr = exp.price_from
+      ? `fra ${exp.price_from} kr${unit}`
+      : (PRICE_BAND_LABELS[String(exp.price_band)] || String(exp.price_band));
+    facts.push(["Pris", escapeHtml(pr)]);
+  }
+  if ((exp.languages || []).length) facts.push(["Språk", escapeHtml((exp.languages || []).join(", "))]);
+  if ((exp.accessibility || []).length) facts.push(["Tilgjengelighet", escapeHtml((exp.accessibility || []).join(", "))]);
+  if (exp.meeting_point) facts.push(["Oppmøte", escapeHtml(exp.meeting_point)]);
+  const factsRows = facts.map(([k, v]) => `<tr><th scope="row">${escapeHtml(k)}</th><td>${v}</td></tr>`).join("");
+
+  // Description block (graceful fallback when no own summary yet).
+  const descBlock = exp.description
+    ? `<p class="lede">${escapeHtml(exp.description)}</p>`
+    : `<p class="lede lede-soft">Detaljert beskrivelse publiseres fortløpende. ${escapeHtml(exp.title)} er en ${escapeHtml(catLabel(cat).toLowerCase())}-opplevelse${place ? " i " + escapeHtml(place) : ""}. Se tilbyderens nettside for program, priser og bestilling.</p>`;
+
+  // Booking CTA.
+  const bookingUrl = safeHttpUrl(exp.booking_url);
+  let cta = "";
+  if (bookingUrl) {
+    cta = `<a class="cta" href="${escapeHtml(bookingUrl)}" target="_blank" rel="noopener nofollow">Book / les mer hos tilbyder →</a>`;
+  } else if (provSite) {
+    cta = `<a class="cta" href="${escapeHtml(provSite)}" target="_blank" rel="noopener nofollow">Besøk tilbyderens nettside →</a>`;
+  } else {
+    cta = `<p class="cta-soft">Bestilling skjer hos tilbyder. Kontaktinfo kommer.</p>`;
+  }
+
+  // Provider card.
+  const provInner = provName
+    ? `<p class="prov-name">${provSite ? `<a href="${escapeHtml(provSite)}" target="_blank" rel="noopener">${escapeHtml(provName)}</a>` : escapeHtml(provName)}</p>
+       ${brregVerified ? `<p class="prov-verified">✓ Verifisert mot Brønnøysundregistrene${orgNr ? ` · org.nr ${escapeHtml(orgNr)}` : ""}</p>` : `<p class="prov-soft">Tilbyder under verifisering.</p>`}
+       <p class="prov-link"><a href="/tilbyder/${escapeHtml(String(provider!.id))}">Alle opplevelser fra denne tilbyderen →</a></p>`
+    : `<p class="prov-soft">Tilbyder er ikke matchet ennå.</p>`;
+
+  // Map block — coords from experience, else provider; graceful no-geo fallback.
+  const lat = numOrNull(exp.loc_lat) ?? numOrNull(provider ? provider.lat : null);
+  const lon = numOrNull(exp.loc_lon) ?? numOrNull(provider ? provider.lon : null);
+  const mapBlock = (lat !== null && lon !== null)
+    ? `<a class="map-card" href="https://www.openstreetmap.org/?mlat=${lat}&mlon=${lon}#map=13/${lat}/${lon}" target="_blank" rel="noopener" aria-label="Åpne posisjon i OpenStreetMap">
+         <svg viewBox="0 0 24 24" width="22" height="22" aria-hidden="true"><path d="M12 2a7 7 0 0 0-7 7c0 5 7 13 7 13s7-8 7-13a7 7 0 0 0-7-7z" fill="none" stroke="currentColor" stroke-width="1.6"/><circle cx="12" cy="9" r="2.4" fill="currentColor"/></svg>
+         <span><strong>${escapeHtml(place || "Posisjon")}</strong><span class="map-sub">Åpne i kart (OpenStreetMap)</span></span>
+       </a>`
+    : `<div class="map-card map-fallback">
+         <svg viewBox="0 0 24 24" width="22" height="22" aria-hidden="true"><path d="M12 2a7 7 0 0 0-7 7c0 5 7 13 7 13s7-8 7-13a7 7 0 0 0-7-7z" fill="none" stroke="currentColor" stroke-width="1.6"/><circle cx="12" cy="9" r="2.4" fill="currentColor"/></svg>
+         <span><strong>${escapeHtml(place || "Sted ikke oppgitt")}</strong><span class="map-sub">Nøyaktig posisjon er ikke registrert ennå.</span></span>
+       </div>`;
+
+  // Evidence / source.
+  const evUrl = safeHttpUrl(exp.evidence_url);
+  const evBlock = evUrl
+    ? `<p class="evidence">Kilde: <a href="${escapeHtml(evUrl)}" target="_blank" rel="noopener nofollow">${escapeHtml(hostOf(evUrl))}</a></p>`
+    : "";
+
+  // Related grid (these links resolve — they are other detail pages).
+  const relCards = related
+    .map((r) => `<a class="rel-card" href="/opplevelse/${encodeURIComponent(r.slug)}">
+        <span class="rel-title">${escapeHtml(r.title)}</span>
+        <span class="rel-meta">${escapeHtml([r.kommune, r.fylke].filter(Boolean).join(", "))}</span>
+      </a>`)
+    .join("");
+  const relBlock = relCards
+    ? `<section class="related" aria-labelledby="rel-h"><h2 id="rel-h">Flere ${escapeHtml(catLabel(cat).toLowerCase())}-opplevelser</h2><div class="rel-grid">${relCards}</div></section>`
+    : "";
+
+  // JSON-LD: TouristAttraction + BreadcrumbList.
+  const ld: Record<string, unknown> = {
+    "@context": "https://schema.org",
+    "@type": "TouristAttraction",
+    name: exp.title,
+    description: metaDesc,
+    url: canonical,
+    touristType: catLabel(cat),
+    address: { "@type": "PostalAddress", addressLocality: exp.kommune || undefined, addressRegion: exp.fylke || undefined, addressCountry: "NO" },
+  };
+  if (lat !== null && lon !== null) ld.geo = { "@type": "GeoCoordinates", latitude: lat, longitude: lon };
+  if (provName) ld.provider = { "@type": "Organization", name: provName, ...(provSite ? { url: provSite } : {}) };
+  const breadcrumb = {
+    "@context": "https://schema.org",
+    "@type": "BreadcrumbList",
+    itemListElement: [
+      { "@type": "ListItem", position: 1, name: "Forsiden", item: url },
+      ...(cat ? [{ "@type": "ListItem", position: 2, name: catLabel(cat), item: `${url}/kategori/${encodeURIComponent(cat)}` }] : []),
+      { "@type": "ListItem", position: cat ? 3 : 2, name: exp.title, item: canonical },
+    ],
+  };
+  const ldScripts = [ld, breadcrumb]
+    .map((o) => `<script type="application/ld+json">${JSON.stringify(o).replace(/<\//g, "<\\/")}</script>`)
+    .join("\n");
+
+  const title = `${exp.title}${place ? " – " + place : ""} | Opplevagent`;
+
+  return `<!doctype html>
+<html lang="nb">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>${escapeHtml(title)}</title>
+<meta name="description" content="${escapeHtml(metaDesc)}">
+<meta name="robots" content="index, follow, max-snippet:-1, max-image-preview:large">
+<meta name="theme-color" content="#0b3d2e">
+<link rel="canonical" href="${canonical}">
+<link rel="icon" type="image/svg+xml" href="/favicon.svg">
+<meta property="og:title" content="${escapeHtml(exp.title)}">
+<meta property="og:description" content="${escapeHtml(metaDesc)}">
+<meta property="og:type" content="website">
+<meta property="og:url" content="${canonical}">
+<meta property="og:locale" content="nb_NO">
+<meta property="og:site_name" content="Opplevagent">
+<meta property="og:image" content="${url}/favicon.svg">
+<meta name="twitter:card" content="summary">
+${ldScripts}
+<style>
+  *{margin:0;padding:0;box-sizing:border-box}
+  :root{
+    --fjord-900:#072a20;--fjord-800:#0b3d2e;--fjord-700:#0f5132;--fjord-600:#147a4d;
+    --teal-500:#14b8a6;--amber-500:#f59e0b;--coral-500:#ff7a45;
+    --ink:#10231b;--ink-soft:#3c5249;--mist:#6b8178;
+    --surface:#fff;--canvas:#f4f8f4;--canvas-2:#eaf2ec;--line:#dde9e0;
+    --r-sm:8px;--r-md:14px;--r-lg:20px;--r-pill:999px;
+    --sh-sm:0 1px 2px rgba(7,42,32,.06),0 2px 6px rgba(7,42,32,.05);
+    --sh-md:0 6px 18px rgba(7,42,32,.10);--maxw:1080px;
+  }
+  body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;color:var(--ink);background:var(--canvas);line-height:1.6;-webkit-font-smoothing:antialiased}
+  a{color:var(--fjord-600);text-decoration:none}
+  a:hover{text-decoration:underline}
+  :focus-visible{outline:3px solid var(--amber-500);outline-offset:2px;border-radius:4px}
+  svg{display:block}
+  .container{max-width:var(--maxw);margin:0 auto;padding:0 24px}
+  @media(max-width:560px){.container{padding:0 16px}}
+  .skip-link{position:absolute;left:-9999px;top:0;background:var(--fjord-800);color:#fff;padding:10px 16px;z-index:200}
+  .skip-link:focus{left:0}
+  .site-nav{position:sticky;top:0;z-index:100;background:rgba(244,248,244,.9);backdrop-filter:saturate(160%) blur(12px);border-bottom:1px solid var(--line)}
+  .nav-inner{max-width:var(--maxw);margin:0 auto;padding:0 24px;height:58px;display:flex;align-items:center;justify-content:space-between}
+  @media(max-width:560px){.nav-inner{padding:0 16px}}
+  .brand{display:flex;align-items:center;gap:10px;font-weight:800;font-size:1.12rem;color:var(--fjord-800)}
+  .brand:hover{text-decoration:none}
+  .brand .mark{width:32px;height:32px;border-radius:9px;background:linear-gradient(150deg,var(--fjord-700),var(--teal-500));display:flex;align-items:center;justify-content:center}
+  .brand .mark svg{color:#fff}
+  .nav-links a{font-size:.86rem;font-weight:600;color:var(--ink-soft);margin-left:22px}
+  .breadcrumb{padding:18px 0 4px;font-size:.84rem;color:var(--mist)}
+  .breadcrumb a{color:var(--ink-soft)}
+  .breadcrumb .sep{margin:0 8px;color:var(--line)}
+  .head{padding:14px 0 8px}
+  .head h1{font-size:clamp(1.6rem,3.6vw,2.5rem);font-weight:800;letter-spacing:-.025em;line-height:1.12;color:var(--fjord-900)}
+  .head .place{margin-top:8px;color:var(--ink-soft);font-size:1rem;display:flex;align-items:center;gap:7px}
+  .badges{display:flex;flex-wrap:wrap;gap:8px;margin:16px 0 4px}
+  .badge{display:inline-flex;align-items:center;gap:6px;padding:5px 12px;border-radius:var(--r-pill);background:var(--canvas-2);color:var(--ink-soft);font-size:.8rem;font-weight:600;border:1px solid var(--line)}
+  a.badge-cat{background:var(--fjord-800);color:#fff;border-color:var(--fjord-800)}
+  a.badge-cat:hover{background:var(--fjord-700);text-decoration:none}
+  .badge-verified{background:#e7f6ec;color:#0f7a3d;border-color:#bfe6cd}
+  .layout{display:grid;grid-template-columns:1fr 340px;gap:32px;margin:26px 0 10px;align-items:start}
+  @media(max-width:860px){.layout{grid-template-columns:1fr;gap:22px}}
+  .lede{font-size:1.08rem;color:var(--ink);margin-bottom:22px}
+  .lede-soft{color:var(--ink-soft)}
+  .facts{width:100%;border-collapse:collapse;background:var(--surface);border:1px solid var(--line);border-radius:var(--r-md);overflow:hidden}
+  .facts th,.facts td{text-align:left;padding:12px 16px;font-size:.92rem;border-bottom:1px solid var(--line);vertical-align:top}
+  .facts tr:last-child th,.facts tr:last-child td{border-bottom:none}
+  .facts th{width:38%;color:var(--mist);font-weight:600}
+  .evidence{margin-top:16px;font-size:.84rem;color:var(--mist)}
+  .aside{display:flex;flex-direction:column;gap:16px;position:sticky;top:78px}
+  @media(max-width:860px){.aside{position:static}}
+  .card{background:var(--surface);border:1px solid var(--line);border-radius:var(--r-lg);padding:20px;box-shadow:var(--sh-sm)}
+  .card h2{font-size:.78rem;text-transform:uppercase;letter-spacing:.06em;color:var(--mist);margin-bottom:12px}
+  .cta{display:block;text-align:center;background:linear-gradient(135deg,var(--amber-500),var(--coral-500));color:#fff;font-weight:800;padding:14px 18px;border-radius:var(--r-pill);box-shadow:0 4px 14px rgba(245,158,11,.4)}
+  .cta:hover{text-decoration:none;filter:brightness(1.04)}
+  .cta-soft{color:var(--ink-soft);font-size:.92rem}
+  .prov-name{font-weight:700;font-size:1.04rem;margin-bottom:6px}
+  .prov-verified{color:#0f7a3d;font-size:.86rem;margin-bottom:8px}
+  .prov-soft{color:var(--mist);font-size:.88rem}
+  .prov-link{font-size:.88rem;margin-top:6px}
+  .map-card{display:flex;align-items:center;gap:12px;color:var(--ink-soft);background:var(--canvas-2);border:1px solid var(--line);border-radius:var(--r-md);padding:14px 16px}
+  .map-card:hover{text-decoration:none;border-color:var(--fjord-600)}
+  .map-card svg{color:var(--fjord-600);flex:0 0 22px}
+  .map-card strong{display:block;color:var(--ink);font-size:.95rem}
+  .map-sub{font-size:.8rem;color:var(--mist)}
+  .map-fallback:hover{border-color:var(--line)}
+  .related{margin:34px 0 10px}
+  .related h2{font-size:1.2rem;font-weight:800;color:var(--fjord-900);margin-bottom:14px}
+  .rel-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:12px}
+  .rel-card{display:flex;flex-direction:column;gap:4px;background:var(--surface);border:1px solid var(--line);border-radius:var(--r-md);padding:14px 16px}
+  .rel-card:hover{text-decoration:none;border-color:var(--fjord-600);box-shadow:var(--sh-sm)}
+  .rel-title{font-weight:700;color:var(--ink);font-size:.95rem}
+  .rel-meta{font-size:.82rem;color:var(--mist)}
+  .site-foot{margin-top:48px;border-top:1px solid var(--line);background:var(--canvas-2)}
+  .foot-inner{max-width:var(--maxw);margin:0 auto;padding:26px 24px;font-size:.84rem;color:var(--mist);display:flex;flex-wrap:wrap;gap:16px;justify-content:space-between}
+  .foot-inner a{color:var(--ink-soft)}
+</style>
+</head>
+<body>
+<a class="skip-link" href="#main">Hopp til innhold</a>
+<nav class="site-nav"><div class="nav-inner">
+  <a class="brand" href="/"><span class="mark"><svg viewBox="0 0 24 24" width="20" height="20" aria-hidden="true"><path d="M3 18 L9 7 L13 13 L16 9 L21 18 Z" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round"/></svg></span>Opplevagent</a>
+  <span class="nav-links"><a href="/">Forsiden</a><a href="/#kategorier">Kategorier</a></span>
+</div></nav>
+<main id="main" class="container">
+  <nav class="breadcrumb" aria-label="Brødsmuler">
+    <a href="/">Forsiden</a>${cat ? `<span class="sep">/</span><a href="/kategori/${encodeURIComponent(cat)}">${escapeHtml(catLabel(cat))}</a>` : ""}<span class="sep">/</span>${escapeHtml(exp.title)}
+  </nav>
+  <header class="head">
+    <h1>${escapeHtml(exp.title)}</h1>
+    ${place ? `<p class="place"><svg viewBox="0 0 24 24" width="17" height="17" aria-hidden="true"><path d="M12 2a7 7 0 0 0-7 7c0 5 7 13 7 13s7-8 7-13a7 7 0 0 0-7-7z" fill="none" stroke="currentColor" stroke-width="1.7"/><circle cx="12" cy="9" r="2.3" fill="currentColor"/></svg>${escapeHtml(place)}</p>` : ""}
+    <div class="badges">${badges.join("")}</div>
+  </header>
+  <div class="layout">
+    <article>
+      ${descBlock}
+      <table class="facts"><caption class="skip-link">Fakta om opplevelsen</caption><tbody>${factsRows}</tbody></table>
+      ${evBlock}
+    </article>
+    <aside class="aside">
+      <div class="card"><h2>Bestilling</h2>${cta}</div>
+      <div class="card"><h2>Tilbyder</h2>${provInner}</div>
+      <div class="card"><h2>Sted</h2>${mapBlock}</div>
+    </aside>
+  </div>
+  ${relBlock}
+</main>
+<footer class="site-foot"><div class="foot-inner">
+  <span>© ${new Date().getFullYear()} Opplevagent — kuratert markedsplass for norske opplevelser.</span>
+  <span><a href="/">Forsiden</a> · <a href="/llms.txt">llms.txt</a> · <a href="/sitemap.xml">Sitemap</a></span>
+</div></footer>
+</body>
+</html>`;
+}
+
+router.get("/opplevelse/:slug", (req: Request, res: Response, next: NextFunction) => {
+  const slug = String(req.params.slug || "");
+  let exp: ReturnType<typeof getPublishedExperienceBySlug> = null;
+  try {
+    exp = getPublishedExperienceBySlug(slug);
+  } catch {
+    exp = null;
+  }
+  if (!exp) return next(); // → Norwegian 404 catch-all (no rfb/dental leak)
+
+  let provider: Record<string, unknown> | null = null;
+  try {
+    if (exp.provider_id) provider = getProviderById(exp.provider_id);
+  } catch {
+    provider = null;
+  }
+  let related: RelatedExperienceRow[] = [];
+  try {
+    related = getRelatedPublishedExperiences(exp.category ?? null, exp.id, 6);
+  } catch {
+    related = [];
+  }
+
+  res.setHeader("Content-Type", "text/html; charset=utf-8");
+  res.setHeader("Cache-Control", "public, max-age=300");
+  res.send(renderOpplevelseDetail(exp, provider, related, baseUrl()));
+});
+
 
 // ═══════════════════════════════════════════════════════════
 // Catch-all 404 — norsk side (forhindrer rfb/dental-innhold på opplevagent-host)
