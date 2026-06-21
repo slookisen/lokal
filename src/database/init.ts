@@ -1038,6 +1038,97 @@ function initSchema(db: Database.Database): void {
     console.error("Migration outreach_sent_log failed:", err);
   }
 
+  // ─── PR-38: auto-record marketing sends to outreach_sent_log ─────────────
+  //
+  // PROBLEM: outreach_sent_log had no live-path writer. The marketing agent
+  // calls /admin/crm/ingest after each Resend send (category:"innkommende",
+  // threadId:"marketing-batch-eN-<producerId>"). That INSERT fires into
+  // crm_messages with delivery_status='sent' (the column default). Without
+  // this trigger the outreach_ready_pool VIEW's NOT EXISTS gate never sees the
+  // send, so the same producer leaks back into the pool on the next batch.
+  //
+  // DESIGN NOTE: we identify marketing threads by the canonical threadId prefix
+  // "marketing-batch-" (NOT by crm_threads.category = 'marketing' — the agent
+  // sends category:"innkommende" per its CRM-ingest addendum, confirmed in
+  // marketing-comms-agent-crm-ingest-addendum.md). This is the authoritative
+  // discriminator: every other thread kind uses Gmail thread IDs (long hex
+  // strings) or the compose-<uuid> pattern from composeNewThread().
+  //
+  // Idempotent: CREATE TRIGGER IF NOT EXISTS — safe to re-run on every boot.
+  // Dedup guard: NOT EXISTS on message_id prevents double-inserts if the
+  // trigger somehow fires twice (e.g. future REPLACE INTO path).
+  //
+  // Origin: orchestrator PR-38 (2026-06-21).
+  try {
+    db.exec(`
+      CREATE TRIGGER IF NOT EXISTS trg_log_marketing_send_to_outreach_sent_log
+        AFTER INSERT ON crm_messages
+        FOR EACH ROW
+        WHEN NEW.direction = 'out' AND NEW.delivery_status = 'sent'
+        BEGIN
+          INSERT INTO outreach_sent_log (agent_id, sent_at, channel, message_id, notes)
+          SELECT cc.agent_id,
+                 COALESCE(NEW.sent_at, datetime('now')),
+                 'email',
+                 NEW.id,
+                 'auto:marketing_crm_send'
+          FROM crm_threads ct
+          JOIN crm_contacts cc ON cc.id = ct.contact_id
+          WHERE ct.id = NEW.thread_id
+            AND ct.id LIKE 'marketing-batch-%'
+            AND cc.agent_id IS NOT NULL
+            AND NOT EXISTS (
+              SELECT 1 FROM outreach_sent_log o WHERE o.message_id = NEW.id
+            );
+        END
+    `);
+  } catch (err) {
+    console.error("Migration trg_log_marketing_send_to_outreach_sent_log failed:", err);
+  }
+
+  // ─── PR-38: backfill existing marketing sends into outreach_sent_log ─────
+  //
+  // One-time idempotent backfill: find every crm_messages row that is an
+  // out/sent message on a marketing-batch thread whose agent_id is resolvable
+  // and is NOT yet in outreach_sent_log, and insert it.
+  //
+  // "marketing-batch-" threadId prefix is the canonical discriminator (see
+  // trigger comment above). We log each row count so the boot log shows
+  // whether legacy sends were picked up.
+  //
+  // Guarded by the migrations table — runs exactly once per DB file.
+  try {
+    db.exec(`CREATE TABLE IF NOT EXISTS migrations (name TEXT PRIMARY KEY, applied_at TEXT DEFAULT (datetime('now')))`);
+    const alreadyRanBackfill = db.prepare("SELECT 1 FROM migrations WHERE name = 'backfill_marketing_sends_to_sent_log_v1'").get();
+    if (!alreadyRanBackfill) {
+      const backfillResult = db.prepare(`
+        INSERT INTO outreach_sent_log (agent_id, sent_at, channel, message_id, notes)
+        SELECT cc.agent_id,
+               COALESCE(m.sent_at, datetime('now')),
+               'email',
+               m.id,
+               'backfill:marketing_crm_send_v1'
+        FROM crm_messages m
+        JOIN crm_threads ct ON ct.id = m.thread_id
+        JOIN crm_contacts cc ON cc.id = ct.contact_id
+        WHERE m.direction = 'out'
+          AND m.delivery_status = 'sent'
+          AND ct.id LIKE 'marketing-batch-%'
+          AND cc.agent_id IS NOT NULL
+          AND NOT EXISTS (
+            SELECT 1 FROM outreach_sent_log o WHERE o.message_id = m.id
+          )
+      `).run();
+      db.prepare("INSERT INTO migrations (name) VALUES ('backfill_marketing_sends_to_sent_log_v1')").run();
+      if (backfillResult.changes > 0) {
+        console.log(`[PR-38] Migration backfill_marketing_sends_to_sent_log_v1: inserted ${backfillResult.changes} row(s) into outreach_sent_log`);
+      }
+    }
+  } catch (err) {
+    console.error("Migration backfill_marketing_sends_to_sent_log_v1 failed:", err);
+  }
+
+
   // outreach_ready_pool VIEW — the list marketing will read once
   // WO #9 switches over. Filtered by:
   //   - non-null email
