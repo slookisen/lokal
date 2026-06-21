@@ -15062,6 +15062,23 @@ console.log("\n── opplevagent P2: human-browse subpages (experiences) ──
   assertTrue(fylkeKommP2.body.includes('href="/kommune/Troms'),
     "p2-08l: fylke page renders kommune chips linking to /kommune/<x>");
 
+
+  // p2-09: /favicon.svg — must return 200 + image/svg+xml (express.static is bypassed
+  // by the opplevagent host-gate; the favicon route in experiences-seo serves it inline).
+  const faviconP2 = invokeSeo("/favicon.svg", {}, "/favicon.svg");
+  assertEq(faviconP2.status, 200, "p2-09a: GET /favicon.svg → 200 (not 404)");
+  assertTrue(/image\/svg\+xml/.test(faviconP2.headers["content-type"] || ""),
+    "p2-09b: favicon Content-Type is image/svg+xml");
+  assertTrue(faviconP2.body.includes("<svg"), "p2-09c: favicon body contains SVG markup");
+
+  // p2-10: homepage quick-chip uses the correct full fylke URL (fixes broken link
+  // where /fylke/Troms was 404 in production — DB stores "Troms og Finnmark").
+  const homeChipP2 = invokeSeo("/", {}, "/");
+  assertTrue(homeChipP2.body.includes('href="/fylke/Troms%20og%20Finnmark"'),
+    "p2-10a: homepage quick-chip links to /fylke/Troms%20og%20Finnmark (full canonical name)");
+  assertTrue(!/href="\/fylke\/Troms"/.test(homeChipP2.body),
+    "p2-10b: homepage does NOT contain the stale /fylke/Troms short-form href");
+
   if (prevPathP2 === undefined) delete process.env.EXPERIENCES_DB_PATH;
   else process.env.EXPERIENCES_DB_PATH = prevPathP2;
   dbFactoryP2.__resetDbFactoryForTesting();
