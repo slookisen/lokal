@@ -40,6 +40,7 @@ import adminAgentsRoutes from "./routes/admin-agents";
 import adminOutreachPoolRoutes from "./routes/admin-outreach-pool";
 import adminOutreachCandidatesRoutes from "./routes/admin-outreach-candidates";
 import adminRunVerifierRoutes from "./routes/admin-run-verifier";
+import adminLoopHeartbeatRoutes from "./routes/admin-loop-heartbeat";
 import adminRunPlatformVerifierRoutes from "./routes/admin-run-platform-verifier";
 import adminVerifierSweepStatusRouter from "./routes/admin-verifier-sweep-status";
 import ownerPortalRoutes from "./routes/owner-portal";
@@ -426,6 +427,9 @@ app.use("/admin/outreach-ready-pool", adminLimiter, adminOutreachPoolRoutes);
 app.use("/admin/outreach-candidates", adminLimiter, adminOutreachCandidatesRoutes);
 app.use("/admin/outreach-sent-log", adminLimiter, adminOutreachCandidatesRoutes);
 app.use("/admin/run-verifier", adminLimiter, adminRunVerifierRoutes);
+// P1 server-migration: deterministic loop watchdog — liveness from the
+// run-ledger; ?alert=1 emails when a watcher is silent.
+app.use("/admin/loop-heartbeat", adminLimiter, adminLoopHeartbeatRoutes);
 // Phase 2: server-side platform-verifier (deterministic probe loop, dry_run default)
 app.use("/admin/run-platform-verifier", adminLimiter, adminRunPlatformVerifierRoutes);
 app.use("/admin/verifier/sweep-status", adminLimiter, adminVerifierSweepStatusRouter);
