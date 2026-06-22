@@ -12,12 +12,30 @@ function sqliteDatetime(date: Date): string {
 // Reusable SQL fragment: exclude owner traffic from analytics
 const NOT_OWNER = "(is_owner IS NULL OR is_owner = 0)";
 
-// ─── Vertical filter (?vertical=rfb|dental) ─────────────────────
-// Both verticals (rettfrabonden.com + finn-tannlege.com) run on the same
-// app and write to the same analytics tables, separated by vertical_id.
-// Endpoints accept ?vertical=rfb|dental|experiences to split traffic per site;
-// anything else (or omitted) = all traffic combined.
+// ─── Host-locked vertical (site isolation) ──────────────────────
+// The analytics dashboard is also served on the secondary vertical hosts
+// (opplevagent.no → experiences, finn-tannlege.com → dental) so each site has
+// its own per-site stats view. On those hosts we hard-scope every analytics
+// read to that vertical regardless of ?vertical=, so an admin-key holder on
+// opplevagent.no can never read rfb/dental data, and vice versa. The central
+// admin host (rettfrabonden.com / lokal.fly.dev / localhost) is NOT locked —
+// that's where the dashboard switches freely between all verticals.
+function lockedVerticalForHost(req: Request): VerticalId | undefined {
+  const h = (req.hostname || "").toLowerCase();
+  if (h.includes("finn-tannlege")) return "dental";
+  if (h.includes("opplevagent")) return "experiences";
+  return undefined;
+}
+
+// ─── Vertical filter (?vertical=rfb|dental|experiences) ─────────
+// All three verticals (rettfrabonden.com + finn-tannlege.com + opplevagent.no)
+// run on the same app and write to the same analytics tables, separated by
+// vertical_id. Endpoints accept ?vertical=rfb|dental|experiences to split
+// traffic per site; anything else (or omitted) = all traffic combined.
+// A host lock (see above) always overrides the query param for isolation.
 function parseVertical(req: Request): VerticalId | undefined {
+  const locked = lockedVerticalForHost(req);
+  if (locked) return locked;
   const v = String(req.query.vertical || "").toLowerCase();
   return v === "rfb" || v === "dental" || v === "experiences" ? (v as VerticalId) : undefined;
 }
@@ -254,7 +272,9 @@ router.get("/export/:table", (req: Request, res: Response) => {
   const limit = Math.min(10000, parseInt(req.query.limit as string) || 1000);
   const offset = Math.max(0, parseInt(req.query.offset as string) || 0);
 
-  const result = analyticsService.exportData(table, limit, offset);
+  // On an isolation-locked host, scope the raw export to that vertical too so
+  // a per-site dashboard can never dump another vertical's rows.
+  const result = analyticsService.exportData(table, limit, offset, lockedVerticalForHost(req));
   res.json({
     table,
     timestamp: new Date().toISOString(),
@@ -930,6 +950,11 @@ router.get("/ops/diagnostics", (_req: Request, res: Response) => {
 //   }
 router.get("/producer-outcomes", requireAdminAuth, (req: Request, res: Response) => {
   try {
+    // rfb-only content (/produsent/*). Never expose on a locked secondary host.
+    if (lockedVerticalForHost(req)) {
+      res.json({ window: { from: null, to: null, days: 0 }, totals: {}, byDay: [] });
+      return;
+    }
     const db = getDb();
     const days = Math.min(90, Math.max(1, parseInt(String(req.query.days || "30"), 10) || 30));
 
@@ -1005,6 +1030,13 @@ router.get("/producer-outcomes", requireAdminAuth, (req: Request, res: Response)
 //
 // Response shape — see PR-74 spec in repo notes.
 router.get("/umbrella-traffic", (req: Request, res: Response) => {
+  // Markedsnettverk (umbrellas) are an rfb-only concept. Never expose on a
+  // locked secondary host even though the dashboard hides the panel there.
+  if (lockedVerticalForHost(req)) {
+    res.json({ success: true, since_hours: 0, umbrellas: [] });
+    return;
+  }
+
   // ── Param validation ────────────────────────────────────────
   // Reject malformed values explicitly (vs. silent fallback) so the
   // dashboard can't accidentally show "24h" when the user typed "abc".

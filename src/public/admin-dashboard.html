@@ -120,33 +120,43 @@
         .tab-btn.active { background: var(--surface2); color: var(--text); }
         .tab-btn:hover:not(.active) { color: var(--text); }
 
-        /* ─── Vertical switcher (RFB / Finn Tannlege / Begge) ─── */
+        /* ─── Vertical switcher (RFB / Finn Tannlege / OpplevAgent / Alle) ─── */
         .vertical-bar { display: flex; gap: 4px; background: var(--bg); border: 1px solid var(--border); border-radius: 10px; padding: 4px; }
         .vertical-btn { padding: 8px 16px; font-size: 13px; font-weight: 600; color: var(--text-dim); border: none; background: none; cursor: pointer; border-radius: 7px; transition: all .2s; white-space: nowrap; }
         .vertical-btn:hover:not(.active) { color: var(--text); }
         .vertical-btn.active[data-v="rfb"] { background: #4ade8022; color: #4ade80; }
         .vertical-btn.active[data-v="dental"] { background: #2dd4bf22; color: #2dd4bf; }
+        .vertical-btn.active[data-v="experiences"] { background: #f59e0b22; color: #f59e0b; }
         .vertical-btn.active[data-v="all"] { background: var(--surface2); color: var(--text); }
         /* Dental theme: teal accent («Klinisk tillit»-paletten, lysnet for mørk bakgrunn) */
         body[data-vertical="dental"] { --accent: #2dd4bf; }
+        /* Experiences theme: amber accent (Opplevagent-palettens --amber-500) */
+        body[data-vertical="experiences"] { --accent: #f59e0b; }
         body[data-vertical="dental"] .topbar { border-bottom: 2px solid #2dd4bf; }
+        body[data-vertical="experiences"] .topbar { border-bottom: 2px solid #f59e0b; }
         body[data-vertical="rfb"] .topbar { border-bottom: 2px solid #4ade80; }
-        /* Paneler som kun gir mening for RFB skjules i dental-visning */
-        body[data-vertical="dental"] [data-rfb-only] { display: none; }
+        /* Paneler som kun gir mening for RFB skjules i dental-/experiences-visning
+           (byer, produsenter og markedsnettverk leses fra analytics_agent_views,
+           som bare rfb-SEO populerer). */
+        body[data-vertical="dental"] [data-rfb-only],
+        body[data-vertical="experiences"] [data-rfb-only] { display: none; }
         .vertical-banner { display: none; border-radius: 8px; padding: 10px 16px; margin-bottom: 16px; font-size: 0.85rem; font-weight: 600; }
         body[data-vertical="rfb"] #verticalBanner { display: block; background: #4ade8015; border: 1px solid #4ade8055; color: #4ade80; }
         body[data-vertical="dental"] #verticalBanner { display: block; background: #2dd4bf15; border: 1px solid #2dd4bf55; color: #2dd4bf; }
-        /* Sammenligningsstripe i «Begge»-visning */
+        body[data-vertical="experiences"] #verticalBanner { display: block; background: #f59e0b15; border: 1px solid #f59e0b55; color: #f59e0b; }
+        /* Sammenligningsstripe i «Alle»-visning (vises bare på det sentrale hostet) */
         #compareStrip { display: none; }
         body[data-vertical="all"] #compareStrip { display: block; }
-        .compare-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
-        @media (max-width: 800px) { .compare-grid { grid-template-columns: 1fr; } }
+        .compare-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 16px; }
+        @media (max-width: 980px) { .compare-grid { grid-template-columns: 1fr; } }
         .compare-card { background: var(--surface); border-radius: var(--radius); padding: 16px 20px; }
         .compare-card.rfb { border: 1px solid #4ade8055; border-left: 4px solid #4ade80; }
         .compare-card.dental { border: 1px solid #2dd4bf55; border-left: 4px solid #2dd4bf; }
+        .compare-card.experiences { border: 1px solid #f59e0b55; border-left: 4px solid #f59e0b; }
         .compare-title { font-size: 14px; font-weight: 700; margin-bottom: 12px; }
         .compare-card.rfb .compare-title { color: #4ade80; }
         .compare-card.dental .compare-title { color: #2dd4bf; }
+        .compare-card.experiences .compare-title { color: #f59e0b; }
         .compare-stats { display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px; }
         .compare-stat-label { font-size: 10px; text-transform: uppercase; letter-spacing: 0.5px; color: var(--text-dim); }
         .compare-stat-value { font-size: 22px; font-weight: 700; }
@@ -173,7 +183,8 @@
             <div class="vertical-bar" id="verticalBar">
                 <button class="vertical-btn" data-v="rfb">🌱 Rett fra Bonden</button>
                 <button class="vertical-btn" data-v="dental">🦷 Finn Tannlege</button>
-                <button class="vertical-btn active" data-v="all">Begge</button>
+                <button class="vertical-btn" data-v="experiences">🧭 OpplevAgent</button>
+                <button class="vertical-btn active" data-v="all">Alle</button>
             </div>
             <select id="timeSelect" class="time-select">
                 <option value="1">Siste time</option>
@@ -205,6 +216,10 @@
                 <div class="compare-card dental">
                     <div class="compare-title">🦷 Finn Tannlege — finn-tannlege.com</div>
                     <div class="compare-stats" id="compareDental"><div class="loading">Laster...</div></div>
+                </div>
+                <div class="compare-card experiences">
+                    <div class="compare-title">🧭 OpplevAgent — opplevagent.no</div>
+                    <div class="compare-stats" id="compareExperiences"><div class="loading">Laster...</div></div>
                 </div>
             </div>
         </div>
@@ -352,17 +367,34 @@
     var BASE = window.location.origin;
 
     // ─── Vertical switcher state ─────────────────────
-    // 'rfb' = rettfrabonden.com, 'dental' = finn-tannlege.com, 'all' = begge.
-    var VERTICAL = "all";
-    try { VERTICAL = sessionStorage.getItem("rfb_vertical") || "all"; } catch(e) {}
+    // 'rfb' = rettfrabonden.com, 'dental' = finn-tannlege.com,
+    // 'experiences' = opplevagent.no, 'all' = alle tre.
+    //
+    // HOST_LOCK: the dashboard is also served on the secondary vertical hosts
+    // (opplevagent.no, finn-tannlege.com) as a per-site stats view. On those
+    // hosts it is pinned to that site's vertical and the switcher is hidden —
+    // matching the server-side host lock in routes/analytics.ts so a per-site
+    // dashboard can only ever see its own data.
+    function lockedVerticalForHost() {
+        var h = (window.location.hostname || "").toLowerCase();
+        if (h.indexOf("finn-tannlege") >= 0) return "dental";
+        if (h.indexOf("opplevagent") >= 0) return "experiences";
+        return null;
+    }
+    var HOST_LOCK = lockedVerticalForHost();
+
+    var VERTICAL = HOST_LOCK || "all";
+    if (!HOST_LOCK) { try { VERTICAL = sessionStorage.getItem("rfb_vertical") || "all"; } catch(e) {} }
 
     var VERTICAL_META = {
-        rfb:    { title: "🌱 Rett fra Bonden — Analytics",  banner: "Viser kun trafikk for rettfrabonden.com" },
-        dental: { title: "🦷 Finn Tannlege — Analytics",    banner: "Viser kun trafikk for finn-tannlege.com" },
-        all:    { title: "📊 Analytics — begge vertikaler", banner: "" },
+        rfb:         { title: "🌱 Rett fra Bonden — Analytics",  banner: "Viser kun trafikk for rettfrabonden.com" },
+        dental:      { title: "🦷 Finn Tannlege — Analytics",    banner: "Viser kun trafikk for finn-tannlege.com" },
+        experiences: { title: "🧭 OpplevAgent — Analytics",      banner: "Viser kun trafikk for opplevagent.no" },
+        all:         { title: "📊 Analytics — alle vertikaler",  banner: "" },
     };
 
     function setVertical(v) {
+        if (HOST_LOCK) return; // per-site dashboards are pinned to one vertical
         VERTICAL = v;
         try { sessionStorage.setItem("rfb_vertical", v); } catch(e) {}
         applyVerticalUi();
@@ -464,6 +496,16 @@
         document.getElementById("refreshBtn").addEventListener("click", loadDashboard);
         document.getElementById("logoutBtn").addEventListener("click", doLogout);
 
+        // Per-site dashboard (opplevagent.no / finn-tannlege.com): hide the
+        // vertical switcher and brand the login screen for that one site.
+        if (HOST_LOCK) {
+            var vbar = document.getElementById("verticalBar");
+            if (vbar) vbar.style.display = "none";
+            var lockMeta = VERTICAL_META[HOST_LOCK];
+            var loginH1 = document.querySelector("#loginScreen .login-card h1");
+            if (loginH1 && lockMeta) loginH1.textContent = lockMeta.title.replace(" — Analytics", "");
+        }
+
         // Vertical switcher buttons + initial UI state
         var vbtns = document.querySelectorAll("#verticalBar .vertical-btn");
         for (var i = 0; i < vbtns.length; i++) {
@@ -488,7 +530,7 @@
     // selected. Endpoints that ignore the param (conversations, umbrella)
     // are unaffected by the extra query string.
     function api(path) {
-        if (VERTICAL === "rfb" || VERTICAL === "dental") {
+        if (VERTICAL !== "all") {
             path += (path.indexOf("?") >= 0 ? "&" : "?") + "vertical=" + VERTICAL;
         }
         return apiRaw(path);
@@ -514,10 +556,16 @@
         if (hours === "all") hours = "87600";
         // /hourly bins blow up beyond a week, so cap that one separately.
         var hourlyHours = (parseInt(hours, 10) > 168) ? "168" : hours;
+
+        // rfb-only endpoints (producers, cities, umbrella) read from data that
+        // only the rfb SEO routes populate (analytics_agent_views / umbrellas).
+        // Their panels are hidden for dental/experiences, so skip the calls
+        // there — avoids wasted requests and any cross-vertical fetch.
+        var rfbOnly = (VERTICAL === "rfb" || VERTICAL === "all");
         Promise.all([
             api("/summary/" + hours),
-            api("/producers?hours=" + hours + "&limit=15"),
-            api("/cities?hours=" + hours),
+            rfbOnly ? api("/producers?hours=" + hours + "&limit=15") : Promise.resolve({ producers: [] }),
+            rfbOnly ? api("/cities?hours=" + hours) : Promise.resolve({ cities: [] }),
             api("/visitors?hours=" + hours + "&limit=30"),
             api("/hourly?hours=" + hourlyHours),
             api("/pages?hours=" + hours),
@@ -525,7 +573,7 @@
             api("/traffic-classification?hours=" + hours),
             api("/referrers?hours=" + hours),
             api("/conversations"),
-            api("/umbrella-traffic?since_hours=" + hours),
+            rfbOnly ? api("/umbrella-traffic?since_hours=" + hours) : Promise.resolve({ umbrellas: [] }),
         ])
         .then(function(results) {
             var summary = results[0];
@@ -570,10 +618,12 @@
             Promise.all([
                 apiRaw("/summary/" + hours + "?vertical=rfb"),
                 apiRaw("/summary/" + hours + "?vertical=dental"),
+                apiRaw("/summary/" + hours + "?vertical=experiences"),
             ])
             .then(function(res) {
                 renderCompareCard("compareRfb", res[0]);
                 renderCompareCard("compareDental", res[1]);
+                renderCompareCard("compareExperiences", res[2]);
             })
             .catch(function(err) {
                 console.error("Compare strip load failed:", err);

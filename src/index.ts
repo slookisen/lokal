@@ -161,8 +161,18 @@ if (process.env.ENABLE_DENTAL === "1") {
     // NOTE: /.well-known/ is intentionally NOT passed through here —
     // dental has its own well-known surfaces (agent-card.json, openapi.json)
     // served by dental-seo and dental-a2a routers.
+    //
+    // The analytics dashboard + its read API also pass through so
+    // finn-tannlege.com has its own per-site stats view at /admin/dashboard.
+    // The analytics routes host-lock to vertical=dental (routes/analytics.ts
+    // → lockedVerticalForHost), so no rfb/experiences data is reachable here.
     const p = req.path;
-    if (p.startsWith("/api/") || p === "/health") {
+    if (
+      p.startsWith("/api/") ||
+      p === "/health" ||
+      p === "/admin/dashboard" ||
+      p.startsWith("/admin/analytics")
+    ) {
       return next();
     }
 
@@ -214,8 +224,18 @@ if (process.env.ENABLE_EXPERIENCES === "1") {
     // NOTE: /.well-known/ is intentionally NOT passed through here —
     // experiences has its own well-known surfaces (agent-card.json) served
     // by experiences-seo and experiences-a2a routers.
+    //
+    // The analytics dashboard + its read API also pass through so
+    // opplevagent.no has its own per-site stats view at /admin/dashboard.
+    // The analytics routes host-lock to vertical=experiences (routes/analytics.ts
+    // → lockedVerticalForHost), so no rfb/dental data is reachable here.
     const p = req.path;
-    if (p.startsWith("/api/") || p === "/health") {
+    if (
+      p.startsWith("/api/") ||
+      p === "/health" ||
+      p === "/admin/dashboard" ||
+      p.startsWith("/admin/analytics")
+    ) {
       return next();
     }
 
