@@ -64,6 +64,19 @@ function escapeHtml(text: unknown): string {
 
 // Categories are read lazily + defensively — if the experiences DB isn't
 // open (flag off in some context) we just render the landing without them.
+// «Konstellasjon» brand mark (logo spec, Konsept 02): three agent nodes + a coral
+// spark = the perfect match found. Light variant for cream surfaces, dark variant
+// lightens the earth tones for dark surfaces (footer/hero).
+function brandMarkSvg(variant: "light" | "dark" = "light"): string {
+  const olive = variant === "dark" ? "#a7b56e" : "#6f7a4f";
+  const gold = variant === "dark" ? "#e0a43b" : "#c98a2b";
+  const op = variant === "dark" ? "0.55" : "0.45";
+  return `<svg viewBox="0 0 52 48" width="35" height="32" fill="none" aria-hidden="true" focusable="false"><path d="M9 33 L24 11 L43 19 L31 38 Z" fill="none" stroke="#12a594" stroke-width="2" stroke-linejoin="round" opacity="${op}"/><circle cx="9" cy="33" r="4" fill="#12a594"/><circle cx="43" cy="19" r="4" fill="${olive}"/><circle cx="31" cy="38" r="4" fill="${gold}"/><path d="M24 3 C25.1 8.9 26.9 10.7 32.8 11.8 C26.9 12.9 25.1 14.7 24 20.6 C22.9 14.7 21.1 12.9 15.2 11.8 C21.1 10.7 22.9 8.9 24 3 Z" fill="#ff5d3b"/></svg>`;
+}
+function brandInner(variant: "light" | "dark" = "light"): string {
+  return `<span class="mark" aria-hidden="true">${brandMarkSvg(variant)}</span><span class="brand-word">opplevagent<span class="tld">.no</span></span>`;
+}
+
 function safeCategories(): Array<{ category: string; count: number }> {
   try {
     return listCategories();
@@ -194,7 +207,7 @@ router.get("/", (_req: Request, res: Response) => {
 <title>Opplevagent — Kuratert markedsplass for norske opplevelser</title>
 <meta name="description" content="${escapeHtml(desc)}">
 <meta name="robots" content="index, follow, max-snippet:-1, max-image-preview:large">
-<meta name="theme-color" content="#0b3d2e">
+<meta name="theme-color" content="#0e3c36">
 <link rel="canonical" href="${url}">
 <link rel="icon" type="image/svg+xml" href="/favicon.svg">
 <meta property="og:title" content="Opplevagent — norske opplevelser, søkbart for AI-agenter">
@@ -211,17 +224,19 @@ router.get("/", (_req: Request, res: Response) => {
 <meta name="twitter:image" content="${url}/favicon.svg">
 ${ldScripts}
 <style>
+  @import url('https://fonts.googleapis.com/css2?family=Outfit:wght@500;600;700&display=swap');
   *{margin:0;padding:0;box-sizing:border-box}
   :root{
-    --fjord-900:#072a20;--fjord-800:#0b3d2e;--fjord-700:#0f5132;--fjord-600:#147a4d;
-    --teal-500:#14b8a6;--teal-400:#2dd4bf;
-    --amber-500:#f59e0b;--amber-400:#fbbf24;--coral-500:#ff7a45;
-    --ink:#10231b;--ink-soft:#3c5249;--mist:#6b8178;
-    --surface:#ffffff;--canvas:#f4f8f4;--canvas-2:#eaf2ec;--line:#dde9e0;
+    --fjord-900:#0b2e29;--fjord-800:#0e3c36;--fjord-700:#0f5a50;--fjord-600:#0c7264;
+    --font-brand:'Outfit',-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;--olive:#6f7a4f;--gold:#c98a2b;
+    --teal-500:#12a594;--teal-400:#3cc3b4;
+    --amber-500:#ff5d3b;--amber-400:#ff8566;--coral-500:#ff5d3b;
+    --ink:#18130d;--ink-soft:#544a3e;--mist:#7a7163;
+    --surface:#ffffff;--canvas:#f7f4ee;--canvas-2:#efe9dd;--line:#e4ded0;
     --r-sm:8px;--r-md:14px;--r-lg:22px;--r-pill:999px;
-    --sh-sm:0 1px 2px rgba(7,42,32,.06),0 2px 6px rgba(7,42,32,.05);
-    --sh-md:0 6px 18px rgba(7,42,32,.10);
-    --sh-lg:0 18px 48px rgba(7,42,32,.22);
+    --sh-sm:0 1px 2px rgba(24,19,13,.06),0 2px 6px rgba(24,19,13,.05);
+    --sh-md:0 6px 18px rgba(24,19,13,.10);
+    --sh-lg:0 18px 48px rgba(24,19,13,.22);
     --maxw:1120px;
   }
   html{scroll-behavior:smooth}
@@ -241,8 +256,10 @@ ${ldScripts}
   @media(max-width:560px){.nav-inner{padding:0 16px}}
   .brand{display:flex;align-items:center;gap:10px;font-weight:800;font-size:1.16rem;letter-spacing:-.02em;color:var(--fjord-800);text-decoration:none}
   .brand:hover{text-decoration:none}
-  .brand .mark{width:34px;height:34px;flex:0 0 34px;border-radius:10px;background:linear-gradient(150deg,var(--fjord-700),var(--teal-500));display:flex;align-items:center;justify-content:center;box-shadow:var(--sh-sm)}
-  .brand .mark svg{color:#fff}
+  .brand-word{font-family:var(--font-brand);font-weight:600;font-size:1.3rem;letter-spacing:-.015em;text-transform:lowercase;line-height:1;color:var(--ink)}
+  .brand-word .tld{color:var(--fjord-600)}
+  .brand .mark{display:flex;align-items:center;justify-content:center}
+  .brand .mark svg{display:block}
   .nav-links{display:flex;gap:26px;align-items:center}
   .nav-links a{font-size:.88rem;font-weight:600;color:var(--ink-soft)}
   .nav-links a:hover{color:var(--fjord-700)}
@@ -251,14 +268,14 @@ ${ldScripts}
   @media(max-width:760px){.nav-links a:not(.nav-cta){display:none}}
 
   /* ── HERO ── */
-  .hero{position:relative;overflow:hidden;color:#fff;background:linear-gradient(135deg,#072a20 0%,#0f5132 38%,#147a4d 60%,#1f9e6b 78%,#f59e0b 130%)}
-  .hero::before{content:"";position:absolute;inset:0;background:radial-gradient(120% 90% at 18% 8%,rgba(45,212,191,.30),transparent 55%),radial-gradient(90% 80% at 92% 18%,rgba(245,158,11,.28),transparent 60%);pointer-events:none}
+  .hero{position:relative;overflow:hidden;color:#fff;background:linear-gradient(135deg,#0b2e29 0%,#0e3c36 34%,#0f5a50 56%,#12a594 82%,#ff5d3b 136%)}
+  .hero::before{content:"";position:absolute;inset:0;background:radial-gradient(120% 90% at 18% 8%,rgba(60,195,180,.30),transparent 55%),radial-gradient(90% 80% at 92% 18%,rgba(255,93,59,.28),transparent 60%);pointer-events:none}
   .hero-range{position:absolute;left:0;right:0;bottom:-1px;height:140px;opacity:.55;pointer-events:none}
   .hero-inner{position:relative;max-width:920px;margin:0 auto;padding:84px 24px 104px;text-align:center;z-index:1}
   @media(max-width:560px){.hero-inner{padding:60px 16px 96px}}
   .eyebrow{display:inline-flex;align-items:center;gap:8px;padding:6px 14px;border-radius:var(--r-pill);background:rgba(255,255,255,.14);border:1px solid rgba(255,255,255,.22);font-size:.78rem;font-weight:600;letter-spacing:.02em;margin-bottom:22px;backdrop-filter:blur(4px)}
-  .eyebrow .dot{width:7px;height:7px;border-radius:50%;background:var(--amber-400);box-shadow:0 0 0 4px rgba(251,191,36,.25)}
-  .hero h1{font-size:clamp(2rem,5.2vw,3.4rem);font-weight:800;letter-spacing:-.035em;line-height:1.08;margin-bottom:18px;text-shadow:0 2px 30px rgba(7,42,32,.25)}
+  .eyebrow .dot{width:7px;height:7px;border-radius:50%;background:var(--amber-400);box-shadow:0 0 0 4px rgba(255,133,102,.25)}
+  .hero h1{font-size:clamp(2rem,5.2vw,3.4rem);font-weight:800;letter-spacing:-.035em;line-height:1.08;margin-bottom:18px;text-shadow:0 2px 30px rgba(24,19,13,.25)}
   .hero h1 .accent{background:linear-gradient(100deg,var(--amber-400),var(--coral-500));-webkit-background-clip:text;background-clip:text;color:transparent}
   .hero-sub{font-size:clamp(1.02rem,2.1vw,1.22rem);max-width:620px;margin:0 auto 34px;color:rgba(255,255,255,.92)}
 
@@ -269,8 +286,8 @@ ${ldScripts}
   .discover-form .field svg{color:var(--mist);flex:0 0 20px}
   .discover-form input{flex:1;border:none;outline:none;font-size:1.02rem;color:var(--ink);background:transparent;padding:14px 4px;min-width:0}
   .discover-form input::placeholder{color:#90a399}
-  .discover-form button{flex:0 0 auto;border:none;cursor:pointer;background:linear-gradient(135deg,var(--amber-500),var(--coral-500));color:#fff;font-weight:800;font-size:.96rem;padding:14px 26px;border-radius:var(--r-pill);box-shadow:0 4px 14px rgba(245,158,11,.4);transition:transform .12s ease,box-shadow .12s ease}
-  .discover-form button:hover{transform:translateY(-1px);box-shadow:0 6px 18px rgba(245,158,11,.5)}
+  .discover-form button{flex:0 0 auto;border:none;cursor:pointer;background:linear-gradient(135deg,var(--amber-500),var(--coral-500));color:#fff;font-weight:800;font-size:.96rem;padding:14px 26px;border-radius:var(--r-pill);box-shadow:0 4px 14px rgba(255,93,59,.4);transition:transform .12s ease,box-shadow .12s ease}
+  .discover-form button:hover{transform:translateY(-1px);box-shadow:0 6px 18px rgba(255,93,59,.5)}
   .discover-form button:active{transform:translateY(0)}
   @media(max-width:520px){
     .discover-form{flex-direction:column;border-radius:var(--r-lg);padding:10px;gap:8px;align-items:stretch}
@@ -330,7 +347,7 @@ ${ldScripts}
 
   /* agents callout */
   .agents{position:relative;overflow:hidden;background:linear-gradient(140deg,#082c21,#0f5132 70%,#146a45);color:#fff;border-radius:var(--r-lg);padding:44px 40px;box-shadow:var(--sh-md)}
-  .agents::before{content:"";position:absolute;inset:0;background:radial-gradient(80% 120% at 100% 0%,rgba(45,212,191,.22),transparent 55%);pointer-events:none}
+  .agents::before{content:"";position:absolute;inset:0;background:radial-gradient(80% 120% at 100% 0%,rgba(60,195,180,.22),transparent 55%);pointer-events:none}
   .agents-grid{position:relative;display:grid;grid-template-columns:1.05fr 1fr;gap:34px;align-items:center}
   @media(max-width:820px){.agents{padding:32px 24px}.agents-grid{grid-template-columns:1fr;gap:24px}}
   .agents h2{font-size:clamp(1.45rem,3vw,2rem);font-weight:800;letter-spacing:-.02em;margin-bottom:12px}
@@ -367,12 +384,7 @@ ${ldScripts}
 
 <header class="site-nav">
   <div class="nav-inner">
-    <a class="brand" href="/" aria-label="Opplevagent forside">
-      <span class="mark" aria-hidden="true">
-        <svg viewBox="0 0 24 24" width="20" height="20"><path d="M2 19 L8.5 7 L13 14.5 L16 10 L22 19 Z" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"/><circle cx="18" cy="6" r="2.4" fill="currentColor"/></svg>
-      </span>
-      Opplevagent
-    </a>
+    <a class="brand" href="/" aria-label="Opplevagent forside">${brandInner("light")}</a>
     <nav class="nav-links" aria-label="Hovednavigasjon">
       <a href="/opplevelser">Alle opplevelser</a>
       <a href="#kategorier">Kategorier</a>
@@ -386,8 +398,8 @@ ${ldScripts}
 <main id="hovedinnhold">
   <section class="hero" aria-labelledby="hero-title">
     <svg class="hero-range" viewBox="0 0 1440 140" preserveAspectRatio="none" aria-hidden="true">
-      <path d="M0 140 L0 96 L150 40 L300 92 L470 24 L640 88 L820 36 L1010 96 L1200 48 L1340 90 L1440 60 L1440 140 Z" fill="rgba(7,42,32,.45)"/>
-      <path d="M0 140 L0 116 L210 72 L420 112 L640 70 L900 118 L1150 82 L1440 110 L1440 140 Z" fill="rgba(7,42,32,.65)"/>
+      <path d="M0 140 L0 96 L150 40 L300 92 L470 24 L640 88 L820 36 L1010 96 L1200 48 L1340 90 L1440 60 L1440 140 Z" fill="rgba(24,19,13,.45)"/>
+      <path d="M0 140 L0 116 L210 72 L420 112 L640 70 L900 118 L1150 82 L1440 110 L1440 140 Z" fill="rgba(24,19,13,.65)"/>
     </svg>
     <div class="hero-inner">
       <span class="eyebrow"><span class="dot"></span> A2A-markedsplass for norske opplevelser</span>
@@ -504,12 +516,7 @@ ${ldScripts}
 <footer class="site-footer" role="contentinfo">
   <div class="footer-grid">
     <div class="footer-brand">
-      <a class="brand" href="/" aria-label="Opplevagent forside">
-        <span class="mark" aria-hidden="true">
-          <svg viewBox="0 0 24 24" width="20" height="20"><path d="M2 19 L8.5 7 L13 14.5 L16 10 L22 19 Z" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"/><circle cx="18" cy="6" r="2.4" fill="currentColor"/></svg>
-        </span>
-        Opplevagent
-      </a>
+      <a class="brand" href="/" aria-label="Opplevagent forside">${brandInner("dark")}</a>
       <p>Kuratert markedsplass for norske opplevelser og aktiviteter &mdash; søkbar for mennesker og AI-agenter.</p>
     </div>
     <div class="footer-col">
@@ -528,7 +535,7 @@ ${ldScripts}
     </div>
   </div>
   <div class="footer-bottom">
-    <span>&copy; ${year} Opplevagent</span>
+    <span>&copy; ${year} Opplevagent &middot; <a href="/personvern" style="color:rgba(255,255,255,.62)">Personvern</a> &middot; <a href="/vilkar" style="color:rgba(255,255,255,.62)">Vilkår</a></span>
     <span class="verified"><svg viewBox="0 0 24 24" width="15" height="15" aria-hidden="true"><path d="M12 2 L20 5 V11 C20 16 16.5 20 12 22 C7.5 20 4 16 4 11 V5 Z" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"/><path d="M8.5 12 L11 14.5 L15.5 9.5" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg> Tilbydere verifisert mot Brønnøysundregistrene</span>
   </div>
 </footer>
@@ -1067,7 +1074,7 @@ function renderOpplevelseDetail(
 <title>${escapeHtml(title)}</title>
 <meta name="description" content="${escapeHtml(metaDesc)}">
 <meta name="robots" content="index, follow, max-snippet:-1, max-image-preview:large">
-<meta name="theme-color" content="#0b3d2e">
+<meta name="theme-color" content="#0e3c36">
 <link rel="canonical" href="${canonical}">
 <link rel="icon" type="image/svg+xml" href="/favicon.svg">
 <meta property="og:title" content="${escapeHtml(exp.title)}">
@@ -1080,15 +1087,17 @@ function renderOpplevelseDetail(
 <meta name="twitter:card" content="summary">
 ${ldScripts}
 <style>
+  @import url('https://fonts.googleapis.com/css2?family=Outfit:wght@500;600;700&display=swap');
   *{margin:0;padding:0;box-sizing:border-box}
   :root{
-    --fjord-900:#072a20;--fjord-800:#0b3d2e;--fjord-700:#0f5132;--fjord-600:#147a4d;
-    --teal-500:#14b8a6;--amber-500:#f59e0b;--coral-500:#ff7a45;
-    --ink:#10231b;--ink-soft:#3c5249;--mist:#6b8178;
-    --surface:#fff;--canvas:#f4f8f4;--canvas-2:#eaf2ec;--line:#dde9e0;
+    --fjord-900:#0b2e29;--fjord-800:#0e3c36;--fjord-700:#0f5a50;--fjord-600:#0c7264;
+    --font-brand:'Outfit',-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;--olive:#6f7a4f;--gold:#c98a2b;
+    --teal-500:#12a594;--amber-500:#ff5d3b;--coral-500:#ff5d3b;
+    --ink:#18130d;--ink-soft:#544a3e;--mist:#7a7163;
+    --surface:#fff;--canvas:#f7f4ee;--canvas-2:#efe9dd;--line:#e4ded0;
     --r-sm:8px;--r-md:14px;--r-lg:20px;--r-pill:999px;
-    --sh-sm:0 1px 2px rgba(7,42,32,.06),0 2px 6px rgba(7,42,32,.05);
-    --sh-md:0 6px 18px rgba(7,42,32,.10);--maxw:1080px;
+    --sh-sm:0 1px 2px rgba(24,19,13,.06),0 2px 6px rgba(24,19,13,.05);
+    --sh-md:0 6px 18px rgba(24,19,13,.10);--maxw:1080px;
   }
   body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;color:var(--ink);background:var(--canvas);line-height:1.6;-webkit-font-smoothing:antialiased}
   a{color:var(--fjord-600);text-decoration:none}
@@ -1104,8 +1113,10 @@ ${ldScripts}
   @media(max-width:560px){.nav-inner{padding:0 16px}}
   .brand{display:flex;align-items:center;gap:10px;font-weight:800;font-size:1.12rem;color:var(--fjord-800)}
   .brand:hover{text-decoration:none}
-  .brand .mark{width:32px;height:32px;border-radius:9px;background:linear-gradient(150deg,var(--fjord-700),var(--teal-500));display:flex;align-items:center;justify-content:center}
-  .brand .mark svg{color:#fff}
+  .brand-word{font-family:var(--font-brand);font-weight:600;font-size:1.3rem;letter-spacing:-.015em;text-transform:lowercase;line-height:1;color:var(--ink)}
+  .brand-word .tld{color:var(--fjord-600)}
+  .brand .mark{display:flex;align-items:center;justify-content:center}
+  .brand .mark svg{display:block}
   .nav-links a{font-size:.86rem;font-weight:600;color:var(--ink-soft);margin-left:22px}
   .breadcrumb{padding:18px 0 4px;font-size:.84rem;color:var(--mist)}
   .breadcrumb a{color:var(--ink-soft)}
@@ -1137,7 +1148,7 @@ ${ldScripts}
   @media(max-width:860px){.aside{position:static}}
   .card{background:var(--surface);border:1px solid var(--line);border-radius:var(--r-lg);padding:20px;box-shadow:var(--sh-sm)}
   .card h2{font-size:.78rem;text-transform:uppercase;letter-spacing:.06em;color:var(--mist);margin-bottom:12px}
-  .cta{display:block;text-align:center;background:linear-gradient(135deg,var(--amber-500),var(--coral-500));color:#fff;font-weight:800;padding:14px 18px;border-radius:var(--r-pill);box-shadow:0 4px 14px rgba(245,158,11,.4)}
+  .cta{display:block;text-align:center;background:linear-gradient(135deg,var(--amber-500),var(--coral-500));color:#fff;font-weight:800;padding:14px 18px;border-radius:var(--r-pill);box-shadow:0 4px 14px rgba(255,93,59,.4)}
   .cta:hover{text-decoration:none;filter:brightness(1.04)}
   .cta-soft{color:var(--ink-soft);font-size:.92rem}
   .prov-name{font-weight:700;font-size:1.04rem;margin-bottom:6px}
@@ -1165,7 +1176,7 @@ ${ldScripts}
 <body>
 <a class="skip-link" href="#main">Hopp til innhold</a>
 <nav class="site-nav"><div class="nav-inner">
-  <a class="brand" href="/"><span class="mark"><svg viewBox="0 0 24 24" width="20" height="20" aria-hidden="true"><path d="M3 18 L9 7 L13 13 L16 9 L21 18 Z" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round"/></svg></span>Opplevagent</a>
+  <a class="brand" href="/">${brandInner("light")}</a>
   <span class="nav-links"><a href="/">Forsiden</a><a href="/#kategorier">Kategorier</a></span>
 </div></nav>
 <main id="main" class="container">
@@ -1222,15 +1233,17 @@ const BROWSE_PAGE_SIZE = 24;
 // Shared minimal CSS for every browse page — same brand tokens as the landing /
 // detail pages, kept compact since these are list views.
 const BROWSE_CSS = `
+  @import url('https://fonts.googleapis.com/css2?family=Outfit:wght@500;600;700&display=swap');
   *{margin:0;padding:0;box-sizing:border-box}
   :root{
-    --fjord-900:#072a20;--fjord-800:#0b3d2e;--fjord-700:#0f5132;--fjord-600:#147a4d;
-    --teal-500:#14b8a6;--teal-400:#2dd4bf;--amber-500:#f59e0b;--coral-500:#ff7a45;
-    --ink:#10231b;--ink-soft:#3c5249;--mist:#6b8178;
-    --surface:#fff;--canvas:#f4f8f4;--canvas-2:#eaf2ec;--line:#dde9e0;
+    --fjord-900:#0b2e29;--fjord-800:#0e3c36;--fjord-700:#0f5a50;--fjord-600:#0c7264;
+    --font-brand:'Outfit',-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;--olive:#6f7a4f;--gold:#c98a2b;
+    --teal-500:#12a594;--teal-400:#3cc3b4;--amber-500:#ff5d3b;--coral-500:#ff5d3b;
+    --ink:#18130d;--ink-soft:#544a3e;--mist:#7a7163;
+    --surface:#fff;--canvas:#f7f4ee;--canvas-2:#efe9dd;--line:#e4ded0;
     --r-sm:8px;--r-md:14px;--r-lg:20px;--r-pill:999px;
-    --sh-sm:0 1px 2px rgba(7,42,32,.06),0 2px 6px rgba(7,42,32,.05);
-    --sh-md:0 6px 18px rgba(7,42,32,.10);--maxw:1120px;
+    --sh-sm:0 1px 2px rgba(24,19,13,.06),0 2px 6px rgba(24,19,13,.05);
+    --sh-md:0 6px 18px rgba(24,19,13,.10);--maxw:1120px;
   }
   body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;color:var(--ink);background:var(--canvas);line-height:1.6;-webkit-font-smoothing:antialiased}
   a{color:var(--fjord-600);text-decoration:none}
@@ -1246,8 +1259,10 @@ const BROWSE_CSS = `
   @media(max-width:560px){.nav-inner{padding:0 16px}}
   .brand{display:flex;align-items:center;gap:10px;font-weight:800;font-size:1.12rem;color:var(--fjord-800)}
   .brand:hover{text-decoration:none}
-  .brand .mark{width:32px;height:32px;border-radius:9px;background:linear-gradient(150deg,var(--fjord-700),var(--teal-500));display:flex;align-items:center;justify-content:center}
-  .brand .mark svg{color:#fff}
+  .brand-word{font-family:var(--font-brand);font-weight:600;font-size:1.3rem;letter-spacing:-.015em;text-transform:lowercase;line-height:1;color:var(--ink)}
+  .brand-word .tld{color:var(--fjord-600)}
+  .brand .mark{display:flex;align-items:center;justify-content:center}
+  .brand .mark svg{display:block}
   .nav-links a{font-size:.86rem;font-weight:600;color:var(--ink-soft);margin-left:22px}
   .breadcrumb{padding:18px 0 4px;font-size:.84rem;color:var(--mist)}
   .breadcrumb a{color:var(--ink-soft)}
@@ -1296,7 +1311,7 @@ const BROWSE_CSS = `
 // Brand nav + footer shared by every browse page.
 const BROWSE_NAV = `<a class="skip-link" href="#main">Hopp til innhold</a>
 <nav class="site-nav"><div class="nav-inner">
-  <a class="brand" href="/"><span class="mark"><svg viewBox="0 0 24 24" width="20" height="20" aria-hidden="true"><path d="M3 18 L9 7 L13 13 L16 9 L21 18 Z" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round"/></svg></span>Opplevagent</a>
+  <a class="brand" href="/">${brandInner("light")}</a>
   <span class="nav-links"><a href="/opplevelser">Alle opplevelser</a><a href="/#kategorier">Kategorier</a></span>
 </div></nav>`;
 
@@ -1433,7 +1448,7 @@ function renderBrowsePage(opts: {
 <title>${escapeHtml(opts.title)}</title>
 <meta name="description" content="${escapeHtml(opts.metaDesc)}">
 <meta name="robots" content="index, follow, max-snippet:-1, max-image-preview:large">
-<meta name="theme-color" content="#0b3d2e">
+<meta name="theme-color" content="#0e3c36">
 <link rel="canonical" href="${canonical}">
 ${linkRels}<link rel="icon" type="image/svg+xml" href="/favicon.svg">
 <meta property="og:title" content="${escapeHtml(opts.h1)}">
@@ -1763,7 +1778,7 @@ router.get("/sok", (req: Request, res: Response) => {
 <title>${escapeHtml(h1)} | Opplevagent</title>
 <meta name="description" content="${escapeHtml(metaDesc)}">
 <meta name="robots" content="noindex, follow">
-<meta name="theme-color" content="#0b3d2e">
+<meta name="theme-color" content="#0e3c36">
 <link rel="canonical" href="${canonical}">
 <link rel="icon" type="image/svg+xml" href="/favicon.svg">
 <meta property="og:title" content="${escapeHtml(h1)}">
@@ -1833,76 +1848,78 @@ router.get("/opplevelse/:slug", (req: Request, res: Response, next: NextFunction
 router.get("/favicon.svg", (_req: Request, res: Response) => {
   res.setHeader("Content-Type", "image/svg+xml");
   res.setHeader("Cache-Control", "public, max-age=86400");
-  res.send(`<svg width="1024" height="1024" viewBox="0 0 1024 1024" xmlns="http://www.w3.org/2000/svg">
-  <defs>
-    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
-      <stop offset="0%" stop-color="#7AB83A"/>
-      <stop offset="55%" stop-color="#5A9A2E"/>
-      <stop offset="100%" stop-color="#3E7A1E"/>
-    </linearGradient>
-    <radialGradient id="sheen" cx="0.3" cy="0.25" r="0.8">
-      <stop offset="0%" stop-color="#ffffff" stop-opacity="0.22"/>
-      <stop offset="60%" stop-color="#ffffff" stop-opacity="0"/>
-    </radialGradient>
-    <linearGradient id="leafShade" x1="0" y1="0" x2="0" y2="1">
-      <stop offset="0%" stop-color="#ffffff"/>
-      <stop offset="100%" stop-color="#e8f5dc"/>
-    </linearGradient>
-    <filter id="softShadow" x="-20%" y="-20%" width="140%" height="140%">
-      <feGaussianBlur in="SourceAlpha" stdDeviation="8"/>
-      <feOffset dx="0" dy="6" result="offsetblur"/>
-      <feComponentTransfer>
-        <feFuncA type="linear" slope="0.30"/>
-      </feComponentTransfer>
-      <feMerge>
-        <feMergeNode/>
-        <feMergeNode in="SourceGraphic"/>
-      </feMerge>
-    </filter>
-  </defs>
-
-  <!-- Rounded-square background (iOS-style corner radius ~22%) -->
-  <rect x="0" y="0" width="1024" height="1024" rx="228" ry="228" fill="url(#bg)"/>
-  <rect x="0" y="0" width="1024" height="1024" rx="228" ry="228" fill="url(#sheen)"/>
-
-  <!-- Sprout group, centered -->
-  <g filter="url(#softShadow)">
-    <!-- Stem: gentle curve from bottom up to leaf junction -->
-    <path d="M 512 820
-             C 512 760, 512 680, 512 580"
-          stroke="#ffffff" stroke-width="42"
-          stroke-linecap="round" fill="none"/>
-
-    <!-- Left leaf: rounded teardrop curving up-and-out, tip pointing up-left -->
-    <path d="M 512 580
-             C 420 620, 280 560, 220 380
-             C 320 360, 470 430, 512 580 Z"
-          fill="url(#leafShade)"/>
-
-    <!-- Right leaf: mirrored teardrop, tip up-and-right -->
-    <path d="M 512 580
-             C 604 620, 744 560, 804 380
-             C 704 360, 554 430, 512 580 Z"
-          fill="url(#leafShade)"/>
-
-    <!-- Left leaf vein (subtle) -->
-    <path d="M 500 570
-             C 420 540, 340 480, 280 400"
-          stroke="#c8e3a8" stroke-width="7"
-          stroke-linecap="round" fill="none" opacity="0.6"/>
-
-    <!-- Right leaf vein (subtle) -->
-    <path d="M 524 570
-             C 604 540, 684 480, 744 400"
-          stroke="#c8e3a8" stroke-width="7"
-          stroke-linecap="round" fill="none" opacity="0.6"/>
-  </g>
-</svg>`);
+  // «Konstellasjon» app tile — coral with cream mark (logo spec §6).
+  res.send(`<svg width="512" height="512" viewBox="0 0 64 64" fill="none" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Opplevagent"><title>Opplevagent</title><rect width="64" height="64" rx="17" fill="#ff5d3b"/><g transform="translate(12 13.6) scale(0.769)"><path d="M9 33 L24 11 L43 19 L31 38 Z" fill="none" stroke="#f7f4ee" stroke-width="2.4" stroke-linejoin="round" opacity="0.5"/><circle cx="9" cy="33" r="4.2" fill="#f7f4ee"/><circle cx="43" cy="19" r="4.2" fill="#f7f4ee"/><circle cx="31" cy="38" r="4.2" fill="#f7f4ee"/><path d="M24 3 C25.1 8.9 26.9 10.7 32.8 11.8 C26.9 12.9 25.1 14.7 24 20.6 C22.9 14.7 21.1 12.9 15.2 11.8 C21.1 10.7 22.9 8.9 24 3 Z" fill="#f7f4ee"/></g></svg>`);
 });
 
 // ═══════════════════════════════════════════════════════════
 // Catch-all 404 — norsk side (forhindrer rfb/dental-innhold på opplevagent-host)
 // ═══════════════════════════════════════════════════════════
+
+// ── /logo.svg — «Konstellasjon» mark (transparent, self-contained) ──
+router.get("/logo.svg", (_req: Request, res: Response) => {
+  res.setHeader("Content-Type", "image/svg+xml");
+  res.setHeader("Cache-Control", "public, max-age=86400");
+  res.send(`<svg xmlns="http://www.w3.org/2000/svg" width="52" height="48" viewBox="0 0 52 48" fill="none" role="img" aria-label="Opplevagent"><title>Opplevagent</title><path d="M9 33 L24 11 L43 19 L31 38 Z" fill="none" stroke="#12a594" stroke-width="2" stroke-linejoin="round" opacity="0.45"/><circle cx="9" cy="33" r="4" fill="#12a594"/><circle cx="43" cy="19" r="4" fill="#6f7a4f"/><circle cx="31" cy="38" r="4" fill="#c98a2b"/><path d="M24 3 C25.1 8.9 26.9 10.7 32.8 11.8 C26.9 12.9 25.1 14.7 24 20.6 C22.9 14.7 21.1 12.9 15.2 11.8 C21.1 10.7 22.9 8.9 24 3 Z" fill="#ff5d3b"/></svg>`);
+});
+
+// ── Legal pages (privacy / terms) — Claude Connectors prerequisite. Bilingual NO/EN. ──
+const LEGAL_CSS = `@import url('https://fonts.googleapis.com/css2?family=Outfit:wght@600&display=swap');*{margin:0;padding:0;box-sizing:border-box}body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;max-width:760px;margin:0 auto;padding:48px 22px;color:#18130d;background:#f7f4ee;line-height:1.6}h1,h2{font-family:'Outfit',sans-serif;letter-spacing:-.01em}h1{font-size:1.9rem;border-bottom:2px solid #12a594;padding-bottom:.3rem;margin-bottom:.4rem}h2{font-size:1.18rem;color:#0c7264;margin:1.7rem 0 .35rem}a{color:#0c7264}.lang{text-align:right;font-size:.9rem;margin-bottom:.8rem}hr{margin:2.4rem 0;border:none;border-top:1px solid #e4ded0}footer{margin-top:2.4rem;padding-top:1rem;border-top:1px solid #e4ded0;font-size:.85rem;color:#7a7163}ul{margin:.4rem 0 .4rem 1.2rem}p{margin:.4rem 0}`;
+function legalPage(title: string, bodyHtml: string): string {
+  return `<!DOCTYPE html><html lang="no"><head><meta charset="utf-8"><title>${title} — Opplevagent</title><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="robots" content="index, follow"><link rel="icon" type="image/svg+xml" href="/favicon.svg"><style>${LEGAL_CSS}</style></head><body>${bodyHtml}<footer>Opplevagent &middot; <a href="/">opplevagent.no</a> &middot; <a href="/personvern">Personvern</a> &middot; <a href="/vilkar">Vilkår</a> &middot; <a href="/.well-known/agent-card.json">Agent Card</a></footer></body></html>`;
+}
+
+router.get(["/privacy", "/privacy-policy", "/personvern"], (_req: Request, res: Response) => {
+  res.setHeader("Content-Type", "text/html; charset=utf-8");
+  res.setHeader("Cache-Control", "public, max-age=3600");
+  res.send(legalPage("Personvern / Privacy", `<div class="lang"><a href="#en">English</a></div>
+<h1>Personvern</h1><p><strong>Sist oppdatert:</strong> 22. juni 2026</p>
+<p>Opplevagent (opplevagent.no) er en agent-til-agent-markedsplass som hjelper AI-agenter og mennesker med å finne norske opplevelser og aktiviteter — turer, kurs, severdigheter og ting å gjøre. Vi respekterer personvernet til tilbydere, brukere og AI-agenter som samhandler med plattformen.</p>
+<h2>Hva vi samler inn</h2><ul>
+<li><strong>Opplevelsesdata:</strong> tittel, beskrivelse, tilbyder, kategori, fylke/kommune, varighet, pris, sesong og bookinglenke — offentlig tilgjengelig informasjon hentet fra tilbydernes egne nettsider og åpne kilder (Brønnøysundregistrene, Visit Norway / CBIS m.fl.).</li>
+<li><strong>Agent-forespørsler:</strong> hvilke agenter (ChatGPT, Claude, Perplexity m.fl.) som søker, hvilke filtre/søkeord som brukes, og hvilke opplevelser som vises — i aggregert form, uten IP-adresser eller personlige identifikatorer.</li>
+<li><strong>Tilbyder-henvendelser:</strong> e-postadresse lagres så lenge det er nødvendig for å bekrefte eierskap ved overtakelse/korrigering av en oppføring.</li></ul>
+<h2>Hva vi IKKE samler inn</h2><ul><li>Ingen sporingscookies.</li><li>Ingen tredjeparts analyseverktøy.</li><li>Ingen betalinger eller kortdata — booking skjer hos tilbyderen.</li><li>Vi selger ikke data til tredjepart.</li></ul>
+<h2>Lagringstid</h2><p>Aggregerte analytikkdata lagres i opptil 180 dager. Opplevelsesdata fra offentlige kilder lagres så lenge opplevelsen er aktiv.</p>
+<h2>Rettighetene dine</h2><p>Er du tilbyder og vil fjernes eller korrigere informasjon? Send e-post til <a href="mailto:kontakt@opplevagent.no">kontakt@opplevagent.no</a>.</p>
+<h2>Kontakt</h2><p>E-post: <a href="mailto:kontakt@opplevagent.no">kontakt@opplevagent.no</a><br>Operatør: Daniel Fredriksen, Norge.</p>
+<hr>
+<h1 id="en">Privacy Policy</h1><p><strong>Last updated:</strong> 22 June 2026</p>
+<p>Opplevagent (opplevagent.no) is an agent-to-agent marketplace that helps AI agents and humans find Norwegian experiences and activities — tours, courses, attractions, and things to do. We respect the privacy of providers, end-users, and AI agents that interact with the platform.</p>
+<h2>What we collect</h2><ul>
+<li><strong>Experience data:</strong> title, description, provider, category, county/municipality, duration, price, season, and booking link — public information gathered from providers' own websites and open sources (the Norwegian business registry, Visit Norway / CBIS, etc.).</li>
+<li><strong>Agent requests:</strong> which agents search, which filters/terms are used, and which experiences are shown — aggregated, without IP addresses or personal identifiers.</li>
+<li><strong>Provider claims:</strong> email stored only as long as needed to confirm ownership.</li></ul>
+<h2>What we do NOT collect</h2><ul><li>No tracking cookies.</li><li>No third-party analytics.</li><li>No payments or card data — booking happens on the provider's site.</li><li>We do not sell data to third parties.</li></ul>
+<h2>Retention</h2><p>Aggregated analytics for up to 180 days; experience data from public records while the experience is active.</p>
+<h2>Your rights</h2><p>Providers may request removal or correction at <a href="mailto:kontakt@opplevagent.no">kontakt@opplevagent.no</a>.</p>
+<h2>Contact</h2><p>Email: <a href="mailto:kontakt@opplevagent.no">kontakt@opplevagent.no</a><br>Operator: Daniel Fredriksen, Norway.</p>`));
+});
+
+router.get(["/terms", "/terms-of-service", "/tos", "/vilkar"], (_req: Request, res: Response) => {
+  res.setHeader("Content-Type", "text/html; charset=utf-8");
+  res.setHeader("Cache-Control", "public, max-age=3600");
+  res.send(legalPage("Vilkår / Terms of Service", `<div class="lang"><a href="#en">English</a></div>
+<h1>Vilkår for bruk</h1><p><strong>Sist oppdatert:</strong> 22. juni 2026</p>
+<p>Velkommen til Opplevagent (opplevagent.no). Disse vilkårene gjelder for alle som bruker plattformen — sluttbrukere, tilbydere og AI-agenter som kaller våre MCP- eller A2A-endepunkter. Ved å bruke tjenesten aksepterer du vilkårene.</p>
+<h2>1. Hva tjenesten er</h2><p>Opplevagent er et oppdagelseslag for norske opplevelser. Vi eksponerer en katalog gjennom MCP, A2A JSON-RPC og en REST-API slik at agenter og mennesker kan finne turer, kurs, severdigheter og aktiviteter. Vi er <em>ikke</em> en bookingtjeneste og gjennomfører ikke transaksjoner — booking skjer hos tilbyderen.</p>
+<h2>2. Akseptabel bruk</h2><ul><li>Bruk API-ene, MCP-serveren og nettsiden til å finne og utforske opplevelser.</li><li>Integrer tjenesten i egne agenter innenfor rimelige rater.</li><li>Overhold robots.txt og rate-limitene.</li></ul>
+<h2>3. Forbudt bruk</h2><ul><li>Skrape hele datasettet for å republisere det som et konkurrerende register uten skriftlig tillatelse.</li><li>Masseutsendelse/spam til tilbydere basert på kontaktinfo herfra.</li><li>Omgå sikkerhet, rate-limiter eller autentisering.</li></ul>
+<h2>4. Nøyaktighet</h2><p>Data er samlet fra offentlige kilder. <strong>Tjenesten leveres «som den er».</strong> Verifiser pris, sesong og bookinglenker direkte med tilbyderen før du booker.</p>
+<h2>5. Ansvarsbegrensning</h2><p>Opplevagent er ikke ansvarlig for bookinger, gjennomføring, kvalitet eller uenigheter mellom brukere og tilbydere.</p>
+<h2>6. Tilbyderrettigheter</h2><p>Oppdater, fjern eller overta din oppføring via <a href="mailto:kontakt@opplevagent.no">kontakt@opplevagent.no</a>. Se også <a href="/personvern">personvern</a>.</p>
+<h2>7. Gjeldende rett</h2><p>Norsk rett. Tvister løses ved Daniels alminnelige verneting.</p>
+<hr>
+<h1 id="en">Terms of Service</h1><p><strong>Last updated:</strong> 22 June 2026</p>
+<p>Welcome to Opplevagent (opplevagent.no). These terms apply to everyone who uses the platform — end-users, providers, and AI agents calling our MCP or A2A endpoints. By using the service you accept these terms.</p>
+<h2>1. What the service is</h2><p>Opplevagent is a discovery layer for Norwegian experiences. We expose a directory via MCP, A2A JSON-RPC, and a REST API so agents and humans can find tours, courses, attractions, and activities. We are <em>not</em> a booking service and do not process transactions — booking happens on the provider's site.</p>
+<h2>2. Acceptable use</h2><ul><li>Use the APIs, MCP server, and website to find and explore experiences.</li><li>Integrate the service into your own agents within reasonable rate limits.</li><li>Respect robots.txt and published rate limits.</li></ul>
+<h2>3. Prohibited use</h2><ul><li>Scraping the full dataset to republish as a competing directory without written permission.</li><li>Bulk unsolicited messages or spam to providers.</li><li>Circumventing security, rate limits, or authentication.</li></ul>
+<h2>4. Accuracy</h2><p>Data is gathered from public sources. <strong>The service is provided "as is".</strong> Verify price, season, and booking links directly with the provider before booking.</p>
+<h2>5. Limitation of liability</h2><p>Opplevagent is not liable for bookings, conduct of experiences, quality, or disputes between users and providers.</p>
+<h2>6. Provider rights</h2><p>Update, remove, or claim your listing via <a href="mailto:kontakt@opplevagent.no">kontakt@opplevagent.no</a>. See also the <a href="/privacy">privacy policy</a>.</p>
+<h2>7. Governing law</h2><p>Norwegian law. Disputes resolved at Daniel's ordinary venue.</p>`));
+});
 
 router.use((_req: Request, res: Response) => {
   res.status(404);
