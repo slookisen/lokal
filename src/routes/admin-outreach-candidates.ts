@@ -30,6 +30,7 @@
 import { Router, Request, Response } from "express";
 import { getDb } from "../database/init";
 import { isBlocked } from "../services/blocklist-service";
+import { meetsAboutQualityBar } from "../services/search-enrich";
 import { dedupeByEmail } from "../services/marketing-dedupe";
 
 const router = Router();
@@ -193,7 +194,8 @@ router.get("/", (req: Request, res: Response) => {
       -- carries PR-16's inference_only_fields. Both default to '{}' so they are
       -- always present; the JS helpers treat any non-matching shape as "absent".
       k.field_provenance AS field_provenance,
-      k.verification_review_reason AS verification_review_reason
+      k.verification_review_reason AS verification_review_reason,
+      k.about AS about
     `;
 
     type PoolRow = {
@@ -208,6 +210,7 @@ router.get("/", (req: Request, res: Response) => {
       is_hard_bounced: number;
       field_provenance: string | null;
       verification_review_reason: string | null;
+      about: string | null;
     };
 
     let rows: PoolRow[];
@@ -295,6 +298,8 @@ router.get("/", (req: Request, res: Response) => {
     // orch-pr-17 data-quality counters
     let websiteUnverifiedCount = 0;
     let inferenceOnlyCount = 0;
+    // orch-content-quality-gate: junk nav-boilerplate descriptions
+    let lowQualityDescriptionCount = 0;
 
     for (const row of rows) {
       let isContactedOrCooldown = false;
@@ -338,6 +343,17 @@ router.get("/", (req: Request, res: Response) => {
       // Read-only on PR-16's verification_review_reason.inference_only_fields;
       // absent/malformed → false. Free-mail is NEVER a reason here.
       const suppressedForInferenceOnly = hasInferenceOnlyFactualField(row.verification_review_reason);
+      // ── orch-content-quality-gate: nav-boilerplate description ───────────────
+      // A stored about/description that contains website navigation chrome (e.g.
+      // "Skip to content Menu Velkommen!") is worse than no description at all —
+      // it means the scraper captured the nav skeleton rather than real prose.
+      // meetsAboutQualityBar returns false for null/empty (no suppression when
+      // description is simply absent) and also rejects cookie/nav boilerplate.
+      // Only suppress when an about IS present AND fails the bar.
+      const suppressedForLowQualityDescription =
+        row.about != null && row.about.trim().length > 0
+          ? !meetsAboutQualityBar(row.about)
+          : false;
 
       if (suppressedForContacted) contactedOrCooldownCount++;
       if (suppressedForReplied) repliedCount++;
@@ -347,6 +363,7 @@ router.get("/", (req: Request, res: Response) => {
       if (suppressedForBlocklist) blocklistedCount++;
       if (suppressedForWebsiteUnverified) websiteUnverifiedCount++;
       if (suppressedForInferenceOnly) inferenceOnlyCount++;
+      if (suppressedForLowQualityDescription) lowQualityDescriptionCount++;
 
       if (
         !suppressedForContacted &&
@@ -356,7 +373,8 @@ router.get("/", (req: Request, res: Response) => {
         !suppressedForBounce &&
         !suppressedForBlocklist &&
         !suppressedForWebsiteUnverified &&
-        !suppressedForInferenceOnly
+        !suppressedForInferenceOnly &&
+        !suppressedForLowQualityDescription
       ) {
         candidates.push({
           agent_id: row.agent_id,
@@ -398,6 +416,8 @@ router.get("/", (req: Request, res: Response) => {
         // orch-pr-17: new data-quality suppression reasons
         website_unverified: websiteUnverifiedCount,
         inference_only: inferenceOnlyCount,
+        // orch-content-quality-gate
+        low_quality_description: lowQualityDescriptionCount,
       },
     });
   } catch (err: any) {

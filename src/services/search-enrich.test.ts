@@ -433,6 +433,25 @@ export function runSearchEnrichTests(opts: { log?: boolean } = {}): TestSummary 
     assertTrue(meetsAboutQualityBar(noLetters), "quality: Norwegian via function words (no æøå) passes");
     // minLen override is honoured.
     assertTrue(meetsAboutQualityBar("Kort tekst på gården.", 10), "quality: minLen override honoured");
+
+    // ── orch-content-quality-gate: NAV_BOILERPLATE_MARKERS ──────────────────
+    // Real Molvik Gård stored description — website nav skeleton scraped instead
+    // of real prose. Contains "Skip to content" so must be REJECTED.
+    const molvikNav = "Molvik Gard – Lokalmat og gardsopplevingar Skip to content Menu Velkommen! Vi er ein liten gard i Nordhordland.";
+    assertTrue(!meetsAboutQualityBar(molvikNav), "quality: Molvik-style nav junk (Skip to content) rejected");
+
+    // Norwegian skip-link + open-menu button (Åpne meny → apne meny after accent-strip).
+    const norNavBoilerplate = "Hopp til innhold Om oss Apne meny Produkt Kontakt";
+    assertTrue(!meetsAboutQualityBar(norNavBoilerplate, 30), "quality: Norwegian nav chrome (Hopp til innhold + Apne meny) rejected");
+
+    // Login + handlekurv links typical of WooCommerce/Shopify headers.
+    const loginCartNav = "Logg inn til din konto Handlekurv 0 Produkter Kontakt oss Ring gjerne på telefon for sporsmal om levering til din adresse.";
+    assertTrue(!meetsAboutQualityBar(loginCartNav), "quality: login/cart nav links (logg inn + handlekurv) rejected");
+
+    // FALSE-POSITIVE guard: a café legitimately mentions "menyen" (the menu/card).
+    // "se menyen vår" does NOT contain any NAV_BOILERPLATE_MARKERS token, so it PASSES.
+    const cafeAboutWithMenu = "Vi er eit lite familiedrive kafé på Voss. Sjekk gjerne ut menyen var for dagens rettar og spesialitetar laga av lokale raavar fra naerliggande gardar.";
+    assertTrue(meetsAboutQualityBar(cafeAboutWithMenu), "quality: café mentioning menyen (false-positive guard) still passes");
   }
 
   // ── orch-experiences-content-refresh: mapToExperienceCategories (PURE) ──────

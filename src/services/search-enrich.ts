@@ -873,6 +873,42 @@ const GENERIC_ABOUT_MARKERS: readonly string[] = [
   "all rights reserved", "alle rettigheter",
 ];
 
+// Website navigation chrome that is NOT a real "about" — "Skip to content",
+// login/cart links, hamburger-menu labels, etc. scraped from the nav skeleton
+// rather than the page body. Matched the same way as GENERIC_ABOUT_MARKERS:
+// accent-stripped lowercase substrings.
+//
+// Markers are multi-token to minimise false-positives:
+//   "skip to content"     — English accessibility skip-link (nearly universal)
+//   "skip to the content" — variant
+//   "skip to main content"— variant
+//   "hopp til innhold"    — Norwegian accessibility skip-link
+//   "toggle navigation"   — hamburger-menu aria label
+//   "apne meny"           — Norwegian "Åpne meny" open-menu button (å→a by stripNorwegianAccents)
+//   "lukk meny"           — Norwegian "Lukk meny" close-menu button
+//   "logg inn"            — login link (multi-token; "logg" alone is too common)
+//   "handlekurv"          — Norwegian "shopping cart" link text (single token but unambiguous)
+//   "shopping_cart"       — Material / icon-font ligature text that leaks into scraped text
+//   "search for:"         — WordPress search-form label
+//
+// NOT included (false-positive risk):
+//   "meny"/"menu"         — a café legitimately says "se menyen vår"
+//   "sok"/"search"        — too common in body copy
+//   "logg"                — too common ("Vi logg…" narratives)
+const NAV_BOILERPLATE_MARKERS: readonly string[] = [
+  "skip to content",
+  "skip to the content",
+  "skip to main content",
+  "hopp til innhold",
+  "toggle navigation",
+  "apne meny",
+  "lukk meny",
+  "logg inn",
+  "handlekurv",
+  "shopping_cart",
+  "search for:",
+];
+
 // Letters that signal the text is Norwegian (or at least Scandinavian) prose
 // rather than an English/other-language snippet: the æ/ø/å family plus a small
 // set of very common Norwegian function words. The homepage content we want to
@@ -906,6 +942,10 @@ export function meetsAboutQualityBar(text: string | null | undefined, minLen = 8
 
   // Reject boilerplate (cookie/consent/placeholder dominates the snippet).
   for (const marker of GENERIC_ABOUT_MARKERS) {
+    if (lowerAscii.includes(marker)) return false;
+  }
+  // Reject website navigation chrome (skip-links, menu buttons, cart/login labels).
+  for (const marker of NAV_BOILERPLATE_MARKERS) {
     if (lowerAscii.includes(marker)) return false;
   }
 
