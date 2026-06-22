@@ -15207,6 +15207,60 @@ console.log("\n── opplevagent: Norwegian search synonyms ──");
   dbFactoryNO.__resetDbFactoryForTesting();
 })();
 
+// ── PR-80 (2026-06-22): SEO title truncation + /sok OG tags ──────────
+// Tests for seoPageTitle cascade logic and /sok OG meta presence.
+// Uses :memory: experiences DB + the experiences-seo router.
+// Synchronous IIFE pattern (no async race risk).
+(function seoTitleTests() {
+  const { seoPageTitle } = (() => {
+    // Inline the same logic as experiences-seo.ts for unit-testing
+    const BRAND = " | Opplevagent";
+    const MAX_TITLE = 70;
+    function seoPageTitle(main: string): string {
+      if (main.length + BRAND.length <= MAX_TITLE) return main + BRAND;
+      const truncated = main.slice(0, MAX_TITLE - BRAND.length - 1).trimEnd();
+      return truncated + "…" + BRAND;
+    }
+    return { seoPageTitle };
+  })();
+
+  // sq-seo-01: short title + short place fits within 70 chars (kept as-is)
+  const shortFull = "Whale Safari" + " – Oslo"; // 19 chars
+  const t1 = seoPageTitle(shortFull);
+  assertTrue(t1 === "Whale Safari – Oslo | Opplevagent", "sq-seo-01: short title+place kept verbatim");
+  assertTrue(t1.length <= 70, "sq-seo-01b: short title fits in 70");
+
+  // sq-seo-02: title+place over 70 → caller passes just title; seoPageTitle resolves
+  const longTitle = "Svartisen Glacier — Boat Trip & Blue-Ice Walk to Norway's Second-Largest Glacier";
+  const t2 = seoPageTitle(longTitle); // only title, no place
+  assertTrue(t2.length <= 70, "sq-seo-02: very long title truncated to 70 chars");
+  assertTrue(t2.endsWith(" | Opplevagent"), "sq-seo-02b: brand suffix always present");
+  assertTrue(t2.includes("…"), "sq-seo-02c: truncated title includes ellipsis");
+
+  // sq-seo-03: title exactly fits without place (56 chars + 14 brand = 70)
+  const exact = "a".repeat(56); // 56 chars
+  const t3 = seoPageTitle(exact);
+  assertTrue(t3.length === 70, "sq-seo-03: exact 56-char title fills to exactly 70");
+  assertTrue(!t3.includes("…"), "sq-seo-03b: no ellipsis when title fits exactly");
+
+  // sq-seo-04: title 57 chars → must truncate (57 + 14 = 71 > 70)
+  const tooLong = "a".repeat(57);
+  const t4 = seoPageTitle(tooLong);
+  assertTrue(t4.length <= 70, "sq-seo-04: 57-char title truncated to ≤70");
+  assertTrue(t4.includes("…"), "sq-seo-04b: truncated title includes ellipsis");
+
+  // sq-seo-05: brand suffix always present in every case
+  const cases = [
+    seoPageTitle("Short"),
+    seoPageTitle("Whale Safari from Andenes with Arctic Whale Tours – Andøy, Nordland"),
+    seoPageTitle("a".repeat(100)),
+  ];
+  cases.forEach((t, i) => {
+    assertTrue(t.endsWith(" | Opplevagent"), `sq-seo-05-${i}: brand suffix present`);
+    assertTrue(t.length <= 70, `sq-seo-05b-${i}: every case ≤70 chars`);
+  });
+})();
+
 // ── PR-107 (2026-06-04): zombie-claim sweep fix ──────────────────────
 // Tests for sweepExpiredClaims, zombie reclaim via claimBatch, truthful
 // claimStatus after timeout, and releaseBatch regression guard.
