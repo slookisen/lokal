@@ -15084,6 +15084,129 @@ console.log("\n── opplevagent P2: human-browse subpages (experiences) ──
   dbFactoryP2.__resetDbFactoryForTesting();
 })();
 
+// ── Norwegian search synonym expansion (feat/experiences-search-norwegian) ─────
+// Verifies that searchPublishedExperiences() expands Norwegian query terms into
+// English equivalents so Norwegian users find English-titled experiences.
+// Isolated :memory: experiences.db + sync IIFE (no async CI race).
+console.log("\n── opplevagent: Norwegian search synonyms ──");
+(() => {
+  const prevPathNO = process.env.EXPERIENCES_DB_PATH;
+  process.env.EXPERIENCES_DB_PATH = ":memory:";
+
+  const dbFactoryPathNO = require.resolve("../src/database/db-factory");
+  const expStorePathNO   = require.resolve("../src/services/experience-store");
+  delete require.cache[dbFactoryPathNO];
+  delete require.cache[expStorePathNO];
+
+  const dbFactoryNO = require("../src/database/db-factory") as typeof import("../src/database/db-factory");
+  dbFactoryNO.__resetDbFactoryForTesting();
+  const expStoreNO = require("../src/services/experience-store") as typeof import("../src/services/experience-store");
+
+  // Seed: Brreg-verified provider + English-titled experiences (mirrors prod data).
+  dbFactoryNO.getDb("experiences");
+  const provNO = expStoreNO.createProvider({
+    navn: "Northern Experiences AS", org_nr: "910000001",
+    fylke: "Troms og Finnmark", kommune: "Tromsø",
+    brreg_verified: 1, brreg_active: 1, verification_status: "verified",
+  });
+  const provNO2 = expStoreNO.createProvider({
+    navn: "Alpine Norway AS", org_nr: "910000002",
+    fylke: "Innlandet", kommune: "Øyer",
+    brreg_verified: 1, brreg_active: 1, verification_status: "verified",
+  });
+  // English-titled experiences (like production DB)
+  expStoreNO.createExperience({
+    title: "Whale Safari from Tromsø with Arctic Whale Tours",
+    provider_id: provNO, provider_match_status: "matched",
+    category: "dyreliv_safari", fylke: "Troms og Finnmark", kommune: "Tromsø",
+    indoor_outdoor: "outdoor", season: ["winter"],
+    confidence: "high", verification_status: "verified",
+  });
+  expStoreNO.createExperience({
+    title: "Northern Lights Aurora Chase by Snowmobile",
+    provider_id: provNO, provider_match_status: "matched",
+    category: "dyreliv_safari", fylke: "Troms og Finnmark", kommune: "Tromsø",
+    indoor_outdoor: "outdoor", season: ["winter"],
+    confidence: "high", verification_status: "verified",
+  });
+  expStoreNO.createExperience({
+    title: "Blue Ice Glacier Hike at Nigardsbreen",
+    provider_id: provNO2, provider_match_status: "matched",
+    category: "natur_friluft", fylke: "Vestland", kommune: "Luster",
+    indoor_outdoor: "outdoor", season: ["summer"],
+    confidence: "high", verification_status: "verified",
+  });
+  expStoreNO.createExperience({
+    title: "Dog Sledding in Tromsø — Morning Tour",
+    provider_id: provNO, provider_match_status: "matched",
+    category: "vinter_sno", fylke: "Troms og Finnmark", kommune: "Tromsø",
+    indoor_outdoor: "outdoor", season: ["winter"],
+    confidence: "high", verification_status: "verified",
+  });
+  expStoreNO.createExperience({
+    title: "Guided Hiking to Preikestolen Pulpit Rock",
+    provider_id: provNO2, provider_match_status: "matched",
+    category: "natur_friluft", fylke: "Rogaland", kommune: "Stavanger",
+    indoor_outdoor: "outdoor", season: ["summer"],
+    confidence: "high", verification_status: "verified",
+  });
+  // Draft — must never appear in search results
+  expStoreNO.createExperience({
+    title: "Whale Watching Draft", provider_id: provNO,
+    category: "dyreliv_safari", fylke: "Troms og Finnmark", kommune: "Tromsø",
+    confidence: "high", verification_status: "pending_verify",
+  });
+
+  const { searchPublishedExperiences: searchNO } = expStoreNO;
+
+  // sq-no-01: Norwegian "hval" finds English "Whale Safari" (key gap in prod)
+  const hvalRes = searchNO("hval", 20);
+  assertTrue(hvalRes.length >= 1, "sq-no-01: 'hval' (Norwegian) finds English-titled whale experience");
+  assertTrue(hvalRes.some((r: any) => /whale/i.test(r.title)), "sq-no-01b: hval result has 'whale' in title");
+
+  // sq-no-02: Norwegian "nordlys" finds English "Northern Lights / Aurora"
+  const nordlysRes = searchNO("nordlys", 20);
+  assertTrue(nordlysRes.length >= 1, "sq-no-02: 'nordlys' finds English aurora/northern-lights experience");
+  assertTrue(nordlysRes.some((r: any) => /aurora|northern lights/i.test(r.title)), "sq-no-02b: nordlys result has aurora/northern-lights in title");
+
+  // sq-no-03: Norwegian "isbre" finds English "Glacier" experience
+  const isbreRes = searchNO("isbre", 20);
+  assertTrue(isbreRes.length >= 1, "sq-no-03: 'isbre' finds English glacier experience");
+  assertTrue(isbreRes.some((r: any) => /glacier/i.test(r.title)), "sq-no-03b: isbre result has 'glacier' in title");
+
+  // sq-no-04: Norwegian "hundespann" finds English "Dog Sledding"
+  const hundespannRes = searchNO("hundespann", 20);
+  assertTrue(hundespannRes.length >= 1, "sq-no-04: 'hundespann' finds English dog-sledding experience");
+
+  // sq-no-05: English terms still work (no regression)
+  const whaleRes = searchNO("whale", 20);
+  assertTrue(whaleRes.length >= 1, "sq-no-05: English 'whale' still finds whale experience");
+  const glacierRes = searchNO("glacier", 20);
+  assertTrue(glacierRes.length >= 1, "sq-no-05b: English 'glacier' still finds glacier experience");
+
+  // sq-no-06: Terms without synonyms still work normally (place name search)
+  const tromsøRes = searchNO("tromsø", 20);
+  assertTrue(tromsøRes.length >= 1, "sq-no-06: non-synonym term 'tromsø' still finds experiences");
+
+  // sq-no-07: Draft is excluded even when matched by synonym expansion
+  const whaleAllRes = searchNO("hval", 100);
+  assertTrue(whaleAllRes.every((r: any) => !/draft/i.test(r.title)), "sq-no-07: publish gate excludes draft even via synonym expansion");
+
+  // sq-no-08: Multi-word Norwegian query — "hval tromsø" narrows to whale + Tromsø
+  const multiRes = searchNO("hval tromsø", 20);
+  assertTrue(multiRes.length >= 1, "sq-no-08: multi-word 'hval tromsø' finds whale experience in Tromsø");
+  assertTrue(multiRes.every((r: any) => /tromsø/i.test(r.fylke ?? "") || /tromsø/i.test(r.kommune ?? "")),
+    "sq-no-08b: multi-word result is in Tromsø");
+
+  // sq-no-09: "vandring" finds hiking experience
+  const vandringRes = searchNO("vandring", 20);
+  assertTrue(vandringRes.length >= 1, "sq-no-09: 'vandring' finds English hiking experience");
+
+  if (prevPathNO === undefined) delete process.env.EXPERIENCES_DB_PATH;
+  else process.env.EXPERIENCES_DB_PATH = prevPathNO;
+  dbFactoryNO.__resetDbFactoryForTesting();
+})();
+
 // ── PR-107 (2026-06-04): zombie-claim sweep fix ──────────────────────
 // Tests for sweepExpiredClaims, zombie reclaim via claimBatch, truthful
 // claimStatus after timeout, and releaseBatch regression guard.

@@ -551,10 +551,47 @@ export function getPublishedProviderById(id: string): Record<string, unknown> | 
   return row ?? null;
 }
 
+/**
+ * Norwegian→English synonym map for the /sok search route.
+ * Allows Norwegian-speaking users to find experiences with English-language
+ * titles. Keys: lowercase Norwegian terms. Values: English equivalents to OR
+ * into the LIKE clauses. Kept small and curated — only terms with confirmed
+ * gaps in the production DB (all experience titles are in English).
+ */
+const SEARCH_SYNONYMS: Record<string, string[]> = {
+  hval:        ["whale"],
+  hvalsafari:  ["whale"],
+  nordlys:     ["aurora", "northern lights"],
+  brevandring: ["glacier"],
+  isbre:       ["glacier"],
+  hundespann:  ["dog"],
+  reinsdyr:    ["reindeer"],
+  sjøørn:      ["eagle"],
+  klatring:    ["climb"],
+  klatre:      ["climb"],
+  kajak:       ["kayak"],
+  kajakk:      ["kayak"],
+  badstue:     ["sauna"],
+  vandring:    ["hike", "hiking"],
+  fjelltur:    ["mountain", "hike"],
+  midnattssol: ["midnight"],
+  rorbu:       ["cabin", "fisherman"],
+  fiske:       ["fishing"],
+  dykking:     ["dive", "diving"],
+};
+
+/** Expand one query token with Norwegian→English synonyms (returns ≥1 term). */
+function expandSearchTerm(term: string): string[] {
+  const lower = term.toLowerCase();
+  const synonyms = SEARCH_SYNONYMS[lower] ?? [];
+  return synonyms.length > 0 ? [lower, ...synonyms] : [lower];
+}
+
 /** Free-text search over PUBLISHED experiences (title/description/category/place).
  *  Reuses the publish gate so search only ever returns rows that have a live
  *  detail page. Tokenised AND match — every whitespace-separated term must hit
- *  at least one searchable column. */
+ *  at least one searchable column. Norwegian query terms are expanded via
+ *  SEARCH_SYNONYMS so e.g. "hval" also matches English-titled whale experiences. */
 export function searchPublishedExperiences(query: string, limit = 30): ExperienceCardRow[] {
   const q = String(query || "").trim();
   if (!q) return [];
@@ -563,13 +600,20 @@ export function searchPublishedExperiences(query: string, limit = 30): Experienc
   const db = getDb(VERTICAL);
   const params: Record<string, unknown> = { limit: Math.max(1, Math.min(100, limit)) };
   const termClauses = terms.map((t, i) => {
-    const key = `t${i}`;
-    params[key] = `%${t.toLowerCase()}%`;
-    return (
-      `(lower(e.title) LIKE @${key} OR lower(COALESCE(e.description,'')) LIKE @${key} ` +
-      `OR lower(COALESCE(e.category,'')) LIKE @${key} OR lower(COALESCE(e.fylke,'')) LIKE @${key} ` +
-      `OR lower(COALESCE(e.kommune,'')) LIKE @${key})`
-    );
+    // Expand Norwegian term into [original, ...english_synonyms]
+    const expanded = expandSearchTerm(t);
+    const fieldClauses = expanded.flatMap((et, ei) => {
+      const key = `t${i}_${ei}`;
+      params[key] = `%${et.toLowerCase()}%`;
+      return [
+        `lower(e.title) LIKE @${key}`,
+        `lower(COALESCE(e.description,'')) LIKE @${key}`,
+        `lower(COALESCE(e.category,'')) LIKE @${key}`,
+        `lower(COALESCE(e.fylke,'')) LIKE @${key}`,
+        `lower(COALESCE(e.kommune,'')) LIKE @${key}`,
+      ];
+    });
+    return `(${fieldClauses.join(" OR ")})`;
   });
   return db
     .prepare(
