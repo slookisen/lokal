@@ -712,7 +712,7 @@ export class AnalyticsService {
    * Export raw analytics data for external analysis
    * Returns paginated results
    */
-  exportData(table: "page_views" | "queries" | "agent_views", limit: number = 1000, offset: number = 0): {
+  exportData(table: "page_views" | "queries" | "agent_views", limit: number = 1000, offset: number = 0, vertical?: VerticalId): {
     data: any[];
     total: number;
     limit: number;
@@ -728,14 +728,20 @@ export class AnalyticsService {
       const tableName = tableMap[table];
       if (!tableName) throw new Error("Invalid analytics table");
 
-      const countResult = db.prepare(`SELECT COUNT(*) as count FROM ${tableName}`).get() as any;
+      // Optional vertical scope — used by isolation-locked secondary hosts so a
+      // per-site export can never include another vertical's rows.
+      const where = vertical ? "WHERE vertical_id = ?" : "";
+      const vp: string[] = vertical ? [vertical] : [];
+
+      const countResult = db.prepare(`SELECT COUNT(*) as count FROM ${tableName} ${where}`).get(...vp) as any;
       const total = countResult.count;
 
       const data = db.prepare(`
         SELECT * FROM ${tableName}
+        ${where}
         ORDER BY created_at DESC
         LIMIT ? OFFSET ?
-      `).all(limit, offset) as any[];
+      `).all(...vp, limit, offset) as any[];
 
       return { data, total, limit, offset };
     } catch (err) {
