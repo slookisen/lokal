@@ -152,6 +152,7 @@ const BulkRowSchema = z.object({
   price_from: z.number().int().optional().nullable(),
   duration_min: z.number().int().optional().nullable(),
   booking_url: z.string().optional().nullable(),
+  hjemmeside: z.string().optional().nullable(),
   evidence_url: z.string().optional().nullable(),
   confidence: z.enum(["high", "medium", "low"]).optional().nullable(),
 });
@@ -253,6 +254,7 @@ router.post("/admin/bulk-load", requireAdmin, async (req: Request, res: Response
           org_nr: verdict.org_nr,
           kommune,
           fylke: rows.find((r) => r.fylke)?.fylke ?? null,
+          hjemmeside: rows.find((r) => r.hjemmeside && String(r.hjemmeside).trim())?.hjemmeside?.trim() ?? null,
           naeringskode: verdict.naeringskode ?? null,
           brreg_verified: verdict.brreg_verified,
           brreg_active: verdict.brreg_active,
