@@ -22,10 +22,10 @@ function requireAdminAuth(req: Request, res: Response, next: Function): void {
 const router = Router();
 router.use(requireAdminAuth);
 
-// ?vertical=rfb|dental — anything else (or omitted) = all verticals.
+// ?vertical=rfb|dental|experiences — anything else (or omitted) = all verticals.
 function parseVertical(req: Request): CrmVertical | undefined {
   const v = String(req.query.vertical || "").toLowerCase();
-  return v === "rfb" || v === "dental" ? (v as CrmVertical) : undefined;
+  return v === "rfb" || v === "dental" || v === "experiences" ? (v as CrmVertical) : undefined;
 }
 
 // ─── Schemas ─────────────────────────────────────────────────

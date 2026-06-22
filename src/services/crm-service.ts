@@ -8,10 +8,11 @@ import { getDb } from "../database/init";
 // and read queries for the dashboard UI.
 
 export type ContactType = "producer" | "marketing" | "vendor" | "unknown";
-// Vertical split: rfb = rettfrabonden.com, dental = finn-tannlege.com.
-// All CRM tables carry vertical_id (default 'rfb'). The closed union below
-// is interpolated directly into SQL fragments — never raw user input.
-export type CrmVertical = "rfb" | "dental";
+// Vertical split: rfb = rettfrabonden.com, dental = finn-tannlege.com,
+// experiences = opplevagent.no. All CRM tables carry vertical_id (default
+// 'rfb'). The closed union below is interpolated directly into SQL fragments
+// — never raw user input.
+export type CrmVertical = "rfb" | "dental" | "experiences";
 function vSql(column: string, vertical?: CrmVertical): string {
   return vertical ? ` AND ${column} = '${vertical}'` : "";
 }

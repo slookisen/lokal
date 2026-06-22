@@ -187,15 +187,18 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;backgrou
 .spinner{display:inline-block;width:14px;height:14px;border:2px solid var(--text-dim);border-top-color:var(--accent);border-radius:50%;animation:spin 0.8s linear infinite}
 @keyframes spin{to{transform:rotate(360deg)}}
 
-/* ─── Vertikal-switcher (RFB / Finn Tannlege / Begge) ─── */
+/* ─── Vertikal-switcher (RFB / Finn Tannlege / OpplevAgent / Alle) ─── */
 .vertical-bar{display:flex;gap:4px;background:var(--bg);border:1px solid var(--border);border-radius:10px;padding:4px}
 .vertical-btn{padding:6px 12px;font-size:12px;font-weight:600;color:var(--text-dim);border:none;background:none;cursor:pointer;border-radius:7px;white-space:nowrap}
 .vertical-btn:hover:not(.active){color:var(--text)}
 .vertical-btn.active[data-v="rfb"]{background:#4ade8022;color:#4ade80}
 .vertical-btn.active[data-v="dental"]{background:#2dd4bf22;color:#2dd4bf}
+.vertical-btn.active[data-v="experiences"]{background:#f59e0b22;color:#f59e0b}
 .vertical-btn.active[data-v="all"]{background:var(--surface2);color:var(--text)}
 body[data-vertical="dental"]{--accent:#2dd4bf}
+body[data-vertical="experiences"]{--accent:#f59e0b}
 body[data-vertical="dental"] .topbar{border-bottom:2px solid #2dd4bf}
+body[data-vertical="experiences"] .topbar{border-bottom:2px solid #f59e0b}
 body[data-vertical="rfb"] .topbar{border-bottom:2px solid #4ade80}
 </style>
 </head>
@@ -221,7 +224,8 @@ body[data-vertical="rfb"] .topbar{border-bottom:2px solid #4ade80}
       <div class="vertical-bar" id="verticalBar">
         <button class="vertical-btn" data-v="rfb">🌱 RFB</button>
         <button class="vertical-btn" data-v="dental">🦷 Tannlege</button>
-        <button class="vertical-btn active" data-v="all">Begge</button>
+        <button class="vertical-btn" data-v="experiences">🧭 OpplevAgent</button>
+        <button class="vertical-btn active" data-v="all">Alle</button>
       </div>
       <span class="kpi" id="kpiP0" style="display:none"><span class="num">0</span> P0</span>
       <span class="kpi"><span class="num" id="kpiNew">0</span> nye</span>
@@ -378,7 +382,7 @@ let VERTICAL = sessionStorage.getItem('rfb_crm_vertical') || 'all';
 
 function applyVerticalUi() {
   document.body.setAttribute('data-vertical', VERTICAL);
-  const titles = { rfb: 'Rett fra Bonden — CRM', dental: 'Finn Tannlege — CRM', all: 'CRM — begge vertikaler' };
+  const titles = { rfb: 'Rett fra Bonden — CRM', dental: 'Finn Tannlege — CRM', experiences: 'OpplevAgent — CRM', all: 'CRM — alle vertikaler' };
   const el = document.getElementById('crmTitle');
   if (el) el.textContent = titles[VERTICAL] || titles.all;
   document.querySelectorAll('#verticalBar .vertical-btn').forEach(b => {
@@ -425,7 +429,7 @@ function logout() {
 
 async function api(path, opts = {}) {
   // Append vertical-filter on read requests when a single vertical is valgt.
-  if ((!opts.method || opts.method === 'GET') && (VERTICAL === 'rfb' || VERTICAL === 'dental')) {
+  if ((!opts.method || opts.method === 'GET') && VERTICAL !== 'all') {
     path += (path.includes('?') ? '&' : '?') + 'vertical=' + VERTICAL;
   }
   const res = await fetch(API + path, {
