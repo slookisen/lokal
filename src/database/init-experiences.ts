@@ -201,5 +201,11 @@ export function initExperiencesSchema(db: Database.Database): void {
     }
   }
 
+  // Additive migration (boot-safe): slug column on experience_providers for
+  // human-readable /tilbyder/<slug> URLs (opplevagent-site-quality increment).
+  // ALTER TABLE ... ADD COLUMN is idempotent — error means column already exists.
+  try { db.exec("ALTER TABLE experience_providers ADD COLUMN slug TEXT"); } catch { /* already present */ }
+  try { db.exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_exp_prov_slug ON experience_providers(slug)"); } catch { /* already present */ }
+
   console.log("[experiences] schema initialized");
 }
