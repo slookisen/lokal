@@ -515,6 +515,7 @@ export function listPublishedKommuner(): Array<{ kommune: string; fylke: string 
 /** Distinct providers that have ≥1 PUBLISHED experience (id, name, counts). */
 export type PublishedProviderRow = {
   id: string;
+  slug: string | null;
   navn: string;
   fylke: string | null;
   kommune: string | null;
@@ -524,7 +525,7 @@ export function listPublishedProviders(): PublishedProviderRow[] {
   const db = getDb(VERTICAL);
   return db
     .prepare(
-      `SELECT p.id AS id, p.navn AS navn, p.fylke AS fylke, p.kommune AS kommune,
+      `SELECT p.id AS id, p.slug AS slug, p.navn AS navn, p.fylke AS fylke, p.kommune AS kommune,
               COUNT(*) AS count
        FROM experiences e
        JOIN experience_providers p ON p.id = e.provider_id
@@ -549,6 +550,56 @@ export function getPublishedProviderById(id: string): Record<string, unknown> | 
     )
     .get({ id }) as Record<string, unknown> | undefined;
   return row ?? null;
+}
+
+/** Look up a provider by its generated slug — for the /tilbyder/<slug> URL. */
+export function getPublishedProviderBySlug(slug: string): Record<string, unknown> | null {
+  if (!slug) return null;
+  const db = getDb(VERTICAL);
+  const row = db
+    .prepare(
+      `SELECT p.* FROM experience_providers p
+       WHERE p.slug = @slug AND EXISTS (
+         SELECT 1 FROM experiences e
+         WHERE e.provider_id = p.id AND e.slug IS NOT NULL AND ${PUBLISH_GATE_SQL}
+       )`
+    )
+    .get({ slug }) as Record<string, unknown> | undefined;
+  return row ?? null;
+}
+
+/**
+ * Backfill the slug column for experience_providers rows that have none.
+ * Slug format: <slugified-navn>--<first-8-chars-of-id>.
+ * Idempotent and boot-safe: skips rows already having a slug.
+ * Returns the count of rows updated.
+ */
+export function backfillProviderSlugs(): number {
+  const db = getDb(VERTICAL);
+  const rows = db
+    .prepare("SELECT id, navn FROM experience_providers WHERE slug IS NULL OR slug = ''")
+    .all() as { id: string; navn: string }[];
+  let updated = 0;
+  for (const row of rows) {
+    const base = `${slugify(row.navn)}--${row.id.slice(0, 8)}`;
+    try {
+      const changed = db
+        .prepare("UPDATE experience_providers SET slug = ? WHERE id = ? AND (slug IS NULL OR slug = '')")
+        .run(base, row.id).changes;
+      updated += changed;
+    } catch {
+      // Rare: duplicate slug (two providers with identical name+id-prefix).
+      // Append more of the id to break the tie.
+      const fallback = `${slugify(row.navn)}--${row.id.replace(/-/g, "").slice(0, 12)}`;
+      try {
+        const changed = db
+          .prepare("UPDATE experience_providers SET slug = ? WHERE id = ? AND (slug IS NULL OR slug = '')")
+          .run(fallback, row.id).changes;
+        updated += changed;
+      } catch { /* give up on this row */ }
+    }
+  }
+  return updated;
 }
 
 /**
