@@ -20449,3 +20449,118 @@ _orchPr20BmEventsPromise.then(async () => {
     _orchPr21SentLogActorResolve();
   }
 });
+
+
+// ── site-quality (opplevagent-site-quality loop, 2026-06-22) ──────────────────
+// Tilbyder slug URLs: /tilbyder/<slug> (human-readable) + 301 from UUID URLs.
+// Mirrors the sq-detail IIFE discipline: isolated :memory: experiences.db,
+// fresh require-cache, sync mock req/res. Host-isolated (zero rfb/dental).
+console.log("\n── site-quality: tilbyder slug URLs (sq-slug) ──");
+(() => {
+  const prevPathSlug = process.env.EXPERIENCES_DB_PATH;
+  process.env.EXPERIENCES_DB_PATH = ":memory:";
+
+  const dbFacPathSL = require.resolve("../src/database/db-factory");
+  const expStPathSL = require.resolve("../src/services/experience-store");
+  const expSeoPathSL = require.resolve("../src/routes/experiences-seo");
+  delete require.cache[dbFacPathSL];
+  delete require.cache[expStPathSL];
+  delete require.cache[expSeoPathSL];
+
+  const dbFacSL = require("../src/database/db-factory") as typeof import("../src/database/db-factory");
+  dbFacSL.__resetDbFactoryForTesting();
+  const expStSL = require("../src/services/experience-store") as typeof import("../src/services/experience-store");
+  const seoRouterSL = (require("../src/routes/experiences-seo") as typeof import("../src/routes/experiences-seo")).default as any;
+
+  // Schema init + seed: one Brreg-verified provider + one publishable experience.
+  dbFacSL.getDb("experiences");
+  const provIdSL = expStSL.createProvider({
+    navn: "Brim Explorer AS", org_nr: "988000222",
+    fylke: "Oslo", kommune: "Oslo", hjemmeside: "https://example-brim.no",
+    brreg_verified: 1, brreg_active: 1, verification_status: "verified",
+  });
+  const expIdSL = expStSL.createExperience({
+    title: "Fjordkryss med el-katamaran", provider_id: provIdSL, provider_match_status: "matched",
+    category: "sightseeing_transport", fylke: "Oslo", kommune: "Oslo",
+    indoor_outdoor: "outdoor", season: ["summer"], confidence: "high", verification_status: "verified",
+  });
+
+  // Invoke the router (sync mock req/res). Handles redirect via res.redirect().
+  function invokeSeoSL(
+    routePath: string,
+    params: Record<string, string>,
+    reqPath: string,
+    query: Record<string, string> = {}
+  ): { status: number; body: string; headers: Record<string, string>; redirectTo: string | null } {
+    const layer = (seoRouterSL.stack as any[]).find(
+      (l: any) => l.route && l.route.path === routePath && l.route.methods?.get
+    );
+    assertTrue(!!layer, \`sq-slug: router has GET \${routePath} layer\`);
+    let status = 200; let body = ""; let nexted = false; let redirectTo: string | null = null;
+    const headers: Record<string, string> = {};
+    const res: any = {
+      statusCode: 200,
+      setHeader: (k: string, v: string) => { headers[k.toLowerCase()] = String(v); },
+      status: (c: number) => { status = c; res.statusCode = c; return res; },
+      send: (b: unknown) => { body = typeof b === "string" ? b : String(b); return res; },
+      json: (o: unknown) => { body = JSON.stringify(o); return res; },
+      redirect: (code: number, location: string) => { status = code; redirectTo = location; },
+    };
+    const req: any = { path: reqPath, hostname: "opplevagent.no", params, query };
+    const handler = layer.route.stack[layer.route.stack.length - 1].handle;
+    handler(req, res, () => { nexted = true; });
+    if (nexted) status = 404;
+    return { status, body, headers, redirectTo };
+  }
+
+  // sq-slug-00: backfillProviderSlugs() generates a slug for the seeded provider.
+  const backfilledSL = expStSL.backfillProviderSlugs();
+  assertTrue(backfilledSL >= 1, "sq-slug-00a: backfillProviderSlugs() updated >=1 rows");
+  const provRowSL = expStSL.getPublishedProviderById(provIdSL) as any;
+  assertTrue(!!provRowSL, "sq-slug-00b: provider is published (has live experience)");
+  const provSlugSL = provRowSL.slug as string;
+  assertTrue(typeof provSlugSL === "string" && provSlugSL.length > 0, "sq-slug-00c: provider row has non-empty slug");
+  // Slug must be slugified from navn + 8-char id prefix
+  assertTrue(provSlugSL.startsWith("brim-explorer-as--"), "sq-slug-00d: slug derived from provider navn");
+  assertTrue(provSlugSL.slice(-8) === provIdSL.slice(0, 8), "sq-slug-00e: slug suffix = first 8 chars of provider id");
+
+  // sq-slug-01: GET /tilbyder/<slug> → 200 HTML with correct content.
+  const okSL = invokeSeoSL("/tilbyder/:providerSlugOrId", { providerSlugOrId: provSlugSL }, \`/tilbyder/\${provSlugSL}\`);
+  assertEq(okSL.status, 200, "sq-slug-01a: GET /tilbyder/<slug> → 200");
+  assertTrue(/text\/html/.test(okSL.headers["content-type"] || ""), "sq-slug-01b: Content-Type text/html");
+  assertTrue(/Brim Explorer AS/.test(okSL.body), "sq-slug-01c: tilbyder page renders provider navn");
+  assertTrue(/Verifisert mot Br/.test(okSL.body), "sq-slug-01d: Brreg-verified badge present on slug page");
+  assertTrue(okSL.body.includes(\`/tilbyder/\${provSlugSL}\`), "sq-slug-01e: canonical URL uses slug (not UUID)");
+
+  // sq-slug-02: GET /tilbyder/<uuid> → 301 redirect to /tilbyder/<slug>.
+  const redir = invokeSeoSL("/tilbyder/:providerSlugOrId", { providerSlugOrId: provIdSL }, \`/tilbyder/\${provIdSL}\`);
+  assertEq(redir.status, 301, "sq-slug-02a: UUID URL → 301 redirect");
+  assertEq(redir.redirectTo, \`/tilbyder/\${encodeURIComponent(provSlugSL)}\`, "sq-slug-02b: 301 Location points to slug URL");
+
+  // sq-slug-03: unknown slug → 404 (next() called).
+  const missSL = invokeSeoSL("/tilbyder/:providerSlugOrId", { providerSlugOrId: "does-not-exist-xyz" }, "/tilbyder/does-not-exist-xyz");
+  assertEq(missSL.status, 404, "sq-slug-03: unknown slug → 404");
+
+  // sq-slug-04: sitemap.xml now lists /tilbyder/<slug>, not /tilbyder/<uuid>.
+  const smSL = invokeSeoSL("/sitemap.xml", {}, "/sitemap.xml");
+  assertEq(smSL.status, 200, "sq-slug-04a: sitemap.xml → 200");
+  assertTrue(smSL.body.includes(\`/tilbyder/\${provSlugSL}\`), "sq-slug-04b: sitemap contains slug-based tilbyder URL");
+  assertTrue(!smSL.body.includes(\`/tilbyder/\${provIdSL}\`), "sq-slug-04c: sitemap does NOT contain UUID-based tilbyder URL");
+
+  // sq-slug-05: detail page /opplevelse/<slug> links to /tilbyder/<slug>, not UUID.
+  const expSlugSL = (expStSL.getExperienceById(expIdSL) as any).slug as string;
+  const detailSL = invokeSeoSL("/opplevelse/:slug", { slug: expSlugSL }, \`/opplevelse/\${expSlugSL}\`);
+  assertEq(detailSL.status, 200, "sq-slug-05a: detail page → 200");
+  assertTrue(detailSL.body.includes(\`/tilbyder/\${provSlugSL}\`), "sq-slug-05b: detail page tilbyder link uses slug URL");
+  assertTrue(!detailSL.body.includes(\`/tilbyder/\${provIdSL}\`), "sq-slug-05c: detail page does NOT link to UUID tilbyder URL");
+
+  // HOST ISOLATION: no rfb/dental content on any tilbyder page.
+  assertTrue(!/Rett fra Bonden/i.test(okSL.body), "sq-slug-06: no 'Rett fra Bonden' on tilbyder page");
+  assertTrue(!/Finn-tannlege|\/api\/tannlege/i.test(okSL.body), "sq-slug-07: no dental identity on tilbyder page");
+
+  process.env.EXPERIENCES_DB_PATH = prevPathSlug;
+  delete require.cache[dbFacPathSL];
+  delete require.cache[expStPathSL];
+  delete require.cache[expSeoPathSL];
+  console.log("  sq-slug: OK (7 tests: slug-200/301-uuid/404/sitemap-no-uuid/detail-link/host-isolation)");
+})();
