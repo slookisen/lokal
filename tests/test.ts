@@ -14981,14 +14981,14 @@ console.log("\n── opplevagent P2: human-browse subpages (experiences) ──
   const fylkeMissP2 = invokeSeo("/fylke/:fylke", { fylke: "Atlantis" }, "/fylke/Atlantis");
   assertEq(fylkeMissP2.status, 404, "p2-03d: unknown fylke → 404 (next())");
 
-  // p2-04: /tilbyder/:providerId → 200 scoped to provider; unknown → 404.
-  const provPageP2 = invokeSeo("/tilbyder/:providerId", { providerId: provP2 }, `/tilbyder/${provP2}`);
+  // p2-04: /tilbyder/:providerSlugOrId → 200 (UUID served until slug backfilled); unknown → 404.
+  const provPageP2 = invokeSeo("/tilbyder/:providerSlugOrId", { providerSlugOrId: provP2 }, `/tilbyder/${provP2}`);
   assertEq(provPageP2.status, 200, "p2-04a: GET /tilbyder/<id> → 200");
   assertTrue(/Tromsø Villmark AS/.test(provPageP2.body), "p2-04b: provider page shows provider name");
   assertTrue(/Hvalsafari i Tromsø/.test(provPageP2.body) && !/Tapasvandring i Oslo/.test(provPageP2.body),
     "p2-04c: provider page lists only that provider's experiences");
   assertTrue(/Brønnøysundregistrene/.test(provPageP2.body), "p2-04d: verified provider page shows Brreg note");
-  const provMissP2 = invokeSeo("/tilbyder/:providerId", { providerId: "00000000-dead-beef" }, "/tilbyder/00000000-dead-beef");
+  const provMissP2 = invokeSeo("/tilbyder/:providerSlugOrId", { providerSlugOrId: "00000000-dead-beef" }, "/tilbyder/00000000-dead-beef");
   assertEq(provMissP2.status, 404, "p2-04e: unknown provider → 404 (next())");
 
   // p2-05: /sok?q= → 200 results; empty + no-match handled gracefully (200, noindex).
