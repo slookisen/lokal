@@ -1046,7 +1046,18 @@ function renderOpplevelseDetail(
     .map((o) => `<script type="application/ld+json">${JSON.stringify(o).replace(/<\//g, "<\\/")}</script>`)
     .join("\n");
 
-  const title = `${exp.title}${place ? " – " + place : ""} | Opplevagent`;
+  // Build SEO title ≤70 chars: cascade full (with place) → without place → truncated
+  const BRAND = " | Opplevagent";
+  const MAX_TITLE = 70;
+  function seoPageTitle(main: string): string {
+    if (main.length + BRAND.length <= MAX_TITLE) return main + BRAND;
+    const truncated = main.slice(0, MAX_TITLE - BRAND.length - 1).trimEnd();
+    return truncated + "…" + BRAND;
+  }
+  const titleWithPlace = `${exp.title}${place ? " – " + place : ""}`;
+  const title = seoPageTitle(
+    titleWithPlace.length + BRAND.length <= MAX_TITLE ? titleWithPlace : exp.title
+  );
 
   return `<!doctype html>
 <html lang="nb">
@@ -1755,6 +1766,12 @@ router.get("/sok", (req: Request, res: Response) => {
 <meta name="theme-color" content="#0b3d2e">
 <link rel="canonical" href="${canonical}">
 <link rel="icon" type="image/svg+xml" href="/favicon.svg">
+<meta property="og:title" content="${escapeHtml(h1)}">
+<meta property="og:description" content="${escapeHtml(metaDesc)}">
+<meta property="og:type" content="website">
+<meta property="og:url" content="${canonical}">
+<meta property="og:locale" content="nb_NO">
+<meta property="og:site_name" content="Opplevagent">
 ${ldScript}
 <style>${BROWSE_CSS}</style>
 </head>
