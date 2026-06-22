@@ -29,6 +29,7 @@ import type {
   VerifierFinding,
   VerifierState,
 } from "../types/run-envelope";
+import { normalizeEnvelopeTimes } from "../services/envelope-normalize";
 
 const router = Router();
 
@@ -98,9 +99,23 @@ router.post("/", (req: Request, res: Response) => {
     return;
   }
 
+  // Normalize timestamps before persisting so a drifting agent can't poison the
+  // ledger (unparseable / "+00:00Z" double-marker / future) — the dispatcher's
+  // freshness+cooldown and the verifier's drift math read these. See envelope-normalize.ts.
+  const env = validation.envelope;
+  const { started_at, finished_at, repairs } = normalizeEnvelopeTimes(env, Date.now());
+  env.started_at = started_at;
+  env.finished_at = finished_at;
+  if (repairs.length > 0) {
+    console.warn(
+      `[admin/runs] timestamp repair agent=${env.agent} run=${env.run_id}: ` +
+        repairs.map((r) => `${r.field} ${r.reason}`).join("; "),
+    );
+  }
+
   try {
-    recordRun(validation.envelope);
-    res.json({ success: true, run_id: validation.envelope.run_id });
+    recordRun(env);
+    res.json({ success: true, run_id: env.run_id, ...(repairs.length ? { normalized: repairs.length } : {}) });
   } catch (err: any) {
     res.status(500).json({ error: "Record failed", detail: err.message });
   }

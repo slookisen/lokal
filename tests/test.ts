@@ -6,6 +6,7 @@
 import { redactPII, isValidFodselsnummer } from "../src/utils/pii-redact";
 import { computeLoopHealth } from "../src/services/loop-health";
 import { computeWakeList } from "../src/services/loop-dispatch";
+import { normalizeTimestamp, normalizeEnvelopeTimes } from "../src/services/envelope-normalize";
 
 let passed = 0;
 let failed = 0;
@@ -17522,6 +17523,39 @@ const _orchPr20260614_2Promise = (async () => {
   });
   assertTrue(!p6.inActiveWindow, "dispatch: 02:00 UTC is outside active window");
   assertEq(p6.wake.length, 0, "dispatch: paused window -> no wake");
+}
+
+// -- envelope timestamp normalization (pure) --
+{
+  const now = Date.parse("2026-06-22T12:00:00.000Z");
+  const validZ = (s: string) => !Number.isNaN(Date.parse(s)) && /Z$/.test(s) && !s.includes("+00:00");
+
+  // literal "$(date...)" (heredoc froze the substitution) -> unparseable -> clamp to now
+  const r1 = normalizeTimestamp("$(date -u +%Y-%m-%dT%H:%M:%SZ)", now);
+  assertEq(r1.value, "2026-06-22T12:00:00.000Z", "ts: unparseable $(date) clamps to now");
+  assertTrue(/unparseable/.test(r1.reason || ""), "ts: unparseable flagged");
+
+  // "+00:00Z" double timezone marker (isoformat()+'Z') -> valid canonical Z, not future
+  const r2 = normalizeTimestamp("2026-06-22T08:40:07.592854+00:00Z", now);
+  assertTrue(validZ(r2.value), "ts: +00:00Z double-marker -> clean Z (no +00:00)");
+  assertTrue(Date.parse(r2.value) <= now, "ts: repaired +00:00Z not in the future");
+
+  // future finished_at (clock/derivation skew) -> clamp to now
+  const r3 = normalizeTimestamp("2026-06-22T12:52:00.000Z", now);
+  assertEq(r3.value, "2026-06-22T12:00:00.000Z", "ts: future clamps to now");
+  assertTrue(/future/.test(r3.reason || ""), "ts: future flagged");
+
+  // already-canonical -> unchanged, no repair
+  const r4 = normalizeTimestamp("2026-06-22T11:30:00.000Z", now);
+  assertEq(r4.value, "2026-06-22T11:30:00.000Z", "ts: canonical passes through unchanged");
+  assertEq(r4.reason, null, "ts: canonical needs no repair");
+
+  // envelope monotonicity: finished before started -> started clamped to finished
+  const e = normalizeEnvelopeTimes(
+    { started_at: "2026-06-22T11:00:00.000Z", finished_at: "2026-06-22T10:00:00.000Z" },
+    now,
+  );
+  assertTrue(Date.parse(e.started_at) <= Date.parse(e.finished_at), "ts: envelope started_at <= finished_at");
 }
 
 // Wait for the M2 owner-portal async tests before reporting so their
