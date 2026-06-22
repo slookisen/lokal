@@ -57,7 +57,7 @@ import adminDebioCrossCheckRoutes from "./routes/admin-debio-cross-check";
 import adminJobsRoutes from "./routes/admin-jobs";
 import platformTriggersRoutes, { adminRouter as adminTriggersRoutes } from "./routes/platform-triggers";
 import crmRoutes from "./routes/crm";
-import { list as blocklistList } from "./services/blocklist-service";
+import { list as blocklistList, remove as blocklistRemove } from "./services/blocklist-service";
 import { bounceService } from "./services/bounce-service";
 import { seedData } from "./seed";
 // Seed files moved to src/_seeds/ — only loaded if DB is empty (see below).
@@ -510,6 +510,25 @@ app.get("/admin/blocklist", adminLimiter, (req, res) => {
     res.json({ success: true, count: rows.length, since: since ?? null, entries: rows });
   } catch (err: any) {
     res.status(500).json({ error: "List failed", detail: err.message });
+  }
+});
+
+// ─── DELETE /admin/blocklist/:id (alias for /api/marketplace/admin/blocklist/:id) ───
+// Thin alias so CS tooling can hit the intuitive top-level path without knowing
+// the marketplace router mount. Auth + behavior are IDENTICAL to the router handler
+// at src/routes/marketplace.ts (router.delete("/admin/blocklist/:id", ...)).
+app.delete("/admin/blocklist/:id", adminLimiter, (req, res) => {
+  const adminKey = req.headers["x-admin-key"] as string;
+  const expected = process.env.ADMIN_KEY || process.env.ANALYTICS_ADMIN_KEY || "";
+  if (!expected) { res.status(503).json({ error: "Admin not configured" }); return; }
+  if (!adminKey || adminKey !== expected) { res.status(403).json({ error: "Krever X-Admin-Key header" }); return; }
+  try {
+    const id = parseInt(req.params.id as string, 10);
+    if (!id) { res.status(400).json({ error: "Ugyldig id" }); return; }
+    const removed = blocklistRemove({ id });
+    res.json({ success: true, removed });
+  } catch (err: any) {
+    res.status(500).json({ error: "Remove failed", detail: err.message });
   }
 });
 
