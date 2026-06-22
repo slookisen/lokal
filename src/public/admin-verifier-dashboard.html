@@ -94,15 +94,18 @@ tr.row-clickable:hover { background: var(--surface2); }
 .conflict-field { margin-top: 4px; }
 .conflict-field strong { color: var(--warn); }
 
-/* ─── Vertikal-switcher (RFB / Finn Tannlege / Alle) ─── */
+/* ─── Vertikal-switcher (RFB / Finn Tannlege / OpplevAgent / Alle) ─── */
 .vertical-bar { display: flex; gap: 4px; background: var(--surface); border: 1px solid var(--border); border-radius: 10px; padding: 4px; }
 .vertical-btn { padding: 7px 14px; font-size: 13px; font-weight: 600; color: var(--text-dim); border: none; background: none; cursor: pointer; border-radius: 7px; white-space: nowrap; }
 .vertical-btn:hover:not(.active) { color: var(--text); }
 .vertical-btn.active[data-v="rfb"] { background: #4ade8022; color: #4ade80; }
 .vertical-btn.active[data-v="dental"] { background: #2dd4bf22; color: #2dd4bf; }
+.vertical-btn.active[data-v="experiences"] { background: #f59e0b22; color: #f59e0b; }
 .vertical-btn.active[data-v="all"] { background: var(--surface2); color: var(--text); }
 body[data-vertical="dental"] { --accent: #2dd4bf; }
+body[data-vertical="experiences"] { --accent: #f59e0b; }
 body[data-vertical="dental"] header { border-left: 4px solid #2dd4bf; padding-left: 12px; }
+body[data-vertical="experiences"] header { border-left: 4px solid #f59e0b; padding-left: 12px; }
 body[data-vertical="rfb"] header { border-left: 4px solid #4ade80; padding-left: 12px; }
 </style>
 </head>
@@ -128,6 +131,7 @@ body[data-vertical="rfb"] header { border-left: 4px solid #4ade80; padding-left:
         <div class="vertical-bar" id="verticalBar">
           <button class="vertical-btn" data-v="rfb">🌱 RFB</button>
           <button class="vertical-btn" data-v="dental">🦷 Tannlege</button>
+          <button class="vertical-btn" data-v="experiences">🧭 OpplevAgent</button>
           <button class="vertical-btn active" data-v="all">Alle</button>
         </div>
         <span class="refresh-info" id="refreshInfo"></span>
@@ -218,17 +222,17 @@ var REFRESH_INTERVAL_MS = 30000;
 var refreshTimer = null;
 
 // ─── Vertikal-switcher ───────────────────────────
-// 'rfb' | 'dental' | 'all'. /admin/runs støtter ?vertical= direkte.
+// 'rfb' | 'dental' | 'experiences' | 'all'. /admin/runs støtter ?vertical= direkte.
 var VERTICAL = "all";
 try { VERTICAL = sessionStorage.getItem("rfb_verifier_vertical") || "all"; } catch(e) {}
 
 function verticalQuery() {
-  return (VERTICAL === "rfb" || VERTICAL === "dental") ? "&vertical=" + VERTICAL : "";
+  return VERTICAL !== "all" ? "&vertical=" + VERTICAL : "";
 }
 
 function applyVerticalUi() {
   document.body.setAttribute("data-vertical", VERTICAL);
-  var titles = { rfb: "Verifier — Rett fra Bonden", dental: "Verifier — Finn Tannlege", all: "Verifier Dashboard" };
+  var titles = { rfb: "Verifier — Rett fra Bonden", dental: "Verifier — Finn Tannlege", experiences: "Verifier — OpplevAgent", all: "Verifier Dashboard" };
   document.getElementById("dashTitle").textContent = titles[VERTICAL] || titles.all;
   document.querySelectorAll("#verticalBar .vertical-btn").forEach(function(b) {
     b.classList.toggle("active", b.getAttribute("data-v") === VERTICAL);
