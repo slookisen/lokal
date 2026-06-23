@@ -39,12 +39,23 @@ import {
   listPublishedKommuner,
   listPublishedProviders,
   getPublishedProviderById,
+  getPublishedProviderBySlug,
+  backfillProviderSlugs,
   searchPublishedExperiences,
   type RelatedExperienceRow,
   type ExperienceCardRow,
 } from "../services/experience-store";
 
 const router = Router();
+
+// Lazy, one-shot backfill of experience_providers.slug (additive migration).
+let _providerSlugBackfillDone = false;
+function ensureProviderSlugs(): void {
+  if (!_providerSlugBackfillDone) {
+    _providerSlugBackfillDone = true;
+    try { backfillProviderSlugs(); } catch { /* DB not yet open */ }
+  }
+}
 
 const OPPLEVAGENT_BASE_URL =
   process.env.OPPLEVAGENT_BASE_URL || "https://opplevagent.no";
@@ -644,7 +655,8 @@ router.get("/sitemap.xml", (_req: Request, res: Response) => {
   try {
     for (const row of listPublishedProviders()) {
       if (!row.id) continue;
-      xml += `\n  <url><loc>${url}/tilbyder/${encodeURIComponent(row.id)}</loc><changefreq>weekly</changefreq><priority>0.6</priority><lastmod>${today}</lastmod></url>`;
+      const tilbyderSeg = row.slug ? encodeURIComponent(row.slug) : encodeURIComponent(row.id);
+      xml += `\n  <url><loc>${url}/tilbyder/${tilbyderSeg}</loc><changefreq>weekly</changefreq><priority>0.6</priority><lastmod>${today}</lastmod></url>`;
     }
   } catch { /* experiences DB not open */ }
   try {
@@ -975,7 +987,7 @@ function renderOpplevelseDetail(
   const provInner = provName
     ? `<p class="prov-name">${provSite ? `<a href="${escapeHtml(provSite)}" target="_blank" rel="noopener">${escapeHtml(provName)}</a>` : escapeHtml(provName)}</p>
        ${brregVerified ? `<p class="prov-verified">✓ Verifisert mot Brønnøysundregistrene${orgNr ? ` · org.nr ${escapeHtml(orgNr)}` : ""}</p>` : `<p class="prov-soft">Tilbyder under verifisering.</p>`}
-       <p class="prov-link"><a href="/tilbyder/${escapeHtml(String(provider!.id))}">Alle opplevelser fra denne tilbyderen →</a></p>`
+       <p class="prov-link"><a href="/tilbyder/${escapeHtml(String(provider!.slug || provider!.id))}">Alle opplevelser fra denne tilbyderen →</a></p>`
     : `<p class="prov-soft">Tilbyder er ikke matchet ennå.</p>`;
 
   // Map block — coords from experience, else provider; graceful no-geo fallback.
@@ -1664,16 +1676,26 @@ router.get("/kommune/:kommune", (req: Request, res: Response, next: NextFunction
 });
 
 // providerId is the provider's UUID -- one provider's experiences.
-router.get("/tilbyder/:providerId", (req: Request, res: Response, next: NextFunction) => {
-  const providerId = String(req.params.providerId || "");
-  if (!providerId) return next();
+router.get("/tilbyder/:providerSlugOrId", (req: Request, res: Response, next: NextFunction) => {
+  const param = String(req.params.providerSlugOrId || "");
+  if (!param) return next();
+  ensureProviderSlugs();
+  const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
   let provider: Record<string, unknown> | null = null;
-  try {
-    provider = getPublishedProviderById(providerId);
-  } catch {
-    provider = null;
+  if (UUID_RE.test(param)) {
+    // UUID → look up by ID → 301 redirect to slug URL
+    try { provider = getPublishedProviderById(param); } catch { provider = null; }
+    if (!provider) return next();
+    const slug = provider.slug as string | null;
+    if (slug) { res.redirect(301, `/tilbyder/${encodeURIComponent(slug)}`); return; }
+    // No slug yet (backfill race) — serve by ID temporarily
+  } else {
+    // Normal slug-based lookup
+    try { provider = getPublishedProviderBySlug(param); } catch { provider = null; }
+    if (!provider) return next();
   }
-  if (!provider) return next(); // unknown provider / no live experiences → 404
+  if (!provider) return next();
+  const providerId = String(provider.id || param);
 
   const page = parsePage(req.query.page);
   let total = 0;
@@ -1699,7 +1721,7 @@ router.get("/tilbyder/:providerId", (req: Request, res: Response, next: NextFunc
     h1: navn,
     metaDesc: `Opplevelser fra ${navn}${place ? " i " + place : ""} på Opplevagent. ${total} ${total === 1 ? "opplevelse" : "opplevelser"}.${brregVerified ? " Tilbyder verifisert mot Brønnøysundregistrene." : ""}`,
     lede: ledeBits,
-    canonicalPath: `/tilbyder/${encodeURIComponent(providerId)}`,
+    canonicalPath: `/tilbyder/${encodeURIComponent(String(provider.slug || providerId))}`,
     crumbs: [{ name: "Forsiden", href: "/" }, { name: "Alle opplevelser", href: "/opplevelser" }, { name: navn }],
     rows,
     total,
