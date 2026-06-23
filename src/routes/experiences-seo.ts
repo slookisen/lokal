@@ -26,6 +26,7 @@
 import { Router, Request, Response, NextFunction } from "express";
 import { getExperiencesAgentCard } from "../services/experiences-agent-card";
 import { getExperiencesOpenapi } from "../services/experiences-openapi";
+import { htmlLangAttr, ogLocale, type Lang } from "../i18n/t";
 import {
   listCategories,
   getPublishedExperienceBySlug,
@@ -85,13 +86,76 @@ function safeCategories(): Array<{ category: string; count: number }> {
   }
 }
 
+// ─────────────────────────────────────────────────────────────
+// Homepage UI strings (NO/EN). Phase-1 i18n: only the landing page
+// is genuinely bilingual; browse/detail stay NO-canonical for now.
+// ─────────────────────────────────────────────────────────────
+function homeStrings(lang: Lang) {
+  const no = {
+    metaTitle: "Opplevagent — Kuratert markedsplass for norske opplevelser",
+    metaDesc: "Opplevagent er en kuratert markedsplass for norske opplevelser og aktiviteter — hvalsafari, trehytter, guidede turer, mat og mer. Søkbar for AI-agenter etter sted, vær, sesong og gruppestørrelse.",
+    ogTitle: "Opplevagent — norske opplevelser, søkbart for AI-agenter",
+    ogImageAlt: "Opplevagent — markedsplass for norske opplevelser",
+    skip: "Hopp til hovedinnhold",
+    brandAria: "Opplevagent forside",
+    navAria: "Hovednavigasjon",
+    navAll: "Alle opplevelser", navCategories: "Kategorier", navHow: "Slik funker det", navAgents: "For AI-agenter", navExplore: "Utforsk",
+    heroPill: "A2A-markedsplass for norske opplevelser",
+    heroH1: "Hva kan vi finne på ", heroAccent: "i dag?",
+    heroSub: "Fra hvalsafari og trehytter til guidede fjellturer, matopplevelser og lasertag &mdash; en kuratert oversikt over norske opplevelser, bygget for å bli oppdaget og spurt av AI-agenter.",
+    searchAria: "Finn opplevelser", searchLabel: "Beskriv hva du vil finne på, eller skriv et sted", searchPlaceholder: "Søk: hvalsafari, Oslo, mat …", searchBtn: "Finn opplevelser",
+    hintPre: "Søk på sted, kategori eller aktivitet &mdash; eller ", hintLink: "bla i alle opplevelser", hintPost: ". Agenter kan kalle ", hintPost2: " direkte.",
+    quickAria: "Hurtigsøk", qNature: "Ute i naturen", qAll: "Alle opplevelser",
+    trustAria: "Tillit og datakilder", trustBrreg: "Tilbydere verifisert mot Brønnøysundregistrene", trustFresh: "Innhold oppdatert fortløpende", trustMachine: "Maskinlesbar for AI-agenter",
+    catKicker: "Utforsk", catTitle: "Opplevelser etter kategori", catIntro: "Bla i kuraterte kategorier &mdash; eller la en AI-agent filtrere på vær, sesong, pris og gruppestørrelse for deg.", catAria: "Kategorier", catCount: "opplevelser", catSoon: "Kommer snart", catNote: "Eksempelkategorier &mdash; live opplevelser publiseres fortløpende.",
+    howKicker: "Tillitsmodell", howTitle: "Slik funker det", howSub: "Kuratert, verifisert og beriket &mdash; tre steg som skiller Opplevagent fra en vanlig oppføringsliste.",
+    srcLabel: "Kilde:",
+    s1t: "Kuratert innhenting", s1b: "Opplevelser høstes fortløpende fra kuraterte kilder &mdash; ikke et åpent annonsemarked, men et utvalg av reelle norske tilbydere.", s1src: "kuraterte tilbyderkilder",
+    s2t: "Verifisert tilbyder", s2bPre: "Hver tilbyder kontrolleres mot Brønnøysundregistrene for å bekrefte at det står et ", s2bStrong: "aktivt selskap", s2bPost: " bak opplevelsen.", s2src: "Brønnøysundregistrene (Brreg)",
+    s3t: "Beriket innhold", s3b: "Detaljer berikes fra tilbyderens egen nettside, slik at beskrivelser, varighet og praktisk info blir presise og oppdaterte.", s3src: "tilbyderens egen side",
+    agentsKicker: "For AI-agenter", agentsTitle: "Bygget for å bli spurt av agenter", agentsBody: "Opplevagent eksponerer åpne, maskinlesbare flater etter A2A-protokollen. Agenter kan oppdage tilbudet, lese kontrakten og kjøre intent-søk &mdash; uten skraping.",
+    endpointsAria: "Endepunkter for agenter", codeAria: "Eksempler på agent-kall", codeCmt1: "# message/send &mdash; naturlig språk", codeCmt2: "«hva kan vi finne på i Tromsø i vinter?»",
+    footTagline: "Kuratert markedsplass for norske opplevelser og aktiviteter &mdash; søkbar for mennesker og AI-agenter.", footExplore: "Utforsk", footAgents: "For agenter", footPrivacy: "Personvern", footTerms: "Vilkår", footVerified: "Tilbydere verifisert mot Brønnøysundregistrene",
+  };
+  const en: typeof no = {
+    metaTitle: "Opplevagent — curated marketplace for Norwegian experiences",
+    metaDesc: "Opplevagent is a curated marketplace for Norwegian experiences and activities — whale safaris, treehouses, guided tours, food and more. Searchable for AI agents by place, weather, season and group size.",
+    ogTitle: "Opplevagent — Norwegian experiences, searchable for AI agents",
+    ogImageAlt: "Opplevagent — marketplace for Norwegian experiences",
+    skip: "Skip to main content",
+    brandAria: "Opplevagent home",
+    navAria: "Main navigation",
+    navAll: "All experiences", navCategories: "Categories", navHow: "How it works", navAgents: "For AI agents", navExplore: "Explore",
+    heroPill: "A2A marketplace for Norwegian experiences",
+    heroH1: "What can we do ", heroAccent: "today?",
+    heroSub: "From whale safaris and treehouses to guided mountain hikes, food experiences and laser tag &mdash; a curated overview of Norwegian experiences, built to be discovered and queried by AI agents.",
+    searchAria: "Find experiences", searchLabel: "Describe what you want to do, or type a place", searchPlaceholder: "Search: whale safari, Oslo, food …", searchBtn: "Find experiences",
+    hintPre: "Search by place, category or activity &mdash; or ", hintLink: "browse all experiences", hintPost: ". Agents can call ", hintPost2: " directly.",
+    quickAria: "Quick search", qNature: "Outdoors", qAll: "All experiences",
+    trustAria: "Trust and data sources", trustBrreg: "Providers verified against the Norwegian business registry", trustFresh: "Content updated continuously", trustMachine: "Machine-readable for AI agents",
+    catKicker: "Explore", catTitle: "Experiences by category", catIntro: "Browse curated categories &mdash; or let an AI agent filter by weather, season, price and group size for you.", catAria: "Categories", catCount: "experiences", catSoon: "Coming soon", catNote: "Example categories &mdash; live experiences are published continuously.",
+    howKicker: "Trust model", howTitle: "How it works", howSub: "Curated, verified and enriched &mdash; three steps that set Opplevagent apart from an ordinary listing.",
+    srcLabel: "Source:",
+    s1t: "Curated collection", s1b: "Experiences are gathered continuously from curated sources &mdash; not an open ad market, but a selection of real Norwegian providers.", s1src: "curated provider sources",
+    s2t: "Verified provider", s2bPre: "Each provider is checked against the Norwegian business registry to confirm there's an ", s2bStrong: "active company", s2bPost: " behind the experience.", s2src: "Brønnøysund business registry (Brreg)",
+    s3t: "Enriched content", s3b: "Details are enriched from the provider's own website, so descriptions, duration and practical info are accurate and up to date.", s3src: "the provider's own site",
+    agentsKicker: "For AI agents", agentsTitle: "Built to be queried by agents", agentsBody: "Opplevagent exposes open, machine-readable surfaces following the A2A protocol. Agents can discover the offering, read the contract and run intent searches &mdash; without scraping.",
+    endpointsAria: "Endpoints for agents", codeAria: "Examples of agent calls", codeCmt1: "# message/send &mdash; natural language", codeCmt2: "«what can we do in Tromsø this winter?»",
+    footTagline: "Curated marketplace for Norwegian experiences and activities &mdash; searchable for humans and AI agents.", footExplore: "Explore", footAgents: "For agents", footPrivacy: "Privacy", footTerms: "Terms", footVerified: "Providers verified against the Norwegian business registry",
+  };
+  return lang === "en" ? en : no;
+}
+
 // ═══════════════════════════════════════════════════════════
 // GET / — minimal landing (Opplevagent, NOT the rfb homepage)
 // ═══════════════════════════════════════════════════════════
 
-router.get("/", (_req: Request, res: Response) => {
+router.get("/", (req: Request, res: Response) => {
   const url = baseUrl();
   const year = new Date().getFullYear();
+  const lang: Lang = req.lang === "en" ? "en" : "no";
+  const S = homeStrings(lang);
+  const canonical = lang === "en" ? `${url}/en` : url;
 
   // Categories are read defensively — the page must render perfectly with 0
   // categories (DB not open / no data yet). When empty we show a tasteful set
@@ -136,8 +200,8 @@ router.get("/", (_req: Request, res: Response) => {
     .map((c) => {
       const count =
         !usingFallbackCats && Number.isFinite(c.count) && c.count > 0
-          ? `<span class="cat-count">${c.count} opplevelser</span>`
-          : `<span class="cat-count cat-count-soon">Kommer snart</span>`;
+          ? `<span class="cat-count">${c.count} ${S.catCount}</span>`
+          : `<span class="cat-count cat-count-soon">${S.catSoon}</span>`;
       // Phase 2: human-facing category cards link to the server-rendered
       // /kategori/<x> HTML page (not the raw discover JSON). Pre-data fallback
       // cards point at the index so the grid still leads somewhere sensible.
@@ -155,7 +219,7 @@ router.get("/", (_req: Request, res: Response) => {
     .join("");
 
   const catNote = usingFallbackCats
-    ? `<p class="cat-note">Eksempelkategorier &mdash; live opplevelser publiseres fortløpende.</p>`
+    ? `<p class="cat-note">${S.catNote}</p>`
     : "";
 
   // JSON-LD: WebSite (+ SearchAction wired to the discovery API) and
@@ -168,7 +232,7 @@ router.get("/", (_req: Request, res: Response) => {
       url: url,
       description:
         "Kuratert markedsplass for norske opplevelser og aktiviteter — bygget for å bli oppdaget og spurt av AI-agenter.",
-      inLanguage: "nb-NO",
+      inLanguage: lang === "en" ? "en-US" : "nb-NO",
       potentialAction: {
         "@type": "SearchAction",
         target: {
@@ -195,29 +259,31 @@ router.get("/", (_req: Request, res: Response) => {
     )
     .join("\n");
 
-  const desc =
-    "Opplevagent er en kuratert markedsplass for norske opplevelser og aktiviteter — hvalsafari, trehytter, guidede turer, mat og mer. Søkbar for AI-agenter etter sted, vær, sesong og gruppestørrelse.";
+  const desc = S.metaDesc;
 
   res.setHeader("Content-Type", "text/html; charset=utf-8");
   res.send(`<!doctype html>
-<html lang="nb">
+<html lang="${htmlLangAttr(lang)}">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Opplevagent — Kuratert markedsplass for norske opplevelser</title>
+<title>${escapeHtml(S.metaTitle)}</title>
 <meta name="description" content="${escapeHtml(desc)}">
 <meta name="robots" content="index, follow, max-snippet:-1, max-image-preview:large">
 <meta name="theme-color" content="#0e3c36">
-<link rel="canonical" href="${url}">
+<link rel="canonical" href="${canonical}">
+<link rel="alternate" hreflang="nb" href="${url}">
+<link rel="alternate" hreflang="en" href="${url}/en">
+<link rel="alternate" hreflang="x-default" href="${url}">
 <link rel="icon" type="image/svg+xml" href="/favicon.svg">
-<meta property="og:title" content="Opplevagent — norske opplevelser, søkbart for AI-agenter">
+<meta property="og:title" content="${escapeHtml(S.ogTitle)}">
 <meta property="og:description" content="${escapeHtml(desc)}">
 <meta property="og:type" content="website">
-<meta property="og:url" content="${url}">
-<meta property="og:locale" content="nb_NO">
+<meta property="og:url" content="${canonical}">
+<meta property="og:locale" content="${ogLocale(lang)}">
 <meta property="og:site_name" content="Opplevagent">
 <meta property="og:image" content="${url}/favicon.svg">
-<meta property="og:image:alt" content="Opplevagent — markedsplass for norske opplevelser">
+<meta property="og:image:alt" content="${escapeHtml(S.ogImageAlt)}">
 <meta name="twitter:card" content="summary">
 <meta name="twitter:title" content="Opplevagent">
 <meta name="twitter:description" content="${escapeHtml(desc)}">
@@ -380,17 +446,18 @@ ${ldScripts}
 </style>
 </head>
 <body>
-<a class="skip-link" href="#hovedinnhold">Hopp til hovedinnhold</a>
+<a class="skip-link" href="#hovedinnhold">${S.skip}</a>
 
 <header class="site-nav">
   <div class="nav-inner">
-    <a class="brand" href="/" aria-label="Opplevagent forside">${brandInner("light")}</a>
-    <nav class="nav-links" aria-label="Hovednavigasjon">
-      <a href="/opplevelser">Alle opplevelser</a>
-      <a href="#kategorier">Kategorier</a>
-      <a href="#slik-funker-det">Slik funker det</a>
-      <a href="#for-agenter">For AI-agenter</a>
-      <a class="nav-cta" href="/opplevelser">Utforsk</a>
+    <a class="brand" href="/" aria-label="${S.brandAria}">${brandInner("light")}</a>
+    <nav class="nav-links" aria-label="${S.navAria}">
+      <a href="/opplevelser">${S.navAll}</a>
+      <a href="#kategorier">${S.navCategories}</a>
+      <a href="#slik-funker-det">${S.navHow}</a>
+      <a href="#for-agenter">${S.navAgents}</a>
+      <a class="lang-toggle" href="${lang === "en" ? "/" : "/en"}" hreflang="${lang === "en" ? "nb" : "en"}" aria-label="${lang === "en" ? "Bytt til norsk" : "Switch to English"}" style="border:1px solid var(--line);border-radius:var(--r-pill);padding:5px 11px;font-size:.8rem;font-weight:600;color:var(--ink-soft)">${lang === "en" ? "NO" : "EN"}</a>
+      <a class="nav-cta" href="/opplevelser">${S.navExplore}</a>
     </nav>
   </div>
 </header>
@@ -402,48 +469,48 @@ ${ldScripts}
       <path d="M0 140 L0 116 L210 72 L420 112 L640 70 L900 118 L1150 82 L1440 110 L1440 140 Z" fill="rgba(24,19,13,.65)"/>
     </svg>
     <div class="hero-inner">
-      <span class="eyebrow"><span class="dot"></span> A2A-markedsplass for norske opplevelser</span>
-      <h1 id="hero-title">Hva kan vi finne på <span class="accent">i dag?</span></h1>
-      <p class="hero-sub">Fra hvalsafari og trehytter til guidede fjellturer, matopplevelser og lasertag &mdash; en kuratert oversikt over norske opplevelser, bygget for å bli oppdaget og spurt av AI-agenter.</p>
+      <span class="eyebrow"><span class="dot"></span> ${S.heroPill}</span>
+      <h1 id="hero-title">${S.heroH1}<span class="accent">${S.heroAccent}</span></h1>
+      <p class="hero-sub">${S.heroSub}</p>
 
       <div class="discover">
-        <form class="discover-form" action="/sok" method="GET" role="search" aria-label="Finn opplevelser" id="discover-form">
+        <form class="discover-form" action="/sok" method="GET" role="search" aria-label="${S.searchAria}" id="discover-form">
           <span class="field">
             <svg viewBox="0 0 24 24" width="20" height="20" aria-hidden="true"><circle cx="11" cy="11" r="7" fill="none" stroke="currentColor" stroke-width="2"/><path d="M16.5 16.5 L21 21" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>
-            <label for="discover-q" class="visually-hidden" style="position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0 0 0 0);white-space:nowrap">Beskriv hva du vil finne på, eller skriv et sted</label>
-            <input id="discover-q" name="q" type="search" autocomplete="off" placeholder="Søk: hvalsafari, Oslo, mat …">
+            <label for="discover-q" class="visually-hidden" style="position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0 0 0 0);white-space:nowrap">${S.searchLabel}</label>
+            <input id="discover-q" name="q" type="search" autocomplete="off" placeholder="${S.searchPlaceholder}">
           </span>
-          <button type="submit">Finn opplevelser</button>
+          <button type="submit">${S.searchBtn}</button>
         </form>
-        <p class="discover-hint">Søk på sted, kategori eller aktivitet &mdash; eller <a href="/opplevelser" style="color:#fff;text-decoration:underline">bla i alle opplevelser</a>. Agenter kan kalle <code>GET /api/opplevelser/discover</code> direkte.</p>
-        <div class="quick" role="list" aria-label="Hurtigsøk">
+        <p class="discover-hint">${S.hintPre}<a href="/opplevelser" style="color:#fff;text-decoration:underline">${S.hintLink}</a>${S.hintPost}<code>GET /api/opplevelser/discover</code>${S.hintPost2}</p>
+        <div class="quick" role="list" aria-label="${S.quickAria}">
           <a role="listitem" href="/fylke/Oslo">Oslo</a>
           <a role="listitem" href="/fylke/Troms%20og%20Finnmark">Troms og Finnmark</a>
-          <a role="listitem" href="/sok?q=natur">Ute i naturen</a>
-          <a role="listitem" href="/opplevelser">Alle opplevelser</a>
+          <a role="listitem" href="/sok?q=natur">${S.qNature}</a>
+          <a role="listitem" href="/opplevelser">${S.qAll}</a>
         </div>
       </div>
     </div>
   </section>
 
-  <div class="trust" aria-label="Tillit og datakilder">
+  <div class="trust" aria-label="${S.trustAria}">
     <div class="trust-inner">
-      <span class="trust-item"><svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true"><path d="M12 2 L20 5 V11 C20 16 16.5 20 12 22 C7.5 20 4 16 4 11 V5 Z" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"/><path d="M8.5 12 L11 14.5 L15.5 9.5" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg> Tilbydere verifisert mot Brønnøysundregistrene</span>
+      <span class="trust-item"><svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true"><path d="M12 2 L20 5 V11 C20 16 16.5 20 12 22 C7.5 20 4 16 4 11 V5 Z" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"/><path d="M8.5 12 L11 14.5 L15.5 9.5" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg> ${S.trustBrreg}</span>
       <span class="trust-sep" aria-hidden="true"></span>
-      <span class="trust-item"><svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true"><circle cx="12" cy="12" r="9" fill="none" stroke="currentColor" stroke-width="1.8"/><path d="M12 7 V12 L15.5 14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg> Innhold oppdatert fortløpende</span>
+      <span class="trust-item"><svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true"><circle cx="12" cy="12" r="9" fill="none" stroke="currentColor" stroke-width="1.8"/><path d="M12 7 V12 L15.5 14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg> ${S.trustFresh}</span>
       <span class="trust-sep" aria-hidden="true"></span>
-      <span class="trust-item"><svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true"><rect x="3" y="4" width="18" height="14" rx="2" fill="none" stroke="currentColor" stroke-width="1.8"/><path d="M3 9 H21 M8 14 H13" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg> Maskinlesbar for AI-agenter</span>
+      <span class="trust-item"><svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true"><rect x="3" y="4" width="18" height="14" rx="2" fill="none" stroke="currentColor" stroke-width="1.8"/><path d="M3 9 H21 M8 14 H13" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg> ${S.trustMachine}</span>
     </div>
   </div>
 
   <section class="section" id="kategorier" aria-labelledby="kat-title">
     <div class="container">
       <div class="sec-head">
-        <span class="kicker">Utforsk</span>
-        <h2 id="kat-title">Opplevelser etter kategori</h2>
-        <p>Bla i kuraterte kategorier &mdash; eller la en AI-agent filtrere på vær, sesong, pris og gruppestørrelse for deg.</p>
+        <span class="kicker">${S.catKicker}</span>
+        <h2 id="kat-title">${S.catTitle}</h2>
+        <p>${S.catIntro}</p>
       </div>
-      <div class="cat-grid" role="list" aria-label="Kategorier">
+      <div class="cat-grid" role="list" aria-label="${S.catAria}">
         ${catCards}
       </div>
       ${catNote}
@@ -453,28 +520,28 @@ ${ldScripts}
   <section class="section section-alt" id="slik-funker-det" aria-labelledby="slik-title">
     <div class="container">
       <div class="sec-head center">
-        <span class="kicker">Tillitsmodell</span>
-        <h2 id="slik-title">Slik funker det</h2>
-        <p>Kuratert, verifisert og beriket &mdash; tre steg som skiller Opplevagent fra en vanlig oppføringsliste.</p>
+        <span class="kicker">${S.howKicker}</span>
+        <h2 id="slik-title">${S.howTitle}</h2>
+        <p>${S.howSub}</p>
       </div>
       <div class="steps">
         <div class="step">
           <div class="step-num" aria-hidden="true">1</div>
-          <h3>Kuratert innhenting</h3>
-          <p>Opplevelser høstes fortløpende fra kuraterte kilder &mdash; ikke et åpent annonsemarked, men et utvalg av reelle norske tilbydere.</p>
-          <p class="src">Kilde: <strong>kuraterte tilbyderkilder</strong></p>
+          <h3>${S.s1t}</h3>
+          <p>${S.s1b}</p>
+          <p class="src">${S.srcLabel} <strong>${S.s1src}</strong></p>
         </div>
         <div class="step">
           <div class="step-num" aria-hidden="true">2</div>
-          <h3>Verifisert tilbyder</h3>
-          <p>Hver tilbyder kontrolleres mot Brønnøysundregistrene for å bekrefte at det står et <strong>aktivt selskap</strong> bak opplevelsen.</p>
-          <p class="src">Kilde: <strong>Brønnøysundregistrene (Brreg)</strong></p>
+          <h3>${S.s2t}</h3>
+          <p>${S.s2bPre}<strong>${S.s2bStrong}</strong>${S.s2bPost}</p>
+          <p class="src">${S.srcLabel} <strong>${S.s2src}</strong></p>
         </div>
         <div class="step">
           <div class="step-num" aria-hidden="true">3</div>
-          <h3>Beriket innhold</h3>
-          <p>Detaljer berikes fra tilbyderens egen nettside, slik at beskrivelser, varighet og praktisk info blir presise og oppdaterte.</p>
-          <p class="src">Kilde: <strong>tilbyderens egen side</strong></p>
+          <h3>${S.s3t}</h3>
+          <p>${S.s3b}</p>
+          <p class="src">${S.srcLabel} <strong>${S.s3src}</strong></p>
         </div>
       </div>
     </div>
@@ -485,10 +552,10 @@ ${ldScripts}
       <div class="agents">
         <div class="agents-grid">
           <div>
-            <span class="kicker" style="color:var(--teal-400)">For AI-agenter</span>
-            <h2 id="agent-title">Bygget for å bli spurt av agenter</h2>
-            <p>Opplevagent eksponerer åpne, maskinlesbare flater etter A2A-protokollen. Agenter kan oppdage tilbudet, lese kontrakten og kjøre intent-søk &mdash; uten skraping.</p>
-            <ul class="endpoints" aria-label="Endepunkter for agenter">
+            <span class="kicker" style="color:var(--teal-400)">${S.agentsKicker}</span>
+            <h2 id="agent-title">${S.agentsTitle}</h2>
+            <p>${S.agentsBody}</p>
+            <ul class="endpoints" aria-label="${S.endpointsAria}">
               <li><a href="/.well-known/agent-card.json"><svg viewBox="0 0 24 24" width="15" height="15" aria-hidden="true"><rect x="4" y="3" width="16" height="18" rx="2" fill="none" stroke="currentColor" stroke-width="2"/><path d="M8 8 H16 M8 12 H16 M8 16 H13" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg> Agent Card</a></li>
               <li><a href="/mcp"><svg viewBox="0 0 24 24" width="15" height="15" aria-hidden="true"><circle cx="12" cy="12" r="9" fill="none" stroke="currentColor" stroke-width="2"/><path d="M8 12 H16 M12 8 V16" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg> MCP</a></li>
               <li><a href="/openapi.json"><svg viewBox="0 0 24 24" width="15" height="15" aria-hidden="true"><circle cx="12" cy="12" r="9" fill="none" stroke="currentColor" stroke-width="2"/><path d="M3 12 H21 M12 3 C15 6 15 18 12 21 C9 18 9 6 12 3" fill="none" stroke="currentColor" stroke-width="2"/></svg> OpenAPI 3.1</a></li>
@@ -496,11 +563,11 @@ ${ldScripts}
               <li><a href="/.well-known/agents.txt"><svg viewBox="0 0 24 24" width="15" height="15" aria-hidden="true"><circle cx="9" cy="8" r="3.2" fill="none" stroke="currentColor" stroke-width="2"/><path d="M3.5 20 C3.5 16 6 14 9 14 C12 14 14.5 16 14.5 20 M16 12 L18 14 L22 9" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg> agents.txt</a></li>
             </ul>
           </div>
-          <div class="code-card" aria-label="Eksempler på agent-kall">
+          <div class="code-card" aria-label="${S.codeAria}">
             <span class="c-label">A2A JSON-RPC</span>
             <div><span class="mtd">POST</span> <span class="pth">/a2a</span></div>
-            <div class="cmt"># message/send &mdash; naturlig språk</div>
-            <div class="cmt">«hva kan vi finne på i Tromsø i vinter?»</div>
+            <div class="cmt">${S.codeCmt1}</div>
+            <div class="cmt">${S.codeCmt2}</div>
             <div style="height:14px"></div>
             <span class="c-label">REST discovery</span>
             <div><span class="mtd">GET</span> <span class="pth">/api/opplevelser/discover</span></div>
@@ -516,17 +583,17 @@ ${ldScripts}
 <footer class="site-footer" role="contentinfo">
   <div class="footer-grid">
     <div class="footer-brand">
-      <a class="brand" href="/" aria-label="Opplevagent forside">${brandInner("dark")}</a>
-      <p>Kuratert markedsplass for norske opplevelser og aktiviteter &mdash; søkbar for mennesker og AI-agenter.</p>
+      <a class="brand" href="/" aria-label="${S.brandAria}">${brandInner("dark")}</a>
+      <p>${S.footTagline}</p>
     </div>
     <div class="footer-col">
-      <h4>Utforsk</h4>
-      <a href="/opplevelser">Alle opplevelser</a>
-      <a href="#kategorier">Kategorier</a>
-      <a href="#slik-funker-det">Slik funker det</a>
+      <h4>${S.footExplore}</h4>
+      <a href="/opplevelser">${S.navAll}</a>
+      <a href="#kategorier">${S.navCategories}</a>
+      <a href="#slik-funker-det">${S.navHow}</a>
     </div>
     <div class="footer-col">
-      <h4>For agenter</h4>
+      <h4>${S.footAgents}</h4>
       <a href="/llms.txt"><code>llms.txt</code></a>
       <a href="/.well-known/agent-card.json"><code>agent-card.json</code></a>
       <a href="/mcp"><code>/mcp</code> (MCP)</a>
@@ -535,8 +602,8 @@ ${ldScripts}
     </div>
   </div>
   <div class="footer-bottom">
-    <span>&copy; ${year} Opplevagent &middot; <a href="/personvern" style="color:rgba(255,255,255,.62)">Personvern</a> &middot; <a href="/vilkar" style="color:rgba(255,255,255,.62)">Vilkår</a></span>
-    <span class="verified"><svg viewBox="0 0 24 24" width="15" height="15" aria-hidden="true"><path d="M12 2 L20 5 V11 C20 16 16.5 20 12 22 C7.5 20 4 16 4 11 V5 Z" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"/><path d="M8.5 12 L11 14.5 L15.5 9.5" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg> Tilbydere verifisert mot Brønnøysundregistrene</span>
+    <span>&copy; ${year} Opplevagent &middot; <a href="/personvern" style="color:rgba(255,255,255,.62)">${S.footPrivacy}</a> &middot; <a href="/vilkar" style="color:rgba(255,255,255,.62)">${S.footTerms}</a></span>
+    <span class="verified"><svg viewBox="0 0 24 24" width="15" height="15" aria-hidden="true"><path d="M12 2 L20 5 V11 C20 16 16.5 20 12 22 C7.5 20 4 16 4 11 V5 Z" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"/><path d="M8.5 12 L11 14.5 L15.5 9.5" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg> ${S.footVerified}</span>
   </div>
 </footer>
 
@@ -616,6 +683,7 @@ router.get("/sitemap.xml", (_req: Request, res: Response) => {
   res.setHeader("Content-Type", "application/xml; charset=utf-8");
   const paths: Array<{ p: string; freq: string; pri: string }> = [
     { p: "/", freq: "daily", pri: "1.0" },
+    { p: "/en", freq: "daily", pri: "0.9" },
     { p: "/opplevelser", freq: "daily", pri: "0.9" },
     { p: "/llms.txt", freq: "weekly", pri: "0.8" },
     { p: "/openapi.json", freq: "weekly", pri: "0.7" },
