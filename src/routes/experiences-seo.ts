@@ -653,6 +653,12 @@ router.get("/sitemap.xml", (_req: Request, res: Response) => {
     }
   } catch { /* experiences DB not open */ }
   try {
+    // Back-fill slugs for any providers added since the last /tilbyder/ request.
+    // backfillProviderSlugs() is idempotent (WHERE slug IS NULL — fast no-op when
+    // all providers already have slugs), so calling it here is safe on every
+    // sitemap request. We call it directly (not via ensureProviderSlugs()) so the
+    // one-shot flag does not prevent re-checking for newly-inserted slugless rows.
+    try { backfillProviderSlugs(); } catch { /* DB not yet open */ }
     for (const row of listPublishedProviders()) {
       if (!row.id) continue;
       const tilbyderSeg = row.slug ? encodeURIComponent(row.slug) : encodeURIComponent(row.id);

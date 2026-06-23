@@ -20605,3 +20605,107 @@ console.log("\n── site-quality: tilbyder slug URLs (sq-slug) ──");
   delete require.cache[expSeoPathSL];
   console.log("  sq-slug: OK (7 tests: slug-200/301-uuid/404/sitemap-no-uuid/detail-link/host-isolation)");
 })();
+
+// ── site-quality: sitemap cold-start provider slug backfill (sq-sitemap-cold) ──
+// Regression guard: new provider inserted with slug=NULL; sitemap.xml is hit
+// BEFORE any /tilbyder/ request (which would trigger the cached ensureProviderSlugs).
+// Old code: sitemap emits UUID URL. Fixed code: sitemap calls backfillProviderSlugs()
+// directly (bypassing the one-shot flag) so newly-slugless providers get slugs first.
+console.log("\n── site-quality: sitemap cold-start slug backfill (sq-sitemap-cold) ──");
+(() => {
+  const prevPathCS = process.env.EXPERIENCES_DB_PATH;
+  process.env.EXPERIENCES_DB_PATH = ":memory:";
+
+  const dbFacPathCS = require.resolve("../src/database/db-factory");
+  const expStPathCS = require.resolve("../src/services/experience-store");
+  const expSeoPathCS = require.resolve("../src/routes/experiences-seo");
+  delete require.cache[dbFacPathCS];
+  delete require.cache[expStPathCS];
+  delete require.cache[expSeoPathCS];
+
+  const dbFacCS = require("../src/database/db-factory") as typeof import("../src/database/db-factory");
+  dbFacCS.__resetDbFactoryForTesting();
+  const expStCS = require("../src/services/experience-store") as typeof import("../src/services/experience-store");
+  const seoRouterCS = (require("../src/routes/experiences-seo") as typeof import("../src/routes/experiences-seo")).default as any;
+
+  // Seed: provider inserted WITHOUT calling backfillProviderSlugs() — simulates a
+  // newly-enriched provider that arrived after the server's one-shot backfill ran.
+  dbFacCS.getDb("experiences");
+  const provIdCS = expStCS.createProvider({
+    navn: "Hardanger Fjordsafari AS", org_nr: "912000333",
+    fylke: "Vestland", kommune: "Ulvik", hjemmeside: "https://example-hf.no",
+    brreg_verified: 1, brreg_active: 1, verification_status: "verified",
+  });
+  expStCS.createExperience({
+    title: "Fjordsafari på Hardangerfjorden", provider_id: provIdCS,
+    provider_match_status: "matched", category: "natur_friluft",
+    fylke: "Vestland", kommune: "Ulvik", indoor_outdoor: "outdoor",
+    season: ["summer"], confidence: "high", verification_status: "verified",
+  });
+
+  // Confirm provider has NO slug yet (cold state — backfill not yet called).
+  const rawRow = (dbFacCS.getDb("experiences") as any)
+    .prepare("SELECT slug FROM experience_providers WHERE id = ?")
+    .get(provIdCS) as any;
+  assertTrue(
+    rawRow.slug === null || rawRow.slug === "" || rawRow.slug === undefined,
+    "sq-sitemap-cold-00: provider starts with no slug (cold state)"
+  );
+
+  // Invoke /sitemap.xml FIRST — no /tilbyder/ hit, no ensureProviderSlugs() called.
+  function invokeSeoCS(routePath: string, params: Record<string, string>, reqPath: string) {
+    const layer = (seoRouterCS.stack as any[]).find(
+      (l: any) => l.route && l.route.path === routePath && l.route.methods?.get
+    );
+    assertTrue(!!layer, `sq-sitemap-cold: router has GET ${routePath}`);
+    let status = 200; let body = "";
+    const res: any = {
+      statusCode: 200,
+      setHeader: (_k: string, _v: string) => {},
+      status: (c: number) => { status = c; return res; },
+      send: (b: unknown) => { body = typeof b === "string" ? b : String(b); return res; },
+      json: (o: unknown) => { body = JSON.stringify(o); return res; },
+      redirect: (code: number, _loc: string) => { status = code; },
+    };
+    const req: any = { path: reqPath, hostname: "opplevagent.no", params, query: {} };
+    const handler = layer.route.stack[layer.route.stack.length - 1].handle;
+    let nexted = false;
+    handler(req, res, () => { nexted = true; });
+    if (nexted) status = 404;
+    return { status, body };
+  }
+
+  const smCS = invokeSeoCS("/sitemap.xml", {}, "/sitemap.xml");
+  assertEq(smCS.status, 200, "sq-sitemap-cold-01a: sitemap.xml → 200");
+
+  // After the sitemap request the provider slug must now be set in the DB
+  // (backfillProviderSlugs() ran inside the sitemap route handler).
+  const provAfterCS = (dbFacCS.getDb("experiences") as any)
+    .prepare("SELECT slug FROM experience_providers WHERE id = ?")
+    .get(provIdCS) as any;
+  const slugCS = (provAfterCS?.slug ?? "") as string;
+  assertTrue(
+    typeof slugCS === "string" && slugCS.length > 0,
+    "sq-sitemap-cold-01b: backfill ran inside sitemap — provider now has a slug"
+  );
+  assertTrue(
+    slugCS.startsWith("hardanger-fjordsafari-as--"),
+    "sq-sitemap-cold-01c: slug is derived from provider navn"
+  );
+
+  // Sitemap must contain slug URL, NOT raw UUID.
+  assertTrue(
+    smCS.body.includes(`/tilbyder/${slugCS}`),
+    "sq-sitemap-cold-01d: sitemap emits slug-based tilbyder URL"
+  );
+  assertTrue(
+    !smCS.body.includes(`/tilbyder/${provIdCS}`),
+    "sq-sitemap-cold-01e: sitemap does NOT emit UUID-based tilbyder URL"
+  );
+
+  process.env.EXPERIENCES_DB_PATH = prevPathCS;
+  delete require.cache[dbFacPathCS];
+  delete require.cache[expStPathCS];
+  delete require.cache[expSeoPathCS];
+  console.log("  sq-sitemap-cold: OK (5 tests: cold-no-slug/backfill-ran/slug-derived/sitemap-slug/sitemap-no-uuid)");
+})();
