@@ -26,6 +26,7 @@
 import { Router, Request, Response, NextFunction } from "express";
 import { getExperiencesAgentCard } from "../services/experiences-agent-card";
 import { getExperiencesOpenapi } from "../services/experiences-openapi";
+import { htmlLangAttr, ogLocale, type Lang } from "../i18n/t";
 import {
   listCategories,
   getPublishedExperienceBySlug,
@@ -75,6 +76,19 @@ function escapeHtml(text: unknown): string {
 
 // Categories are read lazily + defensively — if the experiences DB isn't
 // open (flag off in some context) we just render the landing without them.
+// «Konstellasjon» brand mark (logo spec, Konsept 02): three agent nodes + a coral
+// spark = the perfect match found. Light variant for cream surfaces, dark variant
+// lightens the earth tones for dark surfaces (footer/hero).
+function brandMarkSvg(variant: "light" | "dark" = "light"): string {
+  const olive = variant === "dark" ? "#a7b56e" : "#6f7a4f";
+  const gold = variant === "dark" ? "#e0a43b" : "#c98a2b";
+  const op = variant === "dark" ? "0.55" : "0.45";
+  return `<svg viewBox="0 0 52 48" width="35" height="32" fill="none" aria-hidden="true" focusable="false"><path d="M9 33 L24 11 L43 19 L31 38 Z" fill="none" stroke="#12a594" stroke-width="2" stroke-linejoin="round" opacity="${op}"/><circle cx="9" cy="33" r="4" fill="#12a594"/><circle cx="43" cy="19" r="4" fill="${olive}"/><circle cx="31" cy="38" r="4" fill="${gold}"/><path d="M24 3 C25.1 8.9 26.9 10.7 32.8 11.8 C26.9 12.9 25.1 14.7 24 20.6 C22.9 14.7 21.1 12.9 15.2 11.8 C21.1 10.7 22.9 8.9 24 3 Z" fill="#ff5d3b"/></svg>`;
+}
+function brandInner(variant: "light" | "dark" = "light"): string {
+  return `<span class="mark" aria-hidden="true">${brandMarkSvg(variant)}</span><span class="brand-word">opplevagent<span class="tld">.no</span></span>`;
+}
+
 function safeCategories(): Array<{ category: string; count: number }> {
   try {
     return listCategories();
@@ -83,13 +97,76 @@ function safeCategories(): Array<{ category: string; count: number }> {
   }
 }
 
+// ─────────────────────────────────────────────────────────────
+// Homepage UI strings (NO/EN). Phase-1 i18n: only the landing page
+// is genuinely bilingual; browse/detail stay NO-canonical for now.
+// ─────────────────────────────────────────────────────────────
+function homeStrings(lang: Lang) {
+  const no = {
+    metaTitle: "Opplevagent — Kuratert markedsplass for norske opplevelser",
+    metaDesc: "Opplevagent er en kuratert markedsplass for norske opplevelser og aktiviteter — hvalsafari, trehytter, guidede turer, mat og mer. Søkbar for AI-agenter etter sted, vær, sesong og gruppestørrelse.",
+    ogTitle: "Opplevagent — norske opplevelser, søkbart for AI-agenter",
+    ogImageAlt: "Opplevagent — markedsplass for norske opplevelser",
+    skip: "Hopp til hovedinnhold",
+    brandAria: "Opplevagent forside",
+    navAria: "Hovednavigasjon",
+    navAll: "Alle opplevelser", navCategories: "Kategorier", navHow: "Slik funker det", navAgents: "For AI-agenter", navExplore: "Utforsk",
+    heroPill: "A2A-markedsplass for norske opplevelser",
+    heroH1: "Hva kan vi finne på ", heroAccent: "i dag?",
+    heroSub: "Fra hvalsafari og trehytter til guidede fjellturer, matopplevelser og lasertag &mdash; en kuratert oversikt over norske opplevelser, bygget for å bli oppdaget og spurt av AI-agenter.",
+    searchAria: "Finn opplevelser", searchLabel: "Beskriv hva du vil finne på, eller skriv et sted", searchPlaceholder: "Søk: hvalsafari, Oslo, mat …", searchBtn: "Finn opplevelser",
+    hintPre: "Søk på sted, kategori eller aktivitet &mdash; eller ", hintLink: "bla i alle opplevelser", hintPost: ". Agenter kan kalle ", hintPost2: " direkte.",
+    quickAria: "Hurtigsøk", qNature: "Ute i naturen", qAll: "Alle opplevelser",
+    trustAria: "Tillit og datakilder", trustBrreg: "Tilbydere verifisert mot Brønnøysundregistrene", trustFresh: "Innhold oppdatert fortløpende", trustMachine: "Maskinlesbar for AI-agenter",
+    catKicker: "Utforsk", catTitle: "Opplevelser etter kategori", catIntro: "Bla i kuraterte kategorier &mdash; eller la en AI-agent filtrere på vær, sesong, pris og gruppestørrelse for deg.", catAria: "Kategorier", catCount: "opplevelser", catSoon: "Kommer snart", catNote: "Eksempelkategorier &mdash; live opplevelser publiseres fortløpende.",
+    howKicker: "Tillitsmodell", howTitle: "Slik funker det", howSub: "Kuratert, verifisert og beriket &mdash; tre steg som skiller Opplevagent fra en vanlig oppføringsliste.",
+    srcLabel: "Kilde:",
+    s1t: "Kuratert innhenting", s1b: "Opplevelser høstes fortløpende fra kuraterte kilder &mdash; ikke et åpent annonsemarked, men et utvalg av reelle norske tilbydere.", s1src: "kuraterte tilbyderkilder",
+    s2t: "Verifisert tilbyder", s2bPre: "Hver tilbyder kontrolleres mot Brønnøysundregistrene for å bekrefte at det står et ", s2bStrong: "aktivt selskap", s2bPost: " bak opplevelsen.", s2src: "Brønnøysundregistrene (Brreg)",
+    s3t: "Beriket innhold", s3b: "Detaljer berikes fra tilbyderens egen nettside, slik at beskrivelser, varighet og praktisk info blir presise og oppdaterte.", s3src: "tilbyderens egen side",
+    agentsKicker: "For AI-agenter", agentsTitle: "Bygget for å bli spurt av agenter", agentsBody: "Opplevagent eksponerer åpne, maskinlesbare flater etter A2A-protokollen. Agenter kan oppdage tilbudet, lese kontrakten og kjøre intent-søk &mdash; uten skraping.",
+    endpointsAria: "Endepunkter for agenter", codeAria: "Eksempler på agent-kall", codeCmt1: "# message/send &mdash; naturlig språk", codeCmt2: "«hva kan vi finne på i Tromsø i vinter?»",
+    footTagline: "Kuratert markedsplass for norske opplevelser og aktiviteter &mdash; søkbar for mennesker og AI-agenter.", footExplore: "Utforsk", footAgents: "For agenter", footPrivacy: "Personvern", footTerms: "Vilkår", footVerified: "Tilbydere verifisert mot Brønnøysundregistrene",
+  };
+  const en: typeof no = {
+    metaTitle: "Opplevagent — curated marketplace for Norwegian experiences",
+    metaDesc: "Opplevagent is a curated marketplace for Norwegian experiences and activities — whale safaris, treehouses, guided tours, food and more. Searchable for AI agents by place, weather, season and group size.",
+    ogTitle: "Opplevagent — Norwegian experiences, searchable for AI agents",
+    ogImageAlt: "Opplevagent — marketplace for Norwegian experiences",
+    skip: "Skip to main content",
+    brandAria: "Opplevagent home",
+    navAria: "Main navigation",
+    navAll: "All experiences", navCategories: "Categories", navHow: "How it works", navAgents: "For AI agents", navExplore: "Explore",
+    heroPill: "A2A marketplace for Norwegian experiences",
+    heroH1: "What can we do ", heroAccent: "today?",
+    heroSub: "From whale safaris and treehouses to guided mountain hikes, food experiences and laser tag &mdash; a curated overview of Norwegian experiences, built to be discovered and queried by AI agents.",
+    searchAria: "Find experiences", searchLabel: "Describe what you want to do, or type a place", searchPlaceholder: "Search: whale safari, Oslo, food …", searchBtn: "Find experiences",
+    hintPre: "Search by place, category or activity &mdash; or ", hintLink: "browse all experiences", hintPost: ". Agents can call ", hintPost2: " directly.",
+    quickAria: "Quick search", qNature: "Outdoors", qAll: "All experiences",
+    trustAria: "Trust and data sources", trustBrreg: "Providers verified against the Norwegian business registry", trustFresh: "Content updated continuously", trustMachine: "Machine-readable for AI agents",
+    catKicker: "Explore", catTitle: "Experiences by category", catIntro: "Browse curated categories &mdash; or let an AI agent filter by weather, season, price and group size for you.", catAria: "Categories", catCount: "experiences", catSoon: "Coming soon", catNote: "Example categories &mdash; live experiences are published continuously.",
+    howKicker: "Trust model", howTitle: "How it works", howSub: "Curated, verified and enriched &mdash; three steps that set Opplevagent apart from an ordinary listing.",
+    srcLabel: "Source:",
+    s1t: "Curated collection", s1b: "Experiences are gathered continuously from curated sources &mdash; not an open ad market, but a selection of real Norwegian providers.", s1src: "curated provider sources",
+    s2t: "Verified provider", s2bPre: "Each provider is checked against the Norwegian business registry to confirm there's an ", s2bStrong: "active company", s2bPost: " behind the experience.", s2src: "Brønnøysund business registry (Brreg)",
+    s3t: "Enriched content", s3b: "Details are enriched from the provider's own website, so descriptions, duration and practical info are accurate and up to date.", s3src: "the provider's own site",
+    agentsKicker: "For AI agents", agentsTitle: "Built to be queried by agents", agentsBody: "Opplevagent exposes open, machine-readable surfaces following the A2A protocol. Agents can discover the offering, read the contract and run intent searches &mdash; without scraping.",
+    endpointsAria: "Endpoints for agents", codeAria: "Examples of agent calls", codeCmt1: "# message/send &mdash; natural language", codeCmt2: "«what can we do in Tromsø this winter?»",
+    footTagline: "Curated marketplace for Norwegian experiences and activities &mdash; searchable for humans and AI agents.", footExplore: "Explore", footAgents: "For agents", footPrivacy: "Privacy", footTerms: "Terms", footVerified: "Providers verified against the Norwegian business registry",
+  };
+  return lang === "en" ? en : no;
+}
+
 // ═══════════════════════════════════════════════════════════
 // GET / — minimal landing (Opplevagent, NOT the rfb homepage)
 // ═══════════════════════════════════════════════════════════
 
-router.get("/", (_req: Request, res: Response) => {
+router.get("/", (req: Request, res: Response) => {
   const url = baseUrl();
   const year = new Date().getFullYear();
+  const lang: Lang = req.lang === "en" ? "en" : "no";
+  const S = homeStrings(lang);
+  const canonical = lang === "en" ? `${url}/en` : url;
 
   // Categories are read defensively — the page must render perfectly with 0
   // categories (DB not open / no data yet). When empty we show a tasteful set
@@ -134,8 +211,8 @@ router.get("/", (_req: Request, res: Response) => {
     .map((c) => {
       const count =
         !usingFallbackCats && Number.isFinite(c.count) && c.count > 0
-          ? `<span class="cat-count">${c.count} opplevelser</span>`
-          : `<span class="cat-count cat-count-soon">Kommer snart</span>`;
+          ? `<span class="cat-count">${c.count} ${S.catCount}</span>`
+          : `<span class="cat-count cat-count-soon">${S.catSoon}</span>`;
       // Phase 2: human-facing category cards link to the server-rendered
       // /kategori/<x> HTML page (not the raw discover JSON). Pre-data fallback
       // cards point at the index so the grid still leads somewhere sensible.
@@ -153,7 +230,7 @@ router.get("/", (_req: Request, res: Response) => {
     .join("");
 
   const catNote = usingFallbackCats
-    ? `<p class="cat-note">Eksempelkategorier &mdash; live opplevelser publiseres fortløpende.</p>`
+    ? `<p class="cat-note">${S.catNote}</p>`
     : "";
 
   // JSON-LD: WebSite (+ SearchAction wired to the discovery API) and
@@ -166,7 +243,7 @@ router.get("/", (_req: Request, res: Response) => {
       url: url,
       description:
         "Kuratert markedsplass for norske opplevelser og aktiviteter — bygget for å bli oppdaget og spurt av AI-agenter.",
-      inLanguage: "nb-NO",
+      inLanguage: lang === "en" ? "en-US" : "nb-NO",
       potentialAction: {
         "@type": "SearchAction",
         target: {
@@ -193,46 +270,50 @@ router.get("/", (_req: Request, res: Response) => {
     )
     .join("\n");
 
-  const desc =
-    "Opplevagent er en kuratert markedsplass for norske opplevelser og aktiviteter — hvalsafari, trehytter, guidede turer, mat og mer. Søkbar for AI-agenter etter sted, vær, sesong og gruppestørrelse.";
+  const desc = S.metaDesc;
 
   res.setHeader("Content-Type", "text/html; charset=utf-8");
   res.send(`<!doctype html>
-<html lang="nb">
+<html lang="${htmlLangAttr(lang)}">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Opplevagent — Kuratert markedsplass for norske opplevelser</title>
+<title>${escapeHtml(S.metaTitle)}</title>
 <meta name="description" content="${escapeHtml(desc)}">
 <meta name="robots" content="index, follow, max-snippet:-1, max-image-preview:large">
-<meta name="theme-color" content="#0b3d2e">
-<link rel="canonical" href="${url}">
+<meta name="theme-color" content="#0e3c36">
+<link rel="canonical" href="${canonical}">
+<link rel="alternate" hreflang="nb" href="${url}">
+<link rel="alternate" hreflang="en" href="${url}/en">
+<link rel="alternate" hreflang="x-default" href="${url}">
 <link rel="icon" type="image/svg+xml" href="/favicon.svg">
-<meta property="og:title" content="Opplevagent — norske opplevelser, søkbart for AI-agenter">
+<meta property="og:title" content="${escapeHtml(S.ogTitle)}">
 <meta property="og:description" content="${escapeHtml(desc)}">
 <meta property="og:type" content="website">
-<meta property="og:url" content="${url}">
-<meta property="og:locale" content="nb_NO">
+<meta property="og:url" content="${canonical}">
+<meta property="og:locale" content="${ogLocale(lang)}">
 <meta property="og:site_name" content="Opplevagent">
 <meta property="og:image" content="${url}/favicon.svg">
-<meta property="og:image:alt" content="Opplevagent — markedsplass for norske opplevelser">
+<meta property="og:image:alt" content="${escapeHtml(S.ogImageAlt)}">
 <meta name="twitter:card" content="summary">
 <meta name="twitter:title" content="Opplevagent">
 <meta name="twitter:description" content="${escapeHtml(desc)}">
 <meta name="twitter:image" content="${url}/favicon.svg">
 ${ldScripts}
 <style>
+  @import url('https://fonts.googleapis.com/css2?family=Outfit:wght@500;600;700&display=swap');
   *{margin:0;padding:0;box-sizing:border-box}
   :root{
-    --fjord-900:#072a20;--fjord-800:#0b3d2e;--fjord-700:#0f5132;--fjord-600:#147a4d;
-    --teal-500:#14b8a6;--teal-400:#2dd4bf;
-    --amber-500:#f59e0b;--amber-400:#fbbf24;--coral-500:#ff7a45;
-    --ink:#10231b;--ink-soft:#3c5249;--mist:#6b8178;
-    --surface:#ffffff;--canvas:#f4f8f4;--canvas-2:#eaf2ec;--line:#dde9e0;
+    --fjord-900:#0b2e29;--fjord-800:#0e3c36;--fjord-700:#0f5a50;--fjord-600:#0c7264;
+    --font-brand:'Outfit',-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;--olive:#6f7a4f;--gold:#c98a2b;
+    --teal-500:#12a594;--teal-400:#3cc3b4;
+    --amber-500:#ff5d3b;--amber-400:#ff8566;--coral-500:#ff5d3b;
+    --ink:#18130d;--ink-soft:#544a3e;--mist:#7a7163;
+    --surface:#ffffff;--canvas:#f7f4ee;--canvas-2:#efe9dd;--line:#e4ded0;
     --r-sm:8px;--r-md:14px;--r-lg:22px;--r-pill:999px;
-    --sh-sm:0 1px 2px rgba(7,42,32,.06),0 2px 6px rgba(7,42,32,.05);
-    --sh-md:0 6px 18px rgba(7,42,32,.10);
-    --sh-lg:0 18px 48px rgba(7,42,32,.22);
+    --sh-sm:0 1px 2px rgba(24,19,13,.06),0 2px 6px rgba(24,19,13,.05);
+    --sh-md:0 6px 18px rgba(24,19,13,.10);
+    --sh-lg:0 18px 48px rgba(24,19,13,.22);
     --maxw:1120px;
   }
   html{scroll-behavior:smooth}
@@ -252,8 +333,10 @@ ${ldScripts}
   @media(max-width:560px){.nav-inner{padding:0 16px}}
   .brand{display:flex;align-items:center;gap:10px;font-weight:800;font-size:1.16rem;letter-spacing:-.02em;color:var(--fjord-800);text-decoration:none}
   .brand:hover{text-decoration:none}
-  .brand .mark{width:34px;height:34px;flex:0 0 34px;border-radius:10px;background:linear-gradient(150deg,var(--fjord-700),var(--teal-500));display:flex;align-items:center;justify-content:center;box-shadow:var(--sh-sm)}
-  .brand .mark svg{color:#fff}
+  .brand-word{font-family:var(--font-brand);font-weight:600;font-size:1.3rem;letter-spacing:-.015em;text-transform:lowercase;line-height:1;color:var(--ink)}
+  .brand-word .tld{color:var(--fjord-600)}
+  .brand .mark{display:flex;align-items:center;justify-content:center}
+  .brand .mark svg{display:block}
   .nav-links{display:flex;gap:26px;align-items:center}
   .nav-links a{font-size:.88rem;font-weight:600;color:var(--ink-soft)}
   .nav-links a:hover{color:var(--fjord-700)}
@@ -262,14 +345,14 @@ ${ldScripts}
   @media(max-width:760px){.nav-links a:not(.nav-cta){display:none}}
 
   /* ── HERO ── */
-  .hero{position:relative;overflow:hidden;color:#fff;background:linear-gradient(135deg,#072a20 0%,#0f5132 38%,#147a4d 60%,#1f9e6b 78%,#f59e0b 130%)}
-  .hero::before{content:"";position:absolute;inset:0;background:radial-gradient(120% 90% at 18% 8%,rgba(45,212,191,.30),transparent 55%),radial-gradient(90% 80% at 92% 18%,rgba(245,158,11,.28),transparent 60%);pointer-events:none}
+  .hero{position:relative;overflow:hidden;color:#fff;background:linear-gradient(135deg,#0b2e29 0%,#0e3c36 34%,#0f5a50 56%,#12a594 82%,#ff5d3b 136%)}
+  .hero::before{content:"";position:absolute;inset:0;background:radial-gradient(120% 90% at 18% 8%,rgba(60,195,180,.30),transparent 55%),radial-gradient(90% 80% at 92% 18%,rgba(255,93,59,.28),transparent 60%);pointer-events:none}
   .hero-range{position:absolute;left:0;right:0;bottom:-1px;height:140px;opacity:.55;pointer-events:none}
   .hero-inner{position:relative;max-width:920px;margin:0 auto;padding:84px 24px 104px;text-align:center;z-index:1}
   @media(max-width:560px){.hero-inner{padding:60px 16px 96px}}
   .eyebrow{display:inline-flex;align-items:center;gap:8px;padding:6px 14px;border-radius:var(--r-pill);background:rgba(255,255,255,.14);border:1px solid rgba(255,255,255,.22);font-size:.78rem;font-weight:600;letter-spacing:.02em;margin-bottom:22px;backdrop-filter:blur(4px)}
-  .eyebrow .dot{width:7px;height:7px;border-radius:50%;background:var(--amber-400);box-shadow:0 0 0 4px rgba(251,191,36,.25)}
-  .hero h1{font-size:clamp(2rem,5.2vw,3.4rem);font-weight:800;letter-spacing:-.035em;line-height:1.08;margin-bottom:18px;text-shadow:0 2px 30px rgba(7,42,32,.25)}
+  .eyebrow .dot{width:7px;height:7px;border-radius:50%;background:var(--amber-400);box-shadow:0 0 0 4px rgba(255,133,102,.25)}
+  .hero h1{font-size:clamp(2rem,5.2vw,3.4rem);font-weight:800;letter-spacing:-.035em;line-height:1.08;margin-bottom:18px;text-shadow:0 2px 30px rgba(24,19,13,.25)}
   .hero h1 .accent{background:linear-gradient(100deg,var(--amber-400),var(--coral-500));-webkit-background-clip:text;background-clip:text;color:transparent}
   .hero-sub{font-size:clamp(1.02rem,2.1vw,1.22rem);max-width:620px;margin:0 auto 34px;color:rgba(255,255,255,.92)}
 
@@ -280,8 +363,8 @@ ${ldScripts}
   .discover-form .field svg{color:var(--mist);flex:0 0 20px}
   .discover-form input{flex:1;border:none;outline:none;font-size:1.02rem;color:var(--ink);background:transparent;padding:14px 4px;min-width:0}
   .discover-form input::placeholder{color:#90a399}
-  .discover-form button{flex:0 0 auto;border:none;cursor:pointer;background:linear-gradient(135deg,var(--amber-500),var(--coral-500));color:#fff;font-weight:800;font-size:.96rem;padding:14px 26px;border-radius:var(--r-pill);box-shadow:0 4px 14px rgba(245,158,11,.4);transition:transform .12s ease,box-shadow .12s ease}
-  .discover-form button:hover{transform:translateY(-1px);box-shadow:0 6px 18px rgba(245,158,11,.5)}
+  .discover-form button{flex:0 0 auto;border:none;cursor:pointer;background:linear-gradient(135deg,var(--amber-500),var(--coral-500));color:#fff;font-weight:800;font-size:.96rem;padding:14px 26px;border-radius:var(--r-pill);box-shadow:0 4px 14px rgba(255,93,59,.4);transition:transform .12s ease,box-shadow .12s ease}
+  .discover-form button:hover{transform:translateY(-1px);box-shadow:0 6px 18px rgba(255,93,59,.5)}
   .discover-form button:active{transform:translateY(0)}
   @media(max-width:520px){
     .discover-form{flex-direction:column;border-radius:var(--r-lg);padding:10px;gap:8px;align-items:stretch}
@@ -341,7 +424,7 @@ ${ldScripts}
 
   /* agents callout */
   .agents{position:relative;overflow:hidden;background:linear-gradient(140deg,#082c21,#0f5132 70%,#146a45);color:#fff;border-radius:var(--r-lg);padding:44px 40px;box-shadow:var(--sh-md)}
-  .agents::before{content:"";position:absolute;inset:0;background:radial-gradient(80% 120% at 100% 0%,rgba(45,212,191,.22),transparent 55%);pointer-events:none}
+  .agents::before{content:"";position:absolute;inset:0;background:radial-gradient(80% 120% at 100% 0%,rgba(60,195,180,.22),transparent 55%);pointer-events:none}
   .agents-grid{position:relative;display:grid;grid-template-columns:1.05fr 1fr;gap:34px;align-items:center}
   @media(max-width:820px){.agents{padding:32px 24px}.agents-grid{grid-template-columns:1fr;gap:24px}}
   .agents h2{font-size:clamp(1.45rem,3vw,2rem);font-weight:800;letter-spacing:-.02em;margin-bottom:12px}
@@ -374,22 +457,18 @@ ${ldScripts}
 </style>
 </head>
 <body>
-<a class="skip-link" href="#hovedinnhold">Hopp til hovedinnhold</a>
+<a class="skip-link" href="#hovedinnhold">${S.skip}</a>
 
 <header class="site-nav">
   <div class="nav-inner">
-    <a class="brand" href="/" aria-label="Opplevagent forside">
-      <span class="mark" aria-hidden="true">
-        <svg viewBox="0 0 24 24" width="20" height="20"><path d="M2 19 L8.5 7 L13 14.5 L16 10 L22 19 Z" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"/><circle cx="18" cy="6" r="2.4" fill="currentColor"/></svg>
-      </span>
-      Opplevagent
-    </a>
-    <nav class="nav-links" aria-label="Hovednavigasjon">
-      <a href="/opplevelser">Alle opplevelser</a>
-      <a href="#kategorier">Kategorier</a>
-      <a href="#slik-funker-det">Slik funker det</a>
-      <a href="#for-agenter">For AI-agenter</a>
-      <a class="nav-cta" href="/opplevelser">Utforsk</a>
+    <a class="brand" href="/" aria-label="${S.brandAria}">${brandInner("light")}</a>
+    <nav class="nav-links" aria-label="${S.navAria}">
+      <a href="/opplevelser">${S.navAll}</a>
+      <a href="#kategorier">${S.navCategories}</a>
+      <a href="#slik-funker-det">${S.navHow}</a>
+      <a href="#for-agenter">${S.navAgents}</a>
+      <a class="lang-toggle" href="${lang === "en" ? "/" : "/en"}" hreflang="${lang === "en" ? "nb" : "en"}" aria-label="${lang === "en" ? "Bytt til norsk" : "Switch to English"}" style="border:1px solid var(--line);border-radius:var(--r-pill);padding:5px 11px;font-size:.8rem;font-weight:600;color:var(--ink-soft)">${lang === "en" ? "NO" : "EN"}</a>
+      <a class="nav-cta" href="/opplevelser">${S.navExplore}</a>
     </nav>
   </div>
 </header>
@@ -397,52 +476,52 @@ ${ldScripts}
 <main id="hovedinnhold">
   <section class="hero" aria-labelledby="hero-title">
     <svg class="hero-range" viewBox="0 0 1440 140" preserveAspectRatio="none" aria-hidden="true">
-      <path d="M0 140 L0 96 L150 40 L300 92 L470 24 L640 88 L820 36 L1010 96 L1200 48 L1340 90 L1440 60 L1440 140 Z" fill="rgba(7,42,32,.45)"/>
-      <path d="M0 140 L0 116 L210 72 L420 112 L640 70 L900 118 L1150 82 L1440 110 L1440 140 Z" fill="rgba(7,42,32,.65)"/>
+      <path d="M0 140 L0 96 L150 40 L300 92 L470 24 L640 88 L820 36 L1010 96 L1200 48 L1340 90 L1440 60 L1440 140 Z" fill="rgba(24,19,13,.45)"/>
+      <path d="M0 140 L0 116 L210 72 L420 112 L640 70 L900 118 L1150 82 L1440 110 L1440 140 Z" fill="rgba(24,19,13,.65)"/>
     </svg>
     <div class="hero-inner">
-      <span class="eyebrow"><span class="dot"></span> A2A-markedsplass for norske opplevelser</span>
-      <h1 id="hero-title">Hva kan vi finne på <span class="accent">i dag?</span></h1>
-      <p class="hero-sub">Fra hvalsafari og trehytter til guidede fjellturer, matopplevelser og lasertag &mdash; en kuratert oversikt over norske opplevelser, bygget for å bli oppdaget og spurt av AI-agenter.</p>
+      <span class="eyebrow"><span class="dot"></span> ${S.heroPill}</span>
+      <h1 id="hero-title">${S.heroH1}<span class="accent">${S.heroAccent}</span></h1>
+      <p class="hero-sub">${S.heroSub}</p>
 
       <div class="discover">
-        <form class="discover-form" action="/sok" method="GET" role="search" aria-label="Finn opplevelser" id="discover-form">
+        <form class="discover-form" action="/sok" method="GET" role="search" aria-label="${S.searchAria}" id="discover-form">
           <span class="field">
             <svg viewBox="0 0 24 24" width="20" height="20" aria-hidden="true"><circle cx="11" cy="11" r="7" fill="none" stroke="currentColor" stroke-width="2"/><path d="M16.5 16.5 L21 21" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>
-            <label for="discover-q" class="visually-hidden" style="position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0 0 0 0);white-space:nowrap">Beskriv hva du vil finne på, eller skriv et sted</label>
-            <input id="discover-q" name="q" type="search" autocomplete="off" placeholder="Søk: hvalsafari, Oslo, mat …">
+            <label for="discover-q" class="visually-hidden" style="position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0 0 0 0);white-space:nowrap">${S.searchLabel}</label>
+            <input id="discover-q" name="q" type="search" autocomplete="off" placeholder="${S.searchPlaceholder}">
           </span>
-          <button type="submit">Finn opplevelser</button>
+          <button type="submit">${S.searchBtn}</button>
         </form>
-        <p class="discover-hint">Søk på sted, kategori eller aktivitet &mdash; eller <a href="/opplevelser" style="color:#fff;text-decoration:underline">bla i alle opplevelser</a>. Agenter kan kalle <code>GET /api/opplevelser/discover</code> direkte.</p>
-        <div class="quick" role="list" aria-label="Hurtigsøk">
+        <p class="discover-hint">${S.hintPre}<a href="/opplevelser" style="color:#fff;text-decoration:underline">${S.hintLink}</a>${S.hintPost}<code>GET /api/opplevelser/discover</code>${S.hintPost2}</p>
+        <div class="quick" role="list" aria-label="${S.quickAria}">
           <a role="listitem" href="/fylke/Oslo">Oslo</a>
           <a role="listitem" href="/fylke/Troms%20og%20Finnmark">Troms og Finnmark</a>
-          <a role="listitem" href="/sok?q=natur">Ute i naturen</a>
-          <a role="listitem" href="/opplevelser">Alle opplevelser</a>
+          <a role="listitem" href="/sok?q=natur">${S.qNature}</a>
+          <a role="listitem" href="/opplevelser">${S.qAll}</a>
         </div>
       </div>
     </div>
   </section>
 
-  <div class="trust" aria-label="Tillit og datakilder">
+  <div class="trust" aria-label="${S.trustAria}">
     <div class="trust-inner">
-      <span class="trust-item"><svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true"><path d="M12 2 L20 5 V11 C20 16 16.5 20 12 22 C7.5 20 4 16 4 11 V5 Z" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"/><path d="M8.5 12 L11 14.5 L15.5 9.5" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg> Tilbydere verifisert mot Brønnøysundregistrene</span>
+      <span class="trust-item"><svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true"><path d="M12 2 L20 5 V11 C20 16 16.5 20 12 22 C7.5 20 4 16 4 11 V5 Z" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"/><path d="M8.5 12 L11 14.5 L15.5 9.5" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg> ${S.trustBrreg}</span>
       <span class="trust-sep" aria-hidden="true"></span>
-      <span class="trust-item"><svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true"><circle cx="12" cy="12" r="9" fill="none" stroke="currentColor" stroke-width="1.8"/><path d="M12 7 V12 L15.5 14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg> Innhold oppdatert fortløpende</span>
+      <span class="trust-item"><svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true"><circle cx="12" cy="12" r="9" fill="none" stroke="currentColor" stroke-width="1.8"/><path d="M12 7 V12 L15.5 14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg> ${S.trustFresh}</span>
       <span class="trust-sep" aria-hidden="true"></span>
-      <span class="trust-item"><svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true"><rect x="3" y="4" width="18" height="14" rx="2" fill="none" stroke="currentColor" stroke-width="1.8"/><path d="M3 9 H21 M8 14 H13" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg> Maskinlesbar for AI-agenter</span>
+      <span class="trust-item"><svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true"><rect x="3" y="4" width="18" height="14" rx="2" fill="none" stroke="currentColor" stroke-width="1.8"/><path d="M3 9 H21 M8 14 H13" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg> ${S.trustMachine}</span>
     </div>
   </div>
 
   <section class="section" id="kategorier" aria-labelledby="kat-title">
     <div class="container">
       <div class="sec-head">
-        <span class="kicker">Utforsk</span>
-        <h2 id="kat-title">Opplevelser etter kategori</h2>
-        <p>Bla i kuraterte kategorier &mdash; eller la en AI-agent filtrere på vær, sesong, pris og gruppestørrelse for deg.</p>
+        <span class="kicker">${S.catKicker}</span>
+        <h2 id="kat-title">${S.catTitle}</h2>
+        <p>${S.catIntro}</p>
       </div>
-      <div class="cat-grid" role="list" aria-label="Kategorier">
+      <div class="cat-grid" role="list" aria-label="${S.catAria}">
         ${catCards}
       </div>
       ${catNote}
@@ -452,28 +531,28 @@ ${ldScripts}
   <section class="section section-alt" id="slik-funker-det" aria-labelledby="slik-title">
     <div class="container">
       <div class="sec-head center">
-        <span class="kicker">Tillitsmodell</span>
-        <h2 id="slik-title">Slik funker det</h2>
-        <p>Kuratert, verifisert og beriket &mdash; tre steg som skiller Opplevagent fra en vanlig oppføringsliste.</p>
+        <span class="kicker">${S.howKicker}</span>
+        <h2 id="slik-title">${S.howTitle}</h2>
+        <p>${S.howSub}</p>
       </div>
       <div class="steps">
         <div class="step">
           <div class="step-num" aria-hidden="true">1</div>
-          <h3>Kuratert innhenting</h3>
-          <p>Opplevelser høstes fortløpende fra kuraterte kilder &mdash; ikke et åpent annonsemarked, men et utvalg av reelle norske tilbydere.</p>
-          <p class="src">Kilde: <strong>kuraterte tilbyderkilder</strong></p>
+          <h3>${S.s1t}</h3>
+          <p>${S.s1b}</p>
+          <p class="src">${S.srcLabel} <strong>${S.s1src}</strong></p>
         </div>
         <div class="step">
           <div class="step-num" aria-hidden="true">2</div>
-          <h3>Verifisert tilbyder</h3>
-          <p>Hver tilbyder kontrolleres mot Brønnøysundregistrene for å bekrefte at det står et <strong>aktivt selskap</strong> bak opplevelsen.</p>
-          <p class="src">Kilde: <strong>Brønnøysundregistrene (Brreg)</strong></p>
+          <h3>${S.s2t}</h3>
+          <p>${S.s2bPre}<strong>${S.s2bStrong}</strong>${S.s2bPost}</p>
+          <p class="src">${S.srcLabel} <strong>${S.s2src}</strong></p>
         </div>
         <div class="step">
           <div class="step-num" aria-hidden="true">3</div>
-          <h3>Beriket innhold</h3>
-          <p>Detaljer berikes fra tilbyderens egen nettside, slik at beskrivelser, varighet og praktisk info blir presise og oppdaterte.</p>
-          <p class="src">Kilde: <strong>tilbyderens egen side</strong></p>
+          <h3>${S.s3t}</h3>
+          <p>${S.s3b}</p>
+          <p class="src">${S.srcLabel} <strong>${S.s3src}</strong></p>
         </div>
       </div>
     </div>
@@ -484,10 +563,10 @@ ${ldScripts}
       <div class="agents">
         <div class="agents-grid">
           <div>
-            <span class="kicker" style="color:var(--teal-400)">For AI-agenter</span>
-            <h2 id="agent-title">Bygget for å bli spurt av agenter</h2>
-            <p>Opplevagent eksponerer åpne, maskinlesbare flater etter A2A-protokollen. Agenter kan oppdage tilbudet, lese kontrakten og kjøre intent-søk &mdash; uten skraping.</p>
-            <ul class="endpoints" aria-label="Endepunkter for agenter">
+            <span class="kicker" style="color:var(--teal-400)">${S.agentsKicker}</span>
+            <h2 id="agent-title">${S.agentsTitle}</h2>
+            <p>${S.agentsBody}</p>
+            <ul class="endpoints" aria-label="${S.endpointsAria}">
               <li><a href="/.well-known/agent-card.json"><svg viewBox="0 0 24 24" width="15" height="15" aria-hidden="true"><rect x="4" y="3" width="16" height="18" rx="2" fill="none" stroke="currentColor" stroke-width="2"/><path d="M8 8 H16 M8 12 H16 M8 16 H13" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg> Agent Card</a></li>
               <li><a href="/mcp"><svg viewBox="0 0 24 24" width="15" height="15" aria-hidden="true"><circle cx="12" cy="12" r="9" fill="none" stroke="currentColor" stroke-width="2"/><path d="M8 12 H16 M12 8 V16" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg> MCP</a></li>
               <li><a href="/openapi.json"><svg viewBox="0 0 24 24" width="15" height="15" aria-hidden="true"><circle cx="12" cy="12" r="9" fill="none" stroke="currentColor" stroke-width="2"/><path d="M3 12 H21 M12 3 C15 6 15 18 12 21 C9 18 9 6 12 3" fill="none" stroke="currentColor" stroke-width="2"/></svg> OpenAPI 3.1</a></li>
@@ -495,11 +574,11 @@ ${ldScripts}
               <li><a href="/.well-known/agents.txt"><svg viewBox="0 0 24 24" width="15" height="15" aria-hidden="true"><circle cx="9" cy="8" r="3.2" fill="none" stroke="currentColor" stroke-width="2"/><path d="M3.5 20 C3.5 16 6 14 9 14 C12 14 14.5 16 14.5 20 M16 12 L18 14 L22 9" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg> agents.txt</a></li>
             </ul>
           </div>
-          <div class="code-card" aria-label="Eksempler på agent-kall">
+          <div class="code-card" aria-label="${S.codeAria}">
             <span class="c-label">A2A JSON-RPC</span>
             <div><span class="mtd">POST</span> <span class="pth">/a2a</span></div>
-            <div class="cmt"># message/send &mdash; naturlig språk</div>
-            <div class="cmt">«hva kan vi finne på i Tromsø i vinter?»</div>
+            <div class="cmt">${S.codeCmt1}</div>
+            <div class="cmt">${S.codeCmt2}</div>
             <div style="height:14px"></div>
             <span class="c-label">REST discovery</span>
             <div><span class="mtd">GET</span> <span class="pth">/api/opplevelser/discover</span></div>
@@ -515,22 +594,17 @@ ${ldScripts}
 <footer class="site-footer" role="contentinfo">
   <div class="footer-grid">
     <div class="footer-brand">
-      <a class="brand" href="/" aria-label="Opplevagent forside">
-        <span class="mark" aria-hidden="true">
-          <svg viewBox="0 0 24 24" width="20" height="20"><path d="M2 19 L8.5 7 L13 14.5 L16 10 L22 19 Z" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"/><circle cx="18" cy="6" r="2.4" fill="currentColor"/></svg>
-        </span>
-        Opplevagent
-      </a>
-      <p>Kuratert markedsplass for norske opplevelser og aktiviteter &mdash; søkbar for mennesker og AI-agenter.</p>
+      <a class="brand" href="/" aria-label="${S.brandAria}">${brandInner("dark")}</a>
+      <p>${S.footTagline}</p>
     </div>
     <div class="footer-col">
-      <h4>Utforsk</h4>
-      <a href="/opplevelser">Alle opplevelser</a>
-      <a href="#kategorier">Kategorier</a>
-      <a href="#slik-funker-det">Slik funker det</a>
+      <h4>${S.footExplore}</h4>
+      <a href="/opplevelser">${S.navAll}</a>
+      <a href="#kategorier">${S.navCategories}</a>
+      <a href="#slik-funker-det">${S.navHow}</a>
     </div>
     <div class="footer-col">
-      <h4>For agenter</h4>
+      <h4>${S.footAgents}</h4>
       <a href="/llms.txt"><code>llms.txt</code></a>
       <a href="/.well-known/agent-card.json"><code>agent-card.json</code></a>
       <a href="/mcp"><code>/mcp</code> (MCP)</a>
@@ -539,8 +613,8 @@ ${ldScripts}
     </div>
   </div>
   <div class="footer-bottom">
-    <span>&copy; ${year} Opplevagent</span>
-    <span class="verified"><svg viewBox="0 0 24 24" width="15" height="15" aria-hidden="true"><path d="M12 2 L20 5 V11 C20 16 16.5 20 12 22 C7.5 20 4 16 4 11 V5 Z" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"/><path d="M8.5 12 L11 14.5 L15.5 9.5" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg> Tilbydere verifisert mot Brønnøysundregistrene</span>
+    <span>&copy; ${year} Opplevagent &middot; <a href="/personvern" style="color:rgba(255,255,255,.62)">${S.footPrivacy}</a> &middot; <a href="/vilkar" style="color:rgba(255,255,255,.62)">${S.footTerms}</a></span>
+    <span class="verified"><svg viewBox="0 0 24 24" width="15" height="15" aria-hidden="true"><path d="M12 2 L20 5 V11 C20 16 16.5 20 12 22 C7.5 20 4 16 4 11 V5 Z" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"/><path d="M8.5 12 L11 14.5 L15.5 9.5" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg> ${S.footVerified}</span>
   </div>
 </footer>
 
@@ -620,6 +694,7 @@ router.get("/sitemap.xml", (_req: Request, res: Response) => {
   res.setHeader("Content-Type", "application/xml; charset=utf-8");
   const paths: Array<{ p: string; freq: string; pri: string }> = [
     { p: "/", freq: "daily", pri: "1.0" },
+    { p: "/en", freq: "daily", pri: "0.9" },
     { p: "/opplevelser", freq: "daily", pri: "0.9" },
     { p: "/llms.txt", freq: "weekly", pri: "0.8" },
     { p: "/openapi.json", freq: "weekly", pri: "0.7" },
@@ -1085,7 +1160,7 @@ function renderOpplevelseDetail(
 <title>${escapeHtml(title)}</title>
 <meta name="description" content="${escapeHtml(metaDesc)}">
 <meta name="robots" content="index, follow, max-snippet:-1, max-image-preview:large">
-<meta name="theme-color" content="#0b3d2e">
+<meta name="theme-color" content="#0e3c36">
 <link rel="canonical" href="${canonical}">
 <link rel="icon" type="image/svg+xml" href="/favicon.svg">
 <meta property="og:title" content="${escapeHtml(exp.title)}">
@@ -1098,15 +1173,17 @@ function renderOpplevelseDetail(
 <meta name="twitter:card" content="summary">
 ${ldScripts}
 <style>
+  @import url('https://fonts.googleapis.com/css2?family=Outfit:wght@500;600;700&display=swap');
   *{margin:0;padding:0;box-sizing:border-box}
   :root{
-    --fjord-900:#072a20;--fjord-800:#0b3d2e;--fjord-700:#0f5132;--fjord-600:#147a4d;
-    --teal-500:#14b8a6;--amber-500:#f59e0b;--coral-500:#ff7a45;
-    --ink:#10231b;--ink-soft:#3c5249;--mist:#6b8178;
-    --surface:#fff;--canvas:#f4f8f4;--canvas-2:#eaf2ec;--line:#dde9e0;
+    --fjord-900:#0b2e29;--fjord-800:#0e3c36;--fjord-700:#0f5a50;--fjord-600:#0c7264;
+    --font-brand:'Outfit',-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;--olive:#6f7a4f;--gold:#c98a2b;
+    --teal-500:#12a594;--amber-500:#ff5d3b;--coral-500:#ff5d3b;
+    --ink:#18130d;--ink-soft:#544a3e;--mist:#7a7163;
+    --surface:#fff;--canvas:#f7f4ee;--canvas-2:#efe9dd;--line:#e4ded0;
     --r-sm:8px;--r-md:14px;--r-lg:20px;--r-pill:999px;
-    --sh-sm:0 1px 2px rgba(7,42,32,.06),0 2px 6px rgba(7,42,32,.05);
-    --sh-md:0 6px 18px rgba(7,42,32,.10);--maxw:1080px;
+    --sh-sm:0 1px 2px rgba(24,19,13,.06),0 2px 6px rgba(24,19,13,.05);
+    --sh-md:0 6px 18px rgba(24,19,13,.10);--maxw:1080px;
   }
   body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;color:var(--ink);background:var(--canvas);line-height:1.6;-webkit-font-smoothing:antialiased}
   a{color:var(--fjord-600);text-decoration:none}
@@ -1122,8 +1199,10 @@ ${ldScripts}
   @media(max-width:560px){.nav-inner{padding:0 16px}}
   .brand{display:flex;align-items:center;gap:10px;font-weight:800;font-size:1.12rem;color:var(--fjord-800)}
   .brand:hover{text-decoration:none}
-  .brand .mark{width:32px;height:32px;border-radius:9px;background:linear-gradient(150deg,var(--fjord-700),var(--teal-500));display:flex;align-items:center;justify-content:center}
-  .brand .mark svg{color:#fff}
+  .brand-word{font-family:var(--font-brand);font-weight:600;font-size:1.3rem;letter-spacing:-.015em;text-transform:lowercase;line-height:1;color:var(--ink)}
+  .brand-word .tld{color:var(--fjord-600)}
+  .brand .mark{display:flex;align-items:center;justify-content:center}
+  .brand .mark svg{display:block}
   .nav-links a{font-size:.86rem;font-weight:600;color:var(--ink-soft);margin-left:22px}
   .breadcrumb{padding:18px 0 4px;font-size:.84rem;color:var(--mist)}
   .breadcrumb a{color:var(--ink-soft)}
@@ -1155,7 +1234,7 @@ ${ldScripts}
   @media(max-width:860px){.aside{position:static}}
   .card{background:var(--surface);border:1px solid var(--line);border-radius:var(--r-lg);padding:20px;box-shadow:var(--sh-sm)}
   .card h2{font-size:.78rem;text-transform:uppercase;letter-spacing:.06em;color:var(--mist);margin-bottom:12px}
-  .cta{display:block;text-align:center;background:linear-gradient(135deg,var(--amber-500),var(--coral-500));color:#fff;font-weight:800;padding:14px 18px;border-radius:var(--r-pill);box-shadow:0 4px 14px rgba(245,158,11,.4)}
+  .cta{display:block;text-align:center;background:linear-gradient(135deg,var(--amber-500),var(--coral-500));color:#fff;font-weight:800;padding:14px 18px;border-radius:var(--r-pill);box-shadow:0 4px 14px rgba(255,93,59,.4)}
   .cta:hover{text-decoration:none;filter:brightness(1.04)}
   .cta-soft{color:var(--ink-soft);font-size:.92rem}
   .prov-name{font-weight:700;font-size:1.04rem;margin-bottom:6px}
@@ -1183,7 +1262,7 @@ ${ldScripts}
 <body>
 <a class="skip-link" href="#main">Hopp til innhold</a>
 <nav class="site-nav"><div class="nav-inner">
-  <a class="brand" href="/"><span class="mark"><svg viewBox="0 0 24 24" width="20" height="20" aria-hidden="true"><path d="M3 18 L9 7 L13 13 L16 9 L21 18 Z" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round"/></svg></span>Opplevagent</a>
+  <a class="brand" href="/">${brandInner("light")}</a>
   <span class="nav-links"><a href="/">Forsiden</a><a href="/#kategorier">Kategorier</a></span>
 </div></nav>
 <main id="main" class="container">
@@ -1240,15 +1319,17 @@ const BROWSE_PAGE_SIZE = 24;
 // Shared minimal CSS for every browse page — same brand tokens as the landing /
 // detail pages, kept compact since these are list views.
 const BROWSE_CSS = `
+  @import url('https://fonts.googleapis.com/css2?family=Outfit:wght@500;600;700&display=swap');
   *{margin:0;padding:0;box-sizing:border-box}
   :root{
-    --fjord-900:#072a20;--fjord-800:#0b3d2e;--fjord-700:#0f5132;--fjord-600:#147a4d;
-    --teal-500:#14b8a6;--teal-400:#2dd4bf;--amber-500:#f59e0b;--coral-500:#ff7a45;
-    --ink:#10231b;--ink-soft:#3c5249;--mist:#6b8178;
-    --surface:#fff;--canvas:#f4f8f4;--canvas-2:#eaf2ec;--line:#dde9e0;
+    --fjord-900:#0b2e29;--fjord-800:#0e3c36;--fjord-700:#0f5a50;--fjord-600:#0c7264;
+    --font-brand:'Outfit',-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;--olive:#6f7a4f;--gold:#c98a2b;
+    --teal-500:#12a594;--teal-400:#3cc3b4;--amber-500:#ff5d3b;--coral-500:#ff5d3b;
+    --ink:#18130d;--ink-soft:#544a3e;--mist:#7a7163;
+    --surface:#fff;--canvas:#f7f4ee;--canvas-2:#efe9dd;--line:#e4ded0;
     --r-sm:8px;--r-md:14px;--r-lg:20px;--r-pill:999px;
-    --sh-sm:0 1px 2px rgba(7,42,32,.06),0 2px 6px rgba(7,42,32,.05);
-    --sh-md:0 6px 18px rgba(7,42,32,.10);--maxw:1120px;
+    --sh-sm:0 1px 2px rgba(24,19,13,.06),0 2px 6px rgba(24,19,13,.05);
+    --sh-md:0 6px 18px rgba(24,19,13,.10);--maxw:1120px;
   }
   body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;color:var(--ink);background:var(--canvas);line-height:1.6;-webkit-font-smoothing:antialiased}
   a{color:var(--fjord-600);text-decoration:none}
@@ -1264,8 +1345,10 @@ const BROWSE_CSS = `
   @media(max-width:560px){.nav-inner{padding:0 16px}}
   .brand{display:flex;align-items:center;gap:10px;font-weight:800;font-size:1.12rem;color:var(--fjord-800)}
   .brand:hover{text-decoration:none}
-  .brand .mark{width:32px;height:32px;border-radius:9px;background:linear-gradient(150deg,var(--fjord-700),var(--teal-500));display:flex;align-items:center;justify-content:center}
-  .brand .mark svg{color:#fff}
+  .brand-word{font-family:var(--font-brand);font-weight:600;font-size:1.3rem;letter-spacing:-.015em;text-transform:lowercase;line-height:1;color:var(--ink)}
+  .brand-word .tld{color:var(--fjord-600)}
+  .brand .mark{display:flex;align-items:center;justify-content:center}
+  .brand .mark svg{display:block}
   .nav-links a{font-size:.86rem;font-weight:600;color:var(--ink-soft);margin-left:22px}
   .breadcrumb{padding:18px 0 4px;font-size:.84rem;color:var(--mist)}
   .breadcrumb a{color:var(--ink-soft)}
@@ -1314,7 +1397,7 @@ const BROWSE_CSS = `
 // Brand nav + footer shared by every browse page.
 const BROWSE_NAV = `<a class="skip-link" href="#main">Hopp til innhold</a>
 <nav class="site-nav"><div class="nav-inner">
-  <a class="brand" href="/"><span class="mark"><svg viewBox="0 0 24 24" width="20" height="20" aria-hidden="true"><path d="M3 18 L9 7 L13 13 L16 9 L21 18 Z" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round"/></svg></span>Opplevagent</a>
+  <a class="brand" href="/">${brandInner("light")}</a>
   <span class="nav-links"><a href="/opplevelser">Alle opplevelser</a><a href="/#kategorier">Kategorier</a></span>
 </div></nav>`;
 
@@ -1451,7 +1534,7 @@ function renderBrowsePage(opts: {
 <title>${escapeHtml(opts.title)}</title>
 <meta name="description" content="${escapeHtml(opts.metaDesc)}">
 <meta name="robots" content="index, follow, max-snippet:-1, max-image-preview:large">
-<meta name="theme-color" content="#0b3d2e">
+<meta name="theme-color" content="#0e3c36">
 <link rel="canonical" href="${canonical}">
 ${linkRels}<link rel="icon" type="image/svg+xml" href="/favicon.svg">
 <meta property="og:title" content="${escapeHtml(opts.h1)}">
@@ -1791,7 +1874,7 @@ router.get("/sok", (req: Request, res: Response) => {
 <title>${escapeHtml(h1)} | Opplevagent</title>
 <meta name="description" content="${escapeHtml(metaDesc)}">
 <meta name="robots" content="noindex, follow">
-<meta name="theme-color" content="#0b3d2e">
+<meta name="theme-color" content="#0e3c36">
 <link rel="canonical" href="${canonical}">
 <link rel="icon" type="image/svg+xml" href="/favicon.svg">
 <meta property="og:title" content="${escapeHtml(h1)}">
@@ -1861,76 +1944,78 @@ router.get("/opplevelse/:slug", (req: Request, res: Response, next: NextFunction
 router.get("/favicon.svg", (_req: Request, res: Response) => {
   res.setHeader("Content-Type", "image/svg+xml");
   res.setHeader("Cache-Control", "public, max-age=86400");
-  res.send(`<svg width="1024" height="1024" viewBox="0 0 1024 1024" xmlns="http://www.w3.org/2000/svg">
-  <defs>
-    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
-      <stop offset="0%" stop-color="#7AB83A"/>
-      <stop offset="55%" stop-color="#5A9A2E"/>
-      <stop offset="100%" stop-color="#3E7A1E"/>
-    </linearGradient>
-    <radialGradient id="sheen" cx="0.3" cy="0.25" r="0.8">
-      <stop offset="0%" stop-color="#ffffff" stop-opacity="0.22"/>
-      <stop offset="60%" stop-color="#ffffff" stop-opacity="0"/>
-    </radialGradient>
-    <linearGradient id="leafShade" x1="0" y1="0" x2="0" y2="1">
-      <stop offset="0%" stop-color="#ffffff"/>
-      <stop offset="100%" stop-color="#e8f5dc"/>
-    </linearGradient>
-    <filter id="softShadow" x="-20%" y="-20%" width="140%" height="140%">
-      <feGaussianBlur in="SourceAlpha" stdDeviation="8"/>
-      <feOffset dx="0" dy="6" result="offsetblur"/>
-      <feComponentTransfer>
-        <feFuncA type="linear" slope="0.30"/>
-      </feComponentTransfer>
-      <feMerge>
-        <feMergeNode/>
-        <feMergeNode in="SourceGraphic"/>
-      </feMerge>
-    </filter>
-  </defs>
-
-  <!-- Rounded-square background (iOS-style corner radius ~22%) -->
-  <rect x="0" y="0" width="1024" height="1024" rx="228" ry="228" fill="url(#bg)"/>
-  <rect x="0" y="0" width="1024" height="1024" rx="228" ry="228" fill="url(#sheen)"/>
-
-  <!-- Sprout group, centered -->
-  <g filter="url(#softShadow)">
-    <!-- Stem: gentle curve from bottom up to leaf junction -->
-    <path d="M 512 820
-             C 512 760, 512 680, 512 580"
-          stroke="#ffffff" stroke-width="42"
-          stroke-linecap="round" fill="none"/>
-
-    <!-- Left leaf: rounded teardrop curving up-and-out, tip pointing up-left -->
-    <path d="M 512 580
-             C 420 620, 280 560, 220 380
-             C 320 360, 470 430, 512 580 Z"
-          fill="url(#leafShade)"/>
-
-    <!-- Right leaf: mirrored teardrop, tip up-and-right -->
-    <path d="M 512 580
-             C 604 620, 744 560, 804 380
-             C 704 360, 554 430, 512 580 Z"
-          fill="url(#leafShade)"/>
-
-    <!-- Left leaf vein (subtle) -->
-    <path d="M 500 570
-             C 420 540, 340 480, 280 400"
-          stroke="#c8e3a8" stroke-width="7"
-          stroke-linecap="round" fill="none" opacity="0.6"/>
-
-    <!-- Right leaf vein (subtle) -->
-    <path d="M 524 570
-             C 604 540, 684 480, 744 400"
-          stroke="#c8e3a8" stroke-width="7"
-          stroke-linecap="round" fill="none" opacity="0.6"/>
-  </g>
-</svg>`);
+  // «Konstellasjon» app tile — coral with cream mark (logo spec §6).
+  res.send(`<svg width="512" height="512" viewBox="0 0 64 64" fill="none" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Opplevagent"><title>Opplevagent</title><rect width="64" height="64" rx="17" fill="#ff5d3b"/><g transform="translate(12 13.6) scale(0.769)"><path d="M9 33 L24 11 L43 19 L31 38 Z" fill="none" stroke="#f7f4ee" stroke-width="2.4" stroke-linejoin="round" opacity="0.5"/><circle cx="9" cy="33" r="4.2" fill="#f7f4ee"/><circle cx="43" cy="19" r="4.2" fill="#f7f4ee"/><circle cx="31" cy="38" r="4.2" fill="#f7f4ee"/><path d="M24 3 C25.1 8.9 26.9 10.7 32.8 11.8 C26.9 12.9 25.1 14.7 24 20.6 C22.9 14.7 21.1 12.9 15.2 11.8 C21.1 10.7 22.9 8.9 24 3 Z" fill="#f7f4ee"/></g></svg>`);
 });
 
 // ═══════════════════════════════════════════════════════════
 // Catch-all 404 — norsk side (forhindrer rfb/dental-innhold på opplevagent-host)
 // ═══════════════════════════════════════════════════════════
+
+// ── /logo.svg — «Konstellasjon» mark (transparent, self-contained) ──
+router.get("/logo.svg", (_req: Request, res: Response) => {
+  res.setHeader("Content-Type", "image/svg+xml");
+  res.setHeader("Cache-Control", "public, max-age=86400");
+  res.send(`<svg xmlns="http://www.w3.org/2000/svg" width="52" height="48" viewBox="0 0 52 48" fill="none" role="img" aria-label="Opplevagent"><title>Opplevagent</title><path d="M9 33 L24 11 L43 19 L31 38 Z" fill="none" stroke="#12a594" stroke-width="2" stroke-linejoin="round" opacity="0.45"/><circle cx="9" cy="33" r="4" fill="#12a594"/><circle cx="43" cy="19" r="4" fill="#6f7a4f"/><circle cx="31" cy="38" r="4" fill="#c98a2b"/><path d="M24 3 C25.1 8.9 26.9 10.7 32.8 11.8 C26.9 12.9 25.1 14.7 24 20.6 C22.9 14.7 21.1 12.9 15.2 11.8 C21.1 10.7 22.9 8.9 24 3 Z" fill="#ff5d3b"/></svg>`);
+});
+
+// ── Legal pages (privacy / terms) — Claude Connectors prerequisite. Bilingual NO/EN. ──
+const LEGAL_CSS = `@import url('https://fonts.googleapis.com/css2?family=Outfit:wght@600&display=swap');*{margin:0;padding:0;box-sizing:border-box}body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;max-width:760px;margin:0 auto;padding:48px 22px;color:#18130d;background:#f7f4ee;line-height:1.6}h1,h2{font-family:'Outfit',sans-serif;letter-spacing:-.01em}h1{font-size:1.9rem;border-bottom:2px solid #12a594;padding-bottom:.3rem;margin-bottom:.4rem}h2{font-size:1.18rem;color:#0c7264;margin:1.7rem 0 .35rem}a{color:#0c7264}.lang{text-align:right;font-size:.9rem;margin-bottom:.8rem}hr{margin:2.4rem 0;border:none;border-top:1px solid #e4ded0}footer{margin-top:2.4rem;padding-top:1rem;border-top:1px solid #e4ded0;font-size:.85rem;color:#7a7163}ul{margin:.4rem 0 .4rem 1.2rem}p{margin:.4rem 0}`;
+function legalPage(title: string, bodyHtml: string): string {
+  return `<!DOCTYPE html><html lang="no"><head><meta charset="utf-8"><title>${title} — Opplevagent</title><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="robots" content="index, follow"><link rel="icon" type="image/svg+xml" href="/favicon.svg"><style>${LEGAL_CSS}</style></head><body>${bodyHtml}<footer>Opplevagent &middot; <a href="/">opplevagent.no</a> &middot; <a href="/personvern">Personvern</a> &middot; <a href="/vilkar">Vilkår</a> &middot; <a href="/.well-known/agent-card.json">Agent Card</a></footer></body></html>`;
+}
+
+router.get(["/privacy", "/privacy-policy", "/personvern"], (_req: Request, res: Response) => {
+  res.setHeader("Content-Type", "text/html; charset=utf-8");
+  res.setHeader("Cache-Control", "public, max-age=3600");
+  res.send(legalPage("Personvern / Privacy", `<div class="lang"><a href="#en">English</a></div>
+<h1>Personvern</h1><p><strong>Sist oppdatert:</strong> 22. juni 2026</p>
+<p>Opplevagent (opplevagent.no) er en agent-til-agent-markedsplass som hjelper AI-agenter og mennesker med å finne norske opplevelser og aktiviteter — turer, kurs, severdigheter og ting å gjøre. Vi respekterer personvernet til tilbydere, brukere og AI-agenter som samhandler med plattformen.</p>
+<h2>Hva vi samler inn</h2><ul>
+<li><strong>Opplevelsesdata:</strong> tittel, beskrivelse, tilbyder, kategori, fylke/kommune, varighet, pris, sesong og bookinglenke — offentlig tilgjengelig informasjon hentet fra tilbydernes egne nettsider og åpne kilder (Brønnøysundregistrene, Visit Norway / CBIS m.fl.).</li>
+<li><strong>Agent-forespørsler:</strong> hvilke agenter (ChatGPT, Claude, Perplexity m.fl.) som søker, hvilke filtre/søkeord som brukes, og hvilke opplevelser som vises — i aggregert form, uten IP-adresser eller personlige identifikatorer.</li>
+<li><strong>Tilbyder-henvendelser:</strong> e-postadresse lagres så lenge det er nødvendig for å bekrefte eierskap ved overtakelse/korrigering av en oppføring.</li></ul>
+<h2>Hva vi IKKE samler inn</h2><ul><li>Ingen sporingscookies.</li><li>Ingen tredjeparts analyseverktøy.</li><li>Ingen betalinger eller kortdata — booking skjer hos tilbyderen.</li><li>Vi selger ikke data til tredjepart.</li></ul>
+<h2>Lagringstid</h2><p>Aggregerte analytikkdata lagres i opptil 180 dager. Opplevelsesdata fra offentlige kilder lagres så lenge opplevelsen er aktiv.</p>
+<h2>Rettighetene dine</h2><p>Er du tilbyder og vil fjernes eller korrigere informasjon? Send e-post til <a href="mailto:kontakt@opplevagent.no">kontakt@opplevagent.no</a>.</p>
+<h2>Kontakt</h2><p>E-post: <a href="mailto:kontakt@opplevagent.no">kontakt@opplevagent.no</a><br>Operatør: Daniel Fredriksen, Norge.</p>
+<hr>
+<h1 id="en">Privacy Policy</h1><p><strong>Last updated:</strong> 22 June 2026</p>
+<p>Opplevagent (opplevagent.no) is an agent-to-agent marketplace that helps AI agents and humans find Norwegian experiences and activities — tours, courses, attractions, and things to do. We respect the privacy of providers, end-users, and AI agents that interact with the platform.</p>
+<h2>What we collect</h2><ul>
+<li><strong>Experience data:</strong> title, description, provider, category, county/municipality, duration, price, season, and booking link — public information gathered from providers' own websites and open sources (the Norwegian business registry, Visit Norway / CBIS, etc.).</li>
+<li><strong>Agent requests:</strong> which agents search, which filters/terms are used, and which experiences are shown — aggregated, without IP addresses or personal identifiers.</li>
+<li><strong>Provider claims:</strong> email stored only as long as needed to confirm ownership.</li></ul>
+<h2>What we do NOT collect</h2><ul><li>No tracking cookies.</li><li>No third-party analytics.</li><li>No payments or card data — booking happens on the provider's site.</li><li>We do not sell data to third parties.</li></ul>
+<h2>Retention</h2><p>Aggregated analytics for up to 180 days; experience data from public records while the experience is active.</p>
+<h2>Your rights</h2><p>Providers may request removal or correction at <a href="mailto:kontakt@opplevagent.no">kontakt@opplevagent.no</a>.</p>
+<h2>Contact</h2><p>Email: <a href="mailto:kontakt@opplevagent.no">kontakt@opplevagent.no</a><br>Operator: Daniel Fredriksen, Norway.</p>`));
+});
+
+router.get(["/terms", "/terms-of-service", "/tos", "/vilkar"], (_req: Request, res: Response) => {
+  res.setHeader("Content-Type", "text/html; charset=utf-8");
+  res.setHeader("Cache-Control", "public, max-age=3600");
+  res.send(legalPage("Vilkår / Terms of Service", `<div class="lang"><a href="#en">English</a></div>
+<h1>Vilkår for bruk</h1><p><strong>Sist oppdatert:</strong> 22. juni 2026</p>
+<p>Velkommen til Opplevagent (opplevagent.no). Disse vilkårene gjelder for alle som bruker plattformen — sluttbrukere, tilbydere og AI-agenter som kaller våre MCP- eller A2A-endepunkter. Ved å bruke tjenesten aksepterer du vilkårene.</p>
+<h2>1. Hva tjenesten er</h2><p>Opplevagent er et oppdagelseslag for norske opplevelser. Vi eksponerer en katalog gjennom MCP, A2A JSON-RPC og en REST-API slik at agenter og mennesker kan finne turer, kurs, severdigheter og aktiviteter. Vi er <em>ikke</em> en bookingtjeneste og gjennomfører ikke transaksjoner — booking skjer hos tilbyderen.</p>
+<h2>2. Akseptabel bruk</h2><ul><li>Bruk API-ene, MCP-serveren og nettsiden til å finne og utforske opplevelser.</li><li>Integrer tjenesten i egne agenter innenfor rimelige rater.</li><li>Overhold robots.txt og rate-limitene.</li></ul>
+<h2>3. Forbudt bruk</h2><ul><li>Skrape hele datasettet for å republisere det som et konkurrerende register uten skriftlig tillatelse.</li><li>Masseutsendelse/spam til tilbydere basert på kontaktinfo herfra.</li><li>Omgå sikkerhet, rate-limiter eller autentisering.</li></ul>
+<h2>4. Nøyaktighet</h2><p>Data er samlet fra offentlige kilder. <strong>Tjenesten leveres «som den er».</strong> Verifiser pris, sesong og bookinglenker direkte med tilbyderen før du booker.</p>
+<h2>5. Ansvarsbegrensning</h2><p>Opplevagent er ikke ansvarlig for bookinger, gjennomføring, kvalitet eller uenigheter mellom brukere og tilbydere.</p>
+<h2>6. Tilbyderrettigheter</h2><p>Oppdater, fjern eller overta din oppføring via <a href="mailto:kontakt@opplevagent.no">kontakt@opplevagent.no</a>. Se også <a href="/personvern">personvern</a>.</p>
+<h2>7. Gjeldende rett</h2><p>Norsk rett. Tvister løses ved Daniels alminnelige verneting.</p>
+<hr>
+<h1 id="en">Terms of Service</h1><p><strong>Last updated:</strong> 22 June 2026</p>
+<p>Welcome to Opplevagent (opplevagent.no). These terms apply to everyone who uses the platform — end-users, providers, and AI agents calling our MCP or A2A endpoints. By using the service you accept these terms.</p>
+<h2>1. What the service is</h2><p>Opplevagent is a discovery layer for Norwegian experiences. We expose a directory via MCP, A2A JSON-RPC, and a REST API so agents and humans can find tours, courses, attractions, and activities. We are <em>not</em> a booking service and do not process transactions — booking happens on the provider's site.</p>
+<h2>2. Acceptable use</h2><ul><li>Use the APIs, MCP server, and website to find and explore experiences.</li><li>Integrate the service into your own agents within reasonable rate limits.</li><li>Respect robots.txt and published rate limits.</li></ul>
+<h2>3. Prohibited use</h2><ul><li>Scraping the full dataset to republish as a competing directory without written permission.</li><li>Bulk unsolicited messages or spam to providers.</li><li>Circumventing security, rate limits, or authentication.</li></ul>
+<h2>4. Accuracy</h2><p>Data is gathered from public sources. <strong>The service is provided "as is".</strong> Verify price, season, and booking links directly with the provider before booking.</p>
+<h2>5. Limitation of liability</h2><p>Opplevagent is not liable for bookings, conduct of experiences, quality, or disputes between users and providers.</p>
+<h2>6. Provider rights</h2><p>Update, remove, or claim your listing via <a href="mailto:kontakt@opplevagent.no">kontakt@opplevagent.no</a>. See also the <a href="/privacy">privacy policy</a>.</p>
+<h2>7. Governing law</h2><p>Norwegian law. Disputes resolved at Daniel's ordinary venue.</p>`));
+});
 
 router.use((_req: Request, res: Response) => {
   res.status(404);
