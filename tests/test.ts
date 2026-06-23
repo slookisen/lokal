@@ -20709,3 +20709,95 @@ console.log("\n── site-quality: sitemap cold-start slug backfill (sq-sitemap
   delete require.cache[expSeoPathCS];
   console.log("  sq-sitemap-cold: OK (5 tests: cold-no-slug/backfill-ran/slug-derived/sitemap-slug/sitemap-no-uuid)");
 })();
+
+// ── site-quality (opplevagent-site-quality loop, 2026-06-23) ──────────────────
+// Homepage category card labels: cat-name must render human-readable label
+// (e.g. "Kultur & historie") NOT the raw DB slug ("kultur_historie").
+// Regression guard for the Konstellasjon overhaul (commit 7423eb50) where
+// CATEGORY_LABELS was defined after the router handler, causing the deployed
+// build to render raw slugs due to incremental-build const hoisting race.
+// Fix: CATEGORY_LABELS hoisted to module top (before safeCategories).
+// Uses :memory: DB + experiences-seo router; host-isolated (zero rfb/dental).
+console.log("\n── site-quality: homepage cat-name labels (sq-homepage-catlabel) ──");
+(() => {
+  const prevPathHL = process.env.EXPERIENCES_DB_PATH;
+  process.env.EXPERIENCES_DB_PATH = ":memory:";
+
+  const dbFacPathHL = require.resolve("../src/database/db-factory");
+  const expStPathHL = require.resolve("../src/services/experience-store");
+  const expSeoPathHL = require.resolve("../src/routes/experiences-seo");
+  delete require.cache[dbFacPathHL];
+  delete require.cache[expStPathHL];
+  delete require.cache[expSeoPathHL];
+
+  const dbFacHL = require("../src/database/db-factory") as typeof import("../src/database/db-factory");
+  dbFacHL.__resetDbFactoryForTesting();
+  const expStHL = require("../src/services/experience-store") as typeof import("../src/services/experience-store");
+  const seoRouterHL = (require("../src/routes/experiences-seo") as typeof import("../src/routes/experiences-seo")).default as any;
+
+  // Seed: one verified provider + one published experience per category so
+  // safeCategories() returns real data (avoids the fallback cat set).
+  dbFacHL.getDb("experiences");
+  const provHL = expStHL.createProvider({
+    navn: "Test AS", org_nr: "111000999",
+    fylke: "Oslo", kommune: "Oslo",
+    brreg_verified: 1, brreg_active: 1, verification_status: "verified",
+  });
+  const categories = [
+    "kultur_historie", "vinter_sno", "natur_friluft",
+    "sightseeing_transport", "mat_drikke",
+  ];
+  for (const cat of categories) {
+    expStHL.createExperience({
+      title: `Test ${cat}`, provider_id: provHL, provider_match_status: "matched",
+      category: cat, fylke: "Oslo", kommune: "Oslo",
+      confidence: "high", verification_status: "verified",
+    });
+  }
+
+  // Invoke GET / (Norwegian homepage)
+  const layerHL = (seoRouterHL.stack as any[]).find(
+    (l: any) => l.route && l.route.path === "/" && l.route.methods?.get
+  );
+  assertTrue(!!layerHL, "sq-homepage-catlabel-00: router has GET / layer");
+  let bodyHL = ""; let statusHL = 200;
+  const resHL: any = {
+    statusCode: 200,
+    setHeader: () => {},
+    status: (c: number) => { statusHL = c; return resHL; },
+    send: (b: unknown) => { bodyHL = String(b); return resHL; },
+    json: (o: unknown) => { bodyHL = JSON.stringify(o); return resHL; },
+  };
+  const reqHL: any = { path: "/", hostname: "opplevagent.no", params: {}, query: {}, lang: "no" };
+  const handlerHL = layerHL.route.stack[layerHL.route.stack.length - 1].handle;
+  handlerHL(reqHL, resHL, () => { statusHL = 404; });
+
+  assertEq(statusHL, 200, "sq-homepage-catlabel-01: GET / → 200");
+
+  // Core: cat-name spans must render human-readable labels, NOT raw slugs.
+  assertTrue(
+    bodyHL.includes("Kultur &amp; historie") || bodyHL.includes("Kultur & historie"),
+    "sq-homepage-catlabel-02: homepage renders 'Kultur & historie' not raw slug"
+  );
+  assertTrue(
+    bodyHL.includes("Vinter &amp; sn") || bodyHL.includes("Vinter & sn"),
+    "sq-homepage-catlabel-03: homepage renders 'Vinter & snø' not raw slug"
+  );
+  assertTrue(
+    !bodyHL.includes('>kultur_historie<'),
+    "sq-homepage-catlabel-04: raw slug 'kultur_historie' is NOT in a cat-name span"
+  );
+  assertTrue(
+    !bodyHL.includes('>vinter_sno<'),
+    "sq-homepage-catlabel-05: raw slug 'vinter_sno' is NOT in a cat-name span"
+  );
+
+  // Host-isolation: Norwegian homepage must not leak rfb/dental identity.
+  assertTrue(!/Rett fra Bonden/i.test(bodyHL), "sq-homepage-catlabel-06: no rfb leak");
+  assertTrue(!/tannlege/i.test(bodyHL), "sq-homepage-catlabel-07: no dental leak");
+
+  if (prevPathHL === undefined) delete process.env.EXPERIENCES_DB_PATH;
+  else process.env.EXPERIENCES_DB_PATH = prevPathHL;
+  dbFacHL.__resetDbFactoryForTesting();
+  console.log("  sq-homepage-catlabel: OK (7 tests: 200/readable-label-kultur/readable-label-vinter/no-raw-slug-kultur/no-raw-slug-vinter/no-rfb/no-dental)");
+})();

@@ -89,6 +89,23 @@ function brandInner(variant: "light" | "dark" = "light"): string {
   return `<span class="mark" aria-hidden="true">${brandMarkSvg(variant)}</span><span class="brand-word">opplevagent<span class="tld">.no</span></span>`;
 }
 
+
+const CATEGORY_LABELS: Record<string, string> = {
+  vinter_sno: "Vinter & snø",
+  sightseeing_transport: "Sightseeing & transport",
+  dyreliv_safari: "Dyreliv & safari",
+  natur_friluft: "Natur & friluft",
+  kultur_historie: "Kultur & historie",
+  overnatting_opplevelse: "Overnatting & opplevelse",
+  adrenalin_action: "Adrenalin & action",
+  velvaere_spa: "Velvære & spa",
+  mat_drikke: "Mat & drikke",
+};
+function catLabel(c: string | null | undefined): string {
+  if (!c) return "Opplevelse";
+  return CATEGORY_LABELS[c] || c.replace(/_/g, " ");
+}
+
 function safeCategories(): Array<{ category: string; count: number }> {
   try {
     return listCategories();
@@ -222,7 +239,7 @@ router.get("/", (req: Request, res: Response) => {
       return `<a class="cat-card" href="${href}">
         <span class="cat-ico" aria-hidden="true">${catIcon(c.category)}</span>
         <span class="cat-body">
-          <span class="cat-name">${escapeHtml(c.category)}</span>
+          <span class="cat-name">${escapeHtml(catLabel(c.category))}</span>
           ${count}
         </span>
       </a>`;
@@ -892,21 +909,6 @@ router.get("/openapi.json", (_req: Request, res: Response) => {
 // Only publishable rows (verified + confidence>=medium + provider
 // brreg_active) render; anything else falls through to the 404 catch-all.
 // ═══════════════════════════════════════════════════════════
-const CATEGORY_LABELS: Record<string, string> = {
-  vinter_sno: "Vinter & snø",
-  sightseeing_transport: "Sightseeing & transport",
-  dyreliv_safari: "Dyreliv & safari",
-  natur_friluft: "Natur & friluft",
-  kultur_historie: "Kultur & historie",
-  overnatting_opplevelse: "Overnatting & opplevelse",
-  adrenalin_action: "Adrenalin & action",
-  velvaere_spa: "Velvære & spa",
-  mat_drikke: "Mat & drikke",
-};
-function catLabel(c: string | null | undefined): string {
-  if (!c) return "Opplevelse";
-  return CATEGORY_LABELS[c] || c.replace(/_/g, " ");
-}
 const SEASON_LABELS: Record<string, string> = {
   summer: "Sommer", winter: "Vinter", spring: "Vår",
   autumn: "Høst", fall: "Høst", year_round: "Hele året",
