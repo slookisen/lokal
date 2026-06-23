@@ -14922,13 +14922,13 @@ console.log("\n── opplevagent P2: human-browse subpages (experiences) ──
     params: Record<string, string>,
     reqPath: string,
     query: Record<string, string> = {}
-  ): { status: number; body: string; headers: Record<string, string> } {
+  ): { status: number; body: string; headers: Record<string, string>; redirectTo: string | null } {
     const layer = (seoRouterP2.stack as any[]).find(
       (l: any) => l.route && l.route.path === routePath && l.route.methods?.get
     );
     assertTrue(!!layer, `p2-browse: router has GET ${routePath} layer`);
-    if (!layer) return { status: 0, body: "", headers: {} };
-    let status = 200; let body = ""; let nexted = false;
+    if (!layer) return { status: 0, body: "", headers: {}, redirectTo: null };
+    let status = 200; let body = ""; let nexted = false; let redirectTo: string | null = null;
     const headers: Record<string, string> = {};
     const res: any = {
       statusCode: 200,
@@ -14936,12 +14936,13 @@ console.log("\n── opplevagent P2: human-browse subpages (experiences) ──
       status: (c: number) => { status = c; res.statusCode = c; return res; },
       send: (b: unknown) => { body = typeof b === "string" ? b : String(b); return res; },
       json: (o: unknown) => { body = JSON.stringify(o); return res; },
+      redirect: (code: number, location: string) => { status = code; redirectTo = location; },
     };
     const req: any = { path: reqPath, hostname: "opplevagent.no", params, query };
     const handler = layer.route.stack[layer.route.stack.length - 1].handle;
     handler(req, res, () => { nexted = true; });
     if (nexted) status = 404; // route called next() → would hit 404 catch-all
-    return { status, body, headers };
+    return { status, body, headers, redirectTo };
   }
 
   // p2-01: /opplevelser index → 200, lists all published, excludes draft, on-brand.
@@ -14981,15 +14982,21 @@ console.log("\n── opplevagent P2: human-browse subpages (experiences) ──
   const fylkeMissP2 = invokeSeo("/fylke/:fylke", { fylke: "Atlantis" }, "/fylke/Atlantis");
   assertEq(fylkeMissP2.status, 404, "p2-03d: unknown fylke → 404 (next())");
 
-  // p2-04: /tilbyder/:providerSlugOrId → 200 (UUID served until slug backfilled); unknown → 404.
-  const provPageP2 = invokeSeo("/tilbyder/:providerSlugOrId", { providerSlugOrId: provP2 }, `/tilbyder/${provP2}`);
-  assertEq(provPageP2.status, 200, "p2-04a: GET /tilbyder/<id> → 200");
-  assertTrue(/Tromsø Villmark AS/.test(provPageP2.body), "p2-04b: provider page shows provider name");
+  // p2-04: /tilbyder/:providerSlugOrId — UUID now → 301 redirect to slug URL.
+  const uuidRedirP2 = invokeSeo("/tilbyder/:providerSlugOrId", { providerSlugOrId: provP2 }, `/tilbyder/${provP2}`);
+  assertEq(uuidRedirP2.status, 301, "p2-04a: GET /tilbyder/<uuid> → 301 redirect to slug URL");
+  assertTrue(uuidRedirP2.redirectTo !== null && uuidRedirP2.redirectTo.startsWith("/tilbyder/"),
+    "p2-04a2: redirect location is a /tilbyder/<slug> URL");
+  // Follow redirect: slug URL → 200 with content
+  const provSlugSeg = decodeURIComponent((uuidRedirP2.redirectTo ?? "").replace("/tilbyder/", ""));
+  const provPageP2 = invokeSeo("/tilbyder/:providerSlugOrId", { providerSlugOrId: provSlugSeg }, `/tilbyder/${provSlugSeg}`);
+  assertEq(provPageP2.status, 200, "p2-04b: GET /tilbyder/<slug> → 200");
+  assertTrue(/Tromsø Villmark AS/.test(provPageP2.body), "p2-04c: provider page shows provider name");
   assertTrue(/Hvalsafari i Tromsø/.test(provPageP2.body) && !/Tapasvandring i Oslo/.test(provPageP2.body),
-    "p2-04c: provider page lists only that provider's experiences");
-  assertTrue(/Brønnøysundregistrene/.test(provPageP2.body), "p2-04d: verified provider page shows Brreg note");
+    "p2-04d: provider page lists only that provider's experiences");
+  assertTrue(/Brønnøysundregistrene/.test(provPageP2.body), "p2-04e: verified provider page shows Brreg note");
   const provMissP2 = invokeSeo("/tilbyder/:providerSlugOrId", { providerSlugOrId: "00000000-dead-beef" }, "/tilbyder/00000000-dead-beef");
-  assertEq(provMissP2.status, 404, "p2-04e: unknown provider → 404 (next())");
+  assertEq(provMissP2.status, 404, "p2-04f: unknown provider → 404 (next())");
 
   // p2-05: /sok?q= → 200 results; empty + no-match handled gracefully (200, noindex).
   const sokP2 = invokeSeo("/sok", {}, "/sok", { q: "hval" });
@@ -15017,7 +15024,7 @@ console.log("\n── opplevagent P2: human-browse subpages (experiences) ──
     "p2-06b: sitemap includes the /opplevelser index");
   assertTrue(smP2.body.includes("/kategori/dyreliv_safari"), "p2-06c: sitemap includes category URLs");
   assertTrue(smP2.body.includes("/fylke/Troms"), "p2-06d: sitemap includes fylke URLs");
-  assertTrue(smP2.body.includes(`/tilbyder/${provP2}`), "p2-06e: sitemap includes provider URLs");
+  assertTrue(smP2.body.includes(`/tilbyder/${provSlugSeg}`), "p2-06e: sitemap includes slug-based provider URLs");
   assertTrue(smP2.body.includes(`/opplevelse/${whaleSlugP2}`), "p2-06f: sitemap includes published detail URLs");
   assertTrue(!smP2.body.includes(`/opplevelse/${draftSlugP2}`), "p2-06g: sitemap excludes the unpublished draft");
 
@@ -20495,7 +20502,7 @@ console.log("\n── site-quality: tilbyder slug URLs (sq-slug) ──");
     const layer = (seoRouterSL.stack as any[]).find(
       (l: any) => l.route && l.route.path === routePath && l.route.methods?.get
     );
-    assertTrue(!!layer, \`sq-slug: router has GET \${routePath} layer\`);
+    assertTrue(!!layer, `sq-slug: router has GET ${routePath} layer`);
     let status = 200; let body = ""; let nexted = false; let redirectTo: string | null = null;
     const headers: Record<string, string> = {};
     const res: any = {
@@ -20525,17 +20532,17 @@ console.log("\n── site-quality: tilbyder slug URLs (sq-slug) ──");
   assertTrue(provSlugSL.slice(-8) === provIdSL.slice(0, 8), "sq-slug-00e: slug suffix = first 8 chars of provider id");
 
   // sq-slug-01: GET /tilbyder/<slug> → 200 HTML with correct content.
-  const okSL = invokeSeoSL("/tilbyder/:providerSlugOrId", { providerSlugOrId: provSlugSL }, \`/tilbyder/\${provSlugSL}\`);
+  const okSL = invokeSeoSL("/tilbyder/:providerSlugOrId", { providerSlugOrId: provSlugSL }, `/tilbyder/${provSlugSL}`);
   assertEq(okSL.status, 200, "sq-slug-01a: GET /tilbyder/<slug> → 200");
   assertTrue(/text\/html/.test(okSL.headers["content-type"] || ""), "sq-slug-01b: Content-Type text/html");
   assertTrue(/Brim Explorer AS/.test(okSL.body), "sq-slug-01c: tilbyder page renders provider navn");
   assertTrue(/Verifisert mot Br/.test(okSL.body), "sq-slug-01d: Brreg-verified badge present on slug page");
-  assertTrue(okSL.body.includes(\`/tilbyder/\${provSlugSL}\`), "sq-slug-01e: canonical URL uses slug (not UUID)");
+  assertTrue(okSL.body.includes(`/tilbyder/${provSlugSL}`), "sq-slug-01e: canonical URL uses slug (not UUID)");
 
   // sq-slug-02: GET /tilbyder/<uuid> → 301 redirect to /tilbyder/<slug>.
-  const redir = invokeSeoSL("/tilbyder/:providerSlugOrId", { providerSlugOrId: provIdSL }, \`/tilbyder/\${provIdSL}\`);
+  const redir = invokeSeoSL("/tilbyder/:providerSlugOrId", { providerSlugOrId: provIdSL }, `/tilbyder/${provIdSL}`);
   assertEq(redir.status, 301, "sq-slug-02a: UUID URL → 301 redirect");
-  assertEq(redir.redirectTo, \`/tilbyder/\${encodeURIComponent(provSlugSL)}\`, "sq-slug-02b: 301 Location points to slug URL");
+  assertEq(redir.redirectTo, `/tilbyder/${encodeURIComponent(provSlugSL)}`, "sq-slug-02b: 301 Location points to slug URL");
 
   // sq-slug-03: unknown slug → 404 (next() called).
   const missSL = invokeSeoSL("/tilbyder/:providerSlugOrId", { providerSlugOrId: "does-not-exist-xyz" }, "/tilbyder/does-not-exist-xyz");
@@ -20544,15 +20551,15 @@ console.log("\n── site-quality: tilbyder slug URLs (sq-slug) ──");
   // sq-slug-04: sitemap.xml now lists /tilbyder/<slug>, not /tilbyder/<uuid>.
   const smSL = invokeSeoSL("/sitemap.xml", {}, "/sitemap.xml");
   assertEq(smSL.status, 200, "sq-slug-04a: sitemap.xml → 200");
-  assertTrue(smSL.body.includes(\`/tilbyder/\${provSlugSL}\`), "sq-slug-04b: sitemap contains slug-based tilbyder URL");
-  assertTrue(!smSL.body.includes(\`/tilbyder/\${provIdSL}\`), "sq-slug-04c: sitemap does NOT contain UUID-based tilbyder URL");
+  assertTrue(smSL.body.includes(`/tilbyder/${provSlugSL}`), "sq-slug-04b: sitemap contains slug-based tilbyder URL");
+  assertTrue(!smSL.body.includes(`/tilbyder/${provIdSL}`), "sq-slug-04c: sitemap does NOT contain UUID-based tilbyder URL");
 
   // sq-slug-05: detail page /opplevelse/<slug> links to /tilbyder/<slug>, not UUID.
   const expSlugSL = (expStSL.getExperienceById(expIdSL) as any).slug as string;
-  const detailSL = invokeSeoSL("/opplevelse/:slug", { slug: expSlugSL }, \`/opplevelse/\${expSlugSL}\`);
+  const detailSL = invokeSeoSL("/opplevelse/:slug", { slug: expSlugSL }, `/opplevelse/${expSlugSL}`);
   assertEq(detailSL.status, 200, "sq-slug-05a: detail page → 200");
-  assertTrue(detailSL.body.includes(\`/tilbyder/\${provSlugSL}\`), "sq-slug-05b: detail page tilbyder link uses slug URL");
-  assertTrue(!detailSL.body.includes(\`/tilbyder/\${provIdSL}\`), "sq-slug-05c: detail page does NOT link to UUID tilbyder URL");
+  assertTrue(detailSL.body.includes(`/tilbyder/${provSlugSL}`), "sq-slug-05b: detail page tilbyder link uses slug URL");
+  assertTrue(!detailSL.body.includes(`/tilbyder/${provIdSL}`), "sq-slug-05c: detail page does NOT link to UUID tilbyder URL");
 
   // HOST ISOLATION: no rfb/dental content on any tilbyder page.
   assertTrue(!/Rett fra Bonden/i.test(okSL.body), "sq-slug-06: no 'Rett fra Bonden' on tilbyder page");
