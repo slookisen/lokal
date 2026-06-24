@@ -881,6 +881,7 @@ Eksempel (tools/call — discover):
 
 Agent Card (A2A-protokoll):   ${url}/.well-known/agent-card.json
 Alias:                        ${url}/agent-card.json
+ChatGPT Custom GPT:           https://chatgpt.com/g/g-6a3ab590a7f081919c528a15c6765a7d-opplevagent-finn-opplevelser-i-norge
 A2A JSON-RPC 2.0 endepunkt:  ${url}/a2a
 OpenAPI 3.1 spec:             ${url}/openapi.json
 

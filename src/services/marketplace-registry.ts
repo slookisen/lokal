@@ -838,6 +838,13 @@ class MarketplaceRegistry {
           status: "live",
           description: "mcp.so MCP servers directory listing.",
         },
+        {
+          channel: "custom-gpt",
+          url: "https://chatgpt.com/g/g-69dbf8593c1c81919050f8da98cd327d-rett-fra-bonden",
+          install: "https://chatgpt.com/g/g-69dbf8593c1c81919050f8da98cd327d-rett-fra-bonden",
+          status: "live",
+          description: "ChatGPT Custom GPT — Rett fra Bonden local food marketplace; Actions on rettfrabonden.com/openapi.yaml.",
+        },
       ],
 
       // ─── Lokal-specific metadata ───────────────────────────

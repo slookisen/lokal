@@ -1696,6 +1696,7 @@ Brønnøysundregistrene, HPR og klinikkenes egne nettsider.
 
 Agent Card (A2A-protokoll):   ${DENTAL_BASE_URL}/.well-known/agent-card.json
 Alias:                        ${DENTAL_BASE_URL}/agent-card.json
+ChatGPT Custom GPT:           https://chatgpt.com/g/g-6a21e79241cc8191a04642bda508e42b-finn-tannlege-i-norge
 A2A JSON-RPC 2.0 endepunkt:  ${DENTAL_BASE_URL}/a2a
 OpenAPI 3.1 spec:             ${DENTAL_BASE_URL}/openapi.json
 
