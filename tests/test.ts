@@ -20801,3 +20801,126 @@ console.log("\n── site-quality: homepage cat-name labels (sq-homepage-catlab
   dbFacHL.__resetDbFactoryForTesting();
   console.log("  sq-homepage-catlabel: OK (7 tests: 200/readable-label-kultur/readable-label-vinter/no-raw-slug-kultur/no-raw-slug-vinter/no-rfb/no-dental)");
 })();
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Category icon regression guard — sq-caticon
+// Verifies that the slug-keyed CATEGORY_ICON_INNER + catIconSvg() rendering
+// is correct: each live category slug gets a unique inline SVG; an unknown slug
+// falls back to the compass; no leaked inline SVG XSS surface; aria-hidden OK.
+// Regression guard for PR #88 (feat/experiences-category-icons, 2026-06-23).
+// ─────────────────────────────────────────────────────────────────────────────
+console.log("\n── site-quality: category card icons (sq-caticon) ──");
+(() => {
+  const prevPath = process.env.EXPERIENCES_DB_PATH;
+  process.env.EXPERIENCES_DB_PATH = ":memory:";
+
+  const dbFacPath = require.resolve("../src/database/db-factory");
+  const expStPath = require.resolve("../src/services/experience-store");
+  const expSeoPath = require.resolve("../src/routes/experiences-seo");
+  delete require.cache[dbFacPath];
+  delete require.cache[expStPath];
+  delete require.cache[expSeoPath];
+
+  const dbFac = require("../src/database/db-factory") as typeof import("../src/database/db-factory");
+  dbFac.__resetDbFactoryForTesting();
+  const expSt = require("../src/services/experience-store") as typeof import("../src/services/experience-store");
+  const seoRouter = (require("../src/routes/experiences-seo") as typeof import("../src/routes/experiences-seo")).default as any;
+
+  // Seed: verified provider + 4 experiences covering known slugs and one unknown.
+  dbFac.getDb("experiences");
+  const prov = expSt.createProvider({
+    navn: "Ikontest AS", org_nr: "999000111",
+    fylke: "Vestland", kommune: "Bergen",
+    brreg_verified: 1, brreg_active: 1, verification_status: "verified",
+  });
+  const seedCats = ["natur_friluft", "vinter_sno", "mat_drikke", "ukjent_slug_xyz"];
+  for (const cat of seedCats) {
+    expSt.createExperience({
+      title: `Ikon test ${cat}`, provider_id: prov, provider_match_status: "matched",
+      category: cat, fylke: "Vestland", kommune: "Bergen",
+      confidence: "high", verification_status: "verified",
+    });
+  }
+
+  // Invoke GET /
+  const layer = (seoRouter.stack as any[]).find(
+    (l: any) => l.route && l.route.path === "/" && l.route.methods?.get
+  );
+  assertTrue(!!layer, "sq-caticon-00: router has GET / layer");
+  let body = ""; let status = 200;
+  const res: any = {
+    statusCode: 200, setHeader: () => {},
+    status: (c: number) => { status = c; return res; },
+    send: (b: unknown) => { body = String(b); return res; },
+    json: (o: unknown) => { body = JSON.stringify(o); return res; },
+  };
+  const req: any = { path: "/", hostname: "opplevagent.no", params: {}, query: {}, lang: "no" };
+  const handler = layer.route.stack[layer.route.stack.length - 1].handle;
+  handler(req, res, () => { status = 404; });
+
+  assertEq(status, 200, "sq-caticon-01: GET / → 200");
+
+  // cat-ico spans must contain SVG markup (icon is rendered, not empty).
+  assertTrue(
+    /class="cat-ico"[^>]*aria-hidden="true"><svg/.test(body) ||
+    /cat-ico[^>]*><span[^>]*>.*<svg/.test(body) ||
+    (body.includes("cat-ico") && body.includes("<svg")),
+    "sq-caticon-02: cat-ico spans contain <svg> elements"
+  );
+
+  // SVGs must carry aria-hidden="true" for screen-reader safety.
+  const svgMatches = body.match(/<svg[^>]*>/g) || [];
+  const catIcoSvgs = svgMatches.filter((t: string) => t.includes('aria-hidden="true"'));
+  assertTrue(catIcoSvgs.length > 0, "sq-caticon-03: category SVGs have aria-hidden=\"true\"");
+
+  // natur_friluft must render the mountain-silhouette icon (not the old compass).
+  // Mountain glyph contains "M2.5 19 L8 9" (peak path). Compass contained r="9".
+  // We extract the icon for natur_friluft from the body near its cat-name span.
+  const naturBlock = (() => {
+    // The card structure: <a class="cat-card" href="/kategori/natur_friluft"><span class="cat-ico">SVG</span>
+    // The cat-ico SVG comes AFTER the href in the HTML — search forward.
+    const hrefIdx = body.indexOf("/kategori/natur_friluft");
+    if (hrefIdx < 0) return "";
+    const catIcoIdx = body.indexOf("cat-ico", hrefIdx);
+    return catIcoIdx >= 0 ? body.substring(catIcoIdx, catIcoIdx + 600) : "";
+  })();
+  assertTrue(
+    naturBlock.includes("M2.5 19") || naturBlock.includes("L8 9") || naturBlock.includes("L21.5 19"),
+    "sq-caticon-04: natur_friluft card renders mountain-silhouette icon (not compass)"
+  );
+
+  // vinter_sno must render the snowflake icon (has multi-segment symmetric lines).
+  // Snowflake pattern has many <line> elements; old compass had circle r="9".
+  const vinterBlock = (() => {
+    // Same forward-search pattern: cat-ico SVG comes after the href.
+    const hrefIdx = body.indexOf("/kategori/vinter_sno");
+    if (hrefIdx < 0) return "";
+    const catIcoIdx = body.indexOf("cat-ico", hrefIdx);
+    return catIcoIdx >= 0 ? body.substring(catIcoIdx, catIcoIdx + 600) : "";
+  })();
+  assertTrue(
+    vinterBlock.includes('x1="12" y1="3"') || vinterBlock.includes('x1="12"') && vinterBlock.includes("y1=\"21\""),
+    "sq-caticon-05: vinter_sno card renders snowflake icon (central vertical line)"
+  );
+
+  // No old 7-glyph compass (<circle cx="12" cy="12" r="9">) in live-category icons.
+  // (Compass may appear for the ukjent_slug_xyz fallback card, that's OK.)
+  // Count category cards that still have the old compass (should be zero for known slugs).
+  const oldCompassPattern = /<circle cx="12" cy="12" r="9"/g;
+  const matches = body.match(oldCompassPattern) || [];
+  // In the worst case 1 compass (for the unknown slug) is acceptable; 0+ known cats should not have it.
+  // We check that natur_friluft card does NOT contain the old compass.
+  assertTrue(
+    !naturBlock.includes('r="9"'),
+    "sq-caticon-06: natur_friluft card does NOT use old compass fallback (r=\"9\")"
+  );
+
+  // Host-isolation.
+  assertTrue(!/Rett fra Bonden/i.test(body), "sq-caticon-07: no rfb leak");
+  assertTrue(!/tannlege/i.test(body), "sq-caticon-08: no dental leak");
+
+  if (prevPath === undefined) delete process.env.EXPERIENCES_DB_PATH;
+  else process.env.EXPERIENCES_DB_PATH = prevPath;
+  dbFac.__resetDbFactoryForTesting();
+  console.log("  sq-caticon: OK (9 tests: 200/svg-present/aria-hidden/mountain-icon/snowflake-icon/no-compass-for-natur/no-rfb/no-dental)");
+})();

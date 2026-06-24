@@ -106,6 +106,104 @@ function catLabel(c: string | null | undefined): string {
   return CATEGORY_LABELS[c] || c.replace(/_/g, " ");
 }
 
+// ─────────────────────────────────────────────────────────────
+// Category icons — 52 unique, single-colour (currentColor) glyphs keyed by
+// category slug (design handoff "design_handoff_ikoner", 2026-06-23). The 9
+// live categories map 1:1; the other 43 are pre-wired so a new category shows
+// its own icon the moment a matching slug is published — no code change. This
+// replaces the old 7-glyph set that reused a compass/cup across 5 of 9 cards.
+// Inner SVG markup only; catIconSvg() supplies viewBox + size + the shared
+// stroke attrs. Dots carry their own fill/stroke overrides.
+// ─────────────────────────────────────────────────────────────
+const CATEGORY_ICON_INNER: Record<string, string> = {
+  kultur_historie: '<path d="M6 21 L6 13 L12 8.5 L18 13 L18 21"></path><path d="M8.2 13 L12 9.8 L15.8 13"></path><path d="M9.8 16.5 L12 14.6 L14.2 16.5"></path><line x1="12" y1="4.5" x2="12" y2="8.5"></line><line x1="10.2" y1="6" x2="13.8" y2="6"></line><line x1="5" y1="21" x2="19" y2="21"></line>',
+  sightseeing_transport: '<path d="M3.5 14.5 H20.5 L18.3 18.2 H5.7 Z"></path><path d="M7 14.5 V10.5 H15.5 V14.5"></path><circle cx="9.2" cy="12.4" r="0.85" fill="currentColor" stroke="none"></circle><circle cx="12.5" cy="12.4" r="0.85" fill="currentColor" stroke="none"></circle><path d="M2.6 20.4 q2.2 -1.5 4.4 0 t4.4 0 t4.4 0 t4.4 0"></path>',
+  natur_friluft: '<path d="M2.5 19 L8 9 L11.5 14.5 L15 8.5 L21.5 19"></path><circle cx="17.4" cy="6.4" r="1.7"></circle><line x1="2.5" y1="19" x2="21.5" y2="19"></line>',
+  adrenalin_action: '<line x1="2.5" y1="6" x2="21.5" y2="10.5"></line><circle cx="11" cy="8.7" r="1.7"></circle><path d="M11 10.4 L11 14.5"></path><line x1="11" y1="11.8" x2="14.2" y2="14.4"></line><line x1="11" y1="14.5" x2="9.2" y2="18.4"></line><line x1="11" y1="14.5" x2="12.7" y2="18.4"></line>',
+  vinter_sno: '<line x1="12" y1="3" x2="12" y2="21"></line><line x1="4.2" y1="7.5" x2="19.8" y2="16.5"></line><line x1="4.2" y1="16.5" x2="19.8" y2="7.5"></line><line x1="12" y1="6.2" x2="10" y2="4.5"></line><line x1="12" y1="6.2" x2="14" y2="4.5"></line><line x1="12" y1="17.8" x2="10" y2="19.5"></line><line x1="12" y1="17.8" x2="14" y2="19.5"></line><line x1="6.8" y1="9.1" x2="6.6" y2="6.6"></line><line x1="6.8" y1="9.1" x2="4.3" y2="8.9"></line><line x1="17.2" y1="14.9" x2="17.4" y2="17.4"></line><line x1="17.2" y1="14.9" x2="19.7" y2="15.1"></line><line x1="6.8" y1="14.9" x2="4.3" y2="15.1"></line><line x1="6.8" y1="14.9" x2="6.6" y2="17.4"></line><line x1="17.2" y1="9.1" x2="19.7" y2="8.9"></line><line x1="17.2" y1="9.1" x2="17.4" y2="6.6"></line>',
+  overnatting_opplevelse: '<path d="M3.5 11.5 L12 5 L20.5 11.5"></path><path d="M5.5 10 V20 H18.5 V10"></path><path d="M10 20 V14.5 H14 V20"></path><line x1="15.5" y1="7.6" x2="15.5" y2="5.2"></line>',
+  dyreliv_safari: '<path d="M12 14.5 C9.5 9.5 7.5 7 5 5.6 C7.8 7.8 10 10 11.2 13.6"></path><path d="M12 14.5 C14.5 9.5 16.5 7 19 5.6 C16.2 7.8 14 10 12.8 13.6"></path><path d="M2.8 19.4 q2.4 -1.6 4.8 0 t4.8 0 t4.8 0 t4.8 0"></path>',
+  velvaere_spa: '<path d="M4.5 13 H19.5 A7.5 7.5 0 0 1 4.5 13 Z"></path><line x1="4.5" y1="13" x2="19.5" y2="13"></line><path d="M9 4.5 c1.2 1.1 -1.2 2.1 0 3.4"></path><path d="M12 3.6 c1.2 1.1 -1.2 2.1 0 3.4"></path><path d="M15 4.5 c1.2 1.1 -1.2 2.1 0 3.4"></path>',
+  mat_drikke: '<path d="M7 4 V8.5 M9.2 4 V8.5 M8.1 8.5 V20"></path><path d="M16.2 4 c2.4 0.4 2.4 6.4 0.6 8.4 L16.4 12.6 V20"></path>',
+  fottur: '<path d="M8 4 V12 L4.5 14 C3.3 14.7 3.4 17 5.4 17 H19 V15 C19 13.2 16.4 13 14 12 L11 10 V4 Z"></path><line x1="4.6" y1="17.6" x2="19.4" y2="17.6"></line>',
+  topptur: '<path d="M4 19 L11 6 L18 19"></path><line x1="11" y1="6" x2="11" y2="3"></line><path d="M11 3 H15 L13.8 4.6 L15 6.2 H11"></path><line x1="4" y1="19" x2="18" y2="19"></line>',
+  fisketur: '<path d="M3 12 c3 -4.2 9.5 -4.2 12.5 0 c-3 4.2 -9.5 4.2 -12.5 0 Z"></path><line x1="15.5" y1="12" x2="19" y2="8.8"></line><line x1="15.5" y1="12" x2="19" y2="15.2"></line><circle cx="7.4" cy="10.6" r="0.8" fill="currentColor" stroke="none"></circle><path d="M20.5 5.5 V10 a1.9 1.9 0 0 1 -3.8 0"></path>',
+  kajakk: '<path d="M3.5 13 q8.5 5 17 0 q-8.5 -5 -17 0 Z"></path><line x1="6" y1="8" x2="18" y2="18"></line><path d="M6 8 l-1.6 -1.4"></path><path d="M18 18 l1.6 1.4"></path>',
+  brevandring: '<line x1="7" y1="20.5" x2="16.5" y2="6"></line><path d="M16.5 6 q3.4 -1 4.4 2.4"></path><path d="M16.5 6 q-1 -3.4 -4.4 -2.4"></path><line x1="8.4" y1="18" x2="5.6" y2="19.6"></line>',
+  sopptur: '<path d="M4.5 11.5 a7.5 5.5 0 0 1 15 0 Z"></path><path d="M9.8 11.5 v5.5 a2.2 2.2 0 0 0 4.4 0 v-5.5"></path><circle cx="9.5" cy="9" r="0.7" fill="currentColor" stroke="none"></circle><circle cx="13" cy="8" r="0.7" fill="currentColor" stroke="none"></circle><circle cx="15.4" cy="9.6" r="0.6" fill="currentColor" stroke="none"></circle>',
+  riding: '<path d="M7.5 20 V11.5 a4.5 5 0 0 1 9 0 V20"></path><circle cx="7.5" cy="20" r="0.8" fill="currentColor" stroke="none"></circle><circle cx="16.5" cy="20" r="0.8" fill="currentColor" stroke="none"></circle><circle cx="7.9" cy="16" r="0.7" fill="currentColor" stroke="none"></circle><circle cx="16.1" cy="16" r="0.7" fill="currentColor" stroke="none"></circle><circle cx="8.6" cy="12.6" r="0.7" fill="currentColor" stroke="none"></circle><circle cx="15.4" cy="12.6" r="0.7" fill="currentColor" stroke="none"></circle>',
+  klatring: '<path d="M9 4.5 C5.5 4.5 5.5 19.5 9 19.5 C12.5 19.5 12.5 4.5 9 4.5 Z"></path><line x1="9" y1="5.5" x2="9" y2="12.5"></line><line x1="13" y1="8" x2="20" y2="11"></line>',
+  rafting: '<path d="M4 13 H20 L17.6 16.5 H6.4 Z"></path><line x1="8.5" y1="13" x2="6.5" y2="9.5"></line><line x1="15.5" y1="13" x2="17.5" y2="9.5"></line><path d="M2.8 20 q2.4 -1.6 4.8 0 t4.8 0 t4.8 0 t4.8 0"></path>',
+  paragliding: '<path d="M3 9 Q12 3 21 9"></path><line x1="4.5" y1="9" x2="11" y2="15"></line><line x1="9.5" y1="9" x2="12" y2="15"></line><line x1="14.5" y1="9" x2="12" y2="15"></line><line x1="19.5" y1="9" x2="13" y2="15"></line><circle cx="12" cy="16.6" r="1.6"></circle>',
+  klatrepark: '<line x1="7" y1="21" x2="7" y2="5"></line><line x1="4.5" y1="9" x2="7" y2="5"></line><line x1="9.5" y1="9" x2="7" y2="5"></line><path d="M7 11 L20 8"></path><path d="M7 15 L20 12"></path><circle cx="20" cy="8" r="1" fill="currentColor" stroke="none"></circle><circle cx="20" cy="12" r="1" fill="currentColor" stroke="none"></circle>',
+  lasertag: '<circle cx="12" cy="12" r="8.2"></circle><circle cx="12" cy="12" r="4.2"></circle><circle cx="12" cy="12" r="1.4" fill="currentColor" stroke="none"></circle>',
+  escape: '<circle cx="7.5" cy="12" r="3.2"></circle><circle cx="7.5" cy="12" r="0.8" fill="currentColor" stroke="none"></circle><line x1="10.7" y1="12" x2="20" y2="12"></line><line x1="17" y1="12" x2="17" y2="15"></line><line x1="20" y1="12" x2="20" y2="15.5"></line>',
+  alpint: '<path d="M6 20 L13.5 5 Q14.2 3.4 16 4.2"></path><path d="M9.5 20 L17 5 Q17.7 3.4 19.5 4.2"></path><line x1="5" y1="20" x2="11" y2="20"></line>',
+  langrenn: '<path d="M8.5 20.5 V7 Q8.5 4.2 6.4 4.4"></path><path d="M14 20.5 V7 Q14 4.2 11.9 4.4"></path><line x1="8.5" y1="12" x2="14" y2="12"></line>',
+  hundespann: '<path d="M3.5 16.5 H13 V13.5 H3.5 Z"></path><path d="M2.8 19 Q3.2 18 4.6 18 H13"></path><line x1="13" y1="14.6" x2="16.5" y2="13"></line><path d="M16.5 13 q1.6 -2.8 4 -1.4 l0.8 1.6 q0.8 1.4 -0.4 2.4 l-1.2 1 H17 v-2.2"></path><circle cx="20.6" cy="12.4" r="0.7" fill="currentColor" stroke="none"></circle>',
+  snoscooter: '<path d="M3 17 q2 -1.5 5 -1 l6 0.6 4 -3.6"></path><path d="M2.4 18.6 Q3 17.4 4.6 17.6"></path><line x1="14" y1="11" x2="17" y2="8"></line><line x1="17" y1="8" x2="20.5" y2="8"></line><circle cx="18" cy="14" r="1" fill="currentColor" stroke="none"></circle>',
+  skoyter: '<path d="M8 4 V13 L6 15 H17"></path><path d="M6.2 17.6 H18 Q18 16 16.4 16 H6"></path><line x1="8" y1="8" x2="11.5" y2="8"></line>',
+  nordlys: '<path d="M6 4 Q3.5 11 6 18"></path><path d="M11 3.5 Q8.5 11 11 18.5"></path><path d="M16 4 Q13.5 11 16 18"></path><path d="M21 4.5 Q18.5 11 21 17.5"></path><circle cx="8.5" cy="6" r="0.6" fill="currentColor" stroke="none"></circle><circle cx="18" cy="7" r="0.6" fill="currentColor" stroke="none"></circle><circle cx="13.5" cy="5" r="0.5" fill="currentColor" stroke="none"></circle><line x1="3" y1="20" x2="21" y2="20"></line>',
+  dykking: '<path d="M4.5 9 H16 A3 3 0 0 1 13 15 H7.5 A3 3 0 0 1 4.5 9 Z"></path><circle cx="7.5" cy="11" r="1.4"></circle><circle cx="12" cy="11" r="1.4"></circle><path d="M19.5 7 V15 a1.8 1.8 0 0 1 -3.6 0"></path>',
+  fugletitting: '<path d="M3.5 12 Q7 8 10.5 11.5"></path><path d="M10.5 11.5 Q14 8 17.5 11.5"></path><path d="M17.5 11.5 q1.6 -0.4 2.8 -1.8"></path><circle cx="10.5" cy="11.5" r="0.6" fill="currentColor" stroke="none"></circle>',
+  seiling: '<path d="M4 17 H18 L15.8 20 H6.2 Z"></path><line x1="11" y1="17" x2="11" y2="4"></line><path d="M11 5 L11 15 L4.5 15 Z"></path>',
+  batt: '<path d="M3 14 Q12 19.5 21 14"></path><line x1="3" y1="14" x2="5" y2="11"></line><line x1="21" y1="14" x2="19" y2="11"></line><line x1="9" y1="9" x2="6.5" y2="13.5"></line><line x1="15" y1="9" x2="17.5" y2="13.5"></line>',
+  helikopter: '<path d="M6 12 a4 3 0 0 1 8 0 Z"></path><line x1="14" y1="11" x2="21" y2="10"></line><path d="M21 10 q0.6 1.4 -1 2.2"></path><line x1="10" y1="9" x2="10" y2="6.5"></line><line x1="4.5" y1="6.5" x2="16" y2="6.5"></line><line x1="6" y1="15" x2="13" y2="15"></line><line x1="7.5" y1="15" x2="7.5" y2="16.5"></line><line x1="11.5" y1="15" x2="11.5" y2="16.5"></line>',
+  luftballong: '<path d="M12 4 a6 6.5 0 0 1 0 13 a6 6.5 0 0 1 0 -13 Z"></path><line x1="8.5" y1="14" x2="10.5" y2="17"></line><line x1="15.5" y1="14" x2="13.5" y2="17"></line><path d="M10 17 H14 L13.4 20 H10.6 Z"></path>',
+  sykkel: '<circle cx="6" cy="16" r="3.4"></circle><circle cx="18" cy="16" r="3.4"></circle><line x1="6" y1="16" x2="10" y2="16"></line><line x1="10" y1="16" x2="14" y2="9"></line><line x1="8.5" y1="9" x2="14.5" y2="9"></line><line x1="8.5" y1="9" x2="6" y2="16"></line><line x1="14" y1="9" x2="18" y2="16"></line><line x1="13.5" y1="7.5" x2="15.5" y2="7.5"></line>',
+  midnattssol: '<path d="M6 15 a6 6 0 0 1 12 0"></path><line x1="3" y1="15" x2="21" y2="15"></line><line x1="12" y1="4" x2="12" y2="6.5"></line><line x1="5.6" y1="6.6" x2="7.2" y2="8.4"></line><line x1="18.4" y1="6.6" x2="16.8" y2="8.4"></line><line x1="5" y1="18" x2="9" y2="18"></line><line x1="11" y1="18" x2="15" y2="18"></line><line x1="16" y1="18" x2="19" y2="18"></line>',
+  museum: '<path d="M3 8.5 L12 4 L21 8.5"></path><line x1="5.5" y1="8.5" x2="5.5" y2="17"></line><line x1="10" y1="8.5" x2="10" y2="17"></line><line x1="14" y1="8.5" x2="14" y2="17"></line><line x1="18.5" y1="8.5" x2="18.5" y2="17"></line><line x1="3.5" y1="17" x2="20.5" y2="17"></line><line x1="2.8" y1="20" x2="21.2" y2="20"></line>',
+  kunst: '<path d="M4 5 H20 V18 H4 Z"></path><path d="M4 14 L9 10 L13 13 L16 11 L20 14.5"></path><circle cx="8" cy="8.5" r="1.2"></circle>',
+  konsert: '<circle cx="7" cy="17.5" r="2.2"></circle><circle cx="15.5" cy="15.5" r="2.2"></circle><line x1="9.2" y1="17.5" x2="9.2" y2="6"></line><line x1="17.7" y1="15.5" x2="17.7" y2="4.5"></line><path d="M9.2 6 L17.7 4.5 M9.2 8 L17.7 6.5"></path>',
+  festival: '<circle cx="12" cy="11" r="7.5"></circle><circle cx="12" cy="11" r="1" fill="currentColor" stroke="none"></circle><line x1="12" y1="3.5" x2="12" y2="18.5"></line><line x1="4.5" y1="11" x2="19.5" y2="11"></line><line x1="6.7" y1="5.7" x2="17.3" y2="16.3"></line><line x1="6.7" y1="16.3" x2="17.3" y2="5.7"></line><line x1="8" y1="18" x2="12" y2="21"></line><line x1="16" y1="18" x2="12" y2="21"></line>',
+  samisk: '<path d="M4 19 L12 4 L20 19 Z"></path><line x1="11" y1="6.5" x2="13.5" y2="3.5"></line><line x1="13" y1="6.5" x2="10.5" y2="3.5"></line><path d="M10.5 19 L12 12.5 L13.5 19"></path>',
+  byvandring: '<path d="M12 21 c-4 -5 -6 -8 -6 -11 a6 6 0 0 1 12 0 c0 3 -2 6 -6 11 Z"></path><circle cx="12" cy="10" r="2.3"></circle>',
+  bryggeri: '<path d="M6.5 8 H15 V18.5 H6.5 Z"></path><path d="M15 10 H18 V15 H15"></path><path d="M6.5 8 q1 -2 2.8 -0.9 q1 -2 2.8 -0.2 q1.8 -1 2.9 0.8 Z"></path><line x1="9" y1="11" x2="9" y2="16"></line><line x1="12.5" y1="11" x2="12.5" y2="16"></line>',
+  vinsmaking: '<path d="M7.5 4 H16.5 C16.5 9.5 14.5 11.5 12 11.5 C9.5 11.5 7.5 9.5 7.5 4 Z"></path><line x1="12" y1="11.5" x2="12" y2="19"></line><line x1="8.5" y1="19" x2="15.5" y2="19"></line><path d="M8.1 6.5 H15.9"></path>',
+  bakeri: '<path d="M3.5 15 a8.5 6 0 0 1 17 0 Z"></path><line x1="3.5" y1="15" x2="20.5" y2="15"></line><path d="M8 11.5 q1 -2 2 0"></path><path d="M12 10.5 q1 -2 2 0"></path><path d="M16 11.5 q1 -2 2 0"></path>',
+  sjomat: '<circle cx="12" cy="13.5" r="3.6"></circle><line x1="8.6" y1="12.2" x2="5" y2="10.4"></line><line x1="8.4" y1="14" x2="4.8" y2="14.6"></line><line x1="8.8" y1="15.6" x2="5.6" y2="17.4"></line><line x1="15.4" y1="12.2" x2="19" y2="10.4"></line><line x1="15.6" y1="14" x2="19.2" y2="14.6"></line><line x1="15.2" y1="15.6" x2="18.4" y2="17.4"></line><path d="M9.6 10.6 L7 7.8 Q5.6 6.4 6.8 5.6"></path><path d="M14.4 10.6 L17 7.8 Q18.4 6.4 17.2 5.6"></path><circle cx="10.6" cy="12.4" r="0.7" fill="currentColor" stroke="none"></circle><circle cx="13.4" cy="12.4" r="0.7" fill="currentColor" stroke="none"></circle>',
+  gardsbesok: '<path d="M4 11 L12 5 L20 11 V20 H4 Z"></path><path d="M4 11 H20"></path><path d="M9.5 20 V13.5 H14.5 V20"></path><line x1="9.5" y1="13.5" x2="14.5" y2="16.8"></line><line x1="14.5" y1="13.5" x2="9.5" y2="16.8"></line>',
+  badstu: '<path d="M7 11 L8.4 19 H14.6 L16 11 Z"></path><line x1="6.2" y1="11" x2="16.8" y2="11"></line><path d="M8.4 11 a3 2.4 0 0 1 6.2 0"></path><line x1="16.8" y1="10.4" x2="20" y2="6.6"></line><circle cx="20.6" cy="5.8" r="1.4"></circle><path d="M10.5 6.6 c0.9 0.9 -0.9 1.7 0 2.6"></path>',
+  yoga: '<circle cx="12" cy="5.5" r="2"></circle><line x1="12" y1="7.5" x2="12" y2="13"></line><path d="M5 18 Q12 12.5 19 18"></path><path d="M12 12 L6 16"></path><path d="M12 12 L18 16"></path>',
+  camping: '<path d="M3 19 L12 5 L21 19 Z"></path><path d="M12 5 L9 19"></path><path d="M12 5 L15 19"></path><path d="M9 19 L12 12.5 L15 19"></path><line x1="2.5" y1="19" x2="21.5" y2="19"></line>',
+  glamping: '<path d="M3.5 19 Q12 2.5 20.5 19 Z"></path><line x1="12" y1="4" x2="12" y2="2"></line><path d="M10 19 L12 11.5 L14 19"></path><line x1="2.8" y1="19" x2="21.2" y2="19"></line>',
+  fyrtarn: '<path d="M9.5 20 L10.3 10 H13.7 L14.5 20 Z"></path><path d="M9.7 10 L9.2 7.5 H14.8 L14.3 10"></path><path d="M10.3 13.5 H13.7"></path><path d="M11 7.5 H13 V5.5 H11 Z"></path><line x1="7.5" y1="6.5" x2="9.5" y2="7"></line><line x1="16.5" y1="6.5" x2="14.5" y2="7"></line><line x1="8" y1="20" x2="16" y2="20"></line>',
+};
+
+// Compass — last-resort glyph when a category matches neither a slug nor a
+// fuzzy bucket, so the grid never renders an empty tile.
+const CATEGORY_ICON_FALLBACK =
+  '<circle cx="12" cy="12" r="9"></circle><path d="M15.5 8.5 L11 11 L8.5 15.5 L13 13 Z" fill="currentColor" stroke="none"></path>';
+
+// Resolve a category slug *or* a human label to an icon key. A direct slug hit
+// covers every live + future category; the fuzzy buckets keep the pre-data
+// fallback labels (e.g. "På vannet") and any legacy/internal slug
+// (vannaktivitet, wellness_spa …) showing a sensible icon. Order matters:
+// "vinter" is tested before the "vin" (wine) bucket.
+function resolveCategoryIconKey(catOrLabel: string | null | undefined): string {
+  const c = String(catOrLabel ?? "").toLowerCase();
+  if (CATEGORY_ICON_INNER[c]) return c;
+  if (/(vinter|ski|_sno|snø|aking|skøyte|skoyte|langrenn|nordlys)/.test(c)) return "vinter_sno";
+  if (/(safari|hval|dyreliv|fugl|whale|wildlife|elg|moskus)/.test(c)) return "dyreliv_safari";
+  if (/(vann|kajakk|kano|fjord|båt|seil|dykk|snork|fiske|rafting|padl|sjø)/.test(c)) return "kajakk";
+  if (/(overnatting|hytte|telt|camp|glamp|fyrtårn|fyrtarn)/.test(c)) return "overnatting_opplevelse";
+  if (/(velvær|velvaer|spa|wellness|sauna|badstu|yoga|massasj)/.test(c)) return "velvaere_spa";
+  if (/(kultur|museum|kunst|historie|teater|konsert|festival|galleri|samisk|arrangement)/.test(c)) return "kultur_historie";
+  if (/(adrenalin|action|familie|barn|lek|laser|escape|klatr)/.test(c)) return "adrenalin_action";
+  if (/(sightseeing|transport|buss|guidet|rundtur|helikopter|ballong|sykkel)/.test(c)) return "sightseeing_transport";
+  if (/(mat|drikke|smak|øl|vin|gård|gard|food|bakeri|bryggeri|sjømat|sjomat)/.test(c)) return "mat_drikke";
+  if (/(natur|friluft|fjell|tur|hike|vandr|topp|sopp|riding)/.test(c)) return "natur_friluft";
+  return "";
+}
+
+// Wrapped, sized <svg> for a category. Supplies the shared stroke presentation
+// attrs; inner dots override with their own fill where needed.
+function catIconSvg(catOrLabel: string | null | undefined, size: number, cls = ""): string {
+  const key = resolveCategoryIconKey(catOrLabel);
+  const inner = (key && CATEGORY_ICON_INNER[key]) || CATEGORY_ICON_FALLBACK;
+  return `<svg${cls ? ` class="${cls}"` : ""} viewBox="0 0 24 24" width="${size}" height="${size}" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${inner}</svg>`;
+}
+
 function safeCategories(): Array<{ category: string; count: number }> {
   try {
     return listCategories();
@@ -200,29 +298,9 @@ router.get("/", (req: Request, res: Response) => {
   const usingFallbackCats = cats.length === 0;
   const catSource = usingFallbackCats ? fallbackCats : cats.slice(0, 12);
 
-  // A small inline SVG glyph per category keeps the grid alive without any
-  // external image files. Falls back to a generic compass for unknown labels.
-  const catGlyph = (label: string): string => {
-    const l = label.toLowerCase();
-    if (/(vann|safari|hval|kajakk|fjord|båt|seil|dykk|fiske)/.test(l)) return "wave";
-    if (/(mat|drikke|smak|øl|vin|gård|food)/.test(l)) return "cup";
-    if (/(vinter|ski|snø|aking|skøyte)/.test(l)) return "snow";
-    if (/(kultur|museum|kunst|historie|teater)/.test(l)) return "frame";
-    if (/(familie|barn|lek|park|laser)/.test(l)) return "spark";
-    if (/(natur|friluft|fjell|tur|hike|vandr|klatr)/.test(l)) return "peak";
-    return "compass";
-  };
-  const GLYPHS: Record<string, string> = {
-    peak: '<path d="M3 18 L9 7 L13 13 L16 9 L21 18 Z" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"/>',
-    wave: '<path d="M3 9 Q6 6 9 9 T15 9 T21 9 M3 14 Q6 11 9 14 T15 14 T21 14" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/>',
-    cup: '<path d="M6 4 H16 V11 A5 5 0 0 1 6 11 Z M16 6 H18.5 A2 2 0 0 1 18.5 10 H16 M5 20 H17" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round" stroke-linecap="round"/>',
-    snow: '<path d="M12 3 V21 M4.5 7.5 L19.5 16.5 M19.5 7.5 L4.5 16.5" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/>',
-    frame: '<rect x="4" y="5" width="16" height="14" rx="1.5" fill="none" stroke="currentColor" stroke-width="1.6"/><path d="M4 15 L9 10 L13 14 L16 11 L20 15" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"/>',
-    spark: '<path d="M12 3 L14 10 L21 12 L14 14 L12 21 L10 14 L3 12 L10 10 Z" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"/>',
-    compass: '<circle cx="12" cy="12" r="9" fill="none" stroke="currentColor" stroke-width="1.6"/><path d="M15.5 8.5 L11 11 L8.5 15.5 L13 13 Z" fill="currentColor"/>',
-  };
-  const catIcon = (label: string): string =>
-    `<svg viewBox="0 0 24 24" width="26" height="26" aria-hidden="true">${GLYPHS[catGlyph(label)]}</svg>`;
+  // Each category card carries its own unique inline glyph (see CATEGORY_ICON_INNER
+  // / catIconSvg above). Keyed on the category slug, with a fuzzy + compass
+  // fallback for the pre-data example labels — no external image files.
 
   const catCards = catSource
     .map((c) => {
@@ -237,7 +315,7 @@ router.get("/", (req: Request, res: Response) => {
         ? `/opplevelser`
         : `/kategori/${encodeURIComponent(c.category)}`;
       return `<a class="cat-card" href="${href}">
-        <span class="cat-ico" aria-hidden="true">${catIcon(c.category)}</span>
+        <span class="cat-ico" aria-hidden="true">${catIconSvg(c.category, 26)}</span>
         <span class="cat-body">
           <span class="cat-name">${escapeHtml(catLabel(c.category))}</span>
           ${count}
@@ -941,35 +1019,6 @@ function numOrNull(v: unknown): number | null {
   return Number.isFinite(n) ? n : null;
 }
 
-// Category → inline SVG glyph for the hero placeholder. Mirrors the homepage
-// glyph set but keys on the internal category CODE (e.g. "vinter_sno") rather
-// than a display label, so it works directly off exp.category.
-const DETAIL_GLYPHS: Record<string, string> = {
-  peak: '<path d="M3 18 L9 7 L13 13 L16 9 L21 18 Z" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round"/>',
-  wave: '<path d="M3 9 Q6 6 9 9 T15 9 T21 9 M3 14 Q6 11 9 14 T15 14 T21 14" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/>',
-  cup: '<path d="M6 4 H16 V11 A5 5 0 0 1 6 11 Z M16 6 H18.5 A2 2 0 0 1 18.5 10 H16 M5 20 H17" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round" stroke-linecap="round"/>',
-  snow: '<path d="M12 3 V21 M4.5 7.5 L19.5 16.5 M19.5 7.5 L4.5 16.5" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/>',
-  frame: '<rect x="4" y="5" width="16" height="14" rx="1.5" fill="none" stroke="currentColor" stroke-width="1.4"/><path d="M4 15 L9 10 L13 14 L16 11 L20 15" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round"/>',
-  spark: '<path d="M12 3 L14 10 L21 12 L14 14 L12 21 L10 14 L3 12 L10 10 Z" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round"/>',
-  bed: '<path d="M3 17 V9 H13 A4 4 0 0 1 17 13 H21 V17 M3 13 H21 M3 17 V19 M21 17 V19" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/>',
-  spa: '<path d="M12 21 C7 17 5 13 8 10 C10 8 12 10 12 12 C12 10 14 8 16 10 C19 13 17 17 12 21 Z M12 12 V3" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round"/>',
-  compass: '<circle cx="12" cy="12" r="9" fill="none" stroke="currentColor" stroke-width="1.4"/><path d="M15.5 8.5 L11 11 L8.5 15.5 L13 13 Z" fill="currentColor"/>',
-};
-function detailGlyphKey(cat: string | null | undefined): string {
-  const c = String(cat ?? "").toLowerCase();
-  // Order matters: winter ("vinter") is checked before food so the "vin"
-  // substring in "vinter" doesn't get mis-routed to the wine/cup glyph.
-  if (/(vinter|ski|_sno|snø|aking|skøyte)/.test(c)) return "snow";
-  if (/(vann|safari|hval|kajakk|fjord|båt|seil|dykk|fiske|dyreliv)/.test(c)) return "wave";
-  if (/(overnatting|hytte|telt|camp)/.test(c)) return "bed";
-  if (/(velvaere|velvære|spa|wellness)/.test(c)) return "spa";
-  if (/(kultur|museum|kunst|historie|teater)/.test(c)) return "frame";
-  if (/(adrenalin|action|familie|barn|lek|park|laser)/.test(c)) return "spark";
-  if (/(natur|friluft|fjell|tur|hike|vandr|klatr|sightseeing|transport)/.test(c)) return "peak";
-  if (/(mat|drikke|smak|øl|vin|gård|food)/.test(c)) return "cup";
-  return "compass";
-}
-
 // Hero media: render a real photo if the row carries one (future enrichment),
 // otherwise a branded, category-themed SVG placeholder. The typed Experience
 // schema has no image column today, so we read image_url/image/hero_image
@@ -980,9 +1029,9 @@ function renderHeroMedia(exp: Record<string, unknown>, cat: string | null, place
     const alt = `${String(exp.title ?? "Opplevelse")}${place ? " – " + place : ""}`;
     return `<figure class="hero-media"><img src="${escapeHtml(img)}" alt="${escapeHtml(alt)}" loading="lazy" decoding="async" width="1080" height="540"></figure>`;
   }
-  const glyph = DETAIL_GLYPHS[detailGlyphKey(cat)];
+  const glyph = catIconSvg(cat, 72, "hero-glyph");
   return `<figure class="hero-media hero-placeholder" role="img" aria-label="${escapeHtml(catLabel(cat))} — illustrasjon">
-      <svg class="hero-glyph" viewBox="0 0 24 24" width="72" height="72" aria-hidden="true">${glyph}</svg>
+      ${glyph}
       <figcaption class="hero-cap">${escapeHtml(catLabel(cat))}</figcaption>
     </figure>`;
 }
