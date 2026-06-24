@@ -4208,7 +4208,8 @@ router.post("/admin/homepage-provenance-batch", async (req: Request, res: Respon
               OR k.field_provenance = '{}'
               OR k.field_provenance NOT LIKE '%"homepage"%'
             )
-          ORDER BY k.updated_at ASC
+            AND (k.url_fetch_fail_count < 3 OR k.url_fetch_fail_last IS NULL OR k.url_fetch_fail_last < datetime('now', '-14 days'))
+          ORDER BY k.url_fetch_fail_count ASC, k.updated_at ASC
           LIMIT ?`
       )
       .all(limit) as Array<{ agent_id: string; homepage_url: string | null }>;
@@ -4369,6 +4370,9 @@ router.post("/admin/homepage-provenance-batch", async (req: Request, res: Respon
         signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
       });
       if (!resp.ok) {
+        db.prepare(
+          "UPDATE agent_knowledge SET url_fetch_fail_count = COALESCE(url_fetch_fail_count, 0) + 1, url_fetch_fail_last = ? WHERE agent_id = ?"
+        ).run(new Date().toISOString(), agentId);
         return {
           agentId,
           status: "fetch_error",
@@ -4376,7 +4380,14 @@ router.post("/admin/homepage-provenance-batch", async (req: Request, res: Respon
         };
       }
       html = await resp.text();
+      // Successful fetch — reset failure counter.
+      db.prepare(
+        "UPDATE agent_knowledge SET url_fetch_fail_count = 0, url_fetch_fail_last = NULL WHERE agent_id = ?"
+      ).run(agentId);
     } catch (fetchErr: any) {
+      db.prepare(
+        "UPDATE agent_knowledge SET url_fetch_fail_count = COALESCE(url_fetch_fail_count, 0) + 1, url_fetch_fail_last = ? WHERE agent_id = ?"
+      ).run(new Date().toISOString(), agentId);
       return {
         agentId,
         status: "fetch_error",

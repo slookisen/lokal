@@ -2160,6 +2160,28 @@ function initSchema(db: Database.Database): void {
   `);
   db.exec(`CREATE INDEX IF NOT EXISTS idx_order_items_order_id ON order_items(order_id)`);
 
+  // ─── fetch-wall (orch-pr-20260624-fetchwall): url_fetch_fail tracking ────
+  // Tracks consecutive URL fetch failures per agent_knowledge row so the
+  // homepage-provenance-batch TIER-1 auto-select can skip dead-URL agents
+  // (fail_count >= 3 within last 14 days) and prefer rarely-failed ones.
+  // Idempotent — guarded by the migrations table.
+  try {
+    db.exec(`CREATE TABLE IF NOT EXISTS migrations (name TEXT PRIMARY KEY, applied_at TEXT DEFAULT (datetime('now')))`);
+    const alreadyRan = db.prepare("SELECT 1 FROM migrations WHERE name = 'add_url_fetch_fail_tracking_v1'").get();
+    if (!alreadyRan) {
+      for (const stmt of [
+        `ALTER TABLE agent_knowledge ADD COLUMN url_fetch_fail_count INTEGER DEFAULT 0`,
+        `ALTER TABLE agent_knowledge ADD COLUMN url_fetch_fail_last TEXT DEFAULT NULL`,
+      ]) {
+        try { db.exec(stmt); } catch { /* column already exists — expected on re-run */ }
+      }
+      db.prepare("INSERT INTO migrations (name) VALUES ('add_url_fetch_fail_tracking_v1')").run();
+      console.log("[init] Migration add_url_fetch_fail_tracking_v1 applied.");
+    }
+  } catch (e) {
+    console.warn("[init] add_url_fetch_fail_tracking_v1 migration skipped:", e instanceof Error ? e.message : String(e));
+  }
+
 }
 
 export function closeDb(): void {
