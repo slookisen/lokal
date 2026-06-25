@@ -1707,6 +1707,10 @@ Eksempel (cURL):
     -H "Content-Type: application/json" \\
     -d '{"jsonrpc":"2.0","method":"message/send","params":{"message":{"text":"finn tannlege med helfo-avtale i Oslo"}},"id":"1"}'
 
+## ChatGPT Custom GPT
+
+ChatGPT Custom GPT — Finn tannlege i Norge: https://chatgpt.com/g/g-6a21e79241cc8191a04642bda508e42b-finn-tannlege-i-norge
+
 ## MCP (Model Context Protocol)
 
 HTTP Streamable MCP:  ${DENTAL_BASE_URL}/mcp

@@ -251,6 +251,10 @@ Content-Type: application/json
 - [Teknologi](${BASE_URL}/teknologi): Hvordan A2A-teknologien fungerer
 - [Personvern](${BASE_URL}/personvern): Ingen cookies, ingen sporing
 
+## ChatGPT Custom GPT
+
+ChatGPT Custom GPT — Rett fra Bonden: https://chatgpt.com/g/g-69dbf8593c1c81919050f8da98cd327d-rett-fra-bonden
+
 ## Kontakt
 
 - Nettside: ${BASE_URL}
