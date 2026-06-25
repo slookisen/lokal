@@ -872,6 +872,13 @@ export type ExperienceContentRow = {
   title: string;
   description: string | null;
   category: string | null;
+  subcategory: string | null;
+  activity_tags: string | null;   // JSON-encoded string[] stored in DB
+  season: string | null;          // JSON-encoded string[] stored in DB
+  indoor_outdoor: string | null;
+  duration_min: number | null;
+  price_from: number | null;
+  booking_url: string | null;
   content_source: string | null;
   verification_status: string | null;
 };
@@ -880,7 +887,9 @@ export function getExperiencesForProvider(providerId: string): ExperienceContent
   const db = getDb(VERTICAL);
   return db
     .prepare(
-      `SELECT id, title, description, category, content_source, verification_status
+      `SELECT id, title, description, category, subcategory, activity_tags, season,
+              indoor_outdoor, duration_min, price_from, booking_url,
+              content_source, verification_status
          FROM experiences WHERE provider_id = ? ORDER BY created_at ASC`
     )
     .all(providerId) as ExperienceContentRow[];
@@ -902,21 +911,36 @@ export function isExperienceContentLocked(row: {
 
 /**
  * Apply homepage-sourced content to ONE experience, respecting locks + thin-only
- * gate. Writes `description` only if currently blank, `category` only if
- * currently empty; stamps content_source='provider_site', enrichment_state and
- * updated_at when anything changed. Returns the field names actually written
- * (empty array = nothing written: locked, or no thin field, or no candidates).
- * NEVER touches contact/orgnr/Brreg fields. Idempotent: a second run finds the
- * fields populated and writes nothing.
+ * gate. Writes each candidate field only if the experience's current value is
+ * blank; stamps content_source='provider_site', enrichment_state, and updated_at
+ * when anything changed. Returns the field names actually written.
+ * NEVER touches contact/orgnr/Brreg/owner fields. Idempotent: a second run finds
+ * the fields populated and writes nothing.
+ *
+ * Extended by experiences-richer-profiles (2026-06-25) to also write structured
+ * attributes: subcategory, activity_tags, season, indoor_outdoor, duration_min,
+ * price_from, booking_url — all written only to EMPTY + UNLOCKED experiences.
  */
 export function applyExperienceContent(
   experienceId: string,
-  candidate: { description?: string | null; category?: string | null }
+  candidate: {
+    description?: string | null;
+    category?: string | null;
+    subcategory?: string | null;
+    activity_tags?: string[] | null;
+    season?: string[] | null;
+    indoor_outdoor?: string | null;
+    duration_min?: number | null;
+    price_from?: number | null;
+    booking_url?: string | null;
+  }
 ): string[] {
   const db = getDb(VERTICAL);
   const row = db
     .prepare(
-      `SELECT id, description, category, content_source, verification_status
+      `SELECT id, description, category, subcategory, activity_tags, season,
+              indoor_outdoor, duration_min, price_from, booking_url,
+              content_source, verification_status
          FROM experiences WHERE id = ?`
     )
     .get(experienceId) as ExperienceContentRow | undefined;
@@ -927,23 +951,60 @@ export function applyExperienceContent(
   const params: Record<string, unknown> = { id: experienceId };
   const written: string[] = [];
 
-  const descBlank = !row.description || String(row.description).trim() === "";
-  if (descBlank && candidate.description && candidate.description.trim().length > 0) {
+  function isBlank(v: unknown): boolean {
+    if (v === null || v === undefined) return true;
+    const s = String(v).trim();
+    return s === "" || s === "null" || s === "[]";
+  }
+
+  if (isBlank(row.description) && candidate.description?.trim()) {
     sets.push("description = @description");
     params.description = candidate.description.trim();
     written.push("description");
   }
-
-  const catBlank = !row.category || String(row.category).trim() === "";
-  if (catBlank && candidate.category && candidate.category.trim().length > 0) {
+  if (isBlank(row.category) && candidate.category?.trim()) {
     sets.push("category = @category");
     params.category = candidate.category.trim();
     written.push("category");
   }
+  if (isBlank(row.subcategory) && candidate.subcategory?.trim()) {
+    sets.push("subcategory = @subcategory");
+    params.subcategory = candidate.subcategory.trim();
+    written.push("subcategory");
+  }
+  if (isBlank(row.activity_tags) && candidate.activity_tags?.length) {
+    sets.push("activity_tags = @activity_tags");
+    params.activity_tags = JSON.stringify(candidate.activity_tags);
+    written.push("activity_tags");
+  }
+  if (isBlank(row.season) && candidate.season?.length) {
+    sets.push("season = @season");
+    params.season = JSON.stringify(candidate.season);
+    written.push("season");
+  }
+  if (isBlank(row.indoor_outdoor) && candidate.indoor_outdoor) {
+    sets.push("indoor_outdoor = @indoor_outdoor");
+    params.indoor_outdoor = candidate.indoor_outdoor;
+    written.push("indoor_outdoor");
+  }
+  if (isBlank(row.duration_min) && typeof candidate.duration_min === "number") {
+    sets.push("duration_min = @duration_min");
+    params.duration_min = candidate.duration_min;
+    written.push("duration_min");
+  }
+  if (isBlank(row.price_from) && typeof candidate.price_from === "number") {
+    sets.push("price_from = @price_from");
+    params.price_from = candidate.price_from;
+    written.push("price_from");
+  }
+  if (isBlank(row.booking_url) && candidate.booking_url?.trim()) {
+    sets.push("booking_url = @booking_url");
+    params.booking_url = candidate.booking_url.trim();
+    written.push("booking_url");
+  }
 
   if (sets.length === 0) return [];
 
-  // Mark provenance + enrichment state on any successful content write.
   sets.push("content_source = 'provider_site'");
   sets.push("enrichment_state = 'enriched'");
   sets.push("updated_at = datetime('now')");
