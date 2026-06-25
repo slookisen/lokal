@@ -1199,6 +1199,7 @@ export function extractBookingUrl(
     if (BOOKING_KEYWORDS.some((kw) => anchorText.includes(kw) || hrefLower.includes(kw))) {
       try {
         const url = /^https?:\/\//i.test(href) ? href : new URL(href, pageBaseUrl).href;
+        if (!/^https?:\/\//i.test(url)) continue; // reject javascript:, data:, etc.
         return { value: url, snippet: `<a href="${href}">${m[2].trim()}</a>` };
       } catch {
         /* malformed href — skip */
