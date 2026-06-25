@@ -42,6 +42,12 @@ import {
   summarizeAbout,
   meetsAboutQualityBar,
   mapToExperienceCategories,
+  extractPriceFrom,
+  extractDurationMin,
+  extractSeasons,
+  extractIndoorOutdoor,
+  extractActivityTags,
+  extractBookingUrl,
 } from "../services/search-enrich";
 import { classifyProvider, sleep, BrregClass } from "../services/experience-brreg";
 
@@ -423,8 +429,13 @@ router.post("/admin/content-refresh", requireAdmin, async (req: Request, res: Re
   }
 
   let scanned = 0;
-  const byField: Record<string, number> = { description: 0, category: 0 };
-  const changed: Array<{ provider_id: string; fields: string[] }> = [];
+  const byField: Record<string, number> = {
+    description: 0, category: 0, subcategory: 0,
+    activity_tags: 0, season: 0, indoor_outdoor: 0,
+    duration_min: 0, price_from: 0, booking_url: 0,
+  };
+  type ProvenanceMap = Record<string, { source_url: string; snippet: string | null }>;
+  const changed: Array<{ provider_id: string; fields: string[]; provenance: ProvenanceMap }> = [];
   const skippedLocked: Array<{ provider_id: string; experience_ids: string[] }> = [];
   const errors: Array<{ provider_id: string; error: string }> = [];
 
@@ -445,36 +456,70 @@ router.post("/admin/content-refresh", requireAdmin, async (req: Request, res: Re
     }
     const { primaryHtml, combinedHtml } = fetched;
 
-    // Run the SHARED extractors + the experiences-vocab category mapper.
+    // ── Extract content + structured attributes from the fetched homepage ──────
     const contentText = extractVisibleText(combinedHtml);
     const aboutSummary = summarizeAbout(primaryHtml);
     const expCategories = mapToExperienceCategories(contentText);
 
-    // Build candidate content: about → description (quality-gated), first mapped
-    // slug → category. Both are only WRITTEN onto thin/empty fields by the store.
+    // Structured-attribute extraction (richer profiles, 2026-06-25).
+    const priceResult   = extractPriceFrom(contentText);
+    const durationResult = extractDurationMin(contentText);
+    const seasonResult  = extractSeasons(contentText);
+    const ioResult      = extractIndoorOutdoor(contentText);
+    const tagsResult    = extractActivityTags(contentText);
+    const bookingResult = extractBookingUrl(primaryHtml, fetched.fetchUrl);
+
     const candidateDescription = meetsAboutQualityBar(aboutSummary) ? aboutSummary : null;
     const candidateCategory = expCategories.length > 0 ? expCategories[0] : null;
+    const candidateActivityTags = tagsResult.values.length > 0 ? tagsResult.values : null;
+    const candidateSeason = seasonResult.values.length > 0 ? seasonResult.values : null;
 
+    // Provenance map — keyed by field name, value is { source_url, snippet }.
+    // Stored in the response only (not in DB). Faithfulness evidence for Daniel.
+    const provenance: ProvenanceMap = {};
+    if (candidateDescription)   provenance.description   = { source_url: fetched.fetchUrl, snippet: aboutSummary.slice(0, 120) };
+    if (candidateCategory)      provenance.category      = { source_url: fetched.fetchUrl, snippet: candidateCategory };
+    if (priceResult.value !== null)   provenance.price_from    = { source_url: fetched.fetchUrl, snippet: priceResult.snippet };
+    if (durationResult.value !== null) provenance.duration_min = { source_url: fetched.fetchUrl, snippet: durationResult.snippet };
+    if (candidateSeason)        provenance.season        = { source_url: fetched.fetchUrl, snippet: seasonResult.snippets.join(", ") };
+    if (ioResult.value)         provenance.indoor_outdoor = { source_url: fetched.fetchUrl, snippet: ioResult.snippet };
+    if (candidateActivityTags)  provenance.activity_tags = { source_url: fetched.fetchUrl, snippet: tagsResult.snippets.join(", ") };
+    if (bookingResult.value)    provenance.booking_url   = { source_url: fetched.fetchUrl, snippet: bookingResult.snippet };
+
+    // Check if anything extractable at all (avoids wasted processing).
+    const hasAnyCandidate = candidateDescription || candidateCategory || priceResult.value !== null
+      || durationResult.value !== null || candidateSeason || ioResult.value || candidateActivityTags
+      || bookingResult.value;
     scanned++;
-    if (!candidateDescription && !candidateCategory) return; // nothing extractable
+    if (!hasAnyCandidate) return;
 
-    // Gate per experience through the store (respects locks + thin-only).
     const expRows = getExperiencesForProvider(providerId);
     const writtenFields = new Set<string>();
     const lockedExpIds: string[] = [];
     const toApply: Array<{ id: string }> = [];
 
+    const candidateObj = {
+      description:    candidateDescription,
+      category:       candidateCategory,
+      activity_tags:  candidateActivityTags,
+      season:         candidateSeason,
+      indoor_outdoor: ioResult.value,
+      duration_min:   durationResult.value,
+      price_from:     priceResult.value,
+      booking_url:    bookingResult.value,
+    };
+
     for (const e of expRows) {
-      // Reportable lock detection (mirrors the store's gate) so the response can
-      // surface skipped_locked even on a dry-run.
       if (e.verification_status === "verified" || e.content_source === "manual" || e.content_source === "claim") {
-        // Only count it as "skipped_locked" if it WOULD otherwise have been a
-        // write target (has a thin field this run could have filled).
-        const descBlank = !e.description || String(e.description).trim() === "";
-        const catBlank = !e.category || String(e.category).trim() === "";
-        if ((candidateDescription && descBlank) || (candidateCategory && catBlank)) {
-          lockedExpIds.push(e.id);
-        }
+        // Count as skipped_locked only if at least one thin field would have been filled.
+        const anyThin = (candidateDescription && !e.description) || (candidateCategory && !e.category)
+          || (candidateObj.price_from !== null && !e.price_from)
+          || (candidateObj.duration_min !== null && !e.duration_min)
+          || (candidateObj.season && !e.season)
+          || (candidateObj.indoor_outdoor && !e.indoor_outdoor)
+          || (candidateObj.activity_tags && !e.activity_tags)
+          || (candidateObj.booking_url && !e.booking_url);
+        if (anyThin) lockedExpIds.push(e.id);
         continue;
       }
       toApply.push({ id: e.id });
@@ -485,42 +530,35 @@ router.post("/admin/content-refresh", requireAdmin, async (req: Request, res: Re
     }
 
     if (dryRun) {
-      // Report what WOULD be written, write nothing. Recompute thin-only here.
       for (const e of expRows) {
-        if (e.verification_status === "verified" || e.content_source === "manual" || e.content_source === "claim") {
-          continue;
-        }
-        const descBlank = !e.description || String(e.description).trim() === "";
-        const catBlank = !e.category || String(e.category).trim() === "";
-        if (candidateDescription && descBlank) writtenFields.add("description");
-        if (candidateCategory && catBlank) writtenFields.add("category");
+        if (e.verification_status === "verified" || e.content_source === "manual" || e.content_source === "claim") continue;
+        if (candidateDescription && (!e.description || !String(e.description).trim())) writtenFields.add("description");
+        if (candidateCategory && (!e.category || !String(e.category).trim())) writtenFields.add("category");
+        if (candidateObj.price_from !== null && !e.price_from) writtenFields.add("price_from");
+        if (candidateObj.duration_min !== null && !e.duration_min) writtenFields.add("duration_min");
+        if (candidateObj.season && (!e.season || e.season === "[]")) writtenFields.add("season");
+        if (candidateObj.indoor_outdoor && !e.indoor_outdoor) writtenFields.add("indoor_outdoor");
+        if (candidateObj.activity_tags && (!e.activity_tags || e.activity_tags === "[]")) writtenFields.add("activity_tags");
+        if (candidateObj.booking_url && !e.booking_url) writtenFields.add("booking_url");
       }
     } else {
-      // Apply through the lock-respecting store writer.
       for (const a of toApply) {
         try {
-          const fields = applyExperienceContent(a.id, {
-            description: candidateDescription,
-            category: candidateCategory,
-          });
+          const fields = applyExperienceContent(a.id, candidateObj);
           for (const f of fields) writtenFields.add(f);
         } catch (e: any) {
           errors.push({ provider_id: providerId, error: `write_failed ${a.id}: ${e?.message ?? String(e)}` });
         }
       }
       if (writtenFields.size > 0) {
-        try {
-          markProviderEnriched(providerId);
-        } catch {
-          /* best-effort enrichment stamp */
-        }
+        try { markProviderEnriched(providerId); } catch { /* best-effort */ }
       }
     }
 
     if (writtenFields.size > 0) {
       const fieldList = Array.from(writtenFields);
       for (const f of fieldList) if (f in byField) byField[f] += 1;
-      changed.push({ provider_id: providerId, fields: fieldList });
+      changed.push({ provider_id: providerId, fields: fieldList, provenance });
     }
   }
 

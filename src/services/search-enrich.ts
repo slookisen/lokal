@@ -1033,6 +1033,181 @@ export function mapToExperienceCategories(text: string | null | undefined): stri
   return EXPERIENCE_CATEGORIES.filter((c) => hits.has(c));
 }
 
+// ─── Structured-attribute extractors for experiences-richer-profiles ──────────
+//
+// PURE — no LLM, no I/O. Each extractor returns a matched value + a provenance
+// snippet (the exact text that yielded the value). Returns null/[] when no fact
+// is found — never guesses. All accent-fold via stripNorwegianAccents().
+
+/**
+ * Extract the lowest advertised price per person in NOK.
+ * Matches "fra 299 kr", "499 kr", "kr 299", "299,-", "NOK 399".
+ */
+export function extractPriceFrom(
+  text: string | null | undefined
+): { value: number | null; snippet: string | null } {
+  if (!text) return { value: null, snippet: null };
+  // Each pattern captures the numeric part in group 1.
+  const PATTERNS = [
+    /fra\s+(\d[\d\s]{0,5})\s*kr\b/gi,
+    /(\d[\d\s]{0,5})\s*(?:,-|nok)\b/gi,
+    /(\d[\d\s]{0,5})\s*kr\s*(?:\/\s*pers(?:on)?|pp\b)/gi,
+    /\bkr\.?\s*(\d[\d\s]{0,5})\b/gi,
+  ];
+  let best: { value: number; snippet: string } | null = null;
+  for (const pat of PATTERNS) {
+    let m: RegExpExecArray | null;
+    while ((m = pat.exec(text)) !== null) {
+      const val = parseInt(m[1].replace(/\s/g, ""), 10);
+      if (!isNaN(val) && val >= 10 && val <= 50000) {
+        if (!best || val < best.value) best = { value: val, snippet: m[0].trim() };
+      }
+    }
+  }
+  return best ? { value: best.value, snippet: best.snippet } : { value: null, snippet: null };
+}
+
+/**
+ * Extract experience duration in minutes.
+ * Matches "2 timer", "90 min", "1,5 timer", "halvdag" (240 min), "heldag" (480 min).
+ */
+export function extractDurationMin(
+  text: string | null | undefined
+): { value: number | null; snippet: string | null } {
+  if (!text) return { value: null, snippet: null };
+  const HOUR_RE = /(\d+(?:[.,]\d+)?)\s*(?:time|timer|hours?)\b/gi;
+  const MIN_RE = /(\d+)\s*min(?:utter?|utes?)?\b/gi;
+  const HALF_DAY_RE = /\bhalv(?:e)?\s*dag\b/gi;
+  const FULL_DAY_RE = /\bhel(?:e)?\s*dag\b/gi;
+  let m: RegExpExecArray | null;
+  if ((m = HOUR_RE.exec(text))) {
+    const val = Math.round(parseFloat(m[1].replace(",", ".")) * 60);
+    if (val > 0 && val <= 14400) return { value: val, snippet: m[0].trim() };
+  }
+  if ((m = MIN_RE.exec(text))) {
+    const val = parseInt(m[1], 10);
+    if (val > 0 && val <= 14400) return { value: val, snippet: m[0].trim() };
+  }
+  if ((m = HALF_DAY_RE.exec(text))) return { value: 240, snippet: m[0].trim() };
+  if ((m = FULL_DAY_RE.exec(text))) return { value: 480, snippet: m[0].trim() };
+  return { value: null, snippet: null };
+}
+
+const SEASON_LEXICON: ReadonlyArray<readonly [string, readonly string[]]> = [
+  ["summer", ["sommer", "sommeren", "juni", "juli", "august", "summer"]],
+  ["winter", ["vinter", "vinteren", "desember", "januar", "februar", "winter"]],
+  ["spring", ["var", "varen", "mars", "april", "mai", "spring"]],
+  ["autumn", ["host", "hosten", "september", "oktober", "november", "autumn", "fall"]],
+];
+
+/**
+ * Extract applicable seasons from visible text. Returns deduped season slugs +
+ * one representative snippet per match. Accent-folds input before matching.
+ */
+export function extractSeasons(
+  text: string | null | undefined
+): { values: string[]; snippets: string[] } {
+  if (!text) return { values: [], snippets: [] };
+  const hay = stripNorwegianAccents(text.toLowerCase());
+  const found: string[] = [];
+  const snippets: string[] = [];
+  for (const [season, keywords] of SEASON_LEXICON) {
+    for (const kw of keywords) {
+      if (hay.includes(kw)) { found.push(season); snippets.push(kw); break; }
+    }
+  }
+  return { values: found, snippets };
+}
+
+/**
+ * Detect indoor / outdoor suitability. Returns 'indoor', 'outdoor', 'both',
+ * or null when undetectable from the text.
+ */
+export function extractIndoorOutdoor(
+  text: string | null | undefined
+): { value: "indoor" | "outdoor" | "both" | null; snippet: string | null } {
+  if (!text) return { value: null, snippet: null };
+  const hay = stripNorwegianAccents(text.toLowerCase());
+  const INDOOR_KWS = ["innendors", "inne ", "innomhus", "indoor", "innenfor"];
+  const OUTDOOR_KWS = ["utendors", "ute ", "utomhus", "outdoor", "utenfor", "friluft"];
+  let indoorSnippet: string | null = null;
+  let outdoorSnippet: string | null = null;
+  for (const kw of INDOOR_KWS) { if (hay.includes(kw)) { indoorSnippet = kw.trim(); break; } }
+  for (const kw of OUTDOOR_KWS) { if (hay.includes(kw)) { outdoorSnippet = kw.trim(); break; } }
+  if (indoorSnippet && outdoorSnippet) return { value: "both", snippet: `${indoorSnippet} / ${outdoorSnippet}` };
+  if (indoorSnippet) return { value: "indoor", snippet: indoorSnippet };
+  if (outdoorSnippet) return { value: "outdoor", snippet: outdoorSnippet };
+  return { value: null, snippet: null };
+}
+
+const ACTIVITY_TAG_LEXICON: ReadonlyArray<readonly [string, readonly string[]]> = [
+  ["guided_tour", ["guidet tur", "guided tour"]],
+  ["kayaking", ["kajakk", "kayak"]],
+  ["hiking", ["fottur", "fjelltur", "vandring", "hiking", "trekking"]],
+  ["wildlife", ["hvalsafari", "dyreliv", "safari", "wildlife"]],
+  ["fishing", ["fisketur", "havfiske", "fiske "]],
+  ["skiing", ["skitur", "langrenn", "telemark"]],
+  ["dogsledding", ["hundekjoring", "hundeslede"]],
+  ["northern_lights", ["nordlys", "nordlystur", "aurora", "northern lights"]],
+  ["rafting", ["rafting", "elvepadling"]],
+  ["farm_visit", ["gardsbesok", "besoksgard", "gardsopplevelse"]],
+  ["spa_wellness", ["spa", "wellness", "badstu", "isbad"]],
+  ["food_tour", ["matkurs", "olsmaking", "food tour", "matvandring"]],
+  ["cycling", ["sykkeltur", "terrengsykling", "cycling"]],
+  ["climbing", ["klatring", "via ferrata", "climbing"]],
+  ["water_sports", ["dykking", "snorkling", "stand up paddle"]],
+];
+
+/**
+ * Extract activity tags from visible text. Returns up to 5 matched tag slugs +
+ * one snippet per tag. PURE — accent-folds input before matching.
+ */
+export function extractActivityTags(
+  text: string | null | undefined
+): { values: string[]; snippets: string[] } {
+  if (!text) return { values: [], snippets: [] };
+  const hay = stripNorwegianAccents(text.toLowerCase());
+  const found: string[] = [];
+  const snippets: string[] = [];
+  for (const [tag, keywords] of ACTIVITY_TAG_LEXICON) {
+    if (found.length >= 5) break;
+    for (const kw of keywords) {
+      const norm = stripNorwegianAccents(kw);
+      if (hay.includes(norm)) { found.push(tag as string); snippets.push(kw); break; }
+    }
+  }
+  return { values: found, snippets };
+}
+
+/**
+ * Extract a booking / ticket URL from raw HTML. Looks for <a href="…"> whose
+ * anchor text or href contains booking keywords. Returns first match as an
+ * absolute URL + a short excerpt of the anchor tag.
+ */
+export function extractBookingUrl(
+  html: string | null | undefined,
+  pageBaseUrl: string
+): { value: string | null; snippet: string | null } {
+  if (!html) return { value: null, snippet: null };
+  const BOOKING_KEYWORDS = ["bestill", "book", "kjop", "ticket", "billet", "reserver", "billett"];
+  const linkRe = /<a\s[^>]*href=["']([^"'#][^"']{0,200})["'][^>]*>([^<]{0,80})<\/a>/gi;
+  let m: RegExpExecArray | null;
+  while ((m = linkRe.exec(html)) !== null) {
+    const href = m[1].trim();
+    const anchorText = stripNorwegianAccents(m[2].toLowerCase());
+    const hrefLower = stripNorwegianAccents(href.toLowerCase());
+    if (BOOKING_KEYWORDS.some((kw) => anchorText.includes(kw) || hrefLower.includes(kw))) {
+      try {
+        const url = /^https?:\/\//i.test(href) ? href : new URL(href, pageBaseUrl).href;
+        return { value: url, snippet: `<a href="${href}">${m[2].trim()}</a>` };
+      } catch {
+        /* malformed href — skip */
+      }
+    }
+  }
+  return { value: null, snippet: null };
+}
+
 /** SSRF guard: allow only http(s) to public hosts; block localhost, link-local,
  * private/CGNAT ranges and cloud-metadata (169.254.0.0/16). Domain names are allowed
  * (DNS-rebinding is out of scope for this admin-gated, dry-run-by-default endpoint). */
