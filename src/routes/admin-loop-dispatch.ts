@@ -122,6 +122,7 @@ async function fireRoutine(
         method: "POST",
         headers: {
           Authorization: `Bearer ${ref.token}`,
+          "anthropic-version": "2023-06-01",
           "anthropic-beta": FIRE_BETA,
           "Content-Type": "application/json",
         },
