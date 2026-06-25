@@ -185,7 +185,7 @@ router.post("/", async (req: Request, res: Response) => {
         deferred.push({ agent: w.agent, reason: w.reason, why: "shadow mode" });
         continue;
       }
-      const text = `Off-cycle wake by loop-dispatcher (run ${w.reason} set next_suggested=${w.agent}). One-time run.`;
+      const text = `Off-cycle wake by loop-dispatcher (${w.reason}; next_suggested=${w.agent}). Run your FULL normal cycle exactly as a scheduled run would: complete every step, write your usual end-of-run report, and POST your run-envelope to /admin/runs at the end so this wake is visible in the run-ledger. One-time run.`;
       const r = await fireRoutine(ref, text);
       fired.push({ agent: w.agent, reason: w.reason, ...r });
     }
