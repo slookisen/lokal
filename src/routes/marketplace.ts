@@ -4208,7 +4208,14 @@ router.post("/admin/homepage-provenance-batch", async (req: Request, res: Respon
               OR k.field_provenance = '{}'
               OR k.field_provenance NOT LIKE '%"homepage"%'
             )
-          ORDER BY k.updated_at ASC
+          -- orch-pr-20260625-1 (controller-handoff 2026-06-24-lokal-agent-enrichment-2
+          --   + companion -homepage-fetch-wall-1): order REACHABLE homepages first so the
+          --   batch stops re-selecting the same dead-URL TIER-1 cohort every run. Pure
+          --   ordering change (no row excluded -> outreach_pool candidate set unchanged);
+          --   reachable = url_last_status 2xx/3xx (same predicate as init.ts pool gate).
+          ORDER BY
+            CASE WHEN k.url_last_status BETWEEN 200 AND 399 THEN 0 ELSE 1 END,
+            k.updated_at ASC
           LIMIT ?`
       )
       .all(limit) as Array<{ agent_id: string; homepage_url: string | null }>;
