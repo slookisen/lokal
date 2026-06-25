@@ -862,6 +862,10 @@ bygget for å bli oppdaget og spurt av AI-agenter. Tjenesten lar agenter finne
 turer, kurs og opplevelser filtrert på fylke, kommune, kategori, vær, sesong,
 gruppestørrelse, alder, pris, varighet og språk.
 
+## ChatGPT Custom GPT
+
+ChatGPT Custom GPT — Opplevagent: https://chatgpt.com/g/g-6a3ab590a7f081919c528a15c6765a7d-opplevagent-finn-opplevelser-i-norge
+
 ## MCP (Model Context Protocol) — Streamable HTTP
 
 MCP-endepunkt (Streamable HTTP):  ${url}/mcp

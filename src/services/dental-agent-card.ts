@@ -101,5 +101,14 @@ export function getDentalAgentCard(): object {
       openapi: `${url}/openapi.json`,
       llms: `${url}/llms.txt`,
     },
+    "x-distribution": [
+      {
+        channel: "custom-gpt",
+        url: "https://chatgpt.com/g/g-6a21e79241cc8191a04642bda508e42b-finn-tannlege-i-norge",
+        install: "https://chatgpt.com/g/g-6a21e79241cc8191a04642bda508e42b-finn-tannlege-i-norge",
+        status: "live",
+        description: "ChatGPT Custom GPT — Finn tannlege i Norge clinic discovery; Actions on finn-tannlege.com/openapi.json.",
+      },
+    ],
   };
 }
