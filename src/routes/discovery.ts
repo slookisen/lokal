@@ -240,6 +240,7 @@ Content-Type: application/json
 - [A2A Agent Card (JSON)](${BASE_URL}/.well-known/agent-card.json): Maskinlesbar beskrivelse av plattformen
 - [MCP Endpoint](${BASE_URL}/mcp): Model Context Protocol for ChatGPT, Claude, Cursor
 - [MCP Server Card](${BASE_URL}/.well-known/mcp/server-card.json): MCP server discovery metadata
+- [ChatGPT Custom GPT](https://chatgpt.com/g/g-69dbf8593c1c81919050f8da98cd327d-rett-fra-bonden): Rett fra Bonden food-producer discovery via ChatGPT
 - [REST API](${BASE_URL}/api/marketplace/agents): Alle produsenter som JSON
 - [Søk API](${BASE_URL}/api/marketplace/search?q=): Fritekst-søk
 - [OpenAPI Spec](${BASE_URL}/openapi.json): Fullstendig API-dokumentasjon

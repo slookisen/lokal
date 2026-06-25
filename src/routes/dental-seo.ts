@@ -1711,6 +1711,7 @@ Eksempel (cURL):
 
 HTTP Streamable MCP:  ${DENTAL_BASE_URL}/mcp
 npm-pakke (stdio):    npx finn-tannlege-mcp
+ChatGPT Custom GPT:   https://chatgpt.com/g/g-6a21e79241cc8191a04642bda508e42b-finn-tannlege-i-norge
 
 Tilgjengelige MCP-tools:
 - tannlege_search   — søk klinikker (fritekst, fylke, spesialitet, Helfo, akutt)

@@ -866,6 +866,7 @@ gruppestørrelse, alder, pris, varighet og språk.
 
 MCP-endepunkt (Streamable HTTP):  ${url}/mcp
 Koble til: lim inn https://opplevagent.no/mcp i Claude Desktop / ChatGPT som MCP-URL.
+ChatGPT Custom GPT:   https://chatgpt.com/g/g-6a3ab590a7f081919c528a15c6765a7d-opplevagent-finn-opplevelser-i-norge
 
 Tilgjengelige MCP-verktøy:
 - discover_experiences         — finn opplevelser etter fylke, kategori, vær, sesong, pris m.m.

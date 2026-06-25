@@ -103,6 +103,15 @@ export function getExperiencesAgentCard(): object {
         ],
       },
     ],
+    "x-distribution": [
+      {
+        channel: "custom-gpt",
+        url: "https://chatgpt.com/g/g-6a3ab590a7f081919c528a15c6765a7d-opplevagent-finn-opplevelser-i-norge",
+        install: "https://chatgpt.com/g/g-6a3ab590a7f081919c528a15c6765a7d-opplevagent-finn-opplevelser-i-norge",
+        status: "live",
+        description: "ChatGPT Custom GPT — Opplevagent experiences discovery; 3 Actions on opplevagent.no/openapi.json (discover/categories/get).",
+      },
+    ],
     endpoints: {
       rest: `${url}/api/opplevelser`,
       discover: `${url}/api/opplevelser/discover`,
