@@ -94,6 +94,90 @@ export const GetExperienceInputSchema = {
   ),
 };
 
+// ─── OpenAI Apps SDK UI components (MCP resources) ──────────
+// These HTML resources are served via resources/list + resources/read so
+// ChatGPT can render inline cards when a tool result references the template.
+// Content is fully self-contained (no external CDN) per spec.
+
+const EXPERIENCES_LIST_HTML = `<!DOCTYPE html>
+<html lang="no">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Opplevagent — Opplevelser</title>
+<style>
+  body { font-family: system-ui, sans-serif; margin: 0; padding: 8px; background: #fff; }
+  .card { border: 1px solid #e5e7eb; border-radius: 8px; padding: 12px; margin-bottom: 8px; cursor: pointer; }
+  .card:hover { background: #f9fafb; }
+  .card h3 { margin: 0 0 4px; font-size: 14px; font-weight: 600; color: #111; }
+  .card p { margin: 0; font-size: 12px; color: #6b7280; }
+  .badge { display: inline-block; background: #f3f4f6; border-radius: 4px; padding: 2px 6px; font-size: 11px; margin-right: 4px; }
+</style>
+</head>
+<body>
+<div id="root"></div>
+<script>
+(async () => {
+  const data = await window.openai?.getToolOutput?.() || {};
+  const results = data.results || data.experiences || [];
+  const root = document.getElementById('root');
+  if (!results.length) { root.innerHTML = '<p>Ingen opplevelser funnet.</p>'; return; }
+  root.innerHTML = results.map(e => \`
+    <div class="card" onclick="window.openai?.sendMessage?.('Vis detaljer for \${e.title}')">
+      <h3>\${e.title}</h3>
+      <p>
+        <span class="badge">\${e.category || ''}</span>
+        <span class="badge">\${e.fylke || e.kommune || ''}</span>
+        \${e.price_from ? \`<span class="badge">fra \${e.price_from} kr</span>\` : ''}
+        \${e.duration_min ? \`<span class="badge">\${e.duration_min} min</span>\` : ''}
+      </p>
+      <p><a href="https://opplevagent.no/opplevelse/\${e.slug}" target="_blank" rel="noopener">Les mer ↗</a></p>
+    </div>
+  \`).join('');
+})();
+</script>
+</body>
+</html>`;
+
+const EXPERIENCE_DETAIL_HTML = `<!DOCTYPE html>
+<html lang="no">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Opplevagent — Detaljer</title>
+<style>
+  body { font-family: system-ui, sans-serif; margin: 0; padding: 12px; background: #fff; }
+  h2 { margin: 0 0 8px; font-size: 16px; color: #111; }
+  p { margin: 0 0 6px; font-size: 13px; color: #374151; }
+  .meta { font-size: 12px; color: #6b7280; margin-bottom: 8px; }
+  .badge { display: inline-block; background: #f3f4f6; border-radius: 4px; padding: 2px 6px; font-size: 11px; margin-right: 4px; }
+  a.cta { display: inline-block; margin-top: 8px; padding: 8px 16px; background: #059669; color: #fff; border-radius: 6px; text-decoration: none; font-size: 13px; }
+</style>
+</head>
+<body>
+<div id="root"></div>
+<script>
+(async () => {
+  const e = await window.openai?.getToolOutput?.() || {};
+  const root = document.getElementById('root');
+  root.innerHTML = \`
+    <h2>\${e.title || 'Opplevelse'}</h2>
+    <div class="meta">
+      <span class="badge">\${e.category || ''}</span>
+      <span class="badge">\${e.fylke || ''}</span>
+      \${e.indoor_outdoor ? \`<span class="badge">\${e.indoor_outdoor}</span>\` : ''}
+      \${e.price_from ? \`<span class="badge">fra \${e.price_from} kr</span>\` : ''}
+      \${e.duration_min ? \`<span class="badge">\${e.duration_min} min</span>\` : ''}
+    </div>
+    <p>\${e.description || ''}</p>
+    \${e.booking_url ? \`<a class="cta" href="\${e.booking_url}" target="_blank" rel="noopener">Book nå ↗</a>\` : ''}
+    <br><a href="https://opplevagent.no/opplevelse/\${e.slug || ''}" target="_blank" rel="noopener" style="font-size:12px;color:#6b7280;">Se på opplevagent.no ↗</a>
+  \`;
+})();
+</script>
+</body>
+</html>`;
+
 // ─── Tool registrations ──────────────────────────────────────
 
 function registerExperienceTools(server: McpServer): void {
@@ -117,6 +201,9 @@ function registerExperienceTools(server: McpServer): void {
         destructiveHint: false,
         idempotentHint: true,
         openWorldHint: true,
+      },
+      _meta: {
+        "openai/outputTemplate": "ui://opplevagent/experiences-list",
       },
     },
     async ({ fylke, kommune, category, weather, season, indoor_outdoor, group_size, age, max_price, duration_max, language, limit }) => {
@@ -232,6 +319,46 @@ function registerExperienceTools(server: McpServer): void {
     }
   );
 
+  // ─── OpenAI Apps SDK resources ──────────────────────────────
+  // resources/list returns these two; resources/read returns the HTML content.
+  // ChatGPT uses these as output templates referenced by tools via _meta.
+
+  server.resource(
+    "experiences-list",
+    "ui://opplevagent/experiences-list",
+    {
+      description: "ChatGPT inline card list for discover_experiences results — renders each experience as a clickable card with title, category, location, price, and duration.",
+      mimeType: "text/html",
+    },
+    async () => ({
+      contents: [
+        {
+          uri: "ui://opplevagent/experiences-list",
+          text: EXPERIENCES_LIST_HTML,
+          mimeType: "text/html",
+        },
+      ],
+    })
+  );
+
+  server.resource(
+    "experience-detail",
+    "ui://opplevagent/experience-detail",
+    {
+      description: "ChatGPT inline card for get_experience results — renders full details for a single experience with title, meta badges, description, and a booking CTA.",
+      mimeType: "text/html",
+    },
+    async () => ({
+      contents: [
+        {
+          uri: "ui://opplevagent/experience-detail",
+          text: EXPERIENCE_DETAIL_HTML,
+          mimeType: "text/html",
+        },
+      ],
+    })
+  );
+
   // Tool 3: get_experience
   server.registerTool(
     "get_experience",
@@ -252,6 +379,9 @@ function registerExperienceTools(server: McpServer): void {
         destructiveHint: false,
         idempotentHint: true,
         openWorldHint: true,
+      },
+      _meta: {
+        "openai/outputTemplate": "ui://opplevagent/experience-detail",
       },
     },
     async ({ id }) => {

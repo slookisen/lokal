@@ -1,0 +1,18 @@
+{
+  "schema_version": "v1",
+  "name_for_human": "Opplevagent",
+  "name_for_model": "opplevagent",
+  "description_for_human": "Finn norske opplevelser — aktiviteter, mat og naturopplevelser i hele Norge.",
+  "description_for_model": "Opplevagent er en norsk opplevelsesmarkedsplass. Bruk discoverExperiences for å søke etter opplevelser etter kategori, fylke og pris. Bruk getExperience for detaljer om én opplevelse. Bruk listExperienceCategories for kategorier.",
+  "auth": {
+    "type": "none"
+  },
+  "api": {
+    "type": "mcp",
+    "url": "https://opplevagent.no/mcp"
+  },
+  "logo_url": "https://opplevagent.no/favicon-192.png",
+  "contact_email": "da.fredriksen@gmail.com",
+  "legal_info_url": "https://opplevagent.no/vilkar",
+  "privacy_policy_url": "https://opplevagent.no/personvern"
+}
