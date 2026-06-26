@@ -399,10 +399,57 @@ router.post(["/", "/mcp"], async (req: Request, res: Response) => {
   }
 });
 
-// GET /mcp — SSE stream for server-to-client notifications
+// GET /mcp — SSE stream for server-to-client notifications.
+// If no mcp-session-id header is present (e.g. a browser navigating directly),
+// return a friendly HTML landing page (200) instead of a raw 400 JSON error.
 router.get(["/", "/mcp"], async (req: Request, res: Response) => {
   const sessionId = req.headers["mcp-session-id"] as string | undefined;
-  if (!sessionId || !experiencesSessions.has(sessionId)) {
+  if (!sessionId) {
+    // Browser-friendly landing page — explains what the endpoint is and how
+    // to connect. Only shown when the session header is absent (browser visit).
+    // MCP POST/session handshake is NOT affected by this branch.
+    res.status(200).setHeader("Content-Type", "text/html; charset=utf-8").send(`<!doctype html>
+<html lang="no">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Opplevagent MCP-endepunkt</title>
+<style>
+  *{margin:0;padding:0;box-sizing:border-box}
+  body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;background:#f7f4ee;color:#18130d;line-height:1.6;padding:40px 24px}
+  .card{max-width:640px;margin:0 auto;background:#fff;border:1px solid #e4ded0;border-radius:14px;padding:36px 36px 32px;box-shadow:0 6px 18px rgba(24,19,13,.08)}
+  h1{font-size:1.45rem;font-weight:800;letter-spacing:-.02em;color:#0e3c36;margin-bottom:8px}
+  .sub{color:#544a3e;margin-bottom:24px;font-size:.97rem}
+  .label{font-size:.75rem;font-weight:800;letter-spacing:.1em;text-transform:uppercase;color:#0c7264;margin-bottom:6px}
+  .endpoint{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:.92rem;background:#f0ede6;border:1px solid #ddd8cc;border-radius:7px;padding:10px 14px;color:#18130d;margin-bottom:20px;word-break:break-all}
+  pre{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:.82rem;background:#0e3c36;color:#d4f0e8;border-radius:9px;padding:16px 18px;overflow-x:auto;line-height:1.55;margin-bottom:24px}
+  .back{font-size:.88rem;color:#0c7264}
+  .back a{color:#0c7264;font-weight:600}
+</style>
+</head>
+<body>
+<div class="card">
+  <h1>Opplevagent MCP-endepunkt</h1>
+  <p class="sub">Dette er <strong>opplevagent.no</strong> sitt MCP-endepunkt. For &aring; koble til trenger du en MCP-klient (f.eks. Claude Desktop, Cursor, eller en AI-assistent med MCP-st&oslash;tte).</p>
+
+  <div class="label">Endepunkt-URL</div>
+  <div class="endpoint">https://opplevagent.no/mcp</div>
+
+  <div class="label">curl-eksempel (initialize)</div>
+  <pre>curl -X POST https://opplevagent.no/mcp \\
+  -H "Content-Type: application/json" \\
+  -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"my-agent","version":"1.0"}}}'</pre>
+
+  <div class="label">Tilgjengelige verkt&oslash;y</div>
+  <p class="sub" style="margin-bottom:20px">discover_experiences &bull; list_experience_categories &bull; get_experience</p>
+
+  <p class="back">&larr; <a href="/">Tilbake til opplevagent.no</a></p>
+</div>
+</body>
+</html>`);
+    return;
+  }
+  if (!experiencesSessions.has(sessionId)) {
     res.status(400).json({ error: "Missing or invalid mcp-session-id header" });
     return;
   }
