@@ -27,10 +27,12 @@ import {
   DiscoverFilterSchema,
   // orch-experiences-content-refresh — homepage→content writer
   selectProvidersForContentRefresh,
+  selectProvidersNeedingEnrichmentNoHomepage,
   getProviderContentTarget,
   getExperiencesForProvider,
   applyExperienceContent,
   markProviderEnriched,
+  EXPERIENCE_DESCRIPTION_PLACEHOLDER,
   type ContentRefreshTarget,
 } from "../services/experience-store";
 // PURE homepage extractors + SSRF guard — REUSED from the rfb search-enrich
@@ -439,6 +441,16 @@ router.post("/admin/content-refresh", requireAdmin, async (req: Request, res: Re
   const skippedLocked: Array<{ provider_id: string; experience_ids: string[] }> = [];
   const errors: Array<{ provider_id: string; error: string }> = [];
 
+  // Surface providers that need enrichment but have no homepage URL — they cannot
+  // be scraped but should be visible in the response so operators know they exist.
+  // Only added in auto-select mode (not when caller specified explicit providerIds).
+  if (!Array.isArray(body.providerIds) || body.providerIds.length === 0) {
+    const noHomepage = selectProvidersNeedingEnrichmentNoHomepage(limit);
+    for (const p of noHomepage) {
+      errors.push({ provider_id: p.id, error: `no_homepage: ${p.navn}` });
+    }
+  }
+
   async function processOne(t: ContentRefreshTarget): Promise<void> {
     const providerId = t.id;
 
@@ -512,7 +524,8 @@ router.post("/admin/content-refresh", requireAdmin, async (req: Request, res: Re
     for (const e of expRows) {
       if (e.verification_status === "verified" || e.content_source === "manual" || e.content_source === "claim") {
         // Count as skipped_locked only if at least one thin field would have been filled.
-        const anyThin = (candidateDescription && !e.description) || (candidateCategory && !e.category)
+        const descIsBlank = !e.description || !String(e.description).trim() || String(e.description).trim() === EXPERIENCE_DESCRIPTION_PLACEHOLDER;
+        const anyThin = (candidateDescription && descIsBlank) || (candidateCategory && !e.category)
           || (candidateObj.price_from !== null && !e.price_from)
           || (candidateObj.duration_min !== null && !e.duration_min)
           || (candidateObj.season && !e.season)
@@ -532,7 +545,8 @@ router.post("/admin/content-refresh", requireAdmin, async (req: Request, res: Re
     if (dryRun) {
       for (const e of expRows) {
         if (e.verification_status === "verified" || e.content_source === "manual" || e.content_source === "claim") continue;
-        if (candidateDescription && (!e.description || !String(e.description).trim())) writtenFields.add("description");
+        const descThin = !e.description || !String(e.description).trim() || String(e.description).trim() === EXPERIENCE_DESCRIPTION_PLACEHOLDER;
+        if (candidateDescription && descThin) writtenFields.add("description");
         if (candidateCategory && (!e.category || !String(e.category).trim())) writtenFields.add("category");
         if (candidateObj.price_from !== null && !e.price_from) writtenFields.add("price_from");
         if (candidateObj.duration_min !== null && !e.duration_min) writtenFields.add("duration_min");

@@ -811,6 +811,15 @@ export function getProviderByName(navn: string): Record<string, unknown> | null 
 //     only if currently empty. We never overwrite an existing non-empty value
 //     (blank beats wrong), matching the rfb "only fill google-sourced/empty" gate.
 
+/**
+ * Placeholder description inserted by the bulk-load seed (experiences vertical).
+ * Providers whose description equals this string are treated as having an EMPTY
+ * description for content-refresh selection and write purposes — they are fully
+ * eligible for homepage-based enrichment.
+ */
+export const EXPERIENCE_DESCRIPTION_PLACEHOLDER =
+  "Detaljert beskrivelse publiseres fortløpende.";
+
 export type ContentRefreshTarget = {
   id: string;
   navn: string;
@@ -820,9 +829,11 @@ export type ContentRefreshTarget = {
 /**
  * Auto-select providers eligible for a homepage content-refresh: providers that
  * HAVE a website (hjemmeside) AND own ≥1 experience whose content is THIN
- * (description empty OR category empty) and NOT locked (not verified, not
- * manual/claim-sourced). Ordered oldest-enriched first (last_enriched_at NULLs
- * first) so a sweep makes progress. Capped by `limit`.
+ * (description empty/placeholder OR category empty) and NOT locked (not verified,
+ * not manual/claim-sourced). The bulk-load placeholder text
+ * (EXPERIENCE_DESCRIPTION_PLACEHOLDER) is treated as empty so bulk-loaded providers
+ * are selectable for enrichment. Ordered oldest-enriched first (last_enriched_at
+ * NULLs first) so a sweep makes progress. Capped by `limit`.
  */
 export function selectProvidersForContentRefresh(limit = 25): ContentRefreshTarget[] {
   const db = getDb(VERTICAL);
@@ -839,14 +850,47 @@ export function selectProvidersForContentRefresh(limit = 25): ContentRefreshTarg
                AND (e.content_source IS NULL OR e.content_source NOT IN ('manual','claim'))
                AND (
                      e.description IS NULL OR TRIM(e.description) = ''
+                  OR TRIM(e.description) = ?
                   OR e.category    IS NULL OR TRIM(e.category)    = ''
                    )
           )
         ORDER BY (p.last_enriched_at IS NOT NULL), p.last_enriched_at ASC, p.created_at ASC
         LIMIT ?`
     )
-    .all(cap) as Array<{ id: string; navn: string; hjemmeside: string }>;
+    .all(EXPERIENCE_DESCRIPTION_PLACEHOLDER, cap) as Array<{ id: string; navn: string; hjemmeside: string }>;
   return rows.filter((r) => r.hjemmeside && r.hjemmeside.trim().length > 0);
+}
+
+/**
+ * Select providers that have thin experiences (description empty/placeholder OR
+ * category empty, unlocked) but NO usable hjemmeside URL — they cannot be scraped
+ * but should appear in the content-refresh error list so operators know they exist.
+ * Capped by `limit`.
+ */
+export function selectProvidersNeedingEnrichmentNoHomepage(limit = 100): Array<{ id: string; navn: string }> {
+  const db = getDb(VERTICAL);
+  const cap = Math.max(1, Math.min(500, limit));
+  const rows = db
+    .prepare(
+      `SELECT p.id AS id, p.navn AS navn
+         FROM experience_providers p
+        WHERE (p.hjemmeside IS NULL OR TRIM(p.hjemmeside) = '')
+          AND EXISTS (
+            SELECT 1 FROM experiences e
+             WHERE e.provider_id = p.id
+               AND e.verification_status != 'verified'
+               AND (e.content_source IS NULL OR e.content_source NOT IN ('manual','claim'))
+               AND (
+                     e.description IS NULL OR TRIM(e.description) = ''
+                  OR TRIM(e.description) = ?
+                  OR e.category    IS NULL OR TRIM(e.category)    = ''
+                   )
+          )
+        ORDER BY p.created_at ASC
+        LIMIT ?`
+    )
+    .all(EXPERIENCE_DESCRIPTION_PLACEHOLDER, cap) as Array<{ id: string; navn: string }>;
+  return rows;
 }
 
 /**
@@ -954,7 +998,7 @@ export function applyExperienceContent(
   function isBlank(v: unknown): boolean {
     if (v === null || v === undefined) return true;
     const s = String(v).trim();
-    return s === "" || s === "null" || s === "[]";
+    return s === "" || s === "null" || s === "[]" || s === EXPERIENCE_DESCRIPTION_PLACEHOLDER;
   }
 
   if (isBlank(row.description) && candidate.description?.trim()) {
