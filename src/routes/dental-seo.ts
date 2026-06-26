@@ -2180,6 +2180,31 @@ router.get("/.well-known/agent-card.json", (_req: Request, res: Response) => {
   res.json(getDentalAgentCard());
 });
 
+// GET /.well-known/agents.txt — AI Agent Discovery File (parity with rfb + opplevagent)
+router.get("/.well-known/agents.txt", (_req: Request, res: Response) => {
+  res.header("Content-Type", "text/plain; charset=utf-8");
+  res.header("Cache-Control", "public, max-age=3600");
+  res.send(`# agents.txt — finn-tannlege.com
+# AI Agent Discovery File
+# See: https://github.com/dennj/agents.txt
+User-agent: *
+Allow-actions: search, read, discover, compare
+Disallow-actions: modify, delete, register-without-key
+Agent-card: https://finn-tannlege.com/.well-known/agent-card.json
+MCP-endpoint: https://finn-tannlege.com/mcp
+A2A-endpoint: https://finn-tannlege.com/a2a
+API-base: https://finn-tannlege.com/api/tannleger
+Name: Finn Tannlege
+Description: Norwegian dental practice directory — find, compare, and book dentists
+Languages: no, en
+Categories: dental, healthcare, directory, norway, booking
+Region: NO
+Rate-limit: 300 requests per 15 minutes (general)
+Rate-limit: 500 requests per hour (admin)
+Contact: https://github.com/slookisen/lokal/issues
+`);
+});
+
 // GET /agent-card.json — alias (some crawlers skip well-known prefix)
 router.get("/agent-card.json", (_req: Request, res: Response) => {
   res.header("Content-Type", "application/json; charset=utf-8");
