@@ -829,9 +829,26 @@ export function selectProvidersForContentRefresh(limit = 25): ContentRefreshTarg
   const cap = Math.max(1, Math.min(100, limit));
   const rows = db
     .prepare(
-      `SELECT p.id AS id, p.navn AS navn, TRIM(p.hjemmeside) AS hjemmeside
+      `SELECT p.id AS id, p.navn AS navn,
+              COALESCE(
+                CASE WHEN p.hjemmeside IS NOT NULL AND TRIM(p.hjemmeside) != ''
+                     THEN TRIM(p.hjemmeside) END,
+                (SELECT TRIM(e2.evidence_url)
+                   FROM experiences e2
+                  WHERE e2.provider_id = p.id
+                    AND e2.evidence_url IS NOT NULL AND TRIM(e2.evidence_url) != ''
+                  LIMIT 1)
+              ) AS hjemmeside
          FROM experience_providers p
-        WHERE p.hjemmeside IS NOT NULL AND TRIM(p.hjemmeside) != ''
+        WHERE (
+            (p.hjemmeside IS NOT NULL AND TRIM(p.hjemmeside) != '')
+            OR EXISTS (
+                SELECT 1 FROM experiences e2
+                 WHERE e2.provider_id = p.id
+                   AND e2.evidence_url IS NOT NULL AND TRIM(e2.evidence_url) != ''
+                   AND p.hjemmeside IS NULL
+               )
+          )
           AND EXISTS (
             SELECT 1 FROM experiences e
              WHERE e.provider_id = p.id
