@@ -17,7 +17,7 @@ import { v4 as uuid } from "uuid";
 import { z } from "zod";
 import { getDb } from "../database/db-factory";
 
-// ─── Schemas (input validation) ─────────────────────────────────────
+// ─── Schemas (input validation) ───────────────────────────────────
 
 const HelfoAgreementSchema = z.enum(["true", "false", "unknown"]);
 const VerificationStatusSchema = z.enum([
@@ -55,7 +55,13 @@ export const DentalAgentSchema = z.object({
   enrichment_state: z.string().optional(),
   verification_status: VerificationStatusSchema.optional(),
 
-  // ─── PR-100: geocoding fields (6) ──────────────────────────────────
+  // ─── PR-130: Google Places rating + price-band provenance ──────────
+  rating: z.number().min(0).max(5).optional().nullable(),
+  rating_count: z.number().int().nonnegative().optional().nullable(),
+  rating_source: z.string().optional().nullable(),
+  price_band_source: z.string().optional().nullable(),
+
+  // ─── PR-100: geocoding fields (6) ──────────────────────────────
   lat: z.number().min(-90).max(90).optional().nullable(),
   lng: z.number().min(-180).max(180).optional().nullable(),
   geocode_source: z.enum(["kartverket", "google_places", "manual"]).optional().nullable(),
@@ -72,7 +78,7 @@ export const DentalAgentSchema = z.object({
     .nullable(),
   field_provenance: z.record(z.string(), z.unknown()).optional().nullable(),
 
-  // ─── PR-100: deep-scrape fields (10) ───────────────────────────────
+  // ─── PR-100: deep-scrape fields (10) ─────────────────────────────
   om_oss: z.string().max(2000).optional().nullable(),
   specialists: z
     .array(
@@ -166,7 +172,7 @@ export type MergedRow = Partial<DentalAgent> & {
   org_nr?: string | null;
 };
 
-// ─── Helpers ────────────────────────────────────────────────────────
+// ─── Helpers ───────────────────────────────────────────────────────
 
 function jsonOrNull(arr: string[] | undefined): string | null {
   if (!arr || arr.length === 0) return null;
@@ -240,7 +246,13 @@ function hydrateAgent(row: Record<string, unknown>): DentalAgent & {
       (row.verification_status as DentalAgent["verification_status"]) ??
       "pending_verify",
 
-    // ─── PR-100: geocoding fields ────────────────────────────────────
+    // ─── PR-130: rating + price-band provenance ───────────────────
+    rating: (row.rating as number | null) ?? null,
+    rating_count: (row.rating_count as number | null) ?? null,
+    rating_source: (row.rating_source as string | null) ?? null,
+    price_band_source: (row.price_band_source as string | null) ?? null,
+
+    // ─── PR-100: geocoding fields ────────────────────────────────
     lat: (row.lat as number | null) ?? null,
     lng: (row.lng as number | null) ?? null,
     geocode_source:
@@ -250,7 +262,7 @@ function hydrateAgent(row: Record<string, unknown>): DentalAgent & {
     opening_hours: parseJsonOrNull(row.opening_hours) as DentalAgent["opening_hours"],
     field_provenance: parseJsonOrNull(row.field_provenance) as DentalAgent["field_provenance"],
 
-    // ─── PR-100: deep-scrape fields ──────────────────────────────────
+    // ─── PR-100: deep-scrape fields ──────────────────────────────
     om_oss: (row.om_oss as string | null) ?? null,
     specialists: parseJsonOrNull(row.specialists) as DentalAgent["specialists"],
     treatment_tech: parseJsonOrNull(row.treatment_tech) as DentalAgent["treatment_tech"],
@@ -264,7 +276,7 @@ function hydrateAgent(row: Record<string, unknown>): DentalAgent & {
   };
 }
 
-// ─── Public API ─────────────────────────────────────────────────────
+// ─── Public API ───────────────────────────────────────────────────
 
 export function createDentalAgent(input: DentalAgent): string {
   const parsed = DentalAgentSchema.parse(input);
@@ -354,16 +366,7 @@ export function getDentalAgentById(
   return row ? hydrateAgent(row) : null;
 }
 
-// ─── Specialty filter helper (PR: finn-tannlege search) ─────────────
-// Specialty data is sparse on dental_agents.available_specialties (the
-// clinic-level JSON array is populated for only ~2% of rows). The same
-// information frequently lives in the `specialists` JSON array
-// (objects with a "specialty" field) that PR-100 deep-scrape fills.
-// To make the specialty filter useful instead of zeroing-out results,
-// match the requested specialty against EITHER column. Both columns are
-// JSON-array text, so a LIKE on the quoted specialty value is the
-// pragmatic match (json_each() would be exact but heavier; revisit if
-// false-positives appear). Returns a SQL fragment + binds the params.
+// ─── Specialty filter helper (PR: finn-tannlege search) ─────────────────
 function pushSpecialtyClause(
   where: string[],
   params: Record<string, unknown>,
@@ -372,11 +375,7 @@ function pushSpecialtyClause(
   where.push(
     "(available_specialties LIKE @specialty OR specialists LIKE @specialtyPerson)"
   );
-  // available_specialties: ["oral kirurgi og oral medisin"]  → match %"<value>"%
   params.specialty = `%"${specialty}"%`;
-  // specialists: [{"name":"...","specialty":"oral kirurgi og oral medisin"}]
-  //   → match %"specialty":"<value>"%  (tolerant of whitespace via the
-  //   colon-space variant; JSON.stringify emits no space, so this is exact).
   params.specialtyPerson = `%"specialty":"${specialty}"%`;
 }
 
@@ -391,38 +390,14 @@ export function listDentalAgents(
   const where: string[] = [];
   const params: Record<string, unknown> = {};
 
-  if (parsed.fylke) {
-    where.push("fylke = @fylke");
-    params.fylke = parsed.fylke;
-  }
-  if (parsed.chain_brand) {
-    where.push("chain_brand = @chain_brand");
-    params.chain_brand = parsed.chain_brand;
-  }
-  if (parsed.verification_status) {
-    where.push("verification_status = @verification_status");
-    params.verification_status = parsed.verification_status;
-  }
-  if (parsed.specialty) {
-    pushSpecialtyClause(where, params, parsed.specialty);
-  }
-  // PR-109 / PR-105 additive filters
-  if (parsed.q) {
-    where.push("(navn LIKE @q OR poststed LIKE @q)");
-    params.q = `%${parsed.q}%`;
-  }
-  if (parsed.helfo_agreement !== undefined) {
-    where.push("helfo_agreement = @helfo_agreement");
-    params.helfo_agreement = parsed.helfo_agreement;
-  }
-  if (parsed.acute_vakt !== undefined) {
-    where.push("acute_vakt = @acute_vakt");
-    params.acute_vakt = parsed.acute_vakt;
-  }
-  if (parsed.enrichment_state !== undefined) {
-    where.push("enrichment_state = @enrichment_state");
-    params.enrichment_state = parsed.enrichment_state;
-  }
+  if (parsed.fylke) { where.push("fylke = @fylke"); params.fylke = parsed.fylke; }
+  if (parsed.chain_brand) { where.push("chain_brand = @chain_brand"); params.chain_brand = parsed.chain_brand; }
+  if (parsed.verification_status) { where.push("verification_status = @verification_status"); params.verification_status = parsed.verification_status; }
+  if (parsed.specialty) { pushSpecialtyClause(where, params, parsed.specialty); }
+  if (parsed.q) { where.push("(navn LIKE @q OR poststed LIKE @q)"); params.q = `%${parsed.q}%`; }
+  if (parsed.helfo_agreement !== undefined) { where.push("helfo_agreement = @helfo_agreement"); params.helfo_agreement = parsed.helfo_agreement; }
+  if (parsed.acute_vakt !== undefined) { where.push("acute_vakt = @acute_vakt"); params.acute_vakt = parsed.acute_vakt; }
+  if (parsed.enrichment_state !== undefined) { where.push("enrichment_state = @enrichment_state"); params.enrichment_state = parsed.enrichment_state; }
   if (parsed.poststed) { where.push("poststed = @poststed"); params.poststed = parsed.poststed; }
 
   const sql =
@@ -439,14 +414,11 @@ export function listDentalAgents(
 
 // ─── PR-109: new public query functions ─────────────────────────────
 
-/** COUNT(*) with the same WHERE building as listDentalAgents. */
 export function countDentalAgents(filter: ListFilter = {}): number {
   const parsed = ListFilterSchema.parse(filter);
   const db = getDb("dental");
-
   const where: string[] = [];
   const params: Record<string, unknown> = {};
-
   if (parsed.fylke) { where.push("fylke = @fylke"); params.fylke = parsed.fylke; }
   if (parsed.chain_brand) { where.push("chain_brand = @chain_brand"); params.chain_brand = parsed.chain_brand; }
   if (parsed.verification_status) { where.push("verification_status = @verification_status"); params.verification_status = parsed.verification_status; }
@@ -455,50 +427,30 @@ export function countDentalAgents(filter: ListFilter = {}): number {
   if (parsed.helfo_agreement !== undefined) { where.push("helfo_agreement = @helfo_agreement"); params.helfo_agreement = parsed.helfo_agreement; }
   if (parsed.acute_vakt !== undefined) { where.push("acute_vakt = @acute_vakt"); params.acute_vakt = parsed.acute_vakt; }
   if (parsed.enrichment_state !== undefined) { where.push("enrichment_state = @enrichment_state"); params.enrichment_state = parsed.enrichment_state; }
-
-  const sql = "SELECT COUNT(*) AS n FROM dental_agents" +
-    (where.length ? ` WHERE ${where.join(" AND ")}` : "");
+  const sql = "SELECT COUNT(*) AS n FROM dental_agents" + (where.length ? ` WHERE ${where.join(" AND ")}` : "");
   const row = db.prepare(sql).get(params) as { n: number };
   return row.n;
 }
 
-/**
- * Like countDentalAgents but always excludes verification_status='rejected'.
- * Used by public-facing pages (/sok, /fylke) where rejected clinics
- * must not appear in the total count shown to visitors.
- */
 export function countPublicDentalAgents(filter: ListFilter = {}): number {
   const parsed = ListFilterSchema.parse(filter);
   const db = getDb("dental");
-
   const where: string[] = ["verification_status != 'rejected'"];
   const params: Record<string, unknown> = {};
-
   if (parsed.fylke) { where.push("fylke = @fylke"); params.fylke = parsed.fylke; }
   if (parsed.chain_brand) { where.push("chain_brand = @chain_brand"); params.chain_brand = parsed.chain_brand; }
-  if (parsed.verification_status && parsed.verification_status !== "rejected") {
-    where.push("verification_status = @verification_status");
-    params.verification_status = parsed.verification_status;
-  }
+  if (parsed.verification_status && parsed.verification_status !== "rejected") { where.push("verification_status = @verification_status"); params.verification_status = parsed.verification_status; }
   if (parsed.specialty) { pushSpecialtyClause(where, params, parsed.specialty); }
   if (parsed.q) { where.push("(navn LIKE @q OR poststed LIKE @q)"); params.q = `%${parsed.q}%`; }
   if (parsed.helfo_agreement !== undefined) { where.push("helfo_agreement = @helfo_agreement"); params.helfo_agreement = parsed.helfo_agreement; }
   if (parsed.acute_vakt !== undefined) { where.push("acute_vakt = @acute_vakt"); params.acute_vakt = parsed.acute_vakt; }
   if (parsed.enrichment_state !== undefined) { where.push("enrichment_state = @enrichment_state"); params.enrichment_state = parsed.enrichment_state; }
   if (parsed.poststed) { where.push("poststed = @poststed"); params.poststed = parsed.poststed; }
-
-  const sql = "SELECT COUNT(*) AS n FROM dental_agents" +
-    ` WHERE ${where.join(" AND ")}`;
+  const sql = "SELECT COUNT(*) AS n FROM dental_agents" + ` WHERE ${where.join(" AND ")}`;
   const row = db.prepare(sql).get(params) as { n: number };
   return row.n;
 }
 
-/**
- * Public-facing list: same WHERE building as listDentalAgents but
- * ALWAYS excludes verification_status='rejected', and applies a
- * quality-first sort: verified first, then enriched, then those with
- * website or phone, then alphabetically.
- */
 export function listPublicDentalAgents(
   filter: ListFilter = {},
   limit = 50,
@@ -506,23 +458,17 @@ export function listPublicDentalAgents(
 ): Array<DentalAgent & { id: string }> {
   const parsed = ListFilterSchema.parse(filter);
   const db = getDb("dental");
-
-  const where: string[] = ["verification_status != 'rejected'"]; // always exclude rejected
+  const where: string[] = ["verification_status != 'rejected'"];
   const params: Record<string, unknown> = {};
-
   if (parsed.fylke) { where.push("fylke = @fylke"); params.fylke = parsed.fylke; }
   if (parsed.chain_brand) { where.push("chain_brand = @chain_brand"); params.chain_brand = parsed.chain_brand; }
-  if (parsed.verification_status && parsed.verification_status !== "rejected") {
-    where.push("verification_status = @verification_status");
-    params.verification_status = parsed.verification_status;
-  }
+  if (parsed.verification_status && parsed.verification_status !== "rejected") { where.push("verification_status = @verification_status"); params.verification_status = parsed.verification_status; }
   if (parsed.specialty) { pushSpecialtyClause(where, params, parsed.specialty); }
   if (parsed.q) { where.push("(navn LIKE @q OR poststed LIKE @q)"); params.q = `%${parsed.q}%`; }
   if (parsed.helfo_agreement !== undefined) { where.push("helfo_agreement = @helfo_agreement"); params.helfo_agreement = parsed.helfo_agreement; }
   if (parsed.acute_vakt !== undefined) { where.push("acute_vakt = @acute_vakt"); params.acute_vakt = parsed.acute_vakt; }
   if (parsed.enrichment_state !== undefined) { where.push("enrichment_state = @enrichment_state"); params.enrichment_state = parsed.enrichment_state; }
   if (parsed.poststed) { where.push("poststed = @poststed"); params.poststed = parsed.poststed; }
-
   const sql =
     "SELECT * FROM dental_agents" +
     ` WHERE ${where.join(" AND ")}` +
@@ -532,23 +478,12 @@ export function listPublicDentalAgents(
     "  CASE WHEN hjemmeside IS NOT NULL OR telefon IS NOT NULL THEN 0 ELSE 1 END ASC," +
     "  navn ASC" +
     " LIMIT @limit OFFSET @offset";
-
   params.limit = Math.max(1, Math.min(500, limit));
   params.offset = Math.max(0, offset);
-
   const rows = db.prepare(sql).all(params) as Array<Record<string, unknown>>;
   return rows.map(hydrateAgent);
 }
 
-/**
- * Returns the subset of `candidates` (canonical specialty names) for which
- * at least one non-rejected clinic exists — matching the SAME logic the
- * /sok specialty filter uses (available_specialties OR specialists JSON).
- *
- * The public search dropdown is populated from this so users can only pick
- * specialties that actually return clinics; a specialty with zero coverage
- * is hidden rather than silently zeroing-out the result list.
- */
 export function getAvailableSpecialties(candidates: string[]): string[] {
   const db = getDb("dental");
   const stmt = db.prepare(
@@ -572,39 +507,23 @@ export interface DentalStats {
   specialist_clinic_count: number;
 }
 
-/** Aggregate stats for the finn-tannlege.com frontpage. Excludes rejected rows. */
 export function getDentalStats(): DentalStats {
   const db = getDb("dental");
   const base = "FROM dental_agents WHERE verification_status != 'rejected'";
-
   const total = (db.prepare(`SELECT COUNT(*) AS n ${base}`).get() as { n: number }).n;
-
   const perFylkeRows = db.prepare(
     `SELECT fylke, COUNT(*) AS n ${base} AND fylke IS NOT NULL GROUP BY fylke ORDER BY n DESC`
   ).all() as Array<{ fylke: string; n: number }>;
   const per_fylke = perFylkeRows.map((r) => ({ fylke: r.fylke, count: r.n }));
-
-  const helfo_count = (db.prepare(
-    `SELECT COUNT(*) AS n ${base} AND helfo_agreement = 'true'`
-  ).get() as { n: number }).n;
-
-  const chain_count = (db.prepare(
-    `SELECT COUNT(*) AS n ${base} AND is_chain_member = 1`
-  ).get() as { n: number }).n;
-
-  const acute_count = (db.prepare(
-    `SELECT COUNT(*) AS n ${base} AND acute_vakt = 1`
-  ).get() as { n: number }).n;
-
-  // specialist_clinic_count: clinics whose specialists OR available_specialties
-  // is a non-empty JSON array.
+  const helfo_count = (db.prepare(`SELECT COUNT(*) AS n ${base} AND helfo_agreement = 'true'`).get() as { n: number }).n;
+  const chain_count = (db.prepare(`SELECT COUNT(*) AS n ${base} AND is_chain_member = 1`).get() as { n: number }).n;
+  const acute_count = (db.prepare(`SELECT COUNT(*) AS n ${base} AND acute_vakt = 1`).get() as { n: number }).n;
   const specialist_clinic_count = (db.prepare(
     `SELECT COUNT(*) AS n ${base} AND (
        (specialists IS NOT NULL AND specialists != '[]' AND specialists != '') OR
        (available_specialties IS NOT NULL AND available_specialties != '[]' AND available_specialties != '')
      )`
   ).get() as { n: number }).n;
-
   return { total, per_fylke, helfo_count, chain_count, acute_count, specialist_clinic_count };
 }
 
@@ -612,69 +531,26 @@ export function getDentalStats(): DentalStats {
 export function upsertDentalPerson(input: DentalPerson): string {
   const parsed = DentalPersonSchema.parse(input);
   const db = getDb("dental");
-
-  // Try to find by hpr_nr first (unique), then by id.
   let existing: { id: string } | undefined;
   if (parsed.hpr_nr) {
-    existing = db
-      .prepare("SELECT id FROM dental_persons WHERE hpr_nr = ?")
-      .get(parsed.hpr_nr) as { id: string } | undefined;
+    existing = db.prepare("SELECT id FROM dental_persons WHERE hpr_nr = ?").get(parsed.hpr_nr) as { id: string } | undefined;
   } else if (parsed.id) {
-    existing = db
-      .prepare("SELECT id FROM dental_persons WHERE id = ?")
-      .get(parsed.id) as { id: string } | undefined;
+    existing = db.prepare("SELECT id FROM dental_persons WHERE id = ?").get(parsed.id) as { id: string } | undefined;
   }
-
   const id = existing?.id ?? parsed.id ?? uuid();
-
   if (existing) {
-    db.prepare(
-      `
-      UPDATE dental_persons SET
-        navn = @navn,
-        primary_specialty = @primary_specialty,
-        all_specialties = @all_specialties,
-        own_orgnr = @own_orgnr,
-        fylke_residence = @fylke_residence,
-        is_active = @is_active,
-        source = @source,
-        updated_at = datetime('now')
-      WHERE id = @id
-    `
-    ).run({
-      id,
-      navn: parsed.navn,
-      primary_specialty: parsed.primary_specialty ?? null,
-      all_specialties: jsonOrNull(parsed.all_specialties),
-      own_orgnr: parsed.own_orgnr ?? null,
-      fylke_residence: parsed.fylke_residence ?? null,
-      is_active: parsed.is_active ?? 1,
-      source: parsed.source ?? null,
+    db.prepare(`UPDATE dental_persons SET navn = @navn, primary_specialty = @primary_specialty, all_specialties = @all_specialties, own_orgnr = @own_orgnr, fylke_residence = @fylke_residence, is_active = @is_active, source = @source, updated_at = datetime('now') WHERE id = @id`).run({
+      id, navn: parsed.navn, primary_specialty: parsed.primary_specialty ?? null,
+      all_specialties: jsonOrNull(parsed.all_specialties), own_orgnr: parsed.own_orgnr ?? null,
+      fylke_residence: parsed.fylke_residence ?? null, is_active: parsed.is_active ?? 1, source: parsed.source ?? null,
     });
   } else {
-    db.prepare(
-      `
-      INSERT INTO dental_persons (
-        id, navn, hpr_nr, primary_specialty, all_specialties,
-        own_orgnr, fylke_residence, is_active, source
-      ) VALUES (
-        @id, @navn, @hpr_nr, @primary_specialty, @all_specialties,
-        @own_orgnr, @fylke_residence, @is_active, @source
-      )
-    `
-    ).run({
-      id,
-      navn: parsed.navn,
-      hpr_nr: parsed.hpr_nr ?? null,
-      primary_specialty: parsed.primary_specialty ?? null,
-      all_specialties: jsonOrNull(parsed.all_specialties),
-      own_orgnr: parsed.own_orgnr ?? null,
-      fylke_residence: parsed.fylke_residence ?? null,
-      is_active: parsed.is_active ?? 1,
-      source: parsed.source ?? null,
+    db.prepare(`INSERT INTO dental_persons (id, navn, hpr_nr, primary_specialty, all_specialties, own_orgnr, fylke_residence, is_active, source) VALUES (@id, @navn, @hpr_nr, @primary_specialty, @all_specialties, @own_orgnr, @fylke_residence, @is_active, @source)`).run({
+      id, navn: parsed.navn, hpr_nr: parsed.hpr_nr ?? null, primary_specialty: parsed.primary_specialty ?? null,
+      all_specialties: jsonOrNull(parsed.all_specialties), own_orgnr: parsed.own_orgnr ?? null,
+      fylke_residence: parsed.fylke_residence ?? null, is_active: parsed.is_active ?? 1, source: parsed.source ?? null,
     });
   }
-
   return id;
 }
 
@@ -682,80 +558,31 @@ export function createAffiliation(input: Affiliation): string {
   const parsed = AffiliationSchema.parse(input);
   const id = uuid();
   const db = getDb("dental");
-
-  db.prepare(
-    `
-    INSERT OR IGNORE INTO dental_clinic_affiliations (
-      id, person_id, clinic_agent_id,
-      affiliation_type, role, specialty_used_here,
-      schedule_pattern, is_active, source, evidence_url
-    ) VALUES (
-      @id, @person_id, @clinic_agent_id,
-      @affiliation_type, @role, @specialty_used_here,
-      @schedule_pattern, @is_active, @source, @evidence_url
-    )
-  `
-  ).run({
-    id,
-    person_id: parsed.person_id,
-    clinic_agent_id: parsed.clinic_agent_id,
-    affiliation_type: parsed.affiliation_type ?? null,
-    role: parsed.role ?? null,
-    specialty_used_here: parsed.specialty_used_here ?? null,
-    schedule_pattern: parsed.schedule_pattern ?? null,
-    is_active: parsed.is_active ?? 1,
-    source: parsed.source ?? null,
-    evidence_url: parsed.evidence_url ?? null,
+  db.prepare(`INSERT OR IGNORE INTO dental_clinic_affiliations (id, person_id, clinic_agent_id, affiliation_type, role, specialty_used_here, schedule_pattern, is_active, source, evidence_url) VALUES (@id, @person_id, @clinic_agent_id, @affiliation_type, @role, @specialty_used_here, @schedule_pattern, @is_active, @source, @evidence_url)`).run({
+    id, person_id: parsed.person_id, clinic_agent_id: parsed.clinic_agent_id,
+    affiliation_type: parsed.affiliation_type ?? null, role: parsed.role ?? null,
+    specialty_used_here: parsed.specialty_used_here ?? null, schedule_pattern: parsed.schedule_pattern ?? null,
+    is_active: parsed.is_active ?? 1, source: parsed.source ?? null, evidence_url: parsed.evidence_url ?? null,
   });
-
-  // Keep denormalized read-side in sync.
   recomputeAvailableSpecialties(parsed.clinic_agent_id);
-
   return id;
 }
 
 export function recomputeAvailableSpecialties(clinic_id: string): void {
   const db = getDb("dental");
-  const rows = db
-    .prepare(
-      `
-      SELECT DISTINCT specialty_used_here
-      FROM dental_clinic_affiliations
-      WHERE clinic_agent_id = ?
-        AND is_active = 1
-        AND specialty_used_here IS NOT NULL
-        AND specialty_used_here <> ''
-    `
-    )
-    .all(clinic_id) as Array<{ specialty_used_here: string }>;
-
+  const rows = db.prepare(`SELECT DISTINCT specialty_used_here FROM dental_clinic_affiliations WHERE clinic_agent_id = ? AND is_active = 1 AND specialty_used_here IS NOT NULL AND specialty_used_here <> ''`).all(clinic_id) as Array<{ specialty_used_here: string }>;
   const specialties = rows.map((r) => r.specialty_used_here).sort();
   const json = specialties.length ? JSON.stringify(specialties) : null;
-
-  db.prepare(
-    "UPDATE dental_agents SET available_specialties = ?, updated_at = datetime('now') WHERE id = ?"
-  ).run(json, clinic_id);
+  db.prepare("UPDATE dental_agents SET available_specialties = ?, updated_at = datetime('now') WHERE id = ?").run(json, clinic_id);
 }
 
 export function listSpecialistsForClinic(
   clinic_id: string
 ): Array<DentalPerson & { id: string; specialty_used_here: string | null }> {
   const db = getDb("dental");
-  const rows = db
-    .prepare(
-      `
-      SELECT p.*, a.specialty_used_here
-      FROM dental_persons p
-      JOIN dental_clinic_affiliations a ON a.person_id = p.id
-      WHERE a.clinic_agent_id = ? AND a.is_active = 1
-      ORDER BY p.navn ASC
-    `
-    )
-    .all(clinic_id) as Array<Record<string, unknown>>;
-
+  const rows = db.prepare(`SELECT p.*, a.specialty_used_here FROM dental_persons p JOIN dental_clinic_affiliations a ON a.person_id = p.id WHERE a.clinic_agent_id = ? AND a.is_active = 1 ORDER BY p.navn ASC`).all(clinic_id) as Array<Record<string, unknown>>;
   return rows.map((row) => ({
-    id: row.id as string,
-    navn: row.navn as string,
+    id: row.id as string, navn: row.navn as string,
     hpr_nr: (row.hpr_nr as string | null) ?? null,
     primary_specialty: (row.primary_specialty as string | null) ?? null,
     all_specialties: parseJsonArray(row.all_specialties),
@@ -767,28 +594,14 @@ export function listSpecialistsForClinic(
   }));
 }
 
-export function listChains(): Array<{
-  id: string;
-  chain_brand: string;
-  parent_orgnr: string | null;
-  website: string | null;
-  num_locations_advertised: number | null;
-  tier: string | null;
-  confidence: string | null;
-}> {
+export function listChains(): Array<{ id: string; chain_brand: string; parent_orgnr: string | null; website: string | null; num_locations_advertised: number | null; tier: string | null; confidence: string | null; }> {
   const db = getDb("dental");
-  const rows = db
-    .prepare(
-      "SELECT id, chain_brand, parent_orgnr, website, num_locations_advertised, tier, confidence FROM dental_chains ORDER BY chain_brand ASC"
-    )
-    .all() as Array<Record<string, unknown>>;
+  const rows = db.prepare("SELECT id, chain_brand, parent_orgnr, website, num_locations_advertised, tier, confidence FROM dental_chains ORDER BY chain_brand ASC").all() as Array<Record<string, unknown>>;
   return rows.map((r) => ({
-    id: r.id as string,
-    chain_brand: r.chain_brand as string,
+    id: r.id as string, chain_brand: r.chain_brand as string,
     parent_orgnr: (r.parent_orgnr as string | null) ?? null,
     website: (r.website as string | null) ?? null,
-    num_locations_advertised:
-      (r.num_locations_advertised as number | null) ?? null,
+    num_locations_advertised: (r.num_locations_advertised as number | null) ?? null,
     tier: (r.tier as string | null) ?? null,
     confidence: (r.confidence as string | null) ?? null,
   }));
@@ -802,68 +615,28 @@ export function updateDentalAgent(
   const existing = getDentalAgentById(id);
   if (!existing) return false;
 
-  // Allow-list — never let an UPDATE touch id or vertical.
   const allowed: Array<keyof DentalAgent> = [
-    "org_nr",
-    "navn",
-    "postnummer",
-    "poststed",
-    "fylke",
-    "adresse",
-    "telefon",
-    "mobil",
-    "epost",
-    "hjemmeside",
-    "antall_ansatte",
-    "organisasjonsform",
-    "registreringsdato",
-    "naeringskode",
-    "treatments",
-    "helfo_agreement",
-    "languages_spoken",
-    "acute_vakt",
-    "price_band",
-    "chain_brand",
-    "is_chain_member",
-    "chain_parent_orgnr",
-    "enrichment_state",
-    "verification_status",
+    "org_nr", "navn", "postnummer", "poststed", "fylke", "adresse",
+    "telefon", "mobil", "epost", "hjemmeside",
+    "antall_ansatte", "organisasjonsform", "registreringsdato", "naeringskode",
+    "treatments", "helfo_agreement", "languages_spoken", "acute_vakt", "price_band",
+    "chain_brand", "is_chain_member", "chain_parent_orgnr",
+    "enrichment_state", "verification_status",
+    // PR-130: rating + price-band provenance
+    "rating", "rating_count", "rating_source", "price_band_source",
     // PR-100: geocoding (6)
-    "lat",
-    "lng",
-    "geocode_source",
-    "geocode_confidence",
-    "opening_hours",
-    "field_provenance",
+    "lat", "lng", "geocode_source", "geocode_confidence", "opening_hours", "field_provenance",
     // PR-100: deep-scrape (10)
-    "om_oss",
-    "specialists",
-    "treatment_tech",
-    "equipment_brands",
-    "patient_focus",
-    "accessibility",
-    "payment_options",
-    "online_booking_url",
-    "social_media",
-    "treatments_subtypes",
+    "om_oss", "specialists", "treatment_tech", "equipment_brands",
+    "patient_focus", "accessibility", "payment_options",
+    "online_booking_url", "social_media", "treatments_subtypes",
   ];
 
-  // PR-100: columns that must be JSON.stringify'd before SQL bind.
-  // Mirrors the existing pattern for treatments / languages_spoken.
   const jsonCols = new Set<keyof DentalAgent>([
-    "treatments",
-    "languages_spoken",
-    // PR-100 JSON-typed columns
-    "opening_hours",
-    "field_provenance",
-    "specialists",
-    "treatment_tech",
-    "equipment_brands",
-    "patient_focus",
-    "accessibility",
-    "payment_options",
-    "social_media",
-    "treatments_subtypes",
+    "treatments", "languages_spoken",
+    "opening_hours", "field_provenance", "specialists", "treatment_tech",
+    "equipment_brands", "patient_focus", "accessibility", "payment_options",
+    "social_media", "treatments_subtypes",
   ]);
 
   const sets: string[] = [];
@@ -884,24 +657,65 @@ export function updateDentalAgent(
     }
   }
 
-  if (sets.length === 0) return true; // nothing to do
+  if (sets.length === 0) return true;
   sets.push("updated_at = datetime('now')");
-
-  db.prepare(`UPDATE dental_agents SET ${sets.join(", ")} WHERE id = @id`).run(
-    params
-  );
+  db.prepare(`UPDATE dental_agents SET ${sets.join(", ")} WHERE id = @id`).run(params);
   return true;
 }
 
-/**
- * Bulk-insert from the Phase A.5 merged dataset.
- *
- * `INSERT OR IGNORE` on org_nr — if a row with the same org_nr already
- * exists, we skip it (no clobber). Returns counts so the script can
- * report how much new data was ingested.
- *
- * Wrapped in a single transaction for ~50x speedup on 7k rows.
- */
+// ─── PR-130: targeted rating update ──────────────────────────────────────────────
+//
+// Called by the Google Places enrichment step after Places API returns
+// rating + user_ratings_total for a clinic that already has a Places match.
+// Stores rating/rating_count plus the provenance string
+// (e.g. "google_places|2026-06-27"). Idempotent: always overwrites.
+
+export function updateDentalRating(
+  id: string,
+  rating: number,
+  ratingCount: number,
+  source: string
+): boolean {
+  const db = getDb("dental");
+  const res = db
+    .prepare(
+      `UPDATE dental_agents
+       SET rating = ?, rating_count = ?, rating_source = ?, updated_at = datetime('now')
+       WHERE id = ?`
+    )
+    .run(rating, ratingCount, source, id);
+  return res.changes > 0;
+}
+
+// ─── PR-130: targeted price_band update (with provenance) ────────────────────
+//
+// Updates price_band + price_band_source atomically. Validates enum value.
+// Called from Stage X enrichment when confidence >= 0.80.
+// Valid values: rimelig | standard | premium | ukjent (per dental-specific.yaml)
+
+const PRICE_BAND_ENUM = new Set(["rimelig", "standard", "premium", "ukjent"]);
+
+export function updateDentalPriceBand(
+  id: string,
+  priceBand: string,
+  source: string
+): boolean {
+  if (!PRICE_BAND_ENUM.has(priceBand)) {
+    throw new Error(
+      `Invalid price_band value: ${priceBand}. Must be one of: ${[...PRICE_BAND_ENUM].join(", ")}`
+    );
+  }
+  const db = getDb("dental");
+  const res = db
+    .prepare(
+      `UPDATE dental_agents
+       SET price_band = ?, price_band_source = ?, updated_at = datetime('now')
+       WHERE id = ?`
+    )
+    .run(priceBand, source, id);
+  return res.changes > 0;
+}
+
 export function bulkInsertFromMerged(rows: MergedRow[]): {
   inserted: number;
   skipped: number;
@@ -934,31 +748,16 @@ export function bulkInsertFromMerged(rows: MergedRow[]): {
 
   const tx = db.transaction((batch: MergedRow[]) => {
     for (const row of batch) {
-      // Light-touch validation — bulk pipeline upstream owns shape.
-      if (!row.navn) {
-        skipped++;
-        continue;
-      }
-      // EXCLUSION CHECK (PR-90): skip rows whose org_nr or URL is on
-      // the anti-rediscovery list.
+      if (!row.navn) { skipped++; continue; }
       const excl = isExcluded(row.org_nr ?? null, row.hjemmeside ?? null);
-      if (excl.excluded) {
-        excluded++;
-        continue;
-      }
+      if (excl.excluded) { excluded++; continue; }
       const id = row.id ?? uuid();
       const result = insertOne.run({
-        id,
-        org_nr: row.org_nr ?? null,
-        navn: row.navn,
-        postnummer: row.postnummer ?? null,
-        poststed: row.poststed ?? null,
-        fylke: row.fylke ?? null,
-        adresse: row.adresse ?? null,
-        telefon: row.telefon ?? null,
-        mobil: row.mobil ?? null,
-        epost: row.epost ?? null,
-        hjemmeside: row.hjemmeside ?? null,
+        id, org_nr: row.org_nr ?? null, navn: row.navn,
+        postnummer: row.postnummer ?? null, poststed: row.poststed ?? null,
+        fylke: row.fylke ?? null, adresse: row.adresse ?? null,
+        telefon: row.telefon ?? null, mobil: row.mobil ?? null,
+        epost: row.epost ?? null, hjemmeside: row.hjemmeside ?? null,
         antall_ansatte: row.antall_ansatte ?? null,
         organisasjonsform: row.organisasjonsform ?? null,
         registreringsdato: row.registreringsdato ?? null,
@@ -984,12 +783,7 @@ export function bulkInsertFromMerged(rows: MergedRow[]): {
 }
 
 
-// ─── Phase B exclusions (PR-90) ──────────────────────────────────────
-//
-// Anti-rediscovery: dental_exclusions records orgnrs / URLs we've
-// determined are NOT valid dental clinics (suppliers, dead domains,
-// booking portals misclassified under NACE 86.230, etc). createDentalAgent
-// and bulkInsertFromMerged consult this table before inserting.
+// ─── Phase B exclusions (PR-90) ───────────────────────────────────────
 
 export type ExclusionReason =
   | "not_a_clinic"
@@ -1013,25 +807,11 @@ export function isExcluded(
 ): IsExcludedResult {
   const db = getDb("dental");
   if (orgnr) {
-    const row = db
-      .prepare(
-        `SELECT reason, notes FROM dental_exclusions
-         WHERE org_nr = ?
-         AND (is_permanent = 1 OR reactivate_after IS NULL OR reactivate_after > datetime('now'))
-         LIMIT 1`
-      )
-      .get(orgnr) as { reason: ExclusionReason; notes?: string } | undefined;
+    const row = db.prepare(`SELECT reason, notes FROM dental_exclusions WHERE org_nr = ? AND (is_permanent = 1 OR reactivate_after IS NULL OR reactivate_after > datetime('now')) LIMIT 1`).get(orgnr) as { reason: ExclusionReason; notes?: string } | undefined;
     if (row) return { excluded: true, reason: row.reason, notes: row.notes };
   }
   if (hjemmesideUrl) {
-    const row = db
-      .prepare(
-        `SELECT reason, notes FROM dental_exclusions
-         WHERE hjemmeside_url = ?
-         AND (is_permanent = 1 OR reactivate_after IS NULL OR reactivate_after > datetime('now'))
-         LIMIT 1`
-      )
-      .get(hjemmesideUrl) as { reason: ExclusionReason; notes?: string } | undefined;
+    const row = db.prepare(`SELECT reason, notes FROM dental_exclusions WHERE hjemmeside_url = ? AND (is_permanent = 1 OR reactivate_after IS NULL OR reactivate_after > datetime('now')) LIMIT 1`).get(hjemmesideUrl) as { reason: ExclusionReason; notes?: string } | undefined;
     if (row) return { excluded: true, reason: row.reason, notes: row.notes };
   }
   return { excluded: false };
@@ -1051,24 +831,11 @@ export interface RecordExclusionInput {
 
 export function recordExclusion(args: RecordExclusionInput): string {
   const id = "excl-" + uuid();
-  getDb("dental")
-    .prepare(
-      `INSERT INTO dental_exclusions
-       (id, org_nr, hjemmeside_url, navn_pattern, reason, evidence, notes, excluded_by, reactivate_after, is_permanent)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
-    )
-    .run(
-      id,
-      args.orgnr ?? null,
-      args.hjemmesideUrl ?? null,
-      args.navnPattern ?? null,
-      args.reason,
-      args.evidence ?? null,
-      args.notes ?? null,
-      args.excludedBy,
-      args.reactivateAfter ?? null,
-      args.isPermanent ? 1 : 0
-    );
+  getDb("dental").prepare(`INSERT INTO dental_exclusions (id, org_nr, hjemmeside_url, navn_pattern, reason, evidence, notes, excluded_by, reactivate_after, is_permanent) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
+    id, args.orgnr ?? null, args.hjemmesideUrl ?? null, args.navnPattern ?? null,
+    args.reason, args.evidence ?? null, args.notes ?? null, args.excludedBy,
+    args.reactivateAfter ?? null, args.isPermanent ? 1 : 0
+  );
   return id;
 }
 
@@ -1077,30 +844,18 @@ export interface ListExclusionsFilter {
   limit?: number;
 }
 
-export function listExclusions(
-  filter: ListExclusionsFilter = {}
-): Array<Record<string, unknown>> {
+export function listExclusions(filter: ListExclusionsFilter = {}): Array<Record<string, unknown>> {
   let sql = `SELECT * FROM dental_exclusions WHERE 1=1`;
   const params: unknown[] = [];
-  if (filter.reason) {
-    sql += ` AND reason = ?`;
-    params.push(filter.reason);
-  }
+  if (filter.reason) { sql += ` AND reason = ?`; params.push(filter.reason); }
   sql += ` ORDER BY excluded_at DESC LIMIT ?`;
   params.push(filter.limit ?? 100);
-  return getDb("dental")
-    .prepare(sql)
-    .all(...params) as Array<Record<string, unknown>>;
+  return getDb("dental").prepare(sql).all(...params) as Array<Record<string, unknown>>;
 }
 
 
-// ─── PR-116: SEO helpers ─────────────────────────────────────────────────────
+// ─── PR-116: SEO helpers ─────────────────────────────────────────────────────────────────
 
-/**
- * Returns all distinct non-empty poststeder (cities) with a count of
- * non-rejected clinics, ordered by count descending.
- * poststed values are stored UPPERCASE in the DB (e.g. "OSLO").
- */
 export interface PoststedRow {
   poststed: string;
   fylke: string | null;
@@ -1109,7 +864,6 @@ export interface PoststedRow {
 
 export function listPoststeder(minCount = 1): PoststedRow[] {
   const db = getDb("dental");
-  // For each poststed, pick the most common fylke (subquery via GROUP BY + ORDER BY n DESC LIMIT 1)
   const rows = db.prepare(`
     SELECT poststed,
            (SELECT fylke FROM dental_agents da2
@@ -1125,18 +879,9 @@ export function listPoststeder(minCount = 1): PoststedRow[] {
     HAVING n >= ?
     ORDER BY n DESC
   `).all(minCount) as Array<{ poststed: string; fylke: string | null; n: number }>;
-
-  return rows.map((r) => ({
-    poststed: r.poststed,
-    fylke: r.fylke ?? null,
-    count: r.n,
-  }));
+  return rows.map((r) => ({ poststed: r.poststed, fylke: r.fylke ?? null, count: r.n }));
 }
 
-/**
- * Related clinics in the same poststed, excluding the given agent id,
- * not rejected, quality-sorted (same order as listPublicDentalAgents).
- */
 export function listRelatedClinics(
   agent: DentalAgent & { id: string },
   limit = 6
@@ -1158,32 +903,13 @@ export function listRelatedClinics(
   return rows.map(hydrateAgent);
 }
 
-/**
- * Minimal list for sitemap generation: org_nr, navn, updated_at.
- * Only non-rejected rows with an org_nr (required for stable slug).
- */
 export function getDentalAgentsForSitemap(): Array<{ org_nr: string; navn: string; updated_at: string | null }> {
   const db = getDb("dental");
-  const rows = db.prepare(`
-    SELECT org_nr, navn, updated_at
-    FROM dental_agents
-    WHERE verification_status != 'rejected'
-      AND org_nr IS NOT NULL AND org_nr != ''
-    ORDER BY navn ASC
-  `).all() as Array<{ org_nr: string; navn: string; updated_at: string | null }>;
+  const rows = db.prepare(`SELECT org_nr, navn, updated_at FROM dental_agents WHERE verification_status != 'rejected' AND org_nr IS NOT NULL AND org_nr != '' ORDER BY navn ASC`).all() as Array<{ org_nr: string; navn: string; updated_at: string | null }>;
   return rows;
 }
 
-// ─── PR-127: opening_hours normalization (tolerant ingest) ───────────────────
-//
-// Real-world clinic hours are messy ("9–15.30", "Man-Tor 08-16", "mandag",
-// "stengt", "etter avtale"). The opening_hours zod schema is strict
-// (array of { day: mon..sun, open:"HH:MM", close:"HH:MM" }), and PUT /agents/:id
-// hard-400s the WHOLE body on any invalid field — so one malformed hours entry
-// dropped every other field in the same enrichment PUT (observed:
-// opening_hours_shape_failures + stage_x_field_puts_failed in dental worker
-// envelopes). This helper salvages what it can and drops the rest, so a best-
-// effort hours array reaches the DB instead of nuking the record.
+// ─── PR-127: opening_hours normalization (tolerant ingest) ────────────────────────
 
 const _DAY_MAP: Record<string, "mon" | "tue" | "wed" | "thu" | "fri" | "sat" | "sun"> = {
   mon: "mon", monday: "mon", man: "mon", mandag: "mon", må: "mon",
@@ -1195,31 +921,20 @@ const _DAY_MAP: Record<string, "mon" | "tue" | "wed" | "thu" | "fri" | "sat" | "
   sun: "sun", sunday: "sun", son: "sun", "søn": "sun", sondag: "sun", "søndag": "sun", "sø": "sun",
 };
 
-/** Normalize a single day token to mon..sun, or null if unrecognized. */
 export function normalizeDayToken(raw: unknown): "mon" | "tue" | "wed" | "thu" | "fri" | "sat" | "sun" | null {
   if (typeof raw !== "string") return null;
   const k = raw.trim().toLowerCase().replace(/\.$/, "");
-  // Prototype-safe lookup: reserved keys ("constructor", "__proto__") must
-  // resolve to null, not inherited Object.prototype members (PR-127 review).
   return Object.prototype.hasOwnProperty.call(_DAY_MAP, k) ? _DAY_MAP[k] : null;
 }
 
-/** Normalize a clock token to zero-padded "HH:MM", or null if unparseable. */
 export function normalizeTimeToken(raw: unknown): string | null {
   if (typeof raw === "number" && Number.isFinite(raw)) raw = String(raw);
   if (typeof raw !== "string") return null;
   const s = raw.trim();
   if (!s) return null;
-  // Accept "8", "8:30", "08.30", "0830", "8 30".
-  let m = s.match(/^(\d{1,2})\s*[:.\s]\s*(\d{2})$/);
-  if (!m) {
-    const only = s.match(/^(\d{1,2})$/);
-    if (only) m = [s, only[1], "00"] as unknown as RegExpMatchArray;
-  }
-  if (!m) {
-    const four = s.match(/^(\d{2})(\d{2})$/);
-    if (four) m = [s, four[1], four[2]] as unknown as RegExpMatchArray;
-  }
+  let m = s.match(/^(\d{1,2})\s*[:.\ s]\s*(\d{2})$/);
+  if (!m) { const only = s.match(/^(\d{1,2})$/); if (only) m = [s, only[1], "00"] as unknown as RegExpMatchArray; }
+  if (!m) { const four = s.match(/^(\d{2})(\d{2})$/); if (four) m = [s, four[1], four[2]] as unknown as RegExpMatchArray; }
   if (!m) return null;
   const h = parseInt(m[1], 10);
   const min = parseInt(m[2], 10);
@@ -1229,14 +944,6 @@ export function normalizeTimeToken(raw: unknown): string | null {
 
 export interface OpeningHoursEntry { day: "mon" | "tue" | "wed" | "thu" | "fri" | "sat" | "sun"; open: string; close: string; }
 
-/**
- * Best-effort normalize an opening_hours value into the strict schema shape.
- * Accepts the canonical array, an array with sloppy day/time tokens, a
- * range string per entry ("08:00-16:00"), or a day-keyed object map
- * ({ mon: "08-16" } / { monday: { open, close } }). Unsalvageable entries
- * (closed / "etter avtale" / bad times / unknown day) are dropped.
- * Returns { value, dropped } — value is null when nothing survived.
- */
 export function normalizeOpeningHours(
   input: unknown
 ): { value: OpeningHoursEntry[] | null; dropped: number } {
@@ -1251,7 +958,6 @@ export function normalizeOpeningHours(
     else dropped++;
   };
 
-  // Split a value that may be a range string ("08:00-16:00", "8–16") into [open, close].
   const splitRange = (v: unknown): [unknown, unknown] => {
     if (typeof v === "string") {
       const parts = v.split(/[-–—to]+/i).map((p) => p.trim()).filter(Boolean);
@@ -1270,15 +976,10 @@ export function normalizeOpeningHours(
         } else if (typeof obj.hours === "string" || typeof obj.time === "string") {
           const [o, c] = splitRange(obj.hours ?? obj.time);
           pushFrom(obj.day, o, c);
-        } else {
-          dropped++;
-        }
-      } else {
-        dropped++;
-      }
+        } else { dropped++; }
+      } else { dropped++; }
     }
   } else if (input && typeof input === "object") {
-    // Day-keyed object map.
     for (const [k, v] of Object.entries(input as Record<string, unknown>)) {
       if (v && typeof v === "object" && !Array.isArray(v)) {
         const o = (v as Record<string, unknown>).open;
@@ -1287,9 +988,7 @@ export function normalizeOpeningHours(
       } else if (typeof v === "string") {
         const [o, c] = splitRange(v);
         pushFrom(k, o, c);
-      } else {
-        dropped++;
-      }
+      } else { dropped++; }
     }
   } else if (input == null) {
     return { value: null, dropped: 0 };
