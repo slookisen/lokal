@@ -394,6 +394,34 @@ function initSchema(db: Database.Database): void {
 
 
     -- ════════════════════════════════════════════════════════════
+    -- RETENTION: Daily rollup tables for DB size management
+    -- page_view_daily: aggregated page-view counts per day×path×source×bot_type×vertical
+    -- runs_daily_summary: aggregated run-ledger counts after raw pruning
+    -- ════════════════════════════════════════════════════════════
+    CREATE TABLE IF NOT EXISTS page_view_daily (
+      day TEXT NOT NULL,
+      path TEXT NOT NULL,
+      source TEXT NOT NULL DEFAULT 'unknown',
+      bot_type TEXT NOT NULL DEFAULT 'human',   -- human|chatgpt|claude|other_bot|dev|scanner
+      vertical_id TEXT NOT NULL DEFAULT 'rfb',
+      view_count INTEGER NOT NULL DEFAULT 0,
+      session_count INTEGER NOT NULL DEFAULT 0,
+      PRIMARY KEY (day, path, source, bot_type, vertical_id)
+    );
+    CREATE INDEX IF NOT EXISTS idx_page_view_daily_day ON page_view_daily(day DESC);
+
+    CREATE TABLE IF NOT EXISTS runs_daily_summary (
+      day TEXT NOT NULL,
+      vertical TEXT NOT NULL,
+      agent TEXT NOT NULL,
+      run_count INTEGER NOT NULL DEFAULT 0,
+      completed_count INTEGER NOT NULL DEFAULT 0,
+      failed_count INTEGER NOT NULL DEFAULT 0,
+      partial_count INTEGER NOT NULL DEFAULT 0,
+      PRIMARY KEY (day, vertical, agent)
+    );
+
+    -- ════════════════════════════════════════════════════════════
     -- INDEXES: Geo bounding-box + common lookups
     -- These make discovery fast without PostGIS
     -- ════════════════════════════════════════════════════════════
