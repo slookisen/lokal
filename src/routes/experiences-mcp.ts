@@ -533,6 +533,40 @@ router.post(["/", "/mcp"], async (req: Request, res: Response) => {
 router.get(["/", "/mcp"], async (req: Request, res: Response) => {
   const sessionId = req.headers["mcp-session-id"] as string | undefined;
   if (!sessionId || !experiencesSessions.has(sessionId)) {
+    // Return a human-friendly landing page for browser GET (Accept: text/html, no session).
+    // The MCP POST/session handshake path is unaffected — this branch only fires when
+    // there is no valid session header, which a real MCP client would never send as GET.
+    const accept = req.headers["accept"] || "";
+    if (accept.includes("text/html")) {
+      res.status(200).contentType("text/html").send(`<!doctype html>
+<html lang="no">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Opplevagent MCP — Model Context Protocol</title>
+<style>body{font-family:system-ui,sans-serif;max-width:640px;margin:60px auto;padding:0 24px;color:#1a1a1a;line-height:1.6}
+h1{font-size:1.5rem;margin-bottom:.25rem}p{margin:.75rem 0}code{background:#f0f0f0;padding:2px 6px;border-radius:4px;font-size:.9em}
+pre{background:#f6f8fa;border:1px solid #e1e4e8;border-radius:6px;padding:16px;overflow-x:auto;font-size:.85rem}
+a{color:#0070f3}.back{display:inline-block;margin-top:24px;color:#555;text-decoration:none;font-size:.9rem}</style>
+</head>
+<body>
+<h1>Opplevagent MCP-endepunkt</h1>
+<p>Dette er Opplevagent sitt <a href="https://modelcontextprotocol.io" rel="noopener">Model Context Protocol</a>-endepunkt (Streamable HTTP). Det er designet for AI-agenter og MCP-klienter, ikke nettlesere.</p>
+<p><strong>Koble til fra Claude Desktop / ChatGPT:</strong><br>Lim inn denne URL-en som MCP-server:</p>
+<pre>https://opplevagent.no/mcp</pre>
+<p><strong>Tilgjengelige verktøy:</strong></p>
+<ul>
+<li><code>discover_experiences</code> — finn opplevelser etter fylke, kategori, vær, sesong, pris, varighet</li>
+<li><code>list_experience_categories</code> — alle kategorier med antall opplevelser</li>
+<li><code>get_experience</code> — hent én opplevelse med full profil</li>
+</ul>
+<p><strong>For utviklere — eksempel (cURL):</strong></p>
+<pre>curl -X POST https://opplevagent.no/mcp \\
+  -H "Content-Type: application/json" \\
+  -d '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}'</pre>
+<p>Se også: <a href="/.well-known/agent-card.json">Agent Card</a> · <a href="/openapi.json">OpenAPI 3.1</a> · <a href="/llms.txt">llms.txt</a></p>
+<a class="back" href="/">← Tilbake til Opplevagent</a>
+</body></html>`);
+      return;
+    }
     res.status(400).json({ error: "Missing or invalid mcp-session-id header" });
     return;
   }
