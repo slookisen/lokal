@@ -265,5 +265,40 @@ export function initDentalSchema(db: Database.Database): void {
     console.warn("[init-dental] PR-104 index creation warning:", err);
   }
 
+  // ─── PR-130 (2026-06-27): Google Places rating + price-band provenance ──────
+  //   Additive only — all new columns nullable, no backfill required.
+  //   - rating REAL               Google Places rating (0.0–5.0, one decimal)
+  //   - rating_count INTEGER       Google Places user_ratings_total
+  //   - rating_source TEXT         provenance: 'google_places|YYYY-MM-DD'
+  //   - price_band TEXT CHECK(...)  enum guard: rimelig | standard | premium | ukjent
+  //                                NB: price_band (no CHECK) already exists from PR-89.
+  //                                We leave the old column intact for backward-compat;
+  //                                new writes target price_band (we add the CHECK via a
+  //                                new column price_band_check that the store prefers).
+  //                                Simplest migration: treat old price_band as-is, add
+  //                                rating_count / rating / rating_source / price_band_source.
+  //   - price_band_source TEXT     provenance: source + date price_band was set
+  const pr130Cols: Array<{ name: string; sql: string }> = [
+    { name: "rating",            sql: "ALTER TABLE dental_agents ADD COLUMN rating REAL" },
+    { name: "rating_count",      sql: "ALTER TABLE dental_agents ADD COLUMN rating_count INTEGER" },
+    { name: "rating_source",     sql: "ALTER TABLE dental_agents ADD COLUMN rating_source TEXT" },
+    { name: "price_band_source", sql: "ALTER TABLE dental_agents ADD COLUMN price_band_source TEXT" },
+  ];
+  for (const { name, sql } of pr130Cols) {
+    try {
+      db.exec(sql);
+      console.log(`[init-dental] PR-130 added column ${name}`);
+    } catch (err: any) {
+      if (!String(err.message ?? err).includes("duplicate column name")) throw err;
+    }
+  }
+
+  // Index on rating — enables future "top-rated clinics" sort without full scan
+  try {
+    db.exec("CREATE INDEX IF NOT EXISTS idx_dental_rating ON dental_agents (rating)");
+  } catch (err) {
+    console.warn("[init-dental] PR-130 rating index warning:", err);
+  }
+
   console.log("[dental] schema initialized");
 }
