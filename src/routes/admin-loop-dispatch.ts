@@ -211,10 +211,16 @@ router.post("/", async (req: Request, res: Response) => {
       next_suggested: [], // the dispatcher MUST NOT emit next_suggested (no ping-pong)
       notes: `mode=${mode} candidates=${plan.candidates} wake=${plan.wake.length} fired_ok=${firedOk} deferred=${deferred.length}${plan.inActiveWindow ? "" : " (paused: outside active window)"}`.slice(0, 480),
     };
-    try {
-      recordRun(envelope);
-    } catch {
-      /* best-effort — the dispatch already happened */
+    // Only record an envelope when we actually fired (or attempted) a wake. A no-op
+    // dispatch — the common ~10-min heartbeat that wakes nobody — must NOT flood the
+    // run-ledger (L4 fix 2026-06-27: 115/120 recent ledger runs were dispatcher
+    // heartbeats, drowning real agent runs and killing loop visibility).
+    if (fired.length > 0) {
+      try {
+        recordRun(envelope);
+      } catch {
+        /* best-effort — the dispatch already happened */
+      }
     }
 
     res.json({
