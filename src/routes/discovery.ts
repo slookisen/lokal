@@ -310,7 +310,6 @@ router.get("/llms-full.txt", (_req: Request, res: Response) => {
         const k = knowledgeService.getKnowledge(a.id);
         const parts: string[] = [`- **${a.name}**`];
         if (cats.length) parts.push(`Kategorier: ${cats.join(", ")}`);
-        if (k?.phone) parts.push(`Tlf: ${k.phone}`);
         if (k?.website) parts.push(`Web: ${k.website}`);
         // Canonical profile URL — without this, AI engines reading llms-full.txt
         // have no mapping from producer name → rettfrabonden page, so they cite
