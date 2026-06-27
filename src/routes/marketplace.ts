@@ -860,18 +860,21 @@ router.get("/geocode", async (req: Request, res: Response) => {
 // ─── GET /agents — List all active agents ────────────────────
 
 router.get("/agents", (req: Request, res: Response) => {
-  const all = marketplaceRegistry.getActiveAgents();
-  const offset = Math.max(0, parseInt((req.query.offset as string) || "0", 10) || 0);
-  const limit = Math.min(50, Math.max(1, parseInt((req.query.limit as string) || "50", 10) || 50));
-  const page = all.slice(offset, offset + limit);
+  const HARD_CAP = 50;
+  const allAgents = marketplaceRegistry.getActiveAgents();
+  const total = allAgents.length;
+  let limit = parseInt(req.query.limit as string) || HARD_CAP;
+  if (limit > HARD_CAP) limit = HARD_CAP;
+  const offset = parseInt(req.query.offset as string) || 0;
+  const agents = allAgents.slice(offset, offset + limit);
   res.json({
     success: true,
-    total: all.length,
-    count: page.length,
-    offset,
+    total,
     limit,
-    has_more: offset + limit < all.length,
-    agents: page.map(a => ({
+    offset,
+    page_count: Math.ceil(total / limit),
+    count: agents.length,
+    agents: agents.map(a => ({
       id: a.id,
       name: a.name,
       description: a.description,
