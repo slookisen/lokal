@@ -1,19 +1,3 @@
-/**
- * dental-seo.ts — SSR frontend for finn-tannlege.com
- *
- * PR-109: «Finn-tannlege» dental vertical
- * Host-gated via src/index.ts — only reached when req.hostname is
- * finn-tannlege.com or www.finn-tannlege.com.
- *
- * Design system: «Klinisk tillit»
- *   Primary teal  #0F766E (hover #115E59)
- *   Accent        #14B8A6
- *   Navy text     #0F2A43
- *   Section bg    #F1F5F9
- *   Helfo badge   #15803D / #DCFCE7
- *   Akutt badge   #B45309 / #FEF3C7
- *   Verified      teal
- */
 
 import { Router, Request, Response } from "express";
 import {
@@ -1133,6 +1117,37 @@ function renderClinicProfile(
   if (agent.chain_brand)
     badges.push(`<span class="badge badge-chain">${escapeHtml(agent.chain_brand)}</span>`);
 
+  // ── Rating badge (Google Places)
+  // Only render when rating is non-null; never show "0 anmeldelser" noise.
+  if ((agent as any).rating != null) {
+    const ratingVal: number = (agent as any).rating;
+    const ratingCount: number | null = (agent as any).rating_count ?? null;
+    const stars = "★".repeat(Math.round(ratingVal)) + "☆".repeat(Math.max(0, 5 - Math.round(ratingVal)));
+    const countStr = ratingCount != null ? ` (${ratingCount} anmeldelser)` : "";
+    badges.push(`<span class="badge badge-rating" style="background:#FEF9C3;color:#713F12;border:1px solid #FDE68A">${stars} ${escapeHtml(ratingVal.toFixed(1))}${escapeHtml(countStr)}</span>`);
+  }
+
+  // ── Price band badge
+  // rimelig=green, standard=yellow, premium=red, ukjent/null=hidden
+  if ((agent as any).price_band && (agent as any).price_band !== "ukjent") {
+    const pb: string = (agent as any).price_band;
+    const pbStyles: Record<string, string> = {
+      rimelig: "background:#DCFCE7;color:#166534;border:1px solid #BBF7D0",
+      standard: "background:#FEF9C3;color:#713F12;border:1px solid #FDE68A",
+      premium: "background:#FEE2E2;color:#991B1B;border:1px solid #FECACA",
+    };
+    const pbLabels: Record<string, string> = {
+      rimelig: "💚 Rimelig",
+      standard: "🟡 Standard",
+      premium: "🔴 Premium",
+    };
+    const style = pbStyles[pb] ?? "";
+    const label = pbLabels[pb] ?? pb;
+    if (style) {
+      badges.push(`<span class="badge badge-price-band" style="${style}">${escapeHtml(label)}</span>`);
+    }
+  }
+
   // ── Action buttons
   const _callTelHref = safeTelHref(agent.telefon);
   const callBtn = _callTelHref
@@ -1159,6 +1174,19 @@ function renderClinicProfile(
   if (agent.registreringsdato) infoItems.push(`<div class="info-item"><div class="info-label">Registrert</div><div class="info-value">${escapeHtml(agent.registreringsdato)}</div></div>`);
   if (agent.antall_ansatte !== null && agent.antall_ansatte !== undefined) infoItems.push(`<div class="info-item"><div class="info-label">Antall ansatte</div><div class="info-value">${escapeHtml(String(agent.antall_ansatte))}</div></div>`);
   if (agent.chain_brand) infoItems.push(`<div class="info-item"><div class="info-label">Kjede</div><div class="info-value">${escapeHtml(agent.chain_brand)}</div></div>`);
+  // Rating info item — only if rating is present
+  if ((agent as any).rating != null) {
+    const ratingVal: number = (agent as any).rating;
+    const ratingCount: number | null = (agent as any).rating_count ?? null;
+    const countStr = ratingCount != null ? ` (${ratingCount} anmeldelser)` : "";
+    infoItems.push(`<div class="info-item"><div class="info-label">Vurdering (Google)</div><div class="info-value">★ ${escapeHtml(ratingVal.toFixed(1))}${escapeHtml(countStr)}</div></div>`);
+  }
+  // Price band info item — only if present and not 'ukjent'
+  if ((agent as any).price_band && (agent as any).price_band !== "ukjent") {
+    const pbLabels: Record<string, string> = { rimelig: "Rimelig", standard: "Standard", premium: "Premium" };
+    const pbLabel = pbLabels[(agent as any).price_band] ?? (agent as any).price_band;
+    infoItems.push(`<div class="info-item"><div class="info-label">Prisnivå</div><div class="info-value">${escapeHtml(pbLabel)}</div></div>`);
+  }
 
   const keyInfoSection = infoItems.length > 0
     ? `<div class="section-box"><h2>Nøkkelinformasjon</h2><div class="info-grid">${infoItems.join("")}</div></div>`

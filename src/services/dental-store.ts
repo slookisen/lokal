@@ -55,6 +55,12 @@ export const DentalAgentSchema = z.object({
   enrichment_state: z.string().optional(),
   verification_status: VerificationStatusSchema.optional(),
 
+  // ─── PR-130: Google Places rating + price-band provenance ──────────
+  rating: z.number().min(0).max(5).optional().nullable(),
+  rating_count: z.number().int().nonnegative().optional().nullable(),
+  rating_source: z.string().optional().nullable(),
+  price_band_source: z.string().optional().nullable(),
+
   // ─── PR-100: geocoding fields (6) ──────────────────────────────────
   lat: z.number().min(-90).max(90).optional().nullable(),
   lng: z.number().min(-180).max(180).optional().nullable(),
@@ -239,6 +245,12 @@ function hydrateAgent(row: Record<string, unknown>): DentalAgent & {
     verification_status:
       (row.verification_status as DentalAgent["verification_status"]) ??
       "pending_verify",
+
+    // ─── PR-130: rating + price-band provenance ─────────────────────
+    rating: (row.rating as number | null) ?? null,
+    rating_count: (row.rating_count as number | null) ?? null,
+    rating_source: (row.rating_source as string | null) ?? null,
+    price_band_source: (row.price_band_source as string | null) ?? null,
 
     // ─── PR-100: geocoding fields ────────────────────────────────────
     lat: (row.lat as number | null) ?? null,
@@ -828,6 +840,11 @@ export function updateDentalAgent(
     "chain_parent_orgnr",
     "enrichment_state",
     "verification_status",
+    // PR-130: rating + price-band provenance
+    "rating",
+    "rating_count",
+    "rating_source",
+    "price_band_source",
     // PR-100: geocoding (6)
     "lat",
     "lng",
@@ -891,6 +908,59 @@ export function updateDentalAgent(
     params
   );
   return true;
+}
+
+// ─── PR-130: targeted rating update ──────────────────────────────────────────
+//
+// Called by the Google Places enrichment step after Places API returns
+// rating + user_ratings_total for a clinic that already has a Places match.
+// Stores rating/rating_count plus the provenance string
+// (e.g. "google_places|2026-06-27"). Idempotent: always overwrites.
+
+export function updateDentalRating(
+  id: string,
+  rating: number,
+  ratingCount: number,
+  source: string
+): boolean {
+  const db = getDb("dental");
+  const res = db
+    .prepare(
+      `UPDATE dental_agents
+       SET rating = ?, rating_count = ?, rating_source = ?, updated_at = datetime('now')
+       WHERE id = ?`
+    )
+    .run(rating, ratingCount, source, id);
+  return res.changes > 0;
+}
+
+// ─── PR-130: targeted price_band update (with provenance) ────────────────────
+//
+// Updates price_band + price_band_source atomically. Validates enum value.
+// Called from Stage X enrichment when confidence >= 0.80.
+// Valid values: rimelig | standard | premium | ukjent (per dental-specific.yaml)
+
+const PRICE_BAND_ENUM = new Set(["rimelig", "standard", "premium", "ukjent"]);
+
+export function updateDentalPriceBand(
+  id: string,
+  priceBand: string,
+  source: string
+): boolean {
+  if (!PRICE_BAND_ENUM.has(priceBand)) {
+    throw new Error(
+      `Invalid price_band value: ${priceBand}. Must be one of: ${[...PRICE_BAND_ENUM].join(", ")}`
+    );
+  }
+  const db = getDb("dental");
+  const res = db
+    .prepare(
+      `UPDATE dental_agents
+       SET price_band = ?, price_band_source = ?, updated_at = datetime('now')
+       WHERE id = ?`
+    )
+    .run(priceBand, source, id);
+  return res.changes > 0;
 }
 
 /**
