@@ -845,6 +845,13 @@ class MarketplaceRegistry {
           status: "live",
           description: "ChatGPT Custom GPT — Rett fra Bonden local-food discovery; Actions on rettfrabonden.com/openapi.yaml.",
         },
+        {
+          channel: "agenstry",
+          url: "https://agenstry.com/agents/rettfrabonden.com",
+          install: `${baseUrl}/.well-known/agent-card.json`,
+          status: "live",
+          description: "Agenstry A2A agent directory — auto-indexed from agent-card.json. 1,750+ agents indexed; drift-monitored.",
+        },
       ],
 
       // ─── Lokal-specific metadata ───────────────────────────
