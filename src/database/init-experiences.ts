@@ -233,5 +233,47 @@ export function initExperiencesSchema(db: Database.Database): void {
     try { db.exec(stmt); } catch { /* already present */ }
   }
 
+  // ─── Phase 2 — Gårdssalg bookings (2026-06-28) ───────────────────────────
+  // Attribution + attendance tracking for legally-required paid visits.
+  // status lifecycle: reserved → confirmed_attended | no_show | cancelled
+  // billable = 1 only when status = confirmed_attended (post-visit commission).
+  try {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS gardssalg_bookings (
+        booking_id    TEXT PRIMARY KEY,
+        experience_id TEXT,
+        provider_id   TEXT NOT NULL,
+        slot_at       TEXT NOT NULL,
+        party_size    INTEGER NOT NULL DEFAULT 1,
+        guest_name    TEXT NOT NULL,
+        guest_email   TEXT NOT NULL,
+        guest_phone   TEXT,
+        booking_ref   TEXT UNIQUE NOT NULL,
+        confirm_token TEXT UNIQUE NOT NULL,
+        source        TEXT NOT NULL DEFAULT 'opplevagent',
+        status        TEXT NOT NULL DEFAULT 'reserved'
+                        CHECK(status IN ('reserved','confirmed_attended','no_show','cancelled')),
+        resolved_by   TEXT,
+        resolved_at   TEXT,
+        commission_rate REAL,
+        billable      INTEGER NOT NULL DEFAULT 0,
+        notes         TEXT,
+        created_at    TEXT DEFAULT (datetime('now')),
+        FOREIGN KEY (provider_id) REFERENCES experience_providers(id)
+      )
+    `);
+  } catch (e) {
+    console.log(`[experiences] gardssalg_bookings init skipped: ${(e as Error).message}`);
+  }
+  const bookingIndexes = [
+    "CREATE INDEX IF NOT EXISTS idx_gsb_provider ON gardssalg_bookings(provider_id)",
+    "CREATE INDEX IF NOT EXISTS idx_gsb_status   ON gardssalg_bookings(status)",
+    "CREATE UNIQUE INDEX IF NOT EXISTS idx_gsb_ref   ON gardssalg_bookings(booking_ref)",
+    "CREATE UNIQUE INDEX IF NOT EXISTS idx_gsb_token ON gardssalg_bookings(confirm_token)",
+  ];
+  for (const stmt of bookingIndexes) {
+    try { db.exec(stmt); } catch { /* already present */ }
+  }
+
   console.log("[experiences] schema initialized");
 }

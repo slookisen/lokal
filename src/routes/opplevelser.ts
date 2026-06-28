@@ -50,6 +50,17 @@ import {
   extractBookingUrl,
 } from "../services/search-enrich";
 import { classifyProvider, sleep, BrregClass } from "../services/experience-brreg";
+import {
+  createBooking,
+  getBookingByRef,
+  getBookingByToken,
+  resolveBooking,
+  getCommissionStatement,
+  BookingInputSchema,
+} from "../services/booking-store";
+import { emailService } from "../services/email-service";
+
+const APP_URL = process.env.APP_URL || "https://opplevagent.no";
 
 const router = Router();
 
@@ -750,5 +761,205 @@ router.post("/", requireAdmin, (req: Request, res: Response) => {
     res.status(500).json({ error: "Internal error" });
   }
 });
+
+// ─── Phase 2 — Gårdssalg booking endpoints (2026-06-28) ──────────────
+//
+// POST /api/opplevelser/book              — guest påmelding
+// GET  /api/opplevelser/book/confirm/:token — producer confirm (attended/no_show)
+// GET  /api/opplevelser/book/:ref/ics     — download ICS calendar file
+// GET  /api/opplevelser/admin/gardssalg/commission — monthly commission statement
+//
+// All writes persist to gardssalg_bookings in experiences.db.
+// No payments; no auto-send; drafts only. Daniel sends confirmations manually.
+
+function buildIcs(booking: Awaited<ReturnType<typeof getBookingByRef>> & {}): string {
+  const dtStamp = new Date().toISOString().replace(/[-:.]/g, "").slice(0, 15) + "Z";
+  const slotDate = new Date(booking!.slot_at);
+  const dtStart = slotDate.toISOString().replace(/[-:.]/g, "").slice(0, 15) + "Z";
+  const dtEnd = new Date(slotDate.getTime() + 2 * 60 * 60 * 1000)
+    .toISOString()
+    .replace(/[-:.]/g, "")
+    .slice(0, 15) + "Z";
+  return [
+    "BEGIN:VCALENDAR",
+    "VERSION:2.0",
+    "PRODID:-//Opplevagent//Gardssalg Booking//NO",
+    "METHOD:REQUEST",
+    "BEGIN:VEVENT",
+    `UID:${booking!.booking_id}@opplevagent.no`,
+    `DTSTAMP:${dtStamp}`,
+    `DTSTART:${dtStart}`,
+    `DTEND:${dtEnd}`,
+    `SUMMARY:Gårdssalg & smaking — ref ${booking!.booking_ref}`,
+    `DESCRIPTION:Påmelding via opplevagent.no. Bookingref: ${booking!.booking_ref}`,
+    `ATTENDEE;CN=${booking!.guest_name}:mailto:${booking!.guest_email}`,
+    "END:VEVENT",
+    "END:VCALENDAR",
+  ].join("\r\n");
+}
+
+async function sendBookingConfirmation(
+  booking: NonNullable<ReturnType<typeof getBookingByRef>>,
+): Promise<void> {
+  const confirmUrl = `${APP_URL}/api/opplevelser/book/confirm/${booking.confirm_token}`;
+  const ics = buildIcs(booking);
+
+  const slotFormatted = new Date(booking.slot_at).toLocaleString("nb-NO", {
+    dateStyle: "full",
+    timeStyle: "short",
+    timeZone: "Europe/Oslo",
+  });
+
+  const htmlContent = `
+<p>Hei ${booking.guest_name},</p>
+<p>Din påmelding er registrert! Her er din bekreftelse:</p>
+<table style="border-collapse:collapse;font-family:sans-serif">
+  <tr><td style="padding:4px 12px 4px 0;font-weight:bold">Bookingref:</td><td>${booking.booking_ref}</td></tr>
+  <tr><td style="padding:4px 12px 4px 0;font-weight:bold">Dato/tid:</td><td>${slotFormatted}</td></tr>
+  <tr><td style="padding:4px 12px 4px 0;font-weight:bold">Antall:</td><td>${booking.party_size} person${booking.party_size > 1 ? "er" : ""}</td></tr>
+</table>
+<p>Tilbyderen vil bekrefte oppmøte etter besøket via lenken nedenfor (kun for tilbyder).</p>
+<p>En kalenderinvitasjon (ICS) er vedlagt denne e-posten.</p>
+<p>Spørsmål? Svar på denne e-posten.</p>
+<p>Hilsen<br>Opplevagent</p>
+  `.trim();
+
+  const textContent = `Hei ${booking.guest_name},\n\nDin påmelding er registrert.\nBookingref: ${booking.booking_ref}\nDato/tid: ${slotFormatted}\nAntall: ${booking.party_size}\n\nHilsen\nOpplevagent`;
+
+  await emailService.sendEmail({
+    to: booking.guest_email,
+    subject: `Bekreftelse på påmelding — ${booking.booking_ref}`,
+    htmlContent,
+    textContent,
+    replyTo: `kontakt@opplevagent.no`,
+    attachments: [
+      {
+        filename: `gardssalg-${booking.booking_ref}.ics`,
+        content: ics,
+        contentType: "text/calendar; charset=utf-8; method=REQUEST",
+      },
+    ],
+  });
+
+  // Producer confirm link — logged so Daniel can verify manually
+  console.log(`[booking] ${booking.booking_ref} confirm_url=${confirmUrl}`);
+}
+
+// ─── POST /api/opplevelser/book ──────────────────────────────────────
+router.post("/book", async (req: Request, res: Response) => {
+  const parsed = BookingInputSchema.safeParse(req.body);
+  if (!parsed.success) {
+    res.status(400).json({ error: "Ugyldig forespørsel", details: parsed.error.issues });
+    return;
+  }
+
+  let booking;
+  try {
+    booking = createBooking(parsed.data);
+  } catch (err) {
+    console.error("[booking] createBooking failed", err);
+    res.status(500).json({ error: "Kunne ikke opprette påmelding" });
+    return;
+  }
+
+  // Fire-and-forget confirmation email; never block the response on it
+  sendBookingConfirmation(booking).catch((e) =>
+    console.error("[booking] email failed", booking.booking_ref, e),
+  );
+
+  const confirmUrl = `${APP_URL}/api/opplevelser/book/confirm/${booking.confirm_token}`;
+
+  res.status(201).json({
+    success: true,
+    booking_ref: booking.booking_ref,
+    status: booking.status,
+    source: booking.source,
+    confirm_url: confirmUrl,
+    message: `Påmelding registrert! Bekreftelse sendes til ${booking.guest_email}.`,
+  });
+});
+
+// ─── GET /api/opplevelser/book/confirm/:token ────────────────────────
+// Producer-facing: resolve a booking as attended or no_show.
+// Accepts ?action=attended (default) or ?action=no_show
+// Returns JSON; a producer portal page can wrap this with a simple form.
+router.get(
+  "/book/confirm/:token",
+  (req: Request, res: Response) => {
+    const { token } = req.params;
+    const action = (req.query.action as string) === "no_show" ? "no_show" : "confirmed_attended";
+
+    const existing = getBookingByToken(token as string);
+    if (!existing) {
+      res.status(404).json({ error: "Booking ikke funnet" });
+      return;
+    }
+    if (existing.status !== "reserved") {
+      res.json({
+        success: true,
+        booking_ref: existing.booking_ref,
+        status: existing.status,
+        message: `Allerede registrert: ${existing.status}`,
+      });
+      return;
+    }
+
+    const resolved = resolveBooking(token as string, action, req.ip || "producer");
+    if (!resolved) {
+      res.status(409).json({ error: "Kunne ikke oppdatere booking" });
+      return;
+    }
+
+    res.json({
+      success: true,
+      booking_ref: resolved.booking_ref,
+      status: resolved.status,
+      billable: resolved.billable === 1,
+      message:
+        resolved.status === "confirmed_attended"
+          ? `Oppmøte bekreftet — ref ${resolved.booking_ref} regnes med i provisjon.`
+          : `Ikke-oppmøte registrert — ref ${resolved.booking_ref} ekskludert fra provisjon.`,
+    });
+  },
+);
+
+// ─── GET /api/opplevelser/book/:ref/ics ─────────────────────────────
+// Download ICS calendar file by booking ref (for guest self-service re-download).
+router.get("/book/:ref/ics", (req: Request, res: Response) => {
+  const booking = getBookingByRef(req.params.ref as string);
+  if (!booking) {
+    res.status(404).json({ error: "Booking ikke funnet" });
+    return;
+  }
+  const ics = buildIcs(booking);
+  res.setHeader("Content-Type", "text/calendar; charset=utf-8");
+  res.setHeader(
+    "Content-Disposition",
+    `attachment; filename="gardssalg-${booking.booking_ref}.ics"`,
+  );
+  res.send(ics);
+});
+
+// ─── GET /api/opplevelser/admin/gardssalg/commission ────────────────
+// Monthly commission statement for one provider.
+// ?provider_id=<id>&month=<YYYY-MM>  (admin-keyed)
+router.get(
+  "/admin/gardssalg/commission",
+  requireAdmin,
+  (req: Request, res: Response) => {
+    const provider_id = req.query.provider_id as string | undefined;
+    const month = req.query.month as string | undefined;
+
+    if (!provider_id || !month || !/^\d{4}-\d{2}$/.test(month)) {
+      res.status(400).json({
+        error: "provider_id og month (YYYY-MM) påkrevd",
+      });
+      return;
+    }
+
+    const statement = getCommissionStatement(provider_id, month);
+    res.json({ success: true, ...statement });
+  },
+);
 
 export default router;

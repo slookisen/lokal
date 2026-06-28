@@ -9,6 +9,12 @@ const logger = {
   error: (msg: string, meta?: any) => console.error(`[Email] ✗ ${msg}`, meta ? JSON.stringify(meta) : ""),
 };
 
+export interface EmailAttachment {
+  filename: string;
+  content: string;
+  contentType: string;
+}
+
 export interface EmailOptions {
   to: string;
   subject: string;
@@ -16,6 +22,7 @@ export interface EmailOptions {
   textContent: string;
   replyTo?: string;
   listUnsubscribe?: string;
+  attachments?: EmailAttachment[];
 }
 
 export class EmailService {
@@ -200,7 +207,7 @@ export class EmailService {
         headers['List-Unsubscribe'] = options.listUnsubscribe;
       }
 
-      const mailOptions = {
+      const mailOptions: Record<string, unknown> = {
         from: this.fromAddress,
         to: options.to,
         subject: options.subject,
@@ -215,6 +222,13 @@ export class EmailService {
         // 2026-05-05 (rfb-supervisor claim-flow E2E test).
         textEncoding: 'base64' as const,
       };
+      if (options.attachments?.length) {
+        mailOptions.attachments = options.attachments.map((a) => ({
+          filename: a.filename,
+          content: a.content,
+          contentType: a.contentType,
+        }));
+      }
 
       const info = await this.transporter.sendMail(mailOptions);
 
