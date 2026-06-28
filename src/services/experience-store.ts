@@ -1044,3 +1044,21 @@ export function markProviderEnriched(providerId: string): boolean {
     .run(providerId);
   return res.changes > 0;
 }
+
+// ─── Gårdssalg feature flag ──────────────────────────────────────────────────
+// Count providers eligible for the Gårdssalg & smaking category: those with
+// producer_type set (seeded or enriched drikkeprodusenter) OR rfb_seed_source =
+// 'rfb-seed'. Used by the SSR feature flag (gardssalgVisible()) to decide
+// whether to surface /kategori/gardssalg in nav, homepage cards, and sitemap.
+// Threshold: ≥5 providers → category becomes visible. Phase 1 (2026-06-28).
+// Query hits experience_providers only — no join, very fast.
+export function countGardssalgProviders(): number {
+  const db = getDb(VERTICAL);
+  const row = db
+    .prepare(
+      "SELECT COUNT(*) AS c FROM experience_providers " +
+      "WHERE producer_type IS NOT NULL OR rfb_seed_source = 'rfb-seed'"
+    )
+    .get() as { c: number };
+  return row.c;
+}
