@@ -1209,4 +1209,44 @@ router.get("/umbrella-traffic", (req: Request, res: Response) => {
 });
 
 
+/**
+ * POST /admin/analytics/ops/retention-rollup
+ * Full retention pass: roll up + prune raw page_views older than windowDays
+ * into page_view_daily, prune run-ledger older than runLedgerKeepDays into
+ * runs_daily_summary, optionally run VACUUM.
+ * Feature-flag: RETENTION_JOB_ENABLED env var must be "true" (or dryRun=true).
+ * Body: { windowDays?: number, runLedgerKeepDays?: number, vacuum?: boolean, dryRun?: boolean }
+ */
+router.post("/ops/retention-rollup", (req: Request, res: Response) => {
+  const dryRun = req.body.dryRun === true;
+  const enabled = process.env.RETENTION_JOB_ENABLED === "true";
+
+  if (!dryRun && !enabled) {
+    res.status(503).json({
+      error: "Retention job is disabled. Set RETENTION_JOB_ENABLED=true to enable, or pass dryRun:true to preview.",
+    });
+    return;
+  }
+
+  try {
+    const { runRetentionPass } = require("../services/retention-service");
+    const windowDays = Math.max(30, Math.min(365, parseInt(req.body.windowDays) || 90));
+    const runLedgerKeepDays = Math.max(14, Math.min(90, parseInt(req.body.runLedgerKeepDays) || 30));
+    const vacuum = req.body.vacuum !== false; // default true
+
+    const result = runRetentionPass({ windowDays, runLedgerKeepDays, vacuum, dryRun });
+
+    console.log(`[retention] ${dryRun ? "DRY RUN" : "DONE"}: rolled up ${result.rollup.rowsRolledUp} page views, deleted ${result.rollup.rowsDeleted}, run-ledger pruned ${result.runLedger.runsDeleted}, vacuum freed ${result.vacuum.freedMb}MB`);
+
+    res.json({
+      success: true,
+      ...result,
+      timestamp: new Date().toISOString(),
+    });
+  } catch (err: any) {
+    console.error("[retention] retention-rollup error:", err);
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
 export default router;
