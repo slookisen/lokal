@@ -28,6 +28,7 @@
 
 import { Router, Request, Response } from "express";
 import { getDb } from "../database/init";
+import { slugify } from "../utils/slug";
 
 const router = Router();
 
@@ -176,6 +177,166 @@ router.get("/", (req: Request, res: Response) => {
     res.json({ success: true, count: total, agents });
   } catch (err: any) {
     res.status(500).json({ error: "List failed", detail: err.message });
+  }
+});
+
+// ─── POST /admin/agents/register ─────────────────────────────
+// Register a net-new agent discovered by the brreg NACE discovery agent.
+//
+// Auth: X-Admin-Key header (same requireAdmin as above).
+//
+// Dedup logic (in order):
+//   1. org_nr tag match  → { success: false, duplicate: true, existing_id }
+//   2. name+city match   → { success: false, duplicate: true, existing_id }
+//   3. Insert new agent with trust_score 0.3 (lower than owner-claimed 0.5)
+//
+// Columns: only those confirmed present in agents table are written.
+//   vertical_id  → confirmed via ALTER TABLE (Phase 4.6a)
+//   data_source  → on agent_knowledge, NOT agents — excluded
+//   auto_sources → on agent_knowledge, NOT agents — excluded
+router.post("/register", (req: Request, res: Response) => {
+  if (!requireAdmin(req, res)) return;
+
+  // ── Validate required fields ───────────────────────────────
+  const {
+    name,
+    url,
+    city,
+    vertical_id,
+    org_nr,
+    source,
+    nace_code,
+    categories,
+    tags: extraTags,
+    phone: _phone,       // reserved; stored in agent_knowledge, not agents
+    description,
+    lat,
+    lng,
+  } = req.body as {
+    name?: string;
+    url?: string;
+    city?: string;
+    vertical_id?: string;
+    org_nr?: string;
+    source?: string;
+    nace_code?: string;
+    categories?: string[];
+    tags?: string[];
+    phone?: string;
+    description?: string;
+    lat?: number;
+    lng?: number;
+  };
+
+  if (!name || !url || !city || !vertical_id || !org_nr || !source) {
+    res.status(400).json({
+      error: "Missing required fields",
+      detail: "name, url, city, vertical_id, org_nr, source are all required",
+    });
+    return;
+  }
+
+  const VALID_VERTICALS = ["rfb", "dental", "experiences"] as const;
+  if (!VALID_VERTICALS.includes(vertical_id as typeof VALID_VERTICALS[number])) {
+    res.status(400).json({
+      error: "Invalid vertical_id",
+      detail: "vertical_id must be one of: rfb, dental, experiences",
+    });
+    return;
+  }
+
+  try {
+    const db = getDb();
+
+    // ── Dedup 1: org_nr tag match ────────────────────────────
+    // Tags are stored as a JSON array. We search for the literal
+    // string "org_nr:<value>" inside the TEXT column.
+    const orgNrTag = `org_nr:${org_nr}`;
+    const byOrgNr = db
+      .prepare(
+        `SELECT id FROM agents WHERE tags LIKE ? LIMIT 1`
+      )
+      .get(`%"${orgNrTag}"%`) as { id: string } | undefined;
+
+    if (byOrgNr) {
+      res.json({
+        success: false,
+        duplicate: true,
+        existing_id: byOrgNr.id,
+        message: "Agent with this org_nr already exists",
+      });
+      return;
+    }
+
+    // ── Dedup 2: name + city match (case-insensitive) ────────
+    const byNameCity = db
+      .prepare(
+        `SELECT id FROM agents WHERE LOWER(name) = LOWER(?) AND LOWER(city) = LOWER(?) LIMIT 1`
+      )
+      .get(name, city) as { id: string } | undefined;
+
+    if (byNameCity) {
+      res.json({
+        success: false,
+        duplicate: true,
+        existing_id: byNameCity.id,
+        message: "Agent with this name+city already exists",
+      });
+      return;
+    }
+
+    // ── Build tags array ─────────────────────────────────────
+    const builtTags: string[] = [`org_nr:${org_nr}`, `source:${source}`];
+    if (nace_code) builtTags.push(`nace:${nace_code}`);
+    if (extraTags && Array.isArray(extraTags)) builtTags.push(...extraTags);
+
+    // ── Insert ───────────────────────────────────────────────
+    // vertical_id is confirmed present (Phase 4.6a ALTER TABLE).
+    // data_source + auto_sources live on agent_knowledge, not agents — excluded.
+    const id = require("crypto").randomUUID();
+    const api_key = `brreg_${require("crypto").randomBytes(20).toString("hex")}`;
+    const agentDescription = (description ?? "").trim() || "Oppdaget via Brreg NACE-søk";
+
+    db.prepare(
+      `INSERT INTO agents (
+        id, name, description, provider, contact_email, url,
+        role, api_key,
+        city, lat, lng,
+        categories, tags,
+        trust_score, is_active, is_verified,
+        vertical_id
+      ) VALUES (
+        ?, ?, ?, ?, ?, ?,
+        'producer', ?,
+        ?, ?, ?,
+        ?, ?,
+        0.3, 1, 0,
+        ?
+      )`
+    ).run(
+      id,
+      name,
+      agentDescription,
+      name,                           // provider = business name
+      "kontakt@rettfrabonden.com",    // placeholder; updated when agent claims profile
+      url,
+      api_key,
+      city,
+      lat ?? null,
+      lng ?? null,
+      JSON.stringify(categories && Array.isArray(categories) ? categories : []),
+      JSON.stringify(builtTags),
+      vertical_id,
+    );
+
+    res.status(201).json({
+      success: true,
+      agent_id: id,
+      slug: slugify(name),
+      message: "Agent registered",
+    });
+  } catch (err: any) {
+    res.status(500).json({ error: "Registration failed", detail: err.message });
   }
 });
 
