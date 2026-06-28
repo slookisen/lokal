@@ -1995,7 +1995,7 @@ router.get("/:city", (req: Request, res: Response, next: any) => {
       || citySlug === "terms" || citySlug === "terms-of-service" || citySlug === "tos" || citySlug === "vilkar"
       || citySlug === "llms.txt" || citySlug === "llms-full.txt"
       || citySlug === "agents" || citySlug === "docs" || citySlug === "samtaler" || citySlug === "samtale"
-      || citySlug === "en" || citySlug === "no"
+      || citySlug === "en" || citySlug === "no" || citySlug === "kontakt"
       || citySlug.includes(".")) {
     return next();
   }
