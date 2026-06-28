@@ -57,6 +57,7 @@ import adminDebioCrossCheckRoutes from "./routes/admin-debio-cross-check";
 import adminJobsRoutes from "./routes/admin-jobs";
 import platformTriggersRoutes, { adminRouter as adminTriggersRoutes } from "./routes/platform-triggers";
 import crmRoutes from "./routes/crm";
+import contactRouter from "./routes/contact";
 import { list as blocklistList } from "./services/blocklist-service";
 import { bounceService } from "./services/bounce-service";
 import { seedData } from "./seed";
@@ -299,6 +300,9 @@ app.use("/api/tannlege", dentalLimiter);
 app.use("/api", generalLimiter);
 
 // ─── Routes ──────────────────────────────────────────────────
+// Public contact form — mounted first so it's available on all 3 platform hosts.
+// The endpoint only creates "kontaktskjema" CRM threads (minimum privilege).
+app.use("/api", contactRouter);
 app.use("/api/producers", producerRoutes);
 app.use("/api/producers", scanRoutes);
 app.use("/api/products", scanRoutes);

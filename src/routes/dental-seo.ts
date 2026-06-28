@@ -571,6 +571,7 @@ function dentalNav(): string {
     <a href="/#fylker">Fylker</a>
     <a href="/sok?akutt=1">Akutt</a>
     <a href="/om">Om</a>
+    <a href="/kontakt">Kontakt</a>
   </div>
 </nav>`;
 }
@@ -584,6 +585,7 @@ function dentalFooter(): string {
       <a href="/hvordan-det-fungerer">Slik fungerer det</a>
       <a href="/personvern">Personvern</a>
       <a href="/sok">Søk etter tannlege</a>
+      <a href="/kontakt">Kontakt oss</a>
     </div>
     <div class="footer-col">
       <h4>Datakilder</h4>
@@ -2247,6 +2249,95 @@ router.get("/openapi.json", (_req: Request, res: Response) => {
   res.header("Access-Control-Allow-Origin", "*");
   res.header("Cache-Control", "public, max-age=300");
   res.json(getDentalOpenapi());
+});
+
+// ═══════════════════════════════════════════════════════════
+// GET /kontakt — public contact form (finn-tannlege.com)
+// ═══════════════════════════════════════════════════════════
+
+router.get("/kontakt", (_req: Request, res: Response) => {
+  const content = `
+<main>
+  <div class="container" style="max-width:640px;margin:0 auto;padding:40px 24px 80px">
+    <h1 style="font-size:2rem;font-weight:800;color:var(--navy);margin-bottom:8px">Kontakt oss</h1>
+    <p style="color:var(--g500);margin-bottom:32px">Spørsmål, feil i en klinikkprofil eller andre henvendelser? Vi svarer innen én virkedag.</p>
+
+    <form id="contact-form" novalidate>
+      <input type="text" name="_honey" value="" style="display:none;position:absolute;left:-9999px" tabindex="-1" autocomplete="off" aria-hidden="true">
+      <input type="hidden" name="platform" value="dental">
+
+      <div style="margin-bottom:20px">
+        <label for="cf-name" style="display:block;font-weight:600;color:var(--navy);margin-bottom:6px">Navn *</label>
+        <input type="text" id="cf-name" name="name" required maxlength="100" autocomplete="name" style="width:100%;padding:10px 12px;border:1px solid #d1d5db;border-radius:8px;font-size:1rem;box-sizing:border-box;color:var(--navy)">
+      </div>
+
+      <div style="margin-bottom:20px">
+        <label for="cf-email" style="display:block;font-weight:600;color:var(--navy);margin-bottom:6px">E-post *</label>
+        <input type="email" id="cf-email" name="email" required maxlength="254" autocomplete="email" style="width:100%;padding:10px 12px;border:1px solid #d1d5db;border-radius:8px;font-size:1rem;box-sizing:border-box;color:var(--navy)">
+      </div>
+
+      <div style="margin-bottom:20px">
+        <label for="cf-subject" style="display:block;font-weight:600;color:var(--navy);margin-bottom:6px">Emne</label>
+        <input type="text" id="cf-subject" name="subject" maxlength="200" style="width:100%;padding:10px 12px;border:1px solid #d1d5db;border-radius:8px;font-size:1rem;box-sizing:border-box;color:var(--navy)">
+      </div>
+
+      <div style="margin-bottom:20px">
+        <label for="cf-message" style="display:block;font-weight:600;color:var(--navy);margin-bottom:6px">Melding *</label>
+        <textarea id="cf-message" name="message" required maxlength="2000" rows="5" style="width:100%;padding:10px 12px;border:1px solid #d1d5db;border-radius:8px;font-size:1rem;box-sizing:border-box;resize:vertical;color:var(--navy)"></textarea>
+      </div>
+
+      <p style="font-size:.82rem;color:var(--g500);margin-bottom:20px">Meldingen lagres for behandling av forespørselen din. Leses kun av oss.</p>
+
+      <div class="cf-turnstile" data-sitekey="0x4AAAAAADr56qDaUM0XWoTF" data-theme="light" style="margin-bottom:20px"></div>
+      <script src="https://challenges.cloudflare.com/turnstile/v0/api.js" async defer></script>
+
+      <button type="submit" class="btn-primary" style="display:inline-flex;align-items:center;gap:8px">Send melding</button>
+    </form>
+  </div>
+</main>
+
+<script>
+(function(){
+  var form = document.getElementById('contact-form');
+  if(!form) return;
+  form.addEventListener('submit', async function(e){
+    e.preventDefault();
+    var btn = form.querySelector('button[type=submit]');
+    btn.disabled = true;
+    btn.textContent = 'Sender…';
+    var data = Object.fromEntries(new FormData(form));
+    var token = (document.querySelector('[name=cf-turnstile-response]') || {}).value || '';
+    try {
+      var res = await fetch('/api/contact', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify(Object.assign({}, data, {cfTurnstileResponse: token}))
+      });
+      var json = await res.json();
+      if(json.success){
+        form.innerHTML = '<p style="color:var(--teal);font-size:1.1rem;font-weight:600;padding:24px 0">&#10003; Takk! Vi svarer så snart vi kan.</p>';
+      } else {
+        btn.disabled = false;
+        btn.textContent = 'Send melding';
+        alert('Noe gikk galt. Prøv igjen.');
+      }
+    } catch(err) {
+      btn.disabled = false;
+      btn.textContent = 'Send melding';
+      alert('Noe gikk galt. Prøv igjen.');
+    }
+  });
+})();
+</script>`;
+
+  res.setHeader("Content-Type", "text/html; charset=utf-8");
+  res.send(
+    dentalShell(content, {
+      title: "Kontakt oss — Finn-tannlege.com",
+      description: "Ta kontakt med Finn-tannlege.com. Vi svarer på spørsmål, feil i klinikkprofiler og andre henvendelser innen én virkedag.",
+      canonical: `${DENTAL_BASE_URL}/kontakt`,
+    }),
+  );
 });
 
 // ═══════════════════════════════════════════════════════════

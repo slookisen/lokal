@@ -697,6 +697,7 @@ ${ldScripts}
       <a href="/opplevelser">${S.navAll}</a>
       <a href="#kategorier">${S.navCategories}</a>
       <a href="#slik-funker-det">${S.navHow}</a>
+      <a href="/kontakt">${lang === "en" ? "Contact us" : "Kontakt oss"}</a>
     </div>
     <div class="footer-col">
       <h4>${S.footAgents}</h4>
@@ -2070,6 +2071,155 @@ router.get(["/terms", "/terms-of-service", "/tos", "/vilkar"], (_req: Request, r
 <h2>5. Limitation of liability</h2><p>Opplevagent is not liable for bookings, conduct of experiences, quality, or disputes between users and providers.</p>
 <h2>6. Provider rights</h2><p>Update, remove, or claim your listing via <a href="mailto:kontakt@opplevagent.no">kontakt@opplevagent.no</a>. See also the <a href="/privacy">privacy policy</a>.</p>
 <h2>7. Governing law</h2><p>Norwegian law. Disputes resolved at Daniel's ordinary venue.</p>`));
+});
+
+// ═══════════════════════════════════════════════════════════
+// GET /kontakt — public contact form (opplevagent.no)
+// ═══════════════════════════════════════════════════════════
+
+router.get("/kontakt", (_req: Request, res: Response) => {
+  const url = baseUrl();
+  res.setHeader("Content-Type", "text/html; charset=utf-8");
+  res.send(`<!DOCTYPE html>
+<html lang="no">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Kontakt oss — Opplevagent</title>
+<meta name="description" content="Ta kontakt med Opplevagent. Spørsmål om opplevelser, tilbydere eller tekniske ting — vi svarer innen én virkedag.">
+<meta name="robots" content="index, follow">
+<link rel="canonical" href="${url}/kontakt">
+<link rel="icon" type="image/svg+xml" href="/favicon.svg">
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;background:#f7f4ee;color:#18130d;line-height:1.6;min-height:100vh;display:flex;flex-direction:column}
+a{color:#0c7264;text-decoration:none}
+a:hover{text-decoration:underline}
+.site-nav{background:rgba(244,248,244,.92);border-bottom:1px solid #dde8dd;padding:0 24px;height:60px;display:flex;align-items:center;gap:32px;position:sticky;top:0;z-index:100}
+.brand{font-weight:800;font-size:1.16rem;color:#0b2e29}
+.nav-links{display:flex;gap:22px;font-size:.88rem;font-weight:600;color:#4a6a4f}
+.main-content{max-width:660px;margin:0 auto;padding:48px 24px 80px;flex:1}
+h1{font-size:1.9rem;font-weight:800;color:#0b2e29;margin-bottom:8px}
+.subtitle{color:#6a7a6a;margin-bottom:36px}
+label{display:block;font-weight:600;color:#18130d;margin-bottom:6px;font-size:.93rem}
+input,textarea{width:100%;padding:10px 12px;border:1px solid #c8d4c8;border-radius:8px;font-size:1rem;font-family:inherit;background:#fff;color:#18130d;transition:border-color .15s}
+input:focus,textarea:focus{outline:none;border-color:#12a594;box-shadow:0 0 0 3px rgba(18,165,148,.15)}
+.field{margin-bottom:22px}
+.consent{font-size:.82rem;color:#6a7a6a;margin-bottom:22px}
+.btn{background:#0b2e29;color:#fff;padding:12px 28px;border:none;border-radius:8px;font-size:1rem;font-weight:700;cursor:pointer;display:inline-flex;align-items:center;gap:8px;font-family:inherit;transition:background .15s}
+.btn:hover{background:#0f5a50}
+.btn:disabled{opacity:.6;cursor:not-allowed}
+.site-footer{background:#0b2e29;color:rgba(255,255,255,.66);padding:40px 24px 28px;margin-top:auto}
+.footer-inner{max-width:1100px;margin:0 auto;display:flex;flex-wrap:wrap;gap:28px 48px;justify-content:space-between;font-size:.85rem}
+.footer-inner a{color:rgba(255,255,255,.62)}
+.footer-inner a:hover{color:#fff;text-decoration:none}
+.footer-bottom{max-width:1100px;margin:24px auto 0;padding-top:16px;border-top:1px solid rgba(255,255,255,.1);font-size:.78rem;color:rgba(255,255,255,.4)}
+</style>
+</head>
+<body>
+<nav class="site-nav">
+  <a class="brand" href="/">opplevagent.no</a>
+  <div class="nav-links">
+    <a href="/opplevelser">Opplevelser</a>
+    <a href="#kategorier">Kategorier</a>
+    <a href="/kontakt" aria-current="page">Kontakt</a>
+  </div>
+</nav>
+
+<div class="main-content">
+  <h1>Kontakt oss</h1>
+  <p class="subtitle">Spørsmål om opplevelser, tilbydere eller tekniske ting? Vi svarer innen én virkedag.</p>
+
+  <form id="contact-form" novalidate>
+    <input type="text" name="_honey" value="" style="display:none;position:absolute;left:-9999px" tabindex="-1" autocomplete="off" aria-hidden="true">
+    <input type="hidden" name="platform" value="experiences">
+
+    <div class="field">
+      <label for="cf-name">Navn *</label>
+      <input type="text" id="cf-name" name="name" required maxlength="100" autocomplete="name">
+    </div>
+
+    <div class="field">
+      <label for="cf-email">E-post *</label>
+      <input type="email" id="cf-email" name="email" required maxlength="254" autocomplete="email">
+    </div>
+
+    <div class="field">
+      <label for="cf-subject">Emne</label>
+      <input type="text" id="cf-subject" name="subject" maxlength="200">
+    </div>
+
+    <div class="field">
+      <label for="cf-message">Melding *</label>
+      <textarea id="cf-message" name="message" required maxlength="2000" rows="5"></textarea>
+    </div>
+
+    <p class="consent">Meldingen lagres for behandling av forespørselen din. Leses kun av oss.</p>
+
+    <div class="cf-turnstile" data-sitekey="0x4AAAAAADr56qDaUM0XWoTF" data-theme="light" style="margin-bottom:22px"></div>
+    <script src="https://challenges.cloudflare.com/turnstile/v0/api.js" async defer></script>
+
+    <button type="submit" class="btn">Send melding</button>
+  </form>
+</div>
+
+<footer class="site-footer">
+  <div class="footer-inner">
+    <div>
+      <div style="font-weight:800;color:#fff;margin-bottom:8px">Opplevagent</div>
+      <div>Norske opplevelser for mennesker og AI-agenter.</div>
+    </div>
+    <div>
+      <div style="font-weight:700;color:#fff;font-size:.78rem;text-transform:uppercase;letter-spacing:.06em;margin-bottom:10px">Utforsk</div>
+      <a href="/opplevelser">Alle opplevelser</a><br>
+      <a href="/#kategorier">Kategorier</a><br>
+      <a href="/kontakt">Kontakt oss</a>
+    </div>
+    <div>
+      <div style="font-weight:700;color:#fff;font-size:.78rem;text-transform:uppercase;letter-spacing:.06em;margin-bottom:10px">For agenter</div>
+      <a href="/llms.txt">llms.txt</a><br>
+      <a href="/.well-known/agent-card.json">agent-card.json</a><br>
+      <a href="/api/opplevelser/discover">/api/opplevelser</a>
+    </div>
+  </div>
+  <div class="footer-bottom">&copy; ${new Date().getFullYear()} Opplevagent</div>
+</footer>
+
+<script>
+(function(){
+  var form = document.getElementById('contact-form');
+  if(!form) return;
+  form.addEventListener('submit', async function(e){
+    e.preventDefault();
+    var btn = form.querySelector('button[type=submit]');
+    btn.disabled = true;
+    btn.textContent = 'Sender…';
+    var data = Object.fromEntries(new FormData(form));
+    var token = (document.querySelector('[name=cf-turnstile-response]') || {}).value || '';
+    try {
+      var res = await fetch('/api/contact', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify(Object.assign({}, data, {cfTurnstileResponse: token}))
+      });
+      var json = await res.json();
+      if(json.success){
+        form.innerHTML = '<p style="color:#0c7264;font-size:1.1rem;font-weight:600;padding:24px 0">&#10003; Takk! Vi svarer så snart vi kan.</p>';
+      } else {
+        btn.disabled = false;
+        btn.textContent = 'Send melding';
+        alert('Noe gikk galt. Prøv igjen.');
+      }
+    } catch(err) {
+      btn.disabled = false;
+      btn.textContent = 'Send melding';
+      alert('Noe gikk galt. Prøv igjen.');
+    }
+  });
+})();
+</script>
+</body>
+</html>`);
 });
 
 router.use((_req: Request, res: Response) => {
