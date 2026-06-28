@@ -39,6 +39,7 @@ import {
   listPublishedFylker,
   listPublishedKommuner,
   listPublishedProviders,
+  countGardssalgProviders,
   getPublishedProviderById,
   getPublishedProviderBySlug,
   backfillProviderSlugs,
@@ -100,6 +101,7 @@ const CATEGORY_LABELS: Record<string, string> = {
   adrenalin_action: "Adrenalin & action",
   velvaere_spa: "Velvære & spa",
   mat_drikke: "Mat & drikke",
+  gardssalg: "Gårdssalg & smaking",
 };
 function catLabel(c: string | null | undefined): string {
   if (!c) return "Opplevelse";
@@ -163,6 +165,7 @@ const CATEGORY_ICON_INNER: Record<string, string> = {
   bakeri: '<path d="M3.5 15 a8.5 6 0 0 1 17 0 Z"></path><line x1="3.5" y1="15" x2="20.5" y2="15"></line><path d="M8 11.5 q1 -2 2 0"></path><path d="M12 10.5 q1 -2 2 0"></path><path d="M16 11.5 q1 -2 2 0"></path>',
   sjomat: '<circle cx="12" cy="13.5" r="3.6"></circle><line x1="8.6" y1="12.2" x2="5" y2="10.4"></line><line x1="8.4" y1="14" x2="4.8" y2="14.6"></line><line x1="8.8" y1="15.6" x2="5.6" y2="17.4"></line><line x1="15.4" y1="12.2" x2="19" y2="10.4"></line><line x1="15.6" y1="14" x2="19.2" y2="14.6"></line><line x1="15.2" y1="15.6" x2="18.4" y2="17.4"></line><path d="M9.6 10.6 L7 7.8 Q5.6 6.4 6.8 5.6"></path><path d="M14.4 10.6 L17 7.8 Q18.4 6.4 17.2 5.6"></path><circle cx="10.6" cy="12.4" r="0.7" fill="currentColor" stroke="none"></circle><circle cx="13.4" cy="12.4" r="0.7" fill="currentColor" stroke="none"></circle>',
   gardsbesok: '<path d="M4 11 L12 5 L20 11 V20 H4 Z"></path><path d="M4 11 H20"></path><path d="M9.5 20 V13.5 H14.5 V20"></path><line x1="9.5" y1="13.5" x2="14.5" y2="16.8"></line><line x1="14.5" y1="13.5" x2="9.5" y2="16.8"></line>',
+  gardssalg: '<path d="M4 11 L12 5 L20 11 V20 H4 Z"></path><path d="M4 11 H20"></path><path d="M9.5 20 V13.5 H14.5 V20"></path><line x1="9.5" y1="13.5" x2="14.5" y2="16.8"></line><line x1="14.5" y1="13.5" x2="9.5" y2="16.8"></line><circle cx="17" cy="7.5" r="1.2"></circle><line x1="17" y1="8.7" x2="17" y2="10.5"></line><line x1="15.5" y1="10.5" x2="18.5" y2="10.5"></line>',
   badstu: '<path d="M7 11 L8.4 19 H14.6 L16 11 Z"></path><line x1="6.2" y1="11" x2="16.8" y2="11"></line><path d="M8.4 11 a3 2.4 0 0 1 6.2 0"></path><line x1="16.8" y1="10.4" x2="20" y2="6.6"></line><circle cx="20.6" cy="5.8" r="1.4"></circle><path d="M10.5 6.6 c0.9 0.9 -0.9 1.7 0 2.6"></path>',
   yoga: '<circle cx="12" cy="5.5" r="2"></circle><line x1="12" y1="7.5" x2="12" y2="13"></line><path d="M5 18 Q12 12.5 19 18"></path><path d="M12 12 L6 16"></path><path d="M12 12 L18 16"></path>',
   camping: '<path d="M3 19 L12 5 L21 19 Z"></path><path d="M12 5 L9 19"></path><path d="M12 5 L15 19"></path><path d="M9 19 L12 12.5 L15 19"></path><line x1="2.5" y1="19" x2="21.5" y2="19"></line>',
@@ -191,6 +194,7 @@ function resolveCategoryIconKey(catOrLabel: string | null | undefined): string {
   if (/(kultur|museum|kunst|historie|teater|konsert|festival|galleri|samisk|arrangement)/.test(c)) return "kultur_historie";
   if (/(adrenalin|action|familie|barn|lek|laser|escape|klatr)/.test(c)) return "adrenalin_action";
   if (/(sightseeing|transport|buss|guidet|rundtur|helikopter|ballong|sykkel)/.test(c)) return "sightseeing_transport";
+  if (/(gårdssalg|gaardssalg|gardssalg)/.test(c)) return "gardssalg";
   if (/(mat|drikke|smak|øl|vin|gård|gard|food|bakeri|bryggeri|sjømat|sjomat)/.test(c)) return "mat_drikke";
   if (/(natur|friluft|fjell|tur|hike|vandr|topp|sopp|riding)/.test(c)) return "natur_friluft";
   return "";
@@ -209,6 +213,20 @@ function safeCategories(): Array<{ category: string; count: number }> {
     return listCategories();
   } catch {
     return [];
+  }
+}
+
+// Feature flag: gardssalg category card/sitemap visibility. Shown when ≥5
+// experience_providers have producer_type set OR rfb_seed_source='rfb-seed'.
+// Below threshold the /kategori/gardssalg URL still renders; we just suppress
+// it from the homepage grid, nav, and sitemap so it doesn't appear as a dead
+// card before meaningful content exists.
+const GARDSSALG_VISIBILITY_THRESHOLD = 5;
+function gardssalgVisible(): boolean {
+  try {
+    return countGardssalgProviders() >= GARDSSALG_VISIBILITY_THRESHOLD;
+  } catch {
+    return false; // DB not open — suppress silently
   }
 }
 
@@ -296,7 +314,13 @@ router.get("/", (req: Request, res: Response) => {
     { category: "Familievennlig", count: 0 },
   ];
   const usingFallbackCats = cats.length === 0;
-  const catSource = usingFallbackCats ? fallbackCats : cats.slice(0, 12);
+  // Phase 1 — Gårdssalg feature flag: inject the gardssalg card when the
+  // provider seed set crosses the visibility threshold and the category is not
+  // already present (e.g. because there are no published experiences yet).
+  let catSource = usingFallbackCats ? fallbackCats : cats.slice(0, 12);
+  if (!usingFallbackCats && gardssalgVisible() && !catSource.some((c) => c.category === "gardssalg")) {
+    catSource = [...catSource, { category: "gardssalg", count: 0 }].slice(0, 12);
+  }
 
   // Each category card carries its own unique inline glyph (see CATEGORY_ICON_INNER
   // / catIconSvg above). Keyed on the category slug, with a fuzzy + compass
@@ -809,6 +833,12 @@ router.get("/sitemap.xml", (_req: Request, res: Response) => {
     for (const row of listPublishedCategories()) {
       if (!row.category) continue;
       xml += `\n  <url><loc>${url}/kategori/${encodeURIComponent(row.category)}</loc><changefreq>weekly</changefreq><priority>0.7</priority><lastmod>${today}</lastmod></url>`;
+    }
+    // Phase 1 — gardssalg feature flag: include /kategori/gardssalg in sitemap
+    // when the provider seed set meets the visibility threshold, even before the
+    // category has published experiences (so Googlebot crawls the page early).
+    if (gardssalgVisible()) {
+      xml += `\n  <url><loc>${url}/kategori/gardssalg</loc><changefreq>weekly</changefreq><priority>0.7</priority><lastmod>${today}</lastmod></url>`;
     }
   } catch { /* experiences DB not open */ }
   try {
