@@ -580,6 +580,151 @@ router.post("/admin/content-refresh", requireAdmin, async (req: Request, res: Re
   });
 });
 
+// ─── POST /api/opplevelser/admin/rfb-seed (admin) ───────────────────
+//
+// Phase 0 gårdssalg seed pass: reads drink producers from the main RFB
+// marketplace DB (agents table) and seeds them as experience_providers rows
+// with rfb_seed_source='rfb-seed'. Idempotent — deduplicates on navn.
+//
+// ?dry_run=true  (default false) — logs candidates without writing.
+//
+// INVARIANT: reads ONLY from the rfb DB; NEVER writes back to it.
+// NB: MUST come before "/:id" so "admin" isn't swallowed as an id param.
+
+import { getDb as getRfbDb } from "../database/init";
+import { getDb as getExpDb } from "../database/db-factory";
+
+const RFB_DRINKS_TAGS = new Set([
+  "distillery", "sider", "brennevin", "bryggeri", "gårdsbutikk", "mjød", "vin",
+]);
+const RFB_DRINKS_CATEGORIES = new Set(["beverages", "fruit"]);
+
+router.post("/admin/rfb-seed", requireAdmin, (req: Request, res: Response) => {
+  const dryRun = req.query.dry_run === "true" || req.query.dry_run === "1";
+
+  // Open both DBs (both are cached singletons — no double-open risk).
+  const rfbDb = getRfbDb();
+  const expDb = getExpDb("experiences");
+
+  // ── Pull candidate agents from rfb DB ────────────────────────────────────
+  // Tags/categories are JSON arrays stored as TEXT. We use LIKE scans since
+  // SQLite json_each availability varies; the JSON encoding guarantees
+  // '"<tag>"' always appears verbatim in the serialised array.
+  const tagClauses = [...RFB_DRINKS_TAGS].map(() => "tags LIKE ?").join(" OR ");
+  const catClauses = [...RFB_DRINKS_CATEGORIES].map(() => "categories LIKE ?").join(" OR ");
+  const tagParams = [...RFB_DRINKS_TAGS].map((t) => `%"${t}"%`);
+  const catParams = [...RFB_DRINKS_CATEGORIES].map((c) => `%"${c}"%`);
+
+  type AgentRow = {
+    id: string;
+    name: string;
+    url: string | null;
+    city: string | null;
+    tags: string | null;
+    categories: string | null;
+  };
+
+  let candidates: AgentRow[] = [];
+  try {
+    candidates = rfbDb
+      .prepare(
+        `SELECT id, name, url, city, tags, categories
+           FROM agents
+          WHERE is_active = 1
+            AND ((${tagClauses}) OR (${catClauses}))`
+      )
+      .all(...tagParams, ...catParams) as AgentRow[];
+  } catch (err) {
+    console.error("[rfb-seed] Failed to query agents table:", err);
+    res.status(500).json({ error: "Failed to query rfb agents" });
+    return;
+  }
+
+  console.log(`[rfb-seed] Found ${candidates.length} candidate(s) in rfb DB (dry_run=${dryRun})`);
+
+  // ── Seed pass ─────────────────────────────────────────────────────────────
+  let seeded = 0;
+  let skippedDuplicate = 0;
+  const candidateNames: string[] = [];
+
+  for (const agent of candidates) {
+    candidateNames.push(agent.name);
+
+    // Dedup: check if experience_providers already has a row for this agent.
+    // Agents table has no org_nr, so we dedup on navn.
+    // (When org_nr becomes available on agents, switch to org_nr dedup.)
+    let alreadyExists = false;
+    try {
+      const existing = expDb
+        .prepare("SELECT id FROM experience_providers WHERE navn = ? LIMIT 1")
+        .get(agent.name);
+      alreadyExists = !!existing;
+    } catch (err) {
+      console.error(`[rfb-seed] Dedup check failed for "${agent.name}":`, err);
+      continue;
+    }
+
+    if (alreadyExists) {
+      console.log(`[rfb-seed] SKIP duplicate: ${agent.name}`);
+      skippedDuplicate++;
+      continue;
+    }
+
+    if (dryRun) {
+      console.log(`[rfb-seed] DRY_RUN would seed: ${agent.name}`);
+      seeded++;
+      continue;
+    }
+
+    // INSERT the provider row. Per-record try/catch so one failure never aborts the batch.
+    try {
+      const id = crypto.randomUUID();
+      expDb
+        .prepare(
+          `INSERT INTO experience_providers
+             (id, org_nr, navn, vertical, hjemmeside,
+              fylke, kommune, postnummer, poststed, adresse,
+              rfb_seed_source, enrichment_state, verification_status,
+              source, confidence)
+           VALUES
+             (@id, @org_nr, @navn, @vertical, @hjemmeside,
+              @fylke, @kommune, @postnummer, @poststed, @adresse,
+              @rfb_seed_source, @enrichment_state, @verification_status,
+              @source, @confidence)`
+        )
+        .run({
+          id,
+          org_nr: null,        // agents table has no org_nr — will be enriched later
+          navn: agent.name,
+          vertical: "experiences",
+          hjemmeside: agent.url ?? null,
+          fylke: null,         // agents table uses city, not fylke — enrich later
+          kommune: agent.city ?? null,
+          postnummer: null,
+          poststed: agent.city ?? null,
+          adresse: null,
+          rfb_seed_source: "rfb-seed",
+          enrichment_state: "raw",
+          verification_status: "pending_verify",
+          source: "rfb-marketplace-seed",
+          confidence: "medium",
+        });
+      console.log(`[rfb-seed] SEEDED: ${agent.name} (id=${id})`);
+      seeded++;
+    } catch (err) {
+      // Per-record isolation — one failure never aborts the batch.
+      console.error(`[rfb-seed] INSERT failed for "${agent.name}":`, err);
+    }
+  }
+
+  res.json({
+    seeded,
+    skipped_duplicate: skippedDuplicate,
+    dry_run: dryRun,
+    candidates: candidateNames,
+  });
+});
+
 // ─── GET /api/opplevelser/:id — single experience ───────────────────
 router.get("/:id", (req: Request, res: Response) => {
   const exp = getExperienceById(req.params.id as string);
