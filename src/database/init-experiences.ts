@@ -207,5 +207,31 @@ export function initExperiencesSchema(db: Database.Database): void {
   try { db.exec("ALTER TABLE experience_providers ADD COLUMN slug TEXT"); } catch { /* already present */ }
   try { db.exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_exp_prov_slug ON experience_providers(slug)"); } catch { /* already present */ }
 
+  // ─── Gårdssalg / drikkeprodusent additive columns (Phase 0, 2026-06-28) ────
+  // All additive — ALTER TABLE errors on re-deploy just mean already-present.
+  const drikkecols = [
+    "ALTER TABLE experience_providers ADD COLUMN producer_type TEXT",          // bryggeri|cideri|vingård|destilleri|mjøderi|seltzeri
+    "ALTER TABLE experience_providers ADD COLUMN alcohol_categories TEXT",     // JSON: ['gruppe1','gruppe2','gruppe3']
+    "ALTER TABLE experience_providers ADD COLUMN tasting_available INTEGER",   // 0|1
+    "ALTER TABLE experience_providers ADD COLUMN visit_required INTEGER",      // 0|1 (required under the new gårdssalg law)
+    "ALTER TABLE experience_providers ADD COLUMN legal_basis TEXT",            // 'existing-2016'|'pending-new-law'
+    "ALTER TABLE experience_providers ADD COLUMN bevilling_status TEXT",       // unknown|holds|na
+    "ALTER TABLE experience_providers ADD COLUMN commission_rate REAL",        // per-provider, null = platform default
+    "ALTER TABLE experience_providers ADD COLUMN rfb_seed_source TEXT",        // 'rfb-seed' if seeded from RFB registry
+    "CREATE INDEX IF NOT EXISTS idx_exp_prov_producer_type ON experience_providers(producer_type)",
+  ];
+  for (const stmt of drikkecols) {
+    try { db.exec(stmt); } catch { /* already present */ }
+  }
+
+  // Phase-3 inert placeholders (not used until law proposisjon + counsel)
+  const phase3cols = [
+    "ALTER TABLE experience_providers ADD COLUMN purchase_cap_note TEXT",
+    "ALTER TABLE experience_providers ADD COLUMN annual_volume_ledger_ref TEXT",
+  ];
+  for (const stmt of phase3cols) {
+    try { db.exec(stmt); } catch { /* already present */ }
+  }
+
   console.log("[experiences] schema initialized");
 }
