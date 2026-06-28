@@ -317,7 +317,15 @@ router.get("/llms-full.txt", (_req: Request, res: Response) => {
         // here is the difference between Perplexity citing hommegaard.no vs.
         // rettfrabonden.com/produsent/homme-gard-ovrebo.
         parts.push(`Profil: ${BASE_URL}/produsent/${slugify(a.name)}`);
-        if (k?.about) parts.push(k.about.substring(0, 120));
+        if (k?.about) {
+          // Redact PII from about text before including in AI-readable dump.
+          // Emails and Norwegian phone numbers must not appear in /llms-full.txt.
+          // Take extra chars before redaction so truncation doesn't expose a partial address.
+          const aboutRedacted = k.about.substring(0, 300)
+            .replace(/[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}/g, "[e-post]")
+            .replace(/(\+47|0047)?[\s\-.]?\d{3}[\s\-.]?\d{2}[\s\-.]?\d{3}/g, "[tlf]");
+          parts.push(aboutRedacted.substring(0, 120));
+        }
         lines.push(parts.join(" | "));
       }
       lines.push(``);
