@@ -320,7 +320,7 @@ function shell(
       </div>
       <div class="ft-col">
         <h4>${escapeHtml(t(lang, "footer.platform"))}</h4>
-        <a href="${localizedPath("/sok", lang)}">${escapeHtml(t(lang, "footer.search_producers"))}</a><a href="${localizedPath("/teknologi", lang)}">${escapeHtml(t(lang, "footer.how_it_works"))}</a><a href="${localizedPath("/om", lang)}">${escapeHtml(t(lang, "footer.about_link"))}</a><a href="${localizedPath("/personvern", lang)}">${escapeHtml(t(lang, "footer.privacy"))}</a>
+        <a href="${localizedPath("/sok", lang)}">${escapeHtml(t(lang, "footer.search_producers"))}</a><a href="${localizedPath("/teknologi", lang)}">${escapeHtml(t(lang, "footer.how_it_works"))}</a><a href="${localizedPath("/om", lang)}">${escapeHtml(t(lang, "footer.about_link"))}</a><a href="${localizedPath("/personvern", lang)}">${escapeHtml(t(lang, "footer.privacy"))}</a><a href="/kontakt">${lang === "en" ? "Contact us" : "Kontakt oss"}</a>
       </div>
       <div class="ft-col">
         <h4>${escapeHtml(t(lang, "footer.for_producers"))}</h4>
@@ -3867,6 +3867,101 @@ Sitemap: ${BASE_URL}/sitemap.xml
 # Agent Discovery:          ${BASE_URL}/.well-known/agents.txt
 # OpenAPI Spec:             ${BASE_URL}/openapi.json
 `);
+});
+
+// ─── /kontakt — public contact form (RFB / rettfrabonden.com) ───
+
+router.get("/kontakt", (req: Request, res: Response) => {
+  const lang = req.lang;
+  const en = lang === "en";
+  const brand = getConfig().display_name;
+  const title = en ? `Contact us — ${brand}` : `Kontakt oss — ${brand}`;
+  const desc = en
+    ? `Get in touch with the ${brand} team. We typically reply within a business day.`
+    : "Ta kontakt med oss. Vi svarer normalt innen én virkedag.";
+
+  const content = `
+<section class="om-hero">
+  <h1>${en ? "Contact us" : "Kontakt oss"}</h1>
+  <p>${en ? `Questions, feedback or partnership inquiries — we&apos;d love to hear from you.` : "Spørsmål, tilbakemeldinger eller henvendelser om samarbeid — vi hører gjerne fra deg."}</p>
+</section>
+
+<section class="om-sec" style="max-width:640px;margin:0 auto;padding:32px 24px 64px">
+  <form id="contact-form" novalidate>
+    <input type="text" name="_honey" value="" style="display:none;position:absolute;left:-9999px" tabindex="-1" autocomplete="off" aria-hidden="true">
+    <input type="hidden" name="platform" value="rfb">
+
+    <div style="margin-bottom:20px">
+      <label for="cf-name" style="display:block;font-weight:600;margin-bottom:6px">${en ? "Name" : "Navn"} *</label>
+      <input type="text" id="cf-name" name="name" required maxlength="100" autocomplete="name" style="width:100%;padding:10px 12px;border:1px solid #d1d5db;border-radius:8px;font-size:1rem;box-sizing:border-box">
+    </div>
+
+    <div style="margin-bottom:20px">
+      <label for="cf-email" style="display:block;font-weight:600;margin-bottom:6px">E-post *</label>
+      <input type="email" id="cf-email" name="email" required maxlength="254" autocomplete="email" style="width:100%;padding:10px 12px;border:1px solid #d1d5db;border-radius:8px;font-size:1rem;box-sizing:border-box">
+    </div>
+
+    <div style="margin-bottom:20px">
+      <label for="cf-subject" style="display:block;font-weight:600;margin-bottom:6px">${en ? "Subject" : "Emne"}</label>
+      <input type="text" id="cf-subject" name="subject" maxlength="200" style="width:100%;padding:10px 12px;border:1px solid #d1d5db;border-radius:8px;font-size:1rem;box-sizing:border-box">
+    </div>
+
+    <div style="margin-bottom:20px">
+      <label for="cf-message" style="display:block;font-weight:600;margin-bottom:6px">${en ? "Message" : "Melding"} *</label>
+      <textarea id="cf-message" name="message" required maxlength="2000" rows="5" style="width:100%;padding:10px 12px;border:1px solid #d1d5db;border-radius:8px;font-size:1rem;box-sizing:border-box;resize:vertical"></textarea>
+    </div>
+
+    <p style="font-size:.82rem;color:#6b7280;margin-bottom:20px">${en ? "Your message is stored for handling your enquiry and is read only by us." : "Meldingen lagres for behandling av forespørselen din. Leses kun av oss."}</p>
+
+    <div class="cf-turnstile" data-sitekey="0x4AAAAAADr56qDaUM0XWoTF" data-theme="light" style="margin-bottom:20px"></div>
+    <script src="https://challenges.cloudflare.com/turnstile/v0/api.js" async defer></script>
+
+    <button type="submit" style="background:var(--green-700,#15803d);color:#fff;padding:12px 28px;border:none;border-radius:8px;font-size:1rem;font-weight:600;cursor:pointer;display:inline-flex;align-items:center;gap:8px">${en ? "Send message" : "Send melding"}</button>
+  </form>
+</section>
+
+<script>
+(function(){
+  var form = document.getElementById('contact-form');
+  if(!form) return;
+  form.addEventListener('submit', async function(e){
+    e.preventDefault();
+    var btn = form.querySelector('button[type=submit]');
+    btn.disabled = true;
+    btn.textContent = '${en ? "Sending…" : "Sender…"}';
+    var data = Object.fromEntries(new FormData(form));
+    var token = (document.querySelector('[name=cf-turnstile-response]') || {}).value || '';
+    try {
+      var res = await fetch('/api/contact', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify(Object.assign({}, data, {cfTurnstileResponse: token}))
+      });
+      var json = await res.json();
+      if(json.success){
+        form.innerHTML = '<p style="color:var(--green-700,#15803d);font-size:1.1rem;font-weight:600;padding:24px 0">&#10003; ${en ? "Thank you! We&apos;ll reply as soon as possible." : "Takk! Vi svarer så snart vi kan."}</p>';
+      } else {
+        btn.disabled = false;
+        btn.textContent = '${en ? "Send message" : "Send melding"}';
+        alert('${en ? "Something went wrong. Please try again." : "Noe gikk galt. Prøv igjen."}');
+      }
+    } catch(err) {
+      btn.disabled = false;
+      btn.textContent = '${en ? "Send message" : "Send melding"}';
+      alert('${en ? "Something went wrong. Please try again." : "Noe gikk galt. Prøv igjen."}');
+    }
+  });
+})();
+</script>`;
+
+  res.setHeader("Content-Type", "text/html; charset=utf-8");
+  res.send(
+    shell(title, desc, content, {
+      canonical: `${BASE_URL}/kontakt`,
+      pathForAlternate: "/kontakt",
+      lang,
+    }),
+  );
 });
 
 export default router;
