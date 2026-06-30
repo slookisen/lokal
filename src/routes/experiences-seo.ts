@@ -44,8 +44,10 @@ import {
   getPublishedProviderBySlug,
   backfillProviderSlugs,
   searchPublishedExperiences,
+  listGardssalgProviders,
   type RelatedExperienceRow,
   type ExperienceCardRow,
+  type GardssalgProviderRow,
 } from "../services/experience-store";
 
 const router = Router();
@@ -1732,6 +1734,121 @@ router.get("/opplevelser", (req: Request, res: Response) => {
     emptyTitle: "Ingen publiserte opplevelser ennå",
     emptyBody: "Vi verifiserer og publiserer nye opplevelser fortløpende. Kom gjerne tilbake snart.",
   });
+  res.setHeader("Content-Type", "text/html; charset=utf-8");
+  res.setHeader("Cache-Control", "public, max-age=300");
+  res.send(html);
+});
+
+// ─── GET /kategori/gardssalg — Gårdssalg & smaking provider catalog ──────────
+// Gardssalg shows experience_providers (drink producers), not experiences.
+// The generic /kategori/:category route queries the experiences table and returns
+// 404 when count=0 — this special handler intercepts "gardssalg" before that.
+// Rendered as a paginated provider listing reusing the opplevagent brand/CSS.
+router.get("/kategori/gardssalg", (req: Request, res: Response) => {
+  const page = parsePage(req.query.page);
+  const PAGE_SIZE = 24;
+  const providers = listGardssalgProviders(PAGE_SIZE, (page - 1) * PAGE_SIZE);
+  const total = countGardssalgProviders();
+
+  function drinkBadge(producerType: string | null): string {
+    const map: Record<string, { label: string; color: string }> = {
+      bryggeri:   { label: "Bryggeri",  color: "#c58a2a" },
+      cideri:     { label: "Sider",     color: "#4a8c3f" },
+      sideri:     { label: "Sider",     color: "#4a8c3f" },
+      mjøderi:    { label: "Mjød",      color: "#7c5cbb" },
+      vingård:    { label: "Fruktvin",  color: "#c0577c" },
+      destilleri: { label: "Destillat", color: "#6c6c6c" },
+      seltzeri:   { label: "Kombucha",  color: "#2a7d9c" },
+    };
+    const entry = producerType ? map[producerType.toLowerCase()] : null;
+    if (!entry) return "";
+    return `<span style="display:inline-block;font-size:.72rem;font-weight:700;letter-spacing:.04em;
+      text-transform:uppercase;padding:2px 8px;border-radius:4px;
+      background:${entry.color}1a;color:${entry.color};border:1px solid ${entry.color}44">${entry.label}</span>`;
+  }
+
+  function renderProviderCard(p: GardssalgProviderRow): string {
+    const sted = [p.poststed ?? p.kommune ?? p.fylke].filter(Boolean).join(", ");
+    const badge = drinkBadge(p.producer_type);
+    const nameHtml = p.slug
+      ? `<a href="/tilbyder/${encodeURIComponent(p.slug)}" style="color:inherit;font-weight:700;font-size:1rem;text-decoration:none">${escapeHtml(p.navn)}</a>`
+      : `<span style="font-weight:700;font-size:1rem">${escapeHtml(p.navn)}</span>`;
+    const link = p.hjemmeside
+      ? `<a href="/tilbyder/${encodeURIComponent(p.slug ?? p.id)}" style="display:inline-block;margin-top:10px;padding:8px 16px;background:#0f5a50;color:#fff;border-radius:6px;font-size:.84rem;font-weight:600;text-decoration:none">Book besøk</a>`
+      : "";
+    return `<article style="background:#fff;border-radius:12px;box-shadow:0 2px 8px rgba(0,0,0,.07);overflow:hidden;display:flex;flex-direction:column">
+  <div style="padding:16px 16px 12px">
+    ${sted ? `<div style="font-size:.78rem;color:#7a7163;margin-bottom:4px">${escapeHtml(sted)}</div>` : ""}
+    <div style="margin-bottom:6px">${nameHtml}</div>
+    ${badge}
+  </div>
+  ${link ? `<div style="padding:0 16px 16px;margin-top:auto">${link}</div>` : ""}
+</article>`;
+  }
+
+  const cards = providers.map(renderProviderCard).join("\n");
+  const emptyMsg = total === 0
+    ? `<p style="color:#544a3e;margin:40px 0">Ingen drikkeprodusenter er lagt til ennå — kom tilbake snart.</p>`
+    : "";
+
+  const paginationLinks: string[] = [];
+  const totalPages = Math.ceil(total / PAGE_SIZE);
+  if (page > 1) paginationLinks.push(`<a href="/kategori/gardssalg?page=${page - 1}">← Forrige</a>`);
+  if (page < totalPages) paginationLinks.push(`<a href="/kategori/gardssalg?page=${page + 1}">Neste →</a>`);
+  const pagination = paginationLinks.length ? `<nav style="margin:32px 0;display:flex;gap:16px">${paginationLinks.join("")}</nav>` : "";
+
+  const url = "https://opplevagent.no";
+  const html = `<!doctype html>
+<html lang="no">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Gårdssalg og smaking | Opplevagent</title>
+<meta name="description" content="Besøk lokale drikkeprodusenter — bryggeri, sideri, mjød og mer. Book en smaking eller omvisning rett hos produsenten.">
+<link rel="canonical" href="${url}/kategori/gardssalg">
+<script type="application/ld+json">{"@context":"https://schema.org","@type":"CollectionPage","name":"Gårdssalg og smaking","description":"Lokale drikkeprodusenter med gårdsbesøk og smaking","url":"${url}/kategori/gardssalg"}</script>
+<style>
+${BROWSE_CSS}
+.provider-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(260px,1fr));gap:20px;margin-top:24px}
+@media(max-width:560px){.provider-grid{grid-template-columns:1fr}}
+.hero-section{background:linear-gradient(135deg,#0e3c36 0%,#0f5a50 100%);color:#fff;padding:48px 0 40px;margin-bottom:32px}
+.hero-kicker{font-size:.78rem;font-weight:700;letter-spacing:.1em;text-transform:uppercase;opacity:.7;margin-bottom:8px}
+.hero-h1{font-size:2rem;font-weight:800;margin-bottom:10px;line-height:1.2}
+.hero-sub{opacity:.85;font-size:1rem;max-width:560px;line-height:1.5}
+.legal-note{font-size:.78rem;color:#7a7163;margin-top:40px;padding-top:16px;border-top:1px solid #e4ded0}
+</style>
+</head>
+<body>
+<a class="skip-link" href="#main">Hopp til innhold</a>
+<nav class="site-nav" aria-label="Navigasjon">
+  <div class="nav-inner">
+    <a class="brand" href="/"><span class="brand-word">opplevagent<span class="tld">.no</span></span></a>
+    <span class="nav-links"><a href="/opplevelser">Alle opplevelser</a><a href="/#kategorier">Kategorier</a></span>
+  </div>
+</nav>
+<header class="hero-section">
+  <div class="container">
+    <div class="hero-kicker">Gårdssalg &amp; smaking</div>
+    <h1 class="hero-h1">Lokale drikkeprodusenter</h1>
+    <p class="hero-sub">Besøk bryggeri, sideri, mjøderi og mer — book en smaking eller omvisning rett hos produsenten.</p>
+  </div>
+</header>
+<main id="main" class="container">
+  <nav class="breadcrumb" aria-label="Brødsmulesti">
+    <a href="/">Forsiden</a> · <a href="/opplevelser">Alle opplevelser</a> · Gårdssalg og smaking
+  </nav>
+  ${total > 0 ? `<p style="color:#544a3e;font-size:.9rem;margin-top:8px">${total} produsent${total === 1 ? "" : "er"}</p>` : ""}
+  ${emptyMsg}
+  ${providers.length > 0 ? `<div class="provider-grid">${cards}</div>` : ""}
+  ${pagination}
+  <p class="legal-note">Vi formidler besøket og smakingen hos produsentene. Selve salget skjer hos produsenten, som har egen kommunal bevilling.</p>
+</main>
+<footer style="margin-top:48px;padding:24px 0;border-top:1px solid #e4ded0;font-size:.8rem;color:#7a7163;text-align:center">
+  <span><a href="/">Forsiden</a> · <a href="/llms.txt">llms.txt</a> · <a href="/sitemap.xml">Sitemap</a></span>
+</footer>
+</body>
+</html>`;
+
   res.setHeader("Content-Type", "text/html; charset=utf-8");
   res.setHeader("Cache-Control", "public, max-age=300");
   res.send(html);
