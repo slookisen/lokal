@@ -591,13 +591,33 @@ router.post("/admin/content-refresh", requireAdmin, async (req: Request, res: Re
   });
 });
 
+// ─── DELETE /api/opplevelser/admin/rfb-seed (admin) ─────────────────────────
+// Rollback: remove all experience_providers rows tagged rfb_seed_source='rfb-seed'.
+// Does NOT touch claimed/enriched/manual providers.
+router.delete("/admin/rfb-seed", requireAdmin, (req: Request, res: Response) => {
+  const expDb = getExpDb("experiences");
+  try {
+    const result = expDb
+      .prepare("DELETE FROM experience_providers WHERE rfb_seed_source = 'rfb-seed'")
+      .run();
+    res.json({
+      deleted: result.changes,
+      message: `Rolled back ${result.changes} rfb-seed provider(s). Homepage card will hide once count drops below 5.`,
+    });
+  } catch (err) {
+    console.error("[rfb-seed] rollback failed", err);
+    res.status(500).json({ error: "Rollback failed" });
+  }
+});
+
 // ─── POST /api/opplevelser/admin/rfb-seed (admin) ───────────────────
 //
 // Phase 0 gårdssalg seed pass: reads drink producers from the main RFB
 // marketplace DB (agents table) and seeds them as experience_providers rows
 // with rfb_seed_source='rfb-seed'. Idempotent — deduplicates on navn.
 //
-// ?dry_run=true  (default false) — logs candidates without writing.
+// Safe dry-run by default. Pass ?apply=true or body { apply: true } to write.
+// Accepts apply from body OR query — avoids accidental live seeds.
 //
 // INVARIANT: reads ONLY from the rfb DB; NEVER writes back to it.
 // NB: MUST come before "/:id" so "admin" isn't swallowed as an id param.
@@ -605,13 +625,36 @@ router.post("/admin/content-refresh", requireAdmin, async (req: Request, res: Re
 import { getDb as getRfbDb } from "../database/init";
 import { getDb as getExpDb } from "../database/db-factory";
 
+// Tight drikkeprodusent filter: only alcohol/craft-drink producers, NOT general farm shops.
+// "gårdsbutikk" removed (too broad). "fruit"/"beverages" categories removed (pull in coffee
+// roasters, ysteri, juice farms). Candidates must also pass the DRINK_NAME_KEYWORDS check.
 const RFB_DRINKS_TAGS = new Set([
-  "distillery", "sider", "brennevin", "bryggeri", "gårdsbutikk", "mjød", "vin",
+  "distillery", "sider", "brennevin", "bryggeri", "mjød", "vin",
 ]);
-const RFB_DRINKS_CATEGORIES = new Set(["beverages", "fruit"]);
+const RFB_DRINKS_CATEGORIES = new Set(["alcohol"]);
+
+// Positive name-keyword signal: at least one must match for "beverages"-tagged agents
+// (drink-specific tags are trusted directly; name check catches untagged ones).
+const DRINK_NAME_KEYWORDS = [
+  "bryggeri", "brygghus", "ølbrygger", "cideri", "sideri", "mjød",
+  "mead", "destilleri", "brenneri", "gårdsbryggeri", "vinprodusent",
+  "kombucha", "gårdsvin", "fruktvin", "craft",
+];
+
+// Exclusion keywords: matched against lowercased agent name — never seed these.
+const EXCLUDE_NAME_KEYWORDS = [
+  "kafferøst", "kaffebrenner", "kaffebrenneri", "ysteri", "ostegård",
+  "juice", "gårdsbutikk",
+];
 
 router.post("/admin/rfb-seed", requireAdmin, (req: Request, res: Response) => {
-  const dryRun = req.query.dry_run === "true" || req.query.dry_run === "1";
+  // Safe default: dry-run. Must explicitly pass apply=true (body or query) to write.
+  const bodyApply = (req.body ?? {}) as { apply?: unknown };
+  const applyFlag =
+    bodyApply.apply === true || bodyApply.apply === 1 ||
+    bodyApply.apply === "1" || bodyApply.apply === "true" ||
+    req.query?.apply === "true" || req.query?.apply === "1";
+  const dryRun = !applyFlag;
 
   // Open both DBs (both are cached singletons — no double-open risk).
   const rfbDb = getRfbDb();
@@ -652,6 +695,21 @@ router.post("/admin/rfb-seed", requireAdmin, (req: Request, res: Response) => {
   }
 
   console.log(`[rfb-seed] Found ${candidates.length} candidate(s) in rfb DB (dry_run=${dryRun})`);
+
+  // Post-filter: exclude non-drikkeprodusenter by name keywords.
+  candidates = candidates.filter((agent) => {
+    const nameLower = agent.name.toLowerCase();
+    if (EXCLUDE_NAME_KEYWORDS.some((kw) => nameLower.includes(kw))) return false;
+    const hasDrinkTag = agent.tags
+      ? (() => {
+          try { return (JSON.parse(agent.tags) as string[]).some((t) => RFB_DRINKS_TAGS.has(t)); }
+          catch { return false; }
+        })()
+      : false;
+    if (hasDrinkTag) return true;
+    return DRINK_NAME_KEYWORDS.some((kw) => nameLower.includes(kw));
+  });
+  console.log(`[rfb-seed] After name-keyword filter: ${candidates.length} drikkeprodusent candidate(s)`);
 
   // ── Seed pass ─────────────────────────────────────────────────────────────
   let seeded = 0;
