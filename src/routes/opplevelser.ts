@@ -609,7 +609,7 @@ import { getDb as getExpDb } from "../database/db-factory";
 
 // Tight drikkeprodusent filter — beverage manufacturers with on-site production only.
 // INCLUDE: bryggeri, cideri/sideri, mjød, destilleri/brenneri, vin, kombucha.
-// EXCLUDE: coffee roasters (kafferøst), cheese (ysteri), plain gårdsbutikk, general fruit farms.
+// EXCLUDE: coffee roasters (kafferøst/kaffebrenneri), cheese (ysteri), plain gårdsbutikk.
 const RFB_DRINKS_TAGS = new Set([
   "bryggeri", "cideri", "sideri", "distillery", "brennevin", "mjød", "vin",
 ]);
@@ -621,6 +621,10 @@ const DRINKS_NAME_KEYWORDS = [
   "destilleri", "brenneri",
   "kombucha",
   "vingård", "vinprodusent", "vingårdsbryggeri",
+];
+// Coffee roasters match "brenneri" via substring — exclude them explicitly.
+const DRINKS_NAME_EXCLUSIONS = [
+  "kaffebrenneri", "kaffibrenneri", "kafferøst", "kafferoasteri", "kaffebar",
 ];
 
 // ─── DELETE /api/opplevelser/admin/rfb-seed — rollback ───────────────────────
@@ -658,6 +662,8 @@ router.post("/admin/rfb-seed", requireAdmin, (req: Request, res: Response) => {
   const tagParams = [...RFB_DRINKS_TAGS].map((t) => `%"${t}"%`);
   const nameClauses = DRINKS_NAME_KEYWORDS.map(() => "lower(name) LIKE ?").join(" OR ");
   const nameParams = DRINKS_NAME_KEYWORDS.map((k) => `%${k}%`);
+  const excludeClauses = DRINKS_NAME_EXCLUSIONS.map(() => "lower(name) NOT LIKE ?").join(" AND ");
+  const excludeParams = DRINKS_NAME_EXCLUSIONS.map((k) => `%${k}%`);
 
   type AgentRow = {
     id: string;
@@ -675,9 +681,10 @@ router.post("/admin/rfb-seed", requireAdmin, (req: Request, res: Response) => {
         `SELECT id, name, url, city, tags, categories
            FROM agents
           WHERE is_active = 1
-            AND ((${tagClauses}) OR (${nameClauses}))`
+            AND ((${tagClauses}) OR (${nameClauses}))
+            AND (${excludeClauses})`
       )
-      .all(...tagParams, ...nameParams) as AgentRow[];
+      .all(...tagParams, ...nameParams, ...excludeParams) as AgentRow[];
   } catch (err) {
     console.error("[rfb-seed] Failed to query agents table:", err);
     res.status(500).json({ error: "Failed to query rfb agents" });
