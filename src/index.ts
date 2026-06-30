@@ -14,6 +14,7 @@ import {
   MAX_REQUEST_SIZE,
   adminLimiter,
   dentalLimiter,
+  aiCrawlerAllowlist,
 } from "./middleware/security";
 import producerRoutes from "./routes/producer";
 import consumerRoutes from "./routes/consumer";
@@ -118,6 +119,11 @@ app.use(securityHeaders);
 app.use(cors(corsOptions));
 app.use(express.json({ limit: MAX_REQUEST_SIZE }));
 app.use(sanitizeInput);
+
+// AI-crawler allowlist — mark known AI crawler UAs on safe read-only
+// paths (llms.txt, sitemap.xml, /.well-known/*) so any scrape-hardening
+// layer (current or future) lets them through. Also emits X-Robots-Tag: all.
+app.use(aiCrawlerAllowlist);
 
 // Analytics middleware (before routes, after security)
 app.use(analyticsService.middleware());

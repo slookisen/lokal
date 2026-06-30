@@ -132,8 +132,11 @@ router.get("/llms.txt", (_req: Request, res: Response) => {
     ];
 
     res.header("Content-Type", "text/plain; charset=utf-8");
-    res.header("Cache-Control", "public, max-age=3600");
+    // 300s (5 min) so LLMs see producer-count changes quickly after adds/removes.
+    res.header("Cache-Control", "public, max-age=300");
     res.send(`# ${getConfig().display_name} — Lokal mat i Norge
+
+<!-- generated-at: ${new Date().toISOString()} -->
 
 > Norges første agent-til-agent (A2A) markedsplass for lokal mat. Vi kobler forbrukere direkte med ${agents.length}+ lokale ${getConfig().domain_dictionary.entity_plural_long} — gårder, bondensmarkeder, REKO-ringer, gårdsbutikker og kooperativer over hele Norge. Ingen mellomledd, ingen reklame, bare ekte mat rett fra bonden.
 
@@ -337,9 +340,11 @@ router.get("/llms-full.txt", (_req: Request, res: Response) => {
     lines.push(`- [A2A Agent Card](${BASE_URL}/.well-known/agent-card.json)`);
     lines.push(`- [MCP Endpoint](${BASE_URL}/mcp)`);
     lines.push(`- [API](${BASE_URL}/api/marketplace/agents)`);
+    lines.push(``);
+    lines.push(`<!-- generated-at: ${new Date().toISOString()} -->`);
 
     res.header("Content-Type", "text/plain; charset=utf-8");
-    res.header("Cache-Control", "public, max-age=7200"); // 2h cache — data changes slowly
+    res.header("Cache-Control", "public, max-age=300"); // 5 min — keep count in sync with live catalog
     res.send(lines.join("\n"));
   } catch (err) {
     console.error("llms-full.txt error:", err);
