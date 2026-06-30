@@ -1062,3 +1062,28 @@ export function countGardssalgProviders(): number {
     .get() as { c: number };
   return row.c;
 }
+
+export type GardssalgProviderRow = {
+  id: string;
+  navn: string;
+  hjemmeside: string | null;
+  fylke: string | null;
+  kommune: string | null;
+  poststed: string | null;
+  producer_type: string | null;
+  enrichment_state: string | null;
+  slug: string | null;
+};
+
+export function listGardssalgProviders(limit = 100, offset = 0): GardssalgProviderRow[] {
+  const db = getDb(VERTICAL);
+  return db
+    .prepare(
+      `SELECT id, navn, hjemmeside, fylke, kommune, poststed, producer_type, enrichment_state, slug
+         FROM experience_providers
+        WHERE producer_type IS NOT NULL OR rfb_seed_source = 'rfb-seed'
+        ORDER BY navn
+        LIMIT ? OFFSET ?`
+    )
+    .all(limit, offset) as GardssalgProviderRow[];
+}
