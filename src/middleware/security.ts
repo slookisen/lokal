@@ -177,3 +177,57 @@ export const adminLimiter = rateLimit({
   validate: sharedValidate,
   message: { success: false, error: "Admin rate limit nådd. Maks 100 admin-operasjoner per time." },
 });
+
+// ─── AI-crawler allowlist ─────────────────────────────────────
+// Cloudflare WAF rules may block unknown bots on finn-tannlege.com and
+// other domains. This middleware runs before any rate-limiter and marks
+// requests from known AI crawlers so downstream scrape-hardening can
+// let them through. We only allow the safe, read-only paths:
+// llms.txt, sitemap.xml, robots.txt, /.well-known/*, and the public
+// SSR pages (GET with no sensitive parameters).
+//
+// PII-redaction and abusive-scraper blocking (anything NOT in this UA
+// list) are unaffected — this is an explicit allowlist, not "allow all".
+
+const AI_CRAWLER_UAS = [
+  "gptbot",
+  "oai-searchbot",
+  "chatgpt-user",
+  "perplexitybot",
+  "claudebot",
+  "anthropic-ai",
+  "google-extended",
+  "googlebot",
+  "bingbot",
+  "applebot",
+];
+
+// Paths that AI crawlers are always permitted to reach.
+const AI_SAFE_PATHS = [
+  "/llms.txt",
+  "/llms-full.txt",
+  "/sitemap.xml",
+  "/robots.txt",
+];
+
+function isAiCrawler(ua: string): boolean {
+  const lower = ua.toLowerCase();
+  return AI_CRAWLER_UAS.some((bot) => lower.includes(bot));
+}
+
+function isAiSafePath(path: string): boolean {
+  if (AI_SAFE_PATHS.includes(path)) return true;
+  if (path.startsWith("/.well-known/")) return true;
+  return false;
+}
+
+export function aiCrawlerAllowlist(req: Request, res: Response, next: NextFunction) {
+  const ua = req.headers["user-agent"] || "";
+  if (req.method === "GET" && isAiCrawler(ua) && isAiSafePath(req.path)) {
+    // Signal to any downstream middleware / rate-limiter that this is a
+    // trusted AI crawler on a read-only path — skip blocking.
+    (req as any).isAiCrawler = true;
+    res.setHeader("X-Robots-Tag", "all");
+  }
+  next();
+}

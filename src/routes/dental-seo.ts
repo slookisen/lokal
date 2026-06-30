@@ -1714,7 +1714,10 @@ router.get("/llms.txt", (_req: Request, res: Response) => {
   try { stats = getCachedDentalStats(); } catch { /* ok */ }
 
   res.setHeader("Content-Type", "text/plain; charset=utf-8");
+  res.setHeader("Cache-Control", "public, max-age=300");
   res.send(`# finn-tannlege.com — LLM-oversikt
+
+<!-- generated-at: ${new Date().toISOString()} -->
 
 ## Hva er dette?
 
