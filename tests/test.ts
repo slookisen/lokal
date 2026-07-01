@@ -175,6 +175,21 @@ console.log("\n── orch-pr-13: contact-normalizer (address/phone) ──");
   console.log(`  contact-normalizer: ${r.passed} passed, ${r.failed} failed`);
 }
 
+// ── PR-131: dental-claim-service buildWhereClause (completion-mode fix) ──
+// Pins the completion-mode already-complete exclusion (and pre-existing
+// PR-108/PR-120 exclusions + base filter behaviour) so `npm test` catches
+// any regression to the dental claim-batch pool logic.
+console.log("\n── PR-131: dental-claim-service (buildWhereClause) ──");
+{
+  const { runDentalClaimServiceTests } = require("../src/services/dental-claim-service.test") as
+    typeof import("../src/services/dental-claim-service.test");
+  const r = runDentalClaimServiceTests({ log: false });
+  passed += r.passed;
+  failed += r.failed;
+  for (const f of r.failures) failures.push("dental-claim-service: " + f);
+  console.log(`  dental-claim-service: ${r.passed} passed, ${r.failed} failed`);
+}
+
 // ── orch-pr-12: search-enrich background sweep + findings + apply-findings ──
 // Async (fire-and-forget sweep loop). Kicked off here; awaited in the REPORT
 // block so its pass/fail counts fold into the `npm test` summary.
