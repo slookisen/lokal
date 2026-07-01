@@ -891,15 +891,25 @@ const NORWEGIAN_WORD_MARKERS: readonly string[] = [
  *   - length ≥ 80 chars (a real description, not a tagline/fragment),
  *   - looks Norwegian — contains an æ/ø/å letter OR a common Norwegian function
  *     word (rejects an English cookie/marketing snippet),
- *   - is NOT dominated by generic boilerplate (cookie/consent/placeholder).
+ *   - is NOT dominated by generic boilerplate (cookie/consent/placeholder),
+ *   - does NOT contain the Unicode replacement character (U+FFFD, "�") — a
+ *     candidate with a "�" was mangled upstream (most likely a byte-level cut
+ *     through a multi-byte UTF-8 character, e.g. mid æ/ø/å) and must never be
+ *     written as a producer's public description (customer-reported bug:
+ *     Olestølen Mikroysteri's meta description ended "...opplevelser p�").
  *
- * Returns false for empty/short/foreign/boilerplate text so the caller keeps the
- * existing value (blank or stale beats wrong). minLen is overridable for tests.
+ * Returns false for empty/short/foreign/boilerplate/mangled text so the caller
+ * keeps the existing value (blank or stale beats wrong or broken). minLen is
+ * overridable for tests.
  */
 export function meetsAboutQualityBar(text: string | null | undefined, minLen = 80): boolean {
   if (!text) return false;
   const trimmed = String(text).replace(/\s+/g, " ").trim();
   if (trimmed.length < minLen) return false;
+
+  // Reject text carrying the Unicode replacement character — a sign of a
+  // mangled/mid-character truncation somewhere upstream (see doc comment).
+  if (trimmed.includes("�")) return false;
 
   const lower = trimmed.toLowerCase();
   const lowerAscii = stripNorwegianAccents(lower);

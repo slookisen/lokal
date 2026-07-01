@@ -109,6 +109,19 @@
 
     function esc(t){if(!t)return '';return String(t).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;')}
 
+    // Repair a "�" (U+FFFD)-mangled string before it's used in a meta tag —
+    // defends against a DB value that arrived from the server already
+    // corrupted (e.g. a byte-level cut through a multi-byte UTF-8 char
+    // upstream). See src/routes/seo.ts safeMetaDescription for the
+    // server-side twin of this fix.
+    function safeDesc(t){
+        if(!t) return '';
+        var s=String(t);
+        if(s.indexOf('�')===-1) return s;
+        s=s.replace(/\S*�+\s*$/,'').replace(/�+/g,'').trim();
+        return s;
+    }
+
     function getAgentId(){var m=window.location.pathname.match(/\/agent\/([^/]+)/);return m?m[1]:null}
 
     function trustColor(score){if(score>=0.7)return '#2D6A4F';if(score>=0.4)return '#E76F51';return '#999'}
@@ -120,7 +133,7 @@
         var name=esc(a.name||'Agent');
         var city=esc(a.city||'Norge');
         var ts=Math.round((a.trustScore||0)*100);
-        var desc=k.about||'';
+        var desc=safeDesc(k.about||'');
 
         // Update page meta
         document.title=name+' | Rett fra Bonden';
