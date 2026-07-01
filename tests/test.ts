@@ -5669,6 +5669,65 @@ console.log("\n── WO-17: seo.ts source-presence (JSON-LD + sitemap) ──")
   );
 }
 
+// ── GEO Lever 1 (dev-request 2026-06-30-geo-content-structured-data):
+// FAQPage JSON-LD source-presence checks. Cheap, deterministic regression
+// guard mirroring the WO-17 pattern above. Full behavioural render checks
+// (valid JSON, @type FAQPage, presence/absence gated on real data, no
+// fabricated Q&A) live in tests/seo-jsonld.test.ts (standalone, run via
+// `npx tsx tests/seo-jsonld.test.ts` — kept out of tests/test.ts because
+// they need their own isolated :memory: DB pin via __setDbForTesting, and
+// tests/test.ts's shared getDb() singleton is already contended by many
+// concurrent IIFEs; adding another independent DB-swapping consumer here
+// risks destabilizing pre-existing tests rather than this feature).
+console.log("\n── geo-faq: seo.ts source-presence (FAQPage JSON-LD) ──");
+{
+  const fsGeoFaq = require("fs");
+  const seoSrcGeoFaq = fsGeoFaq.readFileSync("src/routes/seo.ts", "utf8");
+  assertTrue(
+    seoSrcGeoFaq.includes("function buildProducerFaqJsonLd"),
+    "geo-faq: seo.ts defines buildProducerFaqJsonLd helper"
+  );
+  assertTrue(
+    /"@type":\s*"FAQPage"/.test(seoSrcGeoFaq),
+    "geo-faq: seo.ts contains FAQPage @type"
+  );
+  assertTrue(
+    /"@type":\s*"Question"/.test(seoSrcGeoFaq) && /"@type":\s*"Answer"/.test(seoSrcGeoFaq),
+    "geo-faq: seo.ts contains Question/Answer @type pair"
+  );
+  assertTrue(
+    seoSrcGeoFaq.includes("if (qa.length < 2) return null"),
+    "geo-faq: buildProducerFaqJsonLd requires >=2 real Q&A or emits nothing (no thin content)"
+  );
+  assertTrue(
+    seoSrcGeoFaq.includes("const faqJsonLd = buildProducerFaqJsonLd("),
+    "geo-faq: /produsent/:slug handler calls buildProducerFaqJsonLd"
+  );
+  assertTrue(
+    seoSrcGeoFaq.includes("if (faqJsonLd) jsonLdBlocks.push(faqJsonLd)"),
+    "geo-faq: FAQPage block is only appended when buildProducerFaqJsonLd returns non-null"
+  );
+  assertTrue(
+    seoSrcGeoFaq.includes("jsonLd: jsonLdBlocks"),
+    "geo-faq: /produsent/:slug shell() call passes the combined jsonLdBlocks array"
+  );
+  // Guard against fabricating a "Hva selger" answer with no product/category data.
+  assertTrue(
+    /productNames\.length\)\s*\{[\s\S]{0,300}qa\.push/.test(seoSrcGeoFaq),
+    "geo-faq: 'Hva selger' question is only pushed when real product names exist"
+  );
+  // Guard against fabricating a "Hvor ligger" answer with no address/city data.
+  assertTrue(
+    seoSrcGeoFaq.includes("if (address && cityName)") || seoSrcGeoFaq.includes("} else if (cityName) {"),
+    "geo-faq: 'Hvor ligger' question requires real address or city data"
+  );
+  // Category/city pages are explicitly out of scope this slice.
+  assertTrue(
+    !/router\.get\("\/kategori\/[^"]*"[\s\S]{0,2000}buildProducerFaqJsonLd/.test(seoSrcGeoFaq),
+    "geo-faq: FAQPage builder is not wired into category-page routes this slice"
+  );
+}
+
 // ── PR-56 reviewer note 3: init.ts comment accuracy ──
 console.log("\n── PR-56 note 3: init.ts comment accuracy ──");
 {

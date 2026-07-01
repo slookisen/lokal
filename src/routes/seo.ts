@@ -426,6 +426,103 @@ function isOpenNow(openingHours: Array<{ day: string; open: string; close: strin
   return { isOpen, todayLabel: `${today.open}–${today.close}` };
 }
 
+// ─── GEO Lever 1: FAQPage JSON-LD for producer pages ────────────────
+// Dev-request 2026-06-30-geo-content-structured-data — FAQPage is the
+// highest-impact structured-data type for generative-engine (Perplexity/
+// ChatGPT/Google AI Overviews) citation. Each Q&A becomes an explicit
+// citation candidate for "hva selger X" / "hvor ligger X" style queries.
+//
+// HARD NON-GOAL (per dev-request): no fabricated content. Every answer
+// must trace to a real field on the producer's own catalog data — no
+// generic filler. If a question's underlying data is absent, that
+// question (or the whole block, if fewer than 2 questions clear the
+// bar) is omitted rather than answered with a thin/generic sentence.
+//
+// Only wired into the producer template (/produsent/:slug, non-umbrella
+// branch) this cycle — category/city pages are separate future slices.
+function buildProducerFaqJsonLd(params: {
+  name: string;
+  cityName: string;
+  address?: string;
+  products: any[];
+  categories: string[];
+  deliveryOptions?: string[];
+  hasOpeningHours: boolean;
+  website?: string;
+}): { "@context": string; "@type": string; mainEntity: any[] } | null {
+  const { name, cityName, address, products, categories, deliveryOptions, hasOpeningHours, website } = params;
+  const qa: Array<{ q: string; a: string }> = [];
+
+  // Q1: "Hva selger {navn}?" — only from real product names or, failing
+  // that, real category tags. Never emitted from a generic description.
+  const productNames = (products || [])
+    .map((p: any) => (typeof p === "string" ? p : (p?.name || "")))
+    .filter((n: string) => !!n)
+    .slice(0, 8);
+  const categoryLabels = (categories || []).map((c: string) => formatCat(c)).filter(Boolean);
+  if (productNames.length) {
+    qa.push({
+      q: `Hva selger ${name}?`,
+      a: `${name} selger ${productNames.join(", ")}.`,
+    });
+  } else if (categoryLabels.length) {
+    qa.push({
+      q: `Hva selger ${name}?`,
+      a: `${name} selger ${categoryLabels.join(", ").toLowerCase()}.`,
+    });
+  }
+
+  // Q2: "Hvor ligger {navn}?" — only from a real address and/or city.
+  if (address && cityName) {
+    qa.push({
+      q: `Hvor ligger ${name}?`,
+      a: `${name} ligger på ${address} i ${cityName}.`,
+    });
+  } else if (cityName) {
+    qa.push({
+      q: `Hvor ligger ${name}?`,
+      a: `${name} ligger i ${cityName}.`,
+    });
+  }
+
+  // Q3 (optional): "Kan jeg besøke / bestille fra {navn}?" — only if we
+  // have a real signal: opening hours (implies a visitable location),
+  // delivery options, or a website to order through.
+  const visitParts: string[] = [];
+  if (hasOpeningHours && address) {
+    visitParts.push(`Du kan besøke ${name} på ${address}${cityName ? ` i ${cityName}` : ""} i åpningstiden.`);
+  }
+  if (deliveryOptions && deliveryOptions.length) {
+    visitParts.push(`${name} tilbyr levering via ${deliveryOptions.join(", ").toLowerCase()}.`);
+  } else if (website) {
+    visitParts.push(`Du kan bestille fra ${name} via ${website.replace(/^https?:\/\//, "").replace(/\/$/, "")}.`);
+  }
+  if (visitParts.length) {
+    qa.push({
+      q: `Kan jeg besøke eller bestille fra ${name}?`,
+      a: visitParts.join(" "),
+    });
+  }
+
+  // Require at least 2 real Q&A pairs — anything thinner isn't worth the
+  // structured-data surface area and risks looking like filler to Google's
+  // Rich Results validator / AI-engine content-quality heuristics.
+  if (qa.length < 2) return null;
+
+  return {
+    "@context": "https://schema.org",
+    "@type": "FAQPage",
+    mainEntity: qa.map(({ q, a }) => ({
+      "@type": "Question",
+      "name": q,
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": a,
+      },
+    })),
+  };
+}
+
 // ─── PR-84: Ultra-rich card for positions 1-3 (claimed top producers) ───
 
 function producerCardUltraRich(a: any, knowledge: any, lang: Lang = "no"): string {
@@ -3422,6 +3519,24 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
       };
     }
 
+    // GEO Lever 1 (dev-request 2026-06-30-geo-content-structured-data):
+    // FAQPage JSON-LD generated strictly from this producer's real catalog
+    // data (products/categories/address/opening-hours/delivery/website).
+    // Returns null — and is omitted below — when there isn't enough real
+    // data to answer at least 2 of the 3 candidate questions honestly.
+    const faqJsonLd = buildProducerFaqJsonLd({
+      name: agent.name,
+      cityName,
+      address: k.address || undefined,
+      products: productsList,
+      categories: agent.categories || [],
+      deliveryOptions: (k.deliveryOptions || []).length ? (k.deliveryOptions as string[]) : undefined,
+      hasOpeningHours: hoursList.length > 0,
+      website: k.website || undefined,
+    });
+    const jsonLdBlocks: any[] = [jsonLd];
+    if (faqJsonLd) jsonLdBlocks.push(faqJsonLd);
+
     // Phase 5.4a M2 — Variant A hero claim banner for unclaimed agents.
     // Renders above the fold, server-rendered so AI bots see it (A3).
     const heroClaimHtml = !isClaimed
@@ -3689,7 +3804,7 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
       `${agent.name}${cityName ? t(lang, "producer.title_suffix", { city: cityName }) : ""}${titleFreshnessSuffix(updatedAtDate)}`,
       `${agent.name}${cityName ? ` ${lang === "en" ? "in" : "i"} ${cityName}` : ""}. ${safeMetaDescription(agent.description) || (lang === "en" ? "Local food in Norway." : "Lokalprodusert mat i Norge.")}`,
       content,
-      { canonical: `${BASE_URL}${localizedPath("/produsent/" + slug, lang)}`, jsonLd, extraCss: PROFILE_CSS + RELATED_PRODUCERS_CSS, lang, pathForAlternate: "/produsent/" + slug }
+      { canonical: `${BASE_URL}${localizedPath("/produsent/" + slug, lang)}`, jsonLd: jsonLdBlocks, extraCss: PROFILE_CSS + RELATED_PRODUCERS_CSS, lang, pathForAlternate: "/produsent/" + slug }
     ));
   } catch (err) {
     console.error(`SEO /produsent/${slug} error:`, err);
