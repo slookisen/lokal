@@ -2510,6 +2510,70 @@ export const RELATED_PRODUCERS_CSS = `
   }
 `;
 
+// GEO: FAQPage JSON-LD for producer pages (dev-request 2026-06-30-geo-content-structured-data).
+// Answers are built strictly from catalog fields already on the profile — never fabricated.
+// Quality-gated: returns null unless at least 2 questions have real, catalog-backed answers,
+// so thin/incomplete profiles emit no FAQ schema at all.
+export function buildProducerFaqJsonLd(params: {
+  name: string;
+  url: string;
+  cityName: string;
+  productsList: any[];
+  categories: string[];
+  hoursList: any[];
+  hoursText: string;
+  website?: string;
+  address?: string;
+}): any | null {
+  const qas: Array<{ q: string; a: string }> = [];
+
+  const productNames = (params.productsList || [])
+    .map((p: any) => (typeof p === "string" ? p : p?.name))
+    .filter(Boolean)
+    .slice(0, 8);
+  const catLabels = (params.categories || []).map((c: string) => formatCat(c)).filter(Boolean);
+  const sellItems = productNames.length ? productNames : catLabels;
+  if (sellItems.length) {
+    qas.push({
+      q: `Hva selger ${params.name}?`,
+      a: `${params.name} tilbyr ${sellItems.join(", ")}.`,
+    });
+  }
+
+  if (params.cityName) {
+    const addressPart = params.address ? `${params.address}, ` : "";
+    qas.push({
+      q: `Hvor ligger ${params.name}?`,
+      a: `${params.name} holder til i ${addressPart}${params.cityName}.`,
+    });
+  }
+
+  const hasHours = (params.hoursList || []).length > 0 || !!params.hoursText;
+  const hasWebsite = !!params.website;
+  if (hasHours || hasWebsite) {
+    const parts: string[] = [];
+    if (hasHours) parts.push("har åpningstider oppført på profilen");
+    if (hasWebsite) parts.push(`kan kontaktes/bestilles via ${params.website}`);
+    qas.push({
+      q: `Kan jeg besøke eller bestille fra ${params.name}?`,
+      a: `Ja — ${params.name} ${parts.join(" og ")}.`,
+    });
+  }
+
+  if (qas.length < 2) return null;
+
+  return {
+    "@context": "https://schema.org",
+    "@type": "FAQPage",
+    "@id": `${params.url}#faq`,
+    "mainEntity": qas.map(({ q, a }) => ({
+      "@type": "Question",
+      "name": q,
+      "acceptedAnswer": { "@type": "Answer", "text": a },
+    })),
+  };
+}
+
 router.get("/produsent/:slug", (req: Request, res: Response) => {
   const lang = req.lang;
   const slug = (req.params.slug as string).toLowerCase();
@@ -3413,6 +3477,19 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
       jsonLd.additionalType = (agent.categories as string[]).map((c: string) => formatCat(c)).join(", ");
     }
 
+    // GEO: FAQPage JSON-LD — see buildProducerFaqJsonLd for the quality gate.
+    const faqJsonLd = buildProducerFaqJsonLd({
+      name: agent.name,
+      url: `${BASE_URL}/produsent/${slug}`,
+      cityName,
+      productsList,
+      categories: (agent.categories as string[]) || [],
+      hoursList,
+      hoursText,
+      website: k.website,
+      address: k.address,
+    });
+
     // A2A protocol versioning (custom extension in JSON-LD)
     const agentInfo = info?.agent as any;
     if (agentInfo?.schemaVersion || agentInfo?.agentVersion) {
@@ -3689,7 +3766,7 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
       `${agent.name}${cityName ? t(lang, "producer.title_suffix", { city: cityName }) : ""}${titleFreshnessSuffix(updatedAtDate)}`,
       `${agent.name}${cityName ? ` ${lang === "en" ? "in" : "i"} ${cityName}` : ""}. ${safeMetaDescription(agent.description) || (lang === "en" ? "Local food in Norway." : "Lokalprodusert mat i Norge.")}`,
       content,
-      { canonical: `${BASE_URL}${localizedPath("/produsent/" + slug, lang)}`, jsonLd, extraCss: PROFILE_CSS + RELATED_PRODUCERS_CSS, lang, pathForAlternate: "/produsent/" + slug }
+      { canonical: `${BASE_URL}${localizedPath("/produsent/" + slug, lang)}`, jsonLd: faqJsonLd ? [jsonLd, faqJsonLd] : jsonLd, extraCss: PROFILE_CSS + RELATED_PRODUCERS_CSS, lang, pathForAlternate: "/produsent/" + slug }
     ));
   } catch (err) {
     console.error(`SEO /produsent/${slug} error:`, err);
