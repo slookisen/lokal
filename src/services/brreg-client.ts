@@ -126,6 +126,151 @@ async function fetchWithTimeout(
   }
 }
 
+// ─── Org-nr direct verification (Slice 1 of dev-request ────────────────
+//   2026-06-30-brreg-verification-gate) ──────────────────────────────────
+//
+// verifyOrgNumber(orgNr) does a DIRECT lookup by org-nr (not a name search)
+// against GET /enheter/{orgNr}. Unlike findOrgnumberByName, there is no
+// fuzzy matching here — the org-nr is already known, we just need Brreg's
+// current record for it (active/inactive, registered name, NACE codes).
+//
+// Brreg's single-unit shape includes (per the real Enhetsregisteret API,
+// same field-presence convention already used by experience-brreg.ts's
+// BrregEntity): `konkurs: boolean`, `underAvvikling: boolean`,
+// `underTvangsavviklingEllerTvangsopplosning: boolean`, and
+// `slettedato: string | null` (presence = deleted/dissolved). There is no
+// separate "konkursdato" field in the real API — bankruptcy is exposed as
+// the `konkurs` boolean, which is the convention experience-brreg.ts
+// already relies on, so verifyOrgNumber mirrors it for consistency.
+//
+// This function is intentionally NOT wired into any registration/
+// enrichment endpoint yet — that's deferred to a later slice. It's purely
+// additive: a reusable lookup a future caller can wire in.
+export type BrregFlag = "dissolved" | "bankrupt" | "wrong_nace" | "name_mismatch" | "no_orgnr" | null;
+
+export interface BrregVerifyResult {
+  exists: boolean;
+  active: boolean;           // false if konkurs / underAvvikling / underTvangsavviklingEllerTvangsopplosning / slettedato is set
+  name: string | null;       // Brreg's registered name (foretaksnavn), for the caller to loosely compare
+  nace: string[];            // naeringskode1..3 codes present, as an array of strings
+  registrertDato: string | null;
+  slettetDato: string | null;
+  flag: BrregFlag;           // "dissolved" if slettetDato set, "bankrupt" if konkurs, else null when active+exists
+}
+
+type RawEnhetDetail = {
+  organisasjonsnummer?: string;
+  navn?: string;
+  konkurs?: boolean;
+  underAvvikling?: boolean;
+  underTvangsavviklingEllerTvangsopplosning?: boolean;
+  slettedato?: string | null;
+  registreringsdatoEnhetsregisteret?: string | null;
+  naeringskode1?: { kode?: string } | null;
+  naeringskode2?: { kode?: string } | null;
+  naeringskode3?: { kode?: string } | null;
+};
+
+const SAFE_DEFAULT_VERIFY_RESULT: BrregVerifyResult = {
+  exists: false,
+  active: false,
+  name: null,
+  nace: [],
+  registrertDato: null,
+  slettetDato: null,
+  flag: "no_orgnr",
+};
+
+// Tiny separate per-process cache keyed by orgNr — org-nr lookups are cheap
+// and direct, so this is mostly to avoid hammering Brreg on repeated calls
+// for the same org-nr within one run. Not required by callers.
+const verifyCache: Map<string, BrregVerifyResult> = new Map();
+
+export function __clearBrregVerifyCacheForTesting(): void {
+  verifyCache.clear();
+}
+
+export function brregVerifyCacheSize(): number {
+  return verifyCache.size;
+}
+
+/**
+ * verifyOrgNumber(orgNr) — direct Brreg lookup by org-nr (GET /enheter/{orgNr}).
+ * A 404 means the org-nr doesn't exist in Brreg. Never throws: any
+ * network/parse error or 404 resolves to the safe default result
+ * (`exists: false`, `flag: "no_orgnr"`).
+ *
+ * Does NOT do fuzzy name matching (no query name is needed — the org-nr is
+ * already known). `flag` here only ever comes back as "dissolved",
+ * "bankrupt", or null (active+exists) — or "no_orgnr" via the safe default.
+ * "wrong_nace" and "name_mismatch" are NOT computed here; they require
+ * vertical-specific NACE allow-lists / a caller-supplied name to compare
+ * against, so callers may set those themselves after inspecting the result.
+ */
+export async function verifyOrgNumber(
+  orgNr: string,
+  fetchImpl: typeof fetch = fetch,
+): Promise<BrregVerifyResult> {
+  const cleanOrgNr = (orgNr || "").trim();
+  if (!cleanOrgNr) return { ...SAFE_DEFAULT_VERIFY_RESULT };
+
+  if (verifyCache.has(cleanOrgNr)) return { ...(verifyCache.get(cleanOrgNr) as BrregVerifyResult) };
+
+  const url = `${BRREG_BASE_URL}${BRREG_SEARCH_PATH}/${encodeURIComponent(cleanOrgNr)}`;
+  let res: Response;
+  try {
+    res = await fetchWithTimeout(url, REQUEST_TIMEOUT_MS, fetchImpl);
+  } catch (err) {
+    console.warn("[brreg-client] verifyOrgNumber fetch failed:", err instanceof Error ? err.message : err);
+    return { ...SAFE_DEFAULT_VERIFY_RESULT };
+  }
+
+  if (res.status === 404) {
+    const result = { ...SAFE_DEFAULT_VERIFY_RESULT };
+    verifyCache.set(cleanOrgNr, result);
+    return { ...result };
+  }
+  if (!res.ok) {
+    return { ...SAFE_DEFAULT_VERIFY_RESULT };
+  }
+
+  let json: RawEnhetDetail;
+  try {
+    json = (await res.json()) as RawEnhetDetail;
+  } catch {
+    return { ...SAFE_DEFAULT_VERIFY_RESULT };
+  }
+  if (!json || typeof json.organisasjonsnummer !== "string") {
+    return { ...SAFE_DEFAULT_VERIFY_RESULT };
+  }
+
+  const nace = [json.naeringskode1?.kode, json.naeringskode2?.kode, json.naeringskode3?.kode]
+    .filter((k): k is string => typeof k === "string" && k.length > 0);
+
+  const slettetDato = json.slettedato ?? null;
+  const active =
+    !json.konkurs &&
+    !json.underAvvikling &&
+    !json.underTvangsavviklingEllerTvangsopplosning &&
+    !slettetDato;
+
+  let flag: BrregFlag = null;
+  if (slettetDato) flag = "dissolved";
+  else if (json.konkurs) flag = "bankrupt";
+
+  const result: BrregVerifyResult = {
+    exists: true,
+    active,
+    name: typeof json.navn === "string" ? json.navn : null,
+    nace,
+    registrertDato: json.registreringsdatoEnhetsregisteret ?? null,
+    slettetDato,
+    flag,
+  };
+  verifyCache.set(cleanOrgNr, result);
+  return { ...result };
+}
+
 // ─── Main entry ────────────────────────────────────────────────────────
 //   findOrgnumberByName(name, postal?)
 //   → top-confidence hit if score ≥ 0.9, else null.
