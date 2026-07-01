@@ -48,6 +48,30 @@ function escapeHtml(text: string): string {
     .replace(/"/g, "&quot;").replace(/'/g, "&#39;");
 }
 
+// Repairs a string destined for <meta name="description">/og:description/
+// twitter:description before it's escaped. Producer-reported bug (Olestølen
+// Mikroysteri, 2026-07): the live meta description ended "...opplevelser p�" —
+// a Unicode replacement character (U+FFFD) landing in a DB-stored description,
+// almost certainly from a byte-level cut through a multi-byte UTF-8 character
+// (æ/ø/å are 2-byte UTF-8 in a JS string, so a byte-offset slice — as opposed
+// to a JS string .slice()/.substring(), which is code-unit safe — can chop one
+// in half). We don't know every upstream write path that could reintroduce a
+// "�", so this is a render-time safety net: strip a trailing run of "�" (and
+// any dangling partial word left behind) so a corrupted DB value never reaches
+// a live meta tag, no matter how it got corrupted. Leading/interior "�" runs
+// are also collapsed defensively, though the reported bug was trailing-only.
+function safeMetaDescription(text: string | null | undefined): string {
+  if (!text) return "";
+  let s = String(text);
+  if (!s.includes("�")) return s;
+  // Drop a trailing replacement-char run plus the (now-broken) word fragment
+  // it's attached to, so we don't end the tag mid-word either.
+  s = s.replace(/\S*�+\s*$/u, "").trimEnd();
+  // Any remaining "�" (leading/interior) — collapse rather than ship it raw.
+  s = s.replace(/�+/gu, "").replace(/\s{2,}/g, " ").trim();
+  return s;
+}
+
 const BASE_URL = process.env.BASE_URL || "https://rettfrabonden.com";
 
 const CITY_COORDS: Record<string, { lat: number; lng: number }> = {
@@ -201,6 +225,10 @@ function shell(
 ): string {
   const lang: Lang = extra?.lang || "no";
   const canonicalUrl = extra?.canonical || BASE_URL;
+  // Safety net: repair a "�"-mangled description before it reaches any meta
+  // tag, regardless of which route/DB value produced it (see
+  // safeMetaDescription doc comment above).
+  description = safeMetaDescription(description);
 
   // Build hreflang alternates from the route's NO path.
   // pathForAlternate is the canonical NO path (e.g. "/sok?q=mat").
@@ -3659,7 +3687,7 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
 
     res.send(shell(
       `${agent.name}${cityName ? t(lang, "producer.title_suffix", { city: cityName }) : ""}${titleFreshnessSuffix(updatedAtDate)}`,
-      `${agent.name}${cityName ? ` ${lang === "en" ? "in" : "i"} ${cityName}` : ""}. ${agent.description || (lang === "en" ? "Local food in Norway." : "Lokalprodusert mat i Norge.")}`,
+      `${agent.name}${cityName ? ` ${lang === "en" ? "in" : "i"} ${cityName}` : ""}. ${safeMetaDescription(agent.description) || (lang === "en" ? "Local food in Norway." : "Lokalprodusert mat i Norge.")}`,
       content,
       { canonical: `${BASE_URL}${localizedPath("/produsent/" + slug, lang)}`, jsonLd, extraCss: PROFILE_CSS + RELATED_PRODUCERS_CSS, lang, pathForAlternate: "/produsent/" + slug }
     ));

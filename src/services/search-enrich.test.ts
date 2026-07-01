@@ -433,6 +433,14 @@ export function runSearchEnrichTests(opts: { log?: boolean } = {}): TestSummary 
     assertTrue(meetsAboutQualityBar(noLetters), "quality: Norwegian via function words (no æøå) passes");
     // minLen override is honoured.
     assertTrue(meetsAboutQualityBar("Kort tekst på gården.", 10), "quality: minLen override honoured");
+    // Mangled text carrying the Unicode replacement char (a mid-character
+    // byte-level truncation upstream, e.g. cutting "på" in half) must never
+    // be written as a description — customer-reported bug: Olestølen
+    // Mikroysteri's meta description ended "...opplevelser p�".
+    const mangledTrailing = good.slice(0, 60) + " opplevelser p�";
+    assertTrue(!meetsAboutQualityBar(mangledTrailing), "quality: trailing replacement-char (mid-word cut) fails");
+    const mangledInterior = good.slice(0, 40) + "�" + good.slice(40);
+    assertTrue(!meetsAboutQualityBar(mangledInterior), "quality: interior replacement-char fails");
   }
 
   // ── orch-experiences-content-refresh: mapToExperienceCategories (PURE) ──────
