@@ -2188,6 +2188,76 @@ function initSchema(db: Database.Database): void {
   `);
   db.exec(`CREATE INDEX IF NOT EXISTS idx_order_items_order_id ON order_items(order_id)`);
 
+  // ─── Slice 1 of dev-request 2026-06-30-brreg-verification-gate ─────────
+  // Schema + lookup-function ONLY. This slice does NOT wire org-nr
+  // verification into any registration/enrichment endpoint — that's
+  // deferred to a later slice. Purely additive: unused new nullable/
+  // defaulted columns, populated by nobody yet.
+  //
+  //   org_nr             : the agent's 9-digit Norwegian org number, as its
+  //                        own column (today it only lives encoded as an
+  //                        `org_nr:<value>` tag string inside `tags`).
+  //   brreg_verified      : 1 iff a future caller has confirmed this org_nr
+  //                        against Brreg via verifyOrgNumber() (services/
+  //                        brreg-client.ts). Defaults to 0 — unverified.
+  //   brreg_flag          : last BrregFlag ("dissolved" | "bankrupt" |
+  //                        "wrong_nace" | "name_mismatch" | "no_orgnr" | null).
+  //   brreg_checked_at    : ISO-8601 timestamp of the last verifyOrgNumber()
+  //                        check, if any.
+  // Additive — idempotent ALTERs, same defensive try/catch pattern as the
+  // PR-58/PR-68/PR-95 (debio_verified) migrations above.
+  for (const stmt of [
+    `ALTER TABLE agents ADD COLUMN org_nr TEXT`,
+    `ALTER TABLE agents ADD COLUMN brreg_verified INTEGER NOT NULL DEFAULT 0`,
+    `ALTER TABLE agents ADD COLUMN brreg_flag TEXT`,
+    `ALTER TABLE agents ADD COLUMN brreg_checked_at TEXT`,
+  ]) {
+    try { db.exec(stmt); } catch { /* already exists — expected */ }
+  }
+  try {
+    db.exec(`CREATE INDEX IF NOT EXISTS idx_agents_org_nr ON agents(org_nr) WHERE org_nr IS NOT NULL`);
+  } catch { /* partial index unsupported or already created */ }
+
+  // ─── Backfill: agents.org_nr from the legacy `org_nr:<value>` tag ───────
+  // Existing agent registration (routes/admin-agents.ts) has only ever
+  // stored org-nr encoded as a tag string inside the JSON `tags` column.
+  // This backfill copies that value into the new first-class org_nr column
+  // so a later slice's verification pass has something to read without
+  // re-parsing tags. Idempotent — guarded by the migrations table, runs
+  // once per DB file. Needs JS/JSON parsing (tags is a JSON array of
+  // strings), so this is done in JS rather than raw SQL.
+  try {
+    db.exec(`CREATE TABLE IF NOT EXISTS migrations (name TEXT PRIMARY KEY, applied_at TEXT DEFAULT (datetime('now')))`);
+    const alreadyRan = db.prepare(
+      "SELECT 1 FROM migrations WHERE name = 'backfill_agents_org_nr_from_tags_v1'"
+    ).get();
+    if (!alreadyRan) {
+      const rows = db.prepare("SELECT id, tags FROM agents").all() as { id: string; tags: string | null }[];
+      const orgNrTagRe = /^org_nr:(\d+)$/;
+      let backfilled = 0;
+      const update = db.prepare("UPDATE agents SET org_nr = ? WHERE id = ?");
+      for (const row of rows) {
+        if (!row.tags) continue;
+        let tags: unknown;
+        try { tags = JSON.parse(row.tags); } catch { continue; }
+        if (!Array.isArray(tags)) continue;
+        for (const t of tags) {
+          if (typeof t !== "string") continue;
+          const m = orgNrTagRe.exec(t);
+          if (m) {
+            update.run(m[1], row.id);
+            backfilled++;
+            break;
+          }
+        }
+      }
+      db.prepare("INSERT INTO migrations (name) VALUES ('backfill_agents_org_nr_from_tags_v1')").run();
+      console.log(`\u{1F9F9} Migration backfill_agents_org_nr_from_tags_v1: backfilled org_nr for ${backfilled} agent(s) from tags`);
+    }
+  } catch (err) {
+    console.error("Migration backfill_agents_org_nr_from_tags_v1 failed:", err);
+  }
+
 }
 
 export function closeDb(): void {
