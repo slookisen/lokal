@@ -27,6 +27,7 @@ import { conversationService } from "../services/conversation-service";
 import { getTrafficStats } from "../services/traffic-stats";
 import { slugify } from "../utils/slug";
 import { addUtmParams } from "../utils/url-utm";
+import { capMetaText } from "../utils/text";
 import { t, htmlLangAttr, ogLocale, localizedPath, type Lang } from "../i18n/t";
 import {
   parseIsoOrSqlite,
@@ -2982,7 +2983,7 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
 
       return res.send(shell(
         `${agent.name} — ${getConfig().display_name}`,
-        aboutText || `${umbTypeBadge} på rettfrabonden.com med ${umbrellaChildren.length} medlemsprodusenter`,
+        capMetaText(aboutText, 155) || `${umbTypeBadge} på rettfrabonden.com med ${umbrellaChildren.length} medlemsprodusenter`,
         umbContent,
         {
           extraCss: PROFILE_CSS,
@@ -3657,9 +3658,16 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
       })();
     </script>`;
 
+    // Cap the meta/og/twitter description at a safe length ourselves (word-
+    // boundary trim, no mid-character cut). Search engines and link-unfurl
+    // services (WhatsApp, Facebook, etc.) truncate long descriptions with
+    // their own byte-oriented logic, which can slice a multi-byte Norwegian
+    // character (æ/ø/å) in half and render it as "�". Un-truncated agent
+    // descriptions were routinely 300+ chars, well past every such limit.
+    const rawMetaDescription = `${agent.name}${cityName ? ` ${lang === "en" ? "in" : "i"} ${cityName}` : ""}. ${agent.description || (lang === "en" ? "Local food in Norway." : "Lokalprodusert mat i Norge.")}`;
     res.send(shell(
       `${agent.name}${cityName ? t(lang, "producer.title_suffix", { city: cityName }) : ""}${titleFreshnessSuffix(updatedAtDate)}`,
-      `${agent.name}${cityName ? ` ${lang === "en" ? "in" : "i"} ${cityName}` : ""}. ${agent.description || (lang === "en" ? "Local food in Norway." : "Lokalprodusert mat i Norge.")}`,
+      capMetaText(rawMetaDescription, 155),
       content,
       { canonical: `${BASE_URL}${localizedPath("/produsent/" + slug, lang)}`, jsonLd, extraCss: PROFILE_CSS + RELATED_PRODUCERS_CSS, lang, pathForAlternate: "/produsent/" + slug }
     ));

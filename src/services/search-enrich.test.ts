@@ -433,6 +433,11 @@ export function runSearchEnrichTests(opts: { log?: boolean } = {}): TestSummary 
     assertTrue(meetsAboutQualityBar(noLetters), "quality: Norwegian via function words (no æøå) passes");
     // minLen override is honoured.
     assertTrue(meetsAboutQualityBar("Kort tekst på gården.", 10), "quality: minLen override honoured");
+    // Text containing the Unicode replacement character (byte-truncation
+    // corruption, e.g. a cut-mid-character "på") → fails even though the
+    // rest of the string is substantive/Norwegian.
+    const corrupted = "Familiedrevet gård på Toten som dyrker økologiske grønnsaker og bær, og selger fra op�";
+    assertTrue(!meetsAboutQualityBar(corrupted), "quality: replacement-character corruption fails");
   }
 
   // ── orch-experiences-content-refresh: mapToExperienceCategories (PURE) ──────

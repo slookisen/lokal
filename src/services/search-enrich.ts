@@ -889,6 +889,8 @@ const NORWEGIAN_WORD_MARKERS: readonly string[] = [
  *
  * Requires ALL of:
  *   - length ≥ 80 chars (a real description, not a tagline/fragment),
+ *   - contains no Unicode replacement character (a corrupted/truncated-
+ *     mid-character upstream fetch — e.g. "p�" instead of "på"),
  *   - looks Norwegian — contains an æ/ø/å letter OR a common Norwegian function
  *     word (rejects an English cookie/marketing snippet),
  *   - is NOT dominated by generic boilerplate (cookie/consent/placeholder).
@@ -900,6 +902,13 @@ export function meetsAboutQualityBar(text: string | null | undefined, minLen = 8
   if (!text) return false;
   const trimmed = String(text).replace(/\s+/g, " ").trim();
   if (trimmed.length < minLen) return false;
+
+  // Reject text containing the Unicode replacement character — a definitive
+  // sign of a byte-level truncation/encoding corruption upstream (cuts a
+  // multi-byte Norwegian character in half, e.g. "p�" instead of "på").
+  // A corrupted string should never pass the quality bar even if otherwise
+  // long/Norwegian/non-boilerplate.
+  if (trimmed.includes("�")) return false;
 
   const lower = trimmed.toLowerCase();
   const lowerAscii = stripNorwegianAccents(lower);

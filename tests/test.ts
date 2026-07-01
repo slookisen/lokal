@@ -20924,3 +20924,49 @@ console.log("\n── site-quality: category card icons (sq-caticon) ──");
   dbFac.__resetDbFactoryForTesting();
   console.log("  sq-caticon: OK (9 tests: 200/svg-present/aria-hidden/mountain-icon/snowflake-icon/no-compass-for-natur/no-rfb/no-dental)");
 })();
+
+// ── dev-request 2026-07-01-cs-corrections-profile-quality: capMetaText ──────
+console.log("\n── capMetaText (meta/og/twitter description safe truncation) ──");
+import { capMetaText as _capMetaText } from "../src/utils/text";
+
+// 1. Short text under the cap is returned unchanged.
+assertEq(
+  _capMetaText("Kort tekst.", 155),
+  "Kort tekst.",
+  "capMetaText: text under cap is unchanged"
+);
+
+// 2. Long text is cut on a word boundary, not mid-word.
+{
+  const long = "Familiedrevet gård som dyrker økologiske grønnsaker og bær, og selger direkte fra gårdsbutikken hver helg gjennom hele sommersesongen med mye godt.";
+  const capped = _capMetaText(long, 60);
+  assertTrue(capped.endsWith("…"), "capMetaText: overlong text ends with ellipsis");
+  assertTrue(capped.length <= 60, "capMetaText: result respects the char cap");
+  const withoutEllipsis = capped.slice(0, -1);
+  assertTrue(long.startsWith(withoutEllipsis), "capMetaText: capped content is a verbatim prefix of the source");
+  const nextChar = long[withoutEllipsis.length];
+  assertTrue(nextChar === undefined || nextChar === " ", "capMetaText: cut lands exactly on a word boundary (next source char is a space)");
+}
+
+// 3. Regression guard (code-review finding): a period inside the leading
+// "Name i By." prefix must NOT collapse the whole description down to just
+// the name fragment — capMetaText has no sentence-boundary logic, unlike
+// formatRelatedPreview, so a producer name containing a period (e.g. an
+// abbreviation) cannot truncate the composite meta description early.
+{
+  const composite = "Gård A.S. i Gausdal. Vi selger fantastisk ost og kjøtt fra egen gård, alt økologisk og håndlaget etter gamle tradisjoner fra området.";
+  const capped = _capMetaText(composite, 155);
+  assertTrue(capped.includes("Gausdal"), "capMetaText: name-with-period does not truncate before the city");
+  assertTrue(capped.includes("ost og kjøtt"), "capMetaText: name-with-period does not truncate before the description body");
+}
+
+// 4. Never cuts mid-character for Norwegian æ/ø/å (JS string ops are UTF-16
+// code-unit safe; æ/ø/å are single code units, so this can't regress, but we
+// assert it explicitly since that's the exact production bug this fixes).
+{
+  const nordic = "Skimakern og Budeia driver gård, støl og mikroysteri i Valdres. Om sommeren er det ysting og stølsliv, kurs og opplevelser på Olestølen.";
+  const capped = _capMetaText(nordic, 50);
+  assertTrue(!capped.includes("�"), "capMetaText: never introduces a replacement character");
+}
+
+console.log("  capMetaText: OK (4 tests: under-cap/word-boundary/name-period-regression/no-replacement-char)");

@@ -27,6 +27,7 @@ import { Router, Request, Response, NextFunction } from "express";
 import { getExperiencesAgentCard } from "../services/experiences-agent-card";
 import { getExperiencesOpenapi } from "../services/experiences-openapi";
 import { htmlLangAttr, ogLocale, type Lang } from "../i18n/t";
+import { capMetaText } from "../utils/text";
 import {
   listCategories,
   getPublishedExperienceBySlug,
@@ -1093,7 +1094,7 @@ function renderOpplevelseDetail(
   const metaDescRaw = exp.description
     ? String(exp.description)
     : `${exp.title}${place ? " i " + place : ""}. ${catLabel(cat)} på Opplevagent — kuratert markedsplass for norske opplevelser med Brreg-verifiserte tilbydere.`;
-  const metaDesc = metaDescRaw.length > 155 ? metaDescRaw.slice(0, 152).trim() + "…" : metaDescRaw;
+  const metaDesc = capMetaText(metaDescRaw, 155);
 
   // Badges row.
   const badges: string[] = [];
