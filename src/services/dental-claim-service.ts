@@ -65,6 +65,41 @@ export function buildWhereClause(
     conditions.push("(enrichment_state IS NULL OR enrichment_state != 'thin_site')");
   }
 
+  // PR-131 (2026-07-01): completion-mode already-complete exclusion. When a
+  // worker's raw+hjemmeside pool is drained it falls back to completion mode
+  // (enrichment_state=enriched) to deepen already-enriched records missing
+  // rich fields (om_oss/treatments/opening_hours/specialists). The claim
+  // query has no completeness filter, so every worker kept re-claiming the
+  // SAME already-fully-populated head-of-list batch every cycle (claim ->
+  // discover already complete -> release, 0 spawns), while 105+ genuinely
+  // incomplete `enriched` records later in id-order were never reached
+  // (supervisor-inbox headsup 2026-07-01, dental-agent-enrichment worker).
+  // Exclude a row from the completion-mode pool ONLY when it is unambiguously
+  // fully populated on all four rich fields -- mirrors the "release without
+  // spawning" completeness check the worker SKILL already applies (SKILL
+  // section 4.1), so this just moves that judgment earlier, into the pool
+  // itself. `treatments`/`specialists` are JSON-array TEXT columns written
+  // via jsonOrNull() (src/services/dental-store.ts), which never persists a
+  // literal '[]' -- empty is always NULL -- but we still guard '[]' too
+  // since other defensive reads in the codebase (e.g. dental-store.ts
+  // specialist_clinic_count) do the same. `opening_hours` is a JSON-array
+  // TEXT column guarded as NULL/'' elsewhere (src/routes/dental.ts
+  // google-places-batch auto-select query); '[]'/'{}' are guarded too for
+  // the same defensive reason. `om_oss` is plain TEXT, empty is NULL/''.
+  // Only applied in completion-mode (enrichment_state === "enriched"); no
+  // other filter combination is affected, so raw/thin_site pools and any
+  // future explicit enrichment_state values are untouched.
+  if (filter.enrichment_state === "enriched") {
+    conditions.push(`
+      NOT (
+        om_oss IS NOT NULL AND om_oss <> ''
+        AND treatments IS NOT NULL AND treatments <> '' AND treatments <> '[]'
+        AND opening_hours IS NOT NULL AND opening_hours <> '' AND opening_hours <> '[]' AND opening_hours <> '{}'
+        AND specialists IS NOT NULL AND specialists <> '' AND specialists <> '[]'
+      )
+    `.trim());
+  }
+
   if (filter.enrichment_state !== undefined) {
     conditions.push("enrichment_state = ?");
     params.push(filter.enrichment_state);
