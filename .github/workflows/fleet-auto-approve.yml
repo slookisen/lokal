@@ -1,0 +1,225 @@
+name: Fleet auto-approve
+
+# Auto-approves + auto-merges fleet-generated PRs (author = slookisen) once an
+# independent fleet code-reviewer has posted an APPROVED verdict comment AND all
+# required status checks are green. Approves as `github-actions[bot]` — an identity
+# distinct from the PR author, so branch protection's "distinct approver" rule is
+# satisfied by GitHub itself (Proposer != admitter stays platform-enforced, not
+# honor-system). See dev-requests/2026-07-02-github-actions-auto-approver.md.
+#
+# Deliberately uses `pull_request` / `issue_comment` / `check_suite` (NOT
+# `pull_request_target`) — every PR this workflow acts on is same-repo
+# (fleet branches, never a fork), so there is no reduced-permission-token
+# reason to reach for the riskier `_target` event, and staying on the
+# non-`_target` events avoids ever running workflow code with base-repo
+# secrets against untrusted fork input.
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+  issue_comment:
+    types: [created]
+  check_suite:
+    types: [completed]
+
+permissions:
+  pull-requests: write
+  contents: read
+  checks: read
+  statuses: read
+
+jobs:
+  resolve-pr:
+    runs-on: ubuntu-latest
+    permissions: {}
+    outputs:
+      pr_number: ${{ steps.resolve.outputs.pr_number }}
+    steps:
+      - name: Resolve PR number for this event
+        id: resolve
+        uses: actions/github-script@v7
+        with:
+          script: |
+            let prNumber = null;
+            if (context.eventName === 'pull_request') {
+              prNumber = context.payload.pull_request.number;
+            } else if (context.eventName === 'issue_comment' && context.payload.issue.pull_request) {
+              prNumber = context.payload.issue.number;
+            } else if (context.eventName === 'check_suite') {
+              const prs = context.payload.check_suite.pull_requests || [];
+              if (prs.length > 0) prNumber = prs[0].number;
+            }
+            core.setOutput('pr_number', prNumber ?? '');
+
+  evaluate:
+    needs: resolve-pr
+    if: needs.resolve-pr.outputs.pr_number != ''
+    runs-on: ubuntu-latest
+    concurrency:
+      group: fleet-auto-approve-pr-${{ needs.resolve-pr.outputs.pr_number }}
+      cancel-in-progress: true
+    permissions:
+      pull-requests: write
+      contents: read
+      checks: read
+      statuses: read
+    steps:
+      - name: Gate + approve + enable auto-merge
+        id: gate
+        uses: actions/github-script@v7
+        env:
+          PR_NUMBER: ${{ needs.resolve-pr.outputs.pr_number }}
+          A2A_READ_PAT: ${{ secrets.A2A_READ_PAT }}
+        with:
+          script: |
+            const prNumber = parseInt(process.env.PR_NUMBER, 10);
+            const { owner, repo } = context.repo;
+
+            const note = (msg) => github.rest.issues.createComment({
+              owner, repo, issue_number: prNumber,
+              body: `**fleet-auto-approve:** ${msg}`,
+            });
+
+            const { data: pr } = await github.rest.pulls.get({ owner, repo, pull_number: prNumber });
+
+            // 1. PR author must be the fleet identity.
+            if (pr.user.login !== 'slookisen') {
+              core.info(`author=${pr.user.login} != slookisen — not a fleet PR, no-op`);
+              return;
+            }
+
+            // 2. Protected paths — never auto-approve if the diff touches these,
+            //    regardless of any verdict comment. Self-protecting: this workflow
+            //    file itself can never approve a PR that edits workflows.
+            const PROTECTED = [
+              /(^|\/)\.github\/workflows\//i,
+              /(^|\/)fly\.toml$/i,
+              /(^|\/)dockerfile$/i,
+              /auth/i,
+              /(^|\/)\.env/i,
+              /secret/i,
+            ];
+            const files = await github.paginate(github.rest.pulls.listFiles, {
+              owner, repo, pull_number: prNumber, per_page: 100,
+            });
+            const touchedProtected = files.filter(f => PROTECTED.some(re => re.test(f.filename)));
+            if (touchedProtected.length > 0) {
+              await note(`diff touches protected path(s) — ${touchedProtected.map(f => f.filename).join(', ')}. Needs Daniel, no auto-approve.`);
+              core.info('protected path touched — no-op');
+              return;
+            }
+
+            // 3. Size cap.
+            const MAX_CHANGED_LINES = 1500;
+            const changed = pr.additions + pr.deletions;
+            if (changed > MAX_CHANGED_LINES) {
+              await note(`diff is ${changed} changed lines (cap ${MAX_CHANGED_LINES}). Needs Daniel, no auto-approve.`);
+              core.info('over size cap — no-op');
+              return;
+            }
+
+            // 4. Review-verdict marker: a PR comment of the form
+            //    REVIEW-VERDICT: APPROVED — <path under slookisen/A2A supervisor-inbox/>
+            //    posted by the fleet identity itself AFTER an independent code-reviewer
+            //    sub-agent returned APPROVED. Two independent defenses, since PR comments
+            //    are attacker-writable by anyone with comment access on a public repo:
+            //      a) the comment's AUTHOR must be the trusted fleet account (`slookisen`)
+            //         — an outside commenter's "REVIEW-VERDICT" text is ignored outright.
+            //      b) the referenced doc is never fetched from an attacker-supplied URL —
+            //         only a bare relative path is accepted, and it is resolved ourselves
+            //         against a fixed slookisen/A2A Contents-API call, so there is no SSRF
+            //         surface and no way to point this workflow's secret at a third-party host.
+            const comments = await github.paginate(github.rest.issues.listComments, {
+              owner, repo, issue_number: prNumber, per_page: 100,
+            });
+            const verdictRe = /^REVIEW-VERDICT:\s*APPROVED\s*—\s*(\S+)/m;
+            const verdictComment = [...comments].reverse().find(
+              c => c.user && c.user.login === 'slookisen' && verdictRe.test(c.body || '')
+            );
+            if (!verdictComment) {
+              core.info('no REVIEW-VERDICT: APPROVED comment from the trusted fleet account yet — waiting');
+              return;
+            }
+            const rawRef = verdictComment.body.match(verdictRe)[1];
+            // Only a bare "supervisor-inbox/<safe-filename>.md" path is accepted — reject
+            // anything that looks like a URL, an absolute path, or a path-traversal attempt.
+            const pathRe = /^supervisor-inbox\/[A-Za-z0-9_.-]+\.md$/;
+            if (!pathRe.test(rawRef)) {
+              await note(`REVIEW-VERDICT link "${rawRef}" is not a recognized supervisor-inbox/<file>.md path. No auto-approve.`);
+              core.info('verdict link failed path allowlist — no-op');
+              return;
+            }
+
+            if (!process.env.A2A_READ_PAT) {
+              await note('REVIEW-VERDICT comment found but A2A_READ_PAT secret is not configured — cannot validate the linked review doc. No auto-approve until Daniel adds the secret (see dev-request).');
+              core.info('A2A_READ_PAT missing — no-op');
+              return;
+            }
+            let docText = '';
+            try {
+              const resp = await fetch(
+                `https://api.github.com/repos/slookisen/A2A/contents/${rawRef}?ref=main`,
+                {
+                  headers: {
+                    Authorization: `token ${process.env.A2A_READ_PAT}`,
+                    Accept: 'application/vnd.github.raw+json',
+                  },
+                }
+              );
+              if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+              docText = await resp.text();
+            } catch (e) {
+              await note(`could not fetch review doc "${rawRef}": ${e.message}. No auto-approve.`);
+              core.info('review doc fetch failed — no-op');
+              return;
+            }
+            // Anchored verdict token — a plain substring match on "APPROVED" would also
+            // match "DISAPPROVED" / "NOT APPROVED"; require an explicit rejection check too.
+            const docApproved = new RegExp(`PR[- ]?#?${prNumber}\\b[\\s\\S]{0,200}?\\bVERDICT:\\s*APPROVED\\b`, 'i').test(docText)
+              || new RegExp(`\\bVERDICT:\\s*APPROVED\\b[\\s\\S]{0,200}?PR[- ]?#?${prNumber}\\b`, 'i').test(docText);
+            const docRejected = /\b(DISAPPROVED|NOT APPROVED|CHANGES-REQUESTED|REJECTED)\b/i.test(docText);
+            if (docRejected || !docApproved) {
+              await note(`review doc "${rawRef}" does not contain an explicit "VERDICT: APPROVED" tied to PR #${prNumber}. No auto-approve.`);
+              core.info('review doc does not confirm APPROVED — no-op');
+              return;
+            }
+
+            // 5. Required status checks green for head SHA — both the legacy commit-status
+            //    API and the newer check-runs API, since either can carry required checks.
+            const { data: combined } = await github.rest.repos.getCombinedStatusForRef({
+              owner, repo, ref: pr.head.sha,
+            });
+            const { data: checkRuns } = await github.rest.checks.listForRef({
+              owner, repo, ref: pr.head.sha, per_page: 100,
+            });
+            const statusesOk = combined.state === 'success' || (combined.state === 'pending' && combined.statuses.length === 0);
+            const checksIncomplete = checkRuns.check_runs.some(r => r.status !== 'completed');
+            const checksFailed = checkRuns.check_runs.some(r => r.status === 'completed' && !['success', 'skipped', 'neutral'].includes(r.conclusion));
+            if (checksIncomplete) {
+              core.info('checks still running — waiting');
+              return;
+            }
+            if (checksFailed || !statusesOk) {
+              await note('one or more status checks are red. No auto-approve.');
+              core.info('checks red — no-op');
+              return;
+            }
+
+            // All gates passed — approve as github-actions[bot] and enable auto-merge.
+            await github.rest.pulls.createReview({
+              owner, repo, pull_number: prNumber,
+              event: 'APPROVE',
+              body: `Auto-approved: independent fleet code-reviewer verdict confirmed at slookisen/A2A:${rawRef}, all status checks green, no protected-path or size-cap violation. Branch-protection required-approval satisfied by a distinct identity (github-actions[bot] != ${pr.user.login}).`,
+            });
+
+            await github.graphql(`
+              mutation($prId: ID!) {
+                enablePullRequestAutoMerge(input: { pullRequestId: $prId, mergeMethod: SQUASH }) {
+                  clientMutationId
+                }
+              }
+            `, { prId: pr.node_id }).catch(async (e) => {
+              await note(`approved, but could not enable auto-merge (${e.message}) — merge manually or re-run once checks settle.`);
+            });
+
+            core.info(`PR #${prNumber} auto-approved.`);
