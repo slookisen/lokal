@@ -3782,6 +3782,265 @@ New `*.test.ts` files now live **next to the source** they cover (e.g. `src/serv
 | Deploy model | **Supervisor-only** (since 2026-04-25 PM) | guidebook commits + pushes only |
 
 ---
+<a id="phase-25"></a>
+## Phase 25: Structured Data Enrichment, Brreg Verification Gateway & Gaardssalg Industrialization
+
+Phase 25 (2026-06-25 → 2026-07-02) advances structured data visibility for search engines, adds legal entity verification, and completes the gaardssalg (farm event) booking infrastructure. Three key streams: (1) **FAQ JSON-LD** schema on producer pages for SEO richness, (2) **Brreg org-number verification** service as a gated quality layer for outreach, and (3) **gaardssalg Phase 2** completing the booking lifecycle with commission tracking. All work lands as commit-only; supervisor deploys.
+
+### 25.1 FAQ JSON-LD Schema — Search Engine Rich Results for Producer Pages (dev-request geo-content-structured-data, slice 1)
+
+Adds schema.org FAQPage JSON-LD to `/produsent/:slug` pages so search engines can extract and display Q&A snippets in rich results. File: `src/routes/seo.ts`.
+
+**Schema structure** (up to 3 Q&A pairs per producer):
+
+```json
+{
+  "@context": "https://schema.org",
+  "@type": "FAQPage",
+  "mainEntity": [
+    {
+      "@type": "Question",
+      "name": "Hva selger [Producer]?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "[Catalog items from agent_knowledge.catalog]"
+      }
+    },
+    {
+      "@type": "Question",
+      "name": "Hvor er [Producer] lokalisert?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "[address or location string from agents.geo_address]"
+      }
+    },
+    {
+      "@type": "Question",
+      "name": "Kan jeg besøke og kjøpe fra [Producer]?",
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": "[Visit/order instructions from agent_knowledge.about]"
+      }
+    }
+  ]
+}
+```
+
+**Quality gating:** Answers are only emitted if producer has **≥2 substantive answers** in the record (thin profiles don't get fabricated FAQ content). Function `buildProducerFaqJsonLd()` does the assembly; already integrated into the existing shell() renderer which supports `Array<jsonLd>`.
+
+**Coverage:** Applies to all RFB producers; dental/experiences have their own SSR routes and can adopt the pattern independently.
+
+**Commit:** `b4aa6fe` (2026-07-01)
+
+---
+
+### 25.2 SEO Meta-Description Corruption Defense — Prevent Byte-Level Truncation
+
+Customer-reported bug (Olestølen Mikroysteri, 2026-06-30): the `/produsent/:slug` meta description rendered with Unicode replacement character (U+FFFD) at the end, turning "...opplevelser p" into "...opplevelser p�". Root cause not definitively pinned (no single .slice()/.substring() call detected), so added **defense in depth** (PR-116, `efa1cce`):
+
+**Three-layer fix:**
+
+1. **Route layer** (`src/routes/seo.ts` / `shell()`): New `safeMetaDescription()` helper strips trailing U+FFFD plus its broken word fragment; applied to every meta description, og:description, twitter:description rendered by any SEO route.
+
+2. **Pipeline layer** (`src/services/search-enrich.ts`): Gate `meetsAboutQualityBar()` (the writer's filter before overwriting `agents.description` or `agent_knowledge.about`) now rejects any candidate containing U+FFFD, preventing corrupted data from being written in the first place.
+
+3. **Client layer** (`src/public/agent.html`): Legacy `/agent/:id` page also includes client-side guard (`safeDesc`) on meta-tag rendering as final fallback.
+
+**Tests added:** `src/services/search-enrich.test.ts` with cases covering trailing and interior replacement characters.
+
+**Commit:** `efa1cce` (2026-07-01)
+
+---
+
+### 25.3 Brreg Verification Service — Org-Number Direct Lookup (dev-request 2026-06-30-brreg-verification-gate, slice 1)
+
+Adds legal entity verification via the Norwegian Business Register (Brreg). This is **slice 1 (schema + data layer only)** — no registration/enrichment endpoint wiring yet.
+
+**New service:** `src/services/brreg-client.ts`
+
+```typescript
+export interface BrregOrgVerification {
+  org_number: string;
+  name: string;
+  active: boolean;                    // status from Brreg
+  verified_at: string;                // ISO 8601 timestamp
+  breg_last_checked: string;          // Last API call timestamp
+}
+
+// Direct lookup via Brreg /enheter/{orgNr} endpoint
+async verifyOrgNumber(orgNr: string): Promise<BrregOrgVerification | null>
+```
+
+**API shape** (mirrors experience-brreg.ts convention):
+
+```bash
+GET https://data.brreg.no/enheter/{orgNr}
+Response: { organisasjonsnummer, navn, organisasjonsform, status, ... }
+```
+
+**Schema additions** to `agents` table (additive migration in `src/database/init.ts`):
+
+```sql
+ALTER TABLE agents ADD COLUMN org_nr TEXT;              -- if provided by producer
+ALTER TABLE agents ADD COLUMN brreg_verified BOOLEAN DEFAULT 0;
+ALTER TABLE agents ADD COLUMN brreg_flag TEXT;          -- "verified", "invalid", "mismatch", null
+ALTER TABLE agents ADD COLUMN brreg_checked_at TEXT;    -- ISO 8601 timestamp
+
+-- Backfill tags→org_nr from existing tags column (if org number was in producer's agent card)
+CREATE INDEX idx_agents_brreg_verified ON agents(brreg_verified);
+CREATE INDEX idx_agents_brreg_checked_at ON agents(brreg_checked_at);
+```
+
+**Tests:** `src/services/brreg-client.test.ts` covers live-lookup, inactive org, invalid org number.
+
+**Commit:** `baaa772` (2026-07-02) — slice 1 (no endpoint wiring yet)
+
+---
+
+### 25.4 Dental Claim Pool Exclusion — Completeness Gate for Enrichment
+
+Fix to the dental-claim enrichment pool (PR-121, `1c8c98c`). The `enrichment_state=enriched` claim-batch had no filter for records already **fully populated** (om_oss, treatments, opening_hours, specialists all filled), causing workers to repeatedly claim the same complete head-of-list batch every cycle while 105+ genuinely incomplete enriched records downstream were never reached.
+
+**Fix in `src/services/dental-claim-service.ts`:**
+
+```typescript
+// buildWhereClause() now gated on enrichment_state
+if (enrichment_state === "enriched") {
+  // Exclude records that are completeness-saturated (all key fields populated)
+  whereClause += ` AND (om_oss IS NULL OR treatments IS NULL OR opening_hours IS NULL OR specialists IS NULL)`;
+}
+```
+
+Follows the same pattern as PR-108 (junk exclusion) and PR-120 (thin_site parking exclusion) already in this file.
+
+**Commit:** `1c8c98c` (2026-07-02)
+
+---
+
+### 25.5 Gaardssalg Phase 2 — Booking Lifecycle + Commission Tracking
+
+Completes the gaardssalg (farm visit/event) infrastructure with full booking-to-attendance workflow and commission accounting (PR-111, `0c2154e`). No payments move yet (Phase 3 deferred).
+
+**New tables:**
+
+```sql
+CREATE TABLE IF NOT EXISTS gardssalg_bookings (
+  id              TEXT PRIMARY KEY,
+  experience_id   TEXT NOT NULL REFERENCES experiences(id) ON DELETE CASCADE,
+  guest_name      TEXT NOT NULL,
+  guest_email     TEXT NOT NULL,
+  guest_phone     TEXT,
+  qty_guests      INTEGER NOT NULL DEFAULT 1,
+  status          TEXT NOT NULL DEFAULT 'reserved',  -- reserved|confirmed_attended|no_show|cancelled
+  billable        BOOLEAN DEFAULT 0,                  -- 1 only on confirmed_attended
+  source          TEXT NOT NULL DEFAULT 'opplevagent', -- Attribution: where booking originated
+  commission_rate REAL,                               -- Inherited from experience_providers at book-time
+  created_at      TEXT NOT NULL,
+  updated_at      TEXT NOT NULL,
+  attended_at     TEXT,
+  cancelled_at    TEXT
+);
+```
+
+**New REST endpoints** (`src/routes/opplevelser.ts`):
+
+```bash
+# Guest books an event
+POST /api/opplevelser/book
+  Body: { experience_id, guest_name, guest_email, guest_phone?, qty_guests? }
+  Returns: { booking_id, confirm_token, event_details, ics_attachment_url }
+  
+# Producer attends/declines (token-gated, sent via email)
+GET /api/opplevelser/book/confirm/:token?status=attended|no_show|cancelled
+  Updates: status, billable, attended_at
+  Returns: { booking_id, status, commission_impact }
+
+# Re-download ICS calendar invite
+GET /api/opplevelser/book/:ref/ics
+
+# Admin: monthly commission statement
+GET /api/opplevelser/admin/gardssalg/commission
+  Query: ?year=2026&month=7&producer_id=...
+  Returns: pending_billable, confirmed_attended, total_commission_nok
+```
+
+**Email integration:** Booking confirmation email includes `.ics` (iCalendar) attachment; `email-service.ts` updated with `EmailAttachment` interface and passthrough on `sendEmail()`.
+
+**Lifecycle:**
+- Guest submits booking → `reserved` (no commission yet)
+- Producer receives email with `[Confirm Attended]` / `[No Show]` / `[Cancel]` links
+- Producer clicks confirm → status → `confirmed_attended`, `billable=1`, `attended_at` timestamp
+- Admin can view monthly commission statement (no payout yet — Phase 3)
+
+**Source tracking:** Every booking gets `source='opplevagent'` for attribution proof.
+
+**Commit:** `0c2154e` (2026-06-28)
+
+---
+
+### 25.6 Geo-Discoverability Hardening — AI-Crawler Allowlist + llms.txt Freshness
+
+Two improvements to AI agent discoverability (PR-113, `4a967c7`):
+
+**1. AI-crawler allowlist middleware** (`src/middleware/security.ts`):
+
+```typescript
+// Whitelist: allow these User-Agents to crawl /llms.txt, /llms-full.txt, /.well-known/*
+const ALLOWED_CRAWLERS = [
+  "anthropic-ai",
+  "GPTBot",
+  "Claude-Web",
+  "Perplexity-Bot",
+  // ... others
+];
+
+// Reject non-whitelisted crawlers with 403
+if (!isAllowedCrawler(req.headers['user-agent'])) {
+  return res.status(403).send('Forbidden');
+}
+```
+
+Mounted in `src/index.ts` on routes serving agent discovery metadata.
+
+**2. llms.txt Cache-Control refresh** (`src/routes/discovery.ts`):
+
+- Change: `Cache-Control: max-age=3600` (1 hour) → `max-age=300` (5 minutes)
+- Add: `generated-at` ISO timestamp footer in llms.txt so crawlers can detect freshness
+- Ensures llms.txt reflects recent agent adds/updates without long staleness window
+
+**Data redaction** (`src/routes/dental-seo.ts`): Removed email/phone from `/llms-full.txt` about text to prevent OSINT harvest via AI crawlers.
+
+**Commit:** `4a967c7` (2026-06-30)
+
+---
+
+### 25.7 Gaardssalg Filtering Refinements
+
+Two small but important fixes to gaardssalg categorization:
+
+**1. Exclude coffee roasters from rfb-seed filter** (PR-114, `2af8c75`):
+
+Coffee roasters (roasteries) are service-only (no product inventory) and should not appear in the gaardssalg marketplace seed. Added category exclusion: `category NOT IN (..., 'coffee_roaster', ...)`.
+
+**2. Tight rfb-seed filter + rollback route** (PR-112, `f79894e`):
+
+Tightened the producer-to-gaardssalg eligibility filter to only include actual farm producers with real event catalogs. Added `/kategori/gaardssalg` SSR route for dedicated landing page with category metadata.
+
+---
+
+### 25.8 Gotchas & Lessons Learned — Phase 25 Additions
+
+**C.127: Brreg org-number backfill timing**  
+When rolling out org_nr verification, the backfill migration runs once at boot. Producers who have never supplied an org number get `org_nr=NULL`; only future registrations will include it. If bulk-verifying existing producer pool, run a sweep endpoint (planned for Phase 25 slice 2) to populate org_nr from agent cards or external sources.
+
+**C.128: FAQ JSON-LD quality bar is strict**  
+Only 2+ substantive answers trigger FAQ rendering. A producer with 1 catalog item and no location data will not emit FAQPage JSON-LD — better to have zero schema than corrupted schema. Threshold can be tuned per vertical.
+
+**C.129: Dental claim completeness exclusion is not auto-recovery**  
+The new completeness gate in dental-claim pool will prevent claiming fully-populated records, but it does **not** re-visit previously-missed incomplete records in one pass. The old head-of-list-only behavior meant 105+ records fell behind; they'll be caught in subsequent daily sweeps as new records arrive (FIFO drainage resumes once the near-complete queue clears).
+
+**C.130: llms.txt 5-minute cache is aggressive**  
+Refreshing every 5 minutes means 288 /llms.txt renders per day instead of 144. For 1200+ agents, this adds ~15% compute load on the discovery route. Trade-off: crawlers see changes within 5 min; benefit is worth it for competitive freshness.
 
 <a id="appendix-a"></a>
 ## Appendix A: Tech Stack Reference
