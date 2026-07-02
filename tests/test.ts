@@ -20960,3 +20960,198 @@ console.log("\n── site-quality: category card icons (sq-caticon) ──");
   dbFac.__resetDbFactoryForTesting();
   console.log("  sq-caticon: OK (9 tests: 200/svg-present/aria-hidden/mountain-icon/snowflake-icon/no-compass-for-natur/no-rfb/no-dental)");
 })();
+
+// ─── gardssalg-book: reservation → confirmation journey (2026-07-02) ────────
+// Regression coverage for the live "Book besøk" 404: gårdssalg producers
+// (experience_providers rows with producer_type set / rfb-seed) have ZERO
+// rows in `experiences`, so /tilbyder/<slug> — which requires ≥1 published
+// experience — always 404'd for them. getGardssalgProviderBySlug() + the new
+// /kategori/gardssalg/book/* routes fix that without touching /tilbyder or
+// any other vertical. Covers: reservation panel render, unknown-slug 404, the
+// no-JS POST fallback creating a real booking + redirecting, invalid-input
+// handling, and the /kategori/gardssalg card CTA fix (now points at the
+// booking route, gated on slug not hjemmeside). Same isolated :memory:
+// experiences DB + sync mock req/res pattern as the p2/sq-caticon blocks
+// above — fully synchronous, so it cannot race the async report tail.
+console.log("\n── gardssalg-book: reservation → confirmation journey ──");
+(() => {
+  const prevPathGB = process.env.EXPERIENCES_DB_PATH;
+  process.env.EXPERIENCES_DB_PATH = ":memory:";
+
+  const dbFacPathGB = require.resolve("../src/database/db-factory");
+  const expStPathGB = require.resolve("../src/services/experience-store");
+  const bookStPathGB = require.resolve("../src/services/booking-store");
+  const expSeoPathGB = require.resolve("../src/routes/experiences-seo");
+  delete require.cache[dbFacPathGB];
+  delete require.cache[expStPathGB];
+  delete require.cache[bookStPathGB];
+  delete require.cache[expSeoPathGB];
+
+  const dbFacGB = require("../src/database/db-factory") as typeof import("../src/database/db-factory");
+  dbFacGB.__resetDbFactoryForTesting();
+  const expStGB = require("../src/services/experience-store") as typeof import("../src/services/experience-store");
+  const bookStGB = require("../src/services/booking-store") as typeof import("../src/services/booking-store");
+  const seoRouterGB = (require("../src/routes/experiences-seo") as typeof import("../src/routes/experiences-seo")).default as any;
+
+  const dbGB = dbFacGB.getDb("experiences");
+
+  // Seed a gårdssalg producer: producer_type set, deliberately NO hjemmeside
+  // and NO experiences rows at all — exactly the shape that always 404'd via
+  // /tilbyder/<slug> before this fix, and (separately) never got a "Book
+  // besøk" button at all under the old hjemmeside-gated CTA. NOTE: the
+  // gårdssalg classification column is `producer_type` (bryggeri/sideri/...),
+  // a DIFFERENT column from the general `provider_type` that createProvider()/
+  // ProviderSchema sets — there's no service-layer setter for it (it's
+  // populated by the enrichment pipeline in production), so the test sets it
+  // directly via SQL, same as that pipeline would.
+  const provIdGB = expStGB.createProvider({
+    navn: "Fjellro Sideri", org_nr: "912345678",
+    fylke: "Innlandet", kommune: "Lillehammer", poststed: "Lillehammer",
+    brreg_verified: 0, verification_status: "pending_verify",
+  });
+  dbGB.prepare("UPDATE experience_providers SET producer_type = ? WHERE id = ?").run("sideri", provIdGB);
+  expStGB.backfillProviderSlugs();
+
+  // invokeSeo — same shape as the p2/sq-caticon helpers, generalized to pick
+  // GET or POST (Express gives each method its own Route/layer even when the
+  // path string is identical, so filtering by path+method is unambiguous).
+  function invokeGB(
+    method: "get" | "post",
+    routePath: string,
+    params: Record<string, string>,
+    reqPath: string,
+    opts: { query?: Record<string, string>; body?: Record<string, unknown> } = {}
+  ): { status: number; body: string; headers: Record<string, string>; redirectTo: string | null } {
+    const layer = (seoRouterGB.stack as any[]).find(
+      (l: any) => l.route && l.route.path === routePath && l.route.methods?.[method]
+    );
+    assertTrue(!!layer, `gb-route: router has ${method.toUpperCase()} ${routePath} layer`);
+    if (!layer) return { status: 0, body: "", headers: {}, redirectTo: null };
+    let status = 200; let body = ""; let nexted = false; let redirectTo: string | null = null;
+    const headers: Record<string, string> = {};
+    const res: any = {
+      statusCode: 200,
+      setHeader: (k: string, v: string) => { headers[k.toLowerCase()] = String(v); },
+      status: (c: number) => { status = c; res.statusCode = c; return res; },
+      send: (b: unknown) => { body = typeof b === "string" ? b : String(b); return res; },
+      json: (o: unknown) => { body = JSON.stringify(o); return res; },
+      redirect: (code: number, location: string) => { status = code; redirectTo = location; },
+    };
+    // req.body pre-populated directly (as express.urlencoded() would leave
+    // it) — we invoke only the route's final handler, same as invokeSeo does,
+    // skipping the urlencoded() middleware layer itself (no real req stream
+    // to parse in this mock).
+    const req: any = { path: reqPath, hostname: "opplevagent.no", params, query: opts.query || {}, body: opts.body || {} };
+    const stack = (layer.route.stack as any[]).filter((s: any) => s.method === method);
+    const handle = stack[stack.length - 1].handle;
+    handle(req, res, () => { nexted = true; });
+    if (nexted) status = 404;
+    return { status, body, headers, redirectTo };
+  }
+
+  // gb-01: unknown slug → 404 (next()) — this is the exact live bug: before
+  // the fix, ANY gårdssalg slug hit this same 404 path via /tilbyder/<slug>.
+  const missGB = invokeGB("get", "/kategori/gardssalg/book/:providerSlug",
+    { providerSlug: "finnes-ikke" }, "/kategori/gardssalg/book/finnes-ikke");
+  assertEq(missGB.status, 404, "gb-01: unknown provider slug → 404 (next())");
+
+  const seededGB = expStGB.listGardssalgProviders(10, 0).find((p: any) => p.id === provIdGB);
+  assertTrue(!!seededGB && !!seededGB.slug, "gb-02: seeded provider got a slug from backfillProviderSlugs()");
+  const slugGB = String(seededGB!.slug);
+
+  // gb-03: reservation panel renders for the seeded producer (this used to be
+  // an unconditional 404 for every gårdssalg provider).
+  const panelGB = invokeGB("get", "/kategori/gardssalg/book/:providerSlug",
+    { providerSlug: slugGB }, `/kategori/gardssalg/book/${slugGB}`);
+  assertEq(panelGB.status, 200, "gb-03a: GET /kategori/gardssalg/book/<slug> → 200 (was a 404 before this fix)");
+  assertTrue(/text\/html/.test(panelGB.headers["content-type"] || ""), "gb-03b: panel Content-Type text/html");
+  assertTrue(panelGB.body.includes("Fjellro Sideri"), "gb-03c: panel shows provider name");
+  assertTrue(panelGB.body.includes("Sider"), "gb-03d: panel shows the drink-type badge (sideri → Sider)");
+  assertTrue(panelGB.body.includes("Du betaler ingenting nå"), "gb-03e: panel shows the no-payment microcopy");
+  assertTrue(panelGB.body.includes(`value="${provIdGB}"`), "gb-03f: hidden provider_id field carries the real provider id");
+  assertTrue(new RegExp(`method="POST" action="[^"]*${slugGB}"`).test(panelGB.body),
+    "gb-03g: form POSTs to a URL that works without JS (true HTML form target)");
+  assertTrue(panelGB.body.includes('type="datetime-local"'), "gb-03h: slot_at is a datetime-local input");
+  assertTrue(panelGB.body.includes('name="guest_phone"'), "gb-03i: guest_phone field is present");
+  assertTrue(!panelGB.body.includes('id="guest_phone" name="guest_phone" type="tel" maxlength="30" required'),
+    "gb-03j: guest_phone is optional (no required attribute)");
+  assertTrue(!/kjøp alkohol|selg alkohol|betal for alkohol/i.test(panelGB.body),
+    "gb-03k: no alcohol-purchase language on the reservation panel");
+
+  // gb-04: POST no-JS fallback with invalid input → redirect back with ?error=invalid.
+  const badPostGB = invokeGB("post", "/kategori/gardssalg/book/:providerSlug",
+    { providerSlug: slugGB }, `/kategori/gardssalg/book/${slugGB}`,
+    { body: { slot_at: "", party_size: "2", guest_name: "Ola", guest_email: "not-an-email" } });
+  assertEq(badPostGB.status, 303, "gb-04a: invalid no-JS submission → 303 redirect");
+  assertTrue((badPostGB.redirectTo || "").includes("error=invalid"), "gb-04b: redirect carries ?error=invalid");
+
+  // gb-05/06: POST no-JS fallback with valid input → creates a REAL booking
+  // row via createBooking() and redirects straight to the confirmation URL.
+  // Both this fallback and the JSON API (POST /api/opplevelser/book) call the
+  // exact same createBooking()/sendBookingConfirmation() from booking-store.ts
+  // — nothing is duplicated between the two entry points.
+  const goodPostGB = invokeGB("post", "/kategori/gardssalg/book/:providerSlug",
+    { providerSlug: slugGB }, `/kategori/gardssalg/book/${slugGB}`,
+    {
+      body: {
+        slot_at: "2026-08-15T14:00", party_size: "3",
+        guest_name: "Kari Nordmann", guest_email: "kari@example.no", guest_phone: "12345678",
+      },
+    });
+  assertEq(goodPostGB.status, 303, "gb-05a: valid no-JS submission → 303 redirect");
+  const redirGB = goodPostGB.redirectTo || "";
+  assertTrue(redirGB.startsWith(`/kategori/gardssalg/book/${slugGB}/confirm/`),
+    "gb-05b: redirects to the confirm sub-path for the same provider slug");
+  const refGB = decodeURIComponent(redirGB.split("/confirm/")[1] || "");
+  assertTrue(/^GARD-\d{8}-[A-Z0-9]{5}$/.test(refGB), "gb-05c: booking_ref has the GARD-YYYYMMDD-XXXXX shape");
+
+  const bookingGB = bookStGB.getBookingByRef(refGB);
+  assertTrue(!!bookingGB, "gb-06a: booking exists via getBookingByRef() (same lookup function /ics uses)");
+  assertEq(bookingGB?.provider_id, provIdGB, "gb-06b: booking is attached to the correct provider");
+  assertEq(bookingGB?.party_size, 3, "gb-06c: party_size persisted correctly");
+  assertEq(bookingGB?.guest_name, "Kari Nordmann", "gb-06d: guest_name persisted correctly");
+  assertEq(bookingGB?.status, "reserved", "gb-06e: new booking starts in 'reserved' status");
+
+  // gb-07: a second gårdssalg producer with NO hjemmeside — under the OLD CTA
+  // gate ("has a hjemmeside") this row would get no button at all; under the
+  // fixed slug-based gate it does, and the /kategori/gardssalg listing links
+  // both providers at the new booking route (not the dead /tilbyder/<slug>).
+  const otherProvIdGB = expStGB.createProvider({
+    navn: "Annet Bryggeri",
+    fylke: "Innlandet", kommune: "Lillehammer",
+  });
+  dbGB.prepare("UPDATE experience_providers SET producer_type = ? WHERE id = ?").run("bryggeri", otherProvIdGB);
+  expStGB.backfillProviderSlugs();
+  const otherRowGB = expStGB.listGardssalgProviders(20, 0).find((p: any) => p.id === otherProvIdGB);
+  assertTrue(!!otherRowGB && !!otherRowGB.slug, "gb-07a: second seeded provider (no hjemmeside) also got a slug");
+
+  const listGB = invokeGB("get", "/kategori/gardssalg", {}, "/kategori/gardssalg");
+  assertEq(listGB.status, 200, "gb-08a: GET /kategori/gardssalg → 200");
+  assertTrue(listGB.body.includes(`/kategori/gardssalg/book/${slugGB}`),
+    "gb-08b: listing links the seeded provider to the new booking route");
+  assertTrue(!listGB.body.includes(`/tilbyder/${slugGB}`),
+    "gb-08c: listing no longer links this provider to the dead /tilbyder/<slug> route");
+  assertTrue(listGB.body.includes("Book besøk"), "gb-08d: 'Book besøk' CTA text still present");
+  assertTrue(!!otherRowGB && listGB.body.includes(`/kategori/gardssalg/book/${otherRowGB.slug}`),
+    "gb-08e: CTA gate is now slug-based, not hjemmeside-based (shows for a producer with no website)");
+
+  if (prevPathGB === undefined) delete process.env.EXPERIENCES_DB_PATH;
+  else process.env.EXPERIENCES_DB_PATH = prevPathGB;
+  dbFacGB.__resetDbFactoryForTesting();
+  console.log("  gardssalg-book: OK (panel render, unknown-slug 404, no-JS POST create+redirect, provider ownership, CTA fix)");
+})();
+
+// gb-qr: qrcode SVG generation smoke test. Isolated — touches no DB/Express
+// state at all — so it's safe to run through the async serial chain without
+// racing the fully-synchronous block above (which completes end-to-end
+// before any microtask, including this one, gets a chance to run).
+const _gardssalgQrPromise = runSerial(async () => {
+  const QRCodeGB = require("qrcode");
+  const svg: string = await QRCodeGB.toString("GARD-20260815-ABCDE", { type: "svg", margin: 1, width: 180 });
+  assertTrue(typeof svg === "string" && svg.includes("<svg"), "gb-qr-01: QRCode.toString(type:'svg') returns inline SVG markup");
+  // Generated locally by the `qrcode` library (no HTTP call to any third-party
+  // QR image service); the only "http" text present is the standard SVG XML
+  // namespace declaration, not a network reference.
+  assertTrue(!/<image[^>]+(https?:)?\/\//.test(svg) && !svg.includes("api.qrserver") && !svg.includes("googleapis.com/chart"),
+    "gb-qr-02: generated SVG embeds no <image> reference to a third-party QR service (booking_ref never leaves our infra)");
+});

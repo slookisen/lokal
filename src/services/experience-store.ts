@@ -1087,3 +1087,25 @@ export function listGardssalgProviders(limit = 100, offset = 0): GardssalgProvid
     )
     .all(limit, offset) as GardssalgProviderRow[];
 }
+
+/** Look up a single gårdssalg provider (drink producer) by slug — for the
+ *  /kategori/gardssalg/book/<slug> reservation flow. Mirrors the WHERE clause
+ *  from listGardssalgProviders()/countGardssalgProviders() (producer_type set
+ *  OR rfb-seed), NOT the experiences-join publish gate used by
+ *  getPublishedProviderBySlug() — gårdssalg producers have zero rows in the
+ *  experiences table (their product is a gårdsbesøk booking, not a listed
+ *  "experience"), so the join-based gate always 404'd them. That mismatch was
+ *  the root cause of the live "Book besøk" 404 bug (2026-07-02). */
+export function getGardssalgProviderBySlug(slug: string): GardssalgProviderRow | null {
+  if (!slug) return null;
+  const db = getDb(VERTICAL);
+  const row = db
+    .prepare(
+      `SELECT id, navn, hjemmeside, fylke, kommune, poststed, producer_type, enrichment_state, slug
+         FROM experience_providers
+        WHERE slug = @slug
+          AND (producer_type IS NOT NULL OR rfb_seed_source = 'rfb-seed')`
+    )
+    .get({ slug }) as GardssalgProviderRow | undefined;
+  return row ?? null;
+}

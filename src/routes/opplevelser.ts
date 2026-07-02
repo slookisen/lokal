@@ -57,8 +57,9 @@ import {
   resolveBooking,
   getCommissionStatement,
   BookingInputSchema,
+  buildIcs,
+  sendBookingConfirmation,
 } from "../services/booking-store";
-import { emailService } from "../services/email-service";
 
 const APP_URL = process.env.APP_URL || "https://opplevagent.no";
 
@@ -811,78 +812,10 @@ router.post("/", requireAdmin, (req: Request, res: Response) => {
 // All writes persist to gardssalg_bookings in experiences.db.
 // No payments; no auto-send; drafts only. Daniel sends confirmations manually.
 
-function buildIcs(booking: Awaited<ReturnType<typeof getBookingByRef>> & {}): string {
-  const dtStamp = new Date().toISOString().replace(/[-:.]/g, "").slice(0, 15) + "Z";
-  const slotDate = new Date(booking!.slot_at);
-  const dtStart = slotDate.toISOString().replace(/[-:.]/g, "").slice(0, 15) + "Z";
-  const dtEnd = new Date(slotDate.getTime() + 2 * 60 * 60 * 1000)
-    .toISOString()
-    .replace(/[-:.]/g, "")
-    .slice(0, 15) + "Z";
-  return [
-    "BEGIN:VCALENDAR",
-    "VERSION:2.0",
-    "PRODID:-//Opplevagent//Gardssalg Booking//NO",
-    "METHOD:REQUEST",
-    "BEGIN:VEVENT",
-    `UID:${booking!.booking_id}@opplevagent.no`,
-    `DTSTAMP:${dtStamp}`,
-    `DTSTART:${dtStart}`,
-    `DTEND:${dtEnd}`,
-    `SUMMARY:Gårdssalg & smaking — ref ${booking!.booking_ref}`,
-    `DESCRIPTION:Påmelding via opplevagent.no. Bookingref: ${booking!.booking_ref}`,
-    `ATTENDEE;CN=${booking!.guest_name}:mailto:${booking!.guest_email}`,
-    "END:VEVENT",
-    "END:VCALENDAR",
-  ].join("\r\n");
-}
-
-async function sendBookingConfirmation(
-  booking: NonNullable<ReturnType<typeof getBookingByRef>>,
-): Promise<void> {
-  const confirmUrl = `${APP_URL}/api/opplevelser/book/confirm/${booking.confirm_token}`;
-  const ics = buildIcs(booking);
-
-  const slotFormatted = new Date(booking.slot_at).toLocaleString("nb-NO", {
-    dateStyle: "full",
-    timeStyle: "short",
-    timeZone: "Europe/Oslo",
-  });
-
-  const htmlContent = `
-<p>Hei ${booking.guest_name},</p>
-<p>Din påmelding er registrert! Her er din bekreftelse:</p>
-<table style="border-collapse:collapse;font-family:sans-serif">
-  <tr><td style="padding:4px 12px 4px 0;font-weight:bold">Bookingref:</td><td>${booking.booking_ref}</td></tr>
-  <tr><td style="padding:4px 12px 4px 0;font-weight:bold">Dato/tid:</td><td>${slotFormatted}</td></tr>
-  <tr><td style="padding:4px 12px 4px 0;font-weight:bold">Antall:</td><td>${booking.party_size} person${booking.party_size > 1 ? "er" : ""}</td></tr>
-</table>
-<p>Tilbyderen vil bekrefte oppmøte etter besøket via lenken nedenfor (kun for tilbyder).</p>
-<p>En kalenderinvitasjon (ICS) er vedlagt denne e-posten.</p>
-<p>Spørsmål? Svar på denne e-posten.</p>
-<p>Hilsen<br>Opplevagent</p>
-  `.trim();
-
-  const textContent = `Hei ${booking.guest_name},\n\nDin påmelding er registrert.\nBookingref: ${booking.booking_ref}\nDato/tid: ${slotFormatted}\nAntall: ${booking.party_size}\n\nHilsen\nOpplevagent`;
-
-  await emailService.sendEmail({
-    to: booking.guest_email,
-    subject: `Bekreftelse på påmelding — ${booking.booking_ref}`,
-    htmlContent,
-    textContent,
-    replyTo: `kontakt@opplevagent.no`,
-    attachments: [
-      {
-        filename: `gardssalg-${booking.booking_ref}.ics`,
-        content: ics,
-        contentType: "text/calendar; charset=utf-8; method=REQUEST",
-      },
-    ],
-  });
-
-  // Producer confirm link — logged so Daniel can verify manually
-  console.log(`[booking] ${booking.booking_ref} confirm_url=${confirmUrl}`);
-}
+// buildIcs() and sendBookingConfirmation() now live in ../services/booking-store
+// (moved 2026-07-02) so the gårdssalg SSR reservation form's no-JS fallback
+// route in experiences-seo.ts can reuse the exact same confirmation logic
+// instead of duplicating it.
 
 // ─── POST /api/opplevelser/book ──────────────────────────────────────
 router.post("/book", async (req: Request, res: Response) => {
