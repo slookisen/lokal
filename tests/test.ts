@@ -209,6 +209,26 @@ const _orchPr12SweepPromise: Promise<void> = (async () => {
   }
 })();
 
+// ── Slice 1 of dev-request 2026-06-30-brreg-verification-gate: ──────────
+// verifyOrgNumber(orgNr) org-nr direct-lookup unit tests (brreg-client.ts).
+// Async (injected-fetch tests); kicked off here, awaited in the REPORT
+// block so its pass/fail counts fold into the `npm test` summary.
+console.log("── brreg-verify-gate slice1: verifyOrgNumber unit tests ──");
+const _brregVerifySlice1Promise: Promise<void> = (async () => {
+  try {
+    const { runBrregClientTests } = require("../src/services/brreg-client.test") as
+      typeof import("../src/services/brreg-client.test");
+    const br = await runBrregClientTests({ log: false });
+    passed += br.passed;
+    failed += br.failed;
+    for (const f of br.failures) failures.push("brreg-client: " + f);
+    console.log(`  brreg-client: ${br.passed} passed, ${br.failed} failed`);
+  } catch (err) {
+    failed++;
+    failures.push("brreg-client: unexpected error: " + String(err));
+  }
+})();
+
 // ── trust-score community signal tests ──
 console.log("── trust-score community signal tests ──");
 
@@ -19123,6 +19143,7 @@ console.log("\n── orch-pr-14: MCP discovery product_id surfacing ──");
   try { await _orchPr9PruneDeadUrlsPromise; } catch { /* errors already pushed to failures */ }
   try { await _orchPr18BulkLoadPromise; } catch { /* errors already pushed to failures */ }
   try { await _orchPr12SweepPromise; } catch { /* errors already pushed to failures */ }
+  try { await _brregVerifySlice1Promise; } catch { /* errors already pushed to failures */ }
   try { await _orchPr20BmEventsPromise; } catch { /* errors already pushed to failures */ }
   try { await _orchPr21SentLogActorPromise; } catch { /* errors already pushed to failures */ }
   // PR-109 tests are synchronous (IIFE) — no promise needed
