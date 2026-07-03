@@ -1747,20 +1747,27 @@ router.get("/opplevelser", (req: Request, res: Response) => {
   res.send(html);
 });
 
+// Drink-type → { label, color } map — hoisted to module scope (2026-06-29 UI
+// spec) so every gårdssalg surface (category cards, booking panel badge, and
+// the produsent profile hero below) shares one color-coding source of truth.
+const DRINK_TYPE_META: Record<string, { label: string; color: string }> = {
+  bryggeri:   { label: "Bryggeri",  color: "#c58a2a" },
+  cideri:     { label: "Sider",     color: "#4a8c3f" },
+  sideri:     { label: "Sider",     color: "#4a8c3f" },
+  mjøderi:    { label: "Mjød",      color: "#7c5cbb" },
+  vingård:    { label: "Fruktvin",  color: "#c0577c" },
+  destilleri: { label: "Destillat", color: "#6c6c6c" },
+  seltzeri:   { label: "Kombucha",  color: "#2a7d9c" },
+};
+function drinkTypeMeta(producerType: string | null): { label: string; color: string } | null {
+  return producerType ? DRINK_TYPE_META[producerType.toLowerCase()] ?? null : null;
+}
+
 // Drink-type badge for a gårdssalg provider card — hoisted to module scope
 // (was a closure inside the /kategori/gardssalg handler) so the booking panel
 // route below can render the same badge.
 function drinkBadge(producerType: string | null): string {
-  const map: Record<string, { label: string; color: string }> = {
-    bryggeri:   { label: "Bryggeri",  color: "#c58a2a" },
-    cideri:     { label: "Sider",     color: "#4a8c3f" },
-    sideri:     { label: "Sider",     color: "#4a8c3f" },
-    mjøderi:    { label: "Mjød",      color: "#7c5cbb" },
-    vingård:    { label: "Fruktvin",  color: "#c0577c" },
-    destilleri: { label: "Destillat", color: "#6c6c6c" },
-    seltzeri:   { label: "Kombucha",  color: "#2a7d9c" },
-  };
-  const entry = producerType ? map[producerType.toLowerCase()] : null;
+  const entry = drinkTypeMeta(producerType);
   if (!entry) return "";
   return `<span style="display:inline-block;font-size:.72rem;font-weight:700;letter-spacing:.04em;
     text-transform:uppercase;padding:2px 8px;border-radius:4px;
@@ -1781,17 +1788,25 @@ router.get("/kategori/gardssalg", (req: Request, res: Response) => {
   function renderProviderCard(p: GardssalgProviderRow): string {
     const sted = [p.poststed ?? p.kommune ?? p.fylke].filter(Boolean).join(", ");
     const badge = drinkBadge(p.producer_type);
-    // BEHAVIOR CHANGE (2026-07-02 gårdssalg-book fix): both the name link and
-    // the "Book besøk" CTA now point at the new SSR reservation panel
-    // (/kategori/gardssalg/book/<slug>) instead of /tilbyder/<slug>. The old
-    // /tilbyder/<slug> target 404'd for every gårdssalg provider — those rows
-    // have zero linked `experiences` rows, and getPublishedProviderBySlug()
-    // requires ≥1 published experience to exist. The CTA gate also changed
-    // from "has a hjemmeside URL" to "has a resolvable slug" (i.e. bookable),
-    // since bookability — not having a website — is what the button promises.
+    // BEHAVIOR CHANGE (2026-07-02 gårdssalg-book fix): the "Book besøk" CTA
+    // points at the new SSR reservation panel (/kategori/gardssalg/book/<slug>)
+    // instead of /tilbyder/<slug>. The old /tilbyder/<slug> target 404'd for
+    // every gårdssalg provider — those rows have zero linked `experiences`
+    // rows, and getPublishedProviderBySlug() requires ≥1 published experience
+    // to exist. The CTA gate also changed from "has a hjemmeside URL" to "has
+    // a resolvable slug" (i.e. bookable), since bookability — not having a
+    // website — is what the button promises.
+    // BEHAVIOR CHANGE (2026-07-03 produsent-profil slice): the card's name
+    // link now points at the new rich profile page
+    // (/kategori/gardssalg/produsent/<slug>) instead of straight at the
+    // booking panel — the profile is where a visitor decides whether to book;
+    // the "Book besøk" button stays a direct shortcut to the booking panel
+    // for anyone who already knows they want to reserve. Both routes resolve
+    // via the same getGardssalgProviderBySlug() gate, so they 404/200 in sync.
     const bookHref = p.slug ? `/kategori/gardssalg/book/${encodeURIComponent(p.slug)}` : null;
-    const nameHtml = bookHref
-      ? `<a href="${bookHref}" style="color:inherit;font-weight:700;font-size:1rem;text-decoration:none">${escapeHtml(p.navn)}</a>`
+    const profileHref = p.slug ? `/kategori/gardssalg/produsent/${encodeURIComponent(p.slug)}` : null;
+    const nameHtml = profileHref
+      ? `<a href="${profileHref}" style="color:inherit;font-weight:700;font-size:1rem;text-decoration:none">${escapeHtml(p.navn)}</a>`
       : `<span style="font-weight:700;font-size:1rem">${escapeHtml(p.navn)}</span>`;
     const link = bookHref
       ? `<a href="${bookHref}" style="display:inline-block;margin-top:10px;padding:8px 16px;background:#0f5a50;color:#fff;border-radius:6px;font-size:.84rem;font-weight:600;text-decoration:none">Book besøk</a>`
@@ -1873,6 +1888,262 @@ ${BROWSE_CSS}
   res.setHeader("Cache-Control", "public, max-age=300");
   res.send(html);
 });
+
+// ─── Gårdssalg produsentprofil (2026-07-03, Fase 1 of the rike-profiler
+//     dev-request) ────────────────────────────────────────────────────────
+//
+// GET /kategori/gardssalg/produsent/:providerSlug — a rich, sellable profile
+// page for one drikkeprodusent, sitting BETWEEN the category listing and the
+// booking panel: /kategori/gardssalg (browse) → produsent/<slug> (sell/decide,
+// this route) → book/<slug> (reserve, unchanged). Resolves via the exact same
+// getGardssalgProviderBySlug() gate as the booking panel, so profile and
+// booking 404/200 in lockstep for every provider.
+//
+// Data-availability note: experience_providers today carries navn, hjemmeside,
+// sted, contact, and lat/lon — but no own-summary "description", and no
+// season/duration/price_from/capacity columns (those live on the `experiences`
+// table, which gårdssalg producers have zero rows in — see the block comment
+// below). The "Om produsenten"/"Besøket" sections therefore render an honest,
+// type-general placeholder (not a fabricated specific claim about any one
+// producer — keeps the faithfulness guard's spirit) until the separate
+// multi-page-crawl enrichment slice fills real per-producer copy. The
+// practical-info table only ever renders rows it has real data for.
+function drivingSted(p: GardssalgProviderRow): string {
+  return [p.poststed, p.kommune, p.fylke].filter(Boolean).join(", ");
+}
+
+// Generic, type-general "what a visit typically includes" copy — intentionally
+// NOT phrased as a verified fact about the specific producer (no per-producer
+// source yet), just an honest orientation until real content lands.
+const VISIT_TYPE_COPY: Record<string, string> = {
+  bryggeri: "en omvisning i bryggeriet og en smaking av deres øl",
+  cideri: "en smaking av sider, gjerne med et innblikk i fruktdyrkingen bak",
+  sideri: "en smaking av sider, gjerne med et innblikk i fruktdyrkingen bak",
+  mjøderi: "en smaking av mjød og et innblikk i mjødhåndverket",
+  vingård: "en smaking av fruktvin og en tur i vingården/frukthagen",
+  destilleri: "en omvisning og en smaking av destillater",
+  seltzeri: "en smaking av kombucha og et innblikk i produksjonen",
+};
+
+router.get(
+  "/kategori/gardssalg/produsent/:providerSlug",
+  (req: Request, res: Response, next: NextFunction) => {
+    const slug = String(req.params.providerSlug || "");
+    if (!slug) return next();
+    ensureProviderSlugs();
+    let provider: GardssalgProviderRow | null = null;
+    try {
+      provider = getGardssalgProviderBySlug(slug);
+    } catch {
+      provider = null;
+    }
+    if (!provider) return next();
+
+    const url = baseUrl();
+    const canonical = `${url}/kategori/gardssalg/produsent/${encodeURIComponent(slug)}`;
+    const bookHref = `/kategori/gardssalg/book/${encodeURIComponent(slug)}`;
+    const sted = drivingSted(provider);
+    const meta = drinkTypeMeta(provider.producer_type);
+    const badge = drinkBadge(provider.producer_type);
+    const site = safeHttpUrl(provider.hjemmeside);
+    const lat = numOrNull(provider.lat);
+    const lon = numOrNull(provider.lon);
+
+    const metaDesc = `Besøk ${provider.navn}${sted ? " i " + sted : ""} — book en smaking eller omvisning direkte hos produsenten på Opplevagent.`;
+
+    // Hero — themed by drink-type color-coding (2026-06-29 UI spec, shared
+    // DRINK_TYPE_META also used by drinkBadge()); falls back to the plain
+    // gårdssalg teal gradient used on the category page for untyped rows.
+    const heroBg = meta
+      ? `linear-gradient(135deg,${meta.color} 0%,#0b2e29 75%)`
+      : "linear-gradient(135deg,#0e3c36 0%,#0f5a50 100%)";
+
+    // "Om produsenten" — real hjemmeside link when we have one; honest
+    // placeholder copy otherwise (no fabricated specifics).
+    const aboutBody = site
+      ? `<p>${escapeHtml(provider.navn)} er en lokal drikkeprodusent${sted ? " i " + escapeHtml(sted) : ""}. Les mer om produsenten og produktene på <a href="${escapeHtml(site)}" target="_blank" rel="noopener nofollow">${escapeHtml(hostOf(site))}</a>.</p>`
+      : `<p>${escapeHtml(provider.navn)} er en lokal drikkeprodusent${sted ? " i " + escapeHtml(sted) : ""}. Utfyllende presentasjon publiseres fortløpende.</p>`;
+
+    // "Besøket" — type-general orientation, explicitly not a per-producer claim.
+    const visitCopy = provider.producer_type
+      ? VISIT_TYPE_COPY[provider.producer_type.toLowerCase()]
+      : null;
+    const visitBody = visitCopy
+      ? `<p>Et besøk hos ${escapeHtml(provider.navn)} inkluderer typisk ${visitCopy}. Nøyaktig program avtales ved reservasjon.</p>`
+      : `<p>Detaljer om hva besøket hos ${escapeHtml(provider.navn)} inneholder, publiseres fortløpende. Book et besøk for å avtale program direkte med produsenten.</p>`;
+
+    // Practical info — only rows we actually have data for. Sesong/varighet/
+    // pris/kapasitet are NOT yet columns on experience_providers (see comment
+    // above the route) so they are intentionally omitted rather than guessed.
+    const facts: Array<[string, string]> = [];
+    if (sted) facts.push(["Sted", escapeHtml(sted)]);
+    if (provider.adresse) facts.push(["Adresse", escapeHtml(provider.adresse)]);
+    if (site) facts.push(["Nettside", `<a href="${escapeHtml(site)}" target="_blank" rel="noopener nofollow">${escapeHtml(hostOf(site))}</a>`]);
+    if (provider.telefon) facts.push(["Telefon", `<a href="tel:${escapeHtml(provider.telefon)}">${escapeHtml(provider.telefon)}</a>`]);
+    if (provider.epost) facts.push(["E-post", `<a href="mailto:${escapeHtml(provider.epost)}">${escapeHtml(provider.epost)}</a>`]);
+    const factsRows = facts.map(([k, v]) => `<tr><th scope="row">${escapeHtml(k)}</th><td>${v}</td></tr>`).join("");
+    const factsBlock = facts.length
+      ? `<table class="facts"><caption class="skip-link">Praktisk info</caption><tbody>${factsRows}</tbody></table>
+         <p class="produsent-note">Sesong, varighet, pris og kapasitet legges til etter hvert som profilen berikes.</p>`
+      : `<p class="produsent-note">Praktisk info legges til etter hvert som profilen berikes. Kontakt produsenten ved reservasjon.</p>`;
+
+    // Map block — same OpenStreetMap-link pattern as /opplevelse/:slug.
+    const mapBlock = (lat !== null && lon !== null)
+      ? `<a class="map-card" href="https://www.openstreetmap.org/?mlat=${lat}&mlon=${lon}#map=13/${lat}/${lon}" target="_blank" rel="noopener" aria-label="Åpne posisjon i OpenStreetMap">
+           <svg viewBox="0 0 24 24" width="22" height="22" aria-hidden="true"><path d="M12 2a7 7 0 0 0-7 7c0 5 7 13 7 13s7-8 7-13a7 7 0 0 0-7-7z" fill="none" stroke="currentColor" stroke-width="1.6"/><circle cx="12" cy="9" r="2.4" fill="currentColor"/></svg>
+           <span><strong>${escapeHtml(sted || "Posisjon")}</strong><span class="map-sub">Åpne i kart (OpenStreetMap)</span></span>
+         </a>`
+      : `<div class="map-card map-fallback">
+           <svg viewBox="0 0 24 24" width="22" height="22" aria-hidden="true"><path d="M12 2a7 7 0 0 0-7 7c0 5 7 13 7 13s7-8 7-13a7 7 0 0 0-7-7z" fill="none" stroke="currentColor" stroke-width="1.6"/><circle cx="12" cy="9" r="2.4" fill="currentColor"/></svg>
+           <span><strong>${escapeHtml(sted || "Sted ikke oppgitt")}</strong><span class="map-sub">Nøyaktig posisjon er ikke registrert ennå.</span></span>
+         </div>`;
+
+    // JSON-LD: LocalBusiness (the produsent's physical premises) + offers for
+    // the visit + BreadcrumbList. No numeric price exists yet on this row, so
+    // — same discipline as the /opplevelse/:slug Offer block — `offers`
+    // describes the bookable visit without inventing a price.
+    const ld: Record<string, unknown> = {
+      "@context": "https://schema.org",
+      "@type": "LocalBusiness",
+      name: provider.navn,
+      description: metaDesc,
+      url: canonical,
+      address: {
+        "@type": "PostalAddress",
+        streetAddress: provider.adresse || undefined,
+        addressLocality: provider.poststed || provider.kommune || undefined,
+        addressRegion: provider.fylke || undefined,
+        addressCountry: "NO",
+      },
+    };
+    if (lat !== null && lon !== null) ld.geo = { "@type": "GeoCoordinates", latitude: lat, longitude: lon };
+    if (site) ld.sameAs = [site];
+    if (provider.telefon) ld.telephone = provider.telefon;
+    if (provider.epost) ld.email = provider.epost;
+    ld.offers = {
+      "@type": "Offer",
+      name: `Gårdsbesøk og smaking hos ${provider.navn}`,
+      url: `${url}${bookHref}`,
+      availability: "https://schema.org/InStock",
+    };
+    const breadcrumb = {
+      "@context": "https://schema.org",
+      "@type": "BreadcrumbList",
+      itemListElement: [
+        { "@type": "ListItem", position: 1, name: "Forsiden", item: url },
+        { "@type": "ListItem", position: 2, name: "Gårdssalg og smaking", item: `${url}/kategori/gardssalg` },
+        { "@type": "ListItem", position: 3, name: provider.navn, item: canonical },
+      ],
+    };
+    const ldScripts = [ld, breadcrumb]
+      .map((o) => `<script type="application/ld+json">${JSON.stringify(o).replace(/<\//g, "<\\/")}</script>`)
+      .join("\n");
+
+    const html = `<!doctype html>
+<html lang="nb">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>${escapeHtml(provider.navn)}${sted ? " – " + escapeHtml(sted) : ""} | Opplevagent</title>
+<meta name="description" content="${escapeHtml(metaDesc)}">
+<meta name="robots" content="index, follow, max-snippet:-1, max-image-preview:large">
+<link rel="canonical" href="${canonical}">
+<meta property="og:title" content="${escapeHtml(provider.navn)} | Opplevagent">
+<meta property="og:description" content="${escapeHtml(metaDesc)}">
+<meta property="og:type" content="website">
+<meta property="og:url" content="${canonical}">
+<meta property="og:locale" content="nb_NO">
+<meta property="og:site_name" content="Opplevagent">
+<meta property="og:image" content="${url}/favicon.svg">
+<meta name="twitter:card" content="summary">
+${ldScripts}
+<style>
+${BROWSE_CSS}
+.produsent-hero{background:${heroBg};color:#fff;padding:52px 0 44px;margin-bottom:32px}
+.produsent-hero .hero-kicker{font-size:.78rem;font-weight:700;letter-spacing:.1em;text-transform:uppercase;opacity:.75;margin-bottom:10px}
+.produsent-hero h1{font-size:clamp(1.6rem,3.6vw,2.4rem);font-weight:800;margin-bottom:8px;line-height:1.16}
+.produsent-hero .hero-sted{opacity:.88;font-size:1rem;display:flex;align-items:center;gap:7px}
+.produsent-layout{display:grid;grid-template-columns:1fr 320px;gap:28px;align-items:start;margin-bottom:8px}
+@media(max-width:860px){.produsent-layout{grid-template-columns:1fr}}
+.info-card{background:var(--surface);border:1px solid var(--line);border-radius:var(--r-lg);padding:22px 24px;margin-bottom:20px;box-shadow:var(--sh-sm)}
+.info-card h2{font-size:1.05rem;font-weight:800;color:var(--fjord-900);margin-bottom:10px}
+.info-card p{color:var(--ink-soft);font-size:.96rem}
+.facts{width:100%;border-collapse:collapse;background:var(--surface);border:1px solid var(--line);border-radius:var(--r-md);overflow:hidden}
+.facts th,.facts td{text-align:left;padding:12px 16px;font-size:.9rem;border-bottom:1px solid var(--line);vertical-align:top}
+.facts tr:last-child th,.facts tr:last-child td{border-bottom:none}
+.facts th{width:34%;color:var(--mist);font-weight:600}
+.produsent-note{font-size:.78rem;color:var(--mist);margin-top:10px}
+.aside-card{background:var(--surface);border:1px solid var(--line);border-radius:var(--r-lg);padding:20px;box-shadow:var(--sh-sm);margin-bottom:16px}
+.aside-card h2{font-size:.78rem;text-transform:uppercase;letter-spacing:.06em;color:var(--mist);margin-bottom:12px}
+.reserve-cta{display:block;text-align:center;background:linear-gradient(135deg,var(--amber-500),var(--coral-500));color:#fff;font-weight:800;padding:14px 18px;border-radius:var(--r-pill);box-shadow:0 4px 14px rgba(255,93,59,.4)}
+.reserve-cta:hover{text-decoration:none;filter:brightness(1.04)}
+.map-card{display:flex;align-items:center;gap:12px;color:var(--ink-soft);background:var(--canvas-2);border:1px solid var(--line);border-radius:var(--r-md);padding:14px 16px}
+.map-card:hover{text-decoration:none;border-color:var(--fjord-600)}
+.map-card svg{color:var(--fjord-600);flex:0 0 22px}
+.map-card strong{display:block;color:var(--ink);font-size:.95rem}
+.map-sub{font-size:.8rem;color:var(--mist)}
+.map-fallback:hover{border-color:var(--line)}
+</style>
+</head>
+<body>
+<a class="skip-link" href="#main">Hopp til innhold</a>
+<nav class="site-nav" aria-label="Navigasjon">
+  <div class="nav-inner">
+    <a class="brand" href="/"><span class="brand-word">opplevagent<span class="tld">.no</span></span></a>
+    <span class="nav-links"><a href="/opplevelser">Alle opplevelser</a><a href="/kategori/gardssalg">Gårdssalg</a></span>
+  </div>
+</nav>
+<header class="produsent-hero">
+  <div class="container">
+    <div class="hero-kicker">Gårdssalg &amp; smaking</div>
+    <h1>${escapeHtml(provider.navn)}</h1>
+    ${sted ? `<p class="hero-sted">${escapeHtml(sted)}</p>` : ""}
+    ${badge}
+  </div>
+</header>
+<main id="main" class="container">
+  <nav class="breadcrumb" aria-label="Brødsmulesti">
+    <a href="/">Forsiden</a> · <a href="/kategori/gardssalg">Gårdssalg og smaking</a> · ${escapeHtml(provider.navn)}
+  </nav>
+  <div class="produsent-layout">
+    <article>
+      <div class="info-card">
+        <h2>Om produsenten</h2>
+        ${aboutBody}
+      </div>
+      <div class="info-card">
+        <h2>Besøket</h2>
+        ${visitBody}
+      </div>
+      <div class="info-card">
+        <h2>Praktisk info</h2>
+        ${factsBlock}
+      </div>
+    </article>
+    <aside>
+      <div class="aside-card">
+        <h2>Reserver</h2>
+        <a class="reserve-cta" href="${bookHref}">Reserver besøk</a>
+      </div>
+      <div class="aside-card">
+        <h2>Sted</h2>
+        ${mapBlock}
+      </div>
+    </aside>
+  </div>
+  <p class="legal-note" style="font-size:.78rem;color:#7a7163;margin-top:24px;padding-top:16px;border-top:1px solid #e4ded0">Vi formidler besøket og smakingen hos produsenten. Selve salget skjer hos produsenten, som har egen kommunal bevilling.</p>
+</main>
+<footer style="margin-top:48px;padding:24px 0;border-top:1px solid #e4ded0;font-size:.8rem;color:#7a7163;text-align:center">
+  <span><a href="/">Forsiden</a> · <a href="/kategori/gardssalg">Gårdssalg og smaking</a></span>
+</footer>
+</body>
+</html>`;
+
+    res.setHeader("Content-Type", "text/html; charset=utf-8");
+    res.setHeader("Cache-Control", "public, max-age=300");
+    res.send(html);
+  },
+);
 
 // ─── Gårdssalg reservation → confirmation journey (2026-07-02) ──────────────
 //
