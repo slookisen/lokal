@@ -190,6 +190,23 @@ console.log("\n── PR-131: dental-claim-service (buildWhereClause) ──");
   console.log(`  dental-claim-service: ${r.passed} passed, ${r.failed} failed`);
 }
 
+// ── crm-service: GET /admin/crm/threads?contact_email= regression fix ──
+// Pins the fix for the "/admin/crm/threads?contact_email= silently ignored"
+// P2 bug (flagged supervisor cycles 2026-07-01/02, Daniel work-order
+// 2026-07-03 item 2): contact_email must filter to that contact across ALL
+// statuses, and omitting it must preserve the old awaiting_review-only
+// dashboard-badge default.
+console.log("\n── crm-service (listThreadsByStatus contact_email fix) ──");
+{
+  const { runCrmServiceTests } = require("../src/services/crm-service.test") as
+    typeof import("../src/services/crm-service.test");
+  const r = runCrmServiceTests({ log: false });
+  passed += r.passed;
+  failed += r.failed;
+  for (const f of r.failures) failures.push("crm-service: " + f);
+  console.log(`  crm-service: ${r.passed} passed, ${r.failed} failed`);
+}
+
 // ── orch-pr-12: search-enrich background sweep + findings + apply-findings ──
 // Async (fire-and-forget sweep loop). Kicked off here; awaited in the REPORT
 // block so its pass/fail counts fold into the `npm test` summary.

@@ -121,20 +121,38 @@ router.post("/contacts/:id/notes", (req, res) => {
   res.json({ success: true });
 });
 
-// ─── GET /admin/crm/threads?status=... ──────────────────────
+// ─── GET /admin/crm/threads?status=...&contact_email=... ────
 // List threads filtered by status across all contacts. Used by the
 // dashboard KPI badges (venter / nye / under arbeid) to show what
-// needs attention without drilling into each tab.
+// needs attention without drilling into each tab. Also supports a
+// per-contact lookup via ?contact_email=, which (unless an explicit
+// ?status= is also given) searches across ALL statuses rather than
+// defaulting to "awaiting_review" — the dashboard-badge default only
+// applies when contact_email is omitted.
 router.get("/threads", (req, res) => {
-  const status = (req.query.status as string) || "awaiting_review";
+  const contactEmail = (req.query.contact_email as string | undefined)?.trim() || undefined;
+  const explicitStatus = req.query.status as string | undefined;
   const allowed = ["new", "in_progress", "awaiting_review", "done", "archived"] as const;
-  if (!allowed.includes(status as any)) {
-    return res.status(400).json({ error: "invalid status", allowed });
+
+  let status: string | undefined;
+  if (explicitStatus) {
+    if (!allowed.includes(explicitStatus as any)) {
+      return res.status(400).json({ error: "invalid status", allowed });
+    }
+    status = explicitStatus;
+  } else if (!contactEmail) {
+    status = "awaiting_review";
   }
+
   const limit = Math.min(parseInt(req.query.limit as string) || 200, 500);
   const offset = parseInt(req.query.offset as string) || 0;
-  const threads = crmService.listThreadsByStatus(status as any, { limit, offset, vertical: parseVertical(req) });
-  res.json({ threads, status, count: threads.length });
+  const threads = crmService.listThreadsByStatus(status as any, {
+    limit,
+    offset,
+    vertical: parseVertical(req),
+    contactEmail,
+  });
+  res.json({ threads, status: status || "all", count: threads.length });
 });
 
 // ─── GET /admin/crm/threads/:id ──────────────────────────────
