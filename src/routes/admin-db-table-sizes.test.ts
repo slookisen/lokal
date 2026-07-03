@@ -23,8 +23,13 @@
  *   (d) a second call within the cache TTL returns cached:true and does NOT
  *       re-run a fresh DB query (asserted via a counter wrapped around the
  *       injected db's .prepare)
- *   (e) concurrent simultaneous calls against a cold cache only trigger ONE
- *       underlying computation (in-flight de-dup)
+ *   (e) same-tick reentrant calls against a cold cache only trigger ONE
+ *       underlying computation (in-flight de-dup). Note: this exercises the
+ *       same-tick case, not ordinary separate concurrent HTTP requests —
+ *       Node can't dispatch a second request's handler mid-flight of a
+ *       fully synchronous one, so real request concurrency is already
+ *       serialized by the runtime; the TTL cache (case d/f) is what bounds
+ *       real repeated-polling load.
  *   (f) after the TTL expires, a subsequent call recomputes fresh
  *       (cached:false, new db.prepare calls)
  */

@@ -20,20 +20,25 @@
 // An adversarial review flagged that the dbstat scan below runs fully
 // synchronously on Node's single event-loop thread — the same thread
 // serving ALL customer traffic (search/cart/booking/checkout) across every
-// vertical on this Fly instance — with no rate limit, no caching, and no
-// off-peak restriction (measured ~1.25s against the current 476MB prod DB,
-// growing as the DB grows). This is deliberately NOT rewritten into an
-// async-job architecture (too large a change for a quick production
-// remediation); instead:
+// vertical on this Fly instance — with no caching and no off-peak
+// restriction (measured ~1.25s against the current 476MB prod DB, growing
+// as the DB grows). `/admin/db` already sits behind `adminLimiter`
+// (500 req/hr, src/middleware/security.ts) — that bounds abuse volume but
+// not per-call blocking duration, which is what this guard addresses. This
+// is deliberately NOT rewritten into an async-job architecture (too large a
+// change for a quick production remediation); instead:
 //   1. Successful results are cached in-memory for TABLE_SIZES_CACHE_TTL_MS
-//      (default 5 min). A cache hit skips the scan entirely.
-//   2. Concurrent cache-miss requests de-dupe onto a single in-flight
-//      Promise: a request that arrives while a scan is already running (the
-//      request/response plumbing here is Promise-based, so this can happen
-//      even though the scan itself is still one synchronous, blocking call)
-//      shares that in-flight Promise instead of starting its own scan. This
-//      bounds worst-case concurrent blocking to ONE scan no matter how many
-//      requests arrive during the window — the real DoS protection.
+//      (default 5 min). A cache hit skips the scan entirely — this is the
+//      guard that actually matters for real traffic: it caps scans to at
+//      most once per TTL window no matter how often the route is polled.
+//   2. Cache-miss calls that land in the same synchronous tick (e.g. a
+//      reentrant/same-tick caller) de-dupe onto one in-flight Promise
+//      instead of each starting a scan. Note this does NOT engage for
+//      ordinary separate concurrent HTTP requests — Node cannot dispatch a
+//      second request's handler mid-flight of a fully synchronous one, so
+//      genuine request concurrency is already serialized by the runtime
+//      and is what the TTL cache (guard 1) protects against. This is
+//      defense-in-depth for the same-tick case, not the primary guard.
 
 import { Router, Request, Response } from "express";
 import { getDb } from "../database/init";
