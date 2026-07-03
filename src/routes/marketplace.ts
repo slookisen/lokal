@@ -47,6 +47,12 @@ const router = Router();
 // ── PR-29 v3: per-run cap on Place Details (New) calls to bound approved cost ─
 const MAX_DETAILS_CALLS_PER_RUN = 50; // 50 = existing batch slice max → worst-case unchanged
 
+// dev-request 2026-07-03-places-api-cost-reduction, measure 4: quarterly refresh
+// window for an agent's Enterprise-tier Places data — same cadence constant as
+// dental Phase 2G's PLACES_NO_RETRY_DAYS (src/routes/dental.ts), hoisted to
+// module scope for consistency with that pattern.
+const ENTERPRISE_REFRESH_DAYS = 90;
+
 // ─── Admin key helper ────────────────────────────────────────
 // Accepts ADMIN_KEY or ANALYTICS_ADMIN_KEY so the enrichment
 // pipeline can authenticate with the same key used for the dashboard.
@@ -1706,14 +1712,14 @@ router.post("/admin/google-rating-batch", async (req: Request, res: Response) =>
   // pushing volume straight into the Enterprise SKU (kr 386/mo, see
   // dev-requests/2026-07-03-places-api-cost-reduction.md).
   //
-  // Fix: an agent's Enterprise-tier fields get requested AT MOST ONCE
-  // (first enrichment / new-agent intake). Once an agent already has a
-  // rating on file, or has previously had an Enterprise-tier fetch attempt
-  // recorded (google_enterprise_fetched_at — covers the genuine
-  // "searched, no rating found" case too, so it isn't retried forever),
-  // subsequent runs use an Essentials/Pro-tier-only mask for that agent —
-  // or skip the Google call entirely when there's nothing left to fetch
-  // (no address/phone backfill requested either).
+  // Fix: an agent's Enterprise-tier fields get requested at most once per
+  // ENTERPRISE_REFRESH_DAYS (see below — measure 4 added a quarterly refresh
+  // on top of this). Once an agent already has a fresh rating or a fresh
+  // recorded Enterprise-tier fetch attempt (google_enterprise_fetched_at —
+  // covers the genuine "searched, no rating found" case too), subsequent
+  // runs use an Essentials/Pro-tier-only mask for that agent — or skip the
+  // Google call entirely when there's nothing left to fetch (no
+  // address/phone backfill requested either).
   //
   // Full/first-time field masks — UNCHANGED from pre-existing behavior.
   const enterpriseFieldMask = wantAddrPhone
@@ -1734,20 +1740,35 @@ router.post("/admin/google-rating-batch", async (req: Request, res: Response) =>
 
   // Look up existing Enterprise-tier state for the whole batch in one query
   // (rather than per-agent) so we know, before making any call, which agents
-  // already have a rating or a recorded prior Enterprise-tier fetch attempt.
+  // already have a FRESH (within the last ENTERPRISE_REFRESH_DAYS) recorded
+  // Enterprise-tier fetch. dev-request 2026-07-03-places-api-cost-reduction
+  // measure 4 ("tiltak 6" — cache + slow refresh): a one-time-forever skip
+  // would let a rating go stale indefinitely, so re-fetching is allowed once
+  // the marker ages past the quarterly window — same 90-day cadence as
+  // dental Phase 2G's no-retry marker (PLACES_NO_RETRY_DAYS in dental.ts),
+  // for consistency across both batch endpoints.
   // Best-effort: if this lookup fails for any reason, we fail OPEN to the
   // pre-existing behavior (treat as no prior enterprise data) rather than
-  // silently starving a new agent of its one-time enterprise fetch.
+  // silently starving a new agent of its enterprise fetch.
   const enterpriseState = new Map<string, { hasEnterpriseData: boolean; existingRating: number | null; existingReviewCount: number | null }>();
   try {
     const db0 = getDb();
     const placeholders = batch.map(() => "?").join(",");
     const rows = db0
-      .prepare(`SELECT agent_id, google_rating, google_review_count, google_enterprise_fetched_at FROM agent_knowledge WHERE agent_id IN (${placeholders})`)
-      .all(...batch) as Array<{ agent_id: string; google_rating: number | null; google_review_count: number | null; google_enterprise_fetched_at: string | null }>;
+      .prepare(`
+        SELECT agent_id, google_rating, google_review_count,
+               (google_enterprise_fetched_at IS NOT NULL
+                AND google_enterprise_fetched_at >= datetime('now', '-${ENTERPRISE_REFRESH_DAYS} days')) AS enterprise_fresh
+          FROM agent_knowledge WHERE agent_id IN (${placeholders})
+      `)
+      .all(...batch) as Array<{ agent_id: string; google_rating: number | null; google_review_count: number | null; enterprise_fresh: number }>;
     for (const r of rows) {
       enterpriseState.set(r.agent_id, {
-        hasEnterpriseData: r.google_rating != null || !!r.google_enterprise_fetched_at,
+        // A record with a rating but no fetch-timestamp predates the
+        // 2f2e19f migration — treat as stale (not fresh) so it gets exactly
+        // one quarterly refresh rather than being skipped forever on
+        // unknown-age data.
+        hasEnterpriseData: r.enterprise_fresh === 1,
         existingRating: r.google_rating ?? null,
         existingReviewCount: r.google_review_count ?? null,
       });
@@ -1767,12 +1788,13 @@ router.post("/admin/google-rating-batch", async (req: Request, res: Response) =>
       : MAX_DETAILS_CALLS_PER_RUN;
   let detailsCalls = 0;
 
-  // Records "we already spent this agent's one-time Enterprise-tier Places
-  // Text Search call" — an UPSERT because a brand-new agent may not have an
-  // agent_knowledge row yet (upsertKnowledge() only creates one when a
-  // rating is actually found). Best-effort/non-blocking: a failure here must
-  // never fail the request — worst case the agent's Enterprise fields get
-  // requested again on a future run, which is the pre-existing behavior.
+  // Records "we spent this agent's Enterprise-tier Places Text Search call
+  // for this ENTERPRISE_REFRESH_DAYS window" — an UPSERT because a
+  // brand-new agent may not have an agent_knowledge row yet
+  // (upsertKnowledge() only creates one when a rating is actually found).
+  // Best-effort/non-blocking: a failure here must never fail the request —
+  // worst case the agent's Enterprise fields get requested again on a
+  // future run, which is the safe direction (pre-existing behavior).
   const markEnterpriseFetched = (agentId: string): void => {
     try {
       getDb()
@@ -1795,9 +1817,10 @@ router.post("/admin/google-rating-batch", async (req: Request, res: Response) =>
     const hasEnterpriseData = state?.hasEnterpriseData === true;
     const requestEnterprise = !hasEnterpriseData;
 
-    // Nothing left to do for this agent this run: it already has its
-    // one-time Enterprise-tier fetch, and the caller isn't asking for
-    // address/phone backfill either — skip the Google call entirely.
+    // Nothing left to do for this agent this run: its Enterprise-tier fetch
+    // is still fresh (within ENTERPRISE_REFRESH_DAYS), and the caller isn't
+    // asking for address/phone backfill either — skip the Google call
+    // entirely.
     if (!requestEnterprise && !wantAddrPhone) {
       results.push({
         agentId,
@@ -1842,13 +1865,25 @@ router.post("/admin/google-rating-batch", async (req: Request, res: Response) =>
 
       if (requestEnterprise) {
         if (!place?.rating) {
-          results.push({ agentId, name: info.agent.name, status: "no_rating" });
+          // Include any prior rating this agent already held — a refresh
+          // attempt that finds no rating this time must not read as "this
+          // agent has no rating" when the DB still holds the old value
+          // (upsertKnowledge below is never reached on this path, so the
+          // existing columns are untouched).
+          results.push({
+            agentId,
+            name: info.agent.name,
+            status: "no_rating",
+            googleRating: state?.existingRating ?? undefined,
+            googleReviewCount: state?.existingReviewCount ?? undefined,
+          });
           // A completed (resp.ok) request with a genuine no-match/no-rating
-          // result — record the one-time Enterprise-tier attempt so this
-          // agent isn't re-sent with the Enterprise mask on the next run.
-          // Never marked on transport errors (handled by the `!resp.ok`
-          // branch above, which continues before reaching here) — only on
-          // an actual completed answer from Google.
+          // result — record the Enterprise-tier attempt so this agent isn't
+          // re-sent with the Enterprise mask again until the next
+          // ENTERPRISE_REFRESH_DAYS window. Never marked on transport
+          // errors (handled by the `!resp.ok` branch above, which continues
+          // before reaching here) — only on an actual completed answer from
+          // Google.
           markEnterpriseFetched(agentId);
           continue;
         }
@@ -1861,7 +1896,7 @@ router.post("/admin/google-rating-batch", async (req: Request, res: Response) =>
         trustScoreService.update(agentId);
         enriched++;
 
-        // Record the one-time Enterprise-tier fetch (best-effort, non-blocking).
+        // Record the Enterprise-tier fetch for this refresh window (best-effort, non-blocking).
         markEnterpriseFetched(agentId);
       } else {
         // Repeat run, agent already has Enterprise-tier data: no rating
