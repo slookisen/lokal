@@ -599,14 +599,36 @@ class CrmService {
    *
    * Returned rows are joined with contact info (email, name, type, agent_name)
    * + a snippet of the latest inbound message for quick context.
+   *
+   * `status` is optional (omit to search across all statuses) and `opts.contactEmail`
+   * filters to a single contact (case-insensitive) regardless of status — used by the
+   * per-contact thread lookup (`GET /admin/crm/threads?contact_email=`).
    */
   listThreadsByStatus(
-    status: ThreadStatus,
-    opts: { limit?: number; offset?: number; vertical?: CrmVertical } = {}
+    status: ThreadStatus | undefined,
+    opts: { limit?: number; offset?: number; vertical?: CrmVertical; contactEmail?: string } = {}
   ): any[] {
     const db = getDb();
     const limit = Math.min(opts.limit ?? 200, 500);
     const offset = opts.offset ?? 0;
+
+    const conditions: string[] = [];
+    const params: any[] = [];
+    if (status) {
+      conditions.push("t.status = ?");
+      params.push(status);
+    }
+    if (opts.contactEmail) {
+      conditions.push("LOWER(c.email) = LOWER(?)");
+      params.push(opts.contactEmail);
+    }
+    if (opts.vertical) {
+      conditions.push("t.vertical_id = ?");
+      params.push(opts.vertical);
+    }
+    const whereSql = conditions.length ? `WHERE ${conditions.join(" AND ")}` : "";
+    params.push(limit, offset);
+
     return db.prepare(`
       SELECT
         t.id,
@@ -642,10 +664,10 @@ class CrmService {
       FROM crm_threads t
       JOIN crm_contacts c ON c.id = t.contact_id
       LEFT JOIN agents a ON a.id = c.agent_id
-      WHERE t.status = ?${vSql("t.vertical_id", opts.vertical)}
+      ${whereSql}
       ORDER BY t.last_message_at DESC NULLS LAST, t.created_at DESC
       LIMIT ? OFFSET ?
-    `).all(status, limit, offset);
+    `).all(...params);
   }
 
   /**
