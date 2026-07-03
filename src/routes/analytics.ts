@@ -848,6 +848,61 @@ router.post("/ops/vacuum", (_req: Request, res: Response) => {
 });
 
 /**
+ * POST /admin/analytics/ops/tasks-prune
+ * Delete terminal A2A tasks (completed/failed/canceled) older than N days.
+ * Tasks in-flight (submitted/working/input-required) are never touched.
+ * Body: { dryRun?: boolean (default true), daysToKeep?: number (default 30) }
+ * Set dryRun:false to perform the actual delete.
+ */
+router.post("/ops/tasks-prune", (req: Request, res: Response) => {
+  try {
+    const db = getDb();
+    const dryRun = req.body.dryRun !== false; // default true — safe by default
+    const daysToKeep = Math.max(7, parseInt(req.body.daysToKeep) || 30);
+    const cutoff = sqliteDatetime(new Date(Date.now() - daysToKeep * 24 * 60 * 60 * 1000));
+
+    const eligible = db.prepare(
+      "SELECT COUNT(*) as c, SUM(LENGTH(COALESCE(params,'')) + LENGTH(COALESCE(result,''))) as bytes " +
+      "FROM tasks WHERE status IN ('completed','failed','canceled') AND created_at < ?"
+    ).get(cutoff) as any;
+
+    const totalRows = (db.prepare("SELECT COUNT(*) as c FROM tasks").get() as any).c;
+
+    if (dryRun) {
+      return res.json({
+        success: true,
+        action: "tasks-prune-dry-run",
+        daysToKeep,
+        cutoff,
+        eligibleRows: eligible.c ?? 0,
+        eligibleMb: Number(((eligible.bytes ?? 0) / 1024 / 1024).toFixed(1)),
+        totalRows,
+        note: "Pass dryRun:false to execute the delete.",
+      });
+    }
+
+    const before = (db.prepare("SELECT COUNT(*) as c FROM tasks").get() as any).c;
+    const result = db.prepare(
+      "DELETE FROM tasks WHERE status IN ('completed','failed','canceled') AND created_at < ?"
+    ).run(cutoff);
+    const after = (db.prepare("SELECT COUNT(*) as c FROM tasks").get() as any).c;
+    db.pragma("wal_checkpoint(TRUNCATE)");
+
+    return res.json({
+      success: true,
+      action: "tasks-prune",
+      daysToKeep,
+      cutoff,
+      deletedRows: result.changes,
+      remainingRows: after,
+      rowsBefore: before,
+    });
+  } catch (err) {
+    return res.status(500).json({ success: false, error: String(err) });
+  }
+});
+
+/**
  * GET /admin/analytics/ops/diagnostics
  * Comprehensive system diagnostics for the ops agent.
  * Returns everything needed to make remediation decisions.
