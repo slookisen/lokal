@@ -1924,13 +1924,24 @@ router.post("/admin/google-rating-batch", async (req: Request, res: Response) =>
       // skip the PR-29 Place Details fallback call for address below. Phone
       // is NOT looked up here: Brreg's Enhetsregisteret API has no
       // phone-number field, so phone stays Google-only exactly as before.
+      //
+      // Only attempted when the address column is still empty — mirrors
+      // dental.ts's isEmptyCol(row.adresse) guard so a batch run never pays
+      // for a live Brreg round-trip on agents that already have an address
+      // (fill-only means the write below would discard it anyway).
       let brregAddr: string | null = null;
       if (wantAddrPhone) {
-        try {
-          const brregHit = await findOrgnumberByName(info.agent.name, info.knowledge.postalCode);
-          if (brregHit?.address) brregAddr = brregHit.address;
-        } catch {
-          // Brreg lookup failure is non-fatal — fall through to Google's answer.
+        const existingAddrRow = getDb()
+          .prepare("SELECT address FROM agent_knowledge WHERE agent_id = ?")
+          .get(agentId) as { address?: string | null } | undefined;
+        const addrIsEmpty = !(existingAddrRow?.address ?? "").toString().trim();
+        if (addrIsEmpty) {
+          try {
+            const brregHit = await findOrgnumberByName(info.agent.name, info.knowledge.postalCode);
+            if (brregHit?.address) brregAddr = brregHit.address;
+          } catch {
+            // Brreg lookup failure is non-fatal — fall through to Google's answer.
+          }
         }
       }
 
