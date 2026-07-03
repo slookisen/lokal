@@ -2337,6 +2337,46 @@ function initSchema(db: Database.Database): void {
     console.error("Migration backfill_agents_org_nr_from_tags_v1 failed:", err);
   }
 
+  // ─── Slice 1 of dev-request 2026-07-03-agent-profile-conversations-stats ──
+  // contact_clicks: intent-tracking for mailto:/tel: clicks (POST beacon)
+  // and website/social-link clicks (GET /ut/:agentId/:kind counting
+  // redirect). Purely additive — brand-new table, nothing existing reads or
+  // writes it yet (frontend wiring + owner-dashboard UI are later slices).
+  // Same idiom as the other new-table blocks above (products/carts/orders):
+  // a plain `CREATE TABLE IF NOT EXISTS` is itself the safe migration for a
+  // never-existed-before table, so no `migrations`-table guard is needed —
+  // that guard is only for statements that mutate ALREADY-DEPLOYED rows
+  // (ALTERs, backfills), which this isn't.
+  //
+  //   agent_id   : which agent's profile the click happened on. No FK/
+  //                REFERENCES — same convention as analytics_agent_views —
+  //                so click history survives an agent later being deleted
+  //                or blocklisted.
+  //   kind       : 'email' | 'phone' | 'website' | 'external:<type>' where
+  //                <type> mirrors agent_knowledge.external_links[].type
+  //                (e.g. 'external:facebook'). Never a URL — see
+  //                routes/contact-tracking.ts for why that matters (the
+  //                open-redirect guard on GET /ut/:agentId/:kind).
+  //   session_id : "<ipHash>:<userAgent>", identical shape to
+  //                analytics_page_views.session_id (reuses
+  //                analyticsService.getOrCreateSessionId — same privacy
+  //                posture: hashed IP via crypto.sha256, never a raw IP).
+  //   is_bot     : 1 iff parseUserAgent(ua).isBot from analytics-service.ts
+  //                (exported for reuse so this doesn't drift from the bot
+  //                heuristic used everywhere else in the codebase).
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS contact_clicks (
+      id         INTEGER PRIMARY KEY AUTOINCREMENT,
+      agent_id   TEXT NOT NULL,
+      kind       TEXT NOT NULL,
+      session_id TEXT,
+      is_bot     INTEGER NOT NULL DEFAULT 0,
+      created_at TEXT NOT NULL DEFAULT (datetime('now'))
+    )
+  `);
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_contact_clicks_agent_id ON contact_clicks(agent_id)`);
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_contact_clicks_created_at ON contact_clicks(created_at)`);
+
 }
 
 export function closeDb(): void {
