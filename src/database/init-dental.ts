@@ -300,5 +300,35 @@ export function initDentalSchema(db: Database.Database): void {
     console.warn("[init-dental] PR-130 rating index warning:", err);
   }
 
+  // ─── dev-request 2026-07-03-places-api-cost-reduction, measure 1 ──────────
+  //   Phase-2G no-retry marker — stops the same never-matching records from
+  //   being re-sent to Google Places every cycle (was ~600+ wasted calls/mo).
+  //   - places_attempted_at TEXT   ISO timestamp of the last real Places
+  //                                lookup for this row (matched OR
+  //                                no-confident-match; NEVER set on a
+  //                                transport error — see safety note in the
+  //                                dev-request, a transient 429/5xx/timeout
+  //                                must not permanently starve a record).
+  //   - places_match_status TEXT   'matched' | 'no_match' — informational.
+  const placesAttemptCols: Array<{ name: string; sql: string }> = [
+    { name: "places_attempted_at", sql: "ALTER TABLE dental_agents ADD COLUMN places_attempted_at TEXT" },
+    { name: "places_match_status", sql: "ALTER TABLE dental_agents ADD COLUMN places_match_status TEXT" },
+  ];
+  for (const { name, sql } of placesAttemptCols) {
+    try {
+      db.exec(sql);
+      console.log(`[init-dental] added column ${name}`);
+    } catch (err: any) {
+      if (!String(err.message ?? err).includes("duplicate column name")) throw err;
+    }
+  }
+  try {
+    db.exec(
+      "CREATE INDEX IF NOT EXISTS idx_dental_places_attempted ON dental_agents (places_attempted_at)"
+    );
+  } catch (err) {
+    console.warn("[init-dental] places_attempted_at index warning:", err);
+  }
+
   console.log("[dental] schema initialized");
 }

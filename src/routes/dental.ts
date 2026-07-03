@@ -554,6 +554,14 @@ function isEmptyCol(v: string | null | undefined): boolean {
   return v === null || v === undefined || String(v).trim() === "";
 }
 
+// ─── dev-request 2026-07-03-places-api-cost-reduction, measure 1 ───────────
+// No-retry window for the auto-select pool: a record that already got a real
+// Places lookup (matched OR confidently no-matched) is excluded from
+// auto-select for this many days. A transport failure (api_error) never sets
+// the marker, so it stays eligible next cycle — only a genuine Google answer
+// starves the retry clock.
+const PLACES_NO_RETRY_DAYS = 90;
+
 router.post(
   "/admin/google-places-batch",
   requireAdmin,
@@ -586,6 +594,18 @@ router.post(
 
     const db = getDb("dental");
 
+    // Marks a row as having had a real Places attempt (matched or a
+    // confident no-match) — starts its 90-day no-retry window. Callers MUST
+    // NOT call this for a transport failure (api_error): only a genuine
+    // Google answer should starve the retry clock, per the dev-request's
+    // safety note.
+    function markPlacesAttempt(id: string, status: "matched" | "no_match"): void {
+      if (!write) return; // dry-run: decision-only, no DB write
+      db.prepare(
+        `UPDATE dental_agents SET places_attempted_at = ?, places_match_status = ? WHERE id = ?`
+      ).run(new Date().toISOString(), status, id);
+    }
+
     // ── Selection ──────────────────────────────────────────────────────
     let rows: PlacesAgentRow[];
     if (Array.isArray(body.agentIds) && body.agentIds.length > 0) {
@@ -617,6 +637,10 @@ router.post(
                  OR telefon    IS NULL OR telefon    = ''
                  OR opening_hours IS NULL OR opening_hours = ''
               )
+              AND (
+                    places_attempted_at IS NULL
+                 OR places_attempted_at < datetime('now', '-${PLACES_NO_RETRY_DAYS} days')
+              )
             ORDER BY
               CASE WHEN hjemmeside IS NULL OR hjemmeside = '' THEN 0 ELSE 1 END ASC,
               CASE WHEN (adresse IS NULL OR adresse = '')
@@ -626,6 +650,26 @@ router.post(
             LIMIT ?`
         )
         .all(limit) as PlacesAgentRow[];
+    }
+
+    // Pool-empty short-circuit (auto-select mode only): every eligible record
+    // has already had a real Places attempt within the no-retry window — skip
+    // the Google call entirely rather than re-querying nothing-new.
+    if (rows.length === 0) {
+      res.json({
+        success: true,
+        data: {
+          processed: 0,
+          matched: 0,
+          no_match: 0,
+          homepages_backfilled: 0,
+          by_field: { hjemmeside: 0, adresse: 0, telefon: 0, opening_hours: 0 },
+          write,
+          results: [],
+          pool_empty: true,
+        },
+      });
+      return;
     }
 
     const results: Array<{
@@ -697,6 +741,7 @@ router.post(
       }
 
       if (!place) {
+        markPlacesAttempt(row.id, "no_match");
         results.push({
           agentId: row.id,
           navn: row.navn,
@@ -717,6 +762,7 @@ router.post(
       );
       if (!confident) {
         no_match++;
+        markPlacesAttempt(row.id, "no_match");
         results.push({
           agentId: row.id,
           navn: row.navn,
@@ -731,6 +777,7 @@ router.post(
 
       // ── Confident match — compute FILL-ONLY column writes ────────────
       matched++;
+      markPlacesAttempt(row.id, "matched");
       const nowIso = new Date().toISOString();
       const patch: Record<string, unknown> = {};
       const fields_written: string[] = [];
