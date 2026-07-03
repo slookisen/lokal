@@ -1156,6 +1156,85 @@ function initSchema(db: Database.Database): void {
     console.error("Migration backfill_marketing_sends_to_sent_log_v1 failed:", err);
   }
 
+  // ─── v2: reclassify contacts via agent_knowledge.email + backfill sent log ─
+  //
+  // PROBLEM: classifyEmail() only matched agents.contact_email. Marketing's
+  // real outreach recipient is agent_knowledge.email, which is frequently a
+  // different (often personal) address. Contacts stuck at type='unknown' with
+  // agent_id IS NULL never satisfy the PR-38 trigger's agent_id IS NOT NULL
+  // guard, so their sends never landed in outreach_sent_log and they kept
+  // reappearing in the outreach_ready_pool candidate list (confirmed live:
+  // Olestølen Mikroysteri, agent_id 53c171e2-3b18-4486-bd82-5d7c9938c789,
+  // recontacted 3 consecutive days 2026-07-01..2026-07-03 despite already
+  // having been sent to on 2026-07-01).
+  //
+  // Step 1: reclassify existing unknown/unlinked crm_contacts by matching
+  // their email against agent_knowledge.email (exact match only — see
+  // classifyEmail() 1b for why domain-matching this column would be wrong).
+  // Step 2: re-run the PR-38-style backfill so any marketing sends that were
+  // stuck behind the unresolved agent_id now get logged into
+  // outreach_sent_log, retroactively suppressing those producers from the
+  // pool.
+  //
+  // Guarded by the migrations table — runs exactly once per DB file.
+  try {
+    const alreadyRanReclassify = db.prepare(
+      "SELECT 1 FROM migrations WHERE name = 'reclassify_contacts_and_backfill_sent_log_v2_agent_knowledge_email'"
+    ).get();
+    if (!alreadyRanReclassify) {
+      const reclassifyResult = db.prepare(`
+        UPDATE crm_contacts
+        SET type = 'producer',
+            agent_id = (
+              SELECT a.id
+              FROM agent_knowledge k
+              JOIN agents a ON a.id = k.agent_id
+              WHERE LOWER(k.email) = crm_contacts.email
+                AND a.is_active = 1
+              LIMIT 1
+            )
+        WHERE type = 'unknown'
+          AND agent_id IS NULL
+          AND EXISTS (
+            SELECT 1
+            FROM agent_knowledge k
+            JOIN agents a ON a.id = k.agent_id
+            WHERE LOWER(k.email) = crm_contacts.email
+              AND a.is_active = 1
+          )
+      `).run();
+      if (reclassifyResult.changes > 0) {
+        console.log(`[v2] Migration reclassify_contacts_and_backfill_sent_log_v2_agent_knowledge_email: reclassified ${reclassifyResult.changes} crm_contacts row(s) to producer via agent_knowledge.email`);
+      }
+
+      const backfillKnowledgeResult = db.prepare(`
+        INSERT INTO outreach_sent_log (agent_id, sent_at, channel, message_id, notes)
+        SELECT cc.agent_id,
+               COALESCE(m.sent_at, datetime('now')),
+               'email',
+               m.id,
+               'backfill:marketing_crm_send_agent_knowledge_email_v1'
+        FROM crm_messages m
+        JOIN crm_threads ct ON ct.id = m.thread_id
+        JOIN crm_contacts cc ON cc.id = ct.contact_id
+        WHERE m.direction = 'out'
+          AND m.delivery_status = 'sent'
+          AND ct.id LIKE 'marketing-batch-%'
+          AND cc.agent_id IS NOT NULL
+          AND NOT EXISTS (
+            SELECT 1 FROM outreach_sent_log o WHERE o.message_id = m.id
+          )
+      `).run();
+      if (backfillKnowledgeResult.changes > 0) {
+        console.log(`[v2] Migration reclassify_contacts_and_backfill_sent_log_v2_agent_knowledge_email: inserted ${backfillKnowledgeResult.changes} row(s) into outreach_sent_log`);
+      }
+
+      db.prepare("INSERT INTO migrations (name) VALUES ('reclassify_contacts_and_backfill_sent_log_v2_agent_knowledge_email')").run();
+    }
+  } catch (err) {
+    console.error("Migration reclassify_contacts_and_backfill_sent_log_v2_agent_knowledge_email failed:", err);
+  }
+
 
   // outreach_ready_pool VIEW — the list marketing will read once
   // WO #9 switches over. Filtered by:

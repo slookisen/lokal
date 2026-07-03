@@ -97,6 +97,18 @@ class CrmService {
       .get(lowerEmail) as { id: string } | undefined;
     if (exact) return { type: "producer", agentId: exact.id };
 
+    // 1b. Exact match on agent_knowledge.email — this is the address marketing
+    // actually sends outreach to, and it's often different from agents.contact_email
+    // (e.g. a personal Gmail). Without this tier the contact never gets an agent_id,
+    // and the outreach_sent_log auto-record trigger (PR-38) silently no-ops on its
+    // agent_id IS NOT NULL guard, so the producer keeps reappearing in the pool.
+    const exactKnowledge = db
+      .prepare(
+        "SELECT a.id FROM agent_knowledge k JOIN agents a ON a.id = k.agent_id WHERE LOWER(k.email) = ? AND a.is_active = 1 LIMIT 1"
+      )
+      .get(lowerEmail) as { id: string } | undefined;
+    if (exactKnowledge) return { type: "producer", agentId: exactKnowledge.id };
+
     // 2. Domain match (skip generic freemail domains so we don't false-positive)
     const FREEMAIL = new Set(["gmail.com", "outlook.com", "hotmail.com", "yahoo.com", "live.com", "icloud.com", "online.no", "broadpark.no"]);
     if (domain && !FREEMAIL.has(domain)) {
