@@ -39,6 +39,7 @@ import {
   type PlacesPlace,
 } from "../services/dental-places";
 import { nameSimilarity } from "../services/name-matcher";
+import { logPlacesCall } from "../services/places-usage-tracker";
 
 const router = Router();
 
@@ -667,6 +668,7 @@ router.post(
           write,
           results: [],
           pool_empty: true,
+          places_calls: 0,
         },
       });
       return;
@@ -686,6 +688,7 @@ router.post(
     let matched = 0;
     let no_match = 0;
     let homepages_backfilled = 0;
+    let placesCallsThisRun = 0;
     const by_field = { hjemmeside: 0, adresse: 0, telefon: 0, opening_hours: 0 };
 
     for (let i = 0; i < rows.length; i++) {
@@ -703,6 +706,8 @@ router.post(
 
       let place: PlacesPlace | undefined;
       try {
+        placesCallsThisRun++;
+        logPlacesCall(db, "dental", "google-places-batch", "text_search_enterprise");
         const resp = await fetch(
           "https://places.googleapis.com/v1/places:searchText",
           {
@@ -906,6 +911,7 @@ router.post(
         by_field,
         write,
         results,
+        places_calls: placesCallsThisRun,
       },
     });
   }

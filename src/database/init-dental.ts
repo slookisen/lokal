@@ -180,6 +180,24 @@ export function initDentalSchema(db: Database.Database): void {
     console.log(`[dental] dental_exclusions init skipped: ${(e as Error).message}`);
   }
 
+  // dev-request 2026-07-03-places-api-cost-reduction, measure 2: shared-shape
+  // call-usage log (same schema as the rfb copy in src/database/init.ts —
+  // physically separate DB files, aggregated at read-time). Observability
+  // only.
+  try {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS places_api_call_log (
+        id         INTEGER PRIMARY KEY AUTOINCREMENT,
+        vertical   TEXT NOT NULL,
+        endpoint   TEXT NOT NULL,
+        sku        TEXT NOT NULL,
+        called_at  TEXT NOT NULL DEFAULT (datetime('now'))
+      );
+    `);
+  } catch (e) {
+    console.log(`[dental] places_api_call_log init skipped: ${(e as Error).message}`);
+  }
+
   // Indexes — wrapped in try/catch so re-deploy is safe
   const indexes = [
     "CREATE INDEX IF NOT EXISTS idx_dental_org_nr ON dental_agents(org_nr)",
@@ -192,6 +210,7 @@ export function initDentalSchema(db: Database.Database): void {
     "CREATE INDEX IF NOT EXISTS idx_excl_orgnr ON dental_exclusions(org_nr)",
     "CREATE INDEX IF NOT EXISTS idx_excl_url ON dental_exclusions(hjemmeside_url)",
     "CREATE INDEX IF NOT EXISTS idx_excl_reason ON dental_exclusions(reason)",
+    "CREATE INDEX IF NOT EXISTS idx_places_api_call_log_called_at ON places_api_call_log(called_at)",
   ];
   for (const stmt of indexes) {
     try {
