@@ -1692,13 +1692,68 @@ router.post("/admin/google-rating-batch", async (req: Request, res: Response) =>
   // homepage) on address/phone, recovering agents stuck at source_count=1
   // in `review_required`. Behaviour without the flag is unchanged.
   const wantAddrPhone = include_address_phone === true;
-  const fieldMask = wantAddrPhone
+
+  // ── Measure 2 of dev-request 2026-07-03-places-api-cost-reduction ──────
+  // SKU field-splitting: Places API (New) Text Search bills the ENTIRE call
+  // at Enterprise-tier pricing (1,000 free calls/mo) the moment ANY
+  // Enterprise-tier field (rating, userRatingCount, websiteUri,
+  // internationalPhoneNumber) appears in the FieldMask — regardless of how
+  // many Essentials/Pro fields ride along. Recurring runs of this batch were
+  // requesting rating+userRatingCount(+internationalPhoneNumber) for every
+  // agent on every run, including agents that already have a rating on file,
+  // pushing volume straight into the Enterprise SKU (kr 386/mo, see
+  // dev-requests/2026-07-03-places-api-cost-reduction.md).
+  //
+  // Fix: an agent's Enterprise-tier fields get requested AT MOST ONCE
+  // (first enrichment / new-agent intake). Once an agent already has a
+  // rating on file, or has previously had an Enterprise-tier fetch attempt
+  // recorded (google_enterprise_fetched_at — covers the genuine
+  // "searched, no rating found" case too, so it isn't retried forever),
+  // subsequent runs use an Essentials/Pro-tier-only mask for that agent —
+  // or skip the Google call entirely when there's nothing left to fetch
+  // (no address/phone backfill requested either).
+  //
+  // Full/first-time field masks — UNCHANGED from pre-existing behavior.
+  const enterpriseFieldMask = wantAddrPhone
     ? "places.id,places.rating,places.userRatingCount,places.displayName,places.formattedAddress,places.internationalPhoneNumber"
     : "places.rating,places.userRatingCount,places.displayName";
+  // Repeat-run field mask — Essentials/Pro tier only (no rating,
+  // userRatingCount, or internationalPhoneNumber). formattedAddress is
+  // Pro-tier and still useful for the PR-82 address backfill below; phone
+  // backfill for these agents runs through the PR-29 Place Details (New)
+  // fallback instead, which is a separate (non-Enterprise) SKU.
+  const proFieldMask = "places.id,places.displayName,places.formattedAddress";
 
   const batch = agentIds.slice(0, 50); // Max 50 per request
   const results: any[] = [];
   let enriched = 0;
+  let enterpriseCalls = 0; // Text Search calls made with the Enterprise-tier mask
+  let proCalls = 0;        // Text Search calls made with the Essentials/Pro-only mask
+
+  // Look up existing Enterprise-tier state for the whole batch in one query
+  // (rather than per-agent) so we know, before making any call, which agents
+  // already have a rating or a recorded prior Enterprise-tier fetch attempt.
+  // Best-effort: if this lookup fails for any reason, we fail OPEN to the
+  // pre-existing behavior (treat as no prior enterprise data) rather than
+  // silently starving a new agent of its one-time enterprise fetch.
+  const enterpriseState = new Map<string, { hasEnterpriseData: boolean; existingRating: number | null; existingReviewCount: number | null }>();
+  try {
+    const db0 = getDb();
+    const placeholders = batch.map(() => "?").join(",");
+    const rows = db0
+      .prepare(`SELECT agent_id, google_rating, google_review_count, google_enterprise_fetched_at FROM agent_knowledge WHERE agent_id IN (${placeholders})`)
+      .all(...batch) as Array<{ agent_id: string; google_rating: number | null; google_review_count: number | null; google_enterprise_fetched_at: string | null }>;
+    for (const r of rows) {
+      enterpriseState.set(r.agent_id, {
+        hasEnterpriseData: r.google_rating != null || !!r.google_enterprise_fetched_at,
+        existingRating: r.google_rating ?? null,
+        existingReviewCount: r.google_review_count ?? null,
+      });
+    }
+  } catch {
+    // Lookup failed — enterpriseState stays empty, every agent below falls
+    // back to "no prior enterprise data" (the safe, pre-existing behavior).
+  }
 
   // PR-29 v3: compute effective Details-call cap for this run.
   // Caller may pass max_details_calls to tighten the cap (e.g. for testing or
@@ -1710,14 +1765,56 @@ router.post("/admin/google-rating-batch", async (req: Request, res: Response) =>
       : MAX_DETAILS_CALLS_PER_RUN;
   let detailsCalls = 0;
 
+  // Records "we already spent this agent's one-time Enterprise-tier Places
+  // Text Search call" — an UPSERT because a brand-new agent may not have an
+  // agent_knowledge row yet (upsertKnowledge() only creates one when a
+  // rating is actually found). Best-effort/non-blocking: a failure here must
+  // never fail the request — worst case the agent's Enterprise fields get
+  // requested again on a future run, which is the pre-existing behavior.
+  const markEnterpriseFetched = (agentId: string): void => {
+    try {
+      getDb()
+        .prepare(`
+          INSERT INTO agent_knowledge (agent_id, google_enterprise_fetched_at)
+          VALUES (?, ?)
+          ON CONFLICT(agent_id) DO UPDATE SET google_enterprise_fetched_at = excluded.google_enterprise_fetched_at
+        `)
+        .run(agentId, new Date().toISOString());
+    } catch {
+      // Best-effort marker write — must never fail the request.
+    }
+  };
+
   for (const agentId of batch) {
     const info = knowledgeService.getAgentInfo(agentId);
     if (!info) { results.push({ agentId, status: "not_found" }); continue; }
+
+    const state = enterpriseState.get(agentId);
+    const hasEnterpriseData = state?.hasEnterpriseData === true;
+    const requestEnterprise = !hasEnterpriseData;
+
+    // Nothing left to do for this agent this run: it already has its
+    // one-time Enterprise-tier fetch, and the caller isn't asking for
+    // address/phone backfill either — skip the Google call entirely.
+    if (!requestEnterprise && !wantAddrPhone) {
+      results.push({
+        agentId,
+        name: info.agent.name,
+        status: "skipped_has_rating",
+        googleRating: state?.existingRating ?? undefined,
+        googleReviewCount: state?.existingReviewCount ?? undefined,
+      });
+      continue;
+    }
+
+    const fieldMask = requestEnterprise ? enterpriseFieldMask : proFieldMask;
 
     const city = (info.agent as any).city || "";
     const searchQuery = `${info.agent.name} ${city} Norway`.replace(/\s*[—–-]\s*/g, " ").trim();
 
     try {
+      if (requestEnterprise) enterpriseCalls++; else proCalls++;
+
       const resp = await fetch("https://places.googleapis.com/v1/places:searchText", {
         method: "POST",
         headers: {
@@ -1733,18 +1830,45 @@ router.post("/admin/google-rating-batch", async (req: Request, res: Response) =>
       const data = await resp.json() as any;
       const place = (data.places || [])[0];
 
-      if (!place?.rating) {
-        results.push({ agentId, name: info.agent.name, status: "no_rating" });
-        continue;
-      }
+      if (requestEnterprise) {
+        if (!place?.rating) {
+          results.push({ agentId, name: info.agent.name, status: "no_rating" });
+          // A completed (resp.ok) request with a genuine no-match/no-rating
+          // result — record the one-time Enterprise-tier attempt so this
+          // agent isn't re-sent with the Enterprise mask on the next run.
+          // Never marked on transport errors (handled by the `!resp.ok`
+          // branch above, which continues before reaching here) — only on
+          // an actual completed answer from Google.
+          markEnterpriseFetched(agentId);
+          continue;
+        }
 
-      knowledgeService.upsertKnowledge(agentId, {
-        googleRating: place.rating,
-        googleReviewCount: place.userRatingCount || 0,
-        dataSource: "auto",
-      } as any);
-      trustScoreService.update(agentId);
-      enriched++;
+        knowledgeService.upsertKnowledge(agentId, {
+          googleRating: place.rating,
+          googleReviewCount: place.userRatingCount || 0,
+          dataSource: "auto",
+        } as any);
+        trustScoreService.update(agentId);
+        enriched++;
+
+        // Record the one-time Enterprise-tier fetch (best-effort, non-blocking).
+        markEnterpriseFetched(agentId);
+      } else {
+        // Repeat run, agent already has Enterprise-tier data: no rating
+        // fields were requested, so `place.rating`/`place.userRatingCount`
+        // are never populated here. Only address (Pro-tier, via
+        // formattedAddress) may have come back for the PR-82 backfill below.
+        if (!place) {
+          results.push({
+            agentId,
+            name: info.agent.name,
+            status: "skipped_has_rating",
+            googleRating: state?.existingRating ?? undefined,
+            googleReviewCount: state?.existingReviewCount ?? undefined,
+          });
+          continue;
+        }
+      }
 
       // ── PR-29 v3: Place Details (New) fallback for missing address/phone ──
       // Proto3 omits empty scalars, so Text Search may return no formattedAddress
@@ -1859,8 +1983,8 @@ router.post("/admin/google-rating-batch", async (req: Request, res: Response) =>
             agentId,
             name: info.agent.name,
             status: "enriched_provenance_error",
-            googleRating: place.rating,
-            googleReviewCount: place.userRatingCount || 0,
+            googleRating: requestEnterprise ? place.rating : (state?.existingRating ?? undefined),
+            googleReviewCount: requestEnterprise ? (place.userRatingCount || 0) : (state?.existingReviewCount ?? undefined),
             addressWritten: false,
             phoneWritten: false,
             provenanceError: provErr?.message ?? String(provErr),
@@ -1874,9 +1998,9 @@ router.post("/admin/google-rating-batch", async (req: Request, res: Response) =>
       results.push({
         agentId,
         name: info.agent.name,
-        status: "enriched",
-        googleRating: place.rating,
-        googleReviewCount: place.userRatingCount || 0,
+        status: requestEnterprise ? "enriched" : "enriched_addr_phone_only",
+        googleRating: requestEnterprise ? place.rating : (state?.existingRating ?? undefined),
+        googleReviewCount: requestEnterprise ? (place.userRatingCount || 0) : (state?.existingReviewCount ?? undefined),
         ...(wantAddrPhone ? { addressWritten, phoneWritten } : {}),
       });
 
@@ -1890,7 +2014,19 @@ router.post("/admin/google-rating-batch", async (req: Request, res: Response) =>
   res.json({
     success: true,
     message: `Google-rating hentet for ${enriched} av ${batch.length} agenter`,
-    data: { enriched, total: batch.length, results },
+    data: {
+      enriched,
+      total: batch.length,
+      results,
+      // Measure 2 of dev-request 2026-07-03-places-api-cost-reduction: per-run
+      // Places API call counter, split by SKU tier, so the RFB enrichment
+      // SKILL / daily brief can track projected monthly Enterprise-SKU usage
+      // against the 1,000 free-calls/mo cap without parsing `results`.
+      places_api_calls: enterpriseCalls + proCalls,
+      enterprise_calls: enterpriseCalls,
+      pro_calls: proCalls,
+      details_calls: detailsCalls,
+    },
   });
 });
 

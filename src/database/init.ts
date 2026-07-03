@@ -2377,6 +2377,26 @@ function initSchema(db: Database.Database): void {
   db.exec(`CREATE INDEX IF NOT EXISTS idx_contact_clicks_agent_id ON contact_clicks(agent_id)`);
   db.exec(`CREATE INDEX IF NOT EXISTS idx_contact_clicks_created_at ON contact_clicks(created_at)`);
 
+  // ─── Measure 2 of dev-request 2026-07-03-places-api-cost-reduction ──────
+  // (SKU field-splitting, RFB google-rating-batch): Places API (New) Text
+  // Search bills the whole call at Enterprise-tier pricing (1k free calls/mo)
+  // the moment ANY Enterprise-tier field (rating, userRatingCount, websiteUri,
+  // internationalPhoneNumber) is in the FieldMask — even if most of the mask
+  // is Essentials/Pro tier. `google_rating`/`google_review_count` already
+  // exist and cover the common case (agent has been rated before), but an
+  // agent that was searched and got a genuine "no match"/"no rating" result
+  // has no rating column to key off — without a separate marker it would be
+  // re-sent with the full Enterprise mask on every single recurring run
+  // forever. `google_enterprise_fetched_at` records "we already spent one
+  // Enterprise-tier Places Text Search call on this agent" independent of
+  // whether that call found a rating, so routes/marketplace.ts can drop
+  // straight to an Essentials/Pro-only mask for repeat runs either way.
+  // Additive, nullable, idempotent — same defensive try/catch ALTER idiom as
+  // the org_nr/debio_verified/brreg_* migrations above.
+  try {
+    db.exec(`ALTER TABLE agent_knowledge ADD COLUMN google_enterprise_fetched_at TEXT`);
+  } catch { /* already exists — expected on subsequent boots */ }
+
 }
 
 export function closeDb(): void {
