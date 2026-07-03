@@ -534,8 +534,29 @@ const OpeningHoursArraySchema = z.array(
   })
 );
 
-const PLACES_FIELD_MASK =
+// ─── dev-request 2026-07-03-places-api-cost-reduction, measure 2 ───────────
+// SKU field-splitting: Places API (New) Text Search bills the ENTIRE call at
+// Enterprise-tier pricing (1,000 free calls/mo) the moment ANY Enterprise-tier
+// field (rating, userRatingCount, websiteUri, internationalPhoneNumber)
+// appears in the FieldMask — regardless of how many Essentials/Pro fields
+// ride along. This endpoint requests websiteUri (→ hjemmeside) and
+// internationalPhoneNumber (→ telefon), both Enterprise-tier, on every call —
+// including for clinics that already have both columns filled, where a
+// fill-only write policy means those two fields are looked up only to be
+// thrown away.
+//
+// Fix: request the Enterprise-tier fields only while a clinic still has an
+// empty hjemmeside OR telefon (there is something to gain from them). Once
+// both are filled, use a Pro-tier-only mask (formattedAddress,
+// regularOpeningHours, businessStatus, addressComponents — no websiteUri, no
+// internationalPhoneNumber) for that clinic's request instead. No new column
+// needed: fill-only semantics mean "already filled" IS the durable marker,
+// unlike the RFB rating-batch (measure 2, RFB slice) where a rating can
+// legitimately not exist yet at all.
+const PLACES_ENTERPRISE_FIELD_MASK =
   "places.displayName,places.formattedAddress,places.internationalPhoneNumber,places.websiteUri,places.regularOpeningHours,places.businessStatus,places.addressComponents";
+const PLACES_PRO_FIELD_MASK =
+  "places.displayName,places.formattedAddress,places.regularOpeningHours,places.businessStatus,places.addressComponents";
 
 interface PlacesAgentRow {
   id: string;
@@ -667,6 +688,9 @@ router.post(
           write,
           results: [],
           pool_empty: true,
+          places_api_calls: 0,
+          enterprise_calls: 0,
+          pro_calls: 0,
         },
       });
       return;
@@ -687,6 +711,8 @@ router.post(
     let no_match = 0;
     let homepages_backfilled = 0;
     const by_field = { hjemmeside: 0, adresse: 0, telefon: 0, opening_hours: 0 };
+    let enterpriseCalls = 0; // calls made with the Enterprise-tier mask
+    let proCalls = 0;        // calls made with the Essentials/Pro-only mask
 
     for (let i = 0; i < rows.length; i++) {
       const row = rows[i];
@@ -701,6 +727,14 @@ router.post(
         .replace(/\s+/g, " ")
         .trim();
 
+      // Measure 2: only pay for Enterprise-tier fields while there's a
+      // fill-only gain to be had from them (hjemmeside/telefon still empty).
+      const needsEnterprise = isEmptyCol(row.hjemmeside) || isEmptyCol(row.telefon);
+      const fieldMask = needsEnterprise
+        ? PLACES_ENTERPRISE_FIELD_MASK
+        : PLACES_PRO_FIELD_MASK;
+      if (needsEnterprise) enterpriseCalls++; else proCalls++;
+
       let place: PlacesPlace | undefined;
       try {
         const resp = await fetch(
@@ -710,7 +744,7 @@ router.post(
             headers: {
               "Content-Type": "application/json",
               "X-Goog-Api-Key": placesKey,
-              "X-Goog-FieldMask": PLACES_FIELD_MASK,
+              "X-Goog-FieldMask": fieldMask,
             },
             body: JSON.stringify({ textQuery: query, languageCode: "no" }),
           }
@@ -906,6 +940,9 @@ router.post(
         by_field,
         write,
         results,
+        places_api_calls: enterpriseCalls + proCalls,
+        enterprise_calls: enterpriseCalls,
+        pro_calls: proCalls,
       },
     });
   }
