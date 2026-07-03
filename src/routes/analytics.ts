@@ -861,14 +861,12 @@ router.post("/ops/tasks-prune", (req: Request, res: Response) => {
     const daysToKeep = Math.max(7, parseInt(req.body.daysToKeep) || 30);
     const cutoff = sqliteDatetime(new Date(Date.now() - daysToKeep * 24 * 60 * 60 * 1000));
 
-    const eligible = db.prepare(
-      "SELECT COUNT(*) as c, SUM(LENGTH(COALESCE(params,'')) + LENGTH(COALESCE(result,''))) as bytes " +
-      "FROM tasks WHERE status IN ('completed','failed','canceled') AND created_at < ?"
-    ).get(cutoff) as any;
-
-    const totalRows = (db.prepare("SELECT COUNT(*) as c FROM tasks").get() as any).c;
-
     if (dryRun) {
+      const eligible = db.prepare(
+        "SELECT COUNT(*) as c, SUM(LENGTH(COALESCE(params,'')) + LENGTH(COALESCE(result,'')) + LENGTH(COALESCE(error,''))) as bytes " +
+        "FROM tasks WHERE status IN ('completed','failed','canceled') AND created_at < ?"
+      ).get(cutoff) as any;
+      const totalRows = (db.prepare("SELECT COUNT(*) as c FROM tasks").get() as any).c;
       return res.json({
         success: true,
         action: "tasks-prune-dry-run",
