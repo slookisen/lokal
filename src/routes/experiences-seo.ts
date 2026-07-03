@@ -23,7 +23,8 @@
  * src/index.ts, so rettfrabonden.com and finn-tannlege.com never reach it.
  */
 
-import { Router, Request, Response, NextFunction } from "express";
+import express, { Router, Request, Response, NextFunction } from "express";
+import * as QRCode from "qrcode";
 import { getExperiencesAgentCard } from "../services/experiences-agent-card";
 import { getExperiencesOpenapi } from "../services/experiences-openapi";
 import { htmlLangAttr, ogLocale, type Lang } from "../i18n/t";
@@ -42,6 +43,7 @@ import {
   countGardssalgProviders,
   getPublishedProviderById,
   getPublishedProviderBySlug,
+  getGardssalgProviderBySlug,
   backfillProviderSlugs,
   searchPublishedExperiences,
   listGardssalgProviders,
@@ -49,6 +51,12 @@ import {
   type ExperienceCardRow,
   type GardssalgProviderRow,
 } from "../services/experience-store";
+import {
+  createBooking,
+  getBookingByRef,
+  BookingInputSchema,
+  sendBookingConfirmation,
+} from "../services/booking-store";
 
 const router = Router();
 
@@ -1739,6 +1747,26 @@ router.get("/opplevelser", (req: Request, res: Response) => {
   res.send(html);
 });
 
+// Drink-type badge for a gårdssalg provider card — hoisted to module scope
+// (was a closure inside the /kategori/gardssalg handler) so the booking panel
+// route below can render the same badge.
+function drinkBadge(producerType: string | null): string {
+  const map: Record<string, { label: string; color: string }> = {
+    bryggeri:   { label: "Bryggeri",  color: "#c58a2a" },
+    cideri:     { label: "Sider",     color: "#4a8c3f" },
+    sideri:     { label: "Sider",     color: "#4a8c3f" },
+    mjøderi:    { label: "Mjød",      color: "#7c5cbb" },
+    vingård:    { label: "Fruktvin",  color: "#c0577c" },
+    destilleri: { label: "Destillat", color: "#6c6c6c" },
+    seltzeri:   { label: "Kombucha",  color: "#2a7d9c" },
+  };
+  const entry = producerType ? map[producerType.toLowerCase()] : null;
+  if (!entry) return "";
+  return `<span style="display:inline-block;font-size:.72rem;font-weight:700;letter-spacing:.04em;
+    text-transform:uppercase;padding:2px 8px;border-radius:4px;
+    background:${entry.color}1a;color:${entry.color};border:1px solid ${entry.color}44">${entry.label}</span>`;
+}
+
 // ─── GET /kategori/gardssalg — Gårdssalg & smaking provider catalog ──────────
 // Gardssalg shows experience_providers (drink producers), not experiences.
 // The generic /kategori/:category route queries the experiences table and returns
@@ -1750,31 +1778,23 @@ router.get("/kategori/gardssalg", (req: Request, res: Response) => {
   const providers = listGardssalgProviders(PAGE_SIZE, (page - 1) * PAGE_SIZE);
   const total = countGardssalgProviders();
 
-  function drinkBadge(producerType: string | null): string {
-    const map: Record<string, { label: string; color: string }> = {
-      bryggeri:   { label: "Bryggeri",  color: "#c58a2a" },
-      cideri:     { label: "Sider",     color: "#4a8c3f" },
-      sideri:     { label: "Sider",     color: "#4a8c3f" },
-      mjøderi:    { label: "Mjød",      color: "#7c5cbb" },
-      vingård:    { label: "Fruktvin",  color: "#c0577c" },
-      destilleri: { label: "Destillat", color: "#6c6c6c" },
-      seltzeri:   { label: "Kombucha",  color: "#2a7d9c" },
-    };
-    const entry = producerType ? map[producerType.toLowerCase()] : null;
-    if (!entry) return "";
-    return `<span style="display:inline-block;font-size:.72rem;font-weight:700;letter-spacing:.04em;
-      text-transform:uppercase;padding:2px 8px;border-radius:4px;
-      background:${entry.color}1a;color:${entry.color};border:1px solid ${entry.color}44">${entry.label}</span>`;
-  }
-
   function renderProviderCard(p: GardssalgProviderRow): string {
     const sted = [p.poststed ?? p.kommune ?? p.fylke].filter(Boolean).join(", ");
     const badge = drinkBadge(p.producer_type);
-    const nameHtml = p.slug
-      ? `<a href="/tilbyder/${encodeURIComponent(p.slug)}" style="color:inherit;font-weight:700;font-size:1rem;text-decoration:none">${escapeHtml(p.navn)}</a>`
+    // BEHAVIOR CHANGE (2026-07-02 gårdssalg-book fix): both the name link and
+    // the "Book besøk" CTA now point at the new SSR reservation panel
+    // (/kategori/gardssalg/book/<slug>) instead of /tilbyder/<slug>. The old
+    // /tilbyder/<slug> target 404'd for every gårdssalg provider — those rows
+    // have zero linked `experiences` rows, and getPublishedProviderBySlug()
+    // requires ≥1 published experience to exist. The CTA gate also changed
+    // from "has a hjemmeside URL" to "has a resolvable slug" (i.e. bookable),
+    // since bookability — not having a website — is what the button promises.
+    const bookHref = p.slug ? `/kategori/gardssalg/book/${encodeURIComponent(p.slug)}` : null;
+    const nameHtml = bookHref
+      ? `<a href="${bookHref}" style="color:inherit;font-weight:700;font-size:1rem;text-decoration:none">${escapeHtml(p.navn)}</a>`
       : `<span style="font-weight:700;font-size:1rem">${escapeHtml(p.navn)}</span>`;
-    const link = p.hjemmeside
-      ? `<a href="/tilbyder/${encodeURIComponent(p.slug ?? p.id)}" style="display:inline-block;margin-top:10px;padding:8px 16px;background:#0f5a50;color:#fff;border-radius:6px;font-size:.84rem;font-weight:600;text-decoration:none">Book besøk</a>`
+    const link = bookHref
+      ? `<a href="${bookHref}" style="display:inline-block;margin-top:10px;padding:8px 16px;background:#0f5a50;color:#fff;border-radius:6px;font-size:.84rem;font-weight:600;text-decoration:none">Book besøk</a>`
       : "";
     return `<article style="background:#fff;border-radius:12px;box-shadow:0 2px 8px rgba(0,0,0,.07);overflow:hidden;display:flex;flex-direction:column">
   <div style="padding:16px 16px 12px">
@@ -1853,6 +1873,339 @@ ${BROWSE_CSS}
   res.setHeader("Cache-Control", "public, max-age=300");
   res.send(html);
 });
+
+// ─── Gårdssalg reservation → confirmation journey (2026-07-02) ──────────────
+//
+// Fixes the live "Book besøk" 404: gårdssalg producers have zero rows in the
+// `experiences` table (their product is a gårdsbesøk booking, not a listed
+// "experience"), so /tilbyder/<slug> — which requires ≥1 published experience
+// — always 404'd for them. These three routes give the button a real
+// destination that resolves via getGardssalgProviderBySlug() (mirrors the
+// listGardssalgProviders() WHERE clause, not the experiences-join gate) and
+// carry the guest through reserve → confirm without duplicating the booking
+// business logic that already lives in POST /api/opplevelser/book:
+//
+//   GET  /kategori/gardssalg/book/:providerSlug               reservation panel
+//   POST /kategori/gardssalg/book/:providerSlug               no-JS fallback
+//   GET  /kategori/gardssalg/book/:providerSlug/confirm/:ref  confirmation + QR
+//
+// The panel's <form> is a real HTML POST (works with JS disabled); a small
+// inline <script> progressively enhances it to call the JSON API directly
+// with fetch() and skip the extra redirect round-trip. Both the JS path (the
+// existing POST /api/opplevelser/book handler) and the no-JS fallback below
+// call the exact same createBooking()/sendBookingConfirmation() functions
+// from ../services/booking-store — no business logic is duplicated.
+
+function bookingErrorMessage(code: string): string {
+  switch (code) {
+    case "invalid":
+      return "Sjekk at alle obligatoriske felt er fylt ut riktig (dato/tid, antall personer, navn og e-post), og prøv igjen.";
+    case "internal":
+      return "Noe gikk galt på våre servere. Prøv igjen om litt.";
+    default:
+      return "Noe gikk galt. Prøv igjen.";
+  }
+}
+
+// GET /kategori/gardssalg/book/:providerSlug — reservation panel for one
+// gårdssalg producer. 404s (via next()) if the slug doesn't resolve.
+router.get(
+  "/kategori/gardssalg/book/:providerSlug",
+  (req: Request, res: Response, next: NextFunction) => {
+    const slug = String(req.params.providerSlug || "");
+    if (!slug) return next();
+    ensureProviderSlugs();
+    let provider: GardssalgProviderRow | null = null;
+    try {
+      provider = getGardssalgProviderBySlug(slug);
+    } catch {
+      provider = null;
+    }
+    if (!provider) return next();
+
+    const sted = [provider.poststed, provider.kommune, provider.fylke].filter(Boolean).join(", ");
+    const badge = drinkBadge(provider.producer_type);
+    const url = baseUrl();
+    const canonical = `${url}/kategori/gardssalg/book/${encodeURIComponent(slug)}`;
+    const errorParam = String(req.query.error || "");
+    const errorBanner = errorParam
+      ? `<div role="alert" style="background:#fdecea;border:1px solid #f3b6ae;color:#8a2f24;padding:12px 16px;border-radius:8px;margin-bottom:16px;font-size:.9rem">${escapeHtml(bookingErrorMessage(errorParam))}</div>`
+      : "";
+
+    const html = `<!doctype html>
+<html lang="nb">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Book besøk hos ${escapeHtml(provider.navn)} | Opplevagent</title>
+<meta name="description" content="Reserver en smaking eller omvisning hos ${escapeHtml(provider.navn)}${sted ? " i " + escapeHtml(sted) : ""}. Ingen betaling nå — kun en reservasjon.">
+<meta name="robots" content="noindex, follow">
+<link rel="canonical" href="${canonical}">
+<style>
+${BROWSE_CSS}
+.book-panel{max-width:520px;margin:24px auto 0;background:var(--surface);border-radius:12px;box-shadow:0 2px 8px rgba(0,0,0,.07);padding:28px 24px}
+.book-panel h1{font-size:1.4rem;font-weight:800;color:var(--fjord-900);margin-bottom:4px}
+.book-panel .sted{font-size:.86rem;color:var(--mist);margin-bottom:10px}
+.book-panel .microcopy{font-size:.86rem;color:var(--ink-soft);background:var(--canvas-2);border-radius:8px;padding:10px 14px;margin:14px 0 18px}
+.book-form label{display:block;font-size:.84rem;font-weight:700;color:var(--ink-soft);margin:14px 0 5px}
+.book-form input{width:100%;padding:10px 12px;border:1px solid var(--line);border-radius:8px;font-size:.95rem;color:var(--ink);background:var(--surface)}
+.book-form input:focus-visible{outline:2px solid var(--teal-500);outline-offset:1px}
+.book-form button{margin-top:20px;width:100%;padding:12px 18px;background:var(--fjord-800);color:#fff;border:none;border-radius:8px;font-size:1rem;font-weight:700;cursor:pointer}
+.book-form button:hover{background:var(--fjord-700)}
+.book-form button:disabled{opacity:.6;cursor:default}
+.book-form .hint{font-size:.76rem;color:var(--mist);margin-top:8px;min-height:1em}
+</style>
+</head>
+<body>
+<a class="skip-link" href="#main">Hopp til innhold</a>
+<nav class="site-nav" aria-label="Navigasjon">
+  <div class="nav-inner">
+    <a class="brand" href="/"><span class="brand-word">opplevagent<span class="tld">.no</span></span></a>
+    <span class="nav-links"><a href="/opplevelser">Alle opplevelser</a><a href="/kategori/gardssalg">Gårdssalg</a></span>
+  </div>
+</nav>
+<main id="main" class="container">
+  <nav class="breadcrumb" aria-label="Brødsmulesti">
+    <a href="/">Forsiden</a> · <a href="/kategori/gardssalg">Gårdssalg og smaking</a> · ${escapeHtml(provider.navn)}
+  </nav>
+  <div class="book-panel">
+    ${errorBanner}
+    ${sted ? `<div class="sted">${escapeHtml(sted)}</div>` : ""}
+    <h1>${escapeHtml(provider.navn)}</h1>
+    ${badge}
+    <p class="microcopy">Du betaler ingenting nå — dette er en reservasjon.</p>
+    <form class="book-form" method="POST" action="${canonical}" id="book-form">
+      <input type="hidden" name="provider_id" value="${escapeHtml(provider.id)}">
+      <label for="slot_at">Dato og tid</label>
+      <input id="slot_at" name="slot_at" type="datetime-local" required>
+      <label for="party_size">Antall personer</label>
+      <input id="party_size" name="party_size" type="number" min="1" max="50" value="2" required>
+      <label for="guest_name">Navn</label>
+      <input id="guest_name" name="guest_name" type="text" maxlength="200" autocomplete="name" required>
+      <label for="guest_email">E-post</label>
+      <input id="guest_email" name="guest_email" type="email" autocomplete="email" required>
+      <label for="guest_phone">Telefon <span style="font-weight:400;color:var(--mist)">(valgfritt)</span></label>
+      <input id="guest_phone" name="guest_phone" type="tel" maxlength="30" autocomplete="tel">
+      <button type="submit">Reserver besøk</button>
+      <p class="hint" id="book-form-status" role="status" aria-live="polite"></p>
+    </form>
+  </div>
+</main>
+<footer style="margin-top:48px;padding:24px 0;border-top:1px solid #e4ded0;font-size:.8rem;color:#7a7163;text-align:center">
+  <span><a href="/">Forsiden</a> · <a href="/kategori/gardssalg">Gårdssalg og smaking</a></span>
+</footer>
+<script>
+(function () {
+  var form = document.getElementById("book-form");
+  if (!form) return;
+  form.addEventListener("submit", function (ev) {
+    ev.preventDefault();
+    var status = document.getElementById("book-form-status");
+    var btn = form.querySelector("button[type=submit]");
+    var fd = new FormData(form);
+    var partySize = parseInt(String(fd.get("party_size") || ""), 10);
+    var payload = {
+      provider_id: String(fd.get("provider_id") || ""),
+      slot_at: String(fd.get("slot_at") || ""),
+      party_size: partySize,
+      guest_name: String(fd.get("guest_name") || ""),
+      guest_email: String(fd.get("guest_email") || "")
+    };
+    var phone = String(fd.get("guest_phone") || "").trim();
+    if (phone) payload.guest_phone = phone;
+    if (btn) btn.disabled = true;
+    if (status) status.textContent = "Sender reservasjon …";
+    fetch("/api/opplevelser/book", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload)
+    })
+      .then(function (r) {
+        return r.json().catch(function () { return {}; }).then(function (data) {
+          return { ok: r.ok, data: data };
+        });
+      })
+      .then(function (res) {
+        if (res.ok && res.data && res.data.success && res.data.booking_ref) {
+          window.location.href = ${JSON.stringify(canonical)} + "/confirm/" + encodeURIComponent(res.data.booking_ref);
+          return;
+        }
+        if (btn) btn.disabled = false;
+        if (status) status.textContent = "Noe gikk galt. Sjekk feltene og prøv igjen, eller last siden på nytt uten javascript.";
+      })
+      .catch(function () {
+        if (btn) btn.disabled = false;
+        if (status) status.textContent = "Nettverksfeil. Prøv igjen om litt.";
+      });
+  });
+})();
+</script>
+</body>
+</html>`;
+
+    res.setHeader("Content-Type", "text/html; charset=utf-8");
+    res.setHeader("Cache-Control", "no-store");
+    res.send(html);
+  },
+);
+
+// POST /kategori/gardssalg/book/:providerSlug — no-JS fallback for the panel
+// above. Same validation + the exact same createBooking()/
+// sendBookingConfirmation() service functions the JSON API uses; redirects
+// (303, so a reload doesn't resubmit) to the confirmation page on success or
+// back to the panel with ?error=<code> on failure.
+router.post(
+  "/kategori/gardssalg/book/:providerSlug",
+  express.urlencoded({ extended: false }),
+  (req: Request, res: Response, next: NextFunction) => {
+    const slug = String(req.params.providerSlug || "");
+    if (!slug) return next();
+    ensureProviderSlugs();
+    let provider: GardssalgProviderRow | null = null;
+    try {
+      provider = getGardssalgProviderBySlug(slug);
+    } catch {
+      provider = null;
+    }
+    if (!provider) return next();
+
+    const backTo = `/kategori/gardssalg/book/${encodeURIComponent(slug)}`;
+    const body = (req.body || {}) as Record<string, unknown>;
+    const partySize = parseInt(String(body.party_size ?? ""), 10);
+    const phoneRaw = body.guest_phone ? String(body.guest_phone).trim() : "";
+
+    const parsed = BookingInputSchema.safeParse({
+      provider_id: provider.id,
+      slot_at: String(body.slot_at ?? ""),
+      party_size: partySize,
+      guest_name: String(body.guest_name ?? ""),
+      guest_email: String(body.guest_email ?? ""),
+      ...(phoneRaw ? { guest_phone: phoneRaw } : {}),
+    });
+    if (!parsed.success) {
+      res.redirect(303, `${backTo}?error=invalid`);
+      return;
+    }
+
+    let booking;
+    try {
+      booking = createBooking(parsed.data);
+    } catch (err) {
+      console.error("[gardssalg-book] createBooking failed", err);
+      res.redirect(303, `${backTo}?error=internal`);
+      return;
+    }
+
+    // Fire-and-forget confirmation email — identical to the JSON API path.
+    sendBookingConfirmation(booking).catch((e) =>
+      console.error("[gardssalg-book] email failed", booking.booking_ref, e),
+    );
+
+    res.redirect(303, `${backTo}/confirm/${encodeURIComponent(booking.booking_ref)}`);
+  },
+);
+
+// GET /kategori/gardssalg/book/:providerSlug/confirm/:ref — confirmation page.
+// Looks the booking up via the existing getBookingByRef() (same function the
+// ICS-download endpoint uses) — no duplicate lookup. 404s if the ref doesn't
+// resolve, or resolves to a different provider than the one in the URL.
+router.get(
+  "/kategori/gardssalg/book/:providerSlug/confirm/:ref",
+  async (req: Request, res: Response, next: NextFunction) => {
+    const slug = String(req.params.providerSlug || "");
+    const ref = String(req.params.ref || "");
+    if (!slug || !ref) return next();
+    ensureProviderSlugs();
+    let provider: GardssalgProviderRow | null = null;
+    try {
+      provider = getGardssalgProviderBySlug(slug);
+    } catch {
+      provider = null;
+    }
+    if (!provider) return next();
+
+    let booking: ReturnType<typeof getBookingByRef> = null;
+    try {
+      booking = getBookingByRef(ref);
+    } catch {
+      booking = null;
+    }
+    if (!booking || booking.provider_id !== provider.id) return next();
+
+    const slotFormatted = new Date(booking.slot_at).toLocaleString("nb-NO", {
+      dateStyle: "full",
+      timeStyle: "short",
+      timeZone: "Europe/Oslo",
+    });
+
+    // Server-side SVG generation only — booking_ref never leaves our infra via
+    // a third-party QR image service.
+    let qrSvg = "";
+    try {
+      qrSvg = await QRCode.toString(booking.booking_ref, { type: "svg", margin: 1, width: 180 });
+    } catch (err) {
+      console.error("[gardssalg-book] QR render failed", booking.booking_ref, err);
+      qrSvg = "";
+    }
+
+    const icsUrl = `/api/opplevelser/book/${encodeURIComponent(booking.booking_ref)}/ics`;
+
+    const html = `<!doctype html>
+<html lang="nb">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Reservasjon bekreftet | Opplevagent</title>
+<meta name="robots" content="noindex, nofollow">
+<style>
+${BROWSE_CSS}
+.confirm-panel{max-width:480px;margin:24px auto 0;background:var(--surface);border-radius:12px;box-shadow:0 2px 8px rgba(0,0,0,.07);padding:28px 24px;text-align:center}
+.confirm-panel h1{font-size:1.3rem;font-weight:800;color:var(--fjord-900);margin-bottom:10px}
+.confirm-panel .qr{margin:18px auto;width:180px;height:180px}
+.confirm-panel .qr svg{width:100%;height:100%}
+.confirm-panel .ref{font-family:monospace;font-size:1.05rem;font-weight:700;letter-spacing:.03em;color:var(--fjord-800);background:var(--canvas-2);border-radius:8px;padding:8px 14px;display:inline-block;margin:8px 0 4px}
+.confirm-panel .recap{text-align:left;margin:18px 0;font-size:.92rem;color:var(--ink-soft)}
+.confirm-panel .recap div{padding:5px 0;border-bottom:1px solid var(--line)}
+.confirm-panel .hint{font-size:.82rem;color:var(--mist);margin-top:14px}
+.confirm-panel .ics-link{display:inline-block;margin-top:16px;padding:10px 18px;background:var(--fjord-800);color:#fff;border-radius:8px;font-weight:700;font-size:.9rem;text-decoration:none}
+.confirm-panel .ics-link:hover{background:var(--fjord-700);text-decoration:none}
+</style>
+</head>
+<body>
+<a class="skip-link" href="#main">Hopp til innhold</a>
+<nav class="site-nav" aria-label="Navigasjon">
+  <div class="nav-inner">
+    <a class="brand" href="/"><span class="brand-word">opplevagent<span class="tld">.no</span></span></a>
+    <span class="nav-links"><a href="/opplevelser">Alle opplevelser</a><a href="/kategori/gardssalg">Gårdssalg</a></span>
+  </div>
+</nav>
+<main id="main" class="container">
+  <div class="confirm-panel">
+    <h1>Reservasjon bekreftet</h1>
+    <p>Hos ${escapeHtml(provider.navn)}</p>
+    ${qrSvg ? `<div class="qr">${qrSvg}</div>` : ""}
+    <div class="ref">${escapeHtml(booking.booking_ref)}</div>
+    <p class="hint">Vis ved ankomst — produsenten bekrefter oppmøtet.</p>
+    <div class="recap">
+      <div><strong>Dato/tid:</strong> ${escapeHtml(slotFormatted)}</div>
+      <div><strong>Antall:</strong> ${booking.party_size} person${booking.party_size > 1 ? "er" : ""}</div>
+      <div><strong>Navn:</strong> ${escapeHtml(booking.guest_name)}</div>
+    </div>
+    <p class="hint">En bekreftelse er sendt til ${escapeHtml(booking.guest_email)}.</p>
+    <a class="ics-link" href="${icsUrl}">Last ned kalenderfil (.ics)</a>
+  </div>
+</main>
+<footer style="margin-top:48px;padding:24px 0;border-top:1px solid #e4ded0;font-size:.8rem;color:#7a7163;text-align:center">
+  <span><a href="/">Forsiden</a> · <a href="/kategori/gardssalg">Gårdssalg og smaking</a></span>
+</footer>
+</body>
+</html>`;
+
+    res.setHeader("Content-Type", "text/html; charset=utf-8");
+    res.setHeader("Cache-Control", "no-store");
+    res.send(html);
+  },
+);
 
 // ─── GET /kategori/:category — experiences in a category ─────────────────────
 router.get("/kategori/:category", (req: Request, res: Response, next: NextFunction) => {
