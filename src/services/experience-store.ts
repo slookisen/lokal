@@ -1073,13 +1073,27 @@ export type GardssalgProviderRow = {
   producer_type: string | null;
   enrichment_state: string | null;
   slug: string | null;
+  // Additive (2026-07-03, gårdssalg profile-page slice): geo + address + contact,
+  // already columns on experience_providers (see init-experiences.ts) but not
+  // previously selected here. Read by the /kategori/gardssalg/produsent/<slug>
+  // profile page for its map block + JSON-LD `geo`/`address` + practical info.
+  // Most rows have these NULL until enrichment runs — every consumer must be
+  // null-safe (same discipline as lat/lon on the `experiences` table).
+  adresse: string | null;
+  lat: number | null;
+  lon: number | null;
+  epost: string | null;
+  telefon: string | null;
 };
+
+const GARDSSALG_PROVIDER_COLUMNS =
+  "id, navn, hjemmeside, fylke, kommune, poststed, producer_type, enrichment_state, slug, adresse, lat, lon, epost, telefon";
 
 export function listGardssalgProviders(limit = 100, offset = 0): GardssalgProviderRow[] {
   const db = getDb(VERTICAL);
   return db
     .prepare(
-      `SELECT id, navn, hjemmeside, fylke, kommune, poststed, producer_type, enrichment_state, slug
+      `SELECT ${GARDSSALG_PROVIDER_COLUMNS}
          FROM experience_providers
         WHERE producer_type IS NOT NULL OR rfb_seed_source = 'rfb-seed'
         ORDER BY navn
@@ -1089,7 +1103,8 @@ export function listGardssalgProviders(limit = 100, offset = 0): GardssalgProvid
 }
 
 /** Look up a single gårdssalg provider (drink producer) by slug — for the
- *  /kategori/gardssalg/book/<slug> reservation flow. Mirrors the WHERE clause
+ *  /kategori/gardssalg/book/<slug> reservation flow and the
+ *  /kategori/gardssalg/produsent/<slug> profile page. Mirrors the WHERE clause
  *  from listGardssalgProviders()/countGardssalgProviders() (producer_type set
  *  OR rfb-seed), NOT the experiences-join publish gate used by
  *  getPublishedProviderBySlug() — gårdssalg producers have zero rows in the
@@ -1101,7 +1116,7 @@ export function getGardssalgProviderBySlug(slug: string): GardssalgProviderRow |
   const db = getDb(VERTICAL);
   const row = db
     .prepare(
-      `SELECT id, navn, hjemmeside, fylke, kommune, poststed, producer_type, enrichment_state, slug
+      `SELECT ${GARDSSALG_PROVIDER_COLUMNS}
          FROM experience_providers
         WHERE slug = @slug
           AND (producer_type IS NOT NULL OR rfb_seed_source = 'rfb-seed')`
