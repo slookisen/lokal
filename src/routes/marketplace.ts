@@ -16,6 +16,7 @@ import { mergeFieldProvenance } from "./admin-knowledge";
 import { crossSourceAgreement, isAcceptableHomepageEmail, pageMentionsProducer, type FieldName } from "../services/cross-source-validator";
 import { logPlacesCall, getPlacesUsageThisMonth } from "../services/places-usage-tracker";
 import { getDb as getVerticalDb } from "../database/db-factory";
+import { findOrgnumberByName } from "../services/brreg-client";
 
 // ── PR-29 v3: pure helper for Place Details (New) request params ──────────────
 // Exported so tests can assert the URL structure without touching the handler.
@@ -1915,12 +1916,43 @@ router.post("/admin/google-rating-batch", async (req: Request, res: Response) =>
         }
       }
 
+      // ── measure 3 of dev-request 2026-07-03-places-api-cost-reduction ──
+      // BRREG-first: consult the free Brreg registry for this agent's
+      // address BEFORE relying on Google's (paid) answer — extends the
+      // existing Brreg-wins fill-only policy (PR-82 block below) into an
+      // actual "ask Brreg first" ordering, and lets a confident Brreg hit
+      // skip the PR-29 Place Details fallback call for address below. Phone
+      // is NOT looked up here: Brreg's Enhetsregisteret API has no
+      // phone-number field, so phone stays Google-only exactly as before.
+      //
+      // Only attempted when the address column is still empty — mirrors
+      // dental.ts's isEmptyCol(row.adresse) guard so a batch run never pays
+      // for a live Brreg round-trip on agents that already have an address
+      // (fill-only means the write below would discard it anyway).
+      let brregAddr: string | null = null;
+      if (wantAddrPhone) {
+        const existingAddrRow = getDb()
+          .prepare("SELECT address FROM agent_knowledge WHERE agent_id = ?")
+          .get(agentId) as { address?: string | null } | undefined;
+        const addrIsEmpty = !(existingAddrRow?.address ?? "").toString().trim();
+        if (addrIsEmpty) {
+          try {
+            const brregHit = await findOrgnumberByName(info.agent.name, info.knowledge.postalCode);
+            if (brregHit?.address) brregAddr = brregHit.address;
+          } catch {
+            // Brreg lookup failure is non-fatal — fall through to Google's answer.
+          }
+        }
+      }
+
       // ── PR-29 v3: Place Details (New) fallback for missing address/phone ──
       // Proto3 omits empty scalars, so Text Search may return no formattedAddress
       // / internationalPhoneNumber even when the place has them. We do ONE
       // Details call per agent (bounded by effectiveCap) to back-fill the gaps.
       if (wantAddrPhone && place.id) {
-        const needAddr = typeof place.formattedAddress !== "string" || place.formattedAddress.trim() === "";
+        // measure 3: no need to spend a Details call chasing an address BRREG
+        // already gave us above.
+        const needAddr = !brregAddr && (typeof place.formattedAddress !== "string" || place.formattedAddress.trim() === "");
         const needPhone = typeof place.internationalPhoneNumber !== "string" || place.internationalPhoneNumber.trim() === "";
         if ((needAddr || needPhone) && detailsCalls < effectiveCap) {
           detailsCalls++;
@@ -1958,7 +1990,11 @@ router.post("/admin/google-rating-batch", async (req: Request, res: Response) =>
       let phoneWritten = false;
       if (wantAddrPhone) {
         try {
-          const gAddrRaw = typeof place.formattedAddress === "string" ? place.formattedAddress.trim() : "";
+          // measure 3: prefer the BRREG address looked up above — Google's
+          // formattedAddress is only used as the fallback when BRREG had
+          // nothing usable for this agent.
+          const gAddrRaw = brregAddr || (typeof place.formattedAddress === "string" ? place.formattedAddress.trim() : "");
+          const gAddrSource: "brreg" | "google_places" = brregAddr ? "brreg" : "google_places";
           const gPhoneRaw = typeof place.internationalPhoneNumber === "string" ? place.internationalPhoneNumber : "";
           // Normalise phone: strip whitespace (and any leading "tel:"), keep the leading "+".
           const gPhone = gPhoneRaw.replace(/^tel:/i, "").replace(/\s+/g, "").trim();
@@ -1987,7 +2023,7 @@ router.post("/admin/google-rating-batch", async (req: Request, res: Response) =>
             const nowIso = new Date().toISOString();
             if (gAddrRaw) {
               incomingProv.address = {
-                sources: [{ source_type: "google_places", value: gAddrRaw, fetched_at: nowIso }],
+                sources: [{ source_type: gAddrSource, value: gAddrRaw, fetched_at: nowIso }],
               };
             }
             if (gPhone) {

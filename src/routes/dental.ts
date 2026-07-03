@@ -40,6 +40,7 @@ import {
 } from "../services/dental-places";
 import { nameSimilarity } from "../services/name-matcher";
 import { logPlacesCall } from "../services/places-usage-tracker";
+import { findOrgnumberByName } from "../services/brreg-client";
 
 const router = Router();
 
@@ -738,6 +739,25 @@ router.post(
         : PLACES_PRO_FIELD_MASK;
       if (needsEnterprise) enterpriseCalls++; else proCalls++;
 
+      // ── measure 3 of dev-request 2026-07-03-places-api-cost-reduction ──
+      // BRREG-first: consult the free Brreg registry for this clinic's
+      // address BEFORE relying on Google's (paid) answer, extending the
+      // existing Brreg-wins fill-only policy below into an actual "ask
+      // Brreg first" ordering. Only attempted when adresse is still empty
+      // — a column that's already filled stays fill-only regardless of
+      // source, unchanged from before. Phone is NOT looked up here: Brreg's
+      // Enhetsregisteret API has no phone-number field, so telefon stays
+      // Google-only exactly as before.
+      let brregAddr: string | null = null;
+      if (isEmptyCol(row.adresse)) {
+        try {
+          const brregHit = await findOrgnumberByName(row.navn, row.postnummer);
+          if (brregHit?.address) brregAddr = brregHit.address;
+        } catch {
+          // Brreg lookup failure is non-fatal — fall through to Google's answer.
+        }
+      }
+
       let place: PlacesPlace | undefined;
       try {
         placesCallsThisRun++;
@@ -831,10 +851,15 @@ router.post(
       let homepage_backfilled = false;
 
       // Real values from Places (for provenance, regardless of column write).
-      const gAddr =
+      // measure 3: prefer the BRREG address looked up above when we have
+      // one — Google's formattedAddress is only used as the fallback when
+      // BRREG had nothing usable for this clinic.
+      const placesAddr =
         typeof place.formattedAddress === "string"
           ? place.formattedAddress.trim()
           : "";
+      const gAddr = brregAddr || placesAddr;
+      const gAddrSource: "brreg" | "google_places" = brregAddr ? "brreg" : "google_places";
       const gPhone = normalizePlacePhone(place.internationalPhoneNumber);
       const gWebsite =
         typeof place.websiteUri === "string" ? place.websiteUri.trim() : "";
@@ -859,7 +884,8 @@ router.post(
         }
       }
 
-      // adresse — fill only (Brreg-wins).
+      // adresse — fill only (Brreg-wins). gAddr is BRREG's address when the
+      // measure-3 lookup above found one, else Google's formattedAddress.
       if (isEmptyCol(row.adresse) && gAddr) {
         patch.adresse = gAddr;
         fields_written.push("adresse");
@@ -881,13 +907,15 @@ router.post(
       }
 
       // ── field_provenance — google_places (Tier-A) for every real value ──
+      // (address provenance uses gAddrSource — "brreg" when measure 3's
+      // BRREG-first lookup supplied the value, "google_places" otherwise.)
       const incomingProv: Record<
         string,
         { sources: Array<{ source_type: string; value: string; fetched_at: string }> }
       > = {};
       if (gAddr) {
         incomingProv.address = {
-          sources: [{ source_type: "google_places", value: gAddr, fetched_at: nowIso }],
+          sources: [{ source_type: gAddrSource, value: gAddr, fetched_at: nowIso }],
         };
       }
       if (gPhone) {
