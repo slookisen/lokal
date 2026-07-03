@@ -39,6 +39,7 @@ import {
   type PlacesPlace,
 } from "../services/dental-places";
 import { nameSimilarity } from "../services/name-matcher";
+import { logPlacesCall } from "../services/places-usage-tracker";
 
 const router = Router();
 
@@ -691,6 +692,7 @@ router.post(
           places_api_calls: 0,
           enterprise_calls: 0,
           pro_calls: 0,
+          places_calls: 0,
         },
       });
       return;
@@ -710,6 +712,7 @@ router.post(
     let matched = 0;
     let no_match = 0;
     let homepages_backfilled = 0;
+    let placesCallsThisRun = 0;
     const by_field = { hjemmeside: 0, adresse: 0, telefon: 0, opening_hours: 0 };
     let enterpriseCalls = 0; // calls made with the Enterprise-tier mask
     let proCalls = 0;        // calls made with the Essentials/Pro-only mask
@@ -737,6 +740,16 @@ router.post(
 
       let place: PlacesPlace | undefined;
       try {
+        placesCallsThisRun++;
+        // measure 2 (dental slice, lokal#130): log the SKU tier actually
+        // requested, not always "enterprise" — needsEnterprise/fieldMask
+        // above already decide which mask this specific call uses.
+        logPlacesCall(
+          db,
+          "dental",
+          "google-places-batch",
+          needsEnterprise ? "text_search_enterprise" : "text_search_pro"
+        );
         const resp = await fetch(
           "https://places.googleapis.com/v1/places:searchText",
           {
@@ -943,6 +956,7 @@ router.post(
         places_api_calls: enterpriseCalls + proCalls,
         enterprise_calls: enterpriseCalls,
         pro_calls: proCalls,
+        places_calls: placesCallsThisRun,
       },
     });
   }

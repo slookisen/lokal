@@ -15,7 +15,7 @@
  */
 import { readFileSync } from "fs";
 import { join } from "path";
-import { buildProducerFaqJsonLd } from "../src/routes/seo";
+import { buildProducerFaqJsonLd, buildCityFaqJsonLd } from "../src/routes/seo";
 
 let passed = 0;
 let failed = 0;
@@ -61,6 +61,29 @@ expectTrue(
   expectTrue(!!faq && faq.mainEntity.length === 3, "3 real fields (products+city+website) -> exactly 3 questions");
 }
 
+console.log("\n── geo-content-structured-data: buildCityFaqJsonLd invocation tests (city/category slice) ──");
+const cityFaqBase = { cityName: "Asker", url: "https://rettfrabonden.com/asker", producerCount: 0, topCategories: [], verifiedCount: 0 };
+
+expectTrue(
+  buildCityFaqJsonLd({ ...cityFaqBase, producerCount: 0 }) === null,
+  "0 producers, no categories, no verified -> null (below 2-question quality gate)"
+);
+expectTrue(
+  buildCityFaqJsonLd({ ...cityFaqBase, producerCount: 3 }) === null,
+  "producer-count alone (1 real field) -> null (no thin-page FAQ emitted)"
+);
+{
+  const faq = buildCityFaqJsonLd({ ...cityFaqBase, producerCount: 5, topCategories: ["honning", "ost"] });
+  expectTrue(!!faq && faq["@type"] === "FAQPage", "count + categories (2 real fields) -> non-null FAQPage");
+  expectTrue(!!faq && Array.isArray(faq.mainEntity) && faq.mainEntity.length === 2, "2 real fields -> exactly 2 questions");
+  expectTrue(!!faq && faq.mainEntity.every((q: any) => q["@type"] === "Question" && q.acceptedAnswer?.["@type"] === "Answer"), "each mainEntity item is a valid Question/Answer pair");
+  expectTrue(!!faq && faq.mainEntity[1].acceptedAnswer.text.includes("honning"), "category-question answer includes real category name (not fabricated)");
+}
+{
+  const faq = buildCityFaqJsonLd({ ...cityFaqBase, producerCount: 5, topCategories: ["honning"], verifiedCount: 2 });
+  expectTrue(!!faq && faq.mainEntity.length === 3, "3 real fields (count+category+verified) -> exactly 3 questions");
+}
+
 console.log("── WO-17: seo.ts source-presence assertions ──");
 const seoSrc = readFileSync(join(__dirname, "..", "src", "routes", "seo.ts"), "utf8");
 expectMatch(seoSrc, /hasMerchantReturnPolicy/, "seo.ts contains hasMerchantReturnPolicy");
@@ -79,6 +102,8 @@ expectMatch(seoSrc, /"@type":\s*"Question"/, "seo.ts contains Question @type");
 expectMatch(seoSrc, /"@type":\s*"Answer"/, "seo.ts contains Answer @type");
 expectMatch(seoSrc, /if \(qas\.length < 2\) return null;/, "seo.ts FAQ builder quality-gates on 2+ real answers (no thin pages)");
 expectMatch(seoSrc, /jsonLd:\s*faqJsonLd\s*\?\s*\[jsonLd,\s*faqJsonLd\]\s*:\s*jsonLd/, "seo.ts wires FAQPage block into the producer page's JSON-LD array");
+expectMatch(seoSrc, /function buildCityFaqJsonLd/, "seo.ts defines buildCityFaqJsonLd");
+expectMatch(seoSrc, /if \(cityFaqJsonLd\) jsonLdItems\.push\(cityFaqJsonLd\);/, "seo.ts wires the city FAQPage block into the city page's JSON-LD array");
 
 console.log("\n── WO-17: sitemap 404 filter assertions ──");
 expectMatch(seoSrc, /WO-17.*sitemap|sitemap.*WO-17/s, "seo.ts sitemap loop carries WO-17 marker");

@@ -2113,6 +2113,16 @@ router.get("/:city", (req: Request, res: Response, next: any) => {
       return item;
     });
 
+    const cityCanonicalUrl = `${BASE_URL}${localizedPath("/" + citySlug, lang)}`;
+    const cityFaqJsonLd = buildCityFaqJsonLd({
+      cityName,
+      url: cityCanonicalUrl,
+      producerCount: cityAgents.length,
+      topCategories,
+      verifiedCount,
+    });
+    if (cityFaqJsonLd) jsonLdItems.push(cityFaqJsonLd);
+
     const content = `
     <section class="city-hero">
       <div class="container">
@@ -2130,7 +2140,7 @@ router.get("/:city", (req: Request, res: Response, next: any) => {
       t(lang, "city.title", { city: cityName }),
       t(lang, "city.description", { count: cityAgents.length, city: cityName }),
       content,
-      { canonical: `${BASE_URL}${localizedPath("/" + citySlug, lang)}`, jsonLd: jsonLdItems, extraCss: CITY_CSS, lang, pathForAlternate: "/" + citySlug }
+      { canonical: cityCanonicalUrl, jsonLd: jsonLdItems, extraCss: CITY_CSS, lang, pathForAlternate: "/" + citySlug }
     ));
   } catch (err) {
     console.error(`SEO /${citySlug} error:`, err);
@@ -2557,6 +2567,54 @@ export function buildProducerFaqJsonLd(params: {
     qas.push({
       q: `Kan jeg besøke eller bestille fra ${params.name}?`,
       a: `Ja — ${params.name} ${parts.join(" og ")}.`,
+    });
+  }
+
+  if (qas.length < 2) return null;
+
+  return {
+    "@context": "https://schema.org",
+    "@type": "FAQPage",
+    "@id": `${params.url}#faq`,
+    "mainEntity": qas.map(({ q, a }) => ({
+      "@type": "Question",
+      "name": q,
+      "acceptedAnswer": { "@type": "Answer", "text": a },
+    })),
+  };
+}
+
+// GEO: FAQPage JSON-LD for city pages (dev-request 2026-06-30-geo-content-structured-data,
+// city/category slice). Same quality gate as buildProducerFaqJsonLd: only real, catalog-derived
+// facts, never fabricated, and null unless at least 2 questions have an answer — a city page with
+// no distinguishing catalog data (no category signal, nobody verified) stays without FAQ schema.
+export function buildCityFaqJsonLd(params: {
+  cityName: string;
+  url: string;
+  producerCount: number;
+  topCategories: string[];
+  verifiedCount: number;
+}): any | null {
+  const qas: Array<{ q: string; a: string }> = [];
+
+  if (params.producerCount > 0) {
+    qas.push({
+      q: `Hvor mange lokale produsenter finnes i ${params.cityName}?`,
+      a: `Det er ${params.producerCount} lokale produsenter registrert i ${params.cityName}-området.`,
+    });
+  }
+
+  if (params.topCategories.length) {
+    qas.push({
+      q: `Hva slags lokalmat kan jeg finne i ${params.cityName}?`,
+      a: `Populære kategorier blant produsentene i ${params.cityName} er ${params.topCategories.join(", ")}.`,
+    });
+  }
+
+  if (params.verifiedCount > 0) {
+    qas.push({
+      q: `Er produsentene i ${params.cityName} verifiserte?`,
+      a: `Ja — ${params.verifiedCount} av produsentene i ${params.cityName} er verifiserte, og kan kontaktes direkte uten mellomledd.`,
     });
   }
 
