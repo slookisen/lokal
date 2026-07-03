@@ -29,14 +29,46 @@ export type BrregHit = {
   name: string;
   confidence: number;
   brreg_postal?: string | null;
+  // ─── dev-request 2026-07-03-places-api-cost-reduction, measure 3 ───────
+  // Formatted street address ("<adresse>, <postnummer> <poststed>"), when
+  // Brreg's response for this hit includes a usable street line. null when
+  // Brreg has no street-level address for the hit (a bare postnummer alone
+  // is not "usable" — callers should fall back to Google in that case).
+  // Brreg's Enhetsregisteret API has no phone-number field at all, so there
+  // is no equivalent "address" companion for phone.
+  address: string | null;
+};
+
+type RawBrregAddress = {
+  postnummer?: string | null;
+  poststed?: string | null;
+  adresse?: string[] | null;
 };
 
 type RawEnhet = {
   organisasjonsnummer: string;
   navn: string;
-  forretningsadresse?: { postnummer?: string | null } | null;
-  postadresse?: { postnummer?: string | null } | null;
+  forretningsadresse?: RawBrregAddress | null;
+  postadresse?: RawBrregAddress | null;
 };
+
+// ─── formatBrregAddress ─────────────────────────────────────────────────
+// Formats a Brreg address sub-object into a single display string, e.g.
+// "Storgata 1, 0155 Oslo". Returns null unless there's an actual street
+// line (`adresse`) — a postnummer/poststed with no street is not a usable
+// address for our purposes (measure 3: only fall back to BRREG's address
+// when it has something genuinely usable).
+function formatBrregAddress(addr: RawBrregAddress | null | undefined): string | null {
+  if (!addr) return null;
+  const street = Array.isArray(addr.adresse)
+    ? addr.adresse.filter((s): s is string => typeof s === "string" && s.trim() !== "").join(", ")
+    : "";
+  if (!street) return null;
+  const tail = [addr.postnummer, addr.poststed]
+    .filter((s): s is string => typeof s === "string" && s.trim() !== "")
+    .join(" ");
+  return tail ? `${street}, ${tail}` : street;
+}
 
 // ─── Normalisation ─────────────────────────────────────────────────────
 // Lowercase + diacritic fold (æ→ae, ø→o, å→a) + drop punctuation +
@@ -319,6 +351,7 @@ export async function findOrgnumberByName(
         name: h.navn,
         confidence: score,
         brreg_postal: hitPostal,
+        address: formatBrregAddress(h.forretningsadresse ?? h.postadresse ?? null),
       };
     }
   }
