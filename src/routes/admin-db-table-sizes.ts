@@ -28,12 +28,12 @@
 //   1. Successful results are cached in-memory for TABLE_SIZES_CACHE_TTL_MS
 //      (default 5 min). A cache hit skips the scan entirely.
 //   2. Concurrent cache-miss requests de-dupe onto a single in-flight
-//      Promise (the actual scan is deferred one tick via setImmediate, same
-//      idiom as job-tracker.ts, so a request arriving while another is
-//      queued observes the in-flight Promise instead of starting its own
-//      scan). This bounds worst-case concurrent blocking to ONE scan no
-//      matter how many requests arrive during the window — the real DoS
-//      protection.
+//      Promise: a request that arrives while a scan is already running (the
+//      request/response plumbing here is Promise-based, so this can happen
+//      even though the scan itself is still one synchronous, blocking call)
+//      shares that in-flight Promise instead of starting its own scan. This
+//      bounds worst-case concurrent blocking to ONE scan no matter how many
+//      requests arrive during the window — the real DoS protection.
 
 import { Router, Request, Response } from "express";
 import { getDb } from "../database/init";
