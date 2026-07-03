@@ -60,7 +60,7 @@ jobs:
       cancel-in-progress: true
     permissions:
       pull-requests: write
-      contents: read
+      contents: write
       checks: read
       statuses: read
     steps:
