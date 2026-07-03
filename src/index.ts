@@ -37,6 +37,7 @@ import { analyticsService, shouldRunAutoPrune } from "./services/analytics-servi
 import analyticsRoutes from "./routes/analytics";
 import agentStatsRoutes from "./routes/agent-stats";
 import adminRunsRoutes from "./routes/admin-runs";
+import adminDbTableSizesRoutes from "./routes/admin-db-table-sizes";
 import adminAgentsRoutes from "./routes/admin-agents";
 import adminOutreachPoolRoutes from "./routes/admin-outreach-pool";
 import adminOutreachCandidatesRoutes from "./routes/admin-outreach-candidates";
@@ -451,6 +452,9 @@ app.get("/health", (_req, res) => {
 // Analytics admin endpoints
 app.use("/admin/analytics", analyticsRoutes);
 app.use("/admin/runs", adminLimiter, adminRunsRoutes);
+// 2026-07-03 P1 (dev-requests/2026-06-30-platform-housekeeping-audit.md step 1):
+// read-only DB table-size diagnostic — GET /admin/db/table-sizes
+app.use("/admin/db", adminLimiter, adminDbTableSizesRoutes);
 // PR-93: list agents by status + updated_since — unblocks verifier sweep
 app.use("/admin/agents", adminLimiter, adminAgentsRoutes);
 app.use("/admin/outreach-ready-pool", adminLimiter, adminOutreachPoolRoutes);

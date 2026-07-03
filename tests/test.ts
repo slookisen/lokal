@@ -19163,6 +19163,7 @@ console.log("\n── orch-pr-14: MCP discovery product_id surfacing ──");
   try { await _brregVerifySlice1Promise; } catch { /* errors already pushed to failures */ }
   try { await _orchPr20BmEventsPromise; } catch { /* errors already pushed to failures */ }
   try { await _orchPr21SentLogActorPromise; } catch { /* errors already pushed to failures */ }
+  try { await _adminDbTableSizesPromise; } catch { /* errors already pushed to failures */ }
   // PR-109 tests are synchronous (IIFE) — no promise needed
   // Drop pre-existing intg failures (unmasked by awaiting) — they predate M2
   // and live behind a separate fix-it task. Counting them here would surface
@@ -20541,6 +20542,39 @@ _orchPr20BmEventsPromise.then(async () => {
     failures.push("orch-pr-21-sentlog-actor: unexpected error: " + String(err));
   } finally {
     _orchPr21SentLogActorResolve();
+  }
+});
+
+
+// ─── 2026-07-03 P1: admin-db-table-sizes read-only DB diagnostic ─────────────
+// dev-requests/2026-06-30-platform-housekeeping-audit.md Step 1 — identify
+// what the DB bloat actually is (prod at 476.2MB, ~5 days from 500MB
+// threshold; page-view retention already finds 0 rows to prune).
+//
+// Chained off _orchPr21SentLogActorPromise (same pattern as PR-20/PR-21):
+// this block also swaps the global getDb() singleton via __setDbForTesting,
+// so it must run serially after the other singleton-swapping blocks, not
+// concurrently with them.
+let _adminDbTableSizesResolve: () => void = () => {};
+const _adminDbTableSizesPromise: Promise<void> = new Promise<void>(r => {
+  _adminDbTableSizesResolve = r;
+});
+
+_orchPr21SentLogActorPromise.then(async () => {
+  console.log("\n── admin-db-table-sizes: read-only DB table-size diagnostic ──");
+  try {
+    const { runAdminDbTableSizesTests } = require("../src/routes/admin-db-table-sizes.test") as
+      typeof import("../src/routes/admin-db-table-sizes.test");
+    const jr = await runAdminDbTableSizesTests({ log: false });
+    passed += jr.passed;
+    failed += jr.failed;
+    for (const f of jr.failures) failures.push("admin-db-table-sizes: " + f);
+    console.log(`  admin-db-table-sizes: ${jr.passed} passed, ${jr.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("admin-db-table-sizes: unexpected error: " + String(err?.message || err));
+  } finally {
+    _adminDbTableSizesResolve();
   }
 });
 
