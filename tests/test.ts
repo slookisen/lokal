@@ -21239,3 +21239,222 @@ const _gardssalgQrPromise = runSerial(async () => {
   assertTrue(!/<image[^>]+(https?:)?\/\//.test(svg) && !svg.includes("api.qrserver") && !svg.includes("googleapis.com/chart"),
     "gb-qr-02: generated SVG embeds no <image> reference to a third-party QR service (booking_ref never leaves our infra)");
 });
+
+// ─── gardssalg-profile: produsent profile page (2026-07-03, Fase 1 of the
+//     rike-profiler dev-request) ────────────────────────────────────────────
+// Regression coverage for GET /kategori/gardssalg/produsent/:providerSlug —
+// the new "sell/decide" page between the /kategori/gardssalg listing and the
+// /kategori/gardssalg/book/<slug> reservation panel. Resolves via the exact
+// same getGardssalgProviderBySlug() gate as the booking panel (see the
+// gardssalg-book block above), so covers: unknown-slug 404, a fully-seeded
+// slug rendering all sections (hero/badge, "Om produsenten", "Besøket",
+// practical info table, map block, reserve CTA), LocalBusiness +
+// BreadcrumbList JSON-LD, OG/Twitter tags, the /kategori/gardssalg
+// category-card name-link now pointing at the profile route (not straight at
+// booking), and a no-regression check that the booking panel itself still
+// renders. Same isolated :memory: experiences DB + sync mock req/res pattern
+// as the gardssalg-book/sq-caticon blocks — fully synchronous, so it cannot
+// race the async report tail.
+console.log("\n── gardssalg-profile: produsent profile page ──");
+(() => {
+  const prevPathGP = process.env.EXPERIENCES_DB_PATH;
+  process.env.EXPERIENCES_DB_PATH = ":memory:";
+
+  const dbFacPathGP = require.resolve("../src/database/db-factory");
+  const expStPathGP = require.resolve("../src/services/experience-store");
+  const expSeoPathGP = require.resolve("../src/routes/experiences-seo");
+  delete require.cache[dbFacPathGP];
+  delete require.cache[expStPathGP];
+  delete require.cache[expSeoPathGP];
+
+  const dbFacGP = require("../src/database/db-factory") as typeof import("../src/database/db-factory");
+  dbFacGP.__resetDbFactoryForTesting();
+  const expStGP = require("../src/services/experience-store") as typeof import("../src/services/experience-store");
+  const seoRouterGP = (require("../src/routes/experiences-seo") as typeof import("../src/routes/experiences-seo")).default as any;
+
+  const dbGP = dbFacGP.getDb("experiences");
+
+  // Seed a fully-fleshed gårdssalg producer: adresse/lat/lon/epost/telefon all
+  // set (so every practical-info row + the map block + JSON-LD geo/telephone/
+  // email all get exercised), plus producer_type (set directly via SQL, same
+  // as the gardssalg-book block above — no service-layer setter for this
+  // column, it's populated by the enrichment pipeline in production).
+  const provIdGP = expStGP.createProvider({
+    navn: "Fjellro Sideri", org_nr: "912345679",
+    fylke: "Innlandet", kommune: "Lillehammer", poststed: "Lillehammer",
+    adresse: "Sideriveien 4", lat: 61.115, lon: 10.469,
+    telefon: "61234567", epost: "post@fjellrosideri.no",
+    brreg_verified: 0, verification_status: "pending_verify",
+  });
+  dbGP.prepare("UPDATE experience_providers SET producer_type = ? WHERE id = ?").run("sideri", provIdGP);
+  expStGP.backfillProviderSlugs();
+
+  // A second, bare-minimum producer — no fylke/kommune/poststed either (so
+  // drivingSted() is empty and `facts` stays fully empty, not just missing
+  // adresse/nettside/telefon/epost) — exercises the true "honest omission"
+  // path: practical-info table absent entirely, map falls back to "posisjon
+  // ikke registrert", about/visit copy falls back to the type-general
+  // placeholder.
+  const bareProvIdGP = expStGP.createProvider({
+    navn: "Bekkely Bryggeri",
+  });
+  dbGP.prepare("UPDATE experience_providers SET producer_type = ? WHERE id = ?").run("bryggeri", bareProvIdGP);
+  expStGP.backfillProviderSlugs();
+
+  // invokeGP — same shape as the invokeGB helper in the gardssalg-book block:
+  // find the router layer by path+method, drive its handler with a sync mock
+  // req/res, skip any parsing middleware (GET-only here, no body needed).
+  function invokeGP(
+    routePath: string,
+    params: Record<string, string>,
+    reqPath: string
+  ): { status: number; body: string; headers: Record<string, string> } {
+    const layer = (seoRouterGP.stack as any[]).find(
+      (l: any) => l.route && l.route.path === routePath && l.route.methods?.get
+    );
+    assertTrue(!!layer, `gp-route: router has GET ${routePath} layer`);
+    if (!layer) return { status: 0, body: "", headers: {} };
+    let status = 200; let body = ""; let nexted = false;
+    const headers: Record<string, string> = {};
+    const res: any = {
+      statusCode: 200,
+      setHeader: (k: string, v: string) => { headers[k.toLowerCase()] = String(v); },
+      status: (c: number) => { status = c; res.statusCode = c; return res; },
+      send: (b: unknown) => { body = typeof b === "string" ? b : String(b); return res; },
+      json: (o: unknown) => { body = JSON.stringify(o); return res; },
+    };
+    const req: any = { path: reqPath, hostname: "opplevagent.no", params, query: {}, body: {} };
+    const stack = (layer.route.stack as any[]).filter((s: any) => s.method === "get");
+    const handle = stack[stack.length - 1].handle;
+    handle(req, res, () => { nexted = true; });
+    if (nexted) status = 404;
+    return { status, body, headers };
+  }
+
+  // gp-01: unknown slug → 404 (next()) — same gate as the booking panel, so
+  // an unresolvable slug never renders a profile either.
+  const missGP = invokeGP("/kategori/gardssalg/produsent/:providerSlug",
+    { providerSlug: "finnes-ikke" }, "/kategori/gardssalg/produsent/finnes-ikke");
+  assertEq(missGP.status, 404, "gp-01: unknown provider slug → 404 (next())");
+
+  const seededGP = expStGP.listGardssalgProviders(20, 0).find((p: any) => p.id === provIdGP);
+  assertTrue(!!seededGP && !!seededGP.slug, "gp-02: seeded provider got a slug from backfillProviderSlugs()");
+  const slugGP = String(seededGP!.slug);
+
+  // gp-03: profile page renders for the fully-seeded producer — 200, all
+  // sections present.
+  const profGP = invokeGP("/kategori/gardssalg/produsent/:providerSlug",
+    { providerSlug: slugGP }, `/kategori/gardssalg/produsent/${slugGP}`);
+  assertEq(profGP.status, 200, "gp-03a: GET /kategori/gardssalg/produsent/<slug> → 200");
+  assertTrue(/text\/html/.test(profGP.headers["content-type"] || ""), "gp-03b: profile Content-Type text/html");
+  assertTrue(profGP.body.includes("Fjellro Sideri"), "gp-03c: profile shows provider name (hero h1)");
+  assertTrue(profGP.body.includes("Lillehammer"), "gp-03d: profile shows the driving-sted (poststed/kommune/fylke)");
+  assertTrue(profGP.body.includes(">Om produsenten<"), "gp-03e: 'Om produsenten' section present");
+  assertTrue(profGP.body.includes(">Besøket<"), "gp-03f: 'Besøket' section present");
+  assertTrue(profGP.body.includes(">Praktisk info<") || profGP.body.includes("Praktisk info"), "gp-03g: 'Praktisk info' section present");
+
+  // gp-04: drink-type badge (sideri → "Sider" label, same DRINK_TYPE_META
+  // source of truth shared with the booking panel and category cards).
+  assertTrue(profGP.body.includes("Sider"), "gp-04: drink-type badge shows 'Sider' for producer_type=sideri");
+
+  // gp-05: CTA links to the existing booking route for the SAME slug — the
+  // booking flow itself is untouched by this profile-page slice.
+  assertTrue(profGP.body.includes(`href="/kategori/gardssalg/book/${slugGP}"`),
+    "gp-05: 'Reserver besøk' CTA links to the unchanged /kategori/gardssalg/book/<slug> route");
+  assertTrue(profGP.body.includes("Reserver besøk"), "gp-05b: CTA button text present");
+
+  // gp-06: practical-info rows — only real data, all five seeded fields.
+  assertTrue(/<th scope="row">Sted<\/th>/.test(profGP.body), "gp-06a: practical info has a Sted row");
+  assertTrue(profGP.body.includes("Sideriveien 4"), "gp-06b: practical info shows the seeded adresse");
+  assertTrue(profGP.body.includes('href="tel:61234567"'), "gp-06c: practical info shows a tel: link for telefon");
+  assertTrue(profGP.body.includes('href="mailto:post@fjellrosideri.no"'), "gp-06d: practical info shows a mailto: link for epost");
+
+  // gp-07: map block — lat/lon present → an OpenStreetMap link, not the
+  // "not registered" fallback.
+  assertTrue(profGP.body.includes("openstreetmap.org/?mlat=61.115&mlon=10.469"),
+    "gp-07a: map block links to OpenStreetMap with the seeded lat/lon");
+  assertTrue(!profGP.body.includes("Nøyaktig posisjon er ikke registrert ennå"),
+    "gp-07b: map block does NOT show the 'not registered' fallback when lat/lon exist");
+
+  // gp-08: JSON-LD — LocalBusiness with address/geo/telephone/email, plus a
+  // BreadcrumbList Forsiden → Gårdssalg og smaking → provider name.
+  const ldMatchesGP = profGP.body.match(/<script type="application\/ld\+json">([^<]+)<\/script>/g) || [];
+  assertEq(ldMatchesGP.length, 2, "gp-08a: exactly two JSON-LD scripts (LocalBusiness + BreadcrumbList)");
+  const ldObjsGP = ldMatchesGP.map((s: string) => JSON.parse(s.replace(/^<script[^>]*>/, "").replace(/<\/script>$/, "")));
+  const localBizGP = ldObjsGP.find((o: any) => o["@type"] === "LocalBusiness");
+  assertTrue(!!localBizGP, "gp-08b: a LocalBusiness JSON-LD block is present");
+  assertEq(localBizGP?.name, "Fjellro Sideri", "gp-08c: LocalBusiness name matches the provider");
+  assertEq(localBizGP?.address?.streetAddress, "Sideriveien 4", "gp-08d: LocalBusiness address.streetAddress matches");
+  assertEq(localBizGP?.geo?.latitude, 61.115, "gp-08e: LocalBusiness geo.latitude matches the seeded lat");
+  assertEq(localBizGP?.telephone, "61234567", "gp-08f: LocalBusiness telephone matches");
+  assertEq(localBizGP?.email, "post@fjellrosideri.no", "gp-08g: LocalBusiness email matches");
+  assertEq(localBizGP?.offers?.url, `https://opplevagent.no/kategori/gardssalg/book/${slugGP}`,
+    "gp-08h: LocalBusiness offers.url points at the booking route (absolute URL)");
+  const breadcrumbGP = ldObjsGP.find((o: any) => o["@type"] === "BreadcrumbList");
+  assertTrue(!!breadcrumbGP, "gp-08i: a BreadcrumbList JSON-LD block is present");
+  assertEq(breadcrumbGP?.itemListElement?.length, 3, "gp-08j: breadcrumb has 3 items (Forsiden / Gårdssalg og smaking / provider)");
+  assertEq(breadcrumbGP?.itemListElement?.[2]?.name, "Fjellro Sideri", "gp-08k: last breadcrumb item is the provider name");
+
+  // gp-09: Open Graph + Twitter tags.
+  assertTrue(profGP.body.includes('property="og:title" content="Fjellro Sideri | Opplevagent"'),
+    "gp-09a: og:title includes the provider name");
+  assertTrue(profGP.body.includes('property="og:type" content="website"'), "gp-09b: og:type present");
+  assertTrue(profGP.body.includes(`property="og:url" content="https://opplevagent.no/kategori/gardssalg/produsent/${slugGP}"`),
+    "gp-09c: og:url is the canonical profile URL");
+  assertTrue(profGP.body.includes('name="twitter:card" content="summary"'), "gp-09d: twitter:card present");
+
+  // gp-10: bare-minimum producer (no adresse/lat/lon/epost/telefon/hjemmeside)
+  // still renders 200, with the honest-omission fallbacks — no fabricated
+  // practical info, no fake map position.
+  const bareRowGP = expStGP.listGardssalgProviders(20, 0).find((p: any) => p.id === bareProvIdGP);
+  assertTrue(!!bareRowGP && !!bareRowGP.slug, "gp-10a: bare producer also got a slug");
+  const bareSlugGP = String(bareRowGP!.slug);
+  const bareProfGP = invokeGP("/kategori/gardssalg/produsent/:providerSlug",
+    { providerSlug: bareSlugGP }, `/kategori/gardssalg/produsent/${bareSlugGP}`);
+  assertEq(bareProfGP.status, 200, "gp-10b: bare producer profile still renders 200");
+  assertTrue(bareProfGP.body.includes("Praktisk info legges til etter hvert som profilen berikes"),
+    "gp-10c: bare producer shows the honest 'not yet enriched' practical-info fallback (no fabricated rows)");
+  assertTrue(bareProfGP.body.includes("Nøyaktig posisjon er ikke registrert ennå"),
+    "gp-10d: bare producer shows the honest 'position not registered' map fallback");
+
+  // gp-11: /kategori/gardssalg category-card name-link now points at the new
+  // profile route (not straight at the booking panel) — the "Book besøk"
+  // button stays a direct shortcut to booking, unaffected.
+  const listGP = invokeGP("/kategori/gardssalg", {}, "/kategori/gardssalg");
+  assertEq(listGP.status, 200, "gp-11a: GET /kategori/gardssalg → 200");
+  assertTrue(listGP.body.includes(`href="/kategori/gardssalg/produsent/${slugGP}"`),
+    "gp-11b: category listing links the provider name to the new profile route");
+  assertTrue(listGP.body.includes(`href="/kategori/gardssalg/book/${slugGP}"`),
+    "gp-11c: category listing's 'Book besøk' CTA still links straight to the booking route");
+
+  // gp-12: no-regression check — the booking panel route (unchanged by this
+  // slice) still renders 200 for the same slug the profile page now serves.
+  const bookLayerPresentGP = (seoRouterGP.stack as any[]).some(
+    (l: any) => l.route && l.route.path === "/kategori/gardssalg/book/:providerSlug" && l.route.methods?.get
+  );
+  assertTrue(bookLayerPresentGP, "gp-12a: booking panel GET route is still registered on the router");
+  if (bookLayerPresentGP) {
+    const bookLayerGP = (seoRouterGP.stack as any[]).find(
+      (l: any) => l.route && l.route.path === "/kategori/gardssalg/book/:providerSlug" && l.route.methods?.get
+    );
+    let bookStatusGP = 200; let bookBodyGP = ""; let bookNextedGP = false;
+    const bookResGP: any = {
+      statusCode: 200,
+      setHeader: () => {},
+      status: (c: number) => { bookStatusGP = c; bookResGP.statusCode = c; return bookResGP; },
+      send: (b: unknown) => { bookBodyGP = typeof b === "string" ? b : String(b); return bookResGP; },
+      json: (o: unknown) => { bookBodyGP = JSON.stringify(o); return bookResGP; },
+    };
+    const bookReqGP: any = { path: `/kategori/gardssalg/book/${slugGP}`, hostname: "opplevagent.no", params: { providerSlug: slugGP }, query: {}, body: {} };
+    const bookStackGP = (bookLayerGP.route.stack as any[]).filter((s: any) => s.method === "get");
+    bookStackGP[bookStackGP.length - 1].handle(bookReqGP, bookResGP, () => { bookNextedGP = true; });
+    if (bookNextedGP) bookStatusGP = 404;
+    assertEq(bookStatusGP, 200, "gp-12b: booking panel still renders 200 for the same provider slug (no regression)");
+    assertTrue(bookBodyGP.includes("Fjellro Sideri"), "gp-12c: booking panel still shows the provider name (no regression)");
+  }
+
+  if (prevPathGP === undefined) delete process.env.EXPERIENCES_DB_PATH;
+  else process.env.EXPERIENCES_DB_PATH = prevPathGP;
+  dbFacGP.__resetDbFactoryForTesting();
+  console.log("  gardssalg-profile: OK (unknown-slug 404, full profile render + sections, badge, CTA, practical-info, map, JSON-LD, OG/Twitter, category-card link, booking-panel regression)");
+})();
