@@ -19164,6 +19164,7 @@ console.log("\n── orch-pr-14: MCP discovery product_id surfacing ──");
   try { await _orchPr20BmEventsPromise; } catch { /* errors already pushed to failures */ }
   try { await _orchPr21SentLogActorPromise; } catch { /* errors already pushed to failures */ }
   try { await _adminDbTableSizesPromise; } catch { /* errors already pushed to failures */ }
+  try { await _contactClickTrackingPromise; } catch { /* errors already pushed to failures */ }
   // PR-109 tests are synchronous (IIFE) — no promise needed
   // Drop pre-existing intg failures (unmasked by awaiting) — they predate M2
   // and live behind a separate fix-it task. Counting them here would surface
@@ -20575,6 +20576,38 @@ _orchPr21SentLogActorPromise.then(async () => {
     failures.push("admin-db-table-sizes: unexpected error: " + String(err?.message || err));
   } finally {
     _adminDbTableSizesResolve();
+  }
+});
+
+
+// ─── 2026-07-03 slice 1: contact-click intent tracking ───────────────────────
+// dev-requests/2026-07-03-agent-profile-conversations-stats.md work items
+// 1+2 — new contact_clicks table + POST /api/track/contact-click beacon +
+// GET /ut/:agentId/:kind counting redirect. Chained off
+// _adminDbTableSizesPromise (same reasoning as the PR-20/PR-21/admin-db
+// blocks above): this block also swaps the global getDb() singleton via
+// __setDbForTesting, so it must run serially after the other
+// singleton-swapping blocks, not concurrently with them.
+let _contactClickTrackingResolve: () => void = () => {};
+const _contactClickTrackingPromise: Promise<void> = new Promise<void>(r => {
+  _contactClickTrackingResolve = r;
+});
+
+_adminDbTableSizesPromise.then(async () => {
+  console.log("\n── contact-tracking: contact-click intent tracking (table + endpoints) ──");
+  try {
+    const { runContactTrackingTests } = require("../src/routes/contact-tracking.test") as
+      typeof import("../src/routes/contact-tracking.test");
+    const jr = await runContactTrackingTests({ log: false });
+    passed += jr.passed;
+    failed += jr.failed;
+    for (const f of jr.failures) failures.push("contact-tracking: " + f);
+    console.log(`  contact-tracking: ${jr.passed} passed, ${jr.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("contact-tracking: unexpected error: " + String(err?.message || err));
+  } finally {
+    _contactClickTrackingResolve();
   }
 });
 

@@ -79,14 +79,18 @@ function hashUserAgent(ua: string): string {
 }
 
 // ─── Helper: Parse User-Agent to detect AI agents ──────────────
-interface UAParseResult {
+// Exported (contact-tracking.ts, dev-request 2026-07-03-agent-profile-
+// conversations-stats slice 1) so the new contact_clicks.is_bot column is
+// stamped with the exact same bot heuristic used everywhere else in this
+// file, instead of a re-implementation drifting out of sync over time.
+export interface UAParseResult {
   isBot: boolean;
   clientType: "chatgpt" | "claude" | "gemini" | "a2a-agent" | "browser" | "mobile" | "unknown";
   clientName?: string;
   botSource?: string;
 }
 
-function parseUserAgent(ua: string): UAParseResult {
+export function parseUserAgent(ua: string): UAParseResult {
   if (!ua) return { isBot: false, clientType: "unknown" };
 
   const lower = ua.toLowerCase();

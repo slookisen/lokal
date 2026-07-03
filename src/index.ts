@@ -60,6 +60,7 @@ import adminJobsRoutes from "./routes/admin-jobs";
 import platformTriggersRoutes, { adminRouter as adminTriggersRoutes } from "./routes/platform-triggers";
 import crmRoutes from "./routes/crm";
 import contactRouter from "./routes/contact";
+import contactTrackingRoutes, { redirectRouter as contactRedirectRouter } from "./routes/contact-tracking";
 import { list as blocklistList } from "./services/blocklist-service";
 import { bounceService } from "./services/bounce-service";
 import { seedData } from "./seed";
@@ -305,11 +306,26 @@ app.post("/admin/analytics/prune", adminLimiter);
 app.use("/api/tannlege", dentalLimiter);
 // Everything else gets the general limiter
 app.use("/api", generalLimiter);
+// dev-request 2026-07-03-agent-profile-conversations-stats slice 1:
+// /ut/:agentId/:kind lives outside /api (it's a bare redirect URL meant to
+// be pasted into profile pages), so it doesn't inherit the "/api" limiter
+// above — give it the same shared generalLimiter explicitly instead of a
+// bespoke one. (Same store/instance as the "/api" mount, so quota is
+// shared across both — intentional, this is still just "general API-ish
+// traffic" from one visitor's perspective.)
+app.use("/ut", generalLimiter);
 
 // ─── Routes ──────────────────────────────────────────────────
 // Public contact form — mounted first so it's available on all 3 platform hosts.
 // The endpoint only creates "kontaktskjema" CRM threads (minimum privilege).
 app.use("/api", contactRouter);
+// dev-request 2026-07-03-agent-profile-conversations-stats slice 1:
+// contact-click intent tracking (table + endpoints only — no frontend
+// wiring yet). POST beacon lives under /api/track; the counting redirect
+// is a short top-level path (/ut/...) so it can be dropped straight into
+// a profile page as an href, same style as a URL-shortener endpoint.
+app.use("/api/track", contactTrackingRoutes);
+app.use("/ut", contactRedirectRouter);
 app.use("/api/producers", producerRoutes);
 app.use("/api/producers", scanRoutes);
 app.use("/api/products", scanRoutes);
