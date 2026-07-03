@@ -14,6 +14,8 @@ import { addUtmParams } from "../utils/url-utm";
 import { isBlocked, add as blocklistAdd, list as blocklistList, remove as blocklistRemove } from "../services/blocklist-service";
 import { mergeFieldProvenance } from "./admin-knowledge";
 import { crossSourceAgreement, isAcceptableHomepageEmail, pageMentionsProducer, type FieldName } from "../services/cross-source-validator";
+import { logPlacesCall, getPlacesUsageThisMonth } from "../services/places-usage-tracker";
+import { getDb as getVerticalDb } from "../database/db-factory";
 
 // ── PR-29 v3: pure helper for Place Details (New) request params ──────────────
 // Exported so tests can assert the URL structure without touching the handler.
@@ -1814,7 +1816,15 @@ router.post("/admin/google-rating-batch", async (req: Request, res: Response) =>
 
     try {
       if (requestEnterprise) enterpriseCalls++; else proCalls++;
-
+      // Durable cross-run log (places_api_call_log) for the monthly-projection
+      // guardrail — complements the per-run enterpriseCalls/proCalls counters
+      // above, which only live for the duration of this response.
+      logPlacesCall(
+        getDb(),
+        "rfb",
+        "google-rating-batch",
+        requestEnterprise ? "text_search_enterprise" : "text_search_pro"
+      );
       const resp = await fetch("https://places.googleapis.com/v1/places:searchText", {
         method: "POST",
         headers: {
@@ -1879,6 +1889,7 @@ router.post("/admin/google-rating-batch", async (req: Request, res: Response) =>
         const needPhone = typeof place.internationalPhoneNumber !== "string" || place.internationalPhoneNumber.trim() === "";
         if ((needAddr || needPhone) && detailsCalls < effectiveCap) {
           detailsCalls++;
+          logPlacesCall(getDb(), "rfb", "google-rating-batch-details", "place_details");
           try {
             const { url: detailsUrl, fieldMask: detailsMask } = buildPlaceDetailsRequest(
               place.id,
@@ -2021,11 +2032,60 @@ router.post("/admin/google-rating-batch", async (req: Request, res: Response) =>
       // Measure 2 of dev-request 2026-07-03-places-api-cost-reduction: per-run
       // Places API call counter, split by SKU tier, so the RFB enrichment
       // SKILL / daily brief can track projected monthly Enterprise-SKU usage
-      // against the 1,000 free-calls/mo cap without parsing `results`.
+      // against the 1,000 free-calls/mo cap without parsing results.
       places_api_calls: enterpriseCalls + proCalls,
       enterprise_calls: enterpriseCalls,
       pro_calls: proCalls,
       details_calls: detailsCalls,
+    },
+  });
+});
+
+// ─── GET /admin/places-usage — Places API monthly call-usage summary ──
+// dev-request 2026-07-03-places-api-cost-reduction, measure 2: reads the
+// places_api_call_log tables (rfb + dental — physically separate DB files,
+// aggregated here at read-time) and returns this-calendar-month call counts
+// per SKU, so the daily orchestrator brief can flag when the Enterprise-SKU
+// free-tier cap (1,000 calls/month) is at risk. Observability only — never
+// touches enrichment state.
+router.get("/admin/places-usage", (req: Request, res: Response) => {
+  const adminKey = req.headers["x-admin-key"] as string;
+  const expectedKey = getAdminKey();
+  if (!expectedKey || !adminKey || adminKey !== expectedKey) {
+    res.status(403).json({ error: "Krever X-Admin-Key header" });
+    return;
+  }
+
+  const byVerticalSku: Array<{ vertical: string; sku: string; calls_this_month: number }> = [];
+  byVerticalSku.push(...getPlacesUsageThisMonth(getDb(), "rfb"));
+  // Only reach into the dental vertical DB when it's explicitly enabled —
+  // db-factory.ts's getDb("dental") lazily CREATES /app/data/dental.db (and
+  // runs the full dental schema-init) on first call, so an unconditional
+  // call here would have this read-only usage endpoint silently boot the
+  // dental vertical in an environment where it was deliberately left off
+  // (same ENABLE_DENTAL gate as src/index.ts's dental boot path).
+  if (process.env.ENABLE_DENTAL === "1") {
+    try {
+      byVerticalSku.push(...getPlacesUsageThisMonth(getVerticalDb("dental"), "dental"));
+    } catch {
+      // dental vertical enabled but unavailable for some other reason — rfb-only summary
+    }
+  }
+
+  const enterpriseCallsThisMonth = byVerticalSku
+    .filter((r) => r.sku === "text_search_enterprise")
+    .reduce((sum, r) => sum + r.calls_this_month, 0);
+  const ENTERPRISE_FREE_CAP = 1000;
+  const SOFT_GUARDRAIL_THRESHOLD = 900;
+
+  res.json({
+    success: true,
+    data: {
+      by_vertical_sku: byVerticalSku,
+      enterprise_calls_this_month: enterpriseCallsThisMonth,
+      enterprise_free_cap: ENTERPRISE_FREE_CAP,
+      soft_guardrail_threshold: SOFT_GUARDRAIL_THRESHOLD,
+      over_soft_guardrail: enterpriseCallsThisMonth > SOFT_GUARDRAIL_THRESHOLD,
     },
   });
 });

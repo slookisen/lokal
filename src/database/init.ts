@@ -2397,6 +2397,24 @@ function initSchema(db: Database.Database): void {
     db.exec(`ALTER TABLE agent_knowledge ADD COLUMN google_enterprise_fetched_at TEXT`);
   } catch { /* already exists — expected on subsequent boots */ }
 
+  // ─── dev-request 2026-07-03-places-api-cost-reduction, measure 2 (cont.) ─
+  // Call-usage log for the Google Places API, so the daily brief can flag
+  // when the Enterprise-SKU free-tier cap (1,000 calls/month) is at risk.
+  // Complements the per-run counters above (data.enterprise_calls etc. on
+  // the response) with a durable cross-run log for monthly aggregation.
+  // Written by services/places-usage-tracker.ts. Observability only — a
+  // logging failure there is caught and never blocks/alters enrichment.
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS places_api_call_log (
+      id         INTEGER PRIMARY KEY AUTOINCREMENT,
+      vertical   TEXT NOT NULL,
+      endpoint   TEXT NOT NULL,
+      sku        TEXT NOT NULL,
+      called_at  TEXT NOT NULL DEFAULT (datetime('now'))
+    )
+  `);
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_places_api_call_log_called_at ON places_api_call_log(called_at)`);
+
 }
 
 export function closeDb(): void {
