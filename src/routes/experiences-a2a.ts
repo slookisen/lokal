@@ -95,6 +95,26 @@ const FYLKER = [
   "trøndelag", "nordland", "troms", "finnmark", "svalbard",
 ];
 
+// The indoor/outdoor keywords are short Norwegian substrings ("inne", "ute")
+// that collide with unrelated words — e.g. "finne" (to find) contains "inne",
+// which previously forced indoor_outdoor="indoor" on any query using the verb
+// "finne" (dev-request 2026-07-04-opplevagent-nl-parser-og-fylkesnormalisering:
+// "hva kan vi finne på i Tromsø om vinteren?" wrongly excluded outdoor results).
+// JS's \b doesn't treat æøå as word characters, so a plain regex \b boundary
+// can't be used here. This checks the actual preceding character is not a
+// Unicode letter/digit, while leaving the keyword's own end open so inflected
+// continuations ("inne" + "ndørs" → "innendørs") still match.
+function matchesAsWordPrefix(haystack: string, keyword: string): boolean {
+  let from = 0;
+  for (;;) {
+    const idx = haystack.indexOf(keyword, from);
+    if (idx === -1) return false;
+    const precedingChar = idx > 0 ? haystack[idx - 1] : "";
+    if (!/[\p{L}\p{N}]/u.test(precedingChar)) return true;
+    from = idx + 1;
+  }
+}
+
 export function parseExperiencesIntent(text: string): DiscoverFilter {
   const lower = text.toLowerCase();
   const params: DiscoverFilter = {};
@@ -116,10 +136,10 @@ export function parseExperiencesIntent(text: string): DiscoverFilter {
     params.weather = "clear";
   }
 
-  // Indoor / outdoor detection
-  if (lower.includes("innendørs") || lower.includes("inne") || lower.includes("indoor")) {
+  // Indoor / outdoor detection (word-prefix-aware — see matchesAsWordPrefix)
+  if (matchesAsWordPrefix(lower, "inne") || matchesAsWordPrefix(lower, "indoor")) {
     params.indoor_outdoor = "indoor";
-  } else if (lower.includes("utendørs") || lower.includes("ute") || lower.includes("outdoor") || lower.includes("friluft")) {
+  } else if (matchesAsWordPrefix(lower, "ute") || matchesAsWordPrefix(lower, "outdoor") || matchesAsWordPrefix(lower, "friluft")) {
     params.indoor_outdoor = "outdoor";
   }
 

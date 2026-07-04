@@ -14635,6 +14635,14 @@ console.log("\n── orch-pr-19: opplevagent.no host-gate (experiences) ──"
   // parseExperiencesIntent: outdoor
   assertEq(parseExperiencesIntent("utendørs aktiviteter").indoor_outdoor, "outdoor",
     "orch19-05d: parseExperiencesIntent sets indoor_outdoor='outdoor'");
+  // parseExperiencesIntent: "finne" (to find) must NOT false-match the "inne"
+  // (indoors) keyword — regression for the homepage flagship demo question
+  // returning 0 results (dev-request 2026-07-04-opplevagent-nl-parser-og-fylkesnormalisering).
+  assertEq(parseExperiencesIntent("hva kan vi finne på i Tromsø om vinteren?").indoor_outdoor,
+    undefined, "orch19-05p: 'finne' does not false-trigger indoor_outdoor='indoor'");
+  // innendørs/utendørs (prefix-continuation) still detected correctly.
+  assertEq(parseExperiencesIntent("innendørs aktiviteter").indoor_outdoor, "indoor",
+    "orch19-05q: parseExperiencesIntent still sets indoor_outdoor='indoor' for 'innendørs'");
 
   // handleExperiencesMessageSend: missing message → -32602
   const noMsg19 = handleExperiencesMessageSend({}, "orch19-id") as any;
