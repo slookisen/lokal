@@ -21732,3 +21732,25 @@ console.log("\n── gardssalg-profile: produsent profile page ──");
     failures.push(`${TAG}: unexpected error: ${err instanceof Error ? (err.stack || err.message) : String(err)}`);
   }
 })();
+
+// ── orch-cat-i18n: every canonical platform category must render with a
+// translated (non-English) card-badge label. Regression for untranslated
+// "beverages"/"bakery"/"preserves"/"other" badges found live on the RFB
+// homepage featured card (dev-request 2026-07-04-rfb-datakvalitet-synlige-feil
+// item 4 — "🌱 beverages" shown between Norwegian labels).
+(() => {
+  try {
+    const seoCatMod = require("../src/routes/seo");
+    const platformCatMod = require("../src/services/search-enrich");
+    for (const cat of platformCatMod.PLATFORM_CATEGORIES as string[]) {
+      const label = seoCatMod.formatCat(cat);
+      assertTrue(
+        label !== cat,
+        `orch-cat-i18n: category '${cat}' has a translated card-badge label (got '${label}')`
+      );
+    }
+  } catch (err) {
+    failed++;
+    failures.push(`orch-cat-i18n: unexpected error: ${err instanceof Error ? (err.stack || err.message) : String(err)}`);
+  }
+})();
