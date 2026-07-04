@@ -21458,3 +21458,277 @@ console.log("\n── gardssalg-profile: produsent profile page ──");
   dbFacGP.__resetDbFactoryForTesting();
   console.log("  gardssalg-profile: OK (unknown-slug 404, full profile render + sections, badge, CTA, practical-info, map, JSON-LD, OG/Twitter, category-card link, booking-panel regression)");
 })();
+
+// ── orch-pr-20260704 tasks-prune-async: background job for /ops/tasks-prune
+// and /ops/vacuum, so the 2026-07-04 incident (a single-transaction DELETE
+// over ~4093 `tasks` rows, immediately followed by wal_checkpoint(TRUNCATE),
+// blocked the single-threaded Node event loop for ~12 minutes) can't recur.
+// This block uses its own in-memory DB + own express app/HTTP server on an
+// ephemeral port, but — like many other blocks in this file — it DOES pin
+// the shared getDb() singleton (via __setDbForTesting) for the duration of
+// its HTTP requests, and it shares process.env.ANALYTICS_ADMIN_KEY with
+// every other block that exercises analytics.ts admin routes. Rather than
+// wiring into the file's _prNN handle-coordination scheme, its req() helper
+// (below) defensively re-pins both globals immediately before every request
+// and retries on {401,500} — see the comment on req() for why that's the
+// right fix here (a pre-existing hazard in this shared-process suite, not a
+// bug in the feature under test). Appended after the REPORT IIFE (see the
+// many other post-REPORT blocks above for precedent) — the REPORT IIFE's
+// own chain of awaits takes many seconds in this suite, giving this block's
+// sub-second async work ample time to finish (and fold its passed/failed
+// counts into the shared tally) well before process.exit.
+(async () => {
+  console.log("\n── orch-pr-20260704: tasks-prune / vacuum async background jobs ──");
+  const TAG = "tasks-prune-async";
+  try {
+    const sqlite = require("better-sqlite3");
+    const httpMod = await import("http");
+    const expressMod = (await import("express")).default;
+    const initMod = await import("../src/database/init");
+    const analyticsMod = await import("../src/routes/analytics");
+
+    const ADMIN_KEY = "tpa-test-admin-key-20260704";
+    const prevAnalyticsKey = process.env.ANALYTICS_ADMIN_KEY;
+    process.env.ANALYTICS_ADMIN_KEY = ADMIN_KEY;
+
+    const tpaDb = new sqlite(":memory:");
+    initMod.__setDbForTesting(tpaDb as any);
+    initMod.__initSchemaForTesting(tpaDb as any);
+
+    // ── Seed: mirror the incident's shape — thousands of terminal `tasks`
+    // rows with sizeable params/result/error blobs (~20KB/row average), all
+    // older than the 30-day default cutoff, plus a few rows that must NOT be
+    // touched (in-flight status, or too recent) to prove the WHERE filter
+    // still holds under the new chunked delete.
+    const ELIGIBLE_ROWS = 4200; // 21 chunks of 200 — exercises multi-chunk yielding
+    const BLOB = "x".repeat(7000); // ~7KB per column × 3 columns ≈ 20KB/row
+    const statuses = ["completed", "failed", "canceled"];
+    const insertOld = tpaDb.prepare(
+      "INSERT INTO tasks (id, consumer_agent_id, method, params, status, result, error, created_at, updated_at) " +
+      "VALUES (?, 'tpa-agent', 'tpa.method', ?, ?, ?, ?, datetime('now','-60 days'), datetime('now','-60 days'))"
+    );
+    const seedOld = tpaDb.transaction(() => {
+      for (let i = 0; i < ELIGIBLE_ROWS; i++) {
+        insertOld.run(`tpa-old-${i}`, BLOB, statuses[i % 3], BLOB, BLOB);
+      }
+    });
+    seedOld();
+
+    // In-flight — must survive regardless of age (status filter excludes it).
+    tpaDb.prepare(
+      "INSERT INTO tasks (id, consumer_agent_id, method, params, status, result, error, created_at, updated_at) " +
+      "VALUES ('tpa-inflight-1', 'tpa-agent', 'tpa.method', '{}', 'working', NULL, NULL, datetime('now','-60 days'), datetime('now','-60 days'))"
+    ).run();
+    // Recent completed — must survive (not older than cutoff).
+    tpaDb.prepare(
+      "INSERT INTO tasks (id, consumer_agent_id, method, params, status, result, error, created_at, updated_at) " +
+      "VALUES ('tpa-recent-1', 'tpa-agent', 'tpa.method', '{}', 'completed', '{}', NULL, datetime('now'), datetime('now'))"
+    ).run();
+
+    const totalRowsBefore = (tpaDb.prepare("SELECT COUNT(*) as c FROM tasks").get() as any).c;
+    assertEq(totalRowsBefore, ELIGIBLE_ROWS + 2, `${TAG}: seeded ${ELIGIBLE_ROWS} eligible + 2 non-eligible rows`);
+
+    // ── Mount the real router on a real HTTP server, exactly as prod does.
+    const app = expressMod();
+    app.use(expressMod.json({ limit: "10mb" }));
+    app.use("/admin/analytics", analyticsMod.default);
+
+    const server = httpMod.createServer(app);
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", () => resolve()));
+    const addr = server.address();
+    const port = typeof addr === "object" && addr ? addr.port : 0;
+
+    function rawReq(
+      method: string,
+      urlPath: string,
+      opts: { headers?: Record<string, string>; json?: unknown } = {}
+    ): Promise<{ status: number; body: string; json: any }> {
+      return new Promise((resolve, reject) => {
+        const bodyStr = opts.json !== undefined ? JSON.stringify(opts.json) : undefined;
+        const headers: Record<string, string> = { "X-Admin-Key": ADMIN_KEY, ...(opts.headers || {}) };
+        if (bodyStr) headers["Content-Type"] = "application/json";
+        const r = httpMod.request(
+          { method, host: "127.0.0.1", port, path: urlPath, headers },
+          (resp) => {
+            const chunks: Buffer[] = [];
+            resp.on("data", (c) => chunks.push(c as Buffer));
+            resp.on("end", () => {
+              const body = Buffer.concat(chunks).toString("utf8");
+              let json: any = null;
+              try { json = JSON.parse(body); } catch { /* not JSON */ }
+              resolve({ status: resp.statusCode || 0, body, json });
+            });
+          }
+        );
+        r.on("error", reject);
+        if (bodyStr) r.write(bodyStr);
+        r.end();
+      });
+    }
+
+    // req() wraps rawReq() with a defensive retry-on-{401,500}. This suite
+    // runs dozens of independent test blocks as CONCURRENT top-level async
+    // IIFEs sharing one Node process and one getDb() singleton:
+    //  - At least one other block (pr-74, far earlier in this file) does
+    //    `process.env.ANALYTICS_ADMIN_KEY = "..."` WITHOUT ever restoring
+    //    it, so if that write interleaves after ours, requireAdminAuth
+    //    starts rejecting our X-Admin-Key with 401 for the rest of the
+    //    process even though nothing is wrong with the feature under test.
+    //  - Many blocks (including this one) call __setDbForTesting() to pin
+    //    the shared getDb() singleton to their own in-memory DB for the
+    //    duration of their requests; a fresh HTTP request (unlike our
+    //    already-running background job, which captured its own `db`
+    //    reference once via a local `const db = getDb()` and is therefore
+    //    immune) calls getDb() anew on each call, so if another block's
+    //    __setDbForTesting() write interleaves between our requests, ours
+    //    can transiently hit a DB with no `tasks` table → 500.
+    // Both are pre-existing test-suite-wide hazards around shared mutable
+    // module state, unrelated to the tasks-prune/vacuum behavior this block
+    // actually verifies — re-pinning both globals and retrying is the
+    // correct fix here, not a change to analytics.ts.
+    async function req(
+      method: string,
+      urlPath: string,
+      opts: { headers?: Record<string, string>; json?: unknown } = {}
+    ): Promise<{ status: number; body: string; json: any }> {
+      for (let attempt = 0; attempt < 25; attempt++) {
+        process.env.ANALYTICS_ADMIN_KEY = ADMIN_KEY;
+        initMod.__setDbForTesting(tpaDb as any);
+        const resp = await rawReq(method, urlPath, opts);
+        if (resp.status !== 401 && resp.status !== 500) return resp;
+        await new Promise((r) => setImmediate(r));
+      }
+      // Give up after many retries — pin both globals once more and return
+      // whatever the final attempt yields so the assertion messages show
+      // the real (unexpected) status rather than looping forever.
+      process.env.ANALYTICS_ADMIN_KEY = ADMIN_KEY;
+      initMod.__setDbForTesting(tpaDb as any);
+      return rawReq(method, urlPath, opts);
+    }
+
+    // ── #137 regression guard: dry-run response shape is UNCHANGED ─────────
+    const dry = await req("POST", "/admin/analytics/ops/tasks-prune", { json: { dryRun: true } });
+    assertEq(dry.status, 200, `${TAG}: dry-run returns 200`);
+    assertEq(dry.json?.success, true, `${TAG}: dry-run success=true`);
+    assertEq(dry.json?.action, "tasks-prune-dry-run", `${TAG}: dry-run action unchanged`);
+    assertEq(dry.json?.daysToKeep, 30, `${TAG}: dry-run default daysToKeep=30 unchanged`);
+    assertTrue(typeof dry.json?.cutoff === "string", `${TAG}: dry-run has cutoff string`);
+    assertEq(dry.json?.eligibleRows, ELIGIBLE_ROWS, `${TAG}: dry-run eligibleRows matches seeded eligible rows (got ${dry.json?.eligibleRows})`);
+    assertTrue(typeof dry.json?.eligibleMb === "number", `${TAG}: dry-run has eligibleMb number`);
+    assertEq(dry.json?.totalRows, totalRowsBefore, `${TAG}: dry-run totalRows matches full table count`);
+    assertEq(dry.json?.note, "Pass dryRun:false to execute the delete.", `${TAG}: dry-run note text unchanged`);
+    const dryKeys = Object.keys(dry.json || {}).sort();
+    assertEq(
+      dryKeys.join(","),
+      ["action", "cutoff", "daysToKeep", "eligibleMb", "eligibleRows", "note", "success", "totalRows"].sort().join(","),
+      `${TAG}: dry-run response has exactly the same key set as before (no shape drift)`
+    );
+
+    // ── Kick off the real (dryRun:false) prune — must return 202 immediately,
+    // not block until the delete finishes.
+    const kickoff = await req("POST", "/admin/analytics/ops/tasks-prune", { json: { dryRun: false } });
+    assertEq(kickoff.status, 202, `${TAG}: dryRun:false responds 202 (not blocking) (got ${kickoff.status})`);
+    assertTrue(typeof kickoff.json?.jobId === "string" && kickoff.json.jobId.length > 0, `${TAG}: 202 response carries a jobId`);
+    const jobId = kickoff.json.jobId as string;
+
+    // ── Concurrency lock: a second maintenance POST while one is active
+    // must be rejected with 409 — this is checked immediately (activeJobId
+    // is set synchronously before the 202 above is even sent), so it's not
+    // a timing-sensitive assertion.
+    const dupe = await req("POST", "/admin/analytics/ops/tasks-prune", { json: { dryRun: false } });
+    assertEq(dupe.status, 409, `${TAG}: concurrent second tasks-prune POST returns 409 while a job is active`);
+    assertEq(dupe.json?.error, "job_in_progress", `${TAG}: 409 body identifies job_in_progress`);
+    assertEq(dupe.json?.activeJobId, jobId, `${TAG}: 409 body reports the active jobId`);
+
+    const dupeVacuum = await req("POST", "/admin/analytics/ops/vacuum", {});
+    assertEq(dupeVacuum.status, 409, `${TAG}: vacuum POST also blocked (409) by the same cross-endpoint lock while prune is active`);
+
+    // ── The core regression proof: while the (multi-chunk, yielding) delete
+    // job runs in the background, concurrent HTTP requests must keep being
+    // served promptly — well under 500ms — instead of the ~12-minute stall
+    // from the incident. Hammer the job-status endpoint with bursts of
+    // concurrent requests until the job finishes, asserting every burst's
+    // max latency stays low, and recording whether we observed it mid-run.
+    let sawRunning = false;
+    let finalJob: any = null;
+    let maxBurstLatencyMs = 0;
+    const deadline = Date.now() + 10_000;
+    let rounds = 0;
+    while (Date.now() < deadline) {
+      rounds++;
+      const t0 = Date.now();
+      const burst = await Promise.all(
+        Array.from({ length: 4 }, () => req("GET", `/admin/analytics/ops/jobs/${jobId}`, {}))
+      );
+      const elapsed = Date.now() - t0;
+      maxBurstLatencyMs = Math.max(maxBurstLatencyMs, elapsed);
+      assertTrue(
+        elapsed < 500,
+        `${TAG}: concurrent burst of 4 requests during the running job responded in ${elapsed}ms (< 500ms) [round ${rounds}]`
+      );
+      for (const r of burst) {
+        assertEq(r.status, 200, `${TAG}: GET /ops/jobs/:jobId returns 200 during job [round ${rounds}]`);
+      }
+      const statuses2 = burst.map((r) => r.json?.status);
+      if (statuses2.includes("running")) sawRunning = true;
+      if (statuses2.some((s) => s === "done" || s === "failed")) {
+        finalJob = burst.find((r) => r.json?.status === "done" || r.json?.status === "failed")?.json;
+        break;
+      }
+    }
+    assertTrue(finalJob !== null, `${TAG}: job reached a terminal state (done/failed) within 10s (not hung)`);
+    assertTrue(sawRunning, `${TAG}: at least one concurrent poll observed status="running" mid-job (proves it's genuinely async, not instant/synchronous)`);
+    console.log(`  ${TAG}: job completed in ${rounds} poll round(s), max concurrent-burst latency ${maxBurstLatencyMs}ms`);
+
+    if (finalJob) {
+      assertEq(finalJob.status, "done", `${TAG}: job finishes with status=done`);
+      assertEq(finalJob.type, "tasks-prune", `${TAG}: job type is tasks-prune`);
+      assertEq(finalJob.rowsDeleted, ELIGIBLE_ROWS, `${TAG}: rowsDeleted matches the dry-run's eligibleRows (${ELIGIBLE_ROWS})`);
+      assertEq(finalJob.rowsRemaining, 0, `${TAG}: rowsRemaining is 0 once the job is done`);
+      assertTrue(typeof finalJob.startedAt === "string", `${TAG}: job has startedAt`);
+      assertTrue(typeof finalJob.finishedAt === "string", `${TAG}: job has finishedAt`);
+    }
+
+    // ── Verify the actual DB state matches: eligible rows gone, the two
+    // untouched rows (in-flight + too-recent) survive.
+    const totalRowsAfter = (tpaDb.prepare("SELECT COUNT(*) as c FROM tasks").get() as any).c;
+    assertEq(totalRowsAfter, 2, `${TAG}: only the 2 non-eligible rows remain after the job completes`);
+    const inflightSurvives = tpaDb.prepare("SELECT 1 FROM tasks WHERE id = 'tpa-inflight-1'").get();
+    assertTrue(!!inflightSurvives, `${TAG}: in-flight task (status='working') was never touched`);
+    const recentSurvives = tpaDb.prepare("SELECT 1 FROM tasks WHERE id = 'tpa-recent-1'").get();
+    assertTrue(!!recentSurvives, `${TAG}: recent completed task (younger than cutoff) was never touched`);
+
+    // ── Now that no job is active, the lock must be released — a fresh
+    // maintenance POST should be accepted again (202), not 409.
+    const afterUnlock = await req("POST", "/admin/analytics/ops/tasks-prune", { json: { dryRun: false } });
+    assertEq(afterUnlock.status, 202, `${TAG}: lock released after job completion — a new tasks-prune POST returns 202 again`);
+    // That second run should find 0 eligible rows left (idempotent re-run).
+    if (afterUnlock.status === 202 && typeof afterUnlock.json?.jobId === "string") {
+      const secondJobId = afterUnlock.json.jobId as string;
+      const secondDeadline = Date.now() + 5_000;
+      let secondFinal: any = null;
+      while (Date.now() < secondDeadline) {
+        const poll = await req("GET", `/admin/analytics/ops/jobs/${secondJobId}`, {});
+        if (poll.json?.status === "done" || poll.json?.status === "failed") { secondFinal = poll.json; break; }
+        await new Promise((r) => setTimeout(r, 10));
+      }
+      assertTrue(secondFinal !== null, `${TAG}: idempotent re-run job also completes`);
+      if (secondFinal) {
+        assertEq(secondFinal.rowsDeleted, 0, `${TAG}: idempotent re-run deletes 0 rows (already-deleted rows don't match the filter again)`);
+      }
+    }
+
+    // ── Unknown jobId → 404 (not a crash / not confused with 200).
+    const notFound = await req("GET", "/admin/analytics/ops/jobs/does-not-exist", {});
+    assertEq(notFound.status, 404, `${TAG}: GET /ops/jobs/:jobId with unknown id returns 404`);
+
+    server.close();
+    if (prevAnalyticsKey === undefined) delete process.env.ANALYTICS_ADMIN_KEY;
+    else process.env.ANALYTICS_ADMIN_KEY = prevAnalyticsKey;
+    initMod.__setDbForTesting(null as any);
+    console.log(`  ${TAG}: OK (202-not-blocking, 409 concurrency lock cross-endpoint, chunked yielding under concurrent load, correct final counts, filter idempotency, dry-run #137 shape unchanged, 404 on unknown job)`);
+  } catch (err) {
+    failed++;
+    failures.push(`${TAG}: unexpected error: ${err instanceof Error ? (err.stack || err.message) : String(err)}`);
+  }
+})();
