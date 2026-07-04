@@ -381,8 +381,17 @@ export function countPendingVerify(db: any): number {
 //   - growthCount = Math.floor(limit * growthRatio)   (default 21 of 30)
 //   - verifiedCount = limit - growthCount             (default 9 of 30)
 //   - growth sub-query: WHERE verification_status IN
-//       ('pending_verify','review_required','data_insufficient')
+//       ('unverified','pending_verify','review_required','data_insufficient')
 //   - verified sub-query: WHERE verification_status = 'verified'
+//
+// orch-pr-20260704-poolfix: 'unverified' (the agent_knowledge column
+// DEFAULT for brand-new rows, see database/init.ts) added to the growth
+// bucket. It was previously in neither bucket here, so newly-created
+// agents were silently skipped by every run of the hourly cron once the
+// legacy pending_verify backlog drained — pickBatch (the non-biased
+// picker) already includes 'unverified' via its blanket
+// `NOT IN ('opt_out')` filter, so this just brings pickBatchBiased back
+// in line with that existing, wider population.
 //   - both ordered HTTP-failed-first then oldest last_verified_at first
 //     (matches pickBatch's existing front-bump behaviour).
 //
@@ -413,7 +422,7 @@ export function pickBatchBiased(
   const growthRows = growthTarget > 0
     ? db.prepare(
         `${SELECT_COLS}
-          WHERE k.verification_status IN ('pending_verify', 'review_required', 'data_insufficient')
+          WHERE k.verification_status IN ('unverified', 'pending_verify', 'review_required', 'data_insufficient')
           ${ORDER}
           LIMIT ?`
       ).all(growthTarget)
@@ -449,7 +458,7 @@ export function pickBatchBiased(
   if (verifiedDeficit > 0) {
     extraGrowth = db.prepare(
       `${SELECT_COLS}
-        WHERE k.verification_status IN ('pending_verify', 'review_required', 'data_insufficient')
+        WHERE k.verification_status IN ('unverified', 'pending_verify', 'review_required', 'data_insufficient')
         ${ORDER}
         LIMIT ?`
     ).all(growthTarget + verifiedDeficit);
