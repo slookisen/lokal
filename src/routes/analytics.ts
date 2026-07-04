@@ -1,5 +1,6 @@
 import { Router, Request, Response } from "express";
 import path from "path";
+import { randomUUID } from "crypto";
 import { getDb } from "../database/init";
 import { analyticsService, VerticalId } from "../services/analytics-service";
 
@@ -814,13 +815,125 @@ router.post("/ops/prune", (req: Request, res: Response) => {
   }
 });
 
+// ─── Background maintenance jobs (tasks-prune / vacuum) ─────────────────────
+// Incident (2026-07-04): a single-transaction DELETE over ~4093 `tasks` rows
+// (with sizeable params/result/error BLOB columns) immediately followed by
+// `wal_checkpoint(TRUNCATE)` blocked the single-threaded Node event loop for
+// ~12 minutes in production, because better-sqlite3 is a SYNCHRONOUS API —
+// every call blocks the JS thread for its full duration with zero yielding.
+// The fix: run the delete (and VACUUM) as background jobs, chunked in small
+// transactions with an explicit yield (setImmediate) between chunks so
+// concurrent HTTP requests keep getting served while the job runs, and let
+// callers poll GET /ops/jobs/:jobId instead of holding a request open.
+//
+// In-memory only — jobs don't need to survive a process restart, and a
+// process-wide lock (activeJobId) ensures only one maintenance job (prune OR
+// vacuum) runs at a time, since two concurrent runs of this class of job is
+// what made the original incident worse.
+type MaintenanceJobType = "tasks-prune" | "vacuum";
+type MaintenanceJobStatus = "running" | "done" | "failed";
+
+interface MaintenanceJob {
+  jobId: string;
+  type: MaintenanceJobType;
+  status: MaintenanceJobStatus;
+  rowsDeleted: number;
+  rowsRemaining: number;
+  startedAt: string;
+  finishedAt?: string;
+  error?: string;
+  // vacuum-only, populated on completion
+  sizeBeforeMb?: number;
+  sizeAfterMb?: number;
+  freedMb?: number;
+}
+
+const jobRegistry = new Map<string, MaintenanceJob>();
+let activeJobId: string | null = null;
+
+const PRUNE_CHUNK_SIZE = 200;
+// Passive checkpoint every N chunks (=N*PRUNE_CHUNK_SIZE rows) during a prune
+// job. PASSIVE never blocks on concurrent readers/writers (unlike TRUNCATE),
+// so it's safe to run mid-job.
+const PRUNE_CHECKPOINT_EVERY_N_CHUNKS = 10;
+
+function yieldToEventLoop(): Promise<void> {
+  return new Promise((resolve) => setImmediate(resolve));
+}
+
 /**
- * POST /admin/analytics/ops/vacuum
- * Run SQLite VACUUM to reclaim disk space and defragment.
- * Use when: DB size seems large relative to row counts (fragmentation).
- * WARNING: This locks the DB briefly — don't run during peak traffic.
+ * Chunked background delete for /ops/tasks-prune {dryRun:false}.
+ * Deletes at most PRUNE_CHUNK_SIZE rows per transaction, yielding to the
+ * event loop between chunks. Idempotent/resumable: the WHERE filter
+ * (status IN (...) AND created_at < cutoff) naturally skips already-deleted
+ * rows, so re-running (or a job that dies mid-way) is always safe — no
+ * separate resume-state is needed beyond the activeJobId lock.
  */
-router.post("/ops/vacuum", (_req: Request, res: Response) => {
+async function runTasksPruneJob(jobId: string, cutoff: string): Promise<void> {
+  const job = jobRegistry.get(jobId);
+  if (!job) return;
+  try {
+    const db = getDb();
+    const deleteChunk = db.prepare(
+      "DELETE FROM tasks WHERE rowid IN (SELECT rowid FROM tasks WHERE status IN ('completed','failed','canceled') AND created_at < ? LIMIT ?)"
+    );
+    let chunkCount = 0;
+    for (;;) {
+      const result = deleteChunk.run(cutoff, PRUNE_CHUNK_SIZE);
+      const changes = result.changes;
+      chunkCount++;
+      job.rowsDeleted += changes;
+      job.rowsRemaining = Math.max(0, job.rowsRemaining - changes);
+
+      if (changes === 0) break; // nothing left eligible
+
+      if (chunkCount % PRUNE_CHECKPOINT_EVERY_N_CHUNKS === 0) {
+        // PASSIVE only — never TRUNCATE while the job is actively deleting.
+        db.pragma("wal_checkpoint(PASSIVE)");
+      }
+
+      // Yield control back to the event loop so queued HTTP requests get a
+      // turn before we start the next chunk's transaction.
+      await yieldToEventLoop();
+    }
+
+    // Final passive checkpoint now that deletes are done. TRUNCATE is
+    // reserved for the dedicated vacuum job — running it here (as the old
+    // synchronous code did right after the delete) is exactly the pattern
+    // that stalled prod, since TRUNCATE requires no concurrent readers or
+    // writers holding the WAL.
+    db.pragma("wal_checkpoint(PASSIVE)");
+
+    job.status = "done";
+    job.finishedAt = new Date().toISOString();
+  } catch (err) {
+    job.status = "failed";
+    job.error = String(err);
+    job.finishedAt = new Date().toISOString();
+  } finally {
+    if (activeJobId === jobId) activeJobId = null;
+  }
+}
+
+/**
+ * Background job wrapper for /ops/vacuum. Responds 202 immediately; the
+ * actual work (checkpoint + VACUUM) runs here.
+ *
+ * IMPORTANT: db.exec("VACUUM") itself is a single, synchronous,
+ * un-chunkable better-sqlite3 call — SQLite rewrites the entire database
+ * file in one pass and there is no API to break that into yieldable steps.
+ * This job therefore STILL briefly blocks the Node event loop for VACUUM's
+ * duration (proportional to DB size) — that is a SQLite/better-sqlite3
+ * constraint, not something this chunking can fix. What this DOES fix: the
+ * HTTP response is no longer held open for that duration (caller gets 202 +
+ * jobId immediately and can poll GET /ops/jobs/:jobId instead of blocking a
+ * TCP connection), and the initial wal_checkpoint(PASSIVE) + yield below
+ * moves as much work as possible out of the blocking section. Schedule
+ * vacuum runs off-peak regardless.
+ */
+async function runVacuumJob(jobId: string): Promise<void> {
+  const job = jobRegistry.get(jobId);
+  if (!job) return;
   try {
     const db = getDb();
     const fs = require("fs");
@@ -829,19 +942,89 @@ router.post("/ops/vacuum", (_req: Request, res: Response) => {
     let sizeBefore = 0;
     try { sizeBefore = fs.statSync(dbPath).size; } catch {}
 
+    // Passive checkpoint first — never blocks on concurrent readers/writers.
+    db.pragma("wal_checkpoint(PASSIVE)");
+    await yieldToEventLoop();
+
+    // Terminal step — unavoidably blocking, see doc comment above.
     db.pragma("wal_checkpoint(TRUNCATE)");
     db.exec("VACUUM");
 
     let sizeAfter = 0;
     try { sizeAfter = fs.statSync(dbPath).size; } catch {}
 
-    res.json({
-      success: true,
-      action: "vacuum",
-      sizeBefore: `${(sizeBefore / 1024 / 1024).toFixed(1)}MB`,
-      sizeAfter: `${(sizeAfter / 1024 / 1024).toFixed(1)}MB`,
-      freedMb: ((sizeBefore - sizeAfter) / 1024 / 1024).toFixed(1),
+    job.sizeBeforeMb = Number((sizeBefore / 1024 / 1024).toFixed(1));
+    job.sizeAfterMb = Number((sizeAfter / 1024 / 1024).toFixed(1));
+    job.freedMb = Number(((sizeBefore - sizeAfter) / 1024 / 1024).toFixed(1));
+    job.status = "done";
+    job.finishedAt = new Date().toISOString();
+  } catch (err) {
+    job.status = "failed";
+    job.error = String(err);
+    job.finishedAt = new Date().toISOString();
+  } finally {
+    if (activeJobId === jobId) activeJobId = null;
+  }
+}
+
+/**
+ * GET /admin/analytics/ops/jobs/:jobId
+ * Poll status/progress of a background maintenance job (tasks-prune or
+ * vacuum) started via the endpoints below.
+ */
+router.get("/ops/jobs/:jobId", (req: Request, res: Response) => {
+  const job = jobRegistry.get(String(req.params.jobId));
+  if (!job) {
+    res.status(404).json({ success: false, error: "job_not_found" });
+    return;
+  }
+  res.json({ success: true, ...job });
+});
+
+/**
+ * POST /admin/analytics/ops/vacuum
+ * Run SQLite VACUUM to reclaim disk space and defragment.
+ * Use when: DB size seems large relative to row counts (fragmentation).
+ * WARNING: VACUUM itself still briefly locks/blocks the process (see the
+ * doc comment on runVacuumJob above) — this endpoint no longer holds the
+ * HTTP response open for it, but you should still schedule runs off-peak.
+ *
+ * Responds 202 {jobId} immediately; poll GET /ops/jobs/:jobId for status.
+ * Only one maintenance job (this or tasks-prune) may run at a time — a
+ * second POST while one is active gets 409 {error:"job_in_progress"}.
+ */
+router.post("/ops/vacuum", (_req: Request, res: Response) => {
+  try {
+    if (activeJobId) {
+      const active = jobRegistry.get(activeJobId);
+      res.status(409).json({ success: false, error: "job_in_progress", activeJobId, activeJobType: active?.type });
+      return;
+    }
+
+    const jobId = randomUUID();
+    const job: MaintenanceJob = {
+      jobId,
+      type: "vacuum",
+      status: "running",
+      rowsDeleted: 0,
+      rowsRemaining: 0,
+      startedAt: new Date().toISOString(),
+    };
+    jobRegistry.set(jobId, job);
+    activeJobId = jobId;
+
+    // Fire-and-forget: the job updates its own registry entry as it runs.
+    runVacuumJob(jobId).catch((err) => {
+      const j = jobRegistry.get(jobId);
+      if (j) {
+        j.status = "failed";
+        j.error = String(err);
+        j.finishedAt = new Date().toISOString();
+      }
+      if (activeJobId === jobId) activeJobId = null;
     });
+
+    res.status(202).json({ success: true, jobId, action: "vacuum" });
   } catch (err) {
     res.status(500).json({ success: false, error: String(err) });
   }
@@ -852,7 +1035,15 @@ router.post("/ops/vacuum", (_req: Request, res: Response) => {
  * Delete terminal A2A tasks (completed/failed/canceled) older than N days.
  * Tasks in-flight (submitted/working/input-required) are never touched.
  * Body: { dryRun?: boolean (default true), daysToKeep?: number (default 30) }
- * Set dryRun:false to perform the actual delete.
+ *
+ * dryRun:true (default) — UNCHANGED: synchronous, fast, read-only, same
+ * response shape as before (PR #137).
+ *
+ * dryRun:false — runs as a background job (see runTasksPruneJob above):
+ * responds 202 {jobId} immediately instead of blocking until the delete
+ * finishes. Poll GET /ops/jobs/:jobId for progress. Only one maintenance
+ * job (this or vacuum) may run at a time — a second POST while one is
+ * active gets 409 {error:"job_in_progress"}.
  */
 router.post("/ops/tasks-prune", (req: Request, res: Response) => {
   try {
@@ -879,24 +1070,44 @@ router.post("/ops/tasks-prune", (req: Request, res: Response) => {
       });
     }
 
-    const before = (db.prepare("SELECT COUNT(*) as c FROM tasks").get() as any).c;
-    const result = db.prepare(
-      "DELETE FROM tasks WHERE status IN ('completed','failed','canceled') AND created_at < ?"
-    ).run(cutoff);
-    const after = (db.prepare("SELECT COUNT(*) as c FROM tasks").get() as any).c;
-    db.pragma("wal_checkpoint(TRUNCATE)");
+    if (activeJobId) {
+      const active = jobRegistry.get(activeJobId);
+      res.status(409).json({ success: false, error: "job_in_progress", activeJobId, activeJobType: active?.type });
+      return;
+    }
 
-    return res.json({
-      success: true,
-      action: "tasks-prune",
-      daysToKeep,
-      cutoff,
-      deletedRows: result.changes,
-      remainingRows: after,
-      rowsBefore: before,
+    const eligible = (db.prepare(
+      "SELECT COUNT(*) as c FROM tasks WHERE status IN ('completed','failed','canceled') AND created_at < ?"
+    ).get(cutoff) as any).c ?? 0;
+
+    const jobId = randomUUID();
+    const job: MaintenanceJob = {
+      jobId,
+      type: "tasks-prune",
+      status: "running",
+      rowsDeleted: 0,
+      rowsRemaining: eligible,
+      startedAt: new Date().toISOString(),
+    };
+    jobRegistry.set(jobId, job);
+    activeJobId = jobId;
+
+    // Fire-and-forget: the job updates its own registry entry as it runs.
+    runTasksPruneJob(jobId, cutoff).catch((err) => {
+      const j = jobRegistry.get(jobId);
+      if (j) {
+        j.status = "failed";
+        j.error = String(err);
+        j.finishedAt = new Date().toISOString();
+      }
+      if (activeJobId === jobId) activeJobId = null;
     });
+
+    res.status(202).json({ success: true, jobId, action: "tasks-prune", daysToKeep, cutoff, eligibleRows: eligible });
+    return;
   } catch (err) {
-    return res.status(500).json({ success: false, error: String(err) });
+    res.status(500).json({ success: false, error: String(err) });
+    return;
   }
 });
 
