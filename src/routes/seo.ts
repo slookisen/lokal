@@ -109,8 +109,21 @@ const CATEGORY_MAP: Record<string, { name: string; emoji: string }> = {
   herbs: { name: "Urter", emoji: "&#127807;" },
 };
 
-function formatCat(cat: string): string {
-  return CATEGORY_MAP[cat]?.name || cat;
+// Badge-label-only translations for platform categories (search-enrich.ts
+// PLATFORM_CATEGORIES) that are intentionally NOT in CATEGORY_MAP above.
+// CATEGORY_MAP also drives the homepage category-tile grid (see catCards
+// below) — adding a browsable tile per category is a separate decision from
+// just translating a card badge, so these stay label-only. Without this,
+// producer-card badges fell back to the raw English key (e.g. "🌱 beverages"
+// on the Kringler Gjestegård card) — dev-request
+// 2026-07-04-rfb-datakvalitet-synlige-feil item 4.
+const CATEGORY_BADGE_LABELS_ONLY: Record<string, string> = {
+  bakery: "Bakeri", beverages: "Drikke", preserves: "Syltetøy", other: "Annet",
+};
+
+// Exported for unit tests (translation-completeness sweep).
+export function formatCat(cat: string): string {
+  return CATEGORY_MAP[cat]?.name || CATEGORY_BADGE_LABELS_ONLY[cat] || cat;
 }
 function catEmoji(cat: string): string {
   return CATEGORY_MAP[cat]?.emoji || "&#127793;";
