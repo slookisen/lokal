@@ -19318,6 +19318,7 @@ console.log("\n── orch-pr-14: MCP discovery product_id surfacing ──");
   try { await _adminDbTableSizesPromise; } catch { /* errors already pushed to failures */ }
   try { await _contactClickTrackingPromise; } catch { /* errors already pushed to failures */ }
   try { await _homepageProvenanceEmailBackfillPromise; } catch { /* errors already pushed to failures */ }
+  try { await _oaHomeCountersPromise; } catch { /* errors already pushed to failures */ }
   // PR-109 tests are synchronous (IIFE) — no promise needed
   // Drop pre-existing intg failures (unmasked by awaiting) — they predate M2
   // and live behind a separate fix-it task. Counting them here would surface
@@ -20803,6 +20804,40 @@ Promise.all([_contactClickTrackingPromise, _orchPr20260614Promise]).then(async (
     failures.push("homepage-provenance-email-backfill: unexpected error: " + String(err?.message || err));
   } finally {
     _homepageProvenanceEmailBackfillResolve();
+  }
+});
+
+// ── oa-home-counters (2026-07-05): OA homepage counter strip ────────────────
+// dev-request 2026-07-04-opplevagent-besokstall-og-forside-friskhet item 1.
+// Chained off _homepageProvenanceEmailBackfillPromise (same reasoning as the
+// blocks above): this block also swaps the global getDb() singleton (rfb
+// main DB, for analytics_page_views) via __setDbForTesting, so it must run
+// serially after the other singleton-swapping blocks, not concurrently with
+// them. It additionally uses EXPERIENCES_DB_PATH=":memory:" + db-factory's
+// __resetDbFactoryForTesting() for the catalog side — self-contained and
+// restored in its own finally block, so it doesn't need to serialize against
+// the (non-DB-singleton) synchronous experiences-seo IIFE blocks later in
+// this file.
+let _oaHomeCountersResolve: () => void = () => {};
+const _oaHomeCountersPromise: Promise<void> = new Promise<void>(r => {
+  _oaHomeCountersResolve = r;
+});
+
+_homepageProvenanceEmailBackfillPromise.then(async () => {
+  console.log("\n── oa-home-counters: OA homepage counter strip (catalog counts + host-scoped traffic) ──");
+  try {
+    const { runOaHomeCountersTests } = require("../src/services/oa-home-counters.test") as
+      typeof import("../src/services/oa-home-counters.test");
+    const jr = await runOaHomeCountersTests({ log: false });
+    passed += jr.passed;
+    failed += jr.failed;
+    for (const f of jr.failures) failures.push("oa-home-counters: " + f);
+    console.log(`  oa-home-counters: ${jr.passed} passed, ${jr.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("oa-home-counters: unexpected error: " + String(err?.message || err));
+  } finally {
+    _oaHomeCountersResolve();
   }
 });
 
