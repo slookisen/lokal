@@ -512,6 +512,68 @@ export function listPublishedKommuner(): Array<{ kommune: string; fylke: string 
     .all() as Array<{ kommune: string; fylke: string | null; count: number }>;
 }
 
+// GEO: aggregate FAQ-relevant stats for the category/kommune browse pages
+// (dev-request 2026-06-30-geo-content-structured-data, category/city slice —
+// the producer-vertical city page already has this in routes/seo.ts; these
+// two feed the experiences-vertical `/kategori/:category` and
+// `/kommune/:kommune` pages' FAQPage JSON-LD, built by
+// buildCategoryFaqJsonLd()/buildKommuneFaqJsonLd() in routes/experiences-seo.ts).
+// Both reuse the SAME browseWhere() filter + PUBLISH_GATE_SQL the listing
+// itself queries with, so the FAQ facts can never diverge from what the page
+// actually lists — regardless of which page of paginated results is open.
+
+/** Aggregate stats for one category's FAQPage JSON-LD: how many distinct
+ *  fylker/kommuner have a published experience in this category, and the
+ *  lowest listed starting price (null if no row states one — never guessed). */
+export function getCategoryFaqStats(category: string): {
+  fylkeCount: number;
+  kommuneCount: number;
+  minPriceFrom: number | null;
+} {
+  const db = getDb(VERTICAL);
+  const { sql, params } = browseWhere({ category });
+  const row = db
+    .prepare(
+      `SELECT COUNT(DISTINCT e.fylke) AS fylkeCount,
+              COUNT(DISTINCT e.kommune) AS kommuneCount,
+              MIN(e.price_from) AS minPriceFrom
+       FROM experiences e
+       LEFT JOIN experience_providers p ON p.id = e.provider_id
+       WHERE ${sql}`
+    )
+    .get(params) as { fylkeCount: number; kommuneCount: number; minPriceFrom: number | null } | undefined;
+  return {
+    fylkeCount: row?.fylkeCount || 0,
+    kommuneCount: row?.kommuneCount || 0,
+    minPriceFrom: row?.minPriceFrom ?? null,
+  };
+}
+
+/** Aggregate stats for one kommune's FAQPage JSON-LD: how many distinct
+ *  categories have a published experience there, and the lowest listed
+ *  starting price (null if no row states one — never guessed). Mirrors
+ *  getCategoryFaqStats() but grouped by kommune instead of category. */
+export function getKommuneFaqStats(kommune: string): {
+  categoryCount: number;
+  minPriceFrom: number | null;
+} {
+  const db = getDb(VERTICAL);
+  const { sql, params } = browseWhere({ kommune });
+  const row = db
+    .prepare(
+      `SELECT COUNT(DISTINCT e.category) AS categoryCount,
+              MIN(e.price_from) AS minPriceFrom
+       FROM experiences e
+       LEFT JOIN experience_providers p ON p.id = e.provider_id
+       WHERE ${sql}`
+    )
+    .get(params) as { categoryCount: number; minPriceFrom: number | null } | undefined;
+  return {
+    categoryCount: row?.categoryCount || 0,
+    minPriceFrom: row?.minPriceFrom ?? null,
+  };
+}
+
 /** Distinct providers that have ≥1 PUBLISHED experience (id, name, counts). */
 export type PublishedProviderRow = {
   id: string;
