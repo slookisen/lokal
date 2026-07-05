@@ -243,6 +243,30 @@ export function initExperiencesSchema(db: Database.Database): void {
   // provider still cycles to the back of the queue instead of blocking it.
   try { db.exec("ALTER TABLE experience_providers ADD COLUMN last_content_attempt_at TEXT"); } catch { /* already present */ }
 
+  // ─── FAQPage schema-drift guard (2026-07-05, orch-pr-faq-schema-drift-fixup) ──
+  // getCategoryFaqStats()/getKommuneFaqStats() (PR #149) read experiences.fylke,
+  // .kommune, .category, .price_from via COUNT(DISTINCT ...)/MIN(...). Git
+  // archaeology confirms all four have been part of the ORIGINAL
+  // `CREATE TABLE IF NOT EXISTS experiences (...)` above since the commit that
+  // first created this table (9a0bbf7) — i.e. NOT schema drift under normal
+  // circumstances, since CREATE TABLE IF NOT EXISTS only no-ops on a table that
+  // already existed with an EARLIER, narrower column set, and no such earlier
+  // version of this table exists in history. These ALTER TABLE ADD COLUMN
+  // guards are added anyway, purely as free, provably-idempotent insurance
+  // (identical pattern to every guard above) against any drift between this
+  // git history and whatever actually shipped to the live Fly volume (e.g. an
+  // out-of-band data restore) — a scenario we can't rule out without a live DB
+  // shell. No-ops today; harmless if ever not.
+  const faqStatsCols = [
+    "ALTER TABLE experiences ADD COLUMN fylke TEXT",
+    "ALTER TABLE experiences ADD COLUMN kommune TEXT",
+    "ALTER TABLE experiences ADD COLUMN category TEXT",
+    "ALTER TABLE experiences ADD COLUMN price_from INTEGER",
+  ];
+  for (const stmt of faqStatsCols) {
+    try { db.exec(stmt); } catch { /* already present */ }
+  }
+
   // ─── Phase 2 — Gårdssalg bookings (2026-06-28) ───────────────────────────
   // Attribution + attendance tracking for legally-required paid visits.
   // status lifecycle: reserved → confirmed_attended | no_show | cancelled

@@ -15178,6 +15178,16 @@ console.log("\n── opplevagent P2: human-browse subpages (experiences) ──
   assertTrue(catP2.body.includes('"@type":"CollectionPage"'), "p2-02d: category page emits CollectionPage JSON-LD");
   const catMissP2 = invokeSeo("/kategori/:category", { category: "finnes_ikke" }, "/kategori/finnes_ikke");
   assertEq(catMissP2.status, 404, "p2-02e: unknown category → 404 (next())");
+  // p2-02f/g (orch-pr-faq-schema-drift-fixup regression guard): dyreliv_safari has
+  // 2 published rows sharing one fylke/kommune (>=2 real facts: total + fylkeCount)
+  // -> getCategoryFaqStats()/buildCategoryFaqJsonLd() must actually wire a FAQPage
+  // block into this page end-to-end (not just unit-test the formatter in isolation
+  // — PR #149 never asserted this against a real seeded DB, which is how the
+  // live-prod FAQPage-never-renders bug shipped undetected).
+  assertTrue(catP2.body.includes('"@type":"FAQPage"'),
+    "p2-02f: category page with real fylke/kommune facts emits a FAQPage JSON-LD block");
+  assertTrue(/Hvor mange opplevelser finnes i kategorien/.test(catP2.body),
+    "p2-02g: category FAQPage includes the count question");
 
   // p2-03: /fylke/:fylke → 200 scoped to county; unknown → 404.
   const fylkeP2 = invokeSeo("/fylke/:fylke", { fylke: "Troms" }, "/fylke/Troms");
@@ -15262,6 +15272,12 @@ console.log("\n── opplevagent P2: human-browse subpages (experiences) ──
     "p2-08g: kommune canonical is the absolute opplevagent URL");
   assertTrue(!new RegExp(draftSlugP2).test(kommP2.body) && !/Hemmelig utkast/.test(kommP2.body),
     "p2-08h: kommune page excludes the unpublished draft");
+  // p2-08h2 (orch-pr-faq-schema-drift-fixup regression guard): Tromsø's 2 rows
+  // share 1 category + 1 has a stated price (>=2 real facts: total + categoryCount)
+  // -> getKommuneFaqStats()/buildKommuneFaqJsonLd() must actually wire a FAQPage
+  // block into this page end-to-end. Mirrors p2-02f/g's category-page guard.
+  assertTrue(kommP2.body.includes('"@type":"FAQPage"'),
+    "p2-08h2: kommune page with real category facts emits a FAQPage JSON-LD block");
   const kommMissP2 = invokeSeo("/kommune/:kommune", { kommune: "Nowhereville" }, "/kommune/Nowhereville");
   assertEq(kommMissP2.status, 404, "p2-08i: unknown kommune → 404 (next())");
   assertTrue(!/Rett fra Bonden/i.test(kommP2.body) && !/tannlege/i.test(kommP2.body),
