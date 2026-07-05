@@ -31,6 +31,7 @@ import {
   getExperiencesForProvider,
   applyExperienceContent,
   markProviderEnriched,
+  markProviderContentAttempted,
   type ContentRefreshTarget,
 } from "../services/experience-store";
 // PURE homepage extractors + SSRF guard — REUSED from the rfb search-enrich
@@ -455,6 +456,15 @@ router.post("/admin/content-refresh", requireAdmin, async (req: Request, res: Re
 
   async function processOne(t: ContentRefreshTarget): Promise<void> {
     const providerId = t.id;
+
+    // Stamp the attempt UNCONDITIONALLY (apply mode only — dry-run stays
+    // read-only) before doing any fetch/extraction work, so a provider whose
+    // homepage is permanently unreachable still advances to the back of
+    // selectProvidersForContentRefresh()'s queue on its next call, instead of
+    // sorting first forever (see markProviderContentAttempted's doc comment).
+    if (apply) {
+      try { markProviderContentAttempted(providerId); } catch { /* best-effort */ }
+    }
 
     // Fetch homepage content server-side (SSRF-guarded).
     let fetched: { primaryHtml: string; combinedHtml: string; fetchUrl: string } | null;

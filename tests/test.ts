@@ -21183,6 +21183,88 @@ console.log("\n── gardssalg-homepage-count: live count replaces hardcoded 'K
   console.log("  gardssalg-homepage-count: OK (4 tests: 200/card-present/live-count/no-coming-soon)");
 })();
 
+// ─── content-refresh-attempt-tracking: failed attempts don't block forever ──
+// Regression guard for `controller-handoff/2026-07-05-experiences-enrichment-
+// content-refresh-aggregator-1.md`: selectProvidersForContentRefresh() used to
+// order candidates by last_enriched_at, which is stamped ONLY on a successful
+// write. A provider whose homepage is permanently unreachable (dead site /
+// wrong aggregator URL) never succeeds, so it never gets a timestamp and sorts
+// first FOREVER — starving every other eligible candidate once the pool
+// exceeds the per-run cap. Fix: a separate last_content_attempt_at column,
+// stamped via markProviderContentAttempted() on every attempt regardless of
+// outcome, now drives the ordering instead.
+console.log("\n── content-refresh-attempt-tracking: failed attempts cycle to the back ──");
+(() => {
+  const prevPathCRA = process.env.EXPERIENCES_DB_PATH;
+  process.env.EXPERIENCES_DB_PATH = ":memory:";
+
+  const dbFacPathCRA = require.resolve("../src/database/db-factory");
+  const expStPathCRA = require.resolve("../src/services/experience-store");
+  delete require.cache[dbFacPathCRA];
+  delete require.cache[expStPathCRA];
+
+  const dbFacCRA = require("../src/database/db-factory") as typeof import("../src/database/db-factory");
+  dbFacCRA.__resetDbFactoryForTesting();
+  const expStCRA = require("../src/services/experience-store") as typeof import("../src/services/experience-store");
+
+  dbFacCRA.getDb("experiences");
+
+  // Two eligible providers, both with a website and a thin (no description/
+  // category) experience. Provider A is created first, so absent any attempt
+  // tracking it would always sort first (created_at ASC tiebreak).
+  const provA = expStCRA.createProvider({
+    navn: "Stuck Aggregator AS", org_nr: "900111222",
+    fylke: "Troms", kommune: "Tromsø",
+    hjemmeside: "https://dmo-aggregator.example/stuck-aggregator",
+    brreg_verified: 1, brreg_active: 1, verification_status: "verified",
+  });
+  expStCRA.createExperience({
+    title: "Stuck Aggregator opplevelse", provider_id: provA, provider_match_status: "matched",
+    fylke: "Troms", kommune: "Tromsø", confidence: "high", verification_status: "pending_verify",
+  });
+  const provB = expStCRA.createProvider({
+    navn: "Fresh Provider AS", org_nr: "900333444",
+    fylke: "Troms", kommune: "Tromsø",
+    hjemmeside: "https://fresh-provider.example",
+    brreg_verified: 1, brreg_active: 1, verification_status: "verified",
+  });
+  expStCRA.createExperience({
+    title: "Fresh Provider opplevelse", provider_id: provB, provider_match_status: "matched",
+    fylke: "Troms", kommune: "Tromsø", confidence: "high", verification_status: "pending_verify",
+  });
+
+  // cra-01: before any attempt, both providers have last_content_attempt_at
+  // NULL — tiebreak falls to created_at ASC, so the first-created (provA)
+  // wins a cap=1 selection. This is pre-existing, expected behavior.
+  const firstPick = expStCRA.selectProvidersForContentRefresh(1);
+  assertEq(firstPick.length, 1, "cra-01a: selectProvidersForContentRefresh(1) returns exactly 1");
+  assertEq(firstPick[0]?.id, provA, "cra-01b: with no attempts yet, oldest-created (provA) sorts first");
+
+  // cra-02: stamp provA as attempted (simulating a content-refresh pass whose
+  // fetch failed — this is exactly what processOne() now does unconditionally
+  // in apply mode, before it even tries the fetch).
+  const stamped = expStCRA.markProviderContentAttempted(provA);
+  assertTrue(stamped, "cra-02: markProviderContentAttempted returns true (row changed)");
+
+  // cra-03: provA must now have a real timestamp, not NULL.
+  const dbCRA = dbFacCRA.getDb("experiences");
+  const rowA = dbCRA.prepare("SELECT last_content_attempt_at FROM experience_providers WHERE id = ?").get(provA) as { last_content_attempt_at: string | null };
+  assertTrue(!!rowA.last_content_attempt_at, "cra-03: provA.last_content_attempt_at is set after an attempt");
+
+  // cra-04: THE FIX — a cap=1 selection now prefers provB (never attempted,
+  // NULL sorts first) over provA (attempted, has a real timestamp). Before
+  // this fix, provA (permanently unreachable in production) would have kept
+  // winning this slot on every single call, forever.
+  const secondPick = expStCRA.selectProvidersForContentRefresh(1);
+  assertEq(secondPick.length, 1, "cra-04a: second selectProvidersForContentRefresh(1) returns exactly 1");
+  assertEq(secondPick[0]?.id, provB, "cra-04b: after provA's attempt is stamped, never-attempted provB sorts first");
+
+  if (prevPathCRA === undefined) delete process.env.EXPERIENCES_DB_PATH;
+  else process.env.EXPERIENCES_DB_PATH = prevPathCRA;
+  dbFacCRA.__resetDbFactoryForTesting();
+  console.log("  content-refresh-attempt-tracking: OK (6 tests: initial-order/stamp-returns-true/timestamp-set/reorder-after-attempt)");
+})();
+
 // ─── gardssalg-book: reservation → confirmation journey (2026-07-02) ────────
 // Regression coverage for the live "Book besøk" 404: gårdssalg producers
 // (experience_providers rows with producer_type set / rfb-seed) have ZERO

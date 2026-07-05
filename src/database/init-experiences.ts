@@ -233,6 +233,16 @@ export function initExperiencesSchema(db: Database.Database): void {
     try { db.exec(stmt); } catch { /* already present */ }
   }
 
+  // ─── content-refresh attempt tracking (2026-07-05) ───────────────────────
+  // selectProvidersForContentRefresh() ordered candidates by last_enriched_at
+  // (set only on a SUCCESSFUL write), so a provider whose homepage is
+  // permanently unreachable (dead site / wrong aggregator URL) never gets a
+  // timestamp and sorts first FOREVER — starving every other candidate once
+  // the eligible pool exceeds cap_per_run. This column is updated on every
+  // content-refresh attempt regardless of outcome, so a repeatedly-failing
+  // provider still cycles to the back of the queue instead of blocking it.
+  try { db.exec("ALTER TABLE experience_providers ADD COLUMN last_content_attempt_at TEXT"); } catch { /* already present */ }
+
   // ─── Phase 2 — Gårdssalg bookings (2026-06-28) ───────────────────────────
   // Attribution + attendance tracking for legally-required paid visits.
   // status lifecycle: reserved → confirmed_attended | no_show | cancelled
