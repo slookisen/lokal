@@ -329,7 +329,12 @@ router.get("/", (req: Request, res: Response) => {
   // already present (e.g. because there are no published experiences yet).
   let catSource = usingFallbackCats ? fallbackCats : cats.slice(0, 12);
   if (!usingFallbackCats && gardssalgVisible() && !catSource.some((c) => c.category === "gardssalg")) {
-    catSource = [...catSource, { category: "gardssalg", count: 0 }].slice(0, 12);
+    // Live count, not hardcoded 0 — gardssalgVisible() already proved the
+    // count is >= GARDSSALG_VISIBILITY_THRESHOLD, so this card must never
+    // render the "Kommer snart" (coming soon) badge once visible.
+    let gardssalgCount = 0;
+    try { gardssalgCount = countGardssalgProviders(); } catch { /* DB not open — keep 0 */ }
+    catSource = [...catSource, { category: "gardssalg", count: gardssalgCount }].slice(0, 12);
   }
 
   // Each category card carries its own unique inline glyph (see CATEGORY_ICON_INNER
