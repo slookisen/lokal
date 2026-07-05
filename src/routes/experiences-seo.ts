@@ -28,6 +28,7 @@ import * as QRCode from "qrcode";
 import { getExperiencesAgentCard } from "../services/experiences-agent-card";
 import { getExperiencesOpenapi } from "../services/experiences-openapi";
 import { isDisplayablePhone } from "../services/contact-normalizer";
+import { INDEXNOW_KEY } from "../services/indexnow-service";
 import { htmlLangAttr, ogLocale, type Lang } from "../i18n/t";
 import {
   listCategories,
@@ -772,6 +773,19 @@ ${ldScripts}
 </script>
 </body>
 </html>`);
+});
+
+// ═══════════════════════════════════════════════════════════
+// GET /<INDEXNOW_KEY>.txt — IndexNow key file
+// dev-request 2026-07-04-sokemotor-indeksering-og-lenker slice 1.
+// Literal path (not a :param wildcard), so it can't shadow llms.txt
+// or any other .txt route — non-matching *.txt requests just fall
+// through to the catch-all 404 handler below unaffected.
+// ═══════════════════════════════════════════════════════════
+
+router.get(`/${INDEXNOW_KEY}.txt`, (_req: Request, res: Response) => {
+  res.setHeader("Content-Type", "text/plain; charset=utf-8");
+  res.send(INDEXNOW_KEY);
 });
 
 // ═══════════════════════════════════════════════════════════

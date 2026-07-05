@@ -16,6 +16,7 @@ import { getDentalAgentCard } from "../services/dental-agent-card";
 import { getDentalOpenapi } from "../services/dental-openapi";
 import { getTrafficStats } from "../services/traffic-stats";
 import { isDisplayablePhone } from "../services/contact-normalizer";
+import { INDEXNOW_KEY } from "../services/indexnow-service";
 
 const router = Router();
 
@@ -1660,6 +1661,19 @@ router.get("/sitemap.xml", (_req: Request, res: Response) => {
     console.error("[dental-sitemap] error:", err);
     res.status(500).send("Error generating sitemap");
   }
+});
+
+// ═══════════════════════════════════════════════════════════
+// GET /<INDEXNOW_KEY>.txt — IndexNow key file
+// dev-request 2026-07-04-sokemotor-indeksering-og-lenker slice 1.
+// Literal path (not a :param wildcard), so it can't shadow llms.txt
+// or any other .txt route — non-matching *.txt requests just fall
+// through to the routes/404 handler below unaffected.
+// ═══════════════════════════════════════════════════════════
+
+router.get(`/${INDEXNOW_KEY}.txt`, (_req: Request, res: Response) => {
+  res.setHeader("Content-Type", "text/plain; charset=utf-8");
+  res.send(INDEXNOW_KEY);
 });
 
 // ═══════════════════════════════════════════════════════════

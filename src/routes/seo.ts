@@ -28,6 +28,7 @@ import { getTrafficStats } from "../services/traffic-stats";
 import { isDisplayablePhone } from "../services/contact-normalizer";
 import { slugify } from "../utils/slug";
 import { addUtmParams } from "../utils/url-utm";
+import { INDEXNOW_KEY } from "../services/indexnow-service";
 import { t, htmlLangAttr, ogLocale, localizedPath, type Lang } from "../i18n/t";
 import {
   parseIsoOrSqlite,
@@ -2036,6 +2037,7 @@ router.get("/:city", (req: Request, res: Response, next: any) => {
       || citySlug === "personvern" || citySlug === "privacy" || citySlug === "privacy-policy"
       || citySlug === "terms" || citySlug === "terms-of-service" || citySlug === "tos" || citySlug === "vilkar"
       || citySlug === "llms.txt" || citySlug === "llms-full.txt"
+      || citySlug === `${INDEXNOW_KEY}.txt`
       || citySlug === "agents" || citySlug === "docs" || citySlug === "samtaler" || citySlug === "samtale"
       || citySlug === "en" || citySlug === "no" || citySlug === "kontakt"
       || citySlug.includes(".")) {
@@ -3927,6 +3929,18 @@ router.get("/sitemap.xml", (_req: Request, res: Response) => {
     console.error("Sitemap error:", err);
     res.status(500).send("Error generating sitemap");
   }
+});
+
+// ─── GET /<INDEXNOW_KEY>.txt — IndexNow key file ─────────────
+// dev-request 2026-07-04-sokemotor-indeksering-og-lenker slice 1.
+// Literal path (not a :param wildcard) so any other *.txt request
+// (llms.txt, llms-full.txt, a future unrelated .txt route) simply
+// doesn't match this route and falls through unaffected — no explicit
+// next()-passthrough logic needed. Still added to the /:city catch-all's
+// reserved-slug list below out of caution.
+router.get(`/${INDEXNOW_KEY}.txt`, (_req: Request, res: Response) => {
+  res.header("Content-Type", "text/plain; charset=utf-8");
+  res.send(INDEXNOW_KEY);
 });
 
 // ─── GET /robots.txt ────────────────────────────────────────
