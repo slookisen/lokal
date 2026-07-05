@@ -8735,6 +8735,54 @@ _pr94Promise.then(async () => {
       "pr64: fylkerMatch(anything, null) → false");
     assertEq(fylke.fylkerMatch(null, null), false,
       "pr64: fylkerMatch(null, null) → false");
+
+    // (6) fylkeEquivalents: SQL-IN-clause-ready list of DB-literal fylke
+    // variants (dev-request 2026-07-04-opplevagent-nl-parser-og-fylkesnormalisering item 1).
+    assertTrue(
+      fylke.fylkeEquivalents("Troms").includes("Troms og Finnmark"),
+      "fylke-equiv-01: fylkeEquivalents(Troms) includes 'Troms og Finnmark'"
+    );
+    assertTrue(
+      fylke.fylkeEquivalents("Troms").includes("Troms"),
+      "fylke-equiv-01b: fylkeEquivalents(Troms) includes 'Troms' itself"
+    );
+    assertEq(
+      fylke.fylkeEquivalents("Troms").length, 2,
+      "fylke-equiv-01c: fylkeEquivalents(Troms) does NOT include sibling 'Finnmark'"
+    );
+    {
+      const tf = fylke.fylkeEquivalents("Troms og Finnmark");
+      assertTrue(tf.includes("Troms og Finnmark") && tf.includes("Troms") && tf.includes("Finnmark"),
+        "fylke-equiv-02: fylkeEquivalents(Troms og Finnmark) includes both 'Troms' and 'Finnmark'");
+    }
+    {
+      const viken = fylke.fylkeEquivalents("Viken");
+      assertTrue(
+        viken.includes("Viken") && viken.includes("Akershus") && viken.includes("Buskerud") && viken.includes("Østfold"),
+        "fylke-equiv-03: fylkeEquivalents(Viken) includes all three constituent fylker"
+      );
+    }
+    {
+      const vt = fylke.fylkeEquivalents("Vestfold og Telemark");
+      assertTrue(
+        vt.includes("Vestfold og Telemark") && vt.includes("Vestfold") && vt.includes("Telemark"),
+        "fylke-equiv-04: fylkeEquivalents(Vestfold og Telemark) includes both split parts"
+      );
+      const vestfold = fylke.fylkeEquivalents("Vestfold");
+      assertTrue(
+        vestfold.includes("Vestfold") && vestfold.includes("Vestfold og Telemark"),
+        "fylke-equiv-04b: fylkeEquivalents(Vestfold) includes the pre-2024 merged name"
+      );
+    }
+    {
+      const unrecognised = fylke.fylkeEquivalents("Ikke-noe-sted-1234");
+      assertTrue(
+        Array.isArray(unrecognised) && unrecognised.length === 1 && unrecognised[0] === "Ikke-noe-sted-1234",
+        "fylke-equiv-05: unrecognised fylke input returns [input] unchanged"
+      );
+    }
+    assertEq(fylke.fylkeEquivalents(null).length, 0, "fylke-equiv-06: fylkeEquivalents(null) → []");
+    assertEq(fylke.fylkeEquivalents("").length, 0, "fylke-equiv-07: fylkeEquivalents('') → []");
   } catch (e: any) {
     failed++;
     failures.push("✗ pr64 fylke behavioural: " + (e?.message || String(e)));
@@ -14135,6 +14183,40 @@ console.log("\n── experiences scaffold: experience-store ──");
     "exp-store-06: ExperienceSchema rejects empty title"
   );
 
+  // ── 7. discoverExperiences({fylke:"Troms"}) bridges the pre-2024 DB value
+  // "Troms og Finnmark" via fylkeEquivalents() (dev-request
+  // 2026-07-04-opplevagent-nl-parser-og-fylkesnormalisering item 1: the flagship
+  // demo query "hva kan vi finne på i Tromsø om vinteren?" returned 0 results
+  // because an exact e.fylke = @fylke match never bridged old/new fylke eras).
+  {
+    const preReformId = createExperience({
+      title: "Kajakktur i Karlsøy", category: "natur_friluft",
+      fylke: "Troms og Finnmark", kommune: "Karlsøy",
+      indoor_outdoor: "outdoor", confidence: "high", verification_status: "verified",
+    });
+    const postReformQuery = discoverExperiences({ fylke: "Troms" });
+    assertTrue(
+      postReformQuery.some((e) => e.id === preReformId),
+      "exp-store-07a: discoverExperiences({fylke:'Troms'}) matches a DB row stored as 'Troms og Finnmark'"
+    );
+    // Sibling fylke (Finnmark) still correctly excludes the Troms-side row's
+    // era-mismatched sibling matching is intentionally scoped to the merged
+    // name only — a Finnmark row inserted under the pre-reform merged name
+    // would ALSO match a "Troms" query (both are filed under the same old
+    // DB value), which is the correct/expected behaviour for this bridge.
+    const finnmarkQuery = discoverExperiences({ fylke: "Finnmark" });
+    assertTrue(
+      finnmarkQuery.some((e) => e.id === preReformId),
+      "exp-store-07b: discoverExperiences({fylke:'Finnmark'}) also matches the same pre-reform 'Troms og Finnmark' row"
+    );
+    // A fylke with no overlapping equivalence class still excludes it.
+    const osloQuery2 = discoverExperiences({ fylke: "Oslo" });
+    assertTrue(
+      !osloQuery2.some((e) => e.id === preReformId),
+      "exp-store-07c: discoverExperiences({fylke:'Oslo'}) excludes the pre-reform Troms og Finnmark row"
+    );
+  }
+
   // Restore env state and reset factory so later tests start clean.
   if (prevPathExp === undefined) {
     delete process.env.EXPERIENCES_DB_PATH;
@@ -14623,9 +14705,12 @@ console.log("\n── orch-pr-19: opplevagent.no host-gate (experiences) ──"
     season: ["winter"], confidence: "high", verification_status: "verified",
   });
 
-  // parseExperiencesIntent: fylke detection
-  assertEq(parseExperiencesIntent("hva kan vi finne på i Oslo").fylke, "Oslo",
-    "orch19-05a: parseExperiencesIntent recognises Oslo");
+  // parseExperiencesIntent: kommune detection takes priority over fylke
+  // (Oslo is both a kommune and a fylke name; kommune-first parsing wins).
+  assertEq(parseExperiencesIntent("hva kan vi finne på i Oslo").kommune, "Oslo",
+    "orch19-05a: parseExperiencesIntent recognises Oslo as a kommune");
+  assertEq(parseExperiencesIntent("hva kan vi finne på i Oslo").fylke, undefined,
+    "orch19-05a2: parseExperiencesIntent does not also set fylke when kommune resolved");
   // parseExperiencesIntent: weather=rain
   assertEq(parseExperiencesIntent("noe å gjøre når det regner").weather, "rain",
     "orch19-05b: parseExperiencesIntent sets weather='rain' for 'regner'");
@@ -14643,6 +14728,65 @@ console.log("\n── orch-pr-19: opplevagent.no host-gate (experiences) ──"
   // innendørs/utendørs (prefix-continuation) still detected correctly.
   assertEq(parseExperiencesIntent("innendørs aktiviteter").indoor_outdoor, "indoor",
     "orch19-05q: parseExperiencesIntent still sets indoor_outdoor='indoor' for 'innendørs'");
+
+  // ── kommune-first parsing: the flagship demo query resolves to the kommune
+  // (Tromsø), not the substring-matched fylke ("troms" inside "Tromsø") — the
+  // full fix for dev-request 2026-07-04-opplevagent-nl-parser-og-fylkesnormalisering item 1.
+  {
+    const tromsoIntent = parseExperiencesIntent("hva kan vi finne på i Tromsø om vinteren?");
+    assertEq(tromsoIntent.kommune, "Tromsø",
+      "orch19-05r: parseExperiencesIntent('...i Tromsø...') → kommune='Tromsø'");
+    assertEq(tromsoIntent.fylke, undefined,
+      "orch19-05s: parseExperiencesIntent('...i Tromsø...') does not also set fylke");
+    assertEq(tromsoIntent.season, "winter",
+      "orch19-05t: parseExperiencesIntent('...i Tromsø...') still sets season='winter'");
+    assertEq(tromsoIntent.indoor_outdoor, undefined,
+      "orch19-05u: parseExperiencesIntent('...i Tromsø...') still does not false-trigger indoor_outdoor");
+  }
+
+  // A second, non-Tromsø kommune to confirm this isn't a Tromsø-only special case.
+  {
+    const bodoIntent = parseExperiencesIntent("hva kan man gjøre i Bodø på sommeren?");
+    assertEq(bodoIntent.kommune, "Bodø", "orch19-05v: parseExperiencesIntent('...i Bodø...') → kommune='Bodø'");
+    assertEq(bodoIntent.fylke, undefined, "orch19-05w: parseExperiencesIntent('...i Bodø...') does not also set fylke");
+
+    const alesundIntent = parseExperiencesIntent("noe å gjøre i Ålesund");
+    assertEq(alesundIntent.kommune, "Ålesund", "orch19-05x: parseExperiencesIntent('...i Ålesund...') → kommune='Ålesund'");
+    assertEq(alesundIntent.fylke, undefined, "orch19-05y: parseExperiencesIntent('...i Ålesund...') does not also set fylke");
+  }
+
+  // Regression (PR #146 review): traditional region/valley/district labels
+  // in CITY_TO_FYLKE_RAW (Romsdal, Sunnmøre, Nordmøre, Hallingdal, Jæren,
+  // Vesterålen, Lofoten, Hardanger, Setesdal) are NOT literal kommune values
+  // and must not shadow a correct fylke match — "Romsdal" substring-collides
+  // with the fylke name "Møre og Romsdal" itself, so kommune-first detection
+  // previously (wrongly) resolved this to kommune:"Romsdal" (a nonexistent
+  // DB value → silent 0 results), instead of fylke:"Møre og Romsdal".
+  {
+    const moreRomsdalIntent = parseExperiencesIntent("hva kan vi finne på i Møre og Romsdal om vinteren?");
+    // Note: the pre-existing FYLKER-loop capitalization only uppercases the
+    // first character (not full title-case), so "Møre og romsdal" is the
+    // correct expected value here — unrelated to this fix, and harmless
+    // downstream since fylkeEquivalents()/normaliseFylke() key-match
+    // case-insensitively.
+    assertEq(moreRomsdalIntent.fylke, "Møre og romsdal",
+      "orch19-05z: parseExperiencesIntent('...i Møre og Romsdal...') → fylke (not kommune='Romsdal')");
+    assertEq(moreRomsdalIntent.kommune, undefined,
+      "orch19-05z2: parseExperiencesIntent('...i Møre og Romsdal...') does not set a bogus kommune");
+
+    const sunnmoreIntent = parseExperiencesIntent("aktiviteter på Sunnmøre");
+    assertEq(sunnmoreIntent.kommune, undefined,
+      "orch19-05z3: 'Sunnmøre' (a district, not a kommune) is not detected as a kommune");
+
+    const hallingdalIntent = parseExperiencesIntent("noe å gjøre i Hallingdal");
+    assertEq(hallingdalIntent.kommune, undefined,
+      "orch19-05z4: 'Hallingdal' (a district, not a kommune) is not detected as a kommune");
+
+    // A real kommune whose name is unaffected by the exclusion list still resolves.
+    const moldeIntent = parseExperiencesIntent("noe å gjøre i Molde");
+    assertEq(moldeIntent.kommune, "Molde",
+      "orch19-05z5: real kommune 'Molde' (in Møre og Romsdal) still resolves via kommune-first detection");
+  }
 
   // handleExperiencesMessageSend: missing message → -32602
   const noMsg19 = handleExperiencesMessageSend({}, "orch19-id") as any;

@@ -36,6 +36,7 @@ import {
   listCategories,
   type DiscoverFilter,
 } from "../services/experience-store";
+import { __FYLKE_INTERNAL, NON_KOMMUNE_REGION_LABELS } from "../services/norway-fylke";
 import { getExperiencesAgentCard } from "../services/experiences-agent-card";
 import { jsonRpcLimiter } from "../middleware/security";
 
@@ -115,15 +116,61 @@ function matchesAsWordPrefix(haystack: string, keyword: string): boolean {
   }
 }
 
+// Known kommune (city/municipality) display names, reused from
+// norway-fylke.ts rather than hand-rolling a second list. Checked BEFORE
+// the FYLKER substring loop below: a kommune name is the more specific
+// signal, and several kommune names substring-match into FYLKER (e.g.
+// "Tromsø" contains "troms"), which previously produced a wrong/
+// over-broad fylke instead of the intended kommune (the flagship demo
+// query "hva kan vi finne på i Tromsø om vinteren?" — dev-request
+// 2026-07-04-opplevagent-nl-parser-og-fylkesnormalisering item 1).
+// Excludes traditional region/valley/district labels (Romsdal, Sunnmøre, …)
+// that appear in CITY_TO_FYLKE_RAW for fylke-resolution purposes but are
+// NOT themselves a literal DB `kommune` value — see NON_KOMMUNE_REGION_LABELS
+// in norway-fylke.ts for why (caught in PR #146 review: "Møre og Romsdal"
+// queries were regressing to a nonexistent `kommune: "Romsdal"` match).
+const KOMMUNE_NAMES: string[] = Object.keys(__FYLKE_INTERNAL.CITY_TO_FYLKE_RAW)
+  .filter(name => !NON_KOMMUNE_REGION_LABELS.has(name));
+
+// Detect a kommune name in `lower` (already-lowercased text) using the same
+// word-boundary-aware matching as the indoor/outdoor keywords. When several
+// kommune names match (e.g. short kommune "Os" is a substring-prefix of
+// "Oslo"), the LONGEST match wins — this resolves the common
+// short-name-inside-longer-name case without needing a full tokeniser.
+// NOTE: this does not fully solve general false positives from very short
+// kommune names that happen to be substring-prefixes of unrelated Norwegian
+// words with no longer kommune name present (e.g. "Os" inside "oster"/
+// "ost", or "Time" ["hour"] inside an unrelated "en time i ..." phrase) —
+// left out of scope per the dev-request (word-boundary matching already
+// eliminates the worse substring-inside-a-word bug class; full NLP
+// disambiguation of short ambiguous place names is a separate concern).
+function detectKommune(lower: string): string | null {
+  let best: string | null = null;
+  for (const display of KOMMUNE_NAMES) {
+    if (matchesAsWordPrefix(lower, display.toLowerCase())) {
+      if (!best || display.length > best.length) best = display;
+    }
+  }
+  return best;
+}
+
 export function parseExperiencesIntent(text: string): DiscoverFilter {
   const lower = text.toLowerCase();
   const params: DiscoverFilter = {};
 
-  // Fylke detection
-  for (const f of FYLKER) {
-    if (lower.includes(f)) {
-      params.fylke = f.charAt(0).toUpperCase() + f.slice(1);
-      break;
+  // Kommune detection takes priority over fylke (see detectKommune above).
+  // A caller who only cares about kommune shouldn't also get a redundant
+  // (and possibly stale-era) fylke constraint ANDed in by discoverExperiences.
+  const kommune = detectKommune(lower);
+  if (kommune) {
+    params.kommune = kommune;
+  } else {
+    // Fylke detection — only when no kommune matched.
+    for (const f of FYLKER) {
+      if (lower.includes(f)) {
+        params.fylke = f.charAt(0).toUpperCase() + f.slice(1);
+        break;
+      }
     }
   }
 

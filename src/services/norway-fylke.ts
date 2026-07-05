@@ -472,6 +472,126 @@ export function fylkerMatch(
   return false;
 }
 
+// ─── fylkeEquivalents ──────────────────────────────────────────
+// Display-cased names for the historical alias-map entries that don't
+// have a reverse split in EQUIVALENCE_CLASSES (Vestland / Innlandet /
+// Agder / Trøndelag — see the "still merged" fylker in the top-of-file
+// doc comment: "Hordaland + Sogn og Fjordane", "Hedmark + Oppland",
+// "Aust-Agder + Vest-Agder", "Sør-Trøndelag + Nord-Trøndelag"). The
+// ALIAS_TO_CANONICAL keys themselves are lossy (lowercased, diacritics
+// transliterated, spaces sometimes stripped) so they can't be used
+// directly as DB-literal strings — this restores the proper casing for
+// exactly the entries ALIAS_TO_CANONICAL already carries.
+const ALIAS_DISPLAY: Record<string, string> = {
+  "sortrondelag": "Sør-Trøndelag",
+  "sor trondelag": "Sør-Trøndelag",
+  "nordtrondelag": "Nord-Trøndelag",
+  "nord trondelag": "Nord-Trøndelag",
+  "hordaland": "Hordaland",
+  "sognogfjordane": "Sogn og Fjordane",
+  "sogn og fjordane": "Sogn og Fjordane",
+  "sognfjordane": "Sogn og Fjordane",
+  "hedmark": "Hedmark",
+  "oppland": "Oppland",
+  "austagder": "Aust-Agder",
+  "aust agder": "Aust-Agder",
+  "vestagder": "Vest-Agder",
+  "vest agder": "Vest-Agder",
+};
+
+// Given any fylke string (any era/spelling), return the de-duplicated
+// set of ALL fylke-name variants (as they might literally appear in the
+// DB `fylke` column) that should be treated as "the same place" — for
+// driving a SQL `IN (...)` clause. Restricted to strings that actually
+// occur in this module's own data (CANONICAL_FYLKER, the
+// ALIAS_TO_CANONICAL keys/values, and EQUIVALENCE_CLASSES entries) —
+// not an open-ended fuzzy set.
+//
+// This is a DIFFERENT (asymmetric) relation from fylkerMatch()'s
+// permissive sibling-matching:
+//   - Input is a narrow, post-2024 part of a since-re-split merged
+//     fylke (e.g. "Troms", "Akershus", "Vestfold") → returns itself +
+//     the broader historical merged name it used to be filed under
+//     (so pre-split DB rows still match), but NOT sibling split-parts
+//     (a "Troms" query should not also match "Finnmark" rows).
+//   - Input IS the broader merged name itself (e.g. "Viken", "Troms og
+//     Finnmark", "Vestland") → returns itself + every historical
+//     constituent part (a caller asking for the merged/broad name means
+//     "any of these").
+//
+// Examples:
+//   fylkeEquivalents("Troms")              → ["Troms", "Troms og Finnmark"]
+//   fylkeEquivalents("Troms og Finnmark")  → ["Troms og Finnmark", "Troms", "Finnmark"]
+//   fylkeEquivalents("Viken")               → ["Viken", "Akershus", "Buskerud", "Østfold"]
+//   fylkeEquivalents("Vestland")            → ["Vestland", "Hordaland", "Sogn og Fjordane"]
+//   fylkeEquivalents("garbage")             → ["garbage"]  (unrecognised: literal match only)
+export function fylkeEquivalents(fylke: string | null | undefined): string[] {
+  if (!fylke) return [];
+  const canonical = normaliseFylke(fylke);
+  if (!canonical) return [fylke];
+
+  const result = new Set<string>([canonical]);
+  const ck = key(canonical);
+
+  // Equivalence-class handling: if canonical IS the merged/broad name
+  // (class[0] by this module's convention), every constituent belongs;
+  // if canonical is one of the split parts, add back only the merged
+  // name (not sibling parts).
+  let matchedClass = false;
+  for (const cls of EQUIVALENCE_CLASSES) {
+    const idx = cls.findIndex((s) => key(s) === ck);
+    if (idx === -1) continue;
+    matchedClass = true;
+    if (idx === 0) {
+      for (const s of cls) result.add(s);
+    } else {
+      result.add(cls[0]);
+    }
+    break;
+  }
+
+  if (!matchedClass) {
+    // "Still merged" fylker (Vestland / Innlandet / Agder / Trøndelag):
+    // add the display form of every old half on record in ALIAS_TO_CANONICAL.
+    for (const [aliasKey, canon] of Object.entries(ALIAS_TO_CANONICAL)) {
+      if (canon !== canonical) continue;
+      const displayed = ALIAS_DISPLAY[aliasKey];
+      if (displayed) result.add(displayed);
+    }
+  }
+
+  return Array.from(result);
+}
+
+// ─── non-kommune region/valley/district labels ─────────────────
+// CITY_TO_FYLKE_RAW is a "place name → fylke" lookup (its own doc comment
+// says "city/municipality"), but a handful of its entries are traditional
+// geographic districts spanning MULTIPLE real kommuner, not a kommune in
+// their own right — they exist in the map only so a caller can still
+// resolve the fylke for a well-known district name. Treating one of these
+// as if it were a literal DB `kommune` column value is wrong: no
+// experience row has e.g. `kommune = "Romsdal"`, so a caller that mistakes
+// one for a kommune gets a confident but empty (0-row) result — the exact
+// bug class this module exists to prevent, just relocated. Some of these
+// also substring-collide with a full fylke name ("Romsdal" ⊂ "Møre og
+// Romsdal"), which is how this was first caught (dev-request
+// 2026-07-04-opplevagent-nl-parser-og-fylkesnormalisering item 1, PR #146
+// review). Exported so callers doing kommune-vs-fylke disambiguation
+// (see parseExperiencesIntent in experiences-a2a.ts) can exclude these
+// from "is this a specific kommune" detection while still using
+// cityToFylke()/CITY_TO_FYLKE_RAW normally for fylke resolution.
+export const NON_KOMMUNE_REGION_LABELS: ReadonlySet<string> = new Set([
+  "Hallingdal",   // Buskerud — spans Flå/Nes/Gol/Hemsedal/Ål/Hol
+  "Jæren",        // Rogaland — spans Sandnes/Klepp/Time/Hå/Gjesdal etc.
+  "Setesdal",     // Agder — spans Bygland/Valle/Bykle/Evje og Hornnes
+  "Sunnmøre",     // Møre og Romsdal — spans Ålesund/Volda/Ørsta/Sykkylven etc.
+  "Nordmøre",     // Møre og Romsdal — spans Kristiansund/Surnadal etc.
+  "Romsdal",      // Møre og Romsdal — spans Molde/Rauma etc.; substring-collides with the fylke name itself
+  "Vesterålen",   // Nordland — spans Sortland/Andøy/Øksnes/Bø/Hadsel
+  "Lofoten",      // Nordland — spans Vågan/Vestvågøy/Flakstad/Moskenes/Røst/Værøy
+  "Hardanger",    // Vestland — spans Odda/Ulvik/Jondal/Eidfjord/Kvinnherad etc.
+]);
+
 // Exported for tests + admin-UI sanity checks.
 export const __FYLKE_INTERNAL = {
   CANONICAL_FYLKER,
