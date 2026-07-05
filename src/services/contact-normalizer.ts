@@ -104,10 +104,23 @@ export function phonesMatch(a: string, b: string): boolean {
  *   • 10 digits starting "47"   → drop the leading "47" (un-prefixed country code)
  *   • anything else             → null (do not guess)
  */
-function national8(digits: string): string | null {
+export function national8(digits: string): string | null {
   if (/^\d{8}$/.test(digits)) return digits;
   if (/^47\d{8}$/.test(digits)) return digits.slice(2);
   return null;
+}
+
+/**
+ * True when `raw` reduces to a valid 8-digit Norwegian national number and is
+ * therefore safe to render. wrong_contact_rate guardrail: a wrong/invalid
+ * phone shown to a user or an AI agent is worse than showing none, so any
+ * value that doesn't confidently reduce (e.g. "+47 19 09 49", 6-7 digit
+ * partials, garbage text) must be treated as absent by every display/output
+ * call site — never rendered, never returned.
+ */
+export function isDisplayablePhone(raw: string | null | undefined): raw is string {
+  if (!raw) return false;
+  return national8(normalizePhone(raw)) !== null;
 }
 
 // ─── Address ─────────────────────────────────────────────────────────────────

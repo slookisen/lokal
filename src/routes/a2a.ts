@@ -8,6 +8,7 @@ import { discoveryService } from "../services/discovery-service";
 import { knowledgeService, relabelCertifications } from "../services/knowledge-service";
 import { redactPII } from "../utils/pii-redact";
 import { getDb } from "../database/init";
+import { isDisplayablePhone } from "../services/contact-normalizer";
 
 // ─── A2A Routes ──────────────────────────────────────────────
 // Two protocols served here:
@@ -490,7 +491,7 @@ router.get("/agents/:id/agent.json", (req: Request, res: Response) => {
     enriched["x-knowledge"] = {
       address: knowledge.address,
       postalCode: knowledge.postalCode,
-      phone: knowledge.phone,
+      phone: isDisplayablePhone(knowledge.phone) ? knowledge.phone : undefined,
       email: knowledge.email,
       website: knowledge.website,
       openingHours: knowledge.openingHours,

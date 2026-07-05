@@ -7314,8 +7314,8 @@ console.log("── PR-29 related-producers tests ──");
     "phase5.11-a5: umbrella contact items array exists in umbrella branch"
   );
   assertTrue(
-    /if \(k\.phone\) umbContactItems\.push\(`<div class="ct-item">[\s\S]{0,200}tel:\$\{k\.phone/.test(seoSrc),
-    "phase5.11-a5: umbrella phone uses tel: link (same pattern as producer)"
+    /if \(isDisplayablePhone\(k\.phone\)\) umbContactItems\.push\(`<div class="ct-item">[\s\S]{0,200}tel:\$\{k\.phone/.test(seoSrc),
+    "phase5.11-a5: umbrella phone uses tel: link (same pattern as producer), gated by isDisplayablePhone"
   );
   assertTrue(
     /if \(k\.email\) umbContactItems\.push\(`<div class="ct-item">[\s\S]{0,200}mailto:\$\{k\.email/.test(seoSrc),
@@ -7332,7 +7332,7 @@ console.log("── PR-29 related-producers tests ──");
   );
   // Maps URL gated on at least one contact field
   assertTrue(
-    /if \(k\.address \|\| k\.phone \|\| k\.email \|\| k\.website\) \{[\s\S]{0,500}encodeURIComponent\(umbMapsParts/.test(seoSrc),
+    /if \(k\.address \|\| isDisplayablePhone\(k\.phone\) \|\| k\.email \|\| k\.website\) \{[\s\S]{0,500}encodeURIComponent\(umbMapsParts/.test(seoSrc),
     "phase5.11-a5: Google Maps search link only added when at least one contact field is set"
   );
 

@@ -30,6 +30,7 @@ import {
   normalizeOpeningHours,
 } from "../services/dental-store";
 import { getDb } from "../database/db-factory";
+import { isDisplayablePhone } from "../services/contact-normalizer";
 import { mergeFieldProvenance } from "./admin-knowledge";
 import {
   placesPeriodsToOpeningHours,
@@ -122,7 +123,11 @@ router.get("/agents", (req: Request, res: Response) => {
       parseInt((req.query.offset as string) || "0", 10) || 0
     );
 
-    const agents = listDentalAgents(filter, limit, offset);
+    const agents = listDentalAgents(filter, limit, offset).map((a) => ({
+      ...a,
+      telefon: isDisplayablePhone(a.telefon) ? a.telefon : null,
+      mobil: isDisplayablePhone(a.mobil) ? a.mobil : null,
+    }));
     res.json({ count: agents.length, agents });
   } catch (err) {
     if (err instanceof z.ZodError) {
@@ -145,7 +150,13 @@ router.get("/agents/:id", (req: Request, res: Response) => {
     res.status(404).json({ error: "Not found" });
     return;
   }
-  res.json({ agent });
+  res.json({
+    agent: {
+      ...agent,
+      telefon: isDisplayablePhone(agent.telefon) ? agent.telefon : null,
+      mobil: isDisplayablePhone(agent.mobil) ? agent.mobil : null,
+    },
+  });
 });
 
 // ─── GET /api/tannlege/agents/:id/specialists ───────────────────────
