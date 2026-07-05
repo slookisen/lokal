@@ -25,6 +25,40 @@
  *     into tests/test.ts.
  *     Standalone: npx tsx src/routes/agent-knowledge-get-auth.test.ts
  *
+ * 2026-07-05 CI fix (10 auth-path assertions failing on GH Actions, passing
+ * locally): even though this block is chained off
+ * _homepageProvenanceEmailBackfillPromise (serializing it against every
+ * OTHER chain-coordinated block that also swaps the shared getDb()
+ * singleton), tests/test.ts's `orch-pr-20260704: tasks-prune-async` block
+ * (near the end of the file) is a bare fire-and-forget top-level IIFE that
+ * is NOT part of that coordination chain at all — by its own comment it
+ * relies on finishing "well before process.exit" rather than being awaited.
+ * It repeatedly calls initMod.__setDbForTesting(tpaDb) inside its req()
+ * retry loop while doing REAL async I/O (HTTP round trips, job polling via
+ * setTimeout/setImmediate), so its execution window's timing depends on
+ * real wall-clock scheduling that differs between a local machine and a
+ * GitHub Actions runner. Reproduced by timestamping every
+ * __setDbForTesting call across both blocks: locally tasks-prune-async
+ * reliably finishes ~7s before this block starts (comfortable margin), but
+ * nothing GUARANTEES that margin — on a slower/loaded CI runner it can
+ * shrink to zero, in which case this block's ENTIRE run (all 21
+ * assertions) executes while the global db is pinned to tpaDb (which has
+ * no agent-a/agent-b), producing exactly the observed 404/403/undefined
+ * results for the authenticated-path assertions (matches the CI failure
+ * log) while auth-only checks (which don't depend on the DB row existing)
+ * still passed.
+ *
+ * Fix: callRoute() re-pins initMod.__setDbForTesting(db) synchronously,
+ * immediately before every router.handle() call (mirroring the identical
+ * defensive re-pin-before-every-request pattern tasks-prune-async's own
+ * req() helper already uses for this exact class of hazard). Since
+ * router.handle() for this route is fully synchronous end-to-end (no
+ * await between the re-pin and res.json()/res.end()), nothing else in the
+ * single-threaded event loop can interleave a competing
+ * __setDbForTesting() call between the re-pin and the route reading the
+ * db — this holds regardless of what any other suite does concurrently,
+ * so it isn't just a smaller chance of the same race.
+ *
  * Covers:
  *   (1) unauthenticated GET -> 403, no data leaked at all (not even a
  *       redacted/partial body — this route is now fully auth-gated).
@@ -66,8 +100,16 @@ function callRoute(
     headers?: Record<string, string>;
     body?: any;
   },
+  rePin?: () => void,
 ): Promise<RouteResult> {
   return new Promise((resolve) => {
+    // Re-pin the global db/env singletons synchronously, right here, right
+    // before building the request — see the "2026-07-05 CI fix" note atop
+    // this file. Nothing can interleave between this call and
+    // router.handle() below (no await in between), so this closes the
+    // cross-suite race regardless of what any other unchained test block
+    // does concurrently.
+    if (rePin) rePin();
     const headers = opts.headers || {};
     const req: any = {
       method: opts.method || "GET",
@@ -177,9 +219,18 @@ export function runAgentKnowledgeGetAuthTests(
       const marketplaceMod = require("./marketplace");
       const router = marketplaceMod.default;
 
+      // Re-pin both globals this suite depends on (db + ADMIN_KEY) right
+      // before every single route call below — see the "2026-07-05 CI fix"
+      // note atop this file.
+      const rePin = () => {
+        initMod.__setDbForTesting(db as any);
+        process.env.ADMIN_KEY = testAdminKey;
+        delete process.env.ANALYTICS_ADMIN_KEY;
+      };
+
       // ── (1) unauthenticated GET -> 403, no data leaked ──
       {
-        const r = await callRoute(router, { method: "GET", url: "/agents/agent-a/knowledge" });
+        const r = await callRoute(router, { method: "GET", url: "/agents/agent-a/knowledge" }, rePin);
         assertEq(r.status, 403, "unauthenticated GET /agents/:id/knowledge -> 403");
         assertEq(r.body?.success, false, "unauthenticated GET -> success:false");
         assertTrue(
@@ -197,7 +248,7 @@ export function runAgentKnowledgeGetAuthTests(
           method: "GET",
           url: "/agents/agent-a/knowledge",
           headers: { "x-admin-key": "totally-wrong-key" },
-        });
+        }, rePin);
         assertEq(r.status, 403, "GET with wrong X-Admin-Key -> 403");
       }
 
@@ -207,7 +258,7 @@ export function runAgentKnowledgeGetAuthTests(
           method: "GET",
           url: "/agents/agent-a/knowledge",
           headers: { "x-admin-key": testAdminKey },
-        });
+        }, rePin);
         assertEq(r.status, 200, "GET with valid X-Admin-Key -> 200");
         assertEq(r.body?.success, true, "authenticated GET -> success:true");
         assertEq(r.body?.data?.email, "post@garda.no", "authenticated GET (admin key) returns full email");
@@ -221,7 +272,7 @@ export function runAgentKnowledgeGetAuthTests(
           method: "GET",
           url: "/agents/agent-a/knowledge",
           headers: { "x-claim-token": "claim-token-a" },
-        });
+        }, rePin);
         assertEq(r.status, 200, "GET with valid X-Claim-Token (own agent) -> 200");
         assertEq(r.body?.data?.email, "post@garda.no", "authenticated GET (claim token) returns full email");
       }
@@ -232,7 +283,7 @@ export function runAgentKnowledgeGetAuthTests(
           method: "GET",
           url: "/agents/agent-b/knowledge",
           headers: { "x-claim-token": "claim-token-a" },
-        });
+        }, rePin);
         assertEq(r.status, 403, "GET with claim token belonging to a different agent -> 403 (not just any valid token)");
       }
 
@@ -242,7 +293,7 @@ export function runAgentKnowledgeGetAuthTests(
           method: "GET",
           url: "/agents/agent-b/knowledge",
           headers: { "x-api-key": "api-key-b" },
-        });
+        }, rePin);
         assertEq(r.status, 200, "GET with valid X-API-Key (own agent) -> 200");
         assertEq(r.body?.data?.email, "post@gardb.no", "authenticated GET (api key) returns full email");
       }
@@ -253,7 +304,7 @@ export function runAgentKnowledgeGetAuthTests(
           method: "GET",
           url: "/agents/agent-a/knowledge",
           headers: { "x-api-key": "api-key-b" },
-        });
+        }, rePin);
         assertEq(r.status, 403, "GET with API key belonging to a different agent -> 403");
       }
 
@@ -263,7 +314,7 @@ export function runAgentKnowledgeGetAuthTests(
           method: "GET",
           url: "/agents/does-not-exist/knowledge",
           headers: { "x-admin-key": testAdminKey },
-        });
+        }, rePin);
         assertEq(r.status, 404, "authenticated GET for unknown agent id -> 404");
       }
 
@@ -272,7 +323,7 @@ export function runAgentKnowledgeGetAuthTests(
         const r = await callRoute(router, {
           method: "GET",
           url: "/agents/does-not-exist/knowledge",
-        });
+        }, rePin);
         assertEq(r.status, 403, "unauthenticated GET for unknown agent id still -> 403 (auth precedes existence check)");
       }
 
@@ -282,7 +333,7 @@ export function runAgentKnowledgeGetAuthTests(
           method: "PUT",
           url: "/agents/agent-a/knowledge",
           body: { about: "should not apply" },
-        });
+        }, rePin);
         assertEq(rNoAuth.status, 403, "PUT /agents/:id/knowledge without auth still -> 403 (regression guard, untouched by this fix)");
 
         const rAuth = await callRoute(router, {
@@ -290,7 +341,7 @@ export function runAgentKnowledgeGetAuthTests(
           url: "/agents/agent-a/knowledge",
           headers: { "x-admin-key": testAdminKey },
           body: { about: "Updated via admin" },
-        });
+        }, rePin);
         assertEq(rAuth.status, 200, "PUT /agents/:id/knowledge with valid admin key still -> 200 (unchanged)");
       }
     } finally {
