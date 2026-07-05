@@ -472,6 +472,97 @@ export function fylkerMatch(
   return false;
 }
 
+// ─── fylkeEquivalents ──────────────────────────────────────────
+// Display-cased names for the historical alias-map entries that don't
+// have a reverse split in EQUIVALENCE_CLASSES (Vestland / Innlandet /
+// Agder / Trøndelag — see the "still merged" fylker in the top-of-file
+// doc comment: "Hordaland + Sogn og Fjordane", "Hedmark + Oppland",
+// "Aust-Agder + Vest-Agder", "Sør-Trøndelag + Nord-Trøndelag"). The
+// ALIAS_TO_CANONICAL keys themselves are lossy (lowercased, diacritics
+// transliterated, spaces sometimes stripped) so they can't be used
+// directly as DB-literal strings — this restores the proper casing for
+// exactly the entries ALIAS_TO_CANONICAL already carries.
+const ALIAS_DISPLAY: Record<string, string> = {
+  "sortrondelag": "Sør-Trøndelag",
+  "sor trondelag": "Sør-Trøndelag",
+  "nordtrondelag": "Nord-Trøndelag",
+  "nord trondelag": "Nord-Trøndelag",
+  "hordaland": "Hordaland",
+  "sognogfjordane": "Sogn og Fjordane",
+  "sogn og fjordane": "Sogn og Fjordane",
+  "sognfjordane": "Sogn og Fjordane",
+  "hedmark": "Hedmark",
+  "oppland": "Oppland",
+  "austagder": "Aust-Agder",
+  "aust agder": "Aust-Agder",
+  "vestagder": "Vest-Agder",
+  "vest agder": "Vest-Agder",
+};
+
+// Given any fylke string (any era/spelling), return the de-duplicated
+// set of ALL fylke-name variants (as they might literally appear in the
+// DB `fylke` column) that should be treated as "the same place" — for
+// driving a SQL `IN (...)` clause. Restricted to strings that actually
+// occur in this module's own data (CANONICAL_FYLKER, the
+// ALIAS_TO_CANONICAL keys/values, and EQUIVALENCE_CLASSES entries) —
+// not an open-ended fuzzy set.
+//
+// This is a DIFFERENT (asymmetric) relation from fylkerMatch()'s
+// permissive sibling-matching:
+//   - Input is a narrow, post-2024 part of a since-re-split merged
+//     fylke (e.g. "Troms", "Akershus", "Vestfold") → returns itself +
+//     the broader historical merged name it used to be filed under
+//     (so pre-split DB rows still match), but NOT sibling split-parts
+//     (a "Troms" query should not also match "Finnmark" rows).
+//   - Input IS the broader merged name itself (e.g. "Viken", "Troms og
+//     Finnmark", "Vestland") → returns itself + every historical
+//     constituent part (a caller asking for the merged/broad name means
+//     "any of these").
+//
+// Examples:
+//   fylkeEquivalents("Troms")              → ["Troms", "Troms og Finnmark"]
+//   fylkeEquivalents("Troms og Finnmark")  → ["Troms og Finnmark", "Troms", "Finnmark"]
+//   fylkeEquivalents("Viken")               → ["Viken", "Akershus", "Buskerud", "Østfold"]
+//   fylkeEquivalents("Vestland")            → ["Vestland", "Hordaland", "Sogn og Fjordane"]
+//   fylkeEquivalents("garbage")             → ["garbage"]  (unrecognised: literal match only)
+export function fylkeEquivalents(fylke: string | null | undefined): string[] {
+  if (!fylke) return [];
+  const canonical = normaliseFylke(fylke);
+  if (!canonical) return [fylke];
+
+  const result = new Set<string>([canonical]);
+  const ck = key(canonical);
+
+  // Equivalence-class handling: if canonical IS the merged/broad name
+  // (class[0] by this module's convention), every constituent belongs;
+  // if canonical is one of the split parts, add back only the merged
+  // name (not sibling parts).
+  let matchedClass = false;
+  for (const cls of EQUIVALENCE_CLASSES) {
+    const idx = cls.findIndex((s) => key(s) === ck);
+    if (idx === -1) continue;
+    matchedClass = true;
+    if (idx === 0) {
+      for (const s of cls) result.add(s);
+    } else {
+      result.add(cls[0]);
+    }
+    break;
+  }
+
+  if (!matchedClass) {
+    // "Still merged" fylker (Vestland / Innlandet / Agder / Trøndelag):
+    // add the display form of every old half on record in ALIAS_TO_CANONICAL.
+    for (const [aliasKey, canon] of Object.entries(ALIAS_TO_CANONICAL)) {
+      if (canon !== canonical) continue;
+      const displayed = ALIAS_DISPLAY[aliasKey];
+      if (displayed) result.add(displayed);
+    }
+  }
+
+  return Array.from(result);
+}
+
 // Exported for tests + admin-UI sanity checks.
 export const __FYLKE_INTERNAL = {
   CANONICAL_FYLKER,

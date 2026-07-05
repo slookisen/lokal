@@ -17,6 +17,7 @@
 import { v4 as uuid } from "uuid";
 import { z } from "zod";
 import { getDb } from "../database/db-factory";
+import { fylkeEquivalents } from "./norway-fylke";
 
 const VERTICAL = "experiences";
 
@@ -700,7 +701,16 @@ export function discoverExperiences(
   ];
   const params: Record<string, unknown> = {};
 
-  if (f.fylke) { where.push("e.fylke = @fylke"); params.fylke = f.fylke; }
+  if (f.fylke) {
+    // Bridge pre-2024/2020 fylke-reform era spellings against whatever era
+    // the DB row's fylke column happens to be in (see norway-fylke.ts) —
+    // a caller-supplied "Troms" must still match a DB row stored as the
+    // pre-2024 "Troms og Finnmark", and vice versa.
+    const equivalents = fylkeEquivalents(f.fylke);
+    const placeholders = equivalents.map((_, i) => `@fylke${i}`);
+    where.push(`e.fylke IN (${placeholders.join(", ")})`);
+    equivalents.forEach((v, i) => { params[`fylke${i}`] = v; });
+  }
   if (f.kommune) { where.push("e.kommune = @kommune"); params.kommune = f.kommune; }
   if (f.category) { where.push("e.category = @category"); params.category = f.category; }
   if (f.indoor_outdoor) { where.push("e.indoor_outdoor IN (@io, 'both')"); params.io = f.indoor_outdoor; }
