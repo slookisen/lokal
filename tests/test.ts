@@ -21053,6 +21053,93 @@ console.log("\n── site-quality: category card icons (sq-caticon) ──");
   console.log("  sq-caticon: OK (9 tests: 200/svg-present/aria-hidden/mountain-icon/snowflake-icon/no-compass-for-natur/no-rfb/no-dental)");
 })();
 
+// ─── gardssalg-homepage-count: live count, not hardcoded "Kommer snart" ─────
+// Regression guard for `dev-requests/2026-07-04-opplevagent-besokstall-og-forside-friskhet.md`
+// item 2: once gardssalgVisible() flips true (>= GARDSSALG_VISIBILITY_THRESHOLD
+// providers), the injected homepage card hardcoded `count: 0`, so it always
+// rendered the "Kommer snart" (coming soon) badge even though the live
+// /kategori/gardssalg page had real, bookable producers. Same isolated
+// :memory: experiences DB + sync mock req/res pattern as sq-caticon above.
+console.log("\n── gardssalg-homepage-count: live count replaces hardcoded 'Kommer snart' ──");
+(() => {
+  const prevPathGHC = process.env.EXPERIENCES_DB_PATH;
+  process.env.EXPERIENCES_DB_PATH = ":memory:";
+
+  const dbFacPathGHC = require.resolve("../src/database/db-factory");
+  const expStPathGHC = require.resolve("../src/services/experience-store");
+  const expSeoPathGHC = require.resolve("../src/routes/experiences-seo");
+  delete require.cache[dbFacPathGHC];
+  delete require.cache[expStPathGHC];
+  delete require.cache[expSeoPathGHC];
+
+  const dbFacGHC = require("../src/database/db-factory") as typeof import("../src/database/db-factory");
+  dbFacGHC.__resetDbFactoryForTesting();
+  const expStGHC = require("../src/services/experience-store") as typeof import("../src/services/experience-store");
+  const seoRouterGHC = (require("../src/routes/experiences-seo") as typeof import("../src/routes/experiences-seo")).default as any;
+
+  const dbGHC = dbFacGHC.getDb("experiences");
+
+  // Seed a normal (non-gardssalg) experience so the grid isn't in the
+  // zero-category "fallbackCats" mode (which would mask this bug entirely).
+  const provGHC = expStGHC.createProvider({
+    navn: "Ikontest Gardssalg AS", org_nr: "999000222",
+    fylke: "Vestland", kommune: "Bergen",
+    brreg_verified: 1, brreg_active: 1, verification_status: "verified",
+  });
+  expStGHC.createExperience({
+    title: "Ikon test natur_friluft", provider_id: provGHC, provider_match_status: "matched",
+    category: "natur_friluft", fylke: "Vestland", kommune: "Bergen",
+    confidence: "high", verification_status: "verified",
+  });
+
+  // Seed GARDSSALG_VISIBILITY_THRESHOLD (5) gårdssalg producers — same raw-SQL
+  // `producer_type` set as the gardssalg-book block below (no service-layer
+  // setter for this column).
+  for (let i = 0; i < 5; i++) {
+    const pid = expStGHC.createProvider({
+      navn: `Gardssalg Test Produsent ${i}`, org_nr: `91000${i}${i}${i}${i}`,
+      fylke: "Innlandet", kommune: "Lillehammer",
+      brreg_verified: 0, verification_status: "pending_verify",
+    });
+    dbGHC.prepare("UPDATE experience_providers SET producer_type = ? WHERE id = ?").run("sideri", pid);
+  }
+
+  const layerGHC = (seoRouterGHC.stack as any[]).find(
+    (l: any) => l.route && l.route.path === "/" && l.route.methods?.get
+  );
+  assertTrue(!!layerGHC, "ghc-00: router has GET / layer");
+  let bodyGHC = ""; let statusGHC = 200;
+  const resGHC: any = {
+    statusCode: 200, setHeader: () => {},
+    status: (c: number) => { statusGHC = c; return resGHC; },
+    send: (b: unknown) => { bodyGHC = String(b); return resGHC; },
+    json: (o: unknown) => { bodyGHC = JSON.stringify(o); return resGHC; },
+  };
+  const reqGHC: any = { path: "/", hostname: "opplevagent.no", params: {}, query: {}, lang: "no" };
+  const handleGHC = layerGHC.route.stack[layerGHC.route.stack.length - 1].handle;
+  handleGHC(reqGHC, resGHC, () => { statusGHC = 404; });
+
+  assertEq(statusGHC, 200, "ghc-01: GET / → 200");
+
+  const hrefIdxGHC = bodyGHC.indexOf("/kategori/gardssalg");
+  assertTrue(hrefIdxGHC >= 0, "ghc-02: gardssalg card is present on the homepage grid");
+  const cardBlockGHC = hrefIdxGHC >= 0 ? bodyGHC.substring(hrefIdxGHC, hrefIdxGHC + 900) : "";
+
+  assertTrue(
+    /cat-count">5 /.test(cardBlockGHC),
+    "ghc-03: gardssalg card shows the live count (5), not a hardcoded 0"
+  );
+  assertTrue(
+    !cardBlockGHC.includes("cat-count-soon"),
+    "ghc-04: gardssalg card does NOT render 'Kommer snart' once visible with live providers"
+  );
+
+  if (prevPathGHC === undefined) delete process.env.EXPERIENCES_DB_PATH;
+  else process.env.EXPERIENCES_DB_PATH = prevPathGHC;
+  dbFacGHC.__resetDbFactoryForTesting();
+  console.log("  gardssalg-homepage-count: OK (4 tests: 200/card-present/live-count/no-coming-soon)");
+})();
+
 // ─── gardssalg-book: reservation → confirmation journey (2026-07-02) ────────
 // Regression coverage for the live "Book besøk" 404: gårdssalg producers
 // (experience_providers rows with producer_type set / rfb-seed) have ZERO
