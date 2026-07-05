@@ -821,8 +821,15 @@ export type ContentRefreshTarget = {
  * Auto-select providers eligible for a homepage content-refresh: providers that
  * HAVE a website (hjemmeside) AND own ≥1 experience whose content is THIN
  * (description empty OR category empty) and NOT locked (not verified, not
- * manual/claim-sourced). Ordered oldest-enriched first (last_enriched_at NULLs
- * first) so a sweep makes progress. Capped by `limit`.
+ * manual/claim-sourced). Ordered oldest-attempted first (last_content_attempt_at
+ * NULLs first) so a sweep makes progress. Deliberately keys off
+ * last_content_attempt_at (stamped on every attempt, success or failure) rather
+ * than last_enriched_at (stamped only on a successful write) — a provider whose
+ * homepage is permanently unreachable never succeeds, so ordering by
+ * last_enriched_at alone would leave it NULL/first forever, crowding out every
+ * other candidate once the eligible pool exceeds `limit` (2026-07-05,
+ * controller-handoff/2026-07-05-experiences-enrichment-content-refresh-
+ * aggregator-1.md). Capped by `limit`.
  */
 export function selectProvidersForContentRefresh(limit = 25): ContentRefreshTarget[] {
   const db = getDb(VERTICAL);
@@ -859,7 +866,7 @@ export function selectProvidersForContentRefresh(limit = 25): ContentRefreshTarg
                   OR e.category    IS NULL OR TRIM(e.category)    = ''
                    )
           )
-        ORDER BY (p.last_enriched_at IS NOT NULL), p.last_enriched_at ASC, p.created_at ASC
+        ORDER BY (p.last_content_attempt_at IS NOT NULL), p.last_content_attempt_at ASC, p.created_at ASC
         LIMIT ?`
     )
     .all(cap) as Array<{ id: string; navn: string; hjemmeside: string }>;
@@ -1039,6 +1046,24 @@ export function markProviderEnriched(providerId: string): boolean {
       `UPDATE experience_providers
           SET enrichment_state = 'enriched', last_enriched_at = datetime('now'),
               updated_at = datetime('now')
+        WHERE id = ?`
+    )
+    .run(providerId);
+  return res.changes > 0;
+}
+
+/** Stamp that a content-refresh ATTEMPT happened for this provider, regardless
+ * of outcome (success or failure). Deliberately does NOT touch
+ * enrichment_state/last_enriched_at — those mean "successfully enriched"; this
+ * means "we tried", so a provider whose homepage is permanently unreachable
+ * still cycles to the back of selectProvidersForContentRefresh()'s queue
+ * instead of sorting first on every run forever. Best-effort. */
+export function markProviderContentAttempted(providerId: string): boolean {
+  const db = getDb(VERTICAL);
+  const res = db
+    .prepare(
+      `UPDATE experience_providers
+          SET last_content_attempt_at = datetime('now')
         WHERE id = ?`
     )
     .run(providerId);
