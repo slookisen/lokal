@@ -19318,6 +19318,7 @@ console.log("\n── orch-pr-14: MCP discovery product_id surfacing ──");
   try { await _adminDbTableSizesPromise; } catch { /* errors already pushed to failures */ }
   try { await _contactClickTrackingPromise; } catch { /* errors already pushed to failures */ }
   try { await _homepageProvenanceEmailBackfillPromise; } catch { /* errors already pushed to failures */ }
+  try { await _agentKnowledgeGetAuthPromise; } catch { /* errors already pushed to failures */ }
   // PR-109 tests are synchronous (IIFE) — no promise needed
   // Drop pre-existing intg failures (unmasked by awaiting) — they predate M2
   // and live behind a separate fix-it task. Counting them here would surface
@@ -20803,6 +20804,35 @@ Promise.all([_contactClickTrackingPromise, _orchPr20260614Promise]).then(async (
     failures.push("homepage-provenance-email-backfill: unexpected error: " + String(err?.message || err));
   } finally {
     _homepageProvenanceEmailBackfillResolve();
+  }
+});
+
+// ── agent-knowledge GET auth gate (2026-07-05, dev-request
+// secure-agent-knowledge-endpoint) ────────────────────────────────────────
+// Chained off _homepageProvenanceEmailBackfillPromise for the same reason as
+// the blocks above: this block also swaps the global getDb() singleton via
+// __setDbForTesting, so it must run serially after the other
+// singleton-swapping blocks rather than concurrently with them.
+let _agentKnowledgeGetAuthResolve: () => void = () => {};
+const _agentKnowledgeGetAuthPromise: Promise<void> = new Promise<void>(r => {
+  _agentKnowledgeGetAuthResolve = r;
+});
+
+_homepageProvenanceEmailBackfillPromise.then(async () => {
+  console.log("\n── agent-knowledge-get-auth: GET /agents/:id/knowledge auth gate ──");
+  try {
+    const { runAgentKnowledgeGetAuthTests } = require("../src/routes/agent-knowledge-get-auth.test") as
+      typeof import("../src/routes/agent-knowledge-get-auth.test");
+    const jr = await runAgentKnowledgeGetAuthTests({ log: false });
+    passed += jr.passed;
+    failed += jr.failed;
+    for (const f of jr.failures) failures.push("agent-knowledge-get-auth: " + f);
+    console.log(`  agent-knowledge-get-auth: ${jr.passed} passed, ${jr.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("agent-knowledge-get-auth: unexpected error: " + String(err?.message || err));
+  } finally {
+    _agentKnowledgeGetAuthResolve();
   }
 });
 

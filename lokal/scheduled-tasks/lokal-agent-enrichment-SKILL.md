@@ -198,13 +198,20 @@ for a in by_score[:300]:
 " > /tmp/candidates.json
 
 # Step 1b: Check each candidate's knowledge to find the 50 with FEWEST fields filled
-cat /tmp/candidates.json | python3 -c "
-import json, sys, urllib.request
+# NOTE (2026-07-05, dev-request secure-agent-knowledge-endpoint): GET /knowledge now
+# requires the same auth as the PUT below (X-Admin-Key/X-Claim-Token/X-API-Key) — pass
+# $ADMIN_KEY (already exported for Step 3) or every lookup 403s and fields_filled=0.
+cat /tmp/candidates.json | ADMIN_KEY="$ADMIN_KEY" python3 -c "
+import json, os, sys, urllib.request
 candidates = [json.loads(line) for line in sys.stdin]
+admin_key = os.environ.get('ADMIN_KEY', '')
 scored = []
 for c in candidates:
     try:
-        req = urllib.request.Request(f'https://rettfrabonden.com/api/marketplace/agents/{c[\"id\"]}/knowledge')
+        req = urllib.request.Request(
+            f'https://rettfrabonden.com/api/marketplace/agents/{c[\"id\"]}/knowledge',
+            headers={'X-Admin-Key': admin_key},
+        )
         with urllib.request.urlopen(req, timeout=5) as resp:
             k = json.loads(resp.read()).get('data', {})
             fields_filled = sum(1 for f in ['address','phone','email','website','about'] if k.get(f))
