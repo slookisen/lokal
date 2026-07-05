@@ -4618,10 +4618,10 @@ router.post("/admin/homepage-provenance-batch", async (req: Request, res: Respon
     // Look up homepage URL (prefer agent_knowledge.website, fall back to agents.url).
     const kRow = db
       .prepare(
-        "SELECT website, address, phone, field_provenance FROM agent_knowledge WHERE agent_id = ?"
+        "SELECT website, address, phone, email, field_provenance FROM agent_knowledge WHERE agent_id = ?"
       )
       .get(agentId) as
-      | { website: string | null; address: string | null; phone: string | null; field_provenance: string | null }
+      | { website: string | null; address: string | null; phone: string | null; email: string | null; field_provenance: string | null }
       | undefined;
 
     const agentRow = db
@@ -4765,6 +4765,7 @@ router.post("/admin/homepage-provenance-batch", async (req: Request, res: Respon
 
       const currPhone = (kRow.phone ?? "").toString().trim();
       const currAddr = (kRow.address ?? "").toString().trim();
+      const currEmail = (kRow.email ?? "").toString().trim();
 
       if (!currPhone && extractedPhone) {
         sets.push("phone = ?");
@@ -4773,6 +4774,17 @@ router.post("/admin/homepage-provenance-batch", async (req: Request, res: Respon
       if (!currAddr && extractedAddress) {
         sets.push("address = ?");
         params.push(extractedAddress);
+      }
+      // orch-pr-<N> (2026-07-05): mirrors the phone/address backfill above.
+      // Without this, an extracted+guarded email only ever lands in
+      // field_provenance JSON, never in agent_knowledge.email — the exact
+      // column outreach_ready_pool's VIEW gates on (k.email IS NOT NULL).
+      // Root cause of outreach_pool_added being stuck at 0 despite this batch
+      // "succeeding" (controller-handoff 2026-07-05-lokal-agent-enrichment-
+      // email-acquisition-1.md).
+      if (!currEmail && incomingProv.email) {
+        sets.push("email = ?");
+        params.push(incomingProv.email.sources[0].value);
       }
       sets.push("field_provenance = ?");
       params.push(provJson);
