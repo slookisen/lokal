@@ -19173,6 +19173,7 @@ console.log("\n── orch-pr-14: MCP discovery product_id surfacing ──");
   try { await _orchPr21SentLogActorPromise; } catch { /* errors already pushed to failures */ }
   try { await _adminDbTableSizesPromise; } catch { /* errors already pushed to failures */ }
   try { await _contactClickTrackingPromise; } catch { /* errors already pushed to failures */ }
+  try { await _homepageProvenanceEmailBackfillPromise; } catch { /* errors already pushed to failures */ }
   // PR-109 tests are synchronous (IIFE) — no promise needed
   // Drop pre-existing intg failures (unmasked by awaiting) — they predate M2
   // and live behind a separate fix-it task. Counting them here would surface
@@ -20616,6 +20617,48 @@ _adminDbTableSizesPromise.then(async () => {
     failures.push("contact-tracking: unexpected error: " + String(err?.message || err));
   } finally {
     _contactClickTrackingResolve();
+  }
+});
+
+// ── homepage-provenance email-backfill (2026-07-05) ───────────────────────
+// Chained off _contactClickTrackingPromise (same reasoning as the blocks
+// above): this block also swaps the global getDb() singleton via
+// __setDbForTesting, so it must run serially after the other
+// singleton-swapping blocks, not concurrently with them.
+//
+// 2026-07-05 CI fix: _contactClickTrackingPromise's chain
+// (_orchPr21SentLogActorPromise -> _adminDbTableSizesPromise ->
+// _contactClickTrackingPromise) is a SEPARATE, independently-resolving
+// chain from _orchPr20260614Promise's (_orchPr86Promise + _orchPr93Promise
+// -> _orchPr20260614Promise, the agent_blocklist suppression tests at
+// orch20260614-36..46). Both chains swap the same getDb() singleton, and
+// nothing upstream serializes them against EACH OTHER (they only get
+// jointly awaited afterwards, to avoid exiting early). Chaining solely off
+// _contactClickTrackingPromise let this block's __setDbForTesting(db) race
+// _orchPr20260614Promise's block when the two chains happened to resolve
+// close together — reproduced on CI (8 orch20260614-* failures) though not
+// locally (timing-dependent). Awaiting BOTH chains here removes the race
+// without touching the pre-existing dual-chain structure.
+let _homepageProvenanceEmailBackfillResolve: () => void = () => {};
+const _homepageProvenanceEmailBackfillPromise: Promise<void> = new Promise<void>(r => {
+  _homepageProvenanceEmailBackfillResolve = r;
+});
+
+Promise.all([_contactClickTrackingPromise, _orchPr20260614Promise]).then(async () => {
+  console.log("\n── homepage-provenance-batch: email column backfill ──");
+  try {
+    const { runHomepageProvenanceEmailBackfillTests } = require("../src/routes/homepage-provenance-email-backfill.test") as
+      typeof import("../src/routes/homepage-provenance-email-backfill.test");
+    const jr = await runHomepageProvenanceEmailBackfillTests({ log: false });
+    passed += jr.passed;
+    failed += jr.failed;
+    for (const f of jr.failures) failures.push("homepage-provenance-email-backfill: " + f);
+    console.log(`  homepage-provenance-email-backfill: ${jr.passed} passed, ${jr.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("homepage-provenance-email-backfill: unexpected error: " + String(err?.message || err));
+  } finally {
+    _homepageProvenanceEmailBackfillResolve();
   }
 });
 
