@@ -27,6 +27,7 @@ import express, { Router, Request, Response, NextFunction } from "express";
 import * as QRCode from "qrcode";
 import { getExperiencesAgentCard } from "../services/experiences-agent-card";
 import { getExperiencesOpenapi } from "../services/experiences-openapi";
+import { isDisplayablePhone } from "../services/contact-normalizer";
 import { htmlLangAttr, ogLocale, type Lang } from "../i18n/t";
 import {
   listCategories,
@@ -1984,7 +1985,7 @@ router.get(
     if (sted) facts.push(["Sted", escapeHtml(sted)]);
     if (provider.adresse) facts.push(["Adresse", escapeHtml(provider.adresse)]);
     if (site) facts.push(["Nettside", `<a href="${escapeHtml(site)}" target="_blank" rel="noopener nofollow">${escapeHtml(hostOf(site))}</a>`]);
-    if (provider.telefon) facts.push(["Telefon", `<a href="tel:${escapeHtml(provider.telefon)}">${escapeHtml(provider.telefon)}</a>`]);
+    if (isDisplayablePhone(provider.telefon)) facts.push(["Telefon", `<a href="tel:${escapeHtml(provider.telefon)}">${escapeHtml(provider.telefon)}</a>`]);
     if (provider.epost) facts.push(["E-post", `<a href="mailto:${escapeHtml(provider.epost)}">${escapeHtml(provider.epost)}</a>`]);
     const factsRows = facts.map(([k, v]) => `<tr><th scope="row">${escapeHtml(k)}</th><td>${v}</td></tr>`).join("");
     const factsBlock = facts.length
@@ -2023,7 +2024,7 @@ router.get(
     };
     if (lat !== null && lon !== null) ld.geo = { "@type": "GeoCoordinates", latitude: lat, longitude: lon };
     if (site) ld.sameAs = [site];
-    if (provider.telefon) ld.telephone = provider.telefon;
+    if (isDisplayablePhone(provider.telefon)) ld.telephone = provider.telefon;
     if (provider.epost) ld.email = provider.epost;
     ld.offers = {
       "@type": "Offer",

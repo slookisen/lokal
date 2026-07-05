@@ -25,6 +25,7 @@ import { DiscoveryQuerySchema } from "../models/marketplace";
 import { getDb } from "../database/init";
 import { conversationService } from "../services/conversation-service";
 import { getTrafficStats } from "../services/traffic-stats";
+import { isDisplayablePhone } from "../services/contact-normalizer";
 import { slugify } from "../utils/slug";
 import { addUtmParams } from "../utils/url-utm";
 import { t, htmlLangAttr, ogLocale, localizedPath, type Lang } from "../i18n/t";
@@ -489,7 +490,7 @@ function producerCardUltraRich(a: any, knowledge: any, lang: Lang = "no"): strin
   }
 
   // Phone
-  const phoneLine = knowledge?.phone
+  const phoneLine = isDisplayablePhone(knowledge?.phone)
     ? `<div class="pc-meta-line">📞 ${escapeHtml(knowledge.phone)}</div>`
     : "";
 
@@ -549,7 +550,7 @@ function producerCardMediumRich(a: any, knowledge: any, lang: Lang = "no"): stri
 
   // Phone OR website (first available)
   let contactLine = "";
-  if (knowledge?.phone) {
+  if (isDisplayablePhone(knowledge?.phone)) {
     contactLine = `<div class="pc-meta-line">📞 ${escapeHtml(knowledge.phone)}</div>`;
   } else if (knowledge?.website) {
     const cleanWeb = String(knowledge.website).replace(/^https?:\/\//, "").replace(/\/$/, "");
@@ -2121,7 +2122,7 @@ router.get("/:city", (req: Request, res: Response, next: any) => {
         "url": `${BASE_URL}/produsent/${slugify(a.name)}`,
       };
       if (k.address) item.address = { "@type": "PostalAddress", "streetAddress": k.address, "addressLocality": cityName, "addressCountry": "NO" };
-      if (k.phone) item.telephone = k.phone;
+      if (isDisplayablePhone(k.phone)) item.telephone = k.phone;
       if (a.location?.lat && a.location?.lng) item.geo = { "@type": "GeoCoordinates", "latitude": a.location.lat, "longitude": a.location.lng };
       return item;
     });
@@ -2946,11 +2947,11 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
       // "<name>, <city>, Norge" even if address is missing.
       const umbContactItems: string[] = [];
       if (k.address) umbContactItems.push(`<div class="ct-item"><div class="ct-icon">&#128205;</div><div><div class="ct-label">Adresse</div><div class="ct-val">${escapeHtml(k.address)}${k.postalCode ? `, ${escapeHtml(k.postalCode)}` : ""}</div></div></div>`);
-      if (k.phone) umbContactItems.push(`<div class="ct-item"><div class="ct-icon">&#128222;</div><div><div class="ct-label">Telefon</div><div class="ct-val"><a href="tel:${k.phone.replace(/\s+/g, "")}">${escapeHtml(k.phone)}</a></div></div></div>`);
+      if (isDisplayablePhone(k.phone)) umbContactItems.push(`<div class="ct-item"><div class="ct-icon">&#128222;</div><div><div class="ct-label">Telefon</div><div class="ct-val"><a href="tel:${k.phone.replace(/\s+/g, "")}">${escapeHtml(k.phone)}</a></div></div></div>`);
       if (k.email) umbContactItems.push(`<div class="ct-item"><div class="ct-icon">&#9993;</div><div><div class="ct-label">E-post</div><div class="ct-val"><a href="mailto:${k.email}">${escapeHtml(k.email)}</a></div></div></div>`);
       if (k.website) umbContactItems.push(`<div class="ct-item"><div class="ct-icon">&#127760;</div><div><div class="ct-label">Nettside</div><div class="ct-val"><a href="${escapeHtml(addUtmParams(k.website))}" target="_blank" rel="noopener">${escapeHtml(k.website.replace(/^https?:\/\//, ""))}</a></div></div></div>`);
       // Google Maps search — search by name + (address|city), never raw coords.
-      if (k.address || k.phone || k.email || k.website) {
+      if (k.address || isDisplayablePhone(k.phone) || k.email || k.website) {
         const umbMapsParts = [agent.name];
         if (k.address) umbMapsParts.push(k.address);
         if (cityName) umbMapsParts.push(cityName);
@@ -3167,7 +3168,7 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
     // Contact items
     const contactItems: string[] = [];
     if (k.address) contactItems.push(`<div class="ct-item"><div class="ct-icon">&#128205;</div><div><div class="ct-label">Adresse</div><div class="ct-val">${escapeHtml(k.address)}${k.postalCode ? `, ${escapeHtml(k.postalCode)}` : ""}</div></div></div>`);
-    if (k.phone) contactItems.push(`<div class="ct-item"><div class="ct-icon">&#128222;</div><div><div class="ct-label">Telefon</div><div class="ct-val"><a href="tel:${k.phone.replace(/\s+/g, "")}">${escapeHtml(k.phone)}</a></div></div></div>`);
+    if (isDisplayablePhone(k.phone)) contactItems.push(`<div class="ct-item"><div class="ct-icon">&#128222;</div><div><div class="ct-label">Telefon</div><div class="ct-val"><a href="tel:${k.phone.replace(/\s+/g, "")}">${escapeHtml(k.phone)}</a></div></div></div>`);
     if (k.email) contactItems.push(`<div class="ct-item"><div class="ct-icon">&#9993;</div><div><div class="ct-label">E-post</div><div class="ct-val"><a href="mailto:${k.email}">${escapeHtml(k.email)}</a></div></div></div>`);
     if (k.website) contactItems.push(`<div class="ct-item"><div class="ct-icon">&#127760;</div><div><div class="ct-label">Nettside</div><div class="ct-val"><a href="${escapeHtml(addUtmParams(k.website))}" target="_blank" rel="noopener">${escapeHtml(k.website.replace(/^https?:\/\//, ""))}</a></div></div></div>`);
 
@@ -3333,7 +3334,7 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
     }
 
     // Contact
-    if (k.phone) jsonLd.telephone = k.phone;
+    if (isDisplayablePhone(k.phone)) jsonLd.telephone = k.phone;
     if (k.email) jsonLd.email = k.email;
     if (k.website) jsonLd.url = k.website;
 

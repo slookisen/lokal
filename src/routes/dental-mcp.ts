@@ -29,6 +29,7 @@ import {
 
 import { slugifyClinic } from "./dental-seo";
 import { dentalLimiter } from "../middleware/security";
+import { isDisplayablePhone } from "../services/contact-normalizer";
 
 const router = Router();
 
@@ -109,7 +110,7 @@ export function buildSearchResults(
       org_nr: a.org_nr,
       poststed: a.poststed,
       fylke: a.fylke,
-      telefon: a.telefon,
+      telefon: isDisplayablePhone(a.telefon) ? a.telefon : null,
       hjemmeside: a.hjemmeside,
       helfo_agreement: a.helfo_agreement,
       badges,
@@ -226,8 +227,8 @@ function registerDentalTools(server: McpServer): void {
           postnummer: agent.postnummer,
           poststed: agent.poststed,
           fylke: agent.fylke,
-          telefon: agent.telefon,
-          mobil: agent.mobil,
+          telefon: isDisplayablePhone(agent.telefon) ? agent.telefon : null,
+          mobil: isDisplayablePhone(agent.mobil) ? agent.mobil : null,
           epost: agent.epost,
           hjemmeside: agent.hjemmeside,
           helfo_agreement: agent.helfo_agreement,
