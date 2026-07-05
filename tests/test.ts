@@ -20625,12 +20625,26 @@ _adminDbTableSizesPromise.then(async () => {
 // above): this block also swaps the global getDb() singleton via
 // __setDbForTesting, so it must run serially after the other
 // singleton-swapping blocks, not concurrently with them.
+//
+// 2026-07-05 CI fix: _contactClickTrackingPromise's chain
+// (_orchPr21SentLogActorPromise -> _adminDbTableSizesPromise ->
+// _contactClickTrackingPromise) is a SEPARATE, independently-resolving
+// chain from _orchPr20260614Promise's (_orchPr86Promise + _orchPr93Promise
+// -> _orchPr20260614Promise, the agent_blocklist suppression tests at
+// orch20260614-36..46). Both chains swap the same getDb() singleton, and
+// nothing upstream serializes them against EACH OTHER (they only get
+// jointly awaited afterwards, to avoid exiting early). Chaining solely off
+// _contactClickTrackingPromise let this block's __setDbForTesting(db) race
+// _orchPr20260614Promise's block when the two chains happened to resolve
+// close together — reproduced on CI (8 orch20260614-* failures) though not
+// locally (timing-dependent). Awaiting BOTH chains here removes the race
+// without touching the pre-existing dual-chain structure.
 let _homepageProvenanceEmailBackfillResolve: () => void = () => {};
 const _homepageProvenanceEmailBackfillPromise: Promise<void> = new Promise<void>(r => {
   _homepageProvenanceEmailBackfillResolve = r;
 });
 
-_contactClickTrackingPromise.then(async () => {
+Promise.all([_contactClickTrackingPromise, _orchPr20260614Promise]).then(async () => {
   console.log("\n── homepage-provenance-batch: email column backfill ──");
   try {
     const { runHomepageProvenanceEmailBackfillTests } = require("../src/routes/homepage-provenance-email-backfill.test") as
