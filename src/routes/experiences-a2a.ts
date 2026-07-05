@@ -34,6 +34,7 @@ import {
   discoverExperiences,
   getExperienceById,
   listCategories,
+  listPublishedKommuner,
   type DiscoverFilter,
 } from "../services/experience-store";
 import { getExperiencesAgentCard } from "../services/experiences-agent-card";
@@ -115,15 +116,63 @@ function matchesAsWordPrefix(haystack: string, keyword: string): boolean {
   }
 }
 
+// Like matchesAsWordPrefix, but requires a boundary on BOTH sides — used
+// for whole place names (kommune/city) rather than keyword-prefix matching,
+// so e.g. a short kommune name doesn't false-match inside an unrelated word.
+function matchesAsWholeWord(haystack: string, keyword: string): boolean {
+  if (!keyword) return false;
+  let from = 0;
+  for (;;) {
+    const idx = haystack.indexOf(keyword, from);
+    if (idx === -1) return false;
+    const before = idx > 0 ? haystack[idx - 1] : "";
+    const afterIdx = idx + keyword.length;
+    const after = afterIdx < haystack.length ? haystack[afterIdx] : "";
+    if (!/[\p{L}\p{N}]/u.test(before) && !/[\p{L}\p{N}]/u.test(after)) return true;
+    from = idx + 1;
+  }
+}
+
 export function parseExperiencesIntent(text: string): DiscoverFilter {
   const lower = text.toLowerCase();
   const params: DiscoverFilter = {};
 
-  // Fylke detection
-  for (const f of FYLKER) {
-    if (lower.includes(f)) {
-      params.fylke = f.charAt(0).toUpperCase() + f.slice(1);
-      break;
+  // Place-entity resolution: kommune FIRST, fylke second (dev-request
+  // 2026-07-04-opplevagent-nl-parser-og-fylkesnormalisering item 1).
+  //
+  // A place like "Tromsø" is a kommune, not a fylke — matching it against
+  // the real, currently-published kommune list (not a static/invented one)
+  // both (a) resolves more precisely than a fylke guess, and (b) sidesteps
+  // the 2020/2024 fylke-naming churn entirely, since we read the kommune's
+  // ACTUAL stored fylke value straight from the DB rather than guessing a
+  // spelling. Falls back to the fylke keyword list below when no kommune
+  // matches (e.g. DB unreachable, or the query names a fylke directly).
+  let kommuneMatched = false;
+  try {
+    const kommuner = listPublishedKommuner();
+    // Longest name first so multi-word kommuner aren't pre-empted by a
+    // shorter unrelated substring; this list is small (real published data
+    // only — never invents a kommune the DB doesn't actually have).
+    const byLengthDesc = [...kommuner].sort((a, b) => b.kommune.length - a.kommune.length);
+    for (const k of byLengthDesc) {
+      if (matchesAsWholeWord(lower, k.kommune.toLowerCase())) {
+        params.kommune = k.kommune;
+        if (k.fylke) params.fylke = k.fylke;
+        kommuneMatched = true;
+        break;
+      }
+    }
+  } catch {
+    // DB not reachable — fall back to fylke-only keyword matching.
+  }
+
+  // Fylke detection (fallback when no kommune matched)
+  if (!kommuneMatched) {
+    for (const f of FYLKER) {
+      if (lower.includes(f)) {
+        params.fylke = f.charAt(0).toUpperCase() + f.slice(1);
+        break;
+      }
     }
   }
 

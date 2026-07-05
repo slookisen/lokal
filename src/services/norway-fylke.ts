@@ -472,6 +472,52 @@ export function fylkerMatch(
   return false;
 }
 
+// ─── expandFylkeAliases ────────────────────────────────────────
+// Given a free-form fylke query value, return every fylke spelling that
+// should be treated as a match for it in a DB `WHERE fylke IN (...)`
+// query. This is the SQL-facing counterpart to fylkerMatch(): instead of
+// comparing two values, it expands ONE value into the full candidate set.
+//
+// Used to fix the dev-request 2026-07-04-opplevagent-nl-parser-og-fylkesnormalisering
+// item-1 bug: the live experiences DB stores the pre-2024 merged names
+// ("Troms og Finnmark", "Vestfold og Telemark", possibly "Viken") for rows
+// harvested/seeded before the 2024 fylke split, while callers (NL parser,
+// REST query params, MCP args) send the modern split names ("Troms",
+// "Finnmark", "Vestfold", "Telemark", "Akershus", "Buskerud", "Østfold").
+// An exact `fylke = @fylke` match therefore silently returns 0 rows.
+//
+// Resolution:
+//   1. Always include the raw input verbatim (so an exact DB match still
+//      works even for fylker with no aliasing, e.g. "Oslo").
+//   2. Include the canonical (2024) form, if resolvable.
+//   3. If the raw input OR its canonical form belongs to one of the
+//      old-merger equivalence classes (Viken / Vestfold og Telemark /
+//      Troms og Finnmark), include every member of that class — this is
+//      what makes fylke=Troms also match rows stored as "Troms og
+//      Finnmark", and vice versa.
+//
+// NOTE: this reuses fylkerMatch()'s equivalence-class semantics, which are
+// intentionally permissive about SIBLINGS within a merged-fylke class (e.g.
+// querying fylke=Akershus will also match rows tagged "Buskerud" or
+// "Østfold", not just "Viken") — same trade-off already accepted for
+// hanen-scraper matching. Documented here so it's a visible, reviewed
+// choice rather than a surprise.
+export function expandFylkeAliases(fylke: string | null | undefined): string[] {
+  if (!fylke) return [];
+  const out = new Set<string>([fylke]);
+  const canonical = normaliseFylke(fylke);
+  if (canonical) out.add(canonical);
+  const k = key(fylke);
+  const kCanon = canonical ? key(canonical) : null;
+  EQUIVALENCE_CLASSES.forEach((cls, i) => {
+    const keys = CLASS_KEYS[i];
+    if (keys.has(k) || (kCanon !== null && keys.has(kCanon))) {
+      for (const member of cls) out.add(member);
+    }
+  });
+  return Array.from(out);
+}
+
 // Exported for tests + admin-UI sanity checks.
 export const __FYLKE_INTERNAL = {
   CANONICAL_FYLKER,

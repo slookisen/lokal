@@ -17,6 +17,7 @@
 import { v4 as uuid } from "uuid";
 import { z } from "zod";
 import { getDb } from "../database/db-factory";
+import { expandFylkeAliases } from "./norway-fylke";
 
 const VERTICAL = "experiences";
 
@@ -700,7 +701,18 @@ export function discoverExperiences(
   ];
   const params: Record<string, unknown> = {};
 
-  if (f.fylke) { where.push("e.fylke = @fylke"); params.fylke = f.fylke; }
+  // fylke matching goes through expandFylkeAliases() rather than a plain
+  // `=` comparison: the DB mixes pre-2024 merged fylke names ("Troms og
+  // Finnmark", "Vestfold og Telemark") with post-2024 split names ("Troms",
+  // "Finnmark", ...), and this is the ONE shared choke point every caller
+  // (A2A NL parser, REST query params, MCP tool args) funnels through — see
+  // dev-request 2026-07-04-opplevagent-nl-parser-og-fylkesnormalisering item 1.
+  if (f.fylke) {
+    const candidates = expandFylkeAliases(f.fylke);
+    const placeholders = candidates.map((_, i) => `@fylke${i}`);
+    where.push(`e.fylke IN (${placeholders.join(", ")})`);
+    candidates.forEach((c, i) => { params[`fylke${i}`] = c; });
+  }
   if (f.kommune) { where.push("e.kommune = @kommune"); params.kommune = f.kommune; }
   if (f.category) { where.push("e.category = @category"); params.category = f.category; }
   if (f.indoor_outdoor) { where.push("e.indoor_outdoor IN (@io, 'both')"); params.io = f.indoor_outdoor; }

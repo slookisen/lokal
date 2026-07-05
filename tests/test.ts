@@ -14014,10 +14014,16 @@ console.log("\n── experiences scaffold: experience-store ──");
   }
 
   // ── 2. Insert + get round-trip a single experience.
+  // fylke is "Troms og Finnmark" (the real, pre-2024-reform merged name the
+  // live DB actually uses for Tromsø-area rows — see experiences-seo.ts's
+  // hardcoded /fylke/Troms%20og%20Finnmark homepage link) — NOT "Troms",
+  // which is what a naive NL/REST/MCP caller would ask for. This is the
+  // exact mismatch behind dev-request 2026-07-04-opplevagent-nl-parser-og-fylkesnormalisering
+  // item 1 ("hva kan vi finne på i Tromsø?" → 0 results).
   const expId = createExperience({
     title: "Hvalsafari fra Tromsø",
     category: "dyreliv_safari",
-    fylke: "Troms",
+    fylke: "Troms og Finnmark",
     kommune: "Tromsø",
     indoor_outdoor: "outdoor",
     activity_tags: ["hvalsafari", "rib"],
@@ -14032,7 +14038,7 @@ console.log("\n── experiences scaffold: experience-store ──");
     assertTrue(got !== null, "exp-store-02b: getExperienceById finds the inserted row");
     assertEq(got?.title, "Hvalsafari fra Tromsø", "exp-store-02c: title round-trips");
     assertEq(got?.category, "dyreliv_safari", "exp-store-02d: category round-trips");
-    assertEq(got?.fylke, "Troms", "exp-store-02e: fylke round-trips");
+    assertEq(got?.fylke, "Troms og Finnmark", "exp-store-02e: fylke round-trips");
     // JSON-array fields hydrate back to arrays.
     assertTrue(
       Array.isArray(got?.activity_tags) && got!.activity_tags.includes("hvalsafari"),
@@ -14069,11 +14075,22 @@ console.log("\n── experiences scaffold: experience-store ──");
       "exp-store-03c: discoverExperiences only surfaces verified rows (pending_verify excluded)"
     );
 
-    // Filter narrows by fylke.
+    // Filter narrows by fylke — via ALIAS resolution: the row is stored
+    // under the merged 2020-model name "Troms og Finnmark", but a caller
+    // (REST /api/opplevelser/discover?fylke=Troms, A2A NL, or MCP args)
+    // queries the split 2024-model name "Troms". Regression-guards dev-request
+    // 2026-07-04-opplevagent-nl-parser-og-fylkesnormalisering item 1.
     const inTroms = discoverExperiences({ fylke: "Troms" });
     assertTrue(
       inTroms.some((e) => e.id === expId),
-      "exp-store-03d: discoverExperiences({fylke:'Troms'}) includes the row"
+      "exp-store-03d: discoverExperiences({fylke:'Troms'}) resolves the alias and includes the Troms-og-Finnmark row"
+    );
+    // Symmetric alias: querying the OTHER split half ("Finnmark") must also
+    // resolve to the same merged-name row.
+    const inFinnmark = discoverExperiences({ fylke: "Finnmark" });
+    assertTrue(
+      inFinnmark.some((e) => e.id === expId),
+      "exp-store-03d2: discoverExperiences({fylke:'Finnmark'}) resolves the alias and includes the Troms-og-Finnmark row"
     );
     const inOslo = discoverExperiences({ fylke: "Oslo" });
     assertTrue(
@@ -14618,8 +14635,11 @@ console.log("\n── orch-pr-19: opplevagent.no host-gate (experiences) ──"
     weather_dependent: 0, confidence: "high", verification_status: "verified",
   });
   expStore19.createExperience({
+    // fylke is the REAL merged 2020-model name ("Troms og Finnmark") the live
+    // DB actually stores for Tromsø-area rows — NOT "Troms" — see dev-request
+    // 2026-07-04-opplevagent-nl-parser-og-fylkesnormalisering item 1.
     title: "Hvalsafari fra Tromsø", category: "dyreliv_safari",
-    fylke: "Troms", kommune: "Tromsø", indoor_outdoor: "outdoor",
+    fylke: "Troms og Finnmark", kommune: "Tromsø", indoor_outdoor: "outdoor",
     season: ["winter"], confidence: "high", verification_status: "verified",
   });
 
@@ -14643,6 +14663,17 @@ console.log("\n── orch-pr-19: opplevagent.no host-gate (experiences) ──"
   // innendørs/utendørs (prefix-continuation) still detected correctly.
   assertEq(parseExperiencesIntent("innendørs aktiviteter").indoor_outdoor, "indoor",
     "orch19-05q: parseExperiencesIntent still sets indoor_outdoor='indoor' for 'innendørs'");
+
+  // Place-entity resolution: kommune FIRST, fylke second (dev-request
+  // 2026-07-04-opplevagent-nl-parser-og-fylkesnormalisering item 1). "Tromsø"
+  // must resolve to kommune="Tromsø" (matched against the REAL published
+  // kommune list) and derive the row's ACTUAL fylke value ("Troms og
+  // Finnmark"), not a guessed "Troms" that matches zero DB rows.
+  const tromsoIntent = parseExperiencesIntent("hva kan vi finne på i Tromsø om vinteren?");
+  assertEq(tromsoIntent.kommune, "Tromsø",
+    "orch19-05r: parseExperiencesIntent resolves 'Tromsø' to kommune='Tromsø' (kommune-first)");
+  assertEq(tromsoIntent.fylke, "Troms og Finnmark",
+    "orch19-05s: kommune-first also derives the row's real fylke ('Troms og Finnmark'), not a guessed 'Troms'");
 
   // handleExperiencesMessageSend: missing message → -32602
   const noMsg19 = handleExperiencesMessageSend({}, "orch19-id") as any;
@@ -14668,6 +14699,25 @@ console.log("\n── orch-pr-19: opplevagent.no host-gate (experiences) ──"
       "orch19-05j: Oslo indoor experience surfaced for rain query");
     assertTrue(!titles.includes("Hvalsafari fra Tromsø"),
       "orch19-05k: Troms outdoor experience NOT surfaced (Oslo+rain filter)");
+  }
+
+  // handleExperiencesMessageSend: the flagship homepage demo question must
+  // return results, not 0 (dev-request 2026-07-04-opplevagent-nl-parser-og-fylkesnormalisering
+  // item-1 acceptance criterion). Regression-guards the full place-entity
+  // resolution fix end-to-end: kommune-first resolution in parseExperiencesIntent
+  // PLUS (belt-and-braces for callers passing raw fylke=Troms/Finnmark) the
+  // fylke alias/equivalence-class expansion in discoverExperiences().
+  {
+    const resp = handleExperiencesMessageSend(
+      { message: { text: "hva kan vi finne på i Tromsø om vinteren?" } }, "orch19-tromso"
+    ) as any;
+    const dataArtifact = (resp.result?.artifacts || []).find((a: any) => a.artifactId === "discover-results");
+    const found = dataArtifact?.parts?.[0]?.data;
+    assertTrue(!!found && found.count >= 1,
+      "orch19-05t: Tromsø demo query returns >=1 result (was 0 before the fylke/kommune-alias fix)");
+    const titles = (found?.experiences || []).map((e: any) => e.title);
+    assertTrue(titles.includes("Hvalsafari fra Tromsø"),
+      "orch19-05u: Tromsø demo query surfaces the Hvalsafari-fra-Tromsø experience");
   }
 
   // handleExperiencesMessageSend: categories intent → opplevelser_categories
