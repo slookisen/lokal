@@ -17,6 +17,7 @@ import { crossSourceAgreement, isAcceptableHomepageEmail, pageMentionsProducer, 
 import { logPlacesCall, getPlacesUsageThisMonth } from "../services/places-usage-tracker";
 import { getDb as getVerticalDb } from "../database/db-factory";
 import { findOrgnumberByName } from "../services/brreg-client";
+import { isDisplayablePhone } from "../services/contact-normalizer";
 
 // ── PR-29 v3: pure helper for Place Details (New) request params ──────────────
 // Exported so tests can assert the URL structure without touching the handler.
@@ -139,7 +140,8 @@ function buildContactBlock(agentId: string): {
   const info = knowledgeService.getAgentInfo(agentId);
   if (!info) return null;
   const k = info.knowledge;
-  const hasAnyContact = !!(k.address || k.phone || k.email || k.website);
+  const displayablePhone = isDisplayablePhone(k.phone);
+  const hasAnyContact = !!(k.address || displayablePhone || k.email || k.website);
   if (!hasAnyContact) {
     // Still return vcardUrl so clients always have a handle
     return { vcardUrl: `/api/marketplace/agents/${agentId}/vcard` };
@@ -147,7 +149,7 @@ function buildContactBlock(agentId: string): {
   return {
     address: k.address,
     postalCode: k.postalCode,
-    phone: k.phone,
+    phone: displayablePhone ? k.phone : undefined,
     email: k.email,
     website: k.website ? addUtmParams(k.website) : undefined,
     openingHours: k.openingHours,
@@ -173,7 +175,7 @@ function buildVCard(agentId: string): string | null {
   lines.push(`FN:${escapeVCard(agent.name)}`);
   lines.push(`ORG:${escapeVCard(agent.name)}`);
   if (k.about) lines.push(`NOTE:${escapeVCard(k.about)}`);
-  if (k.phone) lines.push(`TEL;TYPE=WORK,VOICE:${escapeVCard(k.phone)}`);
+  if (isDisplayablePhone(k.phone)) lines.push(`TEL;TYPE=WORK,VOICE:${escapeVCard(k.phone)}`);
   if (k.email) lines.push(`EMAIL;TYPE=WORK:${escapeVCard(k.email)}`);
   if (k.website) lines.push(`URL:${escapeVCard(k.website)}`);
   if (k.address || agent.city) {
@@ -597,7 +599,7 @@ router.get("/agents/:id/card", (req: Request, res: Response) => {
     if (k.postalCode) contact.postalCode = k.postalCode;
     if (cityName) contact.city = cityName;
     contact.country = "Norway";
-    if (k.phone) contact.phone = k.phone;
+    if (isDisplayablePhone(k.phone)) contact.phone = k.phone;
     if (k.email) contact.email = k.email;
     if (k.website) contact.website = addUtmParams(k.website);
     if (Object.keys(contact).length > 1) card.contact = contact;
@@ -943,7 +945,11 @@ router.get("/agents/:id/knowledge", (req: Request, res: Response) => {
     res.status(404).json({ success: false, error: "Ingen kunnskapsdata for denne agenten" });
     return;
   }
-  res.json({ success: true, data: knowledge });
+  const data = {
+    ...knowledge,
+    phone: isDisplayablePhone(knowledge.phone) ? knowledge.phone : undefined,
+  };
+  res.json({ success: true, data });
 });
 
 // ─── POST /admin/agents/:id/curated-fields — Set or clear field lock (Phase 4.9a) ───

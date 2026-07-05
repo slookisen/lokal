@@ -23,6 +23,7 @@ import { knowledgeService, parseProductPrice, isProductHeader, isProductNoise } 
 import { slugify } from "../utils/slug";
 import { addAiUtmParams } from "../utils/url-utm";
 import { getDb } from "../database/init";
+import { isDisplayablePhone } from "../services/contact-normalizer";
 import { geocodingService } from "../services/geocoding-service";
 import {
   createCart as svcCreateCart,
@@ -121,7 +122,7 @@ function getAgentKnowledgeSummary(agentId: string): { contact?: any; productSumm
   const k = info.knowledge || {} as any;
   const contact: any = {};
   if (k.address) contact.address = k.address;
-  if (k.phone) contact.phone = k.phone;
+  if (isDisplayablePhone(k.phone)) contact.phone = k.phone;
   if (k.email) contact.email = k.email;
   if (k.website) contact.website = k.website;
 
@@ -364,7 +365,7 @@ function registerTools(server: McpServer, getClientIdentity?: () => string | und
       // Contact
       const contact: string[] = [];
       if (k.address) contact.push(`📍 ${k.address}${k.postalCode ? `, ${k.postalCode}` : ""}`);
-      if (k.phone) contact.push(`📞 ${k.phone}`);
+      if (isDisplayablePhone(k.phone)) contact.push(`📞 ${k.phone}`);
       if (k.email) contact.push(`✉️ ${k.email}`);
       if (k.website) contact.push(`🌐 ${k.website}`);
       if (contact.length) sections.push(`\n## Kontakt\n${contact.join("\n")}`);
@@ -964,7 +965,7 @@ function formatAgentCompact(agent: any, idx: number, contact?: any, productSumma
   if (contact) {
     const cl: string[] = [];
     if (contact.address) cl.push(`📍 ${contact.address}`);
-    if (contact.phone) cl.push(`📞 ${contact.phone}`);
+    if (isDisplayablePhone(contact.phone)) cl.push(`📞 ${contact.phone}`);
     if (contact.email) cl.push(`✉️ ${contact.email}`);
     if (contact.website) cl.push(`🌐 ${contact.website}`);
     if (cl.length) lines.push(`   ${cl.join("  ·  ")}`);

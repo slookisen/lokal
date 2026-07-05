@@ -15,6 +15,7 @@ import type { DentalAgent, PoststedRow } from "../services/dental-store";
 import { getDentalAgentCard } from "../services/dental-agent-card";
 import { getDentalOpenapi } from "../services/dental-openapi";
 import { getTrafficStats } from "../services/traffic-stats";
+import { isDisplayablePhone } from "../services/contact-normalizer";
 
 const router = Router();
 
@@ -123,11 +124,12 @@ function safeUrl(u: string | null | undefined): string {
 }
 
 // ─── Security: safeTelHref — build tel: href from phone field ────────────
-// Strips everything except digits, +. Returns "" if result < 8 chars (no render).
+// wrong_contact_rate guardrail: only render a tel: link when the value reduces
+// to a real 8-digit NO national number; otherwise treat it as absent.
 function safeTelHref(telefon: string | null | undefined): string {
-  if (!telefon) return "";
+  if (!isDisplayablePhone(telefon)) return "";
   const stripped = telefon.replace(/[^+\d]/g, "");
-  return stripped.length >= 8 ? "tel:" + stripped : "";
+  return "tel:" + stripped;
 }
 
 // ─── Slug helpers ────────────────────────────────────────────
@@ -1282,7 +1284,7 @@ function renderClinicProfile(
     // (The ogImage on the page shell still falls back to favicon.svg for social sharing.)
     // orch-PR-20260613: no real image field in DentalAgent; image is omitted
     // rather than falling back to favicon.svg which is a quality negative.
-    ...(agent.telefon ? { telephone: agent.telefon } : {}),
+    ...(isDisplayablePhone(agent.telefon) ? { telephone: agent.telefon } : {}),
     ...(agent.epost ? { email: agent.epost } : {}),
     ...(safeUrl(agent.hjemmeside) ? { sameAs: safeUrl(agent.hjemmeside) } : {}),
     address: {

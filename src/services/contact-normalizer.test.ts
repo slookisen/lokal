@@ -21,6 +21,7 @@ import {
   addressesMatch,
   phonesMatch,
   splitAddress,
+  isDisplayablePhone,
 } from "./contact-normalizer";
 import { crossSourceAgreement, type ProvenanceRecord } from "./cross-source-validator";
 
@@ -74,6 +75,17 @@ export function runContactNormalizerTests(opts: { log?: boolean } = {}): TestSum
     assertTrue(!phonesMatch("91122333", "91122334"), "phonesMatch NEG: one differing digit ⇒ conflict");
     assertTrue(!phonesMatch("91122333", "9112233"), "phonesMatch NEG: 7-digit partial ⇒ no match");
     assertTrue(!phonesMatch("91122333", ""), "phonesMatch NEG: empty ⇒ no match");
+  }
+
+  // ── isDisplayablePhone: render-guard (wrong_contact_rate = 0) ────────────────
+  {
+    assertTrue(isDisplayablePhone("911 22 333"), "isDisplayablePhone: valid 8-digit local number");
+    assertTrue(isDisplayablePhone("+47 911 22 333"), "isDisplayablePhone: valid +47-prefixed number");
+    assertTrue(!isDisplayablePhone("+47 19 09 49"), "isDisplayablePhone NEG: real failing case (6 national digits)");
+    assertTrue(!isDisplayablePhone(""), "isDisplayablePhone NEG: empty string");
+    assertTrue(!isDisplayablePhone(null), "isDisplayablePhone NEG: null");
+    assertTrue(!isDisplayablePhone(undefined), "isDisplayablePhone NEG: undefined");
+    assertTrue(!isDisplayablePhone("ring oss i dag"), "isDisplayablePhone NEG: garbage text");
   }
 
   // ── normalizeAddress ─────────────────────────────────────────────────────────

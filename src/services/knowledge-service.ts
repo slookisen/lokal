@@ -1,6 +1,7 @@
 import { v4 as uuid } from "uuid";
 import crypto from "crypto";
 import { getDb } from "../database/init";
+import { isDisplayablePhone } from "./contact-normalizer";
 
 // ─── PR-95 (2026-06-01): Debio cert relabelling ──────────────────────
 //
@@ -307,7 +308,9 @@ class KnowledgeService {
         address: knowledge?.address,
         postalCode: knowledge?.postalCode,
         website: knowledge?.website,
-        phone: knowledge?.phone,
+        // wrong_contact_rate guardrail: this feeds the public buyer-facing
+        // "tell me about this seller" endpoint — never return an invalid phone.
+        phone: isDisplayablePhone(knowledge?.phone) ? knowledge?.phone : undefined,
         email: knowledge?.email,
         openingHours: knowledge?.openingHours || [],
         products: knowledge?.products || [],
