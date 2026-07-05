@@ -19318,6 +19318,8 @@ console.log("\n── orch-pr-14: MCP discovery product_id surfacing ──");
   try { await _adminDbTableSizesPromise; } catch { /* errors already pushed to failures */ }
   try { await _contactClickTrackingPromise; } catch { /* errors already pushed to failures */ }
   try { await _homepageProvenanceEmailBackfillPromise; } catch { /* errors already pushed to failures */ }
+  try { await _agentKnowledgeGetAuthPromise; } catch { /* errors already pushed to failures */ }
+  try { await _tasksPruneAsyncPromise; } catch { /* errors already pushed to failures */ }
   // PR-109 tests are synchronous (IIFE) — no promise needed
   // Drop pre-existing intg failures (unmasked by awaiting) — they predate M2
   // and live behind a separate fix-it task. Counting them here would surface
@@ -20806,6 +20808,35 @@ Promise.all([_contactClickTrackingPromise, _orchPr20260614Promise]).then(async (
   }
 });
 
+// ── agent-knowledge GET auth gate (2026-07-05, dev-request
+// secure-agent-knowledge-endpoint) ────────────────────────────────────────
+// Chained off _homepageProvenanceEmailBackfillPromise for the same reason as
+// the blocks above: this block also swaps the global getDb() singleton via
+// __setDbForTesting, so it must run serially after the other
+// singleton-swapping blocks rather than concurrently with them.
+let _agentKnowledgeGetAuthResolve: () => void = () => {};
+const _agentKnowledgeGetAuthPromise: Promise<void> = new Promise<void>(r => {
+  _agentKnowledgeGetAuthResolve = r;
+});
+
+_homepageProvenanceEmailBackfillPromise.then(async () => {
+  console.log("\n── agent-knowledge-get-auth: GET /agents/:id/knowledge auth gate ──");
+  try {
+    const { runAgentKnowledgeGetAuthTests } = require("../src/routes/agent-knowledge-get-auth.test") as
+      typeof import("../src/routes/agent-knowledge-get-auth.test");
+    const jr = await runAgentKnowledgeGetAuthTests({ log: false });
+    passed += jr.passed;
+    failed += jr.failed;
+    for (const f of jr.failures) failures.push("agent-knowledge-get-auth: " + f);
+    console.log(`  agent-knowledge-get-auth: ${jr.passed} passed, ${jr.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("agent-knowledge-get-auth: unexpected error: " + String(err?.message || err));
+  } finally {
+    _agentKnowledgeGetAuthResolve();
+  }
+});
+
 
 // ── site-quality (opplevagent-site-quality loop, 2026-06-22) ──────────────────
 // Tilbyder slug URLs: /tilbyder/<slug> (human-readable) + 301 from UUID URLs.
@@ -21831,17 +21862,105 @@ console.log("\n── gardssalg-profile: produsent profile page ──");
 // ephemeral port, but — like many other blocks in this file — it DOES pin
 // the shared getDb() singleton (via __setDbForTesting) for the duration of
 // its HTTP requests, and it shares process.env.ANALYTICS_ADMIN_KEY with
-// every other block that exercises analytics.ts admin routes. Rather than
-// wiring into the file's _prNN handle-coordination scheme, its req() helper
-// (below) defensively re-pins both globals immediately before every request
-// and retries on {401,500} — see the comment on req() for why that's the
-// right fix here (a pre-existing hazard in this shared-process suite, not a
-// bug in the feature under test). Appended after the REPORT IIFE (see the
-// many other post-REPORT blocks above for precedent) — the REPORT IIFE's
-// own chain of awaits takes many seconds in this suite, giving this block's
-// sub-second async work ample time to finish (and fold its passed/failed
-// counts into the shared tally) well before process.exit.
-(async () => {
+// every other block that exercises analytics.ts admin routes.
+//
+// 2026-07-05 CI fix (3rd attempt — see git history for the two superseded
+// ones): this block used to be a bare fire-and-forget top-level IIFE, NOT
+// part of the file's _prNN-style handle-coordination scheme at all, relying
+// on finishing "well before process.exit" because the REPORT IIFE's own
+// chain of awaits takes many seconds. That margin is not guaranteed on every
+// runner, and CI reproduced it: this block's real-I/O req() loop (HTTP round
+// trips, setTimeout/setImmediate polling) re-pins the shared getDb()
+// singleton at unpredictable wall-clock moments, and — being a plain
+// top-level fire-and-forget IIFE — it can race EVERY OTHER singleton-pinning
+// block in the file, not just agent-knowledge-get-auth.
+//
+// Attempt 1 (agent-knowledge-get-auth.test.ts re-pinning the db immediately
+// before each of its own router.handle() calls) failed identically on CI
+// because it only defends the instant of THAT suite's own db read; it does
+// nothing to stop this block from mutating the shared singleton at any other
+// moment, including during any OTHER suite's db access.
+//
+// Attempt 2 (this comment, superseded within this same PR iteration) chained
+// this block off _agentKnowledgeGetAuthPromise alone, on the theory that
+// putting it "after the last _prNN link" was enough. That is insufficient:
+// this file does NOT have one single linear chain — it has several
+// independently-resolving branches of _prNN-style handles that only get
+// jointly awaited at the very end (in the REPORT IIFE's tail, "to avoid
+// exiting early" per the _homepageProvenanceEmailBackfillPromise comment
+// above), without being ordered against each other during execution.
+// _agentKnowledgeGetAuthPromise's own ancestry (_homepageProvenanceEmailBackfillPromise
+// → Promise.all([_contactClickTrackingPromise, _orchPr20260614Promise]) → ...)
+// is only ONE such branch; chaining off it alone left this block free to
+// start while OTHER branches (e.g. _orchPr20260614_5Promise's cat-* catalog
+// suite) were still in flight — reproduced locally: this block's own
+// __setDbForTesting(tpaDb) call landed mid-suite there and crashed a
+// products-array assertion with a plain undefined-length TypeError.
+//
+// The only fix that removes the race categorically (not just narrows the
+// odds, and not just against one branch) is to make this block depend on
+// EVERY branch the REPORT IIFE itself awaits — i.e. the exact same
+// dependency set, collected below in the same order — via Promise.allSettled
+// (not Promise.all/.then, so that even if some upstream link were to reject
+// this block still runs rather than silently vanishing). Once every one of
+// those has settled, there is no remaining code path anywhere in the file
+// that can still be executing a __setDbForTesting call (or building a
+// response that depends on one), so this block's own db-singleton mutations
+// are provably the last ones in the process, full stop. The req() helper
+// below keeps its defensive re-pin/retry as harmless extra defense-in-depth,
+// but it is no longer what makes this block safe.
+let _tasksPruneAsyncResolve: () => void = () => {};
+const _tasksPruneAsyncPromise: Promise<void> = new Promise<void>(r => {
+  _tasksPruneAsyncResolve = r;
+});
+
+// Same dependency set as the REPORT IIFE's own tail-await list below (every
+// entry from _serialChain through _agentKnowledgeGetAuthPromise) — kept
+// literally identical on purpose so "does this block depend on everything
+// the REPORT IIFE depends on" is true by inspection, not by re-derivation.
+const _tasksPruneAsyncDeps: Promise<unknown>[] = [
+  _serialChain,
+  Promise.all(_pr21Promises),
+  _m2Promise,
+  _pr24Promise,
+  _pr56Promise,
+  _pr63Promise,
+  _pr65Promise,
+  _pr66Promise,
+  _pr67Promise,
+  _pr68Promise,
+  _pr74Promise,
+  _pr75Promise,
+  _pr76Promise,
+  _pr78Promise,
+  _orchPr86Promise,
+  _orchPr93Promise,
+  _pr94Promise,
+  _pr95Promise,
+  _pr103Promise,
+  _pr106Promise,
+  _pr110Promise,
+  _pr125Promise,
+  _seoDentalPromise,
+  _platformVerifierPromise,
+  _orchPr20260614_2Promise,
+  _orchPr20260614Promise,
+  _orchPr20260614_5Promise,
+  _orchPr20260614_6Promise,
+  _orchPr14ProductIdPromise,
+  _orchPr9PruneDeadUrlsPromise,
+  _orchPr18BulkLoadPromise,
+  _orchPr12SweepPromise,
+  _brregVerifySlice1Promise,
+  _orchPr20BmEventsPromise,
+  _orchPr21SentLogActorPromise,
+  _adminDbTableSizesPromise,
+  _contactClickTrackingPromise,
+  _homepageProvenanceEmailBackfillPromise,
+  _agentKnowledgeGetAuthPromise,
+];
+
+Promise.allSettled(_tasksPruneAsyncDeps).then(async () => {
   console.log("\n── orch-pr-20260704: tasks-prune / vacuum async background jobs ──");
   const TAG = "tasks-prune-async";
   try {
@@ -22094,8 +22213,10 @@ console.log("\n── gardssalg-profile: produsent profile page ──");
   } catch (err) {
     failed++;
     failures.push(`${TAG}: unexpected error: ${err instanceof Error ? (err.stack || err.message) : String(err)}`);
+  } finally {
+    _tasksPruneAsyncResolve();
   }
-})();
+});
 
 // ── orch-cat-i18n: every canonical platform category must render with a
 // translated (non-English) card-badge label. Regression for untranslated
