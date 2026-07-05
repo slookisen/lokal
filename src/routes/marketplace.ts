@@ -10,6 +10,7 @@ import { emailService } from "../services/email-service";
 import { trustScoreService } from "../services/trust-score-service";
 import { conversationService } from "../services/conversation-service";
 import { slugify } from "../utils/slug";
+import { pingIndexNow } from "../services/indexnow-service";
 import { addUtmParams } from "../utils/url-utm";
 import { isBlocked, add as blocklistAdd, list as blocklistList, remove as blocklistRemove } from "../services/blocklist-service";
 import { mergeFieldProvenance } from "./admin-knowledge";
@@ -267,6 +268,13 @@ router.post("/register", (req: Request, res: Response) => {
       metadata: { name: agent.name, role: agent.role, city: agent.location?.city },
       ipAddress: req.ip,
     });
+
+    // IndexNow: tell Bing/Yandex the new producer's profile page exists,
+    // so it can be picked up without waiting for a crawl (dev-request
+    // 2026-07-04-sokemotor-indeksering-og-lenker slice 1). Fire-and-forget
+    // — never awaited, never allowed to affect the response below.
+    // /produsent/<slug> URL convention matches seo.ts / the /search route.
+    pingIndexNow([`${getBaseUrl(req)}/produsent/${slugify(agent.name)}`], "rettfrabonden.com");
 
     res.status(201).json({
       success: true,
