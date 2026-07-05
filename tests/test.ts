@@ -14755,6 +14755,39 @@ console.log("\n── orch-pr-19: opplevagent.no host-gate (experiences) ──"
     assertEq(alesundIntent.fylke, undefined, "orch19-05y: parseExperiencesIntent('...i Ålesund...') does not also set fylke");
   }
 
+  // Regression (PR #146 review): traditional region/valley/district labels
+  // in CITY_TO_FYLKE_RAW (Romsdal, Sunnmøre, Nordmøre, Hallingdal, Jæren,
+  // Vesterålen, Lofoten, Hardanger, Setesdal) are NOT literal kommune values
+  // and must not shadow a correct fylke match — "Romsdal" substring-collides
+  // with the fylke name "Møre og Romsdal" itself, so kommune-first detection
+  // previously (wrongly) resolved this to kommune:"Romsdal" (a nonexistent
+  // DB value → silent 0 results), instead of fylke:"Møre og Romsdal".
+  {
+    const moreRomsdalIntent = parseExperiencesIntent("hva kan vi finne på i Møre og Romsdal om vinteren?");
+    // Note: the pre-existing FYLKER-loop capitalization only uppercases the
+    // first character (not full title-case), so "Møre og romsdal" is the
+    // correct expected value here — unrelated to this fix, and harmless
+    // downstream since fylkeEquivalents()/normaliseFylke() key-match
+    // case-insensitively.
+    assertEq(moreRomsdalIntent.fylke, "Møre og romsdal",
+      "orch19-05z: parseExperiencesIntent('...i Møre og Romsdal...') → fylke (not kommune='Romsdal')");
+    assertEq(moreRomsdalIntent.kommune, undefined,
+      "orch19-05z2: parseExperiencesIntent('...i Møre og Romsdal...') does not set a bogus kommune");
+
+    const sunnmoreIntent = parseExperiencesIntent("aktiviteter på Sunnmøre");
+    assertEq(sunnmoreIntent.kommune, undefined,
+      "orch19-05z3: 'Sunnmøre' (a district, not a kommune) is not detected as a kommune");
+
+    const hallingdalIntent = parseExperiencesIntent("noe å gjøre i Hallingdal");
+    assertEq(hallingdalIntent.kommune, undefined,
+      "orch19-05z4: 'Hallingdal' (a district, not a kommune) is not detected as a kommune");
+
+    // A real kommune whose name is unaffected by the exclusion list still resolves.
+    const moldeIntent = parseExperiencesIntent("noe å gjøre i Molde");
+    assertEq(moldeIntent.kommune, "Molde",
+      "orch19-05z5: real kommune 'Molde' (in Møre og Romsdal) still resolves via kommune-first detection");
+  }
+
   // handleExperiencesMessageSend: missing message → -32602
   const noMsg19 = handleExperiencesMessageSend({}, "orch19-id") as any;
   assertEq(noMsg19.error?.code, -32602, "orch19-05e: missing message → error code -32602");

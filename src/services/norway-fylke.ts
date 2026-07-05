@@ -563,6 +563,35 @@ export function fylkeEquivalents(fylke: string | null | undefined): string[] {
   return Array.from(result);
 }
 
+// ─── non-kommune region/valley/district labels ─────────────────
+// CITY_TO_FYLKE_RAW is a "place name → fylke" lookup (its own doc comment
+// says "city/municipality"), but a handful of its entries are traditional
+// geographic districts spanning MULTIPLE real kommuner, not a kommune in
+// their own right — they exist in the map only so a caller can still
+// resolve the fylke for a well-known district name. Treating one of these
+// as if it were a literal DB `kommune` column value is wrong: no
+// experience row has e.g. `kommune = "Romsdal"`, so a caller that mistakes
+// one for a kommune gets a confident but empty (0-row) result — the exact
+// bug class this module exists to prevent, just relocated. Some of these
+// also substring-collide with a full fylke name ("Romsdal" ⊂ "Møre og
+// Romsdal"), which is how this was first caught (dev-request
+// 2026-07-04-opplevagent-nl-parser-og-fylkesnormalisering item 1, PR #146
+// review). Exported so callers doing kommune-vs-fylke disambiguation
+// (see parseExperiencesIntent in experiences-a2a.ts) can exclude these
+// from "is this a specific kommune" detection while still using
+// cityToFylke()/CITY_TO_FYLKE_RAW normally for fylke resolution.
+export const NON_KOMMUNE_REGION_LABELS: ReadonlySet<string> = new Set([
+  "Hallingdal",   // Buskerud — spans Flå/Nes/Gol/Hemsedal/Ål/Hol
+  "Jæren",        // Rogaland — spans Sandnes/Klepp/Time/Hå/Gjesdal etc.
+  "Setesdal",     // Agder — spans Bygland/Valle/Bykle/Evje og Hornnes
+  "Sunnmøre",     // Møre og Romsdal — spans Ålesund/Volda/Ørsta/Sykkylven etc.
+  "Nordmøre",     // Møre og Romsdal — spans Kristiansund/Surnadal etc.
+  "Romsdal",      // Møre og Romsdal — spans Molde/Rauma etc.; substring-collides with the fylke name itself
+  "Vesterålen",   // Nordland — spans Sortland/Andøy/Øksnes/Bø/Hadsel
+  "Lofoten",      // Nordland — spans Vågan/Vestvågøy/Flakstad/Moskenes/Røst/Værøy
+  "Hardanger",    // Vestland — spans Odda/Ulvik/Jondal/Eidfjord/Kvinnherad etc.
+]);
+
 // Exported for tests + admin-UI sanity checks.
 export const __FYLKE_INTERNAL = {
   CANONICAL_FYLKER,

@@ -36,7 +36,7 @@ import {
   listCategories,
   type DiscoverFilter,
 } from "../services/experience-store";
-import { __FYLKE_INTERNAL } from "../services/norway-fylke";
+import { __FYLKE_INTERNAL, NON_KOMMUNE_REGION_LABELS } from "../services/norway-fylke";
 import { getExperiencesAgentCard } from "../services/experiences-agent-card";
 import { jsonRpcLimiter } from "../middleware/security";
 
@@ -124,7 +124,13 @@ function matchesAsWordPrefix(haystack: string, keyword: string): boolean {
 // over-broad fylke instead of the intended kommune (the flagship demo
 // query "hva kan vi finne på i Tromsø om vinteren?" — dev-request
 // 2026-07-04-opplevagent-nl-parser-og-fylkesnormalisering item 1).
-const KOMMUNE_NAMES: string[] = Object.keys(__FYLKE_INTERNAL.CITY_TO_FYLKE_RAW);
+// Excludes traditional region/valley/district labels (Romsdal, Sunnmøre, …)
+// that appear in CITY_TO_FYLKE_RAW for fylke-resolution purposes but are
+// NOT themselves a literal DB `kommune` value — see NON_KOMMUNE_REGION_LABELS
+// in norway-fylke.ts for why (caught in PR #146 review: "Møre og Romsdal"
+// queries were regressing to a nonexistent `kommune: "Romsdal"` match).
+const KOMMUNE_NAMES: string[] = Object.keys(__FYLKE_INTERNAL.CITY_TO_FYLKE_RAW)
+  .filter(name => !NON_KOMMUNE_REGION_LABELS.has(name));
 
 // Detect a kommune name in `lower` (already-lowercased text) using the same
 // word-boundary-aware matching as the indoor/outdoor keywords. When several
