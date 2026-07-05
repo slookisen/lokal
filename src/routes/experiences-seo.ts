@@ -42,6 +42,8 @@ import {
   listPublishedFylker,
   listPublishedKommuner,
   listPublishedProviders,
+  getCategoryFaqStats,
+  getKommuneFaqStats,
   countGardssalgProviders,
   getPublishedProviderById,
   getPublishedProviderBySlug,
@@ -1570,6 +1572,11 @@ function renderBrowsePage(opts: {
   extraTopHtml?: string; // e.g. search box / facet chips, rendered above the grid
   emptyTitle?: string;
   emptyBody?: string;
+  // GEO: additional JSON-LD objects to render alongside CollectionPage +
+  // BreadcrumbList — e.g. a quality-gated FAQPage block (see
+  // buildCategoryFaqJsonLd/buildKommuneFaqJsonLd). Omitted entirely when the
+  // quality gate says the page doesn't have enough real facts.
+  extraJsonLd?: any[];
 }): string {
   const url = baseUrl();
   const canonical = `${url}${opts.canonicalPath}`;
@@ -1607,7 +1614,7 @@ function renderBrowsePage(opts: {
       ...(c.href ? { item: c.href.startsWith("http") ? c.href : `${url}${c.href}` } : {}),
     })),
   };
-  const ldScripts = [collectionLd, breadcrumbLd]
+  const ldScripts = [collectionLd, breadcrumbLd, ...(opts.extraJsonLd || [])]
     .map((o) => `<script type="application/ld+json">${JSON.stringify(o).replace(/<\//g, "<\\/")}</script>`)
     .join("\n");
 
@@ -2498,6 +2505,114 @@ ${BROWSE_CSS}
   },
 );
 
+// GEO: FAQPage JSON-LD for category pages (dev-request
+// 2026-06-30-geo-content-structured-data, category/city slice). The
+// producer-vertical city page already has this (buildCityFaqJsonLd,
+// routes/seo.ts); this is the category-page half, for the experiences
+// (Opplevagent) vertical's /kategori/:category listing. Answers are built
+// strictly from getCategoryFaqStats() aggregates over the SAME
+// publish-gated rows the page itself lists — never fabricated. Quality-gated
+// exactly like buildProducerFaqJsonLd/buildCityFaqJsonLd: null unless at
+// least 2 questions have a real, catalog-backed answer, so a category with no
+// distinguishing signal (single fylke, no stated prices) stays without FAQ
+// schema rather than emit a thin/templated block.
+export function buildCategoryFaqJsonLd(params: {
+  label: string;
+  url: string;
+  total: number;
+  fylkeCount: number;
+  kommuneCount: number;
+  minPriceFrom: number | null;
+}): any | null {
+  const qas: Array<{ q: string; a: string }> = [];
+
+  if (params.total > 0) {
+    qas.push({
+      q: `Hvor mange opplevelser finnes i kategorien ${params.label}?`,
+      a: `Det er ${params.total} ${params.total === 1 ? "opplevelse" : "opplevelser"} i kategorien ${params.label} på Opplevagent.`,
+    });
+  }
+
+  if (params.fylkeCount > 0) {
+    const kommuneClause = params.kommuneCount > 0
+      ? ` fordelt på ${params.kommuneCount} ${params.kommuneCount === 1 ? "kommune" : "kommuner"}`
+      : "";
+    qas.push({
+      q: `I hvor mange fylker finnes ${params.label}?`,
+      a: `${params.label} finnes i ${params.fylkeCount} ${params.fylkeCount === 1 ? "fylke" : "fylker"} på Opplevagent${kommuneClause}.`,
+    });
+  }
+
+  if (params.minPriceFrom !== null && params.minPriceFrom >= 0) {
+    qas.push({
+      q: `Hva koster opplevelser i kategorien ${params.label}?`,
+      a: `Prisene i kategorien ${params.label} starter fra ${params.minPriceFrom} kr — alle tilbydere er verifisert mot Brønnøysundregistrene.`,
+    });
+  }
+
+  if (qas.length < 2) return null;
+
+  return {
+    "@context": "https://schema.org",
+    "@type": "FAQPage",
+    "@id": `${params.url}#faq`,
+    "mainEntity": qas.map(({ q, a }) => ({
+      "@type": "Question",
+      "name": q,
+      "acceptedAnswer": { "@type": "Answer", "text": a },
+    })),
+  };
+}
+
+// GEO: FAQPage JSON-LD for kommune (municipality) pages — the "city" half of
+// the same dev-request slice, for the experiences vertical's
+// /kommune/:kommune listing. Same shape/quality-gate as
+// buildCategoryFaqJsonLd(); see getKommuneFaqStats() for the aggregate query.
+export function buildKommuneFaqJsonLd(params: {
+  kommune: string;
+  fylke: string | null;
+  url: string;
+  total: number;
+  categoryCount: number;
+  minPriceFrom: number | null;
+}): any | null {
+  const qas: Array<{ q: string; a: string }> = [];
+
+  if (params.total > 0) {
+    qas.push({
+      q: `Hvor mange opplevelser finnes i ${params.kommune}?`,
+      a: `Det er ${params.total} ${params.total === 1 ? "opplevelse" : "opplevelser"} i ${params.kommune}${params.fylke ? ` (${params.fylke})` : ""} på Opplevagent.`,
+    });
+  }
+
+  if (params.categoryCount > 0) {
+    qas.push({
+      q: `Hva slags opplevelser kan jeg finne i ${params.kommune}?`,
+      a: `Opplevelsene i ${params.kommune} spenner over ${params.categoryCount} ${params.categoryCount === 1 ? "kategori" : "kategorier"} på Opplevagent.`,
+    });
+  }
+
+  if (params.minPriceFrom !== null && params.minPriceFrom >= 0) {
+    qas.push({
+      q: `Hva koster en opplevelse i ${params.kommune}?`,
+      a: `Prisene i ${params.kommune} starter fra ${params.minPriceFrom} kr — alle tilbydere er verifisert mot Brønnøysundregistrene.`,
+    });
+  }
+
+  if (qas.length < 2) return null;
+
+  return {
+    "@context": "https://schema.org",
+    "@type": "FAQPage",
+    "@id": `${params.url}#faq`,
+    "mainEntity": qas.map(({ q, a }) => ({
+      "@type": "Question",
+      "name": q,
+      "acceptedAnswer": { "@type": "Answer", "text": a },
+    })),
+  };
+}
+
 // ─── GET /kategori/:category — experiences in a category ─────────────────────
 router.get("/kategori/:category", (req: Request, res: Response, next: NextFunction) => {
   const category = String(req.params.category || "");
@@ -2514,18 +2629,36 @@ router.get("/kategori/:category", (req: Request, res: Response, next: NextFuncti
   }
 
   const label = catLabel(category);
+  const canonicalPath = `/kategori/${encodeURIComponent(category)}`;
+  // GEO: FAQPage JSON-LD — see buildCategoryFaqJsonLd for the quality gate.
+  let categoryFaqJsonLd: ReturnType<typeof buildCategoryFaqJsonLd> = null;
+  try {
+    const stats = getCategoryFaqStats(category);
+    categoryFaqJsonLd = buildCategoryFaqJsonLd({
+      label,
+      url: `${baseUrl()}${canonicalPath}`,
+      total,
+      fylkeCount: stats.fylkeCount,
+      kommuneCount: stats.kommuneCount,
+      minPriceFrom: stats.minPriceFrom,
+    });
+  } catch {
+    categoryFaqJsonLd = null;
+  }
+
   const html = renderBrowsePage({
     title: `${label} | Opplevagent`,
     h1: label,
     metaDesc: `${label} i Norge — kuraterte opplevelser på Opplevagent med Brreg-verifiserte tilbydere. ${total} ${total === 1 ? "opplevelse" : "opplevelser"} i kategorien.`,
     lede: `Opplevelser i kategorien ${label.toLowerCase()}.`,
-    canonicalPath: `/kategori/${encodeURIComponent(category)}`,
+    canonicalPath,
     crumbs: [{ name: "Forsiden", href: "/" }, { name: "Alle opplevelser", href: "/opplevelser" }, { name: label }],
     rows,
     total,
     page,
     pageSize: BROWSE_PAGE_SIZE,
     extraTopHtml: searchBox(""),
+    extraJsonLd: categoryFaqJsonLd ? [categoryFaqJsonLd] : undefined,
   });
   res.setHeader("Content-Type", "text/html; charset=utf-8");
   res.setHeader("Cache-Control", "public, max-age=300");
@@ -2593,18 +2726,36 @@ router.get("/kommune/:kommune", (req: Request, res: Response, next: NextFunction
     { name: kommune },
   ];
 
+  const kommuneCanonicalPath = `/kommune/${encodeURIComponent(kommune)}`;
+  // GEO: FAQPage JSON-LD — see buildKommuneFaqJsonLd for the quality gate.
+  let kommuneFaqJsonLd: ReturnType<typeof buildKommuneFaqJsonLd> = null;
+  try {
+    const stats = getKommuneFaqStats(kommune);
+    kommuneFaqJsonLd = buildKommuneFaqJsonLd({
+      kommune,
+      fylke,
+      url: `${baseUrl()}${kommuneCanonicalPath}`,
+      total,
+      categoryCount: stats.categoryCount,
+      minPriceFrom: stats.minPriceFrom,
+    });
+  } catch {
+    kommuneFaqJsonLd = null;
+  }
+
   const html = renderBrowsePage({
     title: `Opplevelser i ${kommune} | Opplevagent`,
     h1: `Opplevelser i ${kommune}`,
     metaDesc: `Kuraterte opplevelser og aktiviteter i ${kommune}${fylke ? ", " + fylke : ""} — verifiserte tilbydere på Opplevagent. ${total} ${total === 1 ? "opplevelse" : "opplevelser"}.`,
     lede: `Hva kan du finne på i ${kommune}? Kuratert oversikt over opplevelser i kommunen.`,
-    canonicalPath: `/kommune/${encodeURIComponent(kommune)}`,
+    canonicalPath: kommuneCanonicalPath,
     crumbs,
     rows,
     total,
     page,
     pageSize: BROWSE_PAGE_SIZE,
     extraTopHtml: searchBox(""),
+    extraJsonLd: kommuneFaqJsonLd ? [kommuneFaqJsonLd] : undefined,
   });
   res.setHeader("Content-Type", "text/html; charset=utf-8");
   res.setHeader("Cache-Control", "public, max-age=300");

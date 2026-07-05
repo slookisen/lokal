@@ -22118,3 +22118,102 @@ console.log("\n── gardssalg-profile: produsent profile page ──");
     failures.push(`orch-cat-i18n: unexpected error: ${err instanceof Error ? (err.stack || err.message) : String(err)}`);
   }
 })();
+
+// ── geo-faq-category-city: FAQPage JSON-LD for the experiences vertical's
+// /kategori/:category and /kommune/:kommune pages (dev-request
+// 2026-06-30-geo-content-structured-data, category/city slice — the
+// producer-vertical city page already has this in seo.ts/PR-132; this is the
+// category-page half plus the same pattern applied to the experiences
+// vertical's kommune page, which is the only other still-uncovered
+// city-equivalent listing page in the codebase). Behavioural checks mirror
+// tests/seo-jsonld.test.ts's buildProducerFaqJsonLd/buildCityFaqJsonLd
+// coverage: quality-gate (thin data -> null, no fabricated content) + happy
+// path (2-3 real, catalog-grounded Q&A pairs).
+console.log("\n── geo-faq-category-city: buildCategoryFaqJsonLd / buildKommuneFaqJsonLd ──");
+(() => {
+  try {
+    const expSeoMod = require("../src/routes/experiences-seo");
+    const { buildCategoryFaqJsonLd, buildKommuneFaqJsonLd } = expSeoMod;
+
+    assertTrue(typeof buildCategoryFaqJsonLd === "function", "geo-faq-cc: experiences-seo.ts exports buildCategoryFaqJsonLd");
+    assertTrue(typeof buildKommuneFaqJsonLd === "function", "geo-faq-cc: experiences-seo.ts exports buildKommuneFaqJsonLd");
+
+    // ── Category page ──
+    const catBase = { label: "Dyreliv & safari", url: "https://opplevagent.no/kategori/dyreliv_safari", total: 0, fylkeCount: 0, kommuneCount: 0, minPriceFrom: null as number | null };
+
+    assertEq(
+      buildCategoryFaqJsonLd({ ...catBase, total: 0 }),
+      null,
+      "geo-faq-cc: category — 0 experiences, no fylker, no price -> null (below 2-question quality gate)"
+    );
+    assertEq(
+      buildCategoryFaqJsonLd({ ...catBase, total: 5 }),
+      null,
+      "geo-faq-cc: category — total alone (1 real field) -> null (no thin-page FAQ emitted)"
+    );
+    {
+      const faq = buildCategoryFaqJsonLd({ ...catBase, total: 5, fylkeCount: 3, kommuneCount: 4 });
+      assertTrue(!!faq && faq["@type"] === "FAQPage", "geo-faq-cc: category — total+fylker (2 real fields) -> non-null FAQPage");
+      assertTrue(!!faq && Array.isArray(faq.mainEntity) && faq.mainEntity.length === 2, "geo-faq-cc: category — 2 real fields -> exactly 2 questions");
+      assertTrue(
+        !!faq && faq.mainEntity.every((q: any) => q["@type"] === "Question" && q.acceptedAnswer?.["@type"] === "Answer"),
+        "geo-faq-cc: category — each mainEntity item is a valid Question/Answer pair"
+      );
+      assertTrue(!!faq && faq.mainEntity[0].acceptedAnswer.text.includes("5"), "geo-faq-cc: category — count answer includes the real total (not fabricated)");
+      assertTrue(!!faq && faq.mainEntity[1].acceptedAnswer.text.includes("3 fylker"), "geo-faq-cc: category — fylke answer includes the real fylke count (not fabricated)");
+    }
+    {
+      const faq = buildCategoryFaqJsonLd({ ...catBase, total: 5, fylkeCount: 3, kommuneCount: 4, minPriceFrom: 350 });
+      assertTrue(!!faq && faq.mainEntity.length === 3, "geo-faq-cc: category — 3 real fields (total+fylker+price) -> exactly 3 questions");
+      assertTrue(!!faq && faq.mainEntity[2].acceptedAnswer.text.includes("350 kr"), "geo-faq-cc: category — price answer includes the real min price (not fabricated)");
+    }
+
+    // ── Kommune page ──
+    const kommuneBase = { kommune: "Ålesund", fylke: "Møre og Romsdal" as string | null, url: "https://opplevagent.no/kommune/%C3%A5lesund", total: 0, categoryCount: 0, minPriceFrom: null as number | null };
+
+    assertEq(
+      buildKommuneFaqJsonLd({ ...kommuneBase, total: 0 }),
+      null,
+      "geo-faq-cc: kommune — 0 experiences, no categories, no price -> null (below 2-question quality gate)"
+    );
+    assertEq(
+      buildKommuneFaqJsonLd({ ...kommuneBase, total: 7 }),
+      null,
+      "geo-faq-cc: kommune — total alone (1 real field) -> null (no thin-page FAQ emitted)"
+    );
+    {
+      const faq = buildKommuneFaqJsonLd({ ...kommuneBase, total: 7, categoryCount: 2 });
+      assertTrue(!!faq && faq["@type"] === "FAQPage", "geo-faq-cc: kommune — total+categories (2 real fields) -> non-null FAQPage");
+      assertTrue(!!faq && Array.isArray(faq.mainEntity) && faq.mainEntity.length === 2, "geo-faq-cc: kommune — 2 real fields -> exactly 2 questions");
+      assertTrue(
+        !!faq && faq.mainEntity.every((q: any) => q["@type"] === "Question" && q.acceptedAnswer?.["@type"] === "Answer"),
+        "geo-faq-cc: kommune — each mainEntity item is a valid Question/Answer pair"
+      );
+      assertTrue(!!faq && faq.mainEntity[0].acceptedAnswer.text.includes("Ålesund"), "geo-faq-cc: kommune — count answer includes the real kommune name (not fabricated)");
+    }
+    {
+      const faq = buildKommuneFaqJsonLd({ ...kommuneBase, total: 7, categoryCount: 2, minPriceFrom: 199 });
+      assertTrue(!!faq && faq.mainEntity.length === 3, "geo-faq-cc: kommune — 3 real fields (total+categories+price) -> exactly 3 questions");
+      assertTrue(!!faq && faq.mainEntity[2].acceptedAnswer.text.includes("199 kr"), "geo-faq-cc: kommune — price answer includes the real min price (not fabricated)");
+    }
+
+    // ── Source-presence: aggregate stats functions + route wiring ──
+    const expStoreMod = require("../src/services/experience-store");
+    assertTrue(typeof expStoreMod.getCategoryFaqStats === "function", "geo-faq-cc: experience-store.ts exports getCategoryFaqStats");
+    assertTrue(typeof expStoreMod.getKommuneFaqStats === "function", "geo-faq-cc: experience-store.ts exports getKommuneFaqStats");
+
+    const fsGeoFaq = require("fs");
+    const expSeoSrcGeoFaq = fsGeoFaq.readFileSync("src/routes/experiences-seo.ts", "utf8");
+    assertTrue(
+      expSeoSrcGeoFaq.includes("extraJsonLd: categoryFaqJsonLd ? [categoryFaqJsonLd] : undefined"),
+      "geo-faq-cc: /kategori/:category wires the category FAQPage block into renderBrowsePage's extraJsonLd"
+    );
+    assertTrue(
+      expSeoSrcGeoFaq.includes("extraJsonLd: kommuneFaqJsonLd ? [kommuneFaqJsonLd] : undefined"),
+      "geo-faq-cc: /kommune/:kommune wires the kommune FAQPage block into renderBrowsePage's extraJsonLd"
+    );
+  } catch (err) {
+    failed++;
+    failures.push(`geo-faq-cc: unexpected error: ${err instanceof Error ? (err.stack || err.message) : String(err)}`);
+  }
+})();

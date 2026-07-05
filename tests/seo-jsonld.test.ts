@@ -16,6 +16,7 @@
 import { readFileSync } from "fs";
 import { join } from "path";
 import { buildProducerFaqJsonLd, buildCityFaqJsonLd } from "../src/routes/seo";
+import { buildCategoryFaqJsonLd, buildKommuneFaqJsonLd } from "../src/routes/experiences-seo";
 
 let passed = 0;
 let failed = 0;
@@ -84,6 +85,53 @@ expectTrue(
   expectTrue(!!faq && faq.mainEntity.length === 3, "3 real fields (count+category+verified) -> exactly 3 questions");
 }
 
+console.log("\n── geo-content-structured-data: buildCategoryFaqJsonLd invocation tests (category/city slice, experiences vertical) ──");
+const catFaqBase = { label: "Dyreliv & safari", url: "https://opplevagent.no/kategori/dyreliv_safari", total: 0, fylkeCount: 0, kommuneCount: 0, minPriceFrom: null as number | null };
+
+expectTrue(
+  buildCategoryFaqJsonLd({ ...catFaqBase, total: 0 }) === null,
+  "0 experiences, no fylker, no price -> null (below 2-question quality gate)"
+);
+expectTrue(
+  buildCategoryFaqJsonLd({ ...catFaqBase, total: 4 }) === null,
+  "total alone (1 real field) -> null (no thin-page FAQ emitted)"
+);
+{
+  const faq = buildCategoryFaqJsonLd({ ...catFaqBase, total: 4, fylkeCount: 2, kommuneCount: 3 });
+  expectTrue(!!faq && faq["@type"] === "FAQPage", "count + fylker (2 real fields) -> non-null FAQPage");
+  expectTrue(!!faq && Array.isArray(faq.mainEntity) && faq.mainEntity.length === 2, "2 real fields -> exactly 2 questions");
+  expectTrue(!!faq && faq.mainEntity.every((q: any) => q["@type"] === "Question" && q.acceptedAnswer?.["@type"] === "Answer"), "each mainEntity item is a valid Question/Answer pair");
+  expectTrue(!!faq && faq.mainEntity[1].acceptedAnswer.text.includes("2 fylker"), "fylke-question answer includes real fylke count (not fabricated)");
+}
+{
+  const faq = buildCategoryFaqJsonLd({ ...catFaqBase, total: 4, fylkeCount: 2, kommuneCount: 3, minPriceFrom: 490 });
+  expectTrue(!!faq && faq.mainEntity.length === 3, "3 real fields (total+fylker+price) -> exactly 3 questions");
+  expectTrue(!!faq && faq.mainEntity[2].acceptedAnswer.text.includes("490 kr"), "price-question answer includes real min price (not fabricated)");
+}
+
+console.log("\n── geo-content-structured-data: buildKommuneFaqJsonLd invocation tests (category/city slice, experiences vertical) ──");
+const kommuneFaqBase = { kommune: "Tromsø", fylke: "Troms og Finnmark" as string | null, url: "https://opplevagent.no/kommune/troms%C3%B8", total: 0, categoryCount: 0, minPriceFrom: null as number | null };
+
+expectTrue(
+  buildKommuneFaqJsonLd({ ...kommuneFaqBase, total: 0 }) === null,
+  "0 experiences, no categories, no price -> null (below 2-question quality gate)"
+);
+expectTrue(
+  buildKommuneFaqJsonLd({ ...kommuneFaqBase, total: 6 }) === null,
+  "total alone (1 real field) -> null (no thin-page FAQ emitted)"
+);
+{
+  const faq = buildKommuneFaqJsonLd({ ...kommuneFaqBase, total: 6, categoryCount: 3 });
+  expectTrue(!!faq && faq["@type"] === "FAQPage", "count + categories (2 real fields) -> non-null FAQPage");
+  expectTrue(!!faq && Array.isArray(faq.mainEntity) && faq.mainEntity.length === 2, "2 real fields -> exactly 2 questions");
+  expectTrue(!!faq && faq.mainEntity.every((q: any) => q["@type"] === "Question" && q.acceptedAnswer?.["@type"] === "Answer"), "each mainEntity item is a valid Question/Answer pair");
+  expectTrue(!!faq && faq.mainEntity[0].acceptedAnswer.text.includes("Tromsø"), "count-question answer includes the real kommune name (not fabricated)");
+}
+{
+  const faq = buildKommuneFaqJsonLd({ ...kommuneFaqBase, total: 6, categoryCount: 3, minPriceFrom: 250 });
+  expectTrue(!!faq && faq.mainEntity.length === 3, "3 real fields (total+categories+price) -> exactly 3 questions");
+}
+
 console.log("── WO-17: seo.ts source-presence assertions ──");
 const seoSrc = readFileSync(join(__dirname, "..", "src", "routes", "seo.ts"), "utf8");
 expectMatch(seoSrc, /hasMerchantReturnPolicy/, "seo.ts contains hasMerchantReturnPolicy");
@@ -104,6 +152,17 @@ expectMatch(seoSrc, /if \(qas\.length < 2\) return null;/, "seo.ts FAQ builder q
 expectMatch(seoSrc, /jsonLd:\s*faqJsonLd\s*\?\s*\[jsonLd,\s*faqJsonLd\]\s*:\s*jsonLd/, "seo.ts wires FAQPage block into the producer page's JSON-LD array");
 expectMatch(seoSrc, /function buildCityFaqJsonLd/, "seo.ts defines buildCityFaqJsonLd");
 expectMatch(seoSrc, /if \(cityFaqJsonLd\) jsonLdItems\.push\(cityFaqJsonLd\);/, "seo.ts wires the city FAQPage block into the city page's JSON-LD array");
+
+console.log("\n── geo-content-structured-data: category/kommune FAQPage JSON-LD assertions (experiences vertical) ──");
+const expSeoSrc = readFileSync(join(__dirname, "..", "src", "routes", "experiences-seo.ts"), "utf8");
+expectMatch(expSeoSrc, /export function buildCategoryFaqJsonLd/, "experiences-seo.ts defines buildCategoryFaqJsonLd");
+expectMatch(expSeoSrc, /export function buildKommuneFaqJsonLd/, "experiences-seo.ts defines buildKommuneFaqJsonLd");
+expectMatch(expSeoSrc, /if \(qas\.length < 2\) return null;/, "experiences-seo.ts FAQ builders quality-gate on 2+ real answers (no thin pages)");
+expectMatch(expSeoSrc, /extraJsonLd:\s*categoryFaqJsonLd\s*\?\s*\[categoryFaqJsonLd\]\s*:\s*undefined/, "experiences-seo.ts wires the category FAQPage block into /kategori/:category's JSON-LD");
+expectMatch(expSeoSrc, /extraJsonLd:\s*kommuneFaqJsonLd\s*\?\s*\[kommuneFaqJsonLd\]\s*:\s*undefined/, "experiences-seo.ts wires the kommune FAQPage block into /kommune/:kommune's JSON-LD");
+const expStoreSrc = readFileSync(join(__dirname, "..", "src", "services", "experience-store.ts"), "utf8");
+expectMatch(expStoreSrc, /export function getCategoryFaqStats/, "experience-store.ts defines getCategoryFaqStats");
+expectMatch(expStoreSrc, /export function getKommuneFaqStats/, "experience-store.ts defines getKommuneFaqStats");
 
 console.log("\n── WO-17: sitemap 404 filter assertions ──");
 expectMatch(seoSrc, /WO-17.*sitemap|sitemap.*WO-17/s, "seo.ts sitemap loop carries WO-17 marker");
