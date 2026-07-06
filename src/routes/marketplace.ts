@@ -945,9 +945,44 @@ router.get("/agents/:id/info", (req: Request, res: Response) => {
 
 // ─── GET /agents/:id/knowledge — Raw knowledge data ─────────
 // For admin/debugging. Returns the raw knowledge record.
-
+//
+// SECURITY (2026-07-05, dev-request secure-agent-knowledge-endpoint):
+// This route returns raw contact fields (email, phone, ...) plus
+// internal-only bookkeeping (curated_fields, data_source, auto_sources)
+// straight from agent_knowledge, unlike the curated public marketplace
+// surfaces (/agents/:id/card, /agents, /search, /discover) which
+// intentionally expose a formatted contact block for buyer-agent commerce.
+// Consumer audit found no legitimate caller that needs this UNAUTHENTICATED
+// (the one internal caller — the scheduled lokal-agent-enrichment SKILL —
+// already holds ADMIN_KEY for its sibling PUT calls; it was simply omitting
+// the header on its GET, now fixed in that doc). Auth model mirrors
+// PUT /agents/:id/knowledge below: X-Admin-Key, X-Claim-Token (for this
+// agent), or X-API-Key (this agent's own key).
 router.get("/agents/:id/knowledge", (req: Request, res: Response) => {
   const agentId = req.params.id as string;
+  const claimToken = (req.headers["x-claim-token"] as string) || "";
+  const apiKey = (req.headers["x-api-key"] as string) || "";
+  const adminKeyHeader = (req.headers["x-admin-key"] as string) || "";
+  const expectedAdminKey = getAdminKey();
+
+  let authorized = false;
+  if (expectedAdminKey && adminKeyHeader && adminKeyHeader === expectedAdminKey) {
+    authorized = true;
+  }
+  if (!authorized && claimToken) {
+    const claim = knowledgeService.getClaimByToken(claimToken);
+    if (claim && claim.agentId === agentId) authorized = true;
+  }
+  if (!authorized && apiKey) {
+    const agent = marketplaceRegistry.getAgentByApiKey(apiKey);
+    if (agent && agent.id === agentId) authorized = true;
+  }
+
+  if (!authorized) {
+    res.status(403).json({ success: false, error: "Ikke autorisert. Bruk X-Admin-Key, X-Claim-Token eller X-API-Key header." });
+    return;
+  }
+
   const knowledge = knowledgeService.getKnowledge(agentId);
   if (!knowledge) {
     res.status(404).json({ success: false, error: "Ingen kunnskapsdata for denne agenten" });
