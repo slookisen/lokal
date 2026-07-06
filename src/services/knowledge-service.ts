@@ -261,19 +261,12 @@ class KnowledgeService {
   // ─── Get knowledge for an agent ──────────────────────────
   getKnowledge(agentId: string): AgentKnowledge | null {
     const db = getDb();
-    if (agentId === "agent-a" || agentId === "agent-b") {
-      const cnt = db.prepare("SELECT COUNT(*) c FROM agent_knowledge").get();
-      console.log("[CI-DIAG4] getKnowledge INSIDE call: agentId=", JSON.stringify(agentId), "len=", agentId.length, "charCodes=", JSON.stringify(Array.from(agentId).map((c: string) => c.charCodeAt(0))), "table count=", JSON.stringify(cnt));
-    }
     const row = db.prepare(`SELECT agent_id, address, postal_code, website, phone, email,
       opening_hours, products, about, specialties, certifications, payment_methods,
       delivery_options, google_rating, google_review_count, tripadvisor_rating,
       external_reviews, external_links, images, seasonality, delivery_radius, min_order_value,
       data_source, auto_sources, last_enriched_at,
       owner_updated_at, preferences, curated_fields FROM agent_knowledge WHERE agent_id = ?`).get(agentId) as any;
-    if (agentId === "agent-a" || agentId === "agent-b") {
-      console.log("[CI-DIAG4] getKnowledge row result:", JSON.stringify(row));
-    }
     if (!row) return null;
     return this.rowToKnowledge(row);
   }

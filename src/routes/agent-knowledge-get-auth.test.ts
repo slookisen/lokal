@@ -207,11 +207,6 @@ export function runAgentKnowledgeGetAuthTests(
       insertKnowledge.run("agent-a", "https://garda.no", "post@garda.no", "+4791234567", "Gardsveien 1", "1234");
       insertKnowledge.run("agent-b", "https://gardb.no", "post@gardb.no", "+4799887766", "Gardsveien 2", "5678");
 
-      // TEMP CI-DIAG: confirm the row is visible on THIS db object immediately post-insert.
-      console.log("[CI-DIAG2] agent_knowledge rows right after insert:", JSON.stringify(db.prepare("SELECT agent_id, email, phone FROM agent_knowledge").all()));
-      console.log("[CI-DIAG2] agents rows right after insert:", JSON.stringify(db.prepare("SELECT id, name, api_key FROM agents").all()));
-      console.log("[CI-DIAG2] sqlite3 lib version:", db.prepare("SELECT sqlite_version() v").get());
-
       // ── Seed a verified claim for agent-a ──
       db.prepare(
         `INSERT INTO agent_claims (id, agent_id, claimant_name, claimant_email, status, claim_token, claim_token_expires_at)
@@ -232,67 +227,6 @@ export function runAgentKnowledgeGetAuthTests(
         process.env.ADMIN_KEY = testAdminKey;
         delete process.env.ANALYTICS_ADMIN_KEY;
       };
-
-      // ── TEMP CI-DIAGNOSTIC (2026-07-06, dev-request ci-test-harness-gh-actions-only-failure) ──
-      // Empirically instrument instead of guessing again — strip once root cause is confirmed.
-      {
-        rePin();
-        const svc = require("../services/knowledge-service");
-        const reg = require("../services/marketplace-registry");
-        const directCount = db.prepare("SELECT COUNT(*) c FROM agents").get();
-        const viaInitMod = initMod.getDb().prepare("SELECT COUNT(*) c FROM agents").get();
-        console.log("[CI-DIAG] process.version=", process.version);
-        console.log("[CI-DIAG] process.env.CI=", process.env.CI);
-        try {
-          console.log("[CI-DIAG] better-sqlite3 compile_options=", JSON.stringify(db.pragma("compile_options")));
-        } catch (e) { console.log("[CI-DIAG] pragma failed:", e); }
-        console.log("[CI-DIAG] db === initMod.getDb():", db === initMod.getDb());
-        console.log("[CI-DIAG] direct db agents count:", JSON.stringify(directCount));
-        console.log("[CI-DIAG] initMod.getDb() agents count:", JSON.stringify(viaInitMod));
-        console.log("[CI-DIAG] knowledgeService.getKnowledge('agent-a') via require(\"../services/knowledge-service\"):", JSON.stringify(svc.knowledgeService.getKnowledge("agent-a")));
-        console.log("[CI-DIAG] marketplaceRegistry.getAgentByApiKey('api-key-b') via require(\"../services/marketplace-registry\"):", JSON.stringify(reg.marketplaceRegistry.getAgentByApiKey("api-key-b")));
-        console.log("[CI-DIAG] require.cache has ../database/init:", !!require.cache[require.resolve("../database/init")]);
-        console.log("[CI-DIAG] require.cache has ../services/knowledge-service:", !!require.cache[require.resolve("../services/knowledge-service")]);
-        console.log("[CI-DIAG] require.cache has ../services/marketplace-registry:", !!require.cache[require.resolve("../services/marketplace-registry")]);
-        console.log("[CI-DIAG] router direct call test: GET agent-a with admin key via router.handle ->");
-        const rDirect = await callRoute(router, {
-          method: "GET",
-          url: "/agents/agent-a/knowledge",
-          headers: { "x-admin-key": testAdminKey },
-        }, rePin);
-        console.log("[CI-DIAG] rDirect =", JSON.stringify(rDirect));
-        console.log("[CI-DIAG3] PRAGMA foreign_keys effective value on our db:", JSON.stringify(db.pragma("foreign_keys")));
-        try {
-          const fullRow = db.prepare(`SELECT agent_id, address, postal_code, website, phone, email,
-            opening_hours, products, about, specialties, certifications, payment_methods,
-            delivery_options, google_rating, google_review_count, tripadvisor_rating,
-            external_reviews, external_links, images, seasonality, delivery_radius, min_order_value,
-            data_source, auto_sources, last_enriched_at,
-            owner_updated_at, preferences, curated_fields FROM agent_knowledge WHERE agent_id = ?`).get("agent-a");
-          console.log("[CI-DIAG3] full-column getKnowledge-equivalent query result:", JSON.stringify(fullRow));
-        } catch (e: any) {
-          console.log("[CI-DIAG3] full-column query THREW:", e?.message, e?.stack);
-        }
-        try {
-          const r1 = svc.knowledgeService.upsertKnowledge("agent-a", { about: "diag", dataSource: "auto" });
-          console.log("[CI-DIAG3] upsertKnowledge OK, result:", JSON.stringify(r1));
-        } catch (e: any) {
-          console.log("[CI-DIAG3] upsertKnowledge THREW:", e?.message, e?.stack);
-        }
-        try {
-          const tss = require("../services/trust-score-service");
-          const r2 = tss.trustScoreService.update("agent-a");
-          console.log("[CI-DIAG3] trustScoreService.update OK, result:", JSON.stringify(r2));
-        } catch (e: any) {
-          console.log("[CI-DIAG3] trustScoreService.update THREW:", e?.message, e?.stack);
-        }
-        try {
-          const r3 = svc.knowledgeService.getAgentInfo("agent-a");
-          console.log("[CI-DIAG3] getAgentInfo OK, result:", JSON.stringify(r3));
-        } catch (e: any) {
-          console.log("[CI-DIAG3] getAgentInfo THREW:", e?.message, e?.stack);
-        }
-      }
 
       // ── (1) unauthenticated GET -> 403, no data leaked ──
       {

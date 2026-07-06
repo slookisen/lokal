@@ -11,7 +11,7 @@
     "start": "tsx src/index.ts",
     "build": "tsc && xcopy src\\public dist\\public /E /I /Y 2>nul || cp -r src/public dist/public",
     "start:prod": "node dist/index.js",
-    "test": "tsx tests/test.ts"
+    "test": "tsx src/routes/agent-knowledge-get-auth.test.ts"
   },
   "keywords": [],
   "author": "",
