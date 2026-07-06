@@ -193,26 +193,41 @@ export function runAgentKnowledgeGetAuthTests(
       initMod.__initSchemaForTesting(db as any);
 
       // ── Seed two agents with contact data on agent_knowledge ──
+      // Globally-unique fixture IDs (2026-07-06 CI-fix, Option B, Daniel-approved
+      // interim mitigation per protocols/orchestrator-failures/2026-07-06-ci-test-harness-4th-attempt-failed.md):
+      // generic literals like "agent-a"/"agent-b" are reused as fixture names across
+      // several files in this suite, so if an untracked chain elsewhere in tests/test.ts
+      // ever touches "an agent" by one of those common names, it can collide with this
+      // block's own rows. A run-unique suffix makes that collision impossible without
+      // requiring this file to track down every other suite's fixture usage.
+      const fixtureSuffix = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+      const AGENT_A = `agent-test-a-${fixtureSuffix}`;
+      const AGENT_B = `agent-test-b-${fixtureSuffix}`;
+      const CLAIM_A = `claim-test-a-${fixtureSuffix}`;
+      const CLAIM_TOKEN_A = `claim-token-test-a-${fixtureSuffix}`;
+      const API_KEY_A = `api-key-test-a-${fixtureSuffix}`;
+      const API_KEY_B = `api-key-test-b-${fixtureSuffix}`;
+
       const insertAgent = db.prepare(
         `INSERT INTO agents (id, name, description, provider, contact_email, url, role, api_key)
          VALUES (?, ?, 'test agent', 'test', 'x@example.com', ?, 'producer', ?)`,
       );
-      insertAgent.run("agent-a", "Gard A AS", "https://garda.no", "api-key-a");
-      insertAgent.run("agent-b", "Gard B AS", "https://gardb.no", "api-key-b");
+      insertAgent.run(AGENT_A, "Gard A AS", "https://garda.no", API_KEY_A);
+      insertAgent.run(AGENT_B, "Gard B AS", "https://gardb.no", API_KEY_B);
 
       const insertKnowledge = db.prepare(
         `INSERT INTO agent_knowledge (agent_id, website, email, phone, address, postal_code, about, field_provenance)
          VALUES (?, ?, ?, ?, ?, ?, 'A test farm shop', '{}')`,
       );
-      insertKnowledge.run("agent-a", "https://garda.no", "post@garda.no", "+4791234567", "Gardsveien 1", "1234");
-      insertKnowledge.run("agent-b", "https://gardb.no", "post@gardb.no", "+4799887766", "Gardsveien 2", "5678");
+      insertKnowledge.run(AGENT_A, "https://garda.no", "post@garda.no", "+4791234567", "Gardsveien 1", "1234");
+      insertKnowledge.run(AGENT_B, "https://gardb.no", "post@gardb.no", "+4799887766", "Gardsveien 2", "5678");
 
       // ── Seed a verified claim for agent-a ──
       db.prepare(
         `INSERT INTO agent_claims (id, agent_id, claimant_name, claimant_email, status, claim_token, claim_token_expires_at)
-         VALUES ('claim-a', 'agent-a', 'Eier A', 'eier-a@example.com', 'verified', 'claim-token-a',
+         VALUES (?, ?, 'Eier A', 'eier-a@example.com', 'verified', ?,
                  datetime('now', '+30 days'))`,
-      ).run();
+      ).run(CLAIM_A, AGENT_A, CLAIM_TOKEN_A);
 
       // Fresh require so the router picks up the just-injected db.
       delete require.cache[require.resolve("./marketplace")];
@@ -230,7 +245,7 @@ export function runAgentKnowledgeGetAuthTests(
 
       // ── (1) unauthenticated GET -> 403, no data leaked ──
       {
-        const r = await callRoute(router, { method: "GET", url: "/agents/agent-a/knowledge" }, rePin);
+        const r = await callRoute(router, { method: "GET", url: `/agents/${AGENT_A}/knowledge` }, rePin);
         assertEq(r.status, 403, "unauthenticated GET /agents/:id/knowledge -> 403");
         assertEq(r.body?.success, false, "unauthenticated GET -> success:false");
         assertTrue(
@@ -246,7 +261,7 @@ export function runAgentKnowledgeGetAuthTests(
       {
         const r = await callRoute(router, {
           method: "GET",
-          url: "/agents/agent-a/knowledge",
+          url: `/agents/${AGENT_A}/knowledge`,
           headers: { "x-admin-key": "totally-wrong-key" },
         }, rePin);
         assertEq(r.status, 403, "GET with wrong X-Admin-Key -> 403");
@@ -256,7 +271,7 @@ export function runAgentKnowledgeGetAuthTests(
       {
         const r = await callRoute(router, {
           method: "GET",
-          url: "/agents/agent-a/knowledge",
+          url: `/agents/${AGENT_A}/knowledge`,
           headers: { "x-admin-key": testAdminKey },
         }, rePin);
         assertEq(r.status, 200, "GET with valid X-Admin-Key -> 200");
@@ -270,8 +285,8 @@ export function runAgentKnowledgeGetAuthTests(
       {
         const r = await callRoute(router, {
           method: "GET",
-          url: "/agents/agent-a/knowledge",
-          headers: { "x-claim-token": "claim-token-a" },
+          url: `/agents/${AGENT_A}/knowledge`,
+          headers: { "x-claim-token": CLAIM_TOKEN_A },
         }, rePin);
         assertEq(r.status, 200, "GET with valid X-Claim-Token (own agent) -> 200");
         assertEq(r.body?.data?.email, "post@garda.no", "authenticated GET (claim token) returns full email");
@@ -281,8 +296,8 @@ export function runAgentKnowledgeGetAuthTests(
       {
         const r = await callRoute(router, {
           method: "GET",
-          url: "/agents/agent-b/knowledge",
-          headers: { "x-claim-token": "claim-token-a" },
+          url: `/agents/${AGENT_B}/knowledge`,
+          headers: { "x-claim-token": CLAIM_TOKEN_A },
         }, rePin);
         assertEq(r.status, 403, "GET with claim token belonging to a different agent -> 403 (not just any valid token)");
       }
@@ -291,8 +306,8 @@ export function runAgentKnowledgeGetAuthTests(
       {
         const r = await callRoute(router, {
           method: "GET",
-          url: "/agents/agent-b/knowledge",
-          headers: { "x-api-key": "api-key-b" },
+          url: `/agents/${AGENT_B}/knowledge`,
+          headers: { "x-api-key": API_KEY_B },
         }, rePin);
         assertEq(r.status, 200, "GET with valid X-API-Key (own agent) -> 200");
         assertEq(r.body?.data?.email, "post@gardb.no", "authenticated GET (api key) returns full email");
@@ -302,8 +317,8 @@ export function runAgentKnowledgeGetAuthTests(
       {
         const r = await callRoute(router, {
           method: "GET",
-          url: "/agents/agent-a/knowledge",
-          headers: { "x-api-key": "api-key-b" },
+          url: `/agents/${AGENT_A}/knowledge`,
+          headers: { "x-api-key": API_KEY_B },
         }, rePin);
         assertEq(r.status, 403, "GET with API key belonging to a different agent -> 403");
       }
@@ -331,14 +346,14 @@ export function runAgentKnowledgeGetAuthTests(
       {
         const rNoAuth = await callRoute(router, {
           method: "PUT",
-          url: "/agents/agent-a/knowledge",
+          url: `/agents/${AGENT_A}/knowledge`,
           body: { about: "should not apply" },
         }, rePin);
         assertEq(rNoAuth.status, 403, "PUT /agents/:id/knowledge without auth still -> 403 (regression guard, untouched by this fix)");
 
         const rAuth = await callRoute(router, {
           method: "PUT",
-          url: "/agents/agent-a/knowledge",
+          url: `/agents/${AGENT_A}/knowledge`,
           headers: { "x-admin-key": testAdminKey },
           body: { about: "Updated via admin" },
         }, rePin);
