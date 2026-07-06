@@ -543,6 +543,24 @@ export async function runDebioCrossCheck(
     return result;
   }
 
+  // dev-request 2026-07-06-rfb-fjern-debio-norsk-gardsmat: Debio was
+  // deactivated (agents.is_active=0) by the migration in database/init.ts.
+  // The cross-check exists solely to CREATE/refresh Debio affiliations —
+  // running it against a deactivated umbrella would silently re-link
+  // producers to a network that's hidden from every public surface. No-op
+  // instead: same shape of early-return as the "umbrella not found" branch
+  // above, just with a different, explicit reason.
+  const umbrellaRow = db.prepare(
+    "SELECT is_active FROM agents WHERE id = ?"
+  ).get(debioUmbrellaId) as { is_active: number | null } | undefined;
+  if (umbrellaRow && umbrellaRow.is_active === 0) {
+    result.errors.push(
+      `Debio umbrella (id ${debioUmbrellaId}) is deactivated (is_active=0) — cross-check is a no-op while inactive.`,
+    );
+    result.duration_ms = Date.now() - t0;
+    return result;
+  }
+
   // ─── Source dispatch ────────────────────────────────────────────
   if (source === "finnoko") {
     try {

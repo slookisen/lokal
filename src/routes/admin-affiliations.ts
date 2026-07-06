@@ -156,14 +156,27 @@ router.post("/auto-create", (req: Request, res: Response) => {
 
     // Verify umbrella exists and IS an umbrella.
     const umbrella = db.prepare(
-      "SELECT id, umbrella_type FROM agents WHERE id = ?"
-    ).get(umbrellaId) as { id: string; umbrella_type: string | null } | undefined;
+      "SELECT id, umbrella_type, is_active FROM agents WHERE id = ?"
+    ).get(umbrellaId) as { id: string; umbrella_type: string | null; is_active: number | null } | undefined;
     if (!umbrella) {
       res.status(404).json({ error: `umbrella_id ${umbrellaId} not found` });
       return;
     }
     if (!umbrella.umbrella_type) {
       res.status(404).json({ error: `umbrella_id ${umbrellaId} is not an umbrella agent` });
+      return;
+    }
+    // dev-request 2026-07-06-rfb-fjern-debio-norsk-gardsmat: a deactivated
+    // umbrella (e.g. Debio, set is_active=0 by the migration in
+    // database/init.ts) must not gain new auto-tagged affiliations — that
+    // would silently re-link/revive it on the producer's profile even
+    // though it's hidden from every public listing. No-op (409) rather
+    // than a hard error: the caller (organic-keyword-detector SKILL) can
+    // safely keep re-running its crawl without this becoming a fatal error.
+    if (umbrella.is_active === 0) {
+      res.status(409).json({
+        error: `umbrella_id ${umbrellaId} is deactivated (is_active=0) — auto-tagging is disabled while inactive`,
+      });
       return;
     }
 
