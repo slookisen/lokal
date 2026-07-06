@@ -8467,21 +8467,6 @@ const _orchPr20BmEventsPromise: Promise<void> = new Promise<void>(r => { _orchPr
 
 _pr94Promise.then(async () => {
   console.log("\n── orch-pr-20: bm-events async scrape job ──");
-  // 2026-07-06 CI race hunt (round 1, dev-request
-  // ci-test-harness-gh-actions-only-failure): temporarily disabled to test
-  // the candidate-1 hypothesis that this block's real fire-and-forget
-  // background scrape (startBmEventsScrapeJob's un-awaited IIFE, which
-  // calls getDb() fresh multiple times rather than capturing it once) can
-  // outlive this test's own 4s waitForJobDone() give-up and later re-read
-  // whatever db the singleton is pinned to at that moment — e.g. the
-  // agent-knowledge-get-auth suite's db, if that suite is running by then.
-  // THROWAWAY: revert this early-return once the hunt concludes.
-  const CI_RACE_HUNT_SKIP_BM_EVENTS_SCRAPE_JOB = true;
-  if (CI_RACE_HUNT_SKIP_BM_EVENTS_SCRAPE_JOB) {
-    console.log("  bm-events-scrape-job: SKIPPED (race-hunt round 1 — candidate 1 disabled)");
-    _orchPr20BmEventsResolve();
-    return;
-  }
   try {
     const { runBmEventsScrapeJobTests } = require("../src/services/bm-events-scrape-job.test") as
       typeof import("../src/services/bm-events-scrape-job.test");
