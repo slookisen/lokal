@@ -21963,22 +21963,6 @@ const _tasksPruneAsyncDeps: Promise<unknown>[] = [
 Promise.allSettled(_tasksPruneAsyncDeps).then(async () => {
   console.log("\n── orch-pr-20260704: tasks-prune / vacuum async background jobs ──");
   const TAG = "tasks-prune-async";
-  // 2026-07-06 CI race hunt (round 3, dev-request
-  // ci-test-harness-gh-actions-only-failure): temporarily disabled to test
-  // the candidate-3 hypothesis. Note this block's own _tasksPruneAsyncDeps
-  // array (above) already includes _agentKnowledgeGetAuthPromise as its
-  // LAST dependency, so structurally this block cannot even START until
-  // AFTER the auth suite's own promise has settled — it should be
-  // impossible for it to race INTO the auth suite's window. Testing anyway
-  // for completeness (rounds 1 and 2 ruled out the other two named
-  // candidates with the identical 11-passed/10-failed signature both times).
-  // THROWAWAY: revert this early-return once the hunt concludes.
-  const CI_RACE_HUNT_SKIP_TASKS_PRUNE_ASYNC = true;
-  if (CI_RACE_HUNT_SKIP_TASKS_PRUNE_ASYNC) {
-    console.log(`  ${TAG}: SKIPPED (race-hunt round 3 — candidate 3 disabled)`);
-    _tasksPruneAsyncResolve();
-    return;
-  }
   try {
     const sqlite = require("better-sqlite3");
     const httpMod = await import("http");
