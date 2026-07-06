@@ -212,21 +212,6 @@ console.log("\n── crm-service (listThreadsByStatus contact_email fix) ──
 // block so its pass/fail counts fold into the `npm test` summary.
 console.log("── orch-pr-12: search-enrich sweep + findings + apply-findings ──");
 const _orchPr12SweepPromise: Promise<void> = (async () => {
-  // 2026-07-06 CI race hunt (round 2, dev-request
-  // ci-test-harness-gh-actions-only-failure): temporarily disabled to test
-  // the candidate-2 hypothesis. This test's own waitForSweepDone() helper
-  // (search-enrich-sweep.test.ts) polls for job completion with a 3s
-  // give-up escape hatch, mirroring the same shape as candidate 1
-  // (bm-events-scrape-job), which round 1 already ruled out on CI (still
-  // 11 passed/10 failed with candidate 1 fully disabled — see round-1
-  // commit, reverted above). Testing whether this block is instead the
-  // source.
-  // THROWAWAY: revert this early-return once the hunt concludes.
-  const CI_RACE_HUNT_SKIP_SEARCH_ENRICH_SWEEP = true;
-  if (CI_RACE_HUNT_SKIP_SEARCH_ENRICH_SWEEP) {
-    console.log("  search-enrich-sweep: SKIPPED (race-hunt round 2 — candidate 2 disabled)");
-    return;
-  }
   try {
     const { runSearchEnrichSweepTests } = require("../src/services/search-enrich-sweep.test") as
       typeof import("../src/services/search-enrich-sweep.test");
