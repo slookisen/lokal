@@ -27,6 +27,34 @@ const failures: string[] = [];
 // v1, so those blocks are left exactly as they are. The REPORT block drains
 // _serialChain (in addition to the existing per-handle awaits) so every
 // serialized link's pass/fail counts fold into the npm test summary.
+//
+// 2026-07-06 root-cause fix (dev-request 2026-07-06-ci-untracked-timer-followup):
+// the "tore the singleton under CI" symptom above had a second, independent
+// cause beyond promise-chain mixing: this file used to import
+// ../src/database/init via a MIX of `require(...)` (CJS, the overwhelming
+// majority of call sites, and what every non-test module — crm-service.ts,
+// admin-affiliations.ts, etc. — uses via its own static `import { getDb }`)
+// and `await import(...)` (dynamic ESM import) in ~17 spots. Node's dynamic
+// `import()` of a CommonJS-compiled file goes through the ESM loader's own
+// `cjsLoader` translator, which — under tsx's dual CJS/ESM hooks — produced a
+// SECOND, independent module instance the first time it ran, with its own
+// private `db` module-scope variable, completely decoupled from the instance
+// every `require(...)` caller (and therefore every service singleton like
+// crmService) shares. Once that second instance existed, __setDbForTesting()
+// calls made through one instance were invisible to getDb() calls made
+// through the other, so tests would swap in a fresh :memory: DB, insert rows,
+// and read back zero — while unrelated code silently kept accumulating state
+// in whichever instance it was bound to. This is exactly the "provably
+// correct in isolation, non-deterministically wrong when it runs after
+// enough of the file has executed" signature this comment block already
+// described. Root-caused via direct instrumentation (module-instance IDs +
+// object-identity tags on the injected DB), confirmed absent on plain `main`
+// and reproducible only once enough test volume shifted execution timing to
+// trigger the dynamic import before crm-service.ts's first (require-based)
+// load. Fix: every call site now uses `require("../src/database/init")` —
+// there is now exactly one module instance for the lifetime of the process.
+// Do not reintroduce `await import(...)` for this module.
+//
 let _serialChain: Promise<void> = Promise.resolve();
 function runSerial(fn: () => Promise<void> | void): Promise<void> {
   const next = _serialChain.then(fn, fn);
@@ -3384,7 +3412,7 @@ async function runIntegrationTests(): Promise<void> {
   {
     const db = buildTestDb();
     // Re-run initSchema by importing getDb freshly via __setDbForTesting path
-    const { getDb } = await import("../src/database/init");
+    const { getDb } = require("../src/database/init");
     __setDbForTesting(db);
     getDb(); // triggers initSchema
 
@@ -3417,7 +3445,7 @@ async function runIntegrationTests(): Promise<void> {
   // ── Fixture 2: Agent with homepage + brreg agreeing on all 3 → verified + pool
   {
     const db = buildTestDb();
-    const { getDb } = await import("../src/database/init");
+    const { getDb } = require("../src/database/init");
     __setDbForTesting(db);
     getDb();
 
@@ -3488,7 +3516,7 @@ async function runIntegrationTests(): Promise<void> {
   // ── Fixture 3: Owner-curated address (Tier-S) but 1-source phone → review_required
   {
     const db = buildTestDb();
-    const { getDb } = await import("../src/database/init");
+    const { getDb } = require("../src/database/init");
     __setDbForTesting(db);
     getDb();
 
@@ -3536,7 +3564,7 @@ async function runIntegrationTests(): Promise<void> {
   // #1/#2 must not touch free-mail handling.
   {
     const db = buildTestDb();
-    const { getDb } = await import("../src/database/init");
+    const { getDb } = require("../src/database/init");
     __setDbForTesting(db);
     getDb();
 
@@ -3582,7 +3610,7 @@ async function runIntegrationTests(): Promise<void> {
   // inference_only_field flag — the Bærsentralen-style fabrication.
   {
     const db = buildTestDb();
-    const { getDb } = await import("../src/database/init");
+    const { getDb } = require("../src/database/init");
     __setDbForTesting(db);
     getDb();
 
@@ -3636,7 +3664,7 @@ async function runIntegrationTests(): Promise<void> {
   // sources on the gating fields is verified and pooled, unchanged by the guards.
   {
     const db = buildTestDb();
-    const { getDb } = await import("../src/database/init");
+    const { getDb } = require("../src/database/init");
     __setDbForTesting(db);
     getDb();
 
@@ -3679,7 +3707,7 @@ async function runIntegrationTests(): Promise<void> {
   // even though its address/phone otherwise agree across two sources.
   {
     const db = buildTestDb();
-    const { getDb } = await import("../src/database/init");
+    const { getDb } = require("../src/database/init");
     __setDbForTesting(db);
     getDb();
 
@@ -3851,7 +3879,7 @@ const _m2Promise = (async function runOwnerPortalTests() {
         notes TEXT
       );
     `);
-    const initMod = await import("../src/database/init");
+    const initMod = require("../src/database/init");
     initMod.__setDbForTesting(portalDb as any);
 
     // Seed an agent + agent_knowledge row
@@ -4245,7 +4273,7 @@ const _pr24Promise = (async function runPr24Tests() {
         updated_at TEXT
       );
     `);
-    const initMod2 = await import("../src/database/init");
+    const initMod2 = require("../src/database/init");
     initMod2.__setDbForTesting(pr24db as any);
 
     // Seed two agents.
@@ -11647,7 +11675,7 @@ const _pr74Promise = (async () => {
   // Inject in-memory DB and load the analytics router fresh, then mount
   // on a tiny Express app to call the actual route handler.
   process.env.ANALYTICS_ADMIN_KEY = "test-key-pr74";
-  const initMod = await import("../src/database/init");
+  const initMod = require("../src/database/init");
   initMod.__setDbForTesting(pr74db);
 
   // Drop cached router (it may have been loaded earlier in this test run
@@ -12150,7 +12178,7 @@ const _orchPr86Promise: Promise<void> = new Promise<void>(r => { _orchPr86Resolv
       updated_at TEXT
     );
   `);
-  const initMod = await import("../src/database/init");
+  const initMod = require("../src/database/init");
   initMod.__setDbForTesting(pr86Db as any);
 
   // Seed an admin key.
@@ -12686,7 +12714,7 @@ const _orchPr93Promise: Promise<void> = new Promise<void>(r => { _orchPr93Resolv
       vertical_id TEXT DEFAULT 'rfb'
     );
   `);
-  const initMod93 = await import("../src/database/init");
+  const initMod93 = require("../src/database/init");
   initMod93.__setDbForTesting(pr93Db as any);
 
   const PR93_KEY = "orch-pr-93-test-key";
@@ -17940,7 +17968,7 @@ const _orchPr20260614Promise: Promise<void> = new Promise<void>(r => { _orchPr20
       );
   `);
 
-  const initMod = await import("../src/database/init");
+  const initMod = require("../src/database/init");
   initMod.__setDbForTesting(orchDb as any);
 
   const ORCH_ADMIN_KEY = "orch-pr-20260614-3-test-key";
@@ -18471,7 +18499,7 @@ const _orchPr20260614_5Promise: Promise<void> = new Promise<void>(r => { _orchPr
   `);
 
   // Set the shared DB to our in-memory db
-  const initMod5 = await import("../src/database/init");
+  const initMod5 = require("../src/database/init");
   initMod5.__setDbForTesting(catDb as any);
 
   const ADMIN_KEY_5 = "test-catalog-admin-key-phase0";
@@ -18791,7 +18819,7 @@ const _orchPr20260614_6Promise: Promise<void> = new Promise<void>(r => { _orchPr
   `);
 
   // Set the shared DB singleton to our test DB
-  const initMod6 = await import("../src/database/init");
+  const initMod6 = require("../src/database/init");
   initMod6.__setDbForTesting(cartDb as any);
   // Pin the module-local cart-service DB handle — this is the race-proof fix:
   // concurrent test blocks re-pinning the global __setDbForTesting cannot
@@ -20341,7 +20369,7 @@ const _orchPr9PruneDeadUrlsPromise: Promise<void> = new Promise<void>(r => {
       );
     `);
 
-    const initMod3 = await import("../src/database/init");
+    const initMod3 = require("../src/database/init");
     initMod3.__setDbForTesting(pruneDb as any);
 
     // Seed agents
@@ -20537,11 +20565,18 @@ const _orchPr9PruneDeadUrlsPromise: Promise<void> = new Promise<void>(r => {
 // matched) and PASS with the fix (also matches 'composed' type + messageId,
 // with compose-origin channel fallback to 'resend_smtp').
 //
-// Race-free serialization: chained off _orchPr20BmEventsPromise so it runs
-// AFTER that block (and transitively after _pr94Promise → _pr56Promise) — the
-// same pattern PR-20 uses. Each sub-block also saves the current getDb()
-// singleton before calling __setDbForTesting() and restores it in a finally,
-// so the global is never left swapped even if an assertion throws.
+// 2026-07-06 fix-up (dev-request 2026-07-06-ci-untracked-timer-followup):
+// chaining off a single upstream promise (_orchPr20BmEventsPromise) was
+// insufficient — same failure mode this file's tasks-prune-async /
+// oa-home-counters postmortems already document: a single-link chain only
+// guarantees ordering against ONE branch, not against every OTHER
+// singleton-swapping block that may still be mid-flight (an unawaited
+// leftover microtask from an earlier block can still fire and swap
+// getDb() out from under this one). Now depends on the FULL set of
+// earlier db-singleton-swapping branches, matching _oaHomeCountersDeps'
+// pattern. Each sub-block also saves the current getDb() singleton before
+// calling __setDbForTesting() and restores it in a finally, so the global
+// is never left swapped even if an assertion throws.
 console.log("\n── orch-pr-21: sent-log actor/channel from composed action ──");
 
 let _orchPr21SentLogActorResolve: () => void = () => {};
@@ -20549,7 +20584,44 @@ const _orchPr21SentLogActorPromise: Promise<void> = new Promise<void>(r => {
   _orchPr21SentLogActorResolve = r;
 });
 
-_orchPr20BmEventsPromise.then(async () => {
+const _orchPr21SentLogActorDeps: Promise<unknown>[] = [
+  _serialChain,
+  Promise.all(_pr21Promises),
+  _m2Promise,
+  _pr24Promise,
+  _pr56Promise,
+  _pr63Promise,
+  _pr65Promise,
+  _pr66Promise,
+  _pr67Promise,
+  _pr68Promise,
+  _pr74Promise,
+  _pr75Promise,
+  _pr76Promise,
+  _pr78Promise,
+  _orchPr86Promise,
+  _orchPr93Promise,
+  _pr94Promise,
+  _pr95Promise,
+  _pr103Promise,
+  _pr106Promise,
+  _pr110Promise,
+  _pr125Promise,
+  _seoDentalPromise,
+  _platformVerifierPromise,
+  _orchPr20260614_2Promise,
+  _orchPr20260614Promise,
+  _orchPr20260614_5Promise,
+  _orchPr20260614_6Promise,
+  _orchPr14ProductIdPromise,
+  _orchPr9PruneDeadUrlsPromise,
+  _orchPr18BulkLoadPromise,
+  _orchPr12SweepPromise,
+  _brregVerifySlice1Promise,
+  _orchPr20BmEventsPromise,
+];
+
+Promise.allSettled(_orchPr21SentLogActorDeps).then(async () => {
   try {
     const Database = require("better-sqlite3");
     const { __setDbForTesting, __initSchemaForTesting, getDb } = require("../src/database/init");
@@ -20709,16 +20781,23 @@ _orchPr20BmEventsPromise.then(async () => {
 // what the DB bloat actually is (prod at 476.2MB, ~5 days from 500MB
 // threshold; page-view retention already finds 0 rows to prune).
 //
-// Chained off _orchPr21SentLogActorPromise (same pattern as PR-20/PR-21):
-// this block also swaps the global getDb() singleton via __setDbForTesting,
-// so it must run serially after the other singleton-swapping blocks, not
-// concurrently with them.
+// 2026-07-06 fix-up (dev-request 2026-07-06-ci-untracked-timer-followup):
+// was chained off _orchPr21SentLogActorPromise alone — insufficient for the
+// same reason pr21's own chaining was upgraded above. This block also swaps
+// the global getDb() singleton via __setDbForTesting, so it must run
+// serially after EVERY other singleton-swapping block that could still be
+// mid-flight, not just its immediate predecessor.
 let _adminDbTableSizesResolve: () => void = () => {};
 const _adminDbTableSizesPromise: Promise<void> = new Promise<void>(r => {
   _adminDbTableSizesResolve = r;
 });
 
-_orchPr21SentLogActorPromise.then(async () => {
+const _adminDbTableSizesDeps: Promise<unknown>[] = [
+  ..._orchPr21SentLogActorDeps,
+  _orchPr21SentLogActorPromise,
+];
+
+Promise.allSettled(_adminDbTableSizesDeps).then(async () => {
   console.log("\n── admin-db-table-sizes: read-only DB table-size diagnostic ──");
   try {
     const { runAdminDbTableSizesTests } = require("../src/routes/admin-db-table-sizes.test") as
@@ -20740,17 +20819,26 @@ _orchPr21SentLogActorPromise.then(async () => {
 // ─── 2026-07-03 slice 1: contact-click intent tracking ───────────────────────
 // dev-requests/2026-07-03-agent-profile-conversations-stats.md work items
 // 1+2 — new contact_clicks table + POST /api/track/contact-click beacon +
-// GET /ut/:agentId/:kind counting redirect. Chained off
-// _adminDbTableSizesPromise (same reasoning as the PR-20/PR-21/admin-db
-// blocks above): this block also swaps the global getDb() singleton via
-// __setDbForTesting, so it must run serially after the other
-// singleton-swapping blocks, not concurrently with them.
+// GET /ut/:agentId/:kind counting redirect.
+//
+// 2026-07-06 fix-up (dev-request 2026-07-06-ci-untracked-timer-followup):
+// was chained off _adminDbTableSizesPromise alone — insufficient for the
+// same reason pr21/admin-db-table-sizes' own chaining was upgraded above.
+// This block also swaps the global getDb() singleton via
+// __setDbForTesting, so it must run serially after EVERY other
+// singleton-swapping block that could still be mid-flight, not just its
+// immediate predecessor.
 let _contactClickTrackingResolve: () => void = () => {};
 const _contactClickTrackingPromise: Promise<void> = new Promise<void>(r => {
   _contactClickTrackingResolve = r;
 });
 
-_adminDbTableSizesPromise.then(async () => {
+const _contactClickTrackingDeps: Promise<unknown>[] = [
+  ..._adminDbTableSizesDeps,
+  _adminDbTableSizesPromise,
+];
+
+Promise.allSettled(_contactClickTrackingDeps).then(async () => {
   console.log("\n── contact-tracking: contact-click intent tracking (table + endpoints) ──");
   try {
     const { runContactTrackingTests } = require("../src/routes/contact-tracking.test") as
@@ -22089,7 +22177,7 @@ Promise.allSettled(_tasksPruneAsyncDeps).then(async () => {
     const sqlite = require("better-sqlite3");
     const httpMod = await import("http");
     const expressMod = (await import("express")).default;
-    const initMod = await import("../src/database/init");
+    const initMod = require("../src/database/init");
     const analyticsMod = await import("../src/routes/analytics");
 
     const ADMIN_KEY = "tpa-test-admin-key-20260704";
@@ -22492,6 +22580,12 @@ let _rfbDebioSuiteResolve: () => void = () => {};
 const _rfbDebioSuitePromise: Promise<void> = new Promise<void>(r => { _rfbDebioSuiteResolve = r; });
 
 (async () => {
+  // 2026-07-06 fix-up (dev-request 2026-07-06-ci-untracked-timer-followup):
+  // use Promise.allSettled over the exhaustive list (matching
+  // _oaHomeCountersDeps / _tasksPruneAsyncDeps) instead of a manual
+  // sequential for-await, and explicitly include _oaHomeCountersPromise
+  // (previously only reached transitively via _tasksPruneAsyncPromise) so
+  // this list is correct by inspection, not by re-derivation.
   const priorPromises: Array<Promise<unknown>> = [
     _serialChain,
     Promise.all(_pr21Promises),
@@ -22504,11 +22598,9 @@ const _rfbDebioSuitePromise: Promise<void> = new Promise<void>(r => { _rfbDebioS
     _orchPr18BulkLoadPromise, _orchPr12SweepPromise, _brregVerifySlice1Promise,
     _orchPr20BmEventsPromise, _orchPr21SentLogActorPromise, _adminDbTableSizesPromise,
     _contactClickTrackingPromise, _homepageProvenanceEmailBackfillPromise,
-    _agentKnowledgeGetAuthPromise, _tasksPruneAsyncPromise,
+    _agentKnowledgeGetAuthPromise, _oaHomeCountersPromise, _tasksPruneAsyncPromise,
   ];
-  for (const p of priorPromises) {
-    try { await p; } catch { /* errors already tallied by their own block */ }
-  }
+  await Promise.allSettled(priorPromises);
   // One extra tick so any then-chained cleanup those blocks scheduled has
   // also run before we start swapping the singleton ourselves.
   await new Promise(r => setImmediate(r));
