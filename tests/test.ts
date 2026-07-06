@@ -20814,28 +20814,48 @@ Promise.all([_contactClickTrackingPromise, _orchPr20260614Promise]).then(async (
 // the blocks above: this block also swaps the global getDb() singleton via
 // __setDbForTesting, so it must run serially after the other
 // singleton-swapping blocks rather than concurrently with them.
+//
+// QUARANTINE (2026-07-06, dev-request 2026-07-06-ci-quarantine-auth-suite):
+// this block's 10 assertions are a proven false-negative on GitHub Actions —
+// identical failure signature survived 9 independent root-cause fix attempts
+// (see dev-requests/2026-07-06-ci-untracked-timer-followup.md, now P3) and the
+// file passes cleanly in isolation (`npx tsx
+// src/routes/agent-knowledge-get-auth.test.ts`). Rather than keep blocking
+// deploys on a false alarm, CI now runs this block in its OWN job
+// (`build-check-auth-isolated` in .github/workflows/fly-deploy.yml) where it
+// is proven green, and skips it here in the shared-process `build-check` job
+// to avoid the cross-test contamination. Both jobs stay required for
+// `deploy` — no enforcement is lost, only isolated. Revert by deleting this
+// `if` (and the isolated job) once the root cause is found.
+const _skipAgentKnowledgeGetAuthInSharedRun = process.env.CI_SKIP_AGENT_KNOWLEDGE_AUTH === "1";
+
 let _agentKnowledgeGetAuthResolve: () => void = () => {};
 const _agentKnowledgeGetAuthPromise: Promise<void> = new Promise<void>(r => {
   _agentKnowledgeGetAuthResolve = r;
 });
 
-_homepageProvenanceEmailBackfillPromise.then(async () => {
-  console.log("\n── agent-knowledge-get-auth: GET /agents/:id/knowledge auth gate ──");
-  try {
-    const { runAgentKnowledgeGetAuthTests } = require("../src/routes/agent-knowledge-get-auth.test") as
-      typeof import("../src/routes/agent-knowledge-get-auth.test");
-    const jr = await runAgentKnowledgeGetAuthTests({ log: false });
-    passed += jr.passed;
-    failed += jr.failed;
-    for (const f of jr.failures) failures.push("agent-knowledge-get-auth: " + f);
-    console.log(`  agent-knowledge-get-auth: ${jr.passed} passed, ${jr.failed} failed`);
-  } catch (err: any) {
-    failed++;
-    failures.push("agent-knowledge-get-auth: unexpected error: " + String(err?.message || err));
-  } finally {
-    _agentKnowledgeGetAuthResolve();
-  }
-});
+if (_skipAgentKnowledgeGetAuthInSharedRun) {
+  console.log("\n── agent-knowledge-get-auth: quarantined to build-check-auth-isolated job (skipped here) ──");
+  _agentKnowledgeGetAuthResolve();
+} else {
+  _homepageProvenanceEmailBackfillPromise.then(async () => {
+    console.log("\n── agent-knowledge-get-auth: GET /agents/:id/knowledge auth gate ──");
+    try {
+      const { runAgentKnowledgeGetAuthTests } = require("../src/routes/agent-knowledge-get-auth.test") as
+        typeof import("../src/routes/agent-knowledge-get-auth.test");
+      const jr = await runAgentKnowledgeGetAuthTests({ log: false });
+      passed += jr.passed;
+      failed += jr.failed;
+      for (const f of jr.failures) failures.push("agent-knowledge-get-auth: " + f);
+      console.log(`  agent-knowledge-get-auth: ${jr.passed} passed, ${jr.failed} failed`);
+    } catch (err: any) {
+      failed++;
+      failures.push("agent-knowledge-get-auth: unexpected error: " + String(err?.message || err));
+    } finally {
+      _agentKnowledgeGetAuthResolve();
+    }
+  });
+}
 
 
 // ── site-quality (opplevagent-site-quality loop, 2026-06-22) ──────────────────
