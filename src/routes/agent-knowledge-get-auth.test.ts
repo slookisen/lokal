@@ -228,6 +228,36 @@ export function runAgentKnowledgeGetAuthTests(
         delete process.env.ANALYTICS_ADMIN_KEY;
       };
 
+      // ── TEMP CI-DIAGNOSTIC (2026-07-06, dev-request ci-test-harness-gh-actions-only-failure) ──
+      // Empirically instrument instead of guessing again — strip once root cause is confirmed.
+      {
+        rePin();
+        const svc = require("../services/knowledge-service");
+        const reg = require("../services/marketplace-registry");
+        const directCount = db.prepare("SELECT COUNT(*) c FROM agents").get();
+        const viaInitMod = initMod.getDb().prepare("SELECT COUNT(*) c FROM agents").get();
+        console.log("[CI-DIAG] process.version=", process.version);
+        console.log("[CI-DIAG] process.env.CI=", process.env.CI);
+        try {
+          console.log("[CI-DIAG] better-sqlite3 compile_options=", JSON.stringify(db.pragma("compile_options")));
+        } catch (e) { console.log("[CI-DIAG] pragma failed:", e); }
+        console.log("[CI-DIAG] db === initMod.getDb():", db === initMod.getDb());
+        console.log("[CI-DIAG] direct db agents count:", JSON.stringify(directCount));
+        console.log("[CI-DIAG] initMod.getDb() agents count:", JSON.stringify(viaInitMod));
+        console.log("[CI-DIAG] knowledgeService.getKnowledge('agent-a') via require(\"../services/knowledge-service\"):", JSON.stringify(svc.knowledgeService.getKnowledge("agent-a")));
+        console.log("[CI-DIAG] marketplaceRegistry.getAgentByApiKey('api-key-b') via require(\"../services/marketplace-registry\"):", JSON.stringify(reg.marketplaceRegistry.getAgentByApiKey("api-key-b")));
+        console.log("[CI-DIAG] require.cache has ../database/init:", !!require.cache[require.resolve("../database/init")]);
+        console.log("[CI-DIAG] require.cache has ../services/knowledge-service:", !!require.cache[require.resolve("../services/knowledge-service")]);
+        console.log("[CI-DIAG] require.cache has ../services/marketplace-registry:", !!require.cache[require.resolve("../services/marketplace-registry")]);
+        console.log("[CI-DIAG] router direct call test: GET agent-a with admin key via router.handle ->");
+        const rDirect = await callRoute(router, {
+          method: "GET",
+          url: "/agents/agent-a/knowledge",
+          headers: { "x-admin-key": testAdminKey },
+        }, rePin);
+        console.log("[CI-DIAG] rDirect =", JSON.stringify(rDirect));
+      }
+
       // ── (1) unauthenticated GET -> 403, no data leaked ──
       {
         const r = await callRoute(router, { method: "GET", url: "/agents/agent-a/knowledge" }, rePin);
