@@ -20810,16 +20810,81 @@ Promise.all([_contactClickTrackingPromise, _orchPr20260614Promise]).then(async (
 
 // ── agent-knowledge GET auth gate (2026-07-05, dev-request
 // secure-agent-knowledge-endpoint) ────────────────────────────────────────
-// Chained off _homepageProvenanceEmailBackfillPromise for the same reason as
-// the blocks above: this block also swaps the global getDb() singleton via
-// __setDbForTesting, so it must run serially after the other
-// singleton-swapping blocks rather than concurrently with them.
+//
+// 2026-07-06 CI fix (dev-request ci-test-harness-gh-actions-only-failure):
+// this block used to chain off _homepageProvenanceEmailBackfillPromise
+// ALONE. That is the exact "Attempt 2" pattern the orch-pr-20260704
+// tasks-prune-async block below already tried and proved insufficient
+// (see that block's comment): this file does not have one single linear
+// chain — it has many independently-resolving branches that only get
+// jointly awaited at the very end, in the REPORT IIFE's tail. Chaining off
+// one ancestor left this block free to run concurrently with any of the
+// OTHER branches that also pin the shared getDb() singleton via
+// __setDbForTesting — reproduced deterministically on CI (never locally,
+// timing-dependent): another branch's __setDbForTesting call landed
+// between this suite's own inserts and its assertions, corrupting the
+// agent_knowledge rows this suite had just seeded (confirmed via direct
+// instrumentation). This suite's own rePin-before-every-router.handle()
+// pattern (kept below as defense-in-depth) only defends the instant of
+// its OWN db reads; it cannot stop another branch from mutating the
+// singleton at any other moment.
+//
+// Fix: depend on Promise.allSettled() of the EXACT same dependency set the
+// REPORT IIFE's own tail-await list depends on (every entry from
+// _serialChain through _homepageProvenanceEmailBackfillPromise) — the same
+// categorical fix already proven for tasks-prune-async. Once every one of
+// those has settled, no other code path in the file can still be executing
+// a __setDbForTesting call, so this suite's db-singleton reads are
+// provably uncontested. tasks-prune-async's own dependency list already
+// includes _agentKnowledgeGetAuthPromise, so ordering is preserved: this
+// suite still runs before tasks-prune-async.
 let _agentKnowledgeGetAuthResolve: () => void = () => {};
 const _agentKnowledgeGetAuthPromise: Promise<void> = new Promise<void>(r => {
   _agentKnowledgeGetAuthResolve = r;
 });
 
-_homepageProvenanceEmailBackfillPromise.then(async () => {
+const _agentKnowledgeGetAuthDeps: Promise<unknown>[] = [
+  _serialChain,
+  Promise.all(_pr21Promises),
+  _m2Promise,
+  _pr24Promise,
+  _pr56Promise,
+  _pr63Promise,
+  _pr65Promise,
+  _pr66Promise,
+  _pr67Promise,
+  _pr68Promise,
+  _pr74Promise,
+  _pr75Promise,
+  _pr76Promise,
+  _pr78Promise,
+  _orchPr86Promise,
+  _orchPr93Promise,
+  _pr94Promise,
+  _pr95Promise,
+  _pr103Promise,
+  _pr106Promise,
+  _pr110Promise,
+  _pr125Promise,
+  _seoDentalPromise,
+  _platformVerifierPromise,
+  _orchPr20260614_2Promise,
+  _orchPr20260614Promise,
+  _orchPr20260614_5Promise,
+  _orchPr20260614_6Promise,
+  _orchPr14ProductIdPromise,
+  _orchPr9PruneDeadUrlsPromise,
+  _orchPr18BulkLoadPromise,
+  _orchPr12SweepPromise,
+  _brregVerifySlice1Promise,
+  _orchPr20BmEventsPromise,
+  _orchPr21SentLogActorPromise,
+  _adminDbTableSizesPromise,
+  _contactClickTrackingPromise,
+  _homepageProvenanceEmailBackfillPromise,
+];
+
+Promise.allSettled(_agentKnowledgeGetAuthDeps).then(async () => {
   console.log("\n── agent-knowledge-get-auth: GET /agents/:id/knowledge auth gate ──");
   try {
     const { runAgentKnowledgeGetAuthTests } = require("../src/routes/agent-knowledge-get-auth.test") as
