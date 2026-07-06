@@ -61,6 +61,7 @@ import {
   BookingInputSchema,
   sendBookingConfirmation,
 } from "../services/booking-store";
+import { getOaHomeCounters } from "../services/oa-home-counters";
 
 const router = Router();
 
@@ -265,6 +266,9 @@ function homeStrings(lang: Lang) {
     hintPre: "Søk på sted, kategori eller aktivitet &mdash; eller ", hintLink: "bla i alle opplevelser", hintPost: ". Agenter kan kalle ", hintPost2: " direkte.",
     quickAria: "Hurtigsøk", qNature: "Ute i naturen", qAll: "Alle opplevelser",
     trustAria: "Tillit og datakilder", trustBrreg: "Tilbydere verifisert mot Brønnøysundregistrene", trustFresh: "Innhold oppdatert fortløpende", trustMachine: "Maskinlesbar for AI-agenter",
+    counterAria: "Opplevagent i tall",
+    counterPageviews: "Sidevisninger", counterUnique: "Unike besøkende", counterHumans: "Ekte mennesker", counterBots: "Bot &amp; AI-trafikk",
+    counterExperiences: "Opplevelser", counterProviders: "Tilbydere", counterMunicipalities: "Kommuner",
     catKicker: "Utforsk", catTitle: "Opplevelser etter kategori", catIntro: "Bla i kuraterte kategorier &mdash; eller la en AI-agent filtrere på vær, sesong, pris og gruppestørrelse for deg.", catAria: "Kategorier", catCount: "opplevelser", catSoon: "Kommer snart", catNote: "Eksempelkategorier &mdash; live opplevelser publiseres fortløpende.",
     howKicker: "Tillitsmodell", howTitle: "Slik funker det", howSub: "Kuratert, verifisert og beriket &mdash; tre steg som skiller Opplevagent fra en vanlig oppføringsliste.",
     srcLabel: "Kilde:",
@@ -291,6 +295,9 @@ function homeStrings(lang: Lang) {
     hintPre: "Search by place, category or activity &mdash; or ", hintLink: "browse all experiences", hintPost: ". Agents can call ", hintPost2: " directly.",
     quickAria: "Quick search", qNature: "Outdoors", qAll: "All experiences",
     trustAria: "Trust and data sources", trustBrreg: "Providers verified against the Norwegian business registry", trustFresh: "Content updated continuously", trustMachine: "Machine-readable for AI agents",
+    counterAria: "Opplevagent in numbers",
+    counterPageviews: "Page views", counterUnique: "Unique visitors", counterHumans: "Real humans", counterBots: "Bot &amp; AI traffic",
+    counterExperiences: "Experiences", counterProviders: "Providers", counterMunicipalities: "Municipalities",
     catKicker: "Explore", catTitle: "Experiences by category", catIntro: "Browse curated categories &mdash; or let an AI agent filter by weather, season, price and group size for you.", catAria: "Categories", catCount: "experiences", catSoon: "Coming soon", catNote: "Example categories &mdash; live experiences are published continuously.",
     howKicker: "Trust model", howTitle: "How it works", howSub: "Curated, verified and enriched &mdash; three steps that set Opplevagent apart from an ordinary listing.",
     srcLabel: "Source:",
@@ -316,6 +323,37 @@ router.get("/", (req: Request, res: Response) => {
   const canonical = lang === "en" ? `${url}/en` : url;
 
   // Categories are read defensively — the page must render perfectly with 0
+  // Counter strip: live, host-scoped (opplevagent.no only) social-proof
+  // numbers — server-rendered + cached (see src/services/oa-home-counters.ts
+  // for the exact scoping/exclusion rules this reuses from the RFB homepage
+  // pattern). Read defensively — must never break the homepage.
+  const numFmt = lang === "en" ? "en-US" : "nb-NO";
+  let counters = { pageViews: 0, uniqueVisitors: 0, realHumans: 0, botAndAi: 0, opplevelser: 0, tilbydere: 0, kommuner: 0 };
+  try {
+    counters = getOaHomeCounters();
+  } catch {
+    // Analytics/catalog DB not open — render the strip with 0s rather than
+    // failing the whole homepage.
+  }
+  const counterStripHtml = `
+  <div class="counters" aria-label="${S.counterAria}">
+    <div class="counters-inner">
+      <div class="counter-item"><div class="counter-val">${counters.pageViews.toLocaleString(numFmt)}</div><div class="counter-lbl">${S.counterPageviews}</div></div>
+      <div class="counter-sep" aria-hidden="true"></div>
+      <div class="counter-item"><div class="counter-val">${counters.uniqueVisitors.toLocaleString(numFmt)}</div><div class="counter-lbl">${S.counterUnique}</div></div>
+      <div class="counter-sep" aria-hidden="true"></div>
+      <div class="counter-item"><div class="counter-val">${counters.realHumans.toLocaleString(numFmt)}</div><div class="counter-lbl">${S.counterHumans}</div></div>
+      <div class="counter-sep" aria-hidden="true"></div>
+      <div class="counter-item"><div class="counter-val counter-val-accent">${counters.botAndAi.toLocaleString(numFmt)}</div><div class="counter-lbl">${S.counterBots}</div></div>
+      <div class="counter-sep" aria-hidden="true"></div>
+      <div class="counter-item"><div class="counter-val">${counters.opplevelser.toLocaleString(numFmt)}</div><div class="counter-lbl">${S.counterExperiences}</div></div>
+      <div class="counter-sep" aria-hidden="true"></div>
+      <div class="counter-item"><div class="counter-val">${counters.tilbydere.toLocaleString(numFmt)}</div><div class="counter-lbl">${S.counterProviders}</div></div>
+      <div class="counter-sep" aria-hidden="true"></div>
+      <div class="counter-item"><div class="counter-val">${counters.kommuner.toLocaleString(numFmt)}</div><div class="counter-lbl">${S.counterMunicipalities}</div></div>
+    </div>
+  </div>`;
+
   // categories (DB not open / no data yet). When empty we show a tasteful set
   // of example categories so the grid never looks broken pre-data.
   const cats = safeCategories();
@@ -525,6 +563,17 @@ ${ldScripts}
   .trust-sep{width:1px;height:18px;background:rgba(255,255,255,.18)}
   @media(max-width:640px){.trust-sep{display:none}}
 
+  /* ── COUNTER STRIP (social-proof numbers, server-rendered + cached) ── */
+  .counters{background:var(--surface);border-bottom:1px solid var(--line)}
+  .counters-inner{max-width:var(--maxw);margin:0 auto;padding:20px 24px;display:flex;flex-wrap:wrap;justify-content:center;align-items:center;gap:14px 30px}
+  @media(max-width:560px){.counters-inner{padding:16px;gap:12px 20px}}
+  .counter-item{text-align:center}
+  .counter-val{font-size:1.25rem;font-weight:800;color:var(--fjord-700);letter-spacing:-.02em;line-height:1}
+  .counter-val.counter-val-accent{color:var(--coral-500)}
+  .counter-lbl{margin-top:3px;font-size:.68rem;font-weight:600;color:var(--mist);text-transform:uppercase;letter-spacing:.04em}
+  .counter-sep{width:1px;height:26px;background:var(--line)}
+  @media(max-width:640px){.counter-sep{display:none}}
+
   /* ── SECTIONS ── */
   main{display:block}
   .section{padding:72px 0}
@@ -651,6 +700,7 @@ ${ldScripts}
       <span class="trust-item"><svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true"><rect x="3" y="4" width="18" height="14" rx="2" fill="none" stroke="currentColor" stroke-width="1.8"/><path d="M3 9 H21 M8 14 H13" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg> ${S.trustMachine}</span>
     </div>
   </div>
+  ${counterStripHtml}
 
   <section class="section" id="kategorier" aria-labelledby="kat-title">
     <div class="container">

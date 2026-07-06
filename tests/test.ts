@@ -19319,6 +19319,7 @@ console.log("\n── orch-pr-14: MCP discovery product_id surfacing ──");
   try { await _contactClickTrackingPromise; } catch { /* errors already pushed to failures */ }
   try { await _homepageProvenanceEmailBackfillPromise; } catch { /* errors already pushed to failures */ }
   try { await _agentKnowledgeGetAuthPromise; } catch { /* errors already pushed to failures */ }
+  try { await _oaHomeCountersPromise; } catch { /* errors already pushed to failures */ }
   try { await _tasksPruneAsyncPromise; } catch { /* errors already pushed to failures */ }
   // PR-109 tests are synchronous (IIFE) — no promise needed
   // Drop pre-existing intg failures (unmasked by awaiting) — they predate M2
@@ -20857,6 +20858,32 @@ if (_skipAgentKnowledgeGetAuthInSharedRun) {
   });
 }
 
+// ── oa-home-counters (2026-07-05): OA homepage counter strip ────────────────
+// dev-request 2026-07-04-opplevagent-besokstall-og-forside-friskhet item 1.
+// Chained off _agentKnowledgeGetAuthPromise, NOT off
+// _homepageProvenanceEmailBackfillPromise directly (same reasoning as the
+// blocks above): this block also swaps the global getDb() singleton (rfb
+// main DB, for analytics_page_views) via __setDbForTesting, so it must run
+// serially after every OTHER singleton-swapping block, not concurrently with
+// them. _agentKnowledgeGetAuthPromise both (a) already resolves after
+// _homepageProvenanceEmailBackfillPromise (or immediately, when quarantined
+// via CI_SKIP_AGENT_KNOWLEDGE_AUTH) and (b) is itself a singleton-swapping
+// block, so chaining off it — rather than off the same
+// _homepageProvenanceEmailBackfillPromise it depends on — is what prevents
+// this block from racing it (the exact race pattern documented above for
+// _contactClickTrackingPromise / _orchPr20260614Promise, and again for
+// tasks-prune-async below). It additionally uses
+// EXPERIENCES_DB_PATH=":memory:" + db-factory's __resetDbFactoryForTesting()
+// for the catalog side — self-contained and restored in its own finally
+// block, so it doesn't need to serialize against the (non-DB-singleton)
+// synchronous experiences-seo IIFE blocks later in this file.
+let _oaHomeCountersResolve: () => void = () => {};
+const _oaHomeCountersPromise: Promise<void> = new Promise<void>(r => {
+  _oaHomeCountersResolve = r;
+});
+
+// (trigger moved below _tasksPruneAsyncDeps -- see _oaHomeCountersDeps, added 2026-07-06 fix-up: chaining off a single upstream promise was insufficient, matching tasks-prune-async's own documented postmortem)
+
 
 // ── site-quality (opplevagent-site-quality loop, 2026-06-22) ──────────────────
 // Tilbyder slug URLs: /tilbyder/<slug> (human-readable) + 301 from UUID URLs.
@@ -21935,9 +21962,82 @@ const _tasksPruneAsyncPromise: Promise<void> = new Promise<void>(r => {
 });
 
 // Same dependency set as the REPORT IIFE's own tail-await list below (every
-// entry from _serialChain through _agentKnowledgeGetAuthPromise) — kept
-// literally identical on purpose so "does this block depend on everything
-// the REPORT IIFE depends on" is true by inspection, not by re-derivation.
+// entry from _serialChain through _oaHomeCountersPromise, i.e. everything
+// EXCEPT _tasksPruneAsyncPromise itself) — kept literally identical on
+// purpose so "does this block depend on everything the REPORT IIFE depends
+// on" is true by inspection, not by re-derivation. 2026-07-06 merge note:
+// _oaHomeCountersPromise (orch-pr-oa-counter-strip) was added here, not just
+// appended to the tail-await list, for the same db-singleton-swap reason
+// as every other entry above — see its own chaining comment for why it now
+// hangs off _agentKnowledgeGetAuthPromise instead of
+// _homepageProvenanceEmailBackfillPromise directly.
+
+// oa-home-counters depends on the FULL branch set (same list tasks-prune-async
+// uses, minus itself) -- chaining off _agentKnowledgeGetAuthPromise alone was
+// insufficient (missed _orchPr20260614_2/_5/_6Promise, which also swap the
+// shared getDb() singleton via db-factory's initMod), per the exact failure
+// mode this file's own tasks-prune-async postmortem documents two attempts
+// above. Fixed 2026-07-06 (independent-review finding on PR #152).
+const _oaHomeCountersDeps: Promise<unknown>[] = [
+  _serialChain,
+  Promise.all(_pr21Promises),
+  _m2Promise,
+  _pr24Promise,
+  _pr56Promise,
+  _pr63Promise,
+  _pr65Promise,
+  _pr66Promise,
+  _pr67Promise,
+  _pr68Promise,
+  _pr74Promise,
+  _pr75Promise,
+  _pr76Promise,
+  _pr78Promise,
+  _orchPr86Promise,
+  _orchPr93Promise,
+  _pr94Promise,
+  _pr95Promise,
+  _pr103Promise,
+  _pr106Promise,
+  _pr110Promise,
+  _pr125Promise,
+  _seoDentalPromise,
+  _platformVerifierPromise,
+  _orchPr20260614_2Promise,
+  _orchPr20260614Promise,
+  _orchPr20260614_5Promise,
+  _orchPr20260614_6Promise,
+  _orchPr14ProductIdPromise,
+  _orchPr9PruneDeadUrlsPromise,
+  _orchPr18BulkLoadPromise,
+  _orchPr12SweepPromise,
+  _brregVerifySlice1Promise,
+  _orchPr20BmEventsPromise,
+  _orchPr21SentLogActorPromise,
+  _adminDbTableSizesPromise,
+  _contactClickTrackingPromise,
+  _homepageProvenanceEmailBackfillPromise,
+  _agentKnowledgeGetAuthPromise,
+];
+
+Promise.allSettled(_oaHomeCountersDeps).then(async () => {
+  console.log("\n── oa-home-counters: OA homepage counter strip (catalog counts + host-scoped traffic) ──");
+  try {
+    const { runOaHomeCountersTests } = require("../src/services/oa-home-counters.test") as
+      typeof import("../src/services/oa-home-counters.test");
+    const jr = await runOaHomeCountersTests({ log: false });
+    passed += jr.passed;
+    failed += jr.failed;
+    for (const f of jr.failures) failures.push("oa-home-counters: " + f);
+    console.log(`  oa-home-counters: ${jr.passed} passed, ${jr.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("oa-home-counters: unexpected error: " + String(err?.message || err));
+  } finally {
+    _oaHomeCountersResolve();
+  }
+});
+
 const _tasksPruneAsyncDeps: Promise<unknown>[] = [
   _serialChain,
   Promise.all(_pr21Promises),
@@ -21978,6 +22078,7 @@ const _tasksPruneAsyncDeps: Promise<unknown>[] = [
   _contactClickTrackingPromise,
   _homepageProvenanceEmailBackfillPromise,
   _agentKnowledgeGetAuthPromise,
+  _oaHomeCountersPromise,
 ];
 
 Promise.allSettled(_tasksPruneAsyncDeps).then(async () => {

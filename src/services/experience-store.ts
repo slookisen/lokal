@@ -598,6 +598,41 @@ export function listPublishedProviders(): PublishedProviderRow[] {
     .all() as PublishedProviderRow[];
 }
 
+/** Count of distinct providers with ≥1 PUBLISHED experience — the "Tilbydere"
+ *  counter powering the homepage counter strip (dev-request
+ *  2026-07-04-opplevagent-besokstall-og-forside-friskhet). Mirrors
+ *  listPublishedProviders()'s WHERE/JOIN shape but returns just the count
+ *  (no full row hydration) so the homepage can call it on every render
+ *  without materializing the whole provider list. */
+export function countPublishedProviders(): number {
+  const db = getDb(VERTICAL);
+  const row = db
+    .prepare(
+      `SELECT COUNT(DISTINCT p.id) AS c
+       FROM experiences e
+       JOIN experience_providers p ON p.id = e.provider_id
+       WHERE e.slug IS NOT NULL AND ${PUBLISH_GATE_SQL}`
+    )
+    .get() as { c: number };
+  return row.c;
+}
+
+/** Count of distinct kommuner with ≥1 PUBLISHED experience — the "Kommuner"
+ *  counter powering the homepage counter strip (same dev-request as
+ *  countPublishedProviders() above). Mirrors listPublishedKommuner()'s
+ *  WHERE shape but returns just the count. */
+export function countPublishedKommuner(): number {
+  const db = getDb(VERTICAL);
+  const row = db
+    .prepare(
+      `SELECT COUNT(DISTINCT e.kommune) AS c FROM experiences e
+       LEFT JOIN experience_providers p ON p.id = e.provider_id
+       WHERE e.kommune IS NOT NULL AND e.kommune != '' AND ${PUBLISH_GATE_SQL}`
+    )
+    .get() as { c: number };
+  return row.c;
+}
+
 /** A provider row, but only if it currently has ≥1 PUBLISHED experience. Used by
  *  the /tilbyder/:id page so providers with no live experience 404 (no orphan). */
 export function getPublishedProviderById(id: string): Record<string, unknown> | null {
