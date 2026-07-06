@@ -19477,6 +19477,7 @@ console.log("\n── orch-pr-14: MCP discovery product_id surfacing ──");
   try { await _homepageProvenanceEmailBackfillPromise; } catch { /* errors already pushed to failures */ }
   try { await _agentKnowledgeGetAuthPromise; } catch { /* errors already pushed to failures */ }
   try { await _oaHomeCountersPromise; } catch { /* errors already pushed to failures */ }
+  try { await _adminAgentsRegisterPromise; } catch { /* errors already pushed to failures */ }
   try { await _tasksPruneAsyncPromise; } catch { /* errors already pushed to failures */ }
   try { await _rfbDebioSuitePromise; } catch { /* errors already pushed to failures */ }
   // relax-envelope tests are synchronous (pure validateEnvelope() unit test) — no promise needed
@@ -21114,6 +21115,36 @@ const _oaHomeCountersPromise: Promise<void> = new Promise<void>(r => {
 
 // (trigger moved below _tasksPruneAsyncDeps -- see _oaHomeCountersDeps, added 2026-07-06 fix-up: chaining off a single upstream promise was insufficient, matching tasks-prune-async's own documented postmortem)
 
+// ── admin-agents-register: Slice 2 of dev-request ──────────────────────────
+// 2026-06-30-brreg-verification-gate: wiring verifyOrgNumber() into
+// POST /admin/agents/register for rfb+experiences (dental skipped).
+// Chained off _agentKnowledgeGetAuthPromise for the same reason as the
+// blocks above: this block also swaps the global getDb() singleton via
+// __setDbForTesting, so it must run serially after the other
+// singleton-swapping blocks rather than concurrently with them.
+let _adminAgentsRegisterResolve: () => void = () => {};
+const _adminAgentsRegisterPromise: Promise<void> = new Promise<void>(r => {
+  _adminAgentsRegisterResolve = r;
+});
+
+_agentKnowledgeGetAuthPromise.then(async () => {
+  console.log("\n── admin-agents-register: brreg-verify wiring (rfb+experiences) ──");
+  try {
+    const { runAdminAgentsRegisterTests } = require("../src/routes/admin-agents.test") as
+      typeof import("../src/routes/admin-agents.test");
+    const jr = await runAdminAgentsRegisterTests({ log: false });
+    passed += jr.passed;
+    failed += jr.failed;
+    for (const f of jr.failures) failures.push("admin-agents-register: " + f);
+    console.log(`  admin-agents-register: ${jr.passed} passed, ${jr.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("admin-agents-register: unexpected error: " + String(err?.message || err));
+  } finally {
+    _adminAgentsRegisterResolve();
+  }
+});
+
 
 // ── site-quality (opplevagent-site-quality loop, 2026-06-22) ──────────────────
 // Tilbyder slug URLs: /tilbyder/<slug> (human-readable) + 301 from UUID URLs.
@@ -22248,6 +22279,7 @@ const _oaHomeCountersDeps: Promise<unknown>[] = [
   _contactClickTrackingPromise,
   _homepageProvenanceEmailBackfillPromise,
   _agentKnowledgeGetAuthPromise,
+  _adminAgentsRegisterPromise,
 ];
 
 Promise.allSettled(_oaHomeCountersDeps).then(async () => {
