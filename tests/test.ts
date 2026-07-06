@@ -211,19 +211,7 @@ console.log("\n── crm-service (listThreadsByStatus contact_email fix) ──
 // Async (fire-and-forget sweep loop). Kicked off here; awaited in the REPORT
 // block so its pass/fail counts fold into the `npm test` summary.
 console.log("── orch-pr-12: search-enrich sweep + findings + apply-findings ──");
-// BISECT (debug/ci-bisect-2026-07-06, candidate 3/3): temporarily skip this
-// block entirely. This is a top-level fire-and-forget IIFE started essentially
-// at file-load time, unchained from any other branch's promise, running fully
-// concurrently with everything else in the file including the later
-// agent-knowledge-get-auth suite. Revert this skip if CI stays RED with the
-// same 10-assertion signature (not the culprit); keep + build the real fix if
-// CI goes GREEN.
-const _BISECT_SKIP_SEARCH_ENRICH_SWEEP = true;
 const _orchPr12SweepPromise: Promise<void> = (async () => {
-  if (_BISECT_SKIP_SEARCH_ENRICH_SWEEP) {
-    console.log("  search-enrich-sweep: SKIPPED (bisect candidate-3 disable, debug/ci-bisect-2026-07-06)");
-    return;
-  }
   try {
     const { runSearchEnrichSweepTests } = require("../src/services/search-enrich-sweep.test") as
       typeof import("../src/services/search-enrich-sweep.test");
