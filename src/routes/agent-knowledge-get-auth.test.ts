@@ -261,14 +261,37 @@ export function runAgentKnowledgeGetAuthTests(
           headers: { "x-admin-key": testAdminKey },
         }, rePin);
         console.log("[CI-DIAG] rDirect =", JSON.stringify(rDirect));
-        console.log("[CI-DIAG2] agent_knowledge rows right before PUT probe:", JSON.stringify(db.prepare("SELECT agent_id, email FROM agent_knowledge").all()));
-        const rPut = await callRoute(router, {
-          method: "PUT",
-          url: "/agents/agent-a/knowledge",
-          headers: { "x-admin-key": testAdminKey },
-          body: { about: "diag probe" },
-        }, rePin);
-        console.log("[CI-DIAG2] rPut (should reveal the real exception) =", JSON.stringify(rPut));
+        console.log("[CI-DIAG3] PRAGMA foreign_keys effective value on our db:", JSON.stringify(db.pragma("foreign_keys")));
+        try {
+          const fullRow = db.prepare(`SELECT agent_id, address, postal_code, website, phone, email,
+            opening_hours, products, about, specialties, certifications, payment_methods,
+            delivery_options, google_rating, google_review_count, tripadvisor_rating,
+            external_reviews, external_links, images, seasonality, delivery_radius, min_order_value,
+            data_source, auto_sources, last_enriched_at,
+            owner_updated_at, preferences, curated_fields FROM agent_knowledge WHERE agent_id = ?`).get("agent-a");
+          console.log("[CI-DIAG3] full-column getKnowledge-equivalent query result:", JSON.stringify(fullRow));
+        } catch (e: any) {
+          console.log("[CI-DIAG3] full-column query THREW:", e?.message, e?.stack);
+        }
+        try {
+          const r1 = svc.knowledgeService.upsertKnowledge("agent-a", { about: "diag", dataSource: "auto" });
+          console.log("[CI-DIAG3] upsertKnowledge OK, result:", JSON.stringify(r1));
+        } catch (e: any) {
+          console.log("[CI-DIAG3] upsertKnowledge THREW:", e?.message, e?.stack);
+        }
+        try {
+          const tss = require("../services/trust-score-service");
+          const r2 = tss.trustScoreService.update("agent-a");
+          console.log("[CI-DIAG3] trustScoreService.update OK, result:", JSON.stringify(r2));
+        } catch (e: any) {
+          console.log("[CI-DIAG3] trustScoreService.update THREW:", e?.message, e?.stack);
+        }
+        try {
+          const r3 = svc.knowledgeService.getAgentInfo("agent-a");
+          console.log("[CI-DIAG3] getAgentInfo OK, result:", JSON.stringify(r3));
+        } catch (e: any) {
+          console.log("[CI-DIAG3] getAgentInfo THREW:", e?.message, e?.stack);
+        }
       }
 
       // ── (1) unauthenticated GET -> 403, no data leaked ──
