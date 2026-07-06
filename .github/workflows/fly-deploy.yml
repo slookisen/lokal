@@ -52,12 +52,44 @@ jobs:
         run: npx tsc --noEmit
 
       - name: Run tests
+        # QUARANTINE (2026-07-06, dev-request 2026-07-06-ci-quarantine-auth-suite):
+        # agent-knowledge-get-auth runs in its own job below
+        # (build-check-auth-isolated) instead of here — see tests/test.ts for
+        # why (proven CI-only false-negative from cross-test contamination in
+        # this shared process; root-cause tracked as P3 in
+        # dev-requests/2026-07-06-ci-untracked-timer-followup.md).
         run: npm test
+        env:
+          CI_SKIP_AGENT_KNOWLEDGE_AUTH: "1"
+
+  build-check-auth-isolated:
+    name: Type-check + tests (agent-knowledge-auth, isolated)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run agent-knowledge-get-auth in isolation
+        # Quarantined out of the shared build-check job (see comment there +
+        # tests/test.ts) because it is a proven false-negative when run
+        # concurrently with ~90 other test blocks in that process, but passes
+        # cleanly in a process of its own. Still required for deploy below —
+        # isolated, not weakened.
+        run: npx tsx src/routes/agent-knowledge-get-auth.test.ts
 
   deploy:
     name: Deploy to Fly.io
     runs-on: ubuntu-latest
-    needs: build-check
+    needs: [build-check, build-check-auth-isolated]
     # Only deploy on push to main / manual dispatch — PR runs only the gate.
     if: github.event_name != 'pull_request'
     concurrency:
