@@ -8465,27 +8465,8 @@ _pr56Promise.then(() => {
 let _orchPr20BmEventsResolve: () => void = () => {};
 const _orchPr20BmEventsPromise: Promise<void> = new Promise<void>(r => { _orchPr20BmEventsResolve = r; });
 
-// BISECT (debug/ci-bisect-2026-07-06, candidate 2/3): temporarily skip this
-// block's fire-and-forget scrape job entirely. Its runner (runBmEventsScraper
-// in bm-events-scraper.ts) calls the shared getDb() singleton fresh at
-// several separate points across await boundaries, and this block's own
-// promise (_orchPr20BmEventsPromise) is chained only off _pr94Promise/
-// _pr56Promise — NOT an ancestor of _agentKnowledgeGetAuthPromise's chain
-// (_homepageProvenanceEmailBackfillPromise → ...) — so it can run fully
-// concurrently with the auth suite's own getDb()/__setDbForTesting use,
-// uncoordinated. Skipping to test whether that's the untracked-timer/DB
-// corruption source. Revert this skip if CI stays RED with the same
-// 10-assertion signature (not the culprit); keep + build the real fix if CI
-// goes GREEN.
-const _BISECT_SKIP_BM_EVENTS_SCRAPE_JOB = true;
-
 _pr94Promise.then(async () => {
   console.log("\n── orch-pr-20: bm-events async scrape job ──");
-  if (_BISECT_SKIP_BM_EVENTS_SCRAPE_JOB) {
-    console.log("  bm-events-scrape-job: SKIPPED (bisect candidate-2 disable, debug/ci-bisect-2026-07-06)");
-    _orchPr20BmEventsResolve();
-    return;
-  }
   try {
     const { runBmEventsScrapeJobTests } = require("../src/services/bm-events-scrape-job.test") as
       typeof import("../src/services/bm-events-scrape-job.test");
@@ -21979,9 +21960,23 @@ const _tasksPruneAsyncDeps: Promise<unknown>[] = [
   _agentKnowledgeGetAuthPromise,
 ];
 
+// BISECT (debug/ci-bisect-2026-07-06, candidate 1/3): temporarily skip this
+// block entirely. It already depends on Promise.allSettled(_tasksPruneAsyncDeps)
+// (all ~35 tracked branches including _agentKnowledgeGetAuthPromise itself), so
+// on paper it can't start before the auth suite settles — but bisecting it
+// empirically per the mandate rather than assuming that's sufficient. Revert
+// this skip if CI stays RED with the same 10-assertion signature (not the
+// culprit); keep + build the real fix if CI goes GREEN.
+const _BISECT_SKIP_TASKS_PRUNE_ASYNC = true;
+
 Promise.allSettled(_tasksPruneAsyncDeps).then(async () => {
   console.log("\n── orch-pr-20260704: tasks-prune / vacuum async background jobs ──");
   const TAG = "tasks-prune-async";
+  if (_BISECT_SKIP_TASKS_PRUNE_ASYNC) {
+    console.log(`  ${TAG}: SKIPPED (bisect candidate-1 disable, debug/ci-bisect-2026-07-06)`);
+    _tasksPruneAsyncResolve();
+    return;
+  }
   try {
     const sqlite = require("better-sqlite3");
     const httpMod = await import("http");
