@@ -20885,6 +20885,14 @@ const _agentKnowledgeGetAuthDeps: Promise<unknown>[] = [
 ];
 
 Promise.allSettled(_agentKnowledgeGetAuthDeps).then(async () => {
+  // TEMP CI-DIAG (round 6): does a real-wall-clock buffer after every
+  // tracked dependency settles eliminate the corruption? If yes, some
+  // dependency resolves its OWN promise while an internal setTimeout/
+  // setInterval poll (e.g. the 2000ms safety-timeouts elsewhere in this
+  // file) is still ticking in the background, past this file's own
+  // Promise.allSettled tracking. Diagnostic only -- to be replaced with a
+  // proper fix once the exact straggler is identified, not shipped as-is.
+  await new Promise((r) => setTimeout(r, 3000));
   console.log("\n── agent-knowledge-get-auth: GET /agents/:id/knowledge auth gate ──");
   try {
     const { runAgentKnowledgeGetAuthTests } = require("../src/routes/agent-knowledge-get-auth.test") as
