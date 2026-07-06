@@ -2,79 +2,10 @@
  * agent-knowledge-get-auth.test.ts — tests the auth gate added 2026-07-05 to
  * GET /agents/:id/knowledge (dev-request secure-agent-knowledge-endpoint).
  *
- * Root cause: GET /agents/:id/knowledge had NO auth check and returned the
- * raw agent_knowledge row (including `email`, since lokal#143 backfilled
- * it) while its sibling PUT already required X-Admin-Key/X-Claim-Token/
- * X-API-Key. Consumer audit (grepped the repo for HTTP callers of this
- * exact GET route) found: (a) the seller dashboard (selger.html) never
- * calls this route unauthenticated — only PUT with X-Claim-Token; (b) the
- * one caller doing an unauthenticated GET was the scheduled
- * lokal-agent-enrichment SKILL script, which already holds ADMIN_KEY for
- * its sibling PUT calls in the same doc and was simply omitting the header
- * on the GET (now fixed in that doc too). No legitimate caller needs this
- * route to stay open, so the remedy is auth-gating (preference (a) in the
- * spec), mirroring PUT /agents/:id/knowledge exactly.
- *
- * Mirrors homepage-provenance-email-backfill.test.ts:
- *   - in-memory better-sqlite3 DB injected via __setDbForTesting +
- *     __initSchemaForTesting (full prod-like schema).
- *   - the previous global db handle is saved/restored.
- *   - the router is exercised directly (router.handle(req, res, next)),
- *     no HTTP server / supertest.
- *   - exported runAgentKnowledgeGetAuthTests({log}) -> TestSummary; wired
- *     into tests/test.ts.
- *     Standalone: npx tsx src/routes/agent-knowledge-get-auth.test.ts
- *
- * 2026-07-05 CI fix (10 auth-path assertions failing on GH Actions, passing
- * locally): even though this block is chained off
- * _homepageProvenanceEmailBackfillPromise (serializing it against every
- * OTHER chain-coordinated block that also swaps the shared getDb()
- * singleton), tests/test.ts's `orch-pr-20260704: tasks-prune-async` block
- * (near the end of the file) is a bare fire-and-forget top-level IIFE that
- * is NOT part of that coordination chain at all — by its own comment it
- * relies on finishing "well before process.exit" rather than being awaited.
- * It repeatedly calls initMod.__setDbForTesting(tpaDb) inside its req()
- * retry loop while doing REAL async I/O (HTTP round trips, job polling via
- * setTimeout/setImmediate), so its execution window's timing depends on
- * real wall-clock scheduling that differs between a local machine and a
- * GitHub Actions runner. Reproduced by timestamping every
- * __setDbForTesting call across both blocks: locally tasks-prune-async
- * reliably finishes ~7s before this block starts (comfortable margin), but
- * nothing GUARANTEES that margin — on a slower/loaded CI runner it can
- * shrink to zero, in which case this block's ENTIRE run (all 21
- * assertions) executes while the global db is pinned to tpaDb (which has
- * no agent-a/agent-b), producing exactly the observed 404/403/undefined
- * results for the authenticated-path assertions (matches the CI failure
- * log) while auth-only checks (which don't depend on the DB row existing)
- * still passed.
- *
- * Fix: callRoute() re-pins initMod.__setDbForTesting(db) synchronously,
- * immediately before every router.handle() call (mirroring the identical
- * defensive re-pin-before-every-request pattern tasks-prune-async's own
- * req() helper already uses for this exact class of hazard). Since
- * router.handle() for this route is fully synchronous end-to-end (no
- * await between the re-pin and res.json()/res.end()), nothing else in the
- * single-threaded event loop can interleave a competing
- * __setDbForTesting() call between the re-pin and the route reading the
- * db — this holds regardless of what any other suite does concurrently,
- * so it isn't just a smaller chance of the same race.
- *
- * Covers:
- *   (1) unauthenticated GET -> 403, no data leaked at all (not even a
- *       redacted/partial body — this route is now fully auth-gated).
- *   (2) wrong X-Admin-Key -> 403.
- *   (3) valid X-Admin-Key -> 200, full payload including raw email/phone
- *       (unchanged from pre-fix shape for authorized callers).
- *   (4) valid X-Claim-Token for THIS agent -> 200, full payload.
- *   (5) valid X-Claim-Token for a DIFFERENT agent -> 403 (token/agent
- *       mismatch must still be enforced, not just "any token").
- *   (6) valid X-API-Key for THIS agent -> 200, full payload.
- *   (7) unknown agent id with a valid admin key -> 404 (unchanged 404
- *       behavior, auth check happens before the lookup so a stray agent-id
- *       guess doesn't get a different status without a key).
- *   (8) sibling PUT /agents/:id/knowledge behavior is unchanged (still
- *       enforces its own pre-existing auth the same way) — regression
- *       guard so this change didn't accidentally touch the PUT handler.
+ * DEBUG INSTRUMENTATION (2026-07-06, throwaway diagnostic branch, dev-request
+ * ci-test-harness-gh-actions-only-failure): dumps DB identity + row counts +
+ * env right before the failing assertions, per the dev-request's "instrument,
+ * don't guess" directive. Remove before merge — this branch is diagnosis-only.
  */
 
 import Database from "better-sqlite3";
@@ -103,12 +34,6 @@ function callRoute(
   rePin?: () => void,
 ): Promise<RouteResult> {
   return new Promise((resolve) => {
-    // Re-pin the global db/env singletons synchronously, right here, right
-    // before building the request — see the "2026-07-05 CI fix" note atop
-    // this file. Nothing can interleave between this call and
-    // router.handle() below (no await in between), so this closes the
-    // cross-suite race regardless of what any other unchained test block
-    // does concurrently.
     if (rePin) rePin();
     const headers = opts.headers || {};
     const req: any = {
@@ -187,7 +112,22 @@ export function runAgentKnowledgeGetAuthTests(
     process.env.ADMIN_KEY = testAdminKey;
     delete process.env.ANALYTICS_ADMIN_KEY;
 
+    // ── DEBUG (2026-07-06) — env + better-sqlite3 diagnostics, once ──
+    console.log(
+      `[DEBUG-CI] CI=${process.env.CI} NODE_ENV=${process.env.NODE_ENV} ` +
+      `platform=${process.platform} node=${process.version}`,
+    );
+    try {
+      const bsq = require("better-sqlite3/package.json");
+      console.log(`[DEBUG-CI] better-sqlite3 version=${bsq.version}`);
+    } catch (e) {
+      console.log(`[DEBUG-CI] better-sqlite3 version lookup failed: ${e}`);
+    }
+
     const db = new Database(":memory:");
+    (db as any).__debugTag = `debug-db-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+    console.log(`[DEBUG-CI] created test db tag=${(db as any).__debugTag}`);
+
     try {
       initMod.__setDbForTesting(db as any);
       initMod.__initSchemaForTesting(db as any);
@@ -207,6 +147,14 @@ export function runAgentKnowledgeGetAuthTests(
       insertKnowledge.run("agent-a", "https://garda.no", "post@garda.no", "+4791234567", "Gardsveien 1", "1234");
       insertKnowledge.run("agent-b", "https://gardb.no", "post@gardb.no", "+4799887766", "Gardsveien 2", "5678");
 
+      // ── DEBUG — confirm the seed actually landed on THIS db object ──
+      const seedCount = (db.prepare("SELECT COUNT(*) c FROM agent_knowledge").get() as any).c;
+      const seedAgentCount = (db.prepare("SELECT COUNT(*) c FROM agents").get() as any).c;
+      console.log(
+        `[DEBUG-CI] tag=${(db as any).__debugTag} post-seed agent_knowledge.count=${seedCount} agents.count=${seedAgentCount} ` +
+        `getDb()===db? ${initMod.getDb() === db}`,
+      );
+
       // ── Seed a verified claim for agent-a ──
       db.prepare(
         `INSERT INTO agent_claims (id, agent_id, claimant_name, claimant_email, status, claim_token, claim_token_expires_at)
@@ -219,9 +167,6 @@ export function runAgentKnowledgeGetAuthTests(
       const marketplaceMod = require("./marketplace");
       const router = marketplaceMod.default;
 
-      // Re-pin both globals this suite depends on (db + ADMIN_KEY) right
-      // before every single route call below — see the "2026-07-05 CI fix"
-      // note atop this file.
       const rePin = () => {
         initMod.__setDbForTesting(db as any);
         process.env.ADMIN_KEY = testAdminKey;
@@ -254,11 +199,27 @@ export function runAgentKnowledgeGetAuthTests(
 
       // ── (3) valid X-Admin-Key -> 200, full payload unchanged ──
       {
+        // ── DEBUG — right before the historically-failing call ──
+        const preCount = (db.prepare("SELECT COUNT(*) c FROM agent_knowledge WHERE agent_id='agent-a'").get() as any).c;
+        const liveDb = initMod.getDb();
+        console.log(
+          `[DEBUG-CI] tag=${(db as any).__debugTag} pre-call(3) agent-a row present=${preCount} ` +
+          `getDb()===testDb? ${liveDb === db} ADMIN_KEY=${process.env.ADMIN_KEY === testAdminKey ? "match" : process.env.ADMIN_KEY}`,
+        );
+
         const r = await callRoute(router, {
           method: "GET",
           url: "/agents/agent-a/knowledge",
           headers: { "x-admin-key": testAdminKey },
         }, rePin);
+
+        // ── DEBUG — right after, re-check identity/state ──
+        const postDb = initMod.getDb();
+        console.log(
+          `[DEBUG-CI] tag=${(db as any).__debugTag} post-call(3) status=${r.status} getDb()===testDb? ${postDb === db} ` +
+          `body=${JSON.stringify(r.body)}`,
+        );
+
         assertEq(r.status, 200, "GET with valid X-Admin-Key -> 200");
         assertEq(r.body?.success, true, "authenticated GET -> success:true");
         assertEq(r.body?.data?.email, "post@garda.no", "authenticated GET (admin key) returns full email");
