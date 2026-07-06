@@ -20882,23 +20882,7 @@ const _oaHomeCountersPromise: Promise<void> = new Promise<void>(r => {
   _oaHomeCountersResolve = r;
 });
 
-_agentKnowledgeGetAuthPromise.then(async () => {
-  console.log("\n── oa-home-counters: OA homepage counter strip (catalog counts + host-scoped traffic) ──");
-  try {
-    const { runOaHomeCountersTests } = require("../src/services/oa-home-counters.test") as
-      typeof import("../src/services/oa-home-counters.test");
-    const jr = await runOaHomeCountersTests({ log: false });
-    passed += jr.passed;
-    failed += jr.failed;
-    for (const f of jr.failures) failures.push("oa-home-counters: " + f);
-    console.log(`  oa-home-counters: ${jr.passed} passed, ${jr.failed} failed`);
-  } catch (err: any) {
-    failed++;
-    failures.push("oa-home-counters: unexpected error: " + String(err?.message || err));
-  } finally {
-    _oaHomeCountersResolve();
-  }
-});
+// (trigger moved below _tasksPruneAsyncDeps -- see _oaHomeCountersDeps, added 2026-07-06 fix-up: chaining off a single upstream promise was insufficient, matching tasks-prune-async's own documented postmortem)
 
 
 // ── site-quality (opplevagent-site-quality loop, 2026-06-22) ──────────────────
@@ -21987,6 +21971,73 @@ const _tasksPruneAsyncPromise: Promise<void> = new Promise<void>(r => {
 // as every other entry above — see its own chaining comment for why it now
 // hangs off _agentKnowledgeGetAuthPromise instead of
 // _homepageProvenanceEmailBackfillPromise directly.
+
+// oa-home-counters depends on the FULL branch set (same list tasks-prune-async
+// uses, minus itself) -- chaining off _agentKnowledgeGetAuthPromise alone was
+// insufficient (missed _orchPr20260614_2/_5/_6Promise, which also swap the
+// shared getDb() singleton via db-factory's initMod), per the exact failure
+// mode this file's own tasks-prune-async postmortem documents two attempts
+// above. Fixed 2026-07-06 (independent-review finding on PR #152).
+const _oaHomeCountersDeps: Promise<unknown>[] = [
+  _serialChain,
+  Promise.all(_pr21Promises),
+  _m2Promise,
+  _pr24Promise,
+  _pr56Promise,
+  _pr63Promise,
+  _pr65Promise,
+  _pr66Promise,
+  _pr67Promise,
+  _pr68Promise,
+  _pr74Promise,
+  _pr75Promise,
+  _pr76Promise,
+  _pr78Promise,
+  _orchPr86Promise,
+  _orchPr93Promise,
+  _pr94Promise,
+  _pr95Promise,
+  _pr103Promise,
+  _pr106Promise,
+  _pr110Promise,
+  _pr125Promise,
+  _seoDentalPromise,
+  _platformVerifierPromise,
+  _orchPr20260614_2Promise,
+  _orchPr20260614Promise,
+  _orchPr20260614_5Promise,
+  _orchPr20260614_6Promise,
+  _orchPr14ProductIdPromise,
+  _orchPr9PruneDeadUrlsPromise,
+  _orchPr18BulkLoadPromise,
+  _orchPr12SweepPromise,
+  _brregVerifySlice1Promise,
+  _orchPr20BmEventsPromise,
+  _orchPr21SentLogActorPromise,
+  _adminDbTableSizesPromise,
+  _contactClickTrackingPromise,
+  _homepageProvenanceEmailBackfillPromise,
+  _agentKnowledgeGetAuthPromise,
+];
+
+Promise.allSettled(_oaHomeCountersDeps).then(async () => {
+  console.log("\n── oa-home-counters: OA homepage counter strip (catalog counts + host-scoped traffic) ──");
+  try {
+    const { runOaHomeCountersTests } = require("../src/services/oa-home-counters.test") as
+      typeof import("../src/services/oa-home-counters.test");
+    const jr = await runOaHomeCountersTests({ log: false });
+    passed += jr.passed;
+    failed += jr.failed;
+    for (const f of jr.failures) failures.push("oa-home-counters: " + f);
+    console.log(`  oa-home-counters: ${jr.passed} passed, ${jr.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("oa-home-counters: unexpected error: " + String(err?.message || err));
+  } finally {
+    _oaHomeCountersResolve();
+  }
+});
+
 const _tasksPruneAsyncDeps: Promise<unknown>[] = [
   _serialChain,
   Promise.all(_pr21Promises),
