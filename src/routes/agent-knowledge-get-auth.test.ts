@@ -207,6 +207,11 @@ export function runAgentKnowledgeGetAuthTests(
       insertKnowledge.run("agent-a", "https://garda.no", "post@garda.no", "+4791234567", "Gardsveien 1", "1234");
       insertKnowledge.run("agent-b", "https://gardb.no", "post@gardb.no", "+4799887766", "Gardsveien 2", "5678");
 
+      // TEMP CI-DIAG: confirm the row is visible on THIS db object immediately post-insert.
+      console.log("[CI-DIAG2] agent_knowledge rows right after insert:", JSON.stringify(db.prepare("SELECT agent_id, email, phone FROM agent_knowledge").all()));
+      console.log("[CI-DIAG2] agents rows right after insert:", JSON.stringify(db.prepare("SELECT id, name, api_key FROM agents").all()));
+      console.log("[CI-DIAG2] sqlite3 lib version:", db.prepare("SELECT sqlite_version() v").get());
+
       // ── Seed a verified claim for agent-a ──
       db.prepare(
         `INSERT INTO agent_claims (id, agent_id, claimant_name, claimant_email, status, claim_token, claim_token_expires_at)
@@ -256,6 +261,14 @@ export function runAgentKnowledgeGetAuthTests(
           headers: { "x-admin-key": testAdminKey },
         }, rePin);
         console.log("[CI-DIAG] rDirect =", JSON.stringify(rDirect));
+        console.log("[CI-DIAG2] agent_knowledge rows right before PUT probe:", JSON.stringify(db.prepare("SELECT agent_id, email FROM agent_knowledge").all()));
+        const rPut = await callRoute(router, {
+          method: "PUT",
+          url: "/agents/agent-a/knowledge",
+          headers: { "x-admin-key": testAdminKey },
+          body: { about: "diag probe" },
+        }, rePin);
+        console.log("[CI-DIAG2] rPut (should reveal the real exception) =", JSON.stringify(rPut));
       }
 
       // ── (1) unauthenticated GET -> 403, no data leaked ──
