@@ -59,6 +59,25 @@
  * db — this holds regardless of what any other suite does concurrently,
  * so it isn't just a smaller chance of the same race.
  *
+ * 2026-07-06 CI fix (interim mitigation, Daniel-approved Option B —
+ * `dev-requests/2026-07-06-ci-test-harness-gh-actions-only-failure.md`):
+ * the re-pin above did not fully close the CI-only failure (4 further fix
+ * attempts — dependency-graph widening, a real-time safety buffer, and
+ * others — all empirically failed; see
+ * `protocols/orchestrator-failures/2026-07-06-ci-test-harness-4th-attempt-failed.md`).
+ * The actual interfering write is still unidentified (suspected untracked
+ * timer, tracked separately as `dev-requests/2026-07-06-ci-untracked-timer-followup.md`).
+ * As a pragmatic, low-risk, reversible mitigation independent of whatever
+ * that interference turns out to be: every fixture id/token in this file
+ * is now generated fresh per test run (`agent-test-<uuid>` etc.) instead of
+ * the fixed literals `agent-a`/`agent-b`. Fixed literals meant any other
+ * test file (or a leftover/duplicate row from a prior run against a
+ * reused db) that happens to reference the same literal id could read or
+ * overwrite this suite's rows; globally-unique ids make that class of
+ * collision structurally impossible, regardless of root cause. This does
+ * NOT replace the root-cause investigation — it only removes fixture-id
+ * collision as a contributing factor.
+ *
  * Covers:
  *   (1) unauthenticated GET -> 403, no data leaked at all (not even a
  *       redacted/partial body — this route is now fully auth-gated).
@@ -78,6 +97,7 @@
  */
 
 import Database from "better-sqlite3";
+import { randomUUID } from "crypto";
 import * as initMod from "../database/init";
 
 export interface TestSummary {
@@ -187,6 +207,19 @@ export function runAgentKnowledgeGetAuthTests(
     process.env.ADMIN_KEY = testAdminKey;
     delete process.env.ANALYTICS_ADMIN_KEY;
 
+    // Globally-unique per-run fixture ids/tokens (2026-07-06 CI fix, see file
+    // header) — nothing else in the suite can collide with these, even if a
+    // stray write from an untracked timer or a leftover row from another run
+    // lands in whatever db object happens to be pinned.
+    const runId = randomUUID();
+    const agentA = `agent-test-a-${runId}`;
+    const agentB = `agent-test-b-${runId}`;
+    const apiKeyA = `api-key-test-a-${runId}`;
+    const apiKeyB = `api-key-test-b-${runId}`;
+    const claimId = `claim-test-a-${runId}`;
+    const claimToken = `claim-token-test-a-${runId}`;
+    const unknownAgentId = `agent-test-does-not-exist-${runId}`;
+
     const db = new Database(":memory:");
     try {
       initMod.__setDbForTesting(db as any);
@@ -197,22 +230,22 @@ export function runAgentKnowledgeGetAuthTests(
         `INSERT INTO agents (id, name, description, provider, contact_email, url, role, api_key)
          VALUES (?, ?, 'test agent', 'test', 'x@example.com', ?, 'producer', ?)`,
       );
-      insertAgent.run("agent-a", "Gard A AS", "https://garda.no", "api-key-a");
-      insertAgent.run("agent-b", "Gard B AS", "https://gardb.no", "api-key-b");
+      insertAgent.run(agentA, "Gard A AS", "https://garda.no", apiKeyA);
+      insertAgent.run(agentB, "Gard B AS", "https://gardb.no", apiKeyB);
 
       const insertKnowledge = db.prepare(
         `INSERT INTO agent_knowledge (agent_id, website, email, phone, address, postal_code, about, field_provenance)
          VALUES (?, ?, ?, ?, ?, ?, 'A test farm shop', '{}')`,
       );
-      insertKnowledge.run("agent-a", "https://garda.no", "post@garda.no", "+4791234567", "Gardsveien 1", "1234");
-      insertKnowledge.run("agent-b", "https://gardb.no", "post@gardb.no", "+4799887766", "Gardsveien 2", "5678");
+      insertKnowledge.run(agentA, "https://garda.no", "post@garda.no", "+4791234567", "Gardsveien 1", "1234");
+      insertKnowledge.run(agentB, "https://gardb.no", "post@gardb.no", "+4799887766", "Gardsveien 2", "5678");
 
-      // ── Seed a verified claim for agent-a ──
+      // ── Seed a verified claim for agentA ──
       db.prepare(
         `INSERT INTO agent_claims (id, agent_id, claimant_name, claimant_email, status, claim_token, claim_token_expires_at)
-         VALUES ('claim-a', 'agent-a', 'Eier A', 'eier-a@example.com', 'verified', 'claim-token-a',
+         VALUES (?, ?, 'Eier A', 'eier-a@example.com', 'verified', ?,
                  datetime('now', '+30 days'))`,
-      ).run();
+      ).run(claimId, agentA, claimToken);
 
       // Fresh require so the router picks up the just-injected db.
       delete require.cache[require.resolve("./marketplace")];
@@ -230,7 +263,7 @@ export function runAgentKnowledgeGetAuthTests(
 
       // ── (1) unauthenticated GET -> 403, no data leaked ──
       {
-        const r = await callRoute(router, { method: "GET", url: "/agents/agent-a/knowledge" }, rePin);
+        const r = await callRoute(router, { method: "GET", url: `/agents/${agentA}/knowledge` }, rePin);
         assertEq(r.status, 403, "unauthenticated GET /agents/:id/knowledge -> 403");
         assertEq(r.body?.success, false, "unauthenticated GET -> success:false");
         assertTrue(
@@ -246,7 +279,7 @@ export function runAgentKnowledgeGetAuthTests(
       {
         const r = await callRoute(router, {
           method: "GET",
-          url: "/agents/agent-a/knowledge",
+          url: `/agents/${agentA}/knowledge`,
           headers: { "x-admin-key": "totally-wrong-key" },
         }, rePin);
         assertEq(r.status, 403, "GET with wrong X-Admin-Key -> 403");
@@ -256,7 +289,7 @@ export function runAgentKnowledgeGetAuthTests(
       {
         const r = await callRoute(router, {
           method: "GET",
-          url: "/agents/agent-a/knowledge",
+          url: `/agents/${agentA}/knowledge`,
           headers: { "x-admin-key": testAdminKey },
         }, rePin);
         assertEq(r.status, 200, "GET with valid X-Admin-Key -> 200");
@@ -270,8 +303,8 @@ export function runAgentKnowledgeGetAuthTests(
       {
         const r = await callRoute(router, {
           method: "GET",
-          url: "/agents/agent-a/knowledge",
-          headers: { "x-claim-token": "claim-token-a" },
+          url: `/agents/${agentA}/knowledge`,
+          headers: { "x-claim-token": claimToken },
         }, rePin);
         assertEq(r.status, 200, "GET with valid X-Claim-Token (own agent) -> 200");
         assertEq(r.body?.data?.email, "post@garda.no", "authenticated GET (claim token) returns full email");
@@ -281,8 +314,8 @@ export function runAgentKnowledgeGetAuthTests(
       {
         const r = await callRoute(router, {
           method: "GET",
-          url: "/agents/agent-b/knowledge",
-          headers: { "x-claim-token": "claim-token-a" },
+          url: `/agents/${agentB}/knowledge`,
+          headers: { "x-claim-token": claimToken },
         }, rePin);
         assertEq(r.status, 403, "GET with claim token belonging to a different agent -> 403 (not just any valid token)");
       }
@@ -291,8 +324,8 @@ export function runAgentKnowledgeGetAuthTests(
       {
         const r = await callRoute(router, {
           method: "GET",
-          url: "/agents/agent-b/knowledge",
-          headers: { "x-api-key": "api-key-b" },
+          url: `/agents/${agentB}/knowledge`,
+          headers: { "x-api-key": apiKeyB },
         }, rePin);
         assertEq(r.status, 200, "GET with valid X-API-Key (own agent) -> 200");
         assertEq(r.body?.data?.email, "post@gardb.no", "authenticated GET (api key) returns full email");
@@ -302,8 +335,8 @@ export function runAgentKnowledgeGetAuthTests(
       {
         const r = await callRoute(router, {
           method: "GET",
-          url: "/agents/agent-a/knowledge",
-          headers: { "x-api-key": "api-key-b" },
+          url: `/agents/${agentA}/knowledge`,
+          headers: { "x-api-key": apiKeyB },
         }, rePin);
         assertEq(r.status, 403, "GET with API key belonging to a different agent -> 403");
       }
@@ -312,7 +345,7 @@ export function runAgentKnowledgeGetAuthTests(
       {
         const r = await callRoute(router, {
           method: "GET",
-          url: "/agents/does-not-exist/knowledge",
+          url: `/agents/${unknownAgentId}/knowledge`,
           headers: { "x-admin-key": testAdminKey },
         }, rePin);
         assertEq(r.status, 404, "authenticated GET for unknown agent id -> 404");
@@ -322,7 +355,7 @@ export function runAgentKnowledgeGetAuthTests(
       {
         const r = await callRoute(router, {
           method: "GET",
-          url: "/agents/does-not-exist/knowledge",
+          url: `/agents/${unknownAgentId}/knowledge`,
         }, rePin);
         assertEq(r.status, 403, "unauthenticated GET for unknown agent id still -> 403 (auth precedes existence check)");
       }
@@ -331,14 +364,14 @@ export function runAgentKnowledgeGetAuthTests(
       {
         const rNoAuth = await callRoute(router, {
           method: "PUT",
-          url: "/agents/agent-a/knowledge",
+          url: `/agents/${agentA}/knowledge`,
           body: { about: "should not apply" },
         }, rePin);
         assertEq(rNoAuth.status, 403, "PUT /agents/:id/knowledge without auth still -> 403 (regression guard, untouched by this fix)");
 
         const rAuth = await callRoute(router, {
           method: "PUT",
-          url: "/agents/agent-a/knowledge",
+          url: `/agents/${agentA}/knowledge`,
           headers: { "x-admin-key": testAdminKey },
           body: { about: "Updated via admin" },
         }, rePin);
