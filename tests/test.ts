@@ -7,6 +7,7 @@ import { redactPII, isValidFodselsnummer } from "../src/utils/pii-redact";
 import { computeLoopHealth } from "../src/services/loop-health";
 import { computeWakeList } from "../src/services/loop-dispatch";
 import { normalizeTimestamp, normalizeEnvelopeTimes } from "../src/services/envelope-normalize";
+import { validateEnvelope } from "../src/routes/admin-runs";
 
 let passed = 0;
 let failed = 0;
@@ -17719,6 +17720,73 @@ const _orchPr20260614_2Promise = (async () => {
   sweepDb4.close();
 })();
 
+// ── relax-run-envelope-schema: validateEnvelope() only requires run_id/agent/
+// status/claims (dev-request 2026-07-01-loop-reliability-backend item 2).
+// vertical / trigger_source / evidence are auto-defaulted server-side when
+// absent; started_at/finished_at are intentionally left untouched here (see
+// src/routes/admin-runs.ts validateEnvelope() doc-comment — normalizeEnvelopeTimes()
+// handles those separately, right after validation, in the POST handler).
+//
+// This is a pure, synchronous unit test of the exported validateEnvelope()
+// function directly — no HTTP, no DB, no __setDbForTesting, no global
+// singleton, no async ordering concern. It cannot participate in the
+// DB-singleton race that has plagued other blocks in this file because it
+// never touches the DB (or Express, or the router) at all.
+{
+  // ── Minimal envelope: only the 4 truly-required fields ──
+  const v1 = validateEnvelope({ run_id: "x", agent: "a", status: "completed", claims: [] });
+  assertTrue(v1.ok === true, "relax-envelope: minimal 4-field object is ok");
+  if (v1.ok) {
+    assertEq(v1.envelope.vertical, "rfb", "relax-envelope: absent vertical defaults to 'rfb'");
+    assertEq(v1.envelope.trigger_source, "manual", "relax-envelope: absent trigger_source defaults to 'manual'");
+    assertTrue(Array.isArray(v1.envelope.evidence) && v1.envelope.evidence.length === 0, "relax-envelope: absent evidence defaults to []");
+  }
+
+  // ── Required fields are still enforced (each checked individually) ──
+  const v2 = validateEnvelope({ agent: "a", status: "completed", claims: [] });
+  assertTrue(v2.ok === false, "relax-envelope: missing run_id is rejected");
+
+  const v3 = validateEnvelope({ run_id: "x", status: "completed", claims: [] });
+  assertTrue(v3.ok === false, "relax-envelope: missing agent is rejected");
+
+  const v4 = validateEnvelope({ run_id: "x", agent: "a", claims: [] });
+  assertTrue(v4.ok === false, "relax-envelope: missing status is rejected");
+
+  const v5 = validateEnvelope({ run_id: "x", agent: "a", status: "completed" });
+  assertTrue(v5.ok === false, "relax-envelope: missing claims is rejected");
+
+  // ── Enum check still fires on an explicit bad value even though the field has a default ──
+  const v6 = validateEnvelope({ run_id: "x", agent: "a", status: "completed", claims: [], trigger_source: "bogus" });
+  assertTrue(v6.ok === false, "relax-envelope: explicit invalid trigger_source is rejected");
+
+  // ── Full 9-field object (pre-existing contract) — completely unaffected: every
+  // explicit field on .envelope must equal exactly what was passed in ──
+  const full = {
+    run_id: "run-relax-full-001",
+    vertical: "rfb",
+    agent: "test-agent",
+    trigger_source: "cron",
+    started_at: "2026-07-01T00:00:00Z",
+    finished_at: "2026-07-01T00:05:00Z",
+    status: "completed",
+    claims: [{ type: "commit", value: "x" }],
+    evidence: [{ claim_idx: 0, url: "x" }],
+  };
+  const v7 = validateEnvelope(full);
+  assertTrue(v7.ok === true, "relax-envelope: full 9-field object is ok");
+  if (v7.ok) {
+    assertEq(v7.envelope.run_id, full.run_id, "relax-envelope: full object run_id unaffected");
+    assertEq(v7.envelope.vertical, full.vertical, "relax-envelope: full object explicit vertical unaffected");
+    assertEq(v7.envelope.agent, full.agent, "relax-envelope: full object agent unaffected");
+    assertEq(v7.envelope.trigger_source, full.trigger_source, "relax-envelope: full object explicit trigger_source unaffected");
+    assertEq(v7.envelope.started_at, full.started_at, "relax-envelope: full object explicit started_at preserved");
+    assertEq(v7.envelope.finished_at, full.finished_at, "relax-envelope: full object explicit finished_at preserved");
+    assertEq(v7.envelope.status, full.status, "relax-envelope: full object status unaffected");
+    assertEq(JSON.stringify(v7.envelope.claims), JSON.stringify(full.claims), "relax-envelope: full object explicit claims unaffected");
+    assertEq(JSON.stringify(v7.envelope.evidence), JSON.stringify(full.evidence), "relax-envelope: full object explicit evidence unaffected (not overwritten with default [])");
+  }
+}
+
 // ── REPORT ────────────────────────────────────────────────────────────
 
 // -- P1 loop-heartbeat (computeLoopHealth, pure) --
@@ -19384,6 +19452,7 @@ console.log("\n── orch-pr-14: MCP discovery product_id surfacing ──");
   try { await _oaHomeCountersPromise; } catch { /* errors already pushed to failures */ }
   try { await _tasksPruneAsyncPromise; } catch { /* errors already pushed to failures */ }
   try { await _rfbDebioSuitePromise; } catch { /* errors already pushed to failures */ }
+  // relax-envelope tests are synchronous (pure validateEnvelope() unit test) — no promise needed
   // PR-109 tests are synchronous (IIFE) — no promise needed
   // Drop pre-existing intg failures (unmasked by awaiting) — they predate M2
   // and live behind a separate fix-it task. Counting them here would surface

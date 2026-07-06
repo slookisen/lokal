@@ -55,26 +55,33 @@ function requireAdmin(req: Request, res: Response): boolean {
 // Not a full schema check — that's TypeScript's job at compile time.
 // This catches obviously-broken POSTs from agents that drift from the
 // contract. Keep it forgiving on unknown extra fields (forward-compat).
-function validateEnvelope(body: unknown): { ok: true; envelope: RunEnvelope } | { ok: false; reason: string } {
+//
+// Dev-request 2026-07-01-loop-reliability-backend item 2: only run_id,
+// agent, status, claims are truly required. vertical / trigger_source /
+// evidence are auto-defaulted server-side when absent (single-vertical
+// reality today — see RunEnvelope.vertical doc-comment — and most agents
+// omit evidence for claims that don't need it). started_at / finished_at
+// are intentionally NOT defaulted here: normalizeEnvelopeTimes() (called
+// right after validation in the POST handler) already treats a missing
+// value as unparseable and clamps it to ingest-time.
+export function validateEnvelope(body: unknown): { ok: true; envelope: RunEnvelope } | { ok: false; reason: string } {
   if (!body || typeof body !== "object") {
     return { ok: false, reason: "body must be an object" };
   }
   const e = body as Record<string, unknown>;
-  const required = [
-    "run_id",
-    "vertical",
-    "agent",
-    "trigger_source",
-    "started_at",
-    "finished_at",
-    "status",
-    "claims",
-    "evidence",
-  ];
+  const required = ["run_id", "agent", "status", "claims"];
   for (const k of required) {
     if (e[k] === undefined) return { ok: false, reason: `missing field: ${k}` };
   }
   if (!Array.isArray(e.claims)) return { ok: false, reason: "claims must be array" };
+
+  // Defaults for optional fields, applied BEFORE the enum checks below so an
+  // explicit invalid value (e.g. trigger_source="bogus") is still rejected,
+  // while an absent value falls through to a valid default.
+  if (e.vertical === undefined) e.vertical = "rfb";
+  if (e.trigger_source === undefined) e.trigger_source = "manual";
+  if (e.evidence === undefined) e.evidence = [];
+
   if (!Array.isArray(e.evidence)) return { ok: false, reason: "evidence must be array" };
   const validTrigger = ["cron", "webhook", "signal", "manual"];
   if (!validTrigger.includes(e.trigger_source as string)) {
