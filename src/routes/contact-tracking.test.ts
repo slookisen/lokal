@@ -28,8 +28,10 @@
  *   (g) POST kind containing a URL-like payload -> 400 (never accepted,
  *       proves the beacon can't be used to stuff arbitrary strings in as
  *       "kind" beyond the closed enum)
- *   (h) GET /ut/:agentId/website -> 302 to the agent's stored website,
- *       AND a contact_clicks row is recorded for the click
+ *   (h) GET /ut/:agentId/website -> 302 to the agent's stored website with
+ *       the same default UTM params the profile page used to attach
+ *       directly (slice 2, 2026-07-06 — see resolveRedirectUrl's addUtmParams
+ *       call), AND a contact_clicks row is recorded for the click
  *   (i) GET /ut/:agentId/external:facebook -> 302 to the matching
  *       external_links entry
  *   (j) GET /ut/:agentId/external:instagram (no such link stored) -> 404,
@@ -181,6 +183,15 @@ export function runContactTrackingTests(opts: { log?: boolean } = {}): Promise<T
         `INSERT INTO agent_knowledge (agent_id, website) VALUES (?, ?)`,
       ).run("agent-3", "javascript:alert(1)");
 
+      // agent-4: stored website already carries the producer's OWN
+      // utm_source (e.g. they run their own campaign tracking) — the
+      // addUtmParams "don't squat" rule (slice 2, 2026-07-06) must leave
+      // it completely alone.
+      insertAgent.run("agent-4", "Test Gård 4 (own UTM tags)", "key-4");
+      db.prepare(
+        `INSERT INTO agent_knowledge (agent_id, website) VALUES (?, ?)`,
+      ).run("agent-4", "https://own-tracking.example/?utm_source=nyhetsbrev");
+
       // Fresh require for a clean handler binding.
       delete require.cache[require.resolve("./contact-tracking")];
       const mod = require("./contact-tracking");
@@ -293,8 +304,8 @@ export function runContactTrackingTests(opts: { log?: boolean } = {}): Promise<T
       assertEq(websiteRedirect.status, 302, "get-website: 302 redirect");
       assertEq(
         websiteRedirect.redirectedTo,
-        "https://example-farm.no",
-        "get-website: redirects to the agent's own stored website (agent_knowledge.website)",
+        "https://example-farm.no/?utm_source=rettfrabonden&utm_medium=referral&utm_campaign=producer_profile",
+        "get-website: redirects to the agent's own stored website (agent_knowledge.website), UTM-tagged same as the old direct link",
       );
       assertEq(
         clickCount("agent-1", "website"),
@@ -349,8 +360,8 @@ export function runContactTrackingTests(opts: { log?: boolean } = {}): Promise<T
       assertEq(withEvilQuery.status, 302, "open-redirect-guard: still 302s");
       assertEq(
         withEvilQuery.redirectedTo,
-        "https://example-farm.no",
-        "open-redirect-guard: query string is completely ignored — target is still the agent's own stored website",
+        "https://example-farm.no/?utm_source=rettfrabonden&utm_medium=referral&utm_campaign=producer_profile",
+        "open-redirect-guard: query string is completely ignored — target is still the agent's own stored website (UTM-tagged)",
       );
 
       // ── (n) OPEN-REDIRECT GUARD: malformed stored website rejected ─
@@ -365,6 +376,19 @@ export function runContactTrackingTests(opts: { log?: boolean } = {}): Promise<T
         "open-redirect-guard: a non-http(s) stored website ('javascript:...') is rejected, not redirected",
       );
       assertTrue(!malformedWebsite.redirectedTo, "open-redirect-guard: no redirect issued for malformed stored URL");
+
+      // ── (o) UTM "don't squat": producer's own utm_source is preserved ──
+      const ownUtmRedirect = await callRoute(redirectRouter, {
+        method: "GET",
+        url: "/agent-4/website",
+        headers: { "user-agent": BROWSER_UA },
+      });
+      assertEq(ownUtmRedirect.status, 302, "own-utm: still 302s");
+      assertEq(
+        ownUtmRedirect.redirectedTo,
+        "https://own-tracking.example/?utm_source=nyhetsbrev",
+        "own-utm: producer's own utm_source on the stored website is left untouched, not overwritten with rettfrabonden's",
+      );
 
       // ── Bonus: agent-2 has no agent_knowledge row at all -> 404 ──
       const noKnowledgeRow = await callRoute(redirectRouter, {

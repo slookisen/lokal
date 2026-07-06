@@ -38,6 +38,7 @@ import { Router, Request, Response } from "express";
 import { getDb } from "../database/init";
 import { knowledgeService } from "../services/knowledge-service";
 import { analyticsService, parseUserAgent } from "../services/analytics-service";
+import { addUtmParams } from "../utils/url-utm";
 
 // ─── Shared validation ───────────────────────────────────────────
 // agentId is our own generated id (see routes/marketplace.ts registration) —
@@ -106,6 +107,19 @@ function resolveRedirectUrl(agentId: string, kind: string): string | null {
     if (parsed.protocol !== "http:" && parsed.protocol !== "https:") return null;
   } catch {
     return null;
+  }
+
+  // Slice 2 (2026-07-06, work item 3): the producer profile page used to
+  // link straight to agent_knowledge.website with addUtmParams() applied
+  // (see seo.ts) so producers could see "sent by rettfrabonden.com" in
+  // their own analytics. Now that the profile routes that same link
+  // through here instead of linking directly, re-apply the exact same
+  // default UTM tags at the redirect boundary so that behavior isn't lost.
+  // Only the dedicated "website" kind gets this — external:<type> social
+  // links were never UTM-tagged before this change either (see linksHtml
+  // in seo.ts), so we don't start doing it for those here.
+  if (kind === "website") {
+    return addUtmParams(candidate);
   }
   return candidate;
 }

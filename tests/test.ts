@@ -190,6 +190,24 @@ console.log("\n── PR-131: dental-claim-service (buildWhereClause) ──");
   console.log(`  dental-claim-service: ${r.passed} passed, ${r.failed} failed`);
 }
 
+// ── dev-request 2026-07-03-agent-profile-conversations-stats slice 2
+//    (work item 4): profile-activity-service — the aggregated "Aktivitet"
+//    panel data that replaced /produsent/:slug's old raw "Siste samtaler"
+//    list. Uses its own in-memory DB handle passed directly to the
+//    function (never touches the shared getDb() singleton), so — like
+//    contact-normalizer/dental-claim-service above — it's safe to run
+//    fully synchronously here, no serialization/promise-chain needed.
+console.log("\n── profile-activity-service: /produsent/:slug 'Aktivitet' panel data ──");
+{
+  const { runProfileActivityServiceTests } = require("../src/services/profile-activity-service.test") as
+    typeof import("../src/services/profile-activity-service.test");
+  const r = runProfileActivityServiceTests({ log: false });
+  passed += r.passed;
+  failed += r.failed;
+  for (const f of r.failures) failures.push("profile-activity-service: " + f);
+  console.log(`  profile-activity-service: ${r.passed} passed, ${r.failed} failed`);
+}
+
 // ── crm-service: GET /admin/crm/threads?contact_email= regression fix ──
 // Pins the fix for the "/admin/crm/threads?contact_email= silently ignored"
 // P2 bug (flagged supervisor cycles 2026-07-01/02, Daniel work-order
