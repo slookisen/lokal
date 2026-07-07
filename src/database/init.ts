@@ -2415,6 +2415,76 @@ function initSchema(db: Database.Database): void {
   `);
   db.exec(`CREATE INDEX IF NOT EXISTS idx_places_api_call_log_called_at ON places_api_call_log(called_at)`);
 
+  // ─── dev-request 2026-07-06-rfb-fjern-debio-norsk-gardsmat ─────────────
+  // Daniel-confirmed: no public surface (homepage "Marked-nettverk",
+  // /api/marketplace/umbrellas, MCP lokal_list_umbrellas, search, sitemap)
+  // should show the Debio or Norsk Gardsmat umbrella networks anymore.
+  //
+  // All of those surfaces already gate on the pre-existing `agents.is_active`
+  // flag (see routes/marketplace.ts GET /umbrellas, routes/mcp.ts
+  // lokal_list_umbrellas, routes/seo.ts homepage umbrella section, and
+  // marketplaceRegistry.getAgentBySlugIncludingUmbrellas used by
+  // GET /produsent/:slug) — there is no separate `umbrellas` table and no
+  // new column is needed, we just need to flip/remove these two specific
+  // agents rows:
+  //
+  //   - Debio (id 2a10c855-00c5-4ba3-a34e-315e930f95a5, slug 'debio'):
+  //     soft-deactivate (is_active=0). Reversible — an admin can flip it
+  //     back to 1 later to restore. The row itself, its debio_verified /
+  //     debio_finnoko_id data, and any agent_affiliations rows are left
+  //     intact so a future reactivation doesn't lose history. See also the
+  //     guard added to routes/admin-affiliations.ts (PR-58 auto-tag
+  //     endpoint) and services/debio-cross-check.ts (C.1-A cross-check)
+  //     that now no-op while the target umbrella is inactive, so nothing
+  //     re-links/revives Debio affiliations while it's deactivated.
+  //   - Norsk Gardsmat (id 39749db1-54af-4865-bb01-e87a23ae55a1, slug
+  //     'norsk-gardsmat'): hard-delete. Research confirmed member_count=0
+  //     (no producer affiliations) and the organization no longer exists,
+  //     so there is nothing to preserve. agent_affiliations rows
+  //     referencing it as umbrella_id cascade-delete via the existing
+  //     `FOREIGN KEY (umbrella_id) REFERENCES agents(id) ON DELETE CASCADE`
+  //     (foreign_keys=ON is set in getDb() above). Defensively also NULL
+  //     out any stray agents.parent_umbrella_id pointing at it first —
+  //     that column carries no FK constraint so it would not otherwise be
+  //     cleaned up (should be a no-op given the confirmed member_count=0).
+  //
+  // One-time guarded migration — same `migrations` table idiom as
+  // backfill_agents_org_nr_from_tags_v1 above — so this does NOT re-apply
+  // on every boot. That matters for reversibility: if an admin later flips
+  // Debio's is_active back to 1, this migration must not re-deactivate it
+  // on the next restart. Purely additive/data-only: no destructive schema
+  // change, and a no-op on any DB where these two ids don't exist (e.g.
+  // fresh test databases).
+  try {
+    db.exec(`CREATE TABLE IF NOT EXISTS migrations (name TEXT PRIMARY KEY, applied_at TEXT DEFAULT (datetime('now')))`);
+    const alreadyRan = db.prepare(
+      "SELECT 1 FROM migrations WHERE name = 'deactivate_debio_delete_norsk_gardsmat_v1'"
+    ).get();
+    if (!alreadyRan) {
+      const DEBIO_ID = "2a10c855-00c5-4ba3-a34e-315e930f95a5";
+      const NORSK_GARDSMAT_ID = "39749db1-54af-4865-bb01-e87a23ae55a1";
+
+      const debioResult = db.prepare(
+        "UPDATE agents SET is_active = 0 WHERE id = ?"
+      ).run(DEBIO_ID);
+
+      db.prepare(
+        "UPDATE agents SET parent_umbrella_id = NULL WHERE parent_umbrella_id = ?"
+      ).run(NORSK_GARDSMAT_ID);
+      const gardsmatResult = db.prepare(
+        "DELETE FROM agents WHERE id = ?"
+      ).run(NORSK_GARDSMAT_ID);
+
+      db.prepare("INSERT INTO migrations (name) VALUES ('deactivate_debio_delete_norsk_gardsmat_v1')").run();
+      console.log(
+        `\u{1F9F9} Migration deactivate_debio_delete_norsk_gardsmat_v1: ` +
+        `debio deactivated=${debioResult.changes}, norsk_gardsmat deleted=${gardsmatResult.changes}`
+      );
+    }
+  } catch (err) {
+    console.error("Migration deactivate_debio_delete_norsk_gardsmat_v1 failed:", err);
+  }
+
 }
 
 export function closeDb(): void {

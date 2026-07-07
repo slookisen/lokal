@@ -862,30 +862,73 @@ function yieldToEventLoop(): Promise<void> {
 }
 
 /**
+ * Tables with a foreign key referencing tasks(id) that do NOT have
+ * ON DELETE CASCADE, so their rows for a chunk's task IDs must be deleted
+ * BEFORE that chunk's `tasks` rows — otherwise the parent DELETE fails with
+ * a SQLite "FOREIGN KEY constraint failed" error (prod incident 2026-07-07:
+ * jobId e0cd7421, 4300 eligible rows, failed immediately with rowsDeleted:
+ * 0). Verified against src/database/init.ts (grepped every CREATE TABLE
+ * block for `REFERENCES tasks` / a plausible `task_id` column) — as of this
+ * fix the ONLY such table is `conversations` (column `task_id`).
+ * `messages.conversation_id` already has `ON DELETE CASCADE` onto
+ * conversations(id), so deleting a conversation row here cascades its
+ * messages automatically — no separate messages delete is needed.
+ *
+ * If a future migration adds another table with a FK to tasks(id), add its
+ * scoped delete here too (see dev-request
+ * 2026-07-07-tasks-prune-fk-cascade-fix.md for the re-audit method).
+ */
+function deleteChunkChildRows(db: ReturnType<typeof getDb>, ids: readonly string[]): void {
+  if (ids.length === 0) return;
+  const placeholders = ids.map(() => "?").join(",");
+  db.prepare(`DELETE FROM conversations WHERE task_id IN (${placeholders})`).run(...ids);
+}
+
+/**
  * Chunked background delete for /ops/tasks-prune {dryRun:false}.
  * Deletes at most PRUNE_CHUNK_SIZE rows per transaction, yielding to the
  * event loop between chunks. Idempotent/resumable: the WHERE filter
  * (status IN (...) AND created_at < cutoff) naturally skips already-deleted
  * rows, so re-running (or a job that dies mid-way) is always safe — no
  * separate resume-state is needed beyond the activeJobId lock.
+ *
+ * Delete order within each chunk (2026-07-07 FK fix): child rows in tables
+ * that reference tasks(id) — see deleteChunkChildRows above — are deleted
+ * FIRST, scoped to that exact chunk's task IDs, then the chunk's `tasks`
+ * rows are deleted, all inside the same per-chunk transaction. Selecting the
+ * chunk's IDs up front (instead of the old rowid-scoped correlated
+ * sub-DELETE) is what makes scoping the child-table deletes to "just this
+ * chunk" possible.
  */
 async function runTasksPruneJob(jobId: string, cutoff: string): Promise<void> {
   const job = jobRegistry.get(jobId);
   if (!job) return;
   try {
     const db = getDb();
-    const deleteChunk = db.prepare(
-      "DELETE FROM tasks WHERE rowid IN (SELECT rowid FROM tasks WHERE status IN ('completed','failed','canceled') AND created_at < ? LIMIT ?)"
+    const selectChunkIds = db.prepare(
+      "SELECT id FROM tasks WHERE status IN ('completed','failed','canceled') AND created_at < ? LIMIT ?"
     );
+    const deleteTasksByIds = (ids: readonly string[]) => {
+      const placeholders = ids.map(() => "?").join(",");
+      return db.prepare(`DELETE FROM tasks WHERE id IN (${placeholders})`).run(...ids).changes;
+    };
+    // One transaction per chunk: child rows first, then the parent tasks
+    // rows, so a chunk either fully deletes (parent + children) or fully
+    // rolls back — never leaves an FK-violating half-state.
+    const deleteChunkTxn = db.transaction((ids: readonly string[]) => {
+      deleteChunkChildRows(db, ids);
+      return deleteTasksByIds(ids);
+    });
+
     let chunkCount = 0;
     for (;;) {
-      const result = deleteChunk.run(cutoff, PRUNE_CHUNK_SIZE);
-      const changes = result.changes;
+      const ids = (selectChunkIds.all(cutoff, PRUNE_CHUNK_SIZE) as Array<{ id: string }>).map((r) => r.id);
+      if (ids.length === 0) break; // nothing left eligible
+
+      const changes = deleteChunkTxn(ids);
       chunkCount++;
       job.rowsDeleted += changes;
       job.rowsRemaining = Math.max(0, job.rowsRemaining - changes);
-
-      if (changes === 0) break; // nothing left eligible
 
       if (chunkCount % PRUNE_CHECKPOINT_EVERY_N_CHUNKS === 0) {
         // PASSIVE only — never TRUNCATE while the job is actively deleting.
