@@ -22129,6 +22129,37 @@ Promise.allSettled(_tasksPruneAsyncDeps).then(async () => {
       "VALUES ('tpa-recent-1', 'tpa-agent', 'tpa.method', '{}', 'completed', '{}', NULL, datetime('now'), datetime('now'))"
     ).run();
 
+    // ── FK cascade fix regression (dev-request
+    // 2026-07-07-tasks-prune-fk-cascade-fix.md): conversations.task_id
+    // REFERENCES tasks(id) with no ON DELETE CASCADE, so any old task that
+    // still has a linked conversation must have that conversation (and its
+    // cascade-linked messages, via messages.conversation_id's existing
+    // ON DELETE CASCADE onto conversations(id)) deleted in the SAME
+    // per-chunk transaction as the task itself — otherwise DELETE FROM tasks
+    // fails with "FOREIGN KEY constraint failed" (the exact prod incident:
+    // jobId e0cd7421, 4300 rows, cutoff 2026-06-07, rowsDeleted: 0).
+    const insertConversation = tpaDb.prepare(
+      "INSERT INTO conversations (id, buyer_agent_id, seller_agent_id, status, query_text, task_id, created_at, updated_at) " +
+      "VALUES (?, 'tpa-buyer', NULL, 'completed', 'tpa fk-cascade test', ?, datetime('now','-60 days'), datetime('now','-60 days'))"
+    );
+    const insertMessage = tpaDb.prepare(
+      "INSERT INTO messages (id, conversation_id, sender_role, content, created_at) " +
+      "VALUES (?, ?, 'buyer', 'tpa fk-cascade test message', datetime('now','-60 days'))"
+    );
+    // Linked to eligible (older-than-cutoff) tasks near the start, middle,
+    // and end of the seeded range, so the fix is proven across chunks, not
+    // just the first one.
+    insertConversation.run("tpa-conv-old-1", "tpa-old-0");
+    insertMessage.run("tpa-msg-old-1", "tpa-conv-old-1");
+    insertConversation.run("tpa-conv-old-2", `tpa-old-${Math.floor(ELIGIBLE_ROWS / 2)}`);
+    insertMessage.run("tpa-msg-old-2", "tpa-conv-old-2");
+    insertConversation.run("tpa-conv-old-3", `tpa-old-${ELIGIBLE_ROWS - 1}`);
+    insertMessage.run("tpa-msg-old-3", "tpa-conv-old-3");
+    // Linked to the recent (NOT eligible) task — parent task, conversation,
+    // AND message must all survive untouched.
+    insertConversation.run("tpa-conv-recent-1", "tpa-recent-1");
+    insertMessage.run("tpa-msg-recent-1", "tpa-conv-recent-1");
+
     const totalRowsBefore = (tpaDb.prepare("SELECT COUNT(*) as c FROM tasks").get() as any).c;
     assertEq(totalRowsBefore, ELIGIBLE_ROWS + 2, `${TAG}: seeded ${ELIGIBLE_ROWS} eligible + 2 non-eligible rows`);
 
@@ -22301,6 +22332,24 @@ Promise.allSettled(_tasksPruneAsyncDeps).then(async () => {
     assertTrue(!!inflightSurvives, `${TAG}: in-flight task (status='working') was never touched`);
     const recentSurvives = tpaDb.prepare("SELECT 1 FROM tasks WHERE id = 'tpa-recent-1'").get();
     assertTrue(!!recentSurvives, `${TAG}: recent completed task (younger than cutoff) was never touched`);
+
+    // ── FK cascade fix: no FK error (job status is "done", asserted above,
+    // NOT "failed" — this is the core regression proof), and the
+    // conversations (+ their cascade-linked messages) for pruned tasks are
+    // gone too — no orphans left behind.
+    for (const convId of ["tpa-conv-old-1", "tpa-conv-old-2", "tpa-conv-old-3"]) {
+      const gone = tpaDb.prepare("SELECT 1 FROM conversations WHERE id = ?").get(convId);
+      assertTrue(!gone, `${TAG}: conversation ${convId} (linked to a pruned task) was deleted, no FK orphan`);
+    }
+    for (const msgId of ["tpa-msg-old-1", "tpa-msg-old-2", "tpa-msg-old-3"]) {
+      const gone = tpaDb.prepare("SELECT 1 FROM messages WHERE id = ?").get(msgId);
+      assertTrue(!gone, `${TAG}: message ${msgId} (linked to a pruned conversation) was cascade-deleted`);
+    }
+    // The recent (non-eligible) task's conversation + message must survive.
+    const recentConvSurvives = tpaDb.prepare("SELECT 1 FROM conversations WHERE id = 'tpa-conv-recent-1'").get();
+    assertTrue(!!recentConvSurvives, `${TAG}: conversation linked to the recent (non-eligible) task survives untouched`);
+    const recentMsgSurvives = tpaDb.prepare("SELECT 1 FROM messages WHERE id = 'tpa-msg-recent-1'").get();
+    assertTrue(!!recentMsgSurvives, `${TAG}: message linked to the recent task's conversation survives untouched`);
 
     // ── Now that no job is active, the lock must be released — a fresh
     // maintenance POST should be accepted again (202), not 409.
