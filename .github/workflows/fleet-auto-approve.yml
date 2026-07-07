@@ -1,6 +1,7 @@
 name: Fleet auto-approve
 
-# Auto-approves + auto-merges fleet-generated PRs (author = slookisen) once an
+# Auto-approves + auto-merges fleet-generated PRs (author = a trusted fleet
+# identity: slookisen or claude[bot]) once an
 # independent fleet code-reviewer has posted an APPROVED verdict comment AND all
 # required status checks are green. Approves as `github-actions[bot]` — an identity
 # distinct from the PR author, so branch protection's "distinct approver" rule is
@@ -82,9 +83,15 @@ jobs:
 
             const { data: pr } = await github.rest.pulls.get({ owner, repo, pull_number: prNumber });
 
-            // 1. PR author must be the fleet identity.
-            if (pr.user.login !== 'slookisen') {
-              core.info(`author=${pr.user.login} != slookisen — not a fleet PR, no-op`);
+            // 1. PR author must be a trusted fleet identity. `claude[bot]` is the
+            //    GitHub-App identity Daniel's own Claude sessions/Cloud Routines write
+            //    through — only this account's installation can author as it, so it is
+            //    exactly as trusted as the PAT identity `slookisen`. (Option A,
+            //    Daniel-approved 2026-07-07 — see slookisen/A2A
+            //    supervisor-inbox/2026-07-06-priority-headsup-fleet-auto-approve-identity-broken.md)
+            const FLEET_IDENTITIES = ['slookisen', 'claude[bot]'];
+            if (!FLEET_IDENTITIES.includes(pr.user.login)) {
+              core.info(`author=${pr.user.login} not in [${FLEET_IDENTITIES.join(', ')}] — not a fleet PR, no-op`);
               return;
             }
 
@@ -123,8 +130,10 @@ jobs:
             //    posted by the fleet identity itself AFTER an independent code-reviewer
             //    sub-agent returned APPROVED. Two independent defenses, since PR comments
             //    are attacker-writable by anyone with comment access on a public repo:
-            //      a) the comment's AUTHOR must be the trusted fleet account (`slookisen`)
-            //         — an outside commenter's "REVIEW-VERDICT" text is ignored outright.
+            //      a) the comment's AUTHOR must be a trusted fleet identity (`slookisen`
+            //         or `claude[bot]`) — an outside commenter's "REVIEW-VERDICT" text is
+            //         ignored outright. (claude[bot] added 2026-07-07, Option A: Cloud-
+            //         Routine-posted comments resolve to the App identity, never the PAT's.)
             //      b) the referenced doc is never fetched from an attacker-supplied URL —
             //         only a bare relative path is accepted, and it is resolved ourselves
             //         against a fixed slookisen/A2A Contents-API call, so there is no SSRF
@@ -134,7 +143,7 @@ jobs:
             });
             const verdictRe = /^REVIEW-VERDICT:\s*APPROVED\s*—\s*(\S+)/m;
             const verdictComment = [...comments].reverse().find(
-              c => c.user && c.user.login === 'slookisen' && verdictRe.test(c.body || '')
+              c => c.user && FLEET_IDENTITIES.includes(c.user.login) && verdictRe.test(c.body || '')
             );
             if (!verdictComment) {
               core.info('no REVIEW-VERDICT: APPROVED comment from the trusted fleet account yet — waiting');
