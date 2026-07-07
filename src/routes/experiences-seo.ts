@@ -2681,6 +2681,9 @@ router.get("/kategori/:category", (req: Request, res: Response, next: NextFuncti
   const label = catLabel(category);
   const canonicalPath = `/kategori/${encodeURIComponent(category)}`;
   // GEO: FAQPage JSON-LD — see buildCategoryFaqJsonLd for the quality gate.
+  // Never allowed to break the page: on any error we fail safe to no FAQ
+  // block, but log a structured, low-noise diagnostic so a regression here
+  // (e.g. schema drift) is visible in Fly logs without a live DB shell.
   let categoryFaqJsonLd: ReturnType<typeof buildCategoryFaqJsonLd> = null;
   try {
     const stats = getCategoryFaqStats(category);
@@ -2692,7 +2695,8 @@ router.get("/kategori/:category", (req: Request, res: Response, next: NextFuncti
       kommuneCount: stats.kommuneCount,
       minPriceFrom: stats.minPriceFrom,
     });
-  } catch {
+  } catch (e) {
+    console.error(`[experiences-seo] /kategori/${category} FAQ stats failed:`, e);
     categoryFaqJsonLd = null;
   }
 
@@ -2778,6 +2782,9 @@ router.get("/kommune/:kommune", (req: Request, res: Response, next: NextFunction
 
   const kommuneCanonicalPath = `/kommune/${encodeURIComponent(kommune)}`;
   // GEO: FAQPage JSON-LD — see buildKommuneFaqJsonLd for the quality gate.
+  // Never allowed to break the page: on any error we fail safe to no FAQ
+  // block, but log a structured, low-noise diagnostic so a regression here
+  // (e.g. schema drift) is visible in Fly logs without a live DB shell.
   let kommuneFaqJsonLd: ReturnType<typeof buildKommuneFaqJsonLd> = null;
   try {
     const stats = getKommuneFaqStats(kommune);
@@ -2789,7 +2796,8 @@ router.get("/kommune/:kommune", (req: Request, res: Response, next: NextFunction
       categoryCount: stats.categoryCount,
       minPriceFrom: stats.minPriceFrom,
     });
-  } catch {
+  } catch (e) {
+    console.error(`[experiences-seo] /kommune/${kommune} FAQ stats failed:`, e);
     kommuneFaqJsonLd = null;
   }
 
