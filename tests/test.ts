@@ -27,6 +27,34 @@ const failures: string[] = [];
 // v1, so those blocks are left exactly as they are. The REPORT block drains
 // _serialChain (in addition to the existing per-handle awaits) so every
 // serialized link's pass/fail counts fold into the npm test summary.
+//
+// 2026-07-06 root-cause fix (dev-request 2026-07-06-ci-untracked-timer-followup):
+// the "tore the singleton under CI" symptom above had a second, independent
+// cause beyond promise-chain mixing: this file used to import
+// ../src/database/init via a MIX of `require(...)` (CJS, the overwhelming
+// majority of call sites, and what every non-test module — crm-service.ts,
+// admin-affiliations.ts, etc. — uses via its own static `import { getDb }`)
+// and `await import(...)` (dynamic ESM import) in ~17 spots. Node's dynamic
+// `import()` of a CommonJS-compiled file goes through the ESM loader's own
+// `cjsLoader` translator, which — under tsx's dual CJS/ESM hooks — produced a
+// SECOND, independent module instance the first time it ran, with its own
+// private `db` module-scope variable, completely decoupled from the instance
+// every `require(...)` caller (and therefore every service singleton like
+// crmService) shares. Once that second instance existed, __setDbForTesting()
+// calls made through one instance were invisible to getDb() calls made
+// through the other, so tests would swap in a fresh :memory: DB, insert rows,
+// and read back zero — while unrelated code silently kept accumulating state
+// in whichever instance it was bound to. This is exactly the "provably
+// correct in isolation, non-deterministically wrong when it runs after
+// enough of the file has executed" signature this comment block already
+// described. Root-caused via direct instrumentation (module-instance IDs +
+// object-identity tags on the injected DB), confirmed absent on plain `main`
+// and reproducible only once enough test volume shifted execution timing to
+// trigger the dynamic import before crm-service.ts's first (require-based)
+// load. Fix: every call site now uses `require("../src/database/init")` —
+// there is now exactly one module instance for the lifetime of the process.
+// Do not reintroduce `await import(...)` for this module.
+//
 let _serialChain: Promise<void> = Promise.resolve();
 function runSerial(fn: () => Promise<void> | void): Promise<void> {
   const next = _serialChain.then(fn, fn);
@@ -3384,7 +3412,7 @@ async function runIntegrationTests(): Promise<void> {
   {
     const db = buildTestDb();
     // Re-run initSchema by importing getDb freshly via __setDbForTesting path
-    const { getDb } = await import("../src/database/init");
+    const { getDb } = require("../src/database/init");
     __setDbForTesting(db);
     getDb(); // triggers initSchema
 
@@ -3417,7 +3445,7 @@ async function runIntegrationTests(): Promise<void> {
   // ── Fixture 2: Agent with homepage + brreg agreeing on all 3 → verified + pool
   {
     const db = buildTestDb();
-    const { getDb } = await import("../src/database/init");
+    const { getDb } = require("../src/database/init");
     __setDbForTesting(db);
     getDb();
 
@@ -3488,7 +3516,7 @@ async function runIntegrationTests(): Promise<void> {
   // ── Fixture 3: Owner-curated address (Tier-S) but 1-source phone → review_required
   {
     const db = buildTestDb();
-    const { getDb } = await import("../src/database/init");
+    const { getDb } = require("../src/database/init");
     __setDbForTesting(db);
     getDb();
 
@@ -3536,7 +3564,7 @@ async function runIntegrationTests(): Promise<void> {
   // #1/#2 must not touch free-mail handling.
   {
     const db = buildTestDb();
-    const { getDb } = await import("../src/database/init");
+    const { getDb } = require("../src/database/init");
     __setDbForTesting(db);
     getDb();
 
@@ -3582,7 +3610,7 @@ async function runIntegrationTests(): Promise<void> {
   // inference_only_field flag — the Bærsentralen-style fabrication.
   {
     const db = buildTestDb();
-    const { getDb } = await import("../src/database/init");
+    const { getDb } = require("../src/database/init");
     __setDbForTesting(db);
     getDb();
 
@@ -3636,7 +3664,7 @@ async function runIntegrationTests(): Promise<void> {
   // sources on the gating fields is verified and pooled, unchanged by the guards.
   {
     const db = buildTestDb();
-    const { getDb } = await import("../src/database/init");
+    const { getDb } = require("../src/database/init");
     __setDbForTesting(db);
     getDb();
 
@@ -3679,7 +3707,7 @@ async function runIntegrationTests(): Promise<void> {
   // even though its address/phone otherwise agree across two sources.
   {
     const db = buildTestDb();
-    const { getDb } = await import("../src/database/init");
+    const { getDb } = require("../src/database/init");
     __setDbForTesting(db);
     getDb();
 
@@ -3851,7 +3879,7 @@ const _m2Promise = (async function runOwnerPortalTests() {
         notes TEXT
       );
     `);
-    const initMod = await import("../src/database/init");
+    const initMod = require("../src/database/init");
     initMod.__setDbForTesting(portalDb as any);
 
     // Seed an agent + agent_knowledge row
@@ -4245,7 +4273,7 @@ const _pr24Promise = (async function runPr24Tests() {
         updated_at TEXT
       );
     `);
-    const initMod2 = await import("../src/database/init");
+    const initMod2 = require("../src/database/init");
     initMod2.__setDbForTesting(pr24db as any);
 
     // Seed two agents.
@@ -11647,7 +11675,7 @@ const _pr74Promise = (async () => {
   // Inject in-memory DB and load the analytics router fresh, then mount
   // on a tiny Express app to call the actual route handler.
   process.env.ANALYTICS_ADMIN_KEY = "test-key-pr74";
-  const initMod = await import("../src/database/init");
+  const initMod = require("../src/database/init");
   initMod.__setDbForTesting(pr74db);
 
   // Drop cached router (it may have been loaded earlier in this test run
@@ -12150,7 +12178,7 @@ const _orchPr86Promise: Promise<void> = new Promise<void>(r => { _orchPr86Resolv
       updated_at TEXT
     );
   `);
-  const initMod = await import("../src/database/init");
+  const initMod = require("../src/database/init");
   initMod.__setDbForTesting(pr86Db as any);
 
   // Seed an admin key.
@@ -12686,7 +12714,7 @@ const _orchPr93Promise: Promise<void> = new Promise<void>(r => { _orchPr93Resolv
       vertical_id TEXT DEFAULT 'rfb'
     );
   `);
-  const initMod93 = await import("../src/database/init");
+  const initMod93 = require("../src/database/init");
   initMod93.__setDbForTesting(pr93Db as any);
 
   const PR93_KEY = "orch-pr-93-test-key";
@@ -17940,7 +17968,7 @@ const _orchPr20260614Promise: Promise<void> = new Promise<void>(r => { _orchPr20
       );
   `);
 
-  const initMod = await import("../src/database/init");
+  const initMod = require("../src/database/init");
   initMod.__setDbForTesting(orchDb as any);
 
   const ORCH_ADMIN_KEY = "orch-pr-20260614-3-test-key";
@@ -18471,7 +18499,7 @@ const _orchPr20260614_5Promise: Promise<void> = new Promise<void>(r => { _orchPr
   `);
 
   // Set the shared DB to our in-memory db
-  const initMod5 = await import("../src/database/init");
+  const initMod5 = require("../src/database/init");
   initMod5.__setDbForTesting(catDb as any);
 
   const ADMIN_KEY_5 = "test-catalog-admin-key-phase0";
@@ -18791,7 +18819,7 @@ const _orchPr20260614_6Promise: Promise<void> = new Promise<void>(r => { _orchPr
   `);
 
   // Set the shared DB singleton to our test DB
-  const initMod6 = await import("../src/database/init");
+  const initMod6 = require("../src/database/init");
   initMod6.__setDbForTesting(cartDb as any);
   // Pin the module-local cart-service DB handle — this is the race-proof fix:
   // concurrent test blocks re-pinning the global __setDbForTesting cannot
@@ -19321,6 +19349,7 @@ console.log("\n── orch-pr-14: MCP discovery product_id surfacing ──");
   try { await _agentKnowledgeGetAuthPromise; } catch { /* errors already pushed to failures */ }
   try { await _oaHomeCountersPromise; } catch { /* errors already pushed to failures */ }
   try { await _tasksPruneAsyncPromise; } catch { /* errors already pushed to failures */ }
+  try { await _rfbDebioSuitePromise; } catch { /* errors already pushed to failures */ }
   // PR-109 tests are synchronous (IIFE) — no promise needed
   // Drop pre-existing intg failures (unmasked by awaiting) — they predate M2
   // and live behind a separate fix-it task. Counting them here would surface
@@ -20340,7 +20369,7 @@ const _orchPr9PruneDeadUrlsPromise: Promise<void> = new Promise<void>(r => {
       );
     `);
 
-    const initMod3 = await import("../src/database/init");
+    const initMod3 = require("../src/database/init");
     initMod3.__setDbForTesting(pruneDb as any);
 
     // Seed agents
@@ -20536,11 +20565,18 @@ const _orchPr9PruneDeadUrlsPromise: Promise<void> = new Promise<void>(r => {
 // matched) and PASS with the fix (also matches 'composed' type + messageId,
 // with compose-origin channel fallback to 'resend_smtp').
 //
-// Race-free serialization: chained off _orchPr20BmEventsPromise so it runs
-// AFTER that block (and transitively after _pr94Promise → _pr56Promise) — the
-// same pattern PR-20 uses. Each sub-block also saves the current getDb()
-// singleton before calling __setDbForTesting() and restores it in a finally,
-// so the global is never left swapped even if an assertion throws.
+// 2026-07-06 fix-up (dev-request 2026-07-06-ci-untracked-timer-followup):
+// chaining off a single upstream promise (_orchPr20BmEventsPromise) was
+// insufficient — same failure mode this file's tasks-prune-async /
+// oa-home-counters postmortems already document: a single-link chain only
+// guarantees ordering against ONE branch, not against every OTHER
+// singleton-swapping block that may still be mid-flight (an unawaited
+// leftover microtask from an earlier block can still fire and swap
+// getDb() out from under this one). Now depends on the FULL set of
+// earlier db-singleton-swapping branches, matching _oaHomeCountersDeps'
+// pattern. Each sub-block also saves the current getDb() singleton before
+// calling __setDbForTesting() and restores it in a finally, so the global
+// is never left swapped even if an assertion throws.
 console.log("\n── orch-pr-21: sent-log actor/channel from composed action ──");
 
 let _orchPr21SentLogActorResolve: () => void = () => {};
@@ -20548,7 +20584,44 @@ const _orchPr21SentLogActorPromise: Promise<void> = new Promise<void>(r => {
   _orchPr21SentLogActorResolve = r;
 });
 
-_orchPr20BmEventsPromise.then(async () => {
+const _orchPr21SentLogActorDeps: Promise<unknown>[] = [
+  _serialChain,
+  Promise.all(_pr21Promises),
+  _m2Promise,
+  _pr24Promise,
+  _pr56Promise,
+  _pr63Promise,
+  _pr65Promise,
+  _pr66Promise,
+  _pr67Promise,
+  _pr68Promise,
+  _pr74Promise,
+  _pr75Promise,
+  _pr76Promise,
+  _pr78Promise,
+  _orchPr86Promise,
+  _orchPr93Promise,
+  _pr94Promise,
+  _pr95Promise,
+  _pr103Promise,
+  _pr106Promise,
+  _pr110Promise,
+  _pr125Promise,
+  _seoDentalPromise,
+  _platformVerifierPromise,
+  _orchPr20260614_2Promise,
+  _orchPr20260614Promise,
+  _orchPr20260614_5Promise,
+  _orchPr20260614_6Promise,
+  _orchPr14ProductIdPromise,
+  _orchPr9PruneDeadUrlsPromise,
+  _orchPr18BulkLoadPromise,
+  _orchPr12SweepPromise,
+  _brregVerifySlice1Promise,
+  _orchPr20BmEventsPromise,
+];
+
+Promise.allSettled(_orchPr21SentLogActorDeps).then(async () => {
   try {
     const Database = require("better-sqlite3");
     const { __setDbForTesting, __initSchemaForTesting, getDb } = require("../src/database/init");
@@ -20708,16 +20781,23 @@ _orchPr20BmEventsPromise.then(async () => {
 // what the DB bloat actually is (prod at 476.2MB, ~5 days from 500MB
 // threshold; page-view retention already finds 0 rows to prune).
 //
-// Chained off _orchPr21SentLogActorPromise (same pattern as PR-20/PR-21):
-// this block also swaps the global getDb() singleton via __setDbForTesting,
-// so it must run serially after the other singleton-swapping blocks, not
-// concurrently with them.
+// 2026-07-06 fix-up (dev-request 2026-07-06-ci-untracked-timer-followup):
+// was chained off _orchPr21SentLogActorPromise alone — insufficient for the
+// same reason pr21's own chaining was upgraded above. This block also swaps
+// the global getDb() singleton via __setDbForTesting, so it must run
+// serially after EVERY other singleton-swapping block that could still be
+// mid-flight, not just its immediate predecessor.
 let _adminDbTableSizesResolve: () => void = () => {};
 const _adminDbTableSizesPromise: Promise<void> = new Promise<void>(r => {
   _adminDbTableSizesResolve = r;
 });
 
-_orchPr21SentLogActorPromise.then(async () => {
+const _adminDbTableSizesDeps: Promise<unknown>[] = [
+  ..._orchPr21SentLogActorDeps,
+  _orchPr21SentLogActorPromise,
+];
+
+Promise.allSettled(_adminDbTableSizesDeps).then(async () => {
   console.log("\n── admin-db-table-sizes: read-only DB table-size diagnostic ──");
   try {
     const { runAdminDbTableSizesTests } = require("../src/routes/admin-db-table-sizes.test") as
@@ -20739,17 +20819,26 @@ _orchPr21SentLogActorPromise.then(async () => {
 // ─── 2026-07-03 slice 1: contact-click intent tracking ───────────────────────
 // dev-requests/2026-07-03-agent-profile-conversations-stats.md work items
 // 1+2 — new contact_clicks table + POST /api/track/contact-click beacon +
-// GET /ut/:agentId/:kind counting redirect. Chained off
-// _adminDbTableSizesPromise (same reasoning as the PR-20/PR-21/admin-db
-// blocks above): this block also swaps the global getDb() singleton via
-// __setDbForTesting, so it must run serially after the other
-// singleton-swapping blocks, not concurrently with them.
+// GET /ut/:agentId/:kind counting redirect.
+//
+// 2026-07-06 fix-up (dev-request 2026-07-06-ci-untracked-timer-followup):
+// was chained off _adminDbTableSizesPromise alone — insufficient for the
+// same reason pr21/admin-db-table-sizes' own chaining was upgraded above.
+// This block also swaps the global getDb() singleton via
+// __setDbForTesting, so it must run serially after EVERY other
+// singleton-swapping block that could still be mid-flight, not just its
+// immediate predecessor.
 let _contactClickTrackingResolve: () => void = () => {};
 const _contactClickTrackingPromise: Promise<void> = new Promise<void>(r => {
   _contactClickTrackingResolve = r;
 });
 
-_adminDbTableSizesPromise.then(async () => {
+const _contactClickTrackingDeps: Promise<unknown>[] = [
+  ..._adminDbTableSizesDeps,
+  _adminDbTableSizesPromise,
+];
+
+Promise.allSettled(_contactClickTrackingDeps).then(async () => {
   console.log("\n── contact-tracking: contact-click intent tracking (table + endpoints) ──");
   try {
     const { runContactTrackingTests } = require("../src/routes/contact-tracking.test") as
@@ -22088,7 +22177,7 @@ Promise.allSettled(_tasksPruneAsyncDeps).then(async () => {
     const sqlite = require("better-sqlite3");
     const httpMod = await import("http");
     const expressMod = (await import("express")).default;
-    const initMod = await import("../src/database/init");
+    const initMod = require("../src/database/init");
     const analyticsMod = await import("../src/routes/analytics");
 
     const ADMIN_KEY = "tpa-test-admin-key-20260704";
@@ -22459,3 +22548,520 @@ console.log("\n── geo-faq-category-city: buildCategoryFaqJsonLd / buildKommu
     failures.push(`geo-faq-cc: unexpected error: ${err instanceof Error ? (err.stack || err.message) : String(err)}`);
   }
 })();
+
+
+
+// ═══════════════════════════════════════════════════════════════════════
+// ── dev-request 2026-07-06-rfb-fjern-debio-norsk-gardsmat ────────────────
+// Daniel-confirmed: Debio soft-deactivated (agents.is_active=0, row kept —
+// reversible), Norsk Gardsmat hard-deleted (member_count confirmed 0, org
+// no longer exists). Both umbrellas must disappear from every public
+// listing surface (homepage, /api/marketplace/umbrellas, MCP
+// lokal_list_umbrellas, /produsent/<slug>) while Hanen / Bondens marked
+// stay completely untouched. All of those surfaces already gate on the
+// pre-existing agents.is_active flag (no schema change needed beyond the
+// one-time data migration). See:
+//   - database/init.ts: 'deactivate_debio_delete_norsk_gardsmat_v1' migration
+//   - routes/admin-affiliations.ts: is_active guard on the PR-58 auto-tag endpoint
+//   - services/debio-cross-check.ts: is_active guard on the C.1-A cross-check
+//
+// Gating: every sub-block below swaps the global getDb() singleton via
+// __setDbForTesting/__initSchemaForTesting. Per this file's own convention
+// (see the top-of-file note on why "mixing serialization mechanisms tore
+// the singleton under CI in v1"), we must NOT run any of that until every
+// other singleton-swapping block elsewhere in this file has fully settled
+// — otherwise we'd race a still-pending async block (e.g. PR-56's
+// matchEventToVenue, which re-reads getDb() between its awaited calls) and
+// corrupt its in-memory DB out from under it. So we await the exact same
+// promise list the final REPORT IIFE awaits before touching the DB at all.
+// ═══════════════════════════════════════════════════════════════════════
+
+let _rfbDebioSuiteResolve: () => void = () => {};
+const _rfbDebioSuitePromise: Promise<void> = new Promise<void>(r => { _rfbDebioSuiteResolve = r; });
+
+(async () => {
+  // 2026-07-06 fix-up (dev-request 2026-07-06-ci-untracked-timer-followup):
+  // use Promise.allSettled over the exhaustive list (matching
+  // _oaHomeCountersDeps / _tasksPruneAsyncDeps) instead of a manual
+  // sequential for-await, and explicitly include _oaHomeCountersPromise
+  // (previously only reached transitively via _tasksPruneAsyncPromise) so
+  // this list is correct by inspection, not by re-derivation.
+  const priorPromises: Array<Promise<unknown>> = [
+    _serialChain,
+    Promise.all(_pr21Promises),
+    _m2Promise, _pr24Promise, _pr56Promise, _pr63Promise, _pr65Promise, _pr66Promise,
+    _pr67Promise, _pr68Promise, _pr74Promise, _pr75Promise, _pr76Promise, _pr78Promise,
+    _orchPr86Promise, _orchPr93Promise, _pr94Promise, _pr95Promise, _pr103Promise,
+    _pr106Promise, _pr110Promise, _pr125Promise, _seoDentalPromise, _platformVerifierPromise,
+    _orchPr20260614_2Promise, _orchPr20260614Promise, _orchPr20260614_5Promise,
+    _orchPr20260614_6Promise, _orchPr14ProductIdPromise, _orchPr9PruneDeadUrlsPromise,
+    _orchPr18BulkLoadPromise, _orchPr12SweepPromise, _brregVerifySlice1Promise,
+    _orchPr20BmEventsPromise, _orchPr21SentLogActorPromise, _adminDbTableSizesPromise,
+    _contactClickTrackingPromise, _homepageProvenanceEmailBackfillPromise,
+    _agentKnowledgeGetAuthPromise, _oaHomeCountersPromise, _tasksPruneAsyncPromise,
+  ];
+  await Promise.allSettled(priorPromises);
+  // One extra tick so any then-chained cleanup those blocks scheduled has
+  // also run before we start swapping the singleton ourselves.
+  await new Promise(r => setImmediate(r));
+
+  console.log("\n── dev-request 2026-07-06: deactivate Debio, delete Norsk Gardsmat ──");
+
+  const DEBIO_ID_RFB = "2a10c855-00c5-4ba3-a34e-315e930f95a5";
+  const NORSK_GARDSMAT_ID_RFB = "39749db1-54af-4865-bb01-e87a23ae55a1";
+
+  const Database = require("better-sqlite3");
+  const initModRfb = require("../src/database/init");
+
+  // ── A. Migration behaviour: init.ts actually flips/deletes the two rows,
+  //    leaves Hanen + Bondens marked completely untouched, cascade-deletes
+  //    any agent_affiliations referencing the deleted umbrella, and is a
+  //    ONE-TIME (guarded) migration so a later manual rollback of Debio's
+  //    is_active flag survives a restart. ──
+  {
+    const prevDbRfb = initModRfb.getDb();
+    const db = new Database(":memory:");
+    db.pragma("foreign_keys = ON");
+    try {
+      initModRfb.__setDbForTesting(db);
+      initModRfb.__initSchemaForTesting(db); // creates schema; migration runs as a no-op (0 matching rows yet)
+
+      // Remove the guard row so we can re-trigger the migration logic against
+      // freshly-seeded rows that simulate the pre-migration production state
+      // (this is the only way to exercise the migration's actual UPDATE/
+      // DELETE statements without a real production DB file).
+      db.prepare("DELETE FROM migrations WHERE name = 'deactivate_debio_delete_norsk_gardsmat_v1'").run();
+
+      const insertUmbrella = db.prepare(`
+        INSERT INTO agents (id, name, description, provider, contact_email, url, role, api_key, umbrella_type, parent_umbrella_id, umbrella_member_count, is_active)
+        VALUES (?, ?, ?, 'umbrella-admin', ?, ?, 'producer', ?, ?, NULL, ?, 1)
+      `);
+      insertUmbrella.run(DEBIO_ID_RFB, "Debio", "Sertifiseringsorgan", "debio@example.no", "https://debio.no", "key-debio-rfb", "certification", 0);
+      insertUmbrella.run(NORSK_GARDSMAT_ID_RFB, "Norsk Gardsmat", "Kvalitetsmerke", "gardsmat@example.no", "https://norskgardsmat.no", "key-gardsmat-rfb", "cooperative", 0);
+      insertUmbrella.run("hanen-control-id", "Hanen", "Bransjeorganisasjon", "hanen@example.no", "https://hanen.no", "key-hanen-rfb", "industry_org", 120);
+      insertUmbrella.run("bm-control-id", "Bondens Marked Norge", "Nasjonalt nettverk", "bm@example.no", "https://bondensmarked.no", "key-bm-rfb", "market_network", 14);
+
+      // A producer + an existing affiliation to Norsk Gardsmat, to prove the
+      // hard-delete cascades and leaves no orphaned agent_affiliations row.
+      db.prepare(`
+        INSERT INTO agents (id, name, description, provider, contact_email, url, role, api_key)
+        VALUES ('producer-rfb-1', 'Test Gård', 'En gård', 'self', 'gard@example.no', 'https://gard.no', 'producer', 'key-producer-rfb')
+      `).run();
+      db.prepare(`
+        INSERT INTO agent_affiliations (producer_id, umbrella_id, status, source)
+        VALUES ('producer-rfb-1', ?, 'active', 'admin')
+      `).run(NORSK_GARDSMAT_ID_RFB);
+
+      // Re-run schema init: the migration guard row is gone, so the migration
+      // re-applies against these freshly-seeded rows (every other statement in
+      // initSchema is an idempotent CREATE TABLE IF NOT EXISTS / ALTER-in-
+      // try/catch no-op on a second call, matching the existing convention
+      // used throughout this file for re-triggering guarded migrations).
+      initModRfb.__initSchemaForTesting(db);
+
+      const debioRow = db.prepare("SELECT is_active FROM agents WHERE id = ?").get(DEBIO_ID_RFB) as any;
+      assertTrue(!!debioRow, "rfb-debio: Debio row still exists after migration (soft-deactivate, not deleted)");
+      assertEq(debioRow?.is_active, 0, "rfb-debio: Debio row is deactivated (is_active=0)");
+
+      const gardsmatRow = db.prepare("SELECT 1 FROM agents WHERE id = ?").get(NORSK_GARDSMAT_ID_RFB);
+      assertTrue(!gardsmatRow, "rfb-gardsmat: Norsk Gardsmat row is gone after migration (hard delete)");
+
+      const orphanAff = db.prepare("SELECT COUNT(*) AS c FROM agent_affiliations WHERE umbrella_id = ?").get(NORSK_GARDSMAT_ID_RFB) as any;
+      assertEq(orphanAff.c, 0, "rfb-gardsmat: no orphaned agent_affiliations rows reference the deleted umbrella (FK cascade)");
+
+      const hanenRow = db.prepare("SELECT is_active, umbrella_member_count FROM agents WHERE id = 'hanen-control-id'").get() as any;
+      assertEq(hanenRow?.is_active, 1, "rfb-control: Hanen untouched — still active");
+      assertEq(hanenRow?.umbrella_member_count, 120, "rfb-control: Hanen member_count untouched");
+
+      const bmRow = db.prepare("SELECT is_active, umbrella_member_count FROM agents WHERE id = 'bm-control-id'").get() as any;
+      assertEq(bmRow?.is_active, 1, "rfb-control: Bondens Marked Norge untouched — still active");
+      assertEq(bmRow?.umbrella_member_count, 14, "rfb-control: Bondens Marked Norge member_count untouched");
+
+      // Reversibility: an admin flips Debio's is_active back to 1 by hand.
+      // Because the migration is one-time-guarded (tracked in `migrations`),
+      // re-running schema init (as happens on every server boot) must NOT
+      // re-deactivate it.
+      db.prepare("UPDATE agents SET is_active = 1 WHERE id = ?").run(DEBIO_ID_RFB);
+      initModRfb.__initSchemaForTesting(db);
+      const debioAfterRollback = db.prepare("SELECT is_active FROM agents WHERE id = ?").get(DEBIO_ID_RFB) as any;
+      assertEq(debioAfterRollback?.is_active, 1,
+        "rfb-debio: migration is one-time-guarded — manual rollback (is_active=1) survives a later schema-init re-run");
+    } catch (err) {
+      failed++;
+      failures.push(`rfb-migration: unexpected error: ${err instanceof Error ? (err.stack || err.message) : String(err)}`);
+    } finally {
+      initModRfb.__setDbForTesting(prevDbRfb);
+      db.close();
+    }
+  }
+
+  // ── B. GET /api/marketplace/umbrellas (default call, no umbrella_type
+  //    filter) excludes an inactive Debio and never sees a Norsk Gardsmat
+  //    that was never re-inserted (simulating the post-migration DB state),
+  //    while a still-active control umbrella is included. ──
+  {
+    const prevDbRfb = initModRfb.getDb();
+    const db = new Database(":memory:");
+    db.pragma("foreign_keys = ON");
+    try {
+      initModRfb.__setDbForTesting(db);
+      initModRfb.__initSchemaForTesting(db);
+
+      const insertUmbrella = db.prepare(`
+        INSERT INTO agents (id, name, description, provider, contact_email, url, role, api_key, umbrella_type, is_active, trust_score)
+        VALUES (?, ?, ?, 'umbrella-admin', ?, ?, 'producer', ?, ?, ?, 0.9)
+      `);
+      insertUmbrella.run(DEBIO_ID_RFB, "Debio", "Sertifiseringsorgan", "debio@example.no", "https://debio.no", "key-debio-b", "certification", 0);
+      insertUmbrella.run("hanen-control-b", "Hanen", "Bransjeorganisasjon", "hanen@example.no", "https://hanen.no", "key-hanen-b", "industry_org", 1);
+
+      const marketplaceRouter = require("../src/routes/marketplace").default as any;
+      const layer = (marketplaceRouter.stack as any[]).find(
+        (l: any) => l.route && l.route.path === "/umbrellas" && l.route.methods?.get
+      );
+      assertTrue(!!layer, "rfb-api-umbrellas: GET /umbrellas layer is registered");
+
+      let statusCode = 200;
+      let body: any = undefined;
+      const res: any = {
+        status: (c: number) => { statusCode = c; return res; },
+        json: (o: unknown) => { body = o; return res; },
+      };
+      const req: any = { query: {}, protocol: "https", get: (_h: string) => "test.local" };
+      const handler = layer.route.stack[layer.route.stack.length - 1].handle;
+      handler(req, res);
+
+      assertEq(statusCode, 200, "rfb-api-umbrellas: default call returns 200");
+      const names = (body?.umbrellas || []).map((u: any) => u.name);
+      assertTrue(!names.includes("Debio"), "rfb-api-umbrellas: response excludes inactive Debio");
+      assertTrue(!names.includes("Norsk Gardsmat"), "rfb-api-umbrellas: response excludes Norsk Gardsmat (row never re-inserted)");
+      assertTrue(names.includes("Hanen"), "rfb-api-umbrellas: response still includes an unrelated active umbrella (Hanen)");
+    } catch (err) {
+      failed++;
+      failures.push(`rfb-api-umbrellas: unexpected error: ${err instanceof Error ? (err.stack || err.message) : String(err)}`);
+    } finally {
+      initModRfb.__setDbForTesting(prevDbRfb);
+      db.close();
+    }
+  }
+
+  // ── C. GET /produsent/debio and /produsent/norsk-gardsmat respond 404
+  //    (not 200 with empty content, not a 5xx crash). ──
+  {
+    const prevDbRfb = initModRfb.getDb();
+    const db = new Database(":memory:");
+    db.pragma("foreign_keys = ON");
+    try {
+      initModRfb.__setDbForTesting(db);
+      initModRfb.__initSchemaForTesting(db);
+
+      db.prepare(`
+        INSERT INTO agents (id, name, description, provider, contact_email, url, role, api_key, umbrella_type, is_active)
+        VALUES (?, 'Debio', 'Sertifiseringsorgan', 'umbrella-admin', 'debio@example.no', 'https://debio.no', 'producer', 'key-debio-c', 'certification', 0)
+      `).run(DEBIO_ID_RFB);
+      // Norsk Gardsmat is intentionally NOT inserted — simulates the
+      // post-migration hard-deleted state.
+
+      const seoRouter = require("../src/routes/seo").default as any;
+      const layer = (seoRouter.stack as any[]).find(
+        (l: any) => l.route && l.route.path === "/produsent/:slug" && l.route.methods?.get
+      );
+      assertTrue(!!layer, "rfb-produsent-404: GET /produsent/:slug layer is registered");
+      const handler = layer.route.stack[layer.route.stack.length - 1].handle;
+
+      function invokeProdusent(slug: string): { status: number; body: string } {
+        let status = 200;
+        let body = "";
+        const res: any = {
+          status: (c: number) => { status = c; return res; },
+          send: (b: unknown) => { body = typeof b === "string" ? b : String(b); return res; },
+          redirect: (_c: number, _l: string) => { status = 301; return res; },
+        };
+        const req: any = { params: { slug }, lang: "no", ip: "127.0.0.1" };
+        handler(req, res);
+        return { status, body };
+      }
+
+      const debioPage = invokeProdusent("debio");
+      assertTrue(debioPage.status === 404 || debioPage.status === 410,
+        `rfb-produsent-404: /produsent/debio responds 404/410 (was ${debioPage.status})`);
+      assertTrue(debioPage.status < 500, "rfb-produsent-404: /produsent/debio does not 5xx-crash");
+
+      const gardsmatPage = invokeProdusent("norsk-gardsmat");
+      assertTrue(gardsmatPage.status === 404 || gardsmatPage.status === 410,
+        `rfb-produsent-404: /produsent/norsk-gardsmat responds 404/410 (was ${gardsmatPage.status})`);
+      assertTrue(gardsmatPage.status < 500, "rfb-produsent-404: /produsent/norsk-gardsmat does not 5xx-crash");
+    } catch (err) {
+      failed++;
+      failures.push(`rfb-produsent-404: unexpected error: ${err instanceof Error ? (err.stack || err.message) : String(err)}`);
+    } finally {
+      initModRfb.__setDbForTesting(prevDbRfb);
+      db.close();
+    }
+  }
+
+  // ── D. Homepage "Marked-nettverk" section renders only active umbrellas —
+  //    Debio/Norsk Gardsmat disappear automatically because the section
+  //    queries `is_active = 1`, not a hardcoded umbrella list. ──
+  {
+    const prevDbRfb = initModRfb.getDb();
+    const db = new Database(":memory:");
+    db.pragma("foreign_keys = ON");
+    try {
+      initModRfb.__setDbForTesting(db);
+      initModRfb.__initSchemaForTesting(db);
+
+      db.prepare(`
+        INSERT INTO agents (id, name, description, provider, contact_email, url, role, api_key, umbrella_type, parent_umbrella_id, umbrella_member_count, is_active)
+        VALUES (?, 'Debio', 'Sertifiseringsorgan', 'umbrella-admin', 'debio@example.no', 'https://debio.no', 'producer', 'key-debio-d', 'certification', NULL, 0, 0)
+      `).run(DEBIO_ID_RFB);
+      // Norsk Gardsmat intentionally absent (hard-deleted state).
+      db.prepare(`
+        INSERT INTO agents (id, name, description, provider, contact_email, url, role, api_key, umbrella_type, parent_umbrella_id, umbrella_member_count, is_active)
+        VALUES ('bm-control-d', 'Bondens Marked Norge', 'Nasjonalt nettverk', 'umbrella-admin', 'bm@example.no', 'https://bondensmarked.no', 'producer', 'key-bm-d', 'market_network', NULL, 14, 1)
+      `).run();
+
+      const seoRouter = require("../src/routes/seo").default as any;
+      const layer = (seoRouter.stack as any[]).find(
+        (l: any) => l.route && l.route.path === "/" && l.route.methods?.get
+      );
+      assertTrue(!!layer, "rfb-homepage: GET / layer is registered");
+      const handler = layer.route.stack[layer.route.stack.length - 1].handle;
+
+      let status = 200;
+      let html = "";
+      const res: any = {
+        status: (c: number) => { status = c; return res; },
+        send: (b: unknown) => { html = typeof b === "string" ? b : String(b); return res; },
+      };
+      const req: any = { lang: "no", query: {} };
+      handler(req, res);
+
+      assertEq(status, 200, "rfb-homepage: homepage renders 200");
+      assertTrue(!html.includes("Debio"), "rfb-homepage: rendered HTML does not mention Debio as a network card");
+      assertTrue(!html.includes("Norsk Gardsmat"), "rfb-homepage: rendered HTML does not mention Norsk Gardsmat as a network card");
+      assertTrue(html.includes("Bondens Marked Norge"), "rfb-homepage: unrelated active umbrella still renders (section isn't hardcoded/empty)");
+    } catch (err) {
+      failed++;
+      failures.push(`rfb-homepage: unexpected error: ${err instanceof Error ? (err.stack || err.message) : String(err)}`);
+    } finally {
+      initModRfb.__setDbForTesting(prevDbRfb);
+      db.close();
+    }
+  }
+
+  // ── E. Whatever powers MCP lokal_list_umbrellas (routes/mcp.ts) excludes
+  //    both. The tool queries the DB directly with the exact same
+  //    umbrella_type/is_active WHERE clause as /api/marketplace/umbrellas
+  //    (source-presence-verified below); we exercise that clause against a
+  //    live in-memory DB with the same fixture to prove the behaviour. ──
+  {
+    const prevDbRfb = initModRfb.getDb();
+    const db = new Database(":memory:");
+    db.pragma("foreign_keys = ON");
+    try {
+      initModRfb.__setDbForTesting(db);
+      initModRfb.__initSchemaForTesting(db);
+
+      db.prepare(`
+        INSERT INTO agents (id, name, description, provider, contact_email, url, role, api_key, umbrella_type, is_active)
+        VALUES (?, 'Debio', 'Sertifiseringsorgan', 'umbrella-admin', 'debio@example.no', 'https://debio.no', 'producer', 'key-debio-e', 'certification', 0)
+      `).run(DEBIO_ID_RFB);
+      db.prepare(`
+        INSERT INTO agents (id, name, description, provider, contact_email, url, role, api_key, umbrella_type, is_active)
+        VALUES ('hanen-control-e', 'Hanen', 'Bransjeorganisasjon', 'umbrella-admin', 'hanen@example.no', 'https://hanen.no', 'producer', 'key-hanen-e', 'industry_org', 1)
+      `).run();
+
+      const mcpSrc = require("fs").readFileSync("src/routes/mcp.ts", "utf8");
+      assertTrue(
+        /const wheres: string\[\] = \["umbrella_type IS NOT NULL", "is_active = 1"\];/.test(mcpSrc),
+        "rfb-mcp-umbrellas: lokal_list_umbrellas still filters umbrella_type IS NOT NULL AND is_active = 1"
+      );
+
+      // Same WHERE clause the tool executes (routes/mcp.ts, Tool 5).
+      const rows = db.prepare(`
+        SELECT id, name FROM agents WHERE umbrella_type IS NOT NULL AND is_active = 1
+      `).all() as any[];
+      const names = rows.map(r => r.name);
+      assertTrue(!names.includes("Debio"), "rfb-mcp-umbrellas: is_active=1 filter excludes inactive Debio");
+      assertTrue(!names.includes("Norsk Gardsmat"), "rfb-mcp-umbrellas: filter excludes Norsk Gardsmat (row absent)");
+      assertTrue(names.includes("Hanen"), "rfb-mcp-umbrellas: filter still includes an unrelated active umbrella");
+    } catch (err) {
+      failed++;
+      failures.push(`rfb-mcp-umbrellas: unexpected error: ${err instanceof Error ? (err.stack || err.message) : String(err)}`);
+    } finally {
+      initModRfb.__setDbForTesting(prevDbRfb);
+      db.close();
+    }
+  }
+
+  // ── F. POST /admin/affiliations/auto-create (PR-58 Debio auto-tag path)
+  //    is a no-op (409, no row inserted) when the target umbrella is
+  //    deactivated, and still works normally (201) for an active umbrella. ──
+  {
+    const prevDbRfb = initModRfb.getDb();
+    const db = new Database(":memory:");
+    db.pragma("foreign_keys = ON");
+    const prevAdminKeyRfb = process.env.ADMIN_KEY;
+    const prevAnalyticsAdminKeyRfb = process.env.ANALYTICS_ADMIN_KEY;
+    try {
+      initModRfb.__setDbForTesting(db);
+      initModRfb.__initSchemaForTesting(db);
+      process.env.ADMIN_KEY = "rfb-test-admin-key";
+      delete process.env.ANALYTICS_ADMIN_KEY;
+
+      db.prepare(`
+        INSERT INTO agents (id, name, description, provider, contact_email, url, role, api_key, umbrella_type, is_active)
+        VALUES (?, 'Debio', 'Sertifiseringsorgan', 'umbrella-admin', 'debio@example.no', 'https://debio.no', 'producer', 'key-debio-f', 'certification', 0)
+      `).run(DEBIO_ID_RFB);
+      db.prepare(`
+        INSERT INTO agents (id, name, description, provider, contact_email, url, role, api_key, umbrella_type, is_active)
+        VALUES ('hanen-control-f', 'Hanen', 'Bransjeorganisasjon', 'umbrella-admin', 'hanen@example.no', 'https://hanen.no', 'producer', 'key-hanen-f', 'industry_org', 1)
+      `).run();
+      db.prepare(`
+        INSERT INTO agents (id, name, description, provider, contact_email, url, role, api_key)
+        VALUES ('producer-f-1', 'Fjord Gård', 'En gård', 'self', 'fjord@example.no', 'https://fjord.no', 'producer', 'key-producer-f')
+      `).run();
+
+      const adminAffRoutePath = require.resolve("../src/routes/admin-affiliations");
+      delete require.cache[adminAffRoutePath];
+      const adminAffRouter = require("../src/routes/admin-affiliations").default as any;
+      const layer = (adminAffRouter.stack as any[]).find(
+        (l: any) => l.route && l.route.path === "/auto-create" && l.route.methods?.post
+      );
+      assertTrue(!!layer, "rfb-autotag-guard: POST /auto-create layer is registered");
+      const handler = layer.route.stack[layer.route.stack.length - 1].handle;
+
+      function fakeRes() {
+        const r: any = { statusCode: 200, body: undefined };
+        r.status = (c: number) => { r.statusCode = c; return r; };
+        r.json = (b: any) => { r.body = b; return r; };
+        return r;
+      }
+      const evidence = {
+        matched_keywords: ["debio sertifisert"],
+        evidence_snippets: ["Vi er Debio sertifisert."],
+        confidence: "medium",
+        source_url: "https://fjord.no/om-oss",
+      };
+
+      // Inactive umbrella (Debio) → no-op, no row inserted.
+      {
+        const res = fakeRes();
+        handler({
+          headers: { "x-admin-key": "rfb-test-admin-key" },
+          body: { agent_id: "producer-f-1", umbrella_id: DEBIO_ID_RFB, source_type: "inferred", evidence },
+        } as any, res);
+        assertTrue(res.statusCode >= 400 && res.statusCode < 500,
+          `rfb-autotag-guard: auto-create against inactive Debio is rejected (was ${res.statusCode})`);
+        const count = db.prepare("SELECT COUNT(*) AS c FROM agent_affiliations").get() as any;
+        assertEq(count.c, 0, "rfb-autotag-guard: no affiliation row inserted for the inactive umbrella");
+      }
+
+      // Active umbrella (Hanen control) → still works normally.
+      {
+        const res = fakeRes();
+        handler({
+          headers: { "x-admin-key": "rfb-test-admin-key" },
+          body: { agent_id: "producer-f-1", umbrella_id: "hanen-control-f", source_type: "inferred", evidence },
+        } as any, res);
+        assertEq(res.statusCode, 201, "rfb-autotag-guard: auto-create against an ACTIVE umbrella still succeeds (guard doesn't break normal path)");
+        const count = db.prepare("SELECT COUNT(*) AS c FROM agent_affiliations WHERE umbrella_id = 'hanen-control-f'").get() as any;
+        assertEq(count.c, 1, "rfb-autotag-guard: active-umbrella auto-create inserted exactly one row");
+      }
+
+      delete require.cache[adminAffRoutePath];
+    } catch (err) {
+      failed++;
+      failures.push(`rfb-autotag-guard: unexpected error: ${err instanceof Error ? (err.stack || err.message) : String(err)}`);
+    } finally {
+      initModRfb.__setDbForTesting(prevDbRfb);
+      if (prevAdminKeyRfb === undefined) delete process.env.ADMIN_KEY; else process.env.ADMIN_KEY = prevAdminKeyRfb;
+      if (prevAnalyticsAdminKeyRfb === undefined) delete process.env.ANALYTICS_ADMIN_KEY; else process.env.ANALYTICS_ADMIN_KEY = prevAnalyticsAdminKeyRfb;
+      db.close();
+    }
+  }
+
+  // ── G. runDebioCrossCheck (services/debio-cross-check.ts, the C.1-A
+  //    Debio-autotag pipeline) is a no-op — never even calls fetch — while
+  //    the Debio umbrella is deactivated. ──
+  {
+    const prevDbRfb = initModRfb.getDb();
+    const db = new Database(":memory:");
+    db.pragma("journal_mode = DELETE");
+    db.pragma("foreign_keys = ON");
+    try {
+      db.exec(`
+        CREATE TABLE agents (
+          id TEXT PRIMARY KEY,
+          name TEXT NOT NULL,
+          umbrella_type TEXT,
+          role TEXT,
+          is_active INTEGER DEFAULT 1,
+          organisasjonsnummer TEXT
+        );
+        CREATE TABLE agent_affiliations (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          producer_id TEXT NOT NULL,
+          umbrella_id TEXT NOT NULL,
+          status TEXT NOT NULL DEFAULT 'pending_confirmation',
+          source TEXT NOT NULL,
+          evidence_json TEXT,
+          created_at TEXT,
+          updated_at TEXT,
+          UNIQUE(producer_id, umbrella_id)
+        );
+        CREATE TABLE debio_unmatched_operators (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          operator_name TEXT UNIQUE NOT NULL,
+          postal_code TEXT,
+          operator_identifier TEXT,
+          first_seen_at TEXT NOT NULL,
+          last_seen_at TEXT NOT NULL,
+          best_match_score REAL
+        );
+      `);
+      db.prepare("INSERT INTO agents (id, name, umbrella_type, is_active) VALUES (?, ?, ?, ?)")
+        .run("u-debio-g", "Debio Sertifisering", "certifier", 0);
+      db.prepare("INSERT INTO agents (id, name, organisasjonsnummer, role) VALUES (?, ?, ?, ?)")
+        .run("p-would-match-g", "Aalrust Gård AS", "111222333", "producer");
+      initModRfb.__setDbForTesting(db);
+
+      const dcc = require("../src/services/debio-cross-check");
+      let fetchCalled = false;
+      const stubFetchNeverCalled = async () => {
+        fetchCalled = true;
+        throw new Error("rfb-crosscheck-guard: fetch must never be called while Debio is inactive");
+      };
+
+      const result = await dcc.runDebioCrossCheck({
+        since: "2026-01-01",
+        fetchImpl: stubFetchNeverCalled as any,
+        delayMs: 0,
+        source: "finnoko",
+      });
+
+      assertEq(fetchCalled, false, "rfb-crosscheck-guard: no network call made — guard returns before dispatching to any source");
+      assertEq(result.affiliations_upserted, 0, "rfb-crosscheck-guard: 0 affiliations upserted while Debio is inactive");
+      assertEq(result.agents_matched, 0, "rfb-crosscheck-guard: 0 agents matched while Debio is inactive");
+      assertTrue(
+        result.errors.some((e: string) => /deactivat|inactive/i.test(e)),
+        "rfb-crosscheck-guard: result.errors explains the no-op (deactivated/inactive)"
+      );
+      const affCount = db.prepare("SELECT COUNT(*) AS c FROM agent_affiliations").get() as any;
+      assertEq(affCount.c, 0, "rfb-crosscheck-guard: no agent_affiliations rows written");
+    } catch (err) {
+      failed++;
+      failures.push(`rfb-crosscheck-guard: unexpected error: ${err instanceof Error ? (err.stack || err.message) : String(err)}`);
+    } finally {
+      initModRfb.__setDbForTesting(prevDbRfb);
+      db.close();
+    }
+  }
+})().then(
+  () => _rfbDebioSuiteResolve(),
+  (err) => {
+    failed++;
+    failures.push(`rfb-suite: unexpected top-level error: ${err instanceof Error ? (err.stack || err.message) : String(err)}`);
+    _rfbDebioSuiteResolve();
+  }
+);
