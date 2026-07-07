@@ -26,6 +26,7 @@ import { getDb } from "../database/init";
 import { conversationService } from "../services/conversation-service";
 import { getTrafficStats } from "../services/traffic-stats";
 import { isDisplayablePhone } from "../services/contact-normalizer";
+import { getProfileActivity } from "../services/profile-activity-service";
 import { slugify } from "../utils/slug";
 import { addUtmParams } from "../utils/url-utm";
 import { INDEXNOW_KEY } from "../services/indexnow-service";
@@ -2279,13 +2280,20 @@ const PROFILE_CSS = `
   }
   /* Visibility tiles (humans / AI) — hidden until JS confirms there is data */
   .pf-stat[data-stat] { display: none; }
-  /* AI-conversations card */
-  .conv-list { display: flex; flex-direction: column; gap: 12px; }
-  .conv-item { padding: 12px 14px; background: var(--g100); border-radius: var(--r-md); border-left: 3px solid #c4b5fd; }
-  .conv-head { display: flex; align-items: center; gap: 8px; font-size: 0.78rem; color: var(--g500); margin-bottom: 6px; }
-  .conv-src { font-weight: 700; color: #6d28d9; }
-  .conv-text { font-size: 0.9rem; color: var(--g700); line-height: 1.55; font-style: italic; }
-  #pf-conv-card { display: none; }
+  /* dev-request 2026-07-03-agent-profile-conversations-stats slice 2:
+     server-rendered "Aktivitet" panel — replaces the old client-hydrated
+     "Siste samtaler" quote list (raw conversation text) with aggregated,
+     non-fabricated numbers computed in profile-activity-service.ts. */
+  .act-grid { display: flex; flex-wrap: wrap; gap: 14px; margin-bottom: 4px; }
+  .act-stat { flex: 1 1 140px; padding: 12px 14px; background: var(--g100); border-radius: var(--r-md); }
+  .act-stat strong { display: block; font-size: 1.3rem; }
+  .act-stat small { font-size: 0.72rem; color: var(--g500); }
+  .act-terms { display: flex; flex-wrap: wrap; gap: 8px; }
+  .act-term { padding: 6px 12px; background: var(--green-50); color: var(--green-700); border-radius: 20px; font-size: 0.8rem; font-weight: 600; }
+  .act-badges { display: flex; flex-wrap: wrap; gap: 8px; }
+  .act-badge { display: inline-flex; align-items: center; gap: 5px; padding: 5px 12px; background: var(--g100); border-radius: 20px; font-size: 0.78rem; font-weight: 600; color: var(--g700); }
+  .act-sub { font-size: 0.72rem; text-transform: uppercase; letter-spacing: 0.5px; color: var(--g500); font-weight: 600; margin: 14px 0 8px; }
+  .act-sub:first-child { margin-top: 0; }
   /* PR-30: freshness badge — subtle, sits between badges and name */
   .profile-meta { margin: 0 0 8px; font-size: 0.78rem; color: var(--g500); }
   .profile-meta .updated-at { color: var(--g500); }
@@ -3170,9 +3178,22 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
     // Contact items
     const contactItems: string[] = [];
     if (k.address) contactItems.push(`<div class="ct-item"><div class="ct-icon">&#128205;</div><div><div class="ct-label">Adresse</div><div class="ct-val">${escapeHtml(k.address)}${k.postalCode ? `, ${escapeHtml(k.postalCode)}` : ""}</div></div></div>`);
-    if (isDisplayablePhone(k.phone)) contactItems.push(`<div class="ct-item"><div class="ct-icon">&#128222;</div><div><div class="ct-label">Telefon</div><div class="ct-val"><a href="tel:${k.phone.replace(/\s+/g, "")}">${escapeHtml(k.phone)}</a></div></div></div>`);
-    if (k.email) contactItems.push(`<div class="ct-item"><div class="ct-icon">&#9993;</div><div><div class="ct-label">E-post</div><div class="ct-val"><a href="mailto:${k.email}">${escapeHtml(k.email)}</a></div></div></div>`);
-    if (k.website) contactItems.push(`<div class="ct-item"><div class="ct-icon">&#127760;</div><div><div class="ct-label">Nettside</div><div class="ct-val"><a href="${escapeHtml(addUtmParams(k.website))}" target="_blank" rel="noopener">${escapeHtml(k.website.replace(/^https?:\/\//, ""))}</a></div></div></div>`);
+    // ─── dev-request 2026-07-03-agent-profile-conversations-stats slice 2
+    // (work item 3): mailto:/tel: get a data-track-kind hook (beacon fired
+    // by a delegated click listener at the bottom of this page — see the
+    // <script> block below; addEventListener only, no inline onclick= —
+    // this platform's CSP/SES setup forbids inline handlers). The beacon
+    // is fire-and-forget and never blocks navigation, so these links keep
+    // working identically with JS disabled or if the beacon call fails.
+    if (isDisplayablePhone(k.phone)) contactItems.push(`<div class="ct-item"><div class="ct-icon">&#128222;</div><div><div class="ct-label">Telefon</div><div class="ct-val"><a href="tel:${k.phone.replace(/\s+/g, "")}" data-track-kind="phone">${escapeHtml(k.phone)}</a></div></div></div>`);
+    if (k.email) contactItems.push(`<div class="ct-item"><div class="ct-icon">&#9993;</div><div><div class="ct-label">E-post</div><div class="ct-val"><a href="mailto:${k.email}" data-track-kind="email">${escapeHtml(k.email)}</a></div></div></div>`);
+    // Website now routes through the counting redirect (GET /ut/:agentId/website,
+    // src/routes/contact-tracking.ts) instead of linking straight to
+    // agent_knowledge.website. This works with JS fully disabled (it's a
+    // plain server-side 302), and still carries the same default UTM tags
+    // the direct link used to (resolveRedirectUrl applies addUtmParams for
+    // the "website" kind specifically — see that file).
+    if (k.website) contactItems.push(`<div class="ct-item"><div class="ct-icon">&#127760;</div><div><div class="ct-label">Nettside</div><div class="ct-val"><a href="/ut/${encodeURIComponent(agent.id)}/website" target="_blank" rel="noopener">${escapeHtml(k.website.replace(/^https?:\/\//, ""))}</a></div></div></div>`);
 
     // Google Maps link — ALWAYS search by business name, never raw coordinates.
     // Our lat/lng are often just city-center approximations, not actual business
@@ -3301,7 +3322,24 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
       : "";
 
     // External links (social media etc.)
+    // dev-request 2026-07-03-agent-profile-conversations-stats slice 2 (work
+    // item 3): route each link through GET /ut/:agentId/external:<type>
+    // (contact-tracking.ts) instead of linking to l.url directly, so a click
+    // is recorded server-side — same no-JS-required counting redirect as the
+    // website link above. resolveRedirectUrl() looks the target up by
+    // `externalLinks.find(link => link.type === type)` — i.e. the FIRST link
+    // of that type — so if an agent ever has two links sharing the same
+    // `type` (no DB constraint prevents it), rewriting both to the same
+    // /ut/ URL would silently redirect the second one to the first one's
+    // target. Guard against that by only tracking types that are unique
+    // among this agent's own externalLinks; anything else falls back to the
+    // untracked direct link so navigation is never wrong.
     const linksList = Array.isArray(k.externalLinks) ? k.externalLinks : [];
+    const linkTypeCounts = new Map<string, number>();
+    for (const l of linksList) {
+      const t = typeof l?.type === "string" ? l.type.trim().toLowerCase() : "";
+      if (t) linkTypeCounts.set(t, (linkTypeCounts.get(t) || 0) + 1);
+    }
     const linksHtml = linksList.length
       ? linksList.map((l: any) => {
           const icon = l.type === "social" && l.label?.toLowerCase().includes("facebook") ? "&#128101;"
@@ -3309,7 +3347,12 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
             : l.type === "maps" ? "&#128506;"
             : l.type === "shop" ? "&#128722;"
             : "&#128279;";
-          return `<a href="${escapeHtml(l.url)}" class="ext-link" target="_blank" rel="noopener">${icon} ${escapeHtml(l.label || "Lenke")}</a>`;
+          const rawType = typeof l.type === "string" ? l.type.trim().toLowerCase() : "";
+          const canTrack = !!rawType && /^[a-z0-9_-]{1,40}$/.test(rawType) && linkTypeCounts.get(rawType) === 1;
+          const href = canTrack
+            ? `/ut/${encodeURIComponent(agent.id)}/external:${rawType}`
+            : escapeHtml(l.url);
+          return `<a href="${href}" class="ext-link" target="_blank" rel="noopener">${icon} ${escapeHtml(l.label || "Lenke")}</a>`;
         }).join("")
       : "";
 
@@ -3616,6 +3659,56 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
       console.error("[seo] related-producers query failed:", e);
     }
 
+    // ─── dev-request 2026-07-03-agent-profile-conversations-stats slice 2
+    // (work item 4): server-rendered "Aktivitet" panel, replacing the old
+    // client-hydrated "Siste samtaler" (raw conversation quotes) block.
+    // All numbers come straight from profile-activity-service.ts — see
+    // that file for exactly which tables/columns back each figure and why
+    // (e.g. why query-term aggregation uses conversations.query_text and
+    // not analytics_queries). Fail-quiet, same pattern as every other
+    // supplementary section on this page: a query error hides the section,
+    // it never 500s the whole profile.
+    const PLATFORM_BADGE_LABELS: Record<string, { en: string; no: string; icon: string }> = {
+      web: { en: "Web", no: "Web", icon: "&#127760;" },
+      chatgpt: { en: "ChatGPT", no: "ChatGPT", icon: "&#129302;" },
+      claude: { en: "Claude", no: "Claude", icon: "&#129302;" },
+      a2a: { en: "A2A", no: "A2A", icon: "&#128260;" },
+      mcp: { en: "MCP", no: "MCP", icon: "&#128268;" },
+    };
+    let activityHtml = "";
+    try {
+      const activity = getProfileActivity(getDb(), agent.id, `/produsent/${slug}`);
+      const { views30, topQueryTerms, platforms } = activity;
+      const hasAnyActivity = views30.human > 0 || views30.ai > 0 || topQueryTerms.length > 0 || platforms.length > 0;
+
+      if (hasAnyActivity) {
+        const statsHtml = `<div class="act-grid">
+          <div class="act-stat"><strong>${views30.human.toLocaleString(lang === "en" ? "en-GB" : "nb-NO")}</strong><small>${lang === "en" ? "Profile views · 30d" : "Profilvisninger · 30d"}</small></div>
+          <div class="act-stat"><strong>${views30.ai.toLocaleString(lang === "en" ? "en-GB" : "nb-NO")}</strong><small>${lang === "en" ? "AI-agent lookups · 30d" : "AI-agent-oppslag · 30d"}</small></div>
+        </div>`;
+
+        const termsHtml = topQueryTerms.length
+          ? `<div class="act-sub">${lang === "en" ? "What people search for" : "Hva folk søker etter"}</div>
+             <div class="act-terms">${topQueryTerms.map(q => `<span class="act-term">${escapeHtml(q.term)}</span>`).join("")}</div>`
+          : "";
+
+        const badgesHtml = platforms.length
+          ? `<div class="act-sub">${lang === "en" ? "Discovered / contacted via" : "Oppdaget / tatt kontakt via"}</div>
+             <div class="act-badges">${platforms.map(p => {
+               const meta = PLATFORM_BADGE_LABELS[p];
+               return `<span class="act-badge">${meta.icon} ${escapeHtml(lang === "en" ? meta.en : meta.no)}</span>`;
+             }).join("")}</div>`
+          : "";
+
+        activityHtml = `<div class="card">
+          <div class="card-head"><span>&#128200;</span><h3>${lang === "en" ? "Activity" : "Aktivitet"}</h3></div>
+          <div class="card-body">${statsHtml}${termsHtml}${badgesHtml}</div>
+        </div>`;
+      }
+    } catch (e) {
+      console.error("[seo] profile-activity query failed:", e);
+    }
+
     const content = `
     <div class="bc"><a href="/">Hjem</a>${cityName ? `<span>/</span><a href="/${slugify(cityName)}">${escapeHtml(cityName)}</a>` : ""}<span>/</span>${escapeHtml(agent.name)}</div>
 
@@ -3660,7 +3753,7 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
         <h3>${lang === "en" ? "Contact information" : "Kontaktinformasjon"}</h3>
         ${contactItems.join("") || `<p style="color:var(--g500);font-size:0.88rem;">${lang === "en" ? "No contact info available yet." : "Ingen kontaktinfo tilgjengelig enn\u00e5."}</p>`}
         <div class="ct-actions">
-          ${k.website ? `<a href="${escapeHtml(addUtmParams(k.website))}" class="btn-p" target="_blank" rel="noopener">&#127760; Bes\u00f8k nettside</a>` : ""}
+          ${k.website ? `<a href="/ut/${encodeURIComponent(agent.id)}/website" class="btn-p" target="_blank" rel="noopener">&#127760; Bes\u00f8k nettside</a>` : ""}
           <a href="${mapsUrl}" class="btn-s" target="_blank" rel="noopener">&#128506; Vis p\u00e5 kart</a>
           <a href="${BASE_URL}/api/marketplace/agents/${agent.id}/vcard" class="btn-s">&#128195; Last ned kontaktkort</a>
         </div>
@@ -3669,12 +3762,12 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
 
     <div class="pf-content">
       <div class="pf-main">
-        <!-- Per-agent stats: hidden until /api/agents/<id>/stats fills it.
-             Sits between Trust score and Produkter per Daniels brief. -->
-        <div id="pf-conv-card" class="card">
-          <div class="card-head"><span>&#128172;</span><h3>${lang === "en" ? "Recent conversations with AI agents" : "Siste samtaler med AI-agenter"}</h3></div>
-          <div class="card-body"><div id="pf-conv-list" class="conv-list"></div></div>
-        </div>
+        <!-- dev-request 2026-07-03-agent-profile-conversations-stats slice 2:
+             server-rendered "Aktivitet" panel (aggregated, non-fabricated
+             numbers) — replaces the old client-hydrated raw-conversation
+             list. Sits between Trust score and Produkter per Daniels brief,
+             same slot the old block occupied. -->
+        ${activityHtml}
 
         ${imagesHtml ? `
         <div class="card">
@@ -3771,9 +3864,19 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
 
     <script>
       // Per-agent stats hydration. Server keeps the page cacheable; this
-      // small fetch personalises the visibility tiles + AI-conversation
-      // card client-side. Fail-quiet: if the API errors or returns 0,
-      // the placeholders stay hidden (display:none in PROFILE_CSS).
+      // small fetch personalises the visibility tiles client-side.
+      // Fail-quiet: if the API errors or returns 0, the placeholders stay
+      // hidden (display:none in PROFILE_CSS).
+      //
+      // dev-request 2026-07-03-agent-profile-conversations-stats slice 2
+      // (work item 3): also attaches a single delegated click listener that
+      // fires the contact-click beacon (POST /api/track/contact-click,
+      // src/routes/contact-tracking.ts, already merged in PR-128) for
+      // mailto:/tel: links. Delegated + addEventListener only — this
+      // platform's CSP/SES setup forbids inline onclick= handlers. Never
+      // calls preventDefault(), so the mailto:/tel: navigation always
+      // proceeds identically whether the beacon succeeds, fails, or
+      // (JS-disabled) never runs at all.
       (function () {
         var agentId = ${JSON.stringify(agent.id)};
         var url = "/api/agents/" + encodeURIComponent(agentId) + "/stats";
@@ -3799,40 +3902,23 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
                 if (parts.length) a.setAttribute("title", parts.join(" · "));
               }
             }
-            if (s.lastConversations && s.lastConversations.length > 0) {
-              var srcLabel = function (src) {
-                if (src === "a2a") return ${JSON.stringify(lang === "en" ? "A2A agent" : "A2A-agent")};
-                if (src === "mcp") return ${JSON.stringify(lang === "en" ? "MCP client" : "MCP-klient")};
-                if (src === "web") return "Web";
-                return ${JSON.stringify(lang === "en" ? "Agent" : "Agent")};
-              };
-              var EN = ${JSON.stringify(lang === "en")};
-              var relTime = function (iso) {
-                if (!iso) return "";
-                var d = Math.floor((Date.now() - new Date(iso).getTime()) / 86400000);
-                if (d <= 0) return EN ? "today" : "i dag";
-                if (d === 1) return EN ? "yesterday" : "i går";
-                if (d < 7) return d + (EN ? " days ago" : " dager siden");
-                if (d < 30) return Math.floor(d / 7) + (EN ? " weeks ago" : " uker siden");
-                if (d < 365) return Math.floor(d / 30) + (EN ? " months ago" : " måneder siden");
-                return Math.floor(d / 365) + (EN ? " years ago" : " år siden");
-              };
-              var escape = function (t) {
-                return String(t || "").replace(/&/g, "&amp;").replace(/</g, "&lt;")
-                  .replace(/>/g, "&gt;").replace(/"/g, "&quot;").replace(/'/g, "&#39;");
-              };
-              var html = s.lastConversations.map(function (c) {
-                return '<div class="conv-item">' +
-                  '<div class="conv-head"><span>&#129302;</span><span class="conv-src">' + escape(srcLabel(c.source)) + '</span><span>&middot; ' + escape(relTime(c.createdAt)) + '</span></div>' +
-                  '<div class="conv-text">&ldquo;' + escape(c.question) + '&rdquo;</div>' +
-                  '</div>';
-              }).join("");
-              var list = document.getElementById("pf-conv-list");
-              var card = document.getElementById("pf-conv-card");
-              if (list && card) { list.innerHTML = html; card.style.display = "block"; }
-            }
           })
           .catch(function () { /* fail-quiet — no UI on error */ });
+
+        document.addEventListener("click", function (e) {
+          var link = e.target && e.target.closest ? e.target.closest("a[data-track-kind]") : null;
+          if (!link) return;
+          var kind = link.getAttribute("data-track-kind");
+          if (!kind) return;
+          try {
+            var payload = JSON.stringify({ agentId: agentId, kind: kind });
+            if (navigator.sendBeacon) {
+              navigator.sendBeacon("/api/track/contact-click", new Blob([payload], { type: "application/json" }));
+            } else {
+              fetch("/api/track/contact-click", { method: "POST", headers: { "Content-Type": "application/json" }, body: payload, keepalive: true }).catch(function () {});
+            }
+          } catch (_) { /* never block mailto:/tel: navigation on a tracking failure */ }
+        });
       })();
     </script>`;
 
