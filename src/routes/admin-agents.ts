@@ -29,8 +29,87 @@
 import { Router, Request, Response } from "express";
 import { getDb } from "../database/init";
 import { slugify } from "../utils/slug";
+import { verifyOrgNumber, type BrregVerifyResult } from "../services/brreg-client";
 
 const router = Router();
+
+// ─── Slice 2 of dev-request 2026-06-30-brreg-verification-gate ─────────
+// Wires verifyOrgNumber() (services/brreg-client.ts, Slice 1) into
+// POST /admin/agents/register for the "rfb" and "experiences" verticals
+// only — "dental" stays Legelisten-primary and is never Brreg-verified
+// here (brreg_* columns stay at their DB defaults for dental rows).
+//
+// Feature flag: BRREG_VERIFY_ON_REGISTER — same `=== "true"` truthy-check
+// convention as the sibling BRREG_NACE_DISCOVERY_ENABLED flag in
+// scheduled-agents/brreg-nace-discovery.md (which defaults OFF/dry-run
+// until Daniel flips it after a verified dry-run). We follow that same
+// conservative default here: unset/falsy → skip verification entirely,
+// so registration behaves exactly as it did before this slice. This is
+// deliberately the rollback lever — Brreg outages or bad NACE data can
+// be neutralised instantly by unsetting the env var, with zero code change.
+function brregVerifyEnabled(): boolean {
+  return process.env.BRREG_VERIFY_ON_REGISTER === "true";
+}
+
+// Per-vertical NACE allow-lists — identical to the lists already used by
+// scheduled-agents/brreg-nace-discovery.md's own registration step, so a
+// candidate that discovery already accepted is not silently rejected here.
+const BRREG_NACE_ALLOWLIST: Record<string, readonly string[]> = {
+  rfb: [
+    "01.410", "01.450", "01.460", "01.490", "01.500",
+    "10.110", "10.130", "10.510", "10.710", "11.020",
+    "47.220", "47.270",
+  ],
+  experiences: [
+    "93.291", "93.292", "79.121", "79.901", "79.902",
+    "96.230", "55.200", "55.300",
+  ],
+};
+
+// runBrregVerifyForRegister — computes (brreg_verified, brreg_flag,
+// brreg_checked_at) for a register-time org-nr check. Never throws — any
+// unexpected error (verifyOrgNumber itself already never throws, but we
+// wrap defensively anyway: a Brreg outage must never break registration)
+// resolves to the "unverified, unchecked" tuple.  brreg_checked_at is only
+// stamped once the whole check has completed without error.
+async function runBrregVerifyForRegister(
+  verticalId: string,
+  orgNr: string,
+): Promise<{ brreg_verified: number; brreg_flag: string | null; brreg_checked_at: string | null }> {
+  try {
+    const result: BrregVerifyResult = await verifyOrgNumber(orgNr);
+
+    if (result.flag === "dissolved" || result.flag === "bankrupt") {
+      return { brreg_verified: 0, brreg_flag: result.flag, brreg_checked_at: new Date().toISOString() };
+    }
+    if (!result.exists) {
+      // Per verifyOrgNumber's SAFE_DEFAULT_VERIFY_RESULT contract, both the
+      // not-found (404) and network/parse-error paths resolve with
+      // flag: "no_orgnr" — we mirror that faithfully rather than assume.
+      return { brreg_verified: 0, brreg_flag: "no_orgnr", brreg_checked_at: new Date().toISOString() };
+    }
+    if (result.active && result.flag === null) {
+      const allowList = BRREG_NACE_ALLOWLIST[verticalId] ?? [];
+      const overlap = result.nace.some((code) => allowList.includes(code));
+      return {
+        brreg_verified: overlap ? 1 : 0,
+        brreg_flag: overlap ? null : "wrong_nace",
+        brreg_checked_at: new Date().toISOString(),
+      };
+    }
+    // Exists, not flagged dissolved/bankrupt, but not (active && flag===null)
+    // either — e.g. underAvvikling/underTvangsavviklingEllerTvangsopplosning
+    // with no slettedato/konkurs. Not explicitly specced; treated as
+    // inconclusive rather than invented into one of the named flags.
+    return { brreg_verified: 0, brreg_flag: null, brreg_checked_at: new Date().toISOString() };
+  } catch (err) {
+    console.warn(
+      "[admin-agents] brreg verify failed unexpectedly (registration proceeds regardless):",
+      err instanceof Error ? err.message : err,
+    );
+    return { brreg_verified: 0, brreg_flag: null, brreg_checked_at: null };
+  }
+}
 
 function getAdminKey(): string {
   return process.env.ADMIN_KEY || process.env.ANALYTICS_ADMIN_KEY || "";
@@ -194,7 +273,7 @@ router.get("/", (req: Request, res: Response) => {
 //   vertical_id  → confirmed via ALTER TABLE (Phase 4.6a)
 //   data_source  → on agent_knowledge, NOT agents — excluded
 //   auto_sources → on agent_knowledge, NOT agents — excluded
-router.post("/register", (req: Request, res: Response) => {
+router.post("/register", async (req: Request, res: Response) => {
   if (!requireAdmin(req, res)) return;
 
   // ── Validate required fields ───────────────────────────────
@@ -290,6 +369,26 @@ router.post("/register", (req: Request, res: Response) => {
     if (nace_code) builtTags.push(`nace:${nace_code}`);
     if (extraTags && Array.isArray(extraTags)) builtTags.push(...extraTags);
 
+    // ── Slice 2 of dev-request 2026-06-30-brreg-verification-gate ────
+    // rfb + experiences only — dental stays Legelisten-primary, brreg_*
+    // columns stay at their DB defaults (0 / null / null) for dental and
+    // for any registration where the flag is off. Never blocks the
+    // registration itself, regardless of outcome.
+    let brreg_verified = 0;
+    let brreg_flag: string | null = null;
+    let brreg_checked_at: string | null = null;
+
+    if (
+      brregVerifyEnabled() &&
+      (vertical_id === "rfb" || vertical_id === "experiences") &&
+      org_nr
+    ) {
+      const verifyOutcome = await runBrregVerifyForRegister(vertical_id, org_nr);
+      brreg_verified = verifyOutcome.brreg_verified;
+      brreg_flag = verifyOutcome.brreg_flag;
+      brreg_checked_at = verifyOutcome.brreg_checked_at;
+    }
+
     // ── Insert ───────────────────────────────────────────────
     // vertical_id is confirmed present (Phase 4.6a ALTER TABLE).
     // data_source + auto_sources live on agent_knowledge, not agents — excluded.
@@ -304,14 +403,16 @@ router.post("/register", (req: Request, res: Response) => {
         city, lat, lng,
         categories, tags,
         trust_score, is_active, is_verified,
-        vertical_id
+        vertical_id,
+        org_nr, brreg_verified, brreg_flag, brreg_checked_at
       ) VALUES (
         ?, ?, ?, ?, ?, ?,
         'producer', ?,
         ?, ?, ?,
         ?, ?,
         0.3, 1, 0,
-        ?
+        ?,
+        ?, ?, ?, ?
       )`
     ).run(
       id,
@@ -327,6 +428,10 @@ router.post("/register", (req: Request, res: Response) => {
       JSON.stringify(categories && Array.isArray(categories) ? categories : []),
       JSON.stringify(builtTags),
       vertical_id,
+      org_nr,
+      brreg_verified,
+      brreg_flag,
+      brreg_checked_at,
     );
 
     res.status(201).json({
