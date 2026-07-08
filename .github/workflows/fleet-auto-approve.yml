@@ -202,8 +202,20 @@ jobs:
               owner, repo, ref: pr.head.sha, per_page: 100,
             });
             const statusesOk = combined.state === 'success' || (combined.state === 'pending' && combined.statuses.length === 0);
-            const checksIncomplete = checkRuns.check_runs.some(r => r.status !== 'completed');
-            const checksFailed = checkRuns.check_runs.some(r => r.status === 'completed' && !['success', 'skipped', 'neutral'].includes(r.conclusion));
+            // Self-check race: this very workflow's own check runs (the `resolve-pr`
+            // and `evaluate` jobs of fleet-auto-approve.yml, whose check-run `name`
+            // defaults to the job's display name since neither sets a custom `name:`)
+            // are themselves part of checkRuns.check_runs for this head SHA. While
+            // this `evaluate` job is mid-execution, its own check run's `status` is
+            // necessarily `in_progress` — never `completed` — so without excluding
+            // them, checksIncomplete would be permanently true for any PR whose only
+            // non-completed check is fleet-auto-approve's own, and the gate could
+            // never pass. Exclude them from both the incomplete and failed checks.
+            // Keep this list in sync if either job is ever renamed.
+            const OWN_JOB_NAMES = ['resolve-pr', 'evaluate'];
+            const externalCheckRuns = checkRuns.check_runs.filter(r => !OWN_JOB_NAMES.includes(r.name));
+            const checksIncomplete = externalCheckRuns.some(r => r.status !== 'completed');
+            const checksFailed = externalCheckRuns.some(r => r.status === 'completed' && !['success', 'skipped', 'neutral'].includes(r.conclusion));
             if (checksIncomplete) {
               core.info('checks still running — waiting');
               return;
