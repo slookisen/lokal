@@ -64,6 +64,7 @@ jobs:
       contents: write
       checks: read
       statuses: read
+      actions: write   # needed to dispatch fly-deploy.yml after merging (see fallback below)
     steps:
       - name: Gate + approve + enable auto-merge
         id: gate
@@ -266,5 +267,34 @@ jobs:
               }
               await note(`approved, but could not enable auto-merge (${e.message}) — merge manually or re-run once checks settle.`);
             });
+
+            // Deploy-trigger fallback (2026-07-08, dev-request
+            // 2026-07-08-fleet-auto-approve-merge-does-not-trigger-deploy): a merge made with
+            // the default GITHUB_TOKEN (both the direct-merge fallback above and the eventual
+            // auto-merge queued by enablePullRequestAutoMerge) never fires fly-deploy.yml's
+            // `push: [main]` trigger — GitHub suppresses new workflow runs caused by the
+            // built-in GITHUB_TOKEN to prevent recursive triggering. An explicit
+            // workflow_dispatch call is a direct API request, not an implicit event cascade,
+            // so it is NOT subject to that suppression. Poll briefly for the merge to actually
+            // land (auto-merge completion is async), then dispatch fly-deploy.yml so every
+            // fleet auto-merge reliably deploys without a human/PAT push needing to follow it.
+            let merged = false;
+            for (let i = 0; i < 6; i++) {
+              const { data: check } = await github.rest.pulls.get({ owner, repo, pull_number: prNumber });
+              if (check.merged) { merged = true; break; }
+              await new Promise(r => setTimeout(r, 3000));
+            }
+            if (merged) {
+              try {
+                await github.rest.actions.createWorkflowDispatch({
+                  owner, repo, workflow_id: 'fly-deploy.yml', ref: 'main',
+                });
+                core.info('Dispatched fly-deploy.yml for the merge commit.');
+              } catch (dispatchErr) {
+                await note(`merged, but could not dispatch fly-deploy.yml (${dispatchErr.message}) — trigger it manually or push to main.`);
+              }
+            } else {
+              await note('approved/merge-enabled, but merge was not confirmed within ~18s — fly-deploy.yml was not auto-dispatched this run. Check /health.git_sha once merged and dispatch fly-deploy.yml manually if it has not advanced.');
+            }
 
             core.info(`PR #${prNumber} auto-approved.`);
