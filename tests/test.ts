@@ -17796,6 +17796,18 @@ const _orchPr20260614_2Promise = (async () => {
   });
   assertTrue(!p6.inActiveWindow, "dispatch: 02:00 UTC is outside active window");
   assertEq(p6.wake.length, 0, "dispatch: paused window -> no wake");
+
+  // Worker agents (added for remediation-wakes-worker-directly, loop-reliability-backend
+  // item 5) are now allowlisted and share the same generic rate-limits as the control plane.
+  for (const worker of ["rfb-customer-service", "lokal-agent-enrichment", "experiences-enrichment"]) {
+    const p7 = computeWakeList([mk("r9", "orchestrator-v3-controller", 1, [worker])], { nowMs: baseUTC });
+    assertEq(p7.wake.length, 1, `dispatch: worker ${worker} is allowlisted -> 1 wake`);
+    assertEq(p7.wake[0]!.agent, worker, `dispatch: wakes the suggested worker ${worker}`);
+  }
+
+  // Still-unlisted worker (e.g. marketing-comms-agent) stays skipped -> allowlist is additive, not opened wide.
+  const p8 = computeWakeList([mk("r10", "orchestrator-v3-controller", 1, ["marketing-comms-agent"])], { nowMs: baseUTC });
+  assertEq(p8.wake.length, 0, "dispatch: still-unlisted worker -> no wake");
 }
 
 // -- envelope timestamp normalization (pure) --
