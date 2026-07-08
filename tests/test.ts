@@ -190,6 +190,21 @@ console.log("\n── orch-pr-10: search-enrich pure decision logic ──");
   console.log(`  search-enrich: ${r.passed} passed, ${r.failed} failed`);
 }
 
+// ── dev-request 2026-07: experience filter tags (derived, additive-only) ──
+// Daniel confirmed "tags/filters only, no new categories" for experiences.
+// Pins deriveExperienceTags() (services/experience-tags.ts) against the
+// actual experiences-row fields so the heuristics can't silently drift.
+console.log("\n── experience-tags (derived filter tags) ──");
+{
+  const { runExperienceTagsTests } = require("../src/services/experience-tags.test") as
+    typeof import("../src/services/experience-tags.test");
+  const r = runExperienceTagsTests({ log: false });
+  passed += r.passed;
+  failed += r.failed;
+  for (const f of r.failures) failures.push("experience-tags: " + f);
+  console.log(`  experience-tags: ${r.passed} passed, ${r.failed} failed`);
+}
+
 // ── orchestrator-pr-13: conservative address/phone contact-normalizer ──
 // Pins the formatting-only relaxation in cross-source-validator (clears
 // formatting-only review_required) while keeping genuine conflicts gated.

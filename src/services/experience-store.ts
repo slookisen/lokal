@@ -18,6 +18,7 @@ import { v4 as uuid } from "uuid";
 import { z } from "zod";
 import { getDb } from "../database/db-factory";
 import { fylkeEquivalents } from "./norway-fylke";
+import { deriveExperienceTags, type ExperienceTag } from "./experience-tags";
 
 const VERTICAL = "experiences";
 
@@ -146,8 +147,13 @@ function slugify(s: string): string {
     .slice(0, 80);
 }
 
-function hydrateExperience(row: Record<string, unknown>): Experience & { id: string } {
-  return {
+// Additive-only cross-cutting filter tags (Daniel dev-request, 2026-07):
+// derived from fields that already exist on the row — see experience-tags.ts.
+// No schema change; computed at read time and attached to every hydrated
+// experience so discoverExperiences()/getExperienceById()/
+// getPublishedExperienceBySlug() callers get it for free.
+function hydrateExperience(row: Record<string, unknown>): Experience & { id: string; tags: ExperienceTag[] } {
+  const base = {
     id: row.id as string,
     provider_id: (row.provider_id as string | null) ?? null,
     provider_match_status: (row.provider_match_status as Experience["provider_match_status"]) ?? "unmatched",
@@ -188,6 +194,7 @@ function hydrateExperience(row: Record<string, unknown>): Experience & { id: str
     seasonal_valid_from: (row.seasonal_valid_from as string | null) ?? null,
     seasonal_valid_to: (row.seasonal_valid_to as string | null) ?? null,
   };
+  return { ...base, tags: deriveExperienceTags(base) };
 }
 
 // ─── Providers ──────────────────────────────────────────────────────
@@ -294,7 +301,7 @@ export function createExperience(input: Experience): string {
   return id;
 }
 
-export function getExperienceById(id: string): (Experience & { id: string }) | null {
+export function getExperienceById(id: string): (Experience & { id: string; tags: ExperienceTag[] }) | null {
   const db = getDb(VERTICAL);
   const row = db.prepare("SELECT * FROM experiences WHERE id = ?").get(id) as Record<string, unknown> | undefined;
   return row ? hydrateExperience(row) : null;
@@ -312,7 +319,7 @@ const PUBLISH_GATE_SQL =
 
 export function getPublishedExperienceBySlug(
   slug: string
-): (Experience & { id: string }) | null {
+): (Experience & { id: string; tags: ExperienceTag[] }) | null {
   if (!slug) return null;
   const db = getDb(VERTICAL);
   const row = db
@@ -787,7 +794,7 @@ export function searchPublishedExperiences(query: string, limit = 30): Experienc
 export function discoverExperiences(
   filter: DiscoverFilter = {},
   limit = 20
-): Array<Experience & { id: string }> {
+): Array<Experience & { id: string; tags: ExperienceTag[] }> {
   const f = DiscoverFilterSchema.parse(filter);
   const db = getDb(VERTICAL);
 
