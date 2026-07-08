@@ -46,12 +46,25 @@ export interface DispatchPlan {
   skip: SkipDecision[];
 }
 
-/** The only agents the dispatcher may ever wake (the control plane). */
+/**
+ * The only agents the dispatcher may ever wake. The control plane (first 4) may be
+ * woken by any agent's `next_suggested`. The three workers below were added so
+ * remediation can wake the worker directly instead of waiting on its own cron
+ * (`dev-requests/2026-07-01-loop-reliability-backend.md` item 5, "Worker-fireability").
+ * Workers share the same generic cooldown/window rate-limits as the control plane —
+ * no separate mechanism. Discipline (enforced in each worker's own SKILL, not here):
+ * a worker's `next_suggested` may only name a control-plane agent, never another
+ * worker — this allowlist governs who may be a wake *target*, not what a woken
+ * worker itself may emit, so it does not by itself prevent a worker→worker loop.
+ */
 export const DEFAULT_ALLOWLIST: string[] = [
   "platform-orchestrator",
   "orchestrator-v3-controller",
   "rfb-supervisor",
   "platform-verifier",
+  "rfb-customer-service",
+  "lokal-agent-enrichment",
+  "experiences-enrichment",
 ];
 
 /**
