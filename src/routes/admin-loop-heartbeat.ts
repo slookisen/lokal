@@ -48,7 +48,15 @@ function clampInt(raw: unknown, def: number, min: number, max: number): number {
 function readHealth(req: Request): LoopHealth {
   const sinceHours = clampInt(req.query.since_hours, 6, 1, 48);
   const runs = listRecentRuns({ sinceHours, limit: 500 });
-  return computeLoopHealth(runs, { nowMs: Date.now() });
+  // Exclude loop-dispatch fire-markers (dev-requests/2026-07-08-loop-dispatch-fire-marker-dedup.md):
+  // a marker only proves a /fire call was made, not that the woken agent actually
+  // completed a real cycle. Counting it as a heartbeat would let the watchdog go
+  // quiet for an agent whose real cron is broken, as long as something keeps
+  // waking it via next_suggested -- masking exactly the failure this endpoint
+  // exists to catch. listRecentRuns itself stays unfiltered (the dispatcher's own
+  // cooldown in admin-loop-dispatch.ts needs to see fire-markers).
+  const realRuns = runs.filter((r) => !r.run_id.startsWith("firemarker-"));
+  return computeLoopHealth(realRuns, { nowMs: Date.now() });
 }
 
 function alertText(h: LoopHealth): string {
