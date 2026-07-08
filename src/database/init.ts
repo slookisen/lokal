@@ -2485,6 +2485,80 @@ function initSchema(db: Database.Database): void {
     console.error("Migration deactivate_debio_delete_norsk_gardsmat_v1 failed:", err);
   }
 
+  // ─── dev-request 2026-07-06-rfb-salgskanal-kategorier (datamodel slice) ──
+  // "Salgskanal" (sales-channel) grouping: browsable-by-how-you-buy, distinct
+  // from product categories (vegetables/fruit/...) and umbrella orgs
+  // (Hanen/Debio/Bondens marked). Five categories in v1 (Daniel-confirmed
+  // live 2026-07-06): Selvplukk, Hjemlevering, Gårdsbutikk, Gårdskafé/
+  // servering, REKO-ring. Membership is 100% auto-derived by
+  // services/salgskanal-matcher.ts (keyword/regex heuristics over
+  // name/description/tags/skills) — NO manual curation by default, but
+  // `source='manual'` rows are preserved across matcher re-runs (see
+  // runSalgskanalSweep()) so an admin override always survives.
+  //
+  // Additive only: two brand-new tables, no changes to existing tables'
+  // existing columns. This is the datamodel + auto-matcher slice only
+  // (work item 1-2 of the dev-request's Spec); the public landing pages
+  // (work item 3), homepage discoverability (work item 4), and the
+  // AI-discovery/MCP surface (work item 5) are explicitly OUT of scope
+  // for this slice and deferred to a follow-up.
+  //
+  // salgskanal_categories: static lookup of the (currently 5) category
+  // definitions. A real table (not a hard-coded enum) so a future slice
+  // can add a 6th category without another migration. sort_order seeds
+  // roughly by measured cohort size (largest first) per the dev-request's
+  // own risk note ("Hjemlevering er tynn i dag — siden må ikke se død ut,
+  // sorter kategoriene etter størrelse") — the future landing-page slice
+  // can rely on it directly.
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS salgskanal_categories (
+      slug TEXT PRIMARY KEY,
+      name TEXT NOT NULL,
+      description TEXT,
+      sort_order INTEGER NOT NULL DEFAULT 0
+    )
+  `);
+  {
+    const seedCategory = db.prepare(`
+      INSERT INTO salgskanal_categories (slug, name, description, sort_order)
+      VALUES (?, ?, ?, ?)
+      ON CONFLICT(slug) DO NOTHING
+    `);
+    const SEED_CATEGORIES: Array<[string, string, string, number]> = [
+      ["gardsbutikk", "Gårdsbutikk", "Produsenter med egen gårdsbutikk eller gårdsutsalg.", 0],
+      ["gardskafe-servering", "Gårdskafé/servering", "Produsenter med egen kafé eller servering på gården.", 1],
+      ["reko-ring", "REKO-ring", "Produsenter som selger via en REKO-ring.", 2],
+      ["selvplukk", "Selvplukk", "Produsenter som tilbyr selvplukk av bær, frukt, grønnsaker m.m.", 3],
+      ["hjemlevering", "Hjemlevering", "Produsenter som tilbyr hjemlevering/utkjøring av varer.", 4],
+    ];
+    for (const row of SEED_CATEGORIES) seedCategory.run(...row);
+  }
+
+  // agent_salgskanal: producer↔category join. UNIQUE(agent_id, category_slug)
+  // keeps the matcher's upserts idempotent on re-runs. `source` mirrors the
+  // agent_affiliations 'inferred' vs human-curated distinction (PR-58/PR-46
+  // pattern above): 'auto' rows are freely refreshed/removed by the matcher
+  // sweep; 'manual' rows are an admin override and the sweep must never
+  // touch them (neither refresh nor delete) — see runSalgskanalSweep().
+  // matched_keywords + evidence_snippet exist for the dev-request's
+  // precision-audit acceptance criterion ("verifier tar 30 tilfeldige
+  // koblinger ... finner belegg i profilen for >= 95%").
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS agent_salgskanal (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      agent_id TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+      category_slug TEXT NOT NULL REFERENCES salgskanal_categories(slug) ON DELETE CASCADE,
+      source TEXT NOT NULL DEFAULT 'auto' CHECK(source IN ('auto','manual')),
+      matched_keywords TEXT,
+      evidence_snippet TEXT,
+      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+      UNIQUE(agent_id, category_slug)
+    )
+  `);
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_agent_salgskanal_category ON agent_salgskanal(category_slug)`);
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_agent_salgskanal_agent ON agent_salgskanal(agent_id)`);
+
 }
 
 export function closeDb(): void {
