@@ -56,6 +56,7 @@ import adminBmEventsRoutes from "./routes/admin-bm-events";
 import adminBmReconcileRoutes from "./routes/admin-bm-reconcile";
 import adminHanenRoutes, { publicRouter as publicHanenRoutes } from "./routes/admin-hanen";
 import adminDebioCrossCheckRoutes from "./routes/admin-debio-cross-check";
+import adminSalgskanalRoutes from "./routes/admin-salgskanal";
 import adminJobsRoutes from "./routes/admin-jobs";
 import platformTriggersRoutes, { adminRouter as adminTriggersRoutes } from "./routes/platform-triggers";
 import crmRoutes from "./routes/crm";
@@ -68,6 +69,7 @@ import { seedData } from "./seed";
 import { discoveryService } from "./services/discovery-service";
 import { trustScoreService } from "./services/trust-score-service";
 import { syncDebioVerifications } from "./services/debio-verification-service";
+import { runSalgskanalSweep } from "./services/salgskanal-matcher";
 
 // Seed-knowledge loaded dynamically — only used if DB is empty
 let seedKnowledge: (() => void) | undefined;
@@ -510,6 +512,8 @@ app.use("/admin/hanen", adminLimiter, adminHanenRoutes);
 app.use("/api/marketplace/hanen", publicHanenRoutes);
 // C.1-A (2026-05-16): Debio TRACES+Brreg cross-check — POST /admin/debio/cross-check
 app.use("/admin/debio", adminLimiter, adminDebioCrossCheckRoutes);
+// dev-request 2026-07-06-rfb-salgskanal-kategorier: salgskanal auto-matcher sweep — POST /admin/salgskanal/sync
+app.use("/admin/salgskanal", adminLimiter, adminSalgskanalRoutes);
 // PR-65 (2026-05-17): in-memory job tracker for ?async=1 admin endpoints — GET /admin/jobs[/:id]
 app.use("/admin", adminLimiter, adminJobsRoutes);
 // Phase 0: admin product backfill endpoint
@@ -862,6 +866,46 @@ if (process.env.RFB_DISABLE_DEBIO_SYNC !== "1") {
       lastDebioSyncAt = now;
     } catch (err) {
       console.error("[debio-sync] failed:", err);
+    }
+  }, 60 * 60_000); // hourly check
+}
+
+// ─── dev-request 2026-07-06-rfb-salgskanal-kategorier: daily salgskanal ──
+// auto-matcher sweep (datamodel + auto-matcher slice) ────────────────────
+//
+// Re-scans every active producer's name/description/tags/skills against
+// the 5 salgskanal categories (Selvplukk/Hjemlevering/Gårdsbutikk/
+// Gårdskafé-servering/REKO-ring) and keeps agent_salgskanal current — no
+// external fetch involved (pure in-DB text scan), so this is cheap enough
+// to run daily. Offset one hour from the Debio sync (05:00 UTC) purely to
+// avoid the two jobs' SQLite writes overlapping.
+//
+// Implementation pattern mirrors PR-95's debio-sync scheduler immediately
+// above: hourly wakeup, only fires inside the target UTC hour, debounced
+// by the 23-hour gap so a restart inside that hour doesn't double-run.
+// POST /admin/salgskanal/sync (admin-salgskanal.ts) runs the same sweep
+// on demand.
+//
+// Disable by setting RFB_DISABLE_SALGSKANAL_SYNC=1 (e.g. on local dev / CI).
+let lastSalgskanalSyncAt: Date | null = null;
+if (process.env.RFB_DISABLE_SALGSKANAL_SYNC !== "1") {
+  setInterval(() => {
+    const now = new Date();
+    if (now.getUTCHours() !== 5) return; // fire only during 05:00 UTC window
+    if (lastSalgskanalSyncAt && (now.getTime() - lastSalgskanalSyncAt.getTime()) < 23 * 3600_000) return;
+    try {
+      const result = runSalgskanalSweep();
+      console.log(
+        `[salgskanal-sync] examined=${result.examined} matched_total=${result.matched_total} ` +
+        `upserted=${result.upserted} refreshed=${result.refreshed} removed_stale=${result.removed_stale} ` +
+        `errors=${result.errors.length}`,
+      );
+      if (result.errors.length > 0) {
+        for (const e of result.errors) console.warn(`[salgskanal-sync] ${e}`);
+      }
+      lastSalgskanalSyncAt = now;
+    } catch (err) {
+      console.error("[salgskanal-sync] failed:", err);
     }
   }, 60 * 60_000); // hourly check
 }

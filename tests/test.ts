@@ -308,6 +308,27 @@ const _brregVerifySlice1Promise: Promise<void> = (async () => {
   }
 })();
 
+// ── dev-request 2026-07-06-rfb-salgskanal-kategorier (datamodel + ────────
+// auto-matcher slice): matchSalgskanalCategories() pure-function unit tests
+// (salgskanal-matcher.ts). Synchronous (no I/O); wrapped in an async IIFE
+// only to match the fold-into-REPORT pattern used by the other per-service
+// test files in this block.
+console.log("── salgskanal-matcher: matchSalgskanalCategories unit tests ──");
+const _salgskanalMatcherPromise: Promise<void> = (async () => {
+  try {
+    const { runSalgskanalMatcherTests } = require("../src/services/salgskanal-matcher.test") as
+      typeof import("../src/services/salgskanal-matcher.test");
+    const sk = runSalgskanalMatcherTests({ log: false });
+    passed += sk.passed;
+    failed += sk.failed;
+    for (const f of sk.failures) failures.push("salgskanal-matcher: " + f);
+    console.log(`  salgskanal-matcher: ${sk.passed} passed, ${sk.failed} failed`);
+  } catch (err) {
+    failed++;
+    failures.push("salgskanal-matcher: unexpected error: " + String(err));
+  }
+})();
+
 // ── trust-score community signal tests ──
 console.log("── trust-score community signal tests ──");
 
@@ -19470,6 +19491,7 @@ console.log("\n── orch-pr-14: MCP discovery product_id surfacing ──");
   try { await _orchPr18BulkLoadPromise; } catch { /* errors already pushed to failures */ }
   try { await _orchPr12SweepPromise; } catch { /* errors already pushed to failures */ }
   try { await _brregVerifySlice1Promise; } catch { /* errors already pushed to failures */ }
+  try { await _salgskanalMatcherPromise; } catch { /* errors already pushed to failures */ }
   try { await _orchPr20BmEventsPromise; } catch { /* errors already pushed to failures */ }
   try { await _orchPr21SentLogActorPromise; } catch { /* errors already pushed to failures */ }
   try { await _adminDbTableSizesPromise; } catch { /* errors already pushed to failures */ }
