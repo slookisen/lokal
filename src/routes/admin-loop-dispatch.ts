@@ -188,6 +188,36 @@ router.post("/", async (req: Request, res: Response) => {
       const text = `Off-cycle wake by loop-dispatcher (${w.reason}; next_suggested=${w.agent}). Run your FULL normal cycle exactly as a scheduled run would: complete every step, write your usual end-of-run report, and POST your run-envelope to /admin/runs at the end so this wake is visible in the run-ledger. One-time run.`;
       const r = await fireRoutine(ref, text);
       fired.push({ agent: w.agent, reason: w.reason, ...r });
+
+      // Fire-marker (dedup boot-lag race, dev-requests/2026-07-08-loop-dispatch-fire-marker-dedup.md):
+      // a woken Cloud Routine takes 30-90s to boot before it POSTs its own started_at
+      // envelope, during which a second dispatch (another /admin/loop-dispatch call,
+      // e.g. an overlapping cron + wake-workflow) sees no fresh run for this agent in
+      // the ledger and fires it again. Record a marker at fire-time — not boot-time —
+      // so computeWakeList's existing cooldown (latest[agent] = finished_at||started_at)
+      // sees this agent as "just ran" immediately, closing the race window to ~0.
+      // next_suggested MUST stay [] so the marker never becomes a wake candidate itself.
+      if (r.ok) {
+        const markerAt = new Date().toISOString();
+        try {
+          recordRun({
+            run_id: `firemarker-${markerAt.replace(/[:.]/g, "-")}-${w.agent}`,
+            vertical: "rfb",
+            agent: w.agent,
+            trigger_source: "signal",
+            started_at: markerAt,
+            finished_at: markerAt,
+            status: "completed",
+            claims: [],
+            evidence: [],
+            next_suggested: [],
+            notes:
+              "loop-dispatch fire-marker (dedup boot-lag) — see dev-requests/2026-07-08-loop-dispatch-fire-marker-dedup.md",
+          });
+        } catch {
+          /* best-effort — the fire already happened; a missing marker just re-opens the boot-lag window */
+        }
+      }
     }
 
     const firedOk = fired.filter((f) => f.ok).length;

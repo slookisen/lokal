@@ -17912,6 +17912,22 @@ const _orchPr20260614_2Promise = (async () => {
   // Still-unlisted worker (e.g. marketing-comms-agent) stays skipped -> allowlist is additive, not opened wide.
   const p8 = computeWakeList([mk("r10", "orchestrator-v3-controller", 1, ["marketing-comms-agent"])], { nowMs: baseUTC });
   assertEq(p8.wake.length, 0, "dispatch: still-unlisted worker -> no wake");
+
+  // Fire-marker dedup (2026-07-08-loop-dispatch-fire-marker-dedup): a marker recorded
+  // at fire-time, 0 min ago, with finished_at == started_at, must be caught by the
+  // EXISTING cooldown immediately -- pinning the mechanism admin-loop-dispatch.ts's
+  // route now relies on to close the agent-boot-lag double-fire race. No change to
+  // computeWakeList itself; this documents that the pure logic already handles it
+  // once the marker row exists.
+  const p9 = computeWakeList(
+    [mk("r11", "rfb-supervisor", 1, ["platform-orchestrator"]), mk("firemarker-r12", "platform-orchestrator", 0, [])],
+    { nowMs: baseUTC },
+  );
+  assertEq(p9.wake.length, 0, "dispatch: fire-marker recorded 0min ago -> immediate cooldown, no double-wake");
+  assertTrue(
+    p9.skip.some((s) => s.agent === "platform-orchestrator" && /cooldown/.test(s.reason)),
+    "dispatch: fire-marker cooldown skip recorded",
+  );
 }
 
 // -- envelope timestamp normalization (pure) --

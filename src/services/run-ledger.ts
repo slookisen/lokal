@@ -168,6 +168,7 @@ export function listPendingVerification(opts: {
     "verifier_state = 'pending'",
     "started_at >= ?",
     "(verifier_checked_at IS NULL OR verifier_checked_at < started_at)",
+    "run_id NOT LIKE 'firemarker-%'",
   ];
   const params: unknown[] = [cutoff];
   if (opts.vertical) {
@@ -202,6 +203,7 @@ export function listStaleRuns(opts: {
     "status = 'completed'",
     "verifier_state = 'pending'",
     "finished_at < ?",
+    "run_id NOT LIKE 'firemarker-%'",
   ];
   const params: unknown[] = [cutoff];
   if (opts.vertical) {
@@ -268,7 +270,7 @@ export function summariseRuns(opts: {
   const sinceHours = opts.sinceHours ?? 24;
   const sinceISO = new Date(Date.now() - sinceHours * 3600_000).toISOString();
 
-  const where = ["started_at >= ?"];
+  const where = ["started_at >= ?", "run_id NOT LIKE 'firemarker-%'"];
   const params: unknown[] = [sinceISO];
   if (opts.vertical) {
     where.push("vertical = ?");
