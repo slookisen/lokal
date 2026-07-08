@@ -186,7 +186,14 @@ jobs:
             // match "DISAPPROVED" / "NOT APPROVED"; require an explicit rejection check too.
             const docApproved = new RegExp(`PR[- ]?#?${prNumber}\\b[\\s\\S]{0,200}?\\bVERDICT:\\s*APPROVED\\b`, 'i').test(docText)
               || new RegExp(`\\bVERDICT:\\s*APPROVED\\b[\\s\\S]{0,200}?PR[- ]?#?${prNumber}\\b`, 'i').test(docText);
-            const docRejected = /\b(DISAPPROVED|NOT APPROVED|CHANGES-REQUESTED|REJECTED)\b/i.test(docText);
+            // Bug fixed 2026-07-08 (lokal#161): this used to be an unanchored
+            // whole-document scan for "REJECTED" etc., which false-positived on
+            // any review doc whose ordinary prose uses one of these words (e.g.
+            // "...still rejected with 400" describing expected validator
+            // behavior) — permanently blocking auto-approve on an otherwise
+            // clean "VERDICT: APPROVED" doc. Anchor it to the verdict token
+            // itself, exactly like docApproved already is.
+            const docRejected = /\bVERDICT:\s*(DISAPPROVED|NOT APPROVED|CHANGES-REQUESTED|REJECTED)\b/i.test(docText);
             if (docRejected || !docApproved) {
               await note(`review doc "${rawRef}" does not contain an explicit "VERDICT: APPROVED" tied to PR #${prNumber}. No auto-approve.`);
               core.info('review doc does not confirm APPROVED — no-op');
