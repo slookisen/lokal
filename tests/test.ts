@@ -21118,16 +21118,83 @@ const _oaHomeCountersPromise: Promise<void> = new Promise<void>(r => {
 // ── admin-agents-register: Slice 2 of dev-request ──────────────────────────
 // 2026-06-30-brreg-verification-gate: wiring verifyOrgNumber() into
 // POST /admin/agents/register for rfb+experiences (dental skipped).
-// Chained off _agentKnowledgeGetAuthPromise for the same reason as the
-// blocks above: this block also swaps the global getDb() singleton via
-// __setDbForTesting, so it must run serially after the other
-// singleton-swapping blocks rather than concurrently with them.
+//
+// 2026-07-08 fix-up (CI failure on PR #162, GH Actions head sha 8885421):
+// this block used to chain off _agentKnowledgeGetAuthPromise ALONE, on the
+// theory that being "after the last link" was enough. That is the exact
+// insufficient-chaining mistake this file's own tasks-prune-async and
+// oa-home-counters postmortems already document two attempts each: this
+// file does NOT have one single linear chain of singleton-swapping blocks —
+// it has several independently-resolving branches (e.g. PR-56's
+// matchEventToVenue suite) that only get jointly awaited at the very end.
+// Chaining off _agentKnowledgeGetAuthPromise left this block free to start
+// __setDbForTesting/close while OTHER branches were still mid-flight, so on
+// CI (where scheduling differs enough from local runs to expose the race)
+// this block's own DB writes could land against a singleton some other
+// block had already swapped out from under it (case6: readRow() sees
+// undefined for every column) or find the singleton already closed by the
+// time an awaited call returned control (case7: 500 instead of 201) — and,
+// symmetrically, this block's own swap/close could land mid-suite inside
+// PR-56, corrupting 8 of its assertions as collateral damage.
+//
+// The only categorical fix (not just narrower odds) is the same one used
+// for _oaHomeCountersDeps / _tasksPruneAsyncDeps below: depend on EVERY
+// other singleton-swapping branch that is already declared above this
+// point in the file (via Promise.allSettled, so a rejected upstream link
+// still lets this block run rather than silently vanishing), so there is
+// no remaining code path that can still be executing a __setDbForTesting
+// call by the time this block starts. _oaHomeCountersPromise and
+// _tasksPruneAsyncPromise are deliberately NOT in this list: both of them
+// already depend on _adminAgentsRegisterPromise (see their own Deps arrays
+// below), so depending on them here would deadlock.
 let _adminAgentsRegisterResolve: () => void = () => {};
 const _adminAgentsRegisterPromise: Promise<void> = new Promise<void>(r => {
   _adminAgentsRegisterResolve = r;
 });
 
-_agentKnowledgeGetAuthPromise.then(async () => {
+const _adminAgentsRegisterDeps: Promise<unknown>[] = [
+  _serialChain,
+  Promise.all(_pr21Promises),
+  _m2Promise,
+  _pr24Promise,
+  _pr56Promise,
+  _pr63Promise,
+  _pr65Promise,
+  _pr66Promise,
+  _pr67Promise,
+  _pr68Promise,
+  _pr74Promise,
+  _pr75Promise,
+  _pr76Promise,
+  _pr78Promise,
+  _orchPr86Promise,
+  _orchPr93Promise,
+  _pr94Promise,
+  _pr95Promise,
+  _pr103Promise,
+  _pr106Promise,
+  _pr110Promise,
+  _pr125Promise,
+  _seoDentalPromise,
+  _platformVerifierPromise,
+  _orchPr20260614_2Promise,
+  _orchPr20260614Promise,
+  _orchPr20260614_5Promise,
+  _orchPr20260614_6Promise,
+  _orchPr14ProductIdPromise,
+  _orchPr9PruneDeadUrlsPromise,
+  _orchPr18BulkLoadPromise,
+  _orchPr12SweepPromise,
+  _brregVerifySlice1Promise,
+  _orchPr20BmEventsPromise,
+  _orchPr21SentLogActorPromise,
+  _adminDbTableSizesPromise,
+  _contactClickTrackingPromise,
+  _homepageProvenanceEmailBackfillPromise,
+  _agentKnowledgeGetAuthPromise,
+];
+
+Promise.allSettled(_adminAgentsRegisterDeps).then(async () => {
   console.log("\n── admin-agents-register: brreg-verify wiring (rfb+experiences) ──");
   try {
     const { runAdminAgentsRegisterTests } = require("../src/routes/admin-agents.test") as
