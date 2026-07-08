@@ -20959,8 +20959,19 @@ const _agentKnowledgeGetAuthPromise: Promise<void> = new Promise<void>(r => {
 });
 
 if (_skipAgentKnowledgeGetAuthInSharedRun) {
-  console.log("\n── agent-knowledge-get-auth: quarantined to build-check-auth-isolated job (skipped here) ──");
-  _agentKnowledgeGetAuthResolve();
+  // Must still wait on _homepageProvenanceEmailBackfillPromise before resolving, same as the
+  // non-skip branch below — every later block (oa-home-counters, admin-agents-register, ...)
+  // chains off _agentKnowledgeGetAuthPromise specifically because it is a singleton-swapping
+  // block that is guaranteed to run serially after every earlier singleton-swapping block.
+  // Resolving immediately here broke that guarantee under CI_SKIP_AGENT_KNOWLEDGE_AUTH=1: it
+  // let those later blocks start (and swap the DB singleton) concurrently with
+  // _homepageProvenanceEmailBackfillPromise's own singleton-swapping, corrupting shared state.
+  // Reproduced locally (CI_SKIP_AGENT_KNOWLEDGE_AUTH=1 npx tsx tests/test.ts): pr-56 and
+  // admin-agents-register both failed with exactly this pattern; fixed by awaiting here too.
+  _homepageProvenanceEmailBackfillPromise.then(() => {
+    console.log("\n── agent-knowledge-get-auth: quarantined to build-check-auth-isolated job (skipped here) ──");
+    _agentKnowledgeGetAuthResolve();
+  });
 } else {
   _homepageProvenanceEmailBackfillPromise.then(async () => {
     console.log("\n── agent-knowledge-get-auth: GET /agents/:id/knowledge auth gate ──");
