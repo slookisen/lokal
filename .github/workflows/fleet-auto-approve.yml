@@ -245,6 +245,25 @@ jobs:
                 }
               }
             `, { prId: pr.node_id }).catch(async (e) => {
+              // GitHub refuses to *enable* auto-merge when the PR is already fully
+              // green/mergeable ("clean" status) at evaluation time — there is
+              // nothing left pending for auto-merge to wait on, so the mutation is
+              // rejected with an error whose message contains "clean status" (e.g.
+              // "Pull request Foo#123 is in clean status"). In that specific case,
+              // fall back to merging directly instead of enabling-and-waiting. Any
+              // OTHER failure (checks still pending, not approved, etc.) keeps
+              // today's behavior unchanged: comment and leave the PR for manual merge.
+              if (/clean status/i.test(e.message || '')) {
+                try {
+                  await github.rest.pulls.merge({
+                    owner, repo, pull_number: prNumber, merge_method: 'squash',
+                  });
+                  core.info(`PR #${prNumber} was already clean/mergeable — merged directly instead of enabling auto-merge.`);
+                } catch (mergeErr) {
+                  await note(`approved; PR was already clean but direct merge failed (${mergeErr.message}) — merge manually.`);
+                }
+                return;
+              }
               await note(`approved, but could not enable auto-merge (${e.message}) — merge manually or re-run once checks settle.`);
             });
 
