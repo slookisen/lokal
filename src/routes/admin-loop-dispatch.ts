@@ -17,9 +17,13 @@
 //   DISPATCH_ACTIVE_START_UTC inclusive hour, default 0  (24/7; dev-requests/2026-07-08-spine-24-7-active-window.md)
 //   DISPATCH_ACTIVE_END_UTC   exclusive hour, default 24 (24/7) — set e.g. 5/21 to restore a night pause
 //
-// Intended trigger: a thin Fly Machine cron that POSTs this endpoint every ~10 min
-// during active hours (same spine as admin-loop-heartbeat / admin-run-verifier).
-// All routes require X-Admin-Key.
+// Trigger (dev-requests/2026-07-09-loop-dispatch-self-tick.md): an in-process
+// setInterval in src/index.ts calls runDispatchTick("active") every ~10 min —
+// the "thin cron" this header originally promised but which was never built,
+// leaving every self-continue envelope to expire unfired (12-min freshness
+// window vs ~4 event-wakes/day). POST /admin/loop-dispatch remains for manual
+// / event-driven wakes (GitHub pushes) and is a thin wrapper over the same
+// runDispatchTick(). All routes require X-Admin-Key.
 
 import { Router, Request, Response } from "express";
 import { listRecentRuns, recordRun } from "../services/run-ledger";
@@ -67,7 +71,7 @@ const ROUTINE_ALIAS: Record<string, string> = {
 };
 
 /** Non-secret-leaking parse diagnostic for the GET endpoint (NEVER includes trig/token values). */
-interface RoutineDiag {
+export interface RoutineDiag {
   present: boolean;
   length: number;
   parse_ok: boolean;
@@ -162,116 +166,156 @@ function planNow(): DispatchPlan {
   );
 }
 
+/** One fired-wake attempt (routine /fire call outcome). */
+export interface DispatchFired {
+  agent: string;
+  reason: string;
+  ok: boolean;
+  status: number;
+  detail?: string;
+}
+
+/** A planned wake that was NOT fired (shadow mode / no routine configured). */
+export interface DispatchDeferred {
+  agent: string;
+  reason: string;
+  why: string;
+}
+
+/** Result of one dispatch tick — exactly the POST route's response body minus `success`. */
+export interface DispatchTickResult extends DispatchPlan {
+  mode: "shadow" | "active";
+  routines: string[];
+  fire_routines: RoutineDiag;
+  fired: DispatchFired[];
+  deferred: DispatchDeferred[];
+  envelope_run_id: string;
+}
+
+/**
+ * One dispatch tick: plan the wake-list from the run-ledger, fire each woken
+ * agent's Cloud Routine (active mode + FIRE_ROUTINES only), record fire-markers
+ * for successful fires, and record a loop-dispatcher envelope IF anything fired.
+ *
+ * Extracted verbatim from the POST handler (dev-requests/2026-07-09-loop-dispatch-
+ * self-tick.md) so the in-process self-tick in src/index.ts and the HTTP route
+ * share one implementation. Behavior-preserving: this is the fleet's production
+ * wake path. Throws on unexpected errors — callers decide (route → 500 JSON,
+ * self-tick → log and keep the server alive).
+ */
+export async function runDispatchTick(mode: "shadow" | "active"): Promise<DispatchTickResult> {
+  const startedAt = new Date().toISOString();
+  const plan = planNow();
+  const { map: routines, diag: routineDiag } = parseRoutines();
+
+  const fired: DispatchFired[] = [];
+  const deferred: DispatchDeferred[] = [];
+
+  for (const w of plan.wake) {
+    const ref = routines[w.agent];
+    if (!ref) {
+      deferred.push({ agent: w.agent, reason: w.reason, why: "no routine configured (Cowork path)" });
+      continue;
+    }
+    if (mode !== "active") {
+      deferred.push({ agent: w.agent, reason: w.reason, why: "shadow mode" });
+      continue;
+    }
+    // Fire-text mirrors charter Rule 0 (bygg først) — dev-requests/2026-07-09-loop-
+    // dispatch-self-tick.md item 3: off-cycle wakes exist to CONTINUE BUILDING, not
+    // to re-run housekeeping; the old "Run your FULL normal cycle" wording contradicted
+    // build-first and burned each wake on reports.
+    const text = `Off-cycle wake by loop-dispatcher (${w.reason}; next_suggested=${w.agent}). Prioritize BUILDING dev-request slices first (charter Rule 0 — bygg først); housekeeping and full reports belong to the daily cycle only. Still POST your run-envelope to /admin/runs at the end so this wake is visible in the run-ledger. One-time run.`;
+    const r = await fireRoutine(ref, text);
+    fired.push({ agent: w.agent, reason: w.reason, ...r });
+
+    // Fire-marker (dedup boot-lag race, dev-requests/2026-07-08-loop-dispatch-fire-marker-dedup.md):
+    // a woken Cloud Routine takes 30-90s to boot before it POSTs its own started_at
+    // envelope, during which a second dispatch (another /admin/loop-dispatch call,
+    // e.g. an overlapping cron + wake-workflow) sees no fresh run for this agent in
+    // the ledger and fires it again. Record a marker at fire-time — not boot-time —
+    // so computeWakeList's existing cooldown (latest[agent] = finished_at||started_at)
+    // sees this agent as "just ran" immediately, closing the race window to ~0.
+    // next_suggested MUST stay [] so the marker never becomes a wake candidate itself.
+    if (r.ok) {
+      const markerAt = new Date().toISOString();
+      try {
+        recordRun({
+          run_id: `firemarker-${markerAt.replace(/[:.]/g, "-")}-${w.agent}`,
+          vertical: "rfb",
+          agent: w.agent,
+          trigger_source: "signal",
+          started_at: markerAt,
+          finished_at: markerAt,
+          status: "completed",
+          claims: [],
+          evidence: [],
+          next_suggested: [],
+          notes:
+            "loop-dispatch fire-marker (dedup boot-lag) — see dev-requests/2026-07-08-loop-dispatch-fire-marker-dedup.md",
+        });
+      } catch {
+        /* best-effort — the fire already happened; a missing marker just re-opens the boot-lag window */
+      }
+    }
+  }
+
+  const firedOk = fired.filter((f) => f.ok).length;
+  const finishedAt = new Date().toISOString();
+  const envelope: RunEnvelope = {
+    run_id: `run-${finishedAt.replace(/[:.]/g, "-")}-loop-dispatcher-fly`,
+    vertical: "rfb",
+    agent: "loop-dispatcher",
+    trigger_source: "cron",
+    started_at: startedAt,
+    finished_at: finishedAt,
+    status: "completed",
+    claims: [
+      {
+        type: "db_state_change",
+        value: firedOk,
+        meta: { kind: "wakes_fired", mode, source: "fly", wake_planned: plan.wake.length },
+      },
+    ],
+    evidence: [],
+    next_suggested: [], // the dispatcher MUST NOT emit next_suggested (no ping-pong)
+    notes: `mode=${mode} candidates=${plan.candidates} wake=${plan.wake.length} fired_ok=${firedOk} deferred=${deferred.length}${plan.inActiveWindow ? "" : " (paused: outside active window)"}`.slice(0, 480),
+  };
+  // Only record an envelope when we actually fired (or attempted) a wake. A no-op
+  // dispatch — the common ~10-min heartbeat that wakes nobody — must NOT flood the
+  // run-ledger (L4 fix 2026-06-27: 115/120 recent ledger runs were dispatcher
+  // heartbeats, drowning real agent runs and killing loop visibility).
+  if (fired.length > 0) {
+    try {
+      recordRun(envelope);
+    } catch {
+      /* best-effort — the dispatch already happened */
+    }
+  }
+
+  return {
+    mode,
+    ...plan,
+    routines: Object.keys(routines),
+    fire_routines: routineDiag,
+    fired,
+    deferred,
+    envelope_run_id: envelope.run_id,
+  };
+}
+
 // POST /admin/loop-dispatch?mode=shadow|active
 //   Decides the wake-list; in active mode (and with FIRE_ROUTINES set) POSTs /fire
-//   to each woken agent that has a routine. Always records a loop-dispatcher envelope.
+//   to each woken agent that has a routine. Records a loop-dispatcher envelope when
+//   anything fired. Thin wrapper over runDispatchTick() — same body the self-tick runs.
 router.post("/", async (req: Request, res: Response) => {
   if (!requireAdmin(req, res)) return;
-  const startedAt = new Date().toISOString();
   try {
-    const plan = planNow();
-    const { map: routines, diag: routineDiag } = parseRoutines();
     const envMode = (process.env.DISPATCH_FIRE_MODE || "shadow").toLowerCase();
     const mode =
       String(req.query.mode || envMode).toLowerCase() === "active" ? "active" : "shadow";
-
-    const fired: Array<{
-      agent: string;
-      reason: string;
-      ok: boolean;
-      status: number;
-      detail?: string;
-    }> = [];
-    const deferred: Array<{ agent: string; reason: string; why: string }> = [];
-
-    for (const w of plan.wake) {
-      const ref = routines[w.agent];
-      if (!ref) {
-        deferred.push({ agent: w.agent, reason: w.reason, why: "no routine configured (Cowork path)" });
-        continue;
-      }
-      if (mode !== "active") {
-        deferred.push({ agent: w.agent, reason: w.reason, why: "shadow mode" });
-        continue;
-      }
-      const text = `Off-cycle wake by loop-dispatcher (${w.reason}; next_suggested=${w.agent}). Run your FULL normal cycle exactly as a scheduled run would: complete every step, write your usual end-of-run report, and POST your run-envelope to /admin/runs at the end so this wake is visible in the run-ledger. One-time run.`;
-      const r = await fireRoutine(ref, text);
-      fired.push({ agent: w.agent, reason: w.reason, ...r });
-
-      // Fire-marker (dedup boot-lag race, dev-requests/2026-07-08-loop-dispatch-fire-marker-dedup.md):
-      // a woken Cloud Routine takes 30-90s to boot before it POSTs its own started_at
-      // envelope, during which a second dispatch (another /admin/loop-dispatch call,
-      // e.g. an overlapping cron + wake-workflow) sees no fresh run for this agent in
-      // the ledger and fires it again. Record a marker at fire-time — not boot-time —
-      // so computeWakeList's existing cooldown (latest[agent] = finished_at||started_at)
-      // sees this agent as "just ran" immediately, closing the race window to ~0.
-      // next_suggested MUST stay [] so the marker never becomes a wake candidate itself.
-      if (r.ok) {
-        const markerAt = new Date().toISOString();
-        try {
-          recordRun({
-            run_id: `firemarker-${markerAt.replace(/[:.]/g, "-")}-${w.agent}`,
-            vertical: "rfb",
-            agent: w.agent,
-            trigger_source: "signal",
-            started_at: markerAt,
-            finished_at: markerAt,
-            status: "completed",
-            claims: [],
-            evidence: [],
-            next_suggested: [],
-            notes:
-              "loop-dispatch fire-marker (dedup boot-lag) — see dev-requests/2026-07-08-loop-dispatch-fire-marker-dedup.md",
-          });
-        } catch {
-          /* best-effort — the fire already happened; a missing marker just re-opens the boot-lag window */
-        }
-      }
-    }
-
-    const firedOk = fired.filter((f) => f.ok).length;
-    const finishedAt = new Date().toISOString();
-    const envelope: RunEnvelope = {
-      run_id: `run-${finishedAt.replace(/[:.]/g, "-")}-loop-dispatcher-fly`,
-      vertical: "rfb",
-      agent: "loop-dispatcher",
-      trigger_source: "cron",
-      started_at: startedAt,
-      finished_at: finishedAt,
-      status: "completed",
-      claims: [
-        {
-          type: "db_state_change",
-          value: firedOk,
-          meta: { kind: "wakes_fired", mode, source: "fly", wake_planned: plan.wake.length },
-        },
-      ],
-      evidence: [],
-      next_suggested: [], // the dispatcher MUST NOT emit next_suggested (no ping-pong)
-      notes: `mode=${mode} candidates=${plan.candidates} wake=${plan.wake.length} fired_ok=${firedOk} deferred=${deferred.length}${plan.inActiveWindow ? "" : " (paused: outside active window)"}`.slice(0, 480),
-    };
-    // Only record an envelope when we actually fired (or attempted) a wake. A no-op
-    // dispatch — the common ~10-min heartbeat that wakes nobody — must NOT flood the
-    // run-ledger (L4 fix 2026-06-27: 115/120 recent ledger runs were dispatcher
-    // heartbeats, drowning real agent runs and killing loop visibility).
-    if (fired.length > 0) {
-      try {
-        recordRun(envelope);
-      } catch {
-        /* best-effort — the dispatch already happened */
-      }
-    }
-
-    res.json({
-      success: true,
-      mode,
-      ...plan,
-      routines: Object.keys(routines),
-      fire_routines: routineDiag,
-      fired,
-      deferred,
-      envelope_run_id: envelope.run_id,
-    });
+    const result = await runDispatchTick(mode);
+    res.json({ success: true, ...result });
   } catch (err: any) {
     res.status(500).json({ success: false, error: String(err?.message || err) });
   }

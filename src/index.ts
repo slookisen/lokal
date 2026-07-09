@@ -43,7 +43,8 @@ import adminOutreachPoolRoutes from "./routes/admin-outreach-pool";
 import adminOutreachCandidatesRoutes from "./routes/admin-outreach-candidates";
 import adminRunVerifierRoutes from "./routes/admin-run-verifier";
 import adminLoopHeartbeatRoutes from "./routes/admin-loop-heartbeat";
-import adminLoopDispatchRoutes from "./routes/admin-loop-dispatch";
+import adminLoopDispatchRoutes, { runDispatchTick } from "./routes/admin-loop-dispatch";
+import { resolveTickIntervalMin } from "./services/loop-dispatch";
 import adminRunPlatformVerifierRoutes from "./routes/admin-run-platform-verifier";
 import adminVerifierSweepStatusRouter from "./routes/admin-verifier-sweep-status";
 import ownerPortalRoutes from "./routes/owner-portal";
@@ -954,6 +955,55 @@ if (
       console.error("[dental-geocode] tick failed:", err);
     }
   }, 60 * 60_000);
+}
+
+// ─── dev-request 2026-07-09-loop-dispatch-self-tick: dispatcher self-tick ───
+//
+// Ticks runDispatchTick("active") every ~10 min so the fleet's self-continue
+// loop actually loops. Root cause (verified against the run-ledger 2026-07-09):
+// a `next_suggested` envelope is only a wake candidate for 12 minutes
+// (computeWakeList windowMin), but NOTHING ever POSTed /admin/loop-dispatch
+// periodically — the "thin Fly Machine cron" promised in admin-loop-dispatch.ts's
+// header was never built, so the only dispatches were event-wakes (~4/day) and
+// every self-continue expired unfired. This closes that gap in-process, the
+// same pattern as the 4 background jobs above (auto-prune / debio-sync /
+// salgskanal-sync / dental-geocode).
+//
+// Self-stopping + quiet: an empty queue plans no wakes → the tick is a pure
+// no-op (no envelope, no log — envelope is only recorded when something fired).
+// Dedup/pacing reuse existing guards: fire-marker (#179), 25-min cooldown,
+// maxWakes 4/tick, allowlist — all untouched.
+//
+// Kill-switch: DISPATCH_TICK_DISABLED=1 (env-only rollback, no deploy).
+// Skipped entirely when FIRE_ROUTINES is unset (nothing could fire anyway —
+// also keeps dev/CI silent). Interval override: DISPATCH_TICK_INTERVAL_MIN
+// (clamped to [2, 120] by resolveTickIntervalMin).
+if (process.env.DISPATCH_TICK_DISABLED === "1" || !process.env.FIRE_ROUTINES) {
+  console.log(
+    "[dispatch-tick] disabled — " +
+    (process.env.DISPATCH_TICK_DISABLED === "1"
+      ? "DISPATCH_TICK_DISABLED=1 (kill-switch)"
+      : "FIRE_ROUTINES unset (nothing could fire)"),
+  );
+} else {
+  const tickIntervalMin = resolveTickIntervalMin(process.env.DISPATCH_TICK_INTERVAL_MIN);
+  console.log(`[dispatch-tick] enabled — runDispatchTick("active") every ${tickIntervalMin} min`);
+  setInterval(async () => {
+    try {
+      const r = await runDispatchTick("active");
+      // Log only when the tick actually did something — a no-op tick every
+      // ~10 min must not spam the logs (mirrors the envelope-only-on-fire rule).
+      if (r.fired.length > 0 || r.deferred.length > 0) {
+        console.log(
+          `[dispatch-tick] candidates=${r.candidates} wake=${r.wake.length} ` +
+          `fired_ok=${r.fired.filter((f) => f.ok).length} deferred=${r.deferred.length} ` +
+          `envelope=${r.fired.length > 0 ? r.envelope_run_id : "none"}`,
+        );
+      }
+    } catch (err) {
+      console.error("[dispatch-tick] failed (non-fatal):", err);
+    }
+  }, tickIntervalMin * 60_000);
 }
 
 // ─── Graceful shutdown ───────────────────────────────────────
