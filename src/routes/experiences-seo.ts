@@ -55,6 +55,7 @@ import {
   type ExperienceCardRow,
   type GardssalgProviderRow,
 } from "../services/experience-store";
+import { EXPERIENCE_TAGS, type ExperienceTag } from "../services/experience-tags";
 import {
   createBooking,
   getBookingByRef,
@@ -1118,6 +1119,19 @@ const PRICE_BAND_LABELS: Record<string, string> = {
   gratis: "Gratis", rimelig: "Rimelig", standard: "Standard",
   premium: "Premium", ukjent: "Pris ikke oppgitt",
 };
+
+// dev-request 2026-07-04-opplevagent-taksonomi-filtre: Norwegian display
+// labels for the derived cross-cutting filter tags (experience-tags.ts).
+// Order matches EXPERIENCE_TAGS — drives both card badges and the /sok
+// filter-chip UI so the two stay in sync by construction.
+const FILTER_TAG_LABELS: Record<ExperienceTag, string> = {
+  familievennlig: "Familievennlig",
+  gratis: "Gratis",
+  "under-300": "Under 300 kr",
+  tilgjengelig: "Tilgjengelig (UU)",
+  værsikker: "Værsikker",
+  sesong: "Sesongbasert",
+};
 // Only accept http(s) URLs from data — never render javascript:/data: URIs.
 function safeHttpUrl(u: unknown): string | null {
   const s = String(u ?? "").trim();
@@ -1546,6 +1560,12 @@ const BROWSE_CSS = `
   .card .c-meta{margin-top:auto;display:flex;flex-wrap:wrap;gap:6px;padding-top:4px}
   .tag{display:inline-flex;align-items:center;padding:3px 10px;border-radius:var(--r-pill);background:var(--canvas-2);color:var(--ink-soft);font-size:.74rem;font-weight:600;border:1px solid var(--line)}
   .tag-cat{background:var(--fjord-800);color:#fff;border-color:var(--fjord-800)}
+  .tag-filter{background:transparent;color:var(--teal-500);border-color:var(--teal-500)}
+  .filter-chips{display:flex;flex-wrap:wrap;gap:8px;margin:14px 0 22px}
+  .chip{display:inline-flex;align-items:center;padding:7px 14px;border-radius:var(--r-pill);background:var(--surface);color:var(--ink-soft);font-size:.85rem;font-weight:600;border:1px solid var(--line)}
+  .chip:hover{text-decoration:none;border-color:var(--teal-500);color:var(--teal-500)}
+  .chip-active{background:var(--teal-500);color:#fff;border-color:var(--teal-500)}
+  .chip-active:hover{background:var(--teal-400);border-color:var(--teal-400);color:#fff}
   .empty{margin:30px 0;background:var(--surface);border:1px dashed var(--line);border-radius:var(--r-lg);padding:40px 28px;text-align:center;color:var(--ink-soft)}
   .empty h2{font-size:1.15rem;color:var(--fjord-900);margin-bottom:8px}
   .empty p{font-size:.95rem;max-width:46ch;margin:0 auto}
@@ -1594,6 +1614,15 @@ function renderCard(row: ExperienceCardRow): string {
   if (row.indoor_outdoor) tags.push(`<span class="tag">${escapeHtml(ioLabel(row.indoor_outdoor))}</span>`);
   if (row.price_from) tags.push(`<span class="tag">fra ${row.price_from} kr</span>`);
   else if (row.price_band && PRICE_BAND_LABELS[row.price_band]) tags.push(`<span class="tag">${escapeHtml(PRICE_BAND_LABELS[row.price_band] as string)}</span>`);
+  // dev-request 2026-07-04-opplevagent-taksonomi-filtre item 4: badges on
+  // cards for the derived cross-cutting filter tags. "gratis"/"under-300"
+  // are skipped here — the price badge above already conveys that; showing
+  // both would be redundant on the same card. Capped at 2 so cards don't
+  // get noisy (up to 6 tags could otherwise fire on one row).
+  const filterBadges = row.tags.filter((t) => t !== "gratis" && t !== "under-300").slice(0, 2);
+  for (const t of filterBadges) {
+    tags.push(`<span class="tag tag-filter">${escapeHtml(FILTER_TAG_LABELS[t])}</span>`);
+  }
   return `<a class="card" href="/opplevelse/${encodeURIComponent(row.slug)}">
     <span class="c-title">${escapeHtml(row.title)}</span>
     ${place ? `<span class="c-place">${PIN_SVG}${escapeHtml(place)}</span>` : ""}
@@ -2879,28 +2908,64 @@ router.get("/tilbyder/:providerSlugOrId", (req: Request, res: Response, next: Ne
   res.send(html);
 });
 
-// ─── GET /sok?q= — HTML search-results page ──────────────────────────────────
+// dev-request 2026-07-04-opplevagent-taksonomi-filtre item 4: SSR-friendly
+// filter-chip toggle links for /sok — build the next URL for clicking one
+// chip (add it if inactive, remove it if active), preserving `q` and every
+// other currently-active tag. No client-side JS: each chip is a plain <a>
+// whose href is the fully resolved next state.
+function sokFilterUrl(q: string, activeTags: ExperienceTag[], toggle: ExperienceTag): string {
+  const params = new URLSearchParams();
+  if (q) params.set("q", q);
+  const next = activeTags.includes(toggle)
+    ? activeTags.filter((t) => t !== toggle)
+    : [...activeTags, toggle];
+  for (const t of next) params.set(t, "1");
+  const qs = params.toString();
+  return qs ? `/sok?${qs}` : "/sok";
+}
+function renderFilterChips(q: string, activeTags: ExperienceTag[]): string {
+  const chips = EXPERIENCE_TAGS.map((t) => {
+    const active = activeTags.includes(t);
+    return `<a class="chip${active ? " chip-active" : ""}" href="${sokFilterUrl(q, activeTags, t)}" aria-pressed="${active}">${active ? "✓ " : ""}${escapeHtml(FILTER_TAG_LABELS[t])}</a>`;
+  }).join("");
+  return `<div class="filter-chips" role="group" aria-label="Filtrer opplevelser">${chips}</div>`;
+}
+
+// ─── GET /sok?q=&<tag>=1 — HTML search-results page ──────────────────────────
 // Human-facing twin of the discover query. Reuses the publish gate so every
 // result links to a live detail page. Not paginated (capped result set); the
 // search box re-renders the current query.
+//
+// dev-request 2026-07-04-opplevagent-taksonomi-filtre item 4: also accepts
+// one query param per EXPERIENCE_TAGS entry (e.g. ?familievennlig=1) — AND
+// semantics across active tags, combinable with `q`. With no `q` but ≥1
+// active tag, browses the full published catalog (capped) instead of an
+// empty result set, so `/sok?gratis=1` alone works as a browse-by-tag view.
 router.get("/sok", (req: Request, res: Response) => {
   const q = String(req.query.q ?? "").trim();
+  const activeTags = EXPERIENCE_TAGS.filter((t) => String(req.query[t] ?? "") === "1");
   let rows: ExperienceCardRow[] = [];
-  if (q) {
-    try {
+  try {
+    if (q) {
       rows = searchPublishedExperiences(q, 60);
-    } catch {
-      rows = [];
+    } else if (activeTags.length > 0) {
+      rows = listPublishedExperiences({}, 60, 0);
     }
+  } catch {
+    rows = [];
   }
+  if (activeTags.length > 0) {
+    rows = rows.filter((r) => activeTags.every((t) => r.tags.includes(t)));
+  }
+  const hasQuery = Boolean(q) || activeTags.length > 0;
 
-  const h1 = q ? `Søk: «${q}»` : "Søk i opplevelser";
+  const h1 = q ? `Søk: «${q}»` : activeTags.length > 0 ? "Filtrer opplevelser" : "Søk i opplevelser";
   const metaDesc = q
     ? `Søkeresultater for «${q}» på Opplevagent — kuraterte norske opplevelser med verifiserte tilbydere.`
     : "Søk blant kuraterte norske opplevelser på Opplevagent — etter sted, kategori eller aktivitet.";
-  const emptyTitle = q ? `Ingen treff for «${q}»` : "Skriv inn et søk";
-  const emptyBody = q
-    ? "Prøv et annet søkeord, et stedsnavn eller en kategori. Du kan også bla i alle opplevelser."
+  const emptyTitle = hasQuery ? `Ingen treff${q ? ` for «${q}»` : ""}` : "Skriv inn et søk";
+  const emptyBody = hasQuery
+    ? "Prøv et annet søkeord eller fjern et filter. Du kan også bla i alle opplevelser."
     : "Søk etter sted, kategori eller aktivitet — for eksempel «hvalsafari», «Tromsø» eller «mat».";
 
   // Search pages are not indexed individually (thin/duplicative); the results
@@ -2948,9 +3013,10 @@ ${BROWSE_NAV}
   <nav class="breadcrumb" aria-label="Brødsmuler"><a href="/">Forsiden</a><span class="sep">/</span><span aria-current="page">Søk</span></nav>
   <header class="head">
     <h1>${escapeHtml(h1)}</h1>
-    ${q ? `<p class="count">${rows.length} ${rows.length === 1 ? "treff" : "treff"}</p>` : ""}
+    ${hasQuery ? `<p class="count">${rows.length} ${rows.length === 1 ? "treff" : "treff"}</p>` : ""}
   </header>
   ${searchBox(q)}
+  ${renderFilterChips(q, activeTags)}
   ${cards}
 </main>
 ${browseFooter()}

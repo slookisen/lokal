@@ -15867,6 +15867,29 @@ console.log("\n── opplevagent P2: human-browse subpages (experiences) ──
   assertTrue(!/Hemmelig utkast/.test(sokP2.body) && !/Hemmelig utkast/.test(sokPlaceP2.body),
     "p2-05j: search never surfaces the unpublished draft");
 
+  // p2-05k..r: dev-request 2026-07-04-opplevagent-taksonomi-filtre item 4 —
+  // filter-chips UI + ?<tag>=1 query filtering + badges on cards. Both
+  // Hvalsafari and Nordlysjakt (season:["winter"]) derive the "sesong" tag;
+  // Tapasvandring (no season set) does not — that split is what the tag
+  // filter assertions below pin.
+  assertTrue(/class="filter-chips"/.test(sokEmptyP2.body) && /Sesongbasert/.test(sokEmptyP2.body) && /Familievennlig/.test(sokEmptyP2.body),
+    "p2-05k: /sok always renders the filter-chip toggle row (all 6 tag labels present)");
+  assertTrue(/tag-filter/.test(sokP2.body) && /Sesongbasert/.test(sokP2.body),
+    "p2-05l: search-result card for the season-tagged Hvalsafari shows a 'Sesongbasert' filter badge");
+  const sokTagOnlyP2 = invokeSeo("/sok", {}, "/sok", { sesong: "1" });
+  assertEq(sokTagOnlyP2.status, 200, "p2-05m: /sok?sesong=1 (no q) → 200, browses by tag alone");
+  assertTrue(/Hvalsafari i Tromsø/.test(sokTagOnlyP2.body) && /Nordlysjakt med buss/.test(sokTagOnlyP2.body),
+    "p2-05n: tag-only filter includes both season-tagged experiences");
+  assertTrue(!/Tapasvandring i Oslo/.test(sokTagOnlyP2.body),
+    "p2-05o: tag-only filter excludes the non-seasonal experience");
+  const sokTagAndQP2 = invokeSeo("/sok", {}, "/sok", { q: "hval", sesong: "1" });
+  assertTrue(/Hvalsafari i Tromsø/.test(sokTagAndQP2.body),
+    "p2-05p: q + tag combine with AND semantics (text match ∩ tag match) and still find the match");
+  const sokNoMatchTagP2 = invokeSeo("/sok", {}, "/sok", { familievennlig: "1" });
+  assertEq(sokNoMatchTagP2.status, 200, "p2-05q: a tag with zero matching fixtures still → 200");
+  assertTrue(/Ingen treff/.test(sokNoMatchTagP2.body), "p2-05r: zero-match tag filter shows the empty-state, not an error");
+  assertTrue(/chip-active/.test(sokTagOnlyP2.body), "p2-05s: the active tag's chip carries the chip-active class");
+
   // p2-06: sitemap.xml now weaves category/fylke/provider/index URLs (DB-driven),
   // and still excludes the unpublished draft.
   const smP2 = invokeSeo("/sitemap.xml", {}, "/sitemap.xml");
