@@ -12,8 +12,10 @@
 // Cowork dispatcher for the ≥3-day parity window before cutover.
 //
 // Config (env, all optional until cutover):
-//   FIRE_ROUTINES      JSON map  { "<agent>": { "trig": "...", "token": "..." }, ... }
-//   DISPATCH_FIRE_MODE "shadow" (default) | "active"   — `?mode=` query overrides
+//   FIRE_ROUTINES             JSON map  { "<agent>": { "trig": "...", "token": "..." }, ... }
+//   DISPATCH_FIRE_MODE        "shadow" (default) | "active"   — `?mode=` query overrides
+//   DISPATCH_ACTIVE_START_UTC inclusive hour, default 0  (24/7; dev-requests/2026-07-08-spine-24-7-active-window.md)
+//   DISPATCH_ACTIVE_END_UTC   exclusive hour, default 24 (24/7) — set e.g. 5/21 to restore a night pause
 //
 // Intended trigger: a thin Fly Machine cron that POSTs this endpoint every ~10 min
 // during active hours (same spine as admin-loop-heartbeat / admin-run-verifier).
@@ -23,6 +25,7 @@ import { Router, Request, Response } from "express";
 import { listRecentRuns, recordRun } from "../services/run-ledger";
 import {
   computeWakeList,
+  resolveActiveWindowHour,
   DEFAULT_ALLOWLIST,
   type DispatchPlan,
 } from "../services/loop-dispatch";
@@ -141,6 +144,12 @@ async function fireRoutine(
 
 function planNow(): DispatchPlan {
   const runs = listRecentRuns({ sinceHours: 1, limit: 500 });
+  // dev-requests/2026-07-08-spine-24-7-active-window.md: default 0/24 (24/7) so the
+  // spine fires whenever there's fresh next_suggested work, day or night. computeWakeList's
+  // own internal defaults (5/21) stay untouched for other callers/tests; only this route's
+  // call now sends explicit window bounds, overridable via env without a code revert.
+  const activeStartUTC = resolveActiveWindowHour(process.env.DISPATCH_ACTIVE_START_UTC, 0);
+  const activeEndUTC = resolveActiveWindowHour(process.env.DISPATCH_ACTIVE_END_UTC, 24);
   return computeWakeList(
     runs.map((r) => ({
       run_id: r.run_id,
@@ -149,7 +158,7 @@ function planNow(): DispatchPlan {
       finished_at: r.finished_at,
       next_suggested: r.next_suggested ?? null,
     })),
-    { nowMs: Date.now(), allowlist: DEFAULT_ALLOWLIST },
+    { nowMs: Date.now(), allowlist: DEFAULT_ALLOWLIST, activeStartUTC, activeEndUTC },
   );
 }
 

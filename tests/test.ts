@@ -5,7 +5,7 @@
 
 import { redactPII, isValidFodselsnummer } from "../src/utils/pii-redact";
 import { computeLoopHealth } from "../src/services/loop-health";
-import { computeWakeList } from "../src/services/loop-dispatch";
+import { computeWakeList, resolveActiveWindowHour } from "../src/services/loop-dispatch";
 import { normalizeTimestamp, normalizeEnvelopeTimes } from "../src/services/envelope-normalize";
 import { validateEnvelope } from "../src/routes/admin-runs";
 
@@ -17900,6 +17900,42 @@ const _orchPr20260614_2Promise = (async () => {
   });
   assertTrue(!p6.inActiveWindow, "dispatch: 02:00 UTC is outside active window");
   assertEq(p6.wake.length, 0, "dispatch: paused window -> no wake");
+
+  // dev-requests/2026-07-08-spine-24-7-active-window.md: admin-loop-dispatch.ts's planNow()
+  // now sends explicit activeStartUTC:0/activeEndUTC:24 by default. Pin that a night hour
+  // (02:00 UTC) with those bounds fires normally -- was paused before this dev-request.
+  // (Built inline, not via mk(), since mk() anchors started_at/finished_at to baseUTC
+  // (10:00) -- reusing it here with a 02:00 nowMs would make the run look "from the
+  // future" and get skipped as stale, unrelated to the window logic under test.)
+  const nightUTC = Date.parse("2026-06-22T02:00:00Z");
+  const p6b = computeWakeList(
+    [
+      {
+        run_id: "r8b",
+        agent: "rfb-supervisor",
+        started_at: new Date(nightUTC - 60_000).toISOString(),
+        finished_at: new Date(nightUTC - 60_000).toISOString(),
+        next_suggested: ["orchestrator-v3-controller"],
+      },
+    ],
+    { nowMs: nightUTC, cooldownMin: 0, activeStartUTC: 0, activeEndUTC: 24 },
+  );
+  assertTrue(p6b.inActiveWindow, "dispatch: 24/7 window (0-24) treats 02:00 UTC as active");
+  assertEq(p6b.wake.length, 1, "dispatch: 24/7 window -> night wake fires");
+  assertEq(p6b.wake[0]!.agent, "orchestrator-v3-controller", "dispatch: 24/7 night wake targets suggested agent");
+
+  // resolveActiveWindowHour: the env-parsing helper planNow() actually calls (PR #180
+  // review flagged that the original test only exercised computeWakeList directly and
+  // never the env-parsing code path this dev-request adds). Cover the footguns a
+  // reviewer would expect: unset, empty-string (NOT caught by `??`), non-numeric, a
+  // valid value, and out-of-range clamping.
+  assertEq(resolveActiveWindowHour(undefined, 0), 0, "resolveActiveWindowHour: unset -> fallback");
+  assertEq(resolveActiveWindowHour("", 24), 24, "resolveActiveWindowHour: empty string -> fallback (not caught by ??)");
+  assertEq(resolveActiveWindowHour("   ", 5), 5, "resolveActiveWindowHour: whitespace-only -> fallback");
+  assertEq(resolveActiveWindowHour("not-a-number", 21), 21, "resolveActiveWindowHour: non-numeric -> fallback");
+  assertEq(resolveActiveWindowHour("7", 0), 7, "resolveActiveWindowHour: valid numeric string -> parsed value");
+  assertEq(resolveActiveWindowHour("-3", 0), 0, "resolveActiveWindowHour: below-range -> clamped to 0");
+  assertEq(resolveActiveWindowHour("99", 0), 24, "resolveActiveWindowHour: above-range -> clamped to 24");
 
   // Worker agents (added for remediation-wakes-worker-directly, loop-reliability-backend
   // item 5) are now allowlisted and share the same generic rate-limits as the control plane.

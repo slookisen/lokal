@@ -9,6 +9,20 @@
 // (routes/admin-loop-dispatch.ts) is a thin wrapper that reads the ledger, calls
 // this, and POSTs the routine `/fire` API for each woken agent that has a routine.
 
+/**
+ * Parse an active-window-hour env var (`DISPATCH_ACTIVE_START_UTC` /
+ * `DISPATCH_ACTIVE_END_UTC`), falling back to `fallback` on missing, empty-string
+ * (`""` is a common Fly.io/CI unset-but-present footgun -- NOT caught by `??`), or
+ * non-numeric input. Clamped to `[0, 24]` since it feeds an hour-of-day comparison.
+ * Pure + exported so `planNow()`'s env-parsing is unit-testable without a DB.
+ */
+export function resolveActiveWindowHour(raw: string | undefined, fallback: number): number {
+  if (raw === undefined || raw.trim() === "") return fallback;
+  const n = Number(raw);
+  if (!Number.isFinite(n)) return fallback;
+  return Math.max(0, Math.min(24, n));
+}
+
 /** Minimal shape we need from a run-ledger record. `RunRecord` satisfies it. */
 export interface DispatchRunLite {
   run_id: string;
