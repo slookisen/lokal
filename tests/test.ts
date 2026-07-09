@@ -15867,6 +15867,69 @@ console.log("\n── opplevagent P2: human-browse subpages (experiences) ──
   assertTrue(!/Hemmelig utkast/.test(sokP2.body) && !/Hemmelig utkast/.test(sokPlaceP2.body),
     "p2-05j: search never surfaces the unpublished draft");
 
+  // p2-05k..r: dev-request 2026-07-04-opplevagent-taksonomi-filtre item 4 —
+  // filter-chips UI + ?<tag>=1 query filtering + badges on cards. Both
+  // Hvalsafari and Nordlysjakt (season:["winter"]) derive the "sesong" tag;
+  // Tapasvandring (no season set) does not — that split is what the tag
+  // filter assertions below pin.
+  //
+  // Care taken against a specific false-positive class (flagged by an
+  // independent review of an earlier version of this block, and again by
+  // self-review below on p2-05l): every /sok page embeds BROWSE_CSS inline
+  // (`<style>...</style>`), which contains bare selector text like
+  // `.tag-filter{...}` and `.chip-active{...}`. A regex that greps the raw
+  // response body for the BARE string "tag-filter" or "chip-active" (no
+  // `class="..."` anchor) matches that CSS rule on every single page
+  // regardless of whether any badge/chip actually rendered — i.e. it can
+  // never fail. Every assertion below anchors to the literal rendered
+  // `class="..."` (or full element) string instead of a bare substring.
+  assertTrue(/class="filter-chips"/.test(sokEmptyP2.body) && /Sesongbasert/.test(sokEmptyP2.body) && /Familievennlig/.test(sokEmptyP2.body),
+    "p2-05k: /sok always renders the filter-chip toggle row (all 6 tag labels present)");
+  // p2-05l: card-badge check anchored to the exact rendered element — NOT a
+  // bare "tag-filter"/"Sesongbasert" substring test, both of which are
+  // vacuously true on every /sok page (the CSS rule .tag-filter{...} is
+  // always present, AND the filter-chip row unconditionally renders a
+  // "Sesongbasert" CHIP LABEL regardless of any card's own badges — so
+  // checking for that text anywhere on the page proves nothing about the
+  // Hvalsafari CARD specifically).
+  assertTrue(/<span class="tag tag-filter">Sesongbasert<\/span>/.test(sokP2.body),
+    "p2-05l: search-result card for the season-tagged Hvalsafari shows a 'Sesongbasert' filter badge (element-anchored, not a bare-text match against the always-present CSS rule or chip label)");
+  const sokTagOnlyP2 = invokeSeo("/sok", {}, "/sok", { sesong: "1" });
+  assertEq(sokTagOnlyP2.status, 200, "p2-05m: /sok?sesong=1 (no q) → 200, browses by tag alone");
+  assertTrue(/Hvalsafari i Tromsø/.test(sokTagOnlyP2.body) && /Nordlysjakt med buss/.test(sokTagOnlyP2.body),
+    "p2-05n: tag-only filter includes both season-tagged experiences");
+  // p2-05o: absence-of-Tapasvandring ALONE is vacuous (also true if the
+  // filter over-excluded everything) — pinned to the exact count instead,
+  // so a broken filter that returns 0 or 3 rows fails this too, not just a
+  // filter that happens to keep Tapasvandring out for the wrong reason.
+  assertTrue(/2 treff/.test(sokTagOnlyP2.body) && !/Tapasvandring i Oslo/.test(sokTagOnlyP2.body),
+    "p2-05o: tag-only filter returns exactly the 2 season-tagged experiences (count-pinned, not just an absence check)");
+  const sokTagAndQP2 = invokeSeo("/sok", {}, "/sok", { q: "hval", sesong: "1" });
+  assertTrue(/Hvalsafari i Tromsø/.test(sokTagAndQP2.body),
+    "p2-05p: q+tag both match Hvalsafari → still found (smoke check only — q=hval alone would already match this row, so this does NOT by itself prove AND-narrowing; see p2-05p2)");
+  // p2-05p2: the actual AND-semantics proof. q="Oslo" alone matches ONLY
+  // Tapasvandring (confirmed by sokPlaceP2 above, p2-05f) — which does NOT
+  // carry the sesong tag. Combining q=Oslo with sesong=1 must therefore
+  // exclude it: if the implementation used OR semantics, or silently
+  // ignored the tag filter whenever `q` is present, Tapasvandring would
+  // incorrectly still appear here.
+  const sokQMatchTagNotP2 = invokeSeo("/sok", {}, "/sok", { q: "Oslo", sesong: "1" });
+  assertTrue(!/Tapasvandring i Oslo/.test(sokQMatchTagNotP2.body) && /Ingen treff/.test(sokQMatchTagNotP2.body),
+    "p2-05p2: q matches Tapasvandring (Oslo) but it lacks the sesong tag — AND semantics correctly excludes it, proving the tag filter isn't a no-op/OR when q is also present");
+  const sokNoMatchTagP2 = invokeSeo("/sok", {}, "/sok", { familievennlig: "1" });
+  assertEq(sokNoMatchTagP2.status, 200, "p2-05q: a tag with zero matching fixtures still → 200, not a crash");
+  // p2-05q2: pins the count to exactly 0 (not just "200 status", which is
+  // true regardless of whether filtering silently no-oped and returned
+  // some/all rows instead of correctly finding zero matches).
+  assertTrue(/0 treff/.test(sokNoMatchTagP2.body), "p2-05q2: zero-match tag filter's count reads exactly '0 treff' (not silently falling back to unfiltered results)");
+  assertTrue(/Ingen treff/.test(sokNoMatchTagP2.body), "p2-05r: zero-match tag filter shows the empty-state, not an error");
+  // p2-05s: anchored to the actual rendered anchor class attribute — NOT a
+  // bare "chip-active" substring, which is vacuously true on every /sok
+  // page via the CSS rule `.chip-active{...}` in the embedded <style>
+  // block regardless of whether any chip is actually in the active state.
+  assertTrue(/class="chip chip-active"/.test(sokTagOnlyP2.body),
+    "p2-05s: the active tag's chip carries the chip-active class on the rendered <a> element (element-anchored, not a bare-text match against the always-present CSS rule)");
+
   // p2-06: sitemap.xml now weaves category/fylke/provider/index URLs (DB-driven),
   // and still excludes the unpublished draft.
   const smP2 = invokeSeo("/sitemap.xml", {}, "/sitemap.xml");

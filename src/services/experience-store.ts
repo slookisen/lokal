@@ -18,7 +18,7 @@ import { v4 as uuid } from "uuid";
 import { z } from "zod";
 import { getDb } from "../database/db-factory";
 import { fylkeEquivalents } from "./norway-fylke";
-import { deriveExperienceTags, type ExperienceTag } from "./experience-tags";
+import { deriveExperienceTags, type ExperienceTag, type TaggableExperience } from "./experience-tags";
 
 const VERTICAL = "experiences";
 
@@ -410,13 +410,55 @@ export type ExperienceCardRow = {
   price_from: number | null;
   price_band: string | null;
   confidence: string | null;
+  // dev-request 2026-07-04-opplevagent-taksonomi-filtre: derived cross-cutting
+  // filter tags (see experience-tags.ts), computed at read time — same as
+  // hydrateExperience()'s `tags`, wired into the card-listing path too so
+  // /sok filter-chips and card badges can rely on it everywhere.
+  tags: ExperienceTag[];
 };
 
 const CARD_COLS =
   "e.slug AS slug, e.title AS title, e.description AS description, " +
   "e.category AS category, e.fylke AS fylke, e.kommune AS kommune, " +
   "e.indoor_outdoor AS indoor_outdoor, e.duration_min AS duration_min, " +
-  "e.price_from AS price_from, e.price_band AS price_band, e.confidence AS confidence";
+  "e.price_from AS price_from, e.price_band AS price_band, e.confidence AS confidence, " +
+  // Extra raw columns needed ONLY to derive `tags` (deriveExperienceTags's
+  // TaggableExperience shape) — not part of the public ExperienceCardRow
+  // surface; stripped by hydrateCardRow() below.
+  "e.age_suitability AS age_suitability, e.min_age AS min_age, " +
+  "e.weather_dependent AS weather_dependent, e.accessibility AS accessibility, " +
+  "e.season AS season, e.seasonal_valid_from AS seasonal_valid_from, " +
+  "e.seasonal_valid_to AS seasonal_valid_to";
+
+/** Maps one raw CARD_COLS row (incl. the tag-derivation-only columns) to the
+ *  public ExperienceCardRow shape, attaching the derived `tags`. */
+function hydrateCardRow(row: Record<string, unknown>): ExperienceCardRow {
+  return {
+    slug: row.slug as string,
+    title: row.title as string,
+    description: (row.description as string | null) ?? null,
+    category: (row.category as string | null) ?? null,
+    fylke: (row.fylke as string | null) ?? null,
+    kommune: (row.kommune as string | null) ?? null,
+    indoor_outdoor: (row.indoor_outdoor as string | null) ?? null,
+    duration_min: (row.duration_min as number | null) ?? null,
+    price_from: (row.price_from as number | null) ?? null,
+    price_band: (row.price_band as string | null) ?? null,
+    confidence: (row.confidence as string | null) ?? null,
+    tags: deriveExperienceTags({
+      age_suitability: (row.age_suitability as TaggableExperience["age_suitability"]) ?? null,
+      min_age: (row.min_age as number | null) ?? null,
+      price_band: (row.price_band as string | null) ?? null,
+      price_from: (row.price_from as number | null) ?? null,
+      indoor_outdoor: (row.indoor_outdoor as TaggableExperience["indoor_outdoor"]) ?? null,
+      weather_dependent: (row.weather_dependent as 0 | 1 | null) ?? null,
+      accessibility: parseJsonArray(row.accessibility),
+      season: parseJsonArray(row.season),
+      seasonal_valid_from: (row.seasonal_valid_from as string | null) ?? null,
+      seasonal_valid_to: (row.seasonal_valid_to as string | null) ?? null,
+    }),
+  };
+}
 
 // Confidence-then-title ordering, identical to /discover, so listings rank the
 // same way the agent surface does.
@@ -464,7 +506,7 @@ export function listPublishedExperiences(
   const { sql, params } = browseWhere(filter);
   params.limit = Math.max(1, Math.min(100, limit));
   params.offset = Math.max(0, offset);
-  return db
+  const rows = db
     .prepare(
       `SELECT ${CARD_COLS} FROM experiences e
        LEFT JOIN experience_providers p ON p.id = e.provider_id
@@ -472,7 +514,8 @@ export function listPublishedExperiences(
        ${CARD_ORDER}
        LIMIT @limit OFFSET @offset`
     )
-    .all(params) as ExperienceCardRow[];
+    .all(params) as Record<string, unknown>[];
+  return rows.map(hydrateCardRow);
 }
 
 /** Distinct categories that have ≥1 PUBLISHED experience (with counts). Drives
@@ -771,7 +814,7 @@ export function searchPublishedExperiences(query: string, limit = 30): Experienc
     });
     return `(${fieldClauses.join(" OR ")})`;
   });
-  return db
+  const rows = db
     .prepare(
       `SELECT ${CARD_COLS} FROM experiences e
        LEFT JOIN experience_providers p ON p.id = e.provider_id
@@ -780,7 +823,8 @@ export function searchPublishedExperiences(query: string, limit = 30): Experienc
        ${CARD_ORDER}
        LIMIT @limit`
     )
-    .all(params) as ExperienceCardRow[];
+    .all(params) as Record<string, unknown>[];
+  return rows.map(hydrateCardRow);
 }
 
 
