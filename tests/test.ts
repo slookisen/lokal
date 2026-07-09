@@ -5,10 +5,10 @@
 
 import { redactPII, isValidFodselsnummer } from "../src/utils/pii-redact";
 import { computeLoopHealth } from "../src/services/loop-health";
-import { computeWakeList, resolveActiveWindowHour } from "../src/services/loop-dispatch";
+import { computeWakeList, resolveActiveWindowHour, resolveTickIntervalMin } from "../src/services/loop-dispatch";
 import { normalizeTimestamp, normalizeEnvelopeTimes } from "../src/services/envelope-normalize";
 import { validateEnvelope } from "../src/routes/admin-runs";
-import {
+import conversationUiRouter, {
   conversationStateLabel,
   searchGroupLabel,
   classifyAssistant,
@@ -18491,6 +18491,24 @@ const _orchPr20260614_2Promise = (async () => {
   assertEq(resolveActiveWindowHour("-3", 0), 0, "resolveActiveWindowHour: below-range -> clamped to 0");
   assertEq(resolveActiveWindowHour("99", 0), 24, "resolveActiveWindowHour: above-range -> clamped to 24");
 
+  // resolveTickIntervalMin (dev-requests/2026-07-09-loop-dispatch-self-tick.md): the
+  // env-parsing helper index.ts's dispatcher self-tick actually calls for
+  // DISPATCH_TICK_INTERVAL_MIN. Same footgun coverage as resolveActiveWindowHour
+  // above (unset / empty-string / non-numeric -> default 10), plus the [2, 120]
+  // clamp: never sub-2-min (ledger-query hammering) and never beyond 120 min
+  // (past that, the 12-min next_suggested freshness window makes every tick
+  // arrive too late by construction -- the exact bug this dev-request fixes).
+  assertEq(resolveTickIntervalMin(undefined), 10, "resolveTickIntervalMin: unset -> default 10");
+  assertEq(resolveTickIntervalMin(""), 10, "resolveTickIntervalMin: empty string -> default 10 (not caught by ??)");
+  assertEq(resolveTickIntervalMin("   "), 10, "resolveTickIntervalMin: whitespace-only -> default 10");
+  assertEq(resolveTickIntervalMin("not-a-number"), 10, "resolveTickIntervalMin: non-numeric -> default 10");
+  assertEq(resolveTickIntervalMin("15"), 15, "resolveTickIntervalMin: valid numeric string -> parsed value");
+  assertEq(resolveTickIntervalMin("10"), 10, "resolveTickIntervalMin: explicit 10 -> 10");
+  assertEq(resolveTickIntervalMin("1"), 2, "resolveTickIntervalMin: below-range -> clamped to 2");
+  assertEq(resolveTickIntervalMin("0"), 2, "resolveTickIntervalMin: zero -> clamped to 2 (disable via DISPATCH_TICK_DISABLED, not interval=0)");
+  assertEq(resolveTickIntervalMin("-5"), 2, "resolveTickIntervalMin: negative -> clamped to 2");
+  assertEq(resolveTickIntervalMin("999"), 120, "resolveTickIntervalMin: above-range -> clamped to 120");
+
   // Worker agents (added for remediation-wakes-worker-directly, loop-reliability-backend
   // item 5) are now allowlisted and share the same generic rate-limits as the control plane.
   for (const worker of ["rfb-customer-service", "lokal-agent-enrichment", "experiences-enrichment"]) {
@@ -20108,6 +20126,7 @@ console.log("\n── orch-pr-14: MCP discovery product_id surfacing ──");
   try { await _adminAgentsRegisterPromise; } catch { /* errors already pushed to failures */ }
   try { await _tasksPruneAsyncPromise; } catch { /* errors already pushed to failures */ }
   try { await _rfbDebioSuitePromise; } catch { /* errors already pushed to failures */ }
+  try { await _dispatchTickSuitePromise; } catch { /* errors already pushed to failures */ }
   // relax-envelope tests are synchronous (pure validateEnvelope() unit test) — no promise needed
   // PR-109 tests are synchronous (IIFE) — no promise needed
   // Drop pre-existing intg failures (unmasked by awaiting) — they predate M2
@@ -23982,3 +24001,128 @@ const _rfbDebioSuitePromise: Promise<void> = new Promise<void>(r => { _rfbDebioS
     _rfbDebioSuiteResolve();
   }
 );
+
+
+// ═══ dev-request 2026-07-09-loop-dispatch-self-tick: runDispatchTick ═════════
+// The POST /admin/loop-dispatch body extracted into an exported function so the
+// in-process self-tick in src/index.ts can call it directly. These tests pin the
+// behaviors the self-tick depends on WITHOUT ever firing a real routine (the
+// test env keeps FIRE_ROUTINES unset for the active-mode paths, and uses shadow
+// mode for the configured-routine path — both are pre-fire defer branches, so
+// no fetch to api.anthropic.com can happen).
+let _dispatchTickSuiteResolve: () => void = () => {};
+const _dispatchTickSuitePromise: Promise<void> = new Promise<void>(r => { _dispatchTickSuiteResolve = r; });
+
+(async () => {
+  // Run strictly after every other singleton-swapping block: _rfbDebioSuitePromise
+  // itself awaits the full REPORT dependency list except the two extras below,
+  // so awaiting these three covers everything the REPORT IIFE waits for.
+  await Promise.allSettled([_rfbDebioSuitePromise, _salgskanalMatcherPromise, _adminAgentsRegisterPromise]);
+  await new Promise(r => setImmediate(r));
+
+  console.log("\n── dev-request 2026-07-09: loop-dispatch self-tick (runDispatchTick) ──");
+
+  const Database = require("better-sqlite3");
+  const initModTick = require("../src/database/init");
+  const { runDispatchTick } = require("../src/routes/admin-loop-dispatch");
+  const { recordRun: recordRunTick } = require("../src/services/run-ledger");
+
+  const prevDbTick = initModTick.getDb();
+  const db = new Database(":memory:");
+  db.pragma("journal_mode = DELETE");
+  db.pragma("foreign_keys = ON");
+  const prevFireRoutines = process.env.FIRE_ROUTINES;
+  const prevActiveStart = process.env.DISPATCH_ACTIVE_START_UTC;
+  const prevActiveEnd = process.env.DISPATCH_ACTIVE_END_UTC;
+  try {
+    initModTick.__setDbForTesting(db);
+    initModTick.__initSchemaForTesting(db);
+    delete process.env.FIRE_ROUTINES;             // active-mode tests must hit the no-routine defer path
+    delete process.env.DISPATCH_ACTIVE_START_UTC; // default 0/24 → always inside the active window
+    delete process.env.DISPATCH_ACTIVE_END_UTC;
+
+    assertEq(typeof runDispatchTick, "function", "tick: runDispatchTick is exported and callable");
+
+    // ── A. Empty ledger, active mode → pure no-op: nothing planned, nothing
+    //    fired, and — critically — NO envelope recorded. Pins the self-stopping
+    //    property (empty queue → tick is silent) AND the fired.length>0 gate
+    //    that keeps the ~10-min heartbeat from flooding the run-ledger (the
+    //    2026-06-27 L4: 115/120 ledger rows were dispatcher heartbeats). ──
+    {
+      const r = await runDispatchTick("active");
+      assertEq(r.mode, "active", "tick-noop: mode passed through to result");
+      assertEq(r.candidates, 0, "tick-noop: empty ledger -> 0 candidates");
+      assertEq(r.wake.length, 0, "tick-noop: empty ledger -> nothing planned");
+      assertEq(r.fired.length, 0, "tick-noop: nothing fired");
+      assertEq(r.deferred.length, 0, "tick-noop: nothing deferred");
+      const c = db.prepare("SELECT COUNT(*) AS c FROM runs").get() as any;
+      assertEq(c.c, 0, "tick-noop: NO envelope recorded on a no-op tick (no ledger spam)");
+    }
+
+    // Seed ONE fresh self-continue: rfb-supervisor finished 1 min ago suggesting
+    // platform-orchestrator (fresh: 1 < 12-min windowMin; no cooldown: the target
+    // has no run of its own). Written through the production recordRun() path.
+    const seededAt = new Date(Date.now() - 60_000).toISOString();
+    recordRunTick({
+      run_id: "tick-seed-run",
+      vertical: "rfb",
+      agent: "rfb-supervisor",
+      trigger_source: "cron",
+      started_at: seededAt,
+      finished_at: seededAt,
+      status: "completed",
+      claims: [],
+      evidence: [],
+      next_suggested: ["platform-orchestrator"],
+    }, db);
+
+    // ── B. Fresh candidate + ACTIVE mode + FIRE_ROUTINES unset → the wake is
+    //    planned but defers on "no routine configured". This is the exact path
+    //    the prod self-tick would take if FIRE_ROUTINES disappeared: it can
+    //    plan, but it can never fire — and it records no envelope (fired=[]). ──
+    {
+      const r = await runDispatchTick("active");
+      assertEq(r.candidates, 1, "tick-noroutine: seeded fresh run is a candidate");
+      assertEq(r.wake.length, 1, "tick-noroutine: wake planned for the suggested agent");
+      assertEq(r.wake[0].agent, "platform-orchestrator", "tick-noroutine: planned wake targets next_suggested");
+      assertEq(r.wake[0].reason, "tick-seed-run", "tick-noroutine: wake reason is the source run_id");
+      assertEq(r.fired.length, 0, "tick-noroutine: nothing fired without FIRE_ROUTINES");
+      assertEq(r.deferred.length, 1, "tick-noroutine: the planned wake is deferred instead");
+      assertTrue(/no routine configured/.test(r.deferred[0].why), "tick-noroutine: defer reason names the missing routine config");
+      const c = db.prepare("SELECT COUNT(*) AS c FROM runs WHERE agent = 'loop-dispatcher'").get() as any;
+      assertEq(c.c, 0, "tick-noroutine: deferred-only tick records NO dispatcher envelope");
+    }
+
+    // ── C. Same fresh candidate + configured routine + SHADOW mode → plans the
+    //    wake, resolves the short alias (orchestrator → platform-orchestrator),
+    //    but defers with why="shadow mode" — no /fire call, no fire-marker,
+    //    no envelope. Shadow stays observation-only. ──
+    {
+      process.env.FIRE_ROUTINES = JSON.stringify({ orchestrator: { trig: "trig-test-tick", token: "tok-test-tick" } });
+      const r = await runDispatchTick("shadow");
+      assertEq(r.mode, "shadow", "tick-shadow: mode passed through to result");
+      assertEq(r.wake.length, 1, "tick-shadow: fresh candidate still planned in shadow");
+      assertTrue(r.fire_routines.mapped_keys.includes("platform-orchestrator"), "tick-shadow: alias orchestrator -> platform-orchestrator resolved");
+      assertEq(r.fired.length, 0, "tick-shadow: shadow mode never fires");
+      assertEq(r.deferred.length, 1, "tick-shadow: planned wake deferred");
+      assertEq(r.deferred[0].agent, "platform-orchestrator", "tick-shadow: deferred wake targets the suggested agent");
+      assertEq(r.deferred[0].why, "shadow mode", "tick-shadow: defer reason is exactly 'shadow mode'");
+      const env = db.prepare("SELECT COUNT(*) AS c FROM runs WHERE agent = 'loop-dispatcher'").get() as any;
+      assertEq(env.c, 0, "tick-shadow: no dispatcher envelope on a deferred tick");
+      const markers = db.prepare("SELECT COUNT(*) AS c FROM runs WHERE run_id LIKE 'firemarker-%'").get() as any;
+      assertEq(markers.c, 0, "tick-shadow: no fire-marker without an actual fire");
+      const total = db.prepare("SELECT COUNT(*) AS c FROM runs").get() as any;
+      assertEq(total.c, 1, "tick-shadow: ledger holds ONLY the seeded run after 3 ticks");
+    }
+  } catch (err) {
+    failed++;
+    failures.push(`tick: unexpected error: ${err instanceof Error ? (err.stack || err.message) : String(err)}`);
+  } finally {
+    if (prevFireRoutines === undefined) delete process.env.FIRE_ROUTINES; else process.env.FIRE_ROUTINES = prevFireRoutines;
+    if (prevActiveStart === undefined) delete process.env.DISPATCH_ACTIVE_START_UTC; else process.env.DISPATCH_ACTIVE_START_UTC = prevActiveStart;
+    if (prevActiveEnd === undefined) delete process.env.DISPATCH_ACTIVE_END_UTC; else process.env.DISPATCH_ACTIVE_END_UTC = prevActiveEnd;
+    initModTick.__setDbForTesting(prevDbTick);
+    db.close();
+    _dispatchTickSuiteResolve();
+  }
+})();

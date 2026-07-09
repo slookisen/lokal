@@ -23,6 +23,24 @@ export function resolveActiveWindowHour(raw: string | undefined, fallback: numbe
   return Math.max(0, Math.min(24, n));
 }
 
+/**
+ * Parse `DISPATCH_TICK_INTERVAL_MIN` (dev-requests/2026-07-09-loop-dispatch-self-tick.md)
+ * for the in-process dispatcher self-tick in src/index.ts. Missing / empty-string /
+ * non-numeric input falls back to 10 (the design cadence from admin-loop-dispatch.ts's
+ * "every ~10 min" header). Numeric input is clamped to [2, 120]: never faster than
+ * 2 min (the tick is "knock on the door", not "spawn" — but a sub-minute loop would
+ * still hammer the ledger query), never slower than 120 min (beyond that the 12-min
+ * next_suggested freshness window makes the tick pointless — the very bug this fixes).
+ * Pure + exported so index.ts's env-parsing is unit-testable, mirroring
+ * resolveActiveWindowHour above.
+ */
+export function resolveTickIntervalMin(raw: string | undefined): number {
+  if (raw === undefined || raw.trim() === "") return 10;
+  const n = Number(raw);
+  if (!Number.isFinite(n)) return 10;
+  return Math.max(2, Math.min(120, n));
+}
+
 /** Minimal shape we need from a run-ledger record. `RunRecord` satisfies it. */
 export interface DispatchRunLite {
   run_id: string;
