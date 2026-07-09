@@ -988,22 +988,33 @@ if (process.env.DISPATCH_TICK_DISABLED === "1" || !process.env.FIRE_ROUTINES) {
 } else {
   const tickIntervalMin = resolveTickIntervalMin(process.env.DISPATCH_TICK_INTERVAL_MIN);
   console.log(`[dispatch-tick] enabled — runDispatchTick("active") every ${tickIntervalMin} min`);
-  setInterval(async () => {
+
+  const dispatchTick = async (label: string) => {
     try {
       const r = await runDispatchTick("active");
       // Log only when the tick actually did something — a no-op tick every
       // ~10 min must not spam the logs (mirrors the envelope-only-on-fire rule).
       if (r.fired.length > 0 || r.deferred.length > 0) {
         console.log(
-          `[dispatch-tick] candidates=${r.candidates} wake=${r.wake.length} ` +
+          `[dispatch-tick] ${label} candidates=${r.candidates} wake=${r.wake.length} ` +
           `fired_ok=${r.fired.filter((f) => f.ok).length} deferred=${r.deferred.length} ` +
           `envelope=${r.fired.length > 0 ? r.envelope_run_id : "none"}`,
         );
       }
     } catch (err) {
-      console.error("[dispatch-tick] failed (non-fatal):", err);
+      console.error(`[dispatch-tick] ${label} failed (non-fatal):`, err);
     }
-  }, tickIntervalMin * 60_000);
+  };
+
+  // dev-requests/2026-07-09-self-continue-cooldown-carveout.md: every deploy swaps
+  // the Fly machine and resets the interval phase, so a next_suggested envelope
+  // posted just before a deploy can go stale (past the 12-min freshness window)
+  // before the first post-deploy interval tick. A boot-tick at +2min (after the
+  // volume mount / db-factory settle, mirroring the dental-geocode boot-tick
+  // pattern above) closes that gap without shortening the steady-state interval.
+  setTimeout(() => { void dispatchTick("boot"); }, 2 * 60_000);
+
+  setInterval(() => { void dispatchTick("interval"); }, tickIntervalMin * 60_000);
 }
 
 // ─── Graceful shutdown ───────────────────────────────────────
