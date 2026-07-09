@@ -97,6 +97,118 @@ export function searchGroupLabel(matchCount: number): { label: string; cls: stri
   return { label: `Søk → ${n} treff`, cls: "st-search" };
 }
 
+// ─── Group by query, not by producer (dev-request 2026-07-04, item 1) ───────
+// A single search fans out to N producers, creating N near-identical top-level
+// conversation threads for the same question. Render ONE card per real search
+// event — (normalized query, session/agent, time-window) — with the per-
+// producer replies collapsed inside it, and kill the repeated identical reply
+// snippets a repeated fan-out leaves behind.
+//
+// The grouping key is read from the ACTUAL data shape (verified against
+// conversation-service.ts + the fan-out call sites), never invented:
+//   • An A2A search shares a stable taskId across every producer conversation
+//     it fans out to (a2a.ts passes taskId: task.id + buyerAgentId to each).
+//   • An MCP / GPT search shares the clientIdentity captured on the opening
+//     system message (conversation-service stores it in metadata.clientIdentity).
+//   • Anonymous api/web searches carry none of those, so we fall back to
+//     (query + source + time-bucket) — enough to keep genuinely separate search
+//     events (even the same query on different days) in separate cards, without
+//     ever fabricating a session id.
+
+type GroupMsg = { senderRole?: string; content?: string; metadata?: Record<string, any> | null };
+type GroupableConv = {
+  id: string;
+  queryText?: string | null;
+  source?: string | null;
+  taskId?: string | null;
+  buyerAgentId?: string | null;
+  sellerAgentId?: string | null;
+  sellerAgentName?: string | null;
+  createdAt?: string;
+  updatedAt?: string;
+  messages: GroupMsg[];
+};
+
+// Session/agent identity for grouping — strongest stable key first, honest
+// empty string when nothing identifies the searcher (never a fabricated id).
+export function conversationSessionKey(conv: GroupableConv): string {
+  if (conv.taskId) return `task:${conv.taskId}`;
+  if (conv.buyerAgentId) return `buyer:${conv.buyerAgentId}`;
+  const sys = (conv.messages || []).find(m => m && m.senderRole === "system");
+  const client = sys?.metadata?.clientIdentity;
+  if (client) return `client:${client}`;
+  return "";
+}
+
+// Hour bucket ("2026-07-09T14:23:01Z" → "2026-07-09T14"). A fan-out lands in the
+// same second, so any bucket collapses it; the hour granularity keeps genuinely
+// separate searches (same query, hours apart) in separate cards.
+function timeBucket(iso: string | undefined): string {
+  return (iso || "").slice(0, 13);
+}
+
+export function conversationGroupKey(conv: GroupableConv): string {
+  const q = (conv.queryText || "").trim().toLowerCase();
+  // No query text → never merge distinct conversations (each is its own card).
+  if (!q) return `id:${conv.id}`;
+  return [q, conv.source || "api", conversationSessionKey(conv), timeBucket(conv.createdAt || conv.updatedAt)].join("||");
+}
+
+// The producer's most recent reply, truncated for the accordion preview. Raw
+// (unescaped) — callers escape at render time.
+export function sellerReplySnippet(conv: GroupableConv, max = 150): string {
+  const sellerMsg = [...(conv.messages || [])].reverse().find(m => m && m.senderRole === "seller");
+  const content = sellerMsg?.content || "";
+  return content.length > max ? content.slice(0, max) + "..." : content;
+}
+
+export interface ConversationGroup {
+  key: string;
+  queryText: string;                 // raw; redact/escape at render
+  source: string;
+  conversations: GroupableConv[];     // deduped — no repeated producer+reply
+  snippets: string[];                 // per-conversation reply snippet (index-aligned)
+  totalMessages: number;              // over the deduped set (honest count)
+  mostRecent: GroupableConv;
+}
+
+// Group a flat, most-recent-first conversation list into query-session cards,
+// dropping the 3× repetition of an identical producer+reply that a repeated
+// fan-out of the same query leaves in the accordion. Insertion order (and thus
+// most-recent-first) is preserved.
+export function groupConversationsForList(convs: GroupableConv[]): ConversationGroup[] {
+  const groups = new Map<string, ConversationGroup & { _seen: Set<string> }>();
+  for (const conv of convs || []) {
+    const key = conversationGroupKey(conv);
+    let g = groups.get(key);
+    if (!g) {
+      g = {
+        key,
+        queryText: (conv.queryText || "").trim(),
+        source: conv.source || "api",
+        conversations: [],
+        snippets: [],
+        totalMessages: 0,
+        mostRecent: conv,
+        _seen: new Set<string>(),
+      };
+      groups.set(key, g);
+    }
+    const snippet = sellerReplySnippet(conv);
+    // Dedupe signature: the same producer answering the same query with the
+    // same templated reply is the "3× identical snippet" noise — collapse it.
+    // Prefer the stable producer id so two DIFFERENT producers are never merged.
+    const sig = `${conv.sellerAgentId || conv.sellerAgentName || ""}::${snippet}`;
+    if (g._seen.has(sig)) continue;
+    g._seen.add(sig);
+    g.conversations.push(conv);
+    g.snippets.push(snippet);
+    g.totalMessages += (conv.messages || []).length;
+    if ((conv.updatedAt || "") > (g.mostRecent.updatedAt || "")) g.mostRecent = conv;
+  }
+  return [...groups.values()].map(({ _seen, ...g }) => g);
+}
+
 function stateBadgeHtml(s: { label: string; cls: string }): string {
   return `<span class="conv-status ${s.cls}">${escapeHtml(s.label)}</span>`;
 }
@@ -426,40 +538,34 @@ router.get("/samtaler", (req: Request, res: Response) => {
           ${activeSource ? `<p style="margin-top:12px"><a href="/samtaler">&larr; Vis alle samtaler</a></p>` : ""}
         </div>`;
     } else {
-      // Group by query text
-      const groups = new Map<string, typeof conversations>();
-      for (const conv of conversations) {
-        const key = (conv.queryText || "").trim().toLowerCase() || conv.id;
-        if (!groups.has(key)) groups.set(key, []);
-        groups.get(key)!.push(conv);
-      }
+      // Group by (query, session/agent, time-window) — one card per real search
+      // event, producer replies collapsed inside, 3× identical repeats dropped.
+      const groups = groupConversationsForList(conversations);
 
       let groupIdx = 0;
-      listHtml = [...groups.entries()].map(([_key, convs]) => {
+      listHtml = groups.map(group => {
         groupIdx++;
-        const first = convs[0];
+        const convs = group.conversations;
         // PII filter on user-typed search query text before public render
-        const queryDisplay = first.queryText ? escapeHtml(redactPII(first.queryText)) : "Direkte samtale";
-        const source = first.source || "api";
+        const queryDisplay = group.queryText ? escapeHtml(redactPII(group.queryText)) : "Direkte samtale";
+        const source = group.source;
         const srcBadge = sourceBadge(source);
-        const totalMsgs = convs.reduce((s, c) => s + c.messages.length, 0);
+        const totalMsgs = group.totalMessages;
         const agentCount = convs.length;
-        const mostRecent = convs.reduce((a, b) => a.updatedAt > b.updatedAt ? a : b);
+        const mostRecent = group.mostRecent;
         const groupId = `grp-${groupIdx}`;
 
         // Provenance: channel from source + assistant classified (never guessed)
         // from the client-id captured on the opening system message.
-        const systemMsg = first.messages.find(m => m.senderRole === "system");
+        const systemMsg = convs[0]!.messages.find(m => m.senderRole === "system");
         const clientIdentity = systemMsg?.metadata?.clientIdentity as string | undefined;
         const asstBadge = assistantBadge(clientIdentity, source);
 
-        // Agent sub-cards
-        const agentCards = convs.map(conv => {
+        // Agent sub-cards — one per (deduped) producer reply.
+        const agentCards = convs.map((conv, i) => {
           const sellerName = escapeHtml(conv.sellerAgentName || "Ukjent selger");
           const sellerMsg = [...conv.messages].reverse().find(m => m.senderRole === "seller");
-          const preview = sellerMsg
-            ? escapeHtml(sellerMsg.content).slice(0, 150) + (sellerMsg.content.length > 150 ? "..." : "")
-            : "";
+          const preview = group.snippets[i] ? escapeHtml(group.snippets[i]!) : "";
 
           return `<a href="/samtale/${conv.id}" class="agent-reply">
             <div class="agent-reply-top">
@@ -469,7 +575,7 @@ router.get("/samtaler", (req: Request, res: Response) => {
             ${preview ? `<div class="agent-reply-text">${preview}</div>` : ""}
             <div class="agent-reply-meta">
               <span>${conv.messages.length} meldinger</span>
-              <span class="cv-time">${formatTime(conv.updatedAt)}</span>
+              <span class="cv-time">${formatTime(conv.updatedAt || "")}</span>
             </div>
           </a>`;
         }).join("\n");
@@ -480,7 +586,7 @@ router.get("/samtaler", (req: Request, res: Response) => {
               <div class="query-icon">&#128269;</div>
               <div>
                 <div class="query-text">&laquo;${queryDisplay}&raquo;</div>
-                <div class="query-meta">${agentCount} produsent${agentCount > 1 ? "er" : ""} svarte &middot; ${totalMsgs} meldinger &middot; ${formatTime(mostRecent.updatedAt)}</div>
+                <div class="query-meta">${agentCount} produsent${agentCount > 1 ? "er" : ""} svarte &middot; ${totalMsgs} meldinger &middot; ${formatTime(mostRecent.updatedAt || "")}</div>
               </div>
             </div>
             <div class="query-right">
