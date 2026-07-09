@@ -1707,6 +1707,109 @@ console.log("── agent-stats: per-agent stats endpoint logic ──");
 }
 
 
+// ── "Menneskelige besøk" strip (dev-request 2026-07-04, item 6) ──────
+// Aggregated + anonymized human-referral patterns for the PUBLIC /samtaler
+// page. We test the PURE functions (classifyReferralSource +
+// aggregateHumanReferrals) directly — deterministic, no DB — so the
+// anonymization, ≥3 threshold, and internal/bot exclusion are provable.
+console.log("── human-visits strip: referral classification + aggregation ──");
+{
+  const {
+    classifyReferralSource,
+    aggregateHumanReferrals,
+    MIN_HUMAN_REFERRAL_COUNT,
+  } = require("../src/services/analytics-service");
+
+  // (a) Source labels correct — reuses the shared classifier's tokens.
+  assertEq(MIN_HUMAN_REFERRAL_COUNT, 3, "human-visits: min threshold is 3");
+  assertEq(classifyReferralSource("https://www.google.com/search?q=x").key, "google", "classify: google");
+  assertEq(classifyReferralSource("https://www.google.com/").label, "Google-søk", "classify: google label");
+  assertEq(classifyReferralSource("https://www.bing.com/").key, "bing", "classify: bing");
+  assertEq(classifyReferralSource("https://chatgpt.com/").key, "chatgpt", "classify: chatgpt.com");
+  assertEq(classifyReferralSource("https://chat.openai.com/").key, "chatgpt", "classify: chat.openai.com");
+  assertEq(classifyReferralSource("https://www.perplexity.ai/").key, "perplexity", "classify: perplexity");
+  // Ordering guard: gemini/bard live on *.google.com — must NOT fall through to google.
+  assertEq(classifyReferralSource("https://gemini.google.com/app").key, "gemini", "classify: gemini before google");
+  assertEq(classifyReferralSource("https://duckduckgo.com/").key, "duckduckgo", "classify: duckduckgo");
+  assertEq(classifyReferralSource("https://m.facebook.com/").key, "sosial", "classify: social");
+  assertEq(classifyReferralSource(null).key, "direkte", "classify: no referrer → direkte");
+  assertEq(classifyReferralSource("").key, "direkte", "classify: empty referrer → direkte");
+  assertEq(classifyReferralSource("https://rettfrabonden.com/sok").key, "intern", "classify: own domain → intern");
+  assertEq(classifyReferralSource("https://some-blog.example/").key, "annet", "classify: unknown host → annet");
+
+  // (b) Aggregation with realistic seed rows.
+  const HUMAN = "Mozilla/5.0 (Macintosh) Chrome/120";
+  const BOT = "Mozilla/5.0 (compatible; GPTBot/1.0)";
+  const rows: any[] = [
+    // google: 5 distinct human sessions. Erga ×3, Hjortegården ×1, unknown-slug ×1.
+    { referrer: "https://www.google.com/", path: "/produsent/erga-gardsutsalg", session_id: "ipg1:" + HUMAN, is_owner: 0 },
+    { referrer: "https://www.google.com/", path: "/produsent/erga-gardsutsalg", session_id: "ipg2:" + HUMAN, is_owner: 0 },
+    { referrer: "https://www.google.com/", path: "/produsent/erga-gardsutsalg", session_id: "ipg3:" + HUMAN, is_owner: 0 },
+    { referrer: "https://www.google.com/", path: "/produsent/hjortegarden", session_id: "ipg4:" + HUMAN, is_owner: 0 },
+    { referrer: "https://www.google.com/", path: "/produsent/some-other-farm", session_id: "ipg5:" + HUMAN, is_owner: 0 },
+    // google but OWNER — must be excluded (internal-traffic exclusion).
+    { referrer: "https://www.google.com/", path: "/produsent/erga-gardsutsalg", session_id: "ipgo:Lokal-Enricher/1.0", is_owner: 1 },
+    // google but BOT — must be excluded (bot exclusion via parseUserAgent).
+    { referrer: "https://www.google.com/", path: "/produsent/erga-gardsutsalg", session_id: "ipgb:" + BOT, is_owner: 0 },
+    // perplexity: 3 distinct human sessions → exactly at threshold.
+    { referrer: "https://www.perplexity.ai/", path: "/produsent/erga-gardsutsalg", session_id: "ipp1:" + HUMAN, is_owner: 0 },
+    { referrer: "https://www.perplexity.ai/", path: "/produsent/erga-gardsutsalg", session_id: "ipp2:" + HUMAN, is_owner: 0 },
+    { referrer: "https://www.perplexity.ai/", path: "/produsent/erga-gardsutsalg", session_id: "ipp3:" + HUMAN, is_owner: 0 },
+    // bing: only 2 distinct human sessions → BELOW threshold, must be suppressed.
+    { referrer: "https://www.bing.com/", path: "/produsent/hjortegarden", session_id: "ipb1:" + HUMAN, is_owner: 0 },
+    { referrer: "https://www.bing.com/", path: "/produsent/hjortegarden", session_id: "ipb2:" + HUMAN, is_owner: 0 },
+    // own-domain navigation → key 'intern', excluded regardless of count.
+    { referrer: "https://rettfrabonden.com/sok", path: "/produsent/erga-gardsutsalg", session_id: "ipi:" + HUMAN, is_owner: 0 },
+    // direct visit (no referrer) → excluded (no journey).
+    { referrer: null, path: "/produsent/erga-gardsutsalg", session_id: "ipd:" + HUMAN, is_owner: 0 },
+  ];
+  const nameMap = new Map<string, string>([
+    ["erga-gardsutsalg", "Erga Gårdsutsalg"],
+    ["hjortegarden", "Hjortegården"],
+  ]);
+
+  const patterns = aggregateHumanReferrals(rows, { producerNameBySlug: nameMap });
+  const byKey: Record<string, any> = {};
+  for (const p of patterns) byKey[p.sourceKey] = p;
+
+  // Threshold: google (5) and perplexity (3) show; bing (2) suppressed.
+  assertTrue(!!byKey.google, "human-visits: google pattern present (≥3)");
+  assertTrue(!!byKey.perplexity, "human-visits: perplexity pattern present (=3)");
+  assertTrue(!byKey.bing, "human-visits: bing SUPPRESSED (<3 threshold)");
+  assertTrue(!byKey.intern, "human-visits: own-domain 'intern' never shown");
+  assertTrue(!byKey.direkte, "human-visits: direct visits never shown");
+
+  // Internal (owner) + bot rows excluded → google = 5 human sessions, not 7.
+  assertEq(byKey.google.visitCount, 5, "human-visits: google visitCount excludes owner + bot");
+  assertEq(byKey.perplexity.visitCount, 3, "human-visits: perplexity visitCount = 3");
+
+  // Producer naming (public names only) + "+N andre" for the unresolved 3rd.
+  assertEq(byKey.google.topProducers.length, 2, "human-visits: names up to 2 producers");
+  assertEq(byKey.google.topProducers[0].name, "Erga Gårdsutsalg", "human-visits: top producer named + ranked by count");
+  assertEq(byKey.google.topProducers[0].count, 3, "human-visits: top producer count = 3");
+  assertEq(byKey.google.otherProducerCount, 1, "human-visits: unresolved 3rd producer → +1 andre");
+
+  // No PII: the aggregated output must not leak IP hashes, session ids, raw UA,
+  // or referrer URLs — only source labels, counts, and public producer names.
+  const json = JSON.stringify(patterns);
+  assertTrue(!json.includes("Mozilla"), "human-visits: no raw UA in output");
+  assertTrue(!json.includes("GPTBot"), "human-visits: no bot UA token in output");
+  assertTrue(!json.includes("Lokal-Enricher"), "human-visits: no owner UA in output");
+  assertTrue(!json.includes("ipg1") && !json.includes("ipp1"), "human-visits: no IP-hash/session id in output");
+  assertTrue(!json.includes("https://"), "human-visits: no raw referrer URL in output");
+  assertTrue(!json.includes("some-other-farm"), "human-visits: unresolved producer slug never surfaced");
+
+  // NON-TAUTOLOGICAL threshold proof: drop minCount to 1 → the 2-session bing
+  // pattern that was correctly suppressed now WRONGLY appears. This proves the
+  // ≥3 default is what gates it, not some unrelated filter.
+  const loose = aggregateHumanReferrals(rows, { producerNameBySlug: nameMap, minCount: 1 });
+  const looseKeys: Record<string, any> = {};
+  for (const p of loose) looseKeys[p.sourceKey] = p;
+  assertTrue(!!looseKeys.bing, "human-visits: bing appears at minCount=1 (proves threshold gates it)");
+  assertEq(looseKeys.bing.visitCount, 2, "human-visits: bing has 2 visits (below default threshold of 3)");
+}
+
+
 // ── A2A v0.3.0 spec-compliance helpers (Phase 4.13 / WO #4) ──────────
 {
   // Lazy-import so we don't bring up the whole Express stack

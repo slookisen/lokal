@@ -1,6 +1,7 @@
 import { Request, Response, NextFunction } from "express";
 import crypto from "crypto";
 import { getDb } from "../database/init";
+import { slugify } from "../utils/slug";
 
 /**
  * Lightweight Analytics Service for Lokal
@@ -181,6 +182,153 @@ function inferReferrerSource(
 
   // Generic referral
   return "referral";
+}
+
+// ═════════════════════════════════════════════════════════════════
+// "Menneskelige besøk" strip (dev-request 2026-07-04, item 6)
+// Aggregated, anonymized human-referral patterns for the PUBLIC /samtaler
+// page. Hard rules (public trust page): NO IPs, NO session-stitching exposed,
+// and a minimum-count threshold before any pattern is shown — under-show
+// rather than expose anything identifiable.
+// ═════════════════════════════════════════════════════════════════
+
+// Minimum number of distinct visits before a referral pattern may be shown
+// publicly. Exported so callers (and tests) reference the single source of truth.
+export const MIN_HUMAN_REFERRAL_COUNT = 3;
+
+export interface ReferralSourceClass {
+  key: string;   // stable machine key: 'google' | 'chatgpt' | 'perplexity' | ...
+  label: string; // Norwegian human label: 'Google-søk', 'ChatGPT', ...
+}
+
+// ─── Named referral-source classifier ─────────────────────────────
+// Reuses the SAME domain tokens as inferReferrerSource() / parseUserAgent()
+// so the public strip never drifts from the rest of analytics. Deterministic,
+// pure, no guessing: an unrecognized host is "annet", no referrer is "direkte",
+// own-domain navigation is "intern" (excluded from the public strip upstream).
+//
+// Ordering matters: Gemini/Bard live on *.google.com and ChatGPT on openai.com,
+// so the AI-assistant checks MUST run before the generic google/bing checks
+// below or those assistants would be miscounted as plain search.
+export function classifyReferralSource(referrer: string | null | undefined): ReferralSourceClass {
+  if (!referrer || !String(referrer).trim()) return { key: "direkte", label: "Direkte" };
+  const ref = String(referrer).toLowerCase();
+
+  // AI assistants first (see ordering note above).
+  if (ref.includes("chat.openai.com") || ref.includes("chatgpt.com") || ref.includes("openai.com")) {
+    return { key: "chatgpt", label: "ChatGPT" };
+  }
+  if (ref.includes("perplexity")) return { key: "perplexity", label: "Perplexity" };
+  if (ref.includes("gemini.google") || ref.includes("bard.google") || ref.includes("gemini.")) {
+    return { key: "gemini", label: "Gemini" };
+  }
+  if (ref.includes("copilot.microsoft") || ref.includes("copilot.")) {
+    return { key: "copilot", label: "Copilot" };
+  }
+
+  // Search engines (human click-through from a SERP) — same tokens as inferReferrerSource.
+  if (ref.includes("google")) return { key: "google", label: "Google-søk" };
+  if (ref.includes("bing")) return { key: "bing", label: "Bing" };
+  if (ref.includes("duckduckgo")) return { key: "duckduckgo", label: "DuckDuckGo" };
+
+  // Social platforms — same tokens as inferReferrerSource's social bucket.
+  if (ref.includes("facebook") || ref.includes("instagram") || ref.includes("linkedin") ||
+      ref.includes("twitter") || ref.includes("t.co") || ref.includes("reddit") ||
+      ref.includes("tiktok") || ref.includes("bsky.app") || ref.includes("bluesky")) {
+    return { key: "sosial", label: "Sosiale medier" };
+  }
+
+  // Own domains → a visitor navigating within the site, NOT an external referral.
+  if (ref.includes("rettfrabonden.com") || ref.includes("finn-tannlege.com") || ref.includes("opplevagent")) {
+    return { key: "intern", label: "Intern navigasjon" };
+  }
+
+  return { key: "annet", label: "Annen nettside" };
+}
+
+export interface HumanReferralRow {
+  referrer: string | null | undefined;
+  path: string | null | undefined;
+  session_id: string | null | undefined;
+  is_owner?: number | null;
+}
+
+export interface HumanReferralPattern {
+  sourceKey: string;                                   // classifyReferralSource key
+  sourceLabel: string;                                 // Norwegian label
+  visitCount: number;                                  // distinct anonymized visits, always ≥ minCount
+  producerViews: number;                               // producer-page views attributed to this source
+  topProducers: Array<{ name: string; count: number }>; // named ONLY when resolvable to a real (public) agent
+  otherProducerCount: number;                          // distinct additional producers → "+N andre"
+}
+
+// ─── Pure aggregation (no DB) ─────────────────────────────────────
+// Extracted as a pure function so the anonymization + threshold logic is
+// deterministically testable without a database. Enforces, in ONE place:
+//   • internal/owner exclusion  (is_owner === 1 dropped — the page_views
+//       equivalent of slice-4's conversations.is_internal)
+//   • bot/crawler exclusion     (parseUserAgent on the UA embedded in
+//       session_id — this strip is HUMAN visits only)
+//   • direct/own-domain drop    (no external referral journey)
+//   • ≥ minCount threshold      (under-show; a pattern with <minCount distinct
+//       visits is SUPPRESSED entirely)
+// Output carries NO IP, NO session id, NO raw UA, NO referrer URL, NO path —
+// only an aggregate count, a source label, and PUBLIC producer names.
+export function aggregateHumanReferrals(
+  rows: HumanReferralRow[],
+  opts: { minCount?: number; producerNameBySlug?: Map<string, string> } = {}
+): HumanReferralPattern[] {
+  const minCount = opts.minCount ?? MIN_HUMAN_REFERRAL_COUNT;
+  const nameBySlug = opts.producerNameBySlug ?? new Map<string, string>();
+
+  interface Acc { sessions: Set<string>; producerViews: number; slugCounts: Map<string, number>; label: string; }
+  const groups = new Map<string, Acc>();
+  let anonSeq = 0; // fallback visit id when session_id is absent (keeps counts honest, never exposed)
+
+  for (const r of rows) {
+    if (r.is_owner === 1) continue;                                  // internal/owner traffic excluded
+    if (!r.referrer || !String(r.referrer).trim()) continue;        // direct visit → no journey to tell
+
+    const sid = r.session_id ? String(r.session_id) : "";
+    // Bot/crawler exclusion — reuse the canonical parseUserAgent heuristic on
+    // the UA embedded in session_id (`${ipHash}:${userAgent}`). session_id is
+    // used for counting/dedup ONLY and is never surfaced.
+    const ua = sid.includes(":") ? sid.slice(sid.indexOf(":") + 1) : "";
+    if (ua && parseUserAgent(ua).isBot) continue;
+
+    const src = classifyReferralSource(r.referrer);
+    if (src.key === "intern" || src.key === "direkte") continue;     // not an external referral
+
+    let g = groups.get(src.key);
+    if (!g) { g = { sessions: new Set(), producerViews: 0, slugCounts: new Map(), label: src.label }; groups.set(src.key, g); }
+    g.sessions.add(sid || `__anon_${anonSeq++}`);
+
+    const m = /^\/produsent\/([^/?#]+)/.exec(String(r.path || ""));
+    if (m) {
+      const slug = m[1]!.toLowerCase();
+      g.producerViews++;
+      g.slugCounts.set(slug, (g.slugCounts.get(slug) || 0) + 1);
+    }
+  }
+
+  const out: HumanReferralPattern[] = [];
+  for (const [key, g] of groups.entries()) {
+    const visitCount = g.sessions.size;
+    if (visitCount < minCount) continue; // ≥ minCount threshold — suppress sparse/identifiable patterns
+
+    const ranked = [...g.slugCounts.entries()].sort((a, b) => b[1] - a[1]);
+    const topProducers: Array<{ name: string; count: number }> = [];
+    let otherProducerCount = 0;
+    for (const [slug, count] of ranked) {
+      const name = nameBySlug.get(slug);
+      if (name && topProducers.length < 2) topProducers.push({ name, count });
+      else otherProducerCount++; // unresolved or beyond the top 2 → counted, never named/guessed
+    }
+
+    out.push({ sourceKey: key, sourceLabel: g.label, visitCount, producerViews: g.producerViews, topProducers, otherProducerCount });
+  }
+  out.sort((a, b) => b.visitCount - a.visitCount);
+  return out;
 }
 
 // ─── Session management (in-memory cache to avoid per-request DB hits) ───
@@ -663,6 +811,58 @@ export class AnalyticsService {
       }));
     } catch (err) {
       console.error("[analytics] Failed to get top producers:", err);
+      return [];
+    }
+  }
+
+  /**
+   * "Menneskelige besøk" strip (dev-request 2026-07-04, item 6).
+   * Returns aggregated, anonymized human-referral patterns for the PUBLIC
+   * /samtaler page. Internal/owner traffic and bots are excluded; only
+   * patterns with ≥ minCount distinct visits are returned (all enforced in
+   * the pure aggregateHumanReferrals()). No PII ever leaves this method.
+   *
+   * Default window is 30 days — human referral traffic is far sparser than
+   * AI-agent traffic, so a wide window is needed before the ≥3 threshold
+   * yields anything to show.
+   */
+  getHumanReferralPatterns(opts: { hoursBack?: number; minCount?: number; vertical?: VerticalId } = {}): HumanReferralPattern[] {
+    try {
+      const db = getDb();
+      const hoursBack = opts.hoursBack ?? 24 * 30;
+      const cutoff = sqliteDatetime(new Date(Date.now() - hoursBack * 60 * 60 * 1000));
+      const V = opts.vertical ? " AND vertical_id = ?" : "";
+      const vp: string[] = opts.vertical ? [opts.vertical] : [];
+
+      // Pull external page views that carry a referrer. is_owner filters OUR OWN
+      // traffic (owner cookie + internal UA markers) — the page_views equivalent
+      // of slice-4's is_internal on conversations. Bot exclusion + classification
+      // + threshold happen in aggregateHumanReferrals().
+      const rows = db.prepare(`
+        SELECT referrer, path, session_id, is_owner
+        FROM analytics_page_views
+        WHERE created_at > ?
+          AND (is_owner IS NULL OR is_owner = 0)
+          AND referrer IS NOT NULL AND TRIM(referrer) != ''${V}
+      `).all(cutoff, ...vp) as HumanReferralRow[];
+
+      if (rows.length === 0) return [];
+
+      // slug→name map from PUBLIC agent names so a producer can be named
+      // honestly (public info) instead of guessing from the URL slug.
+      const producerNameBySlug = new Map<string, string>();
+      try {
+        const agents = db.prepare(`SELECT name FROM agents`).all() as Array<{ name: string }>;
+        for (const a of agents) {
+          if (!a.name) continue;
+          const s = slugify(a.name);
+          if (s && !producerNameBySlug.has(s)) producerNameBySlug.set(s, a.name);
+        }
+      } catch { /* agents table not present in some minimal contexts — degrade to unnamed */ }
+
+      return aggregateHumanReferrals(rows, { minCount: opts.minCount, producerNameBySlug });
+    } catch (err) {
+      console.error("[analytics] Failed to get human referral patterns:", err);
       return [];
     }
   }
