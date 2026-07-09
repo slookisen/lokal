@@ -18536,6 +18536,56 @@ const _orchPr20260614_2Promise = (async () => {
     p9.skip.some((s) => s.agent === "platform-orchestrator" && /cooldown/.test(s.reason)),
     "dispatch: fire-marker cooldown skip recorded",
   );
+
+  // dev-requests/2026-07-09-self-continue-cooldown-carveout.md: self-continue was
+  // matematisk ufyrbar -- `latest[agent]` is seeded from the candidate run's OWN
+  // finished_at, so the cross-agent 25-min cooldownMin could never be satisfied by
+  // a self-continue no matter how much time passed. Pin the fix's 5 cases:
+
+  // (a) self-continue 5 min old, defaults -> fires (was: cooldown-skip forever).
+  const p10 = computeWakeList([mk("r13", "platform-orchestrator", 5, ["platform-orchestrator"])], { nowMs: baseUTC });
+  assertEq(p10.wake.length, 1, "dispatch: self-continue 5min old -> fires");
+  assertEq(p10.wake[0]!.agent, "platform-orchestrator", "dispatch: self-continue wakes the same agent");
+
+  // (b) self-continue 2 min old, default selfContinueCooldownMin=3 -> skipped (too fresh).
+  const p11 = computeWakeList([mk("r14", "platform-orchestrator", 2, ["platform-orchestrator"])], { nowMs: baseUTC });
+  assertEq(p11.wake.length, 0, "dispatch: self-continue 2min old (< 3min breather) -> skip");
+  assertTrue(
+    p11.skip.some((s) => s.agent === "platform-orchestrator" && /self-continue cooldown/.test(s.reason)),
+    "dispatch: self-continue breather skip recorded",
+  );
+
+  // (c) a newer run/fire-marker for the same agent than the self-continue candidate
+  // -> "already continued", no double-fire. r15 (5min old) suggests itself; r16
+  // (2min old, i.e. newer) is a later run/marker for the same agent.
+  const p12 = computeWakeList(
+    [mk("r15", "platform-orchestrator", 5, ["platform-orchestrator"]), mk("r16", "platform-orchestrator", 2, [])],
+    { nowMs: baseUTC },
+  );
+  assertEq(p12.wake.length, 0, "dispatch: newer run for same agent -> already-continued skip");
+  assertTrue(
+    p12.skip.some((s) => s.agent === "platform-orchestrator" && /already continued/.test(s.reason)),
+    "dispatch: already-continued skip recorded",
+  );
+
+  // (d) cross-agent cooldown (p2-style) stays on the untouched 25-min cooldownMin --
+  // re-run p2's exact scenario to pin it doesn't regress alongside the self-continue change.
+  const p13 = computeWakeList(
+    [mk("r17", "rfb-supervisor", 2, ["platform-orchestrator"]), mk("r18", "platform-orchestrator", 5, [])],
+    { nowMs: baseUTC },
+  );
+  assertEq(p13.wake.length, 0, "dispatch: cross-agent target ran 5min ago (< 25 cooldown) -> still skipped");
+  assertTrue(
+    p13.skip.some((s) => s.agent === "platform-orchestrator" && /cooldown/.test(s.reason) && !/self-continue/.test(s.reason)),
+    "dispatch: cross-agent cooldown skip (not self-continue) recorded",
+  );
+
+  // (e) opt override: selfContinueCooldownMin=0 -> a same-instant self-continue fires immediately.
+  const p14 = computeWakeList([mk("r19", "platform-orchestrator", 0, ["platform-orchestrator"])], {
+    nowMs: baseUTC,
+    selfContinueCooldownMin: 0,
+  });
+  assertEq(p14.wake.length, 1, "dispatch: selfContinueCooldownMin=0 override -> fires immediately");
 }
 
 // -- envelope timestamp normalization (pure) --
