@@ -259,6 +259,162 @@ function messageTypeIcon(type: string): string {
   }
 }
 
+// ─── Chat-transcript view: strip repeated boilerplate (dev-request item 5) ───
+// generateSellerResponse() appends the SAME block of static profile info —
+// opening hours + contact + delivery + payment + certifications + profile link
+// — to every auto-reply. In the transcript that block should render ONCE as a
+// compact card, not inside every reply bubble. splitSellerReply() pulls that
+// boilerplate out of the message text (leaving the conversational greeting /
+// product answer / specialties / closing in the bubble) so the card can render
+// it a single time below the producer's replies.
+
+export interface ContactCard {
+  hours?: string;      // "Man 9–17, Lør 10–15" — the åpningstider value
+  lines: string[];     // contact / delivery / payment / cert / profile-link lines
+}
+
+const HOURS_PREFIX = "\u{1F550} Åpningstider:";                 // "🕐 Åpningstider:"
+const CONTACT_HEADER = "Kontakt oss:";
+// A line is static profile boilerplate when it opens with one of these markers.
+const BOILERPLATE_RE = /^(\u{1F4CD}|\u{1F4DE}|✉️|\u{1F310}|\u{1F69A} Levering:|\u{1F4B3} Betaling:|✅|\u{1F517} Se profilen)/u;
+
+export function splitSellerReply(content: string): { body: string; card: ContactCard | null } {
+  const lines = (content || "").split("\n");
+  const bodyLines: string[] = [];
+  const cardLines: string[] = [];
+  let hours: string | undefined;
+  for (const raw of lines) {
+    const t = raw.trim();
+    if (t.startsWith(HOURS_PREFIX)) { hours = t.slice(HOURS_PREFIX.length).trim(); continue; }
+    if (t === CONTACT_HEADER) continue;                 // header folded into the card title
+    if (BOILERPLATE_RE.test(t)) { cardLines.push(t); continue; }
+    bodyLines.push(raw);
+  }
+  const body = bodyLines.join("\n").replace(/\n{3,}/g, "\n\n").trim();
+  const hasCard = hours !== undefined || cardLines.length > 0;
+  return { body, card: hasCard ? { hours, lines: cardLines } : null };
+}
+
+function renderContactCardHtml(card: ContactCard, sellerName: string): string {
+  const rows: string[] = [];
+  if (card.hours) rows.push(`<div class="cc-line">&#128336; Åpningstider: ${escapeHtml(card.hours)}</div>`);
+  for (const line of card.lines) rows.push(`<div class="cc-line">${escapeHtml(line)}</div>`);
+  return `<div class="contact-card">`
+    + `<div class="contact-card-title">Kontakt &amp; &aring;pningstider &mdash; ${escapeHtml(sellerName)}</div>`
+    + rows.join("")
+    + `</div>`;
+}
+
+// Structural shape the transcript renderer needs (a Conversation satisfies it).
+type TranscriptMsg = {
+  senderRole: string;
+  senderAgentName?: string | null;
+  content: string;
+  messageType?: string;
+  metadata?: Record<string, any> | null;
+  createdAt: string;
+};
+type TranscriptConv = {
+  buyerAgentName?: string | null;
+  sellerAgentName?: string | null;
+  queryText?: string | null;
+  source?: string | null;
+  createdAt: string;
+  messages: TranscriptMsg[];
+};
+
+// Render the chat body: the natural-language QUESTION bubble first (from the
+// real queryText — never fabricated), then the producer REPLY bubbles in
+// timeline order, then a single compact contact/hours card. Pure + exported so
+// it is unit-testable without a DB.
+export function renderTranscriptBody(conv: TranscriptConv): string {
+  const buyerName = conv.buyerAgentName || "Anonym kjøper";
+  const sellerName = conv.sellerAgentName || "Ukjent selger";
+  // The opening natural-language question — user-typed, so redact PII.
+  const questionText = conv.queryText ? redactPII(conv.queryText).trim() : "";
+  const askerName = conv.buyerAgentName || "Spørsmål";
+
+  let lastDate = "";
+  let contactCard: ContactCard | null = null;   // rendered ONCE, below the replies
+  const parts: string[] = [];
+
+  // 1. Question-first bubble (only when a real query exists — never invented).
+  if (questionText) {
+    const day = formatTime(conv.createdAt).split(",")[0] || (conv.createdAt.split("T")[0] || "");
+    lastDate = conv.createdAt.split("T")[0] || "";
+    parts.push(
+      `<div class="chat-date-sep"><span>${escapeHtml(day)}</span></div>`
+      + `<div class="msg msg-buyer msg-question">`
+      + `<div class="bubble bubble-buyer">`
+      + `<div class="bubble-name">${escapeHtml(askerName)}</div>`
+      + `<div class="bubble-content">${escapeHtml(questionText)}</div>`
+      + `<div class="bubble-footer"><span class="bubble-time">${formatTimeShort(conv.createdAt)}</span></div>`
+      + `</div></div>`
+    );
+  }
+
+  // 2. Timeline bubbles.
+  for (const msg of conv.messages) {
+    // Suppress the opening query-echo system message — the question bubble above
+    // already shows this exact text, so it must not appear twice.
+    if (questionText && msg.senderRole === "system" && msg.metadata?.queryText) continue;
+
+    const role = msg.senderRole;
+    const msgDate = (msg.createdAt || "").split("T")[0] || "";
+    let dateSep = "";
+    if (msgDate && msgDate !== lastDate) {
+      lastDate = msgDate;
+      dateSep = `<div class="chat-date-sep"><span>${escapeHtml(formatTime(msg.createdAt).split(",")[0] || msgDate)}</span></div>`;
+    }
+
+    const type = msg.messageType || "text";
+
+    if (role === "system") {
+      // System messages often echo user text — redact PII.
+      parts.push(`${dateSep}<div class="msg msg-system msg-${escapeHtml(type)}">`
+        + `<div class="bubble bubble-system">`
+        + `${messageTypeIcon(type)} ${escapeHtml(redactPII(msg.content))}`
+        + `<div class="bubble-footer"><span class="bubble-time">${formatTimeShort(msg.createdAt)}</span></div>`
+        + `</div></div>`);
+      continue;
+    }
+
+    const isBuyer = role === "buyer";
+    const bubbleCls = isBuyer ? "bubble-buyer" : "bubble-seller";
+    const msgCls = isBuyer ? "msg-buyer" : "msg-seller";
+    const name = msg.senderAgentName || (isBuyer ? buyerName : sellerName);
+    const typeIcon = messageTypeIcon(type);
+
+    // Buyer content is user-typed → redact PII. Seller content is producer-
+    // controlled public info; pull its repeated boilerplate into the card.
+    let displayContent: string;
+    if (isBuyer) {
+      displayContent = redactPII(msg.content);
+    } else {
+      const split = splitSellerReply(msg.content);
+      displayContent = split.body || msg.content;   // never blank the bubble
+      if (split.card) contactCard = split.card;      // all replies share one producer → single card
+    }
+
+    parts.push(`${dateSep}<div class="msg ${msgCls} msg-${escapeHtml(type)}">`
+      + `<div class="bubble ${bubbleCls}">`
+      + `<div class="bubble-name">${escapeHtml(name)}${autoReplyTagHtml(msg)}</div>`
+      + `<div class="bubble-content">${typeIcon ? typeIcon + " " : ""}${escapeHtml(displayContent)}</div>`
+      + `<div class="bubble-footer">`
+      + `${type !== "text" ? `<span class="bubble-type">${escapeHtml(type)}</span>` : ""}`
+      + `<span class="bubble-time">${formatTimeShort(msg.createdAt)}</span>`
+      + `</div></div></div>`);
+  }
+
+  // 3. One compact contact/hours card, below the producer's replies.
+  if (contactCard) parts.push(renderContactCardHtml(contactCard, sellerName));
+
+  if (parts.length === 0) {
+    return `<div class="empty-state"><p>Ingen meldinger i denne samtalen enn&aring;.</p></div>`;
+  }
+  return parts.join("\n");
+}
+
 // ─── Shared CSS + page shell ────────────────────────────────
 
 const CHAT_CSS = `
@@ -406,6 +562,11 @@ const CHAT_CSS = `
   .msg-offer .bubble { border-left: 3px solid var(--orange); }
   .msg-accept .bubble { border-left: 3px solid #22c55e; }
   .msg-reject .bubble { border-left: 3px solid #ef4444; }
+
+  /* Compact contact/hours card — boilerplate rendered ONCE (item 5) */
+  .contact-card { max-width: 85%; margin: 14px auto 6px; background: var(--white); border: 1px solid var(--g200); border-radius: var(--r-md); padding: 12px 16px; box-shadow: 0 1px 1px rgba(0,0,0,0.08); font-size: 0.82rem; color: var(--g700); }
+  .contact-card-title { font-weight: 700; font-size: 0.8rem; color: var(--green-700); margin-bottom: 6px; }
+  .cc-line { line-height: 1.55; word-break: break-word; }
 
   .chat-footer { background: var(--white); padding: 14px 24px; border-radius: 0 0 var(--r-lg) var(--r-lg); border-top: 1px solid var(--g200); display: flex; align-items: center; gap: 12px; font-size: 0.82rem; color: var(--g500); }
   .chat-footer .live-dot { width: 8px; height: 8px; background: #22c55e; border-radius: 50%; animation: pulse 2s infinite; }
@@ -667,48 +828,9 @@ router.get("/samtale/:id", (req: Request, res: Response) => {
     const headerSystemMsg = conv.messages.find(m => m.senderRole === "system");
     const headerClientIdentity = headerSystemMsg?.metadata?.clientIdentity as string | undefined;
 
-    // Build chat bubbles
-    let lastDate = "";
-    const bubblesHtml = conv.messages.map(msg => {
-      const role = msg.senderRole;
-      const msgDate = msg.createdAt.split("T")[0];
-      let dateSep = "";
-      if (msgDate !== lastDate) {
-        lastDate = msgDate;
-        dateSep = `<div class="chat-date-sep"><span>${formatTime(msg.createdAt).split(",")[0] || msgDate}</span></div>`;
-      }
-
-      if (role === "system") {
-        // System messages often echo the buyer's query — redact PII
-        return `${dateSep}<div class="msg msg-system msg-${msg.messageType}">
-          <div class="bubble bubble-system">
-            ${messageTypeIcon(msg.messageType)} ${escapeHtml(redactPII(msg.content))}
-            <div class="bubble-footer"><span class="bubble-time">${formatTimeShort(msg.createdAt)}</span></div>
-          </div>
-        </div>`;
-      }
-
-      const isBuyer = role === "buyer";
-      const bubbleCls = isBuyer ? "bubble-buyer" : "bubble-seller";
-      const msgCls = isBuyer ? "msg-buyer" : "msg-seller";
-      const name = msg.senderAgentName || (isBuyer ? buyerName : sellerName);
-      const typeIcon = messageTypeIcon(msg.messageType);
-
-      // Buyer-side content is user-typed — redact PII. Seller-side content is
-      // producer-controlled and passes through unchanged.
-      const displayContent = isBuyer ? redactPII(msg.content) : msg.content;
-
-      return `${dateSep}<div class="msg ${msgCls} msg-${msg.messageType}">
-        <div class="bubble ${bubbleCls}">
-          <div class="bubble-name">${escapeHtml(name)}${autoReplyTagHtml(msg)}</div>
-          <div class="bubble-content">${typeIcon ? typeIcon + " " : ""}${escapeHtml(displayContent)}</div>
-          <div class="bubble-footer">
-            ${msg.messageType !== "text" ? `<span class="bubble-type">${escapeHtml(msg.messageType)}</span>` : ""}
-            <span class="bubble-time">${formatTimeShort(msg.createdAt)}</span>
-          </div>
-        </div>
-      </div>`;
-    }).join("\n");
+    // Build the chat body: question-first transcript with the repeated
+    // åpningstider/kontakt boilerplate collapsed into a single card (item 5).
+    const bubblesHtml = renderTranscriptBody(conv);
 
     // Participant cards
     const buyerInitial = buyerName.charAt(0).toUpperCase();
@@ -755,7 +877,7 @@ router.get("/samtale/:id", (req: Request, res: Response) => {
         </div>
 
         <div class="chat-body" id="chatBody">
-          ${bubblesHtml || '<div class="empty-state"><p>Ingen meldinger i denne samtalen enn&aring;.</p></div>'}
+          ${bubblesHtml}
         </div>
 
         <div class="chat-footer">
