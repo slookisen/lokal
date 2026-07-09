@@ -988,7 +988,7 @@ if (process.env.DISPATCH_TICK_DISABLED === "1" || !process.env.FIRE_ROUTINES) {
 } else {
   const tickIntervalMin = resolveTickIntervalMin(process.env.DISPATCH_TICK_INTERVAL_MIN);
   console.log(`[dispatch-tick] enabled — runDispatchTick("active") every ${tickIntervalMin} min`);
-  setInterval(async () => {
+  const dispatchTickOnce = async () => {
     try {
       const r = await runDispatchTick("active");
       // Log only when the tick actually did something — a no-op tick every
@@ -1003,7 +1003,14 @@ if (process.env.DISPATCH_TICK_DISABLED === "1" || !process.env.FIRE_ROUTINES) {
     } catch (err) {
       console.error("[dispatch-tick] failed (non-fatal):", err);
     }
-  }, tickIntervalMin * 60_000);
+  };
+  // Boot-tick (dev-requests/2026-07-09-self-continue-cooldown-carveout.md): every
+  // deploy swaps the Fly machine and resets the interval phase, so a next_suggested
+  // posted just before a deploy can go stale (12-min freshness) before the first
+  // +interval tick lands. One early tick shortly after boot closes that gap; the
+  // fire-marker/cooldown logic in computeWakeList keeps it double-fire-safe.
+  setTimeout(dispatchTickOnce, 2 * 60_000);
+  setInterval(dispatchTickOnce, tickIntervalMin * 60_000);
 }
 
 // ─── Graceful shutdown ───────────────────────────────────────

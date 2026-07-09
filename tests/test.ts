@@ -18536,6 +18536,76 @@ const _orchPr20260614_2Promise = (async () => {
     p9.skip.some((s) => s.agent === "platform-orchestrator" && /cooldown/.test(s.reason)),
     "dispatch: fire-marker cooldown skip recorded",
   );
+
+  // Self-continue carve-out (dev-requests/2026-07-09-self-continue-cooldown-carveout.md).
+  // THE bug this pins (observed in prod 2026-07-09T23:04Z): a run suggesting its OWN
+  // agent sets latest[agent] = its finished_at, so with defaults the suggestion is only
+  // fresh for 12 min while the cooldown demands >= 25 min -- 12 < 25 made every
+  // self-continue expire unfired, permanently. With the carve-out, a 5-min-old
+  // self-continue fires under pure defaults.
+  const sc1 = computeWakeList(
+    [mk("sc1", "platform-orchestrator", 5, ["platform-orchestrator"])],
+    { nowMs: baseUTC },
+  );
+  assertEq(sc1.wake.length, 1, "dispatch: self-continue 5min old fires under DEFAULTS (was: unfireable, 12 < 25)");
+  assertEq(sc1.wake[0]!.agent, "platform-orchestrator", "dispatch: self-continue wakes the suggesting agent itself");
+  assertEq(sc1.wake[0]!.reason, "sc1", "dispatch: self-continue reason is the suggesting run_id");
+
+  // Breather: a self-continue younger than selfContinueCooldownMin (default 3) waits.
+  const sc2 = computeWakeList(
+    [mk("sc2", "platform-orchestrator", 1, ["platform-orchestrator"])],
+    { nowMs: baseUTC },
+  );
+  assertEq(sc2.wake.length, 0, "dispatch: self-continue 1min old -> breather, no wake yet");
+  assertTrue(
+    sc2.skip.some((s) => s.agent === "platform-orchestrator" && /self-continue breather/.test(s.reason)),
+    "dispatch: self-continue breather skip recorded",
+  );
+
+  // No-double-fire invariant: once the dispatcher fires a self-continue it records a
+  // fire-marker (finished_at = fire time), which is NEWER than the suggesting run --
+  // every later tick inside the freshness window must skip, not re-fire.
+  const sc3 = computeWakeList(
+    [
+      mk("sc3", "platform-orchestrator", 5, ["platform-orchestrator"]),
+      mk("firemarker-sc3", "platform-orchestrator", 2, []),
+    ],
+    { nowMs: baseUTC },
+  );
+  assertEq(sc3.wake.length, 0, "dispatch: self-continue with newer fire-marker -> already continued, no double-fire");
+  assertTrue(
+    sc3.skip.some((s) => s.agent === "platform-orchestrator" && /already continued/.test(s.reason)),
+    "dispatch: self-continue already-continued skip recorded",
+  );
+
+  // An OLDER own run must not block a fresh self-continue (only NEWER rows do).
+  const sc4 = computeWakeList(
+    [
+      mk("sc4", "platform-orchestrator", 5, ["platform-orchestrator"]),
+      mk("sc4-old", "platform-orchestrator", 40, []),
+    ],
+    { nowMs: baseUTC },
+  );
+  assertEq(sc4.wake.length, 1, "dispatch: older own run does not block a fresh self-continue");
+
+  // Cross-agent suggestions keep the FULL 25-min cooldown -- the carve-out is
+  // self-continue-only (p2 above pins the same thing; this pins it side-by-side with
+  // a self-continue in the same ledger, both targeting the cooled-down agent).
+  const sc5 = computeWakeList(
+    [
+      mk("sc5-other", "rfb-supervisor", 2, ["platform-orchestrator"]),
+      mk("sc5-target", "platform-orchestrator", 5, []),
+    ],
+    { nowMs: baseUTC },
+  );
+  assertEq(sc5.wake.length, 0, "dispatch: cross-agent suggestion still honors 25-min cooldown (carve-out is self-only)");
+
+  // Opt override is honored (tests/tuning knob, not read from env).
+  const sc6 = computeWakeList(
+    [mk("sc6", "platform-orchestrator", 1, ["platform-orchestrator"])],
+    { nowMs: baseUTC, selfContinueCooldownMin: 0 },
+  );
+  assertEq(sc6.wake.length, 1, "dispatch: selfContinueCooldownMin override (0) fires a just-finished self-continue");
 }
 
 // -- envelope timestamp normalization (pure) --

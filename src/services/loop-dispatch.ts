@@ -55,6 +55,7 @@ export interface DispatchOpts {
   allowlist?: string[];
   windowMin?: number; // candidate freshness (a run is fresh if it finished within this)
   cooldownMin?: number; // a target that ran within this is skipped
+  selfContinueCooldownMin?: number; // breather before re-firing a run that suggested ITSELF (default 3)
   maxWakes?: number; // hard cap on wakes per cycle
   activeStartUTC?: number; // inclusive hour, default 5  (~06:00 Europe/Oslo)
   activeEndUTC?: number; // exclusive hour, default 21 (~22:00 Europe/Oslo)
@@ -114,6 +115,7 @@ export function computeWakeList(
   const allowlist = new Set(opts.allowlist ?? DEFAULT_ALLOWLIST);
   const windowMin = opts.windowMin ?? 12;
   const cooldownMin = opts.cooldownMin ?? 25;
+  const selfContinueCooldownMin = opts.selfContinueCooldownMin ?? 3;
   const maxWakes = opts.maxWakes ?? 4;
   const startH = opts.activeStartUTC ?? 5;
   const endH = opts.activeEndUTC ?? 21;
@@ -158,7 +160,26 @@ export function computeWakeList(
         continue;
       }
       const last = latest.get(a);
-      if (last !== undefined) {
+      if (r.agent === a) {
+        // Self-continue (dev-requests/2026-07-09-self-continue-cooldown-carveout.md):
+        // this run's OWN finished_at is latest[a] (or older), so the generic cooldown
+        // (25) can never clear inside the freshness window (12) — a run suggesting
+        // itself was structurally unfireable. A fresh completion proves the agent is
+        // idle, so require only a short breather. Double-fire stays impossible: the
+        // fire-marker recorded at fire-time is NEWER than this suggestion, so every
+        // later tick lands in the `last > finMs` skip below.
+        if (last !== undefined && last > finMs) {
+          skip.push({ agent: a, reason: "self-continue already continued (newer run/marker exists)" });
+          continue;
+        }
+        if (ageMin < selfContinueCooldownMin) {
+          skip.push({
+            agent: a,
+            reason: `self-continue breather (finished ${Math.floor(ageMin)}min ago < ${selfContinueCooldownMin})`,
+          });
+          continue;
+        }
+      } else if (last !== undefined) {
         const sinceMin = Math.floor((opts.nowMs - last) / 60_000);
         if (sinceMin < cooldownMin) {
           skip.push({ agent: a, reason: `cooldown (ran ${sinceMin}min ago < ${cooldownMin})` });
