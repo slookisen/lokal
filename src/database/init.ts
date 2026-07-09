@@ -770,6 +770,28 @@ function initSchema(db: Database.Database): void {
     // Column already exists
   }
 
+  // ─── Add is_internal column to conversations ─────────────────
+  // (rfb-samtaler dev-request 2026-07-04, item 3) Flags a conversation as OUR
+  // OWN internal traffic — verifier probes, loop-dispatcher/fleet runs, health
+  // checks, owner/admin/CI requests — so the public /samtaler counters can
+  // report EXTERNAL traffic only. The write-time classifier lives in
+  // conversation-service.ts (isInternalTraffic).
+  //
+  // Safety (data-model touch, deliberately conservative):
+  //   • ADDITIVE only, NOT NULL DEFAULT 0 → every existing row reads as
+  //     external (0) until an explicit backfill flips a clearly-internal one.
+  //     No column is dropped or renamed, no row is rewritten by this migration.
+  //   • Idempotent — guarded on "duplicate column name" so re-runs are no-ops.
+  //   • Single-revert rollback — reverting the code makes getSourceStats() count
+  //     every row again (totals reappear); this column can stay harmlessly, or
+  //     be reset via conversationService.resetInternalFlags().
+  try {
+    db.exec(`ALTER TABLE conversations ADD COLUMN is_internal INTEGER NOT NULL DEFAULT 0`);
+  } catch (e: any) {
+    if (!String(e?.message || '').includes('duplicate column name')) throw e;
+    // Column already exists — idempotent, safe to ignore
+  }
+
   // ─── M1 (Phase 5.4a): magic_links.used_at ───────────────────
   // Tracks WHEN a magic-link token was actually used (clicked & redeemed).
   // Backfill for already-used rows: copy created_at as best-available estimate.

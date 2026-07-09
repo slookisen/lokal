@@ -25,6 +25,83 @@ export type SenderRole = "buyer" | "seller" | "system";
 
 export type ConversationSource = "a2a" | "mcp" | "web" | "api";
 
+// ─── Internal-traffic classification (rfb-samtaler item 3) ───────────────────
+// Public /samtaler counters must report EXTERNAL traffic only. A conversation
+// is "internal" when it originates from OUR OWN tooling talking to itself:
+// verifier probes, loop-dispatcher / fleet runs, health checks, and owner /
+// admin / CI requests. We classify CONSERVATIVELY on purpose — a FALSE POSITIVE
+// (flagging real external traffic as internal) HIDES real traffic, the exact
+// opposite of this feature's goal — so we only flag on signals no third party
+// could plausibly emit, and err toward NOT flagging when unsure.
+//
+// The EXACT rules (all evaluated at write-time from the live HTTP request):
+//   1. hasValidAdminKey — the request carried an `X-Admin-Key` header whose
+//      value equals our secret ADMIN_KEY / ANALYTICS_ADMIN_KEY. The key is a
+//      secret, so a match is definitively our own CI / admin / fleet tooling.
+//   2. ownerCookie — the `_rfb_owner=1` cookie our own owner/dev browser sets
+//      (the same marker analytics-service uses to strip owner traffic).
+//   3. Own-only User-Agent markers — UA substrings only OUR scheduled probes
+//      emit: RFB-* (e.g. RFB-ContactVerifier, RFB-HealthCheck), Lokal-* tools,
+//      and explicit verifier / loop-dispatcher / fleet / health-check tokens.
+//
+// DELIBERATELY NOT treated as internal: generic HTTP-client UAs (curl/,
+// node-fetch, axios/, python-requests, bare "node" / "python"). External
+// A2A / MCP / API agents legitimately use those clients, so flagging them would
+// hide large amounts of REAL external traffic. (analytics-service treats those
+// as "owner" for its dashboard, but here the cost of a false positive is higher
+// — it undermines the trust the page exists to build — so we exclude them and
+// accept the resulting false-negatives, which are the safe direction.)
+const INTERNAL_UA_MARKERS_LC = [
+  "rfb-",                 // RFB-ContactVerifier, RFB-HealthCheck, other RFB-* probes
+  "lokal-enricher",
+  "lokal-verifier",
+  "lokal-agent-verifier",
+  "loop-dispatcher",
+  "loop-dispatch",
+  "fleet-agent",
+  "fleet-runner",
+  "health-check",
+  "healthcheck",
+];
+
+export interface RequestMeta {
+  userAgent?: string;
+  hasValidAdminKey?: boolean;
+  ownerCookie?: boolean;
+}
+
+function expectedAdminKey(): string {
+  return process.env.ADMIN_KEY || process.env.ANALYTICS_ADMIN_KEY || "";
+}
+
+// Extract the classification-relevant signals from an Express-style request.
+// Kept structural (no express import) so it is trivially unit-testable and can
+// be reused by both the conversation-creation callers and the /samtaler
+// admin-view gate. Never throws on a malformed/absent request.
+export function buildRequestMeta(
+  req: { headers?: Record<string, any> } | undefined | null
+): RequestMeta {
+  if (!req || !req.headers) return {};
+  const headers = req.headers;
+  const userAgent = typeof headers["user-agent"] === "string" ? headers["user-agent"] : undefined;
+  const expected = expectedAdminKey();
+  const provided = typeof headers["x-admin-key"] === "string" ? headers["x-admin-key"] : "";
+  const hasValidAdminKey = !!expected && provided === expected;
+  const cookie = typeof headers["cookie"] === "string" ? headers["cookie"] : "";
+  const ownerCookie = cookie.split(";").some((c: string) => c.trim() === "_rfb_owner=1");
+  return { userAgent, hasValidAdminKey, ownerCookie };
+}
+
+// Conservative internal-traffic classifier. Returns true ONLY when confident.
+export function isInternalTraffic(meta?: RequestMeta | null): boolean {
+  if (!meta) return false;
+  if (meta.hasValidAdminKey) return true;   // secret key matched → definitely us
+  if (meta.ownerCookie) return true;        // owner / dev browser
+  const ua = (meta.userAgent || "").toLowerCase();
+  if (ua && INTERNAL_UA_MARKERS_LC.some(m => ua.includes(m))) return true;
+  return false;
+}
+
 export interface Conversation {
   id: string;
   buyerAgentId?: string;
@@ -65,6 +142,7 @@ class ConversationService {
     taskId?: string;
     source?: "a2a" | "mcp" | "web" | "api";
     clientIdentity?: string;   // e.g. "ChatGPT", "Claude Desktop", "Cursor"
+    requestMeta?: RequestMeta; // classification signals from the live request (UA / admin-key / owner-cookie)
     autoRespond?: boolean;  // default true — seller agent replies automatically
   }): Conversation {
     const db = getDb();
@@ -72,10 +150,14 @@ class ConversationService {
     const now = new Date().toISOString();
     const source = opts.source || "api";
 
+    // (item 3) Classify at write-time. Conservative: only confident-internal
+    // requests are flagged; everything else stays 0 (external, publicly counted).
+    const isInternal = isInternalTraffic(opts.requestMeta) ? 1 : 0;
+
     db.prepare(`
-      INSERT INTO conversations (id, buyer_agent_id, seller_agent_id, status, query_text, task_id, source, created_at, updated_at)
-      VALUES (?, ?, ?, 'open', ?, ?, ?, ?, ?)
-    `).run(id, opts.buyerAgentId || null, opts.sellerAgentId, opts.queryText || null, opts.taskId || null, source, now, now);
+      INSERT INTO conversations (id, buyer_agent_id, seller_agent_id, status, query_text, task_id, source, is_internal, created_at, updated_at)
+      VALUES (?, ?, ?, 'open', ?, ?, ?, ?, ?, ?)
+    `).run(id, opts.buyerAgentId || null, opts.sellerAgentId, opts.queryText || null, opts.taskId || null, source, isInternal, now, now);
 
     // Get seller info for the system message
     const seller = db.prepare("SELECT name, categories, city FROM agents WHERE id = ?").get(opts.sellerAgentId) as any;
@@ -94,7 +176,11 @@ class ConversationService {
       senderRole: "system",
       content: systemMsg,
       messageType: "info",
-      metadata: { sellerAgentId: opts.sellerAgentId, queryText: opts.queryText, source, ...(opts.clientIdentity ? { clientIdentity: opts.clientIdentity } : {}) },
+      // Persist the classification-relevant UA (a non-PII client string, same
+      // class as the already-stored clientIdentity) on the opening system
+      // message so the history backfill can re-apply the SAME rules and so the
+      // write-time decision is auditable/reversible.
+      metadata: { sellerAgentId: opts.sellerAgentId, queryText: opts.queryText, source, ...(opts.clientIdentity ? { clientIdentity: opts.clientIdentity } : {}), ...(opts.requestMeta?.userAgent ? { ua: opts.requestMeta.userAgent } : {}) },
     });
 
     // ─── Seller agent auto-response ──────────────────────────
@@ -409,7 +495,7 @@ class ConversationService {
   }
 
   // ─── List recent conversations ──────────────────────────
-  listConversations(opts: { limit?: number; status?: string; agentId?: string; source?: string } = {}): Conversation[] {
+  listConversations(opts: { limit?: number; status?: string; agentId?: string; source?: string; includeInternal?: boolean } = {}): Conversation[] {
     const db = getDb();
     let sql = `
       SELECT c.*,
@@ -422,6 +508,8 @@ class ConversationService {
     `;
     const params: any[] = [];
 
+    // (item 3) Public list = external traffic only. Admin path opts-in to all.
+    if (!opts.includeInternal) { sql += " AND (c.is_internal IS NULL OR c.is_internal = 0)"; }
     if (opts.status) { sql += " AND c.status = ?"; params.push(opts.status); }
     if (opts.source) { sql += " AND c.source = ?"; params.push(opts.source); }
     if (opts.agentId) {
@@ -449,16 +537,67 @@ class ConversationService {
   }
 
   // ─── Conversation stats by source ─────────────────────────
-  getSourceStats(): { source: string; count: number; lastActivity: string }[] {
+  // (item 3) PUBLIC counters exclude internal fleet/verifier traffic by default
+  // — a verifier probe run must NOT increment the numbers a visitor sees. Pass
+  // { includeInternal: true } for the ADMIN view, which still shows full totals.
+  getSourceStats(opts: { includeInternal?: boolean } = {}): { source: string; count: number; lastActivity: string }[] {
     const db = getDb();
+    const where = opts.includeInternal ? "" : "WHERE (is_internal IS NULL OR is_internal = 0)";
     const rows = db.prepare(`
       SELECT COALESCE(source, 'api') as source, COUNT(*) as count,
         MAX(updated_at) as last_activity
       FROM conversations
+      ${where}
       GROUP BY COALESCE(source, 'api')
       ORDER BY count DESC
     `).all() as any[];
     return rows.map(r => ({ source: r.source, count: r.count, lastActivity: r.last_activity }));
+  }
+
+  // ─── Best-effort history backfill of is_internal (item 3) ────────────────
+  // Re-applies the SAME conservative rules used at write-time (isInternalTraffic)
+  // to the User-Agent persisted on each conversation's opening system message,
+  // and flags the confident-internal ones.
+  //   • Idempotent  — only ever SETS is_internal=1 on matching rows; already-
+  //                   flagged rows are skipped; never flips a flag back to 0.
+  //   • Reversible  — resetInternalFlags() (or a code-revert + column reset)
+  //                   restores the prior "counts include everything" behaviour.
+  //   • Conservative— rows with no persisted UA (true legacy history created
+  //                   before UA capture) match nothing and stay UNFLAGGED. We do
+  //                   NOT guess at them; they simply keep counting until a
+  //                   knowable signal exists. Returns {scanned, flagged}.
+  backfillInternalFlags(): { scanned: number; flagged: number } {
+    const db = getDb();
+    const rows = db.prepare(`
+      SELECT c.id as cid,
+        (SELECT m.metadata FROM messages m
+           WHERE m.conversation_id = c.id AND m.sender_role = 'system'
+           ORDER BY m.created_at ASC LIMIT 1) as meta
+      FROM conversations c
+      WHERE (c.is_internal IS NULL OR c.is_internal = 0)
+    `).all() as any[];
+    const upd = db.prepare(`UPDATE conversations SET is_internal = 1 WHERE id = ? AND (is_internal IS NULL OR is_internal = 0)`);
+    let flagged = 0;
+    const tx = db.transaction((items: any[]) => {
+      for (const r of items) {
+        let ua: string | undefined;
+        try { ua = JSON.parse(r.meta || "{}").ua; } catch { ua = undefined; }
+        if (isInternalTraffic({ userAgent: ua })) {
+          upd.run(r.cid);
+          flagged++;
+        }
+      }
+    });
+    tx(rows);
+    return { scanned: rows.length, flagged };
+  }
+
+  // Reversal for the backfill (rollback aid). Clears every internal flag so the
+  // public counters revert to full totals. Returns how many rows were cleared.
+  resetInternalFlags(): { cleared: number } {
+    const db = getDb();
+    const info = db.prepare(`UPDATE conversations SET is_internal = 0 WHERE is_internal = 1`).run();
+    return { cleared: info.changes as number };
   }
 
   // ─── Get agent metrics (seller dashboard / social proof) ─

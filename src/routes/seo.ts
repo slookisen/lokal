@@ -23,7 +23,7 @@ import { geocodingService } from "../services/geocoding-service";
 import { analyticsService } from "../services/analytics-service";
 import { DiscoveryQuerySchema } from "../models/marketplace";
 import { getDb } from "../database/init";
-import { conversationService } from "../services/conversation-service";
+import { conversationService, buildRequestMeta } from "../services/conversation-service";
 import { getTrafficStats } from "../services/traffic-stats";
 import { isDisplayablePhone } from "../services/contact-normalizer";
 import { getProfileActivity } from "../services/profile-activity-service";
@@ -1223,6 +1223,7 @@ router.get("/sok", async (req: Request, res: Response) => {
           queryText: q,
           source: "web",
           buyerAgentName: "Besøkende",
+          requestMeta: buildRequestMeta(req), // (item 3) internal-traffic classification
           autoRespond: true,
         });
       } catch { /* non-critical — don't break search if logging fails */ }

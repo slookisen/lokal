@@ -3727,8 +3727,13 @@ function provR(value: string, source_type: string): ProvenanceRecord {
 console.log("\n── cross-source-validator: runVerifierBatch integration tests ──");
 
 import Database from "better-sqlite3";
-import { __setDbForTesting, __initSchemaForTesting } from "../src/database/init";
+import { __setDbForTesting, __initSchemaForTesting, getDb } from "../src/database/init";
 import { runVerifierBatch, computeKvalitetsGate } from "../src/agents/lokal-agent-verifier";
+import {
+  conversationService as _convSvc,
+  isInternalTraffic as _isInternalTraffic,
+  buildRequestMeta as _buildRequestMeta,
+} from "../src/services/conversation-service";
 
 // Build an isolated in-memory DB for integration tests
 function buildTestDb(): Database.Database {
@@ -3780,6 +3785,131 @@ function insertTestAgent(
     opts.products || JSON.stringify([{name:"Tomater"},{name:"Gulrøtter"},{name:"Poteter"}]),
     JSON.stringify(opts.field_provenance || {})
   );
+}
+
+// ── rfb-samtaler slice 4 (item 3): internal-traffic filter + is_internal ─────
+// Proves: (a) the conservative classifier flags OUR OWN probes but NOT generic
+// external HTTP clients; (b) an internal-UA conversation is written is_internal=1
+// and EXCLUDED from public counters yet INCLUDED in admin totals; (c) a normal
+// external conversation stays public; (d) the backfill flags a seeded internal
+// row, leaves external + signal-less legacy rows untouched, and is idempotent +
+// reversible.
+console.log("\n── rfb-samtaler-slice4: internal-traffic filter (is_internal) ──");
+{
+  // ── (a) Pure classifier — the EXACT rules, incl. the deliberate NON-flags ──
+  const prevAdminKey = process.env.ADMIN_KEY;
+  const prevAnalyticsKey = process.env.ANALYTICS_ADMIN_KEY;
+  process.env.ADMIN_KEY = "slice4-secret-admin-key";
+  delete process.env.ANALYTICS_ADMIN_KEY;
+  try {
+    // Own-only UA markers → internal
+    assertTrue(_isInternalTraffic(_buildRequestMeta({ headers: { "user-agent": "RFB-ContactVerifier/1.0" } })),
+      "slice4-classify: RFB-ContactVerifier UA → internal");
+    assertTrue(_isInternalTraffic(_buildRequestMeta({ headers: { "user-agent": "lokal-agent-verifier/2" } })),
+      "slice4-classify: lokal-agent-verifier UA → internal");
+    assertTrue(_isInternalTraffic(_buildRequestMeta({ headers: { "user-agent": "loop-dispatcher" } })),
+      "slice4-classify: loop-dispatcher UA → internal");
+    // Valid admin key → internal (must MATCH the secret, not merely be present)
+    assertTrue(_isInternalTraffic(_buildRequestMeta({ headers: { "x-admin-key": "slice4-secret-admin-key" } })),
+      "slice4-classify: valid X-Admin-Key → internal");
+    assertTrue(!_isInternalTraffic(_buildRequestMeta({ headers: { "x-admin-key": "wrong-key" } })),
+      "slice4-classify: WRONG X-Admin-Key → NOT internal (matches secret, not mere presence)");
+    // Owner cookie → internal
+    assertTrue(_isInternalTraffic(_buildRequestMeta({ headers: { cookie: "a=1; _rfb_owner=1; b=2" } })),
+      "slice4-classify: _rfb_owner=1 cookie → internal");
+    // KEY conservative non-flags: generic external HTTP clients must stay public
+    assertTrue(!_isInternalTraffic(_buildRequestMeta({ headers: { "user-agent": "curl/8.4.0" } })),
+      "slice4-classify: curl/ (external API client) → NOT internal");
+    assertTrue(!_isInternalTraffic(_buildRequestMeta({ headers: { "user-agent": "node-fetch/2.6.7" } })),
+      "slice4-classify: node-fetch (external agent) → NOT internal");
+    assertTrue(!_isInternalTraffic(_buildRequestMeta({ headers: { "user-agent": "python-requests/2.31" } })),
+      "slice4-classify: python-requests (external agent) → NOT internal");
+    assertTrue(!_isInternalTraffic(_buildRequestMeta({ headers: { "user-agent": "axios/1.6.0" } })),
+      "slice4-classify: axios/ (external agent) → NOT internal");
+    assertTrue(!_isInternalTraffic(_buildRequestMeta({ headers: { "user-agent": "Mozilla/5.0 (X11; Linux) Chrome/120" } })),
+      "slice4-classify: real browser UA → NOT internal");
+    assertTrue(!_isInternalTraffic(_buildRequestMeta({ headers: {} })),
+      "slice4-classify: no signals → NOT internal (bias to external when unsure)");
+  } finally {
+    if (prevAdminKey === undefined) delete process.env.ADMIN_KEY; else process.env.ADMIN_KEY = prevAdminKey;
+    if (prevAnalyticsKey === undefined) delete process.env.ANALYTICS_ADMIN_KEY; else process.env.ANALYTICS_ADMIN_KEY = prevAnalyticsKey;
+  }
+
+  // ── (b)+(c) Write-time flag + public/admin counters (real service path) ──
+  const prevConvDb = getDb();
+  const cdb = new Database(":memory:");
+  cdb.pragma("foreign_keys = ON");
+  __setDbForTesting(cdb);
+  __initSchemaForTesting(cdb);
+  try {
+    // is_internal column exists (additive migration ran)
+    const cols = (cdb.prepare("PRAGMA table_info(conversations)").all() as any[]).map(c => c.name);
+    assertTrue(cols.includes("is_internal"), "slice4-migration: conversations.is_internal column added");
+
+    insertTestAgent(cdb, "seller-1", "Test Gård");
+
+    const convInternal = _convSvc.startConversation({
+      sellerAgentId: "seller-1", queryText: "honning bergen", source: "a2a",
+      requestMeta: _buildRequestMeta({ headers: { "user-agent": "RFB-ContactVerifier/1.0" } }),
+      autoRespond: false,
+    });
+    const convExternal = _convSvc.startConversation({
+      sellerAgentId: "seller-1", queryText: "honning bergen", source: "a2a",
+      requestMeta: _buildRequestMeta({ headers: { "user-agent": "Mozilla/5.0 Chrome/120" } }),
+      autoRespond: false,
+    });
+
+    const flagOf = (id: string) => (cdb.prepare("SELECT is_internal FROM conversations WHERE id = ?").get(id) as any).is_internal;
+    assertEq(flagOf(convInternal.id), 1, "slice4-write: verifier-UA conversation stored is_internal=1");
+    assertEq(flagOf(convExternal.id), 0, "slice4-write: external browser conversation stored is_internal=0");
+
+    // Public counters exclude internal; admin totals include it
+    const pubA2a = _convSvc.getSourceStats().find(s => s.source === "a2a")?.count || 0;
+    const admA2a = _convSvc.getSourceStats({ includeInternal: true }).find(s => s.source === "a2a")?.count || 0;
+    assertEq(pubA2a, 1, "slice4-counter: public a2a count = 1 (internal verifier probe EXCLUDED)");
+    assertEq(admA2a, 2, "slice4-counter: admin a2a count = 2 (internal INCLUDED in totals)");
+
+    // Public list hides the internal conversation; admin list shows both
+    const pubIds = new Set(_convSvc.listConversations({ limit: 50 }).map(c => c.id));
+    const admIds = new Set(_convSvc.listConversations({ limit: 50, includeInternal: true }).map(c => c.id));
+    assertTrue(pubIds.has(convExternal.id) && !pubIds.has(convInternal.id),
+      "slice4-list: public list shows external, hides internal");
+    assertTrue(admIds.has(convExternal.id) && admIds.has(convInternal.id),
+      "slice4-list: admin list shows both");
+
+    // ── (d) Backfill: idempotent, reversible, conservative ──
+    // Seed three legacy rows (is_internal=0): internal-UA, external-UA, no-signal.
+    const seed = (cid: string, ua: string | null) => {
+      cdb.prepare("INSERT INTO conversations (id, seller_agent_id, status, query_text, source, is_internal, created_at, updated_at) VALUES (?, 'seller-1', 'open', 'q', 'a2a', 0, datetime('now'), datetime('now'))").run(cid);
+      const meta = ua === null ? "{}" : JSON.stringify({ source: "a2a", ua });
+      cdb.prepare("INSERT INTO messages (id, conversation_id, sender_role, content, message_type, metadata, created_at) VALUES (?, ?, 'system', 'sys', 'info', ?, datetime('now'))").run(`m-${cid}`, cid, meta);
+    };
+    seed("bf-internal", "RFB-HealthCheck/1.0");
+    seed("bf-external", "Mozilla/5.0 Chrome/120");
+    seed("bf-nosignal", null);
+
+    const r1 = _convSvc.backfillInternalFlags();
+    assertTrue(r1.flagged >= 1, "slice4-backfill: flags at least the seeded internal row");
+    assertEq((cdb.prepare("SELECT is_internal FROM conversations WHERE id='bf-internal'").get() as any).is_internal, 1,
+      "slice4-backfill: internal-UA legacy row → is_internal=1");
+    assertEq((cdb.prepare("SELECT is_internal FROM conversations WHERE id='bf-external'").get() as any).is_internal, 0,
+      "slice4-backfill: external-UA legacy row → LEFT untouched (0)");
+    assertEq((cdb.prepare("SELECT is_internal FROM conversations WHERE id='bf-nosignal'").get() as any).is_internal, 0,
+      "slice4-backfill: no-signal legacy row → LEFT unflagged (conservative, no guessing)");
+
+    // Idempotent: re-running flags nothing new
+    const r2 = _convSvc.backfillInternalFlags();
+    assertEq(r2.flagged, 0, "slice4-backfill: idempotent — second pass flags 0");
+
+    // Reversible: reset clears every internal flag (rollback aid)
+    const cleared = _convSvc.resetInternalFlags().cleared;
+    assertTrue(cleared >= 2, "slice4-rollback: resetInternalFlags clears all flagged rows");
+    assertEq((cdb.prepare("SELECT COUNT(*) c FROM conversations WHERE is_internal=1").get() as any).c, 0,
+      "slice4-rollback: no is_internal=1 rows remain after reset");
+  } finally {
+    __setDbForTesting(prevConvDb);
+    cdb.close();
+  }
 }
 
 // Integration test setup — use a fresh DB each time
