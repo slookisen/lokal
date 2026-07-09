@@ -246,6 +246,7 @@ function registerExperienceTools(server: McpServer): void {
             : null,
           booking_url: e.booking_url ?? null,
           booking_type: e.booking_type ?? null,
+          tags: e.tags ?? [],
         }));
 
         const result = {
@@ -425,6 +426,7 @@ function registerExperienceTools(server: McpServer): void {
           kommune: experience.kommune ?? null,
           fylke: experience.fylke ?? null,
           verification_status: experience.verification_status ?? null,
+          tags: experience.tags ?? [],
         };
 
         return {

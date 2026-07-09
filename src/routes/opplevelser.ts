@@ -124,6 +124,7 @@ router.get("/discover", (req: Request, res: Response) => {
         price_band: e.price_band,
         booking_url: e.booking_url,
         confidence: e.confidence,
+        tags: e.tags,
       })),
     });
   } catch (err) {

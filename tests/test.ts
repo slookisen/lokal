@@ -23007,6 +23007,20 @@ Promise.allSettled(_oaHomeCountersDeps).then(async () => {
     failed += jr.failed;
     for (const f of jr.failures) failures.push("oa-home-counters: " + f);
     console.log(`  oa-home-counters: ${jr.passed} passed, ${jr.failed} failed`);
+
+    // dev-request 2026-07-04-opplevagent-taksonomi-filtre (lokal#145 review
+    // follow-up): tags wired into REST /discover + the OpenAPI Experience
+    // schema. Also swaps the experiences db-factory singleton
+    // (EXPERIENCES_DB_PATH=":memory:"), so it runs sequentially inside this
+    // same already-gated block rather than opening a new race window.
+    console.log("\n── opplevelser-discover-tags: tags wired into REST /discover + OpenAPI ──");
+    const { runOpplevelserDiscoverTagsTests } = require("../src/routes/opplevelser-discover-tags.test") as
+      typeof import("../src/routes/opplevelser-discover-tags.test");
+    const tr = await runOpplevelserDiscoverTagsTests({ log: false });
+    passed += tr.passed;
+    failed += tr.failed;
+    for (const f of tr.failures) failures.push("opplevelser-discover-tags: " + f);
+    console.log(`  opplevelser-discover-tags: ${tr.passed} passed, ${tr.failed} failed`);
   } catch (err: any) {
     failed++;
     failures.push("oa-home-counters: unexpected error: " + String(err?.message || err));

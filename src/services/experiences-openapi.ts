@@ -8,6 +8,8 @@
  * opplevagent.no host. Mirrors dental-openapi.ts.
  */
 
+import { EXPERIENCE_TAGS } from "./experience-tags";
+
 const OPPLEVAGENT_BASE_URL =
   process.env.OPPLEVAGENT_BASE_URL || "https://opplevagent.no";
 
@@ -208,6 +210,11 @@ export function getExperiencesOpenapi(): object {
             price_band: { type: "string", nullable: true },
             booking_url: { type: "string", nullable: true },
             confidence: { type: "string", enum: ["high", "medium", "low"], nullable: true },
+            tags: {
+              type: "array",
+              description: "Derived cross-cutting filter tags (additive-only; computed from existing fields).",
+              items: { type: "string", enum: [...EXPERIENCE_TAGS] },
+            },
           },
         },
       },
