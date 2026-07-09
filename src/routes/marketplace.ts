@@ -8,7 +8,7 @@ import { geocodingService } from "../services/geocoding-service";
 import { getDb } from "../database/init";
 import { emailService } from "../services/email-service";
 import { trustScoreService } from "../services/trust-score-service";
-import { conversationService } from "../services/conversation-service";
+import { conversationService, buildRequestMeta } from "../services/conversation-service";
 import { slugify } from "../utils/slug";
 import { pingIndexNow } from "../services/indexnow-service";
 import { addUtmParams } from "../utils/url-utm";
@@ -336,6 +336,7 @@ router.post("/discover", (req: Request, res: Response) => {
             sellerAgentId: r.agent.id,
             queryText: queryDesc,
             source: "api",
+            requestMeta: buildRequestMeta(req), // (item 3) internal-traffic classification
             autoRespond: true,
           });
           conversations.push({ conversationId: conv.id, sellerAgentId: r.agent.id });
@@ -531,6 +532,7 @@ router.get("/search", async (req: Request, res: Response) => {
           sellerAgentId: r.agent.id,
           queryText: q,
           source: "api",
+          requestMeta: buildRequestMeta(req), // (item 3) internal-traffic classification
           autoRespond: true,
         });
         conversations.push({

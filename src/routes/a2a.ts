@@ -3,7 +3,7 @@ import { agentCardService, store } from "../services";
 import { marketplaceRegistry } from "../services/marketplace-registry";
 import { DiscoveryQuerySchema } from "../models/marketplace";
 import { interactionLogger, InteractionEvent } from "../services/interaction-logger";
-import { conversationService } from "../services/conversation-service";
+import { conversationService, buildRequestMeta } from "../services/conversation-service";
 import { discoveryService } from "../services/discovery-service";
 import { knowledgeService, relabelCertifications } from "../services/knowledge-service";
 import { redactPII } from "../utils/pii-redact";
@@ -278,6 +278,7 @@ function handleMessageSend(params: any, id: any, req: Request, res: Response) {
           queryText: typeof queryText === "string" ? queryText : JSON.stringify(queryText),
           taskId: task.id,
           source: "a2a",
+          requestMeta: buildRequestMeta(req), // (item 3) internal-traffic classification
           autoRespond: true, // Seller agent auto-replies
         });
         conversations.push({
@@ -629,6 +630,7 @@ router.post("/api/conversations", (req: Request, res: Response) => {
   }
   const conversation = conversationService.startConversation({
     buyerAgentId, sellerAgentId, queryText,
+    requestMeta: buildRequestMeta(req), // (item 3) internal-traffic classification
   });
   res.json({ success: true, data: conversation });
 });

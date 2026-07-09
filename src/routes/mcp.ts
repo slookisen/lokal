@@ -35,7 +35,7 @@ import {
 } from "../services/cart-service";
 
 
-import { conversationService } from "../services/conversation-service";
+import { conversationService, buildRequestMeta } from "../services/conversation-service";
 
 const router = Router();
 
@@ -176,7 +176,11 @@ export async function enrichParsedWithGeo(
   }
 }
 
-function registerTools(server: McpServer, getClientIdentity?: () => string | undefined) {
+function registerTools(
+  server: McpServer,
+  getClientIdentity?: () => string | undefined,
+  getRequestMeta?: () => import("../services/conversation-service").RequestMeta | undefined,
+) {
   // Tool 1: Natural language search
   server.registerTool(
     "lokal_search",
@@ -214,6 +218,7 @@ function registerTools(server: McpServer, getClientIdentity?: () => string | und
             queryText: query,
             source: "mcp",
             clientIdentity: getClientIdentity?.(),
+            requestMeta: getRequestMeta?.(), // (item 3) internal-traffic classification
             autoRespond: true,
           });
           convLinks.push(`💬 [Samtale med ${conv.sellerAgentName}](${BASE}/samtale/${conv.id})`);
@@ -308,6 +313,7 @@ function registerTools(server: McpServer, getClientIdentity?: () => string | und
             queryText: queryDesc,
             source: "mcp",
             clientIdentity: getClientIdentity?.(),
+            requestMeta: getRequestMeta?.(), // (item 3) internal-traffic classification
             autoRespond: true,
           });
           convLinks.push(`💬 [Samtale med ${conv.sellerAgentName}](${BASE}/samtale/${conv.id})`);
@@ -993,6 +999,7 @@ interface McpSession {
   server: McpServer;
   lastActivity: number;
   clientIdentity?: string;  // e.g. "ChatGPT", "Claude Desktop", "Cursor"
+  requestMeta?: import("../services/conversation-service").RequestMeta;  // (item 3) internal-traffic classification signals
 }
 
 // ─── MCP client identity detection ─────────────────────────
@@ -1037,16 +1044,21 @@ async function getOrCreateSession(sessionId?: string, req?: Request): Promise<{ 
     if (!session.clientIdentity && req) {
       session.clientIdentity = detectMcpClient(req);
     }
+    // Capture internal-traffic classification signals if not yet known (item 3)
+    if (!session.requestMeta && req) {
+      session.requestMeta = buildRequestMeta(req);
+    }
     return { id: sessionId, session };
   }
 
   // Create new session — detect which AI platform is connecting
   const id = sessionId || randomUUID();
   const clientIdentity = req ? detectMcpClient(req) : undefined;
+  const requestMeta = req ? buildRequestMeta(req) : undefined;
 
   const server = new McpServer({ name: "rett-fra-bonden", version: "0.4.0" });
-  const sessionRef = { clientIdentity };
-  registerTools(server, () => sessionRef.clientIdentity);
+  const sessionRef: { clientIdentity?: string; requestMeta?: import("../services/conversation-service").RequestMeta } = { clientIdentity, requestMeta };
+  registerTools(server, () => sessionRef.clientIdentity, () => sessionRef.requestMeta);
 
   const transport = new StreamableHTTPServerTransport({
     sessionIdGenerator: () => id,
@@ -1054,7 +1066,7 @@ async function getOrCreateSession(sessionId?: string, req?: Request): Promise<{ 
 
   await server.connect(transport);
 
-  const session: McpSession = { transport, server, lastActivity: Date.now(), clientIdentity };
+  const session: McpSession = { transport, server, lastActivity: Date.now(), clientIdentity, requestMeta };
   sessions.set(id, session);
   return { id, session };
 }

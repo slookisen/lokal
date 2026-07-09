@@ -15,7 +15,7 @@
 
 import { Router, Request, Response } from "express";
 import { randomUUID } from "crypto";
-import { conversationService } from "../services/conversation-service";
+import { conversationService, buildRequestMeta } from "../services/conversation-service";
 import { interactionLogger } from "../services/interaction-logger";
 import { redactPII } from "../utils/pii-redact";
 import { parseUserAgent } from "../services/analytics-service";
@@ -640,8 +640,18 @@ router.get("/samtaler", (req: Request, res: Response) => {
     const validSources = ["a2a", "mcp", "web", "api"];
     const filterSource = validSources.includes(activeSource) ? activeSource : undefined;
 
+    // ─── Admin view (item 3) ─────────────────────────────────────
+    // Public default reports EXTERNAL traffic only — our own verifier/fleet/
+    // health-check probes never inflate the numbers a visitor sees. An
+    // authenticated owner/admin can pass ?admin=1 to see full totals (internal
+    // traffic included). Credential = the same X-Admin-Key used across /admin/*,
+    // or the _rfb_owner=1 owner cookie. Without a valid credential ?admin=1 is
+    // ignored and the public (external-only) view is served.
+    const meta = buildRequestMeta(req);
+    const isAdminView = req.query.admin === "1" && (!!meta.hasValidAdminKey || !!meta.ownerCookie);
+
     // ─── Stats per source (always show all, regardless of filter) ─
-    const sourceStats = conversationService.getSourceStats();
+    const sourceStats = conversationService.getSourceStats({ includeInternal: isAdminView });
     const totalAll = sourceStats.reduce((s, r) => s + r.count, 0);
     const statsMap = new Map(sourceStats.map(s => [s.source, s]));
 
@@ -649,6 +659,7 @@ router.get("/samtaler", (req: Request, res: Response) => {
     const conversations = conversationService.listConversations({
       limit: 50,
       source: filterSource,
+      includeInternal: isAdminView,
     });
 
     // ─── Stats cards ────────────────────────────────────────────
@@ -662,7 +673,7 @@ router.get("/samtaler", (req: Request, res: Response) => {
     const statsHtml = `<div class="stats-row">
       <div class="stat-card">
         <div class="stat-num">${totalAll}</div>
-        <div class="stat-label">Totalt samtaler</div>
+        <div class="stat-label">Totalt samtaler${isAdminView ? " <span style=\"opacity:.7\">(inkl. intern trafikk)</span>" : ""}</div>
       </div>
       ${["mcp", "a2a", "web", "api"].map(src => {
         const s = statsMap.get(src);
