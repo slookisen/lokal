@@ -663,7 +663,28 @@ export function renderHumanVisitsStrip(patterns: HumanReferralPattern[]): string
   </section>`;
 }
 
-function chatShell(title: string, description: string, content: string): string {
+// ─── Fresh-content SEO (dev-request 2026-07-04, item 7) ─────────────────────
+// /samtaler is the page whose grouped, server-rendered conversation text
+// carries the GEO/SEO value — it must be INDEXABLE (a blanket noindex fails
+// Lighthouse's "is-crawlable" audit outright, capping the SEO score far below
+// the ≥95 acceptance criterion) and carry a canonical so the ?kilde= filter
+// variants (and the credential-gated ?admin=1 view) never register as
+// duplicate content. /samtale/:id detail pages stay noindex ON PURPOSE: they
+// are thousands of thin, near-duplicate templated transcripts — opening them
+// to the index would be index-bloat, not signal (the fresh text they carry is
+// already surfaced, grouped, on /samtaler). The 404 shell stays noindex too.
+// Passing `canonicalPath` opts a page IN to indexing; the default remains the
+// safe noindex. The robots value mirrors the established seo.ts pageShell.
+function chatShell(
+  title: string,
+  description: string,
+  content: string,
+  opts?: { canonicalPath?: string }
+): string {
+  const robotsAndCanonical = opts?.canonicalPath
+    ? `<link rel="canonical" href="${BASE_URL}${opts.canonicalPath}">
+  <meta name="robots" content="index, follow, max-snippet:-1, max-image-preview:large">`
+    : `<meta name="robots" content="noindex">`;
   return `<!DOCTYPE html>
 <html lang="nb">
 <head>
@@ -671,7 +692,7 @@ function chatShell(title: string, description: string, content: string): string 
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>${escapeHtml(title)} — Rett fra Bonden</title>
   <meta name="description" content="${escapeHtml(description)}">
-  <meta name="robots" content="noindex">
+  ${robotsAndCanonical}
   ${CHAT_CSS}
 </head>
 <body>
@@ -858,6 +879,8 @@ router.get("/samtaler", (req: Request, res: Response) => {
       ? `<div class="pagination-note">Viser siste 50 samtaler${activeSource ? ` fra ${sourceLabels[activeSource]?.label || activeSource}` : ""}.</div>`
       : "";
 
+    // Item 7: indexable + canonical → the bare /samtaler URL, also for the
+    // ?kilde= filter variants, so Google never sees them as duplicates.
     const html = chatShell("Samtaler", "Se hvordan AI-agenter og besøkende finner lokal mat", `
       <div class="container">
         <div class="conv-list-header">
@@ -881,7 +904,7 @@ router.get("/samtaler", (req: Request, res: Response) => {
           });
         });
       </script>
-    `);
+    `, { canonicalPath: "/samtaler" });
 
     res.send(html);
   } catch (err: any) {
