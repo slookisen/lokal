@@ -18,7 +18,8 @@ import { randomUUID } from "crypto";
 import { conversationService, buildRequestMeta } from "../services/conversation-service";
 import { interactionLogger } from "../services/interaction-logger";
 import { redactPII } from "../utils/pii-redact";
-import { parseUserAgent } from "../services/analytics-service";
+import { parseUserAgent, analyticsService, MIN_HUMAN_REFERRAL_COUNT } from "../services/analytics-service";
+import type { HumanReferralPattern } from "../services/analytics-service";
 
 const router = Router();
 
@@ -507,6 +508,24 @@ const CHAT_CSS = `
 
   .pagination-note { text-align: center; padding: 16px 0 32px; font-size: 0.8rem; color: var(--g500); }
 
+  /* ═══ Menneskelige besøk strip (item 6) ═════════════════════ */
+  .human-visits { margin: 36px 0 8px; padding-top: 26px; border-top: 2px dashed var(--g200); }
+  .hv-head { text-align: center; margin-bottom: 18px; }
+  .hv-head h2 { font-size: 1.15rem; font-weight: 800; color: var(--charcoal); margin-bottom: 6px; }
+  .hv-head p { font-size: 0.82rem; color: var(--g500); line-height: 1.55; max-width: 640px; margin: 0 auto; }
+  .hv-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 12px; }
+  .hv-card { background: var(--white); border: 1px solid var(--g100); border-radius: var(--r-md); padding: 14px 16px; }
+  .hv-card-top { display: flex; justify-content: space-between; align-items: center; gap: 8px; margin-bottom: 8px; }
+  .hv-badge { display: inline-flex; align-items: center; gap: 5px; padding: 3px 11px; border-radius: 12px; font-size: 0.74rem; font-weight: 700; background: var(--g100); color: var(--g700); }
+  .hv-count { font-size: 0.72rem; font-weight: 700; color: var(--green-700); background: var(--green-100); padding: 2px 9px; border-radius: 10px; white-space: nowrap; }
+  .hv-story { font-size: 0.86rem; color: var(--g700); line-height: 1.5; }
+  .hv-google, .hv-bing { background: #e8f0fe; color: #1a56db; }
+  .hv-chatgpt { background: #dcfce7; color: #15803d; }
+  .hv-perplexity { background: #f3e8ff; color: #7c3aed; }
+  .hv-gemini { background: #e0e7ff; color: #4338ca; }
+  .hv-duckduckgo { background: #fef3c7; color: #b45309; }
+  .hv-sosial { background: #e0f2fe; color: #0369a1; }
+
   /* ═══ Query Groups (accordion) ══════════════════════════════ */
   .query-group { background: var(--white); border-radius: var(--r-lg); border: 1px solid var(--g100); margin-bottom: 12px; overflow: hidden; }
   .query-header { display: flex; justify-content: space-between; align-items: center; padding: 16px 20px; cursor: pointer; transition: background 0.15s; user-select: none; }
@@ -597,6 +616,52 @@ const CHAT_CSS = `
     .chat-participants { flex-direction: column; gap: 10px; }
   }
 </style>`;
+
+// ─── "Menneskelige besøk" strip (dev-request 2026-07-04, item 6) ──────────
+// A SEPARATE, clearly-labeled section on /samtaler — NOT fake dialogue, NOT
+// mixed into the AI-conversation cards. Renders AGGREGATED, ANONYMIZED human-
+// referral patterns produced by analyticsService.getHumanReferralPatterns()
+// (≥ MIN_HUMAN_REFERRAL_COUNT threshold + internal/bot exclusion enforced
+// there). This renderer only formats already-anonymized aggregates — it never
+// sees an IP, session id, raw UA or referrer URL.
+function humanSourceIcon(key: string): string {
+  const map: Record<string, string> = {
+    google: "&#128269;",      // 🔍
+    bing: "&#128269;",        // 🔍
+    duckduckgo: "&#129717;",  // 🦆
+    chatgpt: "&#129302;",     // 🤖
+    perplexity: "&#128302;",  // 🔮
+    gemini: "&#10024;",       // ✨
+    copilot: "&#129302;",     // 🤖
+    sosial: "&#128241;",      // 📱
+    annet: "&#127760;",       // 🌐
+  };
+  return map[key] || "&#127760;";
+}
+
+export function renderHumanVisitsStrip(patterns: HumanReferralPattern[]): string {
+  if (!patterns || patterns.length === 0) return "";
+  const cards = patterns.map(p => {
+    const producerBit = p.topProducers.length
+      ? `s&aring; p&aring; ${p.topProducers.map(pr => `<strong>${escapeHtml(pr.name)}</strong>`).join(" + ")}${p.otherProducerCount > 0 ? ` + ${p.otherProducerCount} andre` : ""}`
+      : `bes&oslash;kte sidene v&aring;re`;
+    return `<div class="hv-card">
+      <div class="hv-card-top">
+        <span class="hv-badge hv-${escapeHtml(p.sourceKey)}">${humanSourceIcon(p.sourceKey)} ${escapeHtml(p.sourceLabel)}</span>
+        <span class="hv-count">${p.visitCount} bes&oslash;k</span>
+      </div>
+      <div class="hv-story">Fra <strong>${escapeHtml(p.sourceLabel)}</strong> &rarr; ${producerBit}</div>
+    </div>`;
+  }).join("\n");
+
+  return `<section class="human-visits" aria-label="Menneskelige bes&oslash;k">
+    <div class="hv-head">
+      <h2>&#128099; Menneskelige bes&oslash;k</h2>
+      <p>Ikke bare AI-agenter &mdash; ekte mennesker finner ogs&aring; frem hit. Under er <strong>aggregerte, anonymiserte</strong> m&oslash;nstre for hvor bes&oslash;kende kom fra. Ingen IP-adresser, ingen enkeltpersoner &mdash; kun m&oslash;nstre som gjelder <strong>minst ${MIN_HUMAN_REFERRAL_COUNT} bes&oslash;k</strong> vises.</p>
+    </div>
+    <div class="hv-grid">${cards}</div>
+  </section>`;
+}
 
 function chatShell(title: string, description: string, content: string): string {
   return `<!DOCTYPE html>
@@ -775,6 +840,19 @@ router.get("/samtaler", (req: Request, res: Response) => {
       }).join("\n");
     }
 
+    // ─── "Menneskelige besøk" strip (item 6) ────────────────────
+    // Separate, clearly-labeled section: aggregated + anonymized human-referral
+    // patterns (≥ MIN_HUMAN_REFERRAL_COUNT, internal/bot excluded, no PII).
+    // Independent of the AI-channel filter above; failure here must never break
+    // the conversation list.
+    let humanVisitsHtml = "";
+    try {
+      const patterns = analyticsService.getHumanReferralPatterns({ hoursBack: 24 * 30 });
+      humanVisitsHtml = renderHumanVisitsStrip(patterns);
+    } catch (e) {
+      console.error("[samtaler] human-visits strip failed:", e);
+    }
+
     const totalConvs = conversations.length;
     const paginationNote = totalConvs >= 50
       ? `<div class="pagination-note">Viser siste 50 samtaler${activeSource ? ` fra ${sourceLabels[activeSource]?.label || activeSource}` : ""}.</div>`
@@ -790,6 +868,7 @@ router.get("/samtaler", (req: Request, res: Response) => {
         ${tabsHtml}
         ${listHtml}
         ${paginationNote}
+        ${humanVisitsHtml}
       </div>
       <script>
         document.querySelectorAll("[data-toggle]").forEach(function(header) {
