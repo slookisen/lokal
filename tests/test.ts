@@ -20127,6 +20127,7 @@ console.log("\n── orch-pr-14: MCP discovery product_id surfacing ──");
   try { await _tasksPruneAsyncPromise; } catch { /* errors already pushed to failures */ }
   try { await _rfbDebioSuitePromise; } catch { /* errors already pushed to failures */ }
   try { await _dispatchTickSuitePromise; } catch { /* errors already pushed to failures */ }
+  try { await _samtalerSeoPromise; } catch { /* errors already pushed to failures */ }
   // relax-envelope tests are synchronous (pure validateEnvelope() unit test) — no promise needed
   // PR-109 tests are synchronous (IIFE) — no promise needed
   // Drop pre-existing intg failures (unmasked by awaiting) — they predate M2
@@ -24124,5 +24125,150 @@ const _dispatchTickSuitePromise: Promise<void> = new Promise<void>(r => { _dispa
     initModTick.__setDbForTesting(prevDbTick);
     db.close();
     _dispatchTickSuiteResolve();
+  }
+})();
+
+// ═══════════════════════════════════════════════════════════════════════
+// rfb-samtaler slice 6 (item 7): fresh-content SEO on /samtaler.
+// Dev-request 2026-07-04-rfb-samtaler-ekte-samtalevisning, final item.
+//
+// A real Lighthouse run needs a browser and belongs to post-deploy
+// verification; what CAN be proven here, against the ACTUAL route (real
+// express app, real conversation-service write path, raw HTTP fetch), are
+// the server-verifiable Lighthouse SEO signals:
+//   is-crawlable (no accidental noindex on /samtaler), document-title,
+//   meta-description, canonical (absolute, and stable across ?kilde=
+//   filter variants), html lang, exactly one h1, viewport, 404-status,
+//   and — the item-7 core — that the grouped conversation text is present
+//   in the RAW server-rendered HTML, not injected client-side.
+// Deliberate asymmetry under test: /samtale/:id detail pages KEEP noindex
+// (thousands of thin near-duplicate templated transcripts = index-bloat);
+// only /samtaler opts in to indexing. A regression in either direction
+// (noindex leaking back onto /samtaler, or the blanket-indexing of detail
+// pages) fails these tests.
+// ═══════════════════════════════════════════════════════════════════════
+
+let _samtalerSeoResolve: () => void = () => {};
+const _samtalerSeoPromise: Promise<void> = new Promise<void>(r => { _samtalerSeoResolve = r; });
+
+(async () => {
+  // Run strictly after every other singleton-swapping block: _rfbDebioSuitePromise
+  // itself awaits the full REPORT dependency list except the two extras below,
+  // so awaiting these three covers everything the REPORT IIFE waits for.
+  await Promise.allSettled([_rfbDebioSuitePromise, _salgskanalMatcherPromise, _adminAgentsRegisterPromise]);
+  await new Promise(r => setImmediate(r));
+
+  console.log("\n── rfb-samtaler slice 6 (item 7): /samtaler SEO — server-verifiable Lighthouse signals ──");
+
+  const Database6 = require("better-sqlite3");
+  const initMod6 = require("../src/database/init");
+  const prevDb6 = initMod6.getDb();
+  const db6 = new Database6(":memory:");
+  db6.pragma("journal_mode = DELETE");
+  db6.pragma("foreign_keys = ON");
+  let server6: any = null;
+  try {
+    initMod6.__setDbForTesting(db6);
+    initMod6.__initSchemaForTesting(db6);
+
+    // Seed ONE external conversation through the production write path —
+    // startConversation with autoRespond (default) so the producer's
+    // templated auto-reply exists, exactly like a live MCP search.
+    insertTestAgent(db6, "seo-seller-1", "Bergen Honninggård");
+    const conv6 = _convSvc.startConversation({
+      sellerAgentId: "seo-seller-1",
+      queryText: "honning fra bergen",
+      source: "mcp",
+      requestMeta: _buildRequestMeta({ headers: { "user-agent": "Mozilla/5.0 (X11; Linux) Chrome/120" } }),
+    });
+
+    // Mount the REAL router (top-of-file import — same module instance the
+    // pure-function tests use) on a throwaway express app.
+    const expressMod6 = require("express");
+    const app6 = expressMod6();
+    app6.use("/", conversationUiRouter);
+    const httpMod6 = require("http");
+    server6 = httpMod6.createServer(app6);
+    await new Promise<void>(r => server6.listen(0, "127.0.0.1", () => r()));
+    const addr6 = server6.address();
+    const port6 = typeof addr6 === "object" && addr6 ? addr6.port : 0;
+    const get6 = async (p: string): Promise<{ status: number; body: string }> => {
+      const res = await fetch(`http://127.0.0.1:${port6}${p}`);
+      return { status: res.status, body: await res.text() };
+    };
+
+    // ── /samtaler: the page that must pass Lighthouse SEO ≥ 95 ─────────
+    const list = await get6("/samtaler");
+    assertEq(list.status, 200, "seo6: /samtaler returns 200");
+    assertTrue(list.body.includes('<html lang="nb">'),
+      "seo6: /samtaler has valid html lang (nb)");
+    assertTrue(list.body.includes("<title>Samtaler — Rett fra Bonden</title>"),
+      "seo6: /samtaler has a unique, descriptive <title>");
+    assertTrue(/<meta name="description" content="[^"]{20,}">/.test(list.body),
+      "seo6: /samtaler has a non-empty, meaningful meta description");
+    assertEq((list.body.match(/<h1[\s>]/g) || []).length, 1,
+      "seo6: /samtaler has exactly one <h1>");
+    assertTrue(/<meta name="viewport" content="width=device-width/.test(list.body),
+      "seo6: /samtaler has a meta viewport");
+    // is-crawlable: the accidental blanket noindex is GONE from /samtaler…
+    assertTrue(!/noindex/.test(list.body),
+      "seo6: /samtaler carries NO noindex (Lighthouse is-crawlable passes)");
+    assertTrue(/<meta name="robots" content="index, follow/.test(list.body),
+      "seo6: /samtaler robots meta explicitly allows indexing (mirrors seo.ts pageShell)");
+    // canonical: present, absolute, pointing at the bare /samtaler URL.
+    const canonMatch = list.body.match(/<link rel="canonical" href="([^"]+)">/);
+    assertTrue(!!canonMatch, "seo6: /samtaler has a rel=canonical link");
+    assertTrue(!!canonMatch && /^https?:\/\/[^"]+\/samtaler$/.test(canonMatch[1]!),
+      "seo6: canonical is an ABSOLUTE URL ending in /samtaler (no query params)");
+
+    // Item-7 core — fresh conversation text is SERVER-rendered: the real
+    // query text AND the producer's reply text are in the raw HTML of the
+    // initial response (view-source), not injected by client-side JS.
+    assertTrue(list.body.includes("honning fra bergen"),
+      "seo6: grouped query text is present in raw server-rendered HTML");
+    assertTrue(list.body.includes("Bergen Honninggård"),
+      "seo6: producer name is present in raw server-rendered HTML");
+    assertTrue(/Hei fra Bergen Honninggård/.test(list.body),
+      "seo6: producer auto-reply snippet is present in raw server-rendered HTML (not client-injected)");
+
+    // ?kilde= filter variants must canonicalize to the bare /samtaler —
+    // never register as duplicate content.
+    const filtered = await get6("/samtaler?kilde=mcp");
+    assertEq(filtered.status, 200, "seo6: /samtaler?kilde=mcp returns 200");
+    const canonFiltered = filtered.body.match(/<link rel="canonical" href="([^"]+)">/);
+    assertTrue(!!canonFiltered && /\/samtaler$/.test(canonFiltered[1]!) && !canonFiltered[1]!.includes("kilde"),
+      "seo6: ?kilde= variant canonicalizes to bare /samtaler (dedupes filter pages)");
+    assertTrue(!/noindex/.test(filtered.body),
+      "seo6: ?kilde= variant is also crawlable (no noindex)");
+
+    // ── /samtale/:id: DELIBERATELY stays noindex (thin templated pages) ──
+    const detail = await get6(`/samtale/${conv6.id}`);
+    assertEq(detail.status, 200, "seo6: /samtale/:id returns 200");
+    assertTrue(detail.body.includes('<meta name="robots" content="noindex">'),
+      "seo6: /samtale/:id detail page KEEPS noindex (deliberate: thin near-duplicate transcripts)");
+    assertTrue(!detail.body.includes('rel="canonical"'),
+      "seo6: /samtale/:id emits no canonical (noindex pages should not claim one)");
+    assertEq((detail.body.match(/<h1[\s>]/g) || []).length, 1,
+      "seo6: /samtale/:id has exactly one <h1>");
+    assertTrue(detail.body.includes('<html lang="nb">'),
+      "seo6: /samtale/:id has valid html lang (nb)");
+    assertTrue(detail.body.includes("Bergen Honninggård") && /<title>[^<]*Bergen Honninggård[^<]*<\/title>/.test(detail.body),
+      "seo6: /samtale/:id title is unique (contains the producer name)");
+    assertTrue(detail.body.includes("honning fra bergen"),
+      "seo6: /samtale/:id question bubble text is server-rendered in raw HTML");
+
+    // ── 404: real 4xx status (Lighthouse http-status-code), still noindex ──
+    const missing = await get6("/samtale/finnes-ikke-i-det-hele-tatt");
+    assertEq(missing.status, 404, "seo6: unknown /samtale/:id returns a real 404 status");
+    assertTrue(missing.body.includes('<meta name="robots" content="noindex">'),
+      "seo6: 404 shell stays noindex");
+  } catch (err) {
+    failed++;
+    failures.push(`✗ samtaler-seo6: unexpected error: ${err instanceof Error ? (err.stack || err.message) : String(err)}`);
+  } finally {
+    try { if (server6) await new Promise<void>(r => server6.close(() => r())); } catch { /* best-effort */ }
+    initMod6.__setDbForTesting(prevDb6);
+    db6.close();
+    _samtalerSeoResolve();
   }
 })();
