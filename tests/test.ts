@@ -5,7 +5,7 @@
 
 import { redactPII, isValidFodselsnummer } from "../src/utils/pii-redact";
 import { computeLoopHealth } from "../src/services/loop-health";
-import { computeWakeList } from "../src/services/loop-dispatch";
+import { computeWakeList, resolveActiveWindowHour } from "../src/services/loop-dispatch";
 import { normalizeTimestamp, normalizeEnvelopeTimes } from "../src/services/envelope-normalize";
 import { validateEnvelope } from "../src/routes/admin-runs";
 
@@ -17923,6 +17923,19 @@ const _orchPr20260614_2Promise = (async () => {
   assertTrue(p6b.inActiveWindow, "dispatch: 24/7 window (0-24) treats 02:00 UTC as active");
   assertEq(p6b.wake.length, 1, "dispatch: 24/7 window -> night wake fires");
   assertEq(p6b.wake[0]!.agent, "orchestrator-v3-controller", "dispatch: 24/7 night wake targets suggested agent");
+
+  // resolveActiveWindowHour: the env-parsing helper planNow() actually calls (PR #180
+  // review flagged that the original test only exercised computeWakeList directly and
+  // never the env-parsing code path this dev-request adds). Cover the footguns a
+  // reviewer would expect: unset, empty-string (NOT caught by `??`), non-numeric, a
+  // valid value, and out-of-range clamping.
+  assertEq(resolveActiveWindowHour(undefined, 0), 0, "resolveActiveWindowHour: unset -> fallback");
+  assertEq(resolveActiveWindowHour("", 24), 24, "resolveActiveWindowHour: empty string -> fallback (not caught by ??)");
+  assertEq(resolveActiveWindowHour("   ", 5), 5, "resolveActiveWindowHour: whitespace-only -> fallback");
+  assertEq(resolveActiveWindowHour("not-a-number", 21), 21, "resolveActiveWindowHour: non-numeric -> fallback");
+  assertEq(resolveActiveWindowHour("7", 0), 7, "resolveActiveWindowHour: valid numeric string -> parsed value");
+  assertEq(resolveActiveWindowHour("-3", 0), 0, "resolveActiveWindowHour: below-range -> clamped to 0");
+  assertEq(resolveActiveWindowHour("99", 0), 24, "resolveActiveWindowHour: above-range -> clamped to 24");
 
   // Worker agents (added for remediation-wakes-worker-directly, loop-reliability-backend
   // item 5) are now allowlisted and share the same generic rate-limits as the control plane.
