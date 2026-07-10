@@ -333,5 +333,30 @@ export function initExperiencesSchema(db: Database.Database): void {
     try { db.exec(stmt); } catch { /* already present */ }
   }
 
+  // ─── Dedup / canonical-merge columns (dev-request 2026-07-04-opplevagent-
+  // dedup-og-norske-titler, item 1, 2026-07-10) ─────────────────────────────
+  // Same real-world experience was harvested from multiple sources into
+  // multiple DB rows (confirmed on prod /fylke/Oslo: Kon-Tiki Museet 4x, KOK
+  // Oslo 3x, Astrup Fearnley 2x, RIB Oslo 2x, Klatreverket 2x, Teknisk Museum
+  // 2x), polluting both the human browse pages and /api/opplevelser/discover.
+  //
+  // canonical_id: NULL means "this row IS canonical" (either never had a
+  //   duplicate, or is the one duplicate-group member picked to keep). Set to
+  //   another experiences.id when this row was folded into that canonical row
+  //   by the dedup pass — every read path that surfaces experiences to humans
+  //   or agents (discover, MCP, browse/sitemap listings) filters
+  //   `canonical_id IS NULL` so a duplicate row never appears twice.
+  // merged_from: JSON array of the ids merged INTO this (canonical) row, kept
+  //   for auditability/rollback — never read by any query-layer filter.
+  // ALTER TABLE ... ADD COLUMN is idempotent here — error means already-present.
+  const dedupCols = [
+    "ALTER TABLE experiences ADD COLUMN canonical_id TEXT",
+    "ALTER TABLE experiences ADD COLUMN merged_from TEXT",
+    "CREATE INDEX IF NOT EXISTS idx_exp_canonical_id ON experiences(canonical_id)",
+  ];
+  for (const stmt of dedupCols) {
+    try { db.exec(stmt); } catch { /* already present */ }
+  }
+
   console.log("[experiences] schema initialized");
 }

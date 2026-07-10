@@ -24,7 +24,6 @@ import {
   getProviderByOrgnr,
   getProviderByName,
   setBrregVerification,
-  experienceExistsForProvider,
   ExperienceSchema,
   DiscoverFilterSchema,
   // orch-experiences-content-refresh — homepage→content writer
@@ -35,6 +34,10 @@ import {
   markProviderEnriched,
   markProviderContentAttempted,
   type ContentRefreshTarget,
+  // dev-request 2026-07-04-opplevagent-dedup-og-norske-titler, item 1 —
+  // re-harvest guard (never insert/resurrect a duplicate already known/merged)
+  findExistingExperienceMatch,
+  scoreExperienceRichness,
 } from "../services/experience-store";
 // PURE homepage extractors + SSRF guard — REUSED from the rfb search-enrich
 // module (same code the rfb POST /admin/homepage-content-refresh uses). Only the
@@ -321,8 +324,45 @@ router.post("/admin/bulk-load", requireAdmin, async (req: Request, res: Response
       }
 
       // ── insert this provider's experiences (idempotent by title). ───
+      // Re-harvest guard (dev-request 2026-07-04-opplevagent-dedup-og-norske-
+      // titler, item 1): experienceExistsForProvider()'s exact-title check is
+      // subsumed by the fuzzy candidate-key match below (same provider +
+      // kommune + fuzzy title) — a re-harvest of an already-known experience
+      // (worded differently by a different source) must never insert a new
+      // duplicate row, and must never resurrect a row already merged away by
+      // the dedup pass (findExistingExperienceMatch only looks at unmerged rows).
       for (const r of rows) {
-        if (experienceExistsForProvider(providerId, r.title)) {
+        const rowKommune = r.kommune ?? kommune;
+        const match = findExistingExperienceMatch({
+          provider_id: providerId,
+          title: r.title,
+          kommune: rowKommune,
+        });
+        if (match) {
+          const candidateScore = scoreExperienceRichness({
+            subcategory: r.subcategory ?? null,
+            activity_tags: r.activity_tags ?? null,
+            season: r.season ?? null,
+            indoor_outdoor: r.indoor_outdoor ?? null,
+            price_from: r.price_from ?? null,
+            duration_min: r.duration_min ?? null,
+            booking_url: r.booking_url ?? null,
+            evidence_url: r.evidence_url ?? null,
+            confidence: r.confidence ?? null,
+          });
+          const existingScore = scoreExperienceRichness(match);
+          if (candidateScore > existingScore) {
+            applyExperienceContent(match.id, {
+              category: r.category ?? null,
+              subcategory: r.subcategory ?? null,
+              activity_tags: r.activity_tags ?? null,
+              season: r.season ?? null,
+              indoor_outdoor: r.indoor_outdoor ?? null,
+              duration_min: r.duration_min ?? null,
+              price_from: r.price_from ?? null,
+              booking_url: r.booking_url ?? null,
+            });
+          }
           skipped++;
           continue;
         }
@@ -336,7 +376,7 @@ router.post("/admin/bulk-load", requireAdmin, async (req: Request, res: Response
             activity_tags: r.activity_tags,
             season: r.season,
             indoor_outdoor: r.indoor_outdoor ?? null,
-            kommune: r.kommune ?? kommune,
+            kommune: rowKommune,
             fylke: r.fylke ?? null,
             price_from: r.price_from ?? null,
             duration_min: r.duration_min ?? null,

@@ -55,6 +55,7 @@ import {
   backfillProviderSlugs,
   searchPublishedExperiences,
   listGardssalgProviders,
+  resolveCanonicalSlugForDuplicate,
   type RelatedExperienceRow,
   type ExperienceCardRow,
   type GardssalgProviderRow,
@@ -3511,7 +3512,23 @@ router.get("/opplevelse/:slug", (req: Request, res: Response, next: NextFunction
   } catch {
     exp = null;
   }
-  if (!exp) return next(); // → Norwegian 404 catch-all (no rfb/dental leak)
+  if (!exp) {
+    // dev-request 2026-07-04-opplevagent-dedup-og-norske-titler, item 1: this
+    // slug may belong to a row the dedup pass folded into another (canonical)
+    // row — 301 to the canonical row's live slug instead of 404ing on a stale
+    // bookmarked/indexed URL for a now-duplicate row.
+    let canonicalSlug: string | null = null;
+    try {
+      canonicalSlug = resolveCanonicalSlugForDuplicate(slug);
+    } catch {
+      canonicalSlug = null;
+    }
+    if (canonicalSlug && canonicalSlug !== slug) {
+      res.redirect(301, `/opplevelse/${encodeURIComponent(canonicalSlug)}`);
+      return;
+    }
+    return next(); // → Norwegian 404 catch-all (no rfb/dental leak)
+  }
 
   let provider: Record<string, unknown> | null = null;
   try {

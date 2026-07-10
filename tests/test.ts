@@ -23654,6 +23654,19 @@ Promise.allSettled(_oaHomeCountersDeps).then(async () => {
     failed += gr.failed;
     for (const f of gr.failures) failures.push("opplevelser-discover-geo: " + f);
     console.log(`  opplevelser-discover-geo: ${gr.passed} passed, ${gr.failed} failed`);
+
+    // dev-request 2026-07-04-opplevagent-dedup-og-norske-titler, item 1:
+    // candidate-key dedup (fuzzy title-match, canonical scoring, group/merge,
+    // re-harvest guard, discover-query invariant). Same in-memory-DB pattern,
+    // runs sequentially inside this same gated block for the same reason.
+    console.log("\n── experience-dedup: candidate-key dedup + canonical merge ──");
+    const { runExperienceDedupTests } = require("../src/services/experience-dedup.test") as
+      typeof import("../src/services/experience-dedup.test");
+    const dr = await runExperienceDedupTests({ log: false });
+    passed += dr.passed;
+    failed += dr.failed;
+    for (const f of dr.failures) failures.push("experience-dedup: " + f);
+    console.log(`  experience-dedup: ${dr.passed} passed, ${dr.failed} failed`);
   } catch (err: any) {
     failed++;
     failures.push("oa-home-counters: unexpected error: " + String(err?.message || err));
