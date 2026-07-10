@@ -23167,6 +23167,19 @@ Promise.allSettled(_oaHomeCountersDeps).then(async () => {
     failed += tr.failed;
     for (const f of tr.failures) failures.push("opplevelser-discover-tags: " + f);
     console.log(`  opplevelser-discover-tags: ${tr.passed} passed, ${tr.failed} failed`);
+
+    // dev-request 2026-07-04-opplevagent-nl-parser-og-fylkesnormalisering,
+    // item 3: zero-hit graceful degradation (relax filters weakest-first,
+    // note + suggestions surfaced on REST/A2A). Same in-memory-DB pattern,
+    // runs sequentially inside this same gated block for the same reason.
+    console.log("\n── opplevelser-discover-relax: zero-hit filter relaxation ──");
+    const { runOpplevelserDiscoverRelaxTests } = require("../src/routes/opplevelser-discover-relax.test") as
+      typeof import("../src/routes/opplevelser-discover-relax.test");
+    const rr = await runOpplevelserDiscoverRelaxTests({ log: false });
+    passed += rr.passed;
+    failed += rr.failed;
+    for (const f of rr.failures) failures.push("opplevelser-discover-relax: " + f);
+    console.log(`  opplevelser-discover-relax: ${rr.passed} passed, ${rr.failed} failed`);
   } catch (err: any) {
     failed++;
     failures.push("oa-home-counters: unexpected error: " + String(err?.message || err));
