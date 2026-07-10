@@ -106,7 +106,7 @@ export interface Conversation {
   id: string;
   buyerAgentId?: string;
   buyerAgentName?: string;
-  sellerAgentId: string;
+  sellerAgentId?: string;   // absent for verticals with no agents-table seller row (see startConversation)
   sellerAgentName?: string;
   status: ConversationStatus;
   queryText?: string;
@@ -220,13 +220,21 @@ class ConversationService {
       }
     }
 
-    // Log the interaction
-    interactionLogger.log("message", {
-      agentId: opts.buyerAgentId,
-      query: opts.queryText,
-      matchedAgentIds: opts.sellerAgentId ? [opts.sellerAgentId] : [],
-      metadata: { conversationId: id, type: "conversation_started", source },
-    });
+    // Log the interaction — RFB ONLY. interactionLogger is a single
+    // process-wide singleton that feeds RFB's PUBLIC /api/live SSE dashboard
+    // and /api/interactions(/stats) endpoints (see routes/a2a.ts) — none of
+    // which are vertical-aware. Un-gating this for other verticals would leak
+    // opplevagent query text/conversation ids onto RFB's public activity feed
+    // and inflate its public counters, which is exactly the regression the
+    // vertical-filter work in this file exists to prevent.
+    if (verticalId === "rfb") {
+      interactionLogger.log("message", {
+        agentId: opts.buyerAgentId,
+        query: opts.queryText,
+        matchedAgentIds: opts.sellerAgentId ? [opts.sellerAgentId] : [],
+        metadata: { conversationId: id, type: "conversation_started", source },
+      });
+    }
 
     // Update seller metrics — only when there IS a seller agent row.
     if (opts.sellerAgentId) {
@@ -417,9 +425,13 @@ class ConversationService {
       db.prepare("UPDATE conversations SET updated_at = ? WHERE id = ?").run(now, opts.conversationId);
     }
 
-    // Emit for SSE
+    // Emit for SSE — RFB ONLY (see the matching gate + rationale in
+    // startConversation() above: interactionLogger's SSE feed and
+    // /api/interactions endpoints are RFB-public and not vertical-aware).
     const msg = this.getMessage(id)!;
-    interactionLogger.emit("message", msg);
+    if ((opts.verticalId || "rfb") === "rfb") {
+      interactionLogger.emit("message", msg);
+    }
 
     return msg;
   }
@@ -433,6 +445,11 @@ class ConversationService {
     const now = new Date().toISOString();
     const conv = this.getConversation(conversationId);
     if (!conv) throw new Error("Conversation not found");
+    // Transactions are an RFB-only marketplace concept (buyer/seller deal
+    // completion) and always have a real seller agent — the optional
+    // sellerAgentId on startConversation is for the seller-less vertical
+    // conversations (e.g. experiences) that never reach completeTransaction.
+    if (!conv.sellerAgentId) throw new Error("completeTransaction: conversation has no seller agent");
 
     db.prepare("UPDATE conversations SET status = 'completed', updated_at = ? WHERE id = ?").run(now, conversationId);
 

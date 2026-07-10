@@ -15533,6 +15533,7 @@ console.log("\n── opplevagent-conversation-logging: slices 1+2 ──");
   dbFactoryOcl.getDb("experiences");
   const expA2aOcl = require("../src/routes/experiences-a2a") as typeof import("../src/routes/experiences-a2a");
   const expMcpOcl = require("../src/routes/experiences-mcp") as typeof import("../src/routes/experiences-mcp");
+  const { interactionLogger: interactionLoggerOcl } = require("../src/services/interaction-logger") as typeof import("../src/services/interaction-logger");
 
   try {
     // ── conversation-service: vertical-filter default 'rfb' (slice 2) ──
@@ -15569,6 +15570,30 @@ console.log("\n── opplevagent-conversation-logging: slices 1+2 ──");
       (cdbOcl.prepare("SELECT vertical_id FROM messages WHERE conversation_id = ? LIMIT 1").get(expConv.id) as any).vertical_id,
       "experiences", "ocl-06: addMessage() called from within startConversation stamped the SAME vertical_id"
     );
+
+    // ── interactionLogger isolation (review finding): the singleton backs RFB's
+    // PUBLIC /api/live SSE feed + /api/interactions(/stats) endpoints (routes/a2a.ts)
+    // and has no vertical concept — experiences conversations must never reach it,
+    // while rfb conversations must still reach it exactly as before (regression pin).
+    const recentOcl = interactionLoggerOcl.getRecent(200);
+    assertTrue(recentOcl.some((e: any) => e.metadata?.conversationId === rfbConv.id),
+      "ocl-06b: RFB conversation still reaches interactionLogger.log (regression pin — public dashboard/API unaffected)");
+    assertTrue(!recentOcl.some((e: any) => e.metadata?.conversationId === expConv.id),
+      "ocl-06c: experiences conversation does NOT reach interactionLogger.log (no leak onto RFB's public feed/API)");
+    {
+      let sseFiredOcl = false;
+      const sseListenerOcl = () => { sseFiredOcl = true; };
+      interactionLoggerOcl.on("message", sseListenerOcl);
+      try {
+        _convSvc.addMessage({ conversationId: expConv.id, senderRole: "system", content: "ocl-no-leak-check", verticalId: "experiences" });
+        assertTrue(!sseFiredOcl, "ocl-06d: addMessage() on an experiences conversation does NOT emit onto interactionLogger's SSE stream");
+        sseFiredOcl = false;
+        _convSvc.addMessage({ conversationId: rfbConv.id, senderRole: "system", content: "ocl-rfb-still-emits" });
+        assertTrue(sseFiredOcl, "ocl-06e: addMessage() on an rfb conversation still emits onto interactionLogger's SSE stream (regression pin)");
+      } finally {
+        interactionLoggerOcl.removeListener("message", sseListenerOcl);
+      }
+    }
 
     // ── Probe-UA on an experiences conversation -> is_internal=1 (acceptance criterion) ──
     const expConvProbe = _convSvc.startConversation({
@@ -15634,7 +15659,7 @@ console.log("\n── opplevagent-conversation-logging: slices 1+2 ──");
     assertEq(expMcpOcl.detectExperiencesMcpClient({ headers: { "user-agent": "curl/8.4.0" } } as any),
       undefined, "ocl-22: detectExperiencesMcpClient returns undefined for an unrecognised UA");
 
-    console.log("  opplevagent-conversation-logging: OK (22 tests: vertical-stamp/no-fk-crash/null-seller/is_internal/message-vertical/probe-is_internal/list-isolation×4/stats-isolation×2/getConversation-isolation×3/a2a-wiring×2/fail-open×2/mcp-client-detect×2)");
+    console.log("  opplevagent-conversation-logging: OK (27 tests: vertical-stamp/no-fk-crash/null-seller/is_internal/message-vertical/interactionLogger-isolation×4/probe-is_internal/list-isolation×4/stats-isolation×2/getConversation-isolation×3/a2a-wiring×2/fail-open×2/mcp-client-detect×2)");
   } finally {
     __setDbForTesting(prevMainDbOcl);
     if (prevPathOcl === undefined) delete process.env.EXPERIENCES_DB_PATH;
