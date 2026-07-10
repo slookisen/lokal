@@ -1,0 +1,65 @@
+{
+  "manifest_version": "0.3",
+  "name": "opplevagent-mcp",
+  "display_name": "Opplevagent — Norske opplevelser og aktiviteter",
+  "version": "0.1.0",
+  "description": "MCP server for discovering Norwegian local experiences and activities via Opplevagent — search, info, categories.",
+  "long_description": "Opplevagent connects you to a curated, Brreg-verified marketplace of Norwegian experiences and activities. Search by county (fylke), category, weather, season, indoor/outdoor, group size, age, price, and duration. Every result includes location, description, and a booking URL where available.\n\nExamples:\n- \"hva kan vi finne på i Troms om vinteren?\"\n- \"utendørsaktiviteter i Oslo for 4 personer\"\n- \"opplevelser som passer i regnvær i Bergen\"\n- \"familievennlige aktiviteter under 500 kr\"",
+  "author": {
+    "name": "Daniel Fredriksen",
+    "email": "da.fredriksen@gmail.com",
+    "url": "https://github.com/slookisen"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/slookisen/lokal.git"
+  },
+  "homepage": "https://opplevagent.no",
+  "support": "https://github.com/slookisen/lokal/issues",
+  "_source_note": "opplevagent-mcp is published from the mcp-server-opplevagent/ subfolder of this same slookisen/lokal repo (see mcp-server-opplevagent/package.json and server.json), not from a separate slookisen/opplevagent-mcp repo. repository.url and support above were corrected to match the verified in-repo source rather than the initially assumed separate-repo URL.",
+  "server": {
+    "type": "node",
+    "entry_point": "index.js",
+    "mcp_config": {
+      "command": "node",
+      "args": ["${__dirname}/index.js"],
+      "env": {}
+    }
+  },
+  "tools": [
+    {
+      "name": "discover_experiences",
+      "description": "Search the opplevagent.no curated marketplace of Norwegian experiences by county (fylke), category, weather, season, indoor/outdoor, group size, age, price, and duration. Returns title, category, location, description, and booking URL."
+    },
+    {
+      "name": "list_experience_categories",
+      "description": "List all available experience categories on opplevagent.no along with the number of verified experiences in each category."
+    },
+    {
+      "name": "get_experience",
+      "description": "Fetch complete details for a single experience by its UUID — full description, location, indoor/outdoor, season, weather suitability, group size/age limits, price, duration, languages, and booking URL."
+    }
+  ],
+  "keywords": [
+    "opplevelser",
+    "experiences",
+    "norway",
+    "activities",
+    "a2a",
+    "opplevagent",
+    "norwegian-experiences",
+    "norway-activities",
+    "fylke",
+    "reise"
+  ],
+  "license": "MIT",
+  "privacy_policies": [
+    "https://opplevagent.no/personvern"
+  ],
+  "compatibility": {
+    "platforms": ["darwin", "win32", "linux"],
+    "runtimes": {
+      "node": ">=18.0.0"
+    }
+  }
+}
