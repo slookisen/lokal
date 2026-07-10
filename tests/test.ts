@@ -5,7 +5,7 @@
 
 import { redactPII, isValidFodselsnummer } from "../src/utils/pii-redact";
 import { computeLoopHealth } from "../src/services/loop-health";
-import { computeWakeList, resolveActiveWindowHour, resolveTickIntervalMin } from "../src/services/loop-dispatch";
+import { computeWakeList, fireTextFor, resolveActiveWindowHour, resolveTickIntervalMin } from "../src/services/loop-dispatch";
 import { normalizeTimestamp, normalizeEnvelopeTimes } from "../src/services/envelope-normalize";
 import { validateEnvelope } from "../src/routes/admin-runs";
 import conversationUiRouter, {
@@ -18649,6 +18649,39 @@ const _orchPr20260614_2Promise = (async () => {
     selfContinueCooldownMin: 0,
   });
   assertEq(p14.wake.length, 1, "dispatch: selfContinueCooldownMin=0 override -> fires immediately");
+
+  // Charter v2 (2026-07-10, dev-requests/2026-07-10-flaate-2-0-consolidation.md):
+  // rfb-supervisor is a 1x/day cron ops-run, no longer dispatcher-woken. A fresh
+  // suggestion targeting it must skip on ALLOWLIST (not cooldown), so suggesting
+  // agents need no envelope change.
+  const v2a = computeWakeList([mk("v2a", "platform-orchestrator", 2, ["rfb-supervisor"])], { nowMs: baseUTC });
+  assertEq(v2a.wake.length, 0, "dispatch: rfb-supervisor removed from allowlist -> no wake");
+  assertTrue(
+    v2a.skip.some((s) => s.agent === "rfb-supervisor" && /allowlist/.test(s.reason)),
+    "dispatch: rfb-supervisor skip reason is allowlist (not cooldown)",
+  );
+
+  // Per-agent fire-text (charter v2): the orchestrator is told to BUILD; the verifier
+  // is told to PROBE (and must NOT get the build directive that previously caused the
+  // supervisor's improvised verify-only cycles); the controller gets a scoped
+  // guardrail/error-budget pass; workers get the remediation-wake framing. All texts
+  // carry the suggesting run_id (reason) and the envelope-POST instruction.
+  const ftO = fireTextFor("platform-orchestrator", "run-x1");
+  assertTrue(/BUILDING dev-request/.test(ftO), "fireTextFor: orchestrator gets build-first directive");
+  assertTrue(/lease-claim/.test(ftO), "fireTextFor: orchestrator text includes the claim step");
+  const ftV = fireTextFor("platform-verifier", "run-x2");
+  assertTrue(/[Pp]robe/.test(ftV), "fireTextFor: verifier is told to probe deploy-claims");
+  assertTrue(!/BUILDING dev-request/.test(ftV), "fireTextFor: verifier does NOT get the build directive");
+  assertTrue(/rollback first/i.test(ftV), "fireTextFor: verifier text carries rollback-first authority");
+  const ftC = fireTextFor("orchestrator-v3-controller", "run-x3");
+  assertTrue(/error.budget/i.test(ftC), "fireTextFor: controller gets the error-budget pass");
+  const ftW = fireTextFor("rfb-customer-service", "run-x4");
+  assertTrue(/remediation wake/.test(ftW), "fireTextFor: workers get remediation-wake framing");
+  for (const [agent, t] of [["platform-orchestrator", ftO], ["platform-verifier", ftV], ["orchestrator-v3-controller", ftC], ["rfb-customer-service", ftW]] as const) {
+    assertTrue(t.includes("run-x"), `fireTextFor: ${agent} text carries the suggesting run_id`);
+    assertTrue(/POST your run-envelope/.test(t), `fireTextFor: ${agent} text keeps the envelope instruction`);
+    assertTrue(t.includes(`next_suggested=${agent}`), `fireTextFor: ${agent} text names the woken agent`);
+  }
 }
 
 // -- envelope timestamp normalization (pure) --

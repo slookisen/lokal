@@ -29,6 +29,7 @@ import { Router, Request, Response } from "express";
 import { listRecentRuns, recordRun } from "../services/run-ledger";
 import {
   computeWakeList,
+  fireTextFor,
   resolveActiveWindowHour,
   DEFAULT_ALLOWLIST,
   type DispatchPlan,
@@ -221,11 +222,8 @@ export async function runDispatchTick(mode: "shadow" | "active"): Promise<Dispat
       deferred.push({ agent: w.agent, reason: w.reason, why: "shadow mode" });
       continue;
     }
-    // Fire-text mirrors charter Rule 0 (bygg først) — dev-requests/2026-07-09-loop-
-    // dispatch-self-tick.md item 3: off-cycle wakes exist to CONTINUE BUILDING, not
-    // to re-run housekeeping; the old "Run your FULL normal cycle" wording contradicted
-    // build-first and burned each wake on reports.
-    const text = `Off-cycle wake by loop-dispatcher (${w.reason}; next_suggested=${w.agent}). Prioritize BUILDING dev-request slices first (charter Rule 0 — bygg først); housekeeping and full reports belong to the daily cycle only. Still POST your run-envelope to /admin/runs at the end so this wake is visible in the run-ledger. One-time run.`;
+    // Per-agent wake text — see fireTextFor() in services/loop-dispatch.ts (charter v2).
+    const text = fireTextFor(w.agent, w.reason);
     const r = await fireRoutine(ref, text);
     fired.push({ agent: w.agent, reason: w.reason, ...r });
 

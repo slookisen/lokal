@@ -41,6 +41,31 @@ export function resolveTickIntervalMin(raw: string | undefined): number {
   return Math.max(2, Math.min(120, n));
 }
 
+/**
+ * Per-agent wake text (charter v2 2026-07-10, A2A dev-requests/2026-07-10-flaate-2-0-
+ * consolidation.md): the previous one-size fire-text told EVERY woken agent to
+ * "prioritize BUILDING dev-request slices first" — correct for the orchestrator,
+ * nonsense for the verifier and controller, and the source of the supervisor's
+ * improvised "verify-only fallback" cycles. Each agent is woken to do ITS OWN job.
+ * Pure + exported so the texts are unit-testable.
+ */
+export function fireTextFor(agent: string, reason: string): string {
+  const head = `Off-cycle wake by loop-dispatcher (${reason}; next_suggested=${agent}).`;
+  const tail = `Still POST your run-envelope to /admin/runs at the end so this wake is visible in the run-ledger. One-time run.`;
+  switch (agent) {
+    case "platform-orchestrator":
+      return `${head} Prioritize BUILDING dev-request slices first (charter v2 Rule 0 — bygg først): pull the top unclaimed item, lease-claim it in the frontmatter, build. Housekeeping and full reports belong to the daily cycle only. ${tail}`;
+    case "platform-verifier":
+      return `${head} Probe the freshest pending deploy-claims against production (acceptance criteria live in the dev-request). On a failed probe: rollback first, investigate second (charter v2 §5). ${tail}`;
+    case "orchestrator-v3-controller":
+      return `${head} Run a scoped guardrail/error-budget pass over the suggesting run's outcome (controller/autonomy-policy.yaml error_budget) and handle any escalation it raised. Not a full daily cycle. ${tail}`;
+    default:
+      // Workers (rfb-customer-service, *-enrichment): remediation wake — continue the
+      // charter job the suggesting run handed over.
+      return `${head} Continue your own charter job that the suggesting run handed to you — this is a remediation wake, not a full scheduled cycle. ${tail}`;
+  }
+}
+
 /** Minimal shape we need from a run-ledger record. `RunRecord` satisfies it. */
 export interface DispatchRunLite {
   run_id: string;
@@ -99,7 +124,12 @@ export interface DispatchPlan {
 export const DEFAULT_ALLOWLIST: string[] = [
   "platform-orchestrator",
   "orchestrator-v3-controller",
-  "rfb-supervisor",
+  // "rfb-supervisor" removed 2026-07-10 (charter v2, Daniel GO — A2A
+  // dev-requests/2026-07-10-flaate-2-0-consolidation.md): the supervisor is a
+  // 1x/day cron ops-run now, not a dispatcher-woken layer (~50% of its dispatcher
+  // wakes were verify-only no-ops re-confirming what the merge gate + verifier
+  // already prove). A next_suggested=["rfb-supervisor"] now simply skips on
+  // allowlist — suggesting agents need no envelope change.
   "platform-verifier",
   "rfb-customer-service",
   "lokal-agent-enrichment",
