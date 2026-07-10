@@ -902,6 +902,7 @@ router.get("/sitemap.xml", (_req: Request, res: Response) => {
     { p: "/", freq: "daily", pri: "1.0" },
     { p: "/en", freq: "daily", pri: "0.9" },
     { p: "/opplevelser", freq: "daily", pri: "0.9" },
+    { p: "/guide-opplevelser-mcp", freq: "monthly", pri: "0.6" },
     { p: "/llms.txt", freq: "weekly", pri: "0.8" },
     { p: "/openapi.json", freq: "weekly", pri: "0.7" },
   ];
@@ -3636,6 +3637,257 @@ input:focus,textarea:focus{outline:none;border-color:#12a594;box-shadow:0 0 0 3p
   });
 })();
 </script>
+</body>
+</html>`);
+});
+
+// ═══════════════════════════════════════════════════════════
+// GET /guide-opplevelser-mcp — "Oppdag opplevelser via opplevagent-mcp"
+// usage guide (dev-request 2026-06-30-mcp-distribution-traffic-growth,
+// Track C: usage-content — autonomous, in-charter: improving discoverability
+// of the already-shipped opplevagent-mcp server, not a new feature/vertical).
+//
+// Static, hand-authored how-to page cross-referencing the REAL tools
+// registered in src/routes/experiences-mcp.ts (discover_experiences,
+// list_experience_categories, get_experience) — never invented names.
+// Unlike rettfrabonden.com's /teknologi, this vertical has no existing
+// MCP-setup page, so the connection steps live directly on this page.
+// Bilingual (req.lang), mirroring the "/" home route's lang convention.
+// ═══════════════════════════════════════════════════════════
+
+const GUIDE_MCP_CSS = `
+@import url('https://fonts.googleapis.com/css2?family=Outfit:wght@600;700&display=swap');
+*{margin:0;padding:0;box-sizing:border-box}
+body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;color:#18130d;background:#f7f4ee;line-height:1.65}
+a{color:#0c7264}
+a:hover{text-decoration:none}
+.gom-nav{background:rgba(244,248,244,.92);border-bottom:1px solid #dde8dd;padding:0 24px;height:60px;display:flex;align-items:center;gap:16px}
+.gom-nav .brand{font-family:'Outfit',sans-serif;font-weight:700;font-size:1.1rem;color:#0b2e29;text-decoration:none}
+.gom-hero{background:linear-gradient(135deg,#0b2e29 0%,#0e3c36 40%,#12a594 100%);color:#fff;padding:56px 24px 44px;text-align:center}
+.gom-hero h1{font-family:'Outfit',sans-serif;font-size:2.1rem;font-weight:700;letter-spacing:-.02em;margin-bottom:14px}
+.gom-hero p{font-size:1.05rem;max-width:620px;margin:0 auto;color:rgba(255,255,255,.9)}
+.gom-sec{max-width:760px;margin:0 auto;padding:40px 24px}
+.gom-sec h2{font-family:'Outfit',sans-serif;font-size:1.35rem;font-weight:700;color:#0b2e29;margin-bottom:12px}
+.gom-sec p{font-size:.98rem;color:#3a4a3f;margin-bottom:14px}
+.gom-group{font-size:.74rem;font-weight:700;text-transform:uppercase;letter-spacing:.05em;color:#0c7264;margin:20px 0 8px}
+.gom-tools{display:grid;gap:12px;margin:6px 0 18px}
+.gom-tool{background:#fff;border:1px solid #e4ded0;border-radius:14px;padding:16px 20px}
+.gom-tool code{background:#eef3ee;padding:2px 8px;border-radius:5px;font-family:ui-monospace,"SFMono-Regular",Menlo,Consolas,monospace;font-size:.85rem;color:#0c7264;font-weight:700}
+.gom-tool p{margin:8px 0 0;font-size:.9rem;color:#3a4a3f}
+.gom-examples{background:#fff;border:1px solid #e4ded0;border-radius:14px;padding:18px 22px;margin:6px 0 18px}
+.gom-examples li{font-size:.93rem;color:#3a4a3f;margin-bottom:8px;font-style:italic}
+.gom-setup{background:#fff;border:1px solid #e4ded0;border-radius:14px;padding:20px 22px;margin:14px 0}
+.gom-setup h3{font-size:1.02rem;font-weight:700;color:#0b2e29;margin-bottom:10px}
+.gom-code{background:#0b2e29;color:#e2e8f0;border-radius:10px;padding:14px 18px;font-family:ui-monospace,"SFMono-Regular",Menlo,Consolas,monospace;font-size:.8rem;line-height:1.6;overflow-x:auto;margin:8px 0}
+.gom-cta{display:inline-flex;align-items:center;gap:8px;padding:10px 20px;background:#0b2e29;color:#fff!important;border-radius:10px;font-weight:700;font-size:.9rem;text-decoration:none}
+.gom-faq-item{margin-bottom:16px}
+.gom-faq-item h3{font-size:.98rem;font-weight:700;color:#0b2e29;margin-bottom:5px}
+.gom-faq-item p{font-size:.9rem;color:#3a4a3f;margin:0}
+.gom-footer{max-width:760px;margin:0 auto;padding:24px 24px 48px;font-size:.82rem;color:#7a7163}
+@media (max-width:600px){.gom-hero h1{font-size:1.6rem}}
+`;
+
+// Static FAQ content for /guide-opplevelser-mcp. Curated editorial copy
+// (not derived from a possibly-thin DB row), so unlike
+// buildCategoryFaqJsonLd/buildKommuneFaqJsonLd there is no 2-real-facts
+// quality gate — the page always emits its FAQPage block. Exported for tests.
+export function buildOpplevagentMcpGuideFaqJsonLd(lang: Lang, url: string): any {
+  const en = lang === "en";
+  const qas: Array<{ q: string; a: string }> = en ? [
+    {
+      q: "Which AI assistants work with opplevagent-mcp?",
+      a: "Any MCP-compatible assistant — Claude Desktop, ChatGPT (Developer Mode / custom connectors), Cursor, and other MCP clients. Connect via the remote endpoint https://opplevagent.no/mcp or the opplevagent-mcp npm package.",
+    },
+    {
+      q: "What tools does the opplevagent MCP server expose?",
+      a: "discover_experiences filters by county (fylke), municipality (kommune), category, weather, season, indoor/outdoor, group size, age, price, and duration; list_experience_categories lists every category with a live count; get_experience fetches full details for one experience by its UUID.",
+    },
+    {
+      q: "Does using the MCP server cost anything?",
+      a: "No — the server is free and open source, and every experience returned is Brreg-verified against the Norwegian business registry.",
+    },
+    {
+      q: "Can I book an experience directly through my AI assistant?",
+      a: "The assistant surfaces a booking_url (and booking_type) per experience from discover_experiences/get_experience; booking itself happens on the provider's own site or via that link, not inside the MCP conversation.",
+    },
+    {
+      q: "How do I set up opplevagent-mcp in Claude Desktop or ChatGPT?",
+      a: "See the setup steps further up this page — paste https://opplevagent.no/mcp as a remote connector, or add the opplevagent-mcp npm package to your MCP client config.",
+    },
+  ] : [
+    {
+      q: "Hvilke AI-assistenter fungerer med opplevagent-mcp?",
+      a: "Alle MCP-kompatible assistenter — Claude Desktop, ChatGPT (Developer Mode / egendefinerte koblinger), Cursor og andre MCP-klienter. Koble til via det eksterne endepunktet https://opplevagent.no/mcp eller npm-pakken opplevagent-mcp.",
+    },
+    {
+      q: "Hvilke verktøy har opplevagent MCP-serveren?",
+      a: "discover_experiences filtrerer på fylke, kommune, kategori, vær, sesong, innendørs/utendørs, gruppestørrelse, alder, pris og varighet; list_experience_categories lister alle kategorier med et levende antall; get_experience henter fullstendige detaljer for én opplevelse via UUID.",
+    },
+    {
+      q: "Koster det noe å bruke MCP-serveren?",
+      a: "Nei — serveren er gratis og åpen kildekode, og hver opplevelse som returneres er Brreg-verifisert mot Brønnøysundregistrene.",
+    },
+    {
+      q: "Kan jeg booke en opplevelse direkte gjennom AI-assistenten?",
+      a: "Assistenten viser en booking_url (og booking_type) per opplevelse fra discover_experiences/get_experience; selve bookingen skjer hos tilbyderens egen side eller via den lenken, ikke inne i MCP-samtalen.",
+    },
+    {
+      q: "Hvordan setter jeg opp opplevagent-mcp i Claude Desktop eller ChatGPT?",
+      a: "Se oppsettsstegene lenger opp på denne siden — lim inn https://opplevagent.no/mcp som en ekstern kobling, eller legg npm-pakken opplevagent-mcp til MCP-klientens konfigurasjon.",
+    },
+  ];
+
+  return {
+    "@context": "https://schema.org",
+    "@type": "FAQPage",
+    "@id": `${url}#faq`,
+    "mainEntity": qas.map(({ q, a }) => ({
+      "@type": "Question",
+      "name": q,
+      "acceptedAnswer": { "@type": "Answer", "text": a },
+    })),
+  };
+}
+
+router.get("/guide-opplevelser-mcp", (req: Request, res: Response) => {
+  const url = baseUrl();
+  const lang: Lang = req.lang === "en" ? "en" : "no";
+  const en = lang === "en";
+  const canonical = en ? `${url}/en/guide-opplevelser-mcp` : `${url}/guide-opplevelser-mcp`;
+  const faqJsonLd = buildOpplevagentMcpGuideFaqJsonLd(lang, canonical);
+  const faqHtml = faqJsonLd.mainEntity.map((qa: any) =>
+    `<div class="gom-faq-item"><h3>${escapeHtml(qa.name)}</h3><p>${escapeHtml(qa.acceptedAnswer.text)}</p></div>`
+  ).join("");
+
+  const content = en ? `
+  <section class="gom-hero">
+    <h1>Discover Norwegian experiences via opplevagent-mcp</h1>
+    <p>Ask Claude, ChatGPT, or any other MCP-compatible AI assistant to search Opplevagent's curated, Brreg-verified catalog of Norwegian experiences and activities.</p>
+  </section>
+  <section class="gom-sec">
+    <h2>What is this?</h2>
+    <p>Opplevagent runs a remote MCP (Model Context Protocol) server at <code>https://opplevagent.no/mcp</code>. Once your AI assistant is connected, it can search, filter, and read our verified experience catalog directly — the same data behind <a href="/opplevelser">the browse pages</a>, but callable as tools inside a conversation.</p>
+
+    <h2>The tools, exactly as registered</h2>
+    <div class="gom-tools">
+      <div class="gom-tool"><code>discover_experiences</code><p>Search by county (fylke), municipality (kommune), category, weather, season, indoor/outdoor, group size, age, max price, and duration. Returns title, category, location, description, and booking URL.</p></div>
+      <div class="gom-tool"><code>list_experience_categories</code><p>Lists every experience category with a live count of verified experiences — useful before calling discover_experiences with a specific category filter.</p></div>
+      <div class="gom-tool"><code>get_experience</code><p>Fetches full details for one experience by its UUID — description, group/age limits, price, duration, languages, and booking info. Obtain the UUID from discover_experiences results.</p></div>
+    </div>
+
+    <h2>Try asking your assistant</h2>
+    <div class="gom-examples"><ul>
+      <li>"What can we do in Troms in winter?"</li>
+      <li>"Outdoor activities in Oslo for 4 people"</li>
+      <li>"Experiences that work well in the rain in Bergen"</li>
+      <li>"Whale safari Tromsø"</li>
+      <li>"Family-friendly activities under 500 kr"</li>
+      <li>"What categories of experiences exist in Norway?"</li>
+    </ul></div>
+
+    <h2>Get started</h2>
+    <div class="gom-setup">
+      <h3>ChatGPT / other remote MCP clients (easiest)</h3>
+      <p>Open the tools menu, choose "Add an MCP Server", and paste: <code>https://opplevagent.no/mcp</code></p>
+    </div>
+    <div class="gom-setup">
+      <h3>Claude Desktop</h3>
+      <p><strong>Remote (recommended):</strong> Settings → Integrations → Add custom connector → paste <code>https://opplevagent.no/mcp</code>.</p>
+      <p><strong>Local npm package</strong> (developers, Claude Code):</p>
+      <div class="gom-code">{<br>&nbsp;&nbsp;"mcpServers": {<br>&nbsp;&nbsp;&nbsp;&nbsp;"opplevagent": {<br>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;"command": "npx",<br>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;"args": ["opplevagent-mcp"]<br>&nbsp;&nbsp;&nbsp;&nbsp;}<br>&nbsp;&nbsp;}<br>}</div>
+      <p>Or run directly: <code>npx opplevagent-mcp</code></p>
+    </div>
+    <p>Source and README: <a href="https://github.com/slookisen/lokal/tree/main/mcp-server-opplevagent">opplevagent-mcp on GitHub</a>. More AI-discovery details: <a href="/llms.txt">llms.txt</a>.</p>
+    <p><a class="gom-cta" href="https://opplevagent.no/mcp">Connect https://opplevagent.no/mcp →</a></p>
+  </section>
+  <section class="gom-sec">
+    <h2>Frequently asked questions</h2>
+    ${faqHtml}
+  </section>
+  <footer class="gom-footer"><a href="/">opplevagent.no</a> · <a href="/opplevelser">Alle opplevelser</a> · <a href="/llms.txt">llms.txt</a> · <a href="/.well-known/agent-card.json">Agent Card</a></footer>` : `
+  <section class="gom-hero">
+    <h1>Oppdag norske opplevelser via opplevagent-mcp</h1>
+    <p>Be Claude, ChatGPT eller en annen MCP-kompatibel AI-assistent om å søke i Opplevagents kuraterte, Brreg-verifiserte katalog over norske opplevelser og aktiviteter.</p>
+  </section>
+  <section class="gom-sec">
+    <h2>Hva er dette?</h2>
+    <p>Opplevagent kjører en ekstern MCP (Model Context Protocol)-server på <code>https://opplevagent.no/mcp</code>. Når AI-assistenten din er koblet til, kan den søke, filtrere og lese vårt verifiserte opplevelsesregister direkte — samme data som driver <a href="/opplevelser">nettleser-sidene</a>, men tilgjengelig som verktøy i en samtale.</p>
+
+    <h2>Verktøyene, slik de faktisk er registrert</h2>
+    <div class="gom-tools">
+      <div class="gom-tool"><code>discover_experiences</code><p>Søk på fylke, kommune, kategori, vær, sesong, innendørs/utendørs, gruppestørrelse, alder, maks pris og varighet. Returnerer tittel, kategori, sted, beskrivelse og bookinglenke.</p></div>
+      <div class="gom-tool"><code>list_experience_categories</code><p>Lister alle kategorier med et levende antall verifiserte opplevelser — nyttig før du kaller discover_experiences med et spesifikt kategorifilter.</p></div>
+      <div class="gom-tool"><code>get_experience</code><p>Henter fullstendige detaljer for én opplevelse via UUID — beskrivelse, gruppe-/aldersgrenser, pris, varighet, språk og bookinginfo. Hent UUID-en fra resultater fra discover_experiences.</p></div>
+    </div>
+
+    <h2>Prøv å spørre assistenten din</h2>
+    <div class="gom-examples"><ul>
+      <li>«Hva kan vi finne på i Troms om vinteren?»</li>
+      <li>«Utendørsaktiviteter i Oslo for 4 personer»</li>
+      <li>«Opplevelser som passer i regnvær i Bergen»</li>
+      <li>«Hvalsafari Tromsø»</li>
+      <li>«Familievennlige aktiviteter under 500 kr»</li>
+      <li>«Hvilke typer opplevelser finnes i Norge?»</li>
+    </ul></div>
+
+    <h2>Kom i gang</h2>
+    <div class="gom-setup">
+      <h3>ChatGPT / andre eksterne MCP-klienter (enklest)</h3>
+      <p>Åpne verktøy-menyen, velg «Add an MCP Server», og lim inn: <code>https://opplevagent.no/mcp</code></p>
+    </div>
+    <div class="gom-setup">
+      <h3>Claude Desktop</h3>
+      <p><strong>Ekstern (anbefalt):</strong> Settings → Integrations → Add custom connector → lim inn <code>https://opplevagent.no/mcp</code>.</p>
+      <p><strong>Lokal npm-pakke</strong> (utviklere, Claude Code):</p>
+      <div class="gom-code">{<br>&nbsp;&nbsp;"mcpServers": {<br>&nbsp;&nbsp;&nbsp;&nbsp;"opplevagent": {<br>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;"command": "npx",<br>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;"args": ["opplevagent-mcp"]<br>&nbsp;&nbsp;&nbsp;&nbsp;}<br>&nbsp;&nbsp;}<br>}</div>
+      <p>Eller kjør direkte: <code>npx opplevagent-mcp</code></p>
+    </div>
+    <p>Kildekode og README: <a href="https://github.com/slookisen/lokal/tree/main/mcp-server-opplevagent">opplevagent-mcp på GitHub</a>. Flere AI-discovery-detaljer: <a href="/llms.txt">llms.txt</a>.</p>
+    <p><a class="gom-cta" href="https://opplevagent.no/mcp">Koble til https://opplevagent.no/mcp →</a></p>
+  </section>
+  <section class="gom-sec">
+    <h2>Ofte stilte spørsmål</h2>
+    ${faqHtml}
+  </section>
+  <footer class="gom-footer"><a href="/">opplevagent.no</a> · <a href="/opplevelser">Alle opplevelser</a> · <a href="/llms.txt">llms.txt</a> · <a href="/.well-known/agent-card.json">Agent Card</a></footer>`;
+
+  const title = en
+    ? "Discover experiences via opplevagent-mcp | Opplevagent"
+    : "Oppdag opplevelser via opplevagent-mcp | Opplevagent";
+  const description = en
+    ? "How to use Claude, ChatGPT, and other AI assistants with the opplevagent MCP server to find Norwegian experiences — every tool explained."
+    : "Slik bruker du Claude, ChatGPT og andre AI-assistenter med opplevagent MCP-serveren for å finne norske opplevelser — alle verktøyene forklart.";
+  const jsonLdScripts = [faqJsonLd]
+    .map((o) => `<script type="application/ld+json">${JSON.stringify(o).replace(/<\//g, "<\\/")}</script>`)
+    .join("\n");
+
+  res.setHeader("Content-Type", "text/html; charset=utf-8");
+  res.setHeader("Cache-Control", "public, max-age=3600");
+  res.send(`<!doctype html>
+<html lang="${htmlLangAttr(lang)}">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>${escapeHtml(title)}</title>
+<meta name="description" content="${escapeHtml(description)}">
+<meta name="robots" content="index, follow, max-snippet:-1, max-image-preview:large">
+<link rel="canonical" href="${canonical}">
+<link rel="alternate" hreflang="nb" href="${url}/guide-opplevelser-mcp">
+<link rel="alternate" hreflang="en" href="${url}/en/guide-opplevelser-mcp">
+<link rel="alternate" hreflang="x-default" href="${url}/guide-opplevelser-mcp">
+<link rel="icon" type="image/svg+xml" href="/favicon.svg">
+<meta property="og:title" content="${escapeHtml(title)}">
+<meta property="og:description" content="${escapeHtml(description)}">
+<meta property="og:type" content="website">
+<meta property="og:url" content="${canonical}">
+<meta property="og:locale" content="${ogLocale(lang)}">
+<meta property="og:site_name" content="Opplevagent">
+${jsonLdScripts}
+<style>${GUIDE_MCP_CSS}</style>
+</head>
+<body>
+<nav class="gom-nav"><a class="brand" href="/">opplevagent.no</a></nav>
+${content}
 </body>
 </html>`);
 });

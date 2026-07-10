@@ -1746,6 +1746,245 @@ router.get("/teknologi", (req: Request, res: Response) => {
 
 
 // ═══════════════════════════════════════════════════════════════
+// GET /guide-mat-ai — "Finn norsk lokalmat via AI/MCP" usage guide
+// (dev-request 2026-06-30-mcp-distribution-traffic-growth, Track C:
+// usage-content — autonomous, in-charter: improving discoverability of the
+// already-shipped `lokal` MCP server, not a new feature/vertical.)
+//
+// Static, hand-authored how-to page cross-referencing the REAL lokal_*
+// tools registered in src/routes/mcp.ts — never invented names. Cross-links
+// to /teknologi#mcp-oppsett for the ChatGPT/Claude Desktop setup steps
+// rather than repeating them here (that page already owns setup).
+// ═══════════════════════════════════════════════════════════════
+
+const GUIDE_MAT_AI_CSS = `
+  .gma-hero { background: linear-gradient(135deg, #f0f7ed 0%, #e8f5e0 100%); padding: 64px 24px 48px; text-align: center; }
+  .gma-hero h1 { font-size: 2.3rem; font-weight: 800; color: var(--charcoal); letter-spacing: -1.1px; margin-bottom: 16px; }
+  .gma-hero p { font-size: 1.1rem; color: var(--g500); max-width: 640px; margin: 0 auto; line-height: 1.7; }
+  .gma-sec { max-width: 780px; margin: 0 auto; padding: 44px 24px; }
+  .gma-sec h2 { font-size: 1.4rem; font-weight: 800; color: var(--charcoal); margin-bottom: 14px; }
+  .gma-sec p { font-size: 1rem; color: var(--g700); line-height: 1.75; margin-bottom: 14px; }
+  .gma-group-label { font-size: 0.75rem; font-weight: 700; text-transform: uppercase; letter-spacing: 0.6px; color: var(--green-700); margin: 24px 0 8px; }
+  .gma-tools { display: grid; gap: 12px; margin: 8px 0 20px; }
+  .gma-tool { background: var(--white); border: 1px solid var(--g100); border-radius: var(--r-lg); padding: 16px 20px; }
+  .gma-tool code { background: #f1f5f9; padding: 2px 8px; border-radius: 4px; font-family: "SF Mono", "Fira Code", monospace; font-size: 0.86rem; color: var(--green-700); font-weight: 700; }
+  .gma-tool p { margin: 8px 0 0; font-size: 0.9rem; color: var(--g700); }
+  .gma-examples { background: #f8fafc; border-radius: var(--r-lg); padding: 20px 24px; margin: 8px 0 20px; }
+  .gma-examples li { font-size: 0.94rem; color: var(--g700); margin-bottom: 8px; font-style: italic; }
+  .gma-cta { display: inline-flex; align-items: center; gap: 8px; padding: 10px 20px; background: var(--green-700); color: var(--white); border-radius: 10px; font-weight: 600; font-size: 0.9rem; }
+  .gma-faq-item { margin-bottom: 18px; }
+  .gma-faq-item h3 { font-size: 1rem; font-weight: 700; color: var(--charcoal); margin-bottom: 6px; }
+  .gma-faq-item p { font-size: 0.92rem; color: var(--g700); margin: 0; }
+  @media (max-width: 768px) { .gma-hero h1 { font-size: 1.7rem; } }
+`;
+
+// Static FAQ content for /guide-mat-ai. Unlike buildProducerFaqJsonLd this
+// content is fixed/curated editorial copy, not derived from a possibly-thin
+// DB row, so there is no 2-real-facts quality gate here — the page always
+// emits its FAQPage block. Exported for tests.
+export function buildMcpGuideFaqJsonLd(lang: Lang, url: string): any {
+  const en = lang === "en";
+  const qas: Array<{ q: string; a: string }> = en ? [
+    {
+      q: "Which AI assistants can I use to find local food producers?",
+      a: "Any assistant that supports the Model Context Protocol (MCP) can connect — including Claude Desktop, ChatGPT (Developer Mode / custom connectors), Cursor, and other MCP clients. Connect via https://rettfrabonden.com/mcp or the lokal-mcp npm package.",
+    },
+    {
+      q: "What tools does the lokal MCP server expose?",
+      a: "lokal_search and lokal_discover find producers by name, product, or location; lokal_info returns a producer's full price list and contact details; lokal_geocode resolves Norwegian place names to coordinates; lokal_list_umbrellas, lokal_get_umbrella_members, and lokal_get_producer_affiliations cover markets (Bondens marked, REKO) and certifications (Debio); lokal_bm_next_markets lists upcoming market days; and a cart flow (lokal_cart_create, lokal_cart_add_item, lokal_cart_view, lokal_cart_submit, lokal_order_status) lets a pickup order be placed directly from the conversation.",
+    },
+    {
+      q: "Does it cost anything to use the MCP server?",
+      a: "No — the MCP server is free and open source. There is no subscription and no per-query fee for AI assistants or their users.",
+    },
+    {
+      q: "Can I order food directly through my AI assistant?",
+      a: "Yes — the cart tools let you build a shopping list and submit a pickup order per producer. There is no payment inside the AI flow; you pay the producer directly on pickup.",
+    },
+    {
+      q: "How do I set up MCP in Claude Desktop or ChatGPT?",
+      a: "See the full setup guide at rettfrabonden.com/teknologi#mcp-oppsett for step-by-step instructions for ChatGPT, Claude Desktop, and other MCP clients.",
+    },
+  ] : [
+    {
+      q: "Hvilke AI-assistenter kan jeg bruke for å finne lokale matprodusenter?",
+      a: "Alle assistenter som støtter Model Context Protocol (MCP) kan kobles til — inkludert Claude Desktop, ChatGPT (Developer Mode / egendefinerte koblinger), Cursor og andre MCP-klienter. Koble til via https://rettfrabonden.com/mcp eller npm-pakken lokal-mcp.",
+    },
+    {
+      q: "Hvilke verktøy har lokal MCP-serveren?",
+      a: "lokal_search og lokal_discover finner produsenter etter navn, produkt eller sted; lokal_info returnerer full prisliste og kontaktinfo for én produsent; lokal_geocode slår opp norske stedsnavn som koordinater; lokal_list_umbrellas, lokal_get_umbrella_members og lokal_get_producer_affiliations dekker markeder (Bondens marked, REKO) og sertifiseringer (Debio); lokal_bm_next_markets lister kommende markedsdager; og en handlekurv-flyt (lokal_cart_create, lokal_cart_add_item, lokal_cart_view, lokal_cart_submit, lokal_order_status) lar deg legge inn en henteordre direkte fra samtalen.",
+    },
+    {
+      q: "Koster det noe å bruke MCP-serveren?",
+      a: "Nei — MCP-serveren er gratis og åpen kildekode. Det er verken abonnement eller kostnad per forespørsel for AI-assistenter eller brukerne deres.",
+    },
+    {
+      q: "Kan jeg bestille mat direkte gjennom AI-assistenten?",
+      a: "Ja — handlekurv-verktøyene lar deg bygge en handleliste og sende en henteordre per produsent. Det er ingen betaling i AI-flyten — du betaler produsenten direkte ved henting.",
+    },
+    {
+      q: "Hvordan setter jeg opp MCP i Claude Desktop eller ChatGPT?",
+      a: "Se den fullstendige oppsettsguiden på rettfrabonden.com/teknologi#mcp-oppsett for steg-for-steg-instruksjoner for ChatGPT, Claude Desktop og andre MCP-klienter.",
+    },
+  ];
+
+  return {
+    "@context": "https://schema.org",
+    "@type": "FAQPage",
+    "@id": `${url}#faq`,
+    "mainEntity": qas.map(({ q, a }) => ({
+      "@type": "Question",
+      "name": q,
+      "acceptedAnswer": { "@type": "Answer", "text": a },
+    })),
+  };
+}
+
+router.get("/guide-mat-ai", (req: Request, res: Response) => {
+  const lang = req.lang;
+  const en = lang === "en";
+  const canonical = `${BASE_URL}${localizedPath("/guide-mat-ai", lang)}`;
+  const teknologiHref = localizedPath("/teknologi", lang);
+  const sokHref = localizedPath("/sok", lang);
+
+  const content = en ? `
+  <section class="gma-hero">
+    <h1>Find Norwegian local food via AI/MCP</h1>
+    <p>Ask Claude, ChatGPT, or any other MCP-compatible AI assistant to search Rett fra Bonden's registry of Norwegian local food producers — no browser tab needed.</p>
+  </section>
+
+  <section class="gma-sec">
+    <h2>What is this?</h2>
+    <p>Rett fra Bonden runs a remote <a href="${teknologiHref}">MCP (Model Context Protocol)</a> server at <code>https://rettfrabonden.com/mcp</code>. Once connected, your AI assistant can search, filter, and read our verified producer catalog directly — the same data that powers <a href="${sokHref}">the search page</a>, but callable as tools inside a conversation.</p>
+    <p>This guide lists the exact tools the server exposes and how to phrase requests to your assistant. For the connection steps themselves (ChatGPT, Claude Desktop, or the <code>lokal-mcp</code> npm package), see <a href="${teknologiHref}#mcp-oppsett">the setup guide on /teknologi</a>.</p>
+
+    <h2>The tools, exactly as registered</h2>
+    <p class="gma-group-label">Search &amp; discovery</p>
+    <div class="gma-tools">
+      <div class="gma-tool"><code>lokal_search</code><p>Natural-language search by producer name, product, or location (e.g. "organic honey Trondheim"). Returns contact info and the full priced product list for specific matches.</p></div>
+      <div class="gma-tool"><code>lokal_discover</code><p>Structured search filtered by category, tags, and geographic distance.</p></div>
+      <div class="gma-tool"><code>lokal_geocode</code><p>Resolves a Norwegian place name (city, kommune, fylke) to lat/lng coordinates for use with <code>lokal_discover</code>'s distance filter.</p></div>
+      <div class="gma-tool"><code>lokal_stats</code><p>Platform statistics — total producers and cities covered.</p></div>
+    </div>
+    <p class="gma-group-label">Producer detail</p>
+    <div class="gma-tools">
+      <div class="gma-tool"><code>lokal_info</code><p>A single producer's complete product catalog with prices, contact details, opening hours, and delivery options.</p></div>
+    </div>
+    <p class="gma-group-label">Markets, venues &amp; certifications</p>
+    <div class="gma-tools">
+      <div class="gma-tool"><code>lokal_list_umbrellas</code><p>All umbrella organizations — market networks (Bondens marked, REKO), venues (Mathallen), industry orgs (Hanen), and certifiers (Debio).</p></div>
+      <div class="gma-tool"><code>lokal_get_umbrella_members</code><p>Producers that belong to a given umbrella — e.g. every Debio-certified producer, or everyone selling at a named market.</p></div>
+      <div class="gma-tool"><code>lokal_get_producer_affiliations</code><p>Which umbrellas a specific producer belongs to (which markets they sell at, which certifications they hold).</p></div>
+      <div class="gma-tool"><code>lokal_bm_next_markets</code><p>Upcoming Bondens marked market days for a region or venue, refreshed daily.</p></div>
+    </div>
+    <p class="gma-group-label">Shopping cart (pickup, no online payment)</p>
+    <div class="gma-tools">
+      <div class="gma-tool"><code>lokal_cart_create</code> · <code>lokal_cart_add_item</code> · <code>lokal_cart_view</code> · <code>lokal_cart_submit</code> · <code>lokal_order_status</code><p>Build a shopping list from priced products, submit it as a pickup order per producer, and check order status. No payment happens in the AI flow — you pay the producer directly on pickup.</p></div>
+    </div>
+
+    <h2>Try asking your assistant</h2>
+    <div class="gma-examples">
+      <ul>
+        <li>"Find organic vegetables near Bergen"</li>
+        <li>"What does Bjørndal Gård sell, and how much does it cost?"</li>
+        <li>"Which farmers sell at Bondens marked in Oslo, and when is the next market day?"</li>
+        <li>"Show me all Debio-certified producers near Trondheim"</li>
+        <li>"Add two jars of honey from that producer to my cart"</li>
+      </ul>
+    </div>
+
+    <h2>Get started</h2>
+    <p>Full connection steps for ChatGPT, Claude Desktop, and other MCP clients live on our technology page — we keep setup instructions in one place so they stay current.</p>
+    <p><a class="gma-cta" href="${teknologiHref}#mcp-oppsett">Set up MCP on /teknologi →</a></p>
+  </section>
+
+  <section class="gma-sec">
+    <h2>Frequently asked questions</h2>
+    <div class="gma-faq">
+      ${buildMcpGuideFaqJsonLd(lang, canonical).mainEntity.map((qa: any) =>
+        `<div class="gma-faq-item"><h3>${escapeHtml(qa.name)}</h3><p>${escapeHtml(qa.acceptedAnswer.text)}</p></div>`
+      ).join("")}
+    </div>
+  </section>` : `
+  <section class="gma-hero">
+    <h1>Finn norsk lokalmat via AI/MCP</h1>
+    <p>Be Claude, ChatGPT, eller en annen MCP-kompatibel AI-assistent om å søke i Rett fra Bondens register over norske matprodusenter — uten å åpne en nettleser.</p>
+  </section>
+
+  <section class="gma-sec">
+    <h2>Hva er dette?</h2>
+    <p>Rett fra Bonden kjører en ekstern <a href="${teknologiHref}">MCP (Model Context Protocol)</a>-server på <code>https://rettfrabonden.com/mcp</code>. Når AI-assistenten din er koblet til, kan den søke, filtrere og lese vårt verifiserte produsentregister direkte — samme data som driver <a href="${sokHref}">søkesiden</a>, men tilgjengelig som verktøy i en samtale.</p>
+    <p>Denne guiden lister verktøyene serveren eksponerer, og hvordan du kan formulere forespørsler til assistenten din. For selve tilkoblingsstegene (ChatGPT, Claude Desktop, eller npm-pakken <code>lokal-mcp</code>), se <a href="${teknologiHref}#mcp-oppsett">oppsettsguiden på /teknologi</a>.</p>
+
+    <h2>Verktøyene, slik de faktisk er registrert</h2>
+    <p class="gma-group-label">Søk og oppdagelse</p>
+    <div class="gma-tools">
+      <div class="gma-tool"><code>lokal_search</code><p>Naturlig-språk-søk etter produsentnavn, produkt eller sted (f.eks. «økologisk honning Trondheim»). Returnerer kontaktinfo og full priset produktliste for spesifikke treff.</p></div>
+      <div class="gma-tool"><code>lokal_discover</code><p>Strukturert søk filtrert på kategori, tags og geografisk avstand.</p></div>
+      <div class="gma-tool"><code>lokal_geocode</code><p>Slår opp et norsk stedsnavn (by, kommune, fylke) som lat/lng-koordinater for bruk med avstandsfilteret i <code>lokal_discover</code>.</p></div>
+      <div class="gma-tool"><code>lokal_stats</code><p>Plattformstatistikk — totalt antall produsenter og byer dekket.</p></div>
+    </div>
+    <p class="gma-group-label">Produsentdetaljer</p>
+    <div class="gma-tools">
+      <div class="gma-tool"><code>lokal_info</code><p>Én produsents komplette produktkatalog med priser, kontaktdetaljer, åpningstider og leveringsalternativer.</p></div>
+    </div>
+    <p class="gma-group-label">Markeder, salgssteder og sertifiseringer</p>
+    <div class="gma-tools">
+      <div class="gma-tool"><code>lokal_list_umbrellas</code><p>Alle paraplyorganisasjoner — marked-nettverk (Bondens marked, REKO), salgssteder (Mathallen), bransjeorganisasjoner (Hanen) og sertifiserere (Debio).</p></div>
+      <div class="gma-tool"><code>lokal_get_umbrella_members</code><p>Produsenter som tilhører en gitt paraply — f.eks. alle Debio-sertifiserte produsenter, eller alle som selger på et navngitt marked.</p></div>
+      <div class="gma-tool"><code>lokal_get_producer_affiliations</code><p>Hvilke paraplyer en spesifikk produsent tilhører (hvilke markeder de selger på, hvilke sertifiseringer de har).</p></div>
+      <div class="gma-tool"><code>lokal_bm_next_markets</code><p>Kommende Bondens marked-dager for en region eller et salgssted, oppdatert daglig.</p></div>
+    </div>
+    <p class="gma-group-label">Handlekurv (henting, ingen nettbetaling)</p>
+    <div class="gma-tools">
+      <div class="gma-tool"><code>lokal_cart_create</code> · <code>lokal_cart_add_item</code> · <code>lokal_cart_view</code> · <code>lokal_cart_submit</code> · <code>lokal_order_status</code><p>Bygg en handleliste fra prisede produkter, send den som en henteordre per produsent, og sjekk ordrestatus. Det skjer ingen betaling i AI-flyten — du betaler produsenten direkte ved henting.</p></div>
+    </div>
+
+    <h2>Prøv å spørre assistenten din</h2>
+    <div class="gma-examples">
+      <ul>
+        <li>«Finn økologiske grønnsaker nær Bergen»</li>
+        <li>«Hva selger Bjørndal Gård, og hva koster det?»</li>
+        <li>«Hvilke bønder selger på Bondens marked i Oslo, og når er neste markedsdag?»</li>
+        <li>«Vis meg alle Debio-sertifiserte produsenter nær Trondheim»</li>
+        <li>«Legg to glass honning fra den produsenten i handlekurven min»</li>
+      </ul>
+    </div>
+
+    <h2>Kom i gang</h2>
+    <p>Fullstendige tilkoblingssteg for ChatGPT, Claude Desktop og andre MCP-klienter finner du på teknologisiden vår — vi holder oppsettsinstruksjonene ett sted slik at de alltid er oppdaterte.</p>
+    <p><a class="gma-cta" href="${teknologiHref}#mcp-oppsett">Sett opp MCP på /teknologi →</a></p>
+  </section>
+
+  <section class="gma-sec">
+    <h2>Ofte stilte spørsmål</h2>
+    <div class="gma-faq">
+      ${buildMcpGuideFaqJsonLd(lang, canonical).mainEntity.map((qa: any) =>
+        `<div class="gma-faq-item"><h3>${escapeHtml(qa.name)}</h3><p>${escapeHtml(qa.acceptedAnswer.text)}</p></div>`
+      ).join("")}
+    </div>
+  </section>`;
+
+  const description = en
+    ? "How to use Claude, ChatGPT, and other AI assistants with the lokal MCP server to find Norwegian local food producers — every tool explained."
+    : "Slik bruker du Claude, ChatGPT og andre AI-assistenter med lokal MCP-serveren for å finne norske matprodusenter — alle verktøyene forklart.";
+
+  res.send(shell(
+    en ? "Find Norwegian local food via AI/MCP | Rett fra Bonden" : "Finn norsk lokalmat via AI/MCP | Rett fra Bonden",
+    description,
+    content,
+    {
+      canonical,
+      extraCss: GUIDE_MAT_AI_CSS,
+      lang,
+      pathForAlternate: "/guide-mat-ai",
+      jsonLd: [buildMcpGuideFaqJsonLd(lang, canonical)],
+    }
+  ));
+});
+
+
+// ═══════════════════════════════════════════════════════════════
 // GET /personvern — Privacy policy (GDPR-compliant, factual)
 // ═══════════════════════════════════════════════════════════════
 
@@ -4069,8 +4308,8 @@ router.get("/sitemap.xml", (_req: Request, res: Response) => {
     let xml = `<?xml version="1.0" encoding="UTF-8"?>
 <urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9" xmlns:xhtml="http://www.w3.org/1999/xhtml">`;
 
-    const corePaths = ["/", "/om", "/teknologi", "/personvern"];
-    const corePriorities: Record<string, string> = { "/": "1.0", "/om": "0.7", "/teknologi": "0.7", "/personvern": "0.5" };
+    const corePaths = ["/", "/om", "/teknologi", "/guide-mat-ai", "/personvern"];
+    const corePriorities: Record<string, string> = { "/": "1.0", "/om": "0.7", "/teknologi": "0.7", "/guide-mat-ai": "0.6", "/personvern": "0.5" };
     const coreFreq: Record<string, string> = { "/": "daily" };
 
     function addEntry(path: string, freq: string, priority: string, lastmod: string) {
