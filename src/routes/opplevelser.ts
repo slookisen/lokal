@@ -38,6 +38,12 @@ import {
   // re-harvest guard (never insert/resurrect a duplicate already known/merged)
   findExistingExperienceMatch,
   scoreExperienceRichness,
+  // dev-request 2026-07-04-opplevagent-dedup-og-norske-titler, item 1 follow-up —
+  // admin-triggerable run of the one-off backfill (no flyctl/SSH access to the
+  // deployed machine exists in this fleet's tooling, so the backfill script
+  // added in PR #209 has no way to execute against the live DB without an
+  // HTTP trigger — mirrors this file's other requireAdmin-gated one-off actions).
+  runDedupPass,
 } from "../services/experience-store";
 // PURE homepage extractors + SSRF guard — REUSED from the rfb search-enrich
 // module (same code the rfb POST /admin/homepage-content-refresh uses). Only the
@@ -1015,5 +1021,20 @@ router.get(
     res.json({ success: true, ...statement });
   },
 );
+
+// dev-request 2026-07-04-opplevagent-dedup-og-norske-titler, item 1 follow-up:
+// admin-triggerable run of the dedup backfill (src/scripts/experiences-dedup-
+// backfill.ts / runDedupPass() from PR #209). That script assumes shell access
+// to the deployed machine ("npx tsx src/scripts/experiences-dedup-backfill.ts"),
+// which this fleet's tooling has no path to invoke (no flyctl/SSH). This
+// endpoint runs the exact same, already-reviewed runDedupPass() against the
+// live DB, HTTP-triggered like every other one-off admin action in this file.
+// Idempotent (runDedupPass only loads canonical_id IS NULL rows) — safe to
+// call more than once; a second call finds nothing left to merge.
+router.post("/admin/experiences-dedup-backfill", requireAdmin, (_req: Request, res: Response) => {
+  const db = getExpDb("experiences");
+  const result = runDedupPass(db);
+  res.json({ success: true, ...result });
+});
 
 export default router;
