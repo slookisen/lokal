@@ -625,6 +625,78 @@ export function getKommuneFaqStats(kommune: string): {
   };
 }
 
+// GEO: category×kommune cross-tab aggregate + candidate list for the
+// "query landing pages" slice (dev-request 2026-06-30-geo-content-structured-data,
+// final remaining slice — programmatic `/kategori/:category/:kommune` pages
+// targeting "Hvor får jeg [produkt] i [by]"-style queries). Both reuse the
+// SAME browseWhere()/PUBLISH_GATE_SQL filter as getCategoryFaqStats()/
+// getKommuneFaqStats() and the listing itself, so the facts driving the
+// quality gate can never diverge from what the page actually lists.
+
+/** Aggregate stats for one category×kommune combo's FAQPage JSON-LD +
+ *  quality gate: how many published experiences of this category exist in
+ *  this kommune, how many distinct providers offer them, and the lowest
+ *  listed starting price (null if none stated — never guessed). Mirrors
+ *  getCategoryFaqStats()/getKommuneFaqStats() but for the intersection of
+ *  both dimensions. */
+export function getProduktByStats(category: string, kommune: string): {
+  total: number;
+  providerCount: number;
+  minPriceFrom: number | null;
+} {
+  const db = getDb(VERTICAL);
+  const { sql, params } = browseWhere({ category, kommune });
+  const row = db
+    .prepare(
+      `SELECT COUNT(*) AS total,
+              COUNT(DISTINCT e.provider_id) AS providerCount,
+              MIN(e.price_from) AS minPriceFrom
+       FROM experiences e
+       LEFT JOIN experience_providers p ON p.id = e.provider_id
+       WHERE ${sql}`
+    )
+    .get(params) as { total: number; providerCount: number; minPriceFrom: number | null } | undefined;
+  return {
+    total: row?.total || 0,
+    providerCount: row?.providerCount || 0,
+    minPriceFrom: row?.minPriceFrom ?? null,
+  };
+}
+
+/** Every (category, kommune) combo that has ≥1 PUBLISHED experience, with
+ *  the same three facts getProduktByStats() returns — the DB-driven
+ *  candidate list for the query-landing-pages sitemap loop. Deliberately NOT
+ *  a full category × kommune cross-product (most cells of that grid are
+ *  empty): one GROUP BY query returns exactly the combos that exist in the
+ *  catalog, with the quality-gate facts already attached, so the sitemap
+ *  builder can apply the ≥2-real-facts gate in-memory over this one result
+ *  set instead of issuing a query per candidate combo. */
+export type ProduktByComboRow = {
+  category: string;
+  kommune: string;
+  total: number;
+  providerCount: number;
+  minPriceFrom: number | null;
+};
+export function listProduktByCombos(): ProduktByComboRow[] {
+  const db = getDb(VERTICAL);
+  return db
+    .prepare(
+      `SELECT e.category AS category, e.kommune AS kommune,
+              COUNT(*) AS total,
+              COUNT(DISTINCT e.provider_id) AS providerCount,
+              MIN(e.price_from) AS minPriceFrom
+       FROM experiences e
+       LEFT JOIN experience_providers p ON p.id = e.provider_id
+       WHERE e.category IS NOT NULL AND e.category != ''
+         AND e.kommune IS NOT NULL AND e.kommune != ''
+         AND ${PUBLISH_GATE_SQL}
+       GROUP BY e.category, e.kommune
+       ORDER BY total DESC, e.category ASC, e.kommune ASC`
+    )
+    .all() as ProduktByComboRow[];
+}
+
 /** Distinct providers that have ≥1 PUBLISHED experience (id, name, counts). */
 export type PublishedProviderRow = {
   id: string;

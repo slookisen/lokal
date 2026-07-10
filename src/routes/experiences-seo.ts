@@ -45,6 +45,8 @@ import {
   listPublishedProviders,
   getCategoryFaqStats,
   getKommuneFaqStats,
+  getProduktByStats,
+  listProduktByCombos,
   countGardssalgProviders,
   getPublishedProviderById,
   getPublishedProviderBySlug,
@@ -935,6 +937,23 @@ router.get("/sitemap.xml", (_req: Request, res: Response) => {
     for (const row of listPublishedKommuner()) {
       if (!row.kommune) continue;
       xml += `\n  <url><loc>${url}/kommune/${encodeURIComponent(row.kommune)}</loc><changefreq>weekly</changefreq><priority>0.6</priority><lastmod>${today}</lastmod></url>`;
+    }
+  } catch { /* experiences DB not open */ }
+  try {
+    // GEO query-landing pages (dev-request 2026-06-30-geo-content-structured-data):
+    // one <url> per (category, kommune) combo that clears the SAME
+    // >=2-real-facts quality gate the /kategori/:category/:kommune route
+    // itself requires just to 200 (see that route's comment) -- so a URL
+    // only ever lands here if the route would actually serve it, never a
+    // thin/empty combinatorial cell. listProduktByCombos() already returns
+    // only combos with >=1 published experience (one GROUP BY query, not a
+    // full category × kommune cross-product), so this gate check is a cheap
+    // in-memory filter over that one result set, not a query per candidate.
+    for (const row of listProduktByCombos()) {
+      if (!row.category || !row.kommune) continue;
+      const factCount = (row.total > 0 ? 1 : 0) + (row.providerCount > 0 ? 1 : 0) + (row.minPriceFrom !== null ? 1 : 0);
+      if (factCount < 2) continue;
+      xml += `\n  <url><loc>${url}/kategori/${encodeURIComponent(row.category)}/${encodeURIComponent(row.kommune)}</loc><changefreq>weekly</changefreq><priority>0.5</priority><lastmod>${today}</lastmod></url>`;
     }
   } catch { /* experiences DB not open */ }
   try {
@@ -2777,6 +2796,100 @@ export function buildKommuneAnswerFirstOpening(params: {
   return `Opplevelser i ${params.kommune}${fylkePart}: ${countPhrase}${categoryPhrase}${pricePhrase} — kuratert og verifisert mot Brønnøysundregistrene.`;
 }
 
+// GEO: FAQPage JSON-LD for the produkt×by "query landing pages" — the final
+// remaining slice of dev-request 2026-06-30-geo-content-structured-data.
+// Programmatic `/kategori/:category/:kommune` pages targeting the exact
+// question users ask AI assistants ("Hvor får jeg [produkt] i [by]?"),
+// answers built strictly from getProduktByStats()'s aggregate over the SAME
+// publish-gated rows the page itself lists — never fabricated. Same
+// ≥2-real-facts quality gate as buildCategoryFaqJsonLd/buildKommuneFaqJsonLd,
+// BUT unlike those two, the route handler below treats this gate as the page
+// existence gate too (not just the FAQ block) — see the route comment for
+// why: a produkt×by combo is much more likely to be a thin single-item cell
+// than a whole category or whole kommune is, so this slice intentionally
+// applies the quality bar one level earlier (no page at all, not just no FAQ
+// block) to avoid ever serving/indexing a near-empty combinatorial page.
+export function buildProduktByFaqJsonLd(params: {
+  categoryLabel: string;
+  kommune: string;
+  fylke: string | null;
+  url: string;
+  total: number;
+  providerCount: number;
+  minPriceFrom: number | null;
+}): any | null {
+  const qas: Array<{ q: string; a: string }> = [];
+  const labelLc = params.categoryLabel.toLowerCase();
+
+  if (params.total > 0) {
+    qas.push({
+      q: `Hvor får jeg ${labelLc} i ${params.kommune}?`,
+      a: `Det er ${params.total} ${params.total === 1 ? "opplevelse" : "opplevelser"} innen ${labelLc} i ${params.kommune}${params.fylke ? ` (${params.fylke})` : ""} på Opplevagent.`,
+    });
+  }
+
+  if (params.providerCount > 0) {
+    qas.push({
+      q: `Hvor mange tilbydere av ${labelLc} finnes i ${params.kommune}?`,
+      a: `${params.providerCount} verifiserte ${params.providerCount === 1 ? "tilbyder" : "tilbydere"} av ${labelLc} i ${params.kommune} er listet på Opplevagent — alle sjekket mot Brønnøysundregistrene.`,
+    });
+  }
+
+  if (params.minPriceFrom !== null && params.minPriceFrom >= 0) {
+    qas.push({
+      q: `Hva koster ${labelLc} i ${params.kommune}?`,
+      a: `Prisene for ${labelLc} i ${params.kommune} starter fra ${params.minPriceFrom} kr.`,
+    });
+  }
+
+  if (qas.length < 2) return null;
+
+  return {
+    "@context": "https://schema.org",
+    "@type": "FAQPage",
+    "@id": `${params.url}#faq`,
+    "mainEntity": qas.map(({ q, a }) => ({
+      "@type": "Question",
+      "name": q,
+      "acceptedAnswer": { "@type": "Answer", "text": a },
+    })),
+  };
+}
+
+// GEO: answer-first SSR opening for the produkt×by query landing pages —
+// mirrors buildCategoryAnswerFirstOpening/buildKommuneAnswerFirstOpening,
+// grounded in the SAME getProduktByStats() aggregate already verified real
+// for buildProduktByFaqJsonLd above. Same quality gate, same
+// fail-safe-and-log-on-fallback contract (never a silent catch-and-null —
+// see the PR-149 incident note in the dev-request).
+export function buildProduktByAnswerFirstOpening(params: {
+  categoryLabel: string;
+  kommune: string;
+  fylke: string | null;
+  total: number;
+  providerCount: number;
+  minPriceFrom: number | null;
+}): string | null {
+  const hasTotal = params.total > 0;
+  const hasProviders = params.providerCount > 0;
+  const hasPrice = params.minPriceFrom !== null && params.minPriceFrom >= 0;
+
+  const factCount = (hasTotal ? 1 : 0) + (hasProviders ? 1 : 0) + (hasPrice ? 1 : 0);
+  if (factCount < 2) return null;
+
+  const labelLc = params.categoryLabel.toLowerCase();
+  const countPhrase = hasTotal
+    ? `${params.total} ${params.total === 1 ? "opplevelse" : "opplevelser"}`
+    : "opplevelser";
+  const providerPhrase = hasProviders
+    ? ` fra ${params.providerCount} ${params.providerCount === 1 ? "tilbyder" : "tilbydere"}`
+    : "";
+  const pricePhrase = hasPrice ? `, fra ${params.minPriceFrom} kr` : "";
+  const fylkePart = params.fylke ? ` (${params.fylke})` : "";
+
+  return `${params.categoryLabel} i ${params.kommune}${fylkePart}: ${countPhrase}${providerPhrase}${pricePhrase} — kuratert og verifisert mot Brønnøysundregistrene.`;
+}
+
 // ─── GET /kategori/:category — experiences in a category ─────────────────────
 router.get("/kategori/:category", (req: Request, res: Response, next: NextFunction) => {
   const category = String(req.params.category || "");
@@ -2966,6 +3079,122 @@ router.get("/kommune/:kommune", (req: Request, res: Response, next: NextFunction
     pageSize: BROWSE_PAGE_SIZE,
     extraTopHtml: searchBox(""),
     extraJsonLd: kommuneFaqJsonLd ? [kommuneFaqJsonLd] : undefined,
+  });
+  res.setHeader("Content-Type", "text/html; charset=utf-8");
+  res.setHeader("Cache-Control", "public, max-age=300");
+  res.send(html);
+});
+
+// GET /kategori/:category/:kommune -- programmatic "query landing page":
+// the produkt×by cross-tab targeting the exact question users ask AI
+// assistants ("Hvor får jeg [produkt] i [by]?") -- the query-landing-pages
+// slice of dev-request 2026-06-30-geo-content-structured-data. Reuses the
+// SAME renderBrowsePage() template + browseWhere({category, kommune}) filter
+// (already supports both dimensions at once) as /kategori/:category and
+// /kommune/:kommune -- no new rendering subsystem.
+//
+// QUALITY GATE (the entire risk of this feature -- a produkt×by cell is far
+// more likely to be a thin single-row combo than a whole category or whole
+// kommune, and a thin/near-empty combinatorial page is an SEO/GEO thin-
+// content penalty): total===0 -> 404 via next(), same baseline as every
+// sibling browse route. ADDITIONALLY -- and unlike /kategori/:category and
+// /kommune/:kommune, where an insufficient-facts result only suppresses the
+// FAQ block while the page still renders -- this route requires the SAME
+// ≥2-real-facts bar (see buildProduktByFaqJsonLd/buildProduktByAnswerFirstOpening)
+// just to SERVE the page at all. Below that bar we 404 via next() rather than
+// render a real-but-thin single-item page, so this combinatorial route can
+// never be pointed at (or link/sitemap into) a near-empty cell. The sitemap
+// loop applies the identical gate over listProduktByCombos() so a URL only
+// ever appears there if this handler would actually 200 it.
+router.get("/kategori/:category/:kommune", (req: Request, res: Response, next: NextFunction) => {
+  const category = String(req.params.category || "");
+  const kommune = String(req.params.kommune || "");
+  if (!category || !kommune) return next();
+  let total = 0;
+  let rows: ExperienceCardRow[] = [];
+  const page = parsePage(req.query.page);
+  try {
+    total = countPublishedExperiences({ category, kommune });
+    if (total === 0) return next(); // unknown/empty combo -> 404 (no orphan page)
+  } catch {
+    return next();
+  }
+
+  const label = catLabel(category);
+  const canonicalPath = `/kategori/${encodeURIComponent(category)}/${encodeURIComponent(kommune)}`;
+
+  // Quality gate: needs >=2 real catalog facts (same bar as the FAQ block) to
+  // be served at all -- see the route comment above. Computed BEFORE paging
+  // through rows so a thin combo never renders any HTML, not even a
+  // near-empty grid. Any error here fails safe to 404 (no orphan/broken
+  // page), logged (not a silent catch) per the PR-149 incident lesson.
+  let stats: { total: number; providerCount: number; minPriceFrom: number | null };
+  try {
+    stats = getProduktByStats(category, kommune);
+  } catch (e) {
+    console.error(`[experiences-seo] /kategori/${category}/${kommune} produkt×by stats failed:`, e);
+    return next();
+  }
+  const factCount =
+    (stats.total > 0 ? 1 : 0) + (stats.providerCount > 0 ? 1 : 0) + (stats.minPriceFrom !== null ? 1 : 0);
+  if (factCount < 2) {
+    console.log(`[experiences-seo] /kategori/${category}/${kommune}: below quality gate (${factCount} real facts, ${total} experience${total === 1 ? "" : "s"}) -- not served (404), not sitemapped`);
+    return next();
+  }
+
+  try {
+    rows = listPublishedExperiences({ category, kommune }, BROWSE_PAGE_SIZE, (page - 1) * BROWSE_PAGE_SIZE);
+  } catch {
+    return next();
+  }
+
+  const fylke = (rows[0]?.fylke as string | null) || null;
+  const crumbs: BreadcrumbCrumb[] = [
+    { name: "Forsiden", href: "/" },
+    { name: "Alle opplevelser", href: "/opplevelser" },
+    { name: label, href: `/kategori/${encodeURIComponent(category)}` },
+    { name: kommune },
+  ];
+
+  const produktByFaqJsonLd = buildProduktByFaqJsonLd({
+    categoryLabel: label,
+    kommune,
+    fylke,
+    url: `${baseUrl()}${canonicalPath}`,
+    total,
+    providerCount: stats.providerCount,
+    minPriceFrom: stats.minPriceFrom,
+  });
+  const answerFirst = buildProduktByAnswerFirstOpening({
+    categoryLabel: label,
+    kommune,
+    fylke,
+    total,
+    providerCount: stats.providerCount,
+    minPriceFrom: stats.minPriceFrom,
+  });
+  if (!answerFirst) {
+    // Should not happen given the factCount>=2 gate above already passed,
+    // but if the two functions' gates ever drift, fail safe to a generic
+    // (still real, non-fabricated) lede rather than throw -- logged, not
+    // swallowed, per the PR-149 incident lesson.
+    console.log(`[experiences-seo] /kategori/${category}/${kommune}: answer-first opening unexpectedly null despite factCount>=2 -- falling back to generic lede`);
+  }
+  const lede = answerFirst || `${label} i ${kommune}.`;
+
+  const html = renderBrowsePage({
+    title: `${label} i ${kommune} | Opplevagent`,
+    h1: `${label} i ${kommune}`,
+    metaDesc: `${label} i ${kommune} — kuraterte opplevelser på Opplevagent med Brreg-verifiserte tilbydere. ${total} ${total === 1 ? "opplevelse" : "opplevelser"}.`,
+    lede,
+    canonicalPath,
+    crumbs,
+    rows,
+    total,
+    page,
+    pageSize: BROWSE_PAGE_SIZE,
+    extraTopHtml: searchBox(""),
+    extraJsonLd: produktByFaqJsonLd ? [produktByFaqJsonLd] : undefined,
   });
   res.setHeader("Content-Type", "text/html; charset=utf-8");
   res.setHeader("Cache-Control", "public, max-age=300");

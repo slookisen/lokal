@@ -24860,3 +24860,224 @@ console.log("\n── city-normalizer: normalizeCityLabel + getStats() byer-coun
     failures.push(`citynorm: unexpected error: ${err instanceof Error ? (err.stack || err.message) : String(err)}`);
   }
 })();
+
+// ── geo-produkt-by-query-landing: programmatic [produkt]×[by] query landing
+// pages (dev-request 2026-06-30-geo-content-structured-data, final remaining
+// slice). Pure-function coverage for buildProduktByFaqJsonLd /
+// buildProduktByAnswerFirstOpening mirrors the geo-faq-cc /
+// geo-answer-first-opening blocks above (quality gate: thin data -> null, no
+// fabricated content; happy path: real catalog-grounded facts only). Plus an
+// HTTP-level check (same :memory: DB + sync mock req/res pattern as
+// sq-caticon/gardssalg-homepage-count above) that the /kategori/:category/:kommune
+// route ACTUALLY 200s a real combo and ACTUALLY 404s a thin one end-to-end —
+// this is the exact category of bug the PR-149 incident note warns about
+// (tests-green but broken/never-served in practice), so this slice verifies
+// the route handler + DB read together, not just the pure builder functions.
+console.log("\n── geo-produkt-by-query-landing: buildProduktByFaqJsonLd / buildProduktByAnswerFirstOpening / route + sitemap ──");
+(() => {
+  try {
+    const expSeoModPB = require("../src/routes/experiences-seo");
+    const { buildProduktByFaqJsonLd, buildProduktByAnswerFirstOpening } = expSeoModPB;
+
+    assertTrue(typeof buildProduktByFaqJsonLd === "function", "geo-pb: experiences-seo.ts exports buildProduktByFaqJsonLd");
+    assertTrue(typeof buildProduktByAnswerFirstOpening === "function", "geo-pb: experiences-seo.ts exports buildProduktByAnswerFirstOpening");
+
+    const pbBase = {
+      categoryLabel: "Mat & drikke", kommune: "Asker", fylke: "Akershus" as string | null,
+      url: "https://opplevagent.no/kategori/mat_drikke/Asker",
+      total: 0, providerCount: 0, minPriceFrom: null as number | null,
+    };
+
+    // ── Quality gate: <2 real facts -> null (no thin/fabricated page content) ──
+    assertEq(
+      buildProduktByFaqJsonLd({ ...pbBase }),
+      null,
+      "geo-pb-faq: 0 experiences, 0 providers, no price -> null (below 2-fact quality gate)"
+    );
+    assertEq(
+      buildProduktByFaqJsonLd({ ...pbBase, total: 1 }),
+      null,
+      "geo-pb-faq: total alone (1 real field) -> null (no thin-page FAQ emitted)"
+    );
+    assertEq(
+      buildProduktByAnswerFirstOpening({ ...pbBase, total: 1 }),
+      null,
+      "geo-pb-afo: total alone (1 real field) -> null (falls back to generic lede, not fabricated)"
+    );
+
+    // ── Happy path: >=2 real facts -> real, catalog-grounded content ──
+    {
+      const faq = buildProduktByFaqJsonLd({ ...pbBase, total: 3, providerCount: 2 });
+      assertTrue(!!faq && faq["@type"] === "FAQPage", "geo-pb-faq: total+providers (2 real fields) -> non-null FAQPage");
+      assertTrue(!!faq && faq["@id"] === "https://opplevagent.no/kategori/mat_drikke/Asker#faq", "geo-pb-faq: @id anchors to the combo's canonical URL");
+      assertTrue(!!faq && Array.isArray(faq.mainEntity) && faq.mainEntity.length === 2, "geo-pb-faq: 2 real fields -> exactly 2 questions (no padding/fabrication)");
+      assertTrue(
+        !!faq && faq.mainEntity.every((q: any) => q["@type"] === "Question" && q.acceptedAnswer?.["@type"] === "Answer"),
+        "geo-pb-faq: each mainEntity item is a valid Question/Answer pair"
+      );
+      assertTrue(!!faq && /Hvor får jeg/i.test(faq.mainEntity[0].name), "geo-pb-faq: first question is the literal 'Hvor får jeg [produkt] i [by]' GEO target query");
+      assertTrue(!!faq && faq.mainEntity[0].acceptedAnswer.text.includes("3"), "geo-pb-faq: count answer includes the real total (not fabricated)");
+      assertTrue(!!faq && faq.mainEntity[1].acceptedAnswer.text.includes("2"), "geo-pb-faq: provider answer includes the real provider count (not fabricated)");
+    }
+    {
+      const faq = buildProduktByFaqJsonLd({ ...pbBase, total: 3, providerCount: 2, minPriceFrom: 250 });
+      assertTrue(!!faq && faq.mainEntity.length === 3, "geo-pb-faq: 3 real fields (total+providers+price) -> exactly 3 questions");
+      assertTrue(!!faq && faq.mainEntity[2].acceptedAnswer.text.includes("250 kr"), "geo-pb-faq: price answer includes the real min price (not fabricated)");
+    }
+    {
+      const opening = buildProduktByAnswerFirstOpening({ ...pbBase, total: 3, providerCount: 2, minPriceFrom: 250 });
+      assertTrue(!!opening && opening.includes("Mat & drikke") && opening.includes("Asker"), "geo-pb-afo: opening names both the produkt and the by (answer-first, not generic)");
+      assertTrue(!!opening && opening.includes("3") && opening.includes("250 kr"), "geo-pb-afo: opening states the real count and real price (not fabricated)");
+    }
+
+    // ── Source-presence: route wiring + store exports ──
+    const expStoreModPB = require("../src/services/experience-store");
+    assertTrue(typeof expStoreModPB.getProduktByStats === "function", "geo-pb: experience-store.ts exports getProduktByStats");
+    assertTrue(typeof expStoreModPB.listProduktByCombos === "function", "geo-pb: experience-store.ts exports listProduktByCombos");
+
+    const fsGeoPB = require("fs");
+    const expSeoSrcPB = fsGeoPB.readFileSync("src/routes/experiences-seo.ts", "utf8");
+    assertTrue(
+      expSeoSrcPB.includes('router.get("/kategori/:category/:kommune"'),
+      "geo-pb: /kategori/:category/:kommune route is registered"
+    );
+    assertTrue(
+      expSeoSrcPB.includes("extraJsonLd: produktByFaqJsonLd ? [produktByFaqJsonLd] : undefined"),
+      "geo-pb: /kategori/:category/:kommune wires the produkt×by FAQPage block into renderBrowsePage's extraJsonLd"
+    );
+  } catch (err) {
+    failed++;
+    failures.push(`geo-pb: unexpected error: ${err instanceof Error ? (err.stack || err.message) : String(err)}`);
+  }
+})();
+
+// ── geo-produkt-by-http: end-to-end route + sitemap check with a real
+// :memory: DB (not just the pure builder functions above) — a real combo
+// (>=2 facts) must actually 200 with a FAQPage block and appear in the
+// sitemap; a thin combo (1 experience, unmatched provider, no price -> only
+// 1 real fact) must actually 404 via next() and be ABSENT from the sitemap.
+// This is the regression guard the PR-149 incident note calls for: prove the
+// route+DB path end-to-end, not only the isolated pure function.
+console.log("\n── geo-produkt-by-http: /kategori/:category/:kommune route + sitemap (real :memory: DB) ──");
+(() => {
+  const prevPathPBH = process.env.EXPERIENCES_DB_PATH;
+  process.env.EXPERIENCES_DB_PATH = ":memory:";
+
+  const dbFacPathPBH = require.resolve("../src/database/db-factory");
+  const expStPathPBH = require.resolve("../src/services/experience-store");
+  const expSeoPathPBH = require.resolve("../src/routes/experiences-seo");
+  delete require.cache[dbFacPathPBH];
+  delete require.cache[expStPathPBH];
+  delete require.cache[expSeoPathPBH];
+
+  try {
+    const dbFacPBH = require("../src/database/db-factory") as typeof import("../src/database/db-factory");
+    dbFacPBH.__resetDbFactoryForTesting();
+    const expStPBH = require("../src/services/experience-store") as typeof import("../src/services/experience-store");
+    const seoRouterPBH = (require("../src/routes/experiences-seo") as typeof import("../src/routes/experiences-seo")).default as any;
+
+    dbFacPBH.getDb("experiences");
+
+    // Real combo: 2 experiences, 2 distinct verified providers, one with a
+    // stated price -> total=2, providerCount=2, minPriceFrom set = 3 real
+    // facts, clears the >=2-fact gate.
+    const provReal1 = expStPBH.createProvider({
+      navn: "Asker Gårdsmat AS", org_nr: "911000111",
+      fylke: "Akershus", kommune: "Asker",
+      brreg_verified: 1, brreg_active: 1, verification_status: "verified",
+    });
+    const provReal2 = expStPBH.createProvider({
+      navn: "Bondens Bord Asker AS", org_nr: "911000222",
+      fylke: "Akershus", kommune: "Asker",
+      brreg_verified: 1, brreg_active: 1, verification_status: "verified",
+    });
+    expStPBH.createExperience({
+      title: "Smaksrunde hos Asker Gårdsmat", provider_id: provReal1, provider_match_status: "matched",
+      category: "mat_drikke", fylke: "Akershus", kommune: "Asker", price_from: 350,
+      confidence: "high", verification_status: "verified",
+    });
+    expStPBH.createExperience({
+      title: "Gårdsbutikk Bondens Bord", provider_id: provReal2, provider_match_status: "matched",
+      category: "mat_drikke", fylke: "Akershus", kommune: "Asker",
+      confidence: "high", verification_status: "verified",
+    });
+
+    // Thin combo: 1 experience, NO matched provider, NO stated price ->
+    // total=1 only (1 real fact) -> below the 2-fact gate -> must NOT be
+    // served, must NOT be sitemapped.
+    expStPBH.createExperience({
+      title: "Ensom fisketur i Kragerø", provider_id: null, provider_match_status: "unmatched",
+      category: "fisketur", fylke: "Telemark", kommune: "Kragerø",
+      confidence: "high", verification_status: "verified",
+    });
+
+    // Invoke GET /kategori/:category/:kommune directly against the real
+    // combo (mirrors sq-caticon's sync mock req/res invocation pattern).
+    const layerPBH = (seoRouterPBH.stack as any[]).find(
+      (l: any) => l.route && l.route.path === "/kategori/:category/:kommune" && l.route.methods?.get
+    );
+    assertTrue(!!layerPBH, "geo-pb-http-00: router has GET /kategori/:category/:kommune layer");
+
+    function invoke(category: string, kommune: string): { status: number; body: string; nextCalled: boolean } {
+      let body = ""; let status = 200; let nextCalled = false;
+      const res: any = {
+        statusCode: 200, setHeader: () => {},
+        status: (c: number) => { status = c; return res; },
+        send: (b: unknown) => { body = String(b); return res; },
+        json: (o: unknown) => { body = JSON.stringify(o); return res; },
+      };
+      const req: any = { path: `/kategori/${category}/${kommune}`, hostname: "opplevagent.no", params: { category, kommune }, query: {}, lang: "no" };
+      const handler = layerPBH.route.stack[layerPBH.route.stack.length - 1].handle;
+      handler(req, res, () => { nextCalled = true; });
+      return { status, body, nextCalled };
+    }
+
+    const realResult = invoke("mat_drikke", "Asker");
+    assertTrue(!realResult.nextCalled, "geo-pb-http-01: real combo (2 facts+) -> handler serves the page (next() NOT called)");
+    assertTrue(realResult.body.includes("FAQPage"), "geo-pb-http-02: real combo -> FAQPage JSON-LD present in the rendered HTML");
+    assertTrue(realResult.body.includes("Hvor får jeg"), "geo-pb-http-03: real combo -> the literal GEO target question is on the page");
+    assertTrue(realResult.body.includes("Mat &amp; drikke") || realResult.body.includes("Mat & drikke"), "geo-pb-http-04: real combo -> category label rendered");
+    assertTrue(realResult.body.includes("Asker"), "geo-pb-http-05: real combo -> kommune name rendered");
+    assertTrue(realResult.body.includes("350"), "geo-pb-http-06: real combo -> the real stated price is on the page (not fabricated)");
+    assertTrue(!/Rett fra Bonden/i.test(realResult.body) && !/tannlege/i.test(realResult.body), "geo-pb-http-07: no cross-vertical leak");
+
+    const thinResult = invoke("fisketur", "Kragerø");
+    assertTrue(thinResult.nextCalled, "geo-pb-http-08: thin combo (1 fact only, unmatched provider + no price) -> handler calls next() (404), page is NOT served");
+    assertTrue(!thinResult.body.includes("FAQPage"), "geo-pb-http-09: thin combo -> no FAQPage block ever rendered (nothing rendered at all)");
+
+    const unknownResult = invoke("mat_drikke", "Nowhereville");
+    assertTrue(unknownResult.nextCalled, "geo-pb-http-10: unknown/empty combo (0 experiences) -> handler calls next() (404), same baseline as sibling routes");
+
+    // ── Sitemap: real combo present, thin combo absent ──
+    const sitemapLayerPBH = (seoRouterPBH.stack as any[]).find(
+      (l: any) => l.route && l.route.path === "/sitemap.xml" && l.route.methods?.get
+    );
+    assertTrue(!!sitemapLayerPBH, "geo-pb-http-11: router has GET /sitemap.xml layer");
+    let sitemapBody = "";
+    const sitemapRes: any = {
+      setHeader: () => {},
+      send: (b: unknown) => { sitemapBody = String(b); return sitemapRes; },
+    };
+    const sitemapHandler = sitemapLayerPBH.route.stack[sitemapLayerPBH.route.stack.length - 1].handle;
+    sitemapHandler({ path: "/sitemap.xml", hostname: "opplevagent.no", params: {}, query: {} } as any, sitemapRes, () => {});
+
+    assertTrue(
+      sitemapBody.includes("/kategori/mat_drikke/Asker</loc>") || sitemapBody.includes("/kategori/mat_drikke/Asker%20</loc>"),
+      "geo-pb-http-12: sitemap.xml includes the real combo's query-landing URL"
+    );
+    assertTrue(
+      !sitemapBody.includes("/kategori/fisketur/Krager"),
+      "geo-pb-http-13: sitemap.xml does NOT include the thin combo's URL (no orphan/thin sitemap entry)"
+    );
+
+    console.log("  geo-produkt-by-http: OK (13 tests: route-registered/200-real/FAQPage-present/question-present/labels-real/price-real/no-leak/404-thin/no-FAQPage-thin/404-unknown/sitemap-registered/sitemap-includes-real/sitemap-excludes-thin)");
+  } catch (err) {
+    failed++;
+    failures.push(`geo-pb-http: unexpected error: ${err instanceof Error ? (err.stack || err.message) : String(err)}`);
+  } finally {
+    if (prevPathPBH === undefined) delete process.env.EXPERIENCES_DB_PATH;
+    else process.env.EXPERIENCES_DB_PATH = prevPathPBH;
+    const dbFacResetPBH = require("../src/database/db-factory") as typeof import("../src/database/db-factory");
+    dbFacResetPBH.__resetDbFactoryForTesting();
+  }
+})();
