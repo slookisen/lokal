@@ -51,6 +51,10 @@ export function getExperiencesOpenapi(): object {
             { name: "max_price", in: "query", description: "Maximum price (NOK)", schema: { type: "integer", minimum: 1 } },
             { name: "duration_max", in: "query", description: "Maximum duration (minutes)", schema: { type: "integer", minimum: 1 } },
             { name: "language", in: "query", description: "Required language (e.g. «en», «no»)", schema: { type: "string" } },
+            { name: "lat", in: "query", description: "Origin latitude for a near-me search (decimal degrees). Must be given together with lng.", schema: { type: "number", minimum: -90, maximum: 90 }, example: 69.65 },
+            { name: "lng", in: "query", description: "Origin longitude for a near-me search (decimal degrees). Must be given together with lat.", schema: { type: "number", minimum: -180, maximum: 180 }, example: 18.95 },
+            { name: "radius_km", in: "query", description: "Max distance from lat/lng in kilometers. Only applies when lat/lng are given.", schema: { type: "number", exclusiveMinimum: 0, maximum: 5000 }, example: 50 },
+            { name: "sort", in: "query", description: "'distance' — sort ascending by distance from lat/lng (already the default whenever lat/lng are given).", schema: { type: "string", enum: ["distance"] } },
             { name: "limit", in: "query", description: "Max results (default 20, max 100)", schema: { type: "integer", default: 20, minimum: 1, maximum: 100 } },
           ],
           responses: {
@@ -214,6 +218,23 @@ export function getExperiencesOpenapi(): object {
               type: "array",
               description: "Derived cross-cutting filter tags (additive-only; computed from existing fields).",
               items: { type: "string", enum: [...EXPERIENCE_TAGS] },
+            },
+            distance_km: {
+              type: "number",
+              nullable: true,
+              description:
+                "Distance from the caller's lat/lng origin, in kilometers (rounded to 1 decimal). Only present " +
+                "when lat/lng were given in the request. Never fabricated: rows with no geocoded location are " +
+                "excluded from the result entirely rather than shown with a missing/guessed distance.",
+            },
+            geo_precision: {
+              type: "string",
+              enum: ["address", "kommune"],
+              nullable: true,
+              description:
+                "How this row's location (and therefore distance_km) was derived. 'address' = geocoded from the " +
+                "provider's exact street address (precise). 'kommune' = a municipality centroid (approximate — " +
+                "do not present distance_km as exact for these rows). Only present when lat/lng were given.",
             },
           },
         },

@@ -1079,7 +1079,7 @@ MCP-endepunkt (Streamable HTTP):  ${url}/mcp
 Koble til: lim inn https://opplevagent.no/mcp i Claude Desktop / ChatGPT som MCP-URL.
 
 Tilgjengelige MCP-verktøy:
-- discover_experiences         — finn opplevelser etter fylke, kategori, vær, sesong, pris m.m.
+- discover_experiences         — finn opplevelser etter fylke, kategori, vær, sesong, pris, nær-meg (lat/lng/radius_km) m.m.
 - list_experience_categories   — hent alle kategorier med antall verifiserte opplevelser
 - get_experience               — hent fullstendig detalj for én opplevelse via UUID
 
@@ -1134,12 +1134,26 @@ Filterparametre (query string):
 - max_price      makspris i kroner
 - duration_max   maks varighet i minutter
 - language       påkrevd språk (f.eks. "en", "no")
+- lat            breddegrad for "nær meg"-søk (desimalgrader). Må oppgis sammen med lng.
+- lng            lengdegrad for "nær meg"-søk (desimalgrader). Må oppgis sammen med lat.
+- radius_km      maks avstand fra lat/lng i kilometer (gjelder kun sammen med lat/lng)
+- sort           "distance" — sorter stigende etter avstand fra lat/lng (allerede standard når lat/lng er oppgitt)
 - limit          maks antall resultater (standard 20, maks 100)
 
 Respons: JSON med { vertical:"experiences", query, count, results[] }.
 
+Når lat/lng er oppgitt, får hver rad et distance_km-felt (avrundet til én
+desimal) og et geo_precision-felt: "address" betyr posisjonen er hentet fra
+tilbyderens nøyaktige gateadresse (presis), "kommune" betyr et kommune-
+senterpunkt (omtrentlig — presenter aldri denne avstanden som eksakt). Rader
+uten geokodet posisjon i det hele tatt utelates fra svaret istedenfor å få en
+oppdiktet avstand.
+
 Eksempel:
   GET ${url}/api/opplevelser/discover?fylke=Oslo&weather=rain&group_size=4
+
+Eksempel (nær meg — innen 50 km fra Tromsø):
+  GET ${url}/api/opplevelser/discover?lat=69.65&lng=18.95&radius_km=50
 
 ## Flere REST-endepunkt
 

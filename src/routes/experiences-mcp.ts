@@ -131,6 +131,18 @@ export const DiscoverExperiencesInputSchema = {
   language: z.string().optional().describe(
     "Required language for the experience. Examples: 'no', 'en'"
   ),
+  lat: z.number().min(-90).max(90).optional().describe(
+    "Origin latitude for a near-me search (decimal degrees). Must be given together with lng. Example: 69.65 (Tromsø)"
+  ),
+  lng: z.number().min(-180).max(180).optional().describe(
+    "Origin longitude for a near-me search (decimal degrees). Must be given together with lat. Example: 18.95 (Tromsø)"
+  ),
+  radius_km: z.number().positive().max(5000).optional().describe(
+    "Max distance from lat/lng in kilometers. Only applies when lat/lng are given. Example: 50"
+  ),
+  sort: z.enum(["distance"]).optional().describe(
+    "'distance' — sort results ascending by distance from lat/lng. Already the default whenever lat/lng are given; this makes the request explicit."
+  ),
   limit: z.number().min(1).max(50).default(20).describe(
     "Max results (default 20, max 50)"
   ),
@@ -245,9 +257,13 @@ function registerExperienceTools(
         "Filtrer på fylke (county), kategori, vær, sesong, innendørs/utendørs, gruppestørrelse, " +
         "pris og varighet. / Filter by county, category, weather, season, indoor/outdoor, group size, " +
         "price, and duration. " +
+        "Also supports near-me search via lat/lng (+ optional radius_km): when given, results include " +
+        "a rounded distance_km and a geo_precision flag ('address' = exact, 'kommune' = approximate " +
+        "municipality centroid) and are sorted nearest-first. " +
         "Returns title, category, location (fylke/kommune), description, and booking URL if available. " +
         "Only verified experiences from active providers (Brreg-checked) are returned. " +
-        "Examples: 'hva kan vi finne på i Troms om vinteren?', 'outdoor activities in Oslo for 4 people'.",
+        "Examples: 'hva kan vi finne på i Troms om vinteren?', 'outdoor activities in Oslo for 4 people', " +
+        "'experiences within 50km of lat 69.65 / lng 18.95'.",
       inputSchema: DiscoverExperiencesInputSchema,
       annotations: {
         title: "Discover Norwegian experiences",
@@ -260,7 +276,7 @@ function registerExperienceTools(
         "openai/outputTemplate": "ui://opplevagent/experiences-list",
       },
     },
-    async ({ fylke, kommune, category, weather, season, indoor_outdoor, group_size, age, max_price, duration_max, language, limit }) => {
+    async ({ fylke, kommune, category, weather, season, indoor_outdoor, group_size, age, max_price, duration_max, language, lat, lng, radius_km, sort, limit }) => {
       try {
         const filter: DiscoverFilter = {};
         if (fylke) filter.fylke = fylke;
@@ -274,6 +290,11 @@ function registerExperienceTools(
         if (typeof max_price === "number") filter.max_price = max_price;
         if (typeof duration_max === "number") filter.duration_max = duration_max;
         if (language) filter.language = language;
+        if (typeof lat === "number") filter.lat = lat;
+        if (typeof lng === "number") filter.lng = lng;
+        if (typeof radius_km === "number") filter.radius_km = radius_km;
+        if (sort) filter.sort = sort;
+        const hasGeo = typeof filter.lat === "number" && typeof filter.lng === "number";
 
         const { results, relaxedKeys } = discoverExperiencesRelaxed(filter, limit ?? 20);
         const relaxationNote = buildRelaxationNote(relaxedKeys);
@@ -305,6 +326,11 @@ function registerExperienceTools(
           booking_url: e.booking_url ?? null,
           booking_type: e.booking_type ?? null,
           tags: e.tags ?? [],
+          // Only present when an origin (lat/lng) was given. geo_precision
+          // tells the caller whether distance_km is an exact address-based
+          // distance or an approximate kommune-centroid distance — never
+          // presented as exact when it isn't.
+          ...(hasGeo ? { distance_km: e.distance_km ?? null, geo_precision: e.geo_precision ?? null } : {}),
         }));
 
         const result = {
