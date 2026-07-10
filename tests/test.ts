@@ -15703,6 +15703,14 @@ console.log("\n── opplevagent-conversation-logging: slices 1+2 ──");
   assertTrue(!/Rett fra Bonden/i.test(landing.body), "orch19-06b: landing is NOT the rfb homepage (no 'Rett fra Bonden')");
   assertTrue(/\/api\/opplevelser\/discover/.test(landing.body), "orch19-06c: landing links the discover API");
   assertTrue(/text\/html/.test(landing.headers["content-type"] || ""), "orch19-06d: landing Content-Type is text/html");
+  // dev-request 2026-07-10 item 4: "For AI-agenter" endpoints list also
+  // surfaces the ChatGPT Custom GPT (human "try it now" entry point).
+  const expAgentCard = require("../src/services/experiences-agent-card") as typeof import("../src/services/experiences-agent-card");
+  assertTrue(
+    landing.body.includes(`href="${expAgentCard.OPPLEVAGENT_CUSTOM_GPT_URL}"`),
+    "orch19-06n: landing endpoints list links the ChatGPT Custom GPT URL"
+  );
+  assertTrue(/ChatGPT ↗/.test(landing.body), "orch19-06o: landing endpoints list shows 'ChatGPT ↗' link text");
 
   // llms.txt — experiences overview (Norwegian) referencing the discover API.
   const llms = invokeGet("/llms.txt");

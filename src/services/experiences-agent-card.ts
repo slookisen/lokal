@@ -14,6 +14,12 @@
 const OPPLEVAGENT_BASE_URL =
   process.env.OPPLEVAGENT_BASE_URL || "https://opplevagent.no";
 
+// Single source of truth for Opplevagent's ChatGPT Custom GPT — referenced
+// both by the agent card's x-distribution entry and by the "For AI-agenter"
+// human-facing link on the homepage (src/routes/experiences-seo.ts).
+export const OPPLEVAGENT_CUSTOM_GPT_URL =
+  "https://chatgpt.com/g/g-6a3ab590a7f081919c528a15c6765a7d-opplevagent-finn-opplevelser-i-norge";
+
 // Ensure URL never has a trailing slash (A2A spec requirement).
 function baseUrl(): string {
   return OPPLEVAGENT_BASE_URL.replace(/\/$/, "");
@@ -113,8 +119,8 @@ export function getExperiencesAgentCard(): object {
     "x-distribution": [
       {
         channel: "custom-gpt",
-        url: "https://chatgpt.com/g/g-6a3ab590a7f081919c528a15c6765a7d-opplevagent-finn-opplevelser-i-norge",
-        install: "https://chatgpt.com/g/g-6a3ab590a7f081919c528a15c6765a7d-opplevagent-finn-opplevelser-i-norge",
+        url: OPPLEVAGENT_CUSTOM_GPT_URL,
+        install: OPPLEVAGENT_CUSTOM_GPT_URL,
         status: "live",
         description: "ChatGPT Custom GPT — Opplevagent experiences discovery; 3 Actions on opplevagent.no/openapi.json (discover/categories/get).",
       },
