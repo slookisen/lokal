@@ -137,39 +137,56 @@ class ConversationService {
   startConversation(opts: {
     buyerAgentId?: string;
     buyerAgentName?: string;
-    sellerAgentId: string;
+    // sellerAgentId is OPTIONAL: verticals without an `agents`-table row per
+    // listing (e.g. experiences, whose providers live in the separate
+    // experience_providers table) log conversations with no seller agent.
+    // `seller_agent_id` has a live FK to agents(id) (foreign_keys=ON) — NULL
+    // is the only safe value when there is no real agents row; a made-up
+    // string would throw a FK-constraint error on insert.
+    sellerAgentId?: string;
+    sellerName?: string;       // display fallback when sellerAgentId is absent (no DB lookup)
     queryText?: string;
     taskId?: string;
     source?: "a2a" | "mcp" | "web" | "api";
     clientIdentity?: string;   // e.g. "ChatGPT", "Claude Desktop", "Cursor"
     requestMeta?: RequestMeta; // classification signals from the live request (UA / admin-key / owner-cookie)
     autoRespond?: boolean;  // default true — seller agent replies automatically
+    verticalId?: string;    // default 'rfb' — per-vertical scoping (Phase 4.6b)
   }): Conversation {
     const db = getDb();
     const id = uuid();
     const now = new Date().toISOString();
     const source = opts.source || "api";
+    const verticalId = opts.verticalId || "rfb";
 
     // (item 3) Classify at write-time. Conservative: only confident-internal
     // requests are flagged; everything else stays 0 (external, publicly counted).
     const isInternal = isInternalTraffic(opts.requestMeta) ? 1 : 0;
 
     db.prepare(`
-      INSERT INTO conversations (id, buyer_agent_id, seller_agent_id, status, query_text, task_id, source, is_internal, created_at, updated_at)
-      VALUES (?, ?, ?, 'open', ?, ?, ?, ?, ?, ?)
-    `).run(id, opts.buyerAgentId || null, opts.sellerAgentId, opts.queryText || null, opts.taskId || null, source, isInternal, now, now);
+      INSERT INTO conversations (id, buyer_agent_id, seller_agent_id, status, query_text, task_id, source, is_internal, vertical_id, created_at, updated_at)
+      VALUES (?, ?, ?, 'open', ?, ?, ?, ?, ?, ?, ?)
+    `).run(id, opts.buyerAgentId || null, opts.sellerAgentId || null, opts.queryText || null, opts.taskId || null, source, isInternal, verticalId, now, now);
 
-    // Get seller info for the system message
-    const seller = db.prepare("SELECT name, categories, city FROM agents WHERE id = ?").get(opts.sellerAgentId) as any;
-    const sellerName = seller?.name || "Ukjent selger";
-    const sellerCity = seller?.city || "";
-    const sellerCategories = seller?.categories ? JSON.parse(seller.categories).join(", ") : "";
+    // Get seller info for the system message — only when there IS a seller
+    // agent row to look up (see sellerAgentId doc above).
+    let sellerName = opts.sellerName || "Ukjent selger";
+    let sellerCity = "";
+    let sellerCategories = "";
+    if (opts.sellerAgentId) {
+      const seller = db.prepare("SELECT name, categories, city FROM agents WHERE id = ?").get(opts.sellerAgentId) as any;
+      sellerName = seller?.name || sellerName;
+      sellerCity = seller?.city || "";
+      sellerCategories = seller?.categories ? JSON.parse(seller.categories).join(", ") : "";
+    }
 
     // System message introducing the match
     const clientTag = opts.clientIdentity ? ` via ${opts.clientIdentity}` : "";
-    const systemMsg = opts.queryText
-      ? `Søk: "${opts.queryText}" → Match: ${sellerName} (${sellerCity}). Kategorier: ${sellerCategories}.${clientTag}`
-      : `Ny samtale startet med ${sellerName} (${sellerCity}).${clientTag}`;
+    const systemMsg = !opts.sellerAgentId
+      ? (opts.queryText ? `Søk: "${opts.queryText}".${clientTag}` : `Ny samtale startet.${clientTag}`)
+      : opts.queryText
+        ? `Søk: "${opts.queryText}" → Match: ${sellerName} (${sellerCity}). Kategorier: ${sellerCategories}.${clientTag}`
+        : `Ny samtale startet med ${sellerName} (${sellerCity}).${clientTag}`;
 
     this.addMessage({
       conversationId: id,
@@ -181,12 +198,14 @@ class ConversationService {
       // message so the history backfill can re-apply the SAME rules and so the
       // write-time decision is auditable/reversible.
       metadata: { sellerAgentId: opts.sellerAgentId, queryText: opts.queryText, source, ...(opts.clientIdentity ? { clientIdentity: opts.clientIdentity } : {}), ...(opts.requestMeta?.userAgent ? { ua: opts.requestMeta.userAgent } : {}) },
+      verticalId,
     });
 
     // ─── Seller agent auto-response ──────────────────────────
     // The seller agent "wakes up" and responds with what it knows.
     // This is template-based, using the knowledge we've enriched.
-    if (opts.autoRespond !== false) {
+    // No-op without a real seller agent row (nothing to look up a knowledge base for).
+    if (opts.autoRespond !== false && opts.sellerAgentId) {
       const autoReply = this.generateSellerResponse(opts.sellerAgentId, opts.queryText);
       if (autoReply) {
         this.addMessage({
@@ -196,6 +215,7 @@ class ConversationService {
           content: autoReply.text,
           messageType: autoReply.type,
           metadata: autoReply.metadata,
+          verticalId,
         });
       }
     }
@@ -204,14 +224,19 @@ class ConversationService {
     interactionLogger.log("message", {
       agentId: opts.buyerAgentId,
       query: opts.queryText,
-      matchedAgentIds: [opts.sellerAgentId],
+      matchedAgentIds: opts.sellerAgentId ? [opts.sellerAgentId] : [],
       metadata: { conversationId: id, type: "conversation_started", source },
     });
 
-    // Update seller metrics
-    this.incrementMetric(opts.sellerAgentId, "times_contacted");
+    // Update seller metrics — only when there IS a seller agent row.
+    if (opts.sellerAgentId) {
+      this.incrementMetric(opts.sellerAgentId, "times_contacted");
+    }
 
-    return this.getConversation(id)!;
+    // Pass verticalId through explicitly: getConversation()'s default filter
+    // is 'rfb' (see its doc), which would wrongly hide the row we just wrote
+    // for any other vertical.
+    return this.getConversation(id, { verticalId })!;
   }
 
   // ─── Seller agent auto-response generator ─────────────────
@@ -365,19 +390,20 @@ class ConversationService {
     content: string;
     messageType?: MessageType;
     metadata?: Record<string, any>;
+    verticalId?: string;    // default 'rfb' — should match the parent conversation's vertical
   }): ConversationMessage {
     const db = getDb();
     const id = uuid();
     const now = new Date().toISOString();
 
     db.prepare(`
-      INSERT INTO messages (id, conversation_id, sender_role, sender_agent_id, content, message_type, metadata, created_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      INSERT INTO messages (id, conversation_id, sender_role, sender_agent_id, content, message_type, metadata, vertical_id, created_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
     `).run(
       id, opts.conversationId, opts.senderRole,
       opts.senderAgentId || null, opts.content,
       opts.messageType || "text",
-      JSON.stringify(opts.metadata || {}), now
+      JSON.stringify(opts.metadata || {}), opts.verticalId || "rfb", now
     );
 
     // Update conversation timestamp + status
@@ -463,7 +489,12 @@ class ConversationService {
   }
 
   // ─── Get a conversation with messages ────────────────────
-  getConversation(id: string): Conversation | null {
+  // vertical-filter (Phase 4.6b-minimum, dev-request 2026-07-10-opplevagent-conversation-logging):
+  // defaults to 'rfb' when verticalId is omitted so every pre-existing RFB call
+  // site (all rows were 'rfb' before any other vertical logged conversations)
+  // is byte-for-byte unchanged. Pass the row's own vertical explicitly when
+  // fetching a just-written non-'rfb' conversation (see startConversation).
+  getConversation(id: string, opts: { verticalId?: string } = {}): Conversation | null {
     const db = getDb();
     const row = db.prepare(`
       SELECT c.*,
@@ -476,6 +507,7 @@ class ConversationService {
     `).get(id) as any;
 
     if (!row) return null;
+    if (row.vertical_id !== (opts.verticalId || "rfb")) return null;
 
     const messages = this.getMessages(id);
     return {
@@ -495,7 +527,8 @@ class ConversationService {
   }
 
   // ─── List recent conversations ──────────────────────────
-  listConversations(opts: { limit?: number; status?: string; agentId?: string; source?: string; includeInternal?: boolean } = {}): Conversation[] {
+  // vertical-filter: same default-'rfb' contract as getConversation() above.
+  listConversations(opts: { limit?: number; status?: string; agentId?: string; source?: string; includeInternal?: boolean; verticalId?: string } = {}): Conversation[] {
     const db = getDb();
     let sql = `
       SELECT c.*,
@@ -504,9 +537,9 @@ class ConversationService {
       FROM conversations c
       LEFT JOIN agents ba ON c.buyer_agent_id = ba.id
       LEFT JOIN agents sa ON c.seller_agent_id = sa.id
-      WHERE 1=1
+      WHERE c.vertical_id = ?
     `;
-    const params: any[] = [];
+    const params: any[] = [opts.verticalId || "rfb"];
 
     // (item 3) Public list = external traffic only. Admin path opts-in to all.
     if (!opts.includeInternal) { sql += " AND (c.is_internal IS NULL OR c.is_internal = 0)"; }
@@ -540,9 +573,12 @@ class ConversationService {
   // (item 3) PUBLIC counters exclude internal fleet/verifier traffic by default
   // — a verifier probe run must NOT increment the numbers a visitor sees. Pass
   // { includeInternal: true } for the ADMIN view, which still shows full totals.
-  getSourceStats(opts: { includeInternal?: boolean } = {}): { source: string; count: number; lastActivity: string }[] {
+  // vertical-filter: same default-'rfb' contract as getConversation() above.
+  getSourceStats(opts: { includeInternal?: boolean; verticalId?: string } = {}): { source: string; count: number; lastActivity: string }[] {
     const db = getDb();
-    const where = opts.includeInternal ? "" : "WHERE (is_internal IS NULL OR is_internal = 0)";
+    let where = "WHERE vertical_id = ?";
+    const params: any[] = [opts.verticalId || "rfb"];
+    if (!opts.includeInternal) { where += " AND (is_internal IS NULL OR is_internal = 0)"; }
     const rows = db.prepare(`
       SELECT COALESCE(source, 'api') as source, COUNT(*) as count,
         MAX(updated_at) as last_activity
@@ -550,7 +586,7 @@ class ConversationService {
       ${where}
       GROUP BY COALESCE(source, 'api')
       ORDER BY count DESC
-    `).all() as any[];
+    `).all(...params) as any[];
     return rows.map(r => ({ source: r.source, count: r.count, lastActivity: r.last_activity }));
   }
 

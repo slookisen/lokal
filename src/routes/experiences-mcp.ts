@@ -41,11 +41,59 @@ import {
 } from "../services/experience-store";
 
 import { jsonRpcLimiter } from "../middleware/security";
+import { conversationService, buildRequestMeta, type RequestMeta } from "../services/conversation-service";
 
 const router = Router();
 
 // Apply rate limiting to all routes on this router (same pattern as dental-mcp.ts)
 router.use(jsonRpcLimiter);
+
+// ─── Conversation logging (dev-request 2026-07-10-opplevagent-conversation-logging, slice 1) ──
+// Deliberate, narrow exception to this module's content-isolation from the rfb DB:
+// `conversations` is a SHARED cross-vertical table (main db, conversation-service.ts),
+// tagged per-row with vertical_id — this is agent-traffic observability, not experience
+// content. Experience content still goes exclusively through experience-store.ts /
+// getDb('experiences').
+//
+// FAIL-OPEN IS ABSOLUTE: these are live, agent-facing tool calls. A logging failure
+// must NEVER change the tool result a real agent gets — every call site wraps this
+// in try/catch and ignores it.
+interface ExperiencesRequestCtx {
+  requestMeta?: RequestMeta;
+  clientIdentity?: string;
+}
+
+function logExperiencesInteraction(opts: {
+  skill: string;
+  queryText?: string;
+  ctx?: ExperiencesRequestCtx;
+}): void {
+  conversationService.startConversation({
+    verticalId: "experiences",
+    source: "mcp",
+    queryText: opts.queryText || opts.skill,
+    clientIdentity: opts.ctx?.clientIdentity,
+    requestMeta: opts.ctx?.requestMeta,
+    autoRespond: false,
+  });
+}
+
+// ─── MCP client identity detection (mirrors mcp.ts's detectMcpClient) ────────
+export function detectExperiencesMcpClient(req: Request): string | undefined {
+  const ua = (req.headers["user-agent"] as string || "").toLowerCase();
+  const origin = (req.headers["origin"] as string || "").toLowerCase();
+
+  if (ua.includes("chatgpt") || ua.includes("openai") || origin.includes("openai") || origin.includes("chatgpt")) return "ChatGPT";
+  if (ua.includes("claude") || origin.includes("claude.ai") || origin.includes("anthropic")) return "Claude";
+  if (ua.includes("cursor")) return "Cursor";
+  if (ua.includes("copilot") || origin.includes("github.com")) return "GitHub Copilot";
+  if (ua.includes("windsurf")) return "Windsurf";
+  if (ua.includes("cline")) return "Cline";
+  if (ua.includes("continue")) return "Continue";
+  if (ua.includes("python")) return "Python SDK";
+  if (ua.includes("node")) return "Node SDK";
+  return undefined;
+}
 
 // ─── Zod input schemas (exported for testing) ─────────────────
 
@@ -182,7 +230,11 @@ const EXPERIENCE_DETAIL_HTML = `<!DOCTYPE html>
 
 // ─── Tool registrations ──────────────────────────────────────
 
-function registerExperienceTools(server: McpServer): void {
+function registerExperienceTools(
+  server: McpServer,
+  getClientIdentity?: () => string | undefined,
+  getRequestMeta?: () => RequestMeta | undefined,
+): void {
   // Tool 1: discover_experiences
   server.registerTool(
     "discover_experiences",
@@ -264,6 +316,14 @@ function registerExperienceTools(server: McpServer): void {
           experiences: formatted,
         };
 
+        try {
+          logExperiencesInteraction({
+            skill: "discover_experiences",
+            queryText: Object.keys(filter).length ? JSON.stringify(filter) : undefined,
+            ctx: { clientIdentity: getClientIdentity?.(), requestMeta: getRequestMeta?.() },
+          });
+        } catch { /* fail-open: never affects the tool result */ }
+
         return {
           content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }],
         };
@@ -310,6 +370,12 @@ function registerExperienceTools(server: McpServer): void {
           count: categories.length,
           categories,
         };
+        try {
+          logExperiencesInteraction({
+            skill: "list_experience_categories",
+            ctx: { clientIdentity: getClientIdentity?.(), requestMeta: getRequestMeta?.() },
+          });
+        } catch { /* fail-open: never affects the tool result */ }
         return {
           content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }],
         };
@@ -437,6 +503,14 @@ function registerExperienceTools(server: McpServer): void {
           tags: experience.tags ?? [],
         };
 
+        try {
+          logExperiencesInteraction({
+            skill: "get_experience",
+            queryText: id,
+            ctx: { clientIdentity: getClientIdentity?.(), requestMeta: getRequestMeta?.() },
+          });
+        } catch { /* fail-open: never affects the tool result */ }
+
         return {
           content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }],
         };
@@ -464,6 +538,8 @@ interface ExperiencesMcpSession {
   transport: StreamableHTTPServerTransport;
   server: McpServer;
   lastActivity: number;
+  clientIdentity?: string;
+  requestMeta?: RequestMeta;  // (dev-request 2026-07-10-opplevagent-conversation-logging) internal-traffic classification signals
 }
 
 const experiencesSessions = new Map<string, ExperiencesMcpSession>();
@@ -481,15 +557,24 @@ setInterval(() => {
 }, 5 * 60 * 1000);
 
 async function getOrCreateExperiencesSession(
-  sessionId?: string
+  sessionId?: string,
+  req?: Request
 ): Promise<{ id: string; session: ExperiencesMcpSession }> {
   if (sessionId && experiencesSessions.has(sessionId)) {
     const session = experiencesSessions.get(sessionId)!;
     session.lastActivity = Date.now();
+    if (!session.clientIdentity && req) {
+      session.clientIdentity = detectExperiencesMcpClient(req);
+    }
+    if (!session.requestMeta && req) {
+      session.requestMeta = buildRequestMeta(req);
+    }
     return { id: sessionId, session };
   }
 
   const id = sessionId || randomUUID();
+  const clientIdentity = req ? detectExperiencesMcpClient(req) : undefined;
+  const requestMeta = req ? buildRequestMeta(req) : undefined;
 
   const server = new McpServer({
     name: "opplevagent",
@@ -501,7 +586,15 @@ async function getOrCreateExperiencesSession(
       "Kuratert markedsplass for norske opplevelser, sokbar for AI-agenter.",
   });
 
-  registerExperienceTools(server);
+  // Getters read live from the sessions map (by id) rather than closing over
+  // a snapshot, so a later request on the same session that resolves a
+  // clientIdentity/requestMeta the first request couldn't (see the reuse
+  // branch above) is visible to tool calls made after that point too.
+  registerExperienceTools(
+    server,
+    () => experiencesSessions.get(id)?.clientIdentity,
+    () => experiencesSessions.get(id)?.requestMeta,
+  );
 
   const transport = new StreamableHTTPServerTransport({
     sessionIdGenerator: () => id,
@@ -513,6 +606,8 @@ async function getOrCreateExperiencesSession(
     transport,
     server,
     lastActivity: Date.now(),
+    clientIdentity,
+    requestMeta,
   };
   experiencesSessions.set(id, session);
   return { id, session };
@@ -529,7 +624,7 @@ async function getOrCreateExperiencesSession(
 router.post(["/", "/mcp"], async (req: Request, res: Response) => {
   try {
     const sessionId = req.headers["mcp-session-id"] as string | undefined;
-    const { session } = await getOrCreateExperiencesSession(sessionId);
+    const { session } = await getOrCreateExperiencesSession(sessionId, req);
     await session.transport.handleRequest(req, res, req.body);
   } catch (err: any) {
     console.error("[experiences-mcp] POST error:", err.message);
