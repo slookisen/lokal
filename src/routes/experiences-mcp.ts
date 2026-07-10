@@ -32,7 +32,9 @@ import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/
 import { z } from "zod";
 
 import {
-  discoverExperiences,
+  discoverExperiencesRelaxed,
+  buildRelaxationNote,
+  buildNarrowingSuggestions,
   listCategories,
   getExperienceById,
   type DiscoverFilter,
@@ -221,12 +223,16 @@ function registerExperienceTools(server: McpServer): void {
         if (typeof duration_max === "number") filter.duration_max = duration_max;
         if (language) filter.language = language;
 
-        const results = discoverExperiences(filter, limit ?? 20);
+        const { results, relaxedKeys } = discoverExperiencesRelaxed(filter, limit ?? 20);
+        const relaxationNote = buildRelaxationNote(relaxedKeys);
 
-        const summary =
+        let summary =
           results.length === 0
             ? "Ingen opplevelser funnet med de angitte filtrene. / No experiences found matching the given filters."
             : `Fant ${results.length} opplevelse(r). / Found ${results.length} experience(s).`;
+        if (relaxationNote) summary += ` ${relaxationNote}`;
+
+        const suggestions = buildNarrowingSuggestions(results, relaxedKeys);
 
         const formatted = results.map((e) => ({
           id: e.id,
@@ -253,6 +259,8 @@ function registerExperienceTools(server: McpServer): void {
           summary,
           count: results.length,
           filter_applied: filter,
+          relaxed_filters: relaxedKeys.length > 0 ? relaxedKeys : undefined,
+          suggestions: suggestions.length > 0 ? suggestions : undefined,
           experiences: formatted,
         };
 

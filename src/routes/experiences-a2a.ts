@@ -31,7 +31,9 @@
 import { Router, Request, Response } from "express";
 import { z } from "zod";
 import {
-  discoverExperiences,
+  discoverExperiencesRelaxed,
+  buildRelaxationNote,
+  buildNarrowingSuggestions,
   getExperienceById,
   listCategories,
   type DiscoverFilter,
@@ -314,12 +316,16 @@ export function handleExperiencesMessageSend(
 
   // Default: discover
   try {
-    const results = discoverExperiences(filter, 20);
+    const { results, relaxedKeys } = discoverExperiencesRelaxed(filter, 20);
+    const relaxationNote = buildRelaxationNote(relaxedKeys);
 
-    const summaryText =
+    let summaryText =
       results.length === 0
         ? "Ingen opplevelser funnet med de angitte filtrene. / No experiences found matching the given filters."
         : `Fant ${results.length} opplevelse(r). / Found ${results.length} experience(s).`;
+    if (relaxationNote) summaryText += ` ${relaxationNote}`;
+
+    const suggestions = buildNarrowingSuggestions(results, relaxedKeys);
 
     return rpcOk(id, {
       taskId: `experiences-discover-${Date.now()}`,
@@ -340,6 +346,8 @@ export function handleExperiencesMessageSend(
         skill: "opplevelser_discover",
         filter,
         parsedFrom: messageText || null,
+        relaxed_filters: relaxedKeys.length > 0 ? relaxedKeys : undefined,
+        suggestions: suggestions.length > 0 ? suggestions : undefined,
       },
     });
   } catch (err: unknown) {

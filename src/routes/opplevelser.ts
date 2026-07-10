@@ -16,7 +16,9 @@ import { z } from "zod";
 import {
   createExperience,
   getExperienceById,
-  discoverExperiences,
+  discoverExperiencesRelaxed,
+  buildRelaxationNote,
+  buildNarrowingSuggestions,
   listCategories,
   createProvider,
   getProviderByOrgnr,
@@ -106,11 +108,16 @@ router.get("/discover", (req: Request, res: Response) => {
   try {
     const filter = parseDiscoverQuery(req);
     const limit = Math.min(100, Math.max(1, parseInt((req.query.limit as string) || "20", 10) || 20));
-    const results = discoverExperiences(filter, limit);
+    const { results, relaxedKeys } = discoverExperiencesRelaxed(filter, limit);
+    const note = buildRelaxationNote(relaxedKeys);
+    const suggestions = buildNarrowingSuggestions(results, relaxedKeys);
     res.json({
       vertical: "experiences",
       query: filter,
       count: results.length,
+      relaxed_filters: relaxedKeys.length > 0 ? relaxedKeys : undefined,
+      note: note ?? undefined,
+      suggestions: suggestions.length > 0 ? suggestions : undefined,
       results: results.map((e) => ({
         id: e.id,
         slug: e.slug,

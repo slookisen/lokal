@@ -961,6 +961,128 @@ export function discoverExperiences(
   return rows.map(hydrateExperience);
 }
 
+// ─── Zero-hit graceful degradation (dev-request 2026-07-04-opplevagent-nl-
+// parser-og-fylkesnormalisering, item 3) ─────────────────────────────────
+// An agent asking a place/season/weather question should never get a bare
+// "no results" when the DB has hundreds of publishable rows — the query was
+// almost certainly over-constrained. On zero hits we relax filters one at a
+// time, weakest/most-peripheral constraint first, until results appear.
+// Location is the user's core intent, so fylke/kommune are relaxed last.
+const RELAX_ORDER: Array<keyof DiscoverFilter> = [
+  "duration_max",
+  "max_price",
+  "language",
+  "group_size",
+  "age",
+  "weather",
+  "season",
+  "indoor_outdoor",
+  "category",
+  "kommune",
+  "fylke",
+];
+
+const FILTER_LABELS: Record<keyof DiscoverFilter, string> = {
+  fylke: "fylke",
+  kommune: "kommune",
+  category: "kategori",
+  indoor_outdoor: "innendørs/utendørs",
+  weather: "vær",
+  season: "sesong",
+  group_size: "gruppestørrelse",
+  age: "aldersgrense",
+  max_price: "maks pris",
+  duration_max: "maks varighet",
+  language: "språk",
+};
+
+export interface RelaxedDiscoverResult {
+  results: Array<Experience & { id: string; tags: ExperienceTag[] }>;
+  originalFilter: DiscoverFilter;
+  appliedFilter: DiscoverFilter;
+  relaxedKeys: Array<keyof DiscoverFilter>;
+}
+
+/**
+ * discoverExperiences(), but on zero hits progressively drops filters
+ * (weakest first, per RELAX_ORDER) and retries until results appear or every
+ * filter is exhausted. Always returns whichever result set it landed on,
+ * plus which keys were dropped so the caller can surface a relaxation note.
+ */
+export function discoverExperiencesRelaxed(
+  filter: DiscoverFilter = {},
+  limit = 20
+): RelaxedDiscoverResult {
+  const original = DiscoverFilterSchema.parse(filter);
+  let results = discoverExperiences(original, limit);
+  if (results.length > 0) {
+    return { results, originalFilter: original, appliedFilter: original, relaxedKeys: [] };
+  }
+
+  const working: DiscoverFilter = { ...original };
+  const relaxedKeys: Array<keyof DiscoverFilter> = [];
+  for (const key of RELAX_ORDER) {
+    if (working[key] === undefined) continue;
+    delete working[key];
+    relaxedKeys.push(key);
+    results = discoverExperiences(working, limit);
+    if (results.length > 0) break;
+  }
+  return { results, originalFilter: original, appliedFilter: working, relaxedKeys };
+}
+
+/** Bilingual note describing which filters were relaxed to produce results. Null if none were. */
+export function buildRelaxationNote(relaxedKeys: Array<keyof DiscoverFilter>): string | null {
+  if (relaxedKeys.length === 0) return null;
+  const labels = relaxedKeys.map((k) => FILTER_LABELS[k]).join(", ");
+  return (
+    `Ingen treff med de opprinnelige filtrene — løsnet: ${labels}. / ` +
+    `No matches with the original filters — relaxed: ${labels}.`
+  );
+}
+
+/**
+ * 2-3 bilingual suggestions for narrowing back down from a relaxed result
+ * set, derived from what the relaxed results actually contain (so every
+ * suggestion is guaranteed to return >0 hits if reapplied).
+ */
+export function buildNarrowingSuggestions(
+  results: Array<Pick<Experience, "category" | "kommune" | "fylke">>,
+  relaxedKeys: Array<keyof DiscoverFilter>,
+  limit = 3
+): string[] {
+  if (relaxedKeys.length === 0) return [];
+  const suggestions: string[] = [];
+  const distinct = (vals: Array<string | null | undefined>) =>
+    Array.from(new Set(vals.filter((v): v is string => !!v)));
+
+  if (relaxedKeys.includes("category")) {
+    for (const c of distinct(results.map((r) => r.category))) {
+      if (suggestions.length >= limit) break;
+      suggestions.push(`Prøv kategori=${c} / Try category=${c}`);
+    }
+  }
+  if (suggestions.length < limit && relaxedKeys.includes("kommune")) {
+    for (const k of distinct(results.map((r) => r.kommune))) {
+      if (suggestions.length >= limit) break;
+      suggestions.push(`Prøv kommune=${k} / Try kommune=${k}`);
+    }
+  }
+  if (suggestions.length < limit && relaxedKeys.includes("fylke")) {
+    for (const f of distinct(results.map((r) => r.fylke))) {
+      if (suggestions.length >= limit) break;
+      suggestions.push(`Prøv fylke=${f} / Try fylke=${f}`);
+    }
+  }
+  if (suggestions.length === 0 && results.length > 0) {
+    suggestions.push(
+      "Prøv et bredere søk uten pris-, varighets- eller gruppestørrelsesbegrensning. / " +
+        "Try a broader search without price, duration, or group-size limits."
+    );
+  }
+  return suggestions.slice(0, limit);
+}
+
 export function listCategories(): Array<{ category: string; count: number }> {
   const db = getDb(VERTICAL);
   return db.prepare(`
