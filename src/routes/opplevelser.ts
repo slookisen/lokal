@@ -299,7 +299,7 @@ router.post("/admin/bulk-load", requireAdmin, async (req: Request, res: Response
 
       // ── insert this provider's experiences (idempotent by title). ───
       for (const r of rows) {
-        if (experienceExistsForProvider(providerId, r.title)) {
+        if (experienceExistsForProvider(providerId, r.title, r.kommune ?? kommune)) {
           skipped++;
           continue;
         }

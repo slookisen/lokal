@@ -22,6 +22,7 @@ import { deriveExperienceTags, type ExperienceTag, type TaggableExperience } fro
 import {
   titleJaccardSimilarity,
   TITLE_JACCARD_THRESHOLD,
+  hostnameOf,
   dedupeResultRows,
   findDuplicateClusters,
   buildMergePlans,
@@ -1230,19 +1231,44 @@ export function bulkInsertExperiences(rows: HarvestRow[]): { inserted: number; s
  * across ALL providers on every single bulk-load row (expensive, and out of
  * this function's single-provider scope). This is a deliberate design
  * split, not an oversight.
+ *
+ * kommune is REQUIRED to match, mirroring isDuplicateCandidate()'s
+ * (experience-dedup.ts) documented invariant — "same kommune, required.
+ * Never merge across different kommuner even if titles match verbatim."
+ * A single Brreg-verified provider can be a real multi-branch business
+ * (e.g. "Klatreverket" in one kommune and a genuinely separate "Klatreverket
+ * Trondheim" location in another) — without this guard, both the exact
+ * match and the fuzzy fallback would wrongly treat the new branch as an
+ * already-existing row and silently skip inserting it, with no audit trail.
+ * Uses the SAME normalization isDuplicateCandidate() uses for kommune
+ * (trim + case-insensitive); like that function, a missing kommune on
+ * either side can never prove "same place", so it never matches.
  */
-export function experienceExistsForProvider(providerId: string, title: string): boolean {
+export function experienceExistsForProvider(
+  providerId: string,
+  title: string,
+  kommune: string | null
+): boolean {
+  if (!kommune || !kommune.trim()) return false;
+  const normalizedKommune = kommune.trim().toLowerCase();
+
   const db = getDb(VERTICAL);
   const exact = db
     .prepare(
-      "SELECT 1 FROM experiences WHERE provider_id = ? AND lower(trim(title)) = lower(trim(?)) LIMIT 1"
+      `SELECT 1 FROM experiences
+       WHERE provider_id = ? AND lower(trim(title)) = lower(trim(?))
+         AND kommune IS NOT NULL AND lower(trim(kommune)) = ?
+       LIMIT 1`
     )
-    .get(providerId, title);
+    .get(providerId, title, normalizedKommune);
   if (exact) return true;
 
   const existingTitles = db
-    .prepare("SELECT title FROM experiences WHERE provider_id = ?")
-    .all(providerId) as { title: string }[];
+    .prepare(
+      `SELECT title FROM experiences
+       WHERE provider_id = ? AND kommune IS NOT NULL AND lower(trim(kommune)) = ?`
+    )
+    .all(providerId, normalizedKommune) as { title: string }[];
   return existingTitles.some((r) => titleJaccardSimilarity(r.title, title) >= TITLE_JACCARD_THRESHOLD);
 }
 
@@ -1309,13 +1335,45 @@ export function mergeDuplicateCluster(plan: DedupMergePlan): number {
   return changed;
 }
 
+/**
+ * Evidence for one row (canonical or duplicate) in a dry-run/apply merge
+ * summary — lets an admin spot-check WHY a cluster matched before ever
+ * setting apply=true against live data. evidence_hostname is derived via
+ * the same hostnameOf() (experience-dedup.ts) the matcher itself uses for
+ * its cross-provider same-source-URL rule, so this is the actual signal
+ * the match was (partly) based on, not a re-derivation.
+ */
+export interface DedupRowEvidence {
+  provider_id: string | null;
+  evidence_url: string | null;
+  evidence_hostname: string | null;
+}
+
+/**
+ * Per-duplicate evidence, plus the title-similarity score (Jaccard, against
+ * the canonical row's title) that triggered the match — the riskiest
+ * category to spot-check is a different-provider match made only via a
+ * shared discovery hostname (e.g. visitnorway.com/visitoslo.com), so
+ * surfacing provider_id + evidence_url/hostname + score lets an admin catch
+ * a plausible false-positive merge before it's applied.
+ */
+export interface DedupDuplicateSummary extends DedupRowEvidence {
+  id: string;
+  title: string;
+  title_similarity: number;
+}
+
 export interface DedupBackfillMergeSummary {
   canonical_id: string;
   canonical_slug: string | null;
   canonical_title: string;
+  canonical_provider_id: string | null;
+  canonical_evidence_url: string | null;
+  canonical_evidence_hostname: string | null;
   kommune: string | null;
   duplicate_ids: string[];
   duplicate_titles: string[];
+  duplicates: DedupDuplicateSummary[];
 }
 
 export interface DedupBackfillResult {
@@ -1350,9 +1408,20 @@ export function runDedupBackfill(apply: boolean): DedupBackfillResult {
     canonical_id: p.canonical.id,
     canonical_slug: p.canonical.slug,
     canonical_title: p.canonical.title,
+    canonical_provider_id: p.canonical.provider_id,
+    canonical_evidence_url: p.canonical.evidence_url,
+    canonical_evidence_hostname: hostnameOf(p.canonical.evidence_url),
     kommune: p.canonical.kommune,
     duplicate_ids: p.duplicates.map((d) => d.id),
     duplicate_titles: p.duplicates.map((d) => d.title),
+    duplicates: p.duplicates.map((d) => ({
+      id: d.id,
+      title: d.title,
+      provider_id: d.provider_id,
+      evidence_url: d.evidence_url,
+      evidence_hostname: hostnameOf(d.evidence_url),
+      title_similarity: titleJaccardSimilarity(p.canonical.title, d.title),
+    })),
   }));
 
   return {

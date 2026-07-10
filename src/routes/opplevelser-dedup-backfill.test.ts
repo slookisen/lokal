@@ -16,6 +16,13 @@
  *       to /opplevelse/<canonical-slug>; an unknown slug still 404s (next())
  *   (f) HARVESTER GUARD: experienceExistsForProvider() catches a fuzzy
  *       same-provider near-duplicate title, not just an exact match
+ *   (g) HARVESTER GUARD kommune requirement (adversarial review finding 1):
+ *       same provider + different kommune (a real multi-branch business)
+ *       must NOT be flagged as already-existing, even with a fuzzy title
+ *       match or a missing kommune on the incoming row
+ *   (h) MERGE-SUMMARY EVIDENCE (adversarial review finding 2): dry-run/apply
+ *       summaries carry provider_id/evidence_url/evidence_hostname/
+ *       title_similarity for the canonical row + each duplicate
  *
  * Mirrors opplevelser-discover-tags.test.ts's EXPERIENCES_DB_PATH=":memory:"
  * + require-cache-reset pattern and its router.handle(fakeReq, fakeRes)
@@ -153,6 +160,7 @@ export function runOpplevelserDedupBackfillTests(opts: { log?: boolean } = {}): 
       const thinId = expStore.createExperience({
         title: "Kon-Tiki Museet", provider_id: providerId, provider_match_status: "matched",
         kommune: "Oslo", fylke: "Oslo", verification_status: "verified", confidence: "high",
+        evidence_url: "https://www.visitoslo.com/kon-tiki-museet",
       });
       const richId = expStore.createExperience({
         title: "Kon-Tiki Museum", provider_id: providerId, provider_match_status: "matched",
@@ -160,6 +168,7 @@ export function runOpplevelserDedupBackfillTests(opts: { log?: boolean } = {}): 
         description: "Et av Norges mest besøkte museer, ved sjøkanten på Bygdøy.",
         booking_url: "https://kon-tiki.no/billetter",
         price_band: "standard", price_from: 150, duration_min: 60,
+        evidence_url: "https://kon-tiki.no/om-oss",
       });
       const controlId = expStore.createExperience({
         title: "Norsk Folkemuseum", provider_id: providerId, provider_match_status: "matched",
@@ -258,16 +267,65 @@ export function runOpplevelserDedupBackfillTests(opts: { log?: boolean } = {}): 
         kommune: "Bærum", fylke: "Viken", verification_status: "verified", confidence: "high",
       });
       assertTrue(
-        expStore.experienceExistsForProvider(provider2, "Klatreverket"),
+        expStore.experienceExistsForProvider(provider2, "Klatreverket", "Bærum"),
         "f1: exact-title match still caught (unchanged base case)"
       );
       assertTrue(
-        expStore.experienceExistsForProvider(provider2, "Klatreverket Bærum"),
+        expStore.experienceExistsForProvider(provider2, "Klatreverket Bærum", "Bærum"),
         "f2: fuzzy near-duplicate title (extra qualifier word) now caught by the harvester guard"
       );
       assertTrue(
-        !expStore.experienceExistsForProvider(provider2, "Sommarøy Kajakkutleie"),
+        !expStore.experienceExistsForProvider(provider2, "Sommarøy Kajakkutleie", "Bærum"),
         "f3: a genuinely different title for the same provider is still NOT flagged as existing"
+      );
+
+      // ── (g) REGRESSION (review finding 1): kommune is required — a real
+      // multi-branch business (same provider) opening a genuinely NEW
+      // location in a DIFFERENT kommune must not be treated as an
+      // already-existing row, even though the fuzzy title match alone
+      // would clear the Jaccard threshold ("Klatreverket" vs "Klatreverket
+      // Trondheim"). Without the kommune guard, the bulk-loader would
+      // silently (and permanently) skip inserting the new branch. ────────
+      assertTrue(
+        !expStore.experienceExistsForProvider(provider2, "Klatreverket Trondheim", "Trondheim"),
+        "g1: same provider, different kommune, subset title tokens -> NOT flagged as existing (new branch must be insertable)"
+      );
+      // Same scenario but the harvest row carries no kommune at all — can't
+      // prove same-place, so per isDuplicateCandidate()'s own invariant this
+      // must also NOT be flagged as existing (never a false "already exists").
+      assertTrue(
+        !expStore.experienceExistsForProvider(provider2, "Klatreverket", null),
+        "g2: missing kommune -> can't prove same place -> NOT flagged as existing"
+      );
+      // Sanity: the exact-match path also honors the kommune guard, not just
+      // the fuzzy fallback (the review flagged both call sites).
+      assertTrue(
+        !expStore.experienceExistsForProvider(provider2, "Klatreverket", "Trondheim"),
+        "g3: exact-title match in a DIFFERENT kommune -> NOT flagged as existing"
+      );
+
+      // ── (h) REGRESSION (review finding 2): dry-run/apply merge summary
+      // carries evidence (provider_id, evidence_url/hostname, similarity
+      // score) an admin can spot-check before ever setting apply=true. ────
+      const dryEvidence = dry.body.merges[0];
+      assertEq(dryEvidence?.canonical_provider_id, providerId, "h1: canonical_provider_id present + correct");
+      assertEq(dryEvidence?.canonical_evidence_url, "https://kon-tiki.no/om-oss", "h1b: canonical_evidence_url present + correct");
+      assertEq(dryEvidence?.canonical_evidence_hostname, "kon-tiki.no", "h1c: canonical_evidence_hostname derived (www.-stripped) from canonical_evidence_url");
+      assertTrue(Array.isArray(dryEvidence?.duplicates) && dryEvidence.duplicates.length === 1, "h2: per-duplicate evidence array present, one entry");
+      const dupEvidence = dryEvidence?.duplicates?.[0];
+      assertEq(dupEvidence?.id, thinId, "h3: duplicate evidence entry is keyed to the thin (duplicate) row");
+      assertEq(dupEvidence?.provider_id, providerId, "h4: duplicate evidence carries provider_id");
+      assertEq(dupEvidence?.evidence_url, "https://www.visitoslo.com/kon-tiki-museet", "h4b: duplicate evidence carries evidence_url");
+      assertEq(dupEvidence?.evidence_hostname, "visitoslo.com", "h4c: duplicate evidence_hostname derived (www.-stripped) from evidence_url");
+      assertTrue(
+        typeof dupEvidence?.title_similarity === "number" &&
+          dupEvidence.title_similarity >= 0 &&
+          dupEvidence.title_similarity <= 1,
+        "h5: duplicate evidence carries a 0..1 title_similarity score"
+      );
+      assertTrue(
+        (dupEvidence?.title_similarity as number) >= 0.5,
+        "h6: title_similarity for the Kon-Tiki Museet/Museum pair is >= the match threshold that triggered it"
       );
     } catch (err: any) {
       failed++;
