@@ -108,36 +108,63 @@ export function runExperienceDedupTests(opts: { log?: boolean } = {}): Promise<T
       "4b: beginner climbing course vs. birthday party at the same climbing park do not match"
     );
 
-    // ── 4c-4h. titlesMatch: PR #209 review finding — a single shared common
-    //     ACTIVITY-DOMAIN noun (kajakk/rafting/klatring/sykkeltur/fisketur) is
-    //     NOT enough evidence two titles are the same real-world experience.
-    //     These are genuinely distinct, independently-bookable products from
-    //     the same provider/kommune that merely share one domain-activity
-    //     noun — folding one away as a "duplicate" of the other would
-    //     incorrectly hide a real, distinct bookable experience. ──
+    // ── 4c-4h. titlesMatch: PR #209 review round 1 finding — a single shared
+    //     common ACTIVITY-DOMAIN noun (kajakk/rafting/klatring/sykkeltur/
+    //     fisketur) is NOT enough evidence two titles are the same real-world
+    //     experience. These are genuinely distinct, independently-bookable
+    //     products from the same provider/kommune that merely share one
+    //     domain-activity noun — folding one away as a "duplicate" of the
+    //     other would incorrectly hide a real, distinct bookable experience.
+    //     "kajakk" is still caught via the explicit TITLE_STOPWORDS entry
+    //     (bare loanword, no productive suffix to hook a general rule onto);
+    //     rafting/klatring/sykkeltur/fisketur are now caught GENERICALLY via
+    //     GENERIC_ACTIVITY_SUFFIXES ("-ing"/"-tur") instead of by name — round
+    //     2 deliberately removed their specific stopword entries to prove the
+    //     general rule covers them without a per-word crutch. ──
     assertTrue(
       !titlesMatch("Kajakk tur for nybegynnere", "Kajakk tur for viderekommet"),
       "4c: kajakk beginner vs. advanced tour — distinct products, share only the domain noun 'kajakk'"
     );
     assertTrue(
       !titlesMatch("Rafting i Sjoa - dagstur", "Rafting i Sjoa - kveldstur"),
-      "4d: rafting day trip vs. evening trip in Sjoa — distinct products, share only 'rafting'"
+      "4d: rafting day trip vs. evening trip in Sjoa — distinct products, share only 'rafting' (now caught via the '-ing' suffix rule, not a stopword)"
     );
     assertTrue(
       !titlesMatch("Klatring for barn", "Klatring for voksne"),
-      "4e: climbing for kids vs. for adults — distinct products, share only 'klatring'"
+      "4e: climbing for kids vs. for adults — distinct products, share only 'klatring' (now caught via the '-ing' suffix rule, not a stopword)"
     );
     assertTrue(
       !titlesMatch("Sykkeltur for nybegynnere", "Sykkeltur for viderekommet"),
-      "4f: beginner vs. advanced bike tour — distinct products, share only 'sykkeltur'"
+      "4f: beginner vs. advanced bike tour — distinct products, share only 'sykkeltur' (now caught via the '-tur' suffix rule, not a stopword)"
     );
     assertTrue(
       !titlesMatch("Sykkeltur - dagstur", "Sykkeltur - kveldstur"),
-      "4g: day vs. evening bike tour — distinct products, share only 'sykkeltur'"
+      "4g: day vs. evening bike tour — distinct products, share only 'sykkeltur' (now caught via the '-tur' suffix rule, not a stopword)"
     );
     assertTrue(
       !titlesMatch("Fisketur for barn", "Fisketur for voksne"),
-      "4h: fishing trip for kids vs. for adults — distinct products, share only 'fisketur'"
+      "4h: fishing trip for kids vs. for adults — distinct products, share only 'fisketur' (now caught via the '-tur' suffix rule, not a stopword)"
+    );
+
+    // ── 4k-4m. titlesMatch: PR #209 review ROUND 2 finding — round 1 only
+    //     whack-a-moled the 5 specific nouns above onto TITLE_STOPWORDS; the
+    //     reviewer immediately proved the underlying defect was still there
+    //     with 3 activity nouns that were never on that list. These must now
+    //     be rejected via GENERIC_ACTIVITY_SUFFIXES ("-tur"/"-ing"), not by
+    //     adding "fjelltur"/"brevandring"/"elvepadling" as new stopwords —
+    //     that would just be the same whack-a-mole against an open-ended
+    //     vocabulary the reviewer explicitly rejected. ──
+    assertTrue(
+      !titlesMatch("Fjelltur til Galdhøpiggen", "Fjelltur til Snøhetta"),
+      "4k: hike to Galdhøpiggen vs. hike to Snøhetta — different peaks, share only the generic '-tur' noun 'fjelltur'"
+    );
+    assertTrue(
+      !titlesMatch("Brevandring på Nigardsbreen", "Brevandring på Briksdalsbreen"),
+      "4l: glacier walk on Nigardsbreen vs. Briksdalsbreen — different glaciers, share only the generic '-ing' noun 'brevandring'"
+    );
+    assertTrue(
+      !titlesMatch("Elvepadling for nybegynnere", "Elvepadling for viderekommet"),
+      "4m: river paddling for beginners vs. advanced — distinct products, share only the generic '-ing' noun 'elvepadling'"
     );
 
     // Regression guard: the PR's own legitimate matches (3a/3b above) must

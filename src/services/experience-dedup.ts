@@ -47,16 +47,46 @@ const TITLE_STOPWORDS = new Set([
   "museum", "museet", "senter", "center", "park", "opplevelse", "opplevelser",
   "aktivitet", "aktiviteter", "billetter", "tickets", "official", "site",
   "website", "hjemmeside", "tur", "tour", "omvisning", "experience", "experiences",
-  // Generic ACTIVITY-domain nouns (as opposed to proper nouns). A single one
-  // of these shared between two titles is NOT evidence they're the same
-  // real-world bookable experience — e.g. "Kajakk tur for nybegynnere" vs
-  // "Kajakk tur for viderekommet" are two distinct, independently-bookable
-  // products that merely share the domain noun "kajakk" (confirmed
-  // false-positive merge from PR #209 review). Contrast with a proper noun
-  // like "heyerdahl", which stays a strong signal because it names a
-  // specific real-world thing, not a category of activity.
-  "kajakk", "rafting", "klatring", "sykkeltur", "fisketur",
+  // "kajakk" ("kayak") is a bare loanword noun, not a compound/derived
+  // activity noun (see GENERIC_ACTIVITY_SUFFIXES below, which is what
+  // catches the open-ended class this word belongs to) — it has no
+  // productive suffix pattern to hook a general rule onto, so unlike
+  // rafting/klatring/sykkeltur/fisketur (removed from this list in PR #209
+  // review round 2 — GENERIC_ACTIVITY_SUFFIXES now catches all four
+  // generically via "-ing"/"-tur"), this one stays as a small, irreducible,
+  // explicit exception rather than a whack-a-mole pattern.
+  "kajakk",
 ]);
+
+// Generic Norwegian ACTIVITY-noun suffixes: a compound/derived noun ending in
+// one of these names a CATEGORY of outdoor activity (a trip, a hike, a
+// paddling/driving/climbing/sailing session, ...) rather than a specific
+// bookable product or a named person/place/brand — no matter what root word
+// it's built on. A token ending in one of these is therefore NEVER, on its
+// own, sufficient evidence that two titles describe the same real-world
+// experience (see titlesMatch() below) — this is the exact shape of every
+// confirmed false-positive merge from PR #209 review rounds 1 and 2:
+// "Fjelltur til Galdhøpiggen" vs "...Snøhetta" (-tur), "Brevandring på
+// Nigardsbreen" vs "...Briksdalsbreen" (-ing), "Elvepadling for
+// nybegynnere" vs "...viderekommet" (-ing), and the round-1 findings
+// (kajakk/rafting/klatring/sykkeltur/fisketur "tur" — all -tur/-ing too).
+//
+// Deliberately suffix-based, NOT a per-word list: Norwegian tourism/activity
+// nomenclature overwhelmingly builds new activity nouns by gluing a
+// qualifier onto "-tur" (fjelltur, sykkeltur, fisketur, bretur, hundetur,
+// rideturer, ...) or by nominalizing an activity verb with the "-ing" gerund
+// suffix (vandring, padling, klatring, kjøring, seiling, fisking — plus
+// English loanwords the harvester also produces: rafting, camping, hiking,
+// cycling, diving, ...). Round 1 of this fix whack-a-moled five specific
+// nouns onto TITLE_STOPWORDS and the reviewer immediately found three more
+// (fjelltur/brevandring/elvepadling) that weren't on the list — this suffix
+// rule catches those three AND any future Norwegian/English activity noun
+// the harvester encounters, without ever needing another list update.
+const GENERIC_ACTIVITY_SUFFIXES = ["tur", "ing"];
+
+function isGenericActivityToken(token: string): boolean {
+  return GENERIC_ACTIVITY_SUFFIXES.some((suffix) => token.endsWith(suffix));
+}
 
 function stripDiacritics(s: string): string {
   return s
@@ -172,12 +202,22 @@ export function titlesMatch(a: string, b: string): boolean {
   const setA = new Set(tokensA);
   const setB = new Set(tokensB);
 
-  // Single-shared-significant-token signal (e.g. a proper noun like
-  // "heyerdahl") is strong enough evidence on its own — domain-generic nouns
-  // (kajakk, rafting, tur, ...) never reach this point since they're already
-  // filtered out of titleTokens() via TITLE_STOPWORDS.
+  // Single-shared-significant-token signal (e.g. a proper noun/brand like
+  // "heyerdahl" or "kontiki") is strong enough evidence on its own to call
+  // two titles the same real-world experience — but ONLY when that token
+  // isn't itself a generic ACTIVITY-CATEGORY noun (see
+  // GENERIC_ACTIVITY_SUFFIXES above). A generic activity noun is never
+  // sufficient alone, no matter how long it is or how rare it looks lexically
+  // — "Fjelltur til Galdhøpiggen"/"...Snøhetta" share only "fjelltur" (8
+  // chars, well past SIGNIFICANT_TOKEN_MIN_LEN) yet are two different,
+  // independently-bookable trips to two different mountains. Tokens excluded
+  // here still fall through to the whole-string + token-overlap corroboration
+  // path below, same as any other candidate pair — they just can't shortcut
+  // straight to a match on their own.
   for (const t of setA) {
-    if (t.length >= SIGNIFICANT_TOKEN_MIN_LEN && setB.has(t)) return true;
+    if (t.length >= SIGNIFICANT_TOKEN_MIN_LEN && setB.has(t) && !isGenericActivityToken(t)) {
+      return true;
+    }
   }
 
   // Whole-string / reworded-duplicate path: character-level closeness must
