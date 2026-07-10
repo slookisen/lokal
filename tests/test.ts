@@ -23613,6 +23613,166 @@ console.log("\n── geo-faq-category-city: buildCategoryFaqJsonLd / buildKommu
   }
 })();
 
+// ── geo-answer-first-opening: answer-first SSR opening paragraph for
+// producer/category/kommune pages (dev-request
+// 2026-06-30-geo-content-structured-data, answer-first-opening slice).
+// Restructures the opening ~200 words of these pages to directly answer the
+// likely query instead of a generic intro — a human-visible+crawler-visible
+// prose paragraph, distinct from the FAQPage JSON-LD blocks covered by the
+// geo-faq-cc block above. Mirrors that block's coverage: quality-gate (thin
+// data -> null, no fabricated/thin content, falls back to the existing
+// generic opening) + happy path (>=2 real, catalog-grounded facts) + no
+// regression to the FAQ JSON-LD blocks (unaffected).
+console.log("\n── geo-answer-first-opening: buildProducerAnswerFirstOpening / buildCategoryAnswerFirstOpening / buildKommuneAnswerFirstOpening ──");
+(() => {
+  try {
+    const seoMod = require("../src/routes/seo");
+    const expSeoMod = require("../src/routes/experiences-seo");
+    const {
+      buildProducerAnswerFirstOpening,
+      buildProducerFaqJsonLd: buildProducerFaqJsonLd2,
+    } = seoMod;
+    const {
+      buildCategoryAnswerFirstOpening,
+      buildKommuneAnswerFirstOpening,
+      buildCategoryFaqJsonLd: buildCategoryFaqJsonLd2,
+      buildKommuneFaqJsonLd: buildKommuneFaqJsonLd2,
+    } = expSeoMod;
+
+    assertTrue(typeof buildProducerAnswerFirstOpening === "function", "geo-afo: seo.ts exports buildProducerAnswerFirstOpening");
+    assertTrue(typeof buildCategoryAnswerFirstOpening === "function", "geo-afo: experiences-seo.ts exports buildCategoryAnswerFirstOpening");
+    assertTrue(typeof buildKommuneAnswerFirstOpening === "function", "geo-afo: experiences-seo.ts exports buildKommuneAnswerFirstOpening");
+
+    // ── Producer page ──
+    const prodBase = { name: "Gård AS", cityName: "", productsList: [] as any[], categories: [] as string[] };
+
+    assertEq(
+      buildProducerAnswerFirstOpening({ ...prodBase }),
+      null,
+      "geo-afo: producer — 0 real fields -> null (no thin/fabricated opening)"
+    );
+    assertEq(
+      buildProducerAnswerFirstOpening({ ...prodBase, cityName: "Asker" }),
+      null,
+      "geo-afo: producer — only 1 real field (city, no products/categories) -> null (below 2-fact gate)"
+    );
+    assertEq(
+      buildProducerAnswerFirstOpening({ ...prodBase, productsList: ["Honning", "Egg"] }),
+      null,
+      "geo-afo: producer — only 1 real field (products, no city) -> null (below 2-fact gate)"
+    );
+    {
+      const opening = buildProducerAnswerFirstOpening({ ...prodBase, cityName: "Asker", productsList: ["Honning", "Egg"] });
+      assertTrue(typeof opening === "string" && opening.includes("Gård AS"), "geo-afo: producer — 2 real fields -> non-null opening includes the real name");
+      assertTrue(!!opening && opening.includes("Asker"), "geo-afo: producer — opening includes the real city (not fabricated)");
+      assertTrue(!!opening && opening.includes("Honning") && opening.includes("Egg"), "geo-afo: producer — opening includes the real product names (not fabricated)");
+    }
+    {
+      // category fallback: no products, but categories present -> still 2 facts (categories + city)
+      const opening = buildProducerAnswerFirstOpening({ name: "Gård AS", cityName: "Asker", productsList: [], categories: ["honey", "eggs"] });
+      assertTrue(typeof opening === "string", "geo-afo: producer — falls back to category labels when no products list (still real catalog data)");
+    }
+
+    // ── Category page ──
+    const catBase = { label: "Dyreliv & safari", total: 0, fylkeCount: 0, kommuneCount: 0, minPriceFrom: null as number | null };
+
+    assertEq(
+      buildCategoryAnswerFirstOpening({ ...catBase }),
+      null,
+      "geo-afo: category — 0 experiences, no fylker, no price -> null (falls back to generic lede)"
+    );
+    assertEq(
+      buildCategoryAnswerFirstOpening({ ...catBase, total: 5 }),
+      null,
+      "geo-afo: category — total alone (1 real field) -> null (no thin opening emitted)"
+    );
+    {
+      const opening = buildCategoryAnswerFirstOpening({ ...catBase, total: 5, fylkeCount: 3, kommuneCount: 4 });
+      assertTrue(typeof opening === "string" && opening.includes("Dyreliv & safari"), "geo-afo: category — 2 real fields -> non-null opening includes the real category label");
+      assertTrue(!!opening && opening.includes("5") && opening.includes("3 fylker"), "geo-afo: category — opening includes the real total + fylke count (not fabricated)");
+    }
+    {
+      const opening = buildCategoryAnswerFirstOpening({ ...catBase, total: 5, fylkeCount: 3, kommuneCount: 4, minPriceFrom: 350 });
+      assertTrue(!!opening && opening.includes("350 kr"), "geo-afo: category — 3 real fields -> opening includes the real min price (not fabricated)");
+    }
+
+    // ── Kommune page ──
+    const kommuneBase = { kommune: "Ålesund", fylke: "Møre og Romsdal" as string | null, total: 0, categoryCount: 0, minPriceFrom: null as number | null };
+
+    assertEq(
+      buildKommuneAnswerFirstOpening({ ...kommuneBase }),
+      null,
+      "geo-afo: kommune — 0 experiences, no categories, no price -> null (falls back to generic lede)"
+    );
+    assertEq(
+      buildKommuneAnswerFirstOpening({ ...kommuneBase, total: 7 }),
+      null,
+      "geo-afo: kommune — total alone (1 real field) -> null (no thin opening emitted)"
+    );
+    {
+      const opening = buildKommuneAnswerFirstOpening({ ...kommuneBase, total: 7, categoryCount: 2 });
+      assertTrue(typeof opening === "string" && opening.includes("Ålesund"), "geo-afo: kommune — 2 real fields -> non-null opening includes the real kommune name");
+      assertTrue(!!opening && opening.includes("7") && opening.includes("2 kategori"), "geo-afo: kommune — opening includes the real total + category count (not fabricated)");
+    }
+    {
+      const opening = buildKommuneAnswerFirstOpening({ ...kommuneBase, total: 7, categoryCount: 2, minPriceFrom: 199 });
+      assertTrue(!!opening && opening.includes("199 kr"), "geo-afo: kommune — 3 real fields -> opening includes the real min price (not fabricated)");
+    }
+
+    // ── No regression: FAQ JSON-LD builders (geo-faq-cc slice) are unaffected ──
+    assertTrue(typeof buildProducerFaqJsonLd2 === "function", "geo-afo: buildProducerFaqJsonLd still exported (no regression)");
+    assertTrue(typeof buildCategoryFaqJsonLd2 === "function", "geo-afo: buildCategoryFaqJsonLd still exported (no regression)");
+    assertTrue(typeof buildKommuneFaqJsonLd2 === "function", "geo-afo: buildKommuneFaqJsonLd still exported (no regression)");
+    {
+      const faq = buildProducerFaqJsonLd2({ name: "Gård AS", url: "https://rettfrabonden.com/produsent/gard-as", cityName: "Asker", productsList: ["Honning", "Egg"], categories: [], hoursList: [], hoursText: "" });
+      assertTrue(!!faq && faq["@type"] === "FAQPage", "geo-afo: buildProducerFaqJsonLd still returns a valid FAQPage (no regression from answer-first wiring)");
+    }
+
+    // ── Source-presence: wiring + fail-safe-and-log-on-fallback, not silent catch-and-null ──
+    const fsAfo = require("fs");
+    const seoSrcAfo = fsAfo.readFileSync("src/routes/seo.ts", "utf8");
+    const expSeoSrcAfo = fsAfo.readFileSync("src/routes/experiences-seo.ts", "utf8");
+
+    assertTrue(seoSrcAfo.includes("function buildProducerAnswerFirstOpening"), "geo-afo: seo.ts defines buildProducerAnswerFirstOpening");
+    assertTrue(seoSrcAfo.includes("class=\"pf-answer\""), "geo-afo: seo.ts renders the answer-first opening as a distinct pf-answer paragraph on the producer page");
+    assertTrue(
+      /answerFirstOpening \? `<p class="pf-answer"/.test(seoSrcAfo),
+      "geo-afo: producer page only renders pf-answer when the quality gate passed (no thin/empty paragraph)"
+    );
+    assertTrue(
+      seoSrcAfo.includes("answer-first opening skipped (insufficient real facts) — falling back to existing description block"),
+      "geo-afo: producer page LOGS the fallback instead of silently swallowing it (PR-149 regression guard)"
+    );
+
+    assertTrue(expSeoSrcAfo.includes("function buildCategoryAnswerFirstOpening"), "geo-afo: experiences-seo.ts defines buildCategoryAnswerFirstOpening");
+    assertTrue(expSeoSrcAfo.includes("function buildKommuneAnswerFirstOpening"), "geo-afo: experiences-seo.ts defines buildKommuneAnswerFirstOpening");
+    assertTrue(
+      expSeoSrcAfo.includes("answer-first opening skipped (insufficient real facts) — falling back to generic lede"),
+      "geo-afo: category/kommune pages LOG the fallback instead of silently swallowing it (PR-149 regression guard)"
+    );
+    assertTrue(
+      /lede,\s*\n\s*canonicalPath,/.test(expSeoSrcAfo),
+      "geo-afo: /kategori/:category wires the resolved lede (answer-first or fallback) into renderBrowsePage"
+    );
+    assertTrue(
+      expSeoSrcAfo.includes("lede: kommuneLede,"),
+      "geo-afo: /kommune/:kommune wires the resolved lede (answer-first or fallback) into renderBrowsePage"
+    );
+    // Existing FAQ wiring from the geo-faq-cc slice must still be intact (no regression).
+    assertTrue(
+      expSeoSrcAfo.includes("extraJsonLd: categoryFaqJsonLd ? [categoryFaqJsonLd] : undefined"),
+      "geo-afo: /kategori/:category still wires the category FAQPage block (no regression to geo-faq-cc slice)"
+    );
+    assertTrue(
+      expSeoSrcAfo.includes("extraJsonLd: kommuneFaqJsonLd ? [kommuneFaqJsonLd] : undefined"),
+      "geo-afo: /kommune/:kommune still wires the kommune FAQPage block (no regression to geo-faq-cc slice)"
+    );
+  } catch (err) {
+    failed++;
+    failures.push(`geo-afo: unexpected error: ${err instanceof Error ? (err.stack || err.message) : String(err)}`);
+  }
+})();
+
 
 
 // ═══════════════════════════════════════════════════════════════════════
