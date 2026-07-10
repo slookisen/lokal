@@ -26,6 +26,7 @@ import { getDb } from "../database/init";
 import { conversationService, buildRequestMeta } from "../services/conversation-service";
 import { getTrafficStats } from "../services/traffic-stats";
 import { isDisplayablePhone } from "../services/contact-normalizer";
+import { isJunkDescription } from "../services/description-quality";
 import { getProfileActivity } from "../services/profile-activity-service";
 import { slugify } from "../utils/slug";
 import { addUtmParams } from "../utils/url-utm";
@@ -393,7 +394,11 @@ function producerCard(a: any, _matchReasons?: string[], lang: Lang = "no"): stri
   const slug = slugify(a.name);
   const cats = (a.categories || []).slice(0, 3).map((c: string) => `<span class="tag">${catEmoji(c)} ${escapeHtml(formatCat(c))}</span>`).join("");
   const trustPct = Math.round((a.trustScore || 0) * 100);
-  const desc = a.description || "";
+  let desc = a.description || "";
+  if (isJunkDescription(desc)) {
+    console.log(`[description-guard] suppressed junk description (producerCard) for ${a.id} (${a.name})`);
+    desc = "";
+  }
   const verified = a.isVerified ? `<span class="badge badge-v">&#10003; ${escapeHtml(t(lang, "producer.verified"))}</span>` : "";
   // EN viewers see a discreet "Norwegian original" hint when descriptions
   // have not been translated yet (we only have NO descriptions for now).
@@ -457,6 +462,10 @@ function producerCardUltraRich(a: any, knowledge: any, lang: Lang = "no"): strin
 
   // Description: prefer knowledge.about, fall back to agent description. Cap at 350 chars.
   let desc = (knowledge?.about && knowledge.about.length > 20) ? knowledge.about : (a.description || "");
+  if (isJunkDescription(desc)) {
+    console.log(`[description-guard] suppressed junk description (producerCardUltraRich) for ${a.id} (${a.name})`);
+    desc = "";
+  }
   if (desc.length > 350) desc = desc.slice(0, 347).trimEnd() + "…";
 
   const verified = `<span class="badge badge-v">&#10003; ${escapeHtml(t(lang, "producer.verified"))}</span>`;
@@ -536,6 +545,10 @@ function producerCardMediumRich(a: any, knowledge: any, lang: Lang = "no"): stri
 
   // Description: keep existing truncation behavior (~180 chars)
   let desc = a.description || "";
+  if (isJunkDescription(desc)) {
+    console.log(`[description-guard] suppressed junk description (producerCardMediumRich) for ${a.id} (${a.name})`);
+    desc = "";
+  }
   if (desc.length > 180) desc = desc.slice(0, 177).trimEnd() + "…";
 
   const verified = `<span class="badge badge-v">&#10003; ${escapeHtml(t(lang, "producer.verified"))}</span>`;
@@ -2120,9 +2133,14 @@ router.get("/:city", (req: Request, res: Response, next: any) => {
     const jsonLdItems = cityAgents.slice(0, 50).map((a: any) => {
       const info = knowledgeService.getAgentInfo(a.id);
       const k = info?.knowledge || {} as any;
+      let itemDesc = a.description || "";
+      if (isJunkDescription(itemDesc)) {
+        console.log(`[description-guard] suppressed junk description (city JSON-LD) for ${a.id} (${a.name})`);
+        itemDesc = "";
+      }
       const item: any = {
         "@context": "https://schema.org", "@type": "LocalBusiness",
-        "name": a.name, "description": a.description || "",
+        "name": a.name, "description": itemDesc,
         "url": `${BASE_URL}/produsent/${slugify(a.name)}`,
       };
       if (k.address) item.address = { "@type": "PostalAddress", "streetAddress": k.address, "addressLocality": cityName, "addressCountry": "NO" };
@@ -2514,7 +2532,12 @@ export function renderRelatedSection(
   if (!rows.length) return "";
   const items = rows.map((r) => {
     const slug = slugify(r.name);
-    const preview = formatRelatedPreview(r.description || r.about, 180);
+    let previewSource = r.description || r.about || "";
+    if (previewSource && isJunkDescription(previewSource)) {
+      console.log(`[description-guard] suppressed junk description (related-producer preview) for ${r.id} (${r.name})`);
+      previewSource = "";
+    }
+    const preview = formatRelatedPreview(previewSource, 180);
     const cityLabel = r.city ? escapeHtml(r.city) : "";
     return `<a href="${localizedPath("/produsent/" + slug, lang)}" class="rp-card">
       <div class="rp-name">${escapeHtml(r.name)}</div>
@@ -2811,6 +2834,23 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
     const meta = (info?.meta || {}) as any;
     const trustPct = Math.round((agent.trustScore || 0) * 100);
 
+    // Render-time guard: nav/boilerplate scraped text masquerading as a real
+    // description must never render (dev-request 2026-07-04-rfb-datakvalitet
+    // item 1, render-guard-only slice — mirrors item 3's isDisplayablePhone
+    // pattern). Computed once here and reused by every section below (hero
+    // lede, umbrella "about", LocalBusiness JSON-LD, <meta name="description">)
+    // so a junk value never reaches any public output for this page.
+    const rawDescription = agent.description || "";
+    const rawAbout = k.about || "";
+    const safeDescription = isJunkDescription(rawDescription) ? "" : rawDescription;
+    const safeAbout = isJunkDescription(rawAbout) ? "" : rawAbout;
+    if (rawDescription && !safeDescription) {
+      console.log(`[description-guard] suppressed junk agent.description for ${agent.id} (${agent.name}) on /produsent/${slug}`);
+    }
+    if (rawAbout && !safeAbout) {
+      console.log(`[description-guard] suppressed junk knowledge.about for ${agent.id} (${agent.name}) on /produsent/${slug}`);
+    }
+
     // ─── Phase 5.11 A2: umbrella-fields + affiliations lookup ─────────
     // The A1 migration added umbrella_type/parent_umbrella_id/etc. as
     // nullable columns. We read them directly here rather than threading
@@ -2962,7 +3002,7 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
         "cooperative": "Samvirke",
       };
       const umbTypeBadge = umbTypeNo[umbType] || umbType;
-      const aboutText = (k.about || agent.description || "").trim();
+      const aboutText = (safeAbout || safeDescription || "").trim();
       const venuesList = (() => {
         try { return umbrellaRow.umbrella_venues ? JSON.parse(umbrellaRow.umbrella_venues) : []; }
         catch { return []; }
@@ -3396,7 +3436,7 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
       "@type": "LocalBusiness",
       "@id": `${BASE_URL}/produsent/${slug}#business`,
       "name": agent.name,
-      "description": agent.description || k.about || `Lokal ${getConfig().domain_dictionary.entity} i ${cityName || "Norge"}`,
+      "description": safeDescription || safeAbout || `Lokal ${getConfig().domain_dictionary.entity} i ${cityName || "Norge"}`,
       "url": `${BASE_URL}/produsent/${slug}`,
     };
 
@@ -3778,8 +3818,8 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
         ${cityName ? `<div class="pf-loc">&#128205; ${escapeHtml(k.address || cityName)}${k.postalCode ? `, ${escapeHtml(k.postalCode)}` : ""}</div>` : ""}
         ${answerFirstOpening ? `<p class="pf-answer"${lang === "en" ? ' lang="nb"' : ""}>${escapeHtml(answerFirstOpening)}</p>` : ""}
         ${(() => {
-          const desc = agent.description || "";
-          const about = k.about || "";
+          const desc = safeDescription;
+          const about = safeAbout;
           if (!desc && !about) return "";
           // If only one exists, use it
           if (!desc) return `<p class="pf-desc"${lang === "en" ? ' lang="nb"' : ""}>${escapeHtml(about)}</p>`;
@@ -3797,7 +3837,7 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
           }
           return `<p class="pf-desc">${escapeHtml(primary)}</p>`;
         })()}
-        ${lang === "en" && (agent.description || k.about) ? `<div style="display:inline-block;margin-top:10px;padding:4px 10px;background:#f8f8f4;border:1px solid #e8e8e0;border-radius:6px;font-size:11px;color:#666;" title="${escapeHtml(t(lang, "common.translate_note"))}">\u{1F1F3}\u{1F1F4} ${escapeHtml(t(lang, "common.from_norwegian"))}</div>` : ""}
+        ${lang === "en" && (safeDescription || safeAbout) ? `<div style="display:inline-block;margin-top:10px;padding:4px 10px;background:#f8f8f4;border:1px solid #e8e8e0;border-radius:6px;font-size:11px;color:#666;" title="${escapeHtml(t(lang, "common.translate_note"))}">\u{1F1F3}\u{1F1F4} ${escapeHtml(t(lang, "common.from_norwegian"))}</div>` : ""}
         <div class="pf-stats">
           <div class="pf-stat"><div class="pf-stat-icon t">&#9733;</div><div><strong>${trustPct}%</strong><small>${lang === "en" ? "Trust Score" : "Trust Score"}</small></div></div>
           ${k.googleRating ? `<div class="pf-stat"><div class="pf-stat-icon r">&#11088;</div><div><strong>${k.googleRating} / 5</strong><small>${k.googleReviewCount || 0} ${lang === "en" ? "reviews" : "anmeldelser"}</small></div></div>` : ""}
@@ -3981,7 +4021,7 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
 
     res.send(shell(
       `${agent.name}${cityName ? t(lang, "producer.title_suffix", { city: cityName }) : ""}${titleFreshnessSuffix(updatedAtDate)}`,
-      `${agent.name}${cityName ? ` ${lang === "en" ? "in" : "i"} ${cityName}` : ""}. ${safeMetaDescription(agent.description) || (lang === "en" ? "Local food in Norway." : "Lokalprodusert mat i Norge.")}`,
+      `${agent.name}${cityName ? ` ${lang === "en" ? "in" : "i"} ${cityName}` : ""}. ${safeMetaDescription(safeDescription) || (lang === "en" ? "Local food in Norway." : "Lokalprodusert mat i Norge.")}`,
       content,
       { canonical: `${BASE_URL}${localizedPath("/produsent/" + slug, lang)}`, jsonLd: faqJsonLd ? [jsonLd, faqJsonLd] : jsonLd, extraCss: PROFILE_CSS + RELATED_PRODUCERS_CSS, lang, pathForAlternate: "/produsent/" + slug }
     ));

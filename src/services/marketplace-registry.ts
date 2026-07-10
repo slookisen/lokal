@@ -9,6 +9,7 @@ import {
   DiscoveryResult,
 } from "../models/marketplace";
 import { slugify } from "../utils/slug";
+import { isJunkDescription } from "./description-quality";
 
 // ─── Marketplace Registry Service (SQLite-backed) ────────────
 // This is the CORE of what makes Lokal unique: the agent registry.
@@ -589,9 +590,19 @@ class MarketplaceRegistry {
     const agent = this.getAgent(agentId);
     if (!agent) return null;
 
+    // dev-request 2026-07-04-rfb-datakvalitet item 1 (description
+    // sanitizer, render-guard-only slice): this backs the public,
+    // unauthenticated GET /agents/:id/card A2A card — never echo scraped
+    // nav/boilerplate junk here.
+    let cardDescription = agent.description;
+    if (cardDescription && isJunkDescription(cardDescription)) {
+      console.log(`[description-guard] suppressed junk description (agent-card) for ${agent.id} (${agent.name})`);
+      cardDescription = "";
+    }
+
     return {
       name: agent.name,
-      description: agent.description,
+      description: cardDescription,
       url: agent.url,
       provider: { organization: agent.provider },
       version: agent.version,

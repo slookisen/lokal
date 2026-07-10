@@ -9,6 +9,7 @@ import { knowledgeService, relabelCertifications } from "../services/knowledge-s
 import { redactPII } from "../utils/pii-redact";
 import { getDb } from "../database/init";
 import { isDisplayablePhone } from "../services/contact-normalizer";
+import { isJunkDescription } from "../services/description-quality";
 
 // ─── A2A Routes ──────────────────────────────────────────────
 // Two protocols served here:
@@ -488,6 +489,14 @@ router.get("/agents/:id/agent.json", (req: Request, res: Response) => {
       .prepare("SELECT debio_verified FROM agents WHERE id = ?")
       .get(req.params.id as string) as { debio_verified?: number } | undefined;
     const isDebioVerified = debioRow?.debio_verified === 1;
+    // dev-request 2026-07-04-rfb-datakvalitet item 1 (description sanitizer,
+    // render-guard-only slice): x-knowledge.about is public, unauthenticated
+    // A2A/MCP JSON output — never return scraped nav/boilerplate junk here.
+    let safeAbout = knowledge.about;
+    if (safeAbout && isJunkDescription(safeAbout)) {
+      console.log(`[description-guard] suppressed junk knowledge.about (agent.json x-knowledge) for ${req.params.id} (${card.name})`);
+      safeAbout = undefined;
+    }
     const enriched: Record<string, any> = { ...card };
     enriched["x-knowledge"] = {
       address: knowledge.address,
@@ -509,7 +518,7 @@ router.get("/agents/:id/agent.json", (req: Request, res: Response) => {
       googleReviewCount: knowledge.googleReviewCount,
       externalLinks: knowledge.externalLinks,
       seasonality: knowledge.seasonality,
-      about: knowledge.about,
+      about: safeAbout,
       dataSource: knowledge.dataSource,
       lastEnrichedAt: knowledge.lastEnrichedAt,
     };

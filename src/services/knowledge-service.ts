@@ -2,6 +2,7 @@ import { v4 as uuid } from "uuid";
 import crypto from "crypto";
 import { getDb } from "../database/init";
 import { isDisplayablePhone } from "./contact-normalizer";
+import { isJunkDescription } from "./description-quality";
 
 // ─── PR-95 (2026-06-01): Debio cert relabelling ──────────────────────
 //
@@ -314,8 +315,14 @@ class KnowledgeService {
         email: knowledge?.email,
         openingHours: knowledge?.openingHours || [],
         products: knowledge?.products || [],
-        about: knowledge?.about || "",
-        description: agent.description || "",
+        // dev-request 2026-07-04-rfb-datakvalitet item 1 (description
+        // sanitizer, render-guard-only slice): mirrors the isDisplayablePhone
+        // guard above — this feeds the public buyer-facing "tell me about
+        // this seller" endpoints (GET /agents/:id/info, MCP lokal_info),
+        // so scraped nav/boilerplate junk (e.g. "Skip to content ... Meny")
+        // must never be returned as if it were a real description/about text.
+        about: this.guardedDescriptionField(agentId, agent.name, "knowledge.about", knowledge?.about),
+        description: this.guardedDescriptionField(agentId, agent.name, "agent.description", agent.description),
         specialties: knowledge?.specialties || [],
         // PR-95: rewrite certifications to reflect debio_verified flag.
         certifications: relabelCertifications(knowledge?.certifications, debioVerified),
@@ -338,6 +345,20 @@ class KnowledgeService {
           : "Denne informasjonen er basert på offentlig tilgjengelige kilder og kan være utdatert. Kontakt selger direkte for oppdatert informasjon.",
       },
     };
+  }
+
+  // Render-time junk guard for getAgentInfo's `about`/`description` fields
+  // (dev-request 2026-07-04-rfb-datakvalitet item 1). Returns the raw text
+  // unchanged when it passes the heuristic; returns "" and logs a low-noise
+  // diagnostic when it doesn't — never a silent catch-and-null, same
+  // convention as every other suppression path in this codebase.
+  private guardedDescriptionField(agentId: string, agentName: string, fieldLabel: string, raw: string | null | undefined): string {
+    const value = raw || "";
+    if (value && isJunkDescription(value)) {
+      console.log(`[description-guard] suppressed junk ${fieldLabel} (getAgentInfo) for ${agentId} (${agentName})`);
+      return "";
+    }
+    return value;
   }
 
   // ─── Normalize products before storage ─────────────────
