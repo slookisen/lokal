@@ -689,6 +689,10 @@ router.post("/admin/content-refresh", requireAdmin, async (req: Request, res: Re
 
 import { getDb as getRfbDb } from "../database/init";
 import { getDb as getExpDb } from "../database/db-factory";
+// dev-request 2026-07-10-dedup-backfill-trigger — thin HTTP wrapper around the
+// ALREADY-MERGED, already-tested dedup pass (PR #209). Reused verbatim, never
+// reimplemented here.
+import { runDedupPass } from "../services/experience-dedup";
 
 // Tight drikkeprodusent filter — beverage manufacturers with on-site production only.
 // INCLUDE: bryggeri, cideri/sideri, mjød, destilleri/brenneri, vin, kombucha.
@@ -856,6 +860,27 @@ router.post("/admin/rfb-seed", requireAdmin, (req: Request, res: Response) => {
     apply_mode: !dryRun,
     candidates: candidateNames,
   });
+});
+
+// ─── POST /api/opplevelser/admin/dedup-backfill (admin) ─────────────
+// Thin HTTP trigger for the existing, already-reviewed-and-merged dedup pass
+// (dev-request 2026-07-04-opplevagent-dedup-og-norske-titler item 1,
+// src/services/experience-dedup.ts, PR #209). It previously could only be
+// run via `npx tsx src/scripts/experiences-dedup-backfill.ts` directly on the
+// production machine — this route exposes the SAME pure function over HTTP
+// (admin-key gated) so it can be triggered without shell/SSH access. Does NOT
+// reimplement or alter any dedup/matching/merge logic.
+// Idempotent — safe to re-run: runDedupPass() only ever loads rows with
+// canonical_id IS NULL, so no dry-run mode is needed.
+router.post("/admin/dedup-backfill", requireAdmin, (req: Request, res: Response) => {
+  try {
+    const db = getExpDb("experiences");
+    const result = runDedupPass(db);
+    res.json(result);
+  } catch (err) {
+    console.error("[opplevelser] dedup-backfill failed", err);
+    res.status(500).json({ error: "Dedup pass failed", details: String(err) });
+  }
 });
 
 // ─── GET /api/opplevelser/:id — single experience ───────────────────

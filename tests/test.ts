@@ -25805,3 +25805,147 @@ console.log("\n── mcp-usage-guides: GET /guide-opplevelser-mcp (opplevagent.
     failures.push(`mcp-usage-guides (opplevagent): unexpected error: ${err instanceof Error ? (err.stack || err.message) : String(err)}`);
   }
 })();
+
+// ── orch-pr-211: POST /api/opplevelser/admin/dedup-backfill ────────────────
+// dev-request 2026-07-10-dedup-backfill-trigger: this orchestration session
+// has no shell/SSH access to the production Fly machine, only HTTP +
+// X-Admin-Key — so the already-merged, already-tested dedup pass (PR #209,
+// src/services/experience-dedup.ts) needed a thin HTTP trigger to actually
+// run it against live data. Covers: requireAdmin gate (403 missing/wrong
+// key), the REAL runDedupPass() runs and returns its real result shape
+// (groupsFound/rowsMerged/canonicalIds), the DB is actually merged (not just
+// the response shape), an unrelated row is left untouched, and re-running is
+// a true idempotent no-op. Dispatches through the router's OWN middleware
+// stack (requireAdmin THEN handler) via sync mock req/res — same isolated
+// :memory: experiences DB pattern as sq-caticon/gardssalg-book/geo-pb-http
+// above — fully synchronous, so it cannot race the async report tail.
+console.log("\n── orch-pr-211: POST /api/opplevelser/admin/dedup-backfill ──");
+(() => {
+  const prevPathDB = process.env.EXPERIENCES_DB_PATH;
+  const prevAdminKeyDB = process.env.ADMIN_KEY;
+  process.env.EXPERIENCES_DB_PATH = ":memory:";
+  process.env.ADMIN_KEY = "dedup-backfill-test-admin-key";
+
+  const dbFacPathDB = require.resolve("../src/database/db-factory");
+  const expStPathDB = require.resolve("../src/services/experience-store");
+  const expDedupPathDB = require.resolve("../src/services/experience-dedup");
+  const opplevelserPathDB = require.resolve("../src/routes/opplevelser");
+  delete require.cache[dbFacPathDB];
+  delete require.cache[expStPathDB];
+  delete require.cache[expDedupPathDB];
+  delete require.cache[opplevelserPathDB];
+
+  try {
+    const dbFacDB = require("../src/database/db-factory") as typeof import("../src/database/db-factory");
+    dbFacDB.__resetDbFactoryForTesting();
+    const expStDB = require("../src/services/experience-store") as typeof import("../src/services/experience-store");
+    const opplevelserDB = (require("../src/routes/opplevelser") as { default: import("express").Router }).default as any;
+
+    const dbDB = dbFacDB.getDb("experiences");
+
+    const layerDB = (opplevelserDB.stack as any[]).find(
+      (l: any) => l.route && l.route.path === "/admin/dedup-backfill" && l.route.methods?.post
+    );
+    assertTrue(!!layerDB, "dedup-backfill-00: router has POST /admin/dedup-backfill layer");
+
+    // Dispatch through the FULL middleware stack (requireAdmin THEN handler),
+    // exactly like Express would, so the admin gate is genuinely exercised
+    // (not just source-grepped).
+    function invokeDedupBackfill(headers: Record<string, string>): { status: number; body: any } {
+      let status = 200;
+      let body: any = null;
+      const res: any = {
+        status: (c: number) => { status = c; return res; },
+        json: (o: unknown) => { body = o; return res; },
+      };
+      const req: any = { headers, path: "/admin/dedup-backfill", method: "POST" };
+      const stack = layerDB.route.stack as any[];
+      let idx = 0;
+      const next = (err?: unknown) => {
+        if (err) throw err;
+        const l = stack[idx++];
+        if (l) l.handle(req, res, next);
+      };
+      next();
+      return { status, body };
+    }
+
+    // ── db-1: missing X-Admin-Key -> 403, handler never runs. ──────────────
+    {
+      const r = invokeDedupBackfill({});
+      assertEq(r.status, 403, "dedup-backfill-01: missing X-Admin-Key -> 403");
+    }
+    // ── db-2: wrong X-Admin-Key -> 403. ─────────────────────────────────────
+    {
+      const r = invokeDedupBackfill({ "x-admin-key": "wrong-key" });
+      assertEq(r.status, 403, "dedup-backfill-02: wrong X-Admin-Key -> 403");
+    }
+
+    // ── Seed 2 duplicate experiences (same provider org_nr, same kommune,
+    //    titles sharing the >=5-char distinctive token "kontiki" so
+    //    titlesMatch() is guaranteed true) + 1 unrelated experience, so the
+    //    pass has real work to do and we can assert on real merge output.
+    const provDB = expStDB.createProvider({
+      navn: "Kon-Tiki Museet AS", org_nr: "912000111",
+      fylke: "Oslo", kommune: "Oslo",
+      brreg_verified: 1, brreg_active: 1, verification_status: "verified",
+    });
+    const dupIdA = expStDB.createExperience({
+      title: "Kon-Tiki Museet - Omvisning", provider_id: provDB, provider_match_status: "matched",
+      category: "kultur_historie", fylke: "Oslo", kommune: "Oslo",
+      confidence: "high", verification_status: "verified",
+    });
+    const dupIdB = expStDB.createExperience({
+      title: "Kon-Tiki Museet pa Bygdoy", provider_id: provDB, provider_match_status: "matched",
+      category: "kultur_historie", fylke: "Oslo", kommune: "Oslo",
+      confidence: "high", verification_status: "verified",
+    });
+    const unrelatedId = expStDB.createExperience({
+      title: "Hvalsafari fra Tromso", provider_id: null, provider_match_status: "unmatched",
+      category: "dyreliv_safari", fylke: "Troms", kommune: "Tromso",
+      confidence: "high", verification_status: "verified",
+    });
+
+    // ── db-3: correct key -> 200, runs the REAL runDedupPass(), returns its
+    //    real shape (groupsFound/rowsMerged/canonicalIds), and the DB is
+    //    actually merged (one row's canonical_id now points at the other).
+    {
+      const r = invokeDedupBackfill({ "x-admin-key": "dedup-backfill-test-admin-key" });
+      assertEq(r.status, 200, "dedup-backfill-03a: correct X-Admin-Key -> 200");
+      assertEq(r.body.groupsFound, 1, "dedup-backfill-03b: 1 duplicate group found");
+      assertEq(r.body.rowsMerged, 1, "dedup-backfill-03c: 1 row merged");
+      assertTrue(Array.isArray(r.body.canonicalIds) && r.body.canonicalIds.length === 1,
+        "dedup-backfill-03d: canonicalIds has exactly 1 entry");
+      assertTrue(
+        r.body.canonicalIds[0] === dupIdA || r.body.canonicalIds[0] === dupIdB,
+        "dedup-backfill-03e: canonical id is one of the 2 duplicate rows"
+      );
+      const canonicalId = r.body.canonicalIds[0] as string;
+      const mergedId = canonicalId === dupIdA ? dupIdB : dupIdA;
+      const mergedRow = dbDB.prepare("SELECT canonical_id FROM experiences WHERE id = ?").get(mergedId) as { canonical_id: string | null };
+      assertEq(mergedRow.canonical_id, canonicalId, "dedup-backfill-03f: merged row's canonical_id actually stamped in the DB");
+      const unrelatedRow = dbDB.prepare("SELECT canonical_id FROM experiences WHERE id = ?").get(unrelatedId) as { canonical_id: string | null };
+      assertEq(unrelatedRow.canonical_id, null, "dedup-backfill-03g: unrelated experience untouched (canonical_id still NULL)");
+    }
+
+    // ── db-4: idempotent re-run -- no work left, 0 groups/0 merged. ────────
+    {
+      const r = invokeDedupBackfill({ "x-admin-key": "dedup-backfill-test-admin-key" });
+      assertEq(r.status, 200, "dedup-backfill-04a: re-run -> 200");
+      assertEq(r.body.groupsFound, 0, "dedup-backfill-04b: re-run finds 0 groups (already merged)");
+      assertEq(r.body.rowsMerged, 0, "dedup-backfill-04c: re-run merges 0 rows (idempotent no-op)");
+    }
+
+    console.log("  orch-pr-211 dedup-backfill: OK (9 tests: route-registered/403-missing/403-wrong/200-shape/groupsFound/rowsMerged/canonicalIds/db-stamped/unrelated-untouched/idempotent-rerun)");
+  } catch (err) {
+    failed++;
+    failures.push(`orch-pr-211 dedup-backfill: unexpected error: ${err instanceof Error ? (err.stack || err.message) : String(err)}`);
+  } finally {
+    if (prevPathDB === undefined) delete process.env.EXPERIENCES_DB_PATH;
+    else process.env.EXPERIENCES_DB_PATH = prevPathDB;
+    if (prevAdminKeyDB === undefined) delete process.env.ADMIN_KEY;
+    else process.env.ADMIN_KEY = prevAdminKeyDB;
+    const dbFacResetDB = require("../src/database/db-factory") as typeof import("../src/database/db-factory");
+    dbFacResetDB.__resetDbFactoryForTesting();
+  }
+})();
