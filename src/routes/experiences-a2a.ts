@@ -41,8 +41,42 @@ import {
 import { __FYLKE_INTERNAL, NON_KOMMUNE_REGION_LABELS } from "../services/norway-fylke";
 import { getExperiencesAgentCard } from "../services/experiences-agent-card";
 import { jsonRpcLimiter } from "../middleware/security";
+import { conversationService, buildRequestMeta, type RequestMeta } from "../services/conversation-service";
 
 const router = Router();
+
+// ─── Conversation logging (dev-request 2026-07-10-opplevagent-conversation-logging, slice 1) ──
+// Deliberate, narrow exception to this file's "never touch the rfb DB" host
+// isolation: `conversations` is a SHARED cross-vertical table living in the
+// MAIN db (see conversation-service.ts), tagged per-row with vertical_id —
+// it is not experience CONTENT, it is agent-traffic observability, and the
+// dev-request's whole point is to start populating it for 'experiences' so
+// slice 2's vertical-filter (and the future /samtaler-style page) has real
+// data. Experience content queries still go exclusively through
+// experience-store.ts / getDb('experiences') — untouched by this.
+//
+// FAIL-OPEN IS ABSOLUTE: these are live, agent-facing endpoints. A logging
+// failure (DB hiccup, unexpected shape) must NEVER change the response a
+// real agent gets — every call site wraps this in try/catch and ignores it.
+export interface ExperiencesRequestCtx {
+  requestMeta?: RequestMeta;
+  clientIdentity?: string;
+}
+
+function logExperiencesInteraction(opts: {
+  skill: string;
+  queryText?: string;
+  ctx?: ExperiencesRequestCtx;
+}): void {
+  conversationService.startConversation({
+    verticalId: "experiences",
+    source: "a2a",
+    queryText: opts.queryText || opts.skill,
+    clientIdentity: opts.ctx?.clientIdentity,
+    requestMeta: opts.ctx?.requestMeta,
+    autoRespond: false,
+  });
+}
 
 // ─── JSON-RPC helpers ────────────────────────────────────────
 
@@ -210,7 +244,8 @@ export function parseExperiencesIntent(text: string): DiscoverFilter {
 
 export function handleExperiencesMessageSend(
   params: unknown,
-  id: unknown
+  id: unknown,
+  ctx?: ExperiencesRequestCtx
 ): object {
   const p = params && typeof params === "object" ? (params as Record<string, unknown>) : {};
   const message = p.message;
@@ -257,6 +292,7 @@ export function handleExperiencesMessageSend(
   ) {
     try {
       const categories = listCategories();
+      try { logExperiencesInteraction({ skill: "opplevelser_categories", queryText: messageText || undefined, ctx }); } catch { /* fail-open: never affects the response */ }
       return rpcOk(id, {
         taskId: `experiences-categories-${Date.now()}`,
         status: { state: "completed", timestamp: new Date().toISOString() },
@@ -282,6 +318,7 @@ export function handleExperiencesMessageSend(
   if (idMatch) {
     try {
       const exp = getExperienceById(idMatch[1]!);
+      try { logExperiencesInteraction({ skill: "opplevelser_info", queryText: messageText || idMatch[1], ctx }); } catch { /* fail-open: never affects the response */ }
       if (!exp) {
         return rpcOk(id, {
           taskId: `experiences-info-${Date.now()}`,
@@ -326,6 +363,8 @@ export function handleExperiencesMessageSend(
     if (relaxationNote) summaryText += ` ${relaxationNote}`;
 
     const suggestions = buildNarrowingSuggestions(results, relaxedKeys);
+
+    try { logExperiencesInteraction({ skill: "opplevelser_discover", queryText: messageText || undefined, ctx }); } catch { /* fail-open: never affects the response */ }
 
     return rpcOk(id, {
       taskId: `experiences-discover-${Date.now()}`,
@@ -387,7 +426,7 @@ router.post("/a2a", (req: Request, res: Response) => {
     switch (method) {
       case "message/send":
       case "tasks/send": { // Backward-compat alias for older A2A clients (<0.3)
-        const result = handleExperiencesMessageSend(params, id);
+        const result = handleExperiencesMessageSend(params, id, { requestMeta: buildRequestMeta(req) });
         res.json(result);
         break;
       }

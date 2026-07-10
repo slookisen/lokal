@@ -15496,6 +15496,178 @@ console.log("\n── orch-pr-19: opplevagent.no host-gate (experiences) ──"
   dbFactory19.__resetDbFactoryForTesting();
 })();
 
+// ── opplevagent-conversation-logging (dev-request 2026-07-10) ────────────────
+// Slice 1: experiences-a2a/mcp log real agent interactions into the SHARED
+// `conversations` table with vertical_id='experiences', fail-open, reusing
+// the rfb-samtaler is_internal classifier. Slice 2: listConversations /
+// getSourceStats / getConversation get a vertical-filter defaulting to
+// 'rfb' — every existing RFB call site (no param) must be byte-for-byte
+// unchanged, and 'experiences' rows must be fully invisible to it.
+console.log("\n── opplevagent-conversation-logging: slices 1+2 ──");
+(() => {
+  // Isolated MAIN db (conversations/messages live here — see conversation-service.ts)
+  // AND isolated EXPERIENCES db (discover/get results — see experience-store.ts),
+  // set up the same way as rfb-samtaler-slice4 and orch19-05 respectively.
+  // MUST restore the previous main-db singleton in the finally block below —
+  // leaving it swapped corrupts later tests that assume the real shared main
+  // db (this is exactly PR-56's documented __setDbForTesting footgun).
+  const prevMainDbOcl = getDb();
+  const cdbOcl = new Database(":memory:");
+  cdbOcl.pragma("foreign_keys = ON");
+  __setDbForTesting(cdbOcl);
+  __initSchemaForTesting(cdbOcl);
+
+  const prevPathOcl = process.env.EXPERIENCES_DB_PATH;
+  process.env.EXPERIENCES_DB_PATH = ":memory:";
+  const dbFactoryPathOcl = require.resolve("../src/database/db-factory");
+  const expStorePathOcl = require.resolve("../src/services/experience-store");
+  const expA2aPathOcl = require.resolve("../src/routes/experiences-a2a");
+  const expMcpPathOcl = require.resolve("../src/routes/experiences-mcp");
+  delete require.cache[dbFactoryPathOcl];
+  delete require.cache[expStorePathOcl];
+  delete require.cache[expA2aPathOcl];
+  delete require.cache[expMcpPathOcl];
+
+  const dbFactoryOcl = require("../src/database/db-factory") as typeof import("../src/database/db-factory");
+  dbFactoryOcl.__resetDbFactoryForTesting();
+  dbFactoryOcl.getDb("experiences");
+  const expA2aOcl = require("../src/routes/experiences-a2a") as typeof import("../src/routes/experiences-a2a");
+  const expMcpOcl = require("../src/routes/experiences-mcp") as typeof import("../src/routes/experiences-mcp");
+  const { interactionLogger: interactionLoggerOcl } = require("../src/services/interaction-logger") as typeof import("../src/services/interaction-logger");
+
+  try {
+    // ── conversation-service: vertical-filter default 'rfb' (slice 2) ──
+    insertTestAgent(cdbOcl, "ocl-seller-1", "OCL Test Gård");
+    const rfbConv = _convSvc.startConversation({
+      sellerAgentId: "ocl-seller-1", queryText: "rfb baseline", source: "a2a", autoRespond: false,
+    });
+    assertEq(
+      (cdbOcl.prepare("SELECT vertical_id FROM conversations WHERE id = ?").get(rfbConv.id) as any).vertical_id,
+      "rfb", "ocl-01: startConversation with no verticalId stamps vertical_id='rfb' (unchanged default)"
+    );
+
+    const expConv = _convSvc.startConversation({
+      verticalId: "experiences", source: "mcp", queryText: "hva kan man gjøre i Oslo",
+      requestMeta: _buildRequestMeta({ headers: { "user-agent": "Mozilla/5.0 Chrome/120" } }),
+      autoRespond: false,
+    });
+    assertTrue(!!expConv && expConv.id !== rfbConv.id,
+      "ocl-02: startConversation with no sellerAgentId returns a real conversation (no FK-violation throw, no self-lookup null-crash)");
+    assertEq(
+      (cdbOcl.prepare("SELECT vertical_id, seller_agent_id, is_internal FROM conversations WHERE id = ?").get(expConv.id) as any).vertical_id,
+      "experiences", "ocl-03: startConversation({verticalId:'experiences'}) stamps vertical_id='experiences'"
+    );
+    assertEq(
+      (cdbOcl.prepare("SELECT seller_agent_id FROM conversations WHERE id = ?").get(expConv.id) as any).seller_agent_id,
+      null, "ocl-04: no sellerAgentId -> seller_agent_id stored as NULL (not a fabricated/invalid agents.id)"
+    );
+    assertEq(
+      (cdbOcl.prepare("SELECT is_internal FROM conversations WHERE id = ?").get(expConv.id) as any).is_internal,
+      0, "ocl-05: real browser UA on the experiences conversation -> is_internal=0 (external, publicly counted)"
+    );
+    // The opening system message inherited the same vertical_id too.
+    assertEq(
+      (cdbOcl.prepare("SELECT vertical_id FROM messages WHERE conversation_id = ? LIMIT 1").get(expConv.id) as any).vertical_id,
+      "experiences", "ocl-06: addMessage() called from within startConversation stamped the SAME vertical_id"
+    );
+
+    // ── interactionLogger isolation (review finding): the singleton backs RFB's
+    // PUBLIC /api/live SSE feed + /api/interactions(/stats) endpoints (routes/a2a.ts)
+    // and has no vertical concept — experiences conversations must never reach it,
+    // while rfb conversations must still reach it exactly as before (regression pin).
+    const recentOcl = interactionLoggerOcl.getRecent(200);
+    assertTrue(recentOcl.some((e: any) => e.metadata?.conversationId === rfbConv.id),
+      "ocl-06b: RFB conversation still reaches interactionLogger.log (regression pin — public dashboard/API unaffected)");
+    assertTrue(!recentOcl.some((e: any) => e.metadata?.conversationId === expConv.id),
+      "ocl-06c: experiences conversation does NOT reach interactionLogger.log (no leak onto RFB's public feed/API)");
+    {
+      let sseFiredOcl = false;
+      const sseListenerOcl = () => { sseFiredOcl = true; };
+      interactionLoggerOcl.on("message", sseListenerOcl);
+      try {
+        _convSvc.addMessage({ conversationId: expConv.id, senderRole: "system", content: "ocl-no-leak-check", verticalId: "experiences" });
+        assertTrue(!sseFiredOcl, "ocl-06d: addMessage() on an experiences conversation does NOT emit onto interactionLogger's SSE stream");
+        sseFiredOcl = false;
+        _convSvc.addMessage({ conversationId: rfbConv.id, senderRole: "system", content: "ocl-rfb-still-emits" });
+        assertTrue(sseFiredOcl, "ocl-06e: addMessage() on an rfb conversation still emits onto interactionLogger's SSE stream (regression pin)");
+      } finally {
+        interactionLoggerOcl.removeListener("message", sseListenerOcl);
+      }
+    }
+
+    // ── Probe-UA on an experiences conversation -> is_internal=1 (acceptance criterion) ──
+    const expConvProbe = _convSvc.startConversation({
+      verticalId: "experiences", source: "mcp", queryText: "probe",
+      requestMeta: _buildRequestMeta({ headers: { "user-agent": "loop-dispatcher" } }),
+      autoRespond: false,
+    });
+    assertEq(
+      (cdbOcl.prepare("SELECT is_internal FROM conversations WHERE id = ?").get(expConvProbe.id) as any).is_internal,
+      1, "ocl-07: fleet/probe UA on an experiences conversation -> is_internal=1 (reuses rfb-samtaler classifier)"
+    );
+
+    // ── Isolation: default (no verticalId) NEVER leaks 'experiences' rows into RFB views ──
+    const listDefault = _convSvc.listConversations({ includeInternal: true });
+    assertTrue(listDefault.some(c => c.id === rfbConv.id), "ocl-08: default listConversations() still includes the rfb conversation");
+    assertTrue(!listDefault.some(c => c.id === expConv.id), "ocl-09: default listConversations() does NOT leak the experiences conversation");
+    const listExp = _convSvc.listConversations({ verticalId: "experiences", includeInternal: true });
+    assertTrue(listExp.some(c => c.id === expConv.id), "ocl-10: listConversations({verticalId:'experiences'}) surfaces the experiences conversation");
+    assertTrue(!listExp.some(c => c.id === rfbConv.id), "ocl-11: listConversations({verticalId:'experiences'}) does NOT include the rfb conversation");
+
+    const statsDefault = _convSvc.getSourceStats({ includeInternal: true });
+    const statsDefaultA2a = statsDefault.find(s => s.source === "a2a");
+    assertTrue(!!statsDefaultA2a && statsDefaultA2a.count === 1, "ocl-12: default getSourceStats() counts only the 1 rfb a2a conversation");
+    const statsExp = _convSvc.getSourceStats({ verticalId: "experiences", includeInternal: true });
+    const statsExpMcp = statsExp.find(s => s.source === "mcp");
+    assertTrue(!!statsExpMcp && statsExpMcp.count === 2, "ocl-13: getSourceStats({verticalId:'experiences'}) counts both experiences mcp conversations");
+
+    assertEq(_convSvc.getConversation(expConv.id), null,
+      "ocl-14: default getConversation(id) on an experiences-vertical id returns null (isolation, not a crash)");
+    assertTrue(_convSvc.getConversation(expConv.id, { verticalId: "experiences" })?.id === expConv.id,
+      "ocl-15: getConversation(id, {verticalId:'experiences'}) fetches the experiences conversation");
+    assertTrue(_convSvc.getConversation(rfbConv.id)?.id === rfbConv.id,
+      "ocl-16: default getConversation(id) on an rfb-vertical id is unaffected (regression)");
+
+    // ── experiences-a2a wiring: a real discover call logs a vertical-scoped row ──
+    const beforeCount = (cdbOcl.prepare("SELECT COUNT(*) as c FROM conversations WHERE vertical_id = 'experiences'").get() as any).c;
+    const a2aResp = expA2aOcl.handleExperiencesMessageSend(
+      { message: { text: "hva kan vi finne på i Oslo" } }, "ocl-a2a-discover",
+      { requestMeta: _buildRequestMeta({ headers: { "user-agent": "Mozilla/5.0 Chrome/120" } }), clientIdentity: "ChatGPT" }
+    ) as any;
+    assertTrue(a2aResp.result !== undefined, "ocl-17: experiences-a2a discover call still returns a normal result envelope");
+    const afterCount = (cdbOcl.prepare("SELECT COUNT(*) as c FROM conversations WHERE vertical_id = 'experiences'").get() as any).c;
+    assertEq(afterCount, beforeCount + 1, "ocl-18: the real discover call wrote exactly one new experiences-vertical conversation row");
+
+    // ── FAIL-OPEN (acceptance criterion): a logging throw must never affect the response ──
+    const origStartConversation = _convSvc.startConversation;
+    (_convSvc as any).startConversation = () => { throw new Error("ocl-simulated-logging-failure"); };
+    try {
+      const failOpenResp = expA2aOcl.handleExperiencesMessageSend(
+        { message: { text: "hva kan vi finne på i Bergen" } }, "ocl-fail-open"
+      ) as any;
+      assertTrue(failOpenResp.result !== undefined && failOpenResp.id === "ocl-fail-open",
+        "ocl-19: FAIL-OPEN — logging throws, discover call still responds normally (200-equivalent, correct body)");
+      assertEq(failOpenResp.result?.metadata?.skill, "opplevelser_discover",
+        "ocl-20: FAIL-OPEN — response content is unaffected (still the real discover result)");
+    } finally {
+      (_convSvc as any).startConversation = origStartConversation;
+    }
+
+    // ── MCP client-identity detection (pure function) ──
+    assertEq(expMcpOcl.detectExperiencesMcpClient({ headers: { "user-agent": "Mozilla/5.0 ChatGPT-User/1.0" } } as any),
+      "ChatGPT", "ocl-21: detectExperiencesMcpClient recognises ChatGPT UA");
+    assertEq(expMcpOcl.detectExperiencesMcpClient({ headers: { "user-agent": "curl/8.4.0" } } as any),
+      undefined, "ocl-22: detectExperiencesMcpClient returns undefined for an unrecognised UA");
+
+    console.log("  opplevagent-conversation-logging: OK (27 tests: vertical-stamp/no-fk-crash/null-seller/is_internal/message-vertical/interactionLogger-isolation×4/probe-is_internal/list-isolation×4/stats-isolation×2/getConversation-isolation×3/a2a-wiring×2/fail-open×2/mcp-client-detect×2)");
+  } finally {
+    __setDbForTesting(prevMainDbOcl);
+    if (prevPathOcl === undefined) delete process.env.EXPERIENCES_DB_PATH;
+    else process.env.EXPERIENCES_DB_PATH = prevPathOcl;
+    dbFactoryOcl.__resetDbFactoryForTesting();
+  }
+})();
+
 // orch19-06: experiences-seo router — landing is NOT the rfb homepage;
 // llms.txt / robots.txt / agent-card.json / openapi.json route to experiences.
 // We invoke the router's internal GET layers directly (sync, mock req/res).
