@@ -2,6 +2,7 @@ import express, { Router, Request, Response } from "express";
 import { getDb } from "../database/init";
 import { emailService } from "../services/email-service";
 import { slugify } from "../utils/slug";
+import { getOwnerStats } from "../services/owner-stats-service";
 import crypto from "crypto";
 
 const router = Router();
@@ -1170,6 +1171,77 @@ router.get("/api/agents/:agentId/my-audit", (req: Request, res: Response) => {
     });
   } catch (err) {
     console.error("[owner-portal] my-audit error:", err);
+    return res.status(500).json({
+      success: false,
+      error: "internal_error",
+      message: "En feil oppstod.",
+    });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────
+// GET /api/agents/:id/owner-stats — full "Statistikk" tab data (session-gated)
+// ─────────────────────────────────────────────────────────────────
+// dev-request 2026-07-03-agent-profile-conversations-stats, slice 3, work
+// items 5+6. Deliberately NOT the same path as the public, unauthenticated
+// GET /api/agents/:id/stats in src/routes/agent-stats.ts (that route
+// already exists and returns a different, smaller public payload — reusing
+// its exact path here would either collide or silently change public
+// behavior, neither of which is additive). This is the full owner-only
+// package: views over time by source, AI-platform split, matching search
+// queries, conversations per channel, contact-clicks by kind (labeled
+// "kontakt-klikk" — click intent, not confirmed contact), and a
+// discovered→viewed→kontakt-klikk funnel. All aggregation logic lives in
+// src/services/owner-stats-service.ts (see its module doc for the exact
+// is_bot/is_owner filtering applied — and honestly documented gaps — per
+// table).
+//
+// Auth: same magic-link session mechanism as every other owner-facing
+// endpoint in this file (verifyOwnerSession — rfb_owner_session cookie or
+// Bearer token, backed by the magic_links table). No new auth scheme.
+router.get("/api/agents/:id/owner-stats", (req: Request, res: Response) => {
+  try {
+    const { id } = req.params;
+    const session = verifyOwnerSession(req);
+
+    if (!session.valid) {
+      return res.status(401).json({
+        success: false,
+        error: "session_invalid",
+        message: "Din sesjon er utløpt. Logg inn på nytt.",
+      });
+    }
+
+    if (session.agentId !== id) {
+      return res.status(403).json({
+        success: false,
+        error: "forbidden",
+        message: "Du har ikke tilgang til denne agenten.",
+      });
+    }
+
+    const db = getDb();
+    const agent = db.prepare("SELECT id, name FROM agents WHERE id = ?").get(id) as any;
+    if (!agent) {
+      return res.status(404).json({
+        success: false,
+        error: "agent_not_found",
+        message: "Agenten ble ikke funnet.",
+      });
+    }
+
+    // Same slug derivation as agent-stats.ts / profile-activity-service.ts's
+    // caller in seo.ts — the path analytics_page_views actually recorded.
+    const path = `/produsent/${slugify(String(agent.name || ""))}`;
+    const stats = getOwnerStats(db, id, path);
+
+    // Short private cache — this is session-gated, per-owner data, not a
+    // public/shared response (contrast agent-stats.ts's public 5-min cache).
+    res.setHeader("Cache-Control", "private, max-age=60");
+
+    return res.json({ success: true, agentId: id, ...stats });
+  } catch (error) {
+    console.error("[owner-portal] owner-stats error:", error);
     return res.status(500).json({
       success: false,
       error: "internal_error",

@@ -410,6 +410,7 @@
         <button class="tab active" data-tab="profile" data-i18n="tab_profile">Profil</button>
         <button class="tab" data-tab="products" data-i18n="tab_products">Produkter</button>
         <button class="tab" data-tab="hours" data-i18n="tab_hours">Åpningstider</button>
+        <button class="tab" data-tab="stats" data-i18n="tab_stats">Statistikk</button>
         <button class="tab" data-tab="settings" data-i18n="tab_settings">Innstillinger</button>
       </div>
 
@@ -609,6 +610,73 @@
           <div class="hours-grid" id="hoursGrid"></div>
           <div style="margin-top: 1rem;">
             <button class="btn btn-primary" id="btnSaveHours" data-i18n="save_hours">Lagre åpningstider</button>
+          </div>
+        </div>
+      </div>
+
+      <!-- ── Tab: Statistikk ── -->
+      <!-- dev-request 2026-07-03-agent-profile-conversations-stats, slice 3
+           (work items 5+6). Data comes from the session-gated
+           GET /api/agents/:id/owner-stats (src/routes/owner-portal.ts),
+           which uses the magic-link cookie session (rfb_owner_session) —
+           a SEPARATE login from this page's own claim-token flow above, so
+           a visitor who only ever logged in via "Logg inn" up top will see
+           statsLoginRequired here until they also request a statistics
+           login link (same email, same magic_links mechanism the /eier
+           portal uses). See owner-portal.ts's owner-stats route comment
+           for why this endpoint deliberately does not accept the
+           claim-token used elsewhere on this page. -->
+      <div class="tab-panel" id="panel-stats">
+        <div class="card" id="statsLoading" style="text-align:center;color:var(--gray-500);">Laster statistikk &hellip;</div>
+
+        <div class="card hidden" id="statsLoginRequired">
+          <h2>Statistikk</h2>
+          <p style="color:var(--gray-500);font-size:0.9rem;margin-bottom:1rem;">
+            Statistikken din krever en egen innloggingslenke (i tillegg til p&aring;loggingen &oslash;verst p&aring; siden). Vi sender lenken til e-posten som er registrert p&aring; profilen.
+          </p>
+          <div style="display:flex;gap:0.5rem;flex-wrap:wrap;align-items:center;">
+            <input type="email" id="statsLoginEmail" placeholder="din@epost.no" style="padding:0.55rem 0.75rem;border:1px solid var(--gray-300);border-radius:var(--radius);font-size:0.9rem;width:200px;" />
+            <button class="btn btn-primary btn-small" id="btnStatsMagicLink">Send innloggingslenke</button>
+          </div>
+          <div id="statsLoginAlert" style="margin-top:0.5rem;"></div>
+        </div>
+
+        <div class="hidden" id="statsContent">
+          <div class="card">
+            <h2>Trakt: oppdaget &rarr; sett &rarr; kontakt-klikk</h2>
+            <p class="section-hint" style="margin-bottom:0.75rem;">
+              &laquo;Sett&raquo; og &laquo;kontakt-klikk&raquo; er siste 90 dager. &laquo;Oppdaget&raquo; er en l&oslash;pende teller (vises i s&oslash;keresultater). Kontakt-klikk viser <strong>klikk-interesse</strong> &mdash; ikke bekreftet kontakt.
+            </p>
+            <div class="stats-grid" id="statsFunnel"></div>
+          </div>
+
+          <div class="card">
+            <h2>Visninger etter kilde (siste 90 dager)</h2>
+            <div id="statsViewsBySource" style="display:flex;flex-direction:column;gap:0.5rem;"></div>
+          </div>
+
+          <div class="card">
+            <h2>AI-plattform (siste 90 dager)</h2>
+            <p class="section-hint" style="margin-bottom:0.75rem;">Hvor mange ganger ChatGPT, Claude og andre AI-assistenter har hentet profilen din.</p>
+            <div class="stats-grid" id="statsAiPlatforms"></div>
+          </div>
+
+          <div class="card">
+            <h2>S&oslash;k som traff profilen din</h2>
+            <ul class="product-list" id="statsQueryTerms"></ul>
+          </div>
+
+          <div class="card">
+            <h2>Samtaler per kanal</h2>
+            <ul class="product-list" id="statsChannels"></ul>
+          </div>
+
+          <div class="card">
+            <h2>Kontakt-klikk etter type</h2>
+            <p class="section-hint" style="margin-bottom:0.75rem;">
+              Klikk p&aring; e-post-, telefon- og nettside-lenker p&aring; profilen din. Dette er <strong>klikk-interesse</strong>, ikke en bekreftelse p&aring; at kunden faktisk fikk tak i deg.
+            </p>
+            <ul class="product-list" id="statsContactClicks"></ul>
           </div>
         </div>
       </div>
@@ -818,7 +886,7 @@
         login: 'Logg inn', logout: 'Logg ut',
         verified: 'Verifisert',
         stat_discovered: 'Oppdaget', stat_contacted: 'Kontaktet', stat_chosen: 'Valgt', stat_trust: 'Trust Score',
-        tab_profile: 'Profil', tab_products: 'Produkter', tab_hours: '\u00c5pningstider', tab_settings: 'Innstillinger',
+        tab_profile: 'Profil', tab_products: 'Produkter', tab_hours: '\u00c5pningstider', tab_stats: 'Statistikk', tab_settings: 'Innstillinger',
         profile_info: 'Butikkinformasjon',
         about_label: 'Om butikken', address_label: 'Adresse', postal_code_label: 'Postnummer',
         website_label: 'Nettside', phone_label: 'Telefon', email_label: 'Kontakt-epost',
@@ -886,7 +954,7 @@
         login: 'Log in', logout: 'Log out',
         verified: 'Verified',
         stat_discovered: 'Discovered', stat_contacted: 'Contacted', stat_chosen: 'Chosen', stat_trust: 'Trust Score',
-        tab_profile: 'Profile', tab_products: 'Products', tab_hours: 'Opening hours', tab_settings: 'Settings',
+        tab_profile: 'Profile', tab_products: 'Products', tab_hours: 'Opening hours', tab_stats: 'Statistics', tab_settings: 'Settings',
         profile_info: 'Shop information',
         about_label: 'About the shop', address_label: 'Address', postal_code_label: 'Postal code',
         website_label: 'Website', phone_label: 'Phone', email_label: 'Contact email',
@@ -1552,6 +1620,138 @@
       document.querySelectorAll('.tab-panel').forEach(function(p) { p.classList.remove('active'); });
       tab.classList.add('active');
       document.getElementById('panel-' + tab.getAttribute('data-tab')).classList.add('active');
+      if (tab.getAttribute('data-tab') === 'stats') loadOwnerStats();
+    });
+
+    // ── Statistikk tab (dev-request 2026-07-03-agent-profile-conversations-stats, slice 3) ──
+    // GET /api/agents/:id/owner-stats is gated on the rfb_owner_session
+    // magic-link cookie (owner-portal.ts's verifyOwnerSession) — a
+    // DIFFERENT login than this page's own claim-token ("Logg inn" banner
+    // above). If the visitor hasn't also gone through that cookie login
+    // (e.g. via /eier/:id), the fetch below returns 401/403 and we show a
+    // one-time "send me a stats login link" form that reuses the existing,
+    // already-shipped POST /api/agents/:id/request-magic-link endpoint.
+    var statsLoading = false;
+    function loadOwnerStats() {
+      if (!state.agentId || statsLoading) return;
+      statsLoading = true;
+      show('statsLoading');
+      hide('statsLoginRequired');
+      hide('statsContent');
+      fetch(API_BASE + '/api/agents/' + state.agentId + '/owner-stats', { credentials: 'same-origin' })
+        .then(function(r) {
+          if (r.status === 401 || r.status === 403) {
+            hide('statsLoading');
+            show('statsLoginRequired');
+            var prefillEmail = document.getElementById('statsLoginEmail');
+            if (prefillEmail && !prefillEmail.value && state.knowledge && state.knowledge.email) {
+              prefillEmail.value = state.knowledge.email;
+            }
+            return null;
+          }
+          if (!r.ok) throw new Error('HTTP ' + r.status);
+          return r.json();
+        })
+        .then(function(data) {
+          if (!data) return;
+          hide('statsLoading');
+          show('statsContent');
+          renderOwnerStats(data);
+        })
+        .catch(function(err) {
+          hide('statsLoading');
+          show('statsLoginRequired');
+          showAlert('statsLoginAlert', 'Kunne ikke laste statistikk: ' + escHtml(err.message), 'error');
+        })
+        .finally(function() { statsLoading = false; });
+    }
+
+    var SOURCE_LABELS = { direct: 'Direkte', organic: 'Organisk', search: 'Søk', social: 'Sosiale medier', referral: 'Henvisning' };
+    var CHANNEL_LABELS = { web: 'Nettside', a2a: 'A2A', mcp: 'MCP', api: 'API/annet' };
+    var CLICK_KIND_LABELS = { email: 'E-post', phone: 'Telefon', website: 'Nettside' };
+    function clickKindLabel(kind) {
+      if (CLICK_KIND_LABELS[kind]) return CLICK_KIND_LABELS[kind];
+      if (kind && kind.indexOf('external:') === 0) return 'Ekstern lenke (' + kind.slice('external:'.length) + ')';
+      return kind || 'Ukjent';
+    }
+
+    function renderOwnerStats(data) {
+      // Funnel
+      var f = data.funnel || { discovered: 0, viewed: 0, contactClicked: 0 };
+      var funnelHtml = '';
+      funnelHtml += '<div class="stat-card"><div class="stat-number">' + (f.discovered || 0) + '</div><div class="stat-label">Oppdaget</div></div>';
+      funnelHtml += '<div class="stat-card"><div class="stat-number">' + (f.viewed || 0) + '</div><div class="stat-label">Sett (90d)</div></div>';
+      funnelHtml += '<div class="stat-card"><div class="stat-number">' + (f.contactClicked || 0) + '</div><div class="stat-label">Kontakt-klikk (90d)</div></div>';
+      document.getElementById('statsFunnel').innerHTML = funnelHtml;
+
+      // Views by source
+      var vbs = data.viewsBySource || { totals: {} };
+      var totals = vbs.totals || {};
+      var maxTotal = Math.max(1, Object.keys(totals).reduce(function(m, k) { return Math.max(m, totals[k]); }, 0));
+      var vbsHtml = '';
+      Object.keys(totals).forEach(function(src) {
+        var count = totals[src];
+        var pct = Math.round((count / maxTotal) * 100);
+        vbsHtml += '<div>';
+        vbsHtml += '<div style="display:flex;justify-content:space-between;font-size:0.85rem;margin-bottom:2px;"><span>' + (SOURCE_LABELS[src] || src) + '</span><span>' + count + '</span></div>';
+        vbsHtml += '<div class="completion-bar-track"><div class="completion-bar-fill" style="width:' + pct + '%"></div></div>';
+        vbsHtml += '</div>';
+      });
+      document.getElementById('statsViewsBySource').innerHTML = vbsHtml || '<p style="color:var(--gray-500);font-size:0.9rem;">Ingen visninger registrert enn&aring;.</p>';
+
+      // AI platforms
+      var ai = data.aiPlatforms || { chatgpt: 0, claude: 0, other: 0 };
+      var aiHtml = '';
+      aiHtml += '<div class="stat-card"><div class="stat-number">' + (ai.chatgpt || 0) + '</div><div class="stat-label">ChatGPT</div></div>';
+      aiHtml += '<div class="stat-card"><div class="stat-number">' + (ai.claude || 0) + '</div><div class="stat-label">Claude</div></div>';
+      aiHtml += '<div class="stat-card"><div class="stat-number">' + (ai.other || 0) + '</div><div class="stat-label">Andre AI</div></div>';
+      document.getElementById('statsAiPlatforms').innerHTML = aiHtml;
+
+      // Matching search queries
+      var terms = data.matchingSearchQueries || [];
+      var termsHtml = terms.map(function(t) {
+        return '<li class="product-item"><span class="product-name">' + escHtml(t.term) + '</span><span class="product-meta">' + t.count + ' &times;</span></li>';
+      }).join('');
+      document.getElementById('statsQueryTerms').innerHTML = termsHtml || '<li style="text-align:center;color:var(--gray-500);padding:1rem;">Ingen s&oslash;k registrert enn&aring;.</li>';
+
+      // Conversations per channel
+      var channels = data.conversationsByChannel || [];
+      var channelsHtml = channels.map(function(c) {
+        return '<li class="product-item"><span class="product-name">' + (CHANNEL_LABELS[c.source] || c.source) + '</span><span class="product-meta">' + c.count + '</span></li>';
+      }).join('');
+      document.getElementById('statsChannels').innerHTML = channelsHtml || '<li style="text-align:center;color:var(--gray-500);padding:1rem;">Ingen samtaler registrert enn&aring;.</li>';
+
+      // Contact clicks by kind
+      var clicks = data.contactClicksByKind || [];
+      var clicksHtml = clicks.map(function(c) {
+        return '<li class="product-item"><span class="product-name">' + clickKindLabel(c.kind) + '</span><span class="product-meta">' + c.count + '</span></li>';
+      }).join('');
+      document.getElementById('statsContactClicks').innerHTML = clicksHtml || '<li style="text-align:center;color:var(--gray-500);padding:1rem;">Ingen kontakt-klikk registrert enn&aring;.</li>';
+    }
+
+    document.getElementById('btnStatsMagicLink').addEventListener('click', function() {
+      var email = (document.getElementById('statsLoginEmail').value || '').trim();
+      if (!email || email.indexOf('@') === -1) {
+        showAlert('statsLoginAlert', 'Skriv inn en gyldig e-postadresse.', 'error');
+        return;
+      }
+      this.disabled = true;
+      var btn = this;
+      fetch(API_BASE + '/api/agents/' + state.agentId + '/request-magic-link', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ email: email })
+      })
+        .then(function(r) { return r.json().then(function(d) { return { ok: r.ok, data: d }; }); })
+        .then(function(res) {
+          if (res.ok && res.data && res.data.success) {
+            showAlert('statsLoginAlert', 'Sjekk e-posten din! Trykk p&aring; lenken, og kom s&aring; tilbake hit og &aring;pne Statistikk-fanen p&aring; nytt.', 'success');
+          } else {
+            showAlert('statsLoginAlert', (res.data && res.data.message) || 'Kunne ikke sende lenke. Pr&oslash;v igjen.', 'error');
+          }
+        })
+        .catch(function() { showAlert('statsLoginAlert', 'Noe gikk galt. Pr&oslash;v igjen.', 'error'); })
+        .finally(function() { btn.disabled = false; });
     });
 
     // ── Save Profile ──
