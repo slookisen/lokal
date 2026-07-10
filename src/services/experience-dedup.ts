@@ -47,6 +47,15 @@ const TITLE_STOPWORDS = new Set([
   "museum", "museet", "senter", "center", "park", "opplevelse", "opplevelser",
   "aktivitet", "aktiviteter", "billetter", "tickets", "official", "site",
   "website", "hjemmeside", "tur", "tour", "omvisning", "experience", "experiences",
+  // Generic ACTIVITY-domain nouns (as opposed to proper nouns). A single one
+  // of these shared between two titles is NOT evidence they're the same
+  // real-world bookable experience — e.g. "Kajakk tur for nybegynnere" vs
+  // "Kajakk tur for viderekommet" are two distinct, independently-bookable
+  // products that merely share the domain noun "kajakk" (confirmed
+  // false-positive merge from PR #209 review). Contrast with a proper noun
+  // like "heyerdahl", which stays a strong signal because it names a
+  // specific real-world thing, not a category of activity.
+  "kajakk", "rafting", "klatring", "sykkeltur", "fisketur",
 ]);
 
 function stripDiacritics(s: string): string {
@@ -135,6 +144,21 @@ const SIGNIFICANT_TOKEN_MIN_LEN = 5;
 // re-harvesting the same source).
 const WHOLE_STRING_SIMILARITY_THRESHOLD = 0.6;
 
+// Corroborating token-set overlap bar for the whole-string path (see
+// titlesMatch()). Character-level Levenshtein similarity alone can score
+// deceptively high for two titles that share a long common prefix/suffix
+// around a DIFFERENT distinguishing qualifier — e.g. "Rafting i Sjoa -
+// dagstur" vs "Rafting i Sjoa - kveldstur" (0.79 raw char similarity) or
+// "Kajakk tur for nybegynnere" vs "...for viderekommet" (0.63) — even though
+// those describe two distinct, independently-bookable products (confirmed
+// false-positive merges from PR #209 review). A genuine re-wording of the
+// SAME experience (e.g. "KOK Oslo Food Tour" vs "KOK Oslo Food Tur") keeps
+// nearly all of its significant content words in common; two DIFFERENT
+// variants swap out a content word for another, which drags token-set
+// Jaccard overlap well below this bar even when the characters still line
+// up closely.
+const TOKEN_OVERLAP_THRESHOLD = 0.65;
+
 /**
  * True when two titles are plausibly the SAME real-world experience. Intended
  * to be called only after provider-identity + kommune already matched (a
@@ -143,14 +167,34 @@ const WHOLE_STRING_SIMILARITY_THRESHOLD = 0.6;
  * identical wording.
  */
 export function titlesMatch(a: string, b: string): boolean {
-  const tokensA = new Set(titleTokens(a));
-  const tokensB = new Set(titleTokens(b));
-  for (const t of tokensA) {
-    if (t.length >= SIGNIFICANT_TOKEN_MIN_LEN && tokensB.has(t)) return true;
+  const tokensA = titleTokens(a);
+  const tokensB = titleTokens(b);
+  const setA = new Set(tokensA);
+  const setB = new Set(tokensB);
+
+  // Single-shared-significant-token signal (e.g. a proper noun like
+  // "heyerdahl") is strong enough evidence on its own — domain-generic nouns
+  // (kajakk, rafting, tur, ...) never reach this point since they're already
+  // filtered out of titleTokens() via TITLE_STOPWORDS.
+  for (const t of setA) {
+    if (t.length >= SIGNIFICANT_TOKEN_MIN_LEN && setB.has(t)) return true;
   }
+
+  // Whole-string / reworded-duplicate path: character-level closeness must
+  // be corroborated by token-set overlap (see TOKEN_OVERLAP_THRESHOLD above)
+  // — either signal alone is not enough to call two titles the same
+  // real-world experience.
   const na = normalizeExperienceTitle(a);
   const nb = normalizeExperienceTitle(b);
-  return levenshteinSimilarity(na, nb) >= WHOLE_STRING_SIMILARITY_THRESHOLD;
+  if (levenshteinSimilarity(na, nb) < WHOLE_STRING_SIMILARITY_THRESHOLD) return false;
+
+  const union = new Set([...setA, ...setB]);
+  if (union.size === 0) return true; // both titles reduced to nothing but stopwords/short tokens
+  let overlap = 0;
+  for (const t of setA) {
+    if (setB.has(t)) overlap++;
+  }
+  return overlap / union.size >= TOKEN_OVERLAP_THRESHOLD;
 }
 
 // ─── Canonical-row scoring (richest data wins) ──────────────────────────────

@@ -108,6 +108,54 @@ export function runExperienceDedupTests(opts: { log?: boolean } = {}): Promise<T
       "4b: beginner climbing course vs. birthday party at the same climbing park do not match"
     );
 
+    // ── 4c-4h. titlesMatch: PR #209 review finding — a single shared common
+    //     ACTIVITY-DOMAIN noun (kajakk/rafting/klatring/sykkeltur/fisketur) is
+    //     NOT enough evidence two titles are the same real-world experience.
+    //     These are genuinely distinct, independently-bookable products from
+    //     the same provider/kommune that merely share one domain-activity
+    //     noun — folding one away as a "duplicate" of the other would
+    //     incorrectly hide a real, distinct bookable experience. ──
+    assertTrue(
+      !titlesMatch("Kajakk tur for nybegynnere", "Kajakk tur for viderekommet"),
+      "4c: kajakk beginner vs. advanced tour — distinct products, share only the domain noun 'kajakk'"
+    );
+    assertTrue(
+      !titlesMatch("Rafting i Sjoa - dagstur", "Rafting i Sjoa - kveldstur"),
+      "4d: rafting day trip vs. evening trip in Sjoa — distinct products, share only 'rafting'"
+    );
+    assertTrue(
+      !titlesMatch("Klatring for barn", "Klatring for voksne"),
+      "4e: climbing for kids vs. for adults — distinct products, share only 'klatring'"
+    );
+    assertTrue(
+      !titlesMatch("Sykkeltur for nybegynnere", "Sykkeltur for viderekommet"),
+      "4f: beginner vs. advanced bike tour — distinct products, share only 'sykkeltur'"
+    );
+    assertTrue(
+      !titlesMatch("Sykkeltur - dagstur", "Sykkeltur - kveldstur"),
+      "4g: day vs. evening bike tour — distinct products, share only 'sykkeltur'"
+    );
+    assertTrue(
+      !titlesMatch("Fisketur for barn", "Fisketur for voksne"),
+      "4h: fishing trip for kids vs. for adults — distinct products, share only 'fisketur'"
+    );
+
+    // Regression guard: the PR's own legitimate matches (3a/3b above) must
+    // keep matching even with the tightened single-token + token-overlap
+    // corroboration rules — re-asserted here right next to the new
+    // non-matching cases for an easy side-by-side read.
+    assertTrue(
+      titlesMatch(
+        "Kon-Tiki Museet — Heyerdahl's Legendary Pacific Raft…",
+        "…Thor Heyerdahl Expedition Museum at Bygdøy Oslo"
+      ),
+      "4i: (regression) Kon-Tiki / Thor Heyerdahl Expedition Museum still match — proper noun 'heyerdahl' still a strong signal"
+    );
+    assertTrue(
+      titlesMatch("KOK Oslo Food Tour", "KOK Oslo Food Tur"),
+      "4j: (regression) KOK Oslo Food Tour/Tur still match via whole-string + token-overlap corroboration"
+    );
+
     // ── 5. scoreExperienceRichness: more populated fields + longer description + verified wins ──
     const thin = { description: "Kort tekst.", confidence: "low" as const };
     const rich = {
@@ -326,6 +374,63 @@ export function runExperienceDedupTests(opts: { log?: boolean } = {}): Promise<T
         { title: "Splitter ny opplevelse", provider_id: providerId, kommune: "Bergen", fylke: "Vestland" },
       ]);
       assertEq(freshResult.inserted, 1, "11d: a genuinely new (different-kommune) experience still inserts");
+
+      // ── 12. resolveCanonicalSlugForDuplicate: multi-hop redirect chain
+      //     (PR #209 review finding 2). A re-run of the backfill can re-pick a
+      //     new, richer canonical for a group, leaving an OLDER duplicate's
+      //     canonical_id pointing at a row that has itself since been merged
+      //     away. Seed a 2-hop chain directly (row A merged into row B, then
+      //     B later merged into C) and confirm resolving A's slug walks all
+      //     the way to C's slug, not just the first (dead) hop at B's. ──
+      const rowAId = expStore.createExperience({
+        title: "Chain Row A",
+        slug: "chain-row-a",
+        provider_id: providerId,
+        kommune: "Oslo",
+        fylke: "Oslo",
+      });
+      const rowBId = expStore.createExperience({
+        title: "Chain Row B",
+        slug: "chain-row-b",
+        provider_id: providerId,
+        kommune: "Oslo",
+        fylke: "Oslo",
+      });
+      const rowCId = expStore.createExperience({
+        title: "Chain Row C",
+        slug: "chain-row-c",
+        provider_id: providerId,
+        kommune: "Oslo",
+        fylke: "Oslo",
+      });
+      // First pass (in time): A gets merged into B.
+      db.prepare("UPDATE experiences SET canonical_id = ? WHERE id = ?").run(rowBId, rowAId);
+      // Later, idempotent re-run re-picks C as the richer canonical for the
+      // group and merges B into it — but A's canonical_id is NOT touched by
+      // that later pass, so it's left pointing at B, which is now itself a
+      // duplicate (a dead hop) rather than the live terminal canonical.
+      db.prepare("UPDATE experiences SET canonical_id = ? WHERE id = ?").run(rowCId, rowBId);
+
+      assertEq(
+        expStore.resolveCanonicalSlugForDuplicate("chain-row-a"),
+        "chain-row-c",
+        "12a: a 2-hop canonical_id chain (A->B->C) resolves directly to the terminal canonical C's slug, not the dead intermediate B"
+      );
+      assertEq(
+        expStore.resolveCanonicalSlugForDuplicate("chain-row-b"),
+        "chain-row-c",
+        "12b: B (now itself a duplicate of C) resolves directly to C's slug"
+      );
+      assertEq(
+        expStore.resolveCanonicalSlugForDuplicate("chain-row-c"),
+        null,
+        "12c: C (the terminal canonical, canonical_id IS NULL) is not itself a duplicate — returns null"
+      );
+      assertEq(
+        expStore.resolveCanonicalSlugForDuplicate("no-such-slug"),
+        null,
+        "12d: an unknown slug returns null"
+      );
     } catch (err: any) {
       failed++;
       failures.push("experience-dedup: unexpected error: " + String(err?.stack || err?.message || err));

@@ -1240,11 +1240,30 @@ export function listCategories(): Array<{ category: string; count: number }> {
 // ─── Dedup: slug-redirect helper + re-harvest guard (dev-request 2026-07-04-
 // opplevagent-dedup-og-norske-titler, item 1) ───────────────────────────────
 
+// Max hops to walk a canonical_id redirect chain before bailing out. A
+// re-run of the dedup backfill can re-pick a new, richer canonical for a
+// group, leaving an older duplicate row's canonical_id pointing at a row
+// that has ITSELF since been merged away (i.e. that row now also has a
+// non-null canonical_id, pointing at the new terminal canonical). This bound
+// is purely a cycle/corruption guard — legitimate chains should never come
+// close to it — so we never infinite-loop even if data is ever corrupt/cyclic.
+const MAX_CANONICAL_CHAIN_HOPS = 10;
+
 /**
  * If `slug` belongs to a row that has since been merged away as a duplicate
  * (canonical_id set), resolve the LIVE slug of its canonical row — so the
  * /opplevelse/:slug route can 301 to it instead of 404ing on a stale
  * bookmarked/indexed URL for a row the dedup pass folded into another row.
+ *
+ * Walks the canonical_id chain until it reaches a row with canonical_id IS
+ * NULL (the true terminal canonical) — a single hop isn't enough because a
+ * later, idempotent re-run of the backfill can re-pick a new canonical for a
+ * group, leaving an older duplicate pointed at a row that has itself since
+ * been merged into a different, newer canonical. Bounded by
+ * MAX_CANONICAL_CHAIN_HOPS so a corrupt/cyclic chain can't infinite-loop —
+ * if the bound is hit, returns the last-known slug on the chain rather than
+ * looping forever.
+ *
  * Returns null when the slug doesn't exist, isn't a duplicate, or its
  * canonical row is missing/has no slug of its own.
  */
@@ -1255,10 +1274,25 @@ export function resolveCanonicalSlugForDuplicate(slug: string): string | null {
     .prepare("SELECT canonical_id FROM experiences WHERE slug = ?")
     .get(slug) as { canonical_id: string | null } | undefined;
   if (!row || !row.canonical_id) return null;
-  const canonical = db
-    .prepare("SELECT slug FROM experiences WHERE id = ?")
-    .get(row.canonical_id) as { slug: string | null } | undefined;
-  return canonical?.slug ?? null;
+
+  const getById = db.prepare("SELECT id, slug, canonical_id FROM experiences WHERE id = ?");
+  const visited = new Set<string>();
+  let currentId = row.canonical_id;
+  let lastResolved: { id: string; slug: string | null; canonical_id: string | null } | undefined;
+
+  for (let hop = 0; hop < MAX_CANONICAL_CHAIN_HOPS; hop++) {
+    if (visited.has(currentId)) break; // cycle guard — bail to the last-known id
+    visited.add(currentId);
+    const next = getById.get(currentId) as
+      | { id: string; slug: string | null; canonical_id: string | null }
+      | undefined;
+    if (!next) break; // dangling reference — bail to the last-known resolved row
+    lastResolved = next;
+    if (!next.canonical_id) break; // reached the true terminal canonical
+    currentId = next.canonical_id;
+  }
+
+  return lastResolved?.slug ?? null;
 }
 
 /**
