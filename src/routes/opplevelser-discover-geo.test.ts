@@ -290,6 +290,22 @@ export function runOpplevelserDiscoverGeoTests(opts: { log?: boolean } = {}): Pr
         "g2: every A2A result row carries a numeric distance_km and a valid geo_precision"
       );
 
+      // ── (g3/g4) A2A opplevelser_discover skill, no geo → no field leakage ──
+      // Mirrors a4/a5 above for REST: hydrateExperience() unconditionally sets
+      // geo_precision on every row, so the A2A skill must explicitly strip it
+      // (and distance_km) when no origin was given — omitting lat/lng must be
+      // byte-identical to old behavior on this surface too.
+      const a2aResultNoGeo: any = handleExperiencesMessageSend(
+        { message: { data: { fylke: "Troms og Finnmark" } } },
+        2
+      );
+      const a2aExperiencesNoGeo = a2aResultNoGeo.result.artifacts[1].parts[0].data.experiences;
+      assertTrue(a2aExperiencesNoGeo.length === 3, "g3: A2A message/send (no geo) returns all 3 Tromsø-fylke fixtures (incl. the ungeocoded one)");
+      for (const row of a2aExperiencesNoGeo) {
+        assertTrue(!("distance_km" in row), `g4: A2A result row "${row.title}" has no distance_km when lat/lng omitted`);
+        assertTrue(!("geo_precision" in row), `g5: A2A result row "${row.title}" has no geo_precision when lat/lng omitted`);
+      }
+
       // ── (h) openapi.json documents the new params + schema fields ─────
       const { getExperiencesOpenapi } = require("../services/experiences-openapi") as typeof import("../services/experiences-openapi");
       const spec: any = getExperiencesOpenapi();

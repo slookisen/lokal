@@ -373,6 +373,18 @@ export function handleExperiencesMessageSend(
 
     try { logExperiencesInteraction({ skill: "opplevelser_discover", queryText: messageText || undefined, ctx }); } catch { /* fail-open: never affects the response */ }
 
+    // distance_km/geo_precision are only meaningful (and only ever present)
+    // when an origin was given — omitting lat/lng must produce byte-identical
+    // rows to before this feature existed. Mirrors the hasGeo gating in the
+    // REST endpoint (opplevelser.ts) and the MCP tool (experiences-mcp.ts).
+    // Needed here specifically because hydrateExperience() unconditionally
+    // sets geo_precision on every row regardless of whether an origin was
+    // queried, so it must be explicitly stripped rather than merely omitted.
+    const hasGeo = typeof filter.lat === "number" && typeof filter.lng === "number";
+    const experiences = hasGeo
+      ? results
+      : results.map(({ distance_km, geo_precision, ...rest }) => rest);
+
     return rpcOk(id, {
       taskId: `experiences-discover-${Date.now()}`,
       status: { state: "completed", timestamp: new Date().toISOString() },
@@ -385,7 +397,7 @@ export function handleExperiencesMessageSend(
         {
           artifactId: "discover-results",
           name: "experience-discover-results",
-          parts: [{ kind: "data", data: { count: results.length, experiences: results } }],
+          parts: [{ kind: "data", data: { count: results.length, experiences } }],
         },
       ],
       metadata: {
