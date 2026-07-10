@@ -16014,6 +16014,19 @@ console.log("\n── opplevagent P2: human-browse subpages (experiences) ──
   const fylkeMissP2 = invokeSeo("/fylke/:fylke", { fylke: "Atlantis" }, "/fylke/Atlantis");
   assertEq(fylkeMissP2.status, 404, "p2-03d: unknown fylke → 404 (next())");
 
+  // p2-03e..i (dev-request 2026-07-04-opplevagent-nl-parser-og-fylkesnormalisering,
+  // item 5): a differently-cased fylke param 301-redirects to the canonical,
+  // live-DB-cased path instead of 404ing. The exact match above (p2-03a) stays
+  // the same fast path with no added DB calls — the fold+scan-and-compare
+  // fallback only runs once the exact match has already failed.
+  const fylkeFoldLowerP2 = invokeSeo("/fylke/:fylke", { fylke: "troms" }, "/fylke/troms");
+  assertEq(fylkeFoldLowerP2.status, 301, "p2-03e: lowercase /fylke/troms → 301 (case-insensitive match)");
+  assertEq(fylkeFoldLowerP2.redirectTo, "/fylke/Troms", "p2-03f: redirects to the canonical-cased /fylke/Troms");
+  assertEq(fylkeP2.redirectTo, null, "p2-03g: exact-match /fylke/Troms (p2-03a) does NOT redirect");
+  const fylkeFoldNoMatchP2 = invokeSeo("/fylke/:fylke", { fylke: "tromsss" }, "/fylke/tromsss");
+  assertEq(fylkeFoldNoMatchP2.status, 404, "p2-03h: a param that folds to no live fylke still 404s (no false-positive match)");
+  assertEq(fylkeFoldNoMatchP2.redirectTo, null, "p2-03i: no-match case never redirects");
+
   // p2-04: /tilbyder/:providerSlugOrId — UUID now → 301 redirect to slug URL.
   const uuidRedirP2 = invokeSeo("/tilbyder/:providerSlugOrId", { providerSlugOrId: provP2 }, `/tilbyder/${provP2}`);
   assertEq(uuidRedirP2.status, 301, "p2-04a: GET /tilbyder/<uuid> → 301 redirect to slug URL");
@@ -16160,6 +16173,25 @@ console.log("\n── opplevagent P2: human-browse subpages (experiences) ──
     "p2-08h2: kommune page with real category facts emits a FAQPage JSON-LD block");
   const kommMissP2 = invokeSeo("/kommune/:kommune", { kommune: "Nowhereville" }, "/kommune/Nowhereville");
   assertEq(kommMissP2.status, 404, "p2-08i: unknown kommune → 404 (next())");
+
+  // p2-08m..s (dev-request 2026-07-04-opplevagent-nl-parser-og-fylkesnormalisering,
+  // item 5): mirrors the /fylke fold-redirect above (p2-03e..i), but exercises
+  // the ascii-fold path specifically — "Tromsø"'s ø must fold to "o" (not just
+  // case-fold), for both a lowercase-ascii param and an uppercase-with-diacritic
+  // one, and the exact match (p2-08a) must still take the same no-redirect path.
+  const kommFoldLowerP2 = invokeSeo("/kommune/:kommune", { kommune: "tromso" }, "/kommune/tromso");
+  assertEq(kommFoldLowerP2.status, 301, "p2-08m: ascii-folded lowercase /kommune/tromso → 301");
+  assertEq(kommFoldLowerP2.redirectTo, `/kommune/${encodeURIComponent("Tromsø")}`,
+    "p2-08n: redirects to the canonical, correctly-diacritic'd /kommune/Tromsø");
+  const kommFoldUpperP2 = invokeSeo("/kommune/:kommune", { kommune: "TROMSØ" }, "/kommune/TROMS%C3%98");
+  assertEq(kommFoldUpperP2.status, 301, "p2-08o: uppercase-with-diacritic /kommune/TROMSØ → 301");
+  assertEq(kommFoldUpperP2.redirectTo, `/kommune/${encodeURIComponent("Tromsø")}`,
+    "p2-08p: TROMSØ also redirects to the canonical /kommune/Tromsø");
+  assertEq(kommP2.redirectTo, null, "p2-08q: exact-match /kommune/Tromsø (p2-08a) does NOT redirect");
+  const kommFoldNoMatchP2 = invokeSeo("/kommune/:kommune", { kommune: "oslooo" }, "/kommune/oslooo");
+  assertEq(kommFoldNoMatchP2.status, 404, "p2-08r: a param that folds to no live kommune still 404s (no false-positive match)");
+  assertEq(kommFoldNoMatchP2.redirectTo, null, "p2-08s: no-match case never redirects");
+
   assertTrue(!/Rett fra Bonden/i.test(kommP2.body) && !/tannlege/i.test(kommP2.body),
     "p2-08j: kommune page does NOT leak rfb/dental identity");
   // p2-08k: sitemap now weaves kommune URLs (DB-driven, through the publish gate).
@@ -16190,6 +16222,106 @@ console.log("\n── opplevagent P2: human-browse subpages (experiences) ──
   if (prevPathP2 === undefined) delete process.env.EXPERIENCES_DB_PATH;
   else process.env.EXPERIENCES_DB_PATH = prevPathP2;
   dbFactoryP2.__resetDbFactoryForTesting();
+})();
+
+// ── opplevagent: /fylke + /kommune fold-redirect ambiguity guard ───────────────
+// dev-request 2026-07-04-opplevagent-nl-parser-og-fylkesnormalisering, item 5:
+// a param that ascii-folds to match TWO different live canonical values must
+// NOT silently redirect to either one (that would be a guess — could send a
+// crawler/user to the wrong place). Seeds two DISTINCT raw fylke/kommune
+// column values that fold to the SAME key ("Bø" vs "Bo", "Ås" vs "As") — a
+// realistic data-quality scenario (the same place entered with/without
+// diacritics by different harvest sources) — and asserts the ambiguous param
+// still 404s via next(), same as a genuinely-unknown place. Isolated
+// :memory: experiences.db + sync IIFE, same pattern as the P2 block above.
+console.log("\n── opplevagent: /fylke + /kommune fold-redirect ambiguity guard ──");
+(() => {
+  const prevPathAmb = process.env.EXPERIENCES_DB_PATH;
+  process.env.EXPERIENCES_DB_PATH = ":memory:";
+
+  const dbFactoryPathAmb = require.resolve("../src/database/db-factory");
+  const expStorePathAmb = require.resolve("../src/services/experience-store");
+  const expSeoPathAmb = require.resolve("../src/routes/experiences-seo");
+  delete require.cache[dbFactoryPathAmb];
+  delete require.cache[expStorePathAmb];
+  delete require.cache[expSeoPathAmb];
+
+  const dbFactoryAmb = require("../src/database/db-factory") as typeof import("../src/database/db-factory");
+  dbFactoryAmb.__resetDbFactoryForTesting();
+  const expStoreAmb = require("../src/services/experience-store") as typeof import("../src/services/experience-store");
+  const seoRouterAmb = (require("../src/routes/experiences-seo") as typeof import("../src/routes/experiences-seo")).default as any;
+
+  // Two providers/experiences with DISTINCT raw fylke/kommune strings that
+  // ascii-fold+lowercase to the SAME key: "Bø"/"Bo" both fold to "bo",
+  // "Ås"/"As" both fold to "as".
+  const provAmb1 = expStoreAmb.createProvider({
+    navn: "Bø Fjelltur AS", org_nr: "911111111",
+    fylke: "Bø", kommune: "Ås", brreg_verified: 1, brreg_active: 1, verification_status: "verified",
+  });
+  const provAmb2 = expStoreAmb.createProvider({
+    navn: "Bo Aktiviteter AS", org_nr: "922222222",
+    fylke: "Bo", kommune: "As", brreg_verified: 1, brreg_active: 1, verification_status: "verified",
+  });
+  expStoreAmb.createExperience({
+    title: "Fjelltur i Bø", provider_id: provAmb1, provider_match_status: "matched",
+    category: "friluftsliv", fylke: "Bø", kommune: "Ås", indoor_outdoor: "outdoor",
+    confidence: "high", verification_status: "verified",
+  });
+  expStoreAmb.createExperience({
+    title: "Aktivitet i Bo", provider_id: provAmb2, provider_match_status: "matched",
+    category: "friluftsliv", fylke: "Bo", kommune: "As", indoor_outdoor: "outdoor",
+    confidence: "high", verification_status: "verified",
+  });
+
+  function invokeSeoAmb(
+    routePath: string,
+    params: Record<string, string>,
+    reqPath: string
+  ): { status: number; redirectTo: string | null } {
+    const layer = (seoRouterAmb.stack as any[]).find(
+      (l: any) => l.route && l.route.path === routePath && l.route.methods?.get
+    );
+    if (!layer) return { status: 0, redirectTo: null };
+    let status = 200; let nexted = false; let redirectTo: string | null = null;
+    const res: any = {
+      statusCode: 200,
+      setHeader: () => {},
+      status: (c: number) => { status = c; res.statusCode = c; return res; },
+      send: () => res,
+      json: () => res,
+      redirect: (code: number, location: string) => { status = code; redirectTo = location; },
+    };
+    const req: any = { path: reqPath, hostname: "opplevagent.no", params, query: {} };
+    const handler = layer.route.stack[layer.route.stack.length - 1].handle;
+    handler(req, res, () => { nexted = true; });
+    if (nexted) status = 404;
+    return { status, redirectTo };
+  }
+
+  // Sanity: both distinct exact-cased fylke/kommune values resolve normally
+  // (proves the seed itself is live/published before testing the fold-ambiguity).
+  const bøExact = invokeSeoAmb("/fylke/:fylke", { fylke: "Bø" }, "/fylke/B%C3%B8");
+  assertEq(bøExact.status, 200, "amb-01: exact /fylke/Bø → 200 (seed is live)");
+  const boExact = invokeSeoAmb("/fylke/:fylke", { fylke: "Bo" }, "/fylke/Bo");
+  assertEq(boExact.status, 200, "amb-02: exact /fylke/Bo → 200 (seed is live)");
+
+  // The ambiguous fold key: "bo" matches BOTH "Bø" and "Bo" — must NOT guess,
+  // must fall through to next() → 404, same as a genuinely-unknown fylke.
+  const fylkeAmb = invokeSeoAmb("/fylke/:fylke", { fylke: "bo" }, "/fylke/bo");
+  assertEq(fylkeAmb.status, 404, "amb-03: /fylke/bo (folds to match BOTH Bø and Bo) → 404, never guesses");
+  assertEq(fylkeAmb.redirectTo, null, "amb-04: ambiguous fylke fold never redirects");
+
+  const kommAsExact = invokeSeoAmb("/kommune/:kommune", { kommune: "Ås" }, "/kommune/%C3%85s");
+  assertEq(kommAsExact.status, 200, "amb-05: exact /kommune/Ås → 200 (seed is live)");
+  const kommAsExact2 = invokeSeoAmb("/kommune/:kommune", { kommune: "As" }, "/kommune/As");
+  assertEq(kommAsExact2.status, 200, "amb-06: exact /kommune/As → 200 (seed is live)");
+  const kommAmb = invokeSeoAmb("/kommune/:kommune", { kommune: "as" }, "/kommune/as");
+  assertEq(kommAmb.status, 404, "amb-07: /kommune/as (folds to match BOTH Ås and As) → 404, never guesses");
+  assertEq(kommAmb.redirectTo, null, "amb-08: ambiguous kommune fold never redirects");
+
+  if (prevPathAmb === undefined) delete process.env.EXPERIENCES_DB_PATH;
+  else process.env.EXPERIENCES_DB_PATH = prevPathAmb;
+  dbFactoryAmb.__resetDbFactoryForTesting();
 })();
 
 // ── Norwegian search synonym expansion (feat/experiences-search-norwegian) ─────

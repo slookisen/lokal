@@ -563,6 +563,48 @@ export function listPublishedKommuner(): Array<{ kommune: string; fylke: string 
     .all() as Array<{ kommune: string; fylke: string | null; count: number }>;
 }
 
+// dev-request 2026-07-04-opplevagent-nl-parser-og-fylkesnormalisering, item 5:
+// case/diacritic-insensitive fylke/kommune URL matching (routes/experiences-seo.ts
+// /fylke/:fylke and /kommune/:kommune 301-redirect a differently-cased or
+// ascii-folded param — e.g. "/kommune/tromso" — to the canonical, live-DB-cased
+// path — e.g. "/kommune/Tromsø" — instead of 404ing).
+//
+// NOTE: this is a SLUG-COMPARISON helper only — never used for display, and
+// deliberately independent of norway-fylke.ts's `key()` (which additionally
+// strips spaces/punctuation and applies 2020/2024 fylke-reform alias
+// resolution; neither is wanted here — this only needs to recognise the SAME
+// place spelled with different case/diacritics, e.g. "Kristiansand S" must
+// stay "kristiansand s", not collapse into "kristiansands").
+/**
+ * Lowercase + ascii-fold a Norwegian place name for case/diacritic-insensitive
+ * comparison. Strips combining diacritical marks left behind by Unicode NFD
+ * decomposition (handles é/è/ü/etc., and also å — which canonically
+ * decomposes to `a` + U+030A under NFD, so it is already folded by the strip
+ * step); ø and æ have no NFD decomposition (they are their own code points),
+ * so the explicit replacements below handle those two. All three explicit
+ * replacements are kept regardless of which step actually does the work, so
+ * the function's behavior doesn't depend on normalize()'s decomposition
+ * table. Whitespace is preserved (only trimmed at the ends) so multi-word
+ * names remain distinguishable ("Kristiansand S" → "kristiansand s", never
+ * merged with an unrelated "Kristiansands").
+ *
+ *   foldPlaceSlug("Tromsø")          → "tromso"
+ *   foldPlaceSlug("TROMSØ")          → "tromso"
+ *   foldPlaceSlug("Ålesund")         → "alesund"
+ *   foldPlaceSlug("Kristiansand S")  → "kristiansand s"
+ */
+export function foldPlaceSlug(raw: string): string {
+  if (typeof raw !== "string") return "";
+  return raw
+    .toLowerCase()
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "") // strip NFD combining diacritical marks
+    .replace(/ø/g, "o")
+    .replace(/æ/g, "ae")
+    .replace(/å/g, "a")
+    .trim();
+}
+
 // GEO: aggregate FAQ-relevant stats for the category/kommune browse pages
 // (dev-request 2026-06-30-geo-content-structured-data, category/city slice —
 // the producer-vertical city page already has this in routes/seo.ts; these
