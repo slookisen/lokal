@@ -1011,10 +1011,24 @@ Tilgjengelige MCP-verktøy:
 - list_experience_categories   — hent alle kategorier med antall verifiserte opplevelser
 - get_experience               — hent fullstendig detalj for én opplevelse via UUID
 
-Eksempel (tools/call — discover):
+MCP Streamable HTTP krever et initialize-håndtrykk før tools/call — et bart
+tools/call uten forutgående initialize svarer med JSON-RPC-feil -32000
+("Server not initialized"). Steg 1 svarer med en mcp-session-id-header som
+MÅ sendes med i steg 2 (og alle senere kall i samme sesjon).
+
+Eksempel (steg 1: initialize — fang opp mcp-session-id fra svar-headerne):
+  SESSION_ID=$(curl -s -D - -o /dev/null -X POST ${url}/mcp \\
+    -H "Content-Type: application/json" \\
+    -H "Accept: application/json, text/event-stream" \\
+    -d '{"jsonrpc":"2.0","method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"eksempel-klient","version":"1.0.0"}},"id":"1"}' \\
+    | grep -i '^mcp-session-id:' | tr -d '\\r' | cut -d' ' -f2)
+
+Eksempel (steg 2: tools/call — discover, med mcp-session-id fra steg 1):
   curl -X POST ${url}/mcp \\
     -H "Content-Type: application/json" \\
-    -d '{"jsonrpc":"2.0","method":"tools/call","params":{"name":"discover_experiences","arguments":{"fylke":"Oslo","weather":"rain","limit":5}},"id":"1"}'
+    -H "Accept: application/json, text/event-stream" \\
+    -H "mcp-session-id: $SESSION_ID" \\
+    -d '{"jsonrpc":"2.0","method":"tools/call","params":{"name":"discover_experiences","arguments":{"fylke":"Oslo","weather":"rain","limit":5}},"id":"2"}'
 
 ## A2A AI-discovery
 

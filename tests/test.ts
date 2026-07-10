@@ -23352,6 +23352,21 @@ Promise.allSettled(_oaHomeCountersDeps).then(async () => {
     failed += rr.failed;
     for (const f of rr.failures) failures.push("opplevelser-discover-relax: " + f);
     console.log(`  opplevelser-discover-relax: ${rr.passed} passed, ${rr.failed} failed`);
+
+    // dev-request 2026-07-04-opplevagent-nl-parser-og-fylkesnormalisering,
+    // item 6: llms.txt curl-example verifier probe (MCP initialize +
+    // tools/call handshake, A2A message/send, REST discover) — extracts and
+    // literally executes each documented example against a real in-process
+    // HTTP server. Same in-memory-DB pattern, runs sequentially inside this
+    // same gated block for the same reason.
+    console.log("\n── experiences-llms-examples: llms.txt curl-example verifier probe ──");
+    const { runExperiencesLlmsExamplesTests } = require("../src/routes/experiences-llms-examples.test") as
+      typeof import("../src/routes/experiences-llms-examples.test");
+    const lr = await runExperiencesLlmsExamplesTests({ log: false });
+    passed += lr.passed;
+    failed += lr.failed;
+    for (const f of lr.failures) failures.push("experiences-llms-examples: " + f);
+    console.log(`  experiences-llms-examples: ${lr.passed} passed, ${lr.failed} failed`);
   } catch (err: any) {
     failed++;
     failures.push("oa-home-counters: unexpected error: " + String(err?.message || err));
