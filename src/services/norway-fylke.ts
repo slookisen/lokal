@@ -590,6 +590,8 @@ export const NON_KOMMUNE_REGION_LABELS: ReadonlySet<string> = new Set([
   "Vesterålen",   // Nordland — spans Sortland/Andøy/Øksnes/Bø/Hadsel
   "Lofoten",      // Nordland — spans Vågan/Vestvågøy/Flakstad/Moskenes/Røst/Værøy
   "Hardanger",    // Vestland — spans Odda/Ulvik/Jondal/Eidfjord/Kvinnherad etc.
+  "Valdres",      // Innlandet — spans Nord-Aurdal/Vestre Slidre/Øystre Slidre/Vang/Etnedal/Sør-Aurdal
+  "Helgeland",    // Nordland — spans Mo i Rana/Mosjøen/Brønnøysund/Sandnessjøen etc.
 ]);
 
 // Exported for tests + admin-UI sanity checks.

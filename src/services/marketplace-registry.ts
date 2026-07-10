@@ -10,6 +10,7 @@ import {
 } from "../models/marketplace";
 import { slugify } from "../utils/slug";
 import { isJunkDescription } from "./description-quality";
+import { normalizeCityLabel } from "./city-normalizer";
 
 // ─── Marketplace Registry Service (SQLite-backed) ────────────
 // This is the CORE of what makes Lokal unique: the agent registry.
@@ -1017,10 +1018,23 @@ class MarketplaceRegistry {
     const citiesRows = db.prepare("SELECT DISTINCT city FROM agents WHERE city IS NOT NULL AND umbrella_type IS NULL").all() as any[];
     const totalListings = (db.prepare("SELECT COUNT(*) as c FROM listings").get() as any).c;
 
+    // dev-request 2026-07-04-rfb-datakvalitet item 5 (stats-guard slice):
+    // raw agents.city values include country ("Norge"), fylke/county
+    // ("Akershus", "Vestland"), multi-kommune region labels ("Lofoten",
+    // "Valdres") and casing typos ("sandeid"). normalizeCityLabel() strips
+    // the first three and fixes the fourth; two raw values can collapse to
+    // the same normalized city (casing-only difference), so de-duplicate
+    // after mapping.
+    const normalizedCities = new Set<string>();
+    for (const r of citiesRows) {
+      const normalized = normalizeCityLabel(r.city);
+      if (normalized) normalizedCities.add(normalized);
+    }
+
     this._statsCache = {
       totalAgents: total,
       activeProducers,
-      cities: citiesRows.map(r => r.city),
+      cities: Array.from(normalizedCities),
       totalListings,
     };
     this._statsCacheTime = now;

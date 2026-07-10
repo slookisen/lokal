@@ -24679,3 +24679,184 @@ console.log("\n── description-junk-guard: isJunkDescription + render-guard w
     failures.push(`descjunk: unexpected error: ${err instanceof Error ? (err.stack || err.message) : String(err)}`);
   }
 })();
+
+// ── city-normalizer: normalizeCityLabel + getStats() byer-count guard ───────
+// dev-request 2026-07-04-rfb-datakvalitet item 5 (city-field normalization,
+// STATS/COMPUTED-GUARD-only slice — no DB migration/backfill this slice,
+// matches item 1's isJunkDescription / item 3's isDisplayablePhone pattern).
+// Covers: casing normalization, rejection of country/fylke/region pollution
+// (including the two newly-added NON_KOMMUNE_REGION_LABELS entries, Valdres
+// and Helgeland), and an explicit non-null check on real cities — the
+// PR-149-class bug this guards against is a normalization bug that silently
+// nulls out every real city too (which would erase legitimate cities from
+// the "byer" stat, not just the polluted values).
+console.log("\n── city-normalizer: normalizeCityLabel + getStats() byer-count guard ──");
+(() => {
+  try {
+    const cityNorm = require("../src/services/city-normalizer") as typeof import("../src/services/city-normalizer");
+    assertTrue(typeof cityNorm.normalizeCityLabel === "function", "citynorm: city-normalizer.ts exports normalizeCityLabel");
+
+    // ── Casing fixes (idempotent re-casing) ──
+    assertEq(cityNorm.normalizeCityLabel("sandeid"), "Sandeid", "citynorm: 'sandeid' -> 'Sandeid'");
+    assertEq(cityNorm.normalizeCityLabel("stor-elvdal"), "Stor-Elvdal", "citynorm: hyphenated 'stor-elvdal' -> 'Stor-Elvdal' (each hyphen-part gets its own capital)");
+    assertEq(cityNorm.normalizeCityLabel("kristiansand s"), "Kristiansand S", "citynorm: multi-word 'kristiansand s' -> 'Kristiansand S' (not mistaken for the fylke Agder — see isFylkePollution design comment)");
+
+    // ── Country rejection ──
+    assertEq(cityNorm.normalizeCityLabel("Norge"), null, "citynorm: 'Norge' (country) -> null");
+    assertEq(cityNorm.normalizeCityLabel("norge"), null, "citynorm: 'norge' lowercase -> null (case-insensitive)");
+
+    // ── Fylke/county rejection (>=2 required by spec; testing all 4 named in the dev-request) ──
+    assertEq(cityNorm.normalizeCityLabel("Vestland"), null, "citynorm: 'Vestland' (fylke) -> null");
+    assertEq(cityNorm.normalizeCityLabel("Troms"), null, "citynorm: 'Troms' (fylke) -> null");
+    assertEq(cityNorm.normalizeCityLabel("Agder"), null, "citynorm: 'Agder' (fylke) -> null");
+    assertEq(cityNorm.normalizeCityLabel("Akershus"), null, "citynorm: 'Akershus' (fylke) -> null");
+
+    // ── Multi-kommune region-label rejection: newly-added entries + one pre-existing ──
+    assertEq(cityNorm.normalizeCityLabel("Lofoten"), null, "citynorm: 'Lofoten' (multi-kommune region) -> null");
+    assertEq(cityNorm.normalizeCityLabel("Valdres"), null, "citynorm: 'Valdres' (newly-added NON_KOMMUNE_REGION_LABELS entry) -> null");
+    assertEq(cityNorm.normalizeCityLabel("Helgeland"), null, "citynorm: 'Helgeland' (newly-added NON_KOMMUNE_REGION_LABELS entry) -> null");
+    assertEq(cityNorm.normalizeCityLabel("Hallingdal"), null, "citynorm: 'Hallingdal' (pre-existing NON_KOMMUNE_REGION_LABELS entry) -> null");
+
+    // ── Empty / absent input ──
+    assertEq(cityNorm.normalizeCityLabel(null), null, "citynorm: null -> null");
+    assertEq(cityNorm.normalizeCityLabel(undefined), null, "citynorm: undefined -> null");
+    assertEq(cityNorm.normalizeCityLabel(""), null, "citynorm: empty string -> null");
+    assertEq(cityNorm.normalizeCityLabel("   "), null, "citynorm: whitespace-only string -> null");
+
+    // ── Real cities must NEVER be nulled — the false-positive failure class
+    // this module's design comment explicitly guards against. Bergen,
+    // Stavanger and Trondheim are all real kommuner that a naive
+    // `normaliseFylke(raw) !== null` check would incorrectly reject (they
+    // each resolve to their fylke via norway-fylke.ts's kommune fallback);
+    // Oslo is simultaneously a fylke name AND a real city. Each must pass
+    // through non-null with its content preserved (idempotent re-casing). ──
+    const bergen = cityNorm.normalizeCityLabel("Bergen");
+    assertTrue(bergen !== null, "citynorm: 'Bergen' (real city) is NOT nulled");
+    assertEq(bergen, "Bergen", "citynorm: 'Bergen' passes through unchanged (already correctly cased)");
+
+    const stavanger = cityNorm.normalizeCityLabel("Stavanger");
+    assertTrue(stavanger !== null, "citynorm: 'Stavanger' (real city) is NOT nulled");
+    assertEq(stavanger, "Stavanger", "citynorm: 'Stavanger' passes through unchanged");
+
+    const oslo = cityNorm.normalizeCityLabel("Oslo");
+    assertTrue(oslo !== null, "citynorm: 'Oslo' (real city that shares its name with its own fylke) is NOT nulled");
+    assertEq(oslo, "Oslo", "citynorm: 'Oslo' passes through unchanged");
+
+    // ── norway-fylke.ts: the two new NON_KOMMUNE_REGION_LABELS entries ──
+    const fylkeMod = require("../src/services/norway-fylke") as typeof import("../src/services/norway-fylke");
+    assertTrue(fylkeMod.NON_KOMMUNE_REGION_LABELS.has("Valdres"), "citynorm: norway-fylke.ts NON_KOMMUNE_REGION_LABELS now includes 'Valdres'");
+    assertTrue(fylkeMod.NON_KOMMUNE_REGION_LABELS.has("Helgeland"), "citynorm: norway-fylke.ts NON_KOMMUNE_REGION_LABELS now includes 'Helgeland'");
+    // Pre-existing entries must be untouched
+    assertTrue(fylkeMod.NON_KOMMUNE_REGION_LABELS.has("Hallingdal"), "citynorm: pre-existing NON_KOMMUNE_REGION_LABELS entry 'Hallingdal' untouched");
+    assertTrue(fylkeMod.NON_KOMMUNE_REGION_LABELS.has("Lofoten"), "citynorm: pre-existing NON_KOMMUNE_REGION_LABELS entry 'Lofoten' untouched");
+
+    // ── Integration: getStats() byer-count guard, seeded in-memory DB ──
+    // Mirrors the Phase 5.11 A4.1 test's in-memory-DB pattern (tests/test.ts,
+    // "umbrella exclusion from producer surfaces" block) — a minimal inline
+    // schema since src/database/init.ts's initSchema is private.
+    const Database5 = require("better-sqlite3");
+    const initMod5 = require("../src/database/init");
+    const regMod5 = require("../src/services/marketplace-registry");
+
+    const cityDb = new Database5(":memory:");
+    cityDb.pragma("journal_mode = DELETE");
+    cityDb.exec(`
+      CREATE TABLE agents (
+        id TEXT PRIMARY KEY,
+        name TEXT NOT NULL,
+        description TEXT,
+        provider TEXT,
+        contact_email TEXT,
+        url TEXT,
+        version TEXT DEFAULT '1.0.0',
+        role TEXT,
+        api_key TEXT UNIQUE,
+        lat REAL, lng REAL, city TEXT, radius_km REAL,
+        categories TEXT DEFAULT '[]',
+        tags TEXT DEFAULT '[]',
+        skills TEXT DEFAULT '[]',
+        capabilities TEXT DEFAULT '{}',
+        languages TEXT DEFAULT '["no"]',
+        trust_score REAL DEFAULT 0.5,
+        is_active INTEGER DEFAULT 1,
+        is_verified INTEGER DEFAULT 0,
+        discovery_count INTEGER DEFAULT 0,
+        interaction_count INTEGER DEFAULT 0,
+        total_interactions INTEGER DEFAULT 0,
+        avg_response_time_ms REAL,
+        created_at TEXT DEFAULT (datetime('now')),
+        last_seen_at TEXT DEFAULT (datetime('now')),
+        umbrella_type TEXT,
+        parent_umbrella_id TEXT,
+        umbrella_member_count INTEGER,
+        umbrella_scrape_config TEXT,
+        umbrella_venues TEXT
+      );
+      CREATE TABLE listings (id TEXT PRIMARY KEY);
+    `);
+    // Capture the currently-active db (whatever the last synchronous
+    // singleton-swap in this file left it as) so we can restore EXACTLY
+    // that reference afterward — never null. Several other blocks in this
+    // file document why: any dangling async test registered earlier (e.g.
+    // the "pr-56" bm-events-scraper matcher block) resumes via microtask
+    // AFTER this entire script finishes running synchronously, and expects
+    // getDb() to still return whatever was active at that later point in
+    // time. Leaving the singleton null here would make it fall back to
+    // opening the real on-disk prod db for those still-pending assertions.
+    const prevDb5 = initMod5.getDb();
+    initMod5.__setDbForTesting(cityDb);
+    const reg5 = regMod5.marketplaceRegistry as any;
+    reg5._statsCache = null;
+    reg5._agentsCache = null;
+
+    const insertCityAgent = cityDb.prepare(`
+      INSERT INTO agents (id, name, description, provider, contact_email, url, role, api_key, city, is_active, umbrella_type)
+      VALUES (?, ?, 'desc', 'test', ?, 'https://test.no', 'producer', ?, ?, 1, NULL)
+    `);
+    // Real cities (one deliberately lowercase-typo'd, one deliberately with
+    // inconsistent casing that should collapse with its correctly-cased twin).
+    insertCityAgent.run("city-1", "Producer 1", "p1@test.no", "k-city-1", "Bergen");
+    insertCityAgent.run("city-2", "Producer 2", "p2@test.no", "k-city-2", "bergen");
+    insertCityAgent.run("city-3", "Producer 3", "p3@test.no", "k-city-3", "Oslo");
+    insertCityAgent.run("city-4", "Producer 4", "p4@test.no", "k-city-4", "sandeid");
+    // Pollution: country, fylker, multi-kommune regions.
+    insertCityAgent.run("city-5", "Producer 5", "p5@test.no", "k-city-5", "Norge");
+    insertCityAgent.run("city-6", "Producer 6", "p6@test.no", "k-city-6", "Vestland");
+    insertCityAgent.run("city-7", "Producer 7", "p7@test.no", "k-city-7", "Troms");
+    insertCityAgent.run("city-8", "Producer 8", "p8@test.no", "k-city-8", "Lofoten");
+    insertCityAgent.run("city-9", "Producer 9", "p9@test.no", "k-city-9", "Valdres");
+    // Umbrella-tagged agent (excluded from the cities query entirely by the
+    // pre-existing `umbrella_type IS NULL` filter — untouched by this slice).
+    cityDb.prepare(`
+      INSERT INTO agents (id, name, description, provider, contact_email, url, role, api_key, city, is_active, umbrella_type)
+      VALUES ('city-umb', 'Umbrella Org', 'desc', 'test', 'umb@test.no', 'https://umb.test.no', 'producer', 'k-city-umb', 'ShouldNeverAppear', 1, 'market_network')
+    `).run();
+
+    const stats5 = regMod5.marketplaceRegistry.getStats();
+    const sortedCities = [...stats5.cities].sort();
+    // assertEq is a strict (===) comparison, so arrays must be compared by
+    // serialized content, not reference.
+    assertEq(
+      JSON.stringify(sortedCities),
+      JSON.stringify(["Bergen", "Oslo", "Sandeid"]),
+      "citynorm: getStats().cities — pollution removed (Norge/Vestland/Troms/Lofoten/Valdres/umbrella), casing fixed (sandeid->Sandeid), duplicates collapsed (Bergen+bergen->1 entry)"
+    );
+    assertEq(stats5.cities.length, 3, "citynorm: getStats().cities has exactly 3 entries (not 9 raw rows minus umbrella)");
+    assertTrue(!stats5.cities.includes("Vestland"), "citynorm: getStats().cities contains no fylke name (Vestland)");
+    assertTrue(!stats5.cities.includes("Troms"), "citynorm: getStats().cities contains no fylke name (Troms)");
+    assertTrue(!stats5.cities.includes("Norge"), "citynorm: getStats().cities contains no country value (Norge)");
+    assertTrue(!stats5.cities.includes("Lofoten"), "citynorm: getStats().cities contains no region label (Lofoten)");
+    assertTrue(!stats5.cities.includes("Valdres"), "citynorm: getStats().cities contains no region label (Valdres)");
+    assertTrue(!stats5.cities.includes("ShouldNeverAppear"), "citynorm: getStats().cities contains no umbrella location");
+
+    reg5._statsCache = null;
+    reg5._agentsCache = null;
+    // Restore the exact prior db reference (see comment above prevDb5) —
+    // never null, to avoid corrupting any earlier-registered dangling async
+    // test's assertions when it resumes after this script finishes.
+    initMod5.__setDbForTesting(prevDb5);
+  } catch (err) {
+    failed++;
+    failures.push(`citynorm: unexpected error: ${err instanceof Error ? (err.stack || err.message) : String(err)}`);
+  }
+})();
