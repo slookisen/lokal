@@ -275,6 +275,8 @@ function homeStrings(lang: Lang) {
     counterPageviews: "Sidevisninger", counterUnique: "Unike besøkende", counterHumans: "Ekte mennesker", counterBots: "Bot &amp; AI-trafikk",
     counterExperiences: "Opplevelser", counterProviders: "Tilbydere", counterMunicipalities: "Kommuner",
     catKicker: "Utforsk", catTitle: "Opplevelser etter kategori", catIntro: "Bla i kuraterte kategorier &mdash; eller la en AI-agent filtrere på vær, sesong, pris og gruppestørrelse for deg.", catAria: "Kategorier", catCount: "opplevelser", catSoon: "Kommer snart", catNote: "Eksempelkategorier &mdash; live opplevelser publiseres fortløpende.",
+    fylkeKicker: "Steder", fylkeTitle: "Utforsk etter fylke", fylkeIntro: "Se hvor opplevelsene finnes &mdash; velg et fylke for en fullstendig oversikt.", fylkeAria: "Fylker",
+    kommuneTitle: "Populære kommuner", kommuneAria: "Populære kommuner",
     howKicker: "Tillitsmodell", howTitle: "Slik funker det", howSub: "Kuratert, verifisert og beriket &mdash; tre steg som skiller Opplevagent fra en vanlig oppføringsliste.",
     srcLabel: "Kilde:",
     s1t: "Kuratert innhenting", s1b: "Opplevelser høstes fortløpende fra kuraterte kilder &mdash; ikke et åpent annonsemarked, men et utvalg av reelle norske tilbydere.", s1src: "kuraterte tilbyderkilder",
@@ -304,6 +306,8 @@ function homeStrings(lang: Lang) {
     counterPageviews: "Page views", counterUnique: "Unique visitors", counterHumans: "Real humans", counterBots: "Bot &amp; AI traffic",
     counterExperiences: "Experiences", counterProviders: "Providers", counterMunicipalities: "Municipalities",
     catKicker: "Explore", catTitle: "Experiences by category", catIntro: "Browse curated categories &mdash; or let an AI agent filter by weather, season, price and group size for you.", catAria: "Categories", catCount: "experiences", catSoon: "Coming soon", catNote: "Example categories &mdash; live experiences are published continuously.",
+    fylkeKicker: "Places", fylkeTitle: "Explore by county", fylkeIntro: "See where the experiences are &mdash; pick a county for a full overview.", fylkeAria: "Counties",
+    kommuneTitle: "Popular municipalities", kommuneAria: "Popular municipalities",
     howKicker: "Trust model", howTitle: "How it works", howSub: "Curated, verified and enriched &mdash; three steps that set Opplevagent apart from an ordinary listing.",
     srcLabel: "Source:",
     s1t: "Curated collection", s1b: "Experiences are gathered continuously from curated sources &mdash; not an open ad market, but a selection of real Norwegian providers.", s1src: "curated provider sources",
@@ -412,6 +416,57 @@ router.get("/", (req: Request, res: Response) => {
 
   const catNote = usingFallbackCats
     ? `<p class="cat-note">${S.catNote}</p>`
+    : "";
+
+  // Fylke grid + top-10 kommuner chips: read defensively (DB may not be open
+  // pre-data) — the homepage must never break because of this section.
+  // listPublishedFylker()/listPublishedKommuner() already gate on
+  // PUBLISH_GATE_SQL and are ordered by count DESC, so the count > 0 filter
+  // below is just a defensive belt-and-braces check, not a real-world case.
+  let fylkerForGrid: Array<{ fylke: string; count: number }> = [];
+  try { fylkerForGrid = listPublishedFylker().filter((f) => f.fylke && f.count > 0); } catch { /* DB not open */ }
+  let kommunerForChips: Array<{ kommune: string; fylke: string | null; count: number }> = [];
+  try { kommunerForChips = listPublishedKommuner().filter((k) => k.kommune && k.count > 0).slice(0, 10); } catch { /* DB not open */ }
+
+  const fylkeGridCards = fylkerForGrid
+    .map(
+      (f) =>
+        `<a class="fylke-card" href="/fylke/${encodeURIComponent(f.fylke)}">
+          <span class="fylke-card-name">${escapeHtml(f.fylke)}</span>
+          <span class="fylke-card-count">${f.count} ${S.catCount}</span>
+        </a>`
+    )
+    .join("");
+
+  const kommuneChipsHtml = kommunerForChips
+    .map(
+      (k) =>
+        `<a class="chip" href="/kommune/${encodeURIComponent(k.kommune)}">${escapeHtml(k.kommune)} <span class="n">${k.count}</span></a>`
+    )
+    .join("");
+
+  const fylkeSectionHtml = fylkerForGrid.length > 0
+    ? `
+  <section class="section" id="fylker" aria-labelledby="fylke-title">
+    <div class="container">
+      <div class="sec-head">
+        <span class="kicker">${S.fylkeKicker}</span>
+        <h2 id="fylke-title">${S.fylkeTitle}</h2>
+        <p>${S.fylkeIntro}</p>
+      </div>
+      <div class="fylke-grid" role="list" aria-label="${S.fylkeAria}">
+        ${fylkeGridCards}
+      </div>
+      ${kommuneChipsHtml
+        ? `<div class="fylke-kommuner">
+        <h3>${S.kommuneTitle}</h3>
+        <div class="chips" role="list" aria-label="${S.kommuneAria}">
+          ${kommuneChipsHtml}
+        </div>
+      </div>`
+        : ""}
+    </div>
+  </section>`
     : "";
 
   // JSON-LD: WebSite (+ SearchAction wired to the discovery API) and
@@ -602,6 +657,20 @@ ${ldScripts}
   .cat-count-soon{color:var(--amber-500);font-weight:600}
   .cat-note{margin-top:20px;font-size:.88rem;color:var(--mist)}
 
+  /* fylke grid + kommune chips */
+  .fylke-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(180px,1fr));gap:14px}
+  .fylke-card{display:block;background:var(--surface);border:1px solid var(--line);border-radius:var(--r-md);padding:16px 18px;box-shadow:var(--sh-sm);transition:transform .16s ease,box-shadow .16s ease,border-color .16s ease}
+  .section-alt .fylke-card{background:var(--canvas)}
+  .fylke-card:hover{transform:translateY(-3px);box-shadow:var(--sh-md);border-color:var(--teal-400);text-decoration:none}
+  .fylke-card-name{display:block;font-weight:700;color:var(--ink);font-size:1rem;letter-spacing:-.01em}
+  .fylke-card-count{display:block;margin-top:4px;font-size:.82rem;color:var(--mist)}
+  .fylke-kommuner{margin-top:36px}
+  .fylke-kommuner h3{font-size:.95rem;font-weight:700;color:var(--ink);margin-bottom:12px}
+  .chips{display:flex;flex-wrap:wrap;gap:8px}
+  .chip{display:inline-flex;align-items:center;gap:6px;padding:6px 13px;border-radius:var(--r-pill);background:var(--canvas-2);color:var(--ink-soft);font-size:.82rem;font-weight:600;border:1px solid var(--line)}
+  .chip:hover{text-decoration:none;border-color:var(--teal-400);color:var(--fjord-700)}
+  .chip .n{color:var(--mist);font-weight:600}
+
   /* how it works */
   .steps{display:grid;grid-template-columns:repeat(3,1fr);gap:22px;counter-reset:step}
   @media(max-width:820px){.steps{grid-template-columns:1fr}}
@@ -720,6 +789,7 @@ ${ldScripts}
       ${catNote}
     </div>
   </section>
+  ${fylkeSectionHtml}
 
   <section class="section section-alt" id="slik-funker-det" aria-labelledby="slik-title">
     <div class="container">

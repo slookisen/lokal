@@ -16213,11 +16213,28 @@ console.log("\n── opplevagent P2: human-browse subpages (experiences) ──
 
   // p2-10: homepage quick-chip uses the correct full fylke URL (fixes broken link
   // where /fylke/Troms was 404 in production — DB stores "Troms og Finnmark").
+  // Scoped to the hero "quick" chip row specifically: the homepage's DB-driven
+  // fylke-grid (dev-request 2026-07-04-opplevagent-besokstall-og-forside-friskhet,
+  // item 3) legitimately lists every live fylke incl. this test's seeded "Troms"
+  // row with a correct /fylke/Troms link, so a whole-body check would false-fail
+  // on that unrelated, intentional section.
   const homeChipP2 = invokeSeo("/", {}, "/");
-  assertTrue(homeChipP2.body.includes('href="/fylke/Troms%20og%20Finnmark"'),
+  const quickRowP2 = (homeChipP2.body.match(/<div class="quick"[\s\S]*?<\/div>/) || [""])[0];
+  assertTrue(quickRowP2.includes('href="/fylke/Troms%20og%20Finnmark"'),
     "p2-10a: homepage quick-chip links to /fylke/Troms%20og%20Finnmark (full canonical name)");
-  assertTrue(!/href="\/fylke\/Troms"/.test(homeChipP2.body),
-    "p2-10b: homepage does NOT contain the stale /fylke/Troms short-form href");
+  assertTrue(!/href="\/fylke\/Troms"/.test(quickRowP2),
+    "p2-10b: homepage hero quick-chip row does NOT contain the stale /fylke/Troms short-form href");
+
+  // p2-10c/d (dev-request 2026-07-04-opplevagent-besokstall-og-forside-friskhet,
+  // item 3): homepage fylke-grid + top-10 kommuner chips — DB-driven, no new
+  // queries (listPublishedFylker()/listPublishedKommuner(), already used
+  // elsewhere on this route).
+  assertTrue(homeChipP2.body.includes('class="fylke-card"') && homeChipP2.body.includes('href="/fylke/Troms"'),
+    "p2-10c: homepage fylke-grid renders a card for the live seeded fylke, linking to /fylke/Troms");
+  assertTrue(/\d+ opplevelser<\/span>\s*<\/a>/.test(homeChipP2.body),
+    "p2-10d: fylke-grid card shows a live experience count");
+  assertTrue(/class="chip" href="\/kommune\/Troms/.test(homeChipP2.body),
+    "p2-10e: homepage top-10 kommuner chips row links to the live seeded kommune /kommune/Tromsø");
 
   if (prevPathP2 === undefined) delete process.env.EXPERIENCES_DB_PATH;
   else process.env.EXPERIENCES_DB_PATH = prevPathP2;
