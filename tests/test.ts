@@ -25114,3 +25114,194 @@ console.log("\n── geo-produkt-by-http: /kategori/:category/:kommune route + 
     dbFacResetPBH.__resetDbFactoryForTesting();
   }
 })();
+
+// ── mcp-usage-guides: /guide-mat-ai (rettfrabonden.com) — dev-request
+// 2026-06-30-mcp-distribution-traffic-growth, Track C (usage-content).
+// Static, hand-authored SEO page cross-referencing the REAL lokal_* tools
+// registered in src/routes/mcp.ts. Fully static (no DB dependency), so this
+// invokes the seo.ts router handler directly with a plain mock req/res —
+// mirrors the rfb-produsent-404 / rfb-homepage invocation pattern above.
+console.log("\n── mcp-usage-guides: GET /guide-mat-ai (rettfrabonden.com) ──");
+(() => {
+  try {
+    const seoModGma = require("../src/routes/seo");
+    const seoRouterGma = seoModGma.default as any;
+    const { buildMcpGuideFaqJsonLd } = seoModGma;
+
+    assertTrue(typeof buildMcpGuideFaqJsonLd === "function", "gma: seo.ts exports buildMcpGuideFaqJsonLd");
+
+    const layerGma = (seoRouterGma.stack as any[]).find(
+      (l: any) => l.route && l.route.path === "/guide-mat-ai" && l.route.methods?.get
+    );
+    assertTrue(!!layerGma, "gma-00: GET /guide-mat-ai layer is registered");
+    const handlerGma = layerGma.route.stack[layerGma.route.stack.length - 1].handle;
+
+    function invokeGma(lang: "no" | "en"): { status: number; body: string } {
+      let status = 200; let body = "";
+      const res: any = {
+        status: (c: number) => { status = c; return res; },
+        send: (b: unknown) => { body = typeof b === "string" ? b : String(b); return res; },
+      };
+      const req: any = { lang, query: {} };
+      handlerGma(req, res);
+      return { status, body };
+    }
+
+    // ── NO (default) ──
+    const noGma = invokeGma("no");
+    assertEq(noGma.status, 200, "gma-01: GET /guide-mat-ai (no) -> 200");
+    assertTrue(noGma.body.includes('<link rel="canonical" href="https://rettfrabonden.com/guide-mat-ai">'),
+      "gma-02: NO canonical URL present");
+    assertTrue(noGma.body.includes('"@type":"FAQPage"'), "gma-03: FAQPage JSON-LD present in the rendered HTML");
+    assertTrue(noGma.body.includes("Finn norsk lokalmat via AI/MCP"), "gma-04: NO page renders the expected h1/title copy");
+
+    // Real lokal_* tool names from src/routes/mcp.ts must all be present —
+    // this is the whole point of the dev-request (never invent tool names).
+    const realTools = [
+      "lokal_search", "lokal_discover", "lokal_info", "lokal_stats", "lokal_geocode",
+      "lokal_list_umbrellas", "lokal_get_umbrella_members", "lokal_get_producer_affiliations",
+      "lokal_bm_next_markets", "lokal_cart_create", "lokal_cart_add_item", "lokal_cart_view",
+      "lokal_cart_submit", "lokal_order_status",
+    ];
+    for (const tool of realTools) {
+      assertTrue(noGma.body.includes(tool), `gma-05: NO page mentions the real MCP tool ${tool}`);
+    }
+    assertTrue(noGma.body.includes("/teknologi#mcp-oppsett"), "gma-06: NO page cross-links to /teknologi#mcp-oppsett instead of repeating setup steps");
+
+    // ── EN ──
+    const enGma = invokeGma("en");
+    assertEq(enGma.status, 200, "gma-07: GET /guide-mat-ai (en) -> 200");
+    assertTrue(enGma.body.includes('<link rel="canonical" href="https://rettfrabonden.com/en/guide-mat-ai">'),
+      "gma-08: EN canonical URL present (localizedPath /en prefix)");
+    assertTrue(enGma.body.includes('"@type":"FAQPage"'), "gma-09: EN FAQPage JSON-LD present");
+    assertTrue(enGma.body.includes("Find Norwegian local food via AI/MCP"), "gma-10: EN page renders the expected h1/title copy");
+    assertTrue(enGma.body.includes("lokal_search") && enGma.body.includes("lokal_cart_submit"), "gma-11: EN page also lists the real tool names");
+
+    // ── FAQ builder: static curated content, always emitted (no thin-data gate) ──
+    const faqGma = buildMcpGuideFaqJsonLd("no", "https://rettfrabonden.com/guide-mat-ai");
+    assertTrue(!!faqGma && faqGma["@type"] === "FAQPage", "gma-12: buildMcpGuideFaqJsonLd returns a valid FAQPage");
+    assertTrue(Array.isArray(faqGma.mainEntity) && faqGma.mainEntity.length >= 3 && faqGma.mainEntity.length <= 6,
+      "gma-13: FAQ has between 3 and 6 curated Q&A pairs");
+    assertTrue(
+      faqGma.mainEntity.every((q: any) => q["@type"] === "Question" && q.acceptedAnswer?.["@type"] === "Answer"),
+      "gma-14: every FAQ entry is a valid Question/Answer pair"
+    );
+
+    // ── Sitemap: /guide-mat-ai is wired into corePaths ──
+    // Source-presence check rather than executing the real /sitemap.xml
+    // handler: that route queries the live `agents` table (trust_score,
+    // enrichment status, etc.) via marketplaceRegistry, which depends on
+    // whatever DB fixture/schema is the active getDb() singleton at this
+    // point in the shared test run — too fragile to rely on mid-suite.
+    // Mirrors the source-presence style used elsewhere in this file (e.g.
+    // the geo-faq-cc/geo-afo blocks' `expSeoSrcAfo.includes(...)` checks).
+    const fsGma = require("fs");
+    const seoSrcGma = fsGma.readFileSync("src/routes/seo.ts", "utf8");
+    assertTrue(seoSrcGma.includes('const corePaths = ["/", "/om", "/teknologi", "/guide-mat-ai", "/personvern"]'),
+      "gma-15: sitemap.xml's corePaths array includes /guide-mat-ai");
+
+    console.log("  mcp-usage-guides (rfb): OK (16 tests: route-registered/200-no/canonical-no/faq-no/title-no/real-tools/teknologi-crosslink/200-en/canonical-en/faq-en/title-en/tools-en/faq-builder-valid/faq-count/faq-shape/sitemap-corepaths)");
+  } catch (err) {
+    failed++;
+    failures.push(`mcp-usage-guides (rfb): unexpected error: ${err instanceof Error ? (err.stack || err.message) : String(err)}`);
+  }
+})();
+
+// ── mcp-usage-guides: /guide-opplevelser-mcp (opplevagent.no) — same
+// dev-request, experiences-vertical half. Cross-references the REAL tools
+// registered in src/routes/experiences-mcp.ts (discover_experiences,
+// list_experience_categories, get_experience) — explicitly NOT the
+// previously-assumed-but-nonexistent opplev_discover/opplev_info/
+// opplev_categories names. Fully static (no DB dependency).
+console.log("\n── mcp-usage-guides: GET /guide-opplevelser-mcp (opplevagent.no) ──");
+(() => {
+  try {
+    const expSeoModGom = require("../src/routes/experiences-seo");
+    const expSeoRouterGom = expSeoModGom.default as any;
+    const { buildOpplevagentMcpGuideFaqJsonLd } = expSeoModGom;
+
+    assertTrue(typeof buildOpplevagentMcpGuideFaqJsonLd === "function",
+      "gom: experiences-seo.ts exports buildOpplevagentMcpGuideFaqJsonLd");
+
+    const layerGom = (expSeoRouterGom.stack as any[]).find(
+      (l: any) => l.route && l.route.path === "/guide-opplevelser-mcp" && l.route.methods?.get
+    );
+    assertTrue(!!layerGom, "gom-00: GET /guide-opplevelser-mcp layer is registered");
+    const handlerGom = layerGom.route.stack[layerGom.route.stack.length - 1].handle;
+
+    function invokeGom(lang: "no" | "en"): { status: number; body: string; headers: Record<string, string> } {
+      let status = 200; let body = "";
+      const headers: Record<string, string> = {};
+      const res: any = {
+        setHeader: (k: string, v: string) => { headers[k.toLowerCase()] = String(v); },
+        status: (c: number) => { status = c; return res; },
+        send: (b: unknown) => { body = typeof b === "string" ? b : String(b); return res; },
+      };
+      const req: any = { path: "/guide-opplevelser-mcp", hostname: "opplevagent.no", params: {}, query: {}, lang };
+      handlerGom(req, res);
+      return { status, body, headers };
+    }
+
+    // ── NO (default) ──
+    const noGom = invokeGom("no");
+    assertEq(noGom.status, 200, "gom-01: GET /guide-opplevelser-mcp (no) -> 200");
+    assertTrue(/text\/html/.test(noGom.headers["content-type"] || ""), "gom-01b: Content-Type text/html");
+    assertTrue(noGom.body.includes('<link rel="canonical" href="https://opplevagent.no/guide-opplevelser-mcp">'),
+      "gom-02: NO canonical URL present");
+    assertTrue(noGom.body.includes('"@type":"FAQPage"'), "gom-03: FAQPage JSON-LD present in the rendered HTML");
+    assertTrue(noGom.body.includes("Oppdag norske opplevelser via opplevagent-mcp"), "gom-04: NO page renders the expected h1 copy");
+
+    // Real tool names from src/routes/experiences-mcp.ts.
+    const realExpTools = ["discover_experiences", "list_experience_categories", "get_experience"];
+    for (const tool of realExpTools) {
+      assertTrue(noGom.body.includes(tool), `gom-05: NO page mentions the real MCP tool ${tool}`);
+    }
+    // Regression guard: the previously-assumed-but-nonexistent tool names
+    // must never appear on this page (the whole point of the dev-request).
+    const wrongExpTools = ["opplev_discover", "opplev_info", "opplev_categories"];
+    for (const tool of wrongExpTools) {
+      assertTrue(!noGom.body.includes(tool), `gom-06: NO page does NOT mention the nonexistent tool name ${tool}`);
+    }
+    assertTrue(noGom.body.includes("https://opplevagent.no/mcp"), "gom-07: NO page documents the remote MCP endpoint");
+    assertTrue(noGom.body.includes("opplevagent-mcp"), "gom-08: NO page documents the opplevagent-mcp npm package");
+
+    // ── EN ──
+    const enGom = invokeGom("en");
+    assertEq(enGom.status, 200, "gom-09: GET /guide-opplevelser-mcp (en) -> 200");
+    assertTrue(enGom.body.includes('<link rel="canonical" href="https://opplevagent.no/en/guide-opplevelser-mcp">'),
+      "gom-10: EN canonical URL present");
+    assertTrue(enGom.body.includes('"@type":"FAQPage"'), "gom-11: EN FAQPage JSON-LD present");
+    assertTrue(enGom.body.includes("Discover Norwegian experiences via opplevagent-mcp"), "gom-12: EN page renders the expected h1 copy");
+    assertTrue(enGom.body.includes("discover_experiences") && enGom.body.includes("get_experience"), "gom-13: EN page also lists the real tool names");
+
+    // ── FAQ builder: static curated content, always emitted (no thin-data gate) ──
+    const faqGom = buildOpplevagentMcpGuideFaqJsonLd("no", "https://opplevagent.no/guide-opplevelser-mcp");
+    assertTrue(!!faqGom && faqGom["@type"] === "FAQPage", "gom-14: buildOpplevagentMcpGuideFaqJsonLd returns a valid FAQPage");
+    assertTrue(Array.isArray(faqGom.mainEntity) && faqGom.mainEntity.length >= 3 && faqGom.mainEntity.length <= 6,
+      "gom-15: FAQ has between 3 and 6 curated Q&A pairs");
+    assertTrue(
+      faqGom.mainEntity.every((q: any) => q["@type"] === "Question" && q.acceptedAnswer?.["@type"] === "Answer"),
+      "gom-16: every FAQ entry is a valid Question/Answer pair"
+    );
+
+    // ── Sitemap: /guide-opplevelser-mcp is registered ──
+    const sitemapLayerGom = (expSeoRouterGom.stack as any[]).find(
+      (l: any) => l.route && l.route.path === "/sitemap.xml" && l.route.methods?.get
+    );
+    assertTrue(!!sitemapLayerGom, "gom-17: router has GET /sitemap.xml layer");
+    let sitemapBodyGom = "";
+    const sitemapResGom: any = {
+      setHeader: () => {},
+      send: (b: unknown) => { sitemapBodyGom = String(b); return sitemapResGom; },
+    };
+    const sitemapHandlerGom = sitemapLayerGom.route.stack[sitemapLayerGom.route.stack.length - 1].handle;
+    sitemapHandlerGom({ path: "/sitemap.xml", hostname: "opplevagent.no", params: {}, query: {} } as any, sitemapResGom, () => {});
+    assertTrue(sitemapBodyGom.includes("<loc>https://opplevagent.no/guide-opplevelser-mcp</loc>"),
+      "gom-18: sitemap.xml includes the /guide-opplevelser-mcp URL");
+
+    console.log("  mcp-usage-guides (opplevagent): OK (18 tests: route-registered/200-no/content-type/canonical-no/faq-no/title-no/real-tools/no-wrong-tools/mcp-endpoint/npm-package/200-en/canonical-en/faq-en/title-en/tools-en/faq-builder-valid/faq-count/faq-shape/sitemap)");
+  } catch (err) {
+    failed++;
+    failures.push(`mcp-usage-guides (opplevagent): unexpected error: ${err instanceof Error ? (err.stack || err.message) : String(err)}`);
+  }
+})();
