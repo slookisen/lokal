@@ -42,6 +42,7 @@ import {
   listPublishedCategories,
   listPublishedFylker,
   listPublishedKommuner,
+  foldPlaceSlug,
   listPublishedProviders,
   getCategoryFaqStats,
   getKommuneFaqStats,
@@ -2991,7 +2992,22 @@ router.get("/fylke/:fylke", (req: Request, res: Response, next: NextFunction) =>
   const page = parsePage(req.query.page);
   try {
     total = countPublishedExperiences({ fylke });
-    if (total === 0) return next(); // unknown/empty fylke → 404 (no orphan page)
+    if (total === 0) {
+      // Exact match failed — before giving up, try a case/diacritic-insensitive
+      // match against the live fylke list, so a differently-cased or
+      // ascii-folded URL (e.g. /fylke/troms) 301s to the canonical, correctly
+      // cased path instead of 404ing. Only a UNIQUE fold match redirects — zero
+      // matches, or more than one (ambiguous — never seen in real data today,
+      // but two distinctly-cased/spelled live fylke rows folding to the same
+      // key is a latent risk this must never guess through), fall through to
+      // the existing next() 404 unchanged.
+      const foldedParam = foldPlaceSlug(fylke);
+      const matches = listPublishedFylker().filter((f) => foldPlaceSlug(f.fylke) === foldedParam);
+      if (matches.length === 1 && matches[0].fylke !== fylke) {
+        return res.redirect(301, `/fylke/${encodeURIComponent(matches[0].fylke)}`);
+      }
+      return next(); // unknown/empty fylke → 404 (no orphan page)
+    }
     rows = listPublishedExperiences({ fylke }, BROWSE_PAGE_SIZE, (page - 1) * BROWSE_PAGE_SIZE);
   } catch {
     return next();
@@ -3027,7 +3043,16 @@ router.get("/kommune/:kommune", (req: Request, res: Response, next: NextFunction
   const page = parsePage(req.query.page);
   try {
     total = countPublishedExperiences({ kommune });
-    if (total === 0) return next(); // unknown/empty kommune -> 404 (no orphan page)
+    if (total === 0) {
+      // Same case/diacritic-insensitive fallback as /fylke/:fylke above (see
+      // that block's comment) -- mirrors it against listPublishedKommuner().
+      const foldedParam = foldPlaceSlug(kommune);
+      const matches = listPublishedKommuner().filter((k) => foldPlaceSlug(k.kommune) === foldedParam);
+      if (matches.length === 1 && matches[0].kommune !== kommune) {
+        return res.redirect(301, `/kommune/${encodeURIComponent(matches[0].kommune)}`);
+      }
+      return next(); // unknown/empty kommune -> 404 (no orphan page)
+    }
     rows = listPublishedExperiences({ kommune }, BROWSE_PAGE_SIZE, (page - 1) * BROWSE_PAGE_SIZE);
   } catch {
     return next();
