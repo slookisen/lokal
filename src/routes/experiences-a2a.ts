@@ -279,6 +279,13 @@ export function handleExperiencesMessageSend(
       if (typeof d.max_price === "number") filter.max_price = d.max_price;
       if (typeof d.duration_max === "number") filter.duration_max = d.duration_max;
       if (typeof d.language === "string") filter.language = d.language;
+      // near-me geo args (dev-request 2026-07-04-opplevagent-naer-meg-geosok,
+      // item 2) — same lat/lng/radius_km/sort args as the REST discover
+      // endpoint and the discover_experiences MCP tool.
+      if (typeof d.lat === "number") filter.lat = d.lat;
+      if (typeof d.lng === "number") filter.lng = d.lng;
+      if (typeof d.radius_km === "number") filter.radius_km = d.radius_km;
+      if (d.sort === "distance") filter.sort = d.sort;
     }
   }
 

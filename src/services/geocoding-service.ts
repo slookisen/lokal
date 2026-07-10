@@ -252,6 +252,34 @@ const MAJOR_CITIES: Record<string, { lat: number; lng: number; radius: number }>
   "hundvag":           { lat: 58.998, lng: 5.751,  radius: 5 },
 };
 
+// ── Shared distance helper (dev-request 2026-07-04-opplevagent-naer-meg-
+// geosok, item 2) ──────────────────────────────────────────────────
+// Great-circle distance between two lat/lng points, in kilometers
+// (haversine formula). Lives here — the one geo module already shared
+// across verticals (dental-geocode-worker.ts + experiences-geocode-worker.ts
+// both import geocodingService from this file) — rather than in a
+// vertical-specific route file.
+//
+// NB: src/services/marketplace-registry.ts (rfb-only) already has its own
+// private, unexported `haversine()` with the identical formula. It is NOT
+// imported from here: that file is intentionally rfb-isolated (see
+// src/routes/opplevelser.ts's own "Zero overlap with rfb's marketplace.ts"
+// doc comment), so reusing it would mean importing an rfb-only module
+// (and its getDb('rfb') dependency) into the experiences vertical purely
+// to borrow one pure function. This export is the shared, vertical-agnostic
+// home for that formula going forward.
+export function haversineDistanceKm(lat1: number, lng1: number, lat2: number, lng2: number): number {
+  const R = 6371;
+  const toRad = (deg: number) => deg * (Math.PI / 180);
+  const dLat = toRad(lat2 - lat1);
+  const dLng = toRad(lng2 - lng1);
+  const a =
+    Math.sin(dLat / 2) * Math.sin(dLat / 2) +
+    Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) *
+    Math.sin(dLng / 2) * Math.sin(dLng / 2);
+  return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+}
+
 // ── Radius heuristic based on place type ──
 function radiusForType(type: string): number {
   const t = type.toLowerCase();

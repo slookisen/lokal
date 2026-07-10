@@ -19,6 +19,7 @@ import { z } from "zod";
 import { getDb } from "../database/db-factory";
 import { fylkeEquivalents } from "./norway-fylke";
 import { deriveExperienceTags, type ExperienceTag, type TaggableExperience } from "./experience-tags";
+import { haversineDistanceKm } from "./geocoding-service";
 
 const VERTICAL = "experiences";
 
@@ -94,6 +95,11 @@ export const ExperienceSchema = z.object({
   booking_type: z.enum(["instant", "request", "external", "none"]).optional().nullable(),
   loc_lat: z.number().optional().nullable(),
   loc_lon: z.number().optional().nullable(),
+  // How loc_lat/loc_lon was derived — 'address' (precise, geocoded from the
+  // provider's street address) vs 'kommune' (approximate, a municipality
+  // centroid). Added in PR #207 (item-1, near-me search backfill worker).
+  // NULL means the row has no location at all yet.
+  geo_precision: z.enum(["address", "kommune"]).optional().nullable(),
   meeting_point: z.string().optional().nullable(),
   kommune: z.string().optional().nullable(),
   fylke: z.string().optional().nullable(),
@@ -109,7 +115,17 @@ export const ExperienceSchema = z.object({
 export type Experience = z.infer<typeof ExperienceSchema>;
 
 // ─── Discovery filter ───────────────────────────────────────────────
-export const DiscoverFilterSchema = z.object({
+// lat/lng/radius_km/sort — dev-request 2026-07-04-opplevagent-naer-meg-geosok,
+// item 2 (near-me search). All four are optional and additive: omitting them
+// produces byte-identical behavior to before this filter existed. `lat`/`lng`
+// are the caller's origin point; when both are given, discoverExperiences()
+// only returns rows with a real geocoded location (geo_precision NOT NULL —
+// never fabricates a distance for an ungeocoded row), attaches a rounded
+// `distance_km` to each result, and sorts ascending by distance (the only
+// sort `sort:"distance"` can mean — it is accepted as an explicit, documented
+// request for that same behavior, which is otherwise already the default the
+// moment an origin is given).
+const DiscoverFilterBaseSchema = z.object({
   fylke: z.string().optional(),
   kommune: z.string().optional(),
   category: z.string().optional(),
@@ -121,8 +137,16 @@ export const DiscoverFilterSchema = z.object({
   max_price: z.number().int().positive().optional(),
   duration_max: z.number().int().positive().optional(),
   language: z.string().optional(),
+  lat: z.number().min(-90).max(90).optional(),
+  lng: z.number().min(-180).max(180).optional(),
+  radius_km: z.number().positive().max(5000).optional(),
+  sort: z.enum(["distance"]).optional(),
 });
-export type DiscoverFilter = z.infer<typeof DiscoverFilterSchema>;
+export const DiscoverFilterSchema = DiscoverFilterBaseSchema.refine(
+  (f) => (f.lat === undefined) === (f.lng === undefined),
+  { message: "lat and lng must both be provided together", path: ["lat"] }
+);
+export type DiscoverFilter = z.infer<typeof DiscoverFilterBaseSchema>;
 
 // ─── Helpers ────────────────────────────────────────────────────────
 function jsonOrNull(arr: string[] | undefined): string | null {
@@ -182,6 +206,7 @@ function hydrateExperience(row: Record<string, unknown>): Experience & { id: str
     booking_type: (row.booking_type as Experience["booking_type"]) ?? null,
     loc_lat: (row.loc_lat as number | null) ?? null,
     loc_lon: (row.loc_lon as number | null) ?? null,
+    geo_precision: (row.geo_precision as Experience["geo_precision"]) ?? null,
     meeting_point: (row.meeting_point as string | null) ?? null,
     kommune: (row.kommune as string | null) ?? null,
     fylke: (row.fylke as string | null) ?? null,
@@ -263,7 +288,7 @@ export function createExperience(input: Experience): string {
       physical_intensity, duration_min, duration_max, group_min, group_max,
       age_suitability, min_age, price_band, price_from, price_unit,
       languages, accessibility, booking_url, booking_type,
-      loc_lat, loc_lon, meeting_point, kommune, fylke,
+      loc_lat, loc_lon, geo_precision, meeting_point, kommune, fylke,
       discovery_source, content_source, evidence_url, confidence,
       enrichment_state, verification_status, seasonal_valid_from, seasonal_valid_to
     ) VALUES (
@@ -272,7 +297,7 @@ export function createExperience(input: Experience): string {
       @physical_intensity, @duration_min, @duration_max, @group_min, @group_max,
       @age_suitability, @min_age, @price_band, @price_from, @price_unit,
       @languages, @accessibility, @booking_url, @booking_type,
-      @loc_lat, @loc_lon, @meeting_point, @kommune, @fylke,
+      @loc_lat, @loc_lon, @geo_precision, @meeting_point, @kommune, @fylke,
       @discovery_source, @content_source, @evidence_url, @confidence,
       @enrichment_state, @verification_status, @seasonal_valid_from, @seasonal_valid_to
     )
@@ -290,7 +315,8 @@ export function createExperience(input: Experience): string {
     price_band: e.price_band ?? null, price_from: e.price_from ?? null, price_unit: e.price_unit ?? null,
     languages: jsonOrNull(e.languages), accessibility: jsonOrNull(e.accessibility),
     booking_url: e.booking_url ?? null, booking_type: e.booking_type ?? null,
-    loc_lat: e.loc_lat ?? null, loc_lon: e.loc_lon ?? null, meeting_point: e.meeting_point ?? null,
+    loc_lat: e.loc_lat ?? null, loc_lon: e.loc_lon ?? null, geo_precision: e.geo_precision ?? null,
+    meeting_point: e.meeting_point ?? null,
     kommune: e.kommune ?? null, fylke: e.fylke ?? null,
     discovery_source: e.discovery_source ?? null, content_source: e.content_source ?? null,
     evidence_url: e.evidence_url ?? null, confidence: e.confidence ?? null,
@@ -952,7 +978,7 @@ export function searchPublishedExperiences(query: string, limit = 30): Experienc
 export function discoverExperiences(
   filter: DiscoverFilter = {},
   limit = 20
-): Array<Experience & { id: string; tags: ExperienceTag[] }> {
+): Array<Experience & { id: string; tags: ExperienceTag[]; distance_km?: number }> {
   const f = DiscoverFilterSchema.parse(filter);
   const db = getDb(VERTICAL);
 
@@ -962,6 +988,32 @@ export function discoverExperiences(
     "(p.id IS NULL OR p.brreg_active = 1)",
   ];
   const params: Record<string, unknown> = {};
+
+  // near-me geo filter (dev-request 2026-07-04-opplevagent-naer-meg-geosok,
+  // item 2). Both lat+lng present is enforced by DiscoverFilterSchema's
+  // refine, so narrowing on both together here is exact (not just a hint).
+  const hasGeo = typeof f.lat === "number" && typeof f.lng === "number";
+  const originLat = f.lat;
+  const originLng = f.lng;
+  if (hasGeo && typeof originLat === "number" && typeof originLng === "number") {
+    // Never fabricate a distance: a row with no geocoded location at all
+    // (geo_precision IS NULL, e.g. never backfilled, or backfill failed) is
+    // excluded outright rather than surfaced without a distance_km.
+    where.push("e.loc_lat IS NOT NULL AND e.loc_lon IS NOT NULL AND e.geo_precision IS NOT NULL");
+    if (typeof f.radius_km === "number") {
+      // Bounding-box pre-filter (cheap, SQL-level) — mirrors the pattern in
+      // src/services/marketplace-registry.ts's discover(): a coarse degrees-
+      // based box first, then the exact haversine cut (+ real distance_km)
+      // is computed in JS on the (small) surviving set below.
+      const latDelta = f.radius_km / 111.0; // ~111km per degree latitude
+      const lngDelta = f.radius_km / (111.0 * Math.cos((originLat * Math.PI) / 180));
+      where.push("e.loc_lat BETWEEN @geoLatMin AND @geoLatMax AND e.loc_lon BETWEEN @geoLngMin AND @geoLngMax");
+      params.geoLatMin = originLat - latDelta;
+      params.geoLatMax = originLat + latDelta;
+      params.geoLngMin = originLng - lngDelta;
+      params.geoLngMax = originLng + lngDelta;
+    }
+  }
 
   if (f.fylke) {
     // Bridge pre-2024/2020 fylke-reform era spellings against whatever era
@@ -990,7 +1042,13 @@ export function discoverExperiences(
   if (typeof f.duration_max === "number") { where.push("(e.duration_min IS NULL OR e.duration_min <= @dmax)"); params.dmax = f.duration_max; }
   if (f.language) { where.push("(e.languages IS NULL OR e.languages LIKE @lang)"); params.lang = `%"${f.language}"%`; }
 
-  params.limit = Math.max(1, Math.min(100, limit));
+  // When a geo origin is given, the true top-N-by-distance can't be decided
+  // in SQL (no haversine there), so the SQL LIMIT is widened to a generous
+  // candidate cap and the real cut to `limit` happens after the exact
+  // distance is computed + sorted in JS below — otherwise SQL's default
+  // ORDER BY could discard closer rows before the distance sort ever sees them.
+  const GEO_CANDIDATE_CAP = 2000;
+  params.limit = hasGeo ? GEO_CANDIDATE_CAP : Math.max(1, Math.min(100, limit));
 
   const sql = `
     SELECT e.* FROM experiences e
@@ -1000,7 +1058,24 @@ export function discoverExperiences(
     LIMIT @limit
   `;
   const rows = db.prepare(sql).all(params) as Array<Record<string, unknown>>;
-  return rows.map(hydrateExperience);
+  const hydrated = rows.map(hydrateExperience);
+
+  if (!hasGeo || typeof originLat !== "number" || typeof originLng !== "number") return hydrated;
+
+  // Exact haversine distance + radius cut + ascending-distance sort. The
+  // WHERE clause above already guarantees loc_lat/loc_lon/geo_precision are
+  // non-null for every row reaching here, so distance_km is always a real
+  // number (never fabricated for an ungeocoded row).
+  let withDistance = hydrated.map((e) => ({
+    ...e,
+    distance_km: Math.round(haversineDistanceKm(originLat, originLng, e.loc_lat as number, e.loc_lon as number) * 10) / 10,
+  }));
+  if (typeof f.radius_km === "number") {
+    const radiusKm = f.radius_km;
+    withDistance = withDistance.filter((e) => e.distance_km <= radiusKm);
+  }
+  withDistance.sort((a, b) => a.distance_km - b.distance_km);
+  return withDistance.slice(0, Math.max(1, Math.min(100, limit)));
 }
 
 // ─── Zero-hit graceful degradation (dev-request 2026-07-04-opplevagent-nl-
@@ -1036,10 +1111,14 @@ const FILTER_LABELS: Record<keyof DiscoverFilter, string> = {
   max_price: "maks pris",
   duration_max: "maks varighet",
   language: "språk",
+  lat: "breddegrad",
+  lng: "lengdegrad",
+  radius_km: "søkeradius",
+  sort: "sortering",
 };
 
 export interface RelaxedDiscoverResult {
-  results: Array<Experience & { id: string; tags: ExperienceTag[] }>;
+  results: Array<Experience & { id: string; tags: ExperienceTag[]; distance_km?: number }>;
   originalFilter: DiscoverFilter;
   appliedFilter: DiscoverFilter;
   relaxedKeys: Array<keyof DiscoverFilter>;

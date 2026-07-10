@@ -86,6 +86,13 @@ function parseDiscoverQuery(req: Request) {
     const n = parseInt((v as string) || "", 10);
     return Number.isFinite(n) ? n : undefined;
   };
+  // Geo params (lat/lng/radius_km) are floating-point, unlike the existing
+  // int-only filters above — a separate parseFloat helper (dev-request
+  // 2026-07-04-opplevagent-naer-meg-geosok, item 2).
+  const numFloat = (v: unknown) => {
+    const n = parseFloat((v as string) || "");
+    return Number.isFinite(n) ? n : undefined;
+  };
   return DiscoverFilterSchema.parse({
     fylke: req.query.fylke as string | undefined,
     kommune: req.query.kommune as string | undefined,
@@ -98,6 +105,10 @@ function parseDiscoverQuery(req: Request) {
     max_price: num(req.query.max_price),
     duration_max: num(req.query.duration_max),
     language: req.query.language as string | undefined,
+    lat: numFloat(req.query.lat),
+    lng: numFloat(req.query.lng),
+    radius_km: numFloat(req.query.radius_km),
+    sort: req.query.sort as string | undefined,
   });
 }
 
@@ -111,6 +122,10 @@ router.get("/discover", (req: Request, res: Response) => {
     const { results, relaxedKeys } = discoverExperiencesRelaxed(filter, limit);
     const note = buildRelaxationNote(relaxedKeys);
     const suggestions = buildNarrowingSuggestions(results, relaxedKeys);
+    // distance_km/geo_precision are only meaningful (and only ever present)
+    // when an origin was given — omitting lat/lng must produce byte-identical
+    // rows to before this feature existed.
+    const hasGeo = typeof filter.lat === "number" && typeof filter.lng === "number";
     res.json({
       vertical: "experiences",
       query: filter,
@@ -132,6 +147,15 @@ router.get("/discover", (req: Request, res: Response) => {
         booking_url: e.booking_url,
         confidence: e.confidence,
         tags: e.tags,
+        ...(hasGeo
+          ? {
+              distance_km: e.distance_km ?? null,
+              // Honesty about precision: 'address' = geocoded from the
+              // provider's exact street address; 'kommune' = a municipality
+              // centroid (approximate) — never presented as an exact distance.
+              geo_precision: e.geo_precision ?? null,
+            }
+          : {}),
       })),
     });
   } catch (err) {

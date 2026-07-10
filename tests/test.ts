@@ -23640,6 +23640,20 @@ Promise.allSettled(_oaHomeCountersDeps).then(async () => {
     failed += lr.failed;
     for (const f of lr.failures) failures.push("experiences-llms-examples: " + f);
     console.log(`  experiences-llms-examples: ${lr.passed} passed, ${lr.failed} failed`);
+
+    // dev-request 2026-07-04-opplevagent-naer-meg-geosok, item 2: geo params
+    // (lat/lng/radius_km/sort=distance) on REST /discover + the
+    // discover_experiences MCP tool + the opplevelser_discover A2A skill +
+    // openapi.json + llms.txt. Same in-memory-DB pattern, runs sequentially
+    // inside this same gated block for the same reason.
+    console.log("\n── opplevelser-discover-geo: near-me geo params (lat/lng/radius_km/sort) ──");
+    const { runOpplevelserDiscoverGeoTests } = require("../src/routes/opplevelser-discover-geo.test") as
+      typeof import("../src/routes/opplevelser-discover-geo.test");
+    const gr = await runOpplevelserDiscoverGeoTests({ log: false });
+    passed += gr.passed;
+    failed += gr.failed;
+    for (const f of gr.failures) failures.push("opplevelser-discover-geo: " + f);
+    console.log(`  opplevelser-discover-geo: ${gr.passed} passed, ${gr.failed} failed`);
   } catch (err: any) {
     failed++;
     failures.push("oa-home-counters: unexpected error: " + String(err?.message || err));
