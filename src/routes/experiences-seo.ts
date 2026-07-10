@@ -34,6 +34,7 @@ import { htmlLangAttr, ogLocale, type Lang } from "../i18n/t";
 import {
   listCategories,
   getPublishedExperienceBySlug,
+  getExperienceRedirectTarget,
   getProviderById,
   getRelatedPublishedExperiences,
   listPublishedExperienceSlugs,
@@ -3497,7 +3498,27 @@ router.get("/opplevelse/:slug", (req: Request, res: Response, next: NextFunction
   } catch {
     exp = null;
   }
-  if (!exp) return next(); // → Norwegian 404 catch-all (no rfb/dental leak)
+  if (!exp) {
+    // dev-request 2026-07-04-opplevagent-katalog-dedup, item 7: this slug
+    // might belong to a row that got soft-merged into a canonical duplicate
+    // (getPublishedExperienceBySlug()'s gate now excludes those — see
+    // PUBLISH_GATE_SQL). getExperienceRedirectTarget() is a SEPARATE lookup,
+    // without the publish gate, that only checks for a canonical pointer —
+    // if found, 301 to the canonical row's slug (existing URLs keep
+    // working). If the slug doesn't exist at all, this also returns null,
+    // so the existing 404 behavior below is unchanged.
+    let redirectTarget: ReturnType<typeof getExperienceRedirectTarget> = null;
+    try {
+      redirectTarget = getExperienceRedirectTarget(slug);
+    } catch {
+      redirectTarget = null;
+    }
+    if (redirectTarget) {
+      res.redirect(301, `/opplevelse/${redirectTarget.slug}`);
+      return;
+    }
+    return next(); // → Norwegian 404 catch-all (no rfb/dental leak)
+  }
 
   let provider: Record<string, unknown> | null = null;
   try {

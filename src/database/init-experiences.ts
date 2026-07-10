@@ -333,5 +333,17 @@ export function initExperiencesSchema(db: Database.Database): void {
     try { db.exec(stmt); } catch { /* already present */ }
   }
 
+  // ─── Dedup pass: soft-merge duplicate rows (dev-request 2026-07-04-
+  // opplevagent-katalog-dedup, item 1, 2026-07-10) ──────────────────────────
+  // canonical_experience_id (nullable): when set, this row is a soft-merged
+  // duplicate — a harvest-time near-duplicate of the SAME real venue —
+  // pointing at the canonical row's id. NEVER a hard delete: rollback is
+  // just clearing this column back to NULL. See src/services/
+  // experience-dedup.ts for the matching/canonical-picking logic and
+  // PUBLISH_GATE_SQL (experience-store.ts) for how this column excludes
+  // merged rows from every list page / sitemap / discover API in one place.
+  try { db.exec("ALTER TABLE experiences ADD COLUMN canonical_experience_id TEXT"); } catch { /* already present */ }
+  try { db.exec("CREATE INDEX IF NOT EXISTS idx_exp_canonical ON experiences(canonical_experience_id)"); } catch { /* already present */ }
+
   console.log("[experiences] schema initialized");
 }

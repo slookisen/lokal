@@ -526,6 +526,24 @@ console.log("\n── experience-tags (derived filter tags) ──");
   console.log(`  experience-tags: ${r.passed} passed, ${r.failed} failed`);
 }
 
+// ── dev-request 2026-07-04-opplevagent-katalog-dedup, item 1: dedup pass ──
+// Pins the PURE title-normalization/Jaccard-matching, kommune-required
+// false-positive guard, and richness-based canonical-row picking in
+// experience-dedup.ts against the real near-duplicate patterns verified
+// live on /fylke/Oslo (2026-07-04). DB-integration coverage (merge write,
+// publish-gate exclusion, detail-page redirect, harvester guard) lives in
+// opplevelser-dedup-backfill.test.ts, wired further below.
+console.log("\n── experience-dedup (title-fuzzy-match + canonical picking) ──");
+{
+  const { runExperienceDedupTests } = require("../src/services/experience-dedup.test") as
+    typeof import("../src/services/experience-dedup.test");
+  const r = runExperienceDedupTests({ log: false });
+  passed += r.passed;
+  failed += r.failed;
+  for (const f of r.failures) failures.push("experience-dedup: " + f);
+  console.log(`  experience-dedup: ${r.passed} passed, ${r.failed} failed`);
+}
+
 // ── orchestrator-pr-13: conservative address/phone contact-normalizer ──
 // Pins the formatting-only relaxation in cross-source-validator (clears
 // formatting-only review_required) while keeping genuine conflicts gated.
@@ -23640,6 +23658,24 @@ Promise.allSettled(_oaHomeCountersDeps).then(async () => {
     failed += lr.failed;
     for (const f of lr.failures) failures.push("experiences-llms-examples: " + f);
     console.log(`  experiences-llms-examples: ${lr.passed} passed, ${lr.failed} failed`);
+
+    // dev-request 2026-07-04-opplevagent-katalog-dedup, item 1: DB-integration
+    // half of the dedup pass (pure matching logic is covered separately,
+    // above, with no DB needed) — dedup-backfill admin route (dry-run +
+    // apply + idempotent re-run), the PUBLISH_GATE_SQL exclusion propagating
+    // to listPublishedExperiences/discoverExperiences/getPublishedExperienceBySlug,
+    // the /opplevelse/:slug 301 redirect for a merged duplicate, and the
+    // fuzzy-match harvester guard on experienceExistsForProvider(). Same
+    // in-memory-DB pattern, runs sequentially inside this same gated block
+    // for the same reason (single experiences.db singleton swap).
+    console.log("\n── opplevelser-dedup-backfill: dedup pass DB-integration ──");
+    const { runOpplevelserDedupBackfillTests } = require("../src/routes/opplevelser-dedup-backfill.test") as
+      typeof import("../src/routes/opplevelser-dedup-backfill.test");
+    const dr = await runOpplevelserDedupBackfillTests({ log: false });
+    passed += dr.passed;
+    failed += dr.failed;
+    for (const f of dr.failures) failures.push("opplevelser-dedup-backfill: " + f);
+    console.log(`  opplevelser-dedup-backfill: ${dr.passed} passed, ${dr.failed} failed`);
   } catch (err: any) {
     failed++;
     failures.push("oa-home-counters: unexpected error: " + String(err?.message || err));

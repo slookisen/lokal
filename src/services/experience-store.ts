@@ -19,6 +19,15 @@ import { z } from "zod";
 import { getDb } from "../database/db-factory";
 import { fylkeEquivalents } from "./norway-fylke";
 import { deriveExperienceTags, type ExperienceTag, type TaggableExperience } from "./experience-tags";
+import {
+  titleJaccardSimilarity,
+  TITLE_JACCARD_THRESHOLD,
+  dedupeResultRows,
+  findDuplicateClusters,
+  buildMergePlans,
+  type DedupExperienceRow,
+  type DedupMergePlan,
+} from "./experience-dedup";
 
 const VERTICAL = "experiences";
 
@@ -312,10 +321,17 @@ export function getExperienceById(id: string): (Experience & { id: string; tags:
 // publish-gate (verified + confidence>=medium + provider brreg_active) so the
 // set of live HTML detail pages == the set surfaced by /discover (100% weave,
 // zero orphan/dead pages). Read-only; no schema change.
+// dev-request 2026-07-04-opplevagent-katalog-dedup, item 1 (dedup pass):
+// `canonical_experience_id IS NULL` excludes soft-merged duplicate rows (see
+// init-experiences.ts's additive migration + experience-dedup.ts's matching
+// logic). Adding it HERE — the one shared gate reused by every list page,
+// the sitemap, and /discover (see call sites below) — makes duplicates
+// disappear from all of them in one edit, with zero per-call-site changes.
 const PUBLISH_GATE_SQL =
   "e.verification_status = 'verified' " +
   "AND (e.confidence IS NULL OR e.confidence IN ('high','medium')) " +
-  "AND (p.id IS NULL OR p.brreg_active = 1)";
+  "AND (p.id IS NULL OR p.brreg_active = 1) " +
+  "AND e.canonical_experience_id IS NULL";
 
 export function getPublishedExperienceBySlug(
   slug: string
@@ -330,6 +346,29 @@ export function getPublishedExperienceBySlug(
     )
     .get({ slug }) as Record<string, unknown> | undefined;
   return row ? hydrateExperience(row) : null;
+}
+
+// dev-request 2026-07-04-opplevagent-katalog-dedup, item 7 (detail-page
+// redirect): getPublishedExperienceBySlug()'s gate now excludes merged
+// duplicates (PUBLISH_GATE_SQL), so a slug that used to resolve now 404s via
+// that path — this is a DIFFERENT lookup, WITHOUT the publish gate, whose
+// only job is "does this slug belong to a row that got merged into another
+// canonical row, and if so what's THAT row's slug". Returns null both when
+// the slug doesn't exist at all (keep existing 404 behavior unchanged) and
+// when it exists but isn't a merged duplicate (canonical_experience_id NULL)
+// — the route only needs to distinguish "redirect" from "everything else".
+export function getExperienceRedirectTarget(slug: string): { slug: string } | null {
+  if (!slug) return null;
+  const db = getDb(VERTICAL);
+  const row = db
+    .prepare(
+      `SELECT c.slug AS slug
+       FROM experiences e
+       JOIN experiences c ON c.id = e.canonical_experience_id
+       WHERE e.slug = @slug AND e.canonical_experience_id IS NOT NULL AND c.slug IS NOT NULL`
+    )
+    .get({ slug }) as { slug: string } | undefined;
+  return row ?? null;
 }
 
 export function getProviderById(id: string): Record<string, unknown> | null {
@@ -960,6 +999,13 @@ export function discoverExperiences(
     "e.verification_status = 'verified'",
     "(e.confidence IS NULL OR e.confidence IN ('high','medium'))",
     "(p.id IS NULL OR p.brreg_active = 1)",
+    // dev-request 2026-07-04-opplevagent-katalog-dedup, item 6: this
+    // function builds its own WHERE list rather than reusing the shared
+    // PUBLISH_GATE_SQL constant (it needs an AND-composable array for the
+    // optional filters below), so the canonical_experience_id exclusion has
+    // to be repeated here explicitly to keep /discover's gate in lockstep
+    // with every other publish-gated read.
+    "e.canonical_experience_id IS NULL",
   ];
   const params: Record<string, unknown> = {};
 
@@ -1000,7 +1046,13 @@ export function discoverExperiences(
     LIMIT @limit
   `;
   const rows = db.prepare(sql).all(params) as Array<Record<string, unknown>>;
-  return rows.map(hydrateExperience);
+  // dev-request 2026-07-04-opplevagent-katalog-dedup, item 8: belt-and-
+  // suspenders invariant. Should be a no-op in practice (PUBLISH_GATE_SQL
+  // above already excludes merged-duplicate rows), but this is cheap
+  // (O(n) over the small result page, no new DB queries) insurance against
+  // a row slipping through some other path — see dedupeResultRows()'s doc
+  // comment in experience-dedup.ts.
+  return dedupeResultRows(rows.map(hydrateExperience));
 }
 
 // ─── Zero-hit graceful degradation (dev-request 2026-07-04-opplevagent-nl-
@@ -1159,16 +1211,39 @@ export function bulkInsertExperiences(rows: HarvestRow[]): { inserted: number; s
 /**
  * True if an experience with this (provider_id, title) already exists.
  * Used by the admin bulk-load to skip re-inserting a row on a re-run.
- * Title match is case-insensitive/trim-insensitive to absorb harvest noise.
+ *
+ * Exact match: case-insensitive/trim-insensitive, absorbs basic harvest
+ * noise. Extended (dev-request 2026-07-04-opplevagent-katalog-dedup, item 5,
+ * the "harvester guard") with a FUZZY same-provider fallback: re-harvesting
+ * the same real venue for the SAME provider under a slightly reworded title
+ * (e.g. "Kon-Tiki Museet" vs "Kon-Tiki Museum") must not resurrect a
+ * duplicate. Reuses the exact Jaccard matcher/threshold the periodic
+ * cross-provider backfill (runDedupBackfill()) uses, so "does this look like
+ * the same experience" is answered identically at ingest time and at
+ * backfill time.
+ *
+ * Deliberately does NOT catch cross-provider-row duplicates (two different
+ * `experience_providers` rows for the same real business — e.g. one missing
+ * org_nr so getProviderByOrgnr()'s dedup never fired) — that class of
+ * duplicate is caught by the periodic runDedupBackfill() pass instead, not
+ * at ingest time, because resolving it here would require querying/joining
+ * across ALL providers on every single bulk-load row (expensive, and out of
+ * this function's single-provider scope). This is a deliberate design
+ * split, not an oversight.
  */
 export function experienceExistsForProvider(providerId: string, title: string): boolean {
   const db = getDb(VERTICAL);
-  const row = db
+  const exact = db
     .prepare(
       "SELECT 1 FROM experiences WHERE provider_id = ? AND lower(trim(title)) = lower(trim(?)) LIMIT 1"
     )
     .get(providerId, title);
-  return !!row;
+  if (exact) return true;
+
+  const existingTitles = db
+    .prepare("SELECT title FROM experiences WHERE provider_id = ?")
+    .all(providerId) as { title: string }[];
+  return existingTitles.some((r) => titleJaccardSimilarity(r.title, title) >= TITLE_JACCARD_THRESHOLD);
 }
 
 /**
@@ -1183,6 +1258,109 @@ export function getProviderByName(navn: string): Record<string, unknown> | null 
       .prepare("SELECT * FROM experience_providers WHERE lower(trim(navn)) = lower(trim(?)) LIMIT 1")
       .get(navn) as Record<string, unknown>) ?? null
   );
+}
+
+// ─── Dedup pass — cross-provider duplicate-cluster scan + merge ─────────
+// dev-request 2026-07-04-opplevagent-katalog-dedup, item 4 (backfill) + item
+// 3 (merge). Matching/clustering/canonical-picking logic lives in the PURE
+// experience-dedup.ts module (unit-tested independently of any DB); this
+// section is the thin DB wiring: fetch the fields the matcher needs, run it,
+// and (if apply=true) write canonical_experience_id onto the non-canonical
+// rows of each cluster. Powers POST /api/opplevelser/admin/dedup-backfill
+// (src/routes/opplevelser.ts).
+
+const DEDUP_ROW_COLUMNS =
+  "id, title, kommune, provider_id, evidence_url, slug, canonical_experience_id, " +
+  "created_at, description, booking_url, price_band, price_from, duration_min, " +
+  "meeting_point, category, subcategory, activity_tags, season, indoor_outdoor, " +
+  "loc_lat, loc_lon";
+
+/** Every experience row, shaped for the dedup matcher (experience-dedup.ts).
+ *  Includes already-merged rows (findDuplicateClusters() filters those out
+ *  itself) — kept here so this function stays a simple, cacheable full scan. */
+export function listExperiencesForDedup(): DedupExperienceRow[] {
+  const db = getDb(VERTICAL);
+  return db.prepare(`SELECT ${DEDUP_ROW_COLUMNS} FROM experiences`).all() as DedupExperienceRow[];
+}
+
+/**
+ * Write one merge plan: set canonical_experience_id on every duplicate row
+ * in the plan to the canonical row's id. Never touches the canonical row
+ * itself, never touches slug, never deletes anything (rollback = clearing
+ * this column back to NULL). Skips a duplicate that already points
+ * somewhere (shouldn't happen — findDuplicateClusters() excludes
+ * already-merged rows up front — but guarded here too since this function
+ * may be called directly in tests). Returns the number of rows changed.
+ */
+export function mergeDuplicateCluster(plan: DedupMergePlan): number {
+  if (plan.duplicates.length === 0) return 0;
+  const db = getDb(VERTICAL);
+  const stmt = db.prepare(
+    `UPDATE experiences SET canonical_experience_id = @canonicalId, updated_at = datetime('now')
+     WHERE id = @dupId AND canonical_experience_id IS NULL AND id != @canonicalId`
+  );
+  let changed = 0;
+  const tx = db.transaction((dupIds: string[]) => {
+    for (const dupId of dupIds) {
+      changed += stmt.run({ canonicalId: plan.canonical.id, dupId }).changes;
+    }
+  });
+  tx(plan.duplicates.map((d) => d.id));
+  return changed;
+}
+
+export interface DedupBackfillMergeSummary {
+  canonical_id: string;
+  canonical_slug: string | null;
+  canonical_title: string;
+  kommune: string | null;
+  duplicate_ids: string[];
+  duplicate_titles: string[];
+}
+
+export interface DedupBackfillResult {
+  dry_run: boolean;
+  clusters_found: number;
+  rows_merged: number;
+  merges: DedupBackfillMergeSummary[];
+}
+
+/**
+ * Full-catalog duplicate-cluster scan (+ optional merge). Default is a
+ * dry-run: computes the same clusters/merge-plans that `apply: true` would
+ * write, but touches no rows — callers can inspect `merges` before
+ * committing. Idempotent/safe to re-run: listExperiencesForDedup() includes
+ * already-merged rows, but findDuplicateClusters() excludes them from
+ * clustering, so a second run against an unchanged catalog finds zero NEW
+ * clusters (already-merged rows are simply skipped/no-ops).
+ */
+export function runDedupBackfill(apply: boolean): DedupBackfillResult {
+  const rows = listExperiencesForDedup();
+  const clusters = findDuplicateClusters(rows);
+  const plans = buildMergePlans(clusters);
+
+  let rowsMerged = 0;
+  if (apply) {
+    for (const plan of plans) rowsMerged += mergeDuplicateCluster(plan);
+  } else {
+    rowsMerged = plans.reduce((sum, p) => sum + p.duplicates.length, 0);
+  }
+
+  const merges: DedupBackfillMergeSummary[] = plans.map((p) => ({
+    canonical_id: p.canonical.id,
+    canonical_slug: p.canonical.slug,
+    canonical_title: p.canonical.title,
+    kommune: p.canonical.kommune,
+    duplicate_ids: p.duplicates.map((d) => d.id),
+    duplicate_titles: p.duplicates.map((d) => d.title),
+  }));
+
+  return {
+    dry_run: !apply,
+    clusters_found: plans.length,
+    rows_merged: rowsMerged,
+    merges,
+  };
 }
 
 // ─── Homepage-content enrichment (orch-experiences-content-refresh) ──

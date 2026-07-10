@@ -25,6 +25,7 @@ import {
   getProviderByName,
   setBrregVerification,
   experienceExistsForProvider,
+  runDedupBackfill,
   ExperienceSchema,
   DiscoverFilterSchema,
   // orch-experiences-content-refresh — homepage→content writer
@@ -345,6 +346,45 @@ router.post("/admin/bulk-load", requireAdmin, async (req: Request, res: Response
     excluded_inactive: excludedInactive,
     ...(cappedProviders > 0 ? { capped_providers: cappedProviders } : {}),
   });
+});
+
+// ─── POST /api/opplevelser/admin/dedup-backfill (admin) ─────────────
+// dev-request 2026-07-04-opplevagent-katalog-dedup, item 1 ("dedup pass"),
+// item 4 (backfill endpoint). One-off + re-runnable full-catalog duplicate-
+// cluster scan/merge — the same physical venue harvested multiple times
+// from different sources under slightly different titles (verified live
+// 2026-07-04 on /fylke/Oslo: "Kon-Tiki Museet" 4x, "KOK Oslo" 3x, "Astrup
+// Fearnley" 2x, "RIB Oslo" 2x, "Klatreverket" 2x, "Teknisk Museum" 2x).
+// Matching/canonical-picking logic lives in src/services/experience-dedup.ts
+// (pure, unit-tested); the DB scan/write lives in runDedupBackfill()
+// (experience-store.ts). This route is just the admin-gated HTTP wrapper.
+//
+// Covers CROSS-provider duplicates (two different experience_providers rows
+// for the same real business, e.g. one missing org_nr). Same-provider
+// re-harvest duplicates are caught earlier, at ingest time, by
+// experienceExistsForProvider()'s fuzzy-match extension (bulk-load path) —
+// this endpoint doesn't need to re-catch those, though it's harmless if a
+// same-provider cluster shows up here too (idempotent either way).
+//
+// Default is a DRY-RUN — returns the candidate merges as JSON, writes
+// nothing. Pass ?apply=true (query) or {"apply":true} (body) to actually set
+// canonical_experience_id on the non-canonical rows of each cluster.
+// Idempotent/safe to re-run: already-merged rows are excluded from
+// clustering up front (see findDuplicateClusters()'s doc comment), so a
+// second run against an unchanged catalog finds zero NEW clusters.
+//
+// NB: MUST come before "/:id" so "admin" isn't swallowed as an id param.
+router.post("/admin/dedup-backfill", requireAdmin, (req: Request, res: Response) => {
+  const apply =
+    req.query.apply === "true" || req.query.apply === "1" ||
+    req.body?.apply === true || req.body?.apply === "true" || req.body?.apply === "1";
+  try {
+    const result = runDedupBackfill(apply);
+    res.json(result);
+  } catch (err) {
+    console.error("[opplevelser] dedup-backfill failed", err);
+    res.status(500).json({ error: "Internal error" });
+  }
 });
 
 // ─── POST /api/opplevelser/admin/content-refresh (admin) ────────────
