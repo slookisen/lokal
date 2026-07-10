@@ -573,6 +573,26 @@ console.log("\n── profile-activity-service: /produsent/:slug 'Aktivitet' pan
   console.log(`  profile-activity-service: ${r.passed} passed, ${r.failed} failed`);
 }
 
+// ── dev-request 2026-07-03-agent-profile-conversations-stats slice 3
+//    (work items 5+6): owner-stats-service — the six-group "Statistikk"
+//    aggregation behind GET /api/agents/:id/owner-stats. Same pattern as
+//    profile-activity-service above (own in-memory DB handle passed
+//    directly, never touches the shared getDb() singleton) — safe to run
+//    fully synchronously here. The route-level auth (401/403/200) tests
+//    for GET /api/agents/:id/owner-stats itself live in the M2 owner-portal
+//    HTTP-server block (search "m2-owner-stats"), since that block already
+//    has the real session-cookie + Express-router test harness set up.
+console.log("\n── owner-stats-service: owner dashboard 'Statistikk' aggregation ──");
+{
+  const { runOwnerStatsServiceTests } = require("../src/services/owner-stats-service.test") as
+    typeof import("../src/services/owner-stats-service.test");
+  const r = runOwnerStatsServiceTests({ log: false });
+  passed += r.passed;
+  failed += r.failed;
+  for (const f of r.failures) failures.push("owner-stats-service: " + f);
+  console.log(`  owner-stats-service: ${r.passed} passed, ${r.failed} failed`);
+}
+
 // ── crm-service: GET /admin/crm/threads?contact_email= regression fix ──
 // Pins the fix for the "/admin/crm/threads?contact_email= silently ignored"
 // P2 bug (flagged supervisor cycles 2026-07-01/02, Daniel work-order
@@ -4487,6 +4507,36 @@ const _m2Promise = (async function runOwnerPortalTests() {
         changed_at TEXT NOT NULL DEFAULT (datetime('now')),
         notes TEXT
       );
+      -- dev-request 2026-07-03-agent-profile-conversations-stats, slice 3:
+      -- tables owner-stats-service.ts's getOwnerStats() queries, needed so
+      -- GET /api/agents/:id/owner-stats can be exercised end-to-end here
+      -- alongside the other session-gated owner-portal routes above.
+      CREATE TABLE analytics_page_views (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        path TEXT NOT NULL,
+        source TEXT DEFAULT 'unknown',
+        session_id TEXT,
+        is_owner INTEGER DEFAULT 0,
+        created_at TEXT DEFAULT (datetime('now'))
+      );
+      CREATE TABLE conversations (
+        id TEXT PRIMARY KEY,
+        seller_agent_id TEXT,
+        source TEXT,
+        query_text TEXT,
+        created_at TEXT DEFAULT (datetime('now'))
+      );
+      CREATE TABLE contact_clicks (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        agent_id TEXT NOT NULL,
+        kind TEXT NOT NULL,
+        is_bot INTEGER NOT NULL DEFAULT 0,
+        created_at TEXT NOT NULL DEFAULT (datetime('now'))
+      );
+      CREATE TABLE agent_metrics (
+        agent_id TEXT PRIMARY KEY,
+        times_discovered INTEGER DEFAULT 0
+      );
     `);
     const initMod = require("../src/database/init");
     initMod.__setDbForTesting(portalDb as any);
@@ -4649,6 +4699,72 @@ const _m2Promise = (async function runOwnerPortalTests() {
         headers: { Cookie: `rfb_owner_session=${TOKEN}` },
       });
       assertEq(cross.status, 403, "m2-auth: cross-agent my-audit returns 403");
+    }
+
+    // ── dev-request 2026-07-03-agent-profile-conversations-stats, slice 3
+    //    (work items 5+6): GET /api/agents/:id/owner-stats ──────────────
+    {
+      // No session at all -> 401 (mirrors m2-C4's my-audit auth check).
+      const noAuth = await req("GET", `/api/agents/${TEST_AGENT_ID}/owner-stats`);
+      assertEq(noAuth.status, 401, "m2-owner-stats: without session returns 401");
+
+      // Cross-agent: a valid session for TEST_AGENT_ID must not read m2-other's stats.
+      const cross = await req("GET", `/api/agents/m2-other/owner-stats`, {
+        headers: { Cookie: `rfb_owner_session=${TOKEN}` },
+      });
+      assertEq(cross.status, 403, "m2-owner-stats: cross-agent session returns 403");
+
+      // Seed a few rows so the authenticated response has non-trivial numbers.
+      // Path must match slugify(TEST_AGENT_NAME) = slugify("M2 Testgård") = "m2-testgard".
+      const OS_PATH = "/produsent/m2-testgard";
+      portalDb.prepare(
+        `INSERT INTO analytics_page_views (path, source, session_id, is_owner, created_at)
+         VALUES (?, 'direct', 'iphash1:Mozilla/5.0 (Macintosh) Chrome/120', 0, datetime('now', '-1 days'))`
+      ).run(OS_PATH);
+      portalDb.prepare(
+        `INSERT INTO analytics_page_views (path, source, session_id, is_owner, created_at)
+         VALUES (?, 'direct', 'iphash2:Mozilla/5.0 (compatible; GPTBot/1.0)', 0, datetime('now', '-1 days'))`
+      ).run(OS_PATH);
+      portalDb.prepare(
+        `INSERT INTO conversations (id, seller_agent_id, source, query_text, created_at)
+         VALUES ('os-c1', ?, 'web', 'Har dere egg?', datetime('now', '-1 days'))`
+      ).run(TEST_AGENT_ID);
+      portalDb.prepare(
+        `INSERT INTO contact_clicks (agent_id, kind, is_bot, created_at)
+         VALUES (?, 'phone', 0, datetime('now', '-1 days'))`
+      ).run(TEST_AGENT_ID);
+      // A bot click that must NOT be counted.
+      portalDb.prepare(
+        `INSERT INTO contact_clicks (agent_id, kind, is_bot, created_at)
+         VALUES (?, 'phone', 1, datetime('now', '-1 days'))`
+      ).run(TEST_AGENT_ID);
+      portalDb.prepare(
+        `INSERT OR REPLACE INTO agent_metrics (agent_id, times_discovered) VALUES (?, 7)`
+      ).run(TEST_AGENT_ID);
+
+      const withAuth = await req("GET", `/api/agents/${TEST_AGENT_ID}/owner-stats`, {
+        headers: { Cookie: `rfb_owner_session=${TOKEN}` },
+      });
+      assertEq(withAuth.status, 200, "m2-owner-stats: with valid session returns 200");
+      const parsed = JSON.parse(withAuth.body);
+      assertTrue(parsed.success === true, "m2-owner-stats: success=true");
+      assertEq(parsed.windowDays, 90, "m2-owner-stats: windowDays=90");
+      assertEq(parsed.viewsBySource.totals.direct, 1, "m2-owner-stats: 1 human direct view (GPTBot row excluded)");
+      assertEq(parsed.aiPlatforms.chatgpt, 1, "m2-owner-stats: 1 ChatGPT view counted in aiPlatforms");
+      assertTrue(
+        Array.isArray(parsed.matchingSearchQueries) && parsed.matchingSearchQueries.some((q: any) => q.term === "Har dere egg?"),
+        "m2-owner-stats: matchingSearchQueries includes the seeded conversation query"
+      );
+      assertTrue(
+        Array.isArray(parsed.conversationsByChannel) && parsed.conversationsByChannel.some((c: any) => c.source === "web" && c.count === 1),
+        "m2-owner-stats: conversationsByChannel includes web=1"
+      );
+      assertTrue(
+        Array.isArray(parsed.contactClicksByKind) && parsed.contactClicksByKind.some((c: any) => c.kind === "phone" && c.count === 1),
+        "m2-owner-stats: contactClicksByKind phone=1 (bot click excluded)"
+      );
+      assertEq(parsed.funnel.discovered, 7, "m2-owner-stats: funnel.discovered = agent_metrics.times_discovered");
+      assertEq(parsed.funnel.contactClicked, 1, "m2-owner-stats: funnel.contactClicked = 1 (bot click excluded)");
     }
 
     server.close();
