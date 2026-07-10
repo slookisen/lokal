@@ -28,6 +28,7 @@ import * as QRCode from "qrcode";
 import { getExperiencesAgentCard } from "../services/experiences-agent-card";
 import { getExperiencesOpenapi } from "../services/experiences-openapi";
 import { isDisplayablePhone } from "../services/contact-normalizer";
+import { isJunkDescription } from "../services/description-quality";
 import { INDEXNOW_KEY } from "../services/indexnow-service";
 import { htmlLangAttr, ogLocale, type Lang } from "../i18n/t";
 import {
@@ -1183,10 +1184,20 @@ function renderOpplevelseDetail(
   const brregVerified = !!(provider && Number(provider.brreg_verified) === 1);
   const orgNr = provider ? String(provider.org_nr || "") : "";
 
+  // Render-time guard: nav/boilerplate scraped text masquerading as a real
+  // description must never render (dev-request 2026-07-04-rfb-datakvalitet
+  // item 1, render-guard-only slice — same guard used for producer
+  // descriptions in src/routes/seo.ts). Computed once, reused by both the
+  // meta description and the visible lede below.
+  let safeExpDescription = exp.description ? String(exp.description) : "";
+  if (safeExpDescription && isJunkDescription(safeExpDescription)) {
+    console.log(`[description-guard] suppressed junk description (opplevelse detail) for ${exp.id} (${exp.title})`);
+    safeExpDescription = "";
+  }
+
   // Meta description: own summary if present, else a generated one.
-  const metaDescRaw = exp.description
-    ? String(exp.description)
-    : `${exp.title}${place ? " i " + place : ""}. ${catLabel(cat)} på Opplevagent — kuratert markedsplass for norske opplevelser med Brreg-verifiserte tilbydere.`;
+  const metaDescRaw = safeExpDescription
+    || `${exp.title}${place ? " i " + place : ""}. ${catLabel(cat)} på Opplevagent — kuratert markedsplass for norske opplevelser med Brreg-verifiserte tilbydere.`;
   const metaDesc = metaDescRaw.length > 155 ? metaDescRaw.slice(0, 152).trim() + "…" : metaDescRaw;
 
   // Badges row.
@@ -1230,9 +1241,10 @@ function renderOpplevelseDetail(
   // branded category placeholder. exp is typed without an image column today.
   const heroMedia = renderHeroMedia(exp as unknown as Record<string, unknown>, cat, place);
 
-  // Description block (graceful fallback when no own summary yet).
-  const descBlock = exp.description
-    ? `<p class="lede">${escapeHtml(exp.description)}</p>`
+  // Description block (graceful fallback when no own summary yet, or when
+  // the guard above suppressed a junk value).
+  const descBlock = safeExpDescription
+    ? `<p class="lede">${escapeHtml(safeExpDescription)}</p>`
     : `<p class="lede lede-soft">Detaljert beskrivelse publiseres fortløpende. ${escapeHtml(exp.title)} er en ${escapeHtml(catLabel(cat).toLowerCase())}-opplevelse${place ? " i " + escapeHtml(place) : ""}. Se tilbyderens nettside for program, priser og bestilling.</p>`;
 
   // Booking CTA.
@@ -1606,8 +1618,13 @@ const PIN_SVG =
 // Render one experience card. Title links to the guaranteed-live detail page.
 function renderCard(row: ExperienceCardRow): string {
   const place = placeOf(row);
-  const desc = row.description
-    ? `<p class="c-desc">${escapeHtml(row.description)}</p>`
+  let cardDescription = row.description || "";
+  if (cardDescription && isJunkDescription(cardDescription)) {
+    console.log(`[description-guard] suppressed junk description (opplevelse card) for ${row.slug} (${row.title})`);
+    cardDescription = "";
+  }
+  const desc = cardDescription
+    ? `<p class="c-desc">${escapeHtml(cardDescription)}</p>`
     : "";
   const tags: string[] = [];
   if (row.category) tags.push(`<span class="tag tag-cat">${escapeHtml(catLabel(row.category))}</span>`);

@@ -24399,3 +24399,123 @@ const _samtalerSeoPromise: Promise<void> = new Promise<void>(r => { _samtalerSeo
     _samtalerSeoResolve();
   }
 })();
+
+
+// ── description-junk-guard: isJunkDescription + render-guard wiring ──────────
+// dev-request 2026-07-04-rfb-datakvalitet item 1 (description sanitizer,
+// render-guard-only slice — no DB backfill/flag-column this slice, matches
+// item 3's isDisplayablePhone pattern). Mirrors the geo-faq/geo-answer-first
+// quality-gate test style: labeled console.log header, assertTrue/assertEq
+// calls, an explicit positive case (the real Homme Gård junk string), an
+// explicit negative case (normal prose), borderline cases with the judgement
+// call documented inline, plus source-presence assertions that every
+// suppression path logs (never a silent catch-and-null — the PR-149 lesson).
+console.log("\n── description-junk-guard: isJunkDescription + render-guard wiring ──");
+(() => {
+  try {
+    const dq = require("../src/services/description-quality");
+    assertTrue(typeof dq.isJunkDescription === "function", "descjunk: description-quality.ts exports isJunkDescription");
+
+    // ── Acceptance test (dev-request-mandated): the exact Homme Gård live
+    // example must be caught, a normal farm description must not. ──
+    const hommeGaardJunk =
+      "Skip to content Homme 8, 4715 Øvrebø 41360545 john@hommegaard.no Facebook-f Instagram Forside Gårdsutsalg Produksjon … Meny …";
+    assertTrue(dq.isJunkDescription(hommeGaardJunk) === true,
+      "descjunk: Homme Gård live junk string -> true (skip-link + clustered nav tokens + email/phone/social block all fire)");
+
+    const normalFarmDesc =
+      "Vi driver med økologisk grønnsaksdyrking og selger direkte fra gården hver lørdag.";
+    assertTrue(dq.isJunkDescription(normalFarmDesc) === false,
+      "descjunk: normal 1-sentence farm description -> false (plain prose, no boilerplate signals)");
+
+    // ── Empty / absent input: never flagged (nothing to suppress) ──
+    assertTrue(dq.isJunkDescription("") === false, "descjunk: empty string -> false");
+    assertTrue(dq.isJunkDescription(null) === false, "descjunk: null -> false");
+    assertTrue(dq.isJunkDescription(undefined) === false, "descjunk: undefined -> false");
+
+    // ── Rule 1 in isolation: skip-link boilerplate alone is enough ──
+    assertTrue(
+      dq.isJunkDescription("Skip to content. Vi selger honning og egg fra gården vår hver helg, velkommen innom!") === true,
+      "descjunk: rule 1 — bare 'Skip to content' prefix on otherwise-normal prose still flags (skip-link text is never legitimate)"
+    );
+    assertTrue(
+      dq.isJunkDescription("Hopp til innhold. Åpningstider: 10-16 alle hverdager.") === true,
+      "descjunk: rule 1 — Norwegian 'Hopp til innhold' variant also flags"
+    );
+
+    // ── Rule 2 in isolation: >=3 clustered strong nav tokens ──
+    assertTrue(
+      dq.isJunkDescription("Forside Meny Produksjon Om gården vår finner du mer under Kontakt.") === true,
+      "descjunk: rule 2 — 3 clustered strong nav tokens (Forside/Meny/Produksjon) flags with no skip-link and no contact block"
+    );
+    // Borderline / judgement call: only 2 strong tokens present (below the
+    // >=3 clustering threshold) — a farm page mentioning its own menu/front
+    // page ONCE each in real prose should NOT be suppressed just for that.
+    assertTrue(
+      dq.isJunkDescription("Se Forside og Meny på nettsiden vår for åpningstider og mer info om driften.") === false,
+      "descjunk: borderline — only 2 strong nav tokens (Forside, Meny) -> false (below clustering threshold; judgement call: a single incidental mention of the site's own nav shouldn't suppress real prose)"
+    );
+
+    // ── Rule 3 in isolation: email + phone-shape + social, clustered ──
+    assertTrue(
+      dq.isJunkDescription("Ring oss på 12345678 eller send epost til post@gaarden.no, følg oss på Facebook for nyheter fra gården.") === true,
+      "descjunk: rule 3 — email + 8-digit phone-shape + 'Facebook', all within the opening 150 chars, flags as a dumped contact block"
+    );
+    // Borderline / judgement call: a single social-platform mention inside
+    // otherwise normal prose, with NO email and NO phone-shape nearby, is a
+    // common and legitimate call-to-action — must NOT flag on its own.
+    assertTrue(
+      dq.isJunkDescription("Følg oss på Facebook og Instagram for oppdateringer! Vi selger egg, honning og bær rett fra gårdsbutikken.") === false,
+      "descjunk: borderline — Facebook + Instagram mentioned once each, no email/phone nearby -> false (single social CTA in normal prose is not junk)"
+    );
+
+    // ── Rule 4 in isolation: nav-word density, no rule 1-3 signal present ──
+    assertTrue(
+      dq.isJunkDescription("Kontakt Produkter Tjenester Nyheter Blogg her får du alt om gården vår og hva vi driver med til daglig.") === true,
+      "descjunk: rule 4 — 5 distinct nav-density words clustered in the opening segment flags on density alone (no skip-link, no email/phone/social)"
+    );
+    assertTrue(
+      dq.isJunkDescription("Vi har egen gårdsbutikk med kontakt og produkter tilgjengelig i sesong, velkommen innom for en handel.") === false,
+      "descjunk: borderline — 'kontakt' and 'produkter' each mentioned once in flowing prose -> false (density well under threshold)"
+    );
+
+    // ── Render-guard wiring: every output path that surfaces agent.description
+    // / knowledge.about imports the guard AND logs (never silently) when it
+    // suppresses something. Source-presence checks mirror the geo-faq-cc
+    // style below — cheap, resilient to refactors, and catches a call site
+    // that forgot to wire the guard in at all. ──
+    const fs = require("fs");
+    const guardedFiles = [
+      "src/routes/seo.ts",
+      "src/routes/mcp.ts",
+      "src/routes/marketplace.ts",
+      "src/routes/a2a.ts",
+      "src/routes/experiences-seo.ts",
+      "src/services/knowledge-service.ts",
+      "src/services/marketplace-registry.ts",
+    ];
+    for (const file of guardedFiles) {
+      const src = fs.readFileSync(file, "utf8");
+      assertTrue(
+        src.includes("isJunkDescription"),
+        `descjunk: ${file} imports/uses isJunkDescription`
+      );
+      assertTrue(
+        src.includes("[description-guard]"),
+        `descjunk: ${file} logs a visible "[description-guard]" diagnostic on every suppression path (no silent catch-and-null — PR-149 lesson)`
+      );
+    }
+
+    // Spot-check the Homme Gård acceptance case end-to-end through the actual
+    // producer-card renderer (not just the raw predicate), since that's the
+    // concrete surface named in the dev-request (homepage featured card).
+    const seoSrcDescJunk = fs.readFileSync("src/routes/seo.ts", "utf8");
+    assertTrue(
+      /let desc = a\.description \|\| "";\s*\n\s*if \(isJunkDescription\(desc\)\)/.test(seoSrcDescJunk),
+      "descjunk: producerCard() runs the raw agent.description through isJunkDescription before rendering .pc-desc"
+    );
+  } catch (err) {
+    failed++;
+    failures.push(`descjunk: unexpected error: ${err instanceof Error ? (err.stack || err.message) : String(err)}`);
+  }
+})();

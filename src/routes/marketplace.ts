@@ -19,6 +19,7 @@ import { logPlacesCall, getPlacesUsageThisMonth } from "../services/places-usage
 import { getDb as getVerticalDb } from "../database/db-factory";
 import { findOrgnumberByName } from "../services/brreg-client";
 import { isDisplayablePhone } from "../services/contact-normalizer";
+import { isJunkDescription } from "../services/description-quality";
 
 // ── PR-29 v3: pure helper for Place Details (New) request params ──────────────
 // Exported so tests can assert the URL structure without touching the handler.
@@ -158,6 +159,23 @@ function buildContactBlock(agentId: string): {
     deliveryOptions: k.deliveryOptions,
     vcardUrl: `/api/marketplace/agents/${agentId}/vcard`,
   };
+}
+
+// dev-request 2026-07-04-rfb-datakvalitet item 1 (description sanitizer,
+// render-guard-only slice): /search and /discover return `r.agent` straight
+// from marketplaceRegistry's in-memory RegisteredAgent objects, which is a
+// SHARED reference — never mutate it in place, or every other reader of
+// that same agent (producer cards, other requests) would see the mutation
+// too. Instead this returns a shallow copy with a sanitized `description`
+// for THIS response only. Mirrors the isDisplayablePhone-style guard used
+// elsewhere in this file (buildContactBlock above); never a silent drop —
+// logs when it actually suppresses something.
+function withSanitizedDescription<T extends { id: string; name: string; description?: string }>(agent: T): T {
+  if (agent.description && isJunkDescription(agent.description)) {
+    console.log(`[description-guard] suppressed junk description (search/discover) for ${agent.id} (${agent.name})`);
+    return { ...agent, description: "" };
+  }
+  return agent;
 }
 
 // RFC 6350 vCard 3.0 — broad compatibility across iOS, Android, Outlook.
@@ -323,6 +341,7 @@ router.post("/discover", (req: Request, res: Response) => {
 
     const enrichedResults = results.map((r: any) => ({
       ...r,
+      agent: withSanitizedDescription(r.agent),
       contact: buildContactBlock(r.agent.id),
     }));
 
@@ -504,6 +523,7 @@ router.get("/search", async (req: Request, res: Response) => {
 
     return {
       ...r,
+      agent: withSanitizedDescription(r.agent),
       contact,
       profileUrl,
       products,
@@ -895,19 +915,26 @@ router.get("/agents", (req: Request, res: Response) => {
     offset,
     page_count: Math.ceil(total / limit),
     count: agents.length,
-    agents: agents.map(a => ({
-      id: a.id,
-      name: a.name,
-      description: a.description,
-      role: a.role,
-      categories: a.categories,
-      tags: a.tags,
-      location: a.location ? { city: a.location.city } : undefined,
-      trustScore: a.trustScore,
-      isVerified: a.isVerified,
-      isClaimed: knowledgeService.isAgentClaimed(a.id),
-      skills: a.skills.map(s => ({ id: s.id, name: s.name, tags: s.tags })),
-    })),
+    agents: agents.map(a => {
+      let description = a.description;
+      if (description && isJunkDescription(description)) {
+        console.log(`[description-guard] suppressed junk description (GET /agents) for ${a.id} (${a.name})`);
+        description = "";
+      }
+      return {
+        id: a.id,
+        name: a.name,
+        description,
+        role: a.role,
+        categories: a.categories,
+        tags: a.tags,
+        location: a.location ? { city: a.location.city } : undefined,
+        trustScore: a.trustScore,
+        isVerified: a.isVerified,
+        isClaimed: knowledgeService.isAgentClaimed(a.id),
+        skills: a.skills.map(s => ({ id: s.id, name: s.name, tags: s.tags })),
+      };
+    }),
   });
 });
 
@@ -2692,11 +2719,16 @@ router.get("/find-match", (req: Request, res: Response) => {
 
     // ── Lenient threshold: 0.35 lets partial matches through ──
     if (score >= 0.35) {
+      let matchDescription = agent.description || "";
+      if (isJunkDescription(matchDescription)) {
+        console.log(`[description-guard] suppressed junk description (name-match) for ${agent.id} (${agent.name})`);
+        matchDescription = "";
+      }
       matches.push({
         id: agent.id,
         name: agent.name,
         city: agent.city,
-        description: (agent.description || "").substring(0, 120),
+        description: matchDescription.substring(0, 120),
         categories: JSON.parse(agent.categories || "[]"),
         trustScore: agent.trust_score,
         isVerified: !!agent.is_verified,
@@ -3390,20 +3422,27 @@ router.get("/umbrellas", (req: Request, res: Response) => {
       LIMIT ?
     `).all(...params) as any[];
 
-    const umbrellas = rows.map(r => ({
-      id: r.id,
-      name: r.name,
-      description: r.description,
-      umbrella_type: r.umbrella_type,
-      parent_umbrella_id: r.parent_umbrella_id,
-      member_count: r.umbrella_member_count || 0,
-      city: r.city,
-      slug: slugify(r.name),
-      profile_url: `${getBaseUrl(req)}/produsent/${slugify(r.name)}`,
-      card_url: `${getBaseUrl(req)}/api/marketplace/agents/${r.id}/card`,
-      trust_score: r.trust_score,
-      is_verified: r.is_verified === 1,
-    }));
+    const umbrellas = rows.map(r => {
+      let description = r.description;
+      if (description && isJunkDescription(description)) {
+        console.log(`[description-guard] suppressed junk description (GET /umbrellas) for ${r.id} (${r.name})`);
+        description = "";
+      }
+      return {
+        id: r.id,
+        name: r.name,
+        description,
+        umbrella_type: r.umbrella_type,
+        parent_umbrella_id: r.parent_umbrella_id,
+        member_count: r.umbrella_member_count || 0,
+        city: r.city,
+        slug: slugify(r.name),
+        profile_url: `${getBaseUrl(req)}/produsent/${slugify(r.name)}`,
+        card_url: `${getBaseUrl(req)}/api/marketplace/agents/${r.id}/card`,
+        trust_score: r.trust_score,
+        is_verified: r.is_verified === 1,
+      };
+    });
 
     res.json({ success: true, count: umbrellas.length, umbrellas });
   } catch (err: any) {

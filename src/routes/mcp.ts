@@ -24,6 +24,7 @@ import { slugify } from "../utils/slug";
 import { addAiUtmParams } from "../utils/url-utm";
 import { getDb } from "../database/init";
 import { isDisplayablePhone } from "../services/contact-normalizer";
+import { isJunkDescription } from "../services/description-quality";
 import { geocodingService } from "../services/geocoding-service";
 import {
   createCart as svcCreateCart,
@@ -366,7 +367,13 @@ function registerTools(
         sections.push(`📍 ${agent.city}${agent.trustScore ? `  ·  Trust ${Math.round(agent.trustScore * 100)}%` : ""}${agent.isVerified ? "  ·  ✔ Verifisert" : ""}`);
       }
 
-      if (k.about) sections.push(`\n${k.about}`);
+      if (k.about) {
+        if (isJunkDescription(k.about)) {
+          console.log(`[description-guard] suppressed junk knowledge.about (lokal_info) for ${agent.id} (${agent.name})`);
+        } else {
+          sections.push(`\n${k.about}`);
+        }
+      }
 
       // Contact
       const contact: string[] = [];
@@ -960,7 +967,13 @@ function registerTools(
 
 function formatAgentCompact(agent: any, idx: number, contact?: any, productSummary?: string, clientIdentity?: string): string {
   const lines = [`**${idx}. ${agent.name}**`];
-  if (agent.description) lines.push(`   ${agent.description}`);
+  if (agent.description) {
+    if (isJunkDescription(agent.description)) {
+      console.log(`[description-guard] suppressed junk description (lokal_search) for ${agent.id} (${agent.name})`);
+    } else {
+      lines.push(`   ${agent.description}`);
+    }
+  }
 
   const meta: string[] = [];
   if ((agent as any).city || agent.location?.city) meta.push(`📍 ${(agent as any).city || agent.location?.city}`);
