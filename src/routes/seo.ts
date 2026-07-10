@@ -2176,6 +2176,7 @@ const PROFILE_CSS = `
   .pf-badges { display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 10px; }
   .pf-name { font-size: 2.2rem; font-weight: 800; letter-spacing: -1px; line-height: 1.15; margin-bottom: 6px; }
   .pf-loc { display: flex; align-items: center; gap: 6px; font-size: 0.95rem; color: var(--g500); margin-bottom: 14px; }
+  .pf-answer { font-size: 1.05rem; font-weight: 600; color: var(--charcoal); line-height: 1.6; max-width: 580px; margin-bottom: 6px; }
   .pf-desc { font-size: 1rem; color: var(--g700); line-height: 1.7; max-width: 580px; }
   .pf-desc-extra { font-size: 0.9rem; color: var(--g500); line-height: 1.6; max-width: 580px; margin-top: 6px; font-style: italic; }
   .pf-stats { display: flex; gap: 22px; margin-top: 18px; flex-wrap: wrap; }
@@ -2607,6 +2608,38 @@ export function buildProducerFaqJsonLd(params: {
       "acceptedAnswer": { "@type": "Answer", "text": a },
     })),
   };
+}
+
+// GEO: answer-first SSR opening for producer pages (dev-request
+// 2026-06-30-geo-content-structured-data, answer-first-opening slice). AI
+// engines (ChatGPT/Perplexity/Google AI Overviews) weight relevance heavily
+// on a page's opening text, so this composes one lead sentence that states
+// upfront what the shop sells and where — using the EXACT same catalog
+// fields already verified real for buildProducerFaqJsonLd above (never
+// fabricated). Quality-gated the same way: needs >=2 real facts (what they
+// sell + where), otherwise returns null so the caller falls back to the
+// existing about/description block untouched, and the caller MUST log the
+// fallback rather than silently swallow it (a silent catch-and-null shipped
+// a feature tests-green but broken in prod once already — PR-149).
+export function buildProducerAnswerFirstOpening(params: {
+  name: string;
+  cityName: string;
+  productsList: any[];
+  categories: string[];
+}): string | null {
+  const productNames = (params.productsList || [])
+    .map((p: any) => (typeof p === "string" ? p : p?.name))
+    .filter(Boolean)
+    .slice(0, 4);
+  const catLabels = (params.categories || []).map((c: string) => formatCat(c)).filter(Boolean).slice(0, 4);
+  const sellItems = productNames.length ? productNames : catLabels;
+
+  const hasSellItems = sellItems.length > 0;
+  const hasCity = !!params.cityName;
+  if ((hasSellItems ? 1 : 0) + (hasCity ? 1 : 0) < 2) return null;
+
+  const whatPart = sellItems.slice(0, 3).join(", ") + (sellItems.length > 3 ? " med mer" : "");
+  return `${params.name} i ${params.cityName} selger ${whatPart} — finn kontaktinfo og bestill direkte under.`;
 }
 
 // GEO: FAQPage JSON-LD for city pages (dev-request 2026-06-30-geo-content-structured-data,
@@ -3608,6 +3641,28 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
       address: k.address,
     });
 
+    // GEO: answer-first SSR opening — see buildProducerAnswerFirstOpening for
+    // the quality gate. Reuses the exact same real catalog fields as the FAQ
+    // builder above. null (insufficient real facts) is a normal, expected
+    // outcome for thin profiles — logged below (not swallowed) so a
+    // regression here is visible in Fly logs, then the page render falls
+    // back to the existing about/description block untouched.
+    let answerFirstOpening: string | null = null;
+    try {
+      answerFirstOpening = buildProducerAnswerFirstOpening({
+        name: agent.name,
+        cityName,
+        productsList,
+        categories: (agent.categories as string[]) || [],
+      });
+      if (!answerFirstOpening) {
+        console.log(`[seo] /produsent/${slug}: answer-first opening skipped (insufficient real facts) — falling back to existing description block`);
+      }
+    } catch (e) {
+      console.error(`[seo] /produsent/${slug} answer-first opening failed:`, e);
+      answerFirstOpening = null;
+    }
+
     // A2A protocol versioning (custom extension in JSON-LD)
     const agentInfo = info?.agent as any;
     if (agentInfo?.schemaVersion || agentInfo?.agentVersion) {
@@ -3721,6 +3776,7 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
         ${updatedAtDate ? `<p class="profile-meta"><time datetime="${updatedAtDate.toISOString()}" class="updated-at">Profil oppdatert: ${escapeHtml(formatUpdatedPrettyNo(updatedAtDate))}</time></p>` : ""}
         <h1 class="pf-name" translate="no">${escapeHtml(agent.name)}</h1>
         ${cityName ? `<div class="pf-loc">&#128205; ${escapeHtml(k.address || cityName)}${k.postalCode ? `, ${escapeHtml(k.postalCode)}` : ""}</div>` : ""}
+        ${answerFirstOpening ? `<p class="pf-answer"${lang === "en" ? ' lang="nb"' : ""}>${escapeHtml(answerFirstOpening)}</p>` : ""}
         ${(() => {
           const desc = agent.description || "";
           const about = k.about || "";

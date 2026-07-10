@@ -2692,6 +2692,74 @@ export function buildKommuneFaqJsonLd(params: {
   };
 }
 
+// GEO: answer-first SSR opening for category pages (dev-request
+// 2026-06-30-geo-content-structured-data, answer-first-opening slice). AI
+// engines weight relevance heavily on a page's opening text, so this
+// replaces the generic "Opplevelser i kategorien X." lede with a single
+// sentence that states upfront what the page has (count, spread, price) —
+// using the EXACT same getCategoryFaqStats() aggregate already verified real
+// for buildCategoryFaqJsonLd above. Same quality gate: needs >=2 real facts,
+// otherwise returns null so the caller falls back to the existing generic
+// lede untouched (the caller MUST log that fallback, not swallow it — see
+// the PR-149 incident note in the dev-request: a silent catch-and-null
+// shipped a feature tests-green but broken in prod).
+export function buildCategoryAnswerFirstOpening(params: {
+  label: string;
+  total: number;
+  fylkeCount: number;
+  kommuneCount: number;
+  minPriceFrom: number | null;
+}): string | null {
+  const hasTotal = params.total > 0;
+  const hasFylke = params.fylkeCount > 0;
+  const hasPrice = params.minPriceFrom !== null && params.minPriceFrom >= 0;
+
+  const factCount = (hasTotal ? 1 : 0) + (hasFylke ? 1 : 0) + (hasPrice ? 1 : 0);
+  if (factCount < 2) return null;
+
+  const countPhrase = hasTotal
+    ? `${params.total} ${params.total === 1 ? "opplevelse" : "opplevelser"}`
+    : "opplevelser";
+  const spreadPhrase = hasFylke
+    ? ` i ${params.fylkeCount} ${params.fylkeCount === 1 ? "fylke" : "fylker"}${params.kommuneCount > 0 ? ` (${params.kommuneCount} ${params.kommuneCount === 1 ? "kommune" : "kommuner"})` : ""}`
+    : "";
+  const pricePhrase = hasPrice ? `, fra ${params.minPriceFrom} kr` : "";
+
+  return `${params.label} på Opplevagent: ${countPhrase}${spreadPhrase}${pricePhrase} — kuratert og verifisert mot Brønnøysundregistrene.`;
+}
+
+// GEO: answer-first SSR opening for kommune (municipality) pages — the
+// "city" half of the same answer-first-opening slice, mirroring
+// buildCategoryAnswerFirstOpening() above. Grounded strictly in the same
+// getKommuneFaqStats() aggregate already verified real for
+// buildKommuneFaqJsonLd. Same quality gate, same fail-safe-and-log-on-fallback
+// contract.
+export function buildKommuneAnswerFirstOpening(params: {
+  kommune: string;
+  fylke: string | null;
+  total: number;
+  categoryCount: number;
+  minPriceFrom: number | null;
+}): string | null {
+  const hasTotal = params.total > 0;
+  const hasCategories = params.categoryCount > 0;
+  const hasPrice = params.minPriceFrom !== null && params.minPriceFrom >= 0;
+
+  const factCount = (hasTotal ? 1 : 0) + (hasCategories ? 1 : 0) + (hasPrice ? 1 : 0);
+  if (factCount < 2) return null;
+
+  const countPhrase = hasTotal
+    ? `${params.total} ${params.total === 1 ? "opplevelse" : "opplevelser"}`
+    : "opplevelser";
+  const categoryPhrase = hasCategories
+    ? ` fordelt på ${params.categoryCount} ${params.categoryCount === 1 ? "kategori" : "kategorier"}`
+    : "";
+  const pricePhrase = hasPrice ? `, fra ${params.minPriceFrom} kr` : "";
+  const fylkePart = params.fylke ? ` (${params.fylke})` : "";
+
+  return `Opplevelser i ${params.kommune}${fylkePart}: ${countPhrase}${categoryPhrase}${pricePhrase} — kuratert og verifisert mot Brønnøysundregistrene.`;
+}
+
 // ─── GET /kategori/:category — experiences in a category ─────────────────────
 router.get("/kategori/:category", (req: Request, res: Response, next: NextFunction) => {
   const category = String(req.params.category || "");
@@ -2709,11 +2777,18 @@ router.get("/kategori/:category", (req: Request, res: Response, next: NextFuncti
 
   const label = catLabel(category);
   const canonicalPath = `/kategori/${encodeURIComponent(category)}`;
+  const genericLede = `Opplevelser i kategorien ${label.toLowerCase()}.`;
   // GEO: FAQPage JSON-LD — see buildCategoryFaqJsonLd for the quality gate.
-  // Never allowed to break the page: on any error we fail safe to no FAQ
-  // block, but log a structured, low-noise diagnostic so a regression here
-  // (e.g. schema drift) is visible in Fly logs without a live DB shell.
+  // The same getCategoryFaqStats() aggregate also feeds the answer-first
+  // opening paragraph (buildCategoryAnswerFirstOpening) below — one query,
+  // two GEO features sharing one quality gate. Never allowed to break the
+  // page: on any error we fail safe to no FAQ block + the generic lede, but
+  // log a structured, low-noise diagnostic so a regression here (e.g. schema
+  // drift) is visible in Fly logs without a live DB shell — this must NOT be
+  // a silent catch-and-null (that exact bug shipped a feature tests-green
+  // but silently broken in prod, see dev-request PR-149 note).
   let categoryFaqJsonLd: ReturnType<typeof buildCategoryFaqJsonLd> = null;
+  let lede = genericLede;
   try {
     const stats = getCategoryFaqStats(category);
     categoryFaqJsonLd = buildCategoryFaqJsonLd({
@@ -2724,16 +2799,29 @@ router.get("/kategori/:category", (req: Request, res: Response, next: NextFuncti
       kommuneCount: stats.kommuneCount,
       minPriceFrom: stats.minPriceFrom,
     });
+    const answerFirst = buildCategoryAnswerFirstOpening({
+      label,
+      total,
+      fylkeCount: stats.fylkeCount,
+      kommuneCount: stats.kommuneCount,
+      minPriceFrom: stats.minPriceFrom,
+    });
+    if (answerFirst) {
+      lede = answerFirst;
+    } else {
+      console.log(`[experiences-seo] /kategori/${category}: answer-first opening skipped (insufficient real facts) — falling back to generic lede`);
+    }
   } catch (e) {
     console.error(`[experiences-seo] /kategori/${category} FAQ stats failed:`, e);
     categoryFaqJsonLd = null;
+    lede = genericLede;
   }
 
   const html = renderBrowsePage({
     title: `${label} | Opplevagent`,
     h1: label,
     metaDesc: `${label} i Norge — kuraterte opplevelser på Opplevagent med Brreg-verifiserte tilbydere. ${total} ${total === 1 ? "opplevelse" : "opplevelser"} i kategorien.`,
-    lede: `Opplevelser i kategorien ${label.toLowerCase()}.`,
+    lede,
     canonicalPath,
     crumbs: [{ name: "Forsiden", href: "/" }, { name: "Alle opplevelser", href: "/opplevelser" }, { name: label }],
     rows,
@@ -2810,11 +2898,16 @@ router.get("/kommune/:kommune", (req: Request, res: Response, next: NextFunction
   ];
 
   const kommuneCanonicalPath = `/kommune/${encodeURIComponent(kommune)}`;
+  const genericKommuneLede = `Hva kan du finne på i ${kommune}? Kuratert oversikt over opplevelser i kommunen.`;
   // GEO: FAQPage JSON-LD — see buildKommuneFaqJsonLd for the quality gate.
-  // Never allowed to break the page: on any error we fail safe to no FAQ
-  // block, but log a structured, low-noise diagnostic so a regression here
-  // (e.g. schema drift) is visible in Fly logs without a live DB shell.
+  // The same getKommuneFaqStats() aggregate also feeds the answer-first
+  // opening paragraph (buildKommuneAnswerFirstOpening) below — one query, two
+  // GEO features sharing one quality gate. Never allowed to break the page:
+  // on any error we fail safe to no FAQ block + the generic lede, but log a
+  // structured, low-noise diagnostic so a regression here is visible in Fly
+  // logs without a live DB shell — this must NOT be a silent catch-and-null.
   let kommuneFaqJsonLd: ReturnType<typeof buildKommuneFaqJsonLd> = null;
+  let kommuneLede = genericKommuneLede;
   try {
     const stats = getKommuneFaqStats(kommune);
     kommuneFaqJsonLd = buildKommuneFaqJsonLd({
@@ -2825,16 +2918,29 @@ router.get("/kommune/:kommune", (req: Request, res: Response, next: NextFunction
       categoryCount: stats.categoryCount,
       minPriceFrom: stats.minPriceFrom,
     });
+    const answerFirst = buildKommuneAnswerFirstOpening({
+      kommune,
+      fylke,
+      total,
+      categoryCount: stats.categoryCount,
+      minPriceFrom: stats.minPriceFrom,
+    });
+    if (answerFirst) {
+      kommuneLede = answerFirst;
+    } else {
+      console.log(`[experiences-seo] /kommune/${kommune}: answer-first opening skipped (insufficient real facts) — falling back to generic lede`);
+    }
   } catch (e) {
     console.error(`[experiences-seo] /kommune/${kommune} FAQ stats failed:`, e);
     kommuneFaqJsonLd = null;
+    kommuneLede = genericKommuneLede;
   }
 
   const html = renderBrowsePage({
     title: `Opplevelser i ${kommune} | Opplevagent`,
     h1: `Opplevelser i ${kommune}`,
     metaDesc: `Kuraterte opplevelser og aktiviteter i ${kommune}${fylke ? ", " + fylke : ""} — verifiserte tilbydere på Opplevagent. ${total} ${total === 1 ? "opplevelse" : "opplevelser"}.`,
-    lede: `Hva kan du finne på i ${kommune}? Kuratert oversikt over opplevelser i kommunen.`,
+    lede: kommuneLede,
     canonicalPath: kommuneCanonicalPath,
     crumbs,
     rows,
