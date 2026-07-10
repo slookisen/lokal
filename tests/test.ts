@@ -15313,6 +15313,218 @@ const _orchPr18BulkLoadPromise: Promise<void> = new Promise<void>((r) => {
   }
 })();
 
+// ── orch-pr-dedup-backfill-endpoint: POST /api/opplevelser/admin/experiences-dedup-backfill ──
+// dev-request 2026-07-04-opplevagent-dedup-og-norske-titler, item 1 follow-up.
+// PR #209 added runDedupPass() (candidate-key dedup + canonical merge) but only
+// as a one-off SCRIPT (src/scripts/experiences-dedup-backfill.ts) — no flyctl/
+// SSH path exists in this fleet's tooling to actually run that script against
+// the deployed machine, so the real prod duplicate rows (confirmed live:
+// Kon-Tiki Museet 4x on /fylke/Oslo) were never actually merged. This admin
+// HTTP endpoint is the only viable trigger. Drives the REAL opplevelser router
+// over HTTP against an in-memory experiences.db, same async-IIFE HTTP-level
+// pattern as orch-pr-18 (bulk-load) immediately above. Covers: admin gate,
+// a seeded Kon-Tiki-style duplicate pair actually gets merged (canonical_id
+// stamped on exactly one of the pair, the other stays canonical/NULL), an
+// unrelated control row from the same provider/kommune is left untouched, and
+// idempotency (second call finds/merges nothing).
+console.log("\n── orch-pr-dedup-backfill-endpoint: POST /api/opplevelser/admin/experiences-dedup-backfill ──");
+
+let _orchPrDedupBackfillEndpointResolve: () => void = () => {};
+const _orchPrDedupBackfillEndpointPromise: Promise<void> = new Promise<void>((r) => {
+  _orchPrDedupBackfillEndpointResolve = r;
+});
+
+(async () => {
+  // Run after the prior DB-mutating IIFE that also swaps the experiences
+  // db-factory singleton (orch-pr-18's own promise already awaits everything
+  // upstream of it, so awaiting it alone is sufficient here).
+  try { await _orchPr18BulkLoadPromise; } catch { /* upstream */ }
+
+  const prevPathDedup = process.env.EXPERIENCES_DB_PATH;
+  const prevAdminKeyDedup = process.env.ADMIN_KEY;
+  let serverDedup: import("http").Server | null = null;
+  try {
+    process.env.EXPERIENCES_DB_PATH = ":memory:";
+
+    // Bust require cache for db-factory + experience-store + the opplevelser
+    // route TOGETHER so the route binds to the fresh, :memory:-backed store
+    // (mirrors orch-pr-18's scaffold).
+    const dbFactoryPathDedup = require.resolve("../src/database/db-factory");
+    const expStorePathDedup = require.resolve("../src/services/experience-store");
+    const opplevelserPathDedup = require.resolve("../src/routes/opplevelser");
+    delete require.cache[dbFactoryPathDedup];
+    delete require.cache[expStorePathDedup];
+    delete require.cache[opplevelserPathDedup];
+
+    const dbFactoryDedup = require("../src/database/db-factory") as typeof import("../src/database/db-factory");
+    dbFactoryDedup.__resetDbFactoryForTesting();
+    const expStoreDedup = require("../src/services/experience-store") as typeof import("../src/services/experience-store");
+    const opplevelserDedup = require("../src/routes/opplevelser") as { default: import("express").Router };
+
+    // Pin the in-memory experiences DB (so assertions can query it directly).
+    const dbExpDedup = dbFactoryDedup.getDb("experiences");
+
+    // ── Seed a known-duplicate pair (mirrors the confirmed prod Kon-Tiki
+    //    case in src/services/experience-dedup.test.ts) + 1 distinct control
+    //    row from the SAME provider+kommune. ─────────────────────────────
+    const providerIdDedup = expStoreDedup.createProvider({
+      navn: "Kon-Tiki Museet AS",
+      kommune: "Oslo",
+      fylke: "Oslo",
+      brreg_verified: 1,
+      brreg_active: 1,
+      verification_status: "verified",
+    });
+
+    const idThinDedup = expStoreDedup.createExperience({
+      title: "Kon-Tiki Museet — Heyerdahl's Legendary Pacific Raft…",
+      provider_id: providerIdDedup,
+      kommune: "Oslo",
+      fylke: "Oslo",
+      verification_status: "verified",
+      confidence: "medium",
+      description: "Kort.",
+    });
+    const idRichDedup = expStoreDedup.createExperience({
+      title: "Kon-Tiki Museum Oslo — Official Site",
+      provider_id: providerIdDedup,
+      kommune: "Oslo",
+      fylke: "Oslo",
+      verification_status: "verified",
+      confidence: "high",
+      description:
+        "Kon-Tiki Museet viser Thor Heyerdahls originale flåter og fartøy, med utstillinger om ekspedisjonene hans over Stillehavet og en rik samling av gjenstander.",
+      duration_min: 60,
+      price_from: 150,
+      booking_url: "https://kon-tiki.no/book",
+    });
+    // Distinct, unrelated experience from the SAME provider+kommune — negative
+    // control: must survive the pass untouched (never merged).
+    const idControlDedup = expStoreDedup.createExperience({
+      title: "Guidet fjelltur til Fløyen",
+      provider_id: providerIdDedup,
+      kommune: "Oslo",
+      fylke: "Oslo",
+      verification_status: "verified",
+      confidence: "high",
+    });
+
+    // ── Mount the REAL router on a minimal Express app. ────────────────
+    const expressModDedup = (await import("express")).default;
+    const appDedup = expressModDedup();
+    appDedup.use(expressModDedup.json());
+
+    const httpModDedup = await import("http");
+    serverDedup = httpModDedup.createServer(appDedup);
+    await new Promise<void>((resolve) => serverDedup!.listen(0, "127.0.0.1", () => resolve()));
+    const addrDedup = serverDedup.address();
+    const portDedup = typeof addrDedup === "object" && addrDedup ? addrDedup.port : 0;
+
+    const ADMIN_KEY_DEDUP = "dedup-backfill-test-admin-key";
+    process.env.ADMIN_KEY = ADMIN_KEY_DEDUP;
+
+    // NB: pin the admin key SYNCHRONOUSLY at the top of every request's
+    // middleware chain (see orch-pr-18's identical comment) so this test's
+    // admin gate stays deterministic against concurrently-running suites.
+    appDedup.use("/api/opplevelser/admin", (_req, _res, next) => {
+      process.env.ADMIN_KEY = ADMIN_KEY_DEDUP;
+      next();
+    });
+    appDedup.use("/api/opplevelser", opplevelserDedup.default);
+
+    function dedupBackfillReq(key?: string): Promise<{ status: number; body: any }> {
+      const headers: Record<string, string> = {};
+      if (key !== undefined) headers["x-admin-key"] = key;
+      return new Promise((resolve, reject) => {
+        const r = httpModDedup.request(
+          {
+            method: "POST",
+            host: "127.0.0.1",
+            port: portDedup,
+            path: "/api/opplevelser/admin/experiences-dedup-backfill",
+            headers,
+          },
+          (resp) => {
+            const chunks: Buffer[] = [];
+            resp.on("data", (c) => chunks.push(c as Buffer));
+            resp.on("end", () => {
+              const raw = Buffer.concat(chunks).toString("utf8");
+              let parsed: any = null;
+              try { parsed = raw ? JSON.parse(raw) : null; } catch { parsed = { _raw: raw }; }
+              resolve({ status: resp.statusCode || 0, body: parsed });
+            });
+          }
+        );
+        r.on("error", reject);
+        r.end();
+      });
+    }
+
+    const canonicalIdOf = (id: string): string | null =>
+      (dbExpDedup.prepare("SELECT canonical_id FROM experiences WHERE id = ?").get(id) as
+        | { canonical_id: string | null }
+        | undefined)?.canonical_id ?? null;
+
+    // ── db-1: admin gate — missing X-Admin-Key → 403. ──────────────────
+    {
+      const r = await dedupBackfillReq();
+      assertEq(r.status, 403, "db-1: missing X-Admin-Key → 403");
+    }
+    // ── db-2: wrong key → 403. ─────────────────────────────────────────
+    {
+      const r = await dedupBackfillReq("wrong-key");
+      assertEq(r.status, 403, "db-2: wrong X-Admin-Key → 403");
+    }
+    // Nothing merged yet — sanity before the real call.
+    assertEq(canonicalIdOf(idThinDedup), null, "db-2b: pre-call, seeded thin duplicate not yet merged");
+    assertEq(canonicalIdOf(idRichDedup), null, "db-2c: pre-call, seeded rich duplicate not yet merged");
+
+    // ── db-3: correct key → 200, runs the real dedup pass. ─────────────
+    {
+      const r = await dedupBackfillReq(ADMIN_KEY_DEDUP);
+      assertEq(r.status, 200, "db-3a: correct X-Admin-Key → 200");
+      assertEq(r.body.success, true, "db-3b: success: true");
+      assertTrue(typeof r.body.groupsFound === "number" && r.body.groupsFound >= 1,
+        "db-3c: groupsFound >= 1 (the seeded Kon-Tiki duplicate group)");
+      assertTrue(typeof r.body.rowsMerged === "number" && r.body.rowsMerged >= 1,
+        "db-3d: rowsMerged >= 1 (the thin duplicate folded into the richer row)");
+      assertTrue(Array.isArray(r.body.canonicalIds) && r.body.canonicalIds.includes(idRichDedup),
+        "db-3e: canonicalIds includes the richer row (richness scoring picks it as canonical)");
+    }
+
+    // ── db-4: DB state post-merge — exactly one row of the pair has
+    //    canonical_id IS NULL (the survivor); the other now points at it;
+    //    the unrelated control row is untouched. ───────────────────────
+    assertEq(canonicalIdOf(idRichDedup), null, "db-4a: richer row is the canonical survivor — canonical_id stays NULL");
+    assertEq(canonicalIdOf(idThinDedup), idRichDedup, "db-4b: thin duplicate's canonical_id now points at the survivor");
+    assertEq(canonicalIdOf(idControlDedup), null, "db-4c: unrelated control row untouched — canonical_id still NULL");
+
+    // ── db-5: idempotency — calling again finds nothing left to merge. ─
+    {
+      const r = await dedupBackfillReq(ADMIN_KEY_DEDUP);
+      assertEq(r.status, 200, "db-5a: second call → 200 (no error)");
+      assertEq(r.body.success, true, "db-5b: success: true on the idempotent re-run");
+      assertEq(r.body.groupsFound, 0, "db-5c: second call finds 0 new groups");
+      assertEq(r.body.rowsMerged, 0, "db-5d: second call merges 0 rows (idempotent)");
+    }
+
+    // Cleanup.
+    dbFactoryDedup.__resetDbFactoryForTesting();
+  } catch (err) {
+    failed++;
+    failures.push("orch-pr-dedup-backfill-endpoint: unexpected error: " + String(err));
+  } finally {
+    if (serverDedup) {
+      await new Promise<void>((resolve) => serverDedup!.close(() => resolve()));
+    }
+    if (prevPathDedup === undefined) delete process.env.EXPERIENCES_DB_PATH;
+    else process.env.EXPERIENCES_DB_PATH = prevPathDedup;
+    if (prevAdminKeyDedup === undefined) delete process.env.ADMIN_KEY;
+    else process.env.ADMIN_KEY = prevAdminKeyDedup;
+    _orchPrDedupBackfillEndpointResolve();
+  }
+})();
+
 // ── orchestrator-pr-19: opplevagent.no → Opplevagent (experiences) host-gate ──
 // Mirrors the pr113 dental discovery tests. Covers: host→vertical recognition
 // (getVerticalFromHost), the Opplevagent agent-card (+ host isolation vs the
@@ -20704,6 +20916,7 @@ console.log("\n── orch-pr-14: MCP discovery product_id surfacing ──");
   try { await _orchPr14ProductIdPromise; } catch { /* errors already pushed to failures */ }
   try { await _orchPr9PruneDeadUrlsPromise; } catch { /* errors already pushed to failures */ }
   try { await _orchPr18BulkLoadPromise; } catch { /* errors already pushed to failures */ }
+  try { await _orchPrDedupBackfillEndpointPromise; } catch { /* errors already pushed to failures */ }
   try { await _orchPr12SweepPromise; } catch { /* errors already pushed to failures */ }
   try { await _brregVerifySlice1Promise; } catch { /* errors already pushed to failures */ }
   try { await _salgskanalMatcherPromise; } catch { /* errors already pushed to failures */ }
@@ -21986,6 +22199,7 @@ const _orchPr21SentLogActorDeps: Promise<unknown>[] = [
   _orchPr14ProductIdPromise,
   _orchPr9PruneDeadUrlsPromise,
   _orchPr18BulkLoadPromise,
+  _orchPrDedupBackfillEndpointPromise,
   _orchPr12SweepPromise,
   _brregVerifySlice1Promise,
   _orchPr20BmEventsPromise,
@@ -22423,6 +22637,7 @@ const _adminAgentsRegisterDeps: Promise<unknown>[] = [
   _orchPr14ProductIdPromise,
   _orchPr9PruneDeadUrlsPromise,
   _orchPr18BulkLoadPromise,
+  _orchPrDedupBackfillEndpointPromise,
   _orchPr12SweepPromise,
   _brregVerifySlice1Promise,
   _orchPr20BmEventsPromise,
@@ -23577,6 +23792,7 @@ const _oaHomeCountersDeps: Promise<unknown>[] = [
   _orchPr14ProductIdPromise,
   _orchPr9PruneDeadUrlsPromise,
   _orchPr18BulkLoadPromise,
+  _orchPrDedupBackfillEndpointPromise,
   _orchPr12SweepPromise,
   _brregVerifySlice1Promise,
   _orchPr20BmEventsPromise,
@@ -23707,6 +23923,7 @@ const _tasksPruneAsyncDeps: Promise<unknown>[] = [
   _orchPr14ProductIdPromise,
   _orchPr9PruneDeadUrlsPromise,
   _orchPr18BulkLoadPromise,
+  _orchPrDedupBackfillEndpointPromise,
   _orchPr12SweepPromise,
   _brregVerifySlice1Promise,
   _orchPr20BmEventsPromise,
@@ -24352,7 +24569,7 @@ const _rfbDebioSuitePromise: Promise<void> = new Promise<void>(r => { _rfbDebioS
     _pr106Promise, _pr110Promise, _pr125Promise, _seoDentalPromise, _platformVerifierPromise,
     _orchPr20260614_2Promise, _orchPr20260614Promise, _orchPr20260614_5Promise,
     _orchPr20260614_6Promise, _orchPr14ProductIdPromise, _orchPr9PruneDeadUrlsPromise,
-    _orchPr18BulkLoadPromise, _orchPr12SweepPromise, _brregVerifySlice1Promise,
+    _orchPr18BulkLoadPromise, _orchPrDedupBackfillEndpointPromise, _orchPr12SweepPromise, _brregVerifySlice1Promise,
     _orchPr20BmEventsPromise, _orchPr21SentLogActorPromise, _adminDbTableSizesPromise,
     _contactClickTrackingPromise, _homepageProvenanceEmailBackfillPromise,
     _agentKnowledgeGetAuthPromise, _oaHomeCountersPromise, _tasksPruneAsyncPromise,
