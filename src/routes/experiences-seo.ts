@@ -1011,10 +1011,20 @@ Tilgjengelige MCP-verktøy:
 - list_experience_categories   — hent alle kategorier med antall verifiserte opplevelser
 - get_experience               — hent fullstendig detalj for én opplevelse via UUID
 
-Eksempel (tools/call — discover):
-  curl -X POST ${url}/mcp \\
+Eksempel (2 steg — Streamable HTTP krever en sesjon før tools/call):
+
+  # Steg 1 — initialize. Fang opp "Mcp-Session-Id" fra svar-headerne.
+  curl -s -i -X POST ${url}/mcp \\
     -H "Content-Type: application/json" \\
-    -d '{"jsonrpc":"2.0","method":"tools/call","params":{"name":"discover_experiences","arguments":{"fylke":"Oslo","weather":"rain","limit":5}},"id":"1"}'
+    -H "Accept: application/json, text/event-stream" \\
+    -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"example-client","version":"1.0"}}}'
+
+  # Steg 2 — tools/call. Send sesjons-id-en fra steg 1 tilbake som "mcp-session-id"-header.
+  curl -s -X POST ${url}/mcp \\
+    -H "Content-Type: application/json" \\
+    -H "Accept: application/json, text/event-stream" \\
+    -H "mcp-session-id: <session-id fra steg 1>" \\
+    -d '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"discover_experiences","arguments":{"fylke":"Oslo","weather":"rain","limit":5}}}'
 
 ## A2A AI-discovery
 

@@ -15711,6 +15711,27 @@ console.log("\n── opplevagent-conversation-logging: slices 1+2 ──");
   assertTrue(!/\/api\/tannlege/.test(llms.body), "orch19-06g: llms.txt does NOT leak dental /api/tannlege");
   assertTrue(/text\/plain/.test(llms.headers["content-type"] || ""), "orch19-06h: llms.txt Content-Type is text/plain");
 
+  // dev-request 2026-07-04-opplevagent-nl-parser-og-fylkesnormalisering (item 6):
+  // the MCP example must document the real 2-step Streamable HTTP handshake
+  // (initialize -> capture Mcp-Session-Id -> echo it on tools/call), not the
+  // single-step example that 404s with "Server not initialized" against the
+  // real transport in src/routes/experiences-mcp.ts.
+  assertTrue(/"method":"initialize"/.test(llms.body),
+    "orch-llms-mcp-01: llms.txt MCP example documents the initialize step");
+  assertTrue(/"method":"tools\/call"/.test(llms.body),
+    "orch-llms-mcp-02: llms.txt MCP example still documents the tools/call step");
+  const acceptHeaderCount = (llms.body.match(/Accept: application\/json, text\/event-stream/g) || []).length;
+  assertEq(acceptHeaderCount, 2,
+    "orch-llms-mcp-03: both curl steps set the required 'Accept: application/json, text/event-stream' header");
+  assertTrue(/mcp-session-id/i.test(llms.body),
+    "orch-llms-mcp-04: llms.txt documents capturing/echoing the mcp-session-id header between steps");
+  // Old broken example: a tools/call curl with -d immediately after a lone
+  // Content-Type header (no Accept, no session id) must be gone.
+  assertTrue(
+    !/-H "Content-Type: application\/json" \\\n\s*-d '\{"jsonrpc":"2\.0","method":"tools\/call"/.test(llms.body),
+    "orch-llms-mcp-05: the old single-step (no Accept/session-id) tools/call example is gone"
+  );
+
   // robots.txt — points sitemap at opplevagent.no.
   const robots = invokeGet("/robots.txt");
   assertTrue(/Sitemap: https?:\/\/opplevagent\.no\/sitemap\.xml/.test(robots.body),
@@ -20446,6 +20467,7 @@ console.log("\n── orch-pr-14: MCP discovery product_id surfacing ──");
   try { await _rfbDebioSuitePromise; } catch { /* errors already pushed to failures */ }
   try { await _dispatchTickSuitePromise; } catch { /* errors already pushed to failures */ }
   try { await _samtalerSeoPromise; } catch { /* errors already pushed to failures */ }
+  try { await _llmsMcpProbePromise; } catch { /* errors already pushed to failures */ }
   // relax-envelope tests are synchronous (pure validateEnvelope() unit test) — no promise needed
   // PR-109 tests are synchronous (IIFE) — no promise needed
   // Drop pre-existing intg failures (unmasked by awaiting) — they predate M2
@@ -25488,5 +25510,129 @@ console.log("\n── mcp-usage-guides: GET /guide-opplevelser-mcp (opplevagent.
   } catch (err) {
     failed++;
     failures.push(`mcp-usage-guides (opplevagent): unexpected error: ${err instanceof Error ? (err.stack || err.message) : String(err)}`);
+  }
+})();
+
+// ═══════════════════════════════════════════════════════════════════════
+// dev-request 2026-07-04-opplevagent-nl-parser-og-fylkesnormalisering (item 6):
+// verifier probe — the /llms.txt MCP example must not just READ correctly,
+// it must actually WORK against the real Streamable HTTP transport in
+// src/routes/experiences-mcp.ts. This drives the exact 2-step sequence the
+// doc now describes (initialize -> capture Mcp-Session-Id -> echo it on
+// tools/call) against a real, locally-listening express app mounting the
+// unmodified experiences-mcp router, over real HTTP (fetch), and asserts a
+// real, non-error JSON-RPC result comes back — proving the documented
+// example is not just text but a working flow.
+//
+// Out of scope for this slice (same bug, NOT fixed here — see dental-seo.ts's
+// and discovery.ts's (rfb) own separate /llms.txt handlers, which document
+// the identical single-step-no-session tools/call example and would fail
+// the same way against their own MCP transports).
+let _llmsMcpProbeResolve: () => void = () => {};
+const _llmsMcpProbePromise: Promise<void> = new Promise<void>(r => { _llmsMcpProbeResolve = r; });
+
+(async () => {
+  console.log("\n── llms-mcp-probe: /llms.txt 2-step MCP example actually works (item 6) ──");
+
+  const prevPathLmp = process.env.EXPERIENCES_DB_PATH;
+  process.env.EXPERIENCES_DB_PATH = ":memory:";
+
+  const dbFactoryPathLmp = require.resolve("../src/database/db-factory");
+  const expStorePathLmp = require.resolve("../src/services/experience-store");
+  const expMcpPathLmp = require.resolve("../src/routes/experiences-mcp");
+  delete require.cache[dbFactoryPathLmp];
+  delete require.cache[expStorePathLmp];
+  delete require.cache[expMcpPathLmp];
+
+  const dbFactoryLmp = require("../src/database/db-factory") as typeof import("../src/database/db-factory");
+  dbFactoryLmp.__resetDbFactoryForTesting();
+  dbFactoryLmp.getDb("experiences");
+  const expStoreLmp = require("../src/services/experience-store") as typeof import("../src/services/experience-store");
+  const expMcpRouterLmp = (require("../src/routes/experiences-mcp") as typeof import("../src/routes/experiences-mcp")).default;
+
+  // Seed exactly the kind of experience the documented example asks for
+  // (fylke=Oslo, weather=rain -> indoor/weather-independent), so the probe
+  // gets back real content, not just an empty-but-successful result.
+  expStoreLmp.createExperience({
+    title: "Innendørs klatring i Oslo", category: "natur_friluft",
+    fylke: "Oslo", kommune: "Oslo", indoor_outdoor: "indoor",
+    weather_dependent: 0, confidence: "high", verification_status: "verified",
+  });
+
+  const expressLmp = require("express");
+  const httpLmp = require("http");
+  const appLmp = expressLmp();
+  appLmp.use(expressLmp.json());
+  appLmp.use("/", expMcpRouterLmp);
+
+  const serverLmp = httpLmp.createServer(appLmp);
+  await new Promise<void>((resolve) => serverLmp.listen(0, "127.0.0.1", resolve));
+  const addrLmp = serverLmp.address();
+  const portLmp = typeof addrLmp === "object" && addrLmp ? addrLmp.port : 0;
+  const mcpUrlLmp = `http://127.0.0.1:${portLmp}/mcp`;
+
+  // The transport may answer either a plain JSON body or an SSE-framed body
+  // ("event: message\ndata: {...}\n\n") depending on negotiation -- parse
+  // whichever comes back so the probe isn't coupled to that internal detail.
+  function parseMcpBody(contentType: string, text: string): any {
+    if (contentType.includes("application/json")) return JSON.parse(text);
+    const m = text.match(/data:\s*(\{.*\})/s);
+    if (!m) throw new Error(`llms-mcp-probe: could not parse MCP response body: ${text}`);
+    return JSON.parse(m[1]);
+  }
+
+  try {
+    // ── Step 1 (mirrors the /llms.txt example verbatim): initialize ──
+    const initRes = await fetch(mcpUrlLmp, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Accept": "application/json, text/event-stream",
+      },
+      body: JSON.stringify({
+        jsonrpc: "2.0", id: 1, method: "initialize",
+        params: { protocolVersion: "2024-11-05", capabilities: {}, clientInfo: { name: "example-client", version: "1.0" } },
+      }),
+    });
+    assertEq(initRes.status, 200, "llms-mcp-probe-01: step 1 (initialize) returns HTTP 200");
+    const sessionIdLmp = initRes.headers.get("mcp-session-id");
+    assertTrue(!!sessionIdLmp, "llms-mcp-probe-02: step 1 response carries an Mcp-Session-Id header to capture");
+    const initBody = parseMcpBody(initRes.headers.get("content-type") || "", await initRes.text());
+    assertTrue(!initBody.error, "llms-mcp-probe-03: step 1 (initialize) is not a JSON-RPC error");
+    assertTrue(!!initBody.result?.serverInfo, "llms-mcp-probe-04: step 1 result carries serverInfo (real initialize response)");
+
+    // ── Step 2 (mirrors the /llms.txt example verbatim): tools/call, echoing
+    //    the session id captured from step 1 ──
+    const callRes = await fetch(mcpUrlLmp, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Accept": "application/json, text/event-stream",
+        "mcp-session-id": sessionIdLmp || "",
+      },
+      body: JSON.stringify({
+        jsonrpc: "2.0", id: 2, method: "tools/call",
+        params: { name: "discover_experiences", arguments: { fylke: "Oslo", weather: "rain", limit: 5 } },
+      }),
+    });
+    assertEq(callRes.status, 200, "llms-mcp-probe-05: step 2 (tools/call) returns HTTP 200 (proves the doc's session-id echo actually satisfies 'Server not initialized')");
+    const callBody = parseMcpBody(callRes.headers.get("content-type") || "", await callRes.text());
+    assertTrue(!callBody.error, "llms-mcp-probe-06: step 2 (tools/call) is not a JSON-RPC transport-level error");
+    assertTrue(!callBody.result?.isError, "llms-mcp-probe-07: discover_experiences tool result is not itself an error result");
+    const discoverPayload = JSON.parse(callBody.result.content[0].text);
+    assertEq(discoverPayload.count, 1, "llms-mcp-probe-08: discover_experiences returns the 1 seeded Oslo experience (real, non-empty data)");
+    assertEq(discoverPayload.experiences[0].fylke, "Oslo", "llms-mcp-probe-09: returned experience matches the documented fylke=Oslo filter");
+    assertEq(discoverPayload.experiences[0].title, "Innendørs klatring i Oslo", "llms-mcp-probe-10: returned experience is the seeded fixture (end-to-end, not a stub)");
+
+    console.log("  llms-mcp-probe: OK (10 tests: initialize-200/session-id-header/initialize-no-error/serverInfo/toolscall-200/toolscall-no-error/tool-not-isError/real-count/real-fylke/real-title)");
+  } catch (err) {
+    failed++;
+    failures.push(`llms-mcp-probe: unexpected error: ${err instanceof Error ? (err.stack || err.message) : String(err)}`);
+  } finally {
+    await new Promise<void>((resolve) => serverLmp.close(() => resolve()));
+    if (prevPathLmp === undefined) delete process.env.EXPERIENCES_DB_PATH;
+    else process.env.EXPERIENCES_DB_PATH = prevPathLmp;
+    dbFactoryLmp.__resetDbFactoryForTesting();
+    _llmsMcpProbeResolve();
   }
 })();
