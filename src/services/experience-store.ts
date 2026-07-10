@@ -20,6 +20,22 @@ import { getDb } from "../database/db-factory";
 import { fylkeEquivalents } from "./norway-fylke";
 import { deriveExperienceTags, type ExperienceTag, type TaggableExperience } from "./experience-tags";
 import { haversineDistanceKm } from "./geocoding-service";
+import {
+  findExistingCandidateMatch,
+  scoreExperienceRichness,
+  type DedupCandidateRow,
+  type ExperienceRichnessInput,
+} from "./experience-dedup";
+export {
+  runDedupPass,
+  scoreExperienceRichness,
+  pickCanonical,
+  titlesMatch,
+  normalizeExperienceTitle,
+  groupDuplicateCandidates,
+  type DedupCandidateRow,
+  type DedupPassResult,
+} from "./experience-dedup";
 
 const VERTICAL = "experiences";
 
@@ -338,10 +354,15 @@ export function getExperienceById(id: string): (Experience & { id: string; tags:
 // publish-gate (verified + confidence>=medium + provider brreg_active) so the
 // set of live HTML detail pages == the set surfaced by /discover (100% weave,
 // zero orphan/dead pages). Read-only; no schema change.
+// dev-request 2026-07-04-opplevagent-dedup-og-norske-titler, item 1: a row
+// that the dedup pass folded into another (canonical) row must never surface
+// again in any browse/discover/sitemap result — canonical_id IS NULL means
+// "this row IS canonical" (see init-experiences.ts + experience-dedup.ts).
 const PUBLISH_GATE_SQL =
   "e.verification_status = 'verified' " +
   "AND (e.confidence IS NULL OR e.confidence IN ('high','medium')) " +
-  "AND (p.id IS NULL OR p.brreg_active = 1)";
+  "AND (p.id IS NULL OR p.brreg_active = 1) " +
+  "AND e.canonical_id IS NULL";
 
 export function getPublishedExperienceBySlug(
   slug: string
@@ -986,6 +1007,9 @@ export function discoverExperiences(
     "e.verification_status = 'verified'",
     "(e.confidence IS NULL OR e.confidence IN ('high','medium'))",
     "(p.id IS NULL OR p.brreg_active = 1)",
+    // dev-request 2026-07-04-opplevagent-dedup-og-norske-titler, item 1: never
+    // surface a row the dedup pass merged away as a duplicate.
+    "e.canonical_id IS NULL",
   ];
   const params: Record<string, unknown> = {};
 
@@ -1208,21 +1232,95 @@ export function listCategories(): Array<{ category: string; count: number }> {
   const db = getDb(VERTICAL);
   return db.prepare(`
     SELECT category, COUNT(*) as count FROM experiences
-    WHERE category IS NOT NULL AND verification_status = 'verified'
+    WHERE category IS NOT NULL AND verification_status = 'verified' AND canonical_id IS NULL
     GROUP BY category ORDER BY count DESC
   `).all() as Array<{ category: string; count: number }>;
+}
+
+// ─── Dedup: slug-redirect helper + re-harvest guard (dev-request 2026-07-04-
+// opplevagent-dedup-og-norske-titler, item 1) ───────────────────────────────
+
+/**
+ * If `slug` belongs to a row that has since been merged away as a duplicate
+ * (canonical_id set), resolve the LIVE slug of its canonical row — so the
+ * /opplevelse/:slug route can 301 to it instead of 404ing on a stale
+ * bookmarked/indexed URL for a row the dedup pass folded into another row.
+ * Returns null when the slug doesn't exist, isn't a duplicate, or its
+ * canonical row is missing/has no slug of its own.
+ */
+export function resolveCanonicalSlugForDuplicate(slug: string): string | null {
+  if (!slug) return null;
+  const db = getDb(VERTICAL);
+  const row = db
+    .prepare("SELECT canonical_id FROM experiences WHERE slug = ?")
+    .get(slug) as { canonical_id: string | null } | undefined;
+  if (!row || !row.canonical_id) return null;
+  const canonical = db
+    .prepare("SELECT slug FROM experiences WHERE id = ?")
+    .get(row.canonical_id) as { slug: string | null } | undefined;
+  return canonical?.slug ?? null;
+}
+
+/**
+ * Re-harvest guard, store-level wrapper: find an existing (unmerged)
+ * experience that a not-yet-inserted harvest candidate would form a duplicate
+ * group with (same provider identity + kommune + fuzzy title). Used by
+ * bulkInsertExperiences() and the /admin/bulk-load route so a re-harvest of
+ * an already-known experience never resurrects a duplicate that was already
+ * merged away.
+ */
+export function findExistingExperienceMatch(candidate: {
+  provider_id?: string | null;
+  title: string;
+  kommune?: string | null;
+}): DedupCandidateRow | null {
+  const db = getDb(VERTICAL);
+  return findExistingCandidateMatch(db, candidate);
 }
 
 // ─── Bulk insert (Phase A harvest ingest) ───────────────────────────
 export type HarvestRow = Partial<Experience> & { title: string };
 
-export function bulkInsertExperiences(rows: HarvestRow[]): { inserted: number; skipped: number } {
+export function bulkInsertExperiences(
+  rows: HarvestRow[]
+): { inserted: number; skipped: number; updated: number } {
   const db = getDb(VERTICAL);
-  let inserted = 0, skipped = 0;
+  let inserted = 0, skipped = 0, updated = 0;
   const tx = db.transaction((batch: HarvestRow[]) => {
     for (const row of batch) {
       if (!row.title) { skipped++; continue; }
       try {
+        // Re-harvest guard: never insert a brand-new row that duplicates an
+        // existing (unmerged) experience — same provider + kommune + fuzzy
+        // title. If the existing row already has equal-or-better data, skip;
+        // otherwise fill its blanks from this candidate (never overwrite,
+        // never resurrect a row already merged away).
+        const match = findExistingCandidateMatch(db, {
+          provider_id: row.provider_id ?? null,
+          title: row.title,
+          kommune: row.kommune ?? null,
+        });
+        if (match) {
+          const candidateScore = scoreExperienceRichness(row as ExperienceRichnessInput);
+          const existingScore = scoreExperienceRichness(match);
+          if (candidateScore > existingScore) {
+            applyExperienceContent(match.id, {
+              description: row.description ?? null,
+              category: row.category ?? null,
+              subcategory: row.subcategory ?? null,
+              activity_tags: row.activity_tags ?? null,
+              season: row.season ?? null,
+              indoor_outdoor: row.indoor_outdoor ?? null,
+              duration_min: row.duration_min ?? null,
+              price_from: row.price_from ?? null,
+              booking_url: row.booking_url ?? null,
+            });
+            updated++;
+          } else {
+            skipped++;
+          }
+          continue;
+        }
         createExperience(row as Experience);
         inserted++;
       } catch {
@@ -1231,7 +1329,7 @@ export function bulkInsertExperiences(rows: HarvestRow[]): { inserted: number; s
     }
   });
   tx(rows);
-  return { inserted, skipped };
+  return { inserted, skipped, updated };
 }
 
 // ─── Idempotency helper (orchestrator-pr-18 bulk-load) ──────────────
