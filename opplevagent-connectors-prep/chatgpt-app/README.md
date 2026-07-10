@@ -4,7 +4,7 @@
 
 - **MCP endpoint:** `https://opplevagent.no/mcp`
 - **App manifest:** `manifest.json` in this directory (schema_version v1)
-- **Icon:** `https://opplevagent.no/favicon-192.png` (192×192 PNG)
+- **Icon:** `https://opplevagent.no/favicon.svg` (SVG — no PNG icon route exists on opplevagent.no; verified live 2026-07-10, `favicon-192.png` 404s)
 - **Policy URLs:**
   - Privacy: `https://opplevagent.no/personvern`
   - Terms: `https://opplevagent.no/vilkar`

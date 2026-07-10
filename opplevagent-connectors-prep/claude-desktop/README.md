@@ -8,7 +8,7 @@
 - **DXT manifest:** `manifest.json` in this directory (`manifest_version` 0.3)
 - **MCP registry server descriptor:** `server.json` in this directory
   (`io.github.slookisen/opplevagent-mcp`)
-- **Icon:** `https://opplevagent.no/favicon-192.png` (192×192 PNG)
+- **Icon:** `https://opplevagent.no/favicon.svg` (SVG — no PNG icon route exists on opplevagent.no; verified live 2026-07-10, `favicon-192.png` 404s)
 - **Policy URLs:**
   - Privacy: `https://opplevagent.no/personvern`
   - Terms: `https://opplevagent.no/vilkar`
@@ -46,7 +46,7 @@ and the `MIT` license are all directly verified against `mcp-server-opplevagent/
 3. If submitting to the public Claude Desktop connector directory rather than adding a personal
    connector, follow the directory's submission form using `manifest.json` / `server.json` in this
    directory as the source data (name, description, icon, tools, policy URLs, contact).
-4. Upload the icon (`https://opplevagent.no/favicon-192.png`) and confirm the privacy/terms links
+4. Upload the icon (`https://opplevagent.no/favicon.svg`) and confirm the privacy/terms links
    resolve before submitting.
 
 ## Testing before submit
