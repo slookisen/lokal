@@ -309,5 +309,29 @@ export function initExperiencesSchema(db: Database.Database): void {
     try { db.exec(stmt); } catch { /* already present */ }
   }
 
+  // ─── Geocode backfill columns (dev-request 2026-07-04-opplevagent-naer-meg-geosok,
+  // item 1, 2026-07-10) ──────────────────────────────────────────────────────
+  // Mirrors dental_agents' geocode_source/geocode_confidence columns exactly
+  // (see init-dental.ts) so experiences-geocode-worker.ts can run the same
+  // Kartverket address-geocoding + idempotent work-queue pattern against
+  // experience_providers. geocode_confidence doubles as negative-cache: once
+  // set to 'no_match' the row drops out of the WHERE lat IS NULL AND
+  // geocode_confidence IS NULL work queue so dead addresses aren't retried
+  // every tick.
+  //
+  // experiences.geo_precision records HOW a given experience's loc_lat/loc_lon
+  // were resolved: 'address' = copied down from its provider's geocoded street
+  // address (high/medium/low Kartverket confidence), 'kommune' = fallback
+  // centroid via geocodingService (provider missing/ungeocodable, or experience
+  // has no provider yet — harvest-first model). NULL = not yet resolved.
+  const geocodeBackfillCols = [
+    "ALTER TABLE experience_providers ADD COLUMN geocode_source TEXT",
+    "ALTER TABLE experience_providers ADD COLUMN geocode_confidence TEXT",
+    "ALTER TABLE experiences ADD COLUMN geo_precision TEXT",
+  ];
+  for (const stmt of geocodeBackfillCols) {
+    try { db.exec(stmt); } catch { /* already present */ }
+  }
+
   console.log("[experiences] schema initialized");
 }

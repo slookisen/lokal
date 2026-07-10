@@ -957,6 +957,60 @@ if (
   }, 60 * 60_000);
 }
 
+// ─── dev-request 2026-07-04-opplevagent-naer-meg-geosok (item 1, 2026-07-10):
+// Backend experiences geocoding worker ───────────────────────────────
+//
+// Continuous Kartverket-based geocoding for the experiences vertical.
+// Mirrors the dental-geocode block immediately above: first tick fires
+// 30s after boot (lets the Fly volume mount + db-factory init settle);
+// subsequent ticks run hourly. Each tick geocodes up to 50 provider
+// addresses, propagates provider locations down to their experiences,
+// then falls back to kommune-centroid geocoding for any experiences
+// still unresolved (unmatched to a provider, or provider address
+// geocoding failed/pending).
+//
+// Disable on dev / CI with RFB_DISABLE_EXPERIENCES_GEOCODE=1.
+// Only fires when the experiences vertical is actually enabled, otherwise
+// the experiences.db handle isn't open and we'd just be no-oping in a loop.
+if (
+  process.env.RFB_DISABLE_EXPERIENCES_GEOCODE !== "1" &&
+  process.env.ENABLE_EXPERIENCES === "1"
+) {
+  // First tick at boot + 30s (lets the volume mount and db-factory init).
+  setTimeout(async () => {
+    try {
+      const { experiencesGeocodeTick } = await import("./services/experiences-geocode-worker");
+      const r = await experiencesGeocodeTick(50);
+      console.log(
+        `[experiences-geocode] boot-tick processed=${r.providers_processed} ` +
+        `high=${r.providers_high} medium=${r.providers_medium} low=${r.providers_low} ` +
+        `no_match=${r.providers_no_match} addr_precision=${r.experiences_address_precision} ` +
+        `kommune_precision=${r.experiences_kommune_precision} unresolved=${r.experiences_unresolved} ` +
+        `errors=${r.errors} duration_ms=${r.duration_ms}`
+      );
+    } catch (err) {
+      console.error("[experiences-geocode] boot-tick failed:", err);
+    }
+  }, 30_000);
+
+  // Subsequent ticks hourly.
+  setInterval(async () => {
+    try {
+      const { experiencesGeocodeTick } = await import("./services/experiences-geocode-worker");
+      const r = await experiencesGeocodeTick(50);
+      console.log(
+        `[experiences-geocode] tick processed=${r.providers_processed} ` +
+        `high=${r.providers_high} medium=${r.providers_medium} low=${r.providers_low} ` +
+        `no_match=${r.providers_no_match} addr_precision=${r.experiences_address_precision} ` +
+        `kommune_precision=${r.experiences_kommune_precision} unresolved=${r.experiences_unresolved} ` +
+        `errors=${r.errors} duration_ms=${r.duration_ms}`
+      );
+    } catch (err) {
+      console.error("[experiences-geocode] tick failed:", err);
+    }
+  }, 60 * 60_000);
+}
+
 // ─── dev-request 2026-07-09-loop-dispatch-self-tick: dispatcher self-tick ───
 //
 // Ticks runDispatchTick("active") every ~10 min so the fleet's self-continue
