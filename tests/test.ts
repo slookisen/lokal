@@ -526,6 +526,35 @@ console.log("\n── experience-tags (derived filter tags) ──");
   console.log(`  experience-tags: ${r.passed} passed, ${r.failed} failed`);
 }
 
+// ── dev-request 2026-07-04-opplevagent-naer-meg-geosok, item 3: distance/
+// precision label formatting for /sok's «Nær meg» result cards. Pins the
+// honesty rule: an 'address'-precision row gets an exact "X,X km unna", a
+// 'kommune'-precision (centroid-fallback) row NEVER claims a distance.
+console.log("\n── experience-store (formatDistanceLabel) ──");
+{
+  const { runExperienceStoreTests } = require("../src/services/experience-store.test") as
+    typeof import("../src/services/experience-store.test");
+  const r = runExperienceStoreTests({ log: false });
+  passed += r.passed;
+  failed += r.failed;
+  for (const f of r.failures) failures.push("experience-store: " + f);
+  console.log(`  experience-store: ${r.passed} passed, ${r.failed} failed`);
+}
+
+// ── dev-request 2026-07-04-opplevagent-naer-meg-geosok, item 3: /sok's
+// distance-sort toggle URL builder (pure — preserves q/tags/lat/lng/
+// radius_km/sted while adding or removing sort=distance).
+console.log("\n── experiences-seo-sok-geo (buildSortToggleUrl) ──");
+{
+  const { runExperiencesSeoSokGeoTests } = require("../src/routes/experiences-seo-sok-geo.test") as
+    typeof import("../src/routes/experiences-seo-sok-geo.test");
+  const r = runExperiencesSeoSokGeoTests({ log: false });
+  passed += r.passed;
+  failed += r.failed;
+  for (const f of r.failures) failures.push("experiences-seo-sok-geo: " + f);
+  console.log(`  experiences-seo-sok-geo: ${r.passed} passed, ${r.failed} failed`);
+}
+
 // ── orchestrator-pr-13: conservative address/phone contact-normalizer ──
 // Pins the formatting-only relaxation in cross-source-validator (clears
 // formatting-only review_required) while keeping genuine conflicts gated.
