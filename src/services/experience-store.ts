@@ -1680,10 +1680,19 @@ export type GardssalgProviderRow = {
   lon: number | null;
   epost: string | null;
   telefon: string | null;
+  // Additive (2026-07-10, gårdssalg multi-page-crawl content-enrichment
+  // slice, Fase 1 item 3 of the rike-profiler dev-request): real per-producer
+  // "Om produsenten"/"Besøket"/opening-hours copy, filled by
+  // POST /admin/gardssalg-content-refresh. NULL until enrichment runs — every
+  // consumer (the produsent profile route) must be null-safe and keep
+  // rendering its existing honest-omission fallback until then.
+  about_text: string | null;
+  visit_text: string | null;
+  opening_hours_text: string | null;
 };
 
 const GARDSSALG_PROVIDER_COLUMNS =
-  "id, navn, hjemmeside, fylke, kommune, poststed, producer_type, enrichment_state, slug, adresse, lat, lon, epost, telefon";
+  "id, navn, hjemmeside, fylke, kommune, poststed, producer_type, enrichment_state, slug, adresse, lat, lon, epost, telefon, about_text, visit_text, opening_hours_text";
 
 export function listGardssalgProviders(limit = 100, offset = 0): GardssalgProviderRow[] {
   const db = getDb(VERTICAL);
@@ -1719,4 +1728,147 @@ export function getGardssalgProviderBySlug(slug: string): GardssalgProviderRow |
     )
     .get({ slug }) as GardssalgProviderRow | undefined;
   return row ?? null;
+}
+
+// ─── Gårdssalg content-refresh (dev-request 2026-07-03-gardssalg-rike-
+//     profiler-bilder-agentbooking, Fase 1 item 3, 2026-07-10) ──────────────
+//
+// The multi-page-crawl twin of selectProvidersForContentRefresh() /
+// getProviderContentTarget() / applyExperienceContent() above, but writing
+// directly onto experience_providers (about_text/visit_text/
+// opening_hours_text) instead of the experiences table — gårdssalg producers
+// have zero rows in `experiences` (their product is a gårdsbesøk booking, not
+// a listed "experience"; see getGardssalgProviderBySlug's doc comment above).
+// Reuses markProviderContentAttempted() as-is for attempt tracking (same
+// last_content_attempt_at column, same "cycle to the back of the queue on any
+// outcome" discipline). LOCK convention mirrors the experiences table exactly
+// (see isExperienceContentLocked above): content_source 'manual'/'claim' is
+// human/owner-authored and NEVER auto-overwritten by this crawl.
+
+export type GardssalgContentRefreshTarget = {
+  id: string;
+  navn: string;
+  hjemmeside: string;
+  content_source: string | null;
+  about_text: string | null;
+  visit_text: string | null;
+  opening_hours_text: string | null;
+};
+
+/**
+ * Auto-select gårdssalg providers eligible for a content-refresh: gårdssalg
+ * providers (producer_type set OR rfb-seed) WITH a website, NOT locked
+ * (content_source not in manual/claim), and THIN on at least one of
+ * about_text/visit_text/opening_hours_text. Ordered oldest-attempted first
+ * (last_content_attempt_at NULLs first, same discipline as
+ * selectProvidersForContentRefresh — see that function's doc comment for why
+ * last_content_attempt_at rather than a success-only timestamp drives
+ * ordering). Hard-capped at 48 — there are only 48 gårdssalg providers total.
+ */
+export function selectGardssalgProvidersForContentRefresh(limit = 25): GardssalgContentRefreshTarget[] {
+  const db = getDb(VERTICAL);
+  const cap = Math.max(1, Math.min(48, limit));
+  return db
+    .prepare(
+      `SELECT id, navn, TRIM(hjemmeside) AS hjemmeside, content_source,
+              about_text, visit_text, opening_hours_text
+         FROM experience_providers
+        WHERE (producer_type IS NOT NULL OR rfb_seed_source = 'rfb-seed')
+          AND hjemmeside IS NOT NULL AND TRIM(hjemmeside) != ''
+          AND (content_source IS NULL OR content_source NOT IN ('manual','claim'))
+          AND (
+                about_text IS NULL OR TRIM(about_text) = ''
+             OR visit_text IS NULL OR TRIM(visit_text) = ''
+             OR opening_hours_text IS NULL OR TRIM(opening_hours_text) = ''
+              )
+        ORDER BY (last_content_attempt_at IS NOT NULL), last_content_attempt_at ASC, created_at ASC
+        LIMIT ?`
+    )
+    .all(cap) as GardssalgContentRefreshTarget[];
+}
+
+/**
+ * Resolve an explicit providerId for the gårdssalg content-refresh's
+ * `providerIds` override. Scoped to the gårdssalg WHERE clause (producer_type
+ * set OR rfb-seed) — NOT the thin/lock filters above, so an admin can force a
+ * refresh of a provider that isn't currently "eligible" by the auto-select
+ * query (mirrors getProviderContentTarget's override semantics). Returns null
+ * when the provider doesn't exist, isn't a gårdssalg provider, or has no
+ * usable website.
+ */
+export function getGardssalgProviderContentTarget(providerId: string): GardssalgContentRefreshTarget | null {
+  const db = getDb(VERTICAL);
+  const row = db
+    .prepare(
+      `SELECT id, navn, TRIM(hjemmeside) AS hjemmeside, content_source,
+              about_text, visit_text, opening_hours_text
+         FROM experience_providers
+        WHERE id = ?
+          AND (producer_type IS NOT NULL OR rfb_seed_source = 'rfb-seed')`
+    )
+    .get(providerId) as GardssalgContentRefreshTarget | undefined;
+  if (!row || !row.hjemmeside || row.hjemmeside.trim().length === 0) return null;
+  return row;
+}
+
+/**
+ * Apply crawled content to ONE gårdssalg provider, respecting the lock +
+ * thin-only gate: writes each candidate field only if the provider's current
+ * value is blank, and NEVER writes anything if the provider is locked
+ * (content_source 'manual'/'claim'). Stamps content_source='provider_site',
+ * content_evidence_url, and content_updated_at in the SAME UPDATE, but only
+ * when at least one field was actually written (a no-op write stamps
+ * nothing). Returns the field names actually written. Idempotent: a second
+ * run against an already-filled provider writes nothing.
+ */
+export function applyGardssalgProviderContent(
+  providerId: string,
+  candidate: { about_text?: string | null; visit_text?: string | null; opening_hours_text?: string | null },
+  evidenceUrl: string
+): string[] {
+  const db = getDb(VERTICAL);
+  const row = db
+    .prepare(
+      `SELECT id, content_source, about_text, visit_text, opening_hours_text
+         FROM experience_providers WHERE id = ?`
+    )
+    .get(providerId) as
+    | { id: string; content_source: string | null; about_text: string | null; visit_text: string | null; opening_hours_text: string | null }
+    | undefined;
+  if (!row) return [];
+  if (row.content_source === "manual" || row.content_source === "claim") return [];
+
+  function isBlank(v: unknown): boolean {
+    return v === null || v === undefined || String(v).trim() === "";
+  }
+
+  const sets: string[] = [];
+  const params: Record<string, unknown> = { id: providerId };
+  const written: string[] = [];
+
+  if (isBlank(row.about_text) && candidate.about_text?.trim()) {
+    sets.push("about_text = @about_text");
+    params.about_text = candidate.about_text.trim();
+    written.push("about_text");
+  }
+  if (isBlank(row.visit_text) && candidate.visit_text?.trim()) {
+    sets.push("visit_text = @visit_text");
+    params.visit_text = candidate.visit_text.trim();
+    written.push("visit_text");
+  }
+  if (isBlank(row.opening_hours_text) && candidate.opening_hours_text?.trim()) {
+    sets.push("opening_hours_text = @opening_hours_text");
+    params.opening_hours_text = candidate.opening_hours_text.trim();
+    written.push("opening_hours_text");
+  }
+
+  if (sets.length === 0) return [];
+
+  sets.push("content_source = 'provider_site'");
+  sets.push("content_evidence_url = @evidence_url");
+  sets.push("content_updated_at = datetime('now')");
+  params.evidence_url = evidenceUrl;
+
+  db.prepare(`UPDATE experience_providers SET ${sets.join(", ")} WHERE id = @id`).run(params);
+  return written;
 }

@@ -20917,6 +20917,7 @@ console.log("\n── orch-pr-14: MCP discovery product_id surfacing ──");
   try { await _orchPr9PruneDeadUrlsPromise; } catch { /* errors already pushed to failures */ }
   try { await _orchPr18BulkLoadPromise; } catch { /* errors already pushed to failures */ }
   try { await _orchPrDedupBackfillEndpointPromise; } catch { /* errors already pushed to failures */ }
+  try { await _gardssalgContentRefreshPromise; } catch { /* errors already pushed to failures */ }
   try { await _orchPr12SweepPromise; } catch { /* errors already pushed to failures */ }
   try { await _brregVerifySlice1Promise; } catch { /* errors already pushed to failures */ }
   try { await _salgskanalMatcherPromise; } catch { /* errors already pushed to failures */ }
@@ -23681,6 +23682,305 @@ console.log("\n── gardssalg-profile: produsent profile page ──");
   else process.env.EXPERIENCES_DB_PATH = prevPathGP;
   dbFacGP.__resetDbFactoryForTesting();
   console.log("  gardssalg-profile: OK (unknown-slug 404, full profile render + sections, badge, CTA, practical-info, map, JSON-LD, OG/Twitter, category-card link, booking-panel regression)");
+})();
+
+// ─── gardssalg-content-enrichment: pure extractors (2026-07-10, Fase 1 item 3
+//     of the rike-profiler dev-request) ────────────────────────────────────
+// Unit coverage for the multi-page-crawl slice's two new pure extractors:
+// summarizeVisit (same shape as summarizeAbout, but keyword-scans for
+// visit/tasting signal) and extractOpeningHours (scans already-extracted
+// visible text for a weekday+time or åpningstider/åpent+time snippet). Both
+// are PURE — no network, no DB — so this block is a plain synchronous IIFE,
+// same convention as every other pure-function unit test in this file.
+console.log("\n── gardssalg-content-enrichment: summarizeVisit / extractOpeningHours (pure) ──");
+(() => {
+  const { summarizeVisit, extractOpeningHours, extractVisibleText } =
+    require("../src/services/search-enrich") as typeof import("../src/services/search-enrich");
+
+  // ── summarizeVisit ──────────────────────────────────────────────────────
+  {
+    const html = "<html><body><p>Velkommen til gården vår.</p><p>Vi tilbyr omvisning i bryggeriet og en smaking av våre øl hver lørdag.</p></body></html>";
+    const sum = summarizeVisit(html);
+    assertTrue(sum.includes("omvisning") && sum.includes("smaking"), "summarizeVisit: finds a sentence mentioning omvisning/smaking keywords");
+  }
+  {
+    const html = "<html><body><p>Vi har åpent gårdsutsalg hver dag fra ti til fire, kom gjerne innom for å handle direkte fra oss på gården.</p></body></html>";
+    const sum = summarizeVisit(html);
+    assertTrue(sum.toLowerCase().includes("åpent gårdsutsalg"), "summarizeVisit: finds the 'åpent gårdsutsalg' keyword");
+  }
+  {
+    const html = "<html><body><p>Dette er en helt vanlig setning om gårdens historie og ingenting annet som er relevant her i det hele tatt.</p></body></html>";
+    assertEq(summarizeVisit(html), "", "summarizeVisit: no visit/tasting keyword anywhere → empty string (no leading-slice fallback)");
+  }
+  assertEq(summarizeVisit(""), "", "summarizeVisit: empty html → empty string");
+  {
+    const longSentence =
+      "Et flott sted for smaking av lokale produkter fra egen gård og hage, " +
+      "med mye å se og oppleve for hele familien, ".repeat(15) +
+      "velkommen innom.";
+    const sum = summarizeVisit(`<html><body><p>${longSentence}</p></body></html>`);
+    assertTrue(sum.length > 0 && sum.length <= 300, "summarizeVisit: caps a long matching sentence at ~300 chars");
+  }
+
+  // ── extractOpeningHours ─────────────────────────────────────────────────
+  {
+    const text = extractVisibleText("<p>Åpningstider: Mandag-fredag 10:00-16:00, lørdag stengt.</p>");
+    const hours = extractOpeningHours(text);
+    assertTrue(!!hours && /10:00/.test(hours) && /mandag/i.test(hours), "extractOpeningHours: weekday name + HH:MM time pattern → snippet");
+  }
+  {
+    const text = "Vi har åpent man-fre 9-17, velkommen innom.";
+    const hours = extractOpeningHours(text);
+    assertTrue(!!hours && /man-fre/i.test(hours), "extractOpeningHours: 'man-fre' abbreviation range co-located with a time pattern");
+  }
+  {
+    const text = "Åpningstider 10-18 alle hverdager, se nettsiden for detaljer.";
+    const hours = extractOpeningHours(text);
+    assertTrue(!!hours && /10-18/.test(hours), "extractOpeningHours: 'åpningstider' + time pattern, no weekday name needed");
+  }
+  {
+    const text = "Vi åpnet gården vår i 1998 og har drevet siden.";
+    assertEq(extractOpeningHours(text), null, "extractOpeningHours: 'åpnet' (different word, past tense) alone → null");
+  }
+  assertEq(extractOpeningHours(""), null, "extractOpeningHours: empty text → null");
+  {
+    const text = "This bakery is open Monday to Friday from 9am, come visit us anytime.";
+    assertEq(extractOpeningHours(text), null, "extractOpeningHours: English weekday names don't match the Norwegian pattern → null");
+  }
+  {
+    const hours = extractOpeningHours("Mandag er vår favorittdag i uken, ingenting mer å si her.");
+    assertEq(hours, null, "extractOpeningHours: weekday name with no nearby time or åpningstider/åpent keyword → null");
+  }
+
+  console.log("  gardssalg-content-enrichment (pure): OK (summarizeVisit + extractOpeningHours unit tests)");
+})();
+
+// ─── gardssalg-content-refresh: POST /api/opplevelser/admin/gardssalg-content-
+//     refresh (2026-07-10, Fase 1 item 3 of the rike-profiler dev-request) ──
+// Drives the REAL opplevelser router over HTTP against an in-memory
+// experiences.db, same real-HTTP-server pattern as orch-pr-18 (bulk-load) /
+// orch-pr-dedup-backfill-endpoint above (this block explicitly serializes
+// AFTER that one, since both mutate the shared experiences db-factory
+// singleton). Since this route makes real fetch() calls to a producer's
+// hjemmeside, and the CI/sandbox has no network access to arbitrary URLs,
+// this suite deliberately exercises only the paths that don't require a
+// successful fetch: the admin auth-gate, the LOCK check (which this route
+// short-circuits on BEFORE any fetch — see the route's doc comment), and the
+// apply/dry-run attempt-stamping + providerIds-override plumbing. A seeded
+// unlocked provider's hjemmeside is a URL isSafeFetchUrl() rejects outright
+// (http://localhost/), so its fetch fails FAST (no real network wait,
+// no 10s timeout) and lands in `errors` — enough to verify the plumbing
+// without a live network round-trip. The pure extraction logic itself
+// (summarizeVisit/extractOpeningHours/summarizeAbout/meetsAboutQualityBar)
+// is covered independently by the pure-function block above.
+console.log("\n── gardssalg-content-refresh: POST /api/opplevelser/admin/gardssalg-content-refresh ──");
+
+let _gardssalgContentRefreshResolve: () => void = () => {};
+const _gardssalgContentRefreshPromise: Promise<void> = new Promise<void>((r) => {
+  _gardssalgContentRefreshResolve = r;
+});
+
+(async () => {
+  // Serialize after the prior DB-mutating async block (also swaps the
+  // experiences db-factory singleton) — same reasoning as that block's own
+  // "Run after the prior DB-mutating IIFE" comment.
+  try { await _orchPrDedupBackfillEndpointPromise; } catch { /* upstream */ }
+
+  const prevPathGCR = process.env.EXPERIENCES_DB_PATH;
+  const prevAdminKeyGCR = process.env.ADMIN_KEY;
+  let serverGCR: import("http").Server | null = null;
+  try {
+    process.env.EXPERIENCES_DB_PATH = ":memory:";
+
+    const dbFactoryPathGCR = require.resolve("../src/database/db-factory");
+    const expStorePathGCR = require.resolve("../src/services/experience-store");
+    const opplevelserPathGCR = require.resolve("../src/routes/opplevelser");
+    delete require.cache[dbFactoryPathGCR];
+    delete require.cache[expStorePathGCR];
+    delete require.cache[opplevelserPathGCR];
+
+    const dbFactoryGCR = require("../src/database/db-factory") as typeof import("../src/database/db-factory");
+    dbFactoryGCR.__resetDbFactoryForTesting();
+    const expStoreGCR = require("../src/services/experience-store") as typeof import("../src/services/experience-store");
+    const opplevelserGCR = require("../src/routes/opplevelser") as { default: import("express").Router };
+
+    const dbGCR = dbFactoryGCR.getDb("experiences");
+
+    // ── Seed A: a LOCKED gårdssalg provider (content_source='manual') — its
+    // hjemmeside is a normal-looking URL that would (if this route ever
+    // reached the fetch stage for it) attempt a real network call, but the
+    // lock check must short-circuit BEFORE that ever happens.
+    const lockedIdGCR = expStoreGCR.createProvider({
+      navn: "Låst Bryggeri", org_nr: "911000111",
+      fylke: "Vestland", kommune: "Voss",
+      hjemmeside: "https://locked-brewery.example.no",
+    });
+    dbGCR.prepare("UPDATE experience_providers SET producer_type = ?, content_source = ? WHERE id = ?")
+      .run("bryggeri", "manual", lockedIdGCR);
+
+    // ── Seed B: an UNLOCKED gårdssalg provider whose hjemmeside is a URL
+    // isSafeFetchUrl() rejects outright (localhost) — its fetch fails FAST
+    // (no real network, no timeout wait), landing in `errors`.
+    const unlockedIdGCR = expStoreGCR.createProvider({
+      navn: "Ustabil Sideri", org_nr: "911000222",
+      fylke: "Vestland", kommune: "Voss",
+      hjemmeside: "http://localhost/",
+    });
+    dbGCR.prepare("UPDATE experience_providers SET producer_type = ? WHERE id = ?")
+      .run("sideri", unlockedIdGCR);
+
+    // ── Mount the REAL router on a minimal Express app. ────────────────
+    const expressModGCR = (await import("express")).default;
+    const appGCR = expressModGCR();
+    appGCR.use(expressModGCR.json());
+
+    const httpModGCR = await import("http");
+    serverGCR = httpModGCR.createServer(appGCR);
+    await new Promise<void>((resolve) => serverGCR!.listen(0, "127.0.0.1", () => resolve()));
+    const addrGCR = serverGCR.address();
+    const portGCR = typeof addrGCR === "object" && addrGCR ? addrGCR.port : 0;
+
+    const ADMIN_KEY_GCR = "gardssalg-content-refresh-test-admin-key";
+    process.env.ADMIN_KEY = ADMIN_KEY_GCR;
+    appGCR.use("/api/opplevelser/admin", (_req, _res, next) => {
+      process.env.ADMIN_KEY = ADMIN_KEY_GCR;
+      next();
+    });
+    appGCR.use("/api/opplevelser", opplevelserGCR.default);
+
+    function gcrReq(body: Record<string, unknown>, key?: string): Promise<{ status: number; body: any }> {
+      const payload = JSON.stringify(body);
+      const headers: Record<string, string> = {
+        "content-type": "application/json",
+        "content-length": String(Buffer.byteLength(payload)),
+      };
+      if (key !== undefined) headers["x-admin-key"] = key;
+      return new Promise((resolve, reject) => {
+        const r = httpModGCR.request(
+          {
+            method: "POST", host: "127.0.0.1", port: portGCR,
+            path: "/api/opplevelser/admin/gardssalg-content-refresh",
+            headers,
+          },
+          (resp) => {
+            const chunks: Buffer[] = [];
+            resp.on("data", (c) => chunks.push(c as Buffer));
+            resp.on("end", () => {
+              const raw = Buffer.concat(chunks).toString("utf8");
+              let parsed: any = null;
+              try { parsed = raw ? JSON.parse(raw) : null; } catch { parsed = { _raw: raw }; }
+              resolve({ status: resp.statusCode || 0, body: parsed });
+            });
+          }
+        );
+        r.on("error", reject);
+        r.write(payload);
+        r.end();
+      });
+    }
+
+    const attemptAtOf = (id: string): string | null =>
+      (dbGCR.prepare("SELECT last_content_attempt_at FROM experience_providers WHERE id = ?").get(id) as
+        | { last_content_attempt_at: string | null }
+        | undefined)?.last_content_attempt_at ?? null;
+
+    // ── gcr-1/2: admin gate. ─────────────────────────────────────────
+    {
+      const r = await gcrReq({ providerIds: [lockedIdGCR], apply: true });
+      assertEq(r.status, 403, "gcr-1: missing X-Admin-Key → 403");
+    }
+    {
+      const r = await gcrReq({ providerIds: [lockedIdGCR], apply: true }, "wrong-key");
+      assertEq(r.status, 403, "gcr-2: wrong X-Admin-Key → 403");
+    }
+    assertEq(attemptAtOf(lockedIdGCR), null, "gcr-2b: pre-call, locked provider has no attempt timestamp yet");
+
+    // ── gcr-3: apply=1 on the LOCKED provider (via providerIds override) →
+    // skipped_locked, no fetch, no error, response shape sane. ──────────
+    {
+      const r = await gcrReq({ providerIds: [lockedIdGCR], apply: true }, ADMIN_KEY_GCR);
+      assertEq(r.status, 200, "gcr-3a: correct X-Admin-Key + apply → 200");
+      assertEq(r.body.dry_run, false, "gcr-3b: dry_run: false when apply=true");
+      assertEq(r.body.scanned, 0, "gcr-3c: scanned: 0 — locked provider never reaches the fetch stage");
+      assertTrue(Array.isArray(r.body.skipped_locked) && r.body.skipped_locked.includes(lockedIdGCR),
+        "gcr-3d: skipped_locked includes the locked provider's id");
+      assertEq(r.body.changed.length, 0, "gcr-3e: changed: [] — nothing written for a locked provider");
+      assertEq(r.body.errors.length, 0, "gcr-3f: errors: [] — the lock check short-circuits before any fetch, so no fetch error either");
+      assertTrue(
+        typeof r.body.by_field === "object" &&
+        "about_text" in r.body.by_field && "visit_text" in r.body.by_field && "opening_hours_text" in r.body.by_field,
+        "gcr-3g: by_field carries the three gårdssalg content keys"
+      );
+    }
+
+    // ── gcr-4: apply mode stamps last_content_attempt_at UNCONDITIONALLY,
+    // even for a locked provider (same "cycle to the back of the queue on any
+    // outcome" discipline as the experiences-table route). ──────────────
+    const stampedAtGCR = attemptAtOf(lockedIdGCR);
+    assertTrue(!!stampedAtGCR, "gcr-4: locked provider's last_content_attempt_at is now set after an apply-mode call");
+
+    // ── gcr-5: dry-run (apply omitted) must NOT re-stamp the attempt. ────
+    {
+      const r = await gcrReq({ providerIds: [lockedIdGCR] }, ADMIN_KEY_GCR);
+      assertEq(r.status, 200, "gcr-5a: dry-run call → 200");
+      assertEq(r.body.dry_run, true, "gcr-5b: dry_run: true when apply is omitted");
+      assertTrue(Array.isArray(r.body.skipped_locked) && r.body.skipped_locked.includes(lockedIdGCR),
+        "gcr-5c: dry-run still reports the locked provider as skipped_locked");
+    }
+    assertEq(attemptAtOf(lockedIdGCR), stampedAtGCR, "gcr-5d: dry-run does NOT change last_content_attempt_at (stays at its apply-mode value)");
+
+    // ── gcr-6/7: apply=1 on the UNLOCKED provider whose hjemmeside is
+    // rejected by isSafeFetchUrl (localhost) — fetch fails fast, lands in
+    // errors, is NOT counted as scanned, and still gets its attempt stamped.
+    assertEq(attemptAtOf(unlockedIdGCR), null, "gcr-6a: pre-call, unlocked provider has no attempt timestamp yet");
+    {
+      const r = await gcrReq({ providerIds: [unlockedIdGCR], apply: true }, ADMIN_KEY_GCR);
+      assertEq(r.status, 200, "gcr-6b: apply call on the unlocked provider → 200");
+      assertEq(r.body.scanned, 0, "gcr-6c: scanned: 0 — the fetch never succeeds");
+      assertEq(r.body.skipped_locked.length, 0, "gcr-6d: skipped_locked: [] — this provider is NOT locked");
+      assertEq(r.body.changed.length, 0, "gcr-6e: changed: [] — nothing to write without a successful fetch");
+      assertTrue(Array.isArray(r.body.errors) && r.body.errors.length === 1 && r.body.errors[0].provider_id === unlockedIdGCR,
+        "gcr-6f: errors carries exactly one entry for the unreachable-by-design hjemmeside");
+    }
+    assertTrue(!!attemptAtOf(unlockedIdGCR), "gcr-7: unlocked provider's last_content_attempt_at is also stamped in apply mode (unconditional, before the fetch)");
+
+    // ── gcr-8: providerIds override with an unknown id → resolves to no
+    // targets (getGardssalgProviderContentTarget returns null), NOT a crash —
+    // an empty, well-shaped 200 response. ───────────────────────────────
+    {
+      const r = await gcrReq({ providerIds: ["does-not-exist"], apply: true }, ADMIN_KEY_GCR);
+      assertEq(r.status, 200, "gcr-8a: unknown providerId → 200 (no crash)");
+      assertEq(r.body.scanned, 0, "gcr-8b: scanned: 0");
+      assertEq(r.body.changed.length, 0, "gcr-8c: changed: []");
+      assertEq(r.body.errors.length, 0, "gcr-8d: errors: [] — an unresolvable id is silently filtered out of targets, not treated as a fetch error");
+    }
+
+    // ── gcr-9: auto-select (no providerIds) excludes the LOCKED provider —
+    // only the unlocked one is eligible, so it (not the locked one) is the
+    // one that ends up in errors after its (fast, local) fetch fails. ───
+    {
+      const r = await gcrReq({ apply: true, limit: 10 }, ADMIN_KEY_GCR);
+      assertEq(r.status, 200, "gcr-9a: auto-select apply call → 200");
+      assertTrue(!r.body.skipped_locked.includes(lockedIdGCR), "gcr-9b: auto-select never even selects the locked provider (excluded by the WHERE clause, not filtered post-hoc)");
+      assertTrue(r.body.errors.some((e: any) => e.provider_id === unlockedIdGCR),
+        "gcr-9c: auto-select picks up the unlocked provider, whose fetch still fails fast");
+    }
+
+    dbFactoryGCR.__resetDbFactoryForTesting();
+  } catch (err) {
+    failed++;
+    failures.push("gardssalg-content-refresh: unexpected error: " + String(err));
+  } finally {
+    if (serverGCR) {
+      await new Promise<void>((resolve) => serverGCR!.close(() => resolve()));
+    }
+    if (prevPathGCR === undefined) delete process.env.EXPERIENCES_DB_PATH;
+    else process.env.EXPERIENCES_DB_PATH = prevPathGCR;
+    if (prevAdminKeyGCR === undefined) delete process.env.ADMIN_KEY;
+    else process.env.ADMIN_KEY = prevAdminKeyGCR;
+    console.log("  gardssalg-content-refresh: OK (auth-gate, lock-check-before-fetch, apply-vs-dry-run attempt stamping, providerIds override, auto-select exclusion)");
+    _gardssalgContentRefreshResolve();
+  }
 })();
 
 // ── orch-pr-20260704 tasks-prune-async: background job for /ops/tasks-prune

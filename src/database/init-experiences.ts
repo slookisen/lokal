@@ -358,5 +358,31 @@ export function initExperiencesSchema(db: Database.Database): void {
     try { db.exec(stmt); } catch { /* already present */ }
   }
 
+  // ─── Gårdssalg content-enrichment columns (dev-request 2026-07-03-gardssalg-
+  // rike-profiler-bilder-agentbooking, Fase 1 item 3, 2026-07-10) ─────────────
+  // Additive columns for the multi-page-crawl enrichment slice that fills real
+  // per-producer "Om produsenten" / "Besøket" / opening-hours copy on
+  // GET /kategori/gardssalg/produsent/:providerSlug (PR #135), replacing the
+  // generic, type-general placeholder documented in that route's comment block
+  // until now. content_source mirrors the EXACT convention already used on the
+  // `experiences` table (see applyExperienceContent / isExperienceContentLocked
+  // in experience-store.ts and the lock-check in routes/opplevelser.ts ~line
+  // 615): 'provider_site' = auto-filled by this crawl; 'manual'/'claim' =
+  // locked, human/owner-authored, never auto-overwritten. last_content_attempt_at
+  // (added above, 2026-07-05) is REUSED as-is for this slice's attempt
+  // tracking via markProviderContentAttempted() — no new attempt-tracking
+  // column here.
+  const gardssalgContentCols = [
+    "ALTER TABLE experience_providers ADD COLUMN about_text TEXT",
+    "ALTER TABLE experience_providers ADD COLUMN visit_text TEXT",
+    "ALTER TABLE experience_providers ADD COLUMN opening_hours_text TEXT",
+    "ALTER TABLE experience_providers ADD COLUMN content_source TEXT",
+    "ALTER TABLE experience_providers ADD COLUMN content_evidence_url TEXT",
+    "ALTER TABLE experience_providers ADD COLUMN content_updated_at TEXT",
+  ];
+  for (const stmt of gardssalgContentCols) {
+    try { db.exec(stmt); } catch { /* already present */ }
+  }
+
   console.log("[experiences] schema initialized");
 }

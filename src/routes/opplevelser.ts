@@ -34,6 +34,12 @@ import {
   markProviderEnriched,
   markProviderContentAttempted,
   type ContentRefreshTarget,
+  // dev-request 2026-07-03-gardssalg-rike-profiler-bilder-agentbooking, Fase 1
+  // item 3 — multi-page-crawl content enrichment (about/visit/opening-hours)
+  selectGardssalgProvidersForContentRefresh,
+  getGardssalgProviderContentTarget,
+  applyGardssalgProviderContent,
+  type GardssalgContentRefreshTarget,
   // dev-request 2026-07-04-opplevagent-dedup-og-norske-titler, item 1 —
   // re-harvest guard (never insert/resurrect a duplicate already known/merged)
   findExistingExperienceMatch,
@@ -60,6 +66,9 @@ import {
   extractIndoorOutdoor,
   extractActivityTags,
   extractBookingUrl,
+  // gårdssalg multi-page-crawl content enrichment (Fase 1 item 3)
+  summarizeVisit,
+  extractOpeningHours,
 } from "../services/search-enrich";
 import { classifyProvider, sleep, BrregClass } from "../services/experience-brreg";
 import {
@@ -665,6 +674,233 @@ router.post("/admin/content-refresh", requireAdmin, async (req: Request, res: Re
   }
 
   // Bounded concurrency for the network fetches.
+  for (let i = 0; i < targets.length; i += CR_CONCURRENCY) {
+    const slice = targets.slice(i, i + CR_CONCURRENCY);
+    await Promise.all(slice.map((t) => processOne(t)));
+  }
+
+  res.json({
+    dry_run: dryRun,
+    scanned,
+    by_field: byField,
+    changed,
+    skipped_locked: skippedLocked,
+    errors,
+  });
+});
+
+// ─── POST /api/opplevelser/admin/gardssalg-content-refresh (admin) ──────────
+//
+// dev-request 2026-07-03-gardssalg-rike-profiler-bilder-agentbooking, Fase 1
+// item 3 (2026-07-10). The multi-page-crawl enrichment slice referenced by the
+// comment above GET /kategori/gardssalg/produsent/:providerSlug (PR #135):
+// that route's "Om produsenten"/"Besøket" sections render generic,
+// type-general placeholder copy "until the separate multi-page-crawl
+// enrichment slice fills real per-producer copy" — this is that slice.
+//
+// For targeted/auto-selected gårdssalg providers WITH a website, this fetches
+// the homepage + up to 4 gårdssalg-specific sub-pages (om-oss/besøk/smaking/
+// kontakt/åpningstider — capped at 5 total page-fetches per producer, the
+// "~5 sider" cap from the dev-request), runs summarizeAbout (reused from the
+// existing content-refresh route) + the new summarizeVisit/extractOpeningHours
+// extractors, and writes about_text/visit_text/opening_hours_text onto
+// experience_providers through the SAME thin-field + lock discipline as every
+// other content writer in this file (see applyExperienceContent's doc
+// comment). Dry-run by default; apply=1 writes.
+//
+// SAFETY: writes ONLY about_text/visit_text/opening_hours_text +
+// content_source/content_evidence_url/content_updated_at on
+// experience_providers. NEVER touches contact/orgnr/Brreg-verification
+// fields; never overwrites a manual/claim-locked provider; only fills THIN
+// (empty) fields. Reuses the same SSRF guard + extractors as
+// /admin/content-refresh. Auth: same X-Admin-Key (requireAdmin).
+//
+// The lock check (content_source manual/claim) is deliberately done from the
+// TARGET row's own snapshot — BEFORE any fetch is attempted — rather than
+// after (unlike the experiences-table route above, which can only know a
+// sub-row is locked after loading its experiences). This lets a locked
+// gårdssalg provider short-circuit to skipped_locked without ever touching
+// the network, which is also what makes the lock-check path deterministically
+// testable without live network access.
+//
+// NB: MUST come before "/:id" so "admin" isn't swallowed as an id param.
+
+// Gårdssalg-specific candidate sub-pages — a bigger list than CR_CONTENT_PATHS
+// because these producers' useful content (visit/tasting/hours) tends to live
+// on dedicated sub-pages rather than the homepage itself. crFetchGardssalgContent
+// stops once it has fetched 5 pages total (homepage + up to 4 of these), not
+// all 10 — bounding requests per producer to the dev-request's "~5 sider" cap.
+const GARDSSALG_CONTENT_PATHS: readonly string[] = [
+  "/om-oss", "/om", "/besok", "/besøk", "/smaking",
+  "/smaksprover", "/smaksprøver", "/kontakt", "/apningstider", "/åpningstider",
+];
+const GARDSSALG_MAX_PAGES = 5; // homepage + up to 4 sub-pages
+
+/**
+ * Fetch a gårdssalg provider's homepage + up to 4 of its content sub-pages
+ * (GARDSSALG_CONTENT_PATHS), concatenated, stopping once 5 pages total have
+ * been successfully fetched. Same shape/contract as crFetchHomepageContent:
+ * the primary page's HTML is returned first (so summarizeAbout's og/meta
+ * lookups hit the homepage), with sub-page HTML appended for the
+ * visit/opening-hours scans. Returns null only if the primary homepage cannot
+ * be fetched. A 404/failure on any candidate sub-page costs nothing extra —
+ * crFetchHtml already returns null on any failure, so it's just skipped.
+ */
+async function crFetchGardssalgContent(
+  homepageUrl: string
+): Promise<{ primaryHtml: string; combinedHtml: string; fetchUrl: string } | null> {
+  const fetchUrl = /^https?:\/\//i.test(homepageUrl) ? homepageUrl : `https://${homepageUrl}`;
+  const primaryHtml = await crFetchHtml(fetchUrl);
+  if (primaryHtml === null) return null;
+  let combinedHtml = primaryHtml;
+  let pagesFetched = 1;
+  try {
+    const u = new URL(fetchUrl);
+    const base = `${u.protocol}//${u.host}`;
+    for (const path of GARDSSALG_CONTENT_PATHS) {
+      if (pagesFetched >= GARDSSALG_MAX_PAGES) break;
+      const sub = await crFetchHtml(`${base}${path}`);
+      if (sub) {
+        combinedHtml += "\n" + sub;
+        pagesFetched++;
+      }
+    }
+  } catch {
+    /* malformed URL — primary homepage content still stands */
+  }
+  return { primaryHtml, combinedHtml, fetchUrl };
+}
+
+const GS_CR_DEFAULT_LIMIT = 25;
+const GS_CR_HARD_CAP = 48; // there are only 48 gårdssalg providers total
+
+router.post("/admin/gardssalg-content-refresh", requireAdmin, async (req: Request, res: Response) => {
+  const body = (req.body ?? {}) as { providerIds?: unknown; limit?: unknown; apply?: unknown };
+
+  // apply: dry-run by default. apply=1/"1"/true (body) or ?apply=1.
+  const apply =
+    body.apply === true ||
+    body.apply === 1 ||
+    body.apply === "1" ||
+    body.apply === "true" ||
+    req.query?.apply === "1" ||
+    req.query?.apply === "true";
+  const dryRun = !apply;
+
+  // limit: default 25, hard cap 48 (Math.min mirrors CR_HARD_CAP's role, but
+  // scoped to this vertical's real ceiling).
+  const limit = Math.min(
+    typeof body.limit === "number" && body.limit > 0 ? Math.floor(body.limit) : GS_CR_DEFAULT_LIMIT,
+    GS_CR_HARD_CAP
+  );
+
+  // ── Target selection ──────────────────────────────────────────────
+  let targets: GardssalgContentRefreshTarget[];
+  if (Array.isArray(body.providerIds) && body.providerIds.length > 0) {
+    const ids = (body.providerIds as unknown[])
+      .filter((id): id is string => typeof id === "string" && id.trim().length > 0)
+      .map((id) => id.trim())
+      .slice(0, limit);
+    targets = ids
+      .map((id) => getGardssalgProviderContentTarget(id))
+      .filter((t): t is GardssalgContentRefreshTarget => t !== null);
+  } else {
+    targets = selectGardssalgProvidersForContentRefresh(limit);
+  }
+
+  let scanned = 0;
+  const byField: Record<string, number> = { about_text: 0, visit_text: 0, opening_hours_text: 0 };
+  type GsProvenanceMap = Record<string, { source_url: string; snippet: string | null }>;
+  const changed: Array<{ provider_id: string; fields: string[]; provenance: GsProvenanceMap }> = [];
+  const skippedLocked: string[] = [];
+  const errors: Array<{ provider_id: string; error: string }> = [];
+
+  async function processOne(t: GardssalgContentRefreshTarget): Promise<void> {
+    const providerId = t.id;
+
+    // Stamp the attempt UNCONDITIONALLY (apply mode only) before doing any
+    // fetch/extraction work — same "cycle to the back of the queue on any
+    // outcome" reasoning as the experiences-table route above (see
+    // markProviderContentAttempted's doc comment).
+    if (apply) {
+      try { markProviderContentAttempted(providerId); } catch { /* best-effort */ }
+    }
+
+    // LOCK check — from the target's own row snapshot, BEFORE any fetch, so a
+    // locked provider never touches the network at all.
+    if (t.content_source === "manual" || t.content_source === "claim") {
+      skippedLocked.push(providerId);
+      return;
+    }
+
+    // Fetch homepage + gårdssalg sub-pages server-side (SSRF-guarded).
+    let fetched: { primaryHtml: string; combinedHtml: string; fetchUrl: string } | null;
+    try {
+      fetched = await crFetchGardssalgContent(t.hjemmeside);
+    } catch (e: any) {
+      errors.push({ provider_id: providerId, error: e?.message ?? String(e) });
+      return;
+    }
+    if (!fetched) {
+      errors.push({ provider_id: providerId, error: `fetch_failed for ${t.hjemmeside}` });
+      return;
+    }
+    scanned++;
+    const { primaryHtml, combinedHtml } = fetched;
+
+    // ── Extract content ─────────────────────────────────────────────
+    const contentText = extractVisibleText(combinedHtml);
+    const aboutSummary = summarizeAbout(primaryHtml);
+    const visitSummary = summarizeVisit(combinedHtml);
+    const hoursSnippet = extractOpeningHours(contentText);
+
+    const candidateAbout = meetsAboutQualityBar(aboutSummary) ? aboutSummary : null;
+    const candidateVisit = meetsAboutQualityBar(visitSummary) ? visitSummary : null;
+    const candidateHours = hoursSnippet && hoursSnippet.trim() ? hoursSnippet : null;
+
+    const provenance: GsProvenanceMap = {};
+    if (candidateAbout) provenance.about_text = { source_url: fetched.fetchUrl, snippet: candidateAbout.slice(0, 120) };
+    if (candidateVisit) provenance.visit_text = { source_url: fetched.fetchUrl, snippet: candidateVisit.slice(0, 120) };
+    if (candidateHours) provenance.opening_hours_text = { source_url: fetched.fetchUrl, snippet: candidateHours };
+
+    function isBlank(v: unknown): boolean {
+      return v === null || v === undefined || String(v).trim() === "";
+    }
+
+    // THIN-FIELD check against the target's own snapshot (taken at selection
+    // time, before any write in this run) — used for the dry-run projection.
+    const wouldWrite: string[] = [];
+    if (candidateAbout && isBlank(t.about_text)) wouldWrite.push("about_text");
+    if (candidateVisit && isBlank(t.visit_text)) wouldWrite.push("visit_text");
+    if (candidateHours && isBlank(t.opening_hours_text)) wouldWrite.push("opening_hours_text");
+
+    if (wouldWrite.length === 0) return;
+
+    if (dryRun) {
+      for (const f of wouldWrite) if (f in byField) byField[f] += 1;
+      changed.push({ provider_id: providerId, fields: wouldWrite, provenance });
+    } else {
+      try {
+        const written = applyGardssalgProviderContent(
+          providerId,
+          {
+            about_text: candidateAbout ?? undefined,
+            visit_text: candidateVisit ?? undefined,
+            opening_hours_text: candidateHours ?? undefined,
+          },
+          fetched.fetchUrl
+        );
+        if (written.length > 0) {
+          for (const f of written) if (f in byField) byField[f] += 1;
+          changed.push({ provider_id: providerId, fields: written, provenance });
+        }
+      } catch (e: any) {
+        errors.push({ provider_id: providerId, error: `write_failed: ${e?.message ?? String(e)}` });
+      }
+    }
+  }
+
+  // Bounded concurrency for the network fetches (reuses CR_CONCURRENCY).
   for (let i = 0; i < targets.length; i += CR_CONCURRENCY) {
     const slice = targets.slice(i, i + CR_CONCURRENCY);
     await Promise.all(slice.map((t) => processOne(t)));
