@@ -993,9 +993,59 @@ const NAV_BOILERPLATE_MARKERS: readonly string[] = [
   "top of page", "skip to content", "hopp til innhold", "til toppen",
 ];
 
+// Phrases a producer's OWN about/visit text would never use about itself — they
+// only show up when the candidate text was actually scraped from a REGIONAL
+// TOURISM-ASSOCIATION / UMBRELLA-PORTAL page describing its many member
+// businesses collectively ("våre medlemmer" = "our members"). This is a
+// wrong-ENTITY bug, not a formatting one: the prose can be perfectly
+// grammatical, punctuated, on-topic Norwegian and still be about the wrong
+// business. round-2 (2026-07-11): found via a live production dry-run
+// resample (an "Opplev Norge"-style regional portal's "our members offer
+// everything from farm shops to cosy lodging..." copy was about to overwrite a
+// specific farm-sales producer's visit_text). Accent-stripped, lowercase
+// substrings, same convention as GENERIC_ABOUT_MARKERS above.
+const UMBRELLA_MEMBERSHIP_MARKERS: readonly string[] = [
+  "vare medlemmer", "medlemsbedrift", "medlemmene", "medlemsvirksomhetene",
+];
+
+// Small, curated set of words that show up in genuine descriptive SENTENCES
+// (finite verbs + first/second-person pronouns) but essentially never in a
+// flat scraped <nav>/category list, which is just proper/common nouns strung
+// together (optionally glued with "og"). Accent-stripped, lowercase, whole
+// tokens (not substrings — "vaare" must not match inside an unrelated longer
+// word). Used by isLikelyNavMenuLeakage's flat-menu-density signal below.
+//
+// round-2 fix-up (2026-07-11, review CHANGES-REQUESTED): the original list was
+// all ACTIVE-voice verbs/pronouns ("selger" but not "selges"), so it silently
+// over-rejected genuine single-sentence Norwegian producer copy that (a) opens
+// with a Title-Case list of branded regional products — common for Norwegian
+// farm/dairy marketing, e.g. "Nordfjord Ost Sunnmøre Smør ... produseres her på
+// garden hver eneste dag" — and (b) uses PASSIVE voice, which Norwegian
+// marketing/product copy uses constantly ("X produseres/lages/selges her").
+// Added the common passive-voice verb forms plus a few prepositions that are
+// near-universal in real sentences but don't independently glue a flat noun
+// list the way "og" does (deliberately still NOT adding "og" itself — nav
+// lists routinely use it exactly as a glue word, see comment above; and
+// deliberately not adding "til"/"i" for the same over-broad-glue-word reason).
+const REAL_PROSE_SIGNAL_WORDS: ReadonlySet<string> = new Set([
+  "vi", "du", "deg", "var", "vare", "er", "har", "tilbyr", "finner",
+  "ligger", "kan", "selger", "byr", "velkommen",
+  // passive-voice verb forms (round-2 fix-up)
+  "produseres", "lages", "selges", "dyrkes", "hostes", "serveres", "finnes",
+  // NOTE (round-2 fix-up-2, 2026-07-11): "på"/"fra"/"med" were added here in
+  // fix-up-1 as a "common prepositions are near-universal in real sentences"
+  // signal, but that's exactly backwards for THIS check — these 3 short
+  // prepositions are just as near-ubiquitous in scraped Norwegian nav/footer
+  // CHROME ("Følg Oss På Facebook", "Levering Fra 49", "Betal Med Vipps") as
+  // in real prose, so they silently defeated signal 3 for genuine nav-menu
+  // leakage. Deliberately NOT re-added — the passive-voice verbs above are
+  // sufficient (verified: the round-1 "produseres" example still passes on
+  // that verb alone; nothing else in the suite depended on the prepositions).
+]);
+
 /**
  * Detects candidate text that is actually leaked NAVIGATION-MENU markup rather
- * than real venue prose. Two independent signals, either is disqualifying:
+ * than real venue prose. Four independent signals, any one is disqualifying:
  *
  *   1. A "numbered menu list" pattern — several short items each led by a 1-2
  *      digit index immediately followed by a capitalized word, e.g.
@@ -1014,6 +1064,30 @@ const NAV_BOILERPLATE_MARKERS: readonly string[] = [
  *      all, e.g. "--> HEIM | Lofthus sideri ... HEIM JUICE SIDER OM OSS". Real
  *      prose — even prose that mentions a "meny" (menu) of food items — is
  *      written in sentences and will contain at least one '.', '!' or '?'.
+ *   3. A "flat menu list" that doesn't use numbers OR pipes/arrows at all —
+ *      just a run of short Title-Case nouns space-separated (a rendered
+ *      horizontal/e-commerce nav bar, e.g. "Harstad Bryggeri Cart Bryggeriet
+ *      Ølet Omvisning Nyheter Kontakt Merch") or interrupted only by a stray
+ *      language-switcher token ("no en"). Structural signal: at least half the
+ *      alphabetic tokens are Title-Case, at most one sentence-ending mark, AND
+ *      none of REAL_PROSE_SIGNAL_WORDS (a finite/passive verb or personal
+ *      pronoun — deliberately NOT bare prepositions like "på"/"fra"/"med",
+ *      which are just as common in nav/footer chrome as in real prose, see
+ *      round-2 fix-up-2) is present — genuine prose almost always has at
+ *      least one, a flat noun list never does. This deliberately covers
+ *      passive-voice product copy too (round-2 fix-up, 2026-07-11): a single
+ *      grammatical sentence that opens with a Title-Case list of branded
+ *      regional products — common Norwegian farm/dairy marketing, e.g.
+ *      "Nordfjord Ost Sunnmøre Smør ... produseres her på garden hver eneste
+ *      dag" — is real prose, not nav-menu leakage, even though most of its
+ *      tokens are proper nouns (it's caught by "produseres", not "på").
+ *      Requires ≥8 alphabetic tokens so short strings can't trip it.
+ *   4. A literal repeated phrase — a ≥24-char chunk of the text that recurs
+ *      verbatim later in the same string, e.g. a breadcrumb/tagline the
+ *      scraper duplicated ("besøk | Ekeby Gårdsbryggeri besøk | Ekeby
+ *      Gårdsbryggeri ...") or a repeated tagline around a language-switcher
+ *      token. Real venue prose doesn't repeat a 24+ character clause
+ *      verbatim; duplicated breadcrumbs/taglines are a known scraper artifact.
  *
  * PURE, no network/IO.
  */
@@ -1028,6 +1102,46 @@ function isLikelyNavMenuLeakage(trimmed: string): boolean {
   const separatorMatches = trimmed.match(/-->|->|\|/g) || [];
   if (separatorMatches.length >= 3 && sentenceEnders.length === 0) return true;
 
+  // Signal 3: flat, unpunctuated run of short Title-Case tokens with no
+  // finite-verb/pronoun signal of real sentence structure.
+  const alphaTokens = trimmed
+    .split(/\s+/)
+    .map((t) => t.replace(/^[^\p{L}]+|[^\p{L}]+$/gu, ""))
+    .filter((t) => t.length >= 2 && /\p{L}/u.test(t));
+  if (alphaTokens.length >= 8) {
+    const capTokenCount = alphaTokens.filter((t) => /^[A-ZÆØÅ]/.test(t)).length;
+    const capRatio = capTokenCount / alphaTokens.length;
+    const hasRealProseSignal = alphaTokens.some((t) =>
+      REAL_PROSE_SIGNAL_WORDS.has(stripNorwegianAccents(t.toLowerCase()))
+    );
+    if (capRatio >= 0.5 && sentenceEnders.length <= 1 && !hasRealProseSignal) return true;
+  }
+
+  // Signal 4: a ≥24-char chunk of the text repeated verbatim later on.
+  if (hasVerbatimRepeatedPhrase(trimmed)) return true;
+
+  return false;
+}
+
+/**
+ * True if some ≥minLen-character chunk of `trimmed` (accent/case-normalized)
+ * occurs again later in the same string — a duplicated breadcrumb/tagline
+ * scrapers sometimes glue in twice, e.g. "besøk | Ekeby Gårdsbryggeri besøk |
+ * Ekeby Gårdsbryggeri An immersive digital experience...". 24 chars is roughly
+ * one short clause — long enough that ordinary Norwegian prose (which doesn't
+ * repeat a whole clause verbatim) won't collide by chance, short enough to
+ * catch a repeated short breadcrumb/tagline. O(n²) but candidate texts here
+ * are homepage-summary length (well under 1000 chars), so this is cheap.
+ * PURE, no network/IO.
+ */
+function hasVerbatimRepeatedPhrase(trimmed: string, minLen = 24): boolean {
+  const normalized = stripNorwegianAccents(trimmed.toLowerCase());
+  if (normalized.length < minLen * 2) return false;
+  for (let i = 0; i + minLen <= normalized.length; i++) {
+    const chunk = normalized.slice(i, i + minLen);
+    if (!/[a-z]/.test(chunk)) continue; // skip windows with no letters at all
+    if (normalized.indexOf(chunk, i + minLen) !== -1) return true;
+  }
   return false;
 }
 
@@ -1051,18 +1165,24 @@ const NORWEGIAN_WORD_MARKERS: readonly string[] = [
  *     word (rejects an English cookie/marketing snippet),
  *   - is NOT dominated by generic boilerplate (cookie/consent/placeholder),
  *   - is NOT leaked navigation-menu chrome (skip-links/"back to top" anchors,
- *     a numbered-menu-list with too little sentence-ending punctuation to be
- *     real prose, or pipe/arrow-separated menu tokens with NO sentence-ending
- *     punctuation at all — see isLikelyNavMenuLeakage),
+ *     a numbered- or flat-Title-Case-token menu list with too little
+ *     sentence-ending punctuation to be real prose, pipe/arrow-separated menu
+ *     tokens with NO sentence-ending punctuation at all, or a verbatim
+ *     repeated breadcrumb/tagline phrase — see isLikelyNavMenuLeakage),
+ *   - is NOT describing an UMBRELLA/tourism-association's members collectively
+ *     ("våre medlemmer" etc.) rather than this one producer — a wrong-ENTITY
+ *     bug that can otherwise slip past every other check because the prose
+ *     itself is perfectly grammatical, punctuated, real Norwegian (round-2,
+ *     2026-07-11 — see UMBRELLA_MEMBERSHIP_MARKERS doc comment),
  *   - does NOT contain the Unicode replacement character (U+FFFD, "�") — a
  *     candidate with a "�" was mangled upstream (most likely a byte-level cut
  *     through a multi-byte UTF-8 character, e.g. mid æ/ø/å) and must never be
  *     written as a producer's public description (customer-reported bug:
  *     Olestølen Mikroysteri's meta description ended "...opplevelser p�").
  *
- * Returns false for empty/short/foreign/boilerplate/mangled text so the caller
- * keeps the existing value (blank or stale beats wrong or broken). minLen is
- * overridable for tests.
+ * Returns false for empty/short/foreign/boilerplate/mangled/wrong-entity text
+ * so the caller keeps the existing value (blank or stale beats wrong or
+ * broken). minLen is overridable for tests.
  */
 export function meetsAboutQualityBar(text: string | null | undefined, minLen = 80): boolean {
   if (!text) return false;
@@ -1082,13 +1202,19 @@ export function meetsAboutQualityBar(text: string | null | undefined, minLen = 8
   }
 
   // Reject nav-chrome markers (skip-links, "back to top" anchors) and the
-  // numbered/pipe-separated MENU shapes those pages render as (see
+  // numbered/pipe-separated/flat-token MENU shapes those pages render as (see
   // isLikelyNavMenuLeakage doc comment) — leakage from the site's <nav>, not
   // real venue prose.
   for (const marker of NAV_BOILERPLATE_MARKERS) {
     if (lowerAscii.includes(marker)) return false;
   }
   if (isLikelyNavMenuLeakage(trimmed)) return false;
+
+  // Reject umbrella/tourism-association "our members" language — real prose,
+  // wrong entity (see UMBRELLA_MEMBERSHIP_MARKERS doc comment).
+  for (const marker of UMBRELLA_MEMBERSHIP_MARKERS) {
+    if (lowerAscii.includes(marker)) return false;
+  }
 
   // Must look Norwegian: an æ/ø/å letter, OR a common Norwegian function word.
   // (Pad with spaces so word-markers match at the string edges too.)

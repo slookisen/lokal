@@ -491,6 +491,177 @@ export function runSearchEnrichTests(opts: { log?: boolean } = {}): TestSummary 
       meetsAboutQualityBar(realWithOpeningHoursList),
       "quality: real prose with inline opening-hours numbered list still passes"
     );
+
+    // ── round-2 (2026-07-11): found via a live production dry-run resample of
+    // gardssalg-content-refresh — ~26% of candidates that passed round-1's
+    // gate were still wrong (target ≤2%). Four concrete real examples that
+    // must now be rejected, none caught by round-1's numbered/pipe-arrow-only
+    // isLikelyNavMenuLeakage checks. ─────────────────────────────────────────
+
+    // Real example 1: a flat, space-separated e-commerce nav bar (no numbers,
+    // no pipes/arrows — round-1 has neither signal to catch this shape).
+    const navFlatMenu =
+      "Harstad Bryggeri Cart 0 Bryggeriet Ølet Omvisning & ølsmaking Nyheter Bryggeriutsalg Kontakt Ølsjappa Merch - Klær og så";
+    assertTrue(!meetsAboutQualityBar(navFlatMenu), "quality: flat Title-Case nav bar (no numbers/pipes) fails");
+
+    // Real example 2: nav chrome with a language-switcher token ("no en") and
+    // a repeated tagline — only ONE "-->", under round-1's ≥3-separator bar.
+    const navLangSwitchDup =
+      "--> Mack – Verdens nordligste bryggeri Besøk oss Verdens nordligste bryggeri no en Om Mack Produkter Bærekraft Mik";
+    assertTrue(!meetsAboutQualityBar(navLangSwitchDup), "quality: single-arrow nav chrome with duplicated tagline fails");
+
+    // Real example 3: the same short breadcrumb phrase repeated back-to-back
+    // by the scraper — only 2 pipes, under round-1's ≥3-separator threshold,
+    // and round-1 never checked for literal duplication at all.
+    const navDuplicatedBreadcrumb =
+      "besøk | Ekeby Gårdsbryggeri besøk | Ekeby Gårdsbryggeri An immersive digital experience for a historic Swedish monastery";
+    assertTrue(!meetsAboutQualityBar(navDuplicatedBreadcrumb), "quality: literally-duplicated breadcrumb phrase fails");
+
+    // Real example 4: a NEW failure mode — genuine, grammatical, punctuated
+    // Norwegian prose that passes every formatting check, but describes a
+    // REGIONAL TOURISM-ASSOCIATION/UMBRELLA PORTAL's member businesses
+    // collectively, not this one specific producer. A wrong-ENTITY bug, not a
+    // formatting bug.
+    const umbrellaAbout =
+      "Opplev Norge Aktiviteter og opplevelser Overnatting Mat- og drikkeprodusenter Gårdsbutikker Servering Møter, kurs og selskaper Fiske og jakt Vandring";
+    assertTrue(!meetsAboutQualityBar(umbrellaAbout), "quality: umbrella-portal dense category listing fails");
+    const umbrellaVisit =
+      "Våre medlemmer tilbyr alt fra sjarmerende gårdsbutikker med lokalprodusert mat, til koselig overnatting i landlige omgivelser og spennende aktiviteter for hele familien.";
+    assertTrue(
+      !meetsAboutQualityBar(umbrellaVisit),
+      "quality: 'våre medlemmer' collective-membership language fails (real prose, wrong entity)"
+    );
+
+    // Regression: round-1's bad examples must STILL reject after the round-2
+    // additions (navNumbered/navPipeArrow/navPipeOnly/navArrowOnly/navSkipLink
+    // above are re-asserted here as an explicit no-regression pin).
+    assertTrue(!meetsAboutQualityBar(navNumbered), "quality (regression): round-1 numbered nav-menu list still fails");
+    assertTrue(
+      !meetsAboutQualityBar(navPipeArrow),
+      "quality (regression): round-1 pipe/arrow nav-menu with 'top of page' marker still fails"
+    );
+    assertTrue(
+      !meetsAboutQualityBar(navPipeOnly),
+      "quality (regression): round-1 pure pipe-separated menu still fails"
+    );
+    assertTrue(
+      !meetsAboutQualityBar(navArrowOnly),
+      "quality (regression): round-1 pure arrow-separated menu still fails"
+    );
+
+    // Regression: legitimate prose with a numeric inline list (opening-hours
+    // style, written as real sentences) must NOT be over-rejected by the new
+    // flat-menu-density / repeated-phrase checks either.
+    assertTrue(
+      meetsAboutQualityBar(realWithOpeningHoursList),
+      "quality (regression): real prose with inline opening-hours list still passes after round-2 additions"
+    );
+    assertTrue(
+      meetsAboutQualityBar(realWithMenu),
+      "quality (regression): real prose mentioning a food 'meny' still passes after round-2 additions"
+    );
+
+    // ── round-2 fix-up (2026-07-11, review CHANGES-REQUESTED): signal 3's
+    // flat-menu-density check over-rejected genuine, grammatical, single-
+    // sentence Norwegian prose that (a) lists several proper-noun
+    // products/places — common Norwegian farm/dairy producer marketing — and
+    // (b) uses PASSIVE voice ("produseres"), which the old REAL_PROSE_SIGNAL_
+    // WORDS allowlist had zero coverage for (only active "selger" was
+    // present). Reviewer's exact reproduced failing example: ─────────────────
+    const reviewerPassiveProductList =
+      "Nordfjord Ost Sunnmøre Smør Stryn Rømme Geiranger Skyr Loen Youghurt Olden Kefir Briksdal Kremfløte og Hjørundfjord Cottage Cheese produseres her på garden hver eneste dag.";
+    assertTrue(
+      meetsAboutQualityBar(reviewerPassiveProductList),
+      "quality: passive-voice sentence with Title-Case product-name list passes (round-2 fix-up)"
+    );
+    // Close variant: different Title-Case product/place list, different
+    // passive verbs ("lages"/"selges" instead of "produseres") — confirms the
+    // fix is a general passive-voice/preposition signal, not overfit to the
+    // one exact reviewer string.
+    const passiveProductListVariant =
+      "Rørosost Fjellgeit Osterød Skinke Tydal Spekemat Selbu Rømmegrøt Aune Multer og Holtålen Tyttebær lages og selges her på garden hele året.";
+    assertTrue(
+      meetsAboutQualityBar(passiveProductListVariant),
+      "quality: passive-voice product list with different verbs still passes (round-2 fix-up)"
+    );
+    // Close variant: passive voice + preposition, but NOT a Title-Case product
+    // list (ordinary lowercase-heavy prose) — was already passing before the
+    // fix (capRatio never crossed 0.5), pinned here so the fix's word-list
+    // broadening doesn't regress the already-working case either.
+    const passiveNoProductList =
+      "Alle ostene på gården produseres for hånd av bonden selv hver eneste morgen før soloppgang med kjærlighet og omtanke fra hele familien.";
+    assertTrue(
+      meetsAboutQualityBar(passiveNoProductList),
+      "quality: passive-voice prose without a product-name list still passes (round-2 fix-up)"
+    );
+
+    // Regression: round-2's four original bad examples must STILL be rejected
+    // after the fix-up's REAL_PROSE_SIGNAL_WORDS broadening (none of them
+    // contain the newly-added passive verbs or "på"/"fra"/"med").
+    assertTrue(
+      !meetsAboutQualityBar(navFlatMenu),
+      "quality (regression): round-2 flat Title-Case nav bar still fails after fix-up"
+    );
+    assertTrue(
+      !meetsAboutQualityBar(navLangSwitchDup),
+      "quality (regression): round-2 lang-switcher/duplicated-tagline nav chrome still fails after fix-up"
+    );
+    assertTrue(
+      !meetsAboutQualityBar(navDuplicatedBreadcrumb),
+      "quality (regression): round-2 duplicated breadcrumb still fails after fix-up"
+    );
+    assertTrue(
+      !meetsAboutQualityBar(umbrellaAbout),
+      "quality (regression): round-2 umbrella-portal dense category listing still fails after fix-up"
+    );
+    assertTrue(
+      !meetsAboutQualityBar(umbrellaVisit),
+      "quality (regression): round-2 'våre medlemmer' collective-membership prose still fails after fix-up"
+    );
+
+    // ── round-2 fix-up-2 (2026-07-11, review CHANGES-REQUESTED): fix-up-1
+    // added "på"/"fra"/"med" to REAL_PROSE_SIGNAL_WORDS as a broad "common
+    // prepositions are near-universal in real sentences" signal — but those 3
+    // short prepositions are JUST AS near-ubiquitous in scraped Norwegian
+    // nav/footer CHROME, so a single incidental match silently defeated
+    // signal 3 for genuine nav-menu leakage (the unsafe direction: nav chrome
+    // would get written to a real producer's public profile). Fixed by
+    // dropping the 3 bare prepositions and relying on the passive-voice verbs
+    // alone. Reviewer's exact reproduced failing examples: ──────────────────
+    const navPrepositionLeakage1 =
+      "Hjem Om Oss Produkter Nyheter Kontakt Nettbutikk Bestill Levering Fra 49 Facebook Instagram Ølkart Meny Åpningstider";
+    assertTrue(
+      !meetsAboutQualityBar(navPrepositionLeakage1),
+      "quality: flat nav bar with 'Fra' no longer false-passes via bare-preposition signal (fix-up-2)"
+    );
+    const navPrepositionLeakage2 =
+      "Hjem Handlekurv Produkter Bestilling Levering Med Bud Kontakt Nyhetsbrev Facebook Instagram Ølkart Meny Åpning";
+    assertTrue(
+      !meetsAboutQualityBar(navPrepositionLeakage2),
+      "quality: flat nav bar with 'Med' no longer false-passes via bare-preposition signal (fix-up-2)"
+    );
+    const navPrepositionLeakage3 =
+      "Hjem Produkter Kontakt Følg Oss På Facebook Instagram Nyheter Bryggeriutsalg Ølkart Meny Åpningstider Handlekurv";
+    assertTrue(
+      !meetsAboutQualityBar(navPrepositionLeakage3),
+      "quality: flat nav bar with 'På' no longer false-passes via bare-preposition signal (fix-up-2)"
+    );
+
+    // Regression: the passive-voice verbs alone (no prepositions) must still
+    // be sufficient to pass genuine passive-voice product-list prose —
+    // confirms the fix-up-1 examples don't silently depend on på/fra/med.
+    assertTrue(
+      meetsAboutQualityBar(reviewerPassiveProductList),
+      "quality (regression): passive-voice product-list prose still passes without bare prepositions (fix-up-2)"
+    );
+    assertTrue(
+      meetsAboutQualityBar(passiveProductListVariant),
+      "quality (regression): passive-voice product-list variant still passes without bare prepositions (fix-up-2)"
+    );
+    assertTrue(
+      meetsAboutQualityBar(passiveNoProductList),
+      "quality (regression): passive-voice prose without product list still passes without bare prepositions (fix-up-2)"
+    );
   }
 
   // ── orch-experiences-content-refresh: mapToExperienceCategories (PURE) ──────
