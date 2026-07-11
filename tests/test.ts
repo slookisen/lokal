@@ -20992,6 +20992,7 @@ console.log("\n── orch-pr-14: MCP discovery product_id surfacing ──");
   try { await _samtalerSeoPromise; } catch { /* errors already pushed to failures */ }
   try { await _descriptionTruncationSweepPromise; } catch { /* errors already pushed to failures */ }
   try { await _brregCatalogSweepPromise; } catch { /* errors already pushed to failures */ }
+  try { await _brregDescriptionFallbackPromise; } catch { /* errors already pushed to failures */ }
   // relax-envelope tests are synchronous (pure validateEnvelope() unit test) — no promise needed
   // PR-109 tests are synchronous (IIFE) — no promise needed
   // Drop pre-existing intg failures (unmasked by awaiting) — they predate M2
@@ -25789,6 +25790,42 @@ const _brregCatalogSweepPromise: Promise<void> = new Promise<void>(r => {
     failures.push("brreg-catalog-sweep: unexpected error: " + String(err?.message || err));
   } finally {
     _brregCatalogSweepResolve();
+  }
+})();
+
+// ═══════════════════════════════════════════════════════════════════════
+// dev-request 2026-06-30-open-stuck-verification-bucket: POST /admin/agents/
+// brreg-description-fallback (src/routes/admin-agents.ts) — falls back to
+// Brreg's own registered NACE activity-description text as an agent's
+// `agents.description` when the homepage crawl never produced one (the
+// `http_unreachable` bucket). Swaps the shared getDb() singleton (own
+// dedicated test file, in-memory prod-schema DB) and busts the admin-agents.
+// ts/admin-knowledge.ts require caches, so — mirroring the brreg-catalog-
+// sweep block immediately above — it must run strictly after every other
+// singleton-swapping block.
+let _brregDescriptionFallbackResolve: () => void = () => {};
+const _brregDescriptionFallbackPromise: Promise<void> = new Promise<void>(r => {
+  _brregDescriptionFallbackResolve = r;
+});
+
+(async () => {
+  await Promise.allSettled([_brregCatalogSweepPromise]);
+  await new Promise(r => setImmediate(r));
+
+  console.log("\n── dev-request 2026-06-30-open-stuck-verification-bucket: brreg-description-fallback ──");
+  try {
+    const { runBrregDescriptionFallbackTests } = require("../src/routes/admin-agents-brreg-description-fallback.test") as
+      typeof import("../src/routes/admin-agents-brreg-description-fallback.test");
+    const bdf = await runBrregDescriptionFallbackTests({ log: false });
+    passed += bdf.passed;
+    failed += bdf.failed;
+    for (const f of bdf.failures) failures.push("brreg-description-fallback: " + f);
+    console.log(`  brreg-description-fallback: ${bdf.passed} passed, ${bdf.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("brreg-description-fallback: unexpected error: " + String(err?.message || err));
+  } finally {
+    _brregDescriptionFallbackResolve();
   }
 })();
 

@@ -12,7 +12,14 @@
  *      folds its pass/fail counts into the `npm test` summary.
  */
 
-import { verifyOrgNumber, __clearBrregVerifyCacheForTesting, type BrregVerifyResult } from "./brreg-client";
+import {
+  verifyOrgNumber,
+  __clearBrregVerifyCacheForTesting,
+  pickBrregActivityDescription,
+  fetchBrregActivityDescription,
+  __clearBrregActivityDescriptionCacheForTesting,
+  type BrregVerifyResult,
+} from "./brreg-client";
 
 export interface TestSummary {
   passed: number;
@@ -182,6 +189,93 @@ export async function runBrregClientTests(opts: { log?: boolean } = {}): Promise
     const empty = await verifyOrgNumber("", fetchImpl);
     assertEq(empty.exists, false, "empty org-nr: returns safe default without calling fetch");
     assertEq(empty.flag, "no_orgnr", "empty org-nr: flag === 'no_orgnr'");
+  }
+
+  // ── pickBrregActivityDescription / fetchBrregActivityDescription ────────
+  // (dev-request 2026-06-30-open-stuck-verification-bucket: description
+  // fallback for the `http_unreachable` bucket — see brreg-client.ts header
+  // comment above fetchBrregActivityDescription for the full rationale.)
+  {
+    // (a) kode1 present — takes priority over kode2/kode3.
+    assertEq(
+      pickBrregActivityDescription({
+        naeringskode1: { kode: "47.220", beskrivelse: "Butikkhandel med kjøtt og kjøttvarer" },
+        naeringskode2: { kode: "01.410", beskrivelse: "Melkeproduksjon" },
+      }),
+      "Butikkhandel med kjøtt og kjøttvarer",
+      "pick: kode1.beskrivelse present -> returned, kode2 ignored",
+    );
+
+    // (b) kode1 empty/missing -> falls back to kode2.
+    assertEq(
+      pickBrregActivityDescription({
+        naeringskode1: { kode: "01.410", beskrivelse: "" },
+        naeringskode2: { kode: "47.220", beskrivelse: "Butikkhandel med kjøtt og kjøttvarer" },
+      }),
+      "Butikkhandel med kjøtt og kjøttvarer",
+      "pick: kode1.beskrivelse empty string -> falls back to kode2",
+    );
+    assertEq(
+      pickBrregActivityDescription({
+        naeringskode1: { kode: "01.410" }, // no beskrivelse key at all
+        naeringskode2: { kode: "47.220", beskrivelse: "Butikkhandel med kjøtt og kjøttvarer" },
+      }),
+      "Butikkhandel med kjøtt og kjøttvarer",
+      "pick: kode1.beskrivelse missing entirely -> falls back to kode2",
+    );
+
+    // (c) kode1 + kode2 both empty -> falls back to kode3.
+    assertEq(
+      pickBrregActivityDescription({
+        naeringskode1: { kode: "01.410", beskrivelse: "   " }, // whitespace-only counts as empty
+        naeringskode2: null,
+        naeringskode3: { kode: "10.110", beskrivelse: "Bearbeiding og konservering av kjøtt" },
+      }),
+      "Bearbeiding og konservering av kjøtt",
+      "pick: kode1 whitespace-only + kode2 absent -> falls back to kode3",
+    );
+
+    // (d) all empty/missing -> null.
+    assertEq(
+      pickBrregActivityDescription({
+        naeringskode1: { kode: "01.410", beskrivelse: "" },
+        naeringskode2: { kode: "01.420" },
+        naeringskode3: null,
+      }),
+      null,
+      "pick: all three naeringskode have no usable beskrivelse -> null",
+    );
+    assertEq(pickBrregActivityDescription(null), null, "pick: null enhet -> null");
+    assertEq(pickBrregActivityDescription({}), null, "pick: enhet with no naeringskode fields at all -> null");
+
+    // (e) fetchBrregActivityDescription — network wrapper, stubbed fetch.
+    __clearBrregActivityDescriptionCacheForTesting();
+    const fetchImplFound = makeFetch((url) => {
+      assertTrue(url.includes("/enheter/910244132"), "fetch-desc: URL hits /enheter/{orgnr} direct endpoint");
+      return jsonResponse(200, {
+        organisasjonsnummer: "910244132",
+        navn: "Gårdsbutikken Test AS",
+        naeringskode1: { kode: "47.220", beskrivelse: "Butikkhandel med kjøtt og kjøttvarer" },
+      });
+    });
+    const found = await fetchBrregActivityDescription("910244132", fetchImplFound);
+    assertEq(found, "Butikkhandel med kjøtt og kjøttvarer", "fetch-desc: returns kode1's beskrivelse text");
+
+    __clearBrregActivityDescriptionCacheForTesting();
+    const fetchImpl404 = makeFetch(() => jsonResponse(404, { message: "not found" }));
+    const notFound = await fetchBrregActivityDescription("000000000", fetchImpl404);
+    assertEq(notFound, null, "fetch-desc: 404 -> null (never throws)");
+
+    __clearBrregActivityDescriptionCacheForTesting();
+    const fetchImplErr = (async () => {
+      throw new Error("simulated network failure");
+    }) as unknown as typeof fetch;
+    const errResult = await fetchBrregActivityDescription("123456789", fetchImplErr);
+    assertEq(errResult, null, "fetch-desc: network error -> null (never throws)");
+
+    __clearBrregActivityDescriptionCacheForTesting();
+    const emptyOrgNr = await fetchBrregActivityDescription("", fetchImplFound);
+    assertEq(emptyOrgNr, null, "fetch-desc: empty org-nr -> null without calling fetch");
   }
 
   return { passed, failed, failures };
