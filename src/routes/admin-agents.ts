@@ -567,6 +567,37 @@ async function computeBrregSweepRowResult(row: BrregSweepCandidateRow): Promise<
   };
 }
 
+// Atomically claims-and-writes a single candidate row's Brreg outcome.
+//
+// WHY this exists (race fix): runBrregVerifyForRegister() above is awaited
+// — it's a real network call to the Brreg API — so any amount of time can
+// pass between "we last knew this row was unchecked" and "we're ready to
+// write its outcome". A SELECT-then-UPDATE re-check done BEFORE that await
+// (or even done after the await but as two separate statements) still
+// leaves a window: two concurrent callers (a second sweep run, or
+// registration-time wiring) can both observe brreg_checked_at IS NULL,
+// both make their own Brreg fetch for the same org_nr, and both believe
+// they "won" the write.
+//
+// The fix folds the re-check into the UPDATE's WHERE clause so the claim
+// and the write are a single atomic SQLite statement: only a caller whose
+// UPDATE actually matched a still-NULL row gets `changes === 1`. A second
+// caller racing against the first is guaranteed `changes === 0` once the
+// first caller's UPDATE has committed — there is no read-then-write gap
+// left to race.
+export function applyBrregSweepRowUpdate(
+  db: ReturnType<typeof getDb>,
+  id: string,
+  outcome: { brreg_verified: number; brreg_flag: string | null; brreg_checked_at: string | null },
+): boolean {
+  const result = db
+    .prepare(
+      "UPDATE agents SET brreg_verified = ?, brreg_flag = ?, brreg_checked_at = ? WHERE id = ? AND brreg_checked_at IS NULL",
+    )
+    .run(outcome.brreg_verified, outcome.brreg_flag, outcome.brreg_checked_at, id);
+  return result.changes === 1;
+}
+
 function toFlaggedForReview(
   r: BrregSweepRowResult,
 ): { id: string; name: string; org_nr: string; brreg_flag: string } | null {
@@ -641,15 +672,14 @@ router.post("/brreg-catalog-sweep", async (req: Request, res: Response) => {
       return;
     }
 
-    // Real run — re-check each candidate row RIGHT BEFORE writing (never
-    // clobber a row that got checked by something else — registration-time
-    // wiring or a concurrent sweep run — since the scan above), then write
-    // ONLY the three brreg_* columns for that row.
-    const getCurrent = db.prepare("SELECT brreg_checked_at FROM agents WHERE id = ?");
-    const updateStmt = db.prepare(
-      "UPDATE agents SET brreg_verified = ?, brreg_flag = ?, brreg_checked_at = ? WHERE id = ?",
-    );
-
+    // Real run — write ONLY the three brreg_* columns for each row, and
+    // ONLY if the row is still unclaimed (brreg_checked_at IS NULL) at
+    // write time. The claim check and the write are a single atomic
+    // conditional UPDATE (see applyBrregSweepRowUpdate above) — NOT a
+    // separate pre-write SELECT — so a row that got checked by something
+    // else (registration-time wiring or a concurrent sweep run) since the
+    // scan above can never be clobbered, even though runBrregVerifyForRegister
+    // below is an awaited network call.
     const updated: Array<{
       id: string; name: string; org_nr: string; vertical: string;
       brreg_verified: number; brreg_flag: string | null; brreg_checked_at: string | null;
@@ -658,14 +688,13 @@ router.post("/brreg-catalog-sweep", async (req: Request, res: Response) => {
     const skippedAlreadyCheckedIds: string[] = [];
 
     for (const row of batchRows) {
-      const current = getCurrent.get(row.id) as { brreg_checked_at: string | null } | undefined;
-      if (!current || current.brreg_checked_at !== null) {
+      const vertical = row.vertical_id ?? "rfb";
+      const outcome = await runBrregVerifyForRegister(vertical, row.org_nr);
+      const wrote = applyBrregSweepRowUpdate(db, row.id, outcome);
+      if (!wrote) {
         skippedAlreadyCheckedIds.push(row.id);
         continue;
       }
-      const vertical = row.vertical_id ?? "rfb";
-      const outcome = await runBrregVerifyForRegister(vertical, row.org_nr);
-      updateStmt.run(outcome.brreg_verified, outcome.brreg_flag, outcome.brreg_checked_at, row.id);
       updated.push({
         id: row.id,
         name: row.name,

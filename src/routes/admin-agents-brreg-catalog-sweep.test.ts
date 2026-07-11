@@ -153,7 +153,10 @@ export async function runBrregCatalogSweepTests(opts: { log?: boolean } = {}): P
 
     const routePath = require.resolve("../routes/admin-agents");
     delete require.cache[routePath];
-    const routerModule = require("../routes/admin-agents").default;
+    const adminAgentsModule = require("../routes/admin-agents") as
+      typeof import("../routes/admin-agents");
+    const routerModule = adminAgentsModule.default;
+    const { applyBrregSweepRowUpdate } = adminAgentsModule;
 
     function getHandler(method: "get" | "post", path: string) {
       const layer = routerModule.stack.find(
@@ -283,6 +286,25 @@ export async function runBrregCatalogSweepTests(opts: { log?: boolean } = {}): P
       assertEq(dryExplicit.body?.dry_run, true, "dry-explicit: dry_run:true honored");
       const rowAfter2 = readRow("dry-1");
       assertEq(rowAfter2.brreg_checked_at, null, "dry-explicit: still no write after a second dry-run call");
+
+      // STRICT-FALSE parse pins: only the literal JSON boolean `false`
+      // triggers a real write — a truthy/falsy regression here (e.g.
+      // switching to `!body.dry_run` or `Boolean(body.dry_run) === false`)
+      // would silently turn "false" (string), 0, or null into real writes.
+      const dryStringFalse = await callPost({ dry_run: "false" as any });
+      assertEq(dryStringFalse.body?.dry_run, true, 'dry-pin: dry_run:"false" (string) still treated as dry-run');
+      const rowAfterStringFalse = readRow("dry-1");
+      assertEq(rowAfterStringFalse.brreg_checked_at, null, 'dry-pin: dry_run:"false" (string) makes zero writes');
+
+      const dryZero = await callPost({ dry_run: 0 as any });
+      assertEq(dryZero.body?.dry_run, true, "dry-pin: dry_run:0 still treated as dry-run");
+      const rowAfterZero = readRow("dry-1");
+      assertEq(rowAfterZero.brreg_checked_at, null, "dry-pin: dry_run:0 makes zero writes");
+
+      const dryNull = await callPost({ dry_run: null as any });
+      assertEq(dryNull.body?.dry_run, true, "dry-pin: dry_run:null still treated as dry-run");
+      const rowAfterNull = readRow("dry-1");
+      assertEq(rowAfterNull.brreg_checked_at, null, "dry-pin: dry_run:null makes zero writes");
     }
 
     testDb.exec("DELETE FROM agents");
@@ -370,6 +392,45 @@ export async function runBrregCatalogSweepTests(opts: { log?: boolean } = {}): P
 
       const finalUnchecked = testDb.prepare("SELECT COUNT(*) AS n FROM agents WHERE brreg_checked_at IS NULL").get() as { n: number };
       assertEq(finalUnchecked.n, 0, "batch-apply: zero rows remain unchecked after both capped runs");
+    }
+
+    // ── race fix: applyBrregSweepRowUpdate() is an atomic conditional
+    //     UPDATE ... WHERE id = ? AND brreg_checked_at IS NULL, not a
+    //     separate pre-write SELECT. Proves the atomicity property directly
+    //     (no real thread concurrency needed): given a row whose
+    //     brreg_checked_at is still NULL, calling the helper twice in a row
+    //     with the same outcome payload — simulating two concurrent sweep/
+    //     registration callers that both raced past the scan and both
+    //     finished their (stubbed) Brreg fetch for the same row — must
+    //     write exactly once. The first call "wins" (changes===1, returns
+    //     true); the second finds brreg_checked_at no longer NULL and
+    //     "loses" (changes===0, returns false) instead of clobbering the
+    //     first caller's outcome. ───────────────────────────────────────
+    testDb.exec("DELETE FROM agents");
+    fixtures.clear();
+    {
+      insertAgent({ id: "race-row", name: "Race Gård", orgNr: "990000001" });
+
+      const outcomeA = { brreg_verified: 1, brreg_flag: null, brreg_checked_at: "2026-07-11T10:00:00.000Z" };
+      const outcomeB = { brreg_verified: 0, brreg_flag: "dissolved", brreg_checked_at: "2026-07-11T10:00:01.000Z" };
+
+      // First "concurrent" caller: row is still unclaimed -> wins the write.
+      const wonFirst = applyBrregSweepRowUpdate(testDb as any, "race-row", outcomeA);
+      assertTrue(wonFirst === true, "race: first concurrent call to applyBrregSweepRowUpdate wins (changes===1 -> true)");
+
+      // Second "concurrent" caller: same row, same pre-set brreg_checked_at
+      // state (NULL) as of when it started its own Brreg fetch, but by the
+      // time it writes, the first caller already claimed the row -> loses.
+      const wonSecond = applyBrregSweepRowUpdate(testDb as any, "race-row", outcomeB);
+      assertTrue(wonSecond === false, "race: second concurrent call to applyBrregSweepRowUpdate loses (changes===0 -> false), does NOT clobber");
+
+      // The row must reflect ONLY the winner's outcome (outcomeA), never
+      // the loser's (outcomeB) — this is the "never clobber" guarantee the
+      // original comment claimed but the pre-fix code did not actually make.
+      const finalRow = readRow("race-row");
+      assertEq(finalRow.brreg_verified, outcomeA.brreg_verified, "race: final row has the WINNER's brreg_verified, not the loser's");
+      assertEq(finalRow.brreg_flag, outcomeA.brreg_flag, "race: final row has the WINNER's brreg_flag, not the loser's");
+      assertEq(finalRow.brreg_checked_at, outcomeA.brreg_checked_at, "race: final row has the WINNER's brreg_checked_at, not the loser's");
     }
 
     // ── (g) badge: /produsent/:slug renders the Brreg badge only when
