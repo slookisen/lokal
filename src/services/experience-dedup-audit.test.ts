@@ -10,9 +10,18 @@
  *      merge MUST classify 'rare-token'; near-identical wording MUST classify
  *      'whole-string'.
  *   2. buildCorpusTokenCounts(): distinct-title counting + stopword exclusion.
+ *      buildProviderCorpusTokenCounts() (audit v2): distinct-PROVIDER counting
+ *      — a token counts once per provider however many clone titles that
+ *      provider has, and NULL-provider rows count as their own singleton
+ *      pseudo-providers.
  *   3. auditMergedGroups() transitivity: a row weakly linked to its canonical
  *      but whole-string-linked to a sibling merged row is NOT suspect (merges
- *      were transitive union-find).
+ *      were transitive union-find). PLUS the audit-v2 inflation regression pin
+ *      from the prod run (859/1361 rows over-flagged): ONE provider with 16
+ *      harvest-clone "Kon-Tiki ..." titles must NOT make kontiki/heyerdahl
+ *      look corpus-common — under v1's title-distinct counting kontiki hit 16
+ *      >= genericMin and the confirmed-TRUE Kon-Tiki group came back suspect;
+ *      under provider-distinct counting it counts as 1 → rare → trusted.
  *   4. POST /admin/experiences-dedup-unmerge: dry_run defaults TRUE and writes
  *      nothing; empty ids → 400; real run clears exactly the listed rows,
  *      updates the canonical's merged_from, leaves unlisted siblings alone,
@@ -30,7 +39,11 @@
  */
 
 import type Database from "better-sqlite3";
-import { classifyMergedPair, buildCorpusTokenCounts } from "./experience-dedup-audit";
+import {
+  classifyMergedPair,
+  buildCorpusTokenCounts,
+  buildProviderCorpusTokenCounts,
+} from "./experience-dedup-audit";
 
 export interface TestSummary {
   passed: number;
@@ -203,6 +216,26 @@ export function runExperienceDedupAuditTests(opts: { log?: boolean } = {}): Prom
     assertEq(counts.get("til"), undefined, "2e: stopword 'til' never counted");
     assertEq(counts.get("brevandring"), 1, "2f: ordinary distinctive token counted");
 
+    // ── 2 (audit v2). buildProviderCorpusTokenCounts: distinct-PROVIDER counts ──
+    // The prod audit over-flagged because title-distinct counting is inflated
+    // by the duplicates themselves: 16 harvest clones of ONE museum made
+    // "kontiki" look like a corpus-common word. Provider-distinct counting is
+    // immune — however many clone titles a provider has, its tokens count once.
+    const provCounts = buildProviderCorpusTokenCounts([
+      { title: "Fjelltur til Besseggen", provider_id: "p1" },
+      { title: "Fjelltur til Galdhøpiggen", provider_id: "p1" }, // same provider — counts ONCE with the row above
+      { title: "Fjelltur til Snøhetta", provider_id: "p2" },
+      { title: "Fjelltur uten tilbyder", provider_id: null }, // orphan row → its own singleton pseudo-provider
+      { title: "Fjelltur tilbyder mangler", provider_id: null }, // second orphan → a SEPARATE singleton
+      { title: "Museum og museet på tur", provider_id: "p3" }, // stopwords only → contributes nothing
+    ]);
+    assertEq(provCounts.get("fjelltur"), 4, "2g: distinct providers — p1 once (despite 2 titles) + p2 + 2 orphan singletons = 4");
+    assertEq(provCounts.get("besseggen"), 1, "2h: token unique to one provider counts 1");
+    assertEq(provCounts.get("tilbyder"), 2, "2i: null-provider rows do NOT collapse into one bucket — each counts separately");
+    assertEq(provCounts.get("museum"), undefined, "2j: stopword 'museum' never counted");
+    assertEq(provCounts.get("til"), undefined, "2k: stopword 'til' never counted");
+    assertEq(provCounts.get("galdhopiggen"), 1, "2l: normalized/diacritics-folded token counted per provider");
+
     // ── 3–6. DB-backed: auditMergedGroups + admin endpoints + slug redirect ──
     const prevExperiencesDbPath = process.env.EXPERIENCES_DB_PATH;
     const prevAdminKey = process.env.ADMIN_KEY;
@@ -228,27 +261,31 @@ export function runExperienceDedupAuditTests(opts: { log?: boolean } = {}): Prom
       process.env.ADMIN_KEY = ADMIN_KEY;
       const adminHeaders = { "x-admin-key": ADMIN_KEY };
 
-      const providerId = expStore.createProvider({
-        navn: "Norsk Natur AS",
-        kommune: "Oslo",
-        fylke: "Oslo",
-        brreg_verified: 1,
-        brreg_active: 1,
-        verification_status: "verified",
-      });
+      function makeProvider(navn: string): string {
+        return expStore.createProvider({
+          navn,
+          kommune: "Oslo",
+          fylke: "Oslo",
+          brreg_verified: 1,
+          brreg_active: 1,
+          verification_status: "verified",
+        });
+      }
+      const providerId = makeProvider("Norsk Natur AS");
 
       // All rows publishable (verified + high confidence + brreg-active
       // provider) so PUBLISH_GATE_SQL visibility is decided by canonical_id.
-      function seed(title: string): string {
+      function seedFor(provId: string, title: string): string {
         return expStore.createExperience({
           title,
-          provider_id: providerId,
+          provider_id: provId,
           kommune: "Oslo",
           fylke: "Oslo",
           verification_status: "verified",
           confidence: "high",
         });
       }
+      const seed = (title: string): string => seedFor(providerId, title);
       const canonicalIdOf = (id: string): string | null =>
         (db.prepare("SELECT canonical_id FROM experiences WHERE id = ?").get(id) as
           | { canonical_id: string | null }
@@ -272,9 +309,13 @@ export function runExperienceDedupAuditTests(opts: { log?: boolean } = {}): Prom
         );
       }
 
-      // Corpus filler (unmerged) so the broad activity tokens are common
-      // (>= 5 distinct titles) inside this small in-memory corpus, matching
-      // the prod corpus where "fjelltur"/"brevandring" appear everywhere.
+      // Corpus filler (unmerged) so the broad activity tokens are common.
+      // FIXTURE ADJUSTMENT (audit v2): each filler row gets its OWN provider
+      // — the audit now counts a token once per DISTINCT provider, so
+      // "fjelltur"/"brevandring" only stay generic (count >= genericMin 5) if
+      // they genuinely span many providers, exactly like the prod corpus
+      // (rafting spans 30+ providers; one museum's 16 clone titles don't).
+      let fillerSeq = 0;
       for (const t of [
         "Fjelltur til Besseggen",
         "Fjelltur til Preikestolen",
@@ -287,18 +328,48 @@ export function runExperienceDedupAuditTests(opts: { log?: boolean } = {}): Prom
         "Brevandring på Buerbreen",
         "Brevandring på Folgefonna",
       ]) {
-        seed(t);
+        seedFor(makeProvider(`Fillertilbyder ${++fillerSeq} AS`), t);
       }
 
       // FALSE-POSITIVE group: two different mountains merged on 'fjelltur'.
+      // 'fjelltur' spans 6 distinct providers (5 fillers + this one) → generic.
       const idFjellCanonical = seed("Fjelltur til Galdhøpiggen");
       const idFjellSuspect = seed("Fjelltur til Snøhetta");
       mergeInto(idFjellCanonical, [idFjellSuspect]);
 
-      // TRUE group: the confirmed Kon-Tiki/Heyerdahl merge (rare token).
-      const idKontikiCanonical = seed("Kon-Tiki Museet — Heyerdahl's Legendary Pacific Raft");
-      const idKontikiMerged = seed("Thor Heyerdahl Expedition Museum at Bygdøy Oslo");
-      mergeInto(idKontikiCanonical, [idKontikiMerged]);
+      // TRUE group + the audit-v2 INFLATION REGRESSION PIN: ONE provider with
+      // 16 harvest-clone titles of the same real museum (the confirmed prod
+      // shape — Kon-Tiki Museet had 16 clones). Under v1's title-distinct
+      // counting these clones inflated kontiki to 16 >= genericMin, so the
+      // group's own proper noun looked "generic" and the TRUE merges came
+      // back suspect (859/1361 over-flagged in prod). Provider-distinct
+      // counting sees ONE provider → kontiki/heyerdahl stay rare → trusted.
+      const kontikiProviderId = makeProvider("Kon-Tiki Museet AS");
+      const idKontikiCanonical = seedFor(
+        kontikiProviderId,
+        "Kon-Tiki Museet — Heyerdahl's Legendary Pacific Raft"
+      );
+      const kontikiCloneTitles = [
+        "Thor Heyerdahl Expedition Museum at Bygdøy Oslo",
+        "Kon-Tiki Museum Oslo — Official Site",
+        "Besøk Kon-Tiki Museet på Bygdøy",
+        "The Kon-Tiki Museum — Thor Heyerdahl's Raft Expeditions",
+        "Kon-Tiki Museet billetter og åpningstider",
+        "Kon-Tiki Museum tickets Oslo",
+        "Opplev Kon-Tiki Museet i Oslo",
+        "Kon-Tiki Museum guided visit Bygdøy",
+        "Heyerdahl's Kon-Tiki raft museum",
+        "Kon-Tiki — the raft expedition museum",
+        "Thor Heyerdahl museum på Bygdøy",
+        "Kon-Tiki Museet familieutflukt",
+        "Kon-Tiki Museum — Pacific voyage exhibition",
+        "Museum for Kon-Tiki ekspedisjonen",
+        "Kon-Tiki ekspedisjonsmuseum Bygdøy",
+      ];
+      const kontikiCloneIds = kontikiCloneTitles.map((t) => seedFor(kontikiProviderId, t));
+      const idKontikiMerged = kontikiCloneIds[0]; // "Thor Heyerdahl Expedition Museum at Bygdøy Oslo"
+      const idKontikiPinClone = kontikiCloneIds[2]; // "Besøk Kon-Tiki Museet på Bygdøy" — shares ONLY 'kontiki' with the canonical
+      mergeInto(idKontikiCanonical, kontikiCloneIds);
 
       // TRANSITIVITY group: X links to the canonical only via the common
       // 'brevandring', but is whole-string-identical (one-char typo) to its
@@ -308,10 +379,10 @@ export function runExperienceDedupAuditTests(opts: { log?: boolean } = {}): Prom
       const idBrevRowX = seed("Brevandring på Nigardsbren"); // typo: 'nigardsbren' ≠ 'nigardsbreen'
       mergeInto(idBrevCanonical, [idBrevSiblingY, idBrevRowX]);
 
-      // ── 3. auditMergedGroups: classification + transitivity ──
+      // ── 3. auditMergedGroups: classification + transitivity + v2 inflation pin ──
       const auditResult = audit.auditMergedGroups(db);
       assertEq(auditResult.summary.groups_total, 3, "3a: three merged groups audited");
-      assertEq(auditResult.summary.rows_total, 4, "3b: four merged-away rows audited");
+      assertEq(auditResult.summary.rows_total, 18, "3b: 18 merged-away rows audited (1 fjell + 15 kontiki clones + 2 brev)");
       assertEq(auditResult.summary.rows_suspect, 1, "3c: exactly one suspect row (Snøhetta)");
       assertEq(auditResult.summary.groups_with_suspects, 1, "3d: exactly one group carries a suspect");
 
@@ -324,6 +395,41 @@ export function runExperienceDedupAuditTests(opts: { log?: boolean } = {}): Prom
       const kontikiRow = kontikiGroup?.rows.find((r) => r.id === idKontikiMerged);
       assertEq(kontikiRow?.suspect, false, "3g: the true Heyerdahl merge is NOT suspect");
       assertEq(kontikiRow?.best_via, "rare-token", "3h: its best link is rare-token");
+
+      // Inflation regression pin (the prod defect that motivated audit v2):
+      assertEq(kontikiGroup?.rows.length, 15, "3h1: all 15 kontiki clones audited in the group");
+      assertTrue(
+        kontikiGroup !== undefined && kontikiGroup.rows.every((r) => !r.suspect),
+        "3h2: NO kontiki clone is suspect — one provider's 16 clone titles must not inflate its own tokens to 'generic'"
+      );
+      // Prove the two counting modes diverge on exactly this corpus: pull
+      // every title + provider from the DB and count both ways.
+      const corpusRows = db
+        .prepare("SELECT title, provider_id FROM experiences")
+        .all() as Array<{ title: string; provider_id: string | null }>;
+      const v1Counts = buildCorpusTokenCounts(corpusRows.map((r) => r.title));
+      const v2Counts = buildProviderCorpusTokenCounts(corpusRows);
+      assertEq(v1Counts.get("kontiki"), 14, "3h3: title-distinct counting inflates 'kontiki' to 14 (>= genericMin 5 → v1 called it generic)");
+      assertEq(v2Counts.get("kontiki"), 1, "3h4: provider-distinct counting sees 'kontiki' as ONE provider → rare");
+      assertEq(v1Counts.get("heyerdahl"), 5, "3h5: title-distinct 'heyerdahl' also inflated to genericMin by the clones");
+      assertEq(v2Counts.get("heyerdahl"), 1, "3h6: provider-distinct 'heyerdahl' → 1");
+      assertEq(v2Counts.get("fjelltur"), 6, "3h7: genuinely generic 'fjelltur' still spans 6 distinct providers");
+      // Pair-level discriminator: with the OLD title-distinct corpus this TRUE
+      // pair classifies generic-token-only (v1's over-flagging); with the
+      // provider-distinct corpus it classifies rare-token.
+      const pinPair: [string, string] = ["Besøk Kon-Tiki Museet på Bygdøy", "Kon-Tiki Museet — Heyerdahl's Legendary Pacific Raft"];
+      assertEq(
+        classifyMergedPair(pinPair[0], pinPair[1], v1Counts).via,
+        "generic-token-only",
+        "3h8: v1 title-distinct corpus mis-grades the TRUE kontiki pair as generic-token-only (the prod regression)"
+      );
+      assertEq(
+        classifyMergedPair(pinPair[0], pinPair[1], v2Counts).via,
+        "rare-token",
+        "3h9: v2 provider-distinct corpus grades the same pair rare-token (fixed)"
+      );
+      const pinCloneRow = kontikiGroup?.rows.find((r) => r.id === idKontikiPinClone);
+      assertEq(pinCloneRow?.suspect, false, "3h10: the kontiki-only-linked clone is NOT suspect under the audit path");
 
       const brevGroup = auditResult.groups.find((g) => g.canonical_id === idBrevCanonical);
       const rowX = brevGroup?.rows.find((r) => r.id === idBrevRowX);
@@ -358,8 +464,8 @@ export function runExperienceDedupAuditTests(opts: { log?: boolean } = {}): Prom
         // Read-only: zero writes — every canonical_id is exactly as seeded.
         assertEq(canonicalIdOf(idFjellSuspect), idFjellCanonical, "5i: audit made zero writes (suspect row unchanged)");
 
-        // generic_min is honored: at generic_min=20 even 'fjelltur' (7 distinct
-        // titles here) counts as rare → nothing is suspect.
+        // generic_min is honored: at generic_min=20 even 'fjelltur' (6 distinct
+        // providers here) counts as rare → nothing is suspect.
         const relaxedR = await callRoute(
           opplevelserRouter,
           "GET",
