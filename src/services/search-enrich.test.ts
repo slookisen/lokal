@@ -491,6 +491,75 @@ export function runSearchEnrichTests(opts: { log?: boolean } = {}): TestSummary 
       meetsAboutQualityBar(realWithOpeningHoursList),
       "quality: real prose with inline opening-hours numbered list still passes"
     );
+
+    // ── round-2 (2026-07-11): found via a live production dry-run resample of
+    // gardssalg-content-refresh — ~26% of candidates that passed round-1's
+    // gate were still wrong (target ≤2%). Four concrete real examples that
+    // must now be rejected, none caught by round-1's numbered/pipe-arrow-only
+    // isLikelyNavMenuLeakage checks. ─────────────────────────────────────────
+
+    // Real example 1: a flat, space-separated e-commerce nav bar (no numbers,
+    // no pipes/arrows — round-1 has neither signal to catch this shape).
+    const navFlatMenu =
+      "Harstad Bryggeri Cart 0 Bryggeriet Ølet Omvisning & ølsmaking Nyheter Bryggeriutsalg Kontakt Ølsjappa Merch - Klær og så";
+    assertTrue(!meetsAboutQualityBar(navFlatMenu), "quality: flat Title-Case nav bar (no numbers/pipes) fails");
+
+    // Real example 2: nav chrome with a language-switcher token ("no en") and
+    // a repeated tagline — only ONE "-->", under round-1's ≥3-separator bar.
+    const navLangSwitchDup =
+      "--> Mack – Verdens nordligste bryggeri Besøk oss Verdens nordligste bryggeri no en Om Mack Produkter Bærekraft Mik";
+    assertTrue(!meetsAboutQualityBar(navLangSwitchDup), "quality: single-arrow nav chrome with duplicated tagline fails");
+
+    // Real example 3: the same short breadcrumb phrase repeated back-to-back
+    // by the scraper — only 2 pipes, under round-1's ≥3-separator threshold,
+    // and round-1 never checked for literal duplication at all.
+    const navDuplicatedBreadcrumb =
+      "besøk | Ekeby Gårdsbryggeri besøk | Ekeby Gårdsbryggeri An immersive digital experience for a historic Swedish monastery";
+    assertTrue(!meetsAboutQualityBar(navDuplicatedBreadcrumb), "quality: literally-duplicated breadcrumb phrase fails");
+
+    // Real example 4: a NEW failure mode — genuine, grammatical, punctuated
+    // Norwegian prose that passes every formatting check, but describes a
+    // REGIONAL TOURISM-ASSOCIATION/UMBRELLA PORTAL's member businesses
+    // collectively, not this one specific producer. A wrong-ENTITY bug, not a
+    // formatting bug.
+    const umbrellaAbout =
+      "Opplev Norge Aktiviteter og opplevelser Overnatting Mat- og drikkeprodusenter Gårdsbutikker Servering Møter, kurs og selskaper Fiske og jakt Vandring";
+    assertTrue(!meetsAboutQualityBar(umbrellaAbout), "quality: umbrella-portal dense category listing fails");
+    const umbrellaVisit =
+      "Våre medlemmer tilbyr alt fra sjarmerende gårdsbutikker med lokalprodusert mat, til koselig overnatting i landlige omgivelser og spennende aktiviteter for hele familien.";
+    assertTrue(
+      !meetsAboutQualityBar(umbrellaVisit),
+      "quality: 'våre medlemmer' collective-membership language fails (real prose, wrong entity)"
+    );
+
+    // Regression: round-1's bad examples must STILL reject after the round-2
+    // additions (navNumbered/navPipeArrow/navPipeOnly/navArrowOnly/navSkipLink
+    // above are re-asserted here as an explicit no-regression pin).
+    assertTrue(!meetsAboutQualityBar(navNumbered), "quality (regression): round-1 numbered nav-menu list still fails");
+    assertTrue(
+      !meetsAboutQualityBar(navPipeArrow),
+      "quality (regression): round-1 pipe/arrow nav-menu with 'top of page' marker still fails"
+    );
+    assertTrue(
+      !meetsAboutQualityBar(navPipeOnly),
+      "quality (regression): round-1 pure pipe-separated menu still fails"
+    );
+    assertTrue(
+      !meetsAboutQualityBar(navArrowOnly),
+      "quality (regression): round-1 pure arrow-separated menu still fails"
+    );
+
+    // Regression: legitimate prose with a numeric inline list (opening-hours
+    // style, written as real sentences) must NOT be over-rejected by the new
+    // flat-menu-density / repeated-phrase checks either.
+    assertTrue(
+      meetsAboutQualityBar(realWithOpeningHoursList),
+      "quality (regression): real prose with inline opening-hours list still passes after round-2 additions"
+    );
+    assertTrue(
+      meetsAboutQualityBar(realWithMenu),
+      "quality (regression): real prose mentioning a food 'meny' still passes after round-2 additions"
+    );
   }
 
   // ── orch-experiences-content-refresh: mapToExperienceCategories (PURE) ──────
