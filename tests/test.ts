@@ -21027,6 +21027,7 @@ console.log("\n── orch-pr-14: MCP discovery product_id surfacing ──");
   try { await _descriptionTruncationSweepPromise; } catch { /* errors already pushed to failures */ }
   try { await _brregCatalogSweepPromise; } catch { /* errors already pushed to failures */ }
   try { await _brregDescriptionFallbackPromise; } catch { /* errors already pushed to failures */ }
+  try { await _retentionRollupPromise; } catch { /* errors already pushed to failures */ }
   // relax-envelope tests are synchronous (pure validateEnvelope() unit test) — no promise needed
   // PR-109 tests are synchronous (IIFE) — no promise needed
   // Drop pre-existing intg failures (unmasked by awaiting) — they predate M2
@@ -25860,6 +25861,41 @@ const _brregDescriptionFallbackPromise: Promise<void> = new Promise<void>(r => {
     failures.push("brreg-description-fallback: unexpected error: " + String(err?.message || err));
   } finally {
     _brregDescriptionFallbackResolve();
+  }
+})();
+
+// ═══════════════════════════════════════════════════════════════════════
+// dev-request 2026-07-11-retention-rollup-500-rootcause: POST /admin/
+// analytics/ops/retention-rollup (src/routes/analytics.ts) — real (non-dry)
+// calls 500'd because req.body is `undefined` (not `{}`) on a request with
+// no Content-Type header, and the handler read `req.body.dryRun` before its
+// own try/catch even started. Swaps the shared getDb() singleton (own
+// dedicated test file, in-memory prod-schema DB) — mirroring the
+// brreg-description-fallback block immediately above, runs strictly after
+// every other singleton-swapping block.
+let _retentionRollupResolve: () => void = () => {};
+const _retentionRollupPromise: Promise<void> = new Promise<void>(r => {
+  _retentionRollupResolve = r;
+});
+
+(async () => {
+  await Promise.allSettled([_brregDescriptionFallbackPromise]);
+  await new Promise(r => setImmediate(r));
+
+  console.log("\n── dev-request 2026-07-11-retention-rollup-500-rootcause: retention-rollup ──");
+  try {
+    const { runRetentionRollupTests } = require("../src/routes/analytics-retention-rollup.test") as
+      typeof import("../src/routes/analytics-retention-rollup.test");
+    const rr = await runRetentionRollupTests({ log: false });
+    passed += rr.passed;
+    failed += rr.failed;
+    for (const f of rr.failures) failures.push("retention-rollup: " + f);
+    console.log(`  retention-rollup: ${rr.passed} passed, ${rr.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("retention-rollup: unexpected error: " + String(err?.message || err));
+  } finally {
+    _retentionRollupResolve();
   }
 })();
 
