@@ -555,6 +555,29 @@ console.log("\n── manifest.json (PWA manifest, rfb) ──");
   console.log(`  manifest: ${r.passed} passed, ${r.failed} failed`);
 }
 
+// ── dev-request 2026-07-04-app-strategi-pwa, slice 3 of 3: install-prompt
+// UX (rfb host only). Pins src/public/install-prompt.js's syntax, its pure
+// shouldShowInstallButton guard, and an HTTP smoke test (GET returns 200 +
+// JS content-type). Async (spins a throwaway express.static server on port
+// 0) but fully independent — no shared DB singleton — so it's kicked off
+// here and simply awaited in the REPORT block, no dependency chaining
+// needed.
+console.log("── install-prompt: beforeinstallprompt install-button UX ──");
+const _installPromptPromise: Promise<void> = (async () => {
+  try {
+    const { runInstallPromptTests } = require("../src/public/install-prompt.test") as
+      typeof import("../src/public/install-prompt.test");
+    const ipr = await runInstallPromptTests({ log: false });
+    passed += ipr.passed;
+    failed += ipr.failed;
+    for (const f of ipr.failures) failures.push("install-prompt: " + f);
+    console.log(`  install-prompt: ${ipr.passed} passed, ${ipr.failed} failed`);
+  } catch (err) {
+    failed++;
+    failures.push("install-prompt: unexpected error: " + String(err));
+  }
+})();
+
 // ── dev-request 2026-07-04-opplevagent-naer-meg-geosok, item 3: /sok's
 // distance-sort toggle URL builder (pure — preserves q/tags/lat/lng/
 // radius_km/sted while adding or removing sort=distance).
@@ -20977,6 +21000,7 @@ console.log("\n── orch-pr-14: MCP discovery product_id surfacing ──");
   try { await _dispatchTickSuitePromise; } catch { /* errors already pushed to failures */ }
   try { await _samtalerSeoPromise; } catch { /* errors already pushed to failures */ }
   try { await _descriptionTruncationSweepPromise; } catch { /* errors already pushed to failures */ }
+  try { await _installPromptPromise; } catch { /* errors already pushed to failures */ }
   // relax-envelope tests are synchronous (pure validateEnvelope() unit test) — no promise needed
   // PR-109 tests are synchronous (IIFE) — no promise needed
   // Drop pre-existing intg failures (unmasked by awaiting) — they predate M2
