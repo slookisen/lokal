@@ -72,7 +72,10 @@ const BRREG_NACE_ALLOWLIST: Record<string, readonly string[]> = {
 // wrap defensively anyway: a Brreg outage must never break registration)
 // resolves to the "unverified, unchecked" tuple.  brreg_checked_at is only
 // stamped once the whole check has completed without error.
-async function runBrregVerifyForRegister(
+// Exported (not just used by /register) so the backlog sweep below
+// (GET/POST /admin/agents/brreg-catalog-sweep, Slice 3) reuses the exact
+// same classification rules rather than forking a second copy.
+export async function runBrregVerifyForRegister(
   verticalId: string,
   orgNr: string,
 ): Promise<{ brreg_verified: number; brreg_flag: string | null; brreg_checked_at: string | null }> {
@@ -442,6 +445,255 @@ router.post("/register", async (req: Request, res: Response) => {
     });
   } catch (err: any) {
     res.status(500).json({ error: "Registration failed", detail: err.message });
+  }
+});
+
+// ─── GET/POST /admin/agents/brreg-catalog-sweep (Slice 3 of dev-request ──────
+//     2026-06-30-brreg-verification-gate) ──────────────────────────────────
+//
+// WHY: BRREG_VERIFY_ON_REGISTER (Slice 2, above) is unset in prod today, so
+// almost no pre-existing `agents` row has `brreg_verified=1` yet even where
+// registration-time wiring would have caught something. This is the one-time
+// backfill sweep for that backlog — mirrors GET/POST /admin/description-
+// truncation-sweep's dry-run-by-default convention (routes/admin-knowledge.ts)
+// closely: read-only GET diagnostic, POST with a STRICT-FALSE dry_run parse,
+// real writes scoped to exactly the columns this feature owns.
+//
+// Candidate set: agents rows with a non-null/non-empty org_nr that have
+// NEVER been checked (brreg_checked_at IS NULL) — rows already checked
+// (by registration-time wiring or a prior sweep run) are excluded, so
+// re-running this sweep is naturally idempotent without a separate
+// staleness/re-check window (out of scope for this slice, see dev-request).
+//
+// Vertical scoping judgment call: `agents` DOES carry a per-row vertical_id
+// column (Phase 4.6a — see GET / above, `vertical: r.vertical_id ?? "rfb"`),
+// so we use it rather than inventing a new signal or hardcoding "rfb" for
+// every row. But we mirror POST /register's own gating (above) exactly:
+// only "rfb" and "experiences" rows are ever verified — "dental" stays
+// Legelisten-primary and is intentionally excluded from the candidate set,
+// same as it's excluded from the registration-time verify call. A NULL
+// vertical_id defaults to "rfb", matching the GET / listing endpoint's
+// existing convention.
+//
+// Classification is NOT re-derived here — every row's outcome comes from
+// runBrregVerifyForRegister() (exported above), the exact same function
+// POST /register already uses, so a sweep-verified row and a
+// registration-verified row are always classified identically.
+//
+// Hard batch cap: a single GET/POST call only ever scans/verifies up to
+// BRREG_SWEEP_BATCH_CAP rows (oldest-registered-first, by created_at then
+// id for a deterministic order), and reports remaining_count so a caller
+// knows there's more backlog left — this endpoint NEVER walks the full
+// backlog synchronously in one request (see the table-sizes / tasks-prune
+// event-loop-blocking incidents this repo has already hit once).
+//
+// Writes: ONLY `UPDATE agents SET brreg_verified=?, brreg_flag=?,
+// brreg_checked_at=? WHERE id=?`, one row at a time, for rows in the capped
+// batch on a real (dry_run:false) run. NEVER DELETE, NEVER touches
+// is_active or any other column — dissolved/bankrupt agents are only ever
+// flagged, exactly like Slice 2. No filesystem writes; the `flagged_for_review`
+// bucket is returned in the response only (a later slice's concern, not this
+// one's, per the dev-request).
+const BRREG_SWEEP_BATCH_CAP = 50;
+
+// Only these two verticals are ever Brreg-verified (mirrors POST /register's
+// own gating above) — "dental" rows are excluded from the candidate set
+// entirely, never scanned/verified by this sweep.
+const BRREG_SWEEP_ELIGIBLE_VERTICALS = ["rfb", "experiences"] as const;
+
+// Outcomes that belong in the "review list" the dev-request asks for.
+// "no_orgnr" and the inconclusive null case are deliberately NOT review-list
+// material — they're either "nothing to check" or "not a named flag".
+const BRREG_SWEEP_REVIEW_FLAGS = new Set(["dissolved", "bankrupt", "wrong_nace"]);
+
+interface BrregSweepCandidateRow {
+  id: string;
+  name: string;
+  org_nr: string;
+  vertical_id: string | null;
+}
+
+interface BrregSweepRowResult {
+  id: string;
+  name: string;
+  org_nr: string;
+  vertical: string;
+  brreg_verified: number;
+  brreg_flag: string | null;
+}
+
+// Shared WHERE clause for both the count and the capped batch query, so the
+// two can never drift out of sync with each other.
+function brregSweepCandidateWhereSql(): string {
+  return `org_nr IS NOT NULL AND TRIM(org_nr) != '' AND brreg_checked_at IS NULL
+    AND COALESCE(vertical_id, 'rfb') IN ('${BRREG_SWEEP_ELIGIBLE_VERTICALS.join("','")}')`;
+}
+
+function countBrregSweepCandidates(db: ReturnType<typeof getDb>): number {
+  const row = db
+    .prepare(`SELECT COUNT(*) AS n FROM agents WHERE ${brregSweepCandidateWhereSql()}`)
+    .get() as { n: number };
+  return row?.n ?? 0;
+}
+
+// Deterministic, oldest-registered-first ordering (created_at, then id as a
+// tiebreaker) — a hard LIMIT means only up to BRREG_SWEEP_BATCH_CAP rows are
+// ever scanned/verified per invocation; the rest of the backlog is reported
+// via remaining_count, never processed synchronously in the same request.
+function fetchBrregSweepBatch(db: ReturnType<typeof getDb>, cap: number): BrregSweepCandidateRow[] {
+  return db
+    .prepare(
+      `SELECT id, name, org_nr, vertical_id FROM agents
+       WHERE ${brregSweepCandidateWhereSql()}
+       ORDER BY created_at ASC, id ASC
+       LIMIT ?`,
+    )
+    .all(cap) as BrregSweepCandidateRow[];
+}
+
+// Computes (never writes) what runBrregVerifyForRegister would set for a
+// candidate row — reused identically by the GET diagnostic and the POST
+// dry-run preview, so both always agree.
+async function computeBrregSweepRowResult(row: BrregSweepCandidateRow): Promise<BrregSweepRowResult> {
+  const vertical = row.vertical_id ?? "rfb";
+  const outcome = await runBrregVerifyForRegister(vertical, row.org_nr);
+  return {
+    id: row.id,
+    name: row.name,
+    org_nr: row.org_nr,
+    vertical,
+    brreg_verified: outcome.brreg_verified,
+    brreg_flag: outcome.brreg_flag,
+  };
+}
+
+function toFlaggedForReview(
+  r: BrregSweepRowResult,
+): { id: string; name: string; org_nr: string; brreg_flag: string } | null {
+  if (r.brreg_flag && BRREG_SWEEP_REVIEW_FLAGS.has(r.brreg_flag)) {
+    return { id: r.id, name: r.name, org_nr: r.org_nr, brreg_flag: r.brreg_flag };
+  }
+  return null;
+}
+
+router.get("/brreg-catalog-sweep", async (req: Request, res: Response) => {
+  if (!requireAdmin(req, res)) return;
+  try {
+    const db = getDb();
+    const candidateCount = countBrregSweepCandidates(db);
+    const batchRows = fetchBrregSweepBatch(db, BRREG_SWEEP_BATCH_CAP);
+
+    const results: BrregSweepRowResult[] = [];
+    for (const row of batchRows) {
+      results.push(await computeBrregSweepRowResult(row));
+    }
+    const flaggedForReview = results
+      .map(toFlaggedForReview)
+      .filter((x): x is NonNullable<typeof x> => x !== null);
+
+    res.json({
+      success: true,
+      dry_run: true,
+      candidate_count: candidateCount,
+      batch_size: results.length,
+      remaining_count: Math.max(0, candidateCount - results.length),
+      rows: results,
+      flagged_for_review: flaggedForReview,
+    });
+  } catch (err: any) {
+    res.status(500).json({ error: "Sweep diagnostic failed", detail: err.message });
+  }
+});
+
+router.post("/brreg-catalog-sweep", async (req: Request, res: Response) => {
+  if (!requireAdmin(req, res)) return;
+
+  // STRICT-FALSE parse — identical convention to POST /admin/
+  // description-truncation-sweep: null / "false" / 0 / "" / undefined all
+  // mean dry-run; only the literal JSON boolean `false` triggers real writes.
+  const body = (req.body ?? {}) as { dry_run?: unknown };
+  const dryRun = body.dry_run !== false;
+
+  try {
+    const db = getDb();
+    const candidateCount = countBrregSweepCandidates(db);
+    const batchRows = fetchBrregSweepBatch(db, BRREG_SWEEP_BATCH_CAP);
+
+    if (dryRun) {
+      const results: BrregSweepRowResult[] = [];
+      for (const row of batchRows) {
+        results.push(await computeBrregSweepRowResult(row));
+      }
+      const flaggedForReview = results
+        .map(toFlaggedForReview)
+        .filter((x): x is NonNullable<typeof x> => x !== null);
+
+      res.json({
+        success: true,
+        dry_run: true,
+        candidate_count: candidateCount,
+        batch_size: results.length,
+        remaining_count: Math.max(0, candidateCount - results.length),
+        would_update_count: results.length,
+        would_update: results,
+        flagged_for_review: flaggedForReview,
+      });
+      return;
+    }
+
+    // Real run — re-check each candidate row RIGHT BEFORE writing (never
+    // clobber a row that got checked by something else — registration-time
+    // wiring or a concurrent sweep run — since the scan above), then write
+    // ONLY the three brreg_* columns for that row.
+    const getCurrent = db.prepare("SELECT brreg_checked_at FROM agents WHERE id = ?");
+    const updateStmt = db.prepare(
+      "UPDATE agents SET brreg_verified = ?, brreg_flag = ?, brreg_checked_at = ? WHERE id = ?",
+    );
+
+    const updated: Array<{
+      id: string; name: string; org_nr: string; vertical: string;
+      brreg_verified: number; brreg_flag: string | null; brreg_checked_at: string | null;
+    }> = [];
+    const flaggedForReview: Array<{ id: string; name: string; org_nr: string; brreg_flag: string }> = [];
+    const skippedAlreadyCheckedIds: string[] = [];
+
+    for (const row of batchRows) {
+      const current = getCurrent.get(row.id) as { brreg_checked_at: string | null } | undefined;
+      if (!current || current.brreg_checked_at !== null) {
+        skippedAlreadyCheckedIds.push(row.id);
+        continue;
+      }
+      const vertical = row.vertical_id ?? "rfb";
+      const outcome = await runBrregVerifyForRegister(vertical, row.org_nr);
+      updateStmt.run(outcome.brreg_verified, outcome.brreg_flag, outcome.brreg_checked_at, row.id);
+      updated.push({
+        id: row.id,
+        name: row.name,
+        org_nr: row.org_nr,
+        vertical,
+        brreg_verified: outcome.brreg_verified,
+        brreg_flag: outcome.brreg_flag,
+        brreg_checked_at: outcome.brreg_checked_at,
+      });
+      if (outcome.brreg_flag && BRREG_SWEEP_REVIEW_FLAGS.has(outcome.brreg_flag)) {
+        flaggedForReview.push({ id: row.id, name: row.name, org_nr: row.org_nr, brreg_flag: outcome.brreg_flag });
+      }
+    }
+
+    res.json({
+      success: true,
+      dry_run: false,
+      candidate_count: candidateCount,
+      batch_size: batchRows.length,
+      remaining_count: Math.max(0, candidateCount - batchRows.length),
+      updated_count: updated.length,
+      updated,
+      skipped_already_checked_count: skippedAlreadyCheckedIds.length,
+      skipped_already_checked_ids: skippedAlreadyCheckedIds,
+      flagged_for_review: flaggedForReview,
+    });
+  } catch (err: any) {
+    res.status(500).json({ error: "Sweep failed", detail: err.message });
   }
 });
 

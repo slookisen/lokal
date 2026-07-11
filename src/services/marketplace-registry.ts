@@ -1230,6 +1230,9 @@ class MarketplaceRegistry {
       lastSeenAt: row.last_seen_at,
       isActive: row.is_active === 1,
       isVerified: row.is_verified === 1,
+      // dev-request 2026-06-30-brreg-verification-gate, catalog-sweep + badge
+      // slice — same mapping convention as isVerified above.
+      brregVerified: row.brreg_verified === 1,
       trustScore: row.trust_score,
       totalInteractions: row.total_interactions || 0,
       discoveryCount: row.discovery_count || 0,

@@ -125,6 +125,12 @@ export const RegisteredAgentSchema = AgentRegistrationSchema.extend({
   lastSeenAt: z.string().datetime(),
   isActive: z.boolean().default(true),
   isVerified: z.boolean().default(false),
+  // ─── dev-request 2026-06-30-brreg-verification-gate, catalog-sweep +
+  // badge slice ─── mirrors isVerified's mapping convention exactly. Set
+  // from agents.brreg_verified (see database/init.ts ~line 2298) either at
+  // registration time (POST /admin/agents/register) or by the backlog
+  // sweep (GET/POST /admin/agents/brreg-catalog-sweep, routes/admin-agents.ts).
+  brregVerified: z.boolean().default(false),
 
   // Trust metrics (built over time)
   trustScore: z.number().min(0).max(1).default(0.5),
