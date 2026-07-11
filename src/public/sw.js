@@ -71,8 +71,9 @@ function shouldBypass(request, originOverride) {
   const origin = originOverride || (typeof self !== "undefined" && self.location && self.location.origin);
   if (origin && url.origin !== origin) return true;
 
-  if (url.pathname.startsWith("/api/")) return true;
-  if (url.pathname.startsWith("/admin")) return true;
+  const path = url.pathname.toLowerCase();
+  if (path.startsWith("/api/")) return true;
+  if (path.startsWith("/admin")) return true;
 
   return false;
 }

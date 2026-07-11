@@ -102,6 +102,16 @@ export function runServiceWorkerTests(opts: { log?: boolean } = {}): TestSummary
       assertTrue(mod.shouldBypass(mk(`${origin}/api/marketplace/agents`, "POST")), "shouldBypass: non-GET request is bypassed regardless of path");
       assertTrue(mod.shouldBypass(mk("https://evil.example.com/logo-200.png"), origin), "shouldBypass: cross-origin request is bypassed");
 
+      // Express (this repo's server, default config) resolves mixed-case
+      // paths identically to their lowercase forms, so the guard must be
+      // case-insensitive too — otherwise /Admin/*, /API/* etc. fall through
+      // to the cache-first branch and get cache.put()'d despite the "never
+      // cache admin surfaces" contract above.
+      assertTrue(mod.shouldBypass(mk(`${origin}/Admin/dashboard`), origin), "shouldBypass: /Admin/dashboard (mixed-case) is bypassed");
+      assertTrue(mod.shouldBypass(mk(`${origin}/ADMIN/x`), origin), "shouldBypass: /ADMIN/x (upper-case) is bypassed");
+      assertTrue(mod.shouldBypass(mk(`${origin}/API/marketplace/agents`), origin), "shouldBypass: /API/marketplace/agents (upper-case) is bypassed");
+      assertTrue(mod.shouldBypass(mk(`${origin}/Api/x`), origin), "shouldBypass: /Api/x (mixed-case) is bypassed");
+
       assertTrue(!mod.shouldBypass(mk(`${origin}/manifest.json`), origin), "shouldBypass: GET /manifest.json (same-origin, not api/admin) is NOT bypassed");
       assertTrue(!mod.shouldBypass(mk(`${origin}/logo-200.png`), origin), "shouldBypass: GET /logo-200.png is NOT bypassed");
       assertTrue(!mod.shouldBypass(mk(`${origin}/`), origin), "shouldBypass: GET / (navigation) is NOT bypassed");
