@@ -1247,18 +1247,34 @@ export function listCategories(): Array<{ category: string; count: number }> {
  * bookmarked/indexed URL for a row the dedup pass folded into another row.
  * Returns null when the slug doesn't exist, isn't a duplicate, or its
  * canonical row is missing/has no slug of its own.
+ *
+ * dev-request 2026-07-11-dedup-false-positive-remediation: canonical_id can
+ * CHAIN — a row's canonical target may itself have been merged away by a
+ * later pass (A→B→C) — so walk hops until the TERMINAL row (canonical_id IS
+ * NULL) instead of stopping after one. A visited set guards against a cyclic
+ * chain (bad data must 404, not hang the request); on a cycle this returns
+ * null. The 0-hop and 1-hop cases behave exactly as before.
  */
 export function resolveCanonicalSlugForDuplicate(slug: string): string | null {
   if (!slug) return null;
   const db = getDb(VERTICAL);
   const row = db
-    .prepare("SELECT canonical_id FROM experiences WHERE slug = ?")
-    .get(slug) as { canonical_id: string | null } | undefined;
+    .prepare("SELECT id, canonical_id FROM experiences WHERE slug = ?")
+    .get(slug) as { id: string; canonical_id: string | null } | undefined;
   if (!row || !row.canonical_id) return null;
-  const canonical = db
-    .prepare("SELECT slug FROM experiences WHERE id = ?")
-    .get(row.canonical_id) as { slug: string | null } | undefined;
-  return canonical?.slug ?? null;
+  const getById = db.prepare("SELECT slug, canonical_id FROM experiences WHERE id = ?");
+  const visited = new Set<string>([row.id]);
+  let currentId: string = row.canonical_id;
+  for (;;) {
+    if (visited.has(currentId)) return null; // cycle — no terminal row exists
+    visited.add(currentId);
+    const current = getById.get(currentId) as
+      | { slug: string | null; canonical_id: string | null }
+      | undefined;
+    if (!current) return null; // dangling canonical_id
+    if (!current.canonical_id) return current.slug ?? null; // terminal row
+    currentId = current.canonical_id;
+  }
 }
 
 /**
