@@ -70,13 +70,25 @@ function escapeHtml(text: string): string {
 // admin-knowledge.ts can reuse this EXACT repair logic as the one-time DB
 // backfill for rows already corrupted before this render-time guard (and the
 // write-time gate) existed. Do not duplicate this logic elsewhere — import it.
+//
+// dev-request 2026-07-11 truncation-sweep fix-up: the trailing-run regex is
+// also exported on its own (TRAILING_REPLACEMENT_CHAR_REGEX) so the sweep
+// endpoint can classify a candidate row as "single trailing run" (safe to
+// auto-apply) vs. interior/multiple-occurrence/degenerate (never safe to
+// auto-apply — a code-review finding on the sweep PR showed the SECOND pass
+// below, `/�+/gu` → "", just deletes an interior "�" with no word-boundary
+// awareness, fusing the two halves of the surrounding text into new,
+// wrong-but-plausible text). This constant is the single source of truth for
+// "what counts as a trailing run" — do not re-derive it elsewhere.
+export const TRAILING_REPLACEMENT_CHAR_REGEX = /\S*�+\s*$/u;
+
 export function safeMetaDescription(text: string | null | undefined): string {
   if (!text) return "";
   let s = String(text);
   if (!s.includes("�")) return s;
   // Drop a trailing replacement-char run plus the (now-broken) word fragment
   // it's attached to, so we don't end the tag mid-word either.
-  s = s.replace(/\S*�+\s*$/u, "").trimEnd();
+  s = s.replace(TRAILING_REPLACEMENT_CHAR_REGEX, "").trimEnd();
   // Any remaining "�" (leading/interior) — collapse rather than ship it raw.
   s = s.replace(/�+/gu, "").replace(/\s{2,}/g, " ").trim();
   return s;

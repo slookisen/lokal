@@ -23,6 +23,31 @@
  *   (f) A second apply run over the now-clean catalog updates nothing
  *       (idempotent — no row still contains "�").
  *
+ * dev-request 2026-07-11 truncation-sweep fix-up (BLOCKING code-review
+ * finding): safeMetaDescription()'s second pass (`/�+/gu` → "") deletes an
+ * INTERIOR "�" with no word-boundary awareness, fusing text into new,
+ * wrong-but-plausible words (e.g. "kj�tt" -> "kjtt", not "kjøtt"). The sweep
+ * must therefore route anything that isn't a clean single-trailing-run to
+ * manual review, and NEVER auto-apply it. Additional coverage below:
+ *   (g) A row with "�" in the MIDDLE of the string (interior-only, no
+ *       trailing run at all) is flagged needs_manual_review in the GET
+ *       diagnostic and is NEVER auto-applied — its description is
+ *       byte-for-byte unchanged after a dry_run:false apply.
+ *   (h) A row with MULTIPLE "�" occurrences (one trailing + one interior —
+ *       exercises the "trailing regex matches, but '�' remains elsewhere"
+ *       branch) behaves the same way: manual-review, never auto-applied.
+ *   (i) A row that is ALL/mostly "�" (degenerate) is also routed to
+ *       manual-review, not auto-applied, even though the trailing regex
+ *       technically matches the whole string.
+ *   (j) In the SAME apply run, a genuine new trailing-only row IS still
+ *       auto-repaired (regression-guard: manual-review rows in the same
+ *       batch don't block auto-apply of the safe rows), and the apply
+ *       response's `updated` array carries a before/after audit entry for
+ *       it while `skipped_manual_review_ids` lists the three manual-review
+ *       rows. The GET diagnostic distinguishes auto-repairable vs.
+ *       manual-review rows via both a per-row flag and a dedicated
+ *       `rows_needing_manual_review` bucket.
+ *
  * Mirrors src/routes/admin-db-table-sizes.test.ts's pattern: in-memory
  * better-sqlite3 DB injected via __setDbForTesting + __initSchemaForTesting
  * (full prod-like schema), the router exercised directly (no HTTP server),
@@ -275,6 +300,146 @@ export function runDescriptionTruncationSweepTests(opts: { log?: boolean } = {})
         headers: { "x-admin-key": testKey },
       });
       assertEq(diagAfter.body?.corrupted_count, 0, "post-apply: diagnostic finds no corrupted rows left");
+
+      // ── (g)/(h)/(i)/(j) manual-review classification ─────────────────
+      // Fresh fixtures: interior-only, multiple-occurrence, degenerate, and
+      // a brand-new trailing-only row (to prove auto-apply still works for
+      // the safe case in the SAME batch as unsafe ones).
+      const interiorDescription = "Vi selger egg, kj�tt og gr�nnsaker";
+      const multipleDescription = "Gode r�varer og opplevelser p�";
+      const degenerateDescription = "�".repeat(15);
+      const trailing2Description = "Nystekt brød og friske bær hver dag p�";
+
+      insertAgent.run("agent-interior-1", "Interior Gård", interiorDescription, "key-interior-1");
+      insertAgent.run("agent-multiple-1", "Multiple Gård", multipleDescription, "key-multiple-1");
+      insertAgent.run("agent-degenerate-1", "Degenerate Gård", degenerateDescription, "key-degenerate-1");
+      insertAgent.run("agent-trailing-2", "Trailing Gård 2", trailing2Description, "key-trailing-2");
+
+      // ── (g)/(h)/(i) GET diagnostic distinguishes auto-repairable vs.
+      //     manual-review rows ────────────────────────────────────────────
+      const diag2 = await callRoute(router, "GET", "/description-truncation-sweep", {
+        headers: { "x-admin-key": testKey },
+      });
+      assertEq(diag2.body?.corrupted_count, 4, "diag2: 4 corrupted rows found (interior/multiple/degenerate/trailing-2)");
+      assertEq(diag2.body?.auto_repairable_count, 1, "diag2: exactly 1 auto-repairable (trailing-2)");
+      assertEq(diag2.body?.manual_review_count, 3, "diag2: exactly 3 rows need manual review");
+      const manualReviewIds2 = (diag2.body?.rows_needing_manual_review ?? []).map((r: any) => r.id).sort();
+      assertEq(
+        manualReviewIds2,
+        ["agent-degenerate-1", "agent-interior-1", "agent-multiple-1"],
+        "diag2: rows_needing_manual_review lists exactly the 3 unsafe rows",
+      );
+      const trailing2RowInReport = (diag2.body?.rows ?? []).find((r: any) => r.id === "agent-trailing-2");
+      assertTrue(!!trailing2RowInReport, "diag2: combined rows[] still includes the auto-repairable row");
+      assertEq(
+        trailing2RowInReport?.needs_manual_review,
+        false,
+        "diag2: the auto-repairable row is flagged needs_manual_review:false in the combined list",
+      );
+      const interiorRowInReport = (diag2.body?.rows ?? []).find((r: any) => r.id === "agent-interior-1");
+      assertEq(
+        interiorRowInReport?.needs_manual_review,
+        true,
+        "diag2: the interior-corruption row is flagged needs_manual_review:true",
+      );
+
+      // ── dry-run preview separates the two buckets too ────────────────
+      const dry2 = await callRoute(router, "POST", "/description-truncation-sweep", {
+        headers: { "x-admin-key": testKey },
+        body: { dry_run: true },
+      });
+      assertEq(dry2.body?.would_update_count, 1, "dry2: would_update_count only counts the auto-repairable row");
+      assertEq(
+        dry2.body?.would_update?.[0]?.id,
+        "agent-trailing-2",
+        "dry2: would_update previews only the trailing-only row",
+      );
+      assertEq(dry2.body?.manual_review_count, 3, "dry2: manual_review_count is 3");
+      const dry2ManualIds = (dry2.body?.needs_manual_review ?? []).map((r: any) => r.id).sort();
+      assertEq(
+        dry2ManualIds,
+        ["agent-degenerate-1", "agent-interior-1", "agent-multiple-1"],
+        "dry2: needs_manual_review preview lists exactly the 3 unsafe rows",
+      );
+
+      // ── (j) apply: only the trailing-only row gets written; the other
+      //     three are left byte-for-byte unchanged, never passed to
+      //     safeMetaDescription/UPDATE ───────────────────────────────────
+      updateCalls = 0;
+      const apply2 = await callRoute(router, "POST", "/description-truncation-sweep", {
+        headers: { "x-admin-key": testKey },
+        body: { dry_run: false },
+      });
+      assertEq(apply2.status, 200, "apply2: POST dry_run:false -> 200");
+      assertEq(apply2.body?.updated_count, 1, "apply2: updated_count is exactly 1 (trailing-2 only)");
+      assertEq(apply2.body?.updated_ids, ["agent-trailing-2"], "apply2: updated_ids is exactly [agent-trailing-2]");
+      assertEq(updateCalls, 1, "apply2: exactly ONE UPDATE statement issued despite 3 other corrupted rows present");
+      assertEq(apply2.body?.skipped_manual_review_count, 3, "apply2: skipped_manual_review_count is 3");
+      assertEq(
+        (apply2.body?.skipped_manual_review_ids ?? []).slice().sort(),
+        ["agent-degenerate-1", "agent-interior-1", "agent-multiple-1"],
+        "apply2: skipped_manual_review_ids lists exactly the 3 unsafe rows",
+      );
+      assertTrue(Array.isArray(apply2.body?.updated), "apply2: updated is an array (before/after audit trail)");
+      assertEq(apply2.body?.updated?.[0]?.id, "agent-trailing-2", "apply2: updated[0] is the trailing-2 row");
+      assertTrue(
+        typeof apply2.body?.updated?.[0]?.before_snippet === "string" &&
+          apply2.body.updated[0].before_snippet.includes("�"),
+        "apply2: updated[0].before_snippet shows the corruption marker",
+      );
+      assertTrue(
+        typeof apply2.body?.updated?.[0]?.after_snippet === "string" &&
+          !apply2.body.updated[0].after_snippet.includes("�"),
+        "apply2: updated[0].after_snippet has the corruption marker removed",
+      );
+
+      const interiorAfter = db
+        .prepare("SELECT description FROM agents WHERE id = ?")
+        .get("agent-interior-1") as { description: string };
+      assertEq(
+        interiorAfter.description,
+        interiorDescription,
+        "apply2: interior-corruption row's description is byte-for-byte unchanged",
+      );
+      const multipleAfter = db
+        .prepare("SELECT description FROM agents WHERE id = ?")
+        .get("agent-multiple-1") as { description: string };
+      assertEq(
+        multipleAfter.description,
+        multipleDescription,
+        "apply2: multiple-occurrence row's description is byte-for-byte unchanged",
+      );
+      const degenerateAfter = db
+        .prepare("SELECT description FROM agents WHERE id = ?")
+        .get("agent-degenerate-1") as { description: string };
+      assertEq(
+        degenerateAfter.description,
+        degenerateDescription,
+        "apply2: degenerate row's description is byte-for-byte unchanged",
+      );
+      const trailing2After = db
+        .prepare("SELECT description FROM agents WHERE id = ?")
+        .get("agent-trailing-2") as { description: string };
+      assertTrue(
+        !trailing2After.description.includes("�"),
+        "apply2: trailing-2 row's description no longer contains the replacement char",
+      );
+      assertTrue(
+        trailing2After.description.startsWith("Nystekt brød"),
+        "apply2: trailing-2's repaired description keeps the leading, unbroken text",
+      );
+
+      // ── final diagnostic still shows the 3 manual-review rows ────────
+      const diagFinal = await callRoute(router, "GET", "/description-truncation-sweep", {
+        headers: { "x-admin-key": testKey },
+      });
+      assertEq(
+        diagFinal.body?.corrupted_count,
+        3,
+        "diagFinal: 3 corrupted rows remain (only the manual-review ones — trailing-2 is fixed)",
+      );
+      assertEq(diagFinal.body?.auto_repairable_count, 0, "diagFinal: 0 auto-repairable rows remain");
+      assertEq(diagFinal.body?.manual_review_count, 3, "diagFinal: 3 rows still need manual review");
     } finally {
       (db as any).prepare = originalPrepare;
       initMod.__setDbForTesting(prevDb);

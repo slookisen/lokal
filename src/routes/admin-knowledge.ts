@@ -92,7 +92,7 @@ import { isDirectoryOrAggregatorHost } from "../services/cross-source-validator"
 // dev-request 2026-07-01-cs-corrections-profile-quality item C: reuse the
 // render-time repair logic as the one-time DB backfill/cleanup function —
 // see the truncation-sweep router at the bottom of this file.
-import { safeMetaDescription } from "./seo";
+import { safeMetaDescription, TRAILING_REPLACEMENT_CHAR_REGEX } from "./seo";
 // PR-24a: homepage CONTENT extractors (PR-22) + write helpers (PURE).
 import {
   isSafeFetchUrl,
@@ -1491,12 +1491,32 @@ homepageContentRefreshRouter.post(
 // DIFFERENT table and is NOT implicated in this byte-slice bug — this sweep
 // touches ONLY agents.description.
 //
+// dev-request 2026-07-11 truncation-sweep fix-up (BLOCKING code-review
+// finding): safeMetaDescription()'s trailing-run regex only fires when "�"
+// sits at the very end of the string. For an INTERIOR occurrence it falls
+// through to the second pass (`/�+/gu` → ""), which just deletes the
+// replacement char with no word-boundary awareness — FUSING the two halves
+// of surrounding text into new, wrong-but-plausible text (e.g.
+// "kj�tt" -> "kjtt", not "kjøtt" and not even a space). That's worse than the
+// original bug: the "�" at least signals corruption; fused output looks like
+// a real (if misspelled) word and is no longer catchable by a follow-up
+// `LIKE '%�%'` sweep. So this sweep's AUTO-APPLY path only ever repairs the
+// safe, confirmed case — a SINGLE trailing corruption run (see
+// classifyTruncation below) — and routes everything else (interior
+// occurrence, multiple occurrences, or a degenerate mostly-"�" string) to
+// manual review: it's surfaced in the GET diagnostic and in this POST
+// endpoint's dry-run preview, flagged `needs_manual_review: true` /
+// `rows_needing_manual_review`, but `POST ?apply` (dry_run:false) never
+// calls safeMetaDescription() or issues an UPDATE for it.
+//
 // GET  /admin/description-truncation-sweep
 //   Read-only diagnostic — ZERO writes. Scans every agents.description for a
-//   "�", and returns a capped report (id, name, snippet around the
-//   corruption). Capped the same way GET /admin/experiences-dedup-audit caps
-//   its response (AUDIT_RESPONSE_GROUP_CAP in routes/opplevelser.ts) so a
-//   large corpus can't blow up the response.
+//   "�", classifies each row (auto-repairable "trailing" vs. manual-review),
+//   and returns a capped report (id, name, snippet around the corruption,
+//   needs_manual_review) plus a `rows_needing_manual_review` bucket. Capped
+//   the same way GET /admin/experiences-dedup-audit caps its response
+//   (AUDIT_RESPONSE_GROUP_CAP in routes/opplevelser.ts) so a large corpus
+//   can't blow up the response.
 //
 // POST /admin/description-truncation-sweep
 //   Body: { dry_run?: boolean } — dry_run DEFAULTS TO TRUE when absent/not
@@ -1504,15 +1524,28 @@ homepageContentRefreshRouter.post(
 //   /admin/experiences-dedup-unmerge's convention exactly: null / "false" /
 //   0 / "" / undefined all mean dry-run; only the JSON boolean `false` is a
 //   real run). Dry-run reports the same diagnostic plus a preview of the
-//   cleaned value. A real run re-selects the current description for each
-//   candidate row RIGHT BEFORE writing and ONLY updates it if the "�" is
-//   STILL present at that moment — a row fixed by anything else between the
-//   scan and the write is left alone (never clobbers a since-fixed value),
-//   and an already-clean row is never touched or overwritten.
+//   cleaned value for auto-repairable rows, and a separate manual-review
+//   preview (no suggested "after" — there isn't a safe one). A real run
+//   ONLY ever touches rows classified "trailing": it re-classifies the
+//   CURRENT description for each candidate row RIGHT BEFORE writing and
+//   ONLY updates it if that row is STILL a clean single-trailing-run case at
+//   that moment — a row fixed (or mutated into something else) by anything
+//   else between the scan and the write is left alone (never clobbers a
+//   since-fixed value, never auto-applies a row that turned out to need
+//   manual review), and an already-clean row is never touched or
+//   overwritten. Rows classified "manual_review" are NEVER updated by this
+//   endpoint, no matter how many sweep runs go by — they must be fixed by a
+//   human. The apply response includes a before/after audit trail
+//   (`updated: [{id, name, before_snippet, after_snippet}]`) for every row
+//   it actually wrote, not just the bare id list.
 
 const REPLACEMENT_CHAR = "�";
 const TRUNCATION_SWEEP_RESPONSE_CAP = 100;
 const TRUNCATION_SNIPPET_CONTEXT = 30;
+// A cleaned (safeMetaDescription'd) result shorter than this is treated as
+// degenerate — the "trailing run" swallowed most/all of the string's real
+// content, so this is not a confident single-trailing-corruption case.
+const MIN_CLEANED_DESCRIPTION_LENGTH = 5;
 
 interface CorruptedDescriptionRow {
   id: string;
@@ -1525,6 +1558,52 @@ function findCorruptedDescriptions(db: ReturnType<typeof getDb>): CorruptedDescr
   return db
     .prepare("SELECT id, name, description FROM agents WHERE description LIKE ?")
     .all(`%${REPLACEMENT_CHAR}%`) as CorruptedDescriptionRow[];
+}
+
+export type TruncationClassification = "trailing" | "manual_review";
+
+/**
+ * Classify a "�"-containing `agents.description` as either:
+ *   - "trailing": the corruption is a SINGLE trailing run at the very end of
+ *     the string — exactly the case safeMetaDescription()'s trailing-run
+ *     regex (TRAILING_REPLACEMENT_CHAR_REGEX, imported from ./seo, NOT
+ *     re-derived here) repairs safely. Safe to auto-apply.
+ *   - "manual_review": anything else — an interior occurrence (the trailing
+ *     regex doesn't even match, because the last non-whitespace run isn't
+ *     itself a "�" run), multiple occurrences (the trailing regex matches
+ *     but "�" remains elsewhere after stripping that run), or a degenerate
+ *     string where stripping the trailing run leaves next to no real content
+ *     (most/all of the string was "�"). NEVER auto-applied — must be fixed
+ *     by a human.
+ *
+ * Pure — exported for unit-testing. Mirrors (does not duplicate) the two-pass
+ * logic in safeMetaDescription(); this function only decides WHETHER that
+ * repair is safe to trust for a given row, it never repairs anything itself.
+ */
+export function classifyTruncation(description: string): TruncationClassification {
+  if (!description.includes(REPLACEMENT_CHAR)) return "trailing"; // nothing to repair (caller shouldn't reach here)
+
+  if (!TRAILING_REPLACEMENT_CHAR_REGEX.test(description)) {
+    // No trailing run at all — every "�" is interior. This is exactly the
+    // fall-through-to-second-pass case the code review flagged.
+    return "manual_review";
+  }
+
+  const withoutTrailingRun = description.replace(TRAILING_REPLACEMENT_CHAR_REGEX, "");
+  if (withoutTrailingRun.includes(REPLACEMENT_CHAR)) {
+    // The trailing run matched, but there's ALSO corruption elsewhere —
+    // multiple occurrences. Only the trailing one would get a safe repair;
+    // the rest would still fall into the unsafe second pass. Manual review.
+    return "manual_review";
+  }
+
+  // Single trailing run confirmed. Guard against the degenerate case where
+  // that "run" is actually most/all of the string (safeMetaDescription would
+  // collapse it to near-nothing) — that's not a confident repair either.
+  const cleaned = safeMetaDescription(description);
+  if (cleaned.trim().length < MIN_CLEANED_DESCRIPTION_LENGTH) return "manual_review";
+
+  return "trailing";
 }
 
 /**
@@ -1552,15 +1631,25 @@ descriptionTruncationSweepRouter.get(
       id: row.id,
       name: row.name,
       snippet: truncationSnippet(row.description),
+      needs_manual_review: classifyTruncation(row.description) === "manual_review",
     }));
+    const rowsNeedingManualReview = report.filter((r) => r.needs_manual_review);
+    const autoRepairableRows = report.filter((r) => !r.needs_manual_review);
 
     res.json({
       success: true,
       dry_run: true,
       corrupted_count: report.length,
+      auto_repairable_count: autoRepairableRows.length,
+      manual_review_count: rowsNeedingManualReview.length,
       rows_returned: Math.min(report.length, TRUNCATION_SWEEP_RESPONSE_CAP),
       rows_truncated: report.length > TRUNCATION_SWEEP_RESPONSE_CAP,
+      // Combined report (unchanged shape from before this fix-up, now each
+      // row also carries needs_manual_review) plus a dedicated bucket for
+      // the rows that must NOT be auto-applied, so a human/CS agent can spot
+      // them without having to filter the combined list.
       rows: report.slice(0, TRUNCATION_SWEEP_RESPONSE_CAP),
+      rows_needing_manual_review: rowsNeedingManualReview.slice(0, TRUNCATION_SWEEP_RESPONSE_CAP),
     });
   },
 );
@@ -1580,37 +1669,73 @@ descriptionTruncationSweepRouter.post(
     const db = getDb();
     const candidates = findCorruptedDescriptions(db);
 
+    // Classify every candidate ONCE, up front, so the dry-run preview and
+    // the apply path agree on which rows are auto-repairable ("trailing")
+    // vs. manual-review (see classifyTruncation's doc comment).
+    const classified = candidates.map((row) => ({
+      row,
+      classification: classifyTruncation(row.description),
+    }));
+    const autoRepairable = classified.filter((c) => c.classification === "trailing");
+    const manualReview = classified.filter((c) => c.classification === "manual_review");
+
     if (dryRun) {
-      const preview = candidates.slice(0, TRUNCATION_SWEEP_RESPONSE_CAP).map((row) => ({
+      const preview = autoRepairable.slice(0, TRUNCATION_SWEEP_RESPONSE_CAP).map(({ row }) => ({
         id: row.id,
         name: row.name,
         before_snippet: truncationSnippet(row.description),
         after: safeMetaDescription(row.description),
       }));
+      // No suggested "after" for manual-review rows — there isn't a safe
+      // one; that's the whole point of routing them away from auto-apply.
+      const manualPreview = manualReview.slice(0, TRUNCATION_SWEEP_RESPONSE_CAP).map(({ row }) => ({
+        id: row.id,
+        name: row.name,
+        before_snippet: truncationSnippet(row.description),
+        needs_manual_review: true,
+      }));
       res.json({
         success: true,
         dry_run: true,
-        would_update_count: candidates.length,
-        rows_truncated: candidates.length > TRUNCATION_SWEEP_RESPONSE_CAP,
+        would_update_count: autoRepairable.length,
+        rows_truncated: autoRepairable.length > TRUNCATION_SWEEP_RESPONSE_CAP,
         would_update: preview,
+        manual_review_count: manualReview.length,
+        manual_review_rows_truncated: manualReview.length > TRUNCATION_SWEEP_RESPONSE_CAP,
+        needs_manual_review: manualPreview,
       });
       return;
     }
 
-    // Apply: re-check each row for the corruption marker RIGHT BEFORE writing
-    // (never clobber a value that was already fixed since the scan above),
-    // and only write rows that still need it.
+    // Apply: ONLY ever auto-repair rows classified "trailing" — see the
+    // router-level doc comment above and classifyTruncation's doc comment
+    // for why interior/multiple/degenerate corruption is never auto-applied.
+    // Re-check each candidate row RIGHT BEFORE writing (never clobber a
+    // value that was already fixed since the scan above, and never
+    // auto-apply a row that mutated into a manual-review case since the
+    // scan) — only write rows that are STILL a clean single-trailing-run
+    // case at that moment.
     const getCurrent = db.prepare("SELECT description FROM agents WHERE id = ?");
     const updateDescription = db.prepare("UPDATE agents SET description = ? WHERE id = ?");
 
+    const updated: Array<{ id: string; name: string; before_snippet: string; after_snippet: string }> = [];
     const updatedIds: string[] = [];
     const tx = db.transaction(() => {
-      for (const candidate of candidates) {
-        const current = getCurrent.get(candidate.id) as { description: string } | undefined;
+      for (const { row } of autoRepairable) {
+        const current = getCurrent.get(row.id) as { description: string } | undefined;
         if (!current || !current.description.includes(REPLACEMENT_CHAR)) continue; // since-fixed or gone — leave alone
+        if (classifyTruncation(current.description) !== "trailing") continue; // mutated into a manual-review case — leave alone
         const cleaned = safeMetaDescription(current.description);
-        updateDescription.run(cleaned, candidate.id);
-        updatedIds.push(candidate.id);
+        updateDescription.run(cleaned, row.id);
+        updated.push({
+          id: row.id,
+          name: row.name,
+          before_snippet: truncationSnippet(current.description),
+          after_snippet: cleaned.length > 2 * TRUNCATION_SNIPPET_CONTEXT
+            ? `${cleaned.slice(0, 2 * TRUNCATION_SNIPPET_CONTEXT)}…`
+            : cleaned,
+        });
+        updatedIds.push(row.id);
       }
     });
     tx();
@@ -1622,6 +1747,16 @@ descriptionTruncationSweepRouter.post(
       updated_count: updatedIds.length,
       updated_ids: updatedIds.slice(0, TRUNCATION_SWEEP_RESPONSE_CAP),
       ids_truncated: updatedIds.length > TRUNCATION_SWEEP_RESPONSE_CAP,
+      // Before/after audit trail for every row this run actually wrote — so
+      // a human can spot-check the repair, not just see that "some id" changed.
+      updated: updated.slice(0, TRUNCATION_SWEEP_RESPONSE_CAP),
+      // Rows this run intentionally left alone because they need a human —
+      // never auto-applied, but still visible in the response (and in the
+      // GET diagnostic's rows_needing_manual_review bucket).
+      skipped_manual_review_count: manualReview.length,
+      skipped_manual_review_ids: manualReview
+        .slice(0, TRUNCATION_SWEEP_RESPONSE_CAP)
+        .map((c) => c.row.id),
     });
   },
 );
