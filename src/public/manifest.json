@@ -1,0 +1,22 @@
+{
+  "name": "Rett fra Bonden",
+  "short_name": "Rett fra Bonden",
+  "description": "Lokal mat rett fra bonden i Norge — vi kobler norske matprodusenter direkte til kunder og AI-assistenter som ChatGPT og Claude.",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#ffffff",
+  "theme_color": "#2D5016",
+  "icons": [
+    {
+      "src": "/logo-200.png",
+      "sizes": "200x200",
+      "type": "image/png"
+    },
+    {
+      "src": "/logo-512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "any"
+    }
+  ]
+}

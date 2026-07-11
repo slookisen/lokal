@@ -322,6 +322,8 @@ function shell(
   <link rel="icon" href="/favicon.svg" type="image/svg+xml">
   <link rel="icon" href="/favicon.ico" sizes="any">
   <link rel="apple-touch-icon" href="/logo-200.png">
+  <link rel="manifest" href="/manifest.json">
+  <meta name="theme-color" content="#2D5016">
   <title>${escapeHtml(title)}</title>
   <meta name="description" content="${escapeHtml(description)}">
   <link rel="canonical" href="${canonicalUrl}">

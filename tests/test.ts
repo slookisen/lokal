@@ -541,6 +541,20 @@ console.log("\n── experience-store (formatDistanceLabel) ──");
   console.log(`  experience-store: ${r.passed} passed, ${r.failed} failed`);
 }
 
+// ── dev-request 2026-07-04-app-strategi-pwa, slice 1 of 3: manifest.json +
+// icons (rfb host only). Pins the required PWA fields on
+// src/public/manifest.json (name/short_name/start_url/display/icons).
+console.log("\n── manifest.json (PWA manifest, rfb) ──");
+{
+  const { runManifestTests } = require("../src/public/manifest.test") as
+    typeof import("../src/public/manifest.test");
+  const r = runManifestTests({ log: false });
+  passed += r.passed;
+  failed += r.failed;
+  for (const f of r.failures) failures.push("manifest: " + f);
+  console.log(`  manifest: ${r.passed} passed, ${r.failed} failed`);
+}
+
 // ── dev-request 2026-07-04-opplevagent-naer-meg-geosok, item 3: /sok's
 // distance-sort toggle URL builder (pure — preserves q/tags/lat/lng/
 // radius_km/sted while adding or removing sort=distance).
