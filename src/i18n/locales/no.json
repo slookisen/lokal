@@ -116,6 +116,7 @@
   "producer": {
     "title_suffix": " — Lokal matprodusent i {city}",
     "verified": "Verifisert",
+    "brreg_verified": "Registrert i Brønnøysund",
     "trust_score": "Trust Score",
     "categories": "Kategorier",
     "specialties": "Spesialiteter",

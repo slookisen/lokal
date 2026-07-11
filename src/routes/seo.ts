@@ -187,6 +187,11 @@ const CSS = `
   /* Tags & badges */
   .badge { display: inline-flex; align-items: center; gap: 4px; padding: 3px 11px; border-radius: 20px; font-size: 0.72rem; font-weight: 600; }
   .badge-v { background: var(--green-100); color: var(--green-700); }
+  /* Slice 3 of dev-request 2026-06-30-brreg-verification-gate: a SEPARATE,
+     distinctly-colored badge for Brreg org-nr verification — never
+     conflated with .badge-v above (platform claim-verification means
+     something different from "matched against Brønnøysundregistrene"). */
+  .badge-brreg { background: var(--blue-100, #dbeafe); color: var(--blue-700, #1d4ed8); }
   .badge-o { background: var(--orange-light); color: #b45309; }
   .badge-c { background: var(--g100); color: var(--g700); }
   .tag { display: inline-block; padding: 3px 10px; background: var(--g100); border-radius: 12px; font-size: 0.73rem; color: var(--g500); font-weight: 500; margin-right: 4px; margin-bottom: 4px; }
@@ -407,6 +412,12 @@ function producerCard(a: any, _matchReasons?: string[], lang: Lang = "no"): stri
     desc = "";
   }
   const verified = a.isVerified ? `<span class="badge badge-v">&#10003; ${escapeHtml(t(lang, "producer.verified"))}</span>` : "";
+  // Slice 3 of dev-request 2026-06-30-brreg-verification-gate: a SEPARATE
+  // badge from `verified` above — this one only reflects agents.
+  // brreg_verified (Brønnøysund org-nr match), never the platform's own
+  // claim-verification. Renders ONLY when truthy; no-org-nr / unverified
+  // agents get no badge at all (never a negative signal).
+  const brregBadge = a.brregVerified ? `<span class="badge badge-brreg">&#10003; ${escapeHtml(t(lang, "producer.brreg_verified"))}</span>` : "";
   // EN viewers see a discreet "Norwegian original" hint when descriptions
   // have not been translated yet (we only have NO descriptions for now).
   const noteHtml = (lang === "en" && desc) ? `<div class="pc-note" title="${escapeHtml(t(lang, "common.translate_note"))}" style="font-size:11px;color:#888;margin-top:4px;">\u{1F1F3}\u{1F1F4} ${escapeHtml(t(lang, "common.from_norwegian"))}</div>` : "";
@@ -417,7 +428,7 @@ function producerCard(a: any, _matchReasons?: string[], lang: Lang = "no"): stri
         <div class="pc-name" translate="no">${escapeHtml(a.name)}</div>
         <div class="pc-city" translate="no">${cityText}</div>
       </div>
-      ${verified}
+      ${verified}${brregBadge}
     </div>
     ${desc ? `<div class="pc-desc"${lang === "en" ? ' lang="nb"' : ""}>${escapeHtml(desc)}</div>${noteHtml}` : ""}
     <div class="pc-tags">${cats}</div>
@@ -476,6 +487,10 @@ function producerCardUltraRich(a: any, knowledge: any, lang: Lang = "no"): strin
   if (desc.length > 350) desc = desc.slice(0, 347).trimEnd() + "…";
 
   const verified = `<span class="badge badge-v">&#10003; ${escapeHtml(t(lang, "producer.verified"))}</span>`;
+  // Slice 3 of dev-request 2026-06-30-brreg-verification-gate — see the
+  // identical pattern + rationale in producerCard() above. Renders ONLY
+  // when a.brregVerified is truthy.
+  const brregBadge = a.brregVerified ? `<span class="badge badge-brreg">&#10003; ${escapeHtml(t(lang, "producer.brreg_verified"))}</span>` : "";
 
   // Rating: ★ 4.7 (159)
   const rating = (typeof knowledge?.googleRating === "number" && knowledge.googleRating > 0)
@@ -521,7 +536,7 @@ function producerCardUltraRich(a: any, knowledge: any, lang: Lang = "no"): strin
         <div class="pc-name" translate="no">${escapeHtml(a.name)}${rating}</div>
         <div class="pc-city" translate="no">${cityText}</div>
       </div>
-      ${verified}
+      ${verified}${brregBadge}
     </div>
     ${desc ? `<div class="pc-desc"${lang === "en" ? ' lang="nb"' : ""}>${escapeHtml(desc)}</div>${noteHtml}` : ""}
     ${productLine}
@@ -559,6 +574,10 @@ function producerCardMediumRich(a: any, knowledge: any, lang: Lang = "no"): stri
   if (desc.length > 180) desc = desc.slice(0, 177).trimEnd() + "…";
 
   const verified = `<span class="badge badge-v">&#10003; ${escapeHtml(t(lang, "producer.verified"))}</span>`;
+  // Slice 3 of dev-request 2026-06-30-brreg-verification-gate — see the
+  // identical pattern + rationale in producerCard() above. Renders ONLY
+  // when a.brregVerified is truthy.
+  const brregBadge = a.brregVerified ? `<span class="badge badge-brreg">&#10003; ${escapeHtml(t(lang, "producer.brreg_verified"))}</span>` : "";
 
   const rating = (typeof knowledge?.googleRating === "number" && knowledge.googleRating > 0)
     ? `<span class="pc-rating">★ ${knowledge.googleRating.toFixed(1)}</span>`
@@ -594,7 +613,7 @@ function producerCardMediumRich(a: any, knowledge: any, lang: Lang = "no"): stri
         <div class="pc-name" translate="no">${escapeHtml(a.name)}${rating}</div>
         <div class="pc-city" translate="no">${cityText}</div>
       </div>
-      ${verified}
+      ${verified}${brregBadge}
     </div>
     ${desc ? `<div class="pc-desc"${lang === "en" ? ' lang="nb"' : ""}>${escapeHtml(desc)}</div>${noteHtml}` : ""}
     <div class="pc-meta">
@@ -3491,6 +3510,11 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
     // Badges
     const badges: string[] = [];
     if (agent.isVerified) badges.push(`<span class="badge badge-v">&#10003; Verifisert</span>`);
+    // Slice 3 of dev-request 2026-06-30-brreg-verification-gate: a SEPARATE
+    // badge from isVerified above — reflects agents.brreg_verified (Brreg
+    // org-nr match), not the platform's own claim-verification. Renders
+    // ONLY when truthy; no-org-nr / unverified agents get no badge.
+    if (agent.brregVerified) badges.push(`<span class="badge badge-brreg">&#10003; ${escapeHtml(t(lang, "producer.brreg_verified"))}</span>`);
     const certs = k.certifications || [];
     if (certs.some((c: string) => c.toLowerCase().includes("kolog"))) badges.push(`<span class="badge badge-o">&#127793; \u00d8kologisk</span>`);
     (agent.categories || []).slice(0, 3).forEach((c: string) => badges.push(`<span class="badge badge-c">${escapeHtml(formatCat(c))}</span>`));

@@ -111,6 +111,12 @@ async function runBrregVerifyForRegister(
   }
 }
 
+// ─── Slice 3 of dev-request 2026-06-30-brreg-verification-gate ─────────
+// ("catalog sweep + badge") shares the SAME NACE-overlap computation as
+// Slice 2's runBrregVerifyForRegister() above — exported here so the sweep
+// endpoint below (and any future caller) never forks the logic.
+export { runBrregVerifyForRegister, BRREG_NACE_ALLOWLIST };
+
 function getAdminKey(): string {
   return process.env.ADMIN_KEY || process.env.ANALYTICS_ADMIN_KEY || "";
 }
@@ -442,6 +448,235 @@ router.post("/register", async (req: Request, res: Response) => {
     });
   } catch (err: any) {
     res.status(500).json({ error: "Registration failed", detail: err.message });
+  }
+});
+
+// ─── Slice 3 of dev-request 2026-06-30-brreg-verification-gate ─────────
+// ("catalog sweep + badge")
+//
+// POST /admin/agents/brreg-sweep
+//   Batch RE-verifies EXISTING agents (rfb + experiences only — same
+//   dental exclusion as Slice 2) that have an org_nr set but have either
+//   never been Brreg-checked (brreg_checked_at IS NULL) or were last
+//   checked more than BRREG_SWEEP_STALE_DAYS days ago. Reuses
+//   runBrregVerifyForRegister() (Slice 2, above) for the Brreg call + the
+//   per-vertical NACE-overlap computation — this sweep never forks that
+//   logic, it just calls it once per candidate agent.
+//
+//   Unlike POST /register above, this endpoint is NOT gated by
+//   BRREG_VERIFY_ON_REGISTER — that flag only controls verification at
+//   registration time. The sweep is itself the opt-in mechanism: it does
+//   nothing until an operator (or a future scheduled job — NOT wired up
+//   in this slice, see note below) calls it.
+//
+//   Staleness window: 30 days. Rationale: Brreg registry state (dissolved/
+//   bankrupt/NACE changes) moves slowly enough that daily/weekly re-checks
+//   would be wasted load against a public rate-limited API for near-zero
+//   signal; 30 days keeps the catalog reasonably fresh without hammering
+//   Brreg. Not configurable via query param in this slice — a fixed,
+//   documented default was judged sufficient for the first cut.
+//
+//   This endpoint does NOT run automatically — no cron/scheduled-agent
+//   wiring is added in this slice (out of scope; see dev-request). It is
+//   invoked on demand, consistent with the existing admin-sweep pattern
+//   (admin-debio-cross-check.ts, admin-search-enrich.ts) elsewhere in this
+//   codebase.
+//
+//   Query params:
+//     limit    1..500, default 200 — max agents to verify in THIS call.
+//              Brreg org-nr lookups are cheap/direct (unlike the TRACES
+//              pagination admin-debio-cross-check.ts has to chunk), but we
+//              still cap per-call work defensively against Fly's 120s
+//              proxy timeout given the ~1s polite delay between calls.
+//     offset   >=0, default 0 — skips N rows of the CURRENT matching set
+//              (ordered deterministically by `id`). CAVEAT (same one
+//              admin-knowledge.ts's prune-dead-urls sweep documents for its
+//              own offset param): because every call here WRITES
+//              brreg_checked_at, a swept row falls OUT of the matching set
+//              immediately — so incrementing offset across successive real
+//              sweep calls is NOT a safe way to page (row N gets skipped
+//              because row N-1's removal shifted the set underneath it).
+//              The always-correct way to sweep the full catalog across
+//              multiple calls is simply: call again with the SAME limit
+//              and offset=0 (default) repeatedly until `swept` comes back
+//              0 — already-processed rows drop out of the WHERE filter on
+//              their own, so the queue drains monotonically without needing
+//              offset at all. offset is exposed mainly for ad-hoc
+//              inspection (e.g. "what's the 501st-1000th stale row right
+//              now, before I've swept anything").
+//
+//   Response:
+//     { success: true, swept, verified, flagged_dissolved,
+//       flagged_bankrupt, flagged_wrong_nace, errors, limit, offset,
+//       has_more: boolean,  // batch was full (limit) — more matching rows
+//                            // likely remain; call again with offset=0
+//                            // (see the offset caveat above) until this
+//                            // comes back false or `swept` is 0.
+//       flagged: [{ id, name, org_nr, vertical_id, flag }] }
+//
+//   Never auto-deletes or de-lists anything — this endpoint only SURFACES
+//   flagged agents for human review, per the dev-request spec's own
+//   language: "de-list candidate", not auto-delete.
+//
+//   Brreg is a public, rate-limited (open data, NLOD-licensed) API, so a
+//   polite ~1s delay is applied between calls (skipped before the first
+//   row) — same PACE_MS convention as admin-search-enrich.ts. The delay
+//   function is injectable (see runBrregCatalogSweep's `sleepFn` option)
+//   so tests can run the sweep over multiple rows without incurring real
+//   wall-clock delays.
+
+const BRREG_SWEEP_DEFAULT_LIMIT = 200;
+const BRREG_SWEEP_HARD_CAP = 500;
+const BRREG_SWEEP_STALE_DAYS = 30;
+const BRREG_SWEEP_PACE_MS = 1_000;
+
+const defaultSweepSleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
+
+interface BrregSweepTargetRow {
+  id: string;
+  name: string;
+  org_nr: string;
+  vertical_id: string;
+}
+
+export interface BrregSweepFlaggedAgent {
+  id: string;
+  name: string;
+  org_nr: string;
+  vertical_id: string;
+  flag: string;
+}
+
+export interface BrregSweepResult {
+  swept: number;
+  verified: number;
+  flagged_dissolved: number;
+  flagged_bankrupt: number;
+  flagged_wrong_nace: number;
+  errors: number;
+  limit: number;
+  offset: number;
+  has_more: boolean;
+  flagged: BrregSweepFlaggedAgent[];
+}
+
+// Core sweep — factored out of the route handler so tests can call it
+// directly with an injected no-op sleepFn (avoids ~1s-per-row real delays
+// slowing the test suite down), mirroring the dependency-injection style
+// already used by services/search-enrich-sweep.ts for the same reason.
+export async function runBrregCatalogSweep(opts: {
+  limit?: number;
+  offset?: number;
+  sleepFn?: (ms: number) => Promise<void>;
+} = {}): Promise<BrregSweepResult> {
+  const limit = Math.min(
+    Math.max(1, Math.floor(typeof opts.limit === "number" && Number.isFinite(opts.limit) ? opts.limit : BRREG_SWEEP_DEFAULT_LIMIT)),
+    BRREG_SWEEP_HARD_CAP,
+  );
+  const offset = Math.max(0, Math.floor(typeof opts.offset === "number" && Number.isFinite(opts.offset) ? opts.offset : 0));
+  const sleepFn = opts.sleepFn ?? defaultSweepSleep;
+
+  const db = getDb();
+  const staleBefore = new Date(Date.now() - BRREG_SWEEP_STALE_DAYS * 24 * 60 * 60 * 1000).toISOString();
+
+  const rows = db
+    .prepare(
+      `SELECT id, name, org_nr, vertical_id FROM agents
+       WHERE vertical_id IN ('rfb', 'experiences')
+         AND org_nr IS NOT NULL AND TRIM(org_nr) <> ''
+         AND (brreg_checked_at IS NULL OR brreg_checked_at < ?)
+       ORDER BY id ASC
+       LIMIT ? OFFSET ?`
+    )
+    .all(staleBefore, limit, offset) as BrregSweepTargetRow[];
+
+  const result: BrregSweepResult = {
+    swept: 0,
+    verified: 0,
+    flagged_dissolved: 0,
+    flagged_bankrupt: 0,
+    flagged_wrong_nace: 0,
+    errors: 0,
+    limit,
+    offset,
+    has_more: rows.length === limit,
+    flagged: [],
+  };
+
+  const updateStmt = db.prepare(
+    `UPDATE agents SET brreg_verified = ?, brreg_flag = ?, brreg_checked_at = ? WHERE id = ?`
+  );
+
+  for (let i = 0; i < rows.length; i++) {
+    const row = rows[i]!;
+    if (i > 0) await sleepFn(BRREG_SWEEP_PACE_MS);
+
+    try {
+      // runBrregVerifyForRegister() itself never throws (see its own
+      // doc-comment above) — this try/catch is defensive against the DB
+      // write below (or any future change to that contract), so a single
+      // bad row can never abort the rest of the batch.
+      const outcome = await runBrregVerifyForRegister(row.vertical_id, row.org_nr);
+      updateStmt.run(outcome.brreg_verified, outcome.brreg_flag, outcome.brreg_checked_at, row.id);
+
+      result.swept++;
+      if (outcome.brreg_verified === 1) result.verified++;
+
+      if (outcome.brreg_flag === "dissolved" || outcome.brreg_flag === "bankrupt" || outcome.brreg_flag === "wrong_nace") {
+        if (outcome.brreg_flag === "dissolved") result.flagged_dissolved++;
+        else if (outcome.brreg_flag === "bankrupt") result.flagged_bankrupt++;
+        else result.flagged_wrong_nace++;
+        result.flagged.push({
+          id: row.id,
+          name: row.name,
+          org_nr: row.org_nr,
+          vertical_id: row.vertical_id,
+          flag: outcome.brreg_flag,
+        });
+      }
+    } catch (err) {
+      result.errors++;
+      console.warn(
+        "[admin-agents] brreg-sweep row failed unexpectedly (batch continues):",
+        row.id,
+        err instanceof Error ? err.message : err,
+      );
+    }
+  }
+
+  return result;
+}
+
+router.post("/brreg-sweep", async (req: Request, res: Response) => {
+  if (!requireAdmin(req, res)) return;
+
+  const rawLimit = req.query.limit;
+  let limit: number | undefined;
+  if (rawLimit !== undefined) {
+    const n = parseInt(rawLimit as string, 10);
+    if (!Number.isFinite(n) || n < 1) {
+      res.status(400).json({ error: "invalid limit", detail: "limit must be >= 1" });
+      return;
+    }
+    limit = n;
+  }
+
+  const rawOffset = req.query.offset;
+  let offset: number | undefined;
+  if (rawOffset !== undefined) {
+    const n = parseInt(rawOffset as string, 10);
+    if (!Number.isFinite(n) || n < 0) {
+      res.status(400).json({ error: "invalid offset", detail: "offset must be >= 0" });
+      return;
+    }
+    offset = n;
+  }
+
+  try {
+    const result = await runBrregCatalogSweep({ limit, offset });
+    res.json({ success: true, ...result });
+  } catch (err: any) {
+    res.status(500).json({ success: false, error: "Brreg sweep failed", detail: err?.message || String(err) });
   }
 });
 

@@ -22706,6 +22706,25 @@ Promise.allSettled(_adminAgentsRegisterDeps).then(async () => {
   } catch (err: any) {
     failed++;
     failures.push("admin-agents-register: unexpected error: " + String(err?.message || err));
+  }
+
+  // ── admin-agents-brreg-sweep: Slice 3 of the same dev-request ("catalog
+  // sweep + badge") — chained sequentially AFTER the register tests above
+  // (same testDb-singleton-swapping discipline: both live inside this one
+  // already-fully-serialized block rather than declaring a brand-new
+  // top-level dependency chain) ────────────────────────────────────────
+  console.log("\n── admin-agents-brreg-sweep: POST /admin/agents/brreg-sweep ──");
+  try {
+    const { runAdminAgentsBrregSweepTests } = require("../src/routes/admin-agents-brreg-sweep.test") as
+      typeof import("../src/routes/admin-agents-brreg-sweep.test");
+    const sr = await runAdminAgentsBrregSweepTests({ log: false });
+    passed += sr.passed;
+    failed += sr.failed;
+    for (const f of sr.failures) failures.push("admin-agents-brreg-sweep: " + f);
+    console.log(`  admin-agents-brreg-sweep: ${sr.passed} passed, ${sr.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("admin-agents-brreg-sweep: unexpected error: " + String(err?.message || err));
   } finally {
     _adminAgentsRegisterResolve();
   }
@@ -25402,6 +25421,93 @@ const _rfbDebioSuitePromise: Promise<void> = new Promise<void>(r => { _rfbDebioS
     } catch (err) {
       failed++;
       failures.push(`rfb-crosscheck-guard: unexpected error: ${err instanceof Error ? (err.stack || err.message) : String(err)}`);
+    } finally {
+      initModRfb.__setDbForTesting(prevDbRfb);
+      db.close();
+    }
+  }
+  // ── G. Slice 3 of dev-request 2026-06-30-brreg-verification-gate
+  //    ("catalog sweep + badge"): the public "Registrert i Brønnøysund"
+  //    badge on GET /produsent/:slug renders ONLY when agents.
+  //    brreg_verified is truthy, is textually/visually distinct from the
+  //    unrelated isVerified "Verifisert" badge, and is absent for
+  //    no-org-nr / unverified agents (never a negative signal). ──
+  {
+    const prevDbRfb = initModRfb.getDb();
+    const db = new Database(":memory:");
+    db.pragma("foreign_keys = ON");
+    try {
+      initModRfb.__setDbForTesting(db);
+      initModRfb.__initSchemaForTesting(db);
+
+      db.prepare(`
+        INSERT INTO agents (
+          id, name, description, provider, contact_email, url, role, api_key,
+          city, lat, lng, is_active, is_verified, vertical_id, org_nr, brreg_verified
+        ) VALUES (
+          'brreg-badge-yes', 'Brreg Badge Gård', 'Test', 'Brreg Badge Gård', 'badge@example.no',
+          'https://brreg-badge-gard.no', 'producer', 'key-brreg-badge-yes',
+          'Oslo', 59.91, 10.75, 1, 0, 'rfb', '910000099', 1
+        )
+      `).run();
+      db.prepare(`
+        INSERT INTO agents (
+          id, name, description, provider, contact_email, url, role, api_key,
+          city, lat, lng, is_active, is_verified, vertical_id, org_nr, brreg_verified
+        ) VALUES (
+          'brreg-badge-no', 'Usjekket Gård', 'Test', 'Usjekket Gård', 'nobadge@example.no',
+          'https://usjekket-gard.no', 'producer', 'key-brreg-badge-no',
+          'Oslo', 59.91, 10.75, 1, 0, 'rfb', NULL, 0
+        )
+      `).run();
+
+      const seoRouterG = require("../src/routes/seo").default as any;
+      const layerG = (seoRouterG.stack as any[]).find(
+        (l: any) => l.route && l.route.path === "/produsent/:slug" && l.route.methods?.get
+      );
+      assertTrue(!!layerG, "brreg-badge: GET /produsent/:slug layer is registered");
+      const handlerG = layerG.route.stack[layerG.route.stack.length - 1].handle;
+
+      function invokeProdusentG(slug: string, lang: "no" | "en"): { status: number; body: string } {
+        let status = 200;
+        let body = "";
+        const res: any = {
+          status: (c: number) => { status = c; return res; },
+          send: (b: unknown) => { body = typeof b === "string" ? b : String(b); return res; },
+          redirect: (_c: number, _l: string) => { status = 301; return res; },
+        };
+        const req: any = { params: { slug }, lang, ip: "127.0.0.1" };
+        handlerG(req, res);
+        return { status, body };
+      }
+
+      // NOTE: the page's <style> block always defines the `.badge-brreg {
+      // ... }` CSS rule regardless of whether any agent on the page is
+      // Brreg-verified — so assertions must look for the actual rendered
+      // <span class="badge badge-brreg"> markup, not the bare substring
+      // "badge-brreg" (which the CSS rule itself would also match).
+      const BRREG_BADGE_SPAN = 'class="badge badge-brreg"';
+
+      const yesPage = invokeProdusentG("brreg-badge-gard", "no");
+      assertEq(yesPage.status, 200, "brreg-badge: brreg_verified=1 agent's profile page renders 200");
+      assertTrue(yesPage.body.includes(BRREG_BADGE_SPAN), "brreg-badge: brreg_verified=1 profile page renders the <span class=\"badge badge-brreg\"> markup");
+      assertTrue(yesPage.body.includes("Registrert i Brønnøysund"), "brreg-badge: brreg_verified=1 profile page renders the NO Brreg badge label");
+      // is_verified=0 on this fixture (unrelated claim-verification flag) —
+      // confirms badge-brreg is a genuinely separate class, not an alias
+      // for badge-v (which must stay absent here).
+      assertTrue(!yesPage.body.includes('class="badge badge-v"'), "brreg-badge: badge-brreg is a distinct class from badge-v (badge-v span absent since is_verified=0)");
+
+      const noPage = invokeProdusentG("usjekket-gard", "no");
+      assertEq(noPage.status, 200, "brreg-badge: unverified/no-org-nr agent's profile page renders 200");
+      assertTrue(!noPage.body.includes(BRREG_BADGE_SPAN), "brreg-badge: brreg_verified=0 profile page never renders the <span class=\"badge badge-brreg\"> markup");
+      assertTrue(!noPage.body.includes("Registrert i Brønnøysund"), "brreg-badge: brreg_verified=0 profile page never renders the Brreg badge label");
+
+      const yesPageEn = invokeProdusentG("brreg-badge-gard", "en");
+      assertEq(yesPageEn.status, 200, "brreg-badge: EN profile page renders 200");
+      assertTrue(yesPageEn.body.includes("Registered in Brønnøysund"), "brreg-badge: EN profile page renders the EN Brreg badge label (routed through t())");
+    } catch (err) {
+      failed++;
+      failures.push(`brreg-badge: unexpected error: ${err instanceof Error ? (err.stack || err.message) : String(err)}`);
     } finally {
       initModRfb.__setDbForTesting(prevDbRfb);
       db.close();

@@ -1230,6 +1230,10 @@ class MarketplaceRegistry {
       lastSeenAt: row.last_seen_at,
       isActive: row.is_active === 1,
       isVerified: row.is_verified === 1,
+      // Slice 3 of dev-request 2026-06-30-brreg-verification-gate: surfaces
+      // agents.brreg_verified (Slice 1/2/3 columns) for the public badge in
+      // src/routes/seo.ts. Distinct from isVerified above.
+      brregVerified: row.brreg_verified === 1,
       trustScore: row.trust_score,
       totalInteractions: row.total_interactions || 0,
       discoveryCount: row.discovery_count || 0,

@@ -116,6 +116,7 @@
   "producer": {
     "title_suffix": " — Local food producer in {city}",
     "verified": "Verified",
+    "brreg_verified": "Registered in Brønnøysund Register Centre",
     "trust_score": "Trust Score",
     "categories": "Categories",
     "specialties": "Specialties",

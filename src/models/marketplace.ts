@@ -125,6 +125,14 @@ export const RegisteredAgentSchema = AgentRegistrationSchema.extend({
   lastSeenAt: z.string().datetime(),
   isActive: z.boolean().default(true),
   isVerified: z.boolean().default(false),
+  // Slice 3 of dev-request 2026-06-30-brreg-verification-gate ("catalog
+  // sweep + badge"): distinct from isVerified above (that's the platform's
+  // own claim-verification flag). brregVerified mirrors the agents.
+  // brreg_verified DB column — 1 iff Slice 1/2/3's verifyOrgNumber() has
+  // confirmed this agent's org_nr against Brønnøysundregistrene. Never
+  // implies a negative signal when false/absent (no-org-nr agents render
+  // with no badge, never blocked) — see src/routes/seo.ts's badge logic.
+  brregVerified: z.boolean().default(false),
 
   // Trust metrics (built over time)
   trustScore: z.number().min(0).max(1).default(0.5),
