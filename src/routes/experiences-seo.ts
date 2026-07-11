@@ -1832,6 +1832,13 @@ function renderBrowsePage(opts: {
   // buildCategoryFaqJsonLd/buildKommuneFaqJsonLd). Omitted entirely when the
   // quality gate says the page doesn't have enough real facts.
   extraJsonLd?: any[];
+  // dev-request 2026-07-04-opplevagent-naer-meg-geosok, item 4: slug →
+  // distance info, ONLY ever passed by /fylke/:fylke and /kommune/:kommune
+  // when a «nærmest deg» geo sort is active (mirrors /sok's item-3
+  // distanceMap). Every other caller (/opplevelser, /kategori/*, provider
+  // pages, and /fylke|/kommune themselves with no geo sort active) omits it,
+  // so those pages render byte-identically to before this feature existed.
+  distanceMap?: Map<string, { distance_km: number | null; geo_precision: "address" | "kommune" | null }>;
 }): string {
   const url = baseUrl();
   const canonical = `${url}${opts.canonicalPath}`;
@@ -1883,7 +1890,7 @@ function renderBrowsePage(opts: {
 
   const grid =
     opts.rows.length > 0
-      ? `<div class="grid" role="list">${opts.rows.map((r) => renderCard(r)).join("")}</div>`
+      ? `<div class="grid" role="list">${opts.rows.map((r) => renderCard(r, opts.distanceMap?.get(r.slug))).join("")}</div>`
       : `<div class="empty"><h2>${escapeHtml(opts.emptyTitle || "Ingen opplevelser her ennå")}</h2>
          <p>${escapeHtml(opts.emptyBody || "Vi publiserer nye opplevelser fortløpende. Se alle opplevelser i mellomtiden.")}</p>
          <a class="cta" href="/opplevelser">Se alle opplevelser</a></div>`;
@@ -3156,18 +3163,40 @@ router.get("/fylke/:fylke", (req: Request, res: Response, next: NextFunction) =>
     return next();
   }
 
+  // dev-request 2026-07-04-opplevagent-naer-meg-geosok, item 4: "nærmest deg
+  // først" sort — PROGRESSIVE ENHANCEMENT ONLY. With no valid geo origin (or
+  // no explicit sort=distance), resolvePlaceGeoSort's geoActive is false and
+  // every `effective*` value below is exactly the SSR value computed above —
+  // byte-identical to before this feature existed.
+  const fylkeCanonicalPath = `/fylke/${encodeURIComponent(fylke)}`;
+  const geoSort = resolvePlaceGeoSort(req, { fylke });
+  const effectiveRows = geoSort.geoActive && geoSort.rows ? geoSort.rows : rows;
+  const effectiveTotal = geoSort.geoActive && geoSort.rows ? geoSort.rows.length : total;
+  const effectivePage = geoSort.geoActive ? 1 : page;
+  const effectivePageSize = geoSort.geoActive ? Math.max(effectiveTotal, 1) : BROWSE_PAGE_SIZE;
+  const geoQueryForToggle: Record<string, string | undefined> = geoSort.geoOrigin
+    ? { lat: String(geoSort.geoOrigin.lat), lng: String(geoSort.geoOrigin.lng), radius_km: String(geoSort.radiusKm) }
+    : {};
+  const sortToggleHtml = geoSort.geoOrigin
+    ? `<p class="sort-toggle">Sorter etter: <a class="${!geoSort.geoActive ? "active" : ""}" href="${buildSortToggleUrl(geoQueryForToggle, false, fylkeCanonicalPath)}" aria-current="${!geoSort.geoActive ? "true" : "false"}">Standard</a> · <a class="${geoSort.geoActive ? "active" : ""}" href="${buildSortToggleUrl(geoQueryForToggle, true, fylkeCanonicalPath)}" aria-current="${geoSort.geoActive ? "true" : "false"}">Nærmest deg</a></p>`
+    : "";
+  const geoNoteHtml = geoSort.geoActive
+    ? `<p class="geo-note">Viser opplevelser i ${escapeHtml(fylke)} innenfor ${geoSort.radiusKm} km fra deg, sortert etter avstand.</p>`
+    : "";
+
   const html = renderBrowsePage({
     title: `Opplevelser i ${fylke} | Opplevagent`,
     h1: `Opplevelser i ${fylke}`,
     metaDesc: `Kuraterte opplevelser og aktiviteter i ${fylke} — verifiserte tilbydere på Opplevagent. ${total} ${total === 1 ? "opplevelse" : "opplevelser"}.`,
     lede: `Hva kan du finne på i ${fylke}? Kuratert oversikt over opplevelser i fylket.`,
-    canonicalPath: `/fylke/${encodeURIComponent(fylke)}`,
+    canonicalPath: fylkeCanonicalPath,
     crumbs: [{ name: "Forsiden", href: "/" }, { name: "Alle opplevelser", href: "/opplevelser" }, { name: fylke }],
-    rows,
-    total,
-    page,
-    pageSize: BROWSE_PAGE_SIZE,
-    extraTopHtml: searchBox("") + kommuneChips(fylke),
+    rows: effectiveRows,
+    total: effectiveTotal,
+    page: effectivePage,
+    pageSize: effectivePageSize,
+    extraTopHtml: searchBox("") + kommuneChips(fylke) + renderNearMeSortButton(geoSort.radiusKm) + geoNoteHtml + sortToggleHtml,
+    distanceMap: geoSort.geoActive ? geoSort.distanceMap : undefined,
   });
   res.setHeader("Content-Type", "text/html; charset=utf-8");
   res.setHeader("Cache-Control", "public, max-age=300");
@@ -3250,6 +3279,27 @@ router.get("/kommune/:kommune", (req: Request, res: Response, next: NextFunction
     kommuneLede = genericKommuneLede;
   }
 
+  // dev-request 2026-07-04-opplevagent-naer-meg-geosok, item 4: "nærmest deg
+  // først" sort — PROGRESSIVE ENHANCEMENT ONLY, mirrors /fylke/:fylke above
+  // (see that block's comment). With no valid geo origin (or no explicit
+  // sort=distance), geoActive is false and every `effective*` value is
+  // exactly the SSR value already computed above — byte-identical to before
+  // this feature existed.
+  const geoSort = resolvePlaceGeoSort(req, { kommune });
+  const effectiveRows = geoSort.geoActive && geoSort.rows ? geoSort.rows : rows;
+  const effectiveTotal = geoSort.geoActive && geoSort.rows ? geoSort.rows.length : total;
+  const effectivePage = geoSort.geoActive ? 1 : page;
+  const effectivePageSize = geoSort.geoActive ? Math.max(effectiveTotal, 1) : BROWSE_PAGE_SIZE;
+  const geoQueryForToggle: Record<string, string | undefined> = geoSort.geoOrigin
+    ? { lat: String(geoSort.geoOrigin.lat), lng: String(geoSort.geoOrigin.lng), radius_km: String(geoSort.radiusKm) }
+    : {};
+  const sortToggleHtml = geoSort.geoOrigin
+    ? `<p class="sort-toggle">Sorter etter: <a class="${!geoSort.geoActive ? "active" : ""}" href="${buildSortToggleUrl(geoQueryForToggle, false, kommuneCanonicalPath)}" aria-current="${!geoSort.geoActive ? "true" : "false"}">Standard</a> · <a class="${geoSort.geoActive ? "active" : ""}" href="${buildSortToggleUrl(geoQueryForToggle, true, kommuneCanonicalPath)}" aria-current="${geoSort.geoActive ? "true" : "false"}">Nærmest deg</a></p>`
+    : "";
+  const geoNoteHtml = geoSort.geoActive
+    ? `<p class="geo-note">Viser opplevelser i ${escapeHtml(kommune)} innenfor ${geoSort.radiusKm} km fra deg, sortert etter avstand.</p>`
+    : "";
+
   const html = renderBrowsePage({
     title: `Opplevelser i ${kommune} | Opplevagent`,
     h1: `Opplevelser i ${kommune}`,
@@ -3257,12 +3307,13 @@ router.get("/kommune/:kommune", (req: Request, res: Response, next: NextFunction
     lede: kommuneLede,
     canonicalPath: kommuneCanonicalPath,
     crumbs,
-    rows,
-    total,
-    page,
-    pageSize: BROWSE_PAGE_SIZE,
-    extraTopHtml: searchBox(""),
+    rows: effectiveRows,
+    total: effectiveTotal,
+    page: effectivePage,
+    pageSize: effectivePageSize,
+    extraTopHtml: searchBox("") + renderNearMeSortButton(geoSort.radiusKm) + geoNoteHtml + sortToggleHtml,
     extraJsonLd: kommuneFaqJsonLd ? [kommuneFaqJsonLd] : undefined,
+    distanceMap: geoSort.geoActive ? geoSort.distanceMap : undefined,
   });
   res.setHeader("Content-Type", "text/html; charset=utf-8");
   res.setHeader("Cache-Control", "public, max-age=300");
@@ -3473,7 +3524,16 @@ function renderFilterChips(q: string, activeTags: ExperienceTag[]): string {
 // (a plain string-keyed record, not a Request) so it's unit-testable without
 // an Express request — mirrors sokFilterUrl's SSR-only approach: this is a
 // plain <a href>, no client JS required to use it.
-export function buildSortToggleUrl(query: Record<string, string | undefined>, activate: boolean): string {
+// dev-request 2026-07-04-opplevagent-naer-meg-geosok, item 4: `basePath`
+// defaults to "/sok" (unchanged call sites there keep working byte-for-byte)
+// but /fylke/:fylke and /kommune/:kommune pass their own canonical path, so
+// the SAME toggle-URL builder serves all three geo-sort entry points instead
+// of a new one being invented per page.
+export function buildSortToggleUrl(
+  query: Record<string, string | undefined>,
+  activate: boolean,
+  basePath: string = "/sok"
+): string {
   const params = new URLSearchParams();
   for (const [k, v] of Object.entries(query)) {
     if (k === "sort" || !v) continue;
@@ -3481,7 +3541,7 @@ export function buildSortToggleUrl(query: Record<string, string | undefined>, ac
   }
   if (activate) params.set("sort", "distance");
   const qs = params.toString();
-  return qs ? `/sok?${qs}` : "/sok";
+  return qs ? `${basePath}?${qs}` : basePath;
 }
 
 // Default search radius for the «Nær meg» geolocation button + text-place
@@ -3494,6 +3554,139 @@ const NEAR_ME_RADIUS_KM = 50;
 function parseSokFloat(v: unknown): number | undefined {
   const n = parseFloat((v as string) || "");
   return Number.isFinite(n) ? n : undefined;
+}
+
+// Shared geo-origin parser + radius resolver (dev-request 2026-07-04-
+// opplevagent-naer-meg-geosok): item 3 (/sok) and item 4 (/fylke/:fylke,
+// /kommune/:kommune) all need the SAME range-validated lat/lng parse +
+// radius clamp. Item 3's own review round 1 caught a real bug: an
+// out-of-range lat (e.g. ?lat=999) reaching discoverExperiences()
+// unvalidated threw a ZodError and wiped an already-successful search.
+// Centralizing the validation here means that fix protects every geo entry
+// point, not just the one it was first found in — reusing item 3's guard
+// rather than re-deriving (and risking re-diverging from) it per route.
+function parseGeoOriginFromQuery(query: Request["query"]): { lat: number; lng: number } | null {
+  let lat = parseSokFloat(query.lat);
+  let lng = parseSokFloat(query.lng);
+  if (lat !== undefined && (lat < -90 || lat > 90)) lat = undefined;
+  if (lng !== undefined && (lng < -180 || lng > 180)) lng = undefined;
+  return typeof lat === "number" && typeof lng === "number" ? { lat, lng } : null;
+}
+function resolveRadiusKm(query: Request["query"]): number {
+  return Math.min(500, Math.max(1, parseSokFloat(query.radius_km) ?? NEAR_ME_RADIUS_KM));
+}
+
+// dev-request 2026-07-04-opplevagent-naer-meg-geosok, item 4: shared by
+// /fylke/:fylke and /kommune/:kommune — maps discoverExperiences()'s
+// hydrated rows into the ExperienceCardRow shape renderBrowsePage()/
+// renderCard() already render, and collects the same slug -> distance/
+// geo_precision map /sok's item-3 code builds inline, so the SAME honesty
+// rule (formatDistanceLabel, via renderCard's optional `distance` param)
+// renders every distance label across all three geo entry points — never a
+// second, re-derived distance/precision presentation rule.
+function toNearbyCardRows(nearby: ReturnType<typeof discoverExperiences>): {
+  rows: ExperienceCardRow[];
+  distanceMap: Map<string, { distance_km: number | null; geo_precision: "address" | "kommune" | null }>;
+} {
+  const rows: ExperienceCardRow[] = [];
+  const distanceMap = new Map<string, { distance_km: number | null; geo_precision: "address" | "kommune" | null }>();
+  for (const e of nearby) {
+    if (!e.slug) continue;
+    distanceMap.set(e.slug, { distance_km: e.distance_km ?? null, geo_precision: e.geo_precision ?? null });
+    rows.push({
+      slug: e.slug,
+      title: e.title,
+      description: e.description ?? null,
+      category: e.category ?? null,
+      fylke: e.fylke ?? null,
+      kommune: e.kommune ?? null,
+      indoor_outdoor: e.indoor_outdoor ?? null,
+      duration_min: e.duration_min ?? null,
+      price_from: e.price_from ?? null,
+      price_band: e.price_band ?? null,
+      confidence: e.confidence ?? null,
+      tags: e.tags,
+    });
+  }
+  return { rows, distanceMap };
+}
+
+// dev-request 2026-07-04-opplevagent-naer-meg-geosok, item 4: computes the
+// "nærmest deg" geo-sort overlay shared by /fylke/:fylke and
+// /kommune/:kommune. PROGRESSIVE ENHANCEMENT ONLY — when no valid geo origin
+// is in the query, or `sort=distance` isn't explicitly requested, returns
+// geoActive:false and the caller keeps its already-computed SSR rows/total
+// untouched (byte-identical to before this feature existed). Any
+// discoverExperiences() failure here degrades the SAME way — geoActive
+// stays false and the caller's original rows are never wiped — rather than
+// throwing (same "never wipe already-successful data" rule /sok's item-3
+// review round 1 established).
+function resolvePlaceGeoSort(
+  req: Request,
+  placeFilter: { fylke: string } | { kommune: string }
+): {
+  geoActive: boolean;
+  rows: ExperienceCardRow[] | null;
+  distanceMap: Map<string, { distance_km: number | null; geo_precision: "address" | "kommune" | null }>;
+  geoOrigin: { lat: number; lng: number } | null;
+  radiusKm: number;
+} {
+  const geoOrigin = parseGeoOriginFromQuery(req.query);
+  const radiusKm = resolveRadiusKm(req.query);
+  const wantsDistanceSort = geoOrigin !== null && String(req.query.sort ?? "") === "distance";
+  if (!wantsDistanceSort || !geoOrigin) {
+    return { geoActive: false, rows: null, distanceMap: new Map(), geoOrigin, radiusKm };
+  }
+  try {
+    const nearby = discoverExperiences(
+      { ...placeFilter, lat: geoOrigin.lat, lng: geoOrigin.lng, radius_km: radiusKm, sort: "distance" },
+      100
+    );
+    const { rows, distanceMap } = toNearbyCardRows(nearby);
+    return { geoActive: true, rows, distanceMap, geoOrigin, radiusKm };
+  } catch {
+    return { geoActive: false, rows: null, distanceMap: new Map(), geoOrigin, radiusKm };
+  }
+}
+
+// «Nærmest deg først» button for /fylke/:fylke and /kommune/:kommune — same
+// browser-geolocation JS pattern as /sok's renderNearMeBox below (same
+// permission handling / button states), but redirects to the CURRENT page
+// (window.location.pathname) instead of hardcoding /sok, so one function
+// serves both place routes. Unlike /sok, there is no typed-place text
+// fallback here: typing an unrelated place while already on one specific
+// fylke/kommune page has no sane target page, so this stays GPS-only — a
+// strict subset of /sok's affordance, not a third geo-UI pattern. Clicking
+// it sets sort=distance directly (the whole point of granting location
+// here IS the "nærmest deg" sort), and drops `page` since the geo-sorted
+// list isn't paginated the same way.
+function renderNearMeSortButton(radiusKm: number): string {
+  return `<div class="near-me">
+    <button type="button" id="geoBtn" class="geo-btn">📍 Nærmest deg først</button>
+  </div>
+  <script>
+  (function () {
+    var geoBtn = document.getElementById('geoBtn');
+    if (!geoBtn) return;
+    if (!('geolocation' in navigator)) { geoBtn.hidden = true; return; }
+    geoBtn.addEventListener('click', function () {
+      geoBtn.textContent = '⏳ Henter posisjon…';
+      geoBtn.disabled = true;
+      navigator.geolocation.getCurrentPosition(function (pos) {
+        var params = new URLSearchParams(window.location.search);
+        params.delete('page');
+        params.set('lat', String(pos.coords.latitude));
+        params.set('lng', String(pos.coords.longitude));
+        if (!params.get('radius_km')) params.set('radius_km', '${radiusKm}');
+        params.set('sort', 'distance');
+        window.location.href = window.location.pathname + '?' + params.toString();
+      }, function () {
+        geoBtn.textContent = '❌ Posisjon avslått';
+        geoBtn.disabled = true;
+      }, { enableHighAccuracy: false, timeout: 8000 });
+    });
+  })();
+  </script>`;
 }
 
 // «Nær meg» button (browser geolocation, permission-gated) + a text fallback
@@ -3564,18 +3757,18 @@ router.get("/sok", async (req: Request, res: Response) => {
 
   // ── Resolve a geo origin: GPS (lat/lng) takes priority; the typed-place
   //    fallback (`sted`) is only consulted when lat/lng are absent ────────
-  let originLat = parseSokFloat(req.query.lat);
-  let originLng = parseSokFloat(req.query.lng);
-  // Range-validate against the SAME bounds DiscoverFilterSchema enforces
-  // (lat -90..90, lng -180..180 — see experience-store.ts DiscoverFilterBaseSchema)
-  // before either is ever treated as a usable origin. discoverExperiences()
-  // parses its filter through that schema and throws a ZodError on an
-  // out-of-range value; without this check a bad lat/lng (e.g. ?lat=999)
-  // would reach that call and — via the shared try/catch below — wipe an
-  // already-successful q/tag search. Out-of-range here degrades exactly like
-  // omitting lat/lng: geoOrigin stays null, hasGeo stays false.
-  if (originLat !== undefined && (originLat < -90 || originLat > 90)) originLat = undefined;
-  if (originLng !== undefined && (originLng < -180 || originLng > 180)) originLng = undefined;
+  // parseGeoOriginFromQuery range-validates against the SAME bounds
+  // DiscoverFilterSchema enforces (lat -90..90, lng -180..180 — see
+  // experience-store.ts DiscoverFilterBaseSchema) before either is ever
+  // treated as a usable origin. discoverExperiences() parses its filter
+  // through that schema and throws a ZodError on an out-of-range value;
+  // without this check a bad lat/lng (e.g. ?lat=999) would reach that call
+  // and — via the shared try/catch below — wipe an already-successful q/tag
+  // search. Out-of-range here degrades exactly like omitting lat/lng:
+  // geoOrigin stays null, hasGeo stays false.
+  const gpsOrigin = parseGeoOriginFromQuery(req.query);
+  let originLat: number | undefined = gpsOrigin?.lat;
+  let originLng: number | undefined = gpsOrigin?.lng;
   const typedPlace = String(req.query.sted ?? "").trim();
   let placeNotFound = false;
   if ((originLat === undefined || originLng === undefined) && typedPlace) {
@@ -3596,7 +3789,7 @@ router.get("/sok", async (req: Request, res: Response) => {
       ? { lat: originLat, lng: originLng }
       : null;
   const hasGeo = geoOrigin !== null;
-  const radiusKm = Math.min(500, Math.max(1, parseSokFloat(req.query.radius_km) ?? NEAR_ME_RADIUS_KM));
+  const radiusKm = resolveRadiusKm(req.query);
   const sortDistance = hasGeo && String(req.query.sort ?? "") === "distance";
 
   let rows: ExperienceCardRow[] = [];

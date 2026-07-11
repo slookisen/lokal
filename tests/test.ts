@@ -569,6 +569,20 @@ console.log("\n── experiences-seo-sok-geo (buildSortToggleUrl) ──");
   console.log(`  experiences-seo-sok-geo: ${r.passed} passed, ${r.failed} failed`);
 }
 
+// dev-request 2026-07-04-opplevagent-naer-meg-geosok, item 4: buildSortToggleUrl's
+// new (backward-compatible) `basePath` param, shared by /fylke/:fylke and
+// /kommune/:kommune's "nærmest deg" sort toggle.
+console.log("\n── experiences-seo-place-geo (buildSortToggleUrl basePath) ──");
+{
+  const { runExperiencesSeoPlaceGeoUrlTests } = require("../src/routes/experiences-seo-place-geo.test") as
+    typeof import("../src/routes/experiences-seo-place-geo.test");
+  const r = runExperiencesSeoPlaceGeoUrlTests({ log: false });
+  passed += r.passed;
+  failed += r.failed;
+  for (const f of r.failures) failures.push("experiences-seo-place-geo: " + f);
+  console.log(`  experiences-seo-place-geo: ${r.passed} passed, ${r.failed} failed`);
+}
+
 // ── orchestrator-pr-13: conservative address/phone contact-normalizer ──
 // Pins the formatting-only relaxation in cross-source-validator (clears
 // formatting-only review_required) while keeping genuine conflicts gated.
@@ -24231,6 +24245,20 @@ Promise.allSettled(_oaHomeCountersDeps).then(async () => {
     failed += sgr.failed;
     for (const f of sgr.failures) failures.push("experiences-seo-sok-geo-regression: " + f);
     console.log(`  experiences-seo-sok-geo-regression: ${sgr.passed} passed, ${sgr.failed} failed`);
+
+    // dev-request 2026-07-04-opplevagent-naer-meg-geosok, item 4: /fylke/:fylke
+    // and /kommune/:kommune gain a "nærmest deg først" geo-sort option
+    // (progressive enhancement only — SSR order unchanged without a valid geo
+    // origin + explicit sort=distance). Same in-memory-DB pattern, runs
+    // sequentially inside this same gated block for the same reason.
+    console.log("\n── experiences-seo-place-geo: /fylke, /kommune \"nærmest deg\" sort ──");
+    const { runExperiencesSeoPlaceGeoRegressionTests } = require("../src/routes/experiences-seo-place-geo.test") as
+      typeof import("../src/routes/experiences-seo-place-geo.test");
+    const pgr = await runExperiencesSeoPlaceGeoRegressionTests({ log: false });
+    passed += pgr.passed;
+    failed += pgr.failed;
+    for (const f of pgr.failures) failures.push("experiences-seo-place-geo-regression: " + f);
+    console.log(`  experiences-seo-place-geo-regression: ${pgr.passed} passed, ${pgr.failed} failed`);
 
     // dev-request 2026-07-04-opplevagent-dedup-og-norske-titler, item 1:
     // candidate-key dedup (fuzzy title-match, canonical scoring, group/merge,
