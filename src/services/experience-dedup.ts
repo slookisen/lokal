@@ -135,22 +135,122 @@ const SIGNIFICANT_TOKEN_MIN_LEN = 5;
 // re-harvesting the same source).
 const WHOLE_STRING_SIMILARITY_THRESHOLD = 0.6;
 
+// Provider-distinct corpus count below which a shared significant token counts
+// as distinctive (proper-noun-like) evidence rather than a generic activity/
+// category word. Mirrors experience-dedup-audit.ts's DEFAULT_GENERIC_MIN — same
+// value, same provider-distinct counting method (a token used by many DIFFERENT
+// providers is generic; one used by few is distinctive), reused here to gate
+// the merge decision itself (dev-request 2026-07-11-dedup-false-positive-
+// remediation, slice C), not just the read-only audit.
+const SHARED_TOKEN_GENERIC_MIN = 5;
+
+// Whole-string closeness required to corroborate a shared token that is
+// GENERIC (corpus count >= SHARED_TOKEN_GENERIC_MIN) — a generic token alone
+// proves nothing (the exact false-positive class from the 2026-07-10
+// backfill: "Fjelltur til Galdhøpiggen"/"...Snøhetta" share only "fjelltur").
+// Mirrors experience-dedup-audit.ts's DEFAULT_WHOLE_STRING_MIN (0.85) —
+// deliberately stricter than WHOLE_STRING_SIMILARITY_THRESHOLD (0.6) below,
+// which exists for a DIFFERENT case (no shared significant token at all).
+// Confirmed false-positive pairs sit below 0.85 (Sjoa dagstur/kveldstur
+// ≈0.79, Klatring barn/voksne ≈0.74, Brevandring Nigardsbreen/Briksdalsbreen
+// ≈0.76); genuine near-identical rewording sits at/above it.
+const GENERIC_TOKEN_CORROBORATION_MIN = 0.85;
+
 /**
  * True when two titles are plausibly the SAME real-world experience. Intended
  * to be called only after provider-identity + kommune already matched (a
  * strong prior), so the bar here only needs to rule out two genuinely
  * different experiences from the same provider/place, not prove near-
  * identical wording.
+ *
+ * A shared significant token (>= SIGNIFICANT_TOKEN_MIN_LEN chars) is only
+ * sufficient evidence on its own when it is RARE in the corpus (used by few
+ * distinct providers — proper-noun-like). A GENERIC shared token (used by
+ * many providers — a broad activity/category word like "fjelltur") requires
+ * whole-string corroboration (>= GENERIC_TOKEN_CORROBORATION_MIN) — otherwise
+ * two genuinely different experiences that merely share a category word
+ * (e.g. "Fjelltur til Galdhøpiggen" / "Fjelltur til Snøhetta") get treated as
+ * the same real-world experience.
  */
-export function titlesMatch(a: string, b: string): boolean {
+export function titlesMatch(
+  a: string,
+  b: string,
+  corpusTokenCounts: Map<string, number>
+): boolean {
   const tokensA = new Set(titleTokens(a));
   const tokensB = new Set(titleTokens(b));
+  const sharedSignificant: string[] = [];
   for (const t of tokensA) {
-    if (t.length >= SIGNIFICANT_TOKEN_MIN_LEN && tokensB.has(t)) return true;
+    if (t.length >= SIGNIFICANT_TOKEN_MIN_LEN && tokensB.has(t)) sharedSignificant.push(t);
   }
+
   const na = normalizeExperienceTitle(a);
   const nb = normalizeExperienceTitle(b);
-  return levenshteinSimilarity(na, nb) >= WHOLE_STRING_SIMILARITY_THRESHOLD;
+  const wholeStringSim = levenshteinSimilarity(na, nb);
+
+  if (sharedSignificant.length > 0) {
+    const hasRareToken = sharedSignificant.some(
+      (t) => (corpusTokenCounts.get(t) ?? 0) < SHARED_TOKEN_GENERIC_MIN
+    );
+    if (hasRareToken) return true;
+    return wholeStringSim >= GENERIC_TOKEN_CORROBORATION_MIN;
+  }
+
+  return wholeStringSim >= WHOLE_STRING_SIMILARITY_THRESHOLD;
+}
+
+/**
+ * Corpus token frequencies: how many DISTINCT titles each significant token
+ * appears in (a token repeated within one title counts once). Stopwords and
+ * short tokens never appear (titleTokens() drops them).
+ *
+ * NOTE: the audit path no longer uses this (title counts are inflated by the
+ * duplicate clones themselves — see experience-dedup-audit.ts's audit-v2
+ * header note) but the contract is still valid for corpora without
+ * per-entity cloning; kept exported for those callers.
+ */
+export function buildCorpusTokenCounts(titles: string[]): Map<string, number> {
+  const counts = new Map<string, number>();
+  for (const title of titles) {
+    for (const token of new Set(titleTokens(title))) {
+      counts.set(token, (counts.get(token) ?? 0) + 1);
+    }
+  }
+  return counts;
+}
+
+/**
+ * Provider-distinct corpus token frequencies: how many DISTINCT PROVIDERS use
+ * each significant token in any of their titles (merged or not). A provider
+ * with 16 clone titles of one museum contributes exactly 1 to each of that
+ * museum's tokens, so heavily-duplicated entities can't inflate their own
+ * proper nouns into looking "generic". A NULL provider_id row counts as its
+ * own singleton pseudo-provider (per-row fallback key) — orphan rows don't
+ * collapse into one shared bucket. Residual (review round 3): heavy orphan
+ * cloning of ONE entity can therefore still push its tokens generic — that
+ * residual errs only toward OVER-flagging into the human-gated review list,
+ * never toward trusting a false merge (merged groups themselves always have
+ * providers; orphans affect corpus counts only). Token extraction is
+ * identical to titleTokens() (a token counts once per provider, not per title).
+ */
+export function buildProviderCorpusTokenCounts(
+  rows: Array<{ title: string; provider_id: string | null }>
+): Map<string, number> {
+  const providersByToken = new Map<string, Set<string>>();
+  let orphanSeq = 0;
+  for (const row of rows) {
+    const providerKey = row.provider_id ?? `__orphan-row-${orphanSeq++}`;
+    for (const token of new Set(titleTokens(row.title))) {
+      const set = providersByToken.get(token);
+      if (set) set.add(providerKey);
+      else providersByToken.set(token, new Set([providerKey]));
+    }
+  }
+  const counts = new Map<string, number>();
+  for (const [token, providers] of providersByToken) {
+    counts.set(token, providers.size);
+  }
+  return counts;
 }
 
 // ─── Canonical-row scoring (richest data wins) ──────────────────────────────
@@ -282,7 +382,10 @@ function providerIdentityKey(row: { provider_id: string | null; org_nr?: string 
  * and B~C fold into one group even if A~C alone wouldn't have matched).
  * Only returns groups of size >= 2 (an unmatched singleton isn't a group).
  */
-export function groupDuplicateCandidates(rows: DedupCandidateRow[]): DedupCandidateRow[][] {
+export function groupDuplicateCandidates(
+  rows: DedupCandidateRow[],
+  corpusTokenCounts: Map<string, number>
+): DedupCandidateRow[][] {
   const buckets = new Map<string, DedupCandidateRow[]>();
   for (const row of rows) {
     const identity = providerIdentityKey(row);
@@ -308,7 +411,7 @@ export function groupDuplicateCandidates(rows: DedupCandidateRow[]): DedupCandid
     };
     for (let i = 0; i < bucket.length; i++) {
       for (let j = i + 1; j < bucket.length; j++) {
-        if (titlesMatch(bucket[i].title, bucket[j].title)) {
+        if (titlesMatch(bucket[i].title, bucket[j].title, corpusTokenCounts)) {
           const ri = find(i);
           const rj = find(j);
           if (ri !== rj) parent[ri] = rj;
@@ -359,6 +462,18 @@ function loadDedupCandidates(db: Database.Database): DedupCandidateRow[] {
     .all() as DedupCandidateRow[];
 }
 
+/**
+ * Load the provider-distinct corpus token counts from the whole `experiences`
+ * table — same query/method the audit module uses (buildProviderCorpusTokenCounts),
+ * reused here to gate the merge decision inside titlesMatch() itself.
+ */
+function loadCorpusTokenCounts(db: Database.Database): Map<string, number> {
+  const rows = db
+    .prepare("SELECT title, provider_id FROM experiences")
+    .all() as Array<{ title: string; provider_id: string | null }>;
+  return buildProviderCorpusTokenCounts(rows);
+}
+
 export interface DedupPassResult {
   groupsFound: number;
   rowsMerged: number;
@@ -379,7 +494,8 @@ export interface DedupPassResult {
  */
 export function runDedupPass(db: Database.Database): DedupPassResult {
   const rows = loadDedupCandidates(db);
-  const groups = groupDuplicateCandidates(rows);
+  const corpus = loadCorpusTokenCounts(db);
+  const groups = groupDuplicateCandidates(rows, corpus);
 
   const updateCanonicalId = db.prepare(
     "UPDATE experiences SET canonical_id = @canonicalId, updated_at = datetime('now') WHERE id = @id"
@@ -452,8 +568,9 @@ export function findExistingCandidateMatch(
   const rows = loadDedupCandidates(db).filter(
     (r) => providerIdentityKey(r) === identity && (r.kommune || "").trim().toLowerCase() === kommuneKey
   );
+  const corpus = loadCorpusTokenCounts(db);
   for (const row of rows) {
-    if (titlesMatch(row.title, candidate.title)) return row;
+    if (titlesMatch(row.title, candidate.title, corpus)) return row;
   }
   return null;
 }
