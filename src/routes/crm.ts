@@ -3,6 +3,7 @@ import { z } from "zod";
 import { crmService, CrmVertical } from "../services/crm-service";
 import { emailService } from "../services/email-service";
 import { getDb } from "../database/init";
+import { isOutreachPaused } from "./admin-outreach-candidates";
 
 // ─── Admin auth (matches analytics pattern) ─────────────────
 function requireAdminAuth(req: Request, res: Response, next: Function): void {
@@ -297,6 +298,20 @@ router.post("/compose", async (req, res) => {
   const { to, contactName, subject, bodyText, bodyHtml, intent, category, severity, createdBy, force } = parsed.data;
 
   try {
+    // ─── Global outreach kill-switch (P0-2026-07-11) ────────────
+    // When OUTREACH_PAUSED=true, block the automated cold-outreach channel
+    // (claude-actor resend_send). Daniel's manual sends (createdBy='daniel') and
+    // CS conversation replies are unaffected. Belt-and-suspenders with the gate,
+    // which already returns 0 candidates when paused.
+    if (isOutreachPaused() && intent === "resend_send" && createdBy === "claude") {
+      return res.status(423).json({
+        success: false,
+        error: "outreach_paused",
+        reason: "Cold outreach is paused (OUTREACH_PAUSED=true). Automated claude-actor sends are blocked until the flag is cleared.",
+        override: "Pass createdBy=daniel and force=true for a manual override.",
+      });
+    }
+
     // ─── Phase 4.10c-3 — refined service-level rate-limit ───────
     // 2026-05-06 fix: original 4.10c-2 logic was too aggressive — it blocked
     // ALL outbound to a recipient if any out+sent existed in 24h. That broke
@@ -323,7 +338,45 @@ router.post("/compose", async (req, res) => {
       `).get(to, lookback7d) as { hit: number } | undefined;
 
       if (!hasRecentInbound) {
-        // No active inbound conversation — apply cold-outreach rate-limit
+        // ─── Hard cooldown invariant (P0-2026-07-11) ─────────────
+        // Belt-and-suspenders on the SEND path: even if a pool leak (like the
+        // compose-thread bug) puts an already-contacted producer back into a
+        // batch, the actual send is refused if outreach_sent_log shows we
+        // emailed this address within the cooldown window. This is keyed on the
+        // immutable recipient email, so it holds across agent_id churn. The pool
+        // gate is the primary guard; this makes a double-send impossible even
+        // when the gate is bypassed.
+        //
+        // NOTE: OUTREACH_COOLDOWN_DAYS must be <= the mode=second `cooldown_days`
+        // the batch uses (both default 60). A legitimate second-touch is defined
+        // as a send whose PRIOR contact is OUTSIDE the window, so with matched
+        // windows this invariant never blocks it. If the env is set LARGER than
+        // the batch window it fails safe (refuses the send, never double-sends) —
+        // it can wedge a shortened second-touch campaign but cannot cause spam.
+        const cooldownDays = Math.max(1, parseInt(String(process.env.OUTREACH_COOLDOWN_DAYS ?? "60"), 10) || 60);
+        const cooldownCutoff = new Date(Date.now() - cooldownDays * 86400_000).toISOString();
+        const priorOutreach = getDb().prepare(`
+          SELECT sent_at FROM outreach_sent_log
+          WHERE recipient_email IS NOT NULL
+            AND LOWER(recipient_email) = LOWER(?)
+            AND sent_at >= ?
+          ORDER BY sent_at DESC
+          LIMIT 1
+        `).get(to, cooldownCutoff) as { sent_at: string } | undefined;
+
+        if (priorOutreach) {
+          return res.status(429).json({
+            success: false,
+            error: "cooldown_suppressed",
+            reason: `already sent cold outreach to ${to} on ${priorOutreach.sent_at} — within the ${cooldownDays}-day cooldown (outreach_sent_log, email-keyed)`,
+            last_sent_at: priorOutreach.sent_at,
+            cooldown_days: cooldownDays,
+            override: "Pass createdBy=daniel and force=true to bypass (manual override)",
+          });
+        }
+
+        // Legacy 24h duplicate guard (kept as a fast secondary check on raw
+        // crm_messages, e.g. sends not yet mirrored into outreach_sent_log).
         const recent = getDb().prepare(`
           SELECT m.id, m.thread_id, m.subject, m.sent_at
           FROM crm_messages m

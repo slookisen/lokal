@@ -62,6 +62,16 @@ function requireAdmin(req: Request, res: Response): boolean {
   return true;
 }
 
+// ── Global outreach kill-switch (P0-2026-07-11) ──────────────────────────────
+// Single source of truth for "is cold outreach paused". Read by the candidate
+// gate (returns 0 candidates) and by the compose cold-outreach send path (blocks
+// the send). Exported so both enforce the same flag. Env is read live (not
+// cached) so toggling the secret takes effect on the next request without a
+// redeploy beyond Fly's secret-set restart.
+export function isOutreachPaused(): boolean {
+  return String(process.env.OUTREACH_PAUSED ?? "").toLowerCase() === "true";
+}
+
 // ── orch-pr-17: data-quality suppression (wrong-entity + inference-only) ──────
 //
 // Two ADVISORY data-quality signals that PR-16's verifier writes onto each
@@ -151,6 +161,24 @@ router.get("/", (req: Request, res: Response) => {
     const mode = String(req.query.mode ?? "").toLowerCase();
     if (mode !== "first" && mode !== "second") {
       res.status(400).json({ success: false, error: "mode must be 'first' or 'second'" });
+      return;
+    }
+
+    // ── Global kill-switch (P0-2026-07-11) ──────────────────────────────────
+    // OUTREACH_PAUSED=true makes the gate return zero candidates so no batch can
+    // pull recipients, regardless of the pool state. Belt-and-suspenders with a
+    // paused marketing Cloud Routine: a re-enabled/forgotten routine still gets
+    // nothing to send. Reversible via secret (unset / set to anything but true).
+    if (isOutreachPaused()) {
+      res.json({
+        success: true,
+        mode,
+        paused: true,
+        cooldown_days: Math.max(1, parseInt(String(req.query.cooldown_days ?? "60"), 10) || 60),
+        count: 0,
+        candidates: [],
+        note: "outreach is paused (OUTREACH_PAUSED=true)",
+      });
       return;
     }
 
@@ -265,63 +293,77 @@ router.get("/", (req: Request, res: Response) => {
     }
 
     // ── Step 2: load outreach_sent_log data for mode-based filtering ──────────
-    const sentLogMap = new Map<string, string>(); // agent_id → "sent" or "within_cooldown:<date>" or "<last_sent_at>"
+    // P0-2026-07-11: key the cooldown lookup by BOTH agent_id AND recipient_email.
+    // agent_id churn (duplicate/re-registered producer rows) means a send recorded
+    // under one agent_id must still suppress a pool row that carries a different
+    // agent_id but the SAME email. We take MAX(sent_at) over either key.
+    const lastSentByAgent = new Map<string, string>();
+    const lastSentByEmail = new Map<string, string>();
 
-    if (mode === "first") {
-      // The VIEW already excluded these, but we still track them for suppression counts.
-      // Actually for mode=first the VIEW guarantees no sent_log agents appear, so
-      // the contactedOrCooldown count will always be 0 — which is correct.
-    } else {
-      // mode=second: use per-agent MAX(sent_at) (the MOST RECENT contact) to check
-      // cooldown. Using MAX (not MIN) is the safety-correct semantic: an agent whose
-      // latest send is within the window must stay suppressed even if an earlier send
-      // (e.g. a legacy backfill row) is old. (reviewer orch-pr-20260614-3 fix)
-      const cutoff = new Date(Date.now() - cooldownDays * 86400 * 1000).toISOString();
-      const sentAgents = db.prepare(`
+    if (mode === "second") {
+      const sentByAgent = db.prepare(`
         SELECT agent_id, MAX(sent_at) AS last_sent_at
         FROM outreach_sent_log
+        WHERE agent_id IS NOT NULL
         GROUP BY agent_id
       `).all() as Array<{ agent_id: string; last_sent_at: string }>;
+      for (const r of sentByAgent) lastSentByAgent.set(r.agent_id, r.last_sent_at);
 
-      for (const r of sentAgents) {
-        if (r.last_sent_at < cutoff) {
-          // Most-recent send is outside cooldown → eligible for second outreach
-          sentLogMap.set(r.agent_id, r.last_sent_at);
-        } else {
-          // Within cooldown (most-recent contact too recent)
-          sentLogMap.set(r.agent_id, "within_cooldown:" + r.last_sent_at);
-        }
-      }
+      const sentByEmail = db.prepare(`
+        SELECT LOWER(recipient_email) AS email, MAX(sent_at) AS last_sent_at
+        FROM outreach_sent_log
+        WHERE recipient_email IS NOT NULL AND recipient_email != ''
+        GROUP BY LOWER(recipient_email)
+      `).all() as Array<{ email: string; last_sent_at: string }>;
+      for (const r of sentByEmail) lastSentByEmail.set(r.email, r.last_sent_at);
     }
+
+    const cutoff = new Date(Date.now() - cooldownDays * 86400 * 1000).toISOString();
+    // Most-recent send for a candidate across BOTH keys — agent_id and the
+    // immutable recipient_email (populated for every recorded send). Keying on
+    // email survives agent_id churn / duplicate producer rows. (null = never
+    // contacted.) Reads outreach_sent_log, which is now the complete ledger of
+    // cold sends: the v2 triggers record any out/sent message on a no-inbound
+    // thread — marketing-batch-* AND compose-* — plus the queued→sent confirm
+    // path, and the v3 backfill filled in the historically-missing compose sends.
+    const lastSentFor = (row: PoolRow): string | null => {
+      const byAgent = lastSentByAgent.get(row.agent_id) ?? null;
+      const byEmail = row.email ? (lastSentByEmail.get(row.email.toLowerCase()) ?? null) : null;
+      if (byAgent && byEmail) return byAgent > byEmail ? byAgent : byEmail;
+      return byAgent ?? byEmail;
+    };
 
     // ── Step 2b: belt-and-suspenders — independent recipient-email check ──────
     //
-    // Root cause of the 2026-07-11 P0 incident (outreach-suppression-gate-failure):
-    // this gate's suppression signal above is keyed entirely on outreach_sent_log,
-    // which is populated ONLY via the PR-38 trigger on crm_messages, which in turn
-    // only fires when the send's crm_contacts row already has a resolved agent_id
-    // (see crm-service.ts resolveContact — a contact that fails to resolve an
-    // agent_id on its first touch used to stay unlinked forever). When that link is
-    // missing, the actual Resend send still happens and is visible in crm_messages
-    // (confirmed live via GET /admin/crm/sent-log), but outreach_sent_log never
-    // gets the row, so the SAME producer resurfaces as "never contacted" on every
-    // subsequent batch — 91 recipients re-mailed 2-4 days running, 2026-07-04..09.
+    // An invariant that survives EVERY variant of the outreach_sent_log-recording
+    // bug class, by reading raw outbound sends straight from crm_messages by
+    // RECIPIENT EMAIL — the one fact that's always correct, since it's literally
+    // who Resend delivered to — independent of agent_id/crm_contacts linkage OR
+    // the trigger firing.
     //
-    // This check is independent of agent_id/crm_contacts linkage entirely: it reads
-    // raw outbound marketing sends by RECIPIENT EMAIL — the one fact that's always
-    // correct, since it's literally who Resend delivered to — and suppresses
-    // regardless of whether the agent_id-keyed bookkeeping above is intact. Belt
-    // (outreach_sent_log) + suspenders (this). Fixing the linkage bug (crm-service.ts)
-    // is the root-cause fix; this is the invariant that survives future variants of
-    // the same class of bug.
-    const recentSendCutoff = new Date(Date.now() - cooldownDays * 86400 * 1000).toISOString();
+    // Two distinct recording bugs both caused the 2026-07-11 P0 incident:
+    //   (a) #233: a broken crm_contacts.agent_id link left the PR-38 trigger
+    //       (agent_id IS NOT NULL) blind to marketing-batch sends.
+    //   (b) this PR: the marketing agent's phase-2 loop sends via compose-<uuid>
+    //       threads (the MAJORITY of the incident — Beiarmat's 07-07/08/09
+    //       re-sends were all compose; July: 189 compose vs 95 marketing-batch),
+    //       which the old marketing-batch-% trigger never matched.
+    // #233's original Step 2b only scanned thread_id LIKE 'marketing-batch-%', so
+    // it did NOT cover (b). We broaden the scan to the SAME shape discriminator
+    // the v2 trigger uses — an out/sent message on a thread with NO inbound (a
+    // cold outreach) — so this independent guard now catches compose- sends too.
+    // (marketing-batch threads have no inbound, so #233's cases still match.)
+    const recentSendCutoff = cutoff;
     const recentMarketingSends = db.prepare(`
-      SELECT to_emails FROM crm_messages
-      WHERE direction = 'out'
-        AND delivery_status = 'sent'
-        AND thread_id LIKE 'marketing-batch-%'
-        AND sent_at IS NOT NULL
-        AND sent_at > ?
+      SELECT m.to_emails FROM crm_messages m
+      WHERE m.direction = 'out'
+        AND m.delivery_status = 'sent'
+        AND m.sent_at IS NOT NULL
+        AND m.sent_at > ?
+        AND NOT EXISTS (
+          SELECT 1 FROM crm_messages m2
+          WHERE m2.thread_id = m.thread_id AND m2.direction = 'in'
+        )
     `).all(recentSendCutoff) as Array<{ to_emails: string | null }>;
 
     const recentlyEmailedAddresses = new Set<string>();
@@ -360,16 +402,17 @@ router.get("/", (req: Request, res: Response) => {
         // (Kept for clarity — if VIEW is ever replaced, this guard still works.)
         isContactedOrCooldown = false;
       } else {
-        // mode=second: eligible only if in sentLogMap AND outside cooldown
-        const entry = sentLogMap.get(row.agent_id);
-        if (!entry) {
+        // mode=second: eligible only if contacted (by agent_id OR email) AND the
+        // most-recent contact is OUTSIDE the cooldown window.
+        const lastSent = lastSentFor(row);
+        if (!lastSent) {
           // Never contacted — not eligible for second outreach
           isContactedOrCooldown = true;
-        } else if (entry.startsWith("within_cooldown:")) {
-          // Contacted but still in cooldown
+        } else if (lastSent >= cutoff) {
+          // Most-recent contact still within cooldown → suppress
           isContactedOrCooldown = true;
         }
-        // else: entry is a last_sent_at outside cooldown → eligible
+        // else: last send is outside cooldown → eligible for second touch
       }
 
       const suppressedForContacted = isContactedOrCooldown;

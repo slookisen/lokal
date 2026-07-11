@@ -19535,7 +19535,8 @@ const _orchPr20260614Promise: Promise<void> = new Promise<void>(r => { _orchPr20
       sent_at TEXT NOT NULL DEFAULT (datetime('now')),
       channel TEXT NOT NULL DEFAULT 'email',
       message_id TEXT,
-      notes TEXT
+      notes TEXT,
+      recipient_email TEXT  /* P0-2026-07-11: email-keyed suppression column (mirrors init.ts) */
     );
 
     CREATE TABLE crm_contacts (
@@ -26611,3 +26612,138 @@ console.log("\n── mcp-usage-guides: GET /guide-opplevelser-mcp (opplevagent.
     failures.push(`mcp-usage-guides (opplevagent): unexpected error: ${err instanceof Error ? (err.stack || err.message) : String(err)}`);
   }
 })();
+
+
+// ── outreach-suppression-P0 (2026-07-11): compose-leak + email-keyed gate ────
+// Regression for the confirmed incident: the marketing agent's phase-2 send
+// loop switched to POST /admin/crm/compose (compose-<uuid> threads), which the
+// old marketing-batch-% trigger did not recognise, so those sends never landed
+// in outreach_sent_log and the producer was re-pulled into the pool every day
+// (Beiarmat 3 days in a row; 91 recipients ≥2 days). Proves, against the REAL
+// init.ts schema (trigger + VIEW + column): (1) a compose- cold send is now
+// recorded with recipient_email and closes the producer out of mode=first;
+// (2) suppression is email-keyed so it survives agent_id churn / duplicate
+// producer rows; (3) a CS reply (out message on a thread WITH an inbound) is
+// NOT logged as outreach; (4) the OUTREACH_PAUSED kill-switch reads the env.
+console.log("\n── outreach-suppression-P0: compose-leak + email-keyed gate ──");
+{
+  try {
+    // Build an isolated in-memory DB on the REAL schema WITHOUT swapping the
+    // global getDb() singleton (buildTestDb() would) — this block runs at EOF
+    // and a dangling singleton swap can perturb other blocks' async
+    // continuations. We query this handle directly.
+    const odb = new Database(":memory:");
+    odb.pragma("journal_mode = DELETE");
+    odb.pragma("foreign_keys = ON");
+    __initSchemaForTesting(odb);
+    const BEIA = "post@beiarmat-test.no";
+
+    const makeEligible = (id: string, email: string) => {
+      insertTestAgent(odb, id, "Prod " + id, { email, website: "https://" + id + ".example.no" });
+      odb.prepare(
+        `UPDATE agent_knowledge
+           SET verification_status='verified', enrichment_status='partial',
+               url_last_status=200, url_last_probed=datetime('now'), email=?
+         WHERE agent_id=?`
+      ).run(email, id);
+    };
+    const poolCount = (id: string): number =>
+      (odb.prepare("SELECT COUNT(*) AS c FROM outreach_ready_pool WHERE agent_id=?").get(id) as any).c;
+    const sentLogFor = (email: string): number =>
+      (odb.prepare("SELECT COUNT(*) AS c FROM outreach_sent_log WHERE LOWER(recipient_email)=LOWER(?)").get(email) as any).c;
+
+    // (0) recipient_email column exists on the real schema.
+    const oslCols = (odb.prepare("PRAGMA table_info(outreach_sent_log)").all() as any[]).map((c) => c.name);
+    assertTrue(oslCols.includes("recipient_email"), "P0-0: outreach_sent_log has recipient_email column");
+
+    // (1) Baseline: a verified, freshly-probed producer is in the mode=first pool.
+    makeEligible("osl-A", BEIA);
+    assertEq(poolCount("osl-A"), 1, "P0-1: producer appears in outreach_ready_pool before any send");
+
+    // (2) Simulate the marketing phase-2 COMPOSE send: out/sent message on a
+    // compose-<uuid> thread with NO inbound. The v2 trigger must fire.
+    odb.prepare("INSERT INTO crm_contacts (id,type,agent_id,email,name) VALUES (?,?,?,?,?)")
+      .run("c-A", "producer", "osl-A", BEIA, "Beiarmat");
+    odb.prepare("INSERT INTO crm_threads (id,contact_id,subject,category,status,assigned_to) VALUES (?,?,?,?,?,?)")
+      .run("compose-uuid-1", "c-A", "Har vi info riktig om Beiarmat?", "innkommende", "in_progress", "daniel");
+    odb.prepare(
+      `INSERT INTO crm_messages (id,thread_id,direction,from_email,to_emails,subject,body_text,sent_at,delivery_status)
+       VALUES (?,?,?,?,?,?,?,?,?)`
+    ).run("m-A", "compose-uuid-1", "out", "kontakt@rettfrabonden.com", JSON.stringify([BEIA]),
+          "Har vi info riktig om Beiarmat?", "body", new Date().toISOString(), "sent");
+
+    assertEq(sentLogFor(BEIA), 1, "P0-2a: compose- cold send is recorded in outreach_sent_log (leak closed)");
+    const noteRow = odb.prepare("SELECT notes, recipient_email FROM outreach_sent_log WHERE LOWER(recipient_email)=LOWER(?)").get(BEIA) as any;
+    assertEq(noteRow.notes, "auto:cold_outreach_v2", "P0-2b: recorded via the v2 cold-outreach trigger");
+    assertEq(noteRow.recipient_email, BEIA, "P0-2c: recipient_email is the (lowercased) address we emailed");
+
+    // (3) THE REGRESSION: the producer is now EXCLUDED from mode=first — no daily re-send.
+    assertEq(poolCount("osl-A"), 0, "P0-3: producer excluded from outreach_ready_pool after the compose send");
+
+    // (3.5) THE REAL COMPOSE PATH: /admin/crm/compose inserts delivery_status
+    // ='queued' and only flips to 'sent' via a LATER UPDATE once Resend confirms.
+    // An AFTER INSERT trigger never fires for that (row is 'queued' at insert),
+    // so we must also record on the queued→sent UPDATE. Prove that exact flow.
+    const QSENT = "post@queued-sent-test.no";
+    makeEligible("osl-Q", QSENT);
+    odb.prepare("INSERT INTO crm_contacts (id,type,agent_id,email,name) VALUES (?,?,?,?,?)")
+      .run("c-Q", "producer", "osl-Q", QSENT, "QueuedSent");
+    odb.prepare("INSERT INTO crm_threads (id,contact_id,subject,category,status,assigned_to) VALUES (?,?,?,?,?,?)")
+      .run("compose-uuid-Q", "c-Q", "Har vi info riktig?", "innkommende", "in_progress", "daniel");
+    // Insert as QUEUED (sent_at NULL) — the compose route's real initial state.
+    odb.prepare(
+      `INSERT INTO crm_messages (id,thread_id,direction,from_email,to_emails,subject,body_text,sent_at,delivery_status)
+       VALUES (?,?,?,?,?,?,?,?,?)`
+    ).run("m-Q", "compose-uuid-Q", "out", "kontakt@rettfrabonden.com", JSON.stringify([QSENT]),
+          "Har vi info riktig?", "body", null, "queued");
+    assertEq(sentLogFor(QSENT), 0, "P0-3.5a: a QUEUED compose message is NOT yet recorded (send not confirmed)");
+    assertEq(poolCount("osl-Q"), 1, "P0-3.5b: producer still eligible while the send is only queued");
+    // Now confirm the send (Resend OK) exactly as updateMessageDeliveryStatus does.
+    odb.prepare("UPDATE crm_messages SET delivery_status='sent', sent_at=COALESCE(sent_at, datetime('now')) WHERE id=?").run("m-Q");
+    assertEq(sentLogFor(QSENT), 1, "P0-3.5c: queued→sent UPDATE records the compose send (AFTER UPDATE trigger — the real live path)");
+    const qNote = odb.prepare("SELECT notes FROM outreach_sent_log WHERE LOWER(recipient_email)=LOWER(?)").get(QSENT) as any;
+    assertEq(qNote.notes, "auto:cold_outreach_confirm_v2", "P0-3.5d: recorded via the queued→sent confirm trigger");
+    assertEq(poolCount("osl-Q"), 0, "P0-3.5e: producer excluded from the pool after the send is confirmed");
+
+    // (4) agent_id churn: a DUPLICATE producer row (different agent_id, SAME email)
+    // must ALSO be excluded — suppression is keyed on the immutable email, the
+    // same robustness the blocklist has. (Beiarmat: send-time id != pool-time id.)
+    makeEligible("osl-B-dup", BEIA);
+    assertEq(poolCount("osl-B-dup"), 0, "P0-4: duplicate producer (same email, new agent_id) is also excluded — email-keyed suppression survives agent_id churn");
+
+    // (5) A CS REPLY is NOT outreach: an out/sent message on a thread that HAS an
+    // inbound must not be logged (the no-inbound shape discriminator).
+    const OTHER = "post@other-test.no";
+    makeEligible("osl-C", OTHER);
+    odb.prepare("INSERT INTO crm_contacts (id,type,agent_id,email,name) VALUES (?,?,?,?,?)")
+      .run("c-C", "producer", "osl-C", OTHER, "Other");
+    odb.prepare("INSERT INTO crm_threads (id,contact_id,subject,category,status,assigned_to) VALUES (?,?,?,?,?,?)")
+      .run("gmail-thread-hex-c", "c-C", "Spørsmål fra produsent", "innkommende", "in_progress", "claude");
+    odb.prepare(
+      `INSERT INTO crm_messages (id,thread_id,direction,from_email,to_emails,subject,body_text,received_at,delivery_status)
+       VALUES (?,?,?,?,?,?,?,?,?)`
+    ).run("m-C-in", "gmail-thread-hex-c", "in", OTHER, JSON.stringify(["kontakt@rettfrabonden.com"]),
+          "Spørsmål", "hei", new Date().toISOString(), "sent");
+    odb.prepare(
+      `INSERT INTO crm_messages (id,thread_id,direction,from_email,to_emails,subject,body_text,sent_at,delivery_status)
+       VALUES (?,?,?,?,?,?,?,?,?)`
+    ).run("m-C-out", "gmail-thread-hex-c", "out", "kontakt@rettfrabonden.com", JSON.stringify([OTHER]),
+          "Re: Spørsmål", "svar", new Date().toISOString(), "sent");
+    assertEq(sentLogFor(OTHER), 0, "P0-5: a CS reply (out on a thread WITH inbound) is NOT recorded as outreach");
+    assertEq(poolCount("osl-C"), 1, "P0-5b: the CS-replied producer stays eligible (a reply is not a cold-outreach suppression)");
+
+    // (6) Kill-switch reads the live env var.
+    const { isOutreachPaused } = require("../src/routes/admin-outreach-candidates");
+    const prevPaused = process.env.OUTREACH_PAUSED;
+    process.env.OUTREACH_PAUSED = "true";
+    assertTrue(isOutreachPaused() === true, "P0-6a: OUTREACH_PAUSED=true → isOutreachPaused() true");
+    process.env.OUTREACH_PAUSED = "false";
+    assertTrue(isOutreachPaused() === false, "P0-6b: OUTREACH_PAUSED=false → isOutreachPaused() false");
+    if (prevPaused === undefined) delete process.env.OUTREACH_PAUSED; else process.env.OUTREACH_PAUSED = prevPaused;
+
+    console.log("  outreach-suppression-P0: OK (compose-leak recorded + closed, email-keyed churn, CS-reply excluded, kill-switch)");
+  } catch (err) {
+    failed++;
+    failures.push(`outreach-suppression-P0: unexpected error: ${err instanceof Error ? (err.stack || err.message) : String(err)}`);
+  }
+}

@@ -139,8 +139,20 @@ export function runAdminOutreachCandidatesCrmSendGuardTests(opts: { log?: boolea
     // delivery_status defaults to 'sent' — matches the real ingest path
     // (POST /admin/crm/ingest -> crmService.ingestThread(), which never sets
     // delivery_status explicitly). agent_id on the contact stays NULL,
-    // simulating the broken-link P0 scenario: outreach_sent_log's trigger
-    // (WHEN ... AND cc.agent_id IS NOT NULL) never fires for this send.
+    // simulating the broken-link P0 scenario.
+    //
+    // NOTE (2026-07-11 compose-leak PR): under the current real schema the v2
+    // cold-outreach trigger self-heals the agent_id (via agent_knowledge.email)
+    // and records this send into outreach_sent_log, so the email-keyed VIEW would
+    // now exclude the producer UPSTREAM of the Step 2b belt-and-suspenders. To
+    // keep THIS test exercising Step 2b in isolation — its whole point is "the
+    // gate suppresses even when outreach_sent_log is blind to a real send" — we
+    // delete the auto-recorded row, faithfully modelling the missing-bookkeeping
+    // premise. The trigger/VIEW path is covered by the outreach-suppression-P0
+    // block in tests/test.ts.
+    db.prepare(
+      `DELETE FROM outreach_sent_log WHERE LOWER(recipient_email) = LOWER(?)`
+    ).run(agentEmail);
   }
 
   const nowIso = new Date().toISOString();

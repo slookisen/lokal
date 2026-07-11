@@ -1084,6 +1084,19 @@ function initSchema(db: Database.Database): void {
       )
     `);
     db.exec(`CREATE INDEX IF NOT EXISTS idx_outreach_sent_log_agent ON outreach_sent_log(agent_id)`);
+    // ─── P0-2026-07-11: recipient_email — email-keyed suppression column ──────
+    // The agent_id key is fragile: the same producer can hold multiple/churning
+    // agent_id rows (duplicate producers, re-registration), so an agent_id-only
+    // NOT EXISTS gate leaks a re-send whenever the send-time agent_id differs
+    // from the pool-time agent_id (confirmed live: Beiarmat, send-time producer
+    // 38476f5d… vs current agent 94af0bec…). recipient_email is the immutable
+    // key we actually emailed; suppression matches on it the same normalized way
+    // isBlocked() matches the blocklist. Idempotent ALTER (column-guard).
+    const oslCols = db.prepare(`PRAGMA table_info(outreach_sent_log)`).all() as Array<{ name: string }>;
+    if (!oslCols.some((c) => c.name === "recipient_email")) {
+      db.exec(`ALTER TABLE outreach_sent_log ADD COLUMN recipient_email TEXT`);
+    }
+    db.exec(`CREATE INDEX IF NOT EXISTS idx_outreach_sent_log_recipient_email ON outreach_sent_log(recipient_email)`);
   } catch (err) {
     console.error("Migration outreach_sent_log failed:", err);
   }
@@ -1097,43 +1110,127 @@ function initSchema(db: Database.Database): void {
   // this trigger the outreach_ready_pool VIEW's NOT EXISTS gate never sees the
   // send, so the same producer leaks back into the pool on the next batch.
   //
-  // DESIGN NOTE: we identify marketing threads by the canonical threadId prefix
-  // "marketing-batch-" (NOT by crm_threads.category = 'marketing' — the agent
-  // sends category:"innkommende" per its CRM-ingest addendum, confirmed in
-  // marketing-comms-agent-crm-ingest-addendum.md). This is the authoritative
-  // discriminator: every other thread kind uses Gmail thread IDs (long hex
-  // strings) or the compose-<uuid> pattern from composeNewThread().
+  // DESIGN NOTE (v2, P0-2026-07-11): the original trigger identified marketing
+  // sends ONLY by the threadId prefix "marketing-batch-%". That discriminator
+  // silently broke when the marketing agent's phase-2 send loop switched to
+  // POST /admin/crm/compose (marketing-comms-agent-email-verification-addendum),
+  // which creates compose-<uuid> threads. Those sends never matched the prefix
+  // → never landed in outreach_sent_log → the outreach_ready_pool VIEW never
+  // excluded them → the same producer was re-sent every morning (Beiarmat 3
+  // days in a row; 91 recipients ≥2 days, July 2026).
   //
-  // Idempotent: CREATE TRIGGER IF NOT EXISTS — safe to re-run on every boot.
-  // Dedup guard: NOT EXISTS on message_id prevents double-inserts if the
-  // trigger somehow fires twice (e.g. future REPLACE INTO path).
+  // FIX: discriminate on SHAPE, not thread-id format. A cold outreach is an
+  // out/sent message on a thread with NO inbound message. That captures BOTH
+  // marketing-batch-* (Resend/ingest) AND compose-* (compose UI/agent) cold
+  // outreach, while excluding CS replies (which always sit on a thread that has
+  // an inbound). We also record recipient_email (LOWER(cc.email)) so the pool
+  // gate can suppress by the immutable email key even when agent_id churns.
   //
-  // Origin: orchestrator PR-38 (2026-06-21).
+  // agent_id stays NOT NULL: resolve it best-effort (cc.agent_id, else the
+  // agent_knowledge.email match used by the v2 reclassify migration below). If
+  // no agent resolves, the recipient is not in our catalog / pool anyway, so
+  // skipping the row is safe.
+  //
+  // Idempotent: DROP old + CREATE IF NOT EXISTS. Dedup guard: NOT EXISTS on
+  // message_id. Origin: orchestrator PR-38 (2026-06-21); v2 P0 fix 2026-07-11.
   try {
+    db.exec(`DROP TRIGGER IF EXISTS trg_log_marketing_send_to_outreach_sent_log`);
     db.exec(`
-      CREATE TRIGGER IF NOT EXISTS trg_log_marketing_send_to_outreach_sent_log
+      CREATE TRIGGER IF NOT EXISTS trg_log_cold_outreach_to_sent_log_v2
         AFTER INSERT ON crm_messages
         FOR EACH ROW
         WHEN NEW.direction = 'out' AND NEW.delivery_status = 'sent'
         BEGIN
-          INSERT INTO outreach_sent_log (agent_id, sent_at, channel, message_id, notes)
-          SELECT cc.agent_id,
-                 COALESCE(NEW.sent_at, datetime('now')),
-                 'email',
-                 NEW.id,
-                 'auto:marketing_crm_send'
+          INSERT INTO outreach_sent_log (agent_id, recipient_email, sent_at, channel, message_id, notes)
+          SELECT
+            COALESCE(
+              cc.agent_id,
+              (SELECT a.id FROM agent_knowledge k JOIN agents a ON a.id = k.agent_id
+                WHERE LOWER(k.email) = LOWER(cc.email) AND a.is_active = 1 LIMIT 1)
+            ),
+            LOWER(cc.email),
+            COALESCE(NEW.sent_at, datetime('now')),
+            'email',
+            NEW.id,
+            'auto:cold_outreach_v2'
           FROM crm_threads ct
           JOIN crm_contacts cc ON cc.id = ct.contact_id
           WHERE ct.id = NEW.thread_id
-            AND ct.id LIKE 'marketing-batch-%'
-            AND cc.agent_id IS NOT NULL
+            AND cc.email IS NOT NULL AND cc.email != ''
+            AND COALESCE(
+              cc.agent_id,
+              (SELECT a.id FROM agent_knowledge k JOIN agents a ON a.id = k.agent_id
+                WHERE LOWER(k.email) = LOWER(cc.email) AND a.is_active = 1 LIMIT 1)
+            ) IS NOT NULL
+            AND NOT EXISTS (
+              SELECT 1 FROM crm_messages m2
+              WHERE m2.thread_id = NEW.thread_id AND m2.direction = 'in'
+            )
             AND NOT EXISTS (
               SELECT 1 FROM outreach_sent_log o WHERE o.message_id = NEW.id
             );
         END
     `);
   } catch (err) {
-    console.error("Migration trg_log_marketing_send_to_outreach_sent_log failed:", err);
+    console.error("Migration trg_log_cold_outreach_to_sent_log_v2 failed:", err);
+  }
+
+  // ─── v2b (P0-2026-07-11): also record on the queued→sent CONFIRM path ─────
+  //
+  // CRITICAL companion to the AFTER INSERT trigger above. The marketing agent's
+  // phase-2 loop sends via POST /admin/crm/compose, which inserts the crm_message
+  // as delivery_status='queued' and only flips it to 'sent' via a LATER UPDATE
+  // (updateMessageDeliveryStatus) once Resend confirms. An AFTER INSERT trigger
+  // with WHEN NEW.delivery_status='sent' therefore NEVER fires for compose sends
+  // — the row is 'queued' at insert time. Without this AFTER UPDATE trigger the
+  // v2 fix would only close historical sends (via the backfill) while every
+  // FUTURE compose send would still leak. The marketing-batch/ingest path inserts
+  // directly as 'sent' (AFTER INSERT covers it); this covers the compose path.
+  //
+  // Fires only on the transition INTO 'sent' (OLD.delivery_status != 'sent') so a
+  // no-op UPDATE can't re-run it; the message_id dedup guard makes a double-fire
+  // across both triggers a no-op anyway.
+  try {
+    db.exec(`
+      CREATE TRIGGER IF NOT EXISTS trg_log_cold_outreach_on_send_confirm_v2
+        AFTER UPDATE OF delivery_status ON crm_messages
+        FOR EACH ROW
+        WHEN NEW.direction = 'out'
+          AND NEW.delivery_status = 'sent'
+          AND (OLD.delivery_status IS NULL OR OLD.delivery_status != 'sent')
+        BEGIN
+          INSERT INTO outreach_sent_log (agent_id, recipient_email, sent_at, channel, message_id, notes)
+          SELECT
+            COALESCE(
+              cc.agent_id,
+              (SELECT a.id FROM agent_knowledge k JOIN agents a ON a.id = k.agent_id
+                WHERE LOWER(k.email) = LOWER(cc.email) AND a.is_active = 1 LIMIT 1)
+            ),
+            LOWER(cc.email),
+            COALESCE(NEW.sent_at, datetime('now')),
+            'email',
+            NEW.id,
+            'auto:cold_outreach_confirm_v2'
+          FROM crm_threads ct
+          JOIN crm_contacts cc ON cc.id = ct.contact_id
+          WHERE ct.id = NEW.thread_id
+            AND cc.email IS NOT NULL AND cc.email != ''
+            AND COALESCE(
+              cc.agent_id,
+              (SELECT a.id FROM agent_knowledge k JOIN agents a ON a.id = k.agent_id
+                WHERE LOWER(k.email) = LOWER(cc.email) AND a.is_active = 1 LIMIT 1)
+            ) IS NOT NULL
+            AND NOT EXISTS (
+              SELECT 1 FROM crm_messages m2
+              WHERE m2.thread_id = NEW.thread_id AND m2.direction = 'in'
+            )
+            AND NOT EXISTS (
+              SELECT 1 FROM outreach_sent_log o WHERE o.message_id = NEW.id
+            );
+        END
+    `);
+  } catch (err) {
+    console.error("Migration trg_log_cold_outreach_on_send_confirm_v2 failed:", err);
   }
 
   // ─── PR-38: backfill existing marketing sends into outreach_sent_log ─────
@@ -1257,6 +1354,89 @@ function initSchema(db: Database.Database): void {
     console.error("Migration reclassify_contacts_and_backfill_sent_log_v2_agent_knowledge_email failed:", err);
   }
 
+  // ─── v3 (P0-2026-07-11): backfill recipient_email + missing compose- sends ──
+  //
+  // Two idempotent steps, guarded by the migrations table:
+  //   Step 1 — populate recipient_email on existing outreach_sent_log rows
+  //            (the ~363 legacy marketing-batch rows have it NULL) from the
+  //            crm_message they reference; fall back to agent_knowledge.email.
+  //   Step 2 — retroactively log every historical COLD outreach (out/sent on a
+  //            no-inbound thread) that is NOT yet in outreach_sent_log — this is
+  //            the ~127 July compose-<uuid> sends that leaked past the old
+  //            marketing-batch-% trigger. Same shape-discriminator + email key
+  //            as the v2 trigger above, so the pool VIEW excludes them at once.
+  try {
+    const alreadyRanV3 = db.prepare(
+      "SELECT 1 FROM migrations WHERE name = 'backfill_recipient_email_and_compose_cold_sends_v3'"
+    ).get();
+    if (!alreadyRanV3) {
+      // Step 1a: recipient_email from the referenced crm_message's contact.
+      const emailFromMsg = db.prepare(`
+        UPDATE outreach_sent_log
+        SET recipient_email = (
+          SELECT LOWER(cc.email)
+          FROM crm_messages m
+          JOIN crm_threads ct ON ct.id = m.thread_id
+          JOIN crm_contacts cc ON cc.id = ct.contact_id
+          WHERE m.id = outreach_sent_log.message_id
+            AND cc.email IS NOT NULL AND cc.email != ''
+        )
+        WHERE recipient_email IS NULL AND message_id IS NOT NULL
+      `).run();
+      // Step 1b: fallback via agent_knowledge.email for rows still NULL.
+      const emailFromKnowledge = db.prepare(`
+        UPDATE outreach_sent_log
+        SET recipient_email = (
+          SELECT LOWER(k.email) FROM agent_knowledge k
+          WHERE k.agent_id = outreach_sent_log.agent_id
+            AND k.email IS NOT NULL AND k.email != ''
+          LIMIT 1
+        )
+        WHERE recipient_email IS NULL
+      `).run();
+      // Step 2: backfill missing cold outreach (compose-* etc.) by shape.
+      const composeBackfill = db.prepare(`
+        INSERT INTO outreach_sent_log (agent_id, recipient_email, sent_at, channel, message_id, notes)
+        SELECT
+          COALESCE(
+            cc.agent_id,
+            (SELECT a.id FROM agent_knowledge k JOIN agents a ON a.id = k.agent_id
+              WHERE LOWER(k.email) = LOWER(cc.email) AND a.is_active = 1 LIMIT 1)
+          ),
+          LOWER(cc.email),
+          COALESCE(m.sent_at, datetime('now')),
+          'email',
+          m.id,
+          'backfill:cold_outreach_v3'
+        FROM crm_messages m
+        JOIN crm_threads ct ON ct.id = m.thread_id
+        JOIN crm_contacts cc ON cc.id = ct.contact_id
+        WHERE m.direction = 'out'
+          AND m.delivery_status = 'sent'
+          AND cc.email IS NOT NULL AND cc.email != ''
+          AND COALESCE(
+            cc.agent_id,
+            (SELECT a.id FROM agent_knowledge k JOIN agents a ON a.id = k.agent_id
+              WHERE LOWER(k.email) = LOWER(cc.email) AND a.is_active = 1 LIMIT 1)
+          ) IS NOT NULL
+          AND NOT EXISTS (
+            SELECT 1 FROM crm_messages m2
+            WHERE m2.thread_id = m.thread_id AND m2.direction = 'in'
+          )
+          AND NOT EXISTS (
+            SELECT 1 FROM outreach_sent_log o WHERE o.message_id = m.id
+          )
+      `).run();
+      db.prepare("INSERT INTO migrations (name) VALUES ('backfill_recipient_email_and_compose_cold_sends_v3')").run();
+      const touched = (emailFromMsg.changes || 0) + (emailFromKnowledge.changes || 0);
+      if (touched > 0 || composeBackfill.changes > 0) {
+        console.log(`[v3-P0] backfill recipient_email: ${touched} row(s) filled; compose/cold backfill inserted ${composeBackfill.changes} missing send(s) into outreach_sent_log`);
+      }
+    }
+  } catch (err) {
+    console.error("Migration backfill_recipient_email_and_compose_cold_sends_v3 failed:", err);
+  }
+
 
   // outreach_ready_pool VIEW — the list marketing will read once
   // WO #9 switches over. Filtered by:
@@ -1304,9 +1484,15 @@ function initSchema(db: Database.Database): void {
         AND k.url_last_status < 400
         AND k.url_last_probed IS NOT NULL
         AND k.url_last_probed > datetime('now', '-30 days')
+        /* P0-2026-07-11: email-keyed OR agent_id-keyed exclusion. Matching on
+           recipient_email (the immutable address we emailed) makes suppression
+           survive agent_id churn / duplicate producer rows — the same robust
+           key the blocklist uses. agent_id kept for legacy rows lacking a
+           recipient_email backfill. */
         AND NOT EXISTS (
           SELECT 1 FROM outreach_sent_log o
           WHERE o.agent_id = a.id
+             OR (o.recipient_email IS NOT NULL AND o.recipient_email = LOWER(k.email))
         )
     `);
   } catch (err) {
