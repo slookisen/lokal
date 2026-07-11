@@ -50,7 +50,7 @@ import adminVerifierSweepStatusRouter from "./routes/admin-verifier-sweep-status
 import ownerPortalRoutes from "./routes/owner-portal";
 import adminAgentAuditRoutes from "./routes/admin-agent-audit";
 import adminVerifierReviewQueueRoutes from "./routes/admin-verifier-review-queue";
-import adminKnowledgeRoutes, { pruneUrlsRouter, homepageContentRefreshRouter } from "./routes/admin-knowledge";
+import adminKnowledgeRoutes, { pruneUrlsRouter, homepageContentRefreshRouter, descriptionTruncationSweepRouter } from "./routes/admin-knowledge";
 import adminSearchEnrichRoutes from "./routes/admin-search-enrich";
 import adminAffiliationsRoutes from "./routes/admin-affiliations";
 import adminBmEventsRoutes from "./routes/admin-bm-events";
@@ -499,6 +499,10 @@ app.use("/admin/knowledge", adminLimiter, adminKnowledgeRoutes);
 app.use("/admin", adminLimiter, pruneUrlsRouter);
 // PR-24a (2026-06-16): write homepage-sourced content over google_places — POST /admin/homepage-content-refresh (dry-run default)
 app.use("/admin", adminLimiter, homepageContentRefreshRouter);
+// dev-request 2026-07-01-cs-corrections-profile-quality item C: catalog-wide
+// agents.description truncation sweep — GET (read-only diagnostic) + POST
+// (dry-run default) /admin/description-truncation-sweep
+app.use("/admin", adminLimiter, descriptionTruncationSweepRouter);
 // orch-pr-10 (2026-06-14): per-producer Brave search→crawl→confirm→email — POST /admin/search-enrich (dry-run default)
 app.use("/admin/search-enrich", adminLimiter, express.json(), adminSearchEnrichRoutes);
 // PR-58 (2026-05-16): C.1-C auto-tag enrichment — POST /admin/affiliations/auto-create

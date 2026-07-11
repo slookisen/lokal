@@ -89,6 +89,10 @@
 import { Router, Request, Response } from "express";
 import { getDb } from "../database/init";
 import { isDirectoryOrAggregatorHost } from "../services/cross-source-validator";
+// dev-request 2026-07-01-cs-corrections-profile-quality item C: reuse the
+// render-time repair logic as the one-time DB backfill/cleanup function —
+// see the truncation-sweep router at the bottom of this file.
+import { safeMetaDescription } from "./seo";
 // PR-24a: homepage CONTENT extractors (PR-22) + write helpers (PURE).
 import {
   isSafeFetchUrl,
@@ -1465,6 +1469,159 @@ homepageContentRefreshRouter.post(
       changed,
       skipped_curated: skippedCurated,
       errors,
+    });
+  },
+);
+
+// ─── GET/POST /admin/description-truncation-sweep (dev-request ──────────────
+//     2026-07-01-cs-corrections-profile-quality, item C) ────────────────────
+//
+// WHY: a historical bug cut `agents.description` text at a raw BYTE offset
+// instead of a JS-string-safe offset, so a multi-byte UTF-8 character
+// (æ/ø/å) could get chopped in half, landing a Unicode replacement character
+// (U+FFFD, "�") in the stored description — reported live on Olestølen
+// Mikroysteri's profile ("...opplevelser p�"). Two nets already exist for
+// NEW writes: a render-time guard (safeMetaDescription() in routes/seo.ts,
+// now exported for reuse) and a write-time gate — but rows corrupted BEFORE
+// those nets existed are still sitting in the DB. This is the one-time
+// backfill/cleanup surface for those already-corrupted rows.
+//
+// NON-GOALS (do not extend this endpoint to cover these): no re-crawl/
+// re-enrichment of content; agent_knowledge.about is a DIFFERENT column on a
+// DIFFERENT table and is NOT implicated in this byte-slice bug — this sweep
+// touches ONLY agents.description.
+//
+// GET  /admin/description-truncation-sweep
+//   Read-only diagnostic — ZERO writes. Scans every agents.description for a
+//   "�", and returns a capped report (id, name, snippet around the
+//   corruption). Capped the same way GET /admin/experiences-dedup-audit caps
+//   its response (AUDIT_RESPONSE_GROUP_CAP in routes/opplevelser.ts) so a
+//   large corpus can't blow up the response.
+//
+// POST /admin/description-truncation-sweep
+//   Body: { dry_run?: boolean } — dry_run DEFAULTS TO TRUE when absent/not
+//   exactly `false` (STRICT-FALSE parse, mirroring POST
+//   /admin/experiences-dedup-unmerge's convention exactly: null / "false" /
+//   0 / "" / undefined all mean dry-run; only the JSON boolean `false` is a
+//   real run). Dry-run reports the same diagnostic plus a preview of the
+//   cleaned value. A real run re-selects the current description for each
+//   candidate row RIGHT BEFORE writing and ONLY updates it if the "�" is
+//   STILL present at that moment — a row fixed by anything else between the
+//   scan and the write is left alone (never clobbers a since-fixed value),
+//   and an already-clean row is never touched or overwritten.
+
+const REPLACEMENT_CHAR = "�";
+const TRUNCATION_SWEEP_RESPONSE_CAP = 100;
+const TRUNCATION_SNIPPET_CONTEXT = 30;
+
+interface CorruptedDescriptionRow {
+  id: string;
+  name: string;
+  description: string;
+}
+
+/** Fetch every agents row whose description still carries the corruption marker. */
+function findCorruptedDescriptions(db: ReturnType<typeof getDb>): CorruptedDescriptionRow[] {
+  return db
+    .prepare("SELECT id, name, description FROM agents WHERE description LIKE ?")
+    .all(`%${REPLACEMENT_CHAR}%`) as CorruptedDescriptionRow[];
+}
+
+/**
+ * A short window of text around the FIRST "�" in a description, for a
+ * human reviewing the diagnostic report. Pure — exported for unit-testing.
+ */
+export function truncationSnippet(description: string): string {
+  const idx = description.indexOf(REPLACEMENT_CHAR);
+  if (idx === -1) return description.slice(0, TRUNCATION_SNIPPET_CONTEXT * 2);
+  const start = Math.max(0, idx - TRUNCATION_SNIPPET_CONTEXT);
+  const end = Math.min(description.length, idx + TRUNCATION_SNIPPET_CONTEXT);
+  return `${start > 0 ? "…" : ""}${description.slice(start, end)}${end < description.length ? "…" : ""}`;
+}
+
+export const descriptionTruncationSweepRouter = Router();
+
+descriptionTruncationSweepRouter.get(
+  "/description-truncation-sweep",
+  (req: Request, res: Response) => {
+    if (!requireAdmin(req, res)) return;
+
+    const db = getDb();
+    const corrupted = findCorruptedDescriptions(db);
+    const report = corrupted.map((row) => ({
+      id: row.id,
+      name: row.name,
+      snippet: truncationSnippet(row.description),
+    }));
+
+    res.json({
+      success: true,
+      dry_run: true,
+      corrupted_count: report.length,
+      rows_returned: Math.min(report.length, TRUNCATION_SWEEP_RESPONSE_CAP),
+      rows_truncated: report.length > TRUNCATION_SWEEP_RESPONSE_CAP,
+      rows: report.slice(0, TRUNCATION_SWEEP_RESPONSE_CAP),
+    });
+  },
+);
+
+descriptionTruncationSweepRouter.post(
+  "/description-truncation-sweep",
+  (req: Request, res: Response) => {
+    if (!requireAdmin(req, res)) return;
+
+    // STRICT-FALSE parse (mirrors POST /admin/experiences-dedup-unmerge):
+    // writes execute ONLY on the JSON boolean false. Anything else — null,
+    // "false", 0, "", undefined — means dry-run, so a caller who leaves
+    // dry_run unset gets the documented dry-run default, never a live sweep.
+    const body = (req.body ?? {}) as { dry_run?: unknown };
+    const dryRun = body.dry_run !== false;
+
+    const db = getDb();
+    const candidates = findCorruptedDescriptions(db);
+
+    if (dryRun) {
+      const preview = candidates.slice(0, TRUNCATION_SWEEP_RESPONSE_CAP).map((row) => ({
+        id: row.id,
+        name: row.name,
+        before_snippet: truncationSnippet(row.description),
+        after: safeMetaDescription(row.description),
+      }));
+      res.json({
+        success: true,
+        dry_run: true,
+        would_update_count: candidates.length,
+        rows_truncated: candidates.length > TRUNCATION_SWEEP_RESPONSE_CAP,
+        would_update: preview,
+      });
+      return;
+    }
+
+    // Apply: re-check each row for the corruption marker RIGHT BEFORE writing
+    // (never clobber a value that was already fixed since the scan above),
+    // and only write rows that still need it.
+    const getCurrent = db.prepare("SELECT description FROM agents WHERE id = ?");
+    const updateDescription = db.prepare("UPDATE agents SET description = ? WHERE id = ?");
+
+    const updatedIds: string[] = [];
+    const tx = db.transaction(() => {
+      for (const candidate of candidates) {
+        const current = getCurrent.get(candidate.id) as { description: string } | undefined;
+        if (!current || !current.description.includes(REPLACEMENT_CHAR)) continue; // since-fixed or gone — leave alone
+        const cleaned = safeMetaDescription(current.description);
+        updateDescription.run(cleaned, candidate.id);
+        updatedIds.push(candidate.id);
+      }
+    });
+    tx();
+
+    res.json({
+      success: true,
+      dry_run: false,
+      scanned: candidates.length,
+      updated_count: updatedIds.length,
+      updated_ids: updatedIds.slice(0, TRUNCATION_SWEEP_RESPONSE_CAP),
+      ids_truncated: updatedIds.length > TRUNCATION_SWEEP_RESPONSE_CAP,
     });
   },
 );

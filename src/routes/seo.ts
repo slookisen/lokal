@@ -64,7 +64,13 @@ function escapeHtml(text: string): string {
 // any dangling partial word left behind) so a corrupted DB value never reaches
 // a live meta tag, no matter how it got corrupted. Leading/interior "�" runs
 // are also collapsed defensively, though the reported bug was trailing-only.
-function safeMetaDescription(text: string | null | undefined): string {
+//
+// dev-request 2026-07-01-cs-corrections-profile-quality item C (catalog-wide
+// truncation sweep): exported so the admin cleanup endpoint in
+// admin-knowledge.ts can reuse this EXACT repair logic as the one-time DB
+// backfill for rows already corrupted before this render-time guard (and the
+// write-time gate) existed. Do not duplicate this logic elsewhere — import it.
+export function safeMetaDescription(text: string | null | undefined): string {
   if (!text) return "";
   let s = String(text);
   if (!s.includes("�")) return s;

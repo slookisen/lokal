@@ -20933,6 +20933,7 @@ console.log("\n── orch-pr-14: MCP discovery product_id surfacing ──");
   try { await _rfbDebioSuitePromise; } catch { /* errors already pushed to failures */ }
   try { await _dispatchTickSuitePromise; } catch { /* errors already pushed to failures */ }
   try { await _samtalerSeoPromise; } catch { /* errors already pushed to failures */ }
+  try { await _descriptionTruncationSweepPromise; } catch { /* errors already pushed to failures */ }
   // relax-envelope tests are synchronous (pure validateEnvelope() unit test) — no promise needed
   // PR-109 tests are synchronous (IIFE) — no promise needed
   // Drop pre-existing intg failures (unmasked by awaiting) — they predate M2
@@ -25623,6 +25624,47 @@ const _samtalerSeoPromise: Promise<void> = new Promise<void>(r => { _samtalerSeo
     initMod6.__setDbForTesting(prevDb6);
     db6.close();
     _samtalerSeoResolve();
+  }
+})();
+
+// ═══════════════════════════════════════════════════════════════════════
+// dev-request 2026-07-01-cs-corrections-profile-quality item C: catalog-wide
+// agents.description truncation sweep — GET/POST /admin/description-
+// truncation-sweep (src/routes/admin-knowledge.ts, descriptionTruncation-
+// SweepRouter). Swaps the shared getDb() singleton (own dedicated test
+// file, in-memory prod-schema DB), so it must run strictly after every
+// other singleton-swapping block — depends on the same trio
+// _dispatchTickSuitePromise/_samtalerSeoPromise wait on, PLUS those two
+// themselves, to be the last to touch the singleton.
+let _descriptionTruncationSweepResolve: () => void = () => {};
+const _descriptionTruncationSweepPromise: Promise<void> = new Promise<void>(r => {
+  _descriptionTruncationSweepResolve = r;
+});
+
+(async () => {
+  await Promise.allSettled([
+    _rfbDebioSuitePromise,
+    _salgskanalMatcherPromise,
+    _adminAgentsRegisterPromise,
+    _dispatchTickSuitePromise,
+    _samtalerSeoPromise,
+  ]);
+  await new Promise(r => setImmediate(r));
+
+  console.log("\n── dev-request 2026-07-01 item C: agents.description truncation sweep ──");
+  try {
+    const { runDescriptionTruncationSweepTests } = require("../src/routes/admin-knowledge-truncation-sweep.test") as
+      typeof import("../src/routes/admin-knowledge-truncation-sweep.test");
+    const dts = await runDescriptionTruncationSweepTests({ log: false });
+    passed += dts.passed;
+    failed += dts.failed;
+    for (const f of dts.failures) failures.push("description-truncation-sweep: " + f);
+    console.log(`  description-truncation-sweep: ${dts.passed} passed, ${dts.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("description-truncation-sweep: unexpected error: " + String(err?.message || err));
+  } finally {
+    _descriptionTruncationSweepResolve();
   }
 })();
 
