@@ -441,6 +441,43 @@ export function runSearchEnrichTests(opts: { log?: boolean } = {}): TestSummary 
     assertTrue(!meetsAboutQualityBar(mangledTrailing), "quality: trailing replacement-char (mid-word cut) fails");
     const mangledInterior = good.slice(0, 40) + "�" + good.slice(40);
     assertTrue(!meetsAboutQualityBar(mangledInterior), "quality: interior replacement-char fails");
+
+    // ── nav-menu / boilerplate-menu leakage (data-quality bug found in a
+    // gardssalg-content-refresh dry-run: ~40-50% of candidates passing this
+    // gate were actually scraped <nav> chrome, not venue prose) ────────────
+    // Real example 1: a numbered breadcrumb/nav list, no sentence structure.
+    const navNumbered =
+      "01 Hjem 02 Vingård 03 Sideri 04 Tjenester 05 Opplevelser 06 Servering, book bord og finn åpningstider her hos oss.";
+    assertTrue(!meetsAboutQualityBar(navNumbered), "quality: numbered nav-menu list fails");
+    // Real example 2: pipe/arrow-separated nav menu with a "top of page" anchor.
+    const navPipeArrow =
+      "--> HEIM | Lofthus sideri top of page HEIM JUICE SIDER OM OSS UTSALG KONTAKT Velkommen til vår gård i Hardanger.";
+    assertTrue(!meetsAboutQualityBar(navPipeArrow), "quality: pipe/arrow nav-menu with 'top of page' marker fails");
+    // Pure pipe-separated menu (no explicit marker) — many '|' separators, zero
+    // sentence-ending punctuation.
+    const navPipeOnly =
+      "Hjem | Om oss | Produkter | Nettbutikk | Kontakt oss | Meny | Nyheter | Arrangementer for hele familien";
+    assertTrue(!meetsAboutQualityBar(navPipeOnly), "quality: pure pipe-separated menu (no punctuation) fails");
+    // Pure arrow-separated menu (no explicit marker) — same shape with '-->'.
+    const navArrowOnly =
+      "Forside --> Om gården --> Produkter --> Nettbutikk --> Kontakt --> Meny --> Åpningstider for besøkende";
+    assertTrue(!meetsAboutQualityBar(navArrowOnly), "quality: pure arrow-separated menu (no punctuation) fails");
+    // Norwegian skip-link marker alone, embedded in otherwise plausible prose.
+    const navSkipLink =
+      "Hopp til innhold. Velkommen til gårdsbutikken vår hvor du finner ferske grønnsaker, egg og kjøtt fra egen produksjon.";
+    assertTrue(!meetsAboutQualityBar(navSkipLink), "quality: 'hopp til innhold' skip-link marker fails");
+
+    // Near-miss REAL prose that must NOT be over-rejected by the new checks.
+    // Mentions a number immediately followed by a capitalized word exactly
+    // once (below the ≥3 numbered-menu-item threshold).
+    const realWithNumber =
+      "Vi holder åpent fra klokken 10 Alle dager i sommersesongen, og tilbyr ferske bær, grønnsaker og hjemmelaget saft fra egen gård i Hardanger.";
+    assertTrue(meetsAboutQualityBar(realWithNumber), "quality: real prose mentioning one number+capital word still passes");
+    // Mentions a food "meny" (menu) but is written as real sentences with
+    // normal punctuation and no pipe/arrow separators.
+    const realWithMenu =
+      "Vår restaurant har en fast meny med lokale råvarer, og gjestene kan også besøke gårdsbutikken vår for å handle rett fra produksjonen.";
+    assertTrue(meetsAboutQualityBar(realWithMenu), "quality: real prose mentioning a food 'meny' still passes");
   }
 
   // ── orch-experiences-content-refresh: mapToExperienceCategories (PURE) ──────

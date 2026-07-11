@@ -985,6 +985,41 @@ const GENERIC_ABOUT_MARKERS: readonly string[] = [
   "all rights reserved", "alle rettigheter",
 ];
 
+// Literal chrome/boilerplate markers that show up when a page's NAVIGATION MENU
+// (not its body prose) gets scraped as the candidate summary — skip-links,
+// breadcrumb "back to top" anchors, etc. Accent-stripped, lowercase substrings,
+// same convention as GENERIC_ABOUT_MARKERS above.
+const NAV_BOILERPLATE_MARKERS: readonly string[] = [
+  "top of page", "skip to content", "hopp til innhold", "til toppen",
+];
+
+/**
+ * Detects candidate text that is actually leaked NAVIGATION-MENU markup rather
+ * than real venue prose. Two independent signals, either is disqualifying:
+ *
+ *   1. A "numbered menu list" pattern — several short items each led by a 1-2
+ *      digit index immediately followed by a capitalized word, e.g.
+ *      "01 Hjem 02 Vingård 03 Sideri 04 Tjenester" (a rendered `<nav>` list).
+ *      Real prose that happens to mention a number-then-capitalized-word once
+ *      (e.g. a year, a count) will not clear the ≥3 threshold.
+ *   2. Pipe/arrow-separated menu tokens with NO sentence-ending punctuation at
+ *      all, e.g. "--> HEIM | Lofthus sideri ... HEIM JUICE SIDER OM OSS". Real
+ *      prose — even prose that mentions a "meny" (menu) of food items — is
+ *      written in sentences and will contain at least one '.', '!' or '?'.
+ *
+ * PURE, no network/IO.
+ */
+function isLikelyNavMenuLeakage(trimmed: string): boolean {
+  const numberedItemMatches = trimmed.match(/\b\d{1,2}\s*[A-ZÆØÅ][a-zæøå]*/g) || [];
+  if (numberedItemMatches.length >= 3) return true;
+
+  const separatorMatches = trimmed.match(/-->|->|\|/g) || [];
+  const sentenceEnders = trimmed.match(/[.!?]/g) || [];
+  if (separatorMatches.length >= 3 && sentenceEnders.length === 0) return true;
+
+  return false;
+}
+
 // Letters that signal the text is Norwegian (or at least Scandinavian) prose
 // rather than an English/other-language snippet: the æ/ø/å family plus a small
 // set of very common Norwegian function words. The homepage content we want to
@@ -1004,6 +1039,9 @@ const NORWEGIAN_WORD_MARKERS: readonly string[] = [
  *   - looks Norwegian — contains an æ/ø/å letter OR a common Norwegian function
  *     word (rejects an English cookie/marketing snippet),
  *   - is NOT dominated by generic boilerplate (cookie/consent/placeholder),
+ *   - is NOT leaked navigation-menu chrome (skip-links/"back to top" anchors,
+ *     numbered menu lists, or pipe/arrow-separated menu tokens with no
+ *     sentence punctuation — see isLikelyNavMenuLeakage),
  *   - does NOT contain the Unicode replacement character (U+FFFD, "�") — a
  *     candidate with a "�" was mangled upstream (most likely a byte-level cut
  *     through a multi-byte UTF-8 character, e.g. mid æ/ø/å) and must never be
@@ -1030,6 +1068,15 @@ export function meetsAboutQualityBar(text: string | null | undefined, minLen = 8
   for (const marker of GENERIC_ABOUT_MARKERS) {
     if (lowerAscii.includes(marker)) return false;
   }
+
+  // Reject nav-chrome markers (skip-links, "back to top" anchors) and the
+  // numbered/pipe-separated MENU shapes those pages render as (see
+  // isLikelyNavMenuLeakage doc comment) — leakage from the site's <nav>, not
+  // real venue prose.
+  for (const marker of NAV_BOILERPLATE_MARKERS) {
+    if (lowerAscii.includes(marker)) return false;
+  }
+  if (isLikelyNavMenuLeakage(trimmed)) return false;
 
   // Must look Norwegian: an æ/ø/å letter, OR a common Norwegian function word.
   // (Pad with spaces so word-markers match at the string edges too.)
