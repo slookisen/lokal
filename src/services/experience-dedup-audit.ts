@@ -12,11 +12,23 @@
 // This module AUDITS the merges (read-only): it re-examines every merged row
 // (canonical_id IS NOT NULL) and classifies the strongest evidence linking it
 // to its group. The discriminator is corpus frequency: a shared token that
-// appears in few titles across the whole table ("heyerdahl") is distinctive
-// evidence; one that appears everywhere ("fjelltur", "rafting", "klatring")
-// is generic and proves nothing. Rows whose BEST link is generic-only (or no
-// signal at all) are flagged suspect for the un-merge endpoint
+// few PROVIDERS use ("heyerdahl") is distinctive evidence; one that appears
+// across many providers ("fjelltur", "rafting", "klatring") is generic and
+// proves nothing. Rows whose BEST link is generic-only (or no signal at all)
+// are flagged suspect for the un-merge endpoint
 // (POST /admin/experiences-dedup-unmerge in src/routes/opplevelser.ts).
+//
+// AUDIT V2 — provider-distinct corpus counting. The first prod run counted a
+// token once per distinct TITLE, and over-flagged badly (859/1361 rows
+// suspect, including the confirmed-TRUE Kon-Tiki group): the duplicates
+// themselves inflate title counts — "kontiki" appeared in 16 titles because
+// there are 16 harvest clones of ONE museum, so the proper nouns of heavily-
+// duplicated entities looked corpus-common (kontiki(16), heyerdahl(17),
+// dyreparken(8), maihaugen(8), fossheim(7) all >= genericMin 5) while true
+// generics sat only somewhat higher (rafting(32), hotel(274)) — no threshold
+// separates them on that axis. Counting DISTINCT PROVIDERS instead is immune
+// to clone inflation: "rafting" spans many providers → common; "kontiki" is
+// one provider however many clone titles it has → rare.
 //
 // Deliberately does NOT touch titlesMatch()/runDedupPass() — fixing the merge
 // rule itself is a separate slice of the dev-request.
@@ -29,8 +41,12 @@ import { levenshtein, normalizeExperienceTitle, titleTokens } from "./experience
 const SIGNIFICANT_TOKEN_MIN_LEN = 5;
 
 // A shared significant token is "rare" (distinctive, trustworthy evidence)
-// when it appears in fewer than this many distinct titles across the corpus;
-// otherwise it is "generic" and links nothing.
+// when its corpus count is below this; otherwise it is "generic" and links
+// nothing. Under audit v2 the corpus count is DISTINCT PROVIDERS (see header).
+// 5 stays the right default with provider-distinct counting: in both the prod
+// corpus and the test fixtures, true proper nouns sit at 1–2 providers while
+// genuinely broad activity words span 6+ providers even in small corpora —
+// the two populations no longer overlap the way title counts did.
 const DEFAULT_GENERIC_MIN = 5;
 
 // Whole-string closeness bar for the AUDIT. Deliberately STRICTER than
@@ -59,7 +75,8 @@ export interface MergedPairClassification {
 }
 
 export interface ClassifyOptions {
-  /** Shared tokens appearing in >= this many distinct titles are generic (default 5). */
+  /** Shared tokens with a corpus count >= this are generic (default 5).
+   *  The audit path's corpus count is distinct PROVIDERS (audit v2). */
   genericMin?: number;
   /** Whole-string similarity bar (default 0.85 — see comment above). */
   wholeStringMin?: number;
@@ -114,6 +131,11 @@ export function classifyMergedPair(
  * Corpus token frequencies: how many DISTINCT titles each significant token
  * appears in (a token repeated within one title counts once). Stopwords and
  * short tokens never appear (titleTokens() drops them).
+ *
+ * NOTE: the audit path no longer uses this (title counts are inflated by the
+ * duplicate clones themselves — see the audit-v2 header note) but the
+ * contract is still valid for corpora without per-entity cloning; kept
+ * exported for those callers.
  */
 export function buildCorpusTokenCounts(titles: string[]): Map<string, number> {
   const counts = new Map<string, number>();
@@ -121,6 +143,36 @@ export function buildCorpusTokenCounts(titles: string[]): Map<string, number> {
     for (const token of new Set(titleTokens(title))) {
       counts.set(token, (counts.get(token) ?? 0) + 1);
     }
+  }
+  return counts;
+}
+
+/**
+ * Audit-v2 corpus token frequencies: how many DISTINCT PROVIDERS use each
+ * significant token in any of their titles (merged or not). A provider with
+ * 16 clone titles of one museum contributes exactly 1 to each of that
+ * museum's tokens, so heavily-duplicated entities can't inflate their own
+ * proper nouns into looking "generic". A NULL provider_id row counts as its
+ * own singleton pseudo-provider (per-row fallback key) — orphan rows don't
+ * collapse into one shared bucket. Token extraction is identical to
+ * titleTokens() (a token counts once per provider, not per title).
+ */
+export function buildProviderCorpusTokenCounts(
+  rows: Array<{ title: string; provider_id: string | null }>
+): Map<string, number> {
+  const providersByToken = new Map<string, Set<string>>();
+  let orphanSeq = 0;
+  for (const row of rows) {
+    const providerKey = row.provider_id ?? `__orphan-row-${orphanSeq++}`;
+    for (const token of new Set(titleTokens(row.title))) {
+      const set = providersByToken.get(token);
+      if (set) set.add(providerKey);
+      else providersByToken.set(token, new Set([providerKey]));
+    }
+  }
+  const counts = new Map<string, number>();
+  for (const [token, providers] of providersByToken) {
+    counts.set(token, providers.size);
   }
   return counts;
 }
@@ -172,12 +224,14 @@ export interface AuditResult {
  * 'no-signal'.
  */
 export function auditMergedGroups(db: Database.Database, opts: ClassifyOptions = {}): AuditResult {
-  // Corpus = ALL titles (canonical, merged, and unmerged alike) — generic-ness
-  // of a token is a property of the whole harvested table.
-  const allTitles = (db.prepare("SELECT title FROM experiences").all() as Array<{ title: string }>).map(
-    (r) => r.title
-  );
-  const corpus = buildCorpusTokenCounts(allTitles);
+  // Corpus = ALL rows (canonical, merged, and unmerged alike) — generic-ness
+  // of a token is a property of the whole harvested table. Counted per
+  // DISTINCT PROVIDER (audit v2), not per title, so a heavily-cloned entity's
+  // own proper nouns stay rare (see header note).
+  const corpusRows = db
+    .prepare("SELECT title, provider_id FROM experiences")
+    .all() as Array<{ title: string; provider_id: string | null }>;
+  const corpus = buildProviderCorpusTokenCounts(corpusRows);
 
   const mergedRows = db
     .prepare("SELECT id, title, canonical_id FROM experiences WHERE canonical_id IS NOT NULL ORDER BY id")
@@ -250,7 +304,9 @@ export function auditMergedGroups(db: Database.Database, opts: ClassifyOptions =
       groups_with_suspects: groupsWithSuspects,
     },
   };
-}// OPERATOR NOTE (review round 2): a row X can be kept non-suspect by a
+}
+
+// OPERATOR NOTE (review round 2): a row X can be kept non-suspect by a
 // whole-string link to a sibling Y that is itself suspect; after Y is
 // un-merged the next audit recomputes sibling links and may then flag X.
 // The workflow is therefore iterative and self-healing: audit -> un-merge
