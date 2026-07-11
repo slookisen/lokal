@@ -303,6 +303,100 @@ export async function verifyOrgNumber(
   return { ...result };
 }
 
+// ─── Activity-description fallback (dev-request ────────────────────────
+//     2026-06-30-open-stuck-verification-bucket) ─────────────────────────
+//
+// fetchBrregActivityDescription(orgNr) returns Brreg's own registered NACE
+// activity-description text (naeringskode{1,2,3}.beskrivelse) for a given
+// org number — used as a DESCRIPTION FALLBACK for agents whose homepage
+// crawl failed during enrichment (the `http_unreachable` bucket), so they
+// never got a real description. Brreg is already a trusted source
+// elsewhere in this codebase (brreg-verification-gate, brreg-nace-
+// discovery); this hits the SAME GET /enheter/{orgNr} endpoint
+// verifyOrgNumber() already calls, but reads a field verifyOrgNumber never
+// has — verifyOrgNumber only reads naeringskode{N}.kode (the numeric NACE
+// code), never .beskrivelse (the human-readable activity-description text).
+//
+// Priority: naeringskode1's text, falling back to kode2, then kode3, if the
+// higher-priority code has no non-empty beskrivelse. Returns null when none
+// of the three has one.
+
+type RawNaeringskode = { kode?: string; beskrivelse?: string | null } | null | undefined;
+
+interface RawEnhetActivity {
+  naeringskode1?: RawNaeringskode;
+  naeringskode2?: RawNaeringskode;
+  naeringskode3?: RawNaeringskode;
+}
+
+/**
+ * Pure — picks the first non-empty `beskrivelse` from naeringskode1/2/3, in
+ * that priority order. Exported for unit-testing without network I/O.
+ */
+export function pickBrregActivityDescription(enhet: RawEnhetActivity | null | undefined): string | null {
+  if (!enhet) return null;
+  for (const nk of [enhet.naeringskode1, enhet.naeringskode2, enhet.naeringskode3]) {
+    const text = nk?.beskrivelse;
+    if (typeof text === "string" && text.trim() !== "") return text.trim();
+  }
+  return null;
+}
+
+// Tiny per-process cache keyed by orgNr — mirrors verifyCache's rationale
+// (avoid hammering Brreg on repeated calls for the same org-nr in one run).
+const activityDescriptionCache: Map<string, string | null> = new Map();
+
+export function __clearBrregActivityDescriptionCacheForTesting(): void {
+  activityDescriptionCache.clear();
+}
+
+/**
+ * fetchBrregActivityDescription(orgNr) — direct Brreg lookup by org-nr
+ * (GET /enheter/{orgNr}), returning the registered NACE activity-description
+ * text (see pickBrregActivityDescription). Never throws: any network/parse
+ * error or 404 resolves to null — same safe-default convention as
+ * verifyOrgNumber. Does not do fuzzy name matching; the org-nr is already
+ * known.
+ */
+export async function fetchBrregActivityDescription(
+  orgNr: string,
+  fetchImpl: typeof fetch = fetch,
+): Promise<string | null> {
+  const cleanOrgNr = (orgNr || "").trim();
+  if (!cleanOrgNr) return null;
+
+  if (activityDescriptionCache.has(cleanOrgNr)) return activityDescriptionCache.get(cleanOrgNr) ?? null;
+
+  const url = `${BRREG_BASE_URL}${BRREG_SEARCH_PATH}/${encodeURIComponent(cleanOrgNr)}`;
+  let res: Response;
+  try {
+    res = await fetchWithTimeout(url, REQUEST_TIMEOUT_MS, fetchImpl);
+  } catch (err) {
+    console.warn(
+      "[brreg-client] fetchBrregActivityDescription fetch failed:",
+      err instanceof Error ? err.message : err,
+    );
+    return null;
+  }
+
+  if (res.status === 404) {
+    activityDescriptionCache.set(cleanOrgNr, null);
+    return null;
+  }
+  if (!res.ok) return null;
+
+  let json: RawEnhetActivity;
+  try {
+    json = (await res.json()) as RawEnhetActivity;
+  } catch {
+    return null;
+  }
+
+  const result = pickBrregActivityDescription(json);
+  activityDescriptionCache.set(cleanOrgNr, result);
+  return result;
+}
+
 // ─── Main entry ────────────────────────────────────────────────────────
 //   findOrgnumberByName(name, postal?)
 //   → top-confidence hit if score ≥ 0.9, else null.

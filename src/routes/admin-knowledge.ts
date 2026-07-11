@@ -409,8 +409,23 @@ export function canCorrectFactualField(opts: {
   websiteOwnershipUnverified: boolean;
   incomingFieldProvenance: unknown;
   isCurated: boolean;
+  // orch-pr-20260711 (brreg-description-fallback, dev-request 2026-06-30-
+  // open-stuck-verification-bucket): true when the CALLER has already
+  // established the existing column value is genuinely empty — a pure ADD,
+  // not an overwrite (this docstring already said pure ADDs "do not go
+  // through this guard", but every existing call site enforced that
+  // OUTSIDE this function via its own oldPopulated check, or relied on the
+  // hasPreferredContent fast path below as a proxy for it). A brand-new,
+  // narrowly-scoped source like "brreg_fallback" is neither Tier-A nor
+  // Tier-S nor "preferred content", so without this flag a pure ADD from
+  // such a source would always be refused by the Tier-A/Tier-S check below
+  // — even though nothing is being overwritten. Optional and defaults to
+  // undefined/false, so every existing call site (which never passes it) is
+  // byte-for-byte unchanged. The curated-lock refusal above still applies
+  // absolutely — this flag never bypasses it.
+  isPureAdd?: boolean;
 }): CorrectDecision {
-  const { field, existingFieldProvenance, websiteOwnershipUnverified, incomingFieldProvenance, isCurated } = opts;
+  const { field, existingFieldProvenance, websiteOwnershipUnverified, incomingFieldProvenance, isCurated, isPureAdd } = opts;
 
   const isContentField = CONTENT_FIELDS.includes(field);
   if (!CORRECTABLE_FACTUAL_FIELDS.includes(field) && !isContentField) {
@@ -421,6 +436,13 @@ export function canCorrectFactualField(opts: {
   // Owner-curated / locked field — NEVER overwrite a CS/owner-locked field, not
   // even with a homepage source. This guards content fields too.
   if (isCurated) return { allowed: false, reason: "curated_locked" };
+
+  // ── Pure ADD shortcut ────────────────────────────────────────────────────
+  // Nothing existing is being overwritten (the caller has verified the
+  // column is empty), so the Tier-A/Tier-S qualification below — which
+  // exists ONLY to protect a populated legacy value from being replaced by
+  // something under-attested — does not apply. Any real value beats none.
+  if (isPureAdd) return { allowed: true, reason: "ok_pure_add" };
 
   const existing = summariseProvenance(existingFieldProvenance);
   const incoming = summariseProvenance(incomingFieldProvenance);
