@@ -1523,9 +1523,24 @@ router.get("/umbrella-traffic", (req: Request, res: Response) => {
  * runs_daily_summary, optionally run VACUUM.
  * Feature-flag: RETENTION_JOB_ENABLED env var must be "true" (or dryRun=true).
  * Body: { windowDays?: number, runLedgerKeepDays?: number, vacuum?: boolean, dryRun?: boolean }
+ * dryRun is also accepted as ?dryRun=true — dry-run wins on conflict (either
+ * signal true ⇒ dry): a sharp run requires explicit absence of both (mirrors
+ * the strict-false convention from POST /admin/experiences-dedup-unmerge, #215).
+ * Manual-only: there is no scheduler wired to this endpoint (grep confirms no
+ * cron/job calls it) — a periodic trigger is a separate future decision.
  */
 router.post("/ops/retention-rollup", (req: Request, res: Response) => {
-  const dryRun = req.body.dryRun === true;
+  // req.body is `undefined` (not `{}`) when a request has no Content-Type
+  // header at all — express.json() then skips parsing entirely. The naive
+  // `req.body.dryRun` below used to throw on exactly that shape of request
+  // (a plain `POST` with no body), which is how the real-pass 500 was first
+  // found: dev-request 2026-07-11-retention-rollup-500-rootcause.
+  const body = (req.body ?? {}) as { dryRun?: unknown; windowDays?: unknown; runLedgerKeepDays?: unknown; vacuum?: unknown };
+  // A repeated ?dryRun=true&dryRun=true parses as an array in Express — treat
+  // any element being "true" as a dry-run signal rather than silently falling
+  // through to a real run (dry-run must win on every shape of the signal).
+  const queryDryRun = Array.isArray(req.query.dryRun) ? req.query.dryRun.includes("true") : req.query.dryRun === "true";
+  const dryRun = body.dryRun === true || queryDryRun;
   const enabled = process.env.RETENTION_JOB_ENABLED === "true";
 
   if (!dryRun && !enabled) {
@@ -1537,9 +1552,9 @@ router.post("/ops/retention-rollup", (req: Request, res: Response) => {
 
   try {
     const { runRetentionPass } = require("../services/retention-service");
-    const windowDays = Math.max(30, Math.min(365, parseInt(req.body.windowDays) || 90));
-    const runLedgerKeepDays = Math.max(14, Math.min(90, parseInt(req.body.runLedgerKeepDays) || 30));
-    const vacuum = req.body.vacuum !== false; // default true
+    const windowDays = Math.max(30, Math.min(365, parseInt(body.windowDays as string) || 90));
+    const runLedgerKeepDays = Math.max(14, Math.min(90, parseInt(body.runLedgerKeepDays as string) || 30));
+    const vacuum = body.vacuum !== false; // default true
 
     const result = runRetentionPass({ windowDays, runLedgerKeepDays, vacuum, dryRun });
 
