@@ -134,8 +134,30 @@ class CrmService {
       .get(lowerEmail) as { id: string; type: ContactType; agent_id: string | null } | undefined;
 
     if (existing) {
-      // Re-evaluate type if currently 'unknown' (cheap, one indexed lookup)
-      if (existing.type === "unknown") {
+      // Re-evaluate if currently 'unknown' OR stuck with no agent_id link (cheap,
+      // one indexed lookup). The agent_id===null case matters on its own: a contact
+      // that resolved to agent_id=null on first contact (e.g. the producer wasn't
+      // yet 'verified'/didn't have an agent_knowledge row at that time) previously
+      // stayed unlinked FOREVER, because this re-evaluation only ran for
+      // type==='unknown'. An unlinked contact's outbound sends never satisfy the
+      // outreach_sent_log auto-record trigger's `agent_id IS NOT NULL` guard (PR-38),
+      // so the producer silently never gets suppressed and keeps reappearing in the
+      // outreach pool on every batch — root cause of the 2026-07-11 P0 incident
+      // (outreach-suppression-gate-failure, 91 recipients re-contacted 2-4 days
+      // running). Retrying classifyEmail() here self-heals the link as soon as the
+      // producer becomes resolvable, on the very next contact touch.
+      //
+      // Excludes 'vendor' AND 'marketing': classifyEmail() can never itself produce
+      // either of those types with a non-null agentId (vendor's IS always null by
+      // design; 'marketing' isn't a classifyEmail() outcome at all — it's only ever
+      // set manually via POST /admin/crm/contacts/:id/type, e.g. a press/partner
+      // contact whose email happens to domain-match a producer). Without this
+      // exclusion, a manually-tagged 'marketing' contact would get silently flipped
+      // back to 'producer' on its next touch (reviewer finding, 2026-07-11).
+      const needsReclassify =
+        existing.type === "unknown" ||
+        (existing.agent_id === null && existing.type !== "vendor" && existing.type !== "marketing");
+      if (needsReclassify) {
         const c = this.classifyEmail(lowerEmail);
         if (c.type !== "unknown") {
           db.prepare("UPDATE crm_contacts SET type = ?, agent_id = ?, last_seen_at = datetime('now') WHERE id = ?")

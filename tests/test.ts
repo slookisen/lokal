@@ -667,6 +667,39 @@ console.log("\n── crm-service (listThreadsByStatus contact_email fix) ──
   console.log(`  crm-service: ${r.passed} passed, ${r.failed} failed`);
 }
 
+// ── crm-service: resolveContact() self-healing agent_id link (P0 fix) ──
+// Pins the root-cause fix for the 2026-07-11 P0 incident (dev-request
+// outreach-suppression-gate-failure-P0): a crm_contacts row stuck at
+// agent_id=NULL (not just type='unknown') now self-heals its agent_id link
+// on the next resolveContact() touch.
+console.log("\n── crm-service (resolveContact self-healing agent_id link) ──");
+{
+  const { runCrmServiceResolveContactTests } = require("../src/services/crm-service-resolve-contact.test") as
+    typeof import("../src/services/crm-service-resolve-contact.test");
+  const r = runCrmServiceResolveContactTests({ log: false });
+  passed += r.passed;
+  failed += r.failed;
+  for (const f of r.failures) failures.push("crm-service-resolve-contact: " + f);
+  console.log(`  crm-service-resolve-contact: ${r.passed} passed, ${r.failed} failed`);
+}
+
+// ── admin-outreach-candidates: belt-and-suspenders CRM-send guard (P0 fix) ──
+// Pins the defense-in-depth fix for the same 2026-07-11 P0 incident: an
+// independent recipient-email check against crm_messages, so a broken
+// agent_id link can no longer cause the same producer to resurface as
+// "never contacted".
+console.log("── admin-outreach-candidates (belt-and-suspenders CRM-send guard) ──");
+{
+  const { runAdminOutreachCandidatesCrmSendGuardTests } =
+    require("../src/routes/admin-outreach-candidates-crm-send-guard.test") as
+      typeof import("../src/routes/admin-outreach-candidates-crm-send-guard.test");
+  const r = runAdminOutreachCandidatesCrmSendGuardTests({ log: false });
+  passed += r.passed;
+  failed += r.failed;
+  for (const f of r.failures) failures.push("admin-outreach-candidates-crm-send-guard: " + f);
+  console.log(`  admin-outreach-candidates-crm-send-guard: ${r.passed} passed, ${r.failed} failed`);
+}
+
 // ── orch-pr-12: search-enrich background sweep + findings + apply-findings ──
 // Async (fire-and-forget sweep loop). Kicked off here; awaited in the REPORT
 // block so its pass/fail counts fold into the `npm test` summary.
@@ -19533,6 +19566,7 @@ const _orchPr20260614Promise: Promise<void> = new Promise<void>(r => { _orchPr20
       thread_id TEXT NOT NULL,
       direction TEXT NOT NULL,
       from_email TEXT NOT NULL,
+      to_emails TEXT,
       sent_at TEXT,
       received_at TEXT DEFAULT (datetime('now')),
       delivery_status TEXT NOT NULL DEFAULT 'sent'

@@ -20,6 +20,16 @@
 //        9. not inference-only on a factual field (orch-pr-17) — products/address/
 //           phone flagged in verification_review_reason.inference_only_fields (PR-16
 //           signal). suppressed_counts.inference_only
+//       10. belt-and-suspenders (2026-07-11 P0 fix): not already emailed per
+//           crm_messages (raw outbound marketing sends, matched by RECIPIENT
+//           EMAIL) within cooldown_days — independent of outreach_sent_log/
+//           agent_id linkage. suppressed_counts.recent_crm_send_email_match.
+//           Closes the gap that let a broken crm_contacts.agent_id link (see
+//           crm-service.ts resolveContact) leave outreach_sent_log blind to a
+//           real send, causing the SAME producer to resurface as "never
+//           contacted" on the next batch (91 recipients re-mailed 2-4 days
+//           running, 2026-07-04..09 — dev-request outreach-suppression-gate-
+//           failure-P0).
 //      8 & 9 are ADVISORY/defensive: a row missing the signal is never suppressed,
 //      and free-mail (gmail/hotmail) is NEVER a suppression reason.
 //
@@ -284,6 +294,50 @@ router.get("/", (req: Request, res: Response) => {
       }
     }
 
+    // ── Step 2b: belt-and-suspenders — independent recipient-email check ──────
+    //
+    // Root cause of the 2026-07-11 P0 incident (outreach-suppression-gate-failure):
+    // this gate's suppression signal above is keyed entirely on outreach_sent_log,
+    // which is populated ONLY via the PR-38 trigger on crm_messages, which in turn
+    // only fires when the send's crm_contacts row already has a resolved agent_id
+    // (see crm-service.ts resolveContact — a contact that fails to resolve an
+    // agent_id on its first touch used to stay unlinked forever). When that link is
+    // missing, the actual Resend send still happens and is visible in crm_messages
+    // (confirmed live via GET /admin/crm/sent-log), but outreach_sent_log never
+    // gets the row, so the SAME producer resurfaces as "never contacted" on every
+    // subsequent batch — 91 recipients re-mailed 2-4 days running, 2026-07-04..09.
+    //
+    // This check is independent of agent_id/crm_contacts linkage entirely: it reads
+    // raw outbound marketing sends by RECIPIENT EMAIL — the one fact that's always
+    // correct, since it's literally who Resend delivered to — and suppresses
+    // regardless of whether the agent_id-keyed bookkeeping above is intact. Belt
+    // (outreach_sent_log) + suspenders (this). Fixing the linkage bug (crm-service.ts)
+    // is the root-cause fix; this is the invariant that survives future variants of
+    // the same class of bug.
+    const recentSendCutoff = new Date(Date.now() - cooldownDays * 86400 * 1000).toISOString();
+    const recentMarketingSends = db.prepare(`
+      SELECT to_emails FROM crm_messages
+      WHERE direction = 'out'
+        AND delivery_status = 'sent'
+        AND thread_id LIKE 'marketing-batch-%'
+        AND sent_at IS NOT NULL
+        AND sent_at > ?
+    `).all(recentSendCutoff) as Array<{ to_emails: string | null }>;
+
+    const recentlyEmailedAddresses = new Set<string>();
+    for (const msg of recentMarketingSends) {
+      let addrs: unknown;
+      try {
+        addrs = JSON.parse(msg.to_emails || "[]");
+      } catch {
+        continue;
+      }
+      if (!Array.isArray(addrs)) continue;
+      for (const a of addrs) {
+        if (typeof a === "string" && a) recentlyEmailedAddresses.add(a.trim().toLowerCase());
+      }
+    }
+
     // ── Step 3: separate candidates from suppressed ───────────────────────────
     const candidates: Array<{ agent_id: string; name: string; email: string }> = [];
     let contactedOrCooldownCount = 0;
@@ -295,6 +349,8 @@ router.get("/", (req: Request, res: Response) => {
     // orch-pr-17 data-quality counters
     let websiteUnverifiedCount = 0;
     let inferenceOnlyCount = 0;
+    // Step 2b belt-and-suspenders counter
+    let recentCrmSendCount = 0;
 
     for (const row of rows) {
       let isContactedOrCooldown = false;
@@ -338,6 +394,10 @@ router.get("/", (req: Request, res: Response) => {
       // Read-only on PR-16's verification_review_reason.inference_only_fields;
       // absent/malformed → false. Free-mail is NEVER a reason here.
       const suppressedForInferenceOnly = hasInferenceOnlyFactualField(row.verification_review_reason);
+      // Belt-and-suspenders (Step 2b) — see comment above. Independent of
+      // agent_id/outreach_sent_log; catches a producer we already emailed even if
+      // that send's agent_id link is broken/missing.
+      const suppressedForRecentCrmSend = recentlyEmailedAddresses.has(row.email.trim().toLowerCase());
 
       if (suppressedForContacted) contactedOrCooldownCount++;
       if (suppressedForReplied) repliedCount++;
@@ -347,6 +407,7 @@ router.get("/", (req: Request, res: Response) => {
       if (suppressedForBlocklist) blocklistedCount++;
       if (suppressedForWebsiteUnverified) websiteUnverifiedCount++;
       if (suppressedForInferenceOnly) inferenceOnlyCount++;
+      if (suppressedForRecentCrmSend) recentCrmSendCount++;
 
       if (
         !suppressedForContacted &&
@@ -356,7 +417,8 @@ router.get("/", (req: Request, res: Response) => {
         !suppressedForBounce &&
         !suppressedForBlocklist &&
         !suppressedForWebsiteUnverified &&
-        !suppressedForInferenceOnly
+        !suppressedForInferenceOnly &&
+        !suppressedForRecentCrmSend
       ) {
         candidates.push({
           agent_id: row.agent_id,
@@ -398,6 +460,8 @@ router.get("/", (req: Request, res: Response) => {
         // orch-pr-17: new data-quality suppression reasons
         website_unverified: websiteUnverifiedCount,
         inference_only: inferenceOnlyCount,
+        // Step 2b: belt-and-suspenders recipient-email match (agent_id-independent)
+        recent_crm_send_email_match: recentCrmSendCount,
       },
     });
   } catch (err: any) {
