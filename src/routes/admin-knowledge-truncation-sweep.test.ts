@@ -137,8 +137,13 @@ export function runDescriptionTruncationSweepTests(opts: { log?: boolean } = {})
       );
       const corruptedDescription = "Gårdsbutikk med lokale råvarer og opplevelser p�";
       const cleanDescription = "Gårdsbutikk med lokale råvarer, ost og egg.";
+      // 3. Unrepairable: corruption markers start-to-finish — safeMetaDescription()
+      //    cleans this to "". Applying must NOT blank a live description; it
+      //    must skip the write and leave the row flagged for manual review.
+      const unrepairableDescription = "���";
       insertAgent.run("agent-corrupt-1", "Corrupt Gård", corruptedDescription, "key-corrupt-1");
       insertAgent.run("agent-clean-1", "Clean Gård", cleanDescription, "key-clean-1");
+      insertAgent.run("agent-unrepairable-1", "Unrepairable Gård", unrepairableDescription, "key-unrepair-1");
 
       // Fresh require of the router module for a clean handler binding.
       delete require.cache[require.resolve("./admin-knowledge")];
@@ -176,13 +181,14 @@ export function runDescriptionTruncationSweepTests(opts: { log?: boolean } = {})
       });
       assertEq(diag.status, 200, "diag: GET with valid key -> 200");
       assertEq(diag.body?.success, true, "diag: success=true");
-      assertEq(diag.body?.corrupted_count, 1, "diag: exactly 1 corrupted row found");
+      assertEq(diag.body?.corrupted_count, 2, "diag: exactly 2 corrupted rows found (repairable + unrepairable)");
       assertTrue(Array.isArray(diag.body?.rows), "diag: rows is an array");
-      assertEq(diag.body.rows.length, 1, "diag: rows array has exactly 1 entry");
-      assertEq(diag.body.rows[0]?.id, "agent-corrupt-1", "diag: reports the corrupted row's id");
-      assertEq(diag.body.rows[0]?.name, "Corrupt Gård", "diag: reports the corrupted row's name");
+      assertEq(diag.body.rows.length, 2, "diag: rows array has exactly 2 entries");
+      const diagRow = diag.body.rows.find((r: any) => r.id === "agent-corrupt-1");
+      assertTrue(!!diagRow, "diag: reports the corrupted row's id");
+      assertEq(diagRow?.name, "Corrupt Gård", "diag: reports the corrupted row's name");
       assertTrue(
-        typeof diag.body.rows[0]?.snippet === "string" && diag.body.rows[0].snippet.includes("�"),
+        typeof diagRow?.snippet === "string" && diagRow.snippet.includes("�"),
         "diag: snippet includes the corruption marker for review",
       );
       assertTrue(
@@ -199,13 +205,15 @@ export function runDescriptionTruncationSweepTests(opts: { log?: boolean } = {})
       });
       assertEq(dryDefault.status, 200, "dry-default: POST with no body -> 200");
       assertEq(dryDefault.body?.dry_run, true, "dry-default: dry_run reported true");
-      assertEq(dryDefault.body?.would_update_count, 1, "dry-default: would_update_count is 1");
-      assertEq(dryDefault.body?.would_update?.[0]?.id, "agent-corrupt-1", "dry-default: previews the corrupted row");
+      assertEq(dryDefault.body?.would_update_count, 2, "dry-default: would_update_count is 2 (repairable + unrepairable previewed)");
+      const previewCorrupt = dryDefault.body?.would_update?.find((r: any) => r.id === "agent-corrupt-1");
+      assertTrue(!!previewCorrupt, "dry-default: previews the repairable row");
       assertTrue(
-        typeof dryDefault.body?.would_update?.[0]?.after === "string" &&
-          !dryDefault.body.would_update[0].after.includes("�"),
+        typeof previewCorrupt?.after === "string" && !previewCorrupt.after.includes("�"),
         "dry-default: preview 'after' value has the corruption marker removed",
       );
+      const previewUnrepairable = dryDefault.body?.would_update?.find((r: any) => r.id === "agent-unrepairable-1");
+      assertEq(previewUnrepairable?.after, "", "dry-default: unrepairable row previews as cleaning to an empty string");
       assertEq(updateCalls, 0, "dry-default: no UPDATE issued (dry-run default)");
 
       const rowAfterDryDefault = db
@@ -234,9 +242,12 @@ export function runDescriptionTruncationSweepTests(opts: { log?: boolean } = {})
       });
       assertEq(apply.status, 200, "apply: POST dry_run:false -> 200");
       assertEq(apply.body?.dry_run, false, "apply: dry_run reported false");
-      assertEq(apply.body?.updated_count, 1, "apply: updated_count is exactly 1");
-      assertEq(apply.body?.updated_ids, ["agent-corrupt-1"], "apply: updated_ids lists exactly the corrupted row");
-      assertEq(updateCalls, 1, "apply: exactly ONE UPDATE statement issued (only the corrupted row, never the clean one)");
+      assertEq(apply.body?.scanned, 2, "apply: scanned is 2 (both flagged rows)");
+      assertEq(apply.body?.updated_count, 1, "apply: updated_count is exactly 1 (only the repairable row)");
+      assertEq(apply.body?.updated_ids, ["agent-corrupt-1"], "apply: updated_ids lists exactly the repairable row");
+      assertEq(apply.body?.unrepairable_count, 1, "apply: unrepairable_count is 1");
+      assertEq(apply.body?.unrepairable_ids, ["agent-unrepairable-1"], "apply: unrepairable_ids lists the row that cleans to empty");
+      assertEq(updateCalls, 1, "apply: exactly ONE UPDATE statement issued (repairable row only — never the clean row, never the unrepairable one)");
 
       const corruptRowAfter = db
         .prepare("SELECT description FROM agents WHERE id = ?")
@@ -260,21 +271,34 @@ export function runDescriptionTruncationSweepTests(opts: { log?: boolean } = {})
         "apply: the clean row's description is byte-for-byte untouched",
       );
 
-      // ── (f) idempotent: a second apply run over the now-clean catalog updates nothing ──
+      const unrepairableRowAfter = db
+        .prepare("SELECT description FROM agents WHERE id = ?")
+        .get("agent-unrepairable-1") as { description: string };
+      assertEq(
+        unrepairableRowAfter.description,
+        unrepairableDescription,
+        "apply: the unrepairable row's description is NOT blanked — left exactly as-is for manual review",
+      );
+
+      // ── (f) idempotent: a second apply run over the now-mostly-clean catalog
+      //      updates nothing new — the unrepairable row stays flagged by
+      //      design (it never gets silently blanked or dropped from view) ──
       updateCalls = 0;
       const applyAgain = await callRoute(router, "POST", "/description-truncation-sweep", {
         headers: { "x-admin-key": testKey },
         body: { dry_run: false },
       });
-      assertEq(applyAgain.body?.updated_count, 0, "idempotent: second apply run finds nothing left to fix");
-      assertEq(applyAgain.body?.scanned, 0, "idempotent: second apply run scans zero candidate rows");
+      assertEq(applyAgain.body?.updated_count, 0, "idempotent: second apply run fixes nothing new");
+      assertEq(applyAgain.body?.scanned, 1, "idempotent: second apply run still scans the 1 unrepairable row");
+      assertEq(applyAgain.body?.unrepairable_count, 1, "idempotent: unrepairable row still reported every run");
       assertEq(updateCalls, 0, "idempotent: second apply run issues no UPDATE");
 
-      // ── diagnostic now reports zero corrupted rows ───────────────────
+      // ── diagnostic still reports the 1 unrepairable row (by design) ──
       const diagAfter = await callRoute(router, "GET", "/description-truncation-sweep", {
         headers: { "x-admin-key": testKey },
       });
-      assertEq(diagAfter.body?.corrupted_count, 0, "post-apply: diagnostic finds no corrupted rows left");
+      assertEq(diagAfter.body?.corrupted_count, 1, "post-apply: diagnostic still flags the 1 unrepairable row");
+      assertEq(diagAfter.body?.rows?.[0]?.id, "agent-unrepairable-1", "post-apply: the flagged row is the unrepairable one");
     } finally {
       (db as any).prepare = originalPrepare;
       initMod.__setDbForTesting(prevDb);

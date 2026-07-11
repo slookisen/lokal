@@ -1604,11 +1604,21 @@ descriptionTruncationSweepRouter.post(
     const updateDescription = db.prepare("UPDATE agents SET description = ? WHERE id = ?");
 
     const updatedIds: string[] = [];
+    const unrepairableIds: string[] = [];
     const tx = db.transaction(() => {
       for (const candidate of candidates) {
         const current = getCurrent.get(candidate.id) as { description: string } | undefined;
         if (!current || !current.description.includes(REPLACEMENT_CHAR)) continue; // since-fixed or gone — leave alone
         const cleaned = safeMetaDescription(current.description);
+        // A description that is corruption markers start-to-finish (or
+        // whitespace-only after stripping them) cleans to "" — writing that
+        // would trade a garbled-but-nonempty description for a blank one on
+        // a live producer page. Skip and leave it flagged for manual
+        // re-enrichment instead of blanking it.
+        if (!cleaned || cleaned.includes(REPLACEMENT_CHAR)) {
+          unrepairableIds.push(candidate.id);
+          continue;
+        }
         updateDescription.run(cleaned, candidate.id);
         updatedIds.push(candidate.id);
       }
@@ -1622,6 +1632,8 @@ descriptionTruncationSweepRouter.post(
       updated_count: updatedIds.length,
       updated_ids: updatedIds.slice(0, TRUNCATION_SWEEP_RESPONSE_CAP),
       ids_truncated: updatedIds.length > TRUNCATION_SWEEP_RESPONSE_CAP,
+      unrepairable_count: unrepairableIds.length,
+      unrepairable_ids: unrepairableIds.slice(0, TRUNCATION_SWEEP_RESPONSE_CAP),
     });
   },
 );
