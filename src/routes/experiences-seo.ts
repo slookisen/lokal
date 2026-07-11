@@ -3566,6 +3566,16 @@ router.get("/sok", async (req: Request, res: Response) => {
   //    fallback (`sted`) is only consulted when lat/lng are absent ────────
   let originLat = parseSokFloat(req.query.lat);
   let originLng = parseSokFloat(req.query.lng);
+  // Range-validate against the SAME bounds DiscoverFilterSchema enforces
+  // (lat -90..90, lng -180..180 — see experience-store.ts DiscoverFilterBaseSchema)
+  // before either is ever treated as a usable origin. discoverExperiences()
+  // parses its filter through that schema and throws a ZodError on an
+  // out-of-range value; without this check a bad lat/lng (e.g. ?lat=999)
+  // would reach that call and — via the shared try/catch below — wipe an
+  // already-successful q/tag search. Out-of-range here degrades exactly like
+  // omitting lat/lng: geoOrigin stays null, hasGeo stays false.
+  if (originLat !== undefined && (originLat < -90 || originLat > 90)) originLat = undefined;
+  if (originLng !== undefined && (originLng < -180 || originLng > 180)) originLng = undefined;
   const typedPlace = String(req.query.sted ?? "").trim();
   let placeNotFound = false;
   if ((originLat === undefined || originLng === undefined) && typedPlace) {
@@ -3601,8 +3611,18 @@ router.get("/sok", async (req: Request, res: Response) => {
     } else if (activeTags.length > 0) {
       rows = listPublishedExperiences({}, 60, 0);
     }
+  } catch {
+    rows = [];
+  }
 
-    if (geoOrigin) {
+  // Geo/discoverExperiences() branch lives in its OWN try/catch — deliberately
+  // separate from the q/tag search above — so a failure here (a transient
+  // discoverExperiences error, or any future exception) can never wipe rows
+  // that were already successfully computed from q/tags. lat/lng are already
+  // range-validated above, so this should not throw a ZodError in practice,
+  // but this is defense in depth, not the primary guard.
+  if (geoOrigin) {
+    try {
       const nearby = discoverExperiences(
         { lat: geoOrigin.lat, lng: geoOrigin.lng, radius_km: radiusKm, sort: "distance" },
         100
@@ -3631,9 +3651,10 @@ router.get("/sok", async (req: Request, res: Response) => {
             tags: e.tags,
           }));
       }
+    } catch {
+      // Geo lookup failed — degrade to whatever q/tag rows already exist
+      // above; never clear them.
     }
-  } catch {
-    rows = [];
   }
 
   if (activeTags.length > 0) {

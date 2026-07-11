@@ -24200,6 +24200,22 @@ Promise.allSettled(_oaHomeCountersDeps).then(async () => {
     for (const f of gr.failures) failures.push("opplevelser-discover-geo: " + f);
     console.log(`  opplevelser-discover-geo: ${gr.passed} passed, ${gr.failed} failed`);
 
+    // Regression: /sok (experiences-seo.ts) used to run the q/tag search and
+    // the geo (discoverExperiences()) lookup in one shared try/catch, and
+    // never range-validated lat/lng — an out-of-range lat/lng (e.g.
+    // ?lat=999) threw a ZodError inside discoverExperiences() and the shared
+    // catch discarded already-successful q/tag search results. Same
+    // in-memory-DB pattern, runs sequentially inside this same gated block
+    // for the same reason.
+    console.log("\n── experiences-seo-sok-geo-regression: out-of-range lat/lng must not wipe q results ──");
+    const { runExperiencesSeoSokGeoRegressionTests } = require("../src/routes/experiences-seo-sok-geo.test") as
+      typeof import("../src/routes/experiences-seo-sok-geo.test");
+    const sgr = await runExperiencesSeoSokGeoRegressionTests({ log: false });
+    passed += sgr.passed;
+    failed += sgr.failed;
+    for (const f of sgr.failures) failures.push("experiences-seo-sok-geo-regression: " + f);
+    console.log(`  experiences-seo-sok-geo-regression: ${sgr.passed} passed, ${sgr.failed} failed`);
+
     // dev-request 2026-07-04-opplevagent-dedup-og-norske-titler, item 1:
     // candidate-key dedup (fuzzy title-match, canonical scoring, group/merge,
     // re-harvest guard, discover-query invariant). Same in-memory-DB pattern,
