@@ -154,8 +154,12 @@ export function buildCorpusTokenCounts(titles: string[]): Map<string, number> {
  * museum's tokens, so heavily-duplicated entities can't inflate their own
  * proper nouns into looking "generic". A NULL provider_id row counts as its
  * own singleton pseudo-provider (per-row fallback key) — orphan rows don't
- * collapse into one shared bucket. Token extraction is identical to
- * titleTokens() (a token counts once per provider, not per title).
+ * collapse into one shared bucket. Residual (review round 3): heavy orphan
+ * cloning of ONE entity can therefore still push its tokens generic — that
+ * residual errs only toward OVER-flagging into the human-gated review list,
+ * never toward trusting a false merge (merged groups themselves always have
+ * providers; orphans affect corpus counts only). Token extraction is
+ * identical to titleTokens() (a token counts once per provider, not per title).
  */
 export function buildProviderCorpusTokenCounts(
   rows: Array<{ title: string; provider_id: string | null }>
