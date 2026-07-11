@@ -618,6 +618,50 @@ export function runSearchEnrichTests(opts: { log?: boolean } = {}): TestSummary 
       !meetsAboutQualityBar(umbrellaVisit),
       "quality (regression): round-2 'våre medlemmer' collective-membership prose still fails after fix-up"
     );
+
+    // ── round-2 fix-up-2 (2026-07-11, review CHANGES-REQUESTED): fix-up-1
+    // added "på"/"fra"/"med" to REAL_PROSE_SIGNAL_WORDS as a broad "common
+    // prepositions are near-universal in real sentences" signal — but those 3
+    // short prepositions are JUST AS near-ubiquitous in scraped Norwegian
+    // nav/footer CHROME, so a single incidental match silently defeated
+    // signal 3 for genuine nav-menu leakage (the unsafe direction: nav chrome
+    // would get written to a real producer's public profile). Fixed by
+    // dropping the 3 bare prepositions and relying on the passive-voice verbs
+    // alone. Reviewer's exact reproduced failing examples: ──────────────────
+    const navPrepositionLeakage1 =
+      "Hjem Om Oss Produkter Nyheter Kontakt Nettbutikk Bestill Levering Fra 49 Facebook Instagram Ølkart Meny Åpningstider";
+    assertTrue(
+      !meetsAboutQualityBar(navPrepositionLeakage1),
+      "quality: flat nav bar with 'Fra' no longer false-passes via bare-preposition signal (fix-up-2)"
+    );
+    const navPrepositionLeakage2 =
+      "Hjem Handlekurv Produkter Bestilling Levering Med Bud Kontakt Nyhetsbrev Facebook Instagram Ølkart Meny Åpning";
+    assertTrue(
+      !meetsAboutQualityBar(navPrepositionLeakage2),
+      "quality: flat nav bar with 'Med' no longer false-passes via bare-preposition signal (fix-up-2)"
+    );
+    const navPrepositionLeakage3 =
+      "Hjem Produkter Kontakt Følg Oss På Facebook Instagram Nyheter Bryggeriutsalg Ølkart Meny Åpningstider Handlekurv";
+    assertTrue(
+      !meetsAboutQualityBar(navPrepositionLeakage3),
+      "quality: flat nav bar with 'På' no longer false-passes via bare-preposition signal (fix-up-2)"
+    );
+
+    // Regression: the passive-voice verbs alone (no prepositions) must still
+    // be sufficient to pass genuine passive-voice product-list prose —
+    // confirms the fix-up-1 examples don't silently depend on på/fra/med.
+    assertTrue(
+      meetsAboutQualityBar(reviewerPassiveProductList),
+      "quality (regression): passive-voice product-list prose still passes without bare prepositions (fix-up-2)"
+    );
+    assertTrue(
+      meetsAboutQualityBar(passiveProductListVariant),
+      "quality (regression): passive-voice product-list variant still passes without bare prepositions (fix-up-2)"
+    );
+    assertTrue(
+      meetsAboutQualityBar(passiveNoProductList),
+      "quality (regression): passive-voice prose without product list still passes without bare prepositions (fix-up-2)"
+    );
   }
 
   // ── orch-experiences-content-refresh: mapToExperienceCategories (PURE) ──────

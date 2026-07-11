@@ -1032,8 +1032,15 @@ const REAL_PROSE_SIGNAL_WORDS: ReadonlySet<string> = new Set([
   "ligger", "kan", "selger", "byr", "velkommen",
   // passive-voice verb forms (round-2 fix-up)
   "produseres", "lages", "selges", "dyrkes", "hostes", "serveres", "finnes",
-  // common prepositions that are near-universal in real sentences (round-2 fix-up)
-  "pa", "fra", "med",
+  // NOTE (round-2 fix-up-2, 2026-07-11): "på"/"fra"/"med" were added here in
+  // fix-up-1 as a "common prepositions are near-universal in real sentences"
+  // signal, but that's exactly backwards for THIS check — these 3 short
+  // prepositions are just as near-ubiquitous in scraped Norwegian nav/footer
+  // CHROME ("Følg Oss På Facebook", "Levering Fra 49", "Betal Med Vipps") as
+  // in real prose, so they silently defeated signal 3 for genuine nav-menu
+  // leakage. Deliberately NOT re-added — the passive-voice verbs above are
+  // sufficient (verified: the round-1 "produseres" example still passes on
+  // that verb alone; nothing else in the suite depended on the prepositions).
 ]);
 
 /**
@@ -1063,14 +1070,17 @@ const REAL_PROSE_SIGNAL_WORDS: ReadonlySet<string> = new Set([
  *      Ølet Omvisning Nyheter Kontakt Merch") or interrupted only by a stray
  *      language-switcher token ("no en"). Structural signal: at least half the
  *      alphabetic tokens are Title-Case, at most one sentence-ending mark, AND
- *      none of REAL_PROSE_SIGNAL_WORDS (a finite/passive verb, preposition, or
- *      personal pronoun) is present — genuine prose almost always has at least
- *      one, a flat noun list never does. This deliberately covers passive-voice
- *      product copy too (round-2 fix-up, 2026-07-11): a single grammatical
- *      sentence that opens with a Title-Case list of branded regional products
- *      — common Norwegian farm/dairy marketing, e.g. "Nordfjord Ost Sunnmøre
- *      Smør ... produseres her på garden hver eneste dag" — is real prose, not
- *      nav-menu leakage, even though most of its tokens are proper nouns.
+ *      none of REAL_PROSE_SIGNAL_WORDS (a finite/passive verb or personal
+ *      pronoun — deliberately NOT bare prepositions like "på"/"fra"/"med",
+ *      which are just as common in nav/footer chrome as in real prose, see
+ *      round-2 fix-up-2) is present — genuine prose almost always has at
+ *      least one, a flat noun list never does. This deliberately covers
+ *      passive-voice product copy too (round-2 fix-up, 2026-07-11): a single
+ *      grammatical sentence that opens with a Title-Case list of branded
+ *      regional products — common Norwegian farm/dairy marketing, e.g.
+ *      "Nordfjord Ost Sunnmøre Smør ... produseres her på garden hver eneste
+ *      dag" — is real prose, not nav-menu leakage, even though most of its
+ *      tokens are proper nouns (it's caught by "produseres", not "på").
  *      Requires ≥8 alphabetic tokens so short strings can't trip it.
  *   4. A literal repeated phrase — a ≥24-char chunk of the text that recurs
  *      verbatim later in the same string, e.g. a breadcrumb/tagline the
