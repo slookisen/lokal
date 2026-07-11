@@ -92,7 +92,11 @@ import { isDirectoryOrAggregatorHost } from "../services/cross-source-validator"
 // dev-request 2026-07-01-cs-corrections-profile-quality item C: reuse the
 // render-time repair logic as the one-time DB backfill/cleanup function —
 // see the truncation-sweep router at the bottom of this file.
-import { safeMetaDescription, TRAILING_REPLACEMENT_CHAR_REGEX } from "./seo";
+// Pure helpers from the dependency-free meta-description module — NOT from
+// ./seo (importing that heavyweight route module here dragged its whole service
+// chain into the isolated agent-knowledge-get-auth CI test's process and hung
+// it; see ../utils/meta-description header).
+import { safeMetaDescription, TRAILING_REPLACEMENT_CHAR_REGEX } from "../utils/meta-description";
 // PR-24a: homepage CONTENT extractors (PR-22) + write helpers (PURE).
 import {
   isSafeFetchUrl,
