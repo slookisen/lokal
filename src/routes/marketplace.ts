@@ -20,6 +20,7 @@ import { getDb as getVerticalDb } from "../database/db-factory";
 import { findOrgnumberByName } from "../services/brreg-client";
 import { isDisplayablePhone } from "../services/contact-normalizer";
 import { isJunkDescription } from "../services/description-quality";
+import { safeMetaDescription } from "./seo";
 
 // ── PR-29 v3: pure helper for Place Details (New) request params ──────────────
 // Exported so tests can assert the URL structure without touching the handler.
@@ -1535,6 +1536,136 @@ router.put("/agents/:id/description", (req: Request, res: Response) => {
       name: updated.name,
       description: updated.description,
     },
+  });
+});
+
+// ─── GET/POST /admin/agents/truncation-sweep — catalog-wide backfill ──
+// dev-request 2026-07-01-cs-corrections-profile-quality, "Slice spec — catalog-
+// wide truncation sweep (2026-07-11)". PR #116 shipped two defense-in-depth
+// nets for the Olestølen byte-level UTF-8 truncation bug (U+FFFD "�" landing
+// in a description): safeMetaDescription() (render-time net, src/routes/seo.ts)
+// and meetsAboutQualityBar()'s "�"-rejection (write-time gate,
+// src/services/search-enrich.ts). Neither net repairs rows that were ALREADY
+// corrupted in `agents.description` before those nets existed. This pair of
+// endpoints is the one-time backfill: a read-only diagnostic + a dry-run-by-
+// default apply path that reuses safeMetaDescription() (no duplicated repair
+// logic) to clean and persist only the rows still carrying "�".
+//
+// Scope: `agents.description` only — NOT `agent_knowledge.about` (separate
+// table/write-path, not implicated in this bug; see slice spec's non-goals).
+//
+// Auth: X-Admin-Key only (internal fleet diagnostic tool, not a producer-
+// facing action — no claim-token/api-key paths, mirroring the plain
+// getAdminKey()-only idiom used by e.g. POST /admin/bulk-enrich above).
+
+// Mirrors AUDIT_RESPONSE_GROUP_CAP in src/routes/opplevelser.ts's
+// /admin/experiences-dedup-audit — bounds the response so a pathological
+// catalog state can't produce an unbounded payload.
+const TRUNCATION_SWEEP_RESPONSE_CAP = 100;
+
+type TruncatedAgentRow = { id: string; name: string; description: string };
+
+function findTruncatedAgents(db: ReturnType<typeof getDb>): TruncatedAgentRow[] {
+  // Parameterized query binding the literal U+FFFD character wrapped in "%" —
+  // not a LIKE-escape hack, just an ordinary bound parameter.
+  return db
+    .prepare("SELECT id, name, description FROM agents WHERE description LIKE ?")
+    .all(`%${"�"}%`) as TruncatedAgentRow[];
+}
+
+router.get("/admin/agents/truncation-sweep", (req: Request, res: Response) => {
+  const expectedKey = getAdminKey();
+  if (!expectedKey) { res.status(503).json({ success: false, error: "Admin not configured" }); return; }
+  const adminKey = req.headers["x-admin-key"] as string;
+  if (!adminKey || adminKey !== expectedKey) {
+    res.status(403).json({ success: false, error: "Krever X-Admin-Key header" });
+    return;
+  }
+
+  const db = getDb();
+  const rows = findTruncatedAgents(db);
+  const capped = rows.slice(0, TRUNCATION_SWEEP_RESPONSE_CAP);
+
+  res.json({
+    success: true,
+    count: rows.length,
+    truncated: rows.length > TRUNCATION_SWEEP_RESPONSE_CAP,
+    agents: capped.map((r) => ({ id: r.id, name: r.name, snippet: r.description.slice(-120) })),
+  });
+});
+
+// Body: { apply?: boolean } — apply DEFAULTS TO FALSE (dry-run), mirroring the
+// dry_run convention in POST /admin/experiences-dedup-unmerge (opplevelser.ts):
+// writes execute only when the caller explicitly passes `apply: true`; any
+// other value (absent/null/false/truthy-but-not-true) stays a dry run.
+router.post("/admin/agents/truncation-sweep", (req: Request, res: Response) => {
+  const expectedKey = getAdminKey();
+  if (!expectedKey) { res.status(503).json({ success: false, error: "Admin not configured" }); return; }
+  const adminKey = req.headers["x-admin-key"] as string;
+  if (!adminKey || adminKey !== expectedKey) {
+    res.status(403).json({ success: false, error: "Krever X-Admin-Key header" });
+    return;
+  }
+
+  const body = (req.body ?? {}) as { apply?: unknown };
+  const apply = body.apply === true;
+
+  const db = getDb();
+  const rows = findTruncatedAgents(db);
+
+  if (!apply) {
+    // Same TRUNCATION_SWEEP_RESPONSE_CAP as GET — this is a dry-run preview,
+    // not the write path, so capping the enumerated rows (while keeping
+    // `count` truthful) is what bounds the payload on a pathological
+    // catalog state; it does not affect what apply:true would actually fix.
+    const cappedRows = rows.slice(0, TRUNCATION_SWEEP_RESPONSE_CAP);
+    res.json({
+      success: true,
+      dry_run: true,
+      count: rows.length,
+      truncated: rows.length > TRUNCATION_SWEEP_RESPONSE_CAP,
+      would_update: cappedRows.map((r) => ({
+        id: r.id,
+        name: r.name,
+        before: r.description,
+        after: safeMetaDescription(r.description),
+      })),
+    });
+    return;
+  }
+
+  // Re-check "description LIKE '%<FFFD>%'" in the WHERE clause so a row
+  // already fixed by a concurrent request (or already clean) is never
+  // touched twice — only rows that STILL contain "�" at write time get
+  // updated, matching the slice spec's "safe against clobbering a
+  // since-fixed value" requirement.
+  const updateStmt = db.prepare(
+    "UPDATE agents SET description = ? WHERE id = ? AND description LIKE ?"
+  );
+  const updated: Array<{ id: string; name: string; before: string; after: string }> = [];
+
+  const tx = db.transaction(() => {
+    for (const row of rows) {
+      const after = safeMetaDescription(row.description);
+      const result = updateStmt.run(after, row.id, `%${"�"}%`);
+      if (result.changes > 0) {
+        updated.push({ id: row.id, name: row.name, before: row.description, after });
+      }
+    }
+  });
+  tx();
+
+  // Cap the response payload the same way GET/dry-run do — every matching
+  // row above was still fully repaired by the transaction regardless of this
+  // cap; only how many full before/after bodies come back in this response
+  // is bounded, so a pathological catalog state can't produce an unbounded
+  // JSON payload.
+  res.json({
+    success: true,
+    applied: true,
+    updated_count: updated.length,
+    truncated: updated.length > TRUNCATION_SWEEP_RESPONSE_CAP,
+    updated: updated.slice(0, TRUNCATION_SWEEP_RESPONSE_CAP),
   });
 });
 

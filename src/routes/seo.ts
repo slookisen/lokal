@@ -64,7 +64,7 @@ function escapeHtml(text: string): string {
 // any dangling partial word left behind) so a corrupted DB value never reaches
 // a live meta tag, no matter how it got corrupted. Leading/interior "�" runs
 // are also collapsed defensively, though the reported bug was trailing-only.
-function safeMetaDescription(text: string | null | undefined): string {
+export function safeMetaDescription(text: string | null | undefined): string {
   if (!text) return "";
   let s = String(text);
   if (!s.includes("�")) return s;

@@ -20933,6 +20933,7 @@ console.log("\n── orch-pr-14: MCP discovery product_id surfacing ──");
   try { await _rfbDebioSuitePromise; } catch { /* errors already pushed to failures */ }
   try { await _dispatchTickSuitePromise; } catch { /* errors already pushed to failures */ }
   try { await _samtalerSeoPromise; } catch { /* errors already pushed to failures */ }
+  try { await _truncationSweepPromise; } catch { /* errors already pushed to failures */ }
   // relax-envelope tests are synchronous (pure validateEnvelope() unit test) — no promise needed
   // PR-109 tests are synchronous (IIFE) — no promise needed
   // Drop pre-existing intg failures (unmasked by awaiting) — they predate M2
@@ -25623,6 +25624,43 @@ const _samtalerSeoPromise: Promise<void> = new Promise<void>(r => { _samtalerSeo
     initMod6.__setDbForTesting(prevDb6);
     db6.close();
     _samtalerSeoResolve();
+  }
+})();
+
+
+// ── agents-truncation-sweep: GET/POST /admin/agents/truncation-sweep ───────
+// dev-request 2026-07-01-cs-corrections-profile-quality, "Slice spec —
+// catalog-wide truncation sweep (2026-07-11)". Self-contained test module
+// (src/routes/agents-truncation-sweep.test.ts) follows the admin-agents.test.ts
+// pattern exactly: own in-memory DB via __setDbForTesting/__initSchemaForTesting,
+// handlers grabbed directly off the marketplace router's stack and invoked
+// synchronously with fake req/res — no HTTP socket, no shared-singleton race.
+let _truncationSweepResolve: () => void = () => {};
+const _truncationSweepPromise: Promise<void> = new Promise<void>(r => { _truncationSweepResolve = r; });
+
+(async () => {
+  // Same minimal-but-sufficient dependency set as _dispatchTickSuitePromise /
+  // _samtalerSeoPromise directly above: _rfbDebioSuitePromise itself awaits
+  // the full REPORT dependency list except these two extras, so awaiting
+  // these three (plus this block's own siblings) covers everything the
+  // REPORT IIFE waits for.
+  await Promise.allSettled([_rfbDebioSuitePromise, _salgskanalMatcherPromise, _adminAgentsRegisterPromise, _dispatchTickSuitePromise, _samtalerSeoPromise]);
+  await new Promise(r => setImmediate(r));
+
+  console.log("\n── agents-truncation-sweep: GET/POST /admin/agents/truncation-sweep ──");
+  try {
+    const { runTruncationSweepTests } = require("../src/routes/agents-truncation-sweep.test") as
+      typeof import("../src/routes/agents-truncation-sweep.test");
+    const jr = await runTruncationSweepTests({ log: false });
+    passed += jr.passed;
+    failed += jr.failed;
+    for (const f of jr.failures) failures.push("agents-truncation-sweep: " + f);
+    console.log(`  agents-truncation-sweep: ${jr.passed} passed, ${jr.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("agents-truncation-sweep: unexpected error: " + String(err?.message || err));
+  } finally {
+    _truncationSweepResolve();
   }
 })();
 
