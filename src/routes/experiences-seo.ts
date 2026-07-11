@@ -56,11 +56,19 @@ import {
   searchPublishedExperiences,
   listGardssalgProviders,
   resolveCanonicalSlugForDuplicate,
+  // dev-request 2026-07-04-opplevagent-naer-meg-geosok, item 3: «Nær meg» on
+  // /sok — reuses the SAME discoverExperiences()/formatDistanceLabel() the
+  // REST /api/opplevelser/discover endpoint (item 2) is built on, rather
+  // than re-implementing geo filtering/sorting or the distance/precision
+  // honesty rule a second time.
+  discoverExperiences,
+  formatDistanceLabel,
   type RelatedExperienceRow,
   type ExperienceCardRow,
   type GardssalgProviderRow,
 } from "../services/experience-store";
 import { EXPERIENCE_TAGS, type ExperienceTag } from "../services/experience-tags";
+import { geocodingService } from "../services/geocoding-service";
 import {
   createBooking,
   getBookingByRef,
@@ -1679,6 +1687,19 @@ const BROWSE_CSS = `
   .searchbar input{flex:1;border:none;outline:none;font-size:1rem;color:var(--ink);background:transparent;padding:11px 4px;min-width:0}
   .searchbar button{flex:0 0 auto;border:none;cursor:pointer;background:var(--fjord-800);color:#fff;font-weight:700;font-size:.9rem;padding:11px 20px;border-radius:var(--r-pill)}
   .searchbar button:hover{background:var(--fjord-700)}
+  .near-me{display:flex;flex-wrap:wrap;align-items:center;gap:10px;margin:12px 0 4px}
+  .near-me .geo-btn{display:inline-flex;align-items:center;gap:7px;border:1.5px solid var(--teal-500);background:var(--surface);color:var(--teal-500);font-weight:700;font-size:.85rem;padding:9px 16px;border-radius:var(--r-pill);cursor:pointer}
+  .near-me .geo-btn:hover{background:var(--teal-500);color:#fff}
+  .near-me .geo-btn:disabled{opacity:.6;cursor:default}
+  .near-me .geo-btn[hidden]{display:none}
+  .near-me .place-fallback{display:flex;align-items:center;gap:0;background:#fff;border:1px solid var(--line);border-radius:var(--r-pill);padding:4px 4px 4px 12px}
+  .near-me .place-fallback input{border:none;outline:none;font-size:.85rem;color:var(--ink);background:transparent;padding:7px 4px;width:150px}
+  .near-me .place-fallback button{border:none;cursor:pointer;background:var(--canvas-2);color:var(--ink-soft);font-weight:700;font-size:.8rem;padding:7px 14px;border-radius:var(--r-pill)}
+  .near-me .place-fallback button:hover{background:var(--teal-400);color:#fff}
+  .sort-toggle{margin:10px 0 4px;font-size:.84rem}
+  .sort-toggle a{color:var(--ink-soft);font-weight:600}
+  .sort-toggle a.active{color:var(--teal-500)}
+  .geo-note{color:var(--mist);font-size:.82rem;margin:6px 0 0}
   .chips{display:flex;flex-wrap:wrap;gap:8px;margin:18px 0 4px}
   .chip{display:inline-flex;align-items:center;gap:6px;padding:6px 13px;border-radius:var(--r-pill);background:var(--canvas-2);color:var(--ink-soft);font-size:.82rem;font-weight:600;border:1px solid var(--line)}
   .chip:hover{text-decoration:none;border-color:var(--teal-400);color:var(--fjord-700)}
@@ -1689,6 +1710,8 @@ const BROWSE_CSS = `
   .card .c-title{font-weight:700;color:var(--ink);font-size:1.04rem;letter-spacing:-.01em;line-height:1.25}
   .card .c-place{font-size:.84rem;color:var(--mist);display:flex;align-items:center;gap:6px}
   .card .c-place svg{flex:0 0 14px;color:var(--fjord-600)}
+  .card .c-distance{font-size:.84rem;color:var(--teal-500);font-weight:600;display:flex;align-items:center;gap:6px}
+  .card .c-distance svg{flex:0 0 14px;color:var(--teal-500)}
   .card .c-desc{font-size:.9rem;color:var(--ink-soft);display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
   .card .c-meta{margin-top:auto;display:flex;flex-wrap:wrap;gap:6px;padding-top:4px}
   .tag{display:inline-flex;align-items:center;padding:3px 10px;border-radius:var(--r-pill);background:var(--canvas-2);color:var(--ink-soft);font-size:.74rem;font-weight:600;border:1px solid var(--line)}
@@ -1737,7 +1760,15 @@ const PIN_SVG =
   '<svg viewBox="0 0 24 24" width="14" height="14" aria-hidden="true"><path d="M12 2a7 7 0 0 0-7 7c0 5 7 13 7 13s7-8 7-13a7 7 0 0 0-7-7z" fill="none" stroke="currentColor" stroke-width="1.7"/><circle cx="12" cy="9" r="2.3" fill="currentColor"/></svg>';
 
 // Render one experience card. Title links to the guaranteed-live detail page.
-function renderCard(row: ExperienceCardRow): string {
+// `distance` is optional and ONLY ever passed by /sok's «Nær meg» path (dev-
+// request 2026-07-04-opplevagent-naer-meg-geosok, item 3) — every other
+// caller (renderBrowsePage: /opplevelser, /kategori/*, /fylke/*, /kommune/*,
+// provider pages) omits it, so those pages render byte-identically to before
+// this feature existed.
+function renderCard(
+  row: ExperienceCardRow,
+  distance?: { distance_km: number | null; geo_precision: "address" | "kommune" | null }
+): string {
   const place = placeOf(row);
   let cardDescription = row.description || "";
   if (cardDescription && isJunkDescription(cardDescription)) {
@@ -1746,6 +1777,12 @@ function renderCard(row: ExperienceCardRow): string {
   }
   const desc = cardDescription
     ? `<p class="c-desc">${escapeHtml(cardDescription)}</p>`
+    : "";
+  const distanceLabel = distance
+    ? formatDistanceLabel(distance.distance_km, distance.geo_precision, row.kommune)
+    : null;
+  const distanceHtml = distanceLabel
+    ? `<span class="c-distance">${PIN_SVG}${escapeHtml(distanceLabel)}</span>`
     : "";
   const tags: string[] = [];
   if (row.category) tags.push(`<span class="tag tag-cat">${escapeHtml(catLabel(row.category))}</span>`);
@@ -1764,6 +1801,7 @@ function renderCard(row: ExperienceCardRow): string {
   return `<a class="card" href="/opplevelse/${encodeURIComponent(row.slug)}">
     <span class="c-title">${escapeHtml(row.title)}</span>
     ${place ? `<span class="c-place">${PIN_SVG}${escapeHtml(place)}</span>` : ""}
+    ${distanceHtml}
     ${desc}
     <span class="c-meta">${tags.join("")}</span>
   </a>`;
@@ -1845,7 +1883,7 @@ function renderBrowsePage(opts: {
 
   const grid =
     opts.rows.length > 0
-      ? `<div class="grid" role="list">${opts.rows.map(renderCard).join("")}</div>`
+      ? `<div class="grid" role="list">${opts.rows.map((r) => renderCard(r)).join("")}</div>`
       : `<div class="empty"><h2>${escapeHtml(opts.emptyTitle || "Ingen opplevelser her ennå")}</h2>
          <p>${escapeHtml(opts.emptyBody || "Vi publiserer nye opplevelser fortløpende. Se alle opplevelser i mellomtiden.")}</p>
          <a class="cta" href="/opplevelser">Se alle opplevelser</a></div>`;
@@ -3429,6 +3467,80 @@ function renderFilterChips(q: string, activeTags: ExperienceTag[]): string {
   return `<div class="filter-chips" role="group" aria-label="Filtrer opplevelser">${chips}</div>`;
 }
 
+// dev-request 2026-07-04-opplevagent-naer-meg-geosok, item 3: build the /sok
+// URL for toggling the `sort=distance` results-sort, preserving every other
+// currently-active query param (q, tags, lat, lng, radius_km, sted). Pure
+// (a plain string-keyed record, not a Request) so it's unit-testable without
+// an Express request — mirrors sokFilterUrl's SSR-only approach: this is a
+// plain <a href>, no client JS required to use it.
+export function buildSortToggleUrl(query: Record<string, string | undefined>, activate: boolean): string {
+  const params = new URLSearchParams();
+  for (const [k, v] of Object.entries(query)) {
+    if (k === "sort" || !v) continue;
+    params.set(k, v);
+  }
+  if (activate) params.set("sort", "distance");
+  const qs = params.toString();
+  return qs ? `/sok?${qs}` : "/sok";
+}
+
+// Default search radius for the «Nær meg» geolocation button + text-place
+// fallback (dev-request 2026-07-04-opplevagent-naer-meg-geosok, item 3).
+// Only ever used when a geo origin (lat/lng, or a geocoded `sted`) is
+// present — omitting both keeps /sok byte-identical to before this feature
+// existed (progressive enhancement only, no SSR default-order change).
+const NEAR_ME_RADIUS_KM = 50;
+
+function parseSokFloat(v: unknown): number | undefined {
+  const n = parseFloat((v as string) || "");
+  return Number.isFinite(n) ? n : undefined;
+}
+
+// «Nær meg» button (browser geolocation, permission-gated) + a text fallback
+// that reuses geocodingService.geocode() SERVER-SIDE via a plain GET
+// ?sted=<place> param — the fallback works with NO JS at all (plain form
+// submit); the GPS button itself needs JS (navigator.geolocation is a
+// browser API with no no-JS equivalent) and hides itself via script if
+// unsupported. Mirrors rfb's /sok «Nær meg» affordance (src/routes/seo.ts,
+// geoBtn) for UI consistency across the two verticals.
+function renderNearMeBox(q: string, activeTags: ExperienceTag[], radiusKm: number): string {
+  const hidden = [
+    q ? `<input type="hidden" name="q" value="${escapeHtml(q)}">` : "",
+    ...activeTags.map((t) => `<input type="hidden" name="${escapeHtml(t)}" value="1">`),
+  ].join("");
+  return `<div class="near-me">
+    <button type="button" id="geoBtn" class="geo-btn">📍 Nær meg</button>
+    <form class="place-fallback" action="/sok" method="GET">
+      ${hidden}
+      <label for="sok-sted" class="skip-link">Skriv inn sted</label>
+      <input id="sok-sted" name="sted" type="text" autocomplete="off" placeholder="…eller skriv inn sted">
+      <button type="submit">Bruk sted</button>
+    </form>
+  </div>
+  <script>
+  (function () {
+    var geoBtn = document.getElementById('geoBtn');
+    if (!geoBtn) return;
+    if (!('geolocation' in navigator)) { geoBtn.hidden = true; return; }
+    geoBtn.addEventListener('click', function () {
+      geoBtn.textContent = '⏳ Henter posisjon…';
+      geoBtn.disabled = true;
+      navigator.geolocation.getCurrentPosition(function (pos) {
+        var params = new URLSearchParams(window.location.search);
+        params.delete('sted');
+        params.set('lat', String(pos.coords.latitude));
+        params.set('lng', String(pos.coords.longitude));
+        if (!params.get('radius_km')) params.set('radius_km', '${radiusKm}');
+        window.location.href = '/sok?' + params.toString();
+      }, function () {
+        geoBtn.textContent = '❌ Posisjon avslått — skriv inn sted under';
+        geoBtn.disabled = true;
+      }, { enableHighAccuracy: false, timeout: 8000 });
+    });
+  })();
+  </script>`;
+}
+
 // ─── GET /sok?q=&<tag>=1 — HTML search-results page ──────────────────────────
 // Human-facing twin of the discover query. Reuses the publish gate so every
 // result links to a live detail page. Not paginated (capped result set); the
@@ -3439,10 +3551,60 @@ function renderFilterChips(q: string, activeTags: ExperienceTag[]): string {
 // semantics across active tags, combinable with `q`. With no `q` but ≥1
 // active tag, browses the full published catalog (capped) instead of an
 // empty result set, so `/sok?gratis=1` alone works as a browse-by-tag view.
-router.get("/sok", (req: Request, res: Response) => {
+//
+// dev-request 2026-07-04-opplevagent-naer-meg-geosok, item 3: also accepts
+// `lat`/`lng` (browser geolocation) or `sted` (typed place, geocoded here
+// server-side) + `radius_km` + `sort=distance`. PROGRESSIVE ENHANCEMENT
+// ONLY: omitting lat/lng/sted leaves every branch below completely unused —
+// discoverExperiences() is never called, rows/ordering are byte-identical to
+// before this feature existed.
+router.get("/sok", async (req: Request, res: Response) => {
   const q = String(req.query.q ?? "").trim();
   const activeTags = EXPERIENCE_TAGS.filter((t) => String(req.query[t] ?? "") === "1");
+
+  // ── Resolve a geo origin: GPS (lat/lng) takes priority; the typed-place
+  //    fallback (`sted`) is only consulted when lat/lng are absent ────────
+  let originLat = parseSokFloat(req.query.lat);
+  let originLng = parseSokFloat(req.query.lng);
+  // Range-validate against the SAME bounds DiscoverFilterSchema enforces
+  // (lat -90..90, lng -180..180 — see experience-store.ts DiscoverFilterBaseSchema)
+  // before either is ever treated as a usable origin. discoverExperiences()
+  // parses its filter through that schema and throws a ZodError on an
+  // out-of-range value; without this check a bad lat/lng (e.g. ?lat=999)
+  // would reach that call and — via the shared try/catch below — wipe an
+  // already-successful q/tag search. Out-of-range here degrades exactly like
+  // omitting lat/lng: geoOrigin stays null, hasGeo stays false.
+  if (originLat !== undefined && (originLat < -90 || originLat > 90)) originLat = undefined;
+  if (originLng !== undefined && (originLng < -180 || originLng > 180)) originLng = undefined;
+  const typedPlace = String(req.query.sted ?? "").trim();
+  let placeNotFound = false;
+  if ((originLat === undefined || originLng === undefined) && typedPlace) {
+    try {
+      const geo = await geocodingService.geocode(typedPlace);
+      if (geo) {
+        originLat = geo.lat;
+        originLng = geo.lng;
+      } else {
+        placeNotFound = true;
+      }
+    } catch {
+      placeNotFound = true;
+    }
+  }
+  const geoOrigin =
+    typeof originLat === "number" && typeof originLng === "number"
+      ? { lat: originLat, lng: originLng }
+      : null;
+  const hasGeo = geoOrigin !== null;
+  const radiusKm = Math.min(500, Math.max(1, parseSokFloat(req.query.radius_km) ?? NEAR_ME_RADIUS_KM));
+  const sortDistance = hasGeo && String(req.query.sort ?? "") === "distance";
+
   let rows: ExperienceCardRow[] = [];
+  // slug → distance info, from the SAME discoverExperiences() the REST
+  // /api/opplevelser/discover endpoint (item 2) is built on — never
+  // recomputes haversine or the geo_precision honesty rule locally.
+  const distanceMap = new Map<string, { distance_km: number | null; geo_precision: "address" | "kommune" | null }>();
+
   try {
     if (q) {
       rows = searchPublishedExperiences(q, 60);
@@ -3452,19 +3614,103 @@ router.get("/sok", (req: Request, res: Response) => {
   } catch {
     rows = [];
   }
+
+  // Geo/discoverExperiences() branch lives in its OWN try/catch — deliberately
+  // separate from the q/tag search above — so a failure here (a transient
+  // discoverExperiences error, or any future exception) can never wipe rows
+  // that were already successfully computed from q/tags. lat/lng are already
+  // range-validated above, so this should not throw a ZodError in practice,
+  // but this is defense in depth, not the primary guard.
+  if (geoOrigin) {
+    try {
+      const nearby = discoverExperiences(
+        { lat: geoOrigin.lat, lng: geoOrigin.lng, radius_km: radiusKm, sort: "distance" },
+        100
+      );
+      for (const e of nearby) {
+        if (e.slug) distanceMap.set(e.slug, { distance_km: e.distance_km ?? null, geo_precision: e.geo_precision ?? null });
+      }
+      // No text query and no tag filter: near-me IS the browse — surface the
+      // discover results directly (already sorted ascending by distance)
+      // instead of the "type something" empty state.
+      if (!q && activeTags.length === 0) {
+        rows = nearby
+          .filter((e): e is typeof e & { slug: string } => Boolean(e.slug))
+          .map((e) => ({
+            slug: e.slug,
+            title: e.title,
+            description: e.description ?? null,
+            category: e.category ?? null,
+            fylke: e.fylke ?? null,
+            kommune: e.kommune ?? null,
+            indoor_outdoor: e.indoor_outdoor ?? null,
+            duration_min: e.duration_min ?? null,
+            price_from: e.price_from ?? null,
+            price_band: e.price_band ?? null,
+            confidence: e.confidence ?? null,
+            tags: e.tags,
+          }));
+      }
+    } catch {
+      // Geo lookup failed — degrade to whatever q/tag rows already exist
+      // above; never clear them.
+    }
+  }
+
   if (activeTags.length > 0) {
     rows = rows.filter((r) => activeTags.every((t) => r.tags.includes(t)));
   }
-  const hasQuery = Boolean(q) || activeTags.length > 0;
 
-  const h1 = q ? `Søk: «${q}»` : activeTags.length > 0 ? "Filtrer opplevelser" : "Søk i opplevelser";
+  // Distance-sort toggle (dev-request item 3): opt-in re-sort, only possible
+  // (and only rendered) once a geo origin exists. Rows with no distance
+  // (outside radius_km, or never geocoded) sort to the bottom rather than
+  // being dropped.
+  if (sortDistance) {
+    rows = [...rows].sort((a, b) => {
+      const da = distanceMap.get(a.slug)?.distance_km;
+      const db = distanceMap.get(b.slug)?.distance_km;
+      if (da == null && db == null) return 0;
+      if (da == null) return 1;
+      if (db == null) return -1;
+      return da - db;
+    });
+  }
+
+  const hasQuery = Boolean(q) || activeTags.length > 0 || hasGeo;
+
+  const h1 = q
+    ? `Søk: «${q}»`
+    : activeTags.length > 0
+    ? "Filtrer opplevelser"
+    : hasGeo
+    ? "Opplevelser nær deg"
+    : "Søk i opplevelser";
   const metaDesc = q
     ? `Søkeresultater for «${q}» på Opplevagent — kuraterte norske opplevelser med verifiserte tilbydere.`
+    : hasGeo
+    ? "Opplevelser nær deg, sortert etter avstand — kuraterte norske opplevelser med verifiserte tilbydere."
     : "Søk blant kuraterte norske opplevelser på Opplevagent — etter sted, kategori eller aktivitet.";
   const emptyTitle = hasQuery ? `Ingen treff${q ? ` for «${q}»` : ""}` : "Skriv inn et søk";
   const emptyBody = hasQuery
     ? "Prøv et annet søkeord eller fjern et filter. Du kan også bla i alle opplevelser."
     : "Søk etter sted, kategori eller aktivitet — for eksempel «hvalsafari», «Tromsø» eller «mat».";
+
+  const geoNote = placeNotFound
+    ? `<p class="geo-note">Fant ikke stedet «${escapeHtml(typedPlace)}» — prøv et annet stedsnavn.</p>`
+    : hasGeo
+    ? `<p class="geo-note">Viser opplevelser innenfor ${radiusKm} km${typedPlace && !req.query.lat ? ` fra ${escapeHtml(typedPlace)}` : " fra deg"}.</p>`
+    : "";
+
+  // Normalize req.query into a plain string record for buildSortToggleUrl
+  // (drops array/object query values — none of this route's own params are
+  // ever arrays, so nothing real is lost).
+  const sokQueryForToggle: Record<string, string | undefined> = {};
+  for (const [k, v] of Object.entries(req.query)) {
+    if (typeof v === "string") sokQueryForToggle[k] = v;
+  }
+  const sortToggle = hasGeo
+    ? `<p class="sort-toggle">Sorter etter: <a class="${!sortDistance ? "active" : ""}" href="${buildSortToggleUrl(sokQueryForToggle, false)}" aria-current="${!sortDistance ? "true" : "false"}">Relevans</a> · <a class="${sortDistance ? "active" : ""}" href="${buildSortToggleUrl(sokQueryForToggle, true)}" aria-current="${sortDistance ? "true" : "false"}">Avstand</a></p>`
+    : "";
 
   // Search pages are not indexed individually (thin/duplicative); the results
   // still link to indexable detail pages.
@@ -3472,7 +3718,7 @@ router.get("/sok", (req: Request, res: Response) => {
   const canonical = `${url}/sok`;
   const cards =
     rows.length > 0
-      ? `<div class="grid" role="list">${rows.map(renderCard).join("")}</div>`
+      ? `<div class="grid" role="list">${rows.map((r) => renderCard(r, distanceMap.get(r.slug))).join("")}</div>`
       : `<div class="empty"><h2>${escapeHtml(emptyTitle)}</h2><p>${escapeHtml(emptyBody)}</p><a class="cta" href="/opplevelser">Se alle opplevelser</a></div>`;
 
   const breadcrumbLd = {
@@ -3514,7 +3760,10 @@ ${BROWSE_NAV}
     ${hasQuery ? `<p class="count">${rows.length} ${rows.length === 1 ? "treff" : "treff"}</p>` : ""}
   </header>
   ${searchBox(q)}
+  ${renderNearMeBox(q, activeTags, radiusKm)}
+  ${geoNote}
   ${renderFilterChips(q, activeTags)}
+  ${sortToggle}
   ${cards}
 </main>
 ${browseFooter()}

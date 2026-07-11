@@ -526,6 +526,35 @@ console.log("\n── experience-tags (derived filter tags) ──");
   console.log(`  experience-tags: ${r.passed} passed, ${r.failed} failed`);
 }
 
+// ── dev-request 2026-07-04-opplevagent-naer-meg-geosok, item 3: distance/
+// precision label formatting for /sok's «Nær meg» result cards. Pins the
+// honesty rule: an 'address'-precision row gets an exact "X,X km unna", a
+// 'kommune'-precision (centroid-fallback) row NEVER claims a distance.
+console.log("\n── experience-store (formatDistanceLabel) ──");
+{
+  const { runExperienceStoreTests } = require("../src/services/experience-store.test") as
+    typeof import("../src/services/experience-store.test");
+  const r = runExperienceStoreTests({ log: false });
+  passed += r.passed;
+  failed += r.failed;
+  for (const f of r.failures) failures.push("experience-store: " + f);
+  console.log(`  experience-store: ${r.passed} passed, ${r.failed} failed`);
+}
+
+// ── dev-request 2026-07-04-opplevagent-naer-meg-geosok, item 3: /sok's
+// distance-sort toggle URL builder (pure — preserves q/tags/lat/lng/
+// radius_km/sted while adding or removing sort=distance).
+console.log("\n── experiences-seo-sok-geo (buildSortToggleUrl) ──");
+{
+  const { runExperiencesSeoSokGeoTests } = require("../src/routes/experiences-seo-sok-geo.test") as
+    typeof import("../src/routes/experiences-seo-sok-geo.test");
+  const r = runExperiencesSeoSokGeoTests({ log: false });
+  passed += r.passed;
+  failed += r.failed;
+  for (const f of r.failures) failures.push("experiences-seo-sok-geo: " + f);
+  console.log(`  experiences-seo-sok-geo: ${r.passed} passed, ${r.failed} failed`);
+}
+
 // ── orchestrator-pr-13: conservative address/phone contact-normalizer ──
 // Pins the formatting-only relaxation in cross-source-validator (clears
 // formatting-only review_required) while keeping genuine conflicts gated.
@@ -24171,6 +24200,22 @@ Promise.allSettled(_oaHomeCountersDeps).then(async () => {
     failed += gr.failed;
     for (const f of gr.failures) failures.push("opplevelser-discover-geo: " + f);
     console.log(`  opplevelser-discover-geo: ${gr.passed} passed, ${gr.failed} failed`);
+
+    // Regression: /sok (experiences-seo.ts) used to run the q/tag search and
+    // the geo (discoverExperiences()) lookup in one shared try/catch, and
+    // never range-validated lat/lng — an out-of-range lat/lng (e.g.
+    // ?lat=999) threw a ZodError inside discoverExperiences() and the shared
+    // catch discarded already-successful q/tag search results. Same
+    // in-memory-DB pattern, runs sequentially inside this same gated block
+    // for the same reason.
+    console.log("\n── experiences-seo-sok-geo-regression: out-of-range lat/lng must not wipe q results ──");
+    const { runExperiencesSeoSokGeoRegressionTests } = require("../src/routes/experiences-seo-sok-geo.test") as
+      typeof import("../src/routes/experiences-seo-sok-geo.test");
+    const sgr = await runExperiencesSeoSokGeoRegressionTests({ log: false });
+    passed += sgr.passed;
+    failed += sgr.failed;
+    for (const f of sgr.failures) failures.push("experiences-seo-sok-geo-regression: " + f);
+    console.log(`  experiences-seo-sok-geo-regression: ${sgr.passed} passed, ${sgr.failed} failed`);
 
     // dev-request 2026-07-04-opplevagent-dedup-og-norske-titler, item 1:
     // candidate-key dedup (fuzzy title-match, canonical scoring, group/merge,

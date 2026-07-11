@@ -1102,6 +1102,31 @@ export function discoverExperiences(
   return withDistance.slice(0, Math.max(1, Math.min(100, limit)));
 }
 
+// ─── Distance/precision label (dev-request 2026-07-04-opplevagent-naer-meg-
+// geosok, item 3: «Nær meg» on /sok) ──────────────────────────────────────
+// PURE — no DB access. Mirrors the geo_precision honesty rule enforced
+// server-side by discoverExperiences() above: an 'address'-precision row
+// (geocoded from the provider's real street address) gets an exact
+// "2,4 km unna" distance; a 'kommune'-precision row (municipality-centroid
+// fallback — see experiences-geocode-worker.ts Step C) NEVER claims a
+// street-level distance, since none exists — it says "i <kommune> kommune"
+// instead. Returns null when there's nothing honest to say (no geo_precision
+// at all, i.e. the row was never geocoded / excluded from a geo search).
+export function formatDistanceLabel(
+  distance_km: number | null | undefined,
+  geo_precision: "address" | "kommune" | null | undefined,
+  kommune?: string | null
+): string | null {
+  if (geo_precision === "address" && typeof distance_km === "number" && Number.isFinite(distance_km)) {
+    const km = distance_km.toLocaleString("nb-NO", { minimumFractionDigits: 1, maximumFractionDigits: 1 });
+    return `${km} km unna`;
+  }
+  if (geo_precision === "kommune") {
+    return kommune ? `i ${kommune} kommune` : "omtrentlig posisjon (kommune)";
+  }
+  return null;
+}
+
 // ─── Zero-hit graceful degradation (dev-request 2026-07-04-opplevagent-nl-
 // parser-og-fylkesnormalisering, item 3) ─────────────────────────────────
 // An agent asking a place/season/weather question should never get a bare

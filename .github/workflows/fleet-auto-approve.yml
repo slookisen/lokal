@@ -183,18 +183,46 @@ jobs:
               core.info('review doc fetch failed — no-op');
               return;
             }
-            // Anchored verdict token — a plain substring match on "APPROVED" would also
-            // match "DISAPPROVED" / "NOT APPROVED"; require an explicit rejection check too.
-            const docApproved = new RegExp(`PR[- ]?#?${prNumber}\\b[\\s\\S]{0,200}?\\bVERDICT:\\s*APPROVED\\b`, 'i').test(docText)
-              || new RegExp(`\\bVERDICT:\\s*APPROVED\\b[\\s\\S]{0,200}?PR[- ]?#?${prNumber}\\b`, 'i').test(docText);
-            // docRejected must be anchored to an actual "VERDICT: <rejection-word>" line, same as
-            // docApproved above — a bare unanchored word match on e.g. "REJECTED" false-positived
-            // on ordinary review prose ("...still rejected with 400") that has nothing to do with
-            // the review's own verdict, permanently blocking auto-approve for an APPROVED review
-            // whose body happens to use one of these words descriptively (lokal PR #161, 2026-07-08).
-            const docRejected = /\bVERDICT:\s*(DISAPPROVED|NOT APPROVED|CHANGES-REQUESTED|REJECTED)\b/i.test(docText);
+            // Verdict anchoring — only the doc's own FIRST "VERDICT:"-marked line (its
+            // top-of-file, final verdict, per every review doc's authoring convention — see
+            // protocols/management-tier-charter.md §3.6) is authoritative. Any other
+            // VERDICT:-shaped or APPROVED/REJECTED-shaped mention elsewhere in the body —
+            // e.g. an honest "Review history" section narrating an earlier round's
+            // CHANGES-REQUESTED before a later round returned APPROVED — must never be able
+            // to flip this gate (dev-requests/2026-07-10-fleet-auto-approve-docrejected-
+            // anchor-fix.md, lokal#208). A plain substring match on "APPROVED" would also
+            // match "DISAPPROVED" / "NOT APPROVED"; require an explicit rejection check too
+            // (lokal PR #161, 2026-07-08 — do not regress this).
+            // Word-boundary anchored (`\b`), NOT line-start anchored (`^`): two verdict-doc
+            // formats are both in active production use — a plain "VERDICT: APPROVED — ..."
+            // first line, AND a markdown heading "# REVIEW-VERDICT: APPROVED — ..." whose
+            // literal line does not START with "VERDICT:" but does contain it right after
+            // the "-" in "REVIEW-VERDICT" (a non-word char, so `\b` still matches there).
+            // An earlier draft used `^VERDICT:` and would have wrongly no-op'd on every
+            // "# REVIEW-VERDICT:"-style doc (e.g. the one for lokal PR #216) — spot-checked
+            // against real supervisor-inbox docs, don't reintroduce the `^` anchor.
+            // No `/g` flag — `.match()` naturally returns the leftmost/first occurrence in
+            // document order, which is what we want (the top-of-doc verdict always precedes
+            // any later "Review history" mention in every real doc seen so far).
+            // Mirrored (duplicated intentionally — this runner has no checkout step, so this
+            // logic must stay inline) in scripts/test-fleet-auto-approve-verdict-anchor.js —
+            // keep both in sync.
+            const verdictLineMatch = docText.match(/\bVERDICT:\s*(\S.*)$/mi);
+            if (!verdictLineMatch) {
+              await note(`review doc "${rawRef}" has no "VERDICT:" marker. No auto-approve.`);
+              core.info('review doc has no VERDICT: marker — no-op');
+              return;
+            }
+            const verdictLine = verdictLineMatch[0];
+            const isRejectedVerdict = /\bVERDICT:\s*(DISAPPROVED|NOT APPROVED|CHANGES-REQUESTED|REJECTED)\b/i.test(verdictLine);
+            const isApprovedVerdict = !isRejectedVerdict && /\bVERDICT:\s*APPROVED\b/i.test(verdictLine);
+            const windowStart = Math.max(0, verdictLineMatch.index - 200);
+            const windowEnd = verdictLineMatch.index + verdictLine.length + 200;
+            const prNearVerdict = new RegExp(`PR[- ]?#?${prNumber}\\b`, 'i').test(docText.slice(windowStart, windowEnd));
+            const docApproved = isApprovedVerdict && prNearVerdict;
+            const docRejected = isRejectedVerdict;
             if (docRejected || !docApproved) {
-              await note(`review doc "${rawRef}" does not contain an explicit "VERDICT: APPROVED" tied to PR #${prNumber}. No auto-approve.`);
+              await note(`review doc "${rawRef}" does not contain an explicit "VERDICT: APPROVED" (as the doc's first verdict marker) tied to PR #${prNumber}. No auto-approve.`);
               core.info('review doc does not confirm APPROVED — no-op');
               return;
             }
