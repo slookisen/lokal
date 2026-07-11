@@ -20977,6 +20977,7 @@ console.log("\n── orch-pr-14: MCP discovery product_id surfacing ──");
   try { await _dispatchTickSuitePromise; } catch { /* errors already pushed to failures */ }
   try { await _samtalerSeoPromise; } catch { /* errors already pushed to failures */ }
   try { await _descriptionTruncationSweepPromise; } catch { /* errors already pushed to failures */ }
+  try { await _brregCatalogSweepPromise; } catch { /* errors already pushed to failures */ }
   // relax-envelope tests are synchronous (pure validateEnvelope() unit test) — no promise needed
   // PR-109 tests are synchronous (IIFE) — no promise needed
   // Drop pre-existing intg failures (unmasked by awaiting) — they predate M2
@@ -25724,6 +25725,42 @@ const _descriptionTruncationSweepPromise: Promise<void> = new Promise<void>(r =>
     failures.push("description-truncation-sweep: unexpected error: " + String(err?.message || err));
   } finally {
     _descriptionTruncationSweepResolve();
+  }
+})();
+
+// ═══════════════════════════════════════════════════════════════════════
+// dev-request 2026-06-30-brreg-verification-gate, Slice 3: GET/POST
+// /admin/agents/brreg-catalog-sweep (src/routes/admin-agents.ts) — the
+// backlog sweep for `agents` rows that predate the registration-time
+// BRREG_VERIFY_ON_REGISTER wiring (Slice 2), plus the public "Registrert i
+// Brønnøysund" badge on /produsent/:slug (src/routes/seo.ts). Swaps the
+// shared getDb() singleton (own dedicated test file, in-memory prod-schema
+// DB) and busts the seo.ts/admin-agents.ts require caches, so — mirroring
+// the truncation-sweep block immediately above — it must run strictly
+// after every other singleton-swapping block.
+let _brregCatalogSweepResolve: () => void = () => {};
+const _brregCatalogSweepPromise: Promise<void> = new Promise<void>(r => {
+  _brregCatalogSweepResolve = r;
+});
+
+(async () => {
+  await Promise.allSettled([_descriptionTruncationSweepPromise]);
+  await new Promise(r => setImmediate(r));
+
+  console.log("\n── dev-request 2026-06-30-brreg-verification-gate, Slice 3: brreg-catalog-sweep + badge ──");
+  try {
+    const { runBrregCatalogSweepTests } = require("../src/routes/admin-agents-brreg-catalog-sweep.test") as
+      typeof import("../src/routes/admin-agents-brreg-catalog-sweep.test");
+    const bcs = await runBrregCatalogSweepTests({ log: false });
+    passed += bcs.passed;
+    failed += bcs.failed;
+    for (const f of bcs.failures) failures.push("brreg-catalog-sweep: " + f);
+    console.log(`  brreg-catalog-sweep: ${bcs.passed} passed, ${bcs.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("brreg-catalog-sweep: unexpected error: " + String(err?.message || err));
+  } finally {
+    _brregCatalogSweepResolve();
   }
 })();
 

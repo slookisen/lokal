@@ -3491,6 +3491,12 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
     // Badges
     const badges: string[] = [];
     if (agent.isVerified) badges.push(`<span class="badge badge-v">&#10003; Verifisert</span>`);
+    // dev-request 2026-06-30-brreg-verification-gate, catalog-sweep + badge
+    // slice: agents.brreg_verified=1 (set at registration time or by the
+    // GET/POST /admin/agents/brreg-catalog-sweep backlog sweep) surfaces a
+    // separate public badge. Distinct from `isVerified` (manual/legacy
+    // verification) — an agent can have one, both, or neither.
+    if (agent.brregVerified) badges.push(`<span class="badge badge-v">&#10003; Registrert i Brønnøysund</span>`);
     const certs = k.certifications || [];
     if (certs.some((c: string) => c.toLowerCase().includes("kolog"))) badges.push(`<span class="badge badge-o">&#127793; \u00d8kologisk</span>`);
     (agent.categories || []).slice(0, 3).forEach((c: string) => badges.push(`<span class="badge badge-c">${escapeHtml(formatCat(c))}</span>`));
