@@ -24183,6 +24183,22 @@ Promise.allSettled(_oaHomeCountersDeps).then(async () => {
     failed += dr.failed;
     for (const f of dr.failures) failures.push("experience-dedup: " + f);
     console.log(`  experience-dedup: ${dr.passed} passed, ${dr.failed} failed`);
+
+    // dev-request 2026-07-11-dedup-false-positive-remediation: audit of the
+    // prod backfill's merged groups (classify the evidence linking each
+    // merged row, flag generic-token-only/no-signal rows as suspect), the
+    // admin audit + un-merge endpoints, and the multi-hop/cycle-safe
+    // canonical-slug redirect. Also swaps the experiences db-factory
+    // singleton (EXPERIENCES_DB_PATH=":memory:"), so it runs sequentially
+    // inside this same gated block for the same reason as the suites above.
+    console.log("\n── experience-dedup-audit: merged-group audit + un-merge + redirect chain ──");
+    const { runExperienceDedupAuditTests } = require("../src/services/experience-dedup-audit.test") as
+      typeof import("../src/services/experience-dedup-audit.test");
+    const adr = await runExperienceDedupAuditTests({ log: false });
+    passed += adr.passed;
+    failed += adr.failed;
+    for (const f of adr.failures) failures.push("experience-dedup-audit: " + f);
+    console.log(`  experience-dedup-audit: ${adr.passed} passed, ${adr.failed} failed`);
   } catch (err: any) {
     failed++;
     failures.push("oa-home-counters: unexpected error: " + String(err?.message || err));

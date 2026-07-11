@@ -51,6 +51,11 @@ import {
   // HTTP trigger — mirrors this file's other requireAdmin-gated one-off actions).
   runDedupPass,
 } from "../services/experience-store";
+// dev-request 2026-07-11-dedup-false-positive-remediation — read-only audit
+// of the merged groups the prod backfill produced (titlesMatch()'s single-
+// common-token rule merged some genuinely different experiences), consumed by
+// the two admin endpoints at the bottom of this file.
+import { auditMergedGroups } from "../services/experience-dedup-audit";
 // PURE homepage extractors + SSRF guard — REUSED from the rfb search-enrich
 // module (same code the rfb POST /admin/homepage-content-refresh uses). Only the
 // category mapper differs (experiences vocab, not the food vocab).
@@ -1271,6 +1276,143 @@ router.post("/admin/experiences-dedup-backfill", requireAdmin, (_req: Request, r
   const db = getExpDb("experiences");
   const result = runDedupPass(db);
   res.json({ success: true, ...result });
+});
+
+// dev-request 2026-07-11-dedup-false-positive-remediation: the backfill above
+// merged 418 groups / 1361 rows under titlesMatch()'s defective single-
+// common-token rule, and some are false positives ("Fjelltur til
+// Galdhøpiggen" folded into "Fjelltur til Snøhetta"-style groups). This pair
+// of endpoints is the remediation surface: a read-only AUDIT that re-examines
+// every merged row and flags the ones whose only link is a corpus-common
+// token (see src/services/experience-dedup-audit.ts), and an UN-MERGE action
+// that reverses specific soft merges (canonical_id → NULL + merged_from
+// cleanup) after a human has reviewed the audit output.
+
+// GET /api/opplevelser/admin/experiences-dedup-audit?generic_min=5
+// Read-only — zero writes. Responds with the full summary plus group detail
+// for ONLY the groups that contain suspect rows (capped, so a pathological
+// audit can't produce an unbounded response).
+const AUDIT_RESPONSE_GROUP_CAP = 100;
+router.get("/admin/experiences-dedup-audit", requireAdmin, (req: Request, res: Response) => {
+  const rawGenericMin = parseInt((req.query.generic_min as string) || "", 10);
+  const genericMin = Number.isFinite(rawGenericMin) && rawGenericMin >= 1 ? rawGenericMin : undefined;
+
+  const db = getExpDb("experiences");
+  const { groups, summary } = auditMergedGroups(db, genericMin !== undefined ? { genericMin } : {});
+  const suspectGroups = groups.filter((g) => g.rows.some((r) => r.suspect));
+
+  res.json({
+    success: true,
+    // Review caveat for the human reading this JSON: 'suspect' means REVIEW ME,
+    // not certainly-false. The audit's whole-string bar (0.85) is deliberately
+    // stricter than the matcher that made the merges (0.6), so a genuine
+    // duplicate in the 0.6-0.85 band with only generic shared tokens can be
+    // flagged. Inspect both titles + shared_tokens/corpus counts before
+    // un-merging; a wrongly-un-merged true duplicate is a cosmetic resurfaced
+    // listing, a false merge left in place hides a distinct bookable product.
+    note: "suspect = review-me, NOT certainly-false — inspect titles/tokens before un-merging; re-audit after each un-merge batch (sibling links recompute)",
+    summary,
+    groups_returned: Math.min(suspectGroups.length, AUDIT_RESPONSE_GROUP_CAP),
+    groups_truncated: suspectGroups.length > AUDIT_RESPONSE_GROUP_CAP,
+    groups: suspectGroups.slice(0, AUDIT_RESPONSE_GROUP_CAP),
+  });
+});
+
+// POST /api/opplevelser/admin/experiences-dedup-unmerge
+// Body: { ids: string[], dry_run?: boolean } — dry_run DEFAULTS TO TRUE when
+// absent, so the endpoint never writes unless explicitly told to. For each
+// listed id the row must currently be merged away (canonical_id set); rows
+// that aren't are reported as skipped, never as errors — which also makes a
+// re-run of the same body a harmless no-op (idempotent). A real run clears
+// canonical_id on the listed rows and removes them from their canonical row's
+// merged_from JSON array (NULL when the list empties), mirroring exactly the
+// format runDedupPass() writes. The whole real run is one transaction.
+// SEQUENCING CONSTRAINT (review note 1): titlesMatch() is deliberately untouched by this
+// slice, so every un-merged false positive is STILL a titlesMatch() match — re-running
+// POST /admin/experiences-dedup-backfill (or any runDedupPass invocation) will RE-MERGE
+// everything this endpoint un-merges. Do NOT re-run the backfill until the titlesMatch
+// corroboration fix (dev-request 2026-07-11 slice C) is live.
+router.post("/admin/experiences-dedup-unmerge", requireAdmin, (req: Request, res: Response) => {
+  const body = (req.body ?? {}) as { ids?: unknown; dry_run?: unknown };
+  if (!Array.isArray(body.ids) || body.ids.length === 0) {
+    res.status(400).json({ error: "ids (ikke-tom liste) påkrevd" });
+    return;
+  }
+  const ids = body.ids.map(String);
+  // STRICT-FALSE parse (review blocker, PR round 2): writes execute ONLY on the JSON
+  // boolean false. null / "false" / 0 / "" / undefined all mean dry run — many JSON
+  // clients serialize an unset optional boolean as null, and a caller who left dry_run
+  // unset must get the documented dry-run default, never live un-merges.
+  const dryRun = body.dry_run !== false;
+
+  const db = getExpDb("experiences");
+  const getRow = db.prepare("SELECT id, canonical_id FROM experiences WHERE id = ?");
+
+  const toUnmerge: Array<{ id: string; canonical_id: string }> = [];
+  const skipped: Array<{ id: string; reason: string }> = [];
+  for (const id of ids) {
+    const row = getRow.get(id) as { id: string; canonical_id: string | null } | undefined;
+    if (!row) skipped.push({ id, reason: "not_found" });
+    else if (!row.canonical_id) skipped.push({ id, reason: "not_merged" });
+    else toUnmerge.push({ id: row.id, canonical_id: row.canonical_id });
+  }
+
+  if (dryRun) {
+    res.json({
+      success: true,
+      dry_run: true,
+      requested: ids.length,
+      would_unmerge: toUnmerge.map((r) => r.id),
+      skipped,
+    });
+    return;
+  }
+
+  const clearCanonicalId = db.prepare(
+    "UPDATE experiences SET canonical_id = NULL, updated_at = datetime('now') WHERE id = ?"
+  );
+  const getMergedFrom = db.prepare("SELECT merged_from FROM experiences WHERE id = ?");
+  const setMergedFrom = db.prepare(
+    "UPDATE experiences SET merged_from = ?, updated_at = datetime('now') WHERE id = ?"
+  );
+
+  const tx = db.transaction(() => {
+    for (const row of toUnmerge) {
+      clearCanonicalId.run(row.id);
+    }
+    // Group the un-merged ids per canonical row so each merged_from list is
+    // rewritten once. Parse tolerantly, mirroring runDedupPass().
+    const removedByCanonical = new Map<string, Set<string>>();
+    for (const row of toUnmerge) {
+      const set = removedByCanonical.get(row.canonical_id);
+      if (set) set.add(row.id);
+      else removedByCanonical.set(row.canonical_id, new Set([row.id]));
+    }
+    for (const [canonicalId, removedIds] of removedByCanonical) {
+      const existingRaw = (getMergedFrom.get(canonicalId) as { merged_from: string | null } | undefined)
+        ?.merged_from;
+      let existingIds: string[] = [];
+      if (existingRaw) {
+        try {
+          const parsed = JSON.parse(existingRaw);
+          if (Array.isArray(parsed)) existingIds = parsed.map(String);
+        } catch {
+          /* corrupt/legacy value — treat as empty rather than throw */
+        }
+      }
+      const remaining = existingIds.filter((id) => !removedIds.has(id));
+      setMergedFrom.run(remaining.length > 0 ? JSON.stringify(remaining) : null, canonicalId);
+    }
+  });
+  tx();
+
+  res.json({
+    success: true,
+    dry_run: false,
+    requested: ids.length,
+    unmerged: toUnmerge.map((r) => r.id),
+    skipped,
+  });
 });
 
 export default router;
