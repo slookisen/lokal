@@ -478,6 +478,19 @@ export function runSearchEnrichTests(opts: { log?: boolean } = {}): TestSummary 
     const realWithMenu =
       "Vår restaurant har en fast meny med lokale råvarer, og gjestene kan også besøke gårdsbutikken vår for å handle rett fra produksjonen.";
     assertTrue(meetsAboutQualityBar(realWithMenu), "quality: real prose mentioning a food 'meny' still passes");
+    // Regression (review fix-up): genuine, fully-punctuated Norwegian prose
+    // (three real sentences) that happens to contain an inline opening-hours
+    // listing shaped like the numbered-menu-list pattern ("Man 10 Åpent, Tir
+    // 10 Åpent, ..." — five "digit + capitalized word" hits, clearing the ≥3
+    // threshold) must NOT be rejected just because rule 1 fired without a
+    // punctuation escape hatch — it has real sentence structure, unlike a
+    // scraped <nav> list.
+    const realWithOpeningHoursList =
+      "Vi holder åpent i sommersesongen. Kom innom gårdsbutikken vår for ferske varer. Åpningstider: Man 10 Åpent, Tir 10 Åpent, Ons 10 Åpent, Tor 10 Åpent, Fre 10 Åpent.";
+    assertTrue(
+      meetsAboutQualityBar(realWithOpeningHoursList),
+      "quality: real prose with inline opening-hours numbered list still passes"
+    );
   }
 
   // ── orch-experiences-content-refresh: mapToExperienceCategories (PURE) ──────
