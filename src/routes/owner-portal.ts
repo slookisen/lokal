@@ -701,6 +701,8 @@ function portalShell(title: string, body: string): string {
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <meta name="robots" content="noindex,nofollow">
+  <link rel="manifest" href="/manifest.json">
+  <meta name="theme-color" content="#2D5016">
   <title>${escapeHtml(title)} — Rett fra Bonden</title>
   <style>${PORTAL_PALETTE_CSS}</style>
 </head>
