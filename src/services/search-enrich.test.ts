@@ -662,6 +662,115 @@ export function runSearchEnrichTests(opts: { log?: boolean } = {}): TestSummary 
       meetsAboutQualityBar(passiveNoProductList),
       "quality (regression): passive-voice prose without product list still passes without bare prepositions (fix-up-2)"
     );
+
+    // ── round-3 fix-up-3 (2026-07-11, Daniel-approved option A): round-3
+    // review found UMBRELLA_MEMBERSHIP_MARKERS bypassable by differently-
+    // worded collective/umbrella-portal prose that never uses the literal
+    // "våre medlemmer" family of phrases. Fixed with two STRUCTURAL signals
+    // (hasPluralPossessiveCollectiveFraming, hasMultiEntityMention) instead
+    // of another keyword-list point-fix. Three independently-worded
+    // collective/umbrella-portal examples below, none containing "medlem"
+    // (or any other UMBRELLA_MEMBERSHIP_MARKERS phrase) at all. ─────────────
+
+    // Example 1: plural-possessive collective framing via "produsenter"
+    // (producers), not "medlemmer" — signal 1.
+    const collectiveProdusenter =
+      "Hos oss finner du et rikt utvalg av lokale opplevelser og gode smaker. Våre produsenter tilbyr alt fra nystekt bakverk til nykjernet smør, og du er alltid hjertelig velkommen til å besøke gårdsbutikkene i regionen.";
+    assertTrue(
+      !meetsAboutQualityBar(collectiveProdusenter),
+      "quality: 'våre produsenter' collective framing fails without literal umbrella marker phrase (round-3 fix-up-3)"
+    );
+
+    // Example 2: plural-possessive collective framing via "aktører"
+    // (operators/actors) — different noun, different sentence shape from
+    // example 1, still signal 1.
+    const collectiveAktorer =
+      "Regionen har et yrende reiseliv med mange spennende steder å besøke. Blant våre aktører finner du alt fra tradisjonsrike gårder til moderne opplevelsessentre, og alle ønsker deg hjertelig velkommen innom.";
+    assertTrue(
+      !meetsAboutQualityBar(collectiveAktorer),
+      "quality: 'våre aktører' collective framing fails without literal umbrella marker phrase (round-3 fix-up-3)"
+    );
+
+    // Example 3: no "vår"/"våre" possessive at all — instead enumerates 4
+    // distinctly-named businesses in one blurb, real grammatical prose with
+    // proper sentence-ending punctuation (so it clears every OTHER check),
+    // caught purely by signal 2 (multi-entity mention).
+    const collectiveMultiEntity =
+      "Turen gjennom bygda byr på mange flotte stopp. Første stopp er Nordfjord Ysteri som ligger idyllisk til, videre kan du besøke Sunnmøre Bryggeri før du tar turen innom Stryn Sjokoladefabrikk, og aller sist stopper du hos Geiranger Vingård for en smak av lokal frukt.";
+    assertTrue(
+      !meetsAboutQualityBar(collectiveMultiEntity),
+      "quality: prose enumerating 4 distinctly-named businesses fails via multi-entity signal (round-3 fix-up-3)"
+    );
+
+    // Legitimate single-producer prose that must still PASS — guards against
+    // over-rejection from the two new structural signals. Uses "vår gård"
+    // (SINGULAR self-reference, not the plural "våre gårder"/"gardene våre"
+    // that signal 1 targets) and mentions its own village + a product name
+    // but does not enumerate other distinctly-named businesses (0 distinct
+    // ≥2-token Title-Case runs, well under the multi-entity threshold).
+    const legitimateSingleProducer =
+      "Vi er en liten familiegård i Hjartdal i Telemark. Her produserer vi gårdsost for hånd av melk fra egne geiter, og gården vår har vore i familien i fire generasjoner. Velkommen innom gårdsbutikken for å smake ostene våre.";
+    assertTrue(
+      meetsAboutQualityBar(legitimateSingleProducer),
+      "quality: legitimate single-producer prose (own village + product, singular 'vår gård') still passes (round-3 fix-up-3)"
+    );
+
+    // Regression: all prior nav-menu, passive-voice-prose and original
+    // literal-umbrella-marker pins must still hold after adding the two new
+    // structural signals (no weakening/removal of any earlier assertion).
+    assertTrue(!meetsAboutQualityBar(navFlatMenu), "quality (regression, fix-up-3): flat Title-Case nav bar still fails");
+    assertTrue(
+      !meetsAboutQualityBar(navLangSwitchDup),
+      "quality (regression, fix-up-3): lang-switcher/duplicated-tagline nav chrome still fails"
+    );
+    assertTrue(
+      !meetsAboutQualityBar(navDuplicatedBreadcrumb),
+      "quality (regression, fix-up-3): duplicated breadcrumb still fails"
+    );
+    assertTrue(
+      !meetsAboutQualityBar(umbrellaAbout),
+      "quality (regression, fix-up-3): umbrella-portal dense category listing still fails"
+    );
+    assertTrue(
+      !meetsAboutQualityBar(umbrellaVisit),
+      "quality (regression, fix-up-3): 'våre medlemmer' collective-membership prose still fails"
+    );
+    assertTrue(!meetsAboutQualityBar(navNumbered), "quality (regression, fix-up-3): round-1 numbered nav-menu list still fails");
+    assertTrue(
+      !meetsAboutQualityBar(navPipeArrow),
+      "quality (regression, fix-up-3): round-1 pipe/arrow nav-menu with 'top of page' marker still fails"
+    );
+    assertTrue(!meetsAboutQualityBar(navPipeOnly), "quality (regression, fix-up-3): round-1 pure pipe-separated menu still fails");
+    assertTrue(!meetsAboutQualityBar(navArrowOnly), "quality (regression, fix-up-3): round-1 pure arrow-separated menu still fails");
+    assertTrue(
+      !meetsAboutQualityBar(navPrepositionLeakage1),
+      "quality (regression, fix-up-3): flat nav bar with 'Fra' still fails"
+    );
+    assertTrue(
+      !meetsAboutQualityBar(navPrepositionLeakage2),
+      "quality (regression, fix-up-3): flat nav bar with 'Med' still fails"
+    );
+    assertTrue(
+      !meetsAboutQualityBar(navPrepositionLeakage3),
+      "quality (regression, fix-up-3): flat nav bar with 'På' still fails"
+    );
+    assertTrue(
+      meetsAboutQualityBar(realWithOpeningHoursList),
+      "quality (regression, fix-up-3): real prose with inline opening-hours list still passes"
+    );
+    assertTrue(meetsAboutQualityBar(realWithMenu), "quality (regression, fix-up-3): real prose mentioning a food 'meny' still passes");
+    assertTrue(
+      meetsAboutQualityBar(reviewerPassiveProductList),
+      "quality (regression, fix-up-3): passive-voice product-list prose (2 distinct Title-Case runs) still passes — does not trip the new multi-entity threshold"
+    );
+    assertTrue(
+      meetsAboutQualityBar(passiveProductListVariant),
+      "quality (regression, fix-up-3): passive-voice product-list variant (2 distinct Title-Case runs) still passes — does not trip the new multi-entity threshold"
+    );
+    assertTrue(
+      meetsAboutQualityBar(passiveNoProductList),
+      "quality (regression, fix-up-3): passive-voice prose without product list still passes"
+    );
   }
 
   // ── orch-experiences-content-refresh: mapToExperienceCategories (PURE) ──────

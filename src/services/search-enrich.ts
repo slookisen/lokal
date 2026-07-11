@@ -1008,6 +1008,155 @@ const UMBRELLA_MEMBERSHIP_MARKERS: readonly string[] = [
   "vare medlemmer", "medlemsbedrift", "medlemmene", "medlemsvirksomhetene",
 ];
 
+// round-3 fix-up-3 (2026-07-11, Daniel-approved option A — see dev-request /
+// orchestrator-failures/2026-07-11-gardssalg-quality-round2-3-iteration-cap.md):
+// round-3 review found UMBRELLA_MEMBERSHIP_MARKERS above bypassable by
+// differently-worded collective/umbrella-portal prose that never uses those
+// literal phrases — three independently-worded reproductions were given, none
+// containing "medlem" at all. Rather than add yet another literal phrase (the
+// reviewer's explicit direction: this needs a STRUCTURAL signal, not another
+// keyword-list point-fix), this is a grammatical pattern: a first-person-
+// plural possessive pronoun ("vår"/"våre") governing the PLURAL form of a
+// collective/business-type noun a tourism/umbrella portal would plausibly use
+// ("våre produsenter", "bedriftene våre", "våre aktører", ...). Deliberately
+// PLURAL-ONLY: "vår gård"/"vårt bryggeri" (singular self-reference) is
+// completely ordinary Norwegian producer-about-itself prose — "vår"/"våre" is
+// even a positive NORWEGIAN_WORD_MARKERS signal below — and must NOT be
+// flagged. It's only the plural ("våre gårder", "gardene vare") that implies
+// the speaker owns/represents MULTIPLE distinct businesses, which a single
+// producer's own about/visit text essentially never needs to say about
+// itself. Accent-stripped, lowercase, whole-token plural forms (indefinite
+// -er/-mer and definite -ene, following each noun's own irregular Norwegian
+// plural) for the 9 collective/business-type noun classes a tourism/umbrella
+// portal plausibly enumerates: medlem(mer) "member", bedrift(er) "business",
+// produsent(er) "producer", gard/gård(er) "farm", aktør(er) "operator/actor",
+// tilbyder "provider", deltaker "participant", utstiller "exhibitor",
+// virksomhet(er) "enterprise".
+const COLLECTIVE_PLURAL_NOUNS: ReadonlySet<string> = new Set([
+  "medlemmer", "medlemmene",
+  "bedrifter", "bedriftene",
+  "produsenter", "produsentene",
+  "garder", "gardene", "gaarder", "gaardene",
+  "aktorer", "aktorene",
+  "tilbydere", "tilbyderne",
+  "deltakere", "deltakerne",
+  "utstillere", "utstillerne",
+  "virksomheter", "virksomhetene",
+]);
+
+// Accent-stripped forms of "vår"/"våre" — both collapse to "vare" once å→a is
+// applied, which is fine here (both are the same first-person-plural
+// possessive, just singular/plural AGREEMENT with the noun that follows/
+// precedes it, not a meaning distinction we need for this structural check).
+const POSSESSIVE_PLURAL_PRONOUNS: ReadonlySet<string> = new Set(["var", "vare"]);
+
+// How many tokens away (either direction) the possessive and the collective
+// noun may sit and still count as one grammatical unit — covers an inserted
+// adjective/adverb ("våre lokale produsenter", "våre mange aktører") and the
+// noun-then-trailing-possessive Norwegian word order ("medlemmene våre").
+const COLLECTIVE_FRAMING_WINDOW = 3;
+
+/**
+ * Structural collective-framing detector (round-3 fix-up-3). PURE.
+ *
+ * True when a first-person-plural possessive ("vår"/"våre") sits within
+ * COLLECTIVE_FRAMING_WINDOW tokens of the PLURAL form of a collective/
+ * business-type noun (COLLECTIVE_PLURAL_NOUNS), in either word order. This
+ * generalizes UMBRELLA_MEMBERSHIP_MARKERS's literal "våre medlemmer" phrase
+ * to the whole grammatical pattern/noun class, so differently-worded
+ * collective-portal prose ("våre produsenter", "aktørene våre", ...) that
+ * never contains the literal marker phrases is still caught, while ordinary
+ * singular self-reference ("vår gård", "vårt bryggeri") is not, because it
+ * requires the PLURAL noun form specifically (see COLLECTIVE_PLURAL_NOUNS
+ * doc comment for why plural is the load-bearing distinction here).
+ *
+ * Known tradeoff: after accent-stripping, "våre" (our, plural possessive)
+ * and the unrelated ordinary noun "vare" ("an item/product", e.g. "fersk
+ * vare") collapse to the same token. A false positive would need that bare
+ * noun to additionally land within the token window of one of the plural
+ * collective nouns above by coincidence — judged low-probability in genuine
+ * single-producer prose (not observed in this file's regression corpus) and
+ * accepted as a residual risk of the accent-stripping convention this file
+ * already uses everywhere else, rather than special-cased here.
+ */
+function hasPluralPossessiveCollectiveFraming(trimmed: string): boolean {
+  const tokens = trimmed
+    .split(/\s+/)
+    .map((t) => stripNorwegianAccents(t.toLowerCase()).replace(/^[^a-z]+|[^a-z]+$/g, ""))
+    .filter((t) => t.length > 0);
+
+  for (let i = 0; i < tokens.length; i++) {
+    if (!POSSESSIVE_PLURAL_PRONOUNS.has(tokens[i])) continue;
+    const lo = Math.max(0, i - COLLECTIVE_FRAMING_WINDOW);
+    const hi = Math.min(tokens.length - 1, i + COLLECTIVE_FRAMING_WINDOW);
+    for (let j = lo; j <= hi; j++) {
+      if (j === i) continue;
+      if (COLLECTIVE_PLURAL_NOUNS.has(tokens[j])) return true;
+    }
+  }
+  return false;
+}
+
+// round-3 fix-up-3: how many DISTINCT ≥2-token Title-Case runs before the
+// text is treated as enumerating multiple businesses rather than being one
+// producer's own prose. Tuned against this file's own passive-voice
+// Title-Case-product-list regression pins (round-2 fix-up, see
+// reviewerPassiveProductList/passiveProductListVariant in the test file),
+// which are genuine single-producer prose that tops out at 2 distinct runs
+// (one long run of branded product names, one short place-name run) — so 3
+// is the lowest threshold that doesn't reopen that already-fixed regression.
+const MULTI_ENTITY_THRESHOLD = 3;
+
+/**
+ * Structural multi-entity-mention detector (round-3 fix-up-3). PURE.
+ *
+ * A single producer's own about/visit prose is about itself: it may repeat
+ * its own (possibly multi-word) name, and may legitimately mention e.g. its
+ * own village/region alongside a product name, but it essentially never
+ * name-drops several OTHER distinctly-named businesses in the same blurb —
+ * an umbrella/tourism-portal page enumerating its member businesses does
+ * exactly that. Structural proxy: count DISTINCT runs of ≥2 consecutive
+ * Title-Case tokens (proper-noun-shaped chunks, e.g. "Nordfjord Ysteri") in
+ * the text; ≥MULTI_ENTITY_THRESHOLD distinct such chunks is treated as
+ * enumeration of multiple entities and rejected.
+ *
+ * Deliberately counts DISTINCT (deduped, case/accent-insensitive) runs, so a
+ * producer's own multi-word name repeated several times in its own blurb
+ * ("Ekeby Gårdsbryggeri ... Ekeby Gårdsbryggeri") doesn't trip this — it's
+ * one distinct chunk no matter how many times it recurs. Deliberately
+ * requires ≥2-TOKEN runs, not single capitalized words, so an ordinary
+ * "landsby + fylke + produktnavn"-shaped mention (each a lone capitalized
+ * word, not a multi-word run) doesn't false-positive either. This is a
+ * proxy, not a certainty — see MULTI_ENTITY_THRESHOLD doc comment for how
+ * the threshold was picked, and the test file for the false-positive guard
+ * this was tuned against.
+ */
+function hasMultiEntityMention(trimmed: string): boolean {
+  const tokens = trimmed
+    .split(/\s+/)
+    .map((t) => t.replace(/^[^\p{L}]+|[^\p{L}]+$/gu, ""))
+    .filter((t) => t.length > 0);
+
+  const distinctRuns = new Set<string>();
+  let run: string[] = [];
+  const flushRun = () => {
+    if (run.length >= 2) {
+      distinctRuns.add(stripNorwegianAccents(run.join(" ").toLowerCase()));
+    }
+    run = [];
+  };
+  for (const t of tokens) {
+    if (/^[A-ZÆØÅ]/.test(t)) {
+      run.push(t);
+    } else {
+      flushRun();
+    }
+  }
+  flushRun();
+
+  return distinctRuns.size >= MULTI_ENTITY_THRESHOLD;
+}
+
 // Small, curated set of words that show up in genuine descriptive SENTENCES
 // (finite verbs + first/second-person pronouns) but essentially never in a
 // flat scraped <nav>/category list, which is just proper/common nouns strung
@@ -1170,10 +1319,13 @@ const NORWEGIAN_WORD_MARKERS: readonly string[] = [
  *     tokens with NO sentence-ending punctuation at all, or a verbatim
  *     repeated breadcrumb/tagline phrase — see isLikelyNavMenuLeakage),
  *   - is NOT describing an UMBRELLA/tourism-association's members collectively
- *     ("våre medlemmer" etc.) rather than this one producer — a wrong-ENTITY
- *     bug that can otherwise slip past every other check because the prose
- *     itself is perfectly grammatical, punctuated, real Norwegian (round-2,
- *     2026-07-11 — see UMBRELLA_MEMBERSHIP_MARKERS doc comment),
+ *     ("våre medlemmer" etc., OR the same collective/multi-entity framing in
+ *     different words — round-3 fix-up-3's structural signals) rather than
+ *     this one producer — a wrong-ENTITY bug that can otherwise slip past
+ *     every other check because the prose itself is perfectly grammatical,
+ *     punctuated, real Norwegian (round-2, 2026-07-11 — see
+ *     UMBRELLA_MEMBERSHIP_MARKERS, hasPluralPossessiveCollectiveFraming and
+ *     hasMultiEntityMention doc comments),
  *   - does NOT contain the Unicode replacement character (U+FFFD, "�") — a
  *     candidate with a "�" was mangled upstream (most likely a byte-level cut
  *     through a multi-byte UTF-8 character, e.g. mid æ/ø/å) and must never be
@@ -1211,10 +1363,15 @@ export function meetsAboutQualityBar(text: string | null | undefined, minLen = 8
   if (isLikelyNavMenuLeakage(trimmed)) return false;
 
   // Reject umbrella/tourism-association "our members" language — real prose,
-  // wrong entity (see UMBRELLA_MEMBERSHIP_MARKERS doc comment).
+  // wrong entity (see UMBRELLA_MEMBERSHIP_MARKERS doc comment): the literal
+  // marker phrases, OR (round-3 fix-up-3) either of the two STRUCTURAL
+  // collective/multi-entity signals that generalize beyond that literal list
+  // — see hasPluralPossessiveCollectiveFraming / hasMultiEntityMention.
   for (const marker of UMBRELLA_MEMBERSHIP_MARKERS) {
     if (lowerAscii.includes(marker)) return false;
   }
+  if (hasPluralPossessiveCollectiveFraming(trimmed)) return false;
+  if (hasMultiEntityMention(trimmed)) return false;
 
   // Must look Norwegian: an æ/ø/å letter, OR a common Norwegian function word.
   // (Pad with spaces so word-markers match at the string edges too.)
