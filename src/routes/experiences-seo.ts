@@ -2143,14 +2143,19 @@ ${BROWSE_CSS}
 // getGardssalgProviderBySlug() gate as the booking panel, so profile and
 // booking 404/200 in lockstep for every provider.
 //
-// Data-availability note: experience_providers today carries navn, hjemmeside,
-// sted, contact, and lat/lon — but no own-summary "description", and no
-// season/duration/price_from/capacity columns (those live on the `experiences`
-// table, which gårdssalg producers have zero rows in — see the block comment
-// below). The "Om produsenten"/"Besøket" sections therefore render an honest,
-// type-general placeholder (not a fabricated specific claim about any one
-// producer — keeps the faithfulness guard's spirit) until the separate
-// multi-page-crawl enrichment slice fills real per-producer copy. The
+// Data-availability note: experience_providers carries navn, hjemmeside,
+// sted, contact, and lat/lon — but no season/duration/price_from/capacity
+// columns (those live on the `experiences` table, which gårdssalg producers
+// have zero rows in — see the block comment below). As of 2026-07-10
+// (dev-request 2026-07-03-gardssalg-rike-profiler-bilder-agentbooking, Fase 1
+// item 3), experience_providers ALSO carries about_text/visit_text/
+// opening_hours_text — real, per-producer copy filled by the multi-page-crawl
+// enrichment slice (POST /admin/gardssalg-content-refresh, see
+// experience-store.ts's applyGardssalgProviderContent). The "Om produsenten"/
+// "Besøket" sections render that real copy when present; for producers not
+// yet enriched (columns still NULL/empty), they fall back to the same honest,
+// type-general placeholder as before (not a fabricated specific claim about
+// any one producer — keeps the faithfulness guard's spirit). The
 // practical-info table only ever renders rows it has real data for.
 function drivingSted(p: GardssalgProviderRow): string {
   return [p.poststed, p.kommune, p.fylke].filter(Boolean).join(", ");
@@ -2202,17 +2207,23 @@ router.get(
       ? `linear-gradient(135deg,${meta.color} 0%,#0b2e29 75%)`
       : "linear-gradient(135deg,#0e3c36 0%,#0f5a50 100%)";
 
-    // "Om produsenten" — real hjemmeside link when we have one; honest
-    // placeholder copy otherwise (no fabricated specifics).
-    const aboutBody = site
+    // "Om produsenten" — real enriched copy (about_text) when the multi-page-
+    // crawl slice has filled it; otherwise the same honest fallback as before
+    // (real hjemmeside link when we have one, placeholder copy otherwise).
+    const aboutBody = provider.about_text && provider.about_text.trim()
+      ? `<p>${escapeHtml(provider.about_text)}</p>`
+      : site
       ? `<p>${escapeHtml(provider.navn)} er en lokal drikkeprodusent${sted ? " i " + escapeHtml(sted) : ""}. Les mer om produsenten og produktene på <a href="${escapeHtml(site)}" target="_blank" rel="noopener nofollow">${escapeHtml(hostOf(site))}</a>.</p>`
       : `<p>${escapeHtml(provider.navn)} er en lokal drikkeprodusent${sted ? " i " + escapeHtml(sted) : ""}. Utfyllende presentasjon publiseres fortløpende.</p>`;
 
-    // "Besøket" — type-general orientation, explicitly not a per-producer claim.
+    // "Besøket" — real enriched copy (visit_text) when present; otherwise the
+    // existing type-general orientation, explicitly not a per-producer claim.
     const visitCopy = provider.producer_type
       ? VISIT_TYPE_COPY[provider.producer_type.toLowerCase()]
       : null;
-    const visitBody = visitCopy
+    const visitBody = provider.visit_text && provider.visit_text.trim()
+      ? `<p>${escapeHtml(provider.visit_text)}</p>`
+      : visitCopy
       ? `<p>Et besøk hos ${escapeHtml(provider.navn)} inkluderer typisk ${visitCopy}. Nøyaktig program avtales ved reservasjon.</p>`
       : `<p>Detaljer om hva besøket hos ${escapeHtml(provider.navn)} inneholder, publiseres fortløpende. Book et besøk for å avtale program direkte med produsenten.</p>`;
 
@@ -2222,6 +2233,7 @@ router.get(
     const facts: Array<[string, string]> = [];
     if (sted) facts.push(["Sted", escapeHtml(sted)]);
     if (provider.adresse) facts.push(["Adresse", escapeHtml(provider.adresse)]);
+    if (provider.opening_hours_text && provider.opening_hours_text.trim()) facts.push(["Åpningstider", escapeHtml(provider.opening_hours_text)]);
     if (site) facts.push(["Nettside", `<a href="${escapeHtml(site)}" target="_blank" rel="noopener nofollow">${escapeHtml(hostOf(site))}</a>`]);
     if (isDisplayablePhone(provider.telefon)) facts.push(["Telefon", `<a href="tel:${escapeHtml(provider.telefon)}">${escapeHtml(provider.telefon)}</a>`]);
     if (provider.epost) facts.push(["E-post", `<a href="mailto:${escapeHtml(provider.epost)}">${escapeHtml(provider.epost)}</a>`]);
@@ -2246,11 +2258,19 @@ router.get(
     // the visit + BreadcrumbList. No numeric price exists yet on this row, so
     // — same discipline as the /opplevelse/:slug Offer block — `offers`
     // describes the bookable visit without inventing a price.
+    //
+    // description: real enriched about_text (truncated to ~300 chars, same cap
+    // discipline as summarizeAbout) when present — a more accurate/faithful
+    // structured-data description than the generic metaDesc; otherwise metaDesc
+    // as before.
+    const ldDescription = provider.about_text && provider.about_text.trim()
+      ? (provider.about_text.trim().length > 300 ? provider.about_text.trim().slice(0, 300).trim() + "…" : provider.about_text.trim())
+      : metaDesc;
     const ld: Record<string, unknown> = {
       "@context": "https://schema.org",
       "@type": "LocalBusiness",
       name: provider.navn,
-      description: metaDesc,
+      description: ldDescription,
       url: canonical,
       address: {
         "@type": "PostalAddress",

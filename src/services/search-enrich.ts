@@ -761,6 +761,118 @@ export function summarizeAbout(html: string): string {
   return cap(visible);
 }
 
+// Norwegian visit/tasting keywords used by summarizeVisit() below — a page
+// sentence/paragraph mentioning any of these is a reasonable signal that it
+// describes what a gårdssalg visit actually includes (as opposed to generic
+// "about us" prose picked up by summarizeAbout()).
+const VISIT_KEYWORDS: readonly string[] = [
+  "omvisning", "smaking", "besøk", "degustasjon", "tasting",
+  "åpent gårdsutsalg", "gårdsbutikk",
+];
+
+/**
+ * Produce a DETERMINISTIC extractive "visit" summary from the page HTML: scan
+ * the visible body text for the first sentence/paragraph (≥40 chars) that
+ * mentions a visit/tasting keyword (omvisning, smaking, besøk, degustasjon,
+ * tasting, åpent gårdsutsalg, gårdsbutikk). Same shape as summarizeAbout() —
+ * whitespace-collapsed, capped at ~300 chars on a word boundary — but scans
+ * for visit-specific signal instead of og/meta description + first paragraph.
+ * Returns "" if nothing found (same empty-string contract as summarizeAbout,
+ * deliberately with NO leading-slice fallback — an unrelated first paragraph
+ * is worse than no visit copy at all). No generative text — purely
+ * extractive. PURE.
+ */
+export function summarizeVisit(html: string): string {
+  if (!html) return "";
+  const cap = (s: string): string => {
+    const t = s.replace(/\s+/g, " ").trim();
+    if (t.length <= 300) return t;
+    const slice = t.slice(0, 300);
+    const lastSpace = slice.lastIndexOf(" ");
+    return (lastSpace > 200 ? slice.slice(0, lastSpace) : slice).trim();
+  };
+  const visible = extractVisibleText(html);
+  if (!visible) return "";
+  for (const chunk of visible.split(/(?<=[.!?])\s+/)) {
+    const c = chunk.trim();
+    if (c.length < 40) continue;
+    const lower = c.toLowerCase();
+    if (VISIT_KEYWORDS.some((kw) => lower.includes(kw))) return cap(c);
+  }
+  return "";
+}
+
+// Norwegian weekday names + a small set of 3-letter abbreviations (used only
+// in an abbreviation-range like "man-fre") for extractOpeningHours() below.
+// Plain substring/word matches — ASCII edges only (no \b immediately before
+// an æ/ø/å character, which JS's \w-based \b treats as a non-word char and
+// would silently fail to match after a preceding space).
+const OPENING_HOURS_WEEKDAY_RE = /mandag|tirsdag|onsdag|torsdag|fredag|lørdag|søndag/gi;
+const OPENING_HOURS_WEEKDAY_ABBR_RANGE_RE =
+  /\b(?:man|tir|ons|tor|fre|lør|søn)\s?[-–]\s?(?:man|tir|ons|tor|fre|lør|søn)\b/gi;
+const OPENING_HOURS_TIME_RE = /\d{1,2}[:.]\d{2}|\d{1,2}\s?[-–]\s?\d{1,2}/;
+const OPENING_HOURS_WORDS_RE = /åpningstider|åpent/gi;
+
+/**
+ * Scan plain visible text (the caller passes the already-computed
+ * extractVisibleText() output — this function does NOT fetch or parse HTML)
+ * for a short snippet describing opening hours: a Norwegian weekday name (or
+ * a "man-fre"-style abbreviation range) co-located with either a time pattern
+ * (`\d{1,2}[:.]\d{2}` or `\d{1,2}-\d{1,2}`) or the literal words
+ * "åpningstider"/"åpent" — or, failing that, "åpningstider"/"åpent"
+ * co-located with a time pattern on its own (covers pages that state hours
+ * without naming a weekday, e.g. "Åpningstider: 10-18 alle dager"). Returns a
+ * trimmed, whitespace-collapsed snippet (capped ~200 chars) centered on the
+ * first qualifying match, or null if nothing matches. PURE — no network, no
+ * HTML parsing.
+ */
+export function extractOpeningHours(text: string): string | null {
+  if (!text) return null;
+  const WINDOW = 80;
+  const CAP = 200;
+
+  const buildSnippet = (idx: number, matchLen: number): string => {
+    const start = Math.max(0, idx - WINDOW);
+    const end = Math.min(text.length, idx + matchLen + WINDOW);
+    let snippet = text.slice(start, end).replace(/\s+/g, " ").trim();
+    if (snippet.length > CAP) {
+      const slice = snippet.slice(0, CAP);
+      const lastSpace = slice.lastIndexOf(" ");
+      snippet = (lastSpace > CAP - 50 ? slice.slice(0, lastSpace) : slice).trim();
+    }
+    return snippet;
+  };
+  const nearby = (re: RegExp, idx: number, len: number): boolean => {
+    const start = Math.max(0, idx - WINDOW);
+    const end = Math.min(text.length, idx + len + WINDOW);
+    return re.test(text.slice(start, end));
+  };
+
+  // Trigger A: a weekday name/abbreviation-range co-located with a time
+  // pattern OR the literal words "åpningstider"/"åpent".
+  const weekdayMatches = [
+    ...text.matchAll(OPENING_HOURS_WEEKDAY_RE),
+    ...text.matchAll(OPENING_HOURS_WEEKDAY_ABBR_RANGE_RE),
+  ].sort((a, b) => (a.index ?? 0) - (b.index ?? 0));
+  for (const m of weekdayMatches) {
+    if (m.index === undefined) continue;
+    if (nearby(OPENING_HOURS_TIME_RE, m.index, m[0].length) || nearby(/åpningstider|åpent/i, m.index, m[0].length)) {
+      return buildSnippet(m.index, m[0].length);
+    }
+  }
+
+  // Trigger B: "åpningstider"/"åpent" co-located with a time pattern (covers
+  // pages with no explicit weekday name).
+  for (const m of text.matchAll(OPENING_HOURS_WORDS_RE)) {
+    if (m.index === undefined) continue;
+    if (nearby(OPENING_HOURS_TIME_RE, m.index, m[0].length)) {
+      return buildSnippet(m.index, m[0].length);
+    }
+  }
+
+  return null;
+}
+
 // ─── homepage CONTENT → platform write helpers (PR-24a, 2026-06-16) ──────────
 //
 // PURE helpers that turn the raw extractor output (extractProductMentions /
