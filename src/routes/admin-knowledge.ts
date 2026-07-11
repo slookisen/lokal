@@ -1570,8 +1570,9 @@ export type TruncationClassification = "trailing" | "manual_review";
  * Classify a "�"-containing `agents.description` as either:
  *   - "trailing": the corruption is a SINGLE trailing run at the very end of
  *     the string — exactly the case safeMetaDescription()'s trailing-run
- *     regex (TRAILING_REPLACEMENT_CHAR_REGEX, imported from ./seo, NOT
- *     re-derived here) repairs safely. Safe to auto-apply.
+ *     regex (TRAILING_REPLACEMENT_CHAR_REGEX, imported from
+ *     ../utils/meta-description, NOT re-derived here) repairs safely. Safe to
+ *     auto-apply.
  *   - "manual_review": anything else — an interior occurrence (the trailing
  *     regex doesn't even match, because the last non-whitespace run isn't
  *     itself a "�" run), multiple occurrences (the trailing regex matches
