@@ -324,6 +324,7 @@ function shell(
   <link rel="apple-touch-icon" href="/logo-200.png">
   <link rel="manifest" href="/manifest.json">
   <meta name="theme-color" content="#2D5016">
+  <script>if('serviceWorker' in navigator&&!/finn-tannlege\.com|opplevagent\.no/.test(location.hostname)){window.addEventListener('load',function(){navigator.serviceWorker.register('/sw.js').catch(function(){});});}</script>
   <title>${escapeHtml(title)}</title>
   <meta name="description" content="${escapeHtml(description)}">
   <link rel="canonical" href="${canonicalUrl}">

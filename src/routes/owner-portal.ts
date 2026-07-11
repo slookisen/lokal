@@ -703,6 +703,7 @@ function portalShell(title: string, body: string): string {
   <meta name="robots" content="noindex,nofollow">
   <link rel="manifest" href="/manifest.json">
   <meta name="theme-color" content="#2D5016">
+  <script>if('serviceWorker' in navigator&&!/finn-tannlege\.com|opplevagent\.no/.test(location.hostname)){window.addEventListener('load',function(){navigator.serviceWorker.register('/sw.js').catch(function(){});});}</script>
   <title>${escapeHtml(title)} — Rett fra Bonden</title>
   <style>${PORTAL_PALETTE_CSS}</style>
 </head>

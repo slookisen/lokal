@@ -692,6 +692,7 @@ function chatShell(
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <link rel="manifest" href="/manifest.json">
   <meta name="theme-color" content="#2D5016">
+  <script>if('serviceWorker' in navigator&&!/finn-tannlege\.com|opplevagent\.no/.test(location.hostname)){window.addEventListener('load',function(){navigator.serviceWorker.register('/sw.js').catch(function(){});});}</script>
   <title>${escapeHtml(title)} — Rett fra Bonden</title>
   <meta name="description" content="${escapeHtml(description)}">
   ${robotsAndCanonical}

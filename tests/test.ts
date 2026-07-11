@@ -555,6 +555,50 @@ console.log("\n── manifest.json (PWA manifest, rfb) ──");
   console.log(`  manifest: ${r.passed} passed, ${r.failed} failed`);
 }
 
+// ── dev-request 2026-07-04-app-strategi-pwa, slice 2 of 3: service worker +
+// offline shell (rfb host only). Sync/source checks: sw.js parses, exports
+// the shouldBypass() guard (never intercepts /api/, /admin, non-GET, or
+// cross-origin requests), the guard runs before any caches.match(...), and
+// offline.html exists with the expected branded content. The HTTP-level
+// "actually served with 200" checks live in the async _pwaSwPromise block
+// below (awaited in the REPORT tail).
+console.log("\n── sw.js + offline.html (PWA service worker, rfb) ──");
+{
+  const { runServiceWorkerTests } = require("../src/public/sw.test") as
+    typeof import("../src/public/sw.test");
+  const r = runServiceWorkerTests({ log: false });
+  passed += r.passed;
+  failed += r.failed;
+  for (const f of r.failures) failures.push("sw: " + f);
+  console.log(`  sw: ${r.passed} passed, ${r.failed} failed`);
+}
+
+// dev-request 2026-07-04-app-strategi-pwa, slice 2 of 3 (HTTP half): spins a
+// minimal express.static server (same mount config as src/index.ts's rfb
+// static mount) on a random port and confirms /sw.js and /offline.html are
+// actually served with 200 — not just present on disk. No DB / shared
+// singleton involved, so (like PR-106's dentalLimiter smoke test) this needs
+// no upstream await; it just needs to be awaited itself in the REPORT tail
+// below before process.exit().
+let _pwaSwResolve: () => void = () => {};
+const _pwaSwPromise: Promise<void> = new Promise<void>((r) => { _pwaSwResolve = r; });
+(async () => {
+  try {
+    const { runServiceWorkerHttpTests } = require("../src/public/sw.test") as
+      typeof import("../src/public/sw.test");
+    const r = await runServiceWorkerHttpTests({ log: false });
+    passed += r.passed;
+    failed += r.failed;
+    for (const f of r.failures) failures.push("sw-http: " + f);
+    console.log(`  sw-http: ${r.passed} passed, ${r.failed} failed`);
+  } catch (err) {
+    failed++;
+    failures.push("sw-http: unexpected error: " + String(err));
+  } finally {
+    _pwaSwResolve();
+  }
+})();
+
 // ── dev-request 2026-07-04-opplevagent-naer-meg-geosok, item 3: /sok's
 // distance-sort toggle URL builder (pure — preserves q/tags/lat/lng/
 // radius_km/sted while adding or removing sort=distance).
@@ -20977,6 +21021,7 @@ console.log("\n── orch-pr-14: MCP discovery product_id surfacing ──");
   try { await _dispatchTickSuitePromise; } catch { /* errors already pushed to failures */ }
   try { await _samtalerSeoPromise; } catch { /* errors already pushed to failures */ }
   try { await _descriptionTruncationSweepPromise; } catch { /* errors already pushed to failures */ }
+  try { await _pwaSwPromise; } catch { /* errors already pushed to failures */ }
   // relax-envelope tests are synchronous (pure validateEnvelope() unit test) — no promise needed
   // PR-109 tests are synchronous (IIFE) — no promise needed
   // Drop pre-existing intg failures (unmasked by awaiting) — they predate M2
