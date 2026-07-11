@@ -560,6 +560,64 @@ export function runSearchEnrichTests(opts: { log?: boolean } = {}): TestSummary 
       meetsAboutQualityBar(realWithMenu),
       "quality (regression): real prose mentioning a food 'meny' still passes after round-2 additions"
     );
+
+    // ── round-2 fix-up (2026-07-11, review CHANGES-REQUESTED): signal 3's
+    // flat-menu-density check over-rejected genuine, grammatical, single-
+    // sentence Norwegian prose that (a) lists several proper-noun
+    // products/places — common Norwegian farm/dairy producer marketing — and
+    // (b) uses PASSIVE voice ("produseres"), which the old REAL_PROSE_SIGNAL_
+    // WORDS allowlist had zero coverage for (only active "selger" was
+    // present). Reviewer's exact reproduced failing example: ─────────────────
+    const reviewerPassiveProductList =
+      "Nordfjord Ost Sunnmøre Smør Stryn Rømme Geiranger Skyr Loen Youghurt Olden Kefir Briksdal Kremfløte og Hjørundfjord Cottage Cheese produseres her på garden hver eneste dag.";
+    assertTrue(
+      meetsAboutQualityBar(reviewerPassiveProductList),
+      "quality: passive-voice sentence with Title-Case product-name list passes (round-2 fix-up)"
+    );
+    // Close variant: different Title-Case product/place list, different
+    // passive verbs ("lages"/"selges" instead of "produseres") — confirms the
+    // fix is a general passive-voice/preposition signal, not overfit to the
+    // one exact reviewer string.
+    const passiveProductListVariant =
+      "Rørosost Fjellgeit Osterød Skinke Tydal Spekemat Selbu Rømmegrøt Aune Multer og Holtålen Tyttebær lages og selges her på garden hele året.";
+    assertTrue(
+      meetsAboutQualityBar(passiveProductListVariant),
+      "quality: passive-voice product list with different verbs still passes (round-2 fix-up)"
+    );
+    // Close variant: passive voice + preposition, but NOT a Title-Case product
+    // list (ordinary lowercase-heavy prose) — was already passing before the
+    // fix (capRatio never crossed 0.5), pinned here so the fix's word-list
+    // broadening doesn't regress the already-working case either.
+    const passiveNoProductList =
+      "Alle ostene på gården produseres for hånd av bonden selv hver eneste morgen før soloppgang med kjærlighet og omtanke fra hele familien.";
+    assertTrue(
+      meetsAboutQualityBar(passiveNoProductList),
+      "quality: passive-voice prose without a product-name list still passes (round-2 fix-up)"
+    );
+
+    // Regression: round-2's four original bad examples must STILL be rejected
+    // after the fix-up's REAL_PROSE_SIGNAL_WORDS broadening (none of them
+    // contain the newly-added passive verbs or "på"/"fra"/"med").
+    assertTrue(
+      !meetsAboutQualityBar(navFlatMenu),
+      "quality (regression): round-2 flat Title-Case nav bar still fails after fix-up"
+    );
+    assertTrue(
+      !meetsAboutQualityBar(navLangSwitchDup),
+      "quality (regression): round-2 lang-switcher/duplicated-tagline nav chrome still fails after fix-up"
+    );
+    assertTrue(
+      !meetsAboutQualityBar(navDuplicatedBreadcrumb),
+      "quality (regression): round-2 duplicated breadcrumb still fails after fix-up"
+    );
+    assertTrue(
+      !meetsAboutQualityBar(umbrellaAbout),
+      "quality (regression): round-2 umbrella-portal dense category listing still fails after fix-up"
+    );
+    assertTrue(
+      !meetsAboutQualityBar(umbrellaVisit),
+      "quality (regression): round-2 'våre medlemmer' collective-membership prose still fails after fix-up"
+    );
   }
 
   // ── orch-experiences-content-refresh: mapToExperienceCategories (PURE) ──────

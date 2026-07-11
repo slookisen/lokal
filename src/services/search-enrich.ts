@@ -1014,9 +1014,26 @@ const UMBRELLA_MEMBERSHIP_MARKERS: readonly string[] = [
 // together (optionally glued with "og"). Accent-stripped, lowercase, whole
 // tokens (not substrings — "vaare" must not match inside an unrelated longer
 // word). Used by isLikelyNavMenuLeakage's flat-menu-density signal below.
+//
+// round-2 fix-up (2026-07-11, review CHANGES-REQUESTED): the original list was
+// all ACTIVE-voice verbs/pronouns ("selger" but not "selges"), so it silently
+// over-rejected genuine single-sentence Norwegian producer copy that (a) opens
+// with a Title-Case list of branded regional products — common for Norwegian
+// farm/dairy marketing, e.g. "Nordfjord Ost Sunnmøre Smør ... produseres her på
+// garden hver eneste dag" — and (b) uses PASSIVE voice, which Norwegian
+// marketing/product copy uses constantly ("X produseres/lages/selges her").
+// Added the common passive-voice verb forms plus a few prepositions that are
+// near-universal in real sentences but don't independently glue a flat noun
+// list the way "og" does (deliberately still NOT adding "og" itself — nav
+// lists routinely use it exactly as a glue word, see comment above; and
+// deliberately not adding "til"/"i" for the same over-broad-glue-word reason).
 const REAL_PROSE_SIGNAL_WORDS: ReadonlySet<string> = new Set([
   "vi", "du", "deg", "var", "vare", "er", "har", "tilbyr", "finner",
   "ligger", "kan", "selger", "byr", "velkommen",
+  // passive-voice verb forms (round-2 fix-up)
+  "produseres", "lages", "selges", "dyrkes", "hostes", "serveres", "finnes",
+  // common prepositions that are near-universal in real sentences (round-2 fix-up)
+  "pa", "fra", "med",
 ]);
 
 /**
@@ -1046,10 +1063,15 @@ const REAL_PROSE_SIGNAL_WORDS: ReadonlySet<string> = new Set([
  *      Ølet Omvisning Nyheter Kontakt Merch") or interrupted only by a stray
  *      language-switcher token ("no en"). Structural signal: at least half the
  *      alphabetic tokens are Title-Case, at most one sentence-ending mark, AND
- *      none of REAL_PROSE_SIGNAL_WORDS (a finite verb or personal pronoun) is
- *      present — genuine prose almost always has at least one, a flat noun
- *      list never does. Requires ≥8 alphabetic tokens so short strings can't
- *      trip it.
+ *      none of REAL_PROSE_SIGNAL_WORDS (a finite/passive verb, preposition, or
+ *      personal pronoun) is present — genuine prose almost always has at least
+ *      one, a flat noun list never does. This deliberately covers passive-voice
+ *      product copy too (round-2 fix-up, 2026-07-11): a single grammatical
+ *      sentence that opens with a Title-Case list of branded regional products
+ *      — common Norwegian farm/dairy marketing, e.g. "Nordfjord Ost Sunnmøre
+ *      Smør ... produseres her på garden hver eneste dag" — is real prose, not
+ *      nav-menu leakage, even though most of its tokens are proper nouns.
+ *      Requires ≥8 alphabetic tokens so short strings can't trip it.
  *   4. A literal repeated phrase — a ≥24-char chunk of the text that recurs
  *      verbatim later in the same string, e.g. a breadcrumb/tagline the
  *      scraper duplicated ("besøk | Ekeby Gårdsbryggeri besøk | Ekeby
