@@ -83,28 +83,37 @@ export function runExperienceDedupTests(opts: { log?: boolean } = {}): Promise<T
     assertEq(levenshtein("same", "same"), 0, "2b: identical strings -> distance 0");
 
     // ── 3. titlesMatch: confirmed real prod duplicate (Kon-Tiki Museet), wildly different wording ──
+    // corpus where 'heyerdahl' is rare (few distinct providers) — mirrors
+    // experience-dedup-audit.test.ts's rareCorpus/kontiki fixture (~line 167-181).
     assertTrue(
       titlesMatch(
         "Kon-Tiki Museet — Heyerdahl's Legendary Pacific Raft…",
-        "…Thor Heyerdahl Expedition Museum at Bygdøy Oslo"
+        "…Thor Heyerdahl Expedition Museum at Bygdøy Oslo",
+        new Map([["heyerdahl", 2]])
       ),
-      "3a: Kon-Tiki / Thor Heyerdahl Expedition Museum — same real thing, shares distinctive token 'heyerdahl'"
+      "3a: Kon-Tiki / Thor Heyerdahl Expedition Museum — same real thing, shares distinctive RARE token 'heyerdahl'"
     );
 
     // Near-duplicate re-harvest of the exact same source (minor rewording/typo) —
-    // whole-string closeness path, no single 5+ char shared token required.
+    // whole-string closeness path, no single 5+ char shared token required
+    // ("tour"/"tur"/"kok"/"oslo"/"food" are all under 5 chars), so the corpus
+    // is never consulted — empty Map is fine.
     assertTrue(
-      titlesMatch("KOK Oslo Food Tour", "KOK Oslo Food Tur"), // "Tour" vs "Tur" typo
+      titlesMatch("KOK Oslo Food Tour", "KOK Oslo Food Tur", new Map()), // "Tour" vs "Tur" typo
       "3b: near-identical re-harvest wording matches via whole-string similarity"
     );
 
     // ── 4. titlesMatch: two genuinely different experiences from the same provider must NOT match ──
+    // Neither pair shares a >=5-char significant token ("fjelltur"/"floyen"
+    // vs "kajakkpadling"/"bergen"/"havn"; "klatrekurs"/"nybegynnere" vs
+    // "bursdagsfeiring"/"klatreparken"), so both fall through to the
+    // whole-string path regardless of corpus contents — empty Map is fine.
     assertTrue(
-      !titlesMatch("Guidet fjelltur til Fløyen", "Kajakkpadling i Bergen havn"),
+      !titlesMatch("Guidet fjelltur til Fløyen", "Kajakkpadling i Bergen havn", new Map()),
       "4a: two unrelated activities from the same provider/kommune do not match"
     );
     assertTrue(
-      !titlesMatch("Klatrekurs for nybegynnere", "Bursdagsfeiring i klatreparken"),
+      !titlesMatch("Klatrekurs for nybegynnere", "Bursdagsfeiring i klatreparken", new Map()),
       "4b: beginner climbing course vs. birthday party at the same climbing park do not match"
     );
 
@@ -162,7 +171,10 @@ export function runExperienceDedupTests(opts: { log?: boolean } = {}): Promise<T
       row({ id: "5", title: "Astrup Fearnley Museum of Modern Art" }),
       row({ id: "6", title: "Helt urelatert aktivitet uten faellestrekk" }),
     ];
-    const groups7 = groupDuplicateCandidates(rows7);
+    // Empty corpus: every shared significant token counts as absent (count 0,
+    // maximally rare), which mirrors this test's pre-corpus-rarity intent —
+    // clustering behavior, not corpus-rarity semantics, is what's under test.
+    const groups7 = groupDuplicateCandidates(rows7, new Map());
     assertEq(groups7.length, 2, "7a: two duplicate groups found (Kon-Tiki x3, Astrup Fearnley x2)");
     const kontikiGroup = groups7.find((g) => g.some((r) => r.id === "1"));
     assertEq(
@@ -182,7 +194,7 @@ export function runExperienceDedupTests(opts: { log?: boolean } = {}): Promise<T
       row({ id: "p1", provider_id: "provider-A", org_nr: "999888777", title: "RIB-safari i Oslofjorden" }),
       row({ id: "p2", provider_id: "provider-B", org_nr: "999888777", title: "RIB safari Oslofjorden" }),
     ];
-    const groups8 = groupDuplicateCandidates(rows8);
+    const groups8 = groupDuplicateCandidates(rows8, new Map());
     assertEq(groups8.length, 1, "8a: two different provider_id rows sharing org_nr still bucket together");
     assertEq(groups8[0]?.map((r) => r.id).sort(), ["p1", "p2"], "8b: both rows are in the one group");
 
@@ -191,12 +203,61 @@ export function runExperienceDedupTests(opts: { log?: boolean } = {}): Promise<T
       row({ id: "n1", provider_id: null, org_nr: null, title: "Samme opplevelse" }),
       row({ id: "n2", provider_id: null, org_nr: null, title: "Samme opplevelse" }),
     ];
-    assertEq(groupDuplicateCandidates(rows9).length, 0, "9a: rows with no provider anchor never bucket together");
+    assertEq(groupDuplicateCandidates(rows9, new Map()).length, 0, "9a: rows with no provider anchor never bucket together");
     const rows9b: DedupCandidateRow[] = [
       row({ id: "k1", kommune: "Oslo", title: "Klatrekurs for nybegynnere" }),
       row({ id: "k2", kommune: "Bergen", title: "Klatrekurs for nybegynnere" }),
     ];
-    assertEq(groupDuplicateCandidates(rows9b).length, 0, "9b: identical title but different kommune -> not a duplicate group");
+    assertEq(groupDuplicateCandidates(rows9b, new Map()).length, 0, "9b: identical title but different kommune -> not a duplicate group");
+
+    // ── 9b (corpus-rarity regression). titlesMatch: shared GENERIC token alone
+    //        must NOT match; shared RARE token still must — dev-request
+    //        2026-07-11-dedup-false-positive-remediation, slice C. Reproduces
+    //        the exact false-positive pairs from the prod failure report,
+    //        using ONE shared corpus (mirrors experience-dedup-audit.test.ts's
+    //        commonCorpus/rareCorpus fixtures, ~line 126-173, same numbers). ──
+    const commonCorpus = new Map<string, number>([
+      ["fjelltur", 12],
+      ["brevandring", 9],
+      ["rafting", 8],
+      ["klatring", 11],
+      ["galdhopiggen", 2],
+      ["snohetta", 1],
+      ["nigardsbreen", 2],
+      ["briksdalsbreen", 2],
+      ["sjoa", 1], // rare in the corpus, but only 4 chars — must NOT count as a rare-token link
+      ["dagstur", 3],
+      ["kveldstur", 2],
+      ["barn", 4],
+      ["voksne", 3],
+      ["heyerdahl", 2],
+      ["kontiki", 2],
+    ]);
+
+    assertTrue(
+      !titlesMatch("Fjelltur til Galdhøpiggen", "Fjelltur til Snøhetta", commonCorpus),
+      "9b-1: Galdhøpiggen vs Snøhetta — two different mountains sharing only the generic 'fjelltur' must NOT match"
+    );
+    assertTrue(
+      !titlesMatch("Brevandring på Nigardsbreen", "Brevandring på Briksdalsbreen", commonCorpus),
+      "9b-2: Nigardsbreen vs Briksdalsbreen — two different glaciers sharing only the generic 'brevandring' must NOT match"
+    );
+    assertTrue(
+      !titlesMatch("Rafting i Sjoa - dagstur", "Rafting i Sjoa - kveldstur", commonCorpus),
+      "9b-3: Sjoa dagstur vs kveldstur — day/evening tours sharing only the generic 'rafting' must NOT match"
+    );
+    assertTrue(
+      !titlesMatch("Klatring for barn", "Klatring for voksne", commonCorpus),
+      "9b-4: Klatring for barn vs voksne — different audiences sharing only the generic 'klatring' must NOT match"
+    );
+    assertTrue(
+      titlesMatch(
+        "Kon-Tiki Museet — Heyerdahl's Legendary Pacific Raft",
+        "Thor Heyerdahl Expedition Museum at Bygdøy Oslo",
+        commonCorpus
+      ),
+      "9b-5: Kon-Tiki / Thor Heyerdahl — no regression: the SAME corpus still matches via the RARE token 'heyerdahl'"
+    );
 
     // ── 10. runDedupPass + idempotency + re-harvest guard + discover-query invariant,
     //        against a real in-memory experiences DB ──

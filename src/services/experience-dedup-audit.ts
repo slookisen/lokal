@@ -34,7 +34,21 @@
 // rule itself is a separate slice of the dev-request.
 
 import type Database from "better-sqlite3";
-import { levenshtein, normalizeExperienceTitle, titleTokens } from "./experience-dedup";
+import {
+  levenshtein,
+  normalizeExperienceTitle,
+  titleTokens,
+  buildProviderCorpusTokenCounts,
+} from "./experience-dedup";
+
+// buildCorpusTokenCounts/buildProviderCorpusTokenCounts now live in
+// experience-dedup.ts (titlesMatch() needs buildProviderCorpusTokenCounts for
+// its own corpus-rarity gate — dev-request 2026-07-11-dedup-false-positive-
+// remediation, slice C — and importing them back from here would create a
+// circular import). Re-exported below so this module's public import surface
+// (and experience-dedup-audit.test.ts's `from "./experience-dedup-audit"`
+// import) is unchanged.
+export { buildCorpusTokenCounts, buildProviderCorpusTokenCounts } from "./experience-dedup";
 
 // Mirrors SIGNIFICANT_TOKEN_MIN_LEN in experience-dedup.ts (not exported
 // there): a shared token must be at least this long to count as evidence.
@@ -125,60 +139,6 @@ export function classifyMergedPair(
   else via = "no-signal";
 
   return { via, sharedTokens, levSim };
-}
-
-/**
- * Corpus token frequencies: how many DISTINCT titles each significant token
- * appears in (a token repeated within one title counts once). Stopwords and
- * short tokens never appear (titleTokens() drops them).
- *
- * NOTE: the audit path no longer uses this (title counts are inflated by the
- * duplicate clones themselves — see the audit-v2 header note) but the
- * contract is still valid for corpora without per-entity cloning; kept
- * exported for those callers.
- */
-export function buildCorpusTokenCounts(titles: string[]): Map<string, number> {
-  const counts = new Map<string, number>();
-  for (const title of titles) {
-    for (const token of new Set(titleTokens(title))) {
-      counts.set(token, (counts.get(token) ?? 0) + 1);
-    }
-  }
-  return counts;
-}
-
-/**
- * Audit-v2 corpus token frequencies: how many DISTINCT PROVIDERS use each
- * significant token in any of their titles (merged or not). A provider with
- * 16 clone titles of one museum contributes exactly 1 to each of that
- * museum's tokens, so heavily-duplicated entities can't inflate their own
- * proper nouns into looking "generic". A NULL provider_id row counts as its
- * own singleton pseudo-provider (per-row fallback key) — orphan rows don't
- * collapse into one shared bucket. Residual (review round 3): heavy orphan
- * cloning of ONE entity can therefore still push its tokens generic — that
- * residual errs only toward OVER-flagging into the human-gated review list,
- * never toward trusting a false merge (merged groups themselves always have
- * providers; orphans affect corpus counts only). Token extraction is
- * identical to titleTokens() (a token counts once per provider, not per title).
- */
-export function buildProviderCorpusTokenCounts(
-  rows: Array<{ title: string; provider_id: string | null }>
-): Map<string, number> {
-  const providersByToken = new Map<string, Set<string>>();
-  let orphanSeq = 0;
-  for (const row of rows) {
-    const providerKey = row.provider_id ?? `__orphan-row-${orphanSeq++}`;
-    for (const token of new Set(titleTokens(row.title))) {
-      const set = providersByToken.get(token);
-      if (set) set.add(providerKey);
-      else providersByToken.set(token, new Set([providerKey]));
-    }
-  }
-  const counts = new Map<string, number>();
-  for (const [token, providers] of providersByToken) {
-    counts.set(token, providers.size);
-  }
-  return counts;
 }
 
 const VIA_RANK: Record<MergedPairVia, number> = {
