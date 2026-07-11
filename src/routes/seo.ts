@@ -64,17 +64,22 @@ function escapeHtml(text: string): string {
 // any dangling partial word left behind) so a corrupted DB value never reaches
 // a live meta tag, no matter how it got corrupted. Leading/interior "�" runs
 // are also collapsed defensively, though the reported bug was trailing-only.
-function safeMetaDescription(text: string | null | undefined): string {
-  if (!text) return "";
-  let s = String(text);
-  if (!s.includes("�")) return s;
-  // Drop a trailing replacement-char run plus the (now-broken) word fragment
-  // it's attached to, so we don't end the tag mid-word either.
-  s = s.replace(/\S*�+\s*$/u, "").trimEnd();
-  // Any remaining "�" (leading/interior) — collapse rather than ship it raw.
-  s = s.replace(/�+/gu, "").replace(/\s{2,}/g, " ").trim();
-  return s;
-}
+//
+// dev-request 2026-07-01-cs-corrections-profile-quality item C (catalog-wide
+// truncation sweep): exported so the admin cleanup endpoint in
+// admin-knowledge.ts can reuse this EXACT repair logic as the one-time DB
+// backfill for rows already corrupted before this render-time guard (and the
+// write-time gate) existed. Do not duplicate this logic elsewhere — import it.
+//
+// dev-request 2026-07-11 truncation-sweep fix-up: the trailing-run regex is
+// also exported on its own (TRAILING_REPLACEMENT_CHAR_REGEX). Both helpers now
+// live in the dependency-free ../utils/meta-description module (extracted so
+// admin-knowledge.ts's sweep can reuse them WITHOUT importing this heavyweight
+// route module — see that file's header for the isolated-CI-hang it fixed).
+// Imported for internal use below AND re-exported so existing importers of
+// `./seo` keep their API unchanged.
+import { safeMetaDescription, TRAILING_REPLACEMENT_CHAR_REGEX } from "../utils/meta-description";
+export { safeMetaDescription, TRAILING_REPLACEMENT_CHAR_REGEX };
 
 const BASE_URL = process.env.BASE_URL || "https://rettfrabonden.com";
 
