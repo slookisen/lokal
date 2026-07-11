@@ -399,6 +399,24 @@ export function runExperienceDedupAuditTests(opts: { log?: boolean } = {}): Prom
         assertEq(canonicalIdOf(idFjellSuspect), idFjellCanonical, "4g: dry run wrote NOTHING (canonical_id unchanged)");
         assertEq(mergedFromOf(idFjellCanonical), JSON.stringify([idFjellSuspect]), "4h: dry run wrote NOTHING (merged_from unchanged)");
 
+        // STRICT-FALSE parse (review blocker, round 2): writes execute ONLY on
+        // the JSON boolean false. null (how many JSON clients serialize an
+        // UNSET optional boolean), the string "false", and 0 must all mean
+        // dry run — never live un-merges.
+        for (const [label, val] of [["null", null], ["string-false", "false"], ["zero", 0]] as const) {
+          const strict = await callRoute(opplevelserRouter, "POST", "/admin/experiences-dedup-unmerge", {
+            headers: adminHeaders,
+            body: { ids: [idFjellSuspect], dry_run: val },
+          });
+          assertEq(strict.status, 200, `4h-strict(${label}): → 200`);
+          assertEq(strict.body.dry_run, true, `4h-strict(${label}): dry_run ${label} → treated as DRY RUN`);
+          assertEq(
+            canonicalIdOf(idFjellSuspect),
+            idFjellCanonical,
+            `4h-strict(${label}): wrote NOTHING (canonical_id unchanged)`
+          );
+        }
+
         // Before the real run: the merged row is invisible through the
         // PUBLISH_GATE-gated discover path.
         const before = expStore.discoverExperiences({ fylke: "Oslo" }, 100);

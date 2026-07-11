@@ -1067,6 +1067,14 @@ router.get("/admin/experiences-dedup-audit", requireAdmin, (req: Request, res: R
 
   res.json({
     success: true,
+    // Review caveat for the human reading this JSON: 'suspect' means REVIEW ME,
+    // not certainly-false. The audit's whole-string bar (0.85) is deliberately
+    // stricter than the matcher that made the merges (0.6), so a genuine
+    // duplicate in the 0.6-0.85 band with only generic shared tokens can be
+    // flagged. Inspect both titles + shared_tokens/corpus counts before
+    // un-merging; a wrongly-un-merged true duplicate is a cosmetic resurfaced
+    // listing, a false merge left in place hides a distinct bookable product.
+    note: "suspect = review-me, NOT certainly-false — inspect titles/tokens before un-merging; re-audit after each un-merge batch (sibling links recompute)",
     summary,
     groups_returned: Math.min(suspectGroups.length, AUDIT_RESPONSE_GROUP_CAP),
     groups_truncated: suspectGroups.length > AUDIT_RESPONSE_GROUP_CAP,
@@ -1083,6 +1091,11 @@ router.get("/admin/experiences-dedup-audit", requireAdmin, (req: Request, res: R
 // canonical_id on the listed rows and removes them from their canonical row's
 // merged_from JSON array (NULL when the list empties), mirroring exactly the
 // format runDedupPass() writes. The whole real run is one transaction.
+// SEQUENCING CONSTRAINT (review note 1): titlesMatch() is deliberately untouched by this
+// slice, so every un-merged false positive is STILL a titlesMatch() match — re-running
+// POST /admin/experiences-dedup-backfill (or any runDedupPass invocation) will RE-MERGE
+// everything this endpoint un-merges. Do NOT re-run the backfill until the titlesMatch
+// corroboration fix (dev-request 2026-07-11 slice C) is live.
 router.post("/admin/experiences-dedup-unmerge", requireAdmin, (req: Request, res: Response) => {
   const body = (req.body ?? {}) as { ids?: unknown; dry_run?: unknown };
   if (!Array.isArray(body.ids) || body.ids.length === 0) {
@@ -1090,7 +1103,11 @@ router.post("/admin/experiences-dedup-unmerge", requireAdmin, (req: Request, res
     return;
   }
   const ids = body.ids.map(String);
-  const dryRun = body.dry_run === undefined ? true : Boolean(body.dry_run);
+  // STRICT-FALSE parse (review blocker, PR round 2): writes execute ONLY on the JSON
+  // boolean false. null / "false" / 0 / "" / undefined all mean dry run — many JSON
+  // clients serialize an unset optional boolean as null, and a caller who left dry_run
+  // unset must get the documented dry-run default, never live un-merges.
+  const dryRun = body.dry_run !== false;
 
   const db = getExpDb("experiences");
   const getRow = db.prepare("SELECT id, canonical_id FROM experiences WHERE id = ?");

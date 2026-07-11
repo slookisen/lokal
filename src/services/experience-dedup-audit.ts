@@ -250,4 +250,10 @@ export function auditMergedGroups(db: Database.Database, opts: ClassifyOptions =
       groups_with_suspects: groupsWithSuspects,
     },
   };
-}
+}// OPERATOR NOTE (review round 2): a row X can be kept non-suspect by a
+// whole-string link to a sibling Y that is itself suspect; after Y is
+// un-merged the next audit recomputes sibling links and may then flag X.
+// The workflow is therefore iterative and self-healing: audit -> un-merge
+// batch -> RE-AUDIT, until no new suspects appear.
+
+
