@@ -1067,6 +1067,23 @@ function initSchema(db: Database.Database): void {
     }
   }
 
+  // ─── dev-request 2026-07-12-rfb-enrichment-pool-refill-and-waste-reduction ──
+  // homepage_fetch_attempts: consecutive homepage-provenance-batch fetch
+  //   failures for this agent (any successful fetch resets it to 0).
+  // homepage_unreachable_since: set when attempts reaches 3 — parks the agent
+  //   out of the batch auto-select until 30 days have passed, so each run
+  //   stops re-fetching the same dead/aggregator URLs.
+  for (const stmt of [
+    `ALTER TABLE agent_knowledge ADD COLUMN homepage_fetch_attempts INTEGER NOT NULL DEFAULT 0`,
+    `ALTER TABLE agent_knowledge ADD COLUMN homepage_unreachable_since TEXT`,
+  ]) {
+    try {
+      db.exec(stmt);
+    } catch {
+      // Column already exists — expected after first migration
+    }
+  }
+
   // outreach_sent_log — Phase 5 ledger of WHAT we have actually sent
   // through the verify-first pipeline. Empty initially; the WO #9
   // marketing-pool-switch will start writing rows here. CRM threads

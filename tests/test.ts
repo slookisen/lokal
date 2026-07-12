@@ -21493,6 +21493,7 @@ console.log("\n── orch-pr-14: MCP discovery product_id surfacing ──");
   try { await _brregDescriptionFallbackPromise; } catch { /* errors already pushed to failures */ }
   try { await _retentionRollupPromise; } catch { /* errors already pushed to failures */ }
   try { await _pageEvidenceCrawlPromise; } catch { /* errors already pushed to failures */ }
+  try { await _homepageSelectorParkingPromise; } catch { /* errors already pushed to failures */ }
   // relax-envelope tests are synchronous (pure validateEnvelope() unit test) — no promise needed
   // PR-109 tests are synchronous (IIFE) — no promise needed
   // Drop pre-existing intg failures (unmasked by awaiting) — they predate M2
@@ -26859,6 +26860,43 @@ const _pageEvidenceCrawlPromise: Promise<void> = new Promise<void>(r => {
     failures.push("page-evidence-crawl: unexpected error: " + String(err?.message || err));
   } finally {
     _pageEvidenceCrawlResolve();
+  }
+})();
+
+// ═══════════════════════════════════════════════════════════════════════
+// dev-request 2026-07-12-rfb-enrichment-pool-refill-and-waste-reduction:
+// POST /admin/homepage-provenance-batch (src/routes/marketplace.ts) —
+// select:"verified_no_email" selector mode + dead-cohort parking with 30d
+// backoff (homepage_fetch_attempts / homepage_unreachable_since columns,
+// HOMEPAGE_PARKING_DISABLED rollback flag, parked_now in the response).
+// Swaps the shared getDb() singleton (own dedicated test file, in-memory
+// prod-schema DB) and busts the marketplace.ts require cache, so —
+// mirroring the retention-rollup block above — it must run strictly after
+// every other singleton-swapping block; _pageEvidenceCrawlPromise is the
+// current tail of that serial chain.
+let _homepageSelectorParkingResolve: () => void = () => {};
+const _homepageSelectorParkingPromise: Promise<void> = new Promise<void>(r => {
+  _homepageSelectorParkingResolve = r;
+});
+
+(async () => {
+  await Promise.allSettled([_pageEvidenceCrawlPromise]);
+  await new Promise(r => setImmediate(r));
+
+  console.log("\n── dev-request 2026-07-12: homepage-provenance selector + parking ──");
+  try {
+    const { runHomepageProvenanceSelectorParkingTests } = require("../src/routes/homepage-provenance-selector-parking.test") as
+      typeof import("../src/routes/homepage-provenance-selector-parking.test");
+    const sp = await runHomepageProvenanceSelectorParkingTests({ log: false });
+    passed += sp.passed;
+    failed += sp.failed;
+    for (const f of sp.failures) failures.push("homepage-selector-parking: " + f);
+    console.log(`  homepage-selector-parking: ${sp.passed} passed, ${sp.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("homepage-selector-parking: unexpected error: " + String(err?.message || err));
+  } finally {
+    _homepageSelectorParkingResolve();
   }
 })();
 
