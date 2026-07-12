@@ -87,6 +87,12 @@ export const ExperienceSchema = z.object({
   provider_id: z.string().optional().nullable(),
   provider_match_status: z.enum(["unmatched", "matched", "ambiguous"]).optional(),
   title: z.string().min(1),
+  // Norwegian display title (dev-request 2026-07-04-opplevagent-dedup-og-
+  // norske-titler, item 2): LLM-generated natural Norwegian title, backfilled
+  // via POST /admin/experiences-title-no-backfill (routes/opplevelser.ts) —
+  // never set by createExperience(). NULL means "not backfilled yet"; every
+  // render path falls back to `title` when NULL.
+  title_no: z.string().optional().nullable(),
   slug: z.string().optional().nullable(),
   description: z.string().optional().nullable(),
   category: z.string().optional().nullable(),
@@ -198,6 +204,7 @@ function hydrateExperience(row: Record<string, unknown>): Experience & { id: str
     provider_id: (row.provider_id as string | null) ?? null,
     provider_match_status: (row.provider_match_status as Experience["provider_match_status"]) ?? "unmatched",
     title: row.title as string,
+    title_no: (row.title_no as string | null) ?? null,
     slug: (row.slug as string | null) ?? null,
     description: (row.description as string | null) ?? null,
     category: (row.category as string | null) ?? null,
@@ -448,6 +455,10 @@ export function getRelatedPublishedExperiences(
 export type ExperienceCardRow = {
   slug: string;
   title: string;
+  // Norwegian display title (dev-request 2026-07-04-opplevagent-dedup-og-
+  // norske-titler, item 2) — NULL until backfilled; render paths fall back
+  // to `title` when NULL. See ExperienceSchema's title_no field for detail.
+  title_no: string | null;
   description: string | null;
   category: string | null;
   fylke: string | null;
@@ -465,7 +476,7 @@ export type ExperienceCardRow = {
 };
 
 const CARD_COLS =
-  "e.slug AS slug, e.title AS title, e.description AS description, " +
+  "e.slug AS slug, e.title AS title, e.title_no AS title_no, e.description AS description, " +
   "e.category AS category, e.fylke AS fylke, e.kommune AS kommune, " +
   "e.indoor_outdoor AS indoor_outdoor, e.duration_min AS duration_min, " +
   "e.price_from AS price_from, e.price_band AS price_band, e.confidence AS confidence, " +
@@ -483,6 +494,7 @@ function hydrateCardRow(row: Record<string, unknown>): ExperienceCardRow {
   return {
     slug: row.slug as string,
     title: row.title as string,
+    title_no: (row.title_no as string | null) ?? null,
     description: (row.description as string | null) ?? null,
     category: (row.category as string | null) ?? null,
     fylke: (row.fylke as string | null) ?? null,

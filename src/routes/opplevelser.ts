@@ -1415,4 +1415,154 @@ router.post("/admin/experiences-dedup-unmerge", requireAdmin, (req: Request, res
   });
 });
 
+// ─── POST /api/opplevelser/admin/experiences-title-no-backfill ────────────
+// dev-request 2026-07-04-opplevagent-dedup-og-norske-titler, item 2 —
+// Norwegian display titles. Narrowest first slice: an admin-triggerable
+// backfill that asks Claude for a natural Norwegian display title per
+// CANONICAL experience row (canonical_id IS NULL) — merged-away duplicates
+// never need their own title_no, every render path resolves through the
+// canonical row (see experience-store.ts / experiences-seo.ts).
+//
+// NEVER FABRICATE: on missing ANTHROPIC_API_KEY, HTTP failure, or an
+// unparseable response for a given row, that row is SKIPPED (title_no stays
+// NULL) — never guessed, never a pattern-transform fallback. Titles are too
+// varied (already-Norwegian, mixed, hybrid) for a blind "Aktivitet i Sted —
+// Tilbyder" pattern to be a safe real fallback; NULL + render-time fallback
+// to the original `title` (experience-store.ts hydration / experiences-
+// seo.ts renderCard()+detail <h1>) is the safe default.
+//
+// dry_run DEFAULTS TO TRUE (STRICT-FALSE parse, same idiom as
+// /admin/experiences-dedup-unmerge above) — the caller must pass
+// `dry_run: false` explicitly to write. A dry run never writes and only
+// samples a FEW candidates for a useful preview (TITLE_NO_DRY_RUN_SAMPLE) —
+// on an empty candidate set it makes zero LLM calls, so it never requires
+// ANTHROPIC_API_KEY or a working LLM call to succeed.
+//
+// TITLE_NO_BATCH_CAP bounds LLM spend per HTTP call so a single admin
+// trigger can't runaway-spend against the LLM API — repeated calls drain the
+// remaining title_no IS NULL backlog, same operational shape as
+// /admin/experiences-dedup-backfill above.
+const TITLE_NO_BATCH_CAP = 20;
+const TITLE_NO_DRY_RUN_SAMPLE = 5;
+
+type TitleNoCandidate = {
+  id: string;
+  title: string;
+  category: string | null;
+  kommune: string | null;
+  fylke: string | null;
+};
+
+// Calls the Anthropic API the same way ClaudeVisionProvider.analyze() does
+// (src/services/vision-provider.ts) — sync fetch to
+// https://api.anthropic.com/v1/messages, ANTHROPIC_API_KEY from env,
+// x-api-key/anthropic-version headers. One row per call. Returns null (never
+// throws) on any failure so the caller can skip-not-fabricate.
+async function generateTitleNo(candidate: TitleNoCandidate): Promise<string | null> {
+  const apiKey = process.env.ANTHROPIC_API_KEY;
+  if (!apiKey) return null;
+
+  const place = [candidate.kommune, candidate.fylke].filter(Boolean).join(", ");
+  const prompt = `Gi en naturlig norsk visningstittel for denne opplevelsen (kort, ingen anførselstegn, ingen annen tekst).
+
+Tittel: ${candidate.title}
+Kategori: ${candidate.category || "ukjent"}
+Sted: ${place || "ukjent"}`;
+
+  let response: Awaited<ReturnType<typeof fetch>>;
+  try {
+    response = await fetch("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "x-api-key": apiKey,
+        "anthropic-version": "2023-06-01",
+      },
+      body: JSON.stringify({
+        model: "claude-opus-4-8",
+        max_tokens: 200,
+        messages: [{ role: "user", content: prompt }],
+      }),
+    });
+  } catch {
+    return null; // network/fetch failure — never fabricate
+  }
+
+  if (!response.ok) return null;
+
+  let result: any;
+  try {
+    result = await response.json();
+  } catch {
+    return null; // unparseable JSON body — never fabricate
+  }
+
+  const text = result?.content?.find((c: any) => c?.type === "text")?.text;
+  if (typeof text !== "string") return null;
+  const cleaned = text.trim().replace(/^["'«]+|["'»]+$/g, "").trim();
+  return cleaned.length > 0 ? cleaned : null;
+}
+
+router.post("/admin/experiences-title-no-backfill", requireAdmin, async (req: Request, res: Response) => {
+  const body = (req.body ?? {}) as { dry_run?: unknown };
+  // STRICT-FALSE parse (same idiom as /admin/experiences-dedup-unmerge above):
+  // writes execute ONLY on the JSON boolean false. null / "false" / 0 / "" /
+  // undefined all mean dry run.
+  const dryRun = body.dry_run !== false;
+
+  const db = getExpDb("experiences");
+  const candidateRows = db
+    .prepare(
+      `SELECT id, title, category, kommune, fylke FROM experiences
+       WHERE canonical_id IS NULL AND title_no IS NULL
+       ORDER BY id`
+    )
+    .all() as TitleNoCandidate[];
+
+  if (dryRun) {
+    const sample = candidateRows.slice(0, TITLE_NO_DRY_RUN_SAMPLE);
+    const proposals: Array<{ id: string; title: string; proposed_title_no: string | null }> = [];
+    for (const row of sample) {
+      const proposed = await generateTitleNo(row);
+      proposals.push({ id: row.id, title: row.title, proposed_title_no: proposed });
+    }
+    res.json({
+      success: true,
+      dry_run: true,
+      candidates: candidateRows.length,
+      sample: proposals,
+    });
+    return;
+  }
+
+  const batch = candidateRows.slice(0, TITLE_NO_BATCH_CAP);
+  const generated: Array<{ id: string; title_no: string | null }> = [];
+  for (const row of batch) {
+    generated.push({ id: row.id, title_no: await generateTitleNo(row) });
+  }
+
+  const setTitleNo = db.prepare(
+    "UPDATE experiences SET title_no = ?, updated_at = datetime('now') WHERE id = ?"
+  );
+  const tx = db.transaction(() => {
+    for (const r of generated) {
+      if (r.title_no) setTitleNo.run(r.title_no, r.id);
+    }
+  });
+  tx();
+
+  const written = generated.filter((r) => r.title_no).length;
+  const skippedCount = generated.length - written;
+
+  res.json({
+    success: true,
+    dry_run: false,
+    candidates: candidateRows.length,
+    processed: generated.length,
+    written,
+    skipped: skippedCount,
+    remaining: Math.max(0, candidateRows.length - generated.length),
+  });
+});
+
 export default router;

@@ -15708,6 +15708,273 @@ const _orchPrDedupBackfillEndpointPromise: Promise<void> = new Promise<void>((r)
   }
 })();
 
+// ── orch-pr-titleno: POST /api/opplevelser/admin/experiences-title-no-backfill ──
+// dev-request 2026-07-04-opplevagent-dedup-og-norske-titler, item 2 (Norwegian
+// display titles), narrowest first slice. Mirrors the dedup-backfill test
+// immediately above: real router mounted on a minimal Express app, real HTTP
+// round-trip against an in-memory experiences.db. Covers: (1) schema
+// idempotency (title_no column present + double-init of the schema doesn't
+// throw), (2) requireAdmin gate (missing/wrong X-Admin-Key → the ACTUAL status
+// code requireAdmin uses, which is 403, not 401 — see routes/opplevelser.ts's
+// requireAdmin()), (3) dry_run default with ZERO candidates never requires the
+// LLM to succeed (no ANTHROPIC_API_KEY needed), (4) a stubbed successful
+// globalThis.fetch response writes title_no on a real run (dry_run: false),
+// (5) a stubbed failed/unparseable response leaves title_no NULL — never
+// fabricated — and never throws.
+console.log("\n── orch-pr-titleno: POST /api/opplevelser/admin/experiences-title-no-backfill ──");
+
+let _titleNoBackfillResolve: () => void = () => {};
+const _titleNoBackfillPromise: Promise<void> = new Promise<void>((r) => {
+  _titleNoBackfillResolve = r;
+});
+
+(async () => {
+  // Run after the dedup-backfill test above, which also swaps the
+  // experiences db-factory singleton (its own promise already awaits
+  // everything upstream of it).
+  try { await _orchPrDedupBackfillEndpointPromise; } catch { /* upstream */ }
+
+  const prevPathTNB = process.env.EXPERIENCES_DB_PATH;
+  const prevAdminKeyTNB = process.env.ADMIN_KEY;
+  const prevAnthropicKeyTNB = process.env.ANTHROPIC_API_KEY;
+  const prevFetchTNB = globalThis.fetch;
+  let serverTNB: import("http").Server | null = null;
+  try {
+    process.env.EXPERIENCES_DB_PATH = ":memory:";
+
+    const dbFactoryPathTNB = require.resolve("../src/database/db-factory");
+    const expStorePathTNB = require.resolve("../src/services/experience-store");
+    const opplevelserPathTNB = require.resolve("../src/routes/opplevelser");
+    delete require.cache[dbFactoryPathTNB];
+    delete require.cache[expStorePathTNB];
+    delete require.cache[opplevelserPathTNB];
+
+    const dbFactoryTNB = require("../src/database/db-factory") as typeof import("../src/database/db-factory");
+    dbFactoryTNB.__resetDbFactoryForTesting();
+    const expStoreTNB = require("../src/services/experience-store") as typeof import("../src/services/experience-store");
+    const opplevelserTNB = require("../src/routes/opplevelser") as { default: import("express").Router };
+
+    const dbExpTNB = dbFactoryTNB.getDb("experiences");
+
+    // ── tnb-0: schema idempotency — title_no column present + re-running the
+    //    schema init (via a second getDb-triggered path) never throws. ──────
+    {
+      const cols = new Set(
+        (dbExpTNB.prepare("PRAGMA table_info(experiences)").all() as Array<{ name: string }>).map((c) => c.name)
+      );
+      assertTrue(cols.has("title_no"), "tnb-0a: experiences.title_no column exists after schema init");
+      let threw = false;
+      try {
+        dbFactoryTNB.initExperiencesSchema(dbExpTNB);
+      } catch {
+        threw = true;
+      }
+      assertTrue(!threw, "tnb-0b: re-running initExperiencesSchema (title_no ALTER incl.) is idempotent");
+    }
+
+    // ── Mount the REAL router on a minimal Express app. ────────────────
+    const expressModTNB = (await import("express")).default;
+    const appTNB = expressModTNB();
+    appTNB.use(expressModTNB.json());
+
+    const httpModTNB = await import("http");
+    serverTNB = httpModTNB.createServer(appTNB);
+    await new Promise<void>((resolve) => serverTNB!.listen(0, "127.0.0.1", () => resolve()));
+    const addrTNB = serverTNB.address();
+    const portTNB = typeof addrTNB === "object" && addrTNB ? addrTNB.port : 0;
+
+    const ADMIN_KEY_TNB = "title-no-backfill-test-admin-key";
+    process.env.ADMIN_KEY = ADMIN_KEY_TNB;
+
+    // Pin the admin key SYNCHRONOUSLY at the top of every request's
+    // middleware chain (same reasoning as the dedup-backfill test above).
+    appTNB.use("/api/opplevelser/admin", (_req, _res, next) => {
+      process.env.ADMIN_KEY = ADMIN_KEY_TNB;
+      next();
+    });
+    appTNB.use("/api/opplevelser", opplevelserTNB.default);
+
+    function titleNoBackfillReq(key: string | undefined, body: any): Promise<{ status: number; body: any }> {
+      const payload = body === undefined ? "" : JSON.stringify(body);
+      const headers: Record<string, string> = { "Content-Type": "application/json" };
+      if (key !== undefined) headers["x-admin-key"] = key;
+      if (payload) headers["Content-Length"] = Buffer.byteLength(payload).toString();
+      return new Promise((resolve, reject) => {
+        const r = httpModTNB.request(
+          {
+            method: "POST",
+            host: "127.0.0.1",
+            port: portTNB,
+            path: "/api/opplevelser/admin/experiences-title-no-backfill",
+            headers,
+          },
+          (resp) => {
+            const chunks: Buffer[] = [];
+            resp.on("data", (c) => chunks.push(c as Buffer));
+            resp.on("end", () => {
+              const raw = Buffer.concat(chunks).toString("utf8");
+              let parsed: any = null;
+              try { parsed = raw ? JSON.parse(raw) : null; } catch { parsed = { _raw: raw }; }
+              resolve({ status: resp.statusCode || 0, body: parsed });
+            });
+          }
+        );
+        r.on("error", reject);
+        if (payload) r.write(payload);
+        r.end();
+      });
+    }
+
+    const titleNoOf = (id: string): string | null =>
+      (dbExpTNB.prepare("SELECT title_no FROM experiences WHERE id = ?").get(id) as
+        | { title_no: string | null }
+        | undefined)?.title_no ?? null;
+
+    // ── tnb-1: admin gate — missing X-Admin-Key → the actual status code
+    //    requireAdmin uses (403, per routes/opplevelser.ts's requireAdmin()). ──
+    {
+      const r = await titleNoBackfillReq(undefined, { dry_run: true });
+      assertEq(r.status, 403, "tnb-1a: missing X-Admin-Key → 403 (requireAdmin's real status code)");
+    }
+    // ── tnb-2: wrong key → 403. ─────────────────────────────────────────
+    {
+      const r = await titleNoBackfillReq("wrong-key", { dry_run: true });
+      assertEq(r.status, 403, "tnb-2: wrong X-Admin-Key → 403");
+    }
+
+    // ── tnb-3: dry_run default, ZERO candidates — must succeed WITHOUT the
+    //    LLM ever needing to work. Delete any leaked ANTHROPIC_API_KEY so
+    //    this assertion can't accidentally pass via a real network call. ──
+    delete process.env.ANTHROPIC_API_KEY;
+    globalThis.fetch = (async () => {
+      throw new Error("tnb-3: fetch must NOT be called for an empty candidate set");
+    }) as unknown as typeof fetch;
+    {
+      const r = await titleNoBackfillReq(ADMIN_KEY_TNB, undefined); // no body → dry_run defaults true
+      assertEq(r.status, 200, "tnb-3a: correct key, no body → 200");
+      assertEq(r.body.success, true, "tnb-3b: success: true");
+      assertEq(r.body.dry_run, true, "tnb-3c: dry_run defaults to true when omitted");
+      assertEq(r.body.candidates, 0, "tnb-3d: candidates: 0 (nothing seeded yet)");
+      assertTrue(Array.isArray(r.body.sample) && r.body.sample.length === 0,
+        "tnb-3e: sample: [] on an empty candidate set — the LLM was never called");
+    }
+
+    // ── Seed: one canonical candidate row (canonical_id NULL, title_no NULL)
+    //    + one merged-away duplicate (canonical_id set) that must NEVER be a
+    //    candidate — merged-away rows are dead weight per the spec. ────────
+    const providerTNB = expStoreTNB.createProvider({
+      navn: "Fjordtur AS", kommune: "Bergen", fylke: "Vestland",
+      brreg_verified: 1, brreg_active: 1, verification_status: "verified",
+    });
+    const idCanonicalTNB = expStoreTNB.createExperience({
+      title: "Fjordtur med kajakk", provider_id: providerTNB,
+      kommune: "Bergen", fylke: "Vestland", category: "vann_kajakk",
+      verification_status: "verified", confidence: "high",
+    });
+    const idMergedAwayTNB = expStoreTNB.createExperience({
+      title: "Kajakktur på fjorden", provider_id: providerTNB,
+      kommune: "Bergen", fylke: "Vestland", category: "vann_kajakk",
+      verification_status: "verified", confidence: "medium",
+    });
+    dbExpTNB.prepare("UPDATE experiences SET canonical_id = ? WHERE id = ?").run(idCanonicalTNB, idMergedAwayTNB);
+
+    // ── tnb-4: dry_run with a stubbed SUCCESSFUL LLM response — samples the
+    //    candidate, proposes a title_no, but writes NOTHING to the DB. ──────
+    const STUBBED_TITLE_NO = "Kajakkpadling i Bergensfjorden";
+    globalThis.fetch = (async (_url: any, _init: any) => {
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({ content: [{ type: "text", text: STUBBED_TITLE_NO }] }),
+      };
+    }) as unknown as typeof fetch;
+    process.env.ANTHROPIC_API_KEY = "test-anthropic-key";
+    {
+      const r = await titleNoBackfillReq(ADMIN_KEY_TNB, { dry_run: true });
+      assertEq(r.status, 200, "tnb-4a: dry_run with stubbed success → 200");
+      assertEq(r.body.dry_run, true, "tnb-4b: dry_run: true echoed back");
+      assertEq(r.body.candidates, 1, "tnb-4c: candidates: 1 (the merged-away row is excluded)");
+      assertTrue(Array.isArray(r.body.sample) && r.body.sample.length === 1,
+        "tnb-4d: sample has exactly the 1 candidate");
+      assertEq(r.body.sample[0].id, idCanonicalTNB, "tnb-4e: sampled row is the canonical candidate");
+      assertEq(r.body.sample[0].proposed_title_no, STUBBED_TITLE_NO, "tnb-4f: proposed_title_no matches the stubbed LLM response");
+      assertEq(titleNoOf(idCanonicalTNB), null, "tnb-4g: dry_run writes NOTHING — title_no still NULL in the DB");
+    }
+
+    // ── tnb-5: REAL run (dry_run: false) with the same stubbed success →
+    //    writes title_no through a transaction. ─────────────────────────
+    {
+      const r = await titleNoBackfillReq(ADMIN_KEY_TNB, { dry_run: false });
+      assertEq(r.status, 200, "tnb-5a: real run with stubbed success → 200");
+      assertEq(r.body.dry_run, false, "tnb-5b: dry_run: false echoed back");
+      assertEq(r.body.written, 1, "tnb-5c: written: 1");
+      assertEq(r.body.skipped, 0, "tnb-5d: skipped: 0");
+      assertEq(titleNoOf(idCanonicalTNB), STUBBED_TITLE_NO, "tnb-5e: title_no WAS written to the DB");
+    }
+
+    // ── tnb-6: a second real run now finds 0 candidates (idempotent —
+    //    canonical_id IS NULL AND title_no IS NULL no longer matches). ─────
+    {
+      const r = await titleNoBackfillReq(ADMIN_KEY_TNB, { dry_run: false });
+      assertEq(r.status, 200, "tnb-6a: idempotent re-run → 200");
+      assertEq(r.body.candidates, 0, "tnb-6b: candidates: 0 (already backfilled)");
+      assertEq(r.body.written, 0, "tnb-6c: written: 0");
+    }
+
+    // ── tnb-7: a NEW candidate + a stubbed FAILED (non-ok) LLM response —
+    //    title_no stays NULL (never fabricated), and the request never throws. ──
+    const idFailTNB = expStoreTNB.createExperience({
+      title: "Fjelltur til Gaustatoppen", provider_id: providerTNB,
+      kommune: "Bergen", fylke: "Vestland", category: "fjell_tur",
+      verification_status: "verified", confidence: "high",
+    });
+    globalThis.fetch = (async () => {
+      return { ok: false, status: 500, json: async () => ({ error: "boom" }) };
+    }) as unknown as typeof fetch;
+    {
+      const r = await titleNoBackfillReq(ADMIN_KEY_TNB, { dry_run: false });
+      assertEq(r.status, 200, "tnb-7a: real run with stubbed HTTP failure → 200 (does not throw/500)");
+      assertEq(r.body.written, 0, "tnb-7b: written: 0 — nothing fabricated");
+      assertEq(r.body.skipped, 1, "tnb-7c: skipped: 1 — the failed row is skipped, not guessed");
+      assertEq(titleNoOf(idFailTNB), null, "tnb-7d: title_no stays NULL for the row whose LLM call failed");
+    }
+
+    // ── tnb-8: same candidate, this time a stubbed UNPARSEABLE response body
+    //    (ok: true but .json() throws) — same never-fabricate, never-throw
+    //    contract. ──────────────────────────────────────────────────────
+    globalThis.fetch = (async () => {
+      return {
+        ok: true,
+        status: 200,
+        json: async () => { throw new Error("not json"); },
+      };
+    }) as unknown as typeof fetch;
+    {
+      const r = await titleNoBackfillReq(ADMIN_KEY_TNB, { dry_run: false });
+      assertEq(r.status, 200, "tnb-8a: real run with unparseable LLM body → 200 (does not throw/500)");
+      assertEq(r.body.written, 0, "tnb-8b: written: 0 — nothing fabricated");
+      assertEq(titleNoOf(idFailTNB), null, "tnb-8c: title_no still NULL — unparseable response never guessed");
+    }
+
+    dbFactoryTNB.__resetDbFactoryForTesting();
+  } catch (err) {
+    failed++;
+    failures.push("orch-pr-titleno: unexpected error: " + String(err instanceof Error ? (err.stack || err.message) : err));
+  } finally {
+    if (serverTNB) {
+      await new Promise<void>((resolve) => serverTNB!.close(() => resolve()));
+    }
+    globalThis.fetch = prevFetchTNB;
+    if (prevPathTNB === undefined) delete process.env.EXPERIENCES_DB_PATH;
+    else process.env.EXPERIENCES_DB_PATH = prevPathTNB;
+    if (prevAdminKeyTNB === undefined) delete process.env.ADMIN_KEY;
+    else process.env.ADMIN_KEY = prevAdminKeyTNB;
+    if (prevAnthropicKeyTNB === undefined) delete process.env.ANTHROPIC_API_KEY;
+    else process.env.ANTHROPIC_API_KEY = prevAnthropicKeyTNB;
+    _titleNoBackfillResolve();
+  }
+})();
+
 // ── orchestrator-pr-19: opplevagent.no → Opplevagent (experiences) host-gate ──
 // Mirrors the pr113 dental discovery tests. Covers: host→vertical recognition
 // (getVerticalFromHost), the Opplevagent agent-card (+ host isolation vs the
@@ -21102,6 +21369,7 @@ console.log("\n── orch-pr-14: MCP discovery product_id surfacing ──");
   try { await _orchPr9PruneDeadUrlsPromise; } catch { /* errors already pushed to failures */ }
   try { await _orchPr18BulkLoadPromise; } catch { /* errors already pushed to failures */ }
   try { await _orchPrDedupBackfillEndpointPromise; } catch { /* errors already pushed to failures */ }
+  try { await _titleNoBackfillPromise; } catch { /* errors already pushed to failures */ }
   try { await _gardssalgContentRefreshPromise; } catch { /* errors already pushed to failures */ }
   try { await _orchPr12SweepPromise; } catch { /* errors already pushed to failures */ }
   try { await _brregVerifySlice1Promise; } catch { /* errors already pushed to failures */ }
@@ -26877,3 +27145,137 @@ console.log("\n── outreach-suppression-P0: compose-leak + email-keyed gate �
     failures.push(`outreach-suppression-P0: unexpected error: ${err instanceof Error ? (err.stack || err.message) : String(err)}`);
   }
 }
+
+// ── orch-pr-titleno-render: renderCard()/detail-page title_no wiring ────────
+// dev-request 2026-07-04-opplevagent-dedup-og-norske-titler, item 2. Drives
+// the REAL experiences-seo router directly (sync mock req/res + explicit
+// req.lang, same "invokeSeo" pattern as the "site-quality" detail-page tests
+// above — langMiddleware isn't mounted on this bare router, so req.lang is
+// set manually the way the real i18n/middleware.ts would). Covers the two
+// choke points named in the dev-request: the card title span (via
+// GET /opplevelser → renderBrowsePage → renderCard) and the detail-page <h1>
+// (via GET /opplevelse/:slug → renderOpplevelseDetail). Two rows: one WITH
+// title_no backfilled, one WITHOUT (still NULL) — proves the fallback never
+// renders a broken/empty title on either locale.
+console.log("\n── orch-pr-titleno-render: renderCard()/detail-page title_no wiring ──");
+(() => {
+  const prevPathTNR = process.env.EXPERIENCES_DB_PATH;
+  process.env.EXPERIENCES_DB_PATH = ":memory:";
+
+  const dbFactoryPathTNR = require.resolve("../src/database/db-factory");
+  const expStorePathTNR = require.resolve("../src/services/experience-store");
+  const expSeoPathTNR = require.resolve("../src/routes/experiences-seo");
+  delete require.cache[dbFactoryPathTNR];
+  delete require.cache[expStorePathTNR];
+  delete require.cache[expSeoPathTNR];
+
+  const dbFactoryTNR = require("../src/database/db-factory") as typeof import("../src/database/db-factory");
+  dbFactoryTNR.__resetDbFactoryForTesting();
+  const expStoreTNR = require("../src/services/experience-store") as typeof import("../src/services/experience-store");
+  const seoRouterTNR = (require("../src/routes/experiences-seo") as typeof import("../src/routes/experiences-seo")).default as any;
+
+  const dbExpTNR = dbFactoryTNR.getDb("experiences");
+
+  const provIdTNR = expStoreTNR.createProvider({
+    navn: "Nordlys Opplevelser AS", org_nr: "999111222",
+    fylke: "Troms og Finnmark", kommune: "Tromsø", hjemmeside: "https://example-nordlys.no",
+    brreg_verified: 1, brreg_active: 1, verification_status: "verified",
+  });
+
+  // Row WITH title_no backfilled (via a raw UPDATE — this test exercises
+  // rendering, not the backfill endpoint itself, which has its own dedicated
+  // test above).
+  const ENGLISH_TITLE = "Northern Lights Photography Tour";
+  const NORSK_TITLE_NO = "Nordlysfotografering i Tromsø";
+  const expWithNoId = expStoreTNR.createExperience({
+    title: ENGLISH_TITLE, provider_id: provIdTNR, provider_match_status: "matched",
+    category: "dyreliv_safari", fylke: "Troms og Finnmark", kommune: "Tromsø",
+    indoor_outdoor: "outdoor", confidence: "high", verification_status: "verified",
+  });
+  dbExpTNR.prepare("UPDATE experiences SET title_no = ? WHERE id = ?").run(NORSK_TITLE_NO, expWithNoId);
+  const seededWithNo = expStoreTNR.getExperienceById(expWithNoId);
+  const slugWithNo = (seededWithNo as any).slug as string;
+  assertEq((seededWithNo as any).title_no, NORSK_TITLE_NO, "tnr-00a: hydrateExperience() surfaces title_no on the hydrated row");
+
+  // Row WITHOUT title_no (still NULL) — the never-broken-fallback case.
+  const ONLY_TITLE = "Guided Reindeer Sledding";
+  const expNoTitleNoId = expStoreTNR.createExperience({
+    title: ONLY_TITLE, provider_id: provIdTNR, provider_match_status: "matched",
+    category: "dyreliv_safari", fylke: "Troms og Finnmark", kommune: "Tromsø",
+    indoor_outdoor: "outdoor", confidence: "high", verification_status: "verified",
+  });
+  const seededNoTitleNo = expStoreTNR.getExperienceById(expNoTitleNoId);
+  const slugNoTitleNo = (seededNoTitleNo as any).slug as string;
+  assertEq((seededNoTitleNo as any).title_no, null, "tnr-00b: hydrateExperience() surfaces title_no: null when not backfilled");
+
+  // Same helper shape as the "site-quality" invokeSeo tests above, plus an
+  // explicit `lang` param (langMiddleware isn't mounted on this bare router
+  // in a unit test, so req.lang is set directly, exactly as i18n/middleware.ts
+  // would have set it before the handler runs).
+  function invokeSeoTNR(routePath: string, params: Record<string, string>, reqPath: string, lang: "no" | "en"): { status: number; body: string; headers: Record<string, string> } {
+    const layer = (seoRouterTNR.stack as any[]).find(
+      (l: any) => l.route && l.route.path === routePath && l.route.methods?.get
+    );
+    assertTrue(!!layer, `tnr: router has GET ${routePath} layer`);
+    let status = 200; let body = ""; let nexted = false;
+    const headers: Record<string, string> = {};
+    const res: any = {
+      statusCode: 200,
+      setHeader: (k: string, v: string) => { headers[k.toLowerCase()] = String(v); },
+      status: (c: number) => { status = c; res.statusCode = c; return res; },
+      send: (b: unknown) => { body = typeof b === "string" ? b : String(b); return res; },
+      json: (o: unknown) => { body = JSON.stringify(o); return res; },
+    };
+    const req: any = { path: reqPath, hostname: "opplevagent.no", params, query: {}, lang };
+    const handler = layer.route.stack[layer.route.stack.length - 1].handle;
+    handler(req, res, () => { nexted = true; });
+    if (nexted) status = 404;
+    return { status, body, headers };
+  }
+
+  // ── tnr-1: /opplevelser index card — req.lang === "no", title_no set →
+  //    the card shows the Norwegian title, NOT the original. ────────────
+  const idxNoTNR = invokeSeoTNR("/opplevelser", {}, "/opplevelser", "no");
+  assertEq(idxNoTNR.status, 200, "tnr-1a: GET /opplevelser (lang=no) → 200");
+  assertTrue(idxNoTNR.body.includes(`>${NORSK_TITLE_NO}<`), "tnr-1b: card title span shows title_no on /no");
+  assertTrue(!idxNoTNR.body.includes(`>${ENGLISH_TITLE}<`), "tnr-1c: card does NOT show the original title when title_no is set on /no");
+
+  // ── tnr-2: same row, req.lang === "en" → ALWAYS the original title,
+  //    title_no is never shown on /en. ────────────────────────────────
+  const idxEnTNR = invokeSeoTNR("/opplevelser", {}, "/opplevelser", "en");
+  assertEq(idxEnTNR.status, 200, "tnr-2a: GET /opplevelser (lang=en) → 200");
+  assertTrue(idxEnTNR.body.includes(`>${ENGLISH_TITLE}<`), "tnr-2b: card title span shows the original title on /en");
+  assertTrue(!idxEnTNR.body.includes(`>${NORSK_TITLE_NO}<`), "tnr-2c: card does NOT show title_no on /en, even though it's set");
+
+  // ── tnr-3: title_no NULL row — falls back to the original title on BOTH
+  //    locales (no broken/empty title ever rendered). ─────────────────
+  assertTrue(idxNoTNR.body.includes(`>${ONLY_TITLE}<`), "tnr-3a: title_no-less row falls back to `title` on /no");
+  assertTrue(idxEnTNR.body.includes(`>${ONLY_TITLE}<`), "tnr-3b: title_no-less row falls back to `title` on /en");
+
+  // ── tnr-4: detail-page <h1> — same fallback logic as the card. ──────
+  const detailWithNoNO = invokeSeoTNR("/opplevelse/:slug", { slug: slugWithNo }, `/opplevelse/${slugWithNo}`, "no");
+  assertEq(detailWithNoNO.status, 200, "tnr-4a: GET /opplevelse/<slug> (lang=no) → 200");
+  assertTrue(detailWithNoNO.body.includes(`<h1>${NORSK_TITLE_NO}</h1>`), "tnr-4b: detail <h1> shows title_no on /no when set");
+
+  const detailWithNoEN = invokeSeoTNR("/opplevelse/:slug", { slug: slugWithNo }, `/opplevelse/${slugWithNo}`, "en");
+  assertEq(detailWithNoEN.status, 200, "tnr-4c: GET /opplevelse/<slug> (lang=en) → 200");
+  assertTrue(detailWithNoEN.body.includes(`<h1>${ENGLISH_TITLE}</h1>`), "tnr-4d: detail <h1> ALWAYS shows the original title on /en, even though title_no is set");
+
+  const detailNoTitleNoNO = invokeSeoTNR("/opplevelse/:slug", { slug: slugNoTitleNo }, `/opplevelse/${slugNoTitleNo}`, "no");
+  assertEq(detailNoTitleNoNO.status, 200, "tnr-4e: GET /opplevelse/<slug> for the title_no-less row (lang=no) → 200");
+  assertTrue(detailNoTitleNoNO.body.includes(`<h1>${ONLY_TITLE}</h1>`), "tnr-4f: detail <h1> falls back to `title` on /no when title_no is NULL");
+
+  const detailNoTitleNoEN = invokeSeoTNR("/opplevelse/:slug", { slug: slugNoTitleNo }, `/opplevelse/${slugNoTitleNo}`, "en");
+  assertEq(detailNoTitleNoEN.status, 200, "tnr-4g: GET /opplevelse/<slug> for the title_no-less row (lang=en) → 200");
+  assertTrue(detailNoTitleNoEN.body.includes(`<h1>${ONLY_TITLE}</h1>`), "tnr-4h: detail <h1> falls back to `title` on /en when title_no is NULL");
+
+  // ── tnr-5: breadcrumb text is explicitly NOT touched this slice — still
+  //    the original title even on /no with title_no set. ───────────────
+  assertTrue(detailWithNoNO.body.includes(`<span class="sep">/</span>${ENGLISH_TITLE}\n`),
+    "tnr-5: breadcrumb still uses the original title on /no (out of scope this slice, per the dev-request)");
+
+  if (prevPathTNR === undefined) delete process.env.EXPERIENCES_DB_PATH;
+  else process.env.EXPERIENCES_DB_PATH = prevPathTNR;
+  dbFactoryTNR.__resetDbFactoryForTesting();
+  console.log("  orch-pr-titleno-render: OK (card + detail <h1> title_no fallback, both locales)");
+})();

@@ -358,6 +358,26 @@ export function initExperiencesSchema(db: Database.Database): void {
     try { db.exec(stmt); } catch { /* already present */ }
   }
 
+  // ─── Norwegian display-title column (dev-request 2026-07-04-opplevagent-
+  // dedup-og-norske-titler, item 2, 2026-07-12) ─────────────────────────────
+  // title_no: LLM-generated natural Norwegian display title for a CANONICAL
+  //   row (canonical_id IS NULL) — merged-away duplicates never need one, the
+  //   render path always resolves through the canonical row. NULL means "not
+  //   backfilled yet" (or backfill deliberately skipped this row — never
+  //   fabricated); every render path (experiences-seo.ts renderCard()/detail
+  //   <h1>) falls back to the original `title` when NULL, so this column is
+  //   purely additive and can never surface a broken/empty title. Backfilled
+  //   via POST /admin/experiences-title-no-backfill (routes/opplevelser.ts).
+  //   No index — never filtered/joined on, only ever read alongside `title`
+  //   for the row already being rendered.
+  // Same additive/idempotent idiom as the dedup-cols block above.
+  const titleNoCols = [
+    "ALTER TABLE experiences ADD COLUMN title_no TEXT",
+  ];
+  for (const stmt of titleNoCols) {
+    try { db.exec(stmt); } catch { /* already present */ }
+  }
+
   // ─── Gårdssalg content-enrichment columns (dev-request 2026-07-03-gardssalg-
   // rike-profiler-bilder-agentbooking, Fase 1 item 3, 2026-07-10) ─────────────
   // Additive columns for the multi-page-crawl enrichment slice that fills real
