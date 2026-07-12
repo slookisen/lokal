@@ -52,15 +52,13 @@ jobs:
         run: npx tsc --noEmit
 
       - name: Run tests
-        # QUARANTINE (2026-07-06, dev-request 2026-07-06-ci-quarantine-auth-suite):
-        # agent-knowledge-get-auth runs in its own job below
-        # (build-check-auth-isolated) instead of here — see tests/test.ts for
-        # why (proven CI-only false-negative from cross-test contamination in
-        # this shared process; root-cause tracked as P3 in
-        # dev-requests/2026-07-06-ci-untracked-timer-followup.md).
+        # DIAGNOSTIC (2026-07-12, dev-request 2026-07-06-ci-untracked-timer-followup):
+        # throwaway one-round experiment — un-quarantining agent-knowledge-get-auth
+        # in the shared process to check whether the tests/test.ts import()->require()
+        # module-instance fix (already live on main) incidentally resolved the
+        # original CI-only false-negative. NOT a permanent change — this branch is
+        # not intended to merge as-is; see the dev-request for the decision tree.
         run: npm test
-        env:
-          CI_SKIP_AGENT_KNOWLEDGE_AUTH: "1"
 
   build-check-auth-isolated:
     name: Type-check + tests (agent-knowledge-auth, isolated)
