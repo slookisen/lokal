@@ -1571,9 +1571,9 @@ async function fetchHtml(url: string): Promise<string | null> {
 }
 
 /**
- * Crawl the chosen candidate URL plus same-host /kontakt and /om-oss, and merge
- * all extracted emails/phones into one PageEvidence (title from the primary page).
- * This is the DEFAULT `crawl` dependency for enrichOneAgent.
+ * Crawl the chosen candidate URL plus same-host /kontakt, /om-oss and /produkter,
+ * and merge all extracted emails/phones into one PageEvidence (title from the
+ * primary page). This is the DEFAULT `crawl` dependency for enrichOneAgent.
  */
 export async function buildPageEvidence(primaryUrl: string): Promise<PageEvidence | null> {
   const primaryHtml = await fetchHtml(primaryUrl);
@@ -1584,11 +1584,16 @@ export async function buildPageEvidence(primaryUrl: string): Promise<PageEvidenc
   let combinedHtml = primaryHtml;
   const title = extractTitle(primaryHtml);
 
-  // Try same-host /kontakt and /om-oss for additional contact details.
+  // Try same-host /kontakt, /om-oss and /produkter for additional contact +
+  // content signals (mirrors admin-knowledge.ts's HCR_CONTENT_PATHS, which
+  // already includes /produkter for the same reason: richer contentText ->
+  // better aboutSummary/productMentions -> fewer domain_incoherent/kvalitets-
+  // gate failures from thin homepage-only crawls — dev-request
+  // 2026-06-30-open-stuck-verification-bucket, Step 2).
   try {
     const u = new URL(/^https?:\/\//i.test(primaryUrl) ? primaryUrl : `https://${primaryUrl}`);
     const base = `${u.protocol}//${u.host}`;
-    for (const path of ["/kontakt", "/om-oss"]) {
+    for (const path of ["/kontakt", "/om-oss", "/produkter"]) {
       const subHtml = await fetchHtml(`${base}${path}`);
       if (subHtml) {
         for (const e of extractEmails(subHtml)) emails.add(e);

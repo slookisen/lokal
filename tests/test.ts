@@ -21029,6 +21029,7 @@ console.log("\n── orch-pr-14: MCP discovery product_id surfacing ──");
   try { await _brregCatalogSweepPromise; } catch { /* errors already pushed to failures */ }
   try { await _brregDescriptionFallbackPromise; } catch { /* errors already pushed to failures */ }
   try { await _retentionRollupPromise; } catch { /* errors already pushed to failures */ }
+  try { await _pageEvidenceCrawlPromise; } catch { /* errors already pushed to failures */ }
   // relax-envelope tests are synchronous (pure validateEnvelope() unit test) — no promise needed
   // PR-109 tests are synchronous (IIFE) — no promise needed
   // Drop pre-existing intg failures (unmasked by awaiting) — they predate M2
@@ -25897,6 +25898,42 @@ const _retentionRollupPromise: Promise<void> = new Promise<void>(r => {
     failures.push("retention-rollup: unexpected error: " + String(err?.message || err));
   } finally {
     _retentionRollupResolve();
+  }
+})();
+
+// ═══════════════════════════════════════════════════════════════════════
+// dev-request 2026-06-30-open-stuck-verification-bucket, Step 2:
+// buildPageEvidence (src/services/search-enrich.ts) now also crawls the
+// same-host /produkter page (alongside the existing /kontakt, /om-oss),
+// mirroring the already-shipped HCR_CONTENT_PATHS pattern in
+// routes/admin-knowledge.ts. Stubs globalThis.fetch — own dedicated test
+// file, no shared getDb() singleton — so it runs strictly after the last
+// singleton-swapping block (retention-rollup) purely to keep a single,
+// easy-to-follow serial ordering with the rest of this dev-request's tests,
+// not because of any actual shared-state dependency.
+let _pageEvidenceCrawlResolve: () => void = () => {};
+const _pageEvidenceCrawlPromise: Promise<void> = new Promise<void>(r => {
+  _pageEvidenceCrawlResolve = r;
+});
+
+(async () => {
+  await Promise.allSettled([_retentionRollupPromise]);
+  await new Promise(r => setImmediate(r));
+
+  console.log("\n── dev-request 2026-06-30-open-stuck-verification-bucket: page-evidence /produkter crawl ──");
+  try {
+    const { runPageEvidenceCrawlTests } = require("../src/services/search-enrich-page-evidence.test") as
+      typeof import("../src/services/search-enrich-page-evidence.test");
+    const pec = await runPageEvidenceCrawlTests({ log: false });
+    passed += pec.passed;
+    failed += pec.failed;
+    for (const f of pec.failures) failures.push("page-evidence-crawl: " + f);
+    console.log(`  page-evidence-crawl: ${pec.passed} passed, ${pec.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("page-evidence-crawl: unexpected error: " + String(err?.message || err));
+  } finally {
+    _pageEvidenceCrawlResolve();
   }
 })();
 
