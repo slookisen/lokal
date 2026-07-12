@@ -988,7 +988,9 @@ if (
       console.log(
         `[experiences-geocode] boot-tick processed=${r.providers_processed} ` +
         `high=${r.providers_high} medium=${r.providers_medium} low=${r.providers_low} ` +
-        `no_match=${r.providers_no_match} addr_precision=${r.experiences_address_precision} ` +
+        `no_match=${r.providers_no_match} provider_kommune_fallback=${r.providers_kommune_fallback} ` +
+        `provider_fallback_unresolved=${r.providers_fallback_unresolved} ` +
+        `addr_precision=${r.experiences_address_precision} ` +
         `kommune_precision=${r.experiences_kommune_precision} unresolved=${r.experiences_unresolved} ` +
         `errors=${r.errors} duration_ms=${r.duration_ms}`
       );
@@ -1005,7 +1007,9 @@ if (
       console.log(
         `[experiences-geocode] tick processed=${r.providers_processed} ` +
         `high=${r.providers_high} medium=${r.providers_medium} low=${r.providers_low} ` +
-        `no_match=${r.providers_no_match} addr_precision=${r.experiences_address_precision} ` +
+        `no_match=${r.providers_no_match} provider_kommune_fallback=${r.providers_kommune_fallback} ` +
+        `provider_fallback_unresolved=${r.providers_fallback_unresolved} ` +
+        `addr_precision=${r.experiences_address_precision} ` +
         `kommune_precision=${r.experiences_kommune_precision} unresolved=${r.experiences_unresolved} ` +
         `errors=${r.errors} duration_ms=${r.duration_ms}`
       );

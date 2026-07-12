@@ -1731,6 +1731,13 @@ export type GardssalgProviderRow = {
   adresse: string | null;
   lat: number | null;
   lon: number | null;
+  // Additive (2026-07-12, gardssalg-go-live-gate slice 3): tags lat/lon's
+  // precision. 'approximate' = experiences-geocode-worker.ts Step D's
+  // kommune/fylke-centroid fallback (no street-level address resolved);
+  // 'high'/'medium'/'low' = Step A's real address-level Kartverket geocode;
+  // null = not geocoded yet. Read by the produsent-profil map block so it
+  // never claims exact-address precision it doesn't have.
+  geocode_confidence: string | null;
   epost: string | null;
   telefon: string | null;
   // Additive (2026-07-10, gårdssalg multi-page-crawl content-enrichment
@@ -1753,7 +1760,7 @@ export type GardssalgProviderRow = {
 };
 
 const GARDSSALG_PROVIDER_COLUMNS =
-  "id, navn, hjemmeside, fylke, kommune, poststed, producer_type, enrichment_state, slug, adresse, lat, lon, epost, telefon, about_text, visit_text, opening_hours_text, booking_live";
+  "id, navn, hjemmeside, fylke, kommune, poststed, producer_type, enrichment_state, slug, adresse, lat, lon, geocode_confidence, epost, telefon, about_text, visit_text, opening_hours_text, booking_live";
 
 export function listGardssalgProviders(limit = 100, offset = 0): GardssalgProviderRow[] {
   const db = getDb(VERTICAL);

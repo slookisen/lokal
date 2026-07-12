@@ -8,7 +8,7 @@
 // dental_agents (each row IS an address-bearing entity), the experiences
 // vertical is harvest-first — `experiences` rows often have no provider_id
 // yet, and even when they do, an experience has no address of its own; its
-// location comes from its provider. So this worker runs THREE steps per
+// location comes from its provider. So this worker runs FOUR steps per
 // tick, in order:
 //
 //   Step A — geocode experience_providers' street addresses via the
@@ -16,9 +16,21 @@
 //            geocodeOne/kartverketQuery/transliterate/stripHouseLetterSuffix
 //            from dental-geocode-worker.ts — those helpers are already
 //            generic, taking plain address/postnummer/poststed strings).
-//   Step B — propagate a just-(or previously-)geocoded provider's lat/lon
-//            down to any of its experiences that don't have a location yet
-//            (geo_precision='address').
+//   Step D — for providers Step A could not (or will never usefully) place
+//            at address precision, fall back to a kommune/fylke-centroid
+//            lookup via geocodingService, tagged geocode_confidence=
+//            'approximate' so the profile page can render it honestly
+//            (added 2026-07-12, dev-request gardssalg-go-live-gate slice 3
+//            — rural gårdssalg addresses often never resolve via the
+//            adresse-API even though the kommune is known).
+//   Step B — propagate a just-(or previously-)geocoded provider's REAL
+//            address-precision lat/lon down to any of its experiences that
+//            don't have a location yet (geo_precision='address'). Step D's
+//            approximate fallback is deliberately excluded from this
+//            propagation (see Step B's own comment below) — geo_precision=
+//            'address' is the near-me search honesty rule (formatDistanceLabel(),
+//            discoverExperiences()'s radius filter/sort all trust it to mean
+//            a real street address).
 //   Step C — for experiences that still have no location (unmatched to a
 //            provider, or matched to a provider whose address geocoding
 //            failed / is still pending), fall back to a kommune-centroid
@@ -46,6 +58,8 @@ export type ExperiencesGeocodeResult = {
   providers_medium: number;
   providers_low: number;
   providers_no_match: number;
+  providers_kommune_fallback: number;
+  providers_fallback_unresolved: number;
   experiences_address_precision: number;
   experiences_kommune_precision: number;
   experiences_unresolved: number;
@@ -58,11 +72,12 @@ export type ExperiencesGeocodeResult = {
 export type { GeocodeDeps };
 
 /**
- * Main tick. Runs Step A (provider address geocoding), Step B (propagate
- * provider location -> experiences), Step C (kommune-centroid fallback for
- * experiences still unresolved), each capped at `limit` rows so a large
- * backlog can't runaway a single tick. Sequential and deterministic
- * (ORDER BY id) so re-runs are reproducible.
+ * Main tick. Runs Step A (provider address geocoding), Step D (provider
+ * kommune/fylke-centroid fallback for providers Step A couldn't resolve at
+ * address precision), Step B (propagate provider location -> experiences),
+ * Step C (kommune-centroid fallback for experiences still unresolved), each
+ * capped at `limit` rows so a large backlog can't runaway a single tick.
+ * Sequential and deterministic (ORDER BY id) so re-runs are reproducible.
  */
 export async function experiencesGeocodeTick(
   limit: number = 50,
@@ -76,6 +91,8 @@ export async function experiencesGeocodeTick(
     providers_medium: 0,
     providers_low: 0,
     providers_no_match: 0,
+    providers_kommune_fallback: 0,
+    providers_fallback_unresolved: 0,
     experiences_address_precision: 0,
     experiences_kommune_precision: 0,
     experiences_unresolved: 0,
@@ -146,10 +163,81 @@ export async function experiencesGeocodeTick(
     }
   }
 
+  // ─── Step D — provider kommune/fylke-centroid fallback ─────────────
+  // (numbered D, not C, to match the pre-existing Step C below it — this
+  // fills the gap dev-request 2026-07-12-gardssalg-go-live-gate-dark-launch-
+  // og-onboarding slice 3 calls out: rural gårdssalg addresses often never
+  // resolve via the Kartverket adresse-API, so Step A leaves them
+  // geocode_confidence='no_match' and the profile page's map block shows
+  // "posisjon ikke registrert" forever — even though the provider's own
+  // kommune/fylke IS known and geocodable. Mirrors Step C's kommune-centroid
+  // lookup, but writes the PROVIDER's own lat/lon (not an experience's), and
+  // only for rows Step A could not (or will never usefully) resolve at
+  // address precision — never overwrites a real address-level geocode.
+  // geocode_confidence='approximate' tags the result distinctly from
+  // Step A's high/medium/low tiers so the profile route can render an
+  // honest "ca. posisjon" label instead of claiming address precision.
+  const providerFallbackRows = db
+    .prepare(
+      `SELECT id, kommune, fylke
+         FROM experience_providers
+        WHERE lat IS NULL
+          AND (
+            geocode_confidence = 'no_match'
+            OR (
+              geocode_confidence IS NULL
+              AND (adresse IS NULL OR adresse = '' OR postnummer IS NULL OR postnummer = '')
+            )
+          )
+          AND ((kommune IS NOT NULL AND kommune <> '') OR (fylke IS NOT NULL AND fylke <> ''))
+        ORDER BY id
+        LIMIT ?`
+    )
+    .all(limit) as Array<{ id: string; kommune: string | null; fylke: string | null }>;
+
+  const updateProviderApprox = db.prepare(
+    `UPDATE experience_providers
+        SET lat = ?, lon = ?, geocode_source = 'kommune_fallback', geocode_confidence = 'approximate',
+            updated_at = datetime('now')
+      WHERE id = ?`
+  );
+
+  for (const row of providerFallbackRows) {
+    try {
+      let geo = row.kommune ? await geocodingService.geocode(row.kommune) : null;
+      if (!geo && row.fylke) {
+        geo = await geocodingService.geocode(row.fylke);
+      }
+      if (geo) {
+        updateProviderApprox.run(geo.lat, geo.lng, row.id);
+        stats.providers_kommune_fallback++;
+      } else {
+        // Genuine "can't resolve" -- same discipline as Step C: no
+        // negative-cache column for this tier, left to retry next tick
+        // (cheap once geocodingService's in-memory cache is warm).
+        stats.providers_fallback_unresolved++;
+      }
+    } catch (err) {
+      stats.errors++;
+      console.error(`[experiences-geocode] provider kommune fallback failed for ${row.id}:`, err);
+    }
+  }
+
   // ─── Step B — propagate provider location -> experiences ──────────
   // Any experience still missing a location, matched to a provider that
-  // already has a usable (non-no_match) geocode result. Single SQL
+  // already has a usable, address-precision geocode result. Single SQL
   // statement via a join, capped at `limit` rows per tick.
+  //
+  // Excludes 'approximate' (Step D's kommune/fylke-centroid fallback) as
+  // well as 'no_match' — this UPDATE always writes geo_precision='address',
+  // which formatDistanceLabel() (experience-store.ts) and discoverExperiences()'s
+  // haversine radius filter/sort treat as a genuine street-address-level
+  // position (the near-me search "honesty rule"). Propagating an approximate
+  // provider position here would silently mislabel it as exact and corrupt
+  // "within X km" results. Step D's approximate fallback is scoped to the
+  // provider's own profile-page map for now (dev-request gardssalg-go-live-
+  // gate slice 3) — propagating it to experiences is a distinct, un-asked-for
+  // feature left for a future slice if wanted.
   try {
     const propagateRows = db
       .prepare(
@@ -162,7 +250,7 @@ export async function experiencesGeocodeTick(
             AND p.lat IS NOT NULL
             AND p.lon IS NOT NULL
             AND p.geocode_confidence IS NOT NULL
-            AND p.geocode_confidence <> 'no_match'
+            AND p.geocode_confidence NOT IN ('no_match', 'approximate')
           ORDER BY e.id
           LIMIT ?`
       )
