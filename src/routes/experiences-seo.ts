@@ -2272,6 +2272,10 @@ router.get(
     const site = safeHttpUrl(provider.hjemmeside);
     const lat = numOrNull(provider.lat);
     const lon = numOrNull(provider.lon);
+    // Step D fallback (experiences-geocode-worker.ts): a kommune/fylke
+    // centroid, not a real street-address geocode — label it honestly
+    // rather than implying exact-address precision.
+    const geoApprox = provider.geocode_confidence === "approximate";
 
     const metaDesc = `Besøk ${provider.navn}${sted ? " i " + sted : ""} — book en smaking eller omvisning direkte hos produsenten på Opplevagent.`;
 
@@ -2322,7 +2326,7 @@ router.get(
     const mapBlock = (lat !== null && lon !== null)
       ? `<a class="map-card" href="https://www.openstreetmap.org/?mlat=${lat}&mlon=${lon}#map=13/${lat}/${lon}" target="_blank" rel="noopener" aria-label="Åpne posisjon i OpenStreetMap">
            <svg viewBox="0 0 24 24" width="22" height="22" aria-hidden="true"><path d="M12 2a7 7 0 0 0-7 7c0 5 7 13 7 13s7-8 7-13a7 7 0 0 0-7-7z" fill="none" stroke="currentColor" stroke-width="1.6"/><circle cx="12" cy="9" r="2.4" fill="currentColor"/></svg>
-           <span><strong>${escapeHtml(sted || "Posisjon")}</strong><span class="map-sub">Åpne i kart (OpenStreetMap)</span></span>
+           <span><strong>${escapeHtml(sted || "Posisjon")}</strong><span class="map-sub">${geoApprox ? "Ca. posisjon (kommune) – åpne i kart" : "Åpne i kart (OpenStreetMap)"}</span></span>
          </a>`
       : `<div class="map-card map-fallback">
            <svg viewBox="0 0 24 24" width="22" height="22" aria-hidden="true"><path d="M12 2a7 7 0 0 0-7 7c0 5 7 13 7 13s7-8 7-13a7 7 0 0 0-7-7z" fill="none" stroke="currentColor" stroke-width="1.6"/><circle cx="12" cy="9" r="2.4" fill="currentColor"/></svg>

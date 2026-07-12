@@ -24245,6 +24245,167 @@ console.log("\n── gardssalg-dark-launch-stop: BOOKING_DISPATCH_ENABLED / boo
   console.log("  gardssalg-dark-launch-stop: OK (fail-safe flag default, SSR notices x3, hard stop on both entry points incl. no-row/no-email guarantees, flag-on+booking_live full-chain regression, producer dispatch + missing-epost safety)");
 })();
 
+// ─── gardssalg-go-live-gate slice 3: provider kommune/fylke geocode fallback
+//     (experiences-geocode-worker.ts Step D) + honest map-label rendering
+//     (dev-request 2026-07-12-gardssalg-go-live-gate-dark-launch-og-onboarding,
+//     slice 3) ────────────────────────────────────────────────────────────
+//
+// Contact info / website / address display already existed on the
+// produsent-profil route (2026-07-03/07-10 slices); the genuine gap this
+// slice closes is that a provider whose street address never resolves via
+// the Kartverket adresse-API (common for rural gårdssalg addresses) — or
+// who never had a street address recorded at all — permanently shows
+// "posisjon ikke registrert" on its profile map even when its kommune/fylke
+// IS known and geocodable. Step D fills that gap with a kommune/fylke
+// centroid fallback, tagged geocode_confidence='approximate' so the map
+// block can render an honest "ca. posisjon" label instead of claiming
+// address-level precision it doesn't have.
+console.log("\n── gardssalg-go-live-gate slice 3: geocode Step D + honest map label ──");
+const _geoStepDPromise = runSerial(async () => {
+  const prevPathGEO = process.env.EXPERIENCES_DB_PATH;
+  process.env.EXPERIENCES_DB_PATH = ":memory:";
+
+  const dbFacPathGEO = require.resolve("../src/database/db-factory");
+  const expStPathGEO = require.resolve("../src/services/experience-store");
+  const geoWorkerPathGEO = require.resolve("../src/services/experiences-geocode-worker");
+  const expSeoPathGEO = require.resolve("../src/routes/experiences-seo");
+  delete require.cache[dbFacPathGEO];
+  delete require.cache[expStPathGEO];
+  delete require.cache[geoWorkerPathGEO];
+  delete require.cache[expSeoPathGEO];
+
+  const dbFacGEO = require("../src/database/db-factory") as typeof import("../src/database/db-factory");
+  dbFacGEO.__resetDbFactoryForTesting();
+  const expStGEO = require("../src/services/experience-store") as typeof import("../src/services/experience-store");
+  const geoWorkerGEO = require("../src/services/experiences-geocode-worker") as typeof import("../src/services/experiences-geocode-worker");
+  const seoRouterGEO = (require("../src/routes/experiences-seo") as typeof import("../src/routes/experiences-seo")).default as any;
+
+  const dbGEO = dbFacGEO.getDb("experiences");
+
+  function invokeSeoGEO(routePath: string, params: Record<string, string>, reqPath: string):
+    { status: number; body: string } {
+    const layer = (seoRouterGEO.stack as any[]).find(
+      (l: any) => l.route && l.route.path === routePath && l.route.methods?.get
+    );
+    assertTrue(!!layer, `geo-route: seo router has GET ${routePath} layer`);
+    if (!layer) return { status: 0, body: "" };
+    let status = 200; let body = "";
+    const res: any = {
+      statusCode: 200,
+      setHeader: () => {},
+      status: (c: number) => { status = c; res.statusCode = c; return res; },
+      send: (b: unknown) => { body = typeof b === "string" ? b : String(b); return res; },
+    };
+    const req: any = { path: reqPath, hostname: "opplevagent.no", params, query: {}, body: {} };
+    const stack = (layer.route.stack as any[]).filter((s: any) => s.method === "get");
+    const handle = stack[stack.length - 1].handle;
+    handle(req, res, () => {});
+    return { status, body };
+  }
+
+  // ── geo-01: kommune-only provider (no adresse at all) — resolves via the
+  // hardcoded major-cities table (no network), tagged 'approximate'.
+  const provKommuneGEO = expStGEO.createProvider({
+    navn: "Sørlandssider", org_nr: "911111111",
+    fylke: "Agder", kommune: "Kristiansand", poststed: "Kristiansand",
+  });
+  dbGEO.prepare("UPDATE experience_providers SET producer_type = ? WHERE id = ?").run("sideri", provKommuneGEO);
+
+  // ── geo-02: fylke-only provider — no kommune, no adresse.
+  const provFylkeGEO = expStGEO.createProvider({
+    navn: "Vestfold Vingård", org_nr: "922222222", fylke: "Vestfold",
+  });
+  dbGEO.prepare("UPDATE experience_providers SET producer_type = ? WHERE id = ?").run("vingaard", provFylkeGEO);
+
+  // ── geo-03: full street address, but Step A is forced to fail (fake
+  // fetch that always 404s) — proves Step D catches a same-tick Step A
+  // failure, not just rows that were already 'no_match' from a prior tick.
+  const provAddrFailGEO = expStGEO.createProvider({
+    navn: "Bryggeriet Uoppdaget", org_nr: "933333333",
+    fylke: "Vestland", kommune: "Bergen",
+    adresse: "Ukjentveien 999", postnummer: "5000", poststed: "Bergen",
+  });
+  dbGEO.prepare("UPDATE experience_providers SET producer_type = ? WHERE id = ?").run("bryggeri", provAddrFailGEO);
+
+  // ── geo-04: already address-geocoded (Step A success from a prior tick,
+  // simulated directly) — Step D must never touch/overwrite a real
+  // address-precision result.
+  const provAlreadyGeoGEO = expStGEO.createProvider({
+    navn: "Fjordbrenneri", org_nr: "944444444", fylke: "Vestland", kommune: "Bergen",
+  });
+  dbGEO.prepare(
+    "UPDATE experience_providers SET producer_type = ?, lat = ?, lon = ?, geocode_source = 'kartverket', geocode_confidence = 'high' WHERE id = ?"
+  ).run("brenneri", 60.123, 5.456, provAlreadyGeoGEO);
+
+  // ── geo-05: no address, no kommune, no fylke at all — must stay
+  // unresolved without throwing.
+  const provNothingGEO = expStGEO.createProvider({ navn: "Ukjent Sted", org_nr: "955555555" });
+  dbGEO.prepare("UPDATE experience_providers SET producer_type = ? WHERE id = ?").run("annet", provNothingGEO);
+
+  // ── geo-11: Step B must NOT propagate an 'approximate' (Step D fallback)
+  // provider position down to its experiences as geo_precision='address' —
+  // that tag is the near-me search "honesty rule" (formatDistanceLabel(),
+  // discoverExperiences()'s haversine radius filter/sort all trust it to
+  // mean a real street address). An experience with no kommune/fylke of its
+  // own (so Step C can't independently resolve it either) must stay fully
+  // unresolved after the tick, not silently inherit a downgraded-precision
+  // position mislabeled as exact.
+  const expUnderApproxGEO = expStGEO.createExperience({ title: "Smaking hos Sørlandssider", provider_id: provKommuneGEO });
+
+  const alwaysFailFetch = (async () => ({ ok: false, status: 500, json: async () => ({}) })) as unknown as typeof fetch;
+  const stats: any = await geoWorkerGEO.experiencesGeocodeTick(50, { fetchImpl: alwaysFailFetch, sleep: async () => {} });
+
+  const rowKommuneGEO = dbGEO.prepare("SELECT lat, lon, geocode_source, geocode_confidence FROM experience_providers WHERE id = ?").get(provKommuneGEO) as any;
+  assertTrue(rowKommuneGEO.lat !== null && rowKommuneGEO.lon !== null, "geo-01a: kommune-only provider got a lat/lon from Step D");
+  assertEq(rowKommuneGEO.geocode_source, "kommune_fallback", "geo-01b: geocode_source='kommune_fallback' for the kommune fallback");
+  assertEq(rowKommuneGEO.geocode_confidence, "approximate", "geo-01c: geocode_confidence='approximate', not a real address tier");
+
+  const rowFylkeGEO = dbGEO.prepare("SELECT lat, lon, geocode_confidence FROM experience_providers WHERE id = ?").get(provFylkeGEO) as any;
+  assertTrue(rowFylkeGEO.lat !== null && rowFylkeGEO.lon !== null, "geo-02a: fylke-only provider (no kommune) got a lat/lon via the fylke fallback");
+  assertEq(rowFylkeGEO.geocode_confidence, "approximate", "geo-02b: fylke fallback also tagged 'approximate'");
+
+  const rowAddrFailGEO = dbGEO.prepare("SELECT lat, lon, geocode_confidence FROM experience_providers WHERE id = ?").get(provAddrFailGEO) as any;
+  assertTrue(rowAddrFailGEO.lat !== null && rowAddrFailGEO.lon !== null, "geo-03a: Step A failure (forced 404) is caught by Step D in the SAME tick");
+  assertEq(rowAddrFailGEO.geocode_confidence, "approximate", "geo-03b: same-tick Step A->Step D fallback tagged 'approximate'");
+
+  const rowAlreadyGeoGEO = dbGEO.prepare("SELECT lat, lon, geocode_source, geocode_confidence FROM experience_providers WHERE id = ?").get(provAlreadyGeoGEO) as any;
+  assertEq(rowAlreadyGeoGEO.lat, 60.123, "geo-04a: a real address-precision geocode is never overwritten by Step D");
+  assertEq(rowAlreadyGeoGEO.geocode_confidence, "high", "geo-04b: confidence tier untouched");
+
+  const rowNothingGEO = dbGEO.prepare("SELECT lat, geocode_confidence FROM experience_providers WHERE id = ?").get(provNothingGEO) as any;
+  assertEq(rowNothingGEO.lat, null, "geo-05a: no address/kommune/fylke at all stays unresolved, no throw");
+  assertEq(rowNothingGEO.geocode_confidence, null, "geo-05b: no negative-cache tier written for the fully-unresolved case");
+
+  assertTrue(stats.providers_kommune_fallback >= 3, "geo-06: stats.providers_kommune_fallback counts geo-01/02/03");
+  assertTrue(stats.errors === 0, "geo-07: no worker errors despite the forced Step A failure");
+
+  const rowExpUnderApproxGEO = dbGEO.prepare("SELECT loc_lat, loc_lon, geo_precision FROM experiences WHERE id = ?").get(expUnderApproxGEO) as any;
+  assertEq(rowExpUnderApproxGEO.geo_precision, null, "geo-11a: Step B does NOT propagate an approximate provider position to its experiences (geo_precision stays null, not falsely 'address')");
+  assertEq(rowExpUnderApproxGEO.loc_lat, null, "geo-11b: loc_lat stays null too — no silent inherited position at all for this slice");
+
+  // ── geo-08/09/10: route-level honest labeling of the map block.
+  expStGEO.backfillProviderSlugs();
+  const seededKommuneGEO = expStGEO.listGardssalgProviders(50, 0).find((p: any) => p.id === provKommuneGEO);
+  const seededAlreadyGeoGEO = expStGEO.listGardssalgProviders(50, 0).find((p: any) => p.id === provAlreadyGeoGEO);
+  const seededNothingGEO = expStGEO.listGardssalgProviders(50, 0).find((p: any) => p.id === provNothingGEO);
+  assertTrue(!!seededKommuneGEO?.slug && !!seededAlreadyGeoGEO?.slug && !!seededNothingGEO?.slug, "geo-route: all three seeded providers got slugs");
+
+  const profileApproxGEO = invokeSeoGEO("/kategori/gardssalg/produsent/:providerSlug", { providerSlug: String(seededKommuneGEO!.slug) }, `/kategori/gardssalg/produsent/${seededKommuneGEO!.slug}`);
+  assertTrue(profileApproxGEO.body.includes("Ca. posisjon (kommune)"), "geo-08a: an approximate (Step D) position is labeled 'Ca. posisjon (kommune)'");
+  assertTrue(!profileApproxGEO.body.includes("Åpne i kart (OpenStreetMap)</span>"), "geo-08b: the exact-precision label is NOT shown for an approximate position");
+
+  const profileExactGEO = invokeSeoGEO("/kategori/gardssalg/produsent/:providerSlug", { providerSlug: String(seededAlreadyGeoGEO!.slug) }, `/kategori/gardssalg/produsent/${seededAlreadyGeoGEO!.slug}`);
+  assertTrue(profileExactGEO.body.includes("Åpne i kart (OpenStreetMap)"), "geo-09: a real address-precision position keeps the original exact-position label (no regression)");
+
+  const profileNoneGEO = invokeSeoGEO("/kategori/gardssalg/produsent/:providerSlug", { providerSlug: String(seededNothingGEO!.slug) }, `/kategori/gardssalg/produsent/${seededNothingGEO!.slug}`);
+  assertTrue(profileNoneGEO.body.includes("Nøyaktig posisjon er ikke registrert ennå."), "geo-10: a fully-unresolved position keeps the existing honest 'not registered yet' fallback (no regression)");
+
+  if (prevPathGEO === undefined) delete process.env.EXPERIENCES_DB_PATH;
+  else process.env.EXPERIENCES_DB_PATH = prevPathGEO;
+  dbFacGEO.__resetDbFactoryForTesting();
+  console.log("  gardssalg-go-live-gate slice 3 geocode Step D: OK (kommune fallback, fylke fallback, same-tick Step A->D chaining, no-overwrite of real geocodes, unresolved-without-throw, honest map-label rendering incl. no-regression on exact/none cases)");
+});
+
 // gb-qr: qrcode SVG generation smoke test. Isolated — touches no DB/Express
 // state at all — so it's safe to run through the async serial chain without
 // racing the fully-synchronous block above (which completes end-to-end
