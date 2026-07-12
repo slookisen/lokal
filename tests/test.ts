@@ -22969,58 +22969,44 @@ Promise.all([_contactClickTrackingPromise, _orchPr20260614Promise]).then(async (
 // __setDbForTesting, so it must run serially after the other
 // singleton-swapping blocks rather than concurrently with them.
 //
-// QUARANTINE (2026-07-06, dev-request 2026-07-06-ci-quarantine-auth-suite):
-// this block's 10 assertions are a proven false-negative on GitHub Actions —
-// identical failure signature survived 9 independent root-cause fix attempts
-// (see dev-requests/2026-07-06-ci-untracked-timer-followup.md, now P3) and the
-// file passes cleanly in isolation (`npx tsx
-// src/routes/agent-knowledge-get-auth.test.ts`). Rather than keep blocking
-// deploys on a false alarm, CI now runs this block in its OWN job
-// (`build-check-auth-isolated` in .github/workflows/fly-deploy.yml) where it
-// is proven green, and skips it here in the shared-process `build-check` job
-// to avoid the cross-test contamination. Both jobs stay required for
-// `deploy` — no enforcement is lost, only isolated. Revert by deleting this
-// `if` (and the isolated job) once the root cause is found.
-const _skipAgentKnowledgeGetAuthInSharedRun = process.env.CI_SKIP_AGENT_KNOWLEDGE_AUTH === "1";
+// QUARANTINE REMOVED (2026-07-12, dev-request 2026-07-06-ci-untracked-timer-
+// followup): this block's 10 assertions were a proven false-negative on
+// GitHub Actions for 9 independent root-cause fix attempts (see
+// dev-requests/2026-07-06-ci-untracked-timer-followup.md). Root cause found:
+// this file mixing dynamic `await import("../src/database/init")` with
+// `require(...)` under Node 20 + tsx's CJS/ESM loader could resolve to a
+// second, decoupled module instance with its own private `db` variable —
+// fixed as a side effect of PR #167 converting all 17 call sites to
+// `require()`. Confirmed via a throwaway CI diagnostic (PR #241): this block
+// now passes 21/0 in the shared process, part of a 5229/0 full run
+// (https://github.com/slookisen/lokal/actions/runs/29193173020). The
+// `CI_SKIP_AGENT_KNOWLEDGE_AUTH`-gated skip branch and the isolated
+// `build-check-auth-isolated` CI job (which quarantined this block into its
+// own process) are both removed — this block now runs here unconditionally,
+// same as every other block in this file.
 
 let _agentKnowledgeGetAuthResolve: () => void = () => {};
 const _agentKnowledgeGetAuthPromise: Promise<void> = new Promise<void>(r => {
   _agentKnowledgeGetAuthResolve = r;
 });
 
-if (_skipAgentKnowledgeGetAuthInSharedRun) {
-  // Must still wait on _homepageProvenanceEmailBackfillPromise before resolving, same as the
-  // non-skip branch below — every later block (oa-home-counters, admin-agents-register, ...)
-  // chains off _agentKnowledgeGetAuthPromise specifically because it is a singleton-swapping
-  // block that is guaranteed to run serially after every earlier singleton-swapping block.
-  // Resolving immediately here broke that guarantee under CI_SKIP_AGENT_KNOWLEDGE_AUTH=1: it
-  // let those later blocks start (and swap the DB singleton) concurrently with
-  // _homepageProvenanceEmailBackfillPromise's own singleton-swapping, corrupting shared state.
-  // Reproduced locally (CI_SKIP_AGENT_KNOWLEDGE_AUTH=1 npx tsx tests/test.ts): pr-56 and
-  // admin-agents-register both failed with exactly this pattern; fixed by awaiting here too.
-  _homepageProvenanceEmailBackfillPromise.then(() => {
-    console.log("\n── agent-knowledge-get-auth: quarantined to build-check-auth-isolated job (skipped here) ──");
+_homepageProvenanceEmailBackfillPromise.then(async () => {
+  console.log("\n── agent-knowledge-get-auth: GET /agents/:id/knowledge auth gate ──");
+  try {
+    const { runAgentKnowledgeGetAuthTests } = require("../src/routes/agent-knowledge-get-auth.test") as
+      typeof import("../src/routes/agent-knowledge-get-auth.test");
+    const jr = await runAgentKnowledgeGetAuthTests({ log: false });
+    passed += jr.passed;
+    failed += jr.failed;
+    for (const f of jr.failures) failures.push("agent-knowledge-get-auth: " + f);
+    console.log(`  agent-knowledge-get-auth: ${jr.passed} passed, ${jr.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("agent-knowledge-get-auth: unexpected error: " + String(err?.message || err));
+  } finally {
     _agentKnowledgeGetAuthResolve();
-  });
-} else {
-  _homepageProvenanceEmailBackfillPromise.then(async () => {
-    console.log("\n── agent-knowledge-get-auth: GET /agents/:id/knowledge auth gate ──");
-    try {
-      const { runAgentKnowledgeGetAuthTests } = require("../src/routes/agent-knowledge-get-auth.test") as
-        typeof import("../src/routes/agent-knowledge-get-auth.test");
-      const jr = await runAgentKnowledgeGetAuthTests({ log: false });
-      passed += jr.passed;
-      failed += jr.failed;
-      for (const f of jr.failures) failures.push("agent-knowledge-get-auth: " + f);
-      console.log(`  agent-knowledge-get-auth: ${jr.passed} passed, ${jr.failed} failed`);
-    } catch (err: any) {
-      failed++;
-      failures.push("agent-knowledge-get-auth: unexpected error: " + String(err?.message || err));
-    } finally {
-      _agentKnowledgeGetAuthResolve();
-    }
-  });
-}
+  }
+});
 
 // ── oa-home-counters (2026-07-05): OA homepage counter strip ────────────────
 // dev-request 2026-07-04-opplevagent-besokstall-og-forside-friskhet item 1.
@@ -23030,8 +23016,7 @@ if (_skipAgentKnowledgeGetAuthInSharedRun) {
 // main DB, for analytics_page_views) via __setDbForTesting, so it must run
 // serially after every OTHER singleton-swapping block, not concurrently with
 // them. _agentKnowledgeGetAuthPromise both (a) already resolves after
-// _homepageProvenanceEmailBackfillPromise (or immediately, when quarantined
-// via CI_SKIP_AGENT_KNOWLEDGE_AUTH) and (b) is itself a singleton-swapping
+// _homepageProvenanceEmailBackfillPromise and (b) is itself a singleton-swapping
 // block, so chaining off it — rather than off the same
 // _homepageProvenanceEmailBackfillPromise it depends on — is what prevents
 // this block from racing it (the exact race pattern documented above for
