@@ -28018,6 +28018,34 @@ console.log("\n── gardssalg-rfb-enrich: strict-match + skip-junk + lock rule
   ]);
   assertEq(byDomainDup.size, 1, "enrich-14g: same-agent duplicate rows do NOT trigger a collision");
 
+  // (4) EXACT-NAME fallback (rfb-seed provenance): a provider with NO website —
+  // seeded by name — is recovered via exact normalized-name match to RFB. This
+  // is the "Alde Sider" case: its provider row has no hjemmeside, so domain match
+  // misses, but its navn exactly matches the RFB producer.
+  const { indexRfbByName } = enrich;
+  const byName = indexRfbByName([rfbAlde]);
+  const alde = { ...base, navn: "Alde Sider", hjemmeside: null, adresse: null };
+  const rName = pickEnrichmentFields(alde, byDomain, byName);
+  assertEq(rName.status, "would_enrich", "enrich-30: no-website provider recovered by exact-name match");
+  assertEq(rName.matched_by, "name", "enrich-31: matched_by='name' (fallback), not domain");
+  assertEq(rName.matched_rfb?.agent_id, "rfb-alde", "enrich-32: name match resolves the right RFB producer");
+  assertEq(rName.copy.hjemmeside, "https://aldesider.no/", "enrich-33: name match also fills hjemmeside from the RFB site");
+  assertEq(rName.copy.adresse, "Bleievegen 16, 5776 Nå", "enrich-34: name match fills address too");
+
+  // Domain match still takes precedence + is labelled matched_by='domain'.
+  const rDom = pickEnrichmentFields(base, byDomain, byName);
+  assertEq(rDom.matched_by, "domain", "enrich-35: a usable domain still wins and is labelled 'domain'");
+
+  // Name COLLISION: two different producers share a normalized name → dropped,
+  // so a provider on that name is NOT matched (no wrong-producer copy).
+  const byNameCollide = indexRfbByName([
+    { ...rfbAlde, agent_id: "rfb-p", name: "Fellesnavn Gård", url: "https://p.no" },
+    { ...rfbAlde, agent_id: "rfb-q", name: "Fellesnavn Gård", url: "https://q.no" },
+  ]);
+  assertEq(byNameCollide.size, 0, "enrich-36: colliding normalized name dropped from the name index");
+  const rNameCollide = pickEnrichmentFields({ ...base, navn: "Fellesnavn Gård", hjemmeside: null }, new Map(), byNameCollide);
+  assertEq(rNameCollide.status, "no_domain", "enrich-37: provider on a collided name → no_domain (no wrong-producer copy)");
+
   // (4) content_source lock → never overwrite human/owner-authored rows.
   const r4 = pickEnrichmentFields({ ...base, content_source: "manual" }, byDomain);
   assertEq(r4.status, "locked", "enrich-15: content_source=manual → locked");

@@ -21,7 +21,7 @@
 // This file is PURE (no DB/IO) so it is unit-testable; the route wires it to the
 // two DBs and does the dry-run/apply write.
 
-import { normalizeDomain } from "./blocklist-service";
+import { normalizeDomain, normalizeName } from "./blocklist-service";
 import { isDisplayablePhone } from "./contact-normalizer";
 import { isJunkDescription } from "./description-quality";
 
@@ -60,6 +60,10 @@ export interface EnrichResult {
   navn: string;
   status: "would_enrich" | "locked" | "no_domain" | "no_match" | "nothing_to_fill";
   matched_rfb?: { agent_id: string; name: string; domain: string };
+  // How the RFB producer was matched: 'domain' (strict website match — strongest)
+  // or 'name' (exact normalized-name via the rfb-seed provenance — the seed was
+  // name-based, so an exact-name hit is reliable recovery, not fuzzy matching).
+  matched_by?: "domain" | "name";
   copy: Record<string, string | number>;      // field → value that WOULD be written
   skipped: Array<{ field: string; reason: string }>;
 }
@@ -191,6 +195,32 @@ export function indexRfbByDomain(sources: RfbSource[]): Map<string, RfbSource> {
 }
 
 /**
+ * Build the normalized-name→RFB-source index used as the FALLBACK match when a
+ * provider has no usable website domain. The opplevagent gårdssalg providers
+ * were seeded from RFB by name (rfb-seed), so a provider's `navn` is the exact
+ * name of its RFB agent — an exact normalized-name hit is reliable provenance
+ * recovery, not fuzzy matching. Same collision safety as the domain index: if
+ * two DIFFERENT producers normalize to the same name, that name is dropped
+ * (un-matchable) so we never attach the wrong producer's info.
+ */
+export function indexRfbByName(sources: RfbSource[]): Map<string, RfbSource> {
+  const map = new Map<string, RfbSource>();
+  const collided = new Set<string>();
+  for (const s of sources) {
+    const n = normalizeName(s.name);
+    if (!n) continue;
+    const existing = map.get(n);
+    if (existing) {
+      if (existing.agent_id !== s.agent_id) collided.add(n);
+      continue;
+    }
+    map.set(n, s);
+  }
+  for (const n of collided) map.delete(n);
+  return map;
+}
+
+/**
  * Decide what to copy from RFB into a seeded gårdssalg provider. Pure.
  *   - Locked (content_source manual/claim) → status 'locked', copy {}.
  *   - No provider domain → 'no_domain' (flag for manual review).
@@ -200,6 +230,7 @@ export function indexRfbByDomain(sources: RfbSource[]): Map<string, RfbSource> {
 export function pickEnrichmentFields(
   provider: EnrichProviderRow,
   byDomain: Map<string, RfbSource>,
+  byName?: Map<string, RfbSource>,
 ): EnrichResult {
   const base: EnrichResult = { provider_id: provider.id, navn: provider.navn, status: "no_match", copy: {}, skipped: [] };
 
@@ -208,13 +239,24 @@ export function pickEnrichmentFields(
     return { ...base, status: "locked" };
   }
 
+  // 1) Strict website-domain match (strongest signal).
   const providerDomain = normalizeDomain(provider.hjemmeside);
-  // No domain, or a generic/shared one (social/marketplace/own) that can't
-  // uniquely identify a producer → flag for manual review, never auto-match.
-  if (!isMatchableDomain(providerDomain)) return { ...base, status: "no_domain" };
+  const domainMatchable = isMatchableDomain(providerDomain);
+  let src: RfbSource | undefined = domainMatchable ? byDomain.get(providerDomain) : undefined;
+  let matchedBy: "domain" | "name" | undefined = src ? "domain" : undefined;
 
-  const src = byDomain.get(providerDomain);
-  if (!src) return { ...base, status: "no_match" };
+  // 2) Fallback: exact normalized-name match via the rfb-seed provenance.
+  if (!src && byName) {
+    const nm = normalizeName(provider.navn);
+    const nsrc = nm ? byName.get(nm) : undefined;
+    if (nsrc) { src = nsrc; matchedBy = "name"; }
+  }
+
+  if (!src) {
+    // No domain to try AND no name hit → nothing to go on (no_domain); had a
+    // usable domain/name but no RFB producer → no_match. Both need manual review.
+    return { ...base, status: domainMatchable ? "no_match" : "no_domain" };
+  }
 
   const inference = inferenceOnlyFields(src.verification_review_reason);
   const copy: Record<string, string | number> = {};
@@ -256,7 +298,21 @@ export function pickEnrichmentFields(
     copy.lat = src.lat;
     copy.lon = src.lng;
   }
+  // hjemmeside ← RFB producer's own site (mainly for NAME-matched rows, whose
+  // provider hjemmeside is empty — that's why domain match missed them). Only a
+  // real, matchable (non-generic) RFB domain is copied.
+  const srcDomain = normalizeDomain(src.url);
+  if (isEmpty(provider.hjemmeside) && src.url && src.url.trim() && isMatchableDomain(srcDomain)) {
+    copy.hjemmeside = src.url.trim();
+  }
 
   const status: EnrichResult["status"] = Object.keys(copy).length ? "would_enrich" : "nothing_to_fill";
-  return { provider_id: provider.id, navn: provider.navn, status, matched_rfb: { agent_id: src.agent_id, name: src.name, domain: providerDomain }, copy, skipped };
+  // matched_rfb.domain: the provider domain for a domain match, else the RFB
+  // producer's own domain (name-matched rows have no provider domain).
+  const matchDomain = matchedBy === "domain" ? providerDomain : srcDomain;
+  return {
+    provider_id: provider.id, navn: provider.navn, status, matched_by: matchedBy,
+    matched_rfb: { agent_id: src.agent_id, name: src.name, domain: matchDomain },
+    copy, skipped,
+  };
 }
