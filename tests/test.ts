@@ -27993,6 +27993,33 @@ console.log("\n── gardssalg-rfb-enrich: strict-match + skip-junk + lock rule
   const r3 = pickEnrichmentFields({ ...base, hjemmeside: "https://someoneelse.no" }, byDomain);
   assertEq(r3.status, "no_match", "enrich-14: unmatched domain → no_match (never a wrong-producer copy)");
 
+  // (3b) Generic/shared domains (social/own) are NEVER a match — they'd false-
+  // link two different producers. Even if an RFB source shares facebook.com, a
+  // provider on facebook.com is flagged no_domain, not matched.
+  const byDomainFb = indexRfbByDomain([{ ...rfbAlde, url: "https://facebook.com/aldesider" }]);
+  assertEq(byDomainFb.size, 0, "enrich-14b: RFB source on facebook.com is NOT indexed (generic domain)");
+  const rFb = pickEnrichmentFields({ ...base, hjemmeside: "https://facebook.com/ulvikfrukt" }, byDomain);
+  assertEq(rFb.status, "no_domain", "enrich-14c: provider on facebook.com → no_domain (generic, manual review)");
+  const rOwn = pickEnrichmentFields({ ...base, hjemmeside: "https://rettfrabonden.com/produsent/x" }, byDomain);
+  assertEq(rOwn.status, "no_domain", "enrich-14d: provider on our own domain → no_domain (never a match)");
+
+  // (3c) COLLISION: two DIFFERENT producers on the same domain → that domain is
+  // made un-matchable (never an arbitrary first-wins pick that copies the wrong
+  // producer's info). A provider on the collided domain gets no_match.
+  const byDomainCollide = indexRfbByDomain([
+    { ...rfbAlde, agent_id: "rfb-x", name: "Farm X", url: "https://sites.google.com/view/farmx" },
+    { ...rfbAlde, agent_id: "rfb-y", name: "Farm Y", url: "https://sites.google.com/view/farmy" },
+  ]);
+  assertEq(byDomainCollide.size, 0, "enrich-14e: colliding domain (2 producers, sites.google.com) dropped from index");
+  const rCollide = pickEnrichmentFields({ ...base, hjemmeside: "https://sites.google.com/view/farmx" }, byDomainCollide);
+  assertEq(rCollide.status, "no_match", "enrich-14f: provider on a collided domain → no_match (no wrong-producer copy)");
+  // Same-agent duplicate rows are NOT a collision (identical agent_id).
+  const byDomainDup = indexRfbByDomain([
+    { ...rfbAlde, url: "https://aldesider.no" },
+    { ...rfbAlde, url: "https://aldesider.no" },
+  ]);
+  assertEq(byDomainDup.size, 1, "enrich-14g: same-agent duplicate rows do NOT trigger a collision");
+
   // (4) content_source lock → never overwrite human/owner-authored rows.
   const r4 = pickEnrichmentFields({ ...base, content_source: "manual" }, byDomain);
   assertEq(r4.status, "locked", "enrich-15: content_source=manual → locked");

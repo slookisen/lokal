@@ -66,7 +66,8 @@ export interface EnrichResult {
 
 // Emails that are obviously placeholders / non-contactable — never copy these.
 const JUNK_EMAIL_PATTERNS = [
-  "user@domain.com",
+  "@domain.com",   // user@domain.com / post@domain.com placeholders (not real *domain.com)
+  "@example.",
   "example.com",
   "example.org",
   "test@test",
@@ -74,7 +75,6 @@ const JUNK_EMAIL_PATTERNS = [
   "no-reply@",
   "your@email",
   "email@email",
-  "domain.com",
 ];
 export function isJunkEmail(email: string | null | undefined): boolean {
   if (!email) return true;
@@ -82,6 +82,18 @@ export function isJunkEmail(email: string | null | undefined): boolean {
   if (!e || !e.includes("@") || e.length < 5) return true;
   if (e.includes(" ")) return true;
   return JUNK_EMAIL_PATTERNS.some((p) => e.includes(p));
+}
+
+// A light address sanity gate (the address field's counterpart to isJunkEmail /
+// isJunkDescription). Real Norwegian street addresses carry a number and/or a
+// postal code; the junk cases are short filler like "Norge" / "Se hjemmeside".
+export function isJunkAddress(addr: string | null | undefined): boolean {
+  if (!addr) return true;
+  const a = addr.trim();
+  if (a.length < 6) return true;
+  const low = a.toLowerCase();
+  const junkPhrases = ["se hjemmeside", "se nettside", "ukjent", "n/a", "norge", "ikke oppgitt", "kommer snart"];
+  return junkPhrases.some((p) => low === p || low.includes(p));
 }
 
 // Which factual fields did the RFB verifier flag as inference-only (fabricated
@@ -117,23 +129,64 @@ export function parseProductNames(productsJson: string | null | undefined): stri
       : "";
     const t = name.trim();
     if (t && !seen.has(t.toLowerCase())) { seen.add(t.toLowerCase()); out.push(t); }
+    if (out.length >= 50) break; // cap — never store an unbounded product blob
   }
   return out;
 }
 
+// Domains that are NOT a unique producer identity — a match on one of these is
+// meaningless and would false-link two different producers (the wrong-producer-
+// info-on-a-page harm Daniel called out). Covers our own domains, social /
+// marketplace / map profiles, and free-site builders whose bare apex is shared
+// across thousands of tenants. A provider or source whose only URL normalizes to
+// one of these is treated as UN-matchable → flagged no_domain (manual review),
+// never auto-copied. (Tenant subdomains like "gard.wixsite.com" survive
+// normalizeDomain intact and stay distinct — only the bare shared apex is here.)
+const GENERIC_DOMAINS: ReadonlySet<string> = new Set([
+  "rettfrabonden.com", "opplevagent.no", "lokal.fly.dev",
+  "facebook.com", "instagram.com", "twitter.com", "x.com", "linkedin.com",
+  "youtube.com", "tiktok.com", "pinterest.com", "snapchat.com",
+  "google.com", "maps.google.com", "goo.gl", "linktr.ee",
+  "wixsite.com", "wix.com", "squarespace.com", "wordpress.com", "blogspot.com",
+  "weebly.com", "webnode.no", "one.com", "gmail.com", "hotmail.com", "outlook.com",
+]);
+
+/** A domain we can safely use as a unique producer identity for matching. */
+export function isMatchableDomain(domain: string): boolean {
+  if (!domain) return false;
+  if (!domain.includes(".")) return false;          // bare host, not a real domain
+  if (GENERIC_DOMAINS.has(domain)) return false;     // shared/social/own — not identity
+  return true;
+}
+
 /**
- * Build the domain→RFB-source index. A source with no resolvable domain is
- * omitted (can't be strict-matched). If two sources share a domain, the FIRST
- * wins and the collision is not silently merged — callers can detect ambiguity
- * by comparing counts.
+ * Build the domain→RFB-source index. A source with no resolvable OR non-matchable
+ * (generic/shared) domain is omitted.
+ *
+ * COLLISION SAFETY: if two DIFFERENT active producers normalize to the SAME
+ * domain (e.g. a shared free-host apex like sites.google.com that slips past the
+ * generic list, an umbrella + member farms on one cooperative site, or duplicate
+ * re-discovered agent rows), we do NOT pick an arbitrary winner — a first-wins
+ * pick would silently attach the WRONG producer's address/phone to a page, the
+ * exact harm Daniel forbade. Instead the colliding domain is made UN-matchable
+ * (removed from the map), so every provider on it falls to no_match → manual
+ * review. Same-agent duplicates (identical agent_id) are not treated as a
+ * collision.
  */
 export function indexRfbByDomain(sources: RfbSource[]): Map<string, RfbSource> {
   const map = new Map<string, RfbSource>();
+  const collided = new Set<string>();
   for (const s of sources) {
     const d = normalizeDomain(s.url);
-    if (!d) continue;
-    if (!map.has(d)) map.set(d, s);
+    if (!isMatchableDomain(d)) continue;
+    const existing = map.get(d);
+    if (existing) {
+      if (existing.agent_id !== s.agent_id) collided.add(d); // two distinct producers → ambiguous
+      continue;
+    }
+    map.set(d, s);
   }
+  for (const d of collided) map.delete(d);
   return map;
 }
 
@@ -156,7 +209,9 @@ export function pickEnrichmentFields(
   }
 
   const providerDomain = normalizeDomain(provider.hjemmeside);
-  if (!providerDomain) return { ...base, status: "no_domain" };
+  // No domain, or a generic/shared one (social/marketplace/own) that can't
+  // uniquely identify a producer → flag for manual review, never auto-match.
+  if (!isMatchableDomain(providerDomain)) return { ...base, status: "no_domain" };
 
   const src = byDomain.get(providerDomain);
   if (!src) return { ...base, status: "no_match" };
@@ -171,9 +226,10 @@ export function pickEnrichmentFields(
     if (src.about && src.about.trim() && !isJunkDescription(src.about)) copy.about_text = src.about.trim();
     else if (src.about && src.about.trim()) skipped.push({ field: "about_text", reason: "junk_description" });
   }
-  // adresse ← address (skip inference-only)
+  // adresse ← address (skip inference-only and junk/filler addresses)
   if (isEmpty(provider.adresse) && src.address && src.address.trim()) {
     if (inference.has("address")) skipped.push({ field: "adresse", reason: "inference_only" });
+    else if (isJunkAddress(src.address)) skipped.push({ field: "adresse", reason: "junk_address" });
     else copy.adresse = src.address.trim();
   }
   // telefon ← phone (skip non-displayable / inference-only)
