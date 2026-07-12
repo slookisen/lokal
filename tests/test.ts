@@ -3282,6 +3282,60 @@ console.log("\n── cross-source-validator: domainCoherenceCheck ──");
   );
 }
 
+// ── dev-request 2026-06-30-open-stuck-verification-bucket, 2026-07-12T10:55Z
+// slice: PLACEHOLDER_EMAIL_DOMAINS bypass. Prod false positive: an agent was
+// held in review_required solely because knowledge.email is "info@domain.com"
+// (or similar boilerplate contact-form sentinel) — not a real second entity's
+// mailbox. Mirrors the FREE_MAIL_DOMAINS bypass above; must not touch the
+// website-mismatch branch or the Eidsmo true-positive.
+{
+  // Real prod shape: agentHost guldkolla.no, no distinguishing website, email
+  // host is the placeholder sentinel "domain.com".
+  const r = domainCoherenceCheck("https://guldkolla.no/", "https://guldkolla.no", "info@domain.com");
+  assertEq(r.coherent, true, "dc-placeholder: placeholder email domain.com on own-domain agent → coherent");
+}
+{
+  // Mismatched website/agent host is irrelevant here — email placeholder bypass
+  // must fire independent of the website field.
+  const r = domainCoherenceCheck("https://guldkolla.no/", null, "info@domain.com");
+  assertEq(r.coherent, true, "dc-placeholder: placeholder email domain.com, no website → coherent");
+}
+{
+  // Every listed placeholder host is exempt.
+  const hosts = [
+    "domain.com",
+    "example.com",
+    "example.org",
+    "example.net",
+    "yourdomain.com",
+    "yourcompany.com",
+    "website.com",
+    "test.com",
+    "company.com",
+    "email.com",
+  ];
+  for (const h of hosts) {
+    const r = domainCoherenceCheck("https://eidsmokjott.no/", "https://eidsmokjott.no", `info@${h}`);
+    assertEq(r.coherent, true, `dc-placeholder: placeholder host ${h} → coherent`);
+  }
+}
+{
+  // Regression guard: a genuine cross-entity mismatch (Eidsmo true-positive)
+  // must stay incoherent — the placeholder bypass must not widen the gate.
+  const r = domainCoherenceCheck("https://eidsmokjott.no/", "https://eidsmokjott.no", "post@slakthuset.no");
+  assertEq(r.coherent, false, "dc-placeholder: non-placeholder cross-entity email (slakthuset.no) still incoherent");
+}
+{
+  // Regression guard: existing free-mail bypass still works unregressed.
+  const r = domainCoherenceCheck("https://gard.no/", "https://gard.no", "ola@gmail.com");
+  assertEq(r.coherent, true, "dc-placeholder: free-mail bypass (gmail.com) unregressed");
+}
+{
+  // Regression guard: existing directory-host bypass still works unregressed.
+  const r = domainCoherenceCheck("https://hanen.no/produsent/foo", "https://realproducer.no", "post@realproducer.no");
+  assertEq(r.coherent, true, "dc-placeholder: directory-host bypass (hanen.no) unregressed");
+}
+
 // ── PR-129: cross-TLD same-brand equivalence (Eidsmo-safe) ──
 {
   // Same brand, different TLD on the EMAIL → now coherent (was a false positive).
