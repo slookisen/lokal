@@ -4519,8 +4519,13 @@ router.get("/bm-events", (req: Request, res: Response) => {
 // source_count≥2 and be promoted to the outreach pool.
 //
 // Auth: same x-admin-key as google-rating-batch.
-// Body: { agentIds?: string[], limit?: number }  (all optional)
-//   - agentIds: process exactly these agents.
+// Body: { agentIds?: string[], limit?: number, select?: string }  (all optional)
+//   - agentIds: process exactly these agents (wins over `select`).
+//   - select: "verified_no_email" targets verified agents whose email column
+//     is still empty but who have a homepage — the pipeline's own-domain
+//     email extraction can then backfill them into the outreach pool
+//     (dev-request 2026-07-12-rfb-enrichment-pool-refill-and-waste-reduction).
+//     Any other non-absent select value is rejected with 400.
 //   - else auto-select: TIER-1 agents with a website, some enrichment, but
 //     field_provenance empty/{} OR lacking a 2nd source for address/phone,
 //     with verification_status IN (data_insufficient, review_required,
@@ -4540,9 +4545,10 @@ router.post("/admin/homepage-provenance-batch", async (req: Request, res: Respon
     return;
   }
 
-  const { agentIds: bodyAgentIds, limit: limitRaw } = req.body as {
+  const { agentIds: bodyAgentIds, limit: limitRaw, select: selectRaw } = req.body as {
     agentIds?: unknown;
     limit?: unknown;
+    select?: unknown;
   };
   const limit = Math.min(
     typeof limitRaw === "number" && limitRaw > 0 ? Math.floor(limitRaw) : 25,
@@ -4552,12 +4558,57 @@ router.post("/admin/homepage-provenance-batch", async (req: Request, res: Respon
   const db = getDb();
   let targetIds: string[];
 
+  // dev-request 2026-07-12-rfb-enrichment-pool-refill-and-waste-reduction:
+  // both auto-select paths skip agents parked by 3 consecutive fetch failures
+  // (homepage_unreachable_since set in processAgent below) until 30 days have
+  // passed — retried monthly, not burned daily. Explicit agentIds is NOT
+  // filtered (explicit targeting is the trusted path). Env read at request
+  // time so the rollback flag works without a restart.
+  const parkingExclusion = process.env.HOMEPAGE_PARKING_DISABLED === "true"
+    ? ""
+    : `AND (k.homepage_unreachable_since IS NULL OR k.homepage_unreachable_since <= datetime('now','-30 days'))`;
+
   if (Array.isArray(bodyAgentIds) && bodyAgentIds.length > 0) {
     // Explicit list — trust the caller, just cap it.
     targetIds = (bodyAgentIds as unknown[])
       .filter((id): id is string => typeof id === "string" && id.trim().length > 0)
       .map((id) => id.trim())
       .slice(0, limit);
+  } else if (selectRaw !== undefined && selectRaw !== "verified_no_email") {
+    // An admin endpoint driven by autonomous routines must not silently run
+    // the wrong cohort on a typo'd select value — reject instead of falling
+    // through to the default auto-select (PR #248 review finding).
+    res.status(400).json({
+      error: `Ukjent select-verdi: ${String(selectRaw)}. Gyldige: "verified_no_email" (eller utelat feltet for standard auto-select).`,
+    });
+    return;
+  } else if (selectRaw === "verified_no_email") {
+    // select:"verified_no_email" — verified agents the default auto-select can
+    // never reach (it only targets pre-verification statuses): email column
+    // still empty, homepage on file. Same reachable-first ordering idiom as
+    // the default query (but NULLIF on website so an empty-string website
+    // falls through to a.url here the same way processAgent's own fallback
+    // does — an '' website must not burn a LIMIT slot unprocessably). The
+    // pipeline's existing own-domain/aggregator email guards apply unchanged
+    // downstream.
+    const rows = db
+      .prepare(
+        `SELECT k.agent_id, COALESCE(NULLIF(k.website, ''), a.url) AS homepage_url
+           FROM agent_knowledge k
+           JOIN agents a ON a.id = k.agent_id
+          WHERE k.verification_status = 'verified'
+            AND (k.email IS NULL OR k.email = '')
+            AND (k.website IS NOT NULL AND k.website != '' OR a.url IS NOT NULL AND a.url != '')
+            ${parkingExclusion}
+          ORDER BY
+            CASE WHEN k.url_last_status BETWEEN 200 AND 399 THEN 0 ELSE 1 END,
+            k.updated_at ASC
+          LIMIT ?`
+      )
+      .all(limit) as Array<{ agent_id: string; homepage_url: string | null }>;
+    targetIds = rows
+      .filter((r) => r.homepage_url && r.homepage_url.trim())
+      .map((r) => r.agent_id);
   } else {
     // Auto-select: agents with a website, some enrichment data, but
     // field_provenance is empty/{} or lacks a homepage Tier-A source, and
@@ -4575,6 +4626,7 @@ router.post("/admin/homepage-provenance-batch", async (req: Request, res: Respon
               OR k.field_provenance = '{}'
               OR k.field_provenance NOT LIKE '%"homepage"%'
             )
+            ${parkingExclusion}
           -- orch-pr-20260625-1 (controller-handoff 2026-06-24-lokal-agent-enrichment-2
           --   + companion -homepage-fetch-wall-1): order REACHABLE homepages first so the
           --   batch stops re-selecting the same dead-URL TIER-1 cohort every run. Pure
@@ -4704,6 +4756,45 @@ router.post("/admin/homepage-provenance-batch", async (req: Request, res: Respon
     | { agentId: string; status: "fetch_error"; error: string }
     | { agentId: string; status: "not_found" };
 
+  // dev-request 2026-07-12-rfb-enrichment-pool-refill-and-waste-reduction:
+  // dead-cohort parking. Every fetch failure increments
+  // homepage_fetch_attempts; at PARK_AFTER_ATTEMPTS consecutive failures the
+  // agent is parked (homepage_unreachable_since stamped) and excluded from
+  // both auto-select paths for 30 days. Any successful fetch fully resets
+  // the counter. parked_now (in the response) names the agents that crossed
+  // the threshold during THIS run so enrichment reports can list them.
+  const PARK_AFTER_ATTEMPTS = 3;
+  const PARK_BACKOFF_MS = 30 * 86_400_000;
+  const parkedNow: string[] = [];
+
+  function recordHomepageFetchFailure(agentId: string): void {
+    db.prepare(
+      "UPDATE agent_knowledge SET homepage_fetch_attempts = homepage_fetch_attempts + 1 WHERE agent_id = ?"
+    ).run(agentId);
+    const row = db
+      .prepare(
+        "SELECT homepage_fetch_attempts, homepage_unreachable_since FROM agent_knowledge WHERE agent_id = ?"
+      )
+      .get(agentId) as
+      | { homepage_fetch_attempts: number; homepage_unreachable_since: string | null }
+      | undefined;
+    if (row && row.homepage_fetch_attempts >= PARK_AFTER_ATTEMPTS) {
+      // Stamp when not yet parked — or RE-STAMP when the 30-day backoff has
+      // expired and the retry failed again. Without the re-stamp, the stale
+      // timestamp keeps satisfying the exclusion clause's `<= now-30d`
+      // forever, so a still-dead agent would revert to being selected every
+      // run after its first backoff cycle (PR #248 review blocker).
+      const since = row.homepage_unreachable_since;
+      const expired = since !== null && Date.parse(since) <= Date.now() - PARK_BACKOFF_MS;
+      if (!since || expired) {
+        db.prepare(
+          "UPDATE agent_knowledge SET homepage_unreachable_since = ? WHERE agent_id = ?"
+        ).run(new Date().toISOString(), agentId);
+        parkedNow.push(agentId);
+      }
+    }
+  }
+
   async function processAgent(agentId: string): Promise<AgentOutcome> {
     // Look up homepage URL (prefer agent_knowledge.website, fall back to agents.url).
     const kRow = db
@@ -4743,6 +4834,7 @@ router.post("/admin/homepage-provenance-batch", async (req: Request, res: Respon
         signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
       });
       if (!resp.ok) {
+        recordHomepageFetchFailure(agentId);
         return {
           agentId,
           status: "fetch_error",
@@ -4751,12 +4843,19 @@ router.post("/admin/homepage-provenance-batch", async (req: Request, res: Respon
       }
       html = await resp.text();
     } catch (fetchErr: any) {
+      recordHomepageFetchFailure(agentId);
       return {
         agentId,
         status: "fetch_error",
         error: fetchErr?.message ?? String(fetchErr),
       };
     }
+
+    // Successful fetch — reset the parking counter before any extraction, so
+    // a reachable homepage never accumulates stale failure attempts.
+    db.prepare(
+      "UPDATE agent_knowledge SET homepage_fetch_attempts = 0, homepage_unreachable_since = NULL WHERE agent_id = ?"
+    ).run(agentId);
 
     // Extract contact fields.
     const extractedEmail = extractEmail(html);
@@ -4942,6 +5041,9 @@ router.post("/admin/homepage-provenance-batch", async (req: Request, res: Respon
       provenance_written: provenanceWritten,
       by_field: byField,
       errors,
+      // Agents that crossed the 3-failure parking threshold during this run
+      // (dev-request 2026-07-12-rfb-enrichment-pool-refill-and-waste-reduction).
+      parked_now: parkedNow,
     },
   });
 });
