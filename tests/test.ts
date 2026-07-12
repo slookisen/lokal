@@ -15719,8 +15719,8 @@ const _orchPrDedupBackfillEndpointPromise: Promise<void> = new Promise<void>((r)
 // requireAdmin()), (3) dry_run default with ZERO candidates never requires the
 // LLM to succeed (no ANTHROPIC_API_KEY needed), (4) a stubbed successful
 // globalThis.fetch response writes title_no on a real run (dry_run: false),
-// (5) a stubbed failed/unparseable response leaves title_no NULL — never
-// fabricated — and never throws.
+// (5) a stubbed failed/unparseable/non-array-content response leaves
+// title_no NULL — never fabricated — and never throws (500).
 console.log("\n── orch-pr-titleno: POST /api/opplevelser/admin/experiences-title-no-backfill ──");
 
 let _titleNoBackfillResolve: () => void = () => {};
@@ -15954,6 +15954,27 @@ const _titleNoBackfillPromise: Promise<void> = new Promise<void>((r) => {
       assertEq(r.status, 200, "tnb-8a: real run with unparseable LLM body → 200 (does not throw/500)");
       assertEq(r.body.written, 0, "tnb-8b: written: 0 — nothing fabricated");
       assertEq(titleNoOf(idFailTNB), null, "tnb-8c: title_no still NULL — unparseable response never guessed");
+    }
+
+    // ── tnb-9: same candidate, this time a stubbed 200 OK response whose
+    //    `content` field is present but NOT an array (an object instead) —
+    //    result?.content?.find(...) would throw a TypeError since .find is
+    //    not a function on a non-array value. Guards the same never-fabricate,
+    //    never-throw contract as tnb-7/tnb-8: the row is skipped (title_no
+    //    stays NULL) and the route responds 200, not 500. ────────────────
+    globalThis.fetch = (async () => {
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({ content: { unexpected: "shape" } }),
+      };
+    }) as unknown as typeof fetch;
+    {
+      const r = await titleNoBackfillReq(ADMIN_KEY_TNB, { dry_run: false });
+      assertEq(r.status, 200, "tnb-9a: real run with non-array content shape → 200 (does not throw/500)");
+      assertEq(r.body.written, 0, "tnb-9b: written: 0 — nothing fabricated");
+      assertEq(r.body.skipped, 1, "tnb-9c: skipped: 1 — the malformed-shape row is skipped, not guessed");
+      assertEq(titleNoOf(idFailTNB), null, "tnb-9d: title_no stays NULL for the row whose LLM response had a non-array content field");
     }
 
     dbFactoryTNB.__resetDbFactoryForTesting();
