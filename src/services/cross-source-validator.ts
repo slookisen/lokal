@@ -634,6 +634,26 @@ export function isKnownDirectoryHost(host: string): boolean {
   return KNOWN_DIRECTORY_HOSTS.has(host);
 }
 
+// Placeholder/template sentinel domains left behind by boilerplate contact
+// forms / CMS themes (e.g. "info@domain.com"). These are not a second real
+// entity's mailbox, so a knowledge.email host match here must not be treated
+// as a distributor-misattribution signal.
+// dev-request 2026-06-30-open-stuck-verification-bucket, 2026-07-12T10:55Z
+// slice: n=1 agent (guldkolla.no) blocked solely by knowledge.email host
+// domain.com — a category error, same shape as FREE_MAIL_DOMAINS above.
+export const PLACEHOLDER_EMAIL_DOMAINS: readonly string[] = [
+  "domain.com",
+  "example.com",
+  "example.org",
+  "example.net",
+  "yourdomain.com",
+  "yourcompany.com",
+  "website.com",
+  "test.com",
+  "company.com",
+  "email.com",
+];
+
 // ─── orch-pr-27 (2026-06-17): broadened aggregator/directory matcher ──────────
 // Host *families* where EVERY subdomain is an aggregator/municipal/placeholder
 // host and therefore never a producer's own website. Used ONLY by the
@@ -1066,9 +1086,12 @@ export function domainCoherenceCheck(
   }
 
   // Email check — free-mail domains get a pass (personal address, not a
-  // distributor-misattribution signal).
+  // distributor-misattribution signal). Placeholder/template sentinel
+  // domains (dev-request 2026-06-30-open-stuck-verification-bucket,
+  // 2026-07-12 slice) get the same pass: "info@domain.com" is boilerplate
+  // contact-form residue, not a second entity's real mailbox.
   if (emailHost) {
-    if (!FREE_MAIL_DOMAINS.includes(emailHost)) {
+    if (!FREE_MAIL_DOMAINS.includes(emailHost) && !PLACEHOLDER_EMAIL_DOMAINS.includes(emailHost)) {
       const emailRoot = registrableDomain(emailHost);
       if (!domainsEquivalent(emailRoot, agentRoot)) {
         return {
