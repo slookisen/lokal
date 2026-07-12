@@ -826,6 +826,8 @@ router.get(["/privacy", "/privacy-policy"], (_req: Request, res: Response) => {
 <meta charset="utf-8">
 <link rel="manifest" href="/manifest.json">
 <meta name="theme-color" content="#2D5016">
+<script>if('serviceWorker' in navigator&&!/finn-tannlege\.com|opplevagent\.no/.test(location.hostname)){window.addEventListener('load',function(){navigator.serviceWorker.register('/sw.js').catch(function(){});});}</script>
+<script defer src="/install-prompt.js"></script>
 <title>Personvern / Privacy — ${getConfig().display_name}</title>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="description" content="Privacy policy for ${getConfig().display_name} (rettfrabonden.com) — A2A marketplace for local food in Norway.">
@@ -956,6 +958,8 @@ router.get(["/terms", "/terms-of-service", "/tos", "/vilkar"], (_req: Request, r
 <link rel="icon" href="/favicon.ico" sizes="any">
 <link rel="manifest" href="/manifest.json">
 <meta name="theme-color" content="#2D5016">
+<script>if('serviceWorker' in navigator&&!/finn-tannlege\.com|opplevagent\.no/.test(location.hostname)){window.addEventListener('load',function(){navigator.serviceWorker.register('/sw.js').catch(function(){});});}</script>
+<script defer src="/install-prompt.js"></script>
 <style>
   body { font-family: system-ui, -apple-system, sans-serif; max-width: 760px; margin: 2rem auto; padding: 0 1rem; color: #1a1a1a; line-height: 1.6; }
   h1 { border-bottom: 2px solid #2d5016; padding-bottom: 0.3rem; }
