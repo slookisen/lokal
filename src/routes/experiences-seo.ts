@@ -1301,7 +1301,12 @@ function renderOpplevelseDetail(
   exp: ReturnType<typeof getPublishedExperienceBySlug>,
   provider: Record<string, unknown> | null,
   related: RelatedExperienceRow[],
-  url: string
+  url: string,
+  // dev-request 2026-07-04-opplevagent-dedup-og-norske-titler, item 2:
+  // req.lang — only the visible <h1> uses it (title_no || title fallback on
+  // /no, original title always on /en). Breadcrumb/JSON-LD/OG-meta/<title>
+  // tag are deliberately NOT touched this slice — still the original title.
+  lang: Lang
 ): string {
   if (!exp) return "";
   const slug = exp.slug || "";
@@ -1593,7 +1598,7 @@ ${ldScripts}
     <a href="/">Forsiden</a>${cat ? `<span class="sep">/</span><a href="/kategori/${encodeURIComponent(cat)}">${escapeHtml(catLabel(cat))}</a>` : ""}<span class="sep">/</span>${escapeHtml(exp.title)}
   </nav>
   <header class="head">
-    <h1>${escapeHtml(exp.title)}</h1>
+    <h1>${escapeHtml(lang === "no" ? (exp.title_no || exp.title) : exp.title)}</h1>
     ${place ? `<p class="place"><svg viewBox="0 0 24 24" width="17" height="17" aria-hidden="true"><path d="M12 2a7 7 0 0 0-7 7c0 5 7 13 7 13s7-8 7-13a7 7 0 0 0-7-7z" fill="none" stroke="currentColor" stroke-width="1.7"/><circle cx="12" cy="9" r="2.3" fill="currentColor"/></svg>${escapeHtml(place)}</p>` : ""}
     <div class="badges">${badges.join("")}</div>
   </header>
@@ -1767,9 +1772,15 @@ const PIN_SVG =
 // this feature existed.
 function renderCard(
   row: ExperienceCardRow,
+  lang: Lang,
   distance?: { distance_km: number | null; geo_precision: "address" | "kommune" | null }
 ): string {
   const place = placeOf(row);
+  // dev-request 2026-07-04-opplevagent-dedup-og-norske-titler, item 2: /no
+  // prefers the LLM-generated Norwegian display title, falling back to the
+  // original `title` when title_no hasn't been backfilled yet (never a
+  // broken/empty title). /en always renders the original title, unchanged.
+  const displayTitle = lang === "no" ? (row.title_no || row.title) : row.title;
   let cardDescription = row.description || "";
   if (cardDescription && isJunkDescription(cardDescription)) {
     console.log(`[description-guard] suppressed junk description (opplevelse card) for ${row.slug} (${row.title})`);
@@ -1799,7 +1810,7 @@ function renderCard(
     tags.push(`<span class="tag tag-filter">${escapeHtml(FILTER_TAG_LABELS[t])}</span>`);
   }
   return `<a class="card" href="/opplevelse/${encodeURIComponent(row.slug)}">
-    <span class="c-title">${escapeHtml(row.title)}</span>
+    <span class="c-title">${escapeHtml(displayTitle)}</span>
     ${place ? `<span class="c-place">${PIN_SVG}${escapeHtml(place)}</span>` : ""}
     ${distanceHtml}
     ${desc}
@@ -1819,6 +1830,11 @@ function renderBrowsePage(opts: {
   lede?: string;
   canonicalPath: string;
   crumbs: BreadcrumbCrumb[];
+  // dev-request 2026-07-04-opplevagent-dedup-og-norske-titler, item 2:
+  // req.lang, threaded through to renderCard() so /no card titles prefer
+  // title_no (falling back to title) while /en always renders the original
+  // title — see renderCard()'s lang param below.
+  lang: Lang;
   rows: ExperienceCardRow[];
   total: number;
   page: number;          // 1-based
@@ -1890,7 +1906,7 @@ function renderBrowsePage(opts: {
 
   const grid =
     opts.rows.length > 0
-      ? `<div class="grid" role="list">${opts.rows.map((r) => renderCard(r, opts.distanceMap?.get(r.slug))).join("")}</div>`
+      ? `<div class="grid" role="list">${opts.rows.map((r) => renderCard(r, opts.lang, opts.distanceMap?.get(r.slug))).join("")}</div>`
       : `<div class="empty"><h2>${escapeHtml(opts.emptyTitle || "Ingen opplevelser her ennå")}</h2>
          <p>${escapeHtml(opts.emptyBody || "Vi publiserer nye opplevelser fortløpende. Se alle opplevelser i mellomtiden.")}</p>
          <a class="cta" href="/opplevelser">Se alle opplevelser</a></div>`;
@@ -2016,6 +2032,7 @@ router.get("/opplevelser", (req: Request, res: Response) => {
   } catch { total = 0; rows = []; }
 
   const html = renderBrowsePage({
+    lang: req.lang,
     title: "Alle opplevelser | Opplevagent",
     h1: "Alle opplevelser",
     metaDesc:
@@ -3115,6 +3132,7 @@ router.get("/kategori/:category", (req: Request, res: Response, next: NextFuncti
   }
 
   const html = renderBrowsePage({
+    lang: req.lang,
     title: `${label} | Opplevagent`,
     h1: label,
     metaDesc: `${label} i Norge — kuraterte opplevelser på Opplevagent med Brreg-verifiserte tilbydere. ${total} ${total === 1 ? "opplevelse" : "opplevelser"} i kategorien.`,
@@ -3185,6 +3203,7 @@ router.get("/fylke/:fylke", (req: Request, res: Response, next: NextFunction) =>
     : "";
 
   const html = renderBrowsePage({
+    lang: req.lang,
     title: `Opplevelser i ${fylke} | Opplevagent`,
     h1: `Opplevelser i ${fylke}`,
     metaDesc: `Kuraterte opplevelser og aktiviteter i ${fylke} — verifiserte tilbydere på Opplevagent. ${total} ${total === 1 ? "opplevelse" : "opplevelser"}.`,
@@ -3301,6 +3320,7 @@ router.get("/kommune/:kommune", (req: Request, res: Response, next: NextFunction
     : "";
 
   const html = renderBrowsePage({
+    lang: req.lang,
     title: `Opplevelser i ${kommune} | Opplevagent`,
     h1: `Opplevelser i ${kommune}`,
     metaDesc: `Kuraterte opplevelser og aktiviteter i ${kommune}${fylke ? ", " + fylke : ""} — verifiserte tilbydere på Opplevagent. ${total} ${total === 1 ? "opplevelse" : "opplevelser"}.`,
@@ -3418,6 +3438,7 @@ router.get("/kategori/:category/:kommune", (req: Request, res: Response, next: N
   const lede = answerFirst || `${label} i ${kommune}.`;
 
   const html = renderBrowsePage({
+    lang: req.lang,
     title: `${label} i ${kommune} | Opplevagent`,
     h1: `${label} i ${kommune}`,
     metaDesc: `${label} i ${kommune} — kuraterte opplevelser på Opplevagent med Brreg-verifiserte tilbydere. ${total} ${total === 1 ? "opplevelse" : "opplevelser"}.`,
@@ -3478,6 +3499,7 @@ router.get("/tilbyder/:providerSlugOrId", (req: Request, res: Response, next: Ne
     : provSite ? `<div class="chips"><a class="chip" href="${escapeHtml(provSite)}" target="_blank" rel="noopener nofollow">Tilbyderens nettside →</a></div>` : "";
 
   const html = renderBrowsePage({
+    lang: req.lang,
     title: `${navn} | Opplevagent`,
     h1: navn,
     metaDesc: `Opplevelser fra ${navn}${place ? " i " + place : ""} på Opplevagent. ${total} ${total === 1 ? "opplevelse" : "opplevelser"}.${brregVerified ? " Tilbyder verifisert mot Brønnøysundregistrene." : ""}`,
@@ -3596,6 +3618,7 @@ function toNearbyCardRows(nearby: ReturnType<typeof discoverExperiences>): {
     rows.push({
       slug: e.slug,
       title: e.title,
+      title_no: e.title_no ?? null,
       description: e.description ?? null,
       category: e.category ?? null,
       fylke: e.fylke ?? null,
@@ -3832,6 +3855,7 @@ router.get("/sok", async (req: Request, res: Response) => {
           .map((e) => ({
             slug: e.slug,
             title: e.title,
+            title_no: e.title_no ?? null,
             description: e.description ?? null,
             category: e.category ?? null,
             fylke: e.fylke ?? null,
@@ -3911,7 +3935,7 @@ router.get("/sok", async (req: Request, res: Response) => {
   const canonical = `${url}/sok`;
   const cards =
     rows.length > 0
-      ? `<div class="grid" role="list">${rows.map((r) => renderCard(r, distanceMap.get(r.slug))).join("")}</div>`
+      ? `<div class="grid" role="list">${rows.map((r) => renderCard(r, req.lang, distanceMap.get(r.slug))).join("")}</div>`
       : `<div class="empty"><h2>${escapeHtml(emptyTitle)}</h2><p>${escapeHtml(emptyBody)}</p><a class="cta" href="/opplevelser">Se alle opplevelser</a></div>`;
 
   const breadcrumbLd = {
@@ -4007,7 +4031,7 @@ router.get("/opplevelse/:slug", (req: Request, res: Response, next: NextFunction
 
   res.setHeader("Content-Type", "text/html; charset=utf-8");
   res.setHeader("Cache-Control", "public, max-age=300");
-  res.send(renderOpplevelseDetail(exp, provider, related, baseUrl()));
+  res.send(renderOpplevelseDetail(exp, provider, related, baseUrl(), req.lang));
 });
 
 
