@@ -25194,6 +25194,20 @@ Promise.allSettled(_oaHomeCountersDeps).then(async () => {
     for (const f of gr.failures) failures.push("opplevelser-discover-geo: " + f);
     console.log(`  opplevelser-discover-geo: ${gr.passed} passed, ${gr.failed} failed`);
 
+    // Slice 2 PREP of dev-request 2026-07-12-gardssalg-go-live-gate-dark-
+    // launch-og-onboarding: GET /admin/gardssalg-contact-coverage — read-only
+    // contact-field coverage report over the seeded gårdssalg providers.
+    // Same in-memory-DB pattern, runs sequentially inside this same gated
+    // block for the same reason.
+    console.log("\n── opplevelser-gardssalg-contact-coverage: admin contact-coverage report ──");
+    const { runOpplevelserGardssalgContactCoverageTests } = require("../src/routes/opplevelser-gardssalg-contact-coverage.test") as
+      typeof import("../src/routes/opplevelser-gardssalg-contact-coverage.test");
+    const gccr = await runOpplevelserGardssalgContactCoverageTests({ log: false });
+    passed += gccr.passed;
+    failed += gccr.failed;
+    for (const f of gccr.failures) failures.push("opplevelser-gardssalg-contact-coverage: " + f);
+    console.log(`  opplevelser-gardssalg-contact-coverage: ${gccr.passed} passed, ${gccr.failed} failed`);
+
     // Regression: /sok (experiences-seo.ts) used to run the q/tag search and
     // the geo (discoverExperiences()) lookup in one shared try/catch, and
     // never range-validated lat/lng — an out-of-range lat/lng (e.g.

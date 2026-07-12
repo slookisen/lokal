@@ -1229,6 +1229,76 @@ router.post("/admin/rfb-knowledge-enrich", requireAdmin, (req: Request, res: Res
   });
 });
 
+// ─── GET /api/opplevelser/admin/gardssalg-contact-coverage ───────────────────
+//
+// Slice 2 PREP of dev-request 2026-07-12-gardssalg-go-live-gate-dark-launch-
+// og-onboarding: a contact-field coverage report over the seeded gårdssalg
+// providers (rfb_seed_source = 'rfb-seed'), needed before drafting onboarding
+// outreach. Unlike /admin/rfb-knowledge-enrich above (which reports what it
+// WOULD copy from RFB), this reports raw current field presence.
+//
+// Read-only — a single SELECT, no writes. Privacy-minimized by design: never
+// returns raw epost/telefon/hjemmeside/adresse values, only booleans/counts;
+// the unreachable list carries just id+navn — enough to act on, nothing more.
+router.get("/admin/gardssalg-contact-coverage", requireAdmin, (_req: Request, res: Response) => {
+  const expDb = getExpDb("experiences");
+
+  let providers: Array<{
+    id: string;
+    navn: string;
+    epost: string | null;
+    telefon: string | null;
+    hjemmeside: string | null;
+    adresse: string | null;
+  }> = [];
+  try {
+    providers = expDb
+      .prepare(
+        `SELECT id, navn, epost, telefon, hjemmeside, adresse
+           FROM experience_providers
+          WHERE rfb_seed_source = 'rfb-seed'`
+      )
+      .all() as typeof providers;
+  } catch (err) {
+    console.error("[gardssalg-contact-coverage] failed to query providers:", err);
+    res.status(500).json({ error: "Failed to query experience_providers" });
+    return;
+  }
+
+  const present = (v: string | null): boolean => v !== null && v.trim() !== "";
+
+  let withEmail = 0;
+  let withPhone = 0;
+  let withWebsite = 0;
+  let withAddress = 0;
+  let reachable = 0;
+  const unreachable: Array<{ provider_id: string; navn: string }> = [];
+
+  for (const p of providers) {
+    const hasEmail = present(p.epost);
+    const hasPhone = present(p.telefon);
+    if (present(p.hjemmeside)) withWebsite++;
+    if (present(p.adresse)) withAddress++;
+    if (hasEmail) withEmail++;
+    if (hasPhone) withPhone++;
+    if (hasEmail || hasPhone) {
+      reachable++;
+    } else {
+      unreachable.push({ provider_id: p.id, navn: p.navn });
+    }
+  }
+
+  res.json({
+    total_providers: providers.length,
+    with_email: withEmail,
+    with_phone: withPhone,
+    with_website: withWebsite,
+    with_address: withAddress,
+    reachable,
+    unreachable,
+  });
+});
+
 // ─── GET /api/opplevelser/:id — single experience ───────────────────
 router.get("/:id", (req: Request, res: Response) => {
   const exp = getExperienceById(req.params.id as string);
