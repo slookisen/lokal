@@ -3336,6 +3336,45 @@ console.log("\n── cross-source-validator: domainCoherenceCheck ──");
   assertEq(r.coherent, true, "dc-placeholder: directory-host bypass (hanen.no) unregressed");
 }
 
+// ── dev-request 2026-06-30-open-stuck-verification-bucket, 2026-07-12T11:15Z
+// fast follow-up: hostFromUrlLike must strip a trailing FQDN root dot so
+// "domain.com." normalizes identically to "domain.com". Real prod motivating
+// case: guldkolla.no's knowledge.email is "info@domain.com." (trailing dot),
+// which the just-shipped PLACEHOLDER_EMAIL_DOMAINS bypass (above) did NOT
+// catch because "domain.com." didn't .includes()-match the list's "domain.com"
+// entry — this is the exact fix that closes that gap.
+console.log("\n── cross-source-validator: hostFromUrlLike trailing-dot normalization ──");
+{
+  // The actual prod fixture that motivated this slice: PR #236 alone did not
+  // clear this agent because of the trailing-dot gap; this must now be coherent.
+  const r = domainCoherenceCheck("https://guldkolla.no", "guldkolla.no", "info@domain.com.");
+  assertEq(r.coherent, true, "trailing-dot: guldkolla.no / info@domain.com. → coherent (prod motivating fixture)");
+}
+{
+  // Trailing dot on a normal (non-placeholder) own-domain email must still
+  // resolve as the same host as without the dot.
+  const r = domainCoherenceCheck("https://gard.no/", "https://gard.no", "post@gard.no.");
+  assertEq(r.coherent, true, "trailing-dot: post@gard.no. on own-domain agent gard.no → coherent");
+}
+{
+  // Trailing dot on agents.url itself must normalize the same way.
+  const r = domainCoherenceCheck("https://gard.no./", "https://gard.no", "post@gard.no");
+  assertEq(r.coherent, true, "trailing-dot: agents.url gard.no. vs gard.no → coherent");
+}
+{
+  // Degenerate multi-dot trailing input must also be stripped (defensive; not
+  // expected in real data, but the fix strips ALL trailing dots, not just one).
+  const r = domainCoherenceCheck("https://gard.no/", "https://gard.no", "post@gard.no..");
+  assertEq(r.coherent, true, "trailing-dot: multiple trailing dots (gard.no..) still normalize to gard.no");
+}
+{
+  // Regression guard: a genuine cross-entity mismatch must stay incoherent
+  // even when the mismatching email host carries a trailing dot — the fix
+  // must not accidentally widen the gate itself, only the normalization.
+  const r = domainCoherenceCheck("https://eidsmokjott.no/", "https://eidsmokjott.no", "post@slakthuset.no.");
+  assertEq(r.coherent, false, "trailing-dot: cross-entity email with trailing dot (slakthuset.no.) still incoherent");
+}
+
 // ── PR-129: cross-TLD same-brand equivalence (Eidsmo-safe) ──
 {
   // Same brand, different TLD on the EMAIL → now coherent (was a false positive).
