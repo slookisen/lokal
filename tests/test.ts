@@ -23744,6 +23744,17 @@ console.log("\n── gardssalg-book: reservation → confirmation journey ─�
 (() => {
   const prevPathGB = process.env.EXPERIENCES_DB_PATH;
   process.env.EXPERIENCES_DB_PATH = ":memory:";
+  // dev-request 2026-07-12-gardssalg-dark-launch-stop, slice 0: booking
+  // submission now hard-stops unless BOOKING_DISPATCH_ENABLED=true AND the
+  // specific provider is booking_live=1 (see isBookingPaused() in
+  // services/booking-store.ts). This block's whole point is regression
+  // coverage for the "already onboarded" reservation → confirmation journey,
+  // so it opts the seeded provider IN to the live state below (mirrors the
+  // acceptance criteria: "simulate via a direct DB update in a test"). The
+  // dark-launch-stop gate itself (flag off / provider not live) gets its own
+  // dedicated test block further down.
+  const prevDispatchGB = process.env.BOOKING_DISPATCH_ENABLED;
+  process.env.BOOKING_DISPATCH_ENABLED = "true";
 
   const dbFacPathGB = require.resolve("../src/database/db-factory");
   const expStPathGB = require.resolve("../src/services/experience-store");
@@ -23777,6 +23788,9 @@ console.log("\n── gardssalg-book: reservation → confirmation journey ─�
     brreg_verified: 0, verification_status: "pending_verify",
   });
   dbGB.prepare("UPDATE experience_providers SET producer_type = ? WHERE id = ?").run("sideri", provIdGB);
+  // booking_live=1 — this producer is treated as already onboarded for the
+  // purposes of this regression block (see comment above).
+  dbGB.prepare("UPDATE experience_providers SET booking_live = 1 WHERE id = ?").run(provIdGB);
   expStGB.backfillProviderSlugs();
 
   // invokeSeo — same shape as the p2/sq-caticon helpers, generalized to pick
@@ -23904,8 +23918,310 @@ console.log("\n── gardssalg-book: reservation → confirmation journey ─�
 
   if (prevPathGB === undefined) delete process.env.EXPERIENCES_DB_PATH;
   else process.env.EXPERIENCES_DB_PATH = prevPathGB;
+  if (prevDispatchGB === undefined) delete process.env.BOOKING_DISPATCH_ENABLED;
+  else process.env.BOOKING_DISPATCH_ENABLED = prevDispatchGB;
   dbFacGB.__resetDbFactoryForTesting();
   console.log("  gardssalg-book: OK (panel render, unknown-slug 404, no-JS POST create+redirect, provider ownership, CTA fix)");
+})();
+
+// ─── gardssalg-dark-launch-stop: BOOKING_DISPATCH_ENABLED / booking_live gate
+//     (dev-request 2026-07-12-gardssalg-dark-launch-stop, slice 0) ──────────
+// The gårdssalg booking flow has looked fully functional on prod since
+// 2026-07-03 (real form, "confirmation" screen, confirmation email) but no
+// producer is ever notified and no producer has been onboarded — Daniel
+// ordered an immediate dark-launch stop. Covers: the fail-safe default of
+// bookingDispatchEnabled()/isBookingPaused() (anything but the literal
+// string "true" means paused), the three SSR "coming soon" notices (booking
+// panel, produsent-profile reserve CTA, category-card discreet badge), the
+// hard stop on BOTH booking-submission entry points (POST
+// /api/opplevelser/book JSON API + the no-JS SSR fallback) — no reserved
+// row, no guest email, no producer notification while paused — the
+// ?error=paused banner reusing the existing error-banner path, and the
+// flag-on + booking_live=1 happy path: the pre-existing chain works exactly
+// as before (reserved row, guest email, confirm-token redirect) PLUS a
+// producer notification is now attempted, including the "no epost on file"
+// safety case. Same isolated :memory: experiences DB + sync mock req/res
+// pattern as the gardssalg-book block above — every path exercised here
+// resolves its response before its first internal `await` (fire-and-forget
+// email sends), so calling handlers without awaiting is safe and this stays
+// fully synchronous, unable to race the async report tail.
+console.log("\n── gardssalg-dark-launch-stop: BOOKING_DISPATCH_ENABLED / booking_live gate ──");
+(() => {
+  const prevPathGDL = process.env.EXPERIENCES_DB_PATH;
+  process.env.EXPERIENCES_DB_PATH = ":memory:";
+  const prevDispatchGDL = process.env.BOOKING_DISPATCH_ENABLED;
+
+  const dbFacPathGDL = require.resolve("../src/database/db-factory");
+  const expStPathGDL = require.resolve("../src/services/experience-store");
+  const bookStPathGDL = require.resolve("../src/services/booking-store");
+  const expSeoPathGDL = require.resolve("../src/routes/experiences-seo");
+  const opplevelserPathGDL = require.resolve("../src/routes/opplevelser");
+  delete require.cache[dbFacPathGDL];
+  delete require.cache[expStPathGDL];
+  delete require.cache[bookStPathGDL];
+  delete require.cache[expSeoPathGDL];
+  delete require.cache[opplevelserPathGDL];
+
+  const dbFacGDL = require("../src/database/db-factory") as typeof import("../src/database/db-factory");
+  dbFacGDL.__resetDbFactoryForTesting();
+  const expStGDL = require("../src/services/experience-store") as typeof import("../src/services/experience-store");
+  const bookStGDL = require("../src/services/booking-store") as typeof import("../src/services/booking-store");
+  const seoRouterGDL = (require("../src/routes/experiences-seo") as typeof import("../src/routes/experiences-seo")).default as any;
+  const oppRouterGDL = (require("../src/routes/opplevelser") as typeof import("../src/routes/opplevelser")).default as any;
+
+  const dbGDL = dbFacGDL.getDb("experiences");
+
+  // Capture-pattern (same as the "EMAIL SERVICE" block earlier in this file):
+  // override the shared emailService singleton's sendEmail so we can assert
+  // on whether/how many emails were attempted, without any real SMTP calls.
+  // The push happens synchronously the instant sendEmail() is called (before
+  // its first internal await), so it's already recorded by the time the
+  // fire-and-forget .catch()-chained call sites here return.
+  const emailSvcModGDL = require("../src/services/email-service") as typeof import("../src/services/email-service");
+  const origSendGDL = emailSvcModGDL.emailService.sendEmail.bind(emailSvcModGDL.emailService);
+  let emailCallsGDL: Array<{ to: string; subject: string }> = [];
+  (emailSvcModGDL.emailService as any).sendEmail = async (opts: { to: string; subject: string }) => {
+    emailCallsGDL.push({ to: opts.to, subject: opts.subject });
+    return { success: true, messageId: "test" };
+  };
+
+  // ── gdl-00: bookingDispatchEnabled()/isBookingPaused() fail-safe unit coverage
+  delete process.env.BOOKING_DISPATCH_ENABLED;
+  assertEq(bookStGDL.bookingDispatchEnabled(), false, "gdl-00a: bookingDispatchEnabled() defaults false when the env var is unset");
+  process.env.BOOKING_DISPATCH_ENABLED = "false";
+  assertEq(bookStGDL.bookingDispatchEnabled(), false, "gdl-00b: bookingDispatchEnabled() false for the literal string \"false\"");
+  process.env.BOOKING_DISPATCH_ENABLED = "1";
+  assertEq(bookStGDL.bookingDispatchEnabled(), false, "gdl-00c: bookingDispatchEnabled() false for any non-\"true\" value (fail-safe)");
+  process.env.BOOKING_DISPATCH_ENABLED = "true";
+  assertEq(bookStGDL.bookingDispatchEnabled(), true, "gdl-00d: bookingDispatchEnabled() true only for the literal string \"true\"");
+  assertEq(bookStGDL.isBookingPaused(1), false, "gdl-00e: isBookingPaused(1) is false when dispatch is enabled and the provider is live");
+  assertEq(bookStGDL.isBookingPaused(0), true, "gdl-00f: isBookingPaused(0) is true even with dispatch enabled (provider not live)");
+  assertEq(bookStGDL.isBookingPaused(null), true, "gdl-00g: isBookingPaused(null) is true (fail-safe when booking_live is unknown)");
+  delete process.env.BOOKING_DISPATCH_ENABLED;
+  assertEq(bookStGDL.isBookingPaused(1), true, "gdl-00h: isBookingPaused(1) is still true when dispatch is off globally, live provider or not");
+
+  // Seed a gårdssalg producer — booking_live defaults to 0 (additive column,
+  // never flipped to 1 by this slice), with a real epost on file so the
+  // producer-dispatch path (once live) has somewhere to send to.
+  const provIdGDL = expStGDL.createProvider({
+    navn: "Nordlys Bryggeri", org_nr: "923456789",
+    fylke: "Troms", kommune: "Tromsø", poststed: "Tromsø",
+    brreg_verified: 0, verification_status: "pending_verify",
+  });
+  dbGDL.prepare("UPDATE experience_providers SET producer_type = ?, epost = ? WHERE id = ?")
+    .run("bryggeri", "post@nordlysbryggeri.no", provIdGDL);
+  expStGDL.backfillProviderSlugs();
+  const seededGDL = expStGDL.listGardssalgProviders(10, 0).find((p: any) => p.id === provIdGDL);
+  assertTrue(!!seededGDL && !!seededGDL.slug, "gdl-01: seeded provider got a slug");
+  const slugGDL = String(seededGDL!.slug);
+  assertEq(seededGDL!.booking_live, 0, "gdl-02: booking_live defaults to 0 on a freshly-migrated row (additive column)");
+
+  // invokeSeoGDL — same shape as the gardssalg-book block's invokeGB helper.
+  function invokeSeoGDL(
+    method: "get" | "post",
+    routePath: string,
+    params: Record<string, string>,
+    reqPath: string,
+    opts: { query?: Record<string, string>; body?: Record<string, unknown> } = {}
+  ): { status: number; body: string; headers: Record<string, string>; redirectTo: string | null } {
+    const layer = (seoRouterGDL.stack as any[]).find(
+      (l: any) => l.route && l.route.path === routePath && l.route.methods?.[method]
+    );
+    assertTrue(!!layer, `gdl-route: seo router has ${method.toUpperCase()} ${routePath} layer`);
+    if (!layer) return { status: 0, body: "", headers: {}, redirectTo: null };
+    let status = 200; let body = ""; let nexted = false; let redirectTo: string | null = null;
+    const headers: Record<string, string> = {};
+    const res: any = {
+      statusCode: 200,
+      setHeader: (k: string, v: string) => { headers[k.toLowerCase()] = String(v); },
+      status: (c: number) => { status = c; res.statusCode = c; return res; },
+      send: (b: unknown) => { body = typeof b === "string" ? b : String(b); return res; },
+      json: (o: unknown) => { body = JSON.stringify(o); return res; },
+      redirect: (code: number, location: string) => { status = code; redirectTo = location; },
+    };
+    const req: any = { path: reqPath, hostname: "opplevagent.no", params, query: opts.query || {}, body: opts.body || {} };
+    const stack = (layer.route.stack as any[]).filter((s: any) => s.method === method);
+    const handle = stack[stack.length - 1].handle;
+    handle(req, res, () => { nexted = true; });
+    if (nexted) status = 404;
+    return { status, body, headers, redirectTo };
+  }
+
+  // invokeOppGDL — invokes the JSON API's POST /book handler directly (same
+  // "grab the last handler in the route's stack, call with a mock req/res"
+  // idiom as invokeSeoGDL / the pre-existing opplevelser router tests
+  // elsewhere in this file, e.g. the orch19 POST /a2a dispatcher block).
+  function invokeOppGDL(body: Record<string, unknown>): { status: number; json: any } {
+    const layer = (oppRouterGDL.stack as any[]).find(
+      (l: any) => l.route && l.route.path === "/book" && l.route.methods?.post
+    );
+    assertTrue(!!layer, "gdl-route: opplevelser router has POST /book layer");
+    let status = 200; let jsonBody: any = null;
+    const res: any = {
+      status: (c: number) => { status = c; return res; },
+      json: (o: unknown) => { jsonBody = o; return res; },
+    };
+    const req: any = { body };
+    const handle = layer.route.stack[layer.route.stack.length - 1].handle;
+    handle(req, res, () => {});
+    return { status, json: jsonBody };
+  }
+
+  function countBookingsGDL(): number {
+    return (dbGDL.prepare("SELECT COUNT(*) AS c FROM gardssalg_bookings").get() as { c: number }).c;
+  }
+
+  // ═══ Paused (real-world default state today: flag off, provider not live) ═══
+  delete process.env.BOOKING_DISPATCH_ENABLED;
+
+  // gdl-03: booking panel — persistent "coming soon" notice, no claim that
+  // booking works today, and the <form> itself still renders (submission is
+  // what's actually blocked — see gdl-06 — not the form's visibility).
+  const panelGDL = invokeSeoGDL("get", "/kategori/gardssalg/book/:providerSlug",
+    { providerSlug: slugGDL }, `/kategori/gardssalg/book/${slugGDL}`);
+  // NOTE: assertions below key off the `notice-paused` CSS class, not a raw
+  // substring match on "ikke aktive ennå"/"kommer snart" — the panel's inline
+  // <script> ALSO embeds "Reservasjoner er ikke aktive ennå — kommer snart."
+  // as its client-side fallback message (shown if a submit races a flag
+  // flip), so that phrase is present in the page source in BOTH the
+  // live and paused states. The server-rendered notice block is the only
+  // paused-specific signal.
+  assertEq(panelGDL.status, 200, "gdl-03a: GET booking panel still 200 when paused");
+  assertTrue(panelGDL.body.includes('class="notice-paused"'), "gdl-03b: panel shows the server-rendered 'not active yet' notice block");
+  assertTrue(panelGDL.body.includes("ikke aktive ennå"), "gdl-03c: panel notice text includes 'ikke aktive ennå'");
+  assertTrue(!panelGDL.body.includes("Du betaler ingenting nå — dette er en reservasjon."),
+    "gdl-03d: panel does NOT show the 'this is a reservation' microcopy that would imply it works today");
+  assertTrue(panelGDL.body.includes('method="POST"'), "gdl-03e: the reservation <form> itself is still present (only submission is blocked)");
+
+  // gdl-04: produsent profile — same signal on the reserve CTA; CTA
+  // href/button text unchanged (no-regression guarantee for the existing
+  // gardssalg-profile block's gp-05/gp-05b assertions).
+  const profileGDL = invokeSeoGDL("get", "/kategori/gardssalg/produsent/:providerSlug",
+    { providerSlug: slugGDL }, `/kategori/gardssalg/produsent/${slugGDL}`);
+  assertEq(profileGDL.status, 200, "gdl-04a: GET produsent profile still 200 when paused");
+  assertTrue(profileGDL.body.includes('class="reserve-notice"'), "gdl-04b: profile reserve CTA shows the 'not active yet' notice");
+  assertTrue(profileGDL.body.includes(`href="/kategori/gardssalg/book/${slugGDL}"`),
+    "gdl-04c: profile CTA href is unchanged");
+  assertTrue(profileGDL.body.includes("Reserver besøk"), "gdl-04d: profile CTA button text is unchanged");
+
+  // gdl-05: category browse page — discreet "kommer snart" badge on the card.
+  const listGDL = invokeSeoGDL("get", "/kategori/gardssalg", {}, "/kategori/gardssalg");
+  assertEq(listGDL.status, 200, "gdl-05a: GET category page still 200");
+  assertTrue(listGDL.body.includes("Kommer snart"), "gdl-05b: category card shows the discreet 'Kommer snart' badge");
+
+  // gdl-06: POST no-JS fallback while paused → 303 redirect back to the
+  // panel with ?error=paused, NO booking row created, NO emails attempted.
+  const beforeCountGDL = countBookingsGDL();
+  emailCallsGDL = [];
+  const postPausedGDL = invokeSeoGDL("post", "/kategori/gardssalg/book/:providerSlug",
+    { providerSlug: slugGDL }, `/kategori/gardssalg/book/${slugGDL}`,
+    { body: { slot_at: "2026-08-20T14:00", party_size: "2", guest_name: "Per Hansen", guest_email: "per@example.no" } });
+  assertEq(postPausedGDL.status, 303, "gdl-06a: no-JS POST while paused → 303 redirect");
+  assertTrue((postPausedGDL.redirectTo || "").endsWith("?error=paused"), "gdl-06b: redirect carries ?error=paused");
+  assertEq(countBookingsGDL(), beforeCountGDL, "gdl-06c: no reserved row created while paused");
+  assertEq(emailCallsGDL.length, 0, "gdl-06d: no email (guest or producer) attempted while paused");
+
+  // gdl-07: the panel renders the ?error=paused banner via the existing
+  // bookingErrorMessage()/errorBanner path (a new switch case, not a
+  // duplicated banner).
+  const errBannerGDL = invokeSeoGDL("get", "/kategori/gardssalg/book/:providerSlug",
+    { providerSlug: slugGDL }, `/kategori/gardssalg/book/${slugGDL}`, { query: { error: "paused" } });
+  assertTrue(errBannerGDL.body.includes('role="alert"'), "gdl-07a: ?error=paused renders the role=alert error banner");
+  assertTrue(errBannerGDL.body.includes("ikke aktive ennå"), "gdl-07b: ?error=paused banner shows the same honest copy");
+
+  // gdl-08: POST /api/opplevelser/book (JSON API) while paused → explicit
+  // paused/coming-soon JSON (200, so the panel's fetch() script doesn't treat
+  // it as a network error), no reserved row, no emails.
+  const beforeCountGDL2 = countBookingsGDL();
+  emailCallsGDL = [];
+  const jsonPausedGDL = invokeOppGDL({
+    provider_id: provIdGDL, slot_at: "2026-08-21T12:00", party_size: 2,
+    guest_name: "Kari Olsen", guest_email: "kari.olsen@example.no",
+  });
+  assertEq(jsonPausedGDL.status, 200, "gdl-08a: POST /api/opplevelser/book while paused → 200 (not a network-error status)");
+  assertEq(jsonPausedGDL.json?.success, false, "gdl-08b: success:false while paused");
+  assertEq(jsonPausedGDL.json?.paused, true, "gdl-08c: paused:true in the JSON response");
+  assertTrue(typeof jsonPausedGDL.json?.message === "string" && jsonPausedGDL.json.message.length > 0,
+    "gdl-08d: a human-readable 'coming soon' message is included");
+  assertEq(countBookingsGDL(), beforeCountGDL2, "gdl-08e: no reserved row created via the JSON API while paused");
+  assertEq(emailCallsGDL.length, 0, "gdl-08f: no email attempted via the JSON API while paused");
+
+  // ═══ Live (flag on AND this specific provider booking_live=1) — the full
+  // pre-existing chain must work exactly as before, PLUS a producer
+  // notification. ═══
+  process.env.BOOKING_DISPATCH_ENABLED = "true";
+  dbGDL.prepare("UPDATE experience_providers SET booking_live = 1 WHERE id = ?").run(provIdGDL);
+
+  // gdl-09: booking panel notice gone, original microcopy restored.
+  const panelLiveGDL = invokeSeoGDL("get", "/kategori/gardssalg/book/:providerSlug",
+    { providerSlug: slugGDL }, `/kategori/gardssalg/book/${slugGDL}`);
+  assertTrue(!panelLiveGDL.body.includes('class="notice-paused"'), "gdl-09a: panel notice gone once flag=on and provider is booking_live");
+  assertTrue(panelLiveGDL.body.includes("Du betaler ingenting nå — dette er en reservasjon."),
+    "gdl-09b: original no-payment microcopy restored once live");
+
+  // gdl-10: produsent profile CTA notice gone; category badge gone.
+  const profileLiveGDL = invokeSeoGDL("get", "/kategori/gardssalg/produsent/:providerSlug",
+    { providerSlug: slugGDL }, `/kategori/gardssalg/produsent/${slugGDL}`);
+  assertTrue(!profileLiveGDL.body.includes('class="reserve-notice"'), "gdl-10a: profile CTA notice gone once live");
+  const listLiveGDL = invokeSeoGDL("get", "/kategori/gardssalg", {}, "/kategori/gardssalg");
+  assertTrue(!listLiveGDL.body.includes("Kommer snart"), "gdl-10b: category badge gone once live");
+
+  // gdl-11: no-JS POST fallback while live → real booking created, guest +
+  // producer emails BOTH attempted (existing chain unaffected — same
+  // createBooking()/sendBookingConfirmation() as before, ICS/QR/
+  // confirm-token flow all untouched, PLUS the new producer dispatch).
+  emailCallsGDL = [];
+  const postLiveGDL = invokeSeoGDL("post", "/kategori/gardssalg/book/:providerSlug",
+    { providerSlug: slugGDL }, `/kategori/gardssalg/book/${slugGDL}`,
+    { body: { slot_at: "2026-08-22T15:00", party_size: "4", guest_name: "Lise Berg", guest_email: "lise@example.no" } });
+  assertEq(postLiveGDL.status, 303, "gdl-11a: valid no-JS submission while live → 303 redirect (unchanged)");
+  const redirLiveGDL = postLiveGDL.redirectTo || "";
+  assertTrue(redirLiveGDL.includes("/confirm/"), "gdl-11b: redirects to the confirm sub-path (unchanged)");
+  const refLiveGDL = decodeURIComponent(redirLiveGDL.split("/confirm/")[1] || "");
+  const bookingLiveGDL = bookStGDL.getBookingByRef(refLiveGDL);
+  assertTrue(!!bookingLiveGDL, "gdl-11c: reserved row created via getBookingByRef() (unchanged)");
+  assertEq(bookingLiveGDL?.status, "reserved", "gdl-11d: booking starts 'reserved' (unchanged)");
+  assertEq(emailCallsGDL.length, 2, "gdl-11e: both the guest confirmation AND the producer notification were attempted");
+  assertTrue(emailCallsGDL.some((c) => c.to === "lise@example.no"), "gdl-11f: guest confirmation addressed to the guest");
+  assertTrue(emailCallsGDL.some((c) => c.to === "post@nordlysbryggeri.no"), "gdl-11g: producer notification addressed to the provider's epost");
+
+  // gdl-12: JSON API while live → 201 created, real booking, both emails.
+  emailCallsGDL = [];
+  const jsonLiveGDL = invokeOppGDL({
+    provider_id: provIdGDL, slot_at: "2026-08-23T10:00", party_size: 1,
+    guest_name: "Jon Dahl", guest_email: "jon@example.no",
+  });
+  assertEq(jsonLiveGDL.status, 201, "gdl-12a: POST /api/opplevelser/book while live → 201 (unchanged)");
+  assertEq(jsonLiveGDL.json?.success, true, "gdl-12b: success:true while live");
+  assertTrue(!!jsonLiveGDL.json?.booking_ref, "gdl-12c: booking_ref present (unchanged)");
+  assertEq(emailCallsGDL.length, 2, "gdl-12d: both guest and producer emails attempted via the JSON API too");
+
+  // gdl-13: a second, live provider with NO epost on file — the producer
+  // dispatch must never throw or block the guest's booking; only the
+  // producer send is skipped (a console warning is logged, not asserted
+  // here — just the non-throw + guest-still-sent behavior).
+  const provNoEmailGDL = expStGDL.createProvider({
+    navn: "Fjordsmak Sideri", org_nr: "934567890",
+    fylke: "Troms", kommune: "Tromsø",
+  });
+  dbGDL.prepare("UPDATE experience_providers SET producer_type = ?, booking_live = 1 WHERE id = ?")
+    .run("sideri", provNoEmailGDL);
+  emailCallsGDL = [];
+  const jsonNoEpostGDL = invokeOppGDL({
+    provider_id: provNoEmailGDL, slot_at: "2026-08-24T11:00", party_size: 2,
+    guest_name: "Silje Vik", guest_email: "silje@example.no",
+  });
+  assertEq(jsonNoEpostGDL.status, 201, "gdl-13a: booking still succeeds when the provider has no epost on file");
+  assertEq(emailCallsGDL.length, 1, "gdl-13b: only the guest confirmation is attempted (producer send skipped, not thrown)");
+  assertTrue(emailCallsGDL.some((c) => c.to === "silje@example.no"), "gdl-13c: guest still gets their confirmation");
+
+  (emailSvcModGDL.emailService as any).sendEmail = origSendGDL;
+  if (prevPathGDL === undefined) delete process.env.EXPERIENCES_DB_PATH;
+  else process.env.EXPERIENCES_DB_PATH = prevPathGDL;
+  if (prevDispatchGDL === undefined) delete process.env.BOOKING_DISPATCH_ENABLED;
+  else process.env.BOOKING_DISPATCH_ENABLED = prevDispatchGDL;
+  dbFacGDL.__resetDbFactoryForTesting();
+  console.log("  gardssalg-dark-launch-stop: OK (fail-safe flag default, SSR notices x3, hard stop on both entry points incl. no-row/no-email guarantees, flag-on+booking_live full-chain regression, producer dispatch + missing-epost safety)");
 })();
 
 // gb-qr: qrcode SVG generation smoke test. Isolated — touches no DB/Express

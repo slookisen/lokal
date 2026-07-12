@@ -18,6 +18,34 @@ import { emailService } from "./email-service";
 const VERTICAL = "experiences";
 const APP_URL = process.env.APP_URL || "https://opplevagent.no";
 
+// ─── Dark-launch-stop feature flag (dev-request 2026-07-12-gardssalg-dark-
+// launch-stop, slice 0) ────────────────────────────────────────────────────
+// The gårdssalg booking flow has looked 100% functional on prod since
+// 2026-07-03 (real form, "confirmation" screen, confirmation email) but no
+// producer is ever notified and no producer has been onboarded — a live
+// trust/reputation risk. This is the single fail-safe switch: booking
+// submission (both POST /api/opplevelser/book and the no-JS SSR fallback)
+// and the "coming soon" UI notices all gate on the pair
+// (BOOKING_DISPATCH_ENABLED=true AND the specific provider's booking_live=1)
+// via isBookingPaused() below — never re-implement this check inline.
+//
+// Fail-safe by construction: anything other than the literal string "true"
+// (unset, "false", "1", a typo, ...) means OFF.
+export function bookingDispatchEnabled(): boolean {
+  return process.env.BOOKING_DISPATCH_ENABLED === "true";
+}
+
+// True when booking submission for this provider must be blocked and the
+// "coming soon" notice shown — i.e. dispatch is off globally, OR this
+// specific provider hasn't been onboarded (booking_live !== 1) yet.
+// providerBookingLive is whatever experience_providers.booking_live holds
+// (0/1/NULL/undefined) — anything but the literal 1 counts as "not live".
+export function isBookingPaused(
+  providerBookingLive: number | null | undefined,
+): boolean {
+  return !bookingDispatchEnabled() || providerBookingLive !== 1;
+}
+
 export type BookingStatus =
   | "reserved"
   | "confirmed_attended"
@@ -304,4 +332,60 @@ export async function sendBookingConfirmation(booking: GardssalgBooking): Promis
 
   // Producer confirm link — logged so Daniel can verify manually
   console.log(`[booking] ${booking.booking_ref} confirm_url=${confirmUrl}`);
+}
+
+// ─── Producer notification email (dev-request 2026-07-12-gardssalg-dark-
+// launch-stop, slice 0, point 5) ────────────────────────────────────────────
+// Forward-looking wiring for once a producer is actually onboarded: when
+// BOOKING_DISPATCH_ENABLED=true and the booking's provider has
+// booking_live=1 (both call sites — POST /api/opplevelser/book and the no-JS
+// SSR fallback — only reach this after confirming that via isBookingPaused()
+// being false), also notify the producer at their experience_providers.epost
+// via the same emailService used for the guest confirmation above. Minimal
+// on purpose: no template system, plain text/HTML in the same style as
+// sendBookingConfirmation. Fire-and-forget at the call site, same as the
+// guest email — a missing/broken producer notification must never affect
+// the guest's booking. If the provider has no epost on file, log a clear
+// warning instead of throwing.
+export async function sendProducerNotification(
+  booking: GardssalgBooking,
+  producerEmail: string | null | undefined,
+): Promise<void> {
+  if (!producerEmail) {
+    console.error(
+      `[booking] producer notification SKIPPED — no epost on file for provider ${booking.provider_id} (booking ${booking.booking_ref})`,
+    );
+    return;
+  }
+
+  const slotFormatted = new Date(booking.slot_at).toLocaleString("nb-NO", {
+    dateStyle: "full",
+    timeStyle: "short",
+    timeZone: "Europe/Oslo",
+  });
+
+  const htmlContent = `
+<p>Hei,</p>
+<p>Du har fått en ny reservasjon via Opplevagent:</p>
+<table style="border-collapse:collapse;font-family:sans-serif">
+  <tr><td style="padding:4px 12px 4px 0;font-weight:bold">Bookingref:</td><td>${booking.booking_ref}</td></tr>
+  <tr><td style="padding:4px 12px 4px 0;font-weight:bold">Dato/tid:</td><td>${slotFormatted}</td></tr>
+  <tr><td style="padding:4px 12px 4px 0;font-weight:bold">Antall:</td><td>${booking.party_size} person${booking.party_size > 1 ? "er" : ""}</td></tr>
+  <tr><td style="padding:4px 12px 4px 0;font-weight:bold">Gjest:</td><td>${booking.guest_name}</td></tr>
+  <tr><td style="padding:4px 12px 4px 0;font-weight:bold">E-post:</td><td>${booking.guest_email}</td></tr>
+  ${booking.guest_phone ? `<tr><td style="padding:4px 12px 4px 0;font-weight:bold">Telefon:</td><td>${booking.guest_phone}</td></tr>` : ""}
+</table>
+<p>Spørsmål fra gjesten kan besvares direkte — gjestens e-post står over.</p>
+<p>Hilsen<br>Opplevagent</p>
+  `.trim();
+
+  const textContent = `Hei,\n\nDu har fått en ny reservasjon via Opplevagent.\nBookingref: ${booking.booking_ref}\nDato/tid: ${slotFormatted}\nAntall: ${booking.party_size}\nGjest: ${booking.guest_name} (${booking.guest_email}${booking.guest_phone ? ", " + booking.guest_phone : ""})\n\nHilsen\nOpplevagent`;
+
+  await emailService.sendEmail({
+    to: producerEmail,
+    subject: `Ny reservasjon — ${booking.booking_ref}`,
+    htmlContent,
+    textContent,
+    replyTo: `kontakt@opplevagent.no`,
+  });
 }

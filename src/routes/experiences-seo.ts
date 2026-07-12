@@ -74,6 +74,9 @@ import {
   getBookingByRef,
   BookingInputSchema,
   sendBookingConfirmation,
+  // dev-request 2026-07-12-gardssalg-dark-launch-stop, slice 0
+  isBookingPaused,
+  sendProducerNotification,
 } from "../services/booking-store";
 import { getOaHomeCounters } from "../services/oa-home-counters";
 
@@ -2117,10 +2120,20 @@ router.get("/kategori/gardssalg", (req: Request, res: Response) => {
     const link = bookHref
       ? `<a href="${bookHref}" style="display:inline-block;margin-top:10px;padding:8px 16px;background:#0f5a50;color:#fff;border-radius:6px;font-size:.84rem;font-weight:600;text-decoration:none">Book besøk</a>`
       : "";
+    // Discreet "coming soon" marker (dev-request 2026-07-12-gardssalg-dark-
+    // launch-stop, slice 0) — small and unobtrusive by design (the prominent
+    // version lives on the booking panel/produsent profile); uses the shared
+    // var(--) tokens from BROWSE_CSS (included in this page's <style> below)
+    // rather than hardcoded hex, same discipline as the produsent-profil
+    // section even though the rest of this particular card still predates
+    // that convention.
+    const soonBadge = isBookingPaused(p.booking_live)
+      ? `<span style="display:inline-block;font-size:.68rem;font-weight:600;color:var(--mist);background:var(--canvas-2);border:1px solid var(--line);border-radius:4px;padding:1px 7px;margin-left:6px;vertical-align:middle">Kommer snart</span>`
+      : "";
     return `<article style="background:#fff;border-radius:12px;box-shadow:0 2px 8px rgba(0,0,0,.07);overflow:hidden;display:flex;flex-direction:column">
   <div style="padding:16px 16px 12px">
     ${sted ? `<div style="font-size:.78rem;color:#7a7163;margin-bottom:4px">${escapeHtml(sted)}</div>` : ""}
-    <div style="margin-bottom:6px">${nameHtml}</div>
+    <div style="margin-bottom:6px">${nameHtml}${soonBadge}</div>
     ${badge}
   </div>
   ${link ? `<div style="padding:0 16px 16px;margin-top:auto">${link}</div>` : ""}
@@ -2403,6 +2416,7 @@ ${BROWSE_CSS}
 .aside-card h2{font-size:.78rem;text-transform:uppercase;letter-spacing:.06em;color:var(--mist);margin-bottom:12px}
 .reserve-cta{display:block;text-align:center;background:linear-gradient(135deg,var(--amber-500),var(--coral-500));color:#fff;font-weight:800;padding:14px 18px;border-radius:var(--r-pill);box-shadow:0 4px 14px rgba(255,93,59,.4)}
 .reserve-cta:hover{text-decoration:none;filter:brightness(1.04)}
+.reserve-notice{font-size:.8rem;font-weight:600;color:var(--fjord-800);background:var(--canvas-2);border:1px solid var(--line);border-radius:8px;padding:8px 10px;margin-bottom:10px}
 .map-card{display:flex;align-items:center;gap:12px;color:var(--ink-soft);background:var(--canvas-2);border:1px solid var(--line);border-radius:var(--r-md);padding:14px 16px}
 .map-card:hover{text-decoration:none;border-color:var(--fjord-600)}
 .map-card svg{color:var(--fjord-600);flex:0 0 22px}
@@ -2449,6 +2463,7 @@ ${BROWSE_CSS}
     <aside>
       <div class="aside-card">
         <h2>Reserver</h2>
+        ${isBookingPaused(provider.booking_live) ? `<p class="reserve-notice">Reservasjoner er ikke aktive ennå — kommer snart.</p>` : ""}
         <a class="reserve-cta" href="${bookHref}">Reserver besøk</a>
       </div>
       <div class="aside-card">
@@ -2499,6 +2514,11 @@ function bookingErrorMessage(code: string): string {
       return "Sjekk at alle obligatoriske felt er fylt ut riktig (dato/tid, antall personer, navn og e-post), og prøv igjen.";
     case "internal":
       return "Noe gikk galt på våre servere. Prøv igjen om litt.";
+    // dev-request 2026-07-12-gardssalg-dark-launch-stop, slice 0 — the no-JS
+    // POST fallback redirects here with ?error=paused when the hard-stop
+    // gate (isBookingPaused()) blocks a submission.
+    case "paused":
+      return "Reservasjoner er ikke aktive ennå — kommer snart. Du kan sende en interessemelding, men ingen reservasjon blir bekreftet ennå.";
     default:
       return "Noe gikk galt. Prøv igjen.";
   }
@@ -2529,6 +2549,17 @@ router.get(
       ? `<div role="alert" style="background:#fdecea;border:1px solid #f3b6ae;color:#8a2f24;padding:12px 16px;border-radius:8px;margin-bottom:16px;font-size:.9rem">${escapeHtml(bookingErrorMessage(errorParam))}</div>`
       : "";
 
+    // dev-request 2026-07-12-gardssalg-dark-launch-stop, slice 0 — persistent,
+    // no-JS notice shown whenever submission would actually be blocked (see
+    // the hard stop in the POST handler below and in POST
+    // /api/opplevelser/book). Independent of ?error=paused (that's the
+    // banner shown AFTER a blocked submit attempt); this one is unmissable
+    // up front so nothing on the page implies booking works today.
+    const notLive = isBookingPaused(provider.booking_live);
+    const pausedNotice = notLive
+      ? `<div class="notice-paused" role="status"><strong>Kommer snart</strong>Reservasjoner er ikke aktive ennå — kommer snart. Du kan sende en interessemelding, men ingen reservasjon blir bekreftet ennå.</div>`
+      : "";
+
     const html = `<!doctype html>
 <html lang="nb">
 <head>
@@ -2544,6 +2575,8 @@ ${BROWSE_CSS}
 .book-panel h1{font-size:1.4rem;font-weight:800;color:var(--fjord-900);margin-bottom:4px}
 .book-panel .sted{font-size:.86rem;color:var(--mist);margin-bottom:10px}
 .book-panel .microcopy{font-size:.86rem;color:var(--ink-soft);background:var(--canvas-2);border-radius:8px;padding:10px 14px;margin:14px 0 18px}
+.book-panel .notice-paused{font-size:.88rem;color:var(--ink);background:var(--canvas-2);border:1px solid var(--line);border-left:4px solid var(--fjord-800);border-radius:8px;padding:12px 14px;margin:14px 0 18px}
+.book-panel .notice-paused strong{display:block;font-size:.76rem;font-weight:800;text-transform:uppercase;letter-spacing:.05em;color:var(--fjord-800);margin-bottom:4px}
 .book-form label{display:block;font-size:.84rem;font-weight:700;color:var(--ink-soft);margin:14px 0 5px}
 .book-form input{width:100%;padding:10px 12px;border:1px solid var(--line);border-radius:8px;font-size:.95rem;color:var(--ink);background:var(--surface)}
 .book-form input:focus-visible{outline:2px solid var(--teal-500);outline-offset:1px}
@@ -2567,10 +2600,11 @@ ${BROWSE_CSS}
   </nav>
   <div class="book-panel">
     ${errorBanner}
+    ${pausedNotice}
     ${sted ? `<div class="sted">${escapeHtml(sted)}</div>` : ""}
     <h1>${escapeHtml(provider.navn)}</h1>
     ${badge}
-    <p class="microcopy">Du betaler ingenting nå — dette er en reservasjon.</p>
+    ${notLive ? "" : `<p class="microcopy">Du betaler ingenting nå — dette er en reservasjon.</p>`}
     <form class="book-form" method="POST" action="${canonical}" id="book-form">
       <input type="hidden" name="provider_id" value="${escapeHtml(provider.id)}">
       <label for="slot_at">Dato og tid</label>
@@ -2628,6 +2662,10 @@ ${BROWSE_CSS}
           return;
         }
         if (btn) btn.disabled = false;
+        if (res.data && res.data.paused) {
+          if (status) status.textContent = res.data.message || "Reservasjoner er ikke aktive ennå — kommer snart.";
+          return;
+        }
         if (status) status.textContent = "Noe gikk galt. Sjekk feltene og prøv igjen, eller last siden på nytt uten javascript.";
       })
       .catch(function () {
@@ -2667,6 +2705,17 @@ router.post(
     if (!provider) return next();
 
     const backTo = `/kategori/gardssalg/book/${encodeURIComponent(slug)}`;
+
+    // ─── Dark-launch-stop gate (dev-request 2026-07-12-gardssalg-dark-
+    // launch-stop, slice 0) — mirrors the gate in POST /api/opplevelser/book
+    // exactly (see isBookingPaused() in services/booking-store.ts). Checked
+    // before touching req.body at all: no reserved row, no guest email, no
+    // producer notification when paused, full stop.
+    if (isBookingPaused(provider.booking_live)) {
+      res.redirect(303, `${backTo}?error=paused`);
+      return;
+    }
+
     const body = (req.body || {}) as Record<string, unknown>;
     const partySize = parseInt(String(body.party_size ?? ""), 10);
     const phoneRaw = body.guest_phone ? String(body.guest_phone).trim() : "";
@@ -2696,6 +2745,12 @@ router.post(
     // Fire-and-forget confirmation email — identical to the JSON API path.
     sendBookingConfirmation(booking).catch((e) =>
       console.error("[gardssalg-book] email failed", booking.booking_ref, e),
+    );
+
+    // Fire-and-forget producer notification — the gate above already
+    // confirmed dispatch is on and this provider is booking_live.
+    sendProducerNotification(booking, provider.epost).catch((e) =>
+      console.error("[gardssalg-book] producer notification failed", booking.booking_ref, e),
     );
 
     res.redirect(303, `${backTo}/confirm/${encodeURIComponent(booking.booking_ref)}`);

@@ -1742,10 +1742,18 @@ export type GardssalgProviderRow = {
   about_text: string | null;
   visit_text: string | null;
   opening_hours_text: string | null;
+  // Additive (2026-07-12, dev-request 2026-07-12-gardssalg-dark-launch-stop,
+  // slice 0): per-provider booking gate — 0/NULL until a future onboarding
+  // slice flips a given producer to 1. Read together with the
+  // BOOKING_DISPATCH_ENABLED env flag (see isBookingPaused() in
+  // services/booking-store.ts) by the booking panel, produsent profile, and
+  // category-card "coming soon" notices, and by the booking submission gate
+  // in routes/opplevelser.ts + routes/experiences-seo.ts.
+  booking_live: number | null;
 };
 
 const GARDSSALG_PROVIDER_COLUMNS =
-  "id, navn, hjemmeside, fylke, kommune, poststed, producer_type, enrichment_state, slug, adresse, lat, lon, epost, telefon, about_text, visit_text, opening_hours_text";
+  "id, navn, hjemmeside, fylke, kommune, poststed, producer_type, enrichment_state, slug, adresse, lat, lon, epost, telefon, about_text, visit_text, opening_hours_text, booking_live";
 
 export function listGardssalgProviders(limit = 100, offset = 0): GardssalgProviderRow[] {
   const db = getDb(VERTICAL);
