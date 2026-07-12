@@ -1749,6 +1749,9 @@ export type GardssalgProviderRow = {
   about_text: string | null;
   visit_text: string | null;
   opening_hours_text: string | null;
+  // Additive (2026-07-12, gårdssalg RFB-enrichment slice): JSON array of the
+  // producer's drink products (["Eplesider",…]). NULL until enrichment fills it.
+  products: string | null;
   // Additive (2026-07-12, dev-request 2026-07-12-gardssalg-dark-launch-stop,
   // slice 0): per-provider booking gate — 0/NULL until a future onboarding
   // slice flips a given producer to 1. Read together with the
@@ -1760,7 +1763,7 @@ export type GardssalgProviderRow = {
 };
 
 const GARDSSALG_PROVIDER_COLUMNS =
-  "id, navn, hjemmeside, fylke, kommune, poststed, producer_type, enrichment_state, slug, adresse, lat, lon, geocode_confidence, epost, telefon, about_text, visit_text, opening_hours_text, booking_live";
+  "id, navn, hjemmeside, fylke, kommune, poststed, producer_type, enrichment_state, slug, adresse, lat, lon, geocode_confidence, epost, telefon, about_text, visit_text, opening_hours_text, products, booking_live";
 
 export function listGardssalgProviders(limit = 100, offset = 0): GardssalgProviderRow[] {
   const db = getDb(VERTICAL);

@@ -27845,3 +27845,99 @@ console.log("\n── orch-pr-titleno-render: renderCard()/detail-page title_no 
   dbFactoryTNR.__resetDbFactoryForTesting();
   console.log("  orch-pr-titleno-render: OK (card + detail <h1> title_no fallback, both locales)");
 })();
+
+
+// ── gardssalg-produsent-products: "Produkter" section render (2026-07-12, Daniel) ──
+// The gårdssalg produsent page now renders a "Produkter" section from the new
+// experience_providers.products JSON column (filled by the RFB-knowledge
+// enrichment). Proves: (a) products render as chips with the drink names; (b)
+// both ["Eplesider"] and [{name:"Eplesider"}] shapes work; (c) honest omission —
+// a provider with NO products renders no "Produkter" section (never a
+// placeholder); (d) case-insensitive de-dup.
+console.log("\n── gardssalg-produsent-products: 'Produkter' section render ──");
+(() => {
+  const prevPathGPP = process.env.EXPERIENCES_DB_PATH;
+  process.env.EXPERIENCES_DB_PATH = ":memory:";
+
+  const dbFacPathGPP = require.resolve("../src/database/db-factory");
+  const expStPathGPP = require.resolve("../src/services/experience-store");
+  const expSeoPathGPP = require.resolve("../src/routes/experiences-seo");
+  delete require.cache[dbFacPathGPP];
+  delete require.cache[expStPathGPP];
+  delete require.cache[expSeoPathGPP];
+
+  const dbFacGPP = require("../src/database/db-factory") as typeof import("../src/database/db-factory");
+  dbFacGPP.__resetDbFactoryForTesting();
+  const expStGPP = require("../src/services/experience-store") as typeof import("../src/services/experience-store");
+  const seoRouterGPP = (require("../src/routes/experiences-seo") as typeof import("../src/routes/experiences-seo")).default as any;
+  const dbGPP = dbFacGPP.getDb("experiences");
+
+  function renderProdusent(slug: string): { status: number; body: string } {
+    const layer = (seoRouterGPP.stack as any[]).find(
+      (l: any) => l.route && l.route.path === "/kategori/gardssalg/produsent/:providerSlug" && l.route.methods?.get,
+    );
+    let body = ""; let status = 200;
+    const res: any = {
+      statusCode: 200, setHeader: () => {},
+      status: (c: number) => { status = c; return res; },
+      send: (b: unknown) => { body = String(b); return res; },
+      json: (o: unknown) => { body = JSON.stringify(o); return res; },
+    };
+    const req: any = { path: `/kategori/gardssalg/produsent/${slug}`, hostname: "opplevagent.no", params: { providerSlug: slug }, query: {} };
+    const handle = layer.route.stack[layer.route.stack.length - 1].handle;
+    handle(req, res, () => { status = 404; });
+    return { status, body };
+  }
+
+  try {
+    // (a) Provider WITH products (mixed shapes: strings + {name})
+    const pidA = expStGPP.createProvider({
+      navn: "Produkttest Sideri AS", org_nr: "919000111",
+      fylke: "Vestland", kommune: "Ulvik", verification_status: "verified",
+    });
+    dbGPP.prepare("UPDATE experience_providers SET producer_type=?, slug=?, products=? WHERE id=?")
+      .run("cideri", "produkttest-sideri", JSON.stringify(["Eplesider", { name: "Eplemost" }, "eplesider"]), pidA);
+
+    const rA = renderProdusent("produkttest-sideri");
+    assertEq(rA.status, 200, "gpp-01: produsent page with products → 200");
+    assertTrue(rA.body.includes("<h2>Produkter</h2>"), "gpp-02: renders a 'Produkter' section");
+    assertTrue(rA.body.includes("Eplesider"), "gpp-03: lists product 'Eplesider' (string form)");
+    assertTrue(rA.body.includes("Eplemost"), "gpp-04: lists product 'Eplemost' ({name} form)");
+    // case-insensitive de-dup: "Eplesider" + "eplesider" → one chip only
+    const chipCount = (rA.body.match(/product-chips">/g) || []).length;
+    assertEq(chipCount, 1, "gpp-05: exactly one product-chips list rendered");
+    const eplesiderCount = (rA.body.match(/>Eplesider</g) || []).length;
+    assertEq(eplesiderCount, 1, "gpp-06: 'Eplesider' de-duped case-insensitively (one <li>)");
+
+    // (b) Provider WITHOUT products → honest omission (no Produkter section)
+    const pidB = expStGPP.createProvider({
+      navn: "Ingenprodukt Bryggeri AS", org_nr: "919000222",
+      fylke: "Innlandet", kommune: "Lillehammer", verification_status: "verified",
+    });
+    dbGPP.prepare("UPDATE experience_providers SET producer_type=?, slug=? WHERE id=?")
+      .run("bryggeri", "ingenprodukt-bryggeri", pidB);
+    const rB = renderProdusent("ingenprodukt-bryggeri");
+    assertEq(rB.status, 200, "gpp-07: produsent page without products → 200");
+    assertTrue(!rB.body.includes("<h2>Produkter</h2>"), "gpp-08: NO 'Produkter' section when products absent (honest omission)");
+
+    // (c) Malformed products JSON → no crash, no section
+    const pidC = expStGPP.createProvider({
+      navn: "Rar Json Destilleri AS", org_nr: "919000333",
+      fylke: "Troms", kommune: "Tromsø", verification_status: "verified",
+    });
+    dbGPP.prepare("UPDATE experience_providers SET producer_type=?, slug=?, products=? WHERE id=?")
+      .run("destilleri", "rar-json-destilleri", "{not valid json", pidC);
+    const rC = renderProdusent("rar-json-destilleri");
+    assertEq(rC.status, 200, "gpp-09: malformed products JSON → still 200, no crash");
+    assertTrue(!rC.body.includes("<h2>Produkter</h2>"), "gpp-10: malformed products → no section (defensive)");
+
+    console.log("  gardssalg-produsent-products: OK (10 assertions)");
+  } catch (err) {
+    failed++;
+    failures.push(`gardssalg-produsent-products: unexpected error: ${err instanceof Error ? (err.stack || err.message) : String(err)}`);
+  } finally {
+    if (prevPathGPP === undefined) delete process.env.EXPERIENCES_DB_PATH;
+    else process.env.EXPERIENCES_DB_PATH = prevPathGPP;
+    dbFacGPP.__resetDbFactoryForTesting();
+  }
+})();
