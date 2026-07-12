@@ -717,6 +717,13 @@ function hostFromUrlLike(raw: string): string | null {
   // Drop userinfo / port
   s = s.split("@").pop()!.split(":")[0]!;
   s = s.replace(/^www\./i, "").toLowerCase();
+  // Strip trailing FQDN root dot(s) — "domain.com." is DNS-syntactically
+  // identical to "domain.com"; degenerate input could in principle carry
+  // more than one, so strip all of them (dev-request
+  // 2026-06-30-open-stuck-verification-bucket, 2026-07-12T11:15Z fast
+  // follow-up: knowledge.email "info@domain.com." wasn't matching
+  // PLACEHOLDER_EMAIL_DOMAINS's "domain.com" entry because of this gap).
+  s = s.replace(/\.+$/, "");
   if (!s) return null;
   // IDN normalization (2026-06-05, lokal-agent-enrichment): unicode and
   // punycode forms of the same host must compare equal (svanøylaks.no vs
