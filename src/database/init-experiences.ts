@@ -404,5 +404,21 @@ export function initExperiencesSchema(db: Database.Database): void {
     try { db.exec(stmt); } catch { /* already present */ }
   }
 
+  // ─── Gårdssalg dark-launch-stop (dev-request 2026-07-12-gardssalg-dark-
+  // launch-stop, slice 0) ────────────────────────────────────────────────────
+  // The gårdssalg booking flow has been live on prod since 2026-07-03 but no
+  // producer is ever notified of a reservation and no producer has been
+  // onboarded — a trust/reputation risk. booking_live is the per-provider
+  // gate a FUTURE onboarding slice will flip to 1 once a given producer has
+  // actually agreed to receive bookings; it defaults to 0 (not live) so every
+  // existing row is safe the instant this column exists. Read alongside the
+  // BOOKING_DISPATCH_ENABLED env flag (see bookingDispatchEnabled() /
+  // isBookingPaused() in services/booking-store.ts) — booking submission and
+  // the "coming soon" UI notices both gate on the pair, not on this column
+  // alone. This slice only adds the column; nothing sets it to 1 yet.
+  try {
+    db.exec("ALTER TABLE experience_providers ADD COLUMN booking_live INTEGER DEFAULT 0");
+  } catch { /* already present */ }
+
   console.log("[experiences] schema initialized");
 }

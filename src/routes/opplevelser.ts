@@ -50,6 +50,9 @@ import {
   // added in PR #209 has no way to execute against the live DB without an
   // HTTP trigger — mirrors this file's other requireAdmin-gated one-off actions).
   runDedupPass,
+  // dev-request 2026-07-12-gardssalg-dark-launch-stop, slice 0 — need the
+  // full provider row (booking_live + epost) to gate/dispatch bookings.
+  getProviderById,
 } from "../services/experience-store";
 // dev-request 2026-07-11-dedup-false-positive-remediation — read-only audit
 // of the merged groups the prod backfill produced (titlesMatch()'s single-
@@ -85,6 +88,9 @@ import {
   BookingInputSchema,
   buildIcs,
   sendBookingConfirmation,
+  // dev-request 2026-07-12-gardssalg-dark-launch-stop, slice 0
+  isBookingPaused,
+  sendProducerNotification,
 } from "../services/booking-store";
 
 const APP_URL = process.env.APP_URL || "https://opplevagent.no";
@@ -1154,6 +1160,25 @@ router.post("/book", async (req: Request, res: Response) => {
     return;
   }
 
+  // ─── Dark-launch-stop gate (dev-request 2026-07-12-gardssalg-dark-launch-
+  // stop, slice 0) — the gårdssalg flow looks fully functional to a guest
+  // but no producer is notified/onboarded yet, a live trust/reputation risk.
+  // Hard stop, independent of any UI notice: unless BOOKING_DISPATCH_ENABLED
+  // is "true" AND this specific provider is booking_live=1, never create a
+  // 'reserved' row, never send the guest confirmation, never notify a
+  // producer. See isBookingPaused() in services/booking-store.ts.
+  const providerBook = getProviderById(parsed.data.provider_id) as
+    | { booking_live?: number | null; epost?: string | null }
+    | null;
+  if (isBookingPaused(providerBook?.booking_live ?? null)) {
+    res.status(200).json({
+      success: false,
+      paused: true,
+      message: "Reservasjoner er ikke aktive ennå — kommer snart.",
+    });
+    return;
+  }
+
   let booking;
   try {
     booking = createBooking(parsed.data);
@@ -1166,6 +1191,12 @@ router.post("/book", async (req: Request, res: Response) => {
   // Fire-and-forget confirmation email; never block the response on it
   sendBookingConfirmation(booking).catch((e) =>
     console.error("[booking] email failed", booking.booking_ref, e),
+  );
+
+  // Fire-and-forget producer notification — the gate above already confirmed
+  // dispatch is on and this provider is booking_live.
+  sendProducerNotification(booking, providerBook?.epost ?? null).catch((e) =>
+    console.error("[booking] producer notification failed", booking.booking_ref, e),
   );
 
   const confirmUrl = `${APP_URL}/api/opplevelser/book/confirm/${booking.confirm_token}`;
