@@ -1497,7 +1497,8 @@ Sted: ${place || "ukjent"}`;
     return null; // unparseable JSON body — never fabricate
   }
 
-  const text = result?.content?.find((c: any) => c?.type === "text")?.text;
+  const contentArr = Array.isArray(result?.content) ? result.content : [];
+  const text = contentArr.find((c: any) => c?.type === "text")?.text;
   if (typeof text !== "string") return null;
   const cleaned = text.trim().replace(/^["'«]+|["'»]+$/g, "").trim();
   return cleaned.length > 0 ? cleaned : null;
