@@ -326,7 +326,9 @@ router.get("/", (req: Request, res: Response) => {
     // cold sends: the v2 triggers record any out/sent message on a no-inbound
     // thread — marketing-batch-* AND compose-* — plus the queued→sent confirm
     // path, and the v3 backfill filled in the historically-missing compose sends.
-    const lastSentFor = (row: PoolRow): string | null => {
+    // Accepts any row carrying agent_id + email (PoolRow, or a deduped candidate)
+    // so it can drive both the cooldown check and the mode=second ordering below.
+    const lastSentFor = (row: { agent_id: string; email: string }): string | null => {
       const byAgent = lastSentByAgent.get(row.agent_id) ?? null;
       const byEmail = row.email ? (lastSentByEmail.get(row.email.toLowerCase()) ?? null) : null;
       if (byAgent && byEmail) return byAgent > byEmail ? byAgent : byEmail;
@@ -481,8 +483,37 @@ router.get("/", (req: Request, res: Response) => {
     // mirrors the outreach-ready-pool endpoint exactly.
     const deduped = dedupeByEmail(candidates);
 
-    // Cap by limit AFTER suppression + dedupe
-    const cappedCandidates = deduped.selected.slice(0, limit);
+    // ── mode=second: "eldst-kontaktet-først" ordering (2026-07-12, Daniel) ─────
+    // Prioritize the producers whose last contact is LONGEST ago, so a limit-
+    // capped second-touch batch reaches the most-overdue email-nr2 candidates
+    // first. This changes ONLY the order — every suppression above (blocklist,
+    // replied, opt-out, customer, hard-bounce, wrong-entity, inference-only,
+    // cooldown, recent-crm-send) is already applied, so a blocklisted or
+    // already-replied producer is never in `deduped.selected` to begin with.
+    // mode=first keeps its outreach_eligible_at ASC order (never-contacted rows
+    // have no last-contact date to sort on).
+    let ordered = deduped.selected;
+    if (mode === "second") {
+      ordered = [...deduped.selected].sort((a, b) => {
+        const la = lastSentFor(a);
+        const lb = lastSentFor(b);
+        if (la === lb) return 0;
+        if (la === null) return 1;   // never-contacted (defensive) → last
+        if (lb === null) return -1;
+        // outreach_sent_log.sent_at holds mixed formats — app ISO ("…T…Z") and
+        // the trigger/backfill SQLite fallback ("YYYY-MM-DD HH:MM:SS", space at
+        // index 10). Normalize the separator so same-calendar-day ties order by
+        // true time (space<'T' would otherwise sort a same-day SQLite row ahead
+        // of an earlier-in-the-day ISO row). Cross-day order was already correct
+        // (the YYYY-MM-DD prefix is uniform); this only tightens the tie-break.
+        const na = la.replace(" ", "T");
+        const nb = lb.replace(" ", "T");
+        return na < nb ? -1 : na > nb ? 1 : 0; // ascending → oldest contact first
+      });
+    }
+
+    // Cap by limit AFTER suppression + dedupe + ordering
+    const cappedCandidates = ordered.slice(0, limit);
 
     res.json({
       success: true,
