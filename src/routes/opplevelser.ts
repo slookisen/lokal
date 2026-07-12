@@ -944,6 +944,7 @@ import { getDb as getRfbDb } from "../database/init";
 import { getDb as getExpDb } from "../database/db-factory";
 import {
   indexRfbByDomain,
+  indexRfbByName,
   pickEnrichmentFields,
   type RfbSource,
   type EnrichProviderRow,
@@ -1157,6 +1158,7 @@ router.post("/admin/rfb-knowledge-enrich", requireAdmin, (req: Request, res: Res
     return;
   }
   const byDomain = indexRfbByDomain(sources);
+  const byName = indexRfbByName(sources);
 
   // Load the seeded gårdssalg providers.
   let providers: EnrichProviderRow[] = [];
@@ -1173,7 +1175,7 @@ router.post("/admin/rfb-knowledge-enrich", requireAdmin, (req: Request, res: Res
     return;
   }
 
-  const results = providers.map((p) => pickEnrichmentFields(p, byDomain));
+  const results = providers.map((p) => pickEnrichmentFields(p, byDomain, byName));
 
   let enriched = 0;
   const fieldFillCounts: Record<string, number> = {};
@@ -1204,9 +1206,12 @@ router.post("/admin/rfb-knowledge-enrich", requireAdmin, (req: Request, res: Res
     for (const r of results) if (r.status === "would_enrich") for (const f of Object.keys(r.copy)) fieldFillCounts[f] = (fieldFillCounts[f] || 0) + 1;
   }
 
+  const wouldEnrich = results.filter((r) => r.status === "would_enrich");
   const summary = {
     total_providers: results.length,
-    would_enrich: results.filter((r) => r.status === "would_enrich").length,
+    would_enrich: wouldEnrich.length,
+    would_enrich_by_domain: wouldEnrich.filter((r) => r.matched_by === "domain").length,
+    would_enrich_by_name: wouldEnrich.filter((r) => r.matched_by === "name").length,
     locked: results.filter((r) => r.status === "locked").length,
     no_domain: results.filter((r) => r.status === "no_domain").length,
     no_match: results.filter((r) => r.status === "no_match").length,
