@@ -27843,3 +27843,217 @@ console.log("\n── orch-pr-titleno-render: renderCard()/detail-page title_no 
   dbFactoryTNR.__resetDbFactoryForTesting();
   console.log("  orch-pr-titleno-render: OK (card + detail <h1> title_no fallback, both locales)");
 })();
+
+
+// ── gardssalg-produsent-products: "Produkter" section render (2026-07-12, Daniel) ──
+// The gårdssalg produsent page now renders a "Produkter" section from the new
+// experience_providers.products JSON column (filled by the RFB-knowledge
+// enrichment). Proves: (a) products render as chips with the drink names; (b)
+// both ["Eplesider"] and [{name:"Eplesider"}] shapes work; (c) honest omission —
+// a provider with NO products renders no "Produkter" section (never a
+// placeholder); (d) case-insensitive de-dup.
+console.log("\n── gardssalg-produsent-products: 'Produkter' section render ──");
+(() => {
+  const prevPathGPP = process.env.EXPERIENCES_DB_PATH;
+  process.env.EXPERIENCES_DB_PATH = ":memory:";
+
+  const dbFacPathGPP = require.resolve("../src/database/db-factory");
+  const expStPathGPP = require.resolve("../src/services/experience-store");
+  const expSeoPathGPP = require.resolve("../src/routes/experiences-seo");
+  delete require.cache[dbFacPathGPP];
+  delete require.cache[expStPathGPP];
+  delete require.cache[expSeoPathGPP];
+
+  const dbFacGPP = require("../src/database/db-factory") as typeof import("../src/database/db-factory");
+  dbFacGPP.__resetDbFactoryForTesting();
+  const expStGPP = require("../src/services/experience-store") as typeof import("../src/services/experience-store");
+  const seoRouterGPP = (require("../src/routes/experiences-seo") as typeof import("../src/routes/experiences-seo")).default as any;
+  const dbGPP = dbFacGPP.getDb("experiences");
+
+  function renderProdusent(slug: string): { status: number; body: string } {
+    const layer = (seoRouterGPP.stack as any[]).find(
+      (l: any) => l.route && l.route.path === "/kategori/gardssalg/produsent/:providerSlug" && l.route.methods?.get,
+    );
+    let body = ""; let status = 200;
+    const res: any = {
+      statusCode: 200, setHeader: () => {},
+      status: (c: number) => { status = c; return res; },
+      send: (b: unknown) => { body = String(b); return res; },
+      json: (o: unknown) => { body = JSON.stringify(o); return res; },
+    };
+    const req: any = { path: `/kategori/gardssalg/produsent/${slug}`, hostname: "opplevagent.no", params: { providerSlug: slug }, query: {} };
+    const handle = layer.route.stack[layer.route.stack.length - 1].handle;
+    handle(req, res, () => { status = 404; });
+    return { status, body };
+  }
+
+  try {
+    // (a) Provider WITH products (mixed shapes: strings + {name})
+    const pidA = expStGPP.createProvider({
+      navn: "Produkttest Sideri AS", org_nr: "919000111",
+      fylke: "Vestland", kommune: "Ulvik", verification_status: "verified",
+    });
+    dbGPP.prepare("UPDATE experience_providers SET producer_type=?, slug=?, products=? WHERE id=?")
+      .run("cideri", "produkttest-sideri", JSON.stringify(["Eplesider", { name: "Eplemost" }, "eplesider"]), pidA);
+
+    const rA = renderProdusent("produkttest-sideri");
+    assertEq(rA.status, 200, "gpp-01: produsent page with products → 200");
+    assertTrue(rA.body.includes("<h2>Produkter</h2>"), "gpp-02: renders a 'Produkter' section");
+    assertTrue(rA.body.includes("Eplesider"), "gpp-03: lists product 'Eplesider' (string form)");
+    assertTrue(rA.body.includes("Eplemost"), "gpp-04: lists product 'Eplemost' ({name} form)");
+    // case-insensitive de-dup: "Eplesider" + "eplesider" → one chip only
+    const chipCount = (rA.body.match(/product-chips">/g) || []).length;
+    assertEq(chipCount, 1, "gpp-05: exactly one product-chips list rendered");
+    const eplesiderCount = (rA.body.match(/>Eplesider</g) || []).length;
+    assertEq(eplesiderCount, 1, "gpp-06: 'Eplesider' de-duped case-insensitively (one <li>)");
+
+    // (b) Provider WITHOUT products → honest omission (no Produkter section)
+    const pidB = expStGPP.createProvider({
+      navn: "Ingenprodukt Bryggeri AS", org_nr: "919000222",
+      fylke: "Innlandet", kommune: "Lillehammer", verification_status: "verified",
+    });
+    dbGPP.prepare("UPDATE experience_providers SET producer_type=?, slug=? WHERE id=?")
+      .run("bryggeri", "ingenprodukt-bryggeri", pidB);
+    const rB = renderProdusent("ingenprodukt-bryggeri");
+    assertEq(rB.status, 200, "gpp-07: produsent page without products → 200");
+    assertTrue(!rB.body.includes("<h2>Produkter</h2>"), "gpp-08: NO 'Produkter' section when products absent (honest omission)");
+
+    // (c) Malformed products JSON → no crash, no section
+    const pidC = expStGPP.createProvider({
+      navn: "Rar Json Destilleri AS", org_nr: "919000333",
+      fylke: "Troms", kommune: "Tromsø", verification_status: "verified",
+    });
+    dbGPP.prepare("UPDATE experience_providers SET producer_type=?, slug=?, products=? WHERE id=?")
+      .run("destilleri", "rar-json-destilleri", "{not valid json", pidC);
+    const rC = renderProdusent("rar-json-destilleri");
+    assertEq(rC.status, 200, "gpp-09: malformed products JSON → still 200, no crash");
+    assertTrue(!rC.body.includes("<h2>Produkter</h2>"), "gpp-10: malformed products → no section (defensive)");
+
+    console.log("  gardssalg-produsent-products: OK (10 assertions)");
+  } catch (err) {
+    failed++;
+    failures.push(`gardssalg-produsent-products: unexpected error: ${err instanceof Error ? (err.stack || err.message) : String(err)}`);
+  } finally {
+    if (prevPathGPP === undefined) delete process.env.EXPERIENCES_DB_PATH;
+    else process.env.EXPERIENCES_DB_PATH = prevPathGPP;
+    dbFacGPP.__resetDbFactoryForTesting();
+  }
+})();
+
+
+// ── gardssalg-rfb-enrich: field-selection rules (2026-07-12, Daniel 2A) ──────
+// Pure-function tests for the RFB→gårdssalg enrichment picker: strict domain
+// match, skip junk/inference-only, respect the content_source lock, fill only
+// missing fields.
+console.log("\n── gardssalg-rfb-enrich: strict-match + skip-junk + lock rules ──");
+{
+  const enrich = require("../src/services/gardssalg-rfb-enrich") as
+    typeof import("../src/services/gardssalg-rfb-enrich");
+  const { pickEnrichmentFields, indexRfbByDomain, isJunkEmail, parseProductNames } = enrich;
+
+  const rfbAlde: import("../src/services/gardssalg-rfb-enrich").RfbSource = {
+    agent_id: "rfb-alde", name: "Alde Sider", url: "https://aldesider.no/",
+    lat: 60.5, lng: 6.9,
+    about: "Ulvik Frukt og Cideri er en av tre gårder på Norges eneste frukt- og siderrute. Prisbelønt siden 2007.",
+    address: "Bleievegen 16, 5776 Nå", phone: "+47 48007966", email: "user@domain.com",
+    products: JSON.stringify([{ name: "Eplesider" }, "Eplemost"]),
+    verification_review_reason: "{}",
+  };
+  const byDomain = indexRfbByDomain([rfbAlde]);
+
+  const base = {
+    id: "p1", navn: "Alde Sider / Ulvik Frukt & Cideri", hjemmeside: "http://www.aldesider.no",
+    adresse: null, telefon: null, epost: null, lat: null, lon: null,
+    about_text: null, products: null, content_source: null,
+  };
+
+  // (1) Strict domain match → would_enrich, copies the good fields, skips junk email.
+  const r1 = pickEnrichmentFields(base, byDomain);
+  assertEq(r1.status, "would_enrich", "enrich-01: domain match (www vs no-www, http vs https) → would_enrich");
+  assertEq(r1.matched_rfb?.agent_id, "rfb-alde", "enrich-02: matched the right RFB producer by domain");
+  assertEq(r1.copy.adresse, "Bleievegen 16, 5776 Nå", "enrich-03: copies address");
+  assertEq(r1.copy.telefon, "+47 48007966", "enrich-04: copies displayable phone");
+  assertEq(r1.copy.about, undefined, "enrich-05: about copied under about_text key, not about");
+  assertEq(typeof r1.copy.about_text, "string", "enrich-06: copies about_text");
+  assertEq(r1.copy.lat, 60.5, "enrich-07: copies lat from agents.lat");
+  assertEq(r1.copy.lon, 6.9, "enrich-08: copies lon from agents.lng");
+  assertEq(String(r1.copy.products), JSON.stringify(["Eplesider", "Eplemost"]), "enrich-09: copies normalized product names");
+  assertTrue(r1.skipped.some((s) => s.field === "epost" && s.reason === "junk_email"),
+    "enrich-10: placeholder email user@domain.com SKIPPED as junk");
+  assertEq(r1.copy.epost, undefined, "enrich-11: junk email NOT copied");
+
+  // (2) No provider domain → flagged for manual review, no copy.
+  const r2 = pickEnrichmentFields({ ...base, hjemmeside: null }, byDomain);
+  assertEq(r2.status, "no_domain", "enrich-12: provider without a website → no_domain (manual review)");
+  assertEq(Object.keys(r2.copy).length, 0, "enrich-13: no_domain copies nothing");
+
+  // (3) Domain that doesn't match any RFB source → no_match.
+  const r3 = pickEnrichmentFields({ ...base, hjemmeside: "https://someoneelse.no" }, byDomain);
+  assertEq(r3.status, "no_match", "enrich-14: unmatched domain → no_match (never a wrong-producer copy)");
+
+  // (3b) Generic/shared domains (social/own) are NEVER a match — they'd false-
+  // link two different producers. Even if an RFB source shares facebook.com, a
+  // provider on facebook.com is flagged no_domain, not matched.
+  const byDomainFb = indexRfbByDomain([{ ...rfbAlde, url: "https://facebook.com/aldesider" }]);
+  assertEq(byDomainFb.size, 0, "enrich-14b: RFB source on facebook.com is NOT indexed (generic domain)");
+  const rFb = pickEnrichmentFields({ ...base, hjemmeside: "https://facebook.com/ulvikfrukt" }, byDomain);
+  assertEq(rFb.status, "no_domain", "enrich-14c: provider on facebook.com → no_domain (generic, manual review)");
+  const rOwn = pickEnrichmentFields({ ...base, hjemmeside: "https://rettfrabonden.com/produsent/x" }, byDomain);
+  assertEq(rOwn.status, "no_domain", "enrich-14d: provider on our own domain → no_domain (never a match)");
+
+  // (3c) COLLISION: two DIFFERENT producers on the same domain → that domain is
+  // made un-matchable (never an arbitrary first-wins pick that copies the wrong
+  // producer's info). A provider on the collided domain gets no_match.
+  const byDomainCollide = indexRfbByDomain([
+    { ...rfbAlde, agent_id: "rfb-x", name: "Farm X", url: "https://sites.google.com/view/farmx" },
+    { ...rfbAlde, agent_id: "rfb-y", name: "Farm Y", url: "https://sites.google.com/view/farmy" },
+  ]);
+  assertEq(byDomainCollide.size, 0, "enrich-14e: colliding domain (2 producers, sites.google.com) dropped from index");
+  const rCollide = pickEnrichmentFields({ ...base, hjemmeside: "https://sites.google.com/view/farmx" }, byDomainCollide);
+  assertEq(rCollide.status, "no_match", "enrich-14f: provider on a collided domain → no_match (no wrong-producer copy)");
+  // Same-agent duplicate rows are NOT a collision (identical agent_id).
+  const byDomainDup = indexRfbByDomain([
+    { ...rfbAlde, url: "https://aldesider.no" },
+    { ...rfbAlde, url: "https://aldesider.no" },
+  ]);
+  assertEq(byDomainDup.size, 1, "enrich-14g: same-agent duplicate rows do NOT trigger a collision");
+
+  // (4) content_source lock → never overwrite human/owner-authored rows.
+  const r4 = pickEnrichmentFields({ ...base, content_source: "manual" }, byDomain);
+  assertEq(r4.status, "locked", "enrich-15: content_source=manual → locked");
+  assertEq(Object.keys(r4.copy).length, 0, "enrich-16: locked copies nothing");
+  const r4b = pickEnrichmentFields({ ...base, content_source: "claim" }, byDomain);
+  assertEq(r4b.status, "locked", "enrich-17: content_source=claim → locked");
+
+  // (5) Fill ONLY missing fields — an existing adresse is never clobbered.
+  const r5 = pickEnrichmentFields({ ...base, adresse: "Egen adresse 1" }, byDomain);
+  assertEq(r5.copy.adresse, undefined, "enrich-18: existing adresse is NOT overwritten (missing-only fill)");
+
+  // (6) Inference-only factual field is skipped.
+  const byDomainInf = indexRfbByDomain([{ ...rfbAlde, verification_review_reason: JSON.stringify({ inference_only_fields: ["address", "products"] }) }]);
+  const r6 = pickEnrichmentFields(base, byDomainInf);
+  assertTrue(r6.skipped.some((s) => s.field === "adresse" && s.reason === "inference_only"),
+    "enrich-19: inference-only address SKIPPED");
+  assertTrue(r6.skipped.some((s) => s.field === "products" && s.reason === "inference_only"),
+    "enrich-20: inference-only products SKIPPED");
+  assertEq(r6.copy.adresse, undefined, "enrich-21: inference-only address not copied");
+
+  // (7) Junk description skipped.
+  const byDomainJunk = indexRfbByDomain([{ ...rfbAlde, about: "Skip to content Forside Meny Produksjon Kontakt post@x.no Facebook" }]);
+  const r7 = pickEnrichmentFields(base, byDomainJunk);
+  assertTrue(r7.skipped.some((s) => s.field === "about_text" && s.reason === "junk_description"),
+    "enrich-22: junk boilerplate about SKIPPED");
+
+  // (8) isJunkEmail unit.
+  assertEq(isJunkEmail("user@domain.com"), true, "enrich-23: isJunkEmail placeholder");
+  assertEq(isJunkEmail("post@aldesider.no"), false, "enrich-24: isJunkEmail real address");
+  assertEq(isJunkEmail(""), true, "enrich-25: isJunkEmail empty");
+  assertEq(isJunkEmail("noreply@aldesider.no"), true, "enrich-26: isJunkEmail noreply");
+
+  // (9) parseProductNames unit (mixed shapes + dedup).
+  assertEq(JSON.stringify(parseProductNames(JSON.stringify(["A", { name: "B" }, "a"]))), JSON.stringify(["A", "B"]), "enrich-27: parseProductNames mixed + dedup");
+  assertEq(JSON.stringify(parseProductNames("garbage")), "[]", "enrich-28: parseProductNames malformed → []");
+  assertEq(JSON.stringify(parseProductNames(null)), "[]", "enrich-29: parseProductNames null → []");
+
+  console.log("  gardssalg-rfb-enrich: OK (29 assertions)");
+}

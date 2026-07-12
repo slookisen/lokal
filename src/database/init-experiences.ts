@@ -399,6 +399,14 @@ export function initExperiencesSchema(db: Database.Database): void {
     "ALTER TABLE experience_providers ADD COLUMN content_source TEXT",
     "ALTER TABLE experience_providers ADD COLUMN content_evidence_url TEXT",
     "ALTER TABLE experience_providers ADD COLUMN content_updated_at TEXT",
+    // products (2026-07-12, gårdssalg RFB-enrichment slice): JSON array of the
+    // drink products the producer sells (["Eplesider","Eplemost",…]). The
+    // gårdssalg produsent page renders a "Produkter" section from this. NULL
+    // until filled — either by the RFB-knowledge enrichment (agent_knowledge
+    // .products, verified-quality only) or a future homepage-crawl pass. Kept
+    // as its own column (not alcohol_categories, which holds legal alcohol
+    // GROUPS gruppe1/2/3, not product names).
+    "ALTER TABLE experience_providers ADD COLUMN products TEXT",
   ];
   for (const stmt of gardssalgContentCols) {
     try { db.exec(stmt); } catch { /* already present */ }

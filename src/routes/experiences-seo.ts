@@ -2322,6 +2322,45 @@ router.get(
          <p class="produsent-note">Sesong, varighet, pris og kapasitet legges til etter hvert som profilen berikes.</p>`
       : `<p class="produsent-note">Praktisk info legges til etter hvert som profilen berikes. Kontakt produsenten ved reservasjon.</p>`;
 
+    // "Produkter" — the drinks the producer sells, from the products JSON column
+    // (filled by the RFB-knowledge enrichment; verified-quality only). Accepts
+    // either ["Eplesider",…] or [{name:"Eplesider"},…] (the RFB agent_knowledge
+    // .products shape). Honest omission: the section renders ONLY when we have
+    // products — an empty/absent column shows nothing, never a placeholder claim.
+    let productList: string[] = [];
+    try {
+      const parsed = JSON.parse(provider.products || "[]");
+      if (Array.isArray(parsed)) {
+        productList = parsed
+          .map((p) =>
+            typeof p === "string"
+              ? p
+              : p && typeof p === "object" && typeof (p as { name?: unknown }).name === "string"
+              ? ((p as { name: string }).name)
+              : "",
+          )
+          .map((s) => s.trim())
+          .filter(Boolean);
+      }
+    } catch {
+      productList = [];
+    }
+    // De-dup (case-insensitive) and cap so a noisy source can't blow up the page.
+    const seenProduct = new Set<string>();
+    productList = productList.filter((p) => {
+      const k = p.toLowerCase();
+      if (seenProduct.has(k)) return false;
+      seenProduct.add(k);
+      return true;
+    }).slice(0, 24);
+    const productsBlock = productList.length
+      ? `<div class="info-card">
+        <h2>Produkter</h2>
+        <ul class="product-chips">${productList.map((p) => `<li>${escapeHtml(p)}</li>`).join("")}</ul>
+        <p class="produsent-note">Utvalget kan variere. Kontakt produsenten for dagsaktuelt sortiment.</p>
+      </div>`
+      : "";
+
     // Map block — same OpenStreetMap-link pattern as /opplevelse/:slug.
     const mapBlock = (lat !== null && lon !== null)
       ? `<a class="map-card" href="https://www.openstreetmap.org/?mlat=${lat}&mlon=${lon}#map=13/${lat}/${lon}" target="_blank" rel="noopener" aria-label="Åpne posisjon i OpenStreetMap">
@@ -2416,6 +2455,8 @@ ${BROWSE_CSS}
 .facts tr:last-child th,.facts tr:last-child td{border-bottom:none}
 .facts th{width:34%;color:var(--mist);font-weight:600}
 .produsent-note{font-size:.78rem;color:var(--mist);margin-top:10px}
+.product-chips{list-style:none;display:flex;flex-wrap:wrap;gap:8px;margin:2px 0 0;padding:0}
+.product-chips li{background:var(--canvas-2);border:1px solid var(--line);border-radius:var(--r-pill);padding:6px 13px;font-size:.88rem;font-weight:600;color:var(--fjord-900)}
 .aside-card{background:var(--surface);border:1px solid var(--line);border-radius:var(--r-lg);padding:20px;box-shadow:var(--sh-sm);margin-bottom:16px}
 .aside-card h2{font-size:.78rem;text-transform:uppercase;letter-spacing:.06em;color:var(--mist);margin-bottom:12px}
 .reserve-cta{display:block;text-align:center;background:linear-gradient(135deg,var(--amber-500),var(--coral-500));color:#fff;font-weight:800;padding:14px 18px;border-radius:var(--r-pill);box-shadow:0 4px 14px rgba(255,93,59,.4)}
@@ -2459,6 +2500,7 @@ ${BROWSE_CSS}
         <h2>Besøket</h2>
         ${visitBody}
       </div>
+      ${productsBlock}
       <div class="info-card">
         <h2>Praktisk info</h2>
         ${factsBlock}
