@@ -27941,3 +27941,94 @@ console.log("\n── gardssalg-produsent-products: 'Produkter' section render �
     dbFacGPP.__resetDbFactoryForTesting();
   }
 })();
+
+
+// ── gardssalg-rfb-enrich: field-selection rules (2026-07-12, Daniel 2A) ──────
+// Pure-function tests for the RFB→gårdssalg enrichment picker: strict domain
+// match, skip junk/inference-only, respect the content_source lock, fill only
+// missing fields.
+console.log("\n── gardssalg-rfb-enrich: strict-match + skip-junk + lock rules ──");
+{
+  const enrich = require("../src/services/gardssalg-rfb-enrich") as
+    typeof import("../src/services/gardssalg-rfb-enrich");
+  const { pickEnrichmentFields, indexRfbByDomain, isJunkEmail, parseProductNames } = enrich;
+
+  const rfbAlde: import("../src/services/gardssalg-rfb-enrich").RfbSource = {
+    agent_id: "rfb-alde", name: "Alde Sider", url: "https://aldesider.no/",
+    lat: 60.5, lng: 6.9,
+    about: "Ulvik Frukt og Cideri er en av tre gårder på Norges eneste frukt- og siderrute. Prisbelønt siden 2007.",
+    address: "Bleievegen 16, 5776 Nå", phone: "+47 48007966", email: "user@domain.com",
+    products: JSON.stringify([{ name: "Eplesider" }, "Eplemost"]),
+    verification_review_reason: "{}",
+  };
+  const byDomain = indexRfbByDomain([rfbAlde]);
+
+  const base = {
+    id: "p1", navn: "Alde Sider / Ulvik Frukt & Cideri", hjemmeside: "http://www.aldesider.no",
+    adresse: null, telefon: null, epost: null, lat: null, lon: null,
+    about_text: null, products: null, content_source: null,
+  };
+
+  // (1) Strict domain match → would_enrich, copies the good fields, skips junk email.
+  const r1 = pickEnrichmentFields(base, byDomain);
+  assertEq(r1.status, "would_enrich", "enrich-01: domain match (www vs no-www, http vs https) → would_enrich");
+  assertEq(r1.matched_rfb?.agent_id, "rfb-alde", "enrich-02: matched the right RFB producer by domain");
+  assertEq(r1.copy.adresse, "Bleievegen 16, 5776 Nå", "enrich-03: copies address");
+  assertEq(r1.copy.telefon, "+47 48007966", "enrich-04: copies displayable phone");
+  assertEq(r1.copy.about, undefined, "enrich-05: about copied under about_text key, not about");
+  assertEq(typeof r1.copy.about_text, "string", "enrich-06: copies about_text");
+  assertEq(r1.copy.lat, 60.5, "enrich-07: copies lat from agents.lat");
+  assertEq(r1.copy.lon, 6.9, "enrich-08: copies lon from agents.lng");
+  assertEq(String(r1.copy.products), JSON.stringify(["Eplesider", "Eplemost"]), "enrich-09: copies normalized product names");
+  assertTrue(r1.skipped.some((s) => s.field === "epost" && s.reason === "junk_email"),
+    "enrich-10: placeholder email user@domain.com SKIPPED as junk");
+  assertEq(r1.copy.epost, undefined, "enrich-11: junk email NOT copied");
+
+  // (2) No provider domain → flagged for manual review, no copy.
+  const r2 = pickEnrichmentFields({ ...base, hjemmeside: null }, byDomain);
+  assertEq(r2.status, "no_domain", "enrich-12: provider without a website → no_domain (manual review)");
+  assertEq(Object.keys(r2.copy).length, 0, "enrich-13: no_domain copies nothing");
+
+  // (3) Domain that doesn't match any RFB source → no_match.
+  const r3 = pickEnrichmentFields({ ...base, hjemmeside: "https://someoneelse.no" }, byDomain);
+  assertEq(r3.status, "no_match", "enrich-14: unmatched domain → no_match (never a wrong-producer copy)");
+
+  // (4) content_source lock → never overwrite human/owner-authored rows.
+  const r4 = pickEnrichmentFields({ ...base, content_source: "manual" }, byDomain);
+  assertEq(r4.status, "locked", "enrich-15: content_source=manual → locked");
+  assertEq(Object.keys(r4.copy).length, 0, "enrich-16: locked copies nothing");
+  const r4b = pickEnrichmentFields({ ...base, content_source: "claim" }, byDomain);
+  assertEq(r4b.status, "locked", "enrich-17: content_source=claim → locked");
+
+  // (5) Fill ONLY missing fields — an existing adresse is never clobbered.
+  const r5 = pickEnrichmentFields({ ...base, adresse: "Egen adresse 1" }, byDomain);
+  assertEq(r5.copy.adresse, undefined, "enrich-18: existing adresse is NOT overwritten (missing-only fill)");
+
+  // (6) Inference-only factual field is skipped.
+  const byDomainInf = indexRfbByDomain([{ ...rfbAlde, verification_review_reason: JSON.stringify({ inference_only_fields: ["address", "products"] }) }]);
+  const r6 = pickEnrichmentFields(base, byDomainInf);
+  assertTrue(r6.skipped.some((s) => s.field === "adresse" && s.reason === "inference_only"),
+    "enrich-19: inference-only address SKIPPED");
+  assertTrue(r6.skipped.some((s) => s.field === "products" && s.reason === "inference_only"),
+    "enrich-20: inference-only products SKIPPED");
+  assertEq(r6.copy.adresse, undefined, "enrich-21: inference-only address not copied");
+
+  // (7) Junk description skipped.
+  const byDomainJunk = indexRfbByDomain([{ ...rfbAlde, about: "Skip to content Forside Meny Produksjon Kontakt post@x.no Facebook" }]);
+  const r7 = pickEnrichmentFields(base, byDomainJunk);
+  assertTrue(r7.skipped.some((s) => s.field === "about_text" && s.reason === "junk_description"),
+    "enrich-22: junk boilerplate about SKIPPED");
+
+  // (8) isJunkEmail unit.
+  assertEq(isJunkEmail("user@domain.com"), true, "enrich-23: isJunkEmail placeholder");
+  assertEq(isJunkEmail("post@aldesider.no"), false, "enrich-24: isJunkEmail real address");
+  assertEq(isJunkEmail(""), true, "enrich-25: isJunkEmail empty");
+  assertEq(isJunkEmail("noreply@aldesider.no"), true, "enrich-26: isJunkEmail noreply");
+
+  // (9) parseProductNames unit (mixed shapes + dedup).
+  assertEq(JSON.stringify(parseProductNames(JSON.stringify(["A", { name: "B" }, "a"]))), JSON.stringify(["A", "B"]), "enrich-27: parseProductNames mixed + dedup");
+  assertEq(JSON.stringify(parseProductNames("garbage")), "[]", "enrich-28: parseProductNames malformed → []");
+  assertEq(JSON.stringify(parseProductNames(null)), "[]", "enrich-29: parseProductNames null → []");
+
+  console.log("  gardssalg-rfb-enrich: OK (29 assertions)");
+}

@@ -942,6 +942,12 @@ router.post("/admin/gardssalg-content-refresh", requireAdmin, async (req: Reques
 
 import { getDb as getRfbDb } from "../database/init";
 import { getDb as getExpDb } from "../database/db-factory";
+import {
+  indexRfbByDomain,
+  pickEnrichmentFields,
+  type RfbSource,
+  type EnrichProviderRow,
+} from "../services/gardssalg-rfb-enrich";
 
 // Tight drikkeprodusent filter — beverage manufacturers with on-site production only.
 // INCLUDE: bryggeri, cideri/sideri, mjød, destilleri/brenneri, vin, kombucha.
@@ -1108,6 +1114,113 @@ router.post("/admin/rfb-seed", requireAdmin, (req: Request, res: Response) => {
     dry_run: dryRun,
     apply_mode: !dryRun,
     candidates: candidateNames,
+  });
+});
+
+// ─── POST /api/opplevelser/admin/rfb-knowledge-enrich ────────────────────────
+//
+// Fills the sparse rfb-seeded gårdssalg providers from their rich RFB producer
+// twin (agents + agent_knowledge in lokal.db). STRICT website-domain match only;
+// skips low-quality/inference-only values; respects the content_source lock;
+// fills only MISSING fields. See services/gardssalg-rfb-enrich.ts for the rules.
+//
+// DRY-RUN by default (returns the full match/would-copy report); pass
+// ?apply=true (or body.apply) for a live write. Idempotent: re-running only
+// fills fields still missing. Records provenance content_source='rfb-knowledge'
+// + content_evidence_url=<RFB homepage> (the producer's own site as proof).
+router.post("/admin/rfb-knowledge-enrich", requireAdmin, (req: Request, res: Response) => {
+  const apply =
+    req.query.apply === "true" || req.query.apply === "1" ||
+    req.body?.apply === true || req.body?.apply === "true" || req.body?.apply === "1";
+  const dryRun = !apply;
+
+  const rfbDb = getRfbDb();
+  const expDb = getExpDb("experiences");
+
+  // Load the RFB producers (agents + agent_knowledge) and index by domain.
+  let sources: RfbSource[] = [];
+  try {
+    sources = rfbDb.prepare(
+      `SELECT a.id AS agent_id, a.name AS name,
+              COALESCE(k.website, a.url) AS url,
+              a.lat AS lat, a.lng AS lng,
+              k.about AS about, k.address AS address, k.phone AS phone,
+              k.email AS email, k.products AS products,
+              k.verification_review_reason AS verification_review_reason
+         FROM agents a
+         LEFT JOIN agent_knowledge k ON k.agent_id = a.id
+        WHERE a.is_active = 1`
+    ).all() as RfbSource[];
+  } catch (err) {
+    console.error("[rfb-knowledge-enrich] failed to query rfb agents:", err);
+    res.status(500).json({ error: "Failed to query rfb agents" });
+    return;
+  }
+  const byDomain = indexRfbByDomain(sources);
+
+  // Load the seeded gårdssalg providers.
+  let providers: EnrichProviderRow[] = [];
+  try {
+    providers = expDb.prepare(
+      `SELECT id, navn, hjemmeside, adresse, telefon, epost, lat, lon,
+              about_text, products, content_source
+         FROM experience_providers
+        WHERE rfb_seed_source = 'rfb-seed'`
+    ).all() as EnrichProviderRow[];
+  } catch (err) {
+    console.error("[rfb-knowledge-enrich] failed to query providers:", err);
+    res.status(500).json({ error: "Failed to query experience_providers" });
+    return;
+  }
+
+  const results = providers.map((p) => pickEnrichmentFields(p, byDomain));
+
+  let enriched = 0;
+  const fieldFillCounts: Record<string, number> = {};
+  if (apply) {
+    const now = new Date().toISOString();
+    for (const r of results) {
+      if (r.status !== "would_enrich") continue;
+      const sets: string[] = [];
+      const vals: Array<string | number | null> = [];
+      for (const [field, value] of Object.entries(r.copy)) {
+        sets.push(`${field} = ?`);
+        vals.push(value);
+        fieldFillCounts[field] = (fieldFillCounts[field] || 0) + 1;
+      }
+      // Provenance: mark as rfb-knowledge sourced with the producer's own site
+      // as evidence URL (Daniel: "bruk agentens hjemmeside som proof på info").
+      const evidenceUrl = r.matched_rfb ? (byDomain.get(r.matched_rfb.domain)?.url ?? null) : null;
+      sets.push("content_source = ?", "content_evidence_url = ?", "content_updated_at = ?");
+      vals.push("rfb-knowledge", evidenceUrl, now);
+      try {
+        expDb.prepare(`UPDATE experience_providers SET ${sets.join(", ")} WHERE id = ?`).run(...vals, r.provider_id);
+        enriched++;
+      } catch (err) {
+        console.error(`[rfb-knowledge-enrich] UPDATE failed for ${r.navn}:`, err);
+      }
+    }
+  } else {
+    for (const r of results) if (r.status === "would_enrich") for (const f of Object.keys(r.copy)) fieldFillCounts[f] = (fieldFillCounts[f] || 0) + 1;
+  }
+
+  const summary = {
+    total_providers: results.length,
+    would_enrich: results.filter((r) => r.status === "would_enrich").length,
+    locked: results.filter((r) => r.status === "locked").length,
+    no_domain: results.filter((r) => r.status === "no_domain").length,
+    no_match: results.filter((r) => r.status === "no_match").length,
+    nothing_to_fill: results.filter((r) => r.status === "nothing_to_fill").length,
+    field_fill_counts: fieldFillCounts,
+  };
+
+  res.json({
+    dry_run: dryRun,
+    apply_mode: apply,
+    enriched,
+    summary,
+    // Full per-provider detail so Daniel can eyeball every match before applying.
+    results,
   });
 });
 
