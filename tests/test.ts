@@ -766,6 +766,19 @@ console.log("── admin-outreach-candidates (belt-and-suspenders CRM-send guar
   console.log(`  admin-outreach-candidates-crm-send-guard: ${r.passed} passed, ${r.failed} failed`);
 }
 
+// ── mode=second "eldst-kontaktet-først" ordering (2026-07-12, Daniel) ──
+console.log("── admin-outreach-candidates (mode=second oldest-contacted-first ordering) ──");
+{
+  const { runAdminOutreachCandidatesMode2OrderingTests } =
+    require("../src/routes/admin-outreach-candidates-mode2-ordering.test") as
+      typeof import("../src/routes/admin-outreach-candidates-mode2-ordering.test");
+  const r = runAdminOutreachCandidatesMode2OrderingTests({ log: false });
+  passed += r.passed;
+  failed += r.failed;
+  for (const f of r.failures) failures.push("admin-outreach-candidates-mode2-ordering: " + f);
+  console.log(`  admin-outreach-candidates-mode2-ordering: ${r.passed} passed, ${r.failed} failed`);
+}
+
 // ── orch-pr-12: search-enrich background sweep + findings + apply-findings ──
 // Async (fire-and-forget sweep loop). Kicked off here; awaited in the REPORT
 // block so its pass/fail counts fold into the `npm test` summary.
