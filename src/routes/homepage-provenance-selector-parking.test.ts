@@ -149,6 +149,7 @@ export function runHomepageProvenanceSelectorParkingTests(
       // Pre-verification cohort (default auto-select targets).
       insertAgent.run("agent-pending", "Pendinggard AS", "https://pending-gard.no", "key-pending");
       insertAgent.run("agent-dead", "Deadgard AS", "https://dead-gard.no", "key-dead");
+      insertAgent.run("agent-vne-emptyweb", "Emptyweb AS", "https://emptyweb-gard.no", "key-emptyweb");
 
       const insertKnowledge = db.prepare(
         `INSERT INTO agent_knowledge (agent_id, website, email, about, field_provenance, verification_status)
@@ -160,6 +161,9 @@ export function runHomepageProvenanceSelectorParkingTests(
       insertKnowledge.run("agent-vne-dead", "https://vne-dead.no", null, "verified");
       insertKnowledge.run("agent-pending", "https://pending-gard.no", null, "pending_verify");
       insertKnowledge.run("agent-dead", "https://dead-gard.no", null, "pending_verify");
+      // Empty-string website (NOT null): must fall back to agents.url via
+      // NULLIF instead of burning a LIMIT slot as an unprocessable row.
+      insertKnowledge.run("agent-vne-emptyweb", "", null, "verified");
 
       // Fresh require so the router picks up the just-injected db.
       delete require.cache[require.resolve("./marketplace")];
@@ -178,6 +182,7 @@ export function runHomepageProvenanceSelectorParkingTests(
         "vne-dead.no": "Vnedead AS",
         "pending-gard.no": "Pendinggard AS",
         "dead-gard.no": "Deadgard AS",
+        "emptyweb-gard.no": "Emptyweb AS",
       };
       (globalThis as any).fetch = async (url: string) => {
         const host = new URL(url).hostname;
@@ -220,8 +225,10 @@ export function runHomepageProvenanceSelectorParkingTests(
         "sp-04: verified agent WITH email is NOT selected");
       assertTrue(!fetchedHosts.includes("pending-gard.no") && !fetchedHosts.includes("dead-gard.no"),
         "sp-05: pending_verify agents are NOT selected by verified_no_email");
-      assertEq(result.body?.data?.processed, 2,
-        "sp-06: processed=2 (no-homepage verified agent excluded from selection)");
+      assertTrue(fetchedHosts.includes("emptyweb-gard.no"),
+        "sp-05b: empty-string website falls back to agents.url (NULLIF) and is actually fetched");
+      assertEq(result.body?.data?.processed, 3,
+        "sp-06: processed=3 (no-homepage verified agent excluded from selection; empty-website agent included via agents.url)");
       assertTrue(Array.isArray(result.body?.data?.parked_now) && result.body.data.parked_now.length === 0,
         "sp-07: parked_now present in response and empty (all fetches ok)");
 
@@ -234,8 +241,10 @@ export function runHomepageProvenanceSelectorParkingTests(
         "sp-10: default auto-select still excludes verified agents");
 
       result = await post({ select: "bogus_mode" });
-      assertTrue(fetchedHosts.includes("pending-gard.no") && !fetchedHosts.includes("vne-gard.no"),
-        "sp-11: unrecognized select value falls back to the default auto-select");
+      assertEq(result.status, 400,
+        "sp-11: unrecognized select value -> 400 (an autonomous routine's typo must never silently run the wrong cohort)");
+      assertEq(fetchedHosts.length, 0,
+        "sp-11b: nothing is fetched on a rejected select value");
 
       // ── (2) parking after 3 consecutive fetch failures ────────────────────
       failHosts.add("dead-gard.no");
@@ -304,6 +313,22 @@ export function runHomepageProvenanceSelectorParkingTests(
       result = await post({});
       assertTrue(fetchedHosts.includes("dead-gard.no"),
         "sp-28: homepage_unreachable_since older than 30 days -> selectable again");
+
+      // ── (3b) re-park: the expired-backoff retry FAILED again (failHosts
+      // still contains dead-gard.no here), so the failure must RE-STAMP the
+      // parking timestamp — otherwise the stale timestamp satisfies the
+      // exclusion's `<= now-30d` forever and a still-dead agent is burned on
+      // every run after its first backoff cycle (PR #248 review blocker).
+      const reparkedRow = knowledgeRow("agent-dead");
+      assertTrue(
+        !!reparkedRow.homepage_unreachable_since &&
+        Date.parse(reparkedRow.homepage_unreachable_since) > Date.now() - 60_000,
+        "sp-28b: failed retry after expired backoff re-stamps homepage_unreachable_since to a fresh value");
+      assertEq(result.body?.data?.parked_now, ["agent-dead"],
+        "sp-28c: re-parked agent is reported in parked_now");
+      result = await post({});
+      assertTrue(!fetchedHosts.includes("dead-gard.no"),
+        "sp-28d: re-parked agent is excluded from auto-select again");
 
       // ── (4) a successful fetch fully resets the parking state ────────────
       failHosts.delete("dead-gard.no");

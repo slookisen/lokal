@@ -4525,6 +4525,7 @@ router.get("/bm-events", (req: Request, res: Response) => {
 //     is still empty but who have a homepage — the pipeline's own-domain
 //     email extraction can then backfill them into the outreach pool
 //     (dev-request 2026-07-12-rfb-enrichment-pool-refill-and-waste-reduction).
+//     Any other non-absent select value is rejected with 400.
 //   - else auto-select: TIER-1 agents with a website, some enrichment, but
 //     field_provenance empty/{} OR lacking a 2nd source for address/phone,
 //     with verification_status IN (data_insufficient, review_required,
@@ -4573,15 +4574,26 @@ router.post("/admin/homepage-provenance-batch", async (req: Request, res: Respon
       .filter((id): id is string => typeof id === "string" && id.trim().length > 0)
       .map((id) => id.trim())
       .slice(0, limit);
+  } else if (selectRaw !== undefined && selectRaw !== "verified_no_email") {
+    // An admin endpoint driven by autonomous routines must not silently run
+    // the wrong cohort on a typo'd select value — reject instead of falling
+    // through to the default auto-select (PR #248 review finding).
+    res.status(400).json({
+      error: `Ukjent select-verdi: ${String(selectRaw)}. Gyldige: "verified_no_email" (eller utelat feltet for standard auto-select).`,
+    });
+    return;
   } else if (selectRaw === "verified_no_email") {
     // select:"verified_no_email" — verified agents the default auto-select can
     // never reach (it only targets pre-verification statuses): email column
     // still empty, homepage on file. Same reachable-first ordering idiom as
-    // the default query. The pipeline's existing own-domain/aggregator email
-    // guards apply unchanged downstream.
+    // the default query (but NULLIF on website so an empty-string website
+    // falls through to a.url here the same way processAgent's own fallback
+    // does — an '' website must not burn a LIMIT slot unprocessably). The
+    // pipeline's existing own-domain/aggregator email guards apply unchanged
+    // downstream.
     const rows = db
       .prepare(
-        `SELECT k.agent_id, COALESCE(k.website, a.url) AS homepage_url
+        `SELECT k.agent_id, COALESCE(NULLIF(k.website, ''), a.url) AS homepage_url
            FROM agent_knowledge k
            JOIN agents a ON a.id = k.agent_id
           WHERE k.verification_status = 'verified'
@@ -4752,6 +4764,7 @@ router.post("/admin/homepage-provenance-batch", async (req: Request, res: Respon
   // the counter. parked_now (in the response) names the agents that crossed
   // the threshold during THIS run so enrichment reports can list them.
   const PARK_AFTER_ATTEMPTS = 3;
+  const PARK_BACKOFF_MS = 30 * 86_400_000;
   const parkedNow: string[] = [];
 
   function recordHomepageFetchFailure(agentId: string): void {
@@ -4765,11 +4778,20 @@ router.post("/admin/homepage-provenance-batch", async (req: Request, res: Respon
       .get(agentId) as
       | { homepage_fetch_attempts: number; homepage_unreachable_since: string | null }
       | undefined;
-    if (row && row.homepage_fetch_attempts >= PARK_AFTER_ATTEMPTS && !row.homepage_unreachable_since) {
-      db.prepare(
-        "UPDATE agent_knowledge SET homepage_unreachable_since = ? WHERE agent_id = ?"
-      ).run(new Date().toISOString(), agentId);
-      parkedNow.push(agentId);
+    if (row && row.homepage_fetch_attempts >= PARK_AFTER_ATTEMPTS) {
+      // Stamp when not yet parked — or RE-STAMP when the 30-day backoff has
+      // expired and the retry failed again. Without the re-stamp, the stale
+      // timestamp keeps satisfying the exclusion clause's `<= now-30d`
+      // forever, so a still-dead agent would revert to being selected every
+      // run after its first backoff cycle (PR #248 review blocker).
+      const since = row.homepage_unreachable_since;
+      const expired = since !== null && Date.parse(since) <= Date.now() - PARK_BACKOFF_MS;
+      if (!since || expired) {
+        db.prepare(
+          "UPDATE agent_knowledge SET homepage_unreachable_since = ? WHERE agent_id = ?"
+        ).run(new Date().toISOString(), agentId);
+        parkedNow.push(agentId);
+      }
     }
   }
 
