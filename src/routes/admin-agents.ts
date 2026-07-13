@@ -460,6 +460,41 @@ router.post("/register", async (req: Request, res: Response) => {
   }
 });
 
+// ─── DELETE /admin/agents/:id ─────────────────────────────────
+// Rollback/undo path for a bad POST /register call (wrong org-nr match,
+// data error, etc.) — no way to delete/deactivate a mis-registered agent
+// existed before this route. Minimal single-table delete-by-id; does NOT
+// cascade to agent_knowledge or any other table (see report / reviewer note).
+router.delete("/:id", (req: Request, res: Response) => {
+  if (!requireAdmin(req, res)) return;
+
+  const { id } = req.params;
+
+  try {
+    const db = getDb();
+
+    const existing = db
+      .prepare(`SELECT name, org_nr FROM agents WHERE id = ?`)
+      .get(id) as { name: string; org_nr: string | null } | undefined;
+
+    if (!existing) {
+      res.status(404).json({ error: "Agent not found", agent_id: id });
+      return;
+    }
+
+    db.prepare(`DELETE FROM agents WHERE id = ?`).run(id);
+
+    res.json({
+      success: true,
+      deleted_id: id,
+      deleted_name: existing.name ?? null,
+      deleted_org_nr: existing.org_nr ?? null,
+    });
+  } catch (err: any) {
+    res.status(500).json({ error: "Delete failed", detail: err.message });
+  }
+});
+
 // ─── GET/POST /admin/agents/brreg-catalog-sweep (Slice 3 of dev-request ──────
 //     2026-06-30-brreg-verification-gate) ──────────────────────────────────
 //

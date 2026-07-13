@@ -21641,6 +21641,7 @@ console.log("\n── orch-pr-14: MCP discovery product_id surfacing ──");
   try { await _homepageSelectorParkingPromise; } catch { /* errors already pushed to failures */ }
   try { await _domainCoherenceSweepPromise; } catch { /* errors already pushed to failures */ }
   try { await _pendingVerifyParkingPromise; } catch { /* errors already pushed to failures */ }
+  try { await _adminAgentsDeletePromise; } catch { /* errors already pushed to failures */ }
   // relax-envelope tests are synchronous (pure validateEnvelope() unit test) — no promise needed
   // PR-109 tests are synchronous (IIFE) — no promise needed
   // Drop pre-existing intg failures (unmasked by awaiting) — they predate M2
@@ -27149,6 +27150,40 @@ const _pendingVerifyParkingPromise: Promise<void> = new Promise<void>(r => {
     failures.push("pending-verify-parking: unexpected error: " + String(err?.message || err));
   } finally {
     _pendingVerifyParkingResolve();
+  }
+})();
+
+// ═══════════════════════════════════════════════════════════════════════
+// orch-pr-20260713-agents-delete: DELETE /admin/agents/:id (src/routes/
+// admin-agents.ts) — the rollback/undo path for a bad POST /register call
+// (no delete/deactivate route for `agents` existed before this). Swaps the
+// shared getDb() singleton (own dedicated test file, in-memory prod-schema
+// DB) — mirrors the pending-verify-parking block immediately above, so it
+// must run strictly after it; _pendingVerifyParkingPromise is the current
+// tail of that serial chain.
+let _adminAgentsDeleteResolve: () => void = () => {};
+const _adminAgentsDeletePromise: Promise<void> = new Promise<void>(r => {
+  _adminAgentsDeleteResolve = r;
+});
+
+(async () => {
+  await Promise.allSettled([_pendingVerifyParkingPromise]);
+  await new Promise(r => setImmediate(r));
+
+  console.log("\n── orch-pr-20260713-agents-delete: DELETE /admin/agents/:id ──");
+  try {
+    const { runAdminAgentsDeleteTests } = require("../src/routes/admin-agents-delete.test") as
+      typeof import("../src/routes/admin-agents-delete.test");
+    const aad = await runAdminAgentsDeleteTests({ log: false });
+    passed += aad.passed;
+    failed += aad.failed;
+    for (const f of aad.failures) failures.push("admin-agents-delete: " + f);
+    console.log(`  admin-agents-delete: ${aad.passed} passed, ${aad.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("admin-agents-delete: unexpected error: " + String(err?.message || err));
+  } finally {
+    _adminAgentsDeleteResolve();
   }
 })();
 
