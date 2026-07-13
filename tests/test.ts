@@ -5205,6 +5205,148 @@ const _m2Promise = (async function runOwnerPortalTests() {
 }
 
 
+// ── dev-request 2026-07-12-rfb-enrichment-pool-refill-and-waste-reduction ──
+// (re-scoped item 1): /admin/outreach-ready-pool/stats now reports a
+// pool_funnel (each outreach_ready_pool gate applied in order) and
+// homepage_parking (PR #248's parking split) so the next slice can see
+// which gate is actually draining the pool instead of re-measuring blind.
+// Same convention as the WO-7/WO-20 blocks above: replicate the route's SQL
+// against a from-scratch in-memory DB and assert the counts directly.
+console.log("\n── rfb-pool-refill: /admin/outreach-ready-pool/stats funnel-breakdown tests ──");
+{
+  const sqlite = require("better-sqlite3");
+  const fdb = new sqlite(":memory:");
+  fdb.exec(`
+    CREATE TABLE agents (id TEXT PRIMARY KEY, name TEXT NOT NULL, role TEXT, city TEXT, umbrella_type TEXT);
+    CREATE TABLE agent_knowledge (
+      agent_id TEXT PRIMARY KEY REFERENCES agents(id),
+      email TEXT, phone TEXT,
+      verification_status TEXT NOT NULL DEFAULT 'unverified',
+      enrichment_status TEXT NOT NULL DEFAULT 'thin',
+      outreach_eligible_at TEXT,
+      last_verified_at TEXT,
+      url_last_probed TEXT,
+      url_last_status INTEGER,
+      homepage_fetch_attempts INTEGER NOT NULL DEFAULT 0,
+      homepage_unreachable_since TEXT
+    );
+    CREATE TABLE outreach_sent_log (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      agent_id TEXT NOT NULL REFERENCES agents(id),
+      sent_at TEXT NOT NULL DEFAULT (datetime('now')),
+      channel TEXT NOT NULL DEFAULT 'email',
+      message_id TEXT,
+      notes TEXT,
+      recipient_email TEXT
+    );
+    CREATE VIEW outreach_ready_pool AS
+      SELECT a.id AS agent_id, a.name, a.role, a.city AS location_city,
+             k.email, k.phone, k.verification_status, k.enrichment_status,
+             k.outreach_eligible_at, k.last_verified_at, k.url_last_probed, k.url_last_status
+      FROM agents a INNER JOIN agent_knowledge k ON k.agent_id = a.id
+      WHERE k.email IS NOT NULL AND k.email != ''
+        AND a.umbrella_type IS NULL
+        AND k.verification_status = 'verified'
+        AND k.enrichment_status IN ('partial','rich')
+        AND k.url_last_status IS NOT NULL AND k.url_last_status >= 200 AND k.url_last_status < 400
+        AND k.url_last_probed IS NOT NULL AND k.url_last_probed > datetime('now','-30 days')
+        AND NOT EXISTS (
+          SELECT 1 FROM outreach_sent_log o
+          WHERE o.agent_id = a.id
+             OR (o.recipient_email IS NOT NULL AND o.recipient_email = LOWER(k.email))
+        );
+  `);
+
+  const ins = (id: string, opts: {
+    email?: string | null; umbrella?: string | null;
+    verification?: string; enrichment?: string;
+    urlProbedDaysAgo?: number | null; urlStatus?: number | null;
+    unreachableSinceDaysAgo?: number | null; sent?: boolean;
+  } = {}) => {
+    fdb.prepare("INSERT INTO agents (id, name, role, city, umbrella_type) VALUES (?,?,?,?,?)")
+      .run(id, id, "producer", "Oslo", opts.umbrella ?? null);
+    const urlProbed = opts.urlProbedDaysAgo == null ? null
+      : fdb.prepare(`SELECT datetime('now', ?) AS d`).get(`-${opts.urlProbedDaysAgo} days`).d;
+    const unreachableSince = opts.unreachableSinceDaysAgo == null ? null
+      : fdb.prepare(`SELECT datetime('now', ?) AS d`).get(`-${opts.unreachableSinceDaysAgo} days`).d;
+    fdb.prepare(`INSERT INTO agent_knowledge
+        (agent_id, email, verification_status, enrichment_status, url_last_probed, url_last_status, homepage_unreachable_since)
+        VALUES (?,?,?,?,?,?,?)`)
+      .run(id, opts.email === undefined ? "post@x.no" : opts.email,
+        opts.verification ?? "verified", opts.enrichment ?? "rich",
+        urlProbed, opts.urlStatus === undefined ? 200 : opts.urlStatus, unreachableSince);
+    if (opts.sent) {
+      fdb.prepare("INSERT INTO outreach_sent_log (agent_id, recipient_email) VALUES (?,?)")
+        .run(id, (opts.email === undefined ? "post@x.no" : opts.email)?.toLowerCase() ?? null);
+    }
+  };
+
+  // Funnel cohort:
+  ins("ok-1", { urlProbedDaysAgo: 1 });                                    // clears every gate, lands in final pool
+  ins("no-email-1", { email: null });                                     // drops at with_email
+  ins("stale-url-1", { urlProbedDaysAgo: 40 });                           // drops at url_fresh_and_ok (probed, but stale)
+  ins("never-probed-1", { urlProbedDaysAgo: null, urlStatus: null });     // drops at url_fresh_and_ok (never probed)
+  ins("bad-status-1", { urlProbedDaysAgo: 1, urlStatus: 404 });           // drops at url_fresh_and_ok (fresh probe, bad status)
+  ins("umbrella-1", { umbrella: "samvirke", urlProbedDaysAgo: 1 });       // excluded before the funnel even starts
+  ins("not-verified-1", { verification: "pending_verify", urlProbedDaysAgo: 1 });   // excluded before the funnel
+  // Distinct email from ok-1 — otherwise the VIEW's email-keyed suppression
+  // (P0-2026-07-11, matches on recipient_email too) would correctly zap BOTH
+  // agents as the same contact, which would defeat this cohort's purpose of
+  // isolating the "already sent" gate from the URL-freshness gate.
+  ins("already-sent-1", { email: "sent@x.no", urlProbedDaysAgo: 1, sent: true }); // clears url_fresh_and_ok, drops at final (already contacted)
+
+  // Parking cohort (independent of the funnel — homepage-provenance-batch's own
+  // gate, unconditioned on verification/enrichment). Pinned to unverified/thin
+  // so these three don't also leak into the funnel-cohort counts above via
+  // ins()'s verified/rich defaults.
+  ins("parked-active-1", { verification: "unverified", enrichment: "thin", unreachableSinceDaysAgo: 5 });
+  ins("parked-expired-1", { verification: "unverified", enrichment: "thin", unreachableSinceDaysAgo: 40 });
+  ins("not-parked-1", { verification: "unverified", enrichment: "thin", unreachableSinceDaysAgo: null });
+
+  const funnelBase = `
+    FROM agents a
+    INNER JOIN agent_knowledge k ON k.agent_id = a.id
+    WHERE a.umbrella_type IS NULL
+      AND k.verification_status = 'verified'
+      AND k.enrichment_status IN ('partial', 'rich')`;
+  const verifiedRichOrPartial = fdb.prepare(`SELECT COUNT(*) AS c ${funnelBase}`).get().c;
+  const withEmail = fdb.prepare(`SELECT COUNT(*) AS c ${funnelBase} AND k.email IS NOT NULL AND k.email != ''`).get().c;
+  const urlFreshAndOk = fdb.prepare(
+    `SELECT COUNT(*) AS c ${funnelBase} AND k.email IS NOT NULL AND k.email != ''
+       AND k.url_last_status IS NOT NULL AND k.url_last_status >= 200 AND k.url_last_status < 400
+       AND k.url_last_probed IS NOT NULL AND k.url_last_probed > datetime('now', '-30 days')`
+  ).get().c;
+  const finalPool = fdb.prepare(`SELECT COUNT(*) AS c FROM outreach_ready_pool`).get().c;
+  const parking = fdb.prepare(
+    `SELECT
+       SUM(CASE WHEN homepage_unreachable_since IS NOT NULL
+                 AND homepage_unreachable_since > datetime('now', '-30 days') THEN 1 ELSE 0 END) AS parked_active,
+       SUM(CASE WHEN homepage_unreachable_since IS NOT NULL
+                 AND homepage_unreachable_since <= datetime('now', '-30 days') THEN 1 ELSE 0 END) AS parked_expired
+     FROM agent_knowledge`
+  ).get();
+
+  // Funnel cohort is 8 agents (ok-1, no-email-1, stale-url-1, never-probed-1,
+  // bad-status-1, umbrella-1, not-verified-1, already-sent-1); the 3 parking-
+  // cohort agents are pinned to unverified/thin above so they never enter
+  // these counts.
+  assertEq(verifiedRichOrPartial, 6, "rfb-pool-stats: verified_and_rich_or_partial excludes umbrella-1 + not-verified-1");
+  assertEq(withEmail, 5, "rfb-pool-stats: with_email additionally excludes no-email-1");
+  assertEq(urlFreshAndOk, 2, "rfb-pool-stats: url_fresh_and_ok narrows to ok-1 + already-sent-1 (stale/never-probed/bad-status all drop)");
+  assertEq(finalPool, 1, "rfb-pool-stats: final VIEW additionally excludes already-sent-1 (already in outreach_sent_log) — only ok-1 survives");
+  assertEq(parking.parked_active, 1, "rfb-pool-stats: parked_active counts only within-30d unreachable_since");
+  assertEq(parking.parked_expired, 1, "rfb-pool-stats: parked_expired counts only >30d unreachable_since (ready for retry)");
+
+  // Source-presence: confirm the route file actually surfaces these fields.
+  const fs7 = require("fs");
+  const routeSrc7 = fs7.readFileSync("src/routes/admin-outreach-pool.ts", "utf8");
+  assertTrue(routeSrc7.includes("pool_funnel"), "rfb-pool-stats: route surfaces pool_funnel in the /stats response");
+  assertTrue(routeSrc7.includes("homepage_parking"), "rfb-pool-stats: route surfaces homepage_parking in the /stats response");
+  assertTrue(routeSrc7.includes("url_fresh_and_ok"), "rfb-pool-stats: route surfaces the url-freshness funnel gate");
+
+  fdb.close();
+}
+
 
 // ── PR-24 (2026-05-11): /admin/knowledge PUT — field_provenance merge tests ──
 //
