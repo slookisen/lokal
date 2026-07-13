@@ -460,6 +460,81 @@ router.post("/register", async (req: Request, res: Response) => {
   }
 });
 
+// ─── DELETE /admin/agents/:id ─────────────────────────────────
+// Rollback/undo path for a bad POST /register call (wrong org-nr match,
+// data error, etc.) — no way to delete/deactivate a mis-registered agent
+// existed before this route. Scoped, by an explicit guard (not just a
+// comment), to a brand-new registration with zero history: before the
+// actual DELETE, we check for any related rows in the four tables that
+// signal "this agent has real history" and refuse (409) if any are found.
+// This intentionally does NOT check agent_metrics, magic_links,
+// outreach_sent_log, agent_affiliations, products, agent_salgskanal, or
+// the changelog table — those cascade harmlessly and aren't the meaningful
+// "has history" signal; see reviewer note / PR report.
+//
+// Why this matters: `agents` is referenced by ON DELETE CASCADE from
+// agent_knowledge/listings/agent_claims (and others) — a bare DELETE would
+// silently and irreversibly wipe those for ANY agent, not just a fresh one.
+// Worse, conversations.seller_agent_id has NO ON DELETE clause (defaults
+// NO ACTION), so deleting an agent that has ever been a conversation
+// seller previously threw a raw SQLite FK-constraint error, surfaced as an
+// unhelpful 500 — now caught upfront and reported as a clear 409 instead.
+const AGENT_HISTORY_CHECKS: ReadonlyArray<{ table: string; sql: string }> = [
+  { table: "agent_knowledge", sql: `SELECT 1 FROM agent_knowledge WHERE agent_id = ? LIMIT 1` },
+  { table: "listings", sql: `SELECT 1 FROM listings WHERE agent_id = ? LIMIT 1` },
+  { table: "agent_claims", sql: `SELECT 1 FROM agent_claims WHERE agent_id = ? LIMIT 1` },
+  { table: "conversations", sql: `SELECT 1 FROM conversations WHERE seller_agent_id = ? LIMIT 1` },
+];
+
+router.delete("/:id", (req: Request, res: Response) => {
+  if (!requireAdmin(req, res)) return;
+
+  const { id } = req.params;
+
+  try {
+    const db = getDb();
+
+    const existing = db
+      .prepare(`SELECT name, org_nr FROM agents WHERE id = ?`)
+      .get(id) as { name: string; org_nr: string | null } | undefined;
+
+    if (!existing) {
+      res.status(404).json({ error: "Agent not found", agent_id: id });
+      return;
+    }
+
+    // ── History guard ────────────────────────────────────────
+    // Only a brand-new, no-history agent may be deleted here. Any match
+    // in any of the four tables below → refuse with 409, listing every
+    // matching category (not just the first one found).
+    const blocking: string[] = [];
+    for (const check of AGENT_HISTORY_CHECKS) {
+      const hit = db.prepare(check.sql).get(id);
+      if (hit) blocking.push(check.table);
+    }
+
+    if (blocking.length > 0) {
+      res.status(409).json({
+        error: "Agent has existing history, refusing delete",
+        agent_id: id,
+        blocking,
+      });
+      return;
+    }
+
+    db.prepare(`DELETE FROM agents WHERE id = ?`).run(id);
+
+    res.json({
+      success: true,
+      deleted_id: id,
+      deleted_name: existing.name ?? null,
+      deleted_org_nr: existing.org_nr ?? null,
+    });
+  } catch (err: any) {
+    res.status(500).json({ error: "Delete failed", detail: err.message });
+  }
+});
+
 // ─── GET/POST /admin/agents/brreg-catalog-sweep (Slice 3 of dev-request ──────
 //     2026-06-30-brreg-verification-gate) ──────────────────────────────────
 //
