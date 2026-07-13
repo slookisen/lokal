@@ -200,6 +200,36 @@ export function titlesMatch(
 }
 
 /**
+ * Cross-language bridge for titlesMatch(): two candidates are a match if ANY
+ * of (title vs title), (title vs title_no), (title_no vs title), (title_no
+ * vs title_no) match — title vs title first, matching prior (pre-title_no)
+ * behavior exactly when neither row has a title_no. title_no is a Norwegian
+ * display title (dev-request 2026-07-04-opplevagent-dedup-og-norske-titler);
+ * without this bridge, the same real-world experience harvested once with an
+ * English title and once with only a Norwegian title (title_no) would never
+ * cluster. Null/empty sides are skipped — never handed to titlesMatch(),
+ * which expects real strings.
+ */
+function titlesOrTitleNoMatch(
+  aTitle: string | null | undefined,
+  aTitleNo: string | null | undefined,
+  bTitle: string | null | undefined,
+  bTitleNo: string | null | undefined,
+  corpusTokenCounts: Map<string, number>
+): boolean {
+  const candidatePairs: Array<[string | null | undefined, string | null | undefined]> = [
+    [aTitle, bTitle],
+    [aTitle, bTitleNo],
+    [aTitleNo, bTitle],
+    [aTitleNo, bTitleNo],
+  ];
+  for (const [x, y] of candidatePairs) {
+    if (x && x.trim() && y && y.trim() && titlesMatch(x, y, corpusTokenCounts)) return true;
+  }
+  return false;
+}
+
+/**
  * Corpus token frequencies: how many DISTINCT titles each significant token
  * appears in (a token repeated within one title counts once). Stopwords and
  * short tokens never appear (titleTokens() drops them).
@@ -357,6 +387,7 @@ export interface DedupCandidateRow extends ExperienceRichnessInput {
   provider_id: string | null;
   org_nr: string | null;
   title: string;
+  title_no?: string | null;
   kommune: string | null;
   created_at?: string | null;
 }
@@ -411,7 +442,15 @@ export function groupDuplicateCandidates(
     };
     for (let i = 0; i < bucket.length; i++) {
       for (let j = i + 1; j < bucket.length; j++) {
-        if (titlesMatch(bucket[i].title, bucket[j].title, corpusTokenCounts)) {
+        if (
+          titlesOrTitleNoMatch(
+            bucket[i].title,
+            bucket[i].title_no,
+            bucket[j].title,
+            bucket[j].title_no,
+            corpusTokenCounts
+          )
+        ) {
           const ri = find(i);
           const rj = find(j);
           if (ri !== rj) parent[ri] = rj;
@@ -436,7 +475,7 @@ export function groupDuplicateCandidates(
 // ─── DB-touching pass (backfill + live re-harvest guard) ──────────────────
 
 const DEDUP_CANDIDATE_COLUMNS = `
-  e.id, e.provider_id, p.org_nr AS org_nr, e.title, e.kommune,
+  e.id, e.provider_id, p.org_nr AS org_nr, e.title, e.title_no, e.kommune,
   e.description, e.subcategory, e.activity_tags, e.season, e.indoor_outdoor,
   e.weather_dependent, e.physical_intensity, e.duration_min, e.duration_max,
   e.group_min, e.group_max, e.age_suitability, e.min_age, e.price_band,
@@ -466,12 +505,35 @@ function loadDedupCandidates(db: Database.Database): DedupCandidateRow[] {
  * Load the provider-distinct corpus token counts from the whole `experiences`
  * table — same query/method the audit module uses (buildProviderCorpusTokenCounts),
  * reused here to gate the merge decision inside titlesMatch() itself.
+ *
+ * Counts tokens from BOTH `title` and `title_no` (when present). titlesMatch()
+ * is now reached via titlesOrTitleNoMatch(), which can compare EITHER column
+ * across two rows, so "how common is this token across the corpus" has to
+ * reflect both languages' vocabularies combined — an English-title-only
+ * corpus would make a Norwegian word that's actually generic across many
+ * DIFFERENT businesses' title_no values (e.g. a common Norwegian tourism/
+ * activity word) read as count=0/rare, and the SHARED_TOKEN_GENERIC_MIN gate
+ * would then treat two unrelated businesses sharing just that one common word
+ * as confident distinctive evidence — a false-merge risk. title_no tokens are
+ * fed in as a separate synthetic row per experience (same provider_id, so a
+ * provider's title+title_no still count as one provider for that token; a
+ * NULL-provider row's title_no gets its own orphan pseudo-provider key like
+ * any other orphan row) so buildProviderCorpusTokenCounts's existing per-row
+ * tokenize-and-count logic (via titleTokens()) applies unchanged — no
+ * reimplemented tokenization here.
  */
 function loadCorpusTokenCounts(db: Database.Database): Map<string, number> {
   const rows = db
-    .prepare("SELECT title, provider_id FROM experiences")
-    .all() as Array<{ title: string; provider_id: string | null }>;
-  return buildProviderCorpusTokenCounts(rows);
+    .prepare("SELECT title, title_no, provider_id FROM experiences")
+    .all() as Array<{ title: string; title_no: string | null; provider_id: string | null }>;
+  const expandedRows: Array<{ title: string; provider_id: string | null }> = [];
+  for (const row of rows) {
+    expandedRows.push({ title: row.title, provider_id: row.provider_id });
+    if (row.title_no && row.title_no.trim()) {
+      expandedRows.push({ title: row.title_no, provider_id: row.provider_id });
+    }
+  }
+  return buildProviderCorpusTokenCounts(expandedRows);
 }
 
 export interface DedupPassResult {
@@ -550,7 +612,12 @@ export function runDedupPass(db: Database.Database): DedupPassResult {
  */
 export function findExistingCandidateMatch(
   db: Database.Database,
-  candidate: { provider_id?: string | null; title: string; kommune?: string | null }
+  candidate: {
+    provider_id?: string | null;
+    title: string;
+    title_no?: string | null;
+    kommune?: string | null;
+  }
 ): DedupCandidateRow | null {
   if (!candidate.provider_id) return null;
   const kommuneKey = (candidate.kommune || "").trim().toLowerCase();
@@ -570,7 +637,7 @@ export function findExistingCandidateMatch(
   );
   const corpus = loadCorpusTokenCounts(db);
   for (const row of rows) {
-    if (titlesMatch(row.title, candidate.title, corpus)) return row;
+    if (titlesOrTitleNoMatch(row.title, row.title_no, candidate.title, candidate.title_no, corpus)) return row;
   }
   return null;
 }

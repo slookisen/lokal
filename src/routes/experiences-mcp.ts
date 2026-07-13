@@ -310,6 +310,7 @@ function registerExperienceTools(
         const formatted = results.map((e) => ({
           id: e.id,
           title: e.title,
+          title_no: e.title_no ?? null,
           category: e.category ?? null,
           subcategory: e.subcategory ?? null,
           fylke: e.fylke ?? null,
@@ -500,6 +501,7 @@ function registerExperienceTools(
         const result = {
           id: experience.id,
           title: experience.title,
+          title_no: experience.title_no ?? null,
           slug: experience.slug ?? null,
           description: experience.description ?? null,
           category: experience.category ?? null,
