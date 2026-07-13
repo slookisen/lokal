@@ -32,6 +32,7 @@ import {
   domainCoherenceCheck,
   domainsEquivalent,
   hostFromUrlLike,
+  isDirectoryOrAggregatorHost,
   registrableDomain,
 } from "./cross-source-validator";
 
@@ -69,12 +70,33 @@ export type AgentRow = {
   verification_status: string;
 };
 
+// Full (non-collapsed) host of a URL-like string, or null when unparseable/empty.
+function hostOf(raw: string | null | undefined): string | null {
+  if (!raw || !raw.trim()) return null;
+  return hostFromUrlLike(raw);
+}
+
 // Registrable domain of a URL-like string, or null when unparseable/empty.
 function rootOf(raw: string | null | undefined): string | null {
-  if (!raw || !raw.trim()) return null;
-  const host = hostFromUrlLike(raw);
+  const host = hostOf(raw);
   if (!host) return null;
   return registrableDomain(host);
+}
+
+// True when `raw` resolves to a known directory/aggregator/shared-hosting
+// host (e.g. a Google Business Site page-builder placeholder, a Norwegian
+// municipal *.kommune.no domain, or an entry in KNOWN_DIRECTORY_HOSTS). Used
+// to keep the circular-scramble matcher from collapsing two UNRELATED
+// agents that both legitimately sit on a shared-hosting/aggregator fallback
+// (registrableDomain naively takes the last two labels for any TLD outside
+// the tiny co.uk/com.au/co.nz/co.jp special-case list, so e.g.
+// companyx.business.site and companyy.business.site both "collapse" to the
+// same bogus registrable root "business.site" — isDirectoryOrAggregatorHost
+// suffix-walks the FULL host, so it correctly recognizes the shared-hosting
+// family instead of trusting that bogus collapsed root).
+function isAggregatorHost(raw: string | null | undefined): boolean {
+  const host = hostOf(raw);
+  return !!host && isDirectoryOrAggregatorHost(host);
 }
 
 /**
@@ -123,13 +145,25 @@ export function classifyAgent(
   // of someone else's mismatch rather than mismatched itself).
   const ownUrlRoot = rootOf(agent.url);
   const matches: AgentRow[] = [];
-  if (ownUrlRoot) {
+  // Aggregator/shared-hosting guard (BLOCKER 1 fix): if THIS agent's own
+  // agents.url sits on a known directory/aggregator/shared-hosting host
+  // (business.site, kommune.no, fylkeskommune.no, KNOWN_DIRECTORY_HOSTS,
+  // …), a root-domain collision against some other agent's website is
+  // expected and meaningless — every tenant on that shared host collapses
+  // to the same (bogus) registrable root. Never treat it as a scramble.
+  const ownUrlIsAggregator = isAggregatorHost(agent.url);
+  if (ownUrlRoot && !ownUrlIsAggregator) {
     for (const other of universe) {
       if (other.agent_id === agent.agent_id) continue;
       const otherWebsiteRoot = rootOf(other.website);
-      if (otherWebsiteRoot && domainsEquivalent(ownUrlRoot, otherWebsiteRoot)) {
-        matches.push(other);
-      }
+      if (!otherWebsiteRoot || !domainsEquivalent(ownUrlRoot, otherWebsiteRoot)) continue;
+      // Same guard on the OTHER side: a match against another agent's
+      // website is only meaningful evidence of a real scramble if that
+      // website is itself a genuine company domain, not a shared-hosting/
+      // aggregator fallback (two unrelated agents can each legitimately
+      // have agent_knowledge.website on the same aggregator family).
+      if (isAggregatorHost(other.website)) continue;
+      matches.push(other);
     }
   }
 
@@ -229,17 +263,31 @@ function readFieldProvenance(db: any, agentId: string): Record<string, unknown> 
 }
 
 /**
- * Re-check a proposed fix against the CURRENT values before writing it. Only
- * the field named in the fix is replaced; the check re-runs domainCoherenceCheck
- * with that substitution so a fix that would introduce a NEW mismatch (e.g. an
- * email host that disagrees with the corrected value) is caught and refused
- * rather than blindly applied.
+ * Re-check a proposed fix against INDEPENDENT evidence before writing it —
+ * evidence that was not itself used to derive the proposed value, so this
+ * can actually fail.
+ *
+ * BLOCKER 2 fix: the previous implementation called
+ * domainCoherenceCheck(fix.new_value, r.knowledge_website, r.knowledge_email)
+ * (or the website-branch mirror) — but fix.new_value IS r.knowledge_website
+ * (resp. r.agent_url) by construction (see classifyAgent's two proposed_fix
+ * sites), so the url/website leg of that check compared a value against
+ * itself and could never fail; only the email leg ever did any real work.
+ * This version:
+ *   (1) never re-derives a value from the fix itself to check against — it
+ *       checks the proposed value against the agent's own STORED email only
+ *       (domainCoherenceCheck(proposed, null, email)), which is independent
+ *       signal not used anywhere in either proposed_fix computation; and
+ *   (2) rejects outright if the proposed value itself resolves to a known
+ *       directory/aggregator/shared-hosting host — defense in depth
+ *       alongside the BLOCKER 1 classifier-level guard: a correction must
+ *       never resolve TO an aggregator domain, regardless of how it was
+ *       derived.
  */
 export function recheckProposedFix(r: ReconciliationAgentResult, fix: ProposedFix): boolean {
-  if (fix.field === "agents.url") {
-    return domainCoherenceCheck(fix.new_value, r.knowledge_website, r.knowledge_email).coherent;
-  }
-  return domainCoherenceCheck(r.agent_url, fix.new_value, r.knowledge_email).coherent;
+  const proposed = fix.new_value;
+  if (isAggregatorHost(proposed)) return false;
+  return domainCoherenceCheck(proposed, null, r.knowledge_email).coherent;
 }
 
 /**

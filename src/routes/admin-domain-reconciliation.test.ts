@@ -45,6 +45,12 @@
 
 import Database from "better-sqlite3";
 import * as initMod from "../database/init";
+import {
+  classifyAgent,
+  recheckProposedFix,
+  type AgentRow,
+  type ReconciliationAgentResult,
+} from "../services/domain-reconciliation";
 
 export interface TestSummary {
   passed: number;
@@ -136,6 +142,147 @@ export function runAdminDomainReconciliationTests(
       failures.push(`✗ ${label}`);
       if (log) console.log(`  ✗ ${label}`);
     }
+  }
+
+  // ═══ Pure unit tests: classifyAgent + recheckProposedFix ═══════════════
+  // No DB involved — classifyAgent and recheckProposedFix are pure functions.
+  // Covers the two 2026-07-13 review BLOCKERs:
+  //   BLOCKER 1 — aggregator/shared-hosting false-positive scramble matches
+  //   BLOCKER 2 — recheckProposedFix must use independent evidence, not a
+  //               value compared against itself
+  function agentRow(over: Partial<AgentRow> & { agent_id: string }): AgentRow {
+    return {
+      agent_id: over.agent_id,
+      name: over.name ?? null,
+      url: over.url ?? null,
+      website: over.website ?? null,
+      email: over.email ?? null,
+      verification_status: over.verification_status ?? "review_required",
+    };
+  }
+
+  // (B1a) Own-side guard: agent's OWN agents.url sits on a shared-hosting
+  // aggregator family (business.site). Its naive registrable root
+  // ("business.site") collides with another, wholly-unrelated agent's
+  // website root — pre-fix this produced a false circular_scramble_detected.
+  {
+    const agg1 = agentRow({
+      agent_id: "agg-1",
+      url: "https://companyp.business.site",
+      website: "https://unrelatedreal.no",
+      email: "post@unrelatedreal.no",
+    });
+    const other = agentRow({
+      agent_id: "agg-2",
+      url: null,
+      website: "https://companyq.business.site",
+      verification_status: "verified",
+    });
+    const result = classifyAgent(agg1, [agg1, other]);
+    assertTrue(
+      result.classification !== "circular_scramble_detected",
+      "unit-b1a: own agents.url on business.site is never classified circular_scramble_detected against an unrelated agent's business.site website",
+    );
+    assertEq(result.classification, "manual_review_needed", "unit-b1a: falls through to manual_review_needed (own url doesn't cohere against its own email either)");
+  }
+
+  // (B1b) Other-side guard: agent's OWN url is an ordinary (non-aggregator)
+  // domain whose naive registrable root happens to equal a KNOWN_DIRECTORY_
+  // HOSTS entry's naive root (lokalmat.coop.no's eTLD+1 is "coop.no", same
+  // as mygard.coop.no's) — the match must be excluded because the OTHER
+  // side (the matched-against website) is a known directory host, even
+  // though this agent's own url is not.
+  {
+    const own = agentRow({
+      agent_id: "coop-1",
+      url: "https://mygard.coop.no",
+      website: "https://randomthing.no",
+      email: "post@randomthing.no",
+    });
+    const directoryPartner = agentRow({
+      agent_id: "coop-2",
+      url: null,
+      website: "https://lokalmat.coop.no",
+      verification_status: "verified",
+    });
+    const result = classifyAgent(own, [own, directoryPartner]);
+    assertTrue(
+      result.classification !== "circular_scramble_detected",
+      "unit-b1b: agents.url matching a KNOWN_DIRECTORY_HOSTS entry's naive collapsed root (via another agent's website) is never classified circular_scramble_detected",
+    );
+  }
+
+  // (B2a) recheckProposedFix rejects a proposed fix actively contradicted by
+  // the agent's OWN stored email — independent evidence not derived from
+  // the fix itself.
+  {
+    const badFix: ReconciliationAgentResult = {
+      agent_id: "rc-1",
+      name: null,
+      verification_status: "review_required",
+      agent_url: "https://scrambled-elsewhere.no",
+      knowledge_website: "https://ownsite.no",
+      knowledge_email: "post@totallydifferent.no",
+      coherent: false,
+      coherence_reason: "test fixture",
+      classification: "circular_scramble_detected",
+      proposed_fix: { field: "agents.url", new_value: "https://ownsite.no" },
+      related_agent_ids: [],
+      reasoning: "test fixture",
+    };
+    assertTrue(
+      !recheckProposedFix(badFix, badFix.proposed_fix!),
+      "unit-b2a: recheckProposedFix REJECTS a proposed url fix whose target contradicts the agent's own stored email",
+    );
+  }
+
+  // (B2b) recheckProposedFix rejects a proposed fix that would itself
+  // resolve TO a known aggregator/shared-hosting host — defense in depth,
+  // proven independently of the email leg by using a free-mail address
+  // (post@gmail.com) that would otherwise pass the email check trivially.
+  {
+    const aggregatorFix: ReconciliationAgentResult = {
+      agent_id: "rc-2",
+      name: null,
+      verification_status: "review_required",
+      agent_url: "https://realsite.no",
+      knowledge_website: "https://companyz.business.site",
+      knowledge_email: "post@gmail.com",
+      coherent: false,
+      coherence_reason: "test fixture",
+      classification: "stale_knowledge_website",
+      proposed_fix: { field: "agents.url", new_value: "https://companyz.business.site" },
+      related_agent_ids: [],
+      reasoning: "test fixture",
+    };
+    assertTrue(
+      !recheckProposedFix(aggregatorFix, aggregatorFix.proposed_fix!),
+      "unit-b2b: recheckProposedFix REJECTS a proposed fix resolving to a known aggregator host, even when the email leg would otherwise pass (free-mail bypass)",
+    );
+  }
+
+  // (B2c) Positive control — recheckProposedFix is not "reject everything":
+  // a proposed fix that genuinely coheres against independent email
+  // evidence is accepted.
+  {
+    const goodFix: ReconciliationAgentResult = {
+      agent_id: "rc-3",
+      name: null,
+      verification_status: "review_required",
+      agent_url: "https://scrambled-elsewhere.no",
+      knowledge_website: "https://realsite.no",
+      knowledge_email: "post@realsite.no",
+      coherent: false,
+      coherence_reason: "test fixture",
+      classification: "circular_scramble_detected",
+      proposed_fix: { field: "agents.url", new_value: "https://realsite.no" },
+      related_agent_ids: [],
+      reasoning: "test fixture",
+    };
+    assertTrue(
+      recheckProposedFix(goodFix, goodFix.proposed_fix!),
+      "unit-b2c: recheckProposedFix ACCEPTS a proposed fix that coheres against the agent's own stored email",
+    );
   }
 
   return (async () => {
