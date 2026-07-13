@@ -47,6 +47,17 @@ function parseBool(v: unknown, dflt: boolean): boolean {
 
 // GET /admin/outreach-ready-pool/stats — pool size + breakdowns
 // Defined BEFORE the index route so /stats is not eaten by /:limit-style logic.
+//
+// dev-request 2026-07-12-rfb-enrichment-pool-refill-and-waste-reduction (re-scoped
+// item 1, per the 2026-07-12T17:5xZ premise-correction note on that file): the
+// original "pool_size=2" reading was misread as an email-coverage problem. It is
+// actually the `outreach_ready_pool` VIEW's five-gate funnel (email present,
+// non-umbrella, verified, partial/rich, URL probed-fresh-and-OK, not already
+// sent) draining almost everything at the URL-freshness gate. `pool_funnel`
+// below counts the cohort surviving each gate in order so the next slice knows
+// which gate to fix instead of re-measuring blind. `homepage_parking` reports
+// the PR #248 parking mechanism's live split (still-backed-off vs. eligible for
+// retry) — read-only, same columns/window that route already writes.
 router.get("/stats", (req: Request, res: Response) => {
   if (!requireAdmin(req, res)) return;
   try {
@@ -58,11 +69,54 @@ router.get("/stats", (req: Request, res: Response) => {
     const byEnrichment = db
       .prepare(`SELECT enrichment_status AS k, COUNT(*) AS c FROM agent_knowledge GROUP BY enrichment_status`)
       .all() as Array<{ k: string; c: number }>;
+
+    // Funnel: each step ANDs one more outreach_ready_pool gate onto the last,
+    // in the same order the VIEW applies them, so the counts strictly
+    // decrease and the biggest single drop identifies the bottleneck gate.
+    const funnelBase = `
+      FROM agents a
+      INNER JOIN agent_knowledge k ON k.agent_id = a.id
+      WHERE a.umbrella_type IS NULL
+        AND k.verification_status = 'verified'
+        AND k.enrichment_status IN ('partial', 'rich')`;
+    const verifiedRichOrPartial = db.prepare(`SELECT COUNT(*) AS c ${funnelBase}`).get() as { c: number };
+    const withEmail = db
+      .prepare(`SELECT COUNT(*) AS c ${funnelBase} AND k.email IS NOT NULL AND k.email != ''`)
+      .get() as { c: number };
+    const urlFreshAndOk = db
+      .prepare(
+        `SELECT COUNT(*) AS c ${funnelBase} AND k.email IS NOT NULL AND k.email != ''
+           AND k.url_last_status IS NOT NULL AND k.url_last_status >= 200 AND k.url_last_status < 400
+           AND k.url_last_probed IS NOT NULL AND k.url_last_probed > datetime('now', '-30 days')`
+      )
+      .get() as { c: number };
+
+    const parking = db
+      .prepare(
+        `SELECT
+           SUM(CASE WHEN homepage_unreachable_since IS NOT NULL
+                     AND homepage_unreachable_since > datetime('now', '-30 days') THEN 1 ELSE 0 END) AS parked_active,
+           SUM(CASE WHEN homepage_unreachable_since IS NOT NULL
+                     AND homepage_unreachable_since <= datetime('now', '-30 days') THEN 1 ELSE 0 END) AS parked_expired
+         FROM agent_knowledge`
+      )
+      .get() as { parked_active: number | null; parked_expired: number | null };
+
     res.json({
       success: true,
       pool_size: total?.c ?? 0,
       by_verification_status: byStatus,
       by_enrichment_status: byEnrichment,
+      pool_funnel: {
+        verified_and_rich_or_partial: verifiedRichOrPartial?.c ?? 0,
+        with_email: withEmail?.c ?? 0,
+        url_fresh_and_ok: urlFreshAndOk?.c ?? 0,
+        not_yet_contacted_final: total?.c ?? 0,
+      },
+      homepage_parking: {
+        parked_active: parking?.parked_active ?? 0,
+        parked_expired_ready_for_retry: parking?.parked_expired ?? 0,
+      },
     });
   } catch (err: any) {
     res.status(500).json({ success: false, error: String(err?.message || err) });
