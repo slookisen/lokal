@@ -53,6 +53,11 @@ import {
   // dev-request 2026-07-12-gardssalg-dark-launch-stop, slice 0 — need the
   // full provider row (booking_live + epost) to gate/dispatch bookings.
   getProviderById,
+  // dev-request 2026-07-04-opplevagent-dedup-og-norske-titler, item 3
+  // (detail completeness weave) — the SAME "published" gate the detail
+  // page/`/discover` use, reused by the new catalog-wide coverage report
+  // below rather than redefined.
+  PUBLISH_GATE_SQL,
 } from "../services/experience-store";
 // dev-request 2026-07-11-dedup-false-positive-remediation — read-only audit
 // of the merged groups the prod backfill produced (titlesMatch()'s single-
@@ -1296,6 +1301,66 @@ router.get("/admin/gardssalg-contact-coverage", requireAdmin, (_req: Request, re
     with_address: withAddress,
     reachable,
     unreachable,
+  });
+});
+
+// ─── GET /api/opplevelser/admin/detail-completeness-coverage ─────────────────
+//
+// dev-request 2026-07-04-opplevagent-dedup-og-norske-titler, item 3 ("detail
+// completeness weave"): unlike /admin/gardssalg-contact-coverage above (scoped
+// to seeded gårdssalg providers via rfb_seed_source = 'rfb-seed'), this reports
+// booking_url/phone/website field coverage over the FULL catalog of published
+// experiences — the same "published" set the detail page (/opplevelse/:slug)
+// and /discover actually surface (PUBLISH_GATE_SQL: verified + confidence
+// high/medium/null + provider brreg_active-or-none + canonical_id IS NULL).
+//
+// Read-only — a single SELECT, no writes. Phone/website are read via the
+// experience_providers join (same fields item 3 surfaces on the detail page
+// and in the single-experience API row); booking_url lives directly on
+// experiences and is already fully wired elsewhere — this endpoint only
+// reads it to report coverage, never touches its existing behavior.
+router.get("/admin/detail-completeness-coverage", requireAdmin, (_req: Request, res: Response) => {
+  const expDb = getExpDb("experiences");
+
+  let rows: Array<{
+    booking_url: string | null;
+    telefon: string | null;
+    hjemmeside: string | null;
+  }> = [];
+  try {
+    rows = expDb
+      .prepare(
+        `SELECT e.booking_url AS booking_url, p.telefon AS telefon, p.hjemmeside AS hjemmeside
+           FROM experiences e
+           LEFT JOIN experience_providers p ON p.id = e.provider_id
+          WHERE ${PUBLISH_GATE_SQL}`
+      )
+      .all() as typeof rows;
+  } catch (err) {
+    console.error("[detail-completeness-coverage] failed to query experiences:", err);
+    res.status(500).json({ error: "Failed to query experiences" });
+    return;
+  }
+
+  const present = (v: string | null): boolean => v !== null && v.trim() !== "";
+  const pct = (count: number, total: number): number =>
+    total === 0 ? 0 : Math.round((count / total) * 1000) / 10;
+
+  let withBookingUrl = 0;
+  let withPhone = 0;
+  let withWebsite = 0;
+  for (const r of rows) {
+    if (present(r.booking_url)) withBookingUrl++;
+    if (present(r.telefon)) withPhone++;
+    if (present(r.hjemmeside)) withWebsite++;
+  }
+
+  const total = rows.length;
+  res.json({
+    total_experiences: total,
+    with_booking_url: { count: withBookingUrl, pct: pct(withBookingUrl, total) },
+    with_phone: { count: withPhone, pct: pct(withPhone, total) },
+    with_website: { count: withWebsite, pct: pct(withWebsite, total) },
   });
 });
 
