@@ -25354,6 +25354,21 @@ Promise.allSettled(_oaHomeCountersDeps).then(async () => {
     for (const f of gccr.failures) failures.push("opplevelser-gardssalg-contact-coverage: " + f);
     console.log(`  opplevelser-gardssalg-contact-coverage: ${gccr.passed} passed, ${gccr.failed} failed`);
 
+    // dev-request 2026-07-04-opplevagent-dedup-og-norske-titler, item 3
+    // (detail completeness weave): GET /admin/detail-completeness-coverage —
+    // read-only, catalog-wide booking_url/phone/website coverage report over
+    // ALL published experiences (not scoped to gårdssalg/rfb-seed like the
+    // report above). Same in-memory-DB pattern, runs sequentially inside this
+    // same gated block for the same reason.
+    console.log("\n── opplevelser-detail-completeness-coverage: catalog-wide completeness report ──");
+    const { runOpplevelserDetailCompletenessCoverageTests } = require("../src/routes/opplevelser-detail-completeness-coverage.test") as
+      typeof import("../src/routes/opplevelser-detail-completeness-coverage.test");
+    const dccr = await runOpplevelserDetailCompletenessCoverageTests({ log: false });
+    passed += dccr.passed;
+    failed += dccr.failed;
+    for (const f of dccr.failures) failures.push("opplevelser-detail-completeness-coverage: " + f);
+    console.log(`  opplevelser-detail-completeness-coverage: ${dccr.passed} passed, ${dccr.failed} failed`);
+
     // Regression: /sok (experiences-seo.ts) used to run the q/tag search and
     // the geo (discoverExperiences()) lookup in one shared try/catch, and
     // never range-validated lat/lng — an out-of-range lat/lng (e.g.
@@ -28078,6 +28093,146 @@ console.log("\n── orch-pr-titleno-render: renderCard()/detail-page title_no 
   else process.env.EXPERIENCES_DB_PATH = prevPathTNR;
   dbFactoryTNR.__resetDbFactoryForTesting();
   console.log("  orch-pr-titleno-render: OK (card + detail <h1> title_no fallback, both locales)");
+})();
+
+
+// ── orch-pr-provider-phone-weave: provider phone surfaced like booking_url ──
+// dev-request 2026-07-04-opplevagent-dedup-og-norske-titler, item 3 ("detail
+// completeness weave"): experience_providers.telefon is now surfaced (a) on
+// the /opplevelse/:slug detail page next to the booking CTA, and (b) as
+// `phone` on the single-experience API row (getExperienceById() /
+// getPublishedExperienceBySlug()) — same conditional/no-fabrication
+// convention hjemmeside/booking_url already follow. Same "invokeSeo" pattern
+// as orch-pr-titleno-render above for the render half; direct experience-
+// store calls for the API-row half.
+console.log("\n── orch-pr-provider-phone-weave: provider phone on detail page + API row ──");
+(() => {
+  const prevPathPhone = process.env.EXPERIENCES_DB_PATH;
+  process.env.EXPERIENCES_DB_PATH = ":memory:";
+
+  const dbFactoryPathPhone = require.resolve("../src/database/db-factory");
+  const expStorePathPhone = require.resolve("../src/services/experience-store");
+  const expSeoPathPhone = require.resolve("../src/routes/experiences-seo");
+  delete require.cache[dbFactoryPathPhone];
+  delete require.cache[expStorePathPhone];
+  delete require.cache[expSeoPathPhone];
+
+  const dbFactoryPhone = require("../src/database/db-factory") as typeof import("../src/database/db-factory");
+  dbFactoryPhone.__resetDbFactoryForTesting();
+  const expStorePhone = require("../src/services/experience-store") as typeof import("../src/services/experience-store");
+  const seoRouterPhone = (require("../src/routes/experiences-seo") as typeof import("../src/routes/experiences-seo")).default as any;
+
+  // Provider WITH a phone on file.
+  const PHONE = "+47 400 12 345";
+  const providerWithPhoneId = expStorePhone.createProvider({
+    navn: "Fjordsafari Nord AS", org_nr: "999333111",
+    fylke: "Troms og Finnmark", kommune: "Tromsø", hjemmeside: "https://fjordsafari-nord.no",
+    telefon: PHONE,
+    brreg_verified: 1, brreg_active: 1, verification_status: "verified",
+  });
+  const expWithPhoneId = expStorePhone.createExperience({
+    title: "Fjordsafari i Tromsø", provider_id: providerWithPhoneId, provider_match_status: "matched",
+    category: "dyreliv_safari", fylke: "Troms og Finnmark", kommune: "Tromsø",
+    indoor_outdoor: "outdoor", confidence: "high", verification_status: "verified",
+  });
+
+  // Provider WITHOUT a phone (NULL) — the never-fabricate case.
+  const providerNoPhoneId = expStorePhone.createProvider({
+    navn: "Stillhet Opplevelser AS", org_nr: "999333222",
+    fylke: "Troms og Finnmark", kommune: "Tromsø", hjemmeside: "https://stillhet.no",
+    telefon: null,
+    brreg_verified: 1, brreg_active: 1, verification_status: "verified",
+  });
+  const expNoPhoneId = expStorePhone.createExperience({
+    title: "Stillhetsvandring", provider_id: providerNoPhoneId, provider_match_status: "matched",
+    category: "natur_friluft", fylke: "Troms og Finnmark", kommune: "Tromsø",
+    indoor_outdoor: "outdoor", confidence: "high", verification_status: "verified",
+  });
+
+  // Provider with a WHITESPACE-ONLY phone — must be treated as absent, not
+  // rendered/returned as a truthy value (mirrors the trim-check convention
+  // used elsewhere in this codebase, e.g. gardssalg-contact-coverage).
+  const providerBlankPhoneId = expStorePhone.createProvider({
+    navn: "Blank Telefon AS", org_nr: "999333333",
+    fylke: "Troms og Finnmark", kommune: "Tromsø",
+    telefon: "   ",
+    brreg_verified: 1, brreg_active: 1, verification_status: "verified",
+  });
+  const expBlankPhoneId = expStorePhone.createExperience({
+    title: "Blank telefon-tur", provider_id: providerBlankPhoneId, provider_match_status: "matched",
+    category: "natur_friluft", fylke: "Troms og Finnmark", kommune: "Tromsø",
+    indoor_outdoor: "outdoor", confidence: "high", verification_status: "verified",
+  });
+
+  // Experience with NO provider at all.
+  const expNoProviderId = expStorePhone.createExperience({
+    title: "Tur uten tilbyder", provider_match_status: "unmatched",
+    category: "natur_friluft", fylke: "Troms og Finnmark", kommune: "Tromsø",
+    indoor_outdoor: "outdoor", confidence: "high", verification_status: "verified",
+  });
+
+  // ── API row: getExperienceById() ────────────────────────────────────────
+  const gotWithPhone = expStorePhone.getExperienceById(expWithPhoneId) as any;
+  assertEq(gotWithPhone?.phone, PHONE, "phone-1a: getExperienceById() surfaces `phone` from experience_providers.telefon when present");
+
+  const gotNoPhone = expStorePhone.getExperienceById(expNoPhoneId) as any;
+  assertEq(gotNoPhone?.phone, null, "phone-1b: getExperienceById() returns `phone: null` when the provider has no telefon (never fabricated)");
+
+  const gotBlankPhone = expStorePhone.getExperienceById(expBlankPhoneId) as any;
+  assertEq(gotBlankPhone?.phone, null, "phone-1c: getExperienceById() treats a whitespace-only telefon as absent (trimmed)");
+
+  const gotNoProvider = expStorePhone.getExperienceById(expNoProviderId) as any;
+  assertEq(gotNoProvider?.phone, null, "phone-1d: getExperienceById() returns `phone: null` when there is no provider at all");
+
+  // ── API row: getPublishedExperienceBySlug() — same contract ────────────
+  const slugWithPhone = gotWithPhone.slug as string;
+  const publishedWithPhone = expStorePhone.getPublishedExperienceBySlug(slugWithPhone) as any;
+  assertEq(publishedWithPhone?.phone, PHONE, "phone-2a: getPublishedExperienceBySlug() also surfaces `phone` when present");
+
+  const slugNoPhone = gotNoPhone.slug as string;
+  const publishedNoPhone = expStorePhone.getPublishedExperienceBySlug(slugNoPhone) as any;
+  assertEq(publishedNoPhone?.phone, null, "phone-2b: getPublishedExperienceBySlug() returns `phone: null` when absent");
+
+  // ── Detail page render (/opplevelse/:slug) ──────────────────────────────
+  // Same bare-router invocation helper as orch-pr-titleno-render above
+  // (langMiddleware isn't mounted on this bare router in a unit test).
+  function invokeSeoPhone(routePath: string, params: Record<string, string>, reqPath: string): { status: number; body: string } {
+    const layer = (seoRouterPhone.stack as any[]).find(
+      (l: any) => l.route && l.route.path === routePath && l.route.methods?.get
+    );
+    assertTrue(!!layer, `phone: router has GET ${routePath} layer`);
+    let status = 200; let body = ""; let nexted = false;
+    const res: any = {
+      statusCode: 200,
+      setHeader: () => {},
+      status: (c: number) => { status = c; res.statusCode = c; return res; },
+      send: (b: unknown) => { body = typeof b === "string" ? b : String(b); return res; },
+      json: (o: unknown) => { body = JSON.stringify(o); return res; },
+    };
+    const req: any = { path: reqPath, hostname: "opplevagent.no", params, query: {}, lang: "no" };
+    const handler = layer.route.stack[layer.route.stack.length - 1].handle;
+    handler(req, res, () => { nexted = true; });
+    if (nexted) status = 404;
+    return { status, body };
+  }
+
+  const detailWithPhone = invokeSeoPhone("/opplevelse/:slug", { slug: slugWithPhone }, `/opplevelse/${slugWithPhone}`);
+  assertEq(detailWithPhone.status, 200, "phone-3a: GET /opplevelse/<slug> (provider has phone) → 200");
+  assertTrue(detailWithPhone.body.includes(PHONE), "phone-3b: detail page renders the provider's phone number when present");
+  assertTrue(detailWithPhone.body.includes(`href="tel:`), "phone-3c: phone is rendered as a tel: link");
+
+  const detailNoPhone = invokeSeoPhone("/opplevelse/:slug", { slug: slugNoPhone }, `/opplevelse/${slugNoPhone}`);
+  assertEq(detailNoPhone.status, 200, "phone-4a: GET /opplevelse/<slug> (provider has NO phone) → 200");
+  assertTrue(!detailNoPhone.body.includes("prov-phone"), "phone-4b: no phone block rendered at all when telefon is absent (no fabrication)");
+
+  const detailBlankPhone = invokeSeoPhone("/opplevelse/:slug", { slug: (expStorePhone.getExperienceById(expBlankPhoneId) as any).slug }, `/opplevelse/${(expStorePhone.getExperienceById(expBlankPhoneId) as any).slug}`);
+  assertEq(detailBlankPhone.status, 200, "phone-5a: GET /opplevelse/<slug> (provider has whitespace-only telefon) → 200");
+  assertTrue(!detailBlankPhone.body.includes("prov-phone"), "phone-5b: whitespace-only telefon renders no phone block either (trimmed)");
+
+  if (prevPathPhone === undefined) delete process.env.EXPERIENCES_DB_PATH;
+  else process.env.EXPERIENCES_DB_PATH = prevPathPhone;
+  dbFactoryPhone.__resetDbFactoryForTesting();
+  console.log("  orch-pr-provider-phone-weave: OK (API row `phone` present/absent/blank + detail-page tel: rendering)");
 })();
 
 

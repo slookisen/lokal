@@ -350,10 +350,27 @@ export function createExperience(input: Experience): string {
   return id;
 }
 
-export function getExperienceById(id: string): (Experience & { id: string; tags: ExperienceTag[] }) | null {
+// dev-request 2026-07-04-opplevagent-dedup-og-norske-titler, item 3 (detail
+// completeness weave): surface provider phone in the single-experience API
+// row the same way booking_url already is — no fabrication, null when the
+// provider has none on file. Follow-up lookup via getProviderById() (defined
+// below; function declarations hoist) rather than widening the experiences
+// SELECT, so callers that don't need it pay no extra cost.
+function providerPhoneOf(providerId: string | null | undefined): string | null {
+  if (!providerId) return null;
+  const provider = getProviderById(providerId);
+  const raw = provider ? String(provider.telefon ?? "").trim() : "";
+  return raw || null;
+}
+
+export function getExperienceById(
+  id: string
+): (Experience & { id: string; tags: ExperienceTag[]; phone: string | null }) | null {
   const db = getDb(VERTICAL);
   const row = db.prepare("SELECT * FROM experiences WHERE id = ?").get(id) as Record<string, unknown> | undefined;
-  return row ? hydrateExperience(row) : null;
+  if (!row) return null;
+  const hydrated = hydrateExperience(row);
+  return { ...hydrated, phone: providerPhoneOf(hydrated.provider_id) };
 }
 // ─── Site-quality: server-rendered detail-page reads (opplevagent.no) ──────
 // Added by the opplevagent-site-quality loop (work-order 2026-06-20,
@@ -365,7 +382,12 @@ export function getExperienceById(id: string): (Experience & { id: string; tags:
 // that the dedup pass folded into another (canonical) row must never surface
 // again in any browse/discover/sitemap result — canonical_id IS NULL means
 // "this row IS canonical" (see init-experiences.ts + experience-dedup.ts).
-const PUBLISH_GATE_SQL =
+//
+// Exported (item 3, detail-completeness weave) so the catalog-wide
+// detail-completeness-coverage admin report (opplevelser.ts) reports over
+// the SAME "published" set the detail page/`/discover` actually surface,
+// rather than redefining the gate a second time.
+export const PUBLISH_GATE_SQL =
   "e.verification_status = 'verified' " +
   "AND (e.confidence IS NULL OR e.confidence IN ('high','medium')) " +
   "AND (p.id IS NULL OR p.brreg_active = 1) " +
@@ -373,7 +395,7 @@ const PUBLISH_GATE_SQL =
 
 export function getPublishedExperienceBySlug(
   slug: string
-): (Experience & { id: string; tags: ExperienceTag[] }) | null {
+): (Experience & { id: string; tags: ExperienceTag[]; phone: string | null }) | null {
   if (!slug) return null;
   const db = getDb(VERTICAL);
   const row = db
@@ -383,7 +405,9 @@ export function getPublishedExperienceBySlug(
        WHERE e.slug = @slug AND ${PUBLISH_GATE_SQL}`
     )
     .get({ slug }) as Record<string, unknown> | undefined;
-  return row ? hydrateExperience(row) : null;
+  if (!row) return null;
+  const hydrated = hydrateExperience(row);
+  return { ...hydrated, phone: providerPhoneOf(hydrated.provider_id) };
 }
 
 export function getProviderById(id: string): Record<string, unknown> | null {

@@ -1318,6 +1318,11 @@ function renderOpplevelseDetail(
   const place = [exp.kommune, exp.fylke].filter(Boolean).join(", ");
   const provName = provider ? String(provider.navn || "") : "";
   const provSite = provider ? safeHttpUrl(provider.hjemmeside) : null;
+  // dev-request 2026-07-04-opplevagent-dedup-og-norske-titler, item 3
+  // (detail completeness weave): surface provider phone the same way
+  // booking_url/hjemmeside already are — conditional, no fabrication.
+  const provTelRaw = provider ? String(provider.telefon ?? "").trim() : "";
+  const provTel = provTelRaw || null;
   const brregVerified = !!(provider && Number(provider.brreg_verified) === 1);
   const orgNr = provider ? String(provider.org_nr || "") : "";
 
@@ -1394,6 +1399,10 @@ function renderOpplevelseDetail(
   } else {
     cta = `<p class="cta-soft">Bestilling skjer hos tilbyder. Kontaktinfo kommer.</p>`;
   }
+  // Phone — rendered only when the provider has one on file (no fabrication).
+  const phoneBlock = provTel
+    ? `<p class="prov-phone">Telefon: <a href="tel:${escapeHtml(provTel.replace(/\s+/g, ""))}">${escapeHtml(provTel)}</a></p>`
+    : "";
 
   // Provider card.
   const provInner = provName
@@ -1613,7 +1622,7 @@ ${ldScripts}
       ${evBlock}
     </article>
     <aside class="aside">
-      <div class="card"><h2>Bestilling</h2>${cta}</div>
+      <div class="card"><h2>Bestilling</h2>${cta}${phoneBlock}</div>
       <div class="card"><h2>Tilbyder</h2>${provInner}</div>
       <div class="card"><h2>Sted</h2>${mapBlock}</div>
     </aside>
