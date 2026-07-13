@@ -285,6 +285,103 @@ export function runAdminDomainReconciliationTests(
     );
   }
 
+  // ── Round 2 fix: stale_knowledge_website tautology + null/empty-email gap ──
+  // (B3a) stale_knowledge_website is only reachable after the classifier has
+  // already proven agents.url internally coherent (see classifyAgent's
+  // ownCoherence precondition) — recheckProposedFix must NOT re-run that same
+  // check (it would be a no-op tautology, the original BLOCKER 2 bug
+  // relocated) and its outcome must NOT depend on knowledge_email at all.
+  {
+    const staleNullEmail: ReconciliationAgentResult = {
+      agent_id: "rc-4",
+      name: null,
+      verification_status: "review_required",
+      agent_url: "https://realownsite.no",
+      knowledge_website: "https://unrelatedco.no",
+      knowledge_email: null,
+      coherent: false,
+      coherence_reason: "test fixture",
+      classification: "stale_knowledge_website",
+      proposed_fix: { field: "agent_knowledge.website", new_value: "https://realownsite.no" },
+      related_agent_ids: [],
+      reasoning: "test fixture",
+    };
+    assertTrue(
+      recheckProposedFix(staleNullEmail, staleNullEmail.proposed_fix!),
+      "unit-b3a: recheckProposedFix ACCEPTS a stale_knowledge_website fix with a null knowledge_email (safety comes from the classifier precondition, not from an email recheck)",
+    );
+  }
+
+  // (B3b) Same, but empty-string knowledge_email (not just null/undefined) —
+  // same outcome, proving the check is on trimmed truthiness, not just null.
+  {
+    const staleEmptyEmail: ReconciliationAgentResult = {
+      agent_id: "rc-5",
+      name: null,
+      verification_status: "review_required",
+      agent_url: "https://realownsite2.no",
+      knowledge_website: "https://unrelatedco2.no",
+      knowledge_email: "",
+      coherent: false,
+      coherence_reason: "test fixture",
+      classification: "stale_knowledge_website",
+      proposed_fix: { field: "agent_knowledge.website", new_value: "https://realownsite2.no" },
+      related_agent_ids: [],
+      reasoning: "test fixture",
+    };
+    assertTrue(
+      recheckProposedFix(staleEmptyEmail, staleEmptyEmail.proposed_fix!),
+      "unit-b3b: recheckProposedFix ACCEPTS a stale_knowledge_website fix with an empty-string knowledge_email",
+    );
+  }
+
+  // (B3c) circular_scramble_detected's ONLY independent evidence is the
+  // agent's own stored email — a null email means ZERO independent evidence
+  // beyond the aggregator guard, so per this PR's "correctness > pool size,
+  // don't guess" stance the fix must be REFUSED, not silently accepted.
+  {
+    const scrambleNullEmail: ReconciliationAgentResult = {
+      agent_id: "rc-6",
+      name: null,
+      verification_status: "review_required",
+      agent_url: "https://scrambled-elsewhere2.no",
+      knowledge_website: "https://ownsite2.no",
+      knowledge_email: null,
+      coherent: false,
+      coherence_reason: "test fixture",
+      classification: "circular_scramble_detected",
+      proposed_fix: { field: "agents.url", new_value: "https://ownsite2.no" },
+      related_agent_ids: [],
+      reasoning: "test fixture",
+    };
+    assertTrue(
+      !recheckProposedFix(scrambleNullEmail, scrambleNullEmail.proposed_fix!),
+      "unit-b3c: recheckProposedFix REFUSES a circular_scramble_detected fix with a null knowledge_email (no independent evidence at all)",
+    );
+  }
+
+  // (B3d) Same, whitespace-only knowledge_email.
+  {
+    const scrambleEmptyEmail: ReconciliationAgentResult = {
+      agent_id: "rc-7",
+      name: null,
+      verification_status: "review_required",
+      agent_url: "https://scrambled-elsewhere3.no",
+      knowledge_website: "https://ownsite3.no",
+      knowledge_email: "   ",
+      coherent: false,
+      coherence_reason: "test fixture",
+      classification: "circular_scramble_detected",
+      proposed_fix: { field: "agents.url", new_value: "https://ownsite3.no" },
+      related_agent_ids: [],
+      reasoning: "test fixture",
+    };
+    assertTrue(
+      !recheckProposedFix(scrambleEmptyEmail, scrambleEmptyEmail.proposed_fix!),
+      "unit-b3d: recheckProposedFix REFUSES a circular_scramble_detected fix with a whitespace-only knowledge_email",
+    );
+  }
+
   return (async () => {
     const prevDb = initMod.getDb();
     const testKey = "admin-domain-reconciliation-test-key";
@@ -321,14 +418,27 @@ export function runAdminDomainReconciliationTests(
         re: "https://echobonde.no",
       };
       const ringWebsite = (id: string) => RING_DOMAIN[id];
+      // Each ring agent's OWN knowledge_email matches its OWN (correct)
+      // website domain — this is the independent evidence
+      // recheckProposedFix's circular_scramble_detected leg checks against
+      // (round 2 fix: a missing email now REFUSES the fix instead of
+      // silently accepting it, so these fixtures need a real, coherent
+      // email to keep exercising the "fix legitimately proceeds" path;
+      // the null-email REFUSAL path is covered separately by ns-i below).
+      const ringEmail = (id: string) => `post@${new URL(ringWebsite(id)).hostname}`;
       for (let i = 0; i < ring.length; i++) {
         const id = ring[i];
         const nextId = ring[(i + 1) % ring.length];
         insertAgent.run(id, `Ring ${id}`, ringWebsite(nextId), `key-${id}`);
-        insertKnowledge.run(id, ringWebsite(id), null, "review_required");
+        insertKnowledge.run(id, ringWebsite(id), ringEmail(id), "review_required");
       }
 
       // ── (2) stale_knowledge_website: own url coherent, website is wrong ──
+      // knowledge_email is deliberately NULL here — this fixture doubles as
+      // the "stale_knowledge_website legitimately proceeds despite a null
+      // email" positive control (round 2 fix): this branch's recheck never
+      // depends on email (see recheckProposedFix's doc comment), so the fix
+      // must still be applied below even though there's no email at all.
       insertAgent.run("sw-1", "Stale AS", "https://foxstadgard.no", "key-sw1");
       insertKnowledge.run("sw-1", "https://unrelatedbedrift.no", null, "review_required");
 
@@ -350,6 +460,20 @@ export function runAdminDomainReconciliationTests(
       insertKnowledge.run("fr-j", "https://kilogard.no", null, "verified");
       insertAgent.run("fr-i", "Agent I", "https://kilogard.no", "key-fri");
       insertKnowledge.run("fr-i", "https://limafarm.no", "post@mikebedrift.no", "review_required");
+
+      // ── (8) null-email failed-recheck fixture (round 2 fix): ns-i's url
+      // matches ns-j's website (circular candidate), but ns-i has NO stored
+      // email at all — there is zero independent evidence beyond the
+      // aggregator guard, so the proposed fix (agents.url <- ns-i.website)
+      // must be REFUSED (stamped, not written), proving the "refuse when
+      // knowledge_email is null/empty" decision for circular_scramble_
+      // detected actually happens end-to-end, not just at the pure-function
+      // level (see unit-b3c below). ns-j is 'verified' (matching-universe
+      // only, outside the audited cohort, like fr-j above).
+      insertAgent.run("ns-j", "NullEmail Partner J", "https://papagard.no", "key-nsj");
+      insertKnowledge.run("ns-j", "https://papagard.no", null, "verified");
+      insertAgent.run("ns-i", "NullEmail Agent I", "https://papagard.no", "key-nsi");
+      insertKnowledge.run("ns-i", "https://quebecfarm.no", null, "review_required");
 
       // ── (7) multi-cycle backoff fixture: plain manual_review_needed row ──
       insertAgent.run("bo-1", "Backoff AS", "https://novemberhage.no", "key-bo1");
@@ -441,8 +565,12 @@ export function runAdminDomainReconciliationTests(
       // (6) fr-i: circular CANDIDATE at classification time (matches fr-j's website)
       assertEq(agentsById["fr-i"]?.classification, "circular_scramble_detected", "audit-recheck: fr-i classified circular_scramble_detected pre-recheck");
 
-      // Summary counts sanity: circular=5(ring)+1(fr-i)=6, stale=1, manual>=2
-      assertEq(auditResult.body.summary.circular_scramble_detected, 6, "audit-summary: circular count = 6 (5-ring + fr-i)");
+      // (8) ns-i: circular CANDIDATE at classification time (matches ns-j's website),
+      // null knowledge_email — classification itself doesn't depend on email.
+      assertEq(agentsById["ns-i"]?.classification, "circular_scramble_detected", "audit-recheck: ns-i classified circular_scramble_detected pre-recheck (null email)");
+
+      // Summary counts sanity: circular=5(ring)+1(fr-i)+1(ns-i)=7, stale=1, manual>=2
+      assertEq(auditResult.body.summary.circular_scramble_detected, 7, "audit-summary: circular count = 7 (5-ring + fr-i + ns-i)");
       assertEq(auditResult.body.summary.stale_knowledge_website, 1, "audit-summary: stale count = 1");
       assertTrue(auditResult.body.summary.manual_review_needed >= 3, "audit-summary: manual count includes mc-1, mc-2, bo-1");
 
@@ -459,15 +587,16 @@ export function runAdminDomainReconciliationTests(
       const applyResult = await post("/domain-reconciliation-sweep", { dry_run: false });
       assertEq(applyResult.status, 200, "sweep-05: POST sweep dry_run=false -> 200");
       assertEq(applyResult.body.dry_run, false, "sweep-06: response echoes dry_run=false");
-      assertEq(applyResult.body.visited, 10, "sweep-07: visited = 10 (5 ring + sw-1 + mc-1 + mc-2 + fr-i + bo-1; fr-j is 'verified', never visited)");
-      assertEq(applyResult.body.applied.length, 6, "sweep-08: applied = 6 (5 ring + sw-1; fr-i's fix failed its re-check)");
-      assertEq(applyResult.body.failed_recheck, ["fr-i"], "sweep-09: failed_recheck = [fr-i]");
+      assertEq(applyResult.body.visited, 11, "sweep-07: visited = 11 (5 ring + sw-1 + mc-1 + mc-2 + fr-i + ns-i + bo-1; fr-j and ns-j are 'verified', never visited)");
+      assertEq(applyResult.body.applied.length, 6, "sweep-08: applied = 6 (5 ring + sw-1; fr-i's and ns-i's fixes failed their re-check)");
+      assertEq(applyResult.body.failed_recheck, ["fr-i", "ns-i"], "sweep-09: failed_recheck = [fr-i, ns-i] (cohort order is a.id ASC)");
       assertTrue(
         applyResult.body.stamped_no_fix.includes("mc-1") &&
           applyResult.body.stamped_no_fix.includes("mc-2") &&
           applyResult.body.stamped_no_fix.includes("bo-1") &&
-          applyResult.body.stamped_no_fix.includes("fr-i"),
-        "sweep-10: stamped_no_fix includes every manual_review_needed row plus the failed-recheck row",
+          applyResult.body.stamped_no_fix.includes("fr-i") &&
+          applyResult.body.stamped_no_fix.includes("ns-i"),
+        "sweep-10: stamped_no_fix includes every manual_review_needed row plus both failed-recheck rows",
       );
 
       const afterApply = snapshot();
@@ -525,6 +654,26 @@ export function runAdminDomainReconciliationTests(
       const frjK = byId(afterApply.knowledge, "fr-j");
       assertEq(frjAgent.url, "https://kilogard.no", "apply-recheck: fr-j (matching partner) url untouched");
       assertEq(frjK.verification_status, "verified", "apply-recheck: fr-j (matching partner) status untouched");
+
+      // (8) ns-i: proposed fix failed its re-check because knowledge_email is
+      // null — zero independent evidence beyond the aggregator guard — so it
+      // is refused (round 2 fix), NOT applied, stamped instead. This proves
+      // the "refuse when knowledge_email is null/empty" decision for
+      // circular_scramble_detected actually happens end-to-end (not just at
+      // the recheckProposedFix pure-function level — see unit-b3c below).
+      const nsiAgent = byId(afterApply.agents, "ns-i");
+      const nsiK = byId(afterApply.knowledge, "ns-i");
+      assertEq(nsiAgent.url, "https://papagard.no", "apply-recheck: ns-i.agents.url UNCHANGED (fix was refused — null email)");
+      assertEq(nsiK.verification_status, "review_required", "apply-recheck: ns-i verification_status UNCHANGED (fix was refused)");
+      assertTrue(!!nsiK.review_required_last_audited_at, "apply-recheck: ns-i stamped instead of fixed");
+      assertTrue(applyResult.body.failed_recheck.includes("ns-i"), "apply-recheck: ns-i reported in failed_recheck");
+      assertTrue(!applyResult.body.applied.some((a: any) => a.agent_id === "ns-i"), "apply-recheck: ns-i NOT in applied[]");
+
+      // ns-j (the matching partner, 'verified') must be completely untouched.
+      const nsjAgent = byId(afterApply.agents, "ns-j");
+      const nsjK = byId(afterApply.knowledge, "ns-j");
+      assertEq(nsjAgent.url, "https://papagard.no", "apply-recheck: ns-j (matching partner) url untouched");
+      assertEq(nsjK.verification_status, "verified", "apply-recheck: ns-j (matching partner) status untouched");
 
       // ═══ (7) Multi-cycle backoff simulation ═════════════════════════════
       const { pickReviewQueueBatch } = require("../agents/lokal-agent-verifier");

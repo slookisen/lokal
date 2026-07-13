@@ -267,27 +267,87 @@ function readFieldProvenance(db: any, agentId: string): Record<string, unknown> 
  * evidence that was not itself used to derive the proposed value, so this
  * can actually fail.
  *
- * BLOCKER 2 fix: the previous implementation called
- * domainCoherenceCheck(fix.new_value, r.knowledge_website, r.knowledge_email)
- * (or the website-branch mirror) — but fix.new_value IS r.knowledge_website
- * (resp. r.agent_url) by construction (see classifyAgent's two proposed_fix
- * sites), so the url/website leg of that check compared a value against
- * itself and could never fail; only the email leg ever did any real work.
- * This version:
- *   (1) never re-derives a value from the fix itself to check against — it
- *       checks the proposed value against the agent's own STORED email only
- *       (domainCoherenceCheck(proposed, null, email)), which is independent
- *       signal not used anywhere in either proposed_fix computation; and
- *   (2) rejects outright if the proposed value itself resolves to a known
- *       directory/aggregator/shared-hosting host — defense in depth
- *       alongside the BLOCKER 1 classifier-level guard: a correction must
- *       never resolve TO an aggregator domain, regardless of how it was
- *       derived.
+ * BLOCKER 2 fix, round 1 (commit 57fcd51): the previous implementation
+ * called domainCoherenceCheck(fix.new_value, r.knowledge_website,
+ * r.knowledge_email) (or the website-branch mirror) — but fix.new_value IS
+ * r.knowledge_website (resp. r.agent_url) by construction (see
+ * classifyAgent's two proposed_fix sites), so the url/website leg of that
+ * check compared a value against itself and could never fail.
+ *
+ * BLOCKER 2 fix, round 2 (this commit): round 1 only closed the hole for
+ * circular_scramble_detected — it left the SAME tautology one level up in
+ * stale_knowledge_website. There, fix.new_value IS agents.url, and
+ * classifyAgent's stale_knowledge_website branch is only reached AFTER
+ * domainCoherenceCheck(agent.url, null, agent.email) has ALREADY returned
+ * coherent:true as its precondition (see the ownCoherence check above). With
+ * r.knowledge_email === agent.email, re-running
+ * domainCoherenceCheck(fix.new_value, null, r.knowledge_email) for this
+ * branch is bit-for-bit the SAME call over the SAME inputs — mathematically
+ * incapable of ever rejecting anything here. It was the original bug,
+ * relocated rather than fixed.
+ *
+ * There is no independent, already-existing signal in this schema to
+ * re-verify a stale_knowledge_website fix against instead (checked: no
+ * curated_fields_lock / field-level provenance-lock concept exists anywhere
+ * in field_provenance — see readFieldProvenance below; verified absent, not
+ * merely unused). So the two classifications are handled differently, and
+ * DELIBERATELY do not share a code path:
+ *
+ *   - circular_scramble_detected: fix.new_value is r.knowledge_website,
+ *     which was NEVER checked against this agent's own email anywhere in
+ *     classifyAgent — checking it here against r.knowledge_email is
+ *     genuine independent evidence, and can genuinely fail.
+ *
+ *   - stale_knowledge_website: there is nothing independent left to check.
+ *     This branch's safety comes ENTIRELY from the classifier precondition
+ *     (agents.url already proven internally coherent + non-aggregator) —
+ *     the "fix" just propagates an already-validated value into a second
+ *     column, it asserts nothing new. We deliberately do NOT call
+ *     domainCoherenceCheck again here (that would silently reintroduce the
+ *     tautology) and we do NOT frame this as "recheck passed" — there is no
+ *     recheck for this branch, only the aggregator guard below plus the
+ *     classifier's own precondition.
+ *
+ * Both branches keep the isAggregatorHost guard — defense in depth
+ * alongside the BLOCKER 1 classifier-level guard: a correction must never
+ * resolve TO an aggregator/shared-hosting domain, regardless of how it was
+ * derived.
+ *
+ * Null/empty-email gap (round 2 secondary finding): domainCoherenceCheck's
+ * email leg is a no-op when the email is null/empty, so it silently
+ * defaults to coherent:true — degrading "no evidence" into "verified safe".
+ * For circular_scramble_detected, the email check is the ONLY independent
+ * evidence this function has, so a missing email would mean writing a
+ * correction backed by nothing but the aggregator guard. Per this PR's
+ * "correctness > pool size, don't guess" stance (see the file-header
+ * non-goals), we refuse rather than guess: a missing/empty knowledge_email
+ * on this branch is treated as insufficient independent evidence, and the
+ * caller (the sweep route) falls back to stampReviewRequiredAudited instead
+ * of writing. For stale_knowledge_website, email was never part of this
+ * function's evidence to begin with (see above) — a missing email changes
+ * nothing there, by design, not by accident.
  */
 export function recheckProposedFix(r: ReconciliationAgentResult, fix: ProposedFix): boolean {
   const proposed = fix.new_value;
   if (isAggregatorHost(proposed)) return false;
-  return domainCoherenceCheck(proposed, null, r.knowledge_email).coherent;
+
+  if (r.classification === "circular_scramble_detected") {
+    const hasIndependentEmail = !!(r.knowledge_email && r.knowledge_email.trim());
+    if (!hasIndependentEmail) return false; // no independent evidence at all — refuse, don't guess
+    return domainCoherenceCheck(proposed, null, r.knowledge_email).coherent;
+  }
+
+  if (r.classification === "stale_knowledge_website") {
+    // No independent recheck is possible OR needed here (see doc comment
+    // above) — safety comes from the classifier precondition, not from
+    // this function. Email presence/absence is irrelevant to this branch.
+    return true;
+  }
+
+  // manual_review_needed never carries a proposed_fix in current callers,
+  // so this function is never invoked for it — but fail closed rather than
+  // silently accept an unrecognized classification if that ever changes.
+  return false;
 }
 
 /**
