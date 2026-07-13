@@ -106,7 +106,7 @@ export function runOpplevelserDiscoverTagsTests(opts: { log?: boolean } = {}): P
       const dbFactory = require("../database/db-factory") as typeof import("../database/db-factory");
       dbFactory.__resetDbFactoryForTesting();
       const expStore = require("../services/experience-store") as typeof import("../services/experience-store");
-      dbFactory.getDb("experiences");
+      const db = dbFactory.getDb("experiences");
 
       // Fixture: a free (price_from=0), verified Oslo experience — must
       // derive the "gratis" and "familievennlig" tags (age_suitability
@@ -115,13 +115,19 @@ export function runOpplevelserDiscoverTagsTests(opts: { log?: boolean } = {}): P
         navn: "Oslo Friluft AS", fylke: "Oslo", kommune: "Oslo",
         brreg_verified: 1, brreg_active: 1, verification_status: "verified",
       });
-      expStore.createExperience({
+      const experienceId = expStore.createExperience({
         title: "Gratis byvandring i Oslo", provider_id: providerId,
         provider_match_status: "matched", kommune: "Oslo", fylke: "Oslo",
         verification_status: "verified", confidence: "high",
         price_from: 0, price_band: "gratis",
         age_suitability: "family", indoor_outdoor: "outdoor",
       });
+      // title_no is populated by a separate backfill (createExperience never
+      // writes it — see experience-store.ts's INSERT column list), so it's
+      // set here the same way orch-pr-titleno-render's fixture does: a raw
+      // UPDATE against the real db handle.
+      const TITLE_NO = "Gratis byvandring i Oslo sentrum";
+      db.prepare("UPDATE experiences SET title_no = ? WHERE id = ?").run(TITLE_NO, experienceId);
 
       // ── REST GET /api/opplevelser/discover ──────────────────────────
       const opplevelserRouter = (require("./opplevelser") as typeof import("./opplevelser")).default as any;
@@ -133,6 +139,7 @@ export function runOpplevelserDiscoverTagsTests(opts: { log?: boolean } = {}): P
       assertTrue(Array.isArray(row.tags), "a4: result row carries a tags array");
       assertTrue(row.tags.includes("gratis"), "a5: tags includes 'gratis' (price_from=0)");
       assertTrue(row.tags.includes("familievennlig"), "a6: tags includes 'familievennlig' (age_suitability=familie)");
+      assertEq(row.title_no, TITLE_NO, "a7: result row carries the backfilled title_no value");
 
       // ── OpenAPI Experience schema ────────────────────────────────────
       const { getExperiencesOpenapi } = require("../services/experiences-openapi") as typeof import("../services/experiences-openapi");

@@ -171,6 +171,7 @@ router.get("/discover", (req: Request, res: Response) => {
         id: e.id,
         slug: e.slug,
         title: e.title,
+        title_no: e.title_no,
         category: e.category,
         fylke: e.fylke,
         kommune: e.kommune,
