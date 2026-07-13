@@ -380,6 +380,90 @@ export function runAdminDomainCoherenceSweepTests(
       else process.env.DOMAIN_RECONCILIATION_PARKING_DISABLED = prevParkingDisabled;
     }
 
+    // ── ONE-DIRECTIONAL scramble overlap (separate, isolated DB) ─────────
+    // Regression test for a real prod finding, not a hypothetical: probing
+    // the deployed sweep against production surfaced Solheim Kjøtt
+    // (agents.url=bi1.no, website=solheimkjott.no — its website is ALREADY
+    // correct) whose agents.url collides with a DIFFERENT agent's
+    // (Bi 1 Bigård) website. That's the same shape as the 2026-07-05
+    // 5-agent circular-scramble incident, but the strict-reciprocal check
+    // (A's url==B's website AND B's url==A's website) missed it because
+    // Bi 1 Bigård's OWN agents.url does not equal Solheim's website — the
+    // overlap only holds in ONE direction. Under the original logic,
+    // Solheim would have been "auto-fixed" by overwriting its already-
+    // correct website with the still-scrambled agents.url host — actively
+    // re-corrupting good data. This fixture reproduces that exact shape
+    // with two fresh agents (no shared state with the block above) and
+    // asserts both land in circular_scramble_candidates, neither is
+    // auto-fixed, and the one with an already-correct website is not
+    // overwritten by apply.
+    {
+      const prevDb2 = initMod.getDb();
+      const testKey2 = "admin-domain-coherence-onedir-test-key";
+      const prevAdminKey2 = process.env.ADMIN_KEY;
+      process.env.ADMIN_KEY = testKey2;
+      const db2 = new Database(":memory:");
+      try {
+        initMod.__setDbForTesting(db2 as any);
+        initMod.__initSchemaForTesting(db2 as any);
+
+        const insertAgent2 = db2.prepare(
+          `INSERT INTO agents (id, name, description, provider, contact_email, url, role, api_key, umbrella_type)
+           VALUES (?, ?, 'test agent', 'test', 'x@example.com', ?, 'producer', ?, NULL)`,
+        );
+        const insertKnowledge2 = db2.prepare(
+          `INSERT INTO agent_knowledge (agent_id, website, email, about, field_provenance, verification_status, verification_review_reason)
+           VALUES (?, ?, NULL, 'A test farm shop', '{}', 'review_required', '{}')`,
+        );
+
+        // agent-onedir-a's REAL site is onedir-b-real.no (matches agent-onedir-b's
+        // agents.url) — its OWN website field (onedir-a-stale.no) is stale/wrong
+        // and does not match anyone else in this fixture.
+        insertAgent2.run("agent-onedir-a", "OneDirA AS", "https://onedir-b-real.no", "key-onedir-a");
+        insertKnowledge2.run("agent-onedir-a", "https://onedir-a-stale.no");
+        // agent-onedir-b's website is ALREADY CORRECT (matches its own real
+        // identity conceptually) but happens to equal agent-onedir-a's
+        // agents.url host — the one-directional collision.
+        insertAgent2.run("agent-onedir-b", "OneDirB AS", "https://onedir-a-stale.no", "key-onedir-b");
+        insertKnowledge2.run("agent-onedir-b", "https://onedir-b-real.no");
+
+        delete require.cache[require.resolve("./admin-domain-coherence")];
+        const routeMod2 = require("./admin-domain-coherence");
+        const router2 = routeMod2.default;
+
+        function post2(body: any): Promise<RouteResult> {
+          return callRoute(router2, {
+            method: "POST",
+            url: "/",
+            headers: { "content-type": "application/json", "x-admin-key": testKey2 },
+            body,
+          });
+        }
+
+        let r = await post2({});
+        assertEq(r.status, 200, "dc-49: one-directional fixture dry-run -> 200");
+        const oneDirIds = r.body.circular_scramble_candidates.map((a: any) => a.agent_id).sort();
+        assertEq(oneDirIds, ["agent-onedir-a", "agent-onedir-b"],
+          "dc-50: a ONE-DIRECTIONAL host overlap (not a strict reciprocal pair) still flags both agents as scramble candidates");
+        assertTrue(!r.body.auto_fixable.some((a: any) => a.agent_id === "agent-onedir-b"),
+          "dc-51: the agent whose website is already correct is NOT auto-fixed despite the incoherence check flagging it");
+        assertTrue(!r.body.auto_fixable.some((a: any) => a.agent_id === "agent-onedir-a"),
+          "dc-52: the other side of the one-directional overlap is also excluded from auto_fixable");
+
+        r = await post2({ apply: true });
+        const bRow = db2.prepare("SELECT website FROM agent_knowledge WHERE agent_id = 'agent-onedir-b'").get() as { website: string };
+        assertEq(bRow.website, "https://onedir-b-real.no",
+          "dc-53: apply does NOT overwrite the already-correct website with the scrambled agents.url host");
+        const aRow = db2.prepare("SELECT website FROM agent_knowledge WHERE agent_id = 'agent-onedir-a'").get() as { website: string };
+        assertEq(aRow.website, "https://onedir-a-stale.no",
+          "dc-54: apply does not touch the other scramble-candidate's website either");
+      } finally {
+        initMod.__setDbForTesting(prevDb2);
+        if (prevAdminKey2 === undefined) delete process.env.ADMIN_KEY;
+        else process.env.ADMIN_KEY = prevAdminKey2;
+      }
+    }
+
     return { passed, failed, failures };
   })();
 }
