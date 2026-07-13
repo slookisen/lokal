@@ -416,16 +416,26 @@ export function runAdminDomainCoherenceSweepTests(
            VALUES (?, ?, NULL, 'A test farm shop', '{}', 'review_required', '{}')`,
         );
 
-        // agent-onedir-a's REAL site is onedir-b-real.no (matches agent-onedir-b's
-        // agents.url) — its OWN website field (onedir-a-stale.no) is stale/wrong
-        // and does not match anyone else in this fixture.
-        insertAgent2.run("agent-onedir-a", "OneDirA AS", "https://onedir-b-real.no", "key-onedir-a");
-        insertKnowledge2.run("agent-onedir-a", "https://onedir-a-stale.no");
-        // agent-onedir-b's website is ALREADY CORRECT (matches its own real
-        // identity conceptually) but happens to equal agent-onedir-a's
-        // agents.url host — the one-directional collision.
-        insertAgent2.run("agent-onedir-b", "OneDirB AS", "https://onedir-a-stale.no", "key-onedir-b");
-        insertKnowledge2.run("agent-onedir-b", "https://onedir-b-real.no");
+        // agent-onedir-scrambled-url (Solheim-shaped): its agents.url is the
+        // SCRAMBLED one (wrongly points at the OTHER agent's real domain,
+        // shared-collision-host.no) but its OWN knowledge.website is ALREADY
+        // CORRECT (onedir-scrambled-url-actual-site.no) and must never be
+        // overwritten.
+        insertAgent2.run("agent-onedir-scrambled-url", "OneDirScrambledUrl AS", "https://shared-collision-host.no", "key-onedir-a");
+        insertKnowledge2.run("agent-onedir-scrambled-url", "https://onedir-scrambled-url-actual-site.no");
+        // agent-onedir-wrong-website (Bi1-shaped): its OWN agents.url is its
+        // real, correct domain, but its knowledge.website is wrong — it
+        // holds the SAME host (shared-collision-host.no) that the OTHER
+        // agent's (scrambled) agents.url points at. Verified this pair is
+        // genuinely ONE-DIRECTIONAL: agent-onedir-wrong-website's agentHost
+        // (onedir-wrong-website-actual-site.no) does NOT equal
+        // agent-onedir-scrambled-url's websiteHost
+        // (onedir-scrambled-url-actual-site.no) — only the reverse
+        // direction (wrong-website's website == scrambled-url's agents.url)
+        // holds. A strict-reciprocal check (PR #251's original logic) would
+        // have missed this pair entirely.
+        insertAgent2.run("agent-onedir-wrong-website", "OneDirWrongWebsite AS", "https://onedir-wrong-website-actual-site.no", "key-onedir-b");
+        insertKnowledge2.run("agent-onedir-wrong-website", "https://shared-collision-host.no");
 
         delete require.cache[require.resolve("./admin-domain-coherence")];
         const routeMod2 = require("./admin-domain-coherence");
@@ -443,20 +453,20 @@ export function runAdminDomainCoherenceSweepTests(
         let r = await post2({});
         assertEq(r.status, 200, "dc-49: one-directional fixture dry-run -> 200");
         const oneDirIds = r.body.circular_scramble_candidates.map((a: any) => a.agent_id).sort();
-        assertEq(oneDirIds, ["agent-onedir-a", "agent-onedir-b"],
+        assertEq(oneDirIds, ["agent-onedir-scrambled-url", "agent-onedir-wrong-website"],
           "dc-50: a ONE-DIRECTIONAL host overlap (not a strict reciprocal pair) still flags both agents as scramble candidates");
-        assertTrue(!r.body.auto_fixable.some((a: any) => a.agent_id === "agent-onedir-b"),
+        assertTrue(!r.body.auto_fixable.some((a: any) => a.agent_id === "agent-onedir-scrambled-url"),
           "dc-51: the agent whose website is already correct is NOT auto-fixed despite the incoherence check flagging it");
-        assertTrue(!r.body.auto_fixable.some((a: any) => a.agent_id === "agent-onedir-a"),
+        assertTrue(!r.body.auto_fixable.some((a: any) => a.agent_id === "agent-onedir-wrong-website"),
           "dc-52: the other side of the one-directional overlap is also excluded from auto_fixable");
 
         r = await post2({ apply: true });
-        const bRow = db2.prepare("SELECT website FROM agent_knowledge WHERE agent_id = 'agent-onedir-b'").get() as { website: string };
-        assertEq(bRow.website, "https://onedir-b-real.no",
-          "dc-53: apply does NOT overwrite the already-correct website with the scrambled agents.url host");
-        const aRow = db2.prepare("SELECT website FROM agent_knowledge WHERE agent_id = 'agent-onedir-a'").get() as { website: string };
-        assertEq(aRow.website, "https://onedir-a-stale.no",
-          "dc-54: apply does not touch the other scramble-candidate's website either");
+        const scrambledUrlRow = db2.prepare("SELECT website FROM agent_knowledge WHERE agent_id = 'agent-onedir-scrambled-url'").get() as { website: string };
+        assertEq(scrambledUrlRow.website, "https://onedir-scrambled-url-actual-site.no",
+          "dc-53: apply does NOT overwrite the already-correct website with the scrambled agents.url host (the actual bug found in prod)");
+        const wrongWebsiteRow = db2.prepare("SELECT website FROM agent_knowledge WHERE agent_id = 'agent-onedir-wrong-website'").get() as { website: string };
+        assertEq(wrongWebsiteRow.website, "https://shared-collision-host.no",
+          "dc-54: apply does not touch the other scramble-candidate's website either (report-only, even though this one genuinely is wrong)");
       } finally {
         initMod.__setDbForTesting(prevDb2);
         if (prevAdminKey2 === undefined) delete process.env.ADMIN_KEY;
