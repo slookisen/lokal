@@ -2537,7 +2537,10 @@ console.log("\n── PR-27: pickReviewQueueBatch unit tests ──");
       outreach_eligible_at TEXT,
       last_verified_at TEXT, last_http_check_at TEXT, last_http_status INTEGER,
       field_provenance TEXT NOT NULL DEFAULT '{}',
-      verification_review_reason TEXT NOT NULL DEFAULT '{}'
+      verification_review_reason TEXT NOT NULL DEFAULT '{}',
+      domain_reconciliation_checked_at TEXT,
+      domain_reconciliation_outcome TEXT,
+      domain_reconciliation_reason_snapshot TEXT
     );
   `);
   db.prepare("INSERT INTO agents (id,name,role,city) VALUES ('rq-unv','U','producer','Oslo'),('rq-pen','P','producer','Oslo'),('rq-ver','V','producer','Oslo'),('rq-rev1','R1','producer','Oslo'),('rq-rev2','R2','producer','Oslo'),('rq-din','D','producer','Oslo'),('rq-opt','O','producer','Oslo')").run();
@@ -21636,6 +21639,7 @@ console.log("\n── orch-pr-14: MCP discovery product_id surfacing ──");
   try { await _retentionRollupPromise; } catch { /* errors already pushed to failures */ }
   try { await _pageEvidenceCrawlPromise; } catch { /* errors already pushed to failures */ }
   try { await _homepageSelectorParkingPromise; } catch { /* errors already pushed to failures */ }
+  try { await _domainCoherenceSweepPromise; } catch { /* errors already pushed to failures */ }
   // relax-envelope tests are synchronous (pure validateEnvelope() unit test) — no promise needed
   // PR-109 tests are synchronous (IIFE) — no promise needed
   // Drop pre-existing intg failures (unmasked by awaiting) — they predate M2
@@ -27053,6 +27057,44 @@ const _homepageSelectorParkingPromise: Promise<void> = new Promise<void>(r => {
     failures.push("homepage-selector-parking: unexpected error: " + String(err?.message || err));
   } finally {
     _homepageSelectorParkingResolve();
+  }
+})();
+
+// ═══════════════════════════════════════════════════════════════════════
+// dev-request 2026-07-12-rfb-enrichment-pool-refill-and-waste-reduction
+// (item 3): POST /admin/verifier/domain-coherence-sweep
+// (src/routes/admin-domain-coherence.ts) — reuses domainCoherenceCheck to
+// classify the review_required cohort into auto_fixable / manual_review_needed
+// / circular_scramble_candidates, dry-run by default, apply:true writes only
+// the auto_fixable bucket + parks everything else (domain_reconciliation_*
+// columns), and pickReviewQueueBatch (lokal-agent-verifier.ts) honors the
+// same parking backoff. Swaps the shared getDb() singleton (own dedicated
+// test file, in-memory prod-schema DB) — mirrors the homepage-selector-
+// parking block immediately above, so it must run strictly after it;
+// _homepageSelectorParkingPromise is the current tail of that serial chain.
+let _domainCoherenceSweepResolve: () => void = () => {};
+const _domainCoherenceSweepPromise: Promise<void> = new Promise<void>(r => {
+  _domainCoherenceSweepResolve = r;
+});
+
+(async () => {
+  await Promise.allSettled([_homepageSelectorParkingPromise]);
+  await new Promise(r => setImmediate(r));
+
+  console.log("\n── dev-request 2026-07-12 item 3: domain-coherence sweep ──");
+  try {
+    const { runAdminDomainCoherenceSweepTests } = require("../src/routes/admin-domain-coherence.test") as
+      typeof import("../src/routes/admin-domain-coherence.test");
+    const dcs = await runAdminDomainCoherenceSweepTests({ log: false });
+    passed += dcs.passed;
+    failed += dcs.failed;
+    for (const f of dcs.failures) failures.push("domain-coherence-sweep: " + f);
+    console.log(`  domain-coherence-sweep: ${dcs.passed} passed, ${dcs.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("domain-coherence-sweep: unexpected error: " + String(err?.message || err));
+  } finally {
+    _domainCoherenceSweepResolve();
   }
 })();
 

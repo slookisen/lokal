@@ -309,7 +309,26 @@ export function pickBatch(db: any, limit = 30): any[] {
 // because their last_verified_at is recent. This variant scopes the
 // pool to just those rows, oldest-first, so the caller can drain the
 // review queue quickly.
+//
+// dev-request 2026-07-12-rfb-enrichment-pool-refill-and-waste-reduction
+// (item 3): agents the domain-coherence sweep already looked at and could
+// not confidently fix (coherent-but-review_required-for-another-reason,
+// manual_review_needed, or circular_scramble_candidate) are excluded for
+// 30 days — mirrors PR #248's HOMEPAGE_PARKING_DISABLED idiom in
+// marketplace.ts's homepage-provenance-batch auto-select, so this daily
+// drain stops re-processing the same 0-state-change cohort every run.
+// The exclusion only holds while nothing has changed: if
+// verification_review_reason differs from the snapshot taken at
+// check-time, the agent is NOT silenced (something new happened).
+// Env read at call time so the rollback flag works without a restart.
 export function pickReviewQueueBatch(db: any, limit = 30): any[] {
+  const parkingExclusion = process.env.DOMAIN_RECONCILIATION_PARKING_DISABLED === "true"
+    ? ""
+    : `AND (
+         k.domain_reconciliation_checked_at IS NULL
+         OR k.domain_reconciliation_checked_at <= datetime('now','-30 days')
+         OR k.verification_review_reason != COALESCE(k.domain_reconciliation_reason_snapshot, '')
+       )`;
   return db
     .prepare(
       `SELECT a.id, a.name, a.url AS agent_url, a.city AS location_city,
@@ -320,6 +339,7 @@ export function pickReviewQueueBatch(db: any, limit = 30): any[] {
          FROM agents a
    INNER JOIN agent_knowledge k ON k.agent_id = a.id
         WHERE k.verification_status IN ('review_required', 'data_insufficient')
+          ${parkingExclusion}
      ORDER BY COALESCE(k.last_verified_at, '1970-01-01') ASC
         LIMIT ?`
     )
