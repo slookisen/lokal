@@ -32,12 +32,14 @@
 //     Email is a weaker signal (per domainCoherenceCheck's own comments) —
 //     a mismatch here doesn't tell you which URL, if either, is wrong.
 //     Report-only, never written.
-//   - circular_scramble_candidates: a purely mechanical cross-reference
-//     within the incoherent set of this cohort — agent A's agents.url host
-//     equals agent B's knowledge.website host AND vice versa. Mirrors the
-//     5-agent scramble found manually on 07-05. Report-only (a human/future
-//     slice should confirm before swapping two live agents' URLs);
-//     agents.url is NEVER written by this endpoint.
+//   - circular_scramble_candidates: a host-OVERLAP cross-reference within
+//     the incoherent set of this cohort — flags an agent whenever its
+//     agents.url host equals a DIFFERENT agent's knowledge.website host
+//     (checked in both directions, not requiring a strict reciprocal pair —
+//     a longer N-agent scrambled chain only overlaps one-directionally at
+//     each link). Mirrors the 5-agent scramble found manually on 07-05.
+//     Report-only (a human/future slice should confirm before swapping two
+//     live agents' URLs); agents.url is NEVER written by this endpoint.
 //
 // Apply mode (apply:true in body) writes ONLY the auto_fixable bucket.
 // Every other agent this sweep looked at (coherent, manual_review_needed,
@@ -180,38 +182,53 @@ router.post("/", (req: Request, res: Response) => {
       }
     }
 
-    // Purely mechanical cross-reference within the incoherent set: agent A's
-    // agents.url host equals agent B's knowledge.website host AND vice versa.
+    // Cross-reference within the incoherent set for host OVERLAP, not just
+    // strict reciprocal pairs. A strict-reciprocal check (A's agents.url ==
+    // B's website AND B's agents.url == A's website) only catches clean
+    // 2-agent swaps — it misses longer scrambled chains (3+ agents whose
+    // agents.url/website values got shuffled around a cycle), which is
+    // exactly the shape of the 2026-07-05 incident's "5 agents circularly
+    // scrambled" finding: re-probing prod after this endpoint shipped found
+    // Solheim Kjøtt (agents.url=bi1.no, website=solheimkjott.no — its website
+    // is ALREADY correct) whose agents.url collides with Bi 1 Bigård's
+    // website (bi1.no) — a ONE-DIRECTIONAL overlap the strict-reciprocal
+    // check missed, because Bi 1 Bigård's own agents.url (arvolanes.com)
+    // does not equal Solheim's website. Auto-"fixing" Solheim under the old
+    // logic would have overwritten its already-correct website with the
+    // wrong (still-scrambled) host from agents.url — actively re-corrupting
+    // good data. Any host that appears as one agent's agents.url AND
+    // another (different) agent's knowledge.website anywhere in this
+    // cohort is contested — neither side is auto-fixed.
     const scrambledIds = new Set<string>();
     const circular_scramble_candidates: ScrambleCandidate[] = [];
+    const pairedWith = new Map<string, { id: string; name: string }>();
     for (let i = 0; i < incoherent.length; i++) {
-      for (let j = i + 1; j < incoherent.length; j++) {
+      for (let j = 0; j < incoherent.length; j++) {
+        if (i === j) continue;
         const a = incoherent[i]!;
         const b = incoherent[j]!;
-        if (
-          a.agentHost && b.websiteHost && a.agentHost === b.websiteHost &&
-          b.agentHost && a.websiteHost && b.agentHost === a.websiteHost
-        ) {
+        // a's stored website host is contested if it equals a DIFFERENT
+        // agent's real (agents.url) host — i.e. a's website may actually
+        // belong to b.
+        if (a.websiteHost && b.agentHost && a.websiteHost === b.agentHost) {
           scrambledIds.add(a.row.agent_id);
           scrambledIds.add(b.row.agent_id);
-          circular_scramble_candidates.push({
-            agent_id: a.row.agent_id,
-            name: a.row.name,
-            agent_url: a.row.agent_url,
-            current_website: a.row.website,
-            paired_agent_id: b.row.agent_id,
-            paired_agent_name: b.row.name,
-          });
-          circular_scramble_candidates.push({
-            agent_id: b.row.agent_id,
-            name: b.row.name,
-            agent_url: b.row.agent_url,
-            current_website: b.row.website,
-            paired_agent_id: a.row.agent_id,
-            paired_agent_name: a.row.name,
-          });
+          if (!pairedWith.has(a.row.agent_id)) pairedWith.set(a.row.agent_id, { id: b.row.agent_id, name: b.row.name });
+          if (!pairedWith.has(b.row.agent_id)) pairedWith.set(b.row.agent_id, { id: a.row.agent_id, name: a.row.name });
         }
       }
+    }
+    for (const entry of incoherent) {
+      if (!scrambledIds.has(entry.row.agent_id)) continue;
+      const paired = pairedWith.get(entry.row.agent_id)!;
+      circular_scramble_candidates.push({
+        agent_id: entry.row.agent_id,
+        name: entry.row.name,
+        agent_url: entry.row.agent_url,
+        current_website: entry.row.website,
+        paired_agent_id: paired.id,
+        paired_agent_name: paired.name,
+      });
     }
 
     const auto_fixable: AutoFixable[] = [];
