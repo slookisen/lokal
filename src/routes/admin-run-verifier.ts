@@ -87,7 +87,11 @@ router.post("/", async (req: Request, res: Response) => {
   try {
     const batchResult = await runVerifierBatch(
       reprocessReviewQueue
-        ? { batchSize, pickFn: pickReviewQueueBatch }
+        // dev-request 2026-07-12-rfb-enrichment-pool-refill-and-waste-reduction
+        // item 3 (2026-07-13): thread the existing `force` flag through so
+        // ?force=1 also bypasses pickReviewQueueBatch's 21-day audited-backoff
+        // exclusion, not just the night-window gate above.
+        ? { batchSize, pickFn: pickReviewQueueBatch, force: !!force }
         : biasGrowth
           ? { batchSize, pickFn: pickBatchBiased }
           : { batchSize }

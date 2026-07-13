@@ -309,7 +309,19 @@ export function pickBatch(db: any, limit = 30): any[] {
 // because their last_verified_at is recent. This variant scopes the
 // pool to just those rows, oldest-first, so the caller can drain the
 // review queue quickly.
-export function pickReviewQueueBatch(db: any, limit = 30): any[] {
+//
+// dev-request 2026-07-12-rfb-enrichment-pool-refill-and-waste-reduction,
+// item 3 (2026-07-13): a 21-day backoff excludes rows whose
+// review_required_last_audited_at (stamped by POST /admin/domain-
+// reconciliation-sweep on every audited-with-no-fix visit) is recent —
+// this is what stops the daily PR-97 sweep from re-draining the same
+// ~84-agent 0-state-change cohort every run. Pass force=true (wired from
+// /admin/run-verifier's existing ?force=1 flag) to bypass the exclusion.
+export function pickReviewQueueBatch(db: any, limit = 30, force = false): any[] {
+  const backoffClause = force
+    ? ""
+    : `AND (k.review_required_last_audited_at IS NULL
+            OR k.review_required_last_audited_at <= datetime('now', '-21 days'))`;
   return db
     .prepare(
       `SELECT a.id, a.name, a.url AS agent_url, a.city AS location_city,
@@ -320,6 +332,7 @@ export function pickReviewQueueBatch(db: any, limit = 30): any[] {
          FROM agents a
    INNER JOIN agent_knowledge k ON k.agent_id = a.id
         WHERE k.verification_status IN ('review_required', 'data_insufficient')
+          ${backoffClause}
      ORDER BY COALESCE(k.last_verified_at, '1970-01-01') ASC
         LIMIT ?`
     )
@@ -703,7 +716,19 @@ export async function runVerifierBatch(opts: {
   headProbe?: ((url: string, timeoutMs?: number) => Promise<number | null>) | null;
   // PR-27: Optional override for the candidate-picker. Defaults to
   // pickBatch. Pass pickReviewQueueBatch to drain the review queue.
-  pickFn?: (db: any, limit?: number) => any[];
+  // dev-request 2026-07-12-rfb-enrichment-pool-refill-and-waste-reduction
+  // item 3: pickFn's type accepts an optional 3rd `force` param so
+  // pickReviewQueueBatch's 21-day backoff-bypass can be threaded through
+  // (see the `force` opt below). Pickers that don't use it (pickBatch,
+  // pickBatchBiased) simply ignore the extra argument.
+  // `force` typed `any` here (not `boolean`) so pickers with an unrelated
+  // 3rd param (pickBatchBiased's growthRatio: number) stay structurally
+  // assignable to this option — only pickReviewQueueBatch interprets it.
+  pickFn?: (db: any, limit?: number, force?: any) => any[];
+  // Bypasses pickReviewQueueBatch's 21-day audited-backoff exclusion — wired
+  // from /admin/run-verifier's existing ?force=1 flag (item 3, 2026-07-13).
+  // Has no effect on pickBatch / pickBatchBiased.
+  force?: boolean;
 }): Promise<{
   run_id: string;
   started_at: string;
@@ -716,7 +741,7 @@ export async function runVerifierBatch(opts: {
   const runId = `run-${startedAt.replace(/[:.]/g, "").slice(0, 15)}-lokal-agent-verifier-rfb`;
 
   const pickFn = opts.pickFn ?? pickBatch;
-  const candidates = pickFn(db, limit);
+  const candidates = pickFn(db, limit, opts.force ?? false);
   const results: VerifierResult[] = [];
 
   for (const agent of candidates) {

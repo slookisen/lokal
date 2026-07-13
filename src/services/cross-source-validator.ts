@@ -708,7 +708,13 @@ function stripProtocol(s: string): string {
   return s.replace(/^https?:\/\//i, "").replace(/^\/\//, "");
 }
 
-function hostFromUrlLike(raw: string): string | null {
+// Exported (dev-request 2026-07-12-rfb-enrichment-pool-refill-and-waste-
+// reduction item 3, 2026-07-13): the domain-reconciliation service needs the
+// same host/registrable-domain parsing domainCoherenceCheck uses internally,
+// to cross-match one agent's `agents.url` against ANOTHER agent's
+// `agent_knowledge.website` (the circular-scramble shape). No behavior change
+// — visibility only.
+export function hostFromUrlLike(raw: string): string | null {
   let s = raw.trim();
   if (!s) return null;
   s = stripProtocol(s);
@@ -747,7 +753,8 @@ function hostFromEmail(raw: string): string | null {
 }
 
 // Registrable domain (eTLD+1 with simple heuristics, sufficient for .no).
-function registrableDomain(host: string): string {
+// Exported — see hostFromUrlLike export note above.
+export function registrableDomain(host: string): string {
   const labels = host.split(".").filter(Boolean);
   if (labels.length < 2) return host;
   const lastTwo = labels.slice(-2).join(".");
@@ -936,7 +943,8 @@ function brandTokensSimilar(ta: string, tb: string): boolean {
   return false;
 }
 
-function domainsEquivalent(a: string, b: string): boolean {
+// Exported — see hostFromUrlLike export note above.
+export function domainsEquivalent(a: string, b: string): boolean {
   if (a === b) return true;
   if (collapseDomain(a) === collapseDomain(b)) return true;
   // PR-129: cross-TLD same-brand equality. A producer using the same brand on a

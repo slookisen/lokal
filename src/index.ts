@@ -50,6 +50,7 @@ import adminVerifierSweepStatusRouter from "./routes/admin-verifier-sweep-status
 import ownerPortalRoutes from "./routes/owner-portal";
 import adminAgentAuditRoutes from "./routes/admin-agent-audit";
 import adminVerifierReviewQueueRoutes from "./routes/admin-verifier-review-queue";
+import adminDomainReconciliationRoutes from "./routes/admin-domain-reconciliation";
 import adminKnowledgeRoutes, { pruneUrlsRouter, homepageContentRefreshRouter, descriptionTruncationSweepRouter } from "./routes/admin-knowledge";
 import adminSearchEnrichRoutes from "./routes/admin-search-enrich";
 import adminAffiliationsRoutes from "./routes/admin-affiliations";
@@ -493,6 +494,11 @@ app.use("/admin/verifier/sweep-status", adminLimiter, adminVerifierSweepStatusRo
 // ─── M1: Daniel-only agent audit trail (Phase 5.4a) ──────────
 app.use("/admin/agent-audit", adminLimiter, adminAgentAuditRoutes);
 app.use("/admin/verifier-review-queue", adminLimiter, adminVerifierReviewQueueRoutes);
+// dev-request 2026-07-12-rfb-enrichment-pool-refill-and-waste-reduction item 3
+// (2026-07-13): GET /admin/domain-reconciliation-audit (read-only) + POST
+// /admin/domain-reconciliation-sweep (dry_run default) — systematizes the
+// manual 07-05 domain-incoherence fix over the review_required cohort.
+app.use("/admin", adminLimiter, adminDomainReconciliationRoutes);
 // PR-24 (2026-05-11): enrichment write surface accepts field_provenance
 app.use("/admin/knowledge", adminLimiter, adminKnowledgeRoutes);
 // orch-pr-9 (2026-06-14): dead/junk URL prune — POST /admin/prune-dead-urls

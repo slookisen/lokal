@@ -1084,6 +1084,34 @@ function initSchema(db: Database.Database): void {
     }
   }
 
+  // ─── dev-request 2026-07-12-rfb-enrichment-pool-refill-and-waste-reduction,
+  // item 3 (domain-incoherent reconciliation, 2026-07-13) ────────────────────
+  // review_required_last_audited_at: sliding-backoff timestamp. Stamped by
+  // POST /admin/domain-reconciliation-sweep on every pass over a
+  // review_required/data_insufficient row that yields NO fix (classified
+  // manual_review_needed, or a proposed circular/stale fix that failed its
+  // re-coherence check). pickReviewQueueBatch (lokal-agent-verifier.ts)
+  // excludes any row audited within the last 21 days (unless force=1 is
+  // passed to POST /admin/run-verifier) so the daily PR-97 sweep
+  // (?reprocess_review_queue=1) stops re-draining the same 0-state-change
+  // ~84-agent cohort every run.
+  //
+  // Re-stamped (not just set once): the sweep's own candidate query is NOT
+  // itself backoff-filtered — every call revisits every CURRENT
+  // review_required/data_insufficient row and unconditionally re-stamps any
+  // row that still yields no fix. There is deliberately no "only if null /
+  // only if already parked" conditional here, because that is exactly the
+  // shape of the PR #248 review BLOCKER (the homepage-parking mechanism
+  // self-destructed after one backoff cycle because a still-dead agent's
+  // re-visit failed to refresh the timestamp, so the stale value kept
+  // satisfying the exclusion's `<= now-21d` check forever). Always
+  // overwriting on every no-fix visit avoids that bug shape structurally.
+  try {
+    db.exec(`ALTER TABLE agent_knowledge ADD COLUMN review_required_last_audited_at TEXT`);
+  } catch {
+    // Column already exists — expected after first migration
+  }
+
   // outreach_sent_log — Phase 5 ledger of WHAT we have actually sent
   // through the verify-first pipeline. Empty initially; the WO #9
   // marketing-pool-switch will start writing rows here. CRM threads
