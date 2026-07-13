@@ -1084,6 +1084,32 @@ function initSchema(db: Database.Database): void {
     }
   }
 
+  // ─── dev-request 2026-07-12-rfb-enrichment-pool-refill-and-waste-reduction
+  // (item 3) — domain-coherence reconciliation parking ──────────────────────
+  // domain_reconciliation_checked_at: ISO timestamp of the last
+  //   /admin/verifier/domain-coherence-sweep apply-mode pass that looked at
+  //   this agent and did NOT auto-fix it (coherent / manual_review_needed /
+  //   circular_scramble_candidate outcome).
+  // domain_reconciliation_outcome: 'no_action_needed' | 'manual_review_needed'
+  //   | 'circular_scramble_candidate' — what the sweep decided, for
+  //   observability/debugging.
+  // domain_reconciliation_reason_snapshot: the agent_knowledge.
+  //   verification_review_reason value AT the time of the check, so the
+  //   backoff-exclusion query can tell "still the same problem" (skip) apart
+  //   from "something new happened since" (don't permanently silence —
+  //   re-surface even inside the 30-day window).
+  for (const stmt of [
+    `ALTER TABLE agent_knowledge ADD COLUMN domain_reconciliation_checked_at TEXT`,
+    `ALTER TABLE agent_knowledge ADD COLUMN domain_reconciliation_outcome TEXT`,
+    `ALTER TABLE agent_knowledge ADD COLUMN domain_reconciliation_reason_snapshot TEXT`,
+  ]) {
+    try {
+      db.exec(stmt);
+    } catch {
+      // Column already exists — expected after first migration
+    }
+  }
+
   // outreach_sent_log — Phase 5 ledger of WHAT we have actually sent
   // through the verify-first pipeline. Empty initially; the WO #9
   // marketing-pool-switch will start writing rows here. CRM threads
