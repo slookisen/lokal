@@ -27152,6 +27152,32 @@ const _pendingVerifyParkingPromise: Promise<void> = new Promise<void>(r => {
   }
 })();
 
+// ═══════════════════════════════════════════════════════════════════════
+// orch-pr-20260713-verifier-sweep-parking (second review finding): TZ
+// regression test for the pending_verify re-stamp-eligibility check in
+// applyVerifierOutcome. Spawns its own child `tsx` processes (with
+// TZ=America/New_York / TZ=UTC set) each running its own fully isolated
+// in-memory DB — never touches the shared getDb() singleton in THIS
+// process, so it's a "truly independent" block per the top-of-file
+// comment and can run via runSerial() rather than the explicit
+// resolve/promise handle + Promise.allSettled ordering the
+// singleton-swapping blocks need.
+const _tzParkingPromise = runSerial(async () => {
+  console.log("\n── orch-pr-20260713-verifier-sweep-parking: pending_verify parking TZ regression ──");
+  try {
+    const { runLokalAgentVerifierTzParkingTests } = require("../src/agents/lokal-agent-verifier-tz-parking.test") as
+      typeof import("../src/agents/lokal-agent-verifier-tz-parking.test");
+    const tz = await runLokalAgentVerifierTzParkingTests({ log: false });
+    passed += tz.passed;
+    failed += tz.failed;
+    for (const f of tz.failures) failures.push("tz-parking: " + f);
+    console.log(`  tz-parking: ${tz.passed} passed, ${tz.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("tz-parking: unexpected error: " + String(err?.message || err));
+  }
+});
+
 
 // ── description-junk-guard: isJunkDescription + render-guard wiring ──────────
 // dev-request 2026-07-04-rfb-datakvalitet item 1 (description sanitizer,

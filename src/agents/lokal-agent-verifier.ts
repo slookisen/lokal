@@ -664,40 +664,31 @@ export function applyVerifierOutcome(
       db.prepare(
         `UPDATE agent_knowledge SET pending_verify_no_progress_count = pending_verify_no_progress_count + 1 WHERE agent_id = ?`
       ).run(agentId);
-      const row = db
-        .prepare(
-          `SELECT pending_verify_no_progress_count, pending_verify_parked_since FROM agent_knowledge WHERE agent_id = ?`
-        )
-        .get(agentId) as
-        | { pending_verify_no_progress_count: number; pending_verify_parked_since: string | null }
-        | undefined;
-      if (row && row.pending_verify_no_progress_count >= 3) {
-        // Stamp when not yet parked — or RE-STAMP when the 30-day backoff has
-        // already expired and the re-probe still made no progress. Without
-        // the re-stamp, the stale timestamp keeps satisfying the exclusion
-        // clause's `<= now-30d` forever, so a still-unresolvable agent would
-        // revert to being selected every sweep after its first backoff cycle
-        // (the exact PR #248 review blocker in the homepage-parking
-        // precedent — must not repeat it here).
-        const since = row.pending_verify_parked_since;
-        const expired = since !== null && Date.parse(since) <= Date.now() - 30 * 86_400_000;
-        if (!since || expired) {
-          // Stamp via SQLite's own datetime('now') rather than JS
-          // Date#toISOString(): the backoff comparison in
-          // pickPendingVerifyBatch's parkingExclusion also uses
-          // datetime('now','-30 days'), which emits space-separated
-          // "YYYY-MM-DD HH:MM:SS" (no 'T', no ms, no 'Z'). Mixing formats
-          // made the 30-day window effectively ~31 days (lexicographic
-          // comparison: 'T' > ' ' keeps same-day timestamps ordered
-          // "after" the cutoff until the calendar date itself rolls over)
-          // — using the same format on both sides of the comparison keeps
-          // the window exact. Mirrors stampParking() in
-          // admin-domain-coherence.ts (same bug class, fixed there first).
-          db.prepare(
-            `UPDATE agent_knowledge SET pending_verify_parked_since = datetime('now') WHERE agent_id = ?`
-          ).run(agentId);
-        }
-      }
+      // Stamp when not yet parked — or RE-STAMP when the 30-day backoff has
+      // already expired and the re-probe still made no progress. Without
+      // the re-stamp, the stale timestamp keeps satisfying the exclusion
+      // clause's `<= now-30d` forever, so a still-unresolvable agent would
+      // revert to being selected every sweep after its first backoff cycle
+      // (the exact PR #248 review blocker in the homepage-parking
+      // precedent — must not repeat it here).
+      //
+      // The eligibility check itself is done entirely in SQL (no JS
+      // Date.parse/Date.now() round-trip): a JS-side re-read-then-compare
+      // of the SQL-native "YYYY-MM-DD HH:MM:SS" (no timezone marker)
+      // string is interpreted as LOCAL time by Date.parse per ECMA-262,
+      // while the write side (datetime('now')) and pickPendingVerifyBatch's
+      // read side (datetime('now','-30 days')) are both UTC-native — under
+      // a UTC-behind timezone that JS-side comparison could judge a
+      // SQL-already-expired row as "not yet expired" and silently skip the
+      // re-stamp. Keeping the whole comparison SQL-native (matching
+      // stampParking() in admin-domain-coherence.ts) avoids the mismatch.
+      db.prepare(
+        `UPDATE agent_knowledge
+            SET pending_verify_parked_since = datetime('now')
+          WHERE agent_id = ?
+            AND pending_verify_no_progress_count >= 3
+            AND (pending_verify_parked_since IS NULL OR pending_verify_parked_since <= datetime('now','-30 days'))`
+      ).run(agentId);
     } else {
       db.prepare(
         `UPDATE agent_knowledge SET pending_verify_no_progress_count = 0, pending_verify_parked_since = NULL WHERE agent_id = ?`
