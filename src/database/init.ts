@@ -1110,6 +1110,38 @@ function initSchema(db: Database.Database): void {
     }
   }
 
+  // ─── dev-request 2026-07-12-rfb-enrichment-pool-refill-and-waste-reduction
+  // (item 6 follow-up) — pending_verify no-progress parking ────────────────
+  // pending_verify_no_progress_count: increments every time a re-verification
+  //   of a `pending_verify` agent (via the bulk sweep in
+  //   src/services/verifier-sweep.ts / applyVerifierOutcome) resolves BACK to
+  //   `pending_verify` — i.e. the gate re-fails for the same structural reason
+  //   (deriveVerificationStatus's `!passes` branch) and no new data (email,
+  //   Brreg fix, etc.) was acquired. Any outcome OTHER than `pending_verify`
+  //   (verified / review_required / data_insufficient — real progress) fully
+  //   resets this to 0.
+  // pending_verify_parked_since: stamped once pending_verify_no_progress_count
+  //   reaches 3 consecutive no-progress outcomes — parks the agent out of
+  //   pickPendingVerifyBatch's auto-select for 30 days, same shape as
+  //   PR #248's homepage_fetch_attempts/homepage_unreachable_since idiom in
+  //   marketplace.ts and the domain_reconciliation_checked_at idiom in
+  //   lokal-agent-verifier.ts's pickReviewQueueBatch — this stops the bulk
+  //   sweep from burning wall-clock/compute re-probing website/Brreg
+  //   reachability on a cohort (a real ~817-row prod tail) that is proven
+  //   unresolvable by re-verification alone because it's missing data the
+  //   sweep has no way to acquire (e.g. a missing email). Reset to NULL the
+  //   moment real progress happens (any non-pending_verify outcome).
+  for (const stmt of [
+    `ALTER TABLE agent_knowledge ADD COLUMN pending_verify_no_progress_count INTEGER NOT NULL DEFAULT 0`,
+    `ALTER TABLE agent_knowledge ADD COLUMN pending_verify_parked_since TEXT`,
+  ]) {
+    try {
+      db.exec(stmt);
+    } catch {
+      // Column already exists — expected after first migration
+    }
+  }
+
   // outreach_sent_log — Phase 5 ledger of WHAT we have actually sent
   // through the verify-first pipeline. Empty initially; the WO #9
   // marketing-pool-switch will start writing rows here. CRM threads

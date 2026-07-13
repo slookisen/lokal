@@ -21640,6 +21640,7 @@ console.log("\n── orch-pr-14: MCP discovery product_id surfacing ──");
   try { await _pageEvidenceCrawlPromise; } catch { /* errors already pushed to failures */ }
   try { await _homepageSelectorParkingPromise; } catch { /* errors already pushed to failures */ }
   try { await _domainCoherenceSweepPromise; } catch { /* errors already pushed to failures */ }
+  try { await _pendingVerifyParkingPromise; } catch { /* errors already pushed to failures */ }
   // relax-envelope tests are synchronous (pure validateEnvelope() unit test) — no promise needed
   // PR-109 tests are synchronous (IIFE) — no promise needed
   // Drop pre-existing intg failures (unmasked by awaiting) — they predate M2
@@ -27112,6 +27113,70 @@ const _domainCoherenceSweepPromise: Promise<void> = new Promise<void>(r => {
     _domainCoherenceSweepResolve();
   }
 })();
+
+// ═══════════════════════════════════════════════════════════════════════
+// dev-request 2026-07-12-rfb-enrichment-pool-refill-and-waste-reduction
+// (item 6 follow-up): pending_verify no-progress parking
+// (pending_verify_no_progress_count / pending_verify_parked_since,
+// PENDING_VERIFY_PARKING_DISABLED rollback flag) in
+// src/agents/lokal-agent-verifier.ts (pickPendingVerifyBatch,
+// applyVerifierOutcome) + the pending_verify_parking block on
+// GET /admin/outreach-ready-pool/stats. Swaps the shared getDb() singleton
+// (own dedicated test file, in-memory prod-schema DB) — mirrors the
+// domain-coherence-sweep block immediately above, so it must run strictly
+// after it; _domainCoherenceSweepPromise is the current tail of that serial
+// chain.
+let _pendingVerifyParkingResolve: () => void = () => {};
+const _pendingVerifyParkingPromise: Promise<void> = new Promise<void>(r => {
+  _pendingVerifyParkingResolve = r;
+});
+
+(async () => {
+  await Promise.allSettled([_domainCoherenceSweepPromise]);
+  await new Promise(r => setImmediate(r));
+
+  console.log("\n── dev-request 2026-07-12 item 6 follow-up: pending_verify no-progress parking ──");
+  try {
+    const { runLokalAgentVerifierPendingVerifyParkingTests } = require("../src/agents/lokal-agent-verifier-pending-verify-parking.test") as
+      typeof import("../src/agents/lokal-agent-verifier-pending-verify-parking.test");
+    const pvp = await runLokalAgentVerifierPendingVerifyParkingTests({ log: false });
+    passed += pvp.passed;
+    failed += pvp.failed;
+    for (const f of pvp.failures) failures.push("pending-verify-parking: " + f);
+    console.log(`  pending-verify-parking: ${pvp.passed} passed, ${pvp.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("pending-verify-parking: unexpected error: " + String(err?.message || err));
+  } finally {
+    _pendingVerifyParkingResolve();
+  }
+})();
+
+// ═══════════════════════════════════════════════════════════════════════
+// orch-pr-20260713-verifier-sweep-parking (second review finding): TZ
+// regression test for the pending_verify re-stamp-eligibility check in
+// applyVerifierOutcome. Spawns its own child `tsx` processes (with
+// TZ=America/New_York / TZ=UTC set) each running its own fully isolated
+// in-memory DB — never touches the shared getDb() singleton in THIS
+// process, so it's a "truly independent" block per the top-of-file
+// comment and can run via runSerial() rather than the explicit
+// resolve/promise handle + Promise.allSettled ordering the
+// singleton-swapping blocks need.
+const _tzParkingPromise = runSerial(async () => {
+  console.log("\n── orch-pr-20260713-verifier-sweep-parking: pending_verify parking TZ regression ──");
+  try {
+    const { runLokalAgentVerifierTzParkingTests } = require("../src/agents/lokal-agent-verifier-tz-parking.test") as
+      typeof import("../src/agents/lokal-agent-verifier-tz-parking.test");
+    const tz = await runLokalAgentVerifierTzParkingTests({ log: false });
+    passed += tz.passed;
+    failed += tz.failed;
+    for (const f of tz.failures) failures.push("tz-parking: " + f);
+    console.log(`  tz-parking: ${tz.passed} passed, ${tz.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("tz-parking: unexpected error: " + String(err?.message || err));
+  }
+});
 
 
 // ── description-junk-guard: isJunkDescription + render-guard wiring ──────────
