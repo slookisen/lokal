@@ -268,11 +268,15 @@ router.post("/", (req: Request, res: Response) => {
           | undefined;
         if (!fresh) continue;
         const recheck = domainCoherenceCheck(fresh.agent_url, fresh.website, fresh.email);
-        if (recheck.coherent || !(recheck.reason || "").startsWith("knowledge.website host")) {
+        if (recheck.coherent || !(recheck.reason || "").startsWith("knowledge.website host") || !recheck.agentHost) {
           // No longer the mismatch we classified — skip the write.
           continue;
         }
-        updateStmt.run(fix.proposed_website, fix.agent_id);
+        // Write the host from THIS fresh re-check, not fix.proposed_website
+        // (computed from the earlier classification read) — if agents.url
+        // changed between the cohort SELECT and this write, the stale
+        // proposed value would reintroduce a mismatch while reporting success.
+        updateStmt.run(`https://${recheck.agentHost}`, fix.agent_id);
         written++;
       }
     }
@@ -301,13 +305,21 @@ router.post("/", (req: Request, res: Response) => {
 // drain) stops re-selecting it for 30 days unless verification_review_reason
 // changes in the meantime (the snapshot comparison lives in the picker).
 function stampParking(db: any, agentId: string, outcome: string, reviewReasonSnapshot: string): void {
+  // Stamp via SQLite's own datetime('now') rather than JS Date#toISOString():
+  // the backoff comparison in pickReviewQueueBatch/parkingExclusionClause
+  // also uses datetime('now','-30 days'), which emits space-separated
+  // "YYYY-MM-DD HH:MM:SS" (no 'T', no ms, no 'Z'). Mixing formats made the
+  // 30-day window effectively ~31 days (lexicographic comparison: 'T' > ' '
+  // keeps same-day timestamps ordered "after" the cutoff until the calendar
+  // date itself rolls over) — using the same format on both sides of the
+  // comparison keeps the window exact.
   db.prepare(
     `UPDATE agent_knowledge
-        SET domain_reconciliation_checked_at = ?,
+        SET domain_reconciliation_checked_at = datetime('now'),
             domain_reconciliation_outcome = ?,
             domain_reconciliation_reason_snapshot = ?
       WHERE agent_id = ?`
-  ).run(new Date().toISOString(), outcome, reviewReasonSnapshot, agentId);
+  ).run(outcome, reviewReasonSnapshot, agentId);
 }
 
 export default router;
