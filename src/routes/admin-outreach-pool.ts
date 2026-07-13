@@ -58,6 +58,11 @@ function parseBool(v: unknown, dflt: boolean): boolean {
 // which gate to fix instead of re-measuring blind. `homepage_parking` reports
 // the PR #248 parking mechanism's live split (still-backed-off vs. eligible for
 // retry) — read-only, same columns/window that route already writes.
+// `pending_verify_parking` reports the analogous dev-request
+// 2026-07-12-rfb-enrichment-pool-refill-and-waste-reduction (item 6 follow-up)
+// mechanism for the bulk pending_verify sweep (pending_verify_parked_since,
+// stamped in applyVerifierOutcome) — same still-backed-off vs.
+// eligible-for-retry split, read-only.
 router.get("/stats", (req: Request, res: Response) => {
   if (!requireAdmin(req, res)) return;
   try {
@@ -102,6 +107,17 @@ router.get("/stats", (req: Request, res: Response) => {
       )
       .get() as { parked_active: number | null; parked_expired: number | null };
 
+    const pendingVerifyParking = db
+      .prepare(
+        `SELECT
+           SUM(CASE WHEN pending_verify_parked_since IS NOT NULL
+                     AND pending_verify_parked_since > datetime('now', '-30 days') THEN 1 ELSE 0 END) AS parked_active,
+           SUM(CASE WHEN pending_verify_parked_since IS NOT NULL
+                     AND pending_verify_parked_since <= datetime('now', '-30 days') THEN 1 ELSE 0 END) AS parked_expired
+         FROM agent_knowledge`
+      )
+      .get() as { parked_active: number | null; parked_expired: number | null };
+
     res.json({
       success: true,
       pool_size: total?.c ?? 0,
@@ -116,6 +132,10 @@ router.get("/stats", (req: Request, res: Response) => {
       homepage_parking: {
         parked_active: parking?.parked_active ?? 0,
         parked_expired_ready_for_retry: parking?.parked_expired ?? 0,
+      },
+      pending_verify_parking: {
+        parked_active: pendingVerifyParking?.parked_active ?? 0,
+        parked_expired_ready_for_retry: pendingVerifyParking?.parked_expired ?? 0,
       },
     });
   } catch (err: any) {

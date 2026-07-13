@@ -361,7 +361,19 @@ export function pickReviewQueueBatch(db: any, limit = 30): any[] {
 //
 // opt_out is explicitly excluded even though pending_verify and opt_out are
 // mutually exclusive in practice — defensive filter matches all other pickers.
+//
+// dev-request 2026-07-12-rfb-enrichment-pool-refill-and-waste-reduction
+// (item 6 follow-up): agents parked by 3 consecutive no-progress re-verify
+// outcomes (pending_verify_parked_since, stamped in applyVerifierOutcome
+// below) are excluded for 30 days — mirrors pickReviewQueueBatch's
+// DOMAIN_RECONCILIATION_PARKING_DISABLED idiom (itself mirroring PR #248's
+// HOMEPAGE_PARKING_DISABLED in marketplace.ts) so the bulk sweep stops
+// re-probing a cohort proven unresolvable by re-verification alone. Env
+// read at call time so the rollback flag works without a restart.
 export function pickPendingVerifyBatch(db: any, limit = 50): any[] {
+  const parkingExclusion = process.env.PENDING_VERIFY_PARKING_DISABLED === "true"
+    ? ""
+    : `AND (k.pending_verify_parked_since IS NULL OR k.pending_verify_parked_since <= datetime('now','-30 days'))`;
   return db
     .prepare(
       `SELECT a.id, a.name, a.url AS agent_url, a.city AS location_city,
@@ -373,6 +385,7 @@ export function pickPendingVerifyBatch(db: any, limit = 50): any[] {
    INNER JOIN agent_knowledge k ON k.agent_id = a.id
         WHERE k.verification_status = 'pending_verify'
           AND k.verification_status NOT IN ('opt_out')
+          ${parkingExclusion}
      ORDER BY COALESCE(k.sweep_processed_at, k.last_verified_at, '1970-01-01') ASC
         LIMIT ?`
     )
@@ -636,6 +649,51 @@ export function applyVerifierOutcome(
     ).run(outcome.runStartedAt, agentId);
   } catch {
     // sweep_processed_at column not present in this DB — skip.
+  }
+
+  // dev-request 2026-07-12-rfb-enrichment-pool-refill-and-waste-reduction
+  // (item 6 follow-up): pending_verify no-progress parking. Runs
+  // unconditionally, for every outcome (not just pending_verify->pending_verify)
+  // — real progress (any OTHER new_verification_status) must fully reset the
+  // counters, mirroring recordHomepageFetchFailure's reset-on-success branch
+  // in marketplace.ts. Best-effort — same as the sweep_processed_at block
+  // above, the columns may be absent in minimal test-harness schemas that
+  // build agent_knowledge without running full init().
+  try {
+    if (outcome.new_verification_status === "pending_verify") {
+      db.prepare(
+        `UPDATE agent_knowledge SET pending_verify_no_progress_count = pending_verify_no_progress_count + 1 WHERE agent_id = ?`
+      ).run(agentId);
+      const row = db
+        .prepare(
+          `SELECT pending_verify_no_progress_count, pending_verify_parked_since FROM agent_knowledge WHERE agent_id = ?`
+        )
+        .get(agentId) as
+        | { pending_verify_no_progress_count: number; pending_verify_parked_since: string | null }
+        | undefined;
+      if (row && row.pending_verify_no_progress_count >= 3) {
+        // Stamp when not yet parked — or RE-STAMP when the 30-day backoff has
+        // already expired and the re-probe still made no progress. Without
+        // the re-stamp, the stale timestamp keeps satisfying the exclusion
+        // clause's `<= now-30d` forever, so a still-unresolvable agent would
+        // revert to being selected every sweep after its first backoff cycle
+        // (the exact PR #248 review blocker in the homepage-parking
+        // precedent — must not repeat it here).
+        const since = row.pending_verify_parked_since;
+        const expired = since !== null && Date.parse(since) <= Date.now() - 30 * 86_400_000;
+        if (!since || expired) {
+          db.prepare(
+            `UPDATE agent_knowledge SET pending_verify_parked_since = ? WHERE agent_id = ?`
+          ).run(outcome.runStartedAt, agentId);
+        }
+      }
+    } else {
+      db.prepare(
+        `UPDATE agent_knowledge SET pending_verify_no_progress_count = 0, pending_verify_parked_since = NULL WHERE agent_id = ?`
+      ).run(agentId);
+    }
+  } catch {
+    // pending_verify parking columns not present in this DB — skip.
   }
 }
 

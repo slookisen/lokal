@@ -21640,6 +21640,7 @@ console.log("\n── orch-pr-14: MCP discovery product_id surfacing ──");
   try { await _pageEvidenceCrawlPromise; } catch { /* errors already pushed to failures */ }
   try { await _homepageSelectorParkingPromise; } catch { /* errors already pushed to failures */ }
   try { await _domainCoherenceSweepPromise; } catch { /* errors already pushed to failures */ }
+  try { await _pendingVerifyParkingPromise; } catch { /* errors already pushed to failures */ }
   // relax-envelope tests are synchronous (pure validateEnvelope() unit test) — no promise needed
   // PR-109 tests are synchronous (IIFE) — no promise needed
   // Drop pre-existing intg failures (unmasked by awaiting) — they predate M2
@@ -27110,6 +27111,44 @@ const _domainCoherenceSweepPromise: Promise<void> = new Promise<void>(r => {
     failures.push("domain-coherence-sweep: unexpected error: " + String(err?.message || err));
   } finally {
     _domainCoherenceSweepResolve();
+  }
+})();
+
+// ═══════════════════════════════════════════════════════════════════════
+// dev-request 2026-07-12-rfb-enrichment-pool-refill-and-waste-reduction
+// (item 6 follow-up): pending_verify no-progress parking
+// (pending_verify_no_progress_count / pending_verify_parked_since,
+// PENDING_VERIFY_PARKING_DISABLED rollback flag) in
+// src/agents/lokal-agent-verifier.ts (pickPendingVerifyBatch,
+// applyVerifierOutcome) + the pending_verify_parking block on
+// GET /admin/outreach-ready-pool/stats. Swaps the shared getDb() singleton
+// (own dedicated test file, in-memory prod-schema DB) — mirrors the
+// domain-coherence-sweep block immediately above, so it must run strictly
+// after it; _domainCoherenceSweepPromise is the current tail of that serial
+// chain.
+let _pendingVerifyParkingResolve: () => void = () => {};
+const _pendingVerifyParkingPromise: Promise<void> = new Promise<void>(r => {
+  _pendingVerifyParkingResolve = r;
+});
+
+(async () => {
+  await Promise.allSettled([_domainCoherenceSweepPromise]);
+  await new Promise(r => setImmediate(r));
+
+  console.log("\n── dev-request 2026-07-12 item 6 follow-up: pending_verify no-progress parking ──");
+  try {
+    const { runLokalAgentVerifierPendingVerifyParkingTests } = require("../src/agents/lokal-agent-verifier-pending-verify-parking.test") as
+      typeof import("../src/agents/lokal-agent-verifier-pending-verify-parking.test");
+    const pvp = await runLokalAgentVerifierPendingVerifyParkingTests({ log: false });
+    passed += pvp.passed;
+    failed += pvp.failed;
+    for (const f of pvp.failures) failures.push("pending-verify-parking: " + f);
+    console.log(`  pending-verify-parking: ${pvp.passed} passed, ${pvp.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("pending-verify-parking: unexpected error: " + String(err?.message || err));
+  } finally {
+    _pendingVerifyParkingResolve();
   }
 })();
 
