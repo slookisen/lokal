@@ -195,27 +195,49 @@ export function runLokalAgentVerifierPendingVerifyParkingTests(
       noProgressOutcome("agent-noprog", "2026-07-03T00:00:00.000Z");
       row = knowledgeRow("agent-noprog");
       assertEq(row.pending_verify_no_progress_count, 3, "pvp-05: after call 3, count=3");
-      assertEq(row.pending_verify_parked_since, "2026-07-03T00:00:00.000Z",
-        "pvp-06: after call 3, parked_since stamped to that call's runStartedAt");
+      // orch-pr-20260713-verifier-sweep-parking (review-blocker fix): the
+      // stamp is now written via SQL datetime('now') (computed by SQLite
+      // itself), NOT the fake runStartedAt bound as a JS-ISO-string param —
+      // mixing a JS Date#toISOString() value ("...T...Z") with the
+      // datetime('now','-30 days') SQL-native format ("YYYY-MM-DD HH:MM:SS")
+      // used on the read side made the 30-day window effectively ~31 days
+      // (see stampParking() in admin-domain-coherence.ts for the identical,
+      // already-fixed precedent). So we can no longer assert exact equality
+      // against runStartedAt — instead assert "is set" and "is a real,
+      // recent wall-clock stamp", the same idiom
+      // homepage-provenance-selector-parking.test.ts uses for
+      // homepage_unreachable_since (also stamped via datetime('now')-style
+      // real-clock writes).
+      assertTrue(!!row.pending_verify_parked_since, "pvp-06: after call 3, parked_since is set");
+      assertTrue(
+        Date.parse(row.pending_verify_parked_since!) > Date.now() - 60_000,
+        "pvp-06b: after call 3, parked_since is a real, recent DB-stamped clock value (not the fake runStartedAt)"
+      );
 
       // ── (2) re-stamp after expired backoff (PR #248 review-blocker shape) ──
-      // Simulate the parked_since aging past 30 days, then hit the agent with
+      // Simulate the parked_since aging past 30 days (in SQL-native format,
+      // matching how the real column is written), then hit the agent with
       // ANOTHER no-progress outcome (still unresolvable) — the stamp must be
-      // bumped to the new runStartedAt, not left stale.
+      // bumped to a fresh value, not left stale.
       db.prepare(
-        "UPDATE agent_knowledge SET pending_verify_parked_since = '2026-01-01T00:00:00.000Z' WHERE agent_id = 'agent-noprog'",
+        "UPDATE agent_knowledge SET pending_verify_parked_since = datetime('now', '-45 days') WHERE agent_id = 'agent-noprog'",
       ).run();
       noProgressOutcome("agent-noprog", "2026-07-13T00:00:00.000Z");
       row = knowledgeRow("agent-noprog");
       assertEq(row.pending_verify_no_progress_count, 4, "pvp-07: count keeps incrementing past 3");
-      assertEq(row.pending_verify_parked_since, "2026-07-13T00:00:00.000Z",
-        "pvp-08: expired backoff + another no-progress outcome RE-STAMPS parked_since (not left stale)");
+      assertTrue(!!row.pending_verify_parked_since, "pvp-08: expired backoff + another no-progress outcome re-stamps parked_since (still set)");
+      assertTrue(
+        Date.parse(row.pending_verify_parked_since!) > Date.now() - 60_000,
+        "pvp-08b: expired backoff + another no-progress outcome RE-STAMPS parked_since to a fresh value (not left at the 45-day-old stale value)"
+      );
+      const parkedSince2 = row.pending_verify_parked_since;
 
       // A repeat no-progress outcome while STILL within the backoff window
-      // must NOT re-stamp (only expired backoffs re-stamp).
+      // must NOT re-stamp (only expired backoffs re-stamp) — value must be
+      // byte-for-byte unchanged from the re-stamp above.
       noProgressOutcome("agent-noprog", "2026-07-14T00:00:00.000Z");
       row = knowledgeRow("agent-noprog");
-      assertEq(row.pending_verify_parked_since, "2026-07-13T00:00:00.000Z",
+      assertEq(row.pending_verify_parked_since, parkedSince2,
         "pvp-09: still-active backoff window is NOT re-stamped by a subsequent no-progress outcome");
 
       // ── (3) real progress resets both columns ────────────────────────────
@@ -289,6 +311,52 @@ export function runLokalAgentVerifierPendingVerifyParkingTests(
       assertTrue(!batchIds.includes("agent-parked-active"),
         "pvp-19: unsetting the flag restores the exclusion");
 
+      // ── (4b) format-mismatch regression: real write-path stamp, exercised
+      // at the true 30-day boundary ────────────────────────────────────────
+      // orch-pr-20260713-verifier-sweep-parking review finding: the previous
+      // fixture-based tests above (agent-parked-active/-expired) seeded
+      // pending_verify_parked_since via raw SQL datetime('now'[,'-31 days']),
+      // which never exercised the actual applyVerifierOutcome write path —
+      // so they couldn't have caught the JS-ISO-vs-SQL-native format
+      // mismatch bug (a JS Date#toISOString() stamp compared against
+      // datetime('now','-30 days') is off by ~1 day at the boundary). This
+      // test drives 3 REAL applyVerifierOutcome calls to produce a REAL
+      // DB-stamped value, then ages that real value (in SQL-native format,
+      // as SQLite itself would represent it) to precisely 30 days + 1 hour
+      // and 29 days 23 hours, to prove the exclusion clause's boundary is
+      // exact — not the ~31-day boundary the pre-fix code produced.
+      insertAgent.run("agent-boundary", "Boundarygard AS", "https://boundary-gard.no", "key-boundary");
+      insertKnowledge.run("agent-boundary", "https://boundary-gard.no");
+      noProgressOutcome("agent-boundary", "2026-07-01T00:00:00.000Z");
+      noProgressOutcome("agent-boundary", "2026-07-02T00:00:00.000Z");
+      noProgressOutcome("agent-boundary", "2026-07-03T00:00:00.000Z");
+      row = knowledgeRow("agent-boundary");
+      assertTrue(!!row.pending_verify_parked_since, "pvp-24: agent-boundary is parked after 3 real no-progress applyVerifierOutcome calls");
+      assertTrue(
+        Date.parse(row.pending_verify_parked_since!) > Date.now() - 60_000,
+        "pvp-25: agent-boundary's parked_since is a real, recent DB-stamped wall-clock value"
+      );
+
+      // Age the real stamp to exactly "30 days + 1 hour" old -> just past
+      // the boundary -> must be treated as EXPIRED (included).
+      db.prepare(
+        "UPDATE agent_knowledge SET pending_verify_parked_since = datetime('now', '-30 days', '-1 hours') WHERE agent_id = 'agent-boundary'",
+      ).run();
+      batch = pickPendingVerifyBatch(db, 100);
+      batchIds = batch.map((r: any) => r.id);
+      assertTrue(batchIds.includes("agent-boundary"),
+        "pvp-26: parked_since aged to exactly 30 days + 1 hour is treated as EXPIRED (included) — the true 30-day boundary, not the pre-fix ~31-day one");
+
+      // Age the real stamp to "29 days 23 hours" old -> just short of the
+      // boundary -> must STILL be excluded (backoff not yet expired).
+      db.prepare(
+        "UPDATE agent_knowledge SET pending_verify_parked_since = datetime('now', '-29 days', '-23 hours') WHERE agent_id = 'agent-boundary'",
+      ).run();
+      batch = pickPendingVerifyBatch(db, 100);
+      batchIds = batch.map((r: any) => r.id);
+      assertTrue(!batchIds.includes("agent-boundary"),
+        "pvp-27: parked_since aged to 29 days 23 hours is still within the 30-day backoff window (excluded)");
+
       // ── (5) admin-outreach-ready-pool /stats exposes pending_verify_parking ──
       delete require.cache[require.resolve("../routes/admin-outreach-pool")];
       const routeMod = require("../routes/admin-outreach-pool");
@@ -302,16 +370,19 @@ export function runLokalAgentVerifierPendingVerifyParkingTests(
           url: "/stats",
           headers: { "x-admin-key": testAdminKey },
         });
-        assertEq(result.status, 200, "pvp-20: GET /stats -> 200");
+        assertEq(result.status, 200, "pvp-28: GET /stats -> 200");
         assertTrue(!!result.body?.pending_verify_parking,
-          "pvp-21: response includes a pending_verify_parking object");
-        // Parked-active (as of this point): agent-parked-active only
-        // (agent-parked-expired is expired, agent-noprog was re-parked at
-        // pvp-08 with a fresh timestamp).
-        assertEq(result.body.pending_verify_parking.parked_active, 2,
-          "pvp-22: parked_active counts agent-parked-active + agent-noprog (both recently stamped)");
+          "pvp-29: response includes a pending_verify_parking object");
+        // Parked-active (as of this point): agent-parked-active, agent-noprog
+        // (re-parked at pvp-08 with a fresh timestamp), and agent-boundary
+        // (left aged to 29d23h — still "active" — at the end of the (4b)
+        // boundary sub-test above). agent-parked-expired is expired;
+        // agent-progress/agent-progress2 were reset to NULL by real
+        // progress.
+        assertEq(result.body.pending_verify_parking.parked_active, 3,
+          "pvp-30: parked_active counts agent-parked-active + agent-noprog + agent-boundary (all recently/still-actively stamped)");
         assertEq(result.body.pending_verify_parking.parked_expired_ready_for_retry, 1,
-          "pvp-23: parked_expired_ready_for_retry counts agent-parked-expired");
+          "pvp-31: parked_expired_ready_for_retry counts agent-parked-expired");
       } finally {
         if (prevAdminKey === undefined) delete process.env.ADMIN_KEY;
         else process.env.ADMIN_KEY = prevAdminKey;

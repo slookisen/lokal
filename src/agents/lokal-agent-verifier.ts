@@ -682,9 +682,20 @@ export function applyVerifierOutcome(
         const since = row.pending_verify_parked_since;
         const expired = since !== null && Date.parse(since) <= Date.now() - 30 * 86_400_000;
         if (!since || expired) {
+          // Stamp via SQLite's own datetime('now') rather than JS
+          // Date#toISOString(): the backoff comparison in
+          // pickPendingVerifyBatch's parkingExclusion also uses
+          // datetime('now','-30 days'), which emits space-separated
+          // "YYYY-MM-DD HH:MM:SS" (no 'T', no ms, no 'Z'). Mixing formats
+          // made the 30-day window effectively ~31 days (lexicographic
+          // comparison: 'T' > ' ' keeps same-day timestamps ordered
+          // "after" the cutoff until the calendar date itself rolls over)
+          // — using the same format on both sides of the comparison keeps
+          // the window exact. Mirrors stampParking() in
+          // admin-domain-coherence.ts (same bug class, fixed there first).
           db.prepare(
-            `UPDATE agent_knowledge SET pending_verify_parked_since = ? WHERE agent_id = ?`
-          ).run(outcome.runStartedAt, agentId);
+            `UPDATE agent_knowledge SET pending_verify_parked_since = datetime('now') WHERE agent_id = ?`
+          ).run(agentId);
         }
       }
     } else {
