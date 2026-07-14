@@ -1397,6 +1397,7 @@ router.post("/", requireAdmin, (req: Request, res: Response) => {
 // GET  /api/opplevelser/book/confirm/:token — producer confirm (attended/no_show)
 // GET  /api/opplevelser/book/:ref/ics     — download ICS calendar file
 // GET  /api/opplevelser/admin/gardssalg/commission — monthly commission statement
+// GET  /api/opplevelser/admin/gardssalg/bookings-count — existing-rows count (below)
 //
 // All writes persist to gardssalg_bookings in experiences.db.
 // No payments; no auto-send; drafts only. Daniel sends confirmations manually.
@@ -1545,6 +1546,88 @@ router.get(
 
     const statement = getCommissionStatement(provider_id, month);
     res.json({ success: true, ...statement });
+  },
+);
+
+// ─── GET /api/opplevelser/admin/gardssalg/bookings-count ────────────
+// dev-request 2026-07-12-gardssalg-go-live-gate-dark-launch-og-onboarding,
+// acceptance criterion 5 ("Eksisterende bookings-rader talt og rapportert").
+// The booking form went live 2026-07-03, a full 9 days before the 2026-07-12
+// dark-launch-stop deploy — so gardssalg_bookings may already hold real rows
+// written while the flow looked (but wasn't) fully functional. This routine
+// has no DB-shell access, so this is the only way to get that count for the
+// daily brief / any CS follow-up decision. Read-only, admin-gated, zero
+// writes. Deliberately does NOT return guest_name/guest_email/guest_phone in
+// bulk (PII-minimizing — same honest-omission discipline as the rest of this
+// file): the `rows` list carries only non-identifying fields, capped at 200,
+// so an admin can see there ARE real (non-zero-party, real-lead-time) rows
+// worth a CS follow-up without this endpoint itself becoming a bulk contact
+// export. A specific booking's guest contact is already reachable today via
+// the existing `/book/:ref/ics` / confirm-token flow for that one row.
+const GSB_ROWS_CAP = 200;
+router.get(
+  "/admin/gardssalg/bookings-count",
+  requireAdmin,
+  (_req: Request, res: Response) => {
+    const expDb = getExpDb("experiences");
+
+    let byStatus: Array<{ status: string; count: number }> = [];
+    try {
+      byStatus = expDb
+        .prepare(
+          `SELECT status, COUNT(*) AS count
+             FROM gardssalg_bookings
+            GROUP BY status`
+        )
+        .all() as Array<{ status: string; count: number }>;
+    } catch (err) {
+      console.error("[gardssalg/bookings-count] status query failed:", err);
+      res.status(500).json({ error: "Failed to query gardssalg_bookings" });
+      return;
+    }
+
+    const by_status: Record<string, number> = {
+      reserved: 0,
+      confirmed_attended: 0,
+      no_show: 0,
+      cancelled: 0,
+    };
+    let total = 0;
+    for (const row of byStatus) {
+      if (row.status in by_status) by_status[row.status] = row.count;
+      total += row.count;
+    }
+
+    let rows: Array<{
+      booking_id: string;
+      provider_id: string;
+      status: string;
+      party_size: number;
+      created_at: string | null;
+    }> = [];
+    try {
+      rows = expDb
+        .prepare(
+          `SELECT booking_id, provider_id, status, party_size, created_at
+             FROM gardssalg_bookings
+            ORDER BY created_at ASC
+            LIMIT ?`
+        )
+        .all(GSB_ROWS_CAP) as typeof rows;
+    } catch (err) {
+      console.error("[gardssalg/bookings-count] rows query failed:", err);
+      res.status(500).json({ error: "Failed to query gardssalg_bookings rows" });
+      return;
+    }
+
+    res.json({
+      success: true,
+      total,
+      by_status,
+      rows_returned: rows.length,
+      rows_capped: total > GSB_ROWS_CAP,
+      rows,
+    });
   },
 );
 
