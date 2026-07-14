@@ -2803,6 +2803,103 @@ router.get("/admin/claims", (req: Request, res: Response) => {
   });
 });
 
+// ─── GET /admin/claim-funnel: read-only invited → started → verified funnel ──
+// Read-only report over EXISTING tables (outreach_sent_log, agent_claims) —
+// no migration, no new column, no write. "opened" isn't in here: there is no
+// page-view tracking wired to the claim landing route yet (see `note` below).
+//
+// invited-per-source is deliberately NOT computed: outreach_sent_log has no
+// source/campaign column, so a claim's `source` can't be joined back to the
+// outreach send that produced it. Fabricating that number would be worse
+// than omitting it, so by_source only reports started/verified.
+router.get("/admin/claim-funnel", (req: Request, res: Response) => {
+  const expectedKey = getAdminKey();
+  if (!expectedKey) { res.status(503).json({ error: "Admin not configured" }); return; }
+  const adminKey = (req.headers["x-admin-key"] as string) || (req.query.key as string);
+  if (!adminKey || adminKey !== expectedKey) {
+    res.status(403).json({ error: "Krever admin-nøkkel" });
+    return;
+  }
+
+  const parsedDays = parseInt(req.query.days as string, 10);
+  const windowDays = Number.isFinite(parsedDays) && parsedDays > 0 ? parsedDays : 90;
+  // SQLite-side date math (parameterized modifier, not string-interpolated
+  // into the query), matching this file's existing `datetime('now', ...)`
+  // convention (see ENTERPRISE_REFRESH_DAYS / homepage-unreachable checks
+  // above) rather than a hand-rolled JS Date offset.
+  const modifier = `-${windowDays} days`;
+
+  const db = getDb();
+
+  const invited = (db.prepare(
+    `SELECT COUNT(DISTINCT agent_id) AS n FROM outreach_sent_log WHERE sent_at >= datetime('now', ?)`
+  ).get(modifier) as { n: number }).n;
+
+  const started = (db.prepare(
+    `SELECT COUNT(DISTINCT agent_id) AS n FROM agent_claims WHERE created_at >= datetime('now', ?)`
+  ).get(modifier) as { n: number }).n;
+
+  const verified = (db.prepare(
+    `SELECT COUNT(DISTINCT agent_id) AS n FROM agent_claims
+       WHERE status = 'verified' AND verified_at >= datetime('now', ?)`
+  ).get(modifier) as { n: number }).n;
+
+  // null (never 0/NaN/Infinity) when the denominator is 0 — this is a report,
+  // a fabricated 0% or NaN conversion rate would misrepresent "no data yet".
+  const rate = (num: number, den: number): number | null =>
+    den > 0 ? Math.round((num / den) * 1000) / 1000 : null;
+
+  // Per-source started/verified — two independent GROUP BY queries (same
+  // conditions as the top-level counts above, just grouped by source) merged
+  // by source, rather than one query with a single WHERE, so a claim whose
+  // verified_at lands in-window but whose created_at doesn't (or vice versa)
+  // is still counted correctly on each side — exactly like the top-level
+  // started/verified counts are independent of each other.
+  const startedBySource = db.prepare(
+    `SELECT source, COUNT(DISTINCT agent_id) AS n FROM agent_claims
+       WHERE created_at >= datetime('now', ?) GROUP BY source`
+  ).all(modifier) as Array<{ source: string; n: number }>;
+
+  const verifiedBySource = db.prepare(
+    `SELECT source, COUNT(DISTINCT agent_id) AS n FROM agent_claims
+       WHERE status = 'verified' AND verified_at >= datetime('now', ?) GROUP BY source`
+  ).all(modifier) as Array<{ source: string; n: number }>;
+
+  const bySourceMap = new Map<string, { started: number; verified: number }>();
+  for (const row of startedBySource) {
+    bySourceMap.set(row.source, { started: row.n, verified: 0 });
+  }
+  for (const row of verifiedBySource) {
+    const entry = bySourceMap.get(row.source) || { started: 0, verified: 0 };
+    entry.verified = row.n;
+    bySourceMap.set(row.source, entry);
+  }
+
+  const by_source = Array.from(bySourceMap.entries())
+    .sort((a, b) => a[0].localeCompare(b[0]))
+    .map(([source, counts]) => ({
+      source,
+      started: counts.started,
+      verified: counts.verified,
+      verified_rate: rate(counts.verified, counts.started),
+    }));
+
+  res.json({
+    success: true,
+    data: {
+      window_days: windowDays,
+      funnel: { invited, started, verified },
+      conversion: {
+        started_rate: rate(started, invited),
+        verified_rate: rate(verified, started),
+        verified_of_invited_rate: rate(verified, invited),
+      },
+      by_source,
+      note: "opened stage not yet instrumented (no page-view tracking wired to the claim landing route)",
+    },
+  });
+});
+
 // ═══════════════════════════════════════════════════════════════
 // INBOUND EMAIL WEBHOOK
 // Resend sends a POST here when someone emails *@rettfrabonden.com
