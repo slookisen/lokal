@@ -657,6 +657,8 @@
           <div class="card">
             <h2>Visninger etter kilde (siste 90 dager)</h2>
             <div id="statsViewsBySource" style="display:flex;flex-direction:column;gap:0.5rem;"></div>
+            <h3>Siste 30 dager</h3>
+            <div id="statsViewsTrend"></div>
           </div>
 
           <div class="card">
@@ -1702,6 +1704,30 @@
         vbsHtml += '</div>';
       });
       document.getElementById('statsViewsBySource').innerHTML = vbsHtml || '<p style="color:var(--gray-500);font-size:0.9rem;">Ingen visninger registrert enn&aring;.</p>';
+
+      // Views trend: combined daily total across all sources, last 30 days
+      // of the already-fetched 90-day daily array (no new fetch).
+      var daily = vbs.daily || [];
+      var trendEl = document.getElementById('statsViewsTrend');
+      if (daily.length) {
+        var byDate = {};
+        daily.forEach(function(row) {
+          byDate[row.date] = (byDate[row.date] || 0) + (row.count || 0);
+        });
+        var dates = Object.keys(byDate).sort();
+        var last30 = dates.slice(-30);
+        var maxDay = Math.max(1, last30.reduce(function(m, d) { return Math.max(m, byDate[d]); }, 0));
+        var trendHtml = '<div style="display:flex;align-items:flex-end;gap:2px;height:50px;">';
+        last30.forEach(function(d) {
+          var count = byDate[d];
+          var pct = Math.max(4, Math.round((count / maxDay) * 100));
+          trendHtml += '<div title="' + d + ': ' + count + '" style="flex:1;background:var(--forest);border-radius:2px 2px 0 0;height:' + pct + '%;min-width:2px;"></div>';
+        });
+        trendHtml += '</div>';
+        trendEl.innerHTML = trendHtml;
+      } else {
+        trendEl.innerHTML = '<p style="color:var(--gray-500);font-size:0.9rem;">Ingen data enn&aring;.</p>';
+      }
 
       // AI platforms
       var ai = data.aiPlatforms || { chatgpt: 0, claude: 0, other: 0 };
