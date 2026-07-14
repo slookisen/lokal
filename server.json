@@ -26,14 +26,6 @@
     },
     {
       "type": "streamable-http",
-      "url": "https://finn-tannlege.com/mcp"
-    },
-    {
-      "type": "streamable-http",
-      "url": "https://opplevagent.no/mcp"
-    },
-    {
-      "type": "streamable-http",
       "url": "https://server.smithery.ai/@slookisen/rettfrabonden"
     }
   ]
