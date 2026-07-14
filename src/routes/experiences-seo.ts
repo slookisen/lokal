@@ -1088,6 +1088,7 @@ ChatGPT Custom GPT — Opplevagent: https://chatgpt.com/g/g-6a3ab590a7f081919c52
 ## MCP (Model Context Protocol) — Streamable HTTP
 
 MCP-endepunkt (Streamable HTTP):  ${url}/mcp
+MCP Server Card:                  ${url}/.well-known/mcp/server-card.json
 Koble til: lim inn https://opplevagent.no/mcp i Claude Desktop / ChatGPT som MCP-URL.
 
 Tilgjengelige MCP-verktøy:
@@ -1190,6 +1191,8 @@ function serveAgentsTxt(_req: Request, res: Response): void {
 # A2A-markedsplass for norske opplevelser og aktiviteter.
 
 Agent-card: ${url}/.well-known/agent-card.json
+MCP-endpoint: ${url}/mcp
+MCP-server-card: ${url}/.well-known/mcp/server-card.json
 A2A-endpoint: ${url}/a2a
 OpenAPI: ${url}/openapi.json
 LLM-oversikt: ${url}/llms.txt
@@ -1228,6 +1231,111 @@ router.get("/openapi.json", (_req: Request, res: Response) => {
   res.header("Access-Control-Allow-Origin", "*");
   res.header("Cache-Control", "public, max-age=300");
   res.json(getExperiencesOpenapi());
+});
+
+// ═══════════════════════════════════════════════════════════
+// MCP Server Card (SEP-1649) — dev-request 2026-07-13-mcp-2026-spec-server-card
+// ═══════════════════════════════════════════════════════════
+// Mirrors agent-readiness.ts's mcpServerCard() shape/field-names for
+// rettfrabonden.com, but with opplevagent.no's own branding, endpoint, and
+// MCP tools (see experiences-mcp.ts's registerExperienceTools).
+function experiencesMcpServerCard() {
+  const url = baseUrl();
+  let total = 0;
+  try { total = countPublishedExperiences(); } catch { /* experiences db may not be ready */ }
+  const totalLabel = total > 0 ? total.toLocaleString("nb") : "hundreds of";
+
+  return {
+    $schema: "https://modelcontextprotocol.io/schemas/2025-11/server-card.schema.json",
+    schemaVersion: "2025-11",
+    name: "opplevagent",
+    title: "Opplevagent — Norwegian experiences marketplace",
+    version: "0.1.0",
+    description:
+      `Discover ${totalLabel} curated, Brreg-verified Norwegian experiences and activities. ` +
+      "Filter by county (fylke), municipality, category, weather suitability, season, indoor/outdoor, " +
+      "group size, age, price, and duration — including near-me search by coordinates. Supports " +
+      "natural-language queries in Norwegian and English.",
+    homepage: url,
+    repository: {
+      type: "git",
+      url: "https://github.com/slookisen/lokal",
+    },
+    documentation: `${url}/llms.txt`,
+    icon: `${url}/favicon.svg`,
+    vendor: {
+      name: "Opplevagent",
+      url,
+    },
+    license: "MIT",
+    endpoints: [
+      {
+        protocol: "https+mcp",
+        url: `${url}/mcp`,
+        description: "Remote MCP HTTP transport (Streamable HTTP). Compatible with ChatGPT connectors and remote Claude.",
+      },
+    ],
+    transports: ["http", "streamable-http"],
+    capabilities: {
+      tools: { listChanged: false },
+      resources: { listChanged: false, subscribe: false },
+      prompts: { listChanged: false },
+    },
+    tools: [
+      { name: "discover_experiences", description: "Search Norwegian experiences by county, municipality, category, weather, season, indoor/outdoor, group size, age, price, duration, and near-me (lat/lng/radius)." },
+      { name: "list_experience_categories", description: "List all experience categories with the count of verified experiences in each." },
+      { name: "get_experience", description: "Fetch full details for a single experience by its UUID." },
+    ],
+    authentication: {
+      schemes: ["none"],
+      description: "All MCP tools are read-only and require no authentication.",
+    },
+    keywords: [
+      "opplevelser",
+      "experiences",
+      "activities",
+      "aktiviteter",
+      "reise",
+      "travel",
+      "norway",
+      "norge",
+      "friluft",
+    ],
+    contact: {
+      url: `${url}/kontakt`,
+    },
+    "x-opplevagent": {
+      region: "Norway",
+      totalExperiences: total,
+      languages: ["no", "en"],
+    },
+  };
+}
+
+router.get("/.well-known/mcp/server-card.json", (_req: Request, res: Response) => {
+  res.header("Content-Type", "application/json; charset=utf-8");
+  res.header("Cache-Control", "public, max-age=300");
+  res.json(experiencesMcpServerCard());
+});
+
+// Legacy / alternate paths (parity with agent-readiness.ts's rfb aliases)
+router.get("/.well-known/mcp.json", (_req: Request, res: Response) => {
+  res.header("Content-Type", "application/json; charset=utf-8");
+  res.header("Cache-Control", "public, max-age=300");
+  res.json(experiencesMcpServerCard());
+});
+
+router.get("/.well-known/mcp-server.json", (_req: Request, res: Response) => {
+  res.header("Content-Type", "application/json; charset=utf-8");
+  res.header("Cache-Control", "public, max-age=300");
+  res.json(experiencesMcpServerCard());
+});
+
+router.get("/.well-known/mcp/server-cards.json", (_req: Request, res: Response) => {
+  res.header("Content-Type", "application/json; charset=utf-8");
+  res.header("Cache-Control", "public, max-age=300");
+  // Array wrapper form — some aggregators expect an array of cards.
+  res.json([experiencesMcpServerCard()]);
 });
 
 // ═══════════════════════════════════════════════════════════

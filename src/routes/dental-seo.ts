@@ -1763,6 +1763,7 @@ ChatGPT Custom GPT — Finn tannlege i Norge: https://chatgpt.com/g/g-6a21e79241
 ## MCP (Model Context Protocol)
 
 HTTP Streamable MCP:  ${DENTAL_BASE_URL}/mcp
+MCP Server Card:      ${DENTAL_BASE_URL}/.well-known/mcp/server-card.json
 npm-pakke (stdio):    npx finn-tannlege-mcp
 
 Tilgjengelige MCP-tools:
@@ -2241,6 +2242,7 @@ Allow-actions: search, read, discover, compare
 Disallow-actions: modify, delete, register-without-key
 Agent-card: https://finn-tannlege.com/.well-known/agent-card.json
 MCP-endpoint: https://finn-tannlege.com/mcp
+MCP-server-card: https://finn-tannlege.com/.well-known/mcp/server-card.json
 A2A-endpoint: https://finn-tannlege.com/a2a
 API-base: https://finn-tannlege.com/api/tannleger
 Name: Finn Tannlege
@@ -2268,6 +2270,111 @@ router.get("/openapi.json", (_req: Request, res: Response) => {
   res.header("Access-Control-Allow-Origin", "*");
   res.header("Cache-Control", "public, max-age=300");
   res.json(getDentalOpenapi());
+});
+
+// ═══════════════════════════════════════════════════════════
+// MCP Server Card (SEP-1649) — dev-request 2026-07-13-mcp-2026-spec-server-card
+// ═══════════════════════════════════════════════════════════
+// Mirrors agent-readiness.ts's mcpServerCard() shape/field-names for
+// rettfrabonden.com, but with finn-tannlege.com's own branding, endpoint,
+// and MCP tools (see dental-mcp.ts's registerDentalTools).
+function dentalMcpServerCard() {
+  let stats = { total: 0 };
+  try { stats = getCachedDentalStats(); } catch { /* dental db may not be ready */ }
+  const totalLabel = stats.total > 0 ? stats.total.toLocaleString("nb") : "6,900+";
+
+  return {
+    $schema: "https://modelcontextprotocol.io/schemas/2025-11/server-card.schema.json",
+    schemaVersion: "2025-11",
+    name: "finn-tannlege",
+    title: "Finn-tannlege — Norwegian dental clinic search",
+    version: "0.1.0",
+    description:
+      `Search and compare ${totalLabel} Norwegian dental clinics. Filter by county (fylke), specialty, ` +
+      "Helfo direct-billing agreement, and emergency-duty (akuttvakt) availability. Supports " +
+      "natural-language queries in Norwegian and English.",
+    homepage: DENTAL_BASE_URL,
+    repository: {
+      type: "git",
+      url: "https://github.com/slookisen/lokal",
+    },
+    documentation: `${DENTAL_BASE_URL}/llms.txt`,
+    icon: `${DENTAL_BASE_URL}/favicon.svg`,
+    vendor: {
+      name: "Finn-tannlege",
+      url: DENTAL_BASE_URL,
+    },
+    license: "MIT",
+    endpoints: [
+      {
+        protocol: "https+mcp",
+        url: `${DENTAL_BASE_URL}/mcp`,
+        description: "Remote MCP HTTP transport (Streamable HTTP). Compatible with ChatGPT connectors and remote Claude.",
+      },
+    ],
+    transports: ["http", "streamable-http"],
+    capabilities: {
+      tools: { listChanged: false },
+      resources: { listChanged: false, subscribe: false },
+      prompts: { listChanged: false },
+    },
+    tools: [
+      { name: "tannlege_search", description: "Search Norwegian dental clinics by free text, county (fylke), specialty, Helfo agreement, and emergency-duty filters." },
+      { name: "tannlege_info", description: "Fetch full profile for a single dental clinic by organisation number (org_nr) or UUID." },
+      { name: "tannlege_stats", description: "Fetch aggregated Norwegian dental market statistics — totals, per-county breakdown, Helfo/chain/emergency-duty counts." },
+      { name: "tannlege_akutt", description: "Find dental clinics offering emergency-duty (akuttvakt) treatment, optionally filtered by county." },
+      { name: "tannlege_kjeder", description: "List Norwegian dental chains (kjeder) with a count of clinic locations per chain." },
+    ],
+    authentication: {
+      schemes: ["none"],
+      description: "All MCP tools are read-only and require no authentication.",
+    },
+    keywords: [
+      "tannlege",
+      "dental",
+      "tannlegeklinikk",
+      "helfo",
+      "akuttvakt",
+      "healthcare",
+      "norway",
+      "norge",
+      "kjeveortopedi",
+    ],
+    contact: {
+      url: `${DENTAL_BASE_URL}/om`,
+    },
+    "x-finn-tannlege": {
+      region: "Norway",
+      totalClinics: stats.total,
+      languages: ["no", "en"],
+    },
+  };
+}
+
+router.get("/.well-known/mcp/server-card.json", (_req: Request, res: Response) => {
+  res.header("Content-Type", "application/json; charset=utf-8");
+  res.header("Cache-Control", "public, max-age=300");
+  res.json(dentalMcpServerCard());
+});
+
+// Legacy / alternate paths (parity with agent-readiness.ts's rfb aliases)
+router.get("/.well-known/mcp.json", (_req: Request, res: Response) => {
+  res.header("Content-Type", "application/json; charset=utf-8");
+  res.header("Cache-Control", "public, max-age=300");
+  res.json(dentalMcpServerCard());
+});
+
+router.get("/.well-known/mcp-server.json", (_req: Request, res: Response) => {
+  res.header("Content-Type", "application/json; charset=utf-8");
+  res.header("Cache-Control", "public, max-age=300");
+  res.json(dentalMcpServerCard());
+});
+
+router.get("/.well-known/mcp/server-cards.json", (_req: Request, res: Response) => {
+  res.header("Content-Type", "application/json; charset=utf-8");
+  res.header("Cache-Control", "public, max-age=300");
+  // Array wrapper form — some aggregators expect an array of cards.
+  res.json([dentalMcpServerCard()]);
 });
 
 // ═══════════════════════════════════════════════════════════
