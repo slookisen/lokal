@@ -26,6 +26,37 @@ export function trackPageView(req: Request, res: Response, next: NextFunction) {
 }
 
 /**
+ * Middleware: Track /selger.html page-view "opens" specifically
+ * (dev-request orch-pr-20260714-claim-opened-instrumentation — feeds the
+ * "opened" stage of GET /admin/claim-funnel in src/routes/marketplace.ts).
+ *
+ * Deliberately a SEPARATE function from trackPageView() above, not a change
+ * to it: trackPageView() records `req.path` (no query string), which is
+ * fine for its existing (currently unused) SEO-route use case, but would
+ * lose the `?agent=<id>` that /selger.html needs so a page-load can be
+ * attributed to the producer who was invited. This records
+ * `req.originalUrl` instead, so the id lands in the stored
+ * analytics_page_views.path. No other route/caller is affected.
+ *
+ * Always calls next() — analyticsService.recordPageView() already
+ * catches+logs its own errors internally and never throws, so a tracking
+ * failure can never block or alter the page actually being served.
+ *
+ * Usage: app.get("/selger.html", trackSelgerHtmlOpen) — registered before
+ * express.static so the real file still falls through to it unchanged.
+ */
+export function trackSelgerHtmlOpen(req: Request, res: Response, next: NextFunction) {
+  const sessionId = analyticsService.getOrCreateSessionId(req, res);
+  analyticsService.recordPageView({
+    path: req.originalUrl,
+    referrer: req.headers.referer,
+    userAgent: analyticsService.getUserAgent(req),
+    sessionId,
+  });
+  next();
+}
+
+/**
  * Middleware: Measure response time and track queries
  *
  * Usage in router:

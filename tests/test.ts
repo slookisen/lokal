@@ -21764,6 +21764,7 @@ console.log("\n── orch-pr-14: MCP discovery product_id surfacing ──");
   try { await _pendingVerifyParkingPromise; } catch { /* errors already pushed to failures */ }
   try { await _adminAgentsDeletePromise; } catch { /* errors already pushed to failures */ }
   try { await _adminClaimFunnelPromise; } catch { /* errors already pushed to failures */ }
+  try { await _selgerHtmlOpenTrackingPromise; } catch { /* errors already pushed to failures */ }
   // relax-envelope tests are synchronous (pure validateEnvelope() unit test) — no promise needed
   // PR-109 tests are synchronous (IIFE) — no promise needed
   // Drop pre-existing intg failures (unmasked by awaiting) — they predate M2
@@ -27369,6 +27370,41 @@ const _adminClaimFunnelPromise: Promise<void> = new Promise<void>(r => {
     failures.push("admin-claim-funnel: unexpected error: " + String(err?.message || err));
   } finally {
     _adminClaimFunnelResolve();
+  }
+})();
+
+// ═══════════════════════════════════════════════════════════════════════
+// orch-pr-20260714-claim-opened-instrumentation: GET /selger.html open
+// tracking (src/index.ts -> trackSelgerHtmlOpen, src/middleware/analytics.ts)
+// and the "opened" stage it feeds on GET /admin/claim-funnel (covered
+// separately above, in the admin-claim-funnel block). Swaps the shared
+// getDb() singleton (own dedicated test file, in-memory prod-schema DB) —
+// mirrors the admin-claim-funnel block immediately above, so it must run
+// strictly after it; _adminClaimFunnelPromise is the current tail of that
+// serial chain.
+let _selgerHtmlOpenTrackingResolve: () => void = () => {};
+const _selgerHtmlOpenTrackingPromise: Promise<void> = new Promise<void>(r => {
+  _selgerHtmlOpenTrackingResolve = r;
+});
+
+(async () => {
+  await Promise.allSettled([_adminClaimFunnelPromise]);
+  await new Promise(r => setImmediate(r));
+
+  console.log("\n── orch-pr-20260714-claim-opened-instrumentation: GET /selger.html open tracking ──");
+  try {
+    const { runSelgerHtmlOpenTrackingTests } = require("../src/routes/selger-html-open-tracking.test") as
+      typeof import("../src/routes/selger-html-open-tracking.test");
+    const soht = await runSelgerHtmlOpenTrackingTests({ log: false });
+    passed += soht.passed;
+    failed += soht.failed;
+    for (const f of soht.failures) failures.push("selger-html-open-tracking: " + f);
+    console.log(`  selger-html-open-tracking: ${soht.passed} passed, ${soht.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("selger-html-open-tracking: unexpected error: " + String(err?.message || err));
+  } finally {
+    _selgerHtmlOpenTrackingResolve();
   }
 })();
 
