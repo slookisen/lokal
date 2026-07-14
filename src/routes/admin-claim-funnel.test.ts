@@ -1,20 +1,25 @@
 /**
  * admin-claim-funnel.test.ts — unit/integration tests for GET
  * /admin/claim-funnel (src/routes/marketplace.ts), a read-only
- * invited → started → verified funnel report over the EXISTING
- * outreach_sent_log and agent_claims tables (no migration, no new column,
- * no write).
+ * invited → opened → started → verified funnel report over the EXISTING
+ * outreach_sent_log, agent_claims and analytics_page_views tables (no
+ * migration, no new column, no write).
  *
  * Covers:
  *   (a) 403 without X-Admin-Key.
  *   (b) 503 when admin key isn't configured (ADMIN_KEY/ANALYTICS_ADMIN_KEY
  *       both unset).
- *   (c) zero-row case → funnel all zeros, all conversion rates `null`
- *       (never 0/NaN/Infinity), by_source is an empty array, still 200.
+ *   (c) zero-row case → funnel all zeros, `opened` zero, all conversion
+ *       rates `null` (never 0/NaN/Infinity, including the new opened_rate /
+ *       invited_to_opened_rate), by_source is an empty array, the stale
+ *       "opened stage not yet instrumented" `note` field is gone,
+ *       `opened_since_instrumented: true` is present, still 200.
  *   (d) valid key + a hand-seeded fixture (?days=30) → funnel counts,
- *       conversion rates, and by_source breakdown all match hand-computed
- *       expected values (see the comment block above the fixture below for
- *       the arithmetic).
+ *       `opened` (derived from analytics_page_views rows written by the new
+ *       GET /selger.html tracking — see src/index.ts / trackSelgerHtmlOpen
+ *       in src/middleware/analytics.ts), conversion rates, and by_source
+ *       breakdown all match hand-computed expected values (see the comment
+ *       block above the fixture below for the arithmetic).
  *   (e) the existing GET /admin/claims endpoint (same file, untouched by
  *       this change) still responds 200 with its known response shape —
  *       a smoke-test regression guard, not a re-test of its own logic.
@@ -165,13 +170,21 @@ export async function runAdminClaimFunnelTests(opts: { log?: boolean } = {}): Pr
       assertEq(empty.body?.success, true, "c2: zero-row response success:true");
       assertEq(empty.body?.data?.window_days, 30, "c3: window_days echoes the ?days= param");
       assertEq(empty.body?.data?.funnel, { invited: 0, started: 0, verified: 0 }, "c4: funnel is all zeros");
+      assertEq(empty.body?.data?.opened, 0, "c4b: opened is 0 when no analytics_page_views rows exist");
       assertEq(
         empty.body?.data?.conversion,
-        { started_rate: null, verified_rate: null, verified_of_invited_rate: null },
-        "c5: all conversion rates are null (not 0/NaN/Infinity) when denominators are 0",
+        {
+          started_rate: null,
+          verified_rate: null,
+          verified_of_invited_rate: null,
+          opened_rate: null,
+          invited_to_opened_rate: null,
+        },
+        "c5: all conversion rates are null (not 0/NaN/Infinity) when denominators are 0, including the new opened-stage rates",
       );
       assertEq(empty.body?.data?.by_source, [], "c6: by_source is an empty array");
-      assertEq(typeof empty.body?.data?.note, "string", "c7: note field present");
+      assertEq(empty.body?.data?.opened_since_instrumented, true, "c7: opened_since_instrumented:true is present");
+      assertTrue(!("note" in (empty.body?.data ?? {})), "c7b: the stale 'opened stage not yet instrumented' note field is gone");
       // Whole-response JSON round-trip sanity (rules out NaN/Infinity, which
       // JSON.stringify silently turns into `null` too, so also check the
       // literal string form for the tell-tale "NaN"/"Infinity" substrings).
@@ -207,6 +220,16 @@ export async function runAdminClaimFunnelTests(opts: { log?: boolean } = {}): Pr
     //   organic:     started {e,f}=2 (d excluded, outside window),
     //                verified {e}=1 (d excluded, verified_at outside window),
     //                verified_rate 0.5
+    //
+    // analytics_page_views (path / created_at) — feeds "opened":
+    //   /selger.html?agent=agent-a&ref=email-apr26   5d ago  \ same agent,
+    //   /selger.html?agent=agent-a&ref=email-apr26   4d ago  / different
+    //                                                          session -> DISTINCT collapses to 1
+    //   /selger.html?agent=agent-g&ref=organic       1d ago  -- new agent, within window
+    //   /selger.html                    (no ?agent= at all)  2d ago  -- excluded, no agent param
+    //   /selger.html?agent=agent-h                  40d ago  -- OUTSIDE the 30d window, excluded
+    //   => opened (30d) = DISTINCT agent extracted from path = {agent-a, agent-g} = 2
+    //   => opened_rate = started/opened = 4/2 = 2, invited_to_opened_rate = opened/invited = 2/3 = 0.667
     {
       const insertSent = testDb.prepare(
         `INSERT INTO outreach_sent_log (agent_id, sent_at, channel) VALUES (?, ?, 'email')`,
@@ -246,15 +269,35 @@ export async function runAdminClaimFunnelTests(opts: { log?: boolean } = {}): Pr
         status: "code_sent", source: "organic", created_at: daysAgoISO(2), verified_at: null,
       });
 
+      // "opened" fixture — analytics_page_views rows as written by the new
+      // GET /selger.html tracking (trackSelgerHtmlOpen records
+      // req.originalUrl, so ?agent=<id> is preserved in `path`).
+      const insertPageView = testDb.prepare(
+        `INSERT INTO analytics_page_views (path, session_id, created_at) VALUES (?, ?, ?)`,
+      );
+      insertPageView.run("/selger.html?agent=agent-a&ref=email-apr26", "sess-1", daysAgoISO(5));
+      insertPageView.run("/selger.html?agent=agent-a&ref=email-apr26", "sess-2", daysAgoISO(4)); // same agent, different session -> still 1 distinct
+      insertPageView.run("/selger.html?agent=agent-g&ref=organic", "sess-3", daysAgoISO(1));
+      insertPageView.run("/selger.html", "sess-4", daysAgoISO(2)); // no ?agent= at all -> excluded
+      insertPageView.run("/selger.html?agent=agent-h", "sess-5", daysAgoISO(40)); // outside the 30d window -> excluded
+
       const r = await callFunnel({ days: 30 });
       assertEq(r.status, 200, "d1: populated fixture -> 200");
       assertEq(r.body?.data?.window_days, 30, "d2: window_days echoes ?days=30");
       assertEq(r.body?.data?.funnel, { invited: 3, started: 4, verified: 2 }, "d3: funnel counts match hand-computed fixture");
+      assertEq(r.body?.data?.opened, 2, "d3b: opened counts DISTINCT agent ids from in-window /selger.html?agent= page views (agent-a, agent-g)");
       assertEq(
         r.body?.data?.conversion,
-        { started_rate: 1.333, verified_rate: 0.5, verified_of_invited_rate: 0.667 },
-        "d4: conversion rates match hand-computed fixture, rounded to 3dp",
+        {
+          started_rate: 1.333,
+          verified_rate: 0.5,
+          verified_of_invited_rate: 0.667,
+          opened_rate: 2,
+          invited_to_opened_rate: 0.667,
+        },
+        "d4: conversion rates match hand-computed fixture, rounded to 3dp, including the new opened-stage rates",
       );
+      assertEq(r.body?.data?.opened_since_instrumented, true, "d4b: opened_since_instrumented:true still present on the populated fixture");
       const bySource = (r.body?.data?.by_source ?? []) as Array<any>;
       assertEq(bySource.length, 2, "d5: by_source has exactly 2 source groups");
       assertEq(
@@ -274,6 +317,7 @@ export async function runAdminClaimFunnelTests(opts: { log?: boolean } = {}): Pr
       assertEq(r90.body?.data?.window_days, 90, "d9: omitted ?days defaults to 90");
       assertEq(r90.body?.data?.funnel.invited, 4, "d10: 90-day window also counts agent-c (40d ago)");
       assertEq(r90.body?.data?.funnel.started, 5, "d11: 90-day window also counts agent-d's claim (35d ago)");
+      assertEq(r90.body?.data?.opened, 3, "d12: 90-day window also counts agent-h's page view (40d ago) -> {agent-a, agent-g, agent-h}");
     }
 
     // ── (e) GET /admin/claims is unchanged by this diff (smoke regression) ──

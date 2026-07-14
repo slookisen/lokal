@@ -32,6 +32,7 @@ import discoveryRoutes from "./routes/discovery";
 import conversationUiRoutes from "./routes/conversation-ui";
 import agentReadinessRoutes from "./routes/agent-readiness";
 import { linkHeaders, markdownNegotiation } from "./middleware/agent-discovery";
+import { trackSelgerHtmlOpen } from "./middleware/analytics";
 import { langMiddleware } from "./i18n/middleware";
 import { analyticsService, shouldRunAutoPrune } from "./services/analytics-service";
 import analyticsRoutes from "./routes/analytics";
@@ -286,6 +287,17 @@ app.use("/", agentReadinessRoutes);
 // Magic-link auth + 7-field profile management for producers.
 // Mounted at root because it serves both /api/agents/:id/* and /magic-link-verify.
 app.use("/", ownerPortalRoutes);
+
+// ─── orch-pr-20260714-claim-opened-instrumentation: /selger.html open tracking ──
+// Registered BEFORE express.static so this exact path is tracked before
+// falling through to the real static file (trackSelgerHtmlOpen always calls
+// next(), so the file is still served byte-identical to before — same
+// headers/content as every other file under src/public). This captures
+// req.originalUrl (with the ?agent=<id> query string) so GET
+// /admin/claim-funnel can report an "opened" stage. See
+// src/middleware/analytics.ts for why this is a separate function from
+// trackPageView() rather than a change to it.
+app.get("/selger.html", trackSelgerHtmlOpen);
 
 // Serve the marketplace dashboard
 app.use(express.static(path.join(__dirname, "public"), { extensions: ["html"] }));

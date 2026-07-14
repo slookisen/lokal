@@ -2803,10 +2803,15 @@ router.get("/admin/claims", (req: Request, res: Response) => {
   });
 });
 
-// ─── GET /admin/claim-funnel: read-only invited → started → verified funnel ──
-// Read-only report over EXISTING tables (outreach_sent_log, agent_claims) —
-// no migration, no new column, no write. "opened" isn't in here: there is no
-// page-view tracking wired to the claim landing route yet (see `note` below).
+// ─── GET /admin/claim-funnel: read-only invited → opened → started → verified funnel ──
+// Read-only report over EXISTING tables (outreach_sent_log, agent_claims,
+// analytics_page_views) — no migration, no new column, no write.
+//
+// "opened" (orch-pr-20260714-claim-opened-instrumentation): GET
+// /selger.html is now instrumented (src/index.ts -> trackSelgerHtmlOpen,
+// src/middleware/analytics.ts) to record a page view with the full
+// req.originalUrl (so ?agent=<id> is preserved). This only counts page-loads
+// recorded from that deploy forward — see opened_since_instrumented below.
 //
 // invited-per-source is deliberately NOT computed: outreach_sent_log has no
 // source/campaign column, so a claim's `source` can't be joined back to the
@@ -2843,6 +2848,27 @@ router.get("/admin/claim-funnel", (req: Request, res: Response) => {
     `SELECT COUNT(DISTINCT agent_id) AS n FROM agent_claims
        WHERE status = 'verified' AND verified_at >= datetime('now', ?)`
   ).get(modifier) as { n: number }).n;
+
+  // "opened" — distinct producers whose /selger.html landing page was
+  // actually loaded within the window. Pre-filter in SQL to rows that look
+  // like a /selger.html hit carrying an agent= query param, then parse the
+  // exact agent id out of the stored path in JS (simplest correct approach
+  // given how trackSelgerHtmlOpen stores req.originalUrl — no new column).
+  const openedRows = db.prepare(
+    `SELECT path FROM analytics_page_views
+       WHERE created_at >= datetime('now', ?)
+         AND path LIKE '/selger.html?%'
+         AND path LIKE '%agent=%'`
+  ).all(modifier) as Array<{ path: string }>;
+
+  const openedAgentIds = new Set<string>();
+  for (const row of openedRows) {
+    const qIndex = row.path.indexOf("?");
+    if (qIndex === -1) continue;
+    const agentId = new URLSearchParams(row.path.slice(qIndex + 1)).get("agent");
+    if (agentId) openedAgentIds.add(agentId);
+  }
+  const opened = openedAgentIds.size;
 
   // null (never 0/NaN/Infinity) when the denominator is 0 — this is a report,
   // a fabricated 0% or NaN conversion rate would misrepresent "no data yet".
@@ -2889,13 +2915,20 @@ router.get("/admin/claim-funnel", (req: Request, res: Response) => {
     data: {
       window_days: windowDays,
       funnel: { invited, started, verified },
+      opened,
       conversion: {
         started_rate: rate(started, invited),
         verified_rate: rate(verified, started),
         verified_of_invited_rate: rate(verified, invited),
+        opened_rate: rate(started, opened),
+        invited_to_opened_rate: rate(opened, invited),
       },
       by_source,
-      note: "opened stage not yet instrumented (no page-view tracking wired to the claim landing route)",
+      // "opened" only reflects /selger.html page-views recorded from the
+      // orch-pr-20260714-claim-opened-instrumentation deploy forward — there
+      // is no retroactive page-view data, so a low number early on is NOT
+      // the true historical open rate.
+      opened_since_instrumented: true,
     },
   });
 });
