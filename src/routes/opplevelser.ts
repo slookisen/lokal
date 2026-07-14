@@ -1305,6 +1305,63 @@ router.get("/admin/gardssalg-contact-coverage", requireAdmin, (_req: Request, re
   });
 });
 
+// ─── GET /api/opplevelser/admin/gardssalg-provider-lookup ────────────────────
+//
+// Closes a gap surfaced while targeting /admin/gardssalg-content-refresh at
+// two just-registered+seeded providers (Bringebærlandet, Klostergården
+// Håndbryggeri): /admin/rfb-seed only ever returns candidate NAMES, never the
+// new experience_providers.id it assigns, and there was no way to look that
+// id up by name afterwards short of a wide auto-select (scope creep onto
+// unrelated older raw rows). This is a narrow, read-only, name -> id lookup.
+//
+// NB: MUST come before /:id (the generic single-experience catch-all route
+// below) so this path isn't swallowed as an experience id.
+//
+// Read-only — a single SELECT, no writes. Case-insensitive substring match
+// on navn only. NB: SQLite's built-in lower()/LIKE case-folding is ASCII-only
+// (confirmed: lower('BRINGEBÆRLANDET') -> 'bringebÆrlandet' — the Æ is left
+// untouched), which would silently break case-insensitivity for exactly the
+// Norwegian names (æ/ø/å) this endpoint exists to look up. So the SQL layer
+// only fetches columns (no user input in the query at all — nothing to
+// inject), and the case-insensitive substring match itself is done in JS via
+// toLowerCase(), which correctly folds Unicode. Privacy-minimized like
+// /admin/gardssalg-contact-coverage above: never returns epost/telefon/
+// hjemmeside/adresse, only id/navn/rfb_seed_source/created_at.
+router.get("/admin/gardssalg-provider-lookup", requireAdmin, (req: Request, res: Response) => {
+  const navnParam = req.query.navn;
+  const navn = typeof navnParam === "string" ? navnParam.trim() : "";
+  if (!navn) {
+    res.status(400).json({ error: "Query param 'navn' is required and must be non-blank" });
+    return;
+  }
+
+  const expDb = getExpDb("experiences");
+
+  let rows: Array<{
+    id: string;
+    navn: string;
+    rfb_seed_source: string | null;
+    created_at: string | null;
+  }> = [];
+  try {
+    rows = expDb
+      .prepare(
+        `SELECT id, navn, rfb_seed_source, created_at
+           FROM experience_providers`
+      )
+      .all() as typeof rows;
+  } catch (err) {
+    console.error("[gardssalg-provider-lookup] failed to query providers:", err);
+    res.status(500).json({ error: "Failed to query experience_providers" });
+    return;
+  }
+
+  const needle = navn.toLowerCase();
+  const matches = rows.filter((r) => r.navn.toLowerCase().includes(needle));
+
+  res.json({ matches });
+});
+
 // ─── GET /api/opplevelser/admin/detail-completeness-coverage ─────────────────
 //
 // dev-request 2026-07-04-opplevagent-dedup-og-norske-titler, item 3 ("detail

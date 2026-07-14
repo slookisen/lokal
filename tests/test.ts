@@ -25490,6 +25490,22 @@ Promise.allSettled(_oaHomeCountersDeps).then(async () => {
     for (const f of gbcr.failures) failures.push("opplevelser-gardssalg-bookings-count: " + f);
     console.log(`  opplevelser-gardssalg-bookings-count: ${gbcr.passed} passed, ${gbcr.failed} failed`);
 
+    // GET /admin/gardssalg-provider-lookup — read-only, case-insensitive
+    // substring lookup of experience_providers by navn, returning
+    // id/navn/rfb_seed_source/created_at. Closes the gap where /admin/
+    // rfb-seed only returns candidate names, never the new provider id, so a
+    // just-seeded provider couldn't be targeted at /admin/gardssalg-content-
+    // refresh without a wide auto-select. Same in-memory-DB pattern, runs
+    // sequentially inside this same gated block.
+    console.log("\n── opplevelser-gardssalg-provider-lookup: admin name->id lookup ──");
+    const { runOpplevelserGardssalgProviderLookupTests } = require("../src/routes/opplevelser-gardssalg-provider-lookup.test") as
+      typeof import("../src/routes/opplevelser-gardssalg-provider-lookup.test");
+    const gplr = await runOpplevelserGardssalgProviderLookupTests({ log: false });
+    passed += gplr.passed;
+    failed += gplr.failed;
+    for (const f of gplr.failures) failures.push("opplevelser-gardssalg-provider-lookup: " + f);
+    console.log(`  opplevelser-gardssalg-provider-lookup: ${gplr.passed} passed, ${gplr.failed} failed`);
+
     // dev-request 2026-07-04-opplevagent-dedup-og-norske-titler, item 3
     // (detail completeness weave): GET /admin/detail-completeness-coverage —
     // read-only, catalog-wide booking_url/phone/website coverage report over
