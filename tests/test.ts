@@ -21763,6 +21763,7 @@ console.log("\n── orch-pr-14: MCP discovery product_id surfacing ──");
   try { await _domainCoherenceSweepPromise; } catch { /* errors already pushed to failures */ }
   try { await _pendingVerifyParkingPromise; } catch { /* errors already pushed to failures */ }
   try { await _adminAgentsDeletePromise; } catch { /* errors already pushed to failures */ }
+  try { await _adminClaimFunnelPromise; } catch { /* errors already pushed to failures */ }
   // relax-envelope tests are synchronous (pure validateEnvelope() unit test) — no promise needed
   // PR-109 tests are synchronous (IIFE) — no promise needed
   // Drop pre-existing intg failures (unmasked by awaiting) — they predate M2
@@ -27318,6 +27319,40 @@ const _adminAgentsDeletePromise: Promise<void> = new Promise<void>(r => {
     failures.push("admin-agents-delete: unexpected error: " + String(err?.message || err));
   } finally {
     _adminAgentsDeleteResolve();
+  }
+})();
+
+// ═══════════════════════════════════════════════════════════════════════
+// orch-pr-20260714-1: GET /admin/claim-funnel (src/routes/marketplace.ts) —
+// read-only invited -> started -> verified funnel report over the existing
+// outreach_sent_log + agent_claims tables. Swaps the shared getDb()
+// singleton (own dedicated test file, in-memory prod-schema DB) — mirrors
+// the admin-agents-delete block immediately above, so it must run strictly
+// after it; _adminAgentsDeletePromise is the current tail of that serial
+// chain.
+let _adminClaimFunnelResolve: () => void = () => {};
+const _adminClaimFunnelPromise: Promise<void> = new Promise<void>(r => {
+  _adminClaimFunnelResolve = r;
+});
+
+(async () => {
+  await Promise.allSettled([_adminAgentsDeletePromise]);
+  await new Promise(r => setImmediate(r));
+
+  console.log("\n── orch-pr-20260714-1: GET /admin/claim-funnel ──");
+  try {
+    const { runAdminClaimFunnelTests } = require("../src/routes/admin-claim-funnel.test") as
+      typeof import("../src/routes/admin-claim-funnel.test");
+    const acf = await runAdminClaimFunnelTests({ log: false });
+    passed += acf.passed;
+    failed += acf.failed;
+    for (const f of acf.failures) failures.push("admin-claim-funnel: " + f);
+    console.log(`  admin-claim-funnel: ${acf.passed} passed, ${acf.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("admin-claim-funnel: unexpected error: " + String(err?.message || err));
+  } finally {
+    _adminClaimFunnelResolve();
   }
 })();
 
