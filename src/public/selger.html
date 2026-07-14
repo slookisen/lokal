@@ -646,6 +646,8 @@
         </div>
 
         <div class="hidden" id="statsContent">
+          <div class="hidden" id="statsEmptyState" style="margin-bottom:1rem;"></div>
+
           <div class="card">
             <h2>Trakt: oppdaget &rarr; sett &rarr; kontakt-klikk</h2>
             <p class="section-hint" style="margin-bottom:0.75rem;">
@@ -1682,6 +1684,39 @@
     }
 
     function renderOwnerStats(data) {
+      // Empty-state banner: when the producer genuinely has zero activity
+      // across the whole tab (funnel, views-by-source AND AI-platform totals
+      // all zero), show a friendly explanation + concrete onboarding tips
+      // instead of leaving a wall of unexplained "0" stat cards -- every
+      // other sub-section on this tab already explains an empty state in
+      // words, this brings the funnel/AI stat-card sections in line. Purely
+      // additive: the real stat cards below still render exactly as before
+      // (with their true 0s) in both branches; no numbers are fabricated.
+      var emptyStateEl = document.getElementById('statsEmptyState');
+      if (emptyStateEl) {
+        var fz = data.funnel || {};
+        var vbsTotalsZ = (data.viewsBySource && data.viewsBySource.totals) || {};
+        var aiZ = data.aiPlatforms || {};
+        var funnelAllZero = !(fz.discovered || fz.viewed || fz.contactClicked);
+        var viewsAllZero = Object.keys(vbsTotalsZ).every(function(k) { return !vbsTotalsZ[k]; });
+        var aiAllZero = !(aiZ.chatgpt || aiZ.claude || aiZ.other);
+        if (funnelAllZero && viewsAllZero && aiAllZero) {
+          var tipsHtml = '<div style="background:var(--blue-light);border:1px solid #bfdbfe;border-radius:var(--radius);padding:0.75rem;">';
+          tipsHtml += '<div style="font-weight:600;margin-bottom:0.5rem;">Ingen aktivitet registrert enn&aring;</div>';
+          tipsHtml += '<div style="font-size:0.85rem;margin-bottom:0.5rem;">Profilen din er ny, s&aring; det er helt normalt at tallene under st&aring;r p&aring; null. Her er noen konkrete grep for &aring; komme i gang:</div>';
+          tipsHtml += '<div style="font-size:0.85rem;padding:2px 0;">&bull; Fyll ut profilen fullstendig (om g&aring;rden/bedriften, kontaktinfo og &aring;pningstider) &mdash; jo mer komplett profilen er, jo lettere er det for AI-assistenter og s&oslash;k &aring; finne og anbefale deg.</div>';
+          tipsHtml += '<div style="font-size:0.85rem;padding:2px 0;">&bull; Legg til produkter under &laquo;Produkter&raquo;-fanen, s&aring; har bes&oslash;kende og AI-assistenter noe konkret &aring; vise fram.</div>';
+          tipsHtml += '<div style="font-size:0.85rem;padding:2px 0;">&bull; Del lenken til produsentprofilen din (/produsent/&lt;din-url&gt;) i egne kanaler, for eksempel sosiale medier eller nyhetsbrev.</div>';
+          tipsHtml += '<div style="font-size:0.85rem;padding:2px 0;">&bull; S&oslash;rg for at kontaktinformasjonen (e-post, telefon, nettside) er komplett, s&aring; kontakt-klikk kan telles og tilskrives riktig.</div>';
+          tipsHtml += '</div>';
+          emptyStateEl.innerHTML = tipsHtml;
+          emptyStateEl.classList.remove('hidden');
+        } else {
+          emptyStateEl.innerHTML = '';
+          emptyStateEl.classList.add('hidden');
+        }
+      }
+
       // Funnel
       var f = data.funnel || { discovered: 0, viewed: 0, contactClicked: 0 };
       var funnelHtml = '';
