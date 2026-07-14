@@ -25477,6 +25477,19 @@ Promise.allSettled(_oaHomeCountersDeps).then(async () => {
     for (const f of gccr.failures) failures.push("opplevelser-gardssalg-contact-coverage: " + f);
     console.log(`  opplevelser-gardssalg-contact-coverage: ${gccr.passed} passed, ${gccr.failed} failed`);
 
+    // dev-request 2026-07-12-gardssalg-go-live-gate-dark-launch-og-onboarding,
+    // acceptance criterion 5: GET /admin/gardssalg/bookings-count — read-only
+    // count + non-PII listing of existing gardssalg_bookings rows. Same
+    // in-memory-DB pattern, runs sequentially inside this same gated block.
+    console.log("\n── opplevelser-gardssalg-bookings-count: admin bookings-count report ──");
+    const { runOpplevelserGardssalgBookingsCountTests } = require("../src/routes/opplevelser-gardssalg-bookings-count.test") as
+      typeof import("../src/routes/opplevelser-gardssalg-bookings-count.test");
+    const gbcr = await runOpplevelserGardssalgBookingsCountTests({ log: false });
+    passed += gbcr.passed;
+    failed += gbcr.failed;
+    for (const f of gbcr.failures) failures.push("opplevelser-gardssalg-bookings-count: " + f);
+    console.log(`  opplevelser-gardssalg-bookings-count: ${gbcr.passed} passed, ${gbcr.failed} failed`);
+
     // dev-request 2026-07-04-opplevagent-dedup-og-norske-titler, item 3
     // (detail completeness weave): GET /admin/detail-completeness-coverage —
     // read-only, catalog-wide booking_url/phone/website coverage report over
