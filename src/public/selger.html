@@ -1714,14 +1714,23 @@
         daily.forEach(function(row) {
           byDate[row.date] = (byDate[row.date] || 0) + (row.count || 0);
         });
-        var dates = Object.keys(byDate).sort();
-        var last30 = dates.slice(-30);
-        var maxDay = Math.max(1, last30.reduce(function(m, d) { return Math.max(m, byDate[d]); }, 0));
+        // Anchor on the last 30 calendar days ending today (UTC, matching the
+        // backend's strftime('%Y-%m-%d', created_at) date strings), zero-filling
+        // any day with no recorded views -- not just the sparse set of dates
+        // that happen to have >=1 view.
+        var todayStr = new Date().toISOString().slice(0, 10);
+        var todayUtc = new Date(todayStr + 'T00:00:00Z');
+        var last30 = [];
+        for (var i = 29; i >= 0; i--) {
+          var d = new Date(todayUtc.getTime() - i * 86400000);
+          last30.push(d.toISOString().slice(0, 10));
+        }
+        var maxDay = Math.max(1, last30.reduce(function(m, d) { return Math.max(m, byDate[d] || 0); }, 0));
         var trendHtml = '<div style="display:flex;align-items:flex-end;gap:2px;height:50px;">';
         last30.forEach(function(d) {
-          var count = byDate[d];
-          var pct = Math.max(4, Math.round((count / maxDay) * 100));
-          trendHtml += '<div title="' + d + ': ' + count + '" style="flex:1;background:var(--forest);border-radius:2px 2px 0 0;height:' + pct + '%;min-width:2px;"></div>';
+          var count = byDate[d] || 0;
+          var pct = count > 0 ? Math.max(4, Math.round((count / maxDay) * 100)) : 2;
+          trendHtml += '<div title="' + d + ': ' + count + '" style="flex:1;background:var(--forest);border-radius:2px 2px 0 0;height:' + pct + '%;min-width:2px;opacity:' + (count > 0 ? '1' : '0.35') + ';"></div>';
         });
         trendHtml += '</div>';
         trendEl.innerHTML = trendHtml;
