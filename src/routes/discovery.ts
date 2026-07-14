@@ -589,6 +589,7 @@ Disallow-actions: modify, delete, register-without-key
 # Agent endpoints
 Agent-card: ${BASE_URL}/.well-known/agent-card.json
 MCP-endpoint: ${BASE_URL}/mcp
+MCP-server-card: ${BASE_URL}/.well-known/mcp/server-card.json
 A2A-endpoint: ${BASE_URL}/a2a
 API-base: ${BASE_URL}/api/marketplace
 

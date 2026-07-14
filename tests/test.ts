@@ -12648,6 +12648,31 @@ console.log("\n── PR-73: /llms.txt expanded content ──");
   // preview harness during development → 6.7 KB rendered body).
   assertTrue(discSrc.length > 8000, `pr73: discovery.ts is large after expansion (${discSrc.length} bytes)`);
 }
+
+// ── dev-request 2026-07-13-mcp-2026-spec-server-card, slice 1 ─────────────
+// rettfrabonden.com's /.well-known/agents.txt now links the MCP Server Card
+// next to its existing MCP-endpoint line. Source-grep approach (same
+// rationale as PR-73 above — booting the rfb app here would race the m2
+// owner-portal in-memory DB singleton).
+console.log("\n── orch-pr-20260714-mcpcard: rfb agents.txt links MCP Server Card ──");
+{
+  const fsMcpCard = require("fs") as typeof import("fs");
+  const discSrcMcpCard = fsMcpCard.readFileSync("src/routes/discovery.ts", "utf8");
+
+  assertTrue(
+    discSrcMcpCard.includes("MCP-server-card: ${BASE_URL}/.well-known/mcp/server-card.json"),
+    "mcpcard-rfb-01: agents.txt template includes an MCP-server-card line pointing at /.well-known/mcp/server-card.json"
+  );
+  // The new line sits right next to the existing MCP-endpoint line, not
+  // somewhere unrelated in the file.
+  const agentsTxtBlockMatch = discSrcMcpCard.match(/Agent-card: [\s\S]{0,200}A2A-endpoint:/);
+  assertTrue(!!agentsTxtBlockMatch, "mcpcard-rfb-02: agents.txt Agent-card…A2A-endpoint block found");
+  assertTrue(
+    !!agentsTxtBlockMatch && agentsTxtBlockMatch[0].includes("MCP-server-card:"),
+    "mcpcard-rfb-03: MCP-server-card line sits between Agent-card and A2A-endpoint (next to MCP-endpoint)"
+  );
+}
+
 // ─── PR-74: per-umbrella traffic widget on /admin/dashboard ──────────────
 // Validates the SQL-aggregation logic the new
 // GET /admin/analytics/umbrella-traffic endpoint relies on, plus the
@@ -16759,6 +16784,52 @@ console.log("\n── opplevagent-conversation-logging: slices 1+2 ──");
   const oaParsed = JSON.parse(openapi.body);
   assertTrue("/api/opplevelser/discover" in oaParsed.paths, "orch19-06l: openapi.json carries the experiences discover path");
   assertTrue(!("/api/tannlege/agents" in oaParsed.paths), "orch19-06m: openapi.json does NOT carry dental paths");
+
+  // ── dev-request 2026-07-13-mcp-2026-spec-server-card, slice 1 ───────────
+  // MCP Server Card (SEP-1649) + legacy aliases for opplevagent.no.
+  const mcpCardPaths = [
+    "/.well-known/mcp/server-card.json",
+    "/.well-known/mcp.json",
+    "/.well-known/mcp-server.json",
+  ];
+  for (const p of mcpCardPaths) {
+    const r = invokeGet(p);
+    assertEq(r.status, 200, `mcpcard-exp-${p}: returns 200`);
+    assertTrue(/application\/json/.test(r.headers["content-type"] || ""), `mcpcard-exp-${p}: Content-Type is application/json`);
+    assertEq(r.headers["cache-control"], "public, max-age=300", `mcpcard-exp-${p}: Cache-Control is public, max-age=300`);
+    const parsed = JSON.parse(r.body);
+    assertEq(parsed.name, "opplevagent", `mcpcard-exp-${p}: name is 'opplevagent'`);
+    assertEq(parsed.homepage, "https://opplevagent.no", `mcpcard-exp-${p}: homepage is opplevagent.no`);
+    assertEq(parsed.endpoints[0].url, "https://opplevagent.no/mcp", `mcpcard-exp-${p}: endpoints[0].url is https://opplevagent.no/mcp`);
+    const toolNames = (parsed.tools as any[]).map((t) => t.name);
+    assertTrue(
+      toolNames.includes("discover_experiences") &&
+      toolNames.includes("list_experience_categories") &&
+      toolNames.includes("get_experience"),
+      `mcpcard-exp-${p}: tools list includes discover_experiences, list_experience_categories, get_experience`
+    );
+    assertEq((parsed.tools as any[]).length, 3, `mcpcard-exp-${p}: exactly 3 tools listed`);
+    assertTrue(!/Rett fra Bonden|Finn-tannlege/i.test(r.body), `mcpcard-exp-${p}: does NOT leak rfb/dental identity`);
+  }
+
+  // Array-wrapper alias
+  const mcpCards = invokeGet("/.well-known/mcp/server-cards.json");
+  assertEq(mcpCards.status, 200, "mcpcard-exp-array: /.well-known/mcp/server-cards.json returns 200");
+  const mcpCardsParsed = JSON.parse(mcpCards.body);
+  assertTrue(Array.isArray(mcpCardsParsed) && mcpCardsParsed.length === 1, "mcpcard-exp-array: response is a 1-element array");
+  assertEq(mcpCardsParsed[0].name, "opplevagent", "mcpcard-exp-array: wrapped card has name 'opplevagent'");
+
+  // agents.txt and llms.txt cross-link the server card
+  const agentsTxtExp = invokeGet("/.well-known/agents.txt");
+  assertTrue(
+    agentsTxtExp.body.includes("MCP-server-card: https://opplevagent.no/.well-known/mcp/server-card.json"),
+    "mcpcard-exp-agentstxt: agents.txt links the MCP Server Card"
+  );
+  const llmsExpMcp = invokeGet("/llms.txt");
+  assertTrue(
+    llmsExpMcp.body.includes("https://opplevagent.no/.well-known/mcp/server-card.json"),
+    "mcpcard-exp-llmstxt: llms.txt links the MCP Server Card"
+  );
 }
 
 
@@ -18920,17 +18991,17 @@ const _seoDentalPromise = (async () => {
   const addr = server.address();
   const port = typeof addr === "object" && addr ? addr.port : 0;
 
-  function get(urlPath: string): Promise<{ status: number; body: string }> {
+  function get(urlPath: string): Promise<{ status: number; body: string; headers: Record<string, string> }> {
     return new Promise((resolve) => {
       const req = httpMod.request(
         { host: "127.0.0.1", port, path: urlPath, method: "GET" },
         (res: any) => {
           let buf = "";
           res.on("data", (c: any) => (buf += c));
-          res.on("end", () => resolve({ status: res.statusCode, body: buf }));
+          res.on("end", () => resolve({ status: res.statusCode, body: buf, headers: res.headers || {} }));
         }
       );
-      req.on("error", () => resolve({ status: 0, body: "" }));
+      req.on("error", () => resolve({ status: 0, body: "", headers: {} }));
       req.end();
     });
   }
@@ -19088,6 +19159,56 @@ const _seoDentalPromise = (async () => {
     assertTrue(!badDesc.includes("Ukjent"), "orch-PR-20260613-d: 'Ukjent' fylke not in description");
   }
   // ── end orch-PR-20260613 tests ────────────────────────────────────────────
+
+  // ── dev-request 2026-07-13-mcp-2026-spec-server-card, slice 1 ────────────
+  // MCP Server Card (SEP-1649) + legacy aliases for finn-tannlege.com.
+  {
+    const mcpCardPaths = [
+      "/.well-known/mcp/server-card.json",
+      "/.well-known/mcp.json",
+      "/.well-known/mcp-server.json",
+    ];
+    for (const p of mcpCardPaths) {
+      const r = await get(p);
+      assertEq(r.status, 200, `mcpcard-dental-${p}: returns 200`);
+      assertTrue(/application\/json/.test(r.headers["content-type"] || ""), `mcpcard-dental-${p}: Content-Type is application/json`);
+      assertEq(r.headers["cache-control"], "public, max-age=300", `mcpcard-dental-${p}: Cache-Control is public, max-age=300`);
+      const parsed = JSON.parse(r.body);
+      assertEq(parsed.name, "finn-tannlege", `mcpcard-dental-${p}: name is 'finn-tannlege'`);
+      assertEq(parsed.homepage, "https://finn-tannlege.com", `mcpcard-dental-${p}: homepage is finn-tannlege.com`);
+      assertEq(parsed.endpoints[0].url, "https://finn-tannlege.com/mcp", `mcpcard-dental-${p}: endpoints[0].url is https://finn-tannlege.com/mcp`);
+      const toolNames = (parsed.tools as any[]).map((t) => t.name);
+      assertTrue(
+        toolNames.includes("tannlege_search") &&
+        toolNames.includes("tannlege_info") &&
+        toolNames.includes("tannlege_stats") &&
+        toolNames.includes("tannlege_akutt") &&
+        toolNames.includes("tannlege_kjeder"),
+        `mcpcard-dental-${p}: tools list includes all 5 dental MCP tools`
+      );
+      assertEq((parsed.tools as any[]).length, 5, `mcpcard-dental-${p}: exactly 5 tools listed`);
+      assertTrue(!/Rett fra Bonden|Opplevagent/i.test(r.body), `mcpcard-dental-${p}: does NOT leak rfb/experiences identity`);
+    }
+
+    // Array-wrapper alias
+    const mcpCardsDental = await get("/.well-known/mcp/server-cards.json");
+    assertEq(mcpCardsDental.status, 200, "mcpcard-dental-array: /.well-known/mcp/server-cards.json returns 200");
+    const mcpCardsDentalParsed = JSON.parse(mcpCardsDental.body);
+    assertTrue(Array.isArray(mcpCardsDentalParsed) && mcpCardsDentalParsed.length === 1, "mcpcard-dental-array: response is a 1-element array");
+    assertEq(mcpCardsDentalParsed[0].name, "finn-tannlege", "mcpcard-dental-array: wrapped card has name 'finn-tannlege'");
+
+    // agents.txt and llms.txt cross-link the server card
+    const agentsTxtDental = await get("/.well-known/agents.txt");
+    assertTrue(
+      agentsTxtDental.body.includes("MCP-server-card: https://finn-tannlege.com/.well-known/mcp/server-card.json"),
+      "mcpcard-dental-agentstxt: agents.txt links the MCP Server Card"
+    );
+    const llmsDentalMcp = await get("/llms.txt");
+    assertTrue(
+      llmsDentalMcp.body.includes("https://finn-tannlege.com/.well-known/mcp/server-card.json"),
+      "mcpcard-dental-llmstxt: llms.txt links the MCP Server Card"
+    );
+  }
 
   server.close();
 
