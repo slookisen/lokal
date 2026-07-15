@@ -142,6 +142,45 @@ export function hasInferenceOnlyFactualField(
   return false;
 }
 
+// ── Fix 2 (2026-07-15 P0 gate-integrity, dev-request gate-integrity-unverified-
+// agent-bypass): defense-in-depth re-verification of the CORE eligibility
+// conditions the outreach_ready_pool VIEW enforces. Deliberately narrow — this
+// re-checks ONLY verification_status / enrichment_status / email-present /
+// non-umbrella, NOT URL-freshness/cooldown/replied/opted-out/etc (those are
+// already applied earlier in this same request and are not re-derivable from
+// this row shape alone). The point is to catch the row's core verification
+// state having drifted between the initial SELECT (Step 1, above) and the
+// moment of response, or any other latent divergence class between this
+// endpoint and the pool not yet anticipated.
+//
+// Pure + exported so it's unit-testable in isolation, matching the
+// websiteOwnershipUnverified / hasInferenceOnlyFactualField style above.
+export interface CoreEligibilityRow {
+  verification_status: string | null | undefined;
+  enrichment_status: string | null | undefined;
+  email: string | null | undefined;
+  umbrella_type: string | null | undefined;
+}
+
+export function coreEligibilityCheck(
+  row: CoreEligibilityRow | undefined | null,
+): { ok: boolean; failedCondition: string | null } {
+  if (!row) return { ok: false, failedCondition: "agent_or_knowledge_row_missing" };
+  if (row.verification_status !== "verified") {
+    return { ok: false, failedCondition: "verification_status_not_verified" };
+  }
+  if (row.enrichment_status !== "partial" && row.enrichment_status !== "rich") {
+    return { ok: false, failedCondition: "enrichment_status_not_partial_or_rich" };
+  }
+  if (!row.email || row.email.trim() === "") {
+    return { ok: false, failedCondition: "email_missing" };
+  }
+  if (row.umbrella_type !== null && row.umbrella_type !== undefined) {
+    return { ok: false, failedCondition: "umbrella_type_not_null" };
+  }
+  return { ok: true, failedCondition: null };
+}
+
 // ── GET /admin/outreach-candidates ───────────────────────────────────────────
 //
 // Query params:
@@ -246,6 +285,14 @@ router.get("/", (req: Request, res: Response) => {
       is_hard_bounced: number;
       field_provenance: string | null;
       verification_review_reason: string | null;
+      // Fix 1 (gate-integrity dedupe tiebreak parity, 2026-07-15): these three
+      // mirror admin-outreach-pool.ts exactly so dedupeByEmail()'s tiebreak sees
+      // real engagement/rating data here too, instead of silently defaulting to
+      // 0/0/0 and falling through to alphabetical-name order (a DIFFERENT winner
+      // than outreach-ready-pool would pick for the same email collision).
+      views_count: number | null;
+      google_rating: number | null;
+      google_review_count: number | null;
     };
 
     let rows: PoolRow[];
@@ -259,6 +306,9 @@ router.get("/", (req: Request, res: Response) => {
           p.email,
           k.website,
           p.outreach_eligible_at,
+          k.google_rating,
+          k.google_review_count,
+          (SELECT COUNT(*) FROM analytics_agent_views v WHERE v.agent_id = p.agent_id) AS views_count,
           ${suppressionCols}
         FROM outreach_ready_pool p
         INNER JOIN agents a ON a.id = p.agent_id
@@ -275,6 +325,9 @@ router.get("/", (req: Request, res: Response) => {
           k.email,
           k.website,
           k.outreach_eligible_at,
+          k.google_rating,
+          k.google_review_count,
+          (SELECT COUNT(*) FROM analytics_agent_views v WHERE v.agent_id = a.id) AS views_count,
           ${suppressionCols}
         FROM agents a
         INNER JOIN agent_knowledge k ON k.agent_id = a.id
@@ -383,7 +436,19 @@ router.get("/", (req: Request, res: Response) => {
     }
 
     // ── Step 3: separate candidates from suppressed ───────────────────────────
-    const candidates: Array<{ agent_id: string; name: string; email: string }> = [];
+    // Internal working shape carries the dedupe tiebreak fields (views_count,
+    // google_rating, google_review_count) through dedupe + ordering + capping.
+    // The public response never leaks these — they're stripped back out to
+    // {agent_id, name, email} in the final .map() right before res.json().
+    type InternalCandidate = {
+      agent_id: string;
+      name: string;
+      email: string;
+      views_count: number | null;
+      google_rating: number | null;
+      google_review_count: number | null;
+    };
+    const candidates: InternalCandidate[] = [];
     let contactedOrCooldownCount = 0;
     let repliedCount = 0;
     let optedOutCount = 0;
@@ -469,6 +534,9 @@ router.get("/", (req: Request, res: Response) => {
           agent_id: row.agent_id,
           name: row.name,
           email: row.email,
+          views_count: row.views_count,
+          google_rating: row.google_rating,
+          google_review_count: row.google_review_count,
         });
       }
     }
@@ -515,15 +583,60 @@ router.get("/", (req: Request, res: Response) => {
     // Cap by limit AFTER suppression + dedupe + ordering
     const cappedCandidates = ordered.slice(0, limit);
 
+    // ── Fix 2 (2026-07-15 P0 gate-integrity): fresh, independent re-verification
+    // pass over the EXACT agent_ids about to be returned. Genuinely independent
+    // — a brand-new db.prepare(...).all(...) call, not a reuse of the in-memory
+    // `rows`/`candidates` computed above — so it catches drift between the
+    // initial SELECT and this moment. This can only REMOVE a candidate from the
+    // response, never add one.
+    let gateIntegrityViolations = 0;
+    let finalCandidates = cappedCandidates;
+    if (cappedCandidates.length > 0) {
+      const ids = cappedCandidates.map((c) => c.agent_id);
+      const placeholders = ids.map(() => "?").join(",");
+      const recheckRows = db.prepare(`
+        SELECT
+          a.id AS agent_id,
+          k.verification_status,
+          k.enrichment_status,
+          k.email,
+          a.umbrella_type
+        FROM agents a
+        LEFT JOIN agent_knowledge k ON k.agent_id = a.id
+        WHERE a.id IN (${placeholders})
+      `).all(...ids) as Array<{
+        agent_id: string;
+        verification_status: string | null;
+        enrichment_status: string | null;
+        email: string | null;
+        umbrella_type: string | null;
+      }>;
+      const recheckById = new Map(recheckRows.map((r) => [r.agent_id, r]));
+
+      finalCandidates = cappedCandidates.filter((c) => {
+        const fresh = recheckById.get(c.agent_id);
+        const result = coreEligibilityCheck(fresh);
+        if (!result.ok) {
+          gateIntegrityViolations++;
+          console.error(
+            `P0-ALERT: gate-integrity re-verification failed — mode=${mode} agent_id=${c.agent_id} condition=${result.failedCondition}`,
+          );
+          return false;
+        }
+        return true;
+      });
+    }
+
     res.json({
       success: true,
       mode,
       cooldown_days: cooldownDays,
-      count: cappedCandidates.length,
-      candidates: cappedCandidates,
+      count: finalCandidates.length,
+      candidates: finalCandidates.map((c) => ({ agent_id: c.agent_id, name: c.name, email: c.email })),
       dedupe_by_email: true,
       dedupe_suppressed_count: deduped.suppressed.length,
       dedupe_email_collision_groups: deduped.emails_with_collisions,
+      gate_integrity_violations: gateIntegrityViolations,
       suppressed_counts: {
         contacted_or_cooldown: contactedOrCooldownCount,
         replied: repliedCount,

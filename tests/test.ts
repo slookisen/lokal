@@ -779,6 +779,20 @@ console.log("── admin-outreach-candidates (mode=second oldest-contacted-firs
   console.log(`  admin-outreach-candidates-mode2-ordering: ${r.passed} passed, ${r.failed} failed`);
 }
 
+// ── 2026-07-15 gate-integrity fixes (dedupe tiebreak parity + defense-in-depth
+// re-verification) for GET /admin/outreach-candidates ──
+console.log("── admin-outreach-candidates (gate-integrity: dedupe tiebreak parity + re-verification) ──");
+{
+  const { runAdminOutreachCandidatesGateIntegrityTests } =
+    require("../src/routes/admin-outreach-candidates-gate-integrity.test") as
+      typeof import("../src/routes/admin-outreach-candidates-gate-integrity.test");
+  const r = runAdminOutreachCandidatesGateIntegrityTests({ log: false });
+  passed += r.passed;
+  failed += r.failed;
+  for (const f of r.failures) failures.push("admin-outreach-candidates-gate-integrity: " + f);
+  console.log(`  admin-outreach-candidates-gate-integrity: ${r.passed} passed, ${r.failed} failed`);
+}
+
 // ── orch-pr-12: search-enrich background sweep + findings + apply-findings ──
 // Async (fire-and-forget sweep loop). Kicked off here; awaited in the REPORT
 // block so its pass/fail counts fold into the `npm test` summary.
