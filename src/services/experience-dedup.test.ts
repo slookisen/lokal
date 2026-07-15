@@ -702,6 +702,106 @@ export function runExperienceDedupTests(opts: { log?: boolean } = {}): Promise<T
         null,
         "12c: ...and activity B too — neither folds into the other"
       );
+
+      // ── 13. Re-harvest guard threads title_no through the two callers
+      // (findExistingExperienceMatch()/bulkInsertExperiences()) that used to
+      // silently drop it before it ever reached findExistingCandidateMatch()
+      // — dev-request 2026-07-15 titleno-harvest gap fix. Seed a canonical
+      // row with a plainly English title and a Norwegian title_no (patched in
+      // via raw UPDATE, same as the real title-no-backfill route leaves it);
+      // harvest a candidate for the SAME provider+kommune whose title does
+      // NOT fuzzy-match the seed's English title at all, but whose title_no
+      // DOES fuzzy-match the seed's title_no. This only passes if title_no is
+      // actually threaded through both callers now — a type-only fix (adding
+      // the field to the parameter type without passing it through) would
+      // leave this failing: candidate.title_no would get dropped before
+      // reaching findExistingCandidateMatch(), only title-vs-title would be
+      // compared, no match would be found, and the row would be wrongly
+      // inserted as a fresh duplicate.
+      const titleNoProviderId = expStore.createProvider({
+        navn: "Fjordbad Opplevelser AS",
+        kommune: "Oslo",
+        fylke: "Oslo",
+        brreg_verified: 1,
+        brreg_active: 1,
+        verification_status: "verified",
+      });
+      const titleNoSeedId = expStore.createExperience({
+        title: "Floating Sauna on the Oslofjord",
+        provider_id: titleNoProviderId,
+        kommune: "Oslo",
+        fylke: "Oslo",
+        verification_status: "verified",
+        confidence: "high",
+      });
+      setTitleNo.run("Flytende badstue på Oslofjorden", titleNoSeedId);
+
+      const beforeTitleNoCount = (db.prepare("SELECT COUNT(*) AS c FROM experiences").get() as { c: number }).c;
+      const titleNoGuardResult = expStore.bulkInsertExperiences([
+        {
+          // Shares no significant token, and isn't remotely a whole-string
+          // match, with the seed's English title "Floating Sauna on the
+          // Oslofjord".
+          title: "Nordic Forest Zipline Adventure",
+          // Fuzzy-matches the seed's title_no: "flytende"/"badstue"/
+          // "oslofjorden" are all shared significant tokens, rare in this
+          // small test corpus (well under SHARED_TOKEN_GENERIC_MIN), so a
+          // single shared token is sufficient evidence on its own.
+          title_no: "Flytende badstue Oslofjorden tur",
+          provider_id: titleNoProviderId,
+          kommune: "Oslo",
+          fylke: "Oslo",
+          confidence: "low",
+        },
+      ]);
+      const afterTitleNoCount = (db.prepare("SELECT COUNT(*) AS c FROM experiences").get() as { c: number }).c;
+      assertEq(
+        afterTitleNoCount,
+        beforeTitleNoCount,
+        "13a: a title_no-only match still inserts zero new rows (title_no now threaded through bulkInsertExperiences)"
+      );
+      assertEq(titleNoGuardResult.inserted, 0, "13b: bulkInsertExperiences reports 0 inserted for the title_no-only guarded row");
+      assertTrue(
+        titleNoGuardResult.skipped + titleNoGuardResult.updated === 1,
+        "13c: the row was either skipped or applied in-place via the title_no bridge, not inserted"
+      );
+
+      // findExistingExperienceMatch() directly, mirroring bulkInsertExperiences'
+      // internal call — proves the exported store-level wrapper itself now
+      // forwards title_no, not just bulkInsertExperiences' internal object.
+      const directMatch = expStore.findExistingExperienceMatch({
+        provider_id: titleNoProviderId,
+        title: "Nordic Forest Zipline Adventure",
+        title_no: "Flytende badstue Oslofjorden tur",
+        kommune: "Oslo",
+      });
+      assertEq(
+        directMatch?.id,
+        titleNoSeedId,
+        "13d: findExistingExperienceMatch() itself finds the seed row via title_no"
+      );
+
+      // ── Negative sanity check (same two callers, same provider+kommune):
+      // a candidate whose title AND title_no share nothing with the seed row
+      // must still NOT match — proves the title_no fix hasn't made matching
+      // too loose. (Pure-function-level coverage for the analogous over-match
+      // risk already exists at 9c-2/12a-12c above; this confirms it also
+      // holds through the actual bulkInsertExperiences caller path exercised
+      // above, not just at the pure-function level.)
+      const freshTitleNoResult = expStore.bulkInsertExperiences([
+        {
+          title: "Guided Glacier Hiking Tour",
+          title_no: "Guidet brevandring på isbreen",
+          provider_id: titleNoProviderId,
+          kommune: "Oslo",
+          fylke: "Oslo",
+        },
+      ]);
+      assertEq(
+        freshTitleNoResult.inserted,
+        1,
+        "13e: a genuinely different activity (neither title nor title_no overlaps) still inserts normally — the fix hasn't over-widened matching"
+      );
     } catch (err: any) {
       failed++;
       failures.push("experience-dedup: unexpected error: " + String(err?.stack || err?.message || err));

@@ -1349,6 +1349,7 @@ export function resolveCanonicalSlugForDuplicate(slug: string): string | null {
 export function findExistingExperienceMatch(candidate: {
   provider_id?: string | null;
   title: string;
+  title_no?: string | null;
   kommune?: string | null;
 }): DedupCandidateRow | null {
   const db = getDb(VERTICAL);
@@ -1375,6 +1376,7 @@ export function bulkInsertExperiences(
         const match = findExistingCandidateMatch(db, {
           provider_id: row.provider_id ?? null,
           title: row.title,
+          title_no: row.title_no ?? null,
           kommune: row.kommune ?? null,
         });
         if (match) {
