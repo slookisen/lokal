@@ -542,6 +542,84 @@ router.get(
   }
 );
 
+// ─── GET /api/tannlege/admin/agents/recently-enriched ────────────────
+// Slice 5 of dev-request 2026-07-13-enrichment-metode-maldrevet-evidens:
+// mirrors marketplace.ts's GET /admin/agents/recently-enriched for the
+// dental vertical — a random sample of recently-enriched clinics for the
+// platform-verifier's weekly homepage spot-check. Serves the sample
+// only; the spot-check logic (re-fetch + compare + escalate) lives in a
+// separate SKILL.
+//
+// Query params:
+//   ?since=<ISO-8601>  — default: 7 days before now (also the fallback
+//                        for an unparseable value)
+//   ?limit=<int>       — default 10, clamped to [1, 50]
+//
+// dental_agents has no is_active column (unlike rfb's agents table), so
+// there is no activity filter here — just the last_enriched_at window.
+//
+// Auth: requireAdmin (same X-Admin-Key convention as the rest of this file).
+// Returns: 200 { success, count, agents: [{ id, name, website,
+//   last_enriched_at, field_provenance }] }
+router.get("/admin/agents/recently-enriched", requireAdmin, (req: Request, res: Response) => {
+  try {
+    const db = getDb("dental");
+
+    const DEFAULT_SINCE_DAYS = 7;
+    let since = new Date(Date.now() - DEFAULT_SINCE_DAYS * 24 * 60 * 60 * 1000).toISOString();
+    const sinceParam = req.query.since;
+    if (typeof sinceParam === "string" && sinceParam.trim()) {
+      const parsed = new Date(sinceParam);
+      if (!isNaN(parsed.getTime())) {
+        since = parsed.toISOString();
+      }
+    }
+
+    let limit = parseInt((req.query.limit as string) || "10", 10);
+    if (!Number.isFinite(limit)) limit = 10;
+    limit = Math.min(50, Math.max(1, limit));
+
+    const rows = db
+      .prepare(
+        `SELECT id, navn, hjemmeside, last_enriched_at, field_provenance
+           FROM dental_agents
+          WHERE last_enriched_at >= ?
+          ORDER BY RANDOM()
+          LIMIT ?`
+      )
+      .all(since, limit) as Array<{
+        id: string;
+        navn: string;
+        hjemmeside: string | null;
+        last_enriched_at: string | null;
+        field_provenance: string | null;
+      }>;
+
+    const agents = rows.map((r) => {
+      let fieldProvenance: Record<string, unknown> = {};
+      if (r.field_provenance) {
+        try {
+          const parsed = JSON.parse(r.field_provenance);
+          if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+            fieldProvenance = parsed;
+          }
+        } catch { /* malformed → empty */ }
+      }
+      return {
+        id: r.id,
+        name: r.navn,
+        website: r.hjemmeside,
+        last_enriched_at: r.last_enriched_at,
+        field_provenance: fieldProvenance,
+      };
+    });
+
+    res.json({ success: true, count: agents.length, agents });
+  } catch (err: any) {
+    console.error("[tannlege] agents/recently-enriched failed", err);
+    res.status(500).json({ error: "Internal error" });
+  }
+});
 
 // ─── POST /api/tannlege/admin/google-places-batch (admin) — PR-128 ──────
 //

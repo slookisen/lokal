@@ -3515,6 +3515,86 @@ router.get("/admin/agents/dump", (req: Request, res: Response) => {
   }
 });
 
+// ─── GET /admin/agents/recently-enriched ────────────────────────────
+// Slice 5 of dev-request 2026-07-13-enrichment-metode-maldrevet-evidens:
+// the platform-verifier's weekly spot-check needs a random sample of
+// recently-enriched agents to re-fetch their live homepages and check
+// each written field against field_provenance's cited source_url/snippet.
+// This endpoint ONLY serves the sample — the spot-check logic itself
+// (fetch + compare + escalate/pause) lives in a separate SKILL, not here.
+//
+// Query params:
+//   ?since=<ISO-8601>  — default: 7 days before now (also the fallback
+//                        for an unparseable value, so a bad query never
+//                        500s or silently returns everything)
+//   ?limit=<int>       — default 10, clamped to [1, 50]
+//
+// Random-sampled (ORDER BY RANDOM()) rather than deterministic — the
+// point is a spot-check, not the same agents every run.
+//
+// Auth: X-Admin-Key (same pattern as /admin/agents/dump above).
+// Returns: 200 { success, count, agents: [{ id, name, website,
+//   last_enriched_at, field_provenance }] }
+router.get("/admin/agents/recently-enriched", (req: Request, res: Response) => {
+  const adminKey = req.headers["x-admin-key"] as string;
+  const expectedKey = getAdminKey();
+  if (!expectedKey) { res.status(503).json({ error: "Admin not configured" }); return; }
+  if (!adminKey || adminKey !== expectedKey) {
+    res.status(403).json({ error: "Krever X-Admin-Key header" });
+    return;
+  }
+  try {
+    const db = getDb();
+
+    const DEFAULT_SINCE_DAYS = 7;
+    let since = new Date(Date.now() - DEFAULT_SINCE_DAYS * 24 * 60 * 60 * 1000).toISOString();
+    const sinceParam = req.query.since;
+    if (typeof sinceParam === "string" && sinceParam.trim()) {
+      const parsed = new Date(sinceParam);
+      if (!isNaN(parsed.getTime())) {
+        since = parsed.toISOString();
+      }
+    }
+
+    let limit = parseInt((req.query.limit as string) || "10", 10);
+    if (!Number.isFinite(limit)) limit = 10;
+    limit = Math.min(50, Math.max(1, limit));
+
+    const rows = db.prepare(`
+      SELECT a.id as id, a.name as name, a.url as website,
+             k.last_enriched_at as last_enriched_at, k.field_provenance as field_provenance
+      FROM agents a
+      JOIN agent_knowledge k ON k.agent_id = a.id
+      WHERE k.last_enriched_at >= ? AND a.is_active = 1
+      ORDER BY RANDOM()
+      LIMIT ?
+    `).all(since, limit) as any[];
+
+    const agents = rows.map((r) => {
+      let fieldProvenance: Record<string, unknown> = {};
+      if (r.field_provenance) {
+        try {
+          const parsed = JSON.parse(r.field_provenance);
+          if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+            fieldProvenance = parsed;
+          }
+        } catch { /* malformed → empty */ }
+      }
+      return {
+        id: r.id,
+        name: r.name,
+        website: r.website,
+        last_enriched_at: r.last_enriched_at,
+        field_provenance: fieldProvenance,
+      };
+    });
+
+    res.json({ success: true, count: agents.length, agents });
+  } catch (err: any) {
+    res.status(500).json({ error: "recently-enriched fetch failed", detail: err?.message ?? String(err) });
+  }
+});
+
 // ─── Phase 5.11 A2.5: Public umbrella + affiliations discovery API ───
 // Read-only endpoints (no admin-key required) that surface the Phase 5.11
 // data model to A2A clients, AI search agents (Perplexity/ChatGPT/Claude),
