@@ -28,6 +28,8 @@ import {
   ExclusionReason,
   bulkInsertFromMerged,
   normalizeOpeningHours,
+  // enrichment-metode slice 1 (2026-07-16): dead-homepage parking
+  recordDentalHomepageFetchResult,
 } from "../services/dental-store";
 import { getDb } from "../database/db-factory";
 import { isDisplayablePhone } from "../services/contact-normalizer";
@@ -123,7 +125,11 @@ router.get("/agents", (req: Request, res: Response) => {
       parseInt((req.query.offset as string) || "0", 10) || 0
     );
 
-    const agents = listDentalAgents(filter, limit, offset).map((a) => ({
+    // enrichment-metode slice 1: ?exclude_parked=1 skips clinics parked by 3
+    // consecutive homepage-fetch failures (30d backoff) — the enrichment
+    // routine's candidate listing. Absent param = unchanged behavior.
+    const excludeParked = req.query.exclude_parked === "1" || req.query.exclude_parked === "true";
+    const agents = listDentalAgents(filter, limit, offset, { excludeParked }).map((a) => ({
       ...a,
       telefon: isDisplayablePhone(a.telefon) ? a.telefon : null,
       mobil: isDisplayablePhone(a.mobil) ? a.mobil : null,
@@ -256,6 +262,9 @@ router.put("/agents/:id", requireAdmin, (req: Request, res: Response) => {
     res.json({
       id,
       updated: true,
+      // enrichment-metode slice 1: the fields this PUT actually wrote — lets
+      // the enrichment routine count agents_enriched truthfully (>=1 field).
+      fields_updated: Object.keys(result.data),
       ...(strippedFields.length ? { stripped_fields: strippedFields } : {}),
       ...(openingHoursDropped ? { opening_hours_dropped: openingHoursDropped } : {}),
     });
@@ -416,6 +425,30 @@ router.post("/admin/claim-batch", requireAdmin, (req: Request, res: Response) =>
     res.json({ claimed, count: claimed.length });
   } catch (err: any) {
     res.status(400).json({ error: err.message ?? "Internal error" });
+  }
+});
+
+// POST /api/tannlege/admin/homepage-fetch-result
+// Body: { agentId: string, ok: boolean }
+// enrichment-metode slice 1 (2026-07-16): the dental enrichment routine fetches
+// clinic homepages itself and REPORTS each outcome here; the server owns the
+// strike counting (3 consecutive failures → parked 30d, success → full reset —
+// PR #248 semantics). Parked clinics drop out of GET /agents?exclude_parked=1.
+router.post("/admin/homepage-fetch-result", requireAdmin, (req: Request, res: Response) => {
+  try {
+    const { agentId, ok } = (req.body ?? {}) as { agentId?: unknown; ok?: unknown };
+    if (typeof agentId !== "string" || !agentId.trim() || typeof ok !== "boolean") {
+      res.status(400).json({ error: "Invalid body: need {agentId: string, ok: boolean}" });
+      return;
+    }
+    const r = recordDentalHomepageFetchResult(agentId.trim(), ok);
+    if (!r.found) {
+      res.status(404).json({ error: "Not found" });
+      return;
+    }
+    res.json({ agent_id: agentId.trim(), attempts: r.attempts, parked: r.parked, parked_now: r.parked_now });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message ?? "Internal error" });
   }
 });
 

@@ -392,16 +392,74 @@ function pushSpecialtyClause(
   params.specialtyPerson = `%"specialty":"${specialty}"%`;
 }
 
+// ── Dead-homepage parking (enrichment-metode slice 1, 2026-07-16) ────────────
+// Mirrors the RFB PR #248 semantics: 3 consecutive fetch failures park the
+// clinic (homepage_unreachable_since stamped) for 30 days; a successful fetch
+// fully resets. RE-STAMP on failure after an expired backoff — without it a
+// stale timestamp keeps satisfying the `<= now-30d` exclusion forever (PR #248
+// review blocker, inherited here). The dental enrichment ROUTINE fetches
+// homepages itself (unlike the server-fetching experiences/RFB endpoints), so
+// it REPORTS outcomes via POST /admin/homepage-fetch-result; the server owns
+// the strike counting + parking. DENTAL_HOMEPAGE_PARKING_DISABLED=true bypasses
+// the list exclusion (rollback flag, read per query).
+export const DENTAL_PARK_AFTER_ATTEMPTS = 3;
+export const DENTAL_PARK_BACKOFF_MS = 30 * 86_400_000;
+
+export function recordDentalHomepageFetchResult(
+  id: string,
+  ok: boolean,
+): { found: boolean; attempts: number; parked: boolean; parked_now: boolean } {
+  const db = getDb("dental");
+  const exists = db.prepare("SELECT id FROM dental_agents WHERE id = ?").get(id);
+  if (!exists) return { found: false, attempts: 0, parked: false, parked_now: false };
+
+  if (ok) {
+    db.prepare(
+      "UPDATE dental_agents SET homepage_fetch_attempts = 0, homepage_unreachable_since = NULL WHERE id = ?"
+    ).run(id);
+    return { found: true, attempts: 0, parked: false, parked_now: false };
+  }
+
+  db.prepare(
+    "UPDATE dental_agents SET homepage_fetch_attempts = homepage_fetch_attempts + 1 WHERE id = ?"
+  ).run(id);
+  const row = db
+    .prepare("SELECT homepage_fetch_attempts, homepage_unreachable_since FROM dental_agents WHERE id = ?")
+    .get(id) as { homepage_fetch_attempts: number; homepage_unreachable_since: string | null };
+
+  let parkedNow = false;
+  if (row.homepage_fetch_attempts >= DENTAL_PARK_AFTER_ATTEMPTS) {
+    const since = row.homepage_unreachable_since;
+    const expired = since !== null && Date.parse(since) <= Date.now() - DENTAL_PARK_BACKOFF_MS;
+    if (!since || expired) {
+      db.prepare("UPDATE dental_agents SET homepage_unreachable_since = ? WHERE id = ?")
+        .run(new Date().toISOString(), id);
+      parkedNow = true;
+    }
+  }
+  const parked = row.homepage_fetch_attempts >= DENTAL_PARK_AFTER_ATTEMPTS;
+  return { found: true, attempts: row.homepage_fetch_attempts, parked, parked_now: parkedNow };
+}
+
 export function listDentalAgents(
   filter: ListFilter = {},
   limit = 50,
-  offset = 0
+  offset = 0,
+  // enrichment-metode slice 1: opt-in exclusion of parked clinics so the
+  // enrichment routine's candidate listing skips dead homepages for 30d.
+  // Opt-in (4th param → route's ?exclude_parked=1) so existing consumers are
+  // byte-for-byte unchanged.
+  opts: { excludeParked?: boolean } = {}
 ): Array<DentalAgent & { id: string }> {
   const parsed = ListFilterSchema.parse(filter);
   const db = getDb("dental");
 
   const where: string[] = [];
   const params: Record<string, unknown> = {};
+
+  if (opts.excludeParked && process.env.DENTAL_HOMEPAGE_PARKING_DISABLED !== "true") {
+    where.push("(homepage_unreachable_since IS NULL OR homepage_unreachable_since <= datetime('now','-30 days'))");
+  }
 
   if (parsed.fylke) {
     where.push("fylke = @fylke");

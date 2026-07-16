@@ -68,6 +68,17 @@ export function initDentalSchema(db: Database.Database): void {
     console.log(`[dental] dental_agents init skipped: ${(e as Error).message}`);
   }
 
+  // ── Dead-homepage parking (enrichment-metode slice 1, 2026-07-16) ─────────
+  // Mirrors agent_knowledge's PR #248 columns: consecutive fetch-failure counter
+  // + park stamp at 3 (30d backoff). Idempotent ALTERs — error = already present.
+  const dentalParkingCols = [
+    "ALTER TABLE dental_agents ADD COLUMN homepage_fetch_attempts INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE dental_agents ADD COLUMN homepage_unreachable_since TEXT",
+  ];
+  for (const stmt of dentalParkingCols) {
+    try { db.exec(stmt); } catch { /* already present */ }
+  }
+
   // dental_persons — one row per practitioner (HPR-linked when known)
   try {
     db.exec(`

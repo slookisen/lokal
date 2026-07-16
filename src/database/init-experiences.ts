@@ -407,6 +407,12 @@ export function initExperiencesSchema(db: Database.Database): void {
     // as its own column (not alcohol_categories, which holds legal alcohol
     // GROUPS gruppe1/2/3, not product names).
     "ALTER TABLE experience_providers ADD COLUMN products TEXT",
+    // Dead-homepage parking (enrichment-metode slice 1, 2026-07-16): mirrors
+    // agent_knowledge's PR #248 columns — consecutive fetch-failure counter +
+    // park stamp at 3 (30d backoff). Both content-refresh selectors exclude
+    // parked providers unless EXPERIENCES_HOMEPAGE_PARKING_DISABLED=true.
+    "ALTER TABLE experience_providers ADD COLUMN homepage_fetch_attempts INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE experience_providers ADD COLUMN homepage_unreachable_since TEXT",
   ];
   for (const stmt of gardssalgContentCols) {
     try { db.exec(stmt); } catch { /* already present */ }
