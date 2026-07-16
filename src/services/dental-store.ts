@@ -864,16 +864,13 @@ export function listChains(): Array<{
   }));
 }
 
-export function updateDentalAgent(
-  id: string,
-  patch: Partial<DentalAgent>
-): boolean {
-  const db = getDb("dental");
-  const existing = getDentalAgentById(id);
-  if (!existing) return false;
-
-  // Allow-list — never let an UPDATE touch id or vertical.
-  const allowed: Array<keyof DentalAgent> = [
+// Allow-list of PUT-writable dental_agents fields — never id or vertical.
+// Exported (enrichment-metode slice 1 review fix) so the PUT route can compute
+// fields_updated as the INTERSECTION of the validated body and this list:
+// a schema-valid key outside the list (e.g. available_specialties, which is
+// derived from affiliations) is silently skipped by updateDentalAgent below,
+// and must therefore never be reported as written.
+export const DENTAL_AGENT_WRITABLE_FIELDS: ReadonlyArray<string> = [
     "org_nr",
     "navn",
     "postnummer",
@@ -922,6 +919,17 @@ export function updateDentalAgent(
     "social_media",
     "treatments_subtypes",
   ];
+
+export function updateDentalAgent(
+  id: string,
+  patch: Partial<DentalAgent>
+): boolean {
+  const db = getDb("dental");
+  const existing = getDentalAgentById(id);
+  if (!existing) return false;
+
+  // Allow-list — never let an UPDATE touch id or vertical.
+  const allowed: Array<keyof DentalAgent> = DENTAL_AGENT_WRITABLE_FIELDS as Array<keyof DentalAgent>;
 
   // PR-100: columns that must be JSON.stringify'd before SQL bind.
   // Mirrors the existing pattern for treatments / languages_spoken.

@@ -30,6 +30,7 @@ import {
   normalizeOpeningHours,
   // enrichment-metode slice 1 (2026-07-16): dead-homepage parking
   recordDentalHomepageFetchResult,
+  DENTAL_AGENT_WRITABLE_FIELDS,
 } from "../services/dental-store";
 import { getDb } from "../database/db-factory";
 import { isDisplayablePhone } from "../services/contact-normalizer";
@@ -264,7 +265,10 @@ router.put("/agents/:id", requireAdmin, (req: Request, res: Response) => {
       updated: true,
       // enrichment-metode slice 1: the fields this PUT actually wrote — lets
       // the enrichment routine count agents_enriched truthfully (>=1 field).
-      fields_updated: Object.keys(result.data),
+      // Intersected with the store's allow-list (review fix): a schema-valid
+      // key updateDentalAgent skips (id, available_specialties) is NOT written
+      // and must not be counted.
+      fields_updated: Object.keys(result.data).filter((k) => DENTAL_AGENT_WRITABLE_FIELDS.includes(k)),
       ...(strippedFields.length ? { stripped_fields: strippedFields } : {}),
       ...(openingHoursDropped ? { opening_hours_dropped: openingHoursDropped } : {}),
     });

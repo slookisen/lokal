@@ -28892,7 +28892,17 @@ console.log("\n── enrichment-metode-slice1: dead-homepage parking (dental + 
     // (7) unknown id → found:false
     assertEq(dstore.recordDentalHomepageFetchResult("no-such-id", false).found, false, "ems1-15: unknown id → found=false");
 
-    console.log("  enrichment-metode-slice1 (dental): OK (15 assertions)");
+    // (8) fields_updated truthfulness (review fix): the PUT route intersects
+    // Object.keys(body) with DENTAL_AGENT_WRITABLE_FIELDS — schema-valid keys
+    // updateDentalAgent silently skips must NOT be countable as written.
+    assertEq((dstore as any).DENTAL_AGENT_WRITABLE_FIELDS.includes("available_specialties"), false,
+      "ems1-15b: available_specialties (derived) is NOT PUT-writable");
+    assertEq((dstore as any).DENTAL_AGENT_WRITABLE_FIELDS.includes("id"), false,
+      "ems1-15c: id is NOT PUT-writable");
+    assertEq((dstore as any).DENTAL_AGENT_WRITABLE_FIELDS.includes("hjemmeside"), true,
+      "ems1-15d: hjemmeside IS PUT-writable (sanity)");
+
+    console.log("  enrichment-metode-slice1 (dental): OK (18 assertions)");
   } catch (err) {
     failed++;
     failures.push(`enrichment-metode-slice1 dental: unexpected error: ${err instanceof Error ? (err.stack || err.message) : String(err)}`);
