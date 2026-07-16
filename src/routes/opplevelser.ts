@@ -1414,6 +1414,111 @@ router.get("/admin/gardssalg-provider-lookup", requireAdmin, (req: Request, res:
   res.json({ matches });
 });
 
+// ─── GET /api/opplevelser/admin/providers/recently-enriched ──────────────────
+//
+// Slice 5 of dev-request 2026-07-13-enrichment-metode-maldrevet-evidens:
+// mirrors marketplace.ts's GET /admin/agents/recently-enriched and
+// dental.ts's GET /admin/agents/recently-enriched for the experiences
+// vertical — a random sample of recently-enriched providers for the
+// platform-verifier's weekly homepage spot-check. Serves the sample only;
+// the spot-check logic (re-fetch + compare + escalate) lives in a
+// separate SKILL.
+//
+// Uses "providers" (not "agents") in both the route and the response key,
+// matching this file's existing naming (gardssalg-provider-lookup,
+// experience_providers) rather than the rfb/dental "agents" convention.
+//
+// NOTE (experiences has no field_provenance column — see the LOCK MODEL
+// comment near getProviderByName/ContentRefreshTarget above): this
+// response omits field_provenance entirely in favor of an explicit
+// `provenance_model: "none"` marker, rather than inventing a fake
+// rfb-shaped provenance object. The content fields returned instead
+// (about_text/visit_text/opening_hours_text/products/content_source/
+// content_evidence_url) are exactly what the gårdssalg content-refresh
+// writer (applyProviderContent et al.) fills from a provider's homepage —
+// i.e. what a homepage-truth spot-check would need to verify.
+//
+// Query params:
+//   ?since=<ISO-8601>  — default: 7 days before now (also the fallback
+//                        for an unparseable value)
+//   ?limit=<int>       — default 10, clamped to [1, 50]
+//
+// Auth: requireAdmin (same X-Admin-Key convention as the rest of this file).
+// Returns: 200 { success, count, providers: [{ id, name, website,
+//   last_enriched_at, about_text, visit_text, opening_hours_text,
+//   products, content_source, content_evidence_url, field_provenance: null,
+//   provenance_model: "none" }] }
+router.get("/admin/providers/recently-enriched", requireAdmin, (req: Request, res: Response) => {
+  try {
+    const expDb = getExpDb("experiences");
+
+    const DEFAULT_SINCE_DAYS = 7;
+    let since = new Date(Date.now() - DEFAULT_SINCE_DAYS * 24 * 60 * 60 * 1000).toISOString();
+    const sinceParam = req.query.since;
+    if (typeof sinceParam === "string" && sinceParam.trim()) {
+      const parsed = new Date(sinceParam);
+      if (!isNaN(parsed.getTime())) {
+        since = parsed.toISOString();
+      }
+    }
+
+    let limit = parseInt((req.query.limit as string) || "10", 10);
+    if (!Number.isFinite(limit)) limit = 10;
+    limit = Math.min(50, Math.max(1, limit));
+
+    const rows = expDb
+      .prepare(
+        `SELECT id, navn, hjemmeside, last_enriched_at, about_text, visit_text,
+                opening_hours_text, products, content_source, content_evidence_url
+           FROM experience_providers
+          WHERE last_enriched_at >= ?
+          ORDER BY RANDOM()
+          LIMIT ?`
+      )
+      .all(since, limit) as Array<{
+        id: string;
+        navn: string;
+        hjemmeside: string | null;
+        last_enriched_at: string | null;
+        about_text: string | null;
+        visit_text: string | null;
+        opening_hours_text: string | null;
+        products: string | null;
+        content_source: string | null;
+        content_evidence_url: string | null;
+      }>;
+
+    const providers = rows.map((r) => {
+      let products: unknown[] = [];
+      if (r.products) {
+        try {
+          const parsed = JSON.parse(r.products);
+          if (Array.isArray(parsed)) products = parsed;
+        } catch { /* malformed → empty */ }
+      }
+      return {
+        id: r.id,
+        name: r.navn,
+        website: r.hjemmeside,
+        last_enriched_at: r.last_enriched_at,
+        about_text: r.about_text,
+        visit_text: r.visit_text,
+        opening_hours_text: r.opening_hours_text,
+        products,
+        content_source: r.content_source,
+        content_evidence_url: r.content_evidence_url,
+        field_provenance: null,
+        provenance_model: "none",
+      };
+    });
+
+    res.json({ success: true, count: providers.length, providers });
+  } catch (err: any) {
+    console.error("[opplevelser] providers/recently-enriched failed", err);
+    res.status(500).json({ error: "Internal error" });
+  }
+});
+
 // ─── GET /api/opplevelser/admin/detail-completeness-coverage ─────────────────
 //
 // dev-request 2026-07-04-opplevagent-dedup-og-norske-titler, item 3 ("detail

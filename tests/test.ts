@@ -21779,6 +21779,7 @@ console.log("\n── orch-pr-14: MCP discovery product_id surfacing ──");
   try { await _adminAgentsDeletePromise; } catch { /* errors already pushed to failures */ }
   try { await _adminClaimFunnelPromise; } catch { /* errors already pushed to failures */ }
   try { await _selgerHtmlOpenTrackingPromise; } catch { /* errors already pushed to failures */ }
+  try { await _recentlyEnrichedSpotcheckPromise; } catch { /* errors already pushed to failures */ }
   // relax-envelope tests are synchronous (pure validateEnvelope() unit test) — no promise needed
   // PR-109 tests are synchronous (IIFE) — no promise needed
   // Drop pre-existing intg failures (unmasked by awaiting) — they predate M2
@@ -27419,6 +27420,72 @@ const _selgerHtmlOpenTrackingPromise: Promise<void> = new Promise<void>(r => {
     failures.push("selger-html-open-tracking: unexpected error: " + String(err?.message || err));
   } finally {
     _selgerHtmlOpenTrackingResolve();
+  }
+})();
+
+// ═══════════════════════════════════════════════════════════════════════
+// orch-pr-20260716-305-verifier-enrichment-spotcheck: GET .../recently-
+// enriched read-only sample endpoints (rfb + dental + experiences) that
+// back the platform-verifier's weekly homepage spot-check (slice 5 of
+// dev-request 2026-07-13-enrichment-metode-maldrevet-evidens). The rfb
+// block swaps the shared getDb() singleton — mirrors the
+// selger-html-open-tracking block immediately above, so it must run
+// strictly after it; _selgerHtmlOpenTrackingPromise is the current tail
+// of that serial chain. The dental/experiences blocks use their own
+// isolated db-factory handles (DENTAL_DB_PATH / EXPERIENCES_DB_PATH =
+// ":memory:") and never touch the rfb singleton, but run in this same
+// sequential block for simplicity.
+let _recentlyEnrichedSpotcheckResolve: () => void = () => {};
+const _recentlyEnrichedSpotcheckPromise: Promise<void> = new Promise<void>(r => {
+  _recentlyEnrichedSpotcheckResolve = r;
+});
+
+(async () => {
+  await Promise.allSettled([_selgerHtmlOpenTrackingPromise]);
+  await new Promise(r => setImmediate(r));
+
+  console.log("\n── orch-pr-20260716-305: GET /admin/agents/recently-enriched (rfb) ──");
+  try {
+    const { runAdminAgentsRecentlyEnrichedTests } = require("../src/routes/admin-agents-recently-enriched.test") as
+      typeof import("../src/routes/admin-agents-recently-enriched.test");
+    const are = await runAdminAgentsRecentlyEnrichedTests({ log: false });
+    passed += are.passed;
+    failed += are.failed;
+    for (const f of are.failures) failures.push("admin-agents-recently-enriched: " + f);
+    console.log(`  admin-agents-recently-enriched: ${are.passed} passed, ${are.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("admin-agents-recently-enriched: unexpected error: " + String(err?.message || err));
+  }
+
+  console.log("\n── orch-pr-20260716-305: GET /api/tannlege/admin/agents/recently-enriched (dental) ──");
+  try {
+    const { runDentalAgentsRecentlyEnrichedTests } = require("../src/routes/dental-agents-recently-enriched.test") as
+      typeof import("../src/routes/dental-agents-recently-enriched.test");
+    const dre = await runDentalAgentsRecentlyEnrichedTests({ log: false });
+    passed += dre.passed;
+    failed += dre.failed;
+    for (const f of dre.failures) failures.push("dental-agents-recently-enriched: " + f);
+    console.log(`  dental-agents-recently-enriched: ${dre.passed} passed, ${dre.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("dental-agents-recently-enriched: unexpected error: " + String(err?.message || err));
+  }
+
+  console.log("\n── orch-pr-20260716-305: GET /api/opplevelser/admin/providers/recently-enriched (experiences) ──");
+  try {
+    const { runOpplevelserProvidersRecentlyEnrichedTests } = require("../src/routes/opplevelser-providers-recently-enriched.test") as
+      typeof import("../src/routes/opplevelser-providers-recently-enriched.test");
+    const ore = await runOpplevelserProvidersRecentlyEnrichedTests({ log: false });
+    passed += ore.passed;
+    failed += ore.failed;
+    for (const f of ore.failures) failures.push("opplevelser-providers-recently-enriched: " + f);
+    console.log(`  opplevelser-providers-recently-enriched: ${ore.passed} passed, ${ore.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("opplevelser-providers-recently-enriched: unexpected error: " + String(err?.message || err));
+  } finally {
+    _recentlyEnrichedSpotcheckResolve();
   }
 })();
 
