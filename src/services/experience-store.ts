@@ -1481,6 +1481,59 @@ export type ContentRefreshTarget = {
  * controller-handoff/2026-07-05-experiences-enrichment-content-refresh-
  * aggregator-1.md). Capped by `limit`.
  */
+// ── Dead-homepage parking (enrichment-metode slice 1, 2026-07-16) ────────────
+// Mirrors the RFB PR #248 semantics exactly: 3 consecutive fetch failures park
+// the provider (homepage_unreachable_since stamped) for 30 days; a successful
+// fetch fully resets. RE-STAMP on failure after an expired backoff — without it
+// a stale timestamp keeps satisfying the `<= now-30d` exclusion forever and a
+// still-dead provider reverts to being selected every run (PR #248 review
+// blocker, inherited here). Env EXPERIENCES_HOMEPAGE_PARKING_DISABLED=true
+// bypasses the selector exclusion (rollback flag, read per query).
+export const PROVIDER_PARK_AFTER_ATTEMPTS = 3;
+export const PROVIDER_PARK_BACKOFF_MS = 30 * 86_400_000;
+
+export function providerParkingExclusionSql(alias = ""): string {
+  if (process.env.EXPERIENCES_HOMEPAGE_PARKING_DISABLED === "true") return "";
+  const col = alias ? `${alias}.homepage_unreachable_since` : "homepage_unreachable_since";
+  return `AND (${col} IS NULL OR ${col} <= datetime('now','-30 days'))`;
+}
+
+export function recordProviderHomepageFetchResult(
+  providerId: string,
+  ok: boolean,
+): { found: boolean; attempts: number; parked: boolean; parked_now: boolean } {
+  const db = getDb(VERTICAL);
+  const exists = db.prepare("SELECT id FROM experience_providers WHERE id = ?").get(providerId);
+  if (!exists) return { found: false, attempts: 0, parked: false, parked_now: false };
+
+  if (ok) {
+    db.prepare(
+      "UPDATE experience_providers SET homepage_fetch_attempts = 0, homepage_unreachable_since = NULL WHERE id = ?"
+    ).run(providerId);
+    return { found: true, attempts: 0, parked: false, parked_now: false };
+  }
+
+  db.prepare(
+    "UPDATE experience_providers SET homepage_fetch_attempts = homepage_fetch_attempts + 1 WHERE id = ?"
+  ).run(providerId);
+  const row = db
+    .prepare("SELECT homepage_fetch_attempts, homepage_unreachable_since FROM experience_providers WHERE id = ?")
+    .get(providerId) as { homepage_fetch_attempts: number; homepage_unreachable_since: string | null };
+
+  let parkedNow = false;
+  if (row.homepage_fetch_attempts >= PROVIDER_PARK_AFTER_ATTEMPTS) {
+    const since = row.homepage_unreachable_since;
+    const expired = since !== null && Date.parse(since) <= Date.now() - PROVIDER_PARK_BACKOFF_MS;
+    if (!since || expired) {
+      db.prepare("UPDATE experience_providers SET homepage_unreachable_since = ? WHERE id = ?")
+        .run(new Date().toISOString(), providerId);
+      parkedNow = true;
+    }
+  }
+  const parked = row.homepage_fetch_attempts >= PROVIDER_PARK_AFTER_ATTEMPTS;
+  return { found: true, attempts: row.homepage_fetch_attempts, parked, parked_now: parkedNow };
+}
+
 export function selectProvidersForContentRefresh(limit = 25): ContentRefreshTarget[] {
   const db = getDb(VERTICAL);
   const cap = Math.max(1, Math.min(100, limit));
@@ -1516,6 +1569,7 @@ export function selectProvidersForContentRefresh(limit = 25): ContentRefreshTarg
                   OR e.category    IS NULL OR TRIM(e.category)    = ''
                    )
           )
+          ${providerParkingExclusionSql("p")}
         ORDER BY (p.last_content_attempt_at IS NOT NULL), p.last_content_attempt_at ASC, p.created_at ASC
         LIMIT ?`
     )
@@ -1878,6 +1932,7 @@ export function selectGardssalgProvidersForContentRefresh(limit = 25): Gardssalg
              OR visit_text IS NULL OR TRIM(visit_text) = ''
              OR opening_hours_text IS NULL OR TRIM(opening_hours_text) = ''
               )
+          ${providerParkingExclusionSql()}
         ORDER BY (last_content_attempt_at IS NOT NULL), last_content_attempt_at ASC, created_at ASC
         LIMIT ?`
     )

@@ -28811,3 +28811,161 @@ console.log("\n── gardssalg-rfb-enrich: strict-match + skip-junk + lock rule
 
   console.log("  gardssalg-rfb-enrich: OK (29 assertions)");
 }
+
+
+// ── enrichment-metode slice 1: dead-homepage parking (dental + experiences) ──
+// dev-request 2026-07-13-enrichment-metode-maldrevet-evidens, slice 1 (Daniel
+// direkte-GO 2026-07-15). Proves the PR #248 parking semantics ported to both
+// verticals: 3 consecutive fetch failures park (30d), success fully resets,
+// RE-STAMP after expired backoff (the #248 review blocker), selector/list
+// exclusion honors the park + the rollback env flag.
+console.log("\n── enrichment-metode-slice1: dead-homepage parking (dental + experiences) ──");
+(() => {
+  // ── Dental ──────────────────────────────────────────────────────────
+  const prevDentalPath = process.env.DENTAL_DB_PATH;
+  process.env.DENTAL_DB_PATH = ":memory:";
+  const prevDentalFlag = process.env.DENTAL_HOMEPAGE_PARKING_DISABLED;
+  delete process.env.DENTAL_HOMEPAGE_PARKING_DISABLED;
+
+  const dbFacPathEms = require.resolve("../src/database/db-factory");
+  const dentalStorePathEms = require.resolve("../src/services/dental-store");
+  delete require.cache[dbFacPathEms];
+  delete require.cache[dentalStorePathEms];
+  const dbFacEms = require("../src/database/db-factory") as typeof import("../src/database/db-factory");
+  dbFacEms.__resetDbFactoryForTesting();
+  const dstore = require("../src/services/dental-store") as typeof import("../src/services/dental-store");
+
+  try {
+    const dentalDb = dbFacEms.getDb("dental");
+
+    const idA = dstore.createDentalAgent({ navn: "Parkert Tannlege AS", org_nr: "911000111", hjemmeside: "https://dead.example.no" } as any);
+    const idB = dstore.createDentalAgent({ navn: "Frisk Tannlege AS", org_nr: "911000222", hjemmeside: "https://alive.example.no" } as any);
+
+    // (1) two failures → counted, NOT parked yet
+    dstore.recordDentalHomepageFetchResult(idA, false);
+    let r = dstore.recordDentalHomepageFetchResult(idA, false);
+    assertEq(r.attempts, 2, "ems1-01: two failures → attempts=2");
+    assertEq(r.parked, false, "ems1-02: not parked before 3 strikes");
+
+    // (2) third failure → parked_now
+    r = dstore.recordDentalHomepageFetchResult(idA, false);
+    assertEq(r.parked, true, "ems1-03: third failure → parked");
+    assertEq(r.parked_now, true, "ems1-04: parked_now flagged on the crossing failure");
+
+    // (3) excluded from exclude_parked listing; B remains
+    const listed = dstore.listDentalAgents({}, 50, 0, { excludeParked: true }).map((a: any) => a.id);
+    assertEq(listed.includes(idA), false, "ems1-05: parked clinic excluded with excludeParked");
+    assertEq(listed.includes(idB), true, "ems1-06: non-parked clinic still listed");
+    // default listing unchanged (opt-in)
+    const listedAll = dstore.listDentalAgents({}, 50, 0).map((a: any) => a.id);
+    assertEq(listedAll.includes(idA), true, "ems1-07: default listing (no opt) is unchanged");
+
+    // (4) env rollback flag bypasses the exclusion
+    process.env.DENTAL_HOMEPAGE_PARKING_DISABLED = "true";
+    const listedFlag = dstore.listDentalAgents({}, 50, 0, { excludeParked: true }).map((a: any) => a.id);
+    assertEq(listedFlag.includes(idA), true, "ems1-08: DENTAL_HOMEPAGE_PARKING_DISABLED=true bypasses exclusion");
+    delete process.env.DENTAL_HOMEPAGE_PARKING_DISABLED;
+
+    // (5) success fully resets
+    r = dstore.recordDentalHomepageFetchResult(idA, true);
+    assertEq(r.attempts, 0, "ems1-09: success resets attempts");
+    assertEq(r.parked, false, "ems1-10: success clears the park");
+    const listedAfter = dstore.listDentalAgents({}, 50, 0, { excludeParked: true }).map((a: any) => a.id);
+    assertEq(listedAfter.includes(idA), true, "ems1-11: un-parked clinic re-listed");
+
+    // (6) RE-STAMP after expired backoff (the #248 review blocker): park again,
+    // backdate the stamp 31 days, fail once more → fresh stamp (parked_now).
+    dstore.recordDentalHomepageFetchResult(idA, false);
+    dstore.recordDentalHomepageFetchResult(idA, false);
+    dstore.recordDentalHomepageFetchResult(idA, false);
+    dentalDb.prepare("UPDATE dental_agents SET homepage_unreachable_since = ? WHERE id = ?")
+      .run(new Date(Date.now() - 31 * 86_400_000).toISOString(), idA);
+    // expired backoff → clinic re-eligible in the listing...
+    const listedExpired = dstore.listDentalAgents({}, 50, 0, { excludeParked: true }).map((a: any) => a.id);
+    assertEq(listedExpired.includes(idA), true, "ems1-12: expired backoff → retried (listed again)");
+    // ...but a NEW failure re-stamps (else it would stay eligible forever)
+    r = dstore.recordDentalHomepageFetchResult(idA, false);
+    assertEq(r.parked_now, true, "ems1-13: failure after expired backoff RE-STAMPS the park");
+    const listedRestamp = dstore.listDentalAgents({}, 50, 0, { excludeParked: true }).map((a: any) => a.id);
+    assertEq(listedRestamp.includes(idA), false, "ems1-14: re-stamped clinic excluded again");
+
+    // (7) unknown id → found:false
+    assertEq(dstore.recordDentalHomepageFetchResult("no-such-id", false).found, false, "ems1-15: unknown id → found=false");
+
+    // (8) fields_updated truthfulness (review fix): the PUT route intersects
+    // Object.keys(body) with DENTAL_AGENT_WRITABLE_FIELDS — schema-valid keys
+    // updateDentalAgent silently skips must NOT be countable as written.
+    assertEq((dstore as any).DENTAL_AGENT_WRITABLE_FIELDS.includes("available_specialties"), false,
+      "ems1-15b: available_specialties (derived) is NOT PUT-writable");
+    assertEq((dstore as any).DENTAL_AGENT_WRITABLE_FIELDS.includes("id"), false,
+      "ems1-15c: id is NOT PUT-writable");
+    assertEq((dstore as any).DENTAL_AGENT_WRITABLE_FIELDS.includes("hjemmeside"), true,
+      "ems1-15d: hjemmeside IS PUT-writable (sanity)");
+
+    console.log("  enrichment-metode-slice1 (dental): OK (18 assertions)");
+  } catch (err) {
+    failed++;
+    failures.push(`enrichment-metode-slice1 dental: unexpected error: ${err instanceof Error ? (err.stack || err.message) : String(err)}`);
+  } finally {
+    if (prevDentalPath === undefined) delete process.env.DENTAL_DB_PATH; else process.env.DENTAL_DB_PATH = prevDentalPath;
+    if (prevDentalFlag === undefined) delete process.env.DENTAL_HOMEPAGE_PARKING_DISABLED; else process.env.DENTAL_HOMEPAGE_PARKING_DISABLED = prevDentalFlag;
+    dbFacEms.__resetDbFactoryForTesting();
+  }
+})();
+
+(() => {
+  // ── Experiences ─────────────────────────────────────────────────────
+  const prevExpPath = process.env.EXPERIENCES_DB_PATH;
+  process.env.EXPERIENCES_DB_PATH = ":memory:";
+  const prevExpFlag = process.env.EXPERIENCES_HOMEPAGE_PARKING_DISABLED;
+  delete process.env.EXPERIENCES_HOMEPAGE_PARKING_DISABLED;
+
+  const dbFacPathEms2 = require.resolve("../src/database/db-factory");
+  const expStorePathEms2 = require.resolve("../src/services/experience-store");
+  delete require.cache[dbFacPathEms2];
+  delete require.cache[expStorePathEms2];
+  const dbFacEms2 = require("../src/database/db-factory") as typeof import("../src/database/db-factory");
+  dbFacEms2.__resetDbFactoryForTesting();
+  const estore = require("../src/services/experience-store") as typeof import("../src/services/experience-store");
+
+  try {
+    const expDb = dbFacEms2.getDb("experiences");
+
+    // A gårdssalg provider with a (dead) website and thin content — eligible
+    // for the gardssalg content-refresh selector until parked.
+    const pid = estore.createProvider({ navn: "Dødside Sideri AS", org_nr: "922000111", fylke: "Vestland", kommune: "Ulvik" } as any);
+    expDb.prepare("UPDATE experience_providers SET producer_type = ?, hjemmeside = ? WHERE id = ?")
+      .run("cideri", "https://dead-sideri.example.no", pid);
+
+    const selectedBefore = estore.selectGardssalgProvidersForContentRefresh(48).map((t: any) => t.id);
+    assertEq(selectedBefore.includes(pid), true, "ems1-16: thin provider with website selected before parking");
+
+    // 3 strikes → parked → excluded from BOTH selectors
+    estore.recordProviderHomepageFetchResult(pid, false);
+    estore.recordProviderHomepageFetchResult(pid, false);
+    const r3 = estore.recordProviderHomepageFetchResult(pid, false);
+    assertEq(r3.parked_now, true, "ems1-17: 3rd failure parks the provider");
+    const selectedAfter = estore.selectGardssalgProvidersForContentRefresh(48).map((t: any) => t.id);
+    assertEq(selectedAfter.includes(pid), false, "ems1-18: parked provider excluded from gardssalg selector");
+
+    // env rollback flag bypasses
+    process.env.EXPERIENCES_HOMEPAGE_PARKING_DISABLED = "true";
+    const selectedFlag = estore.selectGardssalgProvidersForContentRefresh(48).map((t: any) => t.id);
+    assertEq(selectedFlag.includes(pid), true, "ems1-19: EXPERIENCES_HOMEPAGE_PARKING_DISABLED=true bypasses exclusion");
+    delete process.env.EXPERIENCES_HOMEPAGE_PARKING_DISABLED;
+
+    // success resets → re-selected
+    estore.recordProviderHomepageFetchResult(pid, true);
+    const selectedReset = estore.selectGardssalgProvidersForContentRefresh(48).map((t: any) => t.id);
+    assertEq(selectedReset.includes(pid), true, "ems1-20: success reset → provider re-selected");
+
+    console.log("  enrichment-metode-slice1 (experiences): OK (5 assertions)");
+  } catch (err) {
+    failed++;
+    failures.push(`enrichment-metode-slice1 experiences: unexpected error: ${err instanceof Error ? (err.stack || err.message) : String(err)}`);
+  } finally {
+    if (prevExpPath === undefined) delete process.env.EXPERIENCES_DB_PATH; else process.env.EXPERIENCES_DB_PATH = prevExpPath;
+    if (prevExpFlag === undefined) delete process.env.EXPERIENCES_HOMEPAGE_PARKING_DISABLED; else process.env.EXPERIENCES_HOMEPAGE_PARKING_DISABLED = prevExpFlag;
+    dbFacEms2.__resetDbFactoryForTesting();
+  }
+})();

@@ -33,6 +33,8 @@ import {
   applyExperienceContent,
   markProviderEnriched,
   markProviderContentAttempted,
+  // enrichment-metode slice 1 (2026-07-16): dead-homepage parking
+  recordProviderHomepageFetchResult,
   type ContentRefreshTarget,
   // dev-request 2026-07-03-gardssalg-rike-profiler-bilder-agentbooking, Fase 1
   // item 3 — multi-page-crawl content enrichment (about/visit/opening-hours)
@@ -557,6 +559,9 @@ router.post("/admin/content-refresh", requireAdmin, async (req: Request, res: Re
   const changed: Array<{ provider_id: string; fields: string[]; provenance: ProvenanceMap }> = [];
   const skippedLocked: Array<{ provider_id: string; experience_ids: string[] }> = [];
   const errors: Array<{ provider_id: string; error: string }> = [];
+  // Providers that crossed the 3-failure parking threshold THIS run
+  // (enrichment-metode slice 1; mirrors provenance-batch's parked_now).
+  const parkedNow: string[] = [];
 
   async function processOne(t: ContentRefreshTarget): Promise<void> {
     const providerId = t.id;
@@ -576,11 +581,28 @@ router.post("/admin/content-refresh", requireAdmin, async (req: Request, res: Re
       fetched = await crFetchHomepageContent(t.hjemmeside);
     } catch (e: any) {
       errors.push({ provider_id: providerId, error: e?.message ?? String(e) });
+      // Dead-homepage parking (enrichment-metode slice 1): count the failure;
+      // 3 strikes park the provider 30d (apply mode only — dry-run never writes).
+      if (apply) {
+        try {
+          const p = recordProviderHomepageFetchResult(providerId, false);
+          if (p.parked_now) parkedNow.push(providerId);
+        } catch { /* best-effort */ }
+      }
       return;
     }
     if (!fetched) {
       errors.push({ provider_id: providerId, error: `fetch_failed for ${t.hjemmeside}` });
+      if (apply) {
+        try {
+          const p = recordProviderHomepageFetchResult(providerId, false);
+          if (p.parked_now) parkedNow.push(providerId);
+        } catch { /* best-effort */ }
+      }
       return;
+    }
+    if (apply) {
+      try { recordProviderHomepageFetchResult(providerId, true); } catch { /* best-effort */ }
     }
     const { primaryHtml, combinedHtml } = fetched;
 
@@ -699,10 +721,15 @@ router.post("/admin/content-refresh", requireAdmin, async (req: Request, res: Re
   res.json({
     dry_run: dryRun,
     scanned,
+    // agents_enriched: the method's PRIMARY success metric (enrichment-metode
+    // slice 1) — providers that actually had >=1 field improved this run.
+    agents_enriched: changed.length,
     by_field: byField,
     changed,
     skipped_locked: skippedLocked,
     errors,
+    // Providers parked (3 consecutive fetch failures) during THIS run.
+    parked_now: parkedNow,
   });
 });
 
@@ -831,6 +858,9 @@ router.post("/admin/gardssalg-content-refresh", requireAdmin, async (req: Reques
   const changed: Array<{ provider_id: string; fields: string[]; provenance: GsProvenanceMap }> = [];
   const skippedLocked: string[] = [];
   const errors: Array<{ provider_id: string; error: string }> = [];
+  // Providers that crossed the 3-failure parking threshold THIS run
+  // (enrichment-metode slice 1; mirrors provenance-batch's parked_now).
+  const parkedNow: string[] = [];
 
   async function processOne(t: GardssalgContentRefreshTarget): Promise<void> {
     const providerId = t.id;
@@ -856,11 +886,28 @@ router.post("/admin/gardssalg-content-refresh", requireAdmin, async (req: Reques
       fetched = await crFetchGardssalgContent(t.hjemmeside);
     } catch (e: any) {
       errors.push({ provider_id: providerId, error: e?.message ?? String(e) });
+      // Dead-homepage parking (enrichment-metode slice 1): count the failure;
+      // 3 strikes park the provider 30d (apply mode only — dry-run never writes).
+      if (apply) {
+        try {
+          const p = recordProviderHomepageFetchResult(providerId, false);
+          if (p.parked_now) parkedNow.push(providerId);
+        } catch { /* best-effort */ }
+      }
       return;
     }
     if (!fetched) {
       errors.push({ provider_id: providerId, error: `fetch_failed for ${t.hjemmeside}` });
+      if (apply) {
+        try {
+          const p = recordProviderHomepageFetchResult(providerId, false);
+          if (p.parked_now) parkedNow.push(providerId);
+        } catch { /* best-effort */ }
+      }
       return;
+    }
+    if (apply) {
+      try { recordProviderHomepageFetchResult(providerId, true); } catch { /* best-effort */ }
     }
     scanned++;
     const { primaryHtml, combinedHtml } = fetched;
@@ -926,10 +973,15 @@ router.post("/admin/gardssalg-content-refresh", requireAdmin, async (req: Reques
   res.json({
     dry_run: dryRun,
     scanned,
+    // agents_enriched: the method's PRIMARY success metric (enrichment-metode
+    // slice 1) — providers that actually had >=1 field improved this run.
+    agents_enriched: changed.length,
     by_field: byField,
     changed,
     skipped_locked: skippedLocked,
     errors,
+    // Providers parked (3 consecutive fetch failures) during THIS run.
+    parked_now: parkedNow,
   });
 });
 
