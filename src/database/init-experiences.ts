@@ -434,5 +434,18 @@ export function initExperiencesSchema(db: Database.Database): void {
     db.exec("ALTER TABLE experience_providers ADD COLUMN booking_live INTEGER DEFAULT 0");
   } catch { /* already present */ }
 
+  // ─── Booking-flyt-v1 hidden test provider (dev-request 2026-07-14-booking-
+  // flyt-v1, slice 0) ─────────────────────────────────────────────────────────
+  // catalog_hidden gates a provider OUT of the public gårdssalg catalog + count
+  // (listGardssalgProviders()/countGardssalgProviders() filter rows carrying it)
+  // while keeping it fully bookable by slug (getGardssalgProviderBySlug() does
+  // NOT filter) — the mechanism behind a controlled end-to-end booking test
+  // whose producer notification is routed only to Daniel's inbox. Defaults 0
+  // (visible) so every existing row keeps today's behavior the instant this
+  // column exists; nothing but the admin test-provider endpoint ever sets it 1.
+  try {
+    db.exec("ALTER TABLE experience_providers ADD COLUMN catalog_hidden INTEGER DEFAULT 0");
+  } catch { /* already present */ }
+
   console.log("[experiences] schema initialized");
 }

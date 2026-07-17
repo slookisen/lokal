@@ -1786,7 +1786,12 @@ export function countGardssalgProviders(): number {
   const row = db
     .prepare(
       "SELECT COUNT(*) AS c FROM experience_providers " +
-      "WHERE producer_type IS NOT NULL OR rfb_seed_source = 'rfb-seed'"
+      // Parens are load-bearing: without them the trailing AND would bind
+      // tighter than the OR and change the set. catalog_hidden=1 rows (the
+      // hidden booking-flyt-v1 test provider) never bump the count that gates
+      // gardssalgVisible() (dev-request 2026-07-14-booking-flyt-v1, slice 0).
+      "WHERE (producer_type IS NOT NULL OR rfb_seed_source = 'rfb-seed') " +
+      "AND (catalog_hidden IS NULL OR catalog_hidden != 1)"
     )
     .get() as { c: number };
   return row.c;
@@ -1840,18 +1845,30 @@ export type GardssalgProviderRow = {
   // category-card "coming soon" notices, and by the booking submission gate
   // in routes/opplevelser.ts + routes/experiences-seo.ts.
   booking_live: number | null;
+  // Additive (2026-07-14, dev-request 2026-07-14-booking-flyt-v1, slice 0):
+  // hidden-from-catalog flag. 1 = kept out of the public gårdssalg grid + count
+  // (listGardssalgProviders()/countGardssalgProviders() filter it) but STILL
+  // bookable by slug (getGardssalgProviderBySlug() deliberately does not filter)
+  // — the mechanism behind the controlled end-to-end booking test. 0/NULL =
+  // today's behavior (visible). Only the admin test-provider endpoint sets it 1.
+  catalog_hidden: number | null;
 };
 
 const GARDSSALG_PROVIDER_COLUMNS =
-  "id, navn, hjemmeside, fylke, kommune, poststed, producer_type, enrichment_state, slug, adresse, lat, lon, geocode_confidence, epost, telefon, about_text, visit_text, opening_hours_text, products, booking_live";
+  "id, navn, hjemmeside, fylke, kommune, poststed, producer_type, enrichment_state, slug, adresse, lat, lon, geocode_confidence, epost, telefon, about_text, visit_text, opening_hours_text, products, booking_live, catalog_hidden";
 
 export function listGardssalgProviders(limit = 100, offset = 0): GardssalgProviderRow[] {
   const db = getDb(VERTICAL);
   return db
     .prepare(
+      // catalog_hidden=1 rows (the hidden booking-flyt-v1 test provider) are
+      // filtered out of the public grid; they stay bookable only via
+      // getGardssalgProviderBySlug() below. Parens around the OR are
+      // load-bearing (dev-request 2026-07-14-booking-flyt-v1, slice 0).
       `SELECT ${GARDSSALG_PROVIDER_COLUMNS}
          FROM experience_providers
-        WHERE producer_type IS NOT NULL OR rfb_seed_source = 'rfb-seed'
+        WHERE (producer_type IS NOT NULL OR rfb_seed_source = 'rfb-seed')
+          AND (catalog_hidden IS NULL OR catalog_hidden != 1)
         ORDER BY navn
         LIMIT ? OFFSET ?`
     )

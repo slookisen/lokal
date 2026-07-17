@@ -1176,6 +1176,93 @@ router.post("/admin/rfb-seed", requireAdmin, (req: Request, res: Response) => {
   });
 });
 
+// ─── POST /api/opplevelser/admin/gardssalg/test-provider ─────────────────────
+//
+// dev-request 2026-07-14-booking-flyt-v1, slice 0: idempotent upsert of ONE
+// hidden test gårdssalg provider used to drive a controlled end-to-end booking
+// test. The row is catalog_hidden=1 — never in the public grid, the
+// countGardssalgProviders() gate, or the sitemap (see listGardssalgProviders()/
+// countGardssalgProviders() in experience-store.ts) — yet booking_live=1 and
+// fully bookable by slug, so a booking POST against it (with
+// BOOKING_DISPATCH_ENABLED=true) exercises the real reserve→confirm chain and
+// dispatches the producer notification to the email supplied here (Daniel's
+// inbox), and nowhere else. This endpoint never emails anyone itself; it only
+// writes, and only when called with the admin key. Idempotent: re-running with
+// the same slug/test org_nr updates the one existing row instead of erroring on
+// the UNIQUE indexes or duplicating. Not dry-run — it is an explicit, gated
+// admin action that creates a single hidden, double-gated test row.
+// NB: MUST come before "/:id" so "admin" isn't swallowed as an id param.
+const TEST_PROVIDER_ORG_NR = "TEST000000";
+const TEST_PROVIDER_DEFAULT_NAME = "TEST — Ikke book (booking-flyt-v1 slice 0)";
+const TEST_PROVIDER_DEFAULT_SLUG = "test-ikke-book-slice0";
+router.post("/admin/gardssalg/test-provider", requireAdmin, (req: Request, res: Response) => {
+  const email = typeof req.body?.email === "string" ? req.body.email.trim() : "";
+  // Same shape as ProviderSchema's z.string().email() so createProvider() below
+  // won't reject it — validate up front for a clean 400 instead of a 500.
+  if (!email || !/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email)) {
+    res.status(400).json({ error: "Body må inneholde en gyldig { email }" });
+    return;
+  }
+  const name =
+    typeof req.body?.name === "string" && req.body.name.trim()
+      ? req.body.name.trim()
+      : TEST_PROVIDER_DEFAULT_NAME;
+  const slug =
+    typeof req.body?.slug === "string" && req.body.slug.trim()
+      ? req.body.slug.trim()
+      : TEST_PROVIDER_DEFAULT_SLUG;
+
+  const expDb = getExpDb("experiences");
+
+  try {
+    // Converge on ONE row: match an existing test row by slug OR the fixed test
+    // org_nr (the stable identity across repeat calls, even if the slug changes).
+    const existing = expDb
+      .prepare("SELECT id FROM experience_providers WHERE slug = ? OR org_nr = ? LIMIT 1")
+      .get(slug, TEST_PROVIDER_ORG_NR) as { id: string } | undefined;
+
+    // createProvider() covers the ProviderSchema-known fields (navn/org_nr/epost/
+    // verification_status); the raw UPDATE below sets the columns the schema
+    // doesn't (producer_type/booking_live/catalog_hidden/rfb_seed_source) plus
+    // commission_rate — exactly the createProvider()+raw-UPDATE split the tests
+    // use. On a repeat call we reuse the existing row's id instead.
+    const providerId = existing
+      ? existing.id
+      : createProvider({
+          navn: name,
+          org_nr: TEST_PROVIDER_ORG_NR,
+          epost: email,
+          verification_status: "verified",
+        });
+
+    expDb
+      .prepare(
+        `UPDATE experience_providers
+            SET navn = @navn, epost = @email, slug = @slug,
+                producer_type = 'test-gardssalg', rfb_seed_source = NULL,
+                catalog_hidden = 1, booking_live = 1, commission_rate = 0,
+                verification_status = 'verified', updated_at = datetime('now')
+          WHERE id = @id`
+      )
+      .run({ id: providerId, navn: name, email, slug });
+
+    console.log(
+      `[test-provider] upserted hidden test provider id=${providerId} slug=${slug} epost=${email} (catalog_hidden=1, booking_live=1)`
+    );
+
+    res.json({
+      success: true,
+      provider_id: providerId,
+      slug,
+      booking_url: `${APP_URL}/kategori/gardssalg/book/${slug}`,
+      epost: email,
+    });
+  } catch (err) {
+    console.error("[test-provider] upsert failed:", err);
+    res.status(500).json({ error: "Kunne ikke opprette testprodusent", details: String(err) });
+  }
+});
+
 // ─── POST /api/opplevelser/admin/rfb-knowledge-enrich ────────────────────────
 //
 // Fills the sparse rfb-seeded gårdssalg providers from their rich RFB producer

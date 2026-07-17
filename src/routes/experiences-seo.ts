@@ -2545,7 +2545,7 @@ router.get(
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>${escapeHtml(provider.navn)}${sted ? " – " + escapeHtml(sted) : ""} | Opplevagent</title>
 <meta name="description" content="${escapeHtml(metaDesc)}">
-<meta name="robots" content="index, follow, max-snippet:-1, max-image-preview:large">
+<meta name="robots" content="${provider.catalog_hidden === 1 ? "noindex, nofollow" : "index, follow, max-snippet:-1, max-image-preview:large"}">
 <link rel="canonical" href="${canonical}">
 <meta property="og:title" content="${escapeHtml(provider.navn)} | Opplevagent">
 <meta property="og:description" content="${escapeHtml(metaDesc)}">
