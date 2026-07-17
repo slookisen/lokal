@@ -2244,7 +2244,7 @@ router.get("/kategori/gardssalg", (req: Request, res: Response) => {
     // rather than hardcoded hex, same discipline as the produsent-profil
     // section even though the rest of this particular card still predates
     // that convention.
-    const soonBadge = isBookingPaused(p.booking_live)
+    const soonBadge = isBookingPaused(p.booking_live, p.catalog_hidden)
       ? `<span style="display:inline-block;font-size:.68rem;font-weight:600;color:var(--mist);background:var(--canvas-2);border:1px solid var(--line);border-radius:4px;padding:1px 7px;margin-left:6px;vertical-align:middle">Kommer snart</span>`
       : "";
     return `<article style="background:#fff;border-radius:12px;box-shadow:0 2px 8px rgba(0,0,0,.07);overflow:hidden;display:flex;flex-direction:column">
@@ -2626,7 +2626,7 @@ ${BROWSE_CSS}
     <aside>
       <div class="aside-card">
         <h2>Reserver</h2>
-        ${isBookingPaused(provider.booking_live) ? `<p class="reserve-notice">Reservasjoner er ikke aktive ennå — kommer snart.</p>` : ""}
+        ${isBookingPaused(provider.booking_live, provider.catalog_hidden) ? `<p class="reserve-notice">Reservasjoner er ikke aktive ennå — kommer snart.</p>` : ""}
         <a class="reserve-cta" href="${bookHref}">Reserver besøk</a>
       </div>
       <div class="aside-card">
@@ -2718,7 +2718,7 @@ router.get(
     // /api/opplevelser/book). Independent of ?error=paused (that's the
     // banner shown AFTER a blocked submit attempt); this one is unmissable
     // up front so nothing on the page implies booking works today.
-    const notLive = isBookingPaused(provider.booking_live);
+    const notLive = isBookingPaused(provider.booking_live, provider.catalog_hidden);
     const pausedNotice = notLive
       ? `<div class="notice-paused" role="status"><strong>Kommer snart</strong>Reservasjoner er ikke aktive ennå — kommer snart. Du kan sende en interessemelding, men ingen reservasjon blir bekreftet ennå.</div>`
       : "";
@@ -2874,7 +2874,7 @@ router.post(
     // exactly (see isBookingPaused() in services/booking-store.ts). Checked
     // before touching req.body at all: no reserved row, no guest email, no
     // producer notification when paused, full stop.
-    if (isBookingPaused(provider.booking_live)) {
+    if (isBookingPaused(provider.booking_live, provider.catalog_hidden)) {
       res.redirect(303, `${backTo}?error=paused`);
       return;
     }

@@ -1867,9 +1867,9 @@ router.post("/book", async (req: Request, res: Response) => {
   // 'reserved' row, never send the guest confirmation, never notify a
   // producer. See isBookingPaused() in services/booking-store.ts.
   const providerBook = getProviderById(parsed.data.provider_id) as
-    | { booking_live?: number | null; epost?: string | null }
+    | { booking_live?: number | null; epost?: string | null; catalog_hidden?: number | null }
     | null;
-  if (isBookingPaused(providerBook?.booking_live ?? null)) {
+  if (isBookingPaused(providerBook?.booking_live ?? null, providerBook?.catalog_hidden ?? null)) {
     res.status(200).json({
       success: false,
       paused: true,
