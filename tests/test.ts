@@ -22419,6 +22419,7 @@ console.log("\n── PR-127: normalizeOpeningHours ──");
     isConfidentPlaceMatch,
     normalizePlacePhone,
     isValidHttpUrl,
+    shouldUseEnterpriseFieldMask,
   } = require("../src/services/dental-places") as typeof import("../src/services/dental-places");
 
   // ── placesPeriodsToOpeningHours ──
@@ -22592,6 +22593,54 @@ console.log("\n── PR-127: normalizeOpeningHours ──");
   assertTrue(!isValidHttpUrl("ftp://klinikk.no"), "pr128-19: ftp invalid");
   assertTrue(!isValidHttpUrl("not a url"), "pr128-20: garbage invalid");
   assertTrue(!isValidHttpUrl(""), "pr128-21: empty invalid");
+
+  // ── shouldUseEnterpriseFieldMask ──
+  // dev-request 2026-07-12-dental-enrichment-universe-growth-and-queue-hygiene,
+  // item 1: monthly Enterprise-tier hard-stop paired with the raised
+  // per-cycle homepage-backfill limit (20 -> 100).
+  assertTrue(
+    !shouldUseEnterpriseFieldMask(false, 0, 950),
+    "dhh-01: row doesn't want Enterprise fields -> false regardless of budget"
+  );
+  assertTrue(
+    shouldUseEnterpriseFieldMask(true, 0, 950),
+    "dhh-02: wants Enterprise fields, month fresh (0 calls) -> true"
+  );
+  assertTrue(
+    shouldUseEnterpriseFieldMask(true, 949, 950),
+    "dhh-03: wants Enterprise fields, one call under the hard stop -> true"
+  );
+  assertTrue(
+    !shouldUseEnterpriseFieldMask(true, 950, 950),
+    "dhh-04: wants Enterprise fields, exactly AT the hard stop -> false (fail closed)"
+  );
+  assertTrue(
+    !shouldUseEnterpriseFieldMask(true, 1500, 950),
+    "dhh-05: wants Enterprise fields, month already over the hard stop -> false"
+  );
+  assertTrue(
+    !shouldUseEnterpriseFieldMask(false, 1500, 950),
+    "dhh-06: doesn't want Enterprise fields, month over the hard stop -> still false (not the reason)"
+  );
+  // Simulate a run draining the budget row-by-row: the caller passes
+  // enterpriseCallsThisMonth + enterpriseCalls-so-far as the running total —
+  // once the running total crosses the threshold mid-run, later rows in the
+  // SAME run correctly flip to false without needing a fresh DB read.
+  {
+    const monthSoFar = 948;
+    let enterpriseCallsThisRun = 0;
+    const decisions: boolean[] = [];
+    for (let i = 0; i < 5; i++) {
+      const decide = shouldUseEnterpriseFieldMask(true, monthSoFar + enterpriseCallsThisRun, 950);
+      decisions.push(decide);
+      if (decide) enterpriseCallsThisRun++;
+    }
+    assertEq(
+      JSON.stringify(decisions),
+      JSON.stringify([true, true, false, false, false]),
+      "dhh-07: mid-run budget exhaustion — first 2 of 5 rows get Enterprise, rest fall back to Pro"
+    );
+  }
 }
 
 

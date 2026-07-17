@@ -213,3 +213,30 @@ export function isValidHttpUrl(raw: unknown): boolean {
     return false;
   }
 }
+
+// ─── shouldUseEnterpriseFieldMask ───────────────────────────────────────
+// dev-request 2026-07-12-dental-enrichment-universe-growth-and-queue-hygiene,
+// item 1: raising the per-cycle homepage-backfill limit (20 -> 100) multiplies
+// how many Enterprise-tier Places calls (the mask carrying websiteUri /
+// internationalPhoneNumber — the fields that unlock a homepage/phone
+// backfill) a single run can make. Enterprise-tier billing has only a
+// 1,000-call/month free cap, SHARED with rfb's google-rating-batch (see
+// src/routes/marketplace.ts's /admin/places-usage, ENTERPRISE_FREE_CAP=1000 /
+// SOFT_GUARDRAIL_THRESHOLD=900) — the exact concern dev-request
+// 2026-07-03-places-api-cost-reduction was filed to eliminate. This pure
+// decision — separated from the route's I/O so it's unit-testable without a
+// live DB/HTTP mock — decides, call by call, whether THIS row may use the
+// Enterprise-tier mask given how many Enterprise calls the platform has
+// already made this month (rfb + dental combined) PLUS how many this run has
+// already made. A row that wants Enterprise fields but has exhausted the
+// budget still gets looked up — just with the cheaper Pro-tier mask (no
+// homepage/phone gain for that row this run) — so a raised limit can never
+// push the account over the free cap, even within a single large run.
+export function shouldUseEnterpriseFieldMask(
+  wantsEnterpriseFields: boolean,
+  enterpriseCallsThisMonthSoFar: number,
+  hardStopThreshold: number
+): boolean {
+  if (!wantsEnterpriseFields) return false;
+  return enterpriseCallsThisMonthSoFar < hardStopThreshold;
+}

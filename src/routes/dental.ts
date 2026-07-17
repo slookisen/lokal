@@ -40,10 +40,11 @@ import {
   isConfidentPlaceMatch,
   normalizePlacePhone,
   isValidHttpUrl,
+  shouldUseEnterpriseFieldMask,
   type PlacesPlace,
 } from "../services/dental-places";
 import { nameSimilarity } from "../services/name-matcher";
-import { logPlacesCall } from "../services/places-usage-tracker";
+import { logPlacesCall, getPlacesUsageThisMonth } from "../services/places-usage-tracker";
 import { findOrgnumberByName } from "../services/brreg-client";
 
 const router = Router();
@@ -735,13 +736,50 @@ router.post(
     }
 
     const write = body.write !== false; // default true
-    const HARD_CAP = 50;
+    // dev-request 2026-07-12-dental-enrichment-universe-growth-and-queue-hygiene,
+    // item 1: raise the homepage-backfill default/cap 20/50 -> 100/cycle (the
+    // universe-growth lever — at 20/day a full sweep of the ~5,670 homepage-
+    // less records takes 283 days, at 100/day ~2 months). Paired with the
+    // monthly Enterprise-tier hard-stop below so the higher ceiling can never
+    // push the platform over the shared 1,000-call/mo free cap.
+    const HARD_CAP = 100;
     const limit = Math.max(
       1,
-      Math.min(HARD_CAP, body.limit ?? 20)
+      Math.min(HARD_CAP, body.limit ?? 100)
     );
 
     const db = getDb("dental");
+
+    // ── Monthly Enterprise-tier hard-stop (safety pair for the raised limit
+    // above) — this dev-request's own acceptance requirement: cap Places
+    // spend so a bigger per-cycle limit can't push the account over the
+    // free tier. Mirrors marketplace.ts's /admin/places-usage combined
+    // rfb+dental count; leaves a buffer below the 1,000 free cap for rfb's
+    // own same-day usage.
+    //
+    // Fail-CLOSED on a read failure (unlike places-usage-tracker.ts's own
+    // internal reads, which are best-effort/observability-only and fail
+    // toward 0 by design): this read now GATES real spend, so a DB-open or
+    // query failure here must not silently look like "0 calls made this
+    // month" — that would let a full HARD_CAP-sized run of Enterprise calls
+    // through on exactly the failure path a cost hard-stop should be most
+    // defensive about (independent-review finding, PR #272). Treat an
+    // unreadable count as already at the hard stop instead.
+    const ENTERPRISE_MONTHLY_HARD_STOP = 950;
+    let enterpriseCallsThisMonth = ENTERPRISE_MONTHLY_HARD_STOP;
+    try {
+      const usage = [
+        ...getPlacesUsageThisMonth(getDb("rfb"), "rfb"),
+        ...getPlacesUsageThisMonth(db, "dental"),
+      ];
+      enterpriseCallsThisMonth = usage
+        .filter((r) => r.sku === "text_search_enterprise")
+        .reduce((sum, r) => sum + r.calls_this_month, 0);
+    } catch {
+      // read failed — enterpriseCallsThisMonth stays at ENTERPRISE_MONTHLY_HARD_STOP
+      // (fail closed: this run makes zero Enterprise-tier calls, Pro-tier only)
+    }
+    let enterpriseCapped = false;
 
     // Marks a row as having had a real Places attempt (matched or a
     // confident no-match) — starts its 90-day no-retry window. Callers MUST
@@ -820,6 +858,9 @@ router.post(
           enterprise_calls: 0,
           pro_calls: 0,
           places_calls: 0,
+          enterprise_calls_this_month_before_run: enterpriseCallsThisMonth,
+          enterprise_monthly_hard_stop: ENTERPRISE_MONTHLY_HARD_STOP,
+          enterprise_capped: false,
         },
       });
       return;
@@ -859,7 +900,17 @@ router.post(
 
       // Measure 2: only pay for Enterprise-tier fields while there's a
       // fill-only gain to be had from them (hjemmeside/telefon still empty).
-      const needsEnterprise = isEmptyCol(row.hjemmeside) || isEmptyCol(row.telefon);
+      // Item 1 (this dev-request): gate that want on the monthly hard-stop
+      // budget too — a row that wants Enterprise fields but the platform
+      // has hit ENTERPRISE_MONTHLY_HARD_STOP this month still gets looked
+      // up, just with the cheaper Pro-tier mask (see shouldUseEnterpriseFieldMask).
+      const wantsEnterprise = isEmptyCol(row.hjemmeside) || isEmptyCol(row.telefon);
+      const needsEnterprise = shouldUseEnterpriseFieldMask(
+        wantsEnterprise,
+        enterpriseCallsThisMonth + enterpriseCalls,
+        ENTERPRISE_MONTHLY_HARD_STOP
+      );
+      if (wantsEnterprise && !needsEnterprise) enterpriseCapped = true;
       const fieldMask = needsEnterprise
         ? PLACES_ENTERPRISE_FIELD_MASK
         : PLACES_PRO_FIELD_MASK;
@@ -1111,6 +1162,9 @@ router.post(
         enterprise_calls: enterpriseCalls,
         pro_calls: proCalls,
         places_calls: placesCallsThisRun,
+        enterprise_calls_this_month_before_run: enterpriseCallsThisMonth,
+        enterprise_monthly_hard_stop: ENTERPRISE_MONTHLY_HARD_STOP,
+        enterprise_capped: enterpriseCapped,
       },
     });
   }
