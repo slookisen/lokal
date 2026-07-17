@@ -755,11 +755,18 @@ router.post(
     // spend so a bigger per-cycle limit can't push the account over the
     // free tier. Mirrors marketplace.ts's /admin/places-usage combined
     // rfb+dental count; leaves a buffer below the 1,000 free cap for rfb's
-    // own same-day usage. Best-effort read (getPlacesUsageThisMonth never
-    // throws) — a read failure leaves this at 0, matching this module's
-    // existing "observability must not block enrichment" contract.
+    // own same-day usage.
+    //
+    // Fail-CLOSED on a read failure (unlike places-usage-tracker.ts's own
+    // internal reads, which are best-effort/observability-only and fail
+    // toward 0 by design): this read now GATES real spend, so a DB-open or
+    // query failure here must not silently look like "0 calls made this
+    // month" — that would let a full HARD_CAP-sized run of Enterprise calls
+    // through on exactly the failure path a cost hard-stop should be most
+    // defensive about (independent-review finding, PR #272). Treat an
+    // unreadable count as already at the hard stop instead.
     const ENTERPRISE_MONTHLY_HARD_STOP = 950;
-    let enterpriseCallsThisMonth = 0;
+    let enterpriseCallsThisMonth = ENTERPRISE_MONTHLY_HARD_STOP;
     try {
       const usage = [
         ...getPlacesUsageThisMonth(getDb("rfb"), "rfb"),
@@ -769,7 +776,8 @@ router.post(
         .filter((r) => r.sku === "text_search_enterprise")
         .reduce((sum, r) => sum + r.calls_this_month, 0);
     } catch {
-      // best-effort only; leaves enterpriseCallsThisMonth at 0
+      // read failed — enterpriseCallsThisMonth stays at ENTERPRISE_MONTHLY_HARD_STOP
+      // (fail closed: this run makes zero Enterprise-tier calls, Pro-tier only)
     }
     let enterpriseCapped = false;
 
