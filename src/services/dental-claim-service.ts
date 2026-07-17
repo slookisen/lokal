@@ -18,6 +18,14 @@ export type ClaimFilter = {
   has_hjemmeside?: boolean;
   has_adresse?: boolean;
   has_lat?: boolean;
+  // dev-request 2026-07-12-dental-enrichment-universe-growth-and-queue-hygiene,
+  // item 2a (2026-07-17): opt-in exclusion of clinics parked by 3 consecutive
+  // extraction failures (30d backoff), mirroring the homepage-parking
+  // excludeParked flag (dental-store.ts listDentalAgents) but for the
+  // claim-batch pool instead of the read-side listing. Default/omitted is a
+  // strict no-op -- existing callers (including all other filters here) are
+  // completely unaffected.
+  excludeParkedExtraction?: boolean;
 };
 
 export type ClaimedRecord = {
@@ -122,6 +130,17 @@ export function buildWhereClause(
     conditions.push("lat IS NOT NULL");
   } else if (filter.has_lat === false) {
     conditions.push("lat IS NULL");
+  }
+
+  // dev-request 2026-07-12-dental-enrichment-universe-growth-and-queue-hygiene,
+  // item 2a: exclude clinics parked by 3 consecutive extraction failures
+  // (extraction_unreachable_since set AND within the last 30 days), same
+  // backoff window as the homepage-parking twin (dental-store.ts
+  // DENTAL_PARK_BACKOFF_MS). Opt-in only -- omitted/false is a no-op.
+  if (filter.excludeParkedExtraction) {
+    conditions.push(
+      "(extraction_unreachable_since IS NULL OR extraction_unreachable_since <= datetime('now','-30 days'))"
+    );
   }
 
   return { clause: conditions.join(" AND "), params };
