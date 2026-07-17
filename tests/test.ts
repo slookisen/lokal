@@ -24647,6 +24647,206 @@ console.log("\n── gardssalg-dark-launch-stop: BOOKING_DISPATCH_ENABLED / boo
   console.log("  gardssalg-dark-launch-stop: OK (fail-safe flag default, SSR notices x3, hard stop on both entry points incl. no-row/no-email guarantees, flag-on+booking_live full-chain regression, producer dispatch + missing-epost safety)");
 })();
 
+// ─── gardssalg-test-provider-slice0: hidden-but-bookable test provider
+//     (dev-request 2026-07-14-booking-flyt-v1, slice 0) ──────────────────────
+// Slice 0 of the booking-flyt-v1 build: a controlled end-to-end test harness
+// for the gårdssalg booking flow. The admin endpoint upserts ONE hidden test
+// provider (catalog_hidden=1) that never shows in the public grid, never bumps
+// the countGardssalgProviders() visibility gate, and is never in the sitemap —
+// yet stays fully bookable by slug (booking_live=1) so a real booking against
+// it dispatches the producer notification to a single controlled inbox
+// (Daniel's) and nowhere else. Covers: (a) hidden-from-catalog/count but
+// resolvable by slug; (b) a booking against it is NOT paused and sends exactly
+// one producer email to that inbox, while a normal booking_live=0 provider is
+// still paused (double-gate regression); (c) admin-endpoint idempotency (two
+// calls → one row); (d) an ordinary catalog_hidden=0 provider is unaffected.
+// Same isolated :memory: experiences DB + emailService capture + sync mock
+// req/res pattern as the gardssalg-dark-launch-stop block above — every path
+// resolves before its first internal await, so it stays fully synchronous.
+console.log("\n── gardssalg-test-provider-slice0: hidden-but-bookable test provider + producer dispatch to Daniel ──");
+(() => {
+  const prevPathTP = process.env.EXPERIENCES_DB_PATH;
+  process.env.EXPERIENCES_DB_PATH = ":memory:";
+  const prevDispatchTP = process.env.BOOKING_DISPATCH_ENABLED;
+
+  const dbFacPathTP = require.resolve("../src/database/db-factory");
+  const expStPathTP = require.resolve("../src/services/experience-store");
+  const bookStPathTP = require.resolve("../src/services/booking-store");
+  const opplevelserPathTP = require.resolve("../src/routes/opplevelser");
+  delete require.cache[dbFacPathTP];
+  delete require.cache[expStPathTP];
+  delete require.cache[bookStPathTP];
+  delete require.cache[opplevelserPathTP];
+
+  const dbFacTP = require("../src/database/db-factory") as typeof import("../src/database/db-factory");
+  dbFacTP.__resetDbFactoryForTesting();
+  const expStTP = require("../src/services/experience-store") as typeof import("../src/services/experience-store");
+  const bookStTP = require("../src/services/booking-store") as typeof import("../src/services/booking-store");
+  const oppRouterTP = (require("../src/routes/opplevelser") as typeof import("../src/routes/opplevelser")).default as any;
+
+  const dbTP = dbFacTP.getDb("experiences");
+
+  // Email capture (same pattern as the dark-launch-stop block): monkey-patch the
+  // shared emailService singleton so we can assert on sends without real SMTP.
+  const emailSvcModTP = require("../src/services/email-service") as typeof import("../src/services/email-service");
+  const origSendTP = emailSvcModTP.emailService.sendEmail.bind(emailSvcModTP.emailService);
+  let emailCallsTP: Array<{ to: string; subject: string }> = [];
+  (emailSvcModTP.emailService as any).sendEmail = async (opts: { to: string; subject: string }) => {
+    emailCallsTP.push({ to: opts.to, subject: opts.subject });
+    return { success: true, messageId: "test" };
+  };
+
+  // In production the producer notification for this hidden test provider is
+  // routed to Daniel's real inbox — the entire point of slice 0. The test asserts
+  // the dispatch `to` equals exactly the email handed to the admin endpoint.
+  const danielEmailTP = "da.fredriksen@gmail.com";
+  const TEST_ORG_NR_TP = "TEST000000"; // mirrors the endpoint's fixed test org_nr
+
+  // invokeAdminTP — POST /admin/gardssalg/test-provider. Grabbing the LAST
+  // handler off the route stack invokes the endpoint's own handler and (as with
+  // every admin-route unit test in this file) bypasses the requireAdmin
+  // middleware layer, which is not the behavior under test here.
+  function invokeAdminTP(body: Record<string, unknown>): { status: number; json: any } {
+    const layer = (oppRouterTP.stack as any[]).find(
+      (l: any) => l.route && l.route.path === "/admin/gardssalg/test-provider" && l.route.methods?.post
+    );
+    assertTrue(!!layer, "tp-route: opplevelser router has POST /admin/gardssalg/test-provider layer");
+    if (!layer) return { status: 0, json: null };
+    let status = 200; let jsonBody: any = null;
+    const res: any = {
+      status: (c: number) => { status = c; return res; },
+      json: (o: unknown) => { jsonBody = o; return res; },
+    };
+    const req: any = { body, headers: {} };
+    const handle = layer.route.stack[layer.route.stack.length - 1].handle;
+    handle(req, res, () => {});
+    return { status, json: jsonBody };
+  }
+
+  // invokeBookTP — POST /api/opplevelser/book (JSON API), same idiom as the
+  // dark-launch-stop block's invokeOppGDL.
+  function invokeBookTP(body: Record<string, unknown>): { status: number; json: any } {
+    const layer = (oppRouterTP.stack as any[]).find(
+      (l: any) => l.route && l.route.path === "/book" && l.route.methods?.post
+    );
+    assertTrue(!!layer, "tp-route: opplevelser router has POST /book layer");
+    if (!layer) return { status: 0, json: null };
+    let status = 200; let jsonBody: any = null;
+    const res: any = {
+      status: (c: number) => { status = c; return res; },
+      json: (o: unknown) => { jsonBody = o; return res; },
+    };
+    const req: any = { body };
+    const handle = layer.route.stack[layer.route.stack.length - 1].handle;
+    handle(req, res, () => {});
+    return { status, json: jsonBody };
+  }
+
+  function countBookingsTP(): number {
+    return (dbTP.prepare("SELECT COUNT(*) AS c FROM gardssalg_bookings").get() as { c: number }).c;
+  }
+
+  // Seed one ORDINARY gårdssalg provider (catalog_hidden defaults to 0) so the
+  // (d) regression + the count/list baselines have a real visible row to check.
+  const normalIdTP = expStTP.createProvider({
+    navn: "Ekte Gardssalg Bryggeri", org_nr: "915000111",
+    fylke: "Vestland", kommune: "Voss", poststed: "Voss",
+    brreg_verified: 0, verification_status: "pending_verify",
+  });
+  dbTP.prepare("UPDATE experience_providers SET producer_type = ?, epost = ? WHERE id = ?")
+    .run("bryggeri", "post@ektebryggeri.no", normalIdTP);
+  expStTP.backfillProviderSlugs();
+
+  const countBeforeTP = expStTP.countGardssalgProviders();
+  assertEq(countBeforeTP, 1, "tp-00a: baseline — one ordinary gårdssalg provider is counted");
+  assertTrue(expStTP.listGardssalgProviders(100, 0).some((p: any) => p.id === normalIdTP),
+    "tp-00b: baseline — the ordinary provider appears in listGardssalgProviders()");
+
+  // ═══ (a) create the hidden test provider via the admin endpoint ═══
+  const createTP = invokeAdminTP({ email: danielEmailTP });
+  assertEq(createTP.status, 200, "tp-01a: POST /admin/gardssalg/test-provider → 200");
+  assertEq(createTP.json?.success, true, "tp-01b: success:true");
+  assertTrue(!!createTP.json?.provider_id, "tp-01c: response carries a provider_id");
+  assertEq(createTP.json?.slug, "test-ikke-book-slice0", "tp-01d: default stable slug applied");
+  assertEq(createTP.json?.epost, danielEmailTP, "tp-01e: response echoes the routed epost");
+  assertTrue(String(createTP.json?.booking_url || "").endsWith("/kategori/gardssalg/book/test-ikke-book-slice0"),
+    "tp-01f: booking_url points at the by-slug booking route");
+  const testSlugTP = String(createTP.json.slug);
+  const testIdTP = String(createTP.json.provider_id);
+
+  // Hidden from the catalog + count, but resolvable (bookable) by slug.
+  const listAfterTP = expStTP.listGardssalgProviders(100, 0);
+  assertTrue(!listAfterTP.some((p: any) => p.id === testIdTP),
+    "tp-02a: hidden test provider does NOT appear in listGardssalgProviders()");
+  assertTrue(!listAfterTP.some((p: any) => p.slug === testSlugTP),
+    "tp-02b: hidden test provider's slug is absent from the catalog list");
+  assertEq(expStTP.countGardssalgProviders(), countBeforeTP,
+    "tp-02c: countGardssalgProviders() unchanged — the hidden row never bumps the visibility gate");
+  const bySlugTP = expStTP.getGardssalgProviderBySlug(testSlugTP);
+  assertTrue(!!bySlugTP, "tp-03a: getGardssalgProviderBySlug() STILL returns the hidden test provider (bookable by slug)");
+  assertEq(bySlugTP?.booking_live, 1, "tp-03b: test provider booking_live===1");
+  assertEq(bySlugTP?.catalog_hidden, 1, "tp-03c: test provider catalog_hidden===1");
+  assertEq(bySlugTP?.epost, danielEmailTP, "tp-03d: test provider epost === the routed email");
+
+  // ═══ (d) regression — the ordinary provider is entirely unaffected ═══
+  assertTrue(listAfterTP.some((p: any) => p.id === normalIdTP),
+    "tp-04a: ordinary provider (catalog_hidden default 0) still appears in listGardssalgProviders()");
+  assertEq(expStTP.countGardssalgProviders(), 1,
+    "tp-04b: ordinary provider is still counted exactly as before");
+
+  // ═══ (c) admin-endpoint idempotency — two calls yield ONE row ═══
+  const createAgainTP = invokeAdminTP({ email: danielEmailTP });
+  assertEq(createAgainTP.status, 200, "tp-05a: second admin call → 200");
+  assertEq(createAgainTP.json?.provider_id, testIdTP, "tp-05b: second call returns the SAME provider_id (no duplicate)");
+  const testRowCountTP = (dbTP.prepare("SELECT COUNT(*) AS c FROM experience_providers WHERE org_nr = ?")
+    .get(TEST_ORG_NR_TP) as { c: number }).c;
+  assertEq(testRowCountTP, 1, "tp-05c: exactly ONE test-provider row after two upserts");
+
+  // ═══ (b) booking dispatch — hidden provider bookable, double gate still holds ═══
+  process.env.BOOKING_DISPATCH_ENABLED = "true";
+
+  // A booking against the HIDDEN test provider is NOT paused: it creates a real
+  // reserved row and dispatches exactly one producer notification — to Daniel.
+  emailCallsTP = [];
+  const beforeBookTP = countBookingsTP();
+  const bookTP = invokeBookTP({
+    provider_id: testIdTP, slot_at: "2026-09-01T13:00", party_size: 2,
+    guest_name: "Testgjest", guest_email: "gjest@example.no",
+  });
+  assertEq(bookTP.status, 201, "tp-06a: booking against the hidden test provider is NOT paused → 201");
+  assertEq(bookTP.json?.success, true, "tp-06b: success:true");
+  assertEq(countBookingsTP(), beforeBookTP + 1, "tp-06c: exactly one gardssalg_bookings row created");
+  const refTP = String(bookTP.json?.booking_ref || "");
+  assertTrue(!!refTP, "tp-06d: a booking_ref was returned");
+  assertEq(bookStTP.getBookingByRef(refTP)?.provider_id, testIdTP, "tp-06e: the booking is attached to the test provider");
+  const producerSendsTP = emailCallsTP.filter((c) => c.to === danielEmailTP);
+  assertEq(producerSendsTP.length, 1,
+    "tp-06f: sendProducerNotification sent exactly ONE email, to the test provider's epost (Daniel)");
+  assertTrue(emailCallsTP.some((c) => c.to === "gjest@example.no"),
+    "tp-06g: the guest still receives their own confirmation (existing chain unaffected)");
+
+  // Double-gate regression: a booking against the ordinary provider — visible in
+  // the catalog but booking_live=0 — stays PAUSED even with dispatch enabled.
+  emailCallsTP = [];
+  const beforeBook2TP = countBookingsTP();
+  const bookNormalTP = invokeBookTP({
+    provider_id: normalIdTP, slot_at: "2026-09-02T13:00", party_size: 2,
+    guest_name: "Testgjest 2", guest_email: "gjest2@example.no",
+  });
+  assertEq(bookNormalTP.status, 200, "tp-07a: booking a non-onboarded (booking_live=0) provider → 200 paused, not 201");
+  assertEq(bookNormalTP.json?.paused, true, "tp-07b: paused:true for the ordinary provider (double gate holds)");
+  assertEq(countBookingsTP(), beforeBook2TP, "tp-07c: no booking row created for the paused ordinary provider");
+  assertEq(emailCallsTP.length, 0, "tp-07d: no emails attempted for the paused ordinary provider");
+
+  (emailSvcModTP.emailService as any).sendEmail = origSendTP;
+  if (prevPathTP === undefined) delete process.env.EXPERIENCES_DB_PATH;
+  else process.env.EXPERIENCES_DB_PATH = prevPathTP;
+  if (prevDispatchTP === undefined) delete process.env.BOOKING_DISPATCH_ENABLED;
+  else process.env.BOOKING_DISPATCH_ENABLED = prevDispatchTP;
+  dbFacTP.__resetDbFactoryForTesting();
+  console.log("  gardssalg-test-provider-slice0: OK (hidden from catalog+count / bookable by slug, producer dispatch to Daniel, double-gate regression, admin idempotency, ordinary-provider no-regression)");
+})();
+
 // ─── gardssalg-go-live-gate slice 3: provider kommune/fylke geocode fallback
 //     (experiences-geocode-worker.ts Step D) + honest map-label rendering
 //     (dev-request 2026-07-12-gardssalg-go-live-gate-dark-launch-og-onboarding,
