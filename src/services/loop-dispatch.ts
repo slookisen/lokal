@@ -24,6 +24,25 @@ export function resolveActiveWindowHour(raw: string | undefined, fallback: numbe
 }
 
 /**
+ * Parse `DISPATCH_WINDOW_MIN` (dev-requests/2026-07-17-loop-dispatch-stall-hardening.md)
+ * for planNow()'s candidate-freshness window. The pure default in computeWakeList stays
+ * 12 for other callers/tests; the route now passes 45 so a next_suggested envelope
+ * survives the 25-min cross-agent cooldown instead of expiring unfired (the 2026-07-16
+ * 22:25Z event-wake deadlock) and a failed /fire gets retried on later ticks (the
+ * 2026-07-17 09:40Z 401 outage burned its candidate after one attempt). Clamped to
+ * [5, 55]: never below 5 (a window shorter than the ~10-min tick cadence re-creates
+ * the expire-before-tick bug), never 56+ (planNow reads the ledger with sinceHours: 1,
+ * so candidates older than ~an hour are invisible to the query — a wider window would
+ * silently see nothing).
+ */
+export function resolveWindowMin(raw: string | undefined): number {
+  if (raw === undefined || raw.trim() === "") return 45;
+  const n = Number(raw);
+  if (!Number.isFinite(n)) return 45;
+  return Math.max(5, Math.min(55, n));
+}
+
+/**
  * Parse `DISPATCH_TICK_INTERVAL_MIN` (dev-requests/2026-07-09-loop-dispatch-self-tick.md)
  * for the in-process dispatcher self-tick in src/index.ts. Missing / empty-string /
  * non-numeric input falls back to 10 (the design cadence from admin-loop-dispatch.ts's
@@ -88,6 +107,13 @@ export interface DispatchOpts {
   // anti-thrash cooldown. Default 3 min.
   selfContinueCooldownMin?: number;
   maxWakes?: number; // hard cap on wakes per cycle
+  // Fireable set (dev-requests/2026-07-17-loop-dispatch-stall-hardening.md): the agents
+  // the caller can actually /fire (FIRE_ROUTINES keys). Only wakes for THESE count
+  // toward maxWakes — a wake for an allowlisted-but-routine-less agent (e.g.
+  // platform-verifier) is always deferred downstream and spawns nothing, so letting it
+  // consume the wake budget can starve the orchestrator behind a morning pileup of
+  // worker→verifier suggestions. Omitted → all wakes count (previous behavior).
+  fireable?: string[];
   activeStartUTC?: number; // inclusive hour, default 5  (~06:00 Europe/Oslo)
   activeEndUTC?: number; // exclusive hour, default 21 (~22:00 Europe/Oslo)
 }
@@ -167,16 +193,32 @@ export function computeWakeList(
 
   // lastRunAt[agent] = newest finished_at (fallback started_at) across ALL runs.
   const latest = new Map<string, number>();
+  // latestStart[agent] = newest started_at across ALL runs (incl. fire-markers, whose
+  // started_at is the fire time). Used by the cross-agent consumed-guard below: a
+  // target that STARTED a run after the suggesting run finished has consumed that
+  // suggestion. started_at (not finished_at) so an in-flight run that merely
+  // OVERLAPPED the suggestion — started before it was posted, finished just after —
+  // does not falsely consume it (the 2026-07-16 22:25Z event-wake landed 3 min before
+  // an already-running orchestrator cycle finished; that cycle never saw it).
+  const latestStart = new Map<string, number>();
   for (const r of runs) {
     const t = Date.parse(r.finished_at || r.started_at);
-    if (Number.isNaN(t)) continue;
-    const prev = latest.get(r.agent);
-    if (prev === undefined || t > prev) latest.set(r.agent, t);
+    if (!Number.isNaN(t)) {
+      const prev = latest.get(r.agent);
+      if (prev === undefined || t > prev) latest.set(r.agent, t);
+    }
+    const s = Date.parse(r.started_at);
+    if (!Number.isNaN(s)) {
+      const prevS = latestStart.get(r.agent);
+      if (prevS === undefined || s > prevS) latestStart.set(r.agent, s);
+    }
   }
 
   const wake: WakeDecision[] = [];
   const skip: SkipDecision[] = [];
   const wokenThisCycle = new Set<string>();
+  const fireableSet = opts.fireable === undefined ? null : new Set(opts.fireable);
+  let fireableWakes = 0;
   let candidates = 0;
 
   for (const r of runs) {
@@ -216,19 +258,34 @@ export function computeWakeList(
           });
           continue;
         }
-      } else if (last !== undefined) {
-        const sinceMin = Math.floor((opts.nowMs - last) / 60_000);
-        if (sinceMin < cooldownMin) {
-          skip.push({ agent: a, reason: `cooldown (ran ${sinceMin}min ago < ${cooldownMin})` });
+      } else {
+        // Cross-agent consumed-guard (dev-requests/2026-07-17-loop-dispatch-stall-
+        // hardening.md): the target STARTED a run (or got a fire-marker — its
+        // started_at is the fire time) after this suggestion was posted, so the
+        // suggestion is already served. Required for the wider freshness window:
+        // without it, a suggestion that outlives the cooldown would re-fire an
+        // agent that already handled it.
+        const lastStart = latestStart.get(a);
+        if (lastStart !== undefined && lastStart >= finMs) {
+          skip.push({ agent: a, reason: `consumed (${a} started a run after the suggestion)` });
           continue;
         }
+        if (last !== undefined) {
+          const sinceMin = Math.floor((opts.nowMs - last) / 60_000);
+          if (sinceMin < cooldownMin) {
+            skip.push({ agent: a, reason: `cooldown (ran ${sinceMin}min ago < ${cooldownMin})` });
+            continue;
+          }
+        }
       }
-      if (wake.length >= maxWakes) {
+      const countsTowardCap = fireableSet === null || fireableSet.has(a);
+      if (countsTowardCap && fireableWakes >= maxWakes) {
         skip.push({ agent: a, reason: `max wakes (${maxWakes}) reached` });
         continue;
       }
       wake.push({ agent: a, reason: r.run_id });
       wokenThisCycle.add(a);
+      if (countsTowardCap) fireableWakes++;
     }
   }
 

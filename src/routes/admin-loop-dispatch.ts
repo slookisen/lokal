@@ -31,6 +31,7 @@ import {
   computeWakeList,
   fireTextFor,
   resolveActiveWindowHour,
+  resolveWindowMin,
   DEFAULT_ALLOWLIST,
   type DispatchPlan,
 } from "../services/loop-dispatch";
@@ -155,6 +156,13 @@ function planNow(): DispatchPlan {
   // call now sends explicit window bounds, overridable via env without a code revert.
   const activeStartUTC = resolveActiveWindowHour(process.env.DISPATCH_ACTIVE_START_UTC, 0);
   const activeEndUTC = resolveActiveWindowHour(process.env.DISPATCH_ACTIVE_END_UTC, 24);
+  // dev-requests/2026-07-17-loop-dispatch-stall-hardening.md: 45-min freshness window
+  // (survives the 25-min cross-agent cooldown + gives failed /fire calls retries on
+  // later ticks) + fireable set so routine-less wakes don't consume the maxWakes
+  // budget. Same env-knob pattern as the active window: pure default stays 12,
+  // DISPATCH_WINDOW_MIN restores the old behavior without a code revert.
+  const windowMin = resolveWindowMin(process.env.DISPATCH_WINDOW_MIN);
+  const { map: routines } = parseRoutines();
   return computeWakeList(
     runs.map((r) => ({
       run_id: r.run_id,
@@ -163,7 +171,14 @@ function planNow(): DispatchPlan {
       finished_at: r.finished_at,
       next_suggested: r.next_suggested ?? null,
     })),
-    { nowMs: Date.now(), allowlist: DEFAULT_ALLOWLIST, activeStartUTC, activeEndUTC },
+    {
+      nowMs: Date.now(),
+      allowlist: DEFAULT_ALLOWLIST,
+      activeStartUTC,
+      activeEndUTC,
+      windowMin,
+      fireable: Object.keys(routines),
+    },
   );
 }
 
@@ -259,6 +274,19 @@ export async function runDispatchTick(mode: "shadow" | "active"): Promise<Dispat
   }
 
   const firedOk = fired.filter((f) => f.ok).length;
+  const firedFailed = fired.filter((f) => !f.ok);
+  // Fire-failure visibility (dev-requests/2026-07-17-loop-dispatch-stall-hardening.md):
+  // the 2026-07-17 09:40Z outage — /fire returning 401 authentication_error on an
+  // expired FIRE_ROUTINES token — was invisible in the ledger (`fired_ok=0` with no
+  // status/detail), so the fleet sat idle for hours before a live session diagnosed
+  // it. Surface each failure's HTTP status + truncated detail in the envelope so the
+  // controller/supervisor/daily-brief can see WHY wakes are failing. The detail is
+  // the /fire response body (never the token).
+  const failNote = firedFailed.length
+    ? ` FIRE-FAILURES: ${firedFailed
+        .map((f) => `${f.agent}=HTTP${f.status}${f.detail ? ` ${f.detail.slice(0, 100)}` : ""}`)
+        .join("; ")}`
+    : "";
   const finishedAt = new Date().toISOString();
   const envelope: RunEnvelope = {
     run_id: `run-${finishedAt.replace(/[:.]/g, "-")}-loop-dispatcher-fly`,
@@ -274,10 +302,26 @@ export async function runDispatchTick(mode: "shadow" | "active"): Promise<Dispat
         value: firedOk,
         meta: { kind: "wakes_fired", mode, source: "fly", wake_planned: plan.wake.length },
       },
+      ...(firedFailed.length
+        ? [
+            {
+              type: "db_state_change" as const,
+              value: firedFailed.length,
+              meta: {
+                kind: "wakes_failed",
+                statuses: firedFailed.map((f) => ({ agent: f.agent, status: f.status })),
+              },
+            },
+          ]
+        : []),
     ],
     evidence: [],
     next_suggested: [], // the dispatcher MUST NOT emit next_suggested (no ping-pong)
-    notes: `mode=${mode} candidates=${plan.candidates} wake=${plan.wake.length} fired_ok=${firedOk} deferred=${deferred.length}${plan.inActiveWindow ? "" : " (paused: outside active window)"}`.slice(0, 480),
+    notes:
+      `mode=${mode} candidates=${plan.candidates} wake=${plan.wake.length} fired_ok=${firedOk} deferred=${deferred.length}${plan.inActiveWindow ? "" : " (paused: outside active window)"}${failNote}`.slice(
+        0,
+        480,
+      ),
   };
   // Only record an envelope when we actually fired (or attempted) a wake. A no-op
   // dispatch — the common ~10-min heartbeat that wakes nobody — must NOT flood the

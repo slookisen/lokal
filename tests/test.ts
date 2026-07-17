@@ -5,7 +5,7 @@
 
 import { redactPII, isValidFodselsnummer } from "../src/utils/pii-redact";
 import { computeLoopHealth } from "../src/services/loop-health";
-import { computeWakeList, fireTextFor, resolveActiveWindowHour, resolveTickIntervalMin } from "../src/services/loop-dispatch";
+import { computeWakeList, fireTextFor, resolveActiveWindowHour, resolveTickIntervalMin, resolveWindowMin } from "../src/services/loop-dispatch";
 import { normalizeTimestamp, normalizeEnvelopeTimes } from "../src/services/envelope-normalize";
 import { validateEnvelope } from "../src/routes/admin-runs";
 import conversationUiRouter, {
@@ -20081,10 +20081,10 @@ const _orchPr20260614_2Promise = (async () => {
     [mk("r11", "rfb-supervisor", 1, ["platform-orchestrator"]), mk("firemarker-r12", "platform-orchestrator", 0, [])],
     { nowMs: baseUTC },
   );
-  assertEq(p9.wake.length, 0, "dispatch: fire-marker recorded 0min ago -> immediate cooldown, no double-wake");
+  assertEq(p9.wake.length, 0, "dispatch: fire-marker recorded 0min ago -> immediate skip, no double-wake");
   assertTrue(
-    p9.skip.some((s) => s.agent === "platform-orchestrator" && /cooldown/.test(s.reason)),
-    "dispatch: fire-marker cooldown skip recorded",
+    p9.skip.some((s) => s.agent === "platform-orchestrator" && /consumed|cooldown/.test(s.reason)),
+    "dispatch: fire-marker skip recorded (consumed-guard or cooldown)",
   );
 
   // dev-requests/2026-07-09-self-continue-cooldown-carveout.md: self-continue was
@@ -20169,6 +20169,106 @@ const _orchPr20260614_2Promise = (async () => {
     assertTrue(/POST your run-envelope/.test(t), `fireTextFor: ${agent} text keeps the envelope instruction`);
     assertTrue(t.includes(`next_suggested=${agent}`), `fireTextFor: ${agent} text names the woken agent`);
   }
+
+  // ── dev-requests/2026-07-17-loop-dispatch-stall-hardening.md ──────────────
+  // Two real spine outages pinned as regressions:
+  //  (1) 2026-07-16 22:25Z: an event-wake envelope for the orchestrator landed while
+  //      the orchestrator was inside the 25-min cross-agent cooldown; by the time the
+  //      cooldown expired, the 12-min freshness window had killed the candidate —
+  //      structurally unfireable, fleet slept all night with a full queue.
+  //  (2) 2026-07-17 09:40Z: a /fire call failed (401, dead FIRE_ROUTINES token); the
+  //      candidate expired after that single attempt with no retry and no ledger trace.
+  // Fix: planNow() passes windowMin 45 (env DISPATCH_WINDOW_MIN) so candidates outlive
+  // the cooldown / get retried, guarded by a cross-agent consumed-check so the wider
+  // window cannot double-fire, plus a fireable-aware maxWakes cap.
+
+  // (d) consumed-guard: target STARTED a run after the suggestion was posted -> skip.
+  const c1 = computeWakeList(
+    [
+      mk("rc1", "rfb-supervisor", 5, ["platform-orchestrator"]),
+      mk("rc2", "platform-orchestrator", 2, []), // started (and finished) after rc1 finished
+    ],
+    { nowMs: baseUTC, cooldownMin: 0 },
+  );
+  assertEq(c1.wake.length, 0, "dispatch: consumed-guard -> no wake when target ran after suggestion");
+  assertTrue(
+    c1.skip.some((s) => s.agent === "platform-orchestrator" && /consumed/.test(s.reason)),
+    "dispatch: consumed-guard skip recorded",
+  );
+
+  // (e) in-flight overlap is NOT consumption: the target run STARTED before the
+  // suggestion landed (it never saw it) even though it finished after. The suggestion
+  // must survive to the cooldown check instead of being consumed-skipped — this is the
+  // exact 2026-07-16 22:25Z shape (orchestrator ran 22:22→22:28, event-wake at 22:25).
+  const c2 = computeWakeList(
+    [
+      mk("rc3", "rfb-supervisor", 5, ["platform-orchestrator"]),
+      {
+        run_id: "rc4",
+        agent: "platform-orchestrator",
+        started_at: new Date(baseUTC - 10 * MIN).toISOString(), // started BEFORE rc3 finished
+        finished_at: new Date(baseUTC - 4 * MIN).toISOString(), // finished after
+        next_suggested: [],
+      },
+    ],
+    { nowMs: baseUTC },
+  );
+  assertEq(c2.wake.length, 0, "dispatch: overlapping run -> suggestion survives to cooldown (blocked there)");
+  assertTrue(
+    c2.skip.some((s) => s.agent === "platform-orchestrator" && /cooldown/.test(s.reason)),
+    "dispatch: overlap case skips on cooldown, NOT consumed",
+  );
+
+  // (f) cooldown-deadlock regression: 30-min-old suggestion + expired cooldown. With
+  // the old 12-min window this candidate was stale (the deadlock); with windowMin 45
+  // it fires.
+  const deadlockRuns = [
+    mk("rf1", "rfb-supervisor", 30, ["platform-orchestrator"]),
+    {
+      run_id: "rf2",
+      agent: "platform-orchestrator",
+      started_at: new Date(baseUTC - 33 * MIN).toISOString(), // before rf1 finished -> not consumed
+      finished_at: new Date(baseUTC - 27 * MIN).toISOString(), // cooldown (25) expired
+      next_suggested: [],
+    },
+  ];
+  const f1 = computeWakeList(deadlockRuns, { nowMs: baseUTC, windowMin: 45 });
+  assertEq(f1.wake.length, 1, "dispatch: 45-min window -> post-cooldown wake fires (deadlock fixed)");
+  assertEq(f1.wake[0]!.agent, "platform-orchestrator", "dispatch: deadlock fix wakes the suggested agent");
+  const f2 = computeWakeList(deadlockRuns, { nowMs: baseUTC });
+  assertEq(f2.candidates, 0, "dispatch: default 12-min window still treats 30-min-old run as stale (pure default unchanged)");
+
+  // (g) fireable-aware maxWakes: routine-less wakes don't consume the budget. verifier
+  // (not fireable) is planned first but doesn't count; orchestrator (fireable) still
+  // fires under maxWakes=1; controller (fireable) then hits the cap.
+  const g1 = computeWakeList(
+    [
+      mk("rg1", "rfb-customer-service", 1, ["platform-verifier"]),
+      mk("rg2", "rfb-supervisor", 1, ["platform-orchestrator"]),
+      mk("rg3", "lokal-agent-enrichment", 1, ["orchestrator-v3-controller"]),
+    ],
+    {
+      nowMs: baseUTC,
+      maxWakes: 1,
+      fireable: ["platform-orchestrator", "orchestrator-v3-controller"],
+    },
+  );
+  assertTrue(g1.wake.some((w) => w.agent === "platform-verifier"), "dispatch: non-fireable wake still planned (deferred downstream)");
+  assertTrue(g1.wake.some((w) => w.agent === "platform-orchestrator"), "dispatch: fireable wake not starved by non-fireable pileup");
+  assertTrue(
+    g1.skip.some((s) => s.agent === "orchestrator-v3-controller" && /max wakes/.test(s.reason)),
+    "dispatch: maxWakes still caps fireable wakes",
+  );
+
+  // (h) resolveWindowMin: same env-footgun coverage as its sibling helpers, plus the
+  // [5, 55] clamp (must stay under planNow's sinceHours:1 ledger query).
+  assertEq(resolveWindowMin(undefined), 45, "resolveWindowMin: unset -> default 45");
+  assertEq(resolveWindowMin(""), 45, "resolveWindowMin: empty string -> default 45 (not caught by ??)");
+  assertEq(resolveWindowMin("not-a-number"), 45, "resolveWindowMin: non-numeric -> default 45");
+  assertEq(resolveWindowMin("30"), 30, "resolveWindowMin: valid numeric string -> parsed value");
+  assertEq(resolveWindowMin("12"), 12, "resolveWindowMin: explicit 12 restores the old window");
+  assertEq(resolveWindowMin("3"), 5, "resolveWindowMin: below-range -> clamped to 5");
+  assertEq(resolveWindowMin("99"), 55, "resolveWindowMin: above-range -> clamped to 55 (ledger query bound)");
 }
 
 // -- envelope timestamp normalization (pure) --
