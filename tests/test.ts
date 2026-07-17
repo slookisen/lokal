@@ -27533,6 +27533,25 @@ const _recentlyEnrichedSpotcheckPromise: Promise<void> = new Promise<void>(r => 
   } catch (err: any) {
     failed++;
     failures.push("opplevelser-providers-recently-enriched: unexpected error: " + String(err?.message || err));
+  }
+
+  // dev-request 2026-07-12-experiences-enrichment-supply-and-aggregator-hygiene:
+  // GET .../providers/by-hjemmeside (find providers stuck on an aggregator/DMO
+  // homepage) + PATCH .../providers/:id/hjemmeside (the correction write path
+  // that didn't exist before). Same isolated experiences db-factory handle as
+  // the block immediately above — safe to run in this same sequential slot.
+  console.log("\n── dev-request 2026-07-12: GET by-hjemmeside + PATCH providers/:id/hjemmeside (experiences) ──");
+  try {
+    const { runOpplevelserAdminProvidersHjemmesideTests } = require("../src/routes/opplevelser-admin-providers-hjemmeside.test") as
+      typeof import("../src/routes/opplevelser-admin-providers-hjemmeside.test");
+    const aph = await runOpplevelserAdminProvidersHjemmesideTests({ log: false });
+    passed += aph.passed;
+    failed += aph.failed;
+    for (const f of aph.failures) failures.push("opplevelser-admin-providers-hjemmeside: " + f);
+    console.log(`  opplevelser-admin-providers-hjemmeside: ${aph.passed} passed, ${aph.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("opplevelser-admin-providers-hjemmeside: unexpected error: " + String(err?.message || err));
   } finally {
     _recentlyEnrichedSpotcheckResolve();
   }

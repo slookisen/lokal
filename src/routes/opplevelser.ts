@@ -1519,6 +1519,149 @@ router.get("/admin/providers/recently-enriched", requireAdmin, (req: Request, re
   }
 });
 
+// ─── GET /api/opplevelser/admin/providers/by-hjemmeside ──────────────────────
+// PATCH /api/opplevelser/admin/providers/:id/hjemmeside
+//
+// dev-request 2026-07-12-experiences-enrichment-supply-and-aggregator-hygiene:
+// the enrichment pipeline is supply-starved partly because there was no way
+// to (a) find providers whose hjemmeside is wrongly set to an aggregator/DMO
+// domain (visitnorway.com etc.) instead of their own site — ~13 known cases —
+// and (b) no write path to correct hjemmeside on an existing
+// experience_providers row once bad data was in. This pair closes both gaps:
+// GET .../by-hjemmeside is the read-only lookup half, PATCH .../:id/hjemmeside
+// is the write half. Neither touches any other provider field.
+//
+// GET is registered here (alongside the other providers/* admin routes)
+// rather than right before the generic /:id catch-all further below —
+// unlike /admin/gardssalg-provider-lookup's NB comment, there is no actual
+// collision risk here: this path has 3 segments (admin/providers/by-
+// hjemmeside) and the catch-all is a single-segment /:id, so Express can
+// never confuse the two regardless of registration order.
+//
+// Read-only — a single SELECT, parameterized LIKE (`%pattern%` bound as a
+// query parameter, never string-concatenated into the SQL). Case-
+// insensitive per SQLite's built-in (ASCII-only) LIKE folding — sufficient
+// here since hjemmeside values are URLs/domains (ASCII per RFC), unlike the
+// Norwegian navn field gardssalg-provider-lookup has to fold in JS instead.
+// Response is deliberately minimal — id/navn/hjemmeside/vertical only, same
+// privacy-minimization pattern as /admin/gardssalg-contact-coverage above
+// (no epost/telefon/adresse).
+const BY_HJEMMESIDE_DEFAULT_LIMIT = 100;
+const BY_HJEMMESIDE_MAX_LIMIT = 500;
+router.get("/admin/providers/by-hjemmeside", requireAdmin, (req: Request, res: Response) => {
+  const patternParam = req.query.pattern;
+  const pattern = typeof patternParam === "string" ? patternParam.trim() : "";
+  if (!pattern) {
+    res.status(400).json({ error: "Query param 'pattern' is required and must be non-blank" });
+    return;
+  }
+
+  let limit = parseInt((req.query.limit as string) || "", 10);
+  if (!Number.isFinite(limit)) limit = BY_HJEMMESIDE_DEFAULT_LIMIT;
+  limit = Math.min(BY_HJEMMESIDE_MAX_LIMIT, Math.max(1, limit));
+
+  try {
+    const expDb = getExpDb("experiences");
+    const providers = expDb
+      .prepare(
+        `SELECT id, navn, hjemmeside, vertical
+           FROM experience_providers
+          WHERE hjemmeside LIKE ?
+          ORDER BY navn
+          LIMIT ?`
+      )
+      .all(`%${pattern}%`, limit) as Array<{
+        id: string;
+        navn: string;
+        hjemmeside: string | null;
+        vertical: string;
+      }>;
+
+    res.json({ success: true, count: providers.length, providers });
+  } catch (err) {
+    console.error("[opplevelser] admin/providers/by-hjemmeside failed", err);
+    res.status(500).json({ error: "Internal error" });
+  }
+});
+
+// Very light "does this look like a URL" sanity check — deliberately NOT a
+// strict domain/TLD validator (the dev-request explicitly says not to
+// overengineer this: this route corrects known-bad values like a leaked
+// aggregator domain, it does not need to prove the new value is a live,
+// working homepage). Rejects obvious garbage (whitespace, no dot at all,
+// absurd length); accepts anything URL-shaped (with or without a scheme,
+// with a path/query/port, incl. Norwegian æøå in the host).
+function isPlausibleUrlish(v: string): boolean {
+  if (v.length === 0 || v.length > 2048) return false;
+  if (/\s/.test(v)) return false;
+  return v.includes(".");
+}
+
+// Body: { hjemmeside: string | null }. The field must be PRESENT in the
+// body — entirely missing -> 400 (distinct from an explicit null, which is
+// a valid "clear the homepage" instruction). Present but neither string nor
+// null -> 400. An empty (or empty-after-trim) string is accepted input but
+// normalized to null before writing, matching the "no homepage" semantics
+// used elsewhere in this file (e.g. the present() helper in
+// /admin/gardssalg-contact-coverage above).
+//
+// Response carries BOTH previous_hjemmeside and new_hjemmeside — the audit
+// trail a human/orchestrator correcting bad data needs to confirm exactly
+// what changed. This is a deliberate design requirement of the dev-request,
+// not an incidental extra field.
+router.patch("/admin/providers/:id/hjemmeside", requireAdmin, (req: Request, res: Response) => {
+  const id = req.params.id;
+  const body = (req.body ?? {}) as { hjemmeside?: unknown };
+
+  if (!("hjemmeside" in body)) {
+    res.status(400).json({ error: "Body field 'hjemmeside' is required (string or null)" });
+    return;
+  }
+  const raw = body.hjemmeside;
+  if (raw !== null && typeof raw !== "string") {
+    res.status(400).json({ error: "'hjemmeside' must be a string or null" });
+    return;
+  }
+
+  let normalized: string | null = raw === null ? null : raw.trim();
+  if (normalized === "") normalized = null;
+
+  if (normalized !== null && !isPlausibleUrlish(normalized)) {
+    res.status(400).json({ error: "'hjemmeside' does not look like a plausible URL" });
+    return;
+  }
+
+  try {
+    const expDb = getExpDb("experiences");
+    const existing = expDb
+      .prepare(`SELECT id, hjemmeside FROM experience_providers WHERE id = ?`)
+      .get(id) as { id: string; hjemmeside: string | null } | undefined;
+
+    if (!existing) {
+      res.status(404).json({ error: "Provider not found", id });
+      return;
+    }
+
+    expDb
+      .prepare(
+        `UPDATE experience_providers
+            SET hjemmeside = ?, updated_at = datetime('now')
+          WHERE id = ?`
+      )
+      .run(normalized, id);
+
+    res.json({
+      success: true,
+      id,
+      previous_hjemmeside: existing.hjemmeside,
+      new_hjemmeside: normalized,
+    });
+  } catch (err) {
+    console.error("[opplevelser] admin/providers/:id/hjemmeside PATCH failed", err);
+    res.status(500).json({ error: "Internal error" });
+  }
+});
+
 // ─── GET /api/opplevelser/admin/detail-completeness-coverage ─────────────────
 //
 // dev-request 2026-07-04-opplevagent-dedup-og-norske-titler, item 3 ("detail
