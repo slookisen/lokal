@@ -208,8 +208,12 @@ export function getBookingByToken(
   return row ? hydrate(row) : null;
 }
 
-// Producer calls this via tokenized confirm link.
-// Only transitions from 'reserved'; returns null if token unknown or already resolved.
+// Producer resolves a booking via the tokenized confirm page.
+// Transitions: reserved → confirmed_attended|no_show, and (booking-flyt-v1,
+// "bekreft-løkka") corrections BETWEEN the two resolved states — a mis-click
+// on "ikke møtt" must not be permanent, since billable/commission hangs on
+// it. Same status twice is an idempotent no-op (returns the row unchanged).
+// 'cancelled' is terminal. Returns null only for unknown token / cancelled.
 export function resolveBooking(
   confirm_token: string,
   newStatus: "confirmed_attended" | "no_show",
@@ -217,7 +221,8 @@ export function resolveBooking(
 ): GardssalgBooking | null {
   const db = getDb(VERTICAL);
   const existing = getBookingByToken(confirm_token);
-  if (!existing || existing.status !== "reserved") return null;
+  if (!existing || existing.status === "cancelled") return null;
+  if (existing.status === newStatus) return existing;
 
   db.prepare(`
     UPDATE gardssalg_bookings
@@ -232,6 +237,41 @@ export function resolveBooking(
   );
 
   return getBookingByToken(confirm_token);
+}
+
+// Undo a resolution: back to 'reserved', billable off, resolution fields
+// cleared. Idempotent when already reserved; null for unknown token or the
+// terminal 'cancelled' state.
+export function reopenBooking(confirm_token: string): GardssalgBooking | null {
+  const db = getDb(VERTICAL);
+  const existing = getBookingByToken(confirm_token);
+  if (!existing || existing.status === "cancelled") return null;
+  if (existing.status === "reserved") return existing;
+
+  db.prepare(`
+    UPDATE gardssalg_bookings
+    SET status = 'reserved', resolved_by = NULL, resolved_at = NULL,
+        billable = 0
+    WHERE confirm_token = ?
+  `).run(confirm_token);
+
+  return getBookingByToken(confirm_token);
+}
+
+// Time guard for attendance resolution: attended/no_show only make sense
+// AFTER the visit has started. slot_at is a naive datetime-local string
+// ("2026-09-03T13:00", no timezone) parsed in the server's zone (UTC on
+// Fly), so for an Oslo visit the guard opens up to ~2h after the actual
+// local start — conservative in the right direction for "bekreft etter
+// besøket". An unparseable slot_at returns true so a broken row can still
+// be resolved rather than being stuck forever.
+export function visitTimeReached(
+  booking: Pick<GardssalgBooking, "slot_at">,
+  now: Date = new Date(),
+): boolean {
+  const t = new Date(booking.slot_at).getTime();
+  if (isNaN(t)) return true;
+  return t <= now.getTime();
 }
 
 // Monthly commission statement for one provider.
@@ -275,6 +315,18 @@ export function getPendingBookings(provider_id: string): GardssalgBooking[] {
   return rows.map(hydrate);
 }
 
+// Guest-controlled strings (name, notes, …) are interpolated into email
+// HTML below — escape them so a note like "<script>…" renders as text in
+// the producer's mail client instead of as markup.
+function escEmailHtml(s: string): string {
+  return s
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+}
+
 // ─── ICS + confirmation email — shared by every booking entry point ────────
 // Lives here (not in a route file) so both POST /api/opplevelser/book
 // (opplevelser.ts) and the gårdssalg SSR reservation form's no-JS fallback
@@ -307,7 +359,7 @@ export function buildIcs(booking: GardssalgBooking): string {
 }
 
 export async function sendBookingConfirmation(booking: GardssalgBooking): Promise<void> {
-  const confirmUrl = `${APP_URL}/api/opplevelser/book/confirm/${booking.confirm_token}`;
+  const confirmUrl = `${APP_URL}/kategori/gardssalg/bekreft/${booking.confirm_token}`;
   const ics = buildIcs(booking);
 
   const slotFormatted = new Date(booking.slot_at).toLocaleString("nb-NO", {
@@ -317,20 +369,21 @@ export async function sendBookingConfirmation(booking: GardssalgBooking): Promis
   });
 
   const htmlContent = `
-<p>Hei ${booking.guest_name},</p>
+<p>Hei ${escEmailHtml(booking.guest_name)},</p>
 <p>Din påmelding er registrert! Her er din bekreftelse:</p>
 <table style="border-collapse:collapse;font-family:sans-serif">
   <tr><td style="padding:4px 12px 4px 0;font-weight:bold">Bookingref:</td><td>${booking.booking_ref}</td></tr>
   <tr><td style="padding:4px 12px 4px 0;font-weight:bold">Dato/tid:</td><td>${slotFormatted}</td></tr>
   <tr><td style="padding:4px 12px 4px 0;font-weight:bold">Antall:</td><td>${booking.party_size} person${booking.party_size > 1 ? "er" : ""}</td></tr>
+  ${booking.notes ? `<tr><td style="padding:4px 12px 4px 0;font-weight:bold">Din kommentar:</td><td>${escEmailHtml(booking.notes)}</td></tr>` : ""}
 </table>
-<p>Tilbyderen vil bekrefte oppmøte etter besøket via lenken nedenfor (kun for tilbyder).</p>
+<p>Produsenten er varslet om reservasjonen og bekrefter oppmøtet etter besøket.</p>
 <p>En kalenderinvitasjon (ICS) er vedlagt denne e-posten.</p>
 <p>Spørsmål? Svar på denne e-posten.</p>
 <p>Hilsen<br>Opplevagent</p>
   `.trim();
 
-  const textContent = `Hei ${booking.guest_name},\n\nDin påmelding er registrert.\nBookingref: ${booking.booking_ref}\nDato/tid: ${slotFormatted}\nAntall: ${booking.party_size}\n\nHilsen\nOpplevagent`;
+  const textContent = `Hei ${booking.guest_name},\n\nDin påmelding er registrert.\nBookingref: ${booking.booking_ref}\nDato/tid: ${slotFormatted}\nAntall: ${booking.party_size}${booking.notes ? `\nDin kommentar: ${booking.notes}` : ""}\n\nProdusenten er varslet og bekrefter oppmøtet etter besøket.\n\nHilsen\nOpplevagent`;
 
   await emailService.sendEmail({
     to: booking.guest_email,
@@ -381,6 +434,13 @@ export async function sendProducerNotification(
     timeZone: "Europe/Oslo",
   });
 
+  // Producer-facing confirm page (booking-flyt-v1 "bekreft-løkka"): the
+  // tokenized link goes to the PRODUCER only — never into the guest email or
+  // the booking API response, where it would let a guest resolve their own
+  // attendance (commission integrity). The page itself mutates nothing on
+  // GET; actions are POST buttons, so mail-client link prefetching is safe.
+  const confirmUrl = `${APP_URL}/kategori/gardssalg/bekreft/${booking.confirm_token}`;
+
   const htmlContent = `
 <p>Hei,</p>
 <p>Du har fått en ny reservasjon via Opplevagent:</p>
@@ -388,15 +448,18 @@ export async function sendProducerNotification(
   <tr><td style="padding:4px 12px 4px 0;font-weight:bold">Bookingref:</td><td>${booking.booking_ref}</td></tr>
   <tr><td style="padding:4px 12px 4px 0;font-weight:bold">Dato/tid:</td><td>${slotFormatted}</td></tr>
   <tr><td style="padding:4px 12px 4px 0;font-weight:bold">Antall:</td><td>${booking.party_size} person${booking.party_size > 1 ? "er" : ""}</td></tr>
-  <tr><td style="padding:4px 12px 4px 0;font-weight:bold">Gjest:</td><td>${booking.guest_name}</td></tr>
-  <tr><td style="padding:4px 12px 4px 0;font-weight:bold">E-post:</td><td>${booking.guest_email}</td></tr>
-  ${booking.guest_phone ? `<tr><td style="padding:4px 12px 4px 0;font-weight:bold">Telefon:</td><td>${booking.guest_phone}</td></tr>` : ""}
+  <tr><td style="padding:4px 12px 4px 0;font-weight:bold">Gjest:</td><td>${escEmailHtml(booking.guest_name)}</td></tr>
+  <tr><td style="padding:4px 12px 4px 0;font-weight:bold">E-post:</td><td>${escEmailHtml(booking.guest_email)}</td></tr>
+  ${booking.guest_phone ? `<tr><td style="padding:4px 12px 4px 0;font-weight:bold">Telefon:</td><td>${escEmailHtml(booking.guest_phone)}</td></tr>` : ""}
+  ${booking.notes ? `<tr><td style="padding:4px 12px 4px 0;font-weight:bold">Kommentar fra gjesten:</td><td>${escEmailHtml(booking.notes)}</td></tr>` : ""}
 </table>
 <p>Spørsmål fra gjesten kan besvares direkte — gjestens e-post står over.</p>
+<p>Etter besøket: <a href="${confirmUrl}">bekreft oppmøte eller ikke-oppmøte her</a>.<br>
+Lenken er personlig for denne reservasjonen — ikke del den videre.</p>
 <p>Hilsen<br>Opplevagent</p>
   `.trim();
 
-  const textContent = `Hei,\n\nDu har fått en ny reservasjon via Opplevagent.\nBookingref: ${booking.booking_ref}\nDato/tid: ${slotFormatted}\nAntall: ${booking.party_size}\nGjest: ${booking.guest_name} (${booking.guest_email}${booking.guest_phone ? ", " + booking.guest_phone : ""})\n\nHilsen\nOpplevagent`;
+  const textContent = `Hei,\n\nDu har fått en ny reservasjon via Opplevagent.\nBookingref: ${booking.booking_ref}\nDato/tid: ${slotFormatted}\nAntall: ${booking.party_size}\nGjest: ${booking.guest_name} (${booking.guest_email}${booking.guest_phone ? ", " + booking.guest_phone : ""})${booking.notes ? `\nKommentar fra gjesten: ${booking.notes}` : ""}\n\nEtter besøket: bekreft oppmøte her (personlig lenke, ikke del videre):\n${confirmUrl}\n\nHilsen\nOpplevagent`;
 
   await emailService.sendEmail({
     to: producerEmail,

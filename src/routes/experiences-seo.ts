@@ -77,6 +77,11 @@ import {
   // dev-request 2026-07-12-gardssalg-dark-launch-stop, slice 0
   isBookingPaused,
   sendProducerNotification,
+  // booking-flyt-v1 "bekreft-løkka": producer confirm page (POST-mutating)
+  getBookingByToken,
+  resolveBooking,
+  reopenBooking,
+  visitTimeReached,
 } from "../services/booking-store";
 import { getOaHomeCounters } from "../services/oa-home-counters";
 
@@ -2741,8 +2746,9 @@ ${BROWSE_CSS}
 .book-panel .notice-paused{font-size:.88rem;color:var(--ink);background:var(--canvas-2);border:1px solid var(--line);border-left:4px solid var(--fjord-800);border-radius:8px;padding:12px 14px;margin:14px 0 18px}
 .book-panel .notice-paused strong{display:block;font-size:.76rem;font-weight:800;text-transform:uppercase;letter-spacing:.05em;color:var(--fjord-800);margin-bottom:4px}
 .book-form label{display:block;font-size:.84rem;font-weight:700;color:var(--ink-soft);margin:14px 0 5px}
-.book-form input{width:100%;padding:10px 12px;border:1px solid var(--line);border-radius:8px;font-size:.95rem;color:var(--ink);background:var(--surface)}
-.book-form input:focus-visible{outline:2px solid var(--teal-500);outline-offset:1px}
+.book-form input,.book-form textarea{width:100%;padding:10px 12px;border:1px solid var(--line);border-radius:8px;font-size:.95rem;color:var(--ink);background:var(--surface)}
+.book-form textarea{resize:vertical;font-family:inherit;min-height:72px}
+.book-form input:focus-visible,.book-form textarea:focus-visible{outline:2px solid var(--teal-500);outline-offset:1px}
 .book-form button{margin-top:20px;width:100%;padding:12px 18px;background:var(--fjord-800);color:#fff;border:none;border-radius:8px;font-size:1rem;font-weight:700;cursor:pointer}
 .book-form button:hover{background:var(--fjord-700)}
 .book-form button:disabled{opacity:.6;cursor:default}
@@ -2780,6 +2786,8 @@ ${BROWSE_CSS}
       <input id="guest_email" name="guest_email" type="email" autocomplete="email" required>
       <label for="guest_phone">Telefon <span style="font-weight:400;color:var(--mist)">(valgfritt)</span></label>
       <input id="guest_phone" name="guest_phone" type="tel" maxlength="30" autocomplete="tel">
+      <label for="notes">Kommentar til produsenten <span style="font-weight:400;color:var(--mist)">(valgfritt)</span></label>
+      <textarea id="notes" name="notes" maxlength="500" rows="3" placeholder="F.eks. allergier, spørsmål eller ønsker for besøket"></textarea>
       <button type="submit">Reserver besøk</button>
       <p class="hint" id="book-form-status" role="status" aria-live="polite"></p>
     </form>
@@ -2807,6 +2815,8 @@ ${BROWSE_CSS}
     };
     var phone = String(fd.get("guest_phone") || "").trim();
     if (phone) payload.guest_phone = phone;
+    var notes = String(fd.get("notes") || "").trim();
+    if (notes) payload.notes = notes;
     if (btn) btn.disabled = true;
     if (status) status.textContent = "Sender reservasjon …";
     fetch("/api/opplevelser/book", {
@@ -2882,6 +2892,7 @@ router.post(
     const body = (req.body || {}) as Record<string, unknown>;
     const partySize = parseInt(String(body.party_size ?? ""), 10);
     const phoneRaw = body.guest_phone ? String(body.guest_phone).trim() : "";
+    const notesRaw = body.notes ? String(body.notes).trim() : "";
 
     const parsed = BookingInputSchema.safeParse({
       provider_id: provider.id,
@@ -2890,6 +2901,7 @@ router.post(
       guest_name: String(body.guest_name ?? ""),
       guest_email: String(body.guest_email ?? ""),
       ...(phoneRaw ? { guest_phone: phoneRaw } : {}),
+      ...(notesRaw ? { notes: notesRaw } : {}),
     });
     if (!parsed.success) {
       res.redirect(303, `${backTo}?error=invalid`);
@@ -3005,6 +3017,7 @@ ${BROWSE_CSS}
       <div><strong>Dato/tid:</strong> ${escapeHtml(slotFormatted)}</div>
       <div><strong>Antall:</strong> ${booking.party_size} person${booking.party_size > 1 ? "er" : ""}</div>
       <div><strong>Navn:</strong> ${escapeHtml(booking.guest_name)}</div>
+      ${booking.notes ? `<div><strong>Kommentar:</strong> ${escapeHtml(booking.notes)}</div>` : ""}
     </div>
     <p class="hint">En bekreftelse er sendt til ${escapeHtml(booking.guest_email)}.</p>
     <a class="ics-link" href="${icsUrl}">Last ned kalenderfil (.ics)</a>
@@ -3019,6 +3032,186 @@ ${BROWSE_CSS}
     res.setHeader("Content-Type", "text/html; charset=utf-8");
     res.setHeader("Cache-Control", "no-store");
     res.send(html);
+  },
+);
+
+// ─── Producer confirm page (booking-flyt-v1 "bekreft-løkka") ────────────────
+//   GET  /kategori/gardssalg/bekreft/:token   status + details, mutates NOTHING
+//   POST /kategori/gardssalg/bekreft/:token   action=attended|no_show|reopen
+//
+// The tokenized link lands in the PRODUCER's notification email (see
+// sendProducerNotification). The old API endpoint resolved the booking
+// directly on GET — a state-mutating GET that a mail scanner's link prefetch
+// would have triggered silently; here every resolution is an explicit POST
+// button press (PRG redirect back to this page). Attendance actions are
+// time-guarded via visitTimeReached() — "bekreft oppmøte" only after the
+// visit — while "angre" (undo, back to reserved) is always available so a
+// mis-click on «Ikke møtt» is never permanent (billable/commission hangs on
+// this). Confirmed attendance counts toward the commission base.
+const BEKREFT_STATUS_LABEL: Record<string, string> = {
+  reserved: "Reservert — oppmøte ikke registrert ennå",
+  confirmed_attended: "Oppmøte bekreftet",
+  no_show: "Ikke møtt",
+  cancelled: "Kansellert",
+};
+
+router.get(
+  "/kategori/gardssalg/bekreft/:token",
+  (req: Request, res: Response, next: NextFunction) => {
+    const token = String(req.params.token || "");
+    if (!token) return next();
+    let booking: ReturnType<typeof getBookingByToken> = null;
+    try {
+      booking = getBookingByToken(token);
+    } catch {
+      booking = null;
+    }
+    if (!booking) return next();
+
+    const provider = getProviderById(booking.provider_id) as { navn?: string | null } | null;
+    const slotFormatted = new Date(booking.slot_at).toLocaleString("nb-NO", {
+      dateStyle: "full",
+      timeStyle: "short",
+      timeZone: "Europe/Oslo",
+    });
+    const canConfirm = visitTimeReached(booking);
+    const statusLabel = BEKREFT_STATUS_LABEL[booking.status] || booking.status;
+
+    const done = String(req.query.done || "");
+    const errorParam = String(req.query.error || "");
+    const banner =
+      done && BEKREFT_STATUS_LABEL[done]
+        ? `<div class="bekreft-banner ok" role="status">Registrert: ${escapeHtml(BEKREFT_STATUS_LABEL[done])}</div>`
+        : errorParam === "too_early"
+          ? `<div class="bekreft-banner warn" role="alert">Oppmøte kan først registreres etter besøkstidspunktet.</div>`
+          : errorParam
+            ? `<div class="bekreft-banner warn" role="alert">Kunne ikke oppdatere reservasjonen. Prøv igjen.</div>`
+            : "";
+
+    const postTo = `/kategori/gardssalg/bekreft/${encodeURIComponent(token)}`;
+    const actBtn = (action: string, label: string, cls: string) =>
+      `<form method="POST" action="${postTo}"><input type="hidden" name="action" value="${action}"><button type="submit" class="act-btn ${cls}">${label}</button></form>`;
+
+    let actionsHtml = "";
+    if (booking.status === "cancelled") {
+      actionsHtml = "";
+    } else if (!canConfirm) {
+      actionsHtml = `<p class="bekreft-wait">Oppmøte kan registreres etter besøket (fra ${escapeHtml(slotFormatted)}).</p>`;
+      if (booking.status === "confirmed_attended" || booking.status === "no_show") {
+        actionsHtml += actBtn("reopen", "Angre — tilbake til reservert", "act-undo");
+      }
+    } else {
+      const parts: string[] = [];
+      if (booking.status !== "confirmed_attended") parts.push(actBtn("attended", "Bekreft oppmøte", "act-primary"));
+      if (booking.status !== "no_show") parts.push(actBtn("no_show", "Ikke møtt", "act-secondary"));
+      if (booking.status === "confirmed_attended" || booking.status === "no_show") {
+        parts.push(actBtn("reopen", "Angre — tilbake til reservert", "act-undo"));
+      }
+      actionsHtml = parts.join("\n    ");
+    }
+
+    const html = `<!doctype html>
+<html lang="nb">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Bekreft oppmøte — ${escapeHtml(booking.booking_ref)} | Opplevagent</title>
+<meta name="robots" content="noindex, nofollow">
+<style>
+${BROWSE_CSS}
+.confirm-panel{max-width:480px;margin:24px auto 0;background:var(--surface);border-radius:12px;box-shadow:0 2px 8px rgba(0,0,0,.07);padding:28px 24px}
+.confirm-panel h1{font-size:1.3rem;font-weight:800;color:var(--fjord-900);margin-bottom:4px}
+.confirm-panel .ref{font-family:monospace;font-size:1rem;font-weight:700;letter-spacing:.03em;color:var(--fjord-800);background:var(--canvas-2);border-radius:8px;padding:6px 12px;display:inline-block;margin:8px 0 4px}
+.confirm-panel .status-line{margin:12px 0 4px;font-size:.95rem}
+.confirm-panel .recap{text-align:left;margin:16px 0;font-size:.92rem;color:var(--ink-soft)}
+.confirm-panel .recap div{padding:5px 0;border-bottom:1px solid var(--line)}
+.confirm-panel .hint{font-size:.82rem;color:var(--mist);margin-top:14px}
+.bekreft-banner{border-radius:8px;padding:12px 14px;margin:14px 0;font-size:.9rem}
+.bekreft-banner.ok{background:#e8f4ec;border:1px solid #bcd9c5;color:#1d5a30}
+.bekreft-banner.warn{background:#fdf3e7;border:1px solid #f0d4ae;color:#7a5218}
+.bekreft-wait{font-size:.9rem;color:var(--ink-soft);background:var(--canvas-2);border-radius:8px;padding:12px 14px;margin:14px 0}
+.act-btn{margin-top:12px;width:100%;padding:12px 18px;border:none;border-radius:8px;font-size:1rem;font-weight:700;cursor:pointer}
+.act-primary{background:var(--fjord-800);color:#fff}
+.act-primary:hover{background:var(--fjord-700)}
+.act-secondary{background:var(--canvas-2);color:var(--ink);border:1px solid var(--line)}
+.act-undo{background:transparent;color:var(--ink-soft);border:1px dashed var(--line);font-weight:400;font-size:.88rem;padding:9px 14px}
+</style>
+</head>
+<body>
+<a class="skip-link" href="#main">Hopp til innhold</a>
+<nav class="site-nav" aria-label="Navigasjon">
+  <div class="nav-inner">
+    <a class="brand" href="/"><span class="brand-word">opplevagent<span class="tld">.no</span></span></a>
+  </div>
+</nav>
+<main id="main" class="container">
+  <div class="confirm-panel">
+    <h1>Reservasjon hos ${escapeHtml(provider?.navn || "deg")}</h1>
+    <div class="ref">${escapeHtml(booking.booking_ref)}</div>
+    ${banner}
+    <div class="status-line">Status: <strong>${escapeHtml(statusLabel)}</strong></div>
+    <div class="recap">
+      <div><strong>Dato/tid:</strong> ${escapeHtml(slotFormatted)}</div>
+      <div><strong>Antall:</strong> ${booking.party_size} person${booking.party_size > 1 ? "er" : ""}</div>
+      <div><strong>Gjest:</strong> ${escapeHtml(booking.guest_name)}</div>
+      <div><strong>E-post:</strong> ${escapeHtml(booking.guest_email)}</div>
+      ${booking.guest_phone ? `<div><strong>Telefon:</strong> ${escapeHtml(booking.guest_phone)}</div>` : ""}
+      ${booking.notes ? `<div><strong>Kommentar fra gjesten:</strong> ${escapeHtml(booking.notes)}</div>` : ""}
+    </div>
+    ${actionsHtml}
+    <p class="hint">Denne siden er for produsenten. Bekreftet oppmøte regnes med i provisjonsgrunnlaget; «Ikke møtt» holdes utenfor. Lenken er personlig for denne reservasjonen.</p>
+  </div>
+</main>
+</body>
+</html>`;
+
+    res.setHeader("Content-Type", "text/html; charset=utf-8");
+    res.setHeader("Cache-Control", "no-store");
+    res.send(html);
+  },
+);
+
+router.post(
+  "/kategori/gardssalg/bekreft/:token",
+  express.urlencoded({ extended: false }),
+  (req: Request, res: Response, next: NextFunction) => {
+    const token = String(req.params.token || "");
+    if (!token) return next();
+    let booking: ReturnType<typeof getBookingByToken> = null;
+    try {
+      booking = getBookingByToken(token);
+    } catch {
+      booking = null;
+    }
+    if (!booking) return next();
+
+    const backTo = `/kategori/gardssalg/bekreft/${encodeURIComponent(token)}`;
+    const action = String((req.body || {}).action || "");
+
+    if (action === "reopen") {
+      const reopened = reopenBooking(token);
+      res.redirect(303, reopened ? `${backTo}?done=reserved` : `${backTo}?error=ugyldig`);
+      return;
+    }
+
+    if (action !== "attended" && action !== "no_show") {
+      res.redirect(303, `${backTo}?error=ugyldig`);
+      return;
+    }
+
+    // Time guard: attendance can only be resolved after the visit has started
+    // (see visitTimeReached() for the naive-datetime caveat).
+    if (!visitTimeReached(booking)) {
+      res.redirect(303, `${backTo}?error=too_early`);
+      return;
+    }
+
+    const resolved = resolveBooking(
+      token,
+      action === "attended" ? "confirmed_attended" : "no_show",
+      req.ip || "produsent-lenke",
+    );
+    res.redirect(303, resolved ? `${backTo}?done=${resolved.status}` : `${backTo}?error=ugyldig`);
   },
 );
 
