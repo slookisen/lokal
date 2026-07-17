@@ -441,6 +441,66 @@ export function recordDentalHomepageFetchResult(
   return { found: true, attempts: row.homepage_fetch_attempts, parked, parked_now: parkedNow };
 }
 
+// ── Dead-extraction parking (dev-request 2026-07-12-dental-enrichment-
+// universe-growth-and-queue-hygiene, item 2a, 2026-07-17) ────────────────────
+// Mirrors recordDentalHomepageFetchResult() immediately above, applied to
+// extraction/enrichment failures instead of homepage-fetch failures: the
+// daily claim-batch worker was repeatedly re-claiming dead records (thin
+// directory-listing sites, non-clinic entities) because there was no
+// attempts-counter/parking mechanism for extraction failures — only for the
+// homepage-backfill case above. Same semantics, reusing the same shared
+// DENTAL_PARK_AFTER_ATTEMPTS / DENTAL_PARK_BACKOFF_MS tuning constants: 3
+// consecutive failures park (extraction_unreachable_since stamped) for 30
+// days, success fully resets both columns. RE-STAMP on failure after an
+// expired backoff (same PR #248 review-blocker fix inherited by the
+// homepage twin) — without it a stale timestamp would keep satisfying the
+// `<= now-30d` exclusion forever. `reason` is accepted for observability
+// (logged on failure) but is not persisted — there is no reason column on
+// dental_agents for this slice. The claim-pool exclusion this feeds is
+// dental-claim-service.ts's buildWhereClause() `excludeParkedExtraction`
+// option (opt-in), not listDentalAgents/excludeParked — extraction parking
+// only ever needs to keep dead rows out of the CLAIM pool, not the public
+// read-side listing.
+export function recordDentalExtractionResult(
+  id: string,
+  ok: boolean,
+  reason?: string,
+): { found: boolean; attempts: number; parked: boolean; parked_now: boolean } {
+  const db = getDb("dental");
+  const exists = db.prepare("SELECT id FROM dental_agents WHERE id = ?").get(id);
+  if (!exists) return { found: false, attempts: 0, parked: false, parked_now: false };
+
+  if (ok) {
+    db.prepare(
+      "UPDATE dental_agents SET extraction_attempts = 0, extraction_unreachable_since = NULL WHERE id = ?"
+    ).run(id);
+    return { found: true, attempts: 0, parked: false, parked_now: false };
+  }
+
+  db.prepare(
+    "UPDATE dental_agents SET extraction_attempts = extraction_attempts + 1 WHERE id = ?"
+  ).run(id);
+  const row = db
+    .prepare("SELECT extraction_attempts, extraction_unreachable_since FROM dental_agents WHERE id = ?")
+    .get(id) as { extraction_attempts: number; extraction_unreachable_since: string | null };
+
+  let parkedNow = false;
+  if (row.extraction_attempts >= DENTAL_PARK_AFTER_ATTEMPTS) {
+    const since = row.extraction_unreachable_since;
+    const expired = since !== null && Date.parse(since) <= Date.now() - DENTAL_PARK_BACKOFF_MS;
+    if (!since || expired) {
+      db.prepare("UPDATE dental_agents SET extraction_unreachable_since = ? WHERE id = ?")
+        .run(new Date().toISOString(), id);
+      parkedNow = true;
+    }
+  }
+  const parked = row.extraction_attempts >= DENTAL_PARK_AFTER_ATTEMPTS;
+  if (reason) {
+    console.log(`[dental] extraction failure for ${id}: ${reason}`);
+  }
+  return { found: true, attempts: row.extraction_attempts, parked, parked_now: parkedNow };
+}
+
 export function listDentalAgents(
   filter: ListFilter = {},
   limit = 50,

@@ -173,6 +173,60 @@ export function runDentalClaimServiceTests(opts: { log?: boolean } = {}): TestSu
     assertTrue(params.includes("raw"), "base: enrichment_state bind value present");
   }
 
+  // ── item 2a: excludeParkedExtraction (dev-request 2026-07-12-dental-
+  // enrichment-universe-growth-and-queue-hygiene) ──────────────────────────
+  {
+    const filter: ClaimFilter = { excludeParkedExtraction: true };
+    const { clause } = buildWhereClause(filter, NOW);
+    assertTrue(
+      norm(clause).includes(
+        "(extraction_unreachable_since IS NULL OR extraction_unreachable_since <= datetime('now','-30 days'))"
+      ),
+      "item2a-01: excludeParkedExtraction=true adds the 30d backoff exclusion clause"
+    );
+  }
+  {
+    // default/omitted is a strict no-op
+    const filterOmitted: ClaimFilter = { enrichment_state: "raw", has_hjemmeside: true };
+    const { clause: clauseOmitted } = buildWhereClause(filterOmitted, NOW);
+    assertTrue(
+      !norm(clauseOmitted).includes("extraction_unreachable_since"),
+      "item2a-02: omitted excludeParkedExtraction is a no-op (no extraction_unreachable_since clause)"
+    );
+
+    const filterFalse: ClaimFilter = { excludeParkedExtraction: false };
+    const { clause: clauseFalse } = buildWhereClause(filterFalse, NOW);
+    assertTrue(
+      !norm(clauseFalse).includes("extraction_unreachable_since"),
+      "item2a-03: excludeParkedExtraction=false is a no-op (regression pin)"
+    );
+  }
+  {
+    // composition with an existing filter (has_hjemmeside) -- both clauses present
+    const filter: ClaimFilter = { excludeParkedExtraction: true, has_hjemmeside: true };
+    const { clause } = buildWhereClause(filter, NOW);
+    const c = norm(clause);
+    assertTrue(c.includes("extraction_unreachable_since"), "item2a-04: excludeParkedExtraction present alongside has_hjemmeside");
+    assertTrue(
+      c.includes("hjemmeside IS NOT NULL AND hjemmeside <> ''"),
+      "item2a-05: has_hjemmeside=true clause still present alongside excludeParkedExtraction"
+    );
+  }
+  {
+    // composition with the homepage-parking-analogous other filters (enrichment_state, verification_status)
+    // still work unaffected when excludeParkedExtraction is also set.
+    const filter: ClaimFilter = {
+      excludeParkedExtraction: true,
+      enrichment_state: "enriched",
+      verification_status: "verified",
+    };
+    const { clause } = buildWhereClause(filter, NOW);
+    const c = norm(clause);
+    assertTrue(c.includes("extraction_unreachable_since"), "item2a-06: excludeParkedExtraction present alongside enrichment_state+verification_status");
+    assertTrue(c.includes("enrichment_state = ?"), "item2a-07: enrichment_state = ? clause still present");
+    assertTrue(c.includes("verification_status = ?"), "item2a-08: verification_status = ? clause still present");
+  }
+
   return { passed, failed, failures };
 }
 

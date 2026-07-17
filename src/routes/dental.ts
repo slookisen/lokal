@@ -30,6 +30,9 @@ import {
   normalizeOpeningHours,
   // enrichment-metode slice 1 (2026-07-16): dead-homepage parking
   recordDentalHomepageFetchResult,
+  // dev-request 2026-07-12-dental-enrichment-universe-growth-and-queue-hygiene,
+  // item 2a (2026-07-17): dead-extraction parking
+  recordDentalExtractionResult,
   DENTAL_AGENT_WRITABLE_FIELDS,
 } from "../services/dental-store";
 import { getDb } from "../database/db-factory";
@@ -447,6 +450,39 @@ router.post("/admin/homepage-fetch-result", requireAdmin, (req: Request, res: Re
       return;
     }
     const r = recordDentalHomepageFetchResult(agentId.trim(), ok);
+    if (!r.found) {
+      res.status(404).json({ error: "Not found" });
+      return;
+    }
+    res.json({ agent_id: agentId.trim(), attempts: r.attempts, parked: r.parked, parked_now: r.parked_now });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message ?? "Internal error" });
+  }
+});
+
+// POST /api/tannlege/admin/extraction-result
+// Body: { agentId: string, ok: boolean, reason?: string }
+// dev-request 2026-07-12-dental-enrichment-universe-growth-and-queue-hygiene,
+// item 2a: mirrors POST /admin/homepage-fetch-result above but for
+// extraction/enrichment failures instead of homepage-fetch failures — the
+// daily claim-batch worker was repeatedly re-claiming dead records (thin
+// directory-listing sites, non-clinic entities) because there was no
+// attempts-counter/parking mechanism for extraction failures. The dental
+// enrichment routine REPORTS each extraction outcome here; the server owns
+// the strike counting (3 consecutive failures → parked 30d, success → full
+// reset). Parked clinics drop out of the claim-batch pool via
+// dental-claim-service.ts's buildWhereClause() excludeParkedExtraction
+// option (opt-in). `reason` is optional and used for observability only
+// (logged on failure) — it is not persisted.
+router.post("/admin/extraction-result", requireAdmin, (req: Request, res: Response) => {
+  try {
+    const { agentId, ok, reason } = (req.body ?? {}) as { agentId?: unknown; ok?: unknown; reason?: unknown };
+    if (typeof agentId !== "string" || !agentId.trim() || typeof ok !== "boolean") {
+      res.status(400).json({ error: "Invalid body: need {agentId: string, ok: boolean}" });
+      return;
+    }
+    const reasonStr = typeof reason === "string" && reason.trim() ? reason.trim() : undefined;
+    const r = recordDentalExtractionResult(agentId.trim(), ok, reasonStr);
     if (!r.found) {
       res.status(404).json({ error: "Not found" });
       return;

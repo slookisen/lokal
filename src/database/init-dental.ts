@@ -79,6 +79,22 @@ export function initDentalSchema(db: Database.Database): void {
     try { db.exec(stmt); } catch { /* already present */ }
   }
 
+  // ── Dead-extraction parking (dev-request 2026-07-12-dental-enrichment-
+  // universe-growth-and-queue-hygiene, item 2a, 2026-07-17): mirrors the
+  // homepage-parking columns immediately above, but for enrichment/extraction
+  // failures (thin directory-listing sites, non-clinic entities that
+  // repeatedly fail deep-scrape) instead of homepage-fetch failures. Same
+  // semantics: 3 consecutive extraction failures park the clinic
+  // (extraction_unreachable_since stamped) for 30 days; a successful
+  // extraction fully resets. Idempotent ALTERs — error = already present.
+  const dentalExtractionParkingCols = [
+    "ALTER TABLE dental_agents ADD COLUMN extraction_attempts INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE dental_agents ADD COLUMN extraction_unreachable_since TEXT",
+  ];
+  for (const stmt of dentalExtractionParkingCols) {
+    try { db.exec(stmt); } catch { /* already present */ }
+  }
+
   // dental_persons — one row per practitioner (HPR-linked when known)
   try {
     db.exec(`

@@ -29085,3 +29085,120 @@ console.log("\n── enrichment-metode-slice1: dead-homepage parking (dental + 
     dbFacEms2.__resetDbFactoryForTesting();
   }
 })();
+
+// ── item 2a: dead-extraction parking (dev-request 2026-07-12-dental-
+// enrichment-universe-growth-and-queue-hygiene, 2026-07-17) ──────────────────
+// Mirrors the enrichment-metode-slice1 dead-homepage-parking tests above but
+// for extraction/enrichment failures instead of homepage-fetch failures: the
+// daily claim-batch worker was repeatedly re-claiming dead records (thin
+// directory-listing sites, non-clinic entities) because there was no
+// attempts-counter/parking mechanism for extraction failures. Covers
+// recordDentalExtractionResult() strike counting + parking (dental-store.ts)
+// AND the claim-pool exclusion via dental-claim-service.ts buildWhereClause()
+// excludeParkedExtraction (the actual mechanism that stops the re-claiming --
+// unlike the homepage twin, extraction parking excludes from the CLAIM pool,
+// not the public read-side listing).
+console.log("\n── item2a: dead-extraction parking (dental) ──");
+(() => {
+  const prevPath = process.env.DENTAL_DB_PATH;
+  process.env.DENTAL_DB_PATH = ":memory:";
+
+  const dbFacPathI2a = require.resolve("../src/database/db-factory");
+  const dentalStorePathI2a = require.resolve("../src/services/dental-store");
+  const dentalClaimPathI2a = require.resolve("../src/services/dental-claim-service");
+  delete require.cache[dbFacPathI2a];
+  delete require.cache[dentalStorePathI2a];
+  delete require.cache[dentalClaimPathI2a];
+  const dbFacI2a = require("../src/database/db-factory") as typeof import("../src/database/db-factory");
+  dbFacI2a.__resetDbFactoryForTesting();
+  const dstore = require("../src/services/dental-store") as typeof import("../src/services/dental-store");
+  const { claimBatch, releaseBatch } =
+    require("../src/services/dental-claim-service") as typeof import("../src/services/dental-claim-service");
+
+  try {
+    const dentalDb = dbFacI2a.getDb("dental");
+
+    const idA = dstore.createDentalAgent({ navn: "Thin Directory AS", org_nr: "911100111" } as any);
+    const idB = dstore.createDentalAgent({ navn: "Ekte Tannlege AS", org_nr: "911100222" } as any);
+
+    // ── recordDentalExtractionResult: 3-strike park, success reset, RE-STAMP ──
+
+    // (1) two failures -> counted, not parked yet
+    dstore.recordDentalExtractionResult(idA, false);
+    let r = dstore.recordDentalExtractionResult(idA, false);
+    assertEq(r.attempts, 2, "item2a-01: two failures -> attempts=2");
+    assertEq(r.parked, false, "item2a-02: not parked before 3 strikes");
+
+    // (2) third failure -> parked_now (reason is accepted, not persisted)
+    r = dstore.recordDentalExtractionResult(idA, false, "not_a_clinic: thin directory listing, no dental content");
+    assertEq(r.parked, true, "item2a-03: third failure -> parked");
+    assertEq(r.parked_now, true, "item2a-04: parked_now flagged on the crossing failure");
+
+    // (3) success fully resets
+    r = dstore.recordDentalExtractionResult(idA, true);
+    assertEq(r.attempts, 0, "item2a-05: success resets attempts");
+    assertEq(r.parked, false, "item2a-06: success clears the park");
+
+    // (4) RE-STAMP after expired backoff (PR #248 review blocker, inherited
+    // from the homepage twin): park again, backdate the stamp 31 days, fail
+    // once more -> fresh stamp (parked_now), matching the homepage twin's
+    // exact re-stamp semantics (attempts keep incrementing since last
+    // success -- only the *stamp* is treated as a fresh cycle, not the
+    // counter; verified against recordDentalHomepageFetchResult's ems1-13
+    // behaviour above so this doesn't invent different semantics).
+    dstore.recordDentalExtractionResult(idA, false);
+    dstore.recordDentalExtractionResult(idA, false);
+    dstore.recordDentalExtractionResult(idA, false);
+    dentalDb.prepare("UPDATE dental_agents SET extraction_unreachable_since = ? WHERE id = ?")
+      .run(new Date(Date.now() - 31 * 86_400_000).toISOString(), idA);
+    r = dstore.recordDentalExtractionResult(idA, false);
+    assertEq(r.parked_now, true, "item2a-07: failure after expired backoff RE-STAMPS the park");
+    assertEq(r.attempts, 4, "item2a-08: RE-STAMP re-stamps the timestamp only -- attempts keeps incrementing since last success (matches homepage twin)");
+
+    // (5) unknown id -> found:false
+    assertEq(dstore.recordDentalExtractionResult("no-such-id", false).found, false, "item2a-09: unknown id -> found=false");
+
+    // ── claim-pool exclusion: excludeParkedExtraction (dental-claim-service.ts) ──
+
+    // idA is currently parked (fresh stamp from step 4, within the 30d window).
+    const idC = dstore.createDentalAgent({ navn: "Utlopt Parkert AS", org_nr: "911100333" } as any);
+    dstore.recordDentalExtractionResult(idC, false);
+    dstore.recordDentalExtractionResult(idC, false);
+    dstore.recordDentalExtractionResult(idC, false);
+    // Backdate idC's park past the 30d backoff -- it should be reclaimable again.
+    dentalDb.prepare("UPDATE dental_agents SET extraction_unreachable_since = ? WHERE id = ?")
+      .run(new Date(Date.now() - 31 * 86_400_000).toISOString(), idC);
+
+    const claimedExcluding = claimBatch("item2a-worker", 10, { excludeParkedExtraction: true });
+    const claimedIds = claimedExcluding.map((c: any) => c.id);
+    assertEq(claimedIds.includes(idA), false, "item2a-10: within-window-parked row excluded by excludeParkedExtraction:true");
+    assertEq(claimedIds.includes(idB), true, "item2a-11: never-parked row included by excludeParkedExtraction:true");
+    assertEq(claimedIds.includes(idC), true, "item2a-12: backoff-expired row included by excludeParkedExtraction:true");
+    releaseBatch("item2a-worker", [idA, idB, idC]);
+
+    // default/omitted flag is a strict no-op -- the parked row is still claimable.
+    const claimedDefault = claimBatch("item2a-worker2", 10, {});
+    const claimedDefaultIds = claimedDefault.map((c: any) => c.id);
+    assertEq(claimedDefaultIds.includes(idA), true, "item2a-13: omitted excludeParkedExtraction is a no-op -- parked row still claimable (regression pin)");
+    releaseBatch("item2a-worker2", [idA, idB, idC]);
+
+    // composition with an existing filter (has_hjemmeside) still works.
+    dstore.updateDentalAgent(idB, { hjemmeside: "https://ekte-tannlege.example.no" } as any);
+    const claimedComposed = claimBatch("item2a-worker3", 10, {
+      excludeParkedExtraction: true,
+      has_hjemmeside: true,
+    });
+    const claimedComposedIds = claimedComposed.map((c: any) => c.id);
+    assertEq(claimedComposedIds.includes(idB), true, "item2a-14: composition with has_hjemmeside:true still includes the matching non-parked row");
+    assertEq(claimedComposedIds.includes(idA), false, "item2a-15: composition with has_hjemmeside:true still excludes the parked row");
+    releaseBatch("item2a-worker3", [idA, idB, idC]);
+
+    console.log("  item2a (dead-extraction parking): OK (15 assertions)");
+  } catch (err) {
+    failed++;
+    failures.push(`item2a dead-extraction parking: unexpected error: ${err instanceof Error ? (err.stack || err.message) : String(err)}`);
+  } finally {
+    if (prevPath === undefined) delete process.env.DENTAL_DB_PATH; else process.env.DENTAL_DB_PATH = prevPath;
+    dbFacI2a.__resetDbFactoryForTesting();
+  }
+})();
