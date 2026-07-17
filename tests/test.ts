@@ -24976,6 +24976,293 @@ console.log("\n── gardssalg-test-provider-slice0: hidden-but-bookable test p
   console.log("  gardssalg-test-provider-slice0: OK (hidden from catalog+count / bookable by slug, producer dispatch to Daniel, carve-out dispatches with global flag OFF while real providers stay gated, double-gate regression, admin idempotency, ordinary-provider no-regression)");
 })();
 
+// ─── gardssalg booking: kundekommentar + produsentens bekreft-løkke
+//     (dev-request 2026-07-14-booking-flyt-v1, oppfølging etter Daniels
+//     E2E-test 2026-07-17) ─────────────────────────────────────────────────
+// Two gaps Daniel's live end-to-end test surfaced, closed together:
+// (1) KOMMENTAR: BookingInputSchema/gardssalg_bookings.notes existed all
+//     along, but neither the SSR form, the JS payload, nor either email ever
+//     carried it — a guest comment silently never reached the producer.
+//     Covers: form field render, both entry points persisting notes, notes
+//     in both emails, HTML-escaping of guest-controlled strings in email
+//     HTML (a note is attacker-controlled input into the producer's inbox).
+// (2) BEKREFT-LØKKA: the tokenized attendance-confirm used to be a
+//     state-mutating GET (mail-scanner prefetch would auto-confirm) whose
+//     URL was handed to the GUEST (API response) and never to the producer.
+//     Now: producer email carries a link to a page that mutates nothing on
+//     GET; resolution is POST-only (attended/no_show/reopen) behind a
+//     visitTimeReached() time guard; corrections + undo are possible
+//     (billable/commission hangs on this); the guest-facing API response no
+//     longer leaks confirm_url; the old API GET redirects without mutating.
+// Same isolated :memory: experiences DB + emailService capture + mock
+// req/res idiom as the blocks above; runSerial + await because the
+// /confirm/:ref page handler is async (QR SVG generation).
+console.log("\n── gardssalg booking: kundekommentar + produsentens bekreft-løkke ──");
+const _bekreftLoekkePromise = runSerial(async () => {
+  const prevPathBKC = process.env.EXPERIENCES_DB_PATH;
+  process.env.EXPERIENCES_DB_PATH = ":memory:";
+  const prevDispatchBKC = process.env.BOOKING_DISPATCH_ENABLED;
+  process.env.BOOKING_DISPATCH_ENABLED = "true";
+
+  const dbFacPathBKC = require.resolve("../src/database/db-factory");
+  const expStPathBKC = require.resolve("../src/services/experience-store");
+  const bookStPathBKC = require.resolve("../src/services/booking-store");
+  const expSeoPathBKC = require.resolve("../src/routes/experiences-seo");
+  const opplevelserPathBKC = require.resolve("../src/routes/opplevelser");
+  delete require.cache[dbFacPathBKC];
+  delete require.cache[expStPathBKC];
+  delete require.cache[bookStPathBKC];
+  delete require.cache[expSeoPathBKC];
+  delete require.cache[opplevelserPathBKC];
+
+  const dbFacBKC = require("../src/database/db-factory") as typeof import("../src/database/db-factory");
+  dbFacBKC.__resetDbFactoryForTesting();
+  const expStBKC = require("../src/services/experience-store") as typeof import("../src/services/experience-store");
+  const bookStBKC = require("../src/services/booking-store") as typeof import("../src/services/booking-store");
+  const seoRouterBKC = (require("../src/routes/experiences-seo") as typeof import("../src/routes/experiences-seo")).default as any;
+  const oppRouterBKC = (require("../src/routes/opplevelser") as typeof import("../src/routes/opplevelser")).default as any;
+
+  const dbBKC = dbFacBKC.getDb("experiences");
+
+  // Email capture — including html/text content, since the whole point of
+  // half these assertions is WHAT the emails carry, not just that they sent.
+  const emailSvcModBKC = require("../src/services/email-service") as typeof import("../src/services/email-service");
+  const origSendBKC = emailSvcModBKC.emailService.sendEmail.bind(emailSvcModBKC.emailService);
+  let emailCallsBKC: Array<{ to: string; subject: string; htmlContent: string; textContent: string }> = [];
+  (emailSvcModBKC.emailService as any).sendEmail = async (opts: {
+    to: string; subject: string; htmlContent?: string; textContent?: string;
+  }) => {
+    emailCallsBKC.push({
+      to: opts.to, subject: opts.subject,
+      htmlContent: opts.htmlContent || "", textContent: opts.textContent || "",
+    });
+    return { success: true, messageId: "test" };
+  };
+
+  // Seed one live gårdssalg producer (the carve-out is not the subject here,
+  // so plain booking_live=1 + global flag on, like the gardssalg-book block).
+  const provIdBKC = expStBKC.createProvider({
+    navn: "Bekreft Bryggeri", org_nr: "916000222",
+    fylke: "Viken", kommune: "Ås", poststed: "Ås",
+    brreg_verified: 0, verification_status: "pending_verify",
+  });
+  dbBKC.prepare("UPDATE experience_providers SET producer_type = ?, booking_live = 1, epost = ? WHERE id = ?")
+    .run("bryggeri", "produsent@bekreftbryggeri.no", provIdBKC);
+  expStBKC.backfillProviderSlugs();
+  const slugBKC = String(expStBKC.listGardssalgProviders(50, 0).find((p: any) => p.id === provIdBKC)!.slug);
+
+  // Mock req/res invoke for the seo router (same shape as invokeGB, plus
+  // await so the async /confirm/:ref handler can be exercised too).
+  async function invokeSeoBKC(
+    method: "get" | "post",
+    routePath: string,
+    params: Record<string, string>,
+    reqPath: string,
+    opts: { query?: Record<string, string>; body?: Record<string, unknown> } = {}
+  ): Promise<{ status: number; body: string; redirectTo: string | null }> {
+    const layer = (seoRouterBKC.stack as any[]).find(
+      (l: any) => l.route && l.route.path === routePath && l.route.methods?.[method]
+    );
+    assertTrue(!!layer, `bkc-route: seo router has ${method.toUpperCase()} ${routePath} layer`);
+    if (!layer) return { status: 0, body: "", redirectTo: null };
+    let status = 200; let body = ""; let nexted = false; let redirectTo: string | null = null;
+    const res: any = {
+      statusCode: 200,
+      setHeader: () => {},
+      status: (c: number) => { status = c; res.statusCode = c; return res; },
+      send: (b: unknown) => { body = typeof b === "string" ? b : String(b); return res; },
+      json: (o: unknown) => { body = JSON.stringify(o); return res; },
+      redirect: (code: number, location: string) => { status = code; redirectTo = location; },
+    };
+    const req: any = { path: reqPath, hostname: "opplevagent.no", params, query: opts.query || {}, body: opts.body || {}, ip: "127.0.0.1" };
+    const stack = (layer.route.stack as any[]).filter((s: any) => s.method === method);
+    const handle = stack[stack.length - 1].handle;
+    await handle(req, res, () => { nexted = true; });
+    if (nexted) status = 404;
+    return { status, body, redirectTo };
+  }
+
+  // JSON API invoke (same as invokeBookTP) + a GET variant for the old
+  // /book/confirm/:token endpoint.
+  async function invokeOppBKC(
+    method: "get" | "post",
+    routePath: string,
+    params: Record<string, string>,
+    body: Record<string, unknown>
+  ): Promise<{ status: number; json: any; redirectTo: string | null }> {
+    const layer = (oppRouterBKC.stack as any[]).find(
+      (l: any) => l.route && l.route.path === routePath && l.route.methods?.[method]
+    );
+    assertTrue(!!layer, `bkc-route: opplevelser router has ${method.toUpperCase()} ${routePath} layer`);
+    if (!layer) return { status: 0, json: null, redirectTo: null };
+    let status = 200; let jsonBody: any = null; let redirectTo: string | null = null;
+    const res: any = {
+      status: (c: number) => { status = c; return res; },
+      json: (o: unknown) => { jsonBody = o; return res; },
+      redirect: (code: number, location: string) => { status = code; redirectTo = location; },
+    };
+    const req: any = { body, params, query: {}, ip: "127.0.0.1" };
+    const stack = (layer.route.stack as any[]).filter((s: any) => s.method === method);
+    const handle = stack[stack.length - 1].handle;
+    await handle(req, res, () => {});
+    return { status, json: jsonBody, redirectTo };
+  }
+
+  // ═══ (1a) form renders the comment field ═══
+  const panelBKC = await invokeSeoBKC("get", "/kategori/gardssalg/book/:providerSlug",
+    { providerSlug: slugBKC }, `/kategori/gardssalg/book/${slugBKC}`);
+  assertEq(panelBKC.status, 200, "bkc-01a: booking panel renders");
+  assertTrue(panelBKC.body.includes('name="notes"'), "bkc-01b: panel has the notes field");
+  assertTrue(panelBKC.body.includes('maxlength="500"') && panelBKC.body.includes("<textarea"),
+    "bkc-01c: notes is a textarea capped at the schema's 500 chars");
+  assertTrue(panelBKC.body.includes("Kommentar til produsenten"), "bkc-01d: field labelled as a comment TO the producer");
+
+  // ═══ (1b) no-JS fallback: notes persist + reach BOTH emails, escaped ═══
+  const noteRawBKC = `Har hund <b>og</b> "allergi" & spørsmål`;
+  emailCallsBKC = [];
+  const postFormBKC = await invokeSeoBKC("post", "/kategori/gardssalg/book/:providerSlug",
+    { providerSlug: slugBKC }, `/kategori/gardssalg/book/${slugBKC}`,
+    { body: { slot_at: "2030-08-15T14:00", party_size: "2", guest_name: "Nora Vik", guest_email: "nora@example.no", notes: `  ${noteRawBKC}  ` } });
+  assertEq(postFormBKC.status, 303, "bkc-02a: no-JS submission with a note → 303");
+  const refFormBKC = decodeURIComponent((postFormBKC.redirectTo || "").split("/confirm/")[1] || "");
+  const bookingFormBKC = bookStBKC.getBookingByRef(refFormBKC);
+  assertEq(bookingFormBKC?.notes, noteRawBKC, "bkc-02b: note persisted on the booking row (trimmed)");
+  const tokenFormBKC = String(bookingFormBKC?.confirm_token);
+  const guestMailBKC = emailCallsBKC.find((c) => c.to === "nora@example.no");
+  const prodMailBKC = emailCallsBKC.find((c) => c.to === "produsent@bekreftbryggeri.no");
+  assertTrue(!!guestMailBKC && !!prodMailBKC, "bkc-02c: both guest and producer emails attempted");
+  assertTrue(!!prodMailBKC && prodMailBKC.htmlContent.includes("Kommentar fra gjesten:"),
+    "bkc-02d: producer email carries the guest's comment row");
+  assertTrue(!!prodMailBKC && prodMailBKC.htmlContent.includes("Har hund &lt;b&gt;og&lt;/b&gt;"),
+    "bkc-02e: comment is HTML-escaped in the producer email");
+  assertTrue(!!prodMailBKC && !prodMailBKC.htmlContent.includes("<b>og</b>"),
+    "bkc-02f: raw guest markup never reaches the producer's inbox as HTML");
+  assertTrue(!!guestMailBKC && guestMailBKC.htmlContent.includes("Din kommentar:"),
+    "bkc-02g: guest confirmation echoes their own comment");
+  assertTrue(!!guestMailBKC && !guestMailBKC.htmlContent.includes("lenken nedenfor"),
+    "bkc-02h: stale 'lenken nedenfor' copy (referencing a link that was never there) is gone");
+  assertTrue(!!guestMailBKC
+    && !guestMailBKC.htmlContent.includes(tokenFormBKC)
+    && !guestMailBKC.textContent.includes(tokenFormBKC),
+    "bkc-02i: the confirm token NEVER appears in the guest email (producer credential)");
+  assertTrue(!!prodMailBKC && prodMailBKC.htmlContent.includes(`/kategori/gardssalg/bekreft/${tokenFormBKC}`),
+    "bkc-02j: producer email links the tokenized bekreft page");
+  assertTrue(!!prodMailBKC && prodMailBKC.textContent.includes(`/kategori/gardssalg/bekreft/${tokenFormBKC}`),
+    "bkc-02k: text version carries the bekreft link too");
+
+  // ═══ (1c) the /confirm/:ref guest page shows the comment (escaped) ═══
+  const confirmPageBKC = await invokeSeoBKC("get", "/kategori/gardssalg/book/:providerSlug/confirm/:ref",
+    { providerSlug: slugBKC, ref: refFormBKC }, `/kategori/gardssalg/book/${slugBKC}/confirm/${refFormBKC}`);
+  assertEq(confirmPageBKC.status, 200, "bkc-03a: guest confirmation page renders");
+  assertTrue(confirmPageBKC.body.includes("Kommentar:") && confirmPageBKC.body.includes("Har hund &lt;b&gt;og&lt;/b&gt;"),
+    "bkc-03b: confirmation page shows the note, escaped");
+
+  // ═══ (1d) JSON API: notes persist; confirm_url no longer leaks to guest ═══
+  const jsonBookBKC = await invokeOppBKC("post", "/book", {}, {
+    provider_id: provIdBKC, slot_at: "2030-08-16T11:00", party_size: 4,
+    guest_name: "Jon Agent", guest_email: "jon-agent@example.no", notes: "Betaler med kort — går det?",
+  });
+  assertEq(jsonBookBKC.status, 201, "bkc-04a: JSON API booking with notes → 201");
+  assertEq(bookStBKC.getBookingByRef(String(jsonBookBKC.json?.booking_ref))?.notes, "Betaler med kort — går det?",
+    "bkc-04b: JSON API persists notes (agent channel carries comments end-to-end)");
+  assertTrue(!("confirm_url" in (jsonBookBKC.json || {})),
+    "bkc-04c: booking response no longer hands the producer's confirm credential to the booking caller");
+
+  // ═══ (2a) old API GET is now redirect-only — mutates NOTHING ═══
+  const oldGetBKC = await invokeOppBKC("get", "/book/confirm/:token", { token: tokenFormBKC }, {});
+  assertEq(oldGetBKC.status, 302, "bkc-05a: legacy GET /book/confirm/:token → 302 (was a state-mutating GET)");
+  assertEq(oldGetBKC.redirectTo, `/kategori/gardssalg/bekreft/${encodeURIComponent(tokenFormBKC)}`,
+    "bkc-05b: redirects to the producer bekreft page");
+  assertEq(bookStBKC.getBookingByRef(refFormBKC)?.status, "reserved",
+    "bkc-05c: the booking is UNTOUCHED by the legacy GET (prefetch-safe)");
+  const oldGetMissBKC = await invokeOppBKC("get", "/book/confirm/:token", { token: "finnes-ikke" }, {});
+  assertEq(oldGetMissBKC.status, 404, "bkc-05d: unknown token on the legacy endpoint → 404");
+
+  // ═══ (2b) bekreft page: GET mutates nothing; future visit → time-guarded ═══
+  const bekreftPageBKC = await invokeSeoBKC("get", "/kategori/gardssalg/bekreft/:token",
+    { token: tokenFormBKC }, `/kategori/gardssalg/bekreft/${tokenFormBKC}`);
+  assertEq(bekreftPageBKC.status, 200, "bkc-06a: bekreft page renders for the producer");
+  assertTrue(bekreftPageBKC.body.includes("Nora Vik") && bekreftPageBKC.body.includes("Har hund &lt;b&gt;og&lt;/b&gt;"),
+    "bkc-06b: page shows guest + escaped comment");
+  assertTrue(bekreftPageBKC.body.includes("Oppmøte kan registreres etter besøket"),
+    "bkc-06c: future visit → explains WHEN confirmation opens");
+  assertTrue(!bekreftPageBKC.body.includes('value="attended"'),
+    "bkc-06d: no attendance buttons before the visit (time guard in the UI too)");
+  assertEq(bookStBKC.getBookingByRef(refFormBKC)?.status, "reserved",
+    "bkc-06e: GET on the bekreft page mutates nothing");
+  const earlyPostBKC = await invokeSeoBKC("post", "/kategori/gardssalg/bekreft/:token",
+    { token: tokenFormBKC }, `/kategori/gardssalg/bekreft/${tokenFormBKC}`, { body: { action: "attended" } });
+  assertEq(earlyPostBKC.status, 303, "bkc-07a: pre-visit attended POST → 303 back");
+  assertTrue((earlyPostBKC.redirectTo || "").includes("error=too_early"),
+    "bkc-07b: pre-visit attendance is refused server-side (?error=too_early)");
+  assertEq(bookStBKC.getBookingByRef(refFormBKC)?.status, "reserved",
+    "bkc-07c: booking still reserved after the refused early POST");
+
+  // ═══ (2c) past visit: attended → correction → undo, billable follows ═══
+  const pastBookBKC = await invokeOppBKC("post", "/book", {}, {
+    provider_id: provIdBKC, slot_at: "2020-01-06T12:00", party_size: 3,
+    guest_name: "Per Fortid", guest_email: "per@example.no",
+  });
+  const pastRefBKC = String(pastBookBKC.json?.booking_ref);
+  const pastTokenBKC = String(bookStBKC.getBookingByRef(pastRefBKC)?.confirm_token);
+  const pastPageBKC = await invokeSeoBKC("get", "/kategori/gardssalg/bekreft/:token",
+    { token: pastTokenBKC }, `/kategori/gardssalg/bekreft/${pastTokenBKC}`);
+  assertTrue(pastPageBKC.body.includes('value="attended"') && pastPageBKC.body.includes('value="no_show"'),
+    "bkc-08a: past visit → both attendance actions offered");
+  const attendPostBKC = await invokeSeoBKC("post", "/kategori/gardssalg/bekreft/:token",
+    { token: pastTokenBKC }, `/kategori/gardssalg/bekreft/${pastTokenBKC}`, { body: { action: "attended" } });
+  assertTrue((attendPostBKC.redirectTo || "").includes("done=confirmed_attended"),
+    "bkc-08b: attended POST → PRG redirect with done=confirmed_attended");
+  let pastRowBKC = bookStBKC.getBookingByRef(pastRefBKC);
+  assertEq(pastRowBKC?.status, "confirmed_attended", "bkc-08c: status resolved to confirmed_attended");
+  assertEq(pastRowBKC?.billable, 1, "bkc-08d: billable flips ON with confirmed attendance");
+  assertTrue(!!pastRowBKC?.resolved_at, "bkc-08e: resolved_at recorded");
+  // Correction: a mis-click must be fixable — attended → no_show.
+  const correctPostBKC = await invokeSeoBKC("post", "/kategori/gardssalg/bekreft/:token",
+    { token: pastTokenBKC }, `/kategori/gardssalg/bekreft/${pastTokenBKC}`, { body: { action: "no_show" } });
+  assertTrue((correctPostBKC.redirectTo || "").includes("done=no_show"), "bkc-09a: correction to no_show accepted");
+  pastRowBKC = bookStBKC.getBookingByRef(pastRefBKC);
+  assertEq(pastRowBKC?.status, "no_show", "bkc-09b: status corrected to no_show");
+  assertEq(pastRowBKC?.billable, 0, "bkc-09c: billable flips OFF with the correction");
+  // Undo: back to reserved, resolution fields cleared.
+  const undoPostBKC = await invokeSeoBKC("post", "/kategori/gardssalg/bekreft/:token",
+    { token: pastTokenBKC }, `/kategori/gardssalg/bekreft/${pastTokenBKC}`, { body: { action: "reopen" } });
+  assertTrue((undoPostBKC.redirectTo || "").includes("done=reserved"), "bkc-10a: undo accepted");
+  pastRowBKC = bookStBKC.getBookingByRef(pastRefBKC);
+  assertEq(pastRowBKC?.status, "reserved", "bkc-10b: undo → back to reserved");
+  assertEq(pastRowBKC?.billable, 0, "bkc-10c: undo clears billable");
+  assertEq(pastRowBKC?.resolved_at, null, "bkc-10d: undo clears resolved_at");
+  // Idempotency: same action twice is a calm no-op, not an error.
+  await invokeSeoBKC("post", "/kategori/gardssalg/bekreft/:token",
+    { token: pastTokenBKC }, `/kategori/gardssalg/bekreft/${pastTokenBKC}`, { body: { action: "attended" } });
+  const repeatPostBKC = await invokeSeoBKC("post", "/kategori/gardssalg/bekreft/:token",
+    { token: pastTokenBKC }, `/kategori/gardssalg/bekreft/${pastTokenBKC}`, { body: { action: "attended" } });
+  assertTrue((repeatPostBKC.redirectTo || "").includes("done=confirmed_attended"),
+    "bkc-11a: repeating the same action stays a success (idempotent)");
+  assertEq(bookStBKC.getBookingByRef(pastRefBKC)?.status, "confirmed_attended", "bkc-11b: status unchanged by the repeat");
+  // Unknown action / unknown token.
+  const badActionBKC = await invokeSeoBKC("post", "/kategori/gardssalg/bekreft/:token",
+    { token: pastTokenBKC }, `/kategori/gardssalg/bekreft/${pastTokenBKC}`, { body: { action: "hack" } });
+  assertTrue((badActionBKC.redirectTo || "").includes("error=ugyldig"), "bkc-12a: unknown action → error, no mutation");
+  const missPageBKC = await invokeSeoBKC("get", "/kategori/gardssalg/bekreft/:token",
+    { token: "finnes-ikke" }, "/kategori/gardssalg/bekreft/finnes-ikke");
+  assertEq(missPageBKC.status, 404, "bkc-12b: unknown token → 404 (next())");
+
+  // ═══ (2d) visitTimeReached unit edges ═══
+  assertEq(bookStBKC.visitTimeReached({ slot_at: "2020-01-01T10:00" }), true, "bkc-13a: past slot → confirmable");
+  assertEq(bookStBKC.visitTimeReached({ slot_at: "2099-01-01T10:00" }), false, "bkc-13b: future slot → not yet");
+  assertEq(bookStBKC.visitTimeReached({ slot_at: "ikke-en-dato" }), true,
+    "bkc-13c: unparseable slot_at fails OPEN so a broken row can still be resolved");
+
+  (emailSvcModBKC.emailService as any).sendEmail = origSendBKC;
+  if (prevPathBKC === undefined) delete process.env.EXPERIENCES_DB_PATH;
+  else process.env.EXPERIENCES_DB_PATH = prevPathBKC;
+  if (prevDispatchBKC === undefined) delete process.env.BOOKING_DISPATCH_ENABLED;
+  else process.env.BOOKING_DISPATCH_ENABLED = prevDispatchBKC;
+  dbFacBKC.__resetDbFactoryForTesting();
+  console.log("  gardssalg-bekreftloekke: OK (notes felt→row→begge e-poster escaped, token aldri i gjeste-e-post, confirm_url fjernet fra API-svar, legacy GET redirect-only, POST-basert bekreft med tidsvakt, korreksjon + angre m/ billable, idempotens, ukjent token/handling)");
+});
+
 // ─── gardssalg-go-live-gate slice 3: provider kommune/fylke geocode fallback
 //     (experiences-geocode-worker.ts Step D) + honest map-label rendering
 //     (dev-request 2026-07-12-gardssalg-go-live-gate-dark-launch-og-onboarding,

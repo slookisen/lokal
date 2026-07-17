@@ -90,7 +90,6 @@ import {
   createBooking,
   getBookingByRef,
   getBookingByToken,
-  resolveBooking,
   getCommissionStatement,
   BookingInputSchema,
   buildIcs,
@@ -1838,7 +1837,7 @@ router.post("/", requireAdmin, (req: Request, res: Response) => {
 // ─── Phase 2 — Gårdssalg booking endpoints (2026-06-28) ──────────────
 //
 // POST /api/opplevelser/book              — guest påmelding
-// GET  /api/opplevelser/book/confirm/:token — producer confirm (attended/no_show)
+// GET  /api/opplevelser/book/confirm/:token — 302 → /kategori/gardssalg/bekreft/:token (producer confirm page)
 // GET  /api/opplevelser/book/:ref/ics     — download ICS calendar file
 // GET  /api/opplevelser/admin/gardssalg/commission — monthly commission statement
 // GET  /api/opplevelser/admin/gardssalg/bookings-count — existing-rows count (below)
@@ -1898,59 +1897,38 @@ router.post("/book", async (req: Request, res: Response) => {
     console.error("[booking] producer notification failed", booking.booking_ref, e),
   );
 
-  const confirmUrl = `${APP_URL}/api/opplevelser/book/confirm/${booking.confirm_token}`;
-
+  // NB (booking-flyt-v1 "bekreft-løkka"): the response deliberately does NOT
+  // carry confirm_url anymore. The confirm token is the PRODUCER's credential
+  // for resolving attendance (billable/commission) — handing it to the
+  // booking caller let a guest resolve their own booking. The producer now
+  // gets the link in their notification email instead.
   res.status(201).json({
     success: true,
     booking_ref: booking.booking_ref,
     status: booking.status,
     source: booking.source,
-    confirm_url: confirmUrl,
     message: `Påmelding registrert! Bekreftelse sendes til ${booking.guest_email}.`,
   });
 });
 
 // ─── GET /api/opplevelser/book/confirm/:token ────────────────────────
-// Producer-facing: resolve a booking as attended or no_show.
-// Accepts ?action=attended (default) or ?action=no_show
-// Returns JSON; a producer portal page can wrap this with a simple form.
+// Producer-facing. This USED to resolve the booking directly on GET
+// (?action=attended default) — a state-mutating GET, which meant any
+// link-prefetching mail scanner would have auto-confirmed attendance the
+// moment the link landed in an inbox. It now redirects (302, mutating
+// NOTHING) to the human confirm page, where the actual resolution is a
+// POST from an explicit button press. Kept as a route so the confirm_urls
+// in old server logs / API responses still work.
 router.get(
   "/book/confirm/:token",
   (req: Request, res: Response) => {
     const { token } = req.params;
-    const action = (req.query.action as string) === "no_show" ? "no_show" : "confirmed_attended";
-
     const existing = getBookingByToken(token as string);
     if (!existing) {
       res.status(404).json({ error: "Booking ikke funnet" });
       return;
     }
-    if (existing.status !== "reserved") {
-      res.json({
-        success: true,
-        booking_ref: existing.booking_ref,
-        status: existing.status,
-        message: `Allerede registrert: ${existing.status}`,
-      });
-      return;
-    }
-
-    const resolved = resolveBooking(token as string, action, req.ip || "producer");
-    if (!resolved) {
-      res.status(409).json({ error: "Kunne ikke oppdatere booking" });
-      return;
-    }
-
-    res.json({
-      success: true,
-      booking_ref: resolved.booking_ref,
-      status: resolved.status,
-      billable: resolved.billable === 1,
-      message:
-        resolved.status === "confirmed_attended"
-          ? `Oppmøte bekreftet — ref ${resolved.booking_ref} regnes med i provisjon.`
-          : `Ikke-oppmøte registrert — ref ${resolved.booking_ref} ekskludert fra provisjon.`,
-    });
+    res.redirect(302, `/kategori/gardssalg/bekreft/${encodeURIComponent(token as string)}`);
   },
 );
 
