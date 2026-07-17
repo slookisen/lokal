@@ -13,6 +13,14 @@ primary_region = 'arn'
   NODE_ENV = 'production'
   PORT = '3000'
   MEMORY_LIMIT_MB = '1024'
+  # Gårdssalg booking dispatch master switch (dev-request 2026-07-14-booking-flyt-v1).
+  # Non-secret feature flag → lives here rather than in Fly secrets. SAFE by the
+  # double gate: a booking only dispatches when BOTH this is "true" AND the specific
+  # provider's booking_live=1. Today only the hidden catalog_hidden=1 test provider
+  # (created via POST /api/opplevelser/admin/gardssalg/test-provider) has booking_live=1,
+  # so turning this on routes the notification solely to that test provider's email.
+  # To pause again: set to 'false' (fail-safe: anything but the literal "true" = off).
+  BOOKING_DISPATCH_ENABLED = 'true'
 
 [[mounts]]
   source = 'lokal_data'
