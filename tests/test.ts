@@ -24902,6 +24902,35 @@ console.log("\n── gardssalg-test-provider-slice0: hidden-but-bookable test p
     .get(TEST_ORG_NR_TP) as { c: number }).c;
   assertEq(testRowCountTP, 1, "tp-05c: exactly ONE test-provider row after two upserts");
 
+  // ═══ (e) THE CARVE-OUT — hidden test provider dispatches with the global
+  //     master switch OFF (isBookingPaused catalog_hidden=1 carve-out) ═══
+  // Fly [env] could not turn BOOKING_DISPATCH_ENABLED on at runtime for this app,
+  // so the slice-0 test relies on the hidden test provider dispatching even when
+  // the global flag is off. REAL providers must STILL be gated by it (asserted).
+  delete process.env.BOOKING_DISPATCH_ENABLED; // master switch OFF
+  assertEq(bookStTP.bookingDispatchEnabled(), false, "tp-08a: precondition — global dispatch is OFF");
+  assertEq(bookStTP.isBookingPaused(1, 1), false,
+    "tp-08b: isBookingPaused(booking_live=1, catalog_hidden=1) === false with flag OFF (the carve-out)");
+  emailCallsTP = [];
+  const beforeBookOffTP = countBookingsTP();
+  const bookOffTP = invokeBookTP({
+    provider_id: testIdTP, slot_at: "2026-09-03T13:00", party_size: 3,
+    guest_name: "Testgjest Off", guest_email: "gjest-off@example.no",
+  });
+  assertEq(bookOffTP.status, 201, "tp-08c: hidden test provider books (201) even with the global flag OFF");
+  assertEq(countBookingsTP(), beforeBookOffTP + 1, "tp-08d: one booking row created with the flag OFF");
+  assertEq(emailCallsTP.filter((c) => c.to === danielEmailTP).length, 1,
+    "tp-08e: producer notification still routed to Daniel with the flag OFF");
+  // Real providers stay gated even when onboarded: an ordinary (catalog_hidden 0/NULL)
+  // provider with booking_live=1 is STILL paused while the master switch is off.
+  assertEq(bookStTP.isBookingPaused(1, 0), true,
+    "tp-08f: isBookingPaused(booking_live=1, catalog_hidden=0) === true with flag OFF (real providers still gated)");
+  assertEq(bookStTP.isBookingPaused(1, null), true,
+    "tp-08g: catalog_hidden NULL behaves like a real provider (still gated) with flag OFF");
+  // Onboarding is still required — even a hidden provider must be booking_live=1.
+  assertEq(bookStTP.isBookingPaused(0, 1), true,
+    "tp-08h: catalog_hidden=1 but booking_live=0 → still paused (must be onboarded)");
+
   // ═══ (b) booking dispatch — hidden provider bookable, double gate still holds ═══
   process.env.BOOKING_DISPATCH_ENABLED = "true";
 
@@ -24944,7 +24973,7 @@ console.log("\n── gardssalg-test-provider-slice0: hidden-but-bookable test p
   if (prevDispatchTP === undefined) delete process.env.BOOKING_DISPATCH_ENABLED;
   else process.env.BOOKING_DISPATCH_ENABLED = prevDispatchTP;
   dbFacTP.__resetDbFactoryForTesting();
-  console.log("  gardssalg-test-provider-slice0: OK (hidden from catalog+count / bookable by slug, producer dispatch to Daniel, double-gate regression, admin idempotency, ordinary-provider no-regression)");
+  console.log("  gardssalg-test-provider-slice0: OK (hidden from catalog+count / bookable by slug, producer dispatch to Daniel, carve-out dispatches with global flag OFF while real providers stay gated, double-gate regression, admin idempotency, ordinary-provider no-regression)");
 })();
 
 // ─── gardssalg-go-live-gate slice 3: provider kommune/fylke geocode fallback

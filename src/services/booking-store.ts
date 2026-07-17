@@ -36,14 +36,31 @@ export function bookingDispatchEnabled(): boolean {
 }
 
 // True when booking submission for this provider must be blocked and the
-// "coming soon" notice shown — i.e. dispatch is off globally, OR this
-// specific provider hasn't been onboarded (booking_live !== 1) yet.
+// "coming soon" notice shown — i.e. this provider hasn't been onboarded
+// (booking_live !== 1), OR (for real providers) dispatch is off globally.
 // providerBookingLive is whatever experience_providers.booking_live holds
 // (0/1/NULL/undefined) — anything but the literal 1 counts as "not live".
+//
+// providerCatalogHidden (optional) is experience_providers.catalog_hidden.
+// A catalog_hidden=1 provider is the controlled slice-0 TEST provider: it can
+// ONLY be created by POST /admin/gardssalg/test-provider (admin-key gated) with
+// the notification email pinned by the admin caller, and it is filtered out of
+// the public catalog/count/sitemap. Such a provider dispatches even when the
+// global master switch is off — this is the intended test harness, and its
+// blast radius is bounded to the admin-specified address. REAL providers
+// (catalog_hidden 0/NULL) are unchanged: they still require BOTH the global
+// BOOKING_DISPATCH_ENABLED master switch AND their own booking_live=1.
 export function isBookingPaused(
   providerBookingLive: number | null | undefined,
+  providerCatalogHidden?: number | null | undefined,
 ): boolean {
-  return !bookingDispatchEnabled() || providerBookingLive !== 1;
+  // Must be onboarded either way.
+  if (providerBookingLive !== 1) return true;
+  // Hidden, admin-created, email-pinned test provider → dispatch even if the
+  // global master switch is off (real providers below still require it).
+  if (providerCatalogHidden === 1) return false;
+  // Real providers: unchanged double gate — still need the global master switch.
+  return !bookingDispatchEnabled();
 }
 
 export type BookingStatus =
