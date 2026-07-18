@@ -3661,6 +3661,206 @@ console.log("\n── cross-source-validator: domainCoherenceCheck (orch-PR-2026
   assertEq(r.coherent, true, "ea-06: regression — website equivalent to agent (brand-token match) → still coherent");
 }
 
+// ── Slice 3b (dev-request 2026-07-15-gate-integrity-unverified-agent-bypass):
+// homepage-evidence widening. A homepage-proven contact value (email, phone,
+// or address — a field_provenance record with source_type:"homepage" whose
+// value matches the corresponding knowledge.* value exactly, case-
+// insensitive/trimmed) rescues coherence even when agents.url's host differs
+// from knowledge.website/knowledge.email's host (the post@b1.no vs bi1.no
+// class). Must widen BOTH the website-mismatch branch and the independent
+// email-mismatch branch below it.
+console.log("\n── cross-source-validator: domainCoherenceCheck (slice 3b: homepage-evidence widening) ──");
+{
+  // Website-host-mismatch rescued by homepage-proven PHONE (not email).
+  // agent=bi1.no, website=totallydifferent.no (mismatch), but a homepage
+  // crawl found the exact same phone number published on the producer's
+  // own homepage.
+  const r = domainCoherenceCheck(
+    "https://bi1.no",
+    "https://totallydifferent.no",
+    null,
+    {
+      fieldProvenance: {
+        phone: [{ value: "91122333", source_type: "homepage", source_url: "https://bi1.no/kontakt", fetched_at: "2026-07-01" }],
+      },
+      knowledgePhone: "91122333",
+    },
+  );
+  assertEq(r.coherent, true, "3b-01: website mismatch rescued by homepage-proven phone → coherent");
+}
+{
+  // Website-host-mismatch rescued by homepage-proven ADDRESS.
+  const r = domainCoherenceCheck(
+    "https://bi1.no",
+    "https://totallydifferent.no",
+    null,
+    {
+      fieldProvenance: {
+        address: [{ value: "Bjørkeveien 20B", source_type: "homepage", source_url: "https://bi1.no/om-oss", fetched_at: "2026-07-01" }],
+      },
+      knowledgeAddress: "Bjørkeveien 20B",
+    },
+  );
+  assertEq(r.coherent, true, "3b-02: website mismatch rescued by homepage-proven address → coherent");
+}
+{
+  // Negative control: the SAME mismatch, but fieldProvenance has NO homepage
+  // evidence at all (empty) → stays incoherent. Proves the rescue
+  // discriminates rather than vacuously always passing.
+  const r = domainCoherenceCheck(
+    "https://bi1.no",
+    "https://totallydifferent.no",
+    null,
+    {
+      fieldProvenance: {},
+      knowledgePhone: "91122333",
+      knowledgeAddress: "Bjørkeveien 20B",
+    },
+  );
+  assertEq(r.coherent, false, "3b-03: negative control — no homepage evidence in fieldProvenance → stays incoherent");
+}
+{
+  // Negative control variant: opts entirely omitted (3-arg call) on the exact
+  // same mismatch → must also stay incoherent (today's byte-identical
+  // behavior when opts is not passed).
+  const r = domainCoherenceCheck("https://bi1.no", "https://totallydifferent.no", null);
+  assertEq(r.coherent, false, "3b-04: negative control — opts omitted entirely → stays incoherent (unchanged legacy behavior)");
+}
+{
+  // Negative control: homepage evidence present but for a DIFFERENT phone
+  // value than knowledgePhone (mismatched value) → must not rescue.
+  const r = domainCoherenceCheck(
+    "https://bi1.no",
+    "https://totallydifferent.no",
+    null,
+    {
+      fieldProvenance: {
+        phone: [{ value: "00000000", source_type: "homepage", fetched_at: "2026-07-01" }],
+      },
+      knowledgePhone: "91122333",
+    },
+  );
+  assertEq(r.coherent, false, "3b-05: negative control — homepage evidence value does not match knowledgePhone → stays incoherent");
+}
+{
+  // Email-host-mismatch case (the second, INDEPENDENT check block) rescued by
+  // homepage-proven phone. Website is null so only the email-mismatch branch
+  // fires; a homepage-proven phone should also rescue THIS check.
+  const r = domainCoherenceCheck(
+    "https://bi1.no",
+    null,
+    "post@b1.no",
+    {
+      fieldProvenance: {
+        phone: [{ value: "91122333", source_type: "homepage", source_url: "https://bi1.no/kontakt", fetched_at: "2026-07-01" }],
+      },
+      knowledgePhone: "91122333",
+    },
+  );
+  assertEq(r.coherent, true, "3b-06: email-host mismatch (independent check) rescued by homepage-proven phone → coherent");
+}
+{
+  // Negative control for the email-mismatch branch: same shape, no homepage
+  // evidence → stays incoherent.
+  const r = domainCoherenceCheck("https://bi1.no", null, "post@b1.no");
+  assertEq(r.coherent, false, "3b-07: negative control — email-host mismatch with no opts → stays incoherent");
+}
+{
+  // Regression guard: the true Eidsmo contamination case must stay blocked
+  // even when opts is supplied but carries no matching homepage evidence.
+  const r = domainCoherenceCheck(
+    "https://eidsmokjott.no/",
+    "https://slakthuset.no",
+    "post@slakthuset.no",
+    {
+      fieldProvenance: {
+        phone: [{ value: "12345678", source_type: "brreg", fetched_at: "2026-07-01" }],
+      },
+      knowledgePhone: "99999999",
+    },
+  );
+  assertEq(r.coherent, false, "3b-08: Eidsmo contamination stays blocked — non-homepage source and non-matching value do not rescue");
+}
+
+// ── review fix-up (2026-07-18, follow-up to slice 3b): the rescue must be
+// bound to agentUrl's host via rec.source_url, not just to a value match.
+// field_provenance is append-only (mergeFieldProvenance dedupes on
+// `${source_type}::${value}`, never drops stale records when agents.url
+// later changes) — so a stale homepage record written while agents.url was
+// correct must NOT rescue coherence after agents.url is later
+// corrupted/scrambled to a DIFFERENT entity's host, even though the
+// knowledge.* value it matches is unchanged. This is the exact
+// Solheim/Bi1-class circular-scramble incident the gate exists to catch.
+console.log("\n── cross-source-validator: domainCoherenceCheck (slice 3b review fix-up: source_url host-binding) ──");
+{
+  // STALE-EVIDENCE EXPLOIT: agentUrl is now bi1.no (post-corruption), but the
+  // homepage record's source_url is a THIRD, unrelated host
+  // (unrelated-third-host.no) — neither bi1.no (current agentUrl) nor
+  // totallydifferent.no (the mismatched knowledge.website). Before the fix,
+  // hasHomepageEvidence ignored source_url entirely and this rescued
+  // coherence purely on the value match; after the fix it must NOT rescue.
+  const r = domainCoherenceCheck(
+    "https://bi1.no",
+    "https://totallydifferent.no",
+    null,
+    {
+      fieldProvenance: {
+        phone: [{ value: "91122333", source_type: "homepage", source_url: "https://unrelated-third-host.no/kontakt", fetched_at: "2026-06-01" }],
+      },
+      knowledgePhone: "91122333",
+    },
+  );
+  assertEq(r.coherent, false, "3b-09: stale-evidence exploit — homepage record's source_url is a THIRD, unrelated host → does NOT rescue (fail closed)");
+}
+{
+  // Positive control (proves the fix didn't just break the feature): same
+  // shape, but source_url IS equivalent to the current agentUrl's host
+  // (bi1.no) — still rescues.
+  const r = domainCoherenceCheck(
+    "https://bi1.no",
+    "https://totallydifferent.no",
+    null,
+    {
+      fieldProvenance: {
+        phone: [{ value: "91122333", source_type: "homepage", source_url: "https://www.bi1.no/kontakt-oss", fetched_at: "2026-07-01" }],
+      },
+      knowledgePhone: "91122333",
+    },
+  );
+  assertEq(r.coherent, true, "3b-10: source_url equivalent to current agentUrl's host (bi1.no) → still rescues coherence");
+}
+{
+  // Fail-closed: source_url missing/empty on the record → does not rescue.
+  const r = domainCoherenceCheck(
+    "https://bi1.no",
+    "https://totallydifferent.no",
+    null,
+    {
+      fieldProvenance: {
+        phone: [{ value: "91122333", source_type: "homepage", source_url: "", fetched_at: "2026-06-01" }],
+      },
+      knowledgePhone: "91122333",
+    },
+  );
+  assertEq(r.coherent, false, "3b-11: homepage record with missing/empty source_url → does NOT rescue (fail closed)");
+}
+{
+  // Fail-closed variant: source_url key entirely absent (not just empty) —
+  // e.g. a legacy provenance record written before source_url was tracked.
+  const r = domainCoherenceCheck(
+    "https://bi1.no",
+    "https://totallydifferent.no",
+    null,
+    {
+      fieldProvenance: {
+        phone: [{ value: "91122333", source_type: "homepage", fetched_at: "2026-06-01" }],
+      },
+      knowledgePhone: "91122333",
+    },
+  );
+  assertEq(r.coherent, false, "3b-12: homepage record with source_url key entirely absent → does NOT rescue (fail closed)");
+}
+
 // ── orch-PR-20260613: Norwegian-variant / IDN-variant false-positive reduction ──
 // Tests cover all 8 false-positive pairs that must now be COHERENT, plus 6
 // true-positive pairs that must STAY incoherent.
@@ -4521,7 +4721,7 @@ async function runIntegrationTests(): Promise<void> {
         // fixture's original intent (a genuinely-evidenced free-mail
         // producer reaches verified; Guards #1/#2 don't interfere) intact.
         email: [
-          { value: "bjorkheim.gard@gmail.com", source_type: "homepage", fetched_at: "2026-06-10T07:25Z" },
+          { value: "bjorkheim.gard@gmail.com", source_type: "homepage", source_url: "https://bjorkheim.no/kontakt", fetched_at: "2026-06-10T07:25Z" },
         ],
       },
     });

@@ -708,7 +708,7 @@ function stripProtocol(s: string): string {
   return s.replace(/^https?:\/\//i, "").replace(/^\/\//, "");
 }
 
-function hostFromUrlLike(raw: string): string | null {
+export function hostFromUrlLike(raw: string): string | null {
   let s = raw.trim();
   if (!s) return null;
   s = stripProtocol(s);
@@ -747,7 +747,7 @@ function hostFromEmail(raw: string): string | null {
 }
 
 // Registrable domain (eTLD+1 with simple heuristics, sufficient for .no).
-function registrableDomain(host: string): string {
+export function registrableDomain(host: string): string {
   const labels = host.split(".").filter(Boolean);
   if (labels.length < 2) return host;
   const lastTwo = labels.slice(-2).join(".");
@@ -1025,10 +1025,80 @@ export function isAcceptableHomepageEmail(email: string, siteUrl: string): boole
   return false;
 }
 
+// ─── Slice 3b (dev-request 2026-07-15-gate-integrity-unverified-agent-bypass) ─
+//
+// Field-agnostic homepage-evidence check. Generalizes the inline check that
+// used to live only in lokal-agent-verifier.ts's Guard #3
+// (email_ownership_unproven): true when `records` (a field_provenance[field]
+// value — array, legacy single-object, or missing/unknown) contains a
+// `source_type: "homepage"` record whose value matches `value` exactly,
+// case-insensitive/trimmed. Field-agnostic — callers pass whichever field's
+// provenance records they want checked (email / phone / address / …).
+// Inlines the same legacy-shape coercion `coerceFieldRecords` in
+// lokal-agent-verifier.ts performs, so callers don't need their own
+// coercion step.
+//
+// review fix-up (2026-07-18, follow-up to slice 3b): `field_provenance` is
+// APPEND-ONLY (mergeFieldProvenance in admin-knowledge.ts dedupes on
+// `${source_type}::${value}` but never drops/invalidates old records when
+// agents.url later changes). A homepage record proves the value was once
+// published on *some* page fetched at `rec.source_url` — NOT that it was
+// published on the site the caller is validating THIS agent against right
+// now. Without binding to `rec.source_url`, a stale homepage record from
+// when agents.url was correct can wrongly rescue coherence after agents.url
+// is later corrupted/scrambled to a different entity's host (the exact
+// Solheim/Bi1-class circular-scramble incident this gate exists to catch).
+// So: the record only counts when `rec.source_url`'s host is equivalent to
+// `expectedHost` (the host the caller is trying to anchor identity to).
+// Fail CLOSED — missing/unparseable source_url, or missing/empty
+// expectedHost, means the record does NOT satisfy the check. This is a
+// security-relevant gate, not a UX nicety.
+export function hasHomepageEvidence(
+  records: ProvenanceRecord[] | ProvenanceRecord | unknown,
+  value: string | null | undefined,
+  expectedHost: string | null
+): boolean {
+  if (!value) return false;
+  const target = value.trim().toLowerCase();
+  if (!target) return false;
+  if (!expectedHost || !expectedHost.trim()) return false;
+  const expectedRoot = registrableDomain(expectedHost.trim().toLowerCase());
+
+  let arr: ProvenanceRecord[];
+  if (!records) {
+    arr = [];
+  } else if (Array.isArray(records)) {
+    arr = records as ProvenanceRecord[];
+  } else if (typeof records === "object") {
+    arr = [records as ProvenanceRecord];
+  } else {
+    arr = [];
+  }
+
+  return arr.some((rec) => {
+    if (!rec || typeof rec !== "object") return false;
+    if (rec.source_type !== "homepage") return false;
+    if (typeof rec.value !== "string" || rec.value.trim().toLowerCase() !== target) return false;
+    // Fail closed: source_url must be present and parse to a host equivalent
+    // to expectedHost. A record with no source_url (or one that fails to
+    // parse) does not satisfy the check.
+    if (typeof rec.source_url !== "string" || !rec.source_url.trim()) return false;
+    const recHost = hostFromUrlLike(rec.source_url);
+    if (!recHost) return false;
+    const recRoot = registrableDomain(recHost);
+    return domainsEquivalent(recRoot, expectedRoot);
+  });
+}
+
 export function domainCoherenceCheck(
   agentUrl: string | null | undefined,
   knowledgeWebsite: string | null | undefined,
-  knowledgeEmail: string | null | undefined
+  knowledgeEmail: string | null | undefined,
+  opts?: {
+    fieldProvenance?: Record<string, ProvenanceRecord[] | ProvenanceRecord | unknown>;
+    knowledgePhone?: string | null;
+    knowledgeAddress?: string | null;
+  }
 ): DomainCoherenceResult {
   // No agent URL → nothing to validate against; do not penalize.
   if (!agentUrl || !agentUrl.trim()) return { coherent: true };
@@ -1043,6 +1113,26 @@ export function domainCoherenceCheck(
   const emailHost = knowledgeEmail && knowledgeEmail.trim() && knowledgeEmail.includes("@")
     ? hostFromEmail(knowledgeEmail)
     : null;
+
+  // Slice 3b: a homepage-proven contact value (email, phone, or address —
+  // field_provenance record with source_type:"homepage" whose value matches
+  // the corresponding knowledge.* value exactly, case-insensitive/trimmed)
+  // rescues coherence even when agents.url's host differs from
+  // knowledge.website/knowledge.email's host (the post@b1.no vs bi1.no
+  // class — same evidentiary bar as Guard #3's email-ownership check, just
+  // widened to anchor identity too). Omitting `opts` reproduces today's
+  // exact behavior — this is always false when opts is undefined.
+  const fieldProvenance = opts?.fieldProvenance;
+  // review fix-up (2026-07-18): the rescue must be bound to the CURRENT
+  // agentUrl's host (agentRoot), not just to a value match — otherwise a
+  // stale homepage record from before agents.url was corrupted can rescue
+  // coherence against the new, wrong host. See hasHomepageEvidence's
+  // doc-comment.
+  const homepageEvidenceAnchors = !!fieldProvenance && (
+    hasHomepageEvidence(fieldProvenance.email, knowledgeEmail, agentRoot) ||
+    hasHomepageEvidence(fieldProvenance.phone, opts?.knowledgePhone, agentRoot) ||
+    hasHomepageEvidence(fieldProvenance.address, opts?.knowledgeAddress, agentRoot)
+  );
 
   // Directory-host bypass: if agents.url points at a known directory/aggregator
   // (Hanen, Lokalmat, Brreg, …), it cannot be used as the entity-truth signal.
@@ -1078,7 +1168,7 @@ export function domainCoherenceCheck(
         emailHost !== null &&
         !FREE_MAIL_DOMAINS.includes(emailHost) &&
         domainsEquivalent(registrableDomain(emailHost), agentRoot);
-      if (!emailAnchorsSite) {
+      if (!emailAnchorsSite && !homepageEvidenceAnchors) {
         return {
           coherent: false,
           reason: `knowledge.website host ${websiteHost} != agents.url host ${agentHost}`,
@@ -1100,7 +1190,7 @@ export function domainCoherenceCheck(
   if (emailHost) {
     if (!FREE_MAIL_DOMAINS.includes(emailHost) && !PLACEHOLDER_EMAIL_DOMAINS.includes(emailHost)) {
       const emailRoot = registrableDomain(emailHost);
-      if (!domainsEquivalent(emailRoot, agentRoot)) {
+      if (!domainsEquivalent(emailRoot, agentRoot) && !homepageEvidenceAnchors) {
         return {
           coherent: false,
           reason: `knowledge.email host ${emailHost} != agents.url host ${agentHost}`,
