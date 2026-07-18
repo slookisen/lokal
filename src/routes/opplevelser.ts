@@ -97,6 +97,8 @@ import {
   // dev-request 2026-07-12-gardssalg-dark-launch-stop, slice 0
   isBookingPaused,
   sendProducerNotification,
+  // booking-flyt-v1 slice 2: pre-visit reminder + auto-expiry engine
+  processBookingFollowups,
 } from "../services/booking-store";
 
 const APP_URL = process.env.APP_URL || "https://opplevagent.no";
@@ -1968,6 +1970,27 @@ router.get(
 
     const statement = getCommissionStatement(provider_id, month);
     res.json({ success: true, ...statement });
+  },
+);
+
+// ─── POST /api/opplevelser/admin/booking-followups ──────────────────
+// booking-flyt-v1 slice 2: run the pre-visit reminder + auto-expiry pass on
+// demand (the hourly tick in src/index.ts runs the same function). Idempotent
+// by construction — reminder_sent_at / pre_status / expired_guest_notified_at
+// guards inside processBookingFollowups() make a back-to-back second call a
+// no-op. Admin-keyed like every other one-off action in this file; the
+// external Cloud Routines can call this instead of waiting for the tick.
+router.post(
+  "/admin/booking-followups",
+  requireAdmin,
+  async (_req: Request, res: Response) => {
+    try {
+      const result = await processBookingFollowups();
+      res.json({ success: true, ...result });
+    } catch (err) {
+      console.error("[booking-followups] admin run failed:", err);
+      res.status(500).json({ error: "Kunne ikke kjøre booking-followups" });
+    }
   },
 );
 

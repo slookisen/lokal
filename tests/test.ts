@@ -30019,3 +30019,484 @@ console.log("\n── item2a: dead-extraction parking (dental) ──");
     if (priorDb !== undefined) setRfbDbForA2aV1Test(priorDb);
   }
 })();
+
+// ─── gardssalg booking slice 2: pre-visit e-post-svarsløyfe
+//     (dev-request 2026-07-14-booking-flyt-v1, slice 2) ──────────────────────
+// The PRE-visit request→answer loop, parallel to (and never touching) the
+// post-visit status/confirm_token machine: every new booking gets a one-time,
+// expiring producer respond_token (svar page: Bekreft / Foreslå nytt
+// tidspunkt / Avslå — PRG, GET mutates NOTHING) + an always-readable guest
+// status token; a suggested time round-trips to the guest via a one-shot
+// guest_decision_token; processBookingFollowups() sends one producer reminder
+// after REMINDER_HOURS and auto-expires after EXPIRE_HOURS (clamped 48–72)
+// with a guaranteed guest notification — never a silent death. Covers:
+// token/link hygiene (producer tokens never in guest email and vice versa),
+// one-time + expiry negative tests, PRG-GET-mutates-nothing, clock-adjusted
+// reminder/expiry + idempotency, dispatch-gate-off suppression (with retry
+// once the gate is back on), env clamping, HTML-escaping of guest-controlled
+// strings on the svar page, and legacy-row (respond_token NULL) immunity.
+// Same isolated :memory: DB + emailService capture + mock req/res idiom as
+// the gardssalg blocks above.
+console.log("\n── gardssalg slice 2: pre-visit svarsløyfe (svar/gjestesvar/status + purring/utløp) ──");
+const _previsitSvarsloyfePromise = runSerial(async () => {
+  const prevPathPV = process.env.EXPERIENCES_DB_PATH;
+  process.env.EXPERIENCES_DB_PATH = ":memory:";
+  const prevDispatchPV = process.env.BOOKING_DISPATCH_ENABLED;
+  process.env.BOOKING_DISPATCH_ENABLED = "true";
+  const prevReminderPV = process.env.BOOKING_PREVISIT_REMINDER_HOURS;
+  const prevExpirePV = process.env.BOOKING_PREVISIT_EXPIRE_HOURS;
+  delete process.env.BOOKING_PREVISIT_REMINDER_HOURS;
+  delete process.env.BOOKING_PREVISIT_EXPIRE_HOURS;
+
+  const dbFacPathPV = require.resolve("../src/database/db-factory");
+  const expStPathPV = require.resolve("../src/services/experience-store");
+  const bookStPathPV = require.resolve("../src/services/booking-store");
+  const expSeoPathPV = require.resolve("../src/routes/experiences-seo");
+  const opplevelserPathPV = require.resolve("../src/routes/opplevelser");
+  delete require.cache[dbFacPathPV];
+  delete require.cache[expStPathPV];
+  delete require.cache[bookStPathPV];
+  delete require.cache[expSeoPathPV];
+  delete require.cache[opplevelserPathPV];
+
+  const dbFacPV = require("../src/database/db-factory") as typeof import("../src/database/db-factory");
+  dbFacPV.__resetDbFactoryForTesting();
+  const expStPV = require("../src/services/experience-store") as typeof import("../src/services/experience-store");
+  const bookStPV = require("../src/services/booking-store") as typeof import("../src/services/booking-store");
+  const seoRouterPV = (require("../src/routes/experiences-seo") as typeof import("../src/routes/experiences-seo")).default as any;
+  const oppRouterPV = (require("../src/routes/opplevelser") as typeof import("../src/routes/opplevelser")).default as any;
+
+  const dbPV = dbFacPV.getDb("experiences");
+
+  const emailSvcModPV = require("../src/services/email-service") as typeof import("../src/services/email-service");
+  const origSendPV = emailSvcModPV.emailService.sendEmail.bind(emailSvcModPV.emailService);
+  let emailCallsPV: Array<{ to: string; subject: string; htmlContent: string; textContent: string }> = [];
+  (emailSvcModPV.emailService as any).sendEmail = async (opts: {
+    to: string; subject: string; htmlContent?: string; textContent?: string;
+  }) => {
+    emailCallsPV.push({
+      to: opts.to, subject: opts.subject,
+      htmlContent: opts.htmlContent || "", textContent: opts.textContent || "",
+    });
+    return { success: true, messageId: "test" };
+  };
+
+  const PRODUCER_EMAIL_PV = "produsent@svarbryggeri.no";
+  const provIdPV = expStPV.createProvider({
+    navn: "Svar Bryggeri", org_nr: "917000333",
+    fylke: "Innlandet", kommune: "Hamar", poststed: "Hamar",
+    brreg_verified: 0, verification_status: "pending_verify",
+  });
+  dbPV.prepare("UPDATE experience_providers SET producer_type = ?, booking_live = 1, epost = ? WHERE id = ?")
+    .run("bryggeri", PRODUCER_EMAIL_PV, provIdPV);
+  expStPV.backfillProviderSlugs();
+
+  async function invokeSeoPV(
+    method: "get" | "post",
+    routePath: string,
+    params: Record<string, string>,
+    reqPath: string,
+    opts: { query?: Record<string, string>; body?: Record<string, unknown> } = {}
+  ): Promise<{ status: number; body: string; redirectTo: string | null }> {
+    const layer = (seoRouterPV.stack as any[]).find(
+      (l: any) => l.route && l.route.path === routePath && l.route.methods?.[method]
+    );
+    assertTrue(!!layer, `pv-route: seo router has ${method.toUpperCase()} ${routePath} layer`);
+    if (!layer) return { status: 0, body: "", redirectTo: null };
+    let status = 200; let body = ""; let nexted = false; let redirectTo: string | null = null;
+    const res: any = {
+      statusCode: 200,
+      setHeader: () => {},
+      status: (c: number) => { status = c; res.statusCode = c; return res; },
+      send: (b: unknown) => { body = typeof b === "string" ? b : String(b); return res; },
+      json: (o: unknown) => { body = JSON.stringify(o); return res; },
+      redirect: (code: number, location: string) => { status = code; redirectTo = location; },
+    };
+    const req: any = { path: reqPath, hostname: "opplevagent.no", params, query: opts.query || {}, body: opts.body || {}, ip: "127.0.0.1" };
+    const stack = (layer.route.stack as any[]).filter((s: any) => s.method === method);
+    const handle = stack[stack.length - 1].handle;
+    await handle(req, res, () => { nexted = true; });
+    if (nexted) status = 404;
+    return { status, body, redirectTo };
+  }
+
+  async function invokeOppPV(
+    method: "get" | "post",
+    routePath: string,
+    params: Record<string, string>,
+    body: Record<string, unknown>
+  ): Promise<{ status: number; json: any }> {
+    const layer = (oppRouterPV.stack as any[]).find(
+      (l: any) => l.route && l.route.path === routePath && l.route.methods?.[method]
+    );
+    assertTrue(!!layer, `pv-route: opplevelser router has ${method.toUpperCase()} ${routePath} layer`);
+    if (!layer) return { status: 0, json: null };
+    let status = 200; let jsonBody: any = null;
+    const res: any = {
+      status: (c: number) => { status = c; return res; },
+      json: (o: unknown) => { jsonBody = o; return res; },
+    };
+    const req: any = { body, params, query: {}, ip: "127.0.0.1" };
+    const stack = (layer.route.stack as any[]).filter((s: any) => s.method === method);
+    const handle = stack[stack.length - 1].handle;
+    await handle(req, res, () => {});
+    return { status, json: jsonBody };
+  }
+
+  async function bookPV(extra: Record<string, unknown> = {}): Promise<ReturnType<typeof bookStPV.getBookingByRef>> {
+    const r = await invokeOppPV("post", "/book", {}, {
+      provider_id: provIdPV, slot_at: "2030-09-10T13:00", party_size: 2,
+      guest_name: "Gjest Previsit", guest_email: "gjest-pv@example.no", ...extra,
+    });
+    assertEq(r.status, 201, "pv-book: booking created (201)");
+    return bookStPV.getBookingByRef(String(r.json?.booking_ref));
+  }
+
+  // ═══ (0) env clamp unit tests ═══
+  assertEq(bookStPV.previsitExpireHours(), 60, "pv-00a: EXPIRE default 60 when env unset");
+  process.env.BOOKING_PREVISIT_EXPIRE_HOURS = "10";
+  assertEq(bookStPV.previsitExpireHours(), 48, "pv-00b: EXPIRE clamped up to 48 (env below window)");
+  process.env.BOOKING_PREVISIT_EXPIRE_HOURS = "100";
+  assertEq(bookStPV.previsitExpireHours(), 72, "pv-00c: EXPIRE clamped down to 72 (env above window)");
+  process.env.BOOKING_PREVISIT_EXPIRE_HOURS = "tull";
+  assertEq(bookStPV.previsitExpireHours(), 60, "pv-00d: unparseable env falls back to default 60");
+  delete process.env.BOOKING_PREVISIT_EXPIRE_HOURS;
+  assertEq(bookStPV.previsitReminderHours(), 24, "pv-00e: REMINDER default 24 when env unset");
+  process.env.BOOKING_PREVISIT_REMINDER_HOURS = "6";
+  assertEq(bookStPV.previsitReminderHours(), 6, "pv-00f: REMINDER env-overridable");
+  delete process.env.BOOKING_PREVISIT_REMINDER_HOURS;
+
+  // ═══ (1) new booking carries the pre-visit fields + token/link hygiene ═══
+  emailCallsPV = [];
+  const noteRawPV = `Tar med <script>rullestol</script> & "hund"`;
+  const b1 = await bookPV({ guest_name: `Åse <Angriper>`, notes: noteRawPV });
+  assertTrue(!!b1, "pv-01a: booking row exists");
+  assertEq(b1?.pre_status, "awaiting_provider", "pv-01b: pre_status starts as awaiting_provider");
+  assertTrue(!!b1?.respond_token, "pv-01c: respond_token generated");
+  assertTrue(!!b1?.guest_status_token, "pv-01d: guest_status_token generated");
+  assertEq(b1?.guest_decision_token, null, "pv-01e: no guest_decision_token until a time is suggested");
+  const expiresMsPV = Date.parse(String(b1?.respond_token_expires_at));
+  const expiresInHours = (expiresMsPV - Date.parse(String(b1?.created_at))) / 3600_000;
+  assertTrue(Math.abs(expiresInHours - 60) < 0.1, "pv-01f: respond_token expiry stamped ~60h (default) after creation");
+
+  const guestMail1 = emailCallsPV.find((c) => c.to === "gjest-pv@example.no");
+  const prodMail1 = emailCallsPV.find((c) => c.to === PRODUCER_EMAIL_PV);
+  assertTrue(!!guestMail1 && !!prodMail1, "pv-02a: both guest receipt and producer notification sent");
+  assertTrue(!!prodMail1 && prodMail1.htmlContent.includes(`/kategori/gardssalg/svar/${b1!.respond_token}`),
+    "pv-02b: producer email carries the svar link (respond_token)");
+  assertTrue(!!prodMail1 && prodMail1.textContent.includes(`/kategori/gardssalg/svar/${b1!.respond_token}`),
+    "pv-02c: text version carries the svar link too");
+  assertTrue(!!prodMail1 && prodMail1.htmlContent.includes(`/kategori/gardssalg/bekreft/${b1!.confirm_token}`),
+    "pv-02d: producer email STILL carries the post-visit bekreft link (existing content kept)");
+  assertTrue(!!prodMail1 && !prodMail1.htmlContent.includes(String(b1!.guest_status_token))
+    && !prodMail1.textContent.includes(String(b1!.guest_status_token)),
+    "pv-02e: guest status token NEVER appears in the producer email");
+  assertTrue(!!guestMail1 && guestMail1.htmlContent.includes(`/kategori/gardssalg/status/${b1!.booking_ref}/${b1!.guest_status_token}`),
+    "pv-02f: guest receipt carries the status link (guest_status_token)");
+  assertTrue(!!guestMail1 && !guestMail1.htmlContent.includes(String(b1!.respond_token))
+    && !guestMail1.textContent.includes(String(b1!.respond_token)),
+    "pv-02g: producer respond token NEVER appears in the guest email");
+  assertTrue(!!guestMail1 && !guestMail1.htmlContent.includes(String(b1!.confirm_token))
+    && !guestMail1.textContent.includes(String(b1!.confirm_token)),
+    "pv-02h: post-visit confirm token still never in the guest email (regression)");
+
+  // ═══ (2) svar page: GET mutates nothing, escapes guest strings ═══
+  const svarPage1 = await invokeSeoPV("get", "/kategori/gardssalg/svar/:token",
+    { token: String(b1!.respond_token) }, `/kategori/gardssalg/svar/${b1!.respond_token}`);
+  assertEq(svarPage1.status, 200, "pv-03a: svar page renders for the producer");
+  assertTrue(svarPage1.body.includes('value="bekreft"') && svarPage1.body.includes('value="foresla"')
+    && svarPage1.body.includes('value="avsla"'),
+    "pv-03b: all three actions offered as POST buttons");
+  assertTrue(svarPage1.body.includes("&lt;script&gt;rullestol&lt;/script&gt;"),
+    "pv-03c: guest note HTML-escaped on the svar page");
+  assertTrue(!svarPage1.body.includes("<script>rullestol"),
+    "pv-03d: raw guest markup never renders on the svar page");
+  assertTrue(svarPage1.body.includes("Åse &lt;Angriper&gt;"), "pv-03e: guest name escaped");
+  assertEq(bookStPV.getBookingByRef(String(b1!.booking_ref))?.pre_status, "awaiting_provider",
+    "pv-03f: GET on the svar page mutates nothing");
+  const missSvarPV = await invokeSeoPV("get", "/kategori/gardssalg/svar/:token",
+    { token: "finnes-ikke" }, "/kategori/gardssalg/svar/finnes-ikke");
+  assertEq(missSvarPV.status, 404, "pv-03g: unknown respond token → 404 (next())");
+
+  // ═══ (3) Bekreft → provider_confirmed + guest notified; token now one-time ═══
+  emailCallsPV = [];
+  const confirmPostPV = await invokeSeoPV("post", "/kategori/gardssalg/svar/:token",
+    { token: String(b1!.respond_token) }, `/kategori/gardssalg/svar/${b1!.respond_token}`,
+    { body: { action: "bekreft" } });
+  assertEq(confirmPostPV.status, 303, "pv-04a: bekreft POST → 303 (PRG)");
+  assertTrue((confirmPostPV.redirectTo || "").includes("done=bekreftet"), "pv-04b: redirect carries done=bekreftet");
+  let b1RowPV = bookStPV.getBookingByRef(String(b1!.booking_ref));
+  assertEq(b1RowPV?.pre_status, "provider_confirmed", "pv-04c: pre_status → provider_confirmed");
+  assertTrue(!!b1RowPV?.respond_token_used_at, "pv-04d: respond_token_used_at stamped (one-time)");
+  assertEq(b1RowPV?.status, "reserved", "pv-04e: post-visit status machine UNTOUCHED by the pre-visit answer");
+  const confirmGuestMailPV = emailCallsPV.find((c) => c.to === "gjest-pv@example.no");
+  assertTrue(!!confirmGuestMailPV && confirmGuestMailPV.subject.includes("bekreftet"),
+    "pv-04f: guest notified that the reservation is confirmed");
+  // Reuse (negative): GET → friendly no-action page; POST → no mutation.
+  const usedPagePV = await invokeSeoPV("get", "/kategori/gardssalg/svar/:token",
+    { token: String(b1!.respond_token) }, `/kategori/gardssalg/svar/${b1!.respond_token}`);
+  assertEq(usedPagePV.status, 200, "pv-05a: used token still renders a page (friendly, not 404)");
+  assertTrue(usedPagePV.body.includes("allerede brukt"), "pv-05b: page says the link was already used");
+  assertTrue(!usedPagePV.body.includes('value="bekreft"') && !usedPagePV.body.includes('value="avsla"'),
+    "pv-05c: no action buttons on a used token");
+  emailCallsPV = [];
+  const reusePostPV = await invokeSeoPV("post", "/kategori/gardssalg/svar/:token",
+    { token: String(b1!.respond_token) }, `/kategori/gardssalg/svar/${b1!.respond_token}`,
+    { body: { action: "avsla" } });
+  assertEq(reusePostPV.status, 303, "pv-05d: reused-token POST bounces (303)");
+  assertEq(bookStPV.getBookingByRef(String(b1!.booking_ref))?.pre_status, "provider_confirmed",
+    "pv-05e: reused-token POST mutates NOTHING");
+  assertEq(emailCallsPV.length, 0, "pv-05f: reused-token POST sends no emails");
+
+  // ═══ (4) Avslå → provider_declined + guest apology ═══
+  const b2 = await bookPV({ guest_email: "gjest-pv2@example.no" });
+  emailCallsPV = [];
+  const declinePostPV = await invokeSeoPV("post", "/kategori/gardssalg/svar/:token",
+    { token: String(b2!.respond_token) }, `/kategori/gardssalg/svar/${b2!.respond_token}`,
+    { body: { action: "avsla" } });
+  assertTrue((declinePostPV.redirectTo || "").includes("done=avslatt"), "pv-06a: avslå accepted");
+  assertEq(bookStPV.getBookingByRef(String(b2!.booking_ref))?.pre_status, "provider_declined",
+    "pv-06b: pre_status → provider_declined");
+  const declineMailPV = emailCallsPV.find((c) => c.to === "gjest-pv2@example.no");
+  assertTrue(!!declineMailPV && declineMailPV.htmlContent.includes("beklager"),
+    "pv-06c: guest gets an apologetic decline email");
+  assertTrue(!!declineMailPV && declineMailPV.htmlContent.includes("/kategori/gardssalg"),
+    "pv-06d: decline email points at alternative producers");
+
+  // ═══ (5) Foreslå nytt tidspunkt → guest decision loop ═══
+  const b3 = await bookPV({ guest_email: "gjest-pv3@example.no" });
+  emailCallsPV = [];
+  // Invalid slot first (negative): garbage and past → no mutation.
+  const badSlotPV = await invokeSeoPV("post", "/kategori/gardssalg/svar/:token",
+    { token: String(b3!.respond_token) }, `/kategori/gardssalg/svar/${b3!.respond_token}`,
+    { body: { action: "foresla", suggested_slot: "ikke-en-dato" } });
+  assertTrue((badSlotPV.redirectTo || "").includes("error=ugyldig_tid"), "pv-07a: garbage slot rejected");
+  const pastSlotPV = await invokeSeoPV("post", "/kategori/gardssalg/svar/:token",
+    { token: String(b3!.respond_token) }, `/kategori/gardssalg/svar/${b3!.respond_token}`,
+    { body: { action: "foresla", suggested_slot: "2020-01-01T10:00" } });
+  assertTrue((pastSlotPV.redirectTo || "").includes("error=ugyldig_tid"), "pv-07b: past slot rejected");
+  assertEq(bookStPV.getBookingByRef(String(b3!.booking_ref))?.pre_status, "awaiting_provider",
+    "pv-07c: rejected suggestions mutate nothing");
+  assertEq(emailCallsPV.length, 0, "pv-07d: rejected suggestions send nothing");
+  // Valid suggestion.
+  const suggestPostPV = await invokeSeoPV("post", "/kategori/gardssalg/svar/:token",
+    { token: String(b3!.respond_token) }, `/kategori/gardssalg/svar/${b3!.respond_token}`,
+    { body: { action: "foresla", suggested_slot: "2030-09-12T15:00" } });
+  assertTrue((suggestPostPV.redirectTo || "").includes("done=foreslatt"), "pv-08a: suggestion accepted");
+  let b3RowPV = bookStPV.getBookingByRef(String(b3!.booking_ref));
+  assertEq(b3RowPV?.pre_status, "time_suggested", "pv-08b: pre_status → time_suggested");
+  assertEq(b3RowPV?.suggested_slot_at, "2030-09-12T15:00", "pv-08c: suggested_slot_at persisted");
+  assertTrue(!!b3RowPV?.guest_decision_token, "pv-08d: guest_decision_token generated");
+  assertEq(b3RowPV?.respond_token_used_at, null, "pv-08e: suggest is NOT terminal — respond token not consumed");
+  const suggestMailPV = emailCallsPV.find((c) => c.to === "gjest-pv3@example.no");
+  assertTrue(!!suggestMailPV && suggestMailPV.htmlContent.includes(`/kategori/gardssalg/gjestesvar/${b3RowPV!.guest_decision_token}`),
+    "pv-08f: guest email carries the gjestesvar decision link");
+  assertTrue(!!suggestMailPV && !suggestMailPV.htmlContent.includes(String(b3!.respond_token))
+    && !suggestMailPV.textContent.includes(String(b3!.respond_token)),
+    "pv-08g: producer respond token never in the suggestion email");
+  // Re-suggest ROTATES the guest token; the old link dead-ends (404).
+  const firstDecisionTokenPV = String(b3RowPV!.guest_decision_token);
+  emailCallsPV = [];
+  await invokeSeoPV("post", "/kategori/gardssalg/svar/:token",
+    { token: String(b3!.respond_token) }, `/kategori/gardssalg/svar/${b3!.respond_token}`,
+    { body: { action: "foresla", suggested_slot: "2030-09-13T11:00" } });
+  b3RowPV = bookStPV.getBookingByRef(String(b3!.booking_ref));
+  assertEq(b3RowPV?.suggested_slot_at, "2030-09-13T11:00", "pv-09a: re-suggest replaces the slot");
+  assertTrue(b3RowPV?.guest_decision_token !== firstDecisionTokenPV, "pv-09b: re-suggest rotates the guest token");
+  const staleDecisionPV = await invokeSeoPV("get", "/kategori/gardssalg/gjestesvar/:token",
+    { token: firstDecisionTokenPV }, `/kategori/gardssalg/gjestesvar/${firstDecisionTokenPV}`);
+  assertEq(staleDecisionPV.status, 404, "pv-09c: rotated-away decision link → 404, no action possible");
+  // Guest decision page: GET mutates nothing, shows both times.
+  const decisionTokenPV = String(b3RowPV!.guest_decision_token);
+  const decisionPagePV = await invokeSeoPV("get", "/kategori/gardssalg/gjestesvar/:token",
+    { token: decisionTokenPV }, `/kategori/gardssalg/gjestesvar/${decisionTokenPV}`);
+  assertEq(decisionPagePV.status, 200, "pv-10a: gjestesvar page renders");
+  assertTrue(decisionPagePV.body.includes('value="aksepter"') && decisionPagePV.body.includes('value="avsla"'),
+    "pv-10b: accept/decline offered as POST buttons");
+  assertEq(bookStPV.getBookingByRef(String(b3!.booking_ref))?.pre_status, "time_suggested",
+    "pv-10c: GET on gjestesvar mutates nothing");
+  // Guest accepts → slot updated, provider_confirmed, BOTH parties notified.
+  emailCallsPV = [];
+  const acceptPostPV = await invokeSeoPV("post", "/kategori/gardssalg/gjestesvar/:token",
+    { token: decisionTokenPV }, `/kategori/gardssalg/gjestesvar/${decisionTokenPV}`,
+    { body: { action: "aksepter" } });
+  assertTrue((acceptPostPV.redirectTo || "").includes("done=akseptert"), "pv-11a: accept POST → PRG done=akseptert");
+  b3RowPV = bookStPV.getBookingByRef(String(b3!.booking_ref));
+  assertEq(b3RowPV?.pre_status, "provider_confirmed", "pv-11b: accept → provider_confirmed");
+  assertEq(b3RowPV?.slot_at, "2030-09-13T11:00", "pv-11c: slot_at REPLACED by the accepted suggestion");
+  assertTrue(!!b3RowPV?.respond_token_used_at, "pv-11d: respond token consumed by the terminal outcome");
+  assertTrue(emailCallsPV.some((c) => c.to === "gjest-pv3@example.no" && c.subject.includes("bekreftet")),
+    "pv-11e: guest gets the confirmed email");
+  assertTrue(emailCallsPV.some((c) => c.to === PRODUCER_EMAIL_PV && c.subject.includes("aksepterte")),
+    "pv-11f: producer notified of the guest's acceptance");
+  // One-shot: a second accept/decline POST mutates nothing.
+  emailCallsPV = [];
+  const reAcceptPV = await invokeSeoPV("post", "/kategori/gardssalg/gjestesvar/:token",
+    { token: decisionTokenPV }, `/kategori/gardssalg/gjestesvar/${decisionTokenPV}`,
+    { body: { action: "avsla" } });
+  assertEq(reAcceptPV.status, 303, "pv-12a: second decision POST bounces");
+  assertEq(bookStPV.getBookingByRef(String(b3!.booking_ref))?.pre_status, "provider_confirmed",
+    "pv-12b: second decision POST mutates NOTHING (one-shot by state)");
+  assertEq(emailCallsPV.length, 0, "pv-12c: and sends nothing");
+  const usedDecisionPagePV = await invokeSeoPV("get", "/kategori/gardssalg/gjestesvar/:token",
+    { token: decisionTokenPV }, `/kategori/gardssalg/gjestesvar/${decisionTokenPV}`);
+  assertEq(usedDecisionPagePV.status, 200, "pv-12d: used decision link renders a friendly page");
+  assertTrue(usedDecisionPagePV.body.includes("allerede besvart"), "pv-12e: page explains the link is spent");
+
+  // ═══ (6) guest declines a suggestion → provider_declined + producer notified ═══
+  const b4 = await bookPV({ guest_email: "gjest-pv4@example.no" });
+  await invokeSeoPV("post", "/kategori/gardssalg/svar/:token",
+    { token: String(b4!.respond_token) }, `/kategori/gardssalg/svar/${b4!.respond_token}`,
+    { body: { action: "foresla", suggested_slot: "2030-10-01T12:00" } });
+  const b4TokenPV = String(bookStPV.getBookingByRef(String(b4!.booking_ref))?.guest_decision_token);
+  emailCallsPV = [];
+  const guestDeclinePV = await invokeSeoPV("post", "/kategori/gardssalg/gjestesvar/:token",
+    { token: b4TokenPV }, `/kategori/gardssalg/gjestesvar/${b4TokenPV}`, { body: { action: "avsla" } });
+  assertTrue((guestDeclinePV.redirectTo || "").includes("done=avslatt"), "pv-13a: guest decline accepted");
+  assertEq(bookStPV.getBookingByRef(String(b4!.booking_ref))?.pre_status, "provider_declined",
+    "pv-13b: guest decline → provider_declined");
+  assertTrue(emailCallsPV.some((c) => c.to === PRODUCER_EMAIL_PV && c.subject.includes("avslo")),
+    "pv-13c: producer notified of the guest's decline (through the gate)");
+
+  // ═══ (7) status page: always-readable, read-only, token-guarded ═══
+  const statusPagePV = await invokeSeoPV("get", "/kategori/gardssalg/status/:bookingRef/:guestToken",
+    { bookingRef: String(b3!.booking_ref), guestToken: String(b3!.guest_status_token) },
+    `/kategori/gardssalg/status/${b3!.booking_ref}/${b3!.guest_status_token}`);
+  assertEq(statusPagePV.status, 200, "pv-14a: status page renders with the right token");
+  assertTrue(statusPagePV.body.includes("Bekreftet av produsenten"), "pv-14b: status page shows the current pre-status");
+  const wrongTokenPV = await invokeSeoPV("get", "/kategori/gardssalg/status/:bookingRef/:guestToken",
+    { bookingRef: String(b3!.booking_ref), guestToken: "feil-token" },
+    `/kategori/gardssalg/status/${b3!.booking_ref}/feil-token`);
+  assertEq(wrongTokenPV.status, 404, "pv-14c: wrong guest token → 404 (never leaks status)");
+  assertEq(bookStPV.getBookingByRef(String(b3!.booking_ref))?.pre_status, "provider_confirmed",
+    "pv-14d: status page GET mutates nothing");
+
+  // ═══ (8) clock-adjusted reminder + auto-expiry + idempotency ═══
+  const b5 = await bookPV({ guest_email: "gjest-pv5@example.no" });
+  const t0PV = Date.parse(String(b5!.created_at));
+  emailCallsPV = [];
+  // At +1h: nothing due.
+  let fu = await bookStPV.processBookingFollowups(new Date(t0PV + 1 * 3600_000));
+  assertEq(fu.reminders_sent, 0, "pv-15a: no reminder before REMINDER_HOURS");
+  assertEq(fu.expired, 0, "pv-15b: no expiry before EXPIRE_HOURS");
+  // At +25h: exactly one reminder, stamped.
+  fu = await bookStPV.processBookingFollowups(new Date(t0PV + 25 * 3600_000));
+  assertEq(fu.reminders_sent, 1, "pv-15c: one reminder at +25h (default 24h threshold)");
+  assertTrue(emailCallsPV.some((c) => c.to === PRODUCER_EMAIL_PV && c.subject.includes("minnelse")),
+    "pv-15d: reminder went to the producer");
+  assertTrue(!!bookStPV.getBookingByRef(String(b5!.booking_ref))?.reminder_sent_at,
+    "pv-15e: reminder_sent_at stamped");
+  // Idempotent: run again at the same clock → nothing more.
+  emailCallsPV = [];
+  fu = await bookStPV.processBookingFollowups(new Date(t0PV + 26 * 3600_000));
+  assertEq(fu.reminders_sent, 0, "pv-15f: reminder sent exactly ONCE (idempotent)");
+  assertEq(emailCallsPV.length, 0, "pv-15g: second pass sends nothing");
+  // At +61h: auto-expiry + guest apology, exactly once.
+  emailCallsPV = [];
+  fu = await bookStPV.processBookingFollowups(new Date(t0PV + 61 * 3600_000));
+  assertEq(fu.expired, 1, "pv-16a: expired at +61h (default 60h)");
+  assertEq(fu.expired_guests_notified, 1, "pv-16b: guest notified of the expiry");
+  const expiredRowPV = bookStPV.getBookingByRef(String(b5!.booking_ref));
+  assertEq(expiredRowPV?.pre_status, "expired", "pv-16c: pre_status → expired (terminal)");
+  assertTrue(!!expiredRowPV?.expired_guest_notified_at, "pv-16d: expired_guest_notified_at stamped");
+  const expiryMailPV = emailCallsPV.find((c) => c.to === "gjest-pv5@example.no");
+  assertTrue(!!expiryMailPV && expiryMailPV.htmlContent.includes("beklager"),
+    "pv-16e: expiry email is apologetic — never a silent death");
+  assertTrue(!!expiryMailPV && expiryMailPV.htmlContent.includes("/kategori/gardssalg"),
+    "pv-16f: expiry email points at alternative producers");
+  emailCallsPV = [];
+  fu = await bookStPV.processBookingFollowups(new Date(t0PV + 62 * 3600_000));
+  assertEq(fu.expired, 0, "pv-16g: expiry runs exactly once");
+  assertEq(fu.expired_guests_notified, 0, "pv-16h: guest notified exactly once");
+  assertEq(emailCallsPV.length, 0, "pv-16i: idempotent second pass sends nothing");
+  // Expired token: friendly page, no actions, POST mutates nothing.
+  const expiredPagePV = await invokeSeoPV("get", "/kategori/gardssalg/svar/:token",
+    { token: String(b5!.respond_token) }, `/kategori/gardssalg/svar/${b5!.respond_token}`);
+  assertEq(expiredPagePV.status, 200, "pv-17a: expired token renders a friendly page");
+  assertTrue(expiredPagePV.body.includes("utløpt"), "pv-17b: page explains the expiry");
+  assertTrue(!expiredPagePV.body.includes('value="bekreft"'), "pv-17c: no actions on an expired token");
+  const expiredPostPV = await invokeSeoPV("post", "/kategori/gardssalg/svar/:token",
+    { token: String(b5!.respond_token) }, `/kategori/gardssalg/svar/${b5!.respond_token}`,
+    { body: { action: "bekreft" } });
+  assertEq(expiredPostPV.status, 303, "pv-17d: expired-token POST bounces");
+  assertEq(bookStPV.getBookingByRef(String(b5!.booking_ref))?.pre_status, "expired",
+    "pv-17e: expired-token POST mutates NOTHING");
+
+  // ═══ (9) dispatch gate OFF → producer sends suppressed (and retried later) ═══
+  const b6 = await bookPV({ guest_email: "gjest-pv6@example.no" });
+  const t6PV = Date.parse(String(b6!.created_at));
+  delete process.env.BOOKING_DISPATCH_ENABLED; // gate OFF after creation
+  emailCallsPV = [];
+  fu = await bookStPV.processBookingFollowups(new Date(t6PV + 25 * 3600_000));
+  assertEq(fu.reminders_sent, 0, "pv-18a: gate off → no reminder sent");
+  assertEq(fu.reminders_suppressed, 1, "pv-18b: suppression is counted (and logged), not silent");
+  assertEq(emailCallsPV.filter((c) => c.to === PRODUCER_EMAIL_PV).length, 0,
+    "pv-18c: no producer email attempted with the gate off");
+  assertEq(bookStPV.getBookingByRef(String(b6!.booking_ref))?.reminder_sent_at, null,
+    "pv-18d: reminder_sent_at NOT stamped on suppression (retries when the gate returns)");
+  // Gate back on → the reminder goes out on the next pass.
+  process.env.BOOKING_DISPATCH_ENABLED = "true";
+  emailCallsPV = [];
+  fu = await bookStPV.processBookingFollowups(new Date(t6PV + 26 * 3600_000));
+  assertEq(fu.reminders_sent, 1, "pv-18e: reminder recovers once the gate is back on");
+  // Guest decision → producer notice also respects the gate.
+  const b7 = await bookPV({ guest_email: "gjest-pv7@example.no" });
+  await invokeSeoPV("post", "/kategori/gardssalg/svar/:token",
+    { token: String(b7!.respond_token) }, `/kategori/gardssalg/svar/${b7!.respond_token}`,
+    { body: { action: "foresla", suggested_slot: "2030-11-01T12:00" } });
+  const b7TokenPV = String(bookStPV.getBookingByRef(String(b7!.booking_ref))?.guest_decision_token);
+  delete process.env.BOOKING_DISPATCH_ENABLED;
+  emailCallsPV = [];
+  await invokeSeoPV("post", "/kategori/gardssalg/gjestesvar/:token",
+    { token: b7TokenPV }, `/kategori/gardssalg/gjestesvar/${b7TokenPV}`, { body: { action: "aksepter" } });
+  await new Promise((r) => setImmediate(r)); // drain fire-and-forget sends
+  assertEq(bookStPV.getBookingByRef(String(b7!.booking_ref))?.pre_status, "provider_confirmed",
+    "pv-19a: the guest's acceptance still lands (state is not gated)");
+  assertEq(emailCallsPV.filter((c) => c.to === PRODUCER_EMAIL_PV).length, 0,
+    "pv-19b: producer accept-notice suppressed by the gate");
+  assertTrue(emailCallsPV.some((c) => c.to === "gjest-pv7@example.no"),
+    "pv-19c: the guest's own (transactional) confirmation still goes out");
+  process.env.BOOKING_DISPATCH_ENABLED = "true";
+
+  // ═══ (10) legacy rows (respond_token NULL) are immune ═══
+  dbPV.prepare(`
+    INSERT INTO gardssalg_bookings (
+      booking_id, provider_id, slot_at, party_size, guest_name, guest_email,
+      booking_ref, confirm_token, source, status, created_at
+    ) VALUES ('legacy-id-pv', ?, '2020-01-01T10:00', 2, 'Gammel Gjest', 'gammel@example.no',
+      'GARD-LEGACY-PV1', 'legacy-token-pv', 'opplevagent', 'reserved', '2020-01-01T00:00:00.000Z')
+  `).run(provIdPV);
+  const legacyRowPV = bookStPV.getBookingByRef("GARD-LEGACY-PV1");
+  assertEq(legacyRowPV?.pre_status, "awaiting_provider", "pv-20a: legacy row hydrates with the default pre_status");
+  assertEq(legacyRowPV?.respond_token, null, "pv-20b: legacy row has no respond token");
+  emailCallsPV = [];
+  fu = await bookStPV.processBookingFollowups(new Date());
+  assertEq(bookStPV.getBookingByRef("GARD-LEGACY-PV1")?.pre_status, "awaiting_provider",
+    "pv-20c: followups NEVER touch a legacy row (no retroactive expiry, years overdue or not)");
+  assertTrue(!emailCallsPV.some((c) => c.to === "gammel@example.no"),
+    "pv-20d: no surprise emails to legacy guests");
+
+  // ═══ (11) admin endpoint: requireAdmin-gated, runs the same engine ═══
+  const adminLayerPV = (oppRouterPV.stack as any[]).find(
+    (l: any) => l.route && l.route.path === "/admin/booking-followups" && l.route.methods?.post
+  );
+  assertTrue(!!adminLayerPV, "pv-21a: POST /admin/booking-followups route exists");
+  assertTrue(!!adminLayerPV && adminLayerPV.route.stack.length >= 2,
+    "pv-21b: endpoint has the requireAdmin middleware layer");
+  const adminRunPV = await invokeOppPV("post", "/admin/booking-followups", {}, {});
+  assertEq(adminRunPV.status, 200, "pv-21c: admin run returns 200");
+  assertEq(adminRunPV.json?.success, true, "pv-21d: success:true with counters");
+  assertTrue(typeof adminRunPV.json?.examined === "number", "pv-21e: response carries the counters");
+
+  (emailSvcModPV.emailService as any).sendEmail = origSendPV;
+  if (prevPathPV === undefined) delete process.env.EXPERIENCES_DB_PATH;
+  else process.env.EXPERIENCES_DB_PATH = prevPathPV;
+  if (prevDispatchPV === undefined) delete process.env.BOOKING_DISPATCH_ENABLED;
+  else process.env.BOOKING_DISPATCH_ENABLED = prevDispatchPV;
+  if (prevReminderPV === undefined) delete process.env.BOOKING_PREVISIT_REMINDER_HOURS;
+  else process.env.BOOKING_PREVISIT_REMINDER_HOURS = prevReminderPV;
+  if (prevExpirePV === undefined) delete process.env.BOOKING_PREVISIT_EXPIRE_HOURS;
+  else process.env.BOOKING_PREVISIT_EXPIRE_HOURS = prevExpirePV;
+  dbFacPV.__resetDbFactoryForTesting();
+  console.log("  gardssalg-previsit-svarsloyfe: OK (token-hygiene begge veier, engangs+utløp negativtester, PRG-GET-muterer-ikke, foreslå→gjestesvar-løkke m/ rotasjon, klokkejustert purring/utløp + idempotens, gate-av-suppresjon m/ recovery, legacy-rader immune, admin-endepunkt)");
+});

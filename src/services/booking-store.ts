@@ -69,6 +69,19 @@ export type BookingStatus =
   | "no_show"
   | "cancelled";
 
+// ─── Pre-visit answer loop (booking-flyt-v1 slice 2) ────────────────────────
+// PARALLEL to the post-visit `status` machine above — never mixed with it.
+// awaiting_provider → provider_confirmed | provider_declined
+//                   | time_suggested (guest accepts → provider_confirmed,
+//                                     guest declines → provider_declined)
+//                   | expired (auto, after BOOKING_PREVISIT_EXPIRE_HOURS)
+export type BookingPreStatus =
+  | "awaiting_provider"
+  | "provider_confirmed"
+  | "provider_declined"
+  | "time_suggested"
+  | "expired";
+
 export interface GardssalgBooking {
   booking_id: string;
   experience_id: string | null;
@@ -88,6 +101,19 @@ export interface GardssalgBooking {
   billable: number;
   notes: string | null;
   created_at: string;
+  // Pre-visit answer loop (slice 2). All NULL on rows created before the
+  // slice — such legacy rows are OUTSIDE the pre-visit flow entirely (no
+  // reminder, no auto-expiry, no answer page), guarded by respond_token
+  // IS NOT NULL everywhere below.
+  pre_status: BookingPreStatus;
+  respond_token: string | null;            // PRODUCER credential — never in guest email
+  respond_token_expires_at: string | null;
+  respond_token_used_at: string | null;
+  suggested_slot_at: string | null;
+  guest_decision_token: string | null;     // GUEST credential — never in producer email
+  guest_status_token: string | null;       // GUEST read-only status credential
+  reminder_sent_at: string | null;
+  expired_guest_notified_at: string | null;
 }
 
 export const BookingInputSchema = z.object({
@@ -119,6 +145,21 @@ function generateConfirmToken(): string {
   return uuid().replace(/-/g, "");
 }
 
+// ─── Pre-visit config (booking-flyt-v1 slice 2) ─────────────────────────────
+// Reminder to the producer after N hours without an answer (default 24), and
+// automatic expiry after M hours (default 60, hard-clamped to the spec's
+// 48–72 window so an env typo can never make requests die in an hour or
+// linger for a week). Anything unparseable falls back to the default.
+export function previsitReminderHours(): number {
+  const n = parseFloat(process.env.BOOKING_PREVISIT_REMINDER_HOURS || "");
+  return Number.isFinite(n) && n > 0 ? n : 24;
+}
+export function previsitExpireHours(): number {
+  const n = parseFloat(process.env.BOOKING_PREVISIT_EXPIRE_HOURS || "");
+  const raw = Number.isFinite(n) && n > 0 ? n : 60;
+  return Math.min(72, Math.max(48, raw));
+}
+
 function hydrate(row: Record<string, unknown>): GardssalgBooking {
   return {
     booking_id:     row.booking_id as string,
@@ -139,6 +180,15 @@ function hydrate(row: Record<string, unknown>): GardssalgBooking {
     billable:       row.billable as number,
     notes:          (row.notes as string | null) ?? null,
     created_at:     row.created_at as string,
+    pre_status:     ((row.pre_status as string | null) ?? "awaiting_provider") as BookingPreStatus,
+    respond_token:            (row.respond_token as string | null) ?? null,
+    respond_token_expires_at: (row.respond_token_expires_at as string | null) ?? null,
+    respond_token_used_at:    (row.respond_token_used_at as string | null) ?? null,
+    suggested_slot_at:        (row.suggested_slot_at as string | null) ?? null,
+    guest_decision_token:     (row.guest_decision_token as string | null) ?? null,
+    guest_status_token:       (row.guest_status_token as string | null) ?? null,
+    reminder_sent_at:         (row.reminder_sent_at as string | null) ?? null,
+    expired_guest_notified_at:(row.expired_guest_notified_at as string | null) ?? null,
   };
 }
 
@@ -154,6 +204,7 @@ export function createBooking(input: BookingInput): GardssalgBooking {
     commission_rate = prov?.commission_rate ?? null;
   }
 
+  const now = new Date();
   const booking: GardssalgBooking = {
     booking_id:    uuid(),
     experience_id: input.experience_id ?? null,
@@ -172,18 +223,33 @@ export function createBooking(input: BookingInput): GardssalgBooking {
     commission_rate,
     billable:      0,
     notes:         input.notes ?? null,
-    created_at:    new Date().toISOString(),
+    created_at:    now.toISOString(),
+    // Pre-visit answer loop (slice 2): every NEW booking gets the producer's
+    // one-time expiring answer credential + the guest's read-only status
+    // credential up front. guest_decision_token exists only once a new time
+    // has actually been suggested.
+    pre_status:               "awaiting_provider",
+    respond_token:            generateConfirmToken(),
+    respond_token_expires_at: new Date(now.getTime() + previsitExpireHours() * 3600_000).toISOString(),
+    respond_token_used_at:    null,
+    suggested_slot_at:        null,
+    guest_decision_token:     null,
+    guest_status_token:       generateConfirmToken(),
+    reminder_sent_at:         null,
+    expired_guest_notified_at: null,
   };
 
   db.prepare(`
     INSERT INTO gardssalg_bookings (
       booking_id, experience_id, provider_id, slot_at, party_size,
       guest_name, guest_email, guest_phone, booking_ref, confirm_token,
-      source, status, commission_rate, notes, created_at
+      source, status, commission_rate, notes, created_at,
+      pre_status, respond_token, respond_token_expires_at, guest_status_token
     ) VALUES (
       @booking_id, @experience_id, @provider_id, @slot_at, @party_size,
       @guest_name, @guest_email, @guest_phone, @booking_ref, @confirm_token,
-      @source, @status, @commission_rate, @notes, @created_at
+      @source, @status, @commission_rate, @notes, @created_at,
+      @pre_status, @respond_token, @respond_token_expires_at, @guest_status_token
     )
   `).run(booking);
 
@@ -368,6 +434,14 @@ export async function sendBookingConfirmation(booking: GardssalgBooking): Promis
     timeZone: "Europe/Oslo",
   });
 
+  // Pre-visit answer loop (slice 2): guests get an always-readable, never-
+  // mutating status page keyed by guest_status_token. Legacy rows (created
+  // before the slice) have no token → no link, exactly as before. NB: the
+  // producer's respond_token/confirm_token must NEVER appear in this email.
+  const statusUrl = booking.guest_status_token
+    ? `${APP_URL}/kategori/gardssalg/status/${encodeURIComponent(booking.booking_ref)}/${booking.guest_status_token}`
+    : null;
+
   const htmlContent = `
 <p>Hei ${escEmailHtml(booking.guest_name)},</p>
 <p>Din påmelding er registrert! Her er din bekreftelse:</p>
@@ -377,13 +451,14 @@ export async function sendBookingConfirmation(booking: GardssalgBooking): Promis
   <tr><td style="padding:4px 12px 4px 0;font-weight:bold">Antall:</td><td>${booking.party_size} person${booking.party_size > 1 ? "er" : ""}</td></tr>
   ${booking.notes ? `<tr><td style="padding:4px 12px 4px 0;font-weight:bold">Din kommentar:</td><td>${escEmailHtml(booking.notes)}</td></tr>` : ""}
 </table>
-<p>Produsenten er varslet om reservasjonen og bekrefter oppmøtet etter besøket.</p>
+<p>Produsenten er varslet om forespørselen og svarer på e-post — du får beskjed så snart reservasjonen er bekreftet eller besvart.</p>
+${statusUrl ? `<p>Du kan når som helst se gjeldende status her: <a href="${statusUrl}">statusside for reservasjonen</a>.</p>` : ""}
 <p>En kalenderinvitasjon (ICS) er vedlagt denne e-posten.</p>
 <p>Spørsmål? Svar på denne e-posten.</p>
 <p>Hilsen<br>Opplevagent</p>
   `.trim();
 
-  const textContent = `Hei ${booking.guest_name},\n\nDin påmelding er registrert.\nBookingref: ${booking.booking_ref}\nDato/tid: ${slotFormatted}\nAntall: ${booking.party_size}${booking.notes ? `\nDin kommentar: ${booking.notes}` : ""}\n\nProdusenten er varslet og bekrefter oppmøtet etter besøket.\n\nHilsen\nOpplevagent`;
+  const textContent = `Hei ${booking.guest_name},\n\nDin påmelding er registrert.\nBookingref: ${booking.booking_ref}\nDato/tid: ${slotFormatted}\nAntall: ${booking.party_size}${booking.notes ? `\nDin kommentar: ${booking.notes}` : ""}\n\nProdusenten er varslet om forespørselen og svarer på e-post — du får beskjed så snart reservasjonen er bekreftet eller besvart.${statusUrl ? `\nStatus for reservasjonen: ${statusUrl}` : ""}\n\nHilsen\nOpplevagent`;
 
   await emailService.sendEmail({
     to: booking.guest_email,
@@ -441,9 +516,21 @@ export async function sendProducerNotification(
   // GET; actions are POST buttons, so mail-client link prefetching is safe.
   const confirmUrl = `${APP_URL}/kategori/gardssalg/bekreft/${booking.confirm_token}`;
 
+  // Pre-visit answer loop (slice 2): the producer answers the request on the
+  // tokenized svar page — Bekreft / Foreslå nytt tidspunkt / Avslå. All three
+  // links target the SAME non-mutating GET page (the choice itself is a POST
+  // button there, so mail-client link prefetch can never answer a request) —
+  // exact same PRG safety rationale as the post-visit bekreft page above.
+  // Legacy rows (respond_token NULL) simply omit the block. The guest's
+  // status/decision tokens must NEVER appear in this email.
+  const respondUrl = booking.respond_token
+    ? `${APP_URL}/kategori/gardssalg/svar/${booking.respond_token}`
+    : null;
+  const expireHours = previsitExpireHours();
+
   const htmlContent = `
 <p>Hei,</p>
-<p>Du har fått en ny reservasjon via Opplevagent:</p>
+<p>Du har fått en ny reservasjonsforespørsel via Opplevagent:</p>
 <table style="border-collapse:collapse;font-family:sans-serif">
   <tr><td style="padding:4px 12px 4px 0;font-weight:bold">Bookingref:</td><td>${booking.booking_ref}</td></tr>
   <tr><td style="padding:4px 12px 4px 0;font-weight:bold">Dato/tid:</td><td>${slotFormatted}</td></tr>
@@ -453,13 +540,18 @@ export async function sendProducerNotification(
   ${booking.guest_phone ? `<tr><td style="padding:4px 12px 4px 0;font-weight:bold">Telefon:</td><td>${escEmailHtml(booking.guest_phone)}</td></tr>` : ""}
   ${booking.notes ? `<tr><td style="padding:4px 12px 4px 0;font-weight:bold">Kommentar fra gjesten:</td><td>${escEmailHtml(booking.notes)}</td></tr>` : ""}
 </table>
+${respondUrl ? `<p><strong>Svar gjesten med ett klikk:</strong></p>
+<p><a href="${respondUrl}">Bekreft reservasjonen</a><br>
+<a href="${respondUrl}">Foreslå nytt tidspunkt</a><br>
+<a href="${respondUrl}">Avslå forespørselen</a></p>
+<p>Lenkene åpner svarsiden der du bekrefter valget ditt. Svar gjerne innen ${previsitReminderHours()} timer — uten svar innen ${expireHours} timer utløper forespørselen automatisk og gjesten får beskjed.</p>` : ""}
 <p>Spørsmål fra gjesten kan besvares direkte — gjestens e-post står over.</p>
 <p>Etter besøket: <a href="${confirmUrl}">bekreft oppmøte eller ikke-oppmøte her</a>.<br>
-Lenken er personlig for denne reservasjonen — ikke del den videre.</p>
+Lenkene er personlige for denne reservasjonen — ikke del dem videre.</p>
 <p>Hilsen<br>Opplevagent</p>
   `.trim();
 
-  const textContent = `Hei,\n\nDu har fått en ny reservasjon via Opplevagent.\nBookingref: ${booking.booking_ref}\nDato/tid: ${slotFormatted}\nAntall: ${booking.party_size}\nGjest: ${booking.guest_name} (${booking.guest_email}${booking.guest_phone ? ", " + booking.guest_phone : ""})${booking.notes ? `\nKommentar fra gjesten: ${booking.notes}` : ""}\n\nEtter besøket: bekreft oppmøte her (personlig lenke, ikke del videre):\n${confirmUrl}\n\nHilsen\nOpplevagent`;
+  const textContent = `Hei,\n\nDu har fått en ny reservasjonsforespørsel via Opplevagent.\nBookingref: ${booking.booking_ref}\nDato/tid: ${slotFormatted}\nAntall: ${booking.party_size}\nGjest: ${booking.guest_name} (${booking.guest_email}${booking.guest_phone ? ", " + booking.guest_phone : ""})${booking.notes ? `\nKommentar fra gjesten: ${booking.notes}` : ""}\n${respondUrl ? `\nSvar gjesten (bekreft / foreslå nytt tidspunkt / avslå):\n${respondUrl}\nUten svar innen ${expireHours} timer utløper forespørselen automatisk og gjesten får beskjed.\n` : ""}\nEtter besøket: bekreft oppmøte her (personlig lenke, ikke del videre):\n${confirmUrl}\n\nHilsen\nOpplevagent`;
 
   await emailService.sendEmail({
     to: producerEmail,
@@ -468,4 +560,503 @@ Lenken er personlig for denne reservasjonen — ikke del den videre.</p>
     textContent,
     replyTo: `kontakt@opplevagent.no`,
   });
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Pre-visit answer loop (dev-request 2026-07-14-booking-flyt-v1, slice 2)
+// ═══════════════════════════════════════════════════════════════════════════
+
+// Lookup helpers — respond_token IS NOT NULL is implied (a NULL can never
+// equal the parameter), so legacy rows are unreachable here by construction.
+export function getBookingByRespondToken(respond_token: string): GardssalgBooking | null {
+  if (!respond_token) return null;
+  const db = getDb(VERTICAL);
+  const row = db
+    .prepare("SELECT * FROM gardssalg_bookings WHERE respond_token = ?")
+    .get(respond_token) as Record<string, unknown> | undefined;
+  return row ? hydrate(row) : null;
+}
+
+export function getBookingByGuestDecisionToken(token: string): GardssalgBooking | null {
+  if (!token) return null;
+  const db = getDb(VERTICAL);
+  const row = db
+    .prepare("SELECT * FROM gardssalg_bookings WHERE guest_decision_token = ?")
+    .get(token) as Record<string, unknown> | undefined;
+  return row ? hydrate(row) : null;
+}
+
+// One-time + expiring semantics for the producer's answer credential.
+//   ok      → the svar page may offer actions
+//   used    → a terminal answer was already given (used_at stamped, or the
+//             pre_status is already terminal via the guest's decision)
+//   expired → the request auto-expired (or the token's expiry passed)
+// GET renders a friendly no-action page for used/expired; POST mutates
+// NOTHING in those states (the negative tests pin this).
+export function respondTokenState(
+  booking: GardssalgBooking,
+  now: Date = new Date(),
+): "ok" | "used" | "expired" {
+  if (booking.respond_token_used_at) return "used";
+  if (booking.pre_status === "expired") return "expired";
+  if (booking.pre_status === "provider_confirmed" || booking.pre_status === "provider_declined") {
+    return "used";
+  }
+  if (
+    booking.respond_token_expires_at &&
+    new Date(booking.respond_token_expires_at).getTime() <= now.getTime()
+  ) {
+    return "expired";
+  }
+  return "ok";
+}
+
+// Minimal shape check for a producer-suggested slot: the same naive
+// datetime-local format the booking form itself submits ("2026-09-03T13:00"),
+// parseable, and in the future.
+export function isValidSuggestedSlot(slot: string, now: Date = new Date()): boolean {
+  if (!/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}/.test(slot)) return false;
+  const t = new Date(slot).getTime();
+  return Number.isFinite(t) && t > now.getTime();
+}
+
+// Producer answers "Bekreft": awaiting_provider → provider_confirmed,
+// terminal — respond token consumed. Returns null (no mutation) for unknown
+// token, non-ok token state, or a pre_status that isn't awaiting_provider
+// (from time_suggested the pending guest decision owns the outcome; the
+// producer's remaining moves there are re-suggest or decline).
+export function producerRespondConfirm(
+  respond_token: string,
+  now: Date = new Date(),
+): GardssalgBooking | null {
+  const existing = getBookingByRespondToken(respond_token);
+  if (!existing || respondTokenState(existing, now) !== "ok") return null;
+  if (existing.pre_status !== "awaiting_provider") return null;
+  const db = getDb(VERTICAL);
+  db.prepare(`
+    UPDATE gardssalg_bookings
+    SET pre_status = 'provider_confirmed', respond_token_used_at = ?
+    WHERE respond_token = ? AND pre_status = 'awaiting_provider' AND respond_token_used_at IS NULL
+  `).run(now.toISOString(), respond_token);
+  return getBookingByRespondToken(respond_token);
+}
+
+// Producer answers "Avslå": awaiting_provider|time_suggested →
+// provider_declined, terminal — respond token consumed and any pending guest
+// decision loses its actionable state (pre_status gate on the guest side).
+export function producerRespondDecline(
+  respond_token: string,
+  now: Date = new Date(),
+): GardssalgBooking | null {
+  const existing = getBookingByRespondToken(respond_token);
+  if (!existing || respondTokenState(existing, now) !== "ok") return null;
+  if (existing.pre_status !== "awaiting_provider" && existing.pre_status !== "time_suggested") {
+    return null;
+  }
+  const db = getDb(VERTICAL);
+  db.prepare(`
+    UPDATE gardssalg_bookings
+    SET pre_status = 'provider_declined', respond_token_used_at = ?
+    WHERE respond_token = ? AND pre_status IN ('awaiting_provider','time_suggested')
+      AND respond_token_used_at IS NULL
+  `).run(now.toISOString(), respond_token);
+  return getBookingByRespondToken(respond_token);
+}
+
+// Producer answers "Foreslå nytt tidspunkt": NOT terminal (the guest now owns
+// the outcome), so the respond token is deliberately NOT consumed — the
+// producer may correct a typo by re-suggesting (which ROTATES
+// guest_decision_token, dead-linking the previously emailed one) or still
+// decline. Returns null without mutating on invalid state/slot.
+export function producerSuggestTime(
+  respond_token: string,
+  suggested_slot_at: string,
+  now: Date = new Date(),
+): GardssalgBooking | null {
+  const existing = getBookingByRespondToken(respond_token);
+  if (!existing || respondTokenState(existing, now) !== "ok") return null;
+  if (existing.pre_status !== "awaiting_provider" && existing.pre_status !== "time_suggested") {
+    return null;
+  }
+  if (!isValidSuggestedSlot(suggested_slot_at, now)) return null;
+  const db = getDb(VERTICAL);
+  db.prepare(`
+    UPDATE gardssalg_bookings
+    SET pre_status = 'time_suggested', suggested_slot_at = ?, guest_decision_token = ?
+    WHERE respond_token = ? AND pre_status IN ('awaiting_provider','time_suggested')
+      AND respond_token_used_at IS NULL
+  `).run(suggested_slot_at, generateConfirmToken(), respond_token);
+  return getBookingByRespondToken(respond_token);
+}
+
+// Guest accepts the suggested time: slot_at is REPLACED by the suggestion
+// (the post-visit visitTimeReached() guard then follows the agreed time) and
+// the loop terminates as provider_confirmed. One-shot-for-action by state:
+// only actionable while pre_status='time_suggested', so a second click — or a
+// stale rotated link — mutates nothing.
+export function guestAcceptSuggestion(
+  guest_decision_token: string,
+  now: Date = new Date(),
+): GardssalgBooking | null {
+  const existing = getBookingByGuestDecisionToken(guest_decision_token);
+  if (!existing || existing.pre_status !== "time_suggested" || !existing.suggested_slot_at) {
+    return null;
+  }
+  const db = getDb(VERTICAL);
+  db.prepare(`
+    UPDATE gardssalg_bookings
+    SET pre_status = 'provider_confirmed', slot_at = suggested_slot_at,
+        respond_token_used_at = ?
+    WHERE guest_decision_token = ? AND pre_status = 'time_suggested'
+  `).run(now.toISOString(), guest_decision_token);
+  return getBookingByGuestDecisionToken(guest_decision_token);
+}
+
+// Guest declines the suggested time → provider_declined, terminal.
+export function guestDeclineSuggestion(
+  guest_decision_token: string,
+  now: Date = new Date(),
+): GardssalgBooking | null {
+  const existing = getBookingByGuestDecisionToken(guest_decision_token);
+  if (!existing || existing.pre_status !== "time_suggested") return null;
+  const db = getDb(VERTICAL);
+  db.prepare(`
+    UPDATE gardssalg_bookings
+    SET pre_status = 'provider_declined', respond_token_used_at = ?
+    WHERE guest_decision_token = ? AND pre_status = 'time_suggested'
+  `).run(now.toISOString(), guest_decision_token);
+  return getBookingByGuestDecisionToken(guest_decision_token);
+}
+
+// ─── Pre-visit emails ───────────────────────────────────────────────────────
+// Guest emails are transactional (the guest asked for this booking) and are
+// NOT behind the producer dispatch gates; every guest-controlled string is
+// escEmailHtml()-escaped. Producer emails go through the SAME gate pair as
+// sendProducerNotification — see sendGatedProducerEmail() below: gates off →
+// no send, logged, never silently swallowed.
+
+function slotNb(slot: string | null): string {
+  if (!slot) return "";
+  return new Date(slot).toLocaleString("nb-NO", {
+    dateStyle: "full",
+    timeStyle: "short",
+    timeZone: "Europe/Oslo",
+  });
+}
+
+function guestStatusUrl(booking: GardssalgBooking): string | null {
+  return booking.guest_status_token
+    ? `${APP_URL}/kategori/gardssalg/status/${encodeURIComponent(booking.booking_ref)}/${booking.guest_status_token}`
+    : null;
+}
+
+const statusFooterHtml = (booking: GardssalgBooking): string => {
+  const u = guestStatusUrl(booking);
+  return u ? `<p>Se gjeldende status når som helst: <a href="${u}">statusside for reservasjonen</a>.</p>` : "";
+};
+
+// Guest: the producer confirmed (directly, or via the guest accepting a
+// suggested time — pass acceptedSuggestion to word it accordingly).
+export async function sendPrevisitConfirmedToGuest(
+  booking: GardssalgBooking,
+  acceptedSuggestion = false,
+): Promise<void> {
+  const slotFormatted = slotNb(booking.slot_at);
+  const lead = acceptedSuggestion
+    ? "Du har akseptert det nye tidspunktet — reservasjonen er nå bekreftet:"
+    : "Gode nyheter — produsenten har bekreftet reservasjonen din:";
+  await emailService.sendEmail({
+    to: booking.guest_email,
+    subject: `Reservasjonen er bekreftet — ${booking.booking_ref}`,
+    htmlContent: `
+<p>Hei ${escEmailHtml(booking.guest_name)},</p>
+<p>${lead}</p>
+<table style="border-collapse:collapse;font-family:sans-serif">
+  <tr><td style="padding:4px 12px 4px 0;font-weight:bold">Bookingref:</td><td>${booking.booking_ref}</td></tr>
+  <tr><td style="padding:4px 12px 4px 0;font-weight:bold">Dato/tid:</td><td>${slotFormatted}</td></tr>
+  <tr><td style="padding:4px 12px 4px 0;font-weight:bold">Antall:</td><td>${booking.party_size} person${booking.party_size > 1 ? "er" : ""}</td></tr>
+</table>
+<p>Velkommen! Produsenten registrerer oppmøtet etter besøket.</p>
+${statusFooterHtml(booking)}
+<p>Hilsen<br>Opplevagent</p>`.trim(),
+    textContent: `Hei ${booking.guest_name},\n\n${acceptedSuggestion ? "Du har akseptert det nye tidspunktet — reservasjonen er nå bekreftet." : "Produsenten har bekreftet reservasjonen din."}\nBookingref: ${booking.booking_ref}\nDato/tid: ${slotFormatted}\nAntall: ${booking.party_size}${guestStatusUrl(booking) ? `\nStatus: ${guestStatusUrl(booking)}` : ""}\n\nHilsen\nOpplevagent`,
+    replyTo: "kontakt@opplevagent.no",
+  });
+}
+
+// Guest: the producer (or the guest's own decline of a suggestion) ended the
+// request — apologetic, with a pointer to alternative producers.
+export async function sendPrevisitDeclinedToGuest(booking: GardssalgBooking): Promise<void> {
+  const slotFormatted = slotNb(booking.slot_at);
+  const alternatives = `${APP_URL}/kategori/gardssalg`;
+  await emailService.sendEmail({
+    to: booking.guest_email,
+    subject: `Reservasjonen kunne dessverre ikke bekreftes — ${booking.booking_ref}`,
+    htmlContent: `
+<p>Hei ${escEmailHtml(booking.guest_name)},</p>
+<p>Vi beklager — reservasjonsforespørselen din (${booking.booking_ref}, ${slotFormatted}) kunne dessverre ikke bekreftes av produsenten denne gangen.</p>
+<p>Det finnes flere produsenter som tar imot besøk: <a href="${alternatives}">se alternative tilbydere her</a>.</p>
+${statusFooterHtml(booking)}
+<p>Hilsen<br>Opplevagent</p>`.trim(),
+    textContent: `Hei ${booking.guest_name},\n\nVi beklager — reservasjonsforespørselen din (${booking.booking_ref}, ${slotFormatted}) kunne dessverre ikke bekreftes av produsenten denne gangen.\nSe alternative tilbydere: ${alternatives}\n\nHilsen\nOpplevagent`,
+    replyTo: "kontakt@opplevagent.no",
+  });
+}
+
+// Guest: the producer suggested a new time — carries the guest's one-shot
+// decision link. The producer's respond/confirm tokens must NEVER appear here.
+export async function sendSuggestionToGuest(booking: GardssalgBooking): Promise<void> {
+  if (!booking.guest_decision_token || !booking.suggested_slot_at) return;
+  const decisionUrl = `${APP_URL}/kategori/gardssalg/gjestesvar/${booking.guest_decision_token}`;
+  const originalFormatted = slotNb(booking.slot_at);
+  const suggestedFormatted = slotNb(booking.suggested_slot_at);
+  await emailService.sendEmail({
+    to: booking.guest_email,
+    subject: `Produsenten foreslår et nytt tidspunkt — ${booking.booking_ref}`,
+    htmlContent: `
+<p>Hei ${escEmailHtml(booking.guest_name)},</p>
+<p>Produsenten kan dessverre ikke ta imot besøket ${originalFormatted}, men foreslår i stedet:</p>
+<p style="font-size:1.05rem;font-weight:bold">${suggestedFormatted}</p>
+<p><a href="${decisionUrl}">Svar på forslaget her</a> — du kan akseptere det nye tidspunktet eller avslå.</p>
+<p>Lenken er personlig for denne reservasjonen (${booking.booking_ref}) — ikke del den videre.</p>
+${statusFooterHtml(booking)}
+<p>Hilsen<br>Opplevagent</p>`.trim(),
+    textContent: `Hei ${booking.guest_name},\n\nProdusenten kan dessverre ikke ta imot besøket ${originalFormatted}, men foreslår i stedet:\n${suggestedFormatted}\n\nAksepter eller avslå forslaget her (personlig lenke):\n${decisionUrl}\n\nHilsen\nOpplevagent`,
+    replyTo: "kontakt@opplevagent.no",
+  });
+}
+
+// Guest: the request auto-expired without a producer answer — never a silent
+// death. Apologetic + alternatives, mirrors the declined email.
+export async function sendPrevisitExpiredToGuest(booking: GardssalgBooking): Promise<void> {
+  const slotFormatted = slotNb(booking.slot_at);
+  const alternatives = `${APP_URL}/kategori/gardssalg`;
+  await emailService.sendEmail({
+    to: booking.guest_email,
+    subject: `Forespørselen utløp uten svar — ${booking.booking_ref}`,
+    htmlContent: `
+<p>Hei ${escEmailHtml(booking.guest_name)},</p>
+<p>Vi beklager — produsenten har dessverre ikke besvart reservasjonsforespørselen din (${booking.booking_ref}, ${slotFormatted}) i tide, så den er nå utløpt.</p>
+<p>Det finnes flere produsenter som tar imot besøk: <a href="${alternatives}">se alternative tilbydere her</a>.</p>
+${statusFooterHtml(booking)}
+<p>Hilsen<br>Opplevagent</p>`.trim(),
+    textContent: `Hei ${booking.guest_name},\n\nVi beklager — produsenten har dessverre ikke besvart reservasjonsforespørselen din (${booking.booking_ref}, ${slotFormatted}) i tide, så den er nå utløpt.\nSe alternative tilbydere: ${alternatives}\n\nHilsen\nOpplevagent`,
+    replyTo: "kontakt@opplevagent.no",
+  });
+}
+
+// ─── Gated producer sends ───────────────────────────────────────────────────
+// EVERY pre-visit producer email goes through here: the provider row is read
+// fresh and the send only happens when isBookingPaused() allows it — the
+// exact same gate pair (global master switch + per-provider booking_live,
+// with the hidden-test-provider carve-out) the booking entry points enforce.
+// Gates off or no epost on file → no send, one clear log line. Returns
+// whether a send was actually attempted (the followup engine uses this to
+// avoid stamping reminder_sent_at on a suppressed reminder).
+function getProviderDispatchRow(provider_id: string): {
+  navn: string | null;
+  epost: string | null;
+  booking_live: number | null;
+  catalog_hidden: number | null;
+} | null {
+  const db = getDb(VERTICAL);
+  const row = db
+    .prepare(
+      "SELECT navn, epost, booking_live, catalog_hidden FROM experience_providers WHERE id = ?",
+    )
+    .get(provider_id) as
+    | { navn: string | null; epost: string | null; booking_live: number | null; catalog_hidden: number | null }
+    | undefined;
+  return row ?? null;
+}
+
+async function sendGatedProducerEmail(
+  booking: GardssalgBooking,
+  kind: string,
+  build: (producerEmail: string) => { subject: string; htmlContent: string; textContent: string },
+): Promise<boolean> {
+  const provider = getProviderDispatchRow(booking.provider_id);
+  if (!provider || isBookingPaused(provider.booking_live, provider.catalog_hidden)) {
+    console.log(
+      `[booking-previsit] producer ${kind} SUPPRESSED by dispatch gate — provider ${booking.provider_id}, booking ${booking.booking_ref}`,
+    );
+    return false;
+  }
+  if (!provider.epost) {
+    console.error(
+      `[booking-previsit] producer ${kind} SKIPPED — no epost on file for provider ${booking.provider_id} (booking ${booking.booking_ref})`,
+    );
+    return false;
+  }
+  const { subject, htmlContent, textContent } = build(provider.epost);
+  await emailService.sendEmail({
+    to: provider.epost,
+    subject,
+    htmlContent,
+    textContent,
+    replyTo: "kontakt@opplevagent.no",
+  });
+  return true;
+}
+
+// Producer: reminder after previsitReminderHours() without an answer. Carries
+// the svar link again (producer credential — fine in a producer email).
+export async function sendPrevisitReminderToProducer(booking: GardssalgBooking): Promise<boolean> {
+  if (!booking.respond_token) return false;
+  const respondUrl = `${APP_URL}/kategori/gardssalg/svar/${booking.respond_token}`;
+  const slotFormatted = slotNb(booking.slot_at);
+  return sendGatedProducerEmail(booking, "reminder", () => ({
+    subject: `Påminnelse: ubesvart reservasjonsforespørsel — ${booking.booking_ref}`,
+    htmlContent: `
+<p>Hei,</p>
+<p>En reservasjonsforespørsel venter fortsatt på svar fra deg:</p>
+<table style="border-collapse:collapse;font-family:sans-serif">
+  <tr><td style="padding:4px 12px 4px 0;font-weight:bold">Bookingref:</td><td>${booking.booking_ref}</td></tr>
+  <tr><td style="padding:4px 12px 4px 0;font-weight:bold">Dato/tid:</td><td>${slotFormatted}</td></tr>
+  <tr><td style="padding:4px 12px 4px 0;font-weight:bold">Antall:</td><td>${booking.party_size} person${booking.party_size > 1 ? "er" : ""}</td></tr>
+  <tr><td style="padding:4px 12px 4px 0;font-weight:bold">Gjest:</td><td>${escEmailHtml(booking.guest_name)}</td></tr>
+</table>
+<p><a href="${respondUrl}">Svar her: bekreft, foreslå nytt tidspunkt eller avslå</a>.</p>
+<p>Uten svar innen ${previsitExpireHours()} timer fra forespørselen kom inn, utløper den automatisk og gjesten får beskjed.</p>
+<p>Hilsen<br>Opplevagent</p>`.trim(),
+    textContent: `Hei,\n\nEn reservasjonsforespørsel venter fortsatt på svar fra deg.\nBookingref: ${booking.booking_ref}\nDato/tid: ${slotFormatted}\nAntall: ${booking.party_size}\nGjest: ${booking.guest_name}\n\nSvar her (bekreft / foreslå nytt tidspunkt / avslå):\n${respondUrl}\n\nUten svar innen ${previsitExpireHours()} timer fra forespørselen kom inn, utløper den automatisk og gjesten får beskjed.\n\nHilsen\nOpplevagent`,
+  }));
+}
+
+// Producer: outcome of the guest's decision on a suggested time.
+export async function sendGuestDecisionToProducer(
+  booking: GardssalgBooking,
+  accepted: boolean,
+): Promise<boolean> {
+  const slotFormatted = slotNb(booking.slot_at);
+  return sendGatedProducerEmail(booking, accepted ? "guest-accept" : "guest-decline", () => ({
+    subject: accepted
+      ? `Gjesten aksepterte det nye tidspunktet — ${booking.booking_ref}`
+      : `Gjesten avslo det nye tidspunktet — ${booking.booking_ref}`,
+    htmlContent: accepted
+      ? `
+<p>Hei,</p>
+<p>Gjesten ${escEmailHtml(booking.guest_name)} har akseptert det nye tidspunktet for reservasjon ${booking.booking_ref}.</p>
+<p>Avtalt tidspunkt er nå: <strong>${slotFormatted}</strong>.</p>
+<p>Bekreft oppmøte etter besøket via lenken i den opprinnelige e-posten.</p>
+<p>Hilsen<br>Opplevagent</p>`.trim()
+      : `
+<p>Hei,</p>
+<p>Gjesten ${escEmailHtml(booking.guest_name)} kunne dessverre ikke på det foreslåtte tidspunktet, og reservasjonsforespørselen ${booking.booking_ref} er avsluttet.</p>
+<p>Hilsen<br>Opplevagent</p>`.trim(),
+    textContent: accepted
+      ? `Hei,\n\nGjesten ${booking.guest_name} har akseptert det nye tidspunktet for reservasjon ${booking.booking_ref}.\nAvtalt tidspunkt er nå: ${slotFormatted}.\n\nHilsen\nOpplevagent`
+      : `Hei,\n\nGjesten ${booking.guest_name} kunne dessverre ikke på det foreslåtte tidspunktet, og reservasjonsforespørselen ${booking.booking_ref} er avsluttet.\n\nHilsen\nOpplevagent`,
+  }));
+}
+
+// ─── Reminder + auto-expiry engine ──────────────────────────────────────────
+// Idempotent by construction: reminder_sent_at is stamped only on an ACTUAL
+// send (a gate-suppressed reminder retries next run), expiry flips
+// pre_status exactly once, and expired_guest_notified_at guards the guest
+// notification — so calling this back-to-back does nothing the second time.
+// Timestamp comparisons happen in JS (Date.parse) because created_at mixes
+// ISO-with-Z (createBooking) and sqlite datetime('now') formats historically.
+// Exposed via POST /api/opplevelser/admin/booking-followups (requireAdmin)
+// and the hourly tick in src/index.ts; `now` is injectable for clock tests.
+export interface BookingFollowupResult {
+  examined: number;
+  reminders_sent: number;
+  reminders_suppressed: number;
+  expired: number;
+  expired_guests_notified: number;
+  errors: number;
+}
+
+export async function processBookingFollowups(
+  now: Date = new Date(),
+): Promise<BookingFollowupResult> {
+  const db = getDb(VERTICAL);
+  const result: BookingFollowupResult = {
+    examined: 0,
+    reminders_sent: 0,
+    reminders_suppressed: 0,
+    expired: 0,
+    expired_guests_notified: 0,
+    errors: 0,
+  };
+
+  // Only slice-2 rows (respond_token set) still awaiting an answer, plus
+  // already-expired rows whose guest was never notified (crash between the
+  // status flip and the email must not orphan the apology — "aldri stille
+  // død").
+  const rows = db
+    .prepare(`
+      SELECT * FROM gardssalg_bookings
+      WHERE respond_token IS NOT NULL
+        AND (
+          pre_status = 'awaiting_provider'
+          OR (pre_status = 'expired' AND expired_guest_notified_at IS NULL)
+        )
+    `)
+    .all() as Record<string, unknown>[];
+
+  const nowMs = now.getTime();
+  const reminderMs = previsitReminderHours() * 3600_000;
+
+  for (const raw of rows) {
+    const booking = hydrate(raw);
+    result.examined++;
+    try {
+      // ── Expiry: respond_token_expires_at (stamped at creation from the
+      // clamped previsitExpireHours()) is the single source of truth. ──
+      const expiresMs = booking.respond_token_expires_at
+        ? new Date(booking.respond_token_expires_at).getTime()
+        : NaN;
+      const shouldExpire =
+        booking.pre_status === "awaiting_provider" &&
+        Number.isFinite(expiresMs) &&
+        expiresMs <= nowMs;
+
+      if (shouldExpire) {
+        db.prepare(`
+          UPDATE gardssalg_bookings SET pre_status = 'expired'
+          WHERE booking_id = ? AND pre_status = 'awaiting_provider'
+        `).run(booking.booking_id);
+        booking.pre_status = "expired";
+        result.expired++;
+      }
+
+      if (booking.pre_status === "expired" && !booking.expired_guest_notified_at) {
+        await sendPrevisitExpiredToGuest(booking);
+        db.prepare(
+          "UPDATE gardssalg_bookings SET expired_guest_notified_at = ? WHERE booking_id = ?",
+        ).run(now.toISOString(), booking.booking_id);
+        result.expired_guests_notified++;
+        continue;
+      }
+
+      // ── Reminder: once, after previsitReminderHours() without an answer,
+      // only while the request is still alive. ──
+      if (
+        booking.pre_status === "awaiting_provider" &&
+        !booking.reminder_sent_at &&
+        Number.isFinite(Date.parse(booking.created_at)) &&
+        nowMs - Date.parse(booking.created_at) >= reminderMs
+      ) {
+        const sent = await sendPrevisitReminderToProducer(booking);
+        if (sent) {
+          db.prepare(
+            "UPDATE gardssalg_bookings SET reminder_sent_at = ? WHERE booking_id = ?",
+          ).run(now.toISOString(), booking.booking_id);
+          result.reminders_sent++;
+        } else {
+          result.reminders_suppressed++;
+        }
+      }
+    } catch (err) {
+      result.errors++;
+      console.error(
+        `[booking-previsit] followup failed for ${booking.booking_ref}:`,
+        err,
+      );
+    }
+  }
+
+  return result;
 }

@@ -1037,6 +1037,45 @@ if (
   }, 60 * 60_000);
 }
 
+// ─── booking-flyt-v1 slice 2 (dev-request 2026-07-14-booking-flyt-v1):
+// pre-visit booking followups — producer reminder + auto-expiry ───────
+//
+// Hourly pass over gardssalg_bookings rows still awaiting a producer answer:
+// one reminder after BOOKING_PREVISIT_REMINDER_HOURS (default 24) and
+// automatic expiry + guest notification after BOOKING_PREVISIT_EXPIRE_HOURS
+// (default 60, clamped 48–72) — a request must never die silently. The pass
+// is idempotent (see processBookingFollowups()), so the hourly cadence is
+// just "check often enough"; POST /api/opplevelser/admin/booking-followups
+// runs the same function on demand. Producer emails inside go through the
+// same dispatch gates as every other producer send (suppressed → logged).
+//
+// Mirrors the experiences-geocode scheduler above: gated on the experiences
+// vertical being enabled (otherwise experiences.db isn't open), disable on
+// dev / CI with RFB_DISABLE_BOOKING_FOLLOWUPS=1.
+if (
+  process.env.RFB_DISABLE_BOOKING_FOLLOWUPS !== "1" &&
+  process.env.ENABLE_EXPERIENCES === "1"
+) {
+  setInterval(async () => {
+    try {
+      const { processBookingFollowups } = await import("./services/booking-store");
+      const r = await processBookingFollowups();
+      if (
+        r.reminders_sent || r.reminders_suppressed ||
+        r.expired || r.expired_guests_notified || r.errors
+      ) {
+        console.log(
+          `[booking-followups] tick examined=${r.examined} reminders=${r.reminders_sent} ` +
+          `suppressed=${r.reminders_suppressed} expired=${r.expired} ` +
+          `guests_notified=${r.expired_guests_notified} errors=${r.errors}`
+        );
+      }
+    } catch (err) {
+      console.error("[booking-followups] tick failed:", err);
+    }
+  }, 60 * 60_000);
+}
+
 // ─── dev-request 2026-07-09-loop-dispatch-self-tick: dispatcher self-tick ───
 //
 // Ticks runDispatchTick("active") every ~10 min so the fleet's self-continue
