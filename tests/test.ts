@@ -2488,7 +2488,7 @@ console.log("── human-visits strip: referral classification + aggregation �
   const sqlite = require("better-sqlite3");
   const wo8db = new sqlite(":memory:");
   wo8db.exec(`
-    CREATE TABLE agents (id TEXT PRIMARY KEY, name TEXT, role TEXT, city TEXT, url TEXT);
+    CREATE TABLE agents (id TEXT PRIMARY KEY, name TEXT, role TEXT, city TEXT, url TEXT, is_verified INTEGER DEFAULT 0);
     CREATE TABLE agent_knowledge (
       agent_id TEXT PRIMARY KEY,
       address TEXT, website TEXT, phone TEXT, email TEXT,
@@ -2556,7 +2556,7 @@ console.log("\n── PR-27: pickReviewQueueBatch unit tests ──");
   const sqlite = require("better-sqlite3");
   const db = new sqlite(":memory:");
   db.exec(`
-    CREATE TABLE agents (id TEXT PRIMARY KEY, name TEXT, role TEXT, city TEXT, url TEXT);
+    CREATE TABLE agents (id TEXT PRIMARY KEY, name TEXT, role TEXT, city TEXT, url TEXT, is_verified INTEGER DEFAULT 0);
     CREATE TABLE agent_knowledge (
       agent_id TEXT PRIMARY KEY,
       address TEXT, website TEXT, phone TEXT, email TEXT,
@@ -4505,6 +4505,21 @@ async function runIntegrationTests(): Promise<void> {
           { value: "95011022", source_type: "homepage", fetched_at: "2026-06-10T07:25Z" },
           { value: "95011022", source_type: "google_places", fetched_at: "2026-06-10T07:30Z" },
         ],
+        // dev-request 2026-07-15-gate-integrity-unverified-agent-bypass
+        // (slice 2): this agent is brand-new (insertTestAgent seeds
+        // verification_status='unverified', so it is NOT already in the
+        // pool going into this run) — the new email-ownership-provenance
+        // guard in runVerifierBatch now REQUIRES evidence for a free-mail
+        // address on any agent that isn't already verified, exactly the
+        // same homepage-crawl evidence the address/phone fields above
+        // already carry. Without this, the agent would be correctly (and
+        // intentionally) quarantined to review_required by the new guard —
+        // that is the fix, not a regression. Adding this record keeps this
+        // fixture's original intent (a genuinely-evidenced free-mail
+        // producer reaches verified; Guards #1/#2 don't interfere) intact.
+        email: [
+          { value: "bjorkheim.gard@gmail.com", source_type: "homepage", fetched_at: "2026-06-10T07:25Z" },
+        ],
       },
     });
 
@@ -4519,6 +4534,10 @@ async function runIntegrationTests(): Promise<void> {
     assertTrue(
       !ar!.flags.some((f) => f.startsWith("inference_only_field")),
       "intg-g16A: gmail producer has no inference-only flag",
+    );
+    assertTrue(
+      !ar!.email_ownership_unproven,
+      "intg-g16A: gmail producer with homepage-provenance evidence clears the new email-ownership guard",
     );
     assertEq(
       ar?.new_verification_status,
@@ -13695,7 +13714,7 @@ console.log("\n── orch-pr-87: pickBatchBiased + getSweepStatus ──");
   function makeDb() {
     const db = new sqlite(":memory:");
     db.exec(`
-      CREATE TABLE agents (id TEXT PRIMARY KEY, name TEXT, role TEXT, city TEXT, url TEXT);
+      CREATE TABLE agents (id TEXT PRIMARY KEY, name TEXT, role TEXT, city TEXT, url TEXT, is_verified INTEGER DEFAULT 0);
       CREATE TABLE agent_knowledge (
         agent_id TEXT PRIMARY KEY,
         address TEXT, website TEXT, phone TEXT, email TEXT,
@@ -19662,7 +19681,7 @@ const _orchPr20260614_2Promise = (async () => {
   const pvdb = new sqlite(":memory:");
   pvdb.exec(`
     CREATE TABLE agents (
-      id TEXT PRIMARY KEY, name TEXT, url TEXT, city TEXT, role TEXT
+      id TEXT PRIMARY KEY, name TEXT, url TEXT, city TEXT, role TEXT, is_verified INTEGER DEFAULT 0
     );
     CREATE TABLE agent_knowledge (
       agent_id TEXT PRIMARY KEY,
@@ -21895,6 +21914,7 @@ console.log("\n── orch-pr-14: MCP discovery product_id surfacing ──");
   try { await _adminClaimFunnelPromise; } catch { /* errors already pushed to failures */ }
   try { await _selgerHtmlOpenTrackingPromise; } catch { /* errors already pushed to failures */ }
   try { await _recentlyEnrichedSpotcheckPromise; } catch { /* errors already pushed to failures */ }
+  try { await _emailOwnershipProvenancePromise; } catch { /* errors already pushed to failures */ }
   // relax-envelope tests are synchronous (pure validateEnvelope() unit test) — no promise needed
   // PR-109 tests are synchronous (IIFE) — no promise needed
   // Drop pre-existing intg failures (unmasked by awaiting) — they predate M2
@@ -28185,6 +28205,41 @@ const _recentlyEnrichedSpotcheckPromise: Promise<void> = new Promise<void>(r => 
     failures.push("opplevelser-admin-providers-hjemmeside: unexpected error: " + String(err?.message || err));
   } finally {
     _recentlyEnrichedSpotcheckResolve();
+  }
+})();
+
+// ═══════════════════════════════════════════════════════════════════════
+// dev-request 2026-07-15-gate-integrity-unverified-agent-bypass (slice 2):
+// free-mail email ownership-provenance guard in runVerifierBatch (Guard #3,
+// alongside websiteOwnershipUnverified / inferenceOnlyFields / domain-
+// coherence) + the two new buildRunEnvelope claims. Swaps the shared
+// getDb() singleton (own dedicated test file, in-memory prod-schema DB) —
+// mirrors the recently-enriched-spotcheck block immediately above, so it
+// must run strictly after it; _recentlyEnrichedSpotcheckPromise is the
+// current tail of that serial chain.
+let _emailOwnershipProvenanceResolve: () => void = () => {};
+const _emailOwnershipProvenancePromise: Promise<void> = new Promise<void>(r => {
+  _emailOwnershipProvenanceResolve = r;
+});
+
+(async () => {
+  await Promise.allSettled([_recentlyEnrichedSpotcheckPromise]);
+  await new Promise(r => setImmediate(r));
+
+  console.log("\n── dev-request 2026-07-15 slice 2: email-ownership-provenance guard ──");
+  try {
+    const { runLokalAgentVerifierEmailOwnershipProvenanceTests } = require("../src/agents/lokal-agent-verifier-email-ownership-provenance.test") as
+      typeof import("../src/agents/lokal-agent-verifier-email-ownership-provenance.test");
+    const eop = await runLokalAgentVerifierEmailOwnershipProvenanceTests({ log: false });
+    passed += eop.passed;
+    failed += eop.failed;
+    for (const f of eop.failures) failures.push("email-ownership-provenance: " + f);
+    console.log(`  email-ownership-provenance: ${eop.passed} passed, ${eop.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("email-ownership-provenance: unexpected error: " + String(err?.message || err));
+  } finally {
+    _emailOwnershipProvenanceResolve();
   }
 })();
 
