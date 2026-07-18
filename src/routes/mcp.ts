@@ -875,7 +875,7 @@ function registerTools(
     "lokal_cart_submit",
     {
       title: "Submit cart and place pickup orders",
-      description: "Submit the cart to create pickup orders — one order per producer. Re-checks availability of every item at submit time; if any item is no longer in_stock, submit is rejected with a clear per-item message. No payment is charged. Sellers are not notified (Phase 1 internal-only). Returns a list of order IDs per producer. Use lokal_order_status to check order status.",
+      description: "Submit the cart to create pickup orders — one order per producer. Re-checks availability of every item at submit time; if any item is no longer in_stock, submit is rejected with a clear per-item message. No payment is charged. Sellers who have opted in to order notifications are notified by email and can confirm/decline the order; other sellers are not contacted. Returns a list of order IDs per producer. Use lokal_order_status to check order status.",
       inputSchema: {
         cart_id:   z.string().describe("Cart ID to submit"),
         buyer_ref: z.string().describe("Buyer capability token"),
@@ -903,7 +903,7 @@ function registerTools(
     "lokal_order_status",
     {
       title: "Get order status",
-      description: "Fetch the status and items of a pickup order created by lokal_cart_submit. Requires the order_id returned by submit and the buyer_ref token. Status: pending → confirmed → ready → completed (or declined/cancelled).",
+      description: "Fetch the status, items and status timeline of a pickup order created by lokal_cart_submit. Requires the order_id returned by submit and the buyer_ref token. Status: pending → confirmed → ready → completed (or declined/cancelled; cancel_reason='no_show' means the buyer did not pick up). The timeline array lists every status transition with timestamps.",
       inputSchema: {
         order_id:  z.string().describe("Order ID from lokal_cart_submit"),
         buyer_ref: z.string().describe("Buyer capability token (same as used for the cart)"),

@@ -1,4 +1,5 @@
 import { getDb } from "../database/init";
+import { getTrustEventCounts } from "./trust-event-service";
 
 // ─── Trust Score Service ──────────────────────────────────────
 //
@@ -25,6 +26,40 @@ import { getDb } from "../database/init";
 // Phase 3 (scale): + interaction success + community
 
 // ─── Signal weights ──────────────────────────────────────────
+//
+// Transaction trust-ledger (dev-request 2026-07-13-pilot-ordre-loop):
+// the interaction signal now also reads trust_events counts. Only COMPLETED
+// transactions (order_completed / booking_attended) score.
+//
+// Deliberately NOT scored against the producer:
+//   - order_declined: declining an order a producer can't fulfil is honest
+//     behaviour, not a trust breach.
+//   - order_no_show / booking_no_show: a no-show is the BUYER's failure,
+//     and carts are anonymous — scoring it against the producer would let a
+//     hostile buyer damage a producer's score by simply not showing up, and
+//     would punish honest «Ikke hentet» bookkeeping. The ledger row is still
+//     written (correct bookkeeping, ready the day buyer identity exists);
+//     it just carries no score weight against the producer. Reversing this
+//     is a Daniel-level product decision.
+//
+// Formula (documented here because the WEIGHTS themselves are UNCHANGED —
+// existing scores must not jump while the ledger is empty):
+//
+//   base       = discovery*0.3 + contact*0.4 + chosen*0.3   (pre-existing)
+//   completed  = count(order_completed) + count(booking_attended)
+//   IF completed == 0 → interaction = base          (0 scored events =
+//                                                    today's value, exactly)
+//   ELSE:
+//     txVolume    = min(1, log10(completed+1) / 1)  — 9 completed pickups
+//                                                     max the volume term
+//     interaction = max(base, base*0.6 + txVolume*0.4)
+//
+// The max(base, …) floor guarantees monotonicity: participating in the
+// order loop can NEVER drop a producer below their pre-ledger value (an
+// established producer with base≈0.998 must not fall to ≈0.72 after their
+// first completed pickup — the raw blend alone would do exactly that).
+// Completed pickups can only lift, and become the strongest interaction
+// evidence on the platform once volume outgrows the base.
 
 const WEIGHTS = {
   verification: 0.30,
@@ -284,11 +319,9 @@ class TrustScoreService {
       "SELECT times_discovered, times_contacted, times_chosen FROM agent_metrics WHERE agent_id = ?"
     ).get(agentId) as any;
 
-    if (!metrics) return 0;
-
-    const discovered = metrics.times_discovered || 0;
-    const contacted = metrics.times_contacted || 0;
-    const chosen = metrics.times_chosen || 0;
+    const discovered = metrics?.times_discovered || 0;
+    const contacted = metrics?.times_contacted || 0;
+    const chosen = metrics?.times_chosen || 0;
 
     // Composite: being discovered is basic, contacted is better, chosen is best
     // Use logarithmic scale so early interactions matter more (incentivizes new sellers)
@@ -296,7 +329,22 @@ class TrustScoreService {
     const contactScore   = Math.min(1, Math.log10(contacted + 1) / 1.5);   // ~30 contacts = 1.0
     const chosenScore    = Math.min(1, Math.log10(chosen + 1) / 1);        // 10 chosen = 1.0
 
-    return discoveryScore * 0.3 + contactScore * 0.4 + chosenScore * 0.3;
+    const base = discoveryScore * 0.3 + contactScore * 0.4 + chosenScore * 0.3;
+
+    // Transaction trust-ledger blend — see the formula comment at WEIGHTS.
+    // getTrustEventCounts is defensive (missing table → all zeros). Only
+    // completed transactions score; no-shows/declines are ledger-only (see
+    // the attribution note at WEIGHTS). With zero completed events this
+    // returns exactly `base`, i.e. the pre-ledger value — existing scores
+    // don't move while the ledger is empty.
+    const events = getTrustEventCounts(agentId);
+    if (events.completed === 0) return base;
+
+    const txVolume = Math.min(1, Math.log10(events.completed + 1) / 1); // 9 completed = 1.0
+
+    // Monotonicity floor: participation can never lower the signal below
+    // the producer's pre-ledger value.
+    return Math.max(base, base * 0.6 + txVolume * 0.4);
   }
 
   private communitySignal(agentId: string): number {
@@ -366,12 +414,15 @@ class TrustScoreService {
       "SELECT times_discovered, times_contacted, times_chosen FROM agent_metrics WHERE agent_id = ?"
     ).get(agentId) as any;
 
-    if (!metrics) return "Ingen interaksjoner ennå";
-
     const parts: string[] = [];
-    if (metrics.times_discovered) parts.push(`${metrics.times_discovered} oppdaget`);
-    if (metrics.times_contacted) parts.push(`${metrics.times_contacted} kontaktet`);
-    if (metrics.times_chosen) parts.push(`${metrics.times_chosen} valgt`);
+    if (metrics?.times_discovered) parts.push(`${metrics.times_discovered} oppdaget`);
+    if (metrics?.times_contacted) parts.push(`${metrics.times_contacted} kontaktet`);
+    if (metrics?.times_chosen) parts.push(`${metrics.times_chosen} valgt`);
+
+    // Transaction trust-ledger (pilot-ordre-loop): surface real outcomes too.
+    const events = getTrustEventCounts(agentId);
+    if (events.completed) parts.push(`${events.completed} fullført${events.completed === 1 ? "" : "e"} hentinger`);
+    if (events.noShows) parts.push(`${events.noShows} ikke hentet`);
 
     return parts.length > 0 ? parts.join(", ") : "Ingen interaksjoner ennå";
   }

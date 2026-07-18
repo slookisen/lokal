@@ -15,6 +15,8 @@
 
 import { randomUUID, randomBytes } from "crypto";
 import { getDb } from "../database/init";
+import { recordTrustEvent } from "./trust-event-service";
+import { sendOrderNotificationForOrder, OrderNotificationInput } from "./order-notify-service";
 
 // ─── Test-DB override (module-local, race-proof) ─────────────────────────────
 // In production _cartTestDb is always null → getDb() is used as normal.
@@ -430,6 +432,7 @@ export function submitCart(cartId: string): SubmitResult {
   const buyer_ref = (db.prepare("SELECT buyer_ref FROM carts WHERE id = ?").get(cartId) as any).buyer_ref;
 
   const orderSummaries: OrderSummary[] = [];
+  const pendingNotifications: OrderNotificationInput[] = [];
 
   // Transaction: set cart submitted + create one order per producer
   const tx = db.transaction(() => {
@@ -477,6 +480,17 @@ export function submitCart(cartId: string): SubmitResult {
         total_nok,
         status: "pending",
       });
+
+      pendingNotifications.push({
+        order_id,
+        agent_id,
+        producer_name,
+        buyer_ref,
+        confirm_token,
+        pickup_time: null,
+        total_nok,
+        items: agentItems.map((i) => ({ name: i.product_name, qty: i.qty, unit: i.unit })),
+      });
     }
   });
 
@@ -487,7 +501,18 @@ export function submitCart(cartId: string): SubmitResult {
     return { success: false, status: 500, error: `Submit failed: ${msg}` };
   }
 
-  // No charge, no seller email/SMS — Phase 1 internal only.
+  // ─── Seller notification (dev-request 2026-07-13-pilot-ordre-loop) ──────
+  // Fire-and-forget per created order, AFTER the transaction committed. The
+  // send path is hard-gated per producer (opt-in + verified contact +
+  // suppression — see order-notify-service.ts); a skipped or failed send
+  // must NEVER fail the submit itself, so nothing here is awaited and every
+  // rejection is swallowed after logging. No charge — pickup only.
+  for (const notif of pendingNotifications) {
+    void sendOrderNotificationForOrder(notif).catch((err) => {
+      console.error(`[order-notify] unexpected rejection order=${notif.order_id}:`, err);
+    });
+  }
+
   return { success: true, orders: orderSummaries };
 }
 
@@ -501,6 +526,7 @@ export type OrderView =
       agent_id: string;
       producer_name: string;
       status: string;
+      cancel_reason: string | null;
       fulfilment: string;
       pickup_time: string | null;
       total_nok: number | null;
@@ -512,6 +538,9 @@ export type OrderView =
         unit_price_snapshot: number | null;
         line_total: number | null;
       }>;
+      // Status timeline (order_events) — pilot-ordre-loop. Empty until the
+      // first transition happens.
+      timeline: OrderEvent[];
     }
   | { success: false; status: number; error: string };
 
@@ -519,7 +548,7 @@ export function getOrder(orderId: string, buyerRef: string): OrderView {
   const db = _cartTestDb ?? getDb();
 
   const order = db.prepare(`
-    SELECT o.id, o.cart_id, o.agent_id, o.buyer_ref, o.status, o.fulfilment,
+    SELECT o.id, o.cart_id, o.agent_id, o.buyer_ref, o.status, o.cancel_reason, o.fulfilment,
            o.pickup_time, o.total_nok, a.name AS producer_name
     FROM orders o
     INNER JOIN agents a ON a.id = o.agent_id
@@ -531,6 +560,7 @@ export function getOrder(orderId: string, buyerRef: string): OrderView {
         agent_id: string;
         buyer_ref: string;
         status: string;
+        cancel_reason: string | null;
         fulfilment: string;
         pickup_time: string | null;
         total_nok: number | null;
@@ -564,19 +594,25 @@ export function getOrder(orderId: string, buyerRef: string): OrderView {
     agent_id: order.agent_id,
     producer_name: order.producer_name,
     status: order.status,
+    cancel_reason: order.cancel_reason,
     fulfilment: order.fulfilment,
     pickup_time: order.pickup_time,
     total_nok: order.total_nok,
     items: orderItems,
+    timeline: getOrderTimeline(order.id),
   };
 }
 
-// ─── Admin order lifecycle transitions ───────────────────────────────────────
+// ─── Order lifecycle transitions ─────────────────────────────────────────────
+// dev-request 2026-07-13-pilot-ordre-loop: every legal transition appends an
+// order_events row (the buyer/seller-visible timeline) and terminal outcomes
+// write trust-ledger events (trust-event-service). `ready → cancelled` is the
+// producer "no-show" path and stores cancel_reason='no_show'.
 
 const VALID_TRANSITIONS: Record<string, string[]> = {
   pending:   ["confirmed", "declined"],
   confirmed: ["ready", "cancelled"],
-  ready:     ["completed"],
+  ready:     ["completed", "cancelled"],
   declined:  [],
   completed: [],
   cancelled: [],
@@ -586,11 +622,15 @@ export type TransitionResult =
   | { success: true; order_id: string; status: string }
   | { success: false; status: number; error: string };
 
-export function transitionOrder(orderId: string, toStatus: string): TransitionResult {
+export function transitionOrder(
+  orderId: string,
+  toStatus: string,
+  opts?: { actor?: string; cancelReason?: string | null }
+): TransitionResult {
   const db = _cartTestDb ?? getDb();
 
-  const order = db.prepare("SELECT id, status FROM orders WHERE id = ?").get(orderId) as
-    | { id: string; status: string }
+  const order = db.prepare("SELECT id, status, agent_id FROM orders WHERE id = ?").get(orderId) as
+    | { id: string; status: string; agent_id: string }
     | undefined;
 
   if (!order) return { success: false, status: 404, error: "Order not found" };
@@ -604,9 +644,154 @@ export function transitionOrder(orderId: string, toStatus: string): TransitionRe
     };
   }
 
-  db.prepare(
-    "UPDATE orders SET status = ?, updated_at = datetime('now') WHERE id = ?"
-  ).run(toStatus, orderId);
+  const cancelReason = toStatus === "cancelled" ? (opts?.cancelReason ?? null) : null;
+  const actor = opts?.actor ?? null;
+
+  // No-show bookkeeping is only meaningful for an order that was actually
+  // ready for pickup: cancel_reason='no_show' (and its trust-ledger event)
+  // requires from-status 'ready'. Enforced centrally here so BOTH callers
+  // (producer PRG page and the admin no-show route) share the same guard.
+  // A plain confirmed → cancelled (no reason) remains legal.
+  if (cancelReason === "no_show" && order.status !== "ready") {
+    return {
+      success: false,
+      status: 409,
+      error: `Cannot record a no-show for an order in '${order.status}' — only orders that were ready for pickup can be no-shows`,
+    };
+  }
+
+  // Concurrency guard: the UPDATE re-asserts the from-status we validated
+  // against (id AND status), so two racing transitions (multi-instance, or
+  // producer + admin at once) can't both apply — the loser's UPDATE matches
+  // 0 rows and its transaction rolls back with a 409.
+  let conflict = false;
+  const tx = db.transaction(() => {
+    const upd = db.prepare(
+      "UPDATE orders SET status = ?, cancel_reason = COALESCE(?, cancel_reason), updated_at = datetime('now') WHERE id = ? AND status = ?"
+    ).run(toStatus, cancelReason, orderId, order.status);
+    if (upd.changes !== 1) {
+      conflict = true;
+      throw new Error("concurrent status change");
+    }
+    db.prepare(`
+      INSERT INTO order_events (id, order_id, from_status, to_status, actor, created_at)
+      VALUES (?, ?, ?, ?, ?, datetime('now'))
+    `).run(randomUUID(), orderId, order.status, toStatus, actor);
+  });
+
+  try {
+    tx();
+  } catch (err) {
+    if (conflict) {
+      return {
+        success: false,
+        status: 409,
+        error: "Order status changed concurrently — reload and retry",
+      };
+    }
+    const msg = err instanceof Error ? err.message : String(err);
+    return { success: false, status: 500, error: `Transition failed: ${msg}` };
+  }
+
+  // Trust-ledger: terminal outcomes only. recordTrustEvent never throws.
+  if (toStatus === "completed") {
+    recordTrustEvent({ agentId: order.agent_id, eventType: "order_completed", ref: orderId });
+  } else if (toStatus === "declined") {
+    recordTrustEvent({ agentId: order.agent_id, eventType: "order_declined", ref: orderId });
+  } else if (toStatus === "cancelled" && cancelReason === "no_show") {
+    recordTrustEvent({ agentId: order.agent_id, eventType: "order_no_show", ref: orderId });
+  }
 
   return { success: true, order_id: orderId, status: toStatus };
+}
+
+// ─── Order timeline (order_events) ───────────────────────────────────────────
+
+export interface OrderEvent {
+  from_status: string | null;
+  to_status: string;
+  actor: string | null;
+  created_at: string;
+}
+
+export function getOrderTimeline(orderId: string): OrderEvent[] {
+  const db = _cartTestDb ?? getDb();
+  try {
+    return db.prepare(`
+      SELECT from_status, to_status, actor, created_at
+      FROM order_events
+      WHERE order_id = ?
+      ORDER BY created_at, rowid
+    `).all(orderId) as OrderEvent[];
+  } catch {
+    // Defensive: a DB without the order_events table (minimal test schema)
+    // degrades to an empty timeline instead of breaking order reads.
+    return [];
+  }
+}
+
+// ─── Producer-side order lookup (tokenized confirm link) ─────────────────────
+// The confirm_token is the PRODUCER's capability for this order — it arrives
+// only in the seller-notification email (routes/marketplace-cart.ts renders
+// the /produsent/ordre/:token PRG page on top of this).
+
+export interface ProducerOrderView {
+  order_id: string;
+  agent_id: string;
+  producer_name: string;
+  status: string;
+  cancel_reason: string | null;
+  fulfilment: string;
+  pickup_time: string | null;
+  total_nok: number | null;
+  buyer_ref: string;
+  created_at: string;
+  items: Array<{
+    name_snapshot: string | null;
+    qty: number | null;
+    unit_price_snapshot: number | null;
+    line_total: number | null;
+  }>;
+  timeline: OrderEvent[];
+}
+
+export function getOrderByConfirmToken(token: string): ProducerOrderView | null {
+  if (!token) return null;
+  const db = _cartTestDb ?? getDb();
+
+  const order = db.prepare(`
+    SELECT o.id, o.agent_id, o.status, o.cancel_reason, o.fulfilment, o.pickup_time,
+           o.total_nok, o.buyer_ref, o.created_at, a.name AS producer_name
+    FROM orders o
+    INNER JOIN agents a ON a.id = o.agent_id
+    WHERE o.confirm_token = ?
+  `).get(token) as
+    | {
+        id: string; agent_id: string; status: string; cancel_reason: string | null;
+        fulfilment: string; pickup_time: string | null; total_nok: number | null;
+        buyer_ref: string; created_at: string; producer_name: string;
+      }
+    | undefined;
+
+  if (!order) return null;
+
+  const items = db.prepare(`
+    SELECT name_snapshot, qty, unit_price_snapshot, line_total
+    FROM order_items WHERE order_id = ? ORDER BY rowid
+  `).all(order.id) as ProducerOrderView["items"];
+
+  return {
+    order_id: order.id,
+    agent_id: order.agent_id,
+    producer_name: order.producer_name,
+    status: order.status,
+    cancel_reason: order.cancel_reason,
+    fulfilment: order.fulfilment,
+    pickup_time: order.pickup_time,
+    total_nok: order.total_nok,
+    buyer_ref: order.buyer_ref,
+    created_at: order.created_at,
+    items,
+    timeline: getOrderTimeline(order.id),
+  };
 }

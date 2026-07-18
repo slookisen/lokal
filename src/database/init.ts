@@ -2550,6 +2550,80 @@ function initSchema(db: Database.Database): void {
   `);
   db.exec(`CREATE INDEX IF NOT EXISTS idx_order_items_order_id ON order_items(order_id)`);
 
+  // ─── dev-request 2026-07-13-pilot-ordre-loop: selgervarsling + livssyklus
+  // + trust-ledger for cart-ordre (RFB) ────────────────────────────────────
+  // All additive. Same defensive try/catch ALTER idiom as the brreg slice
+  // below; brand-new tables use plain CREATE TABLE IF NOT EXISTS (the safe
+  // migration for a never-existed-before table — see contact_clicks note).
+  //
+  //   agents.order_notifications_opt_in : send-gate. 0 (default) = NEVER
+  //       notify this producer about orders. Only an explicit admin action
+  //       (POST /admin/orders/notification-optin) flips it to 1.
+  //   agents.order_notification_email   : admin-set override recipient. When
+  //       set, it wins over contact_email AND counts as "verified contact"
+  //       (an admin explicitly chose it — this is how Daniel points a test
+  //       agent at his own inbox, mirroring the booking test-provider
+  //       pattern). When NULL, contact_email is used and the agent must be
+  //       verification_status='verified' in agent_knowledge.
+  //   orders.cancel_reason              : why a cancelled order was cancelled
+  //       ('no_show' is the only writer today — producer "Ikke hentet").
+  for (const stmt of [
+    `ALTER TABLE agents ADD COLUMN order_notifications_opt_in INTEGER NOT NULL DEFAULT 0`,
+    `ALTER TABLE agents ADD COLUMN order_notification_email TEXT`,
+    `ALTER TABLE orders ADD COLUMN cancel_reason TEXT`,
+  ]) {
+    try { db.exec(stmt); } catch { /* already exists — expected */ }
+  }
+
+  // confirm_token is now a lookup key (the /produsent/ordre/:token page), so
+  // index it. UNIQUE preferred (it's a capability token, 16 random bytes) —
+  // but this must NEVER be able to break boot on an existing prod DB, so a
+  // hypothetical pre-existing duplicate falls back to a non-unique index.
+  // Multiple NULLs are fine in a SQLite UNIQUE index (NULLs are distinct).
+  try {
+    db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_orders_confirm_token ON orders(confirm_token)`);
+  } catch {
+    try {
+      db.exec(`CREATE INDEX IF NOT EXISTS idx_orders_confirm_token ON orders(confirm_token)`);
+    } catch { /* index creation is best-effort — lookups still work unindexed */ }
+  }
+
+  // order_events: append-only status-transition timeline per order. Written
+  // by cart-service.transitionOrder() on every legal transition; exposed to
+  // the buyer via getOrder() (lokal_order_status / GET /api/marketplace/
+  // orders/:id) and to the producer via the /produsent/ordre/:token page.
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS order_events (
+      id           TEXT PRIMARY KEY,
+      order_id     TEXT NOT NULL,
+      from_status  TEXT,
+      to_status    TEXT NOT NULL,
+      actor        TEXT,
+      created_at   TEXT NOT NULL DEFAULT (datetime('now'))
+    )
+  `);
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_order_events_order_id ON order_events(order_id)`);
+
+  // trust_events: the transaction trust-ledger. One row per terminal
+  // transaction outcome (order completed / no-show / declined today;
+  // booking_attended / booking_no_show reserved for the booking-resolve
+  // wiring later — recordTrustEvent() in services/trust-event-service.ts is
+  // the single write path). Read by trust-score-service's interaction
+  // signal. No FK on agent_id (same convention as contact_clicks /
+  // analytics_agent_views: history survives agent deletion).
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS trust_events (
+      id          TEXT PRIMARY KEY,
+      agent_id    TEXT NOT NULL,
+      event_type  TEXT NOT NULL CHECK(event_type IN (
+                    'order_completed','order_no_show','order_declined',
+                    'booking_attended','booking_no_show')),
+      ref         TEXT,
+      created_at  TEXT NOT NULL DEFAULT (datetime('now'))
+    )
+  `);
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_trust_events_agent_id ON trust_events(agent_id)`);
+
   // ─── Slice 1 of dev-request 2026-06-30-brreg-verification-gate ─────────
   // Schema + lookup-function ONLY. This slice does NOT wire org-nr
   // verification into any registration/enrichment endpoint — that's
