@@ -8,6 +8,9 @@ import { computeLoopHealth } from "../src/services/loop-health";
 import { computeWakeList, fireTextFor, resolveActiveWindowHour, resolveTickIntervalMin, resolveWindowMin } from "../src/services/loop-dispatch";
 import { normalizeTimestamp, normalizeEnvelopeTimes } from "../src/services/envelope-normalize";
 import { validateEnvelope } from "../src/routes/admin-runs";
+import { marketplaceRegistry } from "../src/services/marketplace-registry";
+import { getDentalAgentCard } from "../src/services/dental-agent-card";
+import { getExperiencesAgentCard } from "../src/services/experiences-agent-card";
 import conversationUiRouter, {
   conversationStateLabel,
   searchGroupLabel,
@@ -16378,7 +16381,7 @@ console.log("\n── orch-pr-19: opplevagent.no host-gate (experiences) ──"
   const card = getExperiencesAgentCard() as any;
 
   assertEq(card.name, "Opplevagent", "orch19-02a: name is 'Opplevagent'");
-  assertEq(card.protocolVersion, "0.3.0", "orch19-02b: protocolVersion is '0.3.0'");
+  assertEq(card.protocolVersion, "1.0.0", "orch19-02b: protocolVersion is '1.0.0' (bumped by dev-request 2026-07-13-a2a-card-v1-signing slice 1)");
   assertTrue(typeof card.url === "string" && card.url.length > 0, "orch19-02c: url is a string");
   assertTrue(card.url.endsWith("/a2a"), "orch19-02d: url ends with '/a2a'");
   assertTrue(!card.url.replace(/\/a2a$/, "").endsWith("/"), "orch19-02e: base url has NO double trailing slash");
@@ -29949,5 +29952,70 @@ console.log("\n── item2a: dead-extraction parking (dental) ──");
   } finally {
     if (prevPath === undefined) delete process.env.DENTAL_DB_PATH; else process.env.DENTAL_DB_PATH = prevPath;
     dbFacI2a.__resetDbFactoryForTesting();
+  }
+})();
+
+// ── a2a-card-v1-signing slice 1: A2A v1.0 fields dual-published on all three
+// agent cards, additive-only (legacy authentication/interfaces untouched) ──
+(() => {
+  // getRegistryCard() -> getStats() reads the RFB `agents`/`listings` tables via
+  // getDb(). Several earlier blocks in this file register async continuations
+  // (runSerial/await) against that same module-level singleton that haven't
+  // necessarily settled by the time this late, purely-synchronous IIFE runs —
+  // swapping it here without restoring would leak our isolated test DB into
+  // whatever resumes after us. Save the current db, swap in a clean isolated
+  // one just for this synchronous block, then put the original back before
+  // yielding control, so nothing downstream (sync or async) ever observes it.
+  const { getDb: getRfbDbForA2aV1Test, __setDbForTesting: setRfbDbForA2aV1Test } =
+    require("../src/database/init") as typeof import("../src/database/init");
+  let priorDb: ReturnType<typeof getRfbDbForA2aV1Test> | undefined;
+  try {
+    priorDb = getRfbDbForA2aV1Test();
+  } catch {
+    priorDb = undefined; // nothing usable was there before us — nothing to restore
+  }
+  try {
+    buildTestDb();
+    const rfbCard: any = marketplaceRegistry.getRegistryCard("https://rettfrabonden.com");
+    assertEq(rfbCard.protocolVersion, "1.0.0", "a2a-v1: rfb protocolVersion bumped to 1.0.0");
+    assertEq(rfbCard.preferredTransport, "JSONRPC", "a2a-v1: rfb preferredTransport is JSONRPC");
+    assertTrue(Array.isArray(rfbCard.additionalInterfaces) && rfbCard.additionalInterfaces.length === 1, "a2a-v1: rfb additionalInterfaces has one entry");
+    assertEq(rfbCard.additionalInterfaces[0].url, "https://rettfrabonden.com/api/marketplace", "a2a-v1: rfb additionalInterfaces REST url");
+    assertEq(rfbCard.additionalInterfaces[0].transport, "HTTP+JSON", "a2a-v1: rfb additionalInterfaces transport");
+    assertEq(rfbCard.securitySchemes.apiKey.type, "apiKey", "a2a-v1: rfb securitySchemes.apiKey.type");
+    assertEq(rfbCard.securitySchemes.apiKey.in, "header", "a2a-v1: rfb securitySchemes.apiKey.in");
+    assertEq(rfbCard.securitySchemes.apiKey.name, "X-API-Key", "a2a-v1: rfb securitySchemes.apiKey.name");
+    assertTrue(Array.isArray(rfbCard.security) && rfbCard.security.length === 0, "a2a-v1: rfb security is an empty array (open reads, no default requirement)");
+    // Legacy 0.3.0 fields must survive untouched (dual-publish, no regression for old consumers).
+    assertEq(rfbCard.authentication.schemes[0], "apiKey", "a2a-v1: rfb legacy authentication.schemes untouched");
+    assertEq(rfbCard.interfaces.length, 2, "a2a-v1: rfb legacy interfaces[] untouched (still 2 entries)");
+    assertEq(rfbCard.interfaces[0].type, "json-rpc", "a2a-v1: rfb legacy interfaces[0].type untouched");
+
+    const dentalCard: any = getDentalAgentCard();
+    assertEq(dentalCard.protocolVersion, "1.0.0", "a2a-v1: dental protocolVersion bumped to 1.0.0");
+    assertEq(dentalCard.preferredTransport, "JSONRPC", "a2a-v1: dental preferredTransport is JSONRPC");
+    assertEq(dentalCard.additionalInterfaces[0].url, "https://finn-tannlege.com/api/tannlege", "a2a-v1: dental additionalInterfaces REST url");
+    assertEq(dentalCard.additionalInterfaces[0].transport, "HTTP+JSON", "a2a-v1: dental additionalInterfaces transport");
+    assertEq(dentalCard.authentication.schemes[0], "none", "a2a-v1: dental legacy authentication untouched (open, no scheme)");
+    assertEq(dentalCard.securitySchemes, undefined, "a2a-v1: dental has no securitySchemes (genuinely open, nothing to declare)");
+
+    const expCard: any = getExperiencesAgentCard();
+    assertEq(expCard.protocolVersion, "1.0.0", "a2a-v1: experiences protocolVersion bumped to 1.0.0");
+    assertEq(expCard.preferredTransport, "JSONRPC", "a2a-v1: experiences preferredTransport is JSONRPC");
+    assertEq(expCard.additionalInterfaces[0].url, "https://opplevagent.no/api/opplevelser", "a2a-v1: experiences additionalInterfaces REST url");
+    assertEq(expCard.additionalInterfaces[0].transport, "HTTP+JSON", "a2a-v1: experiences additionalInterfaces transport");
+    assertEq(expCard.authentication.schemes[0], "none", "a2a-v1: experiences legacy authentication untouched (open, no scheme)");
+    assertEq(expCard.securitySchemes, undefined, "a2a-v1: experiences has no securitySchemes (genuinely open, nothing to declare)");
+
+    // No cross-vertical leakage: each card's additionalInterfaces points at its own host only.
+    assertTrue(!JSON.stringify(dentalCard.additionalInterfaces).includes("opplevagent.no") && !JSON.stringify(dentalCard.additionalInterfaces).includes("rettfrabonden.com"), "a2a-v1: dental additionalInterfaces has no cross-vertical leakage");
+    assertTrue(!JSON.stringify(expCard.additionalInterfaces).includes("finn-tannlege.com") && !JSON.stringify(expCard.additionalInterfaces).includes("rettfrabonden.com"), "a2a-v1: experiences additionalInterfaces has no cross-vertical leakage");
+
+    console.log("  a2a-card-v1-signing slice 1 (v1.0 dual-publish fields): OK (23 assertions)");
+  } catch (err) {
+    failed++;
+    failures.push(`a2a-card-v1-signing slice 1: unexpected error: ${err instanceof Error ? (err.stack || err.message) : String(err)}`);
+  } finally {
+    if (priorDb !== undefined) setRfbDbForA2aV1Test(priorDb);
   }
 })();

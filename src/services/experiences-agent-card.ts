@@ -37,7 +37,14 @@ export function getExperiencesAgentCard(): object {
       "discover tours, courses and things to do filtered by county, municipality, category, " +
       "weather, season, group size, age and price.",
     url: `${url}/a2a`,
-    protocolVersion: "0.3.0",
+    // A2A v1.0 (Linux Foundation, released April 2026) top-level protocol fields,
+    // dual-published alongside legacy `authentication` below (additive-only —
+    // dev-request 2026-07-13-a2a-card-v1-signing slice 1).
+    protocolVersion: "1.0.0",
+    preferredTransport: "JSONRPC",
+    additionalInterfaces: [
+      { url: `${url}/api/opplevelser`, transport: "HTTP+JSON" },
+    ],
     provider: {
       organization: "Opplevagent",
       url,

@@ -79,11 +79,29 @@ router.get("/a2a", (_req: Request, res: Response) => {
         description: "Open agent-to-agent food marketplace operator. Norges første A2A-markedsplass for lokal mat.",
       },
       version: "1.0.0",
+      // A2A v1.0 fields, dual-published alongside legacy `authentication`/`interfaces`
+      // below (additive-only — dev-request 2026-07-13-a2a-card-v1-signing slice 1).
+      // Kept in parity with marketplaceRegistry.getRegistryCard()'s v1.0 fields per
+      // that dev-request's acceptance criterion 4 (this card vs. the .well-known card).
+      protocolVersion: "1.0.0",
+      preferredTransport: "JSONRPC",
+      additionalInterfaces: [
+        { url: `${process.env.BASE_URL || "https://rettfrabonden.com"}/api/marketplace`, transport: "HTTP+JSON" },
+      ],
       documentationUrl: `${process.env.BASE_URL || "https://rettfrabonden.com"}/docs`,
       defaultInputModes: ["text/plain", "application/json"],
       defaultOutputModes: ["application/json"],
       capabilities: { streaming: false, pushNotifications: false, stateTransitionHistory: true },
       authentication: { schemes: ["apiKey"], credentials: null },
+      securitySchemes: {
+        apiKey: {
+          type: "apiKey",
+          in: "header",
+          name: "X-API-Key",
+          description: "API key received upon registration. Required for write operations. Read/search operations are open.",
+        },
+      },
+      security: [],
       interfaces: [
         { type: "json-rpc", url: `${process.env.BASE_URL || "https://rettfrabonden.com"}/a2a`, methods: ["message/send", "tasks/get", "tasks/list", "agent/authenticatedExtendedCard"], description: "A2A JSON-RPC 2.0 endpoint" },
         { type: "rest", url: `${process.env.BASE_URL || "https://rettfrabonden.com"}/api/marketplace`, description: "REST API for search, discovery, registration" },

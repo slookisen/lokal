@@ -661,7 +661,16 @@ class MarketplaceRegistry {
           "Norges f\u00f8rste A2A-markedsplass for lokal mat.",
       },
       version: "1.0.0",
-      protocolVersion: "0.3.0",
+      // A2A v1.0 (Linux Foundation, released April 2026) top-level protocol fields.
+      // Dual-published alongside the legacy `authentication`/`interfaces` fields below —
+      // registries/clients on the old 0.3.0 shape keep working unchanged (dev-request
+      // 2026-07-13-a2a-card-v1-signing slice 1, additive-only by design: nothing legacy
+      // removed or altered, so this cannot regress an already-working consumer).
+      protocolVersion: "1.0.0",
+      preferredTransport: "JSONRPC",
+      additionalInterfaces: [
+        { url: `${baseUrl}/api/marketplace`, transport: "HTTP+JSON" },
+      ],
       documentationUrl: `${baseUrl}/docs`,
       defaultInputModes: ["text/plain", "application/json"],
       defaultOutputModes: ["application/json"],
@@ -675,13 +684,13 @@ class MarketplaceRegistry {
         stateTransitionHistory: true,
       },
 
-      // ─── Authentication ────────────────────────────────────
+      // ─── Authentication (legacy 0.3.0 field, kept for back-compat) ─────
       authentication: {
         schemes: ["apiKey"],
         credentials: null, // Open for reads, key for writes
       },
 
-      // ─── A2A interfaces ────────────────────────────────────
+      // ─── A2A interfaces (legacy 0.3.0 field, kept for back-compat) ──────
       interfaces: [
         {
           type: "json-rpc",
@@ -798,6 +807,10 @@ class MarketplaceRegistry {
             "API-n\u00f8kkel mottatt ved registrering. Kreves for skriveoperasjoner.",
         },
       },
+      // A2A v1.0 `security` requirement list (dev-request 2026-07-13-a2a-card-v1-signing
+      // slice 1) -- empty means no default requirement, matching `authentication.credentials:
+      // null` above: reads are open, `securitySchemes.apiKey` only applies to writes.
+      security: [],
 
       // ─── Distribution channels (Phase 5.11 — Smithery added 2026-05-16;
       // Glama / mcp.so / Official MCP Registry added 2026-05-28 by visibility-agent) ─
