@@ -1255,6 +1255,87 @@ router.get("/api/agents/:id/owner-stats", (req: Request, res: Response) => {
 });
 
 // ─────────────────────────────────────────────────────────────────
+// GET /api/agents/:id/orders — "Bestillinger" tab data (session-gated)
+// ─────────────────────────────────────────────────────────────────
+// dev-request 2026-07-13-produsent-dashboard-verdibevis, criterion 2
+// ("order inbox"). The producer-FACING sibling of the ADMIN-only
+// GET /admin/orders/inbox in src/routes/admin-orders.ts (that route's own
+// comment already flagged "the producer dashboard can consume this later"
+// — this is that later). Unlike the admin inbox, this is NOT filtered to
+// open statuses only — a producer should see their full order history, not
+// just active orders — and it is gated by the owner's own session instead
+// of X-Admin-Key.
+//
+// Auth: identical convention to GET /api/agents/:id/owner-stats immediately
+// above (verifyOwnerSession — rfb_owner_session cookie or Bearer token,
+// backed by the magic_links table). Same error shape, same status codes.
+router.get("/api/agents/:id/orders", (req: Request, res: Response) => {
+  try {
+    const { id } = req.params;
+    const session = verifyOwnerSession(req);
+
+    if (!session.valid) {
+      return res.status(401).json({
+        success: false,
+        error: "session_invalid",
+        message: "Din sesjon er utløpt. Logg inn på nytt.",
+      });
+    }
+
+    if (session.agentId !== id) {
+      return res.status(403).json({
+        success: false,
+        error: "forbidden",
+        message: "Du har ikke tilgang til denne agenten.",
+      });
+    }
+
+    const db = getDb();
+    const agent = db.prepare("SELECT id FROM agents WHERE id = ?").get(id) as any;
+    if (!agent) {
+      return res.status(404).json({
+        success: false,
+        error: "agent_not_found",
+        message: "Agenten ble ikke funnet.",
+      });
+    }
+
+    // All statuses (pending/confirmed/declined/ready/completed/cancelled) —
+    // deliberately NOT filtered to open-only like the admin inbox, since
+    // this is the producer's own order history. LIMIT 100: this is a
+    // dashboard tab, not an export.
+    const rows = db.prepare(`
+      SELECT o.id AS order_id, o.status, o.pickup_time, o.total_nok,
+             o.created_at, o.updated_at, o.cancel_reason,
+             (SELECT COUNT(*) FROM order_items oi WHERE oi.order_id = o.id) AS item_count
+      FROM orders o
+      WHERE o.agent_id = ?
+      ORDER BY o.created_at DESC
+      LIMIT 100
+    `).all(id) as Array<{
+      order_id: string; status: string; pickup_time: string | null;
+      total_nok: number | null; created_at: string; updated_at: string;
+      cancel_reason: string | null; item_count: number;
+    }>;
+
+    const openCount = rows.filter((r) => ["pending", "confirmed", "ready"].includes(r.status)).length;
+
+    // Short private cache — session-gated, per-owner data (same convention
+    // as owner-stats).
+    res.setHeader("Cache-Control", "private, max-age=60");
+
+    return res.json({ success: true, agentId: id, orders: rows, open_count: openCount });
+  } catch (error) {
+    console.error("[owner-portal] orders error:", error);
+    return res.status(500).json({
+      success: false,
+      error: "internal_error",
+      message: "En feil oppstod.",
+    });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────
 // Helper: Escape HTML
 // ─────────────────────────────────────────────────────────────────
 

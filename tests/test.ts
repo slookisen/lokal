@@ -5053,6 +5053,32 @@ const _m2Promise = (async function runOwnerPortalTests() {
         agent_id TEXT PRIMARY KEY,
         times_discovered INTEGER DEFAULT 0
       );
+      -- dev-request 2026-07-13-produsent-dashboard-verdibevis, criterion 2
+      -- ("order inbox"): GET /api/agents/:id/orders needs the orders /
+      -- order_items tables (real schema: src/database/init.ts ~line 2522).
+      CREATE TABLE orders (
+        id             TEXT PRIMARY KEY,
+        cart_id        TEXT,
+        agent_id       TEXT NOT NULL,
+        buyer_ref      TEXT NOT NULL,
+        status         TEXT NOT NULL DEFAULT 'pending',
+        fulfilment     TEXT NOT NULL DEFAULT 'pickup',
+        pickup_time    TEXT,
+        total_nok      REAL,
+        confirm_token  TEXT,
+        created_at     TEXT NOT NULL DEFAULT (datetime('now')),
+        updated_at     TEXT NOT NULL DEFAULT (datetime('now')),
+        cancel_reason  TEXT
+      );
+      CREATE TABLE order_items (
+        id                   TEXT PRIMARY KEY,
+        order_id             TEXT NOT NULL,
+        product_id           TEXT,
+        name_snapshot        TEXT,
+        qty                  INTEGER,
+        unit_price_snapshot  REAL,
+        line_total           REAL
+      );
     `);
     const initMod = require("../src/database/init");
     initMod.__setDbForTesting(portalDb as any);
@@ -5281,6 +5307,106 @@ const _m2Promise = (async function runOwnerPortalTests() {
       );
       assertEq(parsed.funnel.discovered, 7, "m2-owner-stats: funnel.discovered = agent_metrics.times_discovered");
       assertEq(parsed.funnel.contactClicked, 1, "m2-owner-stats: funnel.contactClicked = 1 (bot click excluded)");
+    }
+
+    // ── dev-request 2026-07-13-produsent-dashboard-verdibevis, criterion 2
+    //    ("order inbox"): GET /api/agents/:id/orders ──────────────────────
+    // Producer-FACING sibling of the ADMIN-only GET /admin/orders/inbox —
+    // same auth pattern (verifyOwnerSession) and error shape as owner-stats
+    // above, but returns ALL statuses (not just open ones).
+    {
+      // No session at all -> 401 (mirrors m2-owner-stats' auth check).
+      const noAuth = await req("GET", `/api/agents/${TEST_AGENT_ID}/orders`);
+      assertEq(noAuth.status, 401, "m2-orders: without session returns 401");
+      const noAuthBody = JSON.parse(noAuth.body);
+      assertEq(noAuthBody.error, "session_invalid", "m2-orders: 401 body has error=session_invalid");
+
+      // Cross-agent: a valid session for TEST_AGENT_ID must not read m2-other's orders.
+      const cross = await req("GET", `/api/agents/m2-other/orders`, {
+        headers: { Cookie: `rfb_owner_session=${TOKEN}` },
+      });
+      assertEq(cross.status, 403, "m2-orders: cross-agent session returns 403");
+      const crossBody = JSON.parse(cross.body);
+      assertEq(crossBody.error, "forbidden", "m2-orders: 403 body has error=forbidden");
+
+      // Unknown agent id (but otherwise a technically-valid-shaped path) with
+      // no session -> still 401 first (session is checked before the agent
+      // lookup, same order as owner-stats). Cover the true 404 case below
+      // with a session minted for an agent that doesn't exist in `agents`.
+      const ghostToken = cryptoMod.randomBytes(32).toString("hex");
+      portalDb.prepare(
+        "INSERT INTO magic_links (id, email, token, agent_id, used, used_at, created_at, expires_at) VALUES (?, ?, ?, ?, 1, datetime('now'), datetime('now'), datetime('now', '+7 days'))"
+      ).run("ml_ghost", "ghost@example.no", ghostToken, "m2-ghost-agent");
+      const notFound = await req("GET", `/api/agents/m2-ghost-agent/orders`, {
+        headers: { Cookie: `rfb_owner_session=${ghostToken}` },
+      });
+      assertEq(notFound.status, 404, "m2-orders: session for an agent row that doesn't exist returns 404");
+      const notFoundBody = JSON.parse(notFound.body);
+      assertEq(notFoundBody.error, "agent_not_found", "m2-orders: 404 body has error=agent_not_found");
+
+      // Empty-orders: a valid, freshly-claimed agent with zero orders ->
+      // 200 with orders:[] (not an error).
+      portalDb.prepare(
+        "INSERT OR REPLACE INTO agents (id, name, slug, description, provider, contact_email, url, role, api_key) VALUES ('m2-no-orders', 'Ingen Ordre Gård', 'ingen-ordre', 't', 't', 'ingenordre@example.no', 'https://o.no', 'producer', 'k3')"
+      ).run();
+      const emptyToken = cryptoMod.randomBytes(32).toString("hex");
+      portalDb.prepare(
+        "INSERT INTO magic_links (id, email, token, agent_id, used, used_at, created_at, expires_at) VALUES (?, ?, ?, ?, 1, datetime('now'), datetime('now'), datetime('now', '+7 days'))"
+      ).run("ml_empty", "ingenordre@example.no", emptyToken, "m2-no-orders");
+      const empty = await req("GET", `/api/agents/m2-no-orders/orders`, {
+        headers: { Cookie: `rfb_owner_session=${emptyToken}` },
+      });
+      assertEq(empty.status, 200, "m2-orders: agent with zero orders returns 200 (not an error)");
+      const emptyBody = JSON.parse(empty.body);
+      assertTrue(emptyBody.success === true, "m2-orders: empty-orders success=true");
+      assertTrue(Array.isArray(emptyBody.orders) && emptyBody.orders.length === 0,
+        "m2-orders: empty-orders returns orders:[] (not omitted, not an error)");
+      assertEq(emptyBody.open_count, 0, "m2-orders: empty-orders open_count=0");
+
+      // Success shape: seed a mix of statuses (including a non-open one) for
+      // TEST_AGENT_ID and assert the full response shape + open_count math +
+      // that ALL statuses are returned (unlike the admin open-only inbox).
+      const insertOrder = portalDb.prepare(`
+        INSERT INTO orders (id, agent_id, buyer_ref, status, fulfilment, pickup_time, total_nok, confirm_token, created_at, updated_at, cancel_reason)
+        VALUES (?, ?, 'bref_m2', ?, 'pickup', ?, ?, ?, ?, ?, ?)
+      `);
+      insertOrder.run("ord-pending", TEST_AGENT_ID, "pending", null, 150, "ctok_p", "2026-07-01 10:00:00", "2026-07-01 10:00:00", null);
+      insertOrder.run("ord-completed", TEST_AGENT_ID, "completed", "2026-07-02 09:00:00", 300, "ctok_c", "2026-07-02 08:00:00", "2026-07-02 09:00:00", null);
+      insertOrder.run("ord-noshow", TEST_AGENT_ID, "cancelled", null, 90, "ctok_ns", "2026-07-03 08:00:00", "2026-07-03 08:30:00", "no_show");
+      portalDb.prepare(
+        "INSERT INTO order_items (id, order_id, product_id, name_snapshot, qty, unit_price_snapshot, line_total) VALUES ('oi-1', 'ord-pending', 'p1', 'Egg', 2, 75, 150)"
+      ).run();
+      portalDb.prepare(
+        "INSERT INTO order_items (id, order_id, product_id, name_snapshot, qty, unit_price_snapshot, line_total) VALUES ('oi-2', 'ord-completed', 'p1', 'Egg', 4, 75, 300)"
+      ).run();
+
+      const withAuth = await req("GET", `/api/agents/${TEST_AGENT_ID}/orders`, {
+        headers: { Cookie: `rfb_owner_session=${TOKEN}` },
+      });
+      assertEq(withAuth.status, 200, "m2-orders: with valid session returns 200");
+      const ordersBody = JSON.parse(withAuth.body);
+      assertTrue(ordersBody.success === true, "m2-orders: success=true");
+      assertEq(ordersBody.agentId, TEST_AGENT_ID, "m2-orders: agentId echoed in response");
+      assertTrue(Array.isArray(ordersBody.orders) && ordersBody.orders.length === 3,
+        "m2-orders: all 3 seeded orders returned regardless of status (not filtered to open-only)");
+      assertEq(ordersBody.open_count, 1, "m2-orders: open_count=1 (only ord-pending is pending/confirmed/ready)");
+      // Most-recent-first ordering by created_at.
+      assertEq(ordersBody.orders[0].order_id, "ord-noshow", "m2-orders: most recent order (by created_at) is first");
+      assertEq(ordersBody.orders[2].order_id, "ord-pending", "m2-orders: oldest order is last");
+      const completedRow = ordersBody.orders.find((o: any) => o.order_id === "ord-completed");
+      assertTrue(!!completedRow, "m2-orders: completed order present in response");
+      assertEq(completedRow.status, "completed", "m2-orders: status field present");
+      assertEq(completedRow.item_count, 1, "m2-orders: item_count computed from order_items subquery");
+      assertEq(completedRow.total_nok, 300, "m2-orders: total_nok present");
+      assertEq(completedRow.pickup_time, "2026-07-02 09:00:00", "m2-orders: pickup_time present");
+      const noshowRow = ordersBody.orders.find((o: any) => o.order_id === "ord-noshow");
+      assertEq(noshowRow.cancel_reason, "no_show", "m2-orders: cancel_reason surfaced (e.g. for 'Ikke hentet' display)");
+      const pendingRow = ordersBody.orders.find((o: any) => o.order_id === "ord-pending");
+      assertEq(pendingRow.item_count, 1, "m2-orders: item_count correct for a second order (subquery scoped per-order)");
+
+      // Private per-owner cache header, same convention as owner-stats.
+      assertTrue(String(withAuth.headers["cache-control"] || "").includes("private"),
+        "m2-orders: Cache-Control is private (session-gated per-owner data)");
     }
 
     server.close();
