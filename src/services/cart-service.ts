@@ -647,10 +647,32 @@ export function transitionOrder(
   const cancelReason = toStatus === "cancelled" ? (opts?.cancelReason ?? null) : null;
   const actor = opts?.actor ?? null;
 
+  // No-show bookkeeping is only meaningful for an order that was actually
+  // ready for pickup: cancel_reason='no_show' (and its trust-ledger event)
+  // requires from-status 'ready'. Enforced centrally here so BOTH callers
+  // (producer PRG page and the admin no-show route) share the same guard.
+  // A plain confirmed → cancelled (no reason) remains legal.
+  if (cancelReason === "no_show" && order.status !== "ready") {
+    return {
+      success: false,
+      status: 409,
+      error: `Cannot record a no-show for an order in '${order.status}' — only orders that were ready for pickup can be no-shows`,
+    };
+  }
+
+  // Concurrency guard: the UPDATE re-asserts the from-status we validated
+  // against (id AND status), so two racing transitions (multi-instance, or
+  // producer + admin at once) can't both apply — the loser's UPDATE matches
+  // 0 rows and its transaction rolls back with a 409.
+  let conflict = false;
   const tx = db.transaction(() => {
-    db.prepare(
-      "UPDATE orders SET status = ?, cancel_reason = COALESCE(?, cancel_reason), updated_at = datetime('now') WHERE id = ?"
-    ).run(toStatus, cancelReason, orderId);
+    const upd = db.prepare(
+      "UPDATE orders SET status = ?, cancel_reason = COALESCE(?, cancel_reason), updated_at = datetime('now') WHERE id = ? AND status = ?"
+    ).run(toStatus, cancelReason, orderId, order.status);
+    if (upd.changes !== 1) {
+      conflict = true;
+      throw new Error("concurrent status change");
+    }
     db.prepare(`
       INSERT INTO order_events (id, order_id, from_status, to_status, actor, created_at)
       VALUES (?, ?, ?, ?, ?, datetime('now'))
@@ -660,6 +682,13 @@ export function transitionOrder(
   try {
     tx();
   } catch (err) {
+    if (conflict) {
+      return {
+        success: false,
+        status: 409,
+        error: "Order status changed concurrently — reload and retry",
+      };
+    }
     const msg = err instanceof Error ? err.message : String(err);
     return { success: false, status: 500, error: `Transition failed: ${msg}` };
   }

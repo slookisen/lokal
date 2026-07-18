@@ -2575,6 +2575,19 @@ function initSchema(db: Database.Database): void {
     try { db.exec(stmt); } catch { /* already exists — expected */ }
   }
 
+  // confirm_token is now a lookup key (the /produsent/ordre/:token page), so
+  // index it. UNIQUE preferred (it's a capability token, 16 random bytes) —
+  // but this must NEVER be able to break boot on an existing prod DB, so a
+  // hypothetical pre-existing duplicate falls back to a non-unique index.
+  // Multiple NULLs are fine in a SQLite UNIQUE index (NULLs are distinct).
+  try {
+    db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_orders_confirm_token ON orders(confirm_token)`);
+  } catch {
+    try {
+      db.exec(`CREATE INDEX IF NOT EXISTS idx_orders_confirm_token ON orders(confirm_token)`);
+    } catch { /* index creation is best-effort — lookups still work unindexed */ }
+  }
+
   // order_events: append-only status-transition timeline per order. Written
   // by cart-service.transitionOrder() on every legal transition; exposed to
   // the buyer via getOrder() (lokal_order_status / GET /api/marketplace/

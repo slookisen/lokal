@@ -28,32 +28,38 @@ import { getTrustEventCounts } from "./trust-event-service";
 // ─── Signal weights ──────────────────────────────────────────
 //
 // Transaction trust-ledger (dev-request 2026-07-13-pilot-ordre-loop):
-// the interaction signal now also reads trust_events counts (order_completed
-// / booking_attended lift, order_no_show / booking_no_show lower; declined
-// is recorded in the ledger but deliberately NOT scored — declining an order
-// a producer can't fulfil is honest behaviour, not a trust breach).
+// the interaction signal now also reads trust_events counts. Only COMPLETED
+// transactions (order_completed / booking_attended) score.
+//
+// Deliberately NOT scored against the producer:
+//   - order_declined: declining an order a producer can't fulfil is honest
+//     behaviour, not a trust breach.
+//   - order_no_show / booking_no_show: a no-show is the BUYER's failure,
+//     and carts are anonymous — scoring it against the producer would let a
+//     hostile buyer damage a producer's score by simply not showing up, and
+//     would punish honest «Ikke hentet» bookkeeping. The ledger row is still
+//     written (correct bookkeeping, ready the day buyer identity exists);
+//     it just carries no score weight against the producer. Reversing this
+//     is a Daniel-level product decision.
 //
 // Formula (documented here because the WEIGHTS themselves are UNCHANGED —
 // existing scores must not jump while the ledger is empty):
 //
 //   base       = discovery*0.3 + contact*0.4 + chosen*0.3   (pre-existing)
 //   completed  = count(order_completed) + count(booking_attended)
-//   noShows    = count(order_no_show)  + count(booking_no_show)
-//   IF completed + noShows == 0  → interaction = base        (0 events =
-//                                                             today's value)
+//   IF completed == 0 → interaction = base          (0 scored events =
+//                                                    today's value, exactly)
 //   ELSE:
-//     txVolume    = min(1, log10(completed+1) / 1)   — 9 completed pickups
-//                                                      max the volume term
-//     noShowRate  = noShows / (completed + noShows)
-//     txSignal    = txVolume * (1 - noShowRate)      — no-shows scale the
-//                                                      earned credit down
-//     interaction = base*0.6 + txSignal*0.4          — real transactions are
-//                                                      blended in at 40% of
-//                                                      the interaction slot
+//     txVolume    = min(1, log10(completed+1) / 1)  — 9 completed pickups
+//                                                     max the volume term
+//     interaction = max(base, base*0.6 + txVolume*0.4)
 //
-// So a producer with only no-shows gets txSignal 0 (worse than having no
-// history is impossible — floor is base*0.6), and completed pickups are the
-// strongest interaction evidence on the platform.
+// The max(base, …) floor guarantees monotonicity: participating in the
+// order loop can NEVER drop a producer below their pre-ledger value (an
+// established producer with base≈0.998 must not fall to ≈0.72 after their
+// first completed pickup — the raw blend alone would do exactly that).
+// Completed pickups can only lift, and become the strongest interaction
+// evidence on the platform once volume outgrows the base.
 
 const WEIGHTS = {
   verification: 0.30,
@@ -326,18 +332,19 @@ class TrustScoreService {
     const base = discoveryScore * 0.3 + contactScore * 0.4 + chosenScore * 0.3;
 
     // Transaction trust-ledger blend — see the formula comment at WEIGHTS.
-    // getTrustEventCounts is defensive (missing table → all zeros), and with
-    // zero scored events this returns exactly `base`, i.e. the pre-ledger
-    // value — existing scores don't move while the ledger is empty.
+    // getTrustEventCounts is defensive (missing table → all zeros). Only
+    // completed transactions score; no-shows/declines are ledger-only (see
+    // the attribution note at WEIGHTS). With zero completed events this
+    // returns exactly `base`, i.e. the pre-ledger value — existing scores
+    // don't move while the ledger is empty.
     const events = getTrustEventCounts(agentId);
-    const scored = events.completed + events.noShows;
-    if (scored === 0) return base;
+    if (events.completed === 0) return base;
 
     const txVolume = Math.min(1, Math.log10(events.completed + 1) / 1); // 9 completed = 1.0
-    const noShowRate = events.noShows / scored;
-    const txSignal = txVolume * (1 - noShowRate);
 
-    return base * 0.6 + txSignal * 0.4;
+    // Monotonicity floor: participation can never lower the signal below
+    // the producer's pre-ledger value.
+    return Math.max(base, base * 0.6 + txVolume * 0.4);
   }
 
   private communitySignal(agentId: string): number {

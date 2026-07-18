@@ -163,6 +163,8 @@ export async function runPilotOrdreLoopTests(opts: { log?: boolean } = {}): Prom
     insertKnowledge.run("ag-trust-a", "verified");
     insertAgent.run("ag-trust-b", "Trust B Gård", "trustb@example.no", "key-trust-b");
     insertKnowledge.run("ag-trust-b", "verified");
+    insertAgent.run("ag-trust-c", "Trust C Etablert Gård", "trustc@example.no", "key-trust-c");
+    insertKnowledge.run("ag-trust-c", "verified");
 
     // ── HTTP app (real routers, real sockets — PRG needs redirects) ─────────
     const express = require("express");
@@ -418,6 +420,25 @@ export async function runPilotOrdreLoopTests(opts: { log?: boolean } = {}): Prom
       assertTrue(bogus.status === 303 && (bogus.location || "").includes("error=ugyldig"),
         "prg-13: unknown action → error redirect");
 
+      // Review fix, finding 3: no_show is NOT reachable from 'confirmed' —
+      // an order that was never ready for pickup can't be booked as no-show.
+      const earlyNoShow = await req("POST", `/produsent/ordre/${optinToken}`, { form: { action: "no_show" } });
+      assertTrue(earlyNoShow.status === 303 && (earlyNoShow.location || "").includes("error=ugyldig"),
+        "prg-13b: PRG no_show on a confirmed order → rejected (error=ugyldig)");
+      const afterEarly = testDb.prepare("SELECT status, cancel_reason FROM orders WHERE id = ?").get(optinOrderId) as any;
+      assertTrue(afterEarly?.status === "confirmed" && afterEarly?.cancel_reason == null,
+        "prg-13c: rejected early no_show changes nothing (still confirmed, no cancel_reason)");
+      const earlyTrust = testDb.prepare(
+        "SELECT COUNT(*) AS c FROM trust_events WHERE event_type = 'order_no_show' AND ref = ?"
+      ).get(optinOrderId) as any;
+      assertEq(earlyTrust?.c, 0, "prg-13d: rejected early no_show writes no trust event");
+      const adminEarlyNoShow = await req("POST", `/admin/marketplace/orders/${optinOrderId}/no-show`, {
+        headers: { "x-admin-key": ADMIN_KEY },
+      });
+      assertEq(adminEarlyNoShow.status, 409, "prg-13e: admin no-show on a confirmed order → 409 (same central guard)");
+      // Plain confirmed → cancelled (no reason) stays legal — verified in the
+      // 6×6 matrix below; here we only pin that the no_show REASON is gated.
+
       // confirmed → ready → cancelled (no_show)
       await req("POST", `/produsent/ordre/${optinToken}`, { form: { action: "ready" } });
       assertEq((testDb.prepare("SELECT status FROM orders WHERE id = ?").get(optinOrderId) as any)?.status,
@@ -504,6 +525,27 @@ export async function runPilotOrdreLoopTests(opts: { log?: boolean } = {}): Prom
       cartSvc.transitionOrder("matrix-upd", "confirmed", { actor: "test" });
       const after = (testDb.prepare("SELECT updated_at FROM orders WHERE id = 'matrix-upd'").get() as any)?.updated_at;
       assertTrue(String(after) > String(before), "matrix-03: legal transition bumps updated_at");
+
+      // Review fix, finding 3 (unit level): the no_show REASON is gated on
+      // from-status 'ready' even though confirmed → cancelled itself is legal.
+      testDb.prepare(`
+        INSERT INTO orders (id, agent_id, buyer_ref, status, fulfilment, confirm_token, created_at, updated_at)
+        VALUES ('matrix-ns-conf', 'ag-optout', 'bref_matrix', 'confirmed', 'pickup', 'ctok_nsconf', datetime('now'), datetime('now'))
+      `).run();
+      const nsConf = cartSvc.transitionOrder("matrix-ns-conf", "cancelled", { actor: "test", cancelReason: "no_show" });
+      assertTrue(!nsConf.success && nsConf.status === 409,
+        "matrix-04: cancelled with cancelReason='no_show' from 'confirmed' → 409 (never was ready)");
+      const plainCancel = cartSvc.transitionOrder("matrix-ns-conf", "cancelled", { actor: "test" });
+      assertTrue(plainCancel.success === true,
+        "matrix-05: plain confirmed → cancelled (no reason) remains legal");
+      testDb.prepare(`
+        INSERT INTO orders (id, agent_id, buyer_ref, status, fulfilment, confirm_token, created_at, updated_at)
+        VALUES ('matrix-ns-ready', 'ag-optout', 'bref_matrix', 'ready', 'pickup', 'ctok_nsready', datetime('now'), datetime('now'))
+      `).run();
+      const nsReady = cartSvc.transitionOrder("matrix-ns-ready", "cancelled", { actor: "test", cancelReason: "no_show" });
+      assertTrue(nsReady.success === true &&
+        (testDb.prepare("SELECT cancel_reason FROM orders WHERE id = 'matrix-ns-ready'").get() as any)?.cancel_reason === "no_show",
+        "matrix-06: no_show from 'ready' is legal and persists cancel_reason");
     }
 
     // ════════════════════════════════════════════════════════════════════════
@@ -545,17 +587,38 @@ export async function runPilotOrdreLoopTests(opts: { log?: boolean } = {}): Prom
       const lifted = trustScoreService.getBreakdown("ag-trust-a").signals.interaction.value;
       assertTrue(lifted > baseline, `trust-03: completed orders lift the interaction signal (${baseline} → ${lifted})`);
 
-      // No-shows lower it again.
+      // Review fix, finding 1 — monotonicity with a HIGH base: an established
+      // producer (base≈0.998 from agent_metrics) must NOT drop after their
+      // first completed pickup (the raw 0.6/0.4 blend alone would give ≈0.72).
+      testDb.prepare(`
+        INSERT INTO agent_metrics (agent_id, times_discovered, times_contacted, times_chosen)
+        VALUES ('ag-trust-c', 100, 30, 10)
+      `).run();
+      const highBase = trustScoreService.getBreakdown("ag-trust-c").signals.interaction.value;
+      assertTrue(highBase > 0.99, `trust-03b: seeded metrics give a high base (got ${highBase})`);
+      trustEvtSvc.recordTrustEvent({ agentId: "ag-trust-c", eventType: "order_completed", ref: "c-1" });
+      const afterFirst = trustScoreService.getBreakdown("ag-trust-c").signals.interaction.value;
+      assertTrue(afterFirst >= highBase,
+        `trust-03c: 1 completed order can NEVER lower a high-base producer (${highBase} → ${afterFirst}, max(base,·) floor)`);
+
+      // Review fix, finding 2 — no-shows are ledger-only: they must NOT move
+      // the producer's score (buyer's failure, anonymous carts — attribution
+      // requires buyer identity; Daniel-level decision to change).
       for (let i = 0; i < 5; i++) {
         trustEvtSvc.recordTrustEvent({ agentId: "ag-trust-a", eventType: "order_no_show", ref: `n-${i}` });
       }
-      const lowered = trustScoreService.getBreakdown("ag-trust-a").signals.interaction.value;
-      assertTrue(lowered < lifted, `trust-04: no-shows lower the interaction signal (${lifted} → ${lowered})`);
+      const afterNoShows = trustScoreService.getBreakdown("ag-trust-a").signals.interaction.value;
+      assertEq(afterNoShows, lifted,
+        "trust-04: no-show events do NOT change the producer's interaction signal (ledger-only)");
+      const ledgerRows = testDb.prepare(
+        "SELECT COUNT(*) AS c FROM trust_events WHERE agent_id = 'ag-trust-a' AND event_type = 'order_no_show'"
+      ).get() as any;
+      assertEq(ledgerRows?.c, 5, "trust-04b: the no-show rows ARE still in the ledger (bookkeeping kept)");
 
-      // Only no-shows: floor at base (never negative, never above base).
+      // Only no-shows: completed=0 → exactly the pre-ledger value (0 here).
       trustEvtSvc.recordTrustEvent({ agentId: "ag-trust-b", eventType: "order_no_show", ref: "b-1" });
       const onlyNoShow = trustScoreService.getBreakdown("ag-trust-b").signals.interaction.value;
-      assertEq(onlyNoShow, 0, "trust-05: only-no-show agent with no other interactions scores 0");
+      assertEq(onlyNoShow, 0, "trust-05: only-no-show agent keeps its pre-ledger value (0 — no score impact)");
 
       // booking_* event types are accepted by the ledger (future booking wiring).
       assertTrue(trustEvtSvc.recordTrustEvent({ agentId: "ag-trust-b", eventType: "booking_attended", ref: "bk-1" }),

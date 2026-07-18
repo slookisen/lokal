@@ -273,6 +273,8 @@ cartRouter.get("/orders/:id", (req: Request, res: Response) => {
 // POST /admin/marketplace/orders/:id/confirm|decline|ready|complete|no-show
 // Admin-gated (X-Admin-Key). Transitions the order status. "no-show" is the
 // ready → cancelled path and stores cancel_reason='no_show' (pilot-ordre-loop).
+// no-show on an order that is not 'ready' is rejected with 409 by the central
+// guard in cart-service.transitionOrder (review fix, finding 3).
 
 const LIFECYCLE_ACTIONS = ["confirm", "decline", "ready", "complete", "no-show"] as const;
 const ACTION_TO_STATUS: Record<string, string> = {
@@ -326,6 +328,11 @@ const ORDER_STATUS_LABEL: Record<string, string> = {
 };
 
 // action → { toStatus, cancelReason } for the producer POST handler.
+// NOTE (review fix, finding 3): no_show is additionally gated on the order
+// being in status 'ready' — enforced centrally in cart-service
+// transitionOrder (shared with the admin no-show route above), which
+// returns 409 → this page redirects with ?error=ugyldig. The button is also
+// only rendered for 'ready' (ACTIONS_FOR_STATUS).
 const PRODUCER_ACTIONS: Record<string, { toStatus: string; cancelReason: string | null }> = {
   confirm:  { toStatus: "confirmed", cancelReason: null },
   decline:  { toStatus: "declined",  cancelReason: null },
