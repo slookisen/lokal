@@ -793,6 +793,21 @@ console.log("── admin-outreach-candidates (gate-integrity: dedupe tiebreak p
   console.log(`  admin-outreach-candidates-gate-integrity: ${r.passed} passed, ${r.failed} failed`);
 }
 
+// ── 2026-07-18 dev-request: admin-blocklist-manual-entry-api — generic
+// { identifier_type, identifier_value, reason? } shape for POST /admin/blocklist,
+// plus the free-mail/ISP + vipps.no website_domain guard ──
+console.log("── admin-blocklist-manual-entry (generic identifier_type/identifier_value shape + domain guard) ──");
+{
+  const { runAdminBlocklistManualEntryTests } =
+    require("../src/routes/admin-blocklist-manual-entry.test") as
+      typeof import("../src/routes/admin-blocklist-manual-entry.test");
+  const r = runAdminBlocklistManualEntryTests({ log: false });
+  passed += r.passed;
+  failed += r.failed;
+  for (const f of r.failures) failures.push("admin-blocklist-manual-entry: " + f);
+  console.log(`  admin-blocklist-manual-entry: ${r.passed} passed, ${r.failed} failed`);
+}
+
 // ── orch-pr-12: search-enrich background sweep + findings + apply-findings ──
 // Async (fire-and-forget sweep loop). Kicked off here; awaited in the REPORT
 // block so its pass/fail counts fold into the `npm test` summary.

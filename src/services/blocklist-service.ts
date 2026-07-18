@@ -10,6 +10,7 @@
 // is a one-line addition.
 
 import { getDb } from "../database/init";
+import { FREE_MAIL_DOMAINS } from "./cross-source-validator";
 
 export type BlocklistEntry = {
   id: number;
@@ -59,6 +60,26 @@ export function normalizeDomain(input: string | null | undefined): string {
 // our own domain is a false positive. Both the read path (isBlocked)
 // and the write path (add) refuse to operate on it.
 const OWN_DOMAINS = new Set(["rettfrabonden.com", "lokal.fly.dev"]);
+
+// ─── PROTECTED_DOMAINS (manual-entry guard) ────────────────────
+// Free-mail/ISP hosts (FREE_MAIL_DOMAINS, cross-source-validator.ts) are
+// shared by thousands of unrelated producers, so blocklisting one of them
+// as a website_domain would silently suppress every producer whose site
+// happens to resolve to that host — a large, unintended blast radius for
+// what a human meant as "block this one bad actor". vipps.no is added on
+// top for the same over-suppression reason even though it isn't a
+// free-mail host: it's a shared payment-app domain that legitimately shows
+// up as the "website" for many small producers who link a Vipps page
+// instead of a real site, so blocklisting it would hit all of them (see
+// A2A rfb-customer-service-fjern-direct-delete-addendum, which calls this
+// domain out explicitly for this exact guard).
+export const PROTECTED_DOMAINS = new Set<string>([...FREE_MAIL_DOMAINS, "vipps.no"]);
+
+// Thrown by addManualEntry() for input that is well-formed enough to reach
+// this module but fails a domain-specific business rule (e.g. attempting to
+// blocklist a protected shared domain, or an empty identifier value). The
+// route layer catches this specifically to answer 400 instead of 500.
+export class BlocklistValidationError extends Error {}
 
 // ─── normalizeEmail (PR-14) ────────────────────────────────────
 // Literal email match: lowercase + trim. We do NOT extract the domain —
@@ -198,6 +219,70 @@ export function add(input: {
   `).all(...rowsToInsert.flatMap(r => [r.type, r.value])) as BlocklistEntry[];
 
   return { inserted, rows: reread };
+}
+
+// ─── addManualEntry ─────────────────────────────────────────────
+// Generic single-identifier insert for POST /admin/blocklist's new
+// { identifier_type, identifier_value, reason? } request shape (dev-request
+// 2026-07-15-admin-blocklist-manual-entry-api). Unlike add(), this takes
+// exactly one already-typed identifier rather than fanning out over
+// name/website/email/agentId — the caller already knows which kind of
+// value they're typing in.
+//
+// website_domain is guarded against PROTECTED_DOMAINS (see above) since a
+// manually-typed domain has no producer record behind it to sanity-check
+// against, unlike add()'s OWN_DOMAINS check which only ever guards our own
+// two domains.
+
+export function addManualEntry(input: {
+  identifierType: "email" | "agent_id" | "name_normalized" | "website_domain";
+  identifierValue: string;
+  reason?: string;
+}): { created: boolean; row: BlocklistEntry } {
+  const db = getDb();
+  const now = new Date().toISOString();
+  const reason = input.reason || "manual entry via POST /admin/blocklist";
+
+  let value: string;
+  switch (input.identifierType) {
+    case "email":
+      value = normalizeEmail(input.identifierValue);
+      break;
+    case "website_domain":
+      value = normalizeDomain(input.identifierValue);
+      break;
+    case "name_normalized":
+      value = normalizeName(input.identifierValue);
+      break;
+    case "agent_id":
+      value = String(input.identifierValue || "").trim().toLowerCase();
+      break;
+    default:
+      throw new BlocklistValidationError(`Ukjent identifier_type: ${input.identifierType}`);
+  }
+
+  if (!value) {
+    throw new BlocklistValidationError("identifier_value normaliserte til en tom verdi");
+  }
+
+  if (input.identifierType === "website_domain" && PROTECTED_DOMAINS.has(value)) {
+    throw new BlocklistValidationError(
+      `"${value}" er en delt/frimail-domene (eller vipps.no) og kan ikke blokkeres som website_domain — det ville undertrykt alle produsenter som deler dette domenet.`
+    );
+  }
+
+  const stmt = db.prepare(`
+    INSERT OR IGNORE INTO agent_blocklist
+      (identifier_type, identifier_value, reason, source_email, original_agent_id, original_agent_name, created_at)
+    VALUES (?, ?, ?, NULL, NULL, NULL, ?)
+  `);
+  const res = stmt.run(input.identifierType, value, reason, now);
+
+  const row = db.prepare(
+    "SELECT * FROM agent_blocklist WHERE identifier_type = ? AND identifier_value = ?"
+  ).get(input.identifierType, value) as BlocklistEntry;
+
+  return { created: res.changes > 0, row };
 }
 
 // ─── list ──────────────────────────────────────────────────────

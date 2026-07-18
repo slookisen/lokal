@@ -12,7 +12,7 @@ import { conversationService, buildRequestMeta } from "../services/conversation-
 import { slugify } from "../utils/slug";
 import { pingIndexNow } from "../services/indexnow-service";
 import { addUtmParams } from "../utils/url-utm";
-import { isBlocked, add as blocklistAdd, list as blocklistList, remove as blocklistRemove } from "../services/blocklist-service";
+import { isBlocked, add as blocklistAdd, list as blocklistList, remove as blocklistRemove, addManualEntry as blocklistAddManualEntry, BlocklistValidationError } from "../services/blocklist-service";
 import { mergeFieldProvenance } from "./admin-knowledge";
 import { crossSourceAgreement, isAcceptableHomepageEmail, pageMentionsProducer, type FieldName } from "../services/cross-source-validator";
 import { logPlacesCall, getPlacesUsageThisMonth } from "../services/places-usage-tracker";
@@ -3034,8 +3034,16 @@ function getBaseUrl(req: Request): string {
 //   GET  /api/marketplace/admin/blocklist?limit=100&offset=0
 //        → list rows (most-recent first)
 //   POST /api/marketplace/admin/blocklist
-//        body: { name?, website?, email?, agentId?, reason, sourceEmail? }
+//        body (legacy, named-field shape): { name?, website?, email?, agentId?, reason, sourceEmail? }
 //        → inserts up to 4 rows (one per non-empty identifier)
+//        body (generic shape, dev-request 2026-07-15-admin-blocklist-manual-entry-api):
+//          { identifier_type: "email"|"agent_id"|"name_normalized"|"website_domain",
+//            identifier_value: string, reason? }
+//        → inserts exactly one row; used whenever the request carries
+//          identifier_type and/or identifier_value (checked before falling
+//          back to the legacy shape below). website_domain is rejected (400)
+//          for free-mail/ISP hosts and vipps.no — see PROTECTED_DOMAINS in
+//          blocklist-service.ts.
 //   DELETE /api/marketplace/admin/blocklist/:id
 //        → undoes a single row by primary key
 //
@@ -3073,7 +3081,45 @@ router.post("/admin/blocklist", (req: Request, res: Response) => {
     return;
   }
   try {
-    const { name, website, email, agentId, reason, sourceEmail } = req.body || {};
+    const body = req.body || {};
+
+    // Generic shape (dev-request 2026-07-15-admin-blocklist-manual-entry-api):
+    // takes precedence whenever identifier_type and/or identifier_value is present,
+    // so it never falls through to the legacy named-field logic below.
+    if (body.identifier_type !== undefined || body.identifier_value !== undefined) {
+      const validTypes = ["email", "agent_id", "name_normalized", "website_domain"];
+      if (typeof body.identifier_type !== "string" || !validTypes.includes(body.identifier_type)) {
+        res.status(400).json({ error: `Body må inneholde 'identifier_type' (en av: ${validTypes.join(", ")})` });
+        return;
+      }
+      if (typeof body.identifier_value !== "string" || !body.identifier_value.trim()) {
+        res.status(400).json({ error: "Body må inneholde 'identifier_value' (ikke-tom string)" });
+        return;
+      }
+      try {
+        const result = blocklistAddManualEntry({
+          identifierType: body.identifier_type,
+          identifierValue: body.identifier_value,
+          reason: typeof body.reason === "string" ? body.reason : undefined,
+        });
+        res.status(result.created ? 201 : 200).json({
+          success: true,
+          id: result.row.id,
+          identifier_type: result.row.identifier_type,
+          identifier_value: result.row.identifier_value,
+          created_at: result.row.created_at,
+        });
+      } catch (err: any) {
+        if (err instanceof BlocklistValidationError) {
+          res.status(400).json({ error: err.message });
+          return;
+        }
+        res.status(500).json({ error: "Add failed", detail: err.message });
+      }
+      return;
+    }
+
+    const { name, website, email, agentId, reason, sourceEmail } = body;
     if (!reason || typeof reason !== "string") {
       res.status(400).json({ error: "Body må inneholde 'reason' (string)" });
       return;
