@@ -82,6 +82,22 @@ import {
   resolveBooking,
   reopenBooking,
   visitTimeReached,
+  // booking-flyt-v1 slice 2: pre-visit answer loop (svar / gjestesvar / status)
+  getBookingByRespondToken,
+  getBookingByGuestDecisionToken,
+  respondTokenState,
+  producerRespondConfirm,
+  producerRespondDecline,
+  producerSuggestTime,
+  guestAcceptSuggestion,
+  guestDeclineSuggestion,
+  guestDecisionActionable,
+  previsitOpen,
+  sendPrevisitConfirmedToGuest,
+  sendPrevisitDeclinedToGuest,
+  sendSuggestionToGuest,
+  sendGuestDecisionToProducer,
+  type GardssalgBooking,
 } from "../services/booking-store";
 import { getOaHomeCounters } from "../services/oa-home-counters";
 
@@ -3212,6 +3228,439 @@ router.post(
       req.ip || "produsent-lenke",
     );
     res.redirect(303, resolved ? `${backTo}?done=${resolved.status}` : `${backTo}?error=ugyldig`);
+  },
+);
+
+// ─── Pre-visit answer loop (booking-flyt-v1 slice 2) ────────────────────────
+//   GET  /kategori/gardssalg/svar/:token         producer answer page — GET
+//                                                mutates NOTHING (PRG, exactly
+//                                                like the bekreft page above)
+//   POST /kategori/gardssalg/svar/:token         action=bekreft|foresla|avsla
+//   GET  /kategori/gardssalg/gjestesvar/:token   guest decision page (suggested
+//                                                time) — GET mutates NOTHING
+//   POST /kategori/gardssalg/gjestesvar/:token   action=aksepter|avsla
+//   GET  /kategori/gardssalg/status/:ref/:token  guest read-only status page
+//
+// Token discipline: the respond token is the PRODUCER's credential (one-time
+// for a terminal answer + expiring — reuse/expiry gets a friendly no-action
+// page and never mutates), the decision/status tokens are the GUEST's; the
+// emails in booking-store never cross them. All guest-controlled strings are
+// escapeHtml()-escaped in these pages.
+const PRE_STATUS_LABEL: Record<string, string> = {
+  awaiting_provider: "Venter på svar fra produsenten",
+  provider_confirmed: "Bekreftet av produsenten",
+  provider_declined: "Avslått",
+  time_suggested: "Produsenten har foreslått et nytt tidspunkt",
+  // True in both expiry paths: an unanswered request AND a suggestion that
+  // was never finally settled (review finding 1).
+  expired: "Utløpt — ble ikke avklart i tide",
+};
+
+function previsitSlotNb(slot: string | null): string {
+  if (!slot) return "";
+  return new Date(slot).toLocaleString("nb-NO", {
+    dateStyle: "full",
+    timeStyle: "short",
+    timeZone: "Europe/Oslo",
+  });
+}
+
+// Shared shell for the small pre-visit pages (svar/gjestesvar/status) — same
+// look as the bekreft page above.
+function previsitPage(title: string, inner: string): string {
+  return `<!doctype html>
+<html lang="nb">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>${escapeHtml(title)} | Opplevagent</title>
+<meta name="robots" content="noindex, nofollow">
+<style>
+${BROWSE_CSS}
+.confirm-panel{max-width:520px;margin:24px auto 0;background:var(--surface);border-radius:12px;box-shadow:0 2px 8px rgba(0,0,0,.07);padding:28px 24px}
+.confirm-panel h1{font-size:1.3rem;font-weight:800;color:var(--fjord-900);margin-bottom:4px}
+.confirm-panel .ref{font-family:monospace;font-size:1rem;font-weight:700;letter-spacing:.03em;color:var(--fjord-800);background:var(--canvas-2);border-radius:8px;padding:6px 12px;display:inline-block;margin:8px 0 4px}
+.confirm-panel .status-line{margin:12px 0 4px;font-size:.95rem}
+.confirm-panel .recap{text-align:left;margin:16px 0;font-size:.92rem;color:var(--ink-soft)}
+.confirm-panel .recap div{padding:5px 0;border-bottom:1px solid var(--line)}
+.confirm-panel .hint{font-size:.82rem;color:var(--mist);margin-top:14px}
+.bekreft-banner{border-radius:8px;padding:12px 14px;margin:14px 0;font-size:.9rem}
+.bekreft-banner.ok{background:#e8f4ec;border:1px solid #bcd9c5;color:#1d5a30}
+.bekreft-banner.warn{background:#fdf3e7;border:1px solid #f0d4ae;color:#7a5218}
+.act-btn{margin-top:12px;width:100%;padding:12px 18px;border:none;border-radius:8px;font-size:1rem;font-weight:700;cursor:pointer}
+.act-primary{background:var(--fjord-800);color:#fff}
+.act-primary:hover{background:var(--fjord-700)}
+.act-secondary{background:var(--canvas-2);color:var(--ink);border:1px solid var(--line)}
+.suggest-box{margin-top:16px;padding:14px;border:1px solid var(--line);border-radius:8px;background:var(--canvas-2)}
+.suggest-box label{display:block;font-size:.84rem;font-weight:700;color:var(--ink-soft);margin-bottom:6px}
+.suggest-box input{width:100%;padding:10px 12px;border:1px solid var(--line);border-radius:8px;font-size:.95rem;background:var(--surface);color:var(--ink)}
+</style>
+</head>
+<body>
+<a class="skip-link" href="#main">Hopp til innhold</a>
+<nav class="site-nav" aria-label="Navigasjon">
+  <div class="nav-inner">
+    <a class="brand" href="/"><span class="brand-word">opplevagent<span class="tld">.no</span></span></a>
+  </div>
+</nav>
+<main id="main" class="container">
+  <div class="confirm-panel">
+${inner}
+  </div>
+</main>
+</body>
+</html>`;
+}
+
+function previsitRecapHtml(booking: GardssalgBooking, forProducer: boolean): string {
+  return `<div class="recap">
+      <div><strong>Dato/tid:</strong> ${escapeHtml(previsitSlotNb(booking.slot_at))}</div>
+      ${booking.suggested_slot_at && booking.pre_status === "time_suggested" ? `<div><strong>Foreslått nytt tidspunkt:</strong> ${escapeHtml(previsitSlotNb(booking.suggested_slot_at))}</div>` : ""}
+      <div><strong>Antall:</strong> ${booking.party_size} person${booking.party_size > 1 ? "er" : ""}</div>
+      ${forProducer ? `<div><strong>Gjest:</strong> ${escapeHtml(booking.guest_name)}</div>
+      <div><strong>E-post:</strong> ${escapeHtml(booking.guest_email)}</div>
+      ${booking.guest_phone ? `<div><strong>Telefon:</strong> ${escapeHtml(booking.guest_phone)}</div>` : ""}
+      ${booking.notes ? `<div><strong>Kommentar fra gjesten:</strong> ${escapeHtml(booking.notes)}</div>` : ""}` : ""}
+    </div>`;
+}
+
+// GET /kategori/gardssalg/svar/:token — producer answer page. Unknown token →
+// 404. Used/expired token → friendly page WITHOUT actions (and the POST below
+// refuses to mutate in the same states). A valid token renders the three
+// choices as POST buttons — prefetch-safe by construction.
+router.get(
+  "/kategori/gardssalg/svar/:token",
+  (req: Request, res: Response, next: NextFunction) => {
+    const token = String(req.params.token || "");
+    if (!token) return next();
+    let booking: GardssalgBooking | null = null;
+    try {
+      booking = getBookingByRespondToken(token);
+    } catch {
+      booking = null;
+    }
+    if (!booking) return next();
+
+    const provider = getProviderById(booking.provider_id) as { navn?: string | null } | null;
+    const state = respondTokenState(booking);
+    const statusLabel = PRE_STATUS_LABEL[booking.pre_status] || booking.pre_status;
+
+    const done = String(req.query.done || "");
+    const errorParam = String(req.query.error || "");
+    const banner =
+      done === "bekreftet"
+        ? `<div class="bekreft-banner ok" role="status">Reservasjonen er bekreftet — gjesten har fått beskjed.</div>`
+        : done === "avslatt"
+          ? `<div class="bekreft-banner ok" role="status">Forespørselen er avslått — gjesten har fått beskjed.</div>`
+          : done === "foreslatt"
+            ? `<div class="bekreft-banner ok" role="status">Forslaget er sendt til gjesten — du får e-post når gjesten svarer.</div>`
+            : errorParam === "ugyldig_tid"
+              ? `<div class="bekreft-banner warn" role="alert">Ugyldig tidspunkt — velg et tidspunkt frem i tid.</div>`
+              : errorParam
+                ? `<div class="bekreft-banner warn" role="alert">Kunne ikke registrere svaret. Prøv igjen.</div>`
+                : "";
+
+    let actionsHtml = "";
+    if (!previsitOpen(booking)) {
+      // Post-visit already resolved (attended/no_show) or booking cancelled —
+      // pre-visit answers are moot (review finding 3). Friendly, no actions.
+      actionsHtml = `<div class="bekreft-banner warn" role="status">${
+        booking.status === "cancelled"
+          ? "Reservasjonen er kansellert — forespørselen kan ikke lenger besvares."
+          : "Besøket er allerede registrert (oppmøte-siden) — forhåndssvar er ikke lenger aktuelt for denne reservasjonen."
+      }</div>`;
+    } else if (state !== "ok") {
+      // Friendly no-action page: used or expired — never a mutation, never a
+      // 404. NB the expired text must be TRUE in both reachable states
+      // (pre_status already 'expired' vs. a time_suggested/awaiting row whose
+      // deadline passed but the followup engine hasn't run yet): the closure
+      // + guest notification happen automatically, they may not have happened
+      // YET (review finding 1c).
+      actionsHtml = `<div class="bekreft-banner warn" role="status">${
+        state === "used"
+          ? "Denne svarlenken er allerede brukt — forespørselen er besvart."
+          : "Denne svarlenken er utløpt — forespørselen avsluttes automatisk og gjesten får beskjed."
+      }</div>`;
+    } else {
+      const postTo = `/kategori/gardssalg/svar/${encodeURIComponent(token)}`;
+      const confirmBtn = booking.pre_status === "awaiting_provider"
+        ? `<form method="POST" action="${postTo}"><input type="hidden" name="action" value="bekreft"><button type="submit" class="act-btn act-primary">Bekreft reservasjonen</button></form>`
+        : "";
+      const waitingNote = booking.pre_status === "time_suggested"
+        ? `<div class="bekreft-banner ok" role="status">Forslaget ditt er sendt — venter på svar fra gjesten. Du kan foreslå et annet tidspunkt (erstatter forslaget) eller avslå.</div>`
+        : "";
+      actionsHtml = `${waitingNote}
+    ${confirmBtn}
+    <form method="POST" action="${postTo}" class="suggest-box">
+      <input type="hidden" name="action" value="foresla">
+      <label for="suggested_slot">Foreslå nytt tidspunkt</label>
+      <input id="suggested_slot" name="suggested_slot" type="datetime-local" required>
+      <button type="submit" class="act-btn act-secondary">Send forslag til gjesten</button>
+    </form>
+    <form method="POST" action="${postTo}"><input type="hidden" name="action" value="avsla"><button type="submit" class="act-btn act-secondary">Avslå forespørselen</button></form>`;
+    }
+
+    const inner = `    <h1>Reservasjonsforespørsel hos ${escapeHtml(provider?.navn || "deg")}</h1>
+    <div class="ref">${escapeHtml(booking.booking_ref)}</div>
+    ${banner}
+    <div class="status-line">Status: <strong>${escapeHtml(statusLabel)}</strong></div>
+    ${previsitRecapHtml(booking, true)}
+    ${actionsHtml}
+    <p class="hint">Denne siden er for produsenten. Lenken er personlig for denne forespørselen${booking.respond_token_expires_at ? ` og utløper automatisk ${escapeHtml(previsitSlotNb(booking.respond_token_expires_at))}` : ""} — ikke del den videre.</p>`;
+
+    res.setHeader("Content-Type", "text/html; charset=utf-8");
+    res.setHeader("Cache-Control", "no-store");
+    res.send(previsitPage(`Svar på forespørsel — ${booking.booking_ref}`, inner));
+  },
+);
+
+// POST /kategori/gardssalg/svar/:token — the producer's actual answer.
+// Used/expired tokens and unknown actions mutate NOTHING (PRG back to the
+// friendly GET). Guest notification emails are fire-and-forget, mirroring
+// every other booking email call site.
+router.post(
+  "/kategori/gardssalg/svar/:token",
+  express.urlencoded({ extended: false }),
+  (req: Request, res: Response, next: NextFunction) => {
+    const token = String(req.params.token || "");
+    if (!token) return next();
+    let booking: GardssalgBooking | null = null;
+    try {
+      booking = getBookingByRespondToken(token);
+    } catch {
+      booking = null;
+    }
+    if (!booking) return next();
+
+    const backTo = `/kategori/gardssalg/svar/${encodeURIComponent(token)}`;
+    if (!previsitOpen(booking) || respondTokenState(booking) !== "ok") {
+      // Post-visit already resolved/cancelled, or the token is used/expired —
+      // the friendly GET explains why; nothing was mutated.
+      res.redirect(303, backTo);
+      return;
+    }
+
+    const body = (req.body || {}) as Record<string, unknown>;
+    const action = String(body.action || "");
+
+    if (action === "bekreft") {
+      const updated = producerRespondConfirm(token);
+      if (!updated) {
+        res.redirect(303, `${backTo}?error=ugyldig`);
+        return;
+      }
+      sendPrevisitConfirmedToGuest(updated).catch((e) =>
+        console.error("[booking-previsit] guest confirm email failed", updated.booking_ref, e),
+      );
+      res.redirect(303, `${backTo}?done=bekreftet`);
+      return;
+    }
+
+    if (action === "avsla") {
+      const updated = producerRespondDecline(token);
+      if (!updated) {
+        res.redirect(303, `${backTo}?error=ugyldig`);
+        return;
+      }
+      sendPrevisitDeclinedToGuest(updated).catch((e) =>
+        console.error("[booking-previsit] guest decline email failed", updated.booking_ref, e),
+      );
+      res.redirect(303, `${backTo}?done=avslatt`);
+      return;
+    }
+
+    if (action === "foresla") {
+      const suggested = String(body.suggested_slot || "").trim();
+      const updated = producerSuggestTime(token, suggested);
+      if (!updated) {
+        res.redirect(303, `${backTo}?error=ugyldig_tid`);
+        return;
+      }
+      sendSuggestionToGuest(updated).catch((e) =>
+        console.error("[booking-previsit] guest suggestion email failed", updated.booking_ref, e),
+      );
+      res.redirect(303, `${backTo}?done=foreslatt`);
+      return;
+    }
+
+    res.redirect(303, `${backTo}?error=ugyldig`);
+  },
+);
+
+// GET /kategori/gardssalg/gjestesvar/:token — the guest's decision page for a
+// producer-suggested time. Unknown token → 404 (also covers rotated-away
+// tokens from a re-suggest). No longer actionable (the pre_status moved on) →
+// friendly outcome page, no actions, no mutation.
+router.get(
+  "/kategori/gardssalg/gjestesvar/:token",
+  (req: Request, res: Response, next: NextFunction) => {
+    const token = String(req.params.token || "");
+    if (!token) return next();
+    let booking: GardssalgBooking | null = null;
+    try {
+      booking = getBookingByGuestDecisionToken(token);
+    } catch {
+      booking = null;
+    }
+    if (!booking) return next();
+
+    const provider = getProviderById(booking.provider_id) as { navn?: string | null } | null;
+    const statusLabel = PRE_STATUS_LABEL[booking.pre_status] || booking.pre_status;
+    // Actionable = still time_suggested AND within the loop's expiry window
+    // AND the suggested time itself not yet passed (review finding 1 — an
+    // acceptance may never land in the past) AND post-visit still 'reserved'.
+    const actionable = guestDecisionActionable(booking);
+
+    const done = String(req.query.done || "");
+    const banner =
+      done === "akseptert"
+        ? `<div class="bekreft-banner ok" role="status">Du har akseptert det nye tidspunktet — reservasjonen er bekreftet.</div>`
+        : done === "avslatt"
+          ? `<div class="bekreft-banner ok" role="status">Du har avslått forslaget. Vi beklager at tidspunktet ikke passet.</div>`
+          : "";
+
+    let inner: string;
+    if (!actionable) {
+      // Distinguish "the loop timed out under you" (still time_suggested, but
+      // the deadline or the suggested time passed) from the generic
+      // already-answered case — the timed-out text must be true BEFORE the
+      // followup engine has flipped the row to expired.
+      const timedOut = booking.pre_status === "time_suggested" && previsitOpen(booking);
+      inner = `    <h1>Reservasjon hos ${escapeHtml(provider?.navn || "produsenten")}</h1>
+    <div class="ref">${escapeHtml(booking.booking_ref)}</div>
+    ${banner}
+    <div class="bekreft-banner warn" role="status">${
+      timedOut
+        ? "Fristen for å svare på forslaget er dessverre ute — forespørselen avsluttes automatisk, og du får beskjed på e-post."
+        : "Denne lenken er allerede besvart eller ikke lenger aktiv."
+    }</div>
+    <div class="status-line">Status: <strong>${escapeHtml(statusLabel)}</strong></div>
+    ${previsitRecapHtml(booking, false)}
+    <p class="hint">Trenger du hjelp? Svar på bekreftelses-e-posten din.</p>`;
+    } else {
+      const postTo = `/kategori/gardssalg/gjestesvar/${encodeURIComponent(token)}`;
+      inner = `    <h1>Nytt tidspunkt foreslått — ${escapeHtml(provider?.navn || "produsenten")}</h1>
+    <div class="ref">${escapeHtml(booking.booking_ref)}</div>
+    ${banner}
+    <div class="status-line">Produsenten kan ikke ta imot besøket ${escapeHtml(previsitSlotNb(booking.slot_at))}, men foreslår i stedet:</div>
+    <div class="status-line"><strong>${escapeHtml(previsitSlotNb(booking.suggested_slot_at))}</strong></div>
+    ${previsitRecapHtml(booking, false)}
+    <form method="POST" action="${postTo}"><input type="hidden" name="action" value="aksepter"><button type="submit" class="act-btn act-primary">Aksepter det nye tidspunktet</button></form>
+    <form method="POST" action="${postTo}"><input type="hidden" name="action" value="avsla"><button type="submit" class="act-btn act-secondary">Tidspunktet passer ikke — avslå</button></form>
+    <p class="hint">Lenken er personlig for din reservasjon — ikke del den videre.</p>`;
+    }
+
+    res.setHeader("Content-Type", "text/html; charset=utf-8");
+    res.setHeader("Cache-Control", "no-store");
+    res.send(previsitPage(`Nytt tidspunkt — ${booking.booking_ref}`, inner));
+  },
+);
+
+// POST /kategori/gardssalg/gjestesvar/:token — guest accepts/declines the
+// suggested time. One-shot by state machine: once the pre_status leaves
+// time_suggested, further POSTs mutate nothing (PRG to the friendly GET).
+router.post(
+  "/kategori/gardssalg/gjestesvar/:token",
+  express.urlencoded({ extended: false }),
+  (req: Request, res: Response, next: NextFunction) => {
+    const token = String(req.params.token || "");
+    if (!token) return next();
+    let booking: GardssalgBooking | null = null;
+    try {
+      booking = getBookingByGuestDecisionToken(token);
+    } catch {
+      booking = null;
+    }
+    if (!booking) return next();
+
+    const backTo = `/kategori/gardssalg/gjestesvar/${encodeURIComponent(token)}`;
+    if (!guestDecisionActionable(booking)) {
+      // Already answered, timed out, or post-visit closed — friendly GET
+      // explains which; nothing is mutated (the service guards again anyway).
+      res.redirect(303, backTo);
+      return;
+    }
+
+    const action = String(((req.body || {}) as Record<string, unknown>).action || "");
+    if (action === "aksepter") {
+      const updated = guestAcceptSuggestion(token);
+      if (!updated) {
+        res.redirect(303, backTo);
+        return;
+      }
+      // Both parties get the outcome: guest confirmation (transactional) +
+      // producer notification (through the dispatch gates).
+      sendPrevisitConfirmedToGuest(updated, true).catch((e) =>
+        console.error("[booking-previsit] guest accept email failed", updated.booking_ref, e),
+      );
+      sendGuestDecisionToProducer(updated, true).catch((e) =>
+        console.error("[booking-previsit] producer accept notice failed", updated.booking_ref, e),
+      );
+      res.redirect(303, `${backTo}?done=akseptert`);
+      return;
+    }
+
+    if (action === "avsla") {
+      const updated = guestDeclineSuggestion(token);
+      if (!updated) {
+        res.redirect(303, backTo);
+        return;
+      }
+      sendGuestDecisionToProducer(updated, false).catch((e) =>
+        console.error("[booking-previsit] producer decline notice failed", updated.booking_ref, e),
+      );
+      res.redirect(303, `${backTo}?done=avslatt`);
+      return;
+    }
+
+    res.redirect(303, backTo);
+  },
+);
+
+// GET /kategori/gardssalg/status/:booking_ref/:guest_token — the guest's
+// always-readable status page (no login). Pure read: shows the current
+// pre-visit status + agreed/suggested time. Token must match the row's
+// guest_status_token; anything else → 404 (never reveals whether a ref
+// exists). Never mutates.
+router.get(
+  "/kategori/gardssalg/status/:bookingRef/:guestToken",
+  (req: Request, res: Response, next: NextFunction) => {
+    const bookingRef = String(req.params.bookingRef || "");
+    const guestToken = String(req.params.guestToken || "");
+    if (!bookingRef || !guestToken) return next();
+    let booking: GardssalgBooking | null = null;
+    try {
+      booking = getBookingByRef(bookingRef);
+    } catch {
+      booking = null;
+    }
+    if (!booking || !booking.guest_status_token || booking.guest_status_token !== guestToken) {
+      return next();
+    }
+
+    const provider = getProviderById(booking.provider_id) as { navn?: string | null } | null;
+    const statusLabel = PRE_STATUS_LABEL[booking.pre_status] || booking.pre_status;
+    const extra =
+      booking.pre_status === "expired"
+        ? `<div class="bekreft-banner warn" role="status">Vi beklager — forespørselen ble dessverre ikke avklart i tide og er utløpt. <a href="/kategori/gardssalg">Se alternative tilbydere her</a>.</div>`
+        : booking.pre_status === "provider_declined"
+          ? `<div class="bekreft-banner warn" role="status">Vi beklager at forespørselen ikke kunne bekreftes. <a href="/kategori/gardssalg">Se alternative tilbydere her</a>.</div>`
+          : booking.pre_status === "time_suggested"
+            ? `<div class="bekreft-banner ok" role="status">Sjekk e-posten din — du har fått en lenke for å akseptere eller avslå det nye tidspunktet.</div>`
+            : booking.pre_status === "provider_confirmed"
+              ? `<div class="bekreft-banner ok" role="status">Reservasjonen er bekreftet — velkommen!</div>`
+              : "";
+
+    const inner = `    <h1>Reservasjon hos ${escapeHtml(provider?.navn || "produsenten")}</h1>
+    <div class="ref">${escapeHtml(booking.booking_ref)}</div>
+    <div class="status-line">Status: <strong>${escapeHtml(statusLabel)}</strong></div>
+    ${extra}
+    ${previsitRecapHtml(booking, false)}
+    <p class="hint">Denne siden viser alltid gjeldende status for reservasjonen din. Lenken er personlig — ikke del den videre.</p>`;
+
+    res.setHeader("Content-Type", "text/html; charset=utf-8");
+    res.setHeader("Cache-Control", "no-store");
+    res.send(previsitPage(`Status — ${booking.booking_ref}`, inner));
   },
 );
 

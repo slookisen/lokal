@@ -447,5 +447,53 @@ export function initExperiencesSchema(db: Database.Database): void {
     db.exec("ALTER TABLE experience_providers ADD COLUMN catalog_hidden INTEGER DEFAULT 0");
   } catch { /* already present */ }
 
+  // ─── Booking-flyt-v1 slice 2 — pre-visit e-post-svarsløyfe (dev-request
+  // 2026-07-14-booking-flyt-v1, slice 2) ─────────────────────────────────────
+  // The existing status/confirm_token pair is strictly POST-visit (attendance
+  // → billable/commission) and is untouched. This block adds the PRE-visit
+  // request→answer loop as its own parallel state machine:
+  //
+  //   pre_status: awaiting_provider → provider_confirmed | provider_declined
+  //                                 | time_suggested (→ confirmed/declined via
+  //                                   the guest's decision) | expired
+  //
+  //   respond_token / respond_token_expires_at / respond_token_used_at —
+  //     the PRODUCER's one-time, expiring credential for the
+  //     /kategori/gardssalg/svar/:token answer page (Bekreft / Foreslå nytt
+  //     tidspunkt / Avslå). used_at is stamped on a TERMINAL answer.
+  //   suggested_slot_at + guest_decision_token — set when the producer
+  //     suggests a new time; the guest's one-shot-for-action accept/decline
+  //     credential for /kategori/gardssalg/gjestesvar/:token.
+  //   guest_status_token — the guest's always-readable (never-mutating)
+  //     status-page credential (/kategori/gardssalg/status/:ref/:token).
+  //   reminder_sent_at / expired_guest_notified_at — one-shot markers for the
+  //     producer reminder and the guest's "expired, sorry" notification, so
+  //     processBookingFollowups() stays idempotent.
+  //
+  // pre_status defaults to 'awaiting_provider', but rows created BEFORE this
+  // slice have respond_token NULL — every pre-visit read/followup path
+  // requires respond_token IS NOT NULL, so legacy rows keep today's behavior
+  // (post-visit flow only) and are never reminded/expired retroactively.
+  // ALTER TABLE ADD COLUMN is idempotent here — error means already-present.
+  const previsitCols = [
+    "ALTER TABLE gardssalg_bookings ADD COLUMN pre_status TEXT NOT NULL DEFAULT 'awaiting_provider'",
+    "ALTER TABLE gardssalg_bookings ADD COLUMN respond_token TEXT",
+    "ALTER TABLE gardssalg_bookings ADD COLUMN respond_token_expires_at TEXT",
+    "ALTER TABLE gardssalg_bookings ADD COLUMN respond_token_used_at TEXT",
+    "ALTER TABLE gardssalg_bookings ADD COLUMN suggested_slot_at TEXT",
+    "ALTER TABLE gardssalg_bookings ADD COLUMN guest_decision_token TEXT",
+    "ALTER TABLE gardssalg_bookings ADD COLUMN guest_status_token TEXT",
+    "ALTER TABLE gardssalg_bookings ADD COLUMN reminder_sent_at TEXT",
+    "ALTER TABLE gardssalg_bookings ADD COLUMN expired_guest_notified_at TEXT",
+    // Unique lookup indexes — SQLite unique indexes allow any number of NULLs,
+    // so legacy rows (all tokens NULL) are unaffected.
+    "CREATE UNIQUE INDEX IF NOT EXISTS idx_gsb_respond_token ON gardssalg_bookings(respond_token)",
+    "CREATE UNIQUE INDEX IF NOT EXISTS idx_gsb_guest_decision_token ON gardssalg_bookings(guest_decision_token)",
+    "CREATE INDEX IF NOT EXISTS idx_gsb_pre_status ON gardssalg_bookings(pre_status)",
+  ];
+  for (const stmt of previsitCols) {
+    try { db.exec(stmt); } catch { /* already present */ }
+  }
+
   console.log("[experiences] schema initialized");
 }
