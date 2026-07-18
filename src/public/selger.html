@@ -415,6 +415,7 @@
         <button class="tab" data-tab="products" data-i18n="tab_products">Produkter</button>
         <button class="tab" data-tab="hours" data-i18n="tab_hours">Åpningstider</button>
         <button class="tab" data-tab="stats" data-i18n="tab_stats">Statistikk</button>
+        <button class="tab" data-tab="orders" data-i18n="tab_orders">Bestillinger</button>
         <button class="tab" data-tab="settings" data-i18n="tab_settings">Innstillinger</button>
       </div>
 
@@ -689,6 +690,41 @@
         </div>
       </div>
 
+      <!-- ── Tab: Bestillinger ── -->
+      <!-- dev-request 2026-07-13-produsent-dashboard-verdibevis, criterion 2
+           ("order inbox"). Data comes from the session-gated
+           GET /api/agents/:id/orders (src/routes/owner-portal.ts), gated by
+           the SAME rfb_owner_session magic-link cookie as the Statistikk
+           tab above (a SEPARATE login from this page's own claim-token flow
+           further up). If the visitor hasn't gone through that cookie login,
+           the fetch below returns 401/403 and we show a login-required form
+           that reuses the existing POST /api/agents/:id/request-magic-link
+           endpoint — same pattern as statsLoginRequired, duplicated with its
+           own ids (ordersLoginRequired/ordersLoginEmail) rather than shared,
+           since the two tabs load independently. -->
+      <div class="tab-panel" id="panel-orders">
+        <div class="card" id="ordersLoading" style="text-align:center;color:var(--gray-500);">Laster bestillinger &hellip;</div>
+
+        <div class="card hidden" id="ordersLoginRequired">
+          <h2>Bestillinger</h2>
+          <p style="color:var(--gray-500);font-size:0.9rem;margin-bottom:1rem;">
+            Bestillinger krever en egen innloggingslenke (i tillegg til p&aring;loggingen &oslash;verst p&aring; siden). Vi sender lenken til e-posten som er registrert p&aring; profilen.
+          </p>
+          <div style="display:flex;gap:0.5rem;flex-wrap:wrap;align-items:center;">
+            <input type="email" id="ordersLoginEmail" placeholder="din@epost.no" style="padding:0.55rem 0.75rem;border:1px solid var(--gray-300);border-radius:var(--radius);font-size:0.9rem;width:200px;" />
+            <button class="btn btn-primary btn-small" id="btnOrdersMagicLink">Send innloggingslenke</button>
+          </div>
+          <div id="ordersLoginAlert" style="margin-top:0.5rem;"></div>
+        </div>
+
+        <div class="hidden" id="ordersContent">
+          <div class="card">
+            <h2>Bestillinger</h2>
+            <ul class="product-list" id="ordersList"></ul>
+          </div>
+        </div>
+      </div>
+
       <!-- ── Tab: Settings ── -->
       <div class="tab-panel" id="panel-settings">
         <div class="card">
@@ -894,7 +930,7 @@
         login: 'Logg inn', logout: 'Logg ut',
         verified: 'Verifisert',
         stat_discovered: 'Oppdaget', stat_contacted: 'Kontaktet', stat_chosen: 'Valgt', stat_trust: 'Trust Score',
-        tab_profile: 'Profil', tab_products: 'Produkter', tab_hours: '\u00c5pningstider', tab_stats: 'Statistikk', tab_settings: 'Innstillinger',
+        tab_profile: 'Profil', tab_products: 'Produkter', tab_hours: '\u00c5pningstider', tab_stats: 'Statistikk', tab_orders: 'Bestillinger', tab_settings: 'Innstillinger',
         profile_info: 'Butikkinformasjon',
         about_label: 'Om butikken', address_label: 'Adresse', postal_code_label: 'Postnummer',
         website_label: 'Nettside', phone_label: 'Telefon', email_label: 'Kontakt-epost',
@@ -962,7 +998,7 @@
         login: 'Log in', logout: 'Log out',
         verified: 'Verified',
         stat_discovered: 'Discovered', stat_contacted: 'Contacted', stat_chosen: 'Chosen', stat_trust: 'Trust Score',
-        tab_profile: 'Profile', tab_products: 'Products', tab_hours: 'Opening hours', tab_stats: 'Statistics', tab_settings: 'Settings',
+        tab_profile: 'Profile', tab_products: 'Products', tab_hours: 'Opening hours', tab_stats: 'Statistics', tab_orders: 'Orders', tab_settings: 'Settings',
         profile_info: 'Shop information',
         about_label: 'About the shop', address_label: 'Address', postal_code_label: 'Postal code',
         website_label: 'Website', phone_label: 'Phone', email_label: 'Contact email',
@@ -1629,6 +1665,7 @@
       tab.classList.add('active');
       document.getElementById('panel-' + tab.getAttribute('data-tab')).classList.add('active');
       if (tab.getAttribute('data-tab') === 'stats') loadOwnerStats();
+      if (tab.getAttribute('data-tab') === 'orders') loadOwnerOrders();
     });
 
     // ── Statistikk tab (dev-request 2026-07-03-agent-profile-conversations-stats, slice 3) ──
@@ -1825,6 +1862,137 @@
           }
         })
         .catch(function() { showAlert('statsLoginAlert', 'Noe gikk galt. Pr&oslash;v igjen.', 'error'); })
+        .finally(function() { btn.disabled = false; });
+    });
+
+    // ── Bestillinger tab (dev-request 2026-07-13-produsent-dashboard-verdibevis, criterion 2) ──
+    // GET /api/agents/:id/orders is gated on the same rfb_owner_session
+    // magic-link cookie as the Statistikk tab above — mirrors
+    // loadOwnerStats()'s structure exactly (401/403 -> login-required form
+    // reusing the existing magic-link request endpoint).
+    var ORDER_STATUS_LABELS = {
+      pending: 'Venter',
+      confirmed: 'Bekreftet',
+      declined: 'Avslått',
+      ready: 'Klar for henting',
+      completed: 'Fullført',
+      cancelled: 'Kansellert'
+    };
+    function orderStatusLabel(o) {
+      if (o.status === 'cancelled' && o.cancel_reason === 'no_show') return 'Ikke hentet';
+      return ORDER_STATUS_LABELS[o.status] || o.status;
+    }
+    // Reuses the existing .badge base class + this file's already-defined
+    // badge/alert color vars -- no new CSS classes. badge-green/badge-orange
+    // already exist; there is no badge-red, so red statuses use an inline
+    // style built from the same --red/--red-light vars as .alert-error.
+    function orderStatusBadge(o) {
+      var label = escHtml(orderStatusLabel(o));
+      if (o.status === 'completed') {
+        return '<span class="badge badge-green">' + label + '</span>';
+      }
+      if (o.status === 'pending' || o.status === 'confirmed' || o.status === 'ready') {
+        return '<span class="badge badge-orange">' + label + '</span>';
+      }
+      // declined / cancelled
+      return '<span class="badge" style="background:var(--red-light);color:var(--red);">' + label + '</span>';
+    }
+    function formatOrderDate(iso) {
+      if (!iso) return '';
+      // SQLite datetime('now') strings are 'YYYY-MM-DD HH:MM:SS' (UTC, no
+      // 'Z') -- normalize so Date() parses them correctly instead of as
+      // local time.
+      var d = new Date(iso.indexOf('T') === -1 ? iso.replace(' ', 'T') + 'Z' : iso);
+      if (isNaN(d.getTime())) return iso;
+      return d.toLocaleDateString('nb-NO', { day: '2-digit', month: 'short', year: 'numeric' }) +
+        ' ' + d.toLocaleTimeString('nb-NO', { hour: '2-digit', minute: '2-digit' });
+    }
+    function formatNok(n) {
+      if (n === null || n === undefined) return '–';
+      return Math.round(n).toLocaleString('nb-NO') + ' kr';
+    }
+
+    var ordersLoading = false;
+    function loadOwnerOrders() {
+      if (!state.agentId || ordersLoading) return;
+      ordersLoading = true;
+      show('ordersLoading');
+      hide('ordersLoginRequired');
+      hide('ordersContent');
+      fetch(API_BASE + '/api/agents/' + state.agentId + '/orders', { credentials: 'same-origin' })
+        .then(function(r) {
+          if (r.status === 401 || r.status === 403) {
+            hide('ordersLoading');
+            show('ordersLoginRequired');
+            var prefillEmail = document.getElementById('ordersLoginEmail');
+            if (prefillEmail && !prefillEmail.value && state.knowledge && state.knowledge.email) {
+              prefillEmail.value = state.knowledge.email;
+            }
+            return null;
+          }
+          if (!r.ok) throw new Error('HTTP ' + r.status);
+          return r.json();
+        })
+        .then(function(data) {
+          if (!data) return;
+          hide('ordersLoading');
+          show('ordersContent');
+          renderOwnerOrders(data);
+        })
+        .catch(function(err) {
+          hide('ordersLoading');
+          show('ordersLoginRequired');
+          showAlert('ordersLoginAlert', 'Kunne ikke laste bestillinger: ' + escHtml(err.message), 'error');
+        })
+        .finally(function() { ordersLoading = false; });
+    }
+
+    function renderOwnerOrders(data) {
+      var orders = data.orders || [];
+      if (orders.length === 0) {
+        document.getElementById('ordersList').innerHTML =
+          '<li style="text-align:center;color:var(--gray-500);padding:2rem;">Ingen bestillinger enn&aring;</li>';
+        return;
+      }
+      var html = orders.map(function(o) {
+        var metaBits = [formatOrderDate(o.created_at), (o.item_count || 0) + ' varer'];
+        if (o.pickup_time) metaBits.push('Henting: ' + formatOrderDate(o.pickup_time));
+        return '<li class="product-item">' +
+          '<div>' +
+            '<span class="product-name">Bestilling #' + escHtml(String(o.order_id).slice(0, 8)) + '</span><br>' +
+            '<span class="product-meta">' + metaBits.map(escHtml).join(' &bull; ') + '</span>' +
+          '</div>' +
+          '<div style="text-align:right;">' +
+            orderStatusBadge(o) + '<br>' +
+            '<span class="product-meta">' + escHtml(formatNok(o.total_nok)) + '</span>' +
+          '</div>' +
+        '</li>';
+      }).join('');
+      document.getElementById('ordersList').innerHTML = html;
+    }
+
+    document.getElementById('btnOrdersMagicLink').addEventListener('click', function() {
+      var email = (document.getElementById('ordersLoginEmail').value || '').trim();
+      if (!email || email.indexOf('@') === -1) {
+        showAlert('ordersLoginAlert', 'Skriv inn en gyldig e-postadresse.', 'error');
+        return;
+      }
+      this.disabled = true;
+      var btn = this;
+      fetch(API_BASE + '/api/agents/' + state.agentId + '/request-magic-link', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ email: email })
+      })
+        .then(function(r) { return r.json().then(function(d) { return { ok: r.ok, data: d }; }); })
+        .then(function(res) {
+          if (res.ok && res.data && res.data.success) {
+            showAlert('ordersLoginAlert', 'Sjekk e-posten din! Trykk p&aring; lenken, og kom s&aring; tilbake hit og &aring;pne Bestillinger-fanen p&aring; nytt.', 'success');
+          } else {
+            showAlert('ordersLoginAlert', (res.data && res.data.message) || 'Kunne ikke sende lenke. Pr&oslash;v igjen.', 'error');
+          }
+        })
+        .catch(function() { showAlert('ordersLoginAlert', 'Noe gikk galt. Pr&oslash;v igjen.', 'error'); })
         .finally(function() { btn.disabled = false; });
     });
 
