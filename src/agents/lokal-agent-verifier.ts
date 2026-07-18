@@ -49,6 +49,20 @@ export interface VerifierResult {
   url_demoted: boolean;
   // orch-PR-20260512-33: domain-coherence override (Eidsmo fix)
   domain_incoherent: boolean;
+  // dev-request 2026-07-15-gate-integrity-unverified-agent-bypass (slice 2):
+  // free-mail/ISP email counted as ownership-proven with zero evidence — see
+  // the Guard #3 block in runVerifierBatch for the full rationale.
+  // email_ownership_unproven: true whenever the free-mail+no-evidence
+  // condition holds (regardless of enforced-vs-report-only).
+  // email_ownership_report_only: true specifically when the agent was
+  // ALREADY `verified` going into this run — Daniel's explicit instruction
+  // is that this check must NEVER downgrade an already-verified agent, so
+  // that case is counted/reported but never changes the outcome.
+  email_ownership_unproven: boolean;
+  email_ownership_report_only: boolean;
+  // agent display name, carried through so buildRunEnvelope can surface
+  // report-only examples as {agent_id, name} without a second DB read.
+  agent_name: string | null;
 }
 
 export interface BrregLookupResult {
@@ -94,6 +108,17 @@ function hostnameFromUrl(u: string | null | undefined): string | null {
 function emailDomain(e: string | null | undefined): string | null {
   if (!e || !e.includes("@")) return null;
   return e.split("@")[1].toLowerCase();
+}
+
+// Coerce a field_provenance[field] value (array, legacy single-object, or
+// missing) to a ProvenanceRecord[] — mirrors the same coercion in
+// crossSourceAgreement() (cross-source-validator.ts) so both call sites treat
+// the legacy single-record shape identically.
+function coerceFieldRecords(raw: unknown): ProvenanceRecord[] {
+  if (!raw) return [];
+  if (Array.isArray(raw)) return raw as ProvenanceRecord[];
+  if (typeof raw === "object") return [raw as ProvenanceRecord];
+  return [];
 }
 
 // HEAD-fetch with short timeout. We don't follow redirects deeply;
@@ -287,7 +312,7 @@ export function computeEnrichmentStatus(input: {
 export function pickBatch(db: any, limit = 30): any[] {
   return db
     .prepare(
-      `SELECT a.id, a.name, a.url AS agent_url, a.city AS location_city,
+      `SELECT a.id, a.name, a.url AS agent_url, a.city AS location_city, a.is_verified,
               k.email, k.phone, k.address,
               k.website, k.about, k.products, k.field_provenance,
               k.verification_status, k.enrichment_status,
@@ -331,7 +356,7 @@ export function pickReviewQueueBatch(db: any, limit = 30): any[] {
        )`;
   return db
     .prepare(
-      `SELECT a.id, a.name, a.url AS agent_url, a.city AS location_city,
+      `SELECT a.id, a.name, a.url AS agent_url, a.city AS location_city, a.is_verified,
               k.email, k.phone, k.address,
               k.website, k.about, k.products, k.field_provenance,
               k.verification_status, k.enrichment_status,
@@ -376,7 +401,7 @@ export function pickPendingVerifyBatch(db: any, limit = 50): any[] {
     : `AND (k.pending_verify_parked_since IS NULL OR k.pending_verify_parked_since <= datetime('now','-30 days'))`;
   return db
     .prepare(
-      `SELECT a.id, a.name, a.url AS agent_url, a.city AS location_city,
+      `SELECT a.id, a.name, a.url AS agent_url, a.city AS location_city, a.is_verified,
               k.email, k.phone, k.address,
               k.website, k.about, k.products, k.field_provenance,
               k.verification_status, k.enrichment_status,
@@ -441,7 +466,7 @@ export function pickBatchBiased(
   const growthTarget = Math.floor(limit * growthRatio);
   const verifiedTarget = limit - growthTarget;
 
-  const SELECT_COLS = `SELECT a.id, a.name, a.url AS agent_url, a.city AS location_city,
+  const SELECT_COLS = `SELECT a.id, a.name, a.url AS agent_url, a.city AS location_city, a.is_verified,
               k.email, k.phone, k.address,
               k.website, k.about, k.products, k.field_provenance,
               k.verification_status, k.enrichment_status,
@@ -947,6 +972,70 @@ export async function runVerifierBatch(opts: {
     }
 
     const wasInPool = agent.verification_status === "verified";
+
+    // ── Guard #3 (verifier side): free-mail ownership provenance ──────────────
+    // dev-request 2026-07-15-gate-integrity-unverified-agent-bypass, slice 2.
+    // computeKvalitetsGate's email_own_domain exemption treats ANY free-mail/
+    // ISP address (gmail.com, online.no, …) as automatically "the producer's
+    // own email" with zero evidence required — that exemption is intentional
+    // and UNCHANGED (small Norwegian producers commonly use a personal
+    // mailbox), but it means a wrong-entity free-mail address needs no
+    // evidence at all to count as ownership. Real failure (2026-07-15): an
+    // outreach email went to the wrong entity because a personal free-mail
+    // address (norskott@online.no) had been attached to the wrong producer
+    // ("Dalheim Gårdsysteri") during enrichment.
+    //
+    // Evidence (either is sufficient to clear the flag):
+    //   A. field_provenance.email has a "homepage" source_type record whose
+    //      value matches this exact email — the homepage-provenance crawl
+    //      found the address published on the producer's own site (same
+    //      crawl/source_type already used for website_ownership above).
+    //   B. agents.is_verified = 1 — the producer went through the manual
+    //      claim/verification flow (agent_claims); a human already proved
+    //      ownership of this listing, independent of the crawl.
+    //
+    // Daniel's explicit, binding instruction (after seeing that a naive
+    // "re-check agents.is_verified" fix would collapse the verified pool from
+    // 487 to single digits): "we cannot reduce the verified/outreach pool, the
+    // whole point is to GROW this pool." So — unlike websiteOwnershipUnverified
+    // above, which downgrades an already-verified agent on every re-verify pass
+    // — this check must NEVER downgrade an agent that is ALREADY `verified`
+    // going into this run. It reuses `wasInPool` (just computed above) as the
+    // monotonic guard: enforced (quarantine to review_required) only when
+    // `!wasInPool`; report-only (counted, zero effect on the outcome) when
+    // `wasInPool`.
+    const emailDomainForOwnership = emailDomain(agent.email);
+    const isFreeMailForOwnership = !!(emailDomainForOwnership && FREE_MAIL_DOMAINS.includes(emailDomainForOwnership));
+    const emailHomepageEvidence = coerceFieldRecords(fieldProv.email).some(
+      (rec) =>
+        rec &&
+        typeof rec === "object" &&
+        rec.source_type === "homepage" &&
+        typeof rec.value === "string" &&
+        !!agent.email &&
+        rec.value.trim().toLowerCase() === String(agent.email).trim().toLowerCase()
+    );
+    const emailManuallyVerified = agent.is_verified === 1 || agent.is_verified === true;
+    const emailOwnershipUnproven = isFreeMailForOwnership && !emailHomepageEvidence && !emailManuallyVerified;
+    let emailOwnershipReportOnly = false;
+    if (emailOwnershipUnproven) {
+      if (!wasInPool) {
+        gate.flags.push("email_ownership_unproven");
+        if (newVerification === "verified") newVerification = "review_required";
+        (crossSourceResults as Record<string, unknown>).email_ownership_unproven = true;
+        console.log(
+          `[verifier] ${agent.id} (${agent.name ?? "?"}) free-mail email ownership unproven (no homepage evidence, agents.is_verified=${agent.is_verified ?? 0}) — quarantined from pool`,
+        );
+      } else {
+        // Already verified — report-only, per Daniel's monotonic-pool
+        // instruction above. Must NOT touch newVerification.
+        emailOwnershipReportOnly = true;
+        console.log(
+          `[verifier] ${agent.id} (${agent.name ?? "?"}) free-mail email ownership unproven but agent already verified — report-only, outcome unchanged`,
+        );
+      }
+    }
+
     const nowInPool = newVerification === "verified" && newEnrichment !== "thin";
     const eligibleAt = nowInPool && !wasInPool ? startedAt : null;
 
@@ -977,6 +1066,9 @@ export async function runVerifierBatch(opts: {
       url_last_status: probeResult ? probeResult.status : null,
       url_demoted: urlDemoted,
       domain_incoherent: !coherence.coherent,
+      email_ownership_unproven: emailOwnershipUnproven,
+      email_ownership_report_only: emailOwnershipReportOnly,
+      agent_name: agent.name ?? null,
     });
   }
 
@@ -1009,6 +1101,20 @@ export function buildRunEnvelope(input: {
   // operators can see at a glance how many agents this hourly run pulled
   // out of pool eligibility for mismatched website/email hosts.
   const domainIncoherent = r.filter((x) => x.domain_incoherent).length;
+  // dev-request 2026-07-15-gate-integrity-unverified-agent-bypass (slice 2):
+  // free-mail ownership-provenance guard. Two claims, mirroring the split
+  // enforced-vs-report-only behaviour above:
+  //   - enforced: NOT already verified going in, quarantined to review_required.
+  //   - report-only: ALREADY verified going in — outcome untouched (Daniel's
+  //     no-pool-reduction instruction), but surfaced with a few examples so
+  //     the daily brief can call out the cohort worth a manual look.
+  const emailOwnershipUnprovenEnforced = r.filter(
+    (x) => x.email_ownership_unproven && !x.email_ownership_report_only
+  ).length;
+  const emailOwnershipReportOnlyResults = r.filter((x) => x.email_ownership_report_only);
+  const emailOwnershipReportOnlyExamples = emailOwnershipReportOnlyResults
+    .slice(0, 5)
+    .map((x) => ({ agent_id: x.agent_id, name: x.agent_name }));
 
   return {
     run_id: input.run_id,
@@ -1026,6 +1132,19 @@ export function buildRunEnvelope(input: {
       { type: "db_state_change", value: httpUnreachable, meta: { kind: "http_unreachable" } },
       { type: "db_state_change", value: brregFlagged, meta: { kind: "brreg_inactive_flagged" } },
       { type: "db_state_change", value: domainIncoherent, meta: { kind: "agents_domain_incoherent" } },
+      {
+        type: "db_state_change",
+        value: emailOwnershipUnprovenEnforced,
+        meta: { kind: "agents_email_ownership_unproven_enforced" },
+      },
+      {
+        type: "db_state_change",
+        value: emailOwnershipReportOnlyResults.length,
+        meta: {
+          kind: "agents_email_ownership_unproven_existing_verified_report_only",
+          examples: emailOwnershipReportOnlyExamples,
+        },
+      },
       {
         type: "db_state_change",
         value: newlyEligible,
