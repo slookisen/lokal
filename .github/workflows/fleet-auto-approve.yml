@@ -99,11 +99,24 @@ jobs:
             // 2. Protected paths — never auto-approve if the diff touches these,
             //    regardless of any verdict comment. Self-protecting: this workflow
             //    file itself can never approve a PR that edits workflows.
+            //
+            //    Full intended surface (dev-request 2026-07-13-fleet-auto-approve-
+            //    protected-path-regex-widen, Daniel-approved "A — utvid regex"):
+            //    auth / session / cookie / admin-key / owner-portal / magic-link,
+            //    plus the pre-existing infra guards below. /auth/i alone missed
+            //    owner-portal.ts (#206, and again #287) because "owner-portal" has
+            //    no "auth" substring — each of the patterns below is independent,
+            //    not a rename of /auth/i.
             const PROTECTED = [
               /(^|\/)\.github\/workflows\//i,
               /(^|\/)fly\.toml$/i,
               /(^|\/)dockerfile$/i,
               /auth/i,
+              /session/i,
+              /cookie/i,
+              /admin-key/i,
+              /owner-portal/i,
+              /magic-link/i,
               /(^|\/)\.env/i,
               /secret/i,
             ];
