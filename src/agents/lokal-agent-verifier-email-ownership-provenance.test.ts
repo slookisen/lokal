@@ -187,7 +187,9 @@ export function runLokalAgentVerifierEmailOwnershipProvenanceTests(
       });
 
       // ── Case 3: Evidence path A (homepage provenance) clears the flag,
-      // regardless of prior status.
+      // regardless of prior status. source_url must resolve to THIS agent's
+      // own agent_url host (review fix-up, 2026-07-18) for the evidence to
+      // count.
       seedAgent({
         id: "agent-homepage-evidence",
         name: "Homepagegard AS",
@@ -196,7 +198,26 @@ export function runLokalAgentVerifierEmailOwnershipProvenanceTests(
         verificationStatus: "pending_verify",
         isVerified: false,
         emailProvenance: [
-          { value: "bar@gmail.com", source_type: "homepage", fetched_at: "2026-07-10T00:00:00Z" },
+          { value: "bar@gmail.com", source_type: "homepage", source_url: "https://homepagegard.no/kontakt", fetched_at: "2026-07-10T00:00:00Z" },
+        ],
+      });
+
+      // ── Case 6 (review fix-up, 2026-07-18): STALE-EVIDENCE / host-mismatch
+      // negative control. A homepage record proves the exact free-mail value
+      // was published — but at a DIFFERENT agent's homepage (source_url host
+      // != this agent's own agent_url host). This is the append-only-
+      // provenance staleness class: must NOT count as ownership proof for
+      // THIS listing, so the flag stays unproven and (not already verified)
+      // the agent is quarantined.
+      seedAgent({
+        id: "agent-stale-homepage-evidence",
+        name: "Stalegard AS",
+        domain: "stalegard.no",
+        email: "qux@gmail.com",
+        verificationStatus: "pending_verify",
+        isVerified: false,
+        emailProvenance: [
+          { value: "qux@gmail.com", source_type: "homepage", source_url: "https://some-other-unrelated-agent.no/kontakt", fetched_at: "2026-07-10T00:00:00Z" },
         ],
       });
 
@@ -288,6 +309,18 @@ export function runLokalAgentVerifierEmailOwnershipProvenanceTests(
       assertTrue(!r5.flags.includes("email_domain_mismatch"),
         "eop-19: real-domain email matching its own website host still has no email_domain_mismatch flag (unchanged pre-existing behavior)");
 
+      // ── Case 6 assertions (review fix-up: stale/host-mismatched homepage
+      // evidence must NOT count as ownership proof) ──────────────────────
+      const r6 = resultFor("agent-stale-homepage-evidence");
+      assertEq(r6.email_ownership_unproven, true,
+        "eop-19b: homepage evidence whose source_url host != this agent's own agent_url host does NOT clear the unproven flag (fail closed)");
+      assertEq(r6.email_ownership_report_only, false,
+        "eop-19c: not-already-verified, so the host-mismatched-evidence case is enforced, not report-only");
+      assertEq(r6.new_verification_status, "review_required",
+        "eop-19d: host-mismatched homepage evidence does not rescue — agent is quarantined to review_required");
+      assertTrue(r6.flags.includes("email_ownership_unproven"),
+        "eop-19e: host-mismatched-evidence case pushes the advisory gate.flags entry");
+
       // ── DB write-through sanity: case 1 truly left verification_status
       // untouched in agent_knowledge (not just in the in-memory result). ──
       const dbRow1 = db
@@ -316,8 +349,8 @@ export function runLokalAgentVerifierEmailOwnershipProvenanceTests(
       );
       assertTrue(!!enforcedClaim, "eop-22: buildRunEnvelope includes the enforced-count claim");
       assertTrue(!!reportOnlyClaim, "eop-23: buildRunEnvelope includes the report-only claim");
-      assertEq(enforcedClaim?.value, 1,
-        `eop-24: enforced claim counts exactly agent-not-yet-verified (got ${enforcedClaim?.value})`);
+      assertEq(enforcedClaim?.value, 2,
+        `eop-24: enforced claim counts agent-not-yet-verified + agent-stale-homepage-evidence (got ${enforcedClaim?.value})`);
       assertEq(reportOnlyClaim?.value, 1,
         `eop-25: report-only claim counts exactly agent-already-verified (got ${reportOnlyClaim?.value})`);
       const examples = (reportOnlyClaim?.meta as any)?.examples as Array<{ agent_id: string; name: string | null }>;

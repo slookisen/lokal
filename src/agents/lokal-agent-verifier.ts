@@ -24,6 +24,8 @@ import {
   domainCoherenceCheck,
   factualFieldsWithOnlyInference,
   hasHomepageEvidence,
+  hostFromUrlLike,
+  registrableDomain,
   FREE_MAIL_DOMAINS,
   type FieldName,
   type ProvenanceRecord,
@@ -1057,7 +1059,14 @@ export async function runVerifierBatch(opts: {
     // `wasInPool`.
     const emailDomainForOwnership = emailDomain(agent.email);
     const isFreeMailForOwnership = !!(emailDomainForOwnership && FREE_MAIL_DOMAINS.includes(emailDomainForOwnership));
-    const emailHomepageEvidence = hasHomepageEvidence(fieldProv.email, agent.email);
+    // review fix-up (2026-07-18): bind the homepage-evidence rescue to THIS
+    // agent's own listing (agent.agent_url's host) — same append-only-
+    // provenance staleness risk as slice 3b's domain-coherence rescue. A
+    // stale homepage record proving ownership of a free-mail address for a
+    // DIFFERENT agent_url must not count as ownership proof for this one.
+    const agentUrlHost = agent.agent_url ? hostFromUrlLike(agent.agent_url) : null;
+    const agentUrlRoot = agentUrlHost ? registrableDomain(agentUrlHost) : null;
+    const emailHomepageEvidence = hasHomepageEvidence(fieldProv.email, agent.email, agentUrlRoot);
     const emailManuallyVerified = agent.is_verified === 1 || agent.is_verified === true;
     const emailOwnershipUnproven = isFreeMailForOwnership && !emailHomepageEvidence && !emailManuallyVerified;
     let emailOwnershipReportOnly = false;

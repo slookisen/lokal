@@ -513,7 +513,7 @@ export function runAdminDomainCoherenceSweepTests(
           null,
           "91122333",
           null,
-          JSON.stringify({ phone: [{ value: "91122333", source_type: "homepage", fetched_at: "2026-07-01" }] }),
+          JSON.stringify({ phone: [{ value: "91122333", source_type: "homepage", source_url: "https://b1.no/kontakt", fetched_at: "2026-07-01" }] }),
         );
 
         // Control: identical shape, but NO homepage evidence — must classify
@@ -527,6 +527,22 @@ export function runAdminDomainCoherenceSweepTests(
           "91122333",
           null,
           "{}",
+        );
+
+        // review fix-up (2026-07-18): STALE-EVIDENCE control. Identical shape
+        // to the rescued fixture (same matching phone value, source_type
+        // "homepage"), but source_url points at a THIRD, unrelated agent's
+        // homepage — not this row's own agents.url host (b3.no). Must NOT be
+        // rescued: proves the rescue is bound to THIS row's agent_url host,
+        // not just to a value match anywhere in field_provenance.
+        insertAgent3.run("agent-homepage-stale-evidence", "StaleEvidence AS", "https://b3.no", "key-hp-stale", null);
+        insertKnowledge3.run(
+          "agent-homepage-stale-evidence",
+          "https://yet-another-wrong-host.no",
+          null,
+          "91122333",
+          null,
+          JSON.stringify({ phone: [{ value: "91122333", source_type: "homepage", source_url: "https://some-unrelated-agent.no/kontakt", fetched_at: "2026-06-01" }] }),
         );
 
         delete require.cache[require.resolve("./admin-domain-coherence")];
@@ -560,6 +576,10 @@ export function runAdminDomainCoherenceSweepTests(
           r.body.auto_fixable.some((a: any) => a.agent_id === "agent-homepage-not-rescued"),
           "dc-59: control agent WITHOUT homepage evidence IS classified auto_fixable (proves the rescue discriminates)",
         );
+        assertTrue(
+          r.body.auto_fixable.some((a: any) => a.agent_id === "agent-homepage-stale-evidence"),
+          "dc-59b: stale-evidence agent (source_url host != this row's agent_url host) IS classified auto_fixable, NOT rescued (fail closed)",
+        );
 
         r = await post3({ apply: true });
         assertEq(r.status, 200, "dc-60: apply POST -> 200");
@@ -579,6 +599,12 @@ export function runAdminDomainCoherenceSweepTests(
         ).get() as { website: string };
         assertEq(notRescuedRow.website, "https://b2.no",
           "dc-64: control agent WITHOUT homepage evidence IS auto-fixed under apply:true (website corrected to agents.url host)");
+
+        const staleEvidenceRow = db3.prepare(
+          "SELECT website FROM agent_knowledge WHERE agent_id = 'agent-homepage-stale-evidence'"
+        ).get() as { website: string };
+        assertEq(staleEvidenceRow.website, "https://b3.no",
+          "dc-65: stale-evidence agent IS auto-fixed under apply:true (website corrected to agents.url host) — the stale record did not rescue it");
       } finally {
         initMod.__setDbForTesting(prevDb3);
         if (prevAdminKey3 === undefined) delete process.env.ADMIN_KEY;
