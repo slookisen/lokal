@@ -30488,6 +30488,221 @@ const _previsitSvarsloyfePromise = runSerial(async () => {
   assertEq(adminRunPV.json?.success, true, "pv-21d: success:true with counters");
   assertTrue(typeof adminRunPV.json?.examined === "number", "pv-21e: response carries the counters");
 
+
+  // ═══ (22) REVIEW FINDING 1: time_suggested expires too — at the token
+  //     expiry OR the suggested time itself, whichever comes first; a guest
+  //     can never accept into the past; the expired svar page tells the truth ═══
+  // Neutralize b6 first (still awaiting from the gate test) so far-future
+  // clock runs below only ever see the row under test.
+  bookStPV.producerRespondDecline(String(b6!.respond_token));
+  assertEq(bookStPV.getBookingByRef(String(b6!.booking_ref))?.pre_status, "provider_declined",
+    "pv-22-setup: b6 closed out of the awaiting pool");
+
+  // (a) token expiry closes a time_suggested loop.
+  const b8 = await bookPV({ guest_email: "gjest-pv8@example.no" });
+  await invokeSeoPV("post", "/kategori/gardssalg/svar/:token",
+    { token: String(b8!.respond_token) }, `/kategori/gardssalg/svar/${b8!.respond_token}`,
+    { body: { action: "foresla", suggested_slot: "2035-06-01T12:00" } });
+  assertEq(bookStPV.getBookingByRef(String(b8!.booking_ref))?.pre_status, "time_suggested",
+    "pv-22a: b8 sits in time_suggested");
+  const t8PV = Date.parse(String(b8!.created_at));
+  emailCallsPV = [];
+  fu = await bookStPV.processBookingFollowups(new Date(t8PV + 61 * 3600_000));
+  assertEq(fu.expired, 1, "pv-22b: time_suggested EXPIRES at the token deadline (was: never)");
+  assertEq(fu.expired_guests_notified, 1, "pv-22c: guest notified of the expiry");
+  assertEq(bookStPV.getBookingByRef(String(b8!.booking_ref))?.pre_status, "expired",
+    "pv-22d: pre_status → expired");
+  const suggExpiryMailPV = emailCallsPV.find((c) => c.to === "gjest-pv8@example.no");
+  assertTrue(!!suggExpiryMailPV && suggExpiryMailPV.htmlContent.includes("ikke endelig avklart"),
+    "pv-22e: expiry email uses the truthful suggestion-variant wording (producer DID answer)");
+  fu = await bookStPV.processBookingFollowups(new Date(t8PV + 62 * 3600_000));
+  assertEq(fu.expired + fu.expired_guests_notified, 0, "pv-22f: suggestion-expiry is idempotent");
+
+  // (b) the suggested time itself passing closes the loop even while the
+  // respond token is still valid.
+  const b9 = await bookPV({ guest_email: "gjest-pv9@example.no" });
+  await invokeSeoPV("post", "/kategori/gardssalg/svar/:token",
+    { token: String(b9!.respond_token) }, `/kategori/gardssalg/svar/${b9!.respond_token}`,
+    { body: { action: "foresla", suggested_slot: "2030-09-12T15:00" } });
+  dbPV.prepare("UPDATE gardssalg_bookings SET respond_token_expires_at = '2099-01-01T00:00:00.000Z' WHERE booking_ref = ?")
+    .run(String(b9!.booking_ref));
+  emailCallsPV = [];
+  fu = await bookStPV.processBookingFollowups(new Date("2030-09-13T00:00:00Z"));
+  assertEq(fu.expired, 1, "pv-23a: a PASSED suggested time expires the loop even with a live token");
+  assertEq(bookStPV.getBookingByRef(String(b9!.booking_ref))?.pre_status, "expired",
+    "pv-23b: pre_status → expired");
+  assertTrue(emailCallsPV.some((c) => c.to === "gjest-pv9@example.no"),
+    "pv-23c: guest notified — never a silent death");
+
+  // (c) guest acceptance is time-bounded (service-level, injectable clock).
+  const b12 = await bookPV({ guest_email: "gjest-pv12@example.no" });
+  await invokeSeoPV("post", "/kategori/gardssalg/svar/:token",
+    { token: String(b12!.respond_token) }, `/kategori/gardssalg/svar/${b12!.respond_token}`,
+    { body: { action: "foresla", suggested_slot: "2030-05-01T10:00" } });
+  const b12RowPV = bookStPV.getBookingByRef(String(b12!.booking_ref));
+  const b12DecisionPV = String(b12RowPV!.guest_decision_token);
+  assertEq(bookStPV.guestAcceptSuggestion(b12DecisionPV, new Date("2030-06-01T00:00:00Z")), null,
+    "pv-24a: accept AFTER the suggested time is refused (slot_at can never land in the past)");
+  assertEq(bookStPV.guestAcceptSuggestion(b12DecisionPV,
+    new Date(Date.parse(String(b12!.created_at)) + 61 * 3600_000)), null,
+    "pv-24b: accept AFTER the token expiry is refused");
+  assertEq(bookStPV.guestDeclineSuggestion(b12DecisionPV, new Date("2030-06-01T00:00:00Z")), null,
+    "pv-24c: decline is bounded by the same window (followups own the closure)");
+  let b12CheckPV = bookStPV.getBookingByRef(String(b12!.booking_ref));
+  assertEq(b12CheckPV?.pre_status, "time_suggested", "pv-24d: refused decisions mutate nothing");
+  assertEq(b12CheckPV?.slot_at, "2030-09-10T13:00", "pv-24e: slot_at untouched");
+
+  // (d) truthful expired page: deadline passed but the followup engine has
+  // NOT yet flipped the row — the page may not claim the guest was told.
+  dbPV.prepare("UPDATE gardssalg_bookings SET respond_token_expires_at = ? WHERE booking_ref = ?")
+    .run(new Date(Date.now() - 3600_000).toISOString(), String(b12!.booking_ref));
+  const expiredSuggestPagePV = await invokeSeoPV("get", "/kategori/gardssalg/svar/:token",
+    { token: String(b12!.respond_token) }, `/kategori/gardssalg/svar/${b12!.respond_token}`);
+  assertEq(expiredSuggestPagePV.status, 200, "pv-25a: deadline-passed time_suggested renders friendly page");
+  assertTrue(expiredSuggestPagePV.body.includes("avsluttes automatisk"),
+    "pv-25b: page promises the automatic closure (true in both states)");
+  assertTrue(!expiredSuggestPagePV.body.includes("Gjesten har fått beskjed"),
+    "pv-25c: page no longer CLAIMS the guest was already told (was a lie pre-followup)");
+  const expiredSuggestPostPV = await invokeSeoPV("post", "/kategori/gardssalg/svar/:token",
+    { token: String(b12!.respond_token) }, `/kategori/gardssalg/svar/${b12!.respond_token}`,
+    { body: { action: "bekreft" } });
+  assertEq(expiredSuggestPostPV.status, 303, "pv-25d: POST on the timed-out token bounces");
+  assertEq(bookStPV.getBookingByRef(String(b12!.booking_ref))?.pre_status, "time_suggested",
+    "pv-25e: and mutates nothing");
+  // Guest side of the same moment: timed-out message, actions withheld.
+  const timedOutDecisionPagePV = await invokeSeoPV("get", "/kategori/gardssalg/gjestesvar/:token",
+    { token: b12DecisionPV }, `/kategori/gardssalg/gjestesvar/${b12DecisionPV}`);
+  assertEq(timedOutDecisionPagePV.status, 200, "pv-25f: timed-out gjestesvar renders");
+  assertTrue(timedOutDecisionPagePV.body.includes("Fristen for å svare på forslaget er dessverre ute"),
+    "pv-25g: guest sees the timed-out explanation, not a generic already-answered text");
+  assertTrue(!timedOutDecisionPagePV.body.includes('value="aksepter"'),
+    "pv-25h: no accept button after the deadline");
+  const timedOutAcceptPV = await invokeSeoPV("post", "/kategori/gardssalg/gjestesvar/:token",
+    { token: b12DecisionPV }, `/kategori/gardssalg/gjestesvar/${b12DecisionPV}`,
+    { body: { action: "aksepter" } });
+  assertEq(timedOutAcceptPV.status, 303, "pv-25i: timed-out accept POST bounces");
+  assertEq(bookStPV.getBookingByRef(String(b12!.booking_ref))?.pre_status, "time_suggested",
+    "pv-25j: and mutates nothing (route + service double-guard)");
+
+  // ═══ (23) REVIEW FINDING 2: concurrency — overlapping followup runs send
+  //     each email exactly once (guarded claim UPDATEs arbitrate) ═══
+  const b10 = await bookPV({ guest_email: "gjest-pv10@example.no" });
+  const t10PV = Date.parse(String(b10!.created_at));
+  // Latency mock: keeps the send in-flight long enough for the second call
+  // to reach the same rows — the exact double-send window from the review PoC.
+  (emailSvcModPV.emailService as any).sendEmail = async (opts: {
+    to: string; subject: string; htmlContent?: string; textContent?: string;
+  }) => {
+    await new Promise((r) => setTimeout(r, 15));
+    emailCallsPV.push({
+      to: opts.to, subject: opts.subject,
+      htmlContent: opts.htmlContent || "", textContent: opts.textContent || "",
+    });
+    return { success: true, messageId: "test" };
+  };
+  emailCallsPV = [];
+  const [remA, remB] = await Promise.all([
+    bookStPV.processBookingFollowups(new Date(t10PV + 25 * 3600_000)),
+    bookStPV.processBookingFollowups(new Date(t10PV + 25 * 3600_000)),
+  ]);
+  assertEq(remA.reminders_sent + remB.reminders_sent, 1,
+    "pv-26a: concurrent runs send exactly ONE reminder between them");
+  assertEq(emailCallsPV.filter((c) => c.to === PRODUCER_EMAIL_PV && c.subject.includes("minnelse")).length, 1,
+    "pv-26b: exactly one reminder email on the wire");
+  // b12 (deadline already passed above) expires in the same concurrent pass —
+  // flip and guest notification also exactly once.
+  assertEq(remA.expired + remB.expired, 1, "pv-26c: concurrent expiry flips exactly once");
+  assertEq(emailCallsPV.filter((c) => c.to === "gjest-pv12@example.no").length, 1,
+    "pv-26d: exactly one expiry email to the guest");
+  emailCallsPV = [];
+  const [expA, expB] = await Promise.all([
+    bookStPV.processBookingFollowups(new Date(t10PV + 61 * 3600_000)),
+    bookStPV.processBookingFollowups(new Date(t10PV + 61 * 3600_000)),
+  ]);
+  assertEq(expA.expired + expB.expired, 1, "pv-26e: concurrent runs expire b10 exactly once");
+  assertEq(expA.expired_guests_notified + expB.expired_guests_notified, 1,
+    "pv-26f: exactly one guest notification claimed");
+  assertEq(emailCallsPV.filter((c) => c.to === "gjest-pv10@example.no").length, 1,
+    "pv-26g: exactly one expiry email to b10's guest");
+  // Restore the plain synchronous-capture mock.
+  (emailSvcModPV.emailService as any).sendEmail = async (opts: {
+    to: string; subject: string; htmlContent?: string; textContent?: string;
+  }) => {
+    emailCallsPV.push({
+      to: opts.to, subject: opts.subject,
+      htmlContent: opts.htmlContent || "", textContent: opts.textContent || "",
+    });
+    return { success: true, messageId: "test" };
+  };
+
+  // ═══ (24) REVIEW FINDING 3: post-visit-resolved bookings are outside the
+  //     pre-visit loop — no reminders/expiry, no answers, friendly page ═══
+  const b11 = await bookPV({ guest_email: "gjest-pv11@example.no", slot_at: "2020-01-06T12:00" });
+  bookStPV.resolveBooking(String(b11!.confirm_token), "confirmed_attended", "pv-test");
+  assertEq(bookStPV.getBookingByRef(String(b11!.booking_ref))?.status, "confirmed_attended",
+    "pv-27-setup: b11 resolved post-visit");
+  assertEq(bookStPV.producerRespondConfirm(String(b11!.respond_token)), null,
+    "pv-27a: pre-visit confirm refused on a resolved booking");
+  assertEq(bookStPV.producerRespondDecline(String(b11!.respond_token)), null,
+    "pv-27b: pre-visit decline refused on a resolved booking");
+  const resolvedPagePV = await invokeSeoPV("get", "/kategori/gardssalg/svar/:token",
+    { token: String(b11!.respond_token) }, `/kategori/gardssalg/svar/${b11!.respond_token}`);
+  assertEq(resolvedPagePV.status, 200, "pv-27c: svar page still renders (friendly)");
+  assertTrue(resolvedPagePV.body.includes("ikke lenger aktuelt"),
+    "pv-27d: page explains the visit is already registered");
+  assertTrue(!resolvedPagePV.body.includes('value="bekreft"') && !resolvedPagePV.body.includes('value="avsla"'),
+    "pv-27e: no pre-visit actions offered");
+  emailCallsPV = [];
+  const resolvedPostPV = await invokeSeoPV("post", "/kategori/gardssalg/svar/:token",
+    { token: String(b11!.respond_token) }, `/kategori/gardssalg/svar/${b11!.respond_token}`,
+    { body: { action: "avsla" } });
+  assertEq(resolvedPostPV.status, 303, "pv-27f: POST bounces");
+  assertEq(bookStPV.getBookingByRef(String(b11!.booking_ref))?.pre_status, "awaiting_provider",
+    "pv-27g: nothing mutated");
+  assertEq(emailCallsPV.length, 0, "pv-27h: nothing sent");
+  const t11PV = Date.parse(String(b11!.created_at));
+  fu = await bookStPV.processBookingFollowups(new Date(t11PV + 25 * 3600_000));
+  assertEq(fu.examined, 0, "pv-27i: resolved booking never even enters the followup query");
+  fu = await bookStPV.processBookingFollowups(new Date(t11PV + 61 * 3600_000));
+  assertEq(bookStPV.getBookingByRef(String(b11!.booking_ref))?.pre_status, "awaiting_provider",
+    "pv-27j: never auto-expired — post-visit outcome owns the booking");
+  assertEq(bookStPV.getBookingByRef(String(b11!.booking_ref))?.reminder_sent_at, null,
+    "pv-27k: never reminded");
+
+  // ═══ (25) NITs: anchored slot regex, stamped deadline in emails/pages,
+  //     no "ett klikk" over-promise, cancelled booking ═══
+  assertEq(bookStPV.isValidSuggestedSlot("2030-09-12T15:00junk"), false,
+    "pv-28a: trailing garbage rejected (anchored regex)");
+  assertEq(bookStPV.isValidSuggestedSlot("2030-09-12T15:00:30"), true,
+    "pv-28b: optional seconds accepted");
+  assertEq(bookStPV.isValidSuggestedSlot("2030-09-12"), false, "pv-28c: date-only rejected");
+  emailCallsPV = [];
+  const b14 = await bookPV({ guest_email: "gjest-pv14@example.no" });
+  const b14DeadlinePV = new Date(String(b14!.respond_token_expires_at)).toLocaleString("nb-NO", {
+    dateStyle: "full", timeStyle: "short", timeZone: "Europe/Oslo",
+  });
+  const b14ProdMailPV = emailCallsPV.find((c) => c.to === PRODUCER_EMAIL_PV);
+  assertTrue(!!b14ProdMailPV && b14ProdMailPV.textContent.includes(`Svarfrist: ${b14DeadlinePV}`),
+    "pv-28d: producer email states the STAMPED deadline (not a live-env hour count)");
+  assertTrue(!!b14ProdMailPV && !b14ProdMailPV.htmlContent.includes("ett klikk"),
+    "pv-28e: email no longer promises separate one-click links");
+  const b14PagePV = await invokeSeoPV("get", "/kategori/gardssalg/svar/:token",
+    { token: String(b14!.respond_token) }, `/kategori/gardssalg/svar/${b14!.respond_token}`);
+  assertTrue(b14PagePV.body.includes(b14DeadlinePV),
+    "pv-28f: svar page shows the stamped deadline too");
+  // Cancelled booking → same post-visit-closed handling as resolved.
+  dbPV.prepare("UPDATE gardssalg_bookings SET status = 'cancelled' WHERE booking_ref = ?")
+    .run(String(b14!.booking_ref));
+  const cancelledPagePV = await invokeSeoPV("get", "/kategori/gardssalg/svar/:token",
+    { token: String(b14!.respond_token) }, `/kategori/gardssalg/svar/${b14!.respond_token}`);
+  assertTrue(cancelledPagePV.body.includes("kansellert"), "pv-28g: cancelled booking gets the cancelled text");
+  const cancelledPostPV = await invokeSeoPV("post", "/kategori/gardssalg/svar/:token",
+    { token: String(b14!.respond_token) }, `/kategori/gardssalg/svar/${b14!.respond_token}`,
+    { body: { action: "bekreft" } });
+  assertEq(cancelledPostPV.status, 303, "pv-28h: POST on a cancelled booking bounces");
+  assertEq(bookStPV.getBookingByRef(String(b14!.booking_ref))?.pre_status, "awaiting_provider",
+    "pv-28i: and mutates nothing");
+
   (emailSvcModPV.emailService as any).sendEmail = origSendPV;
   if (prevPathPV === undefined) delete process.env.EXPERIENCES_DB_PATH;
   else process.env.EXPERIENCES_DB_PATH = prevPathPV;
@@ -30498,5 +30713,5 @@ const _previsitSvarsloyfePromise = runSerial(async () => {
   if (prevExpirePV === undefined) delete process.env.BOOKING_PREVISIT_EXPIRE_HOURS;
   else process.env.BOOKING_PREVISIT_EXPIRE_HOURS = prevExpirePV;
   dbFacPV.__resetDbFactoryForTesting();
-  console.log("  gardssalg-previsit-svarsloyfe: OK (token-hygiene begge veier, engangs+utløp negativtester, PRG-GET-muterer-ikke, foreslå→gjestesvar-løkke m/ rotasjon, klokkejustert purring/utløp + idempotens, gate-av-suppresjon m/ recovery, legacy-rader immune, admin-endepunkt)");
+  console.log("  gardssalg-previsit-svarsloyfe: OK (token-hygiene begge veier, engangs+utløp negativtester, PRG-GET-muterer-ikke, foreslå→gjestesvar-løkke m/ rotasjon, klokkejustert purring/utløp + idempotens, gate-av-suppresjon m/ recovery, legacy-rader immune, admin-endepunkt; review-fixes: time_suggested-utløp begge veier + fortids-aksept avvist + sannferdige sider, samtidighets-sikre claims, post-visit-resolvete utenfor løyfen, ankret slot-regex + stemplet frist)");
 });

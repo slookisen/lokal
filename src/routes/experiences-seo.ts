@@ -91,11 +91,12 @@ import {
   producerSuggestTime,
   guestAcceptSuggestion,
   guestDeclineSuggestion,
+  guestDecisionActionable,
+  previsitOpen,
   sendPrevisitConfirmedToGuest,
   sendPrevisitDeclinedToGuest,
   sendSuggestionToGuest,
   sendGuestDecisionToProducer,
-  previsitExpireHours,
   type GardssalgBooking,
 } from "../services/booking-store";
 import { getOaHomeCounters } from "../services/oa-home-counters";
@@ -3250,7 +3251,9 @@ const PRE_STATUS_LABEL: Record<string, string> = {
   provider_confirmed: "Bekreftet av produsenten",
   provider_declined: "Avslått",
   time_suggested: "Produsenten har foreslått et nytt tidspunkt",
-  expired: "Utløpt uten svar fra produsenten",
+  // True in both expiry paths: an unanswered request AND a suggestion that
+  // was never finally settled (review finding 1).
+  expired: "Utløpt — ble ikke avklart i tide",
 };
 
 function previsitSlotNb(slot: string | null): string {
@@ -3358,12 +3361,25 @@ router.get(
                 : "";
 
     let actionsHtml = "";
-    if (state !== "ok") {
-      // Friendly no-action page: used or expired — never a mutation, never a 404.
+    if (!previsitOpen(booking)) {
+      // Post-visit already resolved (attended/no_show) or booking cancelled —
+      // pre-visit answers are moot (review finding 3). Friendly, no actions.
+      actionsHtml = `<div class="bekreft-banner warn" role="status">${
+        booking.status === "cancelled"
+          ? "Reservasjonen er kansellert — forespørselen kan ikke lenger besvares."
+          : "Besøket er allerede registrert (oppmøte-siden) — forhåndssvar er ikke lenger aktuelt for denne reservasjonen."
+      }</div>`;
+    } else if (state !== "ok") {
+      // Friendly no-action page: used or expired — never a mutation, never a
+      // 404. NB the expired text must be TRUE in both reachable states
+      // (pre_status already 'expired' vs. a time_suggested/awaiting row whose
+      // deadline passed but the followup engine hasn't run yet): the closure
+      // + guest notification happen automatically, they may not have happened
+      // YET (review finding 1c).
       actionsHtml = `<div class="bekreft-banner warn" role="status">${
         state === "used"
           ? "Denne svarlenken er allerede brukt — forespørselen er besvart."
-          : "Denne svarlenken er utløpt, og forespørselen er derfor avsluttet. Gjesten har fått beskjed."
+          : "Denne svarlenken er utløpt — forespørselen avsluttes automatisk og gjesten får beskjed."
       }</div>`;
     } else {
       const postTo = `/kategori/gardssalg/svar/${encodeURIComponent(token)}`;
@@ -3390,7 +3406,7 @@ router.get(
     <div class="status-line">Status: <strong>${escapeHtml(statusLabel)}</strong></div>
     ${previsitRecapHtml(booking, true)}
     ${actionsHtml}
-    <p class="hint">Denne siden er for produsenten. Lenken er personlig for denne forespørselen og utløper automatisk (${previsitExpireHours()} timer etter at forespørselen kom inn) — ikke del den videre.</p>`;
+    <p class="hint">Denne siden er for produsenten. Lenken er personlig for denne forespørselen${booking.respond_token_expires_at ? ` og utløper automatisk ${escapeHtml(previsitSlotNb(booking.respond_token_expires_at))}` : ""} — ikke del den videre.</p>`;
 
     res.setHeader("Content-Type", "text/html; charset=utf-8");
     res.setHeader("Cache-Control", "no-store");
@@ -3417,8 +3433,9 @@ router.post(
     if (!booking) return next();
 
     const backTo = `/kategori/gardssalg/svar/${encodeURIComponent(token)}`;
-    if (respondTokenState(booking) !== "ok") {
-      // Friendly GET explains used/expired; nothing was mutated.
+    if (!previsitOpen(booking) || respondTokenState(booking) !== "ok") {
+      // Post-visit already resolved/cancelled, or the token is used/expired —
+      // the friendly GET explains why; nothing was mutated.
       res.redirect(303, backTo);
       return;
     }
@@ -3489,7 +3506,10 @@ router.get(
 
     const provider = getProviderById(booking.provider_id) as { navn?: string | null } | null;
     const statusLabel = PRE_STATUS_LABEL[booking.pre_status] || booking.pre_status;
-    const actionable = booking.pre_status === "time_suggested" && !!booking.suggested_slot_at;
+    // Actionable = still time_suggested AND within the loop's expiry window
+    // AND the suggested time itself not yet passed (review finding 1 — an
+    // acceptance may never land in the past) AND post-visit still 'reserved'.
+    const actionable = guestDecisionActionable(booking);
 
     const done = String(req.query.done || "");
     const banner =
@@ -3501,10 +3521,19 @@ router.get(
 
     let inner: string;
     if (!actionable) {
+      // Distinguish "the loop timed out under you" (still time_suggested, but
+      // the deadline or the suggested time passed) from the generic
+      // already-answered case — the timed-out text must be true BEFORE the
+      // followup engine has flipped the row to expired.
+      const timedOut = booking.pre_status === "time_suggested" && previsitOpen(booking);
       inner = `    <h1>Reservasjon hos ${escapeHtml(provider?.navn || "produsenten")}</h1>
     <div class="ref">${escapeHtml(booking.booking_ref)}</div>
     ${banner}
-    <div class="bekreft-banner warn" role="status">Denne lenken er allerede besvart eller ikke lenger aktiv.</div>
+    <div class="bekreft-banner warn" role="status">${
+      timedOut
+        ? "Fristen for å svare på forslaget er dessverre ute — forespørselen avsluttes automatisk, og du får beskjed på e-post."
+        : "Denne lenken er allerede besvart eller ikke lenger aktiv."
+    }</div>
     <div class="status-line">Status: <strong>${escapeHtml(statusLabel)}</strong></div>
     ${previsitRecapHtml(booking, false)}
     <p class="hint">Trenger du hjelp? Svar på bekreftelses-e-posten din.</p>`;
@@ -3545,8 +3574,9 @@ router.post(
     if (!booking) return next();
 
     const backTo = `/kategori/gardssalg/gjestesvar/${encodeURIComponent(token)}`;
-    if (booking.pre_status !== "time_suggested") {
-      // Already answered (or otherwise closed) — friendly GET, no mutation.
+    if (!guestDecisionActionable(booking)) {
+      // Already answered, timed out, or post-visit closed — friendly GET
+      // explains which; nothing is mutated (the service guards again anyway).
       res.redirect(303, backTo);
       return;
     }
@@ -3612,7 +3642,7 @@ router.get(
     const statusLabel = PRE_STATUS_LABEL[booking.pre_status] || booking.pre_status;
     const extra =
       booking.pre_status === "expired"
-        ? `<div class="bekreft-banner warn" role="status">Vi beklager — produsenten besvarte ikke forespørselen i tide. <a href="/kategori/gardssalg">Se alternative tilbydere her</a>.</div>`
+        ? `<div class="bekreft-banner warn" role="status">Vi beklager — forespørselen ble dessverre ikke avklart i tide og er utløpt. <a href="/kategori/gardssalg">Se alternative tilbydere her</a>.</div>`
         : booking.pre_status === "provider_declined"
           ? `<div class="bekreft-banner warn" role="status">Vi beklager at forespørselen ikke kunne bekreftes. <a href="/kategori/gardssalg">Se alternative tilbydere her</a>.</div>`
           : booking.pre_status === "time_suggested"
