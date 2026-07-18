@@ -30011,7 +30011,7 @@ console.log("\n── item2a: dead-extraction parking (dental) ──");
     assertTrue(!JSON.stringify(dentalCard.additionalInterfaces).includes("opplevagent.no") && !JSON.stringify(dentalCard.additionalInterfaces).includes("rettfrabonden.com"), "a2a-v1: dental additionalInterfaces has no cross-vertical leakage");
     assertTrue(!JSON.stringify(expCard.additionalInterfaces).includes("finn-tannlege.com") && !JSON.stringify(expCard.additionalInterfaces).includes("rettfrabonden.com"), "a2a-v1: experiences additionalInterfaces has no cross-vertical leakage");
 
-    console.log("  a2a-card-v1-signing slice 1 (v1.0 dual-publish fields): OK (23 assertions)");
+    console.log("  a2a-card-v1-signing slice 1 (v1.0 dual-publish fields): OK (26 assertions)");
   } catch (err) {
     failed++;
     failures.push(`a2a-card-v1-signing slice 1: unexpected error: ${err instanceof Error ? (err.stack || err.message) : String(err)}`);
