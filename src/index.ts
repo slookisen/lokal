@@ -23,7 +23,8 @@ import a2aRoutes from "./routes/a2a";
 import reservationRoutes from "./routes/reservation";
 import marketplaceRoutes from "./routes/marketplace";
 import { catalogRouter as marketplaceCatalogRouter, adminCatalogRouter } from "./routes/marketplace-catalog";
-import { cartRouter, adminOrderRouter } from "./routes/marketplace-cart";
+import { cartRouter, adminOrderRouter, producerOrderRouter } from "./routes/marketplace-cart";
+import adminOrdersRoutes from "./routes/admin-orders";
 import dentalRoutes from "./routes/dental";
 import opplevelserRoutes from "./routes/opplevelser";
 import mcpRoutes from "./routes/mcp";
@@ -352,6 +353,10 @@ app.use("/api/marketplace", marketplaceRoutes);
 app.use("/api/marketplace/catalog", marketplaceCatalogRouter);
 // Phase 1: cart + order REST routes
 app.use("/api/marketplace", cartRouter);
+// dev-request 2026-07-13-pilot-ordre-loop: tokenized producer order confirm
+// page (PRG). The confirm_token arrives only in the seller-notification
+// email — GET renders, POST transitions.
+app.use("/produsent/ordre", producerOrderRouter);
 app.use("/api/tannlege", dentalRoutes);
 app.use("/api/opplevelser", opplevelserRoutes);
 app.use("/mcp", mcpRoutes);
@@ -543,6 +548,8 @@ app.use("/admin", adminLimiter, adminJobsRoutes);
 app.use("/admin/products", adminLimiter, adminCatalogRouter);
 // Phase 1: admin order lifecycle transitions
 app.use("/admin/marketplace", adminLimiter, adminOrderRouter);
+// dev-request 2026-07-13-pilot-ordre-loop: notification opt-in + seller order inbox
+app.use("/admin/orders", adminLimiter, adminOrdersRoutes);
 
 // Platform triggers — public webhook receiver + admin queue access.
 // /platform/triggers/* uses HMAC (no admin-key); /admin/triggers/* uses admin-key.

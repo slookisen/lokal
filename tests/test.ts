@@ -21331,7 +21331,12 @@ const _orchPr20260614_6Promise: Promise<void> = new Promise<void>(r => { _orchPr
       api_key TEXT UNIQUE NOT NULL DEFAULT (hex(randomblob(8))),
       is_active INTEGER DEFAULT 1,
       city TEXT,
-      umbrella_type TEXT
+      umbrella_type TEXT,
+      -- pilot-ordre-loop: submitCart's fire-and-forget notification resolver
+      -- reads these; default opt_in=0 means the legacy cart tests exercise
+      -- the never-send default path.
+      order_notifications_opt_in INTEGER NOT NULL DEFAULT 0,
+      order_notification_email TEXT
     );
     CREATE TABLE agent_knowledge (
       agent_id TEXT PRIMARY KEY,
@@ -21391,6 +21396,7 @@ const _orchPr20260614_6Promise: Promise<void> = new Promise<void>(r => { _orchPr
       pickup_time TEXT,
       total_nok REAL,
       confirm_token TEXT,
+      cancel_reason TEXT,
       created_at TEXT NOT NULL DEFAULT (datetime('now')),
       updated_at TEXT NOT NULL DEFAULT (datetime('now'))
     );
@@ -21406,6 +21412,28 @@ const _orchPr20260614_6Promise: Promise<void> = new Promise<void>(r => { _orchPr
       line_total REAL
     );
     CREATE INDEX IF NOT EXISTS idx_order_items_order_id ON order_items(order_id);
+    -- pilot-ordre-loop additive tables: transitionOrder writes order_events
+    -- on every transition and trust_events at terminal states, so the legacy
+    -- lifecycle tests in this block need them present.
+    CREATE TABLE order_events (
+      id TEXT PRIMARY KEY,
+      order_id TEXT NOT NULL,
+      from_status TEXT,
+      to_status TEXT NOT NULL,
+      actor TEXT,
+      created_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+    CREATE INDEX IF NOT EXISTS idx_order_events_order_id ON order_events(order_id);
+    CREATE TABLE trust_events (
+      id TEXT PRIMARY KEY,
+      agent_id TEXT NOT NULL,
+      event_type TEXT NOT NULL CHECK(event_type IN (
+        'order_completed','order_no_show','order_declined',
+        'booking_attended','booking_no_show')),
+      ref TEXT,
+      created_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+    CREATE INDEX IF NOT EXISTS idx_trust_events_agent_id ON trust_events(agent_id);
   `);
 
   // Set the shared DB singleton to our test DB
@@ -21416,6 +21444,14 @@ const _orchPr20260614_6Promise: Promise<void> = new Promise<void>(r => { _orchPr
   // clobber this handle, so every await inside the cart block is safe.
   const { __setCartTestDb } = await import("../src/services/cart-service");
   __setCartTestDb(cartDb as any);
+  // pilot-ordre-loop: pin the trust-ledger and notify-gate module handles to
+  // the same DB so transitionOrder's trust_events writes and submitCart's
+  // fire-and-forget recipient resolution are race-proof too (they'd otherwise
+  // read the global singleton, which concurrent blocks re-pin).
+  const { __setTrustEventTestDb } = require("../src/services/trust-event-service");
+  __setTrustEventTestDb(cartDb as any);
+  const { __setOrderNotifyTestDb } = require("../src/services/order-notify-service");
+  __setOrderNotifyTestDb(cartDb as any);
 
   // ── Seed two verified producers with products ─────────────────────────────
   cartDb.prepare("INSERT INTO agents (id, name, city) VALUES (?, ?, ?)").run("ag-carrot", "Gangstad Gård", "Trondheim");
@@ -21765,9 +21801,11 @@ const _orchPr20260614_6Promise: Promise<void> = new Promise<void>(r => { _orchPr
   }
 
   server6.close();
-  // Reset the module-local cart-service DB handle so it does not affect
-  // any later test blocks that might dynamically import cart-service.
+  // Reset the module-local DB handles so they do not affect any later test
+  // blocks that might dynamically import these services.
   __setCartTestDb(null);
+  __setTrustEventTestDb(null);
+  __setOrderNotifyTestDb(null);
   if (prevAdminKey6 === undefined) delete process.env.ADMIN_KEY;
   else process.env.ADMIN_KEY = prevAdminKey6;
 
@@ -21962,6 +22000,7 @@ console.log("\n── orch-pr-14: MCP discovery product_id surfacing ──");
   try { await _selgerHtmlOpenTrackingPromise; } catch { /* errors already pushed to failures */ }
   try { await _recentlyEnrichedSpotcheckPromise; } catch { /* errors already pushed to failures */ }
   try { await _emailOwnershipProvenancePromise; } catch { /* errors already pushed to failures */ }
+  try { await _pilotOrdreLoopPromise; } catch { /* errors already pushed to failures */ }
   // relax-envelope tests are synchronous (pure validateEnvelope() unit test) — no promise needed
   // PR-109 tests are synchronous (IIFE) — no promise needed
   // Drop pre-existing intg failures (unmasked by awaiting) — they predate M2
@@ -28287,6 +28326,39 @@ const _emailOwnershipProvenancePromise: Promise<void> = new Promise<void>(r => {
     failures.push("email-ownership-provenance: unexpected error: " + String(err?.message || err));
   } finally {
     _emailOwnershipProvenanceResolve();
+  }
+})();
+
+// ═══════════════════════════════════════════════════════════════════════
+// dev-request 2026-07-13-pilot-ordre-loop: selgervarsling + livssyklus +
+// trust-ledger for cart-ordre (RFB). Swaps the shared getDb() singleton
+// (own dedicated test file, in-memory prod-schema DB, stubbed email send)
+// — mirroring the blocks above, it must run strictly after every other
+// singleton-swapping block; _emailOwnershipProvenancePromise is the
+// current tail of that serial chain.
+let _pilotOrdreLoopResolve: () => void = () => {};
+const _pilotOrdreLoopPromise: Promise<void> = new Promise<void>(r => {
+  _pilotOrdreLoopResolve = r;
+});
+
+(async () => {
+  await Promise.allSettled([_emailOwnershipProvenancePromise]);
+  await new Promise(r => setImmediate(r));
+
+  console.log("\n── dev-request 2026-07-13: pilot-ordre-loop (selgervarsling + livssyklus + trust-ledger) ──");
+  try {
+    const { runPilotOrdreLoopTests } = require("../src/routes/pilot-ordre-loop.test") as
+      typeof import("../src/routes/pilot-ordre-loop.test");
+    const pol = await runPilotOrdreLoopTests({ log: false });
+    passed += pol.passed;
+    failed += pol.failed;
+    for (const f of pol.failures) failures.push("pilot-ordre-loop: " + f);
+    console.log(`  pilot-ordre-loop: ${pol.passed} passed, ${pol.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("pilot-ordre-loop: unexpected error: " + String(err?.message || err));
+  } finally {
+    _pilotOrdreLoopResolve();
   }
 })();
 

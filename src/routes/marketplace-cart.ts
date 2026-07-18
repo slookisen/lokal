@@ -17,12 +17,18 @@
  *   POST   /admin/marketplace/orders/:id/decline
  *   POST   /admin/marketplace/orders/:id/ready
  *   POST   /admin/marketplace/orders/:id/complete
+ *   POST   /admin/marketplace/orders/:id/no-show      (ready → cancelled, cancel_reason='no_show')
  *
- * No payment. No seller notification (Phase 1 internal-only).
- * Anonymous buyer: cart token (buyer_ref) guards reads and mutations.
+ * Producer confirm page (tokenized, PRG — dev-request 2026-07-13-pilot-ordre-loop):
+ *   GET    /produsent/ordre/:confirm_token            shows the order, mutates NOTHING
+ *   POST   /produsent/ordre/:confirm_token            action=confirm|decline|ready|complete|no_show
+ *
+ * No payment. Sellers with explicit opt-in ARE notified on submit (see
+ * services/order-notify-service.ts — opt-in + verified contact + suppression
+ * gate). Anonymous buyer: cart token (buyer_ref) guards reads and mutations.
  */
 
-import { Router, Request, Response } from "express";
+import express, { Router, Request, Response } from "express";
 import {
   createCart,
   checkCartToken,
@@ -33,6 +39,7 @@ import {
   submitCart,
   getOrder,
   transitionOrder,
+  getOrderByConfirmToken,
 } from "../services/cart-service";
 
 // ─── Public cart/order router ────────────────────────────────────────────────
@@ -40,6 +47,9 @@ export const cartRouter = Router();
 
 // ─── Admin order lifecycle router ────────────────────────────────────────────
 export const adminOrderRouter = Router();
+
+// ─── Producer order confirm-page router (mounted at /produsent/ordre) ────────
+export const producerOrderRouter = Router();
 
 // ─── Admin key helper ─────────────────────────────────────────────────────────
 function requireAdmin(req: Request, res: Response): boolean {
@@ -260,15 +270,17 @@ cartRouter.get("/orders/:id", (req: Request, res: Response) => {
 });
 
 // ─── Admin order lifecycle ────────────────────────────────────────────────────
-// POST /admin/marketplace/orders/:id/confirm|decline|ready|complete
-// Admin-gated (X-Admin-Key). Transitions the order status.
+// POST /admin/marketplace/orders/:id/confirm|decline|ready|complete|no-show
+// Admin-gated (X-Admin-Key). Transitions the order status. "no-show" is the
+// ready → cancelled path and stores cancel_reason='no_show' (pilot-ordre-loop).
 
-const LIFECYCLE_ACTIONS = ["confirm", "decline", "ready", "complete"] as const;
+const LIFECYCLE_ACTIONS = ["confirm", "decline", "ready", "complete", "no-show"] as const;
 const ACTION_TO_STATUS: Record<string, string> = {
-  confirm: "confirmed",
-  decline: "declined",
-  ready:   "ready",
-  complete: "completed",
+  confirm:   "confirmed",
+  decline:   "declined",
+  ready:     "ready",
+  complete:  "completed",
+  "no-show": "cancelled",
 };
 
 for (const action of LIFECYCLE_ACTIONS) {
@@ -276,7 +288,10 @@ for (const action of LIFECYCLE_ACTIONS) {
     if (!requireAdmin(req, res)) return;
 
     const toStatus = ACTION_TO_STATUS[action]!;
-    const result = transitionOrder(cartId(req), toStatus);
+    const result = transitionOrder(cartId(req), toStatus, {
+      actor: "admin",
+      cancelReason: action === "no-show" ? "no_show" : null,
+    });
 
     if (!result.success) {
       res.status(result.status).json(result);
@@ -286,3 +301,176 @@ for (const action of LIFECYCLE_ACTIONS) {
     res.json(result);
   });
 }
+
+// ─── Producer confirm page (PRG — dev-request 2026-07-13-pilot-ordre-loop) ───
+// Pattern mirrors the booking "bekreft-løkka" in experiences-seo.ts: the
+// tokenized link lands ONLY in the producer's notification email; GET renders
+// state and mutates NOTHING (mail-scanner link prefetch safe); every mutation
+// is an explicit POST button → 303 redirect back to the GET (PRG).
+
+function escapePageHtml(s: string): string {
+  return s
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;");
+}
+
+const ORDER_STATUS_LABEL: Record<string, string> = {
+  pending:   "Venter på din bekreftelse",
+  confirmed: "Bekreftet — ikke klar for henting ennå",
+  declined:  "Avslått",
+  ready:     "Klar for henting",
+  completed: "Hentet",
+  cancelled: "Kansellert",
+};
+
+// action → { toStatus, cancelReason } for the producer POST handler.
+const PRODUCER_ACTIONS: Record<string, { toStatus: string; cancelReason: string | null }> = {
+  confirm:  { toStatus: "confirmed", cancelReason: null },
+  decline:  { toStatus: "declined",  cancelReason: null },
+  ready:    { toStatus: "ready",     cancelReason: null },
+  complete: { toStatus: "completed", cancelReason: null },
+  no_show:  { toStatus: "cancelled", cancelReason: "no_show" },
+};
+
+// Which action buttons are offered per current status (must stay a subset of
+// cart-service VALID_TRANSITIONS — the service re-validates on POST anyway).
+const ACTIONS_FOR_STATUS: Record<string, Array<{ action: string; label: string; cls: string }>> = {
+  pending: [
+    { action: "confirm", label: "Bekreft ordren", cls: "act-primary" },
+    { action: "decline", label: "Avslå", cls: "act-secondary" },
+  ],
+  confirmed: [
+    { action: "ready", label: "Klar for henting", cls: "act-primary" },
+  ],
+  ready: [
+    { action: "complete", label: "Hentet", cls: "act-primary" },
+    { action: "no_show", label: "Ikke hentet (no-show)", cls: "act-secondary" },
+  ],
+  declined: [],
+  completed: [],
+  cancelled: [],
+};
+
+producerOrderRouter.get("/:token", (req: Request, res: Response) => {
+  const raw = req.params["token"];
+  const token = Array.isArray(raw) ? (raw[0] as string) : (raw as string);
+  const order = token ? getOrderByConfirmToken(token) : null;
+  if (!order) {
+    res.status(404).setHeader("Content-Type", "text/html; charset=utf-8");
+    res.send("<!doctype html><html lang=\"nb\"><head><meta charset=\"utf-8\"><title>Ordre ikke funnet</title></head><body><p>Ordren ble ikke funnet. Sjekk at du brukte hele lenken fra e-posten.</p></body></html>");
+    return;
+  }
+
+  const orderRef = order.order_id.slice(0, 8);
+  const statusLabel = ORDER_STATUS_LABEL[order.status] || order.status;
+  const done = String(req.query["done"] || "");
+  const errorParam = String(req.query["error"] || "");
+  const banner =
+    done && ORDER_STATUS_LABEL[done]
+      ? `<div class="ordre-banner ok" role="status">Registrert: ${escapePageHtml(ORDER_STATUS_LABEL[done])}</div>`
+      : errorParam === "ugyldig"
+        ? `<div class="ordre-banner warn" role="alert">Handlingen er ikke gyldig for ordrens nåværende status.</div>`
+        : errorParam
+          ? `<div class="ordre-banner warn" role="alert">Kunne ikke oppdatere ordren. Prøv igjen.</div>`
+          : "";
+
+  const postTo = `/produsent/ordre/${encodeURIComponent(token)}`;
+  const actionsHtml = (ACTIONS_FOR_STATUS[order.status] || [])
+    .map(
+      (a) =>
+        `<form method="POST" action="${postTo}"><input type="hidden" name="action" value="${a.action}"><button type="submit" class="act-btn ${a.cls}">${a.label}</button></form>`
+    )
+    .join("\n    ");
+
+  const itemsHtml = order.items
+    .map(
+      (i) =>
+        `<div>${escapePageHtml(i.name_snapshot || "Vare")} — ${i.qty ?? "?"} stk${i.line_total != null ? ` (${i.line_total} kr)` : ""}</div>`
+    )
+    .join("\n      ");
+
+  const timelineHtml = order.timeline.length
+    ? `<div class="recap"><strong>Tidslinje:</strong>\n      ${order.timeline
+        .map((e) => `<div>${escapePageHtml(e.created_at)}: ${escapePageHtml(e.from_status || "–")} → ${escapePageHtml(e.to_status)}</div>`)
+        .join("\n      ")}</div>`
+    : "";
+
+  const html = `<!doctype html>
+<html lang="nb">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Ordre ${escapePageHtml(orderRef)} | Rett fra Bonden</title>
+<meta name="robots" content="noindex, nofollow">
+<style>
+body{font-family:system-ui,sans-serif;background:#f5f3ee;color:#1e2b23;margin:0}
+.confirm-panel{max-width:480px;margin:32px auto;background:#fff;border-radius:12px;box-shadow:0 2px 8px rgba(0,0,0,.07);padding:28px 24px}
+.confirm-panel h1{font-size:1.25rem;font-weight:800;margin:0 0 4px}
+.confirm-panel .ref{font-family:monospace;font-size:1rem;font-weight:700;letter-spacing:.03em;background:#eef0ea;border-radius:8px;padding:6px 12px;display:inline-block;margin:8px 0 4px}
+.confirm-panel .status-line{margin:12px 0 4px;font-size:.95rem}
+.confirm-panel .recap{text-align:left;margin:16px 0;font-size:.92rem;color:#41504a}
+.confirm-panel .recap div{padding:5px 0;border-bottom:1px solid #e4e2da}
+.confirm-panel .hint{font-size:.82rem;color:#7c877f;margin-top:14px}
+.ordre-banner{border-radius:8px;padding:12px 14px;margin:14px 0;font-size:.9rem}
+.ordre-banner.ok{background:#e8f4ec;border:1px solid #bcd9c5;color:#1d5a30}
+.ordre-banner.warn{background:#fdf3e7;border:1px solid #f0d4ae;color:#7a5218}
+.act-btn{margin-top:12px;width:100%;padding:12px 18px;border:none;border-radius:8px;font-size:1rem;font-weight:700;cursor:pointer}
+.act-primary{background:#2c5b3f;color:#fff}
+.act-secondary{background:#eef0ea;color:#1e2b23;border:1px solid #d8dbd2}
+</style>
+</head>
+<body>
+<main class="container">
+  <div class="confirm-panel">
+    <h1>Henteordre hos ${escapePageHtml(order.producer_name)}</h1>
+    <div class="ref">${escapePageHtml(orderRef)}</div>
+    ${banner}
+    <div class="status-line">Status: <strong>${escapePageHtml(statusLabel)}</strong>${order.cancel_reason === "no_show" ? " (ikke hentet)" : ""}</div>
+    <div class="recap">
+      <div><strong>Opprettet:</strong> ${escapePageHtml(order.created_at)}</div>
+      ${order.pickup_time ? `<div><strong>Hentetid:</strong> ${escapePageHtml(order.pickup_time)}</div>` : ""}
+      ${order.total_nok != null ? `<div><strong>Sum:</strong> ${order.total_nok} kr</div>` : ""}
+      ${itemsHtml}
+    </div>
+    ${timelineHtml}
+    ${actionsHtml}
+    <p class="hint">Denne siden er for produsenten. Lenken er personlig for denne ordren — ikke del den videre. Ingen betaling skjer via plattformen.</p>
+  </div>
+</main>
+</body>
+</html>`;
+
+  res.setHeader("Content-Type", "text/html; charset=utf-8");
+  res.setHeader("Cache-Control", "no-store");
+  res.send(html);
+});
+
+producerOrderRouter.post(
+  "/:token",
+  express.urlencoded({ extended: false }),
+  (req: Request, res: Response) => {
+    const raw = req.params["token"];
+    const token = Array.isArray(raw) ? (raw[0] as string) : (raw as string);
+    const order = token ? getOrderByConfirmToken(token) : null;
+    if (!order) {
+      res.status(404).json({ success: false, error: "Order not found" });
+      return;
+    }
+
+    const backTo = `/produsent/ordre/${encodeURIComponent(token)}`;
+    const action = String((req.body || {})["action"] || "");
+    const mapped = PRODUCER_ACTIONS[action];
+    if (!mapped) {
+      res.redirect(303, `${backTo}?error=ugyldig`);
+      return;
+    }
+
+    const result = transitionOrder(order.order_id, mapped.toStatus, {
+      actor: "producer",
+      cancelReason: mapped.cancelReason,
+    });
+    res.redirect(303, result.success ? `${backTo}?done=${mapped.toStatus}` : `${backTo}?error=ugyldig`);
+  }
+);

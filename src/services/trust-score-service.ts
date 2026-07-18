@@ -1,4 +1,5 @@
 import { getDb } from "../database/init";
+import { getTrustEventCounts } from "./trust-event-service";
 
 // ─── Trust Score Service ──────────────────────────────────────
 //
@@ -25,6 +26,34 @@ import { getDb } from "../database/init";
 // Phase 3 (scale): + interaction success + community
 
 // ─── Signal weights ──────────────────────────────────────────
+//
+// Transaction trust-ledger (dev-request 2026-07-13-pilot-ordre-loop):
+// the interaction signal now also reads trust_events counts (order_completed
+// / booking_attended lift, order_no_show / booking_no_show lower; declined
+// is recorded in the ledger but deliberately NOT scored — declining an order
+// a producer can't fulfil is honest behaviour, not a trust breach).
+//
+// Formula (documented here because the WEIGHTS themselves are UNCHANGED —
+// existing scores must not jump while the ledger is empty):
+//
+//   base       = discovery*0.3 + contact*0.4 + chosen*0.3   (pre-existing)
+//   completed  = count(order_completed) + count(booking_attended)
+//   noShows    = count(order_no_show)  + count(booking_no_show)
+//   IF completed + noShows == 0  → interaction = base        (0 events =
+//                                                             today's value)
+//   ELSE:
+//     txVolume    = min(1, log10(completed+1) / 1)   — 9 completed pickups
+//                                                      max the volume term
+//     noShowRate  = noShows / (completed + noShows)
+//     txSignal    = txVolume * (1 - noShowRate)      — no-shows scale the
+//                                                      earned credit down
+//     interaction = base*0.6 + txSignal*0.4          — real transactions are
+//                                                      blended in at 40% of
+//                                                      the interaction slot
+//
+// So a producer with only no-shows gets txSignal 0 (worse than having no
+// history is impossible — floor is base*0.6), and completed pickups are the
+// strongest interaction evidence on the platform.
 
 const WEIGHTS = {
   verification: 0.30,
@@ -284,11 +313,9 @@ class TrustScoreService {
       "SELECT times_discovered, times_contacted, times_chosen FROM agent_metrics WHERE agent_id = ?"
     ).get(agentId) as any;
 
-    if (!metrics) return 0;
-
-    const discovered = metrics.times_discovered || 0;
-    const contacted = metrics.times_contacted || 0;
-    const chosen = metrics.times_chosen || 0;
+    const discovered = metrics?.times_discovered || 0;
+    const contacted = metrics?.times_contacted || 0;
+    const chosen = metrics?.times_chosen || 0;
 
     // Composite: being discovered is basic, contacted is better, chosen is best
     // Use logarithmic scale so early interactions matter more (incentivizes new sellers)
@@ -296,7 +323,21 @@ class TrustScoreService {
     const contactScore   = Math.min(1, Math.log10(contacted + 1) / 1.5);   // ~30 contacts = 1.0
     const chosenScore    = Math.min(1, Math.log10(chosen + 1) / 1);        // 10 chosen = 1.0
 
-    return discoveryScore * 0.3 + contactScore * 0.4 + chosenScore * 0.3;
+    const base = discoveryScore * 0.3 + contactScore * 0.4 + chosenScore * 0.3;
+
+    // Transaction trust-ledger blend — see the formula comment at WEIGHTS.
+    // getTrustEventCounts is defensive (missing table → all zeros), and with
+    // zero scored events this returns exactly `base`, i.e. the pre-ledger
+    // value — existing scores don't move while the ledger is empty.
+    const events = getTrustEventCounts(agentId);
+    const scored = events.completed + events.noShows;
+    if (scored === 0) return base;
+
+    const txVolume = Math.min(1, Math.log10(events.completed + 1) / 1); // 9 completed = 1.0
+    const noShowRate = events.noShows / scored;
+    const txSignal = txVolume * (1 - noShowRate);
+
+    return base * 0.6 + txSignal * 0.4;
   }
 
   private communitySignal(agentId: string): number {
@@ -366,12 +407,15 @@ class TrustScoreService {
       "SELECT times_discovered, times_contacted, times_chosen FROM agent_metrics WHERE agent_id = ?"
     ).get(agentId) as any;
 
-    if (!metrics) return "Ingen interaksjoner ennå";
-
     const parts: string[] = [];
-    if (metrics.times_discovered) parts.push(`${metrics.times_discovered} oppdaget`);
-    if (metrics.times_contacted) parts.push(`${metrics.times_contacted} kontaktet`);
-    if (metrics.times_chosen) parts.push(`${metrics.times_chosen} valgt`);
+    if (metrics?.times_discovered) parts.push(`${metrics.times_discovered} oppdaget`);
+    if (metrics?.times_contacted) parts.push(`${metrics.times_contacted} kontaktet`);
+    if (metrics?.times_chosen) parts.push(`${metrics.times_chosen} valgt`);
+
+    // Transaction trust-ledger (pilot-ordre-loop): surface real outcomes too.
+    const events = getTrustEventCounts(agentId);
+    if (events.completed) parts.push(`${events.completed} fullført${events.completed === 1 ? "" : "e"} hentinger`);
+    if (events.noShows) parts.push(`${events.noShows} ikke hentet`);
 
     return parts.length > 0 ? parts.join(", ") : "Ingen interaksjoner ennå";
   }
