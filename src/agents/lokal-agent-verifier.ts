@@ -433,13 +433,11 @@ export function countPendingVerify(db: any): number {
 // /admin/run-verifier going forward — keeps the systematic-sweep
 // guarantee for already-`verified` agents while biasing capacity
 // toward the growth-reservoir buckets (pending_verify, review_required,
-// data_insufficient) where actual pool-growth is unlocked.
+// unverified, data_insufficient) where actual pool-growth is unlocked.
 //
 // Split semantics:
 //   - growthCount = Math.floor(limit * growthRatio)   (default 21 of 30)
 //   - verifiedCount = limit - growthCount             (default 9 of 30)
-//   - growth sub-query: WHERE verification_status IN
-//       ('unverified','pending_verify','review_required','data_insufficient')
 //   - verified sub-query: WHERE verification_status = 'verified'
 //
 // orch-pr-20260704-poolfix: 'unverified' (the agent_knowledge column
@@ -450,12 +448,34 @@ export function countPendingVerify(db: any): number {
 // picker) already includes 'unverified' via its blanket
 // `NOT IN ('opt_out')` filter, so this just brings pickBatchBiased back
 // in line with that existing, wider population.
-//   - both ordered HTTP-failed-first then oldest last_verified_at first
-//     (matches pickBatch's existing front-bump behaviour).
 //
-// Fall-back: if one sub-query returns fewer rows than its target,
-// the deficit is filled from the other bucket so the caller always
-// gets up to `limit` candidates when any exist.
+// orch-pr-20260718-gate-integrity-slice3: the growth bucket used to be
+// filled by a single query pooling all 4 growth statuses behind one
+// `ORDER BY ..., COALESCE(last_verified_at, '1970-01-01') ASC` clause.
+// Freshly-scraped `unverified` rows have `last_verified_at IS NULL`,
+// which COALESCE maps to '1970-01-01' — sorting ahead of every row that
+// already carries a real (even if very stale) timestamp. Since new
+// `unverified` rows keep appearing continuously from scraping, they won
+// every growth slot on every run and the `pending_verify` /
+// `review_required` backlogs were never reached. Fixed by giving each of
+// the 4 growth statuses its own quota (a near-equal split of
+// `growthTarget`, remainder slots going to the priority order
+// ['pending_verify', 'review_required', 'unverified', 'data_insufficient']
+// so the starved backlog cohorts get first claim on any remainder), each
+// queried independently with the SAME ORDER clause. If any status's own
+// query comes up short (not enough rows in that cohort), the shortfall
+// is backfilled from the combined 4-status pool, excluding ids already
+// picked — mirroring the existing growth/verified cross-bucket backfill
+// pattern below.
+//   - all growth queries ordered HTTP-failed-first then oldest
+//     last_verified_at first (matches pickBatch's existing front-bump
+//     behaviour).
+//
+// Fall-back: if the growth or verified bucket (after its own internal
+// backfill, for growth) returns fewer rows than its target, the deficit
+// is filled from the OTHER bucket so the caller always gets up to
+// `limit` candidates when any exist. This cross-bucket fall-back is
+// UNCHANGED from before.
 //
 // opt_out agents are always excluded (matches pickBatch).
 export function pickBatchBiased(
@@ -477,14 +497,55 @@ export function pickBatchBiased(
   const ORDER = `ORDER BY CASE WHEN k.last_http_status >= 400 THEN 0 ELSE 1 END,
               COALESCE(k.last_verified_at, '1970-01-01') ASC`;
 
-  const growthRows = growthTarget > 0
-    ? db.prepare(
-        `${SELECT_COLS}
-          WHERE k.verification_status IN ('unverified', 'pending_verify', 'review_required', 'data_insufficient')
-          ${ORDER}
-          LIMIT ?`
-      ).all(growthTarget)
-    : [];
+  // Priority order matters: statuses earlier in this list get the
+  // "remainder" slots when growthTarget doesn't divide evenly by 4.
+  // The backlog cohorts (pending_verify, review_required) get remainder
+  // priority since they're the ones that were starved by the old
+  // pooled-query behaviour.
+  const GROWTH_STATUSES = ['pending_verify', 'review_required', 'unverified', 'data_insufficient'];
+
+  const perStatusBase = Math.floor(growthTarget / GROWTH_STATUSES.length);
+  const perStatusRemainder = growthTarget % GROWTH_STATUSES.length;
+
+  const growthRows: any[] = [];
+  const growthHaveIds = new Set<string>();
+  GROWTH_STATUSES.forEach((status, idx) => {
+    const quota = perStatusBase + (idx < perStatusRemainder ? 1 : 0);
+    if (quota <= 0) return;
+    const rows = db.prepare(
+      `${SELECT_COLS}
+        WHERE k.verification_status = ?
+        ${ORDER}
+        LIMIT ?`
+    ).all(status, quota);
+    for (const r of rows) {
+      growthRows.push(r);
+      growthHaveIds.add(r.id);
+    }
+  });
+
+  // Per-status quotas can come up short (a cohort simply doesn't have
+  // enough rows) — backfill the shortfall from the combined 4-status
+  // pool, excluding ids already selected. Same backfill idiom as the
+  // growth/verified cross-bucket fall-back further below: over-fetch to
+  // (already-have + shortfall) = growthTarget, filter dupes, slice to
+  // the shortfall.
+  const growthQuotaShortfall = growthTarget - growthRows.length;
+  if (growthQuotaShortfall > 0) {
+    let growthBackfill = db.prepare(
+      `${SELECT_COLS}
+        WHERE k.verification_status IN ('pending_verify', 'review_required', 'unverified', 'data_insufficient')
+        ${ORDER}
+        LIMIT ?`
+    ).all(growthTarget);
+    growthBackfill = growthBackfill
+      .filter((r: any) => !growthHaveIds.has(r.id))
+      .slice(0, growthQuotaShortfall);
+    for (const r of growthBackfill) {
+      growthRows.push(r);
+      growthHaveIds.add(r.id);
+    }
+  }
 
   const verifiedRows = verifiedTarget > 0
     ? db.prepare(
@@ -520,8 +581,7 @@ export function pickBatchBiased(
         ${ORDER}
         LIMIT ?`
     ).all(growthTarget + verifiedDeficit);
-    const haveIds = new Set(growthRows.map((r: any) => r.id));
-    extraGrowth = extraGrowth.filter((r: any) => !haveIds.has(r.id)).slice(0, verifiedDeficit);
+    extraGrowth = extraGrowth.filter((r: any) => !growthHaveIds.has(r.id)).slice(0, verifiedDeficit);
   }
 
   return [...growthRows, ...extraGrowth, ...verifiedRows, ...extraVerified].slice(0, limit);
