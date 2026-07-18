@@ -1025,10 +1025,56 @@ export function isAcceptableHomepageEmail(email: string, siteUrl: string): boole
   return false;
 }
 
+// ─── Slice 3b (dev-request 2026-07-15-gate-integrity-unverified-agent-bypass) ─
+//
+// Field-agnostic homepage-evidence check. Generalizes the inline check that
+// used to live only in lokal-agent-verifier.ts's Guard #3
+// (email_ownership_unproven): true when `records` (a field_provenance[field]
+// value — array, legacy single-object, or missing/unknown) contains a
+// `source_type: "homepage"` record whose value matches `value` exactly,
+// case-insensitive/trimmed. Field-agnostic — callers pass whichever field's
+// provenance records they want checked (email / phone / address / …).
+// Inlines the same legacy-shape coercion `coerceFieldRecords` in
+// lokal-agent-verifier.ts performs, so callers don't need their own
+// coercion step.
+export function hasHomepageEvidence(
+  records: ProvenanceRecord[] | ProvenanceRecord | unknown,
+  value: string | null | undefined
+): boolean {
+  if (!value) return false;
+  const target = value.trim().toLowerCase();
+  if (!target) return false;
+
+  let arr: ProvenanceRecord[];
+  if (!records) {
+    arr = [];
+  } else if (Array.isArray(records)) {
+    arr = records as ProvenanceRecord[];
+  } else if (typeof records === "object") {
+    arr = [records as ProvenanceRecord];
+  } else {
+    arr = [];
+  }
+
+  return arr.some(
+    (rec) =>
+      rec &&
+      typeof rec === "object" &&
+      rec.source_type === "homepage" &&
+      typeof rec.value === "string" &&
+      rec.value.trim().toLowerCase() === target
+  );
+}
+
 export function domainCoherenceCheck(
   agentUrl: string | null | undefined,
   knowledgeWebsite: string | null | undefined,
-  knowledgeEmail: string | null | undefined
+  knowledgeEmail: string | null | undefined,
+  opts?: {
+    fieldProvenance?: Record<string, ProvenanceRecord[] | ProvenanceRecord | unknown>;
+    knowledgePhone?: string | null;
+    knowledgeAddress?: string | null;
+  }
 ): DomainCoherenceResult {
   // No agent URL → nothing to validate against; do not penalize.
   if (!agentUrl || !agentUrl.trim()) return { coherent: true };
@@ -1043,6 +1089,21 @@ export function domainCoherenceCheck(
   const emailHost = knowledgeEmail && knowledgeEmail.trim() && knowledgeEmail.includes("@")
     ? hostFromEmail(knowledgeEmail)
     : null;
+
+  // Slice 3b: a homepage-proven contact value (email, phone, or address —
+  // field_provenance record with source_type:"homepage" whose value matches
+  // the corresponding knowledge.* value exactly, case-insensitive/trimmed)
+  // rescues coherence even when agents.url's host differs from
+  // knowledge.website/knowledge.email's host (the post@b1.no vs bi1.no
+  // class — same evidentiary bar as Guard #3's email-ownership check, just
+  // widened to anchor identity too). Omitting `opts` reproduces today's
+  // exact behavior — this is always false when opts is undefined.
+  const fieldProvenance = opts?.fieldProvenance;
+  const homepageEvidenceAnchors = !!fieldProvenance && (
+    hasHomepageEvidence(fieldProvenance.email, knowledgeEmail) ||
+    hasHomepageEvidence(fieldProvenance.phone, opts?.knowledgePhone) ||
+    hasHomepageEvidence(fieldProvenance.address, opts?.knowledgeAddress)
+  );
 
   // Directory-host bypass: if agents.url points at a known directory/aggregator
   // (Hanen, Lokalmat, Brreg, …), it cannot be used as the entity-truth signal.
@@ -1078,7 +1139,7 @@ export function domainCoherenceCheck(
         emailHost !== null &&
         !FREE_MAIL_DOMAINS.includes(emailHost) &&
         domainsEquivalent(registrableDomain(emailHost), agentRoot);
-      if (!emailAnchorsSite) {
+      if (!emailAnchorsSite && !homepageEvidenceAnchors) {
         return {
           coherent: false,
           reason: `knowledge.website host ${websiteHost} != agents.url host ${agentHost}`,
@@ -1100,7 +1161,7 @@ export function domainCoherenceCheck(
   if (emailHost) {
     if (!FREE_MAIL_DOMAINS.includes(emailHost) && !PLACEHOLDER_EMAIL_DOMAINS.includes(emailHost)) {
       const emailRoot = registrableDomain(emailHost);
-      if (!domainsEquivalent(emailRoot, agentRoot)) {
+      if (!domainsEquivalent(emailRoot, agentRoot) && !homepageEvidenceAnchors) {
         return {
           coherent: false,
           reason: `knowledge.email host ${emailHost} != agents.url host ${agentHost}`,

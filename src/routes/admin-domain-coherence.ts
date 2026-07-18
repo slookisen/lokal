@@ -60,7 +60,37 @@
 
 import { Router, Request, Response } from "express";
 import { getDb } from "../database/init";
-import { domainCoherenceCheck } from "../services/cross-source-validator";
+import { domainCoherenceCheck, type ProvenanceRecord } from "../services/cross-source-validator";
+
+// Parse field_provenance (may be a JSON string from SQLite, already an
+// object, or null/missing) into the shape domainCoherenceCheck's opts
+// expect — mirrors the equivalent parsing in lokal-agent-verifier.ts so both
+// call sites treat the column identically.
+function parseFieldProvenance(
+  raw: string | null | undefined
+): Record<string, ProvenanceRecord[] | ProvenanceRecord | unknown> {
+  if (!raw) return {};
+  try {
+    const v = typeof raw === "string" ? JSON.parse(raw) : raw;
+    return v && typeof v === "object" ? v : {};
+  } catch {
+    return {};
+  }
+}
+
+// Builds the domainCoherenceCheck 4th-arg opts object from a row/fresh-read
+// that carries phone/address/field_provenance alongside website/email.
+function coherenceOpts(row: {
+  phone: string | null;
+  address: string | null;
+  field_provenance: string | null;
+}) {
+  return {
+    fieldProvenance: parseFieldProvenance(row.field_provenance),
+    knowledgePhone: row.phone,
+    knowledgeAddress: row.address,
+  };
+}
 
 const router = Router();
 
@@ -88,6 +118,9 @@ interface CohortRow {
   agent_url: string | null;
   website: string | null;
   email: string | null;
+  phone: string | null;
+  address: string | null;
+  field_provenance: string | null;
   verification_review_reason: string;
 }
 
@@ -140,7 +173,8 @@ router.post("/", (req: Request, res: Response) => {
     const rows = db
       .prepare(
         `SELECT a.id AS agent_id, a.name, a.url AS agent_url,
-                k.website, k.email, k.verification_review_reason
+                k.website, k.email, k.phone, k.address, k.field_provenance,
+                k.verification_review_reason
            FROM agents a
      INNER JOIN agent_knowledge k ON k.agent_id = a.id
           WHERE k.verification_status = 'review_required'
@@ -164,7 +198,7 @@ router.post("/", (req: Request, res: Response) => {
     }> = [];
 
     for (const row of rows) {
-      const result = domainCoherenceCheck(row.agent_url, row.website, row.email);
+      const result = domainCoherenceCheck(row.agent_url, row.website, row.email, coherenceOpts(row));
       if (result.coherent) {
         coherent_skipped++;
         if (apply) {
@@ -272,7 +306,7 @@ router.post("/", (req: Request, res: Response) => {
         `UPDATE agent_knowledge SET website = ? WHERE agent_id = ?`
       );
       const freshStmt = db.prepare(
-        `SELECT a.url AS agent_url, k.website, k.email
+        `SELECT a.url AS agent_url, k.website, k.email, k.phone, k.address, k.field_provenance
            FROM agents a INNER JOIN agent_knowledge k ON k.agent_id = a.id
           WHERE a.id = ?`
       );
@@ -281,10 +315,17 @@ router.post("/", (req: Request, res: Response) => {
         // between the classification read above and this write (or between
         // an earlier dry-run call and this apply call).
         const fresh = freshStmt.get(fix.agent_id) as
-          | { agent_url: string | null; website: string | null; email: string | null }
+          | {
+              agent_url: string | null;
+              website: string | null;
+              email: string | null;
+              phone: string | null;
+              address: string | null;
+              field_provenance: string | null;
+            }
           | undefined;
         if (!fresh) continue;
-        const recheck = domainCoherenceCheck(fresh.agent_url, fresh.website, fresh.email);
+        const recheck = domainCoherenceCheck(fresh.agent_url, fresh.website, fresh.email, coherenceOpts(fresh));
         if (recheck.coherent || !(recheck.reason || "").startsWith("knowledge.website host") || !recheck.agentHost) {
           // No longer the mismatch we classified — skip the write.
           continue;

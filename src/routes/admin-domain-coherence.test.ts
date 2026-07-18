@@ -474,6 +474,118 @@ export function runAdminDomainCoherenceSweepTests(
       }
     }
 
+    // ── Slice 3b (dev-request 2026-07-15-gate-integrity-unverified-agent-bypass):
+    // homepage-evidence widening (separate, isolated DB). A cohort row whose
+    // knowledge.website host mismatches agents.url's host, but whose
+    // field_provenance carries homepage-proven phone/address evidence that
+    // matches the row's own phone/address value, must be classified
+    // `coherent` (never auto_fixable/manual_review_needed) — and under
+    // apply:true must get stampParking(..., "no_action_needed", ...), never
+    // reach the auto-fix WRITE path (knowledge.website must be left
+    // untouched).
+    {
+      const prevDb3 = initMod.getDb();
+      const testKey3 = "admin-domain-coherence-homepage-evidence-test-key";
+      const prevAdminKey3 = process.env.ADMIN_KEY;
+      process.env.ADMIN_KEY = testKey3;
+      const db3 = new Database(":memory:");
+      try {
+        initMod.__setDbForTesting(db3 as any);
+        initMod.__initSchemaForTesting(db3 as any);
+
+        const insertAgent3 = db3.prepare(
+          `INSERT INTO agents (id, name, description, provider, contact_email, url, role, api_key, umbrella_type)
+           VALUES (?, ?, 'test agent', 'test', 'x@example.com', ?, 'producer', ?, ?)`,
+        );
+        const insertKnowledge3 = db3.prepare(
+          `INSERT INTO agent_knowledge (agent_id, website, email, phone, address, field_provenance, about, verification_status, verification_review_reason)
+           VALUES (?, ?, ?, ?, ?, ?, 'A test farm shop', 'review_required', '{}')`,
+        );
+
+        // agent_url host (b1.no) mismatches knowledge.website (totally-wrong-host.no)
+        // — the classic auto_fixable shape — BUT field_provenance.phone has a
+        // homepage-proven record matching the row's own phone value. This must
+        // rescue coherence entirely: no bucket, no write.
+        insertAgent3.run("agent-homepage-rescued", "HomepageRescued AS", "https://b1.no", "key-hp-rescued", null);
+        insertKnowledge3.run(
+          "agent-homepage-rescued",
+          "https://totally-wrong-host.no",
+          null,
+          "91122333",
+          null,
+          JSON.stringify({ phone: [{ value: "91122333", source_type: "homepage", fetched_at: "2026-07-01" }] }),
+        );
+
+        // Control: identical shape, but NO homepage evidence — must classify
+        // normally (auto_fixable), proving the fixture above wasn't coherent
+        // for some other reason.
+        insertAgent3.run("agent-homepage-not-rescued", "HomepageNotRescued AS", "https://b2.no", "key-hp-not-rescued", null);
+        insertKnowledge3.run(
+          "agent-homepage-not-rescued",
+          "https://also-totally-wrong-host.no",
+          null,
+          "91122333",
+          null,
+          "{}",
+        );
+
+        delete require.cache[require.resolve("./admin-domain-coherence")];
+        const routeMod3 = require("./admin-domain-coherence");
+        const router3 = routeMod3.default;
+
+        function post3(body: any): Promise<RouteResult> {
+          return callRoute(router3, {
+            method: "POST",
+            url: "/",
+            headers: { "content-type": "application/json", "x-admin-key": testKey3 },
+            body,
+          });
+        }
+
+        let r = await post3({});
+        assertEq(r.status, 200, "dc-55: homepage-evidence fixture dry-run -> 200");
+        assertTrue(
+          !r.body.auto_fixable.some((a: any) => a.agent_id === "agent-homepage-rescued"),
+          "dc-56: homepage-proven-phone agent is NOT auto_fixable",
+        );
+        assertTrue(
+          !r.body.manual_review_needed.some((a: any) => a.agent_id === "agent-homepage-rescued"),
+          "dc-57: homepage-proven-phone agent is NOT manual_review_needed either",
+        );
+        assertTrue(
+          !r.body.circular_scramble_candidates.some((a: any) => a.agent_id === "agent-homepage-rescued"),
+          "dc-58: homepage-proven-phone agent is NOT a circular_scramble_candidate",
+        );
+        assertTrue(
+          r.body.auto_fixable.some((a: any) => a.agent_id === "agent-homepage-not-rescued"),
+          "dc-59: control agent WITHOUT homepage evidence IS classified auto_fixable (proves the rescue discriminates)",
+        );
+
+        r = await post3({ apply: true });
+        assertEq(r.status, 200, "dc-60: apply POST -> 200");
+
+        const rescuedRow = db3.prepare(
+          "SELECT website, domain_reconciliation_outcome, domain_reconciliation_checked_at FROM agent_knowledge WHERE agent_id = 'agent-homepage-rescued'"
+        ).get() as { website: string; domain_reconciliation_outcome: string | null; domain_reconciliation_checked_at: string | null };
+        assertEq(rescuedRow.website, "https://totally-wrong-host.no",
+          "dc-61: apply does NOT rewrite the homepage-rescued agent's website (never reaches the auto-fix WRITE path)");
+        assertEq(rescuedRow.domain_reconciliation_outcome, "no_action_needed",
+          "dc-62: homepage-rescued agent is parked as no_action_needed under apply:true");
+        assertTrue(!!rescuedRow.domain_reconciliation_checked_at,
+          "dc-63: homepage-rescued agent gets a parking timestamp under apply:true");
+
+        const notRescuedRow = db3.prepare(
+          "SELECT website FROM agent_knowledge WHERE agent_id = 'agent-homepage-not-rescued'"
+        ).get() as { website: string };
+        assertEq(notRescuedRow.website, "https://b2.no",
+          "dc-64: control agent WITHOUT homepage evidence IS auto-fixed under apply:true (website corrected to agents.url host)");
+      } finally {
+        initMod.__setDbForTesting(prevDb3);
+        if (prevAdminKey3 === undefined) delete process.env.ADMIN_KEY;
+        else process.env.ADMIN_KEY = prevAdminKey3;
+      }
+    }
+
     return { passed, failed, failures };
   })();
 }

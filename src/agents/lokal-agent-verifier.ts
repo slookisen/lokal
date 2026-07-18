@@ -23,6 +23,7 @@ import {
   aggregateVerdict,
   domainCoherenceCheck,
   factualFieldsWithOnlyInference,
+  hasHomepageEvidence,
   FREE_MAIL_DOMAINS,
   type FieldName,
   type ProvenanceRecord,
@@ -108,17 +109,6 @@ function hostnameFromUrl(u: string | null | undefined): string | null {
 function emailDomain(e: string | null | undefined): string | null {
   if (!e || !e.includes("@")) return null;
   return e.split("@")[1].toLowerCase();
-}
-
-// Coerce a field_provenance[field] value (array, legacy single-object, or
-// missing) to a ProvenanceRecord[] — mirrors the same coercion in
-// crossSourceAgreement() (cross-source-validator.ts) so both call sites treat
-// the legacy single-record shape identically.
-function coerceFieldRecords(raw: unknown): ProvenanceRecord[] {
-  if (!raw) return [];
-  if (Array.isArray(raw)) return raw as ProvenanceRecord[];
-  if (typeof raw === "object") return [raw as ProvenanceRecord];
-  return [];
 }
 
 // HEAD-fetch with short timeout. We don't follow redirects deeply;
@@ -977,6 +967,7 @@ export async function runVerifierBatch(opts: {
       agent.agent_url,
       agent.website,
       agent.email,
+      { fieldProvenance: fieldProv, knowledgePhone: agent.phone, knowledgeAddress: agent.address },
     );
     let newVerification = deriveVerificationStatus(gate.passes, gate.flags, agentVerdict);
     if (inferenceOnlyFields.length > 0) {
@@ -1066,15 +1057,7 @@ export async function runVerifierBatch(opts: {
     // `wasInPool`.
     const emailDomainForOwnership = emailDomain(agent.email);
     const isFreeMailForOwnership = !!(emailDomainForOwnership && FREE_MAIL_DOMAINS.includes(emailDomainForOwnership));
-    const emailHomepageEvidence = coerceFieldRecords(fieldProv.email).some(
-      (rec) =>
-        rec &&
-        typeof rec === "object" &&
-        rec.source_type === "homepage" &&
-        typeof rec.value === "string" &&
-        !!agent.email &&
-        rec.value.trim().toLowerCase() === String(agent.email).trim().toLowerCase()
-    );
+    const emailHomepageEvidence = hasHomepageEvidence(fieldProv.email, agent.email);
     const emailManuallyVerified = agent.is_verified === 1 || agent.is_verified === true;
     const emailOwnershipUnproven = isFreeMailForOwnership && !emailHomepageEvidence && !emailManuallyVerified;
     let emailOwnershipReportOnly = false;
