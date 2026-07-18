@@ -22,7 +22,14 @@ export function getDentalAgentCard(): object {
       "A2A-markedsplass for norske tannlegeklinikker — ~6 900 klinikker med Helfo-avtale-, spesialitet- og akuttvakt-data. " +
       "A2A marketplace for Norwegian dental clinics — ~6,900 clinics with Helfo-agreement, speciality, and emergency-duty data.",
     url: `${url}/a2a`,
-    protocolVersion: "0.3.0",
+    // A2A v1.0 (Linux Foundation, released April 2026) top-level protocol fields,
+    // dual-published alongside legacy `authentication` below (additive-only —
+    // dev-request 2026-07-13-a2a-card-v1-signing slice 1).
+    protocolVersion: "1.0.0",
+    preferredTransport: "JSONRPC",
+    additionalInterfaces: [
+      { url: `${url}/api/tannlege`, transport: "HTTP+JSON" },
+    ],
     provider: {
       organization: "Finn-tannlege",
       url,
