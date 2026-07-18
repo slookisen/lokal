@@ -13790,6 +13790,50 @@ console.log("\n── orch-pr-87: pickBatchBiased + getSweepStatus ──");
     db.close();
   }
 
+  // Test 3b (orch-pr-20260718-gate-integrity-slice3): regression test for
+  // the NULL-starvation bug in the growth bucket's old pooled query.
+  // Freshly-scraped `unverified` rows have last_verified_at IS NULL,
+  // which COALESCE(...,'1970-01-01') mapped to the "oldest possible"
+  // timestamp — so as long as unverified rows kept appearing, they won
+  // every growth slot and the pending_verify/review_required backlogs
+  // were never reached. Seed 1000 unverified rows with a real NULL
+  // last_verified_at (raw insert, NOT seedAgents, which always sets a
+  // real timestamp — this reproduces the actual DEFAULT NULL state of a
+  // brand-new agent_knowledge row) plus 20 pending_verify + 20
+  // review_required rows (via seedAgents, real stale timestamps). Before
+  // the fix, all 21 growth slots would go to unverified; after the fix,
+  // each growth status gets its own quota so the backlog cohorts must
+  // appear in the batch.
+  {
+    const db = makeDb();
+
+    const insA = db.prepare("INSERT INTO agents (id,name,role,city) VALUES (?, ?, 'producer', 'Oslo')");
+    const insUnverifiedNull = db.prepare(
+      `INSERT INTO agent_knowledge (agent_id, email, website, verification_status, last_verified_at)
+       VALUES (?, ?, ?, 'unverified', NULL)`
+    );
+    for (let i = 0; i < 1000; i++) {
+      const id = `nullstarve-${i}`;
+      insA.run(id, `Agent ${id}`);
+      insUnverifiedNull.run(id, `${id}@x.no`, `https://${id}.no`);
+    }
+
+    seedAgents(db, "backlog-pv", 20, "pending_verify", "2026-01-01T00:00:00Z");
+    seedAgents(db, "backlog-rr", 20, "review_required", "2026-01-01T00:00:00Z");
+
+    const batch = pickBatchBiased(db, 30, 0.7);
+    const growthStatuses = new Set(["unverified", "data_insufficient", "pending_verify", "review_required"]);
+    const growthRows = batch.filter((r: any) => growthStatuses.has(r.verification_status));
+    const hasPendingVerify = growthRows.some((r: any) => r.verification_status === "pending_verify");
+    const hasReviewRequired = growthRows.some((r: any) => r.verification_status === "review_required");
+
+    assertTrue(hasPendingVerify,
+      "orch-pr-20260718-slice3: growth bucket includes at least one pending_verify row despite 1000 fresh unverified rows");
+    assertTrue(hasReviewRequired,
+      "orch-pr-20260718-slice3: growth bucket includes at least one review_required row despite 1000 fresh unverified rows");
+    db.close();
+  }
+
   // Test 4: getSweepStatus shape + processed-count math
   {
     const db = makeDb();
