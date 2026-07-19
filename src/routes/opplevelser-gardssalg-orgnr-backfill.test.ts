@@ -249,46 +249,81 @@ export function runOpplevelserGardssalgOrgnrBackfillTests(
       assertTrue(
         store.gardssalgOrgnrPostalCorroborated(
           { postnummer: null, poststed: "Nesoddtangen" },
-          { brreg_postal: null, address: "Gårdsveien 1, 1450 Nesoddtangen" },
+          { brreg_postal: null, brreg_poststed: "Nesoddtangen" },
         ),
-        "f2: matching poststed substring (no postnummer on target) -> corroborated",
+        "f2: matching poststed (exact, no postnummer on target) -> corroborated",
       );
       assertTrue(
         !store.gardssalgOrgnrPostalCorroborated(
           { postnummer: null, poststed: null },
-          { brreg_postal: "1450", address: "Gårdsveien 1, 1450 Nesoddtangen" },
+          { brreg_postal: "1450", brreg_poststed: "Nesoddtangen" },
         ),
         "f3: no signal at all on the target row -> NEVER corroborated (ved tvil: ikke skriv)",
       );
       assertTrue(
         !store.gardssalgOrgnrPostalCorroborated(
           { postnummer: "9999", poststed: null },
-          { brreg_postal: "1450", address: "Gårdsveien 1, 1450 Nesoddtangen" },
+          { brreg_postal: "1450", brreg_poststed: "Nesoddtangen" },
         ),
         "f4: mismatched postnummer -> not corroborated",
+      );
+      // Regression (independent review finding): a SHORT poststed must never
+      // "corroborate" via substring containment against an unrelated, longer
+      // town name it happens to be a substring of. Pre-fix, this compared
+      // against the full formatted `address` display string with .includes()
+      // — "nes" ⊂ "Sandnes", "os" ⊂ "Oslo" — silently corroborating an
+      // org_nr for the WRONG provider. Post-fix, brreg_poststed is compared
+      // as an EXACT (normalised) match against the hit's own poststed field.
+      assertTrue(
+        !store.gardssalgOrgnrPostalCorroborated(
+          { postnummer: null, poststed: "Nes" },
+          { brreg_postal: null, brreg_poststed: "Sandnes" },
+        ),
+        "f5: short poststed 'Nes' does NOT falsely corroborate against unrelated 'Sandnes'",
+      );
+      assertTrue(
+        !store.gardssalgOrgnrPostalCorroborated(
+          { postnummer: null, poststed: "Os" },
+          { brreg_postal: null, brreg_poststed: "Oslo" },
+        ),
+        "f6: short poststed 'Os' does NOT falsely corroborate against unrelated 'Oslo'",
+      );
+      assertTrue(
+        store.gardssalgOrgnrPostalCorroborated(
+          { postnummer: null, poststed: "Bø" },
+          { brreg_postal: null, brreg_poststed: "BØ" },
+        ),
+        "f7: exact match is still case/diacritic-normalised (Bø == BØ)",
       );
 
       // ── (g) gardssalgOrgnrAutoWriteEligible ──────────────────────────────
       assertTrue(
         store.gardssalgOrgnrAutoWriteEligible(
           { postnummer: "1450", poststed: null },
-          { confidence: 1.0, brreg_postal: "1450", address: "Gårdsveien 1, 1450 Nesoddtangen" },
+          { confidence: 1.0, brreg_postal: "1450", brreg_poststed: "Nesoddtangen" },
         ),
         "g1: confidence 1.0 + postal corroboration -> auto-write eligible",
       );
       assertTrue(
         !store.gardssalgOrgnrAutoWriteEligible(
           { postnummer: "1450", poststed: null },
-          { confidence: 0.95, brreg_postal: "1450", address: "Gårdsveien 1, 1450 Nesoddtangen" },
+          { confidence: 0.95, brreg_postal: "1450", brreg_poststed: "Nesoddtangen" },
         ),
         "g2: confidence 0.95 (first-token+postal, not exact name) -> NEVER auto-write even with matching postal",
       );
       assertTrue(
         !store.gardssalgOrgnrAutoWriteEligible(
           { postnummer: null, poststed: null },
-          { confidence: 1.0, brreg_postal: "1450", address: "Gårdsveien 1, 1450 Nesoddtangen" },
+          { confidence: 1.0, brreg_postal: "1450", brreg_poststed: "Nesoddtangen" },
         ),
         "g3: confidence 1.0 but no corroboration signal on target -> not auto-write eligible",
+      );
+      assertTrue(
+        !store.gardssalgOrgnrAutoWriteEligible(
+          { postnummer: null, poststed: "Nes" },
+          { confidence: 1.0, brreg_postal: null, brreg_poststed: "Sandnes" },
+        ),
+        "g4: confidence 1.0 but the short-poststed substring collision -> NOT auto-write eligible (the exact cross-contamination scenario this gate exists to prevent)",
       );
 
       // ── applyGardssalgProviderOrgnr fixtures (h)-(k) ─────────────────────
@@ -390,9 +425,29 @@ export function runOpplevelserGardssalgOrgnrBackfillTests(
         content_source: null, postnummer: null, poststed: null,
         catalog_hidden: null, created_at: "2026-02-01 00:00:00",
       });
+      // Regression fixture (independent review finding): target's poststed
+      // "Nes" is a short substring of the Brreg hit's actual (unrelated)
+      // poststed "Sandnes" — an exact-name match (confidence 1.0) must NOT
+      // auto-write here despite the pre-fix substring bug that would have.
+      insertProvider.run({
+        id: "route-poststed-collision", navn: "Route Poststed Collision Gard", org_nr: null,
+        content_source: null, postnummer: null, poststed: "Nes",
+        catalog_hidden: null, created_at: "2026-02-01 00:00:00",
+      });
 
       globalThis.fetch = (async (url: string | URL | Request) => {
         const u = String(url);
+        if (u.includes("navn=Route%20Poststed%20Collision%20Gard")) {
+          return {
+            ok: true, status: 200,
+            json: async () => ({
+              _embedded: { enheter: [{
+                organisasjonsnummer: "914000099", navn: "Route Poststed Collision Gard",
+                forretningsadresse: { adresse: ["Sandnesveien 1"], postnummer: "4306", poststed: "Sandnes" },
+              }] },
+            }),
+          } as unknown as Response;
+        }
         if (u.includes("navn=Route%20Exact%20Gard")) {
           return {
             ok: true, status: 200,
@@ -428,7 +483,7 @@ export function runOpplevelserGardssalgOrgnrBackfillTests(
       const dryRes = await callRoute(opplevelserRouter, {
         headers: { "x-admin-key": testKey },
         body: {
-          providerIds: ["route-exact", "route-locked", "route-review", "route-no-candidate"],
+          providerIds: ["route-exact", "route-locked", "route-review", "route-no-candidate", "route-poststed-collision"],
           apply: false,
         },
       });
@@ -461,11 +516,24 @@ export function runOpplevelserGardssalgOrgnrBackfillTests(
       assertTrue(!!noCandRow, "p2: route-no-candidate upserted into review queue");
       assertEq(noCandRow.candidate_orgnr, null, "p3: no candidate fields on a no_brreg_candidate row");
 
+      // Regression (independent review finding, end-to-end through the
+      // route): the short-poststed substring collision must land in
+      // needs_human_review, never changed[] — confidence is 1.0 (exact name
+      // match) but "Nes" vs the hit's actual "Sandnes" must NOT corroborate.
+      assertTrue(
+        dryRes.body.unresolved.some((u: any) => u.provider_id === "route-poststed-collision" && u.reason === "needs_human_review"),
+        "o1b: route-poststed-collision -> unresolved reason needs_human_review (NOT auto-written despite exact name match)",
+      );
+      assertTrue(
+        !dryRes.body.changed.some((c: any) => c.provider_id === "route-poststed-collision"),
+        "o1c: route-poststed-collision does NOT appear in changed[] — the fix holds end-to-end",
+      );
+
       // (n) apply: true -> route-exact actually written.
       const applyRes = await callRoute(opplevelserRouter, {
         headers: { "x-admin-key": testKey },
         body: {
-          providerIds: ["route-exact", "route-locked", "route-review", "route-no-candidate"],
+          providerIds: ["route-exact", "route-locked", "route-review", "route-no-candidate", "route-poststed-collision"],
           apply: true,
         },
       });
@@ -477,6 +545,7 @@ export function runOpplevelserGardssalgOrgnrBackfillTests(
       assertEq(applyRes.body.agents_enriched, applyRes.body.changed.length, "n5: agents_enriched === changed.length");
       assertEq(getProviderRow("route-locked").org_nr, null, "q2: route-locked still untouched after apply");
       assertEq(getProviderRow("route-review").org_nr, null, "o5: route-review still untouched after apply (never auto-written)");
+      assertEq(getProviderRow("route-poststed-collision").org_nr, null, "o5b: route-poststed-collision still untouched after apply — the fix holds under apply too, not just dry-run");
 
       // (t) a confirmed write clears any stale review-queue entry. Reuse
       // route-exact: force a stale review-queue row for it first, then prove
