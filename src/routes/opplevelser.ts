@@ -41,6 +41,10 @@ import {
   selectGardssalgProvidersForContentRefresh,
   getGardssalgProviderContentTarget,
   applyGardssalgProviderContent,
+  // dev-request 2026-07-18-gardssalg-profilkvalitet-foer-outreach, slice 2 —
+  // shared fill-vs-replace decision so the dry-run preview below can never
+  // drift from what applyGardssalgProviderContent() actually does.
+  gardssalgReplaceableFieldAction,
   type GardssalgContentRefreshTarget,
   // dev-request 2026-07-18-gardssalg-profilkvalitet-foer-outreach, slice 1 —
   // rollback/provenance substrate backing POST /admin/gardssalg-content-rollback
@@ -861,7 +865,18 @@ router.post("/admin/gardssalg-content-refresh", requireAdmin, async (req: Reques
   let scanned = 0;
   const byField: Record<string, number> = { about_text: 0, visit_text: 0, opening_hours_text: 0 };
   type GsProvenanceMap = Record<string, { source_url: string; snippet: string | null }>;
-  const changed: Array<{ provider_id: string; fields: string[]; provenance: GsProvenanceMap }> = [];
+  // dev-request 2026-07-18-gardssalg-profilkvalitet-foer-outreach, slice 2 —
+  // `actions` is ADDITIVE alongside the existing `fields: string[]` (kept
+  // as-is for backward compatibility with existing callers/tests): a
+  // field-keyed map of "filled" (was blank) vs "replaced" (was thin,
+  // non-blank) so a future batch report can tell the two apart per field.
+  type GsFieldAction = "filled" | "replaced";
+  const changed: Array<{
+    provider_id: string;
+    fields: string[];
+    actions: Record<string, GsFieldAction>;
+    provenance: GsProvenanceMap;
+  }> = [];
   const skippedLocked: string[] = [];
   const errors: Array<{ provider_id: string; error: string }> = [];
   // Providers that crossed the 3-failure parking threshold THIS run
@@ -937,18 +952,26 @@ router.post("/admin/gardssalg-content-refresh", requireAdmin, async (req: Reques
       return v === null || v === undefined || String(v).trim() === "";
     }
 
-    // THIN-FIELD check against the target's own snapshot (taken at selection
-    // time, before any write in this run) — used for the dry-run projection.
-    const wouldWrite: string[] = [];
-    if (candidateAbout && isBlank(t.about_text)) wouldWrite.push("about_text");
-    if (candidateVisit && isBlank(t.visit_text)) wouldWrite.push("visit_text");
-    if (candidateHours && isBlank(t.opening_hours_text)) wouldWrite.push("opening_hours_text");
+    // THIN/BLANK-FIELD check against the target's own snapshot (taken at
+    // selection time, before any write in this run) — used both to gate
+    // whether there's anything to do at all AND for the dry-run projection.
+    // about_text/visit_text go through gardssalgReplaceableFieldAction (the
+    // SAME fill-blank-OR-replace-thin decision applyGardssalgProviderContent
+    // makes) so the preview can never drift from the real write path.
+    // opening_hours_text stays on the old fill-only-blank check (unchanged).
+    const wouldWriteActions: Record<string, GsFieldAction> = {};
+    const aboutAction = gardssalgReplaceableFieldAction(t.about_text, candidateAbout);
+    if (aboutAction) wouldWriteActions.about_text = aboutAction;
+    const visitAction = gardssalgReplaceableFieldAction(t.visit_text, candidateVisit);
+    if (visitAction) wouldWriteActions.visit_text = visitAction;
+    if (candidateHours && isBlank(t.opening_hours_text)) wouldWriteActions.opening_hours_text = "filled";
 
+    const wouldWrite = Object.keys(wouldWriteActions);
     if (wouldWrite.length === 0) return;
 
     if (dryRun) {
       for (const f of wouldWrite) if (f in byField) byField[f] += 1;
-      changed.push({ provider_id: providerId, fields: wouldWrite, provenance });
+      changed.push({ provider_id: providerId, fields: wouldWrite, actions: wouldWriteActions, provenance });
     } else {
       try {
         const written = applyGardssalgProviderContent(
@@ -961,8 +984,12 @@ router.post("/admin/gardssalg-content-refresh", requireAdmin, async (req: Reques
           fetched.fetchUrl
         );
         if (written.length > 0) {
-          for (const f of written) if (f in byField) byField[f] += 1;
-          changed.push({ provider_id: providerId, fields: written, provenance });
+          const actions: Record<string, GsFieldAction> = {};
+          for (const f of written) {
+            if (f in byField) byField[f] += 1;
+            actions[f] = wouldWriteActions[f] ?? "filled";
+          }
+          changed.push({ provider_id: providerId, fields: written, actions, provenance });
         }
       } catch (e: any) {
         errors.push({ provider_id: providerId, error: `write_failed: ${e?.message ?? String(e)}` });
