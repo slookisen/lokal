@@ -259,6 +259,34 @@ router.put("/agents/:id", requireAdmin, (req: Request, res: Response) => {
       return;
     }
 
+    // orch-pr-20260719-dental-field-provenance: Stage X (the enrichment
+    // worker) sends one field per PUT, sequentially, so a field_provenance
+    // patch here must MERGE with what's already on the row, not overwrite it
+    // — otherwise each subsequent PUT wipes out the provenance recorded by
+    // the previous one. Mirrors the merge idiom already used by the Google
+    // Places homepage-backfill block above (~line 1156): read the row's
+    // current field_provenance, tolerate junk/missing JSON, merge via the
+    // shared mergeFieldProvenance() helper. Only runs when the body actually
+    // includes field_provenance — no extra DB read otherwise.
+    if (
+      result.data.field_provenance &&
+      typeof result.data.field_provenance === "object"
+    ) {
+      const existingAgent = getDentalAgentById(id);
+      let existingProv: Record<string, unknown> = {};
+      if (
+        existingAgent &&
+        existingAgent.field_provenance &&
+        typeof existingAgent.field_provenance === "object"
+      ) {
+        existingProv = existingAgent.field_provenance as Record<string, unknown>;
+      }
+      result.data.field_provenance = mergeFieldProvenance(
+        existingProv,
+        result.data.field_provenance as any
+      ) as any;
+    }
+
     const ok = updateDentalAgent(id, result.data);
     if (!ok) {
       res.status(404).json({ error: "Not found" });
