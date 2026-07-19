@@ -17,7 +17,7 @@
  *      and folds its pass/fail counts into the `npm test` summary.
  */
 
-import { formatDistanceLabel, gardssalgRewriteEligible } from "./experience-store";
+import { formatDistanceLabel, gardssalgRewriteEligible, gardssalgProductsEligible } from "./experience-store";
 
 export interface TestSummary {
   passed: number;
@@ -92,6 +92,22 @@ export function runExperienceStoreTests(opts: { log?: boolean } = {}): TestSumma
   assertEq(gardssalgRewriteEligible("   "), false, "gardssalgRewriteEligible: whitespace-only string → false");
   assertEq(gardssalgRewriteEligible(null), false, "gardssalgRewriteEligible: null → false");
   assertEq(gardssalgRewriteEligible(undefined), false, "gardssalgRewriteEligible: undefined → false");
+
+  // ── gardssalgProductsEligible (dev-request 2026-07-18-gardssalg-
+  //    profilkvalitet-foer-outreach, slice 5c) — fill-only gate for the
+  //    "products" JSON-array column. ────────────────────────────────────────
+  assertEq(gardssalgProductsEligible(null), true, "gardssalgProductsEligible: null → true (blank column, eligible)");
+  assertEq(gardssalgProductsEligible(undefined), true, "gardssalgProductsEligible: undefined → true");
+  assertEq(gardssalgProductsEligible(""), true, "gardssalgProductsEligible: empty string → true");
+  assertEq(gardssalgProductsEligible("   "), true, "gardssalgProductsEligible: whitespace-only string → true");
+  assertEq(gardssalgProductsEligible("[]"), true, "gardssalgProductsEligible: literal '[]' → true (empty array)");
+  assertEq(gardssalgProductsEligible("  []  "), true, "gardssalgProductsEligible: '[]' with surrounding whitespace → true");
+  assertEq(gardssalgProductsEligible(JSON.stringify([])), true, "gardssalgProductsEligible: JSON.stringify([]) round-trip → true");
+  assertEq(gardssalgProductsEligible(JSON.stringify(["Eplesider"])), false, "gardssalgProductsEligible: non-empty array (one product) → false, never overwritten");
+  assertEq(gardssalgProductsEligible(JSON.stringify(["Eplesider", "Eplemost"])), false, "gardssalgProductsEligible: non-empty array (two products) → false");
+  assertEq(gardssalgProductsEligible("not valid json"), false, "gardssalgProductsEligible: malformed non-JSON value → false, conservative (never silently overwritten)");
+  assertEq(gardssalgProductsEligible('{"not":"an array"}'), false, "gardssalgProductsEligible: valid JSON but not an array (an object) → false");
+  assertEq(gardssalgProductsEligible("[1,2,3]"), false, "gardssalgProductsEligible: valid non-empty JSON array (even of non-strings) → false, only an EMPTY array is eligible");
 
   return { passed, failed, failures };
 }

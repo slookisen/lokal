@@ -1926,6 +1926,11 @@ export type GardssalgContentRefreshTarget = {
   about_text: string | null;
   visit_text: string | null;
   opening_hours_text: string | null;
+  // dev-request 2026-07-18-gardssalg-profilkvalitet-foer-outreach, slice 5c —
+  // raw JSON-array-of-strings column (see init-experiences.ts), read here so
+  // the content-refresh route can gate the products-extraction path on
+  // gardssalgProductsEligible() without a second query.
+  products: string | null;
 };
 
 /**
@@ -1944,7 +1949,7 @@ export function selectGardssalgProvidersForContentRefresh(limit = 25): Gardssalg
   return db
     .prepare(
       `SELECT id, navn, TRIM(hjemmeside) AS hjemmeside, content_source,
-              about_text, visit_text, opening_hours_text
+              about_text, visit_text, opening_hours_text, products
          FROM experience_providers
         WHERE (producer_type IS NOT NULL OR rfb_seed_source = 'rfb-seed')
           AND hjemmeside IS NOT NULL AND TRIM(hjemmeside) != ''
@@ -1953,6 +1958,7 @@ export function selectGardssalgProvidersForContentRefresh(limit = 25): Gardssalg
                 about_text IS NULL OR TRIM(about_text) = ''
              OR visit_text IS NULL OR TRIM(visit_text) = ''
              OR opening_hours_text IS NULL OR TRIM(opening_hours_text) = ''
+             OR products IS NULL OR TRIM(products) = '' OR TRIM(products) = '[]'
               )
           ${providerParkingExclusionSql()}
         ORDER BY (last_content_attempt_at IS NOT NULL), last_content_attempt_at ASC, created_at ASC
@@ -1975,7 +1981,7 @@ export function getGardssalgProviderContentTarget(providerId: string): Gardssalg
   const row = db
     .prepare(
       `SELECT id, navn, TRIM(hjemmeside) AS hjemmeside, content_source,
-              about_text, visit_text, opening_hours_text
+              about_text, visit_text, opening_hours_text, products
          FROM experience_providers
         WHERE id = ?
           AND (producer_type IS NOT NULL OR rfb_seed_source = 'rfb-seed')`
@@ -2050,6 +2056,33 @@ export function gardssalgRewriteEligible(currentValue: string | null | undefined
 }
 
 /**
+ * Eligibility gate for the gårdssalg "products" (JSON array of drink/product
+ * names) FILL-ONLY extraction (dev-request 2026-07-18-gardssalg-
+ * profilkvalitet-foer-outreach, slice 5c). Unlike about_text/visit_text,
+ * `products` has no replace-thin-content concept — any existing non-empty
+ * list (however short) was either written by the RFB-knowledge copy path
+ * (2026-07-12) or a prior run of this same extraction, and is left
+ * untouched; this only ever fills a currently-blank/empty column.
+ *
+ * Returns true when currentProducts is null/undefined, blank/whitespace, the
+ * literal "[]", or parses as a JSON array with zero elements. A value that
+ * fails to parse as JSON is treated as NOT eligible (conservative: an
+ * unexpected non-JSON value in this column should never be silently
+ * overwritten by an automated pass).
+ */
+export function gardssalgProductsEligible(currentProducts: string | null | undefined): boolean {
+  if (currentProducts === null || currentProducts === undefined) return true;
+  const trimmed = String(currentProducts).trim();
+  if (trimmed === "" || trimmed === "[]") return true;
+  try {
+    const parsed = JSON.parse(trimmed);
+    return Array.isArray(parsed) && parsed.length === 0;
+  } catch {
+    return false;
+  }
+}
+
+/**
  * Apply crawled content to ONE gårdssalg provider, respecting the lock gate:
  * NEVER writes anything if the provider is locked (content_source
  * 'manual'/'claim'). For about_text/visit_text, writes a candidate field
@@ -2099,7 +2132,19 @@ export function gardssalgRewriteEligible(currentValue: string | null | undefined
  */
 export function applyGardssalgProviderContent(
   providerId: string,
-  candidate: { about_text?: string | null; visit_text?: string | null; opening_hours_text?: string | null },
+  candidate: {
+    about_text?: string | null;
+    visit_text?: string | null;
+    opening_hours_text?: string | null;
+    // dev-request 2026-07-18-gardssalg-profilkvalitet-foer-outreach, slice 5c
+    // — OPTIONAL, additive, omitted by every pre-existing call site (byte-
+    // identical behavior when not passed). A non-empty array of already-
+    // validated (never-fabricated, length/count-capped — see
+    // generateGardssalgProductList in routes/opplevelser.ts) product name
+    // strings, FILL-ONLY (see gardssalgProductsEligible's doc comment: no
+    // replace-thin-content path for this field, unlike about_text/visit_text).
+    products?: string[] | null;
+  },
   evidenceUrl: string,
   batchId?: string,
   rewriteFields?: Array<"about_text" | "visit_text">
@@ -2107,7 +2152,7 @@ export function applyGardssalgProviderContent(
   const db = getDb(VERTICAL);
   const row = db
     .prepare(
-      `SELECT id, content_source, about_text, visit_text, opening_hours_text, field_provenance
+      `SELECT id, content_source, about_text, visit_text, opening_hours_text, products, field_provenance
          FROM experience_providers WHERE id = ?`
     )
     .get(providerId) as
@@ -2117,6 +2162,7 @@ export function applyGardssalgProviderContent(
         about_text: string | null;
         visit_text: string | null;
         opening_hours_text: string | null;
+        products: string | null;
         field_provenance: string | null;
       }
     | undefined;
@@ -2137,6 +2183,7 @@ export function applyGardssalgProviderContent(
     about_text: row.about_text,
     visit_text: row.visit_text,
     opening_hours_text: row.opening_hours_text,
+    products: row.products,
   };
 
   // Slice 5a: accepted-rewrite fields, re-validated against the FRESH row
@@ -2169,6 +2216,14 @@ export function applyGardssalgProviderContent(
     sets.push("opening_hours_text = @opening_hours_text");
     params.opening_hours_text = candidate.opening_hours_text.trim();
     written.push("opening_hours_text");
+  }
+  // Slice 5c — fill-only, re-checked against the FRESH row snapshot (not the
+  // caller's possibly-stale target snapshot), same defense-in-depth
+  // discipline as the rewriteFields re-check above.
+  if (candidate.products && candidate.products.length > 0 && gardssalgProductsEligible(row.products)) {
+    sets.push("products = @products");
+    params.products = JSON.stringify(candidate.products);
+    written.push("products");
   }
 
   if (sets.length === 0) return [];
@@ -2457,6 +2512,8 @@ const GARDSSALG_ROLLBACKABLE_FIELDS = new Set([
   "adresse",
   "postnummer",
   "poststed",
+  // slice 5c (2026-07-19) — fill-only products (JSON array of strings)
+  "products",
 ]);
 // source_url marker stamped on audit rows inserted BY a rollback itself
 // (as opposed to rows inserted by a content-refresh write) — lets

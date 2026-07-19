@@ -26673,6 +26673,24 @@ Promise.allSettled(_oaHomeCountersDeps).then(async () => {
     for (const f of grwr.failures) failures.push("opplevelser-gardssalg-rewrite: " + f);
     console.log(`  opplevelser-gardssalg-rewrite: ${grwr.passed} passed, ${grwr.failed} failed`);
 
+    // dev-request 2026-07-18-gardssalg-profilkvalitet-foer-outreach, slice 5c:
+    // fill-only extraction of the "products" JSON-array column —
+    // generateGardssalgProductList() (routes/opplevelser.ts, mirrors
+    // generateGardssalgAboutRewrite's never-fabricate contract) +
+    // gardssalgProductsEligible() (services/experience-store.ts) wired into
+    // POST /admin/gardssalg-content-refresh's processOne(), writing through
+    // the SAME applyGardssalgProviderContent() audit/provenance/lock-guard
+    // machinery. Same in-memory-DB pattern, runs sequentially inside this
+    // same gated block for the same reason.
+    console.log("\n── opplevelser-gardssalg-products: slice 5c fill-only products extraction ──");
+    const { runOpplevelserGardssalgProductsTests } = require("../src/routes/opplevelser-gardssalg-products.test") as
+      typeof import("../src/routes/opplevelser-gardssalg-products.test");
+    const gpr = await runOpplevelserGardssalgProductsTests({ log: false });
+    passed += gpr.passed;
+    failed += gpr.failed;
+    for (const f of gpr.failures) failures.push("opplevelser-gardssalg-products: " + f);
+    console.log(`  opplevelser-gardssalg-products: ${gpr.passed} passed, ${gpr.failed} failed`);
+
     // dev-request 2026-07-18-gardssalg-profilkvalitet-foer-outreach, slice 3:
     // Brreg street-address backfill — selectGardssalgProvidersForAddressEnrichment()/
     // getGardssalgProviderAddressTarget()/applyGardssalgProviderAddress()
