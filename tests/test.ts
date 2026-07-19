@@ -26959,6 +26959,19 @@ Promise.allSettled(_oaHomeCountersDeps).then(async () => {
     for (const f of gpr.failures) failures.push("opplevelser-gardssalg-products: " + f);
     console.log(`  opplevelser-gardssalg-products: ${gpr.passed} passed, ${gpr.failed} failed`);
 
+    // dev-request 2026-07-19-brreg-nace-drikkeprodusenter: NACE discovery of
+    // the drink family (11.010/030/040/050) → org_nr-keyed gårdssalg landing
+    // with Brreg address/hjemmeside at birth, batch-tagged rollback. Same
+    // in-memory-DB pattern, runs sequentially inside this same gated block.
+    console.log("\n── opplevelser-gardssalg-nace-discovery: drikkefamilien inn, org_nr-nøklet ──");
+    const { runOpplevelserGardssalgNaceDiscoveryTests } = require("../src/routes/opplevelser-gardssalg-nace-discovery.test") as
+      typeof import("../src/routes/opplevelser-gardssalg-nace-discovery.test");
+    const gnd = await runOpplevelserGardssalgNaceDiscoveryTests(false);
+    passed += gnd.passed;
+    failed += gnd.failed;
+    for (const f of gnd.failures) failures.push("opplevelser-gardssalg-nace-discovery: " + f);
+    console.log(`  opplevelser-gardssalg-nace-discovery: ${gnd.passed} passed, ${gnd.failed} failed`);
+
     // dev-request 2026-07-18-gardssalg-profilkvalitet-foer-outreach, slice 3:
     // Brreg street-address backfill — selectGardssalgProvidersForAddressEnrichment()/
     // getGardssalgProviderAddressTarget()/applyGardssalgProviderAddress()

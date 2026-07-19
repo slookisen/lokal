@@ -2909,6 +2909,50 @@ export function gardssalgContentExclusionReason(
   return null;
 }
 
+// ─── Gårdssalg NACE discovery support (dev-request 2026-07-19-brreg-nace-
+//     drikkeprodusenter) ─────────────────────────────────────────────────────
+
+// Brreg registry names are UPPERCASE with a trailing org-form suffix
+// ("67 NORTH DISTILLERY AS"); the catalog shows human display names
+// ("67 North Distillery"). Deterministic transform: strip trailing org-form
+// tokens, then title-case — digits kept verbatim, Norwegian small words
+// lowercased unless first. Pure + exported for tests.
+const BRREG_ORG_SUFFIX_TOKENS = new Set(["as", "asa", "ans", "da", "enk", "sa", "ba", "nuf", "iks", "kf"]);
+const NORWEGIAN_SMALL_WORDS = new Set(["og", "i", "på", "av", "med", "for", "til", "fra"]);
+export function brregDisplayName(brregNavn: string): string {
+  const tokens = (brregNavn || "").trim().split(/\s+/).filter(Boolean);
+  while (tokens.length > 1 && BRREG_ORG_SUFFIX_TOKENS.has(tokens[tokens.length - 1].toLowerCase())) {
+    tokens.pop();
+  }
+  return tokens
+    .map((t, i) => {
+      const lower = t.toLowerCase();
+      if (/^\d+$/.test(t)) return t;
+      if (i > 0 && NORWEGIAN_SMALL_WORDS.has(lower)) return lower;
+      return lower
+        .split("-")
+        .map((part) => (part ? part.charAt(0).toUpperCase() + part.slice(1) : part))
+        .join("-");
+    })
+    .join(" ");
+}
+
+/**
+ * Name-dedup basis for NACE discovery: every existing gårdssalg row's
+ * id/navn/org_nr (INCLUDING catalog_hidden — a discovery candidate matching
+ * the hidden test provider must still be treated as a duplicate, never
+ * re-created as a visible row).
+ */
+export function listGardssalgNameDedupRows(): Array<{ id: string; navn: string; org_nr: string | null; kommune: string | null }> {
+  const db = getDb(VERTICAL);
+  return db
+    .prepare(
+      `SELECT id, navn, org_nr, kommune FROM experience_providers
+        WHERE (producer_type IS NOT NULL OR rfb_seed_source = 'rfb-seed')`
+    )
+    .all() as Array<{ id: string; navn: string; org_nr: string | null; kommune: string | null }>;
+}
+
 // ─── Gårdssalg content rollback (dev-request 2026-07-18-gardssalg-
 // profilkvalitet-foer-outreach, slice 1; widened in slice 3 to also cover
 // applyGardssalgProviderAddress's adresse/postnummer/poststed writes) ────────
