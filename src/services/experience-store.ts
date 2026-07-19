@@ -18,6 +18,11 @@ import { v4 as uuid } from "uuid";
 import { z } from "zod";
 import { getDb } from "../database/db-factory";
 import { fylkeEquivalents } from "./norway-fylke";
+// dev-request 2026-07-18-gardssalg-profilkvalitet-foer-outreach, slice 2 —
+// reuse the same quality-bar predicate the homepage-content extractor already
+// gates candidates with, so applyGardssalgProviderContent() can tell "thin"
+// existing content from decent existing content before deciding to replace it.
+import { meetsAboutQualityBar } from "./search-enrich";
 import { deriveExperienceTags, type ExperienceTag, type TaggableExperience } from "./experience-tags";
 import { haversineDistanceKm } from "./geocoding-service";
 import {
@@ -1981,14 +1986,51 @@ export function getGardssalgProviderContentTarget(providerId: string): Gardssalg
 }
 
 /**
- * Apply crawled content to ONE gårdssalg provider, respecting the lock +
- * thin-only gate: writes each candidate field only if the provider's current
- * value is blank, and NEVER writes anything if the provider is locked
- * (content_source 'manual'/'claim'). Stamps content_source='provider_site',
- * content_evidence_url, and content_updated_at in the SAME UPDATE, but only
- * when at least one field was actually written (a no-op write stamps
- * nothing). Returns the field names actually written. Idempotent: a second
- * run against an already-filled provider writes nothing.
+ * Decide what applyGardssalgProviderContent() would do for ONE about_text/
+ * visit_text field, given the row's current (pre-write) value and a raw
+ * candidate value. Shared between the writer itself and the gårdssalg
+ * content-refresh route's dry-run projection so the preview can never drift
+ * from the real write path. NOT used for opening_hours_text, which keeps the
+ * old fill-only-blank rule (structured/short by nature, not prose-quality-
+ * gated). Returns:
+ *   "filled"   — current value is blank and the candidate has content
+ *                (the original, unchanged behavior).
+ *   "replaced" — current value is non-blank but THIN (fails
+ *                meetsAboutQualityBar), the candidate itself passes the
+ *                quality bar, AND the candidate is strictly longer than the
+ *                current value — so a replace never swaps thin-but-real
+ *                content for something equally or less substantial.
+ *   null       — no write: current value already meets the quality bar
+ *                (never churned), or the candidate doesn't qualify.
+ */
+export function gardssalgReplaceableFieldAction(
+  currentValue: string | null | undefined,
+  candidateValue: string | null | undefined
+): "filled" | "replaced" | null {
+  const candidate = candidateValue?.trim();
+  if (!candidate) return null;
+  const isCurrentBlank = currentValue === null || currentValue === undefined || String(currentValue).trim() === "";
+  if (isCurrentBlank) return "filled";
+  if (meetsAboutQualityBar(currentValue)) return null; // decent existing content — never churned
+  if (!meetsAboutQualityBar(candidate)) return null; // candidate itself thin — can't replace thin with thin
+  const currentTrimmed = String(currentValue).trim();
+  if (!(candidate.length > currentTrimmed.length)) return null; // must be a genuine improvement in length
+  return "replaced";
+}
+
+/**
+ * Apply crawled content to ONE gårdssalg provider, respecting the lock gate:
+ * NEVER writes anything if the provider is locked (content_source
+ * 'manual'/'claim'). For about_text/visit_text, writes a candidate field
+ * when it is blank (fill) OR when the current value is thin/low-quality and
+ * the candidate is a genuine, quality-bar-passing improvement (replace —
+ * see gardssalgReplaceableFieldAction). opening_hours_text keeps the
+ * original fill-only-blank rule unchanged. Stamps content_source=
+ * 'provider_site', content_evidence_url, and content_updated_at in the SAME
+ * UPDATE, but only when at least one field was actually written (a no-op
+ * write stamps nothing). Returns the field names actually written.
+ * Idempotent: a second run against an already-filled, non-thin provider
+ * writes nothing.
  *
  * Rollback/provenance bookkeeping (dev-request 2026-07-18-gardssalg-
  * profilkvalitet-foer-outreach, slice 1) — additive, does NOT change which
@@ -2000,10 +2042,10 @@ export function getGardssalgProviderContentTarget(providerId: string): Gardssalg
  * {source_url, fetched_at} entry into experience_providers.field_provenance
  * for that field, preserving any existing entries for OTHER fields
  * (read-modify-write, never clobbers). old_value is read generically from
- * the row snapshot taken before any write below — today this function only
- * ever fills BLANK fields, so old_value is always null/blank in practice,
- * but the code makes no assumption of that so it stays correct once a
- * future slice starts overwriting non-blank values too.
+ * the row snapshot taken before any write below — since slice 2, about_text/
+ * visit_text writes can be a REPLACE of real prior content, so old_value is
+ * no longer always null/blank; the audit code makes no assumption either
+ * way and needed no change to stay correct for that case.
  */
 export function applyGardssalgProviderContent(
   providerId: string,
@@ -2046,14 +2088,14 @@ export function applyGardssalgProviderContent(
     opening_hours_text: row.opening_hours_text,
   };
 
-  if (isBlank(row.about_text) && candidate.about_text?.trim()) {
+  if (gardssalgReplaceableFieldAction(row.about_text, candidate.about_text)) {
     sets.push("about_text = @about_text");
-    params.about_text = candidate.about_text.trim();
+    params.about_text = candidate.about_text!.trim();
     written.push("about_text");
   }
-  if (isBlank(row.visit_text) && candidate.visit_text?.trim()) {
+  if (gardssalgReplaceableFieldAction(row.visit_text, candidate.visit_text)) {
     sets.push("visit_text = @visit_text");
-    params.visit_text = candidate.visit_text.trim();
+    params.visit_text = candidate.visit_text!.trim();
     written.push("visit_text");
   }
   if (isBlank(row.opening_hours_text) && candidate.opening_hours_text?.trim()) {

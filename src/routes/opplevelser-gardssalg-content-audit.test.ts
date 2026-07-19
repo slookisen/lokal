@@ -1,7 +1,8 @@
 /**
  * opplevelser-gardssalg-content-audit.test.ts — tests for the gårdssalg
  * content rollback/provenance substrate (dev-request 2026-07-18-gardssalg-
- * profilkvalitet-foer-outreach, slice 1):
+ * profilkvalitet-foer-outreach, slice 1), PLUS (blocks j/k below) slice 2's
+ * replace-thin-existing-content extension:
  *
  *   - gardssalg_content_audit table + experience_providers.field_provenance
  *     column (src/database/init-experiences.ts)
@@ -41,6 +42,19 @@
  *   (g) rolling back a field with no audit history -> reported in
  *       `skipped`, not a hard error
  *   (h) 400 when neither provider_id nor batch_id is given
+ *   (j) slice 2: applyGardssalgProviderContent() REPLACES thin (non-blank,
+ *       fails meetsAboutQualityBar) about_text/visit_text with a qualifying,
+ *       genuinely-longer candidate (audit old_value = the real prior thin
+ *       text); NEVER replaces decent existing content; a candidate that
+ *       itself fails the quality bar never replaces anything; manual/claim
+ *       locks still block replacement of thin content too; opening_hours_
+ *       text keeps the old fill-only-blank rule
+ *   (k) slice 2: POST /admin/gardssalg-content-refresh's dry-run AND apply
+ *       projections tag each written field's `actions` as "filled" vs
+ *       "replaced" (additive alongside the pre-existing `fields: string[]`),
+ *       matching exactly what applyGardssalgProviderContent() does — mocks
+ *       globalThis.fetch (no network access in the sandbox) to drive the
+ *       route's real extraction pipeline end-to-end
  */
 
 export interface TestSummary {
@@ -448,6 +462,204 @@ export function runOpplevelserGardssalgContentAuditTests(
       assertEq(afterBatchA.opening_hours_text, null, "d6: prov-a.opening_hours_text restored to blank across the batch rollback");
       assertEq(afterBatchB.about_text, null, "d7: prov-b.about_text restored to blank across the batch rollback");
       assertEq(getAuditRows("prov-b").filter((r: any) => r.field_name === "about_text").length, 2, "d8: prov-b gets its own new rollback audit row (write + rollback = 2)");
+
+      // ── SLICE 2 (dev-request 2026-07-18-gardssalg-profilkvalitet-foer-
+      //    outreach, slice 2): applyGardssalgProviderContent() now also
+      //    REPLACES thin (non-blank but low-quality) about_text/visit_text,
+      //    not just fills blanks — Daniel's raw complaint was "korte eller
+      //    dårlige tekster som kan forbedres" (short/bad texts that could be
+      //    improved). opening_hours_text is unchanged (fill-only-blank). ───
+      const GOOD_ABOUT_J =
+        "Familiedrevet gård på Toten som dyrker økologiske grønnsaker og bær, og selger direkte fra gårdsbutikken.";
+      const DECENT_EXISTING_ABOUT_J =
+        "Gården vår har lange tradisjoner med sauehold og ullproduksjon, og vi selger garn og kjøtt direkte fra tunet.";
+      const THIN_CANDIDATE_J = "Kort og lite tekst."; // fails meetsAboutQualityBar (too short)
+
+      insertProvider.run({
+        id: "prov-j-thin", navn: "Prov J Thin Gard", hjemmeside: "https://prov-j-thin.example.no",
+        content_source: null, about_text: "Liten gård med noen dyr.", visit_text: null, opening_hours_text: null,
+      });
+      insertProvider.run({
+        id: "prov-j-decent", navn: "Prov J Decent Gard", hjemmeside: "https://prov-j-decent.example.no",
+        content_source: null, about_text: DECENT_EXISTING_ABOUT_J, visit_text: null, opening_hours_text: null,
+      });
+      insertProvider.run({
+        id: "prov-j-candidate-thin", navn: "Prov J Candidate Thin Gard", hjemmeside: "https://prov-j-candidate-thin.example.no",
+        content_source: null, about_text: "Liten gård med noen dyr.", visit_text: null, opening_hours_text: null,
+      });
+      insertProvider.run({
+        id: "prov-j-manual-thin", navn: "Prov J Manual Thin Gard", hjemmeside: "https://prov-j-manual-thin.example.no",
+        content_source: "manual", about_text: "Kort.", visit_text: null, opening_hours_text: null,
+      });
+
+      // (j1-j6) thin, non-blank about_text IS replaced by a qualifying,
+      // longer candidate — audit old_value is the REAL prior thin text.
+      const writtenJ1 = store.applyGardssalgProviderContent(
+        "prov-j-thin",
+        { about_text: GOOD_ABOUT_J },
+        "https://prov-j-thin.example.no/om-oss",
+        "batch-j",
+      );
+      assertEq(writtenJ1, ["about_text"], "j1: thin about_text IS replaced by a qualifying longer candidate");
+      const rowJ1 = getProviderRow("prov-j-thin");
+      assertEq(rowJ1.about_text, GOOD_ABOUT_J, "j2: about_text now holds the replacement candidate");
+      const auditJ1 = getAuditRows("prov-j-thin");
+      const aboutAuditJ1 = auditJ1.find((r: any) => r.field_name === "about_text");
+      assertTrue(!!aboutAuditJ1, "j3: a replace still produces an about_text audit row");
+      assertEq(aboutAuditJ1.old_value, "Liten gård med noen dyr.", "j4: audit old_value is the REAL prior thin text, not blank");
+      assertEq(aboutAuditJ1.new_value, GOOD_ABOUT_J, "j5: audit new_value is the replacement candidate");
+      const provenanceJ1 = JSON.parse(rowJ1.field_provenance);
+      assertTrue(!!provenanceJ1.about_text, "j6: field_provenance updated for the replaced field");
+
+      // (j7-j9) decent existing content (already passes meetsAboutQualityBar)
+      // is NEVER replaced, even with a longer/different candidate available —
+      // protects decent existing content from unnecessary churn.
+      const writtenJ2 = store.applyGardssalgProviderContent(
+        "prov-j-decent",
+        { about_text: GOOD_ABOUT_J },
+        "https://prov-j-decent.example.no/om-oss",
+      );
+      assertEq(writtenJ2, [], "j7: decent existing about_text is never replaced");
+      const rowJ2 = getProviderRow("prov-j-decent");
+      assertEq(rowJ2.about_text, DECENT_EXISTING_ABOUT_J, "j8: decent existing about_text is unchanged");
+      assertEq(getAuditRows("prov-j-decent").length, 0, "j9: no audit row for a decent field that was correctly left alone");
+
+      // (j10-j11) a candidate that itself fails meetsAboutQualityBar never
+      // replaces anything, even against thin existing content ("thin can't
+      // replace thin").
+      const writtenJ3 = store.applyGardssalgProviderContent(
+        "prov-j-candidate-thin",
+        { about_text: THIN_CANDIDATE_J },
+        "https://prov-j-candidate-thin.example.no/om-oss",
+      );
+      assertEq(writtenJ3, [], "j10: a candidate that itself fails meetsAboutQualityBar never replaces thin existing content");
+      const rowJ3 = getProviderRow("prov-j-candidate-thin");
+      assertEq(rowJ3.about_text, "Liten gård med noen dyr.", "j11: existing thin about_text unchanged when candidate itself is thin");
+
+      // (j12-j14) manual/claim-locked rows are still completely untouched
+      // regardless of how thin their content is (regression — the lock guard
+      // must keep passing unmodified for the new replace path too).
+      const writtenJ4 = store.applyGardssalgProviderContent(
+        "prov-j-manual-thin",
+        { about_text: GOOD_ABOUT_J },
+        "https://prov-j-manual-thin.example.no",
+      );
+      assertEq(writtenJ4, [], "j12: manual-locked provider with THIN content is still never touched (regression, even for the new replace path)");
+      const rowJ4 = getProviderRow("prov-j-manual-thin");
+      assertEq(rowJ4.about_text, "Kort.", "j13: locked provider's thin about_text is unchanged");
+      assertEq(getAuditRows("prov-j-manual-thin").length, 0, "j14: no audit row for the locked provider");
+
+      // (j15-j18) opening_hours_text still only fills when blank — spot
+      // check that it did NOT pick up the new replace-thin behavior.
+      const writtenJ5 = store.applyGardssalgProviderContent(
+        "prov-j-thin",
+        { opening_hours_text: "Ma-fr 9-15" },
+        "https://prov-j-thin.example.no/apningstider",
+      );
+      assertEq(writtenJ5, ["opening_hours_text"], "j15: opening_hours_text still fills when blank");
+      const rowJ5 = getProviderRow("prov-j-thin");
+      assertEq(rowJ5.opening_hours_text, "Ma-fr 9-15", "j16: opening_hours_text written on first (blank) fill");
+
+      const writtenJ6 = store.applyGardssalgProviderContent(
+        "prov-j-thin",
+        { opening_hours_text: "Mandag-fredag klokka 09:00 til 17:00, lørdag 10-14, søndag stengt hele dagen." },
+        "https://prov-j-thin.example.no/apningstider2",
+      );
+      assertEq(writtenJ6, [], "j17: opening_hours_text is NEVER replaced once non-blank, even with a longer/better candidate (unchanged fill-only-blank rule)");
+      const rowJ6 = getProviderRow("prov-j-thin");
+      assertEq(rowJ6.opening_hours_text, "Ma-fr 9-15", "j18: opening_hours_text stays at its original filled value");
+
+      // ── (k) POST /admin/gardssalg-content-refresh: dry-run/apply
+      //       projection distinguishes "replaced" from "filled" per field,
+      //       and never previews a replace of decent existing content. Mocks
+      //       globalThis.fetch (repo convention — see
+      //       search-enrich-page-evidence.test.ts) since this route makes
+      //       real fetch() calls and the sandbox has no network access. ────
+      const prevFetchK = globalThis.fetch;
+      try {
+        const GCR_GOOD_ABOUT_K =
+          "Familiedrevet gård på Toten som dyrker økologiske grønnsaker og bær, og selger direkte fra gårdsbutikken.";
+        const GCR_GOOD_VISIT_K =
+          "Hos oss kan du besøke gårdsbutikken og handle ferske grønnsaker rett fra jordet, åpent gjennom hele sommeren.";
+        const gcrHtmlK = `<html><head><meta property="og:description" content="${GCR_GOOD_ABOUT_K}"></head><body><p>${GCR_GOOD_VISIT_K}</p></body></html>`;
+
+        insertProvider.run({
+          id: "prov-k-thin", navn: "Prov K Thin Gard", hjemmeside: "https://prov-k-thin.example.no",
+          content_source: null, about_text: "Liten gård med noen dyr.", visit_text: null, opening_hours_text: null,
+        });
+        insertProvider.run({
+          id: "prov-k-decent", navn: "Prov K Decent Gard", hjemmeside: "https://prov-k-decent.example.no",
+          content_source: null, about_text: DECENT_EXISTING_ABOUT_J, visit_text: null, opening_hours_text: null,
+        });
+
+        globalThis.fetch = (async (url: string | URL | Request) => {
+          const host = new URL(String(url)).hostname;
+          if (host === "prov-k-thin.example.no" || host === "prov-k-decent.example.no") {
+            return { ok: true, status: 200, text: async () => gcrHtmlK } as unknown as Response;
+          }
+          return { ok: false, status: 404, text: async () => "" } as unknown as Response;
+        }) as typeof fetch;
+
+        // dry-run first: zero writes, but the projection must distinguish
+        // "replaced" (prov-k-thin.about_text) from "filled" (both providers'
+        // visit_text), and must never list prov-k-decent.about_text at all
+        // (decent existing content is protected from the preview onward).
+        const dryK = await callRoute(opplevelserRouter, {
+          url: "/admin/gardssalg-content-refresh",
+          headers: { "x-admin-key": testKey },
+          body: { providerIds: ["prov-k-thin", "prov-k-decent"], apply: false },
+        });
+        assertEq(dryK.status, 200, "k1: dry-run gardssalg-content-refresh -> 200");
+        assertEq(dryK.body.dry_run, true, "k2: dry_run:true");
+
+        const dryThinEntry = dryK.body.changed.find((c: any) => c.provider_id === "prov-k-thin");
+        assertTrue(!!dryThinEntry, "k3: prov-k-thin appears in dry-run changed[]");
+        assertEq(dryThinEntry.actions.about_text, "replaced", "k4: dry-run projects about_text as 'replaced' for thin existing content");
+        assertEq(dryThinEntry.actions.visit_text, "filled", "k5: dry-run projects visit_text as 'filled' (was blank)");
+        assertTrue(
+          dryThinEntry.fields.includes("about_text") && dryThinEntry.fields.includes("visit_text"),
+          "k6: fields[] still lists both field names (backward-compatible, unchanged shape)",
+        );
+
+        const dryDecentEntry = dryK.body.changed.find((c: any) => c.provider_id === "prov-k-decent");
+        assertTrue(!!dryDecentEntry, "k7: prov-k-decent appears in dry-run changed[] (its visit_text is still blank -> fillable)");
+        assertEq(dryDecentEntry.actions.visit_text, "filled", "k8: prov-k-decent visit_text projected as 'filled'");
+        assertTrue(!("about_text" in dryDecentEntry.actions), "k9: prov-k-decent's decent about_text is NOT in actions (protected, not replaced)");
+        assertTrue(!dryDecentEntry.fields.includes("about_text"), "k10: prov-k-decent's about_text is NOT in fields[] either");
+
+        const beforeApplyThin = getProviderRow("prov-k-thin");
+        assertEq(beforeApplyThin.about_text, "Liten gård med noen dyr.", "k11: dry-run performed ZERO writes — prov-k-thin about_text unchanged");
+
+        // apply:true — actually writes, and the SAME distinction must show up
+        // in the real response, with the audit row's old_value = the real
+        // prior thin text (not blank).
+        const applyK = await callRoute(opplevelserRouter, {
+          url: "/admin/gardssalg-content-refresh",
+          headers: { "x-admin-key": testKey },
+          body: { providerIds: ["prov-k-thin", "prov-k-decent"], apply: true },
+        });
+        assertEq(applyK.status, 200, "k12: apply gardssalg-content-refresh -> 200");
+        assertEq(applyK.body.dry_run, false, "k13: dry_run:false");
+
+        const applyThinEntry = applyK.body.changed.find((c: any) => c.provider_id === "prov-k-thin");
+        assertTrue(!!applyThinEntry, "k14: prov-k-thin appears in apply changed[]");
+        assertEq(applyThinEntry.actions.about_text, "replaced", "k15: apply response also tags about_text 'replaced'");
+        assertEq(applyThinEntry.actions.visit_text, "filled", "k16: apply response also tags visit_text 'filled'");
+
+        const afterApplyThin = getProviderRow("prov-k-thin");
+        assertEq(afterApplyThin.about_text, GCR_GOOD_ABOUT_K, "k17: prov-k-thin about_text actually replaced by the crawled candidate");
+        assertEq(afterApplyThin.visit_text, GCR_GOOD_VISIT_K, "k18: prov-k-thin visit_text actually filled by the crawled candidate");
+
+        const afterApplyDecent = getProviderRow("prov-k-decent");
+        assertEq(afterApplyDecent.about_text, DECENT_EXISTING_ABOUT_J, "k19: prov-k-decent's decent about_text is STILL unchanged after apply");
+
+        const auditThinAbout = getAuditRows("prov-k-thin").find((r: any) => r.field_name === "about_text");
+        assertTrue(!!auditThinAbout, "k20: apply produced an about_text audit row for the replace");
+        assertEq(auditThinAbout.old_value, "Liten gård med noen dyr.", "k21: audit old_value is the real prior thin text");
+        assertEq(auditThinAbout.new_value, GCR_GOOD_ABOUT_K, "k22: audit new_value is the crawled replacement");
+      } finally {
+        globalThis.fetch = prevFetchK;
+      }
     } catch (err: any) {
       failed++;
       failures.push("opplevelser-gardssalg-content-audit: unexpected error: " + String(err?.stack || err?.message || err));
