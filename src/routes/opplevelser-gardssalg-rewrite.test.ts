@@ -308,6 +308,144 @@ export function runOpplevelserGardssalgRewriteTests(
         const r = await generateGardssalgAboutRewrite(SOURCE_TEXT, CURRENT_VALUE, "about");
         assertEq(r, null, "ru-9: non-array content field → null, not a thrown TypeError");
       }
+
+      // ── ru-10: markdown artifacts are stripped before the value is
+      //    returned — regression for the live 2026-07-19 finding where the
+      //    first real prod rewrite landed "**Smaksprøver og foredrag**" with
+      //    raw asterisks on the public Besøket section (profile template
+      //    renders plain text; batch was held + field rolled back on this).
+      const MD_PROSE =
+        "Smaksprøver og foredrag: våre populære ølsmakinger med omvisning på bryggeriet er åpne hele året. Her får du smake brygg fra hele sortimentet vårt, laget med råvarer fra fjellbygda, og høre historien bak bryggeriet fra våre egne bryggere.";
+      assertTrue(MD_PROSE.length >= 200 && MD_PROSE.length <= 500, "sanity: ru-10's underlying prose is comfortably inside the [200,500] window (the stripped fixture keeps heading TEXT and lands slightly longer)");
+      const MD_WRAPPED = `## Besøket\n\n**Smaksprøver og foredrag**: våre *populære* ølsmakinger med omvisning på bryggeriet er åpne hele året. Her får du smake brygg fra hele sortimentet vårt, laget med råvarer fra fjellbygda, og høre historien bak bryggeriet fra våre egne `.concat("`bryggere`.");
+      globalThis.fetch = (async () => ({
+        ok: true,
+        status: 200,
+        json: async () => ({ content: [{ type: "text", text: MD_WRAPPED }] }),
+      })) as unknown as typeof fetch;
+      {
+        const r = await generateGardssalgAboutRewrite(SOURCE_TEXT, CURRENT_VALUE, "visit");
+        assertTrue(r !== null, "ru-10a: markdown-formatted candidate is accepted after stripping (not rejected)");
+        assertTrue(!!r && !/[*#`]/.test(r), "ru-10b: no asterisks/hashes/backticks survive into the returned value");
+        assertTrue(!!r && !r.includes("\n"), "ru-10c: newlines collapse to single-paragraph flow");
+        assertTrue(!!r && r.includes("Smaksprøver og foredrag") && r.includes("populære"), "ru-10d: the prose itself survives the strip intact");
+      }
+
+      // ── ru-11: the length gate judges the STRIPPED string — prose padded
+      //    over the floor purely by markdown syntax must still be rejected. ──
+      const PROSE_195 = "e".repeat(195);
+      const MD_PADDED_OVER_200 = `**${PROSE_195}**\n# x`; // 203 raw chars, 197 after strip
+      globalThis.fetch = (async () => ({
+        ok: true,
+        status: 200,
+        json: async () => ({ content: [{ type: "text", text: MD_PADDED_OVER_200 }] }),
+      })) as unknown as typeof fetch;
+      {
+        const r = await generateGardssalgAboutRewrite(SOURCE_TEXT, CURRENT_VALUE, "about");
+        assertEq(r, null, "ru-11: markdown-padded candidate whose stripped prose is under 200 chars → null");
+      }
+
+      // ── ru-12: prompt carries the plain-text instruction (belt half of the
+      //    belt-and-suspenders; the code-side strip is the suspenders). ──────
+      let promptCaptured: any = null;
+      globalThis.fetch = (async (_url: any, init: any) => {
+        promptCaptured = JSON.parse(init.body).messages[0].content;
+        return { ok: true, status: 200, json: async () => ({ content: [{ type: "text", text: VALID_250 }] }) };
+      }) as unknown as typeof fetch;
+      {
+        await generateGardssalgAboutRewrite(SOURCE_TEXT, CURRENT_VALUE, "about");
+        assertTrue(typeof promptCaptured === "string" && promptCaptured.includes("uten markdown-formatering"), "ru-12: prompt instructs plain text without markdown");
+      }
+
+      // ── ru-13: review round-1 leak shapes — the residual fail-closed
+      //    contract: strip what is well-formed, REJECT anything that still
+      //    carries a marker afterwards; never publish, never corrupt. ────────
+      const mockText = (t: string) =>
+        (globalThis.fetch = (async () => ({
+          ok: true,
+          status: 200,
+          json: async () => ({ content: [{ type: "text", text: t }] }),
+        })) as unknown as typeof fetch);
+      // (a) THE round-1 blocker form: a bullet line whose star would pair
+      // with an italic star under the old strip order and leak a raw "*".
+      const BULLET_ITALIC =
+        "* Vi har *mange* gode øl på lager i gårdsbutikken, brygget med vann fra egen kilde og korn fra nabogårdene. Besøkende får omvisning i bryggeriet, historien bak hvert brygg, og smaksprøver av både faste og sesongbaserte varianter hele året.";
+      mockText(BULLET_ITALIC);
+      {
+        const r = await generateGardssalgAboutRewrite(SOURCE_TEXT, CURRENT_VALUE, "visit");
+        assertTrue(r !== null, "ru-13a: bullet+italic line is accepted after the reordered strip");
+        assertTrue(!!r && !/[*#`_]/.test(r), "ru-13b: NO marker of any kind survives (the round-1 leak shape)");
+        assertTrue(!!r && r.includes("mange gode øl"), "ru-13c: prose intact after bullet+italic strip");
+      }
+      // (b) unpaired ** → residual → reject.
+      const PAD_220 = "Gården tilbyr omvisning, smaksprøver og gardsbutikk med egne produkter gjennom hele sesongen, og tar imot både små og store grupper etter avtale. ".repeat(2);
+      mockText(`og **smaksprøver hele året ${PAD_220}`);
+      {
+        const r = await generateGardssalgAboutRewrite(SOURCE_TEXT, CURRENT_VALUE, "about");
+        assertEq(r, null, "ru-13d: unpaired ** survives stripping → residual check rejects (fail-closed)");
+      }
+      // (c) single-underscore italics → residual → reject.
+      mockText(`Vi selger _kortreiste_ råvarer direkte fra gården. ${PAD_220}`);
+      {
+        const r = await generateGardssalgAboutRewrite(SOURCE_TEXT, CURRENT_VALUE, "about");
+        assertEq(r, null, "ru-13e: _kursiv_ underscores → residual check rejects");
+      }
+      // (d) sentinel wrapped in markdown → null (not published, not length-gated by luck).
+      mockText("**INGEN_UTVIDELSE_MULIG**");
+      {
+        const r = await generateGardssalgAboutRewrite(SOURCE_TEXT, CURRENT_VALUE, "about");
+        assertEq(r, null, "ru-13f: markdown-wrapped sentinel → null");
+      }
+      // (e) sentinel embedded in ≥200 chars of prose → null.
+      mockText(`${PAD_220} INGEN_UTVIDELSE_MULIG`);
+      {
+        const r = await generateGardssalgAboutRewrite(SOURCE_TEXT, CURRENT_VALUE, "about");
+        assertEq(r, null, "ru-13g: sentinel embedded in long prose → null, never published with the sentinel in it");
+      }
+      // (f) spaced multiplication signs must never pair-and-vanish (silent
+      // meaning change) — they survive the hugging-italics regex and the
+      // residual check rejects the candidate instead.
+      mockText(`Vi tar imot 2 * 3 grupper i uken og 4 * 5 personer per omvisning. ${PAD_220}`);
+      {
+        const r = await generateGardssalgAboutRewrite(SOURCE_TEXT, CURRENT_VALUE, "about");
+        assertEq(r, null, "ru-13h: spaced '*' (multiplication) → rejected, never silently rewritten to '2 3'");
+      }
+
+      // ── ru-14: round-2 leak shapes — links unwrap to their text; leftover
+      //    bracket/backslash syntax rejects; blockquote markers strip. ───────
+      mockText(`Les mer om oss på [nettsiden vår](https://example.no/om-oss) der du finner alt om gården. ${PAD_220}`);
+      {
+        const r = await generateGardssalgAboutRewrite(SOURCE_TEXT, CURRENT_VALUE, "about");
+        assertTrue(r !== null, "ru-14a: markdown link unwraps and the candidate is accepted");
+        assertTrue(!!r && r.includes("nettsiden vår") && !/[\[\]]/.test(r) && !r.includes("https://"), "ru-14b: link TEXT survives, URL and brackets do not");
+      }
+      mockText(`Huskeliste: - [ ] bestill omvisning. ${PAD_220}`);
+      {
+        const r = await generateGardssalgAboutRewrite(SOURCE_TEXT, CURRENT_VALUE, "about");
+        assertEq(r, null, "ru-14c: leftover checkbox brackets → residual reject");
+      }
+      mockText(`Vi lager \\*ekte\\* sider av egne epler. ${PAD_220}`);
+      {
+        const r = await generateGardssalgAboutRewrite(SOURCE_TEXT, CURRENT_VALUE, "about");
+        assertEq(r, null, "ru-14d: escaped-markdown backslash remnants → residual reject");
+      }
+      mockText(`> Vi gleder oss til å ta imot besøkende i sommer, sier bonden. ${PAD_220}`);
+      {
+        const r = await generateGardssalgAboutRewrite(SOURCE_TEXT, CURRENT_VALUE, "visit");
+        assertTrue(r !== null && !r.includes(">"), "ru-14e: leading blockquote marker stripped cleanly, prose accepted");
+      }
+      // (round 3) strikethrough must never publish raw — "~~stengt~~ nå åpent"
+      // would read as if "stengt" were current text; tables likewise.
+      mockText(`Vi holder ~~stengt~~ åpent hver helg gjennom hele sesongen. ${PAD_220}`);
+      {
+        const r = await generateGardssalgAboutRewrite(SOURCE_TEXT, CURRENT_VALUE, "about");
+        assertEq(r, null, "ru-14f: strikethrough tildes → residual reject, never published as apparent current text");
+      }
+      mockText(`| Produkt | Pris | og mer informasjon om oss finner du hos gården. ${PAD_220}`);
+      {
+        const r = await generateGardssalgAboutRewrite(SOURCE_TEXT, CURRENT_VALUE, "about");
+        assertEq(r, null, "ru-14g: markdown table pipes → residual reject");
+      }
     } catch (err: any) {
       failed++;
       failures.push("opplevelser-gardssalg-rewrite (section A): unexpected error: " + String(err?.stack || err?.message || err));

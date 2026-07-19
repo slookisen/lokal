@@ -2697,6 +2697,68 @@ const GARDSSALG_REWRITE_SOURCE_CHAR_CAP = 6000;
 const GARDSSALG_REWRITE_MIN_LEN = 200;
 const GARDSSALG_REWRITE_MAX_LEN = 500;
 
+// The profile template renders about_text/visit_text as plain text, so any
+// markdown the model emits lands on the public page as literal syntax —
+// found live 2026-07-19 on the first real rewrite ("**Smaksprøver og
+// foredrag**" rendered with raw asterisks on Røros' Besøket section, batch
+// held + field rolled back). The prose in that candidate was grounded and
+// fine; only the formatting was noise — so strip the common markers rather
+// than reject the candidate (a reject would silently shrink the rescued
+// cohort for a purely cosmetic reason). Prompt also instructs plain text,
+// but per this file's convention the output contract is enforced in code,
+// never trusted to the prompt alone. Collapses to single-paragraph prose
+// (newlines → space) since the template renders one flow anyway.
+function stripMarkdownArtifacts(s: string): string {
+  return s
+    .replace(/^#{1,6}\s+/gm, "")            // # headings (marker only — text kept)
+    // Bullets BEFORE bold/italic (review finding, round 1): on "* Vi har
+    // *mange* gode øl" the bullet star would otherwise pair with the
+    // italic's opening star and leak a raw "*" into the result. The bullet
+    // regex requires whitespace after the marker, so "*kursiv*"/"**fet**"
+    // at line start are untouched. A plain "- " reply-dash at line start is
+    // knowingly eaten too (acceptable in this domain; typographic "– "/"— "
+    // are preserved).
+    .replace(/^\s*[-*•]\s+/gm, "")          // list bullets at line start
+    // Links/images (review round 2 — the most realistic remaining leak):
+    // "[nettsiden](https://…)" must land as "nettsiden", never with raw
+    // bracket/paren syntax. Runs before bold/italic so link TEXT can still
+    // carry emphasis markers that the later rules then strip.
+    .replace(/!?\[([^\]\n]*)\]\([^)\n]*\)/g, "$1")
+    .replace(/^\s*>\s+/gm, "")              // blockquote markers at line start
+    .replace(/^[=\-_]{3,}\s*$/gm, "")       // horizontal rules / setext underlines
+    .replace(/\*\*([^*]+)\*\*/g, "$1")      // **bold**
+    .replace(/__([^_]+)__/g, "$1")          // __bold__
+    // Paired same-line italics — but only when the stars hug the text
+    // ("*ord*"), so spaced multiplication signs ("2 * 3") never pair up and
+    // silently change meaning; they instead survive to the residual check
+    // below and reject the candidate (skip, never corrupt).
+    .replace(/\*(\S(?:[^*\n]*?\S)?)\*/g, "$1")
+    .replace(/`+/g, "")                      // code ticks
+    .replace(/\s*\n+\s*/g, " ")             // newlines → single-paragraph flow
+    .replace(/ {2,}/g, " ")
+    .trim();
+}
+
+// Fail-closed residual check (review finding, round 1): stripping handles the
+// well-formed shapes, but unpaired "**", "_kursiv_", spaced "*" etc. can
+// survive it — and this contract is "no markdown artifact ever reaches the
+// public page", not "most don't". Any leftover marker → reject the candidate
+// entirely (skip-not-publish, same bias as the rest of the never-fabricate
+// contract). Underscore is included: legitimate underscores in this prose are
+// essentially nonexistent (a URL-bearing candidate is fine to skip), and
+// rejecting beats corrupting. This also makes the one-pass strip safe despite
+// not being strictly idempotent — nothing with residual syntax ever lands.
+// Round-2 widening: brackets (leftover link/checkbox syntax), backslash
+// (escaped-markdown remnants like "\*ekte\*" → "\ekte\") and ">" (inline
+// blockquote remnants) — all verified publishable through the narrower set.
+// Round-3 widening (reviewer's own recipe, verbatim): "~" (strikethrough —
+// "~~stengt~~" would read as CURRENT text once published raw) and "|"
+// (markdown tables → pipe soup); neither has legitimate use in this prose.
+// NB: a link URL containing ")" can leave a stray paren behind (e.g.
+// wikipedia "...(bruk))" links) — parens can't join this set (legitimate
+// prose), accepted cosmetic residue.
+const GARDSSALG_REWRITE_RESIDUAL_MARKDOWN = /[*#`_\\[\]>~|]/;
+
 export async function generateGardssalgAboutRewrite(
   sourceText: string,
   currentValue: string,
@@ -2714,7 +2776,7 @@ Nåværende tekst: ${currentValue}
 Kildetekst (hentet fra produsentens egen nettside):
 ${cappedSource}
 
-Bruk KUN fakta som faktisk står i kildeteksten under. Ikke finn på detaljer, produkter, åpningstider eller annet som ikke er nevnt. Hvis kildeteksten ikke gir nok materiale til en utvidet, faktabasert tekst på 200–400 tegn, svar med nøyaktig ${GARDSSALG_REWRITE_SENTINEL} og ingenting annet.`;
+Bruk KUN fakta som faktisk står i kildeteksten under. Ikke finn på detaljer, produkter, åpningstider eller annet som ikke er nevnt. Svar i ren løpende tekst uten markdown-formatering — ingen stjerner, overskrifter, punktlister eller linjeskift. Hvis kildeteksten ikke gir nok materiale til en utvidet, faktabasert tekst på 200–400 tegn, svar med nøyaktig ${GARDSSALG_REWRITE_SENTINEL} og ingenting annet.`;
 
   let response: Awaited<ReturnType<typeof fetch>>;
   try {
@@ -2750,10 +2812,28 @@ Bruk KUN fakta som faktisk står i kildeteksten under. Ikke finn på detaljer, p
   const cleaned = text.trim();
   if (cleaned === GARDSSALG_REWRITE_SENTINEL) return null; // explicit "not enough material" escape
 
+  // Strip markdown BEFORE the length gate: the gate must judge the exact
+  // string that would land on the public page, not a version padded by
+  // formatting syntax (a 205-char candidate that is 195 chars of prose plus
+  // asterisks must be rejected as too short, not accepted).
+  const plain = stripMarkdownArtifacts(cleaned);
+
+  // Sentinel embedded/wrapped rather than verbatim (review finding, round 1:
+  // "**INGEN_UTVIDELSE_MULIG**", or the sentinel inside ≥200 chars of prose)
+  // must also count as "no expansion possible" — the raw === check above only
+  // catches the exact form the prompt asks for. Checked BEFORE the residual
+  // gate (round-2 finding: the sentinel itself contains "_", so the other
+  // order made this line unreachable dead code).
+  if (plain.includes(GARDSSALG_REWRITE_SENTINEL)) return null;
+
+  // Residual markers after stripping (unpaired "**", "_x_", spaced "*", …)
+  // → reject outright; see GARDSSALG_REWRITE_RESIDUAL_MARKDOWN's comment.
+  if (GARDSSALG_REWRITE_RESIDUAL_MARKDOWN.test(plain)) return null;
+
   // Length gate enforced in code, not trusted to the prompt alone (spec
   // requirement) — reject anything outside [200, 500], never truncate.
-  if (cleaned.length < GARDSSALG_REWRITE_MIN_LEN || cleaned.length > GARDSSALG_REWRITE_MAX_LEN) return null;
-  return cleaned;
+  if (plain.length < GARDSSALG_REWRITE_MIN_LEN || plain.length > GARDSSALG_REWRITE_MAX_LEN) return null;
+  return plain;
 }
 
 // ─── generateGardssalgProductList (dev-request 2026-07-18-gardssalg-
