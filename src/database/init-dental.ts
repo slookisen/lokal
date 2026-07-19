@@ -376,5 +376,19 @@ export function initDentalSchema(db: Database.Database): void {
     console.warn("[init-dental] places_attempted_at index warning:", err);
   }
 
+  // ─── dev-request 2026-07-18-dental-hjemmeside-directory-portal-cleanup ────
+  //   Additive-only: dental_agents.hjemmeside is meant to be a clinic's OWN
+  //   homepage, but a lot of rows actually carry a directory-listing site, a
+  //   booking portal, or an industry-association URL instead (legelisten.no,
+  //   tannlegerinorge.no, ...), which pollutes downstream enrichment. Rather
+  //   than deleting those bad values, POST /admin/dental/hjemmeside-cleanup-
+  //   sweep (src/routes/admin-dental-hjemmeside-cleanup.ts) moves them here
+  //   and clears hjemmeside — reversible, and directory_url IS NULL doubles
+  //   as the "not yet cleaned" marker for that sweep's candidate query.
+  //   Idempotent ALTER — error = already present.
+  try {
+    db.exec("ALTER TABLE dental_agents ADD COLUMN directory_url TEXT");
+  } catch { /* already present */ }
+
   console.log("[dental] schema initialized");
 }

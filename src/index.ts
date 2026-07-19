@@ -53,6 +53,7 @@ import ownerPortalRoutes from "./routes/owner-portal";
 import adminAgentAuditRoutes from "./routes/admin-agent-audit";
 import adminVerifierReviewQueueRoutes from "./routes/admin-verifier-review-queue";
 import adminDomainCoherenceSweepRoutes from "./routes/admin-domain-coherence";
+import adminDentalHjemmesideCleanupRoutes from "./routes/admin-dental-hjemmeside-cleanup";
 import adminKnowledgeRoutes, { pruneUrlsRouter, homepageContentRefreshRouter, descriptionTruncationSweepRouter } from "./routes/admin-knowledge";
 import adminSearchEnrichRoutes from "./routes/admin-search-enrich";
 import adminAffiliationsRoutes from "./routes/admin-affiliations";
@@ -516,6 +517,11 @@ app.use("/admin/verifier-review-queue", adminLimiter, adminVerifierReviewQueueRo
 // classify the review_required cohort into auto-fixable/manual-review/
 // circular-scramble buckets; dry-run by default, apply:true writes.
 app.use("/admin/verifier/domain-coherence-sweep", adminLimiter, adminDomainCoherenceSweepRoutes);
+// dev-request 2026-07-18-dental-hjemmeside-directory-portal-cleanup: moves
+// directory/booking-portal/industry-association URLs out of dental_agents.
+// hjemmeside into the additive directory_url column — dry-run by default,
+// dry_run:false writes. POST /admin/dental/hjemmeside-cleanup-sweep
+app.use("/admin/dental/hjemmeside-cleanup-sweep", adminLimiter, adminDentalHjemmesideCleanupRoutes);
 // PR-24 (2026-05-11): enrichment write surface accepts field_provenance
 app.use("/admin/knowledge", adminLimiter, adminKnowledgeRoutes);
 // orch-pr-9 (2026-06-14): dead/junk URL prune — POST /admin/prune-dead-urls
