@@ -20,7 +20,7 @@ import { marketplaceRegistry } from "../services/marketplace-registry";
 import { knowledgeService } from "../services/knowledge-service";
 import { getConfig } from "../config/vertical-config";
 import { geocodingService } from "../services/geocoding-service";
-import { analyticsService } from "../services/analytics-service";
+import { analyticsService, parseUserAgent } from "../services/analytics-service";
 import { DiscoveryQuerySchema } from "../models/marketplace";
 import { getDb } from "../database/init";
 import { conversationService, buildRequestMeta } from "../services/conversation-service";
@@ -243,7 +243,7 @@ function shell(
   title: string,
   description: string,
   content: string,
-  extra?: { canonical?: string; jsonLd?: object | object[]; extraCss?: string; lang?: Lang; pathForAlternate?: string }
+  extra?: { canonical?: string; jsonLd?: object | object[]; extraCss?: string; lang?: Lang; pathForAlternate?: string; robots?: string }
 ): string {
   const lang: Lang = extra?.lang || "no";
   const canonicalUrl = extra?.canonical || BASE_URL;
@@ -344,7 +344,7 @@ function shell(
   <meta name="twitter:description" content="${escapeHtml(description)}">
   <meta name="twitter:image" content="${BASE_URL}/logo-512.png">
   <meta name="twitter:image:alt" content="${getConfig().display_name} — lokal mat rett fra bonden i Norge">
-  <meta name="robots" content="index, follow, max-snippet:-1, max-image-preview:large">
+  <meta name="robots" content="${extra?.robots || "index, follow, max-snippet:-1, max-image-preview:large"}">
   <link rel="alternate" hreflang="nb" href="${noUrl}">
   <link rel="alternate" hreflang="en" href="${enUrl}">
   <link rel="alternate" hreflang="x-default" href="${noUrl}">
@@ -637,7 +637,9 @@ function buildConversationShowcase(_lang: Lang = "no"): string {
       const srcColor = sourceColors[source] || "#6b7280";
       const statusEmoji = conv.status === "negotiating" ? "&#128992;" : conv.status === "completed" ? "&#9989;" : "&#128994;";
 
-      return `<a href="/samtale/${conv.id}" class="cv-card">
+      // nofollow: /samtale/<uuid> is an ephemeral, noindex chat log — don't
+      // invite crawlers to queue a fresh URL per conversation shown here.
+      return `<a href="/samtale/${conv.id}" class="cv-card" rel="nofollow">
         <div class="cv-top">
           <div class="cv-agents">${buyer} <span class="cv-arrow">&harr;</span> ${seller}</div>
           <span class="cv-src" style="background:${srcColor}15;color:${srcColor}">${srcLabel}</span>
@@ -1238,7 +1240,12 @@ router.get("/sok", async (req: Request, res: Response) => {
     // ─── Log web search as conversation (source: "web") ─────────
     // Captures human frontend searches in /samtaler alongside AI traffic.
     // Only top 1 match to avoid noise from casual browsing.
-    if (results.length > 0) {
+    // Crawlers are excluded: every Googlebot hit on /sok?q= used to mint a
+    // fresh /samtale/<uuid> page that the homepage then linked, feeding
+    // Google an endless supply of new noindex URLs (GSC 2026-07: 808 pages
+    // excluded by noindex and climbing).
+    const searcherIsBot = parseUserAgent(req.get("user-agent") || "").isBot;
+    if (results.length > 0 && !searcherIsBot) {
       try {
         conversationService.startConversation({
           sellerAgentId: results[0].agent.id,
@@ -1308,7 +1315,10 @@ router.get("/sok", async (req: Request, res: Response) => {
       `${q} \u2014 ${t(lang, "search.title")}`,
       `${lang === "en" ? "Search results for" : "S\u00f8keresultater for"} \u201c${q}\u201d.`,
       content,
-      { canonical: `${BASE_URL}${localizedPath("/sok", lang)}?q=${encodeURIComponent(q)}`, extraCss: SEARCH_CSS, lang, pathForAlternate: `/sok?q=${encodeURIComponent(q)}` }
+      // noindex: /sok?q= is an unbounded query space — GSC 2026-07 showed ~1k
+      // of these stuck in "crawled, not indexed". follow keeps link equity
+      // flowing to the producer pages listed in the results.
+      { canonical: `${BASE_URL}${localizedPath("/sok", lang)}?q=${encodeURIComponent(q)}`, extraCss: SEARCH_CSS, lang, pathForAlternate: `/sok?q=${encodeURIComponent(q)}`, robots: "noindex, follow" }
     ));
   } catch (err) {
     console.error("SEO /sok error:", err);
@@ -4335,7 +4345,22 @@ router.get("/sitemap.xml", (_req: Request, res: Response) => {
     }
 
     for (const p of corePaths) addEntry(p, coreFreq[p] || "monthly", corePriorities[p]!, today);
-    for (const city of cities) addEntry(`/${city}`, "weekly", "0.8", today);
+
+    // City lastmod = newest producer update in that city. Stamping ~370 city
+    // pages with "today" on every request made lastmod meaningless — and a
+    // sitemap that cries wolf gets its honest producer lastmods ignored too.
+    const cityLastmod = new Map<string, string>();
+    for (const a of agents) {
+      const city = (a as any).city || (a as any).location?.city;
+      if (!city) continue;
+      const updatedAt = parseIsoOrSqlite(knowledgeByAgent.get(a.id)?.updatedAt);
+      if (!updatedAt) continue;
+      const lm = lastmodForDate(updatedAt);
+      const citySlug = slugify(city);
+      const prev = cityLastmod.get(citySlug);
+      if (!prev || lm > prev) cityLastmod.set(citySlug, lm);
+    }
+    for (const city of cities) addEntry(`/${city}`, "weekly", "0.8", cityLastmod.get(city) || today);
 
     // PR-30: producer URLs get per-agent <lastmod> + status-driven priority/changefreq
     // WO-17: pre-flight gate filters agents that would 404 in the route handler
@@ -4382,6 +4407,20 @@ router.get(`/${INDEXNOW_KEY}.txt`, (_req: Request, res: Response) => {
 
 // ─── GET /robots.txt ────────────────────────────────────────
 
+// Shared per-group disallows. GSC 2026-07: Googlebot burned crawl budget on
+// /samtale/<uuid> (noindex chat logs, unbounded), /eier/ (private owner
+// portal), /ut/ (outbound redirect tracker — showed up as "page with
+// redirect") and auth-gated /admin/. These must be repeated inside EVERY
+// user-agent group: a crawler that matches a specific group (e.g. Googlebot)
+// ignores the rules under "User-agent: *" entirely.
+// /sok is deliberately NOT listed — its pages carry a noindex meta tag,
+// which the crawler can only see if it is allowed to fetch the page.
+const ROBOTS_DISALLOWS = `Disallow: /samtale/
+Disallow: /eier/
+Disallow: /magic-link-verify
+Disallow: /admin/
+Disallow: /ut/`;
+
 router.get("/robots.txt", (_req: Request, res: Response) => {
   res.header("Content-Type", "text/plain; charset=utf-8");
   // Explicit AI bot allow-list + Content Signals (Cloudflare spec).
@@ -4394,67 +4433,84 @@ router.get("/robots.txt", (_req: Request, res: Response) => {
 
 User-agent: *
 Allow: /
+${ROBOTS_DISALLOWS}
 Content-Signal: search=yes, ai-input=yes, ai-train=no
 
 # ─── AI / agent crawlers (explicit allow) ───────────────────
 User-agent: GPTBot
 Allow: /
+${ROBOTS_DISALLOWS}
 Content-Signal: search=yes, ai-input=yes, ai-train=no
 
 User-agent: OAI-SearchBot
 Allow: /
+${ROBOTS_DISALLOWS}
 Content-Signal: search=yes, ai-input=yes, ai-train=no
 
 User-agent: ChatGPT-User
 Allow: /
+${ROBOTS_DISALLOWS}
 Content-Signal: search=yes, ai-input=yes, ai-train=no
 
 User-agent: ClaudeBot
 Allow: /
+${ROBOTS_DISALLOWS}
 Content-Signal: search=yes, ai-input=yes, ai-train=no
 
 User-agent: Claude-Web
 Allow: /
+${ROBOTS_DISALLOWS}
 Content-Signal: search=yes, ai-input=yes, ai-train=no
 
 User-agent: Claude-SearchBot
 Allow: /
+${ROBOTS_DISALLOWS}
 Content-Signal: search=yes, ai-input=yes, ai-train=no
 
 User-agent: anthropic-ai
 Allow: /
+${ROBOTS_DISALLOWS}
 Content-Signal: search=yes, ai-input=yes, ai-train=no
 
 User-agent: PerplexityBot
 Allow: /
+${ROBOTS_DISALLOWS}
 Content-Signal: search=yes, ai-input=yes, ai-train=no
 
 User-agent: Perplexity-User
 Allow: /
+${ROBOTS_DISALLOWS}
 Content-Signal: search=yes, ai-input=yes, ai-train=no
 
 User-agent: Google-Extended
 Allow: /
+${ROBOTS_DISALLOWS}
 Content-Signal: search=yes, ai-input=yes, ai-train=no
 
 User-agent: Googlebot
 Allow: /
+${ROBOTS_DISALLOWS}
 
 User-agent: Bingbot
 Allow: /
+${ROBOTS_DISALLOWS}
 
 User-agent: Applebot
 Allow: /
+${ROBOTS_DISALLOWS}
 
 User-agent: Applebot-Extended
 Allow: /
+${ROBOTS_DISALLOWS}
 Content-Signal: search=yes, ai-input=yes, ai-train=no
 
 User-agent: Amazonbot
 Allow: /
+${ROBOTS_DISALLOWS}
 
 User-agent: Bytespider
 Allow: /
+${ROBOTS_DISALLOWS}
 Content-Signal: search=yes, ai-input=yes, ai-train=no
 
 User-agent: CCBot
@@ -4462,24 +4518,30 @@ Disallow: /
 
 User-agent: FacebookBot
 Allow: /
+${ROBOTS_DISALLOWS}
 
 User-agent: meta-externalagent
 Allow: /
+${ROBOTS_DISALLOWS}
 Content-Signal: search=yes, ai-input=yes, ai-train=no
 
 User-agent: Diffbot
 Allow: /
+${ROBOTS_DISALLOWS}
 
 User-agent: cohere-ai
 Allow: /
+${ROBOTS_DISALLOWS}
 Content-Signal: search=yes, ai-input=yes, ai-train=no
 
 User-agent: NotHumanSearch
 Allow: /
+${ROBOTS_DISALLOWS}
 Content-Signal: search=yes, ai-input=yes, ai-train=no
 
 User-agent: DuckDuckBot
 Allow: /
+${ROBOTS_DISALLOWS}
 
 User-agent: Omgilibot
 Disallow: /
