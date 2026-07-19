@@ -28601,6 +28601,34 @@ const _recentlyEnrichedSpotcheckPromise: Promise<void> = new Promise<void>(r => 
     failures.push("dental-agents-recently-enriched: unexpected error: " + String(err?.message || err));
   }
 
+  console.log("\n── dev-request 2026-07-18-dental-hjemmeside-directory-portal-cleanup: classifier (pure) ──");
+  try {
+    const { runDentalHjemmesideClassifierTests } = require("../src/services/dental-hjemmeside-classifier.test") as
+      typeof import("../src/services/dental-hjemmeside-classifier.test");
+    const dhcl = await runDentalHjemmesideClassifierTests({ log: false });
+    passed += dhcl.passed;
+    failed += dhcl.failed;
+    for (const f of dhcl.failures) failures.push("dental-hjemmeside-classifier: " + f);
+    console.log(`  dental-hjemmeside-classifier: ${dhcl.passed} passed, ${dhcl.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("dental-hjemmeside-classifier: unexpected error: " + String(err?.message || err));
+  }
+
+  console.log("\n── dev-request 2026-07-18-dental-hjemmeside-directory-portal-cleanup: POST /admin/dental/hjemmeside-cleanup-sweep ──");
+  try {
+    const { runAdminDentalHjemmesideCleanupSweepTests } = require("../src/routes/admin-dental-hjemmeside-cleanup.test") as
+      typeof import("../src/routes/admin-dental-hjemmeside-cleanup.test");
+    const dhcs = await runAdminDentalHjemmesideCleanupSweepTests({ log: false });
+    passed += dhcs.passed;
+    failed += dhcs.failed;
+    for (const f of dhcs.failures) failures.push("admin-dental-hjemmeside-cleanup: " + f);
+    console.log(`  admin-dental-hjemmeside-cleanup: ${dhcs.passed} passed, ${dhcs.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("admin-dental-hjemmeside-cleanup: unexpected error: " + String(err?.message || err));
+  }
+
   console.log("\n── orch-pr-20260716-305: GET /api/opplevelser/admin/providers/recently-enriched (experiences) ──");
   try {
     const { runOpplevelserProvidersRecentlyEnrichedTests } = require("../src/routes/opplevelser-providers-recently-enriched.test") as
