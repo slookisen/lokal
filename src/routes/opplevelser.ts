@@ -66,6 +66,17 @@ import {
   getGardssalgProviderAddressTarget,
   applyGardssalgProviderAddress,
   type GardssalgAddressEnrichmentTarget,
+  // dev-request 2026-07-18-gardssalg-profilkvalitet-foer-outreach, slice 5b —
+  // org_nr backfill via Brreg name-search + exact-name/postal corroboration
+  // (auto-write only when both agree; otherwise the review queue).
+  selectGardssalgProvidersForOrgnrBackfill,
+  getGardssalgProviderOrgnrTarget,
+  applyGardssalgProviderOrgnr,
+  gardssalgOrgnrAutoWriteEligible,
+  upsertGardssalgOrgnrReviewQueue,
+  clearGardssalgOrgnrReviewQueueEntry,
+  listGardssalgOrgnrReviewQueue,
+  type GardssalgOrgnrBackfillTarget,
   // dev-request 2026-07-04-opplevagent-dedup-og-norske-titler, item 1 —
   // re-harvest guard (never insert/resurrect a duplicate already known/merged)
   findExistingExperienceMatch,
@@ -120,6 +131,9 @@ import { fetchBrregBusinessAddress, BRREG_BASE_URL, BRREG_SEARCH_PATH } from "..
 // homepage on CREATE. See isAggregatorWebsite()/firstNonAggregatorWebsite()
 // below, near the bulk-load handler that consumes them.
 import { isDirectoryOrAggregatorHost } from "../services/cross-source-validator";
+// dev-request 2026-07-18-gardssalg-profilkvalitet-foer-outreach, slice 5b —
+// Brreg name-search (candidate generator only, see gardssalgOrgnrAutoWriteEligible).
+import { findOrgnumberByName } from "../services/brreg-client";
 import {
   createBooking,
   getBookingByRef,
@@ -1318,6 +1332,177 @@ router.post("/admin/gardssalg-address-enrichment", requireAdmin, async (req: Req
     unresolved,
     errors,
   });
+});
+
+// ─── POST /api/opplevelser/admin/gardssalg-orgnr-backfill (admin) ───────────
+//
+// dev-request 2026-07-18-gardssalg-profilkvalitet-foer-outreach, slice 5b.
+// Slice 4's batch report found 0/74 gårdssalg providers have org_nr set,
+// which starves slice 3's Brreg address-enrichment (a direct-by-orgnr
+// lookup) of the key it needs — this endpoint backfills org_nr itself, using
+// Brreg's name-search (findOrgnumberByName, brreg-client.ts) as a CANDIDATE
+// GENERATOR ONLY. Per Daniel's binding identitetskrav (slice 4-GO, ordrett:
+// "vær sikker på at man ikke krysser ulike agenter med data" / "ved tvil:
+// ikke skriv"), a candidate is auto-written ONLY when Brreg's own confidence
+// is the exact-match tier (1.0) AND this route's own independent postal
+// corroboration (gardssalgOrgnrAutoWriteEligible, experience-store.ts) also
+// agrees — see that function's doc comment for the exact gate. Every other
+// outcome (no Brreg candidate, sub-1.0 confidence, or a corroboration
+// mismatch/no-signal) is NEVER auto-written: it's upserted into
+// gardssalg_orgnr_review_queue for a human to resolve, and bucketed
+// `unresolved` in this response (reason "needs_human_review" or
+// "no_brreg_candidate").
+//
+// Body: { providerIds?: string[], limit?: number, apply?: boolean }. Same
+// dry-run-by-default convention, providerIds de-dup-before-limit, and
+// hard-cap-at-48 convention as every other gårdssalg admin route in this
+// file (mirrors GS_AE_DEFAULT_LIMIT/GS_AE_HARD_CAP's role above).
+//
+// NB: MUST come before "/:id" so "admin" isn't swallowed as an id param.
+
+const GS_OB_DEFAULT_LIMIT = 48;
+const GS_OB_HARD_CAP = 48; // there are only 74 gårdssalg providers total
+
+router.post("/admin/gardssalg-orgnr-backfill", requireAdmin, async (req: Request, res: Response) => {
+  const body = (req.body ?? {}) as { providerIds?: unknown; limit?: unknown; apply?: unknown };
+
+  const apply =
+    body.apply === true ||
+    body.apply === 1 ||
+    body.apply === "1" ||
+    body.apply === "true" ||
+    req.query?.apply === "1" ||
+    req.query?.apply === "true";
+  const dryRun = !apply;
+
+  const limit = Math.min(
+    typeof body.limit === "number" && body.limit > 0 ? Math.floor(body.limit) : GS_OB_DEFAULT_LIMIT,
+    GS_OB_HARD_CAP
+  );
+
+  let targets: GardssalgOrgnrBackfillTarget[];
+  if (Array.isArray(body.providerIds) && body.providerIds.length > 0) {
+    const ids = Array.from(
+      new Set(
+        (body.providerIds as unknown[])
+          .filter((id): id is string => typeof id === "string" && id.trim().length > 0)
+          .map((id) => id.trim())
+      )
+    ).slice(0, limit);
+    targets = ids
+      .map((id) => getGardssalgProviderOrgnrTarget(id))
+      .filter((t): t is GardssalgOrgnrBackfillTarget => t !== null);
+  } else {
+    targets = selectGardssalgProvidersForOrgnrBackfill(limit);
+  }
+
+  let scanned = 0;
+  const changed: Array<{ provider_id: string; org_nr: string; source_url: string }> = [];
+  const skippedLocked: string[] = [];
+  const unresolved: Array<{ provider_id: string; reason: string }> = [];
+  const errors: Array<{ provider_id: string; error: string }> = [];
+
+  for (const t of targets) {
+    const providerId = t.id;
+
+    if (t.content_source === "manual" || t.content_source === "claim") {
+      skippedLocked.push(providerId);
+      continue;
+    }
+
+    if (t.org_nr && t.org_nr.trim() !== "") {
+      // Only reachable via the explicit providerIds override (the auto-
+      // selector already filters blank-org_nr) — nothing to backfill.
+      unresolved.push({ provider_id: providerId, reason: "already_filled" });
+      continue;
+    }
+
+    let hit: Awaited<ReturnType<typeof findOrgnumberByName>>;
+    try {
+      hit = await findOrgnumberByName(t.navn, t.postnummer);
+    } catch (e: any) {
+      errors.push({ provider_id: providerId, error: e?.message ?? String(e) });
+      continue;
+    }
+    scanned++;
+
+    if (!hit) {
+      unresolved.push({ provider_id: providerId, reason: "no_brreg_candidate" });
+      upsertGardssalgOrgnrReviewQueue({
+        provider_id: providerId,
+        provider_name: t.navn,
+        candidate_orgnr: null,
+        candidate_name: null,
+        candidate_confidence: null,
+        candidate_address: null,
+        reason: "no_brreg_candidate",
+      });
+      continue;
+    }
+
+    if (!gardssalgOrgnrAutoWriteEligible(t, hit)) {
+      unresolved.push({ provider_id: providerId, reason: "needs_human_review" });
+      upsertGardssalgOrgnrReviewQueue({
+        provider_id: providerId,
+        provider_name: t.navn,
+        candidate_orgnr: hit.orgnumber,
+        candidate_name: hit.name,
+        candidate_confidence: hit.confidence,
+        candidate_address: hit.address,
+        reason: "needs_human_review",
+      });
+      continue;
+    }
+
+    const evidenceUrl = `${BRREG_BASE_URL}${BRREG_SEARCH_PATH}/${encodeURIComponent(hit.orgnumber)}`;
+
+    if (dryRun) {
+      changed.push({ provider_id: providerId, org_nr: hit.orgnumber, source_url: evidenceUrl });
+    } else {
+      try {
+        const written = applyGardssalgProviderOrgnr(providerId, hit.orgnumber, evidenceUrl);
+        if (written.length > 0) {
+          changed.push({ provider_id: providerId, org_nr: hit.orgnumber, source_url: evidenceUrl });
+          // A confirmed, applied write supersedes any stale review-queue
+          // entry an earlier run may have left for this provider.
+          clearGardssalgOrgnrReviewQueueEntry(providerId);
+        } else {
+          // Fresh-read-at-write-time found the field already non-blank, the
+          // provider now locked, or (UNIQUE org_nr) another provider already
+          // holds this exact org_nr — same race class documented on the
+          // address-enrichment route above. Bucketed, not silently dropped.
+          unresolved.push({ provider_id: providerId, reason: "already_filled_or_conflict_at_write_time" });
+        }
+      } catch (e: any) {
+        errors.push({ provider_id: providerId, error: `write_failed: ${e?.message ?? String(e)}` });
+      }
+    }
+  }
+
+  res.json({
+    dry_run: dryRun,
+    scanned,
+    agents_enriched: changed.length,
+    changed,
+    skipped_locked: skippedLocked,
+    unresolved,
+    errors,
+  });
+});
+
+// ─── GET /api/opplevelser/admin/gardssalg-orgnr-review-queue (admin) ────────
+//
+// dev-request 2026-07-18-gardssalg-profilkvalitet-foer-outreach, slice 5b.
+// Read-only listing of every gårdssalg provider the backfill route above
+// could NOT auto-confirm an org_nr for — the durable counterpart to that
+// route's per-run `unresolved[]` array (see gardssalg_orgnr_review_queue's
+// schema doc comment, init-experiences.ts). No UI reads this yet; it exists
+// so Daniel/CS has something to query once a triage surface is built.
+//
+// NB: MUST come before "/:id" so "admin" isn't swallowed as an id param.
+router.get("/admin/gardssalg-orgnr-review-queue", requireAdmin, (_req: Request, res: Response) => {
+  const entries = listGardssalgOrgnrReviewQueue();
+  res.json({ count: entries.length, entries });
 });
 
 // ─── POST /api/opplevelser/admin/gardssalg-content-rollback (admin) ─────────

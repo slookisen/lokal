@@ -26978,6 +26978,25 @@ Promise.allSettled(_oaHomeCountersDeps).then(async () => {
     for (const f of gaer.failures) failures.push("opplevelser-gardssalg-address-enrichment: " + f);
     console.log(`  opplevelser-gardssalg-address-enrichment: ${gaer.passed} passed, ${gaer.failed} failed`);
 
+    // dev-request 2026-07-18-gardssalg-profilkvalitet-foer-outreach, slice 5b:
+    // org_nr backfill via Brreg name-search + exact-name/postal corroboration —
+    // selectGardssalgProvidersForOrgnrBackfill()/getGardssalgProviderOrgnrTarget()/
+    // applyGardssalgProviderOrgnr()/gardssalgOrgnrAutoWriteEligible() (src/
+    // services/experience-store.ts), POST /admin/gardssalg-orgnr-backfill +
+    // GET /admin/gardssalg-orgnr-review-queue (src/routes/opplevelser.ts).
+    // Unlocks slice 3's address-enrichment (which needs org_nr as its lookup
+    // key) — auto-writes ONLY on exact-name + postal corroboration, otherwise
+    // routes to the review queue (Daniel's "ved tvil: ikke skriv"). Same
+    // in-memory-DB pattern, runs sequentially inside this same gated block.
+    console.log("\n── opplevelser-gardssalg-orgnr-backfill: Brreg name-search org_nr backfill ──");
+    const { runOpplevelserGardssalgOrgnrBackfillTests } = require("../src/routes/opplevelser-gardssalg-orgnr-backfill.test") as
+      typeof import("../src/routes/opplevelser-gardssalg-orgnr-backfill.test");
+    const gob = await runOpplevelserGardssalgOrgnrBackfillTests({ log: false });
+    passed += gob.passed;
+    failed += gob.failed;
+    for (const f of gob.failures) failures.push("opplevelser-gardssalg-orgnr-backfill: " + f);
+    console.log(`  opplevelser-gardssalg-orgnr-backfill: ${gob.passed} passed, ${gob.failed} failed`);
+
     // dev-request 2026-07-04-opplevagent-dedup-og-norske-titler, item 3
     // (detail completeness weave): GET /admin/detail-completeness-coverage —
     // read-only, catalog-wide booking_url/phone/website coverage report over

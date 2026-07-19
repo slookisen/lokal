@@ -471,6 +471,44 @@ export function initExperiencesSchema(db: Database.Database): void {
     console.error("Migration gardssalg_content_audit failed:", err);
   }
 
+  // ─── gardssalg_orgnr_review_queue (dev-request 2026-07-18-gardssalg-
+  // profilkvalitet-foer-outreach, slice 5b) ───────────────────────────────────
+  // Every gårdssalg provider whose org_nr the Brreg-name-search backfill
+  // (POST /admin/gardssalg-orgnr-backfill) could NOT auto-confirm — either no
+  // Brreg candidate was found at all, or a candidate was found but failed the
+  // exact-name + kommune/poststed corroboration bar (Daniel's binding
+  // identitetskrav, slice 4-GO: "ved tvil: ikke skriv") — lands here instead
+  // of being written. One row per provider (UNIQUE(provider_id)): a rerun of
+  // the backfill route upserts in place rather than accumulating duplicate
+  // rows, mirroring hanen_unmatched_members's (src/database/init.ts)
+  // refresh-on-rerun idiom — this fleet's established pattern for a durable,
+  // human-triageable "couldn't auto-resolve" list (as opposed to the
+  // ephemeral `unresolved[]` array the route also returns per-run). No UI
+  // reads this yet; it exists so Daniel/CS has something queryable once a
+  // triage surface is built, same deferred-UI rationale as
+  // hanen_unmatched_members.
+  try {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS gardssalg_orgnr_review_queue (
+        id TEXT PRIMARY KEY,
+        provider_id TEXT NOT NULL UNIQUE,
+        provider_name TEXT,
+        candidate_orgnr TEXT,
+        candidate_name TEXT,
+        candidate_confidence REAL,
+        candidate_address TEXT,
+        reason TEXT NOT NULL,
+        batch_id TEXT,
+        created_at TEXT NOT NULL DEFAULT (datetime('now')),
+        updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+        FOREIGN KEY (provider_id) REFERENCES experience_providers(id) ON DELETE CASCADE
+      )
+    `);
+    db.exec(`CREATE INDEX IF NOT EXISTS idx_gardssalg_orgnr_review_queue_reason ON gardssalg_orgnr_review_queue(reason)`);
+  } catch (err) {
+    console.error("Migration gardssalg_orgnr_review_queue failed:", err);
+  }
+
   // ─── Gårdssalg dark-launch-stop (dev-request 2026-07-12-gardssalg-dark-
   // launch-stop, slice 0) ────────────────────────────────────────────────────
   // The gårdssalg booking flow has been live on prod since 2026-07-03 but no

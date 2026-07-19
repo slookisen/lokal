@@ -2495,6 +2495,272 @@ export function applyGardssalgProviderAddress(
   return written;
 }
 
+// ─── Gårdssalg org_nr backfill (dev-request 2026-07-18-gardssalg-
+// profilkvalitet-foer-outreach, slice 5b) ────────────────────────────────────
+// Slice 4's batch report found 0/74 gårdssalg providers have org_nr set —
+// this is the key slice 3's Brreg address-enrichment needs (direct-by-orgnr
+// lookup), so slice 3's write path has sat idle with nothing to key off of.
+// This slice backfills org_nr using Brreg's NAME-search (findOrgnumberByName,
+// brreg-client.ts) purely as a CANDIDATE generator — per Daniel's binding
+// identitetskrav (slice 4-GO, ordrett): "vær sikker på at man ikke krysser
+// ulike agenter med data" / "ved tvil: ikke skriv". A candidate is
+// auto-written ONLY when BOTH (a) Brreg's own confidence score is the
+// rubric's exact-match tier (1.0 — normalised query name == normalised hit
+// name, see brreg-client.ts's doc comment) AND (b) this function's own
+// independent postal corroboration (isBlank-safe compare of the provider's
+// existing postnummer/poststed, if any, against the hit's own postal) also
+// agrees. Anything short of that — no candidate, sub-1.0 confidence, no
+// existing postnummer/poststed to corroborate against, or a corroboration
+// mismatch — is NEVER auto-written; the caller (the admin route) routes it
+// to gardssalg_orgnr_review_queue instead. This mirrors, not duplicates,
+// applyGardssalgProviderAddress's fill-only/lock-guard/audit discipline.
+
+export type GardssalgOrgnrBackfillTarget = {
+  id: string;
+  navn: string;
+  org_nr: string | null;
+  content_source: string | null;
+  postnummer: string | null;
+  poststed: string | null;
+};
+
+/**
+ * Auto-select gårdssalg providers eligible for an org_nr backfill attempt:
+ * gårdssalg providers (producer_type set OR rfb-seed), NOT locked
+ * (content_source not in manual/claim), with a blank org_nr, excluding
+ * catalog_hidden=1 — same scoping convention as
+ * selectGardssalgProvidersForAddressEnrichment above, just keyed on org_nr
+ * instead of adresse. Ordered oldest-created first. Hard-capped at 48.
+ */
+export function selectGardssalgProvidersForOrgnrBackfill(limit = 48): GardssalgOrgnrBackfillTarget[] {
+  const db = getDb(VERTICAL);
+  const cap = Math.max(1, Math.min(48, limit));
+  return db
+    .prepare(
+      `SELECT id, navn, org_nr, content_source, postnummer, poststed
+         FROM experience_providers
+        WHERE (producer_type IS NOT NULL OR rfb_seed_source = 'rfb-seed')
+          AND (org_nr IS NULL OR TRIM(org_nr) = '')
+          AND (content_source IS NULL OR content_source NOT IN ('manual','claim'))
+          AND (catalog_hidden IS NULL OR catalog_hidden != 1)
+        ORDER BY created_at ASC
+        LIMIT ?`
+    )
+    .all(cap) as GardssalgOrgnrBackfillTarget[];
+}
+
+/**
+ * Resolve an explicit providerId for the org_nr-backfill route's
+ * `providerIds` override. Scoped to the gårdssalg WHERE clause only (NOT the
+ * blank-org_nr/lock filters) — mirrors getGardssalgProviderAddressTarget's
+ * override semantics, so an admin can force a lookup on any gårdssalg
+ * provider. Unlike the address target getter, this does NOT require org_nr
+ * to already be present (the whole point here is finding it).
+ */
+export function getGardssalgProviderOrgnrTarget(providerId: string): GardssalgOrgnrBackfillTarget | null {
+  const db = getDb(VERTICAL);
+  const row = db
+    .prepare(
+      `SELECT id, navn, org_nr, content_source, postnummer, poststed
+         FROM experience_providers
+        WHERE id = ?
+          AND (producer_type IS NOT NULL OR rfb_seed_source = 'rfb-seed')`
+    )
+    .get(providerId) as GardssalgOrgnrBackfillTarget | undefined;
+  return row ?? null;
+}
+
+/**
+ * True only when an existing, non-blank postnummer OR poststed on the
+ * provider's own row agrees with the Brreg hit's own postal fields
+ * (brreg_postal is a postnummer; poststed is compared case-insensitively,
+ * diacritic-naive — a plain trim+lowercase is enough for this narrow
+ * corroboration check, not a fuzzy match). Returns false (never true) when
+ * the provider has NEITHER field set — there is nothing to corroborate
+ * against, so per Daniel's "ved tvil: ikke skriv" this can never pass by
+ * absence of a signal. Exported for unit tests.
+ */
+export function gardssalgOrgnrPostalCorroborated(
+  target: { postnummer: string | null; poststed: string | null },
+  hit: { brreg_postal?: string | null; address: string | null }
+): boolean {
+  const targetPostnr = (target.postnummer || "").trim();
+  const hitPostnr = (hit.brreg_postal || "").trim();
+  if (targetPostnr && hitPostnr && targetPostnr === hitPostnr) return true;
+
+  const targetPoststed = (target.poststed || "").trim().toLowerCase();
+  if (targetPoststed && hit.address) {
+    // hit.address is a formatted "<street>, <postnr> <poststed>" string
+    // (formatBrregAddress, brreg-client.ts) — a simple substring check on
+    // the trailing poststed token is sufficient here since we only need to
+    // corroborate, never to parse a display string into structured data.
+    if (hit.address.toLowerCase().includes(targetPoststed)) return true;
+  }
+  return false;
+}
+
+/**
+ * True only when Brreg's own name-match confidence is the rubric's exact-
+ * match tier (1.0 — see brreg-client.ts's scoreNameMatch doc comment) AND
+ * gardssalgOrgnrPostalCorroborated agrees. This is the ONLY gate that may
+ * ever auto-write an org_nr — anything else must go to the review queue.
+ * Exported for unit tests.
+ */
+export function gardssalgOrgnrAutoWriteEligible(
+  target: { postnummer: string | null; poststed: string | null },
+  hit: { confidence: number; brreg_postal?: string | null; address: string | null }
+): boolean {
+  return hit.confidence === 1.0 && gardssalgOrgnrPostalCorroborated(target, hit);
+}
+
+/**
+ * Apply a confirmed org_nr candidate to ONE gårdssalg provider. Same lock
+ * guard + fill-only + audit/provenance discipline as
+ * applyGardssalgProviderAddress: NEVER writes if the provider is locked
+ * (content_source manual/claim); only writes if the row's own org_nr is
+ * currently blank (a second call against an already-filled row is a no-op,
+ * idempotent). Because experience_providers.org_nr is UNIQUE, this also
+ * re-checks (at write time, inside the same transaction) that no OTHER
+ * provider already holds this org_nr — a genuine possibility given known
+ * catalog duplicates (see slice 4b's "Ciderhuset-paret" finding) — and skips
+ * the write (returns []) rather than letting the UNIQUE constraint throw,
+ * so a caller-side race or a stale candidate never crashes the batch loop.
+ * Does NOT stamp content_source/content_evidence_url (org_nr is registry
+ * metadata, not website-crawled content — same rationale as
+ * applyGardssalgProviderAddress). Returns the field names actually written
+ * (empty array if nothing to write).
+ */
+export function applyGardssalgProviderOrgnr(
+  providerId: string,
+  orgNr: string,
+  evidenceUrl: string,
+  batchId?: string
+): string[] {
+  const db = getDb(VERTICAL);
+  const row = db
+    .prepare(`SELECT id, content_source, org_nr, field_provenance FROM experience_providers WHERE id = ?`)
+    .get(providerId) as
+    | { id: string; content_source: string | null; org_nr: string | null; field_provenance: string | null }
+    | undefined;
+  if (!row) return [];
+  if (row.content_source === "manual" || row.content_source === "claim") return [];
+
+  const cleanOrgNr = (orgNr || "").trim();
+  if (!cleanOrgNr) return [];
+  if (row.org_nr && row.org_nr.trim() !== "") return []; // fill-only
+
+  const conflict = db
+    .prepare(`SELECT id FROM experience_providers WHERE org_nr = ? AND id != ?`)
+    .get(cleanOrgNr, providerId) as { id: string } | undefined;
+  if (conflict) return [];
+
+  let provenance: Record<string, { source_url: string; fetched_at: string }> = {};
+  if (row.field_provenance) {
+    try {
+      const parsed = JSON.parse(row.field_provenance);
+      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+        provenance = parsed as Record<string, { source_url: string; fetched_at: string }>;
+      }
+    } catch {
+      /* malformed existing JSON -> treat as empty rather than clobber the write */
+    }
+  }
+  provenance.org_nr = { source_url: evidenceUrl, fetched_at: new Date().toISOString() };
+
+  const applyWithAudit = db.transaction(() => {
+    db.prepare(
+      `UPDATE experience_providers SET org_nr = @org_nr, field_provenance = @field_provenance, updated_at = datetime('now') WHERE id = @id`
+    ).run({ id: providerId, org_nr: cleanOrgNr, field_provenance: JSON.stringify(provenance) });
+    db.prepare(
+      `INSERT INTO gardssalg_content_audit
+         (id, provider_id, field_name, old_value, new_value, source_url, batch_id, changed_by, changed_at)
+       VALUES (@id, @provider_id, 'org_nr', @old_value, @new_value, @source_url, @batch_id, 'system', datetime('now'))`
+    ).run({
+      id: uuid(),
+      provider_id: providerId,
+      old_value: row.org_nr ?? null,
+      new_value: cleanOrgNr,
+      source_url: evidenceUrl,
+      batch_id: batchId ?? null,
+    });
+  });
+  applyWithAudit();
+
+  return ["org_nr"];
+}
+
+export type GardssalgOrgnrReviewQueueEntry = {
+  provider_id: string;
+  provider_name?: string | null;
+  candidate_orgnr?: string | null;
+  candidate_name?: string | null;
+  candidate_confidence?: number | null;
+  candidate_address?: string | null;
+  reason: string;
+  batch_id?: string | null;
+};
+
+/**
+ * Upsert (INSERT OR REPLACE, keyed on provider_id's UNIQUE constraint) one
+ * gardssalg_orgnr_review_queue row — a re-run of the backfill route
+ * overwrites a provider's prior review-queue entry rather than accumulating
+ * duplicates, same "refresh, don't pile up" idiom as hanen_unmatched_members
+ * (init.ts). `id` is preserved across an upsert only when the row doesn't
+ * already exist (fresh uuid); an existing row keeps its own id via ON
+ * CONFLICT, so foreign references (none exist yet) would remain stable.
+ */
+export function upsertGardssalgOrgnrReviewQueue(entry: GardssalgOrgnrReviewQueueEntry): void {
+  const db = getDb(VERTICAL);
+  db.prepare(
+    `INSERT INTO gardssalg_orgnr_review_queue
+       (id, provider_id, provider_name, candidate_orgnr, candidate_name, candidate_confidence,
+        candidate_address, reason, batch_id, created_at, updated_at)
+     VALUES (@id, @provider_id, @provider_name, @candidate_orgnr, @candidate_name, @candidate_confidence,
+             @candidate_address, @reason, @batch_id, datetime('now'), datetime('now'))
+     ON CONFLICT(provider_id) DO UPDATE SET
+       provider_name = excluded.provider_name,
+       candidate_orgnr = excluded.candidate_orgnr,
+       candidate_name = excluded.candidate_name,
+       candidate_confidence = excluded.candidate_confidence,
+       candidate_address = excluded.candidate_address,
+       reason = excluded.reason,
+       batch_id = excluded.batch_id,
+       updated_at = datetime('now')`
+  ).run({
+    id: uuid(),
+    provider_id: entry.provider_id,
+    provider_name: entry.provider_name ?? null,
+    candidate_orgnr: entry.candidate_orgnr ?? null,
+    candidate_name: entry.candidate_name ?? null,
+    candidate_confidence: entry.candidate_confidence ?? null,
+    candidate_address: entry.candidate_address ?? null,
+    reason: entry.reason,
+    batch_id: entry.batch_id ?? null,
+  });
+}
+
+/** Removes a provider's review-queue entry — called once org_nr is actually
+ * resolved for it (by a later auto-write, or a human filling it in some
+ * other way), so the queue only ever reflects CURRENTLY-unresolved
+ * providers. Never throws if no row exists. */
+export function clearGardssalgOrgnrReviewQueueEntry(providerId: string): void {
+  const db = getDb(VERTICAL);
+  db.prepare(`DELETE FROM gardssalg_orgnr_review_queue WHERE provider_id = ?`).run(providerId);
+}
+
+/** Lists all current review-queue entries, newest-updated first. Read-only,
+ * backs GET /admin/gardssalg-orgnr-review-queue. */
+export function listGardssalgOrgnrReviewQueue(): (GardssalgOrgnrReviewQueueEntry & {
+  id: string;
+  created_at: string;
+  updated_at: string;
+})[] {
+  const db = getDb(VERTICAL);
+  return db
+    .prepare(`SELECT * FROM gardssalg_orgnr_review_queue ORDER BY updated_at DESC`)
+    .all() as (GardssalgOrgnrReviewQueueEntry & { id: string; created_at: string; updated_at: string })[];
+}
+
 // ─── Gårdssalg content rollback (dev-request 2026-07-18-gardssalg-
 // profilkvalitet-foer-outreach, slice 1; widened in slice 3 to also cover
 // applyGardssalgProviderAddress's adresse/postnummer/poststed writes) ────────
@@ -2514,6 +2780,9 @@ const GARDSSALG_ROLLBACKABLE_FIELDS = new Set([
   "poststed",
   // slice 5c (2026-07-19) — fill-only products (JSON array of strings)
   "products",
+  // slice 5b (2026-07-19) — fill-only org_nr backfill (Brreg name-search +
+  // exact-name/postal corroboration; see applyGardssalgProviderOrgnr below)
+  "org_nr",
 ]);
 // source_url marker stamped on audit rows inserted BY a rollback itself
 // (as opposed to rows inserted by a content-refresh write) — lets
