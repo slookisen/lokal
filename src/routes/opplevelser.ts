@@ -2870,6 +2870,125 @@ router.patch("/admin/providers/:id/hjemmeside", requireAdmin, (req: Request, res
   }
 });
 
+// ─── POST /api/opplevelser/admin/gardssalg-provider-visibility (admin) ──────
+//
+// dev-request 2026-07-19-brreg-nace-drikkeprodusenter, triage-oppfølging:
+// NACE-kodene skiller ikke håndverk fra industri, så en discovery-apply kan
+// lande rader som er formelt korrekte drikkeprodusenter men ikke besøks-/
+// gårdssalgsrelevante (Ringnes-klassen, konkursbo-etterfølgere, rene
+// holdingselskaper). Denne spaken setter/nuller catalog_hidden for
+// EKSPLISITT opplistede rader — samme kolonne og semantikk som den skjulte
+// booking-flyt-testprovideren: listGardssalgProviders filtrerer
+// catalog_hidden=1 ut av det offentlige grid'et, mens slug-oppslag fortsatt
+// virker, så en skjult rad er reversibel og lenkbar, aldri slettet.
+//
+// Body: { providerIds?: string[], orgNrs?: string[], hidden: boolean,
+// apply? } — dry-run default som alle andre admin-ruter i denne fila.
+// Ingen wildcard-/alle-modus: et kall må navngi radene sine (id eller
+// org_nr), så spaken kan aldri skjule eller avsløre noe den ikke eksplisitt
+// ble bedt om. manual/claim-låste rader hoppes over og rapporteres
+// (skipped_locked) — samme lås som alle andre gårdssalg-skrivere.
+const GS_PV_MAX_TARGETS = 500;
+
+router.post("/admin/gardssalg-provider-visibility", requireAdmin, (req: Request, res: Response) => {
+  const body = (req.body ?? {}) as {
+    providerIds?: unknown;
+    orgNrs?: unknown;
+    hidden?: unknown;
+    apply?: unknown;
+  };
+
+  if (typeof body.hidden !== "boolean") {
+    res.status(400).json({ error: "Body field 'hidden' is required (boolean)" });
+    return;
+  }
+  const hidden = body.hidden;
+  const apply =
+    body.apply === true ||
+    body.apply === 1 ||
+    body.apply === "1" ||
+    body.apply === "true" ||
+    req.query?.apply === "1" ||
+    req.query?.apply === "true";
+  const dryRun = !apply;
+
+  const providerIds = Array.isArray(body.providerIds)
+    ? (body.providerIds as unknown[]).filter((v): v is string => typeof v === "string" && v.trim() !== "").map((v) => v.trim())
+    : [];
+  const orgNrs = Array.isArray(body.orgNrs)
+    ? (body.orgNrs as unknown[]).filter((v): v is string => typeof v === "string" && v.trim() !== "").map((v) => v.trim())
+    : [];
+  if (providerIds.length === 0 && orgNrs.length === 0) {
+    res.status(400).json({ error: "Provide at least one target via 'providerIds' and/or 'orgNrs'" });
+    return;
+  }
+  if (providerIds.length + orgNrs.length > GS_PV_MAX_TARGETS) {
+    res.status(400).json({ error: `Too many targets (max ${GS_PV_MAX_TARGETS} per call)` });
+    return;
+  }
+
+  try {
+    const expDb = getExpDb("experiences");
+    const byId = expDb.prepare(
+      `SELECT id, navn, org_nr, catalog_hidden, content_source FROM experience_providers WHERE id = ?`
+    );
+    const byOrgNr = expDb.prepare(
+      `SELECT id, navn, org_nr, catalog_hidden, content_source FROM experience_providers WHERE org_nr = ?`
+    );
+    type PvRow = { id: string; navn: string; org_nr: string | null; catalog_hidden: number | null; content_source: string | null };
+
+    const matched = new Map<string, PvRow>();
+    const notFound: Array<{ ref: string; via: string }> = [];
+    for (const pid of providerIds) {
+      const row = byId.get(pid) as PvRow | undefined;
+      if (row) matched.set(row.id, row);
+      else notFound.push({ ref: pid, via: "provider_id" });
+    }
+    for (const orgnr of orgNrs) {
+      const row = byOrgNr.get(orgnr) as PvRow | undefined;
+      if (row) matched.set(row.id, row);
+      else notFound.push({ ref: orgnr, via: "org_nr" });
+    }
+
+    const skippedLocked: Array<{ id: string; navn: string; org_nr: string | null }> = [];
+    const unchanged: Array<{ id: string; navn: string; org_nr: string | null }> = [];
+    const changed: Array<{ id: string; navn: string; org_nr: string | null; previous_hidden: boolean }> = [];
+    const targetValue = hidden ? 1 : null;
+
+    const upd = expDb.prepare(
+      `UPDATE experience_providers SET catalog_hidden = ?, updated_at = datetime('now') WHERE id = ?`
+    );
+    for (const row of matched.values()) {
+      if (row.content_source === "manual" || row.content_source === "claim") {
+        skippedLocked.push({ id: row.id, navn: row.navn, org_nr: row.org_nr });
+        continue;
+      }
+      const currentlyHidden = row.catalog_hidden === 1;
+      if (currentlyHidden === hidden) {
+        unchanged.push({ id: row.id, navn: row.navn, org_nr: row.org_nr });
+        continue;
+      }
+      if (!dryRun) upd.run(targetValue, row.id);
+      changed.push({ id: row.id, navn: row.navn, org_nr: row.org_nr, previous_hidden: currentlyHidden });
+    }
+
+    res.json({
+      success: true,
+      dry_run: dryRun,
+      hidden,
+      matched_count: matched.size,
+      changed_count: changed.length,
+      changed,
+      unchanged,
+      skipped_locked: skippedLocked,
+      not_found: notFound,
+    });
+  } catch (err) {
+    console.error("[opplevelser] admin/gardssalg-provider-visibility POST failed", err);
+    res.status(500).json({ error: "Internal error" });
+  }
+});
+
 // ─── GET /api/opplevelser/admin/detail-completeness-coverage ─────────────────
 //
 // dev-request 2026-07-04-opplevagent-dedup-og-norske-titler, item 3 ("detail
