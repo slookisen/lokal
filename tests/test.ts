@@ -16263,6 +16263,44 @@ const _orchPr18BulkLoadPromise: Promise<void> = new Promise<void>((r) => {
         "https://myotherrealprovider.no",
         "bl-agg-3d: non-aggregator website is unchanged (regression guard)"
       );
+
+      // bl-agg-4: the actual 2026-07-12 production incident this dev-request
+      // cites — visitinnlandet.no (regional tourism aggregator) landed in 5
+      // providers' hjemmeside via bulk-load, and every content-refresh fetch
+      // against it then failed (http_unreachable). Reproduces that exact
+      // domain to prove THIS incident, not just a generic aggregator, is
+      // actually caught (visitinnlandet.no was added to KNOWN_DIRECTORY_HOSTS
+      // as part of this same slice — it was not previously in the set).
+      const r4 = await bulkReq(
+        {
+          experiences: [
+            {
+              title: "Innlandet Aggregator Opplevelse",
+              provider_name: "Innlandet Aggregator Provider AS",
+              category: "annet",
+              kommune: "Lillehammer",
+              fylke: "Innlandet",
+              indoor_outdoor: "both",
+              evidence_url: "https://www.visitinnlandet.no/listings/some-listing",
+              website: "https://www.visitinnlandet.no/listings/some-listing",
+              confidence: "low",
+            },
+          ],
+          apply: true,
+        },
+        ADMIN_KEY_18
+      );
+      assertEq(r4.status, 200, "bl-agg-4a: apply → 200");
+      assertEq(r4.body.providers_inserted, 1, "bl-agg-4b: 1 provider inserted (unverified+evidence)");
+      const row4 = dbExp18
+        .prepare("SELECT hjemmeside FROM experience_providers WHERE navn = 'Innlandet Aggregator Provider AS'")
+        .get() as { hjemmeside: string | null } | undefined;
+      assertTrue(!!row4, "bl-agg-4c: provider row exists");
+      assertEq(
+        row4!.hjemmeside,
+        null,
+        "bl-agg-4d: hjemmeside is null, NOT the visitinnlandet.no URL (the real 2026-07-12 incident domain)"
+      );
     }
 
     // ── Cleanup ───────────────────────────────────────────────────────

@@ -628,6 +628,16 @@ export const KNOWN_DIRECTORY_HOSTS: ReadonlySet<string> = new Set([
   // (28d mean 49 vs guardrail 25). matfra.no is a defunct local-food directory whose
   // listing pages were being stored as producer "websites".
   "matfra.no",
+  // Extended 2026-07-19 (dev-request 2026-07-12-experiences-enrichment-supply-and-
+  // aggregator-hygiene, item 2): visitinnlandet.no is a regional tourism-aggregator
+  // page, not a producer's own site. Confirmed via the 2026-07-12 experiences-
+  // enrichment run report: 5 providers' `hjemmeside` had been bulk-loaded to
+  // visitinnlandet.no URLs and every content-refresh fetch against them failed
+  // (http_unreachable) — the aggregator blocks scraping. This is the same
+  // aggregator-URL-in-hjemmeside leak this dev-request's item 2 closes at the
+  // bulk-load write path; adding the confirmed domain here so the classifier
+  // actually catches the incident that motivated the fix (not a speculative add).
+  "visitinnlandet.no",
 ]);
 
 export function isKnownDirectoryHost(host: string): boolean {
