@@ -31533,3 +31533,23 @@ const _previsitSvarsloyfePromise = runSerial(async () => {
   dbFacPV.__resetDbFactoryForTesting();
   console.log("  gardssalg-previsit-svarsloyfe: OK (token-hygiene begge veier, engangs+utløp negativtester, PRG-GET-muterer-ikke, foreslå→gjestesvar-løkke m/ rotasjon, klokkejustert purring/utløp + idempotens, gate-av-suppresjon m/ recovery, legacy-rader immune, admin-endepunkt; review-fixes: time_suggested-utløp begge veier + fortids-aksept avvist + sannferdige sider, samtidighets-sikre claims, post-visit-resolvete utenfor løyfen, ankret slot-regex + stemplet frist)");
 });
+
+// ── dev-request 2026-07-19-verifier-drain-persistens-og-throughput: the new
+// `persisted` + `status_transitions` observability fields on POST
+// /admin/run-verifier. Own in-memory DB (swaps the shared getDb() singleton)
+// — runs via runSerial() same as tz-parking above.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-07-19-verifier-drain-persistens-og-throughput: drain observability ──");
+  try {
+    const { runAdminRunVerifierDrainObservabilityTests } = require("../src/routes/admin-run-verifier-drain-observability.test") as
+      typeof import("../src/routes/admin-run-verifier-drain-observability.test");
+    const dob = await runAdminRunVerifierDrainObservabilityTests({ log: false });
+    passed += dob.passed;
+    failed += dob.failed;
+    for (const f of dob.failures) failures.push("verifier-drain-observability: " + f);
+    console.log(`  verifier-drain-observability: ${dob.passed} passed, ${dob.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("verifier-drain-observability: unexpected error: " + String(err?.message || err));
+  }
+});

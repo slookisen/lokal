@@ -109,6 +109,21 @@ router.post("/", async (req: Request, res: Response) => {
     // the free-mail exemption effect and track thin-content prevalence.
     const email_domain_mismatch = results.filter((r) => r.flags.includes("email_domain_mismatch")).length;
     const thin_content = results.filter((r) => r.flags.includes("thin_content")).length;
+    // dev-request 2026-07-19-verifier-drain-persistens-og-throughput: this
+    // endpoint's outcomes are ALWAYS written to agent_knowledge (every
+    // candidate goes through applyVerifierOutcome unconditionally — there
+    // is no evaluate-only/dry-run mode today). `persisted` makes that
+    // explicit so a caller never again has to infer it from an unrelated
+    // field. `status_transitions` distinguishes a real status change from
+    // a re-confirmation of the same status (e.g. a review_required agent
+    // whose underlying evidence hasn't changed since the last pass will
+    // correctly persist review_required again — that is NOT a sign the
+    // write failed; `passed` alone (the basic quality-gate result, which
+    // can be true even when a stricter downstream guard still routes the
+    // agent to review_required) cannot tell these two cases apart.
+    const statusTransitions = results.filter(
+      (r) => r.prior_verification_status !== r.new_verification_status
+    ).length;
 
     // Build envelope and record directly via service (no HTTP roundtrip)
     const envelope: any = buildRunEnvelope({
@@ -141,6 +156,8 @@ router.post("/", async (req: Request, res: Response) => {
       email_domain_mismatch,
       thin_content,
       pool_added: pooledNew,
+      status_transitions: statusTransitions,
+      persisted: true,
       envelope_recorded: envelopeRecorded,
       hour_utc: hourUTC,
       forced: !!force,

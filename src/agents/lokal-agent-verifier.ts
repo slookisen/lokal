@@ -66,6 +66,14 @@ export interface VerifierResult {
   // agent display name, carried through so buildRunEnvelope can surface
   // report-only examples as {agent_id, name} without a second DB read.
   agent_name: string | null;
+  // dev-request 2026-07-19-verifier-drain-persistens-og-throughput: the
+  // agent's verification_status BEFORE this run wrote applyVerifierOutcome
+  // (every candidate is written unconditionally — this is not an
+  // evaluate-only path). Lets a caller distinguish "re-confirmed the same
+  // status because nothing about the underlying evidence changed" from a
+  // real transition, which `passed` (basic-gate-pass, independent of the
+  // stricter cross-source/domain-coherence/email-ownership guards) cannot.
+  prior_verification_status: string;
 }
 
 export interface BrregLookupResult {
@@ -1121,6 +1129,7 @@ export async function runVerifierBatch(opts: {
       email_ownership_unproven: emailOwnershipUnproven,
       email_ownership_report_only: emailOwnershipReportOnly,
       agent_name: agent.name ?? null,
+      prior_verification_status: agent.verification_status,
     });
   }
 
