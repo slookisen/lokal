@@ -230,6 +230,13 @@ export function mergeFieldProvenance(
     let arr: unknown[];
     if (Array.isArray(val)) {
       arr = val.slice();
+    } else if (val && typeof val === "object" && Array.isArray((val as { sources?: unknown }).sources)) {
+      // Wrapped shape ({ sources: [...] }) → unwrap to the contained array.
+      // Mirrors extractSources()'s handling of this same shape on the
+      // incoming side. Must be checked BEFORE the bare-object fallback
+      // below, or the whole wrapper gets treated as a single malformed
+      // record and filtered away — silently wiping this field's provenance.
+      arr = (val as { sources: unknown[] }).sources.slice();
     } else if (val && typeof val === "object") {
       // Legacy single-record shape (pre-WO-16) → wrap in array.
       arr = [val];
