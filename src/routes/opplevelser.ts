@@ -90,6 +90,19 @@ import {
   // any fetch, reported in its own additive response bucket.
   gardssalgSharedHostCounts,
   gardssalgContentExclusionReason,
+  // skive B (2026-07-19, komplett-foer-synlig) — website discovery: candidate
+  // generation + ownership evidence + review queue + approved fill-only write.
+  selectGardssalgProvidersForWebsiteDiscovery,
+  getGardssalgWebsiteDiscoveryTarget,
+  gardssalgWebsiteCandidateHosts,
+  gardssalgPageText,
+  gardssalgWebsiteEvidenceMatch,
+  gardssalgSharedDomainReason,
+  upsertGardssalgWebsiteReviewQueue,
+  clearGardssalgWebsiteReviewQueueEntry,
+  listGardssalgWebsiteReviewQueue,
+  stampGardssalgWebsiteDiscoveryAttempt,
+  applyGardssalgProviderWebsite,
   // dev-request 2026-07-04-opplevagent-dedup-og-norske-titler, item 1 —
   // re-harvest guard (never insert/resurrect a duplicate already known/merged)
   findExistingExperienceMatch,
@@ -143,7 +156,7 @@ import { fetchBrregBusinessAddress, BRREG_BASE_URL, BRREG_SEARCH_PATH } from "..
 // harvest row's `website` is never blindly trusted as a provider's OWN
 // homepage on CREATE. See isAggregatorWebsite()/firstNonAggregatorWebsite()
 // below, near the bulk-load handler that consumes them.
-import { isDirectoryOrAggregatorHost } from "../services/cross-source-validator";
+import { isDirectoryOrAggregatorHost, hostFromUrlLike } from "../services/cross-source-validator";
 // dev-request 2026-07-18-gardssalg-profilkvalitet-foer-outreach, slice 5b —
 // Brreg name-search (candidate generator only, see gardssalgOrgnrAutoWriteEligible);
 // verifyOrgNumber (existing, cached) backs the write-bar's liveness veto — an
@@ -1503,6 +1516,288 @@ router.post("/admin/gardssalg-nace-discovery", requireAdmin, async (req: Request
     duplicates,
     dead,
     errors,
+  });
+});
+
+// ─── POST /api/opplevelser/admin/gardssalg-website-discovery (admin) ────────
+//
+// dev-request 2026-07-19-gardssalg-nye-agenter-komplett-foer-synlig, skive B
+// (L4 — Daniels GO gitt ordrett samme dag). Finds candidate websites for
+// gårdssalg providers whose hjemmeside is blank — the enrichment chain is
+// source-based, so without a website a row can never be filled. Per target:
+// deterministic candidate hosts from the provider's own name
+// (gardssalgWebsiteCandidateHosts), pre-fetch identity checks (curated
+// directory/aggregator + visit*-DMO hosts rejected; hosts ALREADY carried by
+// any catalog row rejected — adopting one would create the shared-host
+// situation the 5d guard quarantines), fetch (SSRF-guarded, redirects
+// followed and the FINAL host re-checked), then ownership evidence on the
+// page text: the provider's org_nr, or exact pruned name + kommune/poststed
+// (gardssalgWebsiteEvidenceMatch). First verified candidate wins.
+//
+// Verified candidates are parked in gardssalg_website_review_queue — NEVER
+// written to the row by this route. Adoption goes through the approve lever
+// below. Dry-run by default: dry-run fetches (read-only) but writes NOTHING
+// (no queue rows, no attempt stamps). Apply mode stamps
+// website_discovery_attempted_at on every processed target (anti-starvation)
+// and upserts the queue. Selection includes catalog_hidden rows by design —
+// the komplett-foer-synlig plan runs this on hidden batches.
+const GS_WD_DEFAULT_LIMIT = 16;
+const GS_WD_HARD_CAP = 48;
+
+async function wdFetchPage(url: string): Promise<{ html: string; finalUrl: string } | null> {
+  if (!isSafeFetchUrl(url)) return null;
+  const fetchUrl = /^https?:\/\//i.test(url) ? url : `https://${url}`;
+  try {
+    const resp = await fetch(fetchUrl, {
+      redirect: "follow",
+      headers: { "User-Agent": CR_UA, Accept: "text/html,application/xhtml+xml" },
+      signal: AbortSignal.timeout(CR_FETCH_TIMEOUT_MS),
+    });
+    if (!resp.ok) return null;
+    const html = await resp.text();
+    return { html, finalUrl: resp.url || fetchUrl };
+  } catch {
+    return null;
+  }
+}
+
+router.post("/admin/gardssalg-website-discovery", requireAdmin, async (req: Request, res: Response) => {
+  const body = (req.body ?? {}) as { providerIds?: unknown; limit?: unknown; apply?: unknown };
+  const apply =
+    body.apply === true ||
+    body.apply === 1 ||
+    body.apply === "1" ||
+    body.apply === "true" ||
+    req.query?.apply === "1" ||
+    req.query?.apply === "true";
+  const dryRun = !apply;
+  const batchTag = `website-discovery-${new Date().toISOString().replace(/[-:]/g, "").replace("T", "-").slice(0, 15)}`;
+
+  const skippedLocked: Array<{ provider_id: string; navn: string }> = [];
+  const alreadyHasWebsite: Array<{ provider_id: string; navn: string }> = [];
+  const notFound: string[] = [];
+  let targets: Array<{ id: string; navn: string; org_nr: string | null; kommune: string | null; poststed: string | null; content_source: string | null }> = [];
+
+  if (Array.isArray(body.providerIds) && body.providerIds.length > 0) {
+    const ids = (body.providerIds as unknown[]).filter((v): v is string => typeof v === "string" && v.trim() !== "").map((v) => v.trim());
+    if (ids.length > GS_WD_HARD_CAP) {
+      res.status(400).json({ error: `Too many providerIds (max ${GS_WD_HARD_CAP} per call)` });
+      return;
+    }
+    for (const id of ids) {
+      const t = getGardssalgWebsiteDiscoveryTarget(id);
+      if (!t) {
+        notFound.push(id);
+      } else if (t.content_source === "manual" || t.content_source === "claim") {
+        skippedLocked.push({ provider_id: t.id, navn: t.navn });
+      } else if (t.hjemmeside && t.hjemmeside.trim() !== "") {
+        alreadyHasWebsite.push({ provider_id: t.id, navn: t.navn });
+      } else {
+        targets.push(t);
+      }
+    }
+  } else {
+    const limit =
+      typeof body.limit === "number" && body.limit > 0
+        ? Math.min(Math.floor(body.limit), GS_WD_HARD_CAP)
+        : GS_WD_DEFAULT_LIMIT;
+    targets = selectGardssalgProvidersForWebsiteDiscovery(limit);
+  }
+
+  const hostCounts = gardssalgSharedHostCounts();
+  const proposed: Array<{
+    provider_id: string;
+    navn: string;
+    candidate_url: string;
+    final_url: string;
+    evidence: { org_nr_found: boolean; name_found: boolean; place_found: boolean; verified: boolean };
+    confidence: number;
+  }> = [];
+  const noCandidateVerified: Array<{ provider_id: string; navn: string; tried: string[] }> = [];
+  const excluded: Array<{ provider_id: string; navn: string; hosts: Array<{ host: string; reason: string }> }> = [];
+  const processedIds: string[] = [];
+
+  for (const t of targets) {
+    processedIds.push(t.id);
+    const candidates = gardssalgWebsiteCandidateHosts(t.navn);
+    const tried: string[] = [];
+    const excludedHere: Array<{ host: string; reason: string }> = [];
+    let hit: { host: string; finalUrl: string; evidence: ReturnType<typeof gardssalgWebsiteEvidenceMatch> } | null = null;
+
+    for (const host of candidates) {
+      const listed = gardssalgSharedDomainReason(host);
+      if (listed) {
+        excludedHere.push({ host, reason: listed });
+        continue;
+      }
+      if ((hostCounts.get(host) || 0) >= 1) {
+        excludedHere.push({ host, reason: "host_already_in_catalog" });
+        continue;
+      }
+      tried.push(host);
+      const page = await wdFetchPage(`https://${host}`);
+      if (!page) continue;
+      const finalHost = hostFromUrlLike(page.finalUrl) || host;
+      if (finalHost !== host) {
+        const listedFinal = gardssalgSharedDomainReason(finalHost);
+        if (listedFinal) {
+          excludedHere.push({ host: finalHost, reason: listedFinal });
+          continue;
+        }
+        if ((hostCounts.get(finalHost) || 0) >= 1) {
+          excludedHere.push({ host: finalHost, reason: "host_already_in_catalog" });
+          continue;
+        }
+      }
+      const ev = gardssalgWebsiteEvidenceMatch(gardssalgPageText(page.html), {
+        orgNr: t.org_nr,
+        navn: t.navn,
+        kommune: t.kommune,
+        poststed: t.poststed,
+      });
+      if (ev.verified) {
+        hit = { host, finalUrl: page.finalUrl, evidence: ev };
+        break;
+      }
+    }
+
+    if (excludedHere.length > 0) excluded.push({ provider_id: t.id, navn: t.navn, hosts: excludedHere });
+    if (hit) {
+      let finalOrigin: string;
+      try {
+        const u = new URL(hit.finalUrl);
+        finalOrigin = `${u.protocol}//${u.host.toLowerCase()}`;
+      } catch {
+        finalOrigin = `https://${hit.host}`;
+      }
+      const confidence = hit.evidence.org_nr_found ? 1.0 : 0.9;
+      proposed.push({
+        provider_id: t.id,
+        navn: t.navn,
+        candidate_url: finalOrigin,
+        final_url: hit.finalUrl,
+        evidence: hit.evidence,
+        confidence,
+      });
+      if (!dryRun) {
+        try {
+          upsertGardssalgWebsiteReviewQueue({
+            provider_id: t.id,
+            provider_name: t.navn,
+            candidate_url: finalOrigin,
+            final_url: hit.finalUrl,
+            evidence: JSON.stringify(hit.evidence),
+            confidence,
+            reason: "website_discovery_candidate",
+            batch_id: batchTag,
+          });
+        } catch {
+          /* queue is best-effort; the run itself must not fail on it */
+        }
+      }
+    } else {
+      noCandidateVerified.push({ provider_id: t.id, navn: t.navn, tried });
+    }
+  }
+
+  if (!dryRun && processedIds.length > 0) stampGardssalgWebsiteDiscoveryAttempt(processedIds);
+
+  res.json({
+    dry_run: dryRun,
+    batch_tag: batchTag,
+    scanned: targets.length,
+    proposed_count: proposed.length,
+    proposed,
+    no_candidate_verified: noCandidateVerified,
+    excluded,
+    skipped_locked: skippedLocked,
+    already_has_website: alreadyHasWebsite,
+    not_found: notFound,
+    queue_size: listGardssalgWebsiteReviewQueue().length,
+  });
+});
+
+// ─── POST /api/opplevelser/admin/gardssalg-website-review-approve (admin) ───
+//
+// The adoption lever for website-discovery candidates — same strict
+// confirmation-surface contract as the org_nr approve lever: ONLY the queued
+// (provider_id, candidate_url) pair can be approved; a different URL is
+// rejected (mismatch_with_queued_candidate), a non-queued provider is
+// rejected. Writes go through applyGardssalgProviderWebsite (fill-only, lock
+// guard, shared-host identity re-check, audit + provenance), and the queue
+// entry is cleared on a confirmed write. Never an arbitrary-write surface.
+router.post("/admin/gardssalg-website-review-approve", requireAdmin, (req: Request, res: Response) => {
+  const body = (req.body ?? {}) as { approvals?: unknown; apply?: unknown };
+  const apply =
+    body.apply === true ||
+    body.apply === 1 ||
+    body.apply === "1" ||
+    body.apply === "true" ||
+    req.query?.apply === "1" ||
+    req.query?.apply === "true";
+  const dryRun = !apply;
+
+  if (!Array.isArray(body.approvals) || body.approvals.length === 0) {
+    res.status(400).json({ error: "Body must contain a non-empty 'approvals' array of {provider_id, url}" });
+    return;
+  }
+  if (body.approvals.length > 200) {
+    res.status(400).json({ error: "Too many approvals (max 200 per call)" });
+    return;
+  }
+
+  const queue = listGardssalgWebsiteReviewQueue();
+  const byProvider = new Map(queue.map((q) => [q.provider_id, q]));
+  const seen = new Set<string>();
+  const approved: Array<{ provider_id: string; url: string }> = [];
+  const written: Array<{ provider_id: string; url: string }> = [];
+  const rejected: Array<{ provider_id: string; reason: string }> = [];
+
+  for (const raw of body.approvals as unknown[]) {
+    const a = raw as { provider_id?: unknown; url?: unknown };
+    const pid = typeof a?.provider_id === "string" ? a.provider_id.trim() : "";
+    const url = typeof a?.url === "string" ? a.url.trim() : "";
+    if (!pid || !url) {
+      rejected.push({ provider_id: pid || "(missing)", reason: "invalid_item" });
+      continue;
+    }
+    if (seen.has(pid)) {
+      rejected.push({ provider_id: pid, reason: "duplicate_in_request" });
+      continue;
+    }
+    seen.add(pid);
+    const q = byProvider.get(pid);
+    if (!q) {
+      rejected.push({ provider_id: pid, reason: "not_in_review_queue" });
+      continue;
+    }
+    if (q.candidate_url !== url) {
+      rejected.push({ provider_id: pid, reason: "mismatch_with_queued_candidate" });
+      continue;
+    }
+    approved.push({ provider_id: pid, url });
+    if (!dryRun) {
+      try {
+        const w = applyGardssalgProviderWebsite(pid, q.candidate_url, q.final_url || q.candidate_url, q.batch_id ?? undefined);
+        if (w.length > 0) {
+          written.push({ provider_id: pid, url: q.candidate_url });
+          clearGardssalgWebsiteReviewQueueEntry(pid);
+        } else {
+          rejected.push({ provider_id: pid, reason: "write_skipped_by_guards" });
+        }
+      } catch (err: any) {
+        rejected.push({ provider_id: pid, reason: `write_failed: ${err?.message ?? String(err)}` });
+      }
+    }
+  }
+
+  res.json({
+    dry_run: dryRun,
+    approved_count: approved.length,
+    approved,
+    written_count: written.length,
+    written,
+    rejected,
   });
 });
 

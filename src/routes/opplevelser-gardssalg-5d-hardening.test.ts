@@ -154,7 +154,16 @@ export function runOpplevelserGardssalg5dHardeningTests(
       P({ id: "p5-visit", navn: "Visit Gard", hjemmeside: "https://visitfjordbygda.no/gard-y" });
       P({ id: "p5-shared-a", navn: "Delt A", hjemmeside: "https://sharedgard.example.no/a" });
       P({ id: "p5-shared-b", navn: "Delt B", hjemmeside: "https://www.sharedgard.example.no/b" });
-      P({ id: "p5-hiddenshare", navn: "Skjult Deler", hjemmeside: "https://aleine.example.no/x", catalog_hidden: 1 });
+      // komplett-foer-synlig (2026-07-19): hidden REAL rows now DO count in
+      // gardssalgSharedHostCounts (the contamination guard must see hidden
+      // discovery batches under enrichment) — the co-host that must NOT
+      // poison p5-alone's count is the booking-flyt TEST provider, excluded
+      // by its stable producer_type marker. Fixture matches that shape.
+      expDb.prepare(
+        `INSERT INTO experience_providers
+           (id, navn, vertical, hjemmeside, catalog_hidden, products, producer_type, enrichment_state, verification_status, source, confidence)
+         VALUES ('p5-hiddenshare', 'Test Deler', 'experiences', 'https://aleine.example.no/x', 1, '["x"]', 'test-gardssalg', 'raw', 'pending_verify', 'test-fixture', 'medium')`
+      ).run();
       P({ id: "p5-alone", navn: "Aleine Gard", hjemmeside: "https://aleine.example.no/side/gard" });
       // 5b hardening fixtures
       P({ id: "p5-tie", navn: "Solbakken Gard", postnummer: "1111", poststed: "Solbygd" });
@@ -173,12 +182,15 @@ export function runOpplevelserGardssalg5dHardeningTests(
       assertEq(expStore.gardssalgOrgnrWasRolledBack("p5-tie"), false,
         "5h-a11: providers without rollback history are not flagged");
 
-      // Shared-host counts: hidden rows must not count (M4).
+      // Shared-host counts: the TEST provider must not count (komplett-foer-
+      // synlig revision of M4 — hidden real rows DO count now; the wd-7
+      // block in opplevelser-gardssalg-website-discovery.test.ts pins the
+      // hidden-row-counts side).
       {
         const counts = expStore.gardssalgSharedHostCounts();
         assertEq(counts.get("sharedgard.example.no"), 2, "5h-a12: www-folded shared host counted across both rows");
         assertEq(counts.get("aleine.example.no"), 1,
-          "5h-a13: catalog_hidden row does NOT count toward shared-host exclusion (M4)");
+          "5h-a13: test-provider co-host does NOT count toward shared-host exclusion (marker-based, not hidden-based)");
       }
 
       // ═══ Section B — content-refresh: exclusion + B2 stamp + crawl base ══
@@ -208,7 +220,7 @@ export function runOpplevelserGardssalg5dHardeningTests(
         assertEq(byId["p5-visit"], "dmo_visit_domain", "5h-b3: visit* DMO excluded");
         assertEq(byId["p5-shared-a"], "shared_host_multiple_providers", "5h-b4: shared host A excluded");
         assertEq(byId["p5-shared-b"], "shared_host_multiple_providers", "5h-b5: shared host B excluded (www variant folded)");
-        assertTrue(!("p5-alone" in byId), "5h-b6: single-owner domain NOT excluded (hidden co-host doesn't count)");
+        assertTrue(!("p5-alone" in byId), "5h-b6: single-owner domain NOT excluded (test-provider co-host doesn't count)");
         assertTrue(!fetchedPageUrls.some((u) => /hanen\.no|visitfjordbygda|sharedgard/.test(u)),
           "5h-b7: excluded providers never touched the network");
         // B2: excluded rows are attempt-stamped in apply mode → they cycle

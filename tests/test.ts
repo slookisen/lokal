@@ -26986,6 +26986,20 @@ Promise.allSettled(_oaHomeCountersDeps).then(async () => {
     for (const f of gpv.failures) failures.push("opplevelser-gardssalg-provider-visibility: " + f);
     console.log(`  opplevelser-gardssalg-provider-visibility: ${gpv.passed} passed, ${gpv.failed} failed`);
 
+    // dev-request 2026-07-19-gardssalg-nye-agenter-komplett-foer-synlig,
+    // skive B: POST /admin/gardssalg-website-discovery (deterministiske
+    // domenekandidater + eierskaps-evidens + review-kø, aldri direkte skriv)
+    // + approve-spaken + delt-host-teller-fixen (skjulte rader telles).
+    // Same in-memory-DB pattern, runs sequentially inside this gated block.
+    console.log("\n── opplevelser-gardssalg-website-discovery: skive B nettside-funn ──");
+    const { runOpplevelserGardssalgWebsiteDiscoveryTests } = require("../src/routes/opplevelser-gardssalg-website-discovery.test") as
+      typeof import("../src/routes/opplevelser-gardssalg-website-discovery.test");
+    const gwd = await runOpplevelserGardssalgWebsiteDiscoveryTests(false);
+    passed += gwd.passed;
+    failed += gwd.failed;
+    for (const f of gwd.failures) failures.push("opplevelser-gardssalg-website-discovery: " + f);
+    console.log(`  opplevelser-gardssalg-website-discovery: ${gwd.passed} passed, ${gwd.failed} failed`);
+
     // dev-request 2026-07-18-gardssalg-profilkvalitet-foer-outreach, slice 3:
     // Brreg street-address backfill — selectGardssalgProvidersForAddressEnrichment()/
     // getGardssalgProviderAddressTarget()/applyGardssalgProviderAddress()
