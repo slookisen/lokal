@@ -26652,6 +26652,27 @@ Promise.allSettled(_oaHomeCountersDeps).then(async () => {
     for (const f of gcar.failures) failures.push("opplevelser-gardssalg-content-audit: " + f);
     console.log(`  opplevelser-gardssalg-content-audit: ${gcar.passed} passed, ${gcar.failed} failed`);
 
+    // dev-request 2026-07-18-gardssalg-profilkvalitet-foer-outreach, slice 5a:
+    // source-grounded LLM REWRITE of about_text/visit_text for the
+    // "passing-bar-but-short" cohort (current value already non-blank and
+    // already passes meetsAboutQualityBar, so gardssalgReplaceableFieldAction
+    // refuses to ever touch it, but is still <200 chars) —
+    // generateGardssalgAboutRewrite() (routes/opplevelser.ts, mirrors
+    // generateTitleNo's never-fabricate contract) + gardssalgRewriteEligible()
+    // (services/experience-store.ts) wired into POST /admin/gardssalg-
+    // content-refresh's processOne(), writing through the SAME
+    // applyGardssalgProviderContent() audit/provenance/lock-guard machinery.
+    // Same in-memory-DB pattern, runs sequentially inside this same gated
+    // block for the same reason.
+    console.log("\n── opplevelser-gardssalg-rewrite: slice 5a passing-bar-but-short LLM rewrite ──");
+    const { runOpplevelserGardssalgRewriteTests } = require("../src/routes/opplevelser-gardssalg-rewrite.test") as
+      typeof import("../src/routes/opplevelser-gardssalg-rewrite.test");
+    const grwr = await runOpplevelserGardssalgRewriteTests({ log: false });
+    passed += grwr.passed;
+    failed += grwr.failed;
+    for (const f of grwr.failures) failures.push("opplevelser-gardssalg-rewrite: " + f);
+    console.log(`  opplevelser-gardssalg-rewrite: ${grwr.passed} passed, ${grwr.failed} failed`);
+
     // dev-request 2026-07-18-gardssalg-profilkvalitet-foer-outreach, slice 3:
     // Brreg street-address backfill — selectGardssalgProvidersForAddressEnrichment()/
     // getGardssalgProviderAddressTarget()/applyGardssalgProviderAddress()

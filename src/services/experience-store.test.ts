@@ -17,7 +17,7 @@
  *      and folds its pass/fail counts into the `npm test` summary.
  */
 
-import { formatDistanceLabel } from "./experience-store";
+import { formatDistanceLabel, gardssalgRewriteEligible } from "./experience-store";
 
 export interface TestSummary {
   passed: number;
@@ -43,6 +43,17 @@ export function runExperienceStoreTests(opts: { log?: boolean } = {}): TestSumma
     }
   }
 
+  function assertTrue(cond: boolean, label: string): void {
+    if (cond) {
+      passed++;
+      if (log) console.log(`  ok ${label}`);
+    } else {
+      failed++;
+      failures.push(`✗ ${label}`);
+      if (log) console.log(`  ✗ ${label}`);
+    }
+  }
+
   // ── formatDistanceLabel: address precision → exact "X,X km unna" ────────
   assertEq(formatDistanceLabel(2.4, "address", "Tromsø"), "2,4 km unna", "address precision: 2.4km → '2,4 km unna'");
   assertEq(formatDistanceLabel(0, "address", "Tromsø"), "0,0 km unna", "address precision: 0km → '0,0 km unna'");
@@ -60,6 +71,27 @@ export function runExperienceStoreTests(opts: { log?: boolean } = {}): TestSumma
   assertEq(formatDistanceLabel(2.4, null, "Oslo"), null, "distance present but no geo_precision flag → null (don't guess)");
   assertEq(formatDistanceLabel(undefined, undefined, undefined), null, "all undefined → null");
   assertEq(formatDistanceLabel(NaN, "address", "Oslo"), null, "address precision but non-finite distance → null, not 'NaN km unna'");
+
+  // ── gardssalgRewriteEligible (dev-request 2026-07-18-gardssalg-
+  //    profilkvalitet-foer-outreach, slice 5a) — the "passing-bar-but-short"
+  //    cohort gardssalgReplaceableFieldAction() never touches. ──────────────
+  const PASSING_BAR_SHORT_86 =
+    "Familiedrevet gård på Toten som dyrker grønnsaker og bær, og selger dem i egen butikk.";
+  const SUB_80_63 = "Liten gård med noen dyr og en pen have full av epletrær og bær.";
+  const PASSING_BAR_LONG_215 =
+    "Familiedrevet gård på Toten som dyrker økologiske grønnsaker og bær, og selger dem direkte fra gårdsbutikken. Vi holder også sauer og høns, og inviterer besøkende til å oppleve gårdslivet på nært hold hele sommeren.";
+
+  assertTrue(PASSING_BAR_SHORT_86.length >= 80 && PASSING_BAR_SHORT_86.length < 200, "sanity: PASSING_BAR_SHORT_86 is in the [80,200) window");
+  assertTrue(SUB_80_63.length < 80, "sanity: SUB_80_63 is under the 80-char quality bar");
+  assertTrue(PASSING_BAR_LONG_215.length >= 200, "sanity: PASSING_BAR_LONG_215 is >= 200 chars");
+
+  assertEq(gardssalgRewriteEligible(PASSING_BAR_SHORT_86), true, "gardssalgRewriteEligible: 86-char value passing the quality bar and <200 chars → true");
+  assertEq(gardssalgRewriteEligible(SUB_80_63), false, "gardssalgRewriteEligible: 63-char value (fails the 80-char quality bar) → false");
+  assertEq(gardssalgRewriteEligible(PASSING_BAR_LONG_215), false, "gardssalgRewriteEligible: 215-char value (passes bar but already >=200 chars) → false, not a rewrite candidate");
+  assertEq(gardssalgRewriteEligible(""), false, "gardssalgRewriteEligible: blank string → false");
+  assertEq(gardssalgRewriteEligible("   "), false, "gardssalgRewriteEligible: whitespace-only string → false");
+  assertEq(gardssalgRewriteEligible(null), false, "gardssalgRewriteEligible: null → false");
+  assertEq(gardssalgRewriteEligible(undefined), false, "gardssalgRewriteEligible: undefined → false");
 
   return { passed, failed, failures };
 }
