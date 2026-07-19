@@ -28601,6 +28601,20 @@ const _recentlyEnrichedSpotcheckPromise: Promise<void> = new Promise<void>(r => 
     failures.push("dental-agents-recently-enriched: unexpected error: " + String(err?.message || err));
   }
 
+  console.log("\n── orch-pr-20260719-dental-field-provenance: PUT /api/tannlege/agents/:id merges field_provenance ──");
+  try {
+    const { runDentalAgentPutFieldProvenanceTests } = require("../src/routes/dental-agent-put-field-provenance.test") as
+      typeof import("../src/routes/dental-agent-put-field-provenance.test");
+    const dfp = await runDentalAgentPutFieldProvenanceTests({ log: false });
+    passed += dfp.passed;
+    failed += dfp.failed;
+    for (const f of dfp.failures) failures.push("dental-agent-put-field-provenance: " + f);
+    console.log(`  dental-agent-put-field-provenance: ${dfp.passed} passed, ${dfp.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("dental-agent-put-field-provenance: unexpected error: " + String(err?.message || err));
+  }
+
   console.log("\n── dev-request 2026-07-18-dental-hjemmeside-directory-portal-cleanup: classifier (pure) ──");
   try {
     const { runDentalHjemmesideClassifierTests } = require("../src/services/dental-hjemmeside-classifier.test") as
