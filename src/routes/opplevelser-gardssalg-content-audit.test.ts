@@ -55,6 +55,19 @@
  *       matching exactly what applyGardssalgProviderContent() does — mocks
  *       globalThis.fetch (no network access in the sandbox) to drive the
  *       route's real extraction pipeline end-to-end
+ *   (l) slice 5a: gardssalgRewriteEligible() (pure eligibility for the
+ *       "passes the quality bar but still <200 chars" cohort (j) never
+ *       touches), applyGardssalgProviderContent()'s additive rewriteFields
+ *       param (writes only when the writer itself re-derives eligibility,
+ *       never trusting the caller's set blindly; lock guard still applies),
+ *       and the full POST /admin/gardssalg-content-refresh rewrite
+ *       integration end-to-end via generateGardssalgAboutRewrite — mocks
+ *       globalThis.fetch, branching on hostname between the provider's own
+ *       homepage and https://api.anthropic.com, covering: a successful
+ *       rewrite (dry-run preview + apply write + audit/provenance), the
+ *       model's INGEN_UTVIDELSE_MULIG sentinel, an out-of-range-length
+ *       candidate, a missing ANTHROPIC_API_KEY, and a locked provider —
+ *       each proven never to call the Anthropic API when it shouldn't
  */
 
 export interface TestSummary {
@@ -659,6 +672,274 @@ export function runOpplevelserGardssalgContentAuditTests(
         assertEq(auditThinAbout.new_value, GCR_GOOD_ABOUT_K, "k22: audit new_value is the crawled replacement");
       } finally {
         globalThis.fetch = prevFetchK;
+      }
+
+      // ── (l) SLICE 5a (dev-request 2026-07-18-gardssalg-profilkvalitet-
+      //       foer-outreach): source-grounded rewrite of about_text/visit_text
+      //       for the cohort (j)'s replace-thin path deliberately never
+      //       touches — non-blank, ALREADY passes meetsAboutQualityBar
+      //       (>=80 chars), but still genuinely thin (<200 chars). Covers:
+      //       gardssalgRewriteEligible (pure), applyGardssalgProviderContent's
+      //       additive rewriteFields param (store-level), and the full
+      //       POST /admin/gardssalg-content-refresh rewrite integration
+      //       (mocked globalThis.fetch, branching on hostname between the
+      //       provider's own homepage and https://api.anthropic.com). ──────
+      {
+        // Distinct (non-repeating) sentences — meetsAboutQualityBar's
+        // hasVerbatimRepeatedPhrase check rejects any text containing a
+        // ≥24-char chunk repeated verbatim, so a repeated-unit builder
+        // would silently fail the quality bar it's meant to pass.
+        const TOO_SHORT_L = "Liten gård med noen dyr og en enkel gårdsbutikk."; // 48 chars, <80 -> fails quality bar
+        const PASSING_BUT_THIN_L = // 106 chars, >=80 (passes bar), <200 -> eligible
+          "Gården vår ligger vakkert til i dalen med utsikt over fjorden. Vi dyrker poteter og grønnsaker på friland.";
+        const ALREADY_LONG_L = // 208 chars, >=200 -> not eligible (even though it passes the bar)
+          "Gården vår ligger vakkert til i dalen med utsikt over fjorden og fjellene rundt. Vi dyrker poteter, gulrøtter og andre grønnsaker på friland gjennom hele sommeren, og selger dem direkte fra gårdsbutikken vår.";
+        const REWRITTEN_L = // 308 chars, valid 200-500 char rewrite candidate
+          "Gården vår ligger vakkert til i dalen med utsikt over fjorden og fjellene rundt. Vi dyrker poteter, gulrøtter og andre grønnsaker på friland gjennom hele sommeren, og selger dem direkte fra gårdsbutikken vår som holder åpent i hele sesongen. Besøkende er hjertelig velkomne til å se hvordan vi driver garden.";
+
+        // (l1-l4) gardssalgRewriteEligible — pure eligibility function.
+        assertTrue(!store.gardssalgRewriteEligible(null), "l1: null currentValue -> not eligible");
+        assertTrue(!store.gardssalgRewriteEligible(""), "l2: blank currentValue -> not eligible");
+        assertTrue(!store.gardssalgRewriteEligible(TOO_SHORT_L), "l3: <80-char (fails quality bar) -> not eligible");
+        assertTrue(store.gardssalgRewriteEligible(PASSING_BUT_THIN_L), "l4a: >=80 and <200 chars -> eligible");
+        assertTrue(!store.gardssalgRewriteEligible(ALREADY_LONG_L), "l4b: >=200 chars -> not eligible, even though it passes the quality bar");
+
+        // (l5-l10) applyGardssalgProviderContent's rewriteFields param —
+        // store-level mechanics, no HTTP/network involved.
+        insertProvider.run({
+          id: "prov-l-rewrite", navn: "Prov L Rewrite Gard", hjemmeside: "https://prov-l-rewrite.example.no",
+          content_source: null, about_text: PASSING_BUT_THIN_L, visit_text: null, opening_hours_text: null,
+        });
+        insertProvider.run({
+          id: "prov-l-already-long", navn: "Prov L Already Long Gard", hjemmeside: "https://prov-l-already-long.example.no",
+          content_source: null, about_text: ALREADY_LONG_L, visit_text: null, opening_hours_text: null,
+        });
+        insertProvider.run({
+          id: "prov-l-manual", navn: "Prov L Manual Gard", hjemmeside: "https://prov-l-manual.example.no",
+          content_source: "manual", about_text: PASSING_BUT_THIN_L, visit_text: null, opening_hours_text: null,
+        });
+
+        // l5: WITHOUT rewriteFields, gardssalgReplaceableFieldAction alone
+        // refuses (current value already passes the quality bar) — the
+        // existing fill/replace path must stay byte-unchanged.
+        const writtenL5 = store.applyGardssalgProviderContent(
+          "prov-l-rewrite",
+          { about_text: REWRITTEN_L },
+          "https://prov-l-rewrite.example.no/om-oss",
+        );
+        assertEq(writtenL5, [], "l5: no rewriteFields -> passing-but-thin content is still never churned (regression)");
+        assertEq(getProviderRow("prov-l-rewrite").about_text, PASSING_BUT_THIN_L, "l5b: about_text unchanged without rewriteFields");
+
+        // l6: WITH rewriteFields naming about_text, AND the row is eligible
+        // -> writes, produces an audit row (old_value = the real prior
+        // passing-but-thin text) + field_provenance entry, same as any other
+        // applyGardssalgProviderContent write.
+        const writtenL6 = store.applyGardssalgProviderContent(
+          "prov-l-rewrite",
+          { about_text: REWRITTEN_L },
+          "https://prov-l-rewrite.example.no/om-oss",
+          "batch-l",
+          new Set(["about_text"]),
+        );
+        assertEq(writtenL6, ["about_text"], "l6: rewriteFields + eligible row -> about_text is written");
+        const rowL6 = getProviderRow("prov-l-rewrite");
+        assertEq(rowL6.about_text, REWRITTEN_L, "l6b: about_text now holds the rewritten candidate");
+        const auditL6 = getAuditRows("prov-l-rewrite").find((r: any) => r.field_name === "about_text");
+        assertTrue(!!auditL6, "l6c: a rewrite still produces an about_text audit row");
+        assertEq(auditL6.old_value, PASSING_BUT_THIN_L, "l6d: audit old_value is the real prior passing-but-thin text");
+        assertEq(auditL6.new_value, REWRITTEN_L, "l6e: audit new_value is the rewritten candidate");
+        assertEq(auditL6.batch_id, "batch-l", "l6f: audit batch_id matches the batchId param");
+        const provenanceL6 = JSON.parse(rowL6.field_provenance);
+        assertTrue(!!provenanceL6.about_text, "l6g: field_provenance updated for the rewritten field");
+
+        // l7: a second run is idempotent — about_text is now >=200 chars, so
+        // it drops out of the eligible set on its own (no extra state/flag).
+        const writtenL7 = store.applyGardssalgProviderContent(
+          "prov-l-rewrite",
+          { about_text: REWRITTEN_L + " enda mer tekst" },
+          "https://prov-l-rewrite.example.no/om-oss",
+          undefined,
+          new Set(["about_text"]),
+        );
+        assertEq(writtenL7, [], "l7: a second rewrite pass is a no-op — the field is no longer rewrite-eligible once >=200 chars");
+
+        // l8: rewriteFields naming a field that is NOT actually eligible
+        // (already >=200 chars) never force-writes it — the writer re-derives
+        // eligibility itself, it does not trust the caller's set blindly.
+        const writtenL8 = store.applyGardssalgProviderContent(
+          "prov-l-already-long",
+          { about_text: REWRITTEN_L },
+          "https://prov-l-already-long.example.no/om-oss",
+          undefined,
+          new Set(["about_text"]),
+        );
+        assertEq(writtenL8, [], "l8: rewriteFields cannot force-write a field the writer itself re-derives as ineligible");
+        assertEq(getProviderRow("prov-l-already-long").about_text, ALREADY_LONG_L, "l8b: already-long about_text is unchanged");
+
+        // l9: manual-locked provider — the lock guard supersedes the rewrite
+        // path exactly like every other write path (regression).
+        const writtenL9 = store.applyGardssalgProviderContent(
+          "prov-l-manual",
+          { about_text: REWRITTEN_L },
+          "https://prov-l-manual.example.no/om-oss",
+          undefined,
+          new Set(["about_text"]),
+        );
+        assertEq(writtenL9, [], "l9: manual-locked provider is never touched, even with rewriteFields set");
+        assertEq(getAuditRows("prov-l-manual").length, 0, "l9b: no audit row for the locked provider");
+
+        // (l10+) Full route integration: POST /admin/gardssalg-content-refresh
+        // actually invoking the LLM rewrite path end-to-end. Mocks
+        // globalThis.fetch, branching on hostname between the provider's own
+        // homepage (always succeeds, generic content — irrelevant to the
+        // outcome since about_text already passes the quality bar regardless
+        // of what's extracted) and https://api.anthropic.com (the rewrite
+        // call itself).
+        const prevFetchL = globalThis.fetch;
+        const prevAnthropicKeyL = process.env.ANTHROPIC_API_KEY;
+        try {
+          const genericHtml = `<html><head><meta property="og:description" content="Gårdsbutikk med lokale varer."></head><body><p>Velkommen til gårdsbutikken vår, åpen hele sommeren.</p></body></html>`;
+
+          insertProvider.run({
+            id: "prov-l-route-ok", navn: "Prov L Route OK Gard", hjemmeside: "https://prov-l-route-ok.example.no",
+            content_source: null, about_text: PASSING_BUT_THIN_L, visit_text: ALREADY_LONG_L, opening_hours_text: null,
+          });
+          insertProvider.run({
+            id: "prov-l-route-sentinel", navn: "Prov L Route Sentinel Gard", hjemmeside: "https://prov-l-route-sentinel.example.no",
+            content_source: null, about_text: PASSING_BUT_THIN_L, visit_text: ALREADY_LONG_L, opening_hours_text: null,
+          });
+          insertProvider.run({
+            id: "prov-l-route-badlen", navn: "Prov L Route Badlen Gard", hjemmeside: "https://prov-l-route-badlen.example.no",
+            content_source: null, about_text: PASSING_BUT_THIN_L, visit_text: ALREADY_LONG_L, opening_hours_text: null,
+          });
+          insertProvider.run({
+            id: "prov-l-route-nokey", navn: "Prov L Route Nokey Gard", hjemmeside: "https://prov-l-route-nokey.example.no",
+            content_source: null, about_text: PASSING_BUT_THIN_L, visit_text: ALREADY_LONG_L, opening_hours_text: null,
+          });
+          insertProvider.run({
+            id: "prov-l-route-locked", navn: "Prov L Route Locked Gard", hjemmeside: "https://prov-l-route-locked.example.no",
+            content_source: "manual", about_text: PASSING_BUT_THIN_L, visit_text: null, opening_hours_text: null,
+          });
+
+          let anthropicCallsL = 0;
+          function makeFetchL(anthropicResponder: (prompt: string) => { ok: boolean; status: number; json: () => Promise<any> }) {
+            return (async (url: string | URL | Request, init?: any) => {
+              const u = new URL(String(url));
+              if (u.hostname === "api.anthropic.com") {
+                anthropicCallsL++;
+                const body = JSON.parse(String(init?.body ?? "{}"));
+                const prompt = body?.messages?.[0]?.content ?? "";
+                return anthropicResponder(prompt) as unknown as Response;
+              }
+              return { ok: true, status: 200, text: async () => genericHtml } as unknown as Response;
+            }) as typeof fetch;
+          }
+
+          // l10: successful rewrite, end-to-end — dry-run previews it,
+          // apply actually writes it through the existing audit/provenance
+          // path (zero new write mechanism).
+          process.env.ANTHROPIC_API_KEY = "test-anthropic-key";
+          anthropicCallsL = 0;
+          globalThis.fetch = makeFetchL(() => ({
+            ok: true, status: 200, json: async () => ({ content: [{ type: "text", text: REWRITTEN_L }] }),
+          }));
+          const dryL10 = await callRoute(opplevelserRouter, {
+            url: "/admin/gardssalg-content-refresh",
+            headers: { "x-admin-key": testKey },
+            body: { providerIds: ["prov-l-route-ok"], apply: false },
+          });
+          assertEq(dryL10.status, 200, "l10a: dry-run -> 200");
+          const dryEntryL10 = dryL10.body.changed.find((c: any) => c.provider_id === "prov-l-route-ok");
+          assertTrue(!!dryEntryL10, "l10b: prov-l-route-ok appears in dry-run changed[]");
+          assertEq(dryEntryL10.actions.about_text, "rewritten", "l10c: dry-run projects about_text as 'rewritten'");
+          assertEq(getProviderRow("prov-l-route-ok").about_text, PASSING_BUT_THIN_L, "l10d: dry-run performed ZERO writes");
+
+          const applyL10 = await callRoute(opplevelserRouter, {
+            url: "/admin/gardssalg-content-refresh",
+            headers: { "x-admin-key": testKey },
+            body: { providerIds: ["prov-l-route-ok"], apply: true },
+          });
+          assertEq(applyL10.status, 200, "l10e: apply -> 200");
+          const applyEntryL10 = applyL10.body.changed.find((c: any) => c.provider_id === "prov-l-route-ok");
+          assertTrue(!!applyEntryL10, "l10f: prov-l-route-ok appears in apply changed[]");
+          assertEq(applyEntryL10.actions.about_text, "rewritten", "l10g: apply response tags about_text 'rewritten'");
+          assertEq(getProviderRow("prov-l-route-ok").about_text, REWRITTEN_L, "l10h: about_text actually rewritten in the DB");
+          const auditL10 = getAuditRows("prov-l-route-ok").find((r: any) => r.field_name === "about_text");
+          assertTrue(!!auditL10, "l10i: apply produced an about_text audit row for the rewrite");
+          assertEq(auditL10.old_value, PASSING_BUT_THIN_L, "l10j: audit old_value is the real prior passing-but-thin text");
+          assertEq(auditL10.new_value, REWRITTEN_L, "l10k: audit new_value is the LLM rewrite");
+
+          // l11: the model's own "not enough material" sentinel -> no write,
+          // field unchanged, no audit row.
+          globalThis.fetch = makeFetchL(() => ({
+            ok: true, status: 200, json: async () => ({ content: [{ type: "text", text: "INGEN_UTVIDELSE_MULIG" }] }),
+          }));
+          const applyL11 = await callRoute(opplevelserRouter, {
+            url: "/admin/gardssalg-content-refresh",
+            headers: { "x-admin-key": testKey },
+            body: { providerIds: ["prov-l-route-sentinel"], apply: true },
+          });
+          assertEq(applyL11.status, 200, "l11a: sentinel response -> 200");
+          assertTrue(
+            !applyL11.body.changed.some((c: any) => c.provider_id === "prov-l-route-sentinel"),
+            "l11b: sentinel response -> prov-l-route-sentinel has nothing to write (about_text ineligible-extraction, visit_text already long)",
+          );
+          assertEq(getProviderRow("prov-l-route-sentinel").about_text, PASSING_BUT_THIN_L, "l11c: about_text unchanged after a sentinel response");
+          assertEq(getAuditRows("prov-l-route-sentinel").length, 0, "l11d: no audit row for a sentinel (never-fabricate) response");
+
+          // l12: a candidate outside the 200-500 char range (too short) is
+          // rejected by the code-enforced length gate, not trusted to the
+          // prompt/model alone.
+          globalThis.fetch = makeFetchL(() => ({
+            ok: true, status: 200, json: async () => ({ content: [{ type: "text", text: "For kort til å telle." }] }),
+          }));
+          const applyL12 = await callRoute(opplevelserRouter, {
+            url: "/admin/gardssalg-content-refresh",
+            headers: { "x-admin-key": testKey },
+            body: { providerIds: ["prov-l-route-badlen"], apply: true },
+          });
+          assertEq(applyL12.status, 200, "l12a: out-of-range-length response -> 200");
+          assertEq(getProviderRow("prov-l-route-badlen").about_text, PASSING_BUT_THIN_L, "l12b: about_text unchanged — the too-short candidate was rejected, not written");
+          assertEq(getAuditRows("prov-l-route-badlen").length, 0, "l12c: no audit row for a rejected out-of-range candidate");
+
+          // l13: ANTHROPIC_API_KEY missing -> generateGardssalgAboutRewrite
+          // returns null for every call, WITHOUT ever calling fetch (mirrors
+          // generateTitleNo's own missing-key contract) — route behaves
+          // exactly as before this slice.
+          delete process.env.ANTHROPIC_API_KEY;
+          anthropicCallsL = 0;
+          globalThis.fetch = makeFetchL(() => {
+            throw new Error("l13: Anthropic must NOT be called when ANTHROPIC_API_KEY is missing");
+          });
+          const applyL13 = await callRoute(opplevelserRouter, {
+            url: "/admin/gardssalg-content-refresh",
+            headers: { "x-admin-key": testKey },
+            body: { providerIds: ["prov-l-route-nokey"], apply: true },
+          });
+          assertEq(applyL13.status, 200, "l13a: missing ANTHROPIC_API_KEY -> 200 (does not throw/500)");
+          assertEq(anthropicCallsL, 0, "l13b: Anthropic was never called when the key is missing");
+          assertEq(getProviderRow("prov-l-route-nokey").about_text, PASSING_BUT_THIN_L, "l13c: about_text unchanged when the key is missing");
+          process.env.ANTHROPIC_API_KEY = "test-anthropic-key";
+
+          // l14: manual-locked provider -> the lock check short-circuits
+          // BEFORE any fetch at all, so Anthropic is never called either.
+          anthropicCallsL = 0;
+          globalThis.fetch = makeFetchL(() => {
+            throw new Error("l14: Anthropic must NOT be called for a locked provider");
+          });
+          const applyL14 = await callRoute(opplevelserRouter, {
+            url: "/admin/gardssalg-content-refresh",
+            headers: { "x-admin-key": testKey },
+            body: { providerIds: ["prov-l-route-locked"], apply: true },
+          });
+          assertEq(applyL14.status, 200, "l14a: locked provider -> 200");
+          assertTrue(applyL14.body.skipped_locked.includes("prov-l-route-locked"), "l14b: locked provider reported in skipped_locked");
+          assertEq(anthropicCallsL, 0, "l14c: Anthropic was never called for a locked provider (lock check happens before any fetch)");
+        } finally {
+          globalThis.fetch = prevFetchL;
+          if (prevAnthropicKeyL === undefined) delete process.env.ANTHROPIC_API_KEY;
+          else process.env.ANTHROPIC_API_KEY = prevAnthropicKeyL;
+        }
       }
     } catch (err: any) {
       failed++;

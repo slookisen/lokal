@@ -2019,6 +2019,26 @@ export function gardssalgReplaceableFieldAction(
 }
 
 /**
+ * dev-request 2026-07-18-gardssalg-profilkvalitet-foer-outreach, slice 5a —
+ * true only for the "quality-bar-passing but still thin" cohort that
+ * gardssalgReplaceableFieldAction deliberately refuses to ever touch
+ * ("decent existing content — never churned"): non-blank, passes
+ * meetsAboutQualityBar (>=80 chars), but still under 200 chars. This is the
+ * ONLY new eligibility check slice 5a adds — gardssalgReplaceableFieldAction
+ * itself stays byte-unchanged. A field that is rewritten past 200 chars (the
+ * code-enforced 200-500 range in generateGardssalgAboutRewrite guarantees
+ * this) drops out of this eligible set on its own, so a second run is
+ * idempotent with no extra state/flag.
+ */
+export function gardssalgRewriteEligible(currentValue: string | null | undefined): boolean {
+  if (currentValue === null || currentValue === undefined) return false;
+  const trimmed = String(currentValue).trim();
+  if (!trimmed) return false;
+  if (!meetsAboutQualityBar(trimmed)) return false;
+  return trimmed.length < 200;
+}
+
+/**
  * Apply crawled content to ONE gårdssalg provider, respecting the lock gate:
  * NEVER writes anything if the provider is locked (content_source
  * 'manual'/'claim'). For about_text/visit_text, writes a candidate field
@@ -2051,7 +2071,16 @@ export function applyGardssalgProviderContent(
   providerId: string,
   candidate: { about_text?: string | null; visit_text?: string | null; opening_hours_text?: string | null },
   evidenceUrl: string,
-  batchId?: string
+  batchId?: string,
+  // dev-request 2026-07-18-gardssalg-profilkvalitet-foer-outreach, slice 5a —
+  // fields whose candidate value is a source-grounded LLM rewrite (not a
+  // fresh extraction). gardssalgReplaceableFieldAction alone would refuse to
+  // write these (current value already passes meetsAboutQualityBar, so its
+  // "never churn decent content" rule returns null) — this additive param
+  // lets the writer also accept a field via gardssalgRewriteEligible(row's
+  // current value), and ONLY that field. It never widens what
+  // gardssalgReplaceableFieldAction itself allows for any other caller.
+  rewriteFields?: ReadonlySet<"about_text" | "visit_text">
 ): string[] {
   const db = getDb(VERTICAL);
   const row = db
@@ -2088,12 +2117,14 @@ export function applyGardssalgProviderContent(
     opening_hours_text: row.opening_hours_text,
   };
 
-  if (gardssalgReplaceableFieldAction(row.about_text, candidate.about_text)) {
+  const aboutIsRewrite = !!rewriteFields?.has("about_text") && gardssalgRewriteEligible(row.about_text);
+  if (gardssalgReplaceableFieldAction(row.about_text, candidate.about_text) || aboutIsRewrite) {
     sets.push("about_text = @about_text");
     params.about_text = candidate.about_text!.trim();
     written.push("about_text");
   }
-  if (gardssalgReplaceableFieldAction(row.visit_text, candidate.visit_text)) {
+  const visitIsRewrite = !!rewriteFields?.has("visit_text") && gardssalgRewriteEligible(row.visit_text);
+  if (gardssalgReplaceableFieldAction(row.visit_text, candidate.visit_text) || visitIsRewrite) {
     sets.push("visit_text = @visit_text");
     params.visit_text = candidate.visit_text!.trim();
     written.push("visit_text");
