@@ -284,8 +284,35 @@ export function runAdminDentalHjemmesideCleanupSweepTests(
       const bulkDry = await post({});
       assertEq(bulkDry.body.scanned, cap, "e1: scan is capped at HJEMMESIDE_CLEANUP_BATCH_CAP even though more candidates exist");
       assertEq(bulkDry.body.would_clean_count, cap - 1, "e2: cap-1 bad rows in the capped batch (clinic-clean occupies the 1 non-bad slot)");
-      assertEq(bulkDry.body.remaining_count, 8, "e3: remaining_count reports the un-scanned backlog ((1 clean-row candidate + extra bulk rows) - cap)");
+      // Dry-run makes ZERO writes, so remaining_count is candidateCount minus
+      // ONLY the flagged (would_clean) rows — NOT minus the whole scanned
+      // batch. clinic-clean is scanned but never flagged, so it must stay in
+      // the remaining count: (1 clean-row candidate + extra bulk rows) -
+      // (cap - 1 bad rows) = 9. (The old buggy candidateCount -
+      // batchRows.length arithmetic would have wrongly given 8, silently
+      // treating the scanned-but-good clinic-clean row as resolved.)
+      assertEq(bulkDry.body.remaining_count, 9, "e3: remaining_count = candidateCount - would_clean_count (dry-run never subtracts scanned-but-not-flagged rows)");
       assertTrue((bulkDry.body.would_clean as any[]).length <= routeMod.HJEMMESIDE_CLEANUP_SAMPLE_CAP, "e4: would_clean array itself is capped to the sample cap, not the full batch");
+
+      // ── (e-apply) remaining_count regression: apply must re-query the TRUE
+      // post-write candidate count, not do candidateCount - batchRows.length
+      // arithmetic. Applying this exact batch cleans (cap - 1) bad bulk rows
+      // but leaves clinic-clean untouched (still a candidate) AND leaves the
+      // 8 un-scanned bulk rows beyond the cap untouched (still candidates)
+      // — true remaining = 1 + 8 = 9, matching the dry-run prediction above.
+      // The pre-fix bug would have reported candidateCount - batchRows.length
+      // = (cap + 8) - cap = 8, undercounting by exactly the 1 untouched
+      // clinic-clean row.
+      const bulkApply = await post({ dry_run: false });
+      assertEq(bulkApply.body.cleaned_count, cap - 1, "e5: apply on the bulk batch cleans exactly the cap-1 bad rows");
+      const trueRemaining = (
+        dentalDb
+          .prepare("SELECT COUNT(*) AS n FROM dental_agents WHERE hjemmeside IS NOT NULL AND directory_url IS NULL")
+          .get() as { n: number }
+      ).n;
+      assertEq(trueRemaining, 9, "e6: sanity-check the TRUE remaining candidate count directly via SQL is 9");
+      assertEq(bulkApply.body.remaining_count, trueRemaining, "e7: apply's remaining_count matches the TRUE re-queried DB count, not a stale scanned-batch subtraction");
+      assertEq(bulkApply.body.remaining_count, 9, "e8: apply's remaining_count is 9, not the buggy 8 (candidateCount - batchRows.length)");
 
       // ── (f) applyHjemmesideCleanupToRow: stale-row / already-cleaned skip ──
       // Fresh isolated row for this check.
@@ -320,6 +347,45 @@ export function runAdminDentalHjemmesideCleanupSweepTests(
       // Row gone entirely (never inserted / deleted since scan) must also be a no-op, not a throw.
       const goneOutcome = routeMod.applyHjemmesideCleanupToRow(dentalDb, { id: "does-not-exist", navn: "Ghost AS", hjemmeside: "https://legelisten.no", reason: "directory" }, new Date().toISOString());
       assertEq(goneOutcome.applied, false, "f5: a row that no longer exists is skipped, not a throw");
+
+      // ── (f-guard) the hjemmeside-equality guard in ISOLATION ────────────
+      // Regression coverage for `current.hjemmeside !== flag.hjemmeside`
+      // (applyHjemmesideCleanupToRow) specifically: when the reviewer
+      // commented out ONLY this check (leaving the directory_url-null check
+      // and the !recheck.isBad check intact), all other tests still passed
+      // — because every other stale-row test above changes hjemmeside to a
+      // value that ALSO fails classification (a "real clinic" domain), so
+      // !recheck.isBad alone already catches it. This test closes that gap:
+      // it changes hjemmeside to a DIFFERENT value that is STILL classified
+      // bad (a different legelisten.no directory listing), so the isBad
+      // recheck would happily pass — ONLY the equality guard can catch it.
+      const classifierMod = require("../services/dental-hjemmeside-classifier") as
+        typeof import("../services/dental-hjemmeside-classifier");
+      insertAgent.run({
+        id: "clinic-guard-isolation", navn: "Guard Isolation Tannlege AS",
+        hjemmeside: "https://legelisten.no/tannlege/guard-scanned-value",
+        field_provenance: null,
+        created_at: "2026-04-01T00:00:00.000Z",
+      });
+      const guardFlag = {
+        id: "clinic-guard-isolation", navn: "Guard Isolation Tannlege AS",
+        hjemmeside: "https://legelisten.no/tannlege/guard-scanned-value",
+        reason: "directory" as const,
+      };
+      const REPLACEMENT_VALUE = "https://legelisten.no/tannlege/guard-replaced-value";
+      // Change hjemmeside to a DIFFERENT value between "scan" and "apply" —
+      // simulating a concurrent write that lands on another still-bad URL.
+      dentalDb.prepare("UPDATE dental_agents SET hjemmeside = ? WHERE id = ?").run(REPLACEMENT_VALUE, "clinic-guard-isolation");
+      // Prove the replacement value would ALSO pass the isBad recheck on its
+      // own — so if this test's skip happened, it can only be attributable
+      // to the equality guard, not to !recheck.isBad.
+      const replacementClassification = classifierMod.classifyHjemmeside(REPLACEMENT_VALUE);
+      assertTrue(replacementClassification.isBad, "g1: the replacement value independently classifies as bad too (isolates the equality guard from the isBad recheck)");
+      const guardOutcome = routeMod.applyHjemmesideCleanupToRow(dentalDb, guardFlag, new Date().toISOString());
+      assertEq(guardOutcome.applied, false, "g2: row is skipped even though the current (changed) value would ALSO classify as bad — attributable only to the hjemmeside-equality guard");
+      const afterGuard = dentalDb.prepare("SELECT hjemmeside, directory_url FROM dental_agents WHERE id = ?").get("clinic-guard-isolation") as any;
+      assertEq(afterGuard.hjemmeside, REPLACEMENT_VALUE, "g3: the row's changed hjemmeside is left exactly as-is, not clobbered");
+      assertEq(afterGuard.directory_url, null, "g4: directory_url is not set by the skipped apply");
     } catch (err: any) {
       failed++;
       failures.push("admin-dental-hjemmeside-cleanup: unexpected error: " + String(err?.stack || err?.message || err));

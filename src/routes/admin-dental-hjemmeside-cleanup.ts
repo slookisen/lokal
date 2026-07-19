@@ -252,7 +252,14 @@ router.post("/", (req: Request, res: Response) => {
           hjemmeside: r.hjemmeside,
           reason: r.reason,
         })),
-        remaining_count: Math.max(0, candidateCount - batchRows.length),
+        // Dry-run makes ZERO writes, so this arithmetic prediction is exact:
+        // if this exact batch were applied, only the flagged (would_clean)
+        // rows would ever leave the candidate set — every scanned-but-not-
+        // flagged row (a legitimate clinic homepage) stays a candidate
+        // forever, so it must NOT be subtracted (candidateCount -
+        // batchRows.length was the bug: it subtracted the whole scanned
+        // batch, silently treating good rows as if they'd been resolved).
+        remaining_count: Math.max(0, candidateCount - flagged.length),
       });
       return;
     }
@@ -277,6 +284,18 @@ router.post("/", (req: Request, res: Response) => {
     });
     tx();
 
+    // Apply DOES write, so remaining_count must be the TRUE current
+    // candidate count, re-queried from the DB after the transaction —
+    // NOT candidateCount - batchRows.length (that arithmetic silently
+    // subtracted every scanned row, including the ones the classifier did
+    // NOT flag — a legitimate clinic homepage that was merely scanned stays
+    // a candidate forever, it never leaves the WHERE clause, so it must
+    // never be subtracted as if resolved). Only actually-cleaned rows
+    // (cleaned.length, which can be < flagged.length if applyHjemmeside
+    // CleanupToRow skipped some as stale/already-cleaned) truly leave the
+    // candidate set, so a fresh COUNT(*) is the only accurate source here.
+    const remainingCount = countCandidates(db);
+
     res.json({
       success: true,
       dry_run: false,
@@ -284,7 +303,7 @@ router.post("/", (req: Request, res: Response) => {
       would_clean_count: flagged.length,
       cleaned_count: cleaned.length,
       cleaned: cleaned.slice(0, HJEMMESIDE_CLEANUP_SAMPLE_CAP),
-      remaining_count: Math.max(0, candidateCount - batchRows.length),
+      remaining_count: remainingCount,
     });
   } catch (err: any) {
     res.status(500).json({ error: "Hjemmeside cleanup sweep failed", detail: err?.message ?? String(err) });
