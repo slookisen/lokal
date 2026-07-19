@@ -26972,6 +26972,20 @@ Promise.allSettled(_oaHomeCountersDeps).then(async () => {
     for (const f of gnd.failures) failures.push("opplevelser-gardssalg-nace-discovery: " + f);
     console.log(`  opplevelser-gardssalg-nace-discovery: ${gnd.passed} passed, ${gnd.failed} failed`);
 
+    // dev-request 2026-07-19-brreg-nace-drikkeprodusenter, triage-oppfølging:
+    // POST /admin/gardssalg-provider-visibility — the explicit-target
+    // catalog_hidden lever for triaging non-visit-relevant discovery rows
+    // (Ringnes-klassen, konkursbo, holdingselskaper) out of the public grid.
+    // Same in-memory-DB pattern, runs sequentially inside this gated block.
+    console.log("\n── opplevelser-gardssalg-provider-visibility: triage-spak for catalog_hidden ──");
+    const { runOpplevelserGardssalgProviderVisibilityTests } = require("../src/routes/opplevelser-gardssalg-provider-visibility.test") as
+      typeof import("../src/routes/opplevelser-gardssalg-provider-visibility.test");
+    const gpv = await runOpplevelserGardssalgProviderVisibilityTests(false);
+    passed += gpv.passed;
+    failed += gpv.failed;
+    for (const f of gpv.failures) failures.push("opplevelser-gardssalg-provider-visibility: " + f);
+    console.log(`  opplevelser-gardssalg-provider-visibility: ${gpv.passed} passed, ${gpv.failed} failed`);
+
     // dev-request 2026-07-18-gardssalg-profilkvalitet-foer-outreach, slice 3:
     // Brreg street-address backfill — selectGardssalgProvidersForAddressEnrichment()/
     // getGardssalgProviderAddressTarget()/applyGardssalgProviderAddress()
