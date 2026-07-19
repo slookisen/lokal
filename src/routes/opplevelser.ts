@@ -2719,6 +2719,13 @@ function stripMarkdownArtifacts(s: string): string {
     // knowingly eaten too (acceptable in this domain; typographic "– "/"— "
     // are preserved).
     .replace(/^\s*[-*•]\s+/gm, "")          // list bullets at line start
+    // Links/images (review round 2 — the most realistic remaining leak):
+    // "[nettsiden](https://…)" must land as "nettsiden", never with raw
+    // bracket/paren syntax. Runs before bold/italic so link TEXT can still
+    // carry emphasis markers that the later rules then strip.
+    .replace(/!?\[([^\]\n]*)\]\([^)\n]*\)/g, "$1")
+    .replace(/^\s*>\s+/gm, "")              // blockquote markers at line start
+    .replace(/^[=\-_]{3,}\s*$/gm, "")       // horizontal rules / setext underlines
     .replace(/\*\*([^*]+)\*\*/g, "$1")      // **bold**
     .replace(/__([^_]+)__/g, "$1")          // __bold__
     // Paired same-line italics — but only when the stars hug the text
@@ -2741,7 +2748,10 @@ function stripMarkdownArtifacts(s: string): string {
 // essentially nonexistent (a URL-bearing candidate is fine to skip), and
 // rejecting beats corrupting. This also makes the one-pass strip safe despite
 // not being strictly idempotent — nothing with residual syntax ever lands.
-const GARDSSALG_REWRITE_RESIDUAL_MARKDOWN = /[*#`_]/;
+// Round-2 widening: brackets (leftover link/checkbox syntax), backslash
+// (escaped-markdown remnants like "\*ekte\*" → "\ekte\") and ">" (inline
+// blockquote remnants) — all verified publishable through the narrower set.
+const GARDSSALG_REWRITE_RESIDUAL_MARKDOWN = /[*#`_\\[\]>]/;
 
 export async function generateGardssalgAboutRewrite(
   sourceText: string,
@@ -2802,15 +2812,17 @@ Bruk KUN fakta som faktisk står i kildeteksten under. Ikke finn på detaljer, p
   // asterisks must be rejected as too short, not accepted).
   const plain = stripMarkdownArtifacts(cleaned);
 
-  // Residual markers after stripping (unpaired "**", "_x_", spaced "*", …)
-  // → reject outright; see GARDSSALG_REWRITE_RESIDUAL_MARKDOWN's comment.
-  if (GARDSSALG_REWRITE_RESIDUAL_MARKDOWN.test(plain)) return null;
-
   // Sentinel embedded/wrapped rather than verbatim (review finding, round 1:
   // "**INGEN_UTVIDELSE_MULIG**", or the sentinel inside ≥200 chars of prose)
   // must also count as "no expansion possible" — the raw === check above only
-  // catches the exact form the prompt asks for.
+  // catches the exact form the prompt asks for. Checked BEFORE the residual
+  // gate (round-2 finding: the sentinel itself contains "_", so the other
+  // order made this line unreachable dead code).
   if (plain.includes(GARDSSALG_REWRITE_SENTINEL)) return null;
+
+  // Residual markers after stripping (unpaired "**", "_x_", spaced "*", …)
+  // → reject outright; see GARDSSALG_REWRITE_RESIDUAL_MARKDOWN's comment.
+  if (GARDSSALG_REWRITE_RESIDUAL_MARKDOWN.test(plain)) return null;
 
   // Length gate enforced in code, not trusted to the prompt alone (spec
   // requirement) — reject anything outside [200, 500], never truncate.

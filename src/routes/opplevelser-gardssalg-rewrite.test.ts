@@ -410,6 +410,30 @@ export function runOpplevelserGardssalgRewriteTests(
         const r = await generateGardssalgAboutRewrite(SOURCE_TEXT, CURRENT_VALUE, "about");
         assertEq(r, null, "ru-13h: spaced '*' (multiplication) → rejected, never silently rewritten to '2 3'");
       }
+
+      // ── ru-14: round-2 leak shapes — links unwrap to their text; leftover
+      //    bracket/backslash syntax rejects; blockquote markers strip. ───────
+      mockText(`Les mer om oss på [nettsiden vår](https://example.no/om-oss) der du finner alt om gården. ${PAD_220}`);
+      {
+        const r = await generateGardssalgAboutRewrite(SOURCE_TEXT, CURRENT_VALUE, "about");
+        assertTrue(r !== null, "ru-14a: markdown link unwraps and the candidate is accepted");
+        assertTrue(!!r && r.includes("nettsiden vår") && !/[\[\]]/.test(r) && !r.includes("https://"), "ru-14b: link TEXT survives, URL and brackets do not");
+      }
+      mockText(`Huskeliste: - [ ] bestill omvisning. ${PAD_220}`);
+      {
+        const r = await generateGardssalgAboutRewrite(SOURCE_TEXT, CURRENT_VALUE, "about");
+        assertEq(r, null, "ru-14c: leftover checkbox brackets → residual reject");
+      }
+      mockText(`Vi lager \\*ekte\\* sider av egne epler. ${PAD_220}`);
+      {
+        const r = await generateGardssalgAboutRewrite(SOURCE_TEXT, CURRENT_VALUE, "about");
+        assertEq(r, null, "ru-14d: escaped-markdown backslash remnants → residual reject");
+      }
+      mockText(`> Vi gleder oss til å ta imot besøkende i sommer, sier bonden. ${PAD_220}`);
+      {
+        const r = await generateGardssalgAboutRewrite(SOURCE_TEXT, CURRENT_VALUE, "visit");
+        assertTrue(r !== null && !r.includes(">"), "ru-14e: leading blockquote marker stripped cleanly, prose accepted");
+      }
     } catch (err: any) {
       failed++;
       failures.push("opplevelser-gardssalg-rewrite (section A): unexpected error: " + String(err?.stack || err?.message || err));
