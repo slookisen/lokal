@@ -25,6 +25,12 @@ import { fylkeEquivalents } from "./norway-fylke";
 import { meetsAboutQualityBar } from "./search-enrich";
 import { deriveExperienceTags, type ExperienceTag, type TaggableExperience } from "./experience-tags";
 import { haversineDistanceKm } from "./geocoding-service";
+// dev-request 2026-07-18-gardssalg-profilkvalitet-foer-outreach, slice 5b —
+// reuse the SAME diacritic-fold/lowercase normaliser findOrgnumberByName's
+// own name-matching already uses, for the poststed EXACT-match comparison in
+// gardssalgOrgnrPostalCorroborated below (never a raw substring test — see
+// that function's doc comment for why).
+import { normaliseName } from "./brreg-client";
 import {
   findExistingCandidateMatch,
   scoreExperienceRichness,
@@ -2573,29 +2579,31 @@ export function getGardssalgProviderOrgnrTarget(providerId: string): GardssalgOr
 /**
  * True only when an existing, non-blank postnummer OR poststed on the
  * provider's own row agrees with the Brreg hit's own postal fields
- * (brreg_postal is a postnummer; poststed is compared case-insensitively,
- * diacritic-naive — a plain trim+lowercase is enough for this narrow
- * corroboration check, not a fuzzy match). Returns false (never true) when
- * the provider has NEITHER field set — there is nothing to corroborate
- * against, so per Daniel's "ved tvil: ikke skriv" this can never pass by
- * absence of a signal. Exported for unit tests.
+ * (brreg_postal is a postnummer, compared exactly; poststed is compared as
+ * an EXACT normalised match against the hit's own brreg_poststed field —
+ * NOT a substring test against the formatted `address` display string,
+ * which is unsafe: a short poststed like "Nes" or "Os" is a substring of
+ * unrelated towns like "Sandnes"/"Oslo", which would have silently
+ * "corroborated" an org_nr for the wrong provider — see brreg-client.ts's
+ * BrregHit.brreg_poststed doc comment, added specifically to close this).
+ * Returns false (never true) when the provider has NEITHER field set, or
+ * when the hit has no comparable field for the one the provider does have —
+ * there is nothing to corroborate against, so per Daniel's "ved tvil: ikke
+ * skriv" this can never pass by absence of a signal. Exported for unit
+ * tests.
  */
 export function gardssalgOrgnrPostalCorroborated(
   target: { postnummer: string | null; poststed: string | null },
-  hit: { brreg_postal?: string | null; address: string | null }
+  hit: { brreg_postal?: string | null; brreg_poststed?: string | null }
 ): boolean {
   const targetPostnr = (target.postnummer || "").trim();
   const hitPostnr = (hit.brreg_postal || "").trim();
   if (targetPostnr && hitPostnr && targetPostnr === hitPostnr) return true;
 
-  const targetPoststed = (target.poststed || "").trim().toLowerCase();
-  if (targetPoststed && hit.address) {
-    // hit.address is a formatted "<street>, <postnr> <poststed>" string
-    // (formatBrregAddress, brreg-client.ts) — a simple substring check on
-    // the trailing poststed token is sufficient here since we only need to
-    // corroborate, never to parse a display string into structured data.
-    if (hit.address.toLowerCase().includes(targetPoststed)) return true;
-  }
+  const targetPoststed = normaliseName(target.poststed || "");
+  const hitPoststed = normaliseName(hit.brreg_poststed || "");
+  if (targetPoststed && hitPoststed && targetPoststed === hitPoststed) return true;
+
   return false;
 }
 
@@ -2608,7 +2616,7 @@ export function gardssalgOrgnrPostalCorroborated(
  */
 export function gardssalgOrgnrAutoWriteEligible(
   target: { postnummer: string | null; poststed: string | null },
-  hit: { confidence: number; brreg_postal?: string | null; address: string | null }
+  hit: { confidence: number; brreg_postal?: string | null; brreg_poststed?: string | null }
 ): boolean {
   return hit.confidence === 1.0 && gardssalgOrgnrPostalCorroborated(target, hit);
 }

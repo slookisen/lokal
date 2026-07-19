@@ -29,6 +29,16 @@ export type BrregHit = {
   name: string;
   confidence: number;
   brreg_postal?: string | null;
+  // ─── dev-request 2026-07-18-gardssalg-profilkvalitet-foer-outreach,
+  // slice 5b ───────────────────────────────────────────────────────────────
+  // The hit's raw poststed (town name), read the same way brreg_postal is
+  // (forretningsadresse falling back to postadresse). Exists specifically so
+  // callers needing an EXACT poststed comparison (e.g.
+  // gardssalgOrgnrPostalCorroborated, experience-store.ts) never have to
+  // parse it back out of the formatted `address` display string below — a
+  // substring test against that string is unsafe (a short poststed like
+  // "Nes" or "Os" is a substring of unrelated towns like "Sandnes"/"Oslo").
+  brreg_poststed?: string | null;
   // ─── dev-request 2026-07-03-places-api-cost-reduction, measure 3 ───────
   // Formatted street address ("<adresse>, <postnummer> <poststed>"), when
   // Brreg's response for this hit includes a usable street line. null when
@@ -545,6 +555,7 @@ export async function findOrgnumberByName(
   for (const h of enheter) {
     if (!h || typeof h.organisasjonsnummer !== "string" || typeof h.navn !== "string") continue;
     const hitPostal = h.forretningsadresse?.postnummer ?? h.postadresse?.postnummer ?? null;
+    const hitPoststed = h.forretningsadresse?.poststed ?? h.postadresse?.poststed ?? null;
     const score = scoreNameMatch(cleanName, h.navn, postalCode ?? null, hitPostal);
     if (!best || score > best.confidence) {
       best = {
@@ -552,6 +563,7 @@ export async function findOrgnumberByName(
         name: h.navn,
         confidence: score,
         brreg_postal: hitPostal,
+        brreg_poststed: hitPoststed,
         address: formatBrregAddress(h.forretningsadresse ?? h.postadresse ?? null),
       };
     }
