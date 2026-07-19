@@ -2877,12 +2877,19 @@ export function gardssalgSharedDomainReason(host: string | null): string | null 
  */
 export function gardssalgSharedHostCounts(): Map<string, number> {
   const db = getDb(VERTICAL);
+  // Hidden rows ARE counted (komplett-foer-synlig, 2026-07-19): the NACE
+  // landing plan parks whole discovery batches as catalog_hidden while they
+  // are enriched, and a contamination guard that cannot see the very rows
+  // being enriched is blind exactly when it matters. The one row that must
+  // NOT count is the booking-flyt test provider — excluded by its stable
+  // producer_type marker instead of the old catalog_hidden!=1 clause (which
+  // silently excluded every hidden real row along with it).
   const rows = db
     .prepare(
       `SELECT hjemmeside FROM experience_providers
         WHERE (producer_type IS NOT NULL OR rfb_seed_source = 'rfb-seed')
           AND hjemmeside IS NOT NULL AND TRIM(hjemmeside) != ''
-          AND (catalog_hidden IS NULL OR catalog_hidden != 1)`
+          AND (producer_type IS NULL OR producer_type != 'test-gardssalg')`
     )
     .all() as Array<{ hjemmeside: string }>;
   const counts = new Map<string, number>();
@@ -2955,6 +2962,300 @@ export function listGardssalgNameDedupRows(): Array<{ id: string; navn: string; 
     .all() as Array<{ id: string; navn: string; org_nr: string | null; kommune: string | null }>;
 }
 
+// ─── Gårdssalg website discovery (dev-request 2026-07-19-gardssalg-nye-
+//     agenter-komplett-foer-synlig, skive B) ─────────────────────────────────
+//
+// Most NACE-discovered rows carry no hjemmeside in Brreg, and the whole
+// enrichment chain (content-refresh → 5a rewrite → 5c products) is source-
+// based: no website, nothing to enrich from. This block generates candidate
+// websites deterministically (domain patterns derived from the provider's own
+// name), verifies OWNERSHIP evidence on the fetched page (the provider's
+// org_nr, or its exact name together with its kommune/poststed), and parks
+// verified candidates in gardssalg_website_review_queue — hjemmeside is NEVER
+// written directly by discovery. Daniel's binding identity rule (2026-07-19)
+// applies doubly to source selection: a wrong homepage would poison every
+// downstream field write, so adoption always goes through the human-approved
+// lever (POST /admin/gardssalg-website-review-approve).
+
+export type GardssalgWebsiteDiscoveryTarget = {
+  id: string;
+  navn: string;
+  org_nr: string | null;
+  kommune: string | null;
+  poststed: string | null;
+  content_source: string | null;
+};
+
+/**
+ * Auto-select gårdssalg providers eligible for website discovery: blank
+ * hjemmeside, not manual/claim-locked, not the test provider. Deliberately
+ * does NOT filter catalog_hidden — the komplett-foer-synlig plan parks whole
+ * discovery batches hidden precisely while this machinery runs on them.
+ * Never-attempted rows first, then oldest attempt (website_discovery_
+ * attempted_at — its own stamp, see init-experiences.ts), then oldest row.
+ */
+export function selectGardssalgProvidersForWebsiteDiscovery(limit = 16): GardssalgWebsiteDiscoveryTarget[] {
+  const db = getDb(VERTICAL);
+  const cap = Math.max(1, Math.min(48, limit));
+  return db
+    .prepare(
+      `SELECT id, navn, org_nr, kommune, poststed, content_source
+         FROM experience_providers
+        WHERE (producer_type IS NOT NULL OR rfb_seed_source = 'rfb-seed')
+          AND (hjemmeside IS NULL OR TRIM(hjemmeside) = '')
+          AND (content_source IS NULL OR content_source NOT IN ('manual', 'claim'))
+          AND (producer_type IS NULL OR producer_type != 'test-gardssalg')
+        ORDER BY (website_discovery_attempted_at IS NOT NULL), website_discovery_attempted_at ASC, created_at ASC
+        LIMIT ?`
+    )
+    .all(cap) as GardssalgWebsiteDiscoveryTarget[];
+}
+
+/** Explicit-target resolver for the route's providerIds override — gårdssalg-
+ * scoped and test-provider-excluded like the selector, but NOT filtered on
+ * blank hjemmeside/locks (those are decided and reported by the route). */
+export function getGardssalgWebsiteDiscoveryTarget(providerId: string): (GardssalgWebsiteDiscoveryTarget & { hjemmeside: string | null }) | null {
+  const db = getDb(VERTICAL);
+  const row = db
+    .prepare(
+      `SELECT id, navn, org_nr, kommune, poststed, content_source, hjemmeside
+         FROM experience_providers
+        WHERE id = ?
+          AND (producer_type IS NOT NULL OR rfb_seed_source = 'rfb-seed')
+          AND (producer_type IS NULL OR producer_type != 'test-gardssalg')`
+    )
+    .get(providerId) as (GardssalgWebsiteDiscoveryTarget & { hjemmeside: string | null }) | undefined;
+  return row ?? null;
+}
+
+/**
+ * Deterministic candidate hosts from the provider's own display name: the
+ * «— Sted»-pruned name, org-form suffix dropped, in the two common Norwegian
+ * domain transliterations (ø→o/å→a and ø→oe/å→aa; æ→ae in both), each as
+ * joined and hyphenated labels under .no. Max 4, degenerate labels (<4 or
+ * >63 chars) dropped. Pure — exported for tests.
+ */
+export function gardssalgWebsiteCandidateHosts(navn: string): string[] {
+  const tokens = gardssalgSearchName(navn).toLowerCase().split(/\s+/).filter(Boolean);
+  while (tokens.length > 1 && BRREG_ORG_SUFFIX_TOKENS.has(tokens[tokens.length - 1])) tokens.pop();
+  const variants = [
+    tokens.map((t) => t.replace(/æ/g, "ae").replace(/ø/g, "o").replace(/å/g, "a")),
+    tokens.map((t) => t.replace(/æ/g, "ae").replace(/ø/g, "oe").replace(/å/g, "aa")),
+  ];
+  const hosts: string[] = [];
+  for (const v of variants) {
+    const clean = v.map((t) => t.replace(/[^a-z0-9]/g, "")).filter(Boolean);
+    if (clean.length === 0) continue;
+    for (const label of [clean.join(""), clean.join("-")]) {
+      if (label.length < 4 || label.length > 63) continue;
+      const host = `${label}.no`;
+      if (!hosts.includes(host)) hosts.push(host);
+    }
+  }
+  return hosts.slice(0, 4);
+}
+
+/** Visible-text extraction for evidence matching — scripts/styles/tags out,
+ * entities-as-space, whitespace collapsed. Pure — exported for tests. */
+export function gardssalgPageText(html: string): string {
+  return (html || "")
+    .replace(/<script[\s\S]*?<\/script>/gi, " ")
+    .replace(/<style[\s\S]*?<\/style>/gi, " ")
+    .replace(/<[^>]+>/g, " ")
+    .replace(/&[a-z]+;|&#\d+;/gi, " ")
+    .replace(/\s+/g, " ");
+}
+
+/**
+ * Ownership evidence for a candidate page. verified requires the provider's
+ * org_nr on the page (separators inside digit runs collapsed, and the match
+ * must not be embedded in a longer digit run), OR the exact pruned name AND
+ * the kommune/poststed both present. Short/generic names (single token under
+ * 8 chars — «Sider», «Engel») never verify on name alone. Pure — exported
+ * for tests.
+ */
+export function gardssalgWebsiteEvidenceMatch(
+  pageText: string,
+  target: { orgNr?: string | null; navn: string; kommune?: string | null; poststed?: string | null }
+): { org_nr_found: boolean; name_found: boolean; place_found: boolean; verified: boolean } {
+  const text = pageText || "";
+  let orgFound = false;
+  const orgNr = (target.orgNr || "").trim();
+  if (/^\d{9}$/.test(orgNr)) {
+    const digitCollapsed = text.replace(/(\d)[\s. ]+(?=\d)/g, "$1");
+    orgFound = new RegExp(`(?<!\\d)${orgNr}(?!\\d)`).test(digitCollapsed);
+  }
+  const normName = normaliseName(gardssalgSearchName(target.navn));
+  const normText = normaliseName(text);
+  // Word-boundary containment in the normalized space (review M2,
+  // 2026-07-19): normaliseName collapses all whitespace to single spaces, so
+  // space-padding both sides gives exact token-boundary semantics — «berg
+  // gard» must NOT verify against a «Berg Gardsdrift» page, and kommune
+  // «Nes» must NOT match «Sandnes»/«Nesbyen» mid-word.
+  const boundaryIncludes = (haystack: string, needle: string): boolean =>
+    needle.length > 0 && ` ${haystack} `.includes(` ${needle} `);
+  const nameSpecific = normName.length >= 8 || normName.split(" ").filter(Boolean).length >= 2;
+  const nameFound = nameSpecific && boundaryIncludes(normText, normName);
+  const normKommune = normaliseName(target.kommune || "");
+  const normPoststed = normaliseName(target.poststed || "");
+  const placeFound =
+    (normKommune.length >= 3 && boundaryIncludes(normText, normKommune)) ||
+    (normPoststed.length >= 3 && boundaryIncludes(normText, normPoststed));
+  return {
+    org_nr_found: orgFound,
+    name_found: nameFound,
+    place_found: placeFound,
+    verified: orgFound || (nameFound && placeFound),
+  };
+}
+
+export type GardssalgWebsiteReviewQueueEntry = {
+  provider_id: string;
+  provider_name?: string | null;
+  candidate_url: string;
+  final_url?: string | null;
+  evidence?: string | null;
+  confidence?: number | null;
+  reason?: string;
+  batch_id?: string | null;
+};
+
+/** Upsert one website-review-queue row — same UNIQUE(provider_id)
+ * refresh-on-rerun idiom as the org_nr queue. */
+export function upsertGardssalgWebsiteReviewQueue(entry: GardssalgWebsiteReviewQueueEntry): void {
+  const db = getDb(VERTICAL);
+  db.prepare(
+    `INSERT INTO gardssalg_website_review_queue
+       (id, provider_id, provider_name, candidate_url, final_url, evidence, confidence, reason, batch_id, created_at, updated_at)
+     VALUES (@id, @provider_id, @provider_name, @candidate_url, @final_url, @evidence, @confidence, @reason, @batch_id, datetime('now'), datetime('now'))
+     ON CONFLICT(provider_id) DO UPDATE SET
+       provider_name = excluded.provider_name,
+       candidate_url = excluded.candidate_url,
+       final_url = excluded.final_url,
+       evidence = excluded.evidence,
+       confidence = excluded.confidence,
+       reason = excluded.reason,
+       batch_id = excluded.batch_id,
+       updated_at = datetime('now')`
+  ).run({
+    id: uuid(),
+    provider_id: entry.provider_id,
+    provider_name: entry.provider_name ?? null,
+    candidate_url: entry.candidate_url,
+    final_url: entry.final_url ?? null,
+    evidence: entry.evidence ?? null,
+    confidence: entry.confidence ?? null,
+    reason: entry.reason ?? "website_discovery_candidate",
+    batch_id: entry.batch_id ?? null,
+  });
+}
+
+/** Removes a provider's website-queue entry once hjemmeside is resolved. */
+export function clearGardssalgWebsiteReviewQueueEntry(providerId: string): void {
+  const db = getDb(VERTICAL);
+  db.prepare(`DELETE FROM gardssalg_website_review_queue WHERE provider_id = ?`).run(providerId);
+}
+
+/** Lists all current website-queue entries, newest-updated first. */
+export function listGardssalgWebsiteReviewQueue(): (GardssalgWebsiteReviewQueueEntry & {
+  id: string;
+  created_at: string;
+  updated_at: string;
+})[] {
+  const db = getDb(VERTICAL);
+  return db
+    .prepare(`SELECT * FROM gardssalg_website_review_queue ORDER BY updated_at DESC`)
+    .all() as (GardssalgWebsiteReviewQueueEntry & { id: string; created_at: string; updated_at: string })[];
+}
+
+/** Anti-starvation stamp for website discovery (mirrors the content-refresh
+ * attempt stamp's role, on its own column). */
+export function stampGardssalgWebsiteDiscoveryAttempt(providerIds: string[]): void {
+  const db = getDb(VERTICAL);
+  const upd = db.prepare(
+    `UPDATE experience_providers SET website_discovery_attempted_at = datetime('now') WHERE id = ?`
+  );
+  for (const id of providerIds) upd.run(id);
+}
+
+/**
+ * Apply an approved website candidate to ONE gårdssalg provider. Same
+ * discipline as applyGardssalgProviderOrgnr: lock guard, FILL-ONLY (an
+ * existing hjemmeside is never replaced), URL sanity, and an identity
+ * re-check at write time — if the candidate's host is already carried by any
+ * other provider in the catalog (gardssalgSharedHostCounts), the write is
+ * skipped: adopting it would create exactly the shared-host situation the 5d
+ * guard exists to quarantine. Stamps field_provenance.hjemmeside and a
+ * gardssalg_content_audit row (field hjemmeside — in
+ * GARDSSALG_ROLLBACKABLE_FIELDS, so the standard rollback lever covers it).
+ * Returns the field names actually written ([] if nothing written).
+ */
+export function applyGardssalgProviderWebsite(
+  providerId: string,
+  url: string,
+  evidenceUrl: string,
+  batchId?: string
+): string[] {
+  const db = getDb(VERTICAL);
+  const row = db
+    .prepare(`SELECT id, content_source, hjemmeside, field_provenance FROM experience_providers WHERE id = ?`)
+    .get(providerId) as
+    | { id: string; content_source: string | null; hjemmeside: string | null; field_provenance: string | null }
+    | undefined;
+  if (!row) return [];
+  if (row.content_source === "manual" || row.content_source === "claim") return [];
+
+  const cleanUrl = (url || "").trim();
+  if (cleanUrl.length === 0 || cleanUrl.length > 2048) return [];
+  if (!/^https?:\/\/\S+\.\S+/i.test(cleanUrl)) return [];
+  if (row.hjemmeside && row.hjemmeside.trim() !== "") return []; // fill-only
+
+  const host = hostFromUrlLike(cleanUrl);
+  if (!host) return [];
+  if ((gardssalgSharedHostCounts().get(host) || 0) >= 1) return [];
+
+  let provenance: Record<string, { source_url: string; fetched_at: string }> = {};
+  if (row.field_provenance) {
+    try {
+      const parsed = JSON.parse(row.field_provenance);
+      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+        provenance = parsed as Record<string, { source_url: string; fetched_at: string }>;
+      }
+    } catch {
+      /* malformed existing JSON -> treat as empty rather than clobber the write */
+    }
+  }
+  provenance.hjemmeside = { source_url: evidenceUrl, fetched_at: new Date().toISOString() };
+
+  const applyWithAudit = db.transaction(() => {
+    const upd = db.prepare(
+      `UPDATE experience_providers SET hjemmeside = @hjemmeside, field_provenance = @field_provenance, updated_at = datetime('now')
+        WHERE id = @id AND (hjemmeside IS NULL OR TRIM(hjemmeside) = '')`
+    ).run({ id: providerId, hjemmeside: cleanUrl, field_provenance: JSON.stringify(provenance) });
+    if (upd.changes === 0) throw new Error("hjemmeside_filled_concurrently");
+    db.prepare(
+      `INSERT INTO gardssalg_content_audit
+         (id, provider_id, field_name, old_value, new_value, source_url, batch_id, changed_by, changed_at)
+       VALUES (@id, @provider_id, 'hjemmeside', @old_value, @new_value, @source_url, @batch_id, 'system', datetime('now'))`
+    ).run({
+      id: uuid(),
+      provider_id: providerId,
+      old_value: row.hjemmeside ?? null,
+      new_value: cleanUrl,
+      source_url: evidenceUrl,
+      batch_id: batchId ?? null,
+    });
+  });
+  try {
+    applyWithAudit();
+  } catch (e: any) {
+    if (String(e?.message) === "hjemmeside_filled_concurrently") return [];
+    throw e;
+  }
+
+  return ["hjemmeside"];
+}
+
 // ─── Gårdssalg content rollback (dev-request 2026-07-18-gardssalg-
 // profilkvalitet-foer-outreach, slice 1; widened in slice 3 to also cover
 // applyGardssalgProviderAddress's adresse/postnummer/poststed writes) ────────
@@ -2977,6 +3278,9 @@ const GARDSSALG_ROLLBACKABLE_FIELDS = new Set([
   // slice 5b (2026-07-19) — fill-only org_nr backfill (Brreg name-search +
   // exact-name/postal corroboration; see applyGardssalgProviderOrgnr below)
   "org_nr",
+  // skive B (2026-07-19, komplett-foer-synlig) — fill-only hjemmeside adopted
+  // from the website-discovery review queue; see applyGardssalgProviderWebsite
+  "hjemmeside",
 ]);
 // source_url marker stamped on audit rows inserted BY a rollback itself
 // (as opposed to rows inserted by a content-refresh write) — lets

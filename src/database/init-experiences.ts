@@ -509,6 +509,51 @@ export function initExperiencesSchema(db: Database.Database): void {
     console.error("Migration gardssalg_orgnr_review_queue failed:", err);
   }
 
+  // ─── gardssalg_website_review_queue (dev-request 2026-07-19-gardssalg-
+  // nye-agenter-komplett-foer-synlig, skive B) ───────────────────────────────
+  // Website-discovery candidates for gårdssalg providers whose hjemmeside is
+  // blank: a domain-pattern candidate that VERIFIED (the fetched page carries
+  // the provider's org_nr, or its exact name together with its kommune/
+  // poststed) lands here — NEVER written directly to the row. Adoption goes
+  // through POST /admin/gardssalg-website-review-approve, the same strict
+  // confirmation-surface contract as the org_nr queue: only the queued
+  // (provider_id, url) pair can be approved. Deliberately a SEPARATE table
+  // from gardssalg_orgnr_review_queue (whose UNIQUE(provider_id) upsert
+  // idiom this mirrors): sharing that table would make a website candidate
+  // overwrite a provider's pending org_nr candidate and vice versa —
+  // two different decisions must not evict each other.
+  try {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS gardssalg_website_review_queue (
+        id TEXT PRIMARY KEY,
+        provider_id TEXT NOT NULL UNIQUE,
+        provider_name TEXT,
+        candidate_url TEXT NOT NULL,
+        final_url TEXT,
+        evidence TEXT,
+        confidence REAL,
+        reason TEXT NOT NULL DEFAULT 'website_discovery_candidate',
+        batch_id TEXT,
+        created_at TEXT NOT NULL DEFAULT (datetime('now')),
+        updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+        FOREIGN KEY (provider_id) REFERENCES experience_providers(id) ON DELETE CASCADE
+      )
+    `);
+    db.exec(`CREATE INDEX IF NOT EXISTS idx_gardssalg_website_review_queue_reason ON gardssalg_website_review_queue(reason)`);
+  } catch (err) {
+    console.error("Migration gardssalg_website_review_queue failed:", err);
+  }
+
+  // Per-provider attempt stamp for website discovery (skive B) — its own
+  // column, NOT last_content_attempt_at (that one orders the content-refresh
+  // selector; overloading it would let a website-discovery sweep push
+  // never-content-refreshed rows to the back of the content queue). Same
+  // anti-starvation role as the content stamp: the discovery selector orders
+  // never-attempted first, then oldest attempt.
+  try {
+    db.exec("ALTER TABLE experience_providers ADD COLUMN website_discovery_attempted_at TEXT");
+  } catch { /* already present */ }
+
   // ─── Gårdssalg dark-launch-stop (dev-request 2026-07-12-gardssalg-dark-
   // launch-stop, slice 0) ────────────────────────────────────────────────────
   // The gårdssalg booking flow has been live on prod since 2026-07-03 but no
