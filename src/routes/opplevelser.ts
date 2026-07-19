@@ -66,6 +66,26 @@ import {
   getGardssalgProviderAddressTarget,
   applyGardssalgProviderAddress,
   type GardssalgAddressEnrichmentTarget,
+  // dev-request 2026-07-18-gardssalg-profilkvalitet-foer-outreach, slice 5b —
+  // org_nr backfill via Brreg name-search + exact-name/postal corroboration
+  // (auto-write only when both agree; otherwise the review queue).
+  selectGardssalgProvidersForOrgnrBackfill,
+  getGardssalgProviderOrgnrTarget,
+  applyGardssalgProviderOrgnr,
+  gardssalgOrgnrAutoWriteEligible,
+  upsertGardssalgOrgnrReviewQueue,
+  clearGardssalgOrgnrReviewQueueEntry,
+  listGardssalgOrgnrReviewQueue,
+  type GardssalgOrgnrBackfillTarget,
+  // slice 5b integration hardening (2026-07-19 review) — display-suffix
+  // strip before search + rolled-back veto.
+  gardssalgSearchName,
+  gardssalgOrgnrWasRolledBack,
+  // slice 5d — shared-/directory-domain guard on the content-refresh route
+  // (the hanen.no cross-contamination incident): exclusion decided BEFORE
+  // any fetch, reported in its own additive response bucket.
+  gardssalgSharedHostCounts,
+  gardssalgContentExclusionReason,
   // dev-request 2026-07-04-opplevagent-dedup-og-norske-titler, item 1 —
   // re-harvest guard (never insert/resurrect a duplicate already known/merged)
   findExistingExperienceMatch,
@@ -120,6 +140,11 @@ import { fetchBrregBusinessAddress, BRREG_BASE_URL, BRREG_SEARCH_PATH } from "..
 // homepage on CREATE. See isAggregatorWebsite()/firstNonAggregatorWebsite()
 // below, near the bulk-load handler that consumes them.
 import { isDirectoryOrAggregatorHost } from "../services/cross-source-validator";
+// dev-request 2026-07-18-gardssalg-profilkvalitet-foer-outreach, slice 5b —
+// Brreg name-search (candidate generator only, see gardssalgOrgnrAutoWriteEligible);
+// verifyOrgNumber (existing, cached) backs the write-bar's liveness veto — an
+// exact-name match to a bankrupt/deregistered org must never claim a row.
+import { findOrgnumberByName, verifyOrgNumber } from "../services/brreg-client";
 import {
   createBooking,
   getBookingByRef,
@@ -871,7 +896,22 @@ async function crFetchGardssalgContent(
   let pagesFetched = 1;
   try {
     const u = new URL(fetchUrl);
-    const base = `${u.protocol}//${u.host}`;
+    // Slice 5d: sub-page candidates resolve relative to the STORED URL's
+    // section, not the host root. For the normal case (hjemmeside is the
+    // site root) this is identical to the old `${protocol}//${host}` base;
+    // for a deep-path hjemmeside it keeps the crawl inside that page's own
+    // section instead of walking onto whatever else the host serves — the
+    // exact mechanism behind the 2026-07-19 hanen.no cross-contamination
+    // (directory root's /om-oss described the directory org, not the farm).
+    // An extensionless last segment ("/medlem/gard-x") is treated as a
+    // section of its own (integration review M1) — only an explicit file
+    // ("/index.html") falls back to its parent directory.
+    let dir = u.pathname;
+    if (!dir.endsWith("/")) {
+      const lastSeg = dir.slice(dir.lastIndexOf("/") + 1);
+      dir = lastSeg.includes(".") ? dir.replace(/[^/]*$/, "") : `${dir}/`;
+    }
+    const base = `${u.protocol}//${u.host}${dir === "/" ? "" : dir.replace(/\/$/, "")}`;
     for (const path of GARDSSALG_CONTENT_PATHS) {
       if (pagesFetched >= GARDSSALG_MAX_PAGES) break;
       const sub = await crFetchHtml(`${base}${path}`);
@@ -947,6 +987,14 @@ router.post("/admin/gardssalg-content-refresh", requireAdmin, async (req: Reques
   // Providers that crossed the 3-failure parking threshold THIS run
   // (enrichment-metode slice 1; mirrors provenance-batch's parked_now).
   const parkedNow: string[] = [];
+  // Slice 5d — shared-/directory-domain guard (the 2026-07-19 hanen.no
+  // cross-contamination incident, caught live by the slice-4b identity
+  // audit): a provider whose hjemmeside lives on a directory/DMO domain, or
+  // on a host shared by 2+ providers in this catalog, is EXCLUDED from all
+  // content fetching/writing and reported here — never silently dropped.
+  // Host counts are computed once per request (cheap, two-digit catalog).
+  const excludedSharedDomain: Array<{ provider_id: string; reason: string }> = [];
+  const sharedHostCounts = gardssalgSharedHostCounts();
 
   async function processOne(t: GardssalgContentRefreshTarget): Promise<void> {
     const providerId = t.id;
@@ -954,9 +1002,22 @@ router.post("/admin/gardssalg-content-refresh", requireAdmin, async (req: Reques
     // Stamp the attempt UNCONDITIONALLY (apply mode only) before doing any
     // fetch/extraction work — same "cycle to the back of the queue on any
     // outcome" reasoning as the experiences-table route above (see
-    // markProviderContentAttempted's doc comment).
+    // markProviderContentAttempted's doc comment). This INCLUDES providers
+    // the shared-domain guard below excludes (integration review B2): an
+    // unstamped excluded provider would stay permanently first in the
+    // last_content_attempt_at-ordered auto-select and starve the queue's
+    // limit slots forever — stamping cycles it to the back like every other
+    // no-progress outcome.
     if (apply) {
       try { markProviderContentAttempted(providerId); } catch { /* best-effort */ }
+    }
+
+    // Shared-domain guard — before lock/fetch: an excluded provider must
+    // never touch the network or receive content writes.
+    const exclusionReason = gardssalgContentExclusionReason(t.hjemmeside, sharedHostCounts);
+    if (exclusionReason) {
+      excludedSharedDomain.push({ provider_id: providerId, reason: exclusionReason });
+      return;
     }
 
     // LOCK check — from the target's own row snapshot, BEFORE any fetch, so a
@@ -1133,6 +1194,9 @@ router.post("/admin/gardssalg-content-refresh", requireAdmin, async (req: Reques
     errors,
     // Providers parked (3 consecutive fetch failures) during THIS run.
     parked_now: parkedNow,
+    // Slice 5d: providers excluded by the shared-/directory-domain guard —
+    // additive bucket; every excluded provider is visible, never dropped.
+    excluded_shared_domain: excludedSharedDomain,
   });
 });
 
@@ -1318,6 +1382,232 @@ router.post("/admin/gardssalg-address-enrichment", requireAdmin, async (req: Req
     unresolved,
     errors,
   });
+});
+
+// ─── POST /api/opplevelser/admin/gardssalg-orgnr-backfill (admin) ───────────
+//
+// dev-request 2026-07-18-gardssalg-profilkvalitet-foer-outreach, slice 5b.
+// Slice 4's batch report found 0/74 gårdssalg providers have org_nr set,
+// which starves slice 3's Brreg address-enrichment (a direct-by-orgnr
+// lookup) of the key it needs — this endpoint backfills org_nr itself, using
+// Brreg's name-search (findOrgnumberByName, brreg-client.ts) as a CANDIDATE
+// GENERATOR ONLY. Per Daniel's binding identitetskrav (slice 4-GO, ordrett:
+// "vær sikker på at man ikke krysser ulike agenter med data" / "ved tvil:
+// ikke skriv"), a candidate is auto-written ONLY when Brreg's own confidence
+// is the exact-match tier (1.0) AND this route's own independent postal
+// corroboration (gardssalgOrgnrAutoWriteEligible, experience-store.ts) also
+// agrees — see that function's doc comment for the exact gate. Every other
+// outcome (no Brreg candidate, sub-1.0 confidence, or a corroboration
+// mismatch/no-signal) is NEVER auto-written: it's upserted into
+// gardssalg_orgnr_review_queue for a human to resolve, and bucketed
+// `unresolved` in this response (reason "needs_human_review" or
+// "no_brreg_candidate").
+//
+// Body: { providerIds?: string[], limit?: number, apply?: boolean }. Same
+// dry-run-by-default convention, providerIds de-dup-before-limit, and
+// hard-cap-at-48 convention as every other gårdssalg admin route in this
+// file (mirrors GS_AE_DEFAULT_LIMIT/GS_AE_HARD_CAP's role above).
+//
+// NB: MUST come before "/:id" so "admin" isn't swallowed as an id param.
+
+const GS_OB_DEFAULT_LIMIT = 48;
+const GS_OB_HARD_CAP = 48; // there are only 74 gårdssalg providers total
+
+router.post("/admin/gardssalg-orgnr-backfill", requireAdmin, async (req: Request, res: Response) => {
+  const body = (req.body ?? {}) as { providerIds?: unknown; limit?: unknown; apply?: unknown };
+
+  const apply =
+    body.apply === true ||
+    body.apply === 1 ||
+    body.apply === "1" ||
+    body.apply === "true" ||
+    req.query?.apply === "1" ||
+    req.query?.apply === "true";
+  const dryRun = !apply;
+
+  const limit = Math.min(
+    typeof body.limit === "number" && body.limit > 0 ? Math.floor(body.limit) : GS_OB_DEFAULT_LIMIT,
+    GS_OB_HARD_CAP
+  );
+
+  let targets: GardssalgOrgnrBackfillTarget[];
+  if (Array.isArray(body.providerIds) && body.providerIds.length > 0) {
+    const ids = Array.from(
+      new Set(
+        (body.providerIds as unknown[])
+          .filter((id): id is string => typeof id === "string" && id.trim().length > 0)
+          .map((id) => id.trim())
+      )
+    ).slice(0, limit);
+    targets = ids
+      .map((id) => getGardssalgProviderOrgnrTarget(id))
+      .filter((t): t is GardssalgOrgnrBackfillTarget => t !== null);
+  } else {
+    targets = selectGardssalgProvidersForOrgnrBackfill(limit);
+  }
+
+  let scanned = 0;
+  const changed: Array<{ provider_id: string; org_nr: string; source_url: string }> = [];
+  const skippedLocked: string[] = [];
+  const unresolved: Array<{ provider_id: string; reason: string }> = [];
+  const errors: Array<{ provider_id: string; error: string }> = [];
+
+  for (const t of targets) {
+    const providerId = t.id;
+
+    if (t.content_source === "manual" || t.content_source === "claim") {
+      skippedLocked.push(providerId);
+      continue;
+    }
+
+    if (t.org_nr && t.org_nr.trim() !== "") {
+      // Only reachable via the explicit providerIds override (the auto-
+      // selector already filters blank-org_nr) — nothing to backfill.
+      unresolved.push({ provider_id: providerId, reason: "already_filled" });
+      continue;
+    }
+
+    // Integration hardening (2026-07-19 review): search with the catalog's
+    // display suffix ("— Sted") stripped — an exact company-name match must
+    // not be demoted to the 0.8x tier by our own display convention. When
+    // stripping actually changed the name, the write bar is tightened below.
+    const searchName = gardssalgSearchName(t.navn);
+    const nameWasStripped = searchName !== t.navn.replace(/\s+/g, " ").trim();
+
+    let hit: Awaited<ReturnType<typeof findOrgnumberByName>>;
+    try {
+      hit = await findOrgnumberByName(searchName, t.postnummer);
+    } catch (e: any) {
+      errors.push({ provider_id: providerId, error: e?.message ?? String(e) });
+      continue;
+    }
+    scanned++;
+
+    if (!hit) {
+      unresolved.push({ provider_id: providerId, reason: "no_brreg_candidate" });
+      upsertGardssalgOrgnrReviewQueue({
+        provider_id: providerId,
+        provider_name: t.navn,
+        candidate_orgnr: null,
+        candidate_name: null,
+        candidate_confidence: null,
+        candidate_address: null,
+        reason: "no_brreg_candidate",
+      });
+      continue;
+    }
+
+    // ── Write-bar veto chain (integration review B1/M3/M5) — each veto is a
+    // review-queue outcome, never a write. Order: cheapest checks first.
+    let vetoReason: string | null = null;
+    if ((hit.exact_ties ?? (hit.confidence === 1.0 ? 1 : 0)) > 1) {
+      // ≥2 exact-name hits in one response (ENK vs AS with the same pruned
+      // name, bankrupt predecessor + successor, …): which one wins is
+      // response-order luck — structurally ambiguous, a human must pick.
+      vetoReason = "ambiguous_exact_name_ties";
+    } else if (nameWasStripped && !(t.postnummer && hit.brreg_postal && t.postnummer.trim() === hit.brreg_postal.trim())) {
+      // The name we searched is OUR truncation of the display name — demand
+      // the strongest corroboration channel (exact postnummer) before
+      // trusting a match against a name we ourselves shortened.
+      vetoReason = "stripped_name_requires_postal_match";
+    } else {
+      // A human deliberately rolled this provider's org_nr back — the same
+      // deterministic Brreg answer must not silently re-apply it. The audit
+      // lookup itself is best-effort (an audit-storage failure must surface
+      // through the WRITE path's own error handling, not turn this read
+      // into a request-killing 500).
+      let rolledBack = false;
+      try { rolledBack = gardssalgOrgnrWasRolledBack(providerId); } catch { rolledBack = false; }
+      if (rolledBack) vetoReason = "previously_rolled_back";
+    }
+    if (!vetoReason && gardssalgOrgnrAutoWriteEligible(t, hit)) {
+      // Liveness LAST (one extra Brreg call, cached): an exact-name match to
+      // a bankrupt/deregistered org must not claim the row — the successor
+      // entity case is exactly the wrong-identity write Daniel's rule bans.
+      try {
+        const ver = await verifyOrgNumber(hit.orgnumber);
+        if (!ver.exists || !ver.active) vetoReason = "brreg_not_active";
+      } catch {
+        vetoReason = "brreg_verify_failed";
+      }
+    }
+    if (vetoReason) {
+      unresolved.push({ provider_id: providerId, reason: vetoReason });
+      upsertGardssalgOrgnrReviewQueue({
+        provider_id: providerId,
+        provider_name: t.navn,
+        candidate_orgnr: hit.orgnumber,
+        candidate_name: hit.name,
+        candidate_confidence: hit.confidence,
+        candidate_address: hit.address,
+        reason: vetoReason,
+      });
+      continue;
+    }
+
+    if (!gardssalgOrgnrAutoWriteEligible(t, hit)) {
+      unresolved.push({ provider_id: providerId, reason: "needs_human_review" });
+      upsertGardssalgOrgnrReviewQueue({
+        provider_id: providerId,
+        provider_name: t.navn,
+        candidate_orgnr: hit.orgnumber,
+        candidate_name: hit.name,
+        candidate_confidence: hit.confidence,
+        candidate_address: hit.address,
+        reason: "needs_human_review",
+      });
+      continue;
+    }
+
+    const evidenceUrl = `${BRREG_BASE_URL}${BRREG_SEARCH_PATH}/${encodeURIComponent(hit.orgnumber)}`;
+
+    if (dryRun) {
+      changed.push({ provider_id: providerId, org_nr: hit.orgnumber, source_url: evidenceUrl });
+    } else {
+      try {
+        const written = applyGardssalgProviderOrgnr(providerId, hit.orgnumber, evidenceUrl);
+        if (written.length > 0) {
+          changed.push({ provider_id: providerId, org_nr: hit.orgnumber, source_url: evidenceUrl });
+          // A confirmed, applied write supersedes any stale review-queue
+          // entry an earlier run may have left for this provider.
+          clearGardssalgOrgnrReviewQueueEntry(providerId);
+        } else {
+          // Fresh-read-at-write-time found the field already non-blank, the
+          // provider now locked, or (UNIQUE org_nr) another provider already
+          // holds this exact org_nr — same race class documented on the
+          // address-enrichment route above. Bucketed, not silently dropped.
+          unresolved.push({ provider_id: providerId, reason: "already_filled_or_conflict_at_write_time" });
+        }
+      } catch (e: any) {
+        errors.push({ provider_id: providerId, error: `write_failed: ${e?.message ?? String(e)}` });
+      }
+    }
+  }
+
+  res.json({
+    dry_run: dryRun,
+    scanned,
+    agents_enriched: changed.length,
+    changed,
+    skipped_locked: skippedLocked,
+    unresolved,
+    errors,
+  });
+});
+
+// ─── GET /api/opplevelser/admin/gardssalg-orgnr-review-queue (admin) ────────
+//
+// dev-request 2026-07-18-gardssalg-profilkvalitet-foer-outreach, slice 5b.
+// Read-only listing of every gårdssalg provider the backfill route above
+// could NOT auto-confirm an org_nr for — the durable counterpart to that
+// route's per-run `unresolved[]` array (see gardssalg_orgnr_review_queue's
+// schema doc comment, init-experiences.ts). No UI reads this yet; it exists
+// so Daniel/CS has something to query once a triage surface is built.
+//
+// NB: MUST come before "/:id" so "admin" isn't swallowed as an id param.
+router.get("/admin/gardssalg-orgnr-review-queue", requireAdmin, (_req: Request, res: Response) => {
+  const entries = listGardssalgOrgnrReviewQueue();
+  res.json({ count: entries.length, entries });
 });
 
 // ─── POST /api/opplevelser/admin/gardssalg-content-rollback (admin) ─────────
