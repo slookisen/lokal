@@ -2710,16 +2710,38 @@ const GARDSSALG_REWRITE_MAX_LEN = 500;
 // (newlines → space) since the template renders one flow anyway.
 function stripMarkdownArtifacts(s: string): string {
   return s
-    .replace(/^#{1,6}\s+/gm, "")            // # headings
+    .replace(/^#{1,6}\s+/gm, "")            // # headings (marker only — text kept)
+    // Bullets BEFORE bold/italic (review finding, round 1): on "* Vi har
+    // *mange* gode øl" the bullet star would otherwise pair with the
+    // italic's opening star and leak a raw "*" into the result. The bullet
+    // regex requires whitespace after the marker, so "*kursiv*"/"**fet**"
+    // at line start are untouched. A plain "- " reply-dash at line start is
+    // knowingly eaten too (acceptable in this domain; typographic "– "/"— "
+    // are preserved).
+    .replace(/^\s*[-*•]\s+/gm, "")          // list bullets at line start
     .replace(/\*\*([^*]+)\*\*/g, "$1")      // **bold**
     .replace(/__([^_]+)__/g, "$1")          // __bold__
-    .replace(/\*([^*\n]+)\*/g, "$1")        // *italic* (paired, same line)
+    // Paired same-line italics — but only when the stars hug the text
+    // ("*ord*"), so spaced multiplication signs ("2 * 3") never pair up and
+    // silently change meaning; they instead survive to the residual check
+    // below and reject the candidate (skip, never corrupt).
+    .replace(/\*(\S(?:[^*\n]*?\S)?)\*/g, "$1")
     .replace(/`+/g, "")                      // code ticks
-    .replace(/^\s*[-*•]\s+/gm, "")          // list bullets at line start
     .replace(/\s*\n+\s*/g, " ")             // newlines → single-paragraph flow
     .replace(/ {2,}/g, " ")
     .trim();
 }
+
+// Fail-closed residual check (review finding, round 1): stripping handles the
+// well-formed shapes, but unpaired "**", "_kursiv_", spaced "*" etc. can
+// survive it — and this contract is "no markdown artifact ever reaches the
+// public page", not "most don't". Any leftover marker → reject the candidate
+// entirely (skip-not-publish, same bias as the rest of the never-fabricate
+// contract). Underscore is included: legitimate underscores in this prose are
+// essentially nonexistent (a URL-bearing candidate is fine to skip), and
+// rejecting beats corrupting. This also makes the one-pass strip safe despite
+// not being strictly idempotent — nothing with residual syntax ever lands.
+const GARDSSALG_REWRITE_RESIDUAL_MARKDOWN = /[*#`_]/;
 
 export async function generateGardssalgAboutRewrite(
   sourceText: string,
@@ -2779,6 +2801,16 @@ Bruk KUN fakta som faktisk står i kildeteksten under. Ikke finn på detaljer, p
   // formatting syntax (a 205-char candidate that is 195 chars of prose plus
   // asterisks must be rejected as too short, not accepted).
   const plain = stripMarkdownArtifacts(cleaned);
+
+  // Residual markers after stripping (unpaired "**", "_x_", spaced "*", …)
+  // → reject outright; see GARDSSALG_REWRITE_RESIDUAL_MARKDOWN's comment.
+  if (GARDSSALG_REWRITE_RESIDUAL_MARKDOWN.test(plain)) return null;
+
+  // Sentinel embedded/wrapped rather than verbatim (review finding, round 1:
+  // "**INGEN_UTVIDELSE_MULIG**", or the sentinel inside ≥200 chars of prose)
+  // must also count as "no expansion possible" — the raw === check above only
+  // catches the exact form the prompt asks for.
+  if (plain.includes(GARDSSALG_REWRITE_SENTINEL)) return null;
 
   // Length gate enforced in code, not trusted to the prompt alone (spec
   // requirement) — reject anything outside [200, 500], never truncate.
