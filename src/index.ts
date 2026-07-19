@@ -123,6 +123,19 @@ app.use((req, res, next) => {
   next();
 });
 
+// ─── trailing slash → canonical URL (301) ───────────────────
+// /bergen/ and /produsent/<slug>/ used to render 200 as duplicates of the
+// slashless canonical; GSC 2026-07 listed ~700 such "alternate page with
+// proper canonical tag" entries. A 301 consolidates them instead of leaving
+// two crawlable copies of every page.
+app.use((req, res, next) => {
+  if ((req.method === "GET" || req.method === "HEAD") && req.path.length > 1 && req.path.endsWith("/")) {
+    const query = req.originalUrl.slice(req.path.length);
+    return res.redirect(301, req.path.replace(/\/+$/, "") + query);
+  }
+  next();
+});
+
 // ─── Security Layer ──────────────────────────────────────────
 app.use(securityHeaders);
 app.use(cors(corsOptions));
