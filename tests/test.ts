@@ -16261,6 +16261,161 @@ const _orchPr18BulkLoadPromise: Promise<void> = new Promise<void>((r) => {
     // Sanity: the Brreg fetch was actually exercised (stub, not network).
     assertTrue(brregCalls.length > 0, "bl-7: Brreg fetch stub was called (no real network)");
 
+    // ── bl-agg: dev-request 2026-07-19-agg-website-leak — a harvest row's
+    // `website` must never be blindly trusted as a provider's OWN homepage on
+    // CREATE when it's a KNOWN aggregator/directory host (e.g. hanen.no,
+    // confirmed present in KNOWN_DIRECTORY_HOSTS). All three providers below
+    // are new names the Brreg stub doesn't recognize (→ unverified), each
+    // carries an evidence_url so it clears the evidence-backed insert gate.
+    {
+      // bl-agg-1: NEW provider whose ONLY row's website is a known aggregator
+      // host → created provider's hjemmeside must be null, not the
+      // aggregator URL.
+      const r1 = await bulkReq(
+        {
+          experiences: [
+            {
+              title: "Aggregator-Only Opplevelse",
+              provider_name: "Aggregator Only Provider AS",
+              category: "annet",
+              kommune: "Lillehammer",
+              fylke: "Innlandet",
+              indoor_outdoor: "both",
+              evidence_url: "https://www.hanen.no/produsent/aggregator-only",
+              website: "https://www.hanen.no/produsent/aggregator-only",
+              confidence: "low",
+            },
+          ],
+          apply: true,
+        },
+        ADMIN_KEY_18
+      );
+      assertEq(r1.status, 200, "bl-agg-1a: apply → 200");
+      assertEq(r1.body.providers_inserted, 1, "bl-agg-1b: 1 provider inserted (unverified+evidence)");
+      const row1 = dbExp18
+        .prepare("SELECT hjemmeside FROM experience_providers WHERE navn = 'Aggregator Only Provider AS'")
+        .get() as { hjemmeside: string | null } | undefined;
+      assertTrue(!!row1, "bl-agg-1c: provider row exists");
+      assertEq(row1!.hjemmeside, null, "bl-agg-1d: hjemmeside is null, NOT the aggregator (hanen.no) URL");
+
+      // bl-agg-2: NEW provider with 2 rows — the FIRST row's website is a
+      // known aggregator host, the SECOND row's website is a real domain.
+      // Order-independence: the aggregator row is listed first, but the
+      // created provider's hjemmeside must be the real domain.
+      const r2 = await bulkReq(
+        {
+          experiences: [
+            {
+              title: "Mixed Website Opplevelse A",
+              provider_name: "Mixed Website Provider AS",
+              category: "annet",
+              kommune: "Bergen",
+              fylke: "Vestland",
+              indoor_outdoor: "both",
+              evidence_url: "https://www.hanen.no/produsent/mixed-website",
+              website: "https://www.hanen.no/produsent/mixed-website",
+              confidence: "low",
+            },
+            {
+              title: "Mixed Website Opplevelse B",
+              provider_name: "Mixed Website Provider AS",
+              category: "annet",
+              kommune: "Bergen",
+              fylke: "Vestland",
+              indoor_outdoor: "both",
+              website: "https://myrealprovider.no",
+              confidence: "low",
+            },
+          ],
+          apply: true,
+        },
+        ADMIN_KEY_18
+      );
+      assertEq(r2.status, 200, "bl-agg-2a: apply → 200");
+      assertEq(r2.body.providers_inserted, 1, "bl-agg-2b: 1 provider inserted (unverified+evidence)");
+      const row2 = dbExp18
+        .prepare("SELECT hjemmeside FROM experience_providers WHERE navn = 'Mixed Website Provider AS'")
+        .get() as { hjemmeside: string | null } | undefined;
+      assertTrue(!!row2, "bl-agg-2c: provider row exists");
+      assertEq(
+        row2!.hjemmeside,
+        "https://myrealprovider.no",
+        "bl-agg-2d: hjemmeside is the real domain, not the aggregator (hanen.no) URL, despite aggregator row being first"
+      );
+
+      // bl-agg-3: regression guard — NEW provider with only a real,
+      // non-aggregator website → unchanged behavior (hjemmeside is still
+      // that real domain; the fix is not overly aggressive).
+      const r3 = await bulkReq(
+        {
+          experiences: [
+            {
+              title: "Real Website Opplevelse",
+              provider_name: "Real Website Provider AS",
+              category: "annet",
+              kommune: "Trondheim",
+              fylke: "Trøndelag",
+              indoor_outdoor: "both",
+              evidence_url: "https://myotherrealprovider.no/om-oss",
+              website: "https://myotherrealprovider.no",
+              confidence: "low",
+            },
+          ],
+          apply: true,
+        },
+        ADMIN_KEY_18
+      );
+      assertEq(r3.status, 200, "bl-agg-3a: apply → 200");
+      assertEq(r3.body.providers_inserted, 1, "bl-agg-3b: 1 provider inserted (unverified+evidence)");
+      const row3 = dbExp18
+        .prepare("SELECT hjemmeside FROM experience_providers WHERE navn = 'Real Website Provider AS'")
+        .get() as { hjemmeside: string | null } | undefined;
+      assertTrue(!!row3, "bl-agg-3c: provider row exists");
+      assertEq(
+        row3!.hjemmeside,
+        "https://myotherrealprovider.no",
+        "bl-agg-3d: non-aggregator website is unchanged (regression guard)"
+      );
+
+      // bl-agg-4: the actual 2026-07-12 production incident this dev-request
+      // cites — visitinnlandet.no (regional tourism aggregator) landed in 5
+      // providers' hjemmeside via bulk-load, and every content-refresh fetch
+      // against it then failed (http_unreachable). Reproduces that exact
+      // domain to prove THIS incident, not just a generic aggregator, is
+      // actually caught (visitinnlandet.no was added to KNOWN_DIRECTORY_HOSTS
+      // as part of this same slice — it was not previously in the set).
+      const r4 = await bulkReq(
+        {
+          experiences: [
+            {
+              title: "Innlandet Aggregator Opplevelse",
+              provider_name: "Innlandet Aggregator Provider AS",
+              category: "annet",
+              kommune: "Lillehammer",
+              fylke: "Innlandet",
+              indoor_outdoor: "both",
+              evidence_url: "https://www.visitinnlandet.no/listings/some-listing",
+              website: "https://www.visitinnlandet.no/listings/some-listing",
+              confidence: "low",
+            },
+          ],
+          apply: true,
+        },
+        ADMIN_KEY_18
+      );
+      assertEq(r4.status, 200, "bl-agg-4a: apply → 200");
+      assertEq(r4.body.providers_inserted, 1, "bl-agg-4b: 1 provider inserted (unverified+evidence)");
+      const row4 = dbExp18
+        .prepare("SELECT hjemmeside FROM experience_providers WHERE navn = 'Innlandet Aggregator Provider AS'")
+        .get() as { hjemmeside: string | null } | undefined;
+      assertTrue(!!row4, "bl-agg-4c: provider row exists");
+      assertEq(
+        row4!.hjemmeside,
+        null,
+        "bl-agg-4d: hjemmeside is null, NOT the visitinnlandet.no URL (the real 2026-07-12 incident domain)"
+      );
+    }
+
     // ── Cleanup ───────────────────────────────────────────────────────
     expBrreg18.__setBrregFetchForTesting(null);
     dbFactory18.__resetDbFactoryForTesting();

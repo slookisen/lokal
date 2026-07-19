@@ -114,6 +114,12 @@ import { classifyProvider, sleep, BrregClass } from "../services/experience-brre
 // Brønnøysundregistrene business-address lookup (same GET /enheter/{orgNr}
 // endpoint verifyOrgNumber()/fetchBrregActivityDescription() already call).
 import { fetchBrregBusinessAddress, BRREG_BASE_URL, BRREG_SEARCH_PATH } from "../services/brreg-client";
+// dev-request 2026-07-19-agg-website-leak — reuse the curated DMO/aggregator
+// host classifier (same one admin-knowledge.ts's classifyWebsite() uses) so a
+// harvest row's `website` is never blindly trusted as a provider's OWN
+// homepage on CREATE. See isAggregatorWebsite()/firstNonAggregatorWebsite()
+// below, near the bulk-load handler that consumes them.
+import { isDirectoryOrAggregatorHost } from "../services/cross-source-validator";
 import {
   createBooking,
   getBookingByRef,
@@ -279,6 +285,42 @@ const BulkLoadSchema = z.object({
 });
 type BulkRow = z.infer<typeof BulkRowSchema>;
 
+// dev-request 2026-07-19-agg-website-leak: a 2026-07-12 harvest run wrote a
+// regional tourism-aggregator/DMO page (a KNOWN_DIRECTORY_HOSTS entry) into
+// 5 providers' `hjemmeside` on CREATE — those providers have since failed
+// every enrichment content-refresh fetch (http_unreachable), because
+// content-refresh fetches whatever's in `hjemmeside`. A harvest row's
+// `website` is evidence of where the provider was DISCOVERED, not proof it's
+// the provider's OWN site, so it must be screened the same way
+// admin-knowledge.ts's classifyWebsite()/parsedHostForUrl() screen
+// agents.url/knowledge.website before treating a host as aggregator-owned.
+//
+// Permissive by design: only KNOWN aggregator/directory hosts are rejected;
+// a merely-malformed or unparseable URL is NOT rejected here (that's a
+// separate concern from provenance-trust, and over-rejecting would silently
+// drop a real homepage the harvester just formatted oddly).
+function isAggregatorWebsite(raw: string): boolean {
+  let parsed: URL;
+  try {
+    // Same scheme-fallback convention as admin-knowledge.ts's parsedHostForUrl.
+    const withScheme = /^https?:\/\//i.test(raw) ? raw : `http://${raw}`;
+    parsed = new URL(withScheme);
+  } catch {
+    return false;
+  }
+  const host = parsed.hostname.toLowerCase().replace(/^www\./, "");
+  if (!host) return false;
+  return isDirectoryOrAggregatorHost(host);
+}
+
+// First row's `website` that is truthy AND not a known aggregator/directory
+// host, else null. Used for the provider-CREATE `hjemmeside` write only (see
+// below) — order-independent: an aggregator-host row earlier in `rows` is
+// skipped in favor of a later row with a real domain.
+function firstNonAggregatorWebsite(rows: BulkRow[]): string | null {
+  return rows.find((r) => r.website && !isAggregatorWebsite(r.website))?.website ?? null;
+}
+
 const MAX_PROVIDERS_PER_CALL = 200;
 const BRREG_PACE_MS = 200; // 150–300ms politeness window between Brreg calls
 
@@ -371,7 +413,7 @@ router.post("/admin/bulk-load", requireAdmin, async (req: Request, res: Response
           org_nr: verdict.org_nr,
           kommune,
           fylke: rows.find((r) => r.fylke)?.fylke ?? null,
-          hjemmeside: rows.find((r) => r.website)?.website ?? null,
+          hjemmeside: firstNonAggregatorWebsite(rows),
           naeringskode: verdict.naeringskode ?? null,
           brreg_verified: verdict.brreg_verified,
           brreg_active: verdict.brreg_active,
