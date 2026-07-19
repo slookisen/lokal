@@ -51,6 +51,13 @@ import {
   planGardssalgContentRollback,
   applyGardssalgContentRollback,
   type GardssalgRollbackPlanItem,
+  // dev-request 2026-07-18-gardssalg-profilkvalitet-foer-outreach, slice 3 —
+  // Brreg street-address backfill (fills adresse/postnummer/poststed only;
+  // geocoding is out of scope, experiences-geocode-worker.ts picks it up)
+  selectGardssalgProvidersForAddressEnrichment,
+  getGardssalgProviderAddressTarget,
+  applyGardssalgProviderAddress,
+  type GardssalgAddressEnrichmentTarget,
   // dev-request 2026-07-04-opplevagent-dedup-og-norske-titler, item 1 —
   // re-harvest guard (never insert/resurrect a duplicate already known/merged)
   findExistingExperienceMatch,
@@ -95,6 +102,10 @@ import {
   extractOpeningHours,
 } from "../services/search-enrich";
 import { classifyProvider, sleep, BrregClass } from "../services/experience-brreg";
+// dev-request 2026-07-18-gardssalg-profilkvalitet-foer-outreach, slice 3 —
+// Brønnøysundregistrene business-address lookup (same GET /enheter/{orgNr}
+// endpoint verifyOrgNumber()/fetchBrregActivityDescription() already call).
+import { fetchBrregBusinessAddress, BRREG_BASE_URL, BRREG_SEARCH_PATH } from "../services/brreg-client";
 import {
   createBooking,
   getBookingByRef,
@@ -1018,15 +1029,202 @@ router.post("/admin/gardssalg-content-refresh", requireAdmin, async (req: Reques
   });
 });
 
+// ─── POST /api/opplevelser/admin/gardssalg-address-enrichment (admin) ───────
+//
+// dev-request 2026-07-18-gardssalg-profilkvalitet-foer-outreach, slice 3.
+// Of the 74 gårdssalg provider profiles, only 42 have a street `adresse`
+// filled in — this blocks the "Sted" (location) section of their public
+// profile and blocks experiences-geocode-worker.ts (which already geocodes
+// any provider that HAS an adresse+postnummer via Kartverket, but does
+// nothing when those fields are simply blank). This endpoint fills ONLY the
+// missing address TEXT from Brreg (the authoritative Norwegian business
+// registry) — it does NOT geocode anything; the existing geocode worker
+// picks up newly-filled addresses automatically on its next scheduled tick.
+//
+// Body: { providerIds?: string[], limit?: number, apply?: boolean }. Same
+// dry-run-by-default convention as every other admin route in this file
+// (apply=1/"1"/true body, or ?apply=1/?apply=true query). limit defaults to
+// (and is hard-capped at) 48 — mirrors GS_CR_HARD_CAP's role, scoped to this
+// route's own ceiling (there are only 74 gårdssalg providers total, and only
+// a fraction lack org_nr or have a blank adresse).
+//
+// Target selection: explicit providerIds (de-duplicated, first occurrence
+// wins, before the limit slice — a caller-supplied duplicate must not be
+// scanned/written twice) via getGardssalgProviderAddressTarget (filtered for
+// nulls) OR auto-select via selectGardssalgProvidersForAddressEnrichment.
+// Per target: locked (content_source manual/claim) -> skipped_locked, no Brreg
+// call. Otherwise calls fetchBrregBusinessAddress(org_nr) — a lightweight
+// direct-by-orgnr lookup, not a multi-page crawl, so this uses a plain
+// sequential loop (no CR_CONCURRENCY fan-out needed). null / no usable street
+// address -> unresolved (reason: "no_brreg_street_address"); a thrown
+// exception -> errors. A usable address computes which of adresse/
+// postnummer/poststed are currently blank per the target's own row snapshot;
+// if that projection is already empty -> unresolved (reason:
+// "already_filled"). Otherwise dry-run records the projection without
+// writing; apply calls applyGardssalgProviderAddress(), which re-reads the
+// row at write time and returns only what it ACTUALLY wrote (may be a subset
+// of the projection, e.g. postnummer already filled by a concurrent write
+// since the snapshot was taken) -> unresolved (reason:
+// "already_filled_at_write_time") if that turns out to be empty too. Every
+// `scanned` target lands in exactly one of changed/skipped_locked/
+// unresolved/errors — no branch silently drops a target.
+//
+// NB: MUST come before "/:id" so "admin" isn't swallowed as an id param.
+
+const GS_AE_DEFAULT_LIMIT = 48;
+const GS_AE_HARD_CAP = 48; // there are only 74 gårdssalg providers total
+
+router.post("/admin/gardssalg-address-enrichment", requireAdmin, async (req: Request, res: Response) => {
+  const body = (req.body ?? {}) as { providerIds?: unknown; limit?: unknown; apply?: unknown };
+
+  // apply: dry-run by default. apply=1/"1"/true (body) or ?apply=1/?apply=true (query).
+  const apply =
+    body.apply === true ||
+    body.apply === 1 ||
+    body.apply === "1" ||
+    body.apply === "true" ||
+    req.query?.apply === "1" ||
+    req.query?.apply === "true";
+  const dryRun = !apply;
+
+  const limit = Math.min(
+    typeof body.limit === "number" && body.limit > 0 ? Math.floor(body.limit) : GS_AE_DEFAULT_LIMIT,
+    GS_AE_HARD_CAP
+  );
+
+  // ── Target selection ──────────────────────────────────────────────
+  // providerIds is de-duplicated (first occurrence wins) BEFORE the limit
+  // slice and BEFORE target resolution: nothing here validates that a
+  // caller's providerIds array is duplicate-free, and processing the same
+  // id twice in one request served no purpose (the second pass is always
+  // either a stale-snapshot re-scan of a row the first pass already wrote,
+  // or — pre-existing-fix below — a harmless but pointless already_filled
+  // no-op). De-duping up front is strictly more useful than leaving it to
+  // fall through the loop: it avoids a redundant Brreg call and a doubled
+  // `scanned` count for what is, from the caller's perspective, one target.
+  let targets: GardssalgAddressEnrichmentTarget[];
+  if (Array.isArray(body.providerIds) && body.providerIds.length > 0) {
+    const ids = Array.from(
+      new Set(
+        (body.providerIds as unknown[])
+          .filter((id): id is string => typeof id === "string" && id.trim().length > 0)
+          .map((id) => id.trim())
+      )
+    ).slice(0, limit);
+    targets = ids
+      .map((id) => getGardssalgProviderAddressTarget(id))
+      .filter((t): t is GardssalgAddressEnrichmentTarget => t !== null);
+  } else {
+    targets = selectGardssalgProvidersForAddressEnrichment(limit);
+  }
+
+  let scanned = 0;
+  type GsAeProvenanceMap = Record<string, { source_url: string }>;
+  const changed: Array<{ provider_id: string; fields: string[]; provenance: GsAeProvenanceMap }> = [];
+  const skippedLocked: string[] = [];
+  const unresolved: Array<{ provider_id: string; reason: string }> = [];
+  const errors: Array<{ provider_id: string; error: string }> = [];
+
+  function isBlank(v: unknown): boolean {
+    return v === null || v === undefined || String(v).trim() === "";
+  }
+
+  for (const t of targets) {
+    const providerId = t.id;
+
+    // LOCK check — from the target's own row snapshot, so a locked provider
+    // never triggers a Brreg call at all.
+    if (t.content_source === "manual" || t.content_source === "claim") {
+      skippedLocked.push(providerId);
+      continue;
+    }
+
+    let candidate: { adresse: string | null; postnummer: string | null; poststed: string | null } | null;
+    try {
+      candidate = await fetchBrregBusinessAddress(t.org_nr);
+    } catch (e: any) {
+      errors.push({ provider_id: providerId, error: e?.message ?? String(e) });
+      continue;
+    }
+    scanned++;
+
+    if (!candidate || !candidate.adresse) {
+      unresolved.push({ provider_id: providerId, reason: "no_brreg_street_address" });
+      continue;
+    }
+
+    const wouldWrite: string[] = [];
+    if (isBlank(t.adresse) && candidate.adresse) wouldWrite.push("adresse");
+    if (isBlank(t.postnummer) && candidate.postnummer) wouldWrite.push("postnummer");
+    if (isBlank(t.poststed) && candidate.poststed) wouldWrite.push("poststed");
+
+    if (wouldWrite.length === 0) {
+      // Only reachable via the explicit providerIds override (which
+      // deliberately does not pre-filter on blank-address, so an admin can
+      // force a lookup on any gårdssalg provider): Brreg returned a usable
+      // address, but every target field was already non-blank, so there's
+      // nothing left to fill. Route to `unresolved` (not a silent
+      // `continue`) so every `scanned` provider lands in exactly one bucket.
+      unresolved.push({ provider_id: providerId, reason: "already_filled" });
+      continue;
+    }
+
+    const evidenceUrl = `${BRREG_BASE_URL}${BRREG_SEARCH_PATH}/${encodeURIComponent(t.org_nr)}`;
+    const provenance: GsAeProvenanceMap = {};
+    for (const f of wouldWrite) provenance[f] = { source_url: evidenceUrl };
+
+    if (dryRun) {
+      changed.push({ provider_id: providerId, fields: wouldWrite, provenance });
+    } else {
+      try {
+        const written = applyGardssalgProviderAddress(providerId, candidate, evidenceUrl);
+        if (written.length > 0) {
+          changed.push({ provider_id: providerId, fields: written, provenance });
+        } else {
+          // applyGardssalgProviderAddress does its own fresh DB read at
+          // write time, which can find every target field already
+          // non-blank even though this loop's earlier (pre-await, and for
+          // providerIds, pre-loop) `t`/`wouldWrite` snapshot said otherwise
+          // — e.g. a concurrent request wrote this same row in between (no
+          // row lock is held across this loop). De-duping providerIds
+          // above closes the same-request-duplicate trigger, but this
+          // fresh-read result can still legitimately be empty via that
+          // race, so it's handled here too rather than assumed unreachable.
+          // Route to `unresolved`, not a silent fall-through, so every
+          // `scanned` provider still lands in exactly one bucket — same
+          // invariant the wouldWrite.length === 0 branch above enforces at
+          // the pre-write check.
+          unresolved.push({ provider_id: providerId, reason: "already_filled_at_write_time" });
+        }
+      } catch (e: any) {
+        errors.push({ provider_id: providerId, error: `write_failed: ${e?.message ?? String(e)}` });
+      }
+    }
+  }
+
+  res.json({
+    dry_run: dryRun,
+    scanned,
+    agents_enriched: changed.length,
+    changed,
+    skipped_locked: skippedLocked,
+    unresolved,
+    errors,
+  });
+});
+
 // ─── POST /api/opplevelser/admin/gardssalg-content-rollback (admin) ─────────
 //
-// dev-request 2026-07-18-gardssalg-profilkvalitet-foer-outreach, slice 1.
-// Daniel wants a full content-quality pass over all 74 gårdssalg producer
-// profiles run in ONE batch with NO canary; the agreed-upon substitute
-// safety net is that every field write made by the content pipeline
-// (applyGardssalgProviderContent, above) is reversible via the
-// gardssalg_content_audit changelog + experience_providers.field_provenance
-// columns (see init-experiences.ts / experience-store.ts). This endpoint is
+// dev-request 2026-07-18-gardssalg-profilkvalitet-foer-outreach, slice 1
+// (widened in slice 3 to also cover applyGardssalgProviderAddress's address
+// fields). Daniel wants a full content-quality pass over all 74 gårdssalg
+// producer profiles run in ONE batch with NO canary; the agreed-upon
+// substitute safety net is that every field write made by the content
+// pipeline (applyGardssalgProviderContent AND applyGardssalgProviderAddress,
+// both in experience-store.ts) is reversible via the gardssalg_content_audit
+// changelog + experience_providers.field_provenance columns (see
+// init-experiences.ts / experience-store.ts and GARDSSALG_ROLLBACKABLE_FIELDS
+// there for the exact set of rollback-eligible field names). This endpoint is
 // that rollback lever. This slice builds ONLY the rollback substrate — it
 // does not change what content gets written by the batch pass.
 //

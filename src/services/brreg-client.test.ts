@@ -18,6 +18,8 @@ import {
   pickBrregActivityDescription,
   fetchBrregActivityDescription,
   __clearBrregActivityDescriptionCacheForTesting,
+  fetchBrregBusinessAddress,
+  __clearBrregAddressCacheForTesting,
   type BrregVerifyResult,
 } from "./brreg-client";
 
@@ -276,6 +278,103 @@ export async function runBrregClientTests(opts: { log?: boolean } = {}): Promise
     __clearBrregActivityDescriptionCacheForTesting();
     const emptyOrgNr = await fetchBrregActivityDescription("", fetchImplFound);
     assertEq(emptyOrgNr, null, "fetch-desc: empty org-nr -> null without calling fetch");
+  }
+
+  // ── fetchBrregBusinessAddress (dev-request 2026-07-18-gardssalg- ────────
+  //    profilkvalitet-foer-outreach, slice 3) ──────────────────────────────
+  {
+    // (a) usable forretningsadresse -> parsed correctly.
+    __clearBrregAddressCacheForTesting();
+    const fetchImplForretning = makeFetch((url) => {
+      assertTrue(url.includes("/enheter/910244132"), "address: URL hits /enheter/{orgnr} direct endpoint");
+      return jsonResponse(200, {
+        organisasjonsnummer: "910244132",
+        navn: "Gårdsbutikken Test AS",
+        forretningsadresse: {
+          adresse: ["Gårdsveien 12"],
+          postnummer: "2850",
+          poststed: "Lena",
+        },
+        postadresse: {
+          adresse: ["Postboks 5"],
+          postnummer: "2850",
+          poststed: "Lena",
+        },
+      });
+    });
+    const addrForretning = await fetchBrregBusinessAddress("910244132", fetchImplForretning);
+    assertEq(
+      addrForretning,
+      { adresse: "Gårdsveien 12", postnummer: "2850", poststed: "Lena" },
+      "address: usable forretningsadresse parsed correctly, takes priority over postadresse",
+    );
+
+    // (b) forretningsadresse present but no street line, postadresse has one
+    //     -> falls back to postadresse.
+    __clearBrregAddressCacheForTesting();
+    const fetchImplFallback = makeFetch(() =>
+      jsonResponse(200, {
+        organisasjonsnummer: "910244133",
+        navn: "Fallback Gard AS",
+        forretningsadresse: { adresse: [], postnummer: "2850", poststed: "Lena" },
+        postadresse: { adresse: ["Postveien 3"], postnummer: "2851", poststed: "Kolbu" },
+      })
+    );
+    const addrFallback = await fetchBrregBusinessAddress("910244133", fetchImplFallback);
+    assertEq(
+      addrFallback,
+      { adresse: "Postveien 3", postnummer: "2851", poststed: "Kolbu" },
+      "address: forretningsadresse has no street line -> falls back to postadresse",
+    );
+
+    // (c) neither has a street line -> null.
+    __clearBrregAddressCacheForTesting();
+    const fetchImplNeither = makeFetch(() =>
+      jsonResponse(200, {
+        organisasjonsnummer: "910244134",
+        navn: "Ingen Gate AS",
+        forretningsadresse: { adresse: [], postnummer: "2850", poststed: "Lena" },
+        postadresse: { postnummer: "2850", poststed: "Lena" },
+      })
+    );
+    const addrNeither = await fetchBrregBusinessAddress("910244134", fetchImplNeither);
+    assertEq(addrNeither, null, "address: neither forretningsadresse nor postadresse has a street line -> null");
+
+    // (d) 404 -> null.
+    __clearBrregAddressCacheForTesting();
+    const fetchImplAddr404 = makeFetch(() => jsonResponse(404, { message: "not found" }));
+    const addr404 = await fetchBrregBusinessAddress("000000000", fetchImplAddr404);
+    assertEq(addr404, null, "address: 404 -> null");
+
+    // (e) network error -> null (never throws).
+    __clearBrregAddressCacheForTesting();
+    const fetchImplAddrErr = (async () => {
+      throw new Error("simulated network failure");
+    }) as unknown as typeof fetch;
+    const addrErr = await fetchBrregBusinessAddress("123456789", fetchImplAddrErr);
+    assertEq(addrErr, null, "address: network error -> null (never throws)");
+
+    // (f) empty org-nr -> null without calling fetch.
+    __clearBrregAddressCacheForTesting();
+    const emptyOrgNrAddr = await fetchBrregBusinessAddress("", fetchImplForretning);
+    assertEq(emptyOrgNrAddr, null, "address: empty org-nr -> null without calling fetch");
+
+    // (g) missing adresse.postnummer/poststed still returns the street line
+    //     (address usable even without postnummer/poststed).
+    __clearBrregAddressCacheForTesting();
+    const fetchImplNoPostal = makeFetch(() =>
+      jsonResponse(200, {
+        organisasjonsnummer: "910244135",
+        navn: "Ingen Postnummer AS",
+        forretningsadresse: { adresse: ["Bare Gate 1"] },
+      })
+    );
+    const addrNoPostal = await fetchBrregBusinessAddress("910244135", fetchImplNoPostal);
+    assertEq(
+      addrNoPostal,
+      { adresse: "Bare Gate 1", postnummer: null, poststed: null },
+      "address: usable street line with no postnummer/poststed -> those default to null",
+    );
   }
 
   return { passed, failed, failures };

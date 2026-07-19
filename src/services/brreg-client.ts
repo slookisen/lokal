@@ -201,6 +201,11 @@ type RawEnhetDetail = {
   naeringskode1?: { kode?: string } | null;
   naeringskode2?: { kode?: string } | null;
   naeringskode3?: { kode?: string } | null;
+  // Additive (dev-request 2026-07-18-gardssalg-profilkvalitet-foer-outreach,
+  // slice 3) — fetchBrregBusinessAddress() reads these; verifyOrgNumber()
+  // never has, so their addition here is a no-op for every existing caller.
+  forretningsadresse?: RawBrregAddress | null;
+  postadresse?: RawBrregAddress | null;
 };
 
 const SAFE_DEFAULT_VERIFY_RESULT: BrregVerifyResult = {
@@ -394,6 +399,108 @@ export async function fetchBrregActivityDescription(
 
   const result = pickBrregActivityDescription(json);
   activityDescriptionCache.set(cleanOrgNr, result);
+  return result;
+}
+
+// ─── Business address (dev-request 2026-07-18-gardssalg-profilkvalitet- ──
+//     foer-outreach, slice 3) ─────────────────────────────────────────────
+//
+// fetchBrregBusinessAddress(orgNr) returns Brreg's registered street address
+// (forretningsadresse, falling back to postadresse when forretningsadresse
+// has no usable street line) for a given org number — used to backfill
+// experience_providers.adresse/postnummer/poststed for gårdssalg providers
+// that never had a street address filled in (only 42 of 74 do). Hits the
+// SAME GET /enheter/{orgNr} endpoint verifyOrgNumber() and
+// fetchBrregActivityDescription() already call, reading yet another field
+// neither of those two reads. Never throws — same safe-default discipline.
+//
+// "Usable" mirrors formatBrregAddress's existing convention above (used by
+// findOrgnumberByName): only a non-empty `adresse` (street line) array
+// counts as usable — a bare postnummer/poststed with no street line is not
+// useful for our purposes, so pickBrregAddress returns null (not a partial
+// object) rather than a result with adresse: null but postnummer/poststed
+// filled in.
+
+export type BrregAddress = {
+  adresse: string | null;     // street line only, e.g. "Gårdsveien 12"
+  postnummer: string | null;
+  poststed: string | null;
+};
+
+function pickBrregAddress(
+  forretningsadresse: RawBrregAddress | null | undefined,
+  postadresse: RawBrregAddress | null | undefined,
+): BrregAddress | null {
+  for (const addr of [forretningsadresse, postadresse]) {
+    if (!addr) continue;
+    const street = Array.isArray(addr.adresse)
+      ? addr.adresse.filter((s): s is string => typeof s === "string" && s.trim() !== "").join(", ")
+      : "";
+    if (!street) continue; // no usable street line on this sub-object — try the next one
+    return {
+      adresse: street,
+      postnummer:
+        typeof addr.postnummer === "string" && addr.postnummer.trim() !== "" ? addr.postnummer.trim() : null,
+      poststed: typeof addr.poststed === "string" && addr.poststed.trim() !== "" ? addr.poststed.trim() : null,
+    };
+  }
+  return null;
+}
+
+// Own small per-process cache keyed by orgNr — deliberately NOT shared with
+// verifyCache/activityDescriptionCache (each of these three org-nr lookup
+// functions caches independently, mirroring the file's existing convention).
+const addressCache: Map<string, BrregAddress | null> = new Map();
+
+export function __clearBrregAddressCacheForTesting(): void {
+  addressCache.clear();
+}
+
+/**
+ * fetchBrregBusinessAddress(orgNr) — direct Brreg lookup by org-nr
+ * (GET /enheter/{orgNr}), returning the registered street address (see
+ * pickBrregAddress above for the forretningsadresse -> postadresse fallback
+ * and "usable street line" rule). Never throws: any network/parse error,
+ * 404, or "no usable street line anywhere" resolves to null — same
+ * safe-default convention as verifyOrgNumber/fetchBrregActivityDescription.
+ * Does not do fuzzy name matching; the org-nr is already known.
+ */
+export async function fetchBrregBusinessAddress(
+  orgNr: string,
+  fetchImpl: typeof fetch = fetch,
+): Promise<BrregAddress | null> {
+  const cleanOrgNr = (orgNr || "").trim();
+  if (!cleanOrgNr) return null;
+
+  if (addressCache.has(cleanOrgNr)) return addressCache.get(cleanOrgNr) ?? null;
+
+  const url = `${BRREG_BASE_URL}${BRREG_SEARCH_PATH}/${encodeURIComponent(cleanOrgNr)}`;
+  let res: Response;
+  try {
+    res = await fetchWithTimeout(url, REQUEST_TIMEOUT_MS, fetchImpl);
+  } catch (err) {
+    console.warn(
+      "[brreg-client] fetchBrregBusinessAddress fetch failed:",
+      err instanceof Error ? err.message : err,
+    );
+    return null;
+  }
+
+  if (res.status === 404) {
+    addressCache.set(cleanOrgNr, null);
+    return null;
+  }
+  if (!res.ok) return null;
+
+  let json: RawEnhetDetail;
+  try {
+    json = (await res.json()) as RawEnhetDetail;
+  } catch {
+    return null;
+  }
+
+  const result = pickBrregAddress(json.forretningsadresse, json.postadresse);
+  addressCache.set(cleanOrgNr, result);
   return result;
 }
 

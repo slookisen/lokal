@@ -26652,6 +26652,25 @@ Promise.allSettled(_oaHomeCountersDeps).then(async () => {
     for (const f of gcar.failures) failures.push("opplevelser-gardssalg-content-audit: " + f);
     console.log(`  opplevelser-gardssalg-content-audit: ${gcar.passed} passed, ${gcar.failed} failed`);
 
+    // dev-request 2026-07-18-gardssalg-profilkvalitet-foer-outreach, slice 3:
+    // Brreg street-address backfill — selectGardssalgProvidersForAddressEnrichment()/
+    // getGardssalgProviderAddressTarget()/applyGardssalgProviderAddress()
+    // (src/services/experience-store.ts) and POST /admin/gardssalg-address-
+    // enrichment (src/routes/opplevelser.ts). Fills ONLY the missing
+    // adresse/postnummer/poststed text from Brreg for gårdssalg providers
+    // that have an org_nr but a blank adresse — does not geocode (out of
+    // scope, experiences-geocode-worker.ts already does that once
+    // adresse+postnummer are non-blank). Same in-memory-DB pattern, runs
+    // sequentially inside this same gated block for the same reason.
+    console.log("\n── opplevelser-gardssalg-address-enrichment: Brreg street-address backfill ──");
+    const { runOpplevelserGardssalgAddressEnrichmentTests } = require("../src/routes/opplevelser-gardssalg-address-enrichment.test") as
+      typeof import("../src/routes/opplevelser-gardssalg-address-enrichment.test");
+    const gaer = await runOpplevelserGardssalgAddressEnrichmentTests({ log: false });
+    passed += gaer.passed;
+    failed += gaer.failed;
+    for (const f of gaer.failures) failures.push("opplevelser-gardssalg-address-enrichment: " + f);
+    console.log(`  opplevelser-gardssalg-address-enrichment: ${gaer.passed} passed, ${gaer.failed} failed`);
+
     // dev-request 2026-07-04-opplevagent-dedup-og-norske-titler, item 3
     // (detail completeness weave): GET /admin/detail-completeness-coverage —
     // read-only, catalog-wide booking_url/phone/website coverage report over

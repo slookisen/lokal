@@ -2154,16 +2154,243 @@ export function applyGardssalgProviderContent(
   return written;
 }
 
+// ─── Gårdssalg address enrichment (dev-request 2026-07-18-gardssalg-
+//     profilkvalitet-foer-outreach, slice 3) ─────────────────────────────────
+//
+// Of the 74 gårdssalg provider profiles, only 42 have a street `adresse`
+// filled in — this blocks the "Sted" (location) section of their public
+// profile and blocks experiences-geocode-worker.ts (which already geocodes
+// any provider that HAS an adresse+postnummer via Kartverket, but does
+// nothing for providers where those fields are simply blank). This backfills
+// ONLY the missing address text from Brreg (brreg-client.ts's
+// fetchBrregBusinessAddress) — it does NOT geocode anything; the existing
+// geocode worker picks up newly-filled addresses automatically on its next
+// scheduled tick.
+//
+// Mirrors selectGardssalgProvidersForContentRefresh/
+// getGardssalgProviderContentTarget/applyGardssalgProviderContent above:
+// same gårdssalg scoping WHERE clause (producer_type set OR rfb-seed), same
+// lock guard (content_source in manual/claim never auto-overwritten), same
+// gardssalg_content_audit + field_provenance write discipline. UNLIKE the
+// content-refresh writer, this is FILL-ONLY for all three fields — there is
+// no "thin address" concept (an existing address, however short, e.g. just
+// a road name with no number, is left untouched; only about_text/visit_text
+// have a replace-thin-content path, per slice 2). Also deliberately does
+// NOT stamp content_source/content_evidence_url: those are the about/visit/
+// hours website-crawl provenance fields, and stamping them here would
+// incorrectly imply the whole profile came from a website crawl when only
+// the address came from Brreg. Address provenance lives solely in
+// field_provenance.
+
+export type GardssalgAddressEnrichmentTarget = {
+  id: string;
+  navn: string;
+  org_nr: string;
+  content_source: string | null;
+  adresse: string | null;
+  postnummer: string | null;
+  poststed: string | null;
+};
+
+/**
+ * Auto-select gårdssalg providers eligible for a Brreg address backfill:
+ * gårdssalg providers (producer_type set OR rfb-seed) WITH an org_nr, NOT
+ * locked (content_source not in manual/claim), and with a blank adresse.
+ * Excludes catalog_hidden=1 rows (the hidden booking-flyt-v1 test provider),
+ * matching the same exclusion listGardssalgProviders()/
+ * countGardssalgProviders() already apply — providerParkingExclusionSql()
+ * itself only gates on homepage_unreachable_since (irrelevant here, this
+ * function never fetches a homepage), so the catalog_hidden exclusion is
+ * applied directly, the same raw `(catalog_hidden IS NULL OR
+ * catalog_hidden != 1)` clause those two functions use.
+ * Ordered oldest-created first (ORDER BY created_at ASC) — there's no
+ * per-address-attempt timestamp column to reuse here (out of scope for this
+ * one-shot backfill), so plain creation order is used instead of the
+ * last_content_attempt_at ordering the content-refresh selector uses.
+ * Hard-capped at 48 (mirrors selectGardssalgProvidersForContentRefresh's cap).
+ */
+export function selectGardssalgProvidersForAddressEnrichment(limit = 48): GardssalgAddressEnrichmentTarget[] {
+  const db = getDb(VERTICAL);
+  const cap = Math.max(1, Math.min(48, limit));
+  return db
+    .prepare(
+      `SELECT id, navn, org_nr, content_source, adresse, postnummer, poststed
+         FROM experience_providers
+        WHERE (producer_type IS NOT NULL OR rfb_seed_source = 'rfb-seed')
+          AND org_nr IS NOT NULL AND TRIM(org_nr) != ''
+          AND (content_source IS NULL OR content_source NOT IN ('manual','claim'))
+          AND (adresse IS NULL OR TRIM(adresse) = '')
+          AND (catalog_hidden IS NULL OR catalog_hidden != 1)
+        ORDER BY created_at ASC
+        LIMIT ?`
+    )
+    .all(cap) as GardssalgAddressEnrichmentTarget[];
+}
+
+/**
+ * Resolve an explicit providerId for the address-enrichment route's
+ * `providerIds` override. Scoped to the gårdssalg WHERE clause (producer_type
+ * set OR rfb-seed) — NOT the blank-adresse/lock filters above, so an admin
+ * can force a lookup for a provider that isn't currently "eligible" by the
+ * auto-select query (mirrors getGardssalgProviderContentTarget's override
+ * semantics). Returns null when the provider doesn't exist, isn't a
+ * gårdssalg provider, or has no org_nr.
+ */
+export function getGardssalgProviderAddressTarget(providerId: string): GardssalgAddressEnrichmentTarget | null {
+  const db = getDb(VERTICAL);
+  const row = db
+    .prepare(
+      `SELECT id, navn, org_nr, content_source, adresse, postnummer, poststed
+         FROM experience_providers
+        WHERE id = ?
+          AND (producer_type IS NOT NULL OR rfb_seed_source = 'rfb-seed')`
+    )
+    .get(providerId) as GardssalgAddressEnrichmentTarget | undefined;
+  if (!row || !row.org_nr || row.org_nr.trim().length === 0) return null;
+  return row;
+}
+
+/**
+ * Apply a Brreg address candidate to ONE gårdssalg provider, respecting the
+ * lock gate: NEVER writes anything if the provider is locked (content_source
+ * 'manual'/'claim'). FILL-ONLY for all three fields — adresse/postnummer/
+ * poststed are each written only if the row's current value is blank AND
+ * the candidate has content; an existing non-blank value (however short) is
+ * never replaced (unlike about_text/visit_text, there is no "thin address"
+ * quality bar). In the same transaction: UPDATEs the written fields +
+ * updated_at, INSERTs one gardssalg_content_audit row per field actually
+ * written (old_value = pre-write snapshot, new_value = what was written,
+ * source_url = evidenceUrl, batch_id = optional batchId — same shape as
+ * applyGardssalgProviderContent's audit inserts), and merges a
+ * {source_url, fetched_at} entry into field_provenance for each written
+ * field (read-modify-write, preserving existing entries for other fields).
+ * Deliberately does NOT touch content_source/content_evidence_url (see the
+ * section doc comment above). Returns the field names actually written
+ * (empty array if nothing to write — e.g. the row already has all three
+ * fields, or the provider is locked). Idempotent: a second call against an
+ * already-fully-filled row writes nothing.
+ */
+export function applyGardssalgProviderAddress(
+  providerId: string,
+  candidate: { adresse?: string | null; postnummer?: string | null; poststed?: string | null },
+  evidenceUrl: string,
+  batchId?: string
+): string[] {
+  const db = getDb(VERTICAL);
+  const row = db
+    .prepare(
+      `SELECT id, content_source, adresse, postnummer, poststed, field_provenance
+         FROM experience_providers WHERE id = ?`
+    )
+    .get(providerId) as
+    | {
+        id: string;
+        content_source: string | null;
+        adresse: string | null;
+        postnummer: string | null;
+        poststed: string | null;
+        field_provenance: string | null;
+      }
+    | undefined;
+  if (!row) return [];
+  if (row.content_source === "manual" || row.content_source === "claim") return [];
+
+  function isBlank(v: unknown): boolean {
+    return v === null || v === undefined || String(v).trim() === "";
+  }
+
+  const sets: string[] = [];
+  const params: Record<string, unknown> = { id: providerId };
+  const written: string[] = [];
+  // Pre-write snapshot — captured BEFORE any write below, so the audit
+  // trail's old_value is always the true pre-write value.
+  const oldValues: Record<string, string | null> = {
+    adresse: row.adresse,
+    postnummer: row.postnummer,
+    poststed: row.poststed,
+  };
+
+  if (isBlank(row.adresse) && candidate.adresse?.trim()) {
+    sets.push("adresse = @adresse");
+    params.adresse = candidate.adresse.trim();
+    written.push("adresse");
+  }
+  if (isBlank(row.postnummer) && candidate.postnummer?.trim()) {
+    sets.push("postnummer = @postnummer");
+    params.postnummer = candidate.postnummer.trim();
+    written.push("postnummer");
+  }
+  if (isBlank(row.poststed) && candidate.poststed?.trim()) {
+    sets.push("poststed = @poststed");
+    params.poststed = candidate.poststed.trim();
+    written.push("poststed");
+  }
+
+  if (sets.length === 0) return [];
+
+  sets.push("updated_at = datetime('now')");
+
+  // ── field_provenance merge (read-modify-write, preserves other fields) ──
+  let provenance: Record<string, { source_url: string; fetched_at: string }> = {};
+  if (row.field_provenance) {
+    try {
+      const parsed = JSON.parse(row.field_provenance);
+      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+        provenance = parsed as Record<string, { source_url: string; fetched_at: string }>;
+      }
+    } catch {
+      /* malformed existing JSON -> treat as empty rather than clobber the write */
+    }
+  }
+  const fetchedAt = new Date().toISOString();
+  for (const f of written) {
+    provenance[f] = { source_url: evidenceUrl, fetched_at: fetchedAt };
+  }
+  sets.push("field_provenance = @field_provenance");
+  params.field_provenance = JSON.stringify(provenance);
+
+  const applyWithAudit = db.transaction(() => {
+    db.prepare(`UPDATE experience_providers SET ${sets.join(", ")} WHERE id = @id`).run(params);
+    const insertAudit = db.prepare(
+      `INSERT INTO gardssalg_content_audit
+         (id, provider_id, field_name, old_value, new_value, source_url, batch_id, changed_by, changed_at)
+       VALUES (@id, @provider_id, @field_name, @old_value, @new_value, @source_url, @batch_id, 'system', datetime('now'))`
+    );
+    for (const f of written) {
+      insertAudit.run({
+        id: uuid(),
+        provider_id: providerId,
+        field_name: f,
+        old_value: oldValues[f] ?? null,
+        new_value: (params[f] as string | undefined) ?? null,
+        source_url: evidenceUrl,
+        batch_id: batchId ?? null,
+      });
+    }
+  });
+  applyWithAudit();
+
+  return written;
+}
+
 // ─── Gårdssalg content rollback (dev-request 2026-07-18-gardssalg-
-// profilkvalitet-foer-outreach, slice 1) ─────────────────────────────────────
+// profilkvalitet-foer-outreach, slice 1; widened in slice 3 to also cover
+// applyGardssalgProviderAddress's adresse/postnummer/poststed writes) ────────
 // Reads/writes gardssalg_content_audit + experience_providers.<field> to
 // undo a gårdssalg content-refresh write. Backs POST /admin/gardssalg-
 // content-rollback (routes/opplevelser.ts). Only the fields
-// applyGardssalgProviderContent() can ever write are rollback-eligible —
-// field_name is validated against this fixed allow-list BEFORE it is ever
-// interpolated into SQL, since field_name can arrive directly from an admin
-// request body.
-const GARDSSALG_ROLLBACKABLE_FIELDS = new Set(["about_text", "visit_text", "opening_hours_text"]);
+// applyGardssalgProviderContent()/applyGardssalgProviderAddress() can ever
+// write are rollback-eligible — field_name is validated against this fixed
+// allow-list BEFORE it is ever interpolated into SQL, since field_name can
+// arrive directly from an admin request body.
+const GARDSSALG_ROLLBACKABLE_FIELDS = new Set([
+  "about_text",
+  "visit_text",
+  "opening_hours_text",
+  "adresse",
+  "postnummer",
+  "poststed",
+]);
 // source_url marker stamped on audit rows inserted BY a rollback itself
 // (as opposed to rows inserted by a content-refresh write) — lets
 // planGardssalgContentRollback tell the two apart for idempotency (see its
@@ -2225,8 +2452,9 @@ function resolveGardssalgRollbackTargets(
  * back (or was never actually changed) — skipped as "already_current"
  * rather than restorable, so a rollback is never blindly re-applied.
  * A field/provider with no audit row at all is skipped as "no_audit_row".
- * An unknown field_name (not one of the 3 gårdssalg content-refresh writes)
- * is skipped as "unknown_field" and never reaches SQL interpolation.
+ * An unknown field_name (not one of the gårdssalg content-refresh/address-
+ * enrichment writes in GARDSSALG_ROLLBACKABLE_FIELDS) is skipped as
+ * "unknown_field" and never reaches SQL interpolation.
  */
 export function planGardssalgContentRollback(
   opts: GardssalgRollbackTarget
