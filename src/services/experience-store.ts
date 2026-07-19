@@ -3087,13 +3087,20 @@ export function gardssalgWebsiteEvidenceMatch(
   }
   const normName = normaliseName(gardssalgSearchName(target.navn));
   const normText = normaliseName(text);
+  // Word-boundary containment in the normalized space (review M2,
+  // 2026-07-19): normaliseName collapses all whitespace to single spaces, so
+  // space-padding both sides gives exact token-boundary semantics — «berg
+  // gard» must NOT verify against a «Berg Gardsdrift» page, and kommune
+  // «Nes» must NOT match «Sandnes»/«Nesbyen» mid-word.
+  const boundaryIncludes = (haystack: string, needle: string): boolean =>
+    needle.length > 0 && ` ${haystack} `.includes(` ${needle} `);
   const nameSpecific = normName.length >= 8 || normName.split(" ").filter(Boolean).length >= 2;
-  const nameFound = nameSpecific && normName.length > 0 && normText.includes(normName);
+  const nameFound = nameSpecific && boundaryIncludes(normText, normName);
   const normKommune = normaliseName(target.kommune || "");
   const normPoststed = normaliseName(target.poststed || "");
   const placeFound =
-    (normKommune.length >= 3 && normText.includes(normKommune)) ||
-    (normPoststed.length >= 3 && normText.includes(normPoststed));
+    (normKommune.length >= 3 && boundaryIncludes(normText, normKommune)) ||
+    (normPoststed.length >= 3 && boundaryIncludes(normText, normPoststed));
   return {
     org_nr_found: orgFound,
     name_found: nameFound,

@@ -141,6 +141,22 @@ export function runOpplevelserGardssalgWebsiteDiscoveryTests(
           { orgNr: null, navn: "Sider", kommune: "Fjordbygda", poststed: null }
         );
         assertEq(ev5.verified, false, "wd-b10: short generic single-token name never verifies on name+place");
+        // Review M2 (2026-07-19): word boundaries in the normalized space.
+        const ev6 = expStore.gardssalgWebsiteEvidenceMatch(
+          "Berg Gardsdrift held til i Nes kommune",
+          { orgNr: null, navn: "Berg Gard", kommune: "Nes", poststed: null }
+        );
+        assertEq(ev6.name_found, false, "wd-b11: name is NOT found mid-word («berg gard» vs «Berg Gardsdrift»)");
+        const ev7 = expStore.gardssalgWebsiteEvidenceMatch(
+          "Vi held til i Sandnes sentrum",
+          { orgNr: null, navn: "Testbryggeriet Nord", kommune: "Nes", poststed: null }
+        );
+        assertEq(ev7.place_found, false, "wd-b12: kommune «Nes» does NOT match inside «Sandnes»");
+        const ev8 = expStore.gardssalgWebsiteEvidenceMatch(
+          "Garden ligg i Nes på Hedmarken",
+          { orgNr: null, navn: "Testbryggeriet Nord", kommune: "Nes", poststed: null }
+        );
+        assertEq(ev8.place_found, true, "wd-b13: kommune «Nes» as its own word still matches (boundaries, not blanket rejection)");
       }
 
       // ═══ Fixtures ═══════════════════════════════════════════════════════
@@ -165,6 +181,12 @@ export function runOpplevelserGardssalgWebsiteDiscoveryTests(
       insertProvider.run({ id: "wd-none", navn: "Ukjent Fjellgard", org_nr: "966666666", kommune: "Lom", poststed: null, hjemmeside: null, catalog_hidden: null, content_source: null, producer_type: "bryggeri" });
       // Test provider — must never be selected nor counted.
       insertProvider.run({ id: "wd-testprov", navn: "Test Gardssalg", org_nr: "977777777", kommune: "Oslo", poststed: null, hjemmeside: "https://testgardssalg.example.no", catalog_hidden: 1, content_source: null, producer_type: "test-gardssalg" });
+      // Redirect-re-check fixtures (review M1): both pages CARRY full
+      // ownership evidence — the ONLY thing that may reject them is the
+      // final-host re-check after the redirect. Deleting that block turns
+      // these into proposals and wd-9 fails.
+      insertProvider.run({ id: "wd-redir-agg", navn: "Omdirigert Gard", org_nr: "988000001", kommune: "Rana", poststed: null, hjemmeside: null, catalog_hidden: null, content_source: null, producer_type: "bryggeri" });
+      insertProvider.run({ id: "wd-redir-taken", navn: "Viderekoblet Gard", org_nr: "988000002", kommune: "Voss", poststed: null, hjemmeside: null, catalog_hidden: null, content_source: null, producer_type: "sideri" });
 
       let fetchCalls: string[] = [];
       globalThis.fetch = (async (url: string | URL | Request) => {
@@ -174,6 +196,15 @@ export function runOpplevelserGardssalgWebsiteDiscoveryTests(
           ({ ok: true, status: 200, url: finalUrl ?? urlStr, text: async () => html } as unknown as Response);
         if (urlStr.startsWith("https://fjelldalbrenneri.no")) {
           return mk("<html><body>Fjelldal Brenneri — org.nr 944 444 444</body></html>");
+        }
+        if (urlStr.startsWith("https://omdirigertgard.no")) {
+          // Full evidence on the page, but the request LANDED on a curated
+          // directory host — only the final-host re-check can reject this.
+          return mk("<html><body>Omdirigert Gard, Rana — org.nr 988000001</body></html>", "https://en.hanen.no/medlem/omdirigert-gard");
+        }
+        if (urlStr.startsWith("https://viderekobletgard.no")) {
+          // Full evidence, but the final host is already carried by wd-owner.
+          return mk("<html><body>Viderekoblet Gard, Voss — org.nr 988000002</body></html>", "https://solbakkengard.no/ny-side");
         }
         if (urlStr.startsWith("https://ukjentfjellgard.no") || urlStr.startsWith("https://ukjent-fjellgard.no")) {
           return mk("<html><body>Parkert domene til salgs</body></html>");
@@ -224,6 +255,26 @@ export function runOpplevelserGardssalgWebsiteDiscoveryTests(
         assertEq(qCnt, 0, "wd-2o: dry-run wrote NOTHING to the queue");
         const stamped = (expDb.prepare(`SELECT COUNT(*) c FROM experience_providers WHERE website_discovery_attempted_at IS NOT NULL`).get() as any).c;
         assertEq(stamped, 0, "wd-2p: dry-run stamped NOTHING");
+      }
+
+      // ── wd-9: redirect-re-check is load-bearing (review M1) — pages with
+      //    FULL evidence must still be rejected when the request lands on an
+      //    excluded/taken final host. ─────────────────────────────────────
+      {
+        const r = await callRoute(opplevelserRouter, {
+          headers: adminHeaders,
+          body: { providerIds: ["wd-redir-agg", "wd-redir-taken"] },
+        });
+        assertEq(r.body.proposed_count, 0, "wd-9a: full on-page evidence proposes NOTHING when the final host is rejected");
+        const aggEx = (r.body.excluded as any[]).find((e) => e.provider_id === "wd-redir-agg");
+        assertTrue(!!aggEx && aggEx.hosts.some((h: any) => h.host === "en.hanen.no" && h.reason === "blocklisted_directory_domain"),
+          "wd-9b: redirect onto a curated directory host rejected by the FINAL-host re-check");
+        const takenEx = (r.body.excluded as any[]).find((e) => e.provider_id === "wd-redir-taken");
+        assertTrue(!!takenEx && takenEx.hosts.some((h: any) => h.host === "solbakkengard.no" && h.reason === "host_already_in_catalog"),
+          "wd-9c: redirect onto a host another provider already carries rejected (identity guard)");
+        const nn = (r.body.no_candidate_verified as any[]).map((e) => e.provider_id).sort();
+        assertEq(JSON.stringify(nn), JSON.stringify(["wd-redir-agg", "wd-redir-taken"]),
+          "wd-9d: both rows fall through to no_candidate_verified — never to proposed");
       }
 
       // ── wd-3: APPLY — queue upserted, attempts stamped (incl. failures). ─
