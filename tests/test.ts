@@ -6208,6 +6208,119 @@ const _pr24Promise = (async function runPr24Tests() {
         // Existing was 1 OPERATIONAL/google_places — re-PUT dedupes → still 1.
         assertEq(provAfterBs.business_status?.length, 1, "pr28-6: business_status dedup still 1");
       }
+
+      // ── orch-pr-20260719 (provenance-legacy-unwrap-bug): the existing-side
+      // normalization loop in mergeFieldProvenance() must unwrap a
+      // {sources:[...]}-wrapped existing entry to its contained array
+      // (mirroring extractSources()'s handling of the incoming side)
+      // BEFORE falling back to the bare-object legacy-single-record wrap.
+      // Pre-fix, a wrapped existing entry was treated as one (malformed)
+      // record, isWellFormedRecord rejected it, and the whole field's
+      // provenance silently collapsed to []. Live data-loss bug fixed
+      // 2026-07-19; see dental.ts PUT /agents/:id which triggered it.
+
+      // ── unwrap-1: exact bug repro — wrapped existing field, unrelated/
+      // empty incoming → the original record must survive, not vanish.
+      {
+        const merged = adminKnowledgeMod.mergeFieldProvenance(
+          {
+            opening_hours: {
+              sources: [
+                { source_type: "homepage", value: "Man-Fre 08-16", fetched_at: "2026-06-01T00:00:00Z", source_url: "https://example.no" },
+              ],
+            },
+          },
+          {},
+        );
+        assertTrue(Array.isArray(merged.opening_hours), "unwrap-1: opening_hours is an array, not dropped");
+        assertEq(merged.opening_hours?.length, 1, "unwrap-1: the one original wrapped record survives (bug: was 0)");
+        assertEq(merged.opening_hours?.[0]?.value, "Man-Fre 08-16", "unwrap-1: surviving record value intact");
+        assertEq(merged.opening_hours?.[0]?.source_type, "homepage", "unwrap-1: surviving record source_type intact");
+      }
+
+      // ── unwrap-2: wrapped existing + incoming addition → both present.
+      {
+        const merged = adminKnowledgeMod.mergeFieldProvenance(
+          {
+            phone: {
+              sources: [{ source_type: "a", value: "1", fetched_at: "t1" }],
+            },
+          },
+          {
+            phone: [{ source_type: "b", value: "2", fetched_at: "t2" }],
+          },
+        );
+        assertEq(merged.phone?.length, 2, "unwrap-2: wrapped existing + incoming both present");
+        const types = (merged.phone || []).map((r) => r.source_type).sort().join(",");
+        assertEq(types, "a,b", "unwrap-2: both source_types present");
+      }
+
+      // ── unwrap-3: wrapped existing with MULTIPLE sources → all survive.
+      {
+        const merged = adminKnowledgeMod.mergeFieldProvenance(
+          {
+            x: {
+              sources: [
+                { source_type: "a", value: "1", fetched_at: "t1" },
+                { source_type: "b", value: "2", fetched_at: "t2" },
+              ],
+            },
+          },
+          {},
+        );
+        assertEq(merged.x?.length, 2, "unwrap-3: both wrapped existing sources survive");
+      }
+
+      // ── unwrap-4: bare legacy single-record shape (NOT wrapped in
+      // `sources`) must keep working exactly as before — this is the
+      // actual "legacy single-record shape (pre-WO-16)" the code comment
+      // refers to, distinct from the {sources:[...]} wrapper.
+      {
+        const merged = adminKnowledgeMod.mergeFieldProvenance(
+          {
+            y: { source_type: "a", value: "1", fetched_at: "t1" },
+          },
+          {},
+        );
+        assertEq(merged.y?.length, 1, "unwrap-4: bare legacy single-record shape still unwraps to 1 record");
+        assertEq(merged.y?.[0]?.source_type, "a", "unwrap-4: bare legacy record source_type intact");
+        assertEq(merged.y?.[0]?.value, "1", "unwrap-4: bare legacy record value intact");
+      }
+
+      // ── unwrap-5: malformed wrapped shapes are tolerated — no throw,
+      // well-formed records kept, the rest dropped.
+      {
+        let threw = false;
+        let mergedA: any = null;
+        try {
+          mergedA = adminKnowledgeMod.mergeFieldProvenance(
+            { z: { sources: "not-an-array" as any } },
+            {},
+          );
+        } catch {
+          threw = true;
+        }
+        assertEq(threw, false, "unwrap-5a: sources:'not-an-array' does not throw");
+        assertEq(mergedA?.z?.length, 0, "unwrap-5a: non-array sources yields no records (nothing well-formed to keep)");
+
+        let mergedB: any = null;
+        try {
+          mergedB = adminKnowledgeMod.mergeFieldProvenance(
+            {
+              z: {
+                sources: [null, { source_type: "a", value: "1", fetched_at: "t1" }] as any,
+              },
+            },
+            {},
+          );
+        } catch {
+          threw = true;
+        }
+        assertEq(threw, false, "unwrap-5b: sources array containing null does not throw");
+        assertEq(mergedB?.z?.length, 1, "unwrap-5b: null entry dropped, well-formed record kept");
+        assertEq(mergedB?.z?.[0]?.source_type, "a", "unwrap-5b: surviving record correct");
+      }
+
       // ── orch-pr-17 (Part B): SAFE correct-not-just-add overwrite guard ──────
       //
       // Unit tests on the pure guard canCorrectFactualField(), then endpoint
