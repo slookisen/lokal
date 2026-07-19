@@ -45,6 +45,10 @@ import {
   // shared fill-vs-replace decision so the dry-run preview below can never
   // drift from what applyGardssalgProviderContent() actually does.
   gardssalgReplaceableFieldAction,
+  // dev-request 2026-07-18-gardssalg-profilkvalitet-foer-outreach, slice 5a —
+  // eligibility gate for the source-grounded LLM rewrite of "passing-bar-
+  // but-short" about_text/visit_text (see generateGardssalgAboutRewrite below).
+  gardssalgRewriteEligible,
   type GardssalgContentRefreshTarget,
   // dev-request 2026-07-18-gardssalg-profilkvalitet-foer-outreach, slice 1 —
   // rollback/provenance substrate backing POST /admin/gardssalg-content-rollback
@@ -881,7 +885,11 @@ router.post("/admin/gardssalg-content-refresh", requireAdmin, async (req: Reques
   // as-is for backward compatibility with existing callers/tests): a
   // field-keyed map of "filled" (was blank) vs "replaced" (was thin,
   // non-blank) so a future batch report can tell the two apart per field.
-  type GsFieldAction = "filled" | "replaced";
+  // "rewritten" (slice 5a) is a THIRD, additive value: current value was
+  // already non-blank AND already passing the quality bar (so neither
+  // "filled" nor "replaced" would ever apply) but still <200 chars — a
+  // source-grounded LLM expansion, not an extractive fill/replace.
+  type GsFieldAction = "filled" | "replaced" | "rewritten";
   const changed: Array<{
     provider_id: string;
     fields: string[];
@@ -977,6 +985,34 @@ router.post("/admin/gardssalg-content-refresh", requireAdmin, async (req: Reques
     if (visitAction) wouldWriteActions.visit_text = visitAction;
     if (candidateHours && isBlank(t.opening_hours_text)) wouldWriteActions.opening_hours_text = "filled";
 
+    // ── Slice 5a: source-grounded REWRITE for the "passing-bar-but-short"
+    // cohort (dev-request 2026-07-18-gardssalg-profilkvalitet-foer-outreach).
+    // Only for about_text/visit_text fields that did NOT already get a
+    // wouldWriteActions entry above AND whose CURRENT value (the target's own
+    // pre-write snapshot, same as every other check above) is
+    // gardssalgRewriteEligible — non-blank, already passing the quality bar
+    // (so gardssalgReplaceableFieldAction would never touch it), but still
+    // <200 chars. Reuses the ALREADY-fetched/extracted contentText — no new
+    // fetch. Runs in BOTH dry-run and apply mode (dry-run still calls the LLM
+    // so the preview is real, same convention as the extractive path above);
+    // dry-run still writes nothing regardless of the LLM's answer.
+    let rewriteAbout: string | null = null;
+    let rewriteVisit: string | null = null;
+    if (!wouldWriteActions.about_text && gardssalgRewriteEligible(t.about_text)) {
+      rewriteAbout = await generateGardssalgAboutRewrite(contentText, t.about_text as string, "about");
+      if (rewriteAbout) {
+        wouldWriteActions.about_text = "rewritten";
+        provenance.about_text = { source_url: fetched.fetchUrl, snippet: rewriteAbout.slice(0, 120) };
+      }
+    }
+    if (!wouldWriteActions.visit_text && gardssalgRewriteEligible(t.visit_text)) {
+      rewriteVisit = await generateGardssalgAboutRewrite(contentText, t.visit_text as string, "visit");
+      if (rewriteVisit) {
+        wouldWriteActions.visit_text = "rewritten";
+        provenance.visit_text = { source_url: fetched.fetchUrl, snippet: rewriteVisit.slice(0, 120) };
+      }
+    }
+
     const wouldWrite = Object.keys(wouldWriteActions);
     if (wouldWrite.length === 0) return;
 
@@ -985,14 +1021,19 @@ router.post("/admin/gardssalg-content-refresh", requireAdmin, async (req: Reques
       changed.push({ provider_id: providerId, fields: wouldWrite, actions: wouldWriteActions, provenance });
     } else {
       try {
+        const rewriteFields: Array<"about_text" | "visit_text"> = [];
+        if (rewriteAbout) rewriteFields.push("about_text");
+        if (rewriteVisit) rewriteFields.push("visit_text");
         const written = applyGardssalgProviderContent(
           providerId,
           {
-            about_text: candidateAbout ?? undefined,
-            visit_text: candidateVisit ?? undefined,
+            about_text: rewriteAbout ?? candidateAbout ?? undefined,
+            visit_text: rewriteVisit ?? candidateVisit ?? undefined,
             opening_hours_text: candidateHours ?? undefined,
           },
-          fetched.fetchUrl
+          fetched.fetchUrl,
+          undefined,
+          rewriteFields.length > 0 ? rewriteFields : undefined
         );
         if (written.length > 0) {
           const actions: Record<string, GsFieldAction> = {};
@@ -2591,6 +2632,105 @@ type TitleNoCandidate = {
   kommune: string | null;
   fylke: string | null;
 };
+
+// ─── generateGardssalgAboutRewrite (dev-request 2026-07-18-gardssalg-
+//     profilkvalitet-foer-outreach, slice 5a) ───────────────────────────────
+// Source-grounded rewrite/expansion of a gårdssalg provider's about_text/
+// visit_text for the "passing-bar-but-short" cohort (see
+// gardssalgRewriteEligible in services/experience-store.ts): current value
+// already clears meetsAboutQualityBar (>=80 chars, so
+// gardssalgReplaceableFieldAction refuses to ever touch it — "never churn
+// quality-passing content") but is still <200 chars.
+//
+// Mirrors generateTitleNo()'s exact never-fabricate contract (see its doc
+// comment immediately below): sync fetch to
+// https://api.anthropic.com/v1/messages, ANTHROPIC_API_KEY from env, model
+// claude-opus-4-8. Returns null — NEVER throws, NEVER fabricates — on
+// missing key / network failure / non-200 / unparseable body.
+//
+// Grounding (Daniel's "kun kildebasert" + "ingen oppdiktede fakta"): the
+// prompt passes ONLY the already-fetched, already-extracted visible page
+// text (sourceText — the SAME extractVisibleText(combinedHtml) the calling
+// route already computed, capped to ~6000 chars here — no new fetch/host-
+// binding surface) + the current value as context (build on real existing
+// content, don't replace it wholesale), with an explicit kun-kildebasert
+// instruction and an escape sentinel (GARDSSALG_REWRITE_SENTINEL) the model
+// must return verbatim when the source text can't support a genuine
+// 200-400 char expansion.
+//
+// Length gate is enforced HERE, in code — not trusted to the prompt alone:
+// a non-sentinel response is only accepted if
+// GARDSSALG_REWRITE_MIN_LEN <= trimmed.length <= GARDSSALG_REWRITE_MAX_LEN
+// (the 500 soft ceiling above the 400 target tolerates natural sentence-
+// boundary overshoot). Anything outside that range — including the sentinel
+// itself — is null; never truncated mid-sentence.
+//
+// Exported (unlike generateTitleNo) purely so it has a direct unit-test
+// surface for its own never-fabricate contract, separate from the
+// route-level dry-run/apply test.
+const GARDSSALG_REWRITE_SENTINEL = "INGEN_UTVIDELSE_MULIG";
+const GARDSSALG_REWRITE_SOURCE_CHAR_CAP = 6000;
+const GARDSSALG_REWRITE_MIN_LEN = 200;
+const GARDSSALG_REWRITE_MAX_LEN = 500;
+
+export async function generateGardssalgAboutRewrite(
+  sourceText: string,
+  currentValue: string,
+  kind: "about" | "visit"
+): Promise<string | null> {
+  const apiKey = process.env.ANTHROPIC_API_KEY;
+  if (!apiKey) return null;
+
+  const cappedSource = (sourceText || "").slice(0, GARDSSALG_REWRITE_SOURCE_CHAR_CAP);
+  const sectionLabel = kind === "about" ? "Om produsenten" : "Besøket hos produsenten";
+  const prompt = `Du skal utvide en kort, men allerede godkjent, norsk tekst om en gårdsprodusent (seksjonen "${sectionLabel}") til en mer utfyllende tekst på 200–400 tegn.
+
+Nåværende tekst: ${currentValue}
+
+Kildetekst (hentet fra produsentens egen nettside):
+${cappedSource}
+
+Bruk KUN fakta som faktisk står i kildeteksten under. Ikke finn på detaljer, produkter, åpningstider eller annet som ikke er nevnt. Hvis kildeteksten ikke gir nok materiale til en utvidet, faktabasert tekst på 200–400 tegn, svar med nøyaktig ${GARDSSALG_REWRITE_SENTINEL} og ingenting annet.`;
+
+  let response: Awaited<ReturnType<typeof fetch>>;
+  try {
+    response = await fetch("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "x-api-key": apiKey,
+        "anthropic-version": "2023-06-01",
+      },
+      body: JSON.stringify({
+        model: "claude-opus-4-8",
+        max_tokens: 400,
+        messages: [{ role: "user", content: prompt }],
+      }),
+    });
+  } catch {
+    return null; // network/fetch failure — never fabricate
+  }
+
+  if (!response.ok) return null;
+
+  let result: any;
+  try {
+    result = await response.json();
+  } catch {
+    return null; // unparseable JSON body — never fabricate
+  }
+
+  const contentArr = Array.isArray(result?.content) ? result.content : [];
+  const text = contentArr.find((c: any) => c?.type === "text")?.text;
+  if (typeof text !== "string") return null;
+  const cleaned = text.trim();
+  if (cleaned === GARDSSALG_REWRITE_SENTINEL) return null; // explicit "not enough material" escape
+
+  // Length gate enforced in code, not trusted to the prompt alone (spec
+  // requirement) — reject anything outside [200, 500], never truncate.
+  if (cleaned.length < GARDSSALG_REWRITE_MIN_LEN || cleaned.length > GARDSSALG_REWRITE_MAX_LEN) return null;
+  return cleaned;
+}
 
 // Calls the Anthropic API the same way ClaudeVisionProvider.analyze() does
 // (src/services/vision-provider.ts) — sync fetch to

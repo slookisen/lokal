@@ -2019,6 +2019,37 @@ export function gardssalgReplaceableFieldAction(
 }
 
 /**
+ * Decide whether a gårdssalg about_text/visit_text field is eligible for the
+ * source-grounded LLM REWRITE path (dev-request 2026-07-18-gardssalg-
+ * profilkvalitet-foer-outreach, slice 5a) — the "passing-bar-but-short"
+ * cohort that gardssalgReplaceableFieldAction() deliberately never touches
+ * ("decent existing content — never churned", see its doc comment above).
+ * This is a SEPARATE, ADDITIVE function — gardssalgReplaceableFieldAction()
+ * itself is byte-unchanged by this slice, and neither function calls the
+ * other.
+ *
+ * Returns true only when ALL of:
+ *   - currentValue is non-blank,
+ *   - currentValue passes meetsAboutQualityBar (>=80 chars, not boilerplate/
+ *     nav-leakage/mangled/wrong-entity — i.e. the value
+ *     gardssalgReplaceableFieldAction itself would refuse to ever churn),
+ *   - currentValue.trim().length < 200 (still genuinely thin by this
+ *     rewrite slice's own, stricter 200-char bar).
+ *
+ * A field already >=200 chars is never eligible — this is what makes a
+ * second run idempotent with no extra state/flag: once a field is rewritten
+ * (the LLM helper's code-enforced 200-500 char output range guarantees
+ * >=200), it drops out of the eligible set on its own.
+ */
+export function gardssalgRewriteEligible(currentValue: string | null | undefined): boolean {
+  if (currentValue === null || currentValue === undefined) return false;
+  const trimmed = String(currentValue).trim();
+  if (!trimmed) return false;
+  if (!meetsAboutQualityBar(trimmed)) return false;
+  return trimmed.length < 200;
+}
+
+/**
  * Apply crawled content to ONE gårdssalg provider, respecting the lock gate:
  * NEVER writes anything if the provider is locked (content_source
  * 'manual'/'claim'). For about_text/visit_text, writes a candidate field
@@ -2046,12 +2077,32 @@ export function gardssalgReplaceableFieldAction(
  * visit_text writes can be a REPLACE of real prior content, so old_value is
  * no longer always null/blank; the audit code makes no assumption either
  * way and needed no change to stay correct for that case.
+ *
+ * `rewriteFields` (dev-request 2026-07-18-gardssalg-profilkvalitet-foer-
+ * outreach, slice 5a) — OPTIONAL, additive, empty/omitted by every pre-
+ * existing call site (byte-identical behavior when not passed): names the
+ * about_text/visit_text fields whose `candidate` value is an ACCEPTED LLM
+ * rewrite (see generateGardssalgAboutRewrite in routes/opplevelser.ts) of a
+ * field whose current value already passes meetsAboutQualityBar — i.e. a
+ * field gardssalgReplaceableFieldAction() would otherwise refuse to ever
+ * touch ("decent existing content — never churned"). The caller is expected
+ * to have already gated this via gardssalgRewriteEligible() AND the rewrite
+ * helper's own 200-500-char acceptance gate; this function does one more
+ * defense-in-depth re-check (gardssalgRewriteEligible against the FRESH row
+ * snapshot read below, not the caller's possibly-stale one) before writing,
+ * so a field that changed between selection and write never gets silently
+ * churned. For a field named here, the write bypasses
+ * gardssalgReplaceableFieldAction()'s decision (which is a no-op for it
+ * anyway, since eligibility requires the current value to already pass the
+ * quality bar) but goes through the exact same audit-row + field_provenance
+ * + lock-guard machinery as every other field.
  */
 export function applyGardssalgProviderContent(
   providerId: string,
   candidate: { about_text?: string | null; visit_text?: string | null; opening_hours_text?: string | null },
   evidenceUrl: string,
-  batchId?: string
+  batchId?: string,
+  rewriteFields?: Array<"about_text" | "visit_text">
 ): string[] {
   const db = getDb(VERTICAL);
   const row = db
@@ -2088,12 +2139,28 @@ export function applyGardssalgProviderContent(
     opening_hours_text: row.opening_hours_text,
   };
 
-  if (gardssalgReplaceableFieldAction(row.about_text, candidate.about_text)) {
+  // Slice 5a: accepted-rewrite fields, re-validated against the FRESH row
+  // snapshot (not the caller's possibly-stale target snapshot) — see this
+  // function's doc comment. Naturally mutually exclusive with the
+  // gardssalgReplaceableFieldAction branch below: eligibility requires the
+  // current value to already pass meetsAboutQualityBar, for which
+  // gardssalgReplaceableFieldAction always returns null ("never churned").
+  const rewriteSet = new Set(rewriteFields ?? []);
+
+  if (rewriteSet.has("about_text") && candidate.about_text?.trim() && gardssalgRewriteEligible(row.about_text)) {
+    sets.push("about_text = @about_text");
+    params.about_text = candidate.about_text.trim();
+    written.push("about_text");
+  } else if (gardssalgReplaceableFieldAction(row.about_text, candidate.about_text)) {
     sets.push("about_text = @about_text");
     params.about_text = candidate.about_text!.trim();
     written.push("about_text");
   }
-  if (gardssalgReplaceableFieldAction(row.visit_text, candidate.visit_text)) {
+  if (rewriteSet.has("visit_text") && candidate.visit_text?.trim() && gardssalgRewriteEligible(row.visit_text)) {
+    sets.push("visit_text = @visit_text");
+    params.visit_text = candidate.visit_text.trim();
+    written.push("visit_text");
+  } else if (gardssalgReplaceableFieldAction(row.visit_text, candidate.visit_text)) {
     sets.push("visit_text = @visit_text");
     params.visit_text = candidate.visit_text!.trim();
     written.push("visit_text");
