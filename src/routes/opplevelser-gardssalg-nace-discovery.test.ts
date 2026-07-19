@@ -9,6 +9,13 @@
  * from birth, batch-tagged via rfb_seed_source for one-operation rollback
  * through the same endpoint's rollbackBatch mode.
  *
+ * Review round 2 (2026-07-19) additions: dash-suffixed legacy-name dedup
+ * («Navn — Sted» rows score 0.8 raw and must still be caught), review-queue
+ * adoption of name-match suggestions in apply mode, per-code capped counter,
+ * tvangsavvikling in the dead filter, rollback lock-guard for claimed rows,
+ * unique per-run batch tag, and the 9-digit org_nr format gate in
+ * applyGardssalgProviderOrgnr.
+ *
  * Same conventions as the other gårdssalg route test files: :memory: DB,
  * fresh requires, router.handle(), mocked globalThis.fetch for Brreg pages.
  */
@@ -117,6 +124,11 @@ export function runOpplevelserGardssalgNaceDiscoveryTests(
       insertProvider.run({ id: "prov-nd-orgnr", navn: "Har Orgnr Bryggeri", org_nr: "955555555", catalog_hidden: null, producer_type: "bryggeri" });
       // Existing HIDDEN gårdssalg row without org_nr → name-dup basis.
       insertProvider.run({ id: "prov-nd-hidden", navn: "Skjult Testsideri", org_nr: null, catalog_hidden: 1, producer_type: "sideri" });
+      // Legacy «Navn — Sted» display name (review B1): raw scoreNameMatch vs
+      // "FJELLDAL BRENNERI AS" is only 0.8 (the suffix token survives
+      // pruning), so dedup MUST also match the gardssalgSearchName-pruned
+      // form or discovery re-creates this row as a public duplicate.
+      insertProvider.run({ id: "prov-nd-dash", navn: "Fjelldal Brenneri — Saltdal", org_nr: null, catalog_hidden: null, producer_type: "destilleri" });
 
       const brregPages: Record<string, any> = {
         "11.010|0": {
@@ -136,6 +148,19 @@ export function runOpplevelserGardssalgNaceDiscoveryTests(
               forretningsadresse: { kommune: "BERGEN" } },
             { organisasjonsnummer: "977777777", navn: "SKJULT TESTSIDERI AS",
               forretningsadresse: { kommune: "VOSS" } },
+            { organisasjonsnummer: "944444444", navn: "FJELLDAL BRENNERI AS",
+              forretningsadresse: { adresse: ["Dalveien 2"], postnummer: "8255", poststed: "RØKLAND", kommune: "SALTDAL" } },
+          ] },
+        },
+        "11.050|0": {
+          page: { totalPages: 1 },
+          _embedded: { enheter: [
+            { organisasjonsnummer: "911000001", navn: "TVANGS BRYGGERI AS", underTvangsavviklingEllerTvangsopplosning: true,
+              forretningsadresse: { kommune: "TROMSØ" } },
+            { organisasjonsnummer: "911000002", navn: "FOERSTE KAPP BRYGGERI AS",
+              forretningsadresse: { kommune: "BODØ" } },
+            { organisasjonsnummer: "911000003", navn: "ANDRE KAPP BRYGGERI AS",
+              forretningsadresse: { kommune: "NARVIK" } },
           ] },
         },
       };
@@ -167,20 +192,27 @@ export function runOpplevelserGardssalgNaceDiscoveryTests(
         assertEq(r.status, 200, "nd-2a: dry-run 200");
         assertEq(r.body.dry_run, true, "nd-2b: dry-run default");
         assertEq(brregCalls, 2, "nd-2c: both Brreg pages fetched (totalPages honored)");
-        assertEq(r.body.per_code["11.010"].total, 4, "nd-2d: all four enheter counted");
+        assertEq(r.body.per_code["11.010"].total, 5, "nd-2d: all five enheter counted");
         assertEq(r.body.per_code["11.010"].dead, 1, "nd-2e: konkurs row → dead");
-        assertEq(r.body.per_code["11.010"].duplicates, 2, "nd-2f: orgnr-dup + name-dup both counted");
+        assertEq(r.body.per_code["11.010"].duplicates, 3, "nd-2f: orgnr-dup + both name-dups counted");
         assertEq(r.body.created_count, 1, "nd-2g: exactly one creatable candidate");
         assertEq(r.body.created[0]?.org_nr, "925174971", "nd-2h: it is 67 North");
         assertEq(r.body.created[0]?.navn, "67 North Distillery", "nd-2i: display name transformed");
         assertEq(r.body.created[0]?.producer_type, "destilleri", "nd-2j: NACE→producer_type mapping");
-        const nameDup = (r.body.duplicates as any[]).find((d) => d.reason === "exact_name_matches_existing_gardssalg");
-        assertEq(nameDup?.existing_provider_id, "prov-nd-hidden",
-          "nd-2k: hidden gårdssalg row matched by pruned name (never re-created)");
+        const nameDup = (r.body.duplicates as any[]).find((d) => d.existing_provider_id === "prov-nd-hidden");
+        assertEq(nameDup?.reason, "exact_name_matches_existing_gardssalg",
+          "nd-2k: hidden gårdssalg row matched by exact name (never re-created)");
         assertEq(nameDup?.suggested_orgnr_for_existing, "977777777",
           "nd-2l: name-dup carries the suggested org_nr for the 5b review flow");
+        const dashDup = (r.body.duplicates as any[]).find((d) => d.existing_provider_id === "prov-nd-dash");
+        assertEq(dashDup?.reason, "exact_name_matches_existing_gardssalg",
+          "nd-2n: «Navn — Sted» legacy row caught via pruned-name match (raw score is only 0.8)");
+        assertEq(dashDup?.suggested_orgnr_for_existing, "944444444",
+          "nd-2o: dash-dup carries its suggested org_nr");
         const cnt = (expDb.prepare(`SELECT COUNT(*) c FROM experience_providers`).get() as any).c;
-        assertEq(cnt, 2, "nd-2m: dry-run created NOTHING");
+        assertEq(cnt, 3, "nd-2m: dry-run created NOTHING");
+        const qCnt = (expDb.prepare(`SELECT COUNT(*) c FROM gardssalg_orgnr_review_queue`).get() as any).c;
+        assertEq(qCnt, 0, "nd-2p: dry-run never touches the review queue");
       }
 
       // ── nd-3: APPLY — row born org_nr-keyed with address + tag. ─────────
@@ -190,7 +222,7 @@ export function runOpplevelserGardssalgNaceDiscoveryTests(
         assertEq(r.body.dry_run, false, "nd-3a: apply mode");
         assertEq(r.body.created_count, 1, "nd-3b: one row created");
         batchTag = r.body.batch_tag;
-        assertTrue(/^brreg-nace-\d{4}-\d{2}-\d{2}$/.test(batchTag), "nd-3c: batch tag is date-stamped");
+        assertTrue(/^brreg-nace-\d{8}-\d{6}$/.test(batchTag), "nd-3c: batch tag is date+time-stamped (unique per run, same-day batches roll back independently)");
         const row = expDb.prepare(`SELECT * FROM experience_providers WHERE org_nr='925174971'`).get() as any;
         assertTrue(!!row, "nd-3d: 67 North exists in the catalog table");
         assertEq(row.navn, "67 North Distillery", "nd-3e: display name persisted");
@@ -205,6 +237,16 @@ export function runOpplevelserGardssalgNaceDiscoveryTests(
         assertTrue(row.booking_live !== 1, "nd-3n: booking_live NEVER set by discovery");
         const visible = expStore.listGardssalgProviders(100, 0).some((p: any) => p.navn === "67 North Distillery");
         assertTrue(visible, "nd-3o: new provider visible in the gårdssalg catalog listing");
+        const q = expDb
+          .prepare(`SELECT provider_id, candidate_orgnr, reason, batch_id FROM gardssalg_orgnr_review_queue ORDER BY provider_id`)
+          .all() as any[];
+        assertEq(q.length, 2, "nd-3p: both name-matches upserted into the review queue in apply mode");
+        const qDash = q.find((x) => x.provider_id === "prov-nd-dash");
+        assertEq(qDash?.candidate_orgnr, "944444444", "nd-3q: dash row's queue entry carries the suggested org_nr (adoptable via the approve lever)");
+        assertEq(qDash?.reason, "nace_discovery_name_match", "nd-3r: queue reason marks NACE discovery as origin");
+        assertEq(qDash?.batch_id, batchTag, "nd-3s: queue entry tied to this discovery batch");
+        const dashRows = (expDb.prepare(`SELECT COUNT(*) c FROM experience_providers WHERE navn LIKE 'Fjelldal Brenneri%'`).get() as any).c;
+        assertEq(dashRows, 1, "nd-3t: legacy dash row NOT re-created as a public duplicate");
       }
 
       // ── nd-4: idempotent re-apply → duplicate, no second row. ───────────
@@ -266,7 +308,56 @@ export function runOpplevelserGardssalgNaceDiscoveryTests(
         const r2 = await callRoute(opplevelserRouter, { headers: adminHeaders, body: { rollbackBatch: batchTag, apply: true } });
         assertEq(r2.body.deleted, 1, "nd-5d: tagged row deleted");
         const cnt = (expDb.prepare(`SELECT COUNT(*) c FROM experience_providers`).get() as any).c;
-        assertEq(cnt, 3, "nd-5e: pre-existing rows (incl. nd-6's approve fixture) untouched by batch rollback");
+        assertEq(cnt, 4, "nd-5e: pre-existing rows (incl. dash fixture + nd-6's approve fixture) untouched by batch rollback");
+      }
+
+      // ── nd-7: dead-filter completeness + honest cap accounting. ─────────
+      {
+        const r = await callRoute(opplevelserRouter, { headers: adminHeaders, body: { codes: ["11.050"], maxCreate: 1 } });
+        assertEq(r.body.per_code["11.050"].total, 3, "nd-7a: all three 11.050 enheter counted");
+        assertEq(r.body.per_code["11.050"].dead, 1, "nd-7b: underTvangsavviklingEllerTvangsopplosning → dead (not created)");
+        assertEq(r.body.per_code["11.050"].created, 1, "nd-7c: cap honored — one created");
+        assertEq(r.body.per_code["11.050"].capped, 1, "nd-7d: the swallowed candidate is COUNTED per code, not silent");
+        assertEq(r.body.capped_count, 1, "nd-7e: top-level capped_count reports the same");
+        const deadHit = (r.body.dead as any[]).find((d) => d.org_nr === "911000001");
+        assertTrue(!!deadHit, "nd-7f: the tvangsavvikling row is the dead one");
+        const cnt = (expDb.prepare(`SELECT COUNT(*) c FROM experience_providers`).get() as any).c;
+        assertEq(cnt, 4, "nd-7g: dry-run capped sweep created nothing");
+      }
+
+      // ── nd-8: rollback lock-guard — claimed rows survive the batch undo. ─
+      {
+        expDb.prepare(
+          `INSERT INTO experience_providers
+             (id, navn, vertical, products, producer_type, enrichment_state, verification_status, source, confidence, rfb_seed_source, content_source)
+           VALUES
+             ('prov-lock-claimed','Kravsatt Bryggeri','experiences','["x"]','bryggeri','raw','pending_verify','test-fixture','medium','nd-lock-batch','claim'),
+             ('prov-lock-free','Fritt Bryggeri','experiences','["x"]','bryggeri','raw','pending_verify','test-fixture','medium','nd-lock-batch',NULL)`
+        ).run();
+        const rd = await callRoute(opplevelserRouter, { headers: adminHeaders, body: { rollbackBatch: "nd-lock-batch" } });
+        assertEq(rd.body.would_delete, 1, "nd-8a: locked row not targeted by rollback dry-run");
+        assertEq((rd.body.skipped_locked as any[])?.length, 1, "nd-8b: locked row reported, not hidden");
+        assertEq((rd.body.skipped_locked as any[])?.[0]?.id, "prov-lock-claimed", "nd-8c: it is the claimed row");
+        const ra = await callRoute(opplevelserRouter, { headers: adminHeaders, body: { rollbackBatch: "nd-lock-batch", apply: true } });
+        assertEq(ra.body.deleted, 1, "nd-8d: only the unlocked row deleted");
+        const claimed = expDb.prepare(`SELECT id FROM experience_providers WHERE id='prov-lock-claimed'`).get();
+        assertTrue(!!claimed, "nd-8e: claimed row SURVIVES the batch rollback (producer content is never deleted)");
+        const free = expDb.prepare(`SELECT id FROM experience_providers WHERE id='prov-lock-free'`).get();
+        assertTrue(!free, "nd-8f: unlocked tagged row is gone");
+      }
+
+      // ── nd-9: applyGardssalgProviderOrgnr 9-digit format gate. ──────────
+      {
+        const r1 = expStore.applyGardssalgProviderOrgnr("prov-nd-hidden", "12345678", "https://data.brreg.no/test");
+        assertEq(r1.length, 0, "nd-9a: 8-digit org_nr rejected");
+        const r2 = expStore.applyGardssalgProviderOrgnr("prov-nd-hidden", "97777777a", "https://data.brreg.no/test");
+        assertEq(r2.length, 0, "nd-9b: non-numeric org_nr rejected");
+        const r3 = expStore.applyGardssalgProviderOrgnr("prov-nd-hidden", " 977 777 777 ", "https://data.brreg.no/test");
+        assertEq(r3.length, 0, "nd-9c: inner-spaced org_nr rejected (only bare 9 digits pass)");
+        const rowBad = expDb.prepare(`SELECT org_nr FROM experience_providers WHERE id='prov-nd-hidden'`).get() as any;
+        assertEq(rowBad.org_nr, null, "nd-9d: nothing written by rejected formats");
+        const r4 = expStore.applyGardssalgProviderOrgnr("prov-nd-hidden", "977777777", "https://data.brreg.no/test");
+        assertEq(r4.length, 1, "nd-9e: well-formed 9 digits still write (the gate rejects format, not function)");
       }
     } catch (err: any) {
       failed++;

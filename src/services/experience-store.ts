@@ -2666,7 +2666,9 @@ export function applyGardssalgProviderOrgnr(
   if (row.content_source === "manual" || row.content_source === "claim") return [];
 
   const cleanOrgNr = (orgNr || "").trim();
-  if (!cleanOrgNr) return [];
+  // Norwegian org numbers are exactly 9 digits — nothing else may reach the
+  // UNIQUE-indexed column (also subsumes the empty-string check).
+  if (!/^\d{9}$/.test(cleanOrgNr)) return [];
   if (row.org_nr && row.org_nr.trim() !== "") return []; // fill-only
 
   const conflict = db

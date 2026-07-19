@@ -1222,12 +1222,22 @@ router.post("/admin/gardssalg-content-refresh", requireAdmin, async (req: Reques
 //   11.010 destilleri · 11.030 sideri · 11.040 mjøderi · 11.050 bryggeri
 //
 // Per candidate enhet:
-//   dead        — konkurs / underAvvikling / slettedato → skipped, reported.
+//   dead        — konkurs / underAvvikling / underTvangsavviklingEller-
+//                 Tvangsopplosning / slettedato → skipped, reported.
 //   duplicate   — org_nr already in experience_providers (ANY row), or
-//                 exact pruned-name match (scoreNameMatch === 1.0) against
-//                 an existing gårdssalg row (incl. catalog_hidden) →
-//                 skipped; the name-match variant carries the suggested
-//                 org_nr so the 5b review flow can adopt it.
+//                 exact name match (scoreNameMatch === 1.0 against the raw
+//                 OR the «— Sted»-pruned catalog name; legacy dash-suffixed
+//                 rows score only 0.8 raw, and re-creating them would mint
+//                 a public duplicate that also steals the org_nr (UNIQUE)
+//                 the legacy row needs) against an existing gårdssalg row
+//                 (incl. catalog_hidden) → skipped. In apply mode the
+//                 name-match variant is also upserted into
+//                 gardssalg_orgnr_review_queue (reason
+//                 nace_discovery_name_match) so the approve lever can adopt
+//                 the suggested org_nr onto the EXISTING row.
+//   capped      — creatable but beyond maxCreate → counted per code and
+//                 reported, so a capped run is distinguishable from a
+//                 complete sweep.
 //   created     — createProvider() with org_nr/navn (brregDisplayName)/
 //                 forretningsadresse/kommune(+nummer)/fylke (cityToFylke
 //                 best effort)/hjemmeside/organisasjonsform/naeringskode,
@@ -1240,7 +1250,11 @@ router.post("/admin/gardssalg-content-refresh", requireAdmin, async (req: Reques
 // Batch rollback (acceptance criterion 5): body {rollbackBatch: "<tag>",
 // apply} deletes ONLY rows whose rfb_seed_source equals that tag — the
 // one-operation undo for a whole discovery batch (no DB shell exists in
-// this environment, so the lever must be an endpoint).
+// this environment, so the lever must be an endpoint). Rows a producer has
+// since claimed (content_source manual/claim) survive the rollback and are
+// reported as skipped_locked — the same lock every gårdssalg writer
+// honours. The tag itself is per-RUN unique (date+time), so two batches
+// landed the same day roll back independently.
 //
 // NB: MUST come before "/:id" so "admin" isn't swallowed as an id param.
 const GARDSSALG_NACE_PRODUCER_TYPE: Record<string, string> = {
@@ -1278,15 +1292,25 @@ router.post("/admin/gardssalg-nace-discovery", requireAdmin, async (req: Request
       return;
     }
     const db = getExpDb("experiences");
-    const rows = db
-      .prepare(`SELECT id, navn, org_nr FROM experience_providers WHERE rfb_seed_source = ?`)
-      .all(tag) as Array<{ id: string; navn: string; org_nr: string | null }>;
+    const tagged = db
+      .prepare(`SELECT id, navn, org_nr, content_source FROM experience_providers WHERE rfb_seed_source = ?`)
+      .all(tag) as Array<{ id: string; navn: string; org_nr: string | null; content_source: string | null }>;
+    // A provider claimed/manually curated AFTER discovery must survive the
+    // batch undo — deleting it would destroy producer-entered content.
+    const skippedLocked = tagged.filter((r) => r.content_source === "manual" || r.content_source === "claim");
+    const rows = tagged.filter((r) => r.content_source !== "manual" && r.content_source !== "claim");
     if (dryRun) {
-      res.json({ success: true, dry_run: true, batch_tag: tag, would_delete: rows.length, rows });
+      res.json({ success: true, dry_run: true, batch_tag: tag, would_delete: rows.length, rows, skipped_locked: skippedLocked });
       return;
     }
-    const del = db.prepare(`DELETE FROM experience_providers WHERE rfb_seed_source = ?`).run(tag);
-    res.json({ success: true, dry_run: false, batch_tag: tag, deleted: del.changes, rows });
+    const del = db
+      .prepare(
+        `DELETE FROM experience_providers
+          WHERE rfb_seed_source = ?
+            AND (content_source IS NULL OR content_source NOT IN ('manual', 'claim'))`
+      )
+      .run(tag);
+    res.json({ success: true, dry_run: false, batch_tag: tag, deleted: del.changes, rows, skipped_locked: skippedLocked });
     return;
   }
 
@@ -1316,16 +1340,19 @@ router.post("/admin/gardssalg-nace-discovery", requireAdmin, async (req: Request
       .map((r) => r.org_nr.trim())
   );
 
-  const batchTag = `brreg-nace-${new Date().toISOString().slice(0, 10)}`;
-  const perCode: Record<string, { total: number; dead: number; duplicates: number; created: number }> = {};
+  // Date+time stamped: a date-only tag collides when two runs land the same
+  // day, and rollbackBatch would then undo BOTH batches as one.
+  const batchTag = `brreg-nace-${new Date().toISOString().replace(/[-:]/g, "").replace("T", "-").slice(0, 15)}`;
+  const perCode: Record<string, { total: number; dead: number; duplicates: number; created: number; capped: number }> = {};
   const created: Array<{ provider_id?: string; org_nr: string; navn: string; producer_type: string; kommune: string | null; hjemmeside: string | null }> = [];
   const duplicates: Array<{ org_nr: string; brreg_navn: string; reason: string; existing_provider_id?: string; suggested_orgnr_for_existing?: string }> = [];
   const dead: Array<{ org_nr: string; navn: string }> = [];
   const errors: Array<{ code: string; error: string }> = [];
   const seenThisBatch = new Set<string>();
+  let cappedTotal = 0;
 
   for (const code of codes) {
-    perCode[code] = { total: 0, dead: 0, duplicates: 0, created: 0 };
+    perCode[code] = { total: 0, dead: 0, duplicates: 0, created: 0, capped: 0 };
     try {
       for (let page = 0; page < GS_ND_MAX_PAGES_PER_CODE; page++) {
         const url = `${BRREG_BASE_URL}${BRREG_SEARCH_PATH}?naeringskode=${encodeURIComponent(code)}&size=${GS_ND_PAGE_SIZE}&page=${page}`;
@@ -1345,7 +1372,7 @@ router.post("/admin/gardssalg-nace-discovery", requireAdmin, async (req: Request
           seenThisBatch.add(orgnr);
           perCode[code].total++;
 
-          if (e.konkurs === true || e.underAvvikling === true || e.slettedato) {
+          if (e.konkurs === true || e.underAvvikling === true || e.underTvangsavviklingEllerTvangsopplosning === true || e.slettedato) {
             perCode[code].dead++;
             dead.push({ org_nr: orgnr, navn: e.navn });
             continue;
@@ -1355,7 +1382,18 @@ router.post("/admin/gardssalg-nace-discovery", requireAdmin, async (req: Request
             duplicates.push({ org_nr: orgnr, brreg_navn: e.navn, reason: "orgnr_exists" });
             continue;
           }
-          const nameMatch = gardssalgRows.find((g) => scoreNameMatch(g.navn, e.navn, null, null) === 1.0);
+          // Match the raw catalog name AND the «— Sted»-pruned one: legacy
+          // dash-suffixed rows («Ægir Bryggeri — Flåm») score only 0.8 raw,
+          // and missing them here would CREATE a public duplicate whose
+          // insert also takes the org_nr (UNIQUE) — permanently un-keying
+          // the legacy row. Over-matching is the safe direction: worst case
+          // a genuinely new enhet lands in the review queue instead of the
+          // catalog.
+          const nameMatch = gardssalgRows.find(
+            (g) =>
+              scoreNameMatch(g.navn, e.navn, null, null) === 1.0 ||
+              scoreNameMatch(gardssalgSearchName(g.navn), e.navn, null, null) === 1.0
+          );
           if (nameMatch) {
             perCode[code].duplicates++;
             duplicates.push({
@@ -1365,10 +1403,44 @@ router.post("/admin/gardssalg-nace-discovery", requireAdmin, async (req: Request
               existing_provider_id: nameMatch.id,
               suggested_orgnr_for_existing: orgnr,
             });
+            // Make the suggestion adoptable, not just reportable: land it in
+            // the durable review queue for the approve lever. Apply mode
+            // only (dry-run stays side-effect free), and only while the
+            // existing row still lacks an org_nr — the queue reflects
+            // unresolved rows, and the applier is fill-only anyway.
+            if (!dryRun && !(nameMatch.org_nr && nameMatch.org_nr.trim() !== "")) {
+              const fa = e.forretningsadresse ?? {};
+              const candidateAddress =
+                [
+                  Array.isArray(fa.adresse) ? fa.adresse.filter(Boolean).join(", ") : "",
+                  typeof fa.postnummer === "string" ? fa.postnummer : "",
+                  typeof fa.poststed === "string" ? fa.poststed : "",
+                ]
+                  .filter(Boolean)
+                  .join(", ") || null;
+              try {
+                upsertGardssalgOrgnrReviewQueue({
+                  provider_id: nameMatch.id,
+                  provider_name: nameMatch.navn,
+                  candidate_orgnr: orgnr,
+                  candidate_name: e.navn,
+                  candidate_confidence: 1.0,
+                  candidate_address: candidateAddress,
+                  reason: "nace_discovery_name_match",
+                  batch_id: batchTag,
+                });
+              } catch {
+                /* review-queue is best-effort; discovery itself must not fail on it */
+              }
+            }
             continue;
           }
 
-          if (created.length >= maxCreate) continue;
+          if (created.length >= maxCreate) {
+            perCode[code].capped++;
+            cappedTotal++;
+            continue;
+          }
 
           const fa = e.forretningsadresse ?? {};
           const adresse = Array.isArray(fa.adresse) ? fa.adresse.filter(Boolean).join(", ") : null;
@@ -1426,6 +1498,7 @@ router.post("/admin/gardssalg-nace-discovery", requireAdmin, async (req: Request
     batch_tag: batchTag,
     per_code: perCode,
     created_count: created.length,
+    capped_count: cappedTotal,
     created,
     duplicates,
     dead,
