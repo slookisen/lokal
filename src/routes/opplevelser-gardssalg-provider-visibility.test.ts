@@ -127,6 +127,11 @@ export function runOpplevelserGardssalgProviderVisibilityTests(
         const r = await callRoute(opplevelserRouter, { headers: adminHeaders, body: { hidden: "true", providerIds: ["pv-a"] } });
         assertEq(r.status, 400, "pv-1d: non-boolean 'hidden' → 400");
       }
+      {
+        const ids = Array.from({ length: 501 }, (_, i) => `pv-cap-${i}`);
+        const r = await callRoute(opplevelserRouter, { headers: adminHeaders, body: { hidden: true, providerIds: ids } });
+        assertEq(r.status, 400, "pv-1e: more than 500 targets → 400 (cap enforced)");
+      }
 
       // ── pv-2: dry-run default — reports, writes nothing. ────────────────
       {
@@ -202,6 +207,24 @@ export function runOpplevelserGardssalgProviderVisibilityTests(
         assertEq(r.body.changed_count, 1, "pv-7a: unhide changed the row");
         assertEq(hiddenFlag("pv-a"), null, "pv-7b: catalog_hidden cleared to NULL (grid filter semantics)");
         assertEq(publiclyListed("Synlig Bryggeri A"), true, "pv-7c: row is publicly listed again");
+      }
+
+      // ── pv-8: gårdssalg scoping — a non-gårdssalg provider row (no
+      //    producer_type, not rfb-seed) can NOT be flipped via the lever;
+      //    the reference lands in not_found and the flag is untouched. ─────
+      {
+        expDb.prepare(
+          `INSERT INTO experience_providers
+             (id, navn, vertical, org_nr, catalog_hidden, products, enrichment_state, verification_status, source, confidence)
+           VALUES ('pv-x', 'Utenfor Vertikalen', 'experiences', '966000009', NULL, '["x"]', 'raw', 'pending_verify', 'test-fixture', 'medium')`
+        ).run();
+        const r = await callRoute(opplevelserRouter, {
+          headers: adminHeaders,
+          body: { hidden: true, providerIds: ["pv-x"], orgNrs: ["966000009"], apply: true },
+        });
+        assertEq(r.body.matched_count, 0, "pv-8a: non-gårdssalg row never matches the lever");
+        assertEq((r.body.not_found as any[]).length, 2, "pv-8b: both references reported as not_found");
+        assertEq(hiddenFlag("pv-x"), null, "pv-8c: catalog_hidden untouched outside the vertical");
       }
     } catch (err: any) {
       failed++;

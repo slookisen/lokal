@@ -2886,8 +2886,11 @@ router.patch("/admin/providers/:id/hjemmeside", requireAdmin, (req: Request, res
 // apply? } — dry-run default som alle andre admin-ruter i denne fila.
 // Ingen wildcard-/alle-modus: et kall må navngi radene sine (id eller
 // org_nr), så spaken kan aldri skjule eller avsløre noe den ikke eksplisitt
-// ble bedt om. manual/claim-låste rader hoppes over og rapporteres
-// (skipped_locked) — samme lås som alle andre gårdssalg-skrivere.
+// ble bedt om. Oppslagene er gårdssalg-scopet (samme klausul som
+// listGardssalgProviders) — en referanse til en ikke-gårdssalg-rad lander i
+// not_found i stedet for å flippe synlighet utenfor vertikalen.
+// manual/claim-låste rader hoppes over og rapporteres (skipped_locked) —
+// samme lås som alle andre gårdssalg-skrivere.
 const GS_PV_MAX_TARGETS = 500;
 
 router.post("/admin/gardssalg-provider-visibility", requireAdmin, (req: Request, res: Response) => {
@@ -2930,10 +2933,12 @@ router.post("/admin/gardssalg-provider-visibility", requireAdmin, (req: Request,
   try {
     const expDb = getExpDb("experiences");
     const byId = expDb.prepare(
-      `SELECT id, navn, org_nr, catalog_hidden, content_source FROM experience_providers WHERE id = ?`
+      `SELECT id, navn, org_nr, catalog_hidden, content_source FROM experience_providers
+        WHERE id = ? AND (producer_type IS NOT NULL OR rfb_seed_source = 'rfb-seed')`
     );
     const byOrgNr = expDb.prepare(
-      `SELECT id, navn, org_nr, catalog_hidden, content_source FROM experience_providers WHERE org_nr = ?`
+      `SELECT id, navn, org_nr, catalog_hidden, content_source FROM experience_providers
+        WHERE org_nr = ? AND (producer_type IS NOT NULL OR rfb_seed_source = 'rfb-seed')`
     );
     type PvRow = { id: string; navn: string; org_nr: string | null; catalog_hidden: number | null; content_source: string | null };
 
