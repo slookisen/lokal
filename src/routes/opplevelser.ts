@@ -2751,7 +2751,13 @@ function stripMarkdownArtifacts(s: string): string {
 // Round-2 widening: brackets (leftover link/checkbox syntax), backslash
 // (escaped-markdown remnants like "\*ekte\*" → "\ekte\") and ">" (inline
 // blockquote remnants) — all verified publishable through the narrower set.
-const GARDSSALG_REWRITE_RESIDUAL_MARKDOWN = /[*#`_\\[\]>]/;
+// Round-3 widening (reviewer's own recipe, verbatim): "~" (strikethrough —
+// "~~stengt~~" would read as CURRENT text once published raw) and "|"
+// (markdown tables → pipe soup); neither has legitimate use in this prose.
+// NB: a link URL containing ")" can leave a stray paren behind (e.g.
+// wikipedia "...(bruk))" links) — parens can't join this set (legitimate
+// prose), accepted cosmetic residue.
+const GARDSSALG_REWRITE_RESIDUAL_MARKDOWN = /[*#`_\\[\]>~|]/;
 
 export async function generateGardssalgAboutRewrite(
   sourceText: string,

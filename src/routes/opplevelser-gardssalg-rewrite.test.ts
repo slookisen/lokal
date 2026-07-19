@@ -434,6 +434,18 @@ export function runOpplevelserGardssalgRewriteTests(
         const r = await generateGardssalgAboutRewrite(SOURCE_TEXT, CURRENT_VALUE, "visit");
         assertTrue(r !== null && !r.includes(">"), "ru-14e: leading blockquote marker stripped cleanly, prose accepted");
       }
+      // (round 3) strikethrough must never publish raw — "~~stengt~~ nå åpent"
+      // would read as if "stengt" were current text; tables likewise.
+      mockText(`Vi holder ~~stengt~~ åpent hver helg gjennom hele sesongen. ${PAD_220}`);
+      {
+        const r = await generateGardssalgAboutRewrite(SOURCE_TEXT, CURRENT_VALUE, "about");
+        assertEq(r, null, "ru-14f: strikethrough tildes → residual reject, never published as apparent current text");
+      }
+      mockText(`| Produkt | Pris | og mer informasjon om oss finner du hos gården. ${PAD_220}`);
+      {
+        const r = await generateGardssalgAboutRewrite(SOURCE_TEXT, CURRENT_VALUE, "about");
+        assertEq(r, null, "ru-14g: markdown table pipes → residual reject");
+      }
     } catch (err: any) {
       failed++;
       failures.push("opplevelser-gardssalg-rewrite (section A): unexpected error: " + String(err?.stack || err?.message || err));
