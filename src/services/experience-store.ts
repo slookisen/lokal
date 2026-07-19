@@ -1989,20 +1989,43 @@ export function getGardssalgProviderContentTarget(providerId: string): Gardssalg
  * when at least one field was actually written (a no-op write stamps
  * nothing). Returns the field names actually written. Idempotent: a second
  * run against an already-filled provider writes nothing.
+ *
+ * Rollback/provenance bookkeeping (dev-request 2026-07-18-gardssalg-
+ * profilkvalitet-foer-outreach, slice 1) — additive, does NOT change which
+ * fields get written or the guard behavior above: for every field actually
+ * written, this also (in the same transaction) inserts one
+ * gardssalg_content_audit row (old_value = the value immediately before this
+ * write, new_value = the value just written, source_url = evidenceUrl,
+ * batch_id = the optional `batchId` param) and merges a
+ * {source_url, fetched_at} entry into experience_providers.field_provenance
+ * for that field, preserving any existing entries for OTHER fields
+ * (read-modify-write, never clobbers). old_value is read generically from
+ * the row snapshot taken before any write below — today this function only
+ * ever fills BLANK fields, so old_value is always null/blank in practice,
+ * but the code makes no assumption of that so it stays correct once a
+ * future slice starts overwriting non-blank values too.
  */
 export function applyGardssalgProviderContent(
   providerId: string,
   candidate: { about_text?: string | null; visit_text?: string | null; opening_hours_text?: string | null },
-  evidenceUrl: string
+  evidenceUrl: string,
+  batchId?: string
 ): string[] {
   const db = getDb(VERTICAL);
   const row = db
     .prepare(
-      `SELECT id, content_source, about_text, visit_text, opening_hours_text
+      `SELECT id, content_source, about_text, visit_text, opening_hours_text, field_provenance
          FROM experience_providers WHERE id = ?`
     )
     .get(providerId) as
-    | { id: string; content_source: string | null; about_text: string | null; visit_text: string | null; opening_hours_text: string | null }
+    | {
+        id: string;
+        content_source: string | null;
+        about_text: string | null;
+        visit_text: string | null;
+        opening_hours_text: string | null;
+        field_provenance: string | null;
+      }
     | undefined;
   if (!row) return [];
   if (row.content_source === "manual" || row.content_source === "claim") return [];
@@ -2014,6 +2037,14 @@ export function applyGardssalgProviderContent(
   const sets: string[] = [];
   const params: Record<string, unknown> = { id: providerId };
   const written: string[] = [];
+  // Pre-write snapshot of every rollback-eligible field, keyed by field name —
+  // captured BEFORE any write below, so the audit trail's old_value is always
+  // the true pre-write value regardless of which fields end up written.
+  const oldValues: Record<string, string | null> = {
+    about_text: row.about_text,
+    visit_text: row.visit_text,
+    opening_hours_text: row.opening_hours_text,
+  };
 
   if (isBlank(row.about_text) && candidate.about_text?.trim()) {
     sets.push("about_text = @about_text");
@@ -2038,6 +2069,267 @@ export function applyGardssalgProviderContent(
   sets.push("content_updated_at = datetime('now')");
   params.evidence_url = evidenceUrl;
 
-  db.prepare(`UPDATE experience_providers SET ${sets.join(", ")} WHERE id = @id`).run(params);
+  // ── field_provenance merge (read-modify-write, preserves other fields) ──
+  let provenance: Record<string, { source_url: string; fetched_at: string }> = {};
+  if (row.field_provenance) {
+    try {
+      const parsed = JSON.parse(row.field_provenance);
+      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+        provenance = parsed as Record<string, { source_url: string; fetched_at: string }>;
+      }
+    } catch {
+      /* malformed existing JSON -> treat as empty rather than clobber the write */
+    }
+  }
+  const fetchedAt = new Date().toISOString();
+  for (const f of written) {
+    provenance[f] = { source_url: evidenceUrl, fetched_at: fetchedAt };
+  }
+  sets.push("field_provenance = @field_provenance");
+  params.field_provenance = JSON.stringify(provenance);
+
+  const applyWithAudit = db.transaction(() => {
+    db.prepare(`UPDATE experience_providers SET ${sets.join(", ")} WHERE id = @id`).run(params);
+    const insertAudit = db.prepare(
+      `INSERT INTO gardssalg_content_audit
+         (id, provider_id, field_name, old_value, new_value, source_url, batch_id, changed_by, changed_at)
+       VALUES (@id, @provider_id, @field_name, @old_value, @new_value, @source_url, @batch_id, 'system', datetime('now'))`
+    );
+    for (const f of written) {
+      insertAudit.run({
+        id: uuid(),
+        provider_id: providerId,
+        field_name: f,
+        old_value: oldValues[f] ?? null,
+        new_value: (params[f] as string | undefined) ?? null,
+        source_url: evidenceUrl,
+        batch_id: batchId ?? null,
+      });
+    }
+  });
+  applyWithAudit();
+
   return written;
+}
+
+// ─── Gårdssalg content rollback (dev-request 2026-07-18-gardssalg-
+// profilkvalitet-foer-outreach, slice 1) ─────────────────────────────────────
+// Reads/writes gardssalg_content_audit + experience_providers.<field> to
+// undo a gårdssalg content-refresh write. Backs POST /admin/gardssalg-
+// content-rollback (routes/opplevelser.ts). Only the fields
+// applyGardssalgProviderContent() can ever write are rollback-eligible —
+// field_name is validated against this fixed allow-list BEFORE it is ever
+// interpolated into SQL, since field_name can arrive directly from an admin
+// request body.
+const GARDSSALG_ROLLBACKABLE_FIELDS = new Set(["about_text", "visit_text", "opening_hours_text"]);
+// source_url marker stamped on audit rows inserted BY a rollback itself
+// (as opposed to rows inserted by a content-refresh write) — lets
+// planGardssalgContentRollback tell the two apart for idempotency (see its
+// doc comment) without a dedicated boolean column.
+const GARDSSALG_ROLLBACK_MARKER = "internal://rollback";
+
+export type GardssalgRollbackTarget = {
+  provider_id?: string;
+  field_name?: string;
+  batch_id?: string;
+};
+
+export type GardssalgRollbackPlanItem = {
+  provider_id: string;
+  field_name: string;
+  current_value: string | null;
+  restore_to: string | null;
+};
+
+export type GardssalgRollbackSkip = {
+  provider_id: string;
+  field_name: string;
+  reason: "no_audit_row" | "already_current" | "unknown_field" | "manual_or_claim_source";
+};
+
+// Resolve the (provider_id, field_name) pairs a rollback request targets:
+// batch_id -> every field any provider had touched under that batch;
+// provider_id (+ optional field_name) -> that provider's field(s) with any
+// audit history. Pure lookup — no writes, no idempotency checks (those
+// happen in planGardssalgContentRollback).
+function resolveGardssalgRollbackTargets(
+  opts: GardssalgRollbackTarget
+): Array<{ provider_id: string; field_name: string }> {
+  const db = getDb(VERTICAL);
+  if (opts.batch_id) {
+    return db
+      .prepare(
+        `SELECT DISTINCT provider_id, field_name FROM gardssalg_content_audit WHERE batch_id = ?`
+      )
+      .all(opts.batch_id) as Array<{ provider_id: string; field_name: string }>;
+  }
+  if (opts.provider_id) {
+    if (opts.field_name) {
+      return [{ provider_id: opts.provider_id, field_name: opts.field_name }];
+    }
+    const rows = db
+      .prepare(`SELECT DISTINCT field_name FROM gardssalg_content_audit WHERE provider_id = ?`)
+      .all(opts.provider_id) as Array<{ field_name: string }>;
+    return rows.map((r) => ({ provider_id: opts.provider_id as string, field_name: r.field_name }));
+  }
+  return [];
+}
+
+/**
+ * Read-only: compute what a gårdssalg content rollback WOULD do, without
+ * writing anything. For each targeted (provider_id, field_name) pair, finds
+ * the MOST RECENT audit row and compares its old_value against the field's
+ * CURRENT live value: if they already match, the field is already rolled
+ * back (or was never actually changed) — skipped as "already_current"
+ * rather than restorable, so a rollback is never blindly re-applied.
+ * A field/provider with no audit row at all is skipped as "no_audit_row".
+ * An unknown field_name (not one of the 3 gårdssalg content-refresh writes)
+ * is skipped as "unknown_field" and never reaches SQL interpolation.
+ */
+export function planGardssalgContentRollback(
+  opts: GardssalgRollbackTarget
+): { restorable: GardssalgRollbackPlanItem[]; skipped: GardssalgRollbackSkip[] } {
+  const db = getDb(VERTICAL);
+  const targets = resolveGardssalgRollbackTargets(opts);
+  const restorable: GardssalgRollbackPlanItem[] = [];
+  const skipped: GardssalgRollbackSkip[] = [];
+
+  for (const t of targets) {
+    if (!GARDSSALG_ROLLBACKABLE_FIELDS.has(t.field_name)) {
+      skipped.push({ provider_id: t.provider_id, field_name: t.field_name, reason: "unknown_field" });
+      continue;
+    }
+    // ORDER BY rowid (SQLite's implicit insertion-order column), not
+    // changed_at/id: changed_at has only second resolution (a write followed
+    // by a rollback within the same second would tie), and id is a random
+    // UUID with no relationship to insertion order — rowid is the only
+    // column that reliably reflects "most recently inserted".
+    const latest = db
+      .prepare(
+        `SELECT old_value, new_value, source_url, changed_at FROM gardssalg_content_audit
+          WHERE provider_id = ? AND field_name = ?
+          ORDER BY rowid DESC LIMIT 1`
+      )
+      .get(t.provider_id, t.field_name) as
+      | { old_value: string | null; new_value: string | null; source_url: string | null; changed_at: string }
+      | undefined;
+    if (!latest) {
+      skipped.push({ provider_id: t.provider_id, field_name: t.field_name, reason: "no_audit_row" });
+      continue;
+    }
+    const providerRow = db
+      .prepare(`SELECT ${t.field_name} AS current_value, content_source FROM experience_providers WHERE id = ?`)
+      .get(t.provider_id) as { current_value: string | null; content_source: string | null } | undefined;
+    if (!providerRow) {
+      skipped.push({ provider_id: t.provider_id, field_name: t.field_name, reason: "no_audit_row" });
+      continue;
+    }
+    // Same write guard as applyGardssalgProviderContent() (~line 2031): once a
+    // provider's content_source is 'manual' or 'claim', the automated
+    // pipeline never touches that row again — a rollback is part of the same
+    // automated pipeline, so it must never overwrite manually-provided
+    // content either, even if a stale audit row from before the claim/manual
+    // edit makes the field look "restorable".
+    if (providerRow.content_source === "manual" || providerRow.content_source === "claim") {
+      skipped.push({ provider_id: t.provider_id, field_name: t.field_name, reason: "manual_or_claim_source" });
+      continue;
+    }
+    const currentValue = providerRow.current_value ?? null;
+    // Idempotency — two cases where there's genuinely nothing to restore:
+    //   (1) currentValue already equals the value we'd be restoring TO
+    //       (latest.old_value) — someone already put it back, via this
+    //       endpoint or otherwise.
+    //   (2) the LATEST audit row is itself a previous rollback
+    //       (source_url === GARDSSALG_ROLLBACK_MARKER) whose new_value
+    //       already matches currentValue — i.e. this exact field was
+    //       already rolled back and nothing has touched it since. This
+    //       case matters because after a rollback, the "latest" audit row
+    //       becomes the ROLLBACK's own row (old_value = the pre-rollback
+    //       value, new_value = the restored value); naively using ITS
+    //       old_value as the next restore target would restore the
+    //       pre-rollback (undesired) value right back — i.e. undo the undo.
+    //       Case (1) alone does not catch this, since currentValue (the
+    //       restored value) generally does NOT equal that row's old_value
+    //       (the pre-rollback value).
+    const alreadyAtRestoreTarget = currentValue === (latest.old_value ?? null);
+    const alreadyRolledBack =
+      latest.source_url === GARDSSALG_ROLLBACK_MARKER && currentValue === (latest.new_value ?? null);
+    if (alreadyAtRestoreTarget || alreadyRolledBack) {
+      skipped.push({ provider_id: t.provider_id, field_name: t.field_name, reason: "already_current" });
+      continue;
+    }
+    restorable.push({
+      provider_id: t.provider_id,
+      field_name: t.field_name,
+      current_value: currentValue,
+      restore_to: latest.old_value ?? null,
+    });
+  }
+
+  return { restorable, skipped };
+}
+
+/**
+ * Apply a previously-planned gårdssalg content rollback (see
+ * planGardssalgContentRollback): restores experience_providers.<field_name>
+ * to `restore_to` for every item, and — critically — inserts a NEW
+ * gardssalg_content_audit row per restore (old_value = the value
+ * immediately before the rollback, new_value = the restored value,
+ * changed_by='system', source_url carries an `internal://rollback` marker)
+ * so the rollback itself is auditable and the audit trail is never
+ * silently mutated or deleted. Each restore + its audit row is applied in
+ * one transaction. field_name is re-validated against the same allow-list
+ * as planGardssalgContentRollback (defense in depth — items should already
+ * be plan() output, but this function never trusts field_name blindly).
+ * content_source is likewise re-verified right before each write (same
+ * defense in depth — items should already have been filtered by plan()'s
+ * manual/claim check, but this function never trusts that blindly either):
+ * if a provider's content_source is 'manual' or 'claim', the item is
+ * skipped entirely (no write, no audit row, omitted from the returned
+ * `restored` array) rather than restored.
+ */
+export function applyGardssalgContentRollback(
+  items: GardssalgRollbackPlanItem[]
+): Array<{ provider_id: string; field_name: string; restored_to: string | null }> {
+  const db = getDb(VERTICAL);
+  const restored: Array<{ provider_id: string; field_name: string; restored_to: string | null }> = [];
+
+  const runOne = db.transaction((item: GardssalgRollbackPlanItem) => {
+    db.prepare(`UPDATE experience_providers SET ${item.field_name} = @val WHERE id = @id`).run({
+      val: item.restore_to,
+      id: item.provider_id,
+    });
+    db.prepare(
+      `INSERT INTO gardssalg_content_audit
+         (id, provider_id, field_name, old_value, new_value, source_url, batch_id, changed_by, changed_at)
+       VALUES (@id, @provider_id, @field_name, @old_value, @new_value, @source_url, NULL, 'system', datetime('now'))`
+    ).run({
+      id: uuid(),
+      provider_id: item.provider_id,
+      field_name: item.field_name,
+      old_value: item.current_value,
+      new_value: item.restore_to,
+      source_url: GARDSSALG_ROLLBACK_MARKER,
+    });
+  });
+
+  for (const item of items) {
+    if (!GARDSSALG_ROLLBACKABLE_FIELDS.has(item.field_name)) continue;
+    // Same write guard as applyGardssalgProviderContent() (~line 2031) and
+    // planGardssalgContentRollback's manual/claim check above — re-verified
+    // here, right before the UPDATE, rather than trusting that this item
+    // already passed that check in plan()'s `restorable` list. If a manual
+    // or claim edit reaches this function anyway, skip it silently: no
+    // write, no audit row, and it's simply omitted from `restored`.
+    const providerRow = db
+      .prepare(`SELECT content_source FROM experience_providers WHERE id = ?`)
+      .get(item.provider_id) as { content_source: string | null } | undefined;
+    if (providerRow && (providerRow.content_source === "manual" || providerRow.content_source === "claim")) {
+      continue;
+    }
+    runOne(item);
+    restored.push({ provider_id: item.provider_id, field_name: item.field_name, restored_to: item.restore_to });
+  }
+
+  return restored;
 }

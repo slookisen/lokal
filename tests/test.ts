@@ -26635,6 +26635,23 @@ Promise.allSettled(_oaHomeCountersDeps).then(async () => {
     for (const f of gplr.failures) failures.push("opplevelser-gardssalg-provider-lookup: " + f);
     console.log(`  opplevelser-gardssalg-provider-lookup: ${gplr.passed} passed, ${gplr.failed} failed`);
 
+    // dev-request 2026-07-18-gardssalg-profilkvalitet-foer-outreach, slice 1:
+    // gardssalg_content_audit table + experience_providers.field_provenance
+    // column, applyGardssalgProviderContent()'s additive audit/provenance
+    // wiring, and POST /admin/gardssalg-content-rollback. The rollback/
+    // provenance substrate that must be proven working BEFORE the 74-producer
+    // no-canary batch content-improvement pass runs. Same in-memory-DB
+    // pattern, runs sequentially inside this same gated block for the same
+    // reason.
+    console.log("\n── opplevelser-gardssalg-content-audit: rollback/provenance substrate ──");
+    const { runOpplevelserGardssalgContentAuditTests } = require("../src/routes/opplevelser-gardssalg-content-audit.test") as
+      typeof import("../src/routes/opplevelser-gardssalg-content-audit.test");
+    const gcar = await runOpplevelserGardssalgContentAuditTests({ log: false });
+    passed += gcar.passed;
+    failed += gcar.failed;
+    for (const f of gcar.failures) failures.push("opplevelser-gardssalg-content-audit: " + f);
+    console.log(`  opplevelser-gardssalg-content-audit: ${gcar.passed} passed, ${gcar.failed} failed`);
+
     // dev-request 2026-07-04-opplevagent-dedup-og-norske-titler, item 3
     // (detail completeness weave): GET /admin/detail-completeness-coverage —
     // read-only, catalog-wide booking_url/phone/website coverage report over
