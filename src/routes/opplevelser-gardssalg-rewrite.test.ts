@@ -339,12 +339,19 @@ export function runOpplevelserGardssalgRewriteTests(
       const expDb = dbFactory.getDb("experiences");
       const opplevelserRouter = (require("./opplevelser") as typeof import("./opplevelser")).default as any;
 
+      // `products` is pre-filled (non-empty) on every fixture below so the
+      // slice 5c fill-only products-extraction path (gardssalgProductsEligible)
+      // never fires for these rows — this file isolates about_text/visit_text
+      // rewrite behavior only; a blank `products` column would make the
+      // route's processOne() ALSO call the (shared, mocked) Anthropic
+      // endpoint for a products candidate every run, throwing off this
+      // file's anthropicCallCount assertions for an unrelated field.
       const insertProvider = expDb.prepare(
         `INSERT INTO experience_providers
-           (id, navn, vertical, hjemmeside, content_source, about_text, visit_text, opening_hours_text,
+           (id, navn, vertical, hjemmeside, content_source, about_text, visit_text, opening_hours_text, products,
             producer_type, enrichment_state, verification_status, source, confidence)
          VALUES
-           (@id, @navn, 'experiences', @hjemmeside, @content_source, @about_text, @visit_text, @opening_hours_text,
+           (@id, @navn, 'experiences', @hjemmeside, @content_source, @about_text, @visit_text, @opening_hours_text, '["Placeholder"]',
             'cideri', 'raw', 'pending_verify', 'test-fixture', 'medium')`,
       );
 

@@ -49,6 +49,10 @@ import {
   // eligibility gate for the source-grounded LLM rewrite of "passing-bar-
   // but-short" about_text/visit_text (see generateGardssalgAboutRewrite below).
   gardssalgRewriteEligible,
+  // dev-request 2026-07-18-gardssalg-profilkvalitet-foer-outreach, slice 5c —
+  // fill-only eligibility gate for the "products" JSON-array column (see
+  // generateGardssalgProductList below).
+  gardssalgProductsEligible,
   type GardssalgContentRefreshTarget,
   // dev-request 2026-07-18-gardssalg-profilkvalitet-foer-outreach, slice 1 —
   // rollback/provenance substrate backing POST /admin/gardssalg-content-rollback
@@ -878,7 +882,7 @@ router.post("/admin/gardssalg-content-refresh", requireAdmin, async (req: Reques
   }
 
   let scanned = 0;
-  const byField: Record<string, number> = { about_text: 0, visit_text: 0, opening_hours_text: 0 };
+  const byField: Record<string, number> = { about_text: 0, visit_text: 0, opening_hours_text: 0, products: 0 };
   type GsProvenanceMap = Record<string, { source_url: string; snippet: string | null }>;
   // dev-request 2026-07-18-gardssalg-profilkvalitet-foer-outreach, slice 2 —
   // `actions` is ADDITIVE alongside the existing `fields: string[]` (kept
@@ -1013,6 +1017,25 @@ router.post("/admin/gardssalg-content-refresh", requireAdmin, async (req: Reques
       }
     }
 
+    // ── Slice 5c: fill-only "products" extraction (dev-request 2026-07-18-
+    // gardssalg-profilkvalitet-foer-outreach). Only fires when the column is
+    // currently blank/empty (gardssalgProductsEligible) — no replace-thin
+    // path, unlike about_text/visit_text. Reuses the ALREADY-fetched/
+    // extracted contentText — no new fetch. Runs in BOTH dry-run and apply
+    // mode (dry-run still calls the LLM so the preview is real), same
+    // convention as the slice 5a rewrite path above.
+    let productsCandidate: string[] | null = null;
+    if (gardssalgProductsEligible(t.products)) {
+      productsCandidate = await generateGardssalgProductList(contentText);
+      if (productsCandidate && productsCandidate.length > 0) {
+        wouldWriteActions.products = "filled";
+        provenance.products = {
+          source_url: fetched.fetchUrl,
+          snippet: productsCandidate.slice(0, 5).join(", ").slice(0, 120),
+        };
+      }
+    }
+
     const wouldWrite = Object.keys(wouldWriteActions);
     if (wouldWrite.length === 0) return;
 
@@ -1030,6 +1053,7 @@ router.post("/admin/gardssalg-content-refresh", requireAdmin, async (req: Reques
             about_text: rewriteAbout ?? candidateAbout ?? undefined,
             visit_text: rewriteVisit ?? candidateVisit ?? undefined,
             opening_hours_text: candidateHours ?? undefined,
+            products: productsCandidate ?? undefined,
           },
           fetched.fetchUrl,
           undefined,
@@ -2730,6 +2754,108 @@ Bruk KUN fakta som faktisk står i kildeteksten under. Ikke finn på detaljer, p
   // requirement) — reject anything outside [200, 500], never truncate.
   if (cleaned.length < GARDSSALG_REWRITE_MIN_LEN || cleaned.length > GARDSSALG_REWRITE_MAX_LEN) return null;
   return cleaned;
+}
+
+// ─── generateGardssalgProductList (dev-request 2026-07-18-gardssalg-
+//     profilkvalitet-foer-outreach, slice 5c) ────────────────────────────────
+// Fill-only extraction of the drink/product names a gårdssalg provider
+// actually sells, sourced ONLY from the already-fetched, already-extracted
+// visible page text (sourceText — the SAME extractVisibleText(combinedHtml)
+// the calling route already computed, capped like the rewrite helper — no
+// new fetch/host-binding surface). Mirrors generateGardssalgAboutRewrite's
+// exact never-fabricate contract: sync fetch to
+// https://api.anthropic.com/v1/messages, ANTHROPIC_API_KEY from env, model
+// claude-opus-4-8. Returns null — NEVER throws, NEVER fabricates — on
+// missing key / network failure / non-200 / unparseable body / a response
+// that isn't a valid JSON array / an empty result after validation.
+//
+// Grounding (Daniel's "kun kildebasert" + "ingen oppfunne produkter"): the
+// prompt instructs the model to list ONLY product/drink names literally
+// present in the source text, in the exact wording used there, and to
+// return the literal sentinel GARDSSALG_PRODUCTS_SENTINEL when the source
+// text names no products at all.
+//
+// Validation is enforced HERE, in code — not trusted to the prompt alone:
+// the response must parse as JSON representing an array; non-string,
+// empty-after-trim, or over-length (> GARDSSALG_PRODUCTS_MAX_ITEM_LEN)
+// entries are silently dropped (filtering, not fabricating — never invents
+// a replacement for a dropped entry); the survivors are deduped case-
+// insensitively (first occurrence wins) and capped to
+// GARDSSALG_PRODUCTS_MAX_ITEMS. An empty list after all of that (including
+// the explicit sentinel) is null, never an empty-but-truthy array.
+const GARDSSALG_PRODUCTS_SENTINEL = "INGEN_PRODUKTER_FUNNET";
+const GARDSSALG_PRODUCTS_SOURCE_CHAR_CAP = 6000;
+const GARDSSALG_PRODUCTS_MAX_ITEMS = 20;
+const GARDSSALG_PRODUCTS_MAX_ITEM_LEN = 60;
+
+export async function generateGardssalgProductList(sourceText: string): Promise<string[] | null> {
+  const apiKey = process.env.ANTHROPIC_API_KEY;
+  if (!apiKey) return null;
+
+  const cappedSource = (sourceText || "").slice(0, GARDSSALG_PRODUCTS_SOURCE_CHAR_CAP);
+  const prompt = `Lag en liste over produkter/drikkevarer denne gårdsprodusenten selger, KUN basert på kildeteksten under.
+
+Kildetekst (hentet fra produsentens egen nettside):
+${cappedSource}
+
+Bruk KUN produktnavn som faktisk står i kildeteksten, med samme ordlyd som der. Ikke finn på produkter som ikke er nevnt. Svar med EKSAKT et JSON-array av strenger, f.eks. ["Eplesider","Eplemost"], og ingenting annet. Hvis kildeteksten ikke nevner noen konkrete produkter, svar med nøyaktig ${GARDSSALG_PRODUCTS_SENTINEL} og ingenting annet.`;
+
+  let response: Awaited<ReturnType<typeof fetch>>;
+  try {
+    response = await fetch("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "x-api-key": apiKey,
+        "anthropic-version": "2023-06-01",
+      },
+      body: JSON.stringify({
+        model: "claude-opus-4-8",
+        max_tokens: 400,
+        messages: [{ role: "user", content: prompt }],
+      }),
+    });
+  } catch {
+    return null; // network/fetch failure — never fabricate
+  }
+
+  if (!response.ok) return null;
+
+  let result: any;
+  try {
+    result = await response.json();
+  } catch {
+    return null; // unparseable JSON body — never fabricate
+  }
+
+  const contentArr = Array.isArray(result?.content) ? result.content : [];
+  const text = contentArr.find((c: any) => c?.type === "text")?.text;
+  if (typeof text !== "string") return null;
+  const cleaned = text.trim();
+  if (cleaned === GARDSSALG_PRODUCTS_SENTINEL) return null; // explicit "no products" escape
+
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(cleaned);
+  } catch {
+    return null; // not valid JSON — never fabricate/guess a list from prose
+  }
+  if (!Array.isArray(parsed)) return null;
+
+  const seen = new Set<string>();
+  const items: string[] = [];
+  for (const raw of parsed) {
+    if (typeof raw !== "string") continue;
+    const item = raw.trim();
+    if (!item || item.length > GARDSSALG_PRODUCTS_MAX_ITEM_LEN) continue;
+    const key = item.toLocaleLowerCase("nb-NO");
+    if (seen.has(key)) continue;
+    seen.add(key);
+    items.push(item);
+    if (items.length >= GARDSSALG_PRODUCTS_MAX_ITEMS) break;
+  }
+
+  return items.length > 0 ? items : null;
 }
 
 // Calls the Anthropic API the same way ClaudeVisionProvider.analyze() does
