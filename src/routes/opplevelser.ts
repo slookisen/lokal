@@ -53,6 +53,10 @@ import {
   // fill-only eligibility gate for the "products" JSON-array column (see
   // generateGardssalgProductList below).
   gardssalgProductsEligible,
+  // dev-request 2026-07-19-brreg-nace-drikkeprodusenter — NACE discovery
+  // landing (display-name transform + name-dedup basis incl. hidden rows).
+  brregDisplayName,
+  listGardssalgNameDedupRows,
   type GardssalgContentRefreshTarget,
   // dev-request 2026-07-18-gardssalg-profilkvalitet-foer-outreach, slice 1 —
   // rollback/provenance substrate backing POST /admin/gardssalg-content-rollback
@@ -144,7 +148,11 @@ import { isDirectoryOrAggregatorHost } from "../services/cross-source-validator"
 // Brreg name-search (candidate generator only, see gardssalgOrgnrAutoWriteEligible);
 // verifyOrgNumber (existing, cached) backs the write-bar's liveness veto — an
 // exact-name match to a bankrupt/deregistered org must never claim a row.
-import { findOrgnumberByName, verifyOrgNumber } from "../services/brreg-client";
+// scoreNameMatch: NACE-discoveryens navne-dedup mot eksisterende gårdssalg-rader.
+import { findOrgnumberByName, verifyOrgNumber, scoreNameMatch } from "../services/brreg-client";
+// dev-request 2026-07-19-brreg-nace-drikkeprodusenter — kommune→fylke best-effort
+// ved landing av nye NACE-oppdagede providere.
+import { cityToFylke } from "../services/norway-fylke";
 import {
   createBooking,
   getBookingByRef,
@@ -1200,6 +1208,304 @@ router.post("/admin/gardssalg-content-refresh", requireAdmin, async (req: Reques
   });
 });
 
+// ─── POST /api/opplevelser/admin/gardssalg-nace-discovery (admin) ────────────
+//
+// dev-request 2026-07-19-brreg-nace-drikkeprodusenter (motivert av 67 North
+// Distillery-funnet: NACE 11.010 var usynlig for all discovery). Sweeps
+// Brreg's registry by the DRINK NACE code family and lands new gårdssalg
+// providers org_nr-KEYED from birth — with Brreg business address and
+// hjemmeside in the same insert, so a discovered provider is born with the
+// identity key + "Sted" data the legacy 74 lacked. Dry-run by default.
+//
+// Fixed, validated code→producer_type map — arbitrary codes are rejected
+// (400), this endpoint scans the drink family only:
+//   11.010 destilleri · 11.030 sideri · 11.040 mjøderi · 11.050 bryggeri
+//
+// Per candidate enhet:
+//   dead        — konkurs / underAvvikling / underTvangsavviklingEller-
+//                 Tvangsopplosning / slettedato → skipped, reported.
+//   duplicate   — org_nr already in experience_providers (ANY row), or
+//                 exact name match (scoreNameMatch === 1.0 against the raw
+//                 OR the «— Sted»-pruned catalog name; legacy dash-suffixed
+//                 rows score only 0.8 raw, and re-creating them would mint
+//                 a public duplicate that also steals the org_nr (UNIQUE)
+//                 the legacy row needs) against an existing gårdssalg row
+//                 (incl. catalog_hidden) → skipped. In apply mode the
+//                 name-match variant is also upserted into
+//                 gardssalg_orgnr_review_queue (reason
+//                 nace_discovery_name_match) so the approve lever can adopt
+//                 the suggested org_nr onto the EXISTING row.
+//   capped      — creatable but beyond maxCreate → counted per code and
+//                 reported, so a capped run is distinguishable from a
+//                 complete sweep.
+//   created     — createProvider() with org_nr/navn (brregDisplayName)/
+//                 forretningsadresse/kommune(+nummer)/fylke (cityToFylke
+//                 best effort)/hjemmeside/organisasjonsform/naeringskode,
+//                 then producer_type + batch tag (rfb_seed_source =
+//                 batch_tag — any value other than the literal 'rfb-seed'
+//                 is inert for the gårdssalg WHERE clause; visibility comes
+//                 from producer_type) + verification_status pending_verify.
+//                 booking_live is NEVER set (onboarding owns that).
+//
+// Batch rollback (acceptance criterion 5): body {rollbackBatch: "<tag>",
+// apply} deletes ONLY rows whose rfb_seed_source equals that tag — the
+// one-operation undo for a whole discovery batch (no DB shell exists in
+// this environment, so the lever must be an endpoint). Rows a producer has
+// since claimed (content_source manual/claim) survive the rollback and are
+// reported as skipped_locked — the same lock every gårdssalg writer
+// honours. The tag itself is per-RUN unique (date+time), so two batches
+// landed the same day roll back independently.
+//
+// NB: MUST come before "/:id" so "admin" isn't swallowed as an id param.
+const GARDSSALG_NACE_PRODUCER_TYPE: Record<string, string> = {
+  "11.010": "destilleri",
+  "11.030": "sideri",
+  "11.040": "mjøderi",
+  "11.050": "bryggeri",
+};
+const GS_ND_PAGE_SIZE = 100;
+const GS_ND_MAX_PAGES_PER_CODE = 10; // 1000/code — far above the real ~240 ceiling
+const GS_ND_DEFAULT_MAX_CREATE = 400;
+
+router.post("/admin/gardssalg-nace-discovery", requireAdmin, async (req: Request, res: Response) => {
+  const body = (req.body ?? {}) as {
+    codes?: unknown;
+    apply?: unknown;
+    maxCreate?: unknown;
+    rollbackBatch?: unknown;
+  };
+
+  const apply =
+    body.apply === true ||
+    body.apply === 1 ||
+    body.apply === "1" ||
+    body.apply === "true" ||
+    req.query?.apply === "1" ||
+    req.query?.apply === "true";
+  const dryRun = !apply;
+
+  // ── Batch rollback mode ─────────────────────────────────────────────
+  if (typeof body.rollbackBatch === "string" && body.rollbackBatch.trim()) {
+    const tag = body.rollbackBatch.trim();
+    if (tag === "rfb-seed") {
+      res.status(400).json({ error: "Refusing: 'rfb-seed' is the legacy seed marker, not a discovery batch tag" });
+      return;
+    }
+    const db = getExpDb("experiences");
+    const tagged = db
+      .prepare(`SELECT id, navn, org_nr, content_source FROM experience_providers WHERE rfb_seed_source = ?`)
+      .all(tag) as Array<{ id: string; navn: string; org_nr: string | null; content_source: string | null }>;
+    // A provider claimed/manually curated AFTER discovery must survive the
+    // batch undo — deleting it would destroy producer-entered content.
+    const skippedLocked = tagged.filter((r) => r.content_source === "manual" || r.content_source === "claim");
+    const rows = tagged.filter((r) => r.content_source !== "manual" && r.content_source !== "claim");
+    if (dryRun) {
+      res.json({ success: true, dry_run: true, batch_tag: tag, would_delete: rows.length, rows, skipped_locked: skippedLocked });
+      return;
+    }
+    const del = db
+      .prepare(
+        `DELETE FROM experience_providers
+          WHERE rfb_seed_source = ?
+            AND (content_source IS NULL OR content_source NOT IN ('manual', 'claim'))`
+      )
+      .run(tag);
+    res.json({ success: true, dry_run: false, batch_tag: tag, deleted: del.changes, rows, skipped_locked: skippedLocked });
+    return;
+  }
+
+  // ── Discovery mode ──────────────────────────────────────────────────
+  let codes: string[];
+  if (Array.isArray(body.codes) && body.codes.length > 0) {
+    codes = (body.codes as unknown[]).filter((c): c is string => typeof c === "string").map((c) => c.trim());
+    const unknown = codes.filter((c) => !(c in GARDSSALG_NACE_PRODUCER_TYPE));
+    if (unknown.length > 0) {
+      res.status(400).json({ error: `Unknown NACE codes: ${unknown.join(", ")} — this endpoint scans the drink family only`, allowed: Object.keys(GARDSSALG_NACE_PRODUCER_TYPE) });
+      return;
+    }
+  } else {
+    codes = Object.keys(GARDSSALG_NACE_PRODUCER_TYPE);
+  }
+  const maxCreate = Math.min(
+    typeof body.maxCreate === "number" && body.maxCreate > 0 ? Math.floor(body.maxCreate) : GS_ND_DEFAULT_MAX_CREATE,
+    GS_ND_DEFAULT_MAX_CREATE
+  );
+
+  // One dedup snapshot up front: org_nr set spans ALL provider rows; the
+  // pruned-name basis spans gårdssalg rows (incl. hidden test provider).
+  const gardssalgRows = listGardssalgNameDedupRows();
+  const db = getExpDb("experiences");
+  const knownOrgnr = new Set(
+    (db.prepare(`SELECT org_nr FROM experience_providers WHERE org_nr IS NOT NULL AND TRIM(org_nr) != ''`).all() as Array<{ org_nr: string }>)
+      .map((r) => r.org_nr.trim())
+  );
+
+  // Date+time stamped: a date-only tag collides when two runs land the same
+  // day, and rollbackBatch would then undo BOTH batches as one.
+  const batchTag = `brreg-nace-${new Date().toISOString().replace(/[-:]/g, "").replace("T", "-").slice(0, 15)}`;
+  const perCode: Record<string, { total: number; dead: number; duplicates: number; created: number; capped: number }> = {};
+  const created: Array<{ provider_id?: string; org_nr: string; navn: string; producer_type: string; kommune: string | null; hjemmeside: string | null }> = [];
+  const duplicates: Array<{ org_nr: string; brreg_navn: string; reason: string; existing_provider_id?: string; suggested_orgnr_for_existing?: string }> = [];
+  const dead: Array<{ org_nr: string; navn: string }> = [];
+  const errors: Array<{ code: string; error: string }> = [];
+  const seenThisBatch = new Set<string>();
+  let cappedTotal = 0;
+
+  for (const code of codes) {
+    perCode[code] = { total: 0, dead: 0, duplicates: 0, created: 0, capped: 0 };
+    try {
+      for (let page = 0; page < GS_ND_MAX_PAGES_PER_CODE; page++) {
+        const url = `${BRREG_BASE_URL}${BRREG_SEARCH_PATH}?naeringskode=${encodeURIComponent(code)}&size=${GS_ND_PAGE_SIZE}&page=${page}`;
+        const resp = await fetch(url);
+        if (!resp.ok) {
+          errors.push({ code, error: `brreg_http_${resp.status}_page_${page}` });
+          break;
+        }
+        const json: any = await resp.json();
+        const enheter: any[] = json?._embedded?.enheter ?? [];
+        const totalPages: number = json?.page?.totalPages ?? 1;
+
+        for (const e of enheter) {
+          if (!e || typeof e.organisasjonsnummer !== "string" || typeof e.navn !== "string") continue;
+          const orgnr = e.organisasjonsnummer.trim();
+          if (seenThisBatch.has(orgnr)) continue;
+          seenThisBatch.add(orgnr);
+          perCode[code].total++;
+
+          if (e.konkurs === true || e.underAvvikling === true || e.underTvangsavviklingEllerTvangsopplosning === true || e.slettedato) {
+            perCode[code].dead++;
+            dead.push({ org_nr: orgnr, navn: e.navn });
+            continue;
+          }
+          if (knownOrgnr.has(orgnr)) {
+            perCode[code].duplicates++;
+            duplicates.push({ org_nr: orgnr, brreg_navn: e.navn, reason: "orgnr_exists" });
+            continue;
+          }
+          // Match the raw catalog name AND the «— Sted»-pruned one: legacy
+          // dash-suffixed rows («Ægir Bryggeri — Flåm») score only 0.8 raw,
+          // and missing them here would CREATE a public duplicate whose
+          // insert also takes the org_nr (UNIQUE) — permanently un-keying
+          // the legacy row. Over-matching is the safe direction: worst case
+          // a genuinely new enhet lands in the review queue instead of the
+          // catalog.
+          const nameMatch = gardssalgRows.find(
+            (g) =>
+              scoreNameMatch(g.navn, e.navn, null, null) === 1.0 ||
+              scoreNameMatch(gardssalgSearchName(g.navn), e.navn, null, null) === 1.0
+          );
+          if (nameMatch) {
+            perCode[code].duplicates++;
+            duplicates.push({
+              org_nr: orgnr,
+              brreg_navn: e.navn,
+              reason: "exact_name_matches_existing_gardssalg",
+              existing_provider_id: nameMatch.id,
+              suggested_orgnr_for_existing: orgnr,
+            });
+            // Make the suggestion adoptable, not just reportable: land it in
+            // the durable review queue for the approve lever. Apply mode
+            // only (dry-run stays side-effect free), and only while the
+            // existing row still lacks an org_nr — the queue reflects
+            // unresolved rows, and the applier is fill-only anyway.
+            if (!dryRun && !(nameMatch.org_nr && nameMatch.org_nr.trim() !== "")) {
+              const fa = e.forretningsadresse ?? {};
+              const candidateAddress =
+                [
+                  Array.isArray(fa.adresse) ? fa.adresse.filter(Boolean).join(", ") : "",
+                  typeof fa.postnummer === "string" ? fa.postnummer : "",
+                  typeof fa.poststed === "string" ? fa.poststed : "",
+                ]
+                  .filter(Boolean)
+                  .join(", ") || null;
+              try {
+                upsertGardssalgOrgnrReviewQueue({
+                  provider_id: nameMatch.id,
+                  provider_name: nameMatch.navn,
+                  candidate_orgnr: orgnr,
+                  candidate_name: e.navn,
+                  candidate_confidence: 1.0,
+                  candidate_address: candidateAddress,
+                  reason: "nace_discovery_name_match",
+                  batch_id: batchTag,
+                });
+              } catch {
+                /* review-queue is best-effort; discovery itself must not fail on it */
+              }
+            }
+            continue;
+          }
+
+          if (created.length >= maxCreate) {
+            perCode[code].capped++;
+            cappedTotal++;
+            continue;
+          }
+
+          const fa = e.forretningsadresse ?? {};
+          const adresse = Array.isArray(fa.adresse) ? fa.adresse.filter(Boolean).join(", ") : null;
+          const kommune = typeof fa.kommune === "string" ? brregDisplayName(fa.kommune) : null;
+          const poststed = typeof fa.poststed === "string" ? brregDisplayName(fa.poststed) : null;
+          const hjemmeside =
+            typeof e.hjemmeside === "string" && e.hjemmeside.trim()
+              ? e.hjemmeside.trim().toLowerCase()
+              : null;
+          const displayNavn = brregDisplayName(e.navn);
+          const producerType = GARDSSALG_NACE_PRODUCER_TYPE[code];
+
+          if (dryRun) {
+            perCode[code].created++;
+            created.push({ org_nr: orgnr, navn: displayNavn, producer_type: producerType, kommune, hjemmeside });
+          } else {
+            try {
+              const providerId = createProvider({
+                org_nr: orgnr,
+                navn: displayNavn,
+                adresse: adresse ?? undefined,
+                postnummer: typeof fa.postnummer === "string" ? fa.postnummer : undefined,
+                poststed: poststed ?? undefined,
+                kommune: kommune ?? undefined,
+                kommunenummer: typeof fa.kommunenummer === "string" ? fa.kommunenummer : undefined,
+                fylke: cityToFylke(kommune) ?? undefined,
+                hjemmeside: hjemmeside ?? undefined,
+                organisasjonsform: e.organisasjonsform?.kode ?? undefined,
+                naeringskode: code,
+                source: "brreg-nace-discovery",
+                confidence: "high",
+              } as any);
+              db.prepare(
+                `UPDATE experience_providers
+                    SET producer_type = @pt, rfb_seed_source = @tag, brreg_verified = 1, brreg_active = 1
+                  WHERE id = @id`
+              ).run({ pt: producerType, tag: batchTag, id: providerId });
+              perCode[code].created++;
+              created.push({ provider_id: providerId, org_nr: orgnr, navn: displayNavn, producer_type: producerType, kommune, hjemmeside });
+            } catch (err: any) {
+              errors.push({ code, error: `create_failed ${orgnr}: ${err?.message ?? String(err)}` });
+            }
+          }
+        }
+
+        if (page + 1 >= totalPages) break;
+      }
+    } catch (err: any) {
+      errors.push({ code, error: err?.message ?? String(err) });
+    }
+  }
+
+  res.json({
+    dry_run: dryRun,
+    batch_tag: batchTag,
+    per_code: perCode,
+    created_count: created.length,
+    capped_count: cappedTotal,
+    created,
+    duplicates,
+    dead,
+    errors,
+  });
+});
+
 // ─── POST /api/opplevelser/admin/gardssalg-address-enrichment (admin) ───────
 //
 // dev-request 2026-07-18-gardssalg-profilkvalitet-foer-outreach, slice 3.
@@ -1608,6 +1914,97 @@ router.post("/admin/gardssalg-orgnr-backfill", requireAdmin, async (req: Request
 router.get("/admin/gardssalg-orgnr-review-queue", requireAdmin, (_req: Request, res: Response) => {
   const entries = listGardssalgOrgnrReviewQueue();
   res.json({ count: entries.length, entries });
+});
+
+// ─── POST /api/opplevelser/admin/gardssalg-orgnr-review-approve (admin) ──────
+//
+// dev-request 2026-07-18-gardssalg-profilkvalitet-foer-outreach, slice 5b —
+// the review queue's missing APPLY lever. The first live backfill run
+// (2026-07-19) routed 61 providers to the queue exactly as the write bar
+// intends — but the queue had no resolution mechanism, so a human decision
+// had nowhere to go. This endpoint closes that loop under a strict contract:
+//
+//   A human may ONLY approve the exact (provider_id, org_nr) pair the queue
+//   itself carries — the org_nr in the request must equal the queue entry's
+//   candidate_orgnr, or the item is rejected (`mismatch`). This is a
+//   confirmation surface, not an arbitrary-write surface: candidates still
+//   come exclusively from the corroborated Brreg search, the human adds the
+//   judgment the auto-bar refused to exercise, and the write still passes
+//   through applyGardssalgProviderOrgnr's fill-only/lock/UNIQUE guards and
+//   lands in the same audit/provenance/rollback machinery.
+//
+// Body: { approvals: [{provider_id, org_nr}], apply? } — dry-run by default.
+// Response buckets: approved / rejected (reason per item) — every submitted
+// item lands in exactly one.
+router.post("/admin/gardssalg-orgnr-review-approve", requireAdmin, (req: Request, res: Response) => {
+  const body = (req.body ?? {}) as { approvals?: unknown; apply?: unknown };
+  const apply =
+    body.apply === true ||
+    body.apply === 1 ||
+    body.apply === "1" ||
+    body.apply === "true" ||
+    req.query?.apply === "1" ||
+    req.query?.apply === "true";
+  const dryRun = !apply;
+
+  if (!Array.isArray(body.approvals) || body.approvals.length === 0) {
+    res.status(400).json({ error: "Requires approvals: [{provider_id, org_nr}]" });
+    return;
+  }
+
+  const queue = listGardssalgOrgnrReviewQueue();
+  const byProvider = new Map(queue.map((q) => [q.provider_id, q]));
+
+  const approved: Array<{ provider_id: string; org_nr: string }> = [];
+  const rejected: Array<{ provider_id: string; reason: string }> = [];
+  const seen = new Set<string>();
+
+  for (const raw of body.approvals as unknown[]) {
+    const a = (raw ?? {}) as { provider_id?: unknown; org_nr?: unknown };
+    const providerId = typeof a.provider_id === "string" ? a.provider_id.trim() : "";
+    const orgNr = typeof a.org_nr === "string" ? a.org_nr.replace(/\s+/g, "") : "";
+    if (!providerId || !orgNr) {
+      rejected.push({ provider_id: providerId || "<mangler>", reason: "invalid_item" });
+      continue;
+    }
+    if (seen.has(providerId)) {
+      rejected.push({ provider_id: providerId, reason: "duplicate_in_request" });
+      continue;
+    }
+    seen.add(providerId);
+
+    const entry = byProvider.get(providerId);
+    if (!entry) {
+      rejected.push({ provider_id: providerId, reason: "not_in_review_queue" });
+      continue;
+    }
+    if (!entry.candidate_orgnr || entry.candidate_orgnr.trim() !== orgNr) {
+      // The human must approve the QUEUED candidate — a different org_nr in
+      // the request is a data-entry error or an attempt to use this as an
+      // arbitrary-write surface. Either way: rejected, nothing written.
+      rejected.push({ provider_id: providerId, reason: "mismatch_with_queued_candidate" });
+      continue;
+    }
+
+    if (dryRun) {
+      approved.push({ provider_id: providerId, org_nr: orgNr });
+      continue;
+    }
+    try {
+      const evidenceUrl = `${BRREG_BASE_URL}${BRREG_SEARCH_PATH}/${encodeURIComponent(orgNr)}`;
+      const written = applyGardssalgProviderOrgnr(providerId, orgNr, evidenceUrl);
+      if (written.length > 0) {
+        clearGardssalgOrgnrReviewQueueEntry(providerId);
+        approved.push({ provider_id: providerId, org_nr: orgNr });
+      } else {
+        rejected.push({ provider_id: providerId, reason: "write_refused_filled_locked_or_conflict" });
+      }
+    } catch (e: any) {
+      rejected.push({ provider_id: providerId, reason: `write_failed: ${e?.message ?? String(e)}` });
+    }
+  }
+
+  res.json({ dry_run: dryRun, approved_count: approved.length, approved, rejected });
 });
 
 // ─── POST /api/opplevelser/admin/gardssalg-content-rollback (admin) ─────────
