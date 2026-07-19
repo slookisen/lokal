@@ -42,6 +42,11 @@ import {
   getGardssalgProviderContentTarget,
   applyGardssalgProviderContent,
   type GardssalgContentRefreshTarget,
+  // dev-request 2026-07-18-gardssalg-profilkvalitet-foer-outreach, slice 1 —
+  // rollback/provenance substrate backing POST /admin/gardssalg-content-rollback
+  planGardssalgContentRollback,
+  applyGardssalgContentRollback,
+  type GardssalgRollbackPlanItem,
   // dev-request 2026-07-04-opplevagent-dedup-og-norske-titler, item 1 —
   // re-harvest guard (never insert/resurrect a duplicate already known/merged)
   findExistingExperienceMatch,
@@ -984,6 +989,102 @@ router.post("/admin/gardssalg-content-refresh", requireAdmin, async (req: Reques
     // Providers parked (3 consecutive fetch failures) during THIS run.
     parked_now: parkedNow,
   });
+});
+
+// ─── POST /api/opplevelser/admin/gardssalg-content-rollback (admin) ─────────
+//
+// dev-request 2026-07-18-gardssalg-profilkvalitet-foer-outreach, slice 1.
+// Daniel wants a full content-quality pass over all 74 gårdssalg producer
+// profiles run in ONE batch with NO canary; the agreed-upon substitute
+// safety net is that every field write made by the content pipeline
+// (applyGardssalgProviderContent, above) is reversible via the
+// gardssalg_content_audit changelog + experience_providers.field_provenance
+// columns (see init-experiences.ts / experience-store.ts). This endpoint is
+// that rollback lever. This slice builds ONLY the rollback substrate — it
+// does not change what content gets written by the batch pass.
+//
+// Body: { provider_id?, field_name?, batch_id?, apply? }. Either provider_id
+// (optionally scoped to one field_name) OR batch_id is required — 400 if
+// neither is given. batch_id rolls back EVERY field any provider had
+// touched under that batch, across all of them.
+//
+// apply: dry-run by default (same convention as every other admin route in
+// this file). apply=false/omitted is a HARD read-only guarantee: the
+// planning step (planGardssalgContentRollback) only ever SELECTs — no
+// UPDATE/INSERT statement runs anywhere on that path. apply=true performs
+// the restores AND inserts a NEW audit row per restore (never mutates/
+// deletes existing audit rows), so the rollback itself is auditable.
+//
+// A (provider_id, field_name) pair with no audit history, or whose latest
+// audit row's old_value already matches the field's current live value
+// (already rolled back / never actually changed), is reported in `skipped`
+// rather than erroring — a batch-wide rollback partially applied earlier
+// must be safely re-runnable.
+//
+// Response: { success: true, dry_run, restored: [...], skipped: [...] }.
+// Auth: same X-Admin-Key convention (requireAdmin) as the rest of this file.
+router.post("/admin/gardssalg-content-rollback", requireAdmin, (req: Request, res: Response) => {
+  const body = (req.body ?? {}) as {
+    provider_id?: unknown;
+    field_name?: unknown;
+    batch_id?: unknown;
+    apply?: unknown;
+  };
+
+  const providerId =
+    typeof body.provider_id === "string" && body.provider_id.trim() ? body.provider_id.trim() : undefined;
+  const fieldName =
+    typeof body.field_name === "string" && body.field_name.trim() ? body.field_name.trim() : undefined;
+  const batchId =
+    typeof body.batch_id === "string" && body.batch_id.trim() ? body.batch_id.trim() : undefined;
+  const apply =
+    body.apply === true || body.apply === 1 || body.apply === "1" || body.apply === "true";
+
+  if (!providerId && !batchId) {
+    res.status(400).json({ error: "Requires provider_id or batch_id" });
+    return;
+  }
+
+  try {
+    const { restorable, skipped } = planGardssalgContentRollback({
+      provider_id: providerId,
+      field_name: fieldName,
+      batch_id: batchId,
+    });
+
+    if (!apply) {
+      // Dry-run: report what WOULD be restored without writing anything —
+      // planGardssalgContentRollback is a pure read (SELECT-only), so no DB
+      // mutation happens on this path.
+      res.json({
+        success: true,
+        dry_run: true,
+        restored: restorable.map((r) => ({
+          provider_id: r.provider_id,
+          field_name: r.field_name,
+          current_value: r.current_value,
+          would_restore_to: r.restore_to,
+        })),
+        skipped,
+      });
+      return;
+    }
+
+    const applied = applyGardssalgContentRollback(restorable as GardssalgRollbackPlanItem[]);
+    res.json({
+      success: true,
+      dry_run: false,
+      restored: applied.map((r) => ({
+        provider_id: r.provider_id,
+        field_name: r.field_name,
+        restored_to: r.restored_to,
+      })),
+      skipped,
+    });
+  } catch (err: any) {
+    console.error("[opplevelser] gardssalg-content-rollback failed", err);
+    res.status(500).json({ error: "Internal error" });
+  }
 });
 
 // ─── Admin rfb-seed routes ───────────────────────────────────────────

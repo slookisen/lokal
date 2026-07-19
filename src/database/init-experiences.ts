@@ -413,9 +413,62 @@ export function initExperiencesSchema(db: Database.Database): void {
     // parked providers unless EXPERIENCES_HOMEPAGE_PARKING_DISABLED=true.
     "ALTER TABLE experience_providers ADD COLUMN homepage_fetch_attempts INTEGER NOT NULL DEFAULT 0",
     "ALTER TABLE experience_providers ADD COLUMN homepage_unreachable_since TEXT",
+    // field_provenance (dev-request 2026-07-18-gardssalg-profilkvalitet-foer-
+    // outreach, slice 1 — rollback/provenance substrate): JSON object, one
+    // entry per gårdssalg-content-pipeline-written field, e.g.
+    // {"about_text":{"source_url":"...","fetched_at":"..."}, "visit_text":{...}}.
+    // NOT the same thing as rfb's agent_knowledge.field_provenance (an array-
+    // per-field, multi-source, evidence-graded model used for verification/
+    // locking decisions there) — see the "LOCK MODEL (experiences-native;
+    // there is no rfb-style field_provenance here)" comment in
+    // experience-store.ts, which is about content-write LOCKING and is
+    // unaffected by this column. This column exists purely so a future
+    // batch content-improvement pass has a per-field "where did this value
+    // come from and when" record to show alongside the gardssalg_content_audit
+    // changelog (below) — it does not gate/lock any write path. Written by
+    // applyGardssalgProviderContent() (read-modify-write merge, never
+    // clobbers other fields' entries); read by nothing yet in this slice.
+    "ALTER TABLE experience_providers ADD COLUMN field_provenance TEXT",
   ];
   for (const stmt of gardssalgContentCols) {
     try { db.exec(stmt); } catch { /* already present */ }
+  }
+
+  // ─── gardssalg_content_audit (dev-request 2026-07-18-gardssalg-
+  // profilkvalitet-foer-outreach, slice 1) ───────────────────────────────────
+  // Insert-only, field-level changelog for every value the gårdssalg
+  // content-refresh pipeline (applyGardssalgProviderContent) writes onto
+  // experience_providers. Mirrors agent_knowledge_audit's shape/purpose in
+  // src/database/init.ts (~line 1632) — this fleet's established convention
+  // for a reversible-write audit trail — adapted to this vertical's provider
+  // rows. Built BEFORE any batch content-improvement writes happen: Daniel
+  // agreed to run the 74-producer content-quality pass in one batch with NO
+  // canary, on the condition that every field write is reversible via this
+  // audit trail (see POST /admin/gardssalg-content-rollback in
+  // routes/opplevelser.ts), proven working first. This slice adds ONLY the
+  // audit/provenance substrate — it does not change what content gets
+  // written.
+  // FK ON DELETE CASCADE: orphan-audits cleaned up if a provider is ever
+  // deleted (mirrors agent_knowledge_audit's FK).
+  try {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS gardssalg_content_audit (
+        id TEXT PRIMARY KEY,
+        provider_id TEXT NOT NULL,
+        field_name TEXT NOT NULL,
+        old_value TEXT,
+        new_value TEXT,
+        source_url TEXT,
+        batch_id TEXT,
+        changed_by TEXT NOT NULL DEFAULT 'system',
+        changed_at TEXT NOT NULL DEFAULT (datetime('now')),
+        FOREIGN KEY (provider_id) REFERENCES experience_providers(id) ON DELETE CASCADE
+      )
+    `);
+    db.exec(`CREATE INDEX IF NOT EXISTS idx_gardssalg_content_audit_provider ON gardssalg_content_audit(provider_id)`);
+    db.exec(`CREATE INDEX IF NOT EXISTS idx_gardssalg_content_audit_batch ON gardssalg_content_audit(batch_id)`);
+  } catch (err) {
+    console.error("Migration gardssalg_content_audit failed:", err);
   }
 
   // ─── Gårdssalg dark-launch-stop (dev-request 2026-07-12-gardssalg-dark-
