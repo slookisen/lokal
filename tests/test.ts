@@ -26997,6 +26997,22 @@ Promise.allSettled(_oaHomeCountersDeps).then(async () => {
     for (const f of gob.failures) failures.push("opplevelser-gardssalg-orgnr-backfill: " + f);
     console.log(`  opplevelser-gardssalg-orgnr-backfill: ${gob.passed} passed, ${gob.failed} failed`);
 
+    // dev-request 2026-07-18-gardssalg-profilkvalitet-foer-outreach, slice 5d
+    // + 5b-integrasjonsherding (2026-07-19-review B1/B2/M1/M2/M3/M5): delt-/
+    // katalogdomene-vern på content-refresh (kuratert klassifiserer +
+    // visit*-klasse + delt-host-telling, attempt-stamping av ekskluderte),
+    // sti-innesluttet subside-crawl, og veto-kjeden i orgnr-backfillens
+    // skrivebar (ties/konkurs/rullet-tilbake/strippet-navn). Same in-memory-
+    // DB pattern, runs sequentially inside this same gated block.
+    console.log("\n── opplevelser-gardssalg-5d-hardening: delt-domene-vern + skrivebar-vetoer ──");
+    const { runOpplevelserGardssalg5dHardeningTests } = require("../src/routes/opplevelser-gardssalg-5d-hardening.test") as
+      typeof import("../src/routes/opplevelser-gardssalg-5d-hardening.test");
+    const g5h = await runOpplevelserGardssalg5dHardeningTests(false);
+    passed += g5h.passed;
+    failed += g5h.failed;
+    for (const f of g5h.failures) failures.push("opplevelser-gardssalg-5d-hardening: " + f);
+    console.log(`  opplevelser-gardssalg-5d-hardening: ${g5h.passed} passed, ${g5h.failed} failed`);
+
     // dev-request 2026-07-04-opplevagent-dedup-og-norske-titler, item 3
     // (detail completeness weave): GET /admin/detail-completeness-coverage —
     // read-only, catalog-wide booking_url/phone/website coverage report over

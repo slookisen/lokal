@@ -437,6 +437,14 @@ export function runOpplevelserGardssalgOrgnrBackfillTests(
 
       globalThis.fetch = (async (url: string | URL | Request) => {
         const u = String(url);
+        // Integration hardening (2026-07-19): the backfill route's write bar
+        // now runs a verifyOrgNumber liveness check (GET /enheter/<orgnr>)
+        // before any auto-write — serve a healthy detail body so these
+        // fixtures exercise the same write paths as before the veto chain.
+        const dm = u.match(/\/enheter\/(\d{9})$/);
+        if (dm) {
+          return { ok: true, status: 200, json: async () => ({ organisasjonsnummer: dm[1], navn: "SUNN TESTENHET AS" }) } as unknown as Response;
+        }
         if (u.includes("navn=Route%20Poststed%20Collision%20Gard")) {
           return {
             ok: true, status: 200,
@@ -609,6 +617,14 @@ export function runOpplevelserGardssalgOrgnrBackfillTests(
       });
       globalThis.fetch = (async (url: string | URL | Request) => {
         const u = String(url);
+        // Integration hardening (2026-07-19): the backfill route's write bar
+        // now runs a verifyOrgNumber liveness check (GET /enheter/<orgnr>)
+        // before any auto-write — serve a healthy detail body so these
+        // fixtures exercise the same write paths as before the veto chain.
+        const dm = u.match(/\/enheter\/(\d{9})$/);
+        if (dm) {
+          return { ok: true, status: 200, json: async () => ({ organisasjonsnummer: dm[1], navn: "SUNN TESTENHET AS" }) } as unknown as Response;
+        }
         if (u.includes("navn=Route%20Write%20Fail%20Gard")) {
           return {
             ok: true, status: 200,

@@ -31,6 +31,9 @@ import { haversineDistanceKm } from "./geocoding-service";
 // gardssalgOrgnrPostalCorroborated below (never a raw substring test — see
 // that function's doc comment for why).
 import { normaliseName } from "./brreg-client";
+// slice 5d — reuse the curated directory/aggregator host classifier + URL→host
+// parser (single source of truth, dev-request 2026-07-19-agg-website-leak).
+import { isDirectoryOrAggregatorHost, hostFromUrlLike } from "./cross-source-validator";
 import {
   findExistingCandidateMatch,
   scoreExperienceRichness,
@@ -2600,6 +2603,15 @@ export function gardssalgOrgnrPostalCorroborated(
   const hitPostnr = (hit.brreg_postal || "").trim();
   if (targetPostnr && hitPostnr && targetPostnr === hitPostnr) return true;
 
+  // Postnummer CONFLICT veto (integration review M2, 2026-07-19): when both
+  // sides carry a postnummer and they point at different postal REGIONS
+  // (different first digit), a same-named poststed elsewhere in the country
+  // (Vik, Nes, Sand … recur across regions) must NOT corroborate — falling
+  // through to the name check here would be exactly the wrong-entity write
+  // this gate exists to prevent. Same-region mismatches (e.g. neighbouring
+  // postnummer within one kommune) still fall through to the poststed check.
+  if (targetPostnr && hitPostnr && targetPostnr[0] !== hitPostnr[0]) return false;
+
   const targetPoststed = normaliseName(target.poststed || "");
   const hitPoststed = normaliseName(hit.brreg_poststed || "");
   if (targetPoststed && hitPoststed && targetPoststed === hitPoststed) return true;
@@ -2676,9 +2688,15 @@ export function applyGardssalgProviderOrgnr(
   provenance.org_nr = { source_url: evidenceUrl, fetched_at: new Date().toISOString() };
 
   const applyWithAudit = db.transaction(() => {
-    db.prepare(
-      `UPDATE experience_providers SET org_nr = @org_nr, field_provenance = @field_provenance, updated_at = datetime('now') WHERE id = @id`
+    // Fill-only guard repeated INSIDE the UPDATE's WHERE (integration review
+    // N2): harmless today (synchronous read→tx, mirrors the address writer),
+    // but makes the statement itself unable to clobber a concurrently-set
+    // org_nr under any future multi-process deployment.
+    const upd = db.prepare(
+      `UPDATE experience_providers SET org_nr = @org_nr, field_provenance = @field_provenance, updated_at = datetime('now')
+        WHERE id = @id AND (org_nr IS NULL OR TRIM(org_nr) = '')`
     ).run({ id: providerId, org_nr: cleanOrgNr, field_provenance: JSON.stringify(provenance) });
+    if (upd.changes === 0) throw new Error("orgnr_filled_concurrently");
     db.prepare(
       `INSERT INTO gardssalg_content_audit
          (id, provider_id, field_name, old_value, new_value, source_url, batch_id, changed_by, changed_at)
@@ -2692,9 +2710,34 @@ export function applyGardssalgProviderOrgnr(
       batch_id: batchId ?? null,
     });
   });
-  applyWithAudit();
+  try {
+    applyWithAudit();
+  } catch (e: any) {
+    if (String(e?.message) === "orgnr_filled_concurrently") return [];
+    throw e;
+  }
 
   return ["org_nr"];
+}
+
+/**
+ * True when this provider's LATEST org_nr audit row is a rollback (an admin
+ * deliberately undid an earlier backfill). The backfill route treats such
+ * rows as review-only (integration review M3): without this, the same
+ * deterministic Brreg answer would silently re-write the very org_nr a human
+ * just rolled back on the next scheduled run — an undo that un-undoes
+ * itself. Exported for tests.
+ */
+export function gardssalgOrgnrWasRolledBack(providerId: string): boolean {
+  const db = getDb(VERTICAL);
+  const latest = db
+    .prepare(
+      `SELECT source_url FROM gardssalg_content_audit
+        WHERE provider_id = ? AND field_name = 'org_nr'
+        ORDER BY rowid DESC LIMIT 1`
+    )
+    .get(providerId) as { source_url: string | null } | undefined;
+  return !!latest && latest.source_url === GARDSSALG_ROLLBACK_MARKER;
 }
 
 export type GardssalgOrgnrReviewQueueEntry = {
@@ -2767,6 +2810,103 @@ export function listGardssalgOrgnrReviewQueue(): (GardssalgOrgnrReviewQueueEntry
   return db
     .prepare(`SELECT * FROM gardssalg_orgnr_review_queue ORDER BY updated_at DESC`)
     .all() as (GardssalgOrgnrReviewQueueEntry & { id: string; created_at: string; updated_at: string })[];
+}
+
+// The catalog's display names often carry a "— Sted" suffix ("Ægir Bryggeri —
+// Flåm") that Brreg registry names never have; searching/scoring with the
+// suffix attached demotes a genuinely exact company-name match to the
+// first-token 0.8x tier — which under the auto-write gate above means the row
+// needlessly lands in the review queue instead of auto-filling. Strips a
+// SPACED dash segment only (em/en/hyphen with whitespace on both sides), so
+// inner compound hyphens ("Saft- og Siderfabrikk") are untouched. Pure +
+// exported for tests; wired into the backfill route's findOrgnumberByName
+// call (slice 5d integration round).
+export function gardssalgSearchName(navn: string): string {
+  return (navn || "")
+    .split(/\s+[—–-]\s+/)[0]
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+// ─── Gårdssalg shared-domain guard (dev-request 2026-07-18-gardssalg-
+//     profilkvalitet-foer-outreach, slice 5d) ────────────────────────────────
+//
+// Slice 4b's post-apply audit caught Daniel's exact feared incident live: a
+// provider whose `hjemmeside` points at its hanen.no DIRECTORY page got
+// about/visit text describing a DIFFERENT member farm, because
+// crFetchGardssalgContent crawls sub-pages from the HOST ROOT — on a shared
+// directory domain that root serves other entities' content. Guard, applied
+// by the content-refresh route before any fetch:
+//   (a) the CURATED directory/aggregator host classifier from
+//       cross-source-validator.ts (dev-request 2026-07-19-agg-website-leak —
+//       hanen.no, siderruta.no, visitnorway, gulesider/proff/1881, the
+//       *.hanen.no-style family suffixes, …) — one source of truth, not a
+//       second hand-rolled list;
+//   (b) a visit*-DMO prefix rule ON TOP: cross-source-validator deliberately
+//       refuses to pattern-match tourism boards because ITS action
+//       (NULLing a hjemmeside) is irreversible — here the action is
+//       "skip content-writes this run" (fully reversible), so the
+//       fail-closed pattern is the right trade for gårdssalg text safety;
+//   (c) an automatic red flag when the SAME host serves more than one
+//       provider's hjemmeside in this catalog — no fixed list can know every
+//       shared domain, but a host with 2+ providers is by definition not one
+//       producer's own site. (The Ciderhuset/Balholm duplicate-provider pair
+//       is the known benign hit of (c) — correct outcome: excluded from
+//       automated TEXT writes until the dedup resolves, since the crawl
+//       cannot know which row the content belongs to.)
+// Excluded providers are reported (never silently dropped) and land on the
+// outreach-hook list — a producer fixing their hjemmeside via claim is the
+// durable fix.
+
+/** Pure host-level rule — exported for tests. */
+export function gardssalgSharedDomainReason(host: string | null): string | null {
+  if (!host) return null;
+  const h = host.toLowerCase().replace(/^www\./, "");
+  if (isDirectoryOrAggregatorHost(h)) return "blocklisted_directory_domain";
+  if (/^visit[a-z0-9-]*\.(no|com)$/.test(h)) return "dmo_visit_domain";
+  return null;
+}
+
+/**
+ * Catalog-wide shared-domain map: host → number of gårdssalg providers whose
+ * hjemmeside lives on it. One cheap full scan (the catalog is two-digit
+ * sized) per refresh request — no caching, so a just-corrected hjemmeside
+ * takes effect immediately.
+ */
+export function gardssalgSharedHostCounts(): Map<string, number> {
+  const db = getDb(VERTICAL);
+  const rows = db
+    .prepare(
+      `SELECT hjemmeside FROM experience_providers
+        WHERE (producer_type IS NOT NULL OR rfb_seed_source = 'rfb-seed')
+          AND hjemmeside IS NOT NULL AND TRIM(hjemmeside) != ''
+          AND (catalog_hidden IS NULL OR catalog_hidden != 1)`
+    )
+    .all() as Array<{ hjemmeside: string }>;
+  const counts = new Map<string, number>();
+  for (const r of rows) {
+    const h = hostFromUrlLike(r.hjemmeside);
+    if (h) counts.set(h, (counts.get(h) || 0) + 1);
+  }
+  return counts;
+}
+
+/**
+ * Full exclusion decision for one provider's hjemmeside, given the catalog
+ * host counts. Returns null when the host is fine, or a machine-readable
+ * reason ("blocklisted_directory_domain" | "dmo_visit_domain" |
+ * "shared_host_multiple_providers").
+ */
+export function gardssalgContentExclusionReason(
+  hjemmeside: string | null | undefined,
+  hostCounts: Map<string, number>
+): string | null {
+  const host = hostFromUrlLike(hjemmeside || "");
+  if (!host) return null;
+  const listed = gardssalgSharedDomainReason(host);
+  if (listed) return listed;
+  if ((hostCounts.get(host) || 0) > 1) return "shared_host_multiple_providers";
+  return null;
 }
 
 // ─── Gårdssalg content rollback (dev-request 2026-07-18-gardssalg-

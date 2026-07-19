@@ -77,6 +77,15 @@ import {
   clearGardssalgOrgnrReviewQueueEntry,
   listGardssalgOrgnrReviewQueue,
   type GardssalgOrgnrBackfillTarget,
+  // slice 5b integration hardening (2026-07-19 review) — display-suffix
+  // strip before search + rolled-back veto.
+  gardssalgSearchName,
+  gardssalgOrgnrWasRolledBack,
+  // slice 5d — shared-/directory-domain guard on the content-refresh route
+  // (the hanen.no cross-contamination incident): exclusion decided BEFORE
+  // any fetch, reported in its own additive response bucket.
+  gardssalgSharedHostCounts,
+  gardssalgContentExclusionReason,
   // dev-request 2026-07-04-opplevagent-dedup-og-norske-titler, item 1 —
   // re-harvest guard (never insert/resurrect a duplicate already known/merged)
   findExistingExperienceMatch,
@@ -132,8 +141,10 @@ import { fetchBrregBusinessAddress, BRREG_BASE_URL, BRREG_SEARCH_PATH } from "..
 // below, near the bulk-load handler that consumes them.
 import { isDirectoryOrAggregatorHost } from "../services/cross-source-validator";
 // dev-request 2026-07-18-gardssalg-profilkvalitet-foer-outreach, slice 5b —
-// Brreg name-search (candidate generator only, see gardssalgOrgnrAutoWriteEligible).
-import { findOrgnumberByName } from "../services/brreg-client";
+// Brreg name-search (candidate generator only, see gardssalgOrgnrAutoWriteEligible);
+// verifyOrgNumber (existing, cached) backs the write-bar's liveness veto — an
+// exact-name match to a bankrupt/deregistered org must never claim a row.
+import { findOrgnumberByName, verifyOrgNumber } from "../services/brreg-client";
 import {
   createBooking,
   getBookingByRef,
@@ -885,7 +896,22 @@ async function crFetchGardssalgContent(
   let pagesFetched = 1;
   try {
     const u = new URL(fetchUrl);
-    const base = `${u.protocol}//${u.host}`;
+    // Slice 5d: sub-page candidates resolve relative to the STORED URL's
+    // section, not the host root. For the normal case (hjemmeside is the
+    // site root) this is identical to the old `${protocol}//${host}` base;
+    // for a deep-path hjemmeside it keeps the crawl inside that page's own
+    // section instead of walking onto whatever else the host serves — the
+    // exact mechanism behind the 2026-07-19 hanen.no cross-contamination
+    // (directory root's /om-oss described the directory org, not the farm).
+    // An extensionless last segment ("/medlem/gard-x") is treated as a
+    // section of its own (integration review M1) — only an explicit file
+    // ("/index.html") falls back to its parent directory.
+    let dir = u.pathname;
+    if (!dir.endsWith("/")) {
+      const lastSeg = dir.slice(dir.lastIndexOf("/") + 1);
+      dir = lastSeg.includes(".") ? dir.replace(/[^/]*$/, "") : `${dir}/`;
+    }
+    const base = `${u.protocol}//${u.host}${dir === "/" ? "" : dir.replace(/\/$/, "")}`;
     for (const path of GARDSSALG_CONTENT_PATHS) {
       if (pagesFetched >= GARDSSALG_MAX_PAGES) break;
       const sub = await crFetchHtml(`${base}${path}`);
@@ -961,6 +987,14 @@ router.post("/admin/gardssalg-content-refresh", requireAdmin, async (req: Reques
   // Providers that crossed the 3-failure parking threshold THIS run
   // (enrichment-metode slice 1; mirrors provenance-batch's parked_now).
   const parkedNow: string[] = [];
+  // Slice 5d — shared-/directory-domain guard (the 2026-07-19 hanen.no
+  // cross-contamination incident, caught live by the slice-4b identity
+  // audit): a provider whose hjemmeside lives on a directory/DMO domain, or
+  // on a host shared by 2+ providers in this catalog, is EXCLUDED from all
+  // content fetching/writing and reported here — never silently dropped.
+  // Host counts are computed once per request (cheap, two-digit catalog).
+  const excludedSharedDomain: Array<{ provider_id: string; reason: string }> = [];
+  const sharedHostCounts = gardssalgSharedHostCounts();
 
   async function processOne(t: GardssalgContentRefreshTarget): Promise<void> {
     const providerId = t.id;
@@ -968,9 +1002,22 @@ router.post("/admin/gardssalg-content-refresh", requireAdmin, async (req: Reques
     // Stamp the attempt UNCONDITIONALLY (apply mode only) before doing any
     // fetch/extraction work — same "cycle to the back of the queue on any
     // outcome" reasoning as the experiences-table route above (see
-    // markProviderContentAttempted's doc comment).
+    // markProviderContentAttempted's doc comment). This INCLUDES providers
+    // the shared-domain guard below excludes (integration review B2): an
+    // unstamped excluded provider would stay permanently first in the
+    // last_content_attempt_at-ordered auto-select and starve the queue's
+    // limit slots forever — stamping cycles it to the back like every other
+    // no-progress outcome.
     if (apply) {
       try { markProviderContentAttempted(providerId); } catch { /* best-effort */ }
+    }
+
+    // Shared-domain guard — before lock/fetch: an excluded provider must
+    // never touch the network or receive content writes.
+    const exclusionReason = gardssalgContentExclusionReason(t.hjemmeside, sharedHostCounts);
+    if (exclusionReason) {
+      excludedSharedDomain.push({ provider_id: providerId, reason: exclusionReason });
+      return;
     }
 
     // LOCK check — from the target's own row snapshot, BEFORE any fetch, so a
@@ -1147,6 +1194,9 @@ router.post("/admin/gardssalg-content-refresh", requireAdmin, async (req: Reques
     errors,
     // Providers parked (3 consecutive fetch failures) during THIS run.
     parked_now: parkedNow,
+    // Slice 5d: providers excluded by the shared-/directory-domain guard —
+    // additive bucket; every excluded provider is visible, never dropped.
+    excluded_shared_domain: excludedSharedDomain,
   });
 });
 
@@ -1417,9 +1467,16 @@ router.post("/admin/gardssalg-orgnr-backfill", requireAdmin, async (req: Request
       continue;
     }
 
+    // Integration hardening (2026-07-19 review): search with the catalog's
+    // display suffix ("— Sted") stripped — an exact company-name match must
+    // not be demoted to the 0.8x tier by our own display convention. When
+    // stripping actually changed the name, the write bar is tightened below.
+    const searchName = gardssalgSearchName(t.navn);
+    const nameWasStripped = searchName !== t.navn.replace(/\s+/g, " ").trim();
+
     let hit: Awaited<ReturnType<typeof findOrgnumberByName>>;
     try {
-      hit = await findOrgnumberByName(t.navn, t.postnummer);
+      hit = await findOrgnumberByName(searchName, t.postnummer);
     } catch (e: any) {
       errors.push({ provider_id: providerId, error: e?.message ?? String(e) });
       continue;
@@ -1436,6 +1493,54 @@ router.post("/admin/gardssalg-orgnr-backfill", requireAdmin, async (req: Request
         candidate_confidence: null,
         candidate_address: null,
         reason: "no_brreg_candidate",
+      });
+      continue;
+    }
+
+    // ── Write-bar veto chain (integration review B1/M3/M5) — each veto is a
+    // review-queue outcome, never a write. Order: cheapest checks first.
+    let vetoReason: string | null = null;
+    if ((hit.exact_ties ?? (hit.confidence === 1.0 ? 1 : 0)) > 1) {
+      // ≥2 exact-name hits in one response (ENK vs AS with the same pruned
+      // name, bankrupt predecessor + successor, …): which one wins is
+      // response-order luck — structurally ambiguous, a human must pick.
+      vetoReason = "ambiguous_exact_name_ties";
+    } else if (nameWasStripped && !(t.postnummer && hit.brreg_postal && t.postnummer.trim() === hit.brreg_postal.trim())) {
+      // The name we searched is OUR truncation of the display name — demand
+      // the strongest corroboration channel (exact postnummer) before
+      // trusting a match against a name we ourselves shortened.
+      vetoReason = "stripped_name_requires_postal_match";
+    } else {
+      // A human deliberately rolled this provider's org_nr back — the same
+      // deterministic Brreg answer must not silently re-apply it. The audit
+      // lookup itself is best-effort (an audit-storage failure must surface
+      // through the WRITE path's own error handling, not turn this read
+      // into a request-killing 500).
+      let rolledBack = false;
+      try { rolledBack = gardssalgOrgnrWasRolledBack(providerId); } catch { rolledBack = false; }
+      if (rolledBack) vetoReason = "previously_rolled_back";
+    }
+    if (!vetoReason && gardssalgOrgnrAutoWriteEligible(t, hit)) {
+      // Liveness LAST (one extra Brreg call, cached): an exact-name match to
+      // a bankrupt/deregistered org must not claim the row — the successor
+      // entity case is exactly the wrong-identity write Daniel's rule bans.
+      try {
+        const ver = await verifyOrgNumber(hit.orgnumber);
+        if (!ver.exists || !ver.active) vetoReason = "brreg_not_active";
+      } catch {
+        vetoReason = "brreg_verify_failed";
+      }
+    }
+    if (vetoReason) {
+      unresolved.push({ provider_id: providerId, reason: vetoReason });
+      upsertGardssalgOrgnrReviewQueue({
+        provider_id: providerId,
+        provider_name: t.navn,
+        candidate_orgnr: hit.orgnumber,
+        candidate_name: hit.name,
+        candidate_confidence: hit.confidence,
+        candidate_address: hit.address,
+        reason: vetoReason,
       });
       continue;
     }

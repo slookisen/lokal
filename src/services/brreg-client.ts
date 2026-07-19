@@ -39,6 +39,14 @@ export type BrregHit = {
   // substring test against that string is unsafe (a short poststed like
   // "Nes" or "Os" is a substring of unrelated towns like "Sandnes"/"Oslo").
   brreg_poststed?: string | null;
+  // ─── slice 5b hardening (integration review, 2026-07-19) ────────────────
+  // How many hits in the SAME search response scored the exact-match tier
+  // (1.0). findOrgnumberByName returns only the best hit, and with a strict
+  // ">" comparison "best" among several 1.0 hits is response-ORDER-dependent
+  // — e.g. "SOLBAKKEN GARD" (ENK) vs "SOLBAKKEN GARD AS" both prune to the
+  // same name and both score 1.0. A caller writing identity keys must treat
+  // exact_ties > 1 as ambiguous and refuse to auto-write.
+  exact_ties?: number;
   // ─── dev-request 2026-07-03-places-api-cost-reduction, measure 3 ───────
   // Formatted street address ("<adresse>, <postnummer> <poststed>"), when
   // Brreg's response for this hit includes a usable street line. null when
@@ -552,11 +560,13 @@ export async function findOrgnumberByName(
       : [];
 
   let best: BrregHit | null = null;
+  let exactTies = 0;
   for (const h of enheter) {
     if (!h || typeof h.organisasjonsnummer !== "string" || typeof h.navn !== "string") continue;
     const hitPostal = h.forretningsadresse?.postnummer ?? h.postadresse?.postnummer ?? null;
     const hitPoststed = h.forretningsadresse?.poststed ?? h.postadresse?.poststed ?? null;
     const score = scoreNameMatch(cleanName, h.navn, postalCode ?? null, hitPostal);
+    if (score === 1.0) exactTies++;
     if (!best || score > best.confidence) {
       best = {
         orgnumber: h.organisasjonsnummer,
@@ -568,6 +578,7 @@ export async function findOrgnumberByName(
       };
     }
   }
+  if (best) best.exact_ties = exactTies;
 
   // Threshold: only return matches at confidence ≥ 0.9.
   const result: BrregHit | null = (best && best.confidence >= 0.9) ? best : null;
