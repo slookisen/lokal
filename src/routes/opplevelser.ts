@@ -2697,6 +2697,30 @@ const GARDSSALG_REWRITE_SOURCE_CHAR_CAP = 6000;
 const GARDSSALG_REWRITE_MIN_LEN = 200;
 const GARDSSALG_REWRITE_MAX_LEN = 500;
 
+// The profile template renders about_text/visit_text as plain text, so any
+// markdown the model emits lands on the public page as literal syntax —
+// found live 2026-07-19 on the first real rewrite ("**Smaksprøver og
+// foredrag**" rendered with raw asterisks on Røros' Besøket section, batch
+// held + field rolled back). The prose in that candidate was grounded and
+// fine; only the formatting was noise — so strip the common markers rather
+// than reject the candidate (a reject would silently shrink the rescued
+// cohort for a purely cosmetic reason). Prompt also instructs plain text,
+// but per this file's convention the output contract is enforced in code,
+// never trusted to the prompt alone. Collapses to single-paragraph prose
+// (newlines → space) since the template renders one flow anyway.
+function stripMarkdownArtifacts(s: string): string {
+  return s
+    .replace(/^#{1,6}\s+/gm, "")            // # headings
+    .replace(/\*\*([^*]+)\*\*/g, "$1")      // **bold**
+    .replace(/__([^_]+)__/g, "$1")          // __bold__
+    .replace(/\*([^*\n]+)\*/g, "$1")        // *italic* (paired, same line)
+    .replace(/`+/g, "")                      // code ticks
+    .replace(/^\s*[-*•]\s+/gm, "")          // list bullets at line start
+    .replace(/\s*\n+\s*/g, " ")             // newlines → single-paragraph flow
+    .replace(/ {2,}/g, " ")
+    .trim();
+}
+
 export async function generateGardssalgAboutRewrite(
   sourceText: string,
   currentValue: string,
@@ -2714,7 +2738,7 @@ Nåværende tekst: ${currentValue}
 Kildetekst (hentet fra produsentens egen nettside):
 ${cappedSource}
 
-Bruk KUN fakta som faktisk står i kildeteksten under. Ikke finn på detaljer, produkter, åpningstider eller annet som ikke er nevnt. Hvis kildeteksten ikke gir nok materiale til en utvidet, faktabasert tekst på 200–400 tegn, svar med nøyaktig ${GARDSSALG_REWRITE_SENTINEL} og ingenting annet.`;
+Bruk KUN fakta som faktisk står i kildeteksten under. Ikke finn på detaljer, produkter, åpningstider eller annet som ikke er nevnt. Svar i ren løpende tekst uten markdown-formatering — ingen stjerner, overskrifter, punktlister eller linjeskift. Hvis kildeteksten ikke gir nok materiale til en utvidet, faktabasert tekst på 200–400 tegn, svar med nøyaktig ${GARDSSALG_REWRITE_SENTINEL} og ingenting annet.`;
 
   let response: Awaited<ReturnType<typeof fetch>>;
   try {
@@ -2750,10 +2774,16 @@ Bruk KUN fakta som faktisk står i kildeteksten under. Ikke finn på detaljer, p
   const cleaned = text.trim();
   if (cleaned === GARDSSALG_REWRITE_SENTINEL) return null; // explicit "not enough material" escape
 
+  // Strip markdown BEFORE the length gate: the gate must judge the exact
+  // string that would land on the public page, not a version padded by
+  // formatting syntax (a 205-char candidate that is 195 chars of prose plus
+  // asterisks must be rejected as too short, not accepted).
+  const plain = stripMarkdownArtifacts(cleaned);
+
   // Length gate enforced in code, not trusted to the prompt alone (spec
   // requirement) — reject anything outside [200, 500], never truncate.
-  if (cleaned.length < GARDSSALG_REWRITE_MIN_LEN || cleaned.length > GARDSSALG_REWRITE_MAX_LEN) return null;
-  return cleaned;
+  if (plain.length < GARDSSALG_REWRITE_MIN_LEN || plain.length > GARDSSALG_REWRITE_MAX_LEN) return null;
+  return plain;
 }
 
 // ─── generateGardssalgProductList (dev-request 2026-07-18-gardssalg-

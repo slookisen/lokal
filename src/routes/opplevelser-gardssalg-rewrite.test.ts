@@ -308,6 +308,54 @@ export function runOpplevelserGardssalgRewriteTests(
         const r = await generateGardssalgAboutRewrite(SOURCE_TEXT, CURRENT_VALUE, "about");
         assertEq(r, null, "ru-9: non-array content field → null, not a thrown TypeError");
       }
+
+      // ── ru-10: markdown artifacts are stripped before the value is
+      //    returned — regression for the live 2026-07-19 finding where the
+      //    first real prod rewrite landed "**Smaksprøver og foredrag**" with
+      //    raw asterisks on the public Besøket section (profile template
+      //    renders plain text; batch was held + field rolled back on this).
+      const MD_PROSE =
+        "Smaksprøver og foredrag: våre populære ølsmakinger med omvisning på bryggeriet er åpne hele året. Her får du smake brygg fra hele sortimentet vårt, laget med råvarer fra fjellbygda, og høre historien bak bryggeriet fra våre egne bryggere.";
+      assertTrue(MD_PROSE.length >= 200 && MD_PROSE.length <= 500, "sanity: ru-10 prose is inside the [200,500] window after stripping");
+      const MD_WRAPPED = `## Besøket\n\n**Smaksprøver og foredrag**: våre *populære* ølsmakinger med omvisning på bryggeriet er åpne hele året. Her får du smake brygg fra hele sortimentet vårt, laget med råvarer fra fjellbygda, og høre historien bak bryggeriet fra våre egne `.concat("`bryggere`.");
+      globalThis.fetch = (async () => ({
+        ok: true,
+        status: 200,
+        json: async () => ({ content: [{ type: "text", text: MD_WRAPPED }] }),
+      })) as unknown as typeof fetch;
+      {
+        const r = await generateGardssalgAboutRewrite(SOURCE_TEXT, CURRENT_VALUE, "visit");
+        assertTrue(r !== null, "ru-10a: markdown-formatted candidate is accepted after stripping (not rejected)");
+        assertTrue(!!r && !/[*#`]/.test(r), "ru-10b: no asterisks/hashes/backticks survive into the returned value");
+        assertTrue(!!r && !r.includes("\n"), "ru-10c: newlines collapse to single-paragraph flow");
+        assertTrue(!!r && r.includes("Smaksprøver og foredrag") && r.includes("populære"), "ru-10d: the prose itself survives the strip intact");
+      }
+
+      // ── ru-11: the length gate judges the STRIPPED string — prose padded
+      //    over the floor purely by markdown syntax must still be rejected. ──
+      const PROSE_195 = "e".repeat(195);
+      const MD_PADDED_OVER_200 = `**${PROSE_195}**\n# x`; // 202 raw chars, 197 after strip
+      globalThis.fetch = (async () => ({
+        ok: true,
+        status: 200,
+        json: async () => ({ content: [{ type: "text", text: MD_PADDED_OVER_200 }] }),
+      })) as unknown as typeof fetch;
+      {
+        const r = await generateGardssalgAboutRewrite(SOURCE_TEXT, CURRENT_VALUE, "about");
+        assertEq(r, null, "ru-11: markdown-padded candidate whose stripped prose is under 200 chars → null");
+      }
+
+      // ── ru-12: prompt carries the plain-text instruction (belt half of the
+      //    belt-and-suspenders; the code-side strip is the suspenders). ──────
+      let promptCaptured: any = null;
+      globalThis.fetch = (async (_url: any, init: any) => {
+        promptCaptured = JSON.parse(init.body).messages[0].content;
+        return { ok: true, status: 200, json: async () => ({ content: [{ type: "text", text: VALID_250 }] }) };
+      }) as unknown as typeof fetch;
+      {
+        await generateGardssalgAboutRewrite(SOURCE_TEXT, CURRENT_VALUE, "about");
+        assertTrue(typeof promptCaptured === "string" && promptCaptured.includes("uten markdown-formatering"), "ru-12: prompt instructs plain text without markdown");
+      }
     } catch (err: any) {
       failed++;
       failures.push("opplevelser-gardssalg-rewrite (section A): unexpected error: " + String(err?.stack || err?.message || err));
