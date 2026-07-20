@@ -1429,6 +1429,37 @@ function renderHeroMedia(exp: Record<string, unknown>, cat: string | null, place
     </figure>`;
 }
 
+// SEO <title> budget (dev-request 2026-07-12-opplevagent-serp-innholdsberikelse,
+// item 2): brand suffix + hard cap, and the truncator used to fit `main` (the
+// page-specific title text) inside it. Pulled to module scope (like
+// buildSortToggleUrl above) so it's a plain, directly-testable pure function
+// rather than a closure buried inside renderOpplevelseDetail — it doesn't
+// depend on anything from that function's scope.
+const BRAND = " | Opplevagent";
+const MAX_TITLE = 70;
+// Truncates `main` so `main + BRAND` never exceeds MAX_TITLE chars, WITHOUT
+// ever appending an ellipsis ("…") inside the <title> tag — Google was
+// rendering the previous ellipsis-truncated title verbatim in SERPs, which
+// reads as a broken/cut-off title. Prefers cutting at the last whitespace
+// boundary inside the truncated slice so words aren't split mid-word, but
+// only if that boundary keeps at least 60% of the available budget (i.e.
+// doesn't throw away an unreasonably large chunk of `main` just to avoid a
+// word-split); otherwise (or if there's no whitespace at all) it hard-cuts at
+// the budget. Either way, any trailing whitespace or dangling punctuation
+// (dash/en-dash/em-dash, comma, period, ampersand, slash) left by the cut is
+// trimmed so the result never looks broken.
+export function seoPageTitle(main: string): string {
+  if (main.length + BRAND.length <= MAX_TITLE) return main + BRAND;
+  const budget = MAX_TITLE - BRAND.length;
+  let truncated = main.slice(0, budget);
+  const lastSpace = truncated.lastIndexOf(" ");
+  if (lastSpace >= Math.floor(budget * 0.6)) {
+    truncated = truncated.slice(0, lastSpace);
+  }
+  truncated = truncated.trimEnd().replace(/[\s\-–—,.&/]+$/, "").trimEnd();
+  return truncated + BRAND;
+}
+
 function renderOpplevelseDetail(
   exp: ReturnType<typeof getPublishedExperienceBySlug>,
   provider: Record<string, unknown> | null,
@@ -1609,13 +1640,7 @@ function renderOpplevelseDetail(
     .join("\n");
 
   // Build SEO title ≤70 chars: cascade full (with place) → without place → truncated
-  const BRAND = " | Opplevagent";
-  const MAX_TITLE = 70;
-  function seoPageTitle(main: string): string {
-    if (main.length + BRAND.length <= MAX_TITLE) return main + BRAND;
-    const truncated = main.slice(0, MAX_TITLE - BRAND.length - 1).trimEnd();
-    return truncated + "…" + BRAND;
-  }
+  // (BRAND/MAX_TITLE/seoPageTitle are module-scope, defined above this function.)
   const titleWithPlace = `${exp.title}${place ? " – " + place : ""}`;
   const title = seoPageTitle(
     titleWithPlace.length + BRAND.length <= MAX_TITLE ? titleWithPlace : exp.title
