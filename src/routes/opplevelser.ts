@@ -1102,7 +1102,22 @@ router.post("/admin/gardssalg-content-refresh", requireAdmin, async (req: Reques
     const hoursSnippet = extractOpeningHours(contentText);
 
     const candidateAbout = meetsAboutQualityBar(aboutSummary) ? aboutSummary : null;
-    const candidateVisit = meetsAboutQualityBar(visitSummary) ? visitSummary : null;
+    const candidateVisitRaw = meetsAboutQualityBar(visitSummary) ? visitSummary : null;
+    // Duplicate-field guard (dev-request 2026-07-20-kvalitetsgate slice 1 —
+    // the Draopar incident): summarizeAbout() and summarizeVisit() extract
+    // independently from primaryHtml/combinedHtml, but when a source page
+    // has no distinct "visit us" section they can both land on the exact
+    // same block — e.g. summarizeVisit's own keyword scan is a plain
+    // substring match (VISIT_KEYWORDS.some(kw => lower.includes(kw))) with
+    // no word boundary, so "smaking" inside nav copy like "Salg og
+    // sidersmaking" false-matches and picks the same leading blob
+    // summarizeAbout()'s fallback already picked. Rather than chase every
+    // way the two extractors could coincide, guard the assignment itself:
+    // if they produced byte-identical text, only about_text gets it —
+    // visit_text stays null (blank/unset) rather than mirroring about_text.
+    // Do NOT fabricate a distinct visit_text from nothing.
+    const candidateVisit =
+      candidateVisitRaw && candidateVisitRaw !== candidateAbout ? candidateVisitRaw : null;
     const candidateHours = hoursSnippet && hoursSnippet.trim() ? hoursSnippet : null;
 
     const provenance: GsProvenanceMap = {};
