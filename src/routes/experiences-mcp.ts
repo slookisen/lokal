@@ -11,10 +11,14 @@
  *
  * ChatGPT / Claude Desktop: paste https://opplevagent.no/mcp as the MCP URL.
  *
- * Tools exposed (3):
+ * Tools exposed (4):
  *   discover_experiences         — filter-based discovery (fylke, category, weather, …)
  *   list_experience_categories   — all categories with experience counts
  *   get_experience               — fetch one experience by UUID
+ *   discover_gardssalg           — filter-based discovery over the gårdssalg
+ *                                  (farm-sale drink producer) vertical, which
+ *                                  has zero rows in `experiences` (dev-request
+ *                                  2026-07-20-gardssalg-mcp-discoverability)
  *
  * Defensive: if the experiences DB is not open (ENABLE_EXPERIENCES not set),
  * every tool returns a graceful "ingen data / not available" text result —
@@ -37,13 +41,32 @@ import {
   buildNarrowingSuggestions,
   listCategories,
   getExperienceById,
+  searchGardssalgProviders,
+  countGardssalgProviders,
   type DiscoverFilter,
+  type GardssalgSearchFilter,
 } from "../services/experience-store";
+// Only isBookingPaused is called directly here — this tool's query already
+// excludes catalog_hidden=1 rows entirely (see searchGardssalgProviders'
+// base WHERE clause), so catalog_hidden is always absent/undefined at this
+// call site; isBookingPaused(providerBookingLive) with catalog_hidden
+// undefined falls straight to the "real providers: still need the global
+// master switch" branch — identical behavior to a normal (non-hidden)
+// provider passed explicitly. bookingDispatchEnabled() itself is already
+// folded into that check and isn't called separately anywhere else in this
+// codebase alongside isBookingPaused (see experiences-seo.ts/opplevelser.ts).
+import { isBookingPaused } from "../services/booking-store";
 
 import { jsonRpcLimiter } from "../middleware/security";
 import { conversationService, buildRequestMeta, type RequestMeta } from "../services/conversation-service";
 
 const router = Router();
+
+// dev-request 2026-07-20-gardssalg-mcp-discoverability: same convention as
+// booking-store.ts / opplevelser.ts (APP_URL = process.env.APP_URL ||
+// "https://opplevagent.no") — used to build the discover_gardssalg
+// profile_url below.
+const APP_URL = process.env.APP_URL || "https://opplevagent.no";
 
 // Apply rate limiting to all routes on this router (same pattern as dental-mcp.ts)
 router.use(jsonRpcLimiter);
@@ -149,6 +172,36 @@ export const DiscoverExperiencesInputSchema = {
 };
 
 export const ListExperienceCategoriesInputSchema = {};
+
+// dev-request 2026-07-20-gardssalg-mcp-discoverability: same shape/style as
+// DiscoverExperiencesInputSchema above, scoped to the gårdssalg (farm-sale
+// drink producer) vertical's own columns on experience_providers.
+export const DiscoverGardssalgInputSchema = {
+  fylke: z.string().optional().describe(
+    "Norwegian county (fylke) of the producer. Examples: 'Oslo', 'Vestland', 'Troms', 'Rogaland'"
+  ),
+  kommune: z.string().optional().describe(
+    "Norwegian municipality (kommune) of the producer. Examples: 'Tromsø', 'Bergen', 'Stavanger'"
+  ),
+  producer_type: z.string().optional().describe(
+    "Type of drink producer. Examples: 'bryggeri' (brewery), 'cideri' (cidery), 'vingård' (vineyard), 'destilleri' (distillery), 'mjøderi' (meadery), 'seltzeri'"
+  ),
+  booking_live: z.boolean().optional().describe(
+    "When true, only return producers that currently accept direct bookings. Omit to include producers regardless of booking status."
+  ),
+  lat: z.number().min(-90).max(90).optional().describe(
+    "Origin latitude for a near-me search (decimal degrees). Must be given together with lng. Example: 69.65 (Tromsø)"
+  ),
+  lng: z.number().min(-180).max(180).optional().describe(
+    "Origin longitude for a near-me search (decimal degrees). Must be given together with lat. Example: 18.95 (Tromsø)"
+  ),
+  radius_km: z.number().positive().max(5000).optional().describe(
+    "Max distance from lat/lng in kilometers. Only applies when lat/lng are given. Example: 50"
+  ),
+  limit: z.number().min(1).max(50).default(20).describe(
+    "Max results (default 20, max 50)"
+  ),
+};
 
 export const GetExperienceInputSchema = {
   id: z.string().uuid().describe(
@@ -392,7 +445,16 @@ function registerExperienceTools(
     },
     async () => {
       try {
-        const categories = listCategories();
+        // dev-request 2026-07-20-gardssalg-mcp-discoverability: the gårdssalg
+        // vertical (farm-sale drink producers) has zero rows in `experiences`
+        // (see getGardssalgProviderBySlug's doc comment in experience-store.ts)
+        // so listCategories() never surfaces it — append one synthetic entry
+        // so agents can discover it exists before calling discover_gardssalg.
+        // Copy first: listCategories() returns a fresh array from a fresh
+        // .all() call each time, but never mutate a store function's return
+        // value on principle.
+        const categories = [...listCategories()];
+        categories.push({ category: "gardssalg_smaking", count: countGardssalgProviders() });
         const result = {
           count: categories.length,
           categories,
@@ -556,6 +618,114 @@ function registerExperienceTools(
       }
     }
   );
+
+  // Tool 4: discover_gardssalg (dev-request 2026-07-20-gardssalg-mcp-
+  // discoverability). Gårdssalg producers have zero rows in `experiences` —
+  // see getGardssalgProviderBySlug's doc comment in experience-store.ts —
+  // so discover_experiences/get_experience never surface them. This tool is
+  // the dedicated search surface over experience_providers for that
+  // vertical, backed by searchGardssalgProviders().
+  server.registerTool(
+    "discover_gardssalg",
+    {
+      title: "Discover Norwegian farm-sale drink producers (gårdssalg)",
+      description:
+        "Search opplevagent.no's gårdssalg (farm-sale) vertical — Brreg-registered Norwegian drink " +
+        "producers (bryggeri/cideri/vingård/destilleri/mjøderi/seltzeri) selling directly from the farm. " +
+        "Finn norske gårdssalg-produsenter (drikkeprodusenter som selger direkte fra gården) etter fylke, " +
+        "kommune og produsenttype. / Filter by county (fylke), municipality (kommune), and producer type. " +
+        "Also supports near-me search via lat/lng (+ optional radius_km): when given, results include a " +
+        "rounded distance_km and are sorted nearest-first, and rows with no geocoded location are excluded " +
+        "(never a fabricated distance). Returns name, location, producer type, and an honest booking status " +
+        "(live direct booking vs. a dark-launch 'coming soon' note — never overclaims booking availability). " +
+        "Examples: 'gårdssalg i Vestland', 'cideri near lat 60.4 / lng 5.3', 'bryggeri med booking'.",
+      inputSchema: DiscoverGardssalgInputSchema,
+      annotations: {
+        title: "Discover gårdssalg producers",
+        readOnlyHint: true,
+        destructiveHint: false,
+        idempotentHint: true,
+        openWorldHint: true,
+      },
+    },
+    async ({ fylke, kommune, producer_type, booking_live, lat, lng, radius_km, limit }) => {
+      try {
+        const filter: GardssalgSearchFilter = {};
+        if (fylke) filter.fylke = fylke;
+        if (kommune) filter.kommune = kommune;
+        if (producer_type) filter.producer_type = producer_type;
+        if (typeof booking_live === "boolean") filter.booking_live = booking_live;
+        if (typeof lat === "number") filter.lat = lat;
+        if (typeof lng === "number") filter.lng = lng;
+        if (typeof radius_km === "number") filter.radius_km = radius_km;
+        const hasGeo = typeof filter.lat === "number" && typeof filter.lng === "number";
+
+        const results = searchGardssalgProviders(filter, limit ?? 20);
+
+        const summary =
+          results.length === 0
+            ? "Ingen gårdssalg-produsenter funnet med de angitte filtrene. / No gårdssalg producers found matching the given filters."
+            : `Fant ${results.length} gårdssalg-produsent(er). / Found ${results.length} gårdssalg producer(s).`;
+
+        const formatted = results.map((row) => {
+          // catalog_hidden is never 1 here — searchGardssalgProviders()'s base
+          // WHERE clause already excludes those rows entirely — so this call
+          // site never needs to (and never does) pass a catalog_hidden arg.
+          const live = !isBookingPaused(row.booking_live);
+          return {
+            navn: row.navn,
+            fylke: row.fylke ?? null,
+            kommune: row.kommune ?? null,
+            producer_type: row.producer_type ?? null,
+            lat: row.lat ?? null,
+            lon: row.lon ?? null,
+            geocode_confidence: row.geocode_confidence ?? null,
+            booking: {
+              live,
+              mode: live ? ("request" as const) : ("paused" as const),
+              note: live
+                ? "Book direkte. / Book directly."
+                : "Reservasjoner åpner snart; ta kontakt via profilsiden. / Bookings open soon; visit the profile page to get in touch.",
+            },
+            profile_url: row.slug ? `${APP_URL}/kategori/gardssalg/produsent/${row.slug}` : null,
+            // Only present when an origin (lat/lng) was given — mirrors
+            // discover_experiences's own ...(hasGeo ? {...} : {}) spread.
+            ...(hasGeo ? { distance_km: row.distance_km ?? null } : {}),
+          };
+        });
+
+        const result = {
+          summary,
+          count: results.length,
+          filter_applied: filter,
+          gardssalg_producers: formatted,
+        };
+
+        try {
+          logExperiencesInteraction({
+            skill: "discover_gardssalg",
+            queryText: Object.keys(filter).length ? JSON.stringify(filter) : undefined,
+            ctx: { clientIdentity: getClientIdentity?.(), requestMeta: getRequestMeta?.() },
+          });
+        } catch { /* fail-open: never affects the tool result */ }
+
+        return {
+          content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }],
+        };
+      } catch (err: any) {
+        // Defensive: DB not open or other failure -> graceful degradation
+        if (err.message?.includes("database") || err.message?.includes("no such table") || err.message?.includes("getDb")) {
+          return {
+            content: [{ type: "text" as const, text: "Ingen data tilgjengelig for oyeblikket. / No experience data available at this time." }],
+          };
+        }
+        return {
+          content: [{ type: "text" as const, text: `Sokefeil: ${err.message}` }],
+          isError: true,
+        };
+      }
+    }
+  );
 }
 
 // ─── Session management ──────────────────────────────────────
@@ -690,6 +860,7 @@ a{color:#0070f3}.back{display:inline-block;margin-top:24px;color:#555;text-decor
 <li><code>discover_experiences</code> — finn opplevelser etter fylke, kategori, vær, sesong, pris, varighet</li>
 <li><code>list_experience_categories</code> — alle kategorier med antall opplevelser</li>
 <li><code>get_experience</code> — hent én opplevelse med full profil</li>
+<li><code>discover_gardssalg</code> — finn gårdssalg-produsenter etter fylke, kommune, produsenttype, nær-meg og bookingstatus</li>
 </ul>
 <p><strong>For utviklere — eksempel (cURL):</strong></p>
 <pre>curl -X POST https://opplevagent.no/mcp \\

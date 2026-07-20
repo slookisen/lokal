@@ -27016,6 +27016,24 @@ Promise.allSettled(_oaHomeCountersDeps).then(async () => {
     for (const f of gwd.failures) failures.push("opplevelser-gardssalg-website-discovery: " + f);
     console.log(`  opplevelser-gardssalg-website-discovery: ${gwd.passed} passed, ${gwd.failed} failed`);
 
+    // dev-request 2026-07-20-gardssalg-mcp-discoverability: the gårdssalg
+    // vertical had zero presence in the agent-facing MCP surface —
+    // list_experience_categories never mentioned it, and there was no tool
+    // to search/filter gårdssalg producers at all. Adds a category entry +
+    // the new discover_gardssalg MCP tool (src/routes/experiences-mcp.ts),
+    // backed by searchGardssalgProviders() (src/services/experience-store.ts).
+    // Same in-memory-DB + real-MCP-session-over-HTTP pattern as
+    // opplevelser-discover-geo.test.ts's (f) block, runs sequentially inside
+    // this same gated block for the same reason.
+    console.log("\n── opplevelser-gardssalg-mcp-discoverability: category entry + discover_gardssalg tool ──");
+    const { runOpplevelserGardssalgMcpDiscoverabilityTests } = require("../src/routes/opplevelser-gardssalg-mcp-discoverability.test") as
+      typeof import("../src/routes/opplevelser-gardssalg-mcp-discoverability.test");
+    const gmd = await runOpplevelserGardssalgMcpDiscoverabilityTests({ log: false });
+    passed += gmd.passed;
+    failed += gmd.failed;
+    for (const f of gmd.failures) failures.push("opplevelser-gardssalg-mcp-discoverability: " + f);
+    console.log(`  opplevelser-gardssalg-mcp-discoverability: ${gmd.passed} passed, ${gmd.failed} failed`);
+
     // dev-request 2026-07-18-gardssalg-profilkvalitet-foer-outreach, slice 3:
     // Brreg street-address backfill — selectGardssalgProvidersForAddressEnrichment()/
     // getGardssalgProviderAddressTarget()/applyGardssalgProviderAddress()

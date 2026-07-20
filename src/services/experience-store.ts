@@ -1960,6 +1960,127 @@ export function getGardssalgProviderBySlug(slug: string): GardssalgProviderRow |
   return row ?? null;
 }
 
+// ─── Gårdssalg search (MCP discoverability, dev-request 2026-07-20-
+// gardssalg-mcp-discoverability) ───────────────────────────────────────────
+// Gårdssalg producers had ZERO presence in the agent-facing MCP surface —
+// discover_experiences/get_experience only ever cover the `experiences`
+// table, and gårdssalg producers have zero rows there (see
+// getGardssalgProviderBySlug's doc comment above). searchGardssalgProviders()
+// backs the new discover_gardssalg MCP tool (src/routes/experiences-mcp.ts).
+//
+// Reuses the EXACT SAME base WHERE clause as listGardssalgProviders()/
+// countGardssalgProviders() — load-bearing: a catalog_hidden=1 row (the
+// hidden booking-flyt-v1 test provider) must NEVER be returned here under
+// any filter combination, same as the public grid/count.
+//
+// fylke/kommune/producer_type are simple exact-match filters. Unlike
+// discoverExperiences()'s fylke handling, this deliberately does NOT bridge
+// fylke-reform-era spelling variants via fylkeEquivalents() (see that
+// function's doc comment in norway-fylke.ts) — gårdssalg providers were all
+// seeded/enriched post-reform, so this column has no pre-2020/pre-2024
+// spelling variance to bridge.
+//
+// near-me (lat/lng[+radius_km]) mirrors discoverExperiences()'s own pattern:
+// a coarse bounding-box pre-filter in SQL, then the exact haversine cut +
+// ascending-distance sort in JS. This table's geo columns are lat/lon (NOT
+// loc_lat/loc_lon like the `experiences` table) — only rows with BOTH
+// non-null are ever considered when an origin is given; a row with no
+// geocode at all is excluded outright, never assigned a fabricated distance.
+export type GardssalgSearchFilter = {
+  fylke?: string;
+  kommune?: string;
+  producer_type?: string;
+  booking_live?: boolean;
+  lat?: number;
+  lng?: number;
+  radius_km?: number;
+};
+
+export function searchGardssalgProviders(
+  filter: GardssalgSearchFilter = {},
+  limit = 20
+): Array<GardssalgProviderRow & { distance_km?: number }> {
+  const db = getDb(VERTICAL);
+
+  // Same base gate as listGardssalgProviders()/countGardssalgProviders() —
+  // parens are load-bearing (see those functions' comments). catalog_hidden=1
+  // rows must never surface here, regardless of what else is filtered.
+  const where: string[] = [
+    "(producer_type IS NOT NULL OR rfb_seed_source = 'rfb-seed')",
+    "(catalog_hidden IS NULL OR catalog_hidden != 1)",
+  ];
+  const params: Record<string, unknown> = {};
+
+  if (filter.fylke) { where.push("fylke = @fylke"); params.fylke = filter.fylke; }
+  if (filter.kommune) { where.push("kommune = @kommune"); params.kommune = filter.kommune; }
+  if (filter.producer_type) { where.push("producer_type = @producer_type"); params.producer_type = filter.producer_type; }
+  // Only the "show me the live ones" case is a real filter; omitted/false
+  // means no filter on this column (not "show me the paused ones").
+  if (filter.booking_live === true) { where.push("booking_live = 1"); }
+
+  const hasGeo = typeof filter.lat === "number" && typeof filter.lng === "number";
+  const originLat = filter.lat;
+  const originLng = filter.lng;
+  if (hasGeo && typeof originLat === "number" && typeof originLng === "number") {
+    // Never fabricate a distance: a row with no lat/lon at all is excluded
+    // outright rather than surfaced without a distance_km.
+    where.push("lat IS NOT NULL AND lon IS NOT NULL");
+    if (typeof filter.radius_km === "number") {
+      // Bounding-box pre-filter (cheap, SQL-level) — mirrors
+      // discoverExperiences()'s own pattern: a coarse degrees-based box
+      // first, then the exact haversine cut (+ real distance_km) is
+      // computed in JS on the (small) surviving set below.
+      const latDelta = filter.radius_km / 111.0; // ~111km per degree latitude
+      const lngDelta = filter.radius_km / (111.0 * Math.cos((originLat * Math.PI) / 180));
+      where.push("lat BETWEEN @geoLatMin AND @geoLatMax AND lon BETWEEN @geoLngMin AND @geoLngMax");
+      params.geoLatMin = originLat - latDelta;
+      params.geoLatMax = originLat + latDelta;
+      params.geoLngMin = originLng - lngDelta;
+      params.geoLngMax = originLng + lngDelta;
+    }
+  }
+
+  // Mirrors DiscoverExperiencesInputSchema's limit convention (experiences-
+  // mcp.ts): default 20, clamped to [1,50].
+  const clampedLimit = Math.max(1, Math.min(50, limit ?? 20));
+
+  // When a geo origin is given, the true top-N-by-distance can't be decided
+  // in SQL (no haversine there), so the SQL LIMIT is widened to a generous
+  // candidate cap and the real cut to `clampedLimit` happens after the exact
+  // distance is computed + sorted in JS below — mirrors discoverExperiences().
+  const GEO_CANDIDATE_CAP = 2000;
+  params.limit = hasGeo ? GEO_CANDIDATE_CAP : clampedLimit;
+
+  const rows = db
+    .prepare(
+      `SELECT ${GARDSSALG_PROVIDER_COLUMNS}
+         FROM experience_providers
+        WHERE ${where.join(" AND ")}
+        ORDER BY navn
+        LIMIT @limit`
+    )
+    .all(params) as GardssalgProviderRow[];
+
+  if (!hasGeo || typeof originLat !== "number" || typeof originLng !== "number") {
+    return rows;
+  }
+
+  // Exact haversine distance + radius cut + ascending-distance sort. The
+  // WHERE clause above already guarantees lat/lon are non-null for every row
+  // reaching here, so distance_km is always a real number (never fabricated
+  // for a non-geocoded row).
+  let withDistance: Array<GardssalgProviderRow & { distance_km: number }> = rows.map((r) => ({
+    ...r,
+    distance_km: Math.round(haversineDistanceKm(originLat, originLng, r.lat as number, r.lon as number) * 10) / 10,
+  }));
+  if (typeof filter.radius_km === "number") {
+    const radiusKm = filter.radius_km;
+    withDistance = withDistance.filter((r) => r.distance_km <= radiusKm);
+  }
+  withDistance.sort((a, b) => a.distance_km - b.distance_km);
+  return withDistance.slice(0, clampedLimit);
+}
+
 // ─── Gårdssalg content-refresh (dev-request 2026-07-03-gardssalg-rike-
 //     profiler-bilder-agentbooking, Fase 1 item 3, 2026-07-10) ──────────────
 //

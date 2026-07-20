@@ -109,6 +109,138 @@ export function runExperienceStoreTests(opts: { log?: boolean } = {}): TestSumma
   assertEq(gardssalgProductsEligible('{"not":"an array"}'), false, "gardssalgProductsEligible: valid JSON but not an array (an object) → false");
   assertEq(gardssalgProductsEligible("[1,2,3]"), false, "gardssalgProductsEligible: valid non-empty JSON array (even of non-strings) → false, only an EMPTY array is eligible");
 
+  // ── searchGardssalgProviders (dev-request 2026-07-20-gardssalg-mcp-
+  //    discoverability) — backs the new discover_gardssalg MCP tool. Unlike
+  //    the pure-function tests above, this needs a real (in-memory) DB, so
+  //    it self-contains the same EXPERIENCES_DB_PATH=":memory:" + require-
+  //    cache-reset + restore-in-finally convention used by the other
+  //    gårdssalg route test files (e.g.
+  //    opplevelser-gardssalg-provider-visibility.test.ts) — dynamically
+  //    re-requiring db-factory/experience-store rather than relying on this
+  //    file's own top-of-file static import, which resolved before any DB
+  //    env override could take effect. ────────────────────────────────────
+  {
+    const prevExperiencesDbPath = process.env.EXPERIENCES_DB_PATH;
+    process.env.EXPERIENCES_DB_PATH = ":memory:";
+
+    const dbFactoryPath = require.resolve("../database/db-factory");
+    const experienceStorePath = require.resolve("./experience-store");
+    const cachePaths = [dbFactoryPath, experienceStorePath];
+    for (const p of cachePaths) delete require.cache[p];
+
+    try {
+      const dbFactory = require("../database/db-factory") as typeof import("../database/db-factory");
+      dbFactory.__resetDbFactoryForTesting();
+      const db = dbFactory.getDb("experiences");
+      const expStore = require("./experience-store") as typeof import("./experience-store");
+
+      const insertProvider = db.prepare(
+        `INSERT INTO experience_providers
+           (id, navn, vertical, fylke, kommune, producer_type, booking_live, catalog_hidden, lat, lon, slug,
+            enrichment_state, verification_status, source, confidence)
+         VALUES
+           (@id, @navn, 'experiences', @fylke, @kommune, @producer_type, @booking_live, @catalog_hidden, @lat, @lon, @slug,
+            'raw', 'pending_verify', 'test-fixture', 'medium')`
+      );
+
+      // gs-a: fully visible, booking live, geocoded near a Bergen origin.
+      insertProvider.run({
+        id: "gs-a", navn: "Sider A", fylke: "Vestland", kommune: "Bergen", producer_type: "cideri",
+        booking_live: 1, catalog_hidden: null, lat: 60.39, lon: 5.32, slug: "sider-a",
+      });
+      // gs-b: fully visible, booking NOT live, different fylke/kommune/type.
+      insertProvider.run({
+        id: "gs-b", navn: "Bryggeri B", fylke: "Oslo", kommune: "Oslo", producer_type: "bryggeri",
+        booking_live: 0, catalog_hidden: null, lat: 59.91, lon: 10.75, slug: "bryggeri-b",
+      });
+      // gs-c: catalog_hidden=1 — matches EVERY filter below (same fylke/
+      // kommune/producer_type as gs-a, booking_live=1, geocoded right next
+      // to gs-a) yet must NEVER appear in any result — the load-bearing
+      // security/data-leak test.
+      insertProvider.run({
+        id: "gs-c", navn: "Skjult C", fylke: "Vestland", kommune: "Bergen", producer_type: "cideri",
+        booking_live: 1, catalog_hidden: 1, lat: 60.40, lon: 5.33, slug: "skjult-c",
+      });
+      // gs-d: visible, but never geocoded (lat/lon NULL) — must be excluded
+      // from any geo-filtered search, never assigned a fabricated distance.
+      insertProvider.run({
+        id: "gs-d", navn: "Ugeokodet D", fylke: "Vestland", kommune: "Bergen", producer_type: "vingård",
+        booking_live: null, catalog_hidden: null, lat: null, lon: null, slug: "ugeokodet-d",
+      });
+      // 55 extra Nordland/seltzeri rows to prove the limit clamp actually
+      // bites (needs >50 candidates to observe truncation at 50). A distinct
+      // producer_type ('seltzeri') keeps this fixture set out of the
+      // producer_type='bryggeri' assertion below.
+      for (let i = 0; i < 55; i++) {
+        insertProvider.run({
+          id: `gs-limit-${i}`, navn: `Limitgård ${String(i).padStart(2, "0")}`, fylke: "Nordland", kommune: "Bodø",
+          producer_type: "seltzeri", booking_live: 0, catalog_hidden: null, lat: null, lon: null, slug: `limitgard-${i}`,
+        });
+      }
+
+      const names = (rows: Array<{ navn: string }>) => rows.map((r) => r.navn).sort();
+
+      // ── fylke/kommune/producer_type exact-match filters ─────────────────
+      assertEq(
+        names(expStore.searchGardssalgProviders({ fylke: "Vestland" })),
+        ["Sider A", "Ugeokodet D"],
+        "sgp-1: fylke='Vestland' returns gs-a + gs-d, never the hidden gs-c, never Oslo's gs-b"
+      );
+      assertEq(
+        names(expStore.searchGardssalgProviders({ kommune: "Bergen" })),
+        ["Sider A", "Ugeokodet D"],
+        "sgp-2: kommune='Bergen' returns gs-a + gs-d, never the hidden gs-c"
+      );
+      assertEq(
+        names(expStore.searchGardssalgProviders({ producer_type: "bryggeri" }, 100)),
+        ["Bryggeri B"],
+        "sgp-3: producer_type='bryggeri' returns only the bryggeri row (gs-b), never the cideri/vingård/seltzeri fixtures"
+      );
+
+      // ── catalog_hidden=1 NEVER returned, under ANY filter combination ────
+      const allNoFilter = expStore.searchGardssalgProviders({}, 100);
+      assertTrue(!allNoFilter.some((r) => r.navn === "Skjult C"), "sgp-4: no filter at all — hidden row absent");
+      const exactMatchFilter = expStore.searchGardssalgProviders(
+        { fylke: "Vestland", kommune: "Bergen", producer_type: "cideri", booking_live: true }, 100
+      );
+      assertTrue(!exactMatchFilter.some((r) => r.navn === "Skjult C"),
+        "sgp-5: filter combination matching every one of the hidden row's own columns still excludes it");
+      assertTrue(exactMatchFilter.some((r) => r.navn === "Sider A"),
+        "sgp-5b: sanity check — that same filter DOES return the real (non-hidden) matching row");
+
+      // ── booking_live:true → only booking_live=1 rows ─────────────────────
+      const liveOnly = expStore.searchGardssalgProviders({ booking_live: true }, 100);
+      assertEq(names(liveOnly), ["Sider A"], "sgp-6: booking_live:true returns only gs-a (booking_live=1), not gs-b (0), gs-d (NULL), or the hidden gs-c (1 but catalog_hidden=1)");
+
+      // ── geo near-me: correct distance_km for a geocoded row, exclusion of
+      //    a non-geocoded row, exclusion of the hidden row even though it is
+      //    geocoded right next to the origin. ──────────────────────────────
+      const geoResults = expStore.searchGardssalgProviders({ lat: 60.39, lng: 5.32, radius_km: 50 }, 100);
+      assertEq(names(geoResults), ["Sider A"], "sgp-7: geo search near Bergen returns only gs-a — gs-d (no lat/lon) and gs-c (hidden) excluded");
+      const gsAGeo = geoResults.find((r) => r.navn === "Sider A");
+      assertTrue(!!gsAGeo && typeof gsAGeo.distance_km === "number" && gsAGeo.distance_km >= 0 && gsAGeo.distance_km < 1,
+        "sgp-8: gs-a queried from its own coordinates gets a real, near-zero distance_km");
+      assertTrue(!geoResults.some((r) => r.navn === "Ugeokodet D"), "sgp-9: never-geocoded row excluded from a geo-filtered search (no fabricated distance)");
+
+      // ── limit: default 20, clamp to [1,50] ───────────────────────────────
+      assertEq(expStore.searchGardssalgProviders({}).length, 20, "sgp-10: default limit is 20");
+      assertEq(expStore.searchGardssalgProviders({ fylke: "Nordland" }, 1000).length, 50, "sgp-11: limit above 50 clamps down to 50");
+      assertEq(expStore.searchGardssalgProviders({ fylke: "Nordland" }, 0).length, 1, "sgp-12: limit of 0 clamps up to 1");
+      assertEq(expStore.searchGardssalgProviders({ fylke: "Nordland" }, -5).length, 1, "sgp-13: a negative limit clamps up to 1");
+    } catch (err: any) {
+      failed++;
+      failures.push("searchGardssalgProviders: unexpected error: " + String(err?.stack || err?.message || err));
+    } finally {
+      if (prevExperiencesDbPath === undefined) delete process.env.EXPERIENCES_DB_PATH;
+      else process.env.EXPERIENCES_DB_PATH = prevExperiencesDbPath;
+      try {
+        const dbFactory = require("../database/db-factory") as typeof import("../database/db-factory");
+        dbFactory.__resetDbFactoryForTesting();
+      } catch { /* best-effort */ }
+      for (const p of cachePaths) delete require.cache[p];
+    }
+  }
+
   return { passed, failed, failures };
 }
 
