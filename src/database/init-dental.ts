@@ -95,6 +95,22 @@ export function initDentalSchema(db: Database.Database): void {
     try { db.exec(stmt); } catch { /* already present */ }
   }
 
+  // ── Stage V helfo_agreement auto-correction (dev-request 2026-07-12-dental-
+  // enrichment-universe-growth-and-queue-hygiene, item 4 / slice 4a, 2026-07-20):
+  // Stage V re-fetches a sample of clinics each cycle and checks the site's
+  // helfo-signal against the DB value; today it can only flag ("drift" →
+  // needs_review), never correct. This column stores a PENDING contradicting
+  // observation per field — keyed by field name (JSON map) so a future item-4b
+  // slice can reuse the same column for treatments/opening_hours without a new
+  // migration — until the SAME value is seen twice in a row, at which point
+  // recordStageVFieldObservation() (dental-store.ts) auto-corrects and clears
+  // the pending entry. This slice only ever reads/writes the "helfo_agreement"
+  // key. Nullable JSON map: {"<field>": {"value": "<str>", "observed_at":
+  // "<ISO>"}}. Idempotent ALTER — error = already present.
+  try {
+    db.exec("ALTER TABLE dental_agents ADD COLUMN stage_v_pending_correction TEXT");
+  } catch { /* already present */ }
+
   // dental_persons — one row per practitioner (HPR-linked when known)
   try {
     db.exec(`

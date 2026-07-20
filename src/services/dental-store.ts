@@ -16,6 +16,14 @@
 import { v4 as uuid } from "uuid";
 import { z } from "zod";
 import { getDb } from "../database/db-factory";
+// dev-request 2026-07-12-dental-enrichment-universe-growth-and-queue-hygiene,
+// slice 4a: reuse the same read-existing → merge → write field_provenance
+// idiom already used by the generic PUT route (dental.ts) and the Places-
+// backfill block, for Stage V's own corrections. Precedent for a service
+// importing this helper from routes/admin-knowledge.ts already exists
+// (src/services/search-enrich-sweep.ts) — no circular dependency (that file
+// imports only express/db/utils, never dental-store).
+import { mergeFieldProvenance } from "../routes/admin-knowledge";
 
 // ─── Schemas (input validation) ─────────────────────────────────────
 
@@ -499,6 +507,129 @@ export function recordDentalExtractionResult(
     console.log(`[dental] extraction failure for ${id}: ${reason}`);
   }
   return { found: true, attempts: row.extraction_attempts, parked, parked_now: parkedNow };
+}
+
+// ── Stage V helfo_agreement auto-correction (dev-request 2026-07-12-dental-
+// enrichment-universe-growth-and-queue-hygiene, item 4 / slice 4a, 2026-07-20)
+// ─────────────────────────────────────────────────────────────────────────
+// Mirrors recordDentalHomepageFetchResult()/recordDentalExtractionResult()
+// above: read row, branch, write, return an outcome object. Stage V (the
+// enrichment routine's §5 sample-verify) re-fetches a small sample of
+// clinics each cycle and checks the site's helfo-signal against the DB
+// value; today it can only flag a mismatch ("drift" → needs_review), never
+// correct it. This function is the correction path for non-Brreg fields:
+// a SINGLE contradicting observation is parked (not yet trusted — could be
+// a stale/transient site glitch); only when the SAME contradicting value is
+// confirmed TWICE IN A ROW does it auto-correct the DB and record
+// provenance. This NEVER touches verification_status — the existing §5.3
+// drift→needs_review rule is completely unchanged, orthogonal side-channel.
+//
+// `field` is restricted to "helfo_agreement" this slice (item 4b —
+// treatments/opening_hours — is future work); the caller (the route below)
+// validates this before calling, so this function trusts its `field`
+// argument the same way recordDentalExtractionResult trusts `reason` being
+// pre-validated by its caller.
+export function recordStageVFieldObservation(
+  id: string,
+  field: "helfo_agreement",
+  observedValue: string,
+):
+  | { found: false }
+  | { found: true; corrected: false; cleared: true }
+  | { found: true; corrected: false; pending: true }
+  | { found: true; corrected: true; previous_value: string | null; new_value: string } {
+  const db = getDb("dental");
+  const row = db
+    .prepare(
+      "SELECT helfo_agreement, field_provenance, stage_v_pending_correction FROM dental_agents WHERE id = ?"
+    )
+    .get(id) as
+    | {
+        helfo_agreement: string | null;
+        field_provenance: string | null;
+        stage_v_pending_correction: string | null;
+      }
+    | undefined;
+  if (!row) return { found: false };
+
+  // Tolerant parse — junk/missing JSON is treated as an empty pending map,
+  // mirroring the tolerant-parse idiom used for field_provenance elsewhere
+  // in this file/dental.ts (never throw on a malformed side-channel column).
+  let pendingMap: Record<string, { value: string; observed_at: string }> = {};
+  if (row.stage_v_pending_correction) {
+    try {
+      const parsed = JSON.parse(row.stage_v_pending_correction);
+      if (parsed && typeof parsed === "object") {
+        pendingMap = parsed as Record<string, { value: string; observed_at: string }>;
+      }
+    } catch {
+      /* tolerate junk — treat as empty */
+    }
+  }
+
+  const writePendingMap = (map: Record<string, { value: string; observed_at: string }>) => {
+    const hasAny = Object.keys(map).length > 0;
+    db.prepare("UPDATE dental_agents SET stage_v_pending_correction = ? WHERE id = ?").run(
+      hasAny ? JSON.stringify(map) : null,
+      id
+    );
+  };
+
+  // Site now agrees with the DB — any stale pending disagreement for this
+  // field was transient. Clear it so a FUTURE contradiction needs 2 fresh
+  // confirmations again, not 1.
+  if (observedValue === row.helfo_agreement) {
+    if (field in pendingMap) {
+      delete pendingMap[field];
+      writePendingMap(pendingMap);
+    }
+    return { found: true, corrected: false, cleared: true };
+  }
+
+  const pendingEntry = pendingMap[field];
+  if (pendingEntry && pendingEntry.value === observedValue) {
+    // SAME contradicting value seen twice in a row → auto-correct.
+    const previousValue = row.helfo_agreement;
+
+    let existingProv: Record<string, unknown> = {};
+    if (row.field_provenance) {
+      try {
+        const parsed = JSON.parse(row.field_provenance);
+        if (parsed && typeof parsed === "object") existingProv = parsed as Record<string, unknown>;
+      } catch {
+        /* tolerate junk */
+      }
+    }
+    const mergedProv = mergeFieldProvenance(existingProv, {
+      [field]: {
+        sources: [
+          {
+            source_type: "stage_v_correction",
+            value: observedValue,
+            fetched_at: new Date().toISOString(),
+          },
+        ],
+      },
+    });
+
+    delete pendingMap[field];
+    db.prepare(
+      "UPDATE dental_agents SET helfo_agreement = ?, field_provenance = ?, stage_v_pending_correction = ? WHERE id = ?"
+    ).run(
+      observedValue,
+      JSON.stringify(mergedProv),
+      Object.keys(pendingMap).length ? JSON.stringify(pendingMap) : null,
+      id
+    );
+
+    return { found: true, corrected: true, previous_value: previousValue, new_value: observedValue };
+  }
+
+  // First observation of this contradicting value, or a different value than
+  // whatever was pending — (re)start the 2-confirmation window.
+  pendingMap[field] = { value: observedValue, observed_at: new Date().toISOString() };
+  writePendingMap(pendingMap);
+  return { found: true, corrected: false, pending: true };
 }
 
 export function listDentalAgents(
