@@ -13,6 +13,7 @@ import {
 } from "../services/dental-store";
 import type { DentalAgent, PoststedRow } from "../services/dental-store";
 import { getDentalAgentCard } from "../services/dental-agent-card";
+import { getJWKS } from "../services/agent-card-signing";
 import { getDentalOpenapi } from "../services/dental-openapi";
 import { getTrafficStats } from "../services/traffic-stats";
 import { isDisplayablePhone } from "../services/contact-normalizer";
@@ -2228,6 +2229,13 @@ router.get("/.well-known/agent-card.json", (_req: Request, res: Response) => {
   res.header("Access-Control-Allow-Origin", "*");
   res.header("Cache-Control", "public, max-age=300");
   res.json(getDentalAgentCard());
+});
+
+// GET /.well-known/jwks.json — JWKS for verifying A2A agent-card signatures
+// (dev-request 2026-07-13-a2a-card-v1-signing slice 2). Same key across all
+// three verticals (one Fly app serves all of them).
+router.get("/.well-known/jwks.json", (_req: Request, res: Response) => {
+  res.json(getJWKS());
 });
 
 // GET /.well-known/agents.txt — AI Agent Discovery File (parity with rfb + opplevagent)

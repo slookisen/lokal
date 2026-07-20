@@ -11,6 +11,8 @@
  * finn-tannlege.com.
  */
 
+import { signAgentCard } from "./agent-card-signing";
+
 const OPPLEVAGENT_BASE_URL =
   process.env.OPPLEVAGENT_BASE_URL || "https://opplevagent.no";
 
@@ -27,7 +29,7 @@ function baseUrl(): string {
 
 export function getExperiencesAgentCard(): object {
   const url = baseUrl();
-  return {
+  const card = {
     name: "Opplevagent",
     description:
       "A2A-markedsplass for norske opplevelser og aktiviteter — søkbar for AI-agenter. " +
@@ -133,4 +135,12 @@ export function getExperiencesAgentCard(): object {
       },
     ],
   };
+  // JWS card signing (dev-request 2026-07-13-a2a-card-v1-signing slice 2) —
+  // sign the card exactly as assembled above (no `signatures` key present
+  // yet), then attach only if a signing key is actually configured. This
+  // covers both consumers of this function (experiences' /a2a route AND its
+  // .well-known/agent-card.json route) with one signature computation.
+  const signatures = signAgentCard(card);
+  if (signatures.length > 0) (card as any).signatures = signatures;
+  return card;
 }
