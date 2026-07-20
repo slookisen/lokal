@@ -95,6 +95,20 @@ export function initDentalSchema(db: Database.Database): void {
     try { db.exec(stmt); } catch { /* already present */ }
   }
 
+  // ── Stage V drift auto-correction (dev-request 2026-07-12-dental-
+  // enrichment-universe-growth-and-queue-hygiene, slice 4a, 2026-07-20):
+  // nullable JSON map of NOT-YET-CONFIRMED Stage-V-observed field values
+  // that disagree with the DB, keyed by field name — e.g.
+  // {"helfo_agreement": {"value": "true", "observed_at": "<ISO>"}}. Slice
+  // 4a only ever reads/writes the "helfo_agreement" key (see
+  // recordStageVFieldObservation() in dental-store.ts), but the column is
+  // a map (not a single value) so a future item-4b slice can reuse it for
+  // `treatments`/`opening_hours` without another migration. Idempotent
+  // ALTER — error = already present.
+  try {
+    db.exec("ALTER TABLE dental_agents ADD COLUMN stage_v_pending_correction TEXT");
+  } catch { /* already present */ }
+
   // dental_persons — one row per practitioner (HPR-linked when known)
   try {
     db.exec(`

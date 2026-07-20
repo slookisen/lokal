@@ -33,6 +33,10 @@ import {
   // dev-request 2026-07-12-dental-enrichment-universe-growth-and-queue-hygiene,
   // item 2a (2026-07-17): dead-extraction parking
   recordDentalExtractionResult,
+  // dev-request 2026-07-12-dental-enrichment-universe-growth-and-queue-hygiene,
+  // slice 4a (2026-07-20): Stage V drift auto-correction
+  recordStageVFieldObservation,
+  HelfoAgreementSchema,
   DENTAL_AGENT_WRITABLE_FIELDS,
 } from "../services/dental-store";
 import { getDb } from "../database/db-factory";
@@ -516,6 +520,48 @@ router.post("/admin/extraction-result", requireAdmin, (req: Request, res: Respon
       return;
     }
     res.json({ agent_id: agentId.trim(), attempts: r.attempts, parked: r.parked, parked_now: r.parked_now });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message ?? "Internal error" });
+  }
+});
+
+// POST /api/tannlege/admin/stage-v-drift-result
+// Body: { agentId: string, field: string, value: string }
+// dev-request 2026-07-12-dental-enrichment-universe-growth-and-queue-hygiene,
+// slice 4a (2026-07-20): Stage V (the sample-verify pass) reports what it
+// observed for a single field here after each sampled re-fetch. `field` is
+// restricted to "helfo_agreement" this slice (a deliberate 400, not a silent
+// accept, so a future item-4b `treatments`/`opening_hours` slice can't be
+// half-shipped by accident — see recordStageVFieldObservation's own comment
+// in dental-store.ts). `value` must be one of the exact helfo_agreement enum
+// values. The server owns the 2-consecutive-matching-observation auto-
+// correct logic; this route never touches verification_status.
+router.post("/admin/stage-v-drift-result", requireAdmin, (req: Request, res: Response) => {
+  try {
+    const { agentId, field, value } = (req.body ?? {}) as {
+      agentId?: unknown;
+      field?: unknown;
+      value?: unknown;
+    };
+    if (typeof agentId !== "string" || !agentId.trim()) {
+      res.status(400).json({ error: "Invalid body: need {agentId: string, field: string, value: string}" });
+      return;
+    }
+    if (field !== "helfo_agreement") {
+      res.status(400).json({ error: 'Invalid field: only "helfo_agreement" is supported this slice' });
+      return;
+    }
+    const valueCheck = HelfoAgreementSchema.safeParse(value);
+    if (!valueCheck.success) {
+      res.status(400).json({ error: 'Invalid value: must be one of "true" | "false" | "unknown"' });
+      return;
+    }
+    const r = recordStageVFieldObservation(agentId.trim(), field, valueCheck.data);
+    if (!r.found) {
+      res.status(404).json({ error: "Not found" });
+      return;
+    }
+    res.json(r);
   } catch (err: any) {
     res.status(500).json({ error: err.message ?? "Internal error" });
   }

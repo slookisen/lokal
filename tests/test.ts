@@ -31889,3 +31889,25 @@ runSerial(async () => {
     failures.push("verifier-drain-observability: unexpected error: " + String(err?.message || err));
   }
 });
+
+// ── dev-request 2026-07-12-dental-enrichment-universe-growth-and-queue-
+// hygiene, slice 4a (2026-07-20): Stage V drift auto-correction —
+// recordStageVFieldObservation() (dental-store.ts) + POST
+// /admin/stage-v-drift-result (dental.ts). Own in-memory dental DB (swaps
+// the shared getDb() singleton) — runs via runSerial() same as the
+// drain-observability block immediately above.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-07-12 slice 4a: Stage V drift auto-correction ──");
+  try {
+    const { runDentalStageVDriftResultTests } = require("../src/routes/dental-stage-v-drift-result.test") as
+      typeof import("../src/routes/dental-stage-v-drift-result.test");
+    const svd = await runDentalStageVDriftResultTests({ log: false });
+    passed += svd.passed;
+    failed += svd.failed;
+    for (const f of svd.failures) failures.push("dental-stage-v-drift-result: " + f);
+    console.log(`  dental-stage-v-drift-result: ${svd.passed} passed, ${svd.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("dental-stage-v-drift-result: unexpected error: " + String(err?.message || err));
+  }
+});
