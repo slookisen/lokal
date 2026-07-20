@@ -448,6 +448,24 @@ export function runSearchEnrichTests(opts: { log?: boolean } = {}): TestSummary 
     assertTrue(prose.includes("liten gård"), "extractProseText: real sentence around short-label nav <ul> still survives");
   }
 
+  // ── review round 2 — an average-based nav-label-length gate is trivially
+  // defeated by a realistic per-row shape: a long descriptive title-link
+  // PLUS a separate short call-to-action link ("Kjøp"/"Se her") per <li>.
+  // 2 long product-sentence anchors (49 and 51 chars) + 2 short 4/6-char CTA
+  // anchors average (49+51+4+6)/4 = 27.5, under a naive "<30 average" nav
+  // gate, which would wrongly classify this whole block as a nav menu and
+  // delete the product text. Must survive.
+  {
+    const html =
+      "<ul>" +
+      "<li><a href='/potet'>Poteter fra egen åker, høstet i går på gården vår</a> <a href='/potet'>Kjøp</a></li>" +
+      "<li><a href='/rodbet'>Rødbeter dyrket økologisk i egen hage på gården vår</a> <a href='/rodbet'>Se her</a></li>" +
+      "</ul>";
+    const prose = extractProseText(html);
+    assertTrue(prose.includes("Poteter fra egen åker"), "extractProseText: mixed long-title + short-CTA-link product <ul> survives (finding 3, round 2)");
+    assertTrue(prose.includes("Rødbeter dyrket økologisk"), "extractProseText: mixed long-title + short-CTA-link product <ul> second item survives (finding 3, round 2)");
+  }
+
   // ── review finding 2 — hyphenated custom elements (<header-widget>,
   // <nav-carousel>) must NOT be mistaken for <header>/<nav> and stripped; the
   // old trailing `\b` treats `-` as a non-word-boundary, so it matched into

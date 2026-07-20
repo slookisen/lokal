@@ -668,35 +668,52 @@ function stripBlocksByTagNames(
  * True if a `<ul>`/`<ol>` block (HTML including its own tags) is a rendered
  * NAV MENU disguised as a list rather than a real content list: at least 3
  * `<a>` tags, the total text living inside those anchors is ≥60% of all the
- * block's visible text, AND the anchors' text reads like nav labels rather
- * than full sentences (short average length). This is the classic "nav-
- * menu-glued-to-a-real-sentence" shape (a horizontal/vertical link list with
- * almost no non-link words, each link a one-or-two-word label like "Hjem" /
- * "Om oss" / "Kontakt oss" / "Åpningstider") — as opposed to a genuine
- * product/ingredient list where every `<li>` links to its own detail page
- * but wraps a full descriptive sentence (e.g. "Poteter fra egen åker, høstet
- * i går"). Anchor count and link-density ratio alone can't tell those two
- * shapes apart — a 3-item "shop our products" list with a real sentence
- * per anchor trips both thresholds just like a nav menu does — so average
- * per-anchor text length is a third, required signal: nav labels are short,
- * product sentences aren't. PURE.
+ * block's visible text, AND none of the individual anchors reads like a full
+ * sentence (as opposed to a nav label). This is the classic "nav-menu-glued-
+ * to-a-real-sentence" shape (a horizontal/vertical link list with almost no
+ * non-link words, each link a one-or-two-word label like "Hjem" / "Om oss" /
+ * "Kontakt oss" / "Åpningstider") — as opposed to a genuine product/
+ * ingredient list where every `<li>` links to its own detail page but wraps
+ * a full descriptive sentence (e.g. "Poteter fra egen åker, høstet i går").
+ * Anchor count and link-density ratio alone can't tell those two shapes
+ * apart — a 3-item "shop our products" list with a real sentence per anchor
+ * trips both thresholds just like a nav menu does — so per-anchor text
+ * length is a third, required signal.
+ *
+ * This is a per-anchor MAX/existence check, not an average: an average is
+ * trivially defeated by a realistic mixed shape where each product row pairs
+ * a long descriptive title-link with a separate short call-to-action link
+ * ("Kjøp" / "Se her") — e.g. anchors of length [49, 53, 4, 6] average 28,
+ * under a naive "<30" mean threshold, even though half the anchors are full
+ * product sentences. A genuine nav menu essentially never has even ONE
+ * anchor whose text reaches sentence length, so requiring that NO anchor
+ * meets/exceeds LONG_ANCHOR_LEN is robust to that minority-of-short-CTAs
+ * shape in a way a mean (or median, which the same repro also defeats:
+ * median of [4,6,49,53] is 27.5) is not. PURE.
  */
 function isHighLinkDensityBlock(blockHtml: string): boolean {
   const anchors = blockHtml.match(/<a\b[^>]*>[\s\S]*?<\/a>/gi) || [];
   if (anchors.length < 3) return false;
   const stripTags = (s: string): string => s.replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim();
+  const anchorTextLens: number[] = [];
   let anchorTextLen = 0;
   for (const a of anchors) {
-    anchorTextLen += stripTags(a.replace(/^<a\b[^>]*>/i, "").replace(/<\/a>\s*$/i, "")).length;
+    const len = stripTags(a.replace(/^<a\b[^>]*>/i, "").replace(/<\/a>\s*$/i, "")).length;
+    anchorTextLens.push(len);
+    anchorTextLen += len;
   }
   const totalTextLen = stripTags(blockHtml).length;
   if (totalTextLen < 15) return false;
   if (anchorTextLen / totalTextLen < 0.6) return false;
   // Nav-label-short check: genuine nav items ("Om oss", "Kontakt oss",
-  // "Åpningstider") average well under this; full product-sentence anchors
-  // (e.g. "Poteter fra egen åker, høstet i går") average well over it.
-  const avgAnchorTextLen = anchorTextLen / anchors.length;
-  return avgAnchorTextLen < 30;
+  // "Åpningstider") are all well under this; a real product-sentence anchor
+  // (e.g. "Poteter fra egen åker, høstet i går") is well over it. A single
+  // anchor at/above this length is decisive: real nav menus don't mix in a
+  // full-sentence link, so its presence means this is a product list, not
+  // a nav menu — even if most OTHER anchors in the same block are short
+  // CTA links like "Kjøp"/"Se her".
+  const LONG_ANCHOR_LEN = 20;
+  return !anchorTextLens.some((len) => len >= LONG_ANCHOR_LEN);
 }
 
 /**
