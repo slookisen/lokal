@@ -33,6 +33,9 @@ import {
   // dev-request 2026-07-12-dental-enrichment-universe-growth-and-queue-hygiene,
   // item 2a (2026-07-17): dead-extraction parking
   recordDentalExtractionResult,
+  // dev-request 2026-07-12-dental-enrichment-universe-growth-and-queue-hygiene,
+  // item 4, slice 4a (2026-07-20): Stage V helfo_agreement auto-correction
+  recordStageVFieldObservation,
   DENTAL_AGENT_WRITABLE_FIELDS,
 } from "../services/dental-store";
 import { getDb } from "../database/db-factory";
@@ -51,6 +54,10 @@ import { logPlacesCall, getPlacesUsageThisMonth } from "../services/places-usage
 import { findOrgnumberByName } from "../services/brreg-client";
 
 const router = Router();
+
+// Mirrors dental-store.ts's (unexported) HelfoAgreementSchema — used here to
+// validate the `value` body field on POST /admin/stage-v-drift-result.
+const HelfoAgreementSchema = z.enum(["true", "false", "unknown"]);
 
 // ─── Admin auth ─────────────────────────────────────────────────────
 // Same shape as marketplace.ts:getAdminKey() — accept either env var
@@ -516,6 +523,50 @@ router.post("/admin/extraction-result", requireAdmin, (req: Request, res: Respon
       return;
     }
     res.json({ agent_id: agentId.trim(), attempts: r.attempts, parked: r.parked, parked_now: r.parked_now });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message ?? "Internal error" });
+  }
+});
+
+// POST /api/tannlege/admin/stage-v-drift-result
+// Body: { agentId: string, field: string, value: "true"|"false"|"unknown" }
+// dev-request 2026-07-12-dental-enrichment-universe-growth-and-queue-hygiene,
+// item 4, slice 4a (2026-07-20): Stage V (the verifier) REPORTS a field
+// observation that contradicts the current DB value here. The server owns
+// the two-confirmations-before-correcting state machine (see
+// recordStageVFieldObservation() in dental-store.ts) — a single
+// contradicting observation is recorded as "pending"; the SAME
+// contradicting value observed on a later call auto-corrects the row and
+// records field_provenance (source_type: "stage_v_correction"). This
+// endpoint NEVER touches verification_status — that stays driven purely by
+// the existing Stage V `drift` classification rule elsewhere.
+//
+// `field` is hard-coded to "helfo_agreement" only this slice (4a) — a
+// forward-compat guard so a future item-4b (treatments/opening_hours) can't
+// be silently half-shipped by this route quietly accepting arbitrary field
+// names before the store-side logic actually supports them.
+router.post("/admin/stage-v-drift-result", requireAdmin, (req: Request, res: Response) => {
+  try {
+    const { agentId, field, value } = (req.body ?? {}) as { agentId?: unknown; field?: unknown; value?: unknown };
+    if (typeof agentId !== "string" || !agentId.trim()) {
+      res.status(400).json({ error: "Invalid body: need {agentId: string, field: string, value: string}" });
+      return;
+    }
+    if (field !== "helfo_agreement") {
+      res.status(400).json({ error: "Invalid body: only helfo_agreement is supported this slice" });
+      return;
+    }
+    const valueResult = HelfoAgreementSchema.safeParse(value);
+    if (!valueResult.success) {
+      res.status(400).json({ error: "Invalid body: value must be one of true|false|unknown" });
+      return;
+    }
+    const r = recordStageVFieldObservation(agentId.trim(), field, valueResult.data);
+    if (!r.found) {
+      res.status(404).json({ error: "Not found" });
+      return;
+    }
+    res.json({ agent_id: agentId.trim(), ...r });
   } catch (err: any) {
     res.status(500).json({ error: err.message ?? "Internal error" });
   }

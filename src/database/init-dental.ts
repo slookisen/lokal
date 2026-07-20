@@ -95,6 +95,23 @@ export function initDentalSchema(db: Database.Database): void {
     try { db.exec(stmt); } catch { /* already present */ }
   }
 
+  // ── Stage V auto-correction (dev-request 2026-07-12-dental-enrichment-
+  // universe-growth-and-queue-hygiene, item 4, slice 4a, 2026-07-20): a
+  // single per-field-keyed JSON map column, `{"<field>": {"value": "<str>",
+  // "observed_at": "<ISO>"}}`, recording a Stage V field observation that
+  // CONTRADICTS the current DB value but hasn't yet been confirmed twice.
+  // Deliberately generic (keyed by field name, not one column per field) so
+  // a future item-4b slice can reuse this same column for `treatments` /
+  // `opening_hours` without a new migration — this slice (4a) only ever
+  // reads/writes the "helfo_agreement" key. Idempotent ALTER — error =
+  // already present.
+  const dentalStageVCols = [
+    "ALTER TABLE dental_agents ADD COLUMN stage_v_pending_correction TEXT",
+  ];
+  for (const stmt of dentalStageVCols) {
+    try { db.exec(stmt); } catch { /* already present */ }
+  }
+
   // dental_persons — one row per practitioner (HPR-linked when known)
   try {
     db.exec(`

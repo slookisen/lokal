@@ -16,6 +16,9 @@
 import { v4 as uuid } from "uuid";
 import { z } from "zod";
 import { getDb } from "../database/db-factory";
+// Stage V auto-correction (item 4a): merge-not-clobber field_provenance
+// writes reuse the same shared helper dental.ts's PUT route uses.
+import { mergeFieldProvenance } from "../routes/admin-knowledge";
 
 // ─── Schemas (input validation) ─────────────────────────────────────
 
@@ -499,6 +502,116 @@ export function recordDentalExtractionResult(
     console.log(`[dental] extraction failure for ${id}: ${reason}`);
   }
   return { found: true, attempts: row.extraction_attempts, parked, parked_now: parkedNow };
+}
+
+// ── Stage V auto-correction (dev-request 2026-07-12-dental-enrichment-
+// universe-growth-and-queue-hygiene, item 4, slice 4a, 2026-07-20) ───────────
+// Stage V (the verifier) observes fields on already-verified clinics and
+// occasionally finds a value that CONTRADICTS what's on the row (e.g. a
+// clinic's homepage now says helfo_agreement=false but the DB still has
+// true). Rather than immediately overwriting on a single observation
+// (noisy — a single bad scrape could flip a correct value), this requires
+// the SAME contradicting value to be observed on two separate calls before
+// auto-correcting. `dental_agents.stage_v_pending_correction` holds the
+// per-field "awaiting confirmation" state as a JSON map so a later item-4b
+// slice can extend this to other fields without a new column.
+//
+// This slice hard-codes the `helfo_agreement` column for the actual
+// correction UPDATE (never dynamic SQL) — the caller (the route) is
+// responsible for restricting `field` to "helfo_agreement" this slice; this
+// function still reads/writes the pending-map generically keyed by
+// whatever `field` string it's given, since the column itself is a map.
+//
+// This function NEVER touches verification_status — that stays driven
+// purely by the existing Stage V `drift` classification rule elsewhere.
+export function recordStageVFieldObservation(
+  agentId: string,
+  field: string,
+  observedValue: string,
+): {
+  found: boolean;
+  corrected?: boolean;
+  cleared?: boolean;
+  pending?: boolean;
+  previous_value?: string | null;
+  new_value?: string;
+} {
+  const db = getDb("dental");
+  const row = db
+    .prepare("SELECT helfo_agreement, stage_v_pending_correction FROM dental_agents WHERE id = ?")
+    .get(agentId) as { helfo_agreement: string | null; stage_v_pending_correction: string | null } | undefined;
+  if (!row) return { found: false };
+
+  const currentValue = row.helfo_agreement;
+  let pendingMap: Record<string, { value: string; observed_at: string }> = {};
+  if (row.stage_v_pending_correction) {
+    try {
+      const parsed = JSON.parse(row.stage_v_pending_correction);
+      if (parsed && typeof parsed === "object") pendingMap = parsed;
+    } catch {
+      pendingMap = {};
+    }
+  }
+  const pendingEntry = pendingMap[field];
+
+  // (1) Observed value matches what's already on the row — nothing to
+  // correct. If a pending entry existed for this field, the contradiction
+  // has resolved itself, so clear it (a fresh contradiction later needs two
+  // NEW confirmations, not a stale one).
+  if (observedValue === currentValue) {
+    if (pendingEntry) {
+      delete pendingMap[field];
+      db.prepare("UPDATE dental_agents SET stage_v_pending_correction = ? WHERE id = ?")
+        .run(stringifyJsonOrNull(pendingMap), agentId);
+      return { found: true, corrected: false, cleared: true, pending: false };
+    }
+    return { found: true, corrected: false, cleared: false, pending: false };
+  }
+
+  // (2) Same contradicting value seen twice in a row — auto-correct.
+  if (pendingEntry && pendingEntry.value === observedValue) {
+    const previousValue = currentValue;
+    delete pendingMap[field];
+
+    if (field === "helfo_agreement") {
+      db.prepare("UPDATE dental_agents SET helfo_agreement = ? WHERE id = ?").run(observedValue, agentId);
+    }
+    db.prepare("UPDATE dental_agents SET stage_v_pending_correction = ? WHERE id = ?")
+      .run(stringifyJsonOrNull(pendingMap), agentId);
+
+    // Merge a field_provenance entry recording this correction — same
+    // merge-not-clobber idiom as dental.ts's PUT route (~line 271-288): read
+    // the row's existing field_provenance via getDentalAgentById, tolerate
+    // null, merge via the shared mergeFieldProvenance() helper, then write
+    // back with a raw scoped UPDATE (not the full updateDentalAgent() path,
+    // which would re-validate the whole row for no reason here).
+    const existingAgent = getDentalAgentById(agentId);
+    let existingProv: Record<string, unknown> = {};
+    if (existingAgent && existingAgent.field_provenance && typeof existingAgent.field_provenance === "object") {
+      existingProv = existingAgent.field_provenance as Record<string, unknown>;
+    }
+    const merged = mergeFieldProvenance(existingProv, {
+      [field]: [
+        {
+          source_type: "stage_v_correction",
+          value: observedValue,
+          fetched_at: new Date().toISOString(),
+        },
+      ],
+    });
+    db.prepare("UPDATE dental_agents SET field_provenance = ? WHERE id = ?")
+      .run(JSON.stringify(merged), agentId);
+
+    return { found: true, corrected: true, previous_value: previousValue, new_value: observedValue };
+  }
+
+  // (3) First observation of this contradicting value (or a different
+  // contradicting value than whatever was pending) — record/overwrite the
+  // pending entry. Only the stage_v_pending_correction column is touched.
+  pendingMap[field] = { value: observedValue, observed_at: new Date().toISOString() };
+  db.prepare("UPDATE dental_agents SET stage_v_pending_correction = ? WHERE id = ?")
+    .run(stringifyJsonOrNull(pendingMap), agentId);
+  return { found: true, corrected: false, pending: true };
 }
 
 export function listDentalAgents(

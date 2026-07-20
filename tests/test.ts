@@ -30981,6 +30981,253 @@ console.log("\n── item2a: dead-extraction parking (dental) ──");
   }
 })();
 
+// ── item4a: Stage V helfo_agreement auto-correction (dev-request 2026-07-12-
+// dental-enrichment-universe-growth-and-queue-hygiene, item 4, slice 4a,
+// 2026-07-20) ────────────────────────────────────────────────────────────
+// Covers recordStageVFieldObservation() (dental-store.ts) store-level logic
+// AND the POST /admin/stage-v-drift-result route wiring (dental.ts):
+//   (1) additive stage_v_pending_correction column, NULL default
+//   (2) first contradicting observation -> pending, DB value + field_provenance
+//       untouched
+//   (3) SAME contradicting value observed twice -> auto-correct, DB value
+//       updated, field_provenance gains a stage_v_correction entry WITHOUT
+//       clobbering an existing unrelated field's provenance entries
+//   (4) an observation matching the current DB value clears any pending
+//       entry, and does so for real (a later same-value contradiction needs
+//       2 FRESH confirmations again, not 1)
+//   (5) verification_status is never touched by any of the above
+//   (6) route: 403 without admin key, 404 unknown agentId, 400 field !=
+//       helfo_agreement, 400 invalid value, 200 happy path wired through to
+//       the store function
+//
+// Uses runSerial() (not the manual _xPromise/_xResolve handle pattern) —
+// this block only ever touches its OWN isolated dental :memory: DB via
+// DENTAL_DB_PATH, never the shared rfb getDb() singleton, so it's "truly
+// independent" per the top-of-file runSerial() comment. The route-level
+// checks need router.handle() (async, Express dispatch), unlike the
+// synchronous store-only blocks (ems1/item2a) immediately above, which is
+// why this block is wrapped in runSerial() instead of a plain sync IIFE.
+runSerial(async () => {
+  console.log("\n── item4a: Stage V helfo_agreement auto-correction ──");
+  const prevPath = process.env.DENTAL_DB_PATH;
+  const prevAdminKey = process.env.ADMIN_KEY;
+  const prevAnalyticsAdminKey = process.env.ANALYTICS_ADMIN_KEY;
+  const testKey = "item4a-stage-v-drift-test-key";
+  process.env.DENTAL_DB_PATH = ":memory:";
+  process.env.ADMIN_KEY = testKey;
+  delete process.env.ANALYTICS_ADMIN_KEY;
+
+  const dbFacPathI4a = require.resolve("../src/database/db-factory");
+  const dentalStorePathI4a = require.resolve("../src/services/dental-store");
+  const dentalRoutePathI4a = require.resolve("../src/routes/dental");
+  const cachePathsI4a = [dbFacPathI4a, dentalStorePathI4a, dentalRoutePathI4a];
+  for (const p of cachePathsI4a) delete require.cache[p];
+
+  interface RouteResult { status: number; body: any; }
+  function callRoute(
+    router: any,
+    opts: { method?: string; path: string; headers?: Record<string, string>; body?: any },
+  ): Promise<RouteResult> {
+    return new Promise((resolve) => {
+      const req: any = {
+        method: opts.method || "GET",
+        url: opts.path,
+        originalUrl: opts.path,
+        path: opts.path,
+        params: {},
+        query: {},
+        headers: opts.headers || {},
+        body: opts.body,
+        get() { return undefined; },
+      };
+      const res: any = {
+        statusCode: 200,
+        status(code: number) { this.statusCode = code; return this; },
+        json(payload: any) { resolve({ status: this.statusCode, body: payload }); return this; },
+      };
+      router.handle(req, res, (err?: any) => {
+        if (err) resolve({ status: 500, body: { error: String(err) } });
+      });
+    });
+  }
+
+  try {
+    const dbFacI4a = require("../src/database/db-factory") as typeof import("../src/database/db-factory");
+    dbFacI4a.__resetDbFactoryForTesting();
+    const dentalDb = dbFacI4a.getDb("dental");
+    const dstore = require("../src/services/dental-store") as typeof import("../src/services/dental-store");
+    const dentalRouter = (require("../src/routes/dental") as typeof import("../src/routes/dental")).default as any;
+
+    function getRow(id: string): {
+      helfo_agreement: string | null;
+      stage_v_pending_correction: string | null;
+      field_provenance: string | null;
+      verification_status: string | null;
+    } {
+      return dentalDb
+        .prepare("SELECT helfo_agreement, stage_v_pending_correction, field_provenance, verification_status FROM dental_agents WHERE id = ?")
+        .get(id) as any;
+    }
+
+    // ── (1) additive column, NULL default on a freshly-created row ─────────
+    const idA = dstore.createDentalAgent({ navn: "Drift Tannlege AS", org_nr: "911400111", helfo_agreement: "true" } as any);
+    const rowA0 = getRow(idA);
+    assertEq(rowA0.stage_v_pending_correction, null, "item4a-01: stage_v_pending_correction defaults to NULL on a fresh row");
+    assertEq(rowA0.verification_status, "pending_verify", "item4a-02: fresh row's verification_status is the untouched default (baseline for the regression guard below)");
+
+    // ── (2) first contradicting observation -> pending, nothing else changes ─
+    const r1 = dstore.recordStageVFieldObservation(idA, "helfo_agreement", "false");
+    assertEq(r1.found, true, "item4a-03: found=true for an existing agent");
+    assertTrue(!r1.corrected, "item4a-04: first differing observation is NOT corrected");
+    assertEq(r1.pending, true, "item4a-05: first differing observation records a pending entry");
+    const rowA1 = getRow(idA);
+    assertEq(rowA1.helfo_agreement, "true", "item4a-06: DB helfo_agreement UNCHANGED after only one contradicting observation");
+    assertEq(rowA1.field_provenance, null, "item4a-07: field_provenance UNCHANGED after only one contradicting observation");
+    assertEq(rowA1.verification_status, "pending_verify", "item4a-08: verification_status untouched after a pending (non-correcting) observation");
+
+    // ── (3) SAME contradicting value observed twice -> auto-correct ────────
+    const r2 = dstore.recordStageVFieldObservation(idA, "helfo_agreement", "false");
+    assertEq(r2.corrected, true, "item4a-09: second identical contradicting observation auto-corrects");
+    assertEq(r2.previous_value, "true", "item4a-10: previous_value reflects the pre-correction DB value");
+    assertEq(r2.new_value, "false", "item4a-11: new_value reflects the observed value");
+    const rowA2 = getRow(idA);
+    assertEq(rowA2.helfo_agreement, "false", "item4a-12: DB helfo_agreement now equals the observed value");
+    assertEq(rowA2.verification_status, "pending_verify", "item4a-13: verification_status STILL untouched after a correcting observation (regression guard)");
+
+    // ── (3b) field_provenance merge: seed an UNRELATED field's provenance
+    // first, prove it survives the merge alongside the new helfo_agreement
+    // entry (not clobbered) ─────────────────────────────────────────────────
+    const idB = dstore.createDentalAgent({ navn: "Drift Provenance Tannlege AS", org_nr: "911400222", helfo_agreement: "unknown" } as any);
+    dentalDb.prepare("UPDATE dental_agents SET field_provenance = ? WHERE id = ?").run(
+      JSON.stringify({ epost: [{ source_type: "brreg", value: "post@example.no", fetched_at: "2026-07-01T00:00:00.000Z" }] }),
+      idB,
+    );
+    dstore.recordStageVFieldObservation(idB, "helfo_agreement", "true"); // (1st) pending
+    const r3 = dstore.recordStageVFieldObservation(idB, "helfo_agreement", "true"); // (2nd, same) corrects
+    assertEq(r3.corrected, true, "item4a-14: idB second identical observation corrects too");
+    const rowB = getRow(idB);
+    assertEq(rowB.helfo_agreement, "true", "item4a-15: idB DB helfo_agreement updated");
+    const provB = JSON.parse(rowB.field_provenance || "{}");
+    assertTrue(Array.isArray(provB.epost) && provB.epost.length === 1 && provB.epost[0].source_type === "brreg",
+      "item4a-16: pre-existing UNRELATED field (epost) provenance survives the merge untouched");
+    assertTrue(Array.isArray(provB.helfo_agreement) && provB.helfo_agreement.length === 1,
+      "item4a-17: new helfo_agreement provenance entry was added");
+    assertEq(provB.helfo_agreement[0].source_type, "stage_v_correction", "item4a-18: new entry's source_type is stage_v_correction");
+    assertEq(provB.helfo_agreement[0].value, "true", "item4a-19: new entry's value is the observed/corrected value");
+    assertEq(rowB.verification_status, "pending_verify", "item4a-20: idB verification_status untouched by the correction");
+
+    // ── (4) matching-value observation clears any pending entry, for real ──
+    // idA is currently helfo_agreement="false" (post-correction from step 3).
+    const r4 = dstore.recordStageVFieldObservation(idA, "helfo_agreement", "unknown"); // 1st contradicting obs
+    assertEq(r4.pending, true, "item4a-21: fresh contradicting observation after a correction is pending again (not instantly re-corrected)");
+    const r5 = dstore.recordStageVFieldObservation(idA, "helfo_agreement", "false"); // matches current DB value -> clears
+    assertEq(r5.corrected, false, "item4a-22: a matching-value observation is never itself a correction");
+    assertEq(r5.cleared, true, "item4a-23: a matching-value observation clears the pending entry");
+    assertEq(r5.pending, false, "item4a-24: cleared response is not itself pending");
+    // Prove the clear actually reset state: the SAME differing value again
+    // needs 2 FRESH confirmations, not 1, to correct.
+    const r6 = dstore.recordStageVFieldObservation(idA, "helfo_agreement", "unknown");
+    assertTrue(!r6.corrected, "item4a-25: post-clear, a single re-observation of the same differing value is NOT enough to correct");
+    assertEq(r6.pending, true, "item4a-26: post-clear, the first re-observation is treated as a fresh pending entry");
+    const r7 = dstore.recordStageVFieldObservation(idA, "helfo_agreement", "unknown");
+    assertEq(r7.corrected, true, "item4a-27: the SECOND fresh confirmation after a clear does correct");
+    const rowA3 = getRow(idA);
+    assertEq(rowA3.helfo_agreement, "unknown", "item4a-28: DB reflects the post-clear-and-reconfirm correction");
+    assertEq(rowA3.verification_status, "pending_verify", "item4a-29: verification_status untouched through the whole clear/reset/reconfirm sequence");
+
+    // A no-op clear call: matching value with nothing pending -> cleared:false.
+    const r8 = dstore.recordStageVFieldObservation(idA, "helfo_agreement", "unknown"); // already equals current value, nothing pending
+    assertEq(r8.corrected, false, "item4a-30: matching-value call with no pending entry is a no-op (corrected)");
+    assertEq(r8.cleared, false, "item4a-31: matching-value call with no pending entry is a no-op (cleared)");
+
+    // Unknown agent id -> found:false.
+    assertEq(dstore.recordStageVFieldObservation("no-such-id", "helfo_agreement", "true").found, false,
+      "item4a-32: unknown agentId -> found=false");
+
+    // ── (6) route wiring: POST /admin/stage-v-drift-result ─────────────────
+    const idD = dstore.createDentalAgent({ navn: "Drift Route Tannlege AS", org_nr: "911400333", helfo_agreement: "true" } as any);
+
+    const noKeyResp = await callRoute(dentalRouter, {
+      method: "POST",
+      path: "/admin/stage-v-drift-result",
+      headers: {},
+      body: { agentId: idD, field: "helfo_agreement", value: "false" },
+    });
+    assertEq(noKeyResp.status, 403, "item4a-33: POST without X-Admin-Key -> 403 (requireAdmin wired)");
+
+    const notFoundResp = await callRoute(dentalRouter, {
+      method: "POST",
+      path: "/admin/stage-v-drift-result",
+      headers: { "x-admin-key": testKey },
+      body: { agentId: "no-such-id", field: "helfo_agreement", value: "false" },
+    });
+    assertEq(notFoundResp.status, 404, "item4a-34: unknown agentId -> 404");
+    assertEq(notFoundResp.body.error, "Not found", "item4a-35: 404 body shape mirrors the twin routes");
+
+    const badFieldResp = await callRoute(dentalRouter, {
+      method: "POST",
+      path: "/admin/stage-v-drift-result",
+      headers: { "x-admin-key": testKey },
+      body: { agentId: idD, field: "treatments", value: "false" },
+    });
+    assertEq(badFieldResp.status, 400, "item4a-36: field != helfo_agreement -> 400");
+
+    const badValueResp = await callRoute(dentalRouter, {
+      method: "POST",
+      path: "/admin/stage-v-drift-result",
+      headers: { "x-admin-key": testKey },
+      body: { agentId: idD, field: "helfo_agreement", value: "maybe" },
+    });
+    assertEq(badValueResp.status, 400, "item4a-37: invalid value -> 400");
+
+    const badBodyResp = await callRoute(dentalRouter, {
+      method: "POST",
+      path: "/admin/stage-v-drift-result",
+      headers: { "x-admin-key": testKey },
+      body: { agentId: "", field: "helfo_agreement", value: "false" },
+    });
+    assertEq(badBodyResp.status, 400, "item4a-38: empty agentId -> 400");
+
+    // Happy path, wired end-to-end through the store function.
+    const ok1 = await callRoute(dentalRouter, {
+      method: "POST",
+      path: "/admin/stage-v-drift-result",
+      headers: { "x-admin-key": testKey },
+      body: { agentId: idD, field: "helfo_agreement", value: "false" },
+    });
+    assertEq(ok1.status, 200, "item4a-39: valid request -> 200");
+    assertEq(ok1.body.pending, true, "item4a-40: first observation via the route -> pending:true");
+    assertEq(getRow(idD).helfo_agreement, "true", "item4a-41: DB unchanged after the route's first (pending) observation");
+
+    const ok2 = await callRoute(dentalRouter, {
+      method: "POST",
+      path: "/admin/stage-v-drift-result",
+      headers: { "x-admin-key": testKey },
+      body: { agentId: idD, field: "helfo_agreement", value: "false" },
+    });
+    assertEq(ok2.status, 200, "item4a-42: second identical observation via the route -> 200");
+    assertEq(ok2.body.corrected, true, "item4a-43: second identical observation via the route -> corrected:true");
+    assertEq(getRow(idD).helfo_agreement, "false", "item4a-44: DB updated via the route's correcting observation");
+    assertEq(getRow(idD).verification_status, "pending_verify", "item4a-45: verification_status untouched via the route too");
+
+    console.log("  item4a (Stage V helfo_agreement auto-correction): OK (45 assertions)");
+  } catch (err: any) {
+    failed++;
+    failures.push("item4a stage-v-drift-result: unexpected error: " + String(err?.stack || err?.message || err));
+  } finally {
+    if (prevPath === undefined) delete process.env.DENTAL_DB_PATH; else process.env.DENTAL_DB_PATH = prevPath;
+    if (prevAdminKey === undefined) delete process.env.ADMIN_KEY; else process.env.ADMIN_KEY = prevAdminKey;
+    if (prevAnalyticsAdminKey === undefined) delete process.env.ANALYTICS_ADMIN_KEY; else process.env.ANALYTICS_ADMIN_KEY = prevAnalyticsAdminKey;
+    try {
+      const dbFacI4aCleanup = require("../src/database/db-factory") as typeof import("../src/database/db-factory");
+      dbFacI4aCleanup.__resetDbFactoryForTesting();
+    } catch {
+      // best-effort cleanup
+    }
+    for (const p of cachePathsI4a) delete require.cache[p];
+  }
+});
+
 // ── a2a-card-v1-signing slice 1: A2A v1.0 fields dual-published on all three
 // agent cards, additive-only (legacy authentication/interfaces untouched) ──
 (() => {
