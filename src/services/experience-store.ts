@@ -2048,20 +2048,32 @@ export function getGardssalgProviderContentTarget(providerId: string): Gardssalg
   return row;
 }
 
-// Extensible, curated Norwegian website-navigation/menu vocabulary — literal
-// words a producer's own about/visit PROSE essentially never uses in
-// isolation, but that recur constantly in scraped <nav>/menu chrome. Single
-// tokens are matched at word boundaries (via the tokeniser below, never as a
-// substring of an unrelated longer word); the phrases are matched as
-// substrings of the whole accent-stripped, lowercased text. "heim" is the
-// Nynorsk/dialect variant of "hjem" (home) — the exact word the Draopar
-// defect (dev-request 2026-07-20-gardssalg-navstoy-duplikatfelt-heuristikk)
-// was found with.
+// Extensible, curated Norwegian website-navigation/menu vocabulary. NOT
+// exclusively nav-only words in isolation — "kontakt"/"hjem"/"levering" are
+// also ordinary vocabulary a producer's own visit_text legitimately uses
+// ("Kontakt oss på forhånd", "vi leverer rett hjem til deg"). What actually
+// distinguishes a leaked nav LABEL from the same word used in a real
+// sentence is CAPITALIZATION IN A POSITION GRAMMAR DOESN'T EXPLAIN: a
+// scraped <nav>/menu item is rendered Title-Case regardless of where it
+// lands in the extracted text, while genuine Norwegian prose is capitalized
+// only at the true start of a sentence. "heim" is the Nynorsk/dialect
+// variant of "hjem" (home) — the exact word the Draopar defect (dev-request
+// 2026-07-20-gardssalg-navstoy-duplikatfelt-heuristikk) was found with.
 const GARDSSALG_NAV_WORDLIST_TOKENS: ReadonlySet<string> = new Set([
   "kontakt", "hjem", "heim", "meny", "handlekurv", "sortiment", "vilkar",
   "levering", "apningstider", "nettbutikk", "sok", "nyhetsbrev", "bestill",
 ]);
-const GARDSSALG_NAV_WORDLIST_PHRASES: readonly string[] = ["logg inn", "om oss", "min konto"];
+// Two-word nav phrases ("Logg Inn", "Om Oss", "Min Konto") — each word must
+// independently be Title-Case for a match (see the mid-sentence-only rule
+// below); unlike the single tokens above, these are checked as a
+// consecutive pair, not via whole-string substring search — a genuine
+// sentence like "les mer om oss på hjemmesiden" contains "om oss" as a
+// lowercase substring and must never match.
+const GARDSSALG_NAV_WORDLIST_PHRASES: readonly (readonly [string, string])[] = [
+  ["logg", "inn"],
+  ["om", "oss"],
+  ["min", "konto"],
+];
 
 /**
  * Detects nav-menu-chrome vocabulary glued into an otherwise quality-bar-
@@ -2074,6 +2086,18 @@ const GARDSSALG_NAV_WORDLIST_PHRASES: readonly string[] = ["logg inn", "om oss",
  * cap-ratio/punctuation/prose-signal shape), but the nav vocabulary itself
  * never belongs in a producer's own about/visit text regardless of what else
  * is in the string.
+ *
+ * A match only counts when the word is (a) Title-Case in the ORIGINAL text
+ * AND (b) NOT at the start of a sentence (index 0, or immediately after a
+ * '.'/'!'/'?') — review round 1 (2026-07-20) found the naive "any-case,
+ * anywhere" version false-positives destructively on ordinary honest
+ * sentences ("Kontakt oss på forhånd, vi har åpningstider …", "Vi leverer
+ * rett hjem til deg om du tar kontakt …") because these words are genuinely
+ * capitalized once, at a sentence's true start, or not capitalized at all —
+ * neither of which a real nav-menu leak looks like. A LEAKED nav label is
+ * capitalized regardless of where it lands mid-string, which is exactly the
+ * signature this rule isolates; it also means Draopar's "Heim"/"Kontakt"
+ * (both genuinely mid-string, no preceding sentence boundary) still match.
  *
  * Deliberately a literal, curated, EXTENSIBLE wordlist rather than a generic
  * "flat Title-Case run with no early punctuation" structural check: an
@@ -2089,6 +2113,13 @@ const GARDSSALG_NAV_WORDLIST_PHRASES: readonly string[] = ["logg inn", "om oss",
  * once, is never penalised — only a text carrying an actual CLUSTER of
  * different nav/menu labels is flagged.
  *
+ * A real trade-off, noted here rather than hidden: a nav menu whose
+ * underlying (pre-CSS) text happens to be all-lowercase would NOT be caught
+ * by this rule. Given apply-mode NULLs real content, under-catching is the
+ * correct default over the destructive alternative — this is exactly the
+ * "eskaleres… dersom heuristikken viser seg for grov" escape hatch this
+ * dev-request's own spec calls for, to revisit after retro-scan results.
+ *
  * PURE, no network/IO. Gårdssalg-scoped only (used by
  * gardssalgMeetsQualityBar below) — does NOT touch meetsAboutQualityBar
  * itself, which is shared by the RFB/experiences/dental content-refresh
@@ -2098,19 +2129,38 @@ export function gardssalgIsNavPolluted(text: string | null | undefined): boolean
   if (!text) return false;
   const trimmed = String(text).replace(/\s+/g, " ").trim();
   if (!trimmed) return false;
-  const lowerAscii = stripNorwegianAccents(trimmed.toLowerCase());
 
-  const tokens = trimmed
-    .split(/\s+/)
-    .map((t) => stripNorwegianAccents(t.toLowerCase()).replace(/^[^a-z0-9]+|[^a-z0-9]+$/g, ""))
-    .filter((t) => t.length > 0);
+  type Tok = { norm: string; titleCase: boolean; sentenceInitial: boolean };
+  const toks: Tok[] = [];
+  let atSentenceStart = true;
+  for (const raw of trimmed.split(" ")) {
+    const word = raw.replace(/^[^\p{L}]+|[^\p{L}]+$/gu, "");
+    const endsSentence = /[.!?]$/.test(raw);
+    if (!word) {
+      if (endsSentence) atSentenceStart = true;
+      continue;
+    }
+    toks.push({
+      norm: stripNorwegianAccents(word.toLowerCase()),
+      titleCase: /^[A-ZÆØÅ]/.test(word),
+      sentenceInitial: atSentenceStart,
+    });
+    atSentenceStart = endsSentence;
+  }
 
   const matchedSignals = new Set<string>();
-  for (const t of tokens) {
-    if (GARDSSALG_NAV_WORDLIST_TOKENS.has(t)) matchedSignals.add(t);
+  for (const t of toks) {
+    if (t.titleCase && !t.sentenceInitial && GARDSSALG_NAV_WORDLIST_TOKENS.has(t.norm)) {
+      matchedSignals.add(t.norm);
+    }
   }
-  for (const p of GARDSSALG_NAV_WORDLIST_PHRASES) {
-    if (lowerAscii.includes(p)) matchedSignals.add(p);
+  for (const phrase of GARDSSALG_NAV_WORDLIST_PHRASES) {
+    for (let i = 0; i + phrase.length <= toks.length; i++) {
+      if (phrase.every((w, j) => toks[i + j].titleCase && toks[i + j].norm === w)) {
+        matchedSignals.add(phrase.join(" "));
+        break;
+      }
+    }
   }
   return matchedSignals.size >= 2;
 }
@@ -2270,9 +2320,13 @@ export function gardssalgProductsEligible(currentProducts: string | null | undef
  *
  * Duplicate-block guard (dev-request 2026-07-20-gardssalg-navstoy-
  * duplikatfelt-heuristikk, spec item 3): if `candidate.about_text` and
- * `candidate.visit_text` are byte-identical after trim, only about_text is
- * ever written this call — visit_text is treated as not-supplied (stays
- * blank rather than duplicating about_text into a second section).
+ * `candidate.visit_text` are byte-identical after trim AND about_text is
+ * actually going to be written with it this call, visit_text is treated as
+ * not-supplied (stays blank rather than duplicating about_text into a
+ * second section). If about_text's write turns out to be a no-op (e.g. its
+ * existing value already passes the quality bar and is never churned),
+ * visit_text's identical-looking candidate is NOT suppressed — a genuinely
+ * blank visit_text still gets filled normally.
  */
 export function applyGardssalgProviderContent(
   providerId: string,
@@ -2338,29 +2392,47 @@ export function applyGardssalgProviderContent(
   // gardssalgReplaceableFieldAction always returns null ("never churned").
   const rewriteSet = new Set(rewriteFields ?? []);
 
-  // dev-request 2026-07-20-gardssalg-navstoy-duplikatfelt-heuristikk, spec
-  // item 3: never write the SAME raw candidate block to both about_text and
-  // visit_text in one pass — they are meant to be semantically distinct
-  // sections. When the source only yielded one usable block (both
-  // candidates byte-identical after trim), about_text wins ("fylles KUN
-  // about_text") and visit_text is treated as though no candidate was
-  // supplied at all — it stays blank (an honest gap a later, separately-
-  // sourced pass can fill) rather than duplicating about_text's content.
-  const aboutCandidateTrimmed = candidate.about_text?.trim();
-  const visitCandidateTrimmed = candidate.visit_text?.trim();
-  const isDuplicateBlock =
-    !!aboutCandidateTrimmed && !!visitCandidateTrimmed && aboutCandidateTrimmed === visitCandidateTrimmed;
-  const visitCandidate: string | null | undefined = isDuplicateBlock ? undefined : candidate.visit_text;
-
+  // about_text decided FIRST — the duplicate-block guard below needs to
+  // know whether about_text is ACTUALLY going to consume the candidate
+  // block before it can decide whether visit_text's identical candidate is
+  // redundant (see that guard's comment — review round 1, 2026-07-20, found
+  // suppressing visit_text unconditionally on candidate-equality alone
+  // could silently block a legitimate blank-visit_text fill whenever
+  // about_text's OWN write turned out to be a no-op, e.g. already-decent
+  // content that is never churned).
+  let aboutWillWrite = false;
   if (rewriteSet.has("about_text") && candidate.about_text?.trim() && gardssalgRewriteEligible(row.about_text)) {
     sets.push("about_text = @about_text");
     params.about_text = candidate.about_text.trim();
     written.push("about_text");
+    aboutWillWrite = true;
   } else if (gardssalgReplaceableFieldAction(row.about_text, candidate.about_text)) {
     sets.push("about_text = @about_text");
     params.about_text = candidate.about_text!.trim();
     written.push("about_text");
+    aboutWillWrite = true;
   }
+
+  // dev-request 2026-07-20-gardssalg-navstoy-duplikatfelt-heuristikk, spec
+  // item 3: never write the SAME raw candidate block to both about_text and
+  // visit_text in one pass — they are meant to be semantically distinct
+  // sections. When the source only yielded one usable block (both
+  // candidates byte-identical after trim) AND about_text is actually going
+  // to use it (aboutWillWrite), about_text wins ("fylles KUN about_text")
+  // and visit_text is treated as though no candidate was supplied at all —
+  // it stays blank (an honest gap a later, separately-sourced pass can
+  // fill) rather than duplicating about_text's content. Gating on
+  // aboutWillWrite matters: if about_text's existing value already passes
+  // the quality bar (never churned — the candidate is simply discarded for
+  // about_text), a genuinely blank visit_text must still be filled
+  // normally, even though the two raw candidates happened to be identical.
+  const aboutCandidateTrimmed = candidate.about_text?.trim();
+  const visitCandidateTrimmed = candidate.visit_text?.trim();
+  const isDuplicateBlock =
+    aboutWillWrite &&
+    !!aboutCandidateTrimmed && !!visitCandidateTrimmed && aboutCandidateTrimmed === visitCandidateTrimmed;
+  const visitCandidate: string | null | undefined = isDuplicateBlock ? undefined : candidate.visit_text;
+
   if (rewriteSet.has("visit_text") && visitCandidate?.trim() && gardssalgRewriteEligible(row.visit_text)) {
     sets.push("visit_text = @visit_text");
     params.visit_text = visitCandidate.trim();

@@ -177,6 +177,45 @@ export function runOpplevelserGardssalgNavstoyHeuristikkTests(
       const pureNavChrome = "Hjem Kontakt Meny Handlekurv Sortiment Vilkår Levering";
       assertTrue(store.gardssalgIsNavPolluted(pureNavChrome), "c3: pure nav-chrome text with >=2 distinct nav words flagged");
 
+      // ── round-1 review fix-up (2026-07-20, CHANGES-REQUESTED): the naive
+      // "any-case, anywhere" version of the wordlist match destructively
+      // false-positived on ordinary honest visit_text sentences that
+      // legitimately use "kontakt"/"hjem"/"åpningstider" as normal
+      // vocabulary, not as leaked nav labels. Reviewer's exact reproduced
+      // failing examples — both must NOT be flagged. ─────────────────────
+      const honestContactSentence =
+        "Kontakt oss på forhånd, vi har åpningstider tirsdag til lørdag klokken ti til fjorten.";
+      assertTrue(
+        !store.gardssalgIsNavPolluted(honestContactSentence),
+        "c4: 'Kontakt oss på forhånd...' (capitalized only by being sentence-initial) not flagged"
+      );
+      assertTrue(
+        store.gardssalgMeetsQualityBar(honestContactSentence),
+        "c5: honest contact/opening-hours sentence passes the gårdssalg composite bar"
+      );
+      const honestDeliverySentence =
+        "Vi leverer rett hjem til deg om du tar kontakt i god tid før helgen, og ellers er du velkommen til gårdsbutikken.";
+      assertTrue(
+        !store.gardssalgIsNavPolluted(honestDeliverySentence),
+        "c6: 'Vi leverer rett hjem ... tar kontakt ...' (both words lowercase mid-sentence) not flagged"
+      );
+      assertTrue(
+        store.gardssalgMeetsQualityBar(honestDeliverySentence),
+        "c7: honest home-delivery sentence passes the gårdssalg composite bar"
+      );
+
+      // A nav word that is ONLY ever capitalized because it starts a real
+      // sentence (not because it's a leaked menu label) must not count even
+      // when paired with a second, later real sentence that also happens to
+      // open with a nav word — sentence-initial capitalization is excluded
+      // by position, not by whether it's the FIRST sentence in the text.
+      const twoSentencesEachOpeningWithNavWord =
+        "Kontakt oss for booking av gårdsbesøk. Hjem til deg leverer vi ferske grønnsaker hver uke i sommersesongen.";
+      assertTrue(
+        !store.gardssalgIsNavPolluted(twoSentencesEachOpeningWithNavWord),
+        "c8: two real sentences each merely opening with a nav-adjacent word not flagged"
+      );
+
       // ── (d): applyGardssalgProviderContent duplicate-block guard ────────
       const insertProvider = expDb.prepare(
         `INSERT INTO experience_providers
@@ -217,6 +256,32 @@ export function runOpplevelserGardssalgNavstoyHeuristikkTests(
         "https://prov-distinct.example.no",
       );
       assertEq(writtenDistinct.sort(), ["about_text", "visit_text"], "d4: distinct about/visit candidates both still written (no over-trigger)");
+
+      // ── round-1 review fix-up (2026-07-20, CHANGES-REQUESTED): the
+      // duplicate-block guard must NOT suppress visit_text when about_text
+      // ISN'T actually going to consume the shared candidate block —
+      // e.g. about_text already holds decent, quality-bar-passing content
+      // (never churned) while visit_text is genuinely blank. Reviewer's
+      // exact reproduced failing scenario: pre-fix, this silently left
+      // visit_text blank forever because candidate equality alone (ignoring
+      // whether about_text's OWN write was a no-op) suppressed it. ────────
+      const decentExistingAbout =
+        "Familiedrevet gård på Toten som dyrker økologiske grønnsaker og bær, og selger direkte fra gårdsbutikken.";
+      insertProvider.run({
+        id: "prov-dup-noop-about", navn: "Prov Dup Noop About Gard", hjemmeside: "https://prov-dup-noop-about.example.no",
+        content_source: null, about_text: decentExistingAbout, visit_text: null, opening_hours_text: null,
+        producer_type: "sideri", catalog_hidden: 0,
+      });
+      const sameBlock2 = "Velkommen til gårdsbutikken vår hver lørdag, med masse ferske varer å velge blant hele sesongen.";
+      const writtenNoopAbout = store.applyGardssalgProviderContent(
+        "prov-dup-noop-about",
+        { about_text: sameBlock2, visit_text: sameBlock2 },
+        "https://prov-dup-noop-about.example.no",
+      );
+      assertEq(writtenNoopAbout, ["visit_text"], "d5: about_text already decent (never churned, no-op) -> visit_text's IDENTICAL candidate still fills the genuinely blank field");
+      const rowNoopAbout = expDb.prepare(`SELECT about_text, visit_text FROM experience_providers WHERE id = ?`).get("prov-dup-noop-about") as any;
+      assertEq(rowNoopAbout.about_text, decentExistingAbout, "d6: about_text unchanged (its own decent content was never touched)");
+      assertEq(rowNoopAbout.visit_text, sameBlock2, "d7: visit_text filled from the candidate, even though it's byte-identical to the (untouched) about_text candidate");
 
       // ── (e): evaluateGardssalgContentQuality — pure decision function ────
       const scanRows = [
