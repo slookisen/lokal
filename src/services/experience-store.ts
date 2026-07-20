@@ -22,7 +22,7 @@ import { fylkeEquivalents } from "./norway-fylke";
 // reuse the same quality-bar predicate the homepage-content extractor already
 // gates candidates with, so applyGardssalgProviderContent() can tell "thin"
 // existing content from decent existing content before deciding to replace it.
-import { meetsAboutQualityBar } from "./search-enrich";
+import { meetsAboutQualityBar, stripNorwegianAccents } from "./search-enrich";
 import { deriveExperienceTags, type ExperienceTag, type TaggableExperience } from "./experience-tags";
 import { haversineDistanceKm } from "./geocoding-service";
 // dev-request 2026-07-18-gardssalg-profilkvalitet-foer-outreach, slice 5b —
@@ -2048,6 +2048,87 @@ export function getGardssalgProviderContentTarget(providerId: string): Gardssalg
   return row;
 }
 
+// Extensible, curated Norwegian website-navigation/menu vocabulary — literal
+// words a producer's own about/visit PROSE essentially never uses in
+// isolation, but that recur constantly in scraped <nav>/menu chrome. Single
+// tokens are matched at word boundaries (via the tokeniser below, never as a
+// substring of an unrelated longer word); the phrases are matched as
+// substrings of the whole accent-stripped, lowercased text. "heim" is the
+// Nynorsk/dialect variant of "hjem" (home) — the exact word the Draopar
+// defect (dev-request 2026-07-20-gardssalg-navstoy-duplikatfelt-heuristikk)
+// was found with.
+const GARDSSALG_NAV_WORDLIST_TOKENS: ReadonlySet<string> = new Set([
+  "kontakt", "hjem", "heim", "meny", "handlekurv", "sortiment", "vilkar",
+  "levering", "apningstider", "nettbutikk", "sok", "nyhetsbrev", "bestill",
+]);
+const GARDSSALG_NAV_WORDLIST_PHRASES: readonly string[] = ["logg inn", "om oss", "min konto"];
+
+/**
+ * Detects nav-menu-chrome vocabulary glued into an otherwise quality-bar-
+ * passing about/visit candidate — the "Draopar-klassen" defect (dev-request
+ * 2026-07-20-gardssalg-navstoy-duplikatfelt-heuristikk): a page extraction
+ * that picks up a handful of nav/menu labels (Heim, Kontakt, Sortiment,
+ * Vilkår, …) immediately before/after one short real sentence — enough real
+ * sentence structure to already clear meetsAboutQualityBar's own
+ * isLikelyNavMenuLeakage check (which looks at the WHOLE candidate's
+ * cap-ratio/punctuation/prose-signal shape), but the nav vocabulary itself
+ * never belongs in a producer's own about/visit text regardless of what else
+ * is in the string.
+ *
+ * Deliberately a literal, curated, EXTENSIBLE wordlist rather than a generic
+ * "flat Title-Case run with no early punctuation" structural check: an
+ * earlier draft of this heuristic tried the latter and reproduced this same
+ * file's own already-fixed false-positive class (search-enrich.ts's
+ * `reviewerPassiveProductList` round-2 fix-up) — genuine passive-voice
+ * Norwegian farm-product prose ("Nordfjord Ost Sunnmøre Smør … produseres
+ * her på garden") is ALSO a long run of Title-Case tokens with no early
+ * sentence-ending punctuation, and a structural-only check cannot tell the
+ * two apart without literal nav-vocabulary evidence. Requires >=2 DISTINCT
+ * nav words/phrases (never a single incidental mention) so a producer
+ * genuinely mentioning their own food "meny" once, or their "Åpningstider"
+ * once, is never penalised — only a text carrying an actual CLUSTER of
+ * different nav/menu labels is flagged.
+ *
+ * PURE, no network/IO. Gårdssalg-scoped only (used by
+ * gardssalgMeetsQualityBar below) — does NOT touch meetsAboutQualityBar
+ * itself, which is shared by the RFB/experiences/dental content-refresh
+ * paths too and is out of scope for this dev-request.
+ */
+export function gardssalgIsNavPolluted(text: string | null | undefined): boolean {
+  if (!text) return false;
+  const trimmed = String(text).replace(/\s+/g, " ").trim();
+  if (!trimmed) return false;
+  const lowerAscii = stripNorwegianAccents(trimmed.toLowerCase());
+
+  const tokens = trimmed
+    .split(/\s+/)
+    .map((t) => stripNorwegianAccents(t.toLowerCase()).replace(/^[^a-z0-9]+|[^a-z0-9]+$/g, ""))
+    .filter((t) => t.length > 0);
+
+  const matchedSignals = new Set<string>();
+  for (const t of tokens) {
+    if (GARDSSALG_NAV_WORDLIST_TOKENS.has(t)) matchedSignals.add(t);
+  }
+  for (const p of GARDSSALG_NAV_WORDLIST_PHRASES) {
+    if (lowerAscii.includes(p)) matchedSignals.add(p);
+  }
+  return matchedSignals.size >= 2;
+}
+
+/**
+ * Gårdssalg-scoped composite quality gate (dev-request 2026-07-20-gardssalg-
+ * navstoy-duplikatfelt-heuristikk, spec item 2 — "kvalitetsporten skjerpes"):
+ * text must clear the shared meetsAboutQualityBar bar AND not be
+ * nav-polluted per gardssalgIsNavPolluted above. Deliberately a NEW,
+ * additive function rather than a change to meetsAboutQualityBar itself
+ * (shared across verticals, out of this dev-request's scope) — every
+ * gårdssalg about_text/visit_text quality decision below should call THIS,
+ * not the raw meetsAboutQualityBar.
+ */
+export function gardssalgMeetsQualityBar(text: string | null | undefined): boolean {
+  return meetsAboutQualityBar(text) && !gardssalgIsNavPolluted(text);
+}
+
 /**
  * Decide what applyGardssalgProviderContent() would do for ONE about_text/
  * visit_text field, given the row's current (pre-write) value and a raw
@@ -2074,8 +2155,8 @@ export function gardssalgReplaceableFieldAction(
   if (!candidate) return null;
   const isCurrentBlank = currentValue === null || currentValue === undefined || String(currentValue).trim() === "";
   if (isCurrentBlank) return "filled";
-  if (meetsAboutQualityBar(currentValue)) return null; // decent existing content — never churned
-  if (!meetsAboutQualityBar(candidate)) return null; // candidate itself thin — can't replace thin with thin
+  if (gardssalgMeetsQualityBar(currentValue)) return null; // decent existing content — never churned
+  if (!gardssalgMeetsQualityBar(candidate)) return null; // candidate itself thin/nav-polluted — can't replace with that
   const currentTrimmed = String(currentValue).trim();
   if (!(candidate.length > currentTrimmed.length)) return null; // must be a genuine improvement in length
   return "replaced";
@@ -2108,7 +2189,7 @@ export function gardssalgRewriteEligible(currentValue: string | null | undefined
   if (currentValue === null || currentValue === undefined) return false;
   const trimmed = String(currentValue).trim();
   if (!trimmed) return false;
-  if (!meetsAboutQualityBar(trimmed)) return false;
+  if (!gardssalgMeetsQualityBar(trimmed)) return false;
   return trimmed.length < 200;
 }
 
@@ -2186,6 +2267,12 @@ export function gardssalgProductsEligible(currentProducts: string | null | undef
  * anyway, since eligibility requires the current value to already pass the
  * quality bar) but goes through the exact same audit-row + field_provenance
  * + lock-guard machinery as every other field.
+ *
+ * Duplicate-block guard (dev-request 2026-07-20-gardssalg-navstoy-
+ * duplikatfelt-heuristikk, spec item 3): if `candidate.about_text` and
+ * `candidate.visit_text` are byte-identical after trim, only about_text is
+ * ever written this call — visit_text is treated as not-supplied (stays
+ * blank rather than duplicating about_text into a second section).
  */
 export function applyGardssalgProviderContent(
   providerId: string,
@@ -2251,6 +2338,20 @@ export function applyGardssalgProviderContent(
   // gardssalgReplaceableFieldAction always returns null ("never churned").
   const rewriteSet = new Set(rewriteFields ?? []);
 
+  // dev-request 2026-07-20-gardssalg-navstoy-duplikatfelt-heuristikk, spec
+  // item 3: never write the SAME raw candidate block to both about_text and
+  // visit_text in one pass — they are meant to be semantically distinct
+  // sections. When the source only yielded one usable block (both
+  // candidates byte-identical after trim), about_text wins ("fylles KUN
+  // about_text") and visit_text is treated as though no candidate was
+  // supplied at all — it stays blank (an honest gap a later, separately-
+  // sourced pass can fill) rather than duplicating about_text's content.
+  const aboutCandidateTrimmed = candidate.about_text?.trim();
+  const visitCandidateTrimmed = candidate.visit_text?.trim();
+  const isDuplicateBlock =
+    !!aboutCandidateTrimmed && !!visitCandidateTrimmed && aboutCandidateTrimmed === visitCandidateTrimmed;
+  const visitCandidate: string | null | undefined = isDuplicateBlock ? undefined : candidate.visit_text;
+
   if (rewriteSet.has("about_text") && candidate.about_text?.trim() && gardssalgRewriteEligible(row.about_text)) {
     sets.push("about_text = @about_text");
     params.about_text = candidate.about_text.trim();
@@ -2260,13 +2361,13 @@ export function applyGardssalgProviderContent(
     params.about_text = candidate.about_text!.trim();
     written.push("about_text");
   }
-  if (rewriteSet.has("visit_text") && candidate.visit_text?.trim() && gardssalgRewriteEligible(row.visit_text)) {
+  if (rewriteSet.has("visit_text") && visitCandidate?.trim() && gardssalgRewriteEligible(row.visit_text)) {
     sets.push("visit_text = @visit_text");
-    params.visit_text = candidate.visit_text.trim();
+    params.visit_text = visitCandidate.trim();
     written.push("visit_text");
-  } else if (gardssalgReplaceableFieldAction(row.visit_text, candidate.visit_text)) {
+  } else if (gardssalgReplaceableFieldAction(row.visit_text, visitCandidate)) {
     sets.push("visit_text = @visit_text");
-    params.visit_text = candidate.visit_text!.trim();
+    params.visit_text = visitCandidate!.trim();
     written.push("visit_text");
   }
   if (isBlank(row.opening_hours_text) && candidate.opening_hours_text?.trim()) {
@@ -2331,6 +2432,226 @@ export function applyGardssalgProviderContent(
   applyWithAudit();
 
   return written;
+}
+
+// ─── Gårdssalg content-quality retroactive scan (dev-request 2026-07-20-
+//     gardssalg-navstoy-duplikatfelt-heuristikk, spec item 4) ───────────────
+//
+// The heuristics above (gardssalgIsNavPolluted / the duplicate-block guard)
+// only stop NEW nav-junk/duplicate writes going forward. This is the
+// retroactive half: find rows that ALREADY carry the defect (written before
+// this dev-request existed) so they can be cleared and re-queued for a clean
+// content-refresh pass. Backs POST /admin/gardssalg-content-quality-scan.
+
+export type GardssalgContentQualityFlag = {
+  provider_id: string;
+  navn: string;
+  field_name: "about_text" | "visit_text";
+  reason: "nav_polluted" | "duplicate_about_visit";
+  excerpt: string;
+};
+
+export type GardssalgQualityScanRow = {
+  id: string;
+  navn: string;
+  content_source: string | null;
+  about_text: string | null;
+  visit_text: string | null;
+};
+
+/**
+ * ALL gårdssalg providers (visible AND catalog_hidden=1), excluding locked
+ * (manual/claim) rows. Unlike every other gårdssalg selector in this file,
+ * this deliberately does NOT filter on catalog_hidden — a hidden-but-
+ * already-enriched row (the ~52 such rows this dev-request's session found
+ * live) can carry the exact same nav-junk/duplicate-field contamination as a
+ * visible one, and must be scannable before it is ever unhidden.
+ */
+export function selectGardssalgProvidersForQualityScan(): GardssalgQualityScanRow[] {
+  const db = getDb(VERTICAL);
+  return db
+    .prepare(
+      `SELECT id, navn, content_source, about_text, visit_text
+         FROM experience_providers
+        WHERE (producer_type IS NOT NULL OR rfb_seed_source = 'rfb-seed')
+          AND (content_source IS NULL OR content_source NOT IN ('manual','claim'))`
+    )
+    .all() as GardssalgQualityScanRow[];
+}
+
+/**
+ * Pure decision function — flags about_text/visit_text fields that are
+ * either (a) nav-menu-polluted per gardssalgIsNavPolluted, or (b)
+ * byte-identical duplicates of each other (about_text === visit_text,
+ * non-blank): the two Draopar-class defects this dev-request exists to
+ * catch. Exported separately from the DB-reading selector above so it is
+ * testable with plain fixtures, no DB required.
+ *
+ * A duplicate pair only flags visit_text — kept consistent with
+ * applyGardssalgProviderContent's own "fylles KUN about_text" tie-break (see
+ * that function's duplicate-block guard) — UNLESS about_text is
+ * INDEPENDENTLY nav-polluted too, in which case both fields are flagged for
+ * their own distinct reasons and visit_text is never double-flagged.
+ */
+export function evaluateGardssalgContentQuality(
+  rows: GardssalgQualityScanRow[]
+): GardssalgContentQualityFlag[] {
+  const flags: GardssalgContentQualityFlag[] = [];
+  for (const row of rows) {
+    const about = row.about_text?.trim() || "";
+    const visit = row.visit_text?.trim() || "";
+    let visitFlagged = false;
+
+    if (about && gardssalgIsNavPolluted(about)) {
+      flags.push({
+        provider_id: row.id,
+        navn: row.navn,
+        field_name: "about_text",
+        reason: "nav_polluted",
+        excerpt: about.slice(0, 160),
+      });
+    }
+    if (visit && gardssalgIsNavPolluted(visit)) {
+      flags.push({
+        provider_id: row.id,
+        navn: row.navn,
+        field_name: "visit_text",
+        reason: "nav_polluted",
+        excerpt: visit.slice(0, 160),
+      });
+      visitFlagged = true;
+    }
+    if (about && visit && about === visit && !visitFlagged) {
+      flags.push({
+        provider_id: row.id,
+        navn: row.navn,
+        field_name: "visit_text",
+        reason: "duplicate_about_visit",
+        excerpt: visit.slice(0, 160),
+      });
+    }
+  }
+  return flags;
+}
+
+// source_url marker stamped on gardssalg_content_audit rows inserted by the
+// quality-scan fixer below (as opposed to a content-refresh write or the
+// existing rollback marker) — lets a reader of the audit log tell the three
+// apart at a glance.
+const GARDSSALG_QUALITY_SCAN_MARKER = "internal://quality-scan";
+
+/**
+ * Applies the quality-scan's flagged fields: NULLs each (provider_id,
+ * field_name) pair — this never writes NEW content, that is the follow-up
+ * content-refresh pass's job once the field is genuinely blank again — via
+ * the SAME gardssalg_content_audit + field_provenance path every other
+ * gårdssalg writer uses (so the existing rollback lever,
+ * POST /admin/gardssalg-content-rollback, can undo a scan-fix batch too),
+ * and resets last_content_attempt_at to NULL so the provider sorts first in
+ * selectGardssalgProvidersForContentRefresh's next auto-select pass — the
+ * spec's "re-kø-stempler raden for ny content-refresh-runde".
+ *
+ * Re-verifies EVERY flag against a FRESH row read (not the caller's
+ * possibly-stale scan snapshot) before writing — same defense-in-depth
+ * discipline as applyGardssalgProviderContent's rewriteFields re-check: a
+ * field that was fixed/changed between scan and apply is skipped, not
+ * blindly nulled.
+ */
+export function applyGardssalgContentQualityFixes(
+  flags: GardssalgContentQualityFlag[],
+  batchId?: string
+): {
+  applied: Array<{ provider_id: string; field_name: string }>;
+  skipped: Array<{ provider_id: string; field_name: string; reason: string }>;
+} {
+  const db = getDb(VERTICAL);
+  const applied: Array<{ provider_id: string; field_name: string }> = [];
+  const skipped: Array<{ provider_id: string; field_name: string; reason: string }> = [];
+
+  for (const flag of flags) {
+    const row = db
+      .prepare(
+        `SELECT id, content_source, about_text, visit_text, field_provenance
+           FROM experience_providers WHERE id = ?`
+      )
+      .get(flag.provider_id) as
+      | {
+          id: string;
+          content_source: string | null;
+          about_text: string | null;
+          visit_text: string | null;
+          field_provenance: string | null;
+        }
+      | undefined;
+    if (!row) {
+      skipped.push({ provider_id: flag.provider_id, field_name: flag.field_name, reason: "not_found" });
+      continue;
+    }
+    if (row.content_source === "manual" || row.content_source === "claim") {
+      skipped.push({ provider_id: flag.provider_id, field_name: flag.field_name, reason: "manual_or_claim_source" });
+      continue;
+    }
+
+    const currentValue = flag.field_name === "about_text" ? row.about_text : row.visit_text;
+    const currentTrimmed = currentValue?.trim() || "";
+    if (!currentTrimmed) {
+      skipped.push({ provider_id: flag.provider_id, field_name: flag.field_name, reason: "already_blank" });
+      continue;
+    }
+
+    const otherValue = flag.field_name === "about_text" ? row.visit_text : row.about_text;
+    const stillMatches =
+      flag.reason === "nav_polluted"
+        ? gardssalgIsNavPolluted(currentTrimmed)
+        : currentTrimmed === (otherValue?.trim() || "");
+    if (!stillMatches) {
+      skipped.push({ provider_id: flag.provider_id, field_name: flag.field_name, reason: "no_longer_matches" });
+      continue;
+    }
+
+    let provenance: Record<string, { source_url: string; fetched_at: string }> = {};
+    if (row.field_provenance) {
+      try {
+        const parsed = JSON.parse(row.field_provenance);
+        if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+          provenance = parsed as Record<string, { source_url: string; fetched_at: string }>;
+        }
+      } catch {
+        /* malformed existing JSON -> treat as empty rather than clobber the write */
+      }
+    }
+    delete provenance[flag.field_name];
+
+    // flag.field_name is a TS literal union ("about_text" | "visit_text")
+    // never sourced from a request body — never interpolate a field name
+    // that DID come from external input without validating it against
+    // GARDSSALG_ROLLBACKABLE_FIELDS first, same as every other gårdssalg
+    // writer in this file.
+    const column = flag.field_name === "about_text" ? "about_text" : "visit_text";
+    const applyOne = db.transaction(() => {
+      db.prepare(
+        `UPDATE experience_providers
+            SET ${column} = NULL, field_provenance = @field_provenance, last_content_attempt_at = NULL
+          WHERE id = @id`
+      ).run({ id: flag.provider_id, field_provenance: JSON.stringify(provenance) });
+      db.prepare(
+        `INSERT INTO gardssalg_content_audit
+           (id, provider_id, field_name, old_value, new_value, source_url, batch_id, changed_by, changed_at)
+         VALUES (@id, @provider_id, @field_name, @old_value, NULL, @source_url, @batch_id, 'system', datetime('now'))`
+      ).run({
+        id: uuid(),
+        provider_id: flag.provider_id,
+        field_name: flag.field_name,
+        old_value: currentTrimmed,
+        source_url: GARDSSALG_QUALITY_SCAN_MARKER,
+        batch_id: batchId ?? null,
+      });
+    });
+    applyOne();
+    applied.push({ provider_id: flag.provider_id, field_name: flag.field_name });
+  }
+
+  return { applied, skipped };
 }
 
 // ─── Gårdssalg address enrichment (dev-request 2026-07-18-gardssalg-

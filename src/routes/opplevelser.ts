@@ -123,6 +123,13 @@ import {
   // page/`/discover` use, reused by the new catalog-wide coverage report
   // below rather than redefined.
   PUBLISH_GATE_SQL,
+  // dev-request 2026-07-20-gardssalg-navstoy-duplikatfelt-heuristikk — nav-
+  // pollution/duplicate-field retroactive scan (dry-run) + fixer (apply),
+  // backing POST /admin/gardssalg-content-quality-scan below.
+  selectGardssalgProvidersForQualityScan,
+  evaluateGardssalgContentQuality,
+  applyGardssalgContentQualityFixes,
+  type GardssalgContentQualityFlag,
 } from "../services/experience-store";
 // dev-request 2026-07-11-dedup-false-positive-remediation — read-only audit
 // of the merged groups the prod backfill produced (titlesMatch()'s single-
@@ -2412,6 +2419,70 @@ router.post("/admin/gardssalg-content-rollback", requireAdmin, (req: Request, re
     });
   } catch (err: any) {
     console.error("[opplevelser] gardssalg-content-rollback failed", err);
+    res.status(500).json({ error: "Internal error" });
+  }
+});
+
+// ─── POST /api/opplevelser/admin/gardssalg-content-quality-scan (admin) ─────
+//
+// dev-request 2026-07-20-gardssalg-navstoy-duplikatfelt-heuristikk, spec item
+// 4 — retroactive bulk scan for the two Draopar-class defects (nav-menu
+// vocabulary glued into about_text/visit_text, and about_text===visit_text
+// duplication) across ALL gårdssalg providers, visible AND catalog_hidden=1
+// (see selectGardssalgProvidersForQualityScan's doc comment for why hidden
+// rows are included). Dry-run by default (same convention as every other
+// admin route in this file); apply=1 nulls the flagged fields via the SAME
+// gardssalg_content_audit + field_provenance path every other gårdssalg
+// writer uses (so POST /admin/gardssalg-content-rollback can undo a scan-fix
+// batch too) and resets last_content_attempt_at so the row is first in line
+// for the next content-refresh pass. NEVER writes new content itself —
+// purely a "clear the contamination, re-queue for a clean refill" lever.
+//
+// Body: { providerIds?: string[], apply? }. providerIds optionally scopes
+// the scan to a subset (mirrors the content-refresh/address-enrichment
+// routes' override convention); omitted/empty scans the full catalog.
+// Response: { dry_run, scanned, flagged, flags, applied?, skipped? }.
+// Auth: same X-Admin-Key convention (requireAdmin) as the rest of this file.
+router.post("/admin/gardssalg-content-quality-scan", requireAdmin, (req: Request, res: Response) => {
+  const body = (req.body ?? {}) as { providerIds?: unknown; apply?: unknown };
+  const apply =
+    body.apply === true ||
+    body.apply === 1 ||
+    body.apply === "1" ||
+    body.apply === "true" ||
+    req.query?.apply === "1" ||
+    req.query?.apply === "true";
+  const dryRun = !apply;
+
+  try {
+    let rows = selectGardssalgProvidersForQualityScan();
+    if (Array.isArray(body.providerIds) && body.providerIds.length > 0) {
+      const ids = new Set(
+        (body.providerIds as unknown[]).filter((id): id is string => typeof id === "string" && id.trim().length > 0)
+      );
+      rows = rows.filter((r) => ids.has(r.id));
+    }
+
+    const flags: GardssalgContentQualityFlag[] = evaluateGardssalgContentQuality(rows);
+
+    if (dryRun) {
+      res.json({ dry_run: true, scanned: rows.length, flagged: flags.length, flags });
+      return;
+    }
+
+    const batchTag = `quality-scan-${new Date().toISOString().replace(/[-:]/g, "").replace("T", "-").slice(0, 15)}`;
+    const { applied, skipped } = applyGardssalgContentQualityFixes(flags, batchTag);
+    res.json({
+      dry_run: false,
+      scanned: rows.length,
+      flagged: flags.length,
+      flags,
+      batch_id: batchTag,
+      applied,
+      skipped,
+    });
+  } catch (err: any) {
+    console.error("[opplevelser] gardssalg-content-quality-scan failed", err);
     res.status(500).json({ error: "Internal error" });
   }
 });

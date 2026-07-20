@@ -50,7 +50,7 @@ const NAME_STOPWORDS: ReadonlySet<string> = new Set([
 // Strip Norwegian accents / diacritics to their ASCII base so "Nalums" and
 // "Nålums" stem identically and so email local-parts (always ASCII) can be
 // compared against name stems.
-function stripNorwegianAccents(s: string): string {
+export function stripNorwegianAccents(s: string): string {
   return s
     .replace(/å/g, "a")
     .replace(/æ/g, "ae")

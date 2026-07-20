@@ -27070,6 +27070,22 @@ Promise.allSettled(_oaHomeCountersDeps).then(async () => {
     for (const f of g5h.failures) failures.push("opplevelser-gardssalg-5d-hardening: " + f);
     console.log(`  opplevelser-gardssalg-5d-hardening: ${g5h.passed} passed, ${g5h.failed} failed`);
 
+    // dev-request 2026-07-20-gardssalg-navstoy-duplikatfelt-heuristikk: the
+    // Draopar-class defect — nav-menu vocabulary glued into about_text/
+    // visit_text, and about_text===visit_text duplication. Covers the
+    // heuristic (gardssalgIsNavPolluted/gardssalgMeetsQualityBar), the
+    // write-time duplicate-block guard, and the retroactive scan/fix
+    // endpoint (POST /admin/gardssalg-content-quality-scan). Same
+    // in-memory-DB pattern, runs sequentially inside this same gated block.
+    console.log("\n── opplevelser-gardssalg-navstoy-heuristikk: nav-pollution + duplicate-field scan ──");
+    const { runOpplevelserGardssalgNavstoyHeuristikkTests } = require("../src/routes/opplevelser-gardssalg-navstoy-heuristikk.test") as
+      typeof import("../src/routes/opplevelser-gardssalg-navstoy-heuristikk.test");
+    const gnh = await runOpplevelserGardssalgNavstoyHeuristikkTests({ log: false });
+    passed += gnh.passed;
+    failed += gnh.failed;
+    for (const f of gnh.failures) failures.push("opplevelser-gardssalg-navstoy-heuristikk: " + f);
+    console.log(`  opplevelser-gardssalg-navstoy-heuristikk: ${gnh.passed} passed, ${gnh.failed} failed`);
+
     // dev-request 2026-07-04-opplevagent-dedup-og-norske-titler, item 3
     // (detail completeness weave): GET /admin/detail-completeness-coverage —
     // read-only, catalog-wide booking_url/phone/website coverage report over
