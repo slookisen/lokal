@@ -16,6 +16,8 @@
 import { Router, Request, Response } from "express";
 import { getDb } from "../database/init";
 import { dedupeByEmail, DedupeCandidate } from "../services/marketing-dedupe";
+import { isJunkDescription } from "../services/description-quality";
+import { isJunkEmail } from "../services/gardssalg-rfb-enrich";
 
 const router = Router();
 
@@ -118,6 +120,58 @@ router.get("/stats", (req: Request, res: Response) => {
       )
       .get() as { parked_active: number | null; parked_expired: number | null };
 
+    // dev-request 2026-07-13-enrichment-tynne-profiler-trust-score (item 1,
+    // stats slice): progress gauge for the low_quality re-enrichment cohort
+    // (POST /admin/homepage-provenance-batch { select: "low_quality" }, in
+    // marketplace.ts) — this route is the existing "pool_funnel"-pattern
+    // stats surface for this same RFB-producer domain (agents/agent_knowledge
+    // in lokal.db), so the new breakdown lands here rather than a new file.
+    // Candidate gate mirrors that selector's SQL WHERE clause (non-umbrella,
+    // trust_score<0.5, has a homepage to re-enrich from) but — deliberately,
+    // per the dev-request's own "e.g. trust_score < 0.5 non-umbrella count"
+    // framing — skips the no_yield/wrong_entity backoff and dead-homepage
+    // parking exclusions: this is a "how big is the bad-profile universe"
+    // gauge, not an exact "would be selected on the very next call" count.
+    // Breaks the total down by which junk/thinness signal(s) fired, using
+    // the SAME isJunkEmail/isJunkDescription predicates the selector ranks
+    // with, so this number and the selector's behaviour can't drift apart.
+    const lowQualityRows = db
+      .prepare(
+        `SELECT a.trust_score AS trust_score, a.description AS description,
+                a.contact_email AS contact_email, k.email AS knowledge_email,
+                k.about AS about, k.products AS products
+           FROM agent_knowledge k
+           JOIN agents a ON a.id = k.agent_id
+          WHERE a.umbrella_type IS NULL
+            AND a.trust_score < 0.5
+            AND (k.website IS NOT NULL AND k.website != '' OR a.url IS NOT NULL AND a.url != '')`
+      )
+      .all() as Array<{
+      trust_score: number;
+      description: string | null;
+      contact_email: string | null;
+      knowledge_email: string | null;
+      about: string | null;
+      products: string | null;
+    }>;
+    let lqJunkEmail = 0;
+    let lqJunkDescription = 0;
+    let lqThin = 0;
+    for (const r of lowQualityRows) {
+      const email = r.knowledge_email && r.knowledge_email.trim() ? r.knowledge_email : r.contact_email;
+      if (isJunkEmail(email)) lqJunkEmail++;
+      if (isJunkDescription(r.description)) lqJunkDescription++;
+      const aboutEmpty = !r.about || !r.about.trim();
+      let productsEmpty = true;
+      try {
+        const arr = JSON.parse(r.products || "[]");
+        productsEmpty = !Array.isArray(arr) || arr.length === 0;
+      } catch {
+        productsEmpty = true;
+      }
+      if (aboutEmpty || productsEmpty) lqThin++;
+    }
+
     res.json({
       success: true,
       pool_size: total?.c ?? 0,
@@ -136,6 +190,12 @@ router.get("/stats", (req: Request, res: Response) => {
       pending_verify_parking: {
         parked_active: pendingVerifyParking?.parked_active ?? 0,
         parked_expired_ready_for_retry: pendingVerifyParking?.parked_expired ?? 0,
+      },
+      low_quality_cohort: {
+        total: lowQualityRows.length,
+        junk_email: lqJunkEmail,
+        junk_description: lqJunkDescription,
+        thin: lqThin,
       },
     });
   } catch (err: any) {
