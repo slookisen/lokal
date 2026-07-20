@@ -25,6 +25,17 @@
  *      3-strikes fetch-FAILURE parking mechanism is untouched (covered by its
  *      own homepage-provenance-selector-parking.test.ts, run unmodified).
  *
+ * Follow-up slice (dev-request 2026-07-19-enrichment-selector-rotasjon-no-yield-
+ * backoff, orch-pr-wrongentity): the reviewer of the original PR flagged that
+ * the ownership-guard-rejection ('wrong_entity') branch rotates via
+ * last_enrichment_attempt_at ASC like everything else, but never accrued any
+ * streak/backoff of its own — and a wrong-site mismatch essentially never
+ * resolves itself (same wrong site, same mismatch, forever), so once the rest
+ * of the universe rests, the same small wrong_entity cohort gets reselected
+ * on every call with zero possible yield. wrong_entity_streak (independent of,
+ * parallel to, no_yield_streak — only 'enriched' resets either) closes that
+ * gap; see the "(6) wrong_entity_streak" section below.
+ *
  * Mirrors homepage-provenance-selector-parking.test.ts:
  *   - in-memory better-sqlite3 DB injected via __setDbForTesting +
  *     __initSchemaForTesting (full prod-like schema, includes this PR's
@@ -196,6 +207,21 @@ export function runHomepageProvenanceSelectorRotationTests(
       insertAgent.run("agent-enrich", "Enrichgard AS", "https://enrich-gard.no", "key-enrich");
       insertKnowledgeVerified.run("agent-enrich", "https://enrich-gard.no");
 
+      // A single agent used for the wrong_entity-streak-backoff test (section
+      // (6) below). Its host deliberately shares no stem with its own name and
+      // its default fetch fixture never mentions the producer, so it fails the
+      // website-ownership guard on every attempt until `wrongEntityFixed` (see
+      // the fetch stub below) is flipped. Its `agents` row is created now, but
+      // — mirroring agent-noyield above — its `agent_knowledge` row is only
+      // inserted right before the section (6) test phase, so it cannot dilute
+      // the rotation-cohort / no-yield-backoff assertions above.
+      insertAgent.run(
+        "agent-wrongentity",
+        "Feilgard AS",
+        "https://feilentitet-mismatch.no",
+        "key-wrongentity",
+      );
+
       // Fresh require so the router picks up the just-injected db.
       delete require.cache[require.resolve("./marketplace")];
       const marketplaceMod = require("./marketplace");
@@ -205,6 +231,11 @@ export function runHomepageProvenanceSelectorRotationTests(
       for (const a of rotationAgents) hostNames[a.host] = a.name;
       hostNames["noyield-gard.no"] = "Noyieldgard AS";
       hostNames["enrich-gard.no"] = "Enrichgard AS";
+
+      // Flips to true partway through section (6) below, to prove an
+      // 'enriched' outcome resets wrong_entity_streak — simulates the site
+      // finally starting to mention the producer (e.g. a rebrand/fix).
+      let wrongEntityFixed = false;
 
       const fetchedHosts: string[] = [];
       (globalThis as any).fetch = async (url: string) => {
@@ -218,6 +249,27 @@ export function runHomepageProvenanceSelectorRotationTests(
             status: 200,
             text: async () =>
               `<html><head><title>${name}</title></head><body><h1>${name}</h1><p>Ring oss på 91 23 45 67</p></body></html>`,
+          } as any;
+        }
+        if (host === "feilentitet-mismatch.no") {
+          if (wrongEntityFixed) {
+            // Now mentions the producer AND carries an extractable phone
+            // number — passes the ownership guard -> 'enriched'.
+            return {
+              ok: true,
+              status: 200,
+              text: async () =>
+                `<html><head><title>Feilgard AS</title></head><body><h1>Feilgard AS</h1><p>Ring oss på 91 23 45 67</p></body></html>`,
+            } as any;
+          }
+          // Fetches fine but never mentions "Feilgard" at all (a completely
+          // unrelated business) — fails the website-ownership guard ->
+          // 'wrong_entity', the branch under test in section (6) below.
+          return {
+            ok: true,
+            status: 200,
+            text: async () =>
+              `<html><head><title>Ukjent Butikk AS</title></head><body><h1>Ukjent Butikk AS</h1><p>Vi selger sko og klær.</p></body></html>`,
           } as any;
         }
         // Mentions the producer (passes ownership guard) but has no
@@ -243,15 +295,18 @@ export function runHomepageProvenanceSelectorRotationTests(
         last_enrichment_attempt_at: string | null;
         last_enrichment_outcome: string | null;
         no_yield_streak: number;
+        wrong_entity_streak: number;
       } {
         return db
           .prepare(
-            "SELECT last_enrichment_attempt_at, last_enrichment_outcome, no_yield_streak FROM agent_knowledge WHERE agent_id = ?",
+            "SELECT last_enrichment_attempt_at, last_enrichment_outcome, no_yield_streak, wrong_entity_streak " +
+            "FROM agent_knowledge WHERE agent_id = ?",
           )
           .get(agentId) as {
           last_enrichment_attempt_at: string | null;
           last_enrichment_outcome: string | null;
           no_yield_streak: number;
+          wrong_entity_streak: number;
         };
       }
 
@@ -370,6 +425,83 @@ export function runHomepageProvenanceSelectorRotationTests(
         Array.isArray(result.body?.data?.parked_now),
         "rot-21: response keeps the existing shape (success/processed/enriched/errors/parked_now)",
       );
+
+      // ── (6) wrong_entity_streak: independent backoff for the ownership-
+      // guard-rejection branch (follow-up slice, orch-pr-wrongentity) ────────
+      // NOW give agent-wrongentity a pending_verify agent_knowledge row
+      // (visible to the default auto-select) — deliberately only from this
+      // point on, so it played no part in any assertion above.
+      insertKnowledge.run("agent-wrongentity", "https://feilentitet-mismatch.no");
+
+      await post({ agentIds: ["agent-wrongentity"] });
+      await post({ agentIds: ["agent-wrongentity"] });
+      let weRow = knowledgeRow("agent-wrongentity");
+      assertEq(weRow.last_enrichment_outcome, "wrong_entity",
+        "we-01: ownership-guard rejection stamps last_enrichment_outcome='wrong_entity'");
+      assertEq(weRow.wrong_entity_streak, 2,
+        "we-02: 2 consecutive wrong_entity outcomes -> wrong_entity_streak=2");
+      assertEq(weRow.no_yield_streak, 0,
+        "we-03: no_yield_streak is untouched by wrong_entity outcomes (independent streaks)");
+
+      result = await post({ agentIds: ["agent-wrongentity"] });
+      weRow = knowledgeRow("agent-wrongentity");
+      assertEq(weRow.wrong_entity_streak, 3,
+        "we-04: 3rd consecutive wrong_entity outcome -> wrong_entity_streak=3");
+      assertEq(weRow.last_enrichment_outcome, "wrong_entity", "we-04b: outcome recorded as wrong_entity");
+
+      // Streak is 3 AND the attempt just happened (recent) -> the default
+      // auto-select must exclude it — same exclusion mechanism already proven
+      // for no_yield_streak above (rot-12), now also keyed off wrong_entity_streak.
+      result = await post({ limit: 25 });
+      assertTrue(!fetchedHosts.includes("feilentitet-mismatch.no"),
+        "we-05: agent with wrong_entity_streak>=3 and a RECENT attempt is excluded from default auto-select");
+
+      // Move the timestamp outside the (same NO_YIELD_BACKOFF_DAYS) backoff
+      // window -> selectable again.
+      db.prepare(
+        "UPDATE agent_knowledge SET last_enrichment_attempt_at = datetime('now','-15 days') WHERE agent_id = 'agent-wrongentity'",
+      ).run();
+      result = await post({ limit: 25 });
+      assertTrue(fetchedHosts.includes("feilentitet-mismatch.no"),
+        "we-06: once the backoff window has passed, the agent is selectable again");
+
+      // Re-park it (streak=3, recent attempt) then prove — mirrors rot-14/19 —
+      // that a DIRECT streak reset (no real fetch, field_provenance untouched)
+      // alone clears the backoff exclusion, same as no_yield_streak (rot-20).
+      db.prepare(
+        "UPDATE agent_knowledge SET wrong_entity_streak = 3, last_enrichment_attempt_at = datetime('now') WHERE agent_id = 'agent-wrongentity'",
+      ).run();
+      result = await post({ limit: 25 });
+      assertTrue(!fetchedHosts.includes("feilentitet-mismatch.no"),
+        "we-07: re-parked (wrong_entity_streak=3, recent attempt) agent is excluded again");
+      db.prepare(
+        "UPDATE agent_knowledge SET wrong_entity_streak = 0 WHERE agent_id = 'agent-wrongentity'",
+      ).run();
+      result = await post({ limit: 25 });
+      assertTrue(fetchedHosts.includes("feilentitet-mismatch.no"),
+        "we-08: wrong_entity_streak reset to 0 immediately clears the backoff exclusion (mirrors rot-20)");
+
+      // Re-park it once more (streak=3, recent attempt), then prove a single
+      // subsequent REAL 'enriched' outcome resets wrong_entity_streak (and,
+      // being the shared reset, no_yield_streak too) — only 'enriched' resets
+      // either streak. (Not re-checked against the default auto-select
+      // afterwards: a genuinely enriched row with a homepage field_provenance
+      // source correctly falls out of that pool via the pre-existing
+      // `field_provenance NOT LIKE '%"homepage"%'` clause — a separate,
+      // legitimate exclusion, not the backoff mechanism under test here.)
+      db.prepare(
+        "UPDATE agent_knowledge SET wrong_entity_streak = 3, last_enrichment_attempt_at = datetime('now') WHERE agent_id = 'agent-wrongentity'",
+      ).run();
+      wrongEntityFixed = true; // the site now mentions the producer + a phone number
+      result = await post({ agentIds: ["agent-wrongentity"] });
+      assertTrue(fetchedHosts.includes("feilentitet-mismatch.no"), "we-09: agent fetched (fixed page)");
+      const weEnrichedRow = knowledgeRow("agent-wrongentity");
+      assertEq(weEnrichedRow.last_enrichment_outcome, "enriched",
+        "we-10: last_enrichment_outcome='enriched' once the page starts mentioning the producer");
+      assertEq(weEnrichedRow.wrong_entity_streak, 0,
+        "we-11: wrong_entity_streak reset to 0 on an enriched outcome");
+      assertEq(weEnrichedRow.no_yield_streak, 0,
+        "we-12: no_yield_streak also reset (already 0 here — the sibling reset is a no-op, not a NEW zero)");
     } finally {
       (globalThis as any).fetch = prevFetch;
       initMod.__setDbForTesting(prevDb);

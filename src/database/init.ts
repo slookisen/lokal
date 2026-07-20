@@ -1173,6 +1173,15 @@ function initSchema(db: Database.Database): void {
     `ALTER TABLE agent_knowledge ADD COLUMN last_enrichment_attempt_at TEXT`,
     `ALTER TABLE agent_knowledge ADD COLUMN last_enrichment_outcome TEXT`,
     `ALTER TABLE agent_knowledge ADD COLUMN no_yield_streak INTEGER NOT NULL DEFAULT 0`,
+    // dev-request 2026-07-19-enrichment-selector-rotasjon-no-yield-backoff
+    // (follow-up slice, orch-pr-wrongentity): mirrors no_yield_streak above but
+    // for the website-ownership-guard rejection branch ('wrong_entity' — page
+    // fetched fine but doesn't mention the producer) specifically. A wrong-site
+    // mismatch essentially never resolves itself, so this cohort needs its own
+    // independent backoff or it gets reselected forever once the rest of the
+    // universe rests. Independent of no_yield_streak — only an 'enriched'
+    // outcome resets either streak.
+    `ALTER TABLE agent_knowledge ADD COLUMN wrong_entity_streak INTEGER NOT NULL DEFAULT 0`,
   ]) {
     try {
       db.exec(stmt);
