@@ -6,6 +6,8 @@
  * so tests can call it without spinning up a server.
  */
 
+import { signAgentCard } from "./agent-card-signing";
+
 const DENTAL_BASE_URL =
   process.env.DENTAL_BASE_URL || "https://finn-tannlege.com";
 
@@ -16,7 +18,7 @@ function baseUrl(): string {
 
 export function getDentalAgentCard(): object {
   const url = baseUrl();
-  return {
+  const card = {
     name: "Finn-tannlege",
     description:
       "A2A-markedsplass for norske tannlegeklinikker — ~6 900 klinikker med Helfo-avtale-, spesialitet- og akuttvakt-data. " +
@@ -118,4 +120,12 @@ export function getDentalAgentCard(): object {
       },
     ],
   };
+  // JWS card signing (dev-request 2026-07-13-a2a-card-v1-signing slice 2) —
+  // sign the card exactly as assembled above (no `signatures` key present
+  // yet), then attach only if a signing key is actually configured. This
+  // covers both consumers of this function (dental's /a2a route AND its
+  // .well-known/agent-card.json route) with one signature computation.
+  const signatures = signAgentCard(card);
+  if (signatures.length > 0) (card as any).signatures = signatures;
+  return card;
 }

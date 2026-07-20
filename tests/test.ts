@@ -30987,6 +30987,161 @@ console.log("\n── item2a: dead-extraction parking (dental) ──");
   }
 })();
 
+// ── a2a-card-v1-signing slice 2: JWS card signing + JWKS publishing ────────
+// Covers: RFC 8785 JCS canonicalization (hand-verified vectors, not
+// self-referential round trips), signAgentCard()/getJWKS() with a
+// live-generated throwaway Ed25519 key (never a hardcoded key-like string),
+// a genuine crypto.verify() round trip + a negative (tampered payload)
+// verify, the no-signing-key fallback path (signAgentCard -> [],
+// getJWKS -> {keys:[]}, never throws), and a route-wiring sanity check on
+// all three domains' GET /.well-known/jwks.json plus a no-`signatures`-key
+// assertion on the four signed card call-sites in the current (no signing
+// key configured) test environment.
+(() => {
+  const signingMod = require("../src/services/agent-card-signing") as typeof import("../src/services/agent-card-signing");
+  const { canonicalizeJCS, signAgentCard, getJWKS, SIGNING_KEY_ID, __resetSigningKeyForTesting } = signingMod;
+  const nodeCrypto = require("crypto") as typeof import("crypto");
+
+  const prevKeyEnv = process.env.A2A_SIGNING_PRIVATE_KEY;
+
+  try {
+    // ── canonicalizeJCS: hand-verified vectors (not self-referential) ──
+    assertEq(canonicalizeJCS({ b: 1, a: 2 }), '{"a":2,"b":1}',
+      "jcs-1: object keys sorted lexicographically (b,a -> a,b)");
+    assertEq(canonicalizeJCS({ a: [3, 2, 1], b: { y: 2, x: 1 } }), '{"a":[3,2,1],"b":{"x":1,"y":2}}',
+      "jcs-2: nested object keys sorted, array element order preserved");
+    // UTF-16 code-unit key ordering, NOT numeric ordering: '1' (0x31) < '2' (0x32) < 'b' (0x62),
+    // so "10" sorts before "2" (compares '1' vs '2' at the first code unit).
+    assertEq(canonicalizeJCS({ b: 1, "10": 2, "2": 3 }), '{"10":2,"2":3,"b":1}',
+      "jcs-3: UTF-16 code-unit key sort, not numeric (\"10\" before \"2\")");
+    assertEq(canonicalizeJCS({ a: 1, b: 2 }), '{"a":1,"b":2}',
+      "jcs-4: no insignificant whitespace (compact output)");
+    assertTrue(canonicalizeJCS({ a: 1, b: 2 }) !== JSON.stringify({ a: 1, b: 2 }, null, 2),
+      "jcs-5: differs from pretty-printed JSON.stringify (whitespace actually stripped)");
+    assertEq(canonicalizeJCS([1, 2, 3]), "[1,2,3]", "jcs-6: array serialization");
+    assertEq(canonicalizeJCS(null), "null", "jcs-7: null serialization");
+    assertEq(canonicalizeJCS("hello"), '"hello"', "jcs-8: string serialization");
+
+    // ── fallback path (no signing key configured) ──────────────────────
+    delete process.env.A2A_SIGNING_PRIVATE_KEY;
+    __resetSigningKeyForTesting();
+    assertEq(signAgentCard({ name: "unsigned" }).length, 0, "sign-fallback-1: signAgentCard() returns [] with no key configured");
+    assertEq(getJWKS().keys.length, 0, "sign-fallback-2: getJWKS() returns {keys:[]} with no key configured");
+
+    // Garbage (unparseable) key must also fail closed, never throw.
+    process.env.A2A_SIGNING_PRIVATE_KEY = "not a real pem key";
+    __resetSigningKeyForTesting();
+    assertEq(signAgentCard({ name: "unsigned" }).length, 0, "sign-fallback-3: unparseable key -> signAgentCard() still returns [] (no throw)");
+    assertEq(getJWKS().keys.length, 0, "sign-fallback-4: unparseable key -> getJWKS() still {keys:[]} (no throw)");
+
+    // ── positive path: live-generated throwaway Ed25519 key ────────────
+    const { privateKey: genPriv, publicKey: genPub } = nodeCrypto.generateKeyPairSync("ed25519");
+    const pem = genPriv.export({ format: "pem", type: "pkcs8" }) as string;
+    process.env.A2A_SIGNING_PRIVATE_KEY = pem;
+    __resetSigningKeyForTesting();
+
+    const testCard = { name: "Test Card", nested: { b: 1, a: 2 }, list: [3, 1, 2] };
+    const sigs = signAgentCard(testCard);
+    assertEq(sigs.length, 1, "sign-1: signAgentCard() returns exactly one signature when a key is configured");
+    assertTrue(typeof sigs[0].protected === "string" && sigs[0].protected.length > 0, "sign-2: signature has a non-empty protected header");
+    assertTrue(typeof sigs[0].signature === "string" && sigs[0].signature.length > 0, "sign-3: signature has a non-empty signature value");
+
+    const protectedHeader = JSON.parse(Buffer.from(sigs[0].protected, "base64url").toString("utf8"));
+    assertEq(protectedHeader.alg, "EdDSA", "sign-4: protected header alg is EdDSA");
+    assertEq(protectedHeader.kid, SIGNING_KEY_ID, "sign-5: protected header kid matches SIGNING_KEY_ID");
+    assertEq(SIGNING_KEY_ID, "lokal-a2a-2026", "sign-6: SIGNING_KEY_ID is the shared platform key id");
+
+    // Reconstruct the JWS signing input exactly as the implementation does,
+    // then verify it independently with crypto.verify().
+    const payloadB64 = Buffer.from(canonicalizeJCS(testCard), "utf8").toString("base64url");
+    const signingInput = Buffer.from(`${sigs[0].protected}.${payloadB64}`, "ascii");
+    const signatureBuf = Buffer.from(sigs[0].signature, "base64url");
+    assertTrue(nodeCrypto.verify(null, signingInput, genPub, signatureBuf),
+      "sign-7: crypto.verify() confirms the signature over the reconstructed signing input");
+
+    // Negative test (acceptance criterion 2): mutate one character of the
+    // canonicalized payload before verifying -- MUST fail.
+    const tamperedPayloadB64 = payloadB64.slice(0, -1) + (payloadB64.slice(-1) === "A" ? "B" : "A");
+    const tamperedSigningInput = Buffer.from(`${sigs[0].protected}.${tamperedPayloadB64}`, "ascii");
+    assertTrue(!nodeCrypto.verify(null, tamperedSigningInput, genPub, signatureBuf),
+      "sign-8: crypto.verify() FAILS against a tampered payload (negative test)");
+
+    // ── getJWKS() shape ─────────────────────────────────────────────────
+    const jwks = getJWKS();
+    assertEq(jwks.keys.length, 1, "jwks-1: getJWKS() returns exactly one key when a signing key is configured");
+    const jwk = jwks.keys[0];
+    assertEq(jwk.kty, "OKP", "jwks-2: kty is OKP");
+    assertEq(jwk.crv, "Ed25519", "jwks-3: crv is Ed25519");
+    assertEq(jwk.kid, SIGNING_KEY_ID, "jwks-4: kid matches SIGNING_KEY_ID");
+    assertEq(jwk.use, "sig", "jwks-5: use is sig");
+    assertEq(jwk.alg, "EdDSA", "jwks-6: alg is EdDSA");
+    const expectedX = (genPub.export({ format: "jwk" }) as any).x;
+    assertEq(jwk.x, expectedX, "jwks-7: x matches the configured public key's JWK x-coordinate");
+
+    // ── route wiring sanity check (default test env: no signing key) ───
+    // Restore the no-key fallback before exercising the routers, so this
+    // mirrors the real deployed-without-secret state.
+    delete process.env.A2A_SIGNING_PRIVATE_KEY;
+    __resetSigningKeyForTesting();
+
+    function invokeRouterGet(router: any, path: string): { status: number; body: string } {
+      const layer = (router.stack as any[]).find(
+        (l: any) => l.route && l.route.path === path && l.route.methods?.get
+      );
+      assertTrue(!!layer, `wiring: router has a GET ${path} layer`);
+      let status = 200;
+      let body = "";
+      const res: any = {
+        statusCode: 200,
+        header: () => res,
+        setHeader: () => {},
+        status: (c: number) => { status = c; return res; },
+        json: (o: unknown) => { body = JSON.stringify(o); return res; },
+        send: (b: unknown) => { body = typeof b === "string" ? b : String(b); return res; },
+      };
+      const req: any = { path, hostname: "test", query: {} };
+      const handler = layer.route.stack[layer.route.stack.length - 1].handle;
+      handler(req, res, () => {});
+      return { status, body };
+    }
+
+    const rfbRouter = (require("../src/routes/a2a") as any).default;
+    const dentalSeoRouter = (require("../src/routes/dental-seo") as any).default;
+    const expSeoRouter = (require("../src/routes/experiences-seo") as any).default;
+
+    for (const [label, router] of [["rfb", rfbRouter], ["dental", dentalSeoRouter], ["experiences", expSeoRouter]] as const) {
+      const jwksResp = invokeRouterGet(router, "/.well-known/jwks.json");
+      assertEq(jwksResp.status, 200, `wiring-${label}-1: GET /.well-known/jwks.json is 200`);
+      const parsedJwks = JSON.parse(jwksResp.body);
+      assertTrue(Array.isArray(parsedJwks.keys) && parsedJwks.keys.length === 0,
+        `wiring-${label}-2: GET /.well-known/jwks.json returns {keys:[]} with no signing key configured`);
+    }
+
+    const rfbAgentCardResp = invokeRouterGet(rfbRouter, "/a2a");
+    const rfbAgentCard = JSON.parse(rfbAgentCardResp.body);
+    assertTrue(!("signatures" in rfbAgentCard), "wiring-rfb-3: GET /a2a card has no `signatures` key with no signing key configured");
+
+    const rfbWellKnownResp = invokeRouterGet(rfbRouter, "/.well-known/agent-card.json");
+    const rfbWellKnownCard = JSON.parse(rfbWellKnownResp.body);
+    assertTrue(!("signatures" in rfbWellKnownCard), "wiring-rfb-4: GET /.well-known/agent-card.json card has no `signatures` key with no signing key configured");
+
+    const dentalCardNoKey: any = getDentalAgentCard();
+    assertTrue(!("signatures" in dentalCardNoKey), "wiring-dental-3: getDentalAgentCard() has no `signatures` key with no signing key configured");
+
+    const expCardNoKey: any = getExperiencesAgentCard();
+    assertTrue(!("signatures" in expCardNoKey), "wiring-experiences-3: getExperiencesAgentCard() has no `signatures` key with no signing key configured");
+
+    console.log("  a2a-card-v1-signing slice 2 (JWS card signing + JWKS): OK (42 assertions)");
+  } catch (err) {
+    failed++;
+    failures.push(`a2a-card-v1-signing slice 2: unexpected error: ${err instanceof Error ? (err.stack || err.message) : String(err)}`);
+  } finally {
+    if (prevKeyEnv === undefined) delete process.env.A2A_SIGNING_PRIVATE_KEY;
+    else process.env.A2A_SIGNING_PRIVATE_KEY = prevKeyEnv;
+    __resetSigningKeyForTesting();
+  }
+})();
+
 // ─── gardssalg booking slice 2: pre-visit e-post-svarsløyfe
 //     (dev-request 2026-07-14-booking-flyt-v1, slice 2) ──────────────────────
 // The PRE-visit request→answer loop, parallel to (and never touching) the

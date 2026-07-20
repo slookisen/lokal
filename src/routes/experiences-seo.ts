@@ -26,6 +26,7 @@
 import express, { Router, Request, Response, NextFunction } from "express";
 import * as QRCode from "qrcode";
 import { getExperiencesAgentCard, OPPLEVAGENT_CUSTOM_GPT_URL } from "../services/experiences-agent-card";
+import { getJWKS } from "../services/agent-card-signing";
 import { getExperiencesOpenapi } from "../services/experiences-openapi";
 import { isDisplayablePhone } from "../services/contact-normalizer";
 import { isJunkDescription } from "../services/description-quality";
@@ -1233,6 +1234,16 @@ router.get("/.well-known/agent-card.json", (_req: Request, res: Response) => {
   res.header("Access-Control-Allow-Origin", "*");
   res.header("Cache-Control", "public, max-age=300");
   res.json(getExperiencesAgentCard());
+});
+
+// GET /.well-known/jwks.json — JWKS for verifying A2A agent-card signatures
+// (dev-request 2026-07-13-a2a-card-v1-signing slice 2). Same key across all
+// three verticals (one Fly app serves all of them).
+router.get("/.well-known/jwks.json", (_req: Request, res: Response) => {
+  res.header("Content-Type", "application/json; charset=utf-8");
+  res.header("Access-Control-Allow-Origin", "*");
+  res.header("Cache-Control", "public, max-age=300");
+  res.json(getJWKS());
 });
 
 // GET /agent-card.json — alias (some crawlers skip the well-known prefix)

@@ -10,6 +10,7 @@ import { redactPII } from "../utils/pii-redact";
 import { getDb } from "../database/init";
 import { isDisplayablePhone } from "../services/contact-normalizer";
 import { isJunkDescription } from "../services/description-quality";
+import { signAgentCard, getJWKS } from "../services/agent-card-signing";
 
 // ─── A2A Routes ──────────────────────────────────────────────
 // Two protocols served here:
@@ -113,6 +114,11 @@ router.get("/a2a", (_req: Request, res: Response) => {
       ],
       "x-lokal": { type: "registry", region: "Norway", stats: { totalAgents: agents.length, cities: cities.slice(0, 30) } },
     };
+    // JWS card signing (dev-request 2026-07-13-a2a-card-v1-signing slice 2) —
+    // sign the card exactly as assembled above (no `signatures` key present
+    // yet), then attach only if a signing key is actually configured.
+    const signatures = signAgentCard(card);
+    if (signatures.length > 0) (card as any).signatures = signatures;
     res.json(card);
   } catch (err: any) {
     res.status(500).json({ error: "Failed to generate agent card", detail: err.message });
@@ -481,6 +487,13 @@ function serveAgentCard(_req: Request, res: Response) {
     },
   };
 
+  // JWS card signing (dev-request 2026-07-13-a2a-card-v1-signing slice 2) —
+  // this card is NOT byte-identical to the inline GET /a2a card above (it has
+  // extra producers/endpoints fields), so it gets its own signature computed
+  // over its own exact content.
+  const signatures = signAgentCard(card);
+  if (signatures.length > 0) (card as any).signatures = signatures;
+
   // A2A spec recommends caching headers: Cache-Control + ETag
   const etag = `"v1-${Date.now().toString(36)}"`;
   res.header("Cache-Control", "public, max-age=3600");
@@ -490,6 +503,13 @@ function serveAgentCard(_req: Request, res: Response) {
 
 router.get("/.well-known/agent-card.json", serveAgentCard); // A2A spec v1.0.0
 router.get("/.well-known/agent.json", serveAgentCard);       // Legacy compat
+
+// GET /.well-known/jwks.json — JWKS for verifying A2A agent-card signatures
+// (dev-request 2026-07-13-a2a-card-v1-signing slice 2). Same key across all
+// three verticals (one Fly app serves all of them).
+router.get("/.well-known/jwks.json", (_req: Request, res: Response) => {
+  res.json(getJWKS());
+});
 
 // GET /agents/:id/agent.json — Individual producer Agent Card (enriched with knowledge)
 router.get("/agents/:id/agent.json", (req: Request, res: Response) => {
