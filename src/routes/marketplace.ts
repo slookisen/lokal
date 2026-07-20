@@ -20,6 +20,7 @@ import { getDb as getVerticalDb } from "../database/db-factory";
 import { findOrgnumberByName } from "../services/brreg-client";
 import { isDisplayablePhone } from "../services/contact-normalizer";
 import { isJunkDescription } from "../services/description-quality";
+import { isJunkEmail } from "../services/gardssalg-rfb-enrich";
 
 // ── PR-29 v3: pure helper for Place Details (New) request params ──────────────
 // Exported so tests can assert the URL structure without touching the handler.
@@ -4781,6 +4782,13 @@ router.get("/bm-events", (req: Request, res: Response) => {
 //     is still empty but who have a homepage — the pipeline's own-domain
 //     email extraction can then backfill them into the outreach pool
 //     (dev-request 2026-07-12-rfb-enrichment-pool-refill-and-waste-reduction).
+//   - select: "low_quality" targets agents ranked worst-first by
+//     agents.trust_score + field-level junk/thinness signals (junk email,
+//     junk description, empty about/products) — re-enriches already-"rich"
+//     but actually-bad profiles from their own homepage, and recomputes
+//     trust_score after a successful ('enriched') outcome
+//     (dev-request 2026-07-13-enrichment-tynne-profiler-trust-score, items
+//     1 + 3 — see the branch below for the full rationale).
 //     Any other non-absent select value is rejected with 400.
 //   - else auto-select: TIER-1 agents with a website, some enrichment, but
 //     field_provenance empty/{} OR lacking a 2nd source for address/phone,
@@ -4855,12 +4863,16 @@ router.post("/admin/homepage-provenance-batch", async (req: Request, res: Respon
       .filter((id): id is string => typeof id === "string" && id.trim().length > 0)
       .map((id) => id.trim())
       .slice(0, limit);
-  } else if (selectRaw !== undefined && selectRaw !== "verified_no_email") {
+  } else if (
+    selectRaw !== undefined &&
+    selectRaw !== "verified_no_email" &&
+    selectRaw !== "low_quality"
+  ) {
     // An admin endpoint driven by autonomous routines must not silently run
     // the wrong cohort on a typo'd select value — reject instead of falling
     // through to the default auto-select (PR #248 review finding).
     res.status(400).json({
-      error: `Ukjent select-verdi: ${String(selectRaw)}. Gyldige: "verified_no_email" (eller utelat feltet for standard auto-select).`,
+      error: `Ukjent select-verdi: ${String(selectRaw)}. Gyldige: "verified_no_email", "low_quality" (eller utelat feltet for standard auto-select).`,
     });
     return;
   } else if (selectRaw === "verified_no_email") {
@@ -4889,6 +4901,114 @@ router.post("/admin/homepage-provenance-batch", async (req: Request, res: Respon
       .all(limit) as Array<{ agent_id: string; homepage_url: string | null }>;
     targetIds = rows
       .filter((r) => r.homepage_url && r.homepage_url.trim())
+      .map((r) => r.agent_id);
+  } else if (selectRaw === "low_quality") {
+    // dev-request 2026-07-13-enrichment-tynne-profiler-trust-score (item 1 +
+    // 3 of that spec; items 2/4/5 are separate slices — see this handler's
+    // module doc comment / PR description for the exact scope split):
+    // opt-in cohort that targets agents that are ALREADY past the default
+    // auto-select's "lacks a homepage Tier-A source" gate but whose data is
+    // actually bad — Daniel: "du kan bruke blant annet trust score til å
+    // finne profiler som er dårlige. bruk hjemmeside som source." Ranked
+    // worst-first by a composite of agents.trust_score (dominant term),
+    // field-level junk signals (placeholder/invalid email via isJunkEmail,
+    // boilerplate/nav-junk description via isJunkDescription), and thinness
+    // (agent_knowledge.about / .products still empty). Deliberately does NOT
+    // require field_provenance to lack a "homepage" source — a "rich"-
+    // looking-but-bad agent that already HAS a stale/junk homepage source is
+    // exactly this cohort's target, so that restriction would exclude the
+    // agents this mode exists to re-select. Keeps the SAME no_yield/
+    // wrong_entity backoff + dead-homepage parking as the default auto-select
+    // (still the correct "don't reselect a hopeless agent" guard for this
+    // cohort too) and the umbrella exclusion (existing file-wide safety
+    // invariant — the default auto-select above doesn't need one because
+    // umbrella agents never carry the pre-verification verification_status
+    // values it gates on, but this mode has no such incidental protection so
+    // it is stated explicitly).
+    const LOW_QUALITY_TRUST_THRESHOLD = 0.5; // mirrors the dev-request's own "<~0.5 = candidate" framing
+    // Bound the SQL fetch to the worst-trust-score rows before doing the
+    // junk/thinness re-rank in JS (isJunkEmail/isJunkDescription aren't SQL-
+    // expressible) — an indexed-adjacent ORDER BY + LIMIT scan rather than a
+    // full-table JS sort over the whole low-trust-score cohort.
+    const LOW_QUALITY_CANDIDATE_CAP = 1000;
+    const candidates = db
+      .prepare(
+        `SELECT k.agent_id AS agent_id,
+                COALESCE(k.website, a.url) AS homepage_url,
+                a.trust_score AS trust_score,
+                a.description AS description,
+                a.contact_email AS contact_email,
+                k.email AS knowledge_email,
+                k.about AS about,
+                k.products AS products,
+                k.last_enrichment_attempt_at AS last_enrichment_attempt_at
+           FROM agent_knowledge k
+           JOIN agents a ON a.id = k.agent_id
+          WHERE a.umbrella_type IS NULL
+            AND a.trust_score < ?
+            AND (k.website IS NOT NULL AND k.website != '' OR a.url IS NOT NULL AND a.url != '')
+            ${parkingExclusion}
+            ${backoffExclusion}
+          ORDER BY a.trust_score ASC
+          LIMIT ?`
+      )
+      .all(LOW_QUALITY_TRUST_THRESHOLD, LOW_QUALITY_CANDIDATE_CAP) as Array<{
+      agent_id: string;
+      homepage_url: string | null;
+      trust_score: number;
+      description: string | null;
+      contact_email: string | null;
+      knowledge_email: string | null;
+      about: string | null;
+      products: string | null;
+      last_enrichment_attempt_at: string | null;
+    }>;
+
+    // Thinness: the two "core" enrichable agent_knowledge fields (about text,
+    // products list) are still empty — the literal "tynne profiler" (thin
+    // profiles) reading from the dev-request title.
+    const isThinKnowledge = (about: string | null, productsJson: string | null): boolean => {
+      const aboutEmpty = !about || !about.trim();
+      let productsEmpty = true;
+      try {
+        const arr = JSON.parse(productsJson || "[]");
+        productsEmpty = !Array.isArray(arr) || arr.length === 0;
+      } catch {
+        productsEmpty = true;
+      }
+      return aboutEmpty || productsEmpty;
+    };
+
+    targetIds = candidates
+      .filter((r) => r.homepage_url && r.homepage_url.trim())
+      .map((r) => {
+        const emailForJunkCheck =
+          r.knowledge_email && r.knowledge_email.trim() ? r.knowledge_email : r.contact_email;
+        const junkSignalCount =
+          (isJunkEmail(emailForJunkCheck) ? 1 : 0) +
+          (isJunkDescription(r.description) ? 1 : 0) +
+          (isThinKnowledge(r.about, r.products) ? 1 : 0);
+        return { ...r, junkSignalCount };
+      })
+      .sort((a, b) => {
+        // Primary: worst (lowest) trust_score first — the dominant term.
+        if (a.trust_score !== b.trust_score) return a.trust_score - b.trust_score;
+        // Tie-break 1: more junk/thinness signals first (worse profile).
+        if (a.junkSignalCount !== b.junkSignalCount) return b.junkSignalCount - a.junkSignalCount;
+        // Tie-break 2: same rotation-fairness idiom as the default auto-
+        // select below — never-attempted (NULL) first, then oldest attempt
+        // first — so this cohort rotates through its full membership too,
+        // not just its worst-scoring head, once no_yield/wrong_entity outcomes
+        // start accumulating on the same agents.
+        const aAt = a.last_enrichment_attempt_at;
+        const bAt = b.last_enrichment_attempt_at;
+        if (aAt === null || bAt === null) {
+          if (aAt === bAt) return 0;
+          return aAt === null ? -1 : 1;
+        }
+        return aAt < bAt ? -1 : aAt > bAt ? 1 : 0;
+      })
+      .slice(0, limit)
       .map((r) => r.agent_id);
   } else {
     // Auto-select: agents with a website, some enrichment data, but
@@ -4931,6 +5051,12 @@ router.post("/admin/homepage-provenance-batch", async (req: Request, res: Respon
       .filter((r) => r.homepage_url && r.homepage_url.trim())
       .map((r) => r.agent_id);
   }
+
+  // dev-request 2026-07-13-enrichment-tynne-profiler-trust-score (item 3):
+  // gates the post-write trust_score recompute below to the low_quality mode
+  // only — every other select path already gets its trust_score refreshed on
+  // the next periodic recalculateAll() sweep, same as today.
+  const isLowQualityMode = selectRaw === "low_quality";
 
   // ── Norwegian contact-field extractors ───────────────────────────────────
 
@@ -5330,6 +5456,30 @@ router.post("/admin/homepage-provenance-batch", async (req: Request, res: Respon
     for (const result of settled) {
       if (result.status === "fulfilled") {
         outcomes.push(result.value);
+        // dev-request 2026-07-13-enrichment-tynne-profiler-trust-score
+        // (item 3): after a successful low_quality re-enrichment, recompute
+        // and persist trust_score immediately — same
+        // recalculate-then-persist single-agent call as every other
+        // trustScoreService.update() site in this file — so the improvement
+        // is visible right away (not just on the next periodic
+        // recalculateAll() sweep) and the low_quality selector (which ranks
+        // worst-trust_score-first) doesn't keep reselecting the same agent
+        // forever once its data has genuinely improved.
+        if (isLowQualityMode && result.value.status === "enriched") {
+          // Never let a trust-score recompute failure (e.g. a transient
+          // SQLite busy/locked error) reject this handler's promise —
+          // Express 5 auto-forwards an uncaught rejection to the default
+          // error handler, which would 500 the whole batch and silently
+          // abandon every remaining CONCURRENCY-slice after this one.
+          try {
+            trustScoreService.update(result.value.agentId);
+          } catch (e: any) {
+            console.error(
+              `[homepage-provenance-batch:low_quality] trust_score update failed (non-critical) for ${result.value.agentId}:`,
+              e?.message ?? String(e),
+            );
+          }
+        }
       } else {
         // Should not happen (processAgent catches internally), but guard anyway.
         outcomes.push({

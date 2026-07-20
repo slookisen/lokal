@@ -22611,6 +22611,7 @@ console.log("\n── orch-pr-14: MCP discovery product_id surfacing ──");
   try { await _emailOwnershipProvenancePromise; } catch { /* errors already pushed to failures */ }
   try { await _pilotOrdreLoopPromise; } catch { /* errors already pushed to failures */ }
   try { await _expNoYieldBackoffPromise; } catch { /* errors already pushed to failures */ }
+  try { await _lowQualitySelectorPromise; } catch { /* errors already pushed to failures */ }
   // relax-envelope tests are synchronous (pure validateEnvelope() unit test) — no promise needed
   // PR-109 tests are synchronous (IIFE) — no promise needed
   // Drop pre-existing intg failures (unmasked by awaiting) — they predate M2
@@ -29273,6 +29274,45 @@ const _expNoYieldBackoffPromise: Promise<void> = new Promise<void>(r => {
     failures.push("content-refresh-no-yield-backoff: unexpected error: " + String(err?.message || err));
   } finally {
     _expNoYieldBackoffResolve();
+  }
+})();
+
+// ═══════════════════════════════════════════════════════════════════════
+// dev-request 2026-07-13-enrichment-tynne-profiler-trust-score (items 1 + 3):
+// `select: "low_quality"` opt-in cohort on POST /admin/homepage-provenance-batch
+// (src/routes/marketplace.ts) — ranks agents worst-first by agents.trust_score
+// + field-level junk/thinness signals, relaxes the default auto-select's
+// "lacks homepage provenance" gate, reuses the existing no_yield/wrong_entity
+// backoff + dead-homepage parking as-is, and recomputes trust_score
+// immediately after a successful low_quality re-enrichment. Also covers the
+// matching low_quality_cohort breakdown on GET /admin/outreach-ready-pool/stats.
+// Swaps the shared getDb() singleton (own dedicated test file, in-memory
+// prod-schema DB) — mirrors the experiences-content-refresh-no-yield-backoff
+// block immediately above, so it must run strictly after it;
+// _expNoYieldBackoffPromise is the current tail of that serial chain.
+let _lowQualitySelectorResolve: () => void = () => {};
+const _lowQualitySelectorPromise: Promise<void> = new Promise<void>(r => {
+  _lowQualitySelectorResolve = r;
+});
+
+(async () => {
+  await Promise.allSettled([_expNoYieldBackoffPromise]);
+  await new Promise(r => setImmediate(r));
+
+  console.log("\n── dev-request 2026-07-13: low_quality re-enrichment selector + trust-score refresh ──");
+  try {
+    const { runHomepageProvenanceLowQualitySelectorTests } = require("../src/routes/homepage-provenance-low-quality-selector.test") as
+      typeof import("../src/routes/homepage-provenance-low-quality-selector.test");
+    const lq = await runHomepageProvenanceLowQualitySelectorTests({ log: false });
+    passed += lq.passed;
+    failed += lq.failed;
+    for (const f of lq.failures) failures.push("low-quality-selector: " + f);
+    console.log(`  low-quality-selector: ${lq.passed} passed, ${lq.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("low-quality-selector: unexpected error: " + String(err?.message || err));
+  } finally {
+    _lowQualitySelectorResolve();
   }
 })();
 
