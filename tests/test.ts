@@ -652,6 +652,20 @@ console.log("\n── experiences-seo-place-geo (buildSortToggleUrl basePath) �
   console.log(`  experiences-seo-place-geo: ${r.passed} passed, ${r.failed} failed`);
 }
 
+// dev-request 2026-07-12-opplevagent-serp-innholdsberikelse, item 2: seoPageTitle()
+// must never emit a "…" ellipsis inside <title> — clean word-boundary
+// truncation instead, still <=70 chars total (main + " | Opplevagent").
+console.log("\n── experiences-seo-title (seoPageTitle clean truncation) ──");
+{
+  const { runExperiencesSeoTitleTests } = require("../src/routes/experiences-seo-title.test") as
+    typeof import("../src/routes/experiences-seo-title.test");
+  const r = runExperiencesSeoTitleTests({ log: false });
+  passed += r.passed;
+  failed += r.failed;
+  for (const f of r.failures) failures.push("experiences-seo-title: " + f);
+  console.log(`  experiences-seo-title: ${r.passed} passed, ${r.failed} failed`);
+}
+
 // ── orchestrator-pr-13: conservative address/phone contact-normalizer ──
 // Pins the formatting-only relaxation in cross-source-validator (clears
 // formatting-only review_required) while keeping genuine conflicts gated.
