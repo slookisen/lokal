@@ -419,6 +419,86 @@ export function runSearchEnrichTests(opts: { log?: boolean } = {}): TestSummary 
     assertTrue(prose.includes("Poteter fra egen åker"), "extractProseText: genuine low-link-density product <ul> is kept, not treated as a nav menu");
   }
 
+  // ── review finding 1 — false-positive on a realistic "shop our products"
+  // <ul> where EACH <li> wraps its full descriptive sentence in a single <a>
+  // linking to a detail page: 3 anchors + ~100% of the block's text inside
+  // them trips the old anchors>=3 + ratio>=0.6 nav-menu thresholds, but the
+  // anchor text is full sentences, not short nav labels — must survive.
+  {
+    const html =
+      "<ul><li><a href='/potet'>Poteter fra egen åker, høstet i går</a></li>" +
+      "<li><a href='/gulrot'>gulrøtter i sesong fra hagen</a></li>" +
+      "<li><a href='/rodbet'>Rødbeter dyrket økologisk her hjemme</a></li></ul>";
+    const prose = extractProseText(html);
+    assertTrue(prose.includes("Poteter fra egen åker"), "extractProseText: product-<ul> with per-item detail-page <a> sentences survives (finding 1)");
+    assertTrue(prose.includes("gulrøtter i sesong"), "extractProseText: product-<ul> second item survives (finding 1)");
+    assertTrue(prose.includes("Rødbeter dyrket økologisk"), "extractProseText: product-<ul> third item survives (finding 1)");
+  }
+  // Contrast: genuine short-label nav <ul>s (the shape isHighLinkDensityBlock
+  // exists to catch) must still be excluded after the finding-1 fix.
+  {
+    const html =
+      "<p>Vi er en liten gård.</p>" +
+      "<ul><li><a href='/'>Hjem</a></li><li><a href='/om'>Om oss</a></li>" +
+      "<li><a href='/kontakt'>Kontakt oss</a></li><li><a href='/tider'>Åpningstider</a></li></ul>";
+    const prose = extractProseText(html);
+    for (const junk of ["Hjem", "Om oss", "Kontakt oss", "Åpningstider"]) {
+      assertTrue(!prose.includes(junk), `extractProseText: short-label nav <ul> item '${junk}' still excluded after finding-1 fix`);
+    }
+    assertTrue(prose.includes("liten gård"), "extractProseText: real sentence around short-label nav <ul> still survives");
+  }
+
+  // ── review finding 2 — hyphenated custom elements (<header-widget>,
+  // <nav-carousel>) must NOT be mistaken for <header>/<nav> and stripped; the
+  // old trailing `\b` treats `-` as a non-word-boundary, so it matched into
+  // the custom element name and silently dropped its real content.
+  {
+    const html =
+      "<header-widget class='x'>Dette er faktisk ekte produktinnhold fra gården vår.</header-widget>" +
+      "<p>Ekte setning nummer to om gårdens historie.</p>";
+    const prose = extractProseText(html);
+    assertTrue(prose.includes("ekte produktinnhold"), "extractProseText: <header-widget> custom element content survives (finding 2)");
+    assertTrue(prose.includes("Ekte setning nummer to"), "extractProseText: sibling paragraph after <header-widget> survives (finding 2)");
+  }
+  {
+    const html =
+      "<nav-carousel>Ekte innhold i en nav-carousel, ikke en faktisk meny.</nav-carousel>" +
+      "<p>En annen ekte setning her.</p>";
+    const prose = extractProseText(html);
+    assertTrue(prose.includes("Ekte innhold i en nav-carousel"), "extractProseText: <nav-carousel> custom element content survives (finding 2)");
+  }
+  // A real <nav> (no hyphen) must still be excluded — the fix must not
+  // over-correct and stop matching plain semantic tags.
+  {
+    const html = "<nav><a href='/'>Hjem</a></nav><p>Gården vår selger egg og honning.</p>";
+    const prose = extractProseText(html);
+    assertTrue(!prose.includes("Hjem"), "extractProseText: plain <nav> (no hyphen) still excluded after finding-2 fix");
+    assertTrue(prose.includes("egg og honning"), "extractProseText: prose after plain <nav> still survives after finding-2 fix");
+  }
+
+  // ── review finding 3 — perf safety cap: a pathological block with many
+  // thousands of unclosed <a> tags inside a <ul> must not blow up processing
+  // time (the anchor-counting regex's backtracking search for `</a>` is
+  // quadratic in unclosed-anchor count without a size cap). Not a timing
+  // assertion (this suite doesn't do those) — just confirms the capped input
+  // is handled at all and real content around it still survives.
+  {
+    const manyUnclosedAnchors = "<ul>" + "<a href='/x'>x".repeat(20_000) + "</ul>";
+    const html = `<p>Ekte innledende setning.</p>${manyUnclosedAnchors}<p>Ekte avsluttende setning.</p>`;
+    const prose = extractProseText(html);
+    assertTrue(prose.includes("Ekte innledende setning"), "extractProseText: pathological unclosed-<a> block — leading prose survives (finding 3)");
+    assertTrue(prose.length <= 20000, "extractProseText: pathological unclosed-<a> block — still respects the ~20k output cap (finding 3)");
+  }
+
+  // ── (low-priority) documents the intentional "unclosed <nav> swallows to
+  // end of string" tradeoff called out in stripBlocksByTagNames' doc comment,
+  // so it's visible/pinned rather than incidental.
+  {
+    const html = "<nav><a href='/'>Hjem</a><p>Ekte setning som aldri skal overleve, siden nav aldri lukkes.</p>";
+    const prose = extractProseText(html);
+    assertEq(prose, "", "extractProseText: unclosed <nav> conservatively swallows everything to end-of-string (documented tradeoff)");
+  }
+
   // Empty/no-html edge case — same empty-string contract as extractVisibleText.
   assertEq(extractProseText(""), "", "extractProseText: empty in → empty out");
   assertEq(extractProseText(null as unknown as string), "", "extractProseText: null-ish in → empty out");

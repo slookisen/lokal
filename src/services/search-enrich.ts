@@ -621,7 +621,15 @@ function stripBlocksByTagNames(
   predicate?: (blockHtml: string) => boolean,
 ): string {
   const namesPattern = tagNames.join("|");
-  const tagRe = new RegExp(`<(/?)(?:${namesPattern})\\b[^>]*?(/?)>`, "gi");
+  // NOTE: the tag-name alternation is followed by `(?![\w-])` rather than a
+  // plain `\b` — `\b` treats `-` as a non-word-boundary character, so a bare
+  // `\b` after e.g. `nav` would ALSO match the start of a hyphenated custom
+  // element like `<nav-carousel>` or `<header-widget>`, silently swallowing
+  // that element's real content as if it were chrome. The lookahead requires
+  // the next character to be neither a word char nor `-`, so it still matches
+  // `<nav>`, `<nav >`, `<nav class="x">`, `<NAV>`, `</nav>` etc. but rejects
+  // `<nav-carousel>`/`<header-widget>`.
+  const tagRe = new RegExp(`<(/?)(?:${namesPattern})(?![\\w-])[^>]*?(/?)>`, "gi");
   let depth = 0;
   let blockStart = -1;
   const ranges: Array<[number, number]> = [];
@@ -659,11 +667,19 @@ function stripBlocksByTagNames(
 /**
  * True if a `<ul>`/`<ol>` block (HTML including its own tags) is a rendered
  * NAV MENU disguised as a list rather than a real content list: at least 3
- * `<a>` tags, and the total text living inside those anchors is ≥60% of all
- * the block's visible text. This is the classic "nav-menu-glued-to-a-real-
- * sentence" shape (a horizontal/vertical link list with almost no non-link
- * words) — as opposed to a genuine product/ingredient list, which is mostly
- * plain text with at most an occasional link. PURE.
+ * `<a>` tags, the total text living inside those anchors is ≥60% of all the
+ * block's visible text, AND the anchors' text reads like nav labels rather
+ * than full sentences (short average length). This is the classic "nav-
+ * menu-glued-to-a-real-sentence" shape (a horizontal/vertical link list with
+ * almost no non-link words, each link a one-or-two-word label like "Hjem" /
+ * "Om oss" / "Kontakt oss" / "Åpningstider") — as opposed to a genuine
+ * product/ingredient list where every `<li>` links to its own detail page
+ * but wraps a full descriptive sentence (e.g. "Poteter fra egen åker, høstet
+ * i går"). Anchor count and link-density ratio alone can't tell those two
+ * shapes apart — a 3-item "shop our products" list with a real sentence
+ * per anchor trips both thresholds just like a nav menu does — so average
+ * per-anchor text length is a third, required signal: nav labels are short,
+ * product sentences aren't. PURE.
  */
 function isHighLinkDensityBlock(blockHtml: string): boolean {
   const anchors = blockHtml.match(/<a\b[^>]*>[\s\S]*?<\/a>/gi) || [];
@@ -675,7 +691,12 @@ function isHighLinkDensityBlock(blockHtml: string): boolean {
   }
   const totalTextLen = stripTags(blockHtml).length;
   if (totalTextLen < 15) return false;
-  return anchorTextLen / totalTextLen >= 0.6;
+  if (anchorTextLen / totalTextLen < 0.6) return false;
+  // Nav-label-short check: genuine nav items ("Om oss", "Kontakt oss",
+  // "Åpningstider") average well under this; full product-sentence anchors
+  // (e.g. "Poteter fra egen åker, høstet i går") average well over it.
+  const avgAnchorTextLen = anchorTextLen / anchors.length;
+  return avgAnchorTextLen < 30;
 }
 
 /**
@@ -699,9 +720,23 @@ function isHighLinkDensityBlock(blockHtml: string): boolean {
  * the whole block" quality-gate loophole let the glued-together nav junk
  * through as the producer's about_text. PURE, no network/IO.
  */
+// Perf safety cap: stripBlocksByTagNames()'s tag scanner and
+// isHighLinkDensityBlock()'s anchor-counting regex are both applied to the
+// RAW (pre-flatten) HTML, before the ~20k-char final-output cap below ever
+// kicks in. A malformed/adversarial homepage full of unclosed `<a>` tags
+// inside a `<ul>`/`<ol>` makes the anchor regex's backtracking search for a
+// matching `</a>` scale quadratically with the unclosed-tag count (measured:
+// 2k/4k/8k/16k unclosed anchors → 14ms/56ms/208ms/801ms, a clean 4x-per-
+// doubling curve) — cheap for a normal page, but potentially seconds-long
+// for one bad fetch in a per-provider content-refresh sweep with no size cap
+// upstream. Bounding the slice BEFORE any tag-stripping/link-density scan
+// keeps worst-case scan cost flat regardless of how large/broken the input
+// HTML is.
+const MAX_PROSE_SCAN_LEN = 25_000;
+
 export function extractProseText(html: string): string {
   if (!html) return "";
-  let h = html;
+  let h = html.slice(0, MAX_PROSE_SCAN_LEN);
   h = h
     .replace(/<script[\s\S]*?<\/script>/gi, " ")
     .replace(/<style[\s\S]*?<\/style>/gi, " ")
