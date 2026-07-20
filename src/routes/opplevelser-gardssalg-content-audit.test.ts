@@ -660,6 +660,78 @@ export function runOpplevelserGardssalgContentAuditTests(
       } finally {
         globalThis.fetch = prevFetchK;
       }
+
+      // ── (l) duplicate-field guard (dev-request 2026-07-20-kvalitetsgate,
+      //       slice 1 — the Draopar incident): a source page with no distinct
+      //       "visit us" section can make summarizeAbout()/summarizeVisit()
+      //       independently land on the EXACT SAME extracted block —
+      //       reproduced here with the real production HTML shape (nav links
+      //       glued in front of one real sentence, where "sidersmaking"
+      //       false-matches summarizeVisit's bare-substring "smaking" keyword
+      //       scan). Before the fix, candidateAbout and candidateVisit in
+      //       POST /admin/gardssalg-content-refresh's processOne() were BOTH
+      //       set to this identical text, so about_text and visit_text ended
+      //       up byte-identical after write. Proves the fix: only about_text
+      //       gets written; visit_text stays blank rather than mirroring it. ──
+      const prevFetchL = globalThis.fetch;
+      try {
+        // Same shape as the real Draopar bug report: a flat run of nav-menu
+        // links (no sentence-ending punctuation of their own) glued directly
+        // in front of the page's one real sentence, all inside a single
+        // "sentence" chunk (extractVisibleText doesn't drop <nav>, and there
+        // is only one '.' in the whole page, at the very end) — so BOTH
+        // summarizeAbout()'s first-paragraph fallback AND summarizeVisit()'s
+        // keyword scan (matching "smaking" inside "sidersmaking") land on
+        // this exact same chunk.
+        const DRAOPAR_SHAPE_HTML =
+          '<html><body>' +
+          '<nav><a href="/">Heim</a> <a href="/salg">Salg og sidersmaking</a> ' +
+          '<a href="/om">Om sider</a> <a href="/kontakt">Kontakt</a> ' +
+          '<a href="/sortar">Sidersortar</a> <a href="/alkoholfritt">Alkoholfritt draopar</a></nav>' +
+          '<main><p>Draopar er dialekt for dråper.</p></main>' +
+          '</body></html>';
+        const DRAOPAR_SHAPE_TEXT =
+          "Heim Salg og sidersmaking Om sider Kontakt Sidersortar Alkoholfritt draopar Draopar er dialekt for dråper.";
+
+        insertProvider.run({
+          id: "prov-l-duplicate", navn: "Prov L Draopar Gard", hjemmeside: "https://prov-l-duplicate.example.no",
+          content_source: null, about_text: null, visit_text: null, opening_hours_text: null,
+        });
+
+        globalThis.fetch = (async (url: string | URL | Request) => {
+          const u = new URL(String(url));
+          if (u.hostname === "prov-l-duplicate.example.no" && (u.pathname === "/" || u.pathname === "")) {
+            return { ok: true, status: 200, text: async () => DRAOPAR_SHAPE_HTML } as unknown as Response;
+          }
+          // Every gårdssalg sub-page candidate (om-oss, besok, smaking, ...)
+          // 404s — this producer's real site is exactly one page, same as
+          // the actual Draopar homepage.
+          return { ok: false, status: 404, text: async () => "" } as unknown as Response;
+        }) as typeof fetch;
+
+        const applyL = await callRoute(opplevelserRouter, {
+          url: "/admin/gardssalg-content-refresh",
+          headers: { "x-admin-key": testKey },
+          body: { providerIds: ["prov-l-duplicate"], apply: true },
+        });
+        assertEq(applyL.status, 200, "l1: apply gardssalg-content-refresh -> 200");
+
+        const rowL = getProviderRow("prov-l-duplicate");
+        assertEq(rowL.about_text, DRAOPAR_SHAPE_TEXT, "l2: about_text is written from the (only) derivable block");
+        assertEq(rowL.visit_text, null, "l3: visit_text stays blank/null — NOT a duplicate of about_text");
+        assertTrue(rowL.about_text !== rowL.visit_text, "l4: about_text and visit_text are never byte-identical (the Draopar regression itself)");
+
+        const entryL = applyL.body.changed.find((c: any) => c.provider_id === "prov-l-duplicate");
+        assertTrue(!!entryL, "l5: prov-l-duplicate appears in the apply response's changed[]");
+        assertTrue(entryL.fields.includes("about_text"), "l6: response fields[] includes about_text");
+        assertTrue(!entryL.fields.includes("visit_text"), "l7: response fields[] does NOT include visit_text (nothing written for it)");
+
+        const auditRowsL = getAuditRows("prov-l-duplicate");
+        assertTrue(auditRowsL.some((r: any) => r.field_name === "about_text"), "l8: an about_text audit row exists");
+        assertTrue(!auditRowsL.some((r: any) => r.field_name === "visit_text"), "l9: no visit_text audit row was created");
+      } finally {
+        globalThis.fetch = prevFetchL;
+      }
     } catch (err: any) {
       failed++;
       failures.push("opplevelser-gardssalg-content-audit: unexpected error: " + String(err?.stack || err?.message || err));
