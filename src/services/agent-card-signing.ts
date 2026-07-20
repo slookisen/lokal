@@ -86,6 +86,17 @@ function getSigningKeyPair(): { privateKey: KeyObject; publicKey: KeyObject } | 
 
   try {
     const privateKey = crypto.createPrivateKey({ key: pem, format: "pem" });
+    if (privateKey.asymmetricKeyType !== "ed25519") {
+      cachedKeyPair = null;
+      if (!warnedOnce) {
+        warnedOnce = true;
+        // Never log the key material itself — not even in an error message.
+        console.warn(
+          "agent-card-signing: A2A_SIGNING_PRIVATE_KEY is set but could not be parsed — agent cards will be served unsigned."
+        );
+      }
+      return cachedKeyPair;
+    }
     const publicKey = crypto.createPublicKey(privateKey);
     cachedKeyPair = { privateKey, publicKey };
   } catch {

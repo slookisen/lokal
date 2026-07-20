@@ -31034,6 +31034,19 @@ console.log("\n── item2a: dead-extraction parking (dental) ──");
     assertEq(signAgentCard({ name: "unsigned" }).length, 0, "sign-fallback-3: unparseable key -> signAgentCard() still returns [] (no throw)");
     assertEq(getJWKS().keys.length, 0, "sign-fallback-4: unparseable key -> getJWKS() still {keys:[]} (no throw)");
 
+    // A validly-formed but wrong key TYPE (e.g. EC, easily confused with
+    // Ed25519 in the "Curve25519 family") must also fail closed, never
+    // throw, and never silently sign under a mismatched alg. Regression
+    // test for: crypto.createPrivateKey() succeeds for ANY PKCS8 key type,
+    // not just Ed25519, so getSigningKeyPair() must explicitly reject
+    // non-ed25519 asymmetricKeyType.
+    const { privateKey: wrongTypePriv } = nodeCrypto.generateKeyPairSync("ec", { namedCurve: "prime256v1" });
+    const wrongTypePem = wrongTypePriv.export({ format: "pem", type: "pkcs8" }) as string;
+    process.env.A2A_SIGNING_PRIVATE_KEY = wrongTypePem;
+    __resetSigningKeyForTesting();
+    assertEq(signAgentCard({ name: "unsigned" }).length, 0, "sign-fallback-5: non-Ed25519 (EC) key -> signAgentCard() returns [] (no throw)");
+    assertEq(getJWKS().keys.length, 0, "sign-fallback-6: non-Ed25519 (EC) key -> getJWKS() still {keys:[]} (no throw)");
+
     // ── positive path: live-generated throwaway Ed25519 key ────────────
     const { privateKey: genPriv, publicKey: genPub } = nodeCrypto.generateKeyPairSync("ed25519");
     const pem = genPriv.export({ format: "pem", type: "pkcs8" }) as string;
@@ -31131,7 +31144,7 @@ console.log("\n── item2a: dead-extraction parking (dental) ──");
     const expCardNoKey: any = getExperiencesAgentCard();
     assertTrue(!("signatures" in expCardNoKey), "wiring-experiences-3: getExperiencesAgentCard() has no `signatures` key with no signing key configured");
 
-    console.log("  a2a-card-v1-signing slice 2 (JWS card signing + JWKS): OK (42 assertions)");
+    console.log("  a2a-card-v1-signing slice 2 (JWS card signing + JWKS): OK (44 assertions)");
   } catch (err) {
     failed++;
     failures.push(`a2a-card-v1-signing slice 2: unexpected error: ${err instanceof Error ? (err.stack || err.message) : String(err)}`);
