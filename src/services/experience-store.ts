@@ -2113,30 +2113,73 @@ const GARDSSALG_NAV_WORDLIST_PHRASES: readonly (readonly [string, string])[] = [
  * once, is never penalised — only a text carrying an actual CLUSTER of
  * different nav/menu labels is flagged.
  *
+ * Review round 2 (2026-07-20) found the sentence-boundary rule alone still
+ * false-positived on a punctuation-light "label: value" blurb shape (e.g.
+ * "Kontakt 900 12 345 Åpningstider mandag-fredag 10-17 …") — a bare numeric/
+ * time-range token or day name carries no sentence-ending punctuation, so
+ * the label word right after it looked mid-sentence-capitalized too. Fixed
+ * by also excluding a match whose immediately preceding raw token is
+ * value-like (gardssalgIsValueLikeRawToken) — a label followed by its own
+ * value is a normal short-blurb shape, not nav-item-adjacent-to-nav-item.
+ * Also extended the phrase matcher's sentence-initial exclusion to match the
+ * single-token rule (a heading like "Om Oss: …" starting the text must not
+ * count merely for being capitalized at position 0).
+ *
  * A real trade-off, noted here rather than hidden: a nav menu whose
- * underlying (pre-CSS) text happens to be all-lowercase would NOT be caught
- * by this rule. Given apply-mode NULLs real content, under-catching is the
- * correct default over the destructive alternative — this is exactly the
- * "eskaleres… dersom heuristikken viser seg for grov" escape hatch this
- * dev-request's own spec calls for, to revisit after retro-scan results.
+ * underlying (pre-CSS) text happens to be all-lowercase, or a nav word
+ * immediately following a Norwegian abbreviation period ("kl.", "f.eks."),
+ * would NOT be caught by this rule. Given apply-mode NULLs real content,
+ * under-catching is the correct default over the destructive alternative —
+ * this is exactly the "eskaleres… dersom heuristikken viser seg for grov"
+ * escape hatch this dev-request's own spec calls for, to revisit after
+ * retro-scan results.
  *
  * PURE, no network/IO. Gårdssalg-scoped only (used by
  * gardssalgMeetsQualityBar below) — does NOT touch meetsAboutQualityBar
  * itself, which is shared by the RFB/experiences/dental content-refresh
  * paths too and is out of scope for this dev-request.
  */
+// Norwegian day names (full + common short forms) — used only to recognise
+// the "Kontakt: 900 12 345  Åpningstider: mandag-fredag 10-17" shape (a
+// label immediately followed by its own value) as legitimate short-blurb
+// structure, NOT nav-menu-item adjacency (review round 2, 2026-07-20).
+const GARDSSALG_DAY_NAMES: ReadonlySet<string> = new Set([
+  "mandag", "tirsdag", "onsdag", "torsdag", "fredag", "lordag", "sondag",
+  "man", "tir", "tirs", "ons", "tor", "tors", "fre", "lor", "son",
+]);
+
+// True if a RAW (unfiltered, original-case, still-punctuated) token looks
+// like a label's VALUE rather than another word in a sentence: a bare
+// number/time-range/date-ish run of digits (with optional ":"/"-"/"."/","),
+// or a day name. Checked against the token immediately preceding a
+// candidate nav-word match — see gardssalgIsNavPolluted's doc comment.
+function gardssalgIsValueLikeRawToken(raw: string): boolean {
+  const stripped = raw.replace(/^[^\p{L}\d]+|[^\p{L}\d]+$/gu, "");
+  if (!stripped) return false;
+  if (/^\d[\d:\-–.,]*$/.test(stripped)) return true;
+  return GARDSSALG_DAY_NAMES.has(stripNorwegianAccents(stripped.toLowerCase()));
+}
+
 export function gardssalgIsNavPolluted(text: string | null | undefined): boolean {
   if (!text) return false;
   const trimmed = String(text).replace(/\s+/g, " ").trim();
   if (!trimmed) return false;
 
-  type Tok = { norm: string; titleCase: boolean; sentenceInitial: boolean };
+  type Tok = { norm: string; titleCase: boolean; sentenceInitial: boolean; precededByValue: boolean };
   const toks: Tok[] = [];
   let atSentenceStart = true;
+  let prevRawWasValueLike = false;
   for (const raw of trimmed.split(" ")) {
     const word = raw.replace(/^[^\p{L}]+|[^\p{L}]+$/gu, "");
     const endsSentence = /[.!?]$/.test(raw);
     if (!word) {
+      // A purely-numeric/punctuation token (e.g. "900", "10-17") never
+      // becomes a Tok itself, but it DOES set up the "value-like
+      // predecessor" signal for whatever nav-word-shaped token follows it —
+      // without this, that following token's sentenceInitial would stay
+      // false (unchanged by a non-letter token), wrongly looking like
+      // mid-sentence nav-menu capitalization.
+      prevRawWasValueLike = gardssalgIsValueLikeRawToken(raw);
       if (endsSentence) atSentenceStart = true;
       continue;
     }
@@ -2144,19 +2187,21 @@ export function gardssalgIsNavPolluted(text: string | null | undefined): boolean
       norm: stripNorwegianAccents(word.toLowerCase()),
       titleCase: /^[A-ZÆØÅ]/.test(word),
       sentenceInitial: atSentenceStart,
+      precededByValue: prevRawWasValueLike,
     });
     atSentenceStart = endsSentence;
+    prevRawWasValueLike = false;
   }
 
   const matchedSignals = new Set<string>();
   for (const t of toks) {
-    if (t.titleCase && !t.sentenceInitial && GARDSSALG_NAV_WORDLIST_TOKENS.has(t.norm)) {
+    if (t.titleCase && !t.sentenceInitial && !t.precededByValue && GARDSSALG_NAV_WORDLIST_TOKENS.has(t.norm)) {
       matchedSignals.add(t.norm);
     }
   }
   for (const phrase of GARDSSALG_NAV_WORDLIST_PHRASES) {
     for (let i = 0; i + phrase.length <= toks.length; i++) {
-      if (phrase.every((w, j) => toks[i + j].titleCase && toks[i + j].norm === w)) {
+      if (!toks[i].sentenceInitial && phrase.every((w, j) => toks[i + j].titleCase && toks[i + j].norm === w)) {
         matchedSignals.add(phrase.join(" "));
         break;
       }
@@ -2204,6 +2249,16 @@ export function gardssalgReplaceableFieldAction(
   const candidate = candidateValue?.trim();
   if (!candidate) return null;
   const isCurrentBlank = currentValue === null || currentValue === undefined || String(currentValue).trim() === "";
+  // "the candidate has content" is this branch's ONLY requirement, by
+  // design — quality-bar gating is the CALLER's job for a fill (the caller
+  // decides what counts as a real candidate before ever offering it here;
+  // see opplevelser.ts's gardssalgMeetsQualityBar-gated candidateAbout/
+  // candidateVisit computation, review round 2, 2026-07-20 CRITICAL finding
+  // — the route was still gating on the raw shared meetsAboutQualityBar,
+  // letting nav-polluted text become a "candidate" in the first place).
+  // This function's replace/never-churn logic below is a DIFFERENT decision
+  // (comparing a non-blank existing value against a candidate) and keeps
+  // its own quality-bar checks, unchanged.
   if (isCurrentBlank) return "filled";
   if (gardssalgMeetsQualityBar(currentValue)) return null; // decent existing content — never churned
   if (!gardssalgMeetsQualityBar(candidate)) return null; // candidate itself thin/nav-polluted — can't replace with that

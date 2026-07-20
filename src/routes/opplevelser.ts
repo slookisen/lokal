@@ -130,6 +130,10 @@ import {
   evaluateGardssalgContentQuality,
   applyGardssalgContentQualityFixes,
   type GardssalgContentQualityFlag,
+  // review round 2 (2026-07-20): the gårdssalg-scoped composite quality gate
+  // itself — gating the content-refresh route's blank-field fill candidates
+  // (see processOne below), not just the replace/rewrite decision functions.
+  gardssalgMeetsQualityBar,
 } from "../services/experience-store";
 // dev-request 2026-07-11-dedup-false-positive-remediation — read-only audit
 // of the merged groups the prod backfill produced (titlesMatch()'s single-
@@ -1108,8 +1112,14 @@ router.post("/admin/gardssalg-content-refresh", requireAdmin, async (req: Reques
     const visitSummary = summarizeVisit(combinedHtml);
     const hoursSnippet = extractOpeningHours(contentText);
 
-    const candidateAbout = meetsAboutQualityBar(aboutSummary) ? aboutSummary : null;
-    const candidateVisit = meetsAboutQualityBar(visitSummary) ? visitSummary : null;
+    // dev-request 2026-07-20-gardssalg-navstoy-duplikatfelt-heuristikk (review
+    // round 2 CRITICAL finding): gate on the gårdssalg-scoped composite bar,
+    // not the raw shared meetsAboutQualityBar — Draopar's own nav-glued text
+    // passed meetsAboutQualityBar (long/Norwegian enough) and would have been
+    // written straight through on the very next blank-field fill, completely
+    // bypassing gardssalgIsNavPolluted. This is THE gate that must catch it.
+    const candidateAbout = gardssalgMeetsQualityBar(aboutSummary) ? aboutSummary : null;
+    const candidateVisit = gardssalgMeetsQualityBar(visitSummary) ? visitSummary : null;
     const candidateHours = hoursSnippet && hoursSnippet.trim() ? hoursSnippet : null;
 
     const provenance: GsProvenanceMap = {};

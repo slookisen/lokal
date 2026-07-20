@@ -35,6 +35,11 @@
  *       zero writes; apply=true nulls the flagged fields via the existing
  *       audit/provenance path and resets last_content_attempt_at (re-queue);
  *       manual/claim rows are never touched; 403 unauthenticated
+ *   (h) end-to-end: POST /admin/gardssalg-content-refresh's REAL crawl path
+ *       (mocked fetch, og:description = the real Draopar text) never fills
+ *       a blank about_text with nav-polluted content — the critical review
+ *       round-2 finding, verified at the actual production call site, not
+ *       just the pure gardssalgIsNavPolluted function
  */
 
 export interface TestSummary {
@@ -216,6 +221,37 @@ export function runOpplevelserGardssalgNavstoyHeuristikkTests(
         "c8: two real sentences each merely opening with a nav-adjacent word not flagged"
       );
 
+      // ── round-2 review fix-up (2026-07-20, CHANGES-REQUESTED): two new
+      // edge cases found in the sentence-boundary-aware heuristic itself.
+      // (1) A punctuation-light "label: value" blurb — a Title-Case label
+      // right after a bare number/day-name carries no sentence-ending
+      // punctuation before it, so it looked mid-sentence-capitalized (=
+      // nav-artifact-shaped) when it's really just a normal short blurb.
+      // (2) The phrase matcher never applied the single-token matcher's
+      // sentence-initial exclusion, so a heading like "Om Oss: ..." at the
+      // very start of the text falsely counted. Reviewer's exact reproduced
+      // failing examples — neither must be flagged. ───────────────────────
+      const labelValueBlurb =
+        "Kontakt 900 12 345 Åpningstider mandag-fredag 10-17 Levering Vi leverer i hele bygda og omegn hver fredag ettermiddag.";
+      assertTrue(
+        !store.gardssalgIsNavPolluted(labelValueBlurb),
+        "c9: 'Kontakt 900 12 345 Åpningstider mandag-fredag 10-17 ...' label:value blurb not flagged"
+      );
+      assertTrue(
+        store.gardssalgMeetsQualityBar(labelValueBlurb),
+        "c10: label:value contact/hours/delivery blurb passes the gårdssalg composite bar"
+      );
+      const headingThenRealProse =
+        "Om Oss: Vi er en familiegård med lange tradisjoner, og selger ferske varer rett fra egen gårdsbutikk hver helg.";
+      assertTrue(
+        !store.gardssalgIsNavPolluted(headingThenRealProse),
+        "c11: 'Om Oss: Vi er en familiegård ...' (heading capitalized only by starting the text) not flagged"
+      );
+      assertTrue(
+        store.gardssalgMeetsQualityBar(headingThenRealProse),
+        "c12: heading-prefixed genuine prose passes the gårdssalg composite bar"
+      );
+
       // ── (d): applyGardssalgProviderContent duplicate-block guard ────────
       const insertProvider = expDb.prepare(
         `INSERT INTO experience_providers
@@ -252,7 +288,7 @@ export function runOpplevelserGardssalgNavstoyHeuristikkTests(
       });
       const writtenDistinct = store.applyGardssalgProviderContent(
         "prov-distinct",
-        { about_text: "Om Prov Distinct gård, med lang nok tekst til å passere kvalitetsporten her.", visit_text: "Besøk oss i helgene, vi holder åpent hver lørdag og søndag hele sommeren." },
+        { about_text: "Om Prov Distinct gård, med lang nok tekst til å passere kvalitetsporten skikkelig godt her.", visit_text: "Besøk oss i helgene, vi holder åpent hver lørdag og søndag hele sommeren for alle gjester." },
         "https://prov-distinct.example.no",
       );
       assertEq(writtenDistinct.sort(), ["about_text", "visit_text"], "d4: distinct about/visit candidates both still written (no over-trigger)");
@@ -403,6 +439,47 @@ export function runOpplevelserGardssalgNavstoyHeuristikkTests(
         body: { providerIds: ["prov-hidden"], apply: false },
       });
       assertEq(rescan.body.flagged, 1, "g22: re-scan after rollback finds the SAME flag again (restored text is still nav-polluted)");
+
+      // ── (h) end-to-end: the REAL crawl path never fills a blank field with
+      // nav-polluted content — review round 2's CRITICAL finding, verified
+      // at the actual production call site (POST /admin/gardssalg-content-
+      // refresh), not just the pure gardssalgIsNavPolluted function. Mocks
+      // globalThis.fetch (repo convention — see opplevelser-gardssalg-
+      // content-audit.test.ts block (k)) since this route makes real
+      // fetch() calls and the sandbox has no network access. ──────────────
+      const prevFetchH = globalThis.fetch;
+      try {
+        const draoparHtml = `<html><head><meta property="og:description" content="${draoparText}"></head><body><p>${draoparText}</p></body></html>`;
+        insertProvider.run({
+          id: "prov-draopar-crawl", navn: "Draopar Crawl Test", hjemmeside: "https://prov-draopar-crawl.example.no",
+          content_source: null, about_text: null, visit_text: null, opening_hours_text: null,
+          producer_type: "sideri", catalog_hidden: 0,
+        });
+        globalThis.fetch = (async (url: string | URL | Request) => {
+          const host = new URL(String(url)).hostname;
+          if (host === "prov-draopar-crawl.example.no") {
+            return { ok: true, status: 200, text: async () => draoparHtml } as unknown as Response;
+          }
+          return { ok: false, status: 404, text: async () => "" } as unknown as Response;
+        }) as typeof fetch;
+
+        const applyDraoparCrawl = await callRoute(opplevelserRouter, {
+          url: "/admin/gardssalg-content-refresh",
+          headers: { "x-admin-key": testKey },
+          body: { providerIds: ["prov-draopar-crawl"], apply: true },
+        });
+        assertEq(applyDraoparCrawl.status, 200, "h1: apply gardssalg-content-refresh (Draopar-shaped crawl) -> 200");
+        assertEq(
+          applyDraoparCrawl.body.changed.find((c: any) => c.provider_id === "prov-draopar-crawl"),
+          undefined,
+          "h2: prov-draopar-crawl does NOT appear in changed[] — the nav-polluted candidate was never accepted"
+        );
+        const rowDraoparCrawl = expDb.prepare(`SELECT about_text, visit_text FROM experience_providers WHERE id = ?`).get("prov-draopar-crawl") as any;
+        assertEq(rowDraoparCrawl.about_text, null, "h3: about_text stays blank — the real crawl path rejects the Draopar-shaped extraction");
+        assertEq(rowDraoparCrawl.visit_text, null, "h4: visit_text stays blank too");
+      } finally {
+        globalThis.fetch = prevFetchH;
+      }
     } catch (err: any) {
       failed++;
       failures.push("opplevelser-gardssalg-navstoy-heuristikk: unexpected error: " + String(err?.stack || err?.message || err));
