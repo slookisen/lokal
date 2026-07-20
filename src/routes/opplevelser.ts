@@ -35,6 +35,8 @@ import {
   markProviderContentAttempted,
   // enrichment-metode slice 1 (2026-07-16): dead-homepage parking
   recordProviderHomepageFetchResult,
+  // dev-request 2026-07-20-experiences-no-yield-backoff
+  recordProviderContentYield,
   type ContentRefreshTarget,
   // dev-request 2026-07-03-gardssalg-rike-profiler-bilder-agentbooking, Fase 1
   // item 3 — multi-page-crawl content enrichment (about/visit/opening-hours)
@@ -758,7 +760,17 @@ router.post("/admin/content-refresh", requireAdmin, async (req: Request, res: Re
       || durationResult.value !== null || candidateSeason || ioResult.value || candidateActivityTags
       || bookingResult.value;
     scanned++;
-    if (!hasAnyCandidate) return;
+    if (!hasAnyCandidate) {
+      // dev-request 2026-07-20-experiences-no-yield-backoff: homepage fetched
+      // fine but nothing extractable — bump content_no_yield_streak so 3
+      // consecutive no-yield outcomes trigger the NO_YIELD_BACKOFF_DAYS rest
+      // period (selectProvidersForContentRefresh's WHERE clause). Apply mode
+      // only — dry-run stays fully read-only.
+      if (apply) {
+        try { recordProviderContentYield(providerId, false); } catch { /* best-effort */ }
+      }
+      return;
+    }
 
     const expRows = getExperiencesForProvider(providerId);
     const writtenFields = new Set<string>();
@@ -819,6 +831,9 @@ router.post("/admin/content-refresh", requireAdmin, async (req: Request, res: Re
       }
       if (writtenFields.size > 0) {
         try { markProviderEnriched(providerId); } catch { /* best-effort */ }
+        // dev-request 2026-07-20-experiences-no-yield-backoff: a real field
+        // write resets content_no_yield_streak to 0, clearing any backoff.
+        try { recordProviderContentYield(providerId, true); } catch { /* best-effort */ }
       }
     }
 
