@@ -29182,6 +29182,26 @@ const _recentlyEnrichedSpotcheckPromise: Promise<void> = new Promise<void>(r => 
   } catch (err: any) {
     failed++;
     failures.push("opplevelser-admin-providers-hjemmeside: unexpected error: " + String(err?.message || err));
+  }
+
+  // dev-request 2026-07-12-experiences-enrichment-supply-and-aggregator-hygiene,
+  // Daniel's 2026-07-19 decision, step 1: POST /admin/hjemmeside-cleanup-sweep
+  // — classify + move aggregator/DMO hjemmeside values into the new
+  // listing_url column (dry-run-first, re-verify-before-write). Same isolated
+  // experiences db-factory handle as the block immediately above — safe to
+  // run in this same sequential slot.
+  console.log("\n── dev-request 2026-07-12 (Daniel's 2026-07-19 decision, step 1): POST /admin/hjemmeside-cleanup-sweep (experiences) ──");
+  try {
+    const { runOpplevelserHjemmesideListingSweepTests } = require("../src/routes/opplevelser-hjemmeside-listing-sweep.test") as
+      typeof import("../src/routes/opplevelser-hjemmeside-listing-sweep.test");
+    const hls = await runOpplevelserHjemmesideListingSweepTests({ log: false });
+    passed += hls.passed;
+    failed += hls.failed;
+    for (const f of hls.failures) failures.push("opplevelser-hjemmeside-listing-sweep: " + f);
+    console.log(`  opplevelser-hjemmeside-listing-sweep: ${hls.passed} passed, ${hls.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("opplevelser-hjemmeside-listing-sweep: unexpected error: " + String(err?.message || err));
   } finally {
     _recentlyEnrichedSpotcheckResolve();
   }
