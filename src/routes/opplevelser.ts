@@ -1171,6 +1171,26 @@ router.post("/admin/gardssalg-content-refresh", requireAdmin, async (req: Reques
       }
     }
 
+    // ── Blank about_text LLM fill (dev-request 2026-07-20-gardssalg-fyll-
+    // blank-fra-kildeinnhold): about_text is completely BLANK AND the
+    // extractive pass above (candidateAbout, gated by meetsAboutQualityBar)
+    // did NOT already produce a wouldWriteActions.about_text entry — i.e.
+    // there is a real fetched homepage but neither the extractive summarizer
+    // nor (structurally, since it requires a non-blank current value)
+    // gardssalgRewriteEligible produced anything. Reuses the ALREADY-
+    // fetched/extracted contentText — no new fetch. Runs in BOTH dry-run and
+    // apply mode, same convention as the slice 5a/5c LLM paths above
+    // (dry-run still calls the LLM so the preview is real; dry-run still
+    // writes nothing regardless of the LLM's answer).
+    let generatedAbout: string | null = null;
+    if (!wouldWriteActions.about_text && isBlank(t.about_text)) {
+      generatedAbout = await generateGardssalgAboutFromSource(contentText, t.navn);
+      if (generatedAbout) {
+        wouldWriteActions.about_text = "filled";
+        provenance.about_text = { source_url: fetched.fetchUrl, snippet: generatedAbout.slice(0, 120) };
+      }
+    }
+
     // ── Slice 5c: fill-only "products" extraction (dev-request 2026-07-18-
     // gardssalg-profilkvalitet-foer-outreach). Only fires when the column is
     // currently blank/empty (gardssalgProductsEligible) — no replace-thin
@@ -1204,7 +1224,7 @@ router.post("/admin/gardssalg-content-refresh", requireAdmin, async (req: Reques
         const written = applyGardssalgProviderContent(
           providerId,
           {
-            about_text: rewriteAbout ?? candidateAbout ?? undefined,
+            about_text: rewriteAbout ?? candidateAbout ?? generatedAbout ?? undefined,
             visit_text: rewriteVisit ?? candidateVisit ?? undefined,
             opening_hours_text: candidateHours ?? undefined,
             products: productsCandidate ?? undefined,
@@ -4011,6 +4031,116 @@ Bruk KUN fakta som faktisk står i kildeteksten under. Ikke finn på detaljer, p
   // Length gate enforced in code, not trusted to the prompt alone (spec
   // requirement) — reject anything outside [200, 500], never truncate.
   if (plain.length < GARDSSALG_REWRITE_MIN_LEN || plain.length > GARDSSALG_REWRITE_MAX_LEN) return null;
+  return plain;
+}
+
+// ─── generateGardssalgAboutFromSource (dev-request 2026-07-20-gardssalg-
+//     fyll-blank-fra-kildeinnhold) ──────────────────────────────────────────
+// Source-grounded GENERATE-FROM-SCRATCH of about_text for the "completely
+// blank, extractive pass found nothing usable" cohort — distinct from
+// generateGardssalgAboutRewrite (slice 5a) above, which only ever EXPANDS an
+// already non-blank, already-passing-bar value. ~22 gårdssalg providers have
+// a real homepage that fetches fine, but summarizeAbout()'s extractive
+// heuristics (no og:description, no matching keyword block) come up with
+// nothing that clears meetsAboutQualityBar, and gardssalgRewriteEligible()
+// never fires either (it requires a non-blank current value) — so today
+// NOTHING fills about_text for them. This function is the dedicated fill
+// path for exactly that gap.
+//
+// Mirrors generateGardssalgAboutRewrite's exact never-fabricate contract:
+// sync fetch to https://api.anthropic.com/v1/messages, ANTHROPIC_API_KEY
+// from env, model claude-opus-4-8. Returns null — NEVER throws, NEVER
+// fabricates — on missing key / network failure / non-200 / unparseable
+// body / the sentinel / residual markdown / failing the shared quality bar.
+//
+// Grounding: the prompt passes ONLY the already-fetched, already-extracted
+// visible page text (pageText — the SAME extractVisibleText(combinedHtml)
+// the calling route already computed, capped to the same
+// GARDSSALG_REWRITE_SOURCE_CHAR_CAP — no new fetch/host-binding surface) and
+// the producer's name (navn, for the model to address the right entity),
+// with an explicit kun-kildebasert instruction and the SAME escape sentinel
+// (GARDSSALG_REWRITE_SENTINEL) the model must return verbatim when the
+// source text can't support a genuine short factual paragraph. Unlike the
+// rewrite prompt's 200–400 char expansion target, this asks for a FRESH
+// short text (~100–300 chars) since there is no existing text to build on.
+//
+// Signature is deliberately 2-arg (pageText, navn) — the dev-request's draft
+// spec sketched a third `sted` (place) arg, but GardssalgContentRefreshTarget
+// (services/experience-store.ts) has no city/kommune column and no other
+// consumer needs one; extending the SELECT/type purely for this would be
+// scope creep for a single-field ask. Noted as a deliberate deviation.
+//
+// Acceptance is judged by the SAME meetsAboutQualityBar() every other
+// extractive/fill candidate in this route already has to clear (no separate
+// arbitrary length range) — this is a FILL-blank candidate, so it must be
+// genuinely good enough to stand alone as the field's sole content.
+export async function generateGardssalgAboutFromSource(
+  pageText: string,
+  navn: string
+): Promise<string | null> {
+  const apiKey = process.env.ANTHROPIC_API_KEY;
+  if (!apiKey) return null;
+
+  const cappedSource = (pageText || "").slice(0, GARDSSALG_REWRITE_SOURCE_CHAR_CAP);
+  const prompt = `Skriv en kort, faktabasert norsk tekst (seksjonen "Om produsenten") om gårdsprodusenten "${navn}", på ca. 100–300 tegn.
+
+Kildetekst (hentet fra produsentens egen nettside):
+${cappedSource}
+
+Bruk KUN fakta som faktisk står i kildeteksten under. Ikke finn på detaljer, produkter, åpningstider eller annet som ikke er nevnt der. Svar i ren løpende tekst uten markdown-formatering — ingen stjerner, overskrifter, punktlister eller linjeskift. Hvis kildeteksten ikke gir nok materiale til en genuin, faktabasert tekst om produsenten, svar med nøyaktig ${GARDSSALG_REWRITE_SENTINEL} og ingenting annet.`;
+
+  let response: Awaited<ReturnType<typeof fetch>>;
+  try {
+    response = await fetch("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "x-api-key": apiKey,
+        "anthropic-version": "2023-06-01",
+      },
+      body: JSON.stringify({
+        model: "claude-opus-4-8",
+        max_tokens: 400,
+        messages: [{ role: "user", content: prompt }],
+      }),
+    });
+  } catch {
+    return null; // network/fetch failure — never fabricate
+  }
+
+  if (!response.ok) return null;
+
+  let result: any;
+  try {
+    result = await response.json();
+  } catch {
+    return null; // unparseable JSON body — never fabricate
+  }
+
+  const contentArr = Array.isArray(result?.content) ? result.content : [];
+  const text = contentArr.find((c: any) => c?.type === "text")?.text;
+  if (typeof text !== "string") return null;
+  const cleaned = text.trim();
+  if (cleaned === GARDSSALG_REWRITE_SENTINEL) return null; // explicit "not enough material" escape
+
+  // Strip markdown BEFORE the quality-bar check — same reasoning as the
+  // rewrite helper: the bar must judge the exact string that would land on
+  // the public page, not a version padded/shortened by formatting syntax.
+  const plain = stripMarkdownArtifacts(cleaned);
+
+  // Sentinel embedded/wrapped rather than verbatim — same two-check
+  // discipline as generateGardssalgAboutRewrite (checked BEFORE the residual
+  // gate since the sentinel itself contains "_").
+  if (plain.includes(GARDSSALG_REWRITE_SENTINEL)) return null;
+
+  // Residual markers after stripping (unpaired "**", "_x_", spaced "*", …)
+  // → reject outright; see GARDSSALG_REWRITE_RESIDUAL_MARKDOWN's comment.
+  if (GARDSSALG_REWRITE_RESIDUAL_MARKDOWN.test(plain)) return null;
+
+  // Acceptance gate enforced in code, not trusted to the prompt alone: reuse
+  // the SAME shared quality bar every other fill candidate in this route is
+  // judged by, rather than inventing a separate arbitrary length range.
+  if (!meetsAboutQualityBar(plain)) return null;
   return plain;
 }
 

@@ -26957,6 +26957,25 @@ Promise.allSettled(_oaHomeCountersDeps).then(async () => {
     for (const f of grwr.failures) failures.push("opplevelser-gardssalg-rewrite: " + f);
     console.log(`  opplevelser-gardssalg-rewrite: ${grwr.passed} passed, ${grwr.failed} failed`);
 
+    // dev-request 2026-07-20-gardssalg-fyll-blank-fra-kildeinnhold: a
+    // dedicated "generate about_text from source when currently blank" LLM
+    // path — distinct from slice 5a's rewrite (which only EXPANDS a
+    // non-blank, already-passing-bar value). generateGardssalgAboutFromSource()
+    // (routes/opplevelser.ts, mirrors generateGardssalgAboutRewrite's
+    // never-fabricate contract, judged by the SAME shared meetsAboutQualityBar
+    // gate) wired into POST /admin/gardssalg-content-refresh's processOne(),
+    // writing through the SAME, unmodified applyGardssalgProviderContent()
+    // fill path. Same in-memory-DB pattern, runs sequentially inside this
+    // same gated block for the same reason.
+    console.log("\n── opplevelser-gardssalg-fillblank: blank about_text LLM fill ──");
+    const { runOpplevelserGardssalgFillblankTests } = require("../src/routes/opplevelser-gardssalg-fillblank.test") as
+      typeof import("../src/routes/opplevelser-gardssalg-fillblank.test");
+    const gfbr = await runOpplevelserGardssalgFillblankTests({ log: false });
+    passed += gfbr.passed;
+    failed += gfbr.failed;
+    for (const f of gfbr.failures) failures.push("opplevelser-gardssalg-fillblank: " + f);
+    console.log(`  opplevelser-gardssalg-fillblank: ${gfbr.passed} passed, ${gfbr.failed} failed`);
+
     // dev-request 2026-07-18-gardssalg-profilkvalitet-foer-outreach, slice 5c:
     // fill-only extraction of the "products" JSON-array column —
     // generateGardssalgProductList() (routes/opplevelser.ts, mirrors
