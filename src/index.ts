@@ -315,7 +315,12 @@ app.use("/", ownerPortalRoutes);
 app.get("/selger.html", trackSelgerHtmlOpen);
 
 // Serve the marketplace dashboard
-app.use(express.static(path.join(__dirname, "public"), { extensions: ["html"] }));
+// redirect:false — serve-static's directory redirect builds its Location from
+// originalUrl, so GET /en (which langMiddleware rewrites to "/", i.e. the
+// static root itself) got 301'd to /en/ … which the trailing-slash middleware
+// above bounces straight back: an infinite /en ⇄ /en/ loop. public/ is flat,
+// so directory redirects are never wanted here.
+app.use(express.static(path.join(__dirname, "public"), { extensions: ["html"], redirect: false }));
 
 // ─── Rate-limited routes ─────────────────────────────────────
 // JSON-RPC gets its own limiter (agents are chatty)
