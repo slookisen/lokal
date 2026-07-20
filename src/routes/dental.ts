@@ -33,6 +33,9 @@ import {
   // dev-request 2026-07-12-dental-enrichment-universe-growth-and-queue-hygiene,
   // item 2a (2026-07-17): dead-extraction parking
   recordDentalExtractionResult,
+  // dev-request 2026-07-12-dental-enrichment-universe-growth-and-queue-hygiene,
+  // item 4 / slice 4a (2026-07-20): Stage V helfo_agreement auto-correction
+  recordStageVFieldObservation,
   DENTAL_AGENT_WRITABLE_FIELDS,
 } from "../services/dental-store";
 import { getDb } from "../database/db-factory";
@@ -516,6 +519,54 @@ router.post("/admin/extraction-result", requireAdmin, (req: Request, res: Respon
       return;
     }
     res.json({ agent_id: agentId.trim(), attempts: r.attempts, parked: r.parked, parked_now: r.parked_now });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message ?? "Internal error" });
+  }
+});
+
+// POST /api/tannlege/admin/stage-v-drift-result
+// Body: { agentId: string, field: "helfo_agreement", value: "true"|"false"|"unknown" }
+// dev-request 2026-07-12-dental-enrichment-universe-growth-and-queue-hygiene,
+// item 4 / slice 4a (2026-07-20): Stage V (the enrichment routine's §5
+// sample-verify) re-fetches a small sample of clinics each cycle and checks
+// the site's helfo-signal against the DB value, but today can only flag a
+// mismatch ("drift" → needs_review), never correct it. This route is the
+// correction-reporting surface: Stage V calls it with the concrete value it
+// found on-site; the server (recordStageVFieldObservation, dental-store.ts)
+// owns the "2 consecutive matching contradictions → auto-correct" logic —
+// a single differing observation is only parked as pending, not yet
+// trusted. `field` is restricted to "helfo_agreement" this slice — any
+// other value 400s (forward-compat guard for the future item-4b
+// treatments/opening_hours fields, so they can't be silently half-shipped
+// by a client sending an unsupported field name). This endpoint NEVER
+// touches verification_status — the existing §5.3 drift→needs_review rule
+// is completely unchanged (see recordStageVFieldObservation's own comment).
+const STAGE_V_HELFO_VALUES = new Set(["true", "false", "unknown"]);
+router.post("/admin/stage-v-drift-result", requireAdmin, (req: Request, res: Response) => {
+  try {
+    const { agentId, field, value } = (req.body ?? {}) as {
+      agentId?: unknown;
+      field?: unknown;
+      value?: unknown;
+    };
+    if (typeof agentId !== "string" || !agentId.trim()) {
+      res.status(400).json({ error: "Invalid body: need {agentId: string, field: string, value: string}" });
+      return;
+    }
+    if (field !== "helfo_agreement") {
+      res.status(400).json({ error: 'Invalid field: only "helfo_agreement" is supported this slice' });
+      return;
+    }
+    if (typeof value !== "string" || !STAGE_V_HELFO_VALUES.has(value)) {
+      res.status(400).json({ error: 'Invalid value: must be one of "true"|"false"|"unknown"' });
+      return;
+    }
+    const r = recordStageVFieldObservation(agentId.trim(), field, value);
+    if (!r.found) {
+      res.status(404).json({ error: "Not found" });
+      return;
+    }
+    res.json({ agent_id: agentId.trim(), field, ...r });
   } catch (err: any) {
     res.status(500).json({ error: err.message ?? "Internal error" });
   }

@@ -29109,6 +29109,20 @@ const _recentlyEnrichedSpotcheckPromise: Promise<void> = new Promise<void>(r => 
     failures.push("dental-agent-put-field-provenance: unexpected error: " + String(err?.message || err));
   }
 
+  console.log("\n── slice4a: POST /api/tannlege/admin/stage-v-drift-result (route) ──");
+  try {
+    const { runDentalStageVDriftResultTests } = require("../src/routes/dental-stage-v-drift-result.test") as
+      typeof import("../src/routes/dental-stage-v-drift-result.test");
+    const dsv = await runDentalStageVDriftResultTests({ log: false });
+    passed += dsv.passed;
+    failed += dsv.failed;
+    for (const f of dsv.failures) failures.push("dental-stage-v-drift-result: " + f);
+    console.log(`  dental-stage-v-drift-result: ${dsv.passed} passed, ${dsv.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("dental-stage-v-drift-result: unexpected error: " + String(err?.message || err));
+  }
+
   console.log("\n── dev-request 2026-07-18-dental-hjemmeside-directory-portal-cleanup: classifier (pure) ──");
   try {
     const { runDentalHjemmesideClassifierTests } = require("../src/services/dental-hjemmeside-classifier.test") as
@@ -30978,6 +30992,116 @@ console.log("\n── item2a: dead-extraction parking (dental) ──");
   } finally {
     if (prevPath === undefined) delete process.env.DENTAL_DB_PATH; else process.env.DENTAL_DB_PATH = prevPath;
     dbFacI2a.__resetDbFactoryForTesting();
+  }
+})();
+
+// ── slice 4a: Stage V helfo_agreement auto-correction (dev-request 2026-07-12-
+// dental-enrichment-universe-growth-and-queue-hygiene, item 4, 2026-07-20) ────
+// Covers recordStageVFieldObservation() (dental-store.ts) directly, mirroring
+// the item2a block above's style (raw db.prepare setup, dstore.* calls, no
+// HTTP layer). Route-level (403/404/400) coverage lives in the standalone
+// dental-stage-v-drift-result.test.ts, wired in below like the field-
+// provenance PUT route test.
+console.log("\n── slice4a: Stage V helfo_agreement auto-correction (dental-store) ──");
+(() => {
+  const prevPath = process.env.DENTAL_DB_PATH;
+  process.env.DENTAL_DB_PATH = ":memory:";
+
+  const dbFacS4a = require.resolve("../src/database/db-factory");
+  const dentalStorePathS4a = require.resolve("../src/services/dental-store");
+  delete require.cache[dbFacS4a];
+  delete require.cache[dentalStorePathS4a];
+  const dbFactoryS4a = require("../src/database/db-factory") as typeof import("../src/database/db-factory");
+  dbFactoryS4a.__resetDbFactoryForTesting();
+  const dstore = require("../src/services/dental-store") as typeof import("../src/services/dental-store");
+
+  try {
+    const dentalDb = dbFactoryS4a.getDb("dental");
+
+    const idA = dstore.createDentalAgent({
+      navn: "Helfo Tvist Tannlege AS",
+      org_nr: "911200111",
+      helfo_agreement: "true",
+    } as any);
+
+    // (1) unknown id -> found:false
+    assertEq((dstore.recordStageVFieldObservation("no-such-id", "helfo_agreement", "false") as any).found,
+      false, "s4a-01: unknown id -> found=false");
+
+    // (2) first contradicting observation ("false" vs DB "true") -> pending,
+    // DB value + field_provenance UNCHANGED.
+    let r = dstore.recordStageVFieldObservation(idA, "helfo_agreement", "false") as any;
+    assertEq(r.corrected, false, "s4a-02: first differing observation -> corrected=false");
+    assertEq(r.pending, true, "s4a-03: first differing observation -> pending=true");
+    let row = dentalDb.prepare("SELECT helfo_agreement, field_provenance, stage_v_pending_correction FROM dental_agents WHERE id = ?").get(idA) as any;
+    assertEq(row.helfo_agreement, "true", "s4a-04: DB helfo_agreement UNCHANGED after first observation");
+    assertEq(row.field_provenance, null, "s4a-05: field_provenance UNCHANGED after first observation");
+    assertTrue(!!row.stage_v_pending_correction, "s4a-06: pending column populated");
+    const pendingParsed = JSON.parse(row.stage_v_pending_correction);
+    assertEq(pendingParsed.helfo_agreement.value, "false", "s4a-07: pending entry records the observed value");
+
+    // (3) SECOND observation, SAME differing value -> auto-correct.
+    r = dstore.recordStageVFieldObservation(idA, "helfo_agreement", "false") as any;
+    assertEq(r.corrected, true, "s4a-08: second matching observation -> corrected=true");
+    assertEq(r.previous_value, "true", "s4a-09: previous_value reported correctly");
+    assertEq(r.new_value, "false", "s4a-10: new_value reported correctly");
+    row = dentalDb.prepare("SELECT helfo_agreement, field_provenance, stage_v_pending_correction FROM dental_agents WHERE id = ?").get(idA) as any;
+    assertEq(row.helfo_agreement, "false", "s4a-11: DB helfo_agreement corrected to the observed value");
+    assertEq(row.stage_v_pending_correction, null, "s4a-12: pending entry cleared after correction");
+    const provAfterCorrect = JSON.parse(row.field_provenance);
+    assertTrue(Array.isArray(provAfterCorrect.helfo_agreement), "s4a-13: field_provenance.helfo_agreement is an array");
+    assertTrue(provAfterCorrect.helfo_agreement.some((e: any) => e.source_type === "stage_v_correction" && e.value === "false"),
+      "s4a-14: field_provenance carries a stage_v_correction entry with the corrected value");
+
+    // (4) verification_status regression guard — never touched by this
+    // function under any input above (correction path just exercised).
+    const verifRow = dentalDb.prepare("SELECT verification_status FROM dental_agents WHERE id = ?").get(idA) as any;
+    assertEq(verifRow.verification_status, "pending_verify", "s4a-15: verification_status untouched by auto-correction (still the create-time default)");
+
+    // (5) a call whose value matches current DB value clears any pending
+    // entry -- a fresh differing observation afterwards needs 2 confirmations
+    // again, not 1.
+    const idB = dstore.createDentalAgent({
+      navn: "Helfo Stabil Tannlege AS",
+      org_nr: "911200222",
+      helfo_agreement: "unknown",
+    } as any);
+    dstore.recordStageVFieldObservation(idB, "helfo_agreement", "true"); // 1st differing observation -> pending
+    let rowB = dentalDb.prepare("SELECT stage_v_pending_correction FROM dental_agents WHERE id = ?").get(idB) as any;
+    assertTrue(!!rowB.stage_v_pending_correction, "s4a-16: pending entry set for idB");
+    const clearR = dstore.recordStageVFieldObservation(idB, "helfo_agreement", "unknown") as any; // matches DB -> clears
+    assertEq(clearR.cleared, true, "s4a-17: observation matching DB value -> cleared=true");
+    rowB = dentalDb.prepare("SELECT helfo_agreement, stage_v_pending_correction FROM dental_agents WHERE id = ?").get(idB) as any;
+    assertEq(rowB.helfo_agreement, "unknown", "s4a-18: DB value unchanged by a matching observation");
+    assertEq(rowB.stage_v_pending_correction, null, "s4a-19: pending entry cleared by a matching observation");
+    // a SINGLE fresh differing observation after the clear is NOT enough to
+    // correct -- proves 2 fresh confirmations are required again, not 1.
+    const rAfterClear = dstore.recordStageVFieldObservation(idB, "helfo_agreement", "true") as any;
+    assertEq(rAfterClear.corrected, false, "s4a-20: single observation after a clear does not auto-correct (needs 2 fresh confirmations)");
+    assertEq(rAfterClear.pending, true, "s4a-21: single observation after a clear is only pending");
+
+    // (6) a DIFFERENT differing value than what was pending restarts the
+    // window rather than accumulating toward a correction.
+    const idC = dstore.createDentalAgent({
+      navn: "Helfo Ombestemt Tannlege AS",
+      org_nr: "911200333",
+      helfo_agreement: "unknown",
+    } as any);
+    dstore.recordStageVFieldObservation(idC, "helfo_agreement", "true"); // pending: true
+    const rSwitch = dstore.recordStageVFieldObservation(idC, "helfo_agreement", "false") as any; // different differing value
+    assertEq(rSwitch.corrected, false, "s4a-22: a different differing value does not auto-correct");
+    assertEq(rSwitch.pending, true, "s4a-23: a different differing value overwrites the pending entry instead");
+    const rowC = dentalDb.prepare("SELECT stage_v_pending_correction FROM dental_agents WHERE id = ?").get(idC) as any;
+    assertEq(JSON.parse(rowC.stage_v_pending_correction).helfo_agreement.value, "false",
+      "s4a-24: pending entry now holds the NEW differing value, not the original one");
+
+    console.log("  slice4a (Stage V helfo_agreement auto-correction): OK (24 assertions)");
+  } catch (err) {
+    failed++;
+    failures.push(`slice4a Stage V helfo_agreement auto-correction: unexpected error: ${err instanceof Error ? (err.stack || err.message) : String(err)}`);
+  } finally {
+    if (prevPath === undefined) delete process.env.DENTAL_DB_PATH; else process.env.DENTAL_DB_PATH = prevPath;
+    dbFactoryS4a.__resetDbFactoryForTesting();
   }
 })();
 
