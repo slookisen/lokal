@@ -4832,12 +4832,21 @@ router.post("/admin/homepage-provenance-batch", async (req: Request, res: Respon
   // parsed defensively same as OUTREACH_COOLDOWN_DAYS in crm.ts). A single
   // subsequent 'enriched' outcome resets no_yield_streak to 0, which alone
   // clears the exclusion (no separate "cleared" column needed).
+  // Follow-up slice (orch-pr-wrongentity): wrong_entity_streak gets the exact
+  // same treatment (independent counter, same NO_YIELD_BACKOFF_DAYS window —
+  // no new env var) because a wrong-site mismatch never resolves itself
+  // either, so without this the same small wrong_entity cohort gets
+  // reselected forever once the rest of the universe is resting. A row is
+  // now excluded if EITHER streak has reached 3 and the row isn't yet
+  // stale-enough to be exempt (renamed to backoffExclusion since it covers
+  // both streaks).
   const noYieldBackoffDays = Math.max(
     1,
     parseInt(String(process.env.NO_YIELD_BACKOFF_DAYS ?? "14"), 10) || 14,
   );
-  const noYieldBackoffExclusion =
-    `AND (k.no_yield_streak < 3 OR k.last_enrichment_attempt_at IS NULL ` +
+  const backoffExclusion =
+    `AND ((k.no_yield_streak < 3 AND k.wrong_entity_streak < 3) ` +
+    `OR k.last_enrichment_attempt_at IS NULL ` +
     `OR k.last_enrichment_attempt_at <= datetime('now','-${noYieldBackoffDays} days'))`;
 
   if (Array.isArray(bodyAgentIds) && bodyAgentIds.length > 0) {
@@ -4899,7 +4908,7 @@ router.post("/admin/homepage-provenance-batch", async (req: Request, res: Respon
               OR k.field_provenance NOT LIKE '%"homepage"%'
             )
             ${parkingExclusion}
-            ${noYieldBackoffExclusion}
+            ${backoffExclusion}
           -- orch-pr-20260625-1 (controller-handoff 2026-06-24-lokal-agent-enrichment-2
           --   + companion -homepage-fetch-wall-1): order REACHABLE homepages first so the
           --   batch stops re-selecting the same dead-URL TIER-1 cohort every run. Pure
@@ -5188,9 +5197,13 @@ router.post("/admin/homepage-provenance-batch", async (req: Request, res: Respon
       // no-yield backoff is scoped to "fetched fine, nothing extractable",
       // not "fetched fine, wrong site"; this agent still rotates via
       // last_enrichment_attempt_at ASC same as every other outcome.
+      // Follow-up slice (orch-pr-wrongentity): a wrong-site mismatch never
+      // resolves itself on its own (same wrong site, forever), so it needs
+      // its own independent streak/backoff here — wrong_entity_streak.
       db.prepare(
         "UPDATE agent_knowledge SET field_provenance = ?, updated_at = ?, " +
-        "last_enrichment_attempt_at = ?, last_enrichment_outcome = 'wrong_entity' WHERE agent_id = ?"
+        "last_enrichment_attempt_at = ?, last_enrichment_outcome = 'wrong_entity', " +
+        "wrong_entity_streak = COALESCE(wrong_entity_streak, 0) + 1 WHERE agent_id = ?"
       ).run(JSON.stringify(existingProvU), nowIsoU, nowIsoU, agentId);
       console.log(
         `[homepage-provenance] ${agentId} (${producerName}) website ownership UNVERIFIED for ${fetchUrl} — page does not mention producer; homepage source NOT recorded`
@@ -5291,10 +5304,13 @@ router.post("/admin/homepage-provenance-batch", async (req: Request, res: Respon
       // progress happens, any accumulated no-yield backoff is cleared (the
       // selector's `no_yield_streak >= 3` exclusion condition alone becomes
       // false again, no separate "backoff cleared" column needed).
+      // Follow-up slice (orch-pr-wrongentity): real progress also clears any
+      // accumulated wrong_entity_streak — only 'enriched' resets either streak.
       sets.push("last_enrichment_attempt_at = ?");
       params.push(nowIso);
       sets.push("last_enrichment_outcome = 'enriched'");
       sets.push("no_yield_streak = 0");
+      sets.push("wrong_entity_streak = 0");
       params.push(agentId);
 
       db.prepare(
