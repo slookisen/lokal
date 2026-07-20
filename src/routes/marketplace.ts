@@ -5466,7 +5466,19 @@ router.post("/admin/homepage-provenance-batch", async (req: Request, res: Respon
         // worst-trust_score-first) doesn't keep reselecting the same agent
         // forever once its data has genuinely improved.
         if (isLowQualityMode && result.value.status === "enriched") {
-          trustScoreService.update(result.value.agentId);
+          // Never let a trust-score recompute failure (e.g. a transient
+          // SQLite busy/locked error) reject this handler's promise —
+          // Express 5 auto-forwards an uncaught rejection to the default
+          // error handler, which would 500 the whole batch and silently
+          // abandon every remaining CONCURRENCY-slice after this one.
+          try {
+            trustScoreService.update(result.value.agentId);
+          } catch (e: any) {
+            console.error(
+              `[homepage-provenance-batch:low_quality] trust_score update failed (non-critical) for ${result.value.agentId}:`,
+              e?.message ?? String(e),
+            );
+          }
         }
       } else {
         // Should not happen (processAgent catches internally), but guard anyway.
