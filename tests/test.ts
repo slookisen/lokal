@@ -22610,6 +22610,7 @@ console.log("\n── orch-pr-14: MCP discovery product_id surfacing ──");
   try { await _recentlyEnrichedSpotcheckPromise; } catch { /* errors already pushed to failures */ }
   try { await _emailOwnershipProvenancePromise; } catch { /* errors already pushed to failures */ }
   try { await _pilotOrdreLoopPromise; } catch { /* errors already pushed to failures */ }
+  try { await _expNoYieldBackoffPromise; } catch { /* errors already pushed to failures */ }
   // relax-envelope tests are synchronous (pure validateEnvelope() unit test) — no promise needed
   // PR-109 tests are synchronous (IIFE) — no promise needed
   // Drop pre-existing intg failures (unmasked by awaiting) — they predate M2
@@ -29199,6 +29200,42 @@ const _pilotOrdreLoopPromise: Promise<void> = new Promise<void>(r => {
     failures.push("pilot-ordre-loop: unexpected error: " + String(err?.message || err));
   } finally {
     _pilotOrdreLoopResolve();
+  }
+})();
+
+// ═══════════════════════════════════════════════════════════════════════
+// dev-request 2026-07-20-experiences-no-yield-backoff: ports marketplace.ts's
+// no_yield_streak backoff (dev-request 2026-07-19-enrichment-selector-
+// rotasjon-no-yield-backoff) to the experiences vertical's
+// selectProvidersForContentRefresh()/POST /admin/content-refresh
+// (src/services/experience-store.ts, src/routes/opplevelser.ts). Swaps the
+// shared experiences db-factory getDb() singleton (own dedicated test file,
+// in-memory prod-schema DB) — mirrors the pilot-ordre-loop block immediately
+// above, so it must run strictly after it; _pilotOrdreLoopPromise is the
+// current tail of that serial chain.
+let _expNoYieldBackoffResolve: () => void = () => {};
+const _expNoYieldBackoffPromise: Promise<void> = new Promise<void>(r => {
+  _expNoYieldBackoffResolve = r;
+});
+
+(async () => {
+  await Promise.allSettled([_pilotOrdreLoopPromise]);
+  await new Promise(r => setImmediate(r));
+
+  console.log("\n── dev-request 2026-07-20: experiences content-refresh no-yield-backoff ──");
+  try {
+    const { runOpplevelserContentRefreshNoYieldBackoffTests } = require("../src/routes/opplevelser-content-refresh-no-yield-backoff.test") as
+      typeof import("../src/routes/opplevelser-content-refresh-no-yield-backoff.test");
+    const nyb = await runOpplevelserContentRefreshNoYieldBackoffTests({ log: false });
+    passed += nyb.passed;
+    failed += nyb.failed;
+    for (const f of nyb.failures) failures.push("content-refresh-no-yield-backoff: " + f);
+    console.log(`  content-refresh-no-yield-backoff: ${nyb.passed} passed, ${nyb.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("content-refresh-no-yield-backoff: unexpected error: " + String(err?.message || err));
+  } finally {
+    _expNoYieldBackoffResolve();
   }
 })();
 

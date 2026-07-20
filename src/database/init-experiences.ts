@@ -243,6 +243,17 @@ export function initExperiencesSchema(db: Database.Database): void {
   // provider still cycles to the back of the queue instead of blocking it.
   try { db.exec("ALTER TABLE experience_providers ADD COLUMN last_content_attempt_at TEXT"); } catch { /* already present */ }
 
+  // ─── content-refresh no-yield backoff (dev-request 2026-07-20-experiences-
+  // no-yield-backoff) ─────────────────────────────────────────────────────
+  // Ports the RFB/marketplace.ts no_yield_streak idea to this vertical: a
+  // provider whose homepage fetch succeeds but yields zero extractable fields
+  // 3 times running rests NO_YIELD_BACKOFF_DAYS days (same env var, default
+  // 14 — see selectProvidersForContentRefresh) before being reselected; any
+  // successful field-write resets the streak to 0. Reuses the existing
+  // last_content_attempt_at column above as the backoff clock — no new
+  // timestamp column needed.
+  try { db.exec("ALTER TABLE experience_providers ADD COLUMN content_no_yield_streak INTEGER NOT NULL DEFAULT 0"); } catch { /* already present */ }
+
   // ─── FAQPage schema-drift guard (2026-07-05, orch-pr-faq-schema-drift-fixup) ──
   // getCategoryFaqStats()/getKommuneFaqStats() (PR #149) read experiences.fylke,
   // .kommune, .category, .price_from via COUNT(DISTINCT ...)/MIN(...). Git

@@ -1512,6 +1512,53 @@ export function providerParkingExclusionSql(alias = ""): string {
   return `AND (${col} IS NULL OR ${col} <= datetime('now','-30 days'))`;
 }
 
+// ── Content-refresh no-yield backoff (dev-request 2026-07-20-experiences-
+// no-yield-backoff) ───────────────────────────────────────────────────────
+// Ports marketplace.ts's no_yield_streak idea to this vertical: a provider
+// whose homepage fetch succeeds but yields zero extractable fields 3 times
+// running rests NO_YIELD_BACKOFF_DAYS days (default 14, env-configurable,
+// parsed defensively the same way marketplace.ts parses it) before being
+// reselected; a single subsequent successful field-write resets
+// content_no_yield_streak to 0, which alone clears the exclusion. Distinct
+// from providerParkingExclusionSql above, which guards fetch FAILURES
+// (homepage_unreachable_since) — this guards fetches that SUCCEED but
+// extract nothing. Reuses last_content_attempt_at as the backoff clock (no
+// new timestamp column).
+export function noYieldBackoffExclusionSql(alias = ""): string {
+  const col = alias ? `${alias}.content_no_yield_streak` : "content_no_yield_streak";
+  const attemptCol = alias ? `${alias}.last_content_attempt_at` : "last_content_attempt_at";
+  const noYieldBackoffDays = Math.max(
+    1,
+    parseInt(String(process.env.NO_YIELD_BACKOFF_DAYS ?? "14"), 10) || 14,
+  );
+  return (
+    `AND (${col} < 3 ` +
+    `OR ${attemptCol} IS NULL ` +
+    `OR ${attemptCol} <= datetime('now','-${noYieldBackoffDays} days'))`
+  );
+}
+
+/**
+ * Record whether a content-refresh attempt yielded any extractable/writable
+ * field for this provider. `yielded=false` increments content_no_yield_streak
+ * (3 consecutive no-yield outcomes trigger the NO_YIELD_BACKOFF_DAYS rest
+ * period enforced by noYieldBackoffExclusionSql, above); `yielded=true`
+ * resets the streak to 0. Mirrors the shape of recordProviderHomepageFetchResult/
+ * markProviderContentAttempted (providerId in, best-effort UPDATE). Best-effort;
+ * returns true if a row changed.
+ */
+export function recordProviderContentYield(providerId: string, yielded: boolean): boolean {
+  const db = getDb(VERTICAL);
+  const res = db
+    .prepare(
+      yielded
+        ? `UPDATE experience_providers SET content_no_yield_streak = 0 WHERE id = ?`
+        : `UPDATE experience_providers SET content_no_yield_streak = content_no_yield_streak + 1 WHERE id = ?`
+    )
+    .run(providerId);
+  return res.changes > 0;
+}
+
 export function recordProviderHomepageFetchResult(
   providerId: string,
   ok: boolean,
@@ -1584,6 +1631,7 @@ export function selectProvidersForContentRefresh(limit = 25): ContentRefreshTarg
                    )
           )
           ${providerParkingExclusionSql("p")}
+          ${noYieldBackoffExclusionSql("p")}
         ORDER BY (p.last_content_attempt_at IS NOT NULL), p.last_content_attempt_at ASC, p.created_at ASC
         LIMIT ?`
     )
