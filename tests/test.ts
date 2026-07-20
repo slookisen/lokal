@@ -22587,6 +22587,7 @@ console.log("\n── orch-pr-14: MCP discovery product_id surfacing ──");
   try { await _retentionRollupPromise; } catch { /* errors already pushed to failures */ }
   try { await _pageEvidenceCrawlPromise; } catch { /* errors already pushed to failures */ }
   try { await _homepageSelectorParkingPromise; } catch { /* errors already pushed to failures */ }
+  try { await _homepageSelectorRotationPromise; } catch { /* errors already pushed to failures */ }
   try { await _domainCoherenceSweepPromise; } catch { /* errors already pushed to failures */ }
   try { await _pendingVerifyParkingPromise; } catch { /* errors already pushed to failures */ }
   try { await _adminAgentsDeletePromise; } catch { /* errors already pushed to failures */ }
@@ -28776,6 +28777,44 @@ const _homepageSelectorParkingPromise: Promise<void> = new Promise<void>(r => {
 })();
 
 // ═══════════════════════════════════════════════════════════════════════
+// dev-request 2026-07-19-enrichment-selector-rotasjon-no-yield-backoff:
+// selector-rotation + no-yield backoff for POST /admin/homepage-provenance-batch
+// (src/routes/marketplace.ts) — last_enrichment_attempt_at/last_enrichment_outcome
+// stamped on every attempted agent (every outcome), default auto-select ordered
+// by last_enrichment_attempt_at ASC instead of updated_at, and a new
+// no_yield_streak>=3 backoff (NO_YIELD_BACKOFF_DAYS, default 14) separate from
+// the existing homepage_fetch_attempts/homepage_unreachable_since 3-strikes
+// fetch-failure parking. Swaps the shared getDb() singleton (own dedicated
+// test file, in-memory prod-schema DB) — mirrors the homepage-selector-parking
+// block immediately above, so it must run strictly after it;
+// _homepageSelectorParkingPromise is the current tail of that serial chain.
+let _homepageSelectorRotationResolve: () => void = () => {};
+const _homepageSelectorRotationPromise: Promise<void> = new Promise<void>(r => {
+  _homepageSelectorRotationResolve = r;
+});
+
+(async () => {
+  await Promise.allSettled([_homepageSelectorParkingPromise]);
+  await new Promise(r => setImmediate(r));
+
+  console.log("\n── dev-request 2026-07-19: enrichment selector rotation + no-yield backoff ──");
+  try {
+    const { runHomepageProvenanceSelectorRotationTests } = require("../src/routes/homepage-provenance-selector-rotation.test") as
+      typeof import("../src/routes/homepage-provenance-selector-rotation.test");
+    const sr = await runHomepageProvenanceSelectorRotationTests({ log: false });
+    passed += sr.passed;
+    failed += sr.failed;
+    for (const f of sr.failures) failures.push("homepage-selector-rotation: " + f);
+    console.log(`  homepage-selector-rotation: ${sr.passed} passed, ${sr.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("homepage-selector-rotation: unexpected error: " + String(err?.message || err));
+  } finally {
+    _homepageSelectorRotationResolve();
+  }
+})();
+
+// ═══════════════════════════════════════════════════════════════════════
 // dev-request 2026-07-12-rfb-enrichment-pool-refill-and-waste-reduction
 // (item 3): POST /admin/verifier/domain-coherence-sweep
 // (src/routes/admin-domain-coherence.ts) — reuses domainCoherenceCheck to
@@ -28785,15 +28824,15 @@ const _homepageSelectorParkingPromise: Promise<void> = new Promise<void>(r => {
 // columns), and pickReviewQueueBatch (lokal-agent-verifier.ts) honors the
 // same parking backoff. Swaps the shared getDb() singleton (own dedicated
 // test file, in-memory prod-schema DB) — mirrors the homepage-selector-
-// parking block immediately above, so it must run strictly after it;
-// _homepageSelectorParkingPromise is the current tail of that serial chain.
+// rotation block immediately above, so it must run strictly after it;
+// _homepageSelectorRotationPromise is the current tail of that serial chain.
 let _domainCoherenceSweepResolve: () => void = () => {};
 const _domainCoherenceSweepPromise: Promise<void> = new Promise<void>(r => {
   _domainCoherenceSweepResolve = r;
 });
 
 (async () => {
-  await Promise.allSettled([_homepageSelectorParkingPromise]);
+  await Promise.allSettled([_homepageSelectorRotationPromise]);
   await new Promise(r => setImmediate(r));
 
   console.log("\n── dev-request 2026-07-12 item 3: domain-coherence sweep ──");

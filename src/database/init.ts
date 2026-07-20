@@ -1142,6 +1142,45 @@ function initSchema(db: Database.Database): void {
     }
   }
 
+  // ─── dev-request 2026-07-19-enrichment-selector-rotasjon-no-yield-backoff ──
+  // POST /admin/homepage-provenance-batch's default auto-select ordered by
+  // k.updated_at ASC, but its two "nothing useful came out of this fetch"
+  // early-return paths (fetch succeeded, ownership guard rejected the page /
+  // fetch succeeded but no contact fields were extractable) never wrote
+  // ANYTHING to agent_knowledge — not even updated_at. An agent that landed in
+  // that gap sorted as "least recently touched" FOREVER and got reselected on
+  // every single call (CONFIRMED: 3 consecutive calls with limit:15 returned
+  // the identical processed=13, enriched=0 batch — zero universe coverage).
+  // last_enrichment_attempt_at / last_enrichment_outcome are stamped on EVERY
+  // agent for which a homepage fetch was actually attempted (all outcomes),
+  // and the selector now orders by last_enrichment_attempt_at ASC (NULLs —
+  // never attempted — first) instead of updated_at, guaranteeing full-universe
+  // rotation before any repeat. no_yield_streak adds a softer, separate
+  // backoff on top of that rotation: 3 consecutive no-yield outcomes (fetched
+  // fine, nothing extractable) rest the agent for NO_YIELD_BACKOFF_DAYS days
+  // (env-configurable, default 14) so a page that structurally never yields
+  // anything doesn't keep burning a network round-trip every run. This is
+  // fully independent of, and additive alongside, the existing
+  // homepage_fetch_attempts / homepage_unreachable_since 3-strikes / 30-day
+  // fetch-FAILURE parking mechanism above — that mechanism is untouched.
+  // last_enrichment_outcome values: 'enriched' | 'no_yield' | 'fetch_failed' |
+  // 'wrong_entity' (the existing website-ownership-guard rejection branch —
+  // homepage fetched fine but the page doesn't mention the producer).
+  // 'locked' is part of the outcome vocabulary for other enrichment handlers
+  // (e.g. the curated-fields gate in homepage-content-refresh) but has no
+  // reachable branch in THIS handler, so it is never written here.
+  for (const stmt of [
+    `ALTER TABLE agent_knowledge ADD COLUMN last_enrichment_attempt_at TEXT`,
+    `ALTER TABLE agent_knowledge ADD COLUMN last_enrichment_outcome TEXT`,
+    `ALTER TABLE agent_knowledge ADD COLUMN no_yield_streak INTEGER NOT NULL DEFAULT 0`,
+  ]) {
+    try {
+      db.exec(stmt);
+    } catch {
+      // Column already exists — expected after first migration
+    }
+  }
+
   // outreach_sent_log — Phase 5 ledger of WHAT we have actually sent
   // through the verify-first pipeline. Empty initially; the WO #9
   // marketing-pool-switch will start writing rows here. CRM threads

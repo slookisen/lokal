@@ -4824,6 +4824,22 @@ router.post("/admin/homepage-provenance-batch", async (req: Request, res: Respon
     ? ""
     : `AND (k.homepage_unreachable_since IS NULL OR k.homepage_unreachable_since <= datetime('now','-30 days'))`;
 
+  // dev-request 2026-07-19-enrichment-selector-rotasjon-no-yield-backoff:
+  // separate, additive backoff for the default auto-select's "fetched fine,
+  // nothing extractable / wrong-entity" cohort (no_yield_streak) — distinct
+  // from the fetch-FAILURE parking above. 3 consecutive no-yield outcomes
+  // rest the agent for NO_YIELD_BACKOFF_DAYS days (default 14, env-configurable,
+  // parsed defensively same as OUTREACH_COOLDOWN_DAYS in crm.ts). A single
+  // subsequent 'enriched' outcome resets no_yield_streak to 0, which alone
+  // clears the exclusion (no separate "cleared" column needed).
+  const noYieldBackoffDays = Math.max(
+    1,
+    parseInt(String(process.env.NO_YIELD_BACKOFF_DAYS ?? "14"), 10) || 14,
+  );
+  const noYieldBackoffExclusion =
+    `AND (k.no_yield_streak < 3 OR k.last_enrichment_attempt_at IS NULL ` +
+    `OR k.last_enrichment_attempt_at <= datetime('now','-${noYieldBackoffDays} days'))`;
+
   if (Array.isArray(bodyAgentIds) && bodyAgentIds.length > 0) {
     // Explicit list — trust the caller, just cap it.
     targetIds = (bodyAgentIds as unknown[])
@@ -4883,14 +4899,22 @@ router.post("/admin/homepage-provenance-batch", async (req: Request, res: Respon
               OR k.field_provenance NOT LIKE '%"homepage"%'
             )
             ${parkingExclusion}
+            ${noYieldBackoffExclusion}
           -- orch-pr-20260625-1 (controller-handoff 2026-06-24-lokal-agent-enrichment-2
           --   + companion -homepage-fetch-wall-1): order REACHABLE homepages first so the
           --   batch stops re-selecting the same dead-URL TIER-1 cohort every run. Pure
           --   ordering change (no row excluded -> outreach_pool candidate set unchanged);
           --   reachable = url_last_status 2xx/3xx (same predicate as init.ts pool gate).
+          -- dev-request 2026-07-19-enrichment-selector-rotasjon-no-yield-backoff:
+          --   within each reachability tier, order by last_enrichment_attempt_at ASC
+          --   (never-attempted NULLs first — same "(x IS NOT NULL), x ASC" idiom as
+          --   selectProvidersForContentRefresh in experience-store.ts) instead of
+          --   updated_at, so a fetch that yields nothing but touches no other column
+          --   still rotates to the back of the queue instead of being reselected
+          --   forever.
           ORDER BY
             CASE WHEN k.url_last_status BETWEEN 200 AND 399 THEN 0 ELSE 1 END,
-            k.updated_at ASC
+            (k.last_enrichment_attempt_at IS NOT NULL), k.last_enrichment_attempt_at ASC
           LIMIT ?`
       )
       .all(limit) as Array<{ agent_id: string; homepage_url: string | null }>;
@@ -5024,9 +5048,14 @@ router.post("/admin/homepage-provenance-batch", async (req: Request, res: Respon
   const parkedNow: string[] = [];
 
   function recordHomepageFetchFailure(agentId: string): void {
+    // dev-request 2026-07-19-enrichment-selector-rotasjon-no-yield-backoff:
+    // stamp attempt/outcome in the SAME statement that already increments
+    // homepage_fetch_attempts (no extra round-trip) — additive observability
+    // alongside the existing fetch-failure counter, does not alter it.
     db.prepare(
-      "UPDATE agent_knowledge SET homepage_fetch_attempts = homepage_fetch_attempts + 1 WHERE agent_id = ?"
-    ).run(agentId);
+      "UPDATE agent_knowledge SET homepage_fetch_attempts = homepage_fetch_attempts + 1, " +
+      "last_enrichment_attempt_at = ?, last_enrichment_outcome = 'fetch_failed' WHERE agent_id = ?"
+    ).run(new Date().toISOString(), agentId);
     const row = db
       .prepare(
         "SELECT homepage_fetch_attempts, homepage_unreachable_since FROM agent_knowledge WHERE agent_id = ?"
@@ -5151,9 +5180,18 @@ router.post("/admin/homepage-provenance-batch", async (req: Request, res: Respon
         url: fetchUrl,
         checked_at: nowIsoU,
       };
+      // dev-request 2026-07-19-enrichment-selector-rotasjon-no-yield-backoff:
+      // this branch already writes a row (field_provenance/updated_at), so
+      // batch the attempt/outcome stamp into the same UPDATE. Outcome is
+      // 'wrong_entity' (the real, reachable branch for that value in this
+      // handler) — deliberately NOT counted toward no_yield_streak, since the
+      // no-yield backoff is scoped to "fetched fine, nothing extractable",
+      // not "fetched fine, wrong site"; this agent still rotates via
+      // last_enrichment_attempt_at ASC same as every other outcome.
       db.prepare(
-        "UPDATE agent_knowledge SET field_provenance = ?, updated_at = ? WHERE agent_id = ?"
-      ).run(JSON.stringify(existingProvU), nowIsoU, agentId);
+        "UPDATE agent_knowledge SET field_provenance = ?, updated_at = ?, " +
+        "last_enrichment_attempt_at = ?, last_enrichment_outcome = 'wrong_entity' WHERE agent_id = ?"
+      ).run(JSON.stringify(existingProvU), nowIsoU, nowIsoU, agentId);
       console.log(
         `[homepage-provenance] ${agentId} (${producerName}) website ownership UNVERIFIED for ${fetchUrl} — page does not mention producer; homepage source NOT recorded`
       );
@@ -5189,7 +5227,20 @@ router.post("/admin/homepage-provenance-batch", async (req: Request, res: Respon
     }
 
     const fieldsFound = Object.keys(incomingProv);
-    if (fieldsFound.length === 0) return { agentId, status: "no_data" };
+    if (fieldsFound.length === 0) {
+      // dev-request 2026-07-19-enrichment-selector-rotasjon-no-yield-backoff:
+      // this is the exact selector-starvation bug — homepage fetched fine but
+      // nothing extractable, and previously NOTHING was written here (not even
+      // updated_at), so this agent sorted "least recently touched" forever
+      // and got reselected on every single call. Stamp the attempt + outcome
+      // and bump no_yield_streak so 3 consecutive no-yield outcomes trigger
+      // the NO_YIELD_BACKOFF_DAYS rest period (selector WHERE clause above).
+      db.prepare(
+        "UPDATE agent_knowledge SET last_enrichment_attempt_at = ?, last_enrichment_outcome = 'no_yield', " +
+        "no_yield_streak = COALESCE(no_yield_streak, 0) + 1 WHERE agent_id = ?"
+      ).run(nowIso, agentId);
+      return { agentId, status: "no_data" };
+    }
 
     // Parse existing provenance, merge, write back.
     let existingProv: Record<string, unknown> = {};
@@ -5235,6 +5286,15 @@ router.post("/admin/homepage-provenance-batch", async (req: Request, res: Respon
       params.push(provJson);
       sets.push("updated_at = ?");
       params.push(nowIso);
+      // dev-request 2026-07-19-enrichment-selector-rotasjon-no-yield-backoff:
+      // an 'enriched' outcome resets no_yield_streak to 0 — the moment real
+      // progress happens, any accumulated no-yield backoff is cleared (the
+      // selector's `no_yield_streak >= 3` exclusion condition alone becomes
+      // false again, no separate "backoff cleared" column needed).
+      sets.push("last_enrichment_attempt_at = ?");
+      params.push(nowIso);
+      sets.push("last_enrichment_outcome = 'enriched'");
+      sets.push("no_yield_streak = 0");
       params.push(agentId);
 
       db.prepare(
