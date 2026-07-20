@@ -23,6 +23,10 @@ import {
   extractBusinessTypeTokens,
   extractProductMentions,
   summarizeAbout,
+  summarizeVisit,
+  // dev-request 2026-07-20 gårdssalg-kvalitetsgate-redesign, criterion 1:
+  // structure-aware prose extraction (PURE).
+  extractProseText,
   // PR-24a: homepage CONTENT → platform write helpers (PURE).
   mapToPlatformCategories,
   meetsAboutQualityBar,
@@ -339,6 +343,113 @@ export function runSearchEnrichTests(opts: { log?: boolean } = {}): TestSummary 
     assertTrue(sum.length <= 300, "summarizeAbout: caps at ~300 chars");
     assertEq(summarizeAbout(""), "", "summarizeAbout: empty → empty");
   }
+
+  // ── dev-request 2026-07-20-gardssalg-kvalitetsgate-redesign, criterion 1 ──
+  // extractProseText(): structure-aware fallback used by summarizeAbout()/
+  // summarizeVisit() only — reproduces the Draopar production bug (nav-menu
+  // chrome glued to the one real prose sentence, which slipped past the old
+  // "contains a prose signal word ⇒ trust the whole block" quality-gate
+  // loophole because that loophole isn't touched by this slice).
+
+  // Draopar-shaped fixture: <header><nav><ul> menu + <footer><ul> menu around
+  // ONE real sentence (contains "er", the classic loophole trigger word).
+  const draoparHtml =
+    "<html><head><title>Draopar</title></head><body>" +
+    "<header><nav><ul>" +
+    "<li><a href='/'>Hjem</a></li><li><a href='/om'>Om oss</a></li>" +
+    "<li><a href='/produkter'>Produkter</a></li><li><a href='/kontakt'>Kontakt</a></li>" +
+    "<li><a href='/nyheter'>Nyheter</a></li>" +
+    "</ul></nav></header>" +
+    "<main><p>Draopar er en liten gård som selger friske grønnsaker rett fra jordet.</p></main>" +
+    "<footer><ul>" +
+    "<li><a href='/personvern'>Personvern</a></li><li><a href='/vilkar'>Vilkår</a></li>" +
+    "<li><a href='/facebook'>Facebook</a></li>" +
+    "</ul><p>&copy; 2026 Draopar Gård</p></footer>" +
+    "</body></html>";
+  {
+    const prose = extractProseText(draoparHtml);
+    assertTrue(prose.includes("Draopar er en liten gård"), "extractProseText/Draopar: keeps the real sentence");
+    for (const junk of ["Hjem", "Om oss", "Produkter", "Nyheter", "Personvern", "Vilkår", "Facebook"]) {
+      assertTrue(!prose.includes(junk), `extractProseText/Draopar: excludes nav/footer menu item '${junk}'`);
+    }
+    // Contrast: the pre-existing extractVisibleText (unchanged, still used
+    // elsewhere) does NOT filter nav/footer chrome — proves the fixture
+    // actually reproduces the bug rather than being vacuously nav-free.
+    const blind = extractVisibleText(draoparHtml);
+    assertTrue(blind.includes("Hjem") && blind.includes("Personvern"), "extractProseText/Draopar: extractVisibleText (unchanged) still leaks the nav/footer junk on the same input");
+  }
+
+  // Nested chrome: <nav> wrapped inside <header><div>...</div></header> — the
+  // depth-aware remover must track the SHARED nav/header/footer/aside family
+  // across nesting, not just a single non-greedy tag pair.
+  {
+    const nested =
+      "<body><header><div><nav><ul><li><a href='/'>Hjem</a></li>" +
+      "<li><a href='/butikk'>Butikk</a></li></ul></nav></div></header>" +
+      "<p>Gården vår er kjent for økologisk frukt og bær.</p></body>";
+    const prose = extractProseText(nested);
+    assertTrue(!prose.includes("Hjem") && !prose.includes("Butikk"), "extractProseText: nested <header><div><nav> chrome excluded");
+    assertTrue(prose.includes("økologisk frukt"), "extractProseText: real sentence after nested chrome survives");
+  }
+
+  // Bare high-link-density <ul> menu with NO <nav>/<header> wrapper at all —
+  // the classic "nav-menu-disguised-as-a-list" pattern (link-density signal).
+  {
+    const bareMenu =
+      "<body><ul><li><a href='/'>Hjem</a></li><li><a href='/butikk'>Butikk</a></li>" +
+      "<li><a href='/om'>Om</a></li><li><a href='/kontakt'>Kontakt</a></li></ul>" +
+      "<p>Vi er en liten gård som selger egne grønnsaker og bær.</p></body>";
+    const prose = extractProseText(bareMenu);
+    assertTrue(!prose.includes("Hjem") && !prose.includes("Butikk"), "extractProseText: bare high-link-density <ul> menu (no nav/header wrapper) excluded");
+    assertTrue(prose.includes("grønnsaker"), "extractProseText: real sentence after bare menu <ul> survives");
+  }
+
+  // Normal, non-nav-polluted fixture: prose still comes through unchanged.
+  {
+    const html = "<body><header><nav>Meny</nav></header><p>Vi er et lite familiebakeri som baker surdeigsbrød hver morgen.</p></body>";
+    const prose = extractProseText(html);
+    assertTrue(prose.includes("familiebakeri"), "extractProseText: normal page — real prose still extracted");
+    assertTrue(!prose.includes("Meny"), "extractProseText: normal page — <nav> text still excluded");
+  }
+  // A real product <ul> (low link density — mostly plain text, no <a> tags)
+  // must NOT be treated as a nav menu and dropped.
+  {
+    const html = "<body><p>Vi selger følgende produkter:</p><ul><li>Poteter fra egen åker</li><li>Gulrøtter, høstet i går</li><li>Rødbeter i sesong</li></ul></body>";
+    const prose = extractProseText(html);
+    assertTrue(prose.includes("Poteter fra egen åker"), "extractProseText: genuine low-link-density product <ul> is kept, not treated as a nav menu");
+  }
+
+  // Empty/no-html edge case — same empty-string contract as extractVisibleText.
+  assertEq(extractProseText(""), "", "extractProseText: empty in → empty out");
+  assertEq(extractProseText(null as unknown as string), "", "extractProseText: null-ish in → empty out");
+
+  // ~20k-char cap, same contract as extractVisibleText.
+  {
+    const big = "ord ".repeat(20000);
+    assertTrue(extractProseText(`<body>${big}</body>`).length <= 20000, "extractProseText: caps at ~20k chars");
+  }
+
+  // End-to-end: summarizeAbout()/summarizeVisit() on the Draopar fixture must
+  // NOT surface the nav/footer junk (this is the actual about_text/visit_text
+  // write-path fix — extractProseText alone proves the extractor works, this
+  // proves it's actually wired in).
+  {
+    const about = summarizeAbout(draoparHtml);
+    assertTrue(about.includes("Draopar er en liten gård"), "summarizeAbout: Draopar fixture — real sentence surfaced");
+    assertTrue(!about.includes("Hjem") && !about.includes("Personvern"), "summarizeAbout: Draopar fixture — nav/footer junk NOT in about_text (regression guard for the production bug)");
+  }
+  {
+    const visitHtml =
+      "<html><body><header><nav><ul><li><a href='/'>Hjem</a></li><li><a href='/om'>Om</a></li>" +
+      "<li><a href='/kontakt'>Kontakt</a></li></ul></nav></header>" +
+      "<main><p>Velkommen til omvisning og smaking på gården vår hver lørdag.</p></main>" +
+      "<footer><ul><li><a href='/vilkar'>Vilkår</a></li><li><a href='/personvern'>Personvern</a></li>" +
+      "<li><a href='/fb'>Facebook</a></li></ul></footer></body></html>";
+    const visit = summarizeVisit(visitHtml);
+    assertTrue(visit.includes("omvisning"), "summarizeVisit: Draopar-shaped fixture — real visit sentence surfaced");
+    assertTrue(!visit.includes("Hjem") && !visit.includes("Vilkår"), "summarizeVisit: Draopar-shaped fixture — nav/footer junk NOT in visit_text");
+  }
+  assertEq(summarizeVisit(""), "", "summarizeVisit: empty → empty");
 
   // ── PR-24a: mapToPlatformCategories — extractor output → platform vocab ─────
   // Built from the live profile-removal complaints. Each case runs the SAME

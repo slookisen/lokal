@@ -664,34 +664,51 @@ export function runOpplevelserGardssalgContentAuditTests(
       // ── (l) duplicate-field guard (dev-request 2026-07-20-kvalitetsgate,
       //       slice 1 — the Draopar incident): a source page with no distinct
       //       "visit us" section can make summarizeAbout()/summarizeVisit()
-      //       independently land on the EXACT SAME extracted block —
-      //       reproduced here with the real production HTML shape (nav links
-      //       glued in front of one real sentence, where "sidersmaking"
-      //       false-matches summarizeVisit's bare-substring "smaking" keyword
-      //       scan). Before the fix, candidateAbout and candidateVisit in
-      //       POST /admin/gardssalg-content-refresh's processOne() were BOTH
-      //       set to this identical text, so about_text and visit_text ended
-      //       up byte-identical after write. Proves the fix: only about_text
-      //       gets written; visit_text stays blank rather than mirroring it. ──
+      //       independently land on the EXACT SAME extracted block. Before
+      //       the #313 fix, candidateAbout and candidateVisit in POST
+      //       /admin/gardssalg-content-refresh's processOne() were BOTH set
+      //       to this identical text, so about_text and visit_text ended up
+      //       byte-identical after write; #313 guards the ASSIGNMENT itself
+      //       (only about_text gets it when they coincide).
+      //
+      //       UPDATE (kvalitetsgate-redesign criterion 1, this slice): the
+      //       ORIGINAL fixture here reproduced the Draopar bug at the
+      //       extractor level too — a flat run of nav-menu <a> links glued in
+      //       front of the one real sentence, with "sidersmaking" (a nav
+      //       link's own label) false-matching summarizeVisit's bare-
+      //       substring "smaking" scan. That was possible because
+      //       summarizeAbout()/summarizeVisit() extracted their fallback text
+      //       via extractVisibleText(), which does not distinguish <nav>
+      //       chrome from body prose. They now extract via extractProseText()
+      //       (search-enrich.ts), which drops <nav>/<header>/<footer>/<aside>
+      //       blocks before flattening — so the nav links here are excluded
+      //       from the candidate entirely and no longer reach either
+      //       extractor. The fixture below keeps the "same chunk" shape that
+      //       #313's guard exists for, but the coincidence is now a GENUINE
+      //       one — the page's one real sentence itself names "sidersmaking"
+      //       (cider tasting), so summarizeAbout()'s first-paragraph fallback
+      //       and summarizeVisit()'s "smaking" keyword scan still legitimately
+      //       land on the same real prose, proving #313's guard is still
+      //       load-bearing even after the nav contamination is fixed — while
+      //       the nav links themselves (now correctly excluded) prove THIS
+      //       slice's fix. ──
       const prevFetchL = globalThis.fetch;
       try {
-        // Same shape as the real Draopar bug report: a flat run of nav-menu
-        // links (no sentence-ending punctuation of their own) glued directly
-        // in front of the page's one real sentence, all inside a single
-        // "sentence" chunk (extractVisibleText doesn't drop <nav>, and there
-        // is only one '.' in the whole page, at the very end) — so BOTH
-        // summarizeAbout()'s first-paragraph fallback AND summarizeVisit()'s
-        // keyword scan (matching "smaking" inside "sidersmaking") land on
-        // this exact same chunk.
+        // Nav-menu chrome (now excluded by extractProseText) wrapped around
+        // the page's one real sentence, which itself genuinely mentions
+        // "sidersmaking" (cider tasting) — so after nav-stripping, the SAME
+        // single real chunk is still what both summarizeAbout() and
+        // summarizeVisit() land on, exercising the #313 dedup guard on
+        // legitimate content instead of leaked nav-menu text.
         const DRAOPAR_SHAPE_HTML =
           '<html><body>' +
-          '<nav><a href="/">Heim</a> <a href="/salg">Salg og sidersmaking</a> ' +
+          '<nav><a href="/">Heim</a> <a href="/salg">Salg</a> ' +
           '<a href="/om">Om sider</a> <a href="/kontakt">Kontakt</a> ' +
           '<a href="/sortar">Sidersortar</a> <a href="/alkoholfritt">Alkoholfritt draopar</a></nav>' +
-          '<main><p>Draopar er dialekt for dråper.</p></main>' +
+          '<main><p>Vi driv eit vesle sideri i Hardanger og inviterer til sidersmaking i vår gamle løe kvar laurdag i haustsesongen.</p></main>' +
           '</body></html>';
         const DRAOPAR_SHAPE_TEXT =
-          "Heim Salg og sidersmaking Om sider Kontakt Sidersortar Alkoholfritt draopar Draopar er dialekt for dråper.";
+          "Vi driv eit vesle sideri i Hardanger og inviterer til sidersmaking i vår gamle løe kvar laurdag i haustsesongen.";
 
         insertProvider.run({
           id: "prov-l-duplicate", navn: "Prov L Draopar Gard", hjemmeside: "https://prov-l-duplicate.example.no",
@@ -719,7 +736,7 @@ export function runOpplevelserGardssalgContentAuditTests(
         const rowL = getProviderRow("prov-l-duplicate");
         assertEq(rowL.about_text, DRAOPAR_SHAPE_TEXT, "l2: about_text is written from the (only) derivable block");
         assertEq(rowL.visit_text, null, "l3: visit_text stays blank/null — NOT a duplicate of about_text");
-        assertTrue(rowL.about_text !== rowL.visit_text, "l4: about_text and visit_text are never byte-identical (the Draopar regression itself)");
+        assertTrue(rowL.about_text !== rowL.visit_text, "l4: about_text and visit_text are never byte-identical (the #313 regression itself)");
 
         const entryL = applyL.body.changed.find((c: any) => c.provider_id === "prov-l-duplicate");
         assertTrue(!!entryL, "l5: prov-l-duplicate appears in the apply response's changed[]");
