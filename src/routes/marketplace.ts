@@ -5165,7 +5165,12 @@ router.post("/admin/homepage-provenance-batch", async (req: Request, res: Respon
   const FETCH_TIMEOUT_MS = 10_000;
 
   type AgentOutcome =
-    | { agentId: string; status: "enriched"; fieldsFound: string[]; provenanceWritten: boolean }
+    // dev-request 2026-07-13-enrichment-tynne-profiler-trust-score (item 2):
+    // emailReplaced is additive/optional — true only when a JUNK stored email
+    // was replaced by a newly extracted guarded value under low_quality mode
+    // (see processAgent's write transaction below); absent/false for every
+    // other outcome, including the pre-existing fill-if-empty path.
+    | { agentId: string; status: "enriched"; fieldsFound: string[]; provenanceWritten: boolean; emailReplaced?: boolean }
     | { agentId: string; status: "no_data" }
     | { agentId: string; status: "ownership_unverified" }
     | { agentId: string; status: "fetch_error"; error: string }
@@ -5393,6 +5398,15 @@ router.post("/admin/homepage-provenance-batch", async (req: Request, res: Respon
     const mergedProv = mergeFieldProvenance(existingProv, incomingProv);
     const provJson = JSON.stringify(mergedProv);
 
+    // dev-request 2026-07-13-enrichment-tynne-profiler-trust-score (item 2):
+    // lazily-fetched curated-field lock cache — knowledgeService.getCuratedFields
+    // is a cheap indexed SELECT (same cost class as the kRow lookup above), but
+    // only agents that actually reach the junk-email-replacement branch below
+    // need it, so it's fetched at most once per call, on demand, rather than
+    // unconditionally for every agent processed.
+    let curatedFieldsCache: ReturnType<typeof knowledgeService.getCuratedFields> | null = null;
+    let emailReplaced = false;
+
     // Optionally back-fill empty columns (mirrors google-rating-batch: only write if column empty).
     const tx = db.transaction(() => {
       const sets: string[] = [];
@@ -5420,6 +5434,28 @@ router.post("/admin/homepage-provenance-batch", async (req: Request, res: Respon
       if (!currEmail && incomingProv.email) {
         sets.push("email = ?");
         params.push(incomingProv.email.sources[0].value);
+      } else if (
+        // dev-request 2026-07-13-enrichment-tynne-profiler-trust-score (item 2):
+        // low_quality mode only — a NON-empty stored email that is itself
+        // JUNK (isJunkEmail; e.g. "info@example.com") gets REPLACED by a
+        // newly extracted, guarded, DIFFERENT value. A non-junk (real,
+        // verified-good) stored email is never touched here — only a
+        // currently-junk value is eligible. The absolute curated-field-lock
+        // guard is checked below, before any write, and is never bypassed.
+        isLowQualityMode &&
+        currEmail &&
+        isJunkEmail(currEmail) &&
+        incomingProv.email &&
+        incomingProv.email.sources[0].value.toLowerCase() !== currEmail.toLowerCase()
+      ) {
+        if (curatedFieldsCache === null) {
+          curatedFieldsCache = knowledgeService.getCuratedFields(agentId);
+        }
+        if (!curatedFieldsCache["email"]) {
+          sets.push("email = ?");
+          params.push(incomingProv.email.sources[0].value);
+          emailReplaced = true;
+        }
       }
       sets.push("field_provenance = ?");
       params.push(provJson);
@@ -5445,7 +5481,9 @@ router.post("/admin/homepage-provenance-batch", async (req: Request, res: Respon
     });
     tx();
 
-    return { agentId, status: "enriched", fieldsFound, provenanceWritten: true };
+    return emailReplaced
+      ? { agentId, status: "enriched", fieldsFound, provenanceWritten: true, emailReplaced: true }
+      : { agentId, status: "enriched", fieldsFound, provenanceWritten: true };
   }
 
   // Run with limited concurrency (≤3 at a time).
@@ -5500,6 +5538,16 @@ router.post("/admin/homepage-provenance-batch", async (req: Request, res: Respon
   const provenanceWritten = outcomes.filter(
     (o): o is Extract<AgentOutcome, { status: "enriched" }> => o.status === "enriched"
   ).reduce((acc, o) => acc + (o.provenanceWritten ? 1 : 0), 0);
+  // dev-request 2026-07-13-enrichment-tynne-profiler-trust-score (item 2):
+  // small additive observability counter — how many 'enriched' outcomes this
+  // run involved a low_quality junk-email REPLACEMENT (as opposed to a plain
+  // fill-if-empty write). Kept additive/minimal (a count alongside the
+  // existing provenance_written count) rather than restructuring the
+  // response shape, so a future reporting slice can trend it without a
+  // breaking change.
+  const emailReplaced = outcomes.filter(
+    (o): o is Extract<AgentOutcome, { status: "enriched" }> => o.status === "enriched"
+  ).reduce((acc, o) => acc + (o.emailReplaced ? 1 : 0), 0);
 
   const byField: Record<string, number> = {};
   for (const o of outcomes) {
@@ -5521,6 +5569,7 @@ router.post("/admin/homepage-provenance-batch", async (req: Request, res: Respon
       enriched,
       ownership_unverified: ownershipUnverified,
       provenance_written: provenanceWritten,
+      email_replaced: emailReplaced,
       by_field: byField,
       errors,
       // Agents that crossed the 3-failure parking threshold during this run

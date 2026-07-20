@@ -22612,6 +22612,7 @@ console.log("\n── orch-pr-14: MCP discovery product_id surfacing ──");
   try { await _pilotOrdreLoopPromise; } catch { /* errors already pushed to failures */ }
   try { await _expNoYieldBackoffPromise; } catch { /* errors already pushed to failures */ }
   try { await _lowQualitySelectorPromise; } catch { /* errors already pushed to failures */ }
+  try { await _junkEmailReplacePromise; } catch { /* errors already pushed to failures */ }
   // relax-envelope tests are synchronous (pure validateEnvelope() unit test) — no promise needed
   // PR-109 tests are synchronous (IIFE) — no promise needed
   // Drop pre-existing intg failures (unmasked by awaiting) — they predate M2
@@ -29327,6 +29328,41 @@ const _lowQualitySelectorPromise: Promise<void> = new Promise<void>(r => {
     failures.push("low-quality-selector: unexpected error: " + String(err?.message || err));
   } finally {
     _lowQualitySelectorResolve();
+  }
+})();
+
+// ═══════════════════════════════════════════════════════════════════════
+// dev-request 2026-07-13-enrichment-tynne-profiler-trust-score (item 2):
+// low_quality mode REPLACES a JUNK stored email (isJunkEmail) with a newly
+// extracted, guarded, DIFFERENT value — never touches a non-junk (good)
+// stored email, never bypasses a curated_fields "email" lock, and leaves
+// default (non-low_quality) mode byte-for-byte unchanged. Own dedicated test
+// file (own in-memory DB, swaps the shared getDb() singleton) — chained
+// after _lowQualitySelectorPromise (same handler, items 1/3 of the same
+// dev-request).
+let _junkEmailReplaceResolve: () => void = () => {};
+const _junkEmailReplacePromise: Promise<void> = new Promise<void>(r => {
+  _junkEmailReplaceResolve = r;
+});
+
+(async () => {
+  await Promise.allSettled([_lowQualitySelectorPromise]);
+  await new Promise(r => setImmediate(r));
+
+  console.log("\n── dev-request 2026-07-13 (item 2): low_quality junk-email replacement ──");
+  try {
+    const { runHomepageProvenanceJunkEmailReplaceTests } = require("../src/routes/homepage-provenance-junk-email-replace.test") as
+      typeof import("../src/routes/homepage-provenance-junk-email-replace.test");
+    const jer = await runHomepageProvenanceJunkEmailReplaceTests({ log: false });
+    passed += jer.passed;
+    failed += jer.failed;
+    for (const f of jer.failures) failures.push("junk-email-replace: " + f);
+    console.log(`  junk-email-replace: ${jer.passed} passed, ${jer.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("junk-email-replace: unexpected error: " + String(err?.message || err));
+  } finally {
+    _junkEmailReplaceResolve();
   }
 })();
 
