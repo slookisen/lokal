@@ -40,6 +40,7 @@ import {
 } from "../services/dental-store";
 import { getDb } from "../database/db-factory";
 import { isDisplayablePhone } from "../services/contact-normalizer";
+import { isTestFingerprintPayload } from "../services/dental-contamination";
 import { mergeFieldProvenance } from "./admin-knowledge";
 import {
   placesPeriodsToOpeningHours,
@@ -235,54 +236,11 @@ router.post("/agents", requireAdmin, (req: Request, res: Response) => {
 // be a target for test-fingerprint payloads.
 const DENTAL_SYNTHETIC_PROBE_IDS = new Set(["persistence-probe-pr100b"]);
 
-// Returns true if `body` matches the KNOWN contamination fingerprint from
-// the incident above. Deliberately narrow — matches on the literal known-bad
-// values/shapes, not a generic heuristic — to avoid false positives on
-// legitimate data that happens to share one field name. ANY ONE of these
-// present is enough to flag the payload: each incident write landed via a
-// single-field PUT, so the check must not require multiple fields at once.
-function isTestFingerprintPayload(body: Record<string, unknown>): boolean {
-  if (!body || typeof body !== "object") return false;
-
-  const specialists = body.specialists;
-  if (
-    Array.isArray(specialists) &&
-    specialists.some(
-      (s) => s && typeof s === "object" && (s as Record<string, unknown>).name === "Test"
-    )
-  ) {
-    return true;
-  }
-
-  if (body.online_booking_url === "https://example.com/booking") return true;
-
-  const socialMedia = body.social_media;
-  if (
-    socialMedia &&
-    typeof socialMedia === "object" &&
-    !Array.isArray(socialMedia) &&
-    (socialMedia as Record<string, unknown>).facebook === "https://facebook.com/x"
-  ) {
-    return true;
-  }
-
-  if (body.om_oss === "test probe") return true;
-
-  const fieldProvenance = body.field_provenance;
-  if (
-    fieldProvenance &&
-    typeof fieldProvenance === "object" &&
-    !Array.isArray(fieldProvenance)
-  ) {
-    for (const key of Object.keys(fieldProvenance as Record<string, unknown>)) {
-      if (key === "_smoke_test_provenance_probe" || key.startsWith("_smoke_test")) {
-        return true;
-      }
-    }
-  }
-
-  return false;
-}
+// isTestFingerprintPayload moved to ../services/dental-contamination (2026-07-21
+// schema-probe-sweep follow-up) — it's now the single source of truth shared
+// with the read-side repair sweep (admin-dental-schema-probe-sweep.ts), which
+// needs to agree on the exact same per-field literal matches. See that
+// module's doc comment for the full fingerprint definition.
 
 // ─── PUT /api/tannlege/agents/:id (admin) ───────────────────────────
 router.put("/agents/:id", requireAdmin, (req: Request, res: Response) => {

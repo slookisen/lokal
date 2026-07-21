@@ -54,6 +54,7 @@ import adminAgentAuditRoutes from "./routes/admin-agent-audit";
 import adminVerifierReviewQueueRoutes from "./routes/admin-verifier-review-queue";
 import adminDomainCoherenceSweepRoutes from "./routes/admin-domain-coherence";
 import adminDentalHjemmesideCleanupRoutes from "./routes/admin-dental-hjemmeside-cleanup";
+import adminDentalSchemaProbeSweepRoutes from "./routes/admin-dental-schema-probe-sweep";
 import adminKnowledgeRoutes, { pruneUrlsRouter, homepageContentRefreshRouter, descriptionTruncationSweepRouter } from "./routes/admin-knowledge";
 import adminSearchEnrichRoutes from "./routes/admin-search-enrich";
 import adminAffiliationsRoutes from "./routes/admin-affiliations";
@@ -540,6 +541,12 @@ app.use("/admin/verifier/domain-coherence-sweep", adminLimiter, adminDomainCoher
 // hjemmeside into the additive directory_url column — dry-run by default,
 // dry_run:false writes. POST /admin/dental/hjemmeside-cleanup-sweep
 app.use("/admin/dental/hjemmeside-cleanup-sweep", adminLimiter, adminDentalHjemmesideCleanupRoutes);
+// dev-request 2026-07-21-dental-schema-probe-writepath-fix, follow-up: finds
+// + repairs dental_agents rows already contaminated by the test/probe
+// fingerprint PR #323's write-path guard now blocks going forward — clears
+// only the contaminated field(s) and flags needs_review for re-enrichment.
+// dry-run by default, apply:true writes. POST /admin/dental/schema-probe-sweep
+app.use("/admin/dental/schema-probe-sweep", adminLimiter, adminDentalSchemaProbeSweepRoutes);
 // PR-24 (2026-05-11): enrichment write surface accepts field_provenance
 app.use("/admin/knowledge", adminLimiter, adminKnowledgeRoutes);
 // orch-pr-9 (2026-06-14): dead/junk URL prune — POST /admin/prune-dead-urls

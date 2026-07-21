@@ -29166,6 +29166,20 @@ const _recentlyEnrichedSpotcheckPromise: Promise<void> = new Promise<void>(r => 
     failures.push("admin-dental-hjemmeside-cleanup: unexpected error: " + String(err?.message || err));
   }
 
+  console.log("\n── dev-request 2026-07-21-dental-schema-probe-writepath-fix (follow-up): POST /admin/dental/schema-probe-sweep ──");
+  try {
+    const { runAdminDentalSchemaProbeSweepTests } = require("../src/routes/admin-dental-schema-probe-sweep.test") as
+      typeof import("../src/routes/admin-dental-schema-probe-sweep.test");
+    const dsps = await runAdminDentalSchemaProbeSweepTests({ log: false });
+    passed += dsps.passed;
+    failed += dsps.failed;
+    for (const f of dsps.failures) failures.push("admin-dental-schema-probe-sweep: " + f);
+    console.log(`  admin-dental-schema-probe-sweep: ${dsps.passed} passed, ${dsps.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("admin-dental-schema-probe-sweep: unexpected error: " + String(err?.message || err));
+  }
+
   console.log("\n── orch-pr-20260716-305: GET /api/opplevelser/admin/providers/recently-enriched (experiences) ──");
   try {
     const { runOpplevelserProvidersRecentlyEnrichedTests } = require("../src/routes/opplevelser-providers-recently-enriched.test") as
