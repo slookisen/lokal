@@ -442,6 +442,7 @@ a:hover{text-decoration:underline}
 .proof-val{font-size:1.4rem;font-weight:800;line-height:1;color:var(--navy)}
 .proof-lbl{font-size:.78rem;color:var(--g500);margin-top:4px}
 .proof-val-muted{color:var(--teal-400)}
+.proof-note{max-width:1100px;margin:10px auto 0;text-align:center;font-size:.72rem;color:var(--g500);line-height:1.5}
 
 /* SECTIONS */
 .section{padding:64px 0}
@@ -605,7 +606,8 @@ function dentalFooter(): string {
     </div>
   </div>
   <div class="footer-bottom">
-    &copy; ${new Date().getFullYear()} Finn-tannlege.com &mdash; AI-agenter: <a href="/llms.txt">llms.txt</a> &middot; API: <a href="/api/tannlege/agents">/api/tannlege</a>
+    &copy; ${new Date().getFullYear()} Finn-tannlege.com &mdash; AI-agenter: <a href="/llms.txt">llms.txt</a> &middot; API: <a href="/api/tannlege/agents">/api/tannlege</a><br>
+    En del av A2A-nettverket: <a href="https://rettfrabonden.com" rel="noopener">rettfrabonden.com</a> &middot; <a href="https://opplevagent.no" rel="noopener">opplevagent.no</a> &mdash; Bygget for både mennesker og AI-agenter
   </div>
 </footer>`;
 }
@@ -827,10 +829,11 @@ router.get("/", (_req: Request, res: Response) => {
   <div class="proof-bar" aria-label="Trafikk">
     <div class="proof-inner">
       <div><div class="proof-val">${traffic.pageViews.toLocaleString("nb")}</div><div class="proof-lbl">Sidevisninger</div></div>
-      <div><div class="proof-val">${traffic.uniqueVisitors.toLocaleString("nb")}</div><div class="proof-lbl">Unike besøkende</div></div>
-      <div><div class="proof-val">${traffic.realHumans.toLocaleString("nb")}</div><div class="proof-lbl">Ekte mennesker</div></div>
-      <div><div class="proof-val proof-val-muted">${traffic.botAndAi.toLocaleString("nb")}</div><div class="proof-lbl">Bot & AI-trafikk</div></div>
+      <div><div class="proof-val">${traffic.realVisitors.toLocaleString("nb")}</div><div class="proof-lbl">Ekte besøkende</div></div>
+      <div title="AI-søk: et menneske spurte ChatGPT, Claude eller Perplexity, og assistenten hentet informasjon fra oss i sanntid. Crawlere: automatisk indeksering og skraping."><div class="proof-val proof-val-muted">${traffic.aiSearchViews.toLocaleString("nb")}</div><div class="proof-lbl">AI-søk</div></div>
+      <div><div class="proof-val">${traffic.botViews.toLocaleString("nb")}</div><div class="proof-lbl">Crawlere & bots</div></div>
     </div>
+    <div class="proof-note">AI-søk: et menneske spurte ChatGPT, Claude eller Perplexity, og assistenten hentet informasjon fra oss i sanntid. Crawlere: automatisk indeksering og skraping. &middot; Siste ${traffic.windowDays} dager</div>
   </div>
 
   <section class="section section-alt">
@@ -940,6 +943,14 @@ router.get("/api/traffic-stats", (_req: Request, res: Response) => {
   res.json({
     pageViews: s.pageViews,
     uniqueVisitors: s.uniqueVisitors,
+    // New three-bucket fields (dev-request 2026-07-21 slice A)
+    realVisitors: s.realVisitors,
+    humanViews: s.humanViews,
+    aiSearchViews: s.aiSearchViews,
+    aiCrawlerViews: s.aiCrawlerViews,
+    botViews: s.botViews,
+    windowDays: s.windowDays,
+    // Back-compat fields (old consumers)
     realHumans: s.realHumans,
     botAndAi: s.botAndAi,
     aiQueries: s.aiQueries,
