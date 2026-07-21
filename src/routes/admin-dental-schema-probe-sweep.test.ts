@@ -350,6 +350,45 @@ export function runAdminDentalSchemaProbeSweepTests(
       const secondApply = await post({ apply: true });
       assertEq(secondApply.body.repaired_count, 0, "12c: second apply run repairs 0 rows (already clean)");
       assertEq(secondApply.body.repairs, [], "12d: second apply repairs array is empty");
+
+      // ── (13) reserved synthetic probe id is excluded from both dry-run
+      // and apply — it's EXPECTED to carry the fingerprint on purpose (the
+      // hourly enrichment worker's own schema probe writes it there every
+      // cycle), so the sweep must never flag or "fix" it. ─────────────────
+      insertAgent.run({
+        id: "persistence-probe-pr100b",
+        navn: "PR-100b Persistence Probe",
+        specialists: JSON.stringify([{ name: "Test", title: "Tannlege" }]),
+        online_booking_url: "https://example.com/booking",
+        social_media: JSON.stringify({ facebook: "https://facebook.com/x" }),
+        om_oss: "test probe",
+        field_provenance: JSON.stringify({ _smoke_test_provenance_probe: { probed_at: "2026-07-21" } }),
+        verification_status: "pending_verify",
+        created_at: "2026-01-01T00:00:00.000Z",
+      });
+
+      const synthDry = await post({});
+      assertEq(synthDry.body.matched_count, 0, "13a: synthetic probe id excluded from dry-run matches");
+      assertTrue(
+        !synthDry.body.matches.some((m: any) => m.id === "persistence-probe-pr100b"),
+        "13b: synthetic probe id not present in dry-run matches list",
+      );
+
+      const synthApply = await post({ apply: true });
+      assertEq(synthApply.body.repaired_count, 0, "13c: synthetic probe id excluded from apply repairs");
+      const synthRow = dentalDb
+        .prepare("SELECT specialists, online_booking_url, social_media, om_oss, field_provenance, verification_status FROM dental_agents WHERE id = ?")
+        .get("persistence-probe-pr100b") as any;
+      assertEq(
+        synthRow.online_booking_url,
+        "https://example.com/booking",
+        "13d: synthetic probe row's fingerprint fields left completely untouched by apply",
+      );
+      assertEq(
+        synthRow.verification_status,
+        "pending_verify",
+        "13e: synthetic probe row's verification_status untouched by apply",
+      );
     } catch (err: any) {
       failed++;
       failures.push("admin-dental-schema-probe-sweep: unexpected error: " + String(err?.stack || err?.message || err));

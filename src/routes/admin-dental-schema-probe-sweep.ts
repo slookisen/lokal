@@ -44,7 +44,7 @@
 
 import { Router, Request, Response } from "express";
 import { getDb } from "../database/db-factory";
-import { findContaminatedFields } from "../services/dental-contamination";
+import { findContaminatedFields, DENTAL_SYNTHETIC_PROBE_IDS } from "../services/dental-contamination";
 import { updateDentalAgent, type DentalAgent } from "../services/dental-store";
 
 function getAdminKey(): string {
@@ -111,7 +111,13 @@ router.post("/", (req: Request, res: Response) => {
 
   try {
     const db = getDb("dental");
-    const rows = fetchAllRows(db);
+    // Exclude reserved synthetic/sandboxed probe ids (see
+    // ../services/dental-contamination.ts) — these are EXPECTED to carry the
+    // fingerprint on purpose (the hourly enrichment worker's own schema
+    // probe writes it here every cycle to exercise the write path). A
+    // sweep/repair pass over real clinic data must never flag or "fix" a
+    // deliberately-fake row like this.
+    const rows = fetchAllRows(db).filter((row) => !DENTAL_SYNTHETIC_PROBE_IDS.has(row.id));
 
     if (!apply) {
       const matches: Array<{ id: string; navn: string; contaminated_fields: string[] }> = [];
