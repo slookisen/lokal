@@ -466,6 +466,25 @@ export function runSearchEnrichTests(opts: { log?: boolean } = {}): TestSummary 
     assertTrue(prose.includes("Rødbeter dyrket økologisk"), "extractProseText: mixed long-title + short-CTA-link product <ul> second item survives (finding 3, round 2)");
   }
 
+  // ── review round 3 — requiring only ONE anchor at/above LONG_ANCHOR_LEN to
+  // disqualify nav classification over-corrects: a genuine nav menu with 3
+  // short chrome labels ("Hjem"/"Om oss"/"Kontakt") plus a single longer
+  // "view all products"-style link (~35 chars) is not a product list — it's
+  // still a nav menu that happens to glue on one long link. Must be stripped;
+  // requires >=2 long anchors to count as content (round 3 / round 4 fix).
+  {
+    const html =
+      "<p>Vi er en liten gård.</p>" +
+      "<ul><li><a href='/'>Hjem</a></li><li><a href='/om'>Om oss</a></li>" +
+      "<li><a href='/kontakt'>Kontakt</a></li>" +
+      "<li><a href='/produkter'>Se alle våre produkter og tjenester</a></li></ul>";
+    const prose = extractProseText(html);
+    for (const junk of ["Hjem", "Om oss", "Kontakt", "Se alle våre produkter"]) {
+      assertTrue(!prose.includes(junk), `extractProseText: nav <ul> with single long "view all" link item '${junk}' still excluded (round 3/4 fix, >=2 long anchors required)`);
+    }
+    assertTrue(prose.includes("liten gård"), "extractProseText: real sentence around single-long-link nav <ul> still survives (round 3/4 fix)");
+  }
+
   // ── review finding 2 — hyphenated custom elements (<header-widget>,
   // <nav-carousel>) must NOT be mistaken for <header>/<nav> and stripped; the
   // old trailing `\b` treats `-` as a non-word-boundary, so it matched into

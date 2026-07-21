@@ -680,16 +680,20 @@ function stripBlocksByTagNames(
  * trips both thresholds just like a nav menu does — so per-anchor text
  * length is a third, required signal.
  *
- * This is a per-anchor MAX/existence check, not an average: an average is
+ * This is a per-anchor MAX/count check, not an average: an average is
  * trivially defeated by a realistic mixed shape where each product row pairs
  * a long descriptive title-link with a separate short call-to-action link
  * ("Kjøp" / "Se her") — e.g. anchors of length [49, 53, 4, 6] average 28,
  * under a naive "<30" mean threshold, even though half the anchors are full
  * product sentences. A genuine nav menu essentially never has even ONE
- * anchor whose text reaches sentence length, so requiring that NO anchor
- * meets/exceeds LONG_ANCHOR_LEN is robust to that minority-of-short-CTAs
- * shape in a way a mean (or median, which the same repro also defeats:
- * median of [4,6,49,53] is 27.5) is not. PURE.
+ * anchor whose text reaches sentence length, let alone two, so requiring
+ * that FEWER THAN 2 anchors meet/exceed LONG_ANCHOR_LEN is robust both to
+ * that minority-of-short-CTAs shape (a mean or median — median of
+ * [4,6,49,53] is 27.5 — is defeated by the same repro) AND to a nav menu
+ * that glues on a single genuinely long "view all products"-style link
+ * alongside its short chrome labels (e.g. "Hjem"/"Om oss"/"Kontakt" plus one
+ * ~35-char link): one long anchor alone isn't enough to call it a product
+ * list — it takes at least two. PURE.
  */
 function isHighLinkDensityBlock(blockHtml: string): boolean {
   const anchors = blockHtml.match(/<a\b[^>]*>[\s\S]*?<\/a>/gi) || [];
@@ -707,13 +711,16 @@ function isHighLinkDensityBlock(blockHtml: string): boolean {
   if (anchorTextLen / totalTextLen < 0.6) return false;
   // Nav-label-short check: genuine nav items ("Om oss", "Kontakt oss",
   // "Åpningstider") are all well under this; a real product-sentence anchor
-  // (e.g. "Poteter fra egen åker, høstet i går") is well over it. A single
-  // anchor at/above this length is decisive: real nav menus don't mix in a
-  // full-sentence link, so its presence means this is a product list, not
-  // a nav menu — even if most OTHER anchors in the same block are short
-  // CTA links like "Kjøp"/"Se her".
+  // (e.g. "Poteter fra egen åker, høstet i går") is well over it. At least
+  // TWO anchors at/above this length is decisive: real nav menus don't mix
+  // in multiple full-sentence links, so their presence means this is a
+  // product list, not a nav menu — even if most OTHER anchors in the same
+  // block are short CTA links like "Kjøp"/"Se her". A single long anchor is
+  // NOT enough on its own: a nav menu can glue on one "view all products"-
+  // style link alongside its short chrome labels without ceasing to be nav.
   const LONG_ANCHOR_LEN = 20;
-  return !anchorTextLens.some((len) => len >= LONG_ANCHOR_LEN);
+  const longAnchorCount = anchorTextLens.filter((len) => len >= LONG_ANCHOR_LEN).length;
+  return longAnchorCount < 2;
 }
 
 /**
