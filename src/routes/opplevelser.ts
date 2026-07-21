@@ -43,6 +43,13 @@ import {
   selectGardssalgProvidersForContentRefresh,
   getGardssalgProviderContentTarget,
   applyGardssalgProviderContent,
+  // dev-request 2026-07-20-gardssalg-kvalitetsgate-redesign, criterion 6 —
+  // retroactive scan+null of about_text/visit_text values that no longer
+  // clear the new extraction+judge gate (see POST /admin/gardssalg-retro-scan).
+  selectGardssalgProvidersForRetroScan,
+  getGardssalgProviderRetroScanTarget,
+  applyGardssalgRetroScanNull,
+  type GardssalgRetroScanTarget,
   // dev-request 2026-07-18-gardssalg-profilkvalitet-foer-outreach, slice 2 —
   // shared fill-vs-replace decision so the dry-run preview below can never
   // drift from what applyGardssalgProviderContent() actually does.
@@ -1460,6 +1467,245 @@ router.post("/admin/gardssalg-content-refresh", requireAdmin, async (req: Reques
     // Slice 5d: providers excluded by the shared-/directory-domain guard —
     // additive bucket; every excluded provider is visible, never dropped.
     excluded_shared_domain: excludedSharedDomain,
+  });
+});
+
+// ─── POST /api/opplevelser/admin/gardssalg-retro-scan (admin) ───────────────
+//
+// dev-request 2026-07-20-gardssalg-kvalitetsgate-redesign, criterion 6. The
+// content-refresh route above only applies the new extraction+judge gate
+// (extractProseText's structure-aware extraction, criterion 1; meetsGardssalg
+// AboutQualityBar's cheap-bar+LLM-judge cascade, criteria 2-4) going FORWARD,
+// to fresh candidates, and only judges a row's CURRENT about_text/visit_text
+// when a fresh judge-approved candidate ALSO exists (cost-bounded — see
+// applyGardssalgProviderContent's currentValueContaminated doc comment
+// above). Content written before the gate existed, or by a run where no
+// fresh candidate happened to qualify, is never revisited. This endpoint is
+// the retroactive sweep: for every non-locked gårdssalg row (visible AND
+// hidden — "excluding only content_source IN ('manual','claim')", the
+// dev-request's own words), it re-fetches the stored hjemmeside (reusing
+// crFetchGardssalgContent, same SSRF-guarded pipeline as content-refresh, so
+// content_evidence_url is a real, freshly-verified URL) and judges the
+// row's CURRENTLY STORED about_text/visit_text — not a freshly generated
+// candidate — against the SAME gate. A field that no longer clears it is
+// NULLED (apply mode), audited via the same gardssalg_content_audit +
+// field_provenance discipline applyGardssalgProviderContent uses, so it is
+// reversible via the existing POST /admin/gardssalg-content-rollback with NO
+// changes to that endpoint (about_text/visit_text are already in
+// GARDSSALG_ROLLBACKABLE_FIELDS there).
+//
+// Extraction is deliberately NOT re-run against the current value here:
+// summarizeAbout()/summarizeVisit() (criterion 1's extractProseText fallback
+// included) derive a NEW candidate from freshly fetched HTML, but this
+// route's job is judging what's ALREADY STORED, not deriving a replacement —
+// see the Non-goals below. The refetch is still real (not skipped) because
+// the write discipline requires a genuine evidence_url, and because a
+// currently-unreachable homepage is treated the same as content-refresh
+// treats it (recordProviderHomepageFetchResult / dead-homepage parking) —
+// see processOne() below.
+//
+// FAIL-CLOSED, but in the OPPOSITE direction from every other gårdssalg LLM
+// call site in this file: judgeGardssalgAboutCandidate's own contract
+// resolves ANY doubt (missing key/network/parse/ambiguous-verdict failure)
+// to `{ approved: false }`, because for a CANDIDATE "not approved" means
+// "don't publish it" — the safe default. Here, "not approved" would instead
+// mean "null out content that's already live" — a DESTRUCTIVE action, so
+// blindly nulling on `approved === false` would mean an API outage nulls
+// every row's content in one sweep. isJudgeInfraFailure() below tells a
+// genuine LLM rejection (real Norwegian reasoning from the model) apart from
+// an infra failure (judgeGardssalgAboutCandidate's own fail-closed sentinel
+// reasoning, every branch of which ends in the literal marker "avvist
+// fail-closed" — see that function's source) and only the FORMER nulls a
+// field; an infra failure leaves the field exactly as it is (retried next
+// run), matching this endpoint's own constraint: "on judge uncertainty/
+// error, do NOT null the field". meetsAboutCheapBar's "thin/boilerplate/
+// mangled/foreign" rejection needs no such split — it is a deterministic,
+// local, network-free check with no failure mode to be uncertain about.
+//
+// "Re-queue": no new queue mechanism is added. selectGardssalgProviders
+// ForContentRefresh's WHERE clause already re-selects any row whose
+// about_text/visit_text/opening_hours_text/products is blank — nulling a
+// field here makes it blank, so the very next content-refresh run (cron or
+// manual) picks the row back up on its own. Verified, not invented, per this
+// criterion's own instruction.
+//
+// Non-goals (explicit): no replacement candidate is generated or written by
+// this route — it only nulls + re-queues. No automatic re-visibility of a
+// row whose fields get nulled. No changes to opening_hours_text/products, no
+// changes to the content-refresh route's own generation logic.
+//
+// NB: MUST come before "/:id" so "admin" isn't swallowed as an id param.
+
+/**
+ * Tell a genuine LLM rejection apart from judgeGardssalgAboutCandidate's own
+ * fail-closed sentinel (missing key / network / non-200 / unparseable JSON /
+ * unexpected shape / ambiguous verdict text) — see that function's source:
+ * every one of those failure branches' reasoning ends in the exact literal
+ * suffix below; a genuine AVVIS verdict's reasoning is either the model's
+ * own one-sentence Norwegian explanation or, if the model returned no
+ * reasoning at all, the literal "avvist av LLM-dommer" fallback — neither of
+ * which ends in this suffix.
+ */
+const GARDSSALG_JUDGE_INFRA_FAILURE_SUFFIX = "avvist fail-closed";
+function isJudgeInfraFailure(verdict: GardssalgJudgeVerdict): boolean {
+  return verdict.reasoning.endsWith(GARDSSALG_JUDGE_INFRA_FAILURE_SUFFIX);
+}
+
+/**
+ * Decide whether ONE currently-stored about_text/visit_text value should be
+ * nulled by the retro-scan: a deterministic meetsAboutCheapBar fail is
+ * confident, real information (never "doubt") and nulls outright; a
+ * cheap-bar pass is then judged by the LLM, and ONLY a genuine (non-infra-
+ * failure) rejection nulls — an infra failure leaves the field untouched
+ * (fail-closed toward NOT destroying data, per this route's own contract).
+ * Blank values are never flagged (nothing to judge). Returns the judge's
+ * reasoning (or a fixed cheap-bar reason) for the response's `changed[]`.
+ */
+async function gardssalgRetroScanShouldNull(
+  value: string | null | undefined,
+  producerName: string,
+  kind: "about" | "visit"
+): Promise<{ shouldNull: boolean; reason: string | null }> {
+  if (value === null || value === undefined || String(value).trim() === "") {
+    return { shouldNull: false, reason: null };
+  }
+  if (!meetsAboutCheapBar(value)) {
+    return { shouldNull: true, reason: "fails the cheap bar (too short/boilerplate/mangled/foreign)" };
+  }
+  const verdict = await judgeGardssalgAboutCandidate(value, producerName, kind);
+  if (verdict.approved) return { shouldNull: false, reason: null };
+  if (isJudgeInfraFailure(verdict)) {
+    // Never destroy data on doubt — leave the field exactly as it is.
+    return { shouldNull: false, reason: null };
+  }
+  return { shouldNull: true, reason: verdict.reasoning };
+}
+
+const GS_RS_DEFAULT_LIMIT = 48;
+const GS_RS_HARD_CAP = 48; // there are only 48 gårdssalg providers total
+
+router.post("/admin/gardssalg-retro-scan", requireAdmin, async (req: Request, res: Response) => {
+  const body = (req.body ?? {}) as { providerIds?: unknown; limit?: unknown; apply?: unknown };
+
+  const apply =
+    body.apply === true ||
+    body.apply === 1 ||
+    body.apply === "1" ||
+    body.apply === "true" ||
+    req.query?.apply === "1" ||
+    req.query?.apply === "true";
+  const dryRun = !apply;
+
+  const limit = Math.min(
+    typeof body.limit === "number" && body.limit > 0 ? Math.floor(body.limit) : GS_RS_DEFAULT_LIMIT,
+    GS_RS_HARD_CAP
+  );
+
+  let targets: GardssalgRetroScanTarget[];
+  if (Array.isArray(body.providerIds) && body.providerIds.length > 0) {
+    const ids = (body.providerIds as unknown[])
+      .filter((id): id is string => typeof id === "string" && id.trim().length > 0)
+      .map((id) => id.trim())
+      .slice(0, limit);
+    targets = ids
+      .map((id) => getGardssalgProviderRetroScanTarget(id))
+      .filter((t): t is GardssalgRetroScanTarget => t !== null);
+  } else {
+    targets = selectGardssalgProvidersForRetroScan(limit);
+  }
+
+  let scanned = 0;
+  const byField: Record<"about_text" | "visit_text", { flagged: number; nulled: number }> = {
+    about_text: { flagged: 0, nulled: 0 },
+    visit_text: { flagged: 0, nulled: 0 },
+  };
+  const changed: Array<{ provider_id: string; fields: string[]; reasons: Record<string, string> }> = [];
+  const skippedLocked: string[] = [];
+  const errors: Array<{ provider_id: string; error: string }> = [];
+
+  async function processOne(t: GardssalgRetroScanTarget): Promise<void> {
+    const providerId = t.id;
+
+    // LOCK check — from the target's own row snapshot, BEFORE any fetch, so
+    // a locked provider never touches the network at all. Same discipline as
+    // /admin/gardssalg-content-refresh (see that route's own doc comment for
+    // why this is deliberately a pre-fetch, snapshot-based check).
+    if (t.content_source === "manual" || t.content_source === "claim") {
+      skippedLocked.push(providerId);
+      return;
+    }
+
+    let fetched: { primaryHtml: string; combinedHtml: string; fetchUrl: string } | null;
+    try {
+      fetched = await crFetchGardssalgContent(t.hjemmeside);
+    } catch (e: any) {
+      errors.push({ provider_id: providerId, error: e?.message ?? String(e) });
+      if (apply) {
+        try { recordProviderHomepageFetchResult(providerId, false); } catch { /* best-effort */ }
+      }
+      return;
+    }
+    if (!fetched) {
+      errors.push({ provider_id: providerId, error: `fetch_failed for ${t.hjemmeside}` });
+      if (apply) {
+        try { recordProviderHomepageFetchResult(providerId, false); } catch { /* best-effort */ }
+      }
+      return;
+    }
+    if (apply) {
+      try { recordProviderHomepageFetchResult(providerId, true); } catch { /* best-effort */ }
+    }
+    scanned++;
+
+    const [aboutVerdict, visitVerdict] = await Promise.all([
+      gardssalgRetroScanShouldNull(t.about_text, t.navn, "about"),
+      gardssalgRetroScanShouldNull(t.visit_text, t.navn, "visit"),
+    ]);
+
+    const wouldNullFields: Array<"about_text" | "visit_text"> = [];
+    const reasons: Record<string, string> = {};
+    if (aboutVerdict.shouldNull) {
+      wouldNullFields.push("about_text");
+      reasons.about_text = aboutVerdict.reason!;
+    }
+    if (visitVerdict.shouldNull) {
+      wouldNullFields.push("visit_text");
+      reasons.visit_text = visitVerdict.reason!;
+    }
+    if (wouldNullFields.length === 0) return;
+
+    for (const f of wouldNullFields) byField[f].flagged += 1;
+
+    if (dryRun) {
+      changed.push({ provider_id: providerId, fields: wouldNullFields, reasons });
+      return;
+    }
+
+    try {
+      const written = applyGardssalgRetroScanNull(providerId, wouldNullFields, fetched.fetchUrl);
+      if (written.length > 0) {
+        for (const f of written) byField[f as "about_text" | "visit_text"].nulled += 1;
+        changed.push({ provider_id: providerId, fields: written, reasons });
+      }
+    } catch (e: any) {
+      errors.push({ provider_id: providerId, error: `write_failed: ${e?.message ?? String(e)}` });
+    }
+  }
+
+  // Bounded concurrency for the network fetches + judge calls (reuses
+  // CR_CONCURRENCY, same as every other gårdssalg admin sweep in this file).
+  for (let i = 0; i < targets.length; i += CR_CONCURRENCY) {
+    const slice = targets.slice(i, i + CR_CONCURRENCY);
+    await Promise.all(slice.map((t) => processOne(t)));
+  }
+
+  res.json({
+    dry_run: dryRun,
+    scanned,
+    by_field: byField,
+    changed,
+    skipped_locked: skippedLocked,
+    errors,
   });
 });
 
