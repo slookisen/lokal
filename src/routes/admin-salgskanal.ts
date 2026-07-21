@@ -16,9 +16,12 @@
 // Auth: X-Admin-Key header (same pattern as the other /admin/* endpoints).
 //
 // Scope note: this endpoint + the underlying sweep are the datamodel/
-// auto-matcher slice ONLY (work items 1-2 of the dev-request's Spec). The
-// public category landing pages, homepage discoverability, and AI-discovery
-// surface (work items 3-5) are a follow-up slice.
+// auto-matcher slice (work items 1-2 of the dev-request's Spec). The public
+// category landing pages (/kategori, /kategori/:slug in routes/seo.ts),
+// homepage "Bla etter salgskanal" section, and the AI-discovery surface
+// (GET /api/marketplace/salgskanal[/:slug] in routes/marketplace.ts + the
+// lokal_salgskanal MCP tool) — work items 3-5 — shipped as a follow-up slice
+// (2026-07-21) and read the same agent_salgskanal table this sweep maintains.
 
 import { Router, Request, Response } from "express";
 import { runSalgskanalSweep } from "../services/salgskanal-matcher";

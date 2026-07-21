@@ -141,6 +141,74 @@ function findHits(haystack: string, keywords: string[]): string[] {
   return hits;
 }
 
+/** All start indices of `keyword` in `haystack` (non-overlapping), left to
+ * right. Used by the two precision guards below (negation + proximity), which
+ * need positions, not just presence. */
+function allIndicesOf(haystack: string, keyword: string): number[] {
+  const idxs: number[] = [];
+  let from = 0;
+  for (;;) {
+    const i = haystack.indexOf(keyword, from);
+    if (i < 0) break;
+    idxs.push(i);
+    from = i + Math.max(1, keyword.length);
+  }
+  return idxs;
+}
+
+// ─── Precision guards (follow-up items from the datamodel/matcher slice
+// review, before the public-facing slice ships) ─────────────────────────
+//
+// (1) REKO-ring negation/ownership guard: a producer who explicitly says they
+//     do NOT use a REKO-ring ("vi selger ikke via reko-ringen", "ingen
+//     reko-ring her") must not be tagged. We require at least one occurrence
+//     of a REKO keyword whose immediate context carries no negation token.
+//     This catches the direct, adjacent negations; it deliberately does not
+//     chase anaphora across sentences ("...men vi selger ikke der") — that is
+//     beyond a substring matcher, and "absent beats wrong" already errs the
+//     right way on the ambiguous long-range cases.
+// (2) Gårdskafé weak-signal proximity guard: the ">=2 weak signals" branch
+//     used to fire when a café mention and a serving mention appeared
+//     ANYWHERE in the text. Two unrelated mentions ("kafé i bygda" ... 300
+//     chars later ... "vi serverer på bestilling") could combine into a false
+//     match. We now require the café and serving signals to co-occur within a
+//     small window so they plausibly describe the same on-farm offering.
+
+const NEGATION_TOKENS = ["ikke", "aldri", "ingen"];
+const REKO_NEGATION_BEFORE = 45;
+const REKO_NEGATION_AFTER = 20;
+const GARDSKAFE_PROXIMITY_WINDOW = 60;
+
+/** True if a Norwegian negation token appears in the window around a keyword
+ * occurrence at `at` (± the before/after spans). Token match is
+ * word-boundary-anchored so "ingen" doesn't fire on "ingenting" etc. */
+function hasNegationNear(haystack: string, at: number, keywordLen: number): boolean {
+  const start = Math.max(0, at - REKO_NEGATION_BEFORE);
+  const end = Math.min(haystack.length, at + keywordLen + REKO_NEGATION_AFTER);
+  const windowText = haystack.slice(start, end);
+  return NEGATION_TOKENS.some((n) => new RegExp(`(^|[^a-zæøå])${n}([^a-zæøå]|$)`).test(windowText));
+}
+
+/** True if `keyword` has at least one occurrence in `haystack` that is NOT
+ * negated in its immediate context. */
+function hasCleanOccurrence(haystack: string, keyword: string): boolean {
+  const idxs = allIndicesOf(haystack, keyword);
+  return idxs.some((i) => !hasNegationNear(haystack, i, keyword.length));
+}
+
+/** True if any keyword from `aKeys` occurs within `window` characters of any
+ * keyword from `bKeys` in `haystack`. */
+function withinProximity(haystack: string, aKeys: string[], bKeys: string[], window: number): boolean {
+  const aIdx = aKeys.flatMap((k) => allIndicesOf(haystack, k));
+  const bIdx = bKeys.flatMap((k) => allIndicesOf(haystack, k));
+  for (const a of aIdx) {
+    for (const b of bIdx) {
+      if (Math.abs(a - b) <= window) return true;
+    }
+  }
+  return false;
+}
+
 /** First occurrence of `keyword` in `raw` (case-insensitive), returned as a
  * ~140-char snippet of the ORIGINAL (non-normalised) text so the evidence
  * record is human-readable. Mirrors organic-keyword-detector.ts's
@@ -200,11 +268,22 @@ function matchOne(
       if (strong.length > 0) {
         matched = true;
         matchedKeywords = strong;
-      } else if (weakCafe.length > 0 && weakServering.length > 0) {
-        // >= 2 distinct signals (a café mention AND a serving mention) —
-        // the precision guard from the dev-request's risk #1. A lone
-        // "kafé i nærheten" (weakCafe only, no servering signal) falls
-        // through to below_threshold here.
+      } else if (
+        weakCafe.length > 0 &&
+        weakServering.length > 0 &&
+        withinProximity(
+          normalised,
+          GARDSKAFE_WEAK_CAFE_KEYWORDS,
+          GARDSKAFE_WEAK_SERVERING_KEYWORDS,
+          GARDSKAFE_PROXIMITY_WINDOW,
+        )
+      ) {
+        // >= 2 distinct signals (a café mention AND a serving mention) that
+        // co-occur within a small window — the precision guard from the
+        // dev-request's risk #1, tightened by the follow-up proximity check.
+        // A lone "kafé i nærheten" (weakCafe only, no servering signal), or a
+        // café mention and a serving mention that are far apart and unrelated,
+        // both fall through to below_threshold here.
         matched = true;
         matchedKeywords = [...weakCafe, ...weakServering];
       } else {
@@ -214,8 +293,13 @@ function matchOne(
       break;
     }
     case "reko-ring": {
-      matchedKeywords = findHits(normalised, REKO_KEYWORDS);
-      matched = matchedKeywords.length > 0;
+      const hits = findHits(normalised, REKO_KEYWORDS);
+      // Ownership/negation guard: require at least one occurrence that is not
+      // negated in its immediate context, so "vi selger ikke via reko-ringen"
+      // does not mis-tag the producer as a REKO-ring member.
+      const clean = hits.some((k) => hasCleanOccurrence(normalised, k));
+      matched = clean;
+      matchedKeywords = clean ? hits : [];
       break;
     }
   }

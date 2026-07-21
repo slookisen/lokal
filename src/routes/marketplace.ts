@@ -10,6 +10,11 @@ import { emailService } from "../services/email-service";
 import { trustScoreService } from "../services/trust-score-service";
 import { conversationService, buildRequestMeta } from "../services/conversation-service";
 import { slugify } from "../utils/slug";
+import {
+  SALGSKANAL_CATEGORY_SLUGS,
+  SALGSKANAL_CATEGORY_NAMES,
+  type SalgskanalCategorySlug,
+} from "../services/salgskanal-matcher";
 import { pingIndexNow } from "../services/indexnow-service";
 import { addUtmParams } from "../utils/url-utm";
 import { isBlocked, add as blocklistAdd, list as blocklistList, remove as blocklistRemove, addManualEntry as blocklistAddManualEntry, BlocklistValidationError } from "../services/blocklist-service";
@@ -3842,6 +3847,100 @@ router.get("/producers/:id/affiliations", (req: Request, res: Response) => {
   }
 });
 
+
+// ─── Salgskanal (sales-channel) public discovery API ───────────────
+// dev-request 2026-07-06-rfb-salgskanal-kategorier, public-facing slice
+// (work item 5 — AI-discovery surface). Machine-readable counterpart to the
+// /kategori/* SSR pages: lets an AI agent enumerate the sales-channel
+// categories and fetch the auto-derived member list per category. Public,
+// no auth — same posture as /umbrellas.
+//
+//   GET /api/marketplace/salgskanal        — categories + live member counts
+//   GET /api/marketplace/salgskanal/:slug  — members of one category
+//
+// Membership is joined against the active-producer set so the counts match
+// what the public pages render (a tagged-but-deactivated producer is excluded).
+
+function loadSalgskanalMembership(): Map<SalgskanalCategorySlug, any[]> {
+  const byCategory = new Map<SalgskanalCategorySlug, any[]>();
+  for (const slug of SALGSKANAL_CATEGORY_SLUGS) byCategory.set(slug, []);
+  const agents = marketplaceRegistry.getActiveAgents();
+  const byId = new Map<string, any>(agents.map((a: any) => [a.id, a]));
+  const rows = getDb()
+    .prepare("SELECT agent_id, category_slug, evidence_snippet FROM agent_salgskanal")
+    .all() as Array<{ agent_id: string; category_slug: string; evidence_snippet: string | null }>;
+  for (const r of rows) {
+    if (!(SALGSKANAL_CATEGORY_SLUGS as string[]).includes(r.category_slug)) continue;
+    const a = byId.get(r.agent_id);
+    if (!a) continue;
+    byCategory.get(r.category_slug as SalgskanalCategorySlug)!.push({ agent: a, evidence: r.evidence_snippet });
+  }
+  for (const slug of SALGSKANAL_CATEGORY_SLUGS) {
+    byCategory.get(slug)!.sort((x, y) => {
+      if (x.agent.isVerified && !y.agent.isVerified) return -1;
+      if (!x.agent.isVerified && y.agent.isVerified) return 1;
+      return (y.agent.trustScore || 0) - (x.agent.trustScore || 0);
+    });
+  }
+  return byCategory;
+}
+
+router.get("/salgskanal", (req: Request, res: Response) => {
+  try {
+    const byCategory = loadSalgskanalMembership();
+    const categories = SALGSKANAL_CATEGORY_SLUGS
+      .map((slug) => ({
+        slug,
+        name: SALGSKANAL_CATEGORY_NAMES[slug],
+        count: byCategory.get(slug)!.length,
+        page_url: `${getBaseUrl(req)}/kategori/${slug}`,
+        members_url: `${getBaseUrl(req)}/api/marketplace/salgskanal/${slug}`,
+      }))
+      .sort((a, b) => b.count - a.count);
+    res.json({ success: true, count: categories.length, categories });
+  } catch (err: any) {
+    console.error("[/salgskanal] Error:", err);
+    res.status(500).json({ success: false, error: err.message || "Intern feil" });
+  }
+});
+
+router.get("/salgskanal/:slug", (req: Request, res: Response) => {
+  const slug = String(req.params.slug || "").toLowerCase();
+  if (!(SALGSKANAL_CATEGORY_SLUGS as string[]).includes(slug)) {
+    res.status(404).json({
+      success: false,
+      error: "Ukjent salgskanal-kategori",
+      valid_slugs: SALGSKANAL_CATEGORY_SLUGS,
+    });
+    return;
+  }
+  try {
+    const typedSlug = slug as SalgskanalCategorySlug;
+    const members = loadSalgskanalMembership().get(typedSlug)!;
+    const limit = Math.min(200, Math.max(1, parseInt(String(req.query.limit ?? "100"), 10) || 100));
+    res.json({
+      success: true,
+      slug: typedSlug,
+      name: SALGSKANAL_CATEGORY_NAMES[typedSlug],
+      page_url: `${getBaseUrl(req)}/kategori/${typedSlug}`,
+      count: members.length,
+      producers: members.slice(0, limit).map(({ agent: a, evidence }) => ({
+        id: a.id,
+        name: a.name,
+        city: a.city || a.location?.city || null,
+        categories: a.categories || [],
+        trustScore: a.trustScore ?? null,
+        isVerified: !!a.isVerified,
+        profile_url: `${getBaseUrl(req)}/produsent/${slugify(a.name)}`,
+        card_url: `${getBaseUrl(req)}/api/marketplace/agents/${a.id}/card`,
+        evidence: evidence || null,
+      })),
+    });
+  } catch (err: any) {
+    console.error("[/salgskanal/:slug] Error:", err);
+    res.status(500).json({ success: false, error: err.message || "Intern feil" });
+  }
+});
 
 // ─── Phase 5.11 A3: Umbrella agents + affiliations admin endpoints ──
 // All endpoints below are gated by X-Admin-Key. They power the Phase 5.11

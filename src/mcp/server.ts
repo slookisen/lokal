@@ -139,6 +139,59 @@ server.tool(
   }
 );
 
+// ─── Tool 2.5: Salgskanal (sales channel) ───────────────────
+// dev-request 2026-07-06-rfb-salgskanal-kategorier (public slice, work item 5).
+// Browse producers by HOW you get the goods (self-picking, farm shop, home
+// delivery, farm café, REKO-ring) — a grouping distinct from product category
+// or umbrella membership. Membership is auto-derived from producer profiles.
+
+server.tool(
+  "lokal_salgskanal",
+  "Browse Norwegian food producers by SALES CHANNEL — how you actually get the goods, " +
+  "rather than what they sell. Categories: selvplukk (self-picking of berries/fruit/vegetables), " +
+  "hjemlevering (home delivery), gardsbutikk (farm shop), gardskafe-servering (farm café/serving), " +
+  "reko-ring (REKO-ring pickup network). Call with no category to list all channels and their " +
+  "producer counts; pass a category slug to get the producers in that channel.",
+  {
+    category: z
+      .enum(["selvplukk", "hjemlevering", "gardsbutikk", "gardskafe-servering", "reko-ring"])
+      .optional()
+      .describe("Salgskanal-slug. Utelat for å liste alle kanaler med antall."),
+    limit: z.number().min(1).max(200).default(50).describe("Maks produsenter (kun ved valgt kategori)"),
+  },
+  async ({ category, limit }) => {
+    try {
+      if (!category) {
+        const response = await fetch(`${API_BASE}/api/marketplace/salgskanal`);
+        const data = (await response.json()) as any;
+        let text = `🧺 **Salgskanaler** (${data.count})\n\n`;
+        for (const c of data.categories || []) {
+          text += `**${c.name}** (\`${c.slug}\`) — ${c.count} produsenter\n  ${c.page_url}\n`;
+        }
+        text += `\nBruk \`category\` for å hente produsentene i én kanal.`;
+        return { content: [{ type: "text", text }] };
+      }
+
+      const response = await fetch(
+        `${API_BASE}/api/marketplace/salgskanal/${category}?limit=${limit}`,
+      );
+      const data = (await response.json()) as any;
+      if (!data.success) {
+        return { content: [{ type: "text", text: `❌ ${data.error || "Ukjent kategori"}` }] };
+      }
+      let text = `🧺 **${data.name}** — ${data.count} produsenter\n${data.page_url}\n\n`;
+      for (const p of data.producers || []) {
+        text += `**${p.name}**${p.city ? ` — ${p.city}` : ""}\n`;
+        text += `  Trust: ${((p.trustScore || 0) * 100).toFixed(0)}% | Verifisert: ${p.isVerified ? "Ja" : "Nei"}\n`;
+        text += `  ${p.profile_url}\n`;
+      }
+      return { content: [{ type: "text", text }] };
+    } catch (err: any) {
+      return { content: [{ type: "text", text: `Feil: ${err.message}` }] };
+    }
+  },
+);
+
 // ─── Tool 3: Register Agent ─────────────────────────────────
 // Let producers register directly from Claude
 
