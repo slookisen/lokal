@@ -658,5 +658,55 @@ export function initExperiencesSchema(db: Database.Database): void {
   // deferred future slice — not built here.
   try { db.exec("ALTER TABLE experience_providers ADD COLUMN listing_url TEXT"); } catch { /* already present */ }
 
+  // ─── experience_homepage_review_queue (dev-request 2026-07-12-experiences-
+  // enrichment-supply-and-aggregator-hygiene, Daniel's decision, step 2,
+  // evidence-leg (a)) ─────────────────────────────────────────────────────
+  // Step 1 (above) moved a chunk of hjemmeside values that were actually DMO/
+  // aggregator catalog URLs into listing_url. This queue is where step 2's
+  // evidence-leg (a) parks its findings: POST /admin/listing-homepage-
+  // discovery (src/routes/opplevelser.ts) fetches a provider's listing_url,
+  // finds the provider's OWN outbound website link on that page, and — only
+  // if the provider's name is verified present on the candidate site's own
+  // text — upserts a row here. NEVER written straight to hjemmeside; adoption
+  // goes through POST /admin/listing-homepage-review-approve, the same
+  // strict confirmation-surface contract as gardssalg_website_review_queue's
+  // approve lever. Deliberately a SEPARATE table from
+  // gardssalg_website_review_queue (this queue is gårdssalg-agnostic — any
+  // vertical's provider can land here) — sharing that table would conflate
+  // two different discovery methods' provenance/evidence shapes.
+  // UNIQUE(provider_id) mirrors the gårdssalg twin's refresh-on-rerun upsert
+  // idiom: at most one pending candidate per provider; a later scan can
+  // re-upsert over an already-resolved (approved/rejected) row the same way.
+  try {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS experience_homepage_review_queue (
+        id TEXT PRIMARY KEY,
+        provider_id TEXT NOT NULL UNIQUE,
+        provider_name TEXT,
+        candidate_url TEXT NOT NULL,
+        final_url TEXT,
+        evidence TEXT,
+        confidence REAL,
+        reason TEXT NOT NULL DEFAULT 'listing_page_link_candidate',
+        batch_id TEXT,
+        status TEXT NOT NULL DEFAULT 'pending',
+        created_at TEXT NOT NULL DEFAULT (datetime('now')),
+        resolved_at TEXT,
+        FOREIGN KEY (provider_id) REFERENCES experience_providers(id) ON DELETE CASCADE
+      )
+    `);
+    db.exec(`CREATE INDEX IF NOT EXISTS idx_experience_homepage_review_queue_status ON experience_homepage_review_queue(status)`);
+  } catch (err) {
+    console.error("Migration experience_homepage_review_queue failed:", err);
+  }
+
+  // Per-provider attempt stamp for listing-homepage discovery (step 2,
+  // evidence-leg (a)) — its own column, same anti-starvation role/convention
+  // as website_discovery_attempted_at above: the discovery selector orders
+  // never-attempted rows first, then oldest attempt.
+  try {
+    db.exec("ALTER TABLE experience_providers ADD COLUMN listing_homepage_discovery_attempted_at TEXT");
+  } catch { /* already present */ }
+
   console.log("[experiences] schema initialized");
 }

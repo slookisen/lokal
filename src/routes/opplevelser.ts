@@ -1921,6 +1921,445 @@ router.post("/admin/gardssalg-website-review-approve", requireAdmin, (req: Reque
   });
 });
 
+// ─── POST /api/opplevelser/admin/listing-homepage-discovery (admin) ────────
+//
+// dev-request 2026-07-12-experiences-enrichment-supply-and-aggregator-hygiene,
+// Daniel's decision, step 2, evidence-leg (a) ONLY — "offisiell nettside-
+// lenken PÅ listing-siden" (the official-website link found on the listing
+// page itself). Legs (b) Brreg org-nr lookup and (c) Google Places (licensed
+// API, has a cost) are explicitly deferred to their own follow-on slices, not
+// built here.
+//
+// WHY: step 1 (POST /admin/hjemmeside-cleanup-sweep, above) already moved
+// providers' wrongly-set hjemmeside — actually a DMO/aggregator catalog URL,
+// not the provider's own site — out into listing_url. Those providers are now
+// hjemmeside-blank and starve the enrichment pipeline. This route fetches
+// listing_url (SSRF-guarded, same wdFetchPage helper defined above for the
+// gårdssalg website-discovery pair), extracts the outbound <a href> hostnames
+// on that listing page in natural page order, screens out known directory/
+// aggregator hosts (a listing page can link to ANOTHER catalog page) and
+// hosts already adopted elsewhere (either as a live hjemmeside on a DIFFERENT
+// provider, or already queued pending for a DIFFERENT provider) — then, for
+// the first surviving host, fetches https://<host> and verifies the
+// provider's OWN name literally appears on that candidate page's text. A
+// verified candidate is parked in experience_homepage_review_queue — NEVER
+// written directly to hjemmeside. Adoption goes through the approve lever
+// below, mirroring gårdssalg-website-discovery/-review-approve's strict
+// confirmation-surface contract (same table shape, same dry-run/apply
+// convention) — a SEPARATE table/route pair rather than reusing the
+// gårdssalg twin directly, since this slice is vertical-agnostic (any
+// provider with a listing_url can land here) and works off a fetched
+// LISTING page's own links rather than deterministic name-derived candidate
+// hosts.
+//
+// Non-goals (this slice): no Brreg org-nr lookup, no Google Places calls, no
+// auto-write of hjemmeside outside the approve lever, no changes to
+// evidence_url/bulk-load/the step-1 sweep, no new KNOWN_DIRECTORY_HOSTS
+// entries added speculatively.
+const LH_DISCOVERY_BATCH_CAP = 30;
+
+/**
+ * Outbound <a href> hostnames from a listing page's raw HTML, resolved
+ * against `baseUrl` (the listing page's OWN final fetched URL — relative
+ * hrefs must resolve against it), first-seen page order, de-duplicated,
+ * excluding the listing page's own host. A simple regex href extraction —
+ * this file already does regex-based lightweight HTML handling elsewhere
+ * (gardssalgPageText's tag-strip, isAggregatorWebsite's host parse) — no
+ * HTML-parser dependency needed here either. mailto:/tel:/javascript:/bare-
+ * fragment hrefs and per-href resolution errors are swallowed; one bad link
+ * never aborts the extraction. Pure — exported for unit testing.
+ */
+export function extractOutboundHostsFromListingPage(html: string, baseUrl: string): string[] {
+  let ownHost: string | null = null;
+  try {
+    ownHost = new URL(baseUrl).hostname.toLowerCase().replace(/^www\./, "");
+  } catch {
+    ownHost = null;
+  }
+  const hosts: string[] = [];
+  const hrefRe = /<a\b[^>]*\bhref\s*=\s*(["'])(.*?)\1/gi;
+  let m: RegExpExecArray | null;
+  while ((m = hrefRe.exec(html)) !== null) {
+    const raw = (m[2] || "").trim();
+    if (!raw || /^(mailto|tel|javascript):/i.test(raw) || raw.startsWith("#")) continue;
+    let resolved: URL;
+    try {
+      resolved = new URL(raw, baseUrl);
+    } catch {
+      continue;
+    }
+    if (resolved.protocol !== "http:" && resolved.protocol !== "https:") continue;
+    const host = resolved.hostname.toLowerCase().replace(/^www\./, "");
+    if (!host || host === ownHost) continue;
+    if (!hosts.includes(host)) hosts.push(host);
+  }
+  return hosts;
+}
+
+/**
+ * Ownership evidence for a listing-homepage candidate page: strips HTML tags
+ * to plain text (script/style content dropped first, same convention as
+ * gardssalgPageText above), then a literal, case-insensitive substring check
+ * for the provider's own (trimmed) name. Norwegian æøå are NOT transliterated
+ * — kept as-is per the dev-request, this is a substring check only, no
+ * scoring heuristic. Pure — exported for unit testing.
+ */
+export function listingHomepageNameVerified(html: string, providerName: string): boolean {
+  const name = (providerName || "").trim().toLowerCase();
+  if (!name) return false;
+  const text = (html || "")
+    .replace(/<script[\s\S]*?<\/script>/gi, " ")
+    .replace(/<style[\s\S]*?<\/style>/gi, " ")
+    .replace(/<[^>]+>/g, " ")
+    .replace(/&[a-z]+;|&#\d+;/gi, " ")
+    .replace(/\s+/g, " ")
+    .toLowerCase();
+  return text.includes(name);
+}
+
+// Upsert one row into experience_homepage_review_queue — UNIQUE(provider_id)
+// refresh-on-rerun idiom, same shape as upsertGardssalgWebsiteReviewQueue
+// (gardssalg_website_review_queue, above) adapted to this queue's own
+// status/resolved_at columns (a re-upsert always lands back in 'pending').
+function upsertListingHomepageReviewQueue(
+  db: ReturnType<typeof getExpDb>,
+  entry: {
+    provider_id: string;
+    provider_name: string;
+    candidate_url: string;
+    final_url: string;
+    evidence: string;
+    confidence: number;
+    batch_id: string;
+  }
+): void {
+  db.prepare(
+    `INSERT INTO experience_homepage_review_queue
+       (id, provider_id, provider_name, candidate_url, final_url, evidence, confidence, reason, batch_id, status, created_at, resolved_at)
+     VALUES (@id, @provider_id, @provider_name, @candidate_url, @final_url, @evidence, @confidence, 'listing_page_link_candidate', @batch_id, 'pending', datetime('now'), NULL)
+     ON CONFLICT(provider_id) DO UPDATE SET
+       provider_name = excluded.provider_name,
+       candidate_url = excluded.candidate_url,
+       final_url = excluded.final_url,
+       evidence = excluded.evidence,
+       confidence = excluded.confidence,
+       reason = excluded.reason,
+       batch_id = excluded.batch_id,
+       status = 'pending',
+       created_at = datetime('now'),
+       resolved_at = NULL`
+  ).run({
+    id: crypto.randomUUID(),
+    provider_id: entry.provider_id,
+    provider_name: entry.provider_name,
+    candidate_url: entry.candidate_url,
+    final_url: entry.final_url,
+    evidence: entry.evidence,
+    confidence: entry.confidence,
+    batch_id: entry.batch_id,
+  });
+}
+
+router.post("/admin/listing-homepage-discovery", requireAdmin, async (req: Request, res: Response) => {
+  const body = (req.body ?? {}) as { providerIds?: unknown; apply?: unknown };
+  const apply =
+    body.apply === true ||
+    body.apply === 1 ||
+    body.apply === "1" ||
+    body.apply === "true" ||
+    req.query?.apply === "1" ||
+    req.query?.apply === "true";
+  const dryRun = !apply;
+  const batchTag = `listing-homepage-${new Date().toISOString().replace(/[-:]/g, "").replace("T", "-").slice(0, 15)}`;
+
+  const expDb = getExpDb("experiences");
+  const skippedLocked: Array<{ provider_id: string; navn: string }> = [];
+  const alreadyHasWebsite: Array<{ provider_id: string; navn: string }> = [];
+  const notFound: string[] = [];
+  let targets: Array<{ id: string; navn: string; listing_url: string | null; content_source: string | null }> = [];
+
+  if (Array.isArray(body.providerIds) && body.providerIds.length > 0) {
+    const ids = (body.providerIds as unknown[]).filter((v): v is string => typeof v === "string" && v.trim() !== "").map((v) => v.trim());
+    if (ids.length > LH_DISCOVERY_BATCH_CAP) {
+      res.status(400).json({ error: `Too many providerIds (max ${LH_DISCOVERY_BATCH_CAP} per call)` });
+      return;
+    }
+    for (const id of ids) {
+      const t = expDb
+        .prepare(`SELECT id, navn, listing_url, hjemmeside, content_source FROM experience_providers WHERE id = ?`)
+        .get(id) as
+        | { id: string; navn: string; listing_url: string | null; hjemmeside: string | null; content_source: string | null }
+        | undefined;
+      if (!t) {
+        notFound.push(id);
+      } else if (t.content_source === "manual" || t.content_source === "claim") {
+        skippedLocked.push({ provider_id: t.id, navn: t.navn });
+      } else if (t.hjemmeside && t.hjemmeside.trim() !== "") {
+        alreadyHasWebsite.push({ provider_id: t.id, navn: t.navn });
+      } else {
+        targets.push({ id: t.id, navn: t.navn, listing_url: t.listing_url, content_source: t.content_source });
+      }
+    }
+  } else {
+    targets = expDb
+      .prepare(
+        `SELECT id, navn, listing_url, content_source
+           FROM experience_providers
+          WHERE listing_url IS NOT NULL AND hjemmeside IS NULL AND (content_source IS NULL OR content_source NOT IN ('manual','claim'))
+          ORDER BY (listing_homepage_discovery_attempted_at IS NOT NULL), listing_homepage_discovery_attempted_at ASC, created_at ASC
+          LIMIT ?`
+      )
+      .all(LH_DISCOVERY_BATCH_CAP) as Array<{ id: string; navn: string; listing_url: string | null; content_source: string | null }>;
+  }
+
+  const proposed: Array<{
+    provider_id: string;
+    navn: string;
+    candidate_url: string;
+    final_url: string;
+    evidence: { host: string; listing_url: string; name_verified: boolean };
+    confidence: number;
+  }> = [];
+  const noCandidateVerified: Array<{ provider_id: string; navn: string; tried: string[] }> = [];
+  const excluded: Array<{ provider_id: string; navn: string; hosts: Array<{ host: string; reason: string }> }> = [];
+  const processedIds: string[] = [];
+  // Hosts queued (pending) for a DIFFERENT provider WITHIN this same run —
+  // apply-mode only, so two candidates discovered in the same batch can't
+  // both claim the same host before either write actually lands.
+  const queuedThisRun = new Set<string>();
+  // Normalized-host set for host_already_in_catalog, computed ONCE per
+  // request (not per-candidate) and reused across the whole batch. This is
+  // the same normalized-host-comparison approach as gardssalgSharedHostCounts()
+  // in experience-store.ts, but deliberately NOT that function — this queue
+  // is gårdssalg-agnostic (see the queue table's migration comment), so it
+  // must dedup against ALL experience_providers' hjemmeside, not just
+  // gårdssalg rows. A raw SQL `LIKE '%' || host` against the stored
+  // hjemmeside string is NOT equivalent: a stored hjemmeside of
+  // 'https://site.no/' or 'https://site.no/kontakt' does not literally END
+  // with 'site.no', so it silently fails to match and an already-catalogued
+  // host slips past dedup and gets proposed for a second provider.
+  const catalogHosts = new Set<string>();
+  for (const row of expDb
+    .prepare(`SELECT hjemmeside FROM experience_providers WHERE hjemmeside IS NOT NULL AND TRIM(hjemmeside) != ''`)
+    .all() as Array<{ hjemmeside: string }>) {
+    const h = hostFromUrlLike(row.hjemmeside);
+    if (h) catalogHosts.add(h);
+  }
+
+  for (const t of targets) {
+    processedIds.push(t.id);
+    const tried: string[] = [];
+    const excludedHere: Array<{ host: string; reason: string }> = [];
+    let hit: { host: string; finalUrl: string } | null = null;
+
+    const listingPage = t.listing_url ? await wdFetchPage(t.listing_url) : null;
+    if (listingPage) {
+      const candidateHosts = extractOutboundHostsFromListingPage(listingPage.html, listingPage.finalUrl);
+      for (const host of candidateHosts) {
+        if (isDirectoryOrAggregatorHost(host)) {
+          excludedHere.push({ host, reason: "directory_or_aggregator_host" });
+          continue;
+        }
+        if (catalogHosts.has(host)) {
+          excludedHere.push({ host, reason: "host_already_in_catalog" });
+          continue;
+        }
+        const queuedElsewhereCount = (
+          expDb
+            .prepare(
+              `SELECT COUNT(*) AS n FROM experience_homepage_review_queue
+                WHERE status = 'pending' AND provider_id != ? AND candidate_url LIKE ?`
+            )
+            .get(t.id, "%" + host) as { n: number }
+        ).n;
+        if (queuedElsewhereCount > 0 || queuedThisRun.has(host)) {
+          excludedHere.push({ host, reason: "host_already_queued_elsewhere" });
+          continue;
+        }
+
+        tried.push(host);
+        const candidatePage = await wdFetchPage(`https://${host}`);
+        if (!candidatePage) continue;
+        if (!listingHomepageNameVerified(candidatePage.html, t.navn)) continue;
+        hit = { host, finalUrl: candidatePage.finalUrl };
+        break;
+      }
+    }
+
+    if (excludedHere.length > 0) excluded.push({ provider_id: t.id, navn: t.navn, hosts: excludedHere });
+
+    if (hit) {
+      let finalOrigin: string;
+      try {
+        const u = new URL(hit.finalUrl);
+        finalOrigin = `${u.protocol}//${u.host.toLowerCase()}`;
+      } catch {
+        finalOrigin = `https://${hit.host}`;
+      }
+      const evidence = { host: hit.host, listing_url: t.listing_url as string, name_verified: true };
+      const confidence = 0.8;
+      proposed.push({
+        provider_id: t.id,
+        navn: t.navn,
+        candidate_url: finalOrigin,
+        final_url: hit.finalUrl,
+        evidence,
+        confidence,
+      });
+      if (!dryRun) {
+        try {
+          upsertListingHomepageReviewQueue(expDb, {
+            provider_id: t.id,
+            provider_name: t.navn,
+            candidate_url: finalOrigin,
+            final_url: hit.finalUrl,
+            evidence: JSON.stringify(evidence),
+            confidence,
+            batch_id: batchTag,
+          });
+          queuedThisRun.add(hit.host);
+        } catch {
+          /* queue write is best-effort; the run itself must not fail on it */
+        }
+      }
+    } else {
+      noCandidateVerified.push({ provider_id: t.id, navn: t.navn, tried });
+    }
+  }
+
+  if (!dryRun && processedIds.length > 0) {
+    const stampStmt = expDb.prepare(
+      `UPDATE experience_providers SET listing_homepage_discovery_attempted_at = datetime('now') WHERE id = ?`
+    );
+    for (const id of processedIds) stampStmt.run(id);
+  }
+
+  res.json({
+    dry_run: dryRun,
+    batch_tag: batchTag,
+    scanned: targets.length,
+    proposed_count: proposed.length,
+    proposed,
+    no_candidate_verified: noCandidateVerified,
+    excluded,
+    skipped_locked: skippedLocked,
+    already_has_website: alreadyHasWebsite,
+    not_found: notFound,
+    queue_size: (expDb.prepare(`SELECT COUNT(*) AS n FROM experience_homepage_review_queue`).get() as { n: number }).n,
+  });
+});
+
+// ─── POST /api/opplevelser/admin/listing-homepage-review-approve (admin) ───
+//
+// The adoption lever for listing-homepage-discovery candidates — same strict
+// confirmation-surface contract as the gårdssalg website-review-approve twin
+// above: ONLY the queued (provider_id, candidate_url) pair can be approved; a
+// different url is rejected (mismatch_with_queued_candidate), a non-pending
+// provider is rejected (not_in_review_queue — an already-approved row is no
+// longer "in the review queue" for this route's purposes, so a repeat call
+// on the same pair is idempotent). Writes go through writeProviderHjemmeside
+// (the same shared UPDATE+row-fetch helper the PATCH .../:id/hjemmeside
+// route below uses) ONLY after a fresh fill-only + lock re-check immediately
+// before writing — mirrors the discipline applyGardssalgProviderWebsite
+// applies at write time, even though that gårdssalg-specific function is not
+// itself called here. A guard-failed approval leaves the queue row 'pending'
+// (NOT approved, NOT rejected) — it may become writable later; only a
+// confirmed write ever moves a row out of 'pending'.
+router.post("/admin/listing-homepage-review-approve", requireAdmin, (req: Request, res: Response) => {
+  const body = (req.body ?? {}) as { approvals?: unknown; apply?: unknown };
+  const apply =
+    body.apply === true ||
+    body.apply === 1 ||
+    body.apply === "1" ||
+    body.apply === "true" ||
+    req.query?.apply === "1" ||
+    req.query?.apply === "true";
+  const dryRun = !apply;
+
+  if (!Array.isArray(body.approvals) || body.approvals.length === 0) {
+    res.status(400).json({ error: "Body must contain a non-empty 'approvals' array of {provider_id, url}" });
+    return;
+  }
+  if (body.approvals.length > 200) {
+    res.status(400).json({ error: "Too many approvals (max 200 per call)" });
+    return;
+  }
+
+  const expDb = getExpDb("experiences");
+  // Only 'pending' rows are "in the review queue" for this route's purposes —
+  // an already-approved row correctly falls into not_in_review_queue below.
+  const queue = expDb
+    .prepare(`SELECT provider_id, candidate_url FROM experience_homepage_review_queue WHERE status = 'pending'`)
+    .all() as Array<{ provider_id: string; candidate_url: string }>;
+  const byProvider = new Map(queue.map((q) => [q.provider_id, q]));
+  const seen = new Set<string>();
+  const approved: Array<{ provider_id: string; url: string }> = [];
+  const written: Array<{ provider_id: string; url: string }> = [];
+  const rejected: Array<{ provider_id: string; reason: string }> = [];
+
+  for (const raw of body.approvals as unknown[]) {
+    const a = raw as { provider_id?: unknown; url?: unknown };
+    const pid = typeof a?.provider_id === "string" ? a.provider_id.trim() : "";
+    const url = typeof a?.url === "string" ? a.url.trim() : "";
+    if (!pid || !url) {
+      rejected.push({ provider_id: pid || "(missing)", reason: "invalid_item" });
+      continue;
+    }
+    if (seen.has(pid)) {
+      rejected.push({ provider_id: pid, reason: "duplicate_in_request" });
+      continue;
+    }
+    seen.add(pid);
+    const q = byProvider.get(pid);
+    if (!q) {
+      rejected.push({ provider_id: pid, reason: "not_in_review_queue" });
+      continue;
+    }
+    if (q.candidate_url !== url) {
+      rejected.push({ provider_id: pid, reason: "mismatch_with_queued_candidate" });
+      continue;
+    }
+    approved.push({ provider_id: pid, url });
+    if (!dryRun) {
+      // Re-check IMMEDIATELY before writing — fill-only + lock guard, mirrors
+      // applyGardssalgProviderWebsite's discipline. If hjemmeside is no
+      // longer NULL (filled by something else since queueing) OR
+      // content_source has since become manual/claim, the write is skipped
+      // and the queue row stays 'pending' (never approved, never rejected).
+      const provider = expDb
+        .prepare(`SELECT id, hjemmeside, content_source FROM experience_providers WHERE id = ?`)
+        .get(pid) as { id: string; hjemmeside: string | null; content_source: string | null } | undefined;
+      const guardOk =
+        !!provider &&
+        (provider.hjemmeside === null || provider.hjemmeside.trim() === "") &&
+        provider.content_source !== "manual" &&
+        provider.content_source !== "claim";
+      if (!guardOk) {
+        rejected.push({ provider_id: pid, reason: "write_skipped_by_guards" });
+        continue;
+      }
+      const result = writeProviderHjemmeside(pid, q.candidate_url);
+      if (!result) {
+        rejected.push({ provider_id: pid, reason: "write_skipped_by_guards" });
+        continue;
+      }
+      expDb
+        .prepare(`UPDATE experience_homepage_review_queue SET status = 'approved', resolved_at = datetime('now') WHERE provider_id = ?`)
+        .run(pid);
+      written.push({ provider_id: pid, url: q.candidate_url });
+    }
+  }
+
+  res.json({
+    dry_run: dryRun,
+    approved_count: approved.length,
+    approved,
+    written_count: written.length,
+    written,
+    rejected,
+  });
+});
+
 // ─── POST /api/opplevelser/admin/gardssalg-address-enrichment (admin) ───────
 //
 // dev-request 2026-07-18-gardssalg-profilkvalitet-foer-outreach, slice 3.
@@ -3220,6 +3659,40 @@ function isPlausibleUrlish(v: string): boolean {
   return v.includes(".");
 }
 
+// Shared fetch-existing-row + UPDATE + return-previous/new logic for writing
+// experience_providers.hjemmeside — factored out (dev-request 2026-07-12-
+// experiences-enrichment-supply-and-aggregator-hygiene, step 2, evidence-leg
+// (a)) so BOTH the free-form admin PATCH route below AND the listing-
+// homepage-review-approve lever above write through the exact same UPDATE
+// shape, rather than a second copy-pasted UPDATE statement. Deliberately
+// does NOT carry the PATCH route's own validation (isPlausibleUrlish,
+// required-field-present checks) — those are specific to its own free-form-
+// admin-correction use case; callers with their own guards (like the
+// approve lever's fill-only + lock re-check) run those BEFORE calling this.
+// Returns null if the provider does not exist; never throws for a missing
+// row. Does not change either caller's external response shape.
+function writeProviderHjemmeside(
+  id: string,
+  value: string | null
+): { previous_hjemmeside: string | null; new_hjemmeside: string | null } | null {
+  const expDb = getExpDb("experiences");
+  const existing = expDb
+    .prepare(`SELECT id, hjemmeside FROM experience_providers WHERE id = ?`)
+    .get(id) as { id: string; hjemmeside: string | null } | undefined;
+
+  if (!existing) return null;
+
+  expDb
+    .prepare(
+      `UPDATE experience_providers
+          SET hjemmeside = ?, updated_at = datetime('now')
+        WHERE id = ?`
+    )
+    .run(value, id);
+
+  return { previous_hjemmeside: existing.hjemmeside, new_hjemmeside: value };
+}
+
 // Body: { hjemmeside: string | null }. The field must be PRESENT in the
 // body — entirely missing -> 400 (distinct from an explicit null, which is
 // a valid "clear the homepage" instruction). Present but neither string nor
@@ -3233,7 +3706,7 @@ function isPlausibleUrlish(v: string): boolean {
 // what changed. This is a deliberate design requirement of the dev-request,
 // not an incidental extra field.
 router.patch("/admin/providers/:id/hjemmeside", requireAdmin, (req: Request, res: Response) => {
-  const id = req.params.id;
+  const id = req.params.id as string;
   const body = (req.body ?? {}) as { hjemmeside?: unknown };
 
   if (!("hjemmeside" in body)) {
@@ -3255,29 +3728,17 @@ router.patch("/admin/providers/:id/hjemmeside", requireAdmin, (req: Request, res
   }
 
   try {
-    const expDb = getExpDb("experiences");
-    const existing = expDb
-      .prepare(`SELECT id, hjemmeside FROM experience_providers WHERE id = ?`)
-      .get(id) as { id: string; hjemmeside: string | null } | undefined;
-
-    if (!existing) {
+    const result = writeProviderHjemmeside(id, normalized);
+    if (!result) {
       res.status(404).json({ error: "Provider not found", id });
       return;
     }
 
-    expDb
-      .prepare(
-        `UPDATE experience_providers
-            SET hjemmeside = ?, updated_at = datetime('now')
-          WHERE id = ?`
-      )
-      .run(normalized, id);
-
     res.json({
       success: true,
       id,
-      previous_hjemmeside: existing.hjemmeside,
-      new_hjemmeside: normalized,
+      previous_hjemmeside: result.previous_hjemmeside,
+      new_hjemmeside: result.new_hjemmeside,
     });
   } catch (err) {
     console.error("[opplevelser] admin/providers/:id/hjemmeside PATCH failed", err);
