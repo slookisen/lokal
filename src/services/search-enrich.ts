@@ -1337,35 +1337,39 @@ const NORWEGIAN_WORD_MARKERS: readonly string[] = [
 ];
 
 /**
- * Quality bar a candidate `about`/`description` summary must clear before the
- * writer is allowed to overwrite an existing value with it. PURE.
+ * The CHEAP, deterministic, universal quality prefilter — the part of the
+ * about/description quality gate that needs no semantic judgment: length,
+ * mangled-Unicode rejection, generic boilerplate/cookie/consent rejection,
+ * and the Norwegian-language check. PURE, no network/IO.
+ *
+ * Extracted out of meetsAboutQualityBar (dev-request 2026-07-20-gardssalg-
+ * kvalitetsgate-redesign, slice 2/3/4) so it can be SHARED by two callers
+ * without duplicating logic:
+ *   1. meetsAboutQualityBar below — unchanged behavior/signature, still the
+ *      gate admin-knowledge.ts's homepage-refresh (a different vertical/
+ *      purpose, not gårdssalg) uses, keeping its existing nav-menu-leakage/
+ *      umbrella-membership regex heuristic layer.
+ *   2. The gårdssalg-specific quality gate (meetsGardssalgAboutQualityBar,
+ *      routes/opplevelser.ts) — runs THIS cheap prefilter first, then an LLM
+ *      judge in place of the nav-heuristic layer (see that function's doc
+ *      comment for why gårdssalg's about_text/visit_text candidates no
+ *      longer use the regex nav-menu-leakage heuristic below).
  *
  * Requires ALL of:
- *   - length ≥ 80 chars (a real description, not a tagline/fragment),
- *   - looks Norwegian — contains an æ/ø/å letter OR a common Norwegian function
- *     word (rejects an English cookie/marketing snippet),
- *   - is NOT dominated by generic boilerplate (cookie/consent/placeholder),
- *   - is NOT leaked navigation-menu chrome (skip-links/"back to top" anchors,
- *     a numbered- or flat-Title-Case-token menu list with too little
- *     sentence-ending punctuation to be real prose, pipe/arrow-separated menu
- *     tokens with NO sentence-ending punctuation at all, or a verbatim
- *     repeated breadcrumb/tagline phrase — see isLikelyNavMenuLeakage),
- *   - is NOT describing an UMBRELLA/tourism-association's members collectively
- *     ("våre medlemmer" etc.) rather than this one producer — a wrong-ENTITY
- *     bug that can otherwise slip past every other check because the prose
- *     itself is perfectly grammatical, punctuated, real Norwegian (round-2,
- *     2026-07-11 — see UMBRELLA_MEMBERSHIP_MARKERS doc comment),
+ *   - length ≥ minLen chars (a real description, not a tagline/fragment),
  *   - does NOT contain the Unicode replacement character (U+FFFD, "�") — a
  *     candidate with a "�" was mangled upstream (most likely a byte-level cut
  *     through a multi-byte UTF-8 character, e.g. mid æ/ø/å) and must never be
  *     written as a producer's public description (customer-reported bug:
- *     Olestølen Mikroysteri's meta description ended "...opplevelser p�").
+ *     Olestølen Mikroysteri's meta description ended "...opplevelser p�"),
+ *   - is NOT dominated by generic boilerplate (cookie/consent/placeholder),
+ *   - looks Norwegian — contains an æ/ø/å letter OR a common Norwegian function
+ *     word (rejects an English cookie/marketing snippet).
  *
- * Returns false for empty/short/foreign/boilerplate/mangled/wrong-entity text
- * so the caller keeps the existing value (blank or stale beats wrong or
- * broken). minLen is overridable for tests.
+ * Returns false for empty/short/mangled/boilerplate/foreign text. minLen is
+ * overridable for tests.
  */
-export function meetsAboutQualityBar(text: string | null | undefined, minLen = 80): boolean {
+export function meetsAboutCheapBar(text: string | null | undefined, minLen = 80): boolean {
   if (!text) return false;
   const trimmed = String(text).replace(/\s+/g, " ").trim();
   if (trimmed.length < minLen) return false;
@@ -1382,6 +1386,53 @@ export function meetsAboutQualityBar(text: string | null | undefined, minLen = 8
     if (lowerAscii.includes(marker)) return false;
   }
 
+  // Must look Norwegian: an æ/ø/å letter, OR a common Norwegian function word.
+  // (Pad with spaces so word-markers match at the string edges too.)
+  const hasNordicLetter = /[æøåÆØÅ]/.test(trimmed);
+  const padded = ` ${lower} `;
+  const hasNorwegianWord = NORWEGIAN_WORD_MARKERS.some((w) => padded.includes(w));
+  if (!hasNordicLetter && !hasNorwegianWord) return false;
+
+  return true;
+}
+
+/**
+ * Quality bar a candidate `about`/`description` summary must clear before the
+ * writer is allowed to overwrite an existing value with it. PURE.
+ *
+ * Requires ALL of:
+ *   - meetsAboutCheapBar (length, mangled-Unicode, boilerplate, Norwegian —
+ *     see its doc comment),
+ *   - is NOT leaked navigation-menu chrome (skip-links/"back to top" anchors,
+ *     a numbered- or flat-Title-Case-token menu list with too little
+ *     sentence-ending punctuation to be real prose, pipe/arrow-separated menu
+ *     tokens with NO sentence-ending punctuation at all, or a verbatim
+ *     repeated breadcrumb/tagline phrase — see isLikelyNavMenuLeakage),
+ *   - is NOT describing an UMBRELLA/tourism-association's members collectively
+ *     ("våre medlemmer" etc.) rather than this one producer — a wrong-ENTITY
+ *     bug that can otherwise slip past every other check because the prose
+ *     itself is perfectly grammatical, punctuated, real Norwegian (round-2,
+ *     2026-07-11 — see UMBRELLA_MEMBERSHIP_MARKERS doc comment).
+ *
+ * Returns false for empty/short/foreign/boilerplate/mangled/wrong-entity text
+ * so the caller keeps the existing value (blank or stale beats wrong or
+ * broken). minLen is overridable for tests.
+ *
+ * NOTE (dev-request 2026-07-20-gardssalg-kvalitetsgate-redesign): this
+ * function's behavior is UNCHANGED by that redesign — it is still the gate
+ * admin-knowledge.ts's homepage-content-refresh (a different vertical/
+ * purpose from gårdssalg) uses, and it still applies the nav-menu-leakage/
+ * umbrella-membership regex heuristic layer below. That heuristic layer is
+ * retired ONLY for gårdssalg about_text/visit_text candidates, via a
+ * separate, additive gårdssalg-specific gate (meetsGardssalgAboutQualityBar,
+ * routes/opplevelser.ts) that reuses meetsAboutCheapBar above instead of
+ * this function.
+ */
+export function meetsAboutQualityBar(text: string | null | undefined, minLen = 80): boolean {
+  if (!meetsAboutCheapBar(text, minLen)) return false;
+  const trimmed = String(text).replace(/\s+/g, " ").trim();
+  const lowerAscii = stripNorwegianAccents(trimmed.toLowerCase());
+
   // Reject nav-chrome markers (skip-links, "back to top" anchors) and the
   // numbered/pipe-separated/flat-token MENU shapes those pages render as (see
   // isLikelyNavMenuLeakage doc comment) — leakage from the site's <nav>, not
@@ -1396,13 +1447,6 @@ export function meetsAboutQualityBar(text: string | null | undefined, minLen = 8
   for (const marker of UMBRELLA_MEMBERSHIP_MARKERS) {
     if (lowerAscii.includes(marker)) return false;
   }
-
-  // Must look Norwegian: an æ/ø/å letter, OR a common Norwegian function word.
-  // (Pad with spaces so word-markers match at the string edges too.)
-  const hasNordicLetter = /[æøåÆØÅ]/.test(trimmed);
-  const padded = ` ${lower} `;
-  const hasNorwegianWord = NORWEGIAN_WORD_MARKERS.some((w) => padded.includes(w));
-  if (!hasNordicLetter && !hasNorwegianWord) return false;
 
   return true;
 }

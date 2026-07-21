@@ -26959,6 +26959,22 @@ Promise.allSettled(_oaHomeCountersDeps).then(async () => {
     for (const f of grwr.failures) failures.push("opplevelser-gardssalg-rewrite: " + f);
     console.log(`  opplevelser-gardssalg-rewrite: ${grwr.passed} passed, ${grwr.failed} failed`);
 
+    // dev-request 2026-07-20-gardssalg-kvalitetsgate-redesign, slice 2/3/4:
+    // LLM judge (judgeGardssalgAboutCandidate) + cascade
+    // (meetsGardssalgAboutQualityBar, routes/opplevelser.ts) that replaces
+    // the retired regex nav-menu-leakage heuristic layer for gårdssalg
+    // about_text/visit_text candidates only — sentinel/fail-closed contract
+    // tests, cascade cost-control (cheap prefilter before any LLM call)
+    // tests, and a >=10-example hand-labeled calibration set.
+    console.log("\n── opplevelser-gardssalg-quality-judge: slice 2/3/4 LLM judge + cascade ──");
+    const { runOpplevelserGardssalgQualityJudgeTests } = require("../src/routes/opplevelser-gardssalg-quality-judge.test") as
+      typeof import("../src/routes/opplevelser-gardssalg-quality-judge.test");
+    const gqj = await runOpplevelserGardssalgQualityJudgeTests({ log: false });
+    passed += gqj.passed;
+    failed += gqj.failed;
+    for (const f of gqj.failures) failures.push("opplevelser-gardssalg-quality-judge: " + f);
+    console.log(`  opplevelser-gardssalg-quality-judge: ${gqj.passed} passed, ${gqj.failed} failed`);
+
     // dev-request 2026-07-20-gardssalg-fyll-blank-fra-kildeinnhold: a
     // dedicated "generate about_text from source when currently blank" LLM
     // path — distinct from slice 5a's rewrite (which only EXPANDS a

@@ -147,6 +147,10 @@ import {
   // gårdssalg multi-page-crawl content enrichment (Fase 1 item 3)
   summarizeVisit,
   extractOpeningHours,
+  // dev-request 2026-07-20-gardssalg-kvalitetsgate-redesign, slice 2/3/4 —
+  // the cheap/universal prefilter, reused (not duplicated) as cascade stage
+  // 1 of meetsGardssalgAboutQualityBar below.
+  meetsAboutCheapBar,
 } from "../services/search-enrich";
 import { classifyProvider, sleep, BrregClass } from "../services/experience-brreg";
 // dev-request 2026-07-18-gardssalg-profilkvalitet-foer-outreach, slice 3 —
@@ -1101,8 +1105,34 @@ router.post("/admin/gardssalg-content-refresh", requireAdmin, async (req: Reques
     const visitSummary = summarizeVisit(combinedHtml);
     const hoursSnippet = extractOpeningHours(contentText);
 
-    const candidateAbout = meetsAboutQualityBar(aboutSummary) ? aboutSummary : null;
-    const candidateVisitRaw = meetsAboutQualityBar(visitSummary) ? visitSummary : null;
+    // Kvalitetsgate-redesign (dev-request 2026-07-20-gardssalg-kvalitetsgate-
+    // redesign, slice 2/3/4): about_text/visit_text candidates are judged by
+    // meetsGardssalgAboutQualityBar()'s cascade (cheap prefilter, THEN an LLM
+    // judge in place of the old regex nav-menu-leakage heuristic layer — see
+    // that function's doc comment above generateGardssalgAboutRewrite for
+    // the full contract and the reasoning for NOT touching the shared
+    // meetsAboutQualityBar/admin-knowledge.ts's use of it).
+    //
+    // Fix-up round (independent review, blocking finding): the original cost
+    // control here ("only judge the candidate when the current value has a
+    // classic write opportunity — blank or cheap-bar-failing") silently made
+    // ALREADY-contaminated existing content permanently unfixable through
+    // this endpoint: nav-menu chrome glued to one real sentence (the
+    // Draopar incident shape) is long enough and real-Norwegian-enough to
+    // clear meetsAboutCheapBar every time, so a row that already had that
+    // exact contamination in the DB would never even get a fresh candidate
+    // computed for it, let alone replaced — precisely the incident class
+    // this whole redesign exists to close. Fix: the candidate is now ALWAYS
+    // computed/judged, regardless of the current value's write-opportunity
+    // status; cost stays bounded because meetsGardssalgAboutQualityBar's own
+    // cheap-bar prefilter means a candidate that couldn't possibly qualify
+    // never reaches the LLM (unchanged from before).
+    const candidateAbout = (await meetsGardssalgAboutQualityBar(aboutSummary, t.navn, "about"))
+      ? aboutSummary
+      : null;
+    const candidateVisitRaw = (await meetsGardssalgAboutQualityBar(visitSummary, t.navn, "visit"))
+      ? visitSummary
+      : null;
     // Duplicate-field guard (dev-request 2026-07-20-kvalitetsgate slice 1 —
     // the Draopar incident): summarizeAbout() and summarizeVisit() extract
     // independently from primaryHtml/combinedHtml, but when a source page
@@ -1120,26 +1150,52 @@ router.post("/admin/gardssalg-content-refresh", requireAdmin, async (req: Reques
       candidateVisitRaw && candidateVisitRaw !== candidateAbout ? candidateVisitRaw : null;
     const candidateHours = hoursSnippet && hoursSnippet.trim() ? hoursSnippet : null;
 
+    function isBlank(v: unknown): boolean {
+      return v === null || v === undefined || String(v).trim() === "";
+    }
+
+    // Current-value CONTAMINATION check — the actual fix for the blocking
+    // finding above. A cheap-bar-passing current value is no longer treated
+    // as automatically decent: when there's something to actually gain from
+    // checking (current passes the cheap bar AND a fresh, ALREADY
+    // judge-approved candidate exists for the same field — candidateAbout/
+    // candidateVisit are only non-null once meetsGardssalgAboutQualityBar
+    // has approved them above), the SAME LLM judge is run against the
+    // CURRENT value too. Judging the candidate first (above) and the
+    // current value only afterward, and only conditionally, bounds this to
+    // at most one extra LLM call per field per run — and zero extra calls
+    // for the overwhelming common case (blank current, or a current/
+    // candidate that fails the free, deterministic cheap-bar check). If the
+    // current value fails ITS judge call, it's contaminated despite passing
+    // the cheap bar, and gardssalgReplaceableFieldAction() below is told so.
+    const aboutCurrentCheapBarPass = !isBlank(t.about_text) && meetsAboutCheapBar(t.about_text);
+    const aboutCurrentContaminated =
+      aboutCurrentCheapBarPass && candidateAbout
+        ? !(await meetsGardssalgAboutQualityBar(t.about_text, t.navn, "about"))
+        : false;
+    const visitCurrentCheapBarPass = !isBlank(t.visit_text) && meetsAboutCheapBar(t.visit_text);
+    const visitCurrentContaminated =
+      visitCurrentCheapBarPass && candidateVisit
+        ? !(await meetsGardssalgAboutQualityBar(t.visit_text, t.navn, "visit"))
+        : false;
+
     const provenance: GsProvenanceMap = {};
     if (candidateAbout) provenance.about_text = { source_url: fetched.fetchUrl, snippet: candidateAbout.slice(0, 120) };
     if (candidateVisit) provenance.visit_text = { source_url: fetched.fetchUrl, snippet: candidateVisit.slice(0, 120) };
     if (candidateHours) provenance.opening_hours_text = { source_url: fetched.fetchUrl, snippet: candidateHours };
 
-    function isBlank(v: unknown): boolean {
-      return v === null || v === undefined || String(v).trim() === "";
-    }
-
     // THIN/BLANK-FIELD check against the target's own snapshot (taken at
     // selection time, before any write in this run) — used both to gate
     // whether there's anything to do at all AND for the dry-run projection.
     // about_text/visit_text go through gardssalgReplaceableFieldAction (the
-    // SAME fill-blank-OR-replace-thin decision applyGardssalgProviderContent
-    // makes) so the preview can never drift from the real write path.
-    // opening_hours_text stays on the old fill-only-blank check (unchanged).
+    // SAME fill-blank-OR-replace-thin-OR-replace-contaminated decision
+    // applyGardssalgProviderContent makes) so the preview can never drift
+    // from the real write path. opening_hours_text stays on the old
+    // fill-only-blank check (unchanged).
     const wouldWriteActions: Record<string, GsFieldAction> = {};
-    const aboutAction = gardssalgReplaceableFieldAction(t.about_text, candidateAbout);
+    const aboutAction = gardssalgReplaceableFieldAction(t.about_text, candidateAbout, aboutCurrentContaminated);
     if (aboutAction) wouldWriteActions.about_text = aboutAction;
-    const visitAction = gardssalgReplaceableFieldAction(t.visit_text, candidateVisit);
+    const visitAction = gardssalgReplaceableFieldAction(t.visit_text, candidateVisit, visitCurrentContaminated);
     if (visitAction) wouldWriteActions.visit_text = visitAction;
     if (candidateHours && isBlank(t.opening_hours_text)) wouldWriteActions.opening_hours_text = "filled";
 
@@ -1154,20 +1210,77 @@ router.post("/admin/gardssalg-content-refresh", requireAdmin, async (req: Reques
     // fetch. Runs in BOTH dry-run and apply mode (dry-run still calls the LLM
     // so the preview is real, same convention as the extractive path above);
     // dry-run still writes nothing regardless of the LLM's answer.
+    //
+    // Fix-up round 2 (independent review's new blocking finding): the
+    // structural gardssalgRewriteEligible check ("passes the cheap bar AND
+    // <200 chars") is exactly as foolable as gardssalgReplaceableFieldAction's
+    // pre-fix-up-round-1 cheap-bar-only check was — nav-menu chrome glued to
+    // one real sentence (the Draopar shape) is long+Norwegian-looking enough
+    // to pass the cheap bar and still land under 200 chars, so it "looks"
+    // like genuine thin content worth expanding. Unlike the replace path,
+    // this rewrite path had NO compensating judge check at all: the
+    // contaminated current value was trusted as grounding text handed
+    // straight to generateGardssalgAboutRewrite, and that helper's OUTPUT
+    // then went straight to the DB with zero semantic check. Two
+    // independent, cost-bounded gates close this (mirrors this file's
+    // existing cascade discipline — the LLM is never called for a field
+    // that couldn't possibly qualify):
+    //   (b) BEFORE generating: once the cheap structural rule says "maybe",
+    //       judge the CURRENT value with the SAME gårdssalg LLM judge used
+    //       everywhere else in this redesign (meetsGardssalgAboutQualityBar)
+    //       and feed the negated verdict into gardssalgRewriteEligible's
+    //       currentValueJudgedContaminated param — a contaminated current
+    //       value is never even handed to the rewrite generator as trusted
+    //       grounding.
+    //   (a) AFTER generating: the rewrite model's own OUTPUT is judged by the
+    //       SAME LLM judge before it is allowed into wouldWriteActions/the
+    //       write path — protects against the rewrite model itself producing
+    //       something bad even from clean grounding, and is the fully
+    //       consistent form of this redesign's philosophy ("every candidate
+    //       about_text/visit_text write for gårdssalg goes through the judge
+    //       cascade before landing").
+    // Fail-closed throughout: any judge failure/ambiguity (missing API key,
+    // network error, unparseable/ambiguous response) resolves to "not
+    // approved" (see judgeGardssalgAboutCandidate's own fail-closed
+    // contract), which here means "not eligible" / "candidate rejected" —
+    // never written on doubt.
+    // Cost dedup: aboutCurrentContaminated/visitCurrentContaminated above are
+    // only a REAL (LLM-backed) verdict when they were actually computed —
+    // i.e. when the current value passed the cheap bar AND a fresh,
+    // judge-approved extractive candidate existed to check it against. In the
+    // narrow case where that already happened for this exact current value
+    // (t.about_text/t.visit_text — unchanged since) but
+    // gardssalgReplaceableFieldAction still declined to act (e.g. the fresh
+    // extractive candidate wasn't strictly longer), re-running the SAME judge
+    // question against the SAME text here would be a wasted, redundant LLM
+    // call — so reuse that verdict instead of asking twice. Only fall back to
+    // a fresh judge call when the earlier check never actually ran.
     let rewriteAbout: string | null = null;
     let rewriteVisit: string | null = null;
     if (!wouldWriteActions.about_text && gardssalgRewriteEligible(t.about_text)) {
-      rewriteAbout = await generateGardssalgAboutRewrite(contentText, t.about_text as string, "about");
-      if (rewriteAbout) {
-        wouldWriteActions.about_text = "rewritten";
-        provenance.about_text = { source_url: fetched.fetchUrl, snippet: rewriteAbout.slice(0, 120) };
+      const aboutCurrentRewriteContaminated = aboutCurrentCheapBarPass && candidateAbout
+        ? aboutCurrentContaminated
+        : !(await meetsGardssalgAboutQualityBar(t.about_text, t.navn, "about"));
+      if (gardssalgRewriteEligible(t.about_text, aboutCurrentRewriteContaminated)) {
+        const aboutRewriteCandidate = await generateGardssalgAboutRewrite(contentText, t.about_text as string, "about");
+        if (aboutRewriteCandidate && (await meetsGardssalgAboutQualityBar(aboutRewriteCandidate, t.navn, "about"))) {
+          rewriteAbout = aboutRewriteCandidate;
+          wouldWriteActions.about_text = "rewritten";
+          provenance.about_text = { source_url: fetched.fetchUrl, snippet: rewriteAbout.slice(0, 120) };
+        }
       }
     }
     if (!wouldWriteActions.visit_text && gardssalgRewriteEligible(t.visit_text)) {
-      rewriteVisit = await generateGardssalgAboutRewrite(contentText, t.visit_text as string, "visit");
-      if (rewriteVisit) {
-        wouldWriteActions.visit_text = "rewritten";
-        provenance.visit_text = { source_url: fetched.fetchUrl, snippet: rewriteVisit.slice(0, 120) };
+      const visitCurrentRewriteContaminated = visitCurrentCheapBarPass && candidateVisit
+        ? visitCurrentContaminated
+        : !(await meetsGardssalgAboutQualityBar(t.visit_text, t.navn, "visit"));
+      if (gardssalgRewriteEligible(t.visit_text, visitCurrentRewriteContaminated)) {
+        const visitRewriteCandidate = await generateGardssalgAboutRewrite(contentText, t.visit_text as string, "visit");
+        if (visitRewriteCandidate && (await meetsGardssalgAboutQualityBar(visitRewriteCandidate, t.navn, "visit"))) {
+          rewriteVisit = visitRewriteCandidate;
+          wouldWriteActions.visit_text = "rewritten";
+          provenance.visit_text = { source_url: fetched.fetchUrl, snippet: rewriteVisit.slice(0, 120) };
+        }
       }
     }
 
@@ -1221,6 +1334,14 @@ router.post("/admin/gardssalg-content-refresh", requireAdmin, async (req: Reques
         const rewriteFields: Array<"about_text" | "visit_text"> = [];
         if (rewriteAbout) rewriteFields.push("about_text");
         if (rewriteVisit) rewriteFields.push("visit_text");
+        // Fix-up round: tell the writer which fields' CURRENT value was
+        // already judged contaminated above, so gardssalgReplaceableFieldAction
+        // (called again inside applyGardssalgProviderContent against the
+        // FRESH row) can replace a cheap-bar-passing-but-contaminated current
+        // value instead of refusing to ever touch it.
+        const contaminatedFields: Array<"about_text" | "visit_text"> = [];
+        if (aboutCurrentContaminated) contaminatedFields.push("about_text");
+        if (visitCurrentContaminated) contaminatedFields.push("visit_text");
         const written = applyGardssalgProviderContent(
           providerId,
           {
@@ -1231,7 +1352,8 @@ router.post("/admin/gardssalg-content-refresh", requireAdmin, async (req: Reques
           },
           fetched.fetchUrl,
           undefined,
-          rewriteFields.length > 0 ? rewriteFields : undefined
+          rewriteFields.length > 0 ? rewriteFields : undefined,
+          contaminatedFields.length > 0 ? contaminatedFields : undefined
         );
         if (written.length > 0) {
           const actions: Record<string, GsFieldAction> = {};
@@ -4113,6 +4235,162 @@ type TitleNoCandidate = {
   kommune: string | null;
   fylke: string | null;
 };
+
+// ─── judgeGardssalgAboutCandidate + meetsGardssalgAboutQualityBar
+//     (dev-request 2026-07-20-gardssalg-kvalitetsgate-redesign, slice 2/3/4)
+//     ───────────────────────────────────────────────────────────────────────
+// Redesign of the gårdssalg about_text/visit_text quality gate: replaces the
+// old regex nav-menu-leakage heuristic (isLikelyNavMenuLeakage,
+// hasVerbatimRepeatedPhrase, NAV_BOILERPLATE_MARKERS,
+// UMBRELLA_MEMBERSHIP_MARKERS — search-enrich.ts) with an LLM judge for the
+// SEMANTIC question ("is this candidate actually good, about the right
+// entity, not leaked nav chrome") — the four-times-patched heuristic layer
+// that let the Draopar incident through on a single loophole word ("er").
+//
+// SCOPING NOTE (why the shared meetsAboutQualityBar in search-enrich.ts is
+// UNTOUCHED): that function is also called from routes/admin-knowledge.ts
+// for the RFB producer/agent homepage-content-refresh vertical — a
+// completely different, non-gårdssalg use case this dev-request's "Ikke-mål"
+// section explicitly does not target. This LLM judge is scoped ONLY to
+// gårdssalg's about_text/visit_text. Blindly stripping the nav-heuristic
+// checks out of the shared function would silently lower admin-knowledge.ts's
+// quality gate too, with no LLM-judge replacement wired in for it — a real
+// regression outside this dev-request's scope. So: meetsAboutQualityBar keeps
+// its existing behavior/callers unchanged; gårdssalg gets its OWN additive
+// gate (meetsGardssalgAboutQualityBar below), reusing only the cheap,
+// universal parts (meetsAboutCheapBar, search-enrich.ts) and replacing the
+// heuristic layer with the LLM judge. This means isLikelyNavMenuLeakage /
+// hasVerbatimRepeatedPhrase / NAV_BOILERPLATE_MARKERS /
+// UMBRELLA_MEMBERSHIP_MARKERS are NOT deleted from search-enrich.ts (the
+// dev-request's literal "removed, not left dead" instruction assumed
+// meetsAboutQualityBar was gårdssalg-exclusive, which it is not) — they stay,
+// unaffected, serving admin-knowledge.ts exactly as before. Gårdssalg simply
+// no longer calls them.
+//
+// judgeGardssalgAboutCandidate mirrors generateGardssalgAboutRewrite's EXACT
+// sentinel/fail-closed contract below: direct fetch to
+// https://api.anthropic.com/v1/messages, ANTHROPIC_API_KEY from env, model
+// claude-opus-4-8. ANY doubt or failure — missing key, network failure,
+// non-200, unparseable JSON, a response that isn't the exact expected
+// verdict token — resolves to REJECT. Never throws, never silently
+// approves.
+export interface GardssalgJudgeVerdict {
+  approved: boolean;
+  reasoning: string;
+}
+
+const GARDSSALG_JUDGE_APPROVE_TOKEN = "GODKJENN";
+const GARDSSALG_JUDGE_REJECT_TOKEN = "AVVIS";
+const GARDSSALG_JUDGE_CANDIDATE_CHAR_CAP = 4000;
+
+export async function judgeGardssalgAboutCandidate(
+  candidateText: string,
+  producerName: string,
+  kind: "about" | "visit"
+): Promise<GardssalgJudgeVerdict> {
+  const apiKey = process.env.ANTHROPIC_API_KEY;
+  if (!apiKey) {
+    return { approved: false, reasoning: "ANTHROPIC_API_KEY mangler — avvist fail-closed" };
+  }
+
+  const sectionLabel = kind === "about" ? "Om produsenten" : "Besøket hos produsenten";
+  const cappedCandidate = (candidateText || "").slice(0, GARDSSALG_JUDGE_CANDIDATE_CHAR_CAP);
+  const prompt = `Du er en kvalitetsdommer for produsentprofiler på en norsk markedsplattform for gårdssalg. Vurder om kandidatteksten under er egnet til å publiseres som seksjonen "${sectionLabel}" for produsenten "${producerName}".
+
+Kandidattekst:
+${cappedCandidate}
+
+Godkjenn KUN hvis teksten er:
+- sammenhengende, ekte norsk prosa spesifikt om DENNE produsenten (ikke en paraplyorganisasjon/reiselivslag/turistkontor sine mange medlemmer omtalt samlet),
+- fri for lekket navigasjonsmeny-, sidetopp- eller bunntekst-innhold (lenkelister, "hjem"/"kontakt"/"meny"-navigasjon, cookie-/samtykketekst, "hopp til innhold" og lignende),
+- fri for åpenbart oppstykket, avkuttet eller ødelagt tekst,
+- faktisk informativ om produsenten, ikke bare en generisk floskel.
+
+Svar med EKSAKT ett av disse to ordene alene på første linje, etterfulgt av en kort norsk begrunnelse på én setning på neste linje:
+${GARDSSALG_JUDGE_APPROVE_TOKEN}
+<kort begrunnelse>
+
+eller
+
+${GARDSSALG_JUDGE_REJECT_TOKEN}
+<kort begrunnelse>
+
+Ved minste tvil, svar ${GARDSSALG_JUDGE_REJECT_TOKEN}.`;
+
+  let response: Awaited<ReturnType<typeof fetch>>;
+  try {
+    response = await fetch("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "x-api-key": apiKey,
+        "anthropic-version": "2023-06-01",
+      },
+      body: JSON.stringify({
+        model: "claude-opus-4-8",
+        max_tokens: 200,
+        messages: [{ role: "user", content: prompt }],
+      }),
+    });
+  } catch {
+    return { approved: false, reasoning: "nettverksfeil under dommer-kall — avvist fail-closed" }; // never fabricate
+  }
+
+  if (!response.ok) {
+    return { approved: false, reasoning: `dommer-API svarte status ${response.status} — avvist fail-closed` };
+  }
+
+  let result: any;
+  try {
+    result = await response.json();
+  } catch {
+    return { approved: false, reasoning: "ikke-parsbar JSON fra dommer-API — avvist fail-closed" };
+  }
+
+  const contentArr = Array.isArray(result?.content) ? result.content : [];
+  const text = contentArr.find((c: any) => c?.type === "text")?.text;
+  if (typeof text !== "string") {
+    return { approved: false, reasoning: "uventet svarformat fra dommer-API — avvist fail-closed" };
+  }
+
+  const lines = text.trim().split(/\r?\n/).map((l) => l.trim()).filter((l) => l.length > 0);
+  const verdictToken = (lines[0] || "").toUpperCase();
+  const reasoning = lines.slice(1).join(" ").trim();
+
+  // Only the EXACT approve token approves. Anything else — the reject
+  // token, an empty response, garbage, a token that merely CONTAINS the
+  // approve word inside a longer sentence — is a reject. Fail-closed on any
+  // ambiguity, never a silent approval.
+  if (verdictToken === GARDSSALG_JUDGE_APPROVE_TOKEN) {
+    return { approved: true, reasoning: reasoning || "godkjent av LLM-dommer" };
+  }
+  if (verdictToken === GARDSSALG_JUDGE_REJECT_TOKEN) {
+    return { approved: false, reasoning: reasoning || "avvist av LLM-dommer" };
+  }
+  return { approved: false, reasoning: "uventet/tvetydig dommersvar — avvist fail-closed" };
+}
+
+/**
+ * The gårdssalg-specific about_text/visit_text quality gate — the cascade
+ * this dev-request builds: the cheap, deterministic prefilter (
+ * meetsAboutCheapBar, search-enrich.ts — length/mangled-Unicode/boilerplate/
+ * Norwegian-check) FIRST, and the LLM judge above ONLY when that passes.
+ * Cost control: a candidate the cheap filter would already reject never
+ * reaches the LLM at all.
+ *
+ * This is the function gårdssalg's about_text/visit_text write call sites
+ * use in place of the shared meetsAboutQualityBar (see this section's top
+ * doc comment for why the shared function itself is untouched).
+ */
+export async function meetsGardssalgAboutQualityBar(
+  candidateText: string | null | undefined,
+  producerName: string,
+  kind: "about" | "visit"
+): Promise<boolean> {
+  if (!meetsAboutCheapBar(candidateText)) return false;
+  const verdict = await judgeGardssalgAboutCandidate(String(candidateText), producerName, kind);
+  return verdict.approved;
+}
 
 // ─── generateGardssalgAboutRewrite (dev-request 2026-07-18-gardssalg-
 //     profilkvalitet-foer-outreach, slice 5a) ───────────────────────────────
