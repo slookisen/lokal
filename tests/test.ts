@@ -27236,6 +27236,35 @@ Promise.allSettled(_oaHomeCountersDeps).then(async () => {
     failed += adr.failed;
     for (const f of adr.failures) failures.push("experience-dedup-audit: " + f);
     console.log(`  experience-dedup-audit: ${adr.passed} passed, ${adr.failed} failed`);
+
+    // dev-request 2026-07-21-analytics-tre-boetter-mcp-logging-a2a-transparens
+    // slice A: THE shared UA/session classifier (traffic-classifier.ts) that
+    // replaced the three drifting bot-pattern lists. Pure module (no DB), but
+    // runs here with its sibling traffic-stats suite for a single honest
+    // reporting point.
+    console.log("\n── traffic-classifier: shared UA/session classifier (tre bøtter) ──");
+    const { runTrafficClassifierTests } = require("../src/services/traffic-classifier.test") as
+      typeof import("../src/services/traffic-classifier.test");
+    const tcr = runTrafficClassifierTests({ log: false });
+    passed += tcr.passed;
+    failed += tcr.failed;
+    for (const f of tcr.failures) failures.push("traffic-classifier: " + f);
+    console.log(`  traffic-classifier: ${tcr.passed} passed, ${tcr.failed} failed`);
+
+    // Same dev-request, slice A: getTrafficStats() rewritten on top of the
+    // shared classifier — sum identity (humanViews + aiSearchViews + botViews
+    // === pageViews), realVisitors ≤ uniqueVisitors, windowDays from the
+    // runtime RFB_AUTO_PRUNE_DAYS retention, back-compat aliases. Swaps the
+    // shared getDb() singleton via __setDbForTesting, so it runs sequentially
+    // inside this same gated block for the same reason as the suites above.
+    console.log("\n── traffic-stats: three-bucket stats + invariants ──");
+    const { runTrafficStatsTests } = require("../src/services/traffic-stats.test") as
+      typeof import("../src/services/traffic-stats.test");
+    const tsr = runTrafficStatsTests({ log: false });
+    passed += tsr.passed;
+    failed += tsr.failed;
+    for (const f of tsr.failures) failures.push("traffic-stats: " + f);
+    console.log(`  traffic-stats: ${tsr.passed} passed, ${tsr.failed} failed`);
   } catch (err: any) {
     failed++;
     failures.push("oa-home-counters: unexpected error: " + String(err?.message || err));

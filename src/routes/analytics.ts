@@ -3,6 +3,7 @@ import path from "path";
 import { randomUUID } from "crypto";
 import { getDb } from "../database/init";
 import { analyticsService, VerticalId } from "../services/analytics-service";
+import { classifySession, uaFromSessionId, SCANNER_PATH_PATTERNS } from "../services/traffic-classifier";
 
 // SQLite stores datetimes as "YYYY-MM-DD HH:MM:SS" (space-separated).
 // JS .toISOString() uses "T" separator which breaks SQLite string comparison.
@@ -565,16 +566,11 @@ router.get("/traffic-classification", (req: Request, res: Response) => {
       GROUP BY session_id
     `).all(cutoff, ...verticalFilter(req).params) as any[];
 
-    // Classification patterns
-    // Bot detection: UA contains "bot"/"spider"/"crawl" as whole-ish word (not
-    // substring of something like "bot_name_lookalike"), OR a known named bot
-    // that doesn't itself contain "bot" (e.g. Bytespider, facebookexternalhit).
-    // The whole-word rule avoids false positives where a browser UA happens to
-    // include "robot" or similar incidentally.
-    const botPatterns = ['bot', 'Bot', 'spider', 'crawl', 'serpstat', 'GPTBot', 'ClaudeBot', 'Chiark', 'Go-http-client', 'Dataprovider', 'NotHumanSearch', 'DuckDuck', 'Googlebot', 'GoogleOther', 'Bytespider', 'Applebot', 'YandexBot', 'BingPreview', 'facebookexternal', 'Twitterbot', 'Amazonbot', 'meta-external', 'PetalBot', 'SemrushBot', 'AhrefsBot', 'DotBot', 'BLEXBot', 'MojeekBot', 'SeekportBot', 'CCBot', 'anthropic-ai', 'cohere-ai', 'ImagesiftBot', 'Diffbot', 'LinkedInBot', 'Slackbot', 'WhatsApp', 'TelegramBot'];
-    const devPatterns = ['curl/', 'Python/', 'aiohttp', 'Lokal/', 'Lokal-Enricher', 'Claude-User', 'Python-urllib', 'node-fetch', 'axios/'];
-    const scannerPatterns = ['Chrome/78.0', 'Chrome/89.0', 'Chrome/95.0', 'Chrome/58.0', 'Chrome/102.0'];
-    const scannerPaths = ['wp-admin', 'wp-login', 'xmlrpc', 'wlwmanifest', '.env', '.git', 'wp-includes'];
+    // Classification now goes through the SHARED classifier
+    // (src/services/traffic-classifier.ts) — the local botPatterns/devPatterns/
+    // scannerPatterns copies that used to live here (one of three drifting
+    // lists) are gone. Scanner probe paths still come from the shared module.
+    const scannerPaths = SCANNER_PATH_PATTERNS;
 
     // Dynamic bot-name extractor. Tries (in order):
     //   1. Exact token ending in Bot/Crawler/Spider/bot (case-insensitive) —
@@ -609,7 +605,18 @@ router.get("/traffic-classification", (req: Request, res: Response) => {
     `).all(cutoff, ...verticalFilter(req).params, ...scannerPaths.map(p => `%${p}%`)) as any[];
     const scannerSessionIds = new Set(scannerHits.map((r: any) => r.session_id));
 
-    const classification = { human: { views: 0, sessions: 0 }, bot: { views: 0, sessions: 0 }, dev: { views: 0, sessions: 0 }, scanner: { views: 0, sessions: 0 } };
+    // Buckets: human/bot/dev/scanner keys are kept for backward compat (`bot`
+    // stays the aggregate of NON-AI bots: search_engine + seo_bot + social +
+    // other_bot), and the two new honest AI buckets are ADDED — ai_search
+    // (human-initiated `*-User` retrieval) and ai_crawler (GPTBot & co).
+    const classification = {
+      human: { views: 0, sessions: 0 },
+      ai_search: { views: 0, sessions: 0 },
+      ai_crawler: { views: 0, sessions: 0 },
+      bot: { views: 0, sessions: 0 },
+      dev: { views: 0, sessions: 0 },
+      scanner: { views: 0, sessions: 0 },
+    };
     const botDetails: Record<string, { name: string; views: number; sampleUa?: string }> = {};
     const humanSessions: any[] = [];
     // Sample raw UAs that fell into "other" so the dashboard can show them.
@@ -617,27 +624,11 @@ router.get("/traffic-classification", (req: Request, res: Response) => {
     const otherSamples: Array<{ ua: string; views: number }> = [];
 
     for (const v of visitors) {
-      const ua = v.session_id.includes(':') ? v.session_id.split(':').slice(1).join(':') : '';
-      const isBot = botPatterns.some(p => ua.includes(p));
-      const isDev = devPatterns.some(p => ua.includes(p));
-      const isScanner = scannerPatterns.some(p => ua.includes(p)) || scannerSessionIds.has(v.session_id);
+      const ua = uaFromSessionId(v.session_id);
+      const category = classifySession(v.session_id, { scannerPaths: scannerSessionIds.has(v.session_id) });
 
       let type: string;
-      if (isBot) {
-        type = 'bot';
-        const botName = extractBotName(ua);
-        if (!botDetails[botName]) botDetails[botName] = { name: botName, views: 0, sampleUa: ua.slice(0, 120) };
-        botDetails[botName].views += v.views;
-        // If we fell back to the last-resort token, preserve the raw UA so we
-        // can surface it in the dashboard's "other" drill-down.
-        if (botName === 'other' || /^(Mozilla|compatible)$/i.test(botName)) {
-          otherSamples.push({ ua: ua.slice(0, 160), views: v.views });
-        }
-      } else if (isDev) {
-        type = 'dev';
-      } else if (isScanner) {
-        type = 'scanner';
-      } else {
+      if (category === 'human') {
         type = 'human';
         humanSessions.push({
           ua: ua.substring(0, 80),
@@ -646,6 +637,25 @@ router.get("/traffic-classification", (req: Request, res: Response) => {
           firstSeen: v.first_seen,
           lastSeen: v.last_seen,
         });
+      } else if (category === 'dev' || category === 'scanner' || category === 'ai_search' || category === 'ai_crawler') {
+        type = category;
+      } else {
+        // search_engine + seo_bot + social + other_bot → the legacy 'bot' key
+        type = 'bot';
+      }
+
+      // Named-bot breakdown covers every non-human, non-dev, non-scanner
+      // session (incl. the AI buckets) so the dashboard's bots list stays
+      // complete.
+      if (type === 'bot' || type === 'ai_search' || type === 'ai_crawler') {
+        const botName = extractBotName(ua);
+        if (!botDetails[botName]) botDetails[botName] = { name: botName, views: 0, sampleUa: ua.slice(0, 120) };
+        botDetails[botName].views += v.views;
+        // If we fell back to the last-resort token, preserve the raw UA so we
+        // can surface it in the dashboard's "other" drill-down.
+        if (botName === 'other' || /^(Mozilla|compatible)$/i.test(botName)) {
+          otherSamples.push({ ua: ua.slice(0, 160), views: v.views });
+        }
       }
 
       (classification as any)[type].views += v.views;
@@ -1193,15 +1203,15 @@ router.get("/ops/diagnostics", (_req: Request, res: Response) => {
       GROUP BY session_id
     `).all(oneHourAgo) as any[];
 
-    const botPatterns = ['bot', 'Bot', 'spider', 'crawl', 'GPTBot', 'ClaudeBot', 'Googlebot', 'Bytespider', 'Applebot', 'YandexBot', 'BingPreview', 'Go-http-client', 'Python/', 'curl/'];
+    // Shared classifier (traffic-classifier.ts): everything non-human counts
+    // as bot here — this endpoint only reports a coarse bot ratio.
     let botViews = 0;
     let humanViews = 0;
     for (const s of sessions) {
-      const ua = s.session_id.includes(':') ? s.session_id.split(':').slice(1).join(':') : '';
-      if (botPatterns.some(p => ua.includes(p))) {
-        botViews += s.views;
-      } else {
+      if (classifySession(s.session_id) === 'human') {
         humanViews += s.views;
+      } else {
+        botViews += s.views;
       }
     }
 

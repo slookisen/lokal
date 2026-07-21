@@ -2,6 +2,7 @@ import { Request, Response, NextFunction } from "express";
 import crypto from "crypto";
 import { getDb } from "../database/init";
 import { slugify } from "../utils/slug";
+import { classifyUA, uaFromSessionId } from "./traffic-classifier";
 
 /**
  * Lightweight Analytics Service for Lokal
@@ -650,42 +651,27 @@ export class AnalyticsService {
       // GPTBot and ClaudeBot were hammering the site. session_id is stored as
       // `${ipHash}:${userAgent}`, so we can scan it for crawler UA tokens and
       // get a truthful read on AI visibility.
+      // Response shape (chatgpt/claude/other) is kept for compatibility, but
+      // membership is now decided by the SHARED classifier
+      // (src/services/traffic-classifier.ts): a session counts as AI traffic
+      // iff it classifies as ai_search (`*-User` retrieval) or ai_crawler.
+      // NOTE (slice A honesty fix): plain search-engine crawlers (Googlebot,
+      // DuckDuckBot, …) used to be folded into `other` here — they are now
+      // search_engine, not AI, so they no longer inflate this number.
       const agentTraffic = { chatgpt: 0, claude: 0, other: 0 };
-
-      // ChatGPT family: OpenAI crawlers and ChatGPT-User browsing agent.
-      const chatgptRow = db.prepare(`
-        SELECT COUNT(*) as count FROM analytics_page_views
-        WHERE created_at > ? AND ${"(is_owner IS NULL OR is_owner = 0)"}
-          AND (session_id LIKE '%GPTBot%' OR session_id LIKE '%ChatGPT%' OR session_id LIKE '%OAI-SearchBot%')${V}
-      `).get(cutoff, ...vp) as any;
-      agentTraffic.chatgpt = chatgptRow?.count || 0;
-
-      // Claude family: ClaudeBot crawler and Claude-User browsing agent.
-      const claudeRow = db.prepare(`
-        SELECT COUNT(*) as count FROM analytics_page_views
-        WHERE created_at > ? AND ${"(is_owner IS NULL OR is_owner = 0)"}
-          AND (session_id LIKE '%ClaudeBot%' OR session_id LIKE '%Claude-User%' OR session_id LIKE '%Anthropic%')${V}
-      `).get(cutoff, ...vp) as any;
-      agentTraffic.claude = claudeRow?.count || 0;
-
-      // Other AI / non-human retrievers — Gemini, Perplexity, Google-Extended,
-      // CCBot, Bytespider, Applebot, YandexBot, NotHumanSearch, DuckDuckBot,
-      // Googlebot. We deliberately include mainstream search bots here because
-      // they contribute to LLM-grounding pipelines and our primary KPI is
-      // "non-human traffic discovering us," not strictly LLM-branded crawlers.
-      const otherRow = db.prepare(`
-        SELECT COUNT(*) as count FROM analytics_page_views
-        WHERE created_at > ? AND ${"(is_owner IS NULL OR is_owner = 0)"}
-          AND (
-            session_id LIKE '%Gemini%' OR session_id LIKE '%Google-Extended%'
-            OR session_id LIKE '%PerplexityBot%' OR session_id LIKE '%Perplexity-User%'
-            OR session_id LIKE '%CCBot%' OR session_id LIKE '%Bytespider%'
-            OR session_id LIKE '%Applebot-Extended%' OR session_id LIKE '%YandexAdditional%'
-            OR session_id LIKE '%NotHumanSearch%' OR session_id LIKE '%DuckDuckBot%'
-            OR session_id LIKE '%Googlebot%'
-          )${V}
-      `).get(cutoff, ...vp) as any;
-      agentTraffic.other = otherRow?.count || 0;
+      const aiSessions = db.prepare(`
+        SELECT session_id, COUNT(*) as count FROM analytics_page_views
+        WHERE created_at > ? AND ${"(is_owner IS NULL OR is_owner = 0)"}${V}
+        GROUP BY session_id
+      `).all(cutoff, ...vp) as any[];
+      for (const row of aiSessions) {
+        const ua = uaFromSessionId(row.session_id);
+        const category = classifyUA(ua);
+        if (category !== "ai_search" && category !== "ai_crawler") continue;
+        if (/GPTBot|ChatGPT|OAI-SearchBot/i.test(ua)) agentTraffic.chatgpt += row.count;
+        else if (/Claude|anthropic/i.test(ua)) agentTraffic.claude += row.count;
+        else agentTraffic.other += row.count;
+      }
 
       // Back-compat: if the analytics_queries table has search-query hits from
       // explicitly named agents (ChatGPT/Claude), fold those in too so we don't
