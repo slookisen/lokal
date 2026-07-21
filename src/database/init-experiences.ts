@@ -642,5 +642,21 @@ export function initExperiencesSchema(db: Database.Database): void {
     try { db.exec(stmt); } catch { /* already present */ }
   }
 
+  // ─── listing_url (dev-request 2026-07-12-experiences-enrichment-supply-
+  // and-aggregator-hygiene, Daniel's 2026-07-19 decision, step 1) ───────────
+  // A chunk of experience_providers.hjemmeside rows carry a DMO/aggregator/
+  // directory URL (visitnorway.no, tripadvisor.com, ...) instead of the
+  // provider's OWN homepage — a catalog/listing page, not the site itself.
+  // POST /admin/hjemmeside-cleanup-sweep (src/routes/opplevelser.ts) moves
+  // those values OUT of hjemmeside and INTO this additive column, clearing
+  // hjemmeside so it stops polluting downstream enrichment/content-refresh.
+  // NULL until a row is swept; NULL also doubles as this sweep's "not yet
+  // moved" candidate marker (hjemmeside IS NOT NULL AND listing_url IS NULL).
+  // Purely additive — every existing row is unaffected (NULL default) until
+  // explicitly swept. Re-discovering the real homepage from this value
+  // (listing-page-link -> Brreg -> Google Places) is step 2, an explicitly
+  // deferred future slice — not built here.
+  try { db.exec("ALTER TABLE experience_providers ADD COLUMN listing_url TEXT"); } catch { /* already present */ }
+
   console.log("[experiences] schema initialized");
 }

@@ -3215,6 +3215,265 @@ router.patch("/admin/providers/:id/hjemmeside", requireAdmin, (req: Request, res
   }
 });
 
+// ─── POST /api/opplevelser/admin/hjemmeside-cleanup-sweep (admin) ───────────
+//
+// dev-request 2026-07-12-experiences-enrichment-supply-and-aggregator-hygiene,
+// Daniel's 2026-07-19 decision, step 1 (classify + move only — step 2,
+// re-discovering the real homepage via listing-page-link -> Brreg org-nr ->
+// Google Places, is an explicitly deferred follow-on slice, not built here).
+//
+// WHY: a chunk of experience_providers.hjemmeside rows carry a DMO/aggregator
+// URL (visitnorway.no, tripadvisor.com, ...) instead of the provider's OWN
+// homepage — a catalog/listing page, not the site itself. The prior slice on
+// this same dev-request (item 2) already stopped NEW leaks at bulk-load
+// CREATE time (see isAggregatorWebsite()/firstNonAggregatorWebsite() above),
+// but rows written before that fix are still sitting on aggregator URLs
+// today. This is the (repeatable) classify-and-move sweep: it moves those
+// values OUT of hjemmeside and INTO the additive listing_url column (see
+// init-experiences.ts) — additive and reversible, nothing deleted, the
+// original value survives verbatim in both listing_url and
+// field_provenance.
+//
+// Classification reuses cross-source-validator.ts's isDirectoryOrAggregatorHost
+// (already covers this exact cohort) via the isAggregatorWebsite() local
+// helper already defined above (the same one the bulk-load CREATE-path fix
+// uses) — no new classifier module, no new domain list, per this
+// dev-request's own "reuse, don't reinvent" instruction. Mirrors the
+// dental#290 precedent (src/routes/admin-dental-hjemmeside-cleanup.ts)
+// adapted to this file's own conventions (requireAdmin gate, getExpDb, the
+// by-hjemmeside/PATCH-hjemmeside pair just above) rather than copy-pasted
+// verbatim.
+//
+// Candidate set: hjemmeside IS NOT NULL AND listing_url IS NULL (a row this
+// sweep already moved is never re-scanned — listing_url IS NULL doubles as
+// the "not yet swept" marker), ordered created_at ASC, id ASC, hard batch cap
+// (mirrors the dental twin's HJEMMESIDE_CLEANUP_BATCH_CAP).
+//
+// dry_run STRICT-FALSE parse (same convention as every other sweep in this
+// file, e.g. /admin/experiences-dedup-unmerge, /admin/experiences-title-no-
+// backfill): body.dry_run !== false — only the literal JSON boolean false
+// triggers a real write; null/"false"/0/""/undefined all mean dry-run.
+//
+// Apply path: for each flagged row, RE-FETCH hjemmeside/listing_url
+// immediately before writing (re-verify pattern, mirrors admin-domain-
+// coherence.ts's apply loop and the dental precedent) — skipped (reported in
+// `skipped`) if hjemmeside changed since the scan, or listing_url is no
+// longer NULL (already moved by a concurrent call). Otherwise, one UPDATE:
+// copy hjemmeside -> listing_url, set hjemmeside = NULL, and merge a
+// {source_url, fetched_at}-shaped entry for the "hjemmeside" key into
+// field_provenance using THIS codebase's LOCAL read-modify-write convention
+// (mirrors experience-store.ts's applyGardssalgProviderContent /
+// applyGardssalgProviderAddress ~lines 2414-2431/2633-2650) — NOT
+// admin-knowledge.ts's shared mergeFieldProvenance() helper (that's an
+// RFB/dental-only mechanism; this codebase deliberately keeps
+// provenance-merge logic vertical-local, so it is never cross-imported
+// here).
+//
+// A row the classifier does NOT flag is never touched, dry-run or apply.
+// requireAdmin-gated, same as every other admin route in this file.
+//
+// Non-goals (this slice): no Brreg/Places re-discovery of the real homepage
+// (step 2, future slice); no changes to evidence_url (legitimately allowed to
+// stay a DMO pointer); no changes to the bulk-load CREATE path (already
+// fixed by the prior slice); no new aggregator domains added speculatively to
+// KNOWN_DIRECTORY_HOSTS.
+const HJEMMESIDE_LISTING_SWEEP_BATCH_CAP = 200;
+const HJEMMESIDE_LISTING_SWEEP_SAMPLE_CAP = 50;
+
+interface ListingSweepCandidate {
+  id: string;
+  navn: string;
+  hjemmeside: string;
+}
+
+// Shared WHERE clause for both the count and the capped batch query, so the
+// two can never drift out of sync with each other.
+function listingSweepCandidateWhereSql(): string {
+  return "hjemmeside IS NOT NULL AND listing_url IS NULL";
+}
+
+function countListingSweepCandidates(db: ReturnType<typeof getExpDb>): number {
+  const row = db
+    .prepare(`SELECT COUNT(*) AS n FROM experience_providers WHERE ${listingSweepCandidateWhereSql()}`)
+    .get() as { n: number };
+  return row?.n ?? 0;
+}
+
+// Deterministic, oldest-registered-first ordering (created_at, then id as a
+// tiebreaker) — a hard LIMIT means only up to HJEMMESIDE_LISTING_SWEEP_BATCH_CAP
+// rows are ever scanned/moved per invocation.
+function fetchListingSweepCandidateBatch(
+  db: ReturnType<typeof getExpDb>,
+  cap: number
+): ListingSweepCandidate[] {
+  return db
+    .prepare(
+      `SELECT id, navn, hjemmeside FROM experience_providers
+       WHERE ${listingSweepCandidateWhereSql()}
+       ORDER BY created_at ASC, id ASC
+       LIMIT ?`
+    )
+    .all(cap) as ListingSweepCandidate[];
+}
+
+// Merges a {source_url, fetched_at} provenance entry for the "hjemmeside" key
+// into an existing field_provenance blob, preserving every OTHER field's
+// entry untouched — mirrors experience-store.ts's own inline read-modify-
+// write convention for this exact column (applyGardssalgProviderContent /
+// applyGardssalgProviderAddress), not admin-knowledge.ts's cross-vertical
+// mergeFieldProvenance() helper. Malformed/non-object/array JSON is treated
+// as empty so a corrupted existing blob never blocks the write. Exported for
+// unit-testing.
+export function mergeHjemmesideListingProvenance(
+  existingRaw: string | null | undefined,
+  entry: { source_url: string; fetched_at: string }
+): string {
+  let provenance: Record<string, { source_url: string; fetched_at: string }> = {};
+  if (existingRaw) {
+    try {
+      const parsed = JSON.parse(existingRaw);
+      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+        provenance = parsed as Record<string, { source_url: string; fetched_at: string }>;
+      }
+    } catch {
+      /* malformed existing JSON -> treat as empty rather than clobber the write */
+    }
+  }
+  provenance.hjemmeside = entry;
+  return JSON.stringify(provenance);
+}
+
+export interface ListingSweepApplyOutcome {
+  applied: boolean;
+  previous_hjemmeside?: string;
+  listing_url?: string;
+  skip_reason?: "row_not_found" | "already_moved" | "hjemmeside_changed" | "no_longer_flagged";
+}
+
+// Re-fetches a single row's CURRENT hjemmeside/listing_url/field_provenance
+// and, ONLY if it's still exactly the row `flag` was computed from (same
+// hjemmeside value, still un-moved) AND still classifies as an aggregator on
+// that fresh read, writes the move in one UPDATE. Otherwise it's a no-op skip
+// — this is the re-verify-immediately-before-writing guard (mirrors
+// admin-domain-coherence.ts's apply loop and the dental precedent's
+// applyHjemmesideCleanupToRow) that stops a row whose hjemmeside changed (or
+// that another call already moved) between an earlier scan and this write
+// from being clobbered. Exported standalone so the "changed since the scan"
+// skip path can be unit-tested directly, without needing an actual
+// concurrent request (this handler has no `await` in its own request-body
+// scan-then-write path, so that race can't be reproduced through two
+// ordinary sequential HTTP calls alone).
+export function applyHjemmesideListingSweepToRow(
+  db: ReturnType<typeof getExpDb>,
+  flag: ListingSweepCandidate,
+  nowIso: string
+): ListingSweepApplyOutcome {
+  const current = db
+    .prepare(`SELECT hjemmeside, listing_url, field_provenance FROM experience_providers WHERE id = ?`)
+    .get(flag.id) as
+    | { hjemmeside: string | null; listing_url: string | null; field_provenance: string | null }
+    | undefined;
+  if (!current) return { applied: false, skip_reason: "row_not_found" }; // row gone since the scan
+  if (current.listing_url !== null) return { applied: false, skip_reason: "already_moved" }; // already moved by something else
+  if (current.hjemmeside !== flag.hjemmeside) return { applied: false, skip_reason: "hjemmeside_changed" }; // changed since the scan — never clobber
+
+  // Re-verify against the CURRENT value, not the earlier scan read —
+  // belt-and-braces alongside the equality check just above.
+  if (!current.hjemmeside || !isAggregatorWebsite(current.hjemmeside)) {
+    return { applied: false, skip_reason: "no_longer_flagged" };
+  }
+
+  const mergedProvenance = mergeHjemmesideListingProvenance(current.field_provenance, {
+    source_url: current.hjemmeside,
+    fetched_at: nowIso,
+  });
+  db.prepare(
+    `UPDATE experience_providers
+        SET listing_url = ?, hjemmeside = NULL, field_provenance = ?, updated_at = datetime('now')
+      WHERE id = ?`
+  ).run(current.hjemmeside, mergedProvenance, flag.id);
+
+  return { applied: true, previous_hjemmeside: current.hjemmeside, listing_url: current.hjemmeside };
+}
+
+router.post("/admin/hjemmeside-cleanup-sweep", requireAdmin, (req: Request, res: Response) => {
+  const body = (req.body ?? {}) as { dry_run?: unknown };
+  // STRICT-FALSE parse — identical convention to every other admin sweep in
+  // this file: writes execute ONLY on the literal JSON boolean false.
+  const dryRun = body.dry_run !== false;
+
+  try {
+    const expDb = getExpDb("experiences");
+    const candidateCount = countListingSweepCandidates(expDb);
+    const batchRows = fetchListingSweepCandidateBatch(expDb, HJEMMESIDE_LISTING_SWEEP_BATCH_CAP);
+    const flagged = batchRows.filter((r) => isAggregatorWebsite(r.hjemmeside));
+
+    if (dryRun) {
+      res.json({
+        success: true,
+        dry_run: true,
+        candidate_count: candidateCount,
+        would_move: flagged.slice(0, HJEMMESIDE_LISTING_SWEEP_SAMPLE_CAP).map((r) => ({
+          id: r.id,
+          navn: r.navn,
+          hjemmeside: r.hjemmeside,
+        })),
+        would_move_count: flagged.length,
+        skipped: [],
+        // Dry-run makes ZERO writes: if this exact batch were applied, only
+        // the flagged (would_move) rows would ever leave the candidate set —
+        // every scanned-but-not-flagged row (a legitimate own-domain
+        // homepage) stays a candidate forever, so it must NOT be subtracted.
+        remaining_count: Math.max(0, candidateCount - flagged.length),
+      });
+      return;
+    }
+
+    // Apply: re-fetch + re-verify each flagged row's CURRENT state
+    // immediately before writing (see applyHjemmesideListingSweepToRow) — a
+    // row that changed (or was already moved by a concurrent call) since the
+    // scan above is skipped, never clobbered.
+    const moved: Array<{ id: string; navn: string; previous_hjemmeside: string; listing_url: string }> = [];
+    const skipped: Array<{ id: string; navn: string; reason: string }> = [];
+    const nowIso = new Date().toISOString();
+
+    const tx = expDb.transaction(() => {
+      for (const flag of flagged) {
+        const outcome = applyHjemmesideListingSweepToRow(expDb, flag, nowIso);
+        if (!outcome.applied) {
+          skipped.push({ id: flag.id, navn: flag.navn, reason: outcome.skip_reason ?? "unknown" });
+          continue;
+        }
+        moved.push({
+          id: flag.id,
+          navn: flag.navn,
+          previous_hjemmeside: outcome.previous_hjemmeside!,
+          listing_url: outcome.listing_url!,
+        });
+      }
+    });
+    tx();
+
+    // Apply DOES write, so remaining_count must be the TRUE current candidate
+    // count, re-queried from the DB after the transaction — a fresh COUNT(*)
+    // is the only accurate source here (mirrors the dental precedent).
+    const remainingCount = countListingSweepCandidates(expDb);
+
+    res.json({
+      success: true,
+      dry_run: false,
+      candidate_count: candidateCount,
+      moved: moved.slice(0, HJEMMESIDE_LISTING_SWEEP_SAMPLE_CAP),
+      moved_count: moved.length,
+      skipped,
+      remaining_count: remainingCount,
+    });
+  } catch (err) {
+    console.error("[opplevelser] admin/hjemmeside-cleanup-sweep failed", err);
+    res.status(500).json({ error: "Internal error" });
+  }
+});
+
 // ─── POST /api/opplevelser/admin/gardssalg-provider-visibility (admin) ──────
 //
 // dev-request 2026-07-19-brreg-nace-drikkeprodusenter, triage-oppfølging:
