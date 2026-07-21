@@ -29110,6 +29110,20 @@ const _recentlyEnrichedSpotcheckPromise: Promise<void> = new Promise<void>(r => 
     failures.push("dental-agent-put-field-provenance: unexpected error: " + String(err?.message || err));
   }
 
+  console.log("\n── dental-schema-probe-writepath-fix: PUT /api/tannlege/agents/:id test-fingerprint guard ──");
+  try {
+    const { runDentalTests } = require("../src/routes/dental.test") as
+      typeof import("../src/routes/dental.test");
+    const dg = await runDentalTests({ log: false });
+    passed += dg.passed;
+    failed += dg.failed;
+    for (const f of dg.failures) failures.push("dental (test-fingerprint guard): " + f);
+    console.log(`  dental (test-fingerprint guard): ${dg.passed} passed, ${dg.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("dental (test-fingerprint guard): unexpected error: " + String(err?.message || err));
+  }
+
   console.log("\n── slice4a: POST /api/tannlege/admin/stage-v-drift-result (route) ──");
   try {
     const { runDentalStageVDriftResultTests } = require("../src/routes/dental-stage-v-drift-result.test") as

@@ -219,6 +219,71 @@ router.post("/agents", requireAdmin, (req: Request, res: Response) => {
   }
 });
 
+// ─── Test-fingerprint guard (defense-in-depth) ──────────────────────
+// Incident (2026-07-21, dev-requests/2026-07-21-dental-schema-probe-writepath-fix.md):
+// two real production dental_agents rows were contaminated by two different
+// actors writing test/probe payloads via PUT /api/tannlege/agents/:id — the
+// hourly enrichment worker's own schema probe (already correctly isolated
+// to a reserved id, no code change needed there) and the platform-
+// orchestrator's ad-hoc post-deploy smoke tests, which had no code-level
+// guard stopping a test payload from landing on a real clinic row. This
+// guard closes that gap: reject (400) any PUT whose body matches the known
+// contamination fingerprint UNLESS the target id is an explicitly
+// allow-listed synthetic/sandboxed probe id.
+//
+// Ids reserved for schema/write-path probes — real clinic rows must never
+// be a target for test-fingerprint payloads.
+const DENTAL_SYNTHETIC_PROBE_IDS = new Set(["persistence-probe-pr100b"]);
+
+// Returns true if `body` matches the KNOWN contamination fingerprint from
+// the incident above. Deliberately narrow — matches on the literal known-bad
+// values/shapes, not a generic heuristic — to avoid false positives on
+// legitimate data that happens to share one field name. ANY ONE of these
+// present is enough to flag the payload: each incident write landed via a
+// single-field PUT, so the check must not require multiple fields at once.
+function isTestFingerprintPayload(body: Record<string, unknown>): boolean {
+  if (!body || typeof body !== "object") return false;
+
+  const specialists = body.specialists;
+  if (
+    Array.isArray(specialists) &&
+    specialists.some(
+      (s) => s && typeof s === "object" && (s as Record<string, unknown>).name === "Test"
+    )
+  ) {
+    return true;
+  }
+
+  if (body.online_booking_url === "https://example.com/booking") return true;
+
+  const socialMedia = body.social_media;
+  if (
+    socialMedia &&
+    typeof socialMedia === "object" &&
+    !Array.isArray(socialMedia) &&
+    (socialMedia as Record<string, unknown>).facebook === "https://facebook.com/x"
+  ) {
+    return true;
+  }
+
+  if (body.om_oss === "test probe") return true;
+
+  const fieldProvenance = body.field_provenance;
+  if (
+    fieldProvenance &&
+    typeof fieldProvenance === "object" &&
+    !Array.isArray(fieldProvenance)
+  ) {
+    for (const key of Object.keys(fieldProvenance as Record<string, unknown>)) {
+      if (key === "_smoke_test_provenance_probe" || key.startsWith("_smoke_test")) {
+        return true;
+      }
+    }
+  }
+
+  return false;
+}
+
 // ─── PUT /api/tannlege/agents/:id (admin) ───────────────────────────
 router.put("/agents/:id", requireAdmin, (req: Request, res: Response) => {
   const id = req.params.id as string;
@@ -227,6 +292,19 @@ router.put("/agents/:id", requireAdmin, (req: Request, res: Response) => {
     const PartialSchema = DentalAgentSchema.partial();
     const body: Record<string, unknown> =
       req.body && typeof req.body === "object" ? { ...(req.body as Record<string, unknown>) } : {};
+
+    // Defense-in-depth: reject a known test/probe fingerprint outright for
+    // any id that isn't an explicitly allow-listed synthetic probe id.
+    // MUST run before the tolerant-strip / opening_hours normalization
+    // logic below mutates `body` — a rejected test payload must be rejected
+    // outright, not silently stripped as an "invalid field".
+    if (isTestFingerprintPayload(body) && !DENTAL_SYNTHETIC_PROBE_IDS.has(id)) {
+      res.status(400).json({
+        error:
+          "Test-fingerprint payload rejected for non-synthetic id. Use a reserved probe id (see DENTAL_SYNTHETIC_PROBE_IDS).",
+      });
+      return;
+    }
 
     // PR-127: pre-normalize opening_hours (messy real-world hours) before
     // validation so a sloppy entry no longer 400s the whole record.
