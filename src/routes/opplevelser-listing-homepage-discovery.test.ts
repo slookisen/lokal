@@ -151,6 +151,14 @@ export function runOpplevelserListingHomepageDiscoveryTests(
       // Listing page's outbound link's host is already live as a DIFFERENT provider's hjemmeside.
       insertProvider.run({ id: "lh-taken", navn: "Tatt Gård", hjemmeside: null, listing_url: "https://visitnorway.no/produsent/tatt", content_source: null });
       insertProvider.run({ id: "lh-owner", navn: "Annen Eier", hjemmeside: "https://tattdomene.no", listing_url: null, content_source: null });
+      // Same as lh-taken/lh-owner, but the existing owner's stored hjemmeside
+      // carries a trailing path (the realistic common case: raw Brreg data /
+      // lightly-validated admin PATCHes, not a bare host) — regression guard
+      // for the LIKE '%'||host suffix-match bug: 'https://x.no/kontakt-oss'
+      // does not literally END with 'x.no', so a raw LIKE suffix match on the
+      // stored URL string silently misses it.
+      insertProvider.run({ id: "lh-taken2", navn: "Tatt Gård To", hjemmeside: null, listing_url: "https://visitnorway.no/produsent/tatt2", content_source: null });
+      insertProvider.run({ id: "lh-owner2", navn: "Annen Eier To", hjemmeside: "https://existing-real-site.no/kontakt-oss", listing_url: null, content_source: null });
       // Listing page's outbound link's own page does NOT contain the provider's name.
       insertProvider.run({ id: "lh-noname", navn: "Navnløs Gård", hjemmeside: null, listing_url: "https://visitnorway.no/produsent/navnlos", content_source: null });
       // Locked row — never processed.
@@ -184,6 +192,9 @@ export function runOpplevelserListingHomepageDiscoveryTests(
         if (urlStr === "https://visitnorway.no/produsent/tatt") {
           return mk('<html><body><a href="https://tattdomene.no/om">Nettsted</a></body></html>');
         }
+        if (urlStr === "https://visitnorway.no/produsent/tatt2") {
+          return mk('<html><body><a href="https://existing-real-site.no/some-page">Nettsted</a></body></html>');
+        }
         if (urlStr === "https://visitnorway.no/produsent/navnlos") {
           return mk('<html><body><a href="https://navnlosdomene.no">Nettsted</a></body></html>');
         }
@@ -214,14 +225,14 @@ export function runOpplevelserListingHomepageDiscoveryTests(
           headers: adminHeaders,
           body: {
             providerIds: [
-              "lh-good", "lh-agg-only", "lh-taken", "lh-noname",
+              "lh-good", "lh-agg-only", "lh-taken", "lh-taken2", "lh-noname",
               "lh-locked", "lh-has-website", "finnes-ikke",
             ],
           },
         });
         assertEq(r.status, 200, "lh-2a: dry-run 200");
         assertEq(r.body.dry_run, true, "lh-2b: dry-run is the default");
-        assertEq(r.body.scanned, 4, "lh-2c: locked + already-has-website + unknown never reach processing (4 real targets)");
+        assertEq(r.body.scanned, 5, "lh-2c: locked + already-has-website + unknown never reach processing (5 real targets)");
         assertEq((r.body.skipped_locked as any[])[0]?.provider_id, "lh-locked", "lh-2d: locked row reported");
         assertEq((r.body.already_has_website as any[])[0]?.provider_id, "lh-has-website", "lh-2e: already-has-website row reported (reused naming)");
         assertEq((r.body.not_found as any[])[0], "finnes-ikke", "lh-2f: unknown id reported");
@@ -245,6 +256,18 @@ export function runOpplevelserListingHomepageDiscoveryTests(
         );
         assertTrue(!(r.body.proposed as any[]).some((p) => p.provider_id === "lh-taken"), "lh-2n: already-in-catalog row never proposed");
         assertTrue(!fetchCalls.includes("https://tattdomene.no"), "lh-2o: the taken host's own page is never fetched (excluded before the ownership fetch)");
+
+        // Regression guard: the owner's stored hjemmeside has a trailing path
+        // ('https://existing-real-site.no/kontakt-oss'), not a bare host —
+        // must still be caught (normalized-host comparison, not a raw LIKE
+        // '%'||host suffix match against the stored URL string).
+        const taken2Ex = (r.body.excluded as any[]).find((e) => e.provider_id === "lh-taken2");
+        assertTrue(
+          !!taken2Ex && taken2Ex.hosts.some((h: any) => h.host === "existing-real-site.no" && h.reason === "host_already_in_catalog"),
+          "lh-2m2: host already live as a DIFFERENT provider's hjemmeside WITH a trailing path → still excluded",
+        );
+        assertTrue(!(r.body.proposed as any[]).some((p) => p.provider_id === "lh-taken2"), "lh-2n2: already-in-catalog (trailing-path owner) row never proposed");
+        assertTrue(!fetchCalls.includes("https://existing-real-site.no"), "lh-2o2: the taken host's own page is never fetched (excluded before the ownership fetch)");
 
         const nn = (r.body.no_candidate_verified as any[]).find((e) => e.provider_id === "lh-noname");
         assertTrue(!!nn && nn.tried.includes("navnlosdomene.no"), "lh-2p: candidate page fetched but name not found → no_candidate_verified, hostname listed");

@@ -2127,6 +2127,24 @@ router.post("/admin/listing-homepage-discovery", requireAdmin, async (req: Reque
   // apply-mode only, so two candidates discovered in the same batch can't
   // both claim the same host before either write actually lands.
   const queuedThisRun = new Set<string>();
+  // Normalized-host set for host_already_in_catalog, computed ONCE per
+  // request (not per-candidate) and reused across the whole batch. This is
+  // the same normalized-host-comparison approach as gardssalgSharedHostCounts()
+  // in experience-store.ts, but deliberately NOT that function — this queue
+  // is gårdssalg-agnostic (see the queue table's migration comment), so it
+  // must dedup against ALL experience_providers' hjemmeside, not just
+  // gårdssalg rows. A raw SQL `LIKE '%' || host` against the stored
+  // hjemmeside string is NOT equivalent: a stored hjemmeside of
+  // 'https://site.no/' or 'https://site.no/kontakt' does not literally END
+  // with 'site.no', so it silently fails to match and an already-catalogued
+  // host slips past dedup and gets proposed for a second provider.
+  const catalogHosts = new Set<string>();
+  for (const row of expDb
+    .prepare(`SELECT hjemmeside FROM experience_providers WHERE hjemmeside IS NOT NULL AND TRIM(hjemmeside) != ''`)
+    .all() as Array<{ hjemmeside: string }>) {
+    const h = hostFromUrlLike(row.hjemmeside);
+    if (h) catalogHosts.add(h);
+  }
 
   for (const t of targets) {
     processedIds.push(t.id);
@@ -2142,10 +2160,7 @@ router.post("/admin/listing-homepage-discovery", requireAdmin, async (req: Reque
           excludedHere.push({ host, reason: "directory_or_aggregator_host" });
           continue;
         }
-        const catalogCount = (
-          expDb.prepare(`SELECT COUNT(*) AS n FROM experience_providers WHERE hjemmeside LIKE ?`).get("%" + host) as { n: number }
-        ).n;
-        if (catalogCount > 0) {
+        if (catalogHosts.has(host)) {
           excludedHere.push({ host, reason: "host_already_in_catalog" });
           continue;
         }
