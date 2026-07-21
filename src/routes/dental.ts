@@ -501,19 +501,22 @@ router.post("/admin/claim-batch", requireAdmin, (req: Request, res: Response) =>
 });
 
 // POST /api/tannlege/admin/homepage-fetch-result
-// Body: { agentId: string, ok: boolean }
+// Body: { agentId: string, ok: boolean, reason?: string }
 // enrichment-metode slice 1 (2026-07-16): the dental enrichment routine fetches
 // clinic homepages itself and REPORTS each outcome here; the server owns the
 // strike counting (3 consecutive failures → parked 30d, success → full reset —
 // PR #248 semantics). Parked clinics drop out of GET /agents?exclude_parked=1.
+// `reason: "proxy_blocked"` (dev-request 2026-07-16-dental-hjemmeside-url-vask,
+// item 4, 2026-07-21) is a no-strike outcome — see recordDentalHomepageFetchResult.
 router.post("/admin/homepage-fetch-result", requireAdmin, (req: Request, res: Response) => {
   try {
-    const { agentId, ok } = (req.body ?? {}) as { agentId?: unknown; ok?: unknown };
+    const { agentId, ok, reason } = (req.body ?? {}) as { agentId?: unknown; ok?: unknown; reason?: unknown };
     if (typeof agentId !== "string" || !agentId.trim() || typeof ok !== "boolean") {
       res.status(400).json({ error: "Invalid body: need {agentId: string, ok: boolean}" });
       return;
     }
-    const r = recordDentalHomepageFetchResult(agentId.trim(), ok);
+    const reasonStr = typeof reason === "string" && reason.trim() ? reason.trim() : undefined;
+    const r = recordDentalHomepageFetchResult(agentId.trim(), ok, reasonStr);
     if (!r.found) {
       res.status(404).json({ error: "Not found" });
       return;

@@ -413,9 +413,19 @@ function pushSpecialtyClause(
 export const DENTAL_PARK_AFTER_ATTEMPTS = 3;
 export const DENTAL_PARK_BACKOFF_MS = 30 * 86_400_000;
 
+// dev-request 2026-07-16-dental-hjemmeside-url-vask, item 4 (2026-07-21):
+// proxy_blocked !== dead_site. The enrichment routine's own egress allowlist
+// (a property of ITS execution sandbox, not the clinic's real site) rejects
+// some homepage fetches outright; counting those as real failures parks
+// clinics whose site is fine, just unreachable from this particular fetcher.
+// `reason: "proxy_blocked"` is a no-strike outcome: the attempts counter and
+// unreachable-since stamp are left untouched (neither incremented nor reset)
+// so the clinic stays exactly as retry-eligible as it was before this call —
+// re-queued on the next pass, never parked on egress-allowlist noise alone.
 export function recordDentalHomepageFetchResult(
   id: string,
   ok: boolean,
+  reason?: string,
 ): { found: boolean; attempts: number; parked: boolean; parked_now: boolean } {
   const db = getDb("dental");
   const exists = db.prepare("SELECT id FROM dental_agents WHERE id = ?").get(id);
@@ -426,6 +436,18 @@ export function recordDentalHomepageFetchResult(
       "UPDATE dental_agents SET homepage_fetch_attempts = 0, homepage_unreachable_since = NULL WHERE id = ?"
     ).run(id);
     return { found: true, attempts: 0, parked: false, parked_now: false };
+  }
+
+  if (reason === "proxy_blocked") {
+    const row = db
+      .prepare("SELECT homepage_fetch_attempts, homepage_unreachable_since FROM dental_agents WHERE id = ?")
+      .get(id) as { homepage_fetch_attempts: number; homepage_unreachable_since: string | null };
+    return {
+      found: true,
+      attempts: row.homepage_fetch_attempts,
+      parked: row.homepage_fetch_attempts >= DENTAL_PARK_AFTER_ATTEMPTS,
+      parked_now: false,
+    };
   }
 
   db.prepare(

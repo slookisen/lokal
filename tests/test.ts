@@ -30966,7 +30966,30 @@ console.log("\n── enrichment-metode-slice1: dead-homepage parking (dental + 
     assertEq((dstore as any).DENTAL_AGENT_WRITABLE_FIELDS.includes("hjemmeside"), true,
       "ems1-15d: hjemmeside IS PUT-writable (sanity)");
 
-    console.log("  enrichment-metode-slice1 (dental): OK (18 assertions)");
+    // (9) dev-request 2026-07-16-dental-hjemmeside-url-vask, item 4: reason:
+    // "proxy_blocked" is a no-strike outcome — attempts/parked state untouched.
+    const idC = dstore.createDentalAgent({ navn: "Proxy-blokkert Tannlege AS", org_nr: "911000333", hjemmeside: "https://blocked.example.no" } as any);
+    let rp = dstore.recordDentalHomepageFetchResult(idC, false, "proxy_blocked");
+    assertEq(rp.attempts, 0, "vask-i4-01: proxy_blocked does not increment attempts");
+    assertEq(rp.parked, false, "vask-i4-02: proxy_blocked does not park");
+    rp = dstore.recordDentalHomepageFetchResult(idC, false, "proxy_blocked");
+    rp = dstore.recordDentalHomepageFetchResult(idC, false, "proxy_blocked");
+    assertEq(rp.attempts, 0, "vask-i4-03: repeated proxy_blocked reports never accumulate strikes");
+    // a genuine failure afterwards still counts normally (reason not sticky)
+    rp = dstore.recordDentalHomepageFetchResult(idC, false);
+    assertEq(rp.attempts, 1, "vask-i4-04: a real failure after proxy_blocked reports still counts as strike 1");
+    // proxy_blocked on an already-parked clinic reports current state, doesn't clear it
+    dstore.recordDentalHomepageFetchResult(idA, false);
+    dstore.recordDentalHomepageFetchResult(idA, false);
+    const parkedBefore = dstore.recordDentalHomepageFetchResult(idA, false);
+    assertEq(parkedBefore.parked, true, "vask-i4-05 setup: idA parked again");
+    rp = dstore.recordDentalHomepageFetchResult(idA, false, "proxy_blocked");
+    assertEq(rp.attempts, parkedBefore.attempts, "vask-i4-05: proxy_blocked on a parked clinic reports unchanged attempts");
+    assertEq(rp.parked, true, "vask-i4-06: proxy_blocked does not un-park a clinic (not a success signal either)");
+    assertEq(dstore.recordDentalHomepageFetchResult("no-such-id", false, "proxy_blocked").found, false,
+      "vask-i4-07: unknown id + proxy_blocked → found=false");
+
+    console.log("  enrichment-metode-slice1 (dental): OK (25 assertions)");
   } catch (err) {
     failed++;
     failures.push(`enrichment-metode-slice1 dental: unexpected error: ${err instanceof Error ? (err.stack || err.message) : String(err)}`);
