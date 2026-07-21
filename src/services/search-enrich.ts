@@ -602,6 +602,183 @@ export function extractVisibleText(html: string): string {
   return text.slice(0, 20_000);
 }
 
+/**
+ * Depth-aware block remover: finds TOP-LEVEL (properly nested) `<tagA>...
+ * </tagA>` / `<tagB>...</tagB>` regions for the given tag names — treating
+ * all of them as ONE shared nesting family, so `<header><nav>...</nav>
+ * </header>` (or a `<nav>` accidentally nested inside another `<nav>`) is
+ * still recognized as a single region bounded by the outermost open/close —
+ * and either removes each region outright (no `predicate`) or removes it
+ * only when `predicate(blockHtmlIncludingTags)` returns true. A block that
+ * never closes (malformed HTML) is treated as running to the end of the
+ * string, which is the conservative choice: better to over-exclude possible
+ * chrome than to leak it into prose. Self-closing tags (`<nav/>`) carry no
+ * content and are ignored. PURE, no network/IO.
+ */
+function stripBlocksByTagNames(
+  html: string,
+  tagNames: readonly string[],
+  predicate?: (blockHtml: string) => boolean,
+): string {
+  const namesPattern = tagNames.join("|");
+  // NOTE: the tag-name alternation is followed by `(?![\w-])` rather than a
+  // plain `\b` — `\b` treats `-` as a non-word-boundary character, so a bare
+  // `\b` after e.g. `nav` would ALSO match the start of a hyphenated custom
+  // element like `<nav-carousel>` or `<header-widget>`, silently swallowing
+  // that element's real content as if it were chrome. The lookahead requires
+  // the next character to be neither a word char nor `-`, so it still matches
+  // `<nav>`, `<nav >`, `<nav class="x">`, `<NAV>`, `</nav>` etc. but rejects
+  // `<nav-carousel>`/`<header-widget>`.
+  const tagRe = new RegExp(`<(/?)(?:${namesPattern})(?![\\w-])[^>]*?(/?)>`, "gi");
+  let depth = 0;
+  let blockStart = -1;
+  const ranges: Array<[number, number]> = [];
+  let m: RegExpExecArray | null;
+  while ((m = tagRe.exec(html))) {
+    const isClosing = m[1] === "/";
+    const isSelfClosing = m[2] === "/";
+    if (isSelfClosing) continue; // empty element, nothing to exclude
+    if (!isClosing) {
+      if (depth === 0) blockStart = m.index;
+      depth++;
+    } else if (depth > 0) {
+      depth--;
+      if (depth === 0 && blockStart !== -1) {
+        ranges.push([blockStart, m.index + m[0].length]);
+        blockStart = -1;
+      }
+    }
+  }
+  if (depth > 0 && blockStart !== -1) ranges.push([blockStart, html.length]);
+  if (ranges.length === 0) return html;
+
+  let out = "";
+  let cursor = 0;
+  for (const [start, end] of ranges) {
+    if (!predicate || predicate(html.slice(start, end))) {
+      out += html.slice(cursor, start) + " ";
+      cursor = end;
+    }
+  }
+  out += html.slice(cursor);
+  return out;
+}
+
+/**
+ * True if a `<ul>`/`<ol>` block (HTML including its own tags) is a rendered
+ * NAV MENU disguised as a list rather than a real content list: at least 3
+ * `<a>` tags, the total text living inside those anchors is ≥60% of all the
+ * block's visible text, AND none of the individual anchors reads like a full
+ * sentence (as opposed to a nav label). This is the classic "nav-menu-glued-
+ * to-a-real-sentence" shape (a horizontal/vertical link list with almost no
+ * non-link words, each link a one-or-two-word label like "Hjem" / "Om oss" /
+ * "Kontakt oss" / "Åpningstider") — as opposed to a genuine product/
+ * ingredient list where every `<li>` links to its own detail page but wraps
+ * a full descriptive sentence (e.g. "Poteter fra egen åker, høstet i går").
+ * Anchor count and link-density ratio alone can't tell those two shapes
+ * apart — a 3-item "shop our products" list with a real sentence per anchor
+ * trips both thresholds just like a nav menu does — so per-anchor text
+ * length is a third, required signal.
+ *
+ * This is a per-anchor MAX/count check, not an average: an average is
+ * trivially defeated by a realistic mixed shape where each product row pairs
+ * a long descriptive title-link with a separate short call-to-action link
+ * ("Kjøp" / "Se her") — e.g. anchors of length [49, 53, 4, 6] average 28,
+ * under a naive "<30" mean threshold, even though half the anchors are full
+ * product sentences. A genuine nav menu essentially never has even ONE
+ * anchor whose text reaches sentence length, let alone two, so requiring
+ * that FEWER THAN 2 anchors meet/exceed LONG_ANCHOR_LEN is robust both to
+ * that minority-of-short-CTAs shape (a mean or median — median of
+ * [4,6,49,53] is 27.5 — is defeated by the same repro) AND to a nav menu
+ * that glues on a single genuinely long "view all products"-style link
+ * alongside its short chrome labels (e.g. "Hjem"/"Om oss"/"Kontakt" plus one
+ * ~35-char link): one long anchor alone isn't enough to call it a product
+ * list — it takes at least two. PURE.
+ */
+function isHighLinkDensityBlock(blockHtml: string): boolean {
+  const anchors = blockHtml.match(/<a\b[^>]*>[\s\S]*?<\/a>/gi) || [];
+  if (anchors.length < 3) return false;
+  const stripTags = (s: string): string => s.replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim();
+  const anchorTextLens: number[] = [];
+  let anchorTextLen = 0;
+  for (const a of anchors) {
+    const len = stripTags(a.replace(/^<a\b[^>]*>/i, "").replace(/<\/a>\s*$/i, "")).length;
+    anchorTextLens.push(len);
+    anchorTextLen += len;
+  }
+  const totalTextLen = stripTags(blockHtml).length;
+  if (totalTextLen < 15) return false;
+  if (anchorTextLen / totalTextLen < 0.6) return false;
+  // Nav-label-short check: genuine nav items ("Om oss", "Kontakt oss",
+  // "Åpningstider") are all well under this; a real product-sentence anchor
+  // (e.g. "Poteter fra egen åker, høstet i går") is well over it. At least
+  // TWO anchors at/above this length is decisive: real nav menus don't mix
+  // in multiple full-sentence links, so their presence means this is a
+  // product list, not a nav menu — even if most OTHER anchors in the same
+  // block are short CTA links like "Kjøp"/"Se her". A single long anchor is
+  // NOT enough on its own: a nav menu can glue on one "view all products"-
+  // style link alongside its short chrome labels without ceasing to be nav.
+  const LONG_ANCHOR_LEN = 20;
+  const longAnchorCount = anchorTextLens.filter((len) => len >= LONG_ANCHOR_LEN).length;
+  return longAnchorCount < 2;
+}
+
+/**
+ * Structure-aware sibling of extractVisibleText(), used ONLY as the body-
+ * prose fallback inside summarizeAbout()/summarizeVisit() (NOT a replacement
+ * for extractVisibleText() itself, which stays exactly as-is for its other
+ * callers — opening-hours/business-type/product extraction — where footer
+ * text is often genuinely relevant, e.g. opening hours living in a
+ * `<footer>`). Same drop-script/style/noscript/template + entity-decode +
+ * whitespace-collapse + ~20k-char-cap contract as extractVisibleText(), but
+ * ADDITIONALLY, before flattening tags to text:
+ *   1. drops `<nav>`/`<header>`/`<footer>`/`<aside>` blocks entirely
+ *      (nesting-aware — see stripBlocksByTagNames), and
+ *   2. drops `<ul>`/`<ol>` blocks that are themselves a disguised nav menu
+ *      (high link-density — see isHighLinkDensityBlock).
+ *
+ * This targets the Draopar production bug directly: a homepage whose nav
+ * menu (rendered as a `<nav>` OR as a bare link-heavy `<ul>` outside any
+ * semantic landmark) sat right next to the one real prose sentence, and the
+ * old blind extractVisibleText() + the "one real-prose-signal-word ⇒ trust
+ * the whole block" quality-gate loophole let the glued-together nav junk
+ * through as the producer's about_text. PURE, no network/IO.
+ */
+// Perf safety cap: stripBlocksByTagNames()'s tag scanner and
+// isHighLinkDensityBlock()'s anchor-counting regex are both applied to the
+// RAW (pre-flatten) HTML, before the ~20k-char final-output cap below ever
+// kicks in. A malformed/adversarial homepage full of unclosed `<a>` tags
+// inside a `<ul>`/`<ol>` makes the anchor regex's backtracking search for a
+// matching `</a>` scale quadratically with the unclosed-tag count (measured:
+// 2k/4k/8k/16k unclosed anchors → 14ms/56ms/208ms/801ms, a clean 4x-per-
+// doubling curve) — cheap for a normal page, but potentially seconds-long
+// for one bad fetch in a per-provider content-refresh sweep with no size cap
+// upstream. Bounding the slice BEFORE any tag-stripping/link-density scan
+// keeps worst-case scan cost flat regardless of how large/broken the input
+// HTML is.
+const MAX_PROSE_SCAN_LEN = 25_000;
+
+export function extractProseText(html: string): string {
+  if (!html) return "";
+  let h = html.slice(0, MAX_PROSE_SCAN_LEN);
+  h = h
+    .replace(/<script[\s\S]*?<\/script>/gi, " ")
+    .replace(/<style[\s\S]*?<\/style>/gi, " ")
+    .replace(/<noscript[\s\S]*?<\/noscript>/gi, " ")
+    .replace(/<template[\s\S]*?<\/template>/gi, " ");
+  h = stripBlocksByTagNames(h, ["nav", "header", "footer", "aside"]);
+  h = stripBlocksByTagNames(h, ["ul", "ol"], isHighLinkDensityBlock);
+  const text = h
+    .replace(/<[^>]+>/g, " ")
+    .replace(/&nbsp;/gi, " ")
+    .replace(/&amp;/gi, "&")
+    .replace(/&aelig;/gi, "æ").replace(/&oslash;/gi, "ø").replace(/&aring;/gi, "å")
+    .replace(/&AElig;/g, "Æ").replace(/&Oslash;/g, "Ø").replace(/&Aring;/g, "Å")
+    .replace(/\s+/g, " ")
+    .trim();
+  return text.slice(0, 20_000);
+}
+
 // Norwegian → category vocabulary, mirroring the platform's canonical map in
 // services/marketplace-registry.ts (categoryMap) and routes/seo.ts
 // (CATEGORY_MAP). Kept local (dependency-free, accent-stripped at match time)
@@ -749,8 +926,10 @@ export function summarizeAbout(html: string): string {
   const md = mdPropFirst?.[1] ?? mdContentFirst?.[1];
   if (md && md.trim()) return cap(decode(md));
 
-  // (3) first meaningful visible paragraph of body text.
-  const visible = extractVisibleText(html);
+  // (3) first meaningful visible paragraph of body text (structure-aware:
+  // nav/header/footer/aside chrome and disguised nav-menu <ul>/<ol> blocks
+  // excluded — see extractProseText doc comment).
+  const visible = extractProseText(html);
   if (!visible) return "";
   // Split into sentence-ish chunks and take the first that is substantive.
   for (const chunk of visible.split(/(?<=[.!?])\s+/)) {
@@ -791,7 +970,9 @@ export function summarizeVisit(html: string): string {
     const lastSpace = slice.lastIndexOf(" ");
     return (lastSpace > 200 ? slice.slice(0, lastSpace) : slice).trim();
   };
-  const visible = extractVisibleText(html);
+  // Structure-aware: nav/header/footer/aside chrome and disguised nav-menu
+  // <ul>/<ol> blocks excluded — see extractProseText doc comment.
+  const visible = extractProseText(html);
   if (!visible) return "";
   for (const chunk of visible.split(/(?<=[.!?])\s+/)) {
     const c = chunk.trim();
