@@ -30,6 +30,10 @@ import {
   // PR-24a: homepage CONTENT → platform write helpers (PURE).
   mapToPlatformCategories,
   meetsAboutQualityBar,
+  // dev-request 2026-07-20-gardssalg-kvalitetsgate-redesign, slice 2/3/4:
+  // the extracted cheap/universal prefilter shared by meetsAboutQualityBar
+  // and gårdssalg's own LLM-judge cascade (routes/opplevelser.ts).
+  meetsAboutCheapBar,
   PLATFORM_CATEGORIES,
   // orch-experiences-content-refresh: experiences-vertical category mapper (PURE).
   mapToExperienceCategories,
@@ -890,6 +894,76 @@ export function runSearchEnrichTests(opts: { log?: boolean } = {}): TestSummary 
       meetsAboutQualityBar(passiveNoProductList),
       "quality (regression): passive-voice prose without product list still passes without bare prepositions (fix-up-2)"
     );
+  }
+
+  // ── dev-request 2026-07-20-gardssalg-kvalitetsgate-redesign, slice 2/3/4:
+  //    meetsAboutCheapBar — the extracted cheap/universal prefilter shared by
+  //    meetsAboutQualityBar (unchanged behavior/callers) and gårdssalg's own
+  //    LLM-judge cascade (meetsGardssalgAboutQualityBar, routes/opplevelser.ts,
+  //    tested in opplevelser-gardssalg-quality-judge.test.ts). Pins that:
+  //    (a) meetsAboutCheapBar still rejects everything the cheap parts of
+  //        meetsAboutQualityBar reject (length/mangled-Unicode/boilerplate/
+  //        foreign-language) — no regression from the extraction;
+  //    (b) UNLIKE meetsAboutQualityBar, meetsAboutCheapBar does NOT run the
+  //        nav-menu-leakage/umbrella-membership/skip-link heuristics — a
+  //        nav-menu-shaped, skip-link, or umbrella-portal text that
+  //        meetsAboutQualityBar rejects is ACCEPTED by meetsAboutCheapBar,
+  //        proving those checks were cleanly extracted out (not duplicated)
+  //        and that gårdssalg's cascade relies on the LLM judge, not this
+  //        cheap layer, to catch them. ─────────────────────────────────────
+  {
+    const good = "Familiedrevet gård på Toten som dyrker økologiske grønnsaker og bær, og selger direkte fra gårdsbutikken.";
+    assertTrue(meetsAboutCheapBar(good), "cheapBar: substantive Norwegian about passes");
+    assertTrue(meetsAboutQualityBar(good), "cheapBar sanity: same fixture still passes the full bar too");
+
+    assertTrue(!meetsAboutCheapBar("Gårdsbutikk på Toten."), "cheapBar: <80 chars fails");
+    assertTrue(!meetsAboutCheapBar(""), "cheapBar: empty fails");
+    assertTrue(!meetsAboutCheapBar(null), "cheapBar: null fails");
+    assertTrue(!meetsAboutCheapBar(undefined), "cheapBar: undefined fails");
+
+    const english = "Welcome to our family farm shop where we sell fresh produce, eggs and homemade jam every weekend.";
+    assertTrue(!meetsAboutCheapBar(english), "cheapBar: long English snippet fails (not Norwegian)");
+
+    const cookie = "Vi bruker informasjonskapsler (cookies) for å gi deg en bedre opplevelse. Ved å fortsette godtar du vår personvern.";
+    assertTrue(!meetsAboutCheapBar(cookie), "cheapBar: cookie/consent boilerplate fails");
+
+    const placeholder = "Denne siden er under konstruksjon. Nettsiden kommer snart med mer informasjon om gården vår og produktene.";
+    assertTrue(!meetsAboutCheapBar(placeholder), "cheapBar: under-construction placeholder fails");
+
+    const noLetters = "Vi driver en liten gard og selger ferske produkter fra egen produksjon til lokalsamfunnet her.";
+    assertTrue(meetsAboutCheapBar(noLetters), "cheapBar: Norwegian via function words (no æøå) passes");
+
+    assertTrue(meetsAboutCheapBar("Kort tekst på gården.", 10), "cheapBar: minLen override honoured");
+
+    const mangledTrailing = good.slice(0, 60) + " opplevelser p�";
+    assertTrue(!meetsAboutCheapBar(mangledTrailing), "cheapBar: trailing replacement-char (mid-word cut) fails");
+    const mangledInterior = good.slice(0, 40) + "�" + good.slice(40);
+    assertTrue(!meetsAboutCheapBar(mangledInterior), "cheapBar: interior replacement-char fails");
+
+    // ── The key divergence from meetsAboutQualityBar: nav-menu-shaped and
+    //    umbrella-portal text is ACCEPTED by the cheap bar (no semantic
+    //    judgment here — that's the LLM judge's job for gårdssalg now). ────
+    const navFlatMenu =
+      "Harstad Bryggeri Cart 0 Bryggeriet Ølet Omvisning & ølsmaking Nyheter Bryggeriutsalg Kontakt Ølsjappa Merch - Klær og så";
+    assertTrue(!meetsAboutQualityBar(navFlatMenu), "cheapBar sanity: flat nav bar still fails the FULL bar (heuristic still applies there)");
+    assertTrue(meetsAboutCheapBar(navFlatMenu), "cheapBar: flat Title-Case nav bar PASSES the cheap bar alone (nav heuristic is not part of it)");
+
+    const navPipeOnly =
+      "Hjem | Om oss | Produkter | Nettbutikk | Kontakt oss | Meny | Nyheter | Arrangementer for hele familien";
+    assertTrue(!meetsAboutQualityBar(navPipeOnly), "cheapBar sanity: pipe-separated menu still fails the FULL bar");
+    assertTrue(meetsAboutCheapBar(navPipeOnly), "cheapBar: pipe-separated menu PASSES the cheap bar alone");
+
+    const umbrellaVisit =
+      "Våre medlemmer tilbyr alt fra sjarmerende gårdsbutikker med lokalprodusert mat, til koselig overnatting i landlige omgivelser og spennende aktiviteter for hele familien.";
+    assertTrue(!meetsAboutQualityBar(umbrellaVisit), "cheapBar sanity: umbrella 'våre medlemmer' text still fails the FULL bar");
+    assertTrue(meetsAboutCheapBar(umbrellaVisit), "cheapBar: umbrella 'våre medlemmer' text PASSES the cheap bar alone (membership-wording check is not part of it)");
+
+    // NAV_BOILERPLATE_MARKERS (skip-links) are ALSO not part of the cheap
+    // bar — same reasoning, gårdssalg's LLM judge owns this now.
+    const navSkipLink =
+      "Hopp til innhold. Velkommen til gårdsbutikken vår hvor du finner ferske grønnsaker, egg og kjøtt fra egen produksjon.";
+    assertTrue(!meetsAboutQualityBar(navSkipLink), "cheapBar sanity: skip-link marker text still fails the FULL bar");
+    assertTrue(meetsAboutCheapBar(navSkipLink), "cheapBar: skip-link marker text PASSES the cheap bar alone");
   }
 
   // ── orch-experiences-content-refresh: mapToExperienceCategories (PURE) ──────

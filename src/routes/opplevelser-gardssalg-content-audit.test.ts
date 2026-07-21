@@ -55,6 +55,12 @@
  *       matching exactly what applyGardssalgProviderContent() does — mocks
  *       globalThis.fetch (no network access in the sandbox) to drive the
  *       route's real extraction pipeline end-to-end
+ *   (m) fix-up round (independent review, blocking finding): an ALREADY-
+ *       contaminated (cheap-bar-passing but nav-menu-leaked, the Draopar
+ *       incident shape) current about_text IS replaceable by a judge-
+ *       approved fresh candidate (self-healing restored), while a
+ *       GENUINELY decent current value (also judge-approved) is still
+ *       NEVER churned even with a fresh candidate available
  */
 
 export interface TestSummary {
@@ -574,8 +580,21 @@ export function runOpplevelserGardssalgContentAuditTests(
       //       and never previews a replace of decent existing content. Mocks
       //       globalThis.fetch (repo convention — see
       //       search-enrich-page-evidence.test.ts) since this route makes
-      //       real fetch() calls and the sandbox has no network access. ────
+      //       real fetch() calls and the sandbox has no network access.
+      //
+      //       UPDATE (kvalitetsgate-redesign, slice 2/3/4): about_text/
+      //       visit_text candidates now also go through the new LLM judge
+      //       (meetsGardssalgAboutQualityBar → judgeGardssalgAboutCandidate,
+      //       routes/opplevelser.ts) once they clear the cheap prefilter —
+      //       so the mock ALSO handles "api.anthropic.com" (same idiom as
+      //       opplevelser-gardssalg-rewrite.test.ts), approving the
+      //       genuinely-good fixture texts below (this block tests the
+      //       fill/replace projection logic, not the judge itself — see
+      //       opplevelser-gardssalg-quality-judge.test.ts for the judge's
+      //       own dedicated tests). ─────────────────────────────────────
       const prevFetchK = globalThis.fetch;
+      const prevAnthropicKeyK = process.env.ANTHROPIC_API_KEY;
+      process.env.ANTHROPIC_API_KEY = "test-anthropic-key-k";
       try {
         const GCR_GOOD_ABOUT_K =
           "Familiedrevet gård på Toten som dyrker økologiske grønnsaker og bær, og selger direkte fra gårdsbutikken.";
@@ -593,7 +612,18 @@ export function runOpplevelserGardssalgContentAuditTests(
         });
 
         globalThis.fetch = (async (url: string | URL | Request) => {
-          const host = new URL(String(url)).hostname;
+          const urlStr = String(url);
+          if (urlStr.includes("api.anthropic.com")) {
+            // Judge mock: always approve — these fixtures are genuinely
+            // clean, on-entity prose (this block's concern is the fill/
+            // replace projection, not judge calibration).
+            return {
+              ok: true,
+              status: 200,
+              json: async () => ({ content: [{ type: "text", text: "GODKJENN\nRen, konkret prosa om produsenten." }] }),
+            } as unknown as Response;
+          }
+          const host = new URL(urlStr).hostname;
           if (host === "prov-k-thin.example.no" || host === "prov-k-decent.example.no") {
             return { ok: true, status: 200, text: async () => gcrHtmlK } as unknown as Response;
           }
@@ -659,6 +689,8 @@ export function runOpplevelserGardssalgContentAuditTests(
         assertEq(auditThinAbout.new_value, GCR_GOOD_ABOUT_K, "k22: audit new_value is the crawled replacement");
       } finally {
         globalThis.fetch = prevFetchK;
+        if (prevAnthropicKeyK === undefined) delete process.env.ANTHROPIC_API_KEY;
+        else process.env.ANTHROPIC_API_KEY = prevAnthropicKeyK;
       }
 
       // ── (l) duplicate-field guard (dev-request 2026-07-20-kvalitetsgate,
@@ -691,8 +723,15 @@ export function runOpplevelserGardssalgContentAuditTests(
       //       land on the same real prose, proving #313's guard is still
       //       load-bearing even after the nav contamination is fixed — while
       //       the nav links themselves (now correctly excluded) prove THIS
-      //       slice's fix. ──
+      //       slice's fix.
+      //
+      //       UPDATE (kvalitetsgate-redesign, slice 2/3/4): the single real
+      //       sentence left after nav-stripping is now also judged by the
+      //       new LLM judge (approved by the mock below) before it can be
+      //       written — same idiom as block (k). ──
       const prevFetchL = globalThis.fetch;
+      const prevAnthropicKeyL = process.env.ANTHROPIC_API_KEY;
+      process.env.ANTHROPIC_API_KEY = "test-anthropic-key-l";
       try {
         // Nav-menu chrome (now excluded by extractProseText) wrapped around
         // the page's one real sentence, which itself genuinely mentions
@@ -716,7 +755,15 @@ export function runOpplevelserGardssalgContentAuditTests(
         });
 
         globalThis.fetch = (async (url: string | URL | Request) => {
-          const u = new URL(String(url));
+          const urlStr = String(url);
+          if (urlStr.includes("api.anthropic.com")) {
+            return {
+              ok: true,
+              status: 200,
+              json: async () => ({ content: [{ type: "text", text: "GODKJENN\nEkte, konkret prosa om produsenten." }] }),
+            } as unknown as Response;
+          }
+          const u = new URL(urlStr);
           if (u.hostname === "prov-l-duplicate.example.no" && (u.pathname === "/" || u.pathname === "")) {
             return { ok: true, status: 200, text: async () => DRAOPAR_SHAPE_HTML } as unknown as Response;
           }
@@ -748,6 +795,171 @@ export function runOpplevelserGardssalgContentAuditTests(
         assertTrue(!auditRowsL.some((r: any) => r.field_name === "visit_text"), "l9: no visit_text audit row was created");
       } finally {
         globalThis.fetch = prevFetchL;
+        if (prevAnthropicKeyL === undefined) delete process.env.ANTHROPIC_API_KEY;
+        else process.env.ANTHROPIC_API_KEY = prevAnthropicKeyL;
+      }
+
+      // ── (m) fix-up round (independent review, blocking finding): an
+      //       ALREADY-contaminated current about_text/visit_text — cheap-bar-
+      //       passing (long enough, real Norwegian words) but nav-menu-leaked,
+      //       the exact Draopar incident shape — must still be replaceable by
+      //       a genuinely good freshly-fetched candidate. Before this fix,
+      //       aboutHasWriteOpportunity gated candidate computation itself on
+      //       meetsAboutCheapBar(current), and gardssalgReplaceableFieldAction
+      //       independently short-circuited on the same cheap-bar check, so a
+      //       row with already-landed contamination could NEVER be healed by
+      //       this endpoint again. The fix judges the CURRENT value with the
+      //       same LLM judge whenever a judge-approved fresh candidate exists
+      //       for the same field, and treats a judge-rejected current value as
+      //       replaceable despite passing the cheap bar. This block proves
+      //       BOTH directions: (m1) contaminated current -> DOES get replaced
+      //       (self-healing works), and (m2) genuinely decent current (also
+      //       judge-approved) -> still NEVER churned, even with a fresh
+      //       candidate available (proves the fix didn't start over-churning
+      //       good content). ────────────────────────────────────────────────
+      const prevFetchM = globalThis.fetch;
+      const prevAnthropicKeyM = process.env.ANTHROPIC_API_KEY;
+      process.env.ANTHROPIC_API_KEY = "test-anthropic-key-m";
+      try {
+        // The PR's own cal-1 calibration fixture shape (opplevelser-gardssalg-
+        // quality-judge.test.ts): nav-menu link labels glued in front of one
+        // real trailing sentence — 97 chars, clears meetsAboutCheapBar (>=80
+        // chars, has "er" as a Norwegian word marker, no boilerplate markers)
+        // despite being leaked nav chrome, not a real about-text.
+        const CAL1_CONTAMINATED_ABOUT =
+          "Heim Sider Om oss Kontakt Sidersortar Alkoholfritt Draopar er ein liten sidergard i Hardanger.";
+        // A genuinely good, longer, on-entity candidate — what a real crawl
+        // of Draopar's homepage should have produced instead of the nav-glued
+        // text above.
+        const GOOD_FRESH_CANDIDATE_ABOUT =
+          "Draopar Sideri held til i Hardanger og lagar sider av eigne eple frå gamle tre på garden, og tek imot gjester til smaking og ein kort omvising gjennom heile haustsesongen.";
+        assertTrue(
+          CAL1_CONTAMINATED_ABOUT.length >= 80,
+          "sanity: CAL1_CONTAMINATED_ABOUT clears the 80-char cheap-bar floor",
+        );
+        assertTrue(
+          GOOD_FRESH_CANDIDATE_ABOUT.length > CAL1_CONTAMINATED_ABOUT.length,
+          "sanity: GOOD_FRESH_CANDIDATE_ABOUT is strictly longer than the contaminated current text (required for 'replaced')",
+        );
+
+        // A genuinely decent, NOT contaminated current about_text (control —
+        // would also pass a real LLM judge, unlike the nav-glued fixture
+        // above) — reused from block (j) above.
+        const GENUINELY_DECENT_ABOUT_M = DECENT_EXISTING_ABOUT_J;
+        const GOOD_FRESH_CANDIDATE_ABOUT_M2 =
+          "Gården vår ligg vakkert til ved fjorden og har halde på med sauehald i fire generasjonar, med eige gardsutsal ope kvar laurdag frå mai til september.";
+        assertTrue(
+          GOOD_FRESH_CANDIDATE_ABOUT_M2.length > GENUINELY_DECENT_ABOUT_M.length,
+          "sanity: GOOD_FRESH_CANDIDATE_ABOUT_M2 is strictly longer than the genuinely decent current text",
+        );
+
+        insertProvider.run({
+          id: "prov-m-contaminated", navn: "Prov M Draopar-shaped Gard", hjemmeside: "https://prov-m-contaminated.example.no",
+          content_source: null, about_text: CAL1_CONTAMINATED_ABOUT, visit_text: null, opening_hours_text: null,
+        });
+        insertProvider.run({
+          id: "prov-m-decent", navn: "Prov M Decent Gard", hjemmeside: "https://prov-m-decent.example.no",
+          content_source: null, about_text: GENUINELY_DECENT_ABOUT_M, visit_text: null, opening_hours_text: null,
+        });
+
+        const contaminatedHtmlM = `<html><head><meta property="og:description" content="${GOOD_FRESH_CANDIDATE_ABOUT}"></head><body><p>Velkommen innom oss.</p></body></html>`;
+        const decentHtmlM = `<html><head><meta property="og:description" content="${GOOD_FRESH_CANDIDATE_ABOUT_M2}"></head><body><p>Velkommen innom oss.</p></body></html>`;
+
+        // Judge mock: distinguishes which text is being judged by substring
+        // match against the prompt (judgeGardssalgAboutCandidate embeds the
+        // candidate text verbatim in its prompt) — approves both fresh
+        // candidates and the genuinely decent current text, REJECTS only the
+        // contaminated cal-1-shaped current text.
+        globalThis.fetch = (async (url: string | URL | Request, init?: any) => {
+          const urlStr = String(url);
+          if (urlStr.includes("api.anthropic.com")) {
+            const body = init?.body ? JSON.parse(init.body) : {};
+            const prompt: string = body?.messages?.[0]?.content ?? "";
+            if (prompt.includes(CAL1_CONTAMINATED_ABOUT)) {
+              return {
+                ok: true,
+                status: 200,
+                json: async () => ({ content: [{ type: "text", text: "AVVIS\nLekket navigasjonsmeny, ikke egnet prosa." }] }),
+              } as unknown as Response;
+            }
+            return {
+              ok: true,
+              status: 200,
+              json: async () => ({ content: [{ type: "text", text: "GODKJENN\nEkte, konkret prosa om produsenten." }] }),
+            } as unknown as Response;
+          }
+          const host = new URL(urlStr).hostname;
+          if (host === "prov-m-contaminated.example.no") {
+            return { ok: true, status: 200, text: async () => contaminatedHtmlM } as unknown as Response;
+          }
+          if (host === "prov-m-decent.example.no") {
+            return { ok: true, status: 200, text: async () => decentHtmlM } as unknown as Response;
+          }
+          return { ok: false, status: 404, text: async () => "" } as unknown as Response;
+        }) as typeof fetch;
+
+        // ── m1: dry-run on prov-m-contaminated projects "replaced" (the
+        //    self-healing path fires), with zero writes. ────────────────────
+        const dryM1 = await callRoute(opplevelserRouter, {
+          url: "/admin/gardssalg-content-refresh",
+          headers: { "x-admin-key": testKey },
+          body: { providerIds: ["prov-m-contaminated"], apply: false },
+        });
+        assertEq(dryM1.status, 200, "m1a: dry-run on contaminated provider -> 200");
+        const dryM1Entry = dryM1.body.changed.find((c: any) => c.provider_id === "prov-m-contaminated");
+        assertTrue(!!dryM1Entry, "m1b: prov-m-contaminated appears in dry-run changed[] — self-healing candidate found");
+        assertEq(dryM1Entry.actions.about_text, "replaced", "m1c: dry-run projects about_text action 'replaced' (contaminated current judged replaceable)");
+        const beforeApplyM1 = getProviderRow("prov-m-contaminated");
+        assertEq(beforeApplyM1.about_text, CAL1_CONTAMINATED_ABOUT, "m1d: dry-run performed ZERO writes — contaminated text still in place");
+
+        // ── m1 (apply): the contaminated current value IS actually replaced
+        //    by the judge-approved fresh candidate — the self-healing path
+        //    this dev-request exists to restore. ─────────────────────────────
+        const applyM1 = await callRoute(opplevelserRouter, {
+          url: "/admin/gardssalg-content-refresh",
+          headers: { "x-admin-key": testKey },
+          body: { providerIds: ["prov-m-contaminated"], apply: true },
+        });
+        assertEq(applyM1.status, 200, "m1e: apply on contaminated provider -> 200");
+        const applyM1Entry = applyM1.body.changed.find((c: any) => c.provider_id === "prov-m-contaminated");
+        assertTrue(!!applyM1Entry, "m1f: prov-m-contaminated appears in apply changed[]");
+        assertEq(applyM1Entry.actions.about_text, "replaced", "m1g: apply response tags about_text 'replaced'");
+
+        const afterApplyM1 = getProviderRow("prov-m-contaminated");
+        assertEq(afterApplyM1.about_text, GOOD_FRESH_CANDIDATE_ABOUT, "m1h: THE FIX — contaminated (but cheap-bar-passing) about_text IS replaced by the good fresh candidate");
+        assertTrue(afterApplyM1.about_text !== CAL1_CONTAMINATED_ABOUT, "m1i: the nav-contaminated text is definitively gone");
+
+        const auditM1 = getAuditRows("prov-m-contaminated").find((r: any) => r.field_name === "about_text");
+        assertTrue(!!auditM1, "m1j: an about_text audit row exists for the self-healing replace");
+        assertEq(auditM1.old_value, CAL1_CONTAMINATED_ABOUT, "m1k: audit old_value is the REAL prior contaminated text (rollback-restorable if this is ever wrong)");
+        assertEq(auditM1.new_value, GOOD_FRESH_CANDIDATE_ABOUT, "m1l: audit new_value is the good fresh candidate");
+
+        // ── m2: control — a GENUINELY decent current value (also
+        //    judge-approved, not contaminated) is still NEVER churned, even
+        //    though a judge-approved fresh candidate is available too. Proves
+        //    the fix didn't start over-churning good content. ───────────────
+        const applyM2 = await callRoute(opplevelserRouter, {
+          url: "/admin/gardssalg-content-refresh",
+          headers: { "x-admin-key": testKey },
+          body: { providerIds: ["prov-m-decent"], apply: true },
+        });
+        assertEq(applyM2.status, 200, "m2a: apply on genuinely-decent provider -> 200");
+        const applyM2Entry = applyM2.body.changed.find((c: any) => c.provider_id === "prov-m-decent");
+        assertTrue(
+          !applyM2Entry || !("about_text" in (applyM2Entry.actions ?? {})),
+          "m2b: prov-m-decent's about_text is NOT in the apply response's actions — never churned",
+        );
+
+        const afterApplyM2 = getProviderRow("prov-m-decent");
+        assertEq(afterApplyM2.about_text, GENUINELY_DECENT_ABOUT_M, "m2c: genuinely decent about_text is completely unchanged after apply, despite a judge-approved fresh candidate being available");
+        assertTrue(
+          !getAuditRows("prov-m-decent").some((r: any) => r.field_name === "about_text"),
+          "m2d: no about_text audit row was created for the genuinely decent (never-churned) field",
+        );
+      } finally {
+        globalThis.fetch = prevFetchM;
+        if (prevAnthropicKeyM === undefined) delete process.env.ANTHROPIC_API_KEY;
+        else process.env.ANTHROPIC_API_KEY = prevAnthropicKeyM;
       }
     } catch (err: any) {
       failed++;

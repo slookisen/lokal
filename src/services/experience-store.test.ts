@@ -17,7 +17,12 @@
  *      and folds its pass/fail counts into the `npm test` summary.
  */
 
-import { formatDistanceLabel, gardssalgRewriteEligible, gardssalgProductsEligible } from "./experience-store";
+import {
+  formatDistanceLabel,
+  gardssalgRewriteEligible,
+  gardssalgProductsEligible,
+  gardssalgReplaceableFieldAction,
+} from "./experience-store";
 
 export interface TestSummary {
   passed: number;
@@ -92,6 +97,68 @@ export function runExperienceStoreTests(opts: { log?: boolean } = {}): TestSumma
   assertEq(gardssalgRewriteEligible("   "), false, "gardssalgRewriteEligible: whitespace-only string → false");
   assertEq(gardssalgRewriteEligible(null), false, "gardssalgRewriteEligible: null → false");
   assertEq(gardssalgRewriteEligible(undefined), false, "gardssalgRewriteEligible: undefined → false");
+
+  // ── gardssalgReplaceableFieldAction's currentValueJudgedContaminated param
+  //    (fix-up round, independent review's blocking finding): "current value
+  //    passes the cheap bar" no longer means "never touch it" unconditionally
+  //    — a cheap-bar-passing current value that the caller's LLM judge found
+  //    contaminated (nav-menu chrome glued to one real sentence, the Draopar
+  //    incident shape — see cal-1 in opplevelser-gardssalg-quality-judge.
+  //    test.ts) must still be replaceable by a genuinely better candidate. ──
+  const CAL1_CONTAMINATED =
+    "Heim Sider Om oss Kontakt Sidersortar Alkoholfritt Draopar er ein liten sidergard i Hardanger.";
+  const GOOD_LONGER_CANDIDATE =
+    "Draopar Sideri held til i Hardanger og lagar sider av eigne eple frå gamle tre på garden, og tek imot gjester til smaking og omvising gjennom heile hausten.";
+  assertTrue(CAL1_CONTAMINATED.length >= 80, "sanity: CAL1_CONTAMINATED clears the 80-char cheap-bar floor");
+  assertTrue(GOOD_LONGER_CANDIDATE.length > CAL1_CONTAMINATED.length, "sanity: GOOD_LONGER_CANDIDATE is strictly longer than the contaminated current text");
+
+  // Old (default/omitted third arg) behavior — UNCHANGED: a cheap-bar-passing
+  // current value is never churned, regardless of the candidate.
+  assertEq(
+    gardssalgReplaceableFieldAction(CAL1_CONTAMINATED, GOOD_LONGER_CANDIDATE),
+    null,
+    "gardssalgReplaceableFieldAction: third arg omitted (defaults false) → cheap-bar-passing current is still never churned (backward-compatible)",
+  );
+  assertEq(
+    gardssalgReplaceableFieldAction(CAL1_CONTAMINATED, GOOD_LONGER_CANDIDATE, false),
+    null,
+    "gardssalgReplaceableFieldAction: currentValueJudgedContaminated=false explicitly → cheap-bar-passing current still never churned",
+  );
+
+  // THE FIX: currentValueJudgedContaminated=true → the cheap-bar-passing but
+  // contaminated current value IS replaced by the qualifying, longer
+  // candidate (self-healing restored for already-landed contamination).
+  assertEq(
+    gardssalgReplaceableFieldAction(CAL1_CONTAMINATED, GOOD_LONGER_CANDIDATE, true),
+    "replaced",
+    "gardssalgReplaceableFieldAction: currentValueJudgedContaminated=true + qualifying longer candidate → 'replaced' (the self-healing path now works)",
+  );
+
+  // Control: a GENUINELY decent current value is still never churned even
+  // when (hypothetically, by caller error) currentValueJudgedContaminated
+  // were left false — proving the contamination flag is what drives the new
+  // behavior, not some accidental loosening of the cheap-bar check itself.
+  const GENUINELY_DECENT =
+    "Gården vår har lange tradisjoner med sauehold og ullproduksjon, og vi selger garn og kjøtt direkte fra tunet.";
+  assertEq(
+    gardssalgReplaceableFieldAction(GENUINELY_DECENT, GOOD_LONGER_CANDIDATE, false),
+    null,
+    "gardssalgReplaceableFieldAction: genuinely decent current (not judged contaminated) → still never churned",
+  );
+
+  // Blank/thin-current and thin-candidate behavior is completely unaffected
+  // by the new third param (it only matters when meetsAboutCheapBar(current)
+  // is true) — regression-proofing the pre-existing contract.
+  assertEq(
+    gardssalgReplaceableFieldAction(null, GOOD_LONGER_CANDIDATE, true),
+    "filled",
+    "gardssalgReplaceableFieldAction: blank current + contaminated=true → still just 'filled' (blank-fill path unaffected by the new param)",
+  );
+  assertEq(
+    gardssalgReplaceableFieldAction("Liten gård.", GOOD_LONGER_CANDIDATE, false),
+    "replaced",
+    "gardssalgReplaceableFieldAction: thin (cheap-bar-failing) current + contaminated=false → still 'replaced' via the pre-existing thin-content path, unaffected by the new param",
+  );
 
   // ── gardssalgProductsEligible (dev-request 2026-07-18-gardssalg-
   //    profilkvalitet-foer-outreach, slice 5c) — fill-only gate for the

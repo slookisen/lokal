@@ -392,10 +392,29 @@ export function runOpplevelserGardssalgFillblankTests(
       // `!wouldWriteActions.about_text` guard would ever see it.
       const extractiveHtml = `<html><head><meta property="og:description" content="${OG_DESC_EXTRACTIVE_ABOUT}"></head><body><p>Velkommen innom oss.</p></body></html>`;
 
-      globalThis.fetch = (async (url: string | URL | Request) => {
+      // kvalitetsgate-redesign (slice 2/3/4): the extractive about_text/
+      // visit_text candidate now also goes through meetsGardssalgAboutQualityBar
+      // → judgeGardssalgAboutCandidate before the OLD fill-from-source LLM
+      // path is even considered — so the shared api.anthropic.com mock must
+      // tell the two prompt shapes apart (judge vs. fill-from-source) rather
+      // than returning one fixed response for both. The judge's prompt is
+      // uniquely identifiable by its "kvalitetsdommer" framing (see
+      // judgeGardssalgAboutCandidate in routes/opplevelser.ts).
+      globalThis.fetch = (async (url: string | URL | Request, init?: any) => {
         const urlStr = String(url);
         if (urlStr.includes("api.anthropic.com")) {
           anthropicCallCount++;
+          const body = init?.body ? JSON.parse(init.body) : {};
+          const prompt: string = body?.messages?.[0]?.content ?? "";
+          if (prompt.includes("kvalitetsdommer")) {
+            // Judge call — approve (this file isolates the blank-fill path,
+            // not judge calibration; see opplevelser-gardssalg-quality-judge.test.ts).
+            return {
+              ok: true,
+              status: 200,
+              json: async () => ({ content: [{ type: "text", text: "GODKJENN\nRen, konkret prosa om produsenten." }] }),
+            } as unknown as Response;
+          }
           return {
             ok: true,
             status: 200,
@@ -468,8 +487,15 @@ export function runOpplevelserGardssalgFillblankTests(
 
       // ── fb-b3: REGRESSION — a provider whose blank about_text gets filled
       //    by the pre-existing EXTRACTIVE path (a page with a passing-bar
-      //    og:description) must NOT also call the new LLM path — the new
-      //    branch's `!wouldWriteActions.about_text` guard must skip it. ─────
+      //    og:description) must NOT also call the OLD fill-from-source LLM
+      //    path — the new branch's `!wouldWriteActions.about_text` guard
+      //    must skip it.
+      //
+      //    UPDATE (kvalitetsgate-redesign, slice 2/3/4): the extractive
+      //    candidate itself now goes through the new LLM quality-judge
+      //    (approved by the mock above) before it can win — so the LLM IS
+      //    called exactly once (the judge), never twice (judge + the OLD
+      //    fill-from-source path must still not ALSO fire). ─────────────
       const callsBeforeExtractive = anthropicCallCount;
       const extractiveRes = await callRoute(opplevelserRouter, {
         url: "/admin/gardssalg-content-refresh",
@@ -477,7 +503,7 @@ export function runOpplevelserGardssalgFillblankTests(
         body: { providerIds: ["prov-fb-extractive"], apply: true },
       });
       assertEq(extractiveRes.status, 200, "fb-b3a: extractive-fill provider call -> 200");
-      assertEq(anthropicCallCount, callsBeforeExtractive, "fb-b3b: the LLM is NOT called when the extractive pass already filled about_text");
+      assertEq(anthropicCallCount, callsBeforeExtractive + 1, "fb-b3b: the LLM is called exactly once (the new quality-judge) — the OLD fill-from-source LLM path does NOT also fire when the extractive pass already filled about_text");
       const extractiveEntry = extractiveRes.body.changed.find((c: any) => c.provider_id === "prov-fb-extractive");
       assertTrue(!!extractiveEntry, "fb-b3c: prov-fb-extractive still appears in changed[] — the EXISTING extractive fill path fired");
       assertEq(extractiveEntry.actions.about_text, "filled", "fb-b3d: action is 'filled' via the extractive path (same tag, different source)");

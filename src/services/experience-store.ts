@@ -22,7 +22,22 @@ import { fylkeEquivalents } from "./norway-fylke";
 // reuse the same quality-bar predicate the homepage-content extractor already
 // gates candidates with, so applyGardssalgProviderContent() can tell "thin"
 // existing content from decent existing content before deciding to replace it.
-import { meetsAboutQualityBar } from "./search-enrich";
+//
+// dev-request 2026-07-20-gardssalg-kvalitetsgate-redesign, slice 2/3/4: this
+// gårdssalg-specific gate now uses meetsAboutCheapBar (the cheap, universal
+// prefilter — length/mangled-Unicode/boilerplate/Norwegian-check) instead of
+// the full meetsAboutQualityBar. By the time a candidate value reaches this
+// module, the route's meetsGardssalgAboutQualityBar() cascade
+// (routes/opplevelser.ts) has ALREADY run the cheap prefilter + the new LLM
+// judge on it — so re-applying the OLD nav-menu-leakage/umbrella-membership
+// regex heuristic here would silently re-impose the very heuristic layer
+// this dev-request retires for gårdssalg, potentially re-rejecting a
+// candidate the LLM judge already approved. Using the cheap-only bar here
+// keeps this module's own defense-in-depth check (currentValue "already
+// decent" / candidate "itself thin") without depending on the retired
+// heuristic. meetsAboutQualityBar itself is UNCHANGED and still used as-is
+// by admin-knowledge.ts's unrelated homepage-refresh vertical.
+import { meetsAboutCheapBar } from "./search-enrich";
 import { deriveExperienceTags, type ExperienceTag, type TaggableExperience } from "./experience-tags";
 import { haversineDistanceKm } from "./geocoding-service";
 // dev-request 2026-07-18-gardssalg-profilkvalitet-foer-outreach, slice 5b —
@@ -2180,23 +2195,53 @@ export function getGardssalgProviderContentTarget(providerId: string): Gardssalg
  *   "filled"   — current value is blank and the candidate has content
  *                (the original, unchanged behavior).
  *   "replaced" — current value is non-blank but THIN (fails
- *                meetsAboutQualityBar), the candidate itself passes the
- *                quality bar, AND the candidate is strictly longer than the
- *                current value — so a replace never swaps thin-but-real
- *                content for something equally or less substantial.
- *   null       — no write: current value already meets the quality bar
- *                (never churned), or the candidate doesn't qualify.
+ *                meetsAboutCheapBar) OR judged-contaminated (see
+ *                currentValueJudgedContaminated below), the candidate itself
+ *                passes the cheap bar, AND the candidate is strictly longer
+ *                than the current value — so a replace never swaps
+ *                thin-but-real content for something equally or less
+ *                substantial.
+ *   null       — no write: current value already meets the cheap bar AND is
+ *                not judged-contaminated (never churned), or the candidate
+ *                doesn't qualify.
+ *
+ * dev-request 2026-07-20-gardssalg-kvalitetsgate-redesign, slice 2/3/4: uses
+ * meetsAboutCheapBar (cheap/universal parts only), NOT the full
+ * meetsAboutQualityBar — see the import's doc comment for why. The semantic
+ * "is this candidate actually good" judgment for gårdssalg now happens
+ * upstream, in the route's meetsGardssalgAboutQualityBar() cascade, before a
+ * candidate value ever reaches this function.
+ *
+ * `currentValueJudgedContaminated` (fix-up round, independent review's
+ * blocking finding): "current value passes the cheap bar" is NOT the same
+ * as "current value is decent" — nav-menu chrome glued to one real sentence
+ * (the Draopar incident shape) is long enough and real-Norwegian-enough to
+ * clear meetsAboutCheapBar every time, so the original slice-2/3/4 code
+ * ("current passes cheap bar -> never touch it, full stop") permanently
+ * locked ALREADY-contaminated rows out of ever being fixed by this endpoint
+ * again — precisely the incident class this redesign exists to close. The
+ * caller (routes/opplevelser.ts) is expected to have already run the SAME
+ * LLM judge used on candidates (meetsGardssalgAboutQualityBar) against the
+ * CURRENT value too, but ONLY when it was cost-effective to do so (current
+ * passes the cheap bar AND a judge-approved fresh candidate exists — see the
+ * caller's own doc comment for the exact cost-bounded ordering), and passes
+ * the negated verdict in here. When true, a cheap-bar-passing current value
+ * is treated as if it had failed the cheap bar for the "never churn" check
+ * below — everything else (candidate must itself pass the cheap bar, and be
+ * strictly longer) is unchanged. Defaults to false so every pre-existing
+ * caller/test that doesn't pass it keeps the exact old behavior.
  */
 export function gardssalgReplaceableFieldAction(
   currentValue: string | null | undefined,
-  candidateValue: string | null | undefined
+  candidateValue: string | null | undefined,
+  currentValueJudgedContaminated: boolean = false
 ): "filled" | "replaced" | null {
   const candidate = candidateValue?.trim();
   if (!candidate) return null;
   const isCurrentBlank = currentValue === null || currentValue === undefined || String(currentValue).trim() === "";
   if (isCurrentBlank) return "filled";
-  if (meetsAboutQualityBar(currentValue)) return null; // decent existing content — never churned
-  if (!meetsAboutQualityBar(candidate)) return null; // candidate itself thin — can't replace thin with thin
+  if (meetsAboutCheapBar(currentValue) && !currentValueJudgedContaminated) return null; // decent existing content — never churned
+  if (!meetsAboutCheapBar(candidate)) return null; // candidate itself thin — can't replace thin with thin
   const currentTrimmed = String(currentValue).trim();
   if (!(candidate.length > currentTrimmed.length)) return null; // must be a genuine improvement in length
   return "replaced";
@@ -2214,9 +2259,10 @@ export function gardssalgReplaceableFieldAction(
  *
  * Returns true only when ALL of:
  *   - currentValue is non-blank,
- *   - currentValue passes meetsAboutQualityBar (>=80 chars, not boilerplate/
- *     nav-leakage/mangled/wrong-entity — i.e. the value
- *     gardssalgReplaceableFieldAction itself would refuse to ever churn),
+ *   - currentValue passes meetsAboutCheapBar (>=80 chars, not boilerplate/
+ *     mangled/foreign — i.e. the value gardssalgReplaceableFieldAction
+ *     itself would refuse to ever churn; see that gate's doc comment for why
+ *     this uses the cheap bar rather than the full meetsAboutQualityBar),
  *   - currentValue.trim().length < 200 (still genuinely thin by this
  *     rewrite slice's own, stricter 200-char bar).
  *
@@ -2224,12 +2270,35 @@ export function gardssalgReplaceableFieldAction(
  * second run idempotent with no extra state/flag: once a field is rewritten
  * (the LLM helper's code-enforced 200-500 char output range guarantees
  * >=200), it drops out of the eligible set on its own.
+ *
+ * `currentValueJudgedContaminated` (fix-up round 2, independent review's
+ * blocking finding — "gardssalgRewriteEligible also lost its nav-check, and
+ * unlike the main replace path, has no compensating LLM-judge check at
+ * all"): mirrors gardssalgReplaceableFieldAction's own
+ * currentValueJudgedContaminated param above (same fix-up round-1 pattern).
+ * A cheap-bar-passing-but-<200-char current value that "looks" eligible by
+ * this function's own structural rule is EXACTLY the Draopar-shaped nav-junk
+ * cohort: long+Norwegian-looking enough to pass meetsAboutCheapBar, still
+ * short enough (<200) to look like a genuine "thin, expand it" candidate —
+ * except it is nav chrome, not real prose, and generateGardssalgAboutRewrite
+ * (routes/opplevelser.ts) takes this exact value as TRUSTED grounding text
+ * for its expansion. The caller is expected to run the SAME LLM judge used
+ * elsewhere in this redesign (meetsGardssalgAboutQualityBar) against the
+ * current value ONLY when it already passes the structural rule below (cost-
+ * bounded — no upfront judging of every current value regardless of rewrite
+ * candidacy, same discipline as gardssalgReplaceableFieldAction's caller),
+ * and pass the negated verdict in here. Defaults to false so every pre-
+ * existing caller/test that doesn't pass it keeps the exact old behavior.
  */
-export function gardssalgRewriteEligible(currentValue: string | null | undefined): boolean {
+export function gardssalgRewriteEligible(
+  currentValue: string | null | undefined,
+  currentValueJudgedContaminated: boolean = false
+): boolean {
   if (currentValue === null || currentValue === undefined) return false;
   const trimmed = String(currentValue).trim();
   if (!trimmed) return false;
-  if (!meetsAboutQualityBar(trimmed)) return false;
+  if (currentValueJudgedContaminated) return false;
+  if (!meetsAboutCheapBar(trimmed)) return false;
   return trimmed.length < 200;
 }
 
@@ -2298,15 +2367,42 @@ export function gardssalgProductsEligible(currentProducts: string | null | undef
  * field gardssalgReplaceableFieldAction() would otherwise refuse to ever
  * touch ("decent existing content — never churned"). The caller is expected
  * to have already gated this via gardssalgRewriteEligible() AND the rewrite
- * helper's own 200-500-char acceptance gate; this function does one more
- * defense-in-depth re-check (gardssalgRewriteEligible against the FRESH row
- * snapshot read below, not the caller's possibly-stale one) before writing,
- * so a field that changed between selection and write never gets silently
- * churned. For a field named here, the write bypasses
+ * helper's own 200-500-char acceptance gate — and, since fix-up round 2
+ * (independent review's blocking finding), also via the SAME gårdssalg LLM
+ * judge (meetsGardssalgAboutQualityBar) against BOTH the current value
+ * (before it's trusted as rewrite grounding — fed into
+ * gardssalgRewriteEligible's currentValueJudgedContaminated param) AND the
+ * rewrite's own output (before it's accepted at all) — see the caller's own
+ * doc comment above its rewrite block for the full two-gate rationale; this
+ * function does one more defense-in-depth re-check (gardssalgRewriteEligible
+ * against the FRESH row snapshot read below, not the caller's possibly-stale
+ * one, though WITHOUT re-running the contamination judge — the value being
+ * written here already cleared the output judge, so this recheck only
+ * guards the structural cheap-bar/length race, same as before fix-up round
+ * 2) before writing, so a field that changed between selection and write
+ * never gets silently churned. For a field named here, the write bypasses
  * gardssalgReplaceableFieldAction()'s decision (which is a no-op for it
  * anyway, since eligibility requires the current value to already pass the
  * quality bar) but goes through the exact same audit-row + field_provenance
  * + lock-guard machinery as every other field.
+ *
+ * `contaminatedFields` (fix-up round, independent review's blocking
+ * finding) — OPTIONAL, additive, empty/omitted by every pre-existing call
+ * site (byte-identical behavior when not passed): names the about_text/
+ * visit_text fields whose CURRENT value the caller already ran through the
+ * LLM judge (meetsGardssalgAboutQualityBar in routes/opplevelser.ts) and
+ * found NOT approved, despite passing the cheap bar — i.e. the Draopar-
+ * shaped "long enough, real-Norwegian-enough, but actually leaked nav
+ * chrome" case. Forwarded straight into gardssalgReplaceableFieldAction()'s
+ * `currentValueJudgedContaminated` param for that field, against THIS
+ * function's own FRESH row snapshot (not the caller's possibly-stale one) —
+ * same defense-in-depth discipline as `rewriteFields` above. If the row's
+ * current value changed between the caller's selection-time judge call and
+ * this write (a narrow race), the contamination verdict could be stale for
+ * the new value; this is accepted as the same tolerance already baked into
+ * the candidate side (a candidate's judge-approval is likewise not
+ * re-verified against a materially different row here, only re-checked
+ * structurally via the cheap bar).
  */
 export function applyGardssalgProviderContent(
   providerId: string,
@@ -2325,7 +2421,8 @@ export function applyGardssalgProviderContent(
   },
   evidenceUrl: string,
   batchId?: string,
-  rewriteFields?: Array<"about_text" | "visit_text">
+  rewriteFields?: Array<"about_text" | "visit_text">,
+  contaminatedFields?: Array<"about_text" | "visit_text">
 ): string[] {
   const db = getDb(VERTICAL);
   const row = db
@@ -2369,14 +2466,21 @@ export function applyGardssalgProviderContent(
   // function's doc comment. Naturally mutually exclusive with the
   // gardssalgReplaceableFieldAction branch below: eligibility requires the
   // current value to already pass meetsAboutQualityBar, for which
-  // gardssalgReplaceableFieldAction always returns null ("never churned").
+  // gardssalgReplaceableFieldAction always returns null ("never churned")
+  // UNLESS the field is also named in contaminatedSet below.
   const rewriteSet = new Set(rewriteFields ?? []);
+  // Fix-up round: fields whose CURRENT value the caller's LLM judge already
+  // found contaminated (see this function's doc comment above) — forwarded
+  // into gardssalgReplaceableFieldAction()'s currentValueJudgedContaminated
+  // param so a cheap-bar-passing-but-contaminated current value can still
+  // be replaced by a genuinely good fresh candidate.
+  const contaminatedSet = new Set(contaminatedFields ?? []);
 
   if (rewriteSet.has("about_text") && candidate.about_text?.trim() && gardssalgRewriteEligible(row.about_text)) {
     sets.push("about_text = @about_text");
     params.about_text = candidate.about_text.trim();
     written.push("about_text");
-  } else if (gardssalgReplaceableFieldAction(row.about_text, candidate.about_text)) {
+  } else if (gardssalgReplaceableFieldAction(row.about_text, candidate.about_text, contaminatedSet.has("about_text"))) {
     sets.push("about_text = @about_text");
     params.about_text = candidate.about_text!.trim();
     written.push("about_text");
@@ -2385,7 +2489,7 @@ export function applyGardssalgProviderContent(
     sets.push("visit_text = @visit_text");
     params.visit_text = candidate.visit_text.trim();
     written.push("visit_text");
-  } else if (gardssalgReplaceableFieldAction(row.visit_text, candidate.visit_text)) {
+  } else if (gardssalgReplaceableFieldAction(row.visit_text, candidate.visit_text, contaminatedSet.has("visit_text"))) {
     sets.push("visit_text = @visit_text");
     params.visit_text = candidate.visit_text!.trim();
     written.push("visit_text");

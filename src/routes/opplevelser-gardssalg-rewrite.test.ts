@@ -546,10 +546,25 @@ export function runOpplevelserGardssalgRewriteTests(
       // helper is never invoked for that cohort.
       const rwSub80Html = `<html><head><meta property="og:description" content="${PASSING_BAR_SHORT_86}"></head><body><p>Velkommen innom oss.</p></body></html>`;
 
-      globalThis.fetch = (async (url: string | URL | Request) => {
+      // kvalitetsgate-redesign (slice 2/3/4): a passing-bar extractive
+      // candidate now also goes through meetsGardssalgAboutQualityBar's LLM
+      // judge before gardssalgReplaceableFieldAction() ever sees it — the
+      // judge's prompt is uniquely identifiable by its "kvalitetsdommer"
+      // framing (see judgeGardssalgAboutCandidate, routes/opplevelser.ts),
+      // so this shared mock tells it apart from the rewrite prompt below.
+      globalThis.fetch = (async (url: string | URL | Request, init?: any) => {
         const urlStr = String(url);
         if (urlStr.includes("api.anthropic.com")) {
           anthropicCallCount++;
+          const body = init?.body ? JSON.parse(init.body) : {};
+          const prompt: string = body?.messages?.[0]?.content ?? "";
+          if (prompt.includes("kvalitetsdommer")) {
+            return {
+              ok: true,
+              status: 200,
+              json: async () => ({ content: [{ type: "text", text: "GODKJENN\nRen, konkret prosa om produsenten." }] }),
+            } as unknown as Response;
+          }
           return {
             ok: true,
             status: 200,
@@ -650,9 +665,18 @@ export function runOpplevelserGardssalgRewriteTests(
 
       // ── rw-5: a sub-80-char (thin-fails-bar) about_text goes through the
       //    EXISTING fill/replace path ONLY — gardssalgRewriteEligible must
-      //    never fire (it requires meetsAboutQualityBar first), so the LLM
-      //    is never called for this field, even though a genuine extractive
-      //    "replace" candidate is available and DOES get written. ─────────
+      //    never fire (it requires meetsAboutCheapBar first), so the OLD
+      //    rewrite LLM helper is never called for this field, even though a
+      //    genuine extractive "replace" candidate is available and DOES get
+      //    written.
+      //
+      //    UPDATE (kvalitetsgate-redesign, slice 2/3/4): the extractive
+      //    candidate itself now goes through the new LLM quality-judge
+      //    (approved by the mock above) exactly once before the replace can
+      //    happen — since the CURRENT value fails the cheap bar (a genuine
+      //    write opportunity), the judge IS invoked. Assert the LLM is
+      //    called exactly once (the judge), and confirm it's the judge, not
+      //    the rewrite helper, that fired (action stays "replaced"). ───────
       const callsBeforeSub80 = anthropicCallCount;
       const sub80Res = await callRoute(opplevelserRouter, {
         url: "/admin/gardssalg-content-refresh",
@@ -660,12 +684,12 @@ export function runOpplevelserGardssalgRewriteTests(
         body: { providerIds: ["prov-rw-sub80"], apply: true },
       });
       assertEq(sub80Res.status, 200, "rw-5a: sub-80 provider call -> 200");
-      assertEq(anthropicCallCount, callsBeforeSub80, "rw-5b: the LLM is NEVER called for a sub-80-char (thin-fails-bar) field — this slice only widens the passing-bar-but-short cohort");
+      assertEq(anthropicCallCount, callsBeforeSub80 + 1, "rw-5b: the LLM is called exactly once (the new quality-judge on the extractive candidate) — the OLD rewrite helper never fires for this cohort");
       const sub80Entry = sub80Res.body.changed.find((c: any) => c.provider_id === "prov-rw-sub80");
       assertTrue(!!sub80Entry, "rw-5c: prov-rw-sub80 still appears in changed[] — the EXISTING extractive replace path fired");
       assertEq(sub80Entry.actions.about_text, "replaced", "rw-5d: prov-rw-sub80's about_text action is 'replaced' (existing path), never 'rewritten'");
       const rowSub80 = getProviderRow("prov-rw-sub80");
-      assertEq(rowSub80.about_text, PASSING_BAR_SHORT_86, "rw-5e: prov-rw-sub80's about_text was written by the existing extractive replace path, not the LLM");
+      assertEq(rowSub80.about_text, PASSING_BAR_SHORT_86, "rw-5e: prov-rw-sub80's about_text was written by the existing extractive replace path (LLM-judge-approved), not the rewrite helper");
 
       // ── rw-6: REGRESSION — candidateAbout/candidateVisit (raw extractive
       //    summaries) AND rewriteAbout/rewriteVisit (LLM rewrites) are BOTH
@@ -727,10 +751,30 @@ export function runOpplevelserGardssalgRewriteTests(
         const urlStr = String(url);
         if (urlStr.includes("api.anthropic.com")) {
           anthropicCallCount++;
+          const bodyStr = init?.body ? String(init.body) : "";
+          const prompt: string = init?.body ? (JSON.parse(init.body).messages?.[0]?.content ?? "") : "";
+          // Fix-up round 2: the route now ALSO judges the current value
+          // (contamination check — gardssalgRewriteEligible's
+          // currentValueJudgedContaminated param — before it's trusted as
+          // rewrite grounding) and the rewrite's own output (before it's
+          // accepted at all) through the SAME gårdssalg LLM judge, uniquely
+          // identifiable by its "kvalitetsdommer" prompt framing (see
+          // judgeGardssalgAboutCandidate) — same convention as the shared
+          // mock above. Approve every judge call here: this fixture's
+          // current values are genuinely clean and rewrite-eligible, so both
+          // new gates must sail through, isolating the pre-existing "both
+          // extractive AND rewrite candidates non-null" regression this
+          // specific test targets.
+          if (prompt.includes("kvalitetsdommer")) {
+            return {
+              ok: true,
+              status: 200,
+              json: async () => ({ content: [{ type: "text", text: "GODKJENN\nRen, konkret prosa om produsenten." }] }),
+            } as unknown as Response;
+          }
           // Return the field-appropriate rewrite: the about-rewrite prompt
           // carries the about current value, the visit-rewrite prompt
           // carries the visit current value — key off which is present.
-          const bodyStr = init?.body ? String(init.body) : "";
           const text = bodyStr.includes(CURRENT_VISIT_PASSING_BAR_SHORT)
             ? REWRITE_CANDIDATE_VISIT_260
             : REWRITE_CANDIDATE_250;
@@ -793,6 +837,176 @@ export function runOpplevelserGardssalgRewriteTests(
       assertEq(bothVisitAudit.new_value, REWRITE_CANDIDATE_VISIT_260, "rw-6m: audit new_value for visit_text is the LLM rewrite, not the extractive candidate");
 
       globalThis.fetch = bothProviderFetch;
+
+      // ── rw-7: REGRESSION — independent review's round-2 blocking finding,
+      //    reproduced end-to-end and now BLOCKED. gardssalgRewriteEligible()
+      //    used to be purely structural (cheap bar + <200 chars), with NO
+      //    compensating LLM-judge check at all — unlike the sibling replace
+      //    path (gardssalgReplaceableFieldAction's currentValueJudgedContaminated,
+      //    fix-up round 1). A nav-menu-contaminated, <200-char current value
+      //    (the exact Draopar-shaped flat-menu text
+      //    opplevelser-gardssalg-content-audit.test.ts's block (m) already
+      //    treats as the canonical reject — reused verbatim here) used to be
+      //    accepted as "rewrite eligible", fed to generateGardssalgAboutRewrite
+      //    as trusted grounding, and its output written with ZERO
+      //    contamination gate. Fix: (b) the current value is now judged BEFORE
+      //    it's trusted as grounding (gardssalgRewriteEligible's
+      //    currentValueJudgedContaminated param) — a contaminated verdict
+      //    means the rewrite generator is never even called — and (a) the
+      //    rewrite's own OUTPUT is judged too (defense-in-depth, unreachable
+      //    in this specific test since (b) already blocks it, but exercised
+      //    by rw-8 below). ─────────────────────────────────────────────────
+      const CAL1_CONTAMINATED_ABOUT =
+        "Heim Sider Om oss Kontakt Sidersortar Alkoholfritt Draopar er ein liten sidergard i Hardanger.";
+      assertTrue(
+        CAL1_CONTAMINATED_ABOUT.length >= 80 && CAL1_CONTAMINATED_ABOUT.length < 200,
+        "sanity: CAL1_CONTAMINATED_ABOUT is in the rewrite-eligible-by-cheap-bar-alone [80,200) window — exactly the shape that used to slip through ungated",
+      );
+
+      insertProvider.run({
+        id: "prov-rw-contaminated", navn: "Prov RW Draopar-shaped Gard", hjemmeside: "https://prov-rw-contaminated.example.no",
+        content_source: null, about_text: CAL1_CONTAMINATED_ABOUT, visit_text: null, opening_hours_text: null,
+      });
+
+      // No og:description/VISIT_KEYWORDS match — the extractive path
+      // contributes NOTHING, isolating the rewrite path as this field's only
+      // possible source of a write (same convention as prov-rw-thin above).
+      const rwContaminatedHtml = "<html><body><p>Velkommen til gården vår, ring for mer info.</p></body></html>";
+
+      let rewriteGeneratorCalledForContaminated = false;
+      globalThis.fetch = (async (url: string | URL | Request, init?: any) => {
+        const urlStr = String(url);
+        if (urlStr.includes("api.anthropic.com")) {
+          anthropicCallCount++;
+          const body = init?.body ? JSON.parse(init.body) : {};
+          const prompt: string = body?.messages?.[0]?.content ?? "";
+          if (prompt.includes("kvalitetsdommer")) {
+            // The current-value contamination judge: REJECT specifically the
+            // Draopar-shaped nav text (same convention as content-audit's
+            // block (m)); approve anything else asked of this judge.
+            if (prompt.includes(CAL1_CONTAMINATED_ABOUT)) {
+              return {
+                ok: true,
+                status: 200,
+                json: async () => ({ content: [{ type: "text", text: "AVVIS\nLekket navigasjonsmeny, ikke egnet prosa." }] }),
+              } as unknown as Response;
+            }
+            return {
+              ok: true,
+              status: 200,
+              json: async () => ({ content: [{ type: "text", text: "GODKJENN\nRen, konkret prosa om produsenten." }] }),
+            } as unknown as Response;
+          }
+          // Any NON-judge (i.e. rewrite-generation) call reaching the LLM for
+          // this fixture would mean contaminated grounding text slipped past
+          // the new gate — the whole point of the fix is that this call must
+          // never happen.
+          rewriteGeneratorCalledForContaminated = true;
+          return {
+            ok: true,
+            status: 200,
+            json: async () => ({ content: [{ type: "text", text: REWRITE_CANDIDATE_250 }] }),
+          } as unknown as Response;
+        }
+        const host = new URL(urlStr).hostname;
+        if (host === "prov-rw-contaminated.example.no") {
+          return { ok: true, status: 200, text: async () => rwContaminatedHtml } as unknown as Response;
+        }
+        return { ok: false, status: 404, text: async () => "" } as unknown as Response;
+      }) as typeof fetch;
+
+      const callsBeforeContaminated = anthropicCallCount;
+      const contaminatedRes = await callRoute(opplevelserRouter, {
+        url: "/admin/gardssalg-content-refresh",
+        headers: { "x-admin-key": testKey },
+        body: { providerIds: ["prov-rw-contaminated"], apply: true },
+      });
+      assertEq(contaminatedRes.status, 200, "rw-7a: apply on the contaminated fixture -> 200");
+      assertEq(
+        anthropicCallCount,
+        callsBeforeContaminated + 1,
+        "rw-7b: exactly ONE LLM call happened (the current-value contamination judge) — the rewrite generator is never reached",
+      );
+      assertTrue(
+        !rewriteGeneratorCalledForContaminated,
+        "rw-7c: generateGardssalgAboutRewrite's underlying fetch was NEVER invoked — contaminated text is never trusted as grounding",
+      );
+      const contaminatedEntry = contaminatedRes.body.changed.find((c: any) => c.provider_id === "prov-rw-contaminated");
+      assertTrue(!contaminatedEntry, "rw-7d: prov-rw-contaminated does not appear in changed[] at all — the write is BLOCKED, nothing else fires for this field either");
+      const rowContaminated = getProviderRow("prov-rw-contaminated");
+      assertEq(
+        rowContaminated.about_text,
+        CAL1_CONTAMINATED_ABOUT,
+        "rw-7e: the contaminated current value survives UNCHANGED in the DB — never overwritten, never used as trusted grounding",
+      );
+      assertEq(getAuditRows("prov-rw-contaminated").length, 0, "rw-7f: no audit row was created for the blocked field");
+
+      // ── rw-8: CONTROL — a genuinely clean, short current value (the SAME
+      //    cheap-bar-eligible [80,200) shape as rw-7's contaminated fixture,
+      //    but no nav leakage) is still correctly judged NOT contaminated,
+      //    generates a rewrite, has its OUTPUT judged, and gets written —
+      //    proving the two new gates above don't collaterally break the
+      //    legitimate rewrite-eligible cohort. ─────────────────────────────
+      const CLEAN_SHORT_ABOUT =
+        "Vi er ein liten familiedriven gard i Telemark som sel eigne produkt frå garden i vårt vesle gardsutsal.";
+      assertTrue(
+        CLEAN_SHORT_ABOUT.length >= 80 && CLEAN_SHORT_ABOUT.length < 200,
+        "sanity: CLEAN_SHORT_ABOUT is in the same rewrite-eligible [80,200) window as rw-7's contaminated fixture, but genuinely clean",
+      );
+
+      insertProvider.run({
+        id: "prov-rw-clean", navn: "Prov RW Clean Gard", hjemmeside: "https://prov-rw-clean.example.no",
+        content_source: null, about_text: CLEAN_SHORT_ABOUT, visit_text: null, opening_hours_text: null,
+      });
+      const rwCleanHtml = "<html><body><p>Velkommen til gården vår, ring for mer info.</p></body></html>";
+      globalThis.fetch = (async (url: string | URL | Request, init?: any) => {
+        const urlStr = String(url);
+        if (urlStr.includes("api.anthropic.com")) {
+          anthropicCallCount++;
+          const body = init?.body ? JSON.parse(init.body) : {};
+          const prompt: string = body?.messages?.[0]?.content ?? "";
+          if (prompt.includes("kvalitetsdommer")) {
+            return {
+              ok: true,
+              status: 200,
+              json: async () => ({ content: [{ type: "text", text: "GODKJENN\nRen, konkret prosa om produsenten." }] }),
+            } as unknown as Response;
+          }
+          return {
+            ok: true,
+            status: 200,
+            json: async () => ({ content: [{ type: "text", text: REWRITE_CANDIDATE_250 }] }),
+          } as unknown as Response;
+        }
+        const host = new URL(urlStr).hostname;
+        if (host === "prov-rw-clean.example.no") {
+          return { ok: true, status: 200, text: async () => rwCleanHtml } as unknown as Response;
+        }
+        return { ok: false, status: 404, text: async () => "" } as unknown as Response;
+      }) as typeof fetch;
+
+      const callsBeforeClean = anthropicCallCount;
+      const cleanRes = await callRoute(opplevelserRouter, {
+        url: "/admin/gardssalg-content-refresh",
+        headers: { "x-admin-key": testKey },
+        body: { providerIds: ["prov-rw-clean"], apply: true },
+      });
+      assertEq(cleanRes.status, 200, "rw-8a: apply on the clean fixture -> 200");
+      assertEq(
+        anthropicCallCount,
+        callsBeforeClean + 3,
+        "rw-8b: THREE LLM calls — current-value judge (approve), rewrite generation, output judge (approve) — cost-bounded, all three fire exactly once each",
+      );
+      const cleanEntry = cleanRes.body.changed.find((c: any) => c.provider_id === "prov-rw-clean");
+      assertTrue(!!cleanEntry, "rw-8c: prov-rw-clean appears in changed[] — the legitimate rewrite path still fires");
+      assertEq(cleanEntry.actions.about_text, "rewritten", "rw-8d: action is 'rewritten'");
+      const rowClean = getProviderRow("prov-rw-clean");
+      assertEq(
+        rowClean.about_text,
+        REWRITE_CANDIDATE_250,
+        "rw-8e: about_text actually rewritten to the accepted candidate — the legitimate cohort is NOT broken by the new gates",
+      );
+      assertEq(getAuditRows("prov-rw-clean").length, 1, "rw-8f: exactly one audit row created for the legitimate rewrite");
     } catch (err: any) {
       failed++;
       failures.push("opplevelser-gardssalg-rewrite (section B): unexpected error: " + String(err?.stack || err?.message || err));
