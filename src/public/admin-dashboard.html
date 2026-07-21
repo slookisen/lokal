@@ -907,9 +907,11 @@
         var cl = data.classification || {};
         var items = [
             { label: "Mennesker", value: (cl.human || {}).views || 0, sessions: (cl.human || {}).sessions || 0, color: "#4ade80" },
-            { label: "Bots/crawlere", value: (cl.bot || {}).views || 0, sessions: (cl.bot || {}).sessions || 0, color: "#f87171" },
+            { label: "AI-s\u00f8k", value: (cl.ai_search || {}).views || 0, sessions: (cl.ai_search || {}).sessions || 0, color: "#a78bfa" },
+            { label: "AI-crawlere", value: (cl.ai_crawler || {}).views || 0, sessions: (cl.ai_crawler || {}).sessions || 0, color: "#38bdf8" },
+            { label: "Bots/crawlere (ikke-AI)", value: (cl.bot || {}).views || 0, sessions: (cl.bot || {}).sessions || 0, color: "#f87171" },
             { label: "Utvikling/test", value: (cl.dev || {}).views || 0, sessions: (cl.dev || {}).sessions || 0, color: "#fbbf24" },
-            { label: "Skannere", value: (cl.scanner || {}).views || 0, sessions: (cl.scanner || {}).sessions || 0, color: "#a78bfa" },
+            { label: "Skannere", value: (cl.scanner || {}).views || 0, sessions: (cl.scanner || {}).sessions || 0, color: "#fb923c" },
         ].filter(function(d) { return d.value > 0; });
 
         var total = items.reduce(function(s, d) { return s + d.value; }, 0);

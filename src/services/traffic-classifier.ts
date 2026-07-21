@@ -67,7 +67,8 @@ export const AI_CRAWLER_PATTERNS = [
   "PerplexityBot",
   "Google-Extended",
   "GoogleOther",
-  "Gemini",
+  // NOTE: no bare "Gemini" pattern — Google's AI crawlers use Google-Extended/GoogleOther,
+  // and "Gemini" appears in real human UAs (e.g. Planet Computers Gemini PDA).
   "Amazonbot",
   "Bytespider",
   "CCBot",

@@ -109,7 +109,11 @@ export function runTrafficClassifierTests(opts: { log?: boolean } = {}): TestSum
   expectBucket(
     "Mozilla/5.0 (compatible; NotHumanSearch/1.0; +https://nothumansearch.com)",
     "ai_crawler", "ac16 NotHumanSearch");
-  expectBucket("Gemini/1.0", "ai_crawler", "ac17 Gemini");
+  // Bare "Gemini" is NOT an AI-crawler token (Google uses Google-Extended/GoogleOther);
+  // it appears in real human UAs — e.g. the Planet Computers Gemini PDA must stay human.
+  expectBucket(
+    "Mozilla/5.0 (Linux; Android 8.1.0; Gemini) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/70.0.3538.80 Mobile Safari/537.36",
+    "human", "ac17 Gemini PDA human");
 
   // ── search_engine ───────────────────────────────────────────────────────
   expectBucket(
