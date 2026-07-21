@@ -27055,6 +27055,24 @@ Promise.allSettled(_oaHomeCountersDeps).then(async () => {
     for (const f of gmd.failures) failures.push("opplevelser-gardssalg-mcp-discoverability: " + f);
     console.log(`  opplevelser-gardssalg-mcp-discoverability: ${gmd.passed} passed, ${gmd.failed} failed`);
 
+    // dev-request 2026-07-19-gardssalg-agent-flater: REST GET /api/opplevelser/
+    // discover?category=gardssalg_smaking always got zero direct hits (gårdssalg
+    // rows live in experience_providers, not `experiences`), and its zero-hit
+    // fallback silently relaxed category into unrelated results. /discover now
+    // intercepts category=gardssalg_smaking BEFORE discoverExperiencesRelaxed()
+    // runs and routes to the same searchGardssalgProviders() store function the
+    // discover_gardssalg MCP tool uses. Same in-memory-DB + synthetic
+    // router.handle() pattern as opplevelser-discover-relax.test.ts, runs
+    // sequentially inside this same gated block for the same reason.
+    console.log("\n── opplevelser-gardssalg-rest-discover: REST /discover?category=gardssalg_smaking intercept ──");
+    const { runOpplevelserGardssalgRestDiscoverTests } = require("../src/routes/opplevelser-gardssalg-rest-discover.test") as
+      typeof import("../src/routes/opplevelser-gardssalg-rest-discover.test");
+    const grd = await runOpplevelserGardssalgRestDiscoverTests({ log: false });
+    passed += grd.passed;
+    failed += grd.failed;
+    for (const f of grd.failures) failures.push("opplevelser-gardssalg-rest-discover: " + f);
+    console.log(`  opplevelser-gardssalg-rest-discover: ${grd.passed} passed, ${grd.failed} failed`);
+
     // dev-request 2026-07-18-gardssalg-profilkvalitet-foer-outreach, slice 3:
     // Brreg street-address backfill — selectGardssalgProvidersForAddressEnrichment()/
     // getGardssalgProviderAddressTarget()/applyGardssalgProviderAddress()

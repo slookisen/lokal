@@ -123,6 +123,14 @@ import {
   // page/`/discover` use, reused by the new catalog-wide coverage report
   // below rather than redefined.
   PUBLISH_GATE_SQL,
+  // dev-request 2026-07-19-gardssalg-agent-flater — REST /discover intercept
+  // for category=gardssalg_smaking, reusing the EXACT SAME search surface as
+  // the discover_gardssalg MCP tool (src/routes/experiences-mcp.ts) instead
+  // of routing through discoverExperiencesRelaxed() (which only ever queries
+  // `experiences` and has zero gårdssalg rows to find, so its zero-hit
+  // fallback used to silently relax category into unrelated results).
+  searchGardssalgProviders,
+  type GardssalgSearchFilter,
 } from "../services/experience-store";
 // dev-request 2026-07-11-dedup-false-positive-remediation — read-only audit
 // of the merged groups the prod backfill produced (titlesMatch()'s single-
@@ -238,6 +246,68 @@ router.get("/discover", (req: Request, res: Response) => {
   try {
     const filter = parseDiscoverQuery(req);
     const limit = Math.min(100, Math.max(1, parseInt((req.query.limit as string) || "20", 10) || 20));
+
+    // dev-request 2026-07-19-gardssalg-agent-flater: gårdssalg (farm-sale
+    // drink producer) rows live in experience_providers, NOT `experiences` —
+    // discoverExperiencesRelaxed() only ever queries `experiences`, so
+    // category=gardssalg_smaking always got zero direct hits there, and its
+    // zero-hit fallback then silently dropped `category` (and possibly other
+    // filters) one at a time until it found UNRELATED experiences to return.
+    // Intercept BEFORE discoverExperiencesRelaxed() runs and route to the
+    // real gårdssalg search surface instead — every other category value
+    // falls straight through to the unchanged relaxation path below.
+    if (filter.category === "gardssalg_smaking") {
+      const gsFilter: GardssalgSearchFilter = {};
+      if (filter.fylke) gsFilter.fylke = filter.fylke;
+      if (filter.kommune) gsFilter.kommune = filter.kommune;
+      // producer_type is gårdssalg-specific — not part of DiscoverFilterSchema —
+      // so it's read directly off the raw query, same as booking_live below.
+      const producerType = req.query.producer_type as string | undefined;
+      if (producerType) gsFilter.producer_type = producerType;
+      // Only the literal string "true" is a real filter — omitted/false means
+      // "no filter on this column" (matches discover_gardssalg's own
+      // isBookingPaused-adjacent semantics, NOT "show only paused ones").
+      if (req.query.booking_live === "true") gsFilter.booking_live = true;
+      if (typeof filter.lat === "number") gsFilter.lat = filter.lat;
+      if (typeof filter.lng === "number") gsFilter.lng = filter.lng;
+      if (typeof filter.radius_km === "number") gsFilter.radius_km = filter.radius_km;
+      const hasGeo = typeof gsFilter.lat === "number" && typeof gsFilter.lng === "number";
+
+      const gsResults = searchGardssalgProviders(gsFilter, limit);
+      res.json({
+        vertical: "gardssalg",
+        query: gsFilter,
+        count: gsResults.length,
+        results: gsResults.map((row) => {
+          // Same shape/construction as discover_gardssalg's own formatting
+          // (src/routes/experiences-mcp.ts) — kept byte-identical on purpose
+          // so an agent gets the same honest booking status either surface.
+          const live = !isBookingPaused(row.booking_live);
+          return {
+            navn: row.navn,
+            fylke: row.fylke ?? null,
+            kommune: row.kommune ?? null,
+            producer_type: row.producer_type ?? null,
+            lat: row.lat ?? null,
+            lon: row.lon ?? null,
+            geocode_confidence: row.geocode_confidence ?? null,
+            booking: {
+              live,
+              mode: live ? ("request" as const) : ("paused" as const),
+              note: live
+                ? "Book direkte. / Book directly."
+                : "Reservasjoner åpner snart; ta kontakt via profilsiden. / Bookings open soon; visit the profile page to get in touch.",
+            },
+            profile_url: row.slug ? `${APP_URL}/kategori/gardssalg/produsent/${row.slug}` : null,
+            // Only present when an origin (lat/lng) was given — mirrors the
+            // experiences-branch's own ...(hasGeo ? {...} : {}) spread below.
+            ...(hasGeo ? { distance_km: row.distance_km ?? null } : {}),
+          };
+        }),
+      });
+      return;
+    }
+
     const { results, relaxedKeys } = discoverExperiencesRelaxed(filter, limit);
     const note = buildRelaxationNote(relaxedKeys);
     const suggestions = buildNarrowingSuggestions(results, relaxedKeys);
