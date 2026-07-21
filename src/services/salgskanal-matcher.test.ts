@@ -165,6 +165,33 @@ export function runSalgskanalMatcherTests(opts: { log?: boolean } = {}): TestSum
       !find(nearbyCafe, "gardskafe-servering").matched,
       "gardskafe: 'kafé i nærheten' (nearby café, 1 weak signal) does NOT match (false-positive trap)",
     );
+
+    // Follow-up proximity guard: two UNRELATED weak signals far apart in the
+    // text must NOT combine into a match (a café mention in one sentence, a
+    // serving mention about something else ~200 chars later).
+    const farApartWeak = matchSalgskanalCategories({
+      name: "Vidsyn Gård",
+      description:
+        "Det ligger en koselig kafé nede i bygda som mange stopper ved. " +
+        "Vi driver med sau og storfe her på gården, og har holdt på i tre generasjoner med " +
+        "tradisjonelt husdyrhold og stell av kulturlandskapet rundt tunet. " +
+        "Vi tilbyr servering til større selskaper på nabogården etter avtale.",
+    });
+    assertTrue(
+      !find(farApartWeak, "gardskafe-servering").matched,
+      "gardskafe: café + servering far apart (unrelated) do NOT combine (proximity guard)",
+    );
+
+    // Adjacent café + servering still matches (proximity guard does not
+    // over-suppress the true weak-signal case).
+    const adjacentWeak = matchSalgskanalCategories({
+      name: "Nære Gård",
+      description: "Enkel kafé med servering i låven på lørdager.",
+    });
+    assertTrue(
+      find(adjacentWeak, "gardskafe-servering").matched,
+      "gardskafe: adjacent 'kafé med servering' still matches after proximity guard",
+    );
   }
 
   // ── REKO-ring — dev-request spot-probe ─────────────────────────────────
@@ -190,6 +217,28 @@ export function runSalgskanalMatcherTests(opts: { log?: boolean } = {}): TestSum
       description: "Vårt REKO-nummer er 12345 hos regnskapsføreren.",
     });
     assertTrue(!find(bareReko, "reko-ring").matched, "reko-ring: bare 'REKO' (no 'ring') does not match");
+
+    // Follow-up negation/ownership guard: an explicit NON-membership statement
+    // must not be mis-tagged.
+    const negatedReko = matchSalgskanalCategories({
+      name: "Sjølberg Gård",
+      description: "Vi selger ikke via reko-ringen — bare fra egen gårdsbutikk.",
+    });
+    assertTrue(
+      !find(negatedReko, "reko-ring").matched,
+      "reko-ring: 'selger ikke via reko-ringen' does NOT match (negation guard)",
+    );
+
+    // ...but a positive ownership statement in the same shape still matches
+    // (guard does not over-suppress).
+    const positiveReko = matchSalgskanalCategories({
+      name: "Medlem Gård",
+      description: "Vi er medlem av reko-ringen og leverer der hver uke.",
+    });
+    assertTrue(
+      find(positiveReko, "reko-ring").matched,
+      "reko-ring: positive 'medlem av reko-ringen' still matches after negation guard",
+    );
   }
 
   // ── Multi-category producer — a profile can match more than one ───────

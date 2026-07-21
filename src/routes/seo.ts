@@ -29,6 +29,11 @@ import { isDisplayablePhone } from "../services/contact-normalizer";
 import { isJunkDescription } from "../services/description-quality";
 import { getProfileActivity } from "../services/profile-activity-service";
 import { slugify } from "../utils/slug";
+import {
+  SALGSKANAL_CATEGORY_SLUGS,
+  SALGSKANAL_CATEGORY_NAMES,
+  type SalgskanalCategorySlug,
+} from "../services/salgskanal-matcher";
 import { addUtmParams } from "../utils/url-utm";
 import { INDEXNOW_KEY } from "../services/indexnow-service";
 import { t, htmlLangAttr, ogLocale, localizedPath, type Lang } from "../i18n/t";
@@ -129,6 +134,137 @@ const CATEGORY_MAP: Record<string, { name: string; emoji: string }> = {
 const CATEGORY_BADGE_LABELS_ONLY: Record<string, string> = {
   bakery: "Bakeri", beverages: "Drikke", preserves: "Syltetøy", other: "Annet",
 };
+
+// ─── Salgskanal (sales-channel) category display + membership ───────────
+// dev-request 2026-07-06-rfb-salgskanal-kategorier, public-facing slice
+// (work items 3-5). The datamodel + auto-matcher (work items 1-2) already
+// ship; this surfaces the auto-derived membership as browsable pages, a
+// homepage section, and a machine-readable JSON/MCP endpoint.
+//
+// Names come from the matcher's canonical maps (single source of truth);
+// emoji + intro copy live here since they are presentation-only.
+const SALGSKANAL_DISPLAY: Record<
+  SalgskanalCategorySlug,
+  { emoji: string; introNo: string; introEn: string }
+> = {
+  selvplukk: {
+    emoji: "\u{1F353}", // strawberry
+    introNo: "Produsenter der du kan plukke bær, frukt, grønnsaker og blomster selv rett fra åkeren.",
+    introEn: "Producers where you can pick berries, fruit, vegetables and flowers yourself, straight from the field.",
+  },
+  hjemlevering: {
+    emoji: "\u{1F69A}", // delivery truck
+    introNo: "Produsenter som kjører varene helt hjem til deg.",
+    introEn: "Producers who deliver the goods all the way to your door.",
+  },
+  gardsbutikk: {
+    emoji: "\u{1F3EA}", // shop
+    introNo: "Produsenter med egen gårdsbutikk eller gårdsutsalg du kan besøke.",
+    introEn: "Producers with their own farm shop you can visit.",
+  },
+  "gardskafe-servering": {
+    emoji: "☕", // coffee
+    introNo: "Produsenter med egen kafé eller servering på gården.",
+    introEn: "Producers with their own café or food service on the farm.",
+  },
+  "reko-ring": {
+    emoji: "\u{1F4E6}", // package
+    introNo: "Produsenter som selger via en REKO-ring med fast henteordning.",
+    introEn: "Producers who sell through a REKO-ring pickup network.",
+  },
+};
+
+function isSalgskanalSlug(s: string): s is SalgskanalCategorySlug {
+  return (SALGSKANAL_CATEGORY_SLUGS as string[]).includes(s);
+}
+
+/**
+ * Loads salgskanal membership joined against the live active-producer set, so
+ * the counts shown on the homepage/category pages always equal the number of
+ * cards actually rendered (a producer tagged by the matcher but later
+ * deactivated must not inflate the count). Reuses the caller's already-loaded
+ * agents array when given, to avoid a second registry scan on the homepage.
+ */
+function loadSalgskanalMembers(preloadedAgents?: any[]): {
+  byCategory: Map<SalgskanalCategorySlug, any[]>;
+  counts: Record<SalgskanalCategorySlug, number>;
+} {
+  const byCategory = new Map<SalgskanalCategorySlug, any[]>();
+  for (const slug of SALGSKANAL_CATEGORY_SLUGS) byCategory.set(slug, []);
+  const counts = Object.fromEntries(
+    SALGSKANAL_CATEGORY_SLUGS.map((s) => [s, 0]),
+  ) as Record<SalgskanalCategorySlug, number>;
+
+  try {
+    const agents = preloadedAgents ?? marketplaceRegistry.getActiveAgents();
+    const byId = new Map<string, any>(agents.map((a: any) => [a.id, a]));
+    const rows = getDb()
+      .prepare("SELECT agent_id, category_slug FROM agent_salgskanal")
+      .all() as Array<{ agent_id: string; category_slug: string }>;
+    for (const r of rows) {
+      if (!isSalgskanalSlug(r.category_slug)) continue;
+      const a = byId.get(r.agent_id);
+      if (!a) continue; // tagged but no longer active/discoverable
+      byCategory.get(r.category_slug)!.push(a);
+    }
+    for (const slug of SALGSKANAL_CATEGORY_SLUGS) {
+      const list = byCategory.get(slug)!;
+      // Verified first, then trust desc, then name — same ordering intent as
+      // the homepage featured sort, so the best-known producers lead.
+      list.sort((x: any, y: any) => {
+        if (x.isVerified && !y.isVerified) return -1;
+        if (!x.isVerified && y.isVerified) return 1;
+        const dt = (y.trustScore || 0) - (x.trustScore || 0);
+        if (dt !== 0) return dt;
+        return String(x.name || "").localeCompare(String(y.name || ""), "nb");
+      });
+      counts[slug] = list.length;
+    }
+  } catch (e) {
+    // Defensive: pre-migration dev DBs may lack the table — degrade to empty
+    // (the homepage section render-gates on count > 0, so it just disappears).
+    console.warn("[seo salgskanal] member load failed:", e);
+  }
+  return { byCategory, counts };
+}
+
+/** Homepage "browse by sales channel" section. Render-gated: categories with
+ *  zero live members are dropped, and the whole section disappears if none
+ *  have members (so a thin cohort never shows a dead card — dev-request risk
+ *  #2). Sorted largest-cohort-first per the dev-request's sizing note. */
+function buildSalgskanalHomeSection(
+  counts: Record<SalgskanalCategorySlug, number>,
+  lang: Lang,
+): string {
+  const cards = [...SALGSKANAL_CATEGORY_SLUGS]
+    .filter((slug) => (counts[slug] || 0) > 0)
+    .sort((a, b) => (counts[b] || 0) - (counts[a] || 0))
+    .map((slug) => {
+      const n = counts[slug] || 0;
+      return `<a href="${localizedPath("/kategori/" + slug, lang)}" class="cat-card">
+          <span class="cat-emoji">${SALGSKANAL_DISPLAY[slug].emoji}</span>
+          <div class="cat-name">${escapeHtml(SALGSKANAL_CATEGORY_NAMES[slug])}</div>
+          <div class="cat-count">${n} ${escapeHtml(t(lang, "home.cats_count_suffix"))}</div>
+        </a>`;
+    })
+    .join("");
+  if (!cards) return "";
+
+  const label = lang === "en" ? "Ways to buy" : "Slik får du varene";
+  const title = lang === "en" ? "Browse by sales channel" : "Bla etter salgskanal";
+  const sub = lang === "en"
+    ? "Find producers by how you get the goods — self-picking, farm shop, home delivery, café, or REKO-ring."
+    : "Finn produsenter etter hvordan du får tak i varene — selvplukk, gårdsbutikk, hjemlevering, kafé eller REKO-ring.";
+  return `
+    <section class="cats-section" style="background:var(--white);">
+      <div class="sh" style="max-width:1100px;margin:0 auto 28px;">
+        <div class="sh-label">${escapeHtml(label)}</div>
+        <div class="sh-title">${escapeHtml(title)}</div>
+        <div class="sh-sub">${escapeHtml(sub)}</div>
+      </div>
+      <div class="cats-grid">${cards}</div>
+    </section>`;
+}
 
 // Exported for unit tests (translation-completeness sweep).
 export function formatCat(cat: string): string {
@@ -374,7 +510,7 @@ function shell(
       </div>
       <div class="ft-col">
         <h4>${escapeHtml(t(lang, "footer.platform"))}</h4>
-        <a href="${localizedPath("/sok", lang)}">${escapeHtml(t(lang, "footer.search_producers"))}</a><a href="${localizedPath("/teknologi", lang)}">${escapeHtml(t(lang, "footer.how_it_works"))}</a><a href="${localizedPath("/om", lang)}">${escapeHtml(t(lang, "footer.about_link"))}</a><a href="${localizedPath("/personvern", lang)}">${escapeHtml(t(lang, "footer.privacy"))}</a><a href="/kontakt">${lang === "en" ? "Contact us" : "Kontakt oss"}</a>
+        <a href="${localizedPath("/sok", lang)}">${escapeHtml(t(lang, "footer.search_producers"))}</a><a href="${localizedPath("/kategori", lang)}">${lang === "en" ? "Sales channels" : "Salgskanaler"}</a><a href="${localizedPath("/teknologi", lang)}">${escapeHtml(t(lang, "footer.how_it_works"))}</a><a href="${localizedPath("/om", lang)}">${escapeHtml(t(lang, "footer.about_link"))}</a><a href="${localizedPath("/personvern", lang)}">${escapeHtml(t(lang, "footer.privacy"))}</a><a href="/kontakt">${lang === "en" ? "Contact us" : "Kontakt oss"}</a>
       </div>
       <div class="ft-col">
         <h4>${escapeHtml(t(lang, "footer.for_producers"))}</h4>
@@ -968,6 +1104,12 @@ router.get("/", (req: Request, res: Response) => {
       console.warn("[seo /] umbrella discovery query failed:", umbErr);
     }
 
+    // dev-request 2026-07-06-rfb-salgskanal-kategorier (public slice): homepage
+    // "browse by sales channel" section. Reuses the already-loaded `agents` so
+    // no second registry scan. Render-gates itself on live membership counts.
+    const { counts: salgskanalCounts } = loadSalgskanalMembers(agents);
+    const salgskanalSectionHtml = buildSalgskanalHomeSection(salgskanalCounts, lang);
+
     const uniqueCities = Object.keys(cityCounts).length;
 
     const jsonLd = {
@@ -1059,6 +1201,7 @@ router.get("/", (req: Request, res: Response) => {
       </div>
       <div class="cities-grid">${cityCards}</div>
     </section>
+${salgskanalSectionHtml}
 ${umbrellaSectionHtml}
     <section class="sec" style="background:var(--white);">
       <div class="sh">
@@ -2299,6 +2442,190 @@ const CITY_CSS = `
   @media (max-width: 768px) { .city-grid { grid-template-columns: 1fr; } }
 `;
 
+// ═══════════════════════════════════════════════════════════════
+// GET /kategori and /kategori/:slug — Salgskanal (sales-channel) pages
+// dev-request 2026-07-06-rfb-salgskanal-kategorier, public-facing slice
+// (work item 3). Browsable by HOW you get the goods; membership is the
+// auto-derived agent_salgskanal set (work items 1-2, already shipped).
+// ═══════════════════════════════════════════════════════════════
+
+const SALGSKANAL_CSS = `
+  .sk-hero { background: var(--green-50); padding: 40px 24px 28px; }
+  .sk-hero .container { max-width: 1100px; margin: 0 auto; }
+  .sk-hero .sk-emoji { font-size: 2.6rem; display: block; margin-bottom: 8px; }
+  .sk-hero h1 { font-size: 1.9rem; font-weight: 800; color: var(--charcoal); margin-bottom: 8px; }
+  .sk-hero p { color: var(--g600, #4b5563); font-size: 1rem; max-width: 640px; }
+  .sk-count { display: inline-block; margin-top: 12px; padding: 4px 12px; background: var(--white); border: 1px solid var(--g100); border-radius: 14px; font-size: 0.85rem; font-weight: 600; color: var(--green-700); }
+  .sk-crumbs { max-width: 1100px; margin: 0 auto; padding: 14px 24px 0; font-size: 0.82rem; color: var(--g500); }
+  .sk-crumbs a { color: var(--green-700); text-decoration: none; }
+  .sk-grid { max-width: 1100px; margin: 0 auto; padding: 28px 24px 56px; display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 16px; }
+  .sk-empty { max-width: 640px; margin: 0 auto; padding: 48px 24px; text-align: center; color: var(--g500); }
+  .sk-index-grid { max-width: 1100px; margin: 0 auto; padding: 28px 24px 56px; display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap: 16px; }
+  .sk-cat-card { background: var(--white); border-radius: var(--r-lg); padding: 22px 20px; border: 1px solid var(--g100); transition: all 0.3s; text-decoration: none; color: var(--charcoal); display: block; }
+  .sk-cat-card:hover { transform: translateY(-2px); box-shadow: var(--shadow-md); border-color: var(--green-100); text-decoration: none; }
+  .sk-cat-emoji { font-size: 2rem; display: block; margin-bottom: 8px; }
+  .sk-cat-name { font-weight: 700; font-size: 1.05rem; margin-bottom: 4px; }
+  .sk-cat-desc { font-size: 0.82rem; color: var(--g500); line-height: 1.4; margin-bottom: 8px; }
+  .sk-cat-count { font-size: 0.78rem; font-weight: 600; color: var(--green-700); }
+  @media (max-width: 768px) { .sk-grid { grid-template-columns: 1fr; } }
+`;
+
+// GET /kategori — index of all sales-channel categories.
+router.get("/kategori", (req: Request, res: Response) => {
+  const lang = req.lang;
+  try {
+    const { byCategory, counts } = loadSalgskanalMembers();
+    const ordered = [...SALGSKANAL_CATEGORY_SLUGS].sort(
+      (a, b) => (counts[b] || 0) - (counts[a] || 0),
+    );
+
+    const cards = ordered
+      .map((slug) => {
+        const d = SALGSKANAL_DISPLAY[slug];
+        const n = counts[slug] || 0;
+        const intro = lang === "en" ? d.introEn : d.introNo;
+        const countLabel = lang === "en"
+          ? `${n} producer${n === 1 ? "" : "s"}`
+          : `${n} produsent${n === 1 ? "" : "er"}`;
+        return `<a href="${localizedPath("/kategori/" + slug, lang)}" class="sk-cat-card">
+          <span class="sk-cat-emoji">${d.emoji}</span>
+          <div class="sk-cat-name">${escapeHtml(SALGSKANAL_CATEGORY_NAMES[slug])}</div>
+          <div class="sk-cat-desc">${escapeHtml(intro)}</div>
+          <div class="sk-cat-count">${escapeHtml(countLabel)} →</div>
+        </a>`;
+      })
+      .join("");
+
+    const title = lang === "en"
+      ? "Sales channels — how to buy local food | " + getConfig().display_name
+      : "Salgskanaler — slik får du varene | " + getConfig().display_name;
+    const desc = lang === "en"
+      ? "Browse Norwegian food producers by sales channel: self-picking, farm shop, home delivery, farm café, and REKO-ring."
+      : "Bla i norske matprodusenter etter salgskanal: selvplukk, gårdsbutikk, hjemlevering, gårdskafé og REKO-ring.";
+    const h1 = lang === "en" ? "Browse by sales channel" : "Bla etter salgskanal";
+    const lede = lang === "en"
+      ? "Find local producers by how you actually get the goods — not just what they sell."
+      : "Finn lokale produsenter etter hvordan du faktisk får tak i varene — ikke bare hva de selger.";
+
+    const jsonLd = {
+      "@context": "https://schema.org",
+      "@type": "CollectionPage",
+      name: h1,
+      description: desc,
+      url: BASE_URL + localizedPath("/kategori", lang),
+      hasPart: ordered.map((slug) => ({
+        "@type": "CollectionPage",
+        name: SALGSKANAL_CATEGORY_NAMES[slug],
+        url: BASE_URL + localizedPath("/kategori/" + slug, lang),
+      })),
+    };
+
+    const content = `
+    <section class="sk-hero">
+      <div class="container">
+        <h1>${escapeHtml(h1)}</h1>
+        <p>${escapeHtml(lede)}</p>
+      </div>
+    </section>
+    <div class="sk-index-grid">${cards}</div>`;
+
+    void byCategory; // members not needed on the index page
+    res.send(shell(title, desc, content, {
+      canonical: BASE_URL + localizedPath("/kategori", lang),
+      jsonLd,
+      extraCss: SALGSKANAL_CSS,
+      lang,
+      pathForAlternate: "/kategori",
+    }));
+  } catch (err) {
+    console.error("SEO /kategori error:", err);
+    res.status(500).send(lang === "en" ? "Internal error" : "Intern feil");
+  }
+});
+
+// GET /kategori/:slug — producers in one sales-channel category.
+router.get("/kategori/:slug", (req: Request, res: Response) => {
+  const lang = req.lang;
+  const slug = String(req.params.slug || "").toLowerCase();
+
+  if (!isSalgskanalSlug(slug)) {
+    return res.status(404).send(shell(
+      lang === "en" ? "Unknown category" : "Ukjent kategori",
+      lang === "en" ? "Unknown sales-channel category." : "Ukjent salgskanal-kategori.",
+      `<div class="sk-empty">
+        <h1 style="font-size:1.6rem;margin-bottom:12px;">${lang === "en" ? "Unknown category" : "Ukjent kategori"} “${escapeHtml(slug)}”</h1>
+        <p><a href="${localizedPath("/kategori", lang)}">${lang === "en" ? "See all sales channels" : "Se alle salgskanaler"}</a></p>
+      </div>`,
+      { robots: "noindex, follow", lang },
+    ));
+  }
+
+  try {
+    const { byCategory, counts } = loadSalgskanalMembers();
+    const members = byCategory.get(slug) || [];
+    const n = counts[slug] || 0;
+    const d = SALGSKANAL_DISPLAY[slug];
+    const name = SALGSKANAL_CATEGORY_NAMES[slug];
+    const intro = lang === "en" ? d.introEn : d.introNo;
+
+    const countLabel = lang === "en"
+      ? `${n} producer${n === 1 ? "" : "s"}`
+      : `${n} produsent${n === 1 ? "" : "er"}`;
+
+    const cards = members.map((a: any) => producerCard(a, undefined, lang)).join("");
+    const body = members.length > 0
+      ? `<div class="sk-grid">${cards}</div>`
+      : `<div class="sk-empty"><p>${lang === "en"
+          ? "No producers listed here yet — this page fills in automatically as producers mention this channel in their profile."
+          : "Ingen produsenter her ennå — siden fylles automatisk etter hvert som produsenter nevner denne kanalen i profilen sin."}</p></div>`;
+
+    const title = `${name} — ${countLabel} | ${getConfig().display_name}`;
+    const metaDesc = `${intro} ${countLabel}.`;
+
+    const jsonLd = {
+      "@context": "https://schema.org",
+      "@type": "CollectionPage",
+      name,
+      description: intro,
+      url: BASE_URL + localizedPath("/kategori/" + slug, lang),
+      mainEntity: {
+        "@type": "ItemList",
+        numberOfItems: members.length,
+        itemListElement: members.slice(0, 100).map((a: any, i: number) => ({
+          "@type": "ListItem",
+          position: i + 1,
+          url: BASE_URL + localizedPath("/produsent/" + slugify(a.name), lang),
+          name: a.name,
+        })),
+      },
+    };
+
+    const crumbLabel = lang === "en" ? "Sales channels" : "Salgskanaler";
+    const content = `
+    <div class="sk-crumbs"><a href="${localizedPath("/kategori", lang)}">${escapeHtml(crumbLabel)}</a> › ${escapeHtml(name)}</div>
+    <section class="sk-hero">
+      <div class="container">
+        <span class="sk-emoji">${d.emoji}</span>
+        <h1>${escapeHtml(name)}</h1>
+        <p>${escapeHtml(intro)}</p>
+        <div class="sk-count">${escapeHtml(countLabel)}</div>
+      </div>
+    </section>
+    ${body}`;
+
+    res.send(shell(title, metaDesc, content, {
+      canonical: BASE_URL + localizedPath("/kategori/" + slug, lang),
+      jsonLd,
+      extraCss: SALGSKANAL_CSS,
+      lang,
+      pathForAlternate: "/kategori/" + slug,
+    }));
+  } catch (err) {
+    console.error("SEO /kategori/:slug error:", err);
+    res.status(500).send(lang === "en" ? "Internal error" : "Intern feil");
+  }
+});
+
 router.get("/:city", (req: Request, res: Response, next: any) => {
   const citySlug = (req.params.city as string).toLowerCase();
 
@@ -2313,6 +2640,7 @@ router.get("/:city", (req: Request, res: Response, next: any) => {
       || citySlug === `${INDEXNOW_KEY}.txt`
       || citySlug === "agents" || citySlug === "docs" || citySlug === "samtaler" || citySlug === "samtale"
       || citySlug === "en" || citySlug === "no" || citySlug === "kontakt"
+      || citySlug === "kategori"
       || citySlug.includes(".")) {
     return next();
   }
@@ -4345,6 +4673,20 @@ router.get("/sitemap.xml", (_req: Request, res: Response) => {
     }
 
     for (const p of corePaths) addEntry(p, coreFreq[p] || "monthly", corePriorities[p]!, today);
+
+    // dev-request 2026-07-06-rfb-salgskanal-kategorier (public slice): the
+    // sales-channel index + one page per category that currently has live
+    // members (empty categories are omitted so the sitemap doesn't list a
+    // thin/near-empty page).
+    try {
+      addEntry("/kategori", "weekly", "0.7", today);
+      const { counts: skCounts } = loadSalgskanalMembers();
+      for (const slug of SALGSKANAL_CATEGORY_SLUGS) {
+        if ((skCounts[slug] || 0) > 0) addEntry(`/kategori/${slug}`, "weekly", "0.6", today);
+      }
+    } catch (e) {
+      console.error("[sitemap] salgskanal entries failed:", e);
+    }
 
     // City lastmod = newest producer update in that city. Stamping ~370 city
     // pages with "today" on every request made lastmod meaningless — and a
