@@ -24683,8 +24683,13 @@ console.log("\n── site-quality: homepage cat-name labels (sq-homepage-catlab
   );
 
   // Host-isolation: Norwegian homepage must not leak rfb/dental identity.
-  assertTrue(!/Rett fra Bonden/i.test(bodyHL), "sq-homepage-catlabel-06: no rfb leak");
-  assertTrue(!/tannlege/i.test(bodyHL), "sq-homepage-catlabel-07: no dental leak");
+  // Exception (dev-request 2026-07-21-analytics-tre-boetter-…-a2a-transparens
+  // slice C): the deliberate A2A network strip cross-links the sibling sites
+  // (rettfrabonden.com / finn-tannlege.com) — strip it before the leak check
+  // so the guard still catches any ACCIDENTAL identity bleed elsewhere.
+  const bodyHLNoNet = bodyHL.replace(/<div class="network-strip">[\s\S]*?<\/div>/g, "");
+  assertTrue(!/Rett fra Bonden/i.test(bodyHLNoNet), "sq-homepage-catlabel-06: no rfb leak");
+  assertTrue(!/tannlege/i.test(bodyHLNoNet), "sq-homepage-catlabel-07: no dental leak");
 
   if (prevPathHL === undefined) delete process.env.EXPERIENCES_DB_PATH;
   else process.env.EXPERIENCES_DB_PATH = prevPathHL;
@@ -24805,9 +24810,11 @@ console.log("\n── site-quality: category card icons (sq-caticon) ──");
     "sq-caticon-06: natur_friluft card does NOT use old compass fallback (r=\"9\")"
   );
 
-  // Host-isolation.
-  assertTrue(!/Rett fra Bonden/i.test(body), "sq-caticon-07: no rfb leak");
-  assertTrue(!/tannlege/i.test(body), "sq-caticon-08: no dental leak");
+  // Host-isolation. Same network-strip exception as sq-homepage-catlabel-06/
+  // 07 (dev-request 2026-07-21 slice C: deliberate A2A sibling-site links).
+  const bodyNoNet = body.replace(/<div class="network-strip">[\s\S]*?<\/div>/g, "");
+  assertTrue(!/Rett fra Bonden/i.test(bodyNoNet), "sq-caticon-07: no rfb leak");
+  assertTrue(!/tannlege/i.test(bodyNoNet), "sq-caticon-08: no dental leak");
 
   if (prevPath === undefined) delete process.env.EXPERIENCES_DB_PATH;
   else process.env.EXPERIENCES_DB_PATH = prevPath;
