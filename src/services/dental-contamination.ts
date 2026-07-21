@@ -24,6 +24,15 @@
 // built on the same per-field checkers below, so they can never drift out of
 // agreement about what counts as contaminated.
 
+// Ids reserved for schema/write-path probes — real clinic rows must never be
+// a target for test-fingerprint payloads, and conversely these ids are
+// EXPECTED to legitimately carry the fingerprint (the hourly enrichment
+// worker's own schema probe writes it here on purpose, every cycle, to
+// exercise the write path) — a sweep/repair pass must exclude them, not
+// flag or "fix" a deliberately-fake row. Single source of truth: dental.ts's
+// PUT /agents/:id guard and the schema-probe-sweep route both import this.
+export const DENTAL_SYNTHETIC_PROBE_IDS = new Set(["persistence-probe-pr100b"]);
+
 // Parses `value` if it's a string (the RAW DB TEXT-column shape); returns it
 // unchanged otherwise (the already-parsed PUT-body shape). A malformed JSON
 // string parses to `undefined`, which every per-field checker below treats

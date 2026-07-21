@@ -40,7 +40,7 @@ import {
 } from "../services/dental-store";
 import { getDb } from "../database/db-factory";
 import { isDisplayablePhone } from "../services/contact-normalizer";
-import { isTestFingerprintPayload } from "../services/dental-contamination";
+import { isTestFingerprintPayload, DENTAL_SYNTHETIC_PROBE_IDS } from "../services/dental-contamination";
 import { mergeFieldProvenance } from "./admin-knowledge";
 import {
   placesPeriodsToOpeningHours,
@@ -232,14 +232,11 @@ router.post("/agents", requireAdmin, (req: Request, res: Response) => {
 // contamination fingerprint UNLESS the target id is an explicitly
 // allow-listed synthetic/sandboxed probe id.
 //
-// Ids reserved for schema/write-path probes — real clinic rows must never
-// be a target for test-fingerprint payloads.
-const DENTAL_SYNTHETIC_PROBE_IDS = new Set(["persistence-probe-pr100b"]);
-
-// isTestFingerprintPayload moved to ../services/dental-contamination (2026-07-21
-// schema-probe-sweep follow-up) — it's now the single source of truth shared
-// with the read-side repair sweep (admin-dental-schema-probe-sweep.ts), which
-// needs to agree on the exact same per-field literal matches. See that
+// DENTAL_SYNTHETIC_PROBE_IDS + isTestFingerprintPayload moved to
+// ../services/dental-contamination (2026-07-21 schema-probe-sweep follow-up)
+// — both are now the single source of truth shared with the read-side
+// repair sweep (admin-dental-schema-probe-sweep.ts), which needs to agree
+// on the exact same reserved ids and per-field literal matches. See that
 // module's doc comment for the full fingerprint definition.
 
 // ─── PUT /api/tannlege/agents/:id (admin) ───────────────────────────
