@@ -27037,6 +27037,26 @@ Promise.allSettled(_oaHomeCountersDeps).then(async () => {
     for (const f of gwd.failures) failures.push("opplevelser-gardssalg-website-discovery: " + f);
     console.log(`  opplevelser-gardssalg-website-discovery: ${gwd.passed} passed, ${gwd.failed} failed`);
 
+    // dev-request 2026-07-12-experiences-enrichment-supply-and-aggregator-
+    // hygiene, Daniel's decision, step 2, evidence-leg (a): POST /admin/
+    // listing-homepage-discovery (fetch a provider's listing_url — the DMO/
+    // aggregator catalog page step 1 moved hjemmeside into, find the
+    // provider's OWN outbound website link on it, verify the provider's name
+    // on that candidate page, park verified candidates in
+    // experience_homepage_review_queue — never written directly) + POST
+    // /admin/listing-homepage-review-approve (the human-gated adoption
+    // lever, sharing writeProviderHjemmeside with PATCH
+    // /admin/providers/:id/hjemmeside). Same in-memory-DB pattern, runs
+    // sequentially inside this same gated block for the same reason.
+    console.log("\n── opplevelser-listing-homepage-discovery: steg 2, bevis-ben (a) — listing-side lenke ──");
+    const { runOpplevelserListingHomepageDiscoveryTests } = require("../src/routes/opplevelser-listing-homepage-discovery.test") as
+      typeof import("../src/routes/opplevelser-listing-homepage-discovery.test");
+    const lhd = await runOpplevelserListingHomepageDiscoveryTests(false);
+    passed += lhd.passed;
+    failed += lhd.failed;
+    for (const f of lhd.failures) failures.push("opplevelser-listing-homepage-discovery: " + f);
+    console.log(`  opplevelser-listing-homepage-discovery: ${lhd.passed} passed, ${lhd.failed} failed`);
+
     // dev-request 2026-07-20-gardssalg-mcp-discoverability: the gårdssalg
     // vertical had zero presence in the agent-facing MCP surface —
     // list_experience_categories never mentioned it, and there was no tool
