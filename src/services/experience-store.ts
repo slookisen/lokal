@@ -2558,6 +2558,199 @@ export function applyGardssalgProviderContent(
   return written;
 }
 
+// ─── Gårdssalg retroactive quality-gate scan (dev-request 2026-07-20-
+//     gardssalg-kvalitetsgate-redesign, criterion 6) ────────────────────────
+//
+// Criteria 1-5 of this dev-request only apply the new extraction+judge gate
+// (extractProseText's structure-aware extraction + meetsGardssalgAboutQuality
+// Bar's cheap-bar+LLM-judge cascade) going FORWARD, to fresh candidates a
+// content-refresh run derives. Rows whose about_text/visit_text was written
+// BEFORE this gate existed (or by a run that only had the fresh-candidate-
+// gated version of the current-value check — see applyGardssalgProviderContent's
+// currentValueContaminated doc comment) are never revisited by that forward-
+// only path. This is the retroactive sweep: judge the CURRENTLY STORED value
+// of every non-locked gårdssalg row against the SAME gate, and null out
+// whatever no longer clears it — backed by the exact same
+// gardssalg_content_audit + field_provenance write discipline as every other
+// gårdssalg writer in this file, so POST /admin/gardssalg-content-rollback
+// (which restores from gardssalg_content_audit's old_value; see that
+// endpoint's doc comment in routes/opplevelser.ts) undoes it with zero
+// changes needed on the rollback side — about_text/visit_text are already in
+// GARDSSALG_ROLLBACKABLE_FIELDS.
+
+export type GardssalgRetroScanTarget = {
+  id: string;
+  navn: string;
+  hjemmeside: string;
+  content_source: string | null;
+  about_text: string | null;
+  visit_text: string | null;
+};
+
+/**
+ * Auto-select gårdssalg providers in scope for the retroactive scan:
+ * gårdssalg providers (producer_type set OR rfb-seed) WITH a website, NOT
+ * locked (content_source not in manual/claim — the dev-request's "excluding
+ * only content_source IN ('manual','claim')" clause). Deliberately does NOT
+ * filter on catalog_hidden — the dev-request explicitly requires "both
+ * visible AND hidden" rows in scope, unlike
+ * selectGardssalgProvidersForAddressEnrichment's catalog_hidden exclusion
+ * above. Deliberately does NOT filter on whether about_text/visit_text is
+ * blank/thin either — unlike selectGardssalgProvidersForContentRefresh, this
+ * is a full retroactive sweep, not a "only rows with an obvious gap" queue;
+ * a row whose about_text/visit_text is already blank is simply a no-op once
+ * selected (nothing to judge/null). Ordered oldest-created first — there is
+ * no dedicated retro-scan attempt timestamp (out of scope for this one-shot
+ * sweep, mirrors selectGardssalgProvidersForAddressEnrichment's own choice
+ * of created_at ASC over adding a new column). Hard-capped at 48 — there are
+ * only 48 gårdssalg providers total.
+ */
+export function selectGardssalgProvidersForRetroScan(limit = 48): GardssalgRetroScanTarget[] {
+  const db = getDb(VERTICAL);
+  const cap = Math.max(1, Math.min(48, limit));
+  return db
+    .prepare(
+      `SELECT id, navn, TRIM(hjemmeside) AS hjemmeside, content_source, about_text, visit_text
+         FROM experience_providers
+        WHERE (producer_type IS NOT NULL OR rfb_seed_source = 'rfb-seed')
+          AND hjemmeside IS NOT NULL AND TRIM(hjemmeside) != ''
+          AND (content_source IS NULL OR content_source NOT IN ('manual','claim'))
+        ORDER BY created_at ASC
+        LIMIT ?`
+    )
+    .all(cap) as GardssalgRetroScanTarget[];
+}
+
+/**
+ * Resolve an explicit providerId for the retro-scan's `providerIds`
+ * override. Scoped to the gårdssalg WHERE clause (producer_type set OR
+ * rfb-seed) — NOT the lock filter above, so an explicitly-requested locked
+ * provider still resolves to a target (and is then reported in
+ * skipped_locked by the route's own in-code check, same convention as
+ * getGardssalgProviderContentTarget/getGardssalgProviderAddressTarget).
+ * Returns null when the provider doesn't exist, isn't a gårdssalg provider,
+ * or has no usable website.
+ */
+export function getGardssalgProviderRetroScanTarget(providerId: string): GardssalgRetroScanTarget | null {
+  const db = getDb(VERTICAL);
+  const row = db
+    .prepare(
+      `SELECT id, navn, TRIM(hjemmeside) AS hjemmeside, content_source, about_text, visit_text
+         FROM experience_providers
+        WHERE id = ?
+          AND (producer_type IS NOT NULL OR rfb_seed_source = 'rfb-seed')`
+    )
+    .get(providerId) as GardssalgRetroScanTarget | undefined;
+  if (!row || !row.hjemmeside || row.hjemmeside.trim().length === 0) return null;
+  return row;
+}
+
+/**
+ * Null a set of about_text/visit_text fields on ONE gårdssalg provider
+ * because the retro-scan (POST /admin/gardssalg-retro-scan,
+ * routes/opplevelser.ts) judged the CURRENTLY STORED value as no longer
+ * clearing the gårdssalg quality gate. Mirrors applyGardssalgProviderContent's
+ * exact write discipline so the row stays reversible via the existing
+ * /admin/gardssalg-content-rollback lever (no new rollback mechanism):
+ *   - lock re-checked against a FRESH row snapshot (defense in depth — the
+ *     caller already checked the target's pre-fetch snapshot, but a row
+ *     could in principle have been claimed between selection and this
+ *     write); a locked row writes nothing.
+ *   - content_source/content_evidence_url/content_updated_at stamped in the
+ *     SAME UPDATE as the field nulls, only when >=1 field is actually
+ *     nulled (a no-op write stamps nothing) — identical convention to
+ *     applyGardssalgProviderContent.
+ *   - one gardssalg_content_audit row per field actually nulled (old_value =
+ *     the contaminated value just cleared, new_value = NULL), so
+ *     planGardssalgContentRollback/applyGardssalgContentRollback (unchanged)
+ *     can restore it.
+ *   - field_provenance entries for nulled fields are REMOVED (read-modify-
+ *     write, preserves other fields' entries) — a blank field has no source
+ *     backing it any more.
+ * A field already blank is left alone (nothing to null); a provider with
+ * nothing to null across the requested fields writes nothing and returns [].
+ */
+export function applyGardssalgRetroScanNull(
+  providerId: string,
+  fields: Array<"about_text" | "visit_text">,
+  evidenceUrl: string,
+  batchId?: string
+): string[] {
+  const db = getDb(VERTICAL);
+  const row = db
+    .prepare(`SELECT id, content_source, about_text, visit_text, field_provenance FROM experience_providers WHERE id = ?`)
+    .get(providerId) as
+    | {
+        id: string;
+        content_source: string | null;
+        about_text: string | null;
+        visit_text: string | null;
+        field_provenance: string | null;
+      }
+    | undefined;
+  if (!row) return [];
+  if (row.content_source === "manual" || row.content_source === "claim") return [];
+
+  const oldValues: Record<string, string | null> = { about_text: row.about_text, visit_text: row.visit_text };
+  const sets: string[] = [];
+  const params: Record<string, unknown> = { id: providerId };
+  const written: string[] = [];
+
+  for (const f of fields) {
+    const current = oldValues[f];
+    if (current === null || current === undefined || String(current).trim() === "") continue; // already blank — nothing to null
+    sets.push(`${f} = NULL`);
+    written.push(f);
+  }
+  if (written.length === 0) return [];
+
+  sets.push("content_source = 'provider_site'");
+  sets.push("content_evidence_url = @evidence_url");
+  sets.push("content_updated_at = datetime('now')");
+  params.evidence_url = evidenceUrl;
+
+  // field_provenance merge — remove the entry for each nulled field (no
+  // source backs a blank value any more), preserving every OTHER field's
+  // entry (read-modify-write, never clobbers).
+  let provenance: Record<string, { source_url: string; fetched_at: string }> = {};
+  if (row.field_provenance) {
+    try {
+      const parsed = JSON.parse(row.field_provenance);
+      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+        provenance = parsed as Record<string, { source_url: string; fetched_at: string }>;
+      }
+    } catch {
+      /* malformed existing JSON -> treat as empty rather than clobber the write */
+    }
+  }
+  for (const f of written) delete provenance[f];
+  sets.push("field_provenance = @field_provenance");
+  params.field_provenance = JSON.stringify(provenance);
+
+  const applyWithAudit = db.transaction(() => {
+    db.prepare(`UPDATE experience_providers SET ${sets.join(", ")} WHERE id = @id`).run(params);
+    const insertAudit = db.prepare(
+      `INSERT INTO gardssalg_content_audit
+         (id, provider_id, field_name, old_value, new_value, source_url, batch_id, changed_by, changed_at)
+       VALUES (@id, @provider_id, @field_name, @old_value, @new_value, @source_url, @batch_id, 'system', datetime('now'))`
+    );
+    for (const f of written) {
+      insertAudit.run({
+        id: uuid(),
+        provider_id: providerId,
+        field_name: f,
+        old_value: oldValues[f] ?? null,
+        new_value: null,
+        source_url: evidenceUrl,
+        batch_id: batchId ?? null,
+      });
+    }
+  });
+  applyWithAudit();
+
+  return written;
+}
+
 // ─── Gårdssalg address enrichment (dev-request 2026-07-18-gardssalg-
 //     profilkvalitet-foer-outreach, slice 3) ─────────────────────────────────
 //

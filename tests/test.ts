@@ -26994,6 +26994,24 @@ Promise.allSettled(_oaHomeCountersDeps).then(async () => {
     for (const f of gfbr.failures) failures.push("opplevelser-gardssalg-fillblank: " + f);
     console.log(`  opplevelser-gardssalg-fillblank: ${gfbr.passed} passed, ${gfbr.failed} failed`);
 
+    // dev-request 2026-07-20-gardssalg-kvalitetsgate-redesign, criterion 6:
+    // the retroactive scan+null endpoint (POST /admin/gardssalg-retro-scan)
+    // that re-judges the CURRENTLY STORED about_text/visit_text of every
+    // non-locked gårdssalg row (visible AND hidden) against the SAME
+    // cheap-bar+LLM-judge gate criteria 1-4 apply to fresh candidates, and
+    // nulls whatever no longer clears it — reversible via the EXISTING,
+    // unmodified POST /admin/gardssalg-content-rollback. Same in-memory-DB
+    // pattern, runs sequentially inside this same gated block for the same
+    // reason.
+    console.log("\n── opplevelser-gardssalg-retro-scan: criterion 6 retroactive scan+null ──");
+    const { runOpplevelserGardssalgRetroScanTests } = require("../src/routes/opplevelser-gardssalg-retro-scan.test") as
+      typeof import("../src/routes/opplevelser-gardssalg-retro-scan.test");
+    const grsr = await runOpplevelserGardssalgRetroScanTests({ log: false });
+    passed += grsr.passed;
+    failed += grsr.failed;
+    for (const f of grsr.failures) failures.push("opplevelser-gardssalg-retro-scan: " + f);
+    console.log(`  opplevelser-gardssalg-retro-scan: ${grsr.passed} passed, ${grsr.failed} failed`);
+
     // dev-request 2026-07-18-gardssalg-profilkvalitet-foer-outreach, slice 5c:
     // fill-only extraction of the "products" JSON-array column —
     // generateGardssalgProductList() (routes/opplevelser.ts, mirrors
