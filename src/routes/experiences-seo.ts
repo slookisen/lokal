@@ -306,8 +306,11 @@ function homeStrings(lang: Lang) {
     quickAria: "Hurtigsøk", qNature: "Ute i naturen", qAll: "Alle opplevelser",
     trustAria: "Tillit og datakilder", trustBrreg: "Tilbydere verifisert mot Brønnøysundregistrene", trustFresh: "Innhold oppdatert fortløpende", trustMachine: "Maskinlesbar for AI-agenter",
     counterAria: "Opplevagent i tall",
-    counterPageviews: "Sidevisninger", counterUnique: "Unike besøkende", counterHumans: "Ekte mennesker", counterBots: "Bot &amp; AI-trafikk",
+    counterPageviews: "Sidevisninger", counterRealVisitors: "Ekte besøkende", counterAiSearch: "AI-søk", counterCrawlers: "Crawlere &amp; bots",
     counterExperiences: "Opplevelser", counterProviders: "Tilbydere", counterMunicipalities: "Kommuner",
+    counterAiExplain: "AI-søk: et menneske spurte ChatGPT, Claude eller Perplexity, og assistenten hentet informasjon fra oss i sanntid. Crawlere: automatisk indeksering og skraping.",
+    counterWindowPre: "Siste", counterWindowPost: "dager",
+    networkLabel: "En del av A2A-nettverket:", networkTagline: "Bygget for både mennesker og AI-agenter",
     catKicker: "Utforsk", catTitle: "Opplevelser etter kategori", catIntro: "Bla i kuraterte kategorier &mdash; eller la en AI-agent filtrere på vær, sesong, pris og gruppestørrelse for deg.", catAria: "Kategorier", catCount: "opplevelser", catSoon: "Kommer snart", catNote: "Eksempelkategorier &mdash; live opplevelser publiseres fortløpende.",
     fylkeKicker: "Steder", fylkeTitle: "Utforsk etter fylke", fylkeIntro: "Se hvor opplevelsene finnes &mdash; velg et fylke for en fullstendig oversikt.", fylkeAria: "Fylker",
     kommuneTitle: "Populære kommuner", kommuneAria: "Populære kommuner",
@@ -337,8 +340,11 @@ function homeStrings(lang: Lang) {
     quickAria: "Quick search", qNature: "Outdoors", qAll: "All experiences",
     trustAria: "Trust and data sources", trustBrreg: "Providers verified against the Norwegian business registry", trustFresh: "Content updated continuously", trustMachine: "Machine-readable for AI agents",
     counterAria: "Opplevagent in numbers",
-    counterPageviews: "Page views", counterUnique: "Unique visitors", counterHumans: "Real humans", counterBots: "Bot &amp; AI traffic",
+    counterPageviews: "Page views", counterRealVisitors: "Real visitors", counterAiSearch: "AI search", counterCrawlers: "Crawlers &amp; bots",
     counterExperiences: "Experiences", counterProviders: "Providers", counterMunicipalities: "Municipalities",
+    counterAiExplain: "AI search: a human asked ChatGPT, Claude or Perplexity, and the assistant fetched information from us in real time. Crawlers: automated indexing and scraping.",
+    counterWindowPre: "Last", counterWindowPost: "days",
+    networkLabel: "Part of the A2A network:", networkTagline: "Built for both humans and AI agents",
     catKicker: "Explore", catTitle: "Experiences by category", catIntro: "Browse curated categories &mdash; or let an AI agent filter by weather, season, price and group size for you.", catAria: "Categories", catCount: "experiences", catSoon: "Coming soon", catNote: "Example categories &mdash; live experiences are published continuously.",
     fylkeKicker: "Places", fylkeTitle: "Explore by county", fylkeIntro: "See where the experiences are &mdash; pick a county for a full overview.", fylkeAria: "Counties",
     kommuneTitle: "Popular municipalities", kommuneAria: "Popular municipalities",
@@ -371,7 +377,7 @@ router.get("/", (req: Request, res: Response) => {
   // for the exact scoping/exclusion rules this reuses from the RFB homepage
   // pattern). Read defensively — must never break the homepage.
   const numFmt = lang === "en" ? "en-US" : "nb-NO";
-  let counters = { pageViews: 0, uniqueVisitors: 0, realHumans: 0, botAndAi: 0, opplevelser: 0, tilbydere: 0, kommuner: 0 };
+  let counters = { pageViews: 0, uniqueVisitors: 0, realVisitors: 0, aiSearchViews: 0, botViews: 0, windowDays: 60, realHumans: 0, botAndAi: 0, opplevelser: 0, tilbydere: 0, kommuner: 0 };
   try {
     counters = getOaHomeCounters();
   } catch {
@@ -383,17 +389,23 @@ router.get("/", (req: Request, res: Response) => {
     <div class="counters-inner">
       <div class="counter-item"><div class="counter-val">${counters.pageViews.toLocaleString(numFmt)}</div><div class="counter-lbl">${S.counterPageviews}</div></div>
       <div class="counter-sep" aria-hidden="true"></div>
-      <div class="counter-item"><div class="counter-val">${counters.uniqueVisitors.toLocaleString(numFmt)}</div><div class="counter-lbl">${S.counterUnique}</div></div>
+      <div class="counter-item"><div class="counter-val">${counters.realVisitors.toLocaleString(numFmt)}</div><div class="counter-lbl">${S.counterRealVisitors}</div></div>
       <div class="counter-sep" aria-hidden="true"></div>
-      <div class="counter-item"><div class="counter-val">${counters.realHumans.toLocaleString(numFmt)}</div><div class="counter-lbl">${S.counterHumans}</div></div>
+      <div class="counter-item" title="${S.counterAiExplain}"><div class="counter-val counter-val-accent">${counters.aiSearchViews.toLocaleString(numFmt)}</div><div class="counter-lbl">${S.counterAiSearch}</div></div>
       <div class="counter-sep" aria-hidden="true"></div>
-      <div class="counter-item"><div class="counter-val counter-val-accent">${counters.botAndAi.toLocaleString(numFmt)}</div><div class="counter-lbl">${S.counterBots}</div></div>
+      <div class="counter-item"><div class="counter-val">${counters.botViews.toLocaleString(numFmt)}</div><div class="counter-lbl">${S.counterCrawlers}</div></div>
       <div class="counter-sep" aria-hidden="true"></div>
       <div class="counter-item"><div class="counter-val">${counters.opplevelser.toLocaleString(numFmt)}</div><div class="counter-lbl">${S.counterExperiences}</div></div>
       <div class="counter-sep" aria-hidden="true"></div>
       <div class="counter-item"><div class="counter-val">${counters.tilbydere.toLocaleString(numFmt)}</div><div class="counter-lbl">${S.counterProviders}</div></div>
       <div class="counter-sep" aria-hidden="true"></div>
       <div class="counter-item"><div class="counter-val">${counters.kommuner.toLocaleString(numFmt)}</div><div class="counter-lbl">${S.counterMunicipalities}</div></div>
+    </div>
+    <div class="counter-note">${S.counterAiExplain} &middot; ${S.counterWindowPre} ${counters.windowDays} ${S.counterWindowPost}</div>
+    <div class="network-strip">${S.networkLabel}
+      <a href="https://rettfrabonden.com" rel="noopener">rettfrabonden.com</a> &middot;
+      <a href="https://finn-tannlege.com" rel="noopener">finn-tannlege.com</a>
+      &mdash; ${S.networkTagline}
     </div>
   </div>`;
 
@@ -667,6 +679,10 @@ ${ldScripts}
   .counter-lbl{margin-top:3px;font-size:.68rem;font-weight:600;color:var(--mist);text-transform:uppercase;letter-spacing:.04em}
   .counter-sep{width:1px;height:26px;background:var(--line)}
   @media(max-width:640px){.counter-sep{display:none}}
+  .counter-note{max-width:var(--maxw);margin:0 auto;padding:0 24px 14px;text-align:center;font-size:.7rem;color:var(--mist);line-height:1.5}
+  .network-strip{max-width:var(--maxw);margin:0 auto;padding:0 24px 16px;text-align:center;font-size:.74rem;color:var(--mist)}
+  .network-strip a{color:var(--fjord-700);font-weight:600;text-decoration:none}
+  .network-strip a:hover{text-decoration:underline}
 
   /* ── SECTIONS ── */
   main{display:block}

@@ -230,7 +230,7 @@
             <strong>Ekskluder deg selv fra tallene?</strong> Du er ikke tagget som eier i denne nettleseren. <a href="#" id="ownerCookieAdd" style="color:#365314; font-weight:600;">Marker meg som eier</a> (gjelder kun denne nettleseren).
         </div>
 
-        <!-- Stat Cards (7 now) -->
+        <!-- Stat Cards (9 now) -->
         <div class="stat-grid">
             <div class="stat-card">
                 <div class="stat-label">Sidevisninger</div>
@@ -249,12 +249,22 @@
                 <div id="statAgentTraffic" class="stat-value yellow">—</div>
             </div>
             <div class="stat-card">
-                <div class="stat-label">Ekte mennesker</div>
+                <div class="stat-label">Ekte mennesker (økter)</div>
                 <div id="statHumans" class="stat-value green">—</div>
                 <div id="statHumansPct" class="stat-sub"></div>
             </div>
+            <div class="stat-card" title="Et menneske spurte ChatGPT, Claude eller Perplexity, og assistenten hentet informasjon fra oss i sanntid (*-User-agenter).">
+                <div class="stat-label">AI-søk (visninger)</div>
+                <div id="statAiSearch" class="stat-value purple">—</div>
+                <div id="statAiSearchPct" class="stat-sub"></div>
+            </div>
+            <div class="stat-card" title="Autonome AI-crawlere (GPTBot, ClaudeBot, PerplexityBot m.fl.) — ikke menneskestartet.">
+                <div class="stat-label">AI-crawlere (visninger)</div>
+                <div id="statAiCrawlers" class="stat-value yellow">—</div>
+                <div id="statAiCrawlersPct" class="stat-sub"></div>
+            </div>
             <div class="stat-card">
-                <div class="stat-label">Bot-trafikk</div>
+                <div class="stat-label">Bot-trafikk (ikke-AI)</div>
                 <div id="statBots" class="stat-value red">—</div>
                 <div id="statBotsPct" class="stat-sub"></div>
             </div>
@@ -655,15 +665,25 @@
         var agentTotal = (s.agentTraffic.chatgpt || 0) + (s.agentTraffic.claude || 0) + (s.agentTraffic.other || 0);
         document.getElementById("statAgentTraffic").textContent = fmtNum(agentTotal);
 
-        // Human/bot stats from classification
+        // Human/AI/bot stats from classification (shared traffic-classifier
+        // buckets). Units are labeled explicitly: the "Ekte mennesker" head-
+        // line is SESSIONS, the percentage subtitle is computed from VIEWS.
         var cl = classData.classification || {};
         var humanViews = (cl.human || {}).views || 0;
         var humanSessions = (cl.human || {}).sessions || 0;
+        var aiSearchViews = (cl.ai_search || {}).views || 0;
+        var aiCrawlerViews = (cl.ai_crawler || {}).views || 0;
+        // Non-AI bots: legacy bot bucket (search engines, SEO bots, social,
+        // other) + scanners. AI crawlers now have their own card.
         var botViews = ((cl.bot || {}).views || 0) + ((cl.scanner || {}).views || 0);
         var totalViews = classData.totalViews || s.pageViews || 1;
 
         document.getElementById("statHumans").textContent = fmtNum(humanSessions);
-        document.getElementById("statHumansPct").textContent = Math.round(humanViews / totalViews * 100) + "% av visninger";
+        document.getElementById("statHumansPct").textContent = Math.round(humanViews / totalViews * 100) + " % av sidevisninger er menneskelige";
+        document.getElementById("statAiSearch").textContent = fmtNum(aiSearchViews);
+        document.getElementById("statAiSearchPct").textContent = Math.round(aiSearchViews / totalViews * 100) + "% av visninger";
+        document.getElementById("statAiCrawlers").textContent = fmtNum(aiCrawlerViews);
+        document.getElementById("statAiCrawlersPct").textContent = Math.round(aiCrawlerViews / totalViews * 100) + "% av visninger";
         document.getElementById("statBots").textContent = fmtNum(botViews);
         document.getElementById("statBotsPct").textContent = Math.round(botViews / totalViews * 100) + "% av visninger";
 

@@ -53,7 +53,17 @@ import {
 export interface OaHomeCounters {
   pageViews: number;
   uniqueVisitors: number;
+  /** Unique HUMAN sessions — honest "ekte besøkende" (NOT views). */
+  realVisitors: number;
+  /** Page views from human-initiated AI retrieval (`*-User` agents). */
+  aiSearchViews: number;
+  /** All remaining non-human views (crawlers, search engines, dev, scanners). */
+  botViews: number;
+  /** Effective data window (days) = the auto-prune retention, runtime value. */
+  windowDays: number;
+  /** @deprecated alias of the traffic helper's humanViews (old name). */
   realHumans: number;
+  /** @deprecated old aggregate (aiSearchViews + botViews + aiQueries). */
   botAndAi: number;
   opplevelser: number;
   tilbydere: number;
@@ -96,6 +106,10 @@ export function getOaHomeCounters(): OaHomeCounters {
   const data: OaHomeCounters = {
     pageViews: traffic.pageViews,
     uniqueVisitors: traffic.uniqueVisitors,
+    realVisitors: traffic.realVisitors,
+    aiSearchViews: traffic.aiSearchViews,
+    botViews: traffic.botViews,
+    windowDays: traffic.windowDays,
     realHumans: traffic.realHumans,
     botAndAi: traffic.botAndAi,
     opplevelser,

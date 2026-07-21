@@ -689,6 +689,14 @@ router.get("/api/traffic-stats", (_req: Request, res: Response) => {
   res.json({
     pageViews: s.pageViews,
     uniqueVisitors: s.uniqueVisitors,
+    // New three-bucket fields (dev-request 2026-07-21 slice A)
+    realVisitors: s.realVisitors,
+    humanViews: s.humanViews,
+    aiSearchViews: s.aiSearchViews,
+    aiCrawlerViews: s.aiCrawlerViews,
+    botViews: s.botViews,
+    windowDays: s.windowDays,
+    // Back-compat fields (old consumers)
     realHumans: s.realHumans,
     botAndAi: s.botAndAi,
     aiQueries: s.aiQueries,
@@ -779,6 +787,10 @@ const LANDING_CSS = `
   .proof-val-purple { color: #7c3aed; }
   .proof-lbl { font-size: 0.68rem; color: var(--g500); margin-top: 3px; font-weight: 500; text-transform: uppercase; letter-spacing: 0.5px; }
   .proof-sep { width: 1px; height: 28px; background: var(--g200); }
+  .proof-note { max-width: 900px; margin: 10px auto 0; text-align: center; font-size: 0.7rem; color: var(--g500); line-height: 1.5; }
+  .network-strip { max-width: 900px; margin: 12px auto 0; text-align: center; font-size: 0.75rem; color: var(--g500); }
+  .network-strip a { color: var(--green-700); font-weight: 600; text-decoration: none; }
+  .network-strip a:hover { text-decoration: underline; }
   @media (max-width: 600px) {
     .proof-inner { gap: 18px; }
     .proof-val { font-size: 1.1rem; }
@@ -1027,19 +1039,25 @@ router.get("/", (req: Request, res: Response) => {
         </div>
         <div class="proof-sep"></div>
         <div class="proof-item">
-          <div class="proof-val">${traffic.uniqueVisitors.toLocaleString(numFmt)}</div>
-          <div class="proof-lbl">${escapeHtml(t(lang, "home.proof_unique"))}</div>
+          <div class="proof-val">${traffic.realVisitors.toLocaleString(numFmt)}</div>
+          <div class="proof-lbl">${escapeHtml(t(lang, "home.proof_real_visitors"))}</div>
+        </div>
+        <div class="proof-sep"></div>
+        <div class="proof-item" title="${escapeHtml(t(lang, "home.proof_ai_explain"))}">
+          <div class="proof-val proof-val-purple">${traffic.aiSearchViews.toLocaleString(numFmt)}</div>
+          <div class="proof-lbl">${escapeHtml(t(lang, "home.proof_ai_search"))}</div>
         </div>
         <div class="proof-sep"></div>
         <div class="proof-item">
-          <div class="proof-val">${traffic.realHumans.toLocaleString(numFmt)}</div>
-          <div class="proof-lbl">${escapeHtml(t(lang, "home.proof_humans"))}</div>
+          <div class="proof-val">${traffic.botViews.toLocaleString(numFmt)}</div>
+          <div class="proof-lbl">${escapeHtml(t(lang, "home.proof_crawlers"))}</div>
         </div>
-        <div class="proof-sep"></div>
-        <div class="proof-item">
-          <div class="proof-val proof-val-purple">${traffic.botAndAi.toLocaleString(numFmt)}</div>
-          <div class="proof-lbl">${escapeHtml(t(lang, "home.proof_bots"))}</div>
-        </div>
+      </div>
+      <div class="proof-note">${escapeHtml(t(lang, "home.proof_ai_explain"))} &middot; ${escapeHtml(t(lang, "home.proof_window", { days: traffic.windowDays }))}</div>
+      <div class="network-strip">${escapeHtml(t(lang, "home.network_label"))}
+        <a href="https://finn-tannlege.com" rel="noopener">finn-tannlege.com</a> &middot;
+        <a href="https://opplevagent.no" rel="noopener">opplevagent.no</a>
+        &mdash; ${escapeHtml(t(lang, "home.network_tagline"))}
       </div>
     </div>
 
