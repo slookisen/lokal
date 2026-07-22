@@ -97,6 +97,23 @@ export function sanitizeInput(req: Request, _res: Response, next: NextFunction) 
 // validation — Fly's edge proxy is trusted infrastructure.
 const sharedValidate = { trustProxy: false } as const;
 
+// ─── Consumer-key rate-limit differentiation ────────────────
+// dev-request 2026-07-13-agent-identity-usage-ledger, slice 1 (L4,
+// Daniel-authorized 2026-07-20). middleware/consumer-identity.ts attaches
+// `req.consumerKeyId` when a request presents a valid, active, voluntary
+// X-API-Key; a caller WITHOUT one leaves it undefined. express-rate-limit
+// v8's `max` accepts a per-request function (installed version: 8.3.2,
+// confirmed via package.json), which is the simplest correct mechanism here
+// — no second limiter instance/store needed.
+//
+// Regression-critical: for a request with no consumerKeyId, this function
+// returns EXACTLY `anonymousMax` — the same static number the limiter used
+// before this change existed. Nothing about the anonymous path's rate-limit
+// behavior changes; a keyed caller simply gets a materially higher ceiling.
+export function keyedMax(anonymousMax: number, keyedMax: number) {
+  return (req: Request): number => (req.consumerKeyId ? keyedMax : anonymousMax);
+}
+
 // ─── Rate Limiters ───────────────────────────────────────────
 
 // General API limiter — raised to 300/15min for enrichment runs (200 agents × ~2 req each)
@@ -108,7 +125,10 @@ const sharedValidate = { trustProxy: false } as const;
 // gate tannlege requests because both limiters would chain.
 export const generalLimiter = rateLimit({
   windowMs: 15 * 60 * 1000, // 15 minutes
-  max: 300,
+  // dev-request 2026-07-13-agent-identity-usage-ledger: a caller presenting
+  // a valid, voluntary X-API-Key gets 3x the anonymous ceiling (900 vs 300).
+  // Anonymous callers (no consumerKeyId) still get exactly 300 — unchanged.
+  max: keyedMax(300, 900),
   standardHeaders: true,
   legacyHeaders: false,
   validate: sharedValidate,
@@ -140,7 +160,9 @@ export const dentalLimiter = rateLimit({
 // JSON-RPC limiter (agents are chatty, so more generous)
 export const jsonRpcLimiter = rateLimit({
   windowMs: 15 * 60 * 1000, // 15 minutes
-  max: 200,
+  // dev-request 2026-07-13-agent-identity-usage-ledger: same keyed/anonymous
+  // differentiation as generalLimiter above — 600 vs 200 for A2A/MCP traffic.
+  max: keyedMax(200, 600),
   standardHeaders: true,
   legacyHeaders: false,
   validate: sharedValidate,
@@ -156,6 +178,19 @@ export const registrationLimiter = rateLimit({
   legacyHeaders: false,
   validate: sharedValidate,
   message: { success: false, error: "Registreringsgrense nådd. Maks 50 registreringer per time." },
+});
+
+// Consumer API-key issuance limiter — dev-request
+// 2026-07-13-agent-identity-usage-ledger, slice 1. Same generous shape as
+// registrationLimiter above (anti-spam on a free, self-service, unauthenticated
+// POST endpoint), not the anonymous data-path — see routes/consumer-keys.ts.
+export const consumerKeyIssuanceLimiter = rateLimit({
+  windowMs: 60 * 60 * 1000, // 1 hour
+  max: 50,
+  standardHeaders: true,
+  legacyHeaders: false,
+  validate: sharedValidate,
+  message: { success: false, error: "For mange nøkkel-utstedelser. Maks 50 per time." },
 });
 
 // Search limiter
