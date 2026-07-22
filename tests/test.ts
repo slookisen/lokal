@@ -27098,6 +27098,26 @@ Promise.allSettled(_oaHomeCountersDeps).then(async () => {
     for (const f of lhd.failures) failures.push("opplevelser-listing-homepage-discovery: " + f);
     console.log(`  opplevelser-listing-homepage-discovery: ${lhd.passed} passed, ${lhd.failed} failed`);
 
+    // dev-request 2026-07-12-experiences-enrichment-supply-and-aggregator-
+    // hygiene, Daniel's decision, step 2, evidence-leg (b): POST /admin/
+    // brreg-website-discovery (direct Brreg org-nr lookup — GET
+    // /enheter/{orgNr} — reading the hjemmeside field via the new
+    // fetchBrregWebsite(), src/services/brreg-client.ts), screening out
+    // directory/aggregator hosts and hosts already adopted elsewhere before
+    // parking a candidate in the SAME experience_homepage_review_queue leg
+    // (a) uses (reason: 'brreg_website_candidate') — never written directly
+    // to hjemmeside. The EXISTING listing-homepage-review-approve route
+    // adopts this reason unmodified (no new approve route). Same
+    // in-memory-DB pattern, runs sequentially inside this same gated block.
+    console.log("\n── opplevelser-brreg-website-discovery: steg 2, bevis-ben (b) — Brreg hjemmeside ──");
+    const { runOpplevelserBrregWebsiteDiscoveryTests } = require("../src/routes/opplevelser-brreg-website-discovery.test") as
+      typeof import("../src/routes/opplevelser-brreg-website-discovery.test");
+    const bwd = await runOpplevelserBrregWebsiteDiscoveryTests(false);
+    passed += bwd.passed;
+    failed += bwd.failed;
+    for (const f of bwd.failures) failures.push("opplevelser-brreg-website-discovery: " + f);
+    console.log(`  opplevelser-brreg-website-discovery: ${bwd.passed} passed, ${bwd.failed} failed`);
+
     // dev-request 2026-07-20-gardssalg-mcp-discoverability: the gårdssalg
     // vertical had zero presence in the agent-facing MCP surface —
     // list_experience_categories never mentioned it, and there was no tool
