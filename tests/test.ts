@@ -32268,3 +32268,23 @@ runSerial(async () => {
     failures.push("verifier-drain-observability: unexpected error: " + String(err?.message || err));
   }
 });
+
+// ── dev-request 2026-07-21-analytics-tre-boetter-mcp-logging-a2a-transparens
+// (Slice B): MCP/A2A/agent-card usage logging + GET /admin/analytics/mcp-usage.
+// Own in-memory DB (swaps the shared getDb() singleton) — runs via runSerial()
+// same as the drain-observability suite above.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-07-21-analytics-tre-boetter-mcp-logging-a2a-transparens: Slice B (mcp-usage-logger) ──");
+  try {
+    const { runMcpUsageLoggerTests } = require("../src/services/mcp-usage-logger.test") as
+      typeof import("../src/services/mcp-usage-logger.test");
+    const mul = await runMcpUsageLoggerTests({ log: false });
+    passed += mul.passed;
+    failed += mul.failed;
+    for (const f of mul.failures) failures.push("mcp-usage-logger: " + f);
+    console.log(`  mcp-usage-logger: ${mul.passed} passed, ${mul.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("mcp-usage-logger: unexpected error: " + String(err?.message || err));
+  }
+});

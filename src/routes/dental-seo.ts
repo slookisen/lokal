@@ -18,6 +18,7 @@ import { getDentalOpenapi } from "../services/dental-openapi";
 import { getTrafficStats } from "../services/traffic-stats";
 import { isDisplayablePhone } from "../services/contact-normalizer";
 import { INDEXNOW_KEY } from "../services/indexnow-service";
+import { agentCardUsageLogger } from "../services/mcp-usage-logger";
 
 const router = Router();
 
@@ -2235,7 +2236,7 @@ router.get("/sted/:stedSlug", (req: Request, res: Response) => {
 // ═══════════════════════════════════════════════════════════
 
 // GET /.well-known/agent-card.json — A2A Agent Card (standard well-known path)
-router.get("/.well-known/agent-card.json", (_req: Request, res: Response) => {
+router.get("/.well-known/agent-card.json", agentCardUsageLogger("dental"), (_req: Request, res: Response) => {
   res.header("Content-Type", "application/json; charset=utf-8");
   res.header("Access-Control-Allow-Origin", "*");
   res.header("Cache-Control", "public, max-age=300");
@@ -2276,7 +2277,7 @@ Contact: https://github.com/slookisen/lokal/issues
 });
 
 // GET /agent-card.json — alias (some crawlers skip well-known prefix)
-router.get("/agent-card.json", (_req: Request, res: Response) => {
+router.get("/agent-card.json", agentCardUsageLogger("dental"), (_req: Request, res: Response) => {
   res.header("Content-Type", "application/json; charset=utf-8");
   res.header("Access-Control-Allow-Origin", "*");
   res.header("Cache-Control", "public, max-age=300");
