@@ -11,6 +11,7 @@ import { getDb } from "../database/init";
 import { isDisplayablePhone } from "../services/contact-normalizer";
 import { isJunkDescription } from "../services/description-quality";
 import { signAgentCard, getJWKS } from "../services/agent-card-signing";
+import { agentCardUsageLogger } from "../services/mcp-usage-logger";
 
 // ─── A2A Routes ──────────────────────────────────────────────
 // Two protocols served here:
@@ -501,8 +502,8 @@ function serveAgentCard(_req: Request, res: Response) {
   res.json(card);
 }
 
-router.get("/.well-known/agent-card.json", serveAgentCard); // A2A spec v1.0.0
-router.get("/.well-known/agent.json", serveAgentCard);       // Legacy compat
+router.get("/.well-known/agent-card.json", agentCardUsageLogger("rfb"), serveAgentCard); // A2A spec v1.0.0
+router.get("/.well-known/agent.json", agentCardUsageLogger("rfb"), serveAgentCard);       // Legacy compat
 
 // GET /.well-known/jwks.json — JWKS for verifying A2A agent-card signatures
 // (dev-request 2026-07-13-a2a-card-v1-signing slice 2). Same key across all

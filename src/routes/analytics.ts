@@ -255,6 +255,70 @@ router.get("/cities", (req: Request, res: Response) => {
 });
 
 /**
+ * GET /admin/analytics/mcp-usage
+ * MCP/A2A/agent-card usage — "hvilke verktøy gir mest, og hvem bruker oss mest"
+ * (dev-request 2026-07-21-analytics-tre-boetter-mcp-logging-a2a-transparens,
+ * Slice B). Reads analytics_mcp_calls, filled by src/services/mcp-usage-logger.ts.
+ * Query params:
+ *   hours=24 (default)
+ *   vertical=rfb|dental|experiences (default: all, or host-locked)
+ */
+router.get("/mcp-usage", (req: Request, res: Response) => {
+  const hours = Math.max(1, Math.min(87600, parseInt(req.query.hours as string) || 24));
+  const cutoff = sqliteDatetime(new Date(Date.now() - hours * 60 * 60 * 1000));
+  const vf = verticalFilter(req);
+  const db = getDb();
+
+  const totalsByProtocol = db.prepare(`
+    SELECT protocol, COUNT(*) as calls
+    FROM analytics_mcp_calls
+    WHERE created_at >= ? AND ${NOT_OWNER}${vf.sql}
+    GROUP BY protocol
+    ORDER BY calls DESC
+  `).all(cutoff, ...vf.params) as Array<{ protocol: string; calls: number }>;
+
+  const byTool = db.prepare(`
+    SELECT protocol, tool_name, COUNT(*) as calls
+    FROM analytics_mcp_calls
+    WHERE created_at >= ? AND ${NOT_OWNER}${vf.sql} AND tool_name IS NOT NULL
+    GROUP BY protocol, tool_name
+    ORDER BY calls DESC
+    LIMIT 50
+  `).all(cutoff, ...vf.params) as Array<{ protocol: string; tool_name: string; calls: number }>;
+
+  const byClient = db.prepare(`
+    SELECT COALESCE(client_name, 'unknown') as client_name, COUNT(*) as calls,
+           COUNT(DISTINCT tool_name) as distinct_tools
+    FROM analytics_mcp_calls
+    WHERE created_at >= ? AND ${NOT_OWNER}${vf.sql}
+    GROUP BY client_name
+    ORDER BY calls DESC
+    LIMIT 50
+  `).all(cutoff, ...vf.params) as Array<{ client_name: string; calls: number; distinct_tools: number }>;
+
+  const byVertical = db.prepare(`
+    SELECT vertical_id, COUNT(*) as calls
+    FROM analytics_mcp_calls
+    WHERE created_at >= ? AND ${NOT_OWNER}${vf.sql}
+    GROUP BY vertical_id
+    ORDER BY calls DESC
+  `).all(cutoff, ...vf.params) as Array<{ vertical_id: string; calls: number }>;
+
+  const totalCalls = totalsByProtocol.reduce((sum, r) => sum + r.calls, 0);
+
+  res.json({
+    timeframe: `last ${hours} hours`,
+    vertical: parseVertical(req) || "all",
+    timestamp: new Date().toISOString(),
+    totalCalls,
+    byProtocol: totalsByProtocol,
+    byTool,
+    byClient,
+    byVertical,
+  });
+});
+
+/**
  * GET /admin/analytics/export/:table
  * Export raw analytics data
  * Params:

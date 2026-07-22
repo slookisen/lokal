@@ -343,6 +343,28 @@ function initSchema(db: Database.Database): void {
       view_source TEXT DEFAULT 'unknown',          -- 'search','direct','discovery','seo'
       created_at TEXT DEFAULT (datetime('now'))
     );
+
+    -- ════════════════════════════════════════════════════════════
+    -- ANALYTICS: MCP/A2A/agent-card usage (dev-request 2026-07-21-analytics-
+    -- tre-boetter-mcp-logging-a2a-transparens, Slice B) — "hvilke verktøy gir
+    -- mest, og hvem bruker oss mest". One row per JSON-RPC request on
+    -- POST /mcp or POST /a2a, and one row per GET /.well-known/agent-card.json
+    -- fetch. Observational only — never blocks/fails the logged call.
+    -- ════════════════════════════════════════════════════════════
+    CREATE TABLE IF NOT EXISTS analytics_mcp_calls (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      protocol TEXT NOT NULL,                      -- 'mcp', 'a2a', 'agent_card'
+      vertical_id TEXT NOT NULL DEFAULT 'rfb',      -- 'rfb', 'dental', 'experiences'
+      tool_name TEXT,                               -- JSON-RPC method, or params.name for tools/call
+      client_name TEXT,                             -- MCP initialize.clientInfo.name, else UA-derived
+      client_version TEXT,                          -- MCP initialize.clientInfo.version, when available
+      user_agent TEXT,                               -- raw UA (not hashed — needed for "hvem bruker oss")
+      ip_hash TEXT,                                  -- privacy-safe hashed IP
+      duration_ms INTEGER,                           -- request latency
+      is_owner INTEGER DEFAULT 0,                    -- our own scheduled agents, excluded from client stats
+      created_at TEXT DEFAULT (datetime('now'))
+    );
+
     -- ════════════════════════════════════════════════════════════
     -- PLATFORM_TRIGGERS: Inbound event ledger (webhooks + manual + GH Actions)
     -- Filled by POST /platform/triggers/:event_type
@@ -544,6 +566,8 @@ function initSchema(db: Database.Database): void {
     CREATE INDEX IF NOT EXISTS idx_analytics_queries_agent ON analytics_queries(agent_id);
     CREATE INDEX IF NOT EXISTS idx_analytics_agent_views_created ON analytics_agent_views(created_at);
     CREATE INDEX IF NOT EXISTS idx_analytics_agent_views_agent ON analytics_agent_views(agent_id);
+    CREATE INDEX IF NOT EXISTS idx_analytics_mcp_calls_created ON analytics_mcp_calls(created_at);
+    CREATE INDEX IF NOT EXISTS idx_analytics_mcp_calls_tool_name ON analytics_mcp_calls(tool_name);
   `);
 
   // ════════════════════════════════════════════════════════════

@@ -45,7 +45,7 @@ const OWNER_UA_MARKERS_LC = [
   "axios/",           // internal node scripts
   "curl/",            // manual terminal checks
 ];
-function isOwnerRequest(req: Request): boolean {
+export function isOwnerRequest(req: Request): boolean {
   const cookieHeader = req.headers.cookie || "";
   if (cookieHeader.split(";").some(c => c.trim() === "_rfb_owner=1")) return true;
   const ua = (req.headers["user-agent"] || "").toLowerCase();
@@ -71,7 +71,7 @@ export function getVerticalFromHost(hostname: string | undefined | null): Vertic
 }
 
 // ─── Helper: Privacy-safe IP hashing ─────────────────────────
-function hashIP(ip: string): string {
+export function hashIP(ip: string): string {
   return crypto.createHash("sha256").update(ip).digest("hex").slice(0, 16);
 }
 

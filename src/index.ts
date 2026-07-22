@@ -36,6 +36,7 @@ import { linkHeaders, markdownNegotiation } from "./middleware/agent-discovery";
 import { trackSelgerHtmlOpen } from "./middleware/analytics";
 import { langMiddleware } from "./i18n/middleware";
 import { analyticsService, shouldRunAutoPrune } from "./services/analytics-service";
+import { mcpUsageLogger } from "./services/mcp-usage-logger";
 import analyticsRoutes from "./routes/analytics";
 import agentStatsRoutes from "./routes/agent-stats";
 import adminRunsRoutes from "./routes/admin-runs";
@@ -211,13 +212,13 @@ if (process.env.ENABLE_DENTAL === "1") {
     if (p === "/mcp" || p.startsWith("/mcp/")) {
       // eslint-disable-next-line @typescript-eslint/no-var-requires
       const dentalMcpRouter = require("./routes/dental-mcp").default;
-      return dentalMcpRouter(req, res, next);
+      return mcpUsageLogger("mcp", "dental")(req, res, () => dentalMcpRouter(req, res, next));
     }
 
     // /a2a endpoint → dental A2A JSON-RPC router (mounted before dental-seo below)
     // dentalA2aRouter handles the /a2a prefix and applies its own rate limiting.
     if (p === "/a2a" || p.startsWith("/a2a/")) {
-      return dentalA2aRouter(req, res, next);
+      return mcpUsageLogger("a2a", "dental")(req, res, () => dentalA2aRouter(req, res, next));
     }
 
     // All other paths on dental hosts → dental-seo router
@@ -276,14 +277,14 @@ if (process.env.ENABLE_EXPERIENCES === "1") {
     if (p === "/mcp" || p.startsWith("/mcp/")) {
       // eslint-disable-next-line @typescript-eslint/no-var-requires
       const experiencesMcpRouter = require("./routes/experiences-mcp").default;
-      return experiencesMcpRouter(req, res, next);
+      return mcpUsageLogger("mcp", "experiences")(req, res, () => experiencesMcpRouter(req, res, next));
     }
 
     // /a2a endpoint → experiences A2A JSON-RPC router (mounted before
     // experiences-seo below). experiencesA2aRouter handles the /a2a prefix
     // and applies its own rate limiting (jsonRpcLimiter).
     if (p === "/a2a" || p.startsWith("/a2a/")) {
-      return experiencesA2aRouter(req, res, next);
+      return mcpUsageLogger("a2a", "experiences")(req, res, () => experiencesA2aRouter(req, res, next));
     }
 
     // All other paths on opplevagent hosts → experiences-seo router
@@ -379,7 +380,8 @@ app.use("/api/marketplace", cartRouter);
 app.use("/produsent/ordre", producerOrderRouter);
 app.use("/api/tannlege", dentalRoutes);
 app.use("/api/opplevelser", opplevelserRoutes);
-app.use("/mcp", mcpRoutes);
+app.use("/mcp", mcpUsageLogger("mcp", "rfb"), mcpRoutes);
+app.use("/a2a", mcpUsageLogger("a2a", "rfb"));
 app.use("/", a2aRoutes);
 
 // ─── SPA dashboard (renamed from index.html to let SEO routes handle /) ──

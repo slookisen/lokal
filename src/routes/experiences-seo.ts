@@ -101,6 +101,7 @@ import {
   type GardssalgBooking,
 } from "../services/booking-store";
 import { getOaHomeCounters } from "../services/oa-home-counters";
+import { agentCardUsageLogger } from "../services/mcp-usage-logger";
 
 const router = Router();
 
@@ -1245,7 +1246,7 @@ router.get("/agents.txt", serveAgentsTxt);
 // GET /.well-known/agent-card.json — A2A Agent Card (Opplevagent)
 // ═══════════════════════════════════════════════════════════
 
-router.get("/.well-known/agent-card.json", (_req: Request, res: Response) => {
+router.get("/.well-known/agent-card.json", agentCardUsageLogger("experiences"), (_req: Request, res: Response) => {
   res.header("Content-Type", "application/json; charset=utf-8");
   res.header("Access-Control-Allow-Origin", "*");
   res.header("Cache-Control", "public, max-age=300");
@@ -1263,7 +1264,7 @@ router.get("/.well-known/jwks.json", (_req: Request, res: Response) => {
 });
 
 // GET /agent-card.json — alias (some crawlers skip the well-known prefix)
-router.get("/agent-card.json", (_req: Request, res: Response) => {
+router.get("/agent-card.json", agentCardUsageLogger("experiences"), (_req: Request, res: Response) => {
   res.header("Content-Type", "application/json; charset=utf-8");
   res.header("Access-Control-Allow-Origin", "*");
   res.header("Cache-Control", "public, max-age=300");
