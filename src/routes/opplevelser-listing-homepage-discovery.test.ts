@@ -445,6 +445,60 @@ export function runOpplevelserListingHomepageDiscoveryTests(
         const untouchedRow = expDb.prepare(`SELECT navn FROM experience_providers WHERE id = 'lh-owner'`).get() as any;
         assertEq(untouchedRow?.navn, "Annen Eier", "lh-7d: existing rows unaffected by the additive migration");
       }
+
+      // ── lh-8: cross-leg queue clobber guard — a provider that already has
+      //    a pending queue row from leg (b) (Brreg) is excluded rather than
+      //    silently overwritten by this leg's own verified candidate.
+      //    Regression guard for the confirmed cross-leg clobber defect: this
+      //    leg (a) route previously had no equivalent of leg (b)'s
+      //    ownPendingOrApproved guard, so calling it on a provider a sibling
+      //    leg had already queued would flip reason/candidate_url/created_at
+      //    out from under the still-pending proposal with no trace of the
+      //    original ever existing. ───────────────────────────────────────
+      {
+        insertProvider.run({ id: "lh-preclobbered", navn: "Forhåndskødd Gård", hjemmeside: null, listing_url: "https://visitnorway.no/produsent/preclobbered", content_source: null });
+        (globalThis.fetch as any) = (async (url: string | URL | Request) => {
+          const urlStr = String(url);
+          const mk = (html: string) => ({ ok: true, status: 200, url: urlStr, text: async () => html } as unknown as Response);
+          if (urlStr === "https://visitnorway.no/produsent/preclobbered") {
+            return mk('<html><body><a href="https://preclobberedgard.no">Nettsted</a></body></html>');
+          }
+          if (urlStr === "https://preclobberedgard.no") {
+            return mk("<html><body>Velkommen til Forhåndskødd Gård.</body></html>");
+          }
+          return { ok: false, status: 404, url: urlStr, text: async () => "" } as unknown as Response;
+        }) as unknown as typeof fetch;
+
+        // Simulate leg (b)'s prior proposal: a pending row for this SAME
+        // provider, a DIFFERENT reason/candidate_url, already sitting in the
+        // shared queue before this leg (a) call ever runs.
+        const preExistingCreatedAt = "2026-07-01 00:00:00";
+        expDb.prepare(
+          `INSERT INTO experience_homepage_review_queue
+             (id, provider_id, provider_name, candidate_url, final_url, evidence, confidence, reason, batch_id, status, created_at, resolved_at)
+           VALUES ('lh-preclobbered-row', 'lh-preclobbered', 'Forhåndskødd Gård', 'https://brreg-real-site.no', 'https://brreg-real-site.no', '{}', 1.0, 'brreg_website_candidate', 'test-fixture-leg-b', 'pending', @createdAt, NULL)`,
+        ).run({ createdAt: preExistingCreatedAt });
+
+        const r = await callRoute(opplevelserRouter, {
+          headers: adminHeaders,
+          body: { providerIds: ["lh-preclobbered"], apply: true },
+        });
+        assertEq(r.body.proposed_count, 0, "lh-8a: pre-queued-by-another-leg provider is NOT proposed by this leg");
+        const ex = (r.body.excluded as any[]).find((e) => e.provider_id === "lh-preclobbered");
+        assertTrue(
+          !!ex && ex.hosts.some((h: any) => h.host === "preclobberedgard.no" && h.reason === "already_queued_for_provider"),
+          "lh-8b: excluded with reason already_queued_for_provider, reusing leg (b)'s exact reason string",
+        );
+
+        const row = expDb.prepare(`SELECT * FROM experience_homepage_review_queue WHERE provider_id = 'lh-preclobbered'`).get() as any;
+        assertEq(row?.reason, "brreg_website_candidate", "lh-8c: existing row's reason UNCHANGED — not clobbered by this leg's own reason");
+        assertEq(row?.candidate_url, "https://brreg-real-site.no", "lh-8d: existing row's candidate_url UNCHANGED");
+        assertEq(row?.created_at, preExistingCreatedAt, "lh-8e: existing row's created_at UNCHANGED — never re-upserted");
+        assertEq(row?.status, "pending", "lh-8f: existing row still pending, untouched");
+
+        const qCount = (expDb.prepare(`SELECT COUNT(*) c FROM experience_homepage_review_queue WHERE provider_id = 'lh-preclobbered'`).get() as any).c;
+        assertEq(qCount, 1, "lh-8g: still exactly one queue row for this provider — no duplicate inserted alongside it");
+      }
     } catch (err: any) {
       failed++;
       failures.push("opplevelser-listing-homepage-discovery: unexpected error: " + String(err?.stack || err?.message || err));

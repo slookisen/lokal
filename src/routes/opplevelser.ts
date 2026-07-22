@@ -2566,6 +2566,25 @@ router.post("/admin/listing-homepage-discovery", requireAdmin, async (req: Reque
       }
     }
 
+    // Genuinely new for this provider only if it doesn't already have a
+    // pending/approved queue entry — e.g. leg (b)'s Brreg-based discovery
+    // already proposed something for it, or an earlier run of this same leg
+    // did — skip rather than re-upsert, so this leg never clobbers a
+    // still-live proposal (from either leg) with its own. Mirrors leg (b)'s
+    // identical ownPendingOrApproved guard in POST /admin/brreg-website-
+    // discovery above.
+    if (hit) {
+      const ownPendingOrApproved = expDb
+        .prepare(
+          `SELECT 1 FROM experience_homepage_review_queue WHERE provider_id = ? AND status IN ('pending','approved')`
+        )
+        .get(t.id);
+      if (ownPendingOrApproved) {
+        excludedHere.push({ host: hit.host, reason: "already_queued_for_provider" });
+        hit = null;
+      }
+    }
+
     if (excludedHere.length > 0) excluded.push({ provider_id: t.id, navn: t.navn, hosts: excludedHere });
 
     if (hit) {
