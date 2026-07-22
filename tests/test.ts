@@ -32288,3 +32288,27 @@ runSerial(async () => {
     failures.push("mcp-usage-logger: unexpected error: " + String(err?.message || err));
   }
 });
+
+// ── dev-request 2026-07-12-opplevagent-serp-innholdsberikelse (item 3):
+// per-page branded og:image — renderExperienceOgImageSvg()/resolveOgAccentColor()
+// (src/services/experience-og-image.ts) + GET /og-image.svg (src/routes/
+// experiences-seo.ts), replacing the domain-wide favicon.svg og:image
+// fallback on opplevelse-detail, tilbyder-detail, and kategori/fylke/kommune-
+// browse pages. Own in-memory DB (swaps the shared getDb() singleton, plus
+// the experiences DB via EXPERIENCES_DB_PATH) — runs via runSerial() same as
+// the two suites above.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-07-12-opplevagent-serp-innholdsberikelse: item 3 (experience-og-image) ──");
+  try {
+    const { runExperienceOgImageTests } = require("../src/services/experience-og-image.test") as
+      typeof import("../src/services/experience-og-image.test");
+    const eoi = await runExperienceOgImageTests({ log: false });
+    passed += eoi.passed;
+    failed += eoi.failed;
+    for (const f of eoi.failures) failures.push("experience-og-image: " + f);
+    console.log(`  experience-og-image: ${eoi.passed} passed, ${eoi.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("experience-og-image: unexpected error: " + String(err?.message || err));
+  }
+});
