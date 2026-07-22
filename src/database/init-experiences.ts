@@ -708,5 +708,15 @@ export function initExperiencesSchema(db: Database.Database): void {
     db.exec("ALTER TABLE experience_providers ADD COLUMN listing_homepage_discovery_attempted_at TEXT");
   } catch { /* already present */ }
 
+  // Per-provider attempt stamp for Brreg-website discovery (step 2,
+  // evidence-leg (b)) — its OWN column, independent of leg (a)'s
+  // listing_homepage_discovery_attempted_at above: a provider with no
+  // listing-page candidate should still get a turn at the Brreg leg, and
+  // vice versa. Same idempotent ALTER TABLE idiom, same anti-starvation
+  // rotation-stamp role.
+  try {
+    db.exec("ALTER TABLE experience_providers ADD COLUMN brreg_website_discovery_attempted_at TEXT");
+  } catch { /* already present */ }
+
   console.log("[experiences] schema initialized");
 }

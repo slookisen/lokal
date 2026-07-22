@@ -172,6 +172,11 @@ import { classifyProvider, sleep, BrregClass } from "../services/experience-brre
 // Brønnøysundregistrene business-address lookup (same GET /enheter/{orgNr}
 // endpoint verifyOrgNumber()/fetchBrregActivityDescription() already call).
 import { fetchBrregBusinessAddress, BRREG_BASE_URL, BRREG_SEARCH_PATH } from "../services/brreg-client";
+// dev-request 2026-07-12-experiences-enrichment-supply-and-aggregator-
+// hygiene, step 2, evidence-leg (b) — Brreg's own hjemmeside field, direct
+// by org-nr (same GET /enheter/{orgNr} endpoint the three lookups above already
+// call). See POST /admin/brreg-website-discovery below.
+import { fetchBrregWebsite } from "../services/brreg-client";
 // dev-request 2026-07-19-agg-website-leak — reuse the curated DMO/aggregator
 // host classifier (same one admin-knowledge.ts's classifyWebsite() uses) so a
 // harvest row's `website` is never blindly trusted as a provider's OWN
@@ -2389,6 +2394,11 @@ export function listingHomepageNameVerified(html: string, providerName: string):
 // refresh-on-rerun idiom, same shape as upsertGardssalgWebsiteReviewQueue
 // (gardssalg_website_review_queue, above) adapted to this queue's own
 // status/resolved_at columns (a re-upsert always lands back in 'pending').
+// `reason` defaults to leg (a)'s original 'listing_page_link_candidate' —
+// unchanged for that existing caller — and is a plain parameter (not a
+// hardcoded SQL literal) so leg (b) below can pass its own
+// 'brreg_website_candidate' value through the SAME upsert helper rather than
+// duplicating this table-write logic a second time.
 function upsertListingHomepageReviewQueue(
   db: ReturnType<typeof getExpDb>,
   entry: {
@@ -2399,12 +2409,13 @@ function upsertListingHomepageReviewQueue(
     evidence: string;
     confidence: number;
     batch_id: string;
+    reason?: string;
   }
 ): void {
   db.prepare(
     `INSERT INTO experience_homepage_review_queue
        (id, provider_id, provider_name, candidate_url, final_url, evidence, confidence, reason, batch_id, status, created_at, resolved_at)
-     VALUES (@id, @provider_id, @provider_name, @candidate_url, @final_url, @evidence, @confidence, 'listing_page_link_candidate', @batch_id, 'pending', datetime('now'), NULL)
+     VALUES (@id, @provider_id, @provider_name, @candidate_url, @final_url, @evidence, @confidence, @reason, @batch_id, 'pending', datetime('now'), NULL)
      ON CONFLICT(provider_id) DO UPDATE SET
        provider_name = excluded.provider_name,
        candidate_url = excluded.candidate_url,
@@ -2418,6 +2429,7 @@ function upsertListingHomepageReviewQueue(
        resolved_at = NULL`
   ).run({
     id: crypto.randomUUID(),
+    reason: entry.reason || "listing_page_link_candidate",
     provider_id: entry.provider_id,
     provider_name: entry.provider_name,
     candidate_url: entry.candidate_url,
@@ -2725,6 +2737,223 @@ router.post("/admin/listing-homepage-review-approve", requireAdmin, (req: Reques
     written_count: written.length,
     written,
     rejected,
+  });
+});
+
+// ─── POST /api/opplevelser/admin/brreg-website-discovery (admin) ───────────
+//
+// dev-request 2026-07-12-experiences-enrichment-supply-and-aggregator-hygiene,
+// Daniel's decision, step 2, evidence-leg (b) ONLY — Brreg's own `hjemmeside`
+// (website) field, looked up directly by the provider's already-known
+// `org_nr`. Leg (c) (Google Places, licensed/paid API) stays out of scope.
+//
+// Mirrors listing-homepage-discovery (leg (a)) closely: same admin gate, same
+// apply-boolean dry-run-by-default convention, same batch cap (30), same
+// experience_homepage_review_queue destination (NEVER writes hjemmeside
+// directly — queue only), same aggregator-host + already-live-elsewhere
+// shared-host exclusion checks. Genuinely NEW here (leg (a) never needed it,
+// since it was the only writer of this queue when it was built): a result
+// already carrying a pending/approved queue entry for THIS provider is
+// skipped rather than re-upserted — UNIQUE(provider_id) means an unconditional
+// upsert would silently clobber another leg's (or an earlier run's) still-live
+// proposal for the same provider.
+//
+// Candidate set: org_nr IS NOT NULL AND hjemmeside IS NULL AND content_source
+// NOT IN ('manual','claim') — mirroring leg (a)'s NULL-safe form of that
+// condition (a bare `content_source NOT IN (...)` is NULL for every row whose
+// content_source is itself NULL, per SQL's three-valued logic, which would
+// silently exclude every un-sourced/auto-discovered provider — not the
+// intent; leg (a)'s existing selector already guards against exactly this).
+//
+// Non-goals (this slice): no Brreg org-nr lookup CHANGES (verifyOrgNumber/
+// fetchBrregActivityDescription/fetchBrregBusinessAddress untouched), no
+// Google Places calls, no auto-write of hjemmeside outside the EXISTING
+// listing-homepage-review-approve lever (reused as-is, no new approve route),
+// no new KNOWN_DIRECTORY_HOSTS entries added speculatively.
+const BW_DISCOVERY_BATCH_CAP = 30;
+
+router.post("/admin/brreg-website-discovery", requireAdmin, async (req: Request, res: Response) => {
+  const body = (req.body ?? {}) as { providerIds?: unknown; apply?: unknown };
+  const apply =
+    body.apply === true ||
+    body.apply === 1 ||
+    body.apply === "1" ||
+    body.apply === "true" ||
+    req.query?.apply === "1" ||
+    req.query?.apply === "true";
+  const dryRun = !apply;
+  const batchTag = `brreg-website-${new Date().toISOString().replace(/[-:]/g, "").replace("T", "-").slice(0, 15)}`;
+
+  const expDb = getExpDb("experiences");
+  const skippedLocked: Array<{ provider_id: string; navn: string }> = [];
+  const alreadyHasWebsite: Array<{ provider_id: string; navn: string }> = [];
+  const notFound: string[] = [];
+  let targets: Array<{ id: string; navn: string; org_nr: string | null; content_source: string | null }> = [];
+
+  if (Array.isArray(body.providerIds) && body.providerIds.length > 0) {
+    const ids = (body.providerIds as unknown[]).filter((v): v is string => typeof v === "string" && v.trim() !== "").map((v) => v.trim());
+    if (ids.length > BW_DISCOVERY_BATCH_CAP) {
+      res.status(400).json({ error: `Too many providerIds (max ${BW_DISCOVERY_BATCH_CAP} per call)` });
+      return;
+    }
+    for (const id of ids) {
+      const t = expDb
+        .prepare(`SELECT id, navn, org_nr, hjemmeside, content_source FROM experience_providers WHERE id = ?`)
+        .get(id) as
+        | { id: string; navn: string; org_nr: string | null; hjemmeside: string | null; content_source: string | null }
+        | undefined;
+      if (!t) {
+        notFound.push(id);
+      } else if (t.content_source === "manual" || t.content_source === "claim") {
+        skippedLocked.push({ provider_id: t.id, navn: t.navn });
+      } else if (t.hjemmeside && t.hjemmeside.trim() !== "") {
+        alreadyHasWebsite.push({ provider_id: t.id, navn: t.navn });
+      } else {
+        targets.push({ id: t.id, navn: t.navn, org_nr: t.org_nr, content_source: t.content_source });
+      }
+    }
+  } else {
+    targets = expDb
+      .prepare(
+        `SELECT id, navn, org_nr, content_source
+           FROM experience_providers
+          WHERE org_nr IS NOT NULL AND hjemmeside IS NULL AND (content_source IS NULL OR content_source NOT IN ('manual','claim'))
+          ORDER BY (brreg_website_discovery_attempted_at IS NOT NULL), brreg_website_discovery_attempted_at ASC, created_at ASC
+          LIMIT ?`
+      )
+      .all(BW_DISCOVERY_BATCH_CAP) as Array<{ id: string; navn: string; org_nr: string | null; content_source: string | null }>;
+  }
+
+  const proposed: Array<{
+    provider_id: string;
+    navn: string;
+    candidate_url: string;
+    evidence: { host: string; org_nr: string; source: "brreg_hjemmeside" };
+    confidence: number;
+  }> = [];
+  const noWebsiteInBrreg: Array<{ provider_id: string; navn: string }> = [];
+  const excluded: Array<{ provider_id: string; navn: string; host: string; reason: string }> = [];
+  const processedIds: string[] = [];
+  // Hosts queued (pending) for a DIFFERENT provider WITHIN this same run —
+  // apply-mode only, mirrors listing-homepage-discovery's queuedThisRun guard.
+  const queuedThisRun = new Set<string>();
+  // Normalized-host set for host_already_in_catalog — computed ONCE per
+  // request and reused across the whole batch, same shared-host guard leg
+  // (a) already computes (vertical-agnostic: dedups against ALL
+  // experience_providers' hjemmeside, not just this vertical's rows).
+  const catalogHosts = new Set<string>();
+  for (const row of expDb
+    .prepare(`SELECT hjemmeside FROM experience_providers WHERE hjemmeside IS NOT NULL AND TRIM(hjemmeside) != ''`)
+    .all() as Array<{ hjemmeside: string }>) {
+    const h = hostFromUrlLike(row.hjemmeside);
+    if (h) catalogHosts.add(h);
+  }
+
+  for (const t of targets) {
+    processedIds.push(t.id);
+
+    const website = t.org_nr ? await fetchBrregWebsite(t.org_nr) : null;
+    if (!website) {
+      noWebsiteInBrreg.push({ provider_id: t.id, navn: t.navn });
+      continue;
+    }
+
+    const host = hostFromUrlLike(website);
+    if (!host) {
+      noWebsiteInBrreg.push({ provider_id: t.id, navn: t.navn });
+      continue;
+    }
+
+    if (isDirectoryOrAggregatorHost(host)) {
+      excluded.push({ provider_id: t.id, navn: t.navn, host, reason: "directory_or_aggregator_host" });
+      continue;
+    }
+    if (catalogHosts.has(host)) {
+      excluded.push({ provider_id: t.id, navn: t.navn, host, reason: "host_already_in_catalog" });
+      continue;
+    }
+    const queuedElsewhereCount = (
+      expDb
+        .prepare(
+          `SELECT COUNT(*) AS n FROM experience_homepage_review_queue
+            WHERE status = 'pending' AND provider_id != ? AND candidate_url LIKE ?`
+        )
+        .get(t.id, "%" + host) as { n: number }
+    ).n;
+    if (queuedElsewhereCount > 0 || queuedThisRun.has(host)) {
+      excluded.push({ provider_id: t.id, navn: t.navn, host, reason: "host_already_queued_elsewhere" });
+      continue;
+    }
+
+    // Genuinely new for this leg: a pending/approved queue entry already
+    // exists for THIS SAME provider (e.g. leg (a)'s listing-page discovery
+    // already proposed something, or an earlier run of this same leg did) —
+    // skip rather than re-upsert, so this leg never clobbers a still-live
+    // proposal (from either leg) with its own.
+    const ownPendingOrApproved = expDb
+      .prepare(
+        `SELECT 1 FROM experience_homepage_review_queue WHERE provider_id = ? AND status IN ('pending','approved')`
+      )
+      .get(t.id);
+    if (ownPendingOrApproved) {
+      excluded.push({ provider_id: t.id, navn: t.navn, host, reason: "already_queued_for_provider" });
+      continue;
+    }
+
+    let finalOrigin: string;
+    try {
+      const u = new URL(website);
+      finalOrigin = `${u.protocol}//${u.host.toLowerCase()}`;
+    } catch {
+      finalOrigin = `https://${host}`;
+    }
+    const evidence = { host, org_nr: t.org_nr as string, source: "brreg_hjemmeside" as const };
+    const confidence = 1.0;
+    proposed.push({
+      provider_id: t.id,
+      navn: t.navn,
+      candidate_url: finalOrigin,
+      evidence,
+      confidence,
+    });
+    if (!dryRun) {
+      try {
+        upsertListingHomepageReviewQueue(expDb, {
+          provider_id: t.id,
+          provider_name: t.navn,
+          candidate_url: finalOrigin,
+          final_url: finalOrigin,
+          evidence: JSON.stringify(evidence),
+          confidence,
+          batch_id: batchTag,
+          reason: "brreg_website_candidate",
+        });
+        queuedThisRun.add(host);
+      } catch {
+        /* queue write is best-effort; the run itself must not fail on it */
+      }
+    }
+  }
+
+  if (!dryRun && processedIds.length > 0) {
+    const stampStmt = expDb.prepare(
+      `UPDATE experience_providers SET brreg_website_discovery_attempted_at = datetime('now') WHERE id = ?`
+    );
+    for (const id of processedIds) stampStmt.run(id);
+  }
+
+  res.json({
+    dry_run: dryRun,
+    batch_tag: batchTag,
+    scanned: targets.length,
+    proposed_count: proposed.length,
+    proposed,
+    no_website_in_brreg: noWebsiteInBrreg,
+    excluded,
+    skipped_locked: skippedLocked,
+    already_has_website: alreadyHasWebsite,
+    not_found: notFound,
+    queue_size: (expDb.prepare(`SELECT COUNT(*) AS n FROM experience_homepage_review_queue`).get() as { n: number }).n,
   });
 });
 

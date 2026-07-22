@@ -522,6 +522,83 @@ export async function fetchBrregBusinessAddress(
   return result;
 }
 
+// ─── Website (hjemmeside) lookup (dev-request 2026-07-12-experiences- ───
+//     enrichment-supply-and-aggregator-hygiene, step 2, evidence-leg (b)) ──
+//
+// fetchBrregWebsite(orgNr) returns Brreg's own registered website field
+// (`hjemmeside`) for a given org number — used as an evidence-leg for
+// providers left hjemmeside-blank by step 1's aggregator-URL cleanup sweep,
+// alongside leg (a)'s listing-page-link discovery. Hits the SAME
+// GET /enheter/{orgNr} endpoint verifyOrgNumber()/
+// fetchBrregActivityDescription()/fetchBrregBusinessAddress() already call,
+// reading yet another field none of those three reads. Never throws — same
+// safe-default discipline (any network/parse error or 404 resolves to
+// null). Does not do fuzzy name matching; the org-nr is already known.
+
+type RawEnhetWebsite = {
+  hjemmeside?: string | null;
+};
+
+// Own small per-process cache keyed by orgNr — deliberately NOT shared with
+// the other three org-nr lookup caches above (each of these functions
+// caches independently, mirroring the file's existing convention).
+const websiteCache: Map<string, string | null> = new Map();
+
+export function __clearBrregWebsiteCacheForTesting(): void {
+  websiteCache.clear();
+}
+
+/**
+ * fetchBrregWebsite(orgNr) — direct Brreg lookup by org-nr
+ * (GET /enheter/{orgNr}), returning the registered website (`hjemmeside`),
+ * trimmed, with an empty string treated as null. Never throws: any
+ * network/parse error, 404, or missing/blank field resolves to null — same
+ * safe-default convention as verifyOrgNumber/fetchBrregActivityDescription/
+ * fetchBrregBusinessAddress. Does not do fuzzy name matching; the org-nr is
+ * already known.
+ */
+export async function fetchBrregWebsite(
+  orgNr: string,
+  fetchImpl: typeof fetch = fetch,
+): Promise<string | null> {
+  const cleanOrgNr = (orgNr || "").trim();
+  if (!cleanOrgNr) return null;
+
+  if (websiteCache.has(cleanOrgNr)) return websiteCache.get(cleanOrgNr) ?? null;
+
+  const url = `${BRREG_BASE_URL}${BRREG_SEARCH_PATH}/${encodeURIComponent(cleanOrgNr)}`;
+  let res: Response;
+  try {
+    res = await fetchWithTimeout(url, REQUEST_TIMEOUT_MS, fetchImpl);
+  } catch (err) {
+    console.warn(
+      "[brreg-client] fetchBrregWebsite fetch failed:",
+      err instanceof Error ? err.message : err,
+    );
+    return null;
+  }
+
+  if (res.status === 404) {
+    websiteCache.set(cleanOrgNr, null);
+    return null;
+  }
+  if (!res.ok) return null;
+
+  let json: RawEnhetWebsite;
+  try {
+    json = (await res.json()) as RawEnhetWebsite;
+  } catch {
+    return null;
+  }
+
+  const result =
+    typeof json.hjemmeside === "string" && json.hjemmeside.trim() !== ""
+      ? json.hjemmeside.trim()
+      : null;
+  websiteCache.set(cleanOrgNr, result);
+  return result;
+}
+
 // ─── Main entry ────────────────────────────────────────────────────────
 //   findOrgnumberByName(name, postal?)
 //   → top-confidence hit if score ≥ 0.9, else null.
