@@ -102,6 +102,7 @@ import {
 } from "../services/booking-store";
 import { getOaHomeCounters } from "../services/oa-home-counters";
 import { agentCardUsageLogger } from "../services/mcp-usage-logger";
+import { renderExperienceOgImageSvg, resolveOgAccentColor } from "../services/experience-og-image";
 
 const router = Router();
 
@@ -121,7 +122,12 @@ function baseUrl(): string {
   return OPPLEVAGENT_BASE_URL.replace(/\/$/, "");
 }
 
-function escapeHtml(text: unknown): string {
+// Exported: reused by src/services/experience-og-image.ts (per-page branded
+// og:image SVGs, dev-request 2026-07-12-opplevagent-serp-innholdsberikelse
+// item 3) so untrusted DB text (provider names, kommune names, …) gets the
+// exact same `& < > " '` escaping there as everywhere else in this file —
+// XML escaping doesn't differ from HTML escaping for that character set.
+export function escapeHtml(text: unknown): string {
   return String(text ?? "")
     .replace(/&/g, "&amp;")
     .replace(/</g, "&lt;")
@@ -161,6 +167,20 @@ const CATEGORY_LABELS: Record<string, string> = {
 function catLabel(c: string | null | undefined): string {
   if (!c) return "Opplevelse";
   return CATEGORY_LABELS[c] || c.replace(/_/g, " ");
+}
+
+// Build the URL for a page's per-page branded og:image (dev-request
+// 2026-07-12-opplevagent-serp-innholdsberikelse, item 3) — served by the
+// GET /og-image.svg route below. Query-param based (not a new path segment)
+// so it can't collide with existing /kategori/:category-style routes and
+// needs no DB round-trip (callers already have label/sublabel/category in
+// hand while building the page).
+function ogImageUrl(url: string, label: string, opts?: { sublabel?: string | null; cat?: string | null }): string {
+  const params = new URLSearchParams();
+  params.set("label", label);
+  if (opts?.sublabel) params.set("sublabel", opts.sublabel);
+  if (opts?.cat) params.set("cat", opts.cat);
+  return `${url}/og-image.svg?${params.toString()}`;
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -1674,6 +1694,14 @@ function renderOpplevelseDetail(
     titleWithPlace.length + BRAND.length <= MAX_TITLE ? titleWithPlace : exp.title
   );
 
+  // Per-page branded og:image (dev-request
+  // 2026-07-12-opplevagent-serp-innholdsberikelse, item 3) — experience
+  // title as the main label, category as sublabel/accent, replacing the
+  // domain-wide favicon.svg fallback. No extra DB query: cat/exp.title are
+  // already in scope.
+  const ogImage = ogImageUrl(url, exp.title, { sublabel: cat ? catLabel(cat) : null, cat });
+  const ogImageAlt = `${exp.title}${cat ? " — " + catLabel(cat) : ""} | Opplevagent`;
+
   return `<!doctype html>
 <html lang="nb">
 <head>
@@ -1691,7 +1719,10 @@ function renderOpplevelseDetail(
 <meta property="og:url" content="${canonical}">
 <meta property="og:locale" content="nb_NO">
 <meta property="og:site_name" content="Opplevagent">
-<meta property="og:image" content="${url}/favicon.svg">
+<meta property="og:image" content="${escapeHtml(ogImage)}">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta property="og:image:alt" content="${escapeHtml(ogImageAlt)}">
 <meta name="twitter:card" content="summary">
 ${ldScripts}
 <style>
@@ -2121,6 +2152,17 @@ function renderBrowsePage(opts: {
     (page > 1 ? `<link rel="prev" href="${escapeHtml(`${url}${pagerBase}${pagerBase.includes("?") ? "&" : "?"}page=${page - 1}`)}">\n` : "") +
     (page < totalPages ? `<link rel="next" href="${escapeHtml(`${url}${pagerBase}${pagerBase.includes("?") ? "&" : "?"}page=${page + 1}`)}">\n` : "");
 
+  // Per-page branded og:image (dev-request
+  // 2026-07-12-opplevagent-serp-innholdsberikelse, item 3) — replaces the
+  // domain-wide favicon.svg fallback. renderBrowsePage() is shared by
+  // /tilbyder/:id, /kategori/:category, /fylke/:fylke, /kommune/:kommune,
+  // /opplevelser, and /sok; opts carries no category-ish field common to all
+  // of them, so this shared page type gets the neutral brand-default accent
+  // (see resolveOgAccentColor()'s fallback) rather than inventing a new opts
+  // field just for this.
+  const ogImage = ogImageUrl(url, opts.h1);
+  const ogImageAlt = `${opts.h1} | Opplevagent`;
+
   return `<!doctype html>
 <html lang="nb">
 <head>
@@ -2138,7 +2180,10 @@ ${linkRels}<link rel="icon" type="image/svg+xml" href="/favicon.svg">
 <meta property="og:url" content="${canonical}">
 <meta property="og:locale" content="nb_NO">
 <meta property="og:site_name" content="Opplevagent">
-<meta property="og:image" content="${url}/favicon.svg">
+<meta property="og:image" content="${escapeHtml(ogImage)}">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta property="og:image:alt" content="${escapeHtml(ogImageAlt)}">
 <meta name="twitter:card" content="summary">
 ${ldScripts}
 <style>${BROWSE_CSS}</style>
@@ -2612,6 +2657,13 @@ router.get(
       .map((o) => `<script type="application/ld+json">${JSON.stringify(o).replace(/<\//g, "<\\/")}</script>`)
       .join("\n");
 
+    // Per-page branded og:image (dev-request
+    // 2026-07-12-opplevagent-serp-innholdsberikelse, item 3) — provider name
+    // as label, "Gårdssalg og smaking" as sublabel, keyed to the gardssalg
+    // accent color. Replaces the domain-wide favicon.svg fallback.
+    const ogImage = ogImageUrl(url, provider.navn, { sublabel: "Gårdssalg og smaking", cat: "gardssalg" });
+    const ogImageAlt = `${provider.navn} — Gårdssalg og smaking | Opplevagent`;
+
     const html = `<!doctype html>
 <html lang="nb">
 <head>
@@ -2627,7 +2679,10 @@ router.get(
 <meta property="og:url" content="${canonical}">
 <meta property="og:locale" content="nb_NO">
 <meta property="og:site_name" content="Opplevagent">
-<meta property="og:image" content="${url}/favicon.svg">
+<meta property="og:image" content="${escapeHtml(ogImage)}">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta property="og:image:alt" content="${escapeHtml(ogImageAlt)}">
 <meta name="twitter:card" content="summary">
 ${ldScripts}
 <style>
@@ -4949,6 +5004,41 @@ router.get("/opplevelse/:slug", (req: Request, res: Response, next: NextFunction
 
 
 
+
+// ═══════════════════════════════════════════════════════════
+// GET /og-image.svg — per-page branded og:image (dev-request
+// 2026-07-12-opplevagent-serp-innholdsberikelse, item 3). Replaces the
+// domain-wide favicon.svg og:image fallback on opplevelse-detail,
+// tilbyder-detail, and kategori/fylke/kommune-browse pages with a
+// self-generated branded SVG/text template — the sanctioned interim path
+// given Daniel's standing "no auto-fetched/scraped photos" constraint
+// (2026-07-10). Query-param based: ?label=&sublabel=&cat= — see
+// ogImageUrl() above for how callers build the URL.
+// express.static is bypassed by the opplevagent host-gate in index.ts, so
+// static/generated assets must be served explicitly from this router — same
+// reason /favicon.svg and /logo.svg below are here.
+//
+// Cache-Control is longer + `immutable` (vs. /favicon.svg's plain
+// max-age=86400) because the output is fully deterministic from the query
+// params alone (no DB/time dependency), so a stronger cache is strictly
+// more appropriate here — a week is a sensible ceiling given link-preview
+// caches (Slack/X/etc.) already do their own long-lived caching regardless.
+// renderExperienceOgImageSvg() itself bounds/truncates label/sublabel, so an
+// absurdly long query string degrades gracefully rather than erroring.
+// ═══════════════════════════════════════════════════════════
+router.get("/og-image.svg", (req: Request, res: Response) => {
+  const label = String(req.query.label ?? "").trim() || "Opplevagent";
+  const sublabel = req.query.sublabel !== undefined ? String(req.query.sublabel).trim() : null;
+  const cat = req.query.cat !== undefined ? String(req.query.cat).trim() : null;
+  const svg = renderExperienceOgImageSvg({
+    label,
+    sublabel,
+    accent: resolveOgAccentColor(cat),
+  });
+  res.setHeader("Content-Type", "image/svg+xml");
+  res.setHeader("Cache-Control", "public, max-age=604800, immutable");
+  res.send(svg);
+});
 
 // ═══════════════════════════════════════════════════════════
 // GET /favicon.svg — site icon for Opplevagent
