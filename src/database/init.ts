@@ -2988,6 +2988,93 @@ function initSchema(db: Database.Database): void {
   db.exec(`CREATE INDEX IF NOT EXISTS idx_agent_salgskanal_category ON agent_salgskanal(category_slug)`);
   db.exec(`CREATE INDEX IF NOT EXISTS idx_agent_salgskanal_agent ON agent_salgskanal(agent_id)`);
 
+  // ─── dev-request 2026-07-13-agent-identity-usage-ledger, slice 1 ─────────
+  // (L4, Daniel-authorized 2026-07-20 — daniel-responses/2026-07-20-go-usage-
+  // ledger-og-supply-graph.md): voluntary, free, self-service API keys for
+  // AI-agent CONSUMERS of the platform (MCP/A2A/REST), plus an aggregate
+  // per-key usage ledger. This is NOT a paywall and NOT the producer-side
+  // `agents.api_key` field (unrelated, untouched) — anonymous access is
+  // unaffected; a key only grants a higher rate-limit tier and gets the
+  // caller a usage record. See src/middleware/consumer-identity.ts for the
+  // middleware that reads/writes these tables and src/routes/consumer-keys.ts
+  // for the self-service issuance/revoke/erase endpoints.
+  //
+  // consumer_api_keys:
+  //   key_hash      : sha256 of the plaintext key — the plaintext itself is
+  //                   NEVER stored anywhere, only returned once at issuance
+  //                   (see POST /api/keys). UNIQUE + NOT NULL, same
+  //                   inline-UNIQUE + belt-and-suspenders explicit index
+  //                   convention as magic_links.token above.
+  //   label         : consumer-chosen free-text name, optional.
+  //   contact_email : optional (data-minimization — the confirm-understanding
+  //                   risk note for this dev-request calls out "e-post
+  //                   valgfritt? minst mulig"), nullable.
+  //   rate_tier     : which rate-limit tier this key gets (see
+  //                   middleware/security.ts keyedMax()). Only 'keyed' exists
+  //                   in slice 1; the column is TEXT (not a CHECK-enum) so a
+  //                   future paid tier can be added without a migration.
+  //   revoked_at    : holder-initiated revoke (POST /api/keys/revoke) — key
+  //                   immediately stops being recognized, but ledger history
+  //                   for it is preserved (revoke ≠ erase).
+  //   deleted_at    : GDPR right-to-erasure marker (POST /api/keys/erase).
+  //                   We soft-delete (null out label/contact_email + stamp
+  //                   this column) rather than hard-delete the row, because
+  //                   consumer_usage_ledger.key_id FKs into this table's id
+  //                   and the ledger's aggregate counts (endpoint/day/count —
+  //                   no call content) stop being personal data once the PII
+  //                   columns are cleared, so hard-deleting would only
+  //                   destroy Daniel's own aggregate usage history for zero
+  //                   privacy benefit. This mirrors the soft-delete half of
+  //                   the codebase's existing GDPR pattern (Debio
+  //                   deactivation above) rather than the hard-delete half
+  //                   (Norsk Gardsmat above), which applies to removing a
+  //                   producer with nothing worth preserving — not to a row
+  //                   anchoring aggregate history. See routes/consumer-keys.ts.
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS consumer_api_keys (
+      id            INTEGER PRIMARY KEY AUTOINCREMENT,
+      key_hash      TEXT UNIQUE NOT NULL,
+      label         TEXT,
+      contact_email TEXT,
+      rate_tier     TEXT NOT NULL DEFAULT 'keyed',
+      created_at    TEXT NOT NULL DEFAULT (datetime('now')),
+      revoked_at    TEXT,
+      deleted_at    TEXT
+    )
+  `);
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_consumer_api_keys_key_hash ON consumer_api_keys(key_hash)`);
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_consumer_api_keys_revoked ON consumer_api_keys(revoked_at)`);
+
+  // consumer_usage_ledger: aggregate counts ONLY — never one row per call and
+  // never call arguments/content (GDPR/data-minimization risk called out in
+  // the dev-request's confirm-understanding section). UNIQUE(key_id,
+  // endpoint_or_tool, day) means a call is an upsert-increment of the
+  // existing row (see recordUsage() in middleware/consumer-identity.ts), not
+  // an insert-per-call.
+  //   key_id           : FK to consumer_api_keys.id. ON DELETE CASCADE is
+  //                      defensive only — the erasure path never hard-deletes
+  //                      the parent row (see above), so this should not
+  //                      normally fire.
+  //   endpoint_or_tool : which MCP tool / A2A method / REST route was called
+  //                      (e.g. "lokal_search", "message/send",
+  //                      "GET /api/marketplace/discover") — never the call's
+  //                      arguments or response content.
+  //   day              : YYYY-MM-DD (UTC), so "topp konsumenter siste 7/30
+  //                      dager" (slice 2, admin reporting — NOT built in this
+  //                      slice) can aggregate by date range cheaply.
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS consumer_usage_ledger (
+      id               INTEGER PRIMARY KEY AUTOINCREMENT,
+      key_id           INTEGER NOT NULL REFERENCES consumer_api_keys(id) ON DELETE CASCADE,
+      endpoint_or_tool TEXT NOT NULL,
+      day              TEXT NOT NULL,
+      call_count       INTEGER NOT NULL DEFAULT 0,
+      UNIQUE(key_id, endpoint_or_tool, day)
+    )
+  `);
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_consumer_usage_ledger_key_id ON consumer_usage_ledger(key_id)`);
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_consumer_usage_ledger_day ON consumer_usage_ledger(day)`);
+
 }
 
 export function closeDb(): void {

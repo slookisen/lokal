@@ -19189,13 +19189,24 @@ console.log("\n── PR-106: dental admin rate-limit raise ──");
   // (general 300, jsonRpc 200, search 150, registration 50, admin 500)
   // should keep their existing `max` values so PR-106 changes ONLY the
   // dental vertical's quota.
+  //
+  // dev-request 2026-07-13-agent-identity-usage-ledger, slice 1 legitimately
+  // changed generalLimiter/jsonRpcLimiter's `max` from a bare number to
+  // `keyedMax(300, ...)` / `keyedMax(200, ...)` — a per-request function
+  // whose anonymous branch (no consumerKeyId) still evaluates to EXACTLY
+  // 300 / 200 (see consumer-identity-rate-limit.test.ts, which proves this
+  // behaviorally with a real HTTP server). The regexes below now accept
+  // either the bare number (the PR-106-era shape) OR keyedMax(<number>, ...
+  // — anything else (a bare number that's drifted, or a keyedMax() call
+  // with a different first argument) still fails, preserving pr106-04's
+  // original guard against the dental quota bleeding into the general one.
   assertTrue(
-    /export const generalLimiter = rateLimit\(\{[\s\S]{0,800}max:\s*300/.test(secSrc),
-    "pr106-04a: generalLimiter max still 300 (rfb unchanged)"
+    /export const generalLimiter = rateLimit\(\{[\s\S]{0,800}max:\s*(300|keyedMax\(300,)/.test(secSrc),
+    "pr106-04a: generalLimiter max still 300 for anonymous callers (rfb unchanged)"
   );
   assertTrue(
-    /export const jsonRpcLimiter = rateLimit\(\{[\s\S]{0,400}max:\s*200/.test(secSrc),
-    "pr106-04b: jsonRpcLimiter max still 200 (rfb unchanged)"
+    /export const jsonRpcLimiter = rateLimit\(\{[\s\S]{0,400}max:\s*(200|keyedMax\(200,)/.test(secSrc),
+    "pr106-04b: jsonRpcLimiter max still 200 for anonymous callers (rfb unchanged)"
   );
   assertTrue(
     /export const searchLimiter = rateLimit\(\{[\s\S]{0,400}max:\s*150/.test(secSrc),
@@ -32330,5 +32341,60 @@ runSerial(async () => {
   } catch (err: any) {
     failed++;
     failures.push("experience-og-image: unexpected error: " + String(err?.message || err));
+  }
+});
+
+// ── dev-request 2026-07-13-agent-identity-usage-ledger, slice 1 (L4,
+// Daniel-authorized 2026-07-20): voluntary, free, self-service consumer
+// API keys (MCP/A2A/REST) + an aggregate per-key usage ledger. Three files:
+// the regression-critical anonymous-fallthrough proof, the issuance/revoke/
+// erase/ledger-upsert route tests, and the real-HTTP-server rate-limit
+// differentiation test. Own in-memory DB (swaps the shared getDb()
+// singleton) — runs via runSerial() same as the three suites above.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-07-13-agent-identity-usage-ledger: anonymous-regression (fallthrough invariant) ──");
+  try {
+    const { runConsumerIdentityAnonymousRegressionTests } = require("../src/middleware/consumer-identity-anonymous-regression.test") as
+      typeof import("../src/middleware/consumer-identity-anonymous-regression.test");
+    const air = await runConsumerIdentityAnonymousRegressionTests({ log: false });
+    passed += air.passed;
+    failed += air.failed;
+    for (const f of air.failures) failures.push("consumer-identity-anonymous-regression: " + f);
+    console.log(`  consumer-identity-anonymous-regression: ${air.passed} passed, ${air.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("consumer-identity-anonymous-regression: unexpected error: " + String(err?.message || err));
+  }
+});
+
+runSerial(async () => {
+  console.log("\n── dev-request 2026-07-13-agent-identity-usage-ledger: consumer-keys (issuance/revoke/erase/ledger) ──");
+  try {
+    const { runConsumerKeysTests } = require("../src/routes/consumer-keys.test") as
+      typeof import("../src/routes/consumer-keys.test");
+    const ck = runConsumerKeysTests({ log: false });
+    passed += ck.passed;
+    failed += ck.failed;
+    for (const f of ck.failures) failures.push("consumer-keys: " + f);
+    console.log(`  consumer-keys: ${ck.passed} passed, ${ck.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("consumer-keys: unexpected error: " + String(err?.message || err));
+  }
+});
+
+runSerial(async () => {
+  console.log("\n── dev-request 2026-07-13-agent-identity-usage-ledger: rate-limit differentiation (real HTTP server) ──");
+  try {
+    const { runConsumerIdentityRateLimitTests } = require("../src/middleware/consumer-identity-rate-limit.test") as
+      typeof import("../src/middleware/consumer-identity-rate-limit.test");
+    const crl = await runConsumerIdentityRateLimitTests({ log: false });
+    passed += crl.passed;
+    failed += crl.failed;
+    for (const f of crl.failures) failures.push("consumer-identity-rate-limit: " + f);
+    console.log(`  consumer-identity-rate-limit: ${crl.passed} passed, ${crl.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("consumer-identity-rate-limit: unexpected error: " + String(err?.message || err));
   }
 });

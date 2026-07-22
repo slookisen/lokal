@@ -15,9 +15,12 @@ import {
   adminLimiter,
   dentalLimiter,
   aiCrawlerAllowlist,
+  consumerKeyIssuanceLimiter,
 } from "./middleware/security";
 import producerRoutes from "./routes/producer";
 import consumerRoutes from "./routes/consumer";
+import consumerKeysRoutes from "./routes/consumer-keys";
+import { consumerIdentity } from "./middleware/consumer-identity";
 import scanRoutes from "./routes/scan";
 import a2aRoutes from "./routes/a2a";
 import reservationRoutes from "./routes/reservation";
@@ -148,6 +151,15 @@ app.use(sanitizeInput);
 // paths (llms.txt, sitemap.xml, /.well-known/*) so any scrape-hardening
 // layer (current or future) lets them through. Also emits X-Robots-Tag: all.
 app.use(aiCrawlerAllowlist);
+
+// ─── Consumer-identity (dev-request 2026-07-13-agent-identity-usage-ledger,
+// slice 1) — voluntary, free X-API-Key recognition for AI-agent consumers.
+// Mounted ONCE, globally, before the dental/experiences host-routing gates
+// below and before every rate limiter and MCP/A2A/REST router, so it covers
+// all three domains uniformly (same "one shared middleware" pattern as
+// aiCrawlerAllowlist just above). Absent header → next() immediately, no
+// other effect whatsoever — see middleware/consumer-identity.ts.
+app.use(consumerIdentity);
 
 // Analytics middleware (before routes, after security)
 app.use(analyticsService.middleware());
@@ -335,6 +347,11 @@ app.use("/api/marketplace/discover", searchLimiter);
 // Admin/destructive endpoints get a strict limiter (10/hour)
 app.use("/api/marketplace/admin", adminLimiter);
 app.delete("/api/marketplace/agents/:id", adminLimiter);
+// dev-request 2026-07-13-agent-identity-usage-ledger, slice 1: anti-spam
+// quota on self-service key ISSUANCE only (same method+exact-path pattern
+// as the adminLimiter line above) — /api/keys/revoke and /api/keys/erase
+// are deliberately NOT covered by this quota, only generalLimiter below.
+app.post("/api/keys", consumerKeyIssuanceLimiter);
 app.post("/admin/analytics/prune", adminLimiter);
 // PR-106: dental vertical has its own per-IP quota (1000/15min) so
 // 3 parallel dental-agent-enrichment workers can run without hitting
@@ -368,6 +385,12 @@ app.use("/api/producers", producerRoutes);
 app.use("/api/producers", scanRoutes);
 app.use("/api/products", scanRoutes);
 app.use("/api", consumerRoutes);
+// dev-request 2026-07-13-agent-identity-usage-ledger, slice 1: self-service
+// consumer API-key issuance/revoke/erase. POST /api/keys is additionally
+// rate-limited by consumerKeyIssuanceLimiter (mounted above, on the exact
+// method+path) — revoke/erase stay unlimited beyond the shared
+// generalLimiter below.
+app.use("/api", consumerKeysRoutes);
 app.use("/api/reservations", reservationRoutes);
 app.use("/api/marketplace", marketplaceRoutes);
 // Phase 0: product catalog feed + per-agent products (public) + backfill (admin)
