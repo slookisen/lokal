@@ -1120,6 +1120,25 @@ router.get("/sitemap.xml", (_req: Request, res: Response) => {
       xml += `\n  <url><loc>${url}/opplevelse/${encodeURIComponent(row.slug)}</loc><changefreq>weekly</changefreq><priority>0.6</priority><lastmod>${lastmod}</lastmod></url>`;
     }
   } catch { /* experiences DB not open — static sitemap only */ }
+  try {
+    // Gårdssalg producer profiles (dev-request 2026-07-19-gardssalg-agent-flater,
+    // item 6/AC8): /kategori/gardssalg/produsent/<slug> was entirely absent from
+    // the sitemap even though the route has been live since 2026-07-10 — producers
+    // have zero `experiences` rows so listPublishedProviders()'s experiences-JOIN
+    // never matches them. Gated on the SAME gardssalgVisible() flag that already
+    // gates the /kategori/gardssalg entry above, so the profile family appears/
+    // disappears from the sitemap in lockstep with the category page itself.
+    // listGardssalgProviders() already excludes catalog_hidden=1 rows via its own
+    // base WHERE (the same gate discover_gardssalg/the category grid rely on) —
+    // not reimplemented here. Slug backfill already ran above (backfillProviderSlugs()
+    // covers all experience_providers rows, not just experience-linked ones).
+    if (gardssalgVisible()) {
+      for (const row of listGardssalgProviders(5000, 0)) {
+        if (!row.slug) continue;
+        xml += `\n  <url><loc>${url}/kategori/gardssalg/produsent/${encodeURIComponent(row.slug)}</loc><changefreq>weekly</changefreq><priority>0.6</priority><lastmod>${today}</lastmod></url>`;
+      }
+    }
+  } catch { /* experiences DB not open */ }
   xml += `\n</urlset>\n`;
   res.send(xml);
 });
