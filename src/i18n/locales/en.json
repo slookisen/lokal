@@ -119,6 +119,7 @@
   },
   "producer": {
     "title_suffix": " — Local food producer in {city}",
+    "title_suffix_no_city": " — Local food producer in Norway",
     "verified": "Verified",
     "trust_score": "Trust Score",
     "categories": "Categories",
