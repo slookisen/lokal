@@ -58,6 +58,7 @@ import adminAgentAuditRoutes from "./routes/admin-agent-audit";
 import adminVerifierReviewQueueRoutes from "./routes/admin-verifier-review-queue";
 import adminDomainCoherenceSweepRoutes from "./routes/admin-domain-coherence";
 import adminDentalHjemmesideCleanupRoutes from "./routes/admin-dental-hjemmeside-cleanup";
+import adminDentalMarkInactiveRoutes from "./routes/admin-dental-mark-inactive";
 import adminDentalSchemaProbeSweepRoutes from "./routes/admin-dental-schema-probe-sweep";
 import adminKnowledgeRoutes, { pruneUrlsRouter, homepageContentRefreshRouter, descriptionTruncationSweepRouter } from "./routes/admin-knowledge";
 import adminSearchEnrichRoutes from "./routes/admin-search-enrich";
@@ -566,6 +567,12 @@ app.use("/admin/verifier/domain-coherence-sweep", adminLimiter, adminDomainCoher
 // hjemmeside into the additive directory_url column — dry-run by default,
 // dry_run:false writes. POST /admin/dental/hjemmeside-cleanup-sweep
 app.use("/admin/dental/hjemmeside-cleanup-sweep", adminLimiter, adminDentalHjemmesideCleanupRoutes);
+// dev-request 2026-07-16-dental-hjemmeside-url-vask, item 2 (nedlagt-flagging):
+// permanent inactive/closed-clinic flag applied by explicit caller-supplied
+// ids (no live scraper — confirmed-closed list gathered manually via
+// research). dry-run by default, dry_run:false writes.
+// POST /admin/dental/mark-inactive
+app.use("/admin/dental/mark-inactive", adminLimiter, adminDentalMarkInactiveRoutes);
 // dev-request 2026-07-21-dental-schema-probe-writepath-fix, follow-up: finds
 // + repairs dental_agents rows already contaminated by the test/probe
 // fingerprint PR #323's write-path guard now blocks going forward — clears

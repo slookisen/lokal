@@ -132,6 +132,15 @@ export function buildWhereClause(
     conditions.push("lat IS NULL");
   }
 
+  // dev-request 2026-07-16-dental-hjemmeside-url-vask, item 2 (nedlagt-
+  // flagging): permanently-closed clinics (is_inactive=1, set via
+  // /admin/dental/mark-inactive) must NEVER re-enter the claim pool -- a
+  // closed clinic should never be enriched again. Unlike
+  // excludeParkedExtraction below, this is ALWAYS applied (unconditional,
+  // no opt-in filter flag), mirroring the PR-108 junk-exclusion / PR-120
+  // thin_site-parking conditions above: no caller can opt out.
+  conditions.push("(is_inactive IS NULL OR is_inactive = 0)");
+
   // dev-request 2026-07-12-dental-enrichment-universe-growth-and-queue-hygiene,
   // item 2a: exclude clinics parked by 3 consecutive extraction failures
   // (extraction_unreachable_since set AND within the last 30 days), same
