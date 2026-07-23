@@ -332,8 +332,16 @@ export function runMcpUsageLoggerTests(opts: { log?: boolean } = {}): Promise<Te
             (protocol, vertical_id, tool_name, client_name, client_version, user_agent, ip_hash, duration_ms, is_owner, created_at)
           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         `);
-        const now = "2026-07-22 09:00:00";
-        const old = "2026-07-19 09:00:00"; // > 24h before `now`
+        // Computed relative to the real wall clock (matching how the route's
+        // own `cutoff = Date.now() - hours*3600*1000` works) rather than a
+        // fixed date literal — a hardcoded past date silently drifts outside
+        // the default 24h window as real time passes, making this fixture
+        // (and every assertion depending on it) fail on any day but the one
+        // it was written on. 1h-ago is safely inside a 24h window; 30h-ago
+        // is safely outside it, regardless of what day the suite runs.
+        const sqliteDatetime = (date: Date): string => date.toISOString().replace("T", " ").replace(/\.\d{3}Z$/, "");
+        const now = sqliteDatetime(new Date(Date.now() - 60 * 60 * 1000));
+        const old = sqliteDatetime(new Date(Date.now() - 30 * 60 * 60 * 1000)); // > 24h before `now`
         insert.run("mcp", "rfb", "lokal_search", "ChatGPT", "1.0", "ChatGPT-User/1.0", "h1", 12, 0, now);
         insert.run("mcp", "rfb", "lokal_search", "ChatGPT", "1.0", "ChatGPT-User/1.0", "h1", 8, 0, now);
         insert.run("mcp", "dental", "lokal_discover", "Claude", "2.0", "Claude-User/1.0", "h2", 20, 0, now);
