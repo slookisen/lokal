@@ -242,13 +242,17 @@ jobs:
 
             // 5. Required status checks green for head SHA — both the legacy commit-status
             //    API and the newer check-runs API, since either can carry required checks.
-            const { data: combined } = await github.rest.repos.getCombinedStatusForRef({
-              owner, repo, ref: pr.head.sha,
-            });
-            const { data: checkRuns } = await github.rest.checks.listForRef({
-              owner, repo, ref: pr.head.sha, per_page: 100,
-            });
-            const statusesOk = combined.state === 'success' || (combined.state === 'pending' && combined.statuses.length === 0);
+            //
+            //    Poll instead of exiting: the `check_suite: completed` trigger above never
+            //    fires for a same-app (GITHUB_TOKEN-authored) check suite on this repo (0
+            //    historical runs, confirmed empirically), so returning immediately while
+            //    checks are still running leaves the PR stuck with nothing to re-evaluate
+            //    it (dev-requests/2026-07-20-fleet-auto-approve-gate-race-checks-pending.md;
+            //    PRs #304, #306, #345 all got stuck this way). Wait here up to ~10 minutes
+            //    (15s intervals) and finish the approve+merge in this same run if checks
+            //    land green within that budget.
+            const POLL_INTERVAL_MS = 15000;
+            const MAX_POLLS = 40; // 40 sleeps of 15s = ~10 minutes total (41st fetch is a no-sleep final check)
             // Self-check race: this very workflow's own check runs (the `resolve-pr`
             // and `evaluate` jobs of fleet-auto-approve.yml, whose check-run `name`
             // defaults to the job's display name since neither sets a custom `name:`)
@@ -260,11 +264,29 @@ jobs:
             // never pass. Exclude them from both the incomplete and failed checks.
             // Keep this list in sync if either job is ever renamed.
             const OWN_JOB_NAMES = ['resolve-pr', 'evaluate'];
-            const externalCheckRuns = checkRuns.check_runs.filter(r => !OWN_JOB_NAMES.includes(r.name));
-            const checksIncomplete = externalCheckRuns.some(r => r.status !== 'completed');
+            let combined, checkRuns, statusesOk, externalCheckRuns, checksIncomplete;
+            for (let poll = 0; poll <= MAX_POLLS; poll++) {
+              ({ data: combined } = await github.rest.repos.getCombinedStatusForRef({
+                owner, repo, ref: pr.head.sha,
+              }));
+              ({ data: checkRuns } = await github.rest.checks.listForRef({
+                owner, repo, ref: pr.head.sha, per_page: 100,
+              }));
+              statusesOk = combined.state === 'success' || (combined.state === 'pending' && combined.statuses.length === 0);
+              externalCheckRuns = checkRuns.check_runs.filter(r => !OWN_JOB_NAMES.includes(r.name));
+              checksIncomplete = externalCheckRuns.some(r => r.status !== 'completed');
+              if (!checksIncomplete || poll === MAX_POLLS) break;
+              core.info(`checks still running — poll ${poll + 1}/${MAX_POLLS}, waiting ${POLL_INTERVAL_MS}ms`);
+              await new Promise((r) => setTimeout(r, POLL_INTERVAL_MS));
+            }
             const checksFailed = externalCheckRuns.some(r => r.status === 'completed' && !['success', 'skipped', 'neutral'].includes(r.conclusion));
             if (checksIncomplete) {
-              core.info('checks still running — waiting');
+              // Unlike every other no-op branch below, this one has no future event to
+              // rescue it (that's the whole reason we polled) — post a visible note so a
+              // check that outlives the poll budget doesn't reproduce the original
+              // invisible-stuck-PR symptom this fix exists to eliminate.
+              await note('checks still running after the ~10-minute poll budget. No auto-approve yet — a future comment or push will re-evaluate.');
+              core.info('checks still incomplete after full poll budget — giving up for this run; a future comment/push will re-evaluate');
               return;
             }
             if (checksFailed || !statusesOk) {
