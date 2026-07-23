@@ -21944,6 +21944,8 @@ const _orchPr20260614_5Promise: Promise<void> = new Promise<void>(r => { _orchPr
       price_nok REAL,
       currency TEXT NOT NULL DEFAULT 'NOK',
       availability TEXT NOT NULL DEFAULT 'in_stock',
+      availability_updated_at TEXT,
+      availability_source TEXT NOT NULL DEFAULT 'enrichment',
       stock_qty INTEGER,
       category TEXT,
       image_url TEXT,
@@ -22220,6 +22222,8 @@ const _orchPr20260614_6Promise: Promise<void> = new Promise<void>(r => { _orchPr
       price_nok REAL,
       currency TEXT NOT NULL DEFAULT 'NOK',
       availability TEXT NOT NULL DEFAULT 'in_stock',
+      availability_updated_at TEXT,
+      availability_source TEXT NOT NULL DEFAULT 'enrichment',
       stock_qty INTEGER,
       category TEXT,
       image_url TEXT,
@@ -22782,10 +22786,15 @@ console.log("\n── orch-pr-14: MCP discovery product_id surfacing ──");
     assertEq(emptyMap.size, 0, "pid-16: no products table → empty map, no throw (discovery degrades to name-only)");
 
     // ── Test 6 (source wiring): both lokal_info AND lokal_search pass the map ────
+    // dev-request 2026-07-13-supply-graph-v1 (Slice 1) added a third,
+    // additive argument (getCatalogAvailabilityMap(agent.id)) to both call
+    // sites — the id-map wiring this regex guards is unchanged, just no
+    // longer the LAST argument, so the pattern now tolerates (and requires)
+    // that trailing arg too.
     const fs = require("fs");
     const mcpSrc = fs.readFileSync("src/routes/mcp.ts", "utf8");
-    const wiredCalls = (mcpSrc.match(/formatProductsForMcp\(k\.products, getCatalogProductIdMap\(agent\.id\)\)/g) || []).length;
-    assertEq(wiredCalls, 2, `pid-17: both MCP product call sites (lokal_info + lokal_search) wire the catalog id map (got ${wiredCalls})`);
+    const wiredCalls = (mcpSrc.match(/formatProductsForMcp\(k\.products, getCatalogProductIdMap\(agent\.id\), getCatalogAvailabilityMap\(agent\.id\)\)/g) || []).length;
+    assertEq(wiredCalls, 2, `pid-17: both MCP product call sites (lokal_info + lokal_search) wire the catalog id map AND the supply-graph availability map (got ${wiredCalls})`);
   } catch (err) {
     failed++;
     failures.push("orch-pr-14-productid: unexpected error: " + String(err));
@@ -32680,5 +32689,61 @@ runSerial(async () => {
   } catch (err: any) {
     failed++;
     failures.push("wrong-entity-retro-sweep: unexpected error: " + String(err?.message || err));
+  }
+});
+
+// ── dev-request 2026-07-13-supply-graph-v1, Slice 1: additive
+// availability_updated_at/availability_source columns on `products` +
+// computeEffectiveAvailability()/setProducerAvailability()
+// (src/services/supply-graph.ts, not yet wired to any route) + additive
+// exposure of the two new fields on the lokal_search/lokal_discover/
+// lokal_info MCP product formatting and the marketplace catalog feed +
+// per-agent product list. Own in-memory DB (swaps the shared getDb()
+// singleton) — runs via runSerial() same as the suites above.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-07-13-supply-graph-v1: supply-graph (computeEffectiveAvailability / setProducerAvailability) ──");
+  try {
+    const { runSupplyGraphTests } = require("../src/services/supply-graph.test") as
+      typeof import("../src/services/supply-graph.test");
+    const sg = runSupplyGraphTests({ log: false });
+    passed += sg.passed;
+    failed += sg.failed;
+    for (const f of sg.failures) failures.push("supply-graph: " + f);
+    console.log(`  supply-graph: ${sg.passed} passed, ${sg.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("supply-graph: unexpected error: " + String(err?.message || err));
+  }
+});
+
+runSerial(async () => {
+  console.log("\n── dev-request 2026-07-13-supply-graph-v1: mcp product-formatting additive regression ──");
+  try {
+    const { runMcpSupplyGraphTests } = require("../src/routes/mcp-supply-graph.test") as
+      typeof import("../src/routes/mcp-supply-graph.test");
+    const msg = runMcpSupplyGraphTests({ log: false });
+    passed += msg.passed;
+    failed += msg.failed;
+    for (const f of msg.failures) failures.push("mcp-supply-graph: " + f);
+    console.log(`  mcp-supply-graph: ${msg.passed} passed, ${msg.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("mcp-supply-graph: unexpected error: " + String(err?.message || err));
+  }
+});
+
+runSerial(async () => {
+  console.log("\n── dev-request 2026-07-13-supply-graph-v1: marketplace-catalog feed/agent-products additive regression ──");
+  try {
+    const { runMarketplaceCatalogSupplyGraphTests } = require("../src/routes/marketplace-catalog-supply-graph.test") as
+      typeof import("../src/routes/marketplace-catalog-supply-graph.test");
+    const mcsg = await runMarketplaceCatalogSupplyGraphTests({ log: false });
+    passed += mcsg.passed;
+    failed += mcsg.failed;
+    for (const f of mcsg.failures) failures.push("marketplace-catalog-supply-graph: " + f);
+    console.log(`  marketplace-catalog-supply-graph: ${mcsg.passed} passed, ${mcsg.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("marketplace-catalog-supply-graph: unexpected error: " + String(err?.message || err));
   }
 });
