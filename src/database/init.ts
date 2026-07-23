@@ -3075,6 +3075,67 @@ function initSchema(db: Database.Database): void {
   db.exec(`CREATE INDEX IF NOT EXISTS idx_consumer_usage_ledger_key_id ON consumer_usage_ledger(key_id)`);
   db.exec(`CREATE INDEX IF NOT EXISTS idx_consumer_usage_ledger_day ON consumer_usage_ledger(day)`);
 
+  // ─── dev-request 2026-07-23-supplygraph: Local Supply Graph v1 ───────────
+  // Producer-set per-product availability (in_stock/seasonal/sold_out),
+  // written directly to THIS table (not agent_knowledge.products — see
+  // src/services/product-availability-service.ts and PATCH /agents/:id/
+  // products/:productId/availability in src/routes/marketplace.ts) with
+  // read-time auto-expiry (no cron sweep — see src/config/supply-graph.ts's
+  // effectiveAvailability()):
+  //
+  //   availability_updated_at : ISO/SQLite timestamp of the last time a
+  //       producer (or the admin backfill below) confirmed `availability`.
+  //       NULL means "never confirmed" -> reads as 'unknown' everywhere.
+  //   field_provenance        : same JSON-object-of-arrays shape as
+  //       agent_knowledge.field_provenance:
+  //         { "availability": [{ value, source_type, fetched_at }, ...] }
+  //       Written by setProductAvailability() on every owner/admin PATCH.
+  //
+  //   `availability` (pre-existing column) accepted values:
+  //     'in_stock' (existing default) | 'seasonal' | 'sold_out'
+  //     — plus the read-time-computed 'unknown', which is NEVER stored (see
+  //     effectiveAvailability() in src/config/supply-graph.ts).
+  //
+  // Additive — idempotent ALTERs, same defensive try/catch pattern as the
+  // PR-58/PR-68/PR-95/brreg migrations above.
+  for (const stmt of [
+    `ALTER TABLE products ADD COLUMN availability_updated_at TEXT`,
+    `ALTER TABLE products ADD COLUMN field_provenance TEXT NOT NULL DEFAULT '{}'`,
+  ]) {
+    try { db.exec(stmt); } catch { /* already exists — expected */ }
+  }
+
+  // ─── Backfill: seed availability_updated_at from the pre-existing
+  // `updated_at` column so this feature's launch doesn't instantly flip
+  // EVERY existing product (which has never been touched by this feature,
+  // so availability_updated_at starts NULL) to 'unknown' the moment it
+  // ships. `updated_at` already existed on every row (DEFAULT
+  // datetime('now') at insert, refreshed by the admin backfill route) and
+  // is the best available proxy for "last time we had reason to believe
+  // this availability value was accurate" — a row backfilled/updated
+  // recently reads as fresh; a row untouched for months correctly degrades
+  // to 'unknown' just like a producer who never reconfirms would. Idempotent
+  // — guarded by the migrations table, runs once per DB file.
+  try {
+    db.exec(`CREATE TABLE IF NOT EXISTS migrations (name TEXT PRIMARY KEY, applied_at TEXT DEFAULT (datetime('now')))`);
+    const alreadyRan = db.prepare(
+      "SELECT 1 FROM migrations WHERE name = 'supplygraph_v1_backfill_availability_updated_at'"
+    ).get();
+    if (!alreadyRan) {
+      const result = db.prepare(
+        "UPDATE products SET availability_updated_at = updated_at WHERE availability_updated_at IS NULL"
+      ).run();
+      db.prepare(
+        "INSERT INTO migrations (name) VALUES ('supplygraph_v1_backfill_availability_updated_at')"
+      ).run();
+      if (result.changes > 0) {
+        console.log(`🌱 Migration: backfilled availability_updated_at for ${result.changes} existing products`);
+      }
+    }
+  } catch (err) {
+    console.error("Migration supplygraph_v1_backfill_availability_updated_at failed:", err);
+  }
+
 }
 
 export function closeDb(): void {

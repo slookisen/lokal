@@ -26,6 +26,8 @@ import { findOrgnumberByName } from "../services/brreg-client";
 import { isDisplayablePhone } from "../services/contact-normalizer";
 import { isJunkDescription } from "../services/description-quality";
 import { isJunkEmail } from "../services/gardssalg-rfb-enrich";
+import { setProductAvailability } from "../services/product-availability-service";
+import { isValidProductAvailability, PRODUCT_AVAILABILITY_VALUES } from "../config/supply-graph";
 
 // ── PR-29 v3: pure helper for Place Details (New) request params ──────────────
 // Exported so tests can assert the URL structure without touching the handler.
@@ -1424,6 +1426,104 @@ router.put("/agents/:id/knowledge", (req: Request, res: Response) => {
   } catch (err: any) {
     res.status(400).json({ success: false, error: err.message });
   }
+});
+
+// ─── PATCH /agents/:id/products/:productId/availability — Local Supply
+// Graph v1 (dev-request 2026-07-23-supplygraph) ──────────────────────────
+//
+// Lets a claimed producer set per-product availability (in_stock/seasonal/
+// sold_out) directly on the SQL `products` table in <=2 taps from the
+// dashboard (src/public/selger.html). Deliberately NOT routed through
+// ownerUpdate()/PUT /agents/:id/knowledge above — that endpoint overwrites
+// the WHOLE freetext agent_knowledge.products blob and has no notion of a
+// SQL products.id, so it cannot target a single product's availability.
+// See src/services/product-availability-service.ts for the write logic and
+// src/config/supply-graph.ts for the read-time auto-expiry rule that governs
+// how this value is SURFACED (lokal_search/lokal_info, the catalog feed, and
+// the per-agent products endpoint all degrade a stale value to 'unknown' —
+// this endpoint only ever writes the raw value + a fresh timestamp).
+//
+// Auth mirrors PUT /agents/:id/knowledge above exactly: X-Admin-Key,
+// X-Claim-Token (claim must belong to :id), or X-API-Key (agent's own key).
+//
+// Body: { availability: "in_stock" | "seasonal" | "sold_out" } — validated
+// strictly; anything else is a 400. Ownership of :productId by :id is
+// enforced in the service layer (id+agent_id WHERE clause) — a productId
+// that exists but belongs to a DIFFERENT agent returns the exact same 404 as
+// a productId that doesn't exist at all, so this endpoint never leaks
+// cross-agent product existence.
+router.patch("/agents/:id/products/:productId/availability", (req: Request, res: Response) => {
+  const claimToken = (req.headers["x-claim-token"] as string) || "";
+  const apiKey = (req.headers["x-api-key"] as string) || "";
+  const adminKeyHeader = (req.headers["x-admin-key"] as string) || "";
+  const expectedAdminKey = getAdminKey();
+  const agentId = req.params.id as string;
+  const productId = req.params.productId as string;
+
+  let authorized = false;
+  let isAdmin = false;
+
+  // 1. Admin key
+  if (expectedAdminKey && adminKeyHeader && adminKeyHeader === expectedAdminKey) {
+    authorized = true;
+    isAdmin = true;
+  }
+
+  // 2. Claim token — seller who has claimed their agent
+  if (!authorized && claimToken) {
+    const claim = knowledgeService.getClaimByToken(claimToken);
+    if (claim && claim.agentId === agentId) authorized = true;
+  }
+
+  // 3. API key — agent's own key from registration
+  if (!authorized && apiKey) {
+    const agent = marketplaceRegistry.getAgentByApiKey(apiKey);
+    if (agent && agent.id === agentId) authorized = true;
+  }
+
+  if (!authorized) {
+    res.status(403).json({ success: false, error: "Ikke autorisert. Bruk X-Admin-Key, X-Claim-Token eller X-API-Key header." });
+    return;
+  }
+
+  const body = (req.body || {}) as Record<string, unknown>;
+  const availability = body.availability;
+  if (typeof availability !== "string" || !isValidProductAvailability(availability)) {
+    res.status(400).json({
+      success: false,
+      error: `Ugyldig availability. Må være en av: ${PRODUCT_AVAILABILITY_VALUES.join(", ")}.`,
+    });
+    return;
+  }
+
+  const result = setProductAvailability({
+    agentId,
+    productId,
+    availability,
+    sourceType: isAdmin ? "admin" : "owner",
+  });
+
+  if (!result.ok) {
+    if (result.reason === "not_found") {
+      res.status(404).json({
+        success: false,
+        error: "Produktet finnes ikke i katalogen for denne produsenten ennå. Lagre produktet først, så vil det synkroniseres til katalogen — prøv igjen etterpå.",
+      });
+    } else {
+      res.status(400).json({
+        success: false,
+        error: `Ugyldig availability. Må være en av: ${PRODUCT_AVAILABILITY_VALUES.join(", ")}.`,
+      });
+    }
+    return;
+  }
+
+  res.json({
+    success: true,
+    id: result.product.id,
+    availability: result.product.availability,
+    availability_updated_at: result.product.availability_updated_at,
+  });
 });
 
 // ─── PUT /agents/:id/description — Write agent.name + agent.description (PR-42) ─

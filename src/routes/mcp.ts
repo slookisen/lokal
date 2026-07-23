@@ -27,6 +27,11 @@ import { isDisplayablePhone } from "../services/contact-normalizer";
 import { isJunkDescription } from "../services/description-quality";
 import { geocodingService } from "../services/geocoding-service";
 import {
+  effectiveAvailability,
+  daysSinceAvailabilityUpdate,
+  type EffectiveAvailability,
+} from "../config/supply-graph";
+import {
   createCart as svcCreateCart,
   checkCartToken as svcCheckCartToken,
   addCartItem as svcAddCartItem,
@@ -52,22 +57,61 @@ export function normalizeProductName(name: string): string {
   return name.toLowerCase().trim().replace(/\s+/g, " ");
 }
 
-// orch-pr-14: build a name_norm → catalog product_id map for one agent.
+// orch-pr-14: build a name_norm → catalog product info map for one agent.
 // The id surfaced here is `products.id` — the SAME column lokal_cart_add_item
 // validates via cart-service.addCartItem (`SELECT p.id FROM products p WHERE
-// p.id = ?`). Only in_stock rows are included so we never advertise an id the
-// cart would reject. Returns an empty map if the catalog has no rows for this
+// p.id = ?`). Returns an empty map if the catalog has no rows for this
 // agent (e.g. backfill not yet run) — callers then format products as before.
-export function getCatalogProductIdMap(agentId: string, db?: any): Map<string, string> {
-  const map = new Map<string, string>();
+//
+// dev-request 2026-07-23-supplygraph: extended for Local Supply Graph v1.
+//   - The query itself is now UNFILTERED by availability (previously
+//     `WHERE availability = 'in_stock'`) because formatProductsForMcp()
+//     needs to show a freshness/availability badge for sold_out/seasonal/
+//     stale rows too, not just in_stock ones.
+//   - BUT the cart-eligibility contract this function has always enforced
+//     is preserved exactly, just expressed via `.id` instead of via the
+//     WHERE clause: `.id` is only non-empty when the row's EFFECTIVE
+//     availability (see effectiveAvailability() in src/config/supply-
+//     graph.ts) is 'in_stock'. IMPORTANT — this is a deliberate BEHAVIOUR
+//     CHANGE from before: a row whose raw stored `availability` is
+//     literally 'in_stock' but whose `availability_updated_at` has gone
+//     stale (never reconfirmed within AVAILABILITY_STALE_DAYS) now ALSO
+//     gets an empty `.id` (previously any literally-'in_stock' row was
+//     eligible regardless of age). This is intentional: "grafen skal aldri
+//     lyve" (the graph must never lie) — we cannot keep handing an
+//     MCP-only agent a purchasable id for a claim nobody has reconfirmed.
+export interface CatalogAvailabilityInfo {
+  /** products.id — non-empty ONLY when effectiveAvailability === 'in_stock'. */
+  id: string;
+  /** Raw stored value ('in_stock' | 'seasonal' | 'sold_out'). */
+  availability: string;
+  availabilityUpdatedAt: string | null;
+  /** Read-time computed value — 'unknown' if never confirmed or stale. */
+  effectiveAvailability: EffectiveAvailability;
+}
+
+export function getCatalogProductIdMap(agentId: string, db?: any): Map<string, CatalogAvailabilityInfo> {
+  const map = new Map<string, CatalogAvailabilityInfo>();
   try {
     const conn = db ?? getDb();
     const rows = conn.prepare(
-      "SELECT id, name_norm FROM products WHERE agent_id = ? AND availability = 'in_stock'"
-    ).all(agentId) as Array<{ id: string; name_norm: string }>;
+      "SELECT id, name_norm, availability, availability_updated_at FROM products WHERE agent_id = ?"
+    ).all(agentId) as Array<{
+      id: string;
+      name_norm: string;
+      availability: string;
+      availability_updated_at: string | null;
+    }>;
     for (const r of rows) {
       // First write wins; UNIQUE(agent_id, name_norm) means at most one row anyway.
-      if (!map.has(r.name_norm)) map.set(r.name_norm, r.id);
+      if (map.has(r.name_norm)) continue;
+      const eff = effectiveAvailability(r.availability, r.availability_updated_at);
+      map.set(r.name_norm, {
+        id: eff === "in_stock" ? r.id : "",
+        availability: r.availability,
+        availabilityUpdatedAt: r.availability_updated_at,
+        effectiveAvailability: eff,
+      });
     }
   } catch {
     // Never let a catalog lookup break discovery output — degrade to name-only.
@@ -75,7 +119,28 @@ export function getCatalogProductIdMap(agentId: string, db?: any): Map<string, s
   return map;
 }
 
-export function formatProductsForMcp(products: any[], productIdByNorm?: Map<string, string>): string {
+// dev-request 2026-07-23-supplygraph: availability badge for the additive
+// `· 🟢 På lager` / `· 🟡 Sesong` / `· 🔴 Utsolgt` / `· ⚪ Ukjent (...)`
+// suffix in formatProductsForMcp(). Pure formatting — no I/O.
+function availabilityBadge(info: CatalogAvailabilityInfo): string {
+  switch (info.effectiveAvailability) {
+    case "in_stock":
+      return "🟢 På lager";
+    case "seasonal":
+      return "🟡 Sesong";
+    case "sold_out":
+      return "🔴 Utsolgt";
+    case "unknown":
+    default: {
+      const days = daysSinceAvailabilityUpdate(info.availabilityUpdatedAt);
+      return days === null
+        ? "⚪ Ukjent (aldri bekreftet)"
+        : `⚪ Ukjent (sist bekreftet ${days} ${days === 1 ? "dag" : "dager"} siden)`;
+    }
+  }
+}
+
+export function formatProductsForMcp(products: any[], productIdByNorm?: Map<string, CatalogAvailabilityInfo>): string {
   if (!products?.length) return "";
 
   const lines: string[] = [];
@@ -102,13 +167,20 @@ export function formatProductsForMcp(products: any[], productIdByNorm?: Map<stri
     const priceStr = price ? ` — ${price}` : "";
     const seasonal = p.seasonal ? " 🌿sesong" : "";
     // orch-pr-14: append the catalog product_id when this product exists in the
-    // products table (in_stock). This is the id an MCP-only agent passes to
-    // lokal_cart_add_item — without it, a pure-MCP buyer could see prices but
-    // had no way to reference a product for the cart. `· id: <uuid>` is both
-    // human-readable and trivially machine-parseable.
-    const pid = productIdByNorm?.get(normalizeProductName(cleanName));
-    const idStr = pid ? `  · id: ${pid}` : "";
-    lines.push(`- ${cleanName}${cat}${priceStr}${seasonal}${idStr}`);
+    // products table AND is cart-eligible (effective availability = in_stock).
+    // This is the id an MCP-only agent passes to lokal_cart_add_item —
+    // without it, a pure-MCP buyer could see prices but had no way to
+    // reference a product for the cart. `· id: <uuid>` is both human-readable
+    // and trivially machine-parseable.
+    //
+    // dev-request 2026-07-23-supplygraph: also append an additive freshness/
+    // availability badge (`· 🟢 På lager` etc.) whenever this product has a
+    // matching catalog row, regardless of eligibility — buyers should SEE
+    // "🔴 Utsolgt" / "⚪ Ukjent" even for products that don't get a cart id.
+    const catalogInfo = productIdByNorm?.get(normalizeProductName(cleanName));
+    const idStr = catalogInfo?.id ? `  · id: ${catalogInfo.id}` : "";
+    const availStr = catalogInfo ? `  · ${availabilityBadge(catalogInfo)}` : "";
+    lines.push(`- ${cleanName}${cat}${priceStr}${seasonal}${idStr}${availStr}`);
     productCount++;
   }
 

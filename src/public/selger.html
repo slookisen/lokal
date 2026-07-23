@@ -909,6 +909,14 @@
       products: [],
       images: [],
       editingProductIndex: -1,
+      // dev-request 2026-07-23-supplygraph: name_norm -> catalog row
+      // ({ id, availability, availability_updated_at, effective_availability })
+      // for the products this agent already has in the SQL `products` table.
+      // Populated by loadCatalogAvailability(); resolves each freetext
+      // product row above to its SQL id so the availability toggle in
+      // renderProducts() knows what to PATCH (state.products itself carries
+      // no SQL id).
+      catalogByNorm: {},
     };
 
     // ── i18n ──
@@ -1442,6 +1450,10 @@
           state.knowledge = info.data.knowledge;
           saveSession();
           renderDashboard();
+          // dev-request 2026-07-23-supplygraph: fire-and-forget — resolves
+          // each product row's SQL catalog id + current availability so the
+          // toggle in renderProducts() can render (re-renders itself when done).
+          loadCatalogAvailability();
         } else if (info.error && info.error.toLowerCase().includes('unauthorized')) {
           // Token expired or invalid — clear session and go back to login
           clearSession();
@@ -2037,6 +2049,126 @@
 
     // ═══════════ PRODUCTS ═══════════
 
+    // dev-request 2026-07-23-supplygraph: Local Supply Graph v1 — producer-
+    // set per-product availability, ≤2-tap toggle on the product list.
+    //
+    // state.products (this freetext array) carries no SQL `products.id` —
+    // the availability write is a NEW, separate, per-product endpoint
+    // (PATCH /agents/:id/products/:productId/availability) that writes
+    // DIRECTLY to the SQL `products` table, so each row here must first be
+    // resolved to its SQL id by matching normalized names (name_norm) — the
+    // exact same join key the backfill/cart/MCP code paths already use.
+    // loadCatalogAvailability() below fetches that catalog list once (on
+    // dashboard load) and indexes it by name_norm into state.catalogByNorm;
+    // renderProducts() below looks each row up in that index.
+
+    var AVAILABILITY_LABELS = { in_stock: '🟢 På lager', seasonal: '🟡 Sesong', sold_out: '🔴 Utsolgt' };
+
+    // Mirrors normalizeProductName() in src/routes/mcp.ts / normalizeName()
+    // in src/routes/marketplace-catalog.ts — MUST stay byte-identical or a
+    // row here can silently fail to match (or, worse, match the WRONG
+    // catalog row) its SQL products.id.
+    function normalizeProductNameJs(name) {
+      return (name || '').toLowerCase().trim().replace(/\s+/g, ' ');
+    }
+
+    // Mirrors the cleanName extraction in parseProductPrice()
+    // (src/services/knowledge-service.ts): strips an embedded "– kr 275/kg"
+    // style price suffix out of the freetext name IF the product's own
+    // `price` field isn't already a separate numeric value — needed because
+    // the bulk-paste import can leave prices embedded in the name, and the
+    // catalog backfill writes name_norm from the STRIPPED name.
+    function extractCleanNameJs(p) {
+      var name = (p.name || '').trim();
+      var price = (p.price || '').trim();
+      if (price && !/\d/.test(price)) price = '';
+      var cleanName = name;
+      if (!price) {
+        var m = name.match(/^(.+?)\s*[–\-—]\s*kr\.?\s*([\d,.\s]+(?:\/\w+)?)\s*$/i);
+        if (m) { cleanName = m[1].trim(); price = 'kr ' + m[2].trim(); }
+      }
+      if (!price) {
+        var m2 = name.match(/^(.+?)\s+kr\.?\s*([\d,.\s]+(?:\/\w+)?)\s*$/i);
+        if (m2) { cleanName = m2[1].trim(); price = 'kr ' + m2[2].trim(); }
+      }
+      return cleanName;
+    }
+
+    function catalogEntryForProduct(p) {
+      var norm = normalizeProductNameJs(extractCleanNameJs(p));
+      return (state.catalogByNorm || {})[norm] || null;
+    }
+
+    function formatAvailabilityFreshness(entry) {
+      if (!entry.availability_updated_at) return 'Aldri bekreftet';
+      var iso = entry.availability_updated_at;
+      var d = new Date(iso.indexOf('T') === -1 ? iso.replace(' ', 'T') + 'Z' : iso);
+      if (isNaN(d.getTime())) return '';
+      var days = Math.max(0, Math.floor((Date.now() - d.getTime()) / 86400000));
+      var whenText = days === 0 ? 'i dag' : (days === 1 ? 'for 1 dag siden' : 'for ' + days + ' dager siden');
+      return entry.effective_availability === 'unknown'
+        ? 'Ukjent — sist bekreftet ' + whenText
+        : 'Bekreftet ' + whenText;
+    }
+
+    // GET the SQL catalog list for this agent (name_norm -> id/availability),
+    // so renderProducts() can resolve each freetext row to its PATCH target.
+    // This endpoint's public path also enforces a verified+non-umbrella
+    // gate, but bypasses it for an authenticated owner (our X-Claim-Token) —
+    // see the comment on GET /api/marketplace/catalog/agents/:id/products
+    // in src/routes/marketplace-catalog.ts.
+    async function loadCatalogAvailability() {
+      if (!state.agentId) return;
+      try {
+        var res = await api('/catalog/agents/' + encodeURIComponent(state.agentId) + '/products');
+        var byNorm = {};
+        if (res && res.success && Array.isArray(res.products)) {
+          res.products.forEach(function(row) {
+            byNorm[normalizeProductNameJs(row.name)] = row;
+          });
+        }
+        state.catalogByNorm = byNorm;
+      } catch (e) {
+        // Never block the product list on this — rows just show "not yet
+        // synced" until the next successful load.
+        state.catalogByNorm = {};
+      }
+      renderProducts();
+    }
+
+    // PATCH the availability for one product. Always re-renders in
+    // `finally` — on success this picks up the freshly-updated
+    // state.catalogByNorm entry; on failure state.catalogByNorm was never
+    // mutated, so re-rendering simply restores the control to its correct
+    // (unchanged) prior value — no separate revert logic needed.
+    async function updateProductAvailability(catalogId, newAvailability) {
+      try {
+        var res = await api(
+          '/agents/' + encodeURIComponent(state.agentId) + '/products/' + encodeURIComponent(catalogId) + '/availability',
+          { method: 'PATCH', body: JSON.stringify({ availability: newAvailability }) }
+        );
+        if (res && res.success) {
+          Object.keys(state.catalogByNorm || {}).forEach(function(k) {
+            var entry = state.catalogByNorm[k];
+            if (entry && entry.id === catalogId) {
+              entry.availability = res.availability || newAvailability;
+              entry.availability_updated_at = res.availability_updated_at || entry.availability_updated_at;
+              entry.effective_availability = entry.availability;
+            }
+          });
+          showAlert('dashAlert', 'Tilgjengelighet oppdatert.', 'success');
+        } else {
+          // Covers the "product not yet in catalog — save it first, then
+          // try again" 404 from the backend, plus any other rejection.
+          showAlert('dashAlert', (res && res.error) || 'Kunne ikke oppdatere tilgjengelighet.', 'error');
+        }
+      } catch (err) {
+        showAlert('dashAlert', (err && err.message) || 'Noe gikk galt. Prøv igjen.', 'error');
+      } finally {
+        renderProducts();
+      }
+    }
+
     function renderProducts() {
       var list = document.getElementById('productList');
       if (state.products.length === 0) {
@@ -2068,6 +2200,44 @@
         if (p.seasonal) metaParts.push('\ud83c\udf43 ' + t('seasonal'));
         metaSpan.textContent = ' \u2022 ' + metaParts.join(' \u2022 ');
         infoDiv.appendChild(metaSpan);
+
+        // dev-request 2026-07-23-supplygraph: availability toggle \u2014 a
+        // <select> firing on 'change' is a single interaction (\u22642 taps).
+        var availDiv = document.createElement('div');
+        availDiv.className = 'product-availability';
+        availDiv.style.cssText = 'display:flex;align-items:center;gap:0.5rem;margin-top:0.35rem;flex-wrap:wrap;';
+        var catalogEntry = catalogEntryForProduct(p);
+        if (catalogEntry) {
+          var availSelect = document.createElement('select');
+          availSelect.className = 'availability-select';
+          availSelect.style.cssText = 'font-size:0.85rem;padding:0.2rem 0.4rem;border-radius:6px;';
+          ['in_stock', 'seasonal', 'sold_out'].forEach(function(val) {
+            var opt = document.createElement('option');
+            opt.value = val;
+            opt.textContent = AVAILABILITY_LABELS[val];
+            if (catalogEntry.availability === val) opt.selected = true;
+            availSelect.appendChild(opt);
+          });
+          (function(entry, selectEl) {
+            selectEl.addEventListener('change', function() {
+              selectEl.disabled = true;
+              updateProductAvailability(entry.id, selectEl.value);
+            });
+          })(catalogEntry, availSelect);
+          availDiv.appendChild(availSelect);
+
+          var freshSpan = document.createElement('span');
+          freshSpan.style.cssText = 'font-size:0.75rem;color:var(--gray-500);';
+          freshSpan.textContent = formatAvailabilityFreshness(catalogEntry);
+          availDiv.appendChild(freshSpan);
+        } else {
+          var notSyncedSpan = document.createElement('span');
+          notSyncedSpan.style.cssText = 'font-size:0.75rem;color:var(--gray-500);font-style:italic;';
+          notSyncedSpan.textContent = 'Ikke synkronisert enn\u00e5';
+          notSyncedSpan.title = 'Produktet er ikke registrert i katalogen enn\u00e5. Lagre produktlisten p\u00e5 nytt (eller vent p\u00e5 neste synkronisering), og pr\u00f8v igjen.';
+          availDiv.appendChild(notSyncedSpan);
+        }
+        infoDiv.appendChild(availDiv);
 
         var actionsDiv = document.createElement('div');
         actionsDiv.className = 'product-actions';

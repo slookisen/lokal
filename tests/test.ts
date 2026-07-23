@@ -695,6 +695,23 @@ console.log("\n── PR-131: dental-claim-service (buildWhereClause) ──");
   console.log(`  dental-claim-service: ${r.passed} passed, ${r.failed} failed`);
 }
 
+// ── dev-request 2026-07-23-supplygraph: product-availability-service —
+//    the write path for producer-set per-product availability. Uses its
+//    own in-memory DB handle passed directly (never touches the shared
+//    getDb() singleton — see that file's top comment), so — like
+//    contact-normalizer/dental-claim-service above — it's safe to run
+//    fully synchronously here, no serialization/promise-chain needed.
+console.log("\n── product-availability-service: Local Supply Graph v1 write path ──");
+{
+  const { runProductAvailabilityServiceTests } = require("../src/services/product-availability-service.test") as
+    typeof import("../src/services/product-availability-service.test");
+  const r = runProductAvailabilityServiceTests({ log: false });
+  passed += r.passed;
+  failed += r.failed;
+  for (const f of r.failures) failures.push("product-availability-service: " + f);
+  console.log(`  product-availability-service: ${r.passed} passed, ${r.failed} failed`);
+}
+
 // ── dev-request 2026-07-03-agent-profile-conversations-stats slice 2
 //    (work item 4): profile-activity-service — the aggregated "Aktivitet"
 //    panel data that replaced /produsent/:slug's old raw "Siste samtaler"
@@ -21944,6 +21961,8 @@ const _orchPr20260614_5Promise: Promise<void> = new Promise<void>(r => { _orchPr
       price_nok REAL,
       currency TEXT NOT NULL DEFAULT 'NOK',
       availability TEXT NOT NULL DEFAULT 'in_stock',
+      availability_updated_at TEXT,
+      field_provenance TEXT NOT NULL DEFAULT '{}',
       stock_qty INTEGER,
       category TEXT,
       image_url TEXT,
@@ -22698,14 +22717,19 @@ console.log("\n── orch-pr-14: MCP discovery product_id surfacing ──");
 
     // Minimal products schema — byte-identical columns to src/database/init.ts
     // (only what getCatalogProductIdMap reads: id, agent_id, name_norm, availability).
+    // dev-request 2026-07-23-supplygraph: added availability_updated_at —
+    // getCatalogProductIdMap() now SELECTs it too (needed for the read-time
+    // auto-expiry rule), so this hand-rolled minimal schema must carry it or
+    // every query below throws "no such column".
     pidDb.exec(`
       CREATE TABLE products (
-        id           TEXT PRIMARY KEY,
-        agent_id     TEXT NOT NULL,
-        name         TEXT NOT NULL,
-        name_norm    TEXT NOT NULL,
-        price_nok    REAL,
-        availability TEXT NOT NULL DEFAULT 'in_stock',
+        id                       TEXT PRIMARY KEY,
+        agent_id                 TEXT NOT NULL,
+        name                     TEXT NOT NULL,
+        name_norm                TEXT NOT NULL,
+        price_nok                REAL,
+        availability             TEXT NOT NULL DEFAULT 'in_stock',
+        availability_updated_at  TEXT,
         UNIQUE(agent_id, name_norm)
       );
     `);
@@ -22722,23 +22746,33 @@ console.log("\n── orch-pr-14: MCP discovery product_id surfacing ──");
     const PID_LAMMELAR = "11111111-1111-1111-1111-111111111111";
     const PID_DEIG     = "22222222-2222-2222-2222-222222222222";
     const PID_SOLDOUT  = "33333333-3333-3333-3333-333333333333";
-    pidDb.prepare("INSERT INTO products (id, agent_id, name, name_norm, price_nok, availability) VALUES (?,?,?,?,?,?)")
+    // dev-request 2026-07-23-supplygraph: in_stock rows now also need a FRESH
+    // availability_updated_at, or effectiveAvailability() degrades them to
+    // 'unknown' (never-confirmed) and they'd lose their cart id — that's the
+    // new auto-expiry rule, not a bug in this fixture.
+    pidDb.prepare("INSERT INTO products (id, agent_id, name, name_norm, price_nok, availability, availability_updated_at) VALUES (?,?,?,?,?,?,datetime('now'))")
       .run(PID_LAMMELAR, "pid-agent", "Lammelår", "lammelår", 275, "in_stock");
-    pidDb.prepare("INSERT INTO products (id, agent_id, name, name_norm, price_nok, availability) VALUES (?,?,?,?,?,?)")
+    pidDb.prepare("INSERT INTO products (id, agent_id, name, name_norm, price_nok, availability, availability_updated_at) VALUES (?,?,?,?,?,?,datetime('now'))")
       .run(PID_DEIG, "pid-agent", "Lammekjøttdeig", "lammekjøttdeig", 185, "in_stock");
     // Out-of-stock row must NOT be advertised (cart would reject it).
-    pidDb.prepare("INSERT INTO products (id, agent_id, name, name_norm, price_nok, availability) VALUES (?,?,?,?,?,?)")
+    pidDb.prepare("INSERT INTO products (id, agent_id, name, name_norm, price_nok, availability, availability_updated_at) VALUES (?,?,?,?,?,?,datetime('now'))")
       .run(PID_SOLDOUT, "pid-agent", "Pinnekjøtt", "pinnekjøtt", 320, "sold_out");
     // A different agent's product — must never leak into pid-agent's map.
-    pidDb.prepare("INSERT INTO products (id, agent_id, name, name_norm, price_nok, availability) VALUES (?,?,?,?,?,?)")
+    pidDb.prepare("INSERT INTO products (id, agent_id, name, name_norm, price_nok, availability, availability_updated_at) VALUES (?,?,?,?,?,?,datetime('now'))")
       .run("99999999-9999-9999-9999-999999999999", "other-agent", "Egg", "egg", 60, "in_stock");
 
-    // ── Test 1: getCatalogProductIdMap returns only this agent's in_stock rows ──
+    // ── Test 1: getCatalogProductIdMap ──────────────────────────────────────
+    // dev-request 2026-07-23-supplygraph: the map is now UNFILTERED by
+    // availability (it also carries display data for sold_out/seasonal/stale
+    // rows), so it includes all 3 of this agent's rows — but `.id` is only
+    // populated for rows whose EFFECTIVE availability is 'in_stock', which is
+    // the exact same cart-eligibility contract this test originally pinned.
     const map = mcpMod.getCatalogProductIdMap("pid-agent", pidDb);
-    assertEq(map.size, 2, `pid-01: map has exactly 2 in_stock products (got ${map.size})`);
-    assertEq(map.get("lammelår"), PID_LAMMELAR, "pid-02: lammelår → correct products.id");
-    assertEq(map.get("lammekjøttdeig"), PID_DEIG, "pid-03: lammekjøttdeig → correct products.id");
-    assertEq(map.get("pinnekjøtt"), undefined, "pid-04: sold_out product excluded from map");
+    assertEq(map.size, 3, `pid-01: map has all 3 of this agent's products (unfiltered — got ${map.size})`);
+    assertEq(map.get("lammelår")?.id, PID_LAMMELAR, "pid-02: lammelår → correct products.id");
+    assertEq(map.get("lammekjøttdeig")?.id, PID_DEIG, "pid-03: lammekjøttdeig → correct products.id");
+    assertEq(map.get("pinnekjøtt")?.id, "", "pid-04: sold_out product's id is EMPTY (excluded from cart eligibility)");
+    assertEq(map.get("pinnekjøtt")?.effectiveAvailability, "sold_out", "pid-04b: sold_out product's effectiveAvailability still surfaced (for display)");
     assertEq(map.get("egg"), undefined, "pid-05: other agent's product not in this agent's map");
 
     // ── Test 2: formatProductsForMcp appends `· id:` for matched in_stock items ─
@@ -22872,6 +22906,7 @@ console.log("\n── orch-pr-14: MCP discovery product_id surfacing ──");
   try { await _expNoYieldBackoffPromise; } catch { /* errors already pushed to failures */ }
   try { await _lowQualitySelectorPromise; } catch { /* errors already pushed to failures */ }
   try { await _junkEmailReplacePromise; } catch { /* errors already pushed to failures */ }
+  try { await _supplyGraphAvailabilityPromise; } catch { /* errors already pushed to failures */ }
   // relax-envelope tests are synchronous (pure validateEnvelope() unit test) — no promise needed
   // PR-109 tests are synchronous (IIFE) — no promise needed
   // Drop pre-existing intg failures (unmasked by awaiting) — they predate M2
@@ -29812,6 +29847,37 @@ const _junkEmailReplacePromise: Promise<void> = new Promise<void>(r => {
     failures.push("junk-email-replace: unexpected error: " + String(err?.message || err));
   } finally {
     _junkEmailReplaceResolve();
+  }
+})();
+
+// ── dev-request 2026-07-23-supplygraph: Local Supply Graph v1 ────────────
+// Integration suite (own in-memory DB, swaps the shared getDb() singleton
+// to exercise the real marketplace.ts/marketplace-catalog.ts routers) —
+// chained after _junkEmailReplacePromise, same tail-chaining idiom as
+// every other singleton-swapping block in this file.
+let _supplyGraphAvailabilityResolve: () => void = () => {};
+const _supplyGraphAvailabilityPromise: Promise<void> = new Promise<void>(r => {
+  _supplyGraphAvailabilityResolve = r;
+});
+
+(async () => {
+  await Promise.allSettled([_junkEmailReplacePromise]);
+  await new Promise(r => setImmediate(r));
+
+  console.log("\n── dev-request 2026-07-23-supplygraph: Local Supply Graph v1 ──");
+  try {
+    const { runSupplyGraphAvailabilityTests } = require("../src/routes/supply-graph-availability.test") as
+      typeof import("../src/routes/supply-graph-availability.test");
+    const sg = await runSupplyGraphAvailabilityTests({ log: false });
+    passed += sg.passed;
+    failed += sg.failed;
+    for (const f of sg.failures) failures.push("supply-graph-availability: " + f);
+    console.log(`  supply-graph-availability: ${sg.passed} passed, ${sg.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("supply-graph-availability: unexpected error: " + String(err?.message || err));
+  } finally {
+    _supplyGraphAvailabilityResolve();
   }
 })();
 
