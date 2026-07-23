@@ -2553,6 +2553,28 @@ function initSchema(db: Database.Database): void {
   db.exec(`CREATE INDEX IF NOT EXISTS idx_products_agent_id ON products(agent_id)`);
   db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_products_agent_name_norm ON products(agent_id, name_norm)`);
 
+  // products.availability_updated_at / availability_source — added for
+  // dev-request 2026-07-13-supply-graph-v1 (Slice 1). Additive only — does
+  // NOT touch the existing `availability` column or its default. Nullable
+  // timestamp lets us tell "never producer-set" (NULL) from "producer set it,
+  // possibly a while ago"; source defaults to 'enrichment' so every existing
+  // row (and every future enrichment-written row) keeps behaving exactly as
+  // before — only rows a producer has explicitly set via the (future)
+  // owner-portal endpoint get source='producer_dashboard' and become subject
+  // to staleness in src/services/supply-graph.ts.
+  // SQLite has no ADD COLUMN IF NOT EXISTS — same try/catch-duplicate-column
+  // guard as every other additive migration in this file.
+  try {
+    db.exec(`ALTER TABLE products ADD COLUMN availability_updated_at TEXT`);
+  } catch {
+    // Column already exists
+  }
+  try {
+    db.exec(`ALTER TABLE products ADD COLUMN availability_source TEXT NOT NULL DEFAULT 'enrichment'`);
+  } catch {
+    // Column already exists
+  }
+
   // ─── Phase 1 (orch-pr-20260614-6): cart + orders tables ─────────────────
   // Cart MVP ("handleliste"). No payment, no seller notification (Phase 1).
   // Anonymous buyer: capability-token model (buyer_ref). Pickup only.

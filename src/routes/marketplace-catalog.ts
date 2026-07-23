@@ -22,6 +22,7 @@ import { randomUUID } from "crypto";
 import { getDb } from "../database/init";
 import { parseProductPrice, isProductHeader, isProductNoise } from "../services/knowledge-service";
 import { slugify } from "../utils/slug";
+import { computeEffectiveAvailability } from "../services/supply-graph";
 
 // ─── Public catalog router (mounted at /api/marketplace/catalog) ────────────
 export const catalogRouter = Router();
@@ -207,6 +208,8 @@ catalogRouter.get("/feed", (req: Request, res: Response) => {
       p.price_nok,
       p.currency,
       p.availability,
+      p.availability_updated_at,
+      p.availability_source,
       p.unit,
       p.category,
       p.image_url,
@@ -229,6 +232,8 @@ catalogRouter.get("/feed", (req: Request, res: Response) => {
     price_nok: number | null;
     currency: string;
     availability: string;
+    availability_updated_at: string | null;
+    availability_source: string;
     unit: string | null;
     category: string | null;
     image_url: string | null;
@@ -237,6 +242,12 @@ catalogRouter.get("/feed", (req: Request, res: Response) => {
     agent_city: string | null;
   }>;
 
+  // dev-request 2026-07-13-supply-graph-v1 (Slice 1): the WHERE filter above
+  // still runs against the RAW p.availability column ('in_stock') — filtering
+  // behaviour is unchanged. Only the EXPOSED `availability` field below is
+  // replaced with the effective (post supply-graph staleness check) value;
+  // `availability_updated_at` is additive — new field, raw timestamp or null.
+  const now = new Date();
   const items = rows.map(r => ({
     id: r.id,
     title: r.name,
@@ -245,7 +256,8 @@ catalogRouter.get("/feed", (req: Request, res: Response) => {
       amount: r.price_nok ?? null,
       currency: r.currency,
     },
-    availability: r.availability,
+    availability: computeEffectiveAvailability(r.availability, r.availability_updated_at, r.availability_source, now),
+    availability_updated_at: r.availability_updated_at ?? null,
     unit: r.unit ?? null,
     category: r.category ?? null,
     seller: {
@@ -286,10 +298,11 @@ INNER JOIN agent_knowledge k ON k.agent_id = a.id
 
   // Note: `source` (internal provenance) is intentionally NOT projected on this
   // public endpoint.
-  const products = db.prepare(`
+  const rows = db.prepare(`
     SELECT
       id, name, description, unit, price_nok, currency,
-      availability, stock_qty, category, image_url,
+      availability, availability_updated_at, availability_source,
+      stock_qty, category, image_url,
       created_at, updated_at
     FROM products
     WHERE agent_id = ?
@@ -302,12 +315,36 @@ INNER JOIN agent_knowledge k ON k.agent_id = a.id
     price_nok: number | null;
     currency: string;
     availability: string;
+    availability_updated_at: string | null;
+    availability_source: string;
     stock_qty: number | null;
     category: string | null;
     image_url: string | null;
     created_at: string;
     updated_at: string;
   }>;
+
+  // dev-request 2026-07-13-supply-graph-v1 (Slice 1): additive fields only —
+  // `availability` becomes the effective (post supply-graph staleness check)
+  // value, `availability_updated_at` is new (raw timestamp or null).
+  // `availability_source` (internal provenance) stays un-projected here, same
+  // as `source` above.
+  const now = new Date();
+  const products = rows.map(r => ({
+    id: r.id,
+    name: r.name,
+    description: r.description,
+    unit: r.unit,
+    price_nok: r.price_nok,
+    currency: r.currency,
+    availability: computeEffectiveAvailability(r.availability, r.availability_updated_at, r.availability_source, now),
+    availability_updated_at: r.availability_updated_at ?? null,
+    stock_qty: r.stock_qty,
+    category: r.category,
+    image_url: r.image_url,
+    created_at: r.created_at,
+    updated_at: r.updated_at,
+  }));
 
   res.json({
     success: true,

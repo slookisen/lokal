@@ -26,6 +26,7 @@ import { getDb } from "../database/init";
 import { isDisplayablePhone } from "../services/contact-normalizer";
 import { isJunkDescription } from "../services/description-quality";
 import { geocodingService } from "../services/geocoding-service";
+import { computeEffectiveAvailability } from "../services/supply-graph";
 import {
   createCart as svcCreateCart,
   checkCartToken as svcCheckCartToken,
@@ -75,7 +76,51 @@ export function getCatalogProductIdMap(agentId: string, db?: any): Map<string, s
   return map;
 }
 
-export function formatProductsForMcp(products: any[], productIdByNorm?: Map<string, string>): string {
+// dev-request 2026-07-13-supply-graph-v1 (Slice 1): per-agent name_norm →
+// effective-availability lookup, built the same way getCatalogProductIdMap()
+// builds its id map. Deliberately NOT filtered to availability='in_stock' —
+// unlike the id map (which only advertises cart-eligible ids), this exists to
+// SURFACE the current effective availability (including 'unknown' for a
+// stale producer_dashboard row, or 'out_of_stock' etc.) for every catalog
+// row, so callers can annotate products regardless of stock state.
+export function getCatalogAvailabilityMap(
+  agentId: string,
+  db?: any
+): Map<string, { availability: string; availabilityUpdatedAt: string | null }> {
+  const map = new Map<string, { availability: string; availabilityUpdatedAt: string | null }>();
+  try {
+    const conn = db ?? getDb();
+    const rows = conn
+      .prepare(
+        "SELECT name_norm, availability, availability_updated_at, availability_source FROM products WHERE agent_id = ?"
+      )
+      .all(agentId) as Array<{
+      name_norm: string;
+      availability: string;
+      availability_updated_at: string | null;
+      availability_source: string;
+    }>;
+    const now = new Date();
+    for (const r of rows) {
+      // First write wins; UNIQUE(agent_id, name_norm) means at most one row anyway.
+      if (!map.has(r.name_norm)) {
+        map.set(r.name_norm, {
+          availability: computeEffectiveAvailability(r.availability, r.availability_updated_at, r.availability_source, now),
+          availabilityUpdatedAt: r.availability_updated_at ?? null,
+        });
+      }
+    }
+  } catch {
+    // Never let a catalog lookup break discovery output — degrade to no availability annotation.
+  }
+  return map;
+}
+
+export function formatProductsForMcp(
+  products: any[],
+  productIdByNorm?: Map<string, string>,
+  availabilityByNorm?: Map<string, { availability: string; availabilityUpdatedAt: string | null }>
+): string {
   if (!products?.length) return "";
 
   const lines: string[] = [];
@@ -108,7 +153,15 @@ export function formatProductsForMcp(products: any[], productIdByNorm?: Map<stri
     // human-readable and trivially machine-parseable.
     const pid = productIdByNorm?.get(normalizeProductName(cleanName));
     const idStr = pid ? `  · id: ${pid}` : "";
-    lines.push(`- ${cleanName}${cat}${priceStr}${seasonal}${idStr}`);
+    // dev-request 2026-07-13-supply-graph-v1 (Slice 1): additive availability
+    // annotation — effective value (post supply-graph staleness check) plus
+    // the raw producer-set timestamp when one exists. Absent entirely when
+    // the product has no matching catalog row, same conditional pattern as
+    // `idStr` above — purely additive, existing text is untouched.
+    const avail = availabilityByNorm?.get(normalizeProductName(cleanName));
+    const availStr = avail ? `  · availability: ${avail.availability}` : "";
+    const availUpdatedStr = avail?.availabilityUpdatedAt ? `  · availability_updated_at: ${avail.availabilityUpdatedAt}` : "";
+    lines.push(`- ${cleanName}${cat}${priceStr}${seasonal}${idStr}${availStr}${availUpdatedStr}`);
     productCount++;
   }
 
@@ -246,7 +299,7 @@ function registerTools(
           // Full product list — orch-pr-14: pass catalog id map so each
           // priced/in-stock product line carries its product_id for cart use.
           if (k.products?.length) {
-            sections.push(formatProductsForMcp(k.products, getCatalogProductIdMap(agent.id)));
+            sections.push(formatProductsForMcp(k.products, getCatalogProductIdMap(agent.id), getCatalogAvailabilityMap(agent.id)));
           }
 
           // Extra details
@@ -397,7 +450,7 @@ function registerTools(
       // orch-pr-14: attach catalog product_id (products.id) to each in-stock
       // product so an MCP-only agent can pass it straight to lokal_cart_add_item.
       if (k.products?.length) {
-        const productSection = formatProductsForMcp(k.products, getCatalogProductIdMap(agent.id));
+        const productSection = formatProductsForMcp(k.products, getCatalogProductIdMap(agent.id), getCatalogAvailabilityMap(agent.id));
         if (productSection) sections.push(productSection);
       }
 
