@@ -17933,6 +17933,71 @@ console.log("\n── opplevagent P2: human-browse subpages (experiences) ──
   assertTrue(smP2.body.includes(`/opplevelse/${whaleSlugP2}`), "p2-06f: sitemap includes published detail URLs");
   assertTrue(!smP2.body.includes(`/opplevelse/${draftSlugP2}`), "p2-06g: sitemap excludes the unpublished draft");
 
+  // p2-06h (dev-request 2026-07-19-gardssalg-agent-flater, item 6/AC8): before
+  // any gårdssalg producer is seeded, gardssalgVisible() is false (0 < the
+  // GARDSSALG_VISIBILITY_THRESHOLD of 5) — the sitemap captured above (smP2)
+  // must contain zero /kategori/gardssalg/produsent/ entries. This is the
+  // negative half of the gate: proves the new block doesn't fire unconditionally.
+  assertTrue(!smP2.body.includes("/kategori/gardssalg/produsent/"),
+    "p2-06h: below the gårdssalg visibility threshold, sitemap has no producer-profile entries");
+
+  // p2-06i..n: seed exactly GARDSSALG_VISIBILITY_THRESHOLD (5) visible gårdssalg
+  // producers plus one catalog_hidden=1 producer (mirrors the tp-0x/ghc-0x
+  // fixture pattern elsewhere in this file — provider_type via createProvider(),
+  // catalog_hidden via raw SQL since it has no service-layer setter), then
+  // re-request the sitemap and confirm the profile family now appears for the
+  // visible producers and is excluded for the hidden one.
+  const dbForGardssalgP2 = dbFactoryP2.getDb("experiences");
+  const gardssalgProducerIdsP2: string[] = [];
+  for (let i = 0; i < 5; i++) {
+    const gpid = expStoreP2.createProvider({
+      navn: `Sitemap Gårdssalg Produsent ${i}`, org_nr: `93000${i}${i}${i}${i}`,
+      fylke: "Vestland", kommune: "Voss",
+      brreg_verified: 0, verification_status: "pending_verify",
+    });
+    // producer_type (gårdssalg-specific) is a distinct column from the generic
+    // Provider schema's `provider_type` field — createProvider() has no setter
+    // for it, same raw-SQL pattern as the tp-0x/ghc-0x fixtures elsewhere in
+    // this file.
+    dbForGardssalgP2.prepare("UPDATE experience_providers SET producer_type = ? WHERE id = ?").run("sideri", gpid);
+    gardssalgProducerIdsP2.push(gpid);
+  }
+  const hiddenGardssalgIdP2 = expStoreP2.createProvider({
+    navn: "Hidden Test Produsent (sitemap)", org_nr: "940009999",
+    fylke: "Vestland", kommune: "Voss",
+    brreg_verified: 0, verification_status: "pending_verify",
+  });
+  dbForGardssalgP2.prepare("UPDATE experience_providers SET producer_type = ?, catalog_hidden = 1 WHERE id = ?").run("sideri", hiddenGardssalgIdP2);
+
+  const smGardssalgP2 = invokeSeo("/sitemap.xml", {}, "/sitemap.xml");
+  assertEq(smGardssalgP2.status, 200, "p2-06i: sitemap.xml (gårdssalg producers seeded) → 200");
+
+  const gpSlugsP2 = gardssalgProducerIdsP2.map((id) => {
+    const row = dbForGardssalgP2.prepare("SELECT slug FROM experience_providers WHERE id = ?").get(id) as { slug: string | null };
+    return row.slug;
+  });
+  assertTrue(gpSlugsP2.every((s) => !!s),
+    "p2-06j: every visible gårdssalg producer got a slug backfilled by the sitemap request");
+  assertTrue(
+    gpSlugsP2.every((s) => smGardssalgP2.body.includes(`/kategori/gardssalg/produsent/${encodeURIComponent(s as string)}`)),
+    "p2-06k: sitemap includes a /kategori/gardssalg/produsent/<slug> entry for every visible gårdssalg producer"
+  );
+
+  const hiddenSlugRowP2 = dbForGardssalgP2.prepare("SELECT slug FROM experience_providers WHERE id = ?").get(hiddenGardssalgIdP2) as { slug: string | null };
+  assertTrue(!!hiddenSlugRowP2.slug,
+    "p2-06l: the catalog_hidden producer ALSO got a slug backfilled (so the exclusion below tests the catalog_hidden gate itself, not merely 'no slug yet')");
+  assertTrue(
+    !smGardssalgP2.body.includes(`/kategori/gardssalg/produsent/${encodeURIComponent(hiddenSlugRowP2.slug as string)}`),
+    "p2-06m: sitemap excludes the catalog_hidden=1 producer's profile URL"
+  );
+
+  // p2-06n: regression guard — the pre-existing sections (category/fylke/
+  // tilbyder/opplevelse) are unchanged by the new gårdssalg block landing in
+  // the same handler; re-assert the same URLs the original smP2 checks did.
+  assertTrue(smGardssalgP2.body.includes("/kategori/dyreliv_safari") && smGardssalgP2.body.includes("/fylke/Troms") &&
+    smGardssalgP2.body.includes(`/opplevelse/${whaleSlugP2}`) && !smGardssalgP2.body.includes(`/opplevelse/${draftSlugP2}`),
+    "p2-06n: pre-existing sitemap sections are unregressed once the gårdssalg block is active");
+
   // p2-07: homepage relink — category cards → /kategori/, search → /sok, and the
   // human nav links to /opplevelser. The discover JSON contract is NOT linked
   // from the human category cards anymore (still referenced for agents).
