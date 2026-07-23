@@ -32660,3 +32660,25 @@ runSerial(async () => {
     failures.push("consumer-identity-rate-limit: unexpected error: " + String(err?.message || err));
   }
 });
+
+// ── dev-request 2026-07-16-wrong-entity-opprydding-rfb (slookisen/A2A):
+// GET /admin/wrong-entity-retro-sweep — catalog-wide read-only/dry-run-only
+// retro-sweep for wrong-entity-contamination candidates (email-domain vs
+// website-domain mismatch, duplicate boilerplate opening-hours). Own
+// in-memory DB (swaps the shared getDb() singleton) — runs via runSerial()
+// same as the suites above.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-07-16-wrong-entity-opprydding-rfb: wrong-entity-retro-sweep ──");
+  try {
+    const { runAdminWrongEntityRetroSweepTests } = require("../src/routes/admin-wrong-entity-retro-sweep.test") as
+      typeof import("../src/routes/admin-wrong-entity-retro-sweep.test");
+    const wes = await runAdminWrongEntityRetroSweepTests({ log: false });
+    passed += wes.passed;
+    failed += wes.failed;
+    for (const f of wes.failures) failures.push("wrong-entity-retro-sweep: " + f);
+    console.log(`  wrong-entity-retro-sweep: ${wes.passed} passed, ${wes.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("wrong-entity-retro-sweep: unexpected error: " + String(err?.message || err));
+  }
+});
