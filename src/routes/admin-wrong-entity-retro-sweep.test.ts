@@ -27,6 +27,11 @@
  *     agent_ids; exactly 2 identical values NOT flagged; distinct values
  *     never grouped together.
  *   - umbrella agents excluded from every heuristic.
+ *   - is_active=0 (soft-deleted/rejected) agents excluded from every
+ *     heuristic AND from total_agents_scanned; specifically, an is_active=0
+ *     agent sharing a duplicate opening-hours value with only 2 real (live)
+ *     agents does not push that group over the 3+ threshold at all (not
+ *     just hidden from the list of ids).
  *   - 403 without/with-wrong X-Admin-Key.
  *   - zero-writes: full DB row snapshot (agents + agent_knowledge) is
  *     byte-identical before and after calling the endpoint.
@@ -147,6 +152,15 @@ export function runAdminWrongEntityRetroSweepTests(
         `INSERT INTO agent_knowledge (agent_id, website, email, phone, address, opening_hours, field_provenance, about)
          VALUES (?, ?, ?, ?, ?, ?, ?, 'A test farm shop')`,
       );
+      // Same shape as insertAgent above, but with an explicit is_active column
+      // — used only for the is_active=0 (soft-deleted/rejected) fixtures below,
+      // and for the 2 live counterparart agents so the group composition is
+      // unambiguous. Every existing insertAgent.run(...) call above/below is
+      // untouched and keeps relying on the schema's is_active DEFAULT 1.
+      const insertAgentWithActive = db.prepare(
+        `INSERT INTO agents (id, name, description, provider, contact_email, url, role, api_key, umbrella_type, is_active)
+         VALUES (?, ?, 'test agent', 'test', 'x@example.com', ?, 'producer', ?, ?, ?)`,
+      );
 
       const BOILERPLATE_HOURS = JSON.stringify([{ day: "man-lor", open: "10:00", close: "17:00" }]);
       const OTHER_HOURS_A = JSON.stringify([{ day: "man-fre", open: "08:00", close: "16:00" }]);
@@ -212,6 +226,39 @@ export function runAdminWrongEntityRetroSweepTests(
       insertAgent.run("agent-umbrella", "Umbrella AS", "https://umbrella-agenturl.no", "key-umbrella", "network");
       insertKnowledge.run("agent-umbrella", "https://umbrella-realsite.no", "post@umbrella-different-host.no", null, null, BOILERPLATE_HOURS, "{}");
 
+      // (10) is_active=0 exclusion — email/website mismatch heuristic.
+      // Genuine mismatch (differing, non-freemail domains, no homepage
+      // provenance) that WOULD be flagged if active, but the agent is
+      // soft-deleted/rejected (is_active=0) -> must be excluded.
+      insertAgentWithActive.run(
+        "agent-mismatch-inactive", "MismatchInactive AS", "https://mismatchinactive-agenturl.no",
+        "key-mismatchinactive", null, 0,
+      );
+      insertKnowledge.run(
+        "agent-mismatch-inactive", "https://mismatchinactive-realsite.no",
+        "post@totally-different-inactive-company.no", null, null,
+        JSON.stringify([{ day: "mismatch-inactive-unique", open: "12:00", close: "13:00" }]), "{}",
+      );
+
+      // (11) is_active=0 exclusion — duplicate-opening-hours heuristic, and
+      // specifically that the inactive agent does NOT count toward the 3+
+      // threshold (not just that its id is hidden from the list). Only 2
+      // LIVE agents (agent-hours-live-1/2) share OTHER_HOURS_C; a 3rd,
+      // is_active=0 agent shares the exact same string. If the inactive
+      // agent were still counted, this group would wrongly reach 3 and be
+      // flagged; with the fix it must stay at 2 live sharers and NOT be
+      // flagged at all.
+      const OTHER_HOURS_C = JSON.stringify([{ day: "ons-fre", open: "07:00", close: "14:00" }]);
+      insertAgentWithActive.run("agent-hours-live-1", "HoursLive1 AS", "https://hourslive1.no", "key-hourslive1", null, 1);
+      insertKnowledge.run("agent-hours-live-1", "https://hourslive1.no", "post@hourslive1.no", null, null, OTHER_HOURS_C, "{}");
+      insertAgentWithActive.run("agent-hours-live-2", "HoursLive2 AS", "https://hourslive2.no", "key-hourslive2", null, 1);
+      insertKnowledge.run("agent-hours-live-2", "https://hourslive2.no", "post@hourslive2.no", null, null, OTHER_HOURS_C, "{}");
+      insertAgentWithActive.run(
+        "agent-hours-inactive-dup", "HoursInactiveDup AS", "https://hoursinactivedup.no",
+        "key-hoursinactivedup", null, 0,
+      );
+      insertKnowledge.run("agent-hours-inactive-dup", "https://hoursinactivedup.no", "post@hoursinactivedup.no", null, null, OTHER_HOURS_C, "{}");
+
       delete require.cache[require.resolve("./admin-wrong-entity-retro-sweep")];
       const routeMod = require("./admin-wrong-entity-retro-sweep");
       const router = routeMod.default;
@@ -241,6 +288,13 @@ export function runAdminWrongEntityRetroSweepTests(
       assertEq(body.success, true, "wes-04: success:true");
       assertTrue(typeof body.total_agents_scanned === "number" && body.total_agents_scanned > 0,
         "wes-05: total_agents_scanned is a positive number");
+      // Exact count: 8 pre-existing active non-umbrella agents (mismatch,
+      // samedomain, freemail, rescued, hours-pair-1, hours-pair-2,
+      // hours-unique, no-email) + 2 new live agents (hours-live-1/2) = 10.
+      // agent-umbrella (umbrella_type set) and the 2 is_active=0 agents
+      // (mismatch-inactive, hours-inactive-dup) must NOT be counted.
+      assertEq(body.total_agents_scanned, 10,
+        "wes-05b: total_agents_scanned excludes is_active=0 agents (and umbrella agents)");
 
       // ── heuristic 1: email/website mismatch ─────────────────────────────
       const mismatchIds = body.email_domain_mismatch.map((a: any) => a.agent_id).sort();
@@ -260,6 +314,8 @@ export function runAdminWrongEntityRetroSweepTests(
         "wes-13: agent missing email/website is excluded, not crashed on");
       assertTrue(!body.email_domain_mismatch.some((a: any) => a.agent_id === "agent-umbrella"),
         "wes-14: umbrella agent is excluded from email_domain_mismatch even though it would otherwise match");
+      assertTrue(!body.email_domain_mismatch.some((a: any) => a.agent_id === "agent-mismatch-inactive"),
+        "wes-14b: is_active=0 agent with a genuine email/website mismatch is excluded from email_domain_mismatch");
 
       // ── heuristic 2: duplicate opening hours ────────────────────────────
       const boilerplateGroup = body.duplicate_opening_hours.find((g: any) => g.value === BOILERPLATE_HOURS);
@@ -273,6 +329,18 @@ export function runAdminWrongEntityRetroSweepTests(
       const uniqueGroup = body.duplicate_opening_hours.find((g: any) =>
         g.agent_ids && g.agent_ids.includes("agent-hours-unique"));
       assertTrue(!uniqueGroup, "wes-18: a fully unique opening-hours value never appears as a group");
+
+      // is_active=0 exclusion: OTHER_HOURS_C is shared by 2 LIVE agents
+      // (agent-hours-live-1/2) plus 1 is_active=0 agent (agent-hours-inactive-dup).
+      // Proving the inactive agent doesn't count toward the 3+ threshold —
+      // not just that its id is hidden — requires the WHOLE group to be
+      // absent, since only 2 live sharers remain.
+      const inactiveDupGroup = body.duplicate_opening_hours.find((g: any) => g.value === OTHER_HOURS_C);
+      assertTrue(!inactiveDupGroup,
+        "wes-18b: a value shared by only 2 LIVE agents + 1 is_active=0 agent is NOT flagged (inactive agent doesn't count toward the 3+ threshold)");
+      assertTrue(!body.duplicate_opening_hours.some((g: any) =>
+        g.agent_ids && g.agent_ids.includes("agent-hours-inactive-dup")),
+        "wes-18c: is_active=0 agent's id never appears in any duplicate-hours group");
 
       // ── skipped_heuristics ───────────────────────────────────────────────
       assertTrue(Array.isArray(body.skipped_heuristics) && body.skipped_heuristics.length === 2,

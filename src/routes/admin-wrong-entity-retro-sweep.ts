@@ -180,7 +180,7 @@ router.get("/", (req: Request, res: Response) => {
     const db = getDb();
 
     const total_agents_scanned = (
-      db.prepare(`SELECT COUNT(*) AS c FROM agents WHERE umbrella_type IS NULL`).get() as { c: number }
+      db.prepare(`SELECT COUNT(*) AS c FROM agents WHERE umbrella_type IS NULL AND is_active = 1`).get() as { c: number }
     ).c;
 
     // ── Heuristic 1: email-domain vs website-domain mismatch ────────────
@@ -190,6 +190,7 @@ router.get("/", (req: Request, res: Response) => {
            FROM agents a
      INNER JOIN agent_knowledge k ON k.agent_id = a.id
           WHERE a.umbrella_type IS NULL
+            AND a.is_active = 1
             AND k.email IS NOT NULL AND TRIM(k.email) != ''
             AND k.website IS NOT NULL AND TRIM(k.website) != ''
        ORDER BY a.id`
@@ -232,6 +233,7 @@ router.get("/", (req: Request, res: Response) => {
            FROM agents a
      INNER JOIN agent_knowledge k ON k.agent_id = a.id
           WHERE a.umbrella_type IS NULL
+            AND a.is_active = 1
             AND k.opening_hours IS NOT NULL
             AND TRIM(k.opening_hours) NOT IN ('', '[]')
        ORDER BY a.id`
