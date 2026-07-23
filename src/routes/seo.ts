@@ -270,6 +270,18 @@ function buildSalgskanalHomeSection(
 export function formatCat(cat: string): string {
   return CATEGORY_MAP[cat]?.name || CATEGORY_BADGE_LABELS_ONLY[cat] || cat;
 }
+// English category display label — sibling to formatCat() above, which
+// returns a NORWEGIAN label via CATEGORY_MAP. Category keys themselves
+// (vegetables/fruit/berries/dairy/eggs/meat/fish/bread/honey/herbs/bakery/
+// beverages/preserves/other) are already English words in the DB, so this
+// just capitalizes them. dev-request 2026-07-19-en-produsentsider-engelsk-
+// innhold: used to build the EN producer-page meta-description entirely
+// from structured fields (never formatCat()'s NB text). Do not reuse
+// formatCat for English pages.
+export function formatCatEn(cat: string): string {
+  if (!cat) return "";
+  return cat.charAt(0).toUpperCase() + cat.slice(1);
+}
 function catEmoji(cat: string): string {
   return CATEGORY_MAP[cat]?.emoji || "&#127793;";
 }
@@ -3317,6 +3329,66 @@ export function buildCityFaqJsonLd(params: {
   };
 }
 
+// ─── dev-request 2026-07-19-en-produsentsider-engelsk-innhold ──────────────
+// /en/produsent/<slug> pages were reusing the NB <title> and meta-description
+// almost verbatim (Google flags them as thin duplicates of /produsent/<slug>).
+// These two builders are pure functions — extracted out of the route handler
+// specifically so they're directly unit-testable (see
+// src/routes/rfb-producer-en-seo.test.ts), following the same pattern as
+// experiences-seo.ts's seoPageTitle(). The NB/"no" branch of each is
+// byte-for-byte the pre-existing inline template-literal behavior; only the
+// "en" branch is new. Zero LLM/API calls — template/field-based only, per
+// the dev-request spec.
+
+/**
+ * Producer-page <title>. NB output is unchanged. EN output gets a distinct
+ * fallback suffix when cityName is empty, so an English page for a cityless
+ * agent no longer renders a title byte-identical to the NB page's title.
+ */
+export function buildProducerPageTitle(
+  agentName: string,
+  cityName: string,
+  lang: Lang,
+  updatedAtDate: Date | null
+): string {
+  let suffix: string;
+  if (cityName) {
+    suffix = t(lang, "producer.title_suffix", { city: cityName });
+  } else if (lang === "en") {
+    suffix = t(lang, "producer.title_suffix_no_city");
+  } else {
+    suffix = "";
+  }
+  return `${agentName}${suffix}${titleFreshnessSuffix(updatedAtDate)}`;
+}
+
+/**
+ * Producer-page <meta name="description">. NB output is unchanged (still
+ * built from the raw NB `safeDescription` via safeMetaDescription()). EN
+ * output is built ENTIRELY from structured/templated fields — agentName,
+ * cityName, primaryCategory, productCount — and never touches
+ * safeDescription/rawDescription, so untranslated NB prose can never leak
+ * into an EN <meta> tag.
+ */
+export function buildProducerMetaDescription(
+  agentName: string,
+  cityName: string,
+  lang: Lang,
+  safeDescription: string,
+  primaryCategory: string,
+  productCount: number
+): string {
+  if (lang !== "en") {
+    return `${agentName}${cityName ? ` i ${cityName}` : ""}. ${safeMetaDescription(safeDescription) || "Lokalprodusert mat i Norge."}`;
+  }
+  let desc = cityName
+    ? `${agentName} is a local food producer in ${cityName}, Norway.`
+    : `${agentName} is a local food producer in Norway.`;
+  if (primaryCategory) desc += ` ${formatCatEn(primaryCategory)}.`;
+  if (productCount > 0) desc += ` ${productCount} product${productCount === 1 ? "" : "s"} listed.`;
+  return desc;
+}
+
 router.get("/produsent/:slug", (req: Request, res: Response) => {
   const lang = req.lang;
   const slug = (req.params.slug as string).toLowerCase();
@@ -4629,9 +4701,18 @@ router.get("/produsent/:slug", (req: Request, res: Response) => {
       })();
     </script>`;
 
+    // dev-request 2026-07-19-en-produsentsider-engelsk-innhold: same
+    // primaryCategory expression as the related-producers block above
+    // (~line 4418), recomputed here rather than hoisted out of that
+    // try-block's scope — keeps this slice's diff isolated from the
+    // unrelated related-producers try/catch.
+    const primaryCategory = ((agent.categories as string[] | undefined) || [])[0] || "";
+    const pageTitle = buildProducerPageTitle(agent.name, cityName, lang, updatedAtDate);
+    const pageMetaDescription = buildProducerMetaDescription(agent.name, cityName, lang, safeDescription, primaryCategory, productsList.length);
+
     res.send(shell(
-      `${agent.name}${cityName ? t(lang, "producer.title_suffix", { city: cityName }) : ""}${titleFreshnessSuffix(updatedAtDate)}`,
-      `${agent.name}${cityName ? ` ${lang === "en" ? "in" : "i"} ${cityName}` : ""}. ${safeMetaDescription(safeDescription) || (lang === "en" ? "Local food in Norway." : "Lokalprodusert mat i Norge.")}`,
+      pageTitle,
+      pageMetaDescription,
       content,
       { canonical: `${BASE_URL}${localizedPath("/produsent/" + slug, lang)}`, jsonLd: faqJsonLd ? [jsonLd, faqJsonLd] : jsonLd, extraCss: PROFILE_CSS + RELATED_PRODUCERS_CSS, lang, pathForAlternate: "/produsent/" + slug }
     ));

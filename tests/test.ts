@@ -666,6 +666,21 @@ console.log("\n── experiences-seo-title (seoPageTitle clean truncation) ─�
   console.log(`  experiences-seo-title: ${r.passed} passed, ${r.failed} failed`);
 }
 
+// dev-request 2026-07-19-en-produsentsider-engelsk-innhold: /en/produsent/<slug>
+// pages must render a distinct <title> and a template-based (never raw-NB-
+// description) <meta name="description"> from the NB /produsent/<slug> page,
+// while the NB output stays byte-for-byte unchanged.
+console.log("\n── rfb-producer-en-seo (buildProducerPageTitle / buildProducerMetaDescription) ──");
+{
+  const { runRfbProducerEnSeoTests } = require("../src/routes/rfb-producer-en-seo.test") as
+    typeof import("../src/routes/rfb-producer-en-seo.test");
+  const r = runRfbProducerEnSeoTests({ log: false });
+  passed += r.passed;
+  failed += r.failed;
+  for (const f of r.failures) failures.push("rfb-producer-en-seo: " + f);
+  console.log(`  rfb-producer-en-seo: ${r.passed} passed, ${r.failed} failed`);
+}
+
 // ── orchestrator-pr-13: conservative address/phone contact-normalizer ──
 // Pins the formatting-only relaxation in cross-source-validator (clears
 // formatting-only review_required) while keeping genuine conflicts gated.
