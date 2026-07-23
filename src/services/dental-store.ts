@@ -754,7 +754,11 @@ export function countPublicDentalAgents(filter: ListFilter = {}): number {
   const parsed = ListFilterSchema.parse(filter);
   const db = getDb("dental");
 
-  const where: string[] = ["verification_status != 'rejected'"];
+  // dev-request 2026-07-16-dental-hjemmeside-url-vask, item 2: permanently
+  // closed clinics (is_inactive=1, set via /admin/dental/mark-inactive) are
+  // hidden from every public-facing path, unconditionally -- same shape as
+  // the verification_status='rejected' exclusion right above.
+  const where: string[] = ["verification_status != 'rejected'", "(is_inactive IS NULL OR is_inactive = 0)"];
   const params: Record<string, unknown> = {};
 
   if (parsed.fylke) { where.push("fylke = @fylke"); params.fylke = parsed.fylke; }
@@ -790,7 +794,11 @@ export function listPublicDentalAgents(
   const parsed = ListFilterSchema.parse(filter);
   const db = getDb("dental");
 
-  const where: string[] = ["verification_status != 'rejected'"]; // always exclude rejected
+  // dev-request 2026-07-16-dental-hjemmeside-url-vask, item 2: permanently
+  // closed clinics (is_inactive=1, set via /admin/dental/mark-inactive) are
+  // hidden from every public-facing path, unconditionally -- same shape as
+  // the verification_status='rejected' exclusion right below.
+  const where: string[] = ["verification_status != 'rejected'", "(is_inactive IS NULL OR is_inactive = 0)"]; // always exclude rejected + inactive
   const params: Record<string, unknown> = {};
 
   if (parsed.fylke) { where.push("fylke = @fylke"); params.fylke = parsed.fylke; }
@@ -834,9 +842,14 @@ export function listPublicDentalAgents(
  */
 export function getAvailableSpecialties(candidates: string[]): string[] {
   const db = getDb("dental");
+  // dev-request 2026-07-16-dental-hjemmeside-url-vask, item 2: a specialty
+  // offered ONLY by permanently-closed clinics (is_inactive=1) must not be
+  // shown in the dropdown -- same unconditional exclusion as
+  // verification_status='rejected' immediately below.
   const stmt = db.prepare(
     `SELECT 1 FROM dental_agents
      WHERE verification_status != 'rejected'
+       AND (is_inactive IS NULL OR is_inactive = 0)
        AND (available_specialties LIKE @s OR specialists LIKE @p)
      LIMIT 1`
   );
@@ -855,10 +868,13 @@ export interface DentalStats {
   specialist_clinic_count: number;
 }
 
-/** Aggregate stats for the finn-tannlege.com frontpage. Excludes rejected rows. */
+/** Aggregate stats for the finn-tannlege.com frontpage. Excludes rejected and inactive rows. */
 export function getDentalStats(): DentalStats {
   const db = getDb("dental");
-  const base = "FROM dental_agents WHERE verification_status != 'rejected'";
+  // dev-request 2026-07-16-dental-hjemmeside-url-vask, item 2: permanently
+  // closed clinics (is_inactive=1) must not inflate the public frontpage
+  // stats -- same unconditional exclusion shape as verification_status='rejected'.
+  const base = "FROM dental_agents WHERE verification_status != 'rejected' AND (is_inactive IS NULL OR is_inactive = 0)";
 
   const total = (db.prepare(`SELECT COUNT(*) AS n ${base}`).get() as { n: number }).n;
 

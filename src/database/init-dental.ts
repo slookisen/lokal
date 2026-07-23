@@ -406,5 +406,26 @@ export function initDentalSchema(db: Database.Database): void {
     db.exec("ALTER TABLE dental_agents ADD COLUMN directory_url TEXT");
   } catch { /* already present */ }
 
+  // ─── dev-request 2026-07-16-dental-hjemmeside-url-vask, item 2 (nedlagt-
+  //   flagging, 2026-07-23): permanent inactive/closed-clinic flag. There is
+  //   no live fylkeskommune "-stengt" page scraper (separate future
+  //   follow-up) -- the confirmed-closed list is gathered manually via
+  //   research and applied via POST /admin/dental/mark-inactive
+  //   (src/routes/admin-dental-mark-inactive.ts) by explicit id, not a
+  //   sweep. A flagged clinic is hidden from every public search/stats path
+  //   (src/services/dental-store.ts) and from the enrichment claim-batch
+  //   pool (src/services/dental-claim-service.ts) -- unconditionally, same
+  //   as the existing verification_status='rejected' exclusion, since a
+  //   permanently-closed clinic should never be enriched again. Idempotent
+  //   ALTERs -- error = already present.
+  const dentalInactiveCols = [
+    "ALTER TABLE dental_agents ADD COLUMN is_inactive INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE dental_agents ADD COLUMN inactive_reason TEXT",
+    "ALTER TABLE dental_agents ADD COLUMN inactive_since TEXT",
+  ];
+  for (const stmt of dentalInactiveCols) {
+    try { db.exec(stmt); } catch { /* already present */ }
+  }
+
   console.log("[dental] schema initialized");
 }

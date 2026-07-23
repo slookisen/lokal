@@ -227,6 +227,43 @@ export function runDentalClaimServiceTests(opts: { log?: boolean } = {}): TestSu
     assertTrue(c.includes("verification_status = ?"), "item2a-08: verification_status = ? clause still present");
   }
 
+  // ── dev-request 2026-07-16-dental-hjemmeside-url-vask, item 2 (nedlagt-
+  // flagging): is_inactive exclusion is ALWAYS applied -- unlike
+  // excludeParkedExtraction above, there is no opt-in filter flag; no caller
+  // can opt out. ─────────────────────────────────────────────────────────
+  {
+    const filter: ClaimFilter = {};
+    const { clause } = buildWhereClause(filter, NOW);
+    assertTrue(
+      norm(clause).includes("(is_inactive IS NULL OR is_inactive = 0)"),
+      "nedlagt-01: is_inactive exclusion present with no filter at all (unconditional)"
+    );
+  }
+  {
+    // Present alongside every other filter combination -- no flag suppresses it.
+    const filter: ClaimFilter = {
+      enrichment_state: "enriched",
+      verification_status: "verified",
+      excludeParkedExtraction: true,
+    };
+    const { clause } = buildWhereClause(filter, NOW);
+    assertTrue(
+      norm(clause).includes("(is_inactive IS NULL OR is_inactive = 0)"),
+      "nedlagt-02: is_inactive exclusion present alongside every other filter (unconditional, no opt-out)"
+    );
+  }
+  {
+    // Even when the caller explicitly requests thin_site / needs_review /
+    // rejected (which suppress the OTHER always-on exclusions above), the
+    // is_inactive exclusion still applies -- it has no suppression condition.
+    const filter: ClaimFilter = { enrichment_state: "thin_site", verification_status: "rejected" };
+    const { clause } = buildWhereClause(filter, NOW);
+    assertTrue(
+      norm(clause).includes("(is_inactive IS NULL OR is_inactive = 0)"),
+      "nedlagt-03: is_inactive exclusion still applies even when thin_site/rejected are explicitly requested"
+    );
+  }
+
   return { passed, failed, failures };
 }
 

@@ -18762,6 +18762,80 @@ console.log("\n── PR-120: list enrichment_state filter + thin_site parking �
   dbFactoryPr120.__resetDbFactoryForTesting();
 })();
 
+// ── dev-request 2026-07-16-dental-hjemmeside-url-vask, item 2 (nedlagt-
+// flagging): is_inactive excluded from claimBatch unconditionally (no
+// filter flag passed) — same :memory: + claimBatch pattern as PR-120 above.
+console.log("\n── dev-request 2026-07-16-dental-hjemmeside-url-vask, item 2: claimBatch is_inactive exclusion ──");
+(() => {
+  const prevPathNedlagt = process.env.DENTAL_DB_PATH;
+  process.env.DENTAL_DB_PATH = ":memory:";
+
+  const dbFactoryPathNedlagt = require.resolve("../src/database/db-factory");
+  const dentalStorePathNedlagt = require.resolve("../src/services/dental-store");
+  const dentalClaimPathNedlagt = require.resolve("../src/services/dental-claim-service");
+  delete require.cache[dbFactoryPathNedlagt];
+  delete require.cache[dentalStorePathNedlagt];
+  delete require.cache[dentalClaimPathNedlagt];
+
+  const dbFactoryNedlagt = require("../src/database/db-factory") as typeof import("../src/database/db-factory");
+  dbFactoryNedlagt.__resetDbFactoryForTesting();
+  const dbNedlagt = dbFactoryNedlagt.getDb("dental");
+
+  const { claimBatch: claimBatchNedlagt, releaseBatch: releaseBatchNedlagt } =
+    require("../src/services/dental-claim-service") as typeof import("../src/services/dental-claim-service");
+  const { createDentalAgent: createAgentNedlagt } =
+    require("../src/services/dental-store") as typeof import("../src/services/dental-store");
+
+  const activeId = createAgentNedlagt({ org_nr: "999000001", navn: "NEDLAGT-FIXTURE AKTIV KLINIKK", postnummer: "0001", poststed: "OSLO", enrichment_state: "raw" } as any);
+  const inactiveId = createAgentNedlagt({ org_nr: "999000002", navn: "NEDLAGT-FIXTURE STENGT KLINIKK", postnummer: "0001", poststed: "OSLO", enrichment_state: "raw" } as any);
+  dbNedlagt.prepare(
+    "UPDATE dental_agents SET is_inactive = 1, inactive_reason = ?, inactive_since = ? WHERE id = ?",
+  ).run("Stengt, verifisert via fylkeskommunen", "2026-06-01T00:00:00.000Z", inactiveId);
+
+  // (a) default claimBatch (no filter at all) excludes the is_inactive=1 row.
+  {
+    const claimed = claimBatchNedlagt("worker-nedlagt-A", 20, {});
+    const ids = claimed.map((r: any) => r.id);
+    assertTrue(!ids.includes(inactiveId), "nedlagt-claim-01: is_inactive=1 record excluded from default claimBatch pool");
+    assertTrue(ids.includes(activeId), "nedlagt-claim-02: active record still claimable from default claimBatch");
+    releaseBatchNedlagt("worker-nedlagt-A", ids);
+  }
+
+  // (b) exclusion holds even when the caller explicitly requests other
+  //     normally-suppressing filter values (verification_status: rejected,
+  //     enrichment_state: thin_site) -- there is no opt-out for is_inactive.
+  {
+    dbNedlagt.prepare("UPDATE dental_agents SET verification_status = 'rejected', enrichment_state = 'thin_site' WHERE id = ?").run(inactiveId);
+    const claimed = claimBatchNedlagt("worker-nedlagt-B", 20, { verification_status: "rejected", enrichment_state: "thin_site" });
+    const ids = claimed.map((r: any) => r.id);
+    assertTrue(!ids.includes(inactiveId), "nedlagt-claim-03: is_inactive=1 record excluded even when explicitly filtering for rejected+thin_site (no opt-out)");
+    releaseBatchNedlagt("worker-nedlagt-B", ids);
+  }
+
+  // (c) pre-existing filters (excludeParkedExtraction, junk-exclusion,
+  //     thin_site parking) remain green/unmodified alongside the new
+  //     exclusion -- a plain active row with none of those conditions set
+  //     is still claimable.
+  {
+    const claimed = claimBatchNedlagt("worker-nedlagt-C", 20, { excludeParkedExtraction: true });
+    const ids = claimed.map((r: any) => r.id);
+    assertTrue(ids.includes(activeId), "nedlagt-claim-04: active row still claimable with excludeParkedExtraction=true (regression check)");
+    assertTrue(!ids.includes(inactiveId), "nedlagt-claim-05: is_inactive row also excluded when excludeParkedExtraction is set");
+    releaseBatchNedlagt("worker-nedlagt-C", ids);
+  }
+
+  // Cleanup.
+  for (const wid of ["worker-nedlagt-A", "worker-nedlagt-B", "worker-nedlagt-C"]) {
+    try { releaseBatchNedlagt(wid, [activeId, inactiveId]); } catch { /* ignore */ }
+  }
+  if (prevPathNedlagt === undefined) {
+    delete process.env.DENTAL_DB_PATH;
+  } else {
+    process.env.DENTAL_DB_PATH = prevPathNedlagt;
+  }
+  dbFactoryNedlagt.__resetDbFactoryForTesting();
+})();
+
 // ── PR-110 (2026-06-04): MCP lokal_search geocode-enrichment ────────
 // Regression: MCP searches were nationwide text-match because the MCP
 // handler skipped the REST route's extractAndGeocode step. Tests call
@@ -19596,6 +19670,115 @@ console.log("\n── PR-109: finn-tannlege SSR + store extensions ──");
     process.env.DENTAL_DB_PATH = prevPathPr109;
   }
   dbFactory109.__resetDbFactoryForTesting();
+})();
+
+
+// ── dev-request 2026-07-16-dental-hjemmeside-url-vask, item 2 (nedlagt-
+// flagging): is_inactive exclusion from every public search/stats path ──
+// (src/services/dental-store.ts: countPublicDentalAgents, listPublicDental
+// Agents, getAvailableSpecialties, getDentalStats) — same :memory: pattern
+// as PR-109 immediately above. is_inactive is set via raw SQL (mirrors how
+// the mark-inactive admin route itself writes it), not via
+// createDentalAgent/updateDentalAgent — there is no public write path for
+// this column outside that route.
+console.log("\n── dev-request 2026-07-16-dental-hjemmeside-url-vask, item 2: is_inactive exclusion (dental-store) ──");
+(() => {
+  const prevPathInactive = process.env.DENTAL_DB_PATH;
+  process.env.DENTAL_DB_PATH = ":memory:";
+
+  const dbFactoryPathInactive = require.resolve("../src/database/db-factory");
+  const dentalStorePathInactive = require.resolve("../src/services/dental-store");
+  delete require.cache[dbFactoryPathInactive];
+  delete require.cache[dentalStorePathInactive];
+
+  const dbFactoryInactive = require("../src/database/db-factory") as typeof import("../src/database/db-factory");
+  dbFactoryInactive.__resetDbFactoryForTesting();
+  const dbInactive = dbFactoryInactive.getDb("dental");
+
+  const {
+    createDentalAgent: createAgentInactive,
+    countPublicDentalAgents: countPublicInactive,
+    listPublicDentalAgents: listPublicInactive,
+    getAvailableSpecialties: getAvailableSpecialtiesInactive,
+    getDentalStats: getDentalStatsInactive,
+  } = require("../src/services/dental-store") as typeof import("../src/services/dental-store");
+
+  const activeId1 = createAgentInactive({
+    navn: "Inactive-Fixture Aktiv Tannlege 1", poststed: "OSLO", fylke: "Oslo",
+    helfo_agreement: "true", acute_vakt: 1,
+    available_specialties: ["periodonti-inactive-fixture"],
+  } as any);
+  const activeId2 = createAgentInactive({
+    navn: "Inactive-Fixture Aktiv Tannlege 2", poststed: "BERGEN", fylke: "Vestland",
+    helfo_agreement: "false", acute_vakt: 0,
+  } as any);
+  const closedId = createAgentInactive({
+    navn: "Inactive-Fixture Nedlagt Tannlege", poststed: "OSLO", fylke: "Oslo",
+    helfo_agreement: "true", acute_vakt: 1,
+    available_specialties: ["periodonti-inactive-fixture"],
+  } as any);
+  // Flag the third clinic as permanently closed — mirrors the write shape of
+  // POST /admin/dental/mark-inactive (raw UPDATE, no public store helper).
+  dbInactive.prepare(
+    "UPDATE dental_agents SET is_inactive = 1, inactive_reason = ?, inactive_since = ? WHERE id = ?",
+  ).run("Stengt, verifisert via fylkeskommunen", "2026-06-01T00:00:00.000Z", closedId);
+
+  // ── countPublicDentalAgents excludes the inactive fixture row ───────────
+  {
+    const total = countPublicInactive({});
+    assertEq(total, 2, "inactive-01: countPublicDentalAgents({}) excludes the is_inactive=1 fixture row (2 of 3)");
+    const oslo = countPublicInactive({ fylke: "Oslo" });
+    assertEq(oslo, 1, "inactive-02: countPublicDentalAgents(fylke=Oslo) excludes the inactive Oslo fixture row (1 of 2)");
+  }
+
+  // ── listPublicDentalAgents excludes the inactive fixture row ────────────
+  {
+    const list = listPublicInactive({}, 100, 0);
+    const ids = list.map((r) => r.id);
+    assertTrue(ids.includes(activeId1), "inactive-03: listPublicDentalAgents includes active fixture row 1");
+    assertTrue(ids.includes(activeId2), "inactive-04: listPublicDentalAgents includes active fixture row 2");
+    assertTrue(!ids.includes(closedId), "inactive-05: listPublicDentalAgents excludes the is_inactive=1 fixture row");
+  }
+
+  // ── getAvailableSpecialties: a specialty offered ONLY by the closed
+  //    clinic + an also-active clinic still shows (covered by the active
+  //    one); if BOTH holders were closed it would be hidden. Here activeId1
+  //    also offers it, so it stays visible — proves the exclusion is at the
+  //    row level (closedId doesn't count toward coverage), not a blanket
+  //    "specialty seen anywhere" check.
+  {
+    const offered = getAvailableSpecialtiesInactive(["periodonti-inactive-fixture", "kjeveortopedi-inactive-fixture-unused"]);
+    assertTrue(offered.includes("periodonti-inactive-fixture"), "inactive-06: specialty still offered via the active clinic that also has it");
+    assertTrue(!offered.includes("kjeveortopedi-inactive-fixture-unused"), "inactive-07: specialty with zero coverage anywhere stays hidden (sanity)");
+  }
+  // A specialty offered ONLY by the closed clinic must be hidden.
+  {
+    const soloClosedId = createAgentInactive({
+      navn: "Inactive-Fixture Solo Nedlagt Spesialist", poststed: "OSLO", fylke: "Oslo",
+      available_specialties: ["endodonti-inactive-only-fixture"],
+    } as any);
+    dbInactive.prepare("UPDATE dental_agents SET is_inactive = 1 WHERE id = ?").run(soloClosedId);
+    const offered = getAvailableSpecialtiesInactive(["endodonti-inactive-only-fixture"]);
+    assertTrue(!offered.includes("endodonti-inactive-only-fixture"), "inactive-08: a specialty offered ONLY by a closed clinic is hidden from the dropdown");
+  }
+
+  // ── getDentalStats excludes the inactive fixture row from every count ──
+  {
+    const stats = getDentalStatsInactive();
+    assertEq(stats.total, 2, "inactive-09: getDentalStats.total excludes is_inactive=1 rows (2 active fixture rows, not counting the extra solo-closed one)");
+    assertEq(stats.helfo_count, 1, "inactive-10: getDentalStats.helfo_count excludes the inactive fixture row (only activeId1 has helfo=true)");
+    assertEq(stats.acute_count, 1, "inactive-11: getDentalStats.acute_count excludes the inactive fixture row (only activeId1 has acute_vakt=1)");
+    const osloEntry = stats.per_fylke.find((f) => f.fylke === "Oslo");
+    assertEq(osloEntry?.count, 1, "inactive-12: getDentalStats.per_fylke Oslo count excludes the closed Oslo clinics (only activeId1)");
+  }
+
+  // Cleanup.
+  if (prevPathInactive === undefined) {
+    delete process.env.DENTAL_DB_PATH;
+  } else {
+    process.env.DENTAL_DB_PATH = prevPathInactive;
+  }
+  dbFactoryInactive.__resetDbFactoryForTesting();
 })();
 
 
@@ -29368,6 +29551,20 @@ const _recentlyEnrichedSpotcheckPromise: Promise<void> = new Promise<void>(r => 
   } catch (err: any) {
     failed++;
     failures.push("admin-dental-hjemmeside-cleanup: unexpected error: " + String(err?.message || err));
+  }
+
+  console.log("\n── dev-request 2026-07-16-dental-hjemmeside-url-vask, item 2 (nedlagt-flagging): POST /admin/dental/mark-inactive ──");
+  try {
+    const { runAdminDentalMarkInactiveTests } = require("../src/routes/admin-dental-mark-inactive.test") as
+      typeof import("../src/routes/admin-dental-mark-inactive.test");
+    const dmi = await runAdminDentalMarkInactiveTests({ log: false });
+    passed += dmi.passed;
+    failed += dmi.failed;
+    for (const f of dmi.failures) failures.push("admin-dental-mark-inactive: " + f);
+    console.log(`  admin-dental-mark-inactive: ${dmi.passed} passed, ${dmi.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("admin-dental-mark-inactive: unexpected error: " + String(err?.message || err));
   }
 
   console.log("\n── dev-request 2026-07-21-dental-schema-probe-writepath-fix (follow-up): POST /admin/dental/schema-probe-sweep ──");
