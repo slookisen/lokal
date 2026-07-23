@@ -22239,6 +22239,12 @@ const _orchPr20260614_6Promise: Promise<void> = new Promise<void>(r => { _orchPr
       price_nok REAL,
       currency TEXT NOT NULL DEFAULT 'NOK',
       availability TEXT NOT NULL DEFAULT 'in_stock',
+      -- dev-request 2026-07-23-supplygraph: cart-service's addCartItem/
+      -- submitCart now read this (effectiveAvailability()) instead of the
+      -- raw availability column alone — every hand-rolled minimal schema
+      -- that cart-service queries against must carry it or those queries
+      -- throw "no such column".
+      availability_updated_at TEXT,
       stock_qty INTEGER,
       category TEXT,
       image_url TEXT,
@@ -22342,31 +22348,41 @@ const _orchPr20260614_6Promise: Promise<void> = new Promise<void>(r => { _orchPr
   // ── Seed two verified producers with products ─────────────────────────────
   cartDb.prepare("INSERT INTO agents (id, name, city) VALUES (?, ?, ?)").run("ag-carrot", "Gangstad Gård", "Trondheim");
   cartDb.prepare("INSERT INTO agent_knowledge (agent_id, verification_status) VALUES (?, 'verified')").run("ag-carrot");
-  cartDb.prepare("INSERT INTO products (id, agent_id, name, name_norm, price_nok, unit, availability) VALUES (?,?,?,?,?,?,?)").run(
+  // dev-request 2026-07-23-supplygraph: in_stock fixtures below all stamp a
+  // FRESH availability_updated_at (datetime('now')) — without it,
+  // effectiveAvailability() degrades a never-confirmed row to 'unknown' and
+  // cart-service's now-hardened checks would reject it (see git show
+  // f3accba -- tests/test.ts for the same fix applied to the pid-agent
+  // fixture earlier in this file).
+  cartDb.prepare("INSERT INTO products (id, agent_id, name, name_norm, price_nok, unit, availability, availability_updated_at) VALUES (?,?,?,?,?,?,?,datetime('now'))").run(
     "prod-carrot", "ag-carrot", "Gulrøtter", "gulrøtter", 30.0, "kg", "in_stock"
   );
 
   cartDb.prepare("INSERT INTO agents (id, name, city) VALUES (?, ?, ?)").run("ag-honey", "Biene Honning", "Bergen");
   cartDb.prepare("INSERT INTO agent_knowledge (agent_id, verification_status) VALUES (?, 'verified')").run("ag-honey");
-  cartDb.prepare("INSERT INTO products (id, agent_id, name, name_norm, price_nok, unit, availability) VALUES (?,?,?,?,?,?,?)").run(
+  cartDb.prepare("INSERT INTO products (id, agent_id, name, name_norm, price_nok, unit, availability, availability_updated_at) VALUES (?,?,?,?,?,?,?,datetime('now'))").run(
     "prod-honey", "ag-honey", "Honning", "honning", 150.0, "glass", "in_stock"
   );
 
   // Seed an unverified producer and product
   cartDb.prepare("INSERT INTO agents (id, name, city) VALUES (?, ?, ?)").run("ag-unverf", "Uverifisert Gård", "Oslo");
   cartDb.prepare("INSERT INTO agent_knowledge (agent_id, verification_status) VALUES (?, 'unverified')").run("ag-unverf");
-  cartDb.prepare("INSERT INTO products (id, agent_id, name, name_norm, price_nok, availability) VALUES (?,?,?,?,?,?)").run(
+  cartDb.prepare("INSERT INTO products (id, agent_id, name, name_norm, price_nok, availability, availability_updated_at) VALUES (?,?,?,?,?,?,datetime('now'))").run(
     "prod-unverf", "ag-unverf", "Urter", "urter", 50.0, "in_stock"
   );
 
   // Seed an umbrella producer
   cartDb.prepare("INSERT INTO agents (id, name, city, umbrella_type) VALUES (?, ?, ?, ?)").run("ag-umbrella", "REKO Ring Test", "Oslo", "reko");
   cartDb.prepare("INSERT INTO agent_knowledge (agent_id, verification_status) VALUES (?, 'verified')").run("ag-umbrella");
-  cartDb.prepare("INSERT INTO products (id, agent_id, name, name_norm, price_nok, availability) VALUES (?,?,?,?,?,?)").run(
+  cartDb.prepare("INSERT INTO products (id, agent_id, name, name_norm, price_nok, availability, availability_updated_at) VALUES (?,?,?,?,?,?,datetime('now'))").run(
     "prod-umbrella", "ag-umbrella", "Noe", "noe", 100.0, "in_stock"
   );
 
-  // Seed an out_of_stock product
+  // Seed an out_of_stock product. Note: 'out_of_stock' was never a valid
+  // producer-settable enum value even before this feature (see
+  // PRODUCT_AVAILABILITY_VALUES) — effectiveAvailability() degrades any
+  // non-enum raw value to 'unknown' regardless of freshness, so this fixture
+  // needs no availability_updated_at stamp to keep behaving as "rejected".
   cartDb.prepare("INSERT INTO products (id, agent_id, name, name_norm, price_nok, availability) VALUES (?,?,?,?,?,?)").run(
     "prod-oos", "ag-carrot", "Tomater", "tomater", 25.0, "out_of_stock"
   );

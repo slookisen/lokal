@@ -424,6 +424,71 @@ export function runSupplyGraphAvailabilityTests(opts: { log?: boolean } = {}): P
         assertTrue(!text.includes("·  ·"), "mcp format regression: no double-suffix artifact when there's no catalog entry");
         assertTrue(!text.includes("id:"), "mcp format regression: no id fragment when there's no catalog entry");
       }
+      // ══════════════════════════════════════════════════════════════════
+      // (E) cart-service: a STALE 'in_stock' product is REJECTED at both
+      // add-to-cart AND submit — review round 1 blocking finding. This is
+      // the "id obtained earlier (or via the public catalog products
+      // endpoint), submitted later via lokal_cart_add_item" gap: the raw
+      // `availability` column still says 'in_stock', but
+      // availability_updated_at is older than AVAILABILITY_STALE_DAYS, so
+      // effectiveAvailability() must degrade it to 'unknown' and both
+      // addCartItem()/submitCart() must refuse it, exactly like a
+      // genuinely sold_out product — "grafen skal aldri lyve" has to hold
+      // at the one point that actually matters: an order is generated.
+      // ══════════════════════════════════════════════════════════════════
+
+      {
+        rePin();
+        const cartSvc = require("../services/cart-service") as typeof import("../services/cart-service");
+        const { cart_id } = cartSvc.createCart();
+
+        // (E1) addCartItem: prod-stale (raw availability='in_stock', but
+        // availability_updated_at is 20 days old) must be REJECTED, not
+        // silently added.
+        const addStale = cartSvc.addCartItem(cart_id, "prod-stale", 1);
+        assertEq(addStale.success, false, "cart-service addCartItem: STALE in_stock product REJECTED, not silently added");
+        if (!addStale.success) {
+          assertEq(addStale.status, 409, "cart-service addCartItem: stale product -> 409");
+          assertTrue(
+            /not in stock|no longer available/i.test(addStale.error),
+            `cart-service addCartItem: error message indicates unavailability (got "${addStale.error}")`,
+          );
+        }
+
+        // (E2) submitCart: a product that was legitimately FRESH in_stock
+        // when added, then goes stale before submit (the realistic gap —
+        // an id held across a conversation turn), must be RE-CHECKED at
+        // submit time using EFFECTIVE availability and rejected.
+        insertProduct("prod-goes-stale", "ag-a", { availability: "in_stock", freshDaysAgo: 1 });
+        const addFresh = cartSvc.addCartItem(cart_id, "prod-goes-stale", 1);
+        assertEq(addFresh.success, true, "cart-service addCartItem: fresh in_stock product added successfully (setup for E2)");
+
+        // Age it past the staleness window WITHOUT touching the raw
+        // `availability` column — this is exactly "never reconfirmed",
+        // not "producer marked it unavailable".
+        db.prepare(
+          "UPDATE products SET availability_updated_at = datetime('now', '-20 days') WHERE id = 'prod-goes-stale'"
+        ).run();
+
+        const submitResult = cartSvc.submitCart(cart_id);
+        assertEq(submitResult.success, false, "cart-service submitCart: item that went STALE since being added -> submit REJECTED");
+        if (!submitResult.success) {
+          assertEq(submitResult.status, 409, "cart-service submitCart: stale item -> 409");
+          assertTrue(
+            !!submitResult.error && /no longer available/i.test(submitResult.error),
+            `cart-service submitCart: error message indicates unavailability (got "${submitResult.error}")`,
+          );
+          const unavail = submitResult.unavailable || [];
+          const entry = unavail.find((u) => u.product_id === "prod-goes-stale");
+          assertTrue(!!entry, "cart-service submitCart: unavailable[] includes the now-stale product");
+          assertEq(entry?.availability, "unknown", "cart-service submitCart: unavailable[].availability reflects EFFECTIVE ('unknown'), not the raw stored 'in_stock'");
+        }
+
+        // No order must have been created for this cart — the transaction
+        // must never have run.
+        const orderCount = (db.prepare("SELECT COUNT(*) AS n FROM orders WHERE cart_id = ?").get(cart_id) as { n: number }).n;
+        assertEq(orderCount, 0, "cart-service submitCart: no order created when submit is rejected for staleness");
+      }
     } finally {
       initMod.__setDbForTesting(prevDb);
       if (prevAdminKey === undefined) delete process.env.ADMIN_KEY;

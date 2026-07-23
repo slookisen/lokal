@@ -188,6 +188,55 @@ export function runProductAvailabilityServiceTests(opts: { log?: boolean } = {})
     }
   }
 
+  // ── mergeAvailabilityProvenance() malformed-JSON fallback (review round 1
+  //    follow-up) — a corrupt/non-object `field_provenance` column (e.g.
+  //    hand-edited data, a future format change, legacy garbage) must never
+  //    THROW and block a write; it should fall back to a fresh `{}` instead.
+  //    mergeAvailabilityProvenance() itself isn't exported, so this drives it
+  //    indirectly through setProductAvailability(), the same way every other
+  //    test in this file exercises it. ──────────────────────────────────────
+  {
+    insertProduct("prod-a4", "ag-a");
+    // Not valid JSON at all.
+    db.prepare("UPDATE products SET field_provenance = ? WHERE id = 'prod-a4'").run("{not valid json!!!");
+
+    let threw: unknown = null;
+    let result: ReturnType<typeof setProductAvailability> | null = null;
+    try {
+      result = setProductAvailability({ agentId: "ag-a", productId: "prod-a4", availability: "sold_out" });
+    } catch (err) {
+      threw = err;
+    }
+    assertTrue(threw === null, `malformed-JSON provenance: setProductAvailability does NOT throw (got: ${String(threw)})`);
+    assertTrue(!!result && result.ok, "malformed-JSON provenance: write still succeeds");
+    if (result && result.ok) {
+      const prov = JSON.parse(result.product.field_provenance) as { availability?: AvailabilityProvenanceRecord[] };
+      assertTrue(Array.isArray(prov.availability), "malformed-JSON provenance: falls back to {} then rebuilds a valid availability array");
+      assertEq(prov.availability?.length, 1, "malformed-JSON provenance: exactly one record (prior garbage discarded, not merged)");
+      assertEq(prov.availability?.[0]?.value, "sold_out", "malformed-JSON provenance: new record's value is correct");
+    }
+
+    // Also cover valid-JSON-but-wrong-shape (a JSON array, not an object) —
+    // same fallback path, different branch of the `typeof === "object" &&
+    // !Array.isArray()` guard.
+    insertProduct("prod-a5", "ag-a");
+    db.prepare("UPDATE products SET field_provenance = ? WHERE id = 'prod-a5'").run("[1,2,3]");
+    let threw2: unknown = null;
+    let result2: ReturnType<typeof setProductAvailability> | null = null;
+    try {
+      result2 = setProductAvailability({ agentId: "ag-a", productId: "prod-a5", availability: "seasonal" });
+    } catch (err) {
+      threw2 = err;
+    }
+    assertTrue(threw2 === null, `array-shaped provenance: setProductAvailability does NOT throw (got: ${String(threw2)})`);
+    if (result2 && result2.ok) {
+      const prov = JSON.parse(result2.product.field_provenance) as { availability?: AvailabilityProvenanceRecord[] };
+      assertEq(prov.availability?.length, 1, "array-shaped provenance: falls back to {} then rebuilds a valid availability array");
+    } else {
+      assertTrue(false, "array-shaped provenance: expected success");
+    }
+  }
+
   // ── effectiveAvailability() — the pure auto-expiry rule ──────────────────
   {
     const NOW = new Date("2026-07-23T12:00:00Z");

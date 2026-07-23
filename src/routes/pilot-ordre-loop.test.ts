@@ -118,9 +118,14 @@ export async function runPilotOrdreLoopTests(opts: { log?: boolean } = {}): Prom
     const insertKnowledge = testDb.prepare(
       "INSERT INTO agent_knowledge (agent_id, verification_status) VALUES (?, ?)"
     );
+    // dev-request 2026-07-23-supplygraph: in_stock rows also need a FRESH
+    // availability_updated_at, or effectiveAvailability() degrades them to
+    // 'unknown' (never-confirmed) and cart-service's now-hardened checks
+    // reject them — mirrors the pid-agent fixture fix in tests/test.ts
+    // (see git show f3accba -- tests/test.ts).
     const insertProduct = testDb.prepare(`
-      INSERT INTO products (id, agent_id, name, name_norm, price_nok, unit, availability)
-      VALUES (?, ?, ?, ?, ?, ?, 'in_stock')
+      INSERT INTO products (id, agent_id, name, name_norm, price_nok, unit, availability, availability_updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, 'in_stock', datetime('now'))
     `);
 
     // Verified producer WITHOUT opt-in (the platform default) — negative case.

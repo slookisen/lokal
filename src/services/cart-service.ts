@@ -17,6 +17,7 @@ import { randomUUID, randomBytes } from "crypto";
 import { getDb } from "../database/init";
 import { recordTrustEvent } from "./trust-event-service";
 import { sendOrderNotificationForOrder, OrderNotificationInput } from "./order-notify-service";
+import { effectiveAvailability } from "../config/supply-graph";
 
 // ─── Test-DB override (module-local, race-proof) ─────────────────────────────
 // In production _cartTestDb is always null → getDb() is used as normal.
@@ -177,17 +178,23 @@ export function addCartItem(
   }
 
   // Verify product
+  // dev-request 2026-07-23-supplygraph: availability_updated_at is required
+  // here so the effective-availability check below can't be bypassed by a
+  // stale-but-still-'in_stock' raw column value ("grafen skal aldri lyve" —
+  // reachable via lokal_cart_add_item with an arbitrary caller-supplied
+  // product_id, not just the REST API).
   const product = db.prepare(`
-    SELECT p.id, p.agent_id, p.availability, p.price_nok
+    SELECT p.id, p.agent_id, p.availability, p.availability_updated_at, p.price_nok
     FROM products p
     WHERE p.id = ?
   `).get(productId) as
-    | { id: string; agent_id: string; availability: string; price_nok: number | null }
+    | { id: string; agent_id: string; availability: string; availability_updated_at: string | null; price_nok: number | null }
     | undefined;
 
   if (!product) return { success: false, status: 404, error: "Product not found" };
-  if (product.availability !== "in_stock") {
-    return { success: false, status: 409, error: `Product is not in stock (availability: ${product.availability})` };
+  const effAvailability = effectiveAvailability(product.availability, product.availability_updated_at);
+  if (effAvailability !== "in_stock") {
+    return { success: false, status: 409, error: `Product is not in stock (availability: ${effAvailability})` };
   }
 
   // Verify producer eligibility
@@ -382,9 +389,10 @@ export function submitCart(cartId: string): SubmitResult {
       ci.qty,
       ci.unit_price_snapshot,
       ci.line_note,
-      p.name        AS product_name,
-      p.unit        AS unit,
-      p.availability AS availability,
+      p.name                     AS product_name,
+      p.unit                     AS unit,
+      p.availability              AS availability,
+      p.availability_updated_at   AS availability_updated_at,
       a.name        AS producer_name
     FROM cart_items ci
     INNER JOIN products p ON p.id = ci.product_id
@@ -400,6 +408,7 @@ export function submitCart(cartId: string): SubmitResult {
     product_name: string;
     unit: string | null;
     availability: string;
+    availability_updated_at: string | null;
     producer_name: string;
   }>;
 
@@ -407,8 +416,13 @@ export function submitCart(cartId: string): SubmitResult {
     return { success: false, status: 400, error: "Cart is empty" };
   }
 
-  // Re-check availability for every item (mandatory per spec)
-  const unavailable = items.filter(i => i.availability !== "in_stock");
+  // Re-check availability for every item (mandatory per spec).
+  // dev-request 2026-07-23-supplygraph: use the read-time EFFECTIVE
+  // availability, not the raw stored column — a product whose availability
+  // was never reconfirmed (or went stale since it was added to the cart)
+  // must be rejected here even though its raw `availability` column still
+  // says 'in_stock' ("grafen skal aldri lyve" applies at submit-time too).
+  const unavailable = items.filter(i => effectiveAvailability(i.availability, i.availability_updated_at) !== "in_stock");
   if (unavailable.length > 0) {
     return {
       success: false,
@@ -417,7 +431,7 @@ export function submitCart(cartId: string): SubmitResult {
       unavailable: unavailable.map(i => ({
         product_id: i.product_id,
         product_name: i.product_name,
-        availability: i.availability,
+        availability: effectiveAvailability(i.availability, i.availability_updated_at),
       })),
     };
   }
