@@ -1134,6 +1134,25 @@ function initSchema(db: Database.Database): void {
     }
   }
 
+  // ─── dev-request 2026-07-16-wrong-entity-opprydding-rfb (platform-wide
+  // retro-sweep detector) — parking for POST /admin/verifier/wrong-entity-
+  // retro-sweep (admin-wrong-entity-retro-sweep.ts). Same idiom as
+  // domain_reconciliation_checked_at above: stamped on every agent the sweep
+  // looked at (apply:true), 30-day backoff so the daily verifier doesn't
+  // re-surface the SAME duplicate-value cluster / postal-code mismatch every
+  // run. wrong_entity_retro_outcome is one of 'no_action_needed' |
+  // 'duplicate_cluster' | 'postal_mismatch' | 'duplicate_cluster+postal_mismatch'.
+  for (const stmt of [
+    `ALTER TABLE agent_knowledge ADD COLUMN wrong_entity_retro_checked_at TEXT`,
+    `ALTER TABLE agent_knowledge ADD COLUMN wrong_entity_retro_outcome TEXT`,
+  ]) {
+    try {
+      db.exec(stmt);
+    } catch {
+      // Column already exists — expected after first migration
+    }
+  }
+
   // ─── dev-request 2026-07-12-rfb-enrichment-pool-refill-and-waste-reduction
   // (item 6 follow-up) — pending_verify no-progress parking ────────────────
   // pending_verify_no_progress_count: increments every time a re-verification

@@ -32660,3 +32660,23 @@ runSerial(async () => {
     failures.push("consumer-identity-rate-limit: unexpected error: " + String(err?.message || err));
   }
 });
+
+// dev-request 2026-07-16-wrong-entity-opprydding-rfb: platform-wide retro-
+// sweep detector (POST /admin/verifier/wrong-entity-retro-sweep). Own
+// in-memory DB (swaps the shared getDb() singleton) — runs via runSerial()
+// same as the three suites above.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-07-16-wrong-entity-opprydding-rfb: wrong-entity retro-sweep detector ──");
+  try {
+    const { runAdminWrongEntityRetroSweepTests } = require("../src/routes/admin-wrong-entity-retro-sweep.test") as
+      typeof import("../src/routes/admin-wrong-entity-retro-sweep.test");
+    const wers = await runAdminWrongEntityRetroSweepTests({ log: false });
+    passed += wers.passed;
+    failed += wers.failed;
+    for (const f of wers.failures) failures.push("wrong-entity-retro-sweep: " + f);
+    console.log(`  wrong-entity-retro-sweep: ${wers.passed} passed, ${wers.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("wrong-entity-retro-sweep: unexpected error: " + String(err?.message || err));
+  }
+});

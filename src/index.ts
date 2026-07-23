@@ -57,6 +57,7 @@ import ownerPortalRoutes from "./routes/owner-portal";
 import adminAgentAuditRoutes from "./routes/admin-agent-audit";
 import adminVerifierReviewQueueRoutes from "./routes/admin-verifier-review-queue";
 import adminDomainCoherenceSweepRoutes from "./routes/admin-domain-coherence";
+import adminWrongEntityRetroSweepRoutes from "./routes/admin-wrong-entity-retro-sweep";
 import adminDentalHjemmesideCleanupRoutes from "./routes/admin-dental-hjemmeside-cleanup";
 import adminDentalMarkInactiveRoutes from "./routes/admin-dental-mark-inactive";
 import adminDentalSchemaProbeSweepRoutes from "./routes/admin-dental-schema-probe-sweep";
@@ -562,6 +563,11 @@ app.use("/admin/verifier-review-queue", adminLimiter, adminVerifierReviewQueueRo
 // classify the review_required cohort into auto-fixable/manual-review/
 // circular-scramble buckets; dry-run by default, apply:true writes.
 app.use("/admin/verifier/domain-coherence-sweep", adminLimiter, adminDomainCoherenceSweepRoutes);
+// dev-request 2026-07-16-wrong-entity-opprydding-rfb: platform-wide retro-
+// sweep detector — duplicate-value clusters (address/phone/opening_hours
+// shared across 3+ unrelated agents) + postal-code-vs-address mismatches.
+// Report-only; apply:true only stamps parking, never writes content fields.
+app.use("/admin/verifier/wrong-entity-retro-sweep", adminLimiter, adminWrongEntityRetroSweepRoutes);
 // dev-request 2026-07-18-dental-hjemmeside-directory-portal-cleanup: moves
 // directory/booking-portal/industry-association URLs out of dental_agents.
 // hjemmeside into the additive directory_url column — dry-run by default,
