@@ -49,6 +49,12 @@ import { normaliseName } from "./brreg-client";
 // slice 5d — reuse the curated directory/aggregator host classifier + URL→host
 // parser (single source of truth, dev-request 2026-07-19-agg-website-leak).
 import { isDirectoryOrAggregatorHost, hostFromUrlLike } from "./cross-source-validator";
+// dev-request 2026-07-21-gardssalg-soekebasert-nettsidefunn — search-based
+// website-discovery candidate source. BraveResult is the shape braveSearch()
+// already returns; only the TYPE is needed here (the pure host-extraction
+// helper below never calls braveSearch itself — the route wires the real
+// network call, see routes/opplevelser.ts).
+import type { BraveResult } from "./search-enrich";
 import {
   findExistingCandidateMatch,
   scoreExperienceRichness,
@@ -3335,6 +3341,58 @@ export function gardssalgSharedDomainReason(host: string | null): string | null 
   return null;
 }
 
+// ─── Social-media exclusion (dev-request 2026-07-21-gardssalg-soekebasert-
+//     nettsidefunn) ─────────────────────────────────────────────────────────
+//
+// Search-based candidate generation (below) commonly turns up a producer's
+// Facebook/Instagram page rather than a real homepage — very common for
+// small Norwegian gårdssalg producers who have no website at all. facebook.com
+// and instagram.com already trip isDirectoryOrAggregatorHost (they're in
+// KNOWN_DIRECTORY_HOSTS), so they were already blocked from ever being
+// proposed as a homepage — but that generic "blocklisted_directory_domain"
+// reason doesn't tell the reviewer/operator that this specific host is a
+// social profile (a genuinely useful "found the producer, but not a
+// homepage" signal) rather than an unrelated tourism/aggregator directory.
+// This gives that a dedicated, more specific reason, checked BEFORE the
+// generic directory check. A small curated list — kept separate from
+// KNOWN_DIRECTORY_HOSTS on purpose (that set is the single source of truth
+// for "never a producer's own site"; this one is only about NAMING the
+// social-media subset of it for reporting).
+const SOCIAL_MEDIA_HOSTS: ReadonlySet<string> = new Set([
+  "facebook.com",
+  "instagram.com",
+  "tiktok.com",
+  "twitter.com",
+  "x.com",
+  "youtube.com",
+  "linkedin.com",
+  "pinterest.com",
+  "snapchat.com",
+]);
+
+/** Pure host-level rule — exported for tests. Suffix-walks like
+ * isDirectoryOrAggregatorHost so e.g. "m.facebook.com" / "business.facebook.com"
+ * also match, not just the bare eTLD+1. */
+export function gardssalgSocialMediaHostReason(host: string | null): string | null {
+  if (!host) return null;
+  const h = host.toLowerCase().replace(/^www\./, "").replace(/\.$/, "");
+  const labels = h.split(".").filter(Boolean);
+  for (let i = 0; i + 2 <= labels.length; i++) {
+    if (SOCIAL_MEDIA_HOSTS.has(labels.slice(i).join("."))) return "social_media_host";
+  }
+  return null;
+}
+
+/** Combined pre-fetch exclusion reason for a website-discovery candidate host
+ * (social-media checked first — a more specific/useful reason than the
+ * generic directory one for hosts that happen to be in both). Exported for
+ * tests; the route uses this single entry point for BOTH the initial
+ * candidate host and the post-redirect final-host re-check, so social and
+ * directory/DMO exclusion apply identically at both points. */
+export function gardssalgWebsiteHostExclusionReason(host: string | null): string | null {
+  return gardssalgSocialMediaHostReason(host) ?? gardssalgSharedDomainReason(host);
+}
+
 /**
  * Catalog-wide shared-domain map: host → number of gårdssalg providers whose
  * hjemmeside lives on it. One cheap full scan (the catalog is two-digit
@@ -3450,6 +3508,9 @@ export type GardssalgWebsiteDiscoveryTarget = {
   kommune: string | null;
   poststed: string | null;
   content_source: string | null;
+  // dev-request 2026-07-21-gardssalg-soekebasert-nettsidefunn — optional
+  // keyword appended to the search-based candidate query (e.g. "bryggeri").
+  producer_type: string | null;
 };
 
 /**
@@ -3465,7 +3526,7 @@ export function selectGardssalgProvidersForWebsiteDiscovery(limit = 16): Gardssa
   const cap = Math.max(1, Math.min(48, limit));
   return db
     .prepare(
-      `SELECT id, navn, org_nr, kommune, poststed, content_source
+      `SELECT id, navn, org_nr, kommune, poststed, content_source, producer_type
          FROM experience_providers
         WHERE (producer_type IS NOT NULL OR rfb_seed_source = 'rfb-seed')
           AND (hjemmeside IS NULL OR TRIM(hjemmeside) = '')
@@ -3484,7 +3545,7 @@ export function getGardssalgWebsiteDiscoveryTarget(providerId: string): (Gardssa
   const db = getDb(VERTICAL);
   const row = db
     .prepare(
-      `SELECT id, navn, org_nr, kommune, poststed, content_source, hjemmeside
+      `SELECT id, navn, org_nr, kommune, poststed, content_source, producer_type, hjemmeside
          FROM experience_providers
         WHERE id = ?
           AND (producer_type IS NOT NULL OR rfb_seed_source = 'rfb-seed')
@@ -3519,6 +3580,79 @@ export function gardssalgWebsiteCandidateHosts(navn: string): string[] {
     }
   }
   return hosts.slice(0, 4);
+}
+
+// ─── Gårdssalg search-based website-discovery candidates (dev-request
+//     2026-07-21-gardssalg-soekebasert-nettsidefunn) ───────────────────────
+//
+// The name-based domain guess above almost never matches a Norwegian
+// producer's real brand domain (a live 20-row test scored 0/20 verified). It
+// is kept as a free, zero-cost first tier (no API call, tried before we ever
+// spend a paid search) — see the route's doc comment for the full tier-1/
+// tier-2 rationale. This block adds the tier-2 SEARCH-based source: a single
+// Brave query per row, whose top organic hits' hosts become candidates that
+// flow through the SAME pre-fetch exclusion + fetch + ownership-evidence
+// pipeline as the name-guess tier (nothing downstream changes).
+
+/**
+ * Build the Brave query for one target: `"<pruned name>" <kommune/poststed>
+ * [<producer_type>]`, e.g. `"Fjelldal Brenneri" Saltdal bryggeri`. Mirrors
+ * search-enrich-sweep's `"<name>" <geo>`.trim() query shape, extended with an
+ * optional trailing producer_type keyword ("bryggeri", "sideri", …) when one
+ * is known — narrows the search without a second API call. Pure — exported
+ * for tests.
+ */
+export function gardssalgWebsiteSearchQuery(target: {
+  navn: string;
+  kommune?: string | null;
+  poststed?: string | null;
+  producer_type?: string | null;
+}): string {
+  const name = gardssalgSearchName(target.navn);
+  const place = (target.kommune || target.poststed || "").trim();
+  const keyword = (target.producer_type || "").trim();
+  return [`"${name}"`, place, keyword].filter(Boolean).join(" ").trim();
+}
+
+/**
+ * Turn Brave organic search results into candidate homepage hosts: the
+ * host of each result's URL, in Brave's own relevance order, deduplicated,
+ * capped at `maxCandidates`. Pure — no ranking/scoring of its own (Brave's
+ * ranking is trusted as-is, unlike search-enrich's rankCandidates which
+ * re-ranks by name-stem overlap — that module crawls MULTIPLE candidate
+ * pages per producer; this one takes the first VERIFIED hit, so passing
+ * through Brave's own order and letting the existing exclusion+evidence
+ * pipeline reject bad hosts is sufficient). Exported for tests.
+ */
+export function gardssalgWebsiteSearchCandidateHosts(
+  results: BraveResult[],
+  maxCandidates = 5
+): string[] {
+  const hosts: string[] = [];
+  for (const r of results) {
+    const host = hostFromUrlLike(r?.url || "");
+    if (!host) continue;
+    if (!hosts.includes(host)) hosts.push(host);
+    if (hosts.length >= maxCandidates) break;
+  }
+  return hosts;
+}
+
+// Injectable Brave-search function — test seam mirroring
+// experience-brreg.ts's __setBrregFetchForTesting / order-notify-service.ts's
+// __setOrderNotifySendForTesting: a module-level override, null by default
+// (production uses the real braveSearch, wired by the route with the env
+// key), settable by tests so route-level tests never hit the network and
+// never need to fabricate Brave's raw JSON response shape — they hand back
+// BraveResult[] directly, exactly like search-enrich-sweep's injected
+// EnrichDeps.search.
+export type GardssalgWebsiteSearchFn = (query: string) => Promise<BraveResult[]>;
+let _gardssalgWebsiteSearchOverride: GardssalgWebsiteSearchFn | null = null;
+export function __setGardssalgWebsiteSearchForTesting(fn: GardssalgWebsiteSearchFn | null): void {
+  _gardssalgWebsiteSearchOverride = fn;
+}
+export function getGardssalgWebsiteSearchOverride(): GardssalgWebsiteSearchFn | null {
+  return _gardssalgWebsiteSearchOverride;
 }
 
 /** Visible-text extraction for evidence matching — scripts/styles/tags out,

@@ -106,12 +106,20 @@ import {
   gardssalgWebsiteCandidateHosts,
   gardssalgPageText,
   gardssalgWebsiteEvidenceMatch,
-  gardssalgSharedDomainReason,
   upsertGardssalgWebsiteReviewQueue,
   clearGardssalgWebsiteReviewQueueEntry,
   listGardssalgWebsiteReviewQueue,
   stampGardssalgWebsiteDiscoveryAttempt,
   applyGardssalgProviderWebsite,
+  // dev-request 2026-07-21-gardssalg-soekebasert-nettsidefunn — search-based
+  // candidate source (tier 2, after the free name-guess tier above): combined
+  // social-media + directory/DMO pre-fetch exclusion, query builder, Brave
+  // result→host extraction, and the injectable-search test seam.
+  gardssalgWebsiteHostExclusionReason,
+  gardssalgWebsiteSearchQuery,
+  gardssalgWebsiteSearchCandidateHosts,
+  getGardssalgWebsiteSearchOverride,
+  type GardssalgWebsiteSearchFn,
   // dev-request 2026-07-04-opplevagent-dedup-og-norske-titler, item 1 —
   // re-harvest guard (never insert/resurrect a duplicate already known/merged)
   findExistingExperienceMatch,
@@ -166,6 +174,12 @@ import {
   // the cheap/universal prefilter, reused (not duplicated) as cascade stage
   // 1 of meetsGardssalgAboutQualityBar below.
   meetsAboutCheapBar,
+  // dev-request 2026-07-21-gardssalg-soekebasert-nettsidefunn — the SAME
+  // braveSearch already used in production by the RFB search-enrich-sweep;
+  // reused as-is (no new HTTP client) for the gårdssalg website-discovery
+  // route's tier-2 search-based candidate source.
+  braveSearch,
+  type BraveResult,
 } from "../services/search-enrich";
 import { classifyProvider, sleep, BrregClass } from "../services/experience-brreg";
 // dev-request 2026-07-18-gardssalg-profilkvalitet-foer-outreach, slice 3 —
@@ -2017,15 +2031,36 @@ router.post("/admin/gardssalg-nace-discovery", requireAdmin, async (req: Request
 // dev-request 2026-07-19-gardssalg-nye-agenter-komplett-foer-synlig, skive B
 // (L4 — Daniels GO gitt ordrett samme dag). Finds candidate websites for
 // gårdssalg providers whose hjemmeside is blank — the enrichment chain is
-// source-based, so without a website a row can never be filled. Per target:
-// deterministic candidate hosts from the provider's own name
-// (gardssalgWebsiteCandidateHosts), pre-fetch identity checks (curated
-// directory/aggregator + visit*-DMO hosts rejected; hosts ALREADY carried by
-// any catalog row rejected — adopting one would create the shared-host
-// situation the 5d guard quarantines), fetch (SSRF-guarded, redirects
-// followed and the FINAL host re-checked), then ownership evidence on the
-// page text: the provider's org_nr, or exact pruned name + kommune/poststed
-// (gardssalgWebsiteEvidenceMatch). First verified candidate wins.
+// source-based, so without a website a row can never be filled. Per target,
+// TWO candidate-host tiers are tried, first verified candidate wins:
+//
+//   Tier 1 (free, tried first) — deterministic candidate hosts guessed from
+//     the provider's own name (gardssalgWebsiteCandidateHosts).
+//   Tier 2 (paid, only when tier 1 verifies nothing) — dev-request
+//     2026-07-21-gardssalg-soekebasert-nettsidefunn: ONE braveSearch call for
+//     `"<name>" <kommune/poststed> [<producer_type>]`, whose top organic
+//     hits' hosts become candidates (gardssalgWebsiteSearchQuery /
+//     gardssalgWebsiteSearchCandidateHosts). A live 20-row test of tier 1
+//     alone scored 0/20 verified — this tier is what actually finds real
+//     Norwegian producer domains.
+//
+// Tier 1 is kept rather than removed: it costs no API call and (per Brave's
+// free-tier pacing) a fast DNS/connect failure on a wrong guess is cheaper
+// than a search call, so trying it first before ever spending tier 2 is
+// strictly a cost win on the rare rows where it verifies. See the PR
+// description for the full removal-vs-keep tradeoff.
+//
+// BOTH tiers flow through the IDENTICAL pre-fetch exclusion → SSRF-guarded
+// fetch (redirects followed, FINAL host re-checked) → ownership-evidence
+// pipeline (tryGardssalgCandidateHosts, below) — nothing about verification,
+// the review queue, or the approval lever changes for tier 2. Pre-fetch
+// exclusion is gardssalgWebsiteHostExclusionReason: curated directory/
+// aggregator + visit*-DMO hosts (as before) PLUS, new in this dev-request, a
+// dedicated social-media check (facebook.com/instagram.com/… — common tier-2
+// hits for producers with only a Facebook page, no real site) so a social
+// profile is reported with its own "social_media_host" reason rather than
+// ever being proposed as a homepage; hosts ALREADY carried by any catalog row
+// are also still rejected (shared-host guard).
 //
 // Verified candidates are parked in gardssalg_website_review_queue — NEVER
 // written to the row by this route. Adoption goes through the approve lever
@@ -2034,8 +2069,20 @@ router.post("/admin/gardssalg-nace-discovery", requireAdmin, async (req: Request
 // website_discovery_attempted_at on every processed target (anti-starvation)
 // and upserts the queue. Selection includes catalog_hidden rows by design —
 // the komplett-foer-synlig plan runs this on hidden batches.
+//
+// Cost control: at most ONE braveSearch call per row per run (tier 2 is
+// tried once, using the first search response's hits — never re-queried),
+// and only when tier 1 found nothing. The per-run row-count cap
+// (GS_WD_DEFAULT_LIMIT/GS_WD_HARD_CAP, unchanged) still bounds how many rows
+// — and therefore how many search calls — a single run can make. If no Brave
+// key is configured (BRAVE_API_KEY / BRAVE_SEARCH_API_KEY) and no test
+// override is set, tier 2 is silently skipped (tier 1 still runs) rather
+// than 503ing the whole route — unlike POST /admin/search-enrich, whose
+// entire purpose is search, this endpoint still has a free tier that works
+// without a key.
 const GS_WD_DEFAULT_LIMIT = 16;
 const GS_WD_HARD_CAP = 48;
+const GS_WD_SEARCH_MAX_CANDIDATES = 5;
 
 async function wdFetchPage(url: string): Promise<{ html: string; finalUrl: string } | null> {
   if (!isSafeFetchUrl(url)) return null;
@@ -2054,6 +2101,60 @@ async function wdFetchPage(url: string): Promise<{ html: string; finalUrl: strin
   }
 }
 
+/**
+ * Try a list of candidate hosts (either tier) in order: pre-fetch exclusion
+ * (social-media / directory-aggregator / DMO / shared-host-in-catalog),
+ * SSRF-guarded fetch, final-host re-check after redirect (same exclusions),
+ * then ownership-evidence match. Returns the first VERIFIED hit, or null.
+ * Mutates `tried`/`excludedHere` (shared across BOTH tiers for one row) so
+ * the response's per-provider `tried`/`excluded` reporting is a single,
+ * complete picture regardless of which tier a host came from.
+ */
+async function tryGardssalgCandidateHosts(
+  hosts: string[],
+  hostCounts: Map<string, number>,
+  target: { org_nr: string | null; navn: string; kommune: string | null; poststed: string | null },
+  tried: string[],
+  excludedHere: Array<{ host: string; reason: string }>,
+): Promise<{ host: string; finalUrl: string; evidence: ReturnType<typeof gardssalgWebsiteEvidenceMatch> } | null> {
+  for (const host of hosts) {
+    const listed = gardssalgWebsiteHostExclusionReason(host);
+    if (listed) {
+      excludedHere.push({ host, reason: listed });
+      continue;
+    }
+    if ((hostCounts.get(host) || 0) >= 1) {
+      excludedHere.push({ host, reason: "host_already_in_catalog" });
+      continue;
+    }
+    tried.push(host);
+    const page = await wdFetchPage(`https://${host}`);
+    if (!page) continue;
+    const finalHost = hostFromUrlLike(page.finalUrl) || host;
+    if (finalHost !== host) {
+      const listedFinal = gardssalgWebsiteHostExclusionReason(finalHost);
+      if (listedFinal) {
+        excludedHere.push({ host: finalHost, reason: listedFinal });
+        continue;
+      }
+      if ((hostCounts.get(finalHost) || 0) >= 1) {
+        excludedHere.push({ host: finalHost, reason: "host_already_in_catalog" });
+        continue;
+      }
+    }
+    const ev = gardssalgWebsiteEvidenceMatch(gardssalgPageText(page.html), {
+      orgNr: target.org_nr,
+      navn: target.navn,
+      kommune: target.kommune,
+      poststed: target.poststed,
+    });
+    if (ev.verified) {
+      return { host, finalUrl: page.finalUrl, evidence: ev };
+    }
+  }
+  return null;
+}
+
 router.post("/admin/gardssalg-website-discovery", requireAdmin, async (req: Request, res: Response) => {
   const body = (req.body ?? {}) as { providerIds?: unknown; limit?: unknown; apply?: unknown };
   const apply =
@@ -2069,7 +2170,7 @@ router.post("/admin/gardssalg-website-discovery", requireAdmin, async (req: Requ
   const skippedLocked: Array<{ provider_id: string; navn: string }> = [];
   const alreadyHasWebsite: Array<{ provider_id: string; navn: string }> = [];
   const notFound: string[] = [];
-  let targets: Array<{ id: string; navn: string; org_nr: string | null; kommune: string | null; poststed: string | null; content_source: string | null }> = [];
+  let targets: Array<{ id: string; navn: string; org_nr: string | null; kommune: string | null; poststed: string | null; content_source: string | null; producer_type: string | null }> = [];
 
   if (Array.isArray(body.providerIds) && body.providerIds.length > 0) {
     const ids = (body.providerIds as unknown[]).filter((v): v is string => typeof v === "string" && v.trim() !== "").map((v) => v.trim());
@@ -2098,6 +2199,14 @@ router.post("/admin/gardssalg-website-discovery", requireAdmin, async (req: Requ
   }
 
   const hostCounts = gardssalgSharedHostCounts();
+  // Tier-2 search dependency: a test override always wins (never touches the
+  // network); otherwise the real braveSearch, wired with whichever Brave env
+  // key is configured — or null (tier 2 silently skipped) if neither is set.
+  const braveKey = process.env.BRAVE_API_KEY || process.env.BRAVE_SEARCH_API_KEY || "";
+  const searchFn: GardssalgWebsiteSearchFn | null =
+    getGardssalgWebsiteSearchOverride() ??
+    (braveKey ? (query: string) => braveSearch(query, braveKey, GS_WD_SEARCH_MAX_CANDIDATES) : null);
+
   const proposed: Array<{
     provider_id: string;
     navn: string;
@@ -2109,48 +2218,30 @@ router.post("/admin/gardssalg-website-discovery", requireAdmin, async (req: Requ
   const noCandidateVerified: Array<{ provider_id: string; navn: string; tried: string[] }> = [];
   const excluded: Array<{ provider_id: string; navn: string; hosts: Array<{ host: string; reason: string }> }> = [];
   const processedIds: string[] = [];
+  let searchCallCount = 0;
 
   for (const t of targets) {
     processedIds.push(t.id);
-    const candidates = gardssalgWebsiteCandidateHosts(t.navn);
     const tried: string[] = [];
     const excludedHere: Array<{ host: string; reason: string }> = [];
-    let hit: { host: string; finalUrl: string; evidence: ReturnType<typeof gardssalgWebsiteEvidenceMatch> } | null = null;
 
-    for (const host of candidates) {
-      const listed = gardssalgSharedDomainReason(host);
-      if (listed) {
-        excludedHere.push({ host, reason: listed });
-        continue;
-      }
-      if ((hostCounts.get(host) || 0) >= 1) {
-        excludedHere.push({ host, reason: "host_already_in_catalog" });
-        continue;
-      }
-      tried.push(host);
-      const page = await wdFetchPage(`https://${host}`);
-      if (!page) continue;
-      const finalHost = hostFromUrlLike(page.finalUrl) || host;
-      if (finalHost !== host) {
-        const listedFinal = gardssalgSharedDomainReason(finalHost);
-        if (listedFinal) {
-          excludedHere.push({ host: finalHost, reason: listedFinal });
-          continue;
-        }
-        if ((hostCounts.get(finalHost) || 0) >= 1) {
-          excludedHere.push({ host: finalHost, reason: "host_already_in_catalog" });
-          continue;
-        }
-      }
-      const ev = gardssalgWebsiteEvidenceMatch(gardssalgPageText(page.html), {
-        orgNr: t.org_nr,
-        navn: t.navn,
-        kommune: t.kommune,
-        poststed: t.poststed,
-      });
-      if (ev.verified) {
-        hit = { host, finalUrl: page.finalUrl, evidence: ev };
-        break;
+    // Tier 1 — free name-guess candidates, tried first.
+    const nameGuessHosts = gardssalgWebsiteCandidateHosts(t.navn);
+    let hit = await tryGardssalgCandidateHosts(nameGuessHosts, hostCounts, t, tried, excludedHere);
+
+    // Tier 2 — search-based candidates, ONLY when tier 1 verified nothing,
+    // and at most ONE braveSearch call for this row.
+    if (!hit && searchFn) {
+      searchCallCount++;
+      try {
+        const query = gardssalgWebsiteSearchQuery(t);
+        const results: BraveResult[] = await searchFn(query);
+        const searchHosts = gardssalgWebsiteSearchCandidateHosts(results, GS_WD_SEARCH_MAX_CANDIDATES);
+        hit = await tryGardssalgCandidateHosts(searchHosts, hostCounts, t, tried, excludedHere);
+      } catch {
+        // A search failure (network/HTTP error) must not abort the row — it
+        // simply falls through to no_candidate_verified like a tier with no
+        // hits would.
       }
     }
 
@@ -2207,6 +2298,11 @@ router.post("/admin/gardssalg-website-discovery", requireAdmin, async (req: Requ
     already_has_website: alreadyHasWebsite,
     not_found: notFound,
     queue_size: listGardssalgWebsiteReviewQueue().length,
+    // dev-request 2026-07-21-gardssalg-soekebasert-nettsidefunn — observability
+    // for the cost-control acceptance criterion: at most one braveSearch call
+    // per scanned row, and 0 whenever no Brave key/override is configured.
+    search_calls: searchCallCount,
+    search_configured: searchFn !== null,
   });
 });
 
