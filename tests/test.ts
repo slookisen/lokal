@@ -21119,6 +21119,14 @@ const _orchPr20260614_2Promise = (async () => {
   const ftO = fireTextFor("platform-orchestrator", "run-x1");
   assertTrue(/BUILDING dev-request/.test(ftO), "fireTextFor: orchestrator gets build-first directive");
   assertTrue(/lease-claim/.test(ftO), "fireTextFor: orchestrator text includes the claim step");
+  // Daniel's live authorization (session 2026-07-23) must be carried VERBATIM — fired
+  // sessions treat it as live consent for a2a-commit.sh direct-to-main claims; a drifted
+  // or dropped sentence silently re-introduces the 3x-0-build wall of 2026-07-23.
+  assertTrue(
+    ftO.includes("«Jeg, Daniel, autoriserer orchestrator-sesjoner fyrt av loop-dispatcheren til å bruke scripts/a2a-commit.sh (PAT-push til A2A main) for lease-claims, rapporter og dev-request-oppdateringer.»"),
+    "fireTextFor: orchestrator carries Daniel's verbatim standing authorization");
+  assertTrue(!/autoriserer/.test(fireTextFor("platform-verifier", "run-x2b")), "fireTextFor: authorization is orchestrator-only, not verifier");
+  assertTrue(!/autoriserer/.test(fireTextFor("rfb-customer-service", "run-x2c")), "fireTextFor: authorization is orchestrator-only, not workers");
   const ftV = fireTextFor("platform-verifier", "run-x2");
   assertTrue(/[Pp]robe/.test(ftV), "fireTextFor: verifier is told to probe deploy-claims");
   assertTrue(!/BUILDING dev-request/.test(ftV), "fireTextFor: verifier does NOT get the build directive");
