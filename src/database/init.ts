@@ -414,6 +414,27 @@ function initSchema(db: Database.Database): void {
       created_at TEXT NOT NULL DEFAULT (datetime('now'))
     );
 
+    -- ════════════════════════════════════════════════════════════
+    -- ORCHESTRATOR_LOCKS: session-level run-lock (orch-pr-20260724-wake-mutex)
+    -- One row per agent name (e.g. 'platform-orchestrator') = current holder,
+    -- if any. Server-side mutex closing the double-fire race: two independent
+    -- Claude Code sessions have no other shared state to coordinate on, and
+    -- the existing dev-request lease + fire-marker dedup don't catch a race
+    -- where both sessions pass their initial checks before either commits
+    -- anything to the dev-request queue. Deliberately a SEPARATE table from
+    -- the "runs" table above — this is a transient session lock, not part
+    -- of the permanent audit ledger, so the runs table/queries need zero
+    -- changes.
+    -- See src/services/run-ledger.ts (acquireLock/releaseLock) for the
+    -- atomic INSERT...ON CONFLICT...DO UPDATE...WHERE pattern that uses it.
+    -- ════════════════════════════════════════════════════════════
+    CREATE TABLE IF NOT EXISTS orchestrator_locks (
+      agent TEXT PRIMARY KEY,                      -- e.g. 'platform-orchestrator'
+      run_id TEXT NOT NULL,                        -- current holder's run_id
+      started_at TEXT NOT NULL,                    -- caller-supplied metadata only (unvalidated) -- NOT the staleness clock, see acquireLock()
+      locked_at TEXT NOT NULL DEFAULT (datetime('now')) -- server-stamped when this row was (re)written; the ONLY staleness clock
+    );
+
 
     -- ════════════════════════════════════════════════════════════
     -- RETENTION: Daily rollup tables for DB size management

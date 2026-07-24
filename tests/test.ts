@@ -840,6 +840,22 @@ console.log("── admin-blocklist-manual-entry (generic identifier_type/identi
   console.log(`  admin-blocklist-manual-entry: ${r.passed} passed, ${r.failed} failed`);
 }
 
+// ── orch-pr-20260724-wake-mutex: orchestrator run-lock — POST /admin/runs/lock
+// and POST /admin/runs/lock/release, closing the platform-orchestrator
+// double-fire race (two sessions starting within the same minute both
+// passing the dev-request lease + fire-marker dedup before either commits) ──
+console.log("── admin-runs-lock (orchestrator run-lock: /admin/runs/lock, /admin/runs/lock/release) ──");
+{
+  const { runAdminRunsLockTests } =
+    require("../src/routes/admin-runs-lock.test") as
+      typeof import("../src/routes/admin-runs-lock.test");
+  const r = runAdminRunsLockTests({ log: false });
+  passed += r.passed;
+  failed += r.failed;
+  for (const f of r.failures) failures.push("admin-runs-lock: " + f);
+  console.log(`  admin-runs-lock: ${r.passed} passed, ${r.failed} failed`);
+}
+
 // ── orch-pr-12: search-enrich background sweep + findings + apply-findings ──
 // Async (fire-and-forget sweep loop). Kicked off here; awaited in the REPORT
 // block so its pass/fail counts fold into the `npm test` summary.
