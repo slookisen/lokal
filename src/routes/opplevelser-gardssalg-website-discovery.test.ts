@@ -159,6 +159,37 @@ export function runOpplevelserGardssalgWebsiteDiscoveryTests(
         assertEq(ev8.place_found, true, "wd-b13: kommune «Nes» as its own word still matches (boundaries, not blanket rejection)");
       }
 
+      // ═══ Section C — search-based candidate helpers (pure) — dev-request
+      //     2026-07-21-gardssalg-soekebasert-nettsidefunn ═══════════════════
+      {
+        const q1 = expStore.gardssalgWebsiteSearchQuery({ navn: "Fjelldal Brenneri AS", kommune: "Saltdal", poststed: null, producer_type: "bryggeri" });
+        assertEq(q1, `"Fjelldal Brenneri AS" Saltdal bryggeri`, "wd-c1: query is «\"name\" kommune producer_type»");
+        const q2 = expStore.gardssalgWebsiteSearchQuery({ navn: "Bjørkegård Sideri — Hardanger", kommune: null, poststed: "5750 Odda", producer_type: null });
+        assertEq(q2, `"Bjørkegård Sideri" 5750 Odda`, "wd-c2: «— Sted» pruned from name; poststed used when kommune absent; no trailing keyword when producer_type unknown");
+
+        const hosts1 = expStore.gardssalgWebsiteSearchCandidateHosts([
+          { title: "A", url: "https://Www.Eksempel.no/om-oss", description: "" },
+          { title: "B", url: "https://eksempel.no/kontakt", description: "" }, // same host (www-insensitive) — deduped
+          { title: "C", url: "https://annen-gard.no", description: "" },
+          { title: "D", url: "", description: "" }, // unparsable/empty — skipped, not thrown
+        ] as any);
+        assertEq(JSON.stringify(hosts1), JSON.stringify(["eksempel.no", "annen-gard.no"]),
+          "wd-c3: hosts deduped (www-insensitive), Brave's own relevance order preserved, empty url skipped");
+        const hosts2 = expStore.gardssalgWebsiteSearchCandidateHosts(
+          Array.from({ length: 8 }, (_, i) => ({ title: "x", url: `https://host${i}.no`, description: "" })) as any,
+          3,
+        );
+        assertEq(hosts2.length, 3, "wd-c4: capped at maxCandidates");
+
+        assertEq(expStore.gardssalgSocialMediaHostReason("www.facebook.com"), "social_media_host", "wd-c5: facebook.com (www-prefixed) is a social host");
+        assertEq(expStore.gardssalgSocialMediaHostReason("m.facebook.com"), "social_media_host", "wd-c6: subdomain family (m.facebook.com) also matches");
+        assertEq(expStore.gardssalgSocialMediaHostReason("eksempel.no"), null, "wd-c7: an ordinary host is not a social host");
+        assertEq(expStore.gardssalgWebsiteHostExclusionReason("instagram.com"), "social_media_host",
+          "wd-c8: combined exclusion reports the MORE SPECIFIC social reason for a host that is both social AND a curated directory host");
+        assertEq(expStore.gardssalgWebsiteHostExclusionReason("hanen.no"), "blocklisted_directory_domain",
+          "wd-c9: a non-social directory host still reports its own reason via the combined check");
+      }
+
       // ═══ Fixtures ═══════════════════════════════════════════════════════
       const insertProvider = expDb.prepare(
         `INSERT INTO experience_providers
@@ -378,6 +409,98 @@ export function runOpplevelserGardssalgWebsiteDiscoveryTests(
         assertEq(plan.skipped.length, 0, "wd-8a: hjemmeside is not skipped as unknown_field");
         assertEq(plan.restorable.length, 1, "wd-8b: the adopted hjemmeside is restorable");
         assertEq(plan.restorable[0]?.restore_to, null, "wd-8c: plan restores to the original blank value");
+      }
+
+      // ── wd-10: tier-2 SEARCH-based candidates (dev-request 2026-07-21-
+      //    gardssalg-soekebasert-nettsidefunn) — route-level integration.
+      //    Fixtures/mocks placed at the very END on purpose: earlier sections
+      //    (esp. wd-4's auto-select ordering assertion) snapshot the DB, and
+      //    these new rows must not shift that snapshot. Tier 1 (name-guess)
+      //    is guaranteed to fail for all four rows below because none of
+      //    their guessed hosts are given a 200 response by either fetch mock
+      //    (the outer one, still in effect until we swap it below, or the
+      //    inner one) — every guessed host falls through to the default 404
+      //    — so every row reaches tier 2, exactly as intended. ────────────
+      {
+        insertProvider.run({ id: "wd-search-orgnr", navn: "Kveldsro Sideri", org_nr: "999111222", kommune: "Ulvik", poststed: null, hjemmeside: null, catalog_hidden: null, content_source: null, producer_type: "sideri" });
+        insertProvider.run({ id: "wd-search-dir", navn: "Blaabaerlia Gard", org_nr: "999222333", kommune: "Nesna", poststed: null, hjemmeside: null, catalog_hidden: null, content_source: null, producer_type: "gardsbutikk" });
+        insertProvider.run({ id: "wd-search-social", navn: "Fjordtun Gardsutsalg", org_nr: "999333444", kommune: "Stryn", poststed: null, hjemmeside: null, catalog_hidden: null, content_source: null, producer_type: "gardsbutikk" });
+        insertProvider.run({ id: "wd-search-none", navn: "Ukjent Soekefjell", org_nr: "999444555", kommune: "Aardal", poststed: null, hjemmeside: null, catalog_hidden: null, content_source: null, producer_type: "gardsbutikk" });
+
+        const searchScenarios: Record<string, Array<{ title: string; url: string; description: string }>> = {
+          "Kveldsro Sideri": [{ title: "Kveldsro Sideri", url: "https://kveldsrosideri-ekte.no", description: "Kveldsro Sideri i Ulvik" }],
+          "Blaabaerlia Gard": [{ title: "Blåbærlia Gård — Hanen", url: "https://hanen.no/blabarlia", description: "medlem" }],
+          "Fjordtun Gardsutsalg": [{ title: "Fjordtun Gardsutsalg", url: "https://www.facebook.com/fjordtungard", description: "Følg oss på Facebook" }],
+          "Ukjent Soekefjell": [],
+        };
+        const searchCalls: string[] = [];
+        // Injectable-search test seam (mirrors experience-brreg.ts's
+        // __setBrregFetchForTesting) — NO real network, hands back
+        // BraveResult[] directly like search-enrich-sweep's injected
+        // EnrichDeps.search, per the dev-request's test-idiom requirement.
+        expStore.__setGardssalgWebsiteSearchForTesting(async (query: string) => {
+          searchCalls.push(query);
+          const m = query.match(/^"([^"]+)"/);
+          const name = m ? m[1]! : query;
+          return searchScenarios[name] ?? [];
+        });
+
+        const searchFetchCalls: string[] = [];
+        const prevFetch2 = globalThis.fetch;
+        globalThis.fetch = (async (url: string | URL | Request) => {
+          const urlStr = String(url);
+          searchFetchCalls.push(urlStr);
+          if (urlStr.startsWith("https://kveldsrosideri-ekte.no")) {
+            return { ok: true, status: 200, url: urlStr, text: async () => "<html><body>Kveldsro Sideri — org.nr 999 111 222 — Ulvik</body></html>" } as unknown as Response;
+          }
+          return { ok: false, status: 404, url: urlStr, text: async () => "" } as unknown as Response;
+        }) as unknown as typeof fetch;
+
+        try {
+          const r = await callRoute(opplevelserRouter, {
+            headers: adminHeaders,
+            body: { providerIds: ["wd-search-orgnr", "wd-search-dir", "wd-search-social", "wd-search-none"], apply: true },
+          });
+
+          assertEq(searchCalls.length, 4, "wd-10a: exactly one braveSearch call per row — cost control (max 1 search API call per row per run)");
+
+          // (a) a search hit that verifies via org-nr evidence gets queued.
+          const orgnrProp = (r.body.proposed as any[]).find((p) => p.provider_id === "wd-search-orgnr");
+          assertTrue(!!orgnrProp, "wd-10b: search-sourced candidate verified via org_nr is proposed");
+          assertEq(orgnrProp?.candidate_url, "https://kveldsrosideri-ekte.no", "wd-10c: proposed candidate is the search-discovered host");
+          assertEq(orgnrProp?.evidence?.org_nr_found, true, "wd-10d: verified via org_nr, identical evidence contract as tier 1");
+          const qRow = expDb.prepare(`SELECT candidate_url FROM gardssalg_website_review_queue WHERE provider_id='wd-search-orgnr'`).get() as any;
+          assertEq(qRow?.candidate_url, "https://kveldsrosideri-ekte.no", "wd-10e: search-sourced candidate lands in the SAME review queue — no new write path");
+          const hjOrgnr = (expDb.prepare(`SELECT hjemmeside FROM experience_providers WHERE id='wd-search-orgnr'`).get() as any).hjemmeside;
+          assertEq(hjOrgnr, null, "wd-10f: discovery still never writes hjemmeside directly, even via search");
+
+          // (b) a directory/aggregator host appearing in search results is
+          //     excluded pre-fetch (reusing the SAME curated exclusion).
+          const dirEx = (r.body.excluded as any[]).find((e) => e.provider_id === "wd-search-dir");
+          assertTrue(!!dirEx && dirEx.hosts.some((h: any) => h.host === "hanen.no" && h.reason === "blocklisted_directory_domain"),
+            "wd-10g: directory host surfaced by search excluded pre-fetch with the SAME curated reason as tier 1");
+          assertTrue(!searchFetchCalls.some((u) => u.includes("hanen.no")), "wd-10h: no fetch ever went to the search-sourced directory host");
+          assertTrue((r.body.no_candidate_verified as any[]).some((e) => e.provider_id === "wd-search-dir"), "wd-10i: falls through to no_candidate_verified");
+
+          // (c) a social-media host appearing in search results is excluded
+          //     as a homepage candidate specifically (never auto-proposed).
+          const socEx = (r.body.excluded as any[]).find((e) => e.provider_id === "wd-search-social");
+          assertTrue(!!socEx && socEx.hosts.some((h: any) => h.host === "facebook.com" && h.reason === "social_media_host"),
+            "wd-10j: Facebook host surfaced by search excluded with its OWN social_media_host reason (a found-but-not-homepage signal, not a generic directory hit)");
+          assertTrue(!searchFetchCalls.some((u) => u.includes("facebook.com")), "wd-10k: no fetch ever went to the social-media host");
+          assertTrue((r.body.no_candidate_verified as any[]).some((e) => e.provider_id === "wd-search-social"), "wd-10l: a social profile is never proposed as the homepage");
+
+          // (d) zero search hits → no candidate verified, no write.
+          assertTrue((r.body.no_candidate_verified as any[]).some((e) => e.provider_id === "wd-search-none"), "wd-10m: zero search hits → no_candidate_verified");
+          assertTrue(!(r.body.proposed as any[]).some((p) => p.provider_id === "wd-search-none"), "wd-10n: nothing proposed for the zero-hit row");
+          const noneQ = (expDb.prepare(`SELECT COUNT(*) c FROM gardssalg_website_review_queue WHERE provider_id='wd-search-none'`).get() as any).c;
+          assertEq(noneQ, 0, "wd-10o: zero search hits → no queue write");
+
+          assertEq(r.body.search_calls, 4, "wd-10p: response reports the search-call count for cost-control observability");
+        } finally {
+          globalThis.fetch = prevFetch2;
+          expStore.__setGardssalgWebsiteSearchForTesting(null);
+        }
       }
     } catch (err: any) {
       failed++;
