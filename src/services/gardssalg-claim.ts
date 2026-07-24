@@ -73,7 +73,7 @@ import crypto from "crypto";
 import { v4 as uuid } from "uuid";
 import { getDb } from "../database/db-factory";
 import { normalizeDomain } from "./blocklist-service";
-import { isMatchableDomain } from "./gardssalg-rfb-enrich";
+import { GENERIC_DOMAINS } from "./gardssalg-rfb-enrich";
 
 const VERTICAL = "experiences";
 
@@ -160,6 +160,30 @@ export function isHjemmesideOwnershipVerified(row: Pick<ClaimProviderRow, "conte
   }
 }
 
+// ── Generic/shared-domain check for claim-email minting ──────────────────
+// STRICTER than gardssalg-rfb-enrich.ts's isMatchableDomain(), which is
+// exact-Set-membership only. That's appropriate for its own use (a source
+// with a colliding/generic domain just falls out of the enrichment index,
+// with a separate collision-safety net besides — see that file's doc), but
+// NOT strict enough for a one-shot, high-trust claim-email mint: exact-match
+// alone lets "mail.gmail.com" or "sub.facebook.com" (a subdomain of a listed
+// generic host) or "gmail.com." (a trailing-FQDN-dot-padded generic host,
+// which normalizeDomain does not strip) sail through as "not generic" and
+// mint post@<that-domain> — handing a claim link to a shared/social mailbox,
+// not the org (security review finding, 2026-07-24, fix-up iteration 2).
+// Reads the SAME GENERIC_DOMAINS list (exported from gardssalg-rfb-enrich.ts)
+// rather than hand-maintaining a second copy; only the matching rule here is
+// stricter (suffix-aware + trailing-dot-safe), not the underlying data.
+function isClaimableDomain(domain: string): boolean {
+  if (!domain) return false;
+  const d = domain.replace(/\.+$/, ""); // strip trailing FQDN dot(s), e.g. "gmail.com." -> "gmail.com"
+  if (!d || !d.includes(".")) return false; // bare host, not a real domain
+  for (const generic of GENERIC_DOMAINS) {
+    if (d === generic || d.endsWith("." + generic)) return false; // exact OR any subdomain of a generic host
+  }
+  return true;
+}
+
 export type OrgLinkedEmailResult =
   | { eligible: true; email: string; source: "brreg_contact" | "verified_domain_address" }
   | { eligible: false; reason: "not_brreg_verified" | "no_org_linked_email" };
@@ -195,20 +219,22 @@ export function deriveOrgLinkedEmail(
   // the thing we've verified, so the well-known "post@" convention address
   // on it is the only address we can send to without trusting scraped data.
   //
-  // isMatchableDomain() (gardssalg-rfb-enrich.ts) is ALSO required here, not
-  // just brreg-verification + provenance: "verified" only means the domain
+  // isClaimableDomain() (above, this file) is ALSO required here, not just
+  // brreg-verification + provenance: "verified" only means the domain
   // reached hjemmeside via a vetted path (manual entry or admin-approved
   // evidence) — it says nothing about whether the domain is a shared/generic
-  // one (a Facebook page, a bare wixsite.com/gmail.com address, etc.) that
-  // isn't actually a unique identity for THIS organisation. Daniel can enter
-  // (or approve) a Facebook URL as a producer's "hjemmeside" when they have no
-  // real site; deriving post@facebook.com from that would hand a claim link
-  // to Meta's shared mailbox, not the org — the exact "wrong producer's info
-  // on a page" harm this module exists to prevent. Falls through to
-  // no_org_linked_email (manual fallback) exactly like an unvetted domain.
+  // one (a Facebook page, a bare wixsite.com/gmail.com address — or a
+  // subdomain / trailing-dot variant of one — etc.) that isn't actually a
+  // unique identity for THIS organisation. Daniel can enter (or approve) a
+  // Facebook URL as a producer's "hjemmeside" when they have no real site;
+  // deriving post@facebook.com (or post@mail.gmail.com, post@gmail.com.,
+  // etc.) from that would hand a claim link to a shared/social mailbox, not
+  // the org — the exact "wrong producer's info on a page" harm this module
+  // exists to prevent. Falls through to no_org_linked_email (manual
+  // fallback) exactly like an unvetted domain.
   if (isHjemmesideOwnershipVerified(provider)) {
     const domain = normalizeDomain(provider.hjemmeside);
-    if (domain && domain.includes(".") && isMatchableDomain(domain)) {
+    if (isClaimableDomain(domain)) {
       return { eligible: true, email: `post@${domain}`, source: "verified_domain_address" };
     }
   }

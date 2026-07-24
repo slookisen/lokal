@@ -132,6 +132,57 @@ export function runGardssalgClaimTests(opts: { log?: boolean } = {}): Promise<Te
       });
       assertEq(r4d, { eligible: false, reason: "no_org_linked_email" }, "a4d: field_provenance-verified but generic domain (gmail.com) -> no_org_linked_email");
 
+      // (a4e-h) SECURITY REGRESSION (fix-up iteration 2): the generic-domain
+      // check must be suffix-aware (catch SUBDOMAINS of a listed generic
+      // host, not just an exact string match) and trailing-dot-safe (a
+      // stray FQDN dot must not slip a generic domain past the check).
+      // Independent review found exact-Set-membership alone let
+      // "mail.gmail.com", "sub.facebook.com", and "gmail.com." (trailing
+      // dot) all sail through as "eligible" -> post@<generic-host>, which
+      // defeats the whole point of the a4c/a4d checks above.
+      const r4e = deriveOrgLinkedEmail({
+        org_nr: "912345678", brreg_verified: 1, hjemmeside: "https://mail.gmail.com",
+        content_source: "manual", field_provenance: null,
+      });
+      assertEq(r4e, { eligible: false, reason: "no_org_linked_email" }, "a4e: subdomain of a generic host (mail.gmail.com) -> no_org_linked_email, not just exact-match gmail.com");
+
+      const r4f = deriveOrgLinkedEmail({
+        org_nr: "912345678", brreg_verified: 1, hjemmeside: "https://sub.facebook.com",
+        content_source: "manual", field_provenance: null,
+      });
+      assertEq(r4f, { eligible: false, reason: "no_org_linked_email" }, "a4f: subdomain of a generic host (sub.facebook.com) -> no_org_linked_email");
+
+      const r4g = deriveOrgLinkedEmail({
+        org_nr: "912345678", brreg_verified: 1, hjemmeside: "https://gmail.com./",
+        content_source: "manual", field_provenance: null,
+      });
+      assertEq(r4g, { eligible: false, reason: "no_org_linked_email" }, "a4g: trailing-FQDN-dot generic domain (gmail.com.) -> no_org_linked_email, dot must not defeat the Set match");
+
+      // Regression guard: a PURE case difference (no subdomain, no trailing
+      // dot) already worked before this fix-up via normalizeDomain's
+      // lowercasing — must still work, don't let the new suffix logic
+      // regress it.
+      const r4h = deriveOrgLinkedEmail({
+        org_nr: "912345678", brreg_verified: 1, hjemmeside: "https://GMAIL.COM",
+        content_source: "manual", field_provenance: null,
+      });
+      assertEq(r4h, { eligible: false, reason: "no_org_linked_email" }, "a4h: pure-case generic domain (GMAIL.COM) -> no_org_linked_email (pre-existing behavior, regression guard only)");
+
+      // (a4i) A genuinely DISTINCT domain must NOT be caught by the suffix
+      // check merely because it happens to start with a generic name as a
+      // label prefix — "gmail.com.evil.example" is not a subdomain of
+      // gmail.com (it doesn't END with ".gmail.com"), it's an unrelated,
+      // real domain and must still be eligible.
+      const r4i = deriveOrgLinkedEmail({
+        org_nr: "912345678", brreg_verified: 1, hjemmeside: "https://gmail.com.evil.example",
+        content_source: "manual", field_provenance: null,
+      });
+      assertEq(
+        r4i,
+        { eligible: true, email: "post@gmail.com.evil.example", source: "verified_domain_address" },
+        "a4i: genuinely distinct domain (gmail.com.evil.example) is NOT a subdomain bypass -> still eligible",
+      );
+
       const r4b = deriveOrgLinkedEmail({
         org_nr: "912345678", brreg_verified: 1, hjemmeside: null,
         content_source: null, field_provenance: null,
