@@ -32806,3 +32806,61 @@ runSerial(async () => {
     failures.push("marketplace-catalog-supply-graph: unexpected error: " + String(err?.message || err));
   }
 });
+
+// ── dev-request 2026-07-21-opplevagent-claim-flyt-drikkeprodusenter:
+// gårdssalg producer owner-claim flow (magic-link-based, mirrors RFB's
+// owner-portal.ts pattern in a vertical-scoped table). Three suites:
+// pure/DB service logic (derivation, masking, issue/verify/session/rate-
+// limit, the content_source='claim' lock invariant against the REAL
+// gardssalg-rfb-enrich.ts gate, owner profile updates), the minimal
+// cross-DB "Statistikk" tab data source, and full HTTP-level route tests
+// (session gating, cookie/redirect behavior, real logout-revoke). Each
+// swaps in its own in-memory DB(s) and restores the previous handle in its
+// own finally block — safe to run via runSerial() same as the suites above.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-07-21-opplevagent-claim-flyt-drikkeprodusenter: gardssalg-claim service ──");
+  try {
+    const { runGardssalgClaimTests } = require("../src/services/gardssalg-claim.test") as
+      typeof import("../src/services/gardssalg-claim.test");
+    const gc = await runGardssalgClaimTests({ log: false });
+    passed += gc.passed;
+    failed += gc.failed;
+    for (const f of gc.failures) failures.push("gardssalg-claim: " + f);
+    console.log(`  gardssalg-claim: ${gc.passed} passed, ${gc.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("gardssalg-claim: unexpected error: " + String(err?.message || err));
+  }
+});
+
+runSerial(async () => {
+  console.log("\n── dev-request 2026-07-21-opplevagent-claim-flyt-drikkeprodusenter: gardssalg-owner-stats-service ──");
+  try {
+    const { runGardssalgOwnerStatsServiceTests } = require("../src/services/gardssalg-owner-stats-service.test") as
+      typeof import("../src/services/gardssalg-owner-stats-service.test");
+    const gos = runGardssalgOwnerStatsServiceTests({ log: false });
+    passed += gos.passed;
+    failed += gos.failed;
+    for (const f of gos.failures) failures.push("gardssalg-owner-stats-service: " + f);
+    console.log(`  gardssalg-owner-stats-service: ${gos.passed} passed, ${gos.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("gardssalg-owner-stats-service: unexpected error: " + String(err?.message || err));
+  }
+});
+
+runSerial(async () => {
+  console.log("\n── dev-request 2026-07-21-opplevagent-claim-flyt-drikkeprodusenter: gardssalg-claim routes (HTTP) ──");
+  try {
+    const { runGardssalgClaimRouteTests } = require("../src/routes/gardssalg-claim.test") as
+      typeof import("../src/routes/gardssalg-claim.test");
+    const gcr = await runGardssalgClaimRouteTests({ log: false });
+    passed += gcr.passed;
+    failed += gcr.failed;
+    for (const f of gcr.failures) failures.push("gardssalg-claim routes: " + f);
+    console.log(`  gardssalg-claim routes: ${gcr.passed} passed, ${gcr.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("gardssalg-claim routes: unexpected error: " + String(err?.message || err));
+  }
+});

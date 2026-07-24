@@ -2781,6 +2781,11 @@ ${BROWSE_CSS}
         <h2>Sted</h2>
         ${mapBlock}
       </div>
+      <div class="aside-card">
+        <h2>Driver du dette stedet?</h2>
+        <p style="font-size:.86rem;color:var(--ink-soft);margin:0 0 10px">Ta over profilen og rediger informasjon, produkter og reservasjoner selv.</p>
+        <a class="gc-claim-cta" href="/kategori/gardssalg/eier/${encodeURIComponent(slug)}" style="display:block;text-align:center;background:#fff;color:#0f5a50;font-weight:700;padding:10px 14px;border:1px solid #0f5a50;border-radius:var(--r-pill);font-size:.9rem">Er dette din bedrift?</a>
+      </div>
     </aside>
   </div>
   <p class="legal-note" style="font-size:.78rem;color:#7a7163;margin-top:24px;padding-top:16px;border-top:1px solid #e4ded0">Vi formidler besøket og smakingen hos produsenten. Selve salget skjer hos produsenten, som har egen kommunal bevilling.</p>

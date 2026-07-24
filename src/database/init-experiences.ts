@@ -718,5 +718,56 @@ export function initExperiencesSchema(db: Database.Database): void {
     db.exec("ALTER TABLE experience_providers ADD COLUMN brreg_website_discovery_attempted_at TEXT");
   } catch { /* already present */ }
 
+  // ─── gardssalg_claims (dev-request 2026-07-21-opplevagent-claim-flyt-
+  // drikkeprodusenter) ──────────────────────────────────────────────────────
+  // Producer owner-claim flow for gårdssalg profiles on opplevagent.no.
+  // MIRRORS (does not reuse/modify) RFB's rettfrabonden.com magic_links table
+  // (src/database/init.ts) — same shape, same lifecycle (issue -> verify
+  // (used=1) -> session), same 7-day expiry convention — but lives in its OWN
+  // table in THIS (experiences.db) database, matching how RFB's magic_links
+  // and its `agents`/`agent_knowledge` rows live entirely in lokal.db while
+  // experience_providers lives here (db-factory.ts's per-vertical DB-file
+  // isolation invariant). Reusing the RFB table directly was not an option
+  // (cross-file FK, and it would blur RFB/experiences isolation); reusing the
+  // PATTERN while keeping the table vertical-scoped is the deliberate choice
+  // here (see the route file's module doc for the full rationale).
+  //
+  // email: the ORG-LINKED target address the link was actually sent to
+  //   (Brreg-contact-email or post@<ownership-verified-domain> — see
+  //   deriveOrgLinkedEmail() in services/gardssalg-claim.ts). Never a
+  //   free-text address the requester typed in — there is no such input on
+  //   this flow, by design (Daniel's "never open claiming by name alone").
+  // used / used_at: same semantics as magic_links — used=1 once the link is
+  //   clicked and the token verified; the session (cookie/Bearer) then reads
+  //   off this row same as RFB's verifyOwnerSession().
+  // revoked_at: NOT present on RFB's magic_links (RFB's "logout" only clears
+  //   the browser cookie; the underlying token stays a valid Bearer
+  //   credential until its 7-day expiry). This column is an intentional,
+  //   additive improvement over the mirrored pattern — real GDPR-minimum
+  //   revocation (POST logout sets this, and verifyGardssalgOwnerSession()
+  //   rejects any token with revoked_at set, cookie or Bearer alike) — NOT a
+  //   change to RFB's own owner-portal.ts, which is untouched.
+  try {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS gardssalg_claims (
+        id TEXT PRIMARY KEY,
+        provider_id TEXT NOT NULL REFERENCES experience_providers(id) ON DELETE CASCADE,
+        email TEXT NOT NULL,
+        email_source TEXT NOT NULL, -- 'brreg_contact' | 'verified_domain_address'
+        token TEXT NOT NULL UNIQUE,
+        used INTEGER NOT NULL DEFAULT 0,
+        used_at TEXT,
+        revoked_at TEXT,
+        created_at TEXT NOT NULL DEFAULT (datetime('now')),
+        expires_at TEXT NOT NULL
+      )
+    `);
+    db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_gardssalg_claims_token ON gardssalg_claims(token)`);
+    db.exec(`CREATE INDEX IF NOT EXISTS idx_gardssalg_claims_provider ON gardssalg_claims(provider_id)`);
+    db.exec(`CREATE INDEX IF NOT EXISTS idx_gardssalg_claims_created ON gardssalg_claims(provider_id, created_at)`);
+  } catch (e) {
+    console.log(`[experiences] gardssalg_claims init skipped: ${(e as Error).message}`);
+  }
+
   console.log("[experiences] schema initialized");
 }

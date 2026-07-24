@@ -276,6 +276,37 @@ export class EmailService {
     });
   }
 
+  /**
+   * dev-request 2026-07-21-opplevagent-claim-flyt-drikkeprodusenter — the
+   * gårdssalg/opplevagent producer-claim magic-link email. REUSES the shape
+   * of sendOwnerMagicLink() above (same one-button, 7-day-expiry template
+   * structure) but is its OWN method with Opplevagent branding/copy and a
+   * kontakt@opplevagent.no reply-to — sendOwnerMagicLink() itself is
+   * untouched (still RFB-only, per this dev-request's explicit non-goal of
+   * never modifying rettfrabonden.com's existing claim flow). Bypasses the
+   * getConfig()-derived brand/supportEmail/fromAddress getters above
+   * entirely (those default to the 'rfb' vertical and verticals/experiences/
+   * config.yaml's resend_domain is still a stale 'rettfrabonden.com'
+   * placeholder — confirmed by reading that file) — same hardcoded-
+   * kontakt@opplevagent.no convention every other opplevagent-facing email
+   * in this codebase already uses (see src/services/booking-store.ts's
+   * replyTo on every gårdssalg booking email).
+   */
+  async sendGardssalgClaimMagicLink(opts: {
+    to: string;
+    providerName: string;
+    verifyUrl: string;
+  }): Promise<{ success: boolean; messageId?: string; error?: string }> {
+    const { to, providerName, verifyUrl } = opts;
+    return await this.sendEmail({
+      to,
+      subject: `Logg inn på eierportalen for ${providerName} — Opplevagent`,
+      htmlContent: buildGardssalgClaimMagicLinkHtml(providerName, verifyUrl),
+      textContent: buildGardssalgClaimMagicLinkText(providerName, verifyUrl),
+      replyTo: "kontakt@opplevagent.no",
+    });
+  }
+
   async sendRaw(options: {
     to: string;
     cc?: string;
@@ -873,6 +904,82 @@ Mvh,
 Rett fra Bonden
 kontakt@rettfrabonden.com
 https://rettfrabonden.com
+`;
+}
+
+// ─── Gårdssalg/opplevagent claim magic-link templates (dev-request
+// 2026-07-21-opplevagent-claim-flyt-drikkeprodusenter) — Opplevagent-branded
+// siblings of buildOwnerMagicLinkHtml/Text above. See
+// sendGardssalgClaimMagicLink()'s doc comment for why this is a separate
+// method/template rather than a change to the RFB ones. */
+function buildGardssalgClaimMagicLinkHtml(providerName: string, verifyUrl: string): string {
+  const safeName = epEscape(providerName);
+  const safeUrl = epEscape(verifyUrl);
+  return `<!DOCTYPE html>
+<html lang="nb">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <style>
+    body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Helvetica Neue', sans-serif; line-height: 1.6; color: #333; max-width: 600px; margin: 0 auto; padding: 0; }
+    .container { background: #ffffff; padding: 40px 20px; }
+    .header { margin-bottom: 24px; border-bottom: 3px solid #0f5a50; padding-bottom: 16px; }
+    .logo { font-size: 22px; font-weight: 700; color: #0f5a50; }
+    h1 { font-size: 20px; color: #1a1a1a; margin: 18px 0 14px 0; }
+    p { margin: 12px 0; font-size: 15px; line-height: 1.7; }
+    .cta-button { display: inline-block; background: #0f5a50; color: #ffffff !important; padding: 14px 32px; text-decoration: none; border-radius: 8px; font-weight: 700; margin: 18px 0; }
+    .cta-button:hover { background: #0e3c36; }
+    .footer { margin-top: 36px; padding-top: 18px; border-top: 1px solid #eee; font-size: 13px; color: #666; }
+    code { word-break: break-all; background: #f5f5f5; padding: 4px 6px; display: inline-block; border-radius: 4px; }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <div class="header">
+      <div class="logo">opplevagent.no</div>
+    </div>
+
+    <h1>Hei!</h1>
+
+    <p>Klikk lenken under for å logge inn på eierportalen for <strong>${safeName}</strong> på Opplevagent.</p>
+
+    <p style="text-align:center;">
+      <a href="${safeUrl}" class="cta-button">Logg inn på eierportalen</a>
+    </p>
+
+    <p style="font-size: 14px; color: #666;">
+      Eller kopier og lim inn denne lenken i nettleseren:
+      <br />
+      <code>${safeUrl}</code>
+    </p>
+
+    <p>Lenken er gyldig i 7 dager.</p>
+
+    <p>Hvis du ikke ba om denne innloggingen, kan du trygt ignorere e-posten.</p>
+
+    <div class="footer">
+      <p>Mvh,<br>Opplevagent — kontakt@opplevagent.no<br>https://opplevagent.no</p>
+    </div>
+  </div>
+</body>
+</html>`;
+}
+
+function buildGardssalgClaimMagicLinkText(providerName: string, verifyUrl: string): string {
+  return `Hei!
+
+Klikk lenken under for å logge inn på eierportalen for ${providerName} på Opplevagent:
+
+${verifyUrl}
+
+Lenken er gyldig i 7 dager.
+
+Hvis du ikke ba om denne innloggingen, kan du trygt ignorere e-posten.
+
+Mvh,
+Opplevagent
+kontakt@opplevagent.no
+https://opplevagent.no
 `;
 }
 
