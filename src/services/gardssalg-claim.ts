@@ -73,6 +73,7 @@ import crypto from "crypto";
 import { v4 as uuid } from "uuid";
 import { getDb } from "../database/db-factory";
 import { normalizeDomain } from "./blocklist-service";
+import { isMatchableDomain } from "./gardssalg-rfb-enrich";
 
 const VERTICAL = "experiences";
 
@@ -127,6 +128,20 @@ export function getClaimProviderBySlug(slug: string): ClaimProviderRow | null {
 }
 
 // ── Ownership-verified-domain check (see module doc above) ───────────────
+// KNOWN GAP (security review, 2026-07-24, non-blocking): content_source ===
+// 'manual' is treated here as a PERMANENT "hjemmeside forever verified" flag.
+// But PATCH /admin/providers/:id/hjemmeside (src/routes/opplevelser.ts,
+// writeProviderHjemmeside) can change hjemmeside on a content_source='manual'
+// row WITHOUT touching content_source or field_provenance — so a manual row's
+// CURRENT hjemmeside is never re-checked against the ORIGINAL evidence that
+// earned the 'manual' trust when a later claim is issued. Lower severity
+// (that route is admin-gated — only Daniel can trigger it), but it's a
+// stale-trust gap in the "provably belongs to the org" invariant. Not fixed
+// here: a real fix needs a design decision (e.g. stamp a re-verification
+// timestamp/hash on hjemmeside change via that route, or stop treating bare
+// content_source='manual' as sufficient without a corroborating
+// field_provenance check) that's bigger than this fix-up's scope — flag for
+// a future dev-request rather than guessing at it here.
 export function isHjemmesideOwnershipVerified(row: Pick<ClaimProviderRow, "content_source" | "field_provenance">): boolean {
   if (row.content_source === "manual") return true;
   if (!row.field_provenance) return false;
@@ -179,9 +194,21 @@ export function deriveOrgLinkedEmail(
   // scraped/unverified) experience_providers.epost — the domain itself is
   // the thing we've verified, so the well-known "post@" convention address
   // on it is the only address we can send to without trusting scraped data.
+  //
+  // isMatchableDomain() (gardssalg-rfb-enrich.ts) is ALSO required here, not
+  // just brreg-verification + provenance: "verified" only means the domain
+  // reached hjemmeside via a vetted path (manual entry or admin-approved
+  // evidence) — it says nothing about whether the domain is a shared/generic
+  // one (a Facebook page, a bare wixsite.com/gmail.com address, etc.) that
+  // isn't actually a unique identity for THIS organisation. Daniel can enter
+  // (or approve) a Facebook URL as a producer's "hjemmeside" when they have no
+  // real site; deriving post@facebook.com from that would hand a claim link
+  // to Meta's shared mailbox, not the org — the exact "wrong producer's info
+  // on a page" harm this module exists to prevent. Falls through to
+  // no_org_linked_email (manual fallback) exactly like an unvetted domain.
   if (isHjemmesideOwnershipVerified(provider)) {
     const domain = normalizeDomain(provider.hjemmeside);
-    if (domain && domain.includes(".")) {
+    if (domain && domain.includes(".") && isMatchableDomain(domain)) {
       return { eligible: true, email: `post@${domain}`, source: "verified_domain_address" };
     }
   }

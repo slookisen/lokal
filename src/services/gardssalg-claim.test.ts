@@ -111,6 +111,27 @@ export function runGardssalgClaimTests(opts: { log?: boolean } = {}): Promise<Te
       });
       assertEq(r4, { eligible: false, reason: "no_org_linked_email" }, "a4: unvetted hjemmeside (no provenance, not manual) -> no_org_linked_email");
 
+      // (a4c) SECURITY: a generic/shared domain must NEVER become a claim
+      // target, even when "verified" via content_source='manual' — Daniel
+      // entering a Facebook page as a producer's hjemmeside (no real site)
+      // must not derive post@facebook.com. Falls through to manual fallback,
+      // same as the no-provenance case above.
+      const r4c = deriveOrgLinkedEmail({
+        org_nr: "912345678", brreg_verified: 1, hjemmeside: "https://www.facebook.com/klostergarden",
+        content_source: "manual", field_provenance: null,
+      });
+      assertEq(r4c, { eligible: false, reason: "no_org_linked_email" }, "a4c: manual content_source but generic domain (facebook.com) -> no_org_linked_email, no post@facebook.com");
+
+      // (a4d) Same, via the admin-approved field_provenance path instead of
+      // 'manual' — a bare gmail.com/wixsite.com value slipping through an
+      // approval must not become a claim target either.
+      const r4d = deriveOrgLinkedEmail({
+        org_nr: "912345678", brreg_verified: 1, hjemmeside: "https://gmail.com",
+        content_source: "provider_site",
+        field_provenance: JSON.stringify({ hjemmeside: { source_url: "https://visitnorway.no/listing/456", fetched_at: "2026-07-01T00:00:00Z" } }),
+      });
+      assertEq(r4d, { eligible: false, reason: "no_org_linked_email" }, "a4d: field_provenance-verified but generic domain (gmail.com) -> no_org_linked_email");
+
       const r4b = deriveOrgLinkedEmail({
         org_nr: "912345678", brreg_verified: 1, hjemmeside: null,
         content_source: null, field_provenance: null,
@@ -186,6 +207,15 @@ export function runGardssalgClaimTests(opts: { log?: boolean } = {}): Promise<Te
         org_nr: "911111111", brreg_verified: 1, hjemmeside: "https://danielsgard.no",
         content_source: "manual", field_provenance: null,
       });
+      // SECURITY regression fixture: content_source='manual' (so
+      // isHjemmesideOwnershipVerified is true) but hjemmeside is a generic/
+      // shared domain (Facebook page entered as the producer's "hjemmeside").
+      // Must NOT produce a viable claim-email -> manual fallback only.
+      insertProvider.run({
+        id: "prov-generic-domain", navn: "Gård Uten Egen Nettside", slug: "gard-uten-egen-nettside",
+        org_nr: "922222222", brreg_verified: 1, hjemmeside: "https://www.facebook.com/gardutenegennettside",
+        content_source: "manual", field_provenance: null,
+      });
 
       // ── issueClaimMagicLink ────────────────────────────────────────────
       const notFound = claimSvc.issueClaimMagicLink("prov-missing");
@@ -193,6 +223,12 @@ export function runGardssalgClaimTests(opts: { log?: boolean } = {}): Promise<Te
 
       const noEmail = claimSvc.issueClaimMagicLink("prov-noemail");
       assertEq(noEmail, { ok: false, error: "no_org_linked_email" }, "b2: issueClaimMagicLink with no org-linked email -> no_org_linked_email (no self-service)");
+
+      // SECURITY: a 'manual' provider whose hjemmeside is a generic/shared
+      // domain (Facebook page, no real site) must never issue a claim link —
+      // that would derive post@facebook.com as the "verified" target.
+      const genericDomain = claimSvc.issueClaimMagicLink("prov-generic-domain");
+      assertEq(genericDomain, { ok: false, error: "no_org_linked_email" }, "b2b: issueClaimMagicLink on a manual provider with a generic-domain hjemmeside (facebook.com) -> no_org_linked_email, never a viable claim-email");
 
       const issued = claimSvc.issueClaimMagicLink("prov-claimable");
       assertTrue(issued.ok === true, "b3: issueClaimMagicLink succeeds for the claimable provider");
