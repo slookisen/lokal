@@ -302,3 +302,130 @@ export function summariseRuns(opts: {
     by_agent: aggregate("agent"),
   };
 }
+
+// ─── Orchestrator run-lock ──────────────────────────────────────
+//
+// orch-pr-20260724-wake-mutex: server-side mutex for the platform-orchestrator
+// build lane (fleet-wide WIP limit of 1). Two independent Claude Code sessions
+// can start within the same minute (cron spine-tick racing a manual/signal
+// trigger) and both pass the existing dev-request lease + fire-marker dedup
+// before either commits anything — this closes that specific double-fire
+// class. Backed by the `orchestrator_locks` table (see database/init.ts):
+// one row per agent name, holding the current holder if any.
+//
+// Deliberately separate from the `runs` table/functions above — this is a
+// transient session lock, not part of the permanent audit ledger.
+
+/**
+ * Acquire the orchestrator run-lock for `agent`. Atomic: a single
+ * INSERT ... ON CONFLICT ... DO UPDATE ... WHERE statement, not a SELECT
+ * followed by a separate write — that read-then-write gap is exactly the
+ * TOCTOU race this lock exists to close (two independent sessions have no
+ * other shared state, so this HTTP surface + SQLite's per-statement
+ * atomicity is the only mutex available). SQLite executes the entire
+ * INSERT...ON CONFLICT...DO UPDATE...WHERE as ONE atomic operation against
+ * the DB file — there is no window between "check current holder" and
+ * "write new holder" for a second caller to land in.
+ *
+ * Staleness is computed against wall-clock time (Date.now()), NOT SQLite's
+ * own datetime('now'): `staleMinutes` is converted into an ISO-8601 UTC
+ * cutoff timestamp in JS, then compared lexicographically against the
+ * stored `locked_at` inside the SQL WHERE guard. That's safe because
+ * ISO-8601 UTC timestamps ("...Z") sort lexicographically in the same
+ * order as chronologically — so "existing row is older than N minutes" is
+ * a numeric wall-clock comparison expressed as a string-range predicate,
+ * not a DB-clock comparison (existing precedent: listRecentRuns/
+ * summariseRuns above use the identical sinceISO-cutoff pattern).
+ *
+ * IMPORTANT — the staleness clock is `locked_at`, a value THIS FUNCTION
+ * stamps itself (`new Date().toISOString()`, right below), never the
+ * caller-supplied `started_at`. `started_at` is still stored and returned
+ * as-is (useful metadata — e.g. surfaced in the `holder` object on a 409 so
+ * a caller can log/display when the winning session actually started its
+ * work), but it MUST NOT be used to decide staleness: it arrives verbatim
+ * from the request body with no format validation beyond "non-empty
+ * string" (see admin-runs.ts), so a malformed or non-standard value
+ * ("not-a-date", a far-future date, a non-"Z"-suffixed offset timestamp, an
+ * epoch number as a string, ...) could make a lexicographic comparison
+ * behave unpredictably — in the worst case, sort as "never stale" and
+ * permanently wedge the platform's one build lane. The mutex's own
+ * correctness must never depend on unvalidated caller input, so the trust
+ * boundary here is 100% server-controlled: `locked_at`, only.
+ *
+ * Returns {acquired:true} when this call now holds the lock — either a
+ * fresh acquire (no prior row) or the prior holder was stale and got
+ * replaced. Returns {acquired:false, holder} with the CURRENT (untouched)
+ * holder's run_id/started_at when an active, non-stale lock is already
+ * held by someone else — the existing row is never overwritten in that case.
+ */
+export function acquireLock(args: {
+  agent: string;
+  run_id: string;
+  started_at: string;
+  staleMinutes?: number;
+  db?: Database.Database;
+}): { acquired: true } | { acquired: false; holder: { run_id: string; started_at: string } } {
+  const conn = args.db ?? getDb();
+  const staleMinutes = args.staleMinutes ?? 90;
+  const staleCutoff = new Date(Date.now() - staleMinutes * 60_000).toISOString();
+  const lockedAt = new Date().toISOString();
+
+  const info = conn
+    .prepare(
+      `INSERT INTO orchestrator_locks (agent, run_id, started_at, locked_at)
+       VALUES (@agent, @run_id, @started_at, @locked_at)
+       ON CONFLICT(agent) DO UPDATE SET
+         run_id = excluded.run_id,
+         started_at = excluded.started_at,
+         locked_at = excluded.locked_at
+       WHERE orchestrator_locks.locked_at < @staleCutoff`,
+    )
+    .run({
+      agent: args.agent,
+      run_id: args.run_id,
+      started_at: args.started_at,
+      locked_at: lockedAt,
+      staleCutoff,
+    });
+
+  if (info.changes > 0) {
+    // Either a brand-new row (no prior holder) or the prior holder was
+    // stale and the DO UPDATE's WHERE guard let the overwrite through.
+    return { acquired: true };
+  }
+
+  // ON CONFLICT fired but the WHERE guard blocked the write: an active,
+  // non-stale lock is held by someone else and was left untouched. Reading
+  // it back here is safe — it's reporting, not deciding; the atomic
+  // statement above already made the acquire/reject decision, so this
+  // SELECT cannot reintroduce the race it's just describing the outcome of.
+  const holder = conn
+    .prepare(`SELECT run_id, started_at FROM orchestrator_locks WHERE agent = ?`)
+    .get(args.agent) as { run_id: string; started_at: string } | undefined;
+
+  // Defensive only — unreachable in practice: ON CONFLICT DO UPDATE only
+  // no-ops when a conflicting row already exists, so `holder` is always
+  // found here.
+  return { acquired: false, holder: holder ?? { run_id: args.run_id, started_at: args.started_at } };
+}
+
+/**
+ * Release the orchestrator run-lock for `agent`, but ONLY if `run_id`
+ * matches the CURRENT holder — a stale/late release from a session that
+ * already lost the race to a newer holder must not be able to clobber the
+ * new holder's lock. Returns whether a row was actually deleted; releasing
+ * a lock you don't hold (already released, or already lost to someone
+ * else) is a no-op, not an error — same idempotent-friendly spirit as
+ * recordRun() above.
+ */
+export function releaseLock(args: {
+  agent: string;
+  run_id: string;
+  db?: Database.Database;
+}): { released: boolean } {
+  const conn = args.db ?? getDb();
+  const info = conn
+    .prepare(`DELETE FROM orchestrator_locks WHERE agent = ? AND run_id = ?`)
+    .run(args.agent, args.run_id);
+  return { released: info.changes > 0 };
+}

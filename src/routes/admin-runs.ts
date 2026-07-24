@@ -23,6 +23,8 @@ import {
   listStaleRuns,
   summariseRuns,
   recordVerifierResult,
+  acquireLock,
+  releaseLock,
 } from "../services/run-ledger";
 import type {
   RunEnvelope,
@@ -205,6 +207,74 @@ router.get("/summary", (req: Request, res: Response) => {
   }
 });
 
+
+// ─── POST /admin/runs/lock ────────────────────────────────────
+// orch-pr-20260724-wake-mutex: server-side session mutex for the
+// platform-orchestrator build lane (fleet-wide WIP limit of 1). Two
+// independent Claude Code sessions have no other shared state to
+// coordinate on, so this is enforced here, not client-side.
+//
+// Body: { agent, run_id, started_at }. Registered as a literal path BEFORE
+// POST /:run_id/verify below — no ordering conflict either way, since
+// "/lock" (1 segment) and "/lock/release" (2 segments, 2nd="release") never
+// match the "/:run_id/verify" pattern (2 segments, 2nd must be "verify"
+// literally), but keeping literal routes ahead of the param route is the
+// safer convention.
+router.post("/lock", (req: Request, res: Response) => {
+  if (!requireAdmin(req, res)) return;
+
+  const body = req.body as { agent?: unknown; run_id?: unknown; started_at?: unknown };
+  const isNonEmptyString = (v: unknown): v is string => typeof v === "string" && v.length > 0;
+  if (!isNonEmptyString(body.agent) || !isNonEmptyString(body.run_id) || !isNonEmptyString(body.started_at)) {
+    res.status(400).json({
+      error: "Invalid lock request",
+      reason: "agent, run_id, started_at are all required non-empty strings",
+    });
+    return;
+  }
+
+  try {
+    const result = acquireLock({
+      agent: body.agent,
+      run_id: body.run_id,
+      started_at: body.started_at,
+    });
+    if (result.acquired) {
+      res.json({ success: true, locked: true });
+    } else {
+      // 409 Conflict — semantically correct, and lets a caller distinguish
+      // "someone else holds the lock" from a generic 5xx error.
+      res.status(409).json({ success: false, locked: false, holder: result.holder });
+    }
+  } catch (err: any) {
+    res.status(500).json({ error: "Lock failed", detail: err.message });
+  }
+});
+
+// ─── POST /admin/runs/lock/release ────────────────────────────
+// Body: { agent, run_id }. Releasing a lock you don't hold (already
+// released, or already lost to a newer holder) is a no-op, not an error —
+// always 200, `released` reports whether a row was actually deleted.
+router.post("/lock/release", (req: Request, res: Response) => {
+  if (!requireAdmin(req, res)) return;
+
+  const body = req.body as { agent?: unknown; run_id?: unknown };
+  const isNonEmptyString = (v: unknown): v is string => typeof v === "string" && v.length > 0;
+  if (!isNonEmptyString(body.agent) || !isNonEmptyString(body.run_id)) {
+    res.status(400).json({
+      error: "Invalid release request",
+      reason: "agent, run_id are both required non-empty strings",
+    });
+    return;
+  }
+
+  try {
+    const { released } = releaseLock({ agent: body.agent, run_id: body.run_id });
+    res.json({ success: true, released });
+  } catch (err: any) {
+    res.status(500).json({ error: "Release failed", detail: err.message });
+  }
+});
 
 // ─── POST /admin/runs/:run_id/verify ─────────────────────────
 // Platform-verifier writes back here after probing each claim.
