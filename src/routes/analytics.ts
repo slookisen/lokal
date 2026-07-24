@@ -56,6 +56,8 @@ function verticalFilter(req: Request): { sql: string; params: string[] } {
  * GET /admin/analytics/summary/:hours — Stats for last N hours
  * GET /admin/analytics/producers  — Top producers by views
  * GET /admin/analytics/cities     — City-level breakdowns
+ * GET /admin/analytics/mcp-usage  — MCP/A2A/agent-card usage by tool/client
+ * GET /admin/analytics/consumer-usage — Top consumer-API-key holders (usage ledger)
  * GET /admin/analytics/export/:table — Raw data export
  * POST /admin/analytics/prune     — Delete old data
  */
@@ -315,6 +317,98 @@ router.get("/mcp-usage", (req: Request, res: Response) => {
     byTool,
     byClient,
     byVertical,
+  });
+});
+
+/**
+ * GET /admin/analytics/consumer-usage
+ * Top consumer-API-key holders — "hvilke agenter bruker dataen min mest"
+ * (dev-request 2026-07-13-agent-identity-usage-ledger, slice 2 / acceptance
+ * criterion 3's second half). Reads consumer_usage_ledger + consumer_api_keys
+ * (src/database/init.ts, src/middleware/consumer-identity.ts) — aggregate
+ * call-counts only, never call content.
+ *
+ * Includes revoked AND erased keys in the aggregation: a revoke/erase only
+ * stops a key from being recognized going forward, it never removes its
+ * historical ledger rows (see the long comment on consumer_api_keys in
+ * database/init.ts — the aggregate history stops being personal data once
+ * an erased key's label/contact_email are nulled, so hiding it here would
+ * just throw away real usage data for no privacy benefit). An erased key's
+ * `label` is already null in the DB at that point, so it surfaces here as
+ * an anonymous "key #<id>" the same way the erasure path intends.
+ *
+ * No join against page-view/UTM analytics tables: consumer API keys and the
+ * existing anonymous analytics_* tables share no common identity column
+ * (by design — issuing a key never attaches it to a browser/session), so
+ * there is nothing to join on today. Flagging this explicitly rather than
+ * fabricating a join — the spec's "joinable with UTM/analytics-kilde"
+ * wording is satisfied by both datasets already being queryable by the same
+ * `day` (YYYY-MM-DD) key for an external report to correlate manually, not
+ * by this endpoint performing a SQL join itself.
+ *
+ * Query params:
+ *   days=7 (default; 1-90)
+ *   limit=50 (default; max consumers returned, 1-200)
+ */
+router.get("/consumer-usage", (req: Request, res: Response) => {
+  const days = Math.max(1, Math.min(90, parseInt(req.query.days as string) || 7));
+  const limit = Math.max(1, Math.min(200, parseInt(req.query.limit as string) || 50));
+  const sinceDay = new Date(Date.now() - days * 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
+  const db = getDb();
+
+  const topConsumers = db
+    .prepare(
+      `SELECT k.id AS key_id, k.label, k.rate_tier, k.created_at,
+              (k.revoked_at IS NOT NULL) AS revoked, (k.deleted_at IS NOT NULL) AS erased,
+              SUM(l.call_count) AS total_calls,
+              COUNT(DISTINCT l.endpoint_or_tool) AS distinct_tools,
+              MAX(l.day) AS last_active_day
+       FROM consumer_usage_ledger l
+       JOIN consumer_api_keys k ON k.id = l.key_id
+       WHERE l.day >= ?
+       GROUP BY k.id
+       ORDER BY total_calls DESC
+       LIMIT ?`,
+    )
+    .all(sinceDay, limit) as Array<{
+    key_id: number;
+    label: string | null;
+    rate_tier: string;
+    created_at: string;
+    revoked: number;
+    erased: number;
+    total_calls: number;
+    distinct_tools: number;
+    last_active_day: string;
+  }>;
+
+  const byTool = db
+    .prepare(
+      `SELECT endpoint_or_tool, SUM(call_count) AS total_calls, COUNT(DISTINCT key_id) AS distinct_keys
+       FROM consumer_usage_ledger
+       WHERE day >= ?
+       GROUP BY endpoint_or_tool
+       ORDER BY total_calls DESC
+       LIMIT 50`,
+    )
+    .all(sinceDay) as Array<{ endpoint_or_tool: string; total_calls: number; distinct_keys: number }>;
+
+  const totals = db
+    .prepare(
+      `SELECT COUNT(*) AS total_keys,
+              SUM(CASE WHEN revoked_at IS NULL AND deleted_at IS NULL THEN 1 ELSE 0 END) AS active_keys
+       FROM consumer_api_keys`,
+    )
+    .get() as { total_keys: number; active_keys: number };
+
+  res.json({
+    timeframe: `last ${days} days`,
+    timestamp: new Date().toISOString(),
+    totalKeysIssued: totals.total_keys,
+    activeKeys: totals.active_keys,
+    consumersWithUsage: topConsumers.length,
+    topConsumers,
+    byTool,
   });
 });
 

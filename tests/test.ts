@@ -32693,6 +32693,26 @@ runSerial(async () => {
   }
 });
 
+// ── dev-request 2026-07-13-agent-identity-usage-ledger, slice 2: admin
+// "top consumers" report — GET /admin/analytics/consumer-usage (acceptance
+// criterion 3's second half). Own in-memory DB (swaps the shared getDb()
+// singleton) — runs via runSerial() same as the three suites above.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-07-13-agent-identity-usage-ledger: slice 2 (consumer-usage-report) ──");
+  try {
+    const { runConsumerUsageReportTests } = require("../src/routes/consumer-usage-report.test") as
+      typeof import("../src/routes/consumer-usage-report.test");
+    const cur = await runConsumerUsageReportTests({ log: false });
+    passed += cur.passed;
+    failed += cur.failed;
+    for (const f of cur.failures) failures.push("consumer-usage-report: " + f);
+    console.log(`  consumer-usage-report: ${cur.passed} passed, ${cur.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("consumer-usage-report: unexpected error: " + String(err?.message || err));
+  }
+});
+
 // ── dev-request 2026-07-16-wrong-entity-opprydding-rfb (slookisen/A2A):
 // GET /admin/wrong-entity-retro-sweep — catalog-wide read-only/dry-run-only
 // retro-sweep for wrong-entity-contamination candidates (email-domain vs
