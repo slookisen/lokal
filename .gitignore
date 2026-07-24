@@ -47,5 +47,8 @@ lpt[1-9]
 # OS
 Thumbs.db
 
+# Claude Code harness scratch worktrees (isolated background-agent checkouts)
+.claude/worktrees/
+
 # Belt-and-suspenders — mcp-server has its own node_modules
 mcp-server/node_modules/
