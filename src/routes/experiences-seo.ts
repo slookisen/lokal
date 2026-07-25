@@ -1370,6 +1370,33 @@ og et \`booking\`-felt ({live, mode, note}) som ærlig speiler dark-launch-statu
 
 Provider-data verifiseres mot Brønnøysundregistrene (CC0). Innhold gjengis
 som faktaoppsummering med kildehenvisning.
+
+## Frivillig API-nøkkel (forbruker-identitet)
+
+Helt valgfritt — alle søk-/lese-endepunktene over er allerede åpne uten nøkkel, og dette er
+IKKE en pålogging eller et krav for å bruke tjenesten.
+
+- Hent en gratis nøkkel: \`POST ${url}/api/keys\` med valgfri JSON-body
+  \`{ "label": "min-agent", "contact_email": "..." }\` (begge felt valgfrie). Svaret inneholder
+  \`key\` — vis den KUN denne ene gangen, den kan ikke hentes igjen.
+- Bruk den: send nøkkelen som \`X-API-Key\`-header på ethvert MCP-/A2A-/REST-kall.
+- Fordel: ca. 3x høyere rate-grense (200→600 på \`/a2a\` og \`/mcp\`, 300→900 på
+  \`/api/opplevelser/discover\` og andre REST-kall), pluss at kallene dine telles i en aggregert
+  forbrukslogg (kun endepunkt/verktøynavn og dato — aldri innhold eller argumenter).
+- Tilbakekall/slett: \`POST ${url}/api/keys/revoke\` (stanser nøkkelen, historikk beholdes)
+  eller \`POST ${url}/api/keys/erase\` (GDPR-sletting av label/e-post). Begge tar
+  \`{ "key": "..." }\` i body, eller nøkkelen som \`X-API-Key\`-header.
+
+Eksempel (cURL):
+  curl -X POST ${url}/api/keys \\
+    -H "Content-Type: application/json" \\
+    -d '{"label":"my-agent"}'
+
+Voluntary — every search/read endpoint above already works with no key, and this is NOT a
+login or a requirement to use the service. Get a free key via \`POST /api/keys\`
+(optional \`label\`/\`contact_email\`), send it back as the \`X-API-Key\` header on any call for a
+higher rate-limit tier, and revoke/erase it any time via \`POST /api/keys/revoke\` or
+\`POST /api/keys/erase\`.
 `);
 });
 

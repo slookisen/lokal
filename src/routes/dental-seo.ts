@@ -1836,6 +1836,35 @@ ${DENTAL_BASE_URL}/hvordan-det-fungerer
 
 Data fra Brønnøysundregistrene er CC0 (fri bruk). HPR-data er offentlig.
 Klinikkdata fra nettsider gjengis som faktaoppsummering.
+
+## Frivillig API-nøkkel (forbruker-identitet)
+
+Helt valgfritt — alle søk-/lese-endepunktene over er allerede åpne uten nøkkel, og dette er
+IKKE en pålogging eller et krav for å bruke tjenesten.
+
+- Hent en gratis nøkkel: \`POST ${DENTAL_BASE_URL}/api/keys\` med valgfri JSON-body
+  \`{ "label": "min-agent", "contact_email": "..." }\` (begge felt valgfrie). Svaret inneholder
+  \`key\` — vis den KUN denne ene gangen, den kan ikke hentes igjen.
+- Bruk den: send nøkkelen som \`X-API-Key\`-header på ethvert MCP-/A2A-/REST-kall.
+- Fordel: kallene dine telles i en aggregert forbrukslogg (kun endepunkt/verktøynavn og dato —
+  aldri innhold eller argumenter). Merk: rate-grensen på finn-tannlege.com er i dag en flat
+  IP-kvote (1000/15 min) som IKKE er høyere med nøkkel — 3x-fordelen som gjelder på
+  rettfrabonden.com/opplevagent.no er ikke koblet på her ennå.
+- Tilbakekall/slett: \`POST ${DENTAL_BASE_URL}/api/keys/revoke\` (stanser nøkkelen, historikk
+  beholdes) eller \`POST ${DENTAL_BASE_URL}/api/keys/erase\` (GDPR-sletting av label/e-post).
+  Begge tar \`{ "key": "..." }\` i body, eller nøkkelen som \`X-API-Key\`-header.
+
+Eksempel (cURL):
+  curl -X POST ${DENTAL_BASE_URL}/api/keys \\
+    -H "Content-Type: application/json" \\
+    -d '{"label":"my-agent"}'
+
+Voluntary — every search/read endpoint above already works with no key, and this is NOT a
+login or a requirement to use the service. Get a free key via \`POST /api/keys\`
+(optional \`label\`/\`contact_email\`), send it back as the \`X-API-Key\` header on any call, and
+revoke/erase it any time via \`POST /api/keys/revoke\` or \`POST /api/keys/erase\`. Note: unlike
+rettfrabonden.com/opplevagent.no, finn-tannlege.com's rate limit is currently a flat per-IP
+quota not yet raised by a key — the key still gets your calls counted in the usage ledger.
 `);
 });
 

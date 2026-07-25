@@ -806,6 +806,28 @@ class MarketplaceRegistry {
             "Read/search operations are open. " +
             "API-n\u00f8kkel mottatt ved registrering. Kreves for skriveoperasjoner.",
         },
+        // dev-request 2026-07-13-agent-identity-usage-ledger, slice 2 (docs-only
+        // advertisement \u2014 issuance/rate-limiting/ledger already shipped in
+        // PR #337/#350). A SECOND, unrelated scheme sharing the same
+        // X-API-Key header name as `apiKey` above \u2014 intentional, not a
+        // collision; see description.
+        consumerApiKey: {
+          type: "apiKey",
+          in: "header",
+          name: "X-API-Key",
+          description: "Free, voluntary consumer-identity key for AI agents calling this API " +
+            "\u2014 get one via POST /api/keys (optional label/contact_email in the JSON body), " +
+            "no login or account needed. Uses the SAME header name (X-API-Key) as the `apiKey` " +
+            "scheme above, but is a separate, optional credential for a different purpose: " +
+            "read/search calls are already fully open with no key at all, and nothing here is " +
+            "required. Sending a consumer key simply raises your rate-limit ceiling (about 3x) " +
+            "and gets your calls counted in a per-key usage ledger. " +
+            "Gratis, frivillig forbruker-identitetsn\u00f8kkel for AI-agenter \u2014 hentes via " +
+            "POST /api/keys, ingen innlogging eller konto kreves. Bruker samme headernavn " +
+            "(X-API-Key) som apiKey-skjemaet over, men er en egen, valgfri legitimasjon til et " +
+            "annet form\u00e5l \u2014 les/s\u00f8k er allerede helt \u00e5pent uten n\u00f8kkel. " +
+            "Gir bare h\u00f8yere rate-grense og en egen forbrukslogg.",
+        },
       },
       // A2A v1.0 `security` requirement list (dev-request 2026-07-13-a2a-card-v1-signing
       // slice 1) -- empty means no default requirement, matching `authentication.credentials:

@@ -102,6 +102,23 @@ router.get("/a2a", (_req: Request, res: Response) => {
           name: "X-API-Key",
           description: "API key received upon registration. Required for write operations. Read/search operations are open.",
         },
+        // dev-request 2026-07-13-agent-identity-usage-ledger, slice 2 (docs-only
+        // advertisement — issuance/rate-limiting/ledger already shipped in
+        // PR #337/#350). A SECOND, unrelated scheme that happens to share the
+        // same X-API-Key header name as `apiKey` above — that's intentional,
+        // not a typo/collision; see the description below.
+        consumerApiKey: {
+          type: "apiKey",
+          in: "header",
+          name: "X-API-Key",
+          description:
+            "Free, voluntary consumer-identity key for AI agents calling this API — get one via POST /api/keys (optional label/contact_email in the JSON body), no login or account needed. " +
+            "Uses the SAME header name (X-API-Key) as the `apiKey` scheme above, but is a separate, optional credential for a different purpose: read/search calls are already fully open with no key at all, and nothing here is required. " +
+            "Sending a consumer key simply raises your rate-limit ceiling (about 3x) and gets your calls counted in a per-key usage ledger. " +
+            "Gratis, frivillig forbruker-identitetsnøkkel for AI-agenter — hentes via POST /api/keys, ingen innlogging eller konto kreves. " +
+            "Bruker samme headernavn (X-API-Key) som apiKey-skjemaet over, men er en egen, valgfri legitimasjon til et annet formål — les/søk er allerede helt åpent uten nøkkel, og ingenting her er obligatorisk. " +
+            "Gir bare høyere rate-grense og en egen forbrukslogg.",
+        },
       },
       security: [],
       interfaces: [

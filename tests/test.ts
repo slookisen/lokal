@@ -31759,7 +31759,15 @@ console.log("\n── slice4a: Stage V helfo_agreement auto-correction (dental-s
     assertEq(dentalCard.additionalInterfaces[0].url, "https://finn-tannlege.com/api/tannlege", "a2a-v1: dental additionalInterfaces REST url");
     assertEq(dentalCard.additionalInterfaces[0].transport, "HTTP+JSON", "a2a-v1: dental additionalInterfaces transport");
     assertEq(dentalCard.authentication.schemes[0], "none", "a2a-v1: dental legacy authentication untouched (open, no scheme)");
-    assertEq(dentalCard.securitySchemes, undefined, "a2a-v1: dental has no securitySchemes (genuinely open, nothing to declare)");
+    // dev-request 2026-07-13-agent-identity-usage-ledger, slice 2 (docs):
+    // dental still has no producer/write `apiKey` scheme (there is no write
+    // API on this domain — `authentication` above stays "none"), but it now
+    // advertises the platform-wide, purely-optional consumer-identity key.
+    assertEq(Object.keys(dentalCard.securitySchemes).length, 1, "a2a-v1: dental securitySchemes has exactly one entry (consumerApiKey — still no producer apiKey scheme)");
+    assertEq(dentalCard.securitySchemes.consumerApiKey.type, "apiKey", "a2a-v1: dental securitySchemes.consumerApiKey.type");
+    assertEq(dentalCard.securitySchemes.consumerApiKey.in, "header", "a2a-v1: dental securitySchemes.consumerApiKey.in");
+    assertEq(dentalCard.securitySchemes.consumerApiKey.name, "X-API-Key", "a2a-v1: dental securitySchemes.consumerApiKey.name");
+    assertTrue(!("security" in dentalCard), "a2a-v1: dental has no `security` requirement array (advertisement only, not auth)");
 
     const expCard: any = getExperiencesAgentCard();
     assertEq(expCard.protocolVersion, "1.0.0", "a2a-v1: experiences protocolVersion bumped to 1.0.0");
@@ -31767,7 +31775,15 @@ console.log("\n── slice4a: Stage V helfo_agreement auto-correction (dental-s
     assertEq(expCard.additionalInterfaces[0].url, "https://opplevagent.no/api/opplevelser", "a2a-v1: experiences additionalInterfaces REST url");
     assertEq(expCard.additionalInterfaces[0].transport, "HTTP+JSON", "a2a-v1: experiences additionalInterfaces transport");
     assertEq(expCard.authentication.schemes[0], "none", "a2a-v1: experiences legacy authentication untouched (open, no scheme)");
-    assertEq(expCard.securitySchemes, undefined, "a2a-v1: experiences has no securitySchemes (genuinely open, nothing to declare)");
+    // dev-request 2026-07-13-agent-identity-usage-ledger, slice 2 (docs):
+    // experiences still has no producer/write `apiKey` scheme (there is no
+    // write API on this domain — `authentication` above stays "none"), but
+    // it now advertises the platform-wide, purely-optional consumer-identity key.
+    assertEq(Object.keys(expCard.securitySchemes).length, 1, "a2a-v1: experiences securitySchemes has exactly one entry (consumerApiKey — still no producer apiKey scheme)");
+    assertEq(expCard.securitySchemes.consumerApiKey.type, "apiKey", "a2a-v1: experiences securitySchemes.consumerApiKey.type");
+    assertEq(expCard.securitySchemes.consumerApiKey.in, "header", "a2a-v1: experiences securitySchemes.consumerApiKey.in");
+    assertEq(expCard.securitySchemes.consumerApiKey.name, "X-API-Key", "a2a-v1: experiences securitySchemes.consumerApiKey.name");
+    assertTrue(!("security" in expCard), "a2a-v1: experiences has no `security` requirement array (advertisement only, not auth)");
 
     // No cross-vertical leakage: each card's additionalInterfaces points at its own host only.
     assertTrue(!JSON.stringify(dentalCard.additionalInterfaces).includes("opplevagent.no") && !JSON.stringify(dentalCard.additionalInterfaces).includes("rettfrabonden.com"), "a2a-v1: dental additionalInterfaces has no cross-vertical leakage");
