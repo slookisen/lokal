@@ -290,6 +290,7 @@ export async function runGeocodingHonestyTests(opts: { log?: boolean } = {}): Pr
 if (require.main === module) {
   runGeocodingHonestyTests({ log: true }).then((s) => {
     console.log(`\n${s.passed} passed, ${s.failed} failed`);
-    if (s.failed > 0) process.exit(1);
+    // Explicit exit: requiring the route modules leaves background timers open.
+    process.exit(s.failed > 0 ? 1 : 0);
   });
 }

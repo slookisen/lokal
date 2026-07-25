@@ -33017,3 +33017,25 @@ runSerial(async () => {
     failures.push("marketplace-search-honesty: unexpected error: " + String(err?.message || err));
   }
 });
+
+// dev-request 2026-07-25-reisesok-korridor-discovery-og-naerhetssok, Fase 0g:
+// `lokal_search` — the MCP tool AI assistants actually call — now accepts
+// lat/lng/radius_km (it had no way to receive the user's position at all), and
+// the read-only-declared tools no longer start seller conversations. Own
+// in-memory DB (swaps the shared getDb() singleton) + a stubbed geocoder
+// fetch — runs via runSerial() same as the suites above.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-07-25-reisesok: Fase 0g (MCP lokal_search geo + read-only) ──");
+  try {
+    const { runMcpSearchGeoTests } = require("../src/routes/mcp-search-geo.test") as
+      typeof import("../src/routes/mcp-search-geo.test");
+    const msg = await runMcpSearchGeoTests({ log: false });
+    passed += msg.passed;
+    failed += msg.failed;
+    for (const f of msg.failures) failures.push("mcp-search-geo: " + f);
+    console.log(`  mcp-search-geo: ${msg.passed} passed, ${msg.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("mcp-search-geo: unexpected error: " + String(err?.message || err));
+  }
+});

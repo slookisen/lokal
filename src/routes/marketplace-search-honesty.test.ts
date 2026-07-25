@@ -336,6 +336,7 @@ export async function runMarketplaceSearchHonestyTests(opts: { log?: boolean } =
 if (require.main === module) {
   runMarketplaceSearchHonestyTests({ log: true }).then((s) => {
     console.log(`\n${s.passed} passed, ${s.failed} failed`);
-    if (s.failed > 0) process.exit(1);
+    // Explicit exit: requiring the route modules leaves background timers open.
+    process.exit(s.failed > 0 ? 1 : 0);
   });
 }
