@@ -33768,3 +33768,26 @@ runSerial(async () => {
     failures.push("route-corridor: unexpected error: " + String(err?.message || err));
   }
 });
+
+// dev-request 2026-07-25-reisesok-korridor-discovery-og-naerhetssok, Fase 2c —
+// the two /reise SSR pages (seo.ts for RFB, experiences-seo.ts for OpplevAgent)
+// and the two /reise JSON mounts. Asserts host isolation in BOTH directions,
+// that the approximate section never renders a per-producer number, and that
+// the no-token routing path says what it is doing. Routers are driven directly
+// with a mock req/res (same harness shape as orch19-06's invokeGet), so no
+// server and no network. Runs via runSerial().
+runSerial(async () => {
+  console.log("\n── dev-request 2026-07-25-reisesok: Fase 2c (/reise pages + JSON API) ──");
+  try {
+    const { runReisePageTests } = require("../src/routes/reise-page.test") as
+      typeof import("../src/routes/reise-page.test");
+    const rp = await runReisePageTests({ log: false });
+    passed += rp.passed;
+    failed += rp.failed;
+    for (const f of rp.failures) failures.push("reise-page: " + f);
+    console.log(`  reise-page: ${rp.passed} passed, ${rp.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("reise-page: unexpected error: " + String(err?.message || err));
+  }
+});

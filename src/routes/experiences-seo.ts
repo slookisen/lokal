@@ -70,6 +70,9 @@ import {
 } from "../services/experience-store";
 import { EXPERIENCE_TAGS, type ExperienceTag } from "../services/experience-tags";
 import { geocodingService } from "../services/geocoding-service";
+// dev-request 2026-07-25-reisesok…, Fase 2c — the /reise corridor page.
+import { corridorSearch, DEFAULT_MAX_DETOUR_KM } from "../services/route-corridor-service";
+import { getDb as getExpDbForReise } from "../database/db-factory";
 import {
   createBooking,
   getBookingByRef,
@@ -2200,7 +2203,7 @@ const BROWSE_NAV = `<a class="skip-link" href="#main">Hopp til innhold</a>
 function browseFooter(): string {
   return `<footer class="site-foot"><div class="foot-inner">
   <span>© ${new Date().getFullYear()} Opplevagent — kuratert markedsplass for norske opplevelser.</span>
-  <span><a href="/opplevelser">Alle opplevelser</a> · <a href="/llms.txt">llms.txt</a> · <a href="/sitemap.xml">Sitemap</a></span>
+  <span><a href="/opplevelser">Alle opplevelser</a> · <a href="/reise">Langs ruten</a> · <a href="/llms.txt">llms.txt</a> · <a href="/sitemap.xml">Sitemap</a></span>
 </div></footer>`;
 }
 
@@ -5834,6 +5837,190 @@ ${jsonLdScripts}
 <body>
 <nav class="gom-nav"><a class="brand" href="/">opplevagent.no</a></nav>
 ${content}
+</body>
+</html>`);
+});
+
+// ─── /reise — korridor-discovery langs en kjørerute (OpplevAgent) ────
+// dev-request 2026-07-25-reisesok-korridor-discovery-og-naerhetssok, Fase 2c.
+//
+// Twin of the RFB page in seo.ts, carrying the other half of the catalogue:
+// opplevelser + gårdssalg (bryggeri / cideri / vingård / destilleri), and never
+// a single Rett-fra-Bonden row. Cross-vertical routes are Fase 7 and need an
+// architecture decision first (7a); 7c says host isolation must survive it.
+//
+// Registered ABOVE the router.use() 404 catch-all below — anything after that
+// is unreachable.
+//
+// Conventions taken from THIS file rather than from seo.ts: inline Norwegian
+// strings (there is no message catalogue here — only the landing page is
+// bilingual, via homeStrings()), BROWSE_CSS + BROWSE_NAV + browseFooter() for
+// the chrome, and its own full <!doctype> document like the other bespoke
+// pages.
+//
+// noindex, follow — same reasoning as the RFB twin: unbounded from/to
+// combinations are the scaled-template pattern Google's March-2026 update
+// penalises. Fase 8's hand-written corridor pages are the indexable surface.
+//
+// UX: one ordered column, not a grid — a grid reads as "ranked", and a
+// traveller reads this as an itinerary, so vertical order must be the only
+// order. Each row leads with «etter N km» (the along-track position) because
+// that is the question being asked. The offset is «N km fra ruten», never
+// «N km å kjøre» — in Norway those differ by an order of magnitude
+// (Molde→Vestnes: 12.8 km apart, 104 km / 118 min to drive), and Fase 4 is
+// what closes the gap.
+const REISE_CSS = `
+.reise-wrap{max-width:var(--maxw);margin:0 auto;padding:32px 24px 64px}
+.reise-wrap h1{font-family:var(--font-brand);font-size:1.9rem;line-height:1.2;margin-bottom:8px}
+.reise-lede{color:var(--ink-soft);max-width:62ch;margin-bottom:20px}
+.reise-form{display:flex;flex-wrap:wrap;gap:12px;align-items:flex-end;background:var(--surface);border:1px solid var(--line);border-radius:var(--r-md);padding:16px;box-shadow:var(--sh-sm)}
+.reise-form label{display:block;font-size:.78rem;color:var(--mist);margin-bottom:4px;font-weight:600;text-transform:uppercase;letter-spacing:.04em}
+.reise-form input[type=text]{padding:11px 13px;border:1px solid var(--line);border-radius:var(--r-sm);font-size:1rem;min-width:190px;background:var(--canvas)}
+.reise-form .rf-range{min-width:230px}
+.reise-form input[type=range]{width:100%}
+.reise-form button{padding:12px 22px;border:0;border-radius:var(--r-pill);background:var(--fjord-700);color:#fff;font-size:1rem;font-weight:600;cursor:pointer}
+.reise-note{background:#fff6e8;border:1px solid #f0d9ae;border-radius:var(--r-sm);padding:12px 14px;margin:18px 0;font-size:.93rem;line-height:1.55}
+.reise-meta{color:var(--mist);font-size:.9rem;margin:18px 0 14px}
+.reise-list{list-style:none;padding:0;margin:0 0 0 10px;border-left:2px solid var(--line)}
+.reise-item{position:relative;padding:15px 0 15px 24px}
+.reise-item:before{content:"";position:absolute;left:-7px;top:23px;width:12px;height:12px;border-radius:50%;background:var(--teal-500);border:2px solid var(--canvas)}
+.reise-along{font-size:.76rem;color:var(--mist);text-transform:uppercase;letter-spacing:.05em}
+.reise-name{font-size:1.06rem;font-weight:600;margin:2px 0 3px;font-family:var(--font-brand)}
+.reise-detour{font-size:.9rem;color:var(--fjord-700)}
+.reise-cats{font-size:.82rem;color:var(--mist);margin-top:3px}
+.reise-approx{margin-top:38px;padding-top:22px;border-top:1px solid var(--line)}
+.reise-approx h2{font-family:var(--font-brand);font-size:1.15rem;margin-bottom:4px}
+.reise-approx-place{margin:18px 0 0}
+.reise-approx-place h3{font-size:.95rem;margin:0 0 4px;font-family:var(--font-brand)}
+.reise-approx-place ul{margin:0;padding-left:18px;font-size:.94rem;line-height:1.75}
+.reise-empty{background:var(--surface);border:1px solid var(--line);border-radius:var(--r-md);padding:22px;margin:18px 0;line-height:1.6}
+`;
+
+router.get("/reise", async (req: Request, res: Response) => {
+  const from = typeof req.query.from === "string" ? req.query.from.trim() : "";
+  const to = typeof req.query.to === "string" ? req.query.to.trim() : "";
+  const drinkOnly = req.query.drink === "true";
+  const detourRaw = parseInt(String(req.query.detour || ""), 10);
+  const detourKm = Number.isFinite(detourRaw) ? Math.min(100, Math.max(1, detourRaw)) : DEFAULT_MAX_DETOUR_KM;
+
+  const title = from && to
+    ? `Stopp mellom ${from} og ${to} | Opplevagent`
+    : "Finn opplevelser og drikkesteder langs ruten | Opplevagent";
+  const description = from && to
+    ? `Opplevelser, gårdssalg og drikkesteder langs kjøreruten fra ${from} til ${to} — i reiserekkefølge.`
+    : "Skriv hvor du kjører fra og til, så lister vi opplevelser, gårdssalg og drikkesteder langs veien — i den rekkefølgen du passerer dem.";
+
+  const form = `
+<form class="reise-form" method="GET" action="/reise">
+  <div><label for="rf-from">Fra</label>
+    <input type="text" id="rf-from" name="from" value="${escapeHtml(from)}" placeholder="f.eks. Oslo" required></div>
+  <div><label for="rf-to">Til</label>
+    <input type="text" id="rf-to" name="to" value="${escapeHtml(to)}" placeholder="f.eks. Trondheim" required></div>
+  <div class="rf-range"><label for="rf-detour">Maks omvei: ${detourKm} km</label>
+    <input type="range" id="rf-detour" name="detour" min="5" max="60" step="5" value="${detourKm}"
+      oninput="document.querySelector('label[for=rf-detour]').textContent='Maks omvei: '+this.value+' km'"></div>
+  <div><label for="rf-drink">Bare drikke</label>
+    <input type="checkbox" id="rf-drink" name="drink" value="true"${drinkOnly ? " checked" : ""} style="width:22px;height:22px"></div>
+  <div><button type="submit">Finn stopp</button></div>
+</form>`;
+
+  let body: string;
+
+  if (!from || !to) {
+    body = `
+<h1>Hva ligger langs veien?</h1>
+<p class="reise-lede">${escapeHtml(description)}</p>
+${form}
+<div class="reise-empty">
+  <p>Vi måler hvert sted mot den faktiske kjøreruten din, og lister dem i den rekkefølgen du passerer dem.</p>
+  <p>Vi oppgir bare avstand når vi kjenner den nøyaktige adressen. Steder vi bare kan plassere til en
+  kommune, lister vi for seg — uten tall. Et oppdiktet tall er verre enn ingen.</p>
+</div>`;
+  } else {
+    let result;
+    try {
+      result = await corridorSearch({
+        from, to,
+        maxDetourKm: detourKm,
+        drinkOnly,
+        sources: ["experience", "gardssalg"],
+        experiencesDb: getExpDbForReise("experiences"),
+        limit: 30,
+      });
+    } catch {
+      res.status(500).send("Intern feil");
+      return;
+    }
+
+    let inner: string;
+    if (!result.ok) {
+      inner = `<div class="reise-empty"><p><strong>${escapeHtml(result.reason || "")}</strong></p></div>`;
+    } else {
+      const notes = result.notes.map((n) => `<div class="reise-note">${escapeHtml(n)}</div>`).join("");
+      const meta = `<p class="reise-meta">${
+        result.route && result.route.distanceKm != null
+          ? escapeHtml(`${Math.round(result.route.distanceKm)} km kjøring, cirka ${Math.round((result.route.durationMinutes || 0) / 60)} timer. `)
+          : ""
+      }${escapeHtml(`${result.stops.length} stopp innenfor ${detourKm} km fra ruten.`)}</p>`;
+
+      const items = result.stops.map((s) => {
+        // detourKm is null whenever the corridor service will not vouch for a
+        // number (straight-line mode). Never write one by hand here.
+        const detour = s.detourKm != null
+          ? escapeHtml(`${s.detourKm.toLocaleString("nb-NO", { minimumFractionDigits: 1, maximumFractionDigits: 1 })} km fra ruten`)
+          : "langs ruten";
+        return `<li class="reise-item">
+  <div class="reise-along">etter ${Math.round(s.alongKm)} km</div>
+  <div class="reise-name"><a href="${escapeHtml(s.url)}">${escapeHtml(s.name)}</a></div>
+  <div class="reise-detour">${detour}${s.place ? " · " + escapeHtml(s.place) : ""}</div>
+  ${s.categories.length ? `<div class="reise-cats">${escapeHtml(s.categories.map((c) => catLabel(c)).join(", "))}</div>` : ""}
+</li>`;
+      }).join("");
+
+      const approx = result.approximate.length === 0 ? "" : `
+<section class="reise-approx">
+  <h2>Steder langs ruten</h2>
+  <p class="reise-meta">Vi vet at disse ligger i disse kommunene, men ikke nøyaktig hvor — så vi sier ikke
+  hvor langt fra ruten de er.</p>
+  ${result.approximate.map((g) => `<div class="reise-approx-place">
+    <h3>${escapeHtml(g.place)}</h3>
+    <ul>${g.items.map((i) => `<li><a href="${escapeHtml(i.url)}">${escapeHtml(i.name)}</a></li>`).join("")}</ul>
+  </div>`).join("")}
+</section>`;
+
+      const empty = result.stops.length === 0 && result.approximate.length === 0
+        ? `<div class="reise-empty"><p>Vi fant ingenting langs denne ruten ennå. Dekningen er tynnest nord
+           for Trondheim — prøv Østlandet, Trøndelag eller Sørlandet, eller øk omveien.</p></div>`
+        : "";
+
+      inner = `${notes}${meta}${result.stops.length ? `<ul class="reise-list">${items}</ul>` : ""}${empty}${approx}`;
+    }
+
+    body = `<h1>${escapeHtml(`${from} → ${to}`)}</h1>${form}${inner}`;
+  }
+
+  res.setHeader("Content-Type", "text/html; charset=utf-8");
+  res.setHeader("Cache-Control", "public, max-age=300");
+  res.send(`<!doctype html>
+<html lang="no">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>${escapeHtml(title)}</title>
+<meta name="description" content="${escapeHtml(description)}">
+<meta name="robots" content="noindex, follow">
+<link rel="canonical" href="${baseUrl()}/reise">
+<link rel="icon" type="image/svg+xml" href="/favicon.svg">
+<meta property="og:title" content="${escapeHtml(title)}">
+<meta property="og:description" content="${escapeHtml(description)}">
+<meta property="og:type" content="website">
+<meta property="og:site_name" content="Opplevagent">
+<style>${BROWSE_CSS}${REISE_CSS}</style>
+</head>
+<body>
+${BROWSE_NAV}
+<main id="main" class="reise-wrap">${body}</main>
+${browseFooter()}
 </body>
 </html>`);
 });
