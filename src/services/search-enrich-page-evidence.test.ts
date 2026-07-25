@@ -49,9 +49,21 @@ export async function runPageEvidenceCrawlTests(opts: { log?: boolean } = {}): P
       const path = new URL(urlStr).pathname;
       const body = bodies[path];
       if (body === undefined) {
-        return { ok: false, status: 404, text: async () => "" } as unknown as Response;
+        return {
+          ok: false,
+          status: 404,
+          text: async () => "",
+          arrayBuffer: async () => new ArrayBuffer(0),
+          headers: { get: () => null },
+        } as unknown as Response;
       }
-      return { ok: true, status: 200, text: async () => body } as unknown as Response;
+      return {
+        ok: true,
+        status: 200,
+        text: async () => body,
+        arrayBuffer: async () => new TextEncoder().encode(body).buffer,
+        headers: { get: () => null },
+      } as unknown as Response;
     }) as typeof fetch;
 
     const evidence = await buildPageEvidence("https://gaarden.example/");
@@ -86,9 +98,22 @@ export async function runPageEvidenceCrawlTests(opts: { log?: boolean } = {}): P
       requestedPaths2.push(urlStr);
       const path = new URL(urlStr).pathname;
       if (path === "/") {
-        return { ok: true, status: 200, text: async () => "<html><body>Bare forsiden.</body></html>" } as unknown as Response;
+        const body = "<html><body>Bare forsiden.</body></html>";
+        return {
+          ok: true,
+          status: 200,
+          text: async () => body,
+          arrayBuffer: async () => new TextEncoder().encode(body).buffer,
+          headers: { get: () => null },
+        } as unknown as Response;
       }
-      return { ok: false, status: 404, text: async () => "" } as unknown as Response;
+      return {
+        ok: false,
+        status: 404,
+        text: async () => "",
+        arrayBuffer: async () => new ArrayBuffer(0),
+        headers: { get: () => null },
+      } as unknown as Response;
     }) as typeof fetch;
     const evidenceNoSubpages = await buildPageEvidence("https://ensom-gard.example/");
     assertTrue(
