@@ -1854,20 +1854,27 @@ export function decodeHtmlBytes(
 // mangle text that only coincidentally contains one of these sequences, or
 // miss nested/double-encoded corruption a substring match can't see.
 //
-// The five signatures cover two independent, real corruption shapes:
-//   - "Ã¦" / "Ã¸" / "Ã¥" / "Â" — classic UTF-8-bytes-decoded-as-Latin-1
-//     double-encoding mojibake (a multi-byte UTF-8 sequence for æ/ø/å, when
-//     wrongly read one byte at a time as Latin-1/Windows-1252, renders as
-//     one of these two-character sequences).
+// The eight signatures cover two independent, real corruption shapes:
+//   - "Ã¦" / "Ã¸" / "Ã¥" (lowercase æ/ø/å) and "Ã†" / "Ã˜" / "Ã…" (uppercase
+//     Æ/Ø/Å) / "Â" — classic UTF-8-bytes-decoded-as-Latin-1 double-encoding
+//     mojibake (a multi-byte UTF-8 sequence for æ/ø/å or Æ/Ø/Å, when wrongly
+//     read one byte at a time as Latin-1/Windows-1252, renders as one of
+//     these two-character sequences). The uppercase forms matter just as
+//     much as the lowercase ones: capitalized Norwegian text (a company name
+//     starting with Æ/Ø/Å, "ÅPNINGSTIDER", "Åpent") mojibakes to a DIFFERENT
+//     byte pair than its lowercase counterpart, so omitting them silently
+//     misses that text in both containsMojibake() and mojibakeSnippet().
 //   - U+FFFD (the Unicode replacement character) — what a page's bytes
 //     become when decoded with the WRONG single-byte encoding assumed to be
 //     UTF-8: the exact fetchHtml() bug PR #360 fixed (windows-1252/
 //     iso-8859-1 bytes forced through a UTF-8-only decode produce invalid
 //     byte sequences, which the decoder replaces with U+FFFD).
-// Real Norwegian prose essentially never contains "Ã¦"/"Ã¸"/"Ã¥"/"Â" as a
-// genuine sequence, or U+FFFD at all — so this is a safe, low-false-positive
-// SCAN (candidate selection), not a rewrite.
-export const MOJIBAKE_SIGNATURES: readonly string[] = ["Ã¦", "Ã¸", "Ã¥", "Â", "�"];
+// Real Norwegian prose essentially never contains "Ã¦"/"Ã¸"/"Ã¥"/"Ã†"/"Ã˜"/
+// "Ã…"/"Â" as a genuine sequence, or U+FFFD at all — so this is a safe,
+// low-false-positive SCAN (candidate selection), not a rewrite.
+export const MOJIBAKE_SIGNATURES: readonly string[] = [
+  "Ã¦", "Ã¸", "Ã¥", "Ã†", "Ã˜", "Ã…", "Â", "�",
+];
 
 /**
  * True if `text` contains any known mojibake signature (see

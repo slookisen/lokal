@@ -1205,9 +1205,33 @@ export function runSearchEnrichTests(opts: { log?: boolean } = {}): TestSummary 
 
       assertEq(
         MOJIBAKE_SIGNATURES.slice().sort(),
-        ["Ã¦", "Ã¸", "Ã¥", "Â", "�"].slice().sort(),
-        "MOJIBAKE_SIGNATURES: exactly the five documented signatures"
+        ["Ã¦", "Ã¸", "Ã¥", "Ã†", "Ã˜", "Ã…", "Â", "�"].slice().sort(),
+        "MOJIBAKE_SIGNATURES: exactly the eight documented signatures (lowercase + uppercase æ/ø/å + Â + U+FFFD)"
       );
+
+      // Uppercase misdecodes (Æ → "Ã†", Ø → "Ã˜", Å → "Ã…") — a capitalized
+      // Norwegian company name or a shouted "ÅPNINGSTIDER"/"Åpent" corrupts to
+      // a DIFFERENT byte pair than its lowercase counterpart, so these must be
+      // detected independently of the lowercase "Ã¦"/"Ã¸"/"Ã¥" signatures.
+      assertTrue(
+        containsMojibake("Ã…PNINGSTIDER"),
+        "containsMojibake: flags uppercase Å misdecode (Ã…) in a shouted opening-hours label"
+      );
+      assertTrue(
+        containsMojibake("Ã˜ynstad Gård"),
+        "containsMojibake: flags uppercase Ø misdecode (Ã˜) in a company name"
+      );
+      assertTrue(
+        containsMojibake("Ã†rlig gårdsbutikk"),
+        "containsMojibake: flags uppercase Æ misdecode (Ã†) in a company name"
+      );
+      for (const corrupted of ["Ã…PNINGSTIDER", "Ã˜ynstad Gård", "Ã†rlig gårdsbutikk"]) {
+        const upperSnippet = mojibakeSnippet(corrupted);
+        assertTrue(
+          upperSnippet.length > 0,
+          `mojibakeSnippet: non-empty snippet for uppercase-misdecoded text: "${corrupted}"`
+        );
+      }
 
       // mojibakeSnippet: centers on the first match, whitespace-collapsed,
       // empty for clean text.
