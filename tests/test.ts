@@ -18104,6 +18104,22 @@ console.log("\n── opplevagent P2: human-browse subpages (experiences) ──
     "p2-09b: favicon Content-Type is image/svg+xml");
   assertTrue(faviconP2.body.includes("<svg"), "p2-09c: favicon body contains SVG markup");
 
+  // p2-09z: /badge/opplevagent.svg — the "Finn oss på Opplevagent" backlink
+  // badge (dev-request 2026-07-12-opplevagent-lenkeplan, item 1). Same
+  // static/deterministic contract as /favicon.svg above: 200,
+  // image/svg+xml, valid SVG markup carrying the brand colors + mark.
+  const badgeSvgP2 = invokeSeo("/badge/opplevagent.svg", {}, "/badge/opplevagent.svg");
+  assertEq(badgeSvgP2.status, 200, "p2-09z-a: GET /badge/opplevagent.svg → 200");
+  assertTrue(/image\/svg\+xml/.test(badgeSvgP2.headers["content-type"] || ""),
+    "p2-09z-b: badge Content-Type is image/svg+xml");
+  assertTrue(/public, max-age=86400/.test(badgeSvgP2.headers["cache-control"] || ""),
+    "p2-09z-c: badge Cache-Control matches the static-SVG convention");
+  assertTrue(badgeSvgP2.body.includes("<svg"), "p2-09z-d: badge body contains SVG markup");
+  assertTrue(badgeSvgP2.body.includes("#ff5d3b") && badgeSvgP2.body.includes("#12a594"),
+    "p2-09z-e: badge body carries the brand coral (#ff5d3b) + teal (#12a594) colors");
+  assertTrue(badgeSvgP2.body.includes("Finn oss på Opplevagent"),
+    "p2-09z-f: badge body includes the 'Finn oss på Opplevagent' copy");
+
   // p2-10: homepage quick-chip uses the correct full fylke URL (fixes broken link
   // where /fylke/Troms was 404 in production — DB stores "Troms og Finnmark").
   // Scoped to the hero "quick" chip row specifically: the homepage's DB-driven
@@ -26516,7 +26532,8 @@ console.log("\n── gardssalg-profile: produsent profile page ──");
   const dbFacGP = require("../src/database/db-factory") as typeof import("../src/database/db-factory");
   dbFacGP.__resetDbFactoryForTesting();
   const expStGP = require("../src/services/experience-store") as typeof import("../src/services/experience-store");
-  const seoRouterGP = (require("../src/routes/experiences-seo") as typeof import("../src/routes/experiences-seo")).default as any;
+  const seoModGP = require("../src/routes/experiences-seo") as typeof import("../src/routes/experiences-seo");
+  const seoRouterGP = seoModGP.default as any;
 
   const dbGP = dbFacGP.getDb("experiences");
 
@@ -26699,10 +26716,35 @@ console.log("\n── gardssalg-profile: produsent profile page ──");
     assertTrue(bookBodyGP.includes("Fjellro Sideri"), "gp-12c: booking panel still shows the provider name (no regression)");
   }
 
+  // gp-13: "Lenk til oss" aside-card — the Opplevagent backlink badge (dev-
+  // request 2026-07-12-opplevagent-lenkeplan, item 1). Verifies the badge
+  // renders live on the produsent page, links/points at the RIGHT provider
+  // (not a different one), and exposes a copy-paste snippet built from the
+  // shared opplevagentBadgeEmbedSnippet() helper — this is the acceptance
+  // criterion "badge-snippet live on tilbyder-siden, curl-probe verifiable".
+  assertTrue(profGP.body.includes(">Lenk til oss<"), "gp-13a: 'Lenk til oss' aside-card title present");
+  assertTrue(profGP.body.includes('src="/badge/opplevagent.svg"'),
+    "gp-13b: profile page renders an <img> referencing /badge/opplevagent.svg");
+  const expectedSnippetGP = seoModGP.opplevagentBadgeEmbedSnippet(slugGP, "https://opplevagent.no");
+  const expectedHrefGP = `https://opplevagent.no/kategori/gardssalg/produsent/${slugGP}`;
+  assertTrue(profGP.body.includes(expectedHrefGP),
+    "gp-13c: profile page's live badge link points at THIS provider's own produsent page");
+  assertTrue(profGP.body.includes(seoModGP.escapeHtml(expectedSnippetGP)),
+    "gp-13d: profile page's copy-paste <textarea> contains the escaped opplevagentBadgeEmbedSnippet() output for THIS provider");
+
+  // gp-13e/f: the bare-minimum second producer gets ITS OWN correct href —
+  // not a copy of the first provider's slug — confirming the snippet is
+  // genuinely per-provider, not a fixed/shared string.
+  const expectedHrefBareGP = `https://opplevagent.no/kategori/gardssalg/produsent/${bareSlugGP}`;
+  assertTrue(bareProfGP.body.includes(expectedHrefBareGP),
+    "gp-13e: bare producer's profile page links its OWN produsent page in the badge snippet");
+  assertTrue(!bareProfGP.body.includes(expectedHrefGP),
+    "gp-13f: bare producer's profile page does NOT contain the OTHER provider's (Fjellro Sideri) href");
+
   if (prevPathGP === undefined) delete process.env.EXPERIENCES_DB_PATH;
   else process.env.EXPERIENCES_DB_PATH = prevPathGP;
   dbFacGP.__resetDbFactoryForTesting();
-  console.log("  gardssalg-profile: OK (unknown-slug 404, full profile render + sections, badge, CTA, practical-info, map, JSON-LD, OG/Twitter, category-card link, booking-panel regression)");
+  console.log("  gardssalg-profile: OK (unknown-slug 404, full profile render + sections, badge, CTA, practical-info, map, JSON-LD, OG/Twitter, category-card link, booking-panel regression, opplevagent-lenkeplan backlink badge)");
 })();
 
 // ─── gardssalg-content-enrichment: pure extractors (2026-07-10, Fase 1 item 3

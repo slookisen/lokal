@@ -2521,6 +2521,12 @@ router.get(
     const url = baseUrl();
     const canonical = `${url}/kategori/gardssalg/produsent/${encodeURIComponent(slug)}`;
     const bookHref = `/kategori/gardssalg/book/${encodeURIComponent(slug)}`;
+    // "Lenk til oss" aside-card (dev-request 2026-07-12-opplevagent-lenkeplan,
+    // item 1) — reuses the same absolute `url` computed above (not
+    // recomputed) so the badge's backlink always matches this exact
+    // provider's canonical profile URL.
+    const badgeProfileHref = canonical;
+    const badgeEmbedSnippet = opplevagentBadgeEmbedSnippet(slug, url);
     const sted = drivingSted(provider);
     const meta = drinkTypeMeta(provider.producer_type);
     const badge = drinkBadge(provider.producer_type);
@@ -2785,6 +2791,12 @@ ${BROWSE_CSS}
         <h2>Driver du dette stedet?</h2>
         <p style="font-size:.86rem;color:var(--ink-soft);margin:0 0 10px">Ta over profilen og rediger informasjon, produkter og reservasjoner selv.</p>
         <a class="gc-claim-cta" href="/kategori/gardssalg/eier/${encodeURIComponent(slug)}" style="display:block;text-align:center;background:#fff;color:#0f5a50;font-weight:700;padding:10px 14px;border:1px solid #0f5a50;border-radius:var(--r-pill);font-size:.9rem">Er dette din bedrift?</a>
+      </div>
+      <div class="aside-card">
+        <h2>Lenk til oss</h2>
+        <p style="font-size:.85rem;color:var(--ink-soft);margin-bottom:10px">Legg badgen på din egen nettside og lenk tilbake til profilen din her på Opplevagent.</p>
+        <a href="${escapeHtml(badgeProfileHref)}" target="_blank" rel="noopener"><img src="/badge/opplevagent.svg" width="180" height="40" alt="Finn oss på Opplevagent"></a>
+        <textarea readonly aria-label="HTML-kode for Opplevagent-badgen" style="width:100%;margin-top:10px;font-family:monospace;font-size:.78rem;padding:8px;border:1px solid var(--line);border-radius:var(--r-md);background:var(--canvas-2);color:var(--ink-soft);resize:vertical" rows="3" onclick="this.select()">${escapeHtml(badgeEmbedSnippet)}</textarea>
       </div>
     </aside>
   </div>
@@ -5076,6 +5088,41 @@ router.get("/favicon.svg", (_req: Request, res: Response) => {
   // «Konstellasjon» app tile — coral with cream mark (logo spec §6).
   res.send(`<svg width="512" height="512" viewBox="0 0 64 64" fill="none" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Opplevagent"><title>Opplevagent</title><rect width="64" height="64" rx="17" fill="#ff5d3b"/><g transform="translate(12 13.6) scale(0.769)"><path d="M9 33 L24 11 L43 19 L31 38 Z" fill="none" stroke="#f7f4ee" stroke-width="2.4" stroke-linejoin="round" opacity="0.5"/><circle cx="9" cy="33" r="4.2" fill="#f7f4ee"/><circle cx="43" cy="19" r="4.2" fill="#f7f4ee"/><circle cx="31" cy="38" r="4.2" fill="#f7f4ee"/><path d="M24 3 C25.1 8.9 26.9 10.7 32.8 11.8 C26.9 12.9 25.1 14.7 24 20.6 C22.9 14.7 21.1 12.9 15.2 11.8 C21.1 10.7 22.9 8.9 24 3 Z" fill="#f7f4ee"/></g></svg>`);
 });
+
+// ═══════════════════════════════════════════════════════════
+// GET /badge/opplevagent.svg — "Finn oss på Opplevagent" backlink badge
+// (dev-request 2026-07-12-opplevagent-lenkeplan, item 1). A small branded
+// "as seen on" pill that gårdssalg producers can embed on their own site to
+// link back to their own produsent profile page here — see
+// opplevagentBadgeEmbedSnippet() below for the copy-paste <a><img> snippet
+// that points at this image. Fully static/deterministic (no query params,
+// no DB), same Content-Type + Cache-Control convention as /favicon.svg
+// above. Mounted alongside the other static SVG routes for the same
+// express.static-bypass reason documented on /favicon.svg and /og-image.svg.
+// ═══════════════════════════════════════════════════════════
+router.get("/badge/opplevagent.svg", (_req: Request, res: Response) => {
+  res.setHeader("Content-Type", "image/svg+xml");
+  res.setHeader("Cache-Control", "public, max-age=86400");
+  // «Konstellasjon» mark (same three-node shape as /logo.svg) + wordmark, in
+  // a bordered cream pill — coral (#ff5d3b) spark, teal (#12a594) node/frame.
+  res.send(`<svg xmlns="http://www.w3.org/2000/svg" width="180" height="40" viewBox="0 0 180 40" role="img" aria-label="Finn oss på Opplevagent"><title>Finn oss på Opplevagent</title><rect x="0.5" y="0.5" width="179" height="39" rx="8" fill="#f7f4ee" stroke="#e4ded0"/><g transform="translate(9 6) scale(0.6)"><path d="M9 33 L24 11 L43 19 L31 38 Z" fill="none" stroke="#12a594" stroke-width="2" stroke-linejoin="round" opacity="0.45"/><circle cx="9" cy="33" r="4" fill="#12a594"/><circle cx="43" cy="19" r="4" fill="#6f7a4f"/><circle cx="31" cy="38" r="4" fill="#c98a2b"/><path d="M24 3 C25.1 8.9 26.9 10.7 32.8 11.8 C26.9 12.9 25.1 14.7 24 20.6 C22.9 14.7 21.1 12.9 15.2 11.8 C21.1 10.7 22.9 8.9 24 3 Z" fill="#ff5d3b"/></g><text x="41" y="17" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif" font-size="7.5" font-weight="700" letter-spacing=".04em" fill="#7a7163">FINN OSS PÅ</text><text x="41" y="30" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif" font-size="12" font-weight="800" fill="#18130d">Opplevagent</text></svg>`);
+});
+
+// Copy-paste embed snippet for the /badge/opplevagent.svg backlink badge
+// (dev-request 2026-07-12-opplevagent-lenkeplan, item 1) — an <a> wrapping
+// an <img>, pointing at the provider's own produsent page and at the badge
+// image above. `absoluteUrl` should be the same base-URL value the caller
+// already computed (e.g. the produsent-page route's `url` = baseUrl()) —
+// don't recompute it here. width/height match the SVG's viewBox above so
+// the embedded image never needs the host page to guess an aspect ratio.
+// Exported so both the produsent-page aside-card (live preview + the
+// escaped copy-paste <textarea>) and tests can share one source of truth
+// for the snippet's exact markup.
+export function opplevagentBadgeEmbedSnippet(providerSlug: string, absoluteUrl: string): string {
+  const profileHref = `${absoluteUrl}/kategori/gardssalg/produsent/${encodeURIComponent(providerSlug)}`;
+  const badgeSrc = `${absoluteUrl}/badge/opplevagent.svg`;
+  return `<a href="${escapeHtml(profileHref)}" target="_blank" rel="noopener"><img src="${escapeHtml(badgeSrc)}" width="180" height="40" alt="Finn oss på Opplevagent"></a>`;
+}
 
 // ═══════════════════════════════════════════════════════════
 // Catch-all 404 — norsk side (forhindrer rfb/dental-innhold på opplevagent-host)
