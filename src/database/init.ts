@@ -3210,6 +3210,90 @@ function initSchema(db: Database.Database): void {
     );
   } catch { /* index already created */ }
 
+  // ─── dev-request 2026-07-25-reisesok-korridor-discovery-og-naerhetssok,
+  // Fase 1a follow-up: postal-code backfill state on agent_knowledge ────────
+  //
+  // Daniel, in-session 2026-07-25: «Kan du lage en fiks for å finne postnummer
+  // på de som mangler kun dette?»
+  //
+  // Measured census (n = 250 of 1 523 active producers, uniform random):
+  // 68.8 % have street + postnummer (Tier-A eligible for the Fase-1a geocode
+  // worker), 21.2 % have neither, and 13.2 % have a real street address but NO
+  // postnummer — blocked from address precision by a missing four-digit number
+  // and nothing else. services/agents-postal-backfill.ts resolves that number
+  // from Kartverket; these columns are its state.
+  //
+  //   postal_code_source           : how the CURRENT postal_code was obtained.
+  //                                  NULL = as it always was (scraped /
+  //                                  enriched / owner-entered — provenance
+  //                                  unrecorded, and deliberately NOT guessed
+  //                                  at retroactively).
+  //                                  'kartverket_adresse_inline' = a 4-digit
+  //                                  number already present in the free-text
+  //                                  address, CONFIRMED against Kartverket
+  //                                  adresser/v1/sok before being promoted
+  //                                  into the column.
+  //                                  'kartverket_adresse_sok' = derived from
+  //                                  street + place, with the hit's own
+  //                                  poststed/kommunenavn corroborating that
+  //                                  place. 'kartverket_adresse_unik' = the
+  //                                  street + house number identifies exactly
+  //                                  ONE address in all of Norway, so no place
+  //                                  token was needed. This column is what lets
+  //                                  a later reader tell a scraped postnummer
+  //                                  from a Kartverket-derived one.
+  //   postal_code_prev             : whatever stood in postal_code immediately
+  //                                  before the backfill worker wrote, set in
+  //                                  the SAME statement. Mirrors
+  //                                  agents.geocode_prev_lat/lng above: one
+  //                                  generation deep, a rollback latch and not
+  //                                  a history table. Full revert is one
+  //                                  statement:
+  //                                    UPDATE agent_knowledge
+  //                                       SET postal_code = postal_code_prev,
+  //                                           postal_code_source = NULL,
+  //                                           postal_backfill_outcome = NULL
+  //                                     WHERE postal_code_source LIKE 'kartverket%';
+  //                                  (The worker only ever writes into an EMPTY
+  //                                  postal_code — that guard is in the UPDATE's
+  //                                  own WHERE clause, not just the selector —
+  //                                  so prev is normally NULL and the revert
+  //                                  restores the empty state.)
+  //   postal_backfill_outcome      : last attempt's verdict —
+  //                                  'inline_confirmed' | 'lookup_resolved' |
+  //                                  'ambiguous' | 'uncorroborated' |
+  //                                  'no_match' | 'unusable_input' | 'error'.
+  //                                  'uncorroborated' means a unique hit DID
+  //                                  exist but sat in a place the record never
+  //                                  names — the near-miss class a looser
+  //                                  matcher would have written, kept out of
+  //                                  'no_match' so ops can actually see it.
+  //   postal_backfill_attempted_at : ISO-8601 stamp written on EVERY attempt
+  //                                  whatever the outcome, including the error
+  //                                  path. This is the ROTATION key and the
+  //                                  selector orders by it. Fase 1a took two
+  //                                  separate review blockers for workers whose
+  //                                  failure paths did not stamp and therefore
+  //                                  re-picked the identical head of the queue
+  //                                  forever; that is why this column exists
+  //                                  before the worker that uses it.
+  //
+  // Additive + idempotent ALTERs, same defensive try/catch idiom as above.
+  for (const stmt of [
+    `ALTER TABLE agent_knowledge ADD COLUMN postal_code_source TEXT`,
+    `ALTER TABLE agent_knowledge ADD COLUMN postal_code_prev TEXT`,
+    `ALTER TABLE agent_knowledge ADD COLUMN postal_backfill_outcome TEXT`,
+    `ALTER TABLE agent_knowledge ADD COLUMN postal_backfill_attempted_at TEXT`,
+  ]) {
+    try { db.exec(stmt); } catch { /* already exists — expected */ }
+  }
+  try {
+    db.exec(
+      `CREATE INDEX IF NOT EXISTS idx_agent_knowledge_postal_backfill_attempted_at
+         ON agent_knowledge(postal_backfill_attempted_at)`
+    );
+  } catch { /* index already created */ }
+
 }
 
 export function closeDb(): void {

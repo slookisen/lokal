@@ -5861,4 +5861,78 @@ router.post("/admin/agents/geocode-batch", async (req: Request, res: Response) =
   }
 });
 
+// ─── POST /admin/agents/postal-backfill ──────────────────────────────
+// dev-request 2026-07-25-reisesok-korridor-discovery-og-naerhetssok, Fase 1a
+// follow-up (Daniel: «Kan du lage en fiks for å finne postnummer på de som
+// mangler kun dette?»).
+//
+// Manual/routine trigger for services/agents-postal-backfill.ts. 13.2 % of
+// active producers (measured, n=250) have a street address but no postnummer
+// and are therefore stuck below address precision — this resolves the missing
+// four digits from Kartverket so the Fase-1a geocode worker can finish the job
+// on its next pass. The worker also runs on its own hourly interval
+// (src/index.ts); this endpoint exists so the backfill can be driven in
+// controlled batches and, more importantly, REHEARSED against prod first.
+//
+// Body (all optional):
+//   { limit?: number (1-200, default 50), dry_run?: boolean (default false) }
+//
+// dry_run: true performs the identical Kartverket probes and reports every
+// verdict in `planned` — including the refusals, which is the interesting part
+// for a conservative matcher — but takes no write at all, not even the attempt
+// timestamp. Verify with the `status` block: it is captured before and after,
+// and a dry run must leave it byte-identical.
+//
+// The limit clamp and the STRICT dry_run parser are reused verbatim from the
+// Fase-1a worker rather than re-declared: `{"dry_run":"true"}` performed a real
+// production write once already (review B4), and a second copy of that
+// decision is a second chance to get it wrong.
+//
+// Auth: X-Admin-Key, same getAdminKey() convention as every other admin
+// endpoint in this file.
+router.post("/admin/agents/postal-backfill", async (req: Request, res: Response) => {
+  const expectedKey = getAdminKey();
+  if (!expectedKey) { res.status(503).json({ success: false, error: "Admin not configured" }); return; }
+  const adminKey = (req.headers["x-admin-key"] as string) || "";
+  if (!adminKey || adminKey !== expectedKey) {
+    res.status(403).json({ success: false, error: "Krever X-Admin-Key header" });
+    return;
+  }
+
+  const body = (req.body || {}) as { limit?: unknown; dry_run?: unknown };
+
+  const { clampGeocodeBatchLimit, parseDryRunFlag } =
+    require("../services/agents-geocode-worker") as typeof import("../services/agents-geocode-worker");
+  const { postalBackfillTick, postalBackfillQueueStatus } =
+    require("../services/agents-postal-backfill") as typeof import("../services/agents-postal-backfill");
+
+  const limit = clampGeocodeBatchLimit(body.limit);
+
+  const dry = parseDryRunFlag(body.dry_run);
+  if (!dry.ok) {
+    res.status(400).json({ success: false, error: dry.error });
+    return;
+  }
+  const dryRun = dry.dryRun;
+
+  try {
+    const before = postalBackfillQueueStatus();
+    const result = await postalBackfillTick(limit, { dryRun });
+    const after = postalBackfillQueueStatus();
+
+    res.json({
+      success: true,
+      data: {
+        ...result,
+        limit,
+        status_before: before,
+        status_after: after,
+      },
+    });
+  } catch (err: any) {
+    console.error("[postal-backfill] admin batch failed:", err);
+    res.status(500).json({ success: false, error: err?.message || "Postal backfill failed" });
+  }
+});
+
 export default router;

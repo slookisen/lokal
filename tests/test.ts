@@ -33691,6 +33691,36 @@ runSerial(async () => {
   }
 });
 
+// dev-request 2026-07-25-reisesok-korridor-discovery-og-naerhetssok, Fase 1a
+// follow-up — the postal-code backfill. Daniel: «Kan du lage en fiks for å
+// finne postnummer på de som mangler kun dette?» 13.2 % of active producers
+// (measured, n=250 uniform random) have a real street address but no
+// postnummer, which is the ONLY thing keeping them off the Fase-1a worker's
+// Tier A. services/agents-postal-backfill.ts resolves the missing four digits
+// from Kartverket — and, more importantly, REFUSES on any ambiguity, since a
+// wrong postnummer becomes a precise-but-wrong coordinate tagged
+// geo_precision='address' and thereby licenses a km figure. Covers the four
+// matching guards, the globally-unique fallback, the additive agent_knowledge
+// migration, never-overwrite, always-stamp (including the error path),
+// rotation, dry-run and single-flight. Own in-memory DB (swaps the shared
+// getDb() singleton, restored on exit) with the only network seam injected —
+// runs via runSerial() same as the Fase-1a suite above.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-07-25-reisesok: Fase 1a follow-up (postnummer-backfill) ──");
+  try {
+    const { runAgentsPostalBackfillTests } = require("../src/services/agents-postal-backfill.test") as
+      typeof import("../src/services/agents-postal-backfill.test");
+    const apb = await runAgentsPostalBackfillTests({ log: false });
+    passed += apb.passed;
+    failed += apb.failed;
+    for (const f of apb.failures) failures.push("agents-postal-backfill: " + f);
+    console.log(`  agents-postal-backfill: ${apb.passed} passed, ${apb.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("agents-postal-backfill: unexpected error: " + String(err?.message || err));
+  }
+});
+
 // dev-request 2026-07-25-reisesok-korridor-discovery-og-naerhetssok, Fase 1b —
 // experiences were 100 % geo_precision='kommune' (zero at address level), so
 // everything in Bodø reported distance_km 0. Steps E/F of
