@@ -573,10 +573,18 @@ export function runOpplevelserGardssalgRewriteTests(
         }
         const host = new URL(urlStr).hostname;
         if (host === "prov-rw-thin.example.no") {
-          return { ok: true, status: 200, text: async () => rwThinHtml } as unknown as Response;
+          return {
+            ok: true, status: 200, text: async () => rwThinHtml,
+            arrayBuffer: async () => new TextEncoder().encode(rwThinHtml).buffer,
+            headers: { get: () => null },
+          } as unknown as Response;
         }
         if (host === "prov-rw-sub80.example.no") {
-          return { ok: true, status: 200, text: async () => rwSub80Html } as unknown as Response;
+          return {
+            ok: true, status: 200, text: async () => rwSub80Html,
+            arrayBuffer: async () => new TextEncoder().encode(rwSub80Html).buffer,
+            headers: { get: () => null },
+          } as unknown as Response;
         }
         return { ok: false, status: 404, text: async () => "" } as unknown as Response;
       }) as typeof fetch;
@@ -786,7 +794,11 @@ export function runOpplevelserGardssalgRewriteTests(
         }
         const host = new URL(urlStr).hostname;
         if (host === "prov-rw-both.example.no") {
-          return { ok: true, status: 200, text: async () => rwBothHtml } as unknown as Response;
+          return {
+            ok: true, status: 200, text: async () => rwBothHtml,
+            arrayBuffer: async () => new TextEncoder().encode(rwBothHtml).buffer,
+            headers: { get: () => null },
+          } as unknown as Response;
         }
         return { ok: false, status: 404, text: async () => "" } as unknown as Response;
       }) as typeof fetch;
@@ -910,7 +922,11 @@ export function runOpplevelserGardssalgRewriteTests(
         }
         const host = new URL(urlStr).hostname;
         if (host === "prov-rw-contaminated.example.no") {
-          return { ok: true, status: 200, text: async () => rwContaminatedHtml } as unknown as Response;
+          return {
+            ok: true, status: 200, text: async () => rwContaminatedHtml,
+            arrayBuffer: async () => new TextEncoder().encode(rwContaminatedHtml).buffer,
+            headers: { get: () => null },
+          } as unknown as Response;
         }
         return { ok: false, status: 404, text: async () => "" } as unknown as Response;
       }) as typeof fetch;
@@ -980,7 +996,11 @@ export function runOpplevelserGardssalgRewriteTests(
         }
         const host = new URL(urlStr).hostname;
         if (host === "prov-rw-clean.example.no") {
-          return { ok: true, status: 200, text: async () => rwCleanHtml } as unknown as Response;
+          return {
+            ok: true, status: 200, text: async () => rwCleanHtml,
+            arrayBuffer: async () => new TextEncoder().encode(rwCleanHtml).buffer,
+            headers: { get: () => null },
+          } as unknown as Response;
         }
         return { ok: false, status: 404, text: async () => "" } as unknown as Response;
       }) as typeof fetch;

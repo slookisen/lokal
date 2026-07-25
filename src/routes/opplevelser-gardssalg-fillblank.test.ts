@@ -423,13 +423,25 @@ export function runOpplevelserGardssalgFillblankTests(
         }
         const host = new URL(urlStr).hostname;
         if (host === "prov-fb-blank.example.no") {
-          return { ok: true, status: 200, text: async () => noExtractiveHtml } as unknown as Response;
+          return {
+            ok: true, status: 200, text: async () => noExtractiveHtml,
+            arrayBuffer: async () => new TextEncoder().encode(noExtractiveHtml).buffer,
+            headers: { get: () => null },
+          } as unknown as Response;
         }
         if (host === "prov-fb-extractive.example.no") {
-          return { ok: true, status: 200, text: async () => extractiveHtml } as unknown as Response;
+          return {
+            ok: true, status: 200, text: async () => extractiveHtml,
+            arrayBuffer: async () => new TextEncoder().encode(extractiveHtml).buffer,
+            headers: { get: () => null },
+          } as unknown as Response;
         }
         if (host === "prov-fb-sub80.example.no") {
-          return { ok: true, status: 200, text: async () => noExtractiveHtml } as unknown as Response;
+          return {
+            ok: true, status: 200, text: async () => noExtractiveHtml,
+            arrayBuffer: async () => new TextEncoder().encode(noExtractiveHtml).buffer,
+            headers: { get: () => null },
+          } as unknown as Response;
         }
         return { ok: false, status: 404, text: async () => "" } as unknown as Response;
       }) as typeof fetch;
