@@ -33744,3 +33744,27 @@ runSerial(async () => {
     failures.push("experiences-address-upgrade: unexpected error: " + String(err?.message || err));
   }
 });
+
+// dev-request 2026-07-25-reisesok-korridor-discovery-og-naerhetssok, Fase 2 —
+// the corridor engine (geo-distance consolidation, route-geometry's
+// Douglas-Peucker + point-to-segment, route-corridor-service's provider seam,
+// polyline cache and THE ALLOW-LIST) plus the Fase-5 drink taxonomy reaching
+// parseNaturalQuery. Own in-memory RFB DB running the real production schema,
+// every network seam injected (RouteProvider + the geocoder's fetch), so
+// nothing here touches the network. Runs via runSerial() like the Fase 0/1
+// suites above.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-07-25-reisesok: Fase 2 (route corridor engine) + Fase 5 (drikke) ──");
+  try {
+    const { runRouteCorridorTests } = require("../src/services/route-corridor.test") as
+      typeof import("../src/services/route-corridor.test");
+    const rc = await runRouteCorridorTests({ log: false });
+    passed += rc.passed;
+    failed += rc.failed;
+    for (const f of rc.failures) failures.push("route-corridor: " + f);
+    console.log(`  route-corridor: ${rc.passed} passed, ${rc.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("route-corridor: unexpected error: " + String(err?.message || err));
+  }
+});

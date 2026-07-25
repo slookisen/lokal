@@ -603,20 +603,58 @@ class MarketplaceRegistry {
       ],
       "honey": ["honning", "honey", "birøkt"],
       "herbs": ["urter", "herbs", "krydder", "dill", "persille", "basilikum", "timian"],
+      // ── Drikke (dev-request 2026-07-25-reisesok…, Fase 5a/5b) ──────────
+      // Daniel asked for this repeatedly: «Jeg ønsker også at søkefunksjon
+      // skal være inne på "drikkesteder"».
+      //
+      // `beverages` is not a new category — it is the THIRD-largest tag in the
+      // live catalogue (measured 2026-07-25 against rettfrabonden.com: 32 of
+      // the first 400 producers, i.e. ~120 of 1 523, incl. Atlungstad
+      // Brenneri, Trysil Bryggeri, Senja Handbryggeri). It had simply never
+      // been reachable: this map had ten food categories and no drink one, so
+      // `øl`, `sider`, `drikke` and `brygg` produced NO category at all and
+      // fell through to a nationwide trust-ranked list. Verified live before
+      // this change: `q=øl` and `q=drikke` both returned `categories: null`
+      // and answered with Kringler Gjestegård / Homme Gård — neither of which
+      // sells drink. `bryggeri`/`sider`/`vin`/`brenneri` appeared to work only
+      // by accident, via the NAME branch matching producers with the word in
+      // their name; a `beverages` producer without it was unfindable.
+      //
+      // The stray one-off values the catalogue also carries (`beer`, `sider`,
+      // `juice`, `coffee`, 1 row each) are deliberately NOT added as separate
+      // categories — they are data noise, and normalising them is a data job,
+      // not a parser job. The keywords below route to `beverages`, and
+      // route-corridor-service.ts's DRINK_CATEGORIES treats the strays as
+      // drink too so a corridor search still finds them.
+      "beverages": [
+        "drikke", "drikkevarer", "drikkested", "drikkesteder", "beverages", "drinks",
+        "øl", "ale", "pils", "brygg", "bryggeri", "mikrobryggeri", "håndverksøl",
+        "sider", "cider", "cideri", "eplesider",
+        "vin", "vingård", "vinproduksjon", "musserende",
+        "destilleri", "brenneri", "gårdsbrenneri", "akevitt", "gin", "whisky",
+        "mjød", "mjøderi",
+        "most", "eplemost", "saft", "juice", "eplejuice",
+        "kombucha", "seltzer", "seltzeri",
+        "kaffe", "kaffebrenneri", "gårdskafé", "gardskafe", "gårdskafe",
+      ],
     };
 
     const detectedCategories: string[] = [];
     const productTerms: string[] = [];
     for (const [category, keywords] of Object.entries(categoryMap)) {
       for (const kw of keywords) {
-        // Use word-boundary matching to avoid partial matches ("ost" in "Tromsø kosten")
-        const regex = new RegExp(`\\b${kw}\\b`);
-        if (regex.test(q)) {
+        // Word-boundary matching, to avoid partial matches ("ost" in "geitost").
+        // NB norwegianWordBoundary(), not \b — see the comment on that helper.
+        // With \b, the headline keyword of this whole slice — «øl» — could
+        // never match ANYTHING, because \b is ASCII-only and sees no boundary
+        // between start-of-string and «ø».
+        if (norwegianWordBoundary(kw).test(q)) {
           if (!detectedCategories.includes(category)) detectedCategories.push(category);
           // Store the specific product term (not the category keyword like "vegetables")
           if (!["grønnsaker", "grønt", "vegetables", "frukt", "fruit", "bær", "berries",
                 "meieri", "dairy", "kjøtt", "meat", "fisk", "fish", "sjømat", "brød", "bread",
-                "bakervarer", "urter", "herbs", "egg", "eggs"].includes(kw)) {
+                "bakervarer", "urter", "herbs", "egg", "eggs",
+                "drikke", "drikkevarer", "beverages", "drinks"].includes(kw)) {
             productTerms.push(kw);
           }
         }
@@ -1598,6 +1636,40 @@ const PROXIMITY_PATTERNS: RegExp[] = [
   /\baround\s+me\b/,
   /\bmy\s+location\b/,
 ];
+
+// ── Norwegian-aware word boundary ────────────────────────────────────
+// dev-request 2026-07-25-reisesok…, Fase 5b.
+//
+// JavaScript's `\b` is defined against `\w` = [A-Za-z0-9_] — ASCII only. æ, ø
+// and å are therefore NON-word characters to it, which breaks the category
+// matcher in both directions:
+//
+//   FALSE NEGATIVE  /\bøl\b/.test("øl") === false. Start-of-string and «ø» are
+//                   both "non-word", so there is no transition and no boundary.
+//                   Every keyword beginning with æ/ø/å was dead code — that is
+//                   «øl», the single most-requested term in this dev-request,
+//                   and «økologiske egg», which has never matched since it was
+//                   added.
+//   FALSE POSITIVE  /\bost\b/.test("Tromsøost") === true. The «ø» before «ost»
+//                   reads as a word→non-word boundary, so a place name splices
+//                   into a product keyword. The existing comment claimed \b
+//                   prevented exactly this class of bug; for ASCII neighbours
+//                   ("geitost") it did, for Norwegian ones it did the opposite.
+//
+// Fix: assert on explicit character classes that include Latin-1 letters, so a
+// letter is a letter regardless of alphabet. Verified against the cases the old
+// comment called out — "geitost" and "Tromsø kosten" still do NOT match `ost`,
+// "Bryggerøl" and "øltønne" do NOT match `øl`, and "øl og vin" does.
+//
+// Deliberately not `\p{L}` with the /u flag: that would also treat digits and
+// underscore differently from the ASCII class and change behaviour for the
+// ~120 pre-existing keywords in ways nobody asked for. This class is the
+// minimal superset that fixes Norwegian.
+const NORWEGIAN_WORD_CHAR = "0-9A-Za-zÀ-ÖØ-öø-ÿ_";
+export function norwegianWordBoundary(keyword: string): RegExp {
+  const escaped = keyword.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  return new RegExp(`(?:^|[^${NORWEGIAN_WORD_CHAR}])${escaped}(?:$|[^${NORWEGIAN_WORD_CHAR}])`);
+}
 
 export function isProximityIntent(query: string): boolean {
   const q = (query || "").toLowerCase().replace(/[?!.,]/g, " ").replace(/\s+/g, " ").trim();
