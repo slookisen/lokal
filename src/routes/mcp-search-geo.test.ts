@@ -24,7 +24,7 @@
  */
 
 import Database from "better-sqlite3";
-import { __setDbForTesting, __initSchemaForTesting } from "../database/init";
+import { __setDbForTesting, __initSchemaForTesting, __peekDbForTesting } from "../database/init";
 import {
   __setGeocodingFetchForTesting,
   __clearGeocodeCacheForTesting,
@@ -86,6 +86,9 @@ export async function runMcpSearchGeoTests(opts: { log?: boolean } = {}): Promis
       `${label} (expected ${JSON.stringify(expected)}, got ${JSON.stringify(actual)})`);
   }
 
+  // Put the singleton back when we are done, so blocks that run after this
+  // suite are not left reading our throwaway in-memory DB.
+  const prevDb = __peekDbForTesting();
   const db = new Database(":memory:");
   db.pragma("journal_mode = DELETE");
   db.pragma("foreign_keys = ON");
@@ -212,10 +215,10 @@ export async function runMcpSearchGeoTests(opts: { log?: boolean } = {}): Promis
     console.log = prevLog;
     __setGeocodingFetchForTesting();
     __clearGeocodeCacheForTesting();
-    // Deliberately NOT db.close(): this handle is still the shared getDb()
-    // singleton (__setDbForTesting has no restore hook), and closing it would
-    // break any later block that reads the singleton. Same discipline as the
-    // other singleton-swapping suites in tests/test.ts.
+    // Restore the singleton, but deliberately do NOT db.close() — nothing
+    // else in the process owns this handle, and closing it would break any
+    // straggler that captured it mid-run.
+    if (prevDb) __setDbForTesting(prevDb as any);
   }
 
   return { passed, failed, failures };

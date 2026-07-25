@@ -28,6 +28,16 @@ export function __setDbForTesting(injected: Database.Database): void {
 // initSchema when the module-level `db` is null, so a test that injects its own
 // DB via __setDbForTesting must call this to actually create the tables.
 // Never call from production code.
+// Test-only companion to __setDbForTesting: returns whatever handle the
+// singleton currently holds (null if none has been opened/injected yet), so a
+// suite that swaps in its own in-memory DB can put the previous one back when
+// it finishes. Without this a swapping suite leaves the singleton pointing at
+// its own throwaway DB for every block that runs after it.
+// Never call from production code.
+export function __peekDbForTesting(): Database.Database | null {
+  return db;
+}
+
 export function __initSchemaForTesting(injected: Database.Database): void {
   initSchema(injected);
 }
