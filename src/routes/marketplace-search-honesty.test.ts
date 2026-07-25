@@ -254,6 +254,70 @@ export async function runMarketplaceSearchHonestyTests(opts: { log?: boolean } =
     }
 
     // ════════════════════════════════════════════════════════════════
+    // B1 (review follow-up) — the name-search carve-out must be HONEST
+    // ════════════════════════════════════════════════════════════════
+    // filterNameCandidatesByGeo() deliberately keeps far-away name matches when
+    // nothing is in range (so "Erga Gårdsutsalg" is still findable from Oslo).
+    // But `geoDropped` was only ever set inside the auto-expand ladder, and the
+    // ladder never runs for a name match — so the response claimed
+    // geoFiltered:true, geoRadiusKm:10 while listing producers 28 / 92 / 289 km
+    // away, at a flat 0.700 each (the min(SPREAD, d/maxKm*SPREAD) grading
+    // saturates once every candidate is out of range, so 0d's fix was undone
+    // too). This is the exact request the reviewer reproduced.
+    {
+      const r = await callRoute(router, {
+        url: "/search",
+        query: { q: "gårdsutsalg", lat: "59.9139", lng: "10.7522", radius: "10" },
+      });
+      assertEq(r.status, 200, "B1: name query + tight radius → 200");
+      assertTrue(r.body.count > 0, "B1: the far-away name matches are still returned (carve-out preserved)");
+
+      const dists: number[] = r.body.results.map((x: any) => x.agent?.location?.distanceKm ?? 0);
+      assertTrue(dists.every((d) => d > 10),
+        `B1: every result really is outside the requested 10 km (got ${dists.map((d) => d.toFixed(0)).join(", ")})`);
+
+      // THE regression: all four of these were wrong on the first branch pass.
+      assertEq(r.body.geoFiltered, false,
+        "B1: geoFiltered is FALSE — the 10 km filter was NOT applied to these results");
+      assertEq(r.body.relaxed_filters, ["geo"], "B1: relaxed_filters names the dropped filter");
+      assertEq(r.body.geoRadiusKm, undefined, "B1: geoRadiusKm no longer advertises the abandoned 10 km");
+      assertTrue(typeof r.body.note === "string" && /hele Norge/.test(r.body.note),
+        `B1: a note explains the widening (got ${JSON.stringify(r.body.note)})`);
+      assertTrue(/gårdsutsalg/.test(String(r.body.note)),
+        "B1: the note names what was searched for, not just the place");
+
+      // Score saturation: 0.700 / 0.700 / 0.700 previously.
+      const scores: number[] = r.body.results.map((x: any) => x.relevanceScore);
+      assertTrue(new Set(scores).size === scores.length,
+        `B1: scores are distinct again, not a saturated tie (got ${JSON.stringify(scores)})`);
+      // …and still ordered nearest-first.
+      const sortedByDist = [...dists].sort((a, b) => a - b);
+      assertEq(dists, sortedByDist,
+        `B1: results are ordered nearest-first (got ${dists.map((d) => d.toFixed(0)).join(", ")})`);
+    }
+    {
+      // Control: when the name match IS in range, nothing is relaxed.
+      const r = await callRoute(router, {
+        url: "/search",
+        query: { q: "gårdsutsalg", lat: String(AGDER.lat), lng: String(AGDER.lng), radius: "90" },
+      });
+      assertEq(r.body.geoFiltered, true, "B1 control: an in-range name match stays honestly geo-filtered");
+      assertEq(r.body.relaxed_filters, undefined, "B1 control: …with no relaxed_filters");
+      assertEq(r.body.geoRadiusKm, 90, "B1 control: …and the requested radius is reported");
+    }
+    {
+      // The broadly-reachable shape the reviewer flagged: an indicator word
+      // plus browser coordinates in a sparse area.
+      const r = await callRoute(router, {
+        url: "/search",
+        query: { q: "gårdsutsalg nær meg", lat: String(VADSO.lat), lng: String(VADSO.lng), radius: "25" },
+      });
+      assertEq(r.body.geoFiltered, false,
+        "B1: «gårdsutsalg nær meg» from Vadsø does not claim a geo filter it did not apply");
+      assertEq(r.body.relaxed_filters, ["geo"], "B1: …and says which filter went");
+    }
+
+    // ════════════════════════════════════════════════════════════════
     // 0e — «nær meg» is an intent, not a stopword
     // ════════════════════════════════════════════════════════════════
     assertTrue(isProximityIntent("nær meg"), "0e: 'nær meg' detected as proximity intent");

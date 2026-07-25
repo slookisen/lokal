@@ -1,5 +1,5 @@
 import { Router, Request, Response } from "express";
-import { marketplaceRegistry } from "../services/marketplace-registry";
+import { marketplaceRegistry, type DiscoverMeta } from "../services/marketplace-registry";
 import { getConfig } from "../config/vertical-config";
 import { AgentRegistrationSchema, AdminRegistrationSchema, DiscoveryQuerySchema } from "../models/marketplace";
 import { interactionLogger } from "../services/interaction-logger";
@@ -496,7 +496,13 @@ router.get("/search", async (req: Request, res: Response) => {
   if (nameQuery) (query as any)._nameQuery = nameQuery;
 
   const startTime = Date.now();
-  let results = marketplaceRegistry.discover(query);
+  // REVIEW FOLLOW-UP B1: discover() can widen a NAME search past the caller's
+  // radius all on its own (nothing in range → keep the far-away name matches).
+  // The auto-expand ladder below never runs in that case (wasNameMatch
+  // short-circuits it), so without this out-param the response would keep
+  // claiming geoFiltered:true for results hundreds of km outside the radius.
+  const discoverMeta: DiscoverMeta = {};
+  let results = marketplaceRegistry.discover(query, discoverMeta);
 
   // ── Auto-expanding radius ──
   // If geo-filtered and too few results, widen the search automatically.
@@ -514,7 +520,9 @@ router.get("/search", async (req: Request, res: Response) => {
   // returned Tønsberg / Melhus / Røros with geoFiltered:true,
   // geoSource:"hardcoded" and no note whatsoever.
   let appliedRadiusKm = parsed.maxDistanceKm;
-  let geoDropped = false;
+  // Seeded from discover()'s own relaxation (B1) so the name-search path and
+  // the auto-expand path report identically.
+  let geoDropped = !!discoverMeta.geoRelaxed;
 
   if (parsed.location && results.length < MIN_RESULTS && !heleNorge && !wasNameMatch) {
     // Only ever WIDEN. RADIUS_STEPS is a fixed ladder, so a caller who asked
@@ -650,6 +658,7 @@ router.get("/search", async (req: Request, res: Response) => {
 
   const safeQuery = q.replace(/<[^>]*>/g, "").replace(/javascript:/gi, "");
   const geoFiltered = !!parsed.location && !heleNorge && !geoDropped;
+  if (geoDropped) appliedRadiusKm = undefined;
 
   res.json({
     success: true,
@@ -671,7 +680,7 @@ router.get("/search", async (req: Request, res: Response) => {
     // Same shape discoverExperiencesRelaxed() already uses on OpplevAgent.
     relaxed_filters: geoDropped ? ["geo"] : undefined,
     needs_location: needsLocation || undefined,
-    note: buildSearchNote({ geoDropped, geoPlaceLabel, needsLocation }),
+    note: buildSearchNote({ geoDropped, geoPlaceLabel, needsLocation, nameQuery }),
     count: enrichedResults.length,
     results: enrichedResults,
     conversations,

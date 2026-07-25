@@ -64,6 +64,8 @@ export function buildSearchNote(opts: {
   geoDropped?: boolean;
   geoPlaceLabel?: string;
   needsLocation?: boolean;
+  /** Set when the widened result set came from the name-match branch (review B1). */
+  nameQuery?: string;
 }): string | undefined {
   if (opts.needsLocation) {
     return (
@@ -74,6 +76,15 @@ export function buildSearchNote(opts: {
   }
   if (opts.geoDropped) {
     const place = opts.geoPlaceLabel || "stedet du søkte på";
+    // A name search that had to be widened says so in its own terms — "no
+    // «gårdsutsalg» near you" is a different, and more useful, statement than
+    // "nothing near you at all".
+    if (opts.nameQuery) {
+      return (
+        `Ingen treff på «${opts.nameQuery}» nær ${place} — viser navnetreff fra hele Norge. / ` +
+        `No «${opts.nameQuery}» matches near ${place} — showing name matches from all of Norway.`
+      );
+    }
     return (
       `Ingen treff nær ${place} — utvidet til hele Norge. / ` +
       `No matches near ${place} — expanded to all of Norway.`
