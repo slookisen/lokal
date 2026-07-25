@@ -336,7 +336,15 @@ export function registerTools(
 
       const lines = results.map((r: any, i: number) => {
         const agent = r.agent;
-        const dist = agent.location?.distanceKm ? ` — ${agent.location.distanceKm.toFixed(1)} km unna` : "";
+        // dev-request 2026-07-25 Fase 1c (honesty rule): distanceKm is only
+        // present for address-precision producers. A centroid-precision row
+        // carries distanceLabel ("i Vadsø-området") instead — an assistant
+        // must never be handed a km figure we made up off a city centroid.
+        const dist = agent.location?.distanceKm
+          ? ` — ${agent.location.distanceKm.toFixed(1)} km unna`
+          : agent.location?.distanceLabel
+            ? ` — ${agent.location.distanceLabel} (omtrentlig posisjon)`
+            : "";
         const summary = getAgentKnowledgeSummary(agent.id);
 
         if (isSpecificQuery) {
@@ -406,7 +414,12 @@ export function registerTools(
 
       const header = `🔍 **Strukturert søk** — ${results.length} resultater:\n`;
       const lines = results.map((r: any, i: number) => {
-        const dist = r.agent.location?.distanceKm ? ` (${r.agent.location.distanceKm.toFixed(1)} km)` : "";
+        // Fase 1c honesty rule — see the same note in lokal_search above.
+        const dist = r.agent.location?.distanceKm
+          ? ` (${r.agent.location.distanceKm.toFixed(1)} km)`
+          : r.agent.location?.distanceLabel
+            ? ` (${r.agent.location.distanceLabel}, omtrentlig)`
+            : "";
         const summary = getAgentKnowledgeSummary(r.agent.id);
         return formatAgentCompact(r.agent, i + 1, summary.contact, summary.productSummary, getClientIdentity?.()) + dist;
       });

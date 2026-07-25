@@ -543,12 +543,30 @@ function shell(
 
 // ─── Producer card HTML (reused across pages) ───────────────
 
-function producerCard(a: any, _matchReasons?: string[], lang: Lang = "no"): string {
+// ─── Card location line — the distance honesty rule ─────────
+// dev-request 2026-07-25-reisesok-korridor-discovery-og-naerhetssok, Fase 1c.
+//
+// The three producer cards below all rendered `city · X km` straight off
+// location.distanceKm. discover() now WITHHOLDS distanceKm for producers whose
+// position is a city/kommune centroid (services/geo-precision.ts) — writing
+// "2,4 km" from a centroid is a number we invented. `distanceLabel` is the
+// server's honest alternative; in a card the city name is already on the line,
+// so the suffix is the short "omtrentlig posisjon" rather than repeating it.
+// Producers with unknown provenance (geo_precision NULL — every pre-Fase-1
+// row) still carry distanceKm and render exactly as before.
+function cardLocationText(a: any, suffix: string = ""): string {
   const city = a.city || a.location?.city || "";
+  const base = `${escapeHtml(city)}${suffix}`;
   const distKm = a.location?.distanceKm;
-  const cityText = distKm != null
-    ? `${escapeHtml(city)} &middot; ${distKm < 1 ? (distKm * 1000).toFixed(0) + " m" : distKm.toFixed(1) + " km"}`
-    : escapeHtml(city);
+  if (distKm != null) {
+    return `${base} &middot; ${distKm < 1 ? (distKm * 1000).toFixed(0) + " m" : distKm.toFixed(1) + " km"}`;
+  }
+  if (a.location?.distanceLabel) return `${base} &middot; omtrentlig posisjon`;
+  return base;
+}
+
+function producerCard(a: any, _matchReasons?: string[], lang: Lang = "no"): string {
+  const cityText = cardLocationText(a);
   const slug = slugify(a.name);
   const cats = (a.categories || []).slice(0, 3).map((c: string) => `<span class="tag">${catEmoji(c)} ${escapeHtml(formatCat(c))}</span>`).join("");
   const trustPct = Math.round((a.trustScore || 0) * 100);
@@ -608,12 +626,8 @@ function isOpenNow(openingHours: Array<{ day: string; open: string; close: strin
 // ─── PR-84: Ultra-rich card for positions 1-3 (claimed top producers) ───
 
 function producerCardUltraRich(a: any, knowledge: any, lang: Lang = "no"): string {
-  const city = a.city || a.location?.city || "";
-  const distKm = a.location?.distanceKm;
   const postal = knowledge?.postalCode ? ` ${escapeHtml(knowledge.postalCode)}` : "";
-  const cityText = distKm != null
-    ? `${escapeHtml(city)}${postal} &middot; ${distKm < 1 ? (distKm * 1000).toFixed(0) + " m" : distKm.toFixed(1) + " km"}`
-    : `${escapeHtml(city)}${postal}`;
+  const cityText = cardLocationText(a, postal);
   const slug = slugify(a.name);
   const cats = (a.categories || []).slice(0, 5).map((c: string) => `<span class="tag">${catEmoji(c)} ${escapeHtml(formatCat(c))}</span>`).join("");
   const trustPct = Math.round((a.trustScore || 0) * 100);
@@ -692,11 +706,7 @@ function producerCardUltraRich(a: any, knowledge: any, lang: Lang = "no"): strin
 // ─── PR-84: Medium-rich card for positions 4-11 (claimed producers) ───
 
 function producerCardMediumRich(a: any, knowledge: any, lang: Lang = "no"): string {
-  const city = a.city || a.location?.city || "";
-  const distKm = a.location?.distanceKm;
-  const cityText = distKm != null
-    ? `${escapeHtml(city)} &middot; ${distKm < 1 ? (distKm * 1000).toFixed(0) + " m" : distKm.toFixed(1) + " km"}`
-    : escapeHtml(city);
+  const cityText = cardLocationText(a);
   const slug = slugify(a.name);
   const cats = (a.categories || []).slice(0, 3).map((c: string) => `<span class="tag">${catEmoji(c)} ${escapeHtml(formatCat(c))}</span>`).join("");
   const trustPct = Math.round((a.trustScore || 0) * 100);
@@ -1581,9 +1591,17 @@ router.get("/sok", async (req: Request, res: Response) => {
     const queryLabel = q
       ? `\u201c${escapeHtml(q)}\u201d`
       : (lang === "en" ? "your location" : "din posisjon");
+    // REVIEW FOLLOW-UP R2: `heleNorge=true` is the OTHER way a coordinates-only
+    // page ends up nationwide, and it was not covered by the geoDropped guard —
+    // /sok?lat=..&lng=..&heleNorge=true rendered «Produsenter nær deg (30 km)»
+    // over a list containing a producer 1 150 km away. Milder than B3 (there is
+    // no false «filtrert etter sted» banner), but item 7's fix made the page
+    // reachable in one click from the «Vis hele Norge» link, and og:description
+    // is what gets shared and indexed.
+    const nationwide = geoDropped || heleNorge;
     const pageHeading = q
       ? `${lang === "en" ? "Search results for" : "S\u00f8keresultater for"} ${queryLabel}`
-      : geoDropped
+      : nationwide
         ? (lang === "en" ? "Producers across Norway" : "Produsenter i hele Norge")
         // …and the km figure is the radius ACTUALLY applied, not the one asked
         // for: the auto-expand ladder may have widened 30 km to 100 km to find
@@ -1662,10 +1680,17 @@ router.get("/sok", async (req: Request, res: Response) => {
       // filter was dropped — it is what link previews and SERPs show.
       q
         ? `${lang === "en" ? "Search results for" : "S\u00f8keresultater for"} \u201c${q}\u201d.`
+        // geoDropped is a FALLBACK (we tried and found nothing); heleNorge is
+        // what the user explicitly asked for. Neither may claim proximity, but
+        // only the first is an apology.
         : geoDropped
           ? (lang === "en"
               ? "No local food producers found near your location \u2014 showing producers across Norway."
               : "Ingen matprodusenter funnet n\u00e6r posisjonen din \u2014 viser produsenter i hele Norge.")
+        : heleNorge
+          ? (lang === "en"
+              ? "Local food producers across Norway."
+              : "Lokale matprodusenter i hele Norge.")
           : (lang === "en" ? "Local food producers near your location." : "Lokale matprodusenter n\u00e6r posisjonen din."),
       content,
       // noindex: /sok?q= is an unbounded query space — GSC 2026-07 showed ~1k

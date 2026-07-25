@@ -238,6 +238,36 @@ export async function runSokSearchHonestyTests(opts: { log?: boolean } = {}): Pr
     }
 
     // ══════════════════════════════════════════════════════════════
+    // R2 (review) — heleNorge=true must drop the proximity claim too
+    // ══════════════════════════════════════════════════════════════
+    // The other way a coordinates-only page ends up nationwide. Reachable in
+    // one click from the «Vis hele Norge» link that item 7 just repaired.
+    {
+      const r = await callHtml(router, `/sok?lat=${OSLO.lat}&lng=${OSLO.lng}&radius=30&heleNorge=true`);
+      assertEq(r.status, 200, "R2: an explicit heleNorge coordinates-only search renders");
+      assertTrue(/Tromsø Sjømat/.test(r.body),
+        "R2: …and really does list producers far outside the 30 km (so the claim would be false)");
+
+      const h1 = (r.body.match(/<h1>([\s\S]*?)<\/h1>/) || [])[1] || "";
+      assertTrue(!/nær deg/i.test(h1), `R2: the H1 drops «nær deg» (got "${h1.trim()}")`);
+      assertTrue(/hele Norge/i.test(h1), `R2: …and says nationwide instead (got "${h1.trim()}")`);
+
+      const title = (r.body.match(/<title>([\s\S]*?)<\/title>/) || [])[1] || "";
+      assertTrue(!/nær deg/i.test(title), `R2: <title> drops it too (got "${title.trim()}")`);
+
+      const desc = (r.body.match(/<meta name="description" content="([^"]*)"/) || [])[1] || "";
+      assertTrue(!/nær posisjonen din/.test(desc),
+        `R2: og/meta description — what gets shared and indexed — drops it (got "${desc}")`);
+      assertTrue(/hele Norge/i.test(desc), `R2: …and states the truth (got "${desc}")`);
+
+      // heleNorge is a user CHOICE, not a failed proximity search, so it must
+      // not apologise the way the geoDropped fallback does.
+      assertTrue(!/Ingen matprodusenter funnet/.test(desc),
+        `R2: an explicit nationwide search is not phrased as a fallback (got "${desc}")`);
+      assertTrue(!/geoRelaxedNote/.test(r.body), "R2: …and shows no relaxation banner");
+    }
+
+    // ══════════════════════════════════════════════════════════════
     // item 7 — «Vis hele Norge» must not be a dead link
     // ══════════════════════════════════════════════════════════════
     {

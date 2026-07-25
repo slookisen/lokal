@@ -11,6 +11,7 @@ import {
 import { slugify } from "../utils/slug";
 import { isJunkDescription } from "./description-quality";
 import { normalizeCityLabel } from "./city-normalizer";
+import { formatRfbDistanceLabel, shouldSuppressDistance } from "./geo-precision";
 
 // ─── Marketplace Registry Service (SQLite-backed) ────────────
 // This is the CORE of what makes Lokal unique: the agent registry.
@@ -348,12 +349,7 @@ class MarketplaceRegistry {
             description: s.description,
             tags: s.tags,
           })),
-          location: agent.location ? {
-            city: agent.location.city,
-            distanceKm: query.location
-              ? haversine(query.location.lat, query.location.lng, agent.location.lat, agent.location.lng)
-              : undefined,
-          } : undefined,
+          location: this.resultLocation(agent, query.location),
           trustScore: agent.trustScore,
           isVerified: agent.isVerified,
           categories: agent.categories,
@@ -368,6 +364,45 @@ class MarketplaceRegistry {
     results.sort((a, b) => b.relevanceScore - a.relevanceScore);
 
     return results.slice(query.offset || 0, (query.offset || 0) + (query.limit || 20));
+  }
+
+  // ─── Result location + the distance honesty rule ──────────
+  // dev-request 2026-07-25-reisesok-korridor-discovery-og-naerhetssok, Fase 1c.
+  //
+  // ONE place decides what a search result is allowed to say about distance,
+  // so the HTML cards, the JSON API and the MCP tools cannot drift apart.
+  // The rule (services/geo-precision.ts, mirroring experience-store.ts's
+  // formatDistanceLabel() on the OpplevAgent side):
+  //   • geo_precision='address'      → real measurement, emit distanceKm.
+  //   • 'city' / 'kommune' / 'postal'→ the position IS a centroid; emitting
+  //                                    "2,4 km unna" would be a fabricated
+  //                                    number. distanceKm is withheld and
+  //                                    distanceLabel says "i <city>-området".
+  //   • NULL (unknown provenance, every pre-Fase-1 row) → unchanged
+  //                                    behaviour, we have no evidence either
+  //                                    way and must not silently blank 948
+  //                                    producers' distances on deploy.
+  // Ranking is untouched: callers keep sorting/filtering on the true
+  // haversine (a centroid is still our best position estimate) — this governs
+  // what we SAY, not what we compute.
+  private resultLocation(
+    agent: RegisteredAgent,
+    origin?: { lat: number; lng: number },
+  ): DiscoveryResult["agent"]["location"] {
+    if (!agent.location) return undefined;
+    const precision = agent.geoPrecision ?? null;
+    const raw = origin
+      ? haversine(origin.lat, origin.lng, agent.location.lat, agent.location.lng)
+      : undefined;
+    const label = origin
+      ? formatRfbDistanceLabel(raw, precision, agent.location.city)
+      : null;
+    return {
+      city: agent.location.city,
+      distanceKm: shouldSuppressDistance(precision) ? undefined : raw,
+      ...(precision ? { geoPrecision: precision } : {}),
+      ...(label ? { distanceLabel: label } : {}),
+    };
   }
 
   // ─── Name-match result builder (geo-aware) ────────────────
@@ -454,10 +489,18 @@ class MarketplaceRegistry {
       .filter((d): d is number => typeof d === "number");
     const gradeScaleKm = geoRelaxed && spanKm.length > 0 ? Math.max(...spanKm) : maxKm;
 
+    // Fase 1c: the emitted distanceKm is now withheld for centroid-precision
+    // producers (see resultLocation()), so the tie-break below can no longer
+    // read it off the result — it would rank an honest "position unknown to
+    // street level" row as Infinity/last. Keep the TRUE distance here, purely
+    // for ordering.
+    const rankDistance = new Map<string, number>();
+
     const results: DiscoveryResult[] = candidates.map(agent => {
       const { score, reasons } = this.calculateRelevance(agent, query, [], new Map());
       this.incrementDiscovery(agent.id);
       const distanceKm = distanceOf(agent);
+      if (typeof distanceKm === "number") rankDistance.set(agent.id, distanceKm);
 
       // Distance grading: 0 penalty at the origin, PROXIMITY_SPREAD at the far
       // edge of the scale, the full penalty for an unplaced producer. Keeps
@@ -475,7 +518,7 @@ class MarketplaceRegistry {
           id: agent.id, name: agent.name, description: agent.description,
           url: agent.url, role: agent.role,
           skills: agent.skills.map(s => ({ id: s.id, name: s.name, description: s.description, tags: s.tags })),
-          location: agent.location ? { city: agent.location.city, distanceKm } : undefined,
+          location: this.resultLocation(agent, origin),
           trustScore: agent.trustScore, isVerified: agent.isVerified,
           categories: agent.categories, tags: agent.tags,
         },
@@ -486,8 +529,8 @@ class MarketplaceRegistry {
 
     results.sort((a, b) => {
       if (b.relevanceScore !== a.relevanceScore) return b.relevanceScore - a.relevanceScore;
-      const da = a.agent.location?.distanceKm ?? Infinity;
-      const db = b.agent.location?.distanceKm ?? Infinity;
+      const da = rankDistance.get(a.agent.id) ?? Infinity;
+      const db = rankDistance.get(b.agent.id) ?? Infinity;
       return da - db;
     });
 
@@ -1418,6 +1461,11 @@ class MarketplaceRegistry {
         city: row.city || "Oslo",
         radiusKm: row.radius_km,
       } : undefined,
+      // dev-request 2026-07-25 Fase 1: coordinate provenance, written by
+      // services/agents-geocode-worker.ts. `?? null` (not `|| undefined`) so a
+      // row from a DB that predates the migration and one the worker has not
+      // reached yet are the same thing to the honesty rule: unknown.
+      geoPrecision: row.geo_precision ?? null,
     };
   }
 

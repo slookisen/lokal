@@ -5794,4 +5794,60 @@ router.post("/admin/homepage-provenance-batch", async (req: Request, res: Respon
   });
 });
 
+// ─── POST /admin/agents/geocode-batch ────────────────────────────────
+// dev-request 2026-07-25-reisesok-korridor-discovery-og-naerhetssok, Fase 1a.
+//
+// Manual/routine trigger for services/agents-geocode-worker.ts, the RFB
+// counterpart of the dental + experiences geocode workers. The worker also
+// runs on its own hourly interval (src/index.ts), exactly like those two; this
+// endpoint exists so a backfill can be driven in controlled batches and — the
+// important part — so a run can be REHEARSED against prod first.
+//
+// Body (all optional):
+//   { limit?: number (1-200, default 50), dry_run?: boolean (default false) }
+//
+// dry_run: true performs the identical Kartverket lookups and reports the
+// changes it WOULD make in `planned`, but takes no write at all — not even the
+// attempt timestamp. Verify with the `status` block: it is captured before and
+// after, and a dry run must leave it byte-identical.
+//
+// Auth: X-Admin-Key, same getAdminKey() convention as every other admin
+// endpoint in this file.
+router.post("/admin/agents/geocode-batch", async (req: Request, res: Response) => {
+  const expectedKey = getAdminKey();
+  if (!expectedKey) { res.status(503).json({ success: false, error: "Admin not configured" }); return; }
+  const adminKey = (req.headers["x-admin-key"] as string) || "";
+  if (!adminKey || adminKey !== expectedKey) {
+    res.status(403).json({ success: false, error: "Krever X-Admin-Key header" });
+    return;
+  }
+
+  const body = (req.body || {}) as { limit?: unknown; dry_run?: unknown };
+  const rawLimit = typeof body.limit === "number" ? Math.floor(body.limit) : 50;
+  const limit = Math.max(1, Math.min(200, Number.isFinite(rawLimit) ? rawLimit : 50));
+  const dryRun = body.dry_run === true;
+
+  try {
+    const { agentsGeocodeTick, agentsGeocodeQueueStatus } =
+      require("../services/agents-geocode-worker") as typeof import("../services/agents-geocode-worker");
+
+    const before = agentsGeocodeQueueStatus();
+    const result = await agentsGeocodeTick(limit, { dryRun });
+    const after = agentsGeocodeQueueStatus();
+
+    res.json({
+      success: true,
+      data: {
+        ...result,
+        limit,
+        status_before: before,
+        status_after: after,
+      },
+    });
+  } catch (err: any) {
+    console.error("[agents-geocode] admin batch failed:", err);
+    res.status(500).json({ success: false, error: err?.message || "Geocode batch failed" });
+  }
+});
+
 export default router;
