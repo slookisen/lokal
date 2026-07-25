@@ -237,6 +237,15 @@ server.registerTool(
     if (k.paymentMethods?.length) sections.push(`\n💳 **Betaling:** ${k.paymentMethods.join(", ")}`);
     if (k.deliveryOptions?.length) sections.push(`🚚 **Levering:** ${k.deliveryOptions.join(", ")}`);
 
+    // Provenance summary (dev-request 2026-07-13-proveniens-transparens-side,
+    // slice 2): additive — only present on `info` when the producer has real
+    // field_provenance + a verification timestamp. This tool reshapes the
+    // REST JSON into markdown (not a verbatim passthrough), so the new field
+    // needs an explicit line here to actually reach the AI-agent caller.
+    if (info.provenance?.sources?.length) {
+      sections.push(`\n🔎 **Kilder:** ${info.provenance.sources.join(", ")} (sist bekreftet ${info.provenance.last_verified})`);
+    }
+
     // Disclaimer / data source
     if (meta.disclaimer) {
       const src = meta.autoSources?.length ? ` (kilder: ${meta.autoSources.join(", ")})` : "";

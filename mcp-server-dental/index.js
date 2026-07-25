@@ -185,6 +185,15 @@ server.registerTool(
     if (agent.online_booking_url) sections.push(`\n📅 Online booking: ${agent.online_booking_url}`);
     if (agent.om_oss) sections.push(`\n${agent.om_oss}`);
 
+    // Provenance summary (dev-request 2026-07-13-proveniens-transparens-side,
+    // slice 2): additive — only present when the clinic has real
+    // field_provenance + last_verified_at. This tool reshapes the REST JSON
+    // into markdown (not a verbatim passthrough), so the new field needs an
+    // explicit line here to actually reach the AI-agent caller.
+    if (agent.provenance?.sources?.length) {
+      sections.push(`\n🔎 Kilder: ${agent.provenance.sources.join(", ")} (sist bekreftet ${agent.provenance.last_verified})`);
+    }
+
     if (Array.isArray(specialists) && specialists.length) {
       sections.push(`\n## Spesialister (${specialists.length})`);
       for (const s of specialists) {

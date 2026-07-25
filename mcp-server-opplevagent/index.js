@@ -268,6 +268,16 @@ server.registerTool(
 
     if (experience.verification_status) sections.push(`\n✔ Status: ${experience.verification_status}`);
 
+    // Provenance summary (dev-request 2026-07-13-proveniens-transparens-side,
+    // slice 2): additive — only present when the provider behind this
+    // experience has real field_provenance + brreg_checked_at. This tool
+    // reshapes the REST JSON into markdown (not a verbatim passthrough), so
+    // the new field needs an explicit line here to actually reach the
+    // AI-agent caller.
+    if (experience.provenance?.sources?.length) {
+      sections.push(`\n🔎 Kilder: ${experience.provenance.sources.join(", ")} (sist bekreftet ${experience.provenance.last_verified})`);
+    }
+
     return { content: [{ type: "text", text: sections.join("\n") }] };
   }
 );
