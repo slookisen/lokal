@@ -38,6 +38,7 @@ import { fylkeEquivalents } from "./norway-fylke";
 // heuristic. meetsAboutQualityBar itself is UNCHANGED and still used as-is
 // by admin-knowledge.ts's unrelated homepage-refresh vertical.
 import { meetsAboutCheapBar } from "./search-enrich";
+import { buildGardssalgProvenanceSummary, type ProvenanceSummary } from "./cross-source-validator";
 // dev-request 2026-07-21-opplevagent-norske-tegn-encoding, criterion 3 —
 // mojibake DETECTION (never used to mutate text directly — see
 // scanGardssalgProviderRowForMojibake/selectGardssalgMojibakeCandidates
@@ -403,14 +404,53 @@ function providerPhoneOf(providerId: string | null | undefined): string | null {
   return raw || null;
 }
 
+// dev-request 2026-07-13-proveniens-transparens-side, slice 2 (additive
+// public provenance summary): mirrors providerPhoneOf() immediately above —
+// same "no fabrication, undefined when the provider has nothing to show"
+// discipline, sourced from the provider row's field_provenance +
+// brreg_checked_at (the provider's own "most recent verification timestamp"
+// — experience_providers has no separate verified_at/last_verified_at
+// column; brreg_checked_at is the closest existing verification-style
+// timestamp, stamped by setBrregVerification()). Uses
+// buildGardssalgProvenanceSummary() because experience_providers.field_provenance
+// is a DIFFERENT on-disk shape than agent_knowledge/dental_agents' (see that
+// function's doc comment in cross-source-validator.ts).
+function providerProvenanceOf(providerId: string | null | undefined): ProvenanceSummary | undefined {
+  if (!providerId) return undefined;
+  const provider = getProviderById(providerId);
+  if (!provider) return undefined;
+  let fieldProvenance: Record<string, unknown> | null = null;
+  const raw = provider.field_provenance;
+  if (typeof raw === "string" && raw.trim()) {
+    try {
+      const parsed = JSON.parse(raw);
+      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+        fieldProvenance = parsed as Record<string, unknown>;
+      }
+    } catch {
+      /* tolerate junk JSON, same convention as the writers of this column */
+    }
+  }
+  return buildGardssalgProvenanceSummary(
+    fieldProvenance,
+    (provider.brreg_checked_at as string | null) ?? null,
+    provider.brreg_verified === 1
+  );
+}
+
 export function getExperienceById(
   id: string
-): (Experience & { id: string; tags: ExperienceTag[]; phone: string | null }) | null {
+): (Experience & { id: string; tags: ExperienceTag[]; phone: string | null; provenance?: ProvenanceSummary }) | null {
   const db = getDb(VERTICAL);
   const row = db.prepare("SELECT * FROM experiences WHERE id = ?").get(id) as Record<string, unknown> | undefined;
   if (!row) return null;
   const hydrated = hydrateExperience(row);
-  return { ...hydrated, phone: providerPhoneOf(hydrated.provider_id) };
+  const provenance = providerProvenanceOf(hydrated.provider_id);
+  return {
+    ...hydrated,
+    phone: providerPhoneOf(hydrated.provider_id),
+    ...(provenance ? { provenance } : {}),
+  };
 }
 // ─── Site-quality: server-rendered detail-page reads (opplevagent.no) ──────
 // Added by the opplevagent-site-quality loop (work-order 2026-06-20,

@@ -53,6 +53,7 @@ import {
 import { nameSimilarity } from "../services/name-matcher";
 import { logPlacesCall, getPlacesUsageThisMonth } from "../services/places-usage-tracker";
 import { findOrgnumberByName } from "../services/brreg-client";
+import { buildProvenanceSummary } from "../services/cross-source-validator";
 
 const router = Router();
 
@@ -165,11 +166,27 @@ router.get("/agents/:id", (req: Request, res: Response) => {
     res.status(404).json({ error: "Not found" });
     return;
   }
+
+  // dev-request 2026-07-13-proveniens-transparens-side, slice 2: additive
+  // entity-level provenance summary. agent.field_provenance is already
+  // hydrated (dental-store's hydrateAgent parses the column); last_verified_at
+  // is NOT part of the DentalAgent type/hydration, so read it directly here —
+  // a small, scoped read rather than widening the shared hydration for every
+  // caller. Omitted entirely when there's nothing to summarize.
+  const verifiedRow = getDb("dental")
+    .prepare("SELECT last_verified_at FROM dental_agents WHERE id = ?")
+    .get(agent.id) as { last_verified_at: string | null } | undefined;
+  const provenance = buildProvenanceSummary(
+    (agent.field_provenance as Record<string, unknown> | null) ?? null,
+    verifiedRow?.last_verified_at ?? null
+  );
+
   res.json({
     agent: {
       ...agent,
       telefon: isDisplayablePhone(agent.telefon) ? agent.telefon : null,
       mobil: isDisplayablePhone(agent.mobil) ? agent.mobil : null,
+      ...(provenance ? { provenance } : {}),
     },
   });
 });

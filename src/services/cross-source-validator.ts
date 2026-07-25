@@ -1659,3 +1659,117 @@ export function factualFieldsWithOnlyInference(
   }
   return out;
 }
+
+// ─── Public provenance summary (dev-request 2026-07-13-proveniens-transparens-
+// side, slice 2 — orch-pr-20260725-proveniens-api-provenance) ───────────────
+//
+// ADDITIVE entity-level rollup for public/agent-facing detail-JSON responses:
+//   provenance: { sources: [...], last_verified: "<ISO-8601>" }
+// v1 is a summary ONLY — it deliberately does not expose which field came
+// from which source (that stays admin-only, see routes/admin-knowledge.ts).
+// Reuses the SAME per-field field_provenance data this module already reads
+// (coerceProvenanceToArrayShape / the ProvenanceRecord shape) — no new
+// tracking mechanism is introduced.
+//
+// `sources` = the distinct source_type values actually backing ANY field on
+// the entity today. Inference/heuristic "sources" (category_inference,
+// web_search, …) are EXCLUDED — matching the /proveniens page's own framing
+// ("AI guesses are never enough on their own … explicitly excluded from
+// counting as evidence", src/routes/seo.ts) and this slice's non-goal of not
+// reintroducing an overclaim (slice 1 had two overclaim defects caught in
+// review). Multi-token source_types ("web_search:gmail.com") are reduced to
+// their head token before the inference check / dedup, mirroring
+// isInferenceSource's own convention.
+//
+// `last_verified` is never fabricated here — callers pass in whatever
+// verification timestamp already exists on the entity's own row (e.g.
+// agent_knowledge.last_verified_at / dental_agents.last_verified_at).
+//
+// Returns undefined — never null/empty — when there is nothing real to
+// summarize, so callers can omit the `provenance` key entirely rather than
+// emit an empty/null field (additive means silence when absent).
+export type ProvenanceSummary = { sources: string[]; last_verified: string };
+
+export function buildProvenanceSummary(
+  fieldProvenance: Record<string, unknown> | null | undefined,
+  lastVerifiedAt: string | null | undefined
+): ProvenanceSummary | undefined {
+  if (typeof lastVerifiedAt !== "string" || !lastVerifiedAt.trim()) return undefined;
+  if (!fieldProvenance || typeof fieldProvenance !== "object") return undefined;
+
+  const coerced = coerceProvenanceToArrayShape(fieldProvenance);
+  const sources: string[] = [];
+  const seen = new Set<string>();
+  for (const records of Object.values(coerced)) {
+    if (!Array.isArray(records)) continue;
+    for (const r of records) {
+      if (!r || typeof r !== "object") continue;
+      const sourceType = (r as ProvenanceRecord).source_type;
+      const value = (r as ProvenanceRecord).value;
+      if (typeof sourceType !== "string" || !sourceType.trim()) continue;
+      if (typeof value !== "string" || !value.trim()) continue;
+      const head = sourceType.trim().toLowerCase().split(":")[0]!;
+      if (!head || isInferenceSource(head)) continue;
+      if (seen.has(head)) continue;
+      seen.add(head);
+      sources.push(head);
+    }
+  }
+  if (sources.length === 0) return undefined;
+  return { sources, last_verified: lastVerifiedAt };
+}
+
+// ─── Gårdssalg (experience_providers) variant ───────────────────────────────
+//
+// experience_providers.field_provenance uses a DIFFERENT on-disk shape than
+// agent_knowledge/dental_agents — one entry per written field of the form
+// { source_url, fetched_at }, with no source_type token at all (see the
+// "NOT the same thing as rfb's field_provenance" comment in
+// src/database/init-experiences.ts). buildProvenanceSummary() above cannot
+// read it, so this classifies each entry's source_url host instead: a
+// brreg.no URL is the Brønnøysundregistrene source; every other host is the
+// provider's own site (the only other writer of this column — see
+// experience-store.ts's applyGardssalgProviderContent /
+// applyGardssalgProviderAddress / applyGardssalgOrgnrFill /
+// applyGardssalgHjemmesideFill, which all stamp evidenceUrl as either a
+// Brreg lookup URL or the provider's own homepage/Facebook URL). Also folds
+// in the provider row's own brreg_verified flag (1 = matched to an org_nr in
+// Brreg) — real, already-existing entity-level evidence, not a new signal.
+export function classifyGardssalgProvenanceSourceUrl(sourceUrl: string): "brreg" | "provider_site" {
+  try {
+    const host = new URL(sourceUrl).hostname.toLowerCase();
+    if (host === "brreg.no" || host.endsWith(".brreg.no")) return "brreg";
+  } catch {
+    /* not a parseable absolute URL — fall through to provider_site */
+  }
+  return "provider_site";
+}
+
+export function buildGardssalgProvenanceSummary(
+  fieldProvenance: Record<string, unknown> | null | undefined,
+  lastVerifiedAt: string | null | undefined,
+  brregVerified?: boolean | 0 | 1 | null
+): ProvenanceSummary | undefined {
+  if (typeof lastVerifiedAt !== "string" || !lastVerifiedAt.trim()) return undefined;
+
+  const sources: string[] = [];
+  const seen = new Set<string>();
+  const add = (token: string) => {
+    if (seen.has(token)) return;
+    seen.add(token);
+    sources.push(token);
+  };
+
+  if (fieldProvenance && typeof fieldProvenance === "object") {
+    for (const entry of Object.values(fieldProvenance)) {
+      if (!entry || typeof entry !== "object") continue;
+      const sourceUrl = (entry as { source_url?: unknown }).source_url;
+      if (typeof sourceUrl !== "string" || !sourceUrl.trim()) continue;
+      add(classifyGardssalgProvenanceSourceUrl(sourceUrl));
+    }
+  }
+  if (brregVerified === true || brregVerified === 1) add("brreg");
+
+  if (sources.length === 0) return undefined;
+  return { sources, last_verified: lastVerifiedAt };
+}
