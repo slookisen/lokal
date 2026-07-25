@@ -706,6 +706,10 @@ function producerCardUltraRich(a: any, knowledge: any, lang: Lang = "no"): strin
 // ─── PR-84: Medium-rich card for positions 4-11 (claimed producers) ───
 
 function producerCardMediumRich(a: any, knowledge: any, lang: Lang = "no"): string {
+  // `city` is still needed on its own below: the address line falls back to it
+  // when knowledge carries no street address. cardLocationText() owns only the
+  // distance half of the location line.
+  const city = a.city || a.location?.city || "";
   const cityText = cardLocationText(a);
   const slug = slugify(a.name);
   const cats = (a.categories || []).slice(0, 3).map((c: string) => `<span class="tag">${catEmoji(c)} ${escapeHtml(formatCat(c))}</span>`).join("");
