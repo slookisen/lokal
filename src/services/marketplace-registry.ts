@@ -24,6 +24,21 @@ import { normalizeCityLabel } from "./city-normalizer";
 //   - JSON arrays stored as TEXT, parsed on read
 //   - Prepared statements for performance
 
+/**
+ * Out-parameter for discover(): how the result set was actually produced.
+ *
+ * REVIEW FOLLOW-UP B1. `discover()` can silently widen a name search beyond the
+ * caller's radius (see filterNameCandidatesByGeo), and the caller has no other
+ * way to find out — the results look identical to a genuine in-radius hit. The
+ * route needs to know so it can report geoFiltered:false + relaxed_filters
+ * instead of claiming a geo filter it did not apply. Optional, so every
+ * existing caller is unaffected.
+ */
+export interface DiscoverMeta {
+  /** True when a name match was kept despite being outside query.maxDistanceKm. */
+  geoRelaxed?: boolean;
+}
+
 class MarketplaceRegistry {
   // ─── In-memory cache ──────────────────────────────────────────
   // Avoids re-querying + JSON.parse() on 1100+ agents per request.
@@ -97,7 +112,7 @@ class MarketplaceRegistry {
   // Consumer agents call this to find producers.
   // Uses bounding-box pre-filter for geo (Gap 6 fix).
 
-  discover(query: DiscoveryQuery): DiscoveryResult[] {
+  discover(query: DiscoveryQuery, meta?: DiscoverMeta): DiscoveryResult[] {
     const db = getDb();
 
     // ── 0. Name-based search: if query contains a producer name, find it directly ──
@@ -129,9 +144,10 @@ class MarketplaceRegistry {
         }
         if (nameCandidates.length > 0) {
           // dev-request 2026-07-25 fix 0d: geo-aware, distance-ranked.
+          const geoFiltered = this.filterNameCandidatesByGeo(nameCandidates, query, meta);
           return this.buildNameMatchResults(
-            this.filterNameCandidatesByGeo(nameCandidates, query),
-            query, 0.9, `Navnematch: "${nameQuery}"`
+            geoFiltered, query, 0.9, `Navnematch: "${nameQuery}"`,
+            undefined, !!meta?.geoRelaxed,
           );
         }
       }
@@ -179,10 +195,11 @@ class MarketplaceRegistry {
           // With no location in the query, this is the original code path.
           let fuzzyCandidates = fuzzyRows.map(x => this.rowToAgent(x.row)!);
           if (query.role) fuzzyCandidates = fuzzyCandidates.filter(a => a.role === query.role);
-          fuzzyCandidates = this.filterNameCandidatesByGeo(fuzzyCandidates, query).slice(0, 10);
+          fuzzyCandidates = this.filterNameCandidatesByGeo(fuzzyCandidates, query, meta).slice(0, 10);
           if (fuzzyCandidates.length > 0) {
             const results = this.buildNameMatchResults(
-              fuzzyCandidates, query, 0.75, `Mulig navnematch: "${nameQuery}"`, 10
+              fuzzyCandidates, query, 0.75, `Mulig navnematch: "${nameQuery}"`, 10,
+              !!meta?.geoRelaxed,
             );
             console.log(`[name-search-fuzzy] matched=${results.length} → ${results.map(r => r.agent.name).join(", ")}`);
             if (results.length > 0) return results;
@@ -378,6 +395,7 @@ class MarketplaceRegistry {
   private filterNameCandidatesByGeo(
     candidates: RegisteredAgent[],
     query: DiscoveryQuery,
+    meta?: DiscoverMeta,
   ): RegisteredAgent[] {
     const origin = query.location;
     const maxKm = query.maxDistanceKm;
@@ -391,7 +409,21 @@ class MarketplaceRegistry {
     }
     // Nothing in range and nothing unplaced → the producer the user named is
     // genuinely far away; return them all rather than pretending they vanished.
-    if (inRange.length + unknown.length === 0) return candidates;
+    //
+    // REVIEW FOLLOW-UP B1: the carve-out is right, but keeping it SILENT
+    // re-introduced exactly the lie 0b fixed. The route only ever set
+    // `geoDropped` inside the auto-expand ladder, and the ladder never runs for
+    // a name match (`wasNameMatch` short-circuits it), so
+    // `?q=gårdsutsalg&lat=59.9139&lng=10.7522&radius=10` answered
+    // geoFiltered:true, geoRadiusKm:10 while listing producers 28 / 92 / 289 km
+    // away. Report the relaxation up to the caller so it can say so, exactly
+    // like the auto-expand path does. Reachable from any query whose word ends
+    // in gård/mat/bakeri/marked/butikk/ysteri/meieri — e.g. «gårdsbutikk nær meg»
+    // with browser coordinates in a sparse area.
+    if (inRange.length + unknown.length === 0) {
+      if (meta) meta.geoRelaxed = true;
+      return candidates;
+    }
     return [...inRange, ...unknown];
   }
 
@@ -401,6 +433,7 @@ class MarketplaceRegistry {
     baseScore: number,
     reason: string,
     maxResults?: number,
+    geoRelaxed = false,
   ): DiscoveryResult[] {
     const origin = query.location;
     const maxKm = query.maxDistanceKm;
@@ -410,20 +443,31 @@ class MarketplaceRegistry {
         ? haversine(origin.lat, origin.lng, a.location.lat, a.location.lng)
         : undefined;
 
+    // REVIEW FOLLOW-UP B1 (second half): grade against a scale the candidates
+    // actually span. When geo was relaxed, EVERY candidate is beyond maxKm, so
+    // `min(SPREAD, d / maxKm * SPREAD)` saturated at SPREAD for all of them and
+    // the flat-score tie 0d was supposed to kill came straight back (measured:
+    // 0.700 / 0.700 / 0.700 for producers 28 / 92 / 289 km away). Scale by the
+    // farthest candidate instead, so the nearest still ranks highest.
+    const spanKm = candidates
+      .map(distanceOf)
+      .filter((d): d is number => typeof d === "number");
+    const gradeScaleKm = geoRelaxed && spanKm.length > 0 ? Math.max(...spanKm) : maxKm;
+
     const results: DiscoveryResult[] = candidates.map(agent => {
       const { score, reasons } = this.calculateRelevance(agent, query, [], new Map());
       this.incrementDiscovery(agent.id);
       const distanceKm = distanceOf(agent);
 
-      // Distance grading: 0 penalty at the origin, PROXIMITY_SPREAD at the
-      // radius edge, the full penalty for an unplaced producer. Keeps every
-      // name hit above a non-name hit while making the order meaningful.
+      // Distance grading: 0 penalty at the origin, PROXIMITY_SPREAD at the far
+      // edge of the scale, the full penalty for an unplaced producer. Keeps
+      // every name hit above a non-name hit while making the order meaningful.
       const PROXIMITY_SPREAD = 0.2;
       let penalty = 0;
-      if (origin && maxKm) {
+      if (origin && gradeScaleKm) {
         penalty = distanceKm === undefined
           ? PROXIMITY_SPREAD
-          : Math.min(PROXIMITY_SPREAD, (distanceKm / maxKm) * PROXIMITY_SPREAD);
+          : Math.min(PROXIMITY_SPREAD, (distanceKm / gradeScaleKm) * PROXIMITY_SPREAD);
       }
 
       return {
