@@ -2910,9 +2910,116 @@ import {
   pageMentionsProducer,
   fieldHasOnlyInferenceSources,
   factualFieldsWithOnlyInference,
+  buildProvenanceSummary,
+  buildGardssalgProvenanceSummary,
+  classifyGardssalgProvenanceSourceUrl,
   type ProvenanceRecord,
   type CrossSourceResult,
 } from "../src/services/cross-source-validator";
+
+console.log("\n── cross-source-validator: buildProvenanceSummary (dev-request 2026-07-13-proveniens-transparens-side, slice 2) ──");
+{
+  // (a) no last_verified_at at all -> undefined (never fabricate a timestamp)
+  assertEq(
+    buildProvenanceSummary({ address: [{ value: "Gata 1", source_type: "brreg", fetched_at: "2026-07-01T00:00Z" }] }, null),
+    undefined,
+    "buildProvenanceSummary: no last_verified_at -> undefined",
+  );
+  assertEq(
+    buildProvenanceSummary({ address: [{ value: "Gata 1", source_type: "brreg", fetched_at: "2026-07-01T00:00Z" }] }, ""),
+    undefined,
+    "buildProvenanceSummary: blank last_verified_at -> undefined",
+  );
+
+  // (b) no field_provenance at all -> undefined even with a timestamp present
+  assertEq(buildProvenanceSummary(null, "2026-07-20T14:00:00Z"), undefined, "buildProvenanceSummary: null field_provenance -> undefined");
+  assertEq(buildProvenanceSummary({}, "2026-07-20T14:00:00Z"), undefined, "buildProvenanceSummary: empty {} field_provenance -> undefined");
+
+  // (c) presence + dedup across fields, inference sources excluded
+  const withData = buildProvenanceSummary(
+    {
+      address: [
+        { value: "Gata 1", source_type: "brreg", fetched_at: "2026-07-01T00:00Z" },
+        { value: "Gata 1", source_type: "google_places", fetched_at: "2026-07-02T00:00Z" },
+      ],
+      phone: [{ value: "12345678", source_type: "brreg", fetched_at: "2026-07-01T00:00Z" }], // dup source_type "brreg" -> deduped
+      about: [{ value: "guessed about text", source_type: "category_inference", fetched_at: "2026-07-01T00:00Z" }], // inference -> excluded
+      products: [{ value: "", source_type: "homepage", fetched_at: "2026-07-01T00:00Z" }], // empty value -> excluded
+    },
+    "2026-07-20T14:00:00Z",
+  );
+  assertTrue(!!withData, "buildProvenanceSummary: real data + timestamp -> present");
+  assertEq(JSON.stringify(withData?.sources), JSON.stringify(["brreg", "google_places"]), "buildProvenanceSummary: sources deduped, inference/empty-value excluded, insertion order preserved");
+  assertEq(withData?.last_verified, "2026-07-20T14:00:00Z", "buildProvenanceSummary: last_verified passed through verbatim, never fabricated");
+
+  // (d) legacy single-object-per-field shape (pre-WO-16) still coerces correctly
+  const legacyShape = buildProvenanceSummary(
+    { address: { value: "Gata 1", source_type: "homepage", fetched_at: "2026-06-01T00:00Z" } },
+    "2026-07-10T00:00:00Z",
+  );
+  assertEq(JSON.stringify(legacyShape?.sources), JSON.stringify(["homepage"]), "buildProvenanceSummary: legacy single-object field shape coerced to array");
+
+  // (e) the {sources:[...]} WIRE shape is never actually persisted on disk —
+  // mergeFieldProvenance() (routes/admin-knowledge.ts) already unwraps it into
+  // a flat array at write time, so field_provenance columns only ever contain
+  // array-of-record or (pre-WO-16) legacy single-object per field. This
+  // mirrors crossSourceAgreement()'s own coercion (cross-source-validator.ts,
+  // ~line 229), which likewise only special-cases Array vs. single-object —
+  // consistent, not a gap, since the wrapper never reaches a read path.
+
+  // (f) only-inference field_provenance -> undefined (no real evidence at all)
+  assertEq(
+    buildProvenanceSummary({ about: [{ value: "guess", source_type: "web_search:gmail.com", fetched_at: "2026-06-01T00:00Z" }] }, "2026-07-10T00:00:00Z"),
+    undefined,
+    "buildProvenanceSummary: prefixed inference-only source (web_search:gmail.com) -> undefined",
+  );
+
+  // (g) malformed records (missing value/source_type) are ignored, not thrown
+  assertEq(
+    buildProvenanceSummary({ address: [{ source_type: "brreg" }, { value: "x" }, "junk", null] as any }, "2026-07-10T00:00:00Z"),
+    undefined,
+    "buildProvenanceSummary: malformed records (no throw) -> undefined when nothing usable survives",
+  );
+}
+
+console.log("\n── cross-source-validator: buildGardssalgProvenanceSummary + classifyGardssalgProvenanceSourceUrl (opplevagent/experience_providers) ──");
+{
+  assertEq(classifyGardssalgProvenanceSourceUrl("https://data.brreg.no/enhetsregisteret/api/enheter/123"), "brreg", "classify: data.brreg.no -> brreg");
+  assertEq(classifyGardssalgProvenanceSourceUrl("https://brreg.no/foo"), "brreg", "classify: brreg.no -> brreg");
+  assertEq(classifyGardssalgProvenanceSourceUrl("https://gardsbutikken.example.no/om-oss"), "provider_site", "classify: producer's own homepage -> provider_site");
+  assertEq(classifyGardssalgProvenanceSourceUrl("not a url"), "provider_site", "classify: unparseable URL falls through to provider_site, never throws");
+
+  // no last_verified -> undefined even with real field_provenance + brreg_verified
+  assertEq(
+    buildGardssalgProvenanceSummary({ about_text: { source_url: "https://gard.example.no", fetched_at: "2026-07-01" } }, null, 1),
+    undefined,
+    "buildGardssalgProvenanceSummary: no brreg_checked_at -> undefined",
+  );
+
+  // field_provenance host classification + brreg_verified fold in, deduped
+  const gs = buildGardssalgProvenanceSummary(
+    {
+      about_text: { source_url: "https://gard.example.no/om-oss", fetched_at: "2026-07-01" },
+      visit_text: { source_url: "https://gard.example.no/besok", fetched_at: "2026-07-02" }, // same host -> dedup
+      adresse: { source_url: "https://data.brreg.no/enheter/123", fetched_at: "2026-06-01" },
+    },
+    "2026-07-15T09:00:00Z",
+    1,
+  );
+  assertEq(JSON.stringify(gs?.sources), JSON.stringify(["provider_site", "brreg"]), "buildGardssalgProvenanceSummary: dedup by host classification + brreg_verified folded in");
+  assertEq(gs?.last_verified, "2026-07-15T09:00:00Z", "buildGardssalgProvenanceSummary: last_verified passed through verbatim");
+
+  // no field_provenance at all, but brreg_verified=1 and a checked_at timestamp -> still present
+  const brregOnly = buildGardssalgProvenanceSummary(null, "2026-07-15T09:00:00Z", true);
+  assertEq(JSON.stringify(brregOnly?.sources), JSON.stringify(["brreg"]), "buildGardssalgProvenanceSummary: brreg_verified alone (no field_provenance) still produces a summary");
+
+  // neither field_provenance nor brreg_verified -> undefined
+  assertEq(
+    buildGardssalgProvenanceSummary({}, "2026-07-15T09:00:00Z", 0),
+    undefined,
+    "buildGardssalgProvenanceSummary: no sources at all -> undefined",
+  );
+}
 
 console.log("\n── cross-source-validator: tierForSource ──");
 assertEq(tierForSource("owner"), "S", "tier: owner=S");
@@ -33367,5 +33474,61 @@ runSerial(async () => {
   } catch (err: any) {
     failed++;
     failures.push("experiences-a2a (gardssalg): unexpected error: " + String(err?.message || err));
+  }
+});
+
+// dev-request 2026-07-13-proveniens-transparens-side, slice 2
+// (orch-pr-20260725-proveniens-api-provenance): additive `provenance`
+// summary field ({ sources, last_verified }) on the public entity-detail
+// JSON responses across all three verticals, reusing the existing
+// field_provenance data (no new tracking mechanism). Pure-function coverage
+// for buildProvenanceSummary/buildGardssalgProvenanceSummary lives inline in
+// the cross-source-validator block near the top of this file; these three
+// blocks cover the route-level wiring per vertical.
+runSerial(async () => {
+  console.log("\n── proveniens-transparens slice 2: GET /api/marketplace/agents/:id/info provenance (rfb) ──");
+  try {
+    const { runMarketplaceAgentProvenanceTests } = require("../src/routes/marketplace-agent-provenance.test") as
+      typeof import("../src/routes/marketplace-agent-provenance.test");
+    const map_ = await runMarketplaceAgentProvenanceTests({ log: false });
+    passed += map_.passed;
+    failed += map_.failed;
+    for (const f of map_.failures) failures.push("marketplace-agent-provenance: " + f);
+    console.log(`  marketplace-agent-provenance: ${map_.passed} passed, ${map_.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("marketplace-agent-provenance: unexpected error: " + String(err?.message || err));
+  }
+});
+
+runSerial(async () => {
+  console.log("\n── proveniens-transparens slice 2: GET /api/tannlege/agents/:id provenance (dental) ──");
+  try {
+    const { runDentalAgentProvenanceTests } = require("../src/routes/dental-agent-provenance.test") as
+      typeof import("../src/routes/dental-agent-provenance.test");
+    const dap = await runDentalAgentProvenanceTests({ log: false });
+    passed += dap.passed;
+    failed += dap.failed;
+    for (const f of dap.failures) failures.push("dental-agent-provenance: " + f);
+    console.log(`  dental-agent-provenance: ${dap.passed} passed, ${dap.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("dental-agent-provenance: unexpected error: " + String(err?.message || err));
+  }
+});
+
+runSerial(async () => {
+  console.log("\n── proveniens-transparens slice 2: GET /api/opplevelser/:id provenance (opplevagent) ──");
+  try {
+    const { runOpplevelserExperienceProvenanceTests } = require("../src/routes/opplevelser-experience-provenance.test") as
+      typeof import("../src/routes/opplevelser-experience-provenance.test");
+    const oep = await runOpplevelserExperienceProvenanceTests({ log: false });
+    passed += oep.passed;
+    failed += oep.failed;
+    for (const f of oep.failures) failures.push("opplevelser-experience-provenance: " + f);
+    console.log(`  opplevelser-experience-provenance: ${oep.passed} passed, ${oep.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("opplevelser-experience-provenance: unexpected error: " + String(err?.message || err));
   }
 });

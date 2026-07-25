@@ -19,7 +19,7 @@ import { pingIndexNow } from "../services/indexnow-service";
 import { addUtmParams } from "../utils/url-utm";
 import { isBlocked, add as blocklistAdd, list as blocklistList, remove as blocklistRemove, addManualEntry as blocklistAddManualEntry, BlocklistValidationError } from "../services/blocklist-service";
 import { mergeFieldProvenance } from "./admin-knowledge";
-import { crossSourceAgreement, isAcceptableHomepageEmail, pageMentionsProducer, type FieldName } from "../services/cross-source-validator";
+import { crossSourceAgreement, isAcceptableHomepageEmail, pageMentionsProducer, buildProvenanceSummary, type FieldName, type ProvenanceSummary } from "../services/cross-source-validator";
 import { logPlacesCall, getPlacesUsageThisMonth } from "../services/places-usage-tracker";
 import { getDb as getVerticalDb } from "../database/db-factory";
 import { findOrgnumberByName } from "../services/brreg-client";
@@ -40,6 +40,31 @@ export function buildPlaceDetailsRequest(
     url: `https://places.googleapis.com/v1/places/${placeId}`,
     fieldMask: parts.join(","),
   };
+}
+
+// ─── Public provenance summary (dev-request 2026-07-13-proveniens-transparens-
+// side, slice 2) ──────────────────────────────────────────────────────────
+// Small, targeted read — deliberately NOT folded into knowledgeService's
+// getKnowledge()/getAgentInfo() SELECT (which many other callers share,
+// including search-listing rows) so this stays scoped to the two
+// entity-detail endpoints below. Returns undefined when there's nothing to
+// summarize; callers must omit the `provenance` key entirely in that case.
+function getAgentProvenanceSummary(agentId: string): ProvenanceSummary | undefined {
+  const db = getDb();
+  const row = db
+    .prepare("SELECT field_provenance, last_verified_at FROM agent_knowledge WHERE agent_id = ?")
+    .get(agentId) as { field_provenance?: string | null; last_verified_at?: string | null } | undefined;
+  if (!row) return undefined;
+  let parsed: Record<string, unknown> | null = null;
+  if (row.field_provenance) {
+    try {
+      const p = JSON.parse(row.field_provenance);
+      if (p && typeof p === "object" && !Array.isArray(p)) parsed = p as Record<string, unknown>;
+    } catch {
+      /* tolerate junk JSON, same convention as admin-knowledge.ts */
+    }
+  }
+  return buildProvenanceSummary(parsed, row.last_verified_at ?? null);
 }
 
 // ─── Marketplace Routes ───────────────────────────────────────
@@ -783,6 +808,13 @@ router.get("/agents/:id/card", (req: Request, res: Response) => {
       // Affiliations are optional metadata — failure here must not break card delivery
       console.error("[seo:phase5.11.a2.5] agent-card affiliations failed:", e);
     }
+
+    // dev-request 2026-07-13-proveniens-transparens-side, slice 2: additive
+    // entity-level provenance summary (mirrors the if(x) card.y = x pattern
+    // used throughout this handler). Omitted entirely when there's nothing
+    // to summarize.
+    const provenance = getAgentProvenanceSummary(agentId);
+    if (provenance) card.provenance = provenance;
   }
 
   res.json(card);
@@ -975,7 +1007,13 @@ router.get("/agents/:id/info", (req: Request, res: Response) => {
     ipAddress: req.ip,
   });
 
-  res.json({ success: true, data: info });
+  // dev-request 2026-07-13-proveniens-transparens-side, slice 2: additive
+  // entity-level provenance summary — omitted entirely when there's nothing
+  // to summarize (never emitted as null/empty).
+  const provenance = getAgentProvenanceSummary(agentId);
+  const data = provenance ? { ...info, provenance } : info;
+
+  res.json({ success: true, data });
 });
 
 // ─── GET /agents/:id/knowledge — Raw knowledge data ─────────
