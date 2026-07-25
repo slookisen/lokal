@@ -218,6 +218,25 @@ export async function runSokSearchHonestyTests(opts: { log?: boolean } = {}): Pr
       assertTrue(!/geoRelaxedNote/.test(r.body), "B3 control: …and shows no relaxation banner");
     }
 
+    {
+      // item 6 companion: when the auto-expand ladder widens the search, the
+      // heading must report the radius that was APPLIED, not the one asked
+      // for. Only one producer sits within 30 km of Oslo, so a 30 km request
+      // climbs the ladder until it has three.
+      const r = await callHtml(router, `/sok?lat=${OSLO.lat}&lng=${OSLO.lng}&radius=30`);
+      const h1 = (r.body.match(/<h1>([\s\S]*?)<\/h1>/) || [])[1] || "";
+      assertTrue(/nær deg/i.test(h1), `item 6: still a proximity heading (got "${h1.trim()}")`);
+      const km = Number((h1.match(/\((\d+) km\)/) || [])[1] || 0);
+      assertTrue(km > 30,
+        `item 6: the heading reports the WIDENED radius, not the requested 30 km (got ${km})`);
+      // …and the ladder never narrows below what was asked for.
+      const r2 = await callHtml(router, `/sok?lat=${OSLO.lat}&lng=${OSLO.lng}&radius=100`);
+      const h2 = (r2.body.match(/<h1>([\s\S]*?)<\/h1>/) || [])[1] || "";
+      const km2 = Number((h2.match(/\((\d+) km\)/) || [])[1] || 0);
+      assertTrue(km2 >= 100,
+        `item 6: a 100 km request is never narrowed to the ladder's first step of 50 (got ${km2})`);
+    }
+
     // ══════════════════════════════════════════════════════════════
     // item 7 — «Vis hele Norge» must not be a dead link
     // ══════════════════════════════════════════════════════════════

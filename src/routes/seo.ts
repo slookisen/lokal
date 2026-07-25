@@ -1585,7 +1585,11 @@ router.get("/sok", async (req: Request, res: Response) => {
       ? `${lang === "en" ? "Search results for" : "S\u00f8keresultater for"} ${queryLabel}`
       : geoDropped
         ? (lang === "en" ? "Producers across Norway" : "Produsenter i hele Norge")
-        : `${lang === "en" ? "Producers near you" : "Produsenter n\u00e6r deg"} (${searchRadiusKm} km)`;
+        // …and the km figure is the radius ACTUALLY applied, not the one asked
+        // for: the auto-expand ladder may have widened 30 km to 100 km to find
+        // three results, and a heading that still said "(30 km)" would be the
+        // same misreport as item 8's radius control.
+        : `${lang === "en" ? "Producers near you" : "Produsenter n\u00e6r deg"} (${appliedRadiusKm ?? searchRadiusKm} km)`;
 
     const content = `
     <section class="search-hero">
