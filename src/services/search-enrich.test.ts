@@ -42,6 +42,13 @@ import {
   // decode of fetched producer-homepage HTML (PURE).
   detectHtmlCharset,
   decodeHtmlBytes,
+  // dev-request 2026-07-21-opplevagent-norske-tegn-encoding, criterion 3:
+  // mojibake DETECTION for the databackfill of already-corrupted text (PURE
+  // — never used to mutate text directly, see the doc comment above these
+  // exports in search-enrich.ts).
+  containsMojibake,
+  mojibakeSnippet,
+  MOJIBAKE_SIGNATURES,
   type PageEvidence,
   type StoredProducer,
   type BraveResult,
@@ -1140,6 +1147,85 @@ export function runSearchEnrichTests(opts: { log?: boolean } = {}): TestSummary 
       original,
       "decodeHtmlBytes: unsupported charset label falls back to utf-8 instead of throwing"
     );
+
+    // ── containsMojibake / mojibakeSnippet (criterion 3 — databackfill
+    // DETECTION for text already corrupted before PR #360 shipped) ────────
+    {
+      // A genuine UTF-8-decoded-as-Latin-1 double-encoding: encode `original`
+      // to UTF-8 bytes, then read those bytes back as Latin-1 — exactly what
+      // an upstream double-decode bug would have produced (distinct from the
+      // windows-1252-forced-through-UTF-8 case above, which produces U+FFFD
+      // instead — both are covered by MOJIBAKE_SIGNATURES).
+      const doubleEncoded = Buffer.from(original, "utf-8").toString("latin1");
+      assertTrue(
+        doubleEncoded.includes("Ã¥") && doubleEncoded.includes("Ã¸"),
+        "sanity: the double-encoded fixture actually contains Ã¥/Ã¸ mojibake"
+      );
+      assertTrue(
+        containsMojibake(doubleEncoded),
+        "containsMojibake: flags genuine double-encoded (UTF-8-as-Latin-1) mojibake"
+      );
+      assertTrue(
+        !containsMojibake(original),
+        "containsMojibake: correctly-decoded Norwegian text (æ/ø/å, no mojibake sequence) is NOT flagged"
+      );
+      assertTrue(
+        !containsMojibake(""),
+        "containsMojibake: empty string is NOT flagged"
+      );
+      assertTrue(
+        !containsMojibake(null),
+        "containsMojibake: null is NOT flagged"
+      );
+      assertTrue(
+        !containsMojibake(undefined),
+        "containsMojibake: undefined is NOT flagged"
+      );
+      assertTrue(
+        containsMojibake("Gr�nnsaker fra egen gard"),
+        "containsMojibake: flags the Unicode replacement character (U+FFFD) — the invalid-UTF-8-decode corruption shape"
+      );
+      // Plain, unrelated ASCII/Norwegian prose with no accidental substring
+      // collision with any signature must never be flagged.
+      assertTrue(
+        !containsMojibake("Velkommen til gardsbutikken var, apent hver lordag om sommeren."),
+        "containsMojibake: ordinary ASCII-only prose is NOT flagged"
+      );
+      // Realistic full-sentence Norwegian about-text fixtures with genuine
+      // æøå — the "extremely reliable, low-false-positive" claim this
+      // detector's doc comment makes.
+      const realisticAboutTexts = [
+        "Gården vår ligger idyllisk til ved fjorden, og vi selger egendyrkede grønnsaker og bær rett fra gårdsbutikken hver helg om sommeren.",
+        "Vi driver økologisk ysteri og lager ost av melk fra egne kyr og geiter — åpent for besøk etter avtale.",
+        "Familiedrevet gård med lange tradisjoner: her finner du poteter, gulrøtter og annet grønt, dyrket uten sprøytemidler.",
+      ];
+      for (const t of realisticAboutTexts) {
+        assertTrue(!containsMojibake(t), `containsMojibake: realistic clean Norwegian about-text is NOT flagged: "${t.slice(0, 30)}..."`);
+      }
+
+      assertEq(
+        MOJIBAKE_SIGNATURES.slice().sort(),
+        ["Ã¦", "Ã¸", "Ã¥", "Â", "�"].slice().sort(),
+        "MOJIBAKE_SIGNATURES: exactly the five documented signatures"
+      );
+
+      // mojibakeSnippet: centers on the first match, whitespace-collapsed,
+      // empty for clean text.
+      assertEq(mojibakeSnippet(null), "", "mojibakeSnippet: null -> ''");
+      assertEq(mojibakeSnippet(original), "", "mojibakeSnippet: clean text with no mojibake -> ''");
+      const snippet = mojibakeSnippet(doubleEncoded, 5);
+      assertTrue(snippet.length > 0, "mojibakeSnippet: non-empty snippet for corrupted text");
+      assertTrue(
+        MOJIBAKE_SIGNATURES.some((sig) => snippet.includes(sig)),
+        "mojibakeSnippet: the returned snippet itself contains a mojibake signature"
+      );
+      const longCorrupted = "x".repeat(200) + "Ã¥" + "y".repeat(200);
+      const boundedSnippet = mojibakeSnippet(longCorrupted, 10);
+      assertTrue(
+        boundedSnippet.length < longCorrupted.length,
+        "mojibakeSnippet: snippet is bounded/windowed, not the entire (potentially huge) field value"
+      );
+    }
   }
 
   return { passed, failed, failures };

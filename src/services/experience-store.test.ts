@@ -22,6 +22,9 @@ import {
   gardssalgRewriteEligible,
   gardssalgProductsEligible,
   gardssalgReplaceableFieldAction,
+  // dev-request 2026-07-21-opplevagent-norske-tegn-encoding, criterion 3:
+  // mojibake candidate-scan DETECTION (PURE — no DB, no network).
+  scanGardssalgProviderRowForMojibake,
 } from "./experience-store";
 
 export interface TestSummary {
@@ -176,6 +179,69 @@ export function runExperienceStoreTests(opts: { log?: boolean } = {}): TestSumma
   assertEq(gardssalgProductsEligible('{"not":"an array"}'), false, "gardssalgProductsEligible: valid JSON but not an array (an object) → false");
   assertEq(gardssalgProductsEligible("[1,2,3]"), false, "gardssalgProductsEligible: valid non-empty JSON array (even of non-strings) → false, only an EMPTY array is eligible");
 
+  // ── scanGardssalgProviderRowForMojibake (dev-request 2026-07-21-
+  //    opplevagent-norske-tegn-encoding, criterion 3) — DETECTION only, one
+  //    match per flagged field, products checked element-by-element. ───────
+  {
+    const CLEAN_ABOUT = "Gården vår ligger idyllisk til ved fjorden, med egne grønnsaker og bær.";
+    const CORRUPT_ABOUT = Buffer.from(CLEAN_ABOUT, "utf-8").toString("latin1"); // genuine Ã¦/Ã¸/Ã¥ mojibake
+
+    assertEq(
+      scanGardssalgProviderRowForMojibake({ about_text: null, visit_text: null, opening_hours_text: null, products: null }),
+      [],
+      "scan-1: an entirely blank row → no matches"
+    );
+    assertEq(
+      scanGardssalgProviderRowForMojibake({ about_text: CLEAN_ABOUT, visit_text: CLEAN_ABOUT, opening_hours_text: null, products: null }),
+      [],
+      "scan-2: clean Norwegian text in every field → no matches"
+    );
+    {
+      const r = scanGardssalgProviderRowForMojibake({ about_text: CORRUPT_ABOUT, visit_text: null, opening_hours_text: null, products: null });
+      assertEq(r.length, 1, "scan-3a: exactly one match for a single corrupted field");
+      assertEq(r[0]?.field, "about_text", "scan-3b: match names the corrupted field");
+      assertTrue(!!r[0]?.snippet && r[0].snippet.length > 0, "scan-3c: match carries a non-empty snippet");
+    }
+    {
+      const r = scanGardssalgProviderRowForMojibake({
+        about_text: CORRUPT_ABOUT, visit_text: CORRUPT_ABOUT, opening_hours_text: "Mandag-fredag 10-18",
+        products: null,
+      });
+      assertEq(
+        r.map((m) => m.field).sort(),
+        ["about_text", "visit_text"],
+        "scan-4: multiple corrupted fields on the same row are ALL reported, the clean field is not"
+      );
+    }
+    // products: JSON-array-of-strings, one hit anywhere in the array flags
+    // the whole column (a single field-level match, not one per element).
+    {
+      const r = scanGardssalgProviderRowForMojibake({
+        about_text: null, visit_text: null, opening_hours_text: null,
+        products: JSON.stringify(["Eplesider", CORRUPT_ABOUT, "Eplemost"]),
+      });
+      assertEq(r.length, 1, "scan-5a: a corrupted element anywhere in products[] → exactly one field-level match");
+      assertEq(r[0]?.field, "products", "scan-5b: match names the products field");
+    }
+    assertEq(
+      scanGardssalgProviderRowForMojibake({ about_text: null, visit_text: null, opening_hours_text: null, products: JSON.stringify(["Eplesider", "Eplemost"]) }),
+      [],
+      "scan-6: a clean products array → no matches"
+    );
+    // Malformed (non-JSON) products value — scanned as a raw string rather
+    // than erroring or being silently skipped.
+    assertEq(
+      scanGardssalgProviderRowForMojibake({ about_text: null, visit_text: null, opening_hours_text: null, products: CORRUPT_ABOUT }).length,
+      1,
+      "scan-7: malformed non-JSON products value is still scanned (as a raw string), not silently skipped"
+    );
+    assertEq(
+      scanGardssalgProviderRowForMojibake({ about_text: null, visit_text: null, opening_hours_text: null, products: "[]" }),
+      [],
+      "scan-8: empty products array literal → no matches"
+    );
+  }
+
   // ── searchGardssalgProviders (dev-request 2026-07-20-gardssalg-mcp-
   //    discoverability) — backs the new discover_gardssalg MCP tool. Unlike
   //    the pure-function tests above, this needs a real (in-memory) DB, so
@@ -297,6 +363,145 @@ export function runExperienceStoreTests(opts: { log?: boolean } = {}): TestSumma
     } catch (err: any) {
       failed++;
       failures.push("searchGardssalgProviders: unexpected error: " + String(err?.stack || err?.message || err));
+    } finally {
+      if (prevExperiencesDbPath === undefined) delete process.env.EXPERIENCES_DB_PATH;
+      else process.env.EXPERIENCES_DB_PATH = prevExperiencesDbPath;
+      try {
+        const dbFactory = require("../database/db-factory") as typeof import("../database/db-factory");
+        dbFactory.__resetDbFactoryForTesting();
+      } catch { /* best-effort */ }
+      for (const p of cachePaths) delete require.cache[p];
+    }
+  }
+
+  // ── selectGardssalgMojibakeCandidates + applyGardssalgProviderContent's
+  //    `forceFields` bypass (dev-request 2026-07-21-opplevagent-norske-tegn-
+  //    encoding, criterion 3) — own isolated in-memory DB block, same
+  //    convention as the searchGardssalgProviders block above. ─────────────
+  {
+    const prevExperiencesDbPath = process.env.EXPERIENCES_DB_PATH;
+    process.env.EXPERIENCES_DB_PATH = ":memory:";
+
+    const dbFactoryPath = require.resolve("../database/db-factory");
+    const experienceStorePath = require.resolve("./experience-store");
+    const cachePaths = [dbFactoryPath, experienceStorePath];
+    for (const p of cachePaths) delete require.cache[p];
+
+    try {
+      const dbFactory = require("../database/db-factory") as typeof import("../database/db-factory");
+      dbFactory.__resetDbFactoryForTesting();
+      const db = dbFactory.getDb("experiences");
+      const expStore = require("./experience-store") as typeof import("./experience-store");
+
+      const CLEAN_ABOUT = "Gården vår ligger idyllisk til ved fjorden, med egne grønnsaker og bær som selges hver helg.";
+      const CORRUPT_ABOUT = Buffer.from(CLEAN_ABOUT, "utf-8").toString("latin1");
+      const CLEAN_VISIT = "Kom innom for omvisning og smaking i gårdsbutikken vår hver lørdag om sommeren.";
+      const CORRUPT_VISIT = Buffer.from(CLEAN_VISIT, "utf-8").toString("latin1");
+
+      const insertProvider = db.prepare(
+        `INSERT INTO experience_providers
+           (id, navn, vertical, hjemmeside, content_source, about_text, visit_text, opening_hours_text, products,
+            producer_type, enrichment_state, verification_status, source, confidence)
+         VALUES
+           (@id, @navn, 'experiences', @hjemmeside, @content_source, @about_text, @visit_text, @opening_hours_text, @products,
+            'cideri', 'raw', 'pending_verify', 'test-fixture', 'medium')`
+      );
+
+      // mb-a: corrupted about_text, unlocked, has hjemmeside → a candidate.
+      insertProvider.run({
+        id: "mb-a", navn: "Mojibake Gard A", hjemmeside: "https://mb-a.example.no",
+        content_source: null, about_text: CORRUPT_ABOUT, visit_text: null, opening_hours_text: null, products: "[]",
+      });
+      // mb-b: clean content throughout → never a candidate.
+      insertProvider.run({
+        id: "mb-b", navn: "Ren Gard B", hjemmeside: "https://mb-b.example.no",
+        content_source: null, about_text: CLEAN_ABOUT, visit_text: CLEAN_VISIT, opening_hours_text: null, products: "[]",
+      });
+      // mb-c: corrupted about_text but LOCKED (content_source='manual') →
+      // never a candidate, even though the text itself matches.
+      insertProvider.run({
+        id: "mb-c", navn: "Last Gard C", hjemmeside: "https://mb-c.example.no",
+        content_source: "manual", about_text: CORRUPT_ABOUT, visit_text: null, opening_hours_text: null, products: "[]",
+      });
+
+      // ── selectGardssalgMojibakeCandidates ────────────────────────────────
+      const candidates = expStore.selectGardssalgMojibakeCandidates(25);
+      const candidateIds = candidates.map((c) => c.id).sort();
+      assertTrue(candidateIds.includes("mb-a"), "mb-1a: corrupted+unlocked provider IS a candidate");
+      assertTrue(!candidateIds.includes("mb-b"), "mb-1b: fully clean provider is NOT a candidate");
+      assertTrue(!candidateIds.includes("mb-c"), "mb-1c: corrupted-but-LOCKED provider is NOT a candidate (never even scanned into the result)");
+      const mbACandidate = candidates.find((c) => c.id === "mb-a");
+      assertTrue(!!mbACandidate && mbACandidate.fields.some((f) => f.field === "about_text"), "mb-1d: mb-a's candidate entry names about_text as the corrupted field");
+
+      // ── applyGardssalgProviderContent: forceFields bypasses
+      //    gardssalgReplaceableFieldAction's "candidate must be strictly
+      //    longer" veto — the exact case mojibake repair needs, since a
+      //    corrected value is typically SHORTER than its corrupted original. ──
+      assertTrue(CORRUPT_ABOUT.length > CLEAN_ABOUT.length, "sanity: the corrupted fixture is LONGER than its clean repair (the scenario forceFields exists for)");
+
+      // Without forceFields: gardssalgReplaceableFieldAction refuses to
+      // replace mb-a's about_text (CORRUPT_ABOUT passes the cheap bar — it's
+      // >=80 chars, has no U+FFFD, and is otherwise well-formed prose — and
+      // CLEAN_ABOUT is SHORTER, so the "candidate must be strictly longer"
+      // rule blocks the write even though CLEAN_ABOUT is the correct value).
+      const writtenNoForce = expStore.applyGardssalgProviderContent(
+        "mb-a", { about_text: CLEAN_ABOUT }, "https://mb-a.example.no"
+      );
+      assertEq(writtenNoForce, [], "mb-2a: WITHOUT forceFields, the shorter (but correct) repair is refused — confirms the gap forceFields closes");
+      const rowAfterNoForce = db.prepare("SELECT about_text FROM experience_providers WHERE id = ?").get("mb-a") as { about_text: string };
+      assertEq(rowAfterNoForce.about_text, CORRUPT_ABOUT, "mb-2b: about_text is unchanged (still corrupted) after the refused write");
+
+      // WITH forceFields: the same shorter, correct candidate IS written.
+      const writtenForced = expStore.applyGardssalgProviderContent(
+        "mb-a", { about_text: CLEAN_ABOUT }, "https://mb-a.example.no",
+        undefined, undefined, undefined, ["about_text"]
+      );
+      assertEq(writtenForced, ["about_text"], "mb-3a: WITH forceFields, the shorter correct candidate IS written");
+      const rowAfterForce = db.prepare(
+        "SELECT about_text, content_source, content_evidence_url, field_provenance FROM experience_providers WHERE id = ?"
+      ).get("mb-a") as { about_text: string; content_source: string; content_evidence_url: string; field_provenance: string };
+      assertEq(rowAfterForce.about_text, CLEAN_ABOUT, "mb-3b: about_text is now the correctly-decoded repair");
+      assertEq(rowAfterForce.content_source, "provider_site", "mb-3c: content_source stamped provider_site, same as any other gårdssalg write");
+      assertEq(rowAfterForce.content_evidence_url, "https://mb-a.example.no", "mb-3d: content_evidence_url stamped to the evidence URL passed in");
+      const provenance = JSON.parse(rowAfterForce.field_provenance);
+      assertTrue(!!provenance.about_text?.source_url, "mb-3e: field_provenance.about_text is stamped — the forced write goes through the SAME provenance machinery as any other write");
+
+      const auditRows = db.prepare(
+        "SELECT * FROM gardssalg_content_audit WHERE provider_id = ? AND field_name = 'about_text' ORDER BY rowid ASC"
+      ).all("mb-a") as Array<{ old_value: string | null; new_value: string | null }>;
+      assertTrue(auditRows.length > 0, "mb-3f: a gardssalg_content_audit row exists for the forced write (auditable/reversible, per the dev-request's own requirement)");
+      const lastAudit = auditRows[auditRows.length - 1]!;
+      assertEq(lastAudit.old_value, CORRUPT_ABOUT, "mb-3g: audit old_value is the pre-write (corrupted) text");
+      assertEq(lastAudit.new_value, CLEAN_ABOUT, "mb-3h: audit new_value is the corrected text");
+
+      // forceFields still respects the row-lock guard: a locked provider's
+      // content_source is never touched, forced or not.
+      const writtenLocked = expStore.applyGardssalgProviderContent(
+        "mb-c", { about_text: CLEAN_ABOUT }, "https://mb-c.example.no",
+        undefined, undefined, undefined, ["about_text"]
+      );
+      assertEq(writtenLocked, [], "mb-4a: forceFields does NOT bypass the lock guard — a manual/claim-locked provider is still never written");
+      const rowLocked = db.prepare("SELECT about_text FROM experience_providers WHERE id = ?").get("mb-c") as { about_text: string };
+      assertEq(rowLocked.about_text, CORRUPT_ABOUT, "mb-4b: locked provider's corrupted about_text is completely untouched");
+
+      // forceFields is per-field: naming "about_text" must not also force an
+      // untouched visit_text write when no visit_text candidate is passed at
+      // all (candidate.visit_text undefined → falsy → no write, regardless
+      // of forceFields' contents).
+      insertProvider.run({
+        id: "mb-e", navn: "Force Scope Gard E", hjemmeside: "https://mb-e.example.no",
+        content_source: null, about_text: CORRUPT_ABOUT, visit_text: CORRUPT_VISIT, opening_hours_text: null, products: "[]",
+      });
+      const writtenScoped = expStore.applyGardssalgProviderContent(
+        "mb-e", { about_text: CLEAN_ABOUT }, "https://mb-e.example.no",
+        undefined, undefined, undefined, ["about_text", "visit_text"]
+      );
+      assertEq(writtenScoped, ["about_text"], "mb-5: forceFields names visit_text too, but with no visit_text candidate value passed, only about_text is actually written");
+      const rowScoped = db.prepare("SELECT visit_text FROM experience_providers WHERE id = ?").get("mb-e") as { visit_text: string };
+      assertEq(rowScoped.visit_text, CORRUPT_VISIT, "mb-5b: visit_text (no candidate passed for it) is completely untouched");
+    } catch (err: any) {
+      failed++;
+      failures.push("gardssalg-mojibake-backfill (experience-store): unexpected error: " + String(err?.stack || err?.message || err));
     } finally {
       if (prevExperiencesDbPath === undefined) delete process.env.EXPERIENCES_DB_PATH;
       else process.env.EXPERIENCES_DB_PATH = prevExperiencesDbPath;

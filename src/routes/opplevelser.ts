@@ -146,6 +146,12 @@ import {
   // fallback used to silently relax category into unrelated results).
   searchGardssalgProviders,
   type GardssalgSearchFilter,
+  // dev-request 2026-07-21-opplevagent-norske-tegn-encoding, criterion 3 —
+  // mojibake candidate scan (detection only) backing
+  // POST /admin/gardssalg-mojibake-backfill below.
+  scanGardssalgProviderRowForMojibake,
+  selectGardssalgMojibakeCandidates,
+  type GardssalgMojibakeCandidate,
 } from "../services/experience-store";
 // dev-request 2026-07-11-dedup-false-positive-remediation — read-only audit
 // of the merged groups the prod backfill produced (titlesMatch()'s single-
@@ -180,6 +186,16 @@ import {
   // route's tier-2 search-based candidate source.
   braveSearch,
   type BraveResult,
+  // dev-request 2026-07-21-opplevagent-norske-tegn-encoding, criterion 3 —
+  // buildPageEvidence already runs the FIXED decode path (fetchHtml() reads
+  // raw bytes + decodeHtmlBytes, PR lokal#360); reused as-is for the mojibake
+  // backfill route's re-fetch step (no new fetch implementation). containsMojibake
+  // is the same detector scanGardssalgProviderRowForMojibake uses, reused
+  // here as the "is the freshly re-extracted candidate itself still corrupt"
+  // safety net before ever writing it.
+  buildPageEvidence,
+  containsMojibake,
+  type PageEvidence,
 } from "../services/search-enrich";
 import { classifyProvider, sleep, BrregClass } from "../services/experience-brreg";
 // dev-request 2026-07-18-gardssalg-profilkvalitet-foer-outreach, slice 3 —
@@ -3670,6 +3686,260 @@ router.post("/admin/gardssalg-content-rollback", requireAdmin, (req: Request, re
     console.error("[opplevelser] gardssalg-content-rollback failed", err);
     res.status(500).json({ error: "Internal error" });
   }
+});
+
+// ─── POST /api/opplevelser/admin/gardssalg-mojibake-backfill (admin) ────────
+//
+// dev-request 2026-07-21-opplevagent-norske-tegn-encoding, criterion 3. PR
+// lokal#360 fixed fetchHtml()'s decode path (search-enrich.ts) so future
+// crawls never mis-decode a source page's æ/ø/å again — but that fix does
+// NOTHING for producer text ALREADY written to the DB before it shipped.
+// This endpoint is the databackfill for that already-corrupted text.
+//
+// Explicitly NOT a blind find/replace on mojibake byte patterns (rejected in
+// the dev-request as too risky — it could mangle text that only
+// coincidentally matches, or miss nested/double-encoded corruption). The
+// repair instead re-runs the SAME re-fetch → re-extract → write pipeline any
+// other gårdssalg content refresh uses, just now with the corrected decode
+// path underneath it:
+//   1. scanGardssalgProviderRowForMojibake (experience-store.ts) flags which
+//      STORED fields (about_text/visit_text/opening_hours_text/products)
+//      contain a known mojibake signature (containsMojibake) — detection
+//      only, never used to mutate text directly.
+//   2. dry_run (default): returns that candidate list — provider id, name,
+//      which field(s) matched, a short snippet of the corrupted text. No
+//      fetch, no write.
+//   3. apply=true: for each candidate, re-fetches the provider's homepage via
+//      buildPageEvidence() (the ALREADY-FIXED decode path) and re-extracts
+//      about_text/visit_text/opening_hours_text with the SAME deterministic,
+//      non-LLM extractors the original write path used (summarizeAbout/
+//      summarizeVisit/extractOpeningHours) — no LLM call, since this is a
+//      pure encoding-correctness repair, not a content-quality judgment.
+//      A field is only written when the freshly re-extracted value (a)
+//      is non-empty, (b) DIFFERS from the currently stored value, AND
+//      (c) does NOT itself still match a mojibake signature (the safety net
+//      against re-corrupting, or against a source site whose text is itself
+//      genuinely unrecoverable). Anything that fails any of those three
+//      checks is skipped and reported, never blanked, never guessed.
+//   4. Writes go through the EXISTING applyGardssalgProviderContent() —
+//      forced via its new `forceFields` param (see that function's own doc
+//      comment for why a force-bypass is needed here specifically:
+//      gardssalgReplaceableFieldAction's "candidate must be strictly LONGER"
+//      replace rule is actively wrong for mojibake repair, since corrupted
+//      text is typically LONGER than its correctly-decoded fix) — so every
+//      write still gets the SAME gardssalg_content_audit row +
+//      field_provenance stamp + content_source='manual'/'claim' lock-guard
+//      as any other gårdssalg content write. That audit trail is the
+//      rollback lever (POST /admin/gardssalg-content-rollback, unmodified —
+//      about_text/visit_text/opening_hours_text are already in
+//      GARDSSALG_ROLLBACKABLE_FIELDS there).
+//
+// `products` (JSON-array-of-strings column) is INCLUDED in detection (dry-run
+// candidates can list it) but NOT auto-repaired here: unlike about_text/
+// visit_text/opening_hours_text, there is no deterministic (non-LLM)
+// extractor that reconstructs the literal product-name strings originally
+// written by generateGardssalgProductList — guessing a replacement without
+// one would violate this endpoint's own "never guess" rule. A products-only
+// match is reported for manual review rather than silently dropped or
+// blindly rewritten; see `products_flagged_for_manual_review` in the
+// response and this route's own doc comment for the reasoning. (Flagged, not
+// silently expanded in scope — a future slice could add an LLM-backed
+// products re-extraction path mirroring generateGardssalgProductList.)
+//
+// Body: { providerIds?: string[], limit?: number, apply?: boolean }.
+// apply: dry-run by default (same convention as every other admin route in
+// this file) — apply=1/"1"/true (body) or ?apply=1/"true" (query).
+// limit: default 25, hard cap 48 (same ceiling as the candidate scan itself
+// — there are only 48 gårdssalg providers total).
+// Auth: same X-Admin-Key convention (requireAdmin) as the rest of this file.
+const MB_DEFAULT_LIMIT = 25;
+const MB_HARD_CAP = 48;
+
+router.post("/admin/gardssalg-mojibake-backfill", requireAdmin, async (req: Request, res: Response) => {
+  const body = (req.body ?? {}) as { providerIds?: unknown; limit?: unknown; apply?: unknown };
+
+  const apply =
+    body.apply === true ||
+    body.apply === 1 ||
+    body.apply === "1" ||
+    body.apply === "true" ||
+    req.query?.apply === "1" ||
+    req.query?.apply === "true";
+  const dryRun = !apply;
+
+  const limit = Math.min(
+    typeof body.limit === "number" && body.limit > 0 ? Math.floor(body.limit) : MB_DEFAULT_LIMIT,
+    MB_HARD_CAP
+  );
+
+  // ── Candidate selection (detection only — no fetch, no write) ─────────
+  let candidates: GardssalgMojibakeCandidate[];
+  if (Array.isArray(body.providerIds) && body.providerIds.length > 0) {
+    const ids = (body.providerIds as unknown[])
+      .filter((id): id is string => typeof id === "string" && id.trim().length > 0)
+      .map((id) => id.trim())
+      .slice(0, limit);
+    candidates = [];
+    for (const id of ids) {
+      const t = getGardssalgProviderContentTarget(id);
+      if (!t) continue;
+      // getGardssalgProviderContentTarget() does NOT itself filter locked
+      // (content_source manual/claim) rows — same override semantics as the
+      // sibling content-refresh route's providerIds resolution. Unlike that
+      // route, a locked row is never even surfaced as a mojibake-backfill
+      // candidate here (not just skipped-before-fetch): forcing a fix onto a
+      // human/owner-authored row is never in scope for this endpoint, dry-run
+      // or apply, explicit id or not.
+      if (t.content_source === "manual" || t.content_source === "claim") continue;
+      const fields = scanGardssalgProviderRowForMojibake(t);
+      if (fields.length > 0) candidates.push({ id: t.id, navn: t.navn, hjemmeside: t.hjemmeside, fields });
+    }
+  } else {
+    candidates = selectGardssalgMojibakeCandidates(limit);
+  }
+
+  if (dryRun) {
+    res.json({
+      dry_run: true,
+      candidates: candidates.length,
+      written: 0,
+      skipped_still_corrupt: 0,
+      skipped_no_change: 0,
+      errors: [],
+      rows: candidates.map((c) => ({
+        provider_id: c.id,
+        name: c.navn,
+        fields: c.fields,
+      })),
+      products_flagged_for_manual_review: candidates
+        .filter((c) => c.fields.some((f) => f.field === "products"))
+        .map((c) => c.id),
+    });
+    return;
+  }
+
+  // ── apply=true: re-fetch (already-fixed decode path) + re-extract +
+  // force-write only what genuinely differs and is no longer corrupt. ────
+  const rows: Array<{ provider_id: string; name: string; field: string; before: string; after: string }> = [];
+  let written = 0;
+  let skippedStillCorrupt = 0;
+  let skippedNoChange = 0;
+  const errors: Array<{ provider_id: string; error: string }> = [];
+  const productsFlagged: string[] = [];
+
+  for (const c of candidates) {
+    const flaggedFieldsPreFetch = new Set(c.fields.map((f) => f.field));
+    if (flaggedFieldsPreFetch.has("products")) productsFlagged.push(c.id);
+    // No deterministic (non-LLM) re-extraction path exists for `products` —
+    // if that's the ONLY flagged field, there is nothing this route can
+    // repair, so skip the fetch entirely rather than paying for a network
+    // round-trip with no possible write at the end of it.
+    const needsFetch =
+      flaggedFieldsPreFetch.has("about_text") ||
+      flaggedFieldsPreFetch.has("visit_text") ||
+      flaggedFieldsPreFetch.has("opening_hours_text");
+    if (!needsFetch) continue;
+
+    let page: PageEvidence | null;
+    try {
+      page = await buildPageEvidence(c.hjemmeside);
+    } catch (e: any) {
+      errors.push({ provider_id: c.id, error: `fetch_failed: ${e?.message ?? String(e)}` });
+      continue;
+    }
+    if (!page) {
+      errors.push({ provider_id: c.id, error: `fetch_failed for ${c.hjemmeside}` });
+      continue;
+    }
+
+    // Re-read the CURRENT stored row (not the candidate's selection-time
+    // snapshot, which may be stale by the time this loop reaches it) so the
+    // "differs from stored" check and the before/after diff are always
+    // against live data — same discipline as every other gårdssalg writer
+    // in this file re-checking against a fresh row.
+    const target = getGardssalgProviderContentTarget(c.id);
+    if (!target) {
+      errors.push({ provider_id: c.id, error: "provider_not_found_or_locked" });
+      continue;
+    }
+
+    const flaggedFields = flaggedFieldsPreFetch;
+
+    const freshAbout = flaggedFields.has("about_text") ? summarizeAbout(page.html) : null;
+    const freshVisit = flaggedFields.has("visit_text") ? summarizeVisit(page.html) : null;
+    const freshHours = flaggedFields.has("opening_hours_text")
+      ? extractOpeningHours(page.contentText ?? extractVisibleText(page.html))
+      : null;
+
+    const candidateWrite: { about_text?: string; visit_text?: string; opening_hours_text?: string } = {};
+    const forceFields: Array<"about_text" | "visit_text" | "opening_hours_text"> = [];
+    const beforeSnapshot: Record<string, string | null> = {
+      about_text: target.about_text,
+      visit_text: target.visit_text,
+      opening_hours_text: target.opening_hours_text,
+    };
+
+    function evaluate(
+      field: "about_text" | "visit_text" | "opening_hours_text",
+      fresh: string | null,
+      stored: string | null
+    ): void {
+      if (!flaggedFields.has(field)) return;
+      const freshTrimmed = fresh?.trim() || "";
+      const storedTrimmed = (stored ?? "").trim();
+      if (!freshTrimmed || freshTrimmed === storedTrimmed) {
+        skippedNoChange++;
+        return;
+      }
+      if (containsMojibake(freshTrimmed)) {
+        skippedStillCorrupt++;
+        return;
+      }
+      candidateWrite[field] = freshTrimmed;
+      forceFields.push(field);
+    }
+
+    evaluate("about_text", freshAbout, target.about_text);
+    evaluate("visit_text", freshVisit, target.visit_text);
+    evaluate("opening_hours_text", freshHours, target.opening_hours_text);
+
+    if (forceFields.length === 0) continue;
+
+    try {
+      const writtenFields = applyGardssalgProviderContent(
+        c.id,
+        candidateWrite,
+        page.url || c.hjemmeside,
+        undefined,
+        undefined,
+        undefined,
+        forceFields
+      );
+      for (const f of writtenFields) {
+        written++;
+        rows.push({
+          provider_id: c.id,
+          name: c.navn,
+          field: f,
+          before: beforeSnapshot[f] ?? "",
+          after: (candidateWrite as Record<string, string | undefined>)[f] ?? "",
+        });
+      }
+    } catch (e: any) {
+      errors.push({ provider_id: c.id, error: `write_failed: ${e?.message ?? String(e)}` });
+    }
+  }
+
+  res.json({
+    dry_run: false,
+    candidates: candidates.length,
+    written,
+    skipped_still_corrupt: skippedStillCorrupt,
+    skipped_no_change: skippedNoChange,
+    errors,
+    rows,
+    products_flagged_for_manual_review: productsFlagged,
+  });
 });
 
 // ─── Admin rfb-seed routes ───────────────────────────────────────────
