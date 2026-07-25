@@ -17,12 +17,31 @@ export interface GeoResult {
   lng: number;
   name: string;        // canonical name from source
   radiusKm: number;    // suggested search radius
-  source: "cache" | "hardcoded" | "database" | "kartverket";
+  source: "cache" | "hardcoded" | "database" | "kartverket" | "kommuneinfo";
+  /** Kartverket navneobjekttype the point came from (kartverket source only). */
+  placeType?: string;
 }
 
 // ── In-memory cache (survives request cycle, clears on restart) ──
 const geoCache = new Map<string, GeoResult | null>();
 const CACHE_MAX = 500;
+
+// ── Injectable fetch (tests) ──────────────────────────────────────
+// Same seam shape as dental-geocode-worker.ts's GeocodeDeps.fetchImpl, but
+// module-level because geocodingService is a singleton every route imports
+// directly. Production never calls the setter, so the default is the global
+// fetch exactly as before.
+let fetchImpl: typeof fetch = (...args: Parameters<typeof fetch>) => fetch(...args);
+
+/** Test-only: swap the fetch used for all Kartverket/Kommuneinfo calls. Pass nothing to restore. */
+export function __setGeocodingFetchForTesting(impl?: typeof fetch): void {
+  fetchImpl = impl || ((...args: Parameters<typeof fetch>) => fetch(...args));
+}
+
+/** Test-only: drop the in-memory geocode cache so each case starts clean. */
+export function __clearGeocodeCacheForTesting(): void {
+  geoCache.clear();
+}
 
 // ── Major Norwegian places hardcoded for speed (no API call needed) ──
 // Expanded in PR-75 (28 → ~100 entries). Covers >95% of common queries.
@@ -280,13 +299,86 @@ export function haversineDistanceKm(lat1: number, lng1: number, lat2: number, ln
   return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
 }
 
+// ── Kartverket navneobjekttype allowlist (dev-request 2026-07-25 fix 0c) ──
+//
+// Before this, lookupKartverket() preferred a populated-place type but fell
+// back to `data.navn[0]` when none of the top-3 hits matched. Kartverket's
+// `sok` is fuzzy, so ANY string that resembles a registered name produced a
+// point — and the caller had no way to tell a real town from a holiday cabin.
+// Live proof (measured 2026-07-25): `blåskjell` returns exactly one hit, the
+// FRITIDSBOLIG «Blåskjell» in Larvik (58.9699, 9.89022). extractAndGeocode()
+// therefore geocoded `blåskjell Kautokeino` to Larvik — 1 400 km wrong — and
+// never even tried the word «Kautokeino» (which resolves correctly to the
+// Tettsted Guovdageaidnu, 69.01243/23.04101).
+//
+// The fix is a STRICT, exact-match (case-insensitive) allowlist, checked in
+// three tiers so a genuine settlement always beats a mere administrative or
+// landscape polygon. Types are the literal `navneobjekttype` strings from
+// https://ws.geonorge.no/stedsnavn/v1/navneobjekttyper (291 of them). Exact
+// match, not substring: the old `.includes("By")` also accepted
+// «Bygg for jordbruk, fiske og fangst» and friends.
+//
+// Anything outside all three tiers is REJECTED — no navn[0] fallback. A
+// rejected lookup falls through to the kommune-register lookup below, and
+// failing that returns null so the caller can be honest about having no geo
+// rather than confidently pointing at the wrong end of the country.
+
+// Tier 1 — actual settlements (a person lives/shops here).
+const POPULATED_PLACE_TYPES = new Set([
+  "tettsted", "statistisk tettsted", "tettbebyggelse", "tettsteddel",
+  "by", "bydel", "administrativ bydel",
+  "grend", "bygdelag (bygd)", "poststed", "boligfelt",
+]);
+
+// Tier 2 — administrative areas (kommune/fylke centroids).
+const ADMIN_AREA_TYPES = new Set([
+  "kommune", "fylke", "annen administrativ inndeling",
+]);
+
+// Tier 3 — named landscape/landmass regions people genuinely search by
+// («Lofoten», «Hardanger», «Valdres», «Vega», «Frosta»). Coarse, but real
+// geography with a defensible representative point — unlike a cabin.
+const REGION_PLACE_TYPES = new Set([
+  "landskapsområde", "dalføre", "øy i sjø", "øygruppe i sjø",
+  "halvøy i sjø", "øy i vann", "fjellområde",
+]);
+
+/** True if Kartverket's navneobjekttype is a place we are willing to geocode to. */
+export function isAcceptablePlaceType(navneobjekttype: string | null | undefined): boolean {
+  const t = (navneobjekttype || "").toLowerCase().trim();
+  return POPULATED_PLACE_TYPES.has(t) || ADMIN_AREA_TYPES.has(t) || REGION_PLACE_TYPES.has(t);
+}
+
 // ── Radius heuristic based on place type ──
+// Exact match on the same normalised type strings as the allowlist above
+// (the old substring test made "Bygg for jordbruk…" a 30 km "by").
 function radiusForType(type: string): number {
-  const t = type.toLowerCase();
-  if (t.includes("tettsted") || t.includes("bydel") || t.includes("grend")) return 15;
-  if (t.includes("by") || t.includes("kommune")) return 30;
-  if (t.includes("fylke") || t.includes("region")) return 60;
+  const t = (type || "").toLowerCase().trim();
+  if (t === "bydel" || t === "administrativ bydel" || t === "tettsteddel" || t === "boligfelt") return 10;
+  if (POPULATED_PLACE_TYPES.has(t)) return 15;
+  if (t === "kommune" || t === "annen administrativ inndeling") return 30;
+  if (t === "fylke") return 90;
+  if (REGION_PLACE_TYPES.has(t)) return 50;
   return 25; // sensible default
+}
+
+/**
+ * Search radius from a kommune's Kartverket bounding box: the larger of the
+ * two half-extents, so the whole kommune is reachable from its centroid.
+ * Clamped to 10–120 km (a kommune-centroid hit is approximate by definition;
+ * an unclamped Kautokeino would ask for ~90 km of nothing).
+ */
+export function radiusFromBoundingBox(box: any, centroidLat: number): number {
+  const ring = box?.coordinates?.[0];
+  if (!Array.isArray(ring) || ring.length < 3) return 30;
+  const lats = ring.map((p: any) => Number(p?.[1])).filter((n: number) => Number.isFinite(n));
+  const lngs = ring.map((p: any) => Number(p?.[0])).filter((n: number) => Number.isFinite(n));
+  if (lats.length < 2 || lngs.length < 2) return 30;
+  const halfLatKm = ((Math.max(...lats) - Math.min(...lats)) / 2) * 111;
+  const halfLngKm = ((Math.max(...lngs) - Math.min(...lngs)) / 2) * 111 * Math.cos(centroidLat * (Math.PI / 180));
+  const r = Math.max(halfLatKm, Math.abs(halfLngKm));
+  if (!Number.isFinite(r) || r <= 0) return 30;
+  return Math.round(Math.min(120, Math.max(10, r)));
 }
 
 class GeocodingService {
@@ -324,9 +416,56 @@ class GeocodingService {
     }
 
     // 4. Kartverket Stedsnavn API (covers ALL Norwegian places)
-    const apiResult = await this.lookupKartverket(key);
+    let apiResult = await this.lookupKartverket(key);
+
+    // 5. Kommune-register fallback (dev-request 2026-07-25 fix 0a/0c).
+    //    Stedsnavn's fuzzy `sok` frequently ranks a farm/cabin/church above
+    //    (or instead of) the kommune that carries the same name — «Flakstad»
+    //    returns 8 hits with the Navnegard «Flagstad» near Hamar first and
+    //    Flakstad kommune in Lofoten never typed as a Kommune at all. Now
+    //    that step 4 rejects those, ask the authoritative kommune register
+    //    (Kommuneinfo) instead of guessing. Only reached when Stedsnavn had
+    //    nothing acceptable, so the common path costs no extra request.
+    if (!apiResult) apiResult = await this.lookupKommuneinfo(key);
+
     this.cacheResult(key, apiResult); // cache null too to avoid repeated API calls
     return apiResult;
+  }
+
+  /**
+   * Resolve a KOMMUNE (municipality) to its official representative point.
+   *
+   * dev-request 2026-07-25 fix 0a. The experiences geocode worker used to call
+   * geocode() for this, which meant a kommune name was resolved by Kartverket
+   * Stedsnavn's fuzzy free-text search. For «Flakstad» that returned the
+   * Navnegard «Flagstad» at Hamar (60.81836, 11.10518) — so every experience
+   * in Flakstad kommune (Lofoten) was stored at Hamar, and OpplevAgent's
+   * discover_experiences at Elverum reported «Nusfjord Arctic Resort» as
+   * 26.2 km away when it is 788 km away.
+   *
+   * This goes to Kartverket's Kommuneinfo register instead, which only knows
+   * about kommuner — a name that is not a kommune simply 404s. Prefers the
+   * kommunenummer when the caller has one (experience_providers already
+   * stores it), because that is exact and immune to name changes/aliases.
+   */
+  async geocodeKommune(kommuneName: string | null | undefined, kommunenummer?: string | null): Promise<GeoResult | null> {
+    const nr = (kommunenummer || "").trim();
+    const name = (kommuneName || "").trim();
+    if (!nr && name.length < 2) return null;
+
+    const key = nr ? `kommunenr:${nr}` : `kommune:${name.toLowerCase()}`;
+    if (geoCache.has(key)) return geoCache.get(key) || null;
+
+    let result: GeoResult | null = null;
+    if (/^\d{4}$/.test(nr)) result = await this.lookupKommuneinfoByNumber(nr);
+    if (!result && name) result = await this.lookupKommuneinfo(name);
+    // Last resort: the generic geocoder (hardcoded table / agents DB / the
+    // now-strict Stedsnavn lookup). Deliberately AFTER the kommune register
+    // so a real kommune can never lose to a same-named farm again.
+    if (!result && name) result = await this.geocode(name);
+
+    this.cacheResult(key, result);
+    return result;
   }
 
   /**
@@ -352,6 +491,15 @@ class GeocodingService {
       "løk", "kål", "agurk", "paprika", "spinat", "salat",
       "mat", "butikk", "butikker", "marked", "gård", "gårdsbutikk",
       "produsent", "produsenter", "bonde", "bonden", "selge", "selges",
+      // dev-request 2026-07-25 fix 0c — product words that are ALSO
+      // registered Norwegian place names. «blåskjell» is a Fritidsbolig in
+      // Larvik; the strict navneobjekttype filter in lookupKartverket()
+      // already rejects it, but skipping them here means we never spend an
+      // HTTP round-trip on a word that is obviously food in the first place.
+      "blåskjell", "skjell", "kamskjell", "østers", "hummer", "krabbe",
+      "sopp", "vilt", "geit", "gris", "kalv", "sau", "and", "elg",
+      "spekemat", "pølser", "pølse", "syltetøy", "saft", "most", "cider",
+      "sider", "øl", "vin", "mjød", "gårdsutsalg", "gårdssalg", "reko",
     ]);
 
     const words = q.split(/\s+/).filter(w => w.length >= 2);
@@ -408,44 +556,119 @@ class GeocodingService {
 
   private async lookupKartverket(placeName: string): Promise<GeoResult | null> {
     try {
-      const url = `https://ws.geonorge.no/stedsnavn/v1/sted?sok=${encodeURIComponent(placeName)}&treffPerSide=3&utkoordsys=4258`;
+      // treffPerSide raised 3 → 10: the acceptable place type is often ranked
+      // below several farms/cabins sharing the name (measured: «Bømlo» has the
+      // Kommune at hit #3, «Dønna» the Poststed at #4). With the strict filter
+      // below, looking at only 3 hits would reject genuine places.
+      const url = `https://ws.geonorge.no/stedsnavn/v1/sted?sok=${encodeURIComponent(placeName)}&treffPerSide=10&utkoordsys=4258`;
 
-      const controller = new AbortController();
-      const timeout = setTimeout(() => controller.abort(), 3000); // 3s timeout
+      const data: any = await this.getJson(url);
+      if (!data || !Array.isArray(data.navn) || data.navn.length === 0) return null;
 
-      const response = await fetch(url, {
-        signal: controller.signal,
-        headers: { "Accept": "application/json" },
-      });
-      clearTimeout(timeout);
+      const hasPoint = (n: any) =>
+        n?.representasjonspunkt && n.representasjonspunkt.nord != null && n.representasjonspunkt.øst != null;
+      const typeOf = (n: any) => (n?.navneobjekttype || "").toLowerCase().trim();
+      const pick = (allowed: Set<string>) =>
+        data.navn.find((n: any) => hasPoint(n) && allowed.has(typeOf(n)));
 
-      if (!response.ok) return null;
-
-      const data: any = await response.json();
-      if (!data.navn || data.navn.length === 0) return null;
-
-      // Prefer results that are populated places (tettsted, by, bydel)
-      // over mountains, lakes etc.
-      const placeTypes = ["Tettsted", "By", "Bydel", "Kommune", "Grend", "Bygd"];
-      let best = data.navn.find((n: any) =>
-        placeTypes.some(t => (n.navneobjekttype || "").includes(t))
-      );
-      if (!best) best = data.navn[0]; // fallback to first result
+      // Tier order: real settlement > administrative area > named region.
+      // NO navn[0] fallback — an unrecognised type means "we do not know
+      // where this is", which is strictly better than a confident wrong point.
+      const best = pick(POPULATED_PLACE_TYPES) || pick(ADMIN_AREA_TYPES) || pick(REGION_PLACE_TYPES);
+      if (!best) {
+        const rejected = data.navn.map((n: any) => n?.navneobjekttype).filter(Boolean).join(", ");
+        console.log(`[geocoding] rejected low-confidence Kartverket match for "${placeName}" (types: ${rejected || "none"})`);
+        return null;
+      }
 
       const punkt = best.representasjonspunkt;
-      if (!punkt || punkt.nord == null || punkt.øst == null) return null;
-
       return {
         lat: punkt.nord,
         lng: punkt.øst,
         name: best.stedsnavn?.[0]?.skrivemåte || placeName,
         radiusKm: radiusForType(best.navneobjekttype || ""),
         source: "kartverket",
+        placeType: best.navneobjekttype || undefined,
       };
     } catch (err) {
       // Network error or timeout — fail gracefully
       console.error(`[geocoding] Kartverket lookup failed for "${placeName}":`, err);
       return null;
+    }
+  }
+
+  // ── Kartverket Kommuneinfo (the kommune register) ────────────────
+  // https://ws.geonorge.no/kommuneinfo/v1/ — free, no API key, CC BY 4.0,
+  // same terms as Stedsnavn. `punktIOmrade` is the kommune's official
+  // representative point; `avgrensningsboks` its bounding box, which gives a
+  // far better search radius than a flat 30 km (Flakstad ≈ 30 km, Oslo ≈ 12).
+  // A name that is not a kommune returns HTTP 404, so there is no fuzzy
+  // false-positive class here at all.
+
+  private async lookupKommuneinfo(name: string): Promise<GeoResult | null> {
+    try {
+      const url = `https://ws.geonorge.no/kommuneinfo/v1/sok?knavn=${encodeURIComponent(name)}&utkoordsys=4258`;
+      const data: any = await this.getJson(url);
+      const list: any[] = Array.isArray(data?.kommuner) ? data.kommuner : [];
+      if (list.length === 0) return null;
+
+      // Exact (diacritic-insensitive) name match wins; otherwise only accept
+      // an unambiguous single hit. Two different kommuner both loosely
+      // matching means we do not actually know which one the user meant.
+      const norm = (s: string) => (s || "").toLowerCase().normalize("NFC").trim();
+      const exact = list.find((k) =>
+        norm(k.kommunenavn) === norm(name) ||
+        norm(k.kommunenavnNorsk) === norm(name) ||
+        (Array.isArray(k.gyldigeNavn) && k.gyldigeNavn.some((g: any) => g?.navn && norm(g.navn) === norm(name)))
+      );
+      const hit = exact || (list.length === 1 ? list[0] : null);
+      return hit ? this.kommuneToGeoResult(hit, name) : null;
+    } catch (err) {
+      console.error(`[geocoding] Kommuneinfo lookup failed for "${name}":`, err);
+      return null;
+    }
+  }
+
+  private async lookupKommuneinfoByNumber(kommunenummer: string): Promise<GeoResult | null> {
+    try {
+      const url = `https://ws.geonorge.no/kommuneinfo/v1/kommuner/${encodeURIComponent(kommunenummer)}?utkoordsys=4258`;
+      const data: any = await this.getJson(url);
+      return data ? this.kommuneToGeoResult(data, kommunenummer) : null;
+    } catch (err) {
+      console.error(`[geocoding] Kommuneinfo lookup failed for kommunenummer ${kommunenummer}:`, err);
+      return null;
+    }
+  }
+
+  private kommuneToGeoResult(k: any, fallbackName: string): GeoResult | null {
+    const coords = k?.punktIOmrade?.coordinates;
+    if (!Array.isArray(coords) || coords.length < 2) return null;
+    const lng = Number(coords[0]);
+    const lat = Number(coords[1]);
+    if (!Number.isFinite(lat) || !Number.isFinite(lng)) return null;
+    return {
+      lat,
+      lng,
+      name: k.kommunenavnNorsk || k.kommunenavn || fallbackName,
+      radiusKm: radiusFromBoundingBox(k?.avgrensningsboks, lat),
+      source: "kommuneinfo",
+      placeType: "Kommune",
+    };
+  }
+
+  /** Shared GET+JSON with the existing 3s abort budget. Non-2xx (incl. Kommuneinfo's 404-on-no-match) → null. */
+  private async getJson(url: string): Promise<any | null> {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 3000); // 3s timeout
+    try {
+      const response = await fetchImpl(url, {
+        signal: controller.signal,
+        headers: { "Accept": "application/json" },
+      });
+      if (!response.ok) return null;
+      return await response.json();
+    } finally {
+      clearTimeout(timeout);
     }
   }
 

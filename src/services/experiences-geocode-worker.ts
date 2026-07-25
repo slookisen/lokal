@@ -179,7 +179,7 @@ export async function experiencesGeocodeTick(
   // honest "ca. posisjon" label instead of claiming address precision.
   const providerFallbackRows = db
     .prepare(
-      `SELECT id, kommune, fylke
+      `SELECT id, kommune, kommunenummer, fylke
          FROM experience_providers
         WHERE lat IS NULL
           AND (
@@ -193,7 +193,7 @@ export async function experiencesGeocodeTick(
         ORDER BY id
         LIMIT ?`
     )
-    .all(limit) as Array<{ id: string; kommune: string | null; fylke: string | null }>;
+    .all(limit) as Array<{ id: string; kommune: string | null; kommunenummer: string | null; fylke: string | null }>;
 
   const updateProviderApprox = db.prepare(
     `UPDATE experience_providers
@@ -204,7 +204,14 @@ export async function experiencesGeocodeTick(
 
   for (const row of providerFallbackRows) {
     try {
-      let geo = row.kommune ? await geocodingService.geocode(row.kommune) : null;
+      // dev-request 2026-07-25 fix 0a: geocodeKommune (Kartverket's kommune
+      // REGISTER, keyed on kommunenummer when we have one) instead of the
+      // free-text geocode() this used to call. Stedsnavn's fuzzy search
+      // resolved «Flakstad» to the Navnegard «Flagstad» near Hamar, so every
+      // Lofoten provider in that kommune was stored 780 km off.
+      let geo = (row.kommune || row.kommunenummer)
+        ? await geocodingService.geocodeKommune(row.kommune, row.kommunenummer)
+        : null;
       if (!geo && row.fylke) {
         geo = await geocodingService.geocode(row.fylke);
       }
@@ -285,16 +292,24 @@ export async function experiencesGeocodeTick(
   // just a genuine "can't resolve yet" -- retried next tick).
   const fallbackRows = db
     .prepare(
-      `SELECT id, kommune, fylke
-         FROM experiences
-        WHERE loc_lat IS NULL
-          AND geo_precision IS NULL
-          AND kommune IS NOT NULL
-          AND kommune <> ''
-        ORDER BY id
+      // LEFT JOIN only to borrow the provider's kommunenummer when it has one
+      // (the `experiences` table has no such column) — an exact register key
+      // beats a fuzzy name lookup. Rows with no provider still work by name.
+      `SELECT e.id AS id, e.kommune AS kommune, e.fylke AS fylke,
+              p.kommunenummer AS kommunenummer
+         FROM experiences e
+         LEFT JOIN experience_providers p
+                ON p.id = e.provider_id
+               AND p.kommune IS NOT NULL
+               AND LOWER(p.kommune) = LOWER(e.kommune)
+        WHERE e.loc_lat IS NULL
+          AND e.geo_precision IS NULL
+          AND e.kommune IS NOT NULL
+          AND e.kommune <> ''
+        ORDER BY e.id
         LIMIT ?`
     )
-    .all(limit) as Array<{ id: string; kommune: string; fylke: string | null }>;
+    .all(limit) as Array<{ id: string; kommune: string; fylke: string | null; kommunenummer: string | null }>;
 
   const updateExperienceKommune = db.prepare(
     `UPDATE experiences
@@ -304,7 +319,8 @@ export async function experiencesGeocodeTick(
 
   for (const row of fallbackRows) {
     try {
-      let geo = await geocodingService.geocode(row.kommune);
+      // dev-request 2026-07-25 fix 0a — kommune REGISTER lookup, see Step D.
+      let geo = await geocodingService.geocodeKommune(row.kommune, row.kommunenummer);
       if (!geo && row.fylke) {
         geo = await geocodingService.geocode(row.fylke);
       }
