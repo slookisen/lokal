@@ -1111,6 +1111,7 @@ if (
         `provider_fallback_unresolved=${r.providers_fallback_unresolved} ` +
         `addr_precision=${r.experiences_address_precision} ` +
         `kommune_precision=${r.experiences_kommune_precision} unresolved=${r.experiences_unresolved} ` +
+        `upgraded_to_address=${r.experiences_upgraded_to_address} ` +
         `errors=${r.errors} duration_ms=${r.duration_ms}`
       );
     } catch (err) {
@@ -1130,6 +1131,7 @@ if (
         `provider_fallback_unresolved=${r.providers_fallback_unresolved} ` +
         `addr_precision=${r.experiences_address_precision} ` +
         `kommune_precision=${r.experiences_kommune_precision} unresolved=${r.experiences_unresolved} ` +
+        `upgraded_to_address=${r.experiences_upgraded_to_address} ` +
         `errors=${r.errors} duration_ms=${r.duration_ms}`
       );
     } catch (err) {

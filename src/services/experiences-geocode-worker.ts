@@ -52,6 +52,51 @@ import { geocodingService } from "./geocoding-service";
 
 const VERTICAL = "experiences";
 
+// ── Fase 1b — is this free text actually an address? ─────────────────
+// dev-request 2026-07-25-reisesok-korridor-discovery-og-naerhetssok.
+//
+// `experiences.meeting_point` is free text written for humans. Measured
+// examples range from a real address ("Sjøgata 21, 8006 Bodø") to things that
+// are not addresses at all ("ved brygga", "vi henter deg på hotellet",
+// "oppmøte 30 min før avgang"). Feeding the second kind to Kartverket's
+// adresse-API is exactly the class of confident-wrong-point bug Fase 0 spent
+// its whole budget killing, so this is deliberately strict and refuses far
+// more than it accepts: a street-ish word followed by a house number is the
+// ONLY shape we accept, and a leading "oppmøte:"-style label is stripped
+// first. When in doubt we return null and the row stays at kommune precision —
+// an honest coarse position beats a precise wrong one.
+export function parseAddressLike(
+  meetingPoint: string | null | undefined
+): { street: string; postnummer: string | null } | null {
+  const raw = (meetingPoint || "").trim();
+  if (!raw || raw.length > 120) return null;
+
+  // Drop a leading label ("Oppmøte: …", "Møtested - …") and take the first
+  // comma-separated segment, which is where a street lives when there is one.
+  const delabelled = raw.replace(/^[^:]{0,20}:\s*/, "");
+  const parts = delabelled.split(",").map((p) => p.trim()).filter(Boolean);
+  if (parts.length === 0) return null;
+
+  // A 4-digit group anywhere in the string is a postnummer candidate. Guarded
+  // against year-like numbers by requiring it to be followed by a word (the
+  // poststed) or to end the string, and to not be part of a longer number.
+  const postMatch = delabelled.match(/(?:^|[\s,])(\d{4})(?=[\s,]|$)/);
+  const postnummer = postMatch ? postMatch[1] : null;
+
+  // "<name…> <number><optional letter>" — the shape of a Norwegian street
+  // address. The name part must contain a letter and must not itself be the
+  // postnummer segment.
+  const streetMatch = parts[0].match(/^([\p{L}][\p{L}\s.'’-]{1,40}?)\s+(\d{1,4}\s?[A-Za-z]?)$/u);
+  if (!streetMatch) return null;
+  const street = `${streetMatch[1].trim()} ${streetMatch[2].replace(/\s+/g, "")}`;
+
+  // A street with no postnummer anywhere is too weak: "Storgata 5" exists in
+  // dozens of kommuner and geocodeOne would happily return the first one.
+  if (!postnummer) return null;
+
+  return { street, postnummer };
+}
+
 export type ExperiencesGeocodeResult = {
   providers_processed: number;
   providers_high: number;
@@ -63,6 +108,10 @@ export type ExperiencesGeocodeResult = {
   experiences_address_precision: number;
   experiences_kommune_precision: number;
   experiences_unresolved: number;
+  /** Fase 1b — kommune-precision rows lifted to address precision this tick. */
+  experiences_upgraded_to_address: number;
+  /** Fase 1b — …of which came from a parseable `meeting_point`. */
+  experiences_upgraded_from_meeting_point: number;
   errors: number;
   duration_ms: number;
 };
@@ -96,6 +145,8 @@ export async function experiencesGeocodeTick(
     experiences_address_precision: 0,
     experiences_kommune_precision: 0,
     experiences_unresolved: 0,
+    experiences_upgraded_to_address: 0,
+    experiences_upgraded_from_meeting_point: 0,
     errors: 0,
     duration_ms: 0,
   };
@@ -336,6 +387,116 @@ export async function experiencesGeocodeTick(
     } catch (err) {
       stats.errors++;
       console.error(`[experiences-geocode] kommune fallback failed for ${row.id}:`, err);
+    }
+  }
+
+  // ─── Step E — kommune-precision → address-precision UPGRADE ────────
+  // dev-request 2026-07-25-reisesok-korridor-discovery-og-naerhetssok, Fase 1b.
+  //
+  // Measured live 2026-07-25: ~427 of 433 experiences are geocoded and 100 %
+  // of them sit at geo_precision='kommune'. ZERO at address precision — so
+  // everything in Bodø honestly reports distance_km 0, and a 10–25 km corridor
+  // search (Fase 2) over those points would be meaningless.
+  //
+  // The cause is an ordering gap, not missing data: Step B only propagates a
+  // provider's address-level position to experiences whose geo_precision IS
+  // NULL. Any experience that Step C reached FIRST (its provider's address
+  // geocoding was still pending, or the provider matched later) is pinned at
+  // 'kommune' forever — even after Step A gives the provider a real street
+  // position. Step E is the missing re-attempt: same join and the same
+  // confidence gate as Step B ('no_match' and Step D's 'approximate' both
+  // excluded — only a genuine address-level provider geocode may claim
+  // geo_precision='address'), but for rows already tagged 'kommune'.
+  //
+  // Strictly an upgrade: kommune → address. Nothing here can move a row the
+  // other way.
+  try {
+    const upgradeRows = db
+      .prepare(
+        `SELECT e.id AS id, p.lat AS lat, p.lon AS lon
+           FROM experiences e
+           JOIN experience_providers p ON p.id = e.provider_id
+          WHERE e.geo_precision = 'kommune'
+            AND p.lat IS NOT NULL
+            AND p.lon IS NOT NULL
+            AND p.geocode_confidence IS NOT NULL
+            AND p.geocode_confidence NOT IN ('no_match', 'approximate')
+          ORDER BY e.id
+          LIMIT ?`
+      )
+      .all(limit) as Array<{ id: string; lat: number; lon: number }>;
+
+    const upgradeToAddress = db.prepare(
+      `UPDATE experiences
+          SET loc_lat = ?, loc_lon = ?, geo_precision = 'address', updated_at = datetime('now')
+        WHERE id = ? AND geo_precision = 'kommune'`
+    );
+
+    for (const row of upgradeRows) {
+      try {
+        upgradeToAddress.run(row.lat, row.lon, row.id);
+        stats.experiences_upgraded_to_address++;
+      } catch (err) {
+        stats.errors++;
+        console.error(`[experiences-geocode] address upgrade failed for ${row.id}:`, err);
+      }
+    }
+  } catch (err) {
+    stats.errors++;
+    console.error("[experiences-geocode] Step E (address upgrade) failed:", err);
+  }
+
+  // ─── Step F — meeting_point as a last-resort address source ────────
+  // Fase 1b, second half. Some experiences have no provider address at all
+  // (unmatched, or the provider row carries none) but their own
+  // `meeting_point` free text happens to BE an address. parseAddressLike()
+  // above accepts only "<street> <number>" plus a postnummer and refuses
+  // everything else — «ved brygga» must stay at kommune precision rather than
+  // become a confident wrong point. Only a real Kartverket adresse-API hit
+  // promotes the row.
+  const meetingPointRows = db
+    .prepare(
+      `SELECT e.id AS id, e.meeting_point AS meeting_point, e.kommune AS kommune,
+              p.poststed AS poststed
+         FROM experiences e
+         LEFT JOIN experience_providers p ON p.id = e.provider_id
+        WHERE e.geo_precision = 'kommune'
+          AND e.meeting_point IS NOT NULL
+          AND e.meeting_point <> ''
+          AND (p.id IS NULL OR p.adresse IS NULL OR p.adresse = '')
+        ORDER BY e.id
+        LIMIT ?`
+    )
+    .all(limit) as Array<{
+    id: string;
+    meeting_point: string | null;
+    kommune: string | null;
+    poststed: string | null;
+  }>;
+
+  const upgradeFromMeetingPoint = db.prepare(
+    `UPDATE experiences
+        SET loc_lat = ?, loc_lon = ?, geo_precision = 'address', updated_at = datetime('now')
+      WHERE id = ? AND geo_precision = 'kommune'`
+  );
+
+  for (const row of meetingPointRows) {
+    try {
+      const parsed = parseAddressLike(row.meeting_point);
+      if (!parsed) continue; // not address-shaped — leave it at kommune, honestly
+      const result = await geocodeOne(
+        parsed.street,
+        parsed.postnummer as string,
+        row.poststed ?? row.kommune ?? "",
+        deps
+      );
+      if (result.confidence === "no_match") continue;
+      upgradeFromMeetingPoint.run(result.lat, result.lng, row.id);
+      stats.experiences_upgraded_to_address++;
+      stats.experiences_upgraded_from_meeting_point++;
+    } catch (err) {
+      stats.errors++;
+      console.error(`[experiences-geocode] meeting_point upgrade failed for ${row.id}:`, err);
     }
   }
 
