@@ -1187,6 +1187,59 @@ if (process.env.RFB_DISABLE_AGENTS_GEOCODE !== "1") {
   }, 60 * 60_000);
 }
 
+// ─── dev-request 2026-07-25-reisesok-korridor-discovery-og-naerhetssok
+// (Fase 1a follow-up): postal-code backfill worker ───────────────────
+//
+// Daniel: «Kan du lage en fiks for å finne postnummer på de som mangler kun
+// dette?» — 13.2 % of active producers (measured, n=250 uniform random) have a
+// real street address but no postnummer, which is the ONLY thing keeping them
+// off the geocode worker's Tier A. This resolves the four digits from
+// Kartverket (conservatively — it refuses on any ambiguity rather than write a
+// postnummer that would become a precise-but-wrong coordinate); the geocode
+// worker above then places them at address precision on its next pass.
+//
+// Same shape as the geocode block: first tick shortly after boot, hourly
+// after that, up to 50 rows per tick, every attempt timestamped so the worker
+// rotates through the whole queue instead of re-processing its head. The boot
+// tick is deliberately offset to 45 s — 15 s behind the geocode worker's — so
+// the two do not open their first burst of Kartverket requests simultaneously.
+// The queue is ~200 rows total and shrinks as it succeeds, so this worker goes
+// quiet on its own.
+//
+// Disable on dev / CI with RFB_DISABLE_POSTAL_BACKFILL=1.
+// Manual/batched runs + dry-run: POST /api/marketplace/admin/agents/postal-backfill.
+if (process.env.RFB_DISABLE_POSTAL_BACKFILL !== "1") {
+  const logPostalBackfill = (label: string, r: {
+    processed: number; resolved: number; resolved_inline: number; resolved_lookup: number;
+    ambiguous: number; no_match: number; unusable: number; errors: number; duration_ms: number;
+  }) => {
+    console.log(
+      `[postal-backfill] ${label} processed=${r.processed} ` +
+      `resolved=${r.resolved} (inline=${r.resolved_inline} lookup=${r.resolved_lookup}) ` +
+      `ambiguous=${r.ambiguous} no_match=${r.no_match} unusable=${r.unusable} ` +
+      `errors=${r.errors} duration_ms=${r.duration_ms}`
+    );
+  };
+
+  setTimeout(async () => {
+    try {
+      const { postalBackfillTick } = await import("./services/agents-postal-backfill");
+      logPostalBackfill("boot-tick", await postalBackfillTick(50));
+    } catch (err) {
+      console.error("[postal-backfill] boot-tick failed:", err);
+    }
+  }, 45_000);
+
+  setInterval(async () => {
+    try {
+      const { postalBackfillTick } = await import("./services/agents-postal-backfill");
+      logPostalBackfill("tick", await postalBackfillTick(50));
+    } catch (err) {
+      console.error("[postal-backfill] tick failed:", err);
+    }
+  }, 60 * 60_000);
+}
+
 // ─── booking-flyt-v1 slice 2 (dev-request 2026-07-14-booking-flyt-v1):
 // pre-visit booking followups — producer reminder + auto-expiry ───────
 //
