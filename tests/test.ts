@@ -32936,3 +32936,30 @@ runSerial(async () => {
     failures.push("experiences-seo-gsc-fixes: unexpected error: " + String(err?.message || err));
   }
 });
+
+// dev-request 2026-07-25-gardssalg-a2a-nl-routing: POST /a2a message/send on
+// opplevagent.no ALWAYS searched the generic `experiences` table, never the
+// gårdssalg (farm-sale drink producer) vertical in `experience_providers`.
+// Adds detectGardssalgIntent() (producer-type keyword table + gårdssalg-only
+// trigger words, both via matchesAsWordPrefix) checked BEFORE the generic
+// "Default: discover" fallback in handleExperiencesMessageSend
+// (src/routes/experiences-a2a.ts), routing a match to
+// searchGardssalgProviders() and formatting each row exactly like the
+// discover_gardssalg MCP tool. Same in-memory-DB + direct-handler-call
+// pattern as opplevelser-discover-relax.test.ts, runs via runSerial() for
+// the same reason as the suites above.
+runSerial(async () => {
+  console.log("\n── experiences-a2a (gardssalg): NL routing to gårdssalg producers ──");
+  try {
+    const { runExperiencesA2aGardssalgTests } = require("../src/routes/experiences-a2a.test") as
+      typeof import("../src/routes/experiences-a2a.test");
+    const eag = await runExperiencesA2aGardssalgTests({ log: false });
+    passed += eag.passed;
+    failed += eag.failed;
+    for (const f of eag.failures) failures.push("experiences-a2a (gardssalg): " + f);
+    console.log(`  experiences-a2a (gardssalg): ${eag.passed} passed, ${eag.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("experiences-a2a (gardssalg): unexpected error: " + String(err?.message || err));
+  }
+});
