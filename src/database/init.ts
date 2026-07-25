@@ -28,6 +28,16 @@ export function __setDbForTesting(injected: Database.Database): void {
 // initSchema when the module-level `db` is null, so a test that injects its own
 // DB via __setDbForTesting must call this to actually create the tables.
 // Never call from production code.
+// Test-only companion to __setDbForTesting: returns whatever handle the
+// singleton currently holds (null if none has been opened/injected yet), so a
+// suite that swaps in its own in-memory DB can put the previous one back when
+// it finishes. Without this a swapping suite leaves the singleton pointing at
+// its own throwaway DB for every block that runs after it.
+// Never call from production code.
+export function __peekDbForTesting(): Database.Database | null {
+  return db;
+}
+
 export function __initSchemaForTesting(injected: Database.Database): void {
   initSchema(injected);
 }
@@ -3117,6 +3127,88 @@ function initSchema(db: Database.Database): void {
   `);
   db.exec(`CREATE INDEX IF NOT EXISTS idx_consumer_usage_ledger_key_id ON consumer_usage_ledger(key_id)`);
   db.exec(`CREATE INDEX IF NOT EXISTS idx_consumer_usage_ledger_day ON consumer_usage_ledger(day)`);
+
+  // ─── dev-request 2026-07-25-reisesok-korridor-discovery-og-naerhetssok,
+  // Fase 1a: coordinate provenance for `agents` ────────────────────────────
+  //
+  // Measured live 2026-07-25: 948 of 1 499 active producers (63.2 %) have
+  // lat/lng, 551 (36.8 %) have NONE and are therefore invisible to every
+  // geo-filtered search. The coordinates that DO exist are seed-time
+  // hardcoded (src/_seeds/seed-expansion-v2.ts:55,73) and frequently a city
+  // centroid rather than the farm — but nothing in the schema recorded that,
+  // so search happily rendered "2,4 km unna" off a centroid. There was also
+  // no geocoding worker for `agents` at all (dental and experiences both have
+  // one). agents-geocode-worker.ts is that worker; these columns are its
+  // state.
+  //
+  //   geo_precision        : 'address' | 'postal' | 'city' | 'kommune' | NULL.
+  //                          Vocabulary + ranking + the honesty rule live in
+  //                          services/geo-precision.ts. NULL means "unknown
+  //                          provenance" — every pre-existing row — and is
+  //                          deliberately NOT backfilled to 'city': that would
+  //                          silently strip the distance figure from 948
+  //                          producers on deploy on a guess. The worker
+  //                          resolves rows out of NULL into an honest tier.
+  //   geocode_source       : which service produced the current position
+  //                          ('kartverket_adresse' | 'kartverket_stedsnavn' |
+  //                          'kommuneinfo' | …). Mirrors dental_agents.
+  //                          geocode_source / experience_providers.
+  //                          geocode_source.
+  //   geocode_outcome      : last attempt's result — 'high' | 'medium' | 'low'
+  //                          (the adresse-API retry ladder's confidence tiers,
+  //                          same vocabulary as dental_agents.
+  //                          geocode_confidence), 'city_centroid',
+  //                          'no_match', or 'skipped_no_upgrade'.
+  //   geocode_attempted_at : ISO-8601 stamp written on EVERY attempt whatever
+  //                          the outcome. This is the ROTATION key — same
+  //                          lesson as agent_knowledge.last_enrichment_
+  //                          attempt_at above (dev-request 2026-07-19): a
+  //                          selector that orders by a column the failure
+  //                          paths never write re-picks the identical batch
+  //                          forever. Ordering is "never attempted first,
+  //                          then oldest attempt", so the worker walks the
+  //                          whole universe before repeating.
+  //
+  //   geocode_prev_lat     : the lat/lng the row held immediately BEFORE this
+  //   geocode_prev_lng       worker last overwrote it, written in the same
+  //                          UPDATE (review follow-up 10). Tier A replaces
+  //                          seed coordinates in place, so without this the
+  //                          dev-request's "Fase 1: kan stoppes" rollback was
+  //                          incomplete — stopping the worker restores
+  //                          nothing, and the pre-existing (possibly correct,
+  //                          hand-placed) coordinate is gone. With it, a full
+  //                          revert is one statement:
+  //                            UPDATE agents
+  //                               SET lat = geocode_prev_lat,
+  //                                   lng = geocode_prev_lng,
+  //                                   geo_precision = NULL,
+  //                                   geocode_source = NULL,
+  //                                   geocode_outcome = NULL
+  //                             WHERE geocode_prev_lat IS NOT NULL;
+  //                          Only ONE generation deep on purpose: this is a
+  //                          rollback latch for the backfill, not a history
+  //                          table. NULL prev means "this row had no
+  //                          coordinates before" — reverting it sets lat/lng
+  //                          back to NULL, which is correct.
+  //
+  // Additive + idempotent ALTERs, same defensive try/catch idiom as every
+  // migration above.
+  for (const stmt of [
+    `ALTER TABLE agents ADD COLUMN geo_precision TEXT`,
+    `ALTER TABLE agents ADD COLUMN geocode_source TEXT`,
+    `ALTER TABLE agents ADD COLUMN geocode_outcome TEXT`,
+    `ALTER TABLE agents ADD COLUMN geocode_attempted_at TEXT`,
+    `ALTER TABLE agents ADD COLUMN geocode_prev_lat REAL`,
+    `ALTER TABLE agents ADD COLUMN geocode_prev_lng REAL`,
+  ]) {
+    try { db.exec(stmt); } catch { /* already exists — expected */ }
+  }
+  try {
+    db.exec(
+      `CREATE INDEX IF NOT EXISTS idx_agents_geocode_attempted_at
+         ON agents(geocode_attempted_at)`
+    );
+  } catch { /* index already created */ }
 
 }
 

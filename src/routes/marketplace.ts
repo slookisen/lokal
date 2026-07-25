@@ -1,5 +1,5 @@
 import { Router, Request, Response } from "express";
-import { marketplaceRegistry } from "../services/marketplace-registry";
+import { marketplaceRegistry, type DiscoverMeta } from "../services/marketplace-registry";
 import { getConfig } from "../config/vertical-config";
 import { AgentRegistrationSchema, AdminRegistrationSchema, DiscoveryQuerySchema } from "../models/marketplace";
 import { interactionLogger } from "../services/interaction-logger";
@@ -26,6 +26,7 @@ import { findOrgnumberByName } from "../services/brreg-client";
 import { isDisplayablePhone } from "../services/contact-normalizer";
 import { isJunkDescription } from "../services/description-quality";
 import { isJunkEmail } from "../services/gardssalg-rfb-enrich";
+import { isValidLatLng, resolveSearchRadiusKm, buildSearchNote, formatPlaceLabel } from "../utils/geo-query";
 
 // ── PR-29 v3: pure helper for Place Details (New) request params ──────────────
 // Exported so tests can assert the URL structure without touching the handler.
@@ -376,9 +377,12 @@ router.post("/discover", (req: Request, res: Response) => {
       contact: buildContactBlock(r.agent.id),
     }));
 
-    // Auto-start conversations with top matches
+    // dev-request 2026-07-25 fix 0g(ii): structured discovery is a read-only
+    // question too (lokal_discover declares readOnlyHint:true and proxies
+    // here). Starting seller conversations is now an explicit opt-in via
+    // { start_conversation: true } in the body, same contract as GET /search.
     const conversations: any[] = [];
-    if (results.length > 0) {
+    if (req.body?.start_conversation === true && results.length > 0) {
       const queryDesc = [query.categories?.join(", "), query.tags?.join(", ")].filter(Boolean).join(" — ") || "strukturert søk";
       for (const r of results.slice(0, 2)) {
         try {
@@ -422,42 +426,62 @@ router.post("/discover", (req: Request, res: Response) => {
 // Example: GET /search?q=ferske+økologiske+grønnsaker+nær+Grünerløkka
 
 router.get("/search", async (req: Request, res: Response) => {
-  const q = req.query.q as string;
-  if (!q) {
-    res.status(400).json({ success: false, error: "Mangler ?q= parameter" });
+  const frontendLat = parseFloat(req.query.lat as string);
+  const frontendLng = parseFloat(req.query.lng as string);
+  const hasBrowserCoords = isValidLatLng(frontendLat, frontendLng);
+
+  // dev-request 2026-07-25 fix 0f: `q` is OPTIONAL when lat+lng are supplied.
+  // Coordinates alone ("what is near me?") is a complete, valid search — this
+  // endpoint used to hard-400 without ?q=, so proximity search was impossible
+  // without first typing a place name.
+  const q = typeof req.query.q === "string" ? req.query.q : "";
+  if (!q && !hasBrowserCoords) {
+    res.status(400).json({
+      success: false,
+      error: "Mangler ?q= parameter (eller ?lat=&lng= for nærhetssøk)",
+    });
     return;
   }
 
   // Parse natural language into structured query (categories, tags, product terms)
   const parsed = marketplaceRegistry.parseNaturalQuery(q);
+  // dev-request 2026-07-25 fix 0e: «nær meg» is an intent, not noise.
+  const proximityIntent = !!(parsed as any)._proximityIntent;
 
   // ── Location resolution (priority order) ──
   // 1. Frontend geolocation (user clicked "Nær meg")
   // 2. Location extracted from query text via geocoding ("tomat i Nesbyen")
   // 3. No location → results from whole country
 
-  const frontendLat = parseFloat(req.query.lat as string);
-  const frontendLng = parseFloat(req.query.lng as string);
   const heleNorge = req.query.heleNorge === "true"; // explicit opt-out of geo filter
 
   let geoSource = "none";
+  let geoPlaceLabel: string | undefined;
 
   if (!heleNorge) {
-    if (!isNaN(frontendLat) && !isNaN(frontendLng)) {
+    if (hasBrowserCoords) {
       // User's browser geolocation
       parsed.location = { lat: frontendLat, lng: frontendLng };
-      parsed.maxDistanceKm = parseFloat(req.query.radius as string) || 30;
+      parsed.maxDistanceKm = resolveSearchRadiusKm(req.query.radius);
       geoSource = "browser";
-    } else if (!parsed.location) {
+      geoPlaceLabel = "din posisjon";
+    } else if (!parsed.location && q) {
       // Try to extract place name from query and geocode it
       const geoResult = await geocodingService.extractAndGeocode(q);
       if (geoResult) {
         parsed.location = { lat: geoResult.lat, lng: geoResult.lng };
         parsed.maxDistanceKm = geoResult.radiusKm;
         geoSource = geoResult.source;
+        geoPlaceLabel = formatPlaceLabel(geoResult.name);
       }
     }
   }
+
+  // dev-request 2026-07-25 fix 0e: the user asked for "near me" but we have no
+  // position — say so instead of silently returning a nationwide trust-ranked
+  // list. Clients (web, MCP, any AI assistant) can act on this by asking for
+  // or supplying coordinates.
+  const needsLocation = proximityIntent && !parsed.location && !heleNorge;
 
   // Preserve internal fields through schema parsing (Zod strips unknown fields)
   const productTerms = parsed._productTerms;
@@ -472,7 +496,13 @@ router.get("/search", async (req: Request, res: Response) => {
   if (nameQuery) (query as any)._nameQuery = nameQuery;
 
   const startTime = Date.now();
-  let results = marketplaceRegistry.discover(query);
+  // REVIEW FOLLOW-UP B1: discover() can widen a NAME search past the caller's
+  // radius all on its own (nothing in range → keep the far-away name matches).
+  // The auto-expand ladder below never runs in that case (wasNameMatch
+  // short-circuits it), so without this out-param the response would keep
+  // claiming geoFiltered:true for results hundreds of km outside the radius.
+  const discoverMeta: DiscoverMeta = {};
+  let results = marketplaceRegistry.discover(query, discoverMeta);
 
   // ── Auto-expanding radius ──
   // If geo-filtered and too few results, widen the search automatically.
@@ -482,8 +512,23 @@ router.get("/search", async (req: Request, res: Response) => {
 
   // Don't expand if we got results from a name-based search — those are exact matches
   const wasNameMatch = nameQuery && results.length > 0 && results[0]?.matchReasons?.some((r: string) => r.startsWith("Navnematch"));
+
+  // dev-request 2026-07-25 fix 0b: track what the auto-expand actually did.
+  // Before this, the expansion built a NEW query object and never touched
+  // `parsed`, so line ~579 still reported geoFiltered:true after the geo
+  // filter had been dropped entirely. Live proof 2026-07-25: `honning Vadsø`
+  // returned Tønsberg / Melhus / Røros with geoFiltered:true,
+  // geoSource:"hardcoded" and no note whatsoever.
+  let appliedRadiusKm = parsed.maxDistanceKm;
+  // Seeded from discover()'s own relaxation (B1) so the name-search path and
+  // the auto-expand path report identically.
+  let geoDropped = !!discoverMeta.geoRelaxed;
+
   if (parsed.location && results.length < MIN_RESULTS && !heleNorge && !wasNameMatch) {
-    for (const expandedRadius of RADIUS_STEPS) {
+    // Only ever WIDEN. RADIUS_STEPS is a fixed ladder, so a caller who asked
+    // for 90 km used to be silently narrowed to 50 km on the first step.
+    const steps = RADIUS_STEPS.filter(r => r > (parsed.maxDistanceKm ?? 0));
+    for (const expandedRadius of steps) {
       if (results.length >= MIN_RESULTS) break;
       const expandedQuery = DiscoveryQuerySchema.parse({
         ...parsed,
@@ -493,6 +538,7 @@ router.get("/search", async (req: Request, res: Response) => {
       });
       if (productTerms) (expandedQuery as any)._productTerms = productTerms;
       results = marketplaceRegistry.discover(expandedQuery);
+      appliedRadiusKm = expandedRadius;
     }
 
     // Last resort: no geo filter at all (show whole country)
@@ -506,6 +552,8 @@ router.get("/search", async (req: Request, res: Response) => {
       });
       if (productTerms) (noGeoQuery as any)._productTerms = productTerms;
       results = marketplaceRegistry.discover(noGeoQuery);
+      geoDropped = true;
+      appliedRadiusKm = undefined;
     }
   }
 
@@ -566,6 +614,18 @@ router.get("/search", async (req: Request, res: Response) => {
   // Only for bot/agent traffic — not for humans browsing the site.
   // ChatGPT Custom GPT, OpenAI agents, etc. have identifiable UA strings.
   // Humans use the /sok frontend which calls discover() directly.
+  //
+  // dev-request 2026-07-25 fix 0g(ii) — SECURITY. This fired for EVERY
+  // JSON-accepting client, which is every MCP/AI caller (src/mcp/server.ts's
+  // lokal_search proxies straight to this endpoint, and it too declares
+  // readOnlyHint:true). An assistant merely exploring on a traveller's behalf
+  // therefore opened seller conversations with up to two farmers who had asked
+  // for none of it. Search is read-only by default now; a caller that
+  // genuinely wants to reach the producer opts in with ?start_conversation=true.
+  // The intentional, user-initiated write paths are untouched: POST /a2a
+  // message/send (a buyer agent addressing a seller), the /sok page's own
+  // "a human actually searched here" log, and the cart/order flow.
+  const wantsConversation = String(req.query.start_conversation ?? "").toLowerCase() === "true";
   const ua = (req.headers["user-agent"] || "").toLowerCase();
   const acceptHeader = (req.headers["accept"] || "").toLowerCase();
   // Treat all JSON-accepting clients as agents (ChatGPT JIT plugin, MCP clients, etc.)
@@ -576,7 +636,7 @@ router.get("/search", async (req: Request, res: Response) => {
     || ua.includes("node-fetch") || ua.includes("axios") || ua.includes("httpie");
 
   const conversations: any[] = [];
-  if (isAgent && results.length > 0) {
+  if (wantsConversation && isAgent && results.length > 0) {
     for (const r of results.slice(0, 2)) {
       try {
         const conv = conversationService.startConversation({
@@ -597,12 +657,30 @@ router.get("/search", async (req: Request, res: Response) => {
   }
 
   const safeQuery = q.replace(/<[^>]*>/g, "").replace(/javascript:/gi, "");
+  const geoFiltered = !!parsed.location && !heleNorge && !geoDropped;
+  if (geoDropped) appliedRadiusKm = undefined;
+
   res.json({
     success: true,
     query: safeQuery,
-    parsed: { ...parsed, _nameQuery: nameQuery || undefined },
-    geoFiltered: !!parsed.location && !heleNorge,
-    geoSource,
+    // When geo was dropped, the echoed `parsed` must not claim a location
+    // either — it is the block AI clients read to explain the result set.
+    parsed: {
+      ...parsed,
+      location: geoDropped ? undefined : parsed.location,
+      maxDistanceKm: geoDropped ? undefined : appliedRadiusKm,
+      _nameQuery: nameQuery || undefined,
+      _proximityIntent: proximityIntent || undefined,
+    },
+    geoFiltered,
+    geoSource: geoDropped ? "none" : geoSource,
+    // Honest radius actually applied (may be wider than the one requested,
+    // because of the auto-expand ladder above).
+    geoRadiusKm: geoFiltered ? appliedRadiusKm : undefined,
+    // Same shape discoverExperiencesRelaxed() already uses on OpplevAgent.
+    relaxed_filters: geoDropped ? ["geo"] : undefined,
+    needs_location: needsLocation || undefined,
+    note: buildSearchNote({ geoDropped, geoPlaceLabel, needsLocation, nameQuery }),
     count: enrichedResults.length,
     results: enrichedResults,
     conversations,
@@ -5714,6 +5792,73 @@ router.post("/admin/homepage-provenance-batch", async (req: Request, res: Respon
       parked_now: parkedNow,
     },
   });
+});
+
+// ─── POST /admin/agents/geocode-batch ────────────────────────────────
+// dev-request 2026-07-25-reisesok-korridor-discovery-og-naerhetssok, Fase 1a.
+//
+// Manual/routine trigger for services/agents-geocode-worker.ts, the RFB
+// counterpart of the dental + experiences geocode workers. The worker also
+// runs on its own hourly interval (src/index.ts), exactly like those two; this
+// endpoint exists so a backfill can be driven in controlled batches and — the
+// important part — so a run can be REHEARSED against prod first.
+//
+// Body (all optional):
+//   { limit?: number (1-200, default 50), dry_run?: boolean (default false) }
+//
+// dry_run: true performs the identical Kartverket lookups and reports the
+// changes it WOULD make in `planned`, but takes no write at all — not even the
+// attempt timestamp. Verify with the `status` block: it is captured before and
+// after, and a dry run must leave it byte-identical.
+//
+// Auth: X-Admin-Key, same getAdminKey() convention as every other admin
+// endpoint in this file.
+router.post("/admin/agents/geocode-batch", async (req: Request, res: Response) => {
+  const expectedKey = getAdminKey();
+  if (!expectedKey) { res.status(503).json({ success: false, error: "Admin not configured" }); return; }
+  const adminKey = (req.headers["x-admin-key"] as string) || "";
+  if (!adminKey || adminKey !== expectedKey) {
+    res.status(403).json({ success: false, error: "Krever X-Admin-Key header" });
+    return;
+  }
+
+  const body = (req.body || {}) as { limit?: unknown; dry_run?: unknown };
+
+  const {
+    agentsGeocodeTick, agentsGeocodeQueueStatus, clampGeocodeBatchLimit, parseDryRunFlag,
+  } = require("../services/agents-geocode-worker") as typeof import("../services/agents-geocode-worker");
+
+  const limit = clampGeocodeBatchLimit(body.limit);
+
+  // REVIEW B4: strict boolean. `dry_run === true` fails OPEN — {"dry_run":"true"}
+  // would have run a REAL write against prod, on the one endpoint whose whole
+  // purpose is rehearsing against prod. Reject rather than interpret.
+  const dry = parseDryRunFlag(body.dry_run);
+  if (!dry.ok) {
+    res.status(400).json({ success: false, error: dry.error });
+    return;
+  }
+  const dryRun = dry.dryRun;
+
+  try {
+
+    const before = agentsGeocodeQueueStatus();
+    const result = await agentsGeocodeTick(limit, { dryRun });
+    const after = agentsGeocodeQueueStatus();
+
+    res.json({
+      success: true,
+      data: {
+        ...result,
+        limit,
+        status_before: before,
+        status_after: after,
+      },
+    });
+  } catch (err: any) {
+    console.error("[agents-geocode] admin batch failed:", err);
+    res.status(500).json({ success: false, error: err?.message || "Geocode batch failed" });
+  }
 });
 
 export default router;

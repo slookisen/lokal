@@ -26,6 +26,7 @@ import { getDb } from "../database/init";
 import { isDisplayablePhone } from "../services/contact-normalizer";
 import { isJunkDescription } from "../services/description-quality";
 import { geocodingService } from "../services/geocoding-service";
+import { isValidLatLng, resolveSearchRadiusKm } from "../utils/geo-query";
 import { computeEffectiveAvailability } from "../services/supply-graph";
 import {
   createCart as svcCreateCart,
@@ -37,7 +38,10 @@ import {
 } from "../services/cart-service";
 
 
-import { conversationService, buildRequestMeta } from "../services/conversation-service";
+// dev-request 2026-07-25 fix 0g(ii): conversationService is deliberately NOT
+// imported here any more — no tool served over /mcp starts a seller
+// conversation. buildRequestMeta stays for session/traffic classification.
+import { buildRequestMeta } from "../services/conversation-service";
 
 const router = Router();
 
@@ -230,7 +234,10 @@ export async function enrichParsedWithGeo(
   }
 }
 
-function registerTools(
+// Exported for testing (dev-request 2026-07-25-reisesok Fase 0g): lets a test
+// capture every tool's inputSchema + handler through a duck-typed server,
+// without standing up a transport.
+export function registerTools(
   server: McpServer,
   getClientIdentity?: () => string | undefined,
   getRequestMeta?: () => import("../services/conversation-service").RequestMeta | undefined,
@@ -240,9 +247,17 @@ function registerTools(
     "lokal_search",
     {
       title: "Search local food producers",
-      description: "Search for local food producers in Norway AND get their products with prices. ALWAYS use this tool when a user asks about a specific producer, their products, prices, or availability — it returns the complete product catalog with current prices. Also use for general searches like 'vegetables near Oslo'. Supports searching by producer name (e.g. 'Bjørndal Gård') or by product/location (e.g. 'organic honey Trondheim'). Returns contact info, full product list with prices, and starts a conversation with the producer.",
+      // dev-request 2026-07-25 fix 0g(i): the description now tells the model
+      // that this is ALSO the proximity/"near me" tool and that it should pass
+      // the user's coordinates when it knows them — previously there was no
+      // way to express "near me" at all, so every location-aware question was
+      // answered from a place NAME or not at all.
+      description: "Search for local food producers in Norway AND get their products with prices. ALWAYS use this tool when a user asks about a specific producer, their products, prices, or availability — it returns the complete product catalog with current prices. Also use for general searches like 'vegetables near Oslo'. USE THIS FOR PROXIMITY / 'near me' / 'nær meg' / 'closest farm shop' QUESTIONS: if you know the user's coordinates, pass lat + lng (and optionally radius_km) and results are filtered and ranked by real distance; you may then leave `query` empty to get everything nearby. Supports searching by producer name (e.g. 'Bjørndal Gård') or by product/location (e.g. 'organic honey Trondheim'). Returns contact info and the full product list with prices. Read-only: it never contacts a producer on the user's behalf.",
       inputSchema: {
-        query: z.string().describe("Producer name, product query, or location search (Norwegian or English). Examples: 'Bjørndal Gård Oppdal', 'beefburger pris', 'ost Trondheim'"),
+        query: z.string().default("").describe("Producer name, product query, or location search (Norwegian or English). Examples: 'Bjørndal Gård Oppdal', 'beefburger pris', 'ost Trondheim'. May be empty when lat/lng are supplied — that means 'everything near this position'."),
+        lat: z.number().min(-90).max(90).optional().describe("User's latitude (WGS84). Supply this for 'near me' searches when you know where the user is."),
+        lng: z.number().min(-180).max(180).optional().describe("User's longitude (WGS84). Must be supplied together with lat."),
+        radius_km: z.number().min(1).max(500).optional().describe("Search radius in km around lat/lng. Default 30. Typical: 15 in a city, 50–100 in rural Norway."),
         limit: z.number().min(1).max(50).default(10).describe("Max results"),
       },
       annotations: {
@@ -253,33 +268,67 @@ function registerTools(
         openWorldHint: false,
       },
     },
-    async ({ query, limit }) => {
-      const parsed = marketplaceRegistry.parseNaturalQuery(query);
-      await enrichParsedWithGeo(parsed, query);
+    async ({ query, lat, lng, radius_km, limit }) => {
+      const q = query || "";
+      const parsed = marketplaceRegistry.parseNaturalQuery(q);
+
+      // fix 0g(i): explicit coordinates beat any place name in the text —
+      // the assistant knows where the user actually is, the text may not say.
+      const hasCoords = isValidLatLng(lat as number, lng as number);
+      if (hasCoords) {
+        parsed.location = { lat: lat as number, lng: lng as number };
+        parsed.maxDistanceKm = resolveSearchRadiusKm(radius_km);
+      } else {
+        await enrichParsedWithGeo(parsed, q);
+      }
+
+      // fix 0e: proximity intent with no position — tell the assistant to
+      // ask for/supply one rather than silently answering nationwide.
+      if (!parsed.location && (parsed as any)._proximityIntent) {
+        return {
+          content: [{
+            type: "text" as const,
+            text:
+              "📍 Dette søket spør etter noe i nærheten, men jeg vet ikke hvor brukeren er. " +
+              "Spør brukeren om sted eller posisjon, og kall lokal_search igjen med `lat` og `lng` " +
+              "(og gjerne `radius_km`).\n\n" +
+              "This search asks for something nearby but no position was supplied. Ask the user " +
+              "where they are, then call lokal_search again with `lat` and `lng` (optionally `radius_km`).",
+          }],
+        };
+      }
+
+      if (!q && !hasCoords) {
+        return {
+          content: [{
+            type: "text" as const,
+            text: "Oppgi enten `query` (fritekst) eller `lat` + `lng` (nærhetssøk). / Supply either `query` or `lat` + `lng`.",
+          }],
+        };
+      }
+
       const results = marketplaceRegistry.discover({ ...parsed, limit: limit || 10, offset: 0 });
 
       if (!results?.length) {
-        return { content: [{ type: "text" as const, text: `Ingen resultater for "${query}". Prøv et bredere søk.` }] };
+        const where = hasCoords ? `innenfor ${parsed.maxDistanceKm} km` : `"${q}"`;
+        return { content: [{ type: "text" as const, text: `Ingen resultater for ${where}. Prøv et bredere søk.` }] };
       }
 
-      // Auto-start conversations with top match so seller agent responds
+      // dev-request 2026-07-25 fix 0g(ii) — SECURITY. This used to call
+      // startConversation() for the top 2 matches on EVERY invocation, despite
+      // the `readOnlyHint: true` annotation a few lines above. An assistant
+      // merely exploring on a traveller's behalf therefore opened seller
+      // conversations with farmers who had asked for none of it. Searching is
+      // now genuinely read-only: the tool returns contact details and the
+      // profile link; actually reaching a producer stays an explicit act (the
+      // lokal_cart_* tools, POST /a2a message/send, or a human clicking
+      // through). Nothing consumed the removed links programmatically — they
+      // were only rendered into the assistant's prose.
       const BASE = process.env.BASE_URL || "https://rettfrabonden.com";
-      const convLinks: string[] = [];
-      for (const r of results.slice(0, 2)) {
-        try {
-          const conv = conversationService.startConversation({
-            sellerAgentId: r.agent.id,
-            queryText: query,
-            source: "mcp",
-            clientIdentity: getClientIdentity?.(),
-            requestMeta: getRequestMeta?.(), // (item 3) internal-traffic classification
-            autoRespond: true,
-          });
-          convLinks.push(`💬 [Samtale med ${conv.sellerAgentName}](${BASE}/samtale/${conv.id})`);
-        } catch { /* non-critical */ }
-      }
 
-      const header = `🥬 **Lokal mat-søk: "${query}"** — fant ${results.length} produsenter:\n`;
+      const header = hasCoords
+        ? `🥬 **Lokal mat nær deg${q ? ` — "${q}"` : ""}** (innenfor ${parsed.maxDistanceKm} km) — fant ${results.length} produsenter:\n`
+        : `🥬 **Lokal mat-søk: "${q}"** — fant ${results.length} produsenter:\n`;
 
       // If name match (1-3 results from specific query), include full product list
       // so AI can answer product/price questions directly without a second tool call
@@ -287,7 +336,15 @@ function registerTools(
 
       const lines = results.map((r: any, i: number) => {
         const agent = r.agent;
-        const dist = agent.location?.distanceKm ? ` — ${agent.location.distanceKm.toFixed(1)} km unna` : "";
+        // dev-request 2026-07-25 Fase 1c (honesty rule): distanceKm is only
+        // present for address-precision producers. A centroid-precision row
+        // carries distanceLabel ("i Vadsø-området") instead — an assistant
+        // must never be handed a km figure we made up off a city centroid.
+        const dist = agent.location?.distanceKm
+          ? ` — ${agent.location.distanceKm.toFixed(1)} km unna`
+          : agent.location?.distanceLabel
+            ? ` — ${agent.location.distanceLabel} (omtrentlig posisjon)`
+            : "";
         const summary = getAgentKnowledgeSummary(agent.id);
 
         if (isSpecificQuery) {
@@ -318,11 +375,7 @@ function registerTools(
         }
       });
 
-      const convSection = convLinks.length
-        ? `\n\n---\n**Samtaler startet automatisk:**\n${convLinks.join("\n")}`
-        : "";
-
-      return { content: [{ type: "text" as const, text: header + "\n" + lines.join("\n\n") + convSection }] };
+      return { content: [{ type: "text" as const, text: header + "\n" + lines.join("\n\n") }] };
     }
   );
 
@@ -356,36 +409,22 @@ function registerTools(
         return { content: [{ type: "text" as const, text: "Ingen produsenter funnet med disse filtrene." }] };
       }
 
-      // Auto-start conversation with top match
-      const BASE = process.env.BASE_URL || "https://rettfrabonden.com";
-      const convLinks: string[] = [];
-      const queryDesc = [categories?.join(", "), tags?.join(", ")].filter(Boolean).join(" — ") || "strukturert søk";
-      for (const r of results.slice(0, 2)) {
-        try {
-          const conv = conversationService.startConversation({
-            sellerAgentId: r.agent.id,
-            queryText: queryDesc,
-            source: "mcp",
-            clientIdentity: getClientIdentity?.(),
-            requestMeta: getRequestMeta?.(), // (item 3) internal-traffic classification
-            autoRespond: true,
-          });
-          convLinks.push(`💬 [Samtale med ${conv.sellerAgentName}](${BASE}/samtale/${conv.id})`);
-        } catch { /* non-critical */ }
-      }
+      // dev-request 2026-07-25 fix 0g(ii): read-only means read-only — see
+      // the same note on lokal_search above. No conversation is started here.
 
       const header = `🔍 **Strukturert søk** — ${results.length} resultater:\n`;
       const lines = results.map((r: any, i: number) => {
-        const dist = r.agent.location?.distanceKm ? ` (${r.agent.location.distanceKm.toFixed(1)} km)` : "";
+        // Fase 1c honesty rule — see the same note in lokal_search above.
+        const dist = r.agent.location?.distanceKm
+          ? ` (${r.agent.location.distanceKm.toFixed(1)} km)`
+          : r.agent.location?.distanceLabel
+            ? ` (${r.agent.location.distanceLabel}, omtrentlig)`
+            : "";
         const summary = getAgentKnowledgeSummary(r.agent.id);
         return formatAgentCompact(r.agent, i + 1, summary.contact, summary.productSummary, getClientIdentity?.()) + dist;
       });
 
-      const convSection = convLinks.length
-        ? `\n\n---\n**Samtaler startet automatisk:**\n${convLinks.join("\n")}`
-        : "";
-
-      return { content: [{ type: "text" as const, text: header + "\n" + lines.join("\n\n") + convSection }] };
+      return { content: [{ type: "text" as const, text: header + "\n" + lines.join("\n\n") }] };
     }
   );
 

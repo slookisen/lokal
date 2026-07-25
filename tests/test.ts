@@ -33532,3 +33532,185 @@ runSerial(async () => {
     failures.push("opplevelser-experience-provenance: unexpected error: " + String(err?.message || err));
   }
 });
+
+// dev-request 2026-07-25-reisesok-korridor-discovery-og-naerhetssok, Fase 0
+// fixes 0a + 0c: kommune-centroid lookups now go to Kartverket's Kommuneinfo
+// REGISTER instead of Stedsnavn's fuzzy free-text search (which resolved
+// «Flakstad» to the Navnegard «Flagstad» near Hamar, putting every Lofoten
+// provider 780 km off and making OpplevAgent report Nusfjord as 26.2 km from
+// Elverum), and lookupKartverket() no longer falls back to navn[0] when no
+// acceptable navneobjekttype matched (which geocoded «blåskjell Kautokeino»
+// to a holiday cabin in Larvik, 1 400 km wrong). Pure module — the Kartverket
+// fetch is injected via __setGeocodingFetchForTesting, no DB, no network —
+// but registered through runSerial() so its counts fold into the summary the
+// same way as the suites above.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-07-25-reisesok: Fase 0a+0c (geocoding honesty) ──");
+  try {
+    const { runGeocodingHonestyTests } = require("../src/services/geocoding-honesty.test") as
+      typeof import("../src/services/geocoding-honesty.test");
+    const gh = await runGeocodingHonestyTests({ log: false });
+    passed += gh.passed;
+    failed += gh.failed;
+    for (const f of gh.failures) failures.push("geocoding-honesty: " + f);
+    console.log(`  geocoding-honesty: ${gh.passed} passed, ${gh.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("geocoding-honesty: unexpected error: " + String(err?.message || err));
+  }
+});
+
+// dev-request 2026-07-25-reisesok-korridor-discovery-og-naerhetssok, Fase 0
+// fixes 0b / 0d / 0e / 0f — the four ways GET /api/marketplace/search misled
+// users in production on 2026-07-25:
+//   0b  `honning Vadsø` dropped the geo filter and still reported
+//       geoFiltered:true / geoSource:"hardcoded" with no note.
+//   0d  `gårdsutsalg i Agder` returned Sørum (277 km) / Stange (318 km) /
+//       Stavanger above the one real Agder producer, all at a flat 0.750.
+//   0e  `nær meg` parsed to nothing (all stopwords) → nationwide list.
+//   0f  Proximity search was impossible without typing text (hard 400).
+// Own in-memory DB (swaps the shared getDb() singleton) + a stubbed geocoder
+// fetch — runs via runSerial() same as the suites above.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-07-25-reisesok: Fase 0b/0d/0e/0f (marketplace search honesty) ──");
+  try {
+    const { runMarketplaceSearchHonestyTests } = require("../src/routes/marketplace-search-honesty.test") as
+      typeof import("../src/routes/marketplace-search-honesty.test");
+    const msh = await runMarketplaceSearchHonestyTests({ log: false });
+    passed += msh.passed;
+    failed += msh.failed;
+    for (const f of msh.failures) failures.push("marketplace-search-honesty: " + f);
+    console.log(`  marketplace-search-honesty: ${msh.passed} passed, ${msh.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("marketplace-search-honesty: unexpected error: " + String(err?.message || err));
+  }
+});
+
+// dev-request 2026-07-25-reisesok-korridor-discovery-og-naerhetssok, Fase 0g:
+// `lokal_search` — the MCP tool AI assistants actually call — now accepts
+// lat/lng/radius_km (it had no way to receive the user's position at all), and
+// the read-only-declared tools no longer start seller conversations. Own
+// in-memory DB (swaps the shared getDb() singleton) + a stubbed geocoder
+// fetch — runs via runSerial() same as the suites above.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-07-25-reisesok: Fase 0g (MCP lokal_search geo + read-only) ──");
+  try {
+    const { runMcpSearchGeoTests } = require("../src/routes/mcp-search-geo.test") as
+      typeof import("../src/routes/mcp-search-geo.test");
+    const msg = await runMcpSearchGeoTests({ log: false });
+    passed += msg.passed;
+    failed += msg.failed;
+    for (const f of msg.failures) failures.push("mcp-search-geo: " + f);
+    console.log(`  mcp-search-geo: ${msg.passed} passed, ${msg.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("mcp-search-geo: unexpected error: " + String(err?.message || err));
+  }
+});
+
+// dev-request 2026-07-25-reisesok-korridor-discovery-og-naerhetssok, Fase 0a,
+// END-TO-END: the symptom Daniel actually saw. OpplevAgent's
+// discover_experiences at the Elverum coordinates (60.9866, 11.4432, r=30)
+// returned «Nusfjord Arctic Resort» in Lofoten with distance_km 26.2 — the
+// true distance is 788 km — because the kommune-centroid worker resolved
+// «Flakstad» to the Navnegard «Flagstad» near Hamar. Exercises the real chain
+// (experiencesGeocodeTick Step C/D → geocodeKommune → experiences.loc_lat →
+// discoverExperiences radius filter) against the real experiences schema in
+// an in-memory DB with the Kartverket fetch injected. Runs via runSerial()
+// because it swaps EXPERIENCES_DB_PATH + the db-factory singleton.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-07-25-reisesok: Fase 0a end-to-end (Elverum → no Lofoten hit) ──");
+  try {
+    const { runExperiencesGeocodeKommuneTests } = require("../src/services/experiences-geocode-kommune.test") as
+      typeof import("../src/services/experiences-geocode-kommune.test");
+    const egk = await runExperiencesGeocodeKommuneTests({ log: false });
+    passed += egk.passed;
+    failed += egk.failed;
+    for (const f of egk.failures) failures.push("experiences-geocode-kommune: " + f);
+    console.log(`  experiences-geocode-kommune: ${egk.passed} passed, ${egk.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("experiences-geocode-kommune: unexpected error: " + String(err?.message || err));
+  }
+});
+
+// Review follow-up for dev-request 2026-07-25-reisesok-korridor-discovery-og-
+// naerhetssok, Fase 0 — the RFB /sok HTML page (marketplace-search-honesty
+// covers the JSON API; this covers what a human and Googlebot actually see):
+//   B2  a coordinates-only search logged «nær 59.914, 10.752» (~110 m) into
+//       conversations.query_text, which renders on the UNAUTHENTICATED
+//       /samtaler and /samtale/<uuid> pages.
+//   B3  the H1/title/description claimed «Produsenter nær deg (30 km)» directly
+//       above the page's own «utvidet til hele Norge» banner.
+//   7   «Vis hele Norge» built ?q=&heleNorge=true → 302 back to the homepage.
+//   8   the radius <select> marked no option for an off-ladder ?radius=.
+//   9   the geolocation permission prompt fired with no user gesture.
+// Own in-memory DB (swaps the shared getDb() singleton, restored on exit) +
+// a stubbed geocoder fetch — runs via runSerial() same as the suites above.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-07-25-reisesok: review follow-up (/sok page honesty + privacy) ──");
+  try {
+    const { runSokSearchHonestyTests } = require("../src/routes/sok-search-honesty.test") as
+      typeof import("../src/routes/sok-search-honesty.test");
+    const ssh = await runSokSearchHonestyTests({ log: false });
+    passed += ssh.passed;
+    failed += ssh.failed;
+    for (const f of ssh.failures) failures.push("sok-search-honesty: " + f);
+    console.log(`  sok-search-honesty: ${ssh.passed} passed, ${ssh.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("sok-search-honesty: unexpected error: " + String(err?.message || err));
+  }
+});
+
+// dev-request 2026-07-25-reisesok-korridor-discovery-og-naerhetssok, Fase 1a +
+// 1c — the RFB coordinate foundation. 948 of 1 499 active producers had
+// seed-time coordinates of unrecorded provenance and 551 had NONE at all
+// (invisible to every geo-filtered search), because `agents` was the one
+// vertical with no geocoding worker. Covers services/agents-geocode-worker.ts
+// (address tier, city-centroid tier, never-downgrade, attempt-stamp rotation,
+// dry-run), the additive agents.geo_precision migration, and the 1c honesty
+// rule wired through marketplace-registry.discover() — a centroid-precision
+// producer must never render a precise km distance. Own in-memory DB (swaps
+// the shared getDb() singleton, restored on exit) + both Kartverket seams
+// injected — runs via runSerial() same as the Fase 0 suites above.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-07-25-reisesok: Fase 1a+1c (agents geocode worker + distance honesty) ──");
+  try {
+    const { runAgentsGeocodeWorkerTests } = require("../src/services/agents-geocode-worker.test") as
+      typeof import("../src/services/agents-geocode-worker.test");
+    const agw = await runAgentsGeocodeWorkerTests({ log: false });
+    passed += agw.passed;
+    failed += agw.failed;
+    for (const f of agw.failures) failures.push("agents-geocode-worker: " + f);
+    console.log(`  agents-geocode-worker: ${agw.passed} passed, ${agw.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("agents-geocode-worker: unexpected error: " + String(err?.message || err));
+  }
+});
+
+// dev-request 2026-07-25-reisesok-korridor-discovery-og-naerhetssok, Fase 1b —
+// experiences were 100 % geo_precision='kommune' (zero at address level), so
+// everything in Bodø reported distance_km 0. Steps E/F of
+// experiences-geocode-worker.ts re-attempt those rows at address level from
+// the provider's street address, and from `meeting_point` when — and only
+// when — it actually parses as an address. Own in-memory experiences DB
+// (EXPERIENCES_DB_PATH=":memory:" + db-factory reset) with the Kartverket
+// adresse-API injected; runs via runSerial().
+runSerial(async () => {
+  console.log("\n── dev-request 2026-07-25-reisesok: Fase 1b (experiences kommune → address upgrade) ──");
+  try {
+    const { runExperiencesAddressUpgradeTests } = require("../src/services/experiences-address-upgrade.test") as
+      typeof import("../src/services/experiences-address-upgrade.test");
+    const eau = await runExperiencesAddressUpgradeTests({ log: false });
+    passed += eau.passed;
+    failed += eau.failed;
+    for (const f of eau.failures) failures.push("experiences-address-upgrade: " + f);
+    console.log(`  experiences-address-upgrade: ${eau.passed} passed, ${eau.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("experiences-address-upgrade: unexpected error: " + String(err?.message || err));
+  }
+});

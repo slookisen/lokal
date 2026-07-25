@@ -11,6 +11,7 @@ import {
 import { slugify } from "../utils/slug";
 import { isJunkDescription } from "./description-quality";
 import { normalizeCityLabel } from "./city-normalizer";
+import { formatRfbDistanceLabel, shouldSuppressDistance } from "./geo-precision";
 
 // ─── Marketplace Registry Service (SQLite-backed) ────────────
 // This is the CORE of what makes Lokal unique: the agent registry.
@@ -23,6 +24,21 @@ import { normalizeCityLabel } from "./city-normalizer";
 //   - Geo filtering uses bounding-box pre-filter + Haversine
 //   - JSON arrays stored as TEXT, parsed on read
 //   - Prepared statements for performance
+
+/**
+ * Out-parameter for discover(): how the result set was actually produced.
+ *
+ * REVIEW FOLLOW-UP B1. `discover()` can silently widen a name search beyond the
+ * caller's radius (see filterNameCandidatesByGeo), and the caller has no other
+ * way to find out — the results look identical to a genuine in-radius hit. The
+ * route needs to know so it can report geoFiltered:false + relaxed_filters
+ * instead of claiming a geo filter it did not apply. Optional, so every
+ * existing caller is unaffected.
+ */
+export interface DiscoverMeta {
+  /** True when a name match was kept despite being outside query.maxDistanceKm. */
+  geoRelaxed?: boolean;
+}
 
 class MarketplaceRegistry {
   // ─── In-memory cache ──────────────────────────────────────────
@@ -97,7 +113,7 @@ class MarketplaceRegistry {
   // Consumer agents call this to find producers.
   // Uses bounding-box pre-filter for geo (Gap 6 fix).
 
-  discover(query: DiscoveryQuery): DiscoveryResult[] {
+  discover(query: DiscoveryQuery, meta?: DiscoverMeta): DiscoveryResult[] {
     const db = getDb();
 
     // ── 0. Name-based search: if query contains a producer name, find it directly ──
@@ -128,29 +144,12 @@ class MarketplaceRegistry {
           nameCandidates = nameCandidates.filter(a => a.role === query.role);
         }
         if (nameCandidates.length > 0) {
-          const results: DiscoveryResult[] = nameCandidates.map(agent => {
-            const { score, reasons } = this.calculateRelevance(agent, query, [], new Map());
-            this.incrementDiscovery(agent.id);
-            return {
-              agent: {
-                id: agent.id, name: agent.name, description: agent.description,
-                url: agent.url, role: agent.role,
-                skills: agent.skills.map(s => ({ id: s.id, name: s.name, description: s.description, tags: s.tags })),
-                location: agent.location ? {
-                  city: agent.location.city,
-                  distanceKm: query.location
-                    ? haversine(query.location.lat, query.location.lng, agent.location.lat, agent.location.lng)
-                    : undefined,
-                } : undefined,
-                trustScore: agent.trustScore, isVerified: agent.isVerified,
-                categories: agent.categories, tags: agent.tags,
-              },
-              relevanceScore: Math.max(score, 0.9), // Name match = high relevance
-              matchReasons: [`Navnematch: "${nameQuery}"`, ...reasons],
-            };
-          });
-          results.sort((a, b) => b.relevanceScore - a.relevanceScore);
-          return results.slice(0, query.limit || 20);
+          // dev-request 2026-07-25 fix 0d: geo-aware, distance-ranked.
+          const geoFiltered = this.filterNameCandidatesByGeo(nameCandidates, query, meta);
+          return this.buildNameMatchResults(
+            geoFiltered, query, 0.9, `Navnematch: "${nameQuery}"`,
+            undefined, !!meta?.geoRelaxed,
+          );
         }
       }
 
@@ -188,33 +187,23 @@ class MarketplaceRegistry {
             return (b.row.trust_score || 0) - (a.row.trust_score || 0);
           });
 
-          let fuzzyCandidates = fuzzyRows.slice(0, 10).map(x => this.rowToAgent(x.row)!);
+          // dev-request 2026-07-25 fix 0d: the top-10 cut used to happen HERE,
+          // before any geo filtering — so a query like "gårdsutsalg i Agder"
+          // kept the ten highest-trust «gårdsutsalg» producers nationwide and
+          // the one real Agder producer only survived by luck (it ranked 6th).
+          // The geo filter now runs FIRST (on the full matchedCount/trust-
+          // ordered list), and the top-10 cut applies to what survives it.
+          // With no location in the query, this is the original code path.
+          let fuzzyCandidates = fuzzyRows.map(x => this.rowToAgent(x.row)!);
           if (query.role) fuzzyCandidates = fuzzyCandidates.filter(a => a.role === query.role);
+          fuzzyCandidates = this.filterNameCandidatesByGeo(fuzzyCandidates, query, meta).slice(0, 10);
           if (fuzzyCandidates.length > 0) {
-            console.log(`[name-search-fuzzy] matched=${fuzzyCandidates.length} → ${fuzzyCandidates.map(a => a.name).join(", ")}`);
-            const results: DiscoveryResult[] = fuzzyCandidates.map(agent => {
-              const { score, reasons } = this.calculateRelevance(agent, query, [], new Map());
-              this.incrementDiscovery(agent.id);
-              return {
-                agent: {
-                  id: agent.id, name: agent.name, description: agent.description,
-                  url: agent.url, role: agent.role,
-                  skills: agent.skills.map(s => ({ id: s.id, name: s.name, description: s.description, tags: s.tags })),
-                  location: agent.location ? {
-                    city: agent.location.city,
-                    distanceKm: query.location
-                      ? haversine(query.location.lat, query.location.lng, agent.location.lat, agent.location.lng)
-                      : undefined,
-                  } : undefined,
-                  trustScore: agent.trustScore, isVerified: agent.isVerified,
-                  categories: agent.categories, tags: agent.tags,
-                },
-                relevanceScore: Math.max(score, 0.75), // fuzzy = lower than strict 0.9
-                matchReasons: [`Mulig navnematch: "${nameQuery}"`, ...reasons],
-              };
-            });
-            results.sort((a, b) => b.relevanceScore - a.relevanceScore);
-            return results.slice(0, query.limit || 20);
+            const results = this.buildNameMatchResults(
+              fuzzyCandidates, query, 0.75, `Mulig navnematch: "${nameQuery}"`, 10,
+              !!meta?.geoRelaxed,
+            );
+            console.log(`[name-search-fuzzy] matched=${results.length} → ${results.map(r => r.agent.name).join(", ")}`);
+            if (results.length > 0) return results;
           }
         }
       }
@@ -360,12 +349,7 @@ class MarketplaceRegistry {
             description: s.description,
             tags: s.tags,
           })),
-          location: agent.location ? {
-            city: agent.location.city,
-            distanceKm: query.location
-              ? haversine(query.location.lat, query.location.lng, agent.location.lat, agent.location.lng)
-              : undefined,
-          } : undefined,
+          location: this.resultLocation(agent, query.location),
           trustScore: agent.trustScore,
           isVerified: agent.isVerified,
           categories: agent.categories,
@@ -382,11 +366,195 @@ class MarketplaceRegistry {
     return results.slice(query.offset || 0, (query.offset || 0) + (query.limit || 20));
   }
 
+  // ─── Result location + the distance honesty rule ──────────
+  // dev-request 2026-07-25-reisesok-korridor-discovery-og-naerhetssok, Fase 1c.
+  //
+  // ONE place decides what a search result is allowed to say about distance,
+  // so the HTML cards, the JSON API and the MCP tools cannot drift apart.
+  // The rule (services/geo-precision.ts, mirroring experience-store.ts's
+  // formatDistanceLabel() on the OpplevAgent side):
+  //   • geo_precision='address'      → real measurement, emit distanceKm.
+  //   • 'city' / 'kommune' / 'postal'→ the position IS a centroid; emitting
+  //                                    "2,4 km unna" would be a fabricated
+  //                                    number. distanceKm is withheld and
+  //                                    distanceLabel says "i <city>-området".
+  //   • NULL (unknown provenance, every pre-Fase-1 row) → unchanged
+  //                                    behaviour, we have no evidence either
+  //                                    way and must not silently blank 948
+  //                                    producers' distances on deploy.
+  // Ranking is untouched: callers keep sorting/filtering on the true
+  // haversine (a centroid is still our best position estimate) — this governs
+  // what we SAY, not what we compute.
+  private resultLocation(
+    agent: RegisteredAgent,
+    origin?: { lat: number; lng: number },
+  ): DiscoveryResult["agent"]["location"] {
+    if (!agent.location) return undefined;
+    const precision = agent.geoPrecision ?? null;
+    const raw = origin
+      ? haversine(origin.lat, origin.lng, agent.location.lat, agent.location.lng)
+      : undefined;
+    const label = origin
+      ? formatRfbDistanceLabel(raw, precision, agent.location.city)
+      : null;
+    return {
+      city: agent.location.city,
+      distanceKm: shouldSuppressDistance(precision) ? undefined : raw,
+      ...(precision ? { geoPrecision: precision } : {}),
+      ...(label ? { distanceLabel: label } : {}),
+    };
+  }
+
+  // ─── Name-match result builder (geo-aware) ────────────────
+  // dev-request 2026-07-25-reisesok-korridor-discovery-og-naerhetssok, fix 0d.
+  //
+  // The two name-search branches above used to return a flat score (0.900
+  // strict / 0.750 fuzzy) for every hit and skip geo filtering entirely, even
+  // when the query carried a location. Live proof 2026-07-25:
+  //   `gårdsutsalg i Agder` → Sørum (277 km), Stange (318 km), Stavanger
+  //   (120 km) all at relevanceScore 0.750, with the single real Agder
+  //   producer ranked 6th.
+  //
+  // Now, when BOTH a name query and a location are present:
+  //   • producers with coordinates OUTSIDE maxDistanceKm are dropped …
+  //   • … but only if something is left. A name search with no hit anywhere
+  //     near the user must still find the producer they typed (the "Erga
+  //     Gårdsutsalg" case: a user in Oslo searching a Kleppe producer by name
+  //     still wants Kleppe, not silence).
+  //   • producers with NO coordinates are always kept — 36.8 % of active RFB
+  //     producers have no lat/lng, and "unknown" is not "far away". They rank
+  //     below everything that is provably in range.
+  //   • the score is graded by distance, so the ranking is no longer a
+  //     20-way tie broken by insertion order.
+  // With no location in the query, behaviour is byte-identical to before.
+  private filterNameCandidatesByGeo(
+    candidates: RegisteredAgent[],
+    query: DiscoveryQuery,
+    meta?: DiscoverMeta,
+  ): RegisteredAgent[] {
+    const origin = query.location;
+    const maxKm = query.maxDistanceKm;
+    if (!origin || !maxKm) return candidates;
+
+    const inRange: RegisteredAgent[] = [];
+    const unknown: RegisteredAgent[] = [];
+    for (const a of candidates) {
+      if (!a.location) { unknown.push(a); continue; }
+      if (haversine(origin.lat, origin.lng, a.location.lat, a.location.lng) <= maxKm) inRange.push(a);
+    }
+    // Nothing in range and nothing unplaced → the producer the user named is
+    // genuinely far away; return them all rather than pretending they vanished.
+    //
+    // REVIEW FOLLOW-UP B1: the carve-out is right, but keeping it SILENT
+    // re-introduced exactly the lie 0b fixed. The route only ever set
+    // `geoDropped` inside the auto-expand ladder, and the ladder never runs for
+    // a name match (`wasNameMatch` short-circuits it), so
+    // `?q=gårdsutsalg&lat=59.9139&lng=10.7522&radius=10` answered
+    // geoFiltered:true, geoRadiusKm:10 while listing producers 28 / 92 / 289 km
+    // away. Report the relaxation up to the caller so it can say so, exactly
+    // like the auto-expand path does. Reachable from any query whose word ends
+    // in gård/mat/bakeri/marked/butikk/ysteri/meieri — e.g. «gårdsbutikk nær meg»
+    // with browser coordinates in a sparse area.
+    if (inRange.length + unknown.length === 0) {
+      if (meta) meta.geoRelaxed = true;
+      return candidates;
+    }
+    return [...inRange, ...unknown];
+  }
+
+  private buildNameMatchResults(
+    candidates: RegisteredAgent[],
+    query: DiscoveryQuery,
+    baseScore: number,
+    reason: string,
+    maxResults?: number,
+    geoRelaxed = false,
+  ): DiscoveryResult[] {
+    const origin = query.location;
+    const maxKm = query.maxDistanceKm;
+
+    const distanceOf = (a: RegisteredAgent): number | undefined =>
+      origin && a.location
+        ? haversine(origin.lat, origin.lng, a.location.lat, a.location.lng)
+        : undefined;
+
+    // REVIEW FOLLOW-UP B1 (second half): grade against a scale the candidates
+    // actually span. When geo was relaxed, EVERY candidate is beyond maxKm, so
+    // `min(SPREAD, d / maxKm * SPREAD)` saturated at SPREAD for all of them and
+    // the flat-score tie 0d was supposed to kill came straight back (measured:
+    // 0.700 / 0.700 / 0.700 for producers 28 / 92 / 289 km away). Scale by the
+    // farthest candidate instead, so the nearest still ranks highest.
+    const spanKm = candidates
+      .map(distanceOf)
+      .filter((d): d is number => typeof d === "number");
+    const gradeScaleKm = geoRelaxed && spanKm.length > 0 ? Math.max(...spanKm) : maxKm;
+
+    // Fase 1c: the emitted distanceKm is now withheld for centroid-precision
+    // producers (see resultLocation()), so the tie-break below can no longer
+    // read it off the result — it would rank an honest "position unknown to
+    // street level" row as Infinity/last. Keep the TRUE distance here, purely
+    // for ordering.
+    const rankDistance = new Map<string, number>();
+
+    const results: DiscoveryResult[] = candidates.map(agent => {
+      const { score, reasons } = this.calculateRelevance(agent, query, [], new Map());
+      this.incrementDiscovery(agent.id);
+      const distanceKm = distanceOf(agent);
+      if (typeof distanceKm === "number") rankDistance.set(agent.id, distanceKm);
+
+      // Distance grading: 0 penalty at the origin, PROXIMITY_SPREAD at the far
+      // edge of the scale, the full penalty for an unplaced producer. Keeps
+      // every name hit above a non-name hit while making the order meaningful.
+      const PROXIMITY_SPREAD = 0.2;
+      let penalty = 0;
+      if (origin && gradeScaleKm) {
+        penalty = distanceKm === undefined
+          ? PROXIMITY_SPREAD
+          : Math.min(PROXIMITY_SPREAD, (distanceKm / gradeScaleKm) * PROXIMITY_SPREAD);
+      }
+
+      return {
+        agent: {
+          id: agent.id, name: agent.name, description: agent.description,
+          url: agent.url, role: agent.role,
+          skills: agent.skills.map(s => ({ id: s.id, name: s.name, description: s.description, tags: s.tags })),
+          location: this.resultLocation(agent, origin),
+          trustScore: agent.trustScore, isVerified: agent.isVerified,
+          categories: agent.categories, tags: agent.tags,
+        },
+        relevanceScore: Math.max(score, baseScore) - penalty,
+        matchReasons: [reason, ...reasons],
+      };
+    });
+
+    results.sort((a, b) => {
+      if (b.relevanceScore !== a.relevanceScore) return b.relevanceScore - a.relevanceScore;
+      const da = rankDistance.get(a.agent.id) ?? Infinity;
+      const db = rankDistance.get(b.agent.id) ?? Infinity;
+      return da - db;
+    });
+
+    return results.slice(0, Math.min(maxResults ?? Infinity, query.limit || 20));
+  }
+
   // ─── Natural language query parsing ───────────────────────
 
-  parseNaturalQuery(query: string): Partial<DiscoveryQuery> & { _productTerms?: string[] } {
+  parseNaturalQuery(query: string): Partial<DiscoveryQuery> & { _productTerms?: string[]; _proximityIntent?: boolean } {
     const q = query.toLowerCase().replace(/[?!.,]/g, "");
-    const parsed: Partial<DiscoveryQuery> & { _productTerms?: string[] } = {};
+    const parsed: Partial<DiscoveryQuery> & { _productTerms?: string[]; _proximityIntent?: boolean } = {};
+
+    // ── Proximity intent (dev-request 2026-07-25 fix 0e) ──────────────
+    // «nær», «nærme», «nærmeste», «meg», «her» and «hvor» are all in the
+    // skipWords set below, so `q=nær meg` used to parse to literally nothing
+    // and return a nationwide trust-ranked list with geoFiltered:false — no
+    // signal at all that the user had asked for something we could not
+    // answer. Recognise the intent BEFORE the words are discarded; the route
+    // turns it into needs_location / a geolocation prompt.
+    //
+    // Deliberately narrow: it must match "near ME", not the preposition in
+    // «honning nær Oslo» (which already geocodes fine and must not be
+    // hijacked into a position request).
+    if (isProximityIntent(q)) parsed._proximityIntent = true;
 
     // ── Product→Category mapping (expanded with Norwegian food terms) ──
     // Each keyword maps to a category AND is stored as a product search term
@@ -1293,6 +1461,11 @@ class MarketplaceRegistry {
         city: row.city || "Oslo",
         radiusKm: row.radius_km,
       } : undefined,
+      // dev-request 2026-07-25 Fase 1: coordinate provenance, written by
+      // services/agents-geocode-worker.ts. `?? null` (not `|| undefined`) so a
+      // row from a DB that predates the migration and one the worker has not
+      // reached yet are the same thing to the honesty rule: unknown.
+      geoPrecision: row.geo_precision ?? null,
     };
   }
 
@@ -1360,7 +1533,25 @@ class MarketplaceRegistry {
       const maxDist = query.maxDistanceKm || 20;
       const distScore = Math.max(0, 1 - dist / maxDist);
       score += 0.15 * distScore;
-      if (dist < 5) reasons.push(`${dist.toFixed(1)} km unna`);
+      // REVIEW B1 (Fase 1c): matchReasons is a SECOND distance surface and it
+      // was not gated. `matchReasons` is spread verbatim into the
+      // /api/marketplace/search JSON (routes/marketplace.ts) and rendered as
+      // the «Match:» line by the Smithery-published stdio MCP server
+      // (src/mcp/server.ts) — so a city-centroid producer was still telling an
+      // AI assistant «1.1 km unna» while location.distanceKm was correctly
+      // withheld. Same gate as resultLocation(): only address precision may
+      // state a number; a centroid says where it is instead.
+      // The SCORE above is deliberately untouched — a centroid is still the
+      // best position estimate we have for ranking. This governs what we say.
+      if (dist < 5) {
+        const precision = agent.geoPrecision ?? null;
+        reasons.push(
+          shouldSuppressDistance(precision)
+            ? (formatRfbDistanceLabel(dist, precision, agent.location.city)
+               ?? "i nærheten (omtrentlig posisjon)")
+            : `${dist.toFixed(1)} km unna`
+        );
+      }
     }
 
     score += 0.05 * agent.trustScore;
@@ -1376,6 +1567,35 @@ class MarketplaceRegistry {
 }
 
 // ─── Haversine distance ──────────────────────────────────────
+
+// ─── Proximity intent («nær meg») ─────────────────────────────
+// dev-request 2026-07-25-reisesok-korridor-discovery-og-naerhetssok, fix 0e.
+// Exported so both the REST route, /sok and the MCP tools classify the same
+// strings identically. Matches "near ME" phrasings only — never the bare
+// preposition in «honning nær Oslo», which resolves to a real place and must
+// keep doing so.
+const PROXIMITY_PATTERNS: RegExp[] = [
+  /\bn(æ|ae)r(me|meste)?\s+(meg|oss|her)\b/,        // nær meg / nærmeste oss / nærme her
+  /\bi\s+n(æ|ae)rheten\b/,                           // i nærheten (av meg)
+  /\bn(æ|ae)rheten\s+av\s+meg\b/,
+  /\brundt\s+meg\b/,
+  /\bher\s+jeg\s+er\b/,
+  // «nærmeste …» always asks for proximity. Safe to match broadly: the route
+  // only turns this into needs_location when no place could be resolved, so
+  // «nærmeste bakeri i Oslo» still just searches Oslo.
+  /\bn(æ|ae)rmeste\b/,
+  /\bnear\s+(me|here|by)\b/,
+  /\bnearby\b/,
+  /\bclose\s+to\s+me\b/,
+  /\baround\s+me\b/,
+  /\bmy\s+location\b/,
+];
+
+export function isProximityIntent(query: string): boolean {
+  const q = (query || "").toLowerCase().replace(/[?!.,]/g, " ").replace(/\s+/g, " ").trim();
+  if (!q) return false;
+  return PROXIMITY_PATTERNS.some((re) => re.test(q));
+}
 
 function haversine(lat1: number, lng1: number, lat2: number, lng2: number): number {
   const R = 6371;

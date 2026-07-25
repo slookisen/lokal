@@ -169,11 +169,22 @@ export async function geocodeOne(
   }
 
   // Step 4: street + postnummer only (drop poststed).
-  const q4 = `${adresse} ${postnummer}`;
-  result = await kartverketQuery(q4, fetchImpl);
-  await sleep(THROTTLE_MS);
-  if (result) {
-    return { ...result, confidence: "low", reason: "street_only_fallback" };
+  //
+  // dev-request 2026-07-25-reisesok Fase 1, review follow-up 8: when poststed
+  // is empty, step 1 ALREADY issued exactly this query (`q1` is
+  // `${adresse} ${postnummer}` in that case), so step 4 was a verbatim repeat
+  // of a request that had just missed — one wasted round-trip per row against
+  // a free public API, on every row of the largest cohort the new RFB worker
+  // processes (agents.city is often empty and is what it passes as poststed).
+  // Skip it and go straight to no_match; behaviour for callers WITH a poststed
+  // is unchanged.
+  if (poststed) {
+    const q4 = `${adresse} ${postnummer}`;
+    result = await kartverketQuery(q4, fetchImpl);
+    await sleep(THROTTLE_MS);
+    if (result) {
+      return { ...result, confidence: "low", reason: "street_only_fallback" };
+    }
   }
 
   return { lat: 0, lng: 0, confidence: "no_match", reason: "all_retries_failed" };

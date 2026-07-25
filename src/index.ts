@@ -1111,6 +1111,7 @@ if (
         `provider_fallback_unresolved=${r.providers_fallback_unresolved} ` +
         `addr_precision=${r.experiences_address_precision} ` +
         `kommune_precision=${r.experiences_kommune_precision} unresolved=${r.experiences_unresolved} ` +
+        `upgraded_to_address=${r.experiences_upgraded_to_address} ` +
         `errors=${r.errors} duration_ms=${r.duration_ms}`
       );
     } catch (err) {
@@ -1130,10 +1131,58 @@ if (
         `provider_fallback_unresolved=${r.providers_fallback_unresolved} ` +
         `addr_precision=${r.experiences_address_precision} ` +
         `kommune_precision=${r.experiences_kommune_precision} unresolved=${r.experiences_unresolved} ` +
+        `upgraded_to_address=${r.experiences_upgraded_to_address} ` +
         `errors=${r.errors} duration_ms=${r.duration_ms}`
       );
     } catch (err) {
       console.error("[experiences-geocode] tick failed:", err);
+    }
+  }, 60 * 60_000);
+}
+
+// ─── dev-request 2026-07-25-reisesok-korridor-discovery-og-naerhetssok
+// (Fase 1a): backend RFB agents geocoding worker ─────────────────────
+//
+// The RFB `agents` table was the only vertical without one — coordinates came
+// from seed files and 551 of 1 499 active producers (36.8 %, measured
+// 2026-07-25) had none at all, making them invisible to every geo-filtered
+// search. Same shape as the dental and experiences blocks above: first tick
+// 30s after boot, hourly after that, up to 50 rows per tick, each row's
+// attempt timestamped so the worker rotates through the whole universe instead
+// of re-processing the same head of the queue.
+//
+// Disable on dev / CI with RFB_DISABLE_AGENTS_GEOCODE=1. No ENABLE_* gate —
+// unlike dental/experiences the RFB DB is always open (it IS the main DB).
+// Manual/batched runs + dry-run: POST /api/marketplace/admin/agents/geocode-batch.
+if (process.env.RFB_DISABLE_AGENTS_GEOCODE !== "1") {
+  const logAgentsGeocode = (label: string, r: {
+    processed: number; address_precision: number; address_high: number;
+    address_medium: number; address_low: number; centroid_precision: number;
+    no_match: number; skipped_no_upgrade: number; errors: number; duration_ms: number;
+  }) => {
+    console.log(
+      `[agents-geocode] ${label} processed=${r.processed} ` +
+      `address=${r.address_precision} (high=${r.address_high} medium=${r.address_medium} low=${r.address_low}) ` +
+      `centroid=${r.centroid_precision} no_match=${r.no_match} ` +
+      `skipped_no_upgrade=${r.skipped_no_upgrade} errors=${r.errors} duration_ms=${r.duration_ms}`
+    );
+  };
+
+  setTimeout(async () => {
+    try {
+      const { agentsGeocodeTick } = await import("./services/agents-geocode-worker");
+      logAgentsGeocode("boot-tick", await agentsGeocodeTick(50));
+    } catch (err) {
+      console.error("[agents-geocode] boot-tick failed:", err);
+    }
+  }, 30_000);
+
+  setInterval(async () => {
+    try {
+      const { agentsGeocodeTick } = await import("./services/agents-geocode-worker");
+      logAgentsGeocode("tick", await agentsGeocodeTick(50));
+    } catch (err) {
+      console.error("[agents-geocode] tick failed:", err);
     }
   }, 60 * 60_000);
 }

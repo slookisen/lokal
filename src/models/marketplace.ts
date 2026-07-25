@@ -140,6 +140,17 @@ export const RegisteredAgentSchema = AgentRegistrationSchema.extend({
   // Discovery stats
   discoveryCount: z.number().default(0),   // How many times this agent was found in searches
   interactionCount: z.number().default(0), // How many times other agents connected
+
+  // ─── dev-request 2026-07-25-reisesok-korridor-discovery-og-naerhetssok,
+  // Fase 1 ─── how precisely we actually know where this producer is:
+  // agents.geo_precision ('address' | 'postal' | 'city' | 'kommune'), written
+  // by services/agents-geocode-worker.ts. Undefined/null = unknown provenance
+  // (every pre-Fase-1 row). Deliberately NOT on the registration schemas — it
+  // is derived state the worker owns, never something a registering agent
+  // declares about itself. Consumed by the honesty rule in
+  // services/geo-precision.ts, which decides whether a search result may
+  // render a km figure at all.
+  geoPrecision: z.enum(["address", "postal", "city", "kommune"]).nullish(),
 });
 
 export type RegisteredAgent = z.infer<typeof RegisteredAgentSchema>;
@@ -191,7 +202,16 @@ export interface DiscoveryResult {
     }>;
     location?: {
       city: string;
+      // dev-request 2026-07-25 Fase 1c (honesty rule): present ONLY when the
+      // producer's position is address-precision, i.e. when the number is a
+      // real measurement. A city/kommune-centroid row leaves this undefined
+      // and carries `distanceLabel` instead ("i Vadsø-området"), so no
+      // surface — HTML card, JSON API or MCP text — can claim a precise
+      // distance we do not have. Ranking still uses the true haversine
+      // internally; this field is about what we SAY.
       distanceKm?: number;
+      geoPrecision?: "address" | "postal" | "city" | "kommune";
+      distanceLabel?: string;
     };
     trustScore: number;
     isVerified: boolean;
