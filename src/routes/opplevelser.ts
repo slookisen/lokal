@@ -244,10 +244,27 @@ import {
   // booking-flyt-v1 slice 2: pre-visit reminder + auto-expiry engine
   processBookingFollowups,
 } from "../services/booking-store";
+// dev-request 2026-07-25-reisesok…, Fase 2 — corridor discovery API.
+import { buildReiseApiRouter } from "./reise-api";
+import { getDb as getExperiencesDbHandle } from "../database/db-factory";
 
 const APP_URL = process.env.APP_URL || "https://opplevagent.no";
 
 const router = Router();
+
+// ── GET /api/opplevelser/reise — corridor discovery ───────────────────
+// dev-request 2026-07-25-reisesok…, Fase 2. Mirror of the RFB mount in
+// marketplace.ts, carrying the OTHER half of the catalogue — experiences +
+// gårdssalg, and never a single RFB row. See reise-api.ts's header for why the
+// source list is closed over rather than read from the query string.
+//
+// Mounted here, at the top, so it is matched before this file's
+// `router.get("/:id")` (≈line 5343), which would otherwise swallow /reise as
+// an experience UUID lookup.
+router.use(buildReiseApiRouter({
+  sources: ["experience", "gardssalg"],
+  databases: () => ({ experiencesDb: getExperiencesDbHandle("experiences") }),
+}));
 
 function getAdminKey(): string {
   return process.env.ADMIN_KEY || process.env.ANALYTICS_ADMIN_KEY || "";

@@ -12,6 +12,14 @@ import { slugify } from "../utils/slug";
 import { isJunkDescription } from "./description-quality";
 import { normalizeCityLabel } from "./city-normalizer";
 import { formatRfbDistanceLabel, shouldSuppressDistance } from "./geo-precision";
+// dev-request 2026-07-25-reisesok…, Fase 2a: this file used to carry its own
+// private, byte-identical copy of the great-circle formula (plus a `toRad`).
+// The single implementation now lives in the PURE services/geo-distance.ts —
+// pure meaning no DB and no network, so importing it does NOT breach this
+// file's deliberate rfb-vertical isolation the way importing
+// geocoding-service.ts (→ database/init) would have. Aliased to the old local
+// name so every call site below reads exactly as it did.
+import { haversineDistanceKm as haversine, toRadians as toRad } from "./geo-distance";
 
 // ─── Marketplace Registry Service (SQLite-backed) ────────────
 // This is the CORE of what makes Lokal unique: the agent registry.
@@ -595,20 +603,73 @@ class MarketplaceRegistry {
       ],
       "honey": ["honning", "honey", "birøkt"],
       "herbs": ["urter", "herbs", "krydder", "dill", "persille", "basilikum", "timian"],
+      // ── Drikke (dev-request 2026-07-25-reisesok…, Fase 5a/5b) ──────────
+      // Daniel asked for this repeatedly: «Jeg ønsker også at søkefunksjon
+      // skal være inne på "drikkesteder"».
+      //
+      // `beverages` is not a new category — it is already the 8th-largest tag
+      // in the live catalogue (review N7 corrects an earlier "third-largest"
+      // overclaim). Full census 2026-07-25, all 1 523 production producers
+      // enumerated: `beverages` 65 rows, and 133 producers carry some
+      // drink-family category (`beverages` / `beer` / `sider` / `juice` /
+      // `coffee`) — Atlungstad Brenneri, Trysil Bryggeri, Senja Handbryggeri,
+      // Bent Gate Brewing, … It had simply never been reachable: this map had
+      // ten food categories and no drink one, so
+      // `øl`, `sider`, `drikke` and `brygg` produced NO category at all and
+      // fell through to a nationwide trust-ranked list. Verified live before
+      // this change: `q=øl` and `q=drikke` both returned `categories: null`
+      // and answered with Kringler Gjestegård / Homme Gård — neither of which
+      // sells drink. `bryggeri`/`sider`/`vin`/`brenneri` appeared to work only
+      // by accident, via the NAME branch matching producers with the word in
+      // their name; a `beverages` producer without it was unfindable.
+      //
+      // The stray one-off values the catalogue also carries (`beer`, `sider`,
+      // `juice`, `coffee`, 1 row each) are deliberately NOT added as separate
+      // categories — they are data noise, and normalising them is a data job,
+      // not a parser job. The keywords below route to `beverages`, and
+      // route-corridor-service.ts's DRINK_CATEGORIES treats the strays as
+      // drink too so a corridor search still finds them.
+      "beverages": DRINK_KEYWORDS,
     };
 
     const detectedCategories: string[] = [];
     const productTerms: string[] = [];
     for (const [category, keywords] of Object.entries(categoryMap)) {
       for (const kw of keywords) {
-        // Use word-boundary matching to avoid partial matches ("ost" in "Tromsø kosten")
-        const regex = new RegExp(`\\b${kw}\\b`);
-        if (regex.test(q)) {
+        // Word-boundary matching, to avoid partial matches ("ost" in "geitost").
+        // NB norwegianWordBoundary(), not \b — see the comment on that helper.
+        // With \b, the headline keyword of this whole slice — «øl» — could
+        // never match ANYTHING, because \b is ASCII-only and sees no boundary
+        // between start-of-string and «ø».
+        if (norwegianWordBoundary(kw).test(q)) {
           if (!detectedCategories.includes(category)) detectedCategories.push(category);
           // Store the specific product term (not the category keyword like "vegetables")
-          if (!["grønnsaker", "grønt", "vegetables", "frukt", "fruit", "bær", "berries",
-                "meieri", "dairy", "kjøtt", "meat", "fisk", "fish", "sjømat", "brød", "bread",
-                "bakervarer", "urter", "herbs", "egg", "eggs"].includes(kw)) {
+          // REVIEW N2: NO drink keyword becomes a product term. The
+          // product matcher one level up (discover(), ~:307) tests
+          // `pName.includes(term)`, an unanchored substring test — so `øl`
+          // matched «Pølser», «Grillpølser av storfe», «Kjøttpølse»,
+          // «Spekepølse» and «Møllerens mel»; `vin` matched «Vinterepler» and
+          // «Rødvinseddik»; `saft` matched «Saftig kanelbolle». A product
+          // match scores +0.25, the same as a category match, so on the
+          // flagship query of this whole slice a sausage producer could
+          // outrank a low-trust brewery, carrying the match reason
+          // «Produkter: Grillpølser av storfe».
+          //
+          // Dropping the drink terms from productTerms removes the harm
+          // completely: with no product terms the matcher block is skipped
+          // outright (`if (productTerms && productTerms.length > 0)`), and the
+          // `beverages` CATEGORY filter — which is what Fase 5 is actually
+          // about — does the selecting.
+          //
+          // Deliberately NOT changing `includes()` to norwegianWordBoundary()
+          // here, even though that is the root cause and it makes the adjacent
+          // regex dead code. Norwegian compounds legitimately depend on the
+          // loose test: «bringebærsaft» matches `bringebær`, «geitostkake»
+          // matches `geitost`. Tightening it is a search-relevance change
+          // across all 134 non-drink keywords, unrelated to this dev-request,
+          // and it belongs in its own slice with its own before/after
+          // measurement. Recorded here so it is not lost.
+          if (!PRODUCT_TERM_EXCLUSIONS.has(kw)) {
             productTerms.push(kw);
           }
         }
@@ -1591,25 +1652,70 @@ const PROXIMITY_PATTERNS: RegExp[] = [
   /\bmy\s+location\b/,
 ];
 
+// ── Fase 5 drink taxonomy (dev-request 2026-07-25-reisesok…, 5a/5b) ──
+// Exported so the corridor engine, the /reise filters and any future MCP enum
+// read the SAME list rather than drifting copies.
+export const DRINK_KEYWORDS = [
+  "drikke", "drikkevarer", "drikkested", "drikkesteder", "beverages", "drinks",
+  "øl", "ale", "pils", "brygg", "bryggeri", "mikrobryggeri", "håndverksøl",
+  "sider", "cider", "cideri", "eplesider",
+  "vin", "vingård", "vinproduksjon", "musserende",
+  "destilleri", "brenneri", "gårdsbrenneri", "akevitt", "gin", "whisky",
+  "mjød", "mjøderi",
+  "most", "eplemost", "saft", "juice", "eplejuice",
+  "kombucha", "seltzer", "seltzeri",
+  "kaffe", "kaffebrenneri", "gårdskafé", "gardskafe", "gårdskafe",
+];
+
+// Keywords that identify a CATEGORY but must never be searched as a product
+// name. The first group is the pre-existing list (category words like
+// «grønnsaker» are not products); the second is every drink keyword — see
+// REVIEW N2 at the push site for the measured false positives.
+const PRODUCT_TERM_EXCLUSIONS = new Set<string>([
+  "grønnsaker", "grønt", "vegetables", "frukt", "fruit", "bær", "berries",
+  "meieri", "dairy", "kjøtt", "meat", "fisk", "fish", "sjømat", "brød", "bread",
+  "bakervarer", "urter", "herbs", "egg", "eggs",
+  ...DRINK_KEYWORDS,
+]);
+
+// ── Norwegian-aware word boundary ────────────────────────────────────
+// dev-request 2026-07-25-reisesok…, Fase 5b.
+//
+// JavaScript's `\b` is defined against `\w` = [A-Za-z0-9_] — ASCII only. æ, ø
+// and å are therefore NON-word characters to it, which breaks the category
+// matcher in both directions:
+//
+//   FALSE NEGATIVE  /\bøl\b/.test("øl") === false. Start-of-string and «ø» are
+//                   both "non-word", so there is no transition and no boundary.
+//                   Every keyword beginning with æ/ø/å was dead code — that is
+//                   «øl», the single most-requested term in this dev-request,
+//                   and «økologiske egg», which has never matched since it was
+//                   added.
+//   FALSE POSITIVE  /\bost\b/.test("Tromsøost") === true. The «ø» before «ost»
+//                   reads as a word→non-word boundary, so a place name splices
+//                   into a product keyword. The existing comment claimed \b
+//                   prevented exactly this class of bug; for ASCII neighbours
+//                   ("geitost") it did, for Norwegian ones it did the opposite.
+//
+// Fix: assert on explicit character classes that include Latin-1 letters, so a
+// letter is a letter regardless of alphabet. Verified against the cases the old
+// comment called out — "geitost" and "Tromsø kosten" still do NOT match `ost`,
+// "Bryggerøl" and "øltønne" do NOT match `øl`, and "øl og vin" does.
+//
+// Deliberately not `\p{L}` with the /u flag: that would also treat digits and
+// underscore differently from the ASCII class and change behaviour for the
+// ~120 pre-existing keywords in ways nobody asked for. This class is the
+// minimal superset that fixes Norwegian.
+const NORWEGIAN_WORD_CHAR = "0-9A-Za-zÀ-ÖØ-öø-ÿ_";
+export function norwegianWordBoundary(keyword: string): RegExp {
+  const escaped = keyword.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  return new RegExp(`(?:^|[^${NORWEGIAN_WORD_CHAR}])${escaped}(?:$|[^${NORWEGIAN_WORD_CHAR}])`);
+}
+
 export function isProximityIntent(query: string): boolean {
   const q = (query || "").toLowerCase().replace(/[?!.,]/g, " ").replace(/\s+/g, " ").trim();
   if (!q) return false;
   return PROXIMITY_PATTERNS.some((re) => re.test(q));
-}
-
-function haversine(lat1: number, lng1: number, lat2: number, lng2: number): number {
-  const R = 6371;
-  const dLat = toRad(lat2 - lat1);
-  const dLng = toRad(lng2 - lng1);
-  const a =
-    Math.sin(dLat / 2) * Math.sin(dLat / 2) +
-    Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) *
-    Math.sin(dLng / 2) * Math.sin(dLng / 2);
-  return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
-}
-
-function toRad(deg: number): number {
-  return deg * (Math.PI / 180);
 }
 
 // Singleton

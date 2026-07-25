@@ -86,6 +86,8 @@ function escapeHtml(text: string): string {
 // `./seo` keep their API unchanged.
 import { safeMetaDescription, TRAILING_REPLACEMENT_CHAR_REGEX } from "../utils/meta-description";
 export { safeMetaDescription, TRAILING_REPLACEMENT_CHAR_REGEX };
+// dev-request 2026-07-25-reisesok…, Fase 2c — the /reise corridor page.
+import { corridorSearch, DEFAULT_MAX_DETOUR_KM } from "../services/route-corridor-service";
 
 const BASE_URL = process.env.BASE_URL || "https://rettfrabonden.com";
 
@@ -523,7 +525,7 @@ function shell(
       </div>
       <div class="ft-col">
         <h4>${escapeHtml(t(lang, "footer.platform"))}</h4>
-        <a href="${localizedPath("/sok", lang)}">${escapeHtml(t(lang, "footer.search_producers"))}</a><a href="${localizedPath("/kategori", lang)}">${lang === "en" ? "Sales channels" : "Salgskanaler"}</a><a href="${localizedPath("/teknologi", lang)}">${escapeHtml(t(lang, "footer.how_it_works"))}</a><a href="${localizedPath("/om", lang)}">${escapeHtml(t(lang, "footer.about_link"))}</a><a href="${localizedPath("/personvern", lang)}">${escapeHtml(t(lang, "footer.privacy"))}</a><a href="/kontakt">${lang === "en" ? "Contact us" : "Kontakt oss"}</a>
+        <a href="${localizedPath("/sok", lang)}">${escapeHtml(t(lang, "footer.search_producers"))}</a><a href="${localizedPath("/reise", lang)}">${lang === "en" ? "Along your route" : "Langs ruten"}</a><a href="${localizedPath("/kategori", lang)}">${lang === "en" ? "Sales channels" : "Salgskanaler"}</a><a href="${localizedPath("/teknologi", lang)}">${escapeHtml(t(lang, "footer.how_it_works"))}</a><a href="${localizedPath("/om", lang)}">${escapeHtml(t(lang, "footer.about_link"))}</a><a href="${localizedPath("/personvern", lang)}">${escapeHtml(t(lang, "footer.privacy"))}</a><a href="/kontakt">${lang === "en" ? "Contact us" : "Kontakt oss"}</a>
       </div>
       <div class="ft-col">
         <h4>${escapeHtml(t(lang, "footer.for_producers"))}</h4>
@@ -2241,6 +2243,217 @@ export function buildMcpGuideFaqJsonLd(lang: Lang, url: string): any {
   };
 }
 
+// ─── /reise — korridor-discovery langs en kjørerute ──────────────────
+// dev-request 2026-07-25-reisesok-korridor-discovery-og-naerhetssok, Fase 2c
+// (the RFB half; the OpplevAgent twin lives in experiences-seo.ts).
+//
+// «om jeg skriver et stedsnavn, eller jeg skal reise fra oslo til bodø, så
+//  skal vi ha en algoritme/løsning for å få forslag til stopp underveis.»
+//
+// Registered HERE, above router.get("/:city") at ≈3026 — that handler is a
+// catch-all with a hardcoded reserved-slug list, and "reise" is added to it as
+// well (belt and braces: this file already does both for /sok, /kontakt,
+// /kategori).
+//
+// ── UX decisions, and why ──────────────────────────────────────────
+// • Two fields and ONE slider, nothing else above the fold. Daniel asked for
+//   «ett felt … smart … uten missforståelser»; the smart-single-field parsing
+//   that routes «oslo til bodø» here from /sok is Fase 3, so this page keeps
+//   an explicit from/to rather than pretending to guess. It degrades to a
+//   plain GET form with no JavaScript.
+// • Results are ONE ordered column, not a grid. A grid reads as "ranked"; a
+//   traveller reads this as an itinerary, so the vertical order has to be the
+//   only order. Each row leads with «etter N km» — the along-track position —
+//   because that is the question being asked ("when do I pass it?").
+// • The detour figure is rendered as «N km fra ruten», never «N km å kjøre».
+//   In Norway those are wildly different numbers (Molde→Vestnes: 12.8 km
+//   apart, 104 km / 118 min to drive) and Fase 4 is what closes the gap.
+// • Imprecisely-placed producers get their own section BELOW the itinerary
+//   with no numbers at all — see the corridor service's honesty rule. They are
+//   shown, not hidden: a third of the catalogue has no street-level position,
+//   and silently dropping it would be its own kind of lying.
+// • noindex. The page is a query surface with unbounded from/to combinations —
+//   exactly the scaled-template pattern Google's March-2026 update penalises.
+//   Fase 8 adds 10-20 HAND-WRITTEN corridor pages that ARE indexable.
+const REISE_CSS = `
+.reise-hero{background:linear-gradient(160deg,#f0f7f0,#fff);padding:40px 0 28px}
+.reise-form{display:flex;flex-wrap:wrap;gap:10px;align-items:flex-end;margin:18px 0 6px}
+.reise-form label{display:block;font-size:.8rem;color:var(--g500);margin-bottom:4px;font-weight:600}
+.reise-form input[type=text]{padding:11px 13px;border:1px solid #d6ded6;border-radius:8px;font-size:1rem;min-width:190px}
+.reise-form .rf-range{min-width:230px}
+.reise-form input[type=range]{width:100%}
+.reise-form button{padding:12px 20px;border:0;border-radius:8px;background:var(--green-700);color:#fff;font-size:1rem;font-weight:600;cursor:pointer}
+.reise-note{background:#fff8e6;border:1px solid #f0dca8;border-radius:8px;padding:11px 14px;margin:14px 0;font-size:.92rem;line-height:1.5}
+.reise-meta{color:var(--g500);font-size:.9rem;margin:6px 0 18px}
+.reise-list{list-style:none;padding:0;margin:0;border-left:2px solid #dfe8df;margin-left:10px}
+.reise-item{position:relative;padding:14px 0 14px 22px}
+.reise-item:before{content:"";position:absolute;left:-7px;top:22px;width:12px;height:12px;border-radius:50%;background:var(--green-700);border:2px solid #fff}
+.reise-along{font-size:.8rem;color:var(--g500);text-transform:uppercase;letter-spacing:.04em}
+.reise-name{font-size:1.06rem;font-weight:600;margin:2px 0 3px}
+.reise-name a{color:inherit;text-decoration:none}
+.reise-name a:hover{text-decoration:underline}
+.reise-detour{font-size:.9rem;color:#3d6b3d}
+.reise-cats{font-size:.82rem;color:var(--g500);margin-top:3px}
+.reise-approx{margin-top:34px;padding-top:20px;border-top:1px solid #e6ece6}
+.reise-approx h2{font-size:1.1rem;margin-bottom:4px}
+.reise-approx-place{margin:16px 0 0}
+.reise-approx-place h3{font-size:.95rem;margin:0 0 4px}
+.reise-approx-place ul{margin:0;padding-left:18px;font-size:.94rem;line-height:1.7}
+.reise-empty{background:#f6f8f6;border-radius:10px;padding:22px;margin:18px 0;line-height:1.6}
+`;
+
+router.get("/reise", async (req: Request, res: Response) => {
+  const lang = req.lang;
+  const en = lang === "en";
+  const from = typeof req.query.from === "string" ? req.query.from.trim() : "";
+  const to = typeof req.query.to === "string" ? req.query.to.trim() : "";
+  const drinkOnly = req.query.drink === "true";
+  const detourRaw = parseInt(String(req.query.detour || ""), 10);
+  const detourKm = Number.isFinite(detourRaw) ? Math.min(100, Math.max(1, detourRaw)) : DEFAULT_MAX_DETOUR_KM;
+
+  const title = from && to
+    ? (en ? `Stops between ${from} and ${to} — ${getConfig().display_name}`
+          : `Stopp mellom ${from} og ${to} — ${getConfig().display_name}`)
+    : (en ? `Find farm shops along your route — ${getConfig().display_name}`
+          : `Finn gårdsutsalg langs ruten — ${getConfig().display_name}`);
+  const desc = en
+    ? "Plan a Norwegian road trip around real local food. Enter where you are driving from and to, and we list farm shops, bakeries and drink producers along the way, in travel order."
+    : "Planlegg kjøreturen rundt ekte lokalmat. Skriv hvor du kjører fra og til, så lister vi gårdsutsalg, bakerier og drikkeprodusenter langs veien — i reiserekkefølge.";
+
+  const form = `
+<form class="reise-form" method="GET" action="${localizedPath("/reise", lang)}">
+  <div><label for="rf-from">${en ? "From" : "Fra"}</label>
+    <input type="text" id="rf-from" name="from" value="${escapeHtml(from)}" placeholder="${en ? "e.g. Oslo" : "f.eks. Oslo"}" required></div>
+  <div><label for="rf-to">${en ? "To" : "Til"}</label>
+    <input type="text" id="rf-to" name="to" value="${escapeHtml(to)}" placeholder="${en ? "e.g. Trondheim" : "f.eks. Trondheim"}" required></div>
+  <div class="rf-range"><label for="rf-detour">${en ? `Max detour: ${detourKm} km` : `Maks omvei: ${detourKm} km`}</label>
+    <input type="range" id="rf-detour" name="detour" min="5" max="60" step="5" value="${detourKm}"
+      oninput="document.querySelector('label[for=rf-detour]').textContent='${en ? "Max detour: " : "Maks omvei: "}'+this.value+' km'"></div>
+  <div><label for="rf-drink">${en ? "Drink only" : "Bare drikke"}</label>
+    <input type="checkbox" id="rf-drink" name="drink" value="true"${drinkOnly ? " checked" : ""} style="width:22px;height:22px"></div>
+  <div><button type="submit">${en ? "Find stops" : "Finn stopp"}</button></div>
+</form>`;
+
+  // No query yet → the form and an honest description of what it does.
+  if (!from || !to) {
+    const intro = `
+<section class="reise-hero"><div class="wrap">
+  <h1>${en ? "What is along the way?" : "Hva ligger langs veien?"}</h1>
+  <p class="lede">${escapeHtml(desc)}</p>
+  ${form}
+</div></section>
+<section class="wrap">
+  <div class="reise-empty">
+    <p>${en
+      ? "We measure each producer's distance from your actual driving route, and list them in the order you will pass them."
+      : "Vi måler hver produsent mot den faktiske kjøreruten din, og lister dem i den rekkefølgen du passerer dem."}</p>
+    <p>${en
+      ? "We only quote a distance when we know a producer's street address. Producers we can only place to a town or municipality are listed separately, without a number — because a made-up number is worse than none."
+      : "Vi oppgir bare avstand når vi kjenner produsentens gateadresse. Produsenter vi bare kan plassere til et sted eller en kommune, lister vi for seg — uten tall. Et oppdiktet tall er verre enn ingen."}</p>
+  </div>
+</section>`;
+    res.setHeader("Content-Type", "text/html; charset=utf-8");
+    res.send(shell(title, desc, intro, {
+      canonical: `${BASE_URL}${localizedPath("/reise", lang)}`,
+      pathForAlternate: "/reise",
+      extraCss: REISE_CSS,
+      lang,
+      robots: "noindex, follow",
+    }));
+    return;
+  }
+
+  let result;
+  try {
+    result = await corridorSearch({
+      from, to,
+      maxDetourKm: detourKm,
+      drinkOnly,
+      // RFB page, RFB catalogue. Cross-vertical routes are Fase 7 and need an
+      // architecture decision; host isolation is not something this page bends.
+      sources: ["rfb"],
+      limit: 30,
+    });
+  } catch {
+    res.status(500).send(en ? "Internal error" : "Intern feil");
+    return;
+  }
+
+  let body: string;
+  if (!result.ok) {
+    body = `<div class="reise-empty"><p><strong>${escapeHtml(result.reason || "")}</strong></p></div>`;
+  } else {
+    const notes = result.notes.map((n) => `<div class="reise-note">${escapeHtml(n)}</div>`).join("");
+
+    const meta = `<p class="reise-meta">${
+      result.route && result.route.distanceKm != null
+        ? escapeHtml(en
+            ? `${Math.round(result.route.distanceKm)} km driving, about ${Math.round((result.route.durationMinutes || 0) / 60)} h.`
+            : `${Math.round(result.route.distanceKm)} km kjøring, cirka ${Math.round((result.route.durationMinutes || 0) / 60)} timer.`)
+        : ""
+    } ${escapeHtml(en
+      ? `${result.stops.length} stops within ${detourKm} km of the route.`
+      : `${result.stops.length} stopp innenfor ${detourKm} km fra ruten.`)}</p>`;
+
+    const items = result.stops.map((s) => {
+      // The detour line is the honest one: `label` comes from
+      // formatRfbDistanceLabel, which refuses to print a km figure for
+      // anything that is not an address-precision coordinate, and is null in
+      // straight-line mode. Never write the number by hand here.
+      const detour = s.detourKm != null
+        ? escapeHtml(en
+            ? `${s.detourKm.toFixed(1)} km from the route`
+            : `${s.detourKm.toLocaleString("nb-NO", { minimumFractionDigits: 1, maximumFractionDigits: 1 })} km fra ruten`)
+        : escapeHtml(en ? "along the route" : "langs ruten");
+      return `<li class="reise-item">
+  <div class="reise-along">${escapeHtml(en ? `after ${Math.round(s.alongKm)} km` : `etter ${Math.round(s.alongKm)} km`)}</div>
+  <div class="reise-name"><a href="${escapeHtml(s.url)}">${escapeHtml(s.name)}</a></div>
+  <div class="reise-detour">${detour}${s.place ? " · " + escapeHtml(s.place) : ""}</div>
+  ${s.categories.length ? `<div class="reise-cats">${escapeHtml(s.categories.map(formatCat).join(", "))}</div>` : ""}
+</li>`;
+    }).join("");
+
+    const approx = result.approximate.length === 0 ? "" : `
+<section class="reise-approx">
+  <h2>${en ? "Places along the route" : "Steder langs ruten"}</h2>
+  <p class="reise-meta">${en
+    ? "We know these producers are in these places, but not their exact address — so we will not tell you how far off your route they are."
+    : "Vi vet at disse produsentene ligger på disse stedene, men ikke nøyaktig hvor — så vi sier ikke hvor langt fra ruten de er."}</p>
+  ${result.approximate.map((g) => `<div class="reise-approx-place">
+    <h3>${escapeHtml(g.place)}</h3>
+    <ul>${g.items.map((i) => `<li><a href="${escapeHtml(i.url)}">${escapeHtml(i.name)}</a></li>`).join("")}</ul>
+  </div>`).join("")}
+</section>`;
+
+    const empty = result.stops.length === 0 && result.approximate.length === 0
+      ? `<div class="reise-empty"><p>${en
+          ? "We found nothing along this route yet. Coverage is thinnest north of Trondheim — try Østlandet, Trøndelag or Sørlandet, or widen the detour."
+          : "Vi fant ingenting langs denne ruten ennå. Dekningen er tynnest nord for Trondheim — prøv Østlandet, Trøndelag eller Sørlandet, eller øk omveien."}</p></div>`
+      : "";
+
+    body = `${notes}${meta}${result.stops.length ? `<ul class="reise-list">${items}</ul>` : ""}${empty}${approx}`;
+  }
+
+  const content = `
+<section class="reise-hero"><div class="wrap">
+  <h1>${escapeHtml(en ? `${from} → ${to}` : `${from} → ${to}`)}</h1>
+  ${form}
+</div></section>
+<section class="wrap">${body}</section>`;
+
+  res.setHeader("Content-Type", "text/html; charset=utf-8");
+  res.send(shell(title, desc, content, {
+    canonical: `${BASE_URL}${localizedPath("/reise", lang)}`,
+    pathForAlternate: "/reise",
+    extraCss: REISE_CSS,
+    lang,
+    // See the header comment: unbounded from/to combinations are exactly the
+    // scaled-template pattern Google penalises. Fase 8's hand-written corridor
+    // pages are the indexable surface.
+    robots: "noindex, follow",
+  }));
+});
+
 router.get("/guide-mat-ai", (req: Request, res: Response) => {
   const lang = req.lang;
   const en = lang === "en";
@@ -3039,6 +3252,11 @@ router.get("/:city", (req: Request, res: Response, next: any) => {
       || citySlug === "agents" || citySlug === "docs" || citySlug === "samtaler" || citySlug === "samtale"
       || citySlug === "en" || citySlug === "no" || citySlug === "kontakt"
       || citySlug === "kategori"
+      // dev-request 2026-07-25-reisesok…, Fase 2c: /reise is registered above
+      // this catch-all, but the reserved list is the file's belt-and-braces
+      // convention (see /sok, /kontakt, /kategori) — a kommune slugging to
+      // "reise" must never shadow the corridor page.
+      || citySlug === "reise"
       || citySlug.includes(".")) {
     return next();
   }

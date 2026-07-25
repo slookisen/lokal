@@ -27,6 +27,7 @@ import { isDisplayablePhone } from "../services/contact-normalizer";
 import { isJunkDescription } from "../services/description-quality";
 import { isJunkEmail } from "../services/gardssalg-rfb-enrich";
 import { isValidLatLng, resolveSearchRadiusKm, buildSearchNote, formatPlaceLabel } from "../utils/geo-query";
+import { buildReiseApiRouter } from "./reise-api";
 
 // ── PR-29 v3: pure helper for Place Details (New) request params ──────────────
 // Exported so tests can assert the URL structure without touching the handler.
@@ -79,6 +80,21 @@ function getAgentProvenanceSummary(agentId: string): ProvenanceSummary | undefin
 // AI agents (ChatGPT, Claude, Gemini plugins) will call.
 
 const router = Router();
+
+// ── GET /api/marketplace/reise — corridor discovery ───────────────────
+// dev-request 2026-07-25-reisesok…, Fase 2, and the machine surface Fase 6's
+// `reise_discover` MCP tool will call.
+//
+// `sources: ["rfb"]` is closed over and CANNOT be widened by the request.
+// /api/* passes straight through the host gates in index.ts, so an endpoint
+// that read its source list from the query string would happily serve
+// opplevagent rows on rettfrabonden.com. Fase 7 (mat + opplevelser in one
+// route) is explicitly a separate slice that «krever arkitekturbeslutning»;
+// this one federates nothing.
+router.use(buildReiseApiRouter({
+  sources: ["rfb"],
+  databases: () => ({ rfbDb: getDb() }),
+}));
 
 // ── PR-29 v3: per-run cap on Place Details (New) calls to bound approved cost ─
 const MAX_DETAILS_CALLS_PER_RUN = 50; // 50 = existing batch slice max → worst-case unchanged

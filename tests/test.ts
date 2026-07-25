@@ -19554,18 +19554,52 @@ const _pr106Promise: Promise<void> = new Promise<void>((r) => { _pr106Resolve = 
     // test runs because each `npm test` boots a fresh process).
     const testIp = "203.0.113." + Math.floor(Math.random() * 250 + 1);
 
+    // dev-request 2026-07-25-reisesok…, review follow-up: these 100 requests
+    // used to go through the GLOBAL fetch — which this block does not own.
+    // At least ten test files in this suite assign `globalThis.fetch` to a
+    // stub, several of them returning a bare `{ ok, status, json }` object with
+    // NO `headers` property, and the tnb block restores whatever was installed
+    // when IT started rather than the pristine native fetch. Whenever pr106's
+    // 100 sequential requests overlapped one of those windows, `r.headers` was
+    // undefined and the whole block died with
+    //   "pr106 behavioural block crashed: Cannot read properties of undefined
+    //    (reading 'get')"
+    // — a latent race that surfaces or hides purely on interleaving (observed
+    // in 4 consecutive runs, then absent once a single string concat in the
+    // catch shifted the timing).
+    //
+    // The block already owns an HTTP server (server6); use node:http directly
+    // so it owns its client too and cannot be perturbed by anyone else's stub.
+    // Same requests, same assertions — it simply stops depending on a global it
+    // never set.
+    const pingOnce = (): Promise<{ status: number; remaining: string }> =>
+      new Promise((resolve, reject) => {
+        const req6 = http6.request(
+          {
+            host: "127.0.0.1", port: port6, path: "/api/tannlege/ping",
+            method: "GET", headers: { "X-Forwarded-For": testIp },
+          },
+          (res6: any) => {
+            res6.resume();  // drain, so the socket is released
+            res6.on("end", () => resolve({
+              status: res6.statusCode,
+              remaining: res6.headers["ratelimit-remaining"] || "?",
+            }));
+          },
+        );
+        req6.on("error", reject);
+        req6.end();
+      });
+
     // pr106-05: 100 successive requests all return 200.
     let oks = 0;
     let lastStatus = -1;
     let lastRemaining = "?";
     for (let i = 0; i < 100; i++) {
-      const r = await fetch(`http://127.0.0.1:${port6}/api/tannlege/ping`, {
-        headers: { "X-Forwarded-For": testIp },
-      });
+      const r = await pingOnce();
       lastStatus = r.status;
-      lastRemaining = r.headers.get("ratelimit-remaining") || "?";
+      lastRemaining = r.remaining;
       if (r.status === 200) oks++;
-      await r.text(); // drain
     }
     assertEq(oks, 100, "pr106-05: 100 dental requests under the new 1000/15min cap all return 200");
 
@@ -33742,5 +33776,52 @@ runSerial(async () => {
   } catch (err: any) {
     failed++;
     failures.push("experiences-address-upgrade: unexpected error: " + String(err?.message || err));
+  }
+});
+
+// dev-request 2026-07-25-reisesok-korridor-discovery-og-naerhetssok, Fase 2 —
+// the corridor engine (geo-distance consolidation, route-geometry's
+// Douglas-Peucker + point-to-segment, route-corridor-service's provider seam,
+// polyline cache and THE ALLOW-LIST) plus the Fase-5 drink taxonomy reaching
+// parseNaturalQuery. Own in-memory RFB DB running the real production schema,
+// every network seam injected (RouteProvider + the geocoder's fetch), so
+// nothing here touches the network. Runs via runSerial() like the Fase 0/1
+// suites above.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-07-25-reisesok: Fase 2 (route corridor engine) + Fase 5 (drikke) ──");
+  try {
+    const { runRouteCorridorTests } = require("../src/services/route-corridor.test") as
+      typeof import("../src/services/route-corridor.test");
+    const rc = await runRouteCorridorTests({ log: false });
+    passed += rc.passed;
+    failed += rc.failed;
+    for (const f of rc.failures) failures.push("route-corridor: " + f);
+    console.log(`  route-corridor: ${rc.passed} passed, ${rc.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("route-corridor: unexpected error: " + String(err?.message || err));
+  }
+});
+
+// dev-request 2026-07-25-reisesok-korridor-discovery-og-naerhetssok, Fase 2c —
+// the two /reise SSR pages (seo.ts for RFB, experiences-seo.ts for OpplevAgent)
+// and the two /reise JSON mounts. Asserts host isolation in BOTH directions,
+// that the approximate section never renders a per-producer number, and that
+// the no-token routing path says what it is doing. Routers are driven directly
+// with a mock req/res (same harness shape as orch19-06's invokeGet), so no
+// server and no network. Runs via runSerial().
+runSerial(async () => {
+  console.log("\n── dev-request 2026-07-25-reisesok: Fase 2c (/reise pages + JSON API) ──");
+  try {
+    const { runReisePageTests } = require("../src/routes/reise-page.test") as
+      typeof import("../src/routes/reise-page.test");
+    const rp = await runReisePageTests({ log: false });
+    passed += rp.passed;
+    failed += rp.failed;
+    for (const f of rp.failures) failures.push("reise-page: " + f);
+    console.log(`  reise-page: ${rp.passed} passed, ${rp.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("reise-page: unexpected error: " + String(err?.message || err));
   }
 });
