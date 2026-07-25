@@ -29,6 +29,9 @@
  *   2. A2A: the `message/send` example (`POST /a2a`).
  *   3. REST: the `discover_experiences`-equivalent example
  *      (`GET /api/opplevelser/discover?...`).
+ *   4. Gårdssalg (dev-request 2026-07-19-opplevagent-gardssalg-agent-flater,
+ *      item 5): the `discover_gardssalg` MCP tool (own initialize + tools/call
+ *      pair) and the `category=gardssalg_smaking` REST discover example.
  *
  * Each call must return a 2xx HTTP status; the two JSON-RPC calls (MCP,
  * A2A) must additionally parse to a JSON-RPC envelope with no top-level
@@ -237,6 +240,52 @@ export function runExperiencesLlmsExamplesTests(opts: { log?: boolean } = {}): P
         // Sanity: it's the discover JSON shape, not a stray 200 from a 404 handler etc.
         const restBody = await restRes.json();
         assertTrue(restBody && restBody.vertical === "experiences", "3d: REST discover response has the expected vertical field");
+      }
+
+      // ── 4. Gårdssalg: discover_gardssalg MCP tool + REST, extracted from the Gårdssalg section ──
+      const gardssalgSection = sliceSection(llmsText, "## Gårdssalg & smaking");
+      assertTrue(gardssalgSection.length > 0, "4a: llms.txt has a Gårdssalg & smaking section");
+
+      const gardssalgMcpPayloads = extractCurlPayloads(gardssalgSection);
+      assertTrue(
+        gardssalgMcpPayloads.length === 2,
+        `4b: Gårdssalg section documents exactly two JSON-RPC payloads (initialize + tools/call) — found ${gardssalgMcpPayloads.length}`
+      );
+
+      if (gardssalgMcpPayloads.length >= 2) {
+        const gsInitRes = await fetch(`${base}/mcp`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json", Accept: "application/json, text/event-stream" },
+          body: gardssalgMcpPayloads[0],
+        });
+        assertTrue(gsInitRes.ok, `4c: Gårdssalg MCP initialize returns 2xx (got ${gsInitRes.status})`);
+        const gsSessionId = gsInitRes.headers.get("mcp-session-id");
+        assertTrue(!!gsSessionId, "4d: Gårdssalg MCP initialize response carries an mcp-session-id header");
+        const gsInitBody = parseJsonRpcBody(await gsInitRes.text(), gsInitRes.headers.get("content-type"));
+        assertTrue(!("error" in gsInitBody), `4e: Gårdssalg MCP initialize response has no top-level error (got ${JSON.stringify(gsInitBody.error)})`);
+
+        const gsCallRes = await fetch(`${base}/mcp`, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            Accept: "application/json, text/event-stream",
+            ...(gsSessionId ? { "mcp-session-id": gsSessionId } : {}),
+          },
+          body: gardssalgMcpPayloads[1],
+        });
+        assertTrue(gsCallRes.ok, `4f: Gårdssalg MCP tools/call (discover_gardssalg) returns 2xx (got ${gsCallRes.status})`);
+        const gsCallBody = parseJsonRpcBody(await gsCallRes.text(), gsCallRes.headers.get("content-type"));
+        assertTrue(!("error" in gsCallBody), `4g: Gårdssalg tools/call response has no top-level error (got ${JSON.stringify(gsCallBody.error)})`);
+      }
+
+      const gardssalgGetMatch = gardssalgSection.match(/GET\s+\S*(\/api\/opplevelser\/discover\?\S*)/);
+      assertTrue(!!gardssalgGetMatch, "4h: Gårdssalg section documents a GET /api/opplevelser/discover example with query params");
+
+      if (gardssalgGetMatch) {
+        const gsRestRes = await fetch(`${base}${gardssalgGetMatch[1]}`);
+        assertTrue(gsRestRes.ok, `4i: Gårdssalg REST discover example returns 2xx (got ${gsRestRes.status})`);
+        const gsRestBody = await gsRestRes.json();
+        assertTrue(gsRestBody && gsRestBody.vertical === "gardssalg", "4j: Gårdssalg REST discover response has the expected vertical field");
       }
     } catch (err: any) {
       failed++;
