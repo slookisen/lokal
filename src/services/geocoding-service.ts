@@ -273,31 +273,22 @@ const MAJOR_CITIES: Record<string, { lat: number; lng: number; radius: number }>
 
 // ── Shared distance helper (dev-request 2026-07-04-opplevagent-naer-meg-
 // geosok, item 2) ──────────────────────────────────────────────────
-// Great-circle distance between two lat/lng points, in kilometers
-// (haversine formula). Lives here — the one geo module already shared
-// across verticals (dental-geocode-worker.ts + experiences-geocode-worker.ts
-// both import geocodingService from this file) — rather than in a
-// vertical-specific route file.
+// MOVED (dev-request 2026-07-25-reisesok…, Fase 2a — «konsolider de tre
+// duplikate haversine-implementasjonene til én delt modul»): the formula now
+// lives ONCE in services/geo-distance.ts, a PURE module (no DB, no network, no
+// vertical) that marketplace-registry.ts, matching-engine.ts and the corridor
+// engine can all import without coupling.
 //
-// NB: src/services/marketplace-registry.ts (rfb-only) already has its own
-// private, unexported `haversine()` with the identical formula. It is NOT
-// imported from here: that file is intentionally rfb-isolated (see
-// src/routes/opplevelser.ts's own "Zero overlap with rfb's marketplace.ts"
-// doc comment), so reusing it would mean importing an rfb-only module
-// (and its getDb('rfb') dependency) into the experiences vertical purely
-// to borrow one pure function. This export is the shared, vertical-agnostic
-// home for that formula going forward.
-export function haversineDistanceKm(lat1: number, lng1: number, lat2: number, lng2: number): number {
-  const R = 6371;
-  const toRad = (deg: number) => deg * (Math.PI / 180);
-  const dLat = toRad(lat2 - lat1);
-  const dLng = toRad(lng2 - lng1);
-  const a =
-    Math.sin(dLat / 2) * Math.sin(dLat / 2) +
-    Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) *
-    Math.sin(dLng / 2) * Math.sin(dLng / 2);
-  return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
-}
+// This file used to document why marketplace-registry.ts kept a private
+// duplicate rather than importing from here: geocoding-service pulls in
+// database/init's getDb, and the rfb registry is deliberately vertical-isolated.
+// geo-distance.ts has no such dependency, so that reason is gone and so is the
+// duplicate.
+//
+// RE-exported (not merely moved) so the existing OpplevAgent call sites —
+// experience-store.ts does `import { haversineDistanceKm } from
+// "./geocoding-service"` — keep resolving unchanged.
+export { haversineDistanceKm } from "./geo-distance";
 
 // ── Kartverket navneobjekttype allowlist (dev-request 2026-07-25 fix 0c) ──
 //

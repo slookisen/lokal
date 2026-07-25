@@ -12,6 +12,14 @@ import { slugify } from "../utils/slug";
 import { isJunkDescription } from "./description-quality";
 import { normalizeCityLabel } from "./city-normalizer";
 import { formatRfbDistanceLabel, shouldSuppressDistance } from "./geo-precision";
+// dev-request 2026-07-25-reisesok…, Fase 2a: this file used to carry its own
+// private, byte-identical copy of the great-circle formula (plus a `toRad`).
+// The single implementation now lives in the PURE services/geo-distance.ts —
+// pure meaning no DB and no network, so importing it does NOT breach this
+// file's deliberate rfb-vertical isolation the way importing
+// geocoding-service.ts (→ database/init) would have. Aliased to the old local
+// name so every call site below reads exactly as it did.
+import { haversineDistanceKm as haversine, toRadians as toRad } from "./geo-distance";
 
 // ─── Marketplace Registry Service (SQLite-backed) ────────────
 // This is the CORE of what makes Lokal unique: the agent registry.
@@ -1595,21 +1603,6 @@ export function isProximityIntent(query: string): boolean {
   const q = (query || "").toLowerCase().replace(/[?!.,]/g, " ").replace(/\s+/g, " ").trim();
   if (!q) return false;
   return PROXIMITY_PATTERNS.some((re) => re.test(q));
-}
-
-function haversine(lat1: number, lng1: number, lat2: number, lng2: number): number {
-  const R = 6371;
-  const dLat = toRad(lat2 - lat1);
-  const dLng = toRad(lng2 - lng1);
-  const a =
-    Math.sin(dLat / 2) * Math.sin(dLat / 2) +
-    Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) *
-    Math.sin(dLng / 2) * Math.sin(dLng / 2);
-  return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
-}
-
-function toRad(deg: number): number {
-  return deg * (Math.PI / 180);
 }
 
 // Singleton

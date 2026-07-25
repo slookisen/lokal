@@ -1,4 +1,8 @@
 import { store } from "./store";
+// dev-request 2026-07-25-reisesok…, Fase 2a — the one shared great-circle
+// implementation (was duplicated privately in this file as calculateDistance +
+// toRad). Pure module: no DB, no network, no vertical coupling.
+import { haversineDistanceKm } from "./geo-distance";
 import {
   SearchRequest,
   SearchResult,
@@ -339,27 +343,22 @@ export class MatchingEngine {
 
   // ─── Utilities ─────────────────────────────────────────────
 
+  // dev-request 2026-07-25-reisesok…, Fase 2a: this was the THIRD byte-identical
+  // copy of the great-circle formula (the others: geocoding-service.ts's
+  // exported haversineDistanceKm and marketplace-registry.ts's private
+  // haversine()). All three now delegate to the single pure implementation in
+  // services/geo-distance.ts. `x ** 2` vs `x * x` and R = 6371 were already
+  // identical, so this is behaviour-preserving to the bit.
+  //
+  // Kept as a private method (rather than inlining the import at the two call
+  // sites) so this class's shape is unchanged.
   private calculateDistance(
     lat1: number,
     lng1: number,
     lat2: number,
     lng2: number
   ): number {
-    // Haversine formula
-    const R = 6371; // Earth's radius in km
-    const dLat = this.toRad(lat2 - lat1);
-    const dLng = this.toRad(lng2 - lng1);
-    const a =
-      Math.sin(dLat / 2) ** 2 +
-      Math.cos(this.toRad(lat1)) *
-        Math.cos(this.toRad(lat2)) *
-        Math.sin(dLng / 2) ** 2;
-    const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
-    return R * c;
-  }
-
-  private toRad(deg: number): number {
-    return (deg * Math.PI) / 180;
+    return haversineDistanceKm(lat1, lng1, lat2, lng2);
   }
 
   private normalizeProductName(name: string): string {
