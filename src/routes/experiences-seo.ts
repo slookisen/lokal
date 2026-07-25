@@ -991,6 +991,46 @@ router.get(`/${INDEXNOW_KEY}.txt`, (_req: Request, res: Response) => {
 // GET /robots.txt
 // ═══════════════════════════════════════════════════════════
 
+// Shared per-group disallows (GSC 2026-07-19 opplevagent.no index audit: 231
+// "Excluded by noindex tag" + 36 "Crawled - currently not indexed", the same
+// crawl-budget-bleed pattern already root-caused + fixed for rettfrabonden.com
+// in PR #302). Root causes ported here:
+//   /kategori/gardssalg/eier/       private owner-claim portal (magic-link
+//                                   entry, per-provider portal, logout) — see
+//                                   src/routes/gardssalg-claim.ts.
+//   /kategori/gardssalg/book/*/confirm/   per-booking confirmation page (real
+//                                   booking ref + guest data) — ephemeral,
+//                                   the wildcard covers every :providerSlug.
+//   /kategori/gardssalg/bekreft/    booking magic-link-style confirm token.
+//   /kategori/gardssalg/svar/       producer answer-to-booking-request token page.
+//   /kategori/gardssalg/gjestesvar/ guest answer-to-suggested-time token page.
+//   /kategori/gardssalg/status/     booking status page (bookingRef+guestToken).
+//   /admin/                         admin surface — X-Admin-Key gated
+//                                   regardless; this is defense-in-depth.
+// Every one of these already carries its own noindex meta tag (svar/
+// gjestesvar/status/bekreft render through the shared previsitPage() shell;
+// confirm/eier render their own) — Disallow keeps crawlers from spending
+// budget fetching them at all, on top of that.
+// These must be repeated inside EVERY user-agent group below: a crawler that
+// matches a specific group (e.g. Googlebot) ignores the rules under
+// "User-agent: *" entirely — that exemption (Googlebot/Bingbot only ever
+// getting a bare "Allow: /") was the actual root cause of the GSC bleed.
+// Deliberately NOT listed here:
+//   /kategori/gardssalg/produsent/:providerSlug   public producer profile —
+//     must stay crawlable; its own catalog_hidden=1 gate is a per-row
+//     <meta name="robots"> noindex, not a robots.txt exclusion.
+//   /kategori/gardssalg/book/:providerSlug (no /confirm/)   the booking FORM
+//     itself is already noindex,follow via its own meta tag — crawlers may
+//     still need to fetch it for OG-preview generation, so it stays Allow.
+//   /sok   already noindex,follow via its own meta tag — same reasoning.
+const GARDSSALG_ROBOTS_DISALLOWS = `Disallow: /kategori/gardssalg/eier/
+Disallow: /kategori/gardssalg/book/*/confirm/
+Disallow: /kategori/gardssalg/bekreft/
+Disallow: /kategori/gardssalg/svar/
+Disallow: /kategori/gardssalg/gjestesvar/
+Disallow: /kategori/gardssalg/status/
+Disallow: /admin/`;
+
 router.get("/robots.txt", (_req: Request, res: Response) => {
   const url = baseUrl();
   res.setHeader("Content-Type", "text/plain; charset=utf-8");
@@ -1000,6 +1040,7 @@ router.get("/robots.txt", (_req: Request, res: Response) => {
 
 User-agent: *
 Allow: /
+${GARDSSALG_ROBOTS_DISALLOWS}
 
 # LLM-vennlige endepunkter
 # Oversikt:      ${url}/llms.txt
@@ -1007,27 +1048,35 @@ Allow: /
 
 User-agent: GPTBot
 Allow: /
+${GARDSSALG_ROBOTS_DISALLOWS}
 
 User-agent: OAI-SearchBot
 Allow: /
+${GARDSSALG_ROBOTS_DISALLOWS}
 
 User-agent: ClaudeBot
 Allow: /
+${GARDSSALG_ROBOTS_DISALLOWS}
 
 User-agent: anthropic-ai
 Allow: /
+${GARDSSALG_ROBOTS_DISALLOWS}
 
 User-agent: PerplexityBot
 Allow: /
+${GARDSSALG_ROBOTS_DISALLOWS}
 
 User-agent: Google-Extended
 Allow: /
+${GARDSSALG_ROBOTS_DISALLOWS}
 
 User-agent: Googlebot
 Allow: /
+${GARDSSALG_ROBOTS_DISALLOWS}
 
 User-agent: Bingbot
 Allow: /
+${GARDSSALG_ROBOTS_DISALLOWS}
 
 Sitemap: ${url}/sitemap.xml
 `);
@@ -1059,28 +1108,58 @@ router.get("/sitemap.xml", (_req: Request, res: Response) => {
   // experience. All read through the same publish gate the pages use, so the
   // sitemap lists exactly the URLs that render 200 — zero orphan/dead entries.
   // Defensive — if the experiences DB is not open we just emit the static URLs.
+  // Back-fill slugs for any providers added since the last /tilbyder/ request,
+  // BEFORE the gårdssalg provider list is fetched below — backfillProviderSlugs()
+  // is idempotent (WHERE slug IS NULL — fast no-op when all providers already
+  // have slugs), so calling it here is safe on every sitemap request. Must run
+  // before the fetch immediately below: that list is reused for the
+  // /kategori/gardssalg/produsent/<slug> loop further down, which skips any
+  // row with a null slug — fetching before backfill would silently drop every
+  // producer profile URL from the sitemap.
+  try { backfillProviderSlugs(); } catch { /* DB not yet open */ }
+  // Gårdssalg provider list — fetched once (when the vertical is visible) and
+  // reused below for BOTH the /kategori/gardssalg aggregate lastmod AND the
+  // per-producer profile lastmod loop further down, instead of querying twice.
+  // GSC 2026-07-19 indekseringsfiks, sitemap lastmod-honesty item: real
+  // per-row/per-aggregate updated_at instead of a blanket "today" stamped on
+  // every request (rfb PR #302 fixed the same pattern for city pages).
+  let gardssalgProvidersForSitemap: GardssalgProviderRow[] | null = null;
+  if (gardssalgVisible()) {
+    try { gardssalgProvidersForSitemap = listGardssalgProviders(5000, 0); } catch { gardssalgProvidersForSitemap = null; }
+  }
   try {
     for (const row of listPublishedCategories()) {
       if (!row.category) continue;
-      xml += `\n  <url><loc>${url}/kategori/${encodeURIComponent(row.category)}</loc><changefreq>weekly</changefreq><priority>0.7</priority><lastmod>${today}</lastmod></url>`;
+      const lastmod = (row.lastmod || today).slice(0, 10);
+      xml += `\n  <url><loc>${url}/kategori/${encodeURIComponent(row.category)}</loc><changefreq>weekly</changefreq><priority>0.7</priority><lastmod>${lastmod}</lastmod></url>`;
     }
     // Phase 1 — gardssalg feature flag: include /kategori/gardssalg in sitemap
     // when the provider seed set meets the visibility threshold, even before the
     // category has published experiences (so Googlebot crawls the page early).
-    if (gardssalgVisible()) {
-      xml += `\n  <url><loc>${url}/kategori/gardssalg</loc><changefreq>weekly</changefreq><priority>0.7</priority><lastmod>${today}</lastmod></url>`;
+    // lastmod = MAX(updated_at) across the gårdssalg provider rows that make up
+    // this category's grid (real aggregate freshness — gårdssalg producers have
+    // zero `experiences` rows, so listPublishedCategories()'s MAX(e.updated_at)
+    // doesn't cover them; falls back to today only if the list is unavailable).
+    if (gardssalgProvidersForSitemap) {
+      let gardssalgLastmod = "";
+      for (const p of gardssalgProvidersForSitemap) {
+        if (p.updated_at && p.updated_at > gardssalgLastmod) gardssalgLastmod = p.updated_at;
+      }
+      xml += `\n  <url><loc>${url}/kategori/gardssalg</loc><changefreq>weekly</changefreq><priority>0.7</priority><lastmod>${(gardssalgLastmod || today).slice(0, 10)}</lastmod></url>`;
     }
   } catch { /* experiences DB not open */ }
   try {
     for (const row of listPublishedFylker()) {
       if (!row.fylke) continue;
-      xml += `\n  <url><loc>${url}/fylke/${encodeURIComponent(row.fylke)}</loc><changefreq>weekly</changefreq><priority>0.7</priority><lastmod>${today}</lastmod></url>`;
+      const lastmod = (row.lastmod || today).slice(0, 10);
+      xml += `\n  <url><loc>${url}/fylke/${encodeURIComponent(row.fylke)}</loc><changefreq>weekly</changefreq><priority>0.7</priority><lastmod>${lastmod}</lastmod></url>`;
     }
   } catch { /* experiences DB not open */ }
   try {
     for (const row of listPublishedKommuner()) {
       if (!row.kommune) continue;
-      xml += `\n  <url><loc>${url}/kommune/${encodeURIComponent(row.kommune)}</loc><changefreq>weekly</changefreq><priority>0.6</priority><lastmod>${today}</lastmod></url>`;
+      const lastmod = (row.lastmod || today).slice(0, 10);
+      xml += `\n  <url><loc>${url}/kommune/${encodeURIComponent(row.kommune)}</loc><changefreq>weekly</changefreq><priority>0.6</priority><lastmod>${lastmod}</lastmod></url>`;
     }
   } catch { /* experiences DB not open */ }
   try {
@@ -1097,20 +1176,18 @@ router.get("/sitemap.xml", (_req: Request, res: Response) => {
       if (!row.category || !row.kommune) continue;
       const factCount = (row.total > 0 ? 1 : 0) + (row.providerCount > 0 ? 1 : 0) + (row.minPriceFrom !== null ? 1 : 0);
       if (factCount < 2) continue;
-      xml += `\n  <url><loc>${url}/kategori/${encodeURIComponent(row.category)}/${encodeURIComponent(row.kommune)}</loc><changefreq>weekly</changefreq><priority>0.5</priority><lastmod>${today}</lastmod></url>`;
+      const lastmod = (row.lastmod || today).slice(0, 10);
+      xml += `\n  <url><loc>${url}/kategori/${encodeURIComponent(row.category)}/${encodeURIComponent(row.kommune)}</loc><changefreq>weekly</changefreq><priority>0.5</priority><lastmod>${lastmod}</lastmod></url>`;
     }
   } catch { /* experiences DB not open */ }
   try {
-    // Back-fill slugs for any providers added since the last /tilbyder/ request.
-    // backfillProviderSlugs() is idempotent (WHERE slug IS NULL — fast no-op when
-    // all providers already have slugs), so calling it here is safe on every
-    // sitemap request. We call it directly (not via ensureProviderSlugs()) so the
-    // one-shot flag does not prevent re-checking for newly-inserted slugless rows.
-    try { backfillProviderSlugs(); } catch { /* DB not yet open */ }
+    // Slug backfill already ran near the top of this handler (before the
+    // gårdssalg provider fetch, which needs it too) — not repeated here.
     for (const row of listPublishedProviders()) {
       if (!row.id) continue;
       const tilbyderSeg = row.slug ? encodeURIComponent(row.slug) : encodeURIComponent(row.id);
-      xml += `\n  <url><loc>${url}/tilbyder/${tilbyderSeg}</loc><changefreq>weekly</changefreq><priority>0.6</priority><lastmod>${today}</lastmod></url>`;
+      const lastmod = (row.lastmod || today).slice(0, 10);
+      xml += `\n  <url><loc>${url}/tilbyder/${tilbyderSeg}</loc><changefreq>weekly</changefreq><priority>0.6</priority><lastmod>${lastmod}</lastmod></url>`;
     }
   } catch { /* experiences DB not open */ }
   try {
@@ -1132,10 +1209,14 @@ router.get("/sitemap.xml", (_req: Request, res: Response) => {
     // base WHERE (the same gate discover_gardssalg/the category grid rely on) —
     // not reimplemented here. Slug backfill already ran above (backfillProviderSlugs()
     // covers all experience_providers rows, not just experience-linked ones).
-    if (gardssalgVisible()) {
-      for (const row of listGardssalgProviders(5000, 0)) {
+    // lastmod = the provider row's own updated_at (real per-entity freshness,
+    // same "row.updated_at || today" pattern the /opplevelse/<slug> loop above
+    // uses) — reuses the SAME list already fetched above, no second query.
+    if (gardssalgProvidersForSitemap) {
+      for (const row of gardssalgProvidersForSitemap) {
         if (!row.slug) continue;
-        xml += `\n  <url><loc>${url}/kategori/gardssalg/produsent/${encodeURIComponent(row.slug)}</loc><changefreq>weekly</changefreq><priority>0.6</priority><lastmod>${today}</lastmod></url>`;
+        const lastmod = (row.updated_at || today).slice(0, 10);
+        xml += `\n  <url><loc>${url}/kategori/gardssalg/produsent/${encodeURIComponent(row.slug)}</loc><changefreq>weekly</changefreq><priority>0.6</priority><lastmod>${lastmod}</lastmod></url>`;
       }
     }
   } catch { /* experiences DB not open */ }
