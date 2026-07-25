@@ -3229,6 +3229,27 @@ function initSchema(db: Database.Database): void {
     `ALTER TABLE agents ADD COLUMN geocode_prev_lat REAL`,
     `ALTER TABLE agents ADD COLUMN geocode_prev_lng REAL`,
     `ALTER TABLE agents ADD COLUMN geocode_attempts INTEGER NOT NULL DEFAULT 0`,
+    //   geo_place_label  : the place a CENTROID-tier position represents, as
+    //                      Kartverket named it («Rana», «Gjerdrum», «Flåm»).
+    //
+    //                      NOT decoration. geo-precision.formatRfbDistanceLabel
+    //                      renders a centroid row as «i {city}-området» and
+    //                      falls back to the bare, useless «omtrentlig
+    //                      posisjon» when city is NULL — and Tier C's entire
+    //                      cohort is DEFINED by having no city. Without this
+    //                      column ~250 producers become visible in proximity
+    //                      search with no indication of WHERE they are, which
+    //                      is most of the point of placing them at all.
+    //
+    //                      Deliberately NOT written into agents.city: that is a
+    //                      curated, owner-editable field which also feeds the
+    //                      "byer" stat counters AND geocoding-service's
+    //                      lookupInDatabase() tier — so writing worker-derived
+    //                      values there would feed one worker's guesses back
+    //                      into the lookup other rows get resolved with.
+    //                      Address-precision rows leave it NULL: they carry a
+    //                      real km figure and need no approximate label.
+    `ALTER TABLE agents ADD COLUMN geo_place_label TEXT`,
   ]) {
     try { db.exec(stmt); } catch { /* already exists — expected */ }
   }

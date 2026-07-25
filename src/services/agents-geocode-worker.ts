@@ -20,13 +20,15 @@
 //            retry ladder dental + experiences already use — not
 //            re-implemented here). Writes geo_precision='address'.
 //   Tier B — city-centroid fallback, ONLY for rows that have no coordinates
-//            at all. Goes through geocodingService.geocode(), i.e. the Fase-0
-//            hardened lookup, so it inherits the navneobjekttype allowlist,
-//            the `navnestatus` name-similarity guard and the ambiguity
-//            refusal ("blåskjell Kautokeino" → Larvik is rejected, not
-//            stored). Writes geo_precision='city' (or 'kommune' when the hit
-//            is an administrative area), which the honesty rule
-//            (geo-precision.ts, 1c) then renders WITHOUT a km figure.
+//            at all. Goes through geocodingService.geocodePlaceForBackfill(),
+//            which is the Fase-0 hardened lookup (navneobjekttype allowlist,
+//            `navnestatus` name-similarity guard, ambiguity refusal — so
+//            "blåskjell Kautokeino" → Larvik is rejected, not stored) MINUS
+//            the local-DB tier and PLUS a kommune corroboration step. Both of
+//            those differences were forced by review; see that function's
+//            header, and REASON 3 below. Writes 'city' only for a town-scale
+//            hit, 'kommune' otherwise — tiers the honesty rule
+//            (geo-precision.ts, 1c) renders WITHOUT a km figure.
 //   Tier C — the producer NAME's place suffix. See the census below.
 //
 // ═══════════════════════════════════════════════════════════════════
@@ -87,16 +89,47 @@
 // Rana", "Bakeverkstedet Salten — Misvær", "Dalheim Gård og Gårdsysteri —
 // Kvæfjord". That suffix is a real signal and it was measured before it was
 // trusted: all 194 DISTINCT suffix tokens in that cohort were run against
-// LIVE Kartverket through this repo's own hardened geocodingService.geocode()
-// (type allowlist + hovednavn similarity guard + ambiguity refusal), and
-// **174 of 194 (89.7 %) resolved**. The 20 that do not (Fenstad, Røyse,
-// Fiskum, Hell, Sørum, Krokkleiva, …) are the guard refusing rather than
-// guessing, which is the behaviour we want.
+// LIVE Kartverket through this repo's own hardened lookup (type allowlist +
+// hovednavn similarity guard + ambiguity refusal), and **174 of 194 (89.7 %)
+// resolved**. The 20 that do not (Fenstad, Røyse, Fiskum, Hell, Sørum,
+// Krokkleiva, …) are the guard refusing rather than guessing.
+//
+// THAT FIGURE CAME WITH A CAVEAT THE FIRST VERSION MISSED, and review caught
+// it: the measurement ran against an EMPTY `agents` table, while
+// geocodingService.geocode() consults the local `agents` table BEFORE
+// Kartverket. 80 of the 183 distinct tokens (44 %) exactly match an existing
+// agents.city, so in production those rows would have taken the local-DB tier
+// and adopted ANOTHER PRODUCER'S SEED COORDINATE — reproduced end to end: «Ny
+// Gård — Hegra» landed on a sibling row's TROMSØ position, written as
+// source=database, precision=city. Both centroid tiers now call
+// geocodePlaceForBackfill(), which has no DB tier at all, so the measured path
+// and the production path are the same path.
 //
 // Tier C NEVER invents a coordinate and never licenses a km figure: it can
 // only ever write 'city' or 'kommune' precision, the tiers geo-precision.ts's
 // honesty rule renders as «i X-området». And it only runs on rows that have
 // NO coordinates at all, exactly like Tier B.
+//
+// For that label to say anything at all, the resolved place is persisted in
+// agents.geo_place_label. This cohort has city = NULL by definition, and
+// formatRfbDistanceLabel() falls back to the bare «omtrentlig posisjon» without
+// a city — worse still, marketplace-registry's location mapping had a legacy
+// `row.city || "Oslo"` default, so ~250 producers in Rana, Misvær and Flåm
+// would each have been announced as «i Oslo-området». Being visible somewhere
+// wrong is not an improvement on being invisible.
+//
+// ── REASON 3 (review) — a hamlet can outrank the kommune it shares a name with
+// The hardened lookup accepts a REGION or MINOR-settlement hit outright and
+// only asks the kommune register when Stedsnavn found nothing at all. Measured
+// live, with two REAL producers on it: «Gjerdrum» resolved to a Grend at
+// 60.68335/11.7955 — whose own kommune is Våler in Innlandet — while Gjerdrum
+// kommune is 60.0788/11.0206 in AKERSHUS, 79.6 km away in another fylke. Bent
+// Gate Brewing and Haukerudhagen both landed there. «Målselv» was 45.7 km out
+// the same way. geocodePlaceForBackfill() now prefers an unambiguous same-named
+// kommune for any sub-town hit; measured over all 183 live tokens that moves
+// exactly 8 of them and leaves the 22 genuine bygder (Flåm, Misvær, Hegra …)
+// alone. See that function's header for why the cheaper "refuse tier-4
+// outright" was rejected: it would have cost 18 producers to fix 0 errors.
 //
 // ONE MEASURED DESIGN DECISION, because the obvious version was wrong.
 // Compound suffixes ("Sparbu, Steinkjer", "Mevika, Gildeskål", "Husøy i
@@ -162,7 +195,7 @@
 
 import { getDb } from "../database/init";
 import { geocodeOne, type GeocodeDeps } from "./dental-geocode-worker";
-import { geocodingService } from "./geocoding-service";
+import { geocodingService, isMajorSettlementType } from "./geocoding-service";
 import { isPrecisionUpgrade, type GeoPrecision } from "./geo-precision";
 import { normalizeCityLabel } from "./city-normalizer";
 import { budgetedFetch, takeKartverketBudget, KARTVERKET_MAX_RPS } from "./kartverket-budget";
@@ -214,6 +247,8 @@ export type AgentsGeocodePlannedChange = {
   lat: number | null;
   lng: number | null;
   outcome: string;
+  /** Resolved place name for centroid tiers — what the honesty label will say. */
+  place_label?: string | null;
 };
 
 export type AgentsGeocodeResult = {
@@ -271,16 +306,10 @@ type CandidateRow = {
  */
 const NAME_PLACE_SUFFIX = /[—–]\s*([^—–]+)\s*$/;
 
-/**
- * True when a name carries a dash — i.e. when Tier C has anything to try. Kept
- * next to the SQL predicate it mirrors (see SELECTABLE_TIER_C) so the two
- * cannot drift: SQL over-selects (any dash anywhere), this function is the
- * precise test, and a row the SQL let through but this rejects simply becomes
- * a stamped no_match and rotates out.
- */
-export function hasNamePlaceSuffix(name: string | null | undefined): boolean {
-  return NAME_PLACE_SUFFIX.test(name || "");
-}
+// NOTE on the SQL side of this: the selector's HAS_NAME_DASH predicate
+// deliberately OVER-selects (any em/en dash anywhere in the name). This regex
+// is the precise test. A row the SQL admits but this rejects simply becomes a
+// stamped no_match and rotates out — the cheap direction to be wrong in.
 
 /**
  * Place candidates mined from a producer name, in the order they should be
@@ -302,6 +331,30 @@ export function hasNamePlaceSuffix(name: string | null | undefined): boolean {
  * "Trøndelag" and "Agder" appear as name suffixes in the live cohort and are
  * dropped here rather than costing a request to discover they are too coarse.
  */
+/**
+ * Kartverket `navneobjekttype` → the precision tier we are willing to CLAIM.
+ *
+ * Only a MAJOR settlement (By, Tettsted, Tettbebyggelse, Bydel …) earns 'city'.
+ * Everything else acceptable — administrative areas, named regions and minor
+ * settlements alike — is tagged 'kommune', the coarsest tier.
+ *
+ * The previous mapping was `kommune|fylke|annen administrativ inndeling →
+ * 'kommune', else 'city'`, which INVERTED the ranking for region types:
+ * «Landskapsområde», «Dalføre», «Øy i sjø» and «Halvøy i sjø» are all coarser
+ * than a kommune, yet claimed the finer tier — «Målselv» and «Ringerike» landed
+ * as 'city'. GEO_PRECISION_RANK puts city (2) above kommune (1), so the
+ * never-downgrade guard would have let a region point overwrite a real kommune
+ * centroid. Nothing user-visible today (both suppress the km figure), but it
+ * was backwards, and it is the guard's input.
+ *
+ * It also does the honest thing for the residual risk in
+ * geocodePlaceForBackfill()'s rule (3): an uncorroborated hamlet-scale hit
+ * makes the coarsest possible claim rather than the second-finest.
+ */
+export function precisionForPlaceType(placeType: string | null | undefined): GeoPrecision {
+  return isMajorSettlementType(placeType) ? "city" : "kommune";
+}
+
 export function placeSuffixCandidates(name: string | null | undefined): string[] {
   const m = NAME_PLACE_SUFFIX.exec(name || "");
   if (!m) return [];
@@ -680,7 +733,8 @@ async function runAgentsGeocodeTick(
     `UPDATE agents
         SET geocode_prev_lat = lat, geocode_prev_lng = lng,
             lat = ?, lng = ?, geo_precision = ?, geocode_source = ?,
-            geocode_outcome = ?, geocode_attempted_at = ?, geocode_attempts = 0
+            geocode_outcome = ?, geo_place_label = ?,
+            geocode_attempted_at = ?, geocode_attempts = 0
       WHERE id = ?`
   );
   const updateAttemptOnly = db.prepare(
@@ -809,25 +863,29 @@ async function runAgentsGeocodeTick(
     outcome: string
   ): Promise<boolean> {
     await takeKartverketBudget(sleep, 2);
-    const geo = await geocodingService.geocode(placeLabel);
+    // geocodePlaceForBackfill, NOT geocode(): the latter consults the local
+    // `agents` table BEFORE Kartverket and answers with ANOTHER PRODUCER'S seed
+    // coordinate. See that function's header — 80 of the 183 live Tier-C tokens
+    // exactly match an existing agents.city, and «Ny Gård — Hegra» was
+    // reproduced adopting a sibling row's Tromsø position (69.6496/18.956).
+    const geo = await geocodingService.geocodePlaceForBackfill(placeLabel);
     await sleep(CENTROID_THROTTLE_MS);
     if (!geo) return false;
 
-    const t = (geo.placeType || "").toLowerCase().trim();
-    const precision: GeoPrecision =
-      t === "kommune" || t === "fylke" || t === "annen administrativ inndeling"
-        ? "kommune"
-        : "city";
+    const precision = precisionForPlaceType(geo.placeType);
     // geo.source is the geocoding-service tier that answered
     // ("kartverket" = Stedsnavn, "kommuneinfo" = the kommune register,
-    // "hardcoded"/"database"/"cache" = local tables). Recorded verbatim
-    // apart from disambiguating Stedsnavn from the adresse API, since
-    // both would otherwise read "kartverket".
+    // "hardcoded" = the curated major-city table). Recorded verbatim apart from
+    // disambiguating Stedsnavn from the adresse API, since both would otherwise
+    // read "kartverket". `database` can no longer occur here.
     const source = geo.source === "kartverket" ? "kartverket_stedsnavn" : geo.source;
     if (isPrecisionUpgrade(row.geo_precision, precision)) {
       stats.centroid_precision++;
       if (outcome === "name_suffix_centroid") stats.name_suffix_precision++;
-      record(row, precision, geo.lat, geo.lng, source, outcome);
+      // geo.name is the place Kartverket actually matched — the thing the
+      // honesty label has to be able to say. See record()'s note on why storing
+      // it is not optional.
+      record(row, precision, geo.lat, geo.lng, source, outcome, geo.name || placeLabel);
     } else {
       stats.skipped_no_upgrade++;
       recordAttemptOnly(row, "skipped_no_upgrade");
@@ -841,7 +899,22 @@ async function runAgentsGeocodeTick(
     lat: number,
     lng: number,
     source: string,
-    outcome: string
+    outcome: string,
+    /**
+     * The place this position represents, for centroid tiers.
+     *
+     * NOT decoration. formatRfbDistanceLabel() renders a centroid row as
+     * «i {city}-området», falling back to the bare, useless «omtrentlig
+     * posisjon» when city is null — and the ENTIRE Tier-C cohort is defined by
+     * having no city. Without persisting the resolved place, ~250 producers
+     * would become visible in proximity search with no indication of where they
+     * are, which is most of the point of placing them at all. Stored in
+     * agents.geo_place_label rather than agents.city on purpose: `city` is a
+     * curated, owner-editable field that also feeds the stats counters and
+     * geocode()'s own lookupInDatabase() tier, and writing worker-derived
+     * values into it would feed exactly the tier B2 was about back into itself.
+     */
+    placeLabel: string | null = null
   ): void {
     stats.planned.push({
       agent_id: row.id,
@@ -851,9 +924,10 @@ async function runAgentsGeocodeTick(
       lat,
       lng,
       outcome,
+      place_label: placeLabel,
     });
     if (dryRun) return;
-    updatePosition.run(lat, lng, precision, source, outcome, nextAttemptStamp(), row.id);
+    updatePosition.run(lat, lng, precision, source, outcome, placeLabel, nextAttemptStamp(), row.id);
   }
 
   function recordAttemptOnly(row: CandidateRow, outcome: string): void {
@@ -915,4 +989,139 @@ export function startAgentsGeocodeWorker(
     },
     ...overrides,
   });
+}
+
+// ── Seed-coordinate audit (read-only measurement, never writes) ──────
+//
+// Review adjudication (c). The ~110 rows in
+// `unreachable.seed_coordinates_no_address` carry a coordinate of unknown
+// provenance and a city, and this worker deliberately refuses to overwrite
+// them. The first version of this slice framed the choice as "reclassify them
+// as 'city' on an inference, or leave them alone" and deferred to Daniel on
+// that basis. That framing was wrong: there is a third option, and it is a
+// MEASUREMENT rather than a guess.
+//
+// Geocode each such row's own `city` and compare the result to the coordinate
+// already stored. If they agree to within ~1 km, the stored value demonstrably
+// IS the city centroid — so tagging it 'city' would not be an inference at all,
+// it would be recording something we checked. If they disagree by tens of
+// kilometres, the stored coordinate is something else (plausibly the real farm,
+// plausibly wrong) and must keep its honest NULL.
+//
+// This function only produces the distribution. It writes NOTHING — no
+// coordinates, no precision, not even an attempt stamp — so it is safe to point
+// at production, and the reclassification decision stays with Daniel, made on
+// real numbers instead of on either of us guessing.
+//
+// It must go through geocodePlaceForBackfill(): geocode() would consult
+// lookupInDatabase(), which for a row's own city can return THAT ROW'S OWN
+// coordinate and report a triumphant 0.0 km agreement for every single row.
+
+export type SeedCoordinateAuditRow = {
+  agent_id: string;
+  name: string;
+  city: string;
+  stored_lat: number;
+  stored_lng: number;
+  centroid_lat: number | null;
+  centroid_lng: number | null;
+  centroid_place: string | null;
+  distance_km: number | null;
+  verdict: "is_centroid" | "near_centroid" | "far_from_centroid" | "city_unresolvable";
+};
+
+export type SeedCoordinateAudit = {
+  examined: number;
+  /** ≤1 km from the city centroid — the stored value IS the centroid. */
+  is_centroid: number;
+  /** 1–10 km — same place, but not literally the centroid point. */
+  near_centroid: number;
+  /** >10 km — the stored coordinate means something else. Leave it alone. */
+  far_from_centroid: number;
+  /** The row's own city could not be resolved safely; no verdict possible. */
+  city_unresolvable: number;
+  duration_ms: number;
+  rows: SeedCoordinateAuditRow[];
+};
+
+/** Great-circle km. Local copy: this module must not import the corridor service. */
+function auditHaversineKm(aLat: number, aLng: number, bLat: number, bLng: number): number {
+  const R = 6371;
+  const toRad = (d: number) => (d * Math.PI) / 180;
+  const dLat = toRad(bLat - aLat);
+  const dLng = toRad(bLng - aLng);
+  const h =
+    Math.sin(dLat / 2) ** 2 +
+    Math.cos(toRad(aLat)) * Math.cos(toRad(bLat)) * Math.sin(dLng / 2) ** 2;
+  return 2 * R * Math.asin(Math.sqrt(h));
+}
+
+export async function auditSeedCoordinates(
+  limit: number = 50,
+  deps: AgentsGeocodeDeps = {}
+): Promise<SeedCoordinateAudit> {
+  const start = Date.now();
+  const sleep = deps.sleep ?? ((ms: number) => new Promise((r) => setTimeout(r, ms)));
+  const db = getDb();
+
+  const rows = db
+    .prepare(
+      `SELECT a.id AS id, a.name AS name, a.city AS city, a.lat AS lat, a.lng AS lng
+         FROM agents a
+         LEFT JOIN agent_knowledge k ON k.agent_id = a.id
+        WHERE a.is_active = 1
+          AND a.geo_precision IS NULL
+          AND a.lat IS NOT NULL AND a.lng IS NOT NULL
+          AND ${HAS_CITY}
+          AND NOT ${HAS_ADDRESS}
+        ORDER BY a.id ASC
+        LIMIT ?`
+    )
+    .all(Math.max(1, Math.min(500, Math.floor(limit)))) as Array<{
+      id: string; name: string | null; city: string; lat: number; lng: number;
+    }>;
+
+  const out: SeedCoordinateAudit = {
+    examined: 0, is_centroid: 0, near_centroid: 0, far_from_centroid: 0,
+    city_unresolvable: 0, duration_ms: 0, rows: [],
+  };
+
+  for (const r of rows) {
+    out.examined++;
+    let centroid: { lat: number; lng: number; name: string } | null = null;
+    try {
+      await takeKartverketBudget(sleep, 2);
+      const g = await geocodingService.geocodePlaceForBackfill(r.city.trim());
+      await sleep(CENTROID_THROTTLE_MS);
+      if (g) centroid = { lat: g.lat, lng: g.lng, name: g.name };
+    } catch (err) {
+      // A lookup failure is not evidence about the coordinate. Report it as
+      // unresolvable rather than letting one bad row abort the whole audit.
+      console.error(`[seed-audit] lookup failed for ${r.id}:`, err);
+    }
+
+    const km = centroid ? auditHaversineKm(r.lat, r.lng, centroid.lat, centroid.lng) : null;
+    const verdict: SeedCoordinateAuditRow["verdict"] =
+      km === null ? "city_unresolvable"
+        : km <= 1 ? "is_centroid"
+        : km <= 10 ? "near_centroid"
+        : "far_from_centroid";
+    out[verdict === "city_unresolvable" ? "city_unresolvable" : verdict]++;
+
+    out.rows.push({
+      agent_id: r.id,
+      name: r.name ?? "",
+      city: r.city,
+      stored_lat: r.lat,
+      stored_lng: r.lng,
+      centroid_lat: centroid?.lat ?? null,
+      centroid_lng: centroid?.lng ?? null,
+      centroid_place: centroid?.name ?? null,
+      distance_km: km === null ? null : Math.round(km * 100) / 100,
+      verdict,
+    });
+  }
+
+  out.duration_ms = Date.now() - start;
+  return out;
 }

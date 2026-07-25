@@ -151,6 +151,15 @@ export const RegisteredAgentSchema = AgentRegistrationSchema.extend({
   // services/geo-precision.ts, which decides whether a search result may
   // render a km figure at all.
   geoPrecision: z.enum(["address", "postal", "city", "kommune"]).nullish(),
+
+  // Fase 1a follow-up ─── the place a CENTROID-tier position represents, as
+  // Kartverket named it (agents.geo_place_label, written by the geocode
+  // worker's Tier B/C). Same ownership rule as geoPrecision: derived state the
+  // worker owns, never self-declared. It exists so the honesty label can say
+  // WHERE an approximate producer is — Tier C's whole cohort has city = NULL,
+  // and without this the renderer says «omtrentlig posisjon», or worse, falls
+  // through to the legacy `|| "Oslo"` default and names the wrong city.
+  geoPlaceLabel: z.string().nullish(),
 });
 
 export type RegisteredAgent = z.infer<typeof RegisteredAgentSchema>;

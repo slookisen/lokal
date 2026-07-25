@@ -5992,4 +5992,56 @@ router.post("/admin/agents/postal-backfill", async (req: Request, res: Response)
   }
 });
 
+// ─── POST /admin/agents/geocode-seed-audit ───────────────────────────
+// dev-request 2026-07-25-reisesok-korridor-discovery-og-naerhetssok, Fase 1a
+// throughput follow-up — review adjudication (c).
+//
+// MEASURES, NEVER WRITES. The geocode worker reports a cohort of producers
+// (~110 measured on prod) carrying a coordinate of UNKNOWN provenance plus a
+// city, with no street address to improve on it. The worker refuses to
+// overwrite those, which is right — but "reclassify them as centroid precision
+// on an inference, or leave them alone" is a false choice. This endpoint takes
+// the third option: geocode each row's own city and compare it to the
+// coordinate already stored.
+//
+//   <=1 km   the stored value demonstrably IS the city centroid. Tagging it
+//            'city' would be recording a measurement, not making a guess.
+//   1-10 km  same place, but not the centroid point itself.
+//   >10 km   the stored coordinate means something else — plausibly the real
+//            farm. It keeps its honest NULL.
+//
+// The reclassification decision stays with Daniel; this gives him the
+// distribution to make it on. There is deliberately NO write path in this
+// handler or in auditSeedCoordinates(), so there is nothing for a dry_run flag
+// to get wrong: the endpoint cannot mutate anything, which is a stronger
+// guarantee than promising not to.
+//
+// Body: { limit?: number (1-500, default 50) }
+// Auth: X-Admin-Key, same getAdminKey() convention as every other admin
+// endpoint in this file.
+router.post("/admin/agents/geocode-seed-audit", async (req: Request, res: Response) => {
+  const expectedKey = getAdminKey();
+  if (!expectedKey) { res.status(503).json({ success: false, error: "Admin not configured" }); return; }
+  const adminKey = (req.headers["x-admin-key"] as string) || "";
+  if (!adminKey || adminKey !== expectedKey) {
+    res.status(403).json({ success: false, error: "Krever X-Admin-Key header" });
+    return;
+  }
+
+  const body = (req.body || {}) as { limit?: unknown };
+  const raw = typeof body.limit === "number" && Number.isFinite(body.limit) ? Math.floor(body.limit) : 50;
+  const limit = Math.max(1, Math.min(500, raw));
+
+  const { auditSeedCoordinates } =
+    require("../services/agents-geocode-worker") as typeof import("../services/agents-geocode-worker");
+
+  try {
+    const audit = await auditSeedCoordinates(limit);
+    res.json({ success: true, data: { ...audit, limit } });
+  } catch (err: any) {
+    console.error("[seed-audit] admin run failed:", err);
+    res.status(500).json({ success: false, error: err?.message || "Seed audit failed" });
+  }
+});
+
 export default router;

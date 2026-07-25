@@ -26,6 +26,22 @@ export interface GeoResult {
 const geoCache = new Map<string, GeoResult | null>();
 const CACHE_MAX = 500;
 
+/**
+ * Separate cache for geocodePlaceForBackfill(). Deliberately NOT geoCache: the
+ * two functions legitimately return DIFFERENT answers for the same string (the
+ * backfill path skips the local-DB tier and prefers a same-named kommune over a
+ * hamlet), so a shared key would let a backfill answer leak into user-facing
+ * search and vice versa depending on which ran first.
+ */
+const backfillGeoCache = new Map<string, GeoResult | null>();
+
+/**
+ * Radius at which a MAJOR_CITIES entry stops being a town and starts being a
+ * region/fylke. See geocodePlaceForBackfill() for the enumeration this is
+ * derived from; it is the table's own documented heuristic, not a guess.
+ */
+const CURATED_REGION_MIN_RADIUS_KM = 50;
+
 // ── Injectable fetch (tests) ──────────────────────────────────────
 // Same seam shape as dental-geocode-worker.ts's GeocodeDeps.fetchImpl, but
 // module-level because geocodingService is a singleton every route imports
@@ -38,9 +54,10 @@ export function __setGeocodingFetchForTesting(impl?: typeof fetch): void {
   fetchImpl = impl || ((...args: Parameters<typeof fetch>) => fetch(...args));
 }
 
-/** Test-only: drop the in-memory geocode cache so each case starts clean. */
+/** Test-only: drop the in-memory geocode caches so each case starts clean. */
 export function __clearGeocodeCacheForTesting(): void {
   geoCache.clear();
+  backfillGeoCache.clear();
 }
 
 // ── Major Norwegian places hardcoded for speed (no API call needed) ──
@@ -370,6 +387,16 @@ const PLACE_TYPE_TIERS: ReadonlyArray<ReadonlySet<string>> = [
   MINOR_SETTLEMENT_TYPES,
 ];
 
+/**
+ * True when the type is a TOWN-scale settlement — the only tier the RFB
+ * backfill worker is willing to claim 'city' precision for
+ * (agents-geocode-worker.precisionForPlaceType). Exported rather than
+ * re-listed there so the two cannot drift.
+ */
+export function isMajorSettlementType(navneobjekttype: string | null | undefined): boolean {
+  return MAJOR_SETTLEMENT_TYPES.has((navneobjekttype || "").toLowerCase().trim());
+}
+
 /** True if Kartverket's navneobjekttype is a place we are willing to geocode to. */
 export function isAcceptablePlaceType(navneobjekttype: string | null | undefined): boolean {
   const t = (navneobjekttype || "").toLowerCase().trim();
@@ -516,6 +543,124 @@ class GeocodingService {
 
     this.cacheResult(key, apiResult); // cache null too to avoid repeated API calls
     return apiResult;
+  }
+
+  /**
+   * Place lookup for the BACKFILL workers' centroid tiers
+   * (agents-geocode-worker.ts Tier B and Tier C). NOT for the search hot path —
+   * geocode() above is unchanged.
+   *
+   * It differs from geocode() in exactly three ways, each forced by a live
+   * review finding against the first version of Tier C.
+   *
+   * 1. IT NEVER CONSULTS lookupInDatabase().
+   *    geocode() tries the local `agents` table (step 3) BEFORE Kartverket:
+   *      SELECT lat, lng, city FROM agents WHERE LOWER(city) = ? … LIMIT 1
+   *    — no ORDER BY, no provenance check, no type allowlist, no hovednavn
+   *    guard. It answers with SOME OTHER PRODUCER'S SEED COORDINATE. That is
+   *    reasonable for "roughly where is the user searching", and completely
+   *    wrong for "where is THIS producer", which is what the workers ask.
+   *    Measured: 80 of the 183 distinct Tier-C tokens (44 %) exactly match an
+   *    existing agents.city (Nes, Lunde, Hemnes, Sørum, Bergen, Ål …), so in
+   *    production those would have taken the DB path and never reached the
+   *    hardened lookup at all. Demonstrated end to end: a row «Ny Gård — Hegra»
+   *    adopted a sibling row's TROMSØ coordinate (69.6496/18.956), written as
+   *    source=database, precision=city. The 89.7 % resolve rate this tier was
+   *    justified with had been measured against an EMPTY agents table, and so
+   *    described a code path production would not have taken.
+   *    It matters even more for Tier B, whose input IS agents.city: there the
+   *    DB tier would have matched a same-city sibling essentially every time.
+   *
+   * 2. A HIT BELOW THE MAJOR-SETTLEMENT TIER MUST BE CORROBORATED.
+   *    lookupKartverket()'s ladder accepts a REGION (tier 3) or MINOR
+   *    settlement (tier 4) outright, and only falls through to the kommune
+   *    register when Stedsnavn found NOTHING acceptable. So a hamlet that
+   *    happens to share a name with a kommune wins and the kommune is never
+   *    asked for. Measured live:
+   *      «Gjerdrum» → Grend at 60.68335/11.7955, whose own kommune is Våler
+   *                   3419 (Innlandet) — while Gjerdrum kommune is
+   *                   60.0788/11.0206 in AKERSHUS, 79.6 km away in a different
+   *                   fylke. Two real producers (Bent Gate Brewing,
+   *                   Haukerudhagen) landed on it.
+   *      «Målselv»  → Landskapsområde, 45.7 km from Målselv kommune.
+   *    So when the hit is tier 3 or 4, ask Kommuneinfo for the same name and
+   *    PREFER an unambiguous same-named kommune. Measured across all 183 live
+   *    Tier-C tokens this touches exactly 8: Gjerdrum (79.6 km) and Målselv
+   *    (45.7 km) are outright corrections, Frøya (52 km) moves from the island
+   *    to its kommune (the right container for "this producer is in Frøya"),
+   *    and the other five move ≤ 10.5 km toward the administrative centre. The
+   *    18 MINOR and 4 REGION hits with NO same-named kommune — Flåm, Misvær,
+   *    Hegra, Feios, Tresfjord, Neiden … all genuine bygder — are untouched.
+   *    That is why this is preferred over the alternative "refuse tier-4
+   *    outright", which would have cost 18 real producers to fix 0 measured
+   *    errors.
+   *
+   * 3. `boligfelt` IS REFUSED OUTRIGHT.
+   *    A HOUSING ESTATE is never what «Produsent — Sted» means, and it is the
+   *    type behind the worst case in this whole dev-request: «Mevika» resolves
+   *    to a Boligfelt at 61.77669/5.27334 in Vestland, ~600 km from Gildeskål
+   *    in Nordland. Rule (2) cannot save that one — there is no Mevika kommune
+   *    — so the type is excluded instead. Measured cost on the live cohort:
+   *    ZERO. Not one of the 183 tokens resolves to a Boligfelt (the 18
+   *    uncorroborated MINOR hits are 17 × «Bygdelag (bygd)» + 1 × «Tettsteddel»).
+   *
+   * RESIDUAL RISK, STATED RATHER THAN PAPERED OVER: a tier-3/tier-4 hit with no
+   * same-named kommune is still only hamlet-scale evidence, and nothing
+   * available at lookup time distinguishes a correct «Flåm» from a hypothetical
+   * wrong one. What IS bounded is the claim we then make: the worker's
+   * precisionForPlaceType() tags every non-MAJOR hit 'kommune', the coarsest
+   * tier, which the honesty rule renders without any km figure.
+   */
+  async geocodePlaceForBackfill(placeName: string): Promise<GeoResult | null> {
+    const key = (placeName || "").toLowerCase().trim();
+    if (!key || key.length < 2) return null;
+    if (backfillGeoCache.has(key)) return backfillGeoCache.get(key) || null;
+
+    let result: GeoResult | null = null;
+
+    // Curated major-city table: static, hand-maintained, no fuzzy matching.
+    // Safe, and it is why «Bergen»/«Stavanger»/«Alta» cost no request at all.
+    const hardcoded = MAJOR_CITIES[key];
+    if (hardcoded) {
+      result = {
+        lat: hardcoded.lat, lng: hardcoded.lng, name: placeName,
+        radiusKm: hardcoded.radius, source: "hardcoded",
+        // The curated table carries no navneobjekttype, but the worker's
+        // precisionForPlaceType() needs one to decide what we may CLAIM — and
+        // defaulting it to "unknown" would have silently demoted every major
+        // city to the kommune tier (caught by the Fase-1a suite's w9, which
+        // asserts Vadsø lands at 'city').
+        //
+        // The table's own documented radius heuristic separates the two kinds
+        // cleanly: "storby 25-30 km, medium 20-25 km, tettsted 15-20 km,
+        // region/dal 40-60 km, fylke 80-120 km". Everything at or above 50 km
+        // is a region or fylke — hallingdal, setesdal, lofoten, vesterålen and
+        // the eleven fylke entries, verified by enumerating all 184 keys. The
+        // single value in between is Bodø at 40, which is a by, so the cut sits
+        // at 50 rather than 40.
+        placeType: hardcoded.radius < CURATED_REGION_MIN_RADIUS_KM ? "By" : "Landskapsområde",
+      };
+    } else {
+      // NOTE the absence of a lookupInDatabase() step — see (1).
+      result = await this.lookupKartverket(key);
+
+      if (result && (result.placeType || "").toLowerCase().trim() === "boligfelt") {
+        result = null;                                                    // (3)
+      } else if (result && placeTypeTier(result.placeType) >= 2) {
+        const kommune = await this.lookupKommuneinfo(key);                // (2)
+        if (kommune) result = kommune;
+      }
+
+      // Unchanged fallback: Stedsnavn had nothing acceptable at all.
+      if (!result) result = await this.lookupKommuneinfo(key);
+    }
+
+    if (backfillGeoCache.size >= CACHE_MAX) {
+      const firstKey = backfillGeoCache.keys().next().value;
+      if (firstKey) backfillGeoCache.delete(firstKey);
+    }
+    backfillGeoCache.set(key, result);
+    return result;
   }
 
   /**

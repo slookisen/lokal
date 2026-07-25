@@ -11,7 +11,21 @@
  * 423 rows the selector could not reach AT ALL. This suite covers the four
  * things that fixes:
  *
- *   tc1-tc12   Tier C — the place suffix in the producer's own name. Including
+ *   b1-b6      REVIEW B1 — a hamlet must not outrank the kommune it shares a
+ *              name with. Two REAL producers landed on the Gjerdrum Grend in
+ *              Innlandet, 79.6 km from Gjerdrum kommune in Akershus.
+ *   db1-db3    REVIEW B2 — the centroid tiers must never consult the local
+ *              `agents` table (reproduced: «Ny Gård — Hegra» adopting a sibling
+ *              row's Tromsø coordinate).
+ *   lb1-lb4    The honesty label must say WHERE the producer is — this cohort
+ *              has city = NULL, and the registry's legacy `|| "Oslo"` default
+ *              would have announced ~250 of them as «i Oslo-området».
+ *   tb1-tb2    REVIEW B3 — Tier B's own no-coordinates guard, the one
+ *              protecting the ~110 seed-coordinate rows.
+ *   hb1-hb2    REVIEW B3 — the postal backlog probe counts only NEVER-attempted
+ *              rows, so a permanently-unresolvable row cannot pin the fast
+ *              cadence on for ever.
+ *   tc1-tc14   Tier C — the place suffix in the producer's own name. Including
  *              the LAST-TOKEN-FIRST rule, which is a measured safety property:
  *              locality-first resolved «Mevika, Gildeskål» ~600 km wrong.
  *   pk1-pk9    Parking — an honest terminal state instead of an infinite retry,
@@ -32,9 +46,12 @@
  *              counter when it lands the postnummer that was blocking a row.
  *
  * MUTATION-TESTED. Every guarantee claimed above was verified by breaking the
- * source and confirming this suite goes red — the specific mutations are listed
+ * source and confirming this suite goes red — 28 mutants, 28 killed, listed
  * against each block below. A test that passes with its guard removed is worse
- * than no test, and two such were found in this file's siblings today.
+ * than no test: THREE vacuous tests were found this way in this very file
+ * (tc4 used a name with no hyphen; tc9 and the Tier-B twin were both masked by
+ * the SQL selector), and an independent reviewer found two more the first pass
+ * had missed. The mutation list is part of the deliverable, not a footnote.
  *
  * Setup mirrors agents-geocode-worker.test.ts: in-memory DB running the REAL
  * production schema via __setDbForTesting/__initSchemaForTesting, singleton
@@ -125,6 +142,7 @@ export function runGeocodeCoverageBoostTests(opts: { log?: boolean } = {}): Prom
     // place ~600 km away (the real measured trap); "Ingenstedet"/"Nowhere" do
     // not resolve at all.
     let stedsnavnCalls: string[] = [];
+    let kommuneCalls: string[] = [];
     geo.__setGeocodingFetchForTesting((async (input: any) => {
       const url = decodeURIComponent(String(input));
       const m = /sok=([^&]+)/i.exec(url);
@@ -132,10 +150,36 @@ export function runGeocodeCoverageBoostTests(opts: { log?: boolean } = {}): Prom
       if (url.includes("/stedsnavn/")) {
         stedsnavnCalls.push(q);
         if (q === "rana") return json(stedsnavn("Rana", "Kommune", 66.31, 14.14));
+        // The live B1 case: Kartverket's top acceptable hit for «Gjerdrum» is a
+        // Grend in Våler, Innlandet — 79.6 km from Gjerdrum kommune in Akershus.
+        if (q === "gjerdrum") return json(stedsnavn("Gjerdrum", "Grend", 60.68335, 11.7955));
+        // The 600-km Boligfelt.
+        if (q === "mevika") return json(stedsnavn("Mevika", "Boligfelt", 61.77669, 5.27334));
+        // A genuine bygd with no same-named kommune — must survive untouched.
+        if (q === "hegra") return json(stedsnavn("Hegra", "Bygdelag (bygd)", 63.464, 11.114));
+        if (q === "stokmarknes") return json(stedsnavn("Stokmarknes", "By", 68.5655, 14.9046));
         if (q === "gildeskål") return json(stedsnavn("Gildeskål", "Kommune", 67.006, 13.9437));
-        if (q === "mevika") return json(stedsnavn("Mevika", "Boligfelt", 61.7767, 5.2733));
         if (q === "misvær") return json(stedsnavn("Misvær", "Tettsted", 67.1188, 14.9992));
         if (q === "vadsø") return json(stedsnavn("Vadsø", "By", 70.0744, 29.7487));
+      }
+      if (url.includes("/kommuneinfo/")) {
+        const kn = /knavn=([^&]+)/i.exec(url)?.[1]?.toLowerCase() || "";
+        kommuneCalls.push(kn);
+        // Only these names are real kommuner. «Hegra», «Mevika» and «Misvær»
+        // are not — Kommuneinfo answers 404, which is the case that must NOT
+        // discard an otherwise-good bygd hit.
+        const K: Record<string, [number, number]> = {
+          "gjerdrum": [60.0788, 11.0206],
+          "gildeskål": [67.006, 13.9437],
+          "rana": [66.31, 14.14],
+          "senja": [69.2311, 17.9873],
+        };
+        const hit = K[kn];
+        if (!hit) return { ok: false, status: 404, json: async () => ({}) } as unknown as Response;
+        return json({ kommuner: [{
+          kommunenavn: kn, kommunenavnNorsk: kn, kommunenummer: "9999",
+          punktIOmrade: { coordinates: [hit[1], hit[0]] },
+        }] });
       }
       return { ok: false, status: 404, json: async () => ({}) } as unknown as Response;
     }) as unknown as typeof fetch);
@@ -178,7 +222,7 @@ export function runGeocodeCoverageBoostTests(opts: { log?: boolean } = {}): Prom
       };
       const rowOf = (id: string) => db
         .prepare(`SELECT lat, lng, geo_precision, geocode_source, geocode_outcome,
-                         geocode_attempted_at, geocode_attempts
+                         geocode_attempted_at, geocode_attempts, geo_place_label
                     FROM agents WHERE id = ?`)
         .get(id) as any;
 
@@ -271,6 +315,131 @@ export function runGeocodeCoverageBoostTests(opts: { log?: boolean } = {}): Prom
       }
 
       // ═══════════════════════════════════════════════════════════════
+      // b1-b6 — REVIEW B1: a hamlet must not outrank the kommune it shares
+      // a name with. Two REAL producers (Bent Gate Brewing, Haukerudhagen)
+      // landed on the Gjerdrum Grend in Innlandet — 79.6 km from Gjerdrum
+      // kommune in Akershus, a different fylke.
+      // Mutations verified to turn these red:
+      //   • drop the kommune-corroboration step  → b1/b2 fail
+      //   • drop the boligfelt refusal           → b5 fails
+      //   • corroborate MAJOR hits too           → b4 fails (extra request)
+      // ═══════════════════════════════════════════════════════════════
+      {
+        geo.__clearGeocodeCacheForTesting();
+        kommuneCalls = [];
+        seed({ id: "b1-gjerdrum", name: "Bent Gate Brewing — Gjerdrum" });
+        await worker.agentsGeocodeTick(50, deps);
+        const g = rowOf("b1-gjerdrum");
+        assertEq(g.lat, 60.0788,
+          "b1: a Grend hit is corroborated against Kommuneinfo and the KOMMUNE wins (Akershus, not the Innlandet hamlet)");
+        assertEq(g.geo_precision, "kommune",
+          "b2: …and the claim is the coarse tier, which the honesty rule renders without a km figure");
+        assertEq(g.geo_place_label, "gjerdrum",
+          "b3: …labelled with the place that actually answered");
+
+        // A town-scale hit must NOT pay an extra Kommuneinfo request.
+        geo.__clearGeocodeCacheForTesting();
+        kommuneCalls = [];
+        // Stokmarknes, not Vadsø: Vadsø is in the curated MAJOR_CITIES table and
+        // so never reaches Kartverket, which would make this assert nothing.
+        seed({ id: "b1-major", name: "Bakeri — Stokmarknes" });
+        await worker.agentsGeocodeTick(50, deps);
+        assertEq(kommuneCalls.length, 0,
+          "b4: a MAJOR settlement hit is trusted outright — no extra corroboration request");
+        assertEq(rowOf("b1-major").geo_precision, "city",
+          "b4b: …and a town is the only thing allowed to claim the 'city' tier");
+
+        // The curated MAJOR_CITIES table holds regions and fylker («Hallingdal»,
+        // «Setesdal», «Trøndelag») alongside towns, and carries no
+        // navneobjekttype of its own. It is classified by its own documented
+        // radius heuristic so a town still claims 'city' while a region claims
+        // the coarse tier — getting this wrong demoted every major city at once
+        // (caught by the Fase-1a suite, not by this one, which is why it is
+        // asserted here now).
+        geo.__clearGeocodeCacheForTesting();
+        seed({ id: "b1-hardcoded", name: "Bakeri — Vadsø" });
+        await worker.agentsGeocodeTick(50, deps);
+        assertEq(rowOf("b1-hardcoded").geo_precision, "city",
+          "b4c: a curated TOWN entry still claims 'city' — the table is not blanket-demoted");
+        const region = await geo.geocodingService.geocodePlaceForBackfill("Hallingdal");
+        assertEq(worker.precisionForPlaceType(region?.placeType), "kommune",
+          "b4d: …while a curated REGION entry claims the coarse tier, never 'city'");
+
+        // Boligfelt: refused outright. This is the 600 km «Mevika» point.
+        geo.__clearGeocodeCacheForTesting();
+        seed({ id: "b1-mevika", name: "Solvold Gård — Mevika" });
+        await worker.agentsGeocodeTick(50, deps);
+        const mv = rowOf("b1-mevika");
+        assertEq(mv.lat, null,
+          "b5: a Boligfelt is REFUSED — «Mevika» does not get written at 61.78/5.27, ~600 km from Gildeskål");
+        assertEq(mv.geocode_outcome, "no_match", "b5b: …and the row is honestly stamped no_match");
+
+        // A genuine bygd with no same-named kommune survives untouched — this
+        // is what "refuse tier-4 outright" would have cost 18 producers.
+        geo.__clearGeocodeCacheForTesting();
+        seed({ id: "b1-hegra", name: "Fuldseth Gård — Hegra" });
+        await worker.agentsGeocodeTick(50, deps);
+        assertEq(rowOf("b1-hegra").lat, 63.464,
+          "b6: a Bygdelag with no same-named kommune is KEPT (Kommuneinfo 404 must not discard a good hit)");
+      }
+
+      // ═══════════════════════════════════════════════════════════════
+      // db1-db3 — REVIEW B2: the centroid tiers must never consult the local
+      // `agents` table. geocode() tries it BEFORE Kartverket and answers with
+      // another producer's seed coordinate; 80 of 183 live Tier-C tokens match
+      // an existing agents.city, so production would have taken that path.
+      // Mutation verified: point placeCentroid back at geocodingService.geocode
+      //   → db1/db2 fail (the row adopts the sibling's Tromsø position).
+      // ═══════════════════════════════════════════════════════════════
+      {
+        geo.__clearGeocodeCacheForTesting();
+        // A sibling row whose city is «Hegra» but whose coordinate is TROMSØ —
+        // exactly the shape lookupInDatabase() would hand back.
+        seed({ id: "db-sibling", name: "Sibling", city: "Hegra", lat: 69.6496, lng: 18.956,
+               geo_precision: "address" });
+        seed({ id: "db-victim", name: "Ny Gård — Hegra" });
+        await worker.agentsGeocodeTick(50, deps);
+        const v = rowOf("db-victim");
+        assertEq(v.lat, 63.464,
+          "db1: Tier C resolves «Hegra» through KARTVERKET, not through a sibling row's coordinate");
+        assertTrue(v.lat !== 69.6496,
+          "db2: …so it does not adopt the sibling's Tromsø position (the reproduced B2 bug)");
+        assertTrue(v.geocode_source !== "database",
+          `db3: …and never records source=database (got ${JSON.stringify(v.geocode_source)})`);
+      }
+
+      // ═══════════════════════════════════════════════════════════════
+      // lb1-lb4 — the honesty LABEL must say where the producer is.
+      // This cohort has city = NULL by definition, and the registry's legacy
+      // `row.city || "Oslo"` default would have announced ~250 producers in
+      // Rana/Misvær/Flåm as «i Oslo-området».
+      // Mutations verified to turn these red:
+      //   • stop persisting geo_place_label      → lb1/lb3 fail
+      //   • drop the geo_place_label fallback in
+      //     marketplace-registry's location map  → lb3/lb4 fail («Oslo»)
+      // ═══════════════════════════════════════════════════════════════
+      {
+        geo.__clearGeocodeCacheForTesting();
+        seed({ id: "lb-1", name: "Straumbotn Gård — Rana" });
+        await worker.agentsGeocodeTick(50, deps);
+        assertEq(rowOf("lb-1").geo_place_label, "Rana",
+          "lb1: the resolved place is PERSISTED — without it the label has nothing to say");
+
+        const precision = require("./geo-precision") as typeof import("./geo-precision");
+        assertEq(precision.formatRfbDistanceLabel(4.2, "kommune", "Rana"), "i Rana-området",
+          "lb2: a centroid row with a place renders «i X-området», never a km figure");
+        assertEq(precision.formatRfbDistanceLabel(4.2, "kommune", null), "omtrentlig posisjon",
+          "lb2b: …and without one it degrades to the useless bare string — which is why lb1 matters");
+
+        const registry = require("./marketplace-registry") as any;
+        const agent = registry.marketplaceRegistry.getAgent("lb-1");
+        assertEq(agent?.location?.city, "Rana",
+          "lb3: the registry surfaces the resolved place as the location label…");
+        assertTrue(agent?.location?.city !== "Oslo",
+          "lb4: …instead of the legacy «Oslo» default, which would name the wrong city outright");
+      }
+
+      // ═══════════════════════════════════════════════════════════════
       // pk1-pk9 — parking: a terminal state, not an infinite retry
       // Mutations verified to turn these red:
       //   • drop NOT_PARKED from SELECTABLE           → pk3 fails
@@ -320,6 +489,60 @@ export function runGeocodeCoverageBoostTests(opts: { log?: boolean } = {}): Prom
         assertEq(rowOf("pk-miss").geocode_attempts, 0, "pk8b: …so the row is selectable again");
         assertTrue(worker.agentsGeocodeQueueStatus().pending > 0,
           "pk9: …and shows up as pending once more");
+      }
+
+      // ═══════════════════════════════════════════════════════════════
+      // tb1-tb2 — REVIEW B3 / M21: Tier B's own no-coordinates guard.
+      // This is the guard protecting the ~110 `seed_coordinates_no_address`
+      // rows — the cohort the whole "do we reclassify seed coordinates"
+      // question is about — and deleting it left every suite green, exactly
+      // like the Tier-C twin (tc9→tc13) found earlier by self-mutation.
+      // Same fixture shape: the SQL selector requires NO coordinates for Tier
+      // B, so only a row selected on TIER A (address + postnummer) whose
+      // address then MISSES can reach Tier B with a coordinate present. Only
+      // the in-loop guard stops the overwrite there.
+      // Mutation verified: delete `hasNoPosition` from the Tier B condition
+      //   → tb1/tb2 fail (the seed coordinate is replaced by a city centroid).
+      // ═══════════════════════════════════════════════════════════════
+      {
+        db.exec(`DELETE FROM agent_knowledge; DELETE FROM agents;`);
+        geo.__clearGeocodeCacheForTesting();
+        seed({
+          id: "tb-seed", name: "Seedgård uten navnesuffiks",
+          lat: 59.9, lng: 10.7,          // unknown-provenance seed coordinate
+          city: "Vadsø",                 // Tier B would resolve this…
+          address: "Ingenveien 1", postal_code: "9999",  // …but Tier A selects and misses
+        });
+        await worker.agentsGeocodeTick(50, deps);
+        const tb = rowOf("tb-seed");
+        assertEq(tb.lat, 59.9,
+          "tb1: Tier B does NOT overwrite an existing seed coordinate with a city centroid, even on a selected row");
+        assertEq(tb.geo_precision, null,
+          "tb2: …and the row keeps its honest unknown provenance rather than being relabelled 'city'");
+      }
+
+      // ═══════════════════════════════════════════════════════════════
+      // hb1-hb2 — REVIEW B3 / M24: the postal worker's backlog probe must
+      // count only NEVER-ATTEMPTED rows. Counting every row still missing a
+      // postnummer would keep the fast cadence on for ever, because most of
+      // this worker's refusals are permanent (an address with no house number
+      // never becomes unique) — "a hot loop dressed as a backlog", as the
+      // source comment puts it. Nothing asserted it.
+      // Mutation verified: drop the postal_backfill_attempted_at IS NULL
+      //   clause → hb2 fails (backlog still true after the row was attempted).
+      // ═══════════════════════════════════════════════════════════════
+      {
+        db.exec(`DELETE FROM agent_knowledge; DELETE FROM agents;`);
+        seed({ id: "hb-1", name: "Uten postnummer", city: "Vadsø", address: "Gate 1" });
+        assertTrue(postal.postalBackfillHasBacklog(),
+          "hb1: a never-attempted address-without-postnummer row IS a backlog");
+
+        db.prepare(
+          `UPDATE agent_knowledge SET postal_backfill_attempted_at = ?, postal_backfill_outcome = 'unusable_input'
+            WHERE agent_id = 'hb-1'`
+        ).run(new Date().toISOString());
+        assertTrue(!postal.postalBackfillHasBacklog(),
+          "hb2: once attempted it is NOT — a permanently-unresolvable row must let the cadence decay, not pin it fast for ever");
       }
 
       // ═══════════════════════════════════════════════════════════════
@@ -382,7 +605,11 @@ export function runGeocodeCoverageBoostTests(opts: { log?: boolean } = {}): Prom
       // ═══════════════════════════════════════════════════════════════
       // sc1-sc9 — the adaptive scheduler and ALWAYS-RESCHEDULE
       // Mutations verified to turn these red:
-      //   • move the re-arm out of `finally` into the try  → sc5 fails
+      //   • DELETE the `finally` (so a throwing tick escapes)  → sc5/sc6 fail
+      //     — the earlier claim here was "move the re-arm out of finally into
+      //     the try", which is NOT a killable mutant: `finally` still runs when
+      //     the catch returns, so that edit changes nothing. Review caught the
+      //     bad claim; the corrected mutation above does kill sc5/sc6.
       //   • drop the try/catch around hasBacklog()         → sc7 throws, sc7/sc8 fail
       //   • return backlogDelayMs unconditionally          → sc3 fails
       // ═══════════════════════════════════════════════════════════════
