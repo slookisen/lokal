@@ -362,7 +362,10 @@ export async function runMarketplaceSearchHonestyTests(opts: { log?: boolean } =
     console.log = prevLogLevel;
     __setGeocodingFetchForTesting();
     __clearGeocodeCacheForTesting();
-    try { db.close(); } catch { /* already closed */ }
+    // Deliberately NOT db.close(): this handle is still the shared getDb()
+    // singleton (__setDbForTesting has no restore hook), and closing it would
+    // break any later block that reads the singleton. Same discipline as the
+    // other singleton-swapping suites in tests/test.ts.
   }
 
   return { passed, failed, failures };
