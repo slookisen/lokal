@@ -241,6 +241,26 @@ if (process.env.ENABLE_DENTAL === "1") {
   });
 }
 
+// ─── Gårdssalg producer owner-claim (dev-request 2026-07-21-opplevagent-
+// claim-flyt-drikkeprodusenter) ───────────────────────────────────────────
+// Mounted HERE — before the opplevagent.no host-gate below — not at its
+// original root-mount position further down (see the ownerPortalRoutes
+// block after that host-gate). The host-gate's own catch-all 404 handler
+// (experiences-seo.ts's trailing `router.use(...)`) swallows every
+// opplevagent.no request that doesn't match one of its explicit pass-
+// throughs (api/health/mcp/a2a) BEFORE it ever reaches a root-mounted
+// router registered later in this file — so mounting gardssalgClaimRoutes
+// after the host-gate (as originally done) made every
+// /kategori/gardssalg/eier/* and /api/opplevelser/gardssalg-claim/* request
+// 404 on opplevagent.no, the only host this feature is for. Confirmed live
+// (2026-07-25) via curl against the deployed claim-entry page. Its path
+// prefixes are unique to the experiences vertical and never collide with
+// any RFB/dental route (same reasoning as before — see
+// src/routes/gardssalg-claim.ts's module doc), so mounting it earlier, on
+// every host, is still correct: it simply calls next() for every non-
+// matching path, same as any other router.
+app.use("/", gardssalgClaimRoutes);
+
 // ─── orchestrator-pr-19: opplevagent.no host routing (experiences) ─────
 // Mirrors the PR-109 dental host-gate exactly, for the experiences vertical.
 // Registered BEFORE agentReadinessRoutes, ownerPortalRoutes and
@@ -320,17 +340,8 @@ app.use("/", agentReadinessRoutes);
 // Mounted at root because it serves both /api/agents/:id/* and /magic-link-verify.
 app.use("/", ownerPortalRoutes);
 
-// ─── Gårdssalg producer owner-claim (dev-request 2026-07-21-opplevagent-
-// claim-flyt-drikkeprodusenter) ───────────────────────────────────────────
-// Mirrors ownerPortalRoutes above: mounted at root (unconditionally, same as
-// opplevelserRoutes at /api/opplevelser below — not gated behind
-// ENABLE_EXPERIENCES, matching that existing precedent) because it serves
-// both /kategori/gardssalg/eier/* (HTML) and
-// /api/opplevelser/gardssalg-claim/:providerId/* (JSON). Its path prefixes
-// are unique to the experiences vertical and never collide with any RFB/
-// dental route, so no host-gating is needed for correctness — see
-// src/routes/gardssalg-claim.ts's module doc for the full design rationale.
-app.use("/", gardssalgClaimRoutes);
+// (gardssalgClaimRoutes is mounted earlier — before the opplevagent.no
+// host-gate above — see the comment there for why.)
 
 // ─── orch-pr-20260714-claim-opened-instrumentation: /selger.html open tracking ──
 // Registered BEFORE express.static so this exact path is tracked before
