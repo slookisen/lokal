@@ -335,10 +335,25 @@ export function initExperiencesSchema(db: Database.Database): void {
   // address (high/medium/low Kartverket confidence), 'kommune' = fallback
   // centroid via geocodingService (provider missing/ungeocodable, or experience
   // has no provider yet — harvest-first model). NULL = not yet resolved.
+  //
+  // meeting_point_geocode_attempted_at (dev-request 2026-07-25-reisesok, Fase
+  // 1b, review B2) is the NEGATIVE CACHE for Step F. Step F re-attempts
+  // kommune-precision rows at address level from `meeting_point`, and its two
+  // give-up paths (the text is not address-shaped / Kartverket found nothing)
+  // originally wrote nothing at all — so the unresolvable residue was
+  // re-selected identically every hour forever AND starved every row behind
+  // the LIMIT (measured: 3 ticks, byte-identical query list, rows 4-6 never
+  // reached; ~100 futile requests/hour against a free public API). It is now
+  // stamped on EVERY Step F attempt whatever the outcome, and the selector
+  // orders by it (never-attempted first), so failures rotate to the back of
+  // the queue instead of blocking it. Same lesson as
+  // agent_knowledge.last_enrichment_attempt_at (dev-request 2026-07-19) and
+  // agents.geocode_attempted_at (Fase 1a).
   const geocodeBackfillCols = [
     "ALTER TABLE experience_providers ADD COLUMN geocode_source TEXT",
     "ALTER TABLE experience_providers ADD COLUMN geocode_confidence TEXT",
     "ALTER TABLE experiences ADD COLUMN geo_precision TEXT",
+    "ALTER TABLE experiences ADD COLUMN meeting_point_geocode_attempted_at TEXT",
   ];
   for (const stmt of geocodeBackfillCols) {
     try { db.exec(stmt); } catch { /* already present */ }

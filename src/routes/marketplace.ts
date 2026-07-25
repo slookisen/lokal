@@ -5823,13 +5823,24 @@ router.post("/admin/agents/geocode-batch", async (req: Request, res: Response) =
   }
 
   const body = (req.body || {}) as { limit?: unknown; dry_run?: unknown };
-  const rawLimit = typeof body.limit === "number" ? Math.floor(body.limit) : 50;
-  const limit = Math.max(1, Math.min(200, Number.isFinite(rawLimit) ? rawLimit : 50));
-  const dryRun = body.dry_run === true;
+
+  const {
+    agentsGeocodeTick, agentsGeocodeQueueStatus, clampGeocodeBatchLimit, parseDryRunFlag,
+  } = require("../services/agents-geocode-worker") as typeof import("../services/agents-geocode-worker");
+
+  const limit = clampGeocodeBatchLimit(body.limit);
+
+  // REVIEW B4: strict boolean. `dry_run === true` fails OPEN — {"dry_run":"true"}
+  // would have run a REAL write against prod, on the one endpoint whose whole
+  // purpose is rehearsing against prod. Reject rather than interpret.
+  const dry = parseDryRunFlag(body.dry_run);
+  if (!dry.ok) {
+    res.status(400).json({ success: false, error: dry.error });
+    return;
+  }
+  const dryRun = dry.dryRun;
 
   try {
-    const { agentsGeocodeTick, agentsGeocodeQueueStatus } =
-      require("../services/agents-geocode-worker") as typeof import("../services/agents-geocode-worker");
 
     const before = agentsGeocodeQueueStatus();
     const result = await agentsGeocodeTick(limit, { dryRun });

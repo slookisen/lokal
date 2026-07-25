@@ -1533,7 +1533,25 @@ class MarketplaceRegistry {
       const maxDist = query.maxDistanceKm || 20;
       const distScore = Math.max(0, 1 - dist / maxDist);
       score += 0.15 * distScore;
-      if (dist < 5) reasons.push(`${dist.toFixed(1)} km unna`);
+      // REVIEW B1 (Fase 1c): matchReasons is a SECOND distance surface and it
+      // was not gated. `matchReasons` is spread verbatim into the
+      // /api/marketplace/search JSON (routes/marketplace.ts) and rendered as
+      // the «Match:» line by the Smithery-published stdio MCP server
+      // (src/mcp/server.ts) — so a city-centroid producer was still telling an
+      // AI assistant «1.1 km unna» while location.distanceKm was correctly
+      // withheld. Same gate as resultLocation(): only address precision may
+      // state a number; a centroid says where it is instead.
+      // The SCORE above is deliberately untouched — a centroid is still the
+      // best position estimate we have for ranking. This governs what we say.
+      if (dist < 5) {
+        const precision = agent.geoPrecision ?? null;
+        reasons.push(
+          shouldSuppressDistance(precision)
+            ? (formatRfbDistanceLabel(dist, precision, agent.location.city)
+               ?? "i nærheten (omtrentlig posisjon)")
+            : `${dist.toFixed(1)} km unna`
+        );
+      }
     }
 
     score += 0.05 * agent.trustScore;

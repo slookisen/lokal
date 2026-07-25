@@ -96,6 +96,8 @@ export type AgentsGeocodeResult = {
   duration_ms: number;
   /** Populated on dry runs so an admin can see exactly what a real run does. */
   planned: AgentsGeocodePlannedChange[];
+  /** True when the single-flight guard turned this call into a no-op. */
+  skipped_already_running: boolean;
 };
 
 type CandidateRow = {
@@ -120,6 +122,52 @@ function nextAttemptStamp(): string {
   const now = Date.now();
   lastStampMs = now > lastStampMs ? now : lastStampMs + 1;
   return new Date(lastStampMs).toISOString();
+}
+
+// ── Single-flight guard (review follow-up 6) ────────────────────────
+// The hourly setInterval tick and an admin POST /admin/agents/geocode-batch
+// can overlap. Selection happens up front and the attempt stamp is only
+// written when a row FINISHES, so two concurrent ticks select the identical
+// batch: measured 4/4 overlap and 8 Kartverket requests for 4 rows. The
+// outcome is benign (same writes, never-downgrade holds) but it doubles load
+// on a free public API and makes a dry run's `planned` list misleading.
+// A module-level flag is enough — this worker is single-process by design.
+let running = false;
+
+// ── Admin-request parsing (pure, unit-tested) ───────────────────────
+// Extracted from the route so the two decisions that actually matter are
+// testable without touching process.env.ADMIN_KEY — the shared global behind
+// this repo's documented cart-*/gardssalg-claim/orch-pr-9 test races.
+
+export const GEOCODE_BATCH_LIMIT_DEFAULT = 50;
+export const GEOCODE_BATCH_LIMIT_MAX = 200;
+
+/** Clamp a caller-supplied batch limit into [1, 200]; non-numbers → default. */
+export function clampGeocodeBatchLimit(raw: unknown): number {
+  const n = typeof raw === "number" && Number.isFinite(raw) ? Math.floor(raw) : GEOCODE_BATCH_LIMIT_DEFAULT;
+  return Math.max(1, Math.min(GEOCODE_BATCH_LIMIT_MAX, n));
+}
+
+/**
+ * Parse the dry_run flag STRICTLY (review B4).
+ *
+ * `body.dry_run === true` fails OPEN: `{"dry_run":"true"}` — the obvious curl
+ * typo, and JSON-stringified booleans are common from shell scripts — is not
+ * `true`, so it silently performed a REAL WRITE against production. This
+ * endpoint exists precisely to rehearse against prod, so failing open defeats
+ * its purpose. Anything that is not a real boolean is now rejected rather than
+ * interpreted. (The repo's other dry_run endpoints use the loose convention,
+ * but none of them is a prod-mutation rehearsal switch.)
+ */
+export function parseDryRunFlag(raw: unknown): { ok: true; dryRun: boolean } | { ok: false; error: string } {
+  if (raw === undefined || raw === null) return { ok: true, dryRun: false };
+  if (typeof raw === "boolean") return { ok: true, dryRun: raw };
+  return {
+    ok: false,
+    error:
+      `dry_run må være en boolsk verdi (true/false uten anførselstegn) — fikk ${JSON.stringify(raw)}. ` +
+      `Avvist i stedet for tolket: en feilskrevet dry_run ville ellers ha kjørt en ekte skriving mot produksjon.`,
+  };
 }
 
 /**
@@ -168,21 +216,8 @@ export function agentsGeocodeQueueStatus(): {
   };
 }
 
-/**
- * One tick. Selects up to `limit` active producers that could still improve,
- * runs Tier A then Tier B per row, and stamps every attempt so the next tick
- * picks a disjoint batch.
- */
-export async function agentsGeocodeTick(
-  limit: number = 50,
-  deps: AgentsGeocodeDeps = {}
-): Promise<AgentsGeocodeResult> {
-  const start = Date.now();
-  const dryRun = deps.dryRun === true;
-  const db = getDb();
-  const sleep = deps.sleep ?? ((ms: number) => new Promise((r) => setTimeout(r, ms)));
-
-  const stats: AgentsGeocodeResult = {
+function emptyStats(dryRun: boolean): AgentsGeocodeResult {
+  return {
     dry_run: dryRun,
     processed: 0,
     address_precision: 0,
@@ -195,7 +230,45 @@ export async function agentsGeocodeTick(
     errors: 0,
     duration_ms: 0,
     planned: [],
+    skipped_already_running: false,
   };
+}
+
+/**
+ * One tick. Selects up to `limit` active producers that could still improve,
+ * runs Tier A then Tier B per row, and stamps every attempt so the next tick
+ * picks a disjoint batch.
+ *
+ * Single-flight (review follow-up 6): if a tick is already in progress this
+ * returns immediately with skipped_already_running=true rather than selecting
+ * — and re-fetching — the same batch a second time.
+ */
+export async function agentsGeocodeTick(
+  limit: number = 50,
+  deps: AgentsGeocodeDeps = {}
+): Promise<AgentsGeocodeResult> {
+  if (running) {
+    console.log("[agents-geocode] tick skipped — a tick is already running");
+    return { ...emptyStats(deps.dryRun === true), skipped_already_running: true };
+  }
+  running = true;
+  try {
+    return await runAgentsGeocodeTick(limit, deps);
+  } finally {
+    running = false;
+  }
+}
+
+async function runAgentsGeocodeTick(
+  limit: number,
+  deps: AgentsGeocodeDeps
+): Promise<AgentsGeocodeResult> {
+  const start = Date.now();
+  const dryRun = deps.dryRun === true;
+  const db = getDb();
+  const sleep = deps.sleep ?? ((ms: number) => new Promise((r) => setTimeout(r, ms)));
+
+  const stats: AgentsGeocodeResult = emptyStats(dryRun);
 
   // ── Candidate selection ───────────────────────────────────────────
   // A row is worth a lookup when it is active, is not already at address
@@ -223,9 +296,15 @@ export async function agentsGeocodeTick(
     )
     .all(limit) as CandidateRow[];
 
+  // geocode_prev_lat/lng capture the coordinate this worker is about to
+  // overwrite (review follow-up 10), in the SAME statement so there is no
+  // window where the old value is lost but the new one is not yet written.
+  // Tier A replaces seed coordinates in place, so without this the
+  // dev-request's "kan stoppes" rollback restores nothing.
   const updatePosition = db.prepare(
     `UPDATE agents
-        SET lat = ?, lng = ?, geo_precision = ?, geocode_source = ?,
+        SET geocode_prev_lat = lat, geocode_prev_lng = lng,
+            lat = ?, lng = ?, geo_precision = ?, geocode_source = ?,
             geocode_outcome = ?, geocode_attempted_at = ?
       WHERE id = ?`
   );
@@ -304,6 +383,22 @@ export async function agentsGeocodeTick(
     } catch (err) {
       stats.errors++;
       console.error(`[agents-geocode] failed for ${row.id}:`, err);
+      // REVIEW B3: the ALWAYS-STAMP invariant this file's header states was
+      // not honoured on the error path. A row that throws every tick (bad
+      // upstream data, a persistent DNS/TLS failure for its address) kept
+      // NULL geocode_attempted_at, so the selector re-picked the identical
+      // head of the queue forever and everything behind the LIMIT starved —
+      // at limit=50, fifty persistently-erroring rows silently halt the whole
+      // backfill and the only symptom is `errors=50` in an hourly log line.
+      // Stamping an 'error' outcome rotates them out; they come back round
+      // once the rest of the universe has been attempted.
+      try {
+        recordAttemptOnly(row, "error");
+      } catch (stampErr) {
+        // Guard the guard: if the DB itself is the thing failing, a throw here
+        // would abort the whole tick and lose the rows already processed.
+        console.error(`[agents-geocode] could not stamp attempt for ${row.id}:`, stampErr);
+      }
     }
   }
 

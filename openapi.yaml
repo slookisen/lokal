@@ -124,6 +124,11 @@ paths:
                           type: number
                         distanceKm:
                           type: number
+                          description: >-
+                            Deprecated at the result level — read
+                            agent.location.distanceKm instead, and see the honesty
+                            rule documented there (a centroid-precision producer
+                            reports no kilometre figure at all).
                         matchReasons:
                           type: array
                           items:
@@ -147,6 +152,16 @@ paths:
                                 type: string
                             location:
                               type: object
+                              description: >-
+                                Where the producer is, and how precisely we know it.
+                                distanceKm is present ONLY when geoPrecision is "address";
+                                for a city/kommune-centroid position it is omitted on
+                                purpose and distanceLabel carries the honest alternative,
+                                because a kilometre figure measured from a municipal
+                                centroid would be a number we invented. Producers whose
+                                coordinate provenance is unknown (geoPrecision absent —
+                                legacy rows not yet processed by the geocoding worker)
+                                still carry distanceKm, unchanged.
                               properties:
                                 city:
                                   type: string
@@ -154,6 +169,27 @@ paths:
                                   type: number
                                 lng:
                                   type: number
+                                distanceKm:
+                                  type: number
+                                  description: >-
+                                    Straight-line distance from the searched position, in km.
+                                    Present only for geoPrecision "address", or for a legacy
+                                    row with no geoPrecision at all. Never present for
+                                    "city"/"kommune"/"postal".
+                                geoPrecision:
+                                  type: string
+                                  enum: [address, postal, city, kommune]
+                                  description: >-
+                                    How the coordinates were resolved. "address" = geocoded
+                                    from a real street address (Kartverket adresser/v1/sok).
+                                    "city"/"kommune" = an approximate centroid. Absent =
+                                    unknown provenance (row not yet processed).
+                                distanceLabel:
+                                  type: string
+                                  description: >-
+                                    Human-readable, honest location phrase — "2,4 km unna"
+                                    for address precision, "i Vadsø-området" for a centroid.
+                                    Safe to show verbatim; never contains a fabricated number.
   /api/marketplace/discover:
     post:
       operationId: discoverProducers
@@ -208,6 +244,11 @@ paths:
                           type: number
                         distanceKm:
                           type: number
+                          description: >-
+                            Deprecated at the result level — read
+                            agent.location.distanceKm instead, and see the honesty
+                            rule documented there (a centroid-precision producer
+                            reports no kilometre figure at all).
                         agent:
                           type: object
                           properties:
@@ -223,6 +264,16 @@ paths:
                                 type: string
                             location:
                               type: object
+                              description: >-
+                                Where the producer is, and how precisely we know it.
+                                distanceKm is present ONLY when geoPrecision is "address";
+                                for a city/kommune-centroid position it is omitted on
+                                purpose and distanceLabel carries the honest alternative,
+                                because a kilometre figure measured from a municipal
+                                centroid would be a number we invented. Producers whose
+                                coordinate provenance is unknown (geoPrecision absent —
+                                legacy rows not yet processed by the geocoding worker)
+                                still carry distanceKm, unchanged.
                               properties:
                                 city:
                                   type: string
@@ -230,6 +281,27 @@ paths:
                                   type: number
                                 lng:
                                   type: number
+                                distanceKm:
+                                  type: number
+                                  description: >-
+                                    Straight-line distance from the searched position, in km.
+                                    Present only for geoPrecision "address", or for a legacy
+                                    row with no geoPrecision at all. Never present for
+                                    "city"/"kommune"/"postal".
+                                geoPrecision:
+                                  type: string
+                                  enum: [address, postal, city, kommune]
+                                  description: >-
+                                    How the coordinates were resolved. "address" = geocoded
+                                    from a real street address (Kartverket adresser/v1/sok).
+                                    "city"/"kommune" = an approximate centroid. Absent =
+                                    unknown provenance (row not yet processed).
+                                distanceLabel:
+                                  type: string
+                                  description: >-
+                                    Human-readable, honest location phrase — "2,4 km unna"
+                                    for address precision, "i Vadsø-området" for a centroid.
+                                    Safe to show verbatim; never contains a fabricated number.
   /api/marketplace/agents/{agentId}/info:
     get:
       operationId: getProducerInfo

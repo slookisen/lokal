@@ -319,6 +319,38 @@ export function runAgentsGeocodeWorkerTests(opts: { log?: boolean } = {}): Promi
           "h6: a legacy row (geo_precision NULL) is UNCHANGED — no silent blanking of 948 producers on deploy");
         assertTrue(komm?.location?.city === "Trondheim",
           "h7: the centroid producer still says where it is; only the false precision is withheld");
+
+        // ── REVIEW B1: matchReasons is the SECOND distance surface ──
+        // It is spread verbatim into the /api/marketplace/search JSON and
+        // rendered as the «Match:» line by the Smithery-published stdio MCP
+        // server (src/mcp/server.ts) — a live AI-assistant surface. Before the
+        // fix a city-centroid producer still emitted "1.1 km unna" there while
+        // location.distanceKm was correctly withheld.
+        const reasonsOf = (id: string) =>
+          (results.find((r) => r.agent.id === id)?.matchReasons ?? []).join(" · ");
+        const kommReasons = reasonsOf("h-komm");
+        const addrReasons = reasonsOf("h-addr");
+        const nullReasons = reasonsOf("h-null");
+
+        assertTrue(!/\d+([.,]\d+)?\s*km/.test(kommReasons),
+          `h10 (B1): a CENTROID producer's matchReasons contain no km figure either (got "${kommReasons}")`);
+        assertTrue(/området|omtrentlig|nærheten/.test(kommReasons),
+          `h11 (B1): …it states the honest alternative instead of going silent (got "${kommReasons}")`);
+        assertTrue(/\d+([.,]\d+)?\s*km/.test(addrReasons),
+          `h12 (B1): an ADDRESS-precision producer still gets its real km reason (got "${addrReasons}")`);
+        assertTrue(/\d+([.,]\d+)?\s*km/.test(nullReasons),
+          `h13 (B1): a legacy NULL-provenance row is unchanged here too (got "${nullReasons}")`);
+
+        // Ranking must NOT have moved: the score still grades on the true
+        // haversine for every row whatever its precision. The three fixtures
+        // sit at increasing distance from the origin — h-null nearest,
+        // h-komm next, h-addr furthest — so their scores must come out in
+        // exactly that order regardless of which of them is allowed to STATE
+        // a distance.
+        const scoreOf = (id: string) => results.find((r) => r.agent.id === id)?.relevanceScore ?? -1;
+        const [sNull, sKomm, sAddr] = [scoreOf("h-null"), scoreOf("h-komm"), scoreOf("h-addr")];
+        assertTrue(sNull > sKomm && sKomm > sAddr,
+          `h14 (B1): scores still follow TRUE distance across all three precisions — suppression governs what we say, not what we compute (null ${sNull} > kommune ${sKomm} > address ${sAddr})`);
       }
 
       // ── h8-h9: the pure helper ───────────────────────────────────
@@ -329,6 +361,130 @@ export function runAgentsGeocodeWorkerTests(opts: { log?: boolean } = {}): Promi
           "h9: …and never a km figure for a centroid row — same rule as experience-store.ts's formatDistanceLabel()");
         assertEq(precision.formatRfbDistanceLabel(2.44, null, "Vadsø"), null,
           "h9b: …while an unknown-provenance row gets no label at all (caller renders as before)");
+      }
+
+      // ── B3: a row that THROWS must still be stamped and rotate ───
+      {
+        for (let i = 1; i <= 3; i++) {
+          seed({ id: `z-${i}`, name: `Kaster ${i}`, city: "Kastestad", address: "Kastegata 1", postal_code: "1111" });
+        }
+        // A fetchImpl that throws for this address — geocodeOne swallows fetch
+        // errors, so throw from the DB-independent path the worker awaits:
+        // geocodingService.geocode(), reached because these rows have no coords.
+        const throwingGeoFetch = (async () => { throw new Error("simulated upstream failure"); }) as unknown as typeof fetch;
+        geo.__setGeocodingFetchForTesting(throwingGeoFetch);
+        geo.__clearGeocodeCacheForTesting();
+        // Kartverket adresse also misses, so Tier A cannot resolve them either.
+        const missDeps = {
+          sleep: async () => {},
+          fetchImpl: (async () => ({ ok: true, status: 200, json: async () => ADDRESS_EMPTY } as unknown as Response)) as unknown as typeof fetch,
+        };
+
+        const t1 = await worker.agentsGeocodeTick(2, missDeps);
+        const ids1 = t1.planned.map((p) => p.agent_id).filter((id) => id.startsWith("z-"));
+        const t2 = await worker.agentsGeocodeTick(2, missDeps);
+        const ids2 = t2.planned.map((p) => p.agent_id).filter((id) => id.startsWith("z-"));
+
+        const stamped = (db.prepare(
+          `SELECT COUNT(*) AS c FROM agents WHERE id LIKE 'z-%' AND geocode_attempted_at IS NOT NULL`
+        ).get() as any).c;
+
+        assertTrue(stamped >= 2,
+          `b3-1: a row whose lookup THROWS is still stamped (got ${stamped} stamped of 3) — the ALWAYS-STAMP invariant now holds on the error path too`);
+        assertTrue(ids2.length > 0 && ids2.every((id) => !ids1.includes(id)),
+          `b3-2: …so consecutive ticks pick DISJOINT rows instead of re-processing the same throwing head forever (${JSON.stringify(ids1)} vs ${JSON.stringify(ids2)})`);
+
+        // Restore the working geocode seam for anything after this block.
+        geo.__setGeocodingFetchForTesting((async (input: any) => {
+          const url = decodeURIComponent(String(input));
+          if (url.includes("/stedsnavn/") && /sok=vadsø/i.test(url)) {
+            return { ok: true, status: 200, json: async () => STEDSNAVN_VADSO } as unknown as Response;
+          }
+          return { ok: false, status: 404, json: async () => ({}) } as unknown as Response;
+        }) as unknown as typeof fetch);
+        geo.__clearGeocodeCacheForTesting();
+      }
+
+      // ── B4 + follow-up 6/10: request parsing, single-flight, rollback ──
+      {
+        // B4 — dry_run must FAIL CLOSED. `{"dry_run":"true"}` is the obvious
+        // curl/shell typo and used to perform a real production write.
+        assertEq(worker.parseDryRunFlag(true).ok && worker.parseDryRunFlag(true).dryRun, true,
+          "b4-1: dry_run:true → dry run");
+        assertEq(worker.parseDryRunFlag(false).ok && (worker.parseDryRunFlag(false) as any).dryRun, false,
+          "b4-2: dry_run:false → real run");
+        assertEq(worker.parseDryRunFlag(undefined).ok, true,
+          "b4-3: omitted dry_run is accepted (defaults to a real run)");
+        assertEq(worker.parseDryRunFlag("true").ok, false,
+          "b4-4: the STRING \"true\" is REJECTED, not silently treated as a real write (this was the fail-open bug)");
+        assertEq(worker.parseDryRunFlag(1).ok, false, "b4-5: 1 is rejected");
+        assertEq(worker.parseDryRunFlag("false").ok, false, "b4-6: the string \"false\" is rejected too — no guessing");
+
+        // Follow-up 6 — the limit clamp, extracted so it is testable without
+        // touching process.env.ADMIN_KEY (the shared global behind this repo's
+        // documented admin-key test races).
+        assertEq(worker.clampGeocodeBatchLimit(undefined), 50, "f6-1: no limit → default 50");
+        assertEq(worker.clampGeocodeBatchLimit(5000), 200, "f6-2: an oversized limit clamps to 200");
+        assertEq(worker.clampGeocodeBatchLimit(0), 1, "f6-3: 0 clamps up to 1");
+        assertEq(worker.clampGeocodeBatchLimit(-7), 1, "f6-4: a negative limit clamps up to 1");
+        assertEq(worker.clampGeocodeBatchLimit("25"), 50, "f6-5: a non-number falls back to the default");
+
+        // Follow-up 6 — single-flight: a second tick started while one is in
+        // flight must no-op rather than select and re-fetch the same batch.
+        //
+        // The overlap is created with a manually-released promise gate, NOT a
+        // timer. This suite swaps the shared getDb() singleton, and a real
+        // setTimeout yields the MACROTASK queue — which lets a concurrently
+        // scheduled non-serial block run, swap the singleton out from under
+        // this one, and produce "no such table: agent_knowledge" here plus
+        // collateral failures (pr93-*, prune-*) over there. Observed exactly
+        // that with a 25 ms sleep. Awaiting only microtasks keeps the whole
+        // block atomic with respect to other blocks.
+        seed({ id: "sf-1", name: "Samtidig Gård", city: "Trondheim", address: "Kongens gate 1", postal_code: "7011" });
+        let releaseGate: () => void = () => {};
+        const gate = new Promise<void>((r) => { releaseGate = r; });
+        const gatedDeps = {
+          sleep: async () => {},
+          fetchImpl: (async () => {
+            await gate;
+            return { ok: true, status: 200, json: async () => ADDRESS_HIT } as unknown as Response;
+          }) as unknown as typeof fetch,
+        };
+
+        const first = worker.agentsGeocodeTick(50, gatedDeps);
+        // Let the first tick reach its awaited fetch (microtasks only).
+        for (let i = 0; i < 5; i++) await Promise.resolve();
+        const second = await worker.agentsGeocodeTick(50, gatedDeps);
+        releaseGate();
+        const firstResult = await first;
+        assertTrue(second.skipped_already_running === true,
+          "f6-6: a tick started while another is running returns skipped_already_running instead of duplicating the batch");
+        assertEq(second.processed, 0, "f6-7: …and processes nothing");
+        assertTrue(firstResult.skipped_already_running === false,
+          "f6-8: …while the tick that actually holds the lock runs normally");
+
+        // Follow-up 10 — rollback latch. Tier A overwrites lat/lng in place;
+        // without prev_lat/prev_lng "stopping the worker" restores nothing.
+        seed({ id: "rb-1", name: "Rullbakk Gård", lat: 11.11, lng: 22.22, city: "Trondheim",
+               address: "Kongens gate 1", postal_code: "7011" });
+        await worker.agentsGeocodeTick(50, deps);
+        const rb = db.prepare(
+          `SELECT lat, lng, geocode_prev_lat, geocode_prev_lng, geo_precision FROM agents WHERE id = 'rb-1'`
+        ).get() as any;
+        assertEq(rb.geocode_prev_lat, 11.11, "f10-1: the pre-existing latitude is preserved in geocode_prev_lat");
+        assertEq(rb.geocode_prev_lng, 22.22, "f10-2: …and the longitude in geocode_prev_lng");
+        assertEq(rb.lat, 63.4155, "f10-3: …while lat/lng now hold the newly geocoded address position");
+
+        // The documented one-statement revert actually restores the row.
+        db.prepare(
+          `UPDATE agents
+              SET lat = geocode_prev_lat, lng = geocode_prev_lng, geo_precision = NULL,
+                  geocode_source = NULL, geocode_outcome = NULL
+            WHERE geocode_prev_lat IS NOT NULL`
+        ).run();
+        const reverted = db.prepare(`SELECT lat, lng, geo_precision FROM agents WHERE id = 'rb-1'`).get() as any;
+        assertEq(reverted.lat, 11.11, "f10-4: the documented rollback statement restores the original latitude");
+        assertEq(reverted.geo_precision, null, "f10-5: …and clears the precision claim with it");
       }
     } catch (err: any) {
       failed++;

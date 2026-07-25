@@ -65,15 +65,38 @@ const VERTICAL = "experiences";
 // ONLY shape we accept, and a leading "oppmøte:"-style label is stripped
 // first. When in doubt we return null and the row stays at kommune precision —
 // an honest coarse position beats a precise wrong one.
+// Review follow-up 5 — words that take a number but are NOT a street.
+// The adresse-API is strictly conjunctive, so these false accepts returned 0
+// hits and never wrote a wrong point; the reason to reject them up front is
+// that they were the volume amplifier for B2 (13 of 29 adversarial inputs
+// accepted → 13 futile requests per pass). Post boxes are the important class:
+// «Postboks 123, 0150 Oslo» is a real postal address and NOT a location.
+const NON_STREET_HEAD = /^(postboks|postbox|p\.?\s?b\.?|boks|bygg|byggetrinn|sal|rom|inngang|port|kai|spor|plattform|gate\s?nr|rv|fv|ev|e)$/i;
+
+// Monotonic ms stamps for Step F's rotation key (review B2). datetime('now')
+// is 1-second granular, so a whole batch would collapse to a single value and
+// the ORDER BY would fall back to the `id` tiebreaker — reinstating exactly
+// the "same rows every tick" defect the stamp exists to fix. Same helper shape
+// as agents-geocode-worker.ts's nextAttemptStamp().
+let lastMeetingPointStampMs = 0;
+function nextMeetingPointStamp(): string {
+  const now = Date.now();
+  lastMeetingPointStampMs = now > lastMeetingPointStampMs ? now : lastMeetingPointStampMs + 1;
+  return new Date(lastMeetingPointStampMs).toISOString();
+}
+
 export function parseAddressLike(
   meetingPoint: string | null | undefined
 ): { street: string; postnummer: string | null } | null {
   const raw = (meetingPoint || "").trim();
   if (!raw || raw.length > 120) return null;
 
-  // Drop a leading label ("Oppmøte: …", "Møtested - …") and take the first
-  // comma-separated segment, which is where a street lives when there is one.
-  const delabelled = raw.replace(/^[^:]{0,20}:\s*/, "");
+  // Drop a leading label ("Oppmøte: …", "Møtested: …"). Bounded to a SHORT
+  // single word plus an optional qualifier so it cannot eat a real place name:
+  // «Oslo S: spor 12, 0154 Oslo» used to be delabelled to «spor 12» and then
+  // parsed as a street (review follow-up 5). A label is a word like «Oppmøte»,
+  // «Møtested», «Sted», «Adresse» — not an arbitrary ≤20-char prefix.
+  const delabelled = raw.replace(/^(oppm(ø|o)te|m(ø|o)tested|m(ø|o)teplass|sted|adresse|hvor)\s*:\s*/i, "");
   const parts = delabelled.split(",").map((p) => p.trim()).filter(Boolean);
   if (parts.length === 0) return null;
 
@@ -88,7 +111,36 @@ export function parseAddressLike(
   // postnummer segment.
   const streetMatch = parts[0].match(/^([\p{L}][\p{L}\s.'’-]{1,40}?)\s+(\d{1,4}\s?[A-Za-z]?)$/u);
   if (!streetMatch) return null;
-  const street = `${streetMatch[1].trim()} ${streetMatch[2].replace(/\s+/g, "")}`;
+  const namePart = streetMatch[1].trim();
+  const numberPart = streetMatch[2].replace(/\s+/g, "");
+  const street = `${namePart} ${numberPart}`;
+
+  // Review follow-up 5, guard 1: reject heads that take a number but are not a
+  // street — «Postboks 123», «P.b. 22», «Kai 4», «Bygg 3», «Sal 2», «Rom 12»,
+  // «Inngang 2», «Rv 7». Compared on the LAST word of the name part, so
+  // «Nedre Postboks» is rejected but «Postboksgata» (a real street) is not.
+  const headWord = namePart.split(/\s+/).pop() || "";
+  if (NON_STREET_HEAD.test(headWord)) return null;
+
+  // Guard 2: the "house number" must not BE the postnummer. «Gården vår i
+  // Vestre Slidre 2966» parsed as street «Gården vår i Vestre Slidre» + number
+  // 2966, with 2966 simultaneously read as the postnummer — a whole sentence
+  // masquerading as an address.
+  if (postMatch && numberPart.replace(/[^\d]/g, "") === postMatch[1]) return null;
+
+  // Guard 3: a street name is at most a few words. «Gården vår i Vestre
+  // Slidre» is prose; a real Norwegian street name is 1-3 words («Nedre
+  // Slottsgate», «Kong Oscars gate»).
+  if (namePart.split(/\s+/).length > 3) return null;
+
+  // Guard 4: an explicitly FOREIGN address. «Vestergade 5, 8000 Aarhus,
+  // Danmark» is perfectly address-shaped and its 8000 is a valid Norwegian
+  // postnummer too (Trondheim) — the only signal that it is not ours is the
+  // country. Kartverket only knows Norway, so this would silently place a
+  // Danish meeting point in Trøndelag if the numbers happened to line up.
+  if (/\b(danmark|denmark|sverige|sweden|finland|island|iceland|deutschland|germany|tyskland|nederland|holland|storbritannia|england|scotland|skottland)\b/i.test(delabelled)) {
+    return null;
+  }
 
   // A street with no postnummer anywhere is too weak: "Storgata 5" exists in
   // dozens of kommuner and geocodeOne would happily return the first one.
@@ -112,6 +164,10 @@ export type ExperiencesGeocodeResult = {
   experiences_upgraded_to_address: number;
   /** Fase 1b — …of which came from a parseable `meeting_point`. */
   experiences_upgraded_from_meeting_point: number;
+  /** Fase 1b — Step F rows whose meeting_point is not address-shaped (stamped, rotated). */
+  meeting_point_not_addresslike: number;
+  /** Fase 1b — Step F rows whose parsed address Kartverket could not find (stamped, rotated). */
+  meeting_point_no_match: number;
   errors: number;
   duration_ms: number;
 };
@@ -147,6 +203,8 @@ export async function experiencesGeocodeTick(
     experiences_unresolved: 0,
     experiences_upgraded_to_address: 0,
     experiences_upgraded_from_meeting_point: 0,
+    meeting_point_not_addresslike: 0,
+    meeting_point_no_match: 0,
     errors: 0,
     duration_ms: 0,
   };
@@ -454,6 +512,20 @@ export async function experiencesGeocodeTick(
   // everything else — «ved brygga» must stay at kommune precision rather than
   // become a confident wrong point. Only a real Kartverket adresse-API hit
   // promotes the row.
+  //
+  // REVIEW B2 — ROTATION. Both give-up paths used to be a bare `continue`
+  // with no write, while the selector was `WHERE geo_precision='kommune' …
+  // ORDER BY e.id LIMIT ?`. The unresolvable residue was therefore re-selected
+  // in exactly the same order every hour, forever, AND starved every row
+  // behind the LIMIT (measured: 3 ticks, byte-identical row list, rows 4-6
+  // never reached; ~100 zero-result Kartverket requests per hour, indefinitely,
+  // against a free public API). meeting_point_geocode_attempted_at is now
+  // stamped on EVERY attempt whatever the outcome, and the selector orders by
+  // it — never-attempted first, then oldest — so a failure rotates to the back
+  // of the queue instead of blocking it. Monotonic ms stamps for the same
+  // reason as the agents worker: datetime('now') is 1-second granular and a
+  // whole batch would collapse to one value, restoring the `id` tiebreaker and
+  // with it the original defect.
   const meetingPointRows = db
     .prepare(
       `SELECT e.id AS id, e.meeting_point AS meeting_point, e.kommune AS kommune,
@@ -464,7 +536,9 @@ export async function experiencesGeocodeTick(
           AND e.meeting_point IS NOT NULL
           AND e.meeting_point <> ''
           AND (p.id IS NULL OR p.adresse IS NULL OR p.adresse = '')
-        ORDER BY e.id
+        ORDER BY (e.meeting_point_geocode_attempted_at IS NOT NULL),
+                 e.meeting_point_geocode_attempted_at ASC,
+                 e.id ASC
         LIMIT ?`
     )
     .all(limit) as Array<{
@@ -476,27 +550,53 @@ export async function experiencesGeocodeTick(
 
   const upgradeFromMeetingPoint = db.prepare(
     `UPDATE experiences
-        SET loc_lat = ?, loc_lon = ?, geo_precision = 'address', updated_at = datetime('now')
+        SET loc_lat = ?, loc_lon = ?, geo_precision = 'address',
+            meeting_point_geocode_attempted_at = ?, updated_at = datetime('now')
       WHERE id = ? AND geo_precision = 'kommune'`
   );
+  const stampMeetingPointAttempt = db.prepare(
+    `UPDATE experiences SET meeting_point_geocode_attempted_at = ? WHERE id = ?`
+  );
+  // Guard the guard: a stamp failure must never abort the tick, and must never
+  // be the reason a row is silently skipped.
+  const stampAttempt = (id: string) => {
+    try {
+      stampMeetingPointAttempt.run(nextMeetingPointStamp(), id);
+    } catch (err) {
+      console.error(`[experiences-geocode] could not stamp meeting_point attempt for ${id}:`, err);
+    }
+  };
 
   for (const row of meetingPointRows) {
     try {
       const parsed = parseAddressLike(row.meeting_point);
-      if (!parsed) continue; // not address-shaped — leave it at kommune, honestly
+      if (!parsed) {
+        // Not address-shaped — leave it at kommune precision, honestly, and
+        // stamp so it does not come back round on the very next tick.
+        stats.meeting_point_not_addresslike++;
+        stampAttempt(row.id);
+        continue;
+      }
       const result = await geocodeOne(
         parsed.street,
         parsed.postnummer as string,
         row.poststed ?? row.kommune ?? "",
         deps
       );
-      if (result.confidence === "no_match") continue;
-      upgradeFromMeetingPoint.run(result.lat, result.lng, row.id);
+      if (result.confidence === "no_match") {
+        stats.meeting_point_no_match++;
+        stampAttempt(row.id);
+        continue;
+      }
+      upgradeFromMeetingPoint.run(result.lat, result.lng, nextMeetingPointStamp(), row.id);
       stats.experiences_upgraded_to_address++;
       stats.experiences_upgraded_from_meeting_point++;
     } catch (err) {
       stats.errors++;
       console.error(`[experiences-geocode] meeting_point upgrade failed for ${row.id}:`, err);
+      // Errors rotate too — a row that throws every tick must not pin the head
+      // of the queue (same invariant as the agents worker's catch).
+      stampAttempt(row.id);
     }
   }
 

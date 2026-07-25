@@ -96,9 +96,18 @@ server.tool(
 
       for (const r of data.results) {
         const a = r.agent;
-        const dist = a.location?.distanceKm ? `${a.location.distanceKm.toFixed(1)} km` : "";
+        // dev-request 2026-07-25 Fase 1c (review B1 / follow-up 8): distanceKm
+        // is present ONLY for address-precision producers. A city/kommune
+        // centroid row carries distanceLabel («i Vadsø-området») instead —
+        // surface it, or this tool silently drops the location line entirely
+        // for every centroid row once the km figure is (correctly) withheld.
+        const dist = a.location?.distanceKm ? `${a.location.distanceKm.toFixed(1)} km unna` : "";
+        const approx = !dist && a.location?.distanceLabel
+          ? `${a.location.distanceLabel} (omtrentlig posisjon)`
+          : "";
         text += `**${a.name}** (score: ${(r.relevanceScore * 100).toFixed(0)}%)`;
-        if (dist) text += ` — ${dist} unna`;
+        if (dist) text += ` — ${dist}`;
+        else if (approx) text += ` — ${approx}`;
         text += `\n`;
         text += `  ${a.description.slice(0, 150)}\n`;
         if (a.categories.length) text += `  Kategorier: ${a.categories.join(", ")}\n`;
@@ -158,7 +167,9 @@ server.tool(
         const a = r.agent;
         text += `**${a.name}** — ${a.role}\n`;
         text += `  ${a.description.slice(0, 150)}\n`;
+        // Fase 1c — same rule as lokal_search above.
         if (a.location?.distanceKm) text += `  Avstand: ${a.location.distanceKm.toFixed(1)} km\n`;
+        else if (a.location?.distanceLabel) text += `  Posisjon: ${a.location.distanceLabel} (omtrentlig)\n`;
         text += `  Trust: ${(a.trustScore * 100).toFixed(0)}% | Verifisert: ${a.isVerified ? "Ja" : "Nei"}\n\n`;
       }
 

@@ -3169,13 +3169,37 @@ function initSchema(db: Database.Database): void {
   //                          then oldest attempt", so the worker walks the
   //                          whole universe before repeating.
   //
+  //   geocode_prev_lat     : the lat/lng the row held immediately BEFORE this
+  //   geocode_prev_lng       worker last overwrote it, written in the same
+  //                          UPDATE (review follow-up 10). Tier A replaces
+  //                          seed coordinates in place, so without this the
+  //                          dev-request's "Fase 1: kan stoppes" rollback was
+  //                          incomplete — stopping the worker restores
+  //                          nothing, and the pre-existing (possibly correct,
+  //                          hand-placed) coordinate is gone. With it, a full
+  //                          revert is one statement:
+  //                            UPDATE agents
+  //                               SET lat = geocode_prev_lat,
+  //                                   lng = geocode_prev_lng,
+  //                                   geo_precision = NULL,
+  //                                   geocode_source = NULL,
+  //                                   geocode_outcome = NULL
+  //                             WHERE geocode_prev_lat IS NOT NULL;
+  //                          Only ONE generation deep on purpose: this is a
+  //                          rollback latch for the backfill, not a history
+  //                          table. NULL prev means "this row had no
+  //                          coordinates before" — reverting it sets lat/lng
+  //                          back to NULL, which is correct.
+  //
   // Additive + idempotent ALTERs, same defensive try/catch idiom as every
-  // migration above. Rollback = stop the worker; the columns are inert.
+  // migration above.
   for (const stmt of [
     `ALTER TABLE agents ADD COLUMN geo_precision TEXT`,
     `ALTER TABLE agents ADD COLUMN geocode_source TEXT`,
     `ALTER TABLE agents ADD COLUMN geocode_outcome TEXT`,
     `ALTER TABLE agents ADD COLUMN geocode_attempted_at TEXT`,
+    `ALTER TABLE agents ADD COLUMN geocode_prev_lat REAL`,
+    `ALTER TABLE agents ADD COLUMN geocode_prev_lng REAL`,
   ]) {
     try { db.exec(stmt); } catch { /* already exists — expected */ }
   }

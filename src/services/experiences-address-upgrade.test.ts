@@ -99,6 +99,38 @@ export function runExperiencesAddressUpgradeTests(opts: { log?: boolean } = {}):
         assertEq(parse("oppmøte 30 min før avgang"), null,
           "p7: a time instruction is refused even though it contains a number");
         assertEq(parse(""), null, "p8: empty/missing meeting_point is refused");
+
+        // ── Review follow-up 5: the adversarial set ────────────────
+        // 13 of 29 of these used to be false-accepted. None could store a
+        // wrong point (the adresse-API is strictly conjunctive, so each simply
+        // returned 0 hits) — but every one was a futile HTTP request, and
+        // together they were the volume amplifier for the B2 no-rotation bug.
+        assertEq(parse("Postboks 123, 0150 Oslo"), null,
+          "p9: a POST BOX is a postal address, not a location — refused");
+        assertEq(parse("P.b. 22, 0150 Oslo"), null, "p10: …abbreviated «P.b.» too");
+        assertEq(parse("Boks 4, 8006 Bodø"), null, "p11: …and «Boks»");
+        assertEq(parse("Kai 4, 8006 Bodø"), null, "p12: «Kai 4» is a quay number, not a street");
+        assertEq(parse("Bygg 3, 8006 Bodø"), null, "p13: «Bygg 3» is a building number");
+        assertEq(parse("Sal 2, 8006 Bodø"), null, "p14: «Sal 2» is a hall number");
+        assertEq(parse("Rom 12, 8006 Bodø"), null, "p15: «Rom 12» is a room number");
+        assertEq(parse("Inngang 2, 8006 Bodø"), null, "p16: «Inngang 2» is an entrance number");
+        assertEq(parse("Rv 7, 3560 Hemsedal"), null, "p17: «Rv 7» is a road number, not an address");
+        assertEq(parse("Oslo S: spor 12, 0154 Oslo"), null,
+          "p18: the delabeller no longer eats «Oslo S:» and parses «spor 12» as a street");
+        assertEq(parse("Gården vår i Vestre Slidre 2966"), null,
+          "p19: a whole sentence whose trailing number IS the postnummer is refused");
+        assertEq(parse("Vestergade 5, 8000 Aarhus, Danmark"), null,
+          "p20: an explicitly FOREIGN address is refused — 8000 is a valid Norwegian postnummer too (Trondheim), so this would otherwise have placed a Danish meeting point in Trøndelag");
+
+        // …and the guards must not have broken the real thing.
+        assertEq(parse("Nedre Slottsgate 8, 0157 Oslo")?.street, "Nedre Slottsgate 8",
+          "p21: a genuine two-word street name still parses");
+        assertEq(parse("Kong Oscars gate 5, 5017 Bergen")?.street, "Kong Oscars gate 5",
+          "p22: …and a three-word one");
+        assertEq(parse("Sjøgata 21B, 8006 Bodø")?.street, "Sjøgata 21B",
+          "p23: …including a house-letter suffix");
+        assertEq(parse("Møtested: Havnegata 7, 8006 Bodø")?.street, "Havnegata 7",
+          "p24: …behind a real «Møtested:» label");
       }
 
       // ── Seed: a Bodø provider WITH a street address ──────────────
@@ -210,6 +242,86 @@ export function runExperiencesAddressUpgradeTests(opts: { log?: boolean } = {}):
           "f3: «ved brygga» is not an address — the row stays honestly at kommune precision");
         assertEq(vague.loc_lat, 67.2804,
           "f4: …with its kommune-centroid position untouched (no guessed point)");
+      }
+
+      // ── B2: Step F must ROTATE, not re-select the same residue forever ──
+      // Before the fix both give-up paths were a bare `continue` with no
+      // write, while the selector was ORDER BY e.id LIMIT ? — so the
+      // unresolvable residue was re-selected in the identical order every
+      // hour forever AND starved every row behind the LIMIT (measured: 3
+      // ticks, byte-identical row list, rows 4-6 never reached; ~100 futile
+      // Kartverket requests/hour, indefinitely, against a free public API).
+      {
+        // Six rows that can NEVER resolve: address-shaped meeting_points that
+        // the injected Kartverket seam always misses. Nothing leaves the queue
+        // by succeeding, so rotation must come from the attempt stamp alone.
+        const stuck: string[] = [];
+        for (let i = 1; i <= 6; i++) {
+          stuck.push(expStore.createExperience({
+            title: `Fastlåst ${i}`, provider_id: withoutAddress,
+            provider_match_status: "matched", kommune: "Bodø", fylke: "Nordland",
+            meeting_point: `Ingenveien ${i}, 8006 Bodø`,
+            verification_status: "verified", confidence: "high",
+          }));
+        }
+        db.prepare(
+          `UPDATE experiences SET loc_lat = 67.2804, loc_lon = 14.4049, geo_precision = 'kommune',
+                  meeting_point_geocode_attempted_at = NULL
+            WHERE id IN (${stuck.map(() => "?").join(",")})`
+        ).run(...stuck);
+
+        // Track exactly which addresses Kartverket is asked for, per tick.
+        const asked: string[][] = [];
+        let current: string[] = [];
+        const trackingDeps = {
+          sleep: async () => {},
+          fetchImpl: (async (input: any) => {
+            const url = decodeURIComponent(String(input));
+            const m = url.match(/sok=([^&]+)/);
+            if (m) current.push(m[1]);
+            return { ok: true, status: 200, json: async () => ({ adresser: [] }) } as unknown as Response;
+          }) as unknown as typeof fetch,
+        };
+
+        for (let tick = 0; tick < 3; tick++) {
+          current = [];
+          await worker.experiencesGeocodeTick(2, trackingDeps);
+          asked.push(current.filter((q) => /ingenveien/i.test(q)));
+        }
+
+        const flat = asked.flat();
+        const uniq = new Set(flat);
+        assertTrue(asked[0].length > 0, `b2-1: tick 1 attempted some stuck rows (${JSON.stringify(asked[0])})`);
+        assertTrue(
+          JSON.stringify(asked[0]) !== JSON.stringify(asked[1]),
+          `b2-2: tick 2 asks for DIFFERENT addresses than tick 1 — the residue rotates instead of repeating (${JSON.stringify(asked[0])} vs ${JSON.stringify(asked[1])})`
+        );
+        assertEq(uniq.size, flat.length,
+          `b2-3: across 3 ticks NO address is queried twice — zero wasted Kartverket requests (${JSON.stringify(flat)})`);
+        assertTrue(uniq.size >= 4,
+          `b2-4: …and the ticks reach BEYOND the first LIMIT-sized batch, so rows behind it no longer starve (${uniq.size} distinct rows reached)`);
+
+        const stampedCount = (db.prepare(
+          `SELECT COUNT(*) AS c FROM experiences
+            WHERE meeting_point_geocode_attempted_at IS NOT NULL AND id IN (${stuck.map(() => "?").join(",")})`
+        ).get(...stuck) as any).c;
+        assertTrue(stampedCount >= 4,
+          `b2-5: every attempted row is stamped whatever the outcome (${stampedCount} of 6 stamped)`);
+
+        const distinctStamps = (db.prepare(
+          `SELECT COUNT(DISTINCT meeting_point_geocode_attempted_at) AS c FROM experiences
+            WHERE meeting_point_geocode_attempted_at IS NOT NULL AND id IN (${stuck.map(() => "?").join(",")})`
+        ).get(...stuck) as any).c;
+        assertEq(distinctStamps, stampedCount,
+          "b2-6: …with DISTINCT monotonic stamps — a 1-second-granularity stamp would collapse a batch and reinstate the id-tiebreaker defect");
+
+        // A row whose text is not address-shaped must be stamped too — it is
+        // the largest cohort, and it costs no HTTP request to leave it stuck.
+        const vagueStamp = db.prepare(
+          `SELECT meeting_point_geocode_attempted_at AS at FROM experiences WHERE id = ?`
+        ).get(expVaguePoint) as any;
+        assertTrue(!!vagueStamp?.at,
+          "b2-7: «ved brygga» is stamped as attempted as well, so the not-address-shaped cohort rotates instead of being re-parsed every tick");
       }
     } catch (err: any) {
       failed++;
