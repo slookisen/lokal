@@ -38,6 +38,11 @@ import { fylkeEquivalents } from "./norway-fylke";
 // heuristic. meetsAboutQualityBar itself is UNCHANGED and still used as-is
 // by admin-knowledge.ts's unrelated homepage-refresh vertical.
 import { meetsAboutCheapBar } from "./search-enrich";
+// dev-request 2026-07-21-opplevagent-norske-tegn-encoding, criterion 3 —
+// mojibake DETECTION (never used to mutate text directly — see
+// scanGardssalgProviderRowForMojibake/selectGardssalgMojibakeCandidates
+// below and the admin backfill route in routes/opplevelser.ts).
+import { containsMojibake, mojibakeSnippet } from "./search-enrich";
 import { deriveExperienceTags, type ExperienceTag, type TaggableExperience } from "./experience-tags";
 import { haversineDistanceKm } from "./geocoding-service";
 // dev-request 2026-07-18-gardssalg-profilkvalitet-foer-outreach, slice 5b —
@@ -2212,6 +2217,130 @@ export function getGardssalgProviderContentTarget(providerId: string): Gardssalg
   return row;
 }
 
+// ─── Gårdssalg mojibake detection + candidate scan (dev-request 2026-07-21-
+// opplevagent-norske-tegn-encoding, criterion 3) ────────────────────────────
+//
+// PR lokal#360 fixed fetchHtml()'s decode path (search-enrich.ts) so NEW
+// crawls never mis-decode a source page's æ/ø/å again. It did nothing for
+// producer text ALREADY written to the DB before that fix — this section is
+// the DETECTION half of the repair: scanning STORED about_text/visit_text/
+// opening_hours_text/products for known mojibake signatures
+// (containsMojibake, search-enrich.ts) to build a CANDIDATE list of provider
+// ids to re-crawl. This never mutates text directly. See the admin backfill
+// route (POST /admin/gardssalg-mojibake-backfill, routes/opplevelser.ts) for
+// the actual re-fetch + re-extract + re-write step, which goes through
+// applyGardssalgProviderContent()'s `forceFields` bypass (added alongside
+// this) so the repair is audited/provenance-stamped exactly like any other
+// gårdssalg content write.
+
+export type GardssalgMojibakeFieldName = "about_text" | "visit_text" | "opening_hours_text" | "products";
+
+export interface GardssalgMojibakeFieldMatch {
+  field: GardssalgMojibakeFieldName;
+  snippet: string;
+}
+
+export interface GardssalgMojibakeCandidate {
+  id: string;
+  navn: string;
+  hjemmeside: string;
+  fields: GardssalgMojibakeFieldMatch[];
+}
+
+/**
+ * Scan ONE provider row's free-text content fields for known mojibake
+ * signatures (containsMojibake). `products` is the JSON-array-of-strings
+ * column (see GardssalgContentRefreshTarget's doc comment above); a
+ * malformed/non-JSON value is scanned as a raw string instead of erroring —
+ * a signature match there is exactly as actionable a scan hit as in any
+ * other field. Returns one match per field (products is checked element-by-
+ * element internally but reported as a single field-level hit, since the
+ * whole column would need re-extraction regardless of which element(s) are
+ * corrupted). PURE — no DB, no network.
+ */
+export function scanGardssalgProviderRowForMojibake(row: {
+  about_text?: string | null;
+  visit_text?: string | null;
+  opening_hours_text?: string | null;
+  products?: string | null;
+}): GardssalgMojibakeFieldMatch[] {
+  const out: GardssalgMojibakeFieldMatch[] = [];
+  const scalarFields: Array<[GardssalgMojibakeFieldName, string | null | undefined]> = [
+    ["about_text", row.about_text],
+    ["visit_text", row.visit_text],
+    ["opening_hours_text", row.opening_hours_text],
+  ];
+  for (const [field, value] of scalarFields) {
+    if (containsMojibake(value)) {
+      out.push({ field, snippet: mojibakeSnippet(value) });
+    }
+  }
+  if (row.products) {
+    let productStrings: string[] = [];
+    try {
+      const parsed = JSON.parse(row.products);
+      if (Array.isArray(parsed)) {
+        productStrings = parsed.filter((p): p is string => typeof p === "string");
+      }
+    } catch {
+      // Non-JSON value in a column that should always be JSON — still worth
+      // scanning as a raw string rather than silently skipping it.
+      productStrings = [row.products];
+    }
+    for (const p of productStrings) {
+      if (containsMojibake(p)) {
+        out.push({ field: "products", snippet: mojibakeSnippet(p) });
+        break; // one hit is enough to flag the whole column for re-extraction
+      }
+    }
+  }
+  return out;
+}
+
+/**
+ * Auto-select gårdssalg providers (producer_type set OR rfb-seed), NOT
+ * locked (content_source not in manual/claim), WITH a website, whose stored
+ * content fields contain a mojibake signature — the candidate list for
+ * POST /admin/gardssalg-mojibake-backfill. Scans every eligible row (the
+ * catalog is small — hard-capped at 48 providers total, same ceiling as
+ * selectGardssalgProvidersForContentRefresh) rather than paging, since the
+ * scan itself is a cheap in-process string search with no I/O; `limit` only
+ * caps how many MATCHING candidates are returned.
+ */
+export function selectGardssalgMojibakeCandidates(limit = 25): GardssalgMojibakeCandidate[] {
+  const db = getDb(VERTICAL);
+  const cap = Math.max(1, Math.min(48, limit));
+  const rows = db
+    .prepare(
+      `SELECT id, navn, TRIM(hjemmeside) AS hjemmeside,
+              about_text, visit_text, opening_hours_text, products
+         FROM experience_providers
+        WHERE (producer_type IS NOT NULL OR rfb_seed_source = 'rfb-seed')
+          AND hjemmeside IS NOT NULL AND TRIM(hjemmeside) != ''
+          AND (content_source IS NULL OR content_source NOT IN ('manual','claim'))
+        ORDER BY (last_content_attempt_at IS NOT NULL), last_content_attempt_at ASC, created_at ASC`
+    )
+    .all() as Array<{
+      id: string;
+      navn: string;
+      hjemmeside: string;
+      about_text: string | null;
+      visit_text: string | null;
+      opening_hours_text: string | null;
+      products: string | null;
+    }>;
+
+  const candidates: GardssalgMojibakeCandidate[] = [];
+  for (const row of rows) {
+    const fields = scanGardssalgProviderRowForMojibake(row);
+    if (fields.length > 0) {
+      candidates.push({ id: row.id, navn: row.navn, hjemmeside: row.hjemmeside, fields });
+      if (candidates.length >= cap) break;
+    }
+  }
+  return candidates;
+}
+
 /**
  * Decide what applyGardssalgProviderContent() would do for ONE about_text/
  * visit_text field, given the row's current (pre-write) value and a raw
@@ -2386,6 +2515,29 @@ export function gardssalgProductsEligible(currentProducts: string | null | undef
  * no longer always null/blank; the audit code makes no assumption either
  * way and needed no change to stay correct for that case.
  *
+ * `forceFields` (dev-request 2026-07-21-opplevagent-norske-tegn-encoding,
+ * criterion 3 — mojibake databackfill) — OPTIONAL, additive, empty/omitted
+ * by every pre-existing call site (byte-identical behavior when not
+ * passed): names the about_text/visit_text/opening_hours_text fields whose
+ * `candidate` value the caller has ALREADY independently verified is a
+ * genuine correctness fix (re-fetched via the already-fixed decode path,
+ * re-extracted, and confirmed both to DIFFER from the stored value and to
+ * NOT itself match a mojibake signature — see the admin backfill route,
+ * routes/opplevelser.ts). This is the same "bypass gardssalgReplaceable
+ * FieldAction()'s decision, still go through the same audit-row +
+ * field_provenance + lock-guard machinery" pattern `rewriteFields` below
+ * already established — it exists here because
+ * gardssalgReplaceableFieldAction()'s own "candidate must be strictly
+ * LONGER than the current value" replace rule is actively WRONG for this
+ * use case: mojibake corruption (e.g. "Ã¦" replacing "æ") typically makes
+ * the corrupted stored text LONGER than its correctly-decoded repair, so
+ * relying on that heuristic here would silently block most real fixes. The
+ * force branch still requires a non-blank trimmed candidate value and is
+ * gated by the SAME row-lock check above (content_source manual/claim never
+ * reaches any per-field branch, forced or not) — only the length-based
+ * "is this an improvement" heuristic is skipped, never the audit/lock
+ * discipline.
+ *
  * `rewriteFields` (dev-request 2026-07-18-gardssalg-profilkvalitet-foer-
  * outreach, slice 5a) — OPTIONAL, additive, empty/omitted by every pre-
  * existing call site (byte-identical behavior when not passed): names the
@@ -2450,7 +2602,10 @@ export function applyGardssalgProviderContent(
   evidenceUrl: string,
   batchId?: string,
   rewriteFields?: Array<"about_text" | "visit_text">,
-  contaminatedFields?: Array<"about_text" | "visit_text">
+  contaminatedFields?: Array<"about_text" | "visit_text">,
+  // dev-request 2026-07-21-opplevagent-norske-tegn-encoding, criterion 3 —
+  // see this function's own doc comment above for the full rationale.
+  forceFields?: Array<"about_text" | "visit_text" | "opening_hours_text">
 ): string[] {
   const db = getDb(VERTICAL);
   const row = db
@@ -2503,8 +2658,19 @@ export function applyGardssalgProviderContent(
   // param so a cheap-bar-passing-but-contaminated current value can still
   // be replaced by a genuinely good fresh candidate.
   const contaminatedSet = new Set(contaminatedFields ?? []);
+  // Mojibake-backfill force set (criterion 3, see this function's doc
+  // comment above) — checked FIRST, ahead of both the rewrite and the
+  // replaceable-field-action branches, since the caller has already done
+  // its own correctness verification (differs from stored + not itself
+  // still corrupted) and only needs the audit/lock machinery below, not a
+  // second opinion from a length-based heuristic that doesn't apply here.
+  const forceSet = new Set(forceFields ?? []);
 
-  if (rewriteSet.has("about_text") && candidate.about_text?.trim() && gardssalgRewriteEligible(row.about_text)) {
+  if (forceSet.has("about_text") && candidate.about_text?.trim()) {
+    sets.push("about_text = @about_text");
+    params.about_text = candidate.about_text.trim();
+    written.push("about_text");
+  } else if (rewriteSet.has("about_text") && candidate.about_text?.trim() && gardssalgRewriteEligible(row.about_text)) {
     sets.push("about_text = @about_text");
     params.about_text = candidate.about_text.trim();
     written.push("about_text");
@@ -2513,7 +2679,11 @@ export function applyGardssalgProviderContent(
     params.about_text = candidate.about_text!.trim();
     written.push("about_text");
   }
-  if (rewriteSet.has("visit_text") && candidate.visit_text?.trim() && gardssalgRewriteEligible(row.visit_text)) {
+  if (forceSet.has("visit_text") && candidate.visit_text?.trim()) {
+    sets.push("visit_text = @visit_text");
+    params.visit_text = candidate.visit_text.trim();
+    written.push("visit_text");
+  } else if (rewriteSet.has("visit_text") && candidate.visit_text?.trim() && gardssalgRewriteEligible(row.visit_text)) {
     sets.push("visit_text = @visit_text");
     params.visit_text = candidate.visit_text.trim();
     written.push("visit_text");
@@ -2522,7 +2692,11 @@ export function applyGardssalgProviderContent(
     params.visit_text = candidate.visit_text!.trim();
     written.push("visit_text");
   }
-  if (isBlank(row.opening_hours_text) && candidate.opening_hours_text?.trim()) {
+  if (forceSet.has("opening_hours_text") && candidate.opening_hours_text?.trim()) {
+    sets.push("opening_hours_text = @opening_hours_text");
+    params.opening_hours_text = candidate.opening_hours_text.trim();
+    written.push("opening_hours_text");
+  } else if (isBlank(row.opening_hours_text) && candidate.opening_hours_text?.trim()) {
     sets.push("opening_hours_text = @opening_hours_text");
     params.opening_hours_text = candidate.opening_hours_text.trim();
     written.push("opening_hours_text");

@@ -27400,6 +27400,27 @@ Promise.allSettled(_oaHomeCountersDeps).then(async () => {
     for (const f of gpr.failures) failures.push("opplevelser-gardssalg-products: " + f);
     console.log(`  opplevelser-gardssalg-products: ${gpr.passed} passed, ${gpr.failed} failed`);
 
+    // dev-request 2026-07-21-opplevagent-norske-tegn-encoding, criterion 3:
+    // POST /admin/gardssalg-mojibake-backfill — the audited, reversible
+    // databackfill for gårdssalg producer text corrupted (æ/ø/å mojibake)
+    // BEFORE PR lokal#360 fixed fetchHtml()'s decode path. Detection-only
+    // scan (scanGardssalgProviderRowForMojibake/selectGardssalgMojibakeCandidates,
+    // experience-store.ts) + a re-fetch-via-the-fixed-decode-path/re-extract/
+    // force-write repair, gated on "differs from stored AND not itself still
+    // corrupt" and written through applyGardssalgProviderContent()'s new
+    // `forceFields` bypass (own pure/DB unit coverage in
+    // search-enrich.test.ts / experience-store.test.ts; this is the route's
+    // wiring/plumbing). Same in-memory-DB pattern, runs sequentially inside
+    // this same gated block for the same reason.
+    console.log("\n── opplevelser-gardssalg-mojibake-backfill: criterion 3 databackfill ──");
+    const { runOpplevelserGardssalgMojibakeBackfillTests } = require("../src/routes/opplevelser-gardssalg-mojibake-backfill.test") as
+      typeof import("../src/routes/opplevelser-gardssalg-mojibake-backfill.test");
+    const gmb = await runOpplevelserGardssalgMojibakeBackfillTests({ log: false });
+    passed += gmb.passed;
+    failed += gmb.failed;
+    for (const f of gmb.failures) failures.push("opplevelser-gardssalg-mojibake-backfill: " + f);
+    console.log(`  opplevelser-gardssalg-mojibake-backfill: ${gmb.passed} passed, ${gmb.failed} failed`);
+
     // dev-request 2026-07-19-brreg-nace-drikkeprodusenter: NACE discovery of
     // the drink family (11.010/030/040/050) → org_nr-keyed gårdssalg landing
     // with Brreg address/hjemmeside at birth, batch-tagged rollback. Same

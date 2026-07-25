@@ -1840,6 +1840,69 @@ export function decodeHtmlBytes(
   }
 }
 
+// ─── mojibake detection (dev-request 2026-07-21-opplevagent-norske-tegn-
+// encoding, criterion 3 — databackfill of ALREADY-corrupted text) ───────────
+//
+// detectHtmlCharset/decodeHtmlBytes (above) fix decoding for NEWLY fetched
+// pages going forward; they do nothing for producer text already written to
+// the DB before that fix shipped (PR lokal#360). containsMojibake() is the
+// detector used to find that already-corrupted text so it can be targeted
+// for a re-fetch + re-extract repair (see applyGardssalgProviderContent's
+// `forceFields` and the admin backfill route in routes/opplevelser.ts) — it
+// is NEVER used to directly rewrite text. A blind find/replace on these
+// patterns was explicitly rejected in the dev-request as too risky: it could
+// mangle text that only coincidentally contains one of these sequences, or
+// miss nested/double-encoded corruption a substring match can't see.
+//
+// The five signatures cover two independent, real corruption shapes:
+//   - "Ã¦" / "Ã¸" / "Ã¥" / "Â" — classic UTF-8-bytes-decoded-as-Latin-1
+//     double-encoding mojibake (a multi-byte UTF-8 sequence for æ/ø/å, when
+//     wrongly read one byte at a time as Latin-1/Windows-1252, renders as
+//     one of these two-character sequences).
+//   - U+FFFD (the Unicode replacement character) — what a page's bytes
+//     become when decoded with the WRONG single-byte encoding assumed to be
+//     UTF-8: the exact fetchHtml() bug PR #360 fixed (windows-1252/
+//     iso-8859-1 bytes forced through a UTF-8-only decode produce invalid
+//     byte sequences, which the decoder replaces with U+FFFD).
+// Real Norwegian prose essentially never contains "Ã¦"/"Ã¸"/"Ã¥"/"Â" as a
+// genuine sequence, or U+FFFD at all — so this is a safe, low-false-positive
+// SCAN (candidate selection), not a rewrite.
+export const MOJIBAKE_SIGNATURES: readonly string[] = ["Ã¦", "Ã¸", "Ã¥", "Â", "�"];
+
+/**
+ * True if `text` contains any known mojibake signature (see
+ * MOJIBAKE_SIGNATURES doc comment above). Null/undefined/empty → false.
+ * PURE — no network/IO.
+ */
+export function containsMojibake(text: string | null | undefined): boolean {
+  if (!text) return false;
+  const s = String(text);
+  return MOJIBAKE_SIGNATURES.some((sig) => s.includes(sig));
+}
+
+/**
+ * A short, whitespace-collapsed snippet of `text` centered on the FIRST
+ * (leftmost) mojibake signature match, for a human-reviewable dry-run
+ * preview. Returns "" when nothing matches. PURE — no network/IO.
+ */
+export function mojibakeSnippet(text: string | null | undefined, window = 40): string {
+  if (!text) return "";
+  const s = String(text);
+  let bestIdx = -1;
+  let bestLen = 0;
+  for (const sig of MOJIBAKE_SIGNATURES) {
+    const idx = s.indexOf(sig);
+    if (idx !== -1 && (bestIdx === -1 || idx < bestIdx)) {
+      bestIdx = idx;
+      bestLen = sig.length;
+    }
+  }
+  if (bestIdx === -1) return "";
+  const start = Math.max(0, bestIdx - window);
+  const end = Math.min(s.length, bestIdx + bestLen + window);
+  return s.slice(start, end).replace(/\s+/g, " ").trim();
+}
+
 async function fetchHtml(url: string): Promise<string | null> {
   if (!isSafeFetchUrl(url)) return null;
   const fetchUrl = /^https?:\/\//i.test(url) ? url : `https://${url}`;
