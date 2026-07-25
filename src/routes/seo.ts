@@ -16,7 +16,7 @@
  */
 
 import { Router, Request, Response } from "express";
-import { marketplaceRegistry } from "../services/marketplace-registry";
+import { marketplaceRegistry, type DiscoverMeta } from "../services/marketplace-registry";
 import { knowledgeService } from "../services/knowledge-service";
 import { getConfig } from "../config/vertical-config";
 import { geocodingService } from "../services/geocoding-service";
@@ -1392,7 +1392,11 @@ router.get("/sok", async (req: Request, res: Response) => {
     if (productTerms) (query as any)._productTerms = productTerms;
     if (nameQuery) (query as any)._nameQuery = nameQuery;
 
-    let results = marketplaceRegistry.discover(query);
+    // REVIEW FOLLOW-UP B1: same out-param as /api/marketplace/search —
+    // discover() can widen a NAME search past our radius by itself, and the
+    // ladder below never runs in that case (wasNameMatch short-circuits it).
+    const discoverMeta: DiscoverMeta = {};
+    let results = marketplaceRegistry.discover(query, discoverMeta);
 
     // If discover returned name-matched results (relevanceScore≥0.9 +
     // matchReasons starts with "Navnematch"), don't run the geo-fallback —
@@ -1406,14 +1410,21 @@ router.get("/sok", async (req: Request, res: Response) => {
     // unrelated nearby producers (the bug Daniel hit on 2026-04-30 with
     // "Erga Gårdsutsalg": 7 random Trondheim hits instead of the 1 in Kleppe).
     const MIN_RESULTS = 3;
-    let geoDropped = false;
+    let geoDropped = !!discoverMeta.geoRelaxed;
+    let appliedRadiusKm = parsed.maxDistanceKm;
     if (parsed.location && results.length < MIN_RESULTS && !heleNorge && !wasNameMatch) {
-      for (const radius of [50, 100, 200]) {
+      // REVIEW FOLLOW-UP item 6: only ever WIDEN. This ladder is fixed at
+      // [50,100,200], so a user who picked 100 km in the new radius control was
+      // silently narrowed to 50 km on the first step. /api/marketplace/search
+      // already got this guard; /sok is where the control actually lives.
+      const steps = [50, 100, 200].filter((r) => r > (parsed.maxDistanceKm ?? 0));
+      for (const radius of steps) {
         if (results.length >= MIN_RESULTS) break;
         const expanded = DiscoveryQuerySchema.parse({ ...parsed, maxDistanceKm: radius, limit: 30, offset: 0 });
         if (productTerms) (expanded as any)._productTerms = productTerms;
         if (nameQuery) (expanded as any)._nameQuery = nameQuery;
         results = marketplaceRegistry.discover(expanded);
+        appliedRadiusKm = radius;
       }
       if (results.length < MIN_RESULTS) {
         const noGeo = DiscoveryQuerySchema.parse({ ...parsed, location: undefined, maxDistanceKm: undefined, limit: 30, offset: 0 });
@@ -1423,6 +1434,7 @@ router.get("/sok", async (req: Request, res: Response) => {
         geoDropped = true;
       }
     }
+    if (geoDropped) appliedRadiusKm = undefined;
 
     // dev-request 2026-07-25 fix 0b: once the geo filter has been dropped, the
     // page may not keep claiming «Resultater filtrert etter sted» — it says
@@ -1477,8 +1489,17 @@ router.get("/sok", async (req: Request, res: Response) => {
       try {
         conversationService.startConversation({
           sellerAgentId: results[0].agent.id,
-          // fix 0f: a coordinates-only search has no text to log.
-          queryText: q || `nær ${frontendLat.toFixed(3)}, ${frontendLng.toFixed(3)}`,
+          // REVIEW FOLLOW-UP B2 — PRIVACY. This used to log
+          // `nær <lat>, <lng>` at 3 decimals (~110 m, household level) for a
+          // coordinates-only search. conversations.query_text is rendered on
+          // the UNAUTHENTICATED /samtaler list and /samtale/<uuid> pages, which
+          // this file's own comments note Googlebot crawls, and redactPII()
+          // does not recognise coordinates. With the new homepage «Finn i
+          // nærheten» button this route is now the PRIMARY way a coordinates-
+          // only search happens. The dev-request's own §6d rule is "truncate to
+          // ~2 decimals if logged at all"; the simplest compliant choice — and
+          // the one taken here — is not to log a position at all.
+          queryText: q || "nærhetssøk",
           source: "web",
           buyerAgentName: "Besøkende",
           requestMeta: buildRequestMeta(req), // (item 3) internal-traffic classification
@@ -1489,18 +1510,37 @@ router.get("/sok", async (req: Request, res: Response) => {
 
     const resultCards = results.map((r: any) => producerCard(r.agent, r.matchReasons, lang)).join("");
 
+    // REVIEW FOLLOW-UP item 7: on a coordinates-only search this used to build
+    // `?q=&heleNorge=true`, which hits the "no q and no coords" branch at the
+    // top of this handler and 302s straight back to the homepage. Carry the
+    // coordinates through so the link actually lands on a result page.
+    const heleNorgeParams = new URLSearchParams();
+    if (q) heleNorgeParams.set("q", q);
+    if (hasBrowserCoords) {
+      heleNorgeParams.set("lat", String(frontendLat));
+      heleNorgeParams.set("lng", String(frontendLng));
+    }
+    heleNorgeParams.set("heleNorge", "true");
     const heleNorgeLink = geoFiltered
-      ? `<a href="${localizedPath("/sok", lang)}?q=${encodeURIComponent(q)}&heleNorge=true" style="display:inline-block;margin-top:12px;padding:7px 18px;background:var(--green-100,#e8f0e0);color:var(--green-700,#2D5016);border:1.5px solid var(--green-700,#2D5016);border-radius:8px;text-decoration:none;font-weight:600;font-size:0.85rem;">\u{1F30D} ${lang === "en" ? "Show all of Norway" : "Vis hele Norge"}</a>`
+      ? `<a href="${localizedPath("/sok", lang)}?${heleNorgeParams.toString()}" style="display:inline-block;margin-top:12px;padding:7px 18px;background:var(--green-100,#e8f0e0);color:var(--green-700,#2D5016);border:1.5px solid var(--green-700,#2D5016);border-radius:8px;text-decoration:none;font-weight:600;font-size:0.85rem;">\u{1F30D} ${lang === "en" ? "Show all of Norway" : "Vis hele Norge"}</a>`
       : "";
 
     // ── fix 0b: honest banner when the geo filter was dropped ──────────
     // The three notes below are mutually exclusive and cover every state the
     // search can end in: geo applied / geo dropped / geo asked for but unknown.
     const placeLabel = escapeHtml(geoPlaceLabel || (lang === "en" ? "that place" : "stedet du søkte på"));
-    const relaxedNote = geoDropped
-      ? `<p id="geoRelaxedNote" style="color:var(--g700,#444);font-size:0.9rem;margin-top:8px;padding:9px 14px;background:#fff8e6;border:1px solid #f0d99a;border-radius:8px;">\u{1F30D} ${lang === "en"
+    // REVIEW FOLLOW-UP B1: geoDropped is now also set when discover() widened a
+    // NAME search on its own, so the banner distinguishes the two cases the
+    // same way the API's `note` does.
+    const relaxedBody = nameQuery
+      ? (lang === "en"
+          ? `No «${escapeHtml(nameQuery)}» matches near ${placeLabel} — showing name matches from all of Norway.`
+          : `Ingen treff på «${escapeHtml(nameQuery)}» nær ${placeLabel} — viser navnetreff fra hele Norge.`)
+      : (lang === "en"
           ? `No matches near ${placeLabel} — expanded to all of Norway.`
-          : `Ingen treff nær ${placeLabel} — utvidet til hele Norge.`}</p>`
+          : `Ingen treff nær ${placeLabel} — utvidet til hele Norge.`);
+    const relaxedNote = geoDropped
+      ? `<p id="geoRelaxedNote" style="color:var(--g700,#444);font-size:0.9rem;margin-top:8px;padding:9px 14px;background:#fff8e6;border:1px solid #f0d99a;border-radius:8px;">\u{1F30D} ${relaxedBody}</p>`
       : "";
 
     const needsLocationNote = needsLocation
@@ -1515,18 +1555,37 @@ router.get("/sok", async (req: Request, res: Response) => {
 
     // fix 0f: the radius is a user control, not a hardcoded 30 in the button's
     // click handler. Feeds both the plain form submit and the geolocation jump.
-    const radiusOptions = [10, 25, 30, 50, 100, 200]
+    //
+    // REVIEW FOLLOW-UP item 8: `?radius=` accepts anything in 1–500, so a value
+    // off the preset ladder (e.g. ?radius=75) left NO option selected and the
+    // control silently showed "10 km" while the search really ran at 75 km —
+    // the control misreporting the applied radius is the same class of dishonesty
+    // as 0b. Splice the actual value into the list when it is not already there.
+    const radiusChoices = Array.from(new Set([10, 25, 30, 50, 100, 200, searchRadiusKm]))
+      .sort((a, b) => a - b);
+    const radiusOptions = radiusChoices
       .map((km) => `<option value="${km}"${km === searchRadiusKm ? " selected" : ""}>${km} km</option>`)
       .join("");
 
     // fix 0f: with no text query the page is "producers near you", not
     // "search results for ''".
+    //
+    // REVIEW FOLLOW-UP B3: …but only when the search REALLY was near you. With
+    // geoDropped the page used to render
+    //   <h1>Produsenter nær deg (30 km) — 4 treff</h1>
+    // directly above its own «Ingen treff nær din posisjon — utvidet til hele
+    // Norge» banner, with a Tromsø producer 1 150 km down the list. The <title>
+    // and og:description are built from the same string, so the contradiction
+    // shipped to search engines and link previews too. Fall back to a neutral
+    // heading whenever the geo filter did not survive.
     const queryLabel = q
       ? `\u201c${escapeHtml(q)}\u201d`
       : (lang === "en" ? "your location" : "din posisjon");
     const pageHeading = q
       ? `${lang === "en" ? "Search results for" : "S\u00f8keresultater for"} ${queryLabel}`
-      : `${lang === "en" ? "Producers near you" : "Produsenter n\u00e6r deg"} (${searchRadiusKm} km)`;
+      : geoDropped
+        ? (lang === "en" ? "Producers across Norway" : "Produsenter i hele Norge")
+        : `${lang === "en" ? "Producers near you" : "Produsenter n\u00e6r deg"} (${searchRadiusKm} km)`;
 
     const content = `
     <section class="search-hero">
@@ -1575,18 +1634,35 @@ router.get("/sok", async (req: Request, res: Response) => {
         }, { enableHighAccuracy: false, timeout: 8000 });
       }
       geoBtn.addEventListener('click', ask);
-      /* dev-request 2026-07-25 fix 0e: the query WAS a proximity request
-         ("n\u00e6r meg") and we have no position \u2014 ask for it straight away
-         instead of leaving the user with a nationwide list. */
-      if (${needsLocation ? "true" : "false"}) ask();
+      /* dev-request 2026-07-25 fix 0e \u2014 REVISED after review (item 9).
+         This used to call ask() unconditionally when needsLocation, i.e. fire
+         the browser permission prompt with NO user gesture. Combined with the
+         deliberately broad /\\bn\u00e6rmeste\\b/ intent pattern that is a real
+         hazard: searching for a producer literally called "N\u00e6rmeste G\u00e5rd AS"
+         would pop a location prompt. A gesture-less prompt is also what
+         browsers penalise (Chrome auto-blocks on low-acceptance origins), so
+         auto-firing risks burning the permission for the button that
+         legitimately needs it. Instead: draw attention to the button and let
+         the user press it. */
+      if (${needsLocation ? "true" : "false"}) {
+        geoBtn.setAttribute('data-needs-location', '1');
+        geoBtn.style.boxShadow = '0 0 0 3px rgba(45,80,22,.25)';
+        try { geoBtn.focus({ preventScroll: true }); } catch (e) { /* older browsers */ }
+      }
     })();
     </script>`;
 
     res.send(shell(
       q ? `${q} \u2014 ${t(lang, "search.title")}` : pageHeading,
+      // B3: the meta description must not claim proximity either when the geo
+      // filter was dropped — it is what link previews and SERPs show.
       q
         ? `${lang === "en" ? "Search results for" : "S\u00f8keresultater for"} \u201c${q}\u201d.`
-        : (lang === "en" ? "Local food producers near your location." : "Lokale matprodusenter n\u00e6r posisjonen din."),
+        : geoDropped
+          ? (lang === "en"
+              ? "No local food producers found near your location \u2014 showing producers across Norway."
+              : "Ingen matprodusenter funnet n\u00e6r posisjonen din \u2014 viser produsenter i hele Norge.")
+          : (lang === "en" ? "Local food producers near your location." : "Lokale matprodusenter n\u00e6r posisjonen din."),
       content,
       // noindex: /sok?q= is an unbounded query space — GSC 2026-07 showed ~1k
       // of these stuck in "crawled, not indexed". follow keeps link equity
