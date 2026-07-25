@@ -1848,8 +1848,8 @@ IKKE en pålogging eller et krav for å bruke tjenesten.
 - Bruk den: send nøkkelen som \`X-API-Key\`-header på ethvert MCP-/A2A-/REST-kall.
 - Fordel: kallene dine telles i en aggregert forbrukslogg (kun endepunkt/verktøynavn og dato —
   aldri innhold eller argumenter). Merk: rate-grensen på finn-tannlege.com er i dag en flat
-  IP-kvote (1000/15 min) som IKKE er høyere med nøkkel — 3x-fordelen som gjelder på
-  rettfrabonden.com/opplevagent.no er ikke koblet på her ennå.
+  IP-kvote (1000/15 min) som IKKE er høyere med nøkkel — den høyere rate-grensen som nøkkelen
+  gir på enkelte andre vertikaler på plattformen er ikke koblet på her ennå.
 - Tilbakekall/slett: \`POST ${DENTAL_BASE_URL}/api/keys/revoke\` (stanser nøkkelen, historikk
   beholdes) eller \`POST ${DENTAL_BASE_URL}/api/keys/erase\` (GDPR-sletting av label/e-post).
   Begge tar \`{ "key": "..." }\` i body, eller nøkkelen som \`X-API-Key\`-header.
@@ -1863,8 +1863,9 @@ Voluntary — every search/read endpoint above already works with no key, and th
 login or a requirement to use the service. Get a free key via \`POST /api/keys\`
 (optional \`label\`/\`contact_email\`), send it back as the \`X-API-Key\` header on any call, and
 revoke/erase it any time via \`POST /api/keys/revoke\` or \`POST /api/keys/erase\`. Note: unlike
-rettfrabonden.com/opplevagent.no, finn-tannlege.com's rate limit is currently a flat per-IP
-quota not yet raised by a key — the key still gets your calls counted in the usage ledger.
+some other verticals on this platform, finn-tannlege.com's rate limit is currently a flat
+per-IP quota not yet raised by a key — the key still gets your calls counted in the usage
+ledger.
 `);
 });
 

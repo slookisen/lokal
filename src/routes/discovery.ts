@@ -279,7 +279,9 @@ IKKE en pålogging eller et krav for å bruke plattformen.
 - Bruk den: send nøkkelen som \`X-API-Key\`-header på ethvert MCP-/A2A-/REST-kall.
 - Fordel: ca. 3x høyere rate-grense (300→900 på generelt REST-API, 200→600 på \`/a2a\`), pluss
   at kallene dine telles i en aggregert forbrukslogg (kun endepunkt/verktøynavn og dato — aldri
-  innhold eller argumenter).
+  innhold eller argumenter). Merk: \`/api/marketplace/search\` og \`/api/marketplace/discover\`
+  ligger i dag bak en egen, flat kvote (150) som IKKE økes av forbrukernøkkelen — 3x-fordelen
+  over gjelder resten av REST-/\`/a2a\`-grensesnittet.
 - Tilbakekall/slett: \`POST ${BASE_URL}/api/keys/revoke\` (stanser nøkkelen, historikk beholdes)
   eller \`POST ${BASE_URL}/api/keys/erase\` (GDPR-sletting av label/e-post). Begge tar
   \`{ "key": "..." }\` i body, eller nøkkelen som \`X-API-Key\`-header.
@@ -292,8 +294,10 @@ Eksempel (cURL):
 Voluntary — every search/read endpoint above already works with no key, and this is NOT a
 login or a requirement to use the platform. Get a free key via \`POST /api/keys\`
 (optional \`label\`/\`contact_email\`), send it back as the \`X-API-Key\` header on any call for a
-higher rate-limit tier, and revoke/erase it any time via \`POST /api/keys/revoke\` or
-\`POST /api/keys/erase\`.
+higher rate-limit tier on the general REST/\`/a2a\` surface, and revoke/erase it any time via
+\`POST /api/keys/revoke\` or \`POST /api/keys/erase\`. Note: \`/api/marketplace/search\` and
+\`/api/marketplace/discover\` currently sit behind a separate, static quota (150) that a
+consumer key does not raise.
 `);
   } catch (err) {
     console.error("llms.txt error:", err);

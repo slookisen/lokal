@@ -820,13 +820,17 @@ class MarketplaceRegistry {
             "no login or account needed. Uses the SAME header name (X-API-Key) as the `apiKey` " +
             "scheme above, but is a separate, optional credential for a different purpose: " +
             "read/search calls are already fully open with no key at all, and nothing here is " +
-            "required. Sending a consumer key simply raises your rate-limit ceiling (about 3x) " +
-            "and gets your calls counted in a per-key usage ledger. " +
+            "required. Sending a consumer key raises your rate-limit ceiling on the general " +
+            "REST/a2a surface (about 3x) and gets your calls counted in a per-key usage ledger " +
+            "\u2014 /api/marketplace/search and /api/marketplace/discover currently sit behind a " +
+            "separate, static per-IP quota that a consumer key does not raise. " +
             "Gratis, frivillig forbruker-identitetsn\u00f8kkel for AI-agenter \u2014 hentes via " +
             "POST /api/keys, ingen innlogging eller konto kreves. Bruker samme headernavn " +
             "(X-API-Key) som apiKey-skjemaet over, men er en egen, valgfri legitimasjon til et " +
             "annet form\u00e5l \u2014 les/s\u00f8k er allerede helt \u00e5pent uten n\u00f8kkel. " +
-            "Gir bare h\u00f8yere rate-grense og en egen forbrukslogg.",
+            "Gir h\u00f8yere rate-grense p\u00e5 det generelle REST-/a2a-grensesnittet (ca. 3x) og en " +
+            "egen forbrukslogg \u2014 /api/marketplace/search og /api/marketplace/discover ligger " +
+            "i dag bak en egen, flat kvote som ikke \u00f8kes av n\u00f8kkelen.",
         },
       },
       // A2A v1.0 `security` requirement list (dev-request 2026-07-13-a2a-card-v1-signing

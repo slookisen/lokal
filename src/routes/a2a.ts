@@ -114,10 +114,10 @@ router.get("/a2a", (_req: Request, res: Response) => {
           description:
             "Free, voluntary consumer-identity key for AI agents calling this API — get one via POST /api/keys (optional label/contact_email in the JSON body), no login or account needed. " +
             "Uses the SAME header name (X-API-Key) as the `apiKey` scheme above, but is a separate, optional credential for a different purpose: read/search calls are already fully open with no key at all, and nothing here is required. " +
-            "Sending a consumer key simply raises your rate-limit ceiling (about 3x) and gets your calls counted in a per-key usage ledger. " +
+            "Sending a consumer key raises your rate-limit ceiling on the general REST and /a2a surface (about 3x) and gets your calls counted in a per-key usage ledger — note that /api/marketplace/search and /api/marketplace/discover currently sit behind a separate, static per-IP quota that a consumer key does not raise. " +
             "Gratis, frivillig forbruker-identitetsnøkkel for AI-agenter — hentes via POST /api/keys, ingen innlogging eller konto kreves. " +
             "Bruker samme headernavn (X-API-Key) som apiKey-skjemaet over, men er en egen, valgfri legitimasjon til et annet formål — les/søk er allerede helt åpent uten nøkkel, og ingenting her er obligatorisk. " +
-            "Gir bare høyere rate-grense og en egen forbrukslogg.",
+            "Gir høyere rate-grense på det generelle REST-/a2a-grensesnittet (ca. 3x) og en egen forbrukslogg — merk at /api/marketplace/search og /api/marketplace/discover i dag ligger bak en egen, flat kvote som ikke økes av nøkkelen.",
         },
       },
       security: [],
