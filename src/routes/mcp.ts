@@ -38,7 +38,10 @@ import {
 } from "../services/cart-service";
 
 
-import { conversationService, buildRequestMeta } from "../services/conversation-service";
+// dev-request 2026-07-25 fix 0g(ii): conversationService is deliberately NOT
+// imported here any more — no tool served over /mcp starts a seller
+// conversation. buildRequestMeta stays for session/traffic classification.
+import { buildRequestMeta } from "../services/conversation-service";
 
 const router = Router();
 
@@ -248,8 +251,8 @@ export function registerTools(
       // that this is ALSO the proximity/"near me" tool and that it should pass
       // the user's coordinates when it knows them — previously there was no
       // way to express "near me" at all, so every location-aware question was
-      // answered from a place NAME guessed out of the text, or nationwide.
-      description: "Search for local food producers in Norway AND get their products with prices. ALWAYS use this tool when a user asks about a specific producer, their products, prices, or availability — it returns the complete product catalog with current prices. Also use for general searches like 'vegetables near Oslo'. USE THIS FOR PROXIMITY / 'near me' / 'nær meg' / 'closest farm shop' QUESTIONS: if you know the user's coordinates, pass lat + lng (and optionally radius_km) and results are filtered and ranked by real distance; you may then leave `query` empty to get everything nearby. Supports searching by producer name (e.g. 'Bjørndal Gård') or by product/location (e.g. 'organic honey Trondheim'). Returns contact info and the full product list with prices.",
+      // answered from a place NAME or not at all.
+      description: "Search for local food producers in Norway AND get their products with prices. ALWAYS use this tool when a user asks about a specific producer, their products, prices, or availability — it returns the complete product catalog with current prices. Also use for general searches like 'vegetables near Oslo'. USE THIS FOR PROXIMITY / 'near me' / 'nær meg' / 'closest farm shop' QUESTIONS: if you know the user's coordinates, pass lat + lng (and optionally radius_km) and results are filtered and ranked by real distance; you may then leave `query` empty to get everything nearby. Supports searching by producer name (e.g. 'Bjørndal Gård') or by product/location (e.g. 'organic honey Trondheim'). Returns contact info and the full product list with prices. Read-only: it never contacts a producer on the user's behalf.",
       inputSchema: {
         query: z.string().default("").describe("Producer name, product query, or location search (Norwegian or English). Examples: 'Bjørndal Gård Oppdal', 'beefburger pris', 'ost Trondheim'. May be empty when lat/lng are supplied — that means 'everything near this position'."),
         lat: z.number().min(-90).max(90).optional().describe("User's latitude (WGS84). Supply this for 'near me' searches when you know where the user is."),
@@ -311,22 +314,17 @@ export function registerTools(
         return { content: [{ type: "text" as const, text: `Ingen resultater for ${where}. Prøv et bredere søk.` }] };
       }
 
-      // Auto-start conversations with top match so seller agent responds
+      // dev-request 2026-07-25 fix 0g(ii) — SECURITY. This used to call
+      // startConversation() for the top 2 matches on EVERY invocation, despite
+      // the `readOnlyHint: true` annotation a few lines above. An assistant
+      // merely exploring on a traveller's behalf therefore opened seller
+      // conversations with farmers who had asked for none of it. Searching is
+      // now genuinely read-only: the tool returns contact details and the
+      // profile link; actually reaching a producer stays an explicit act (the
+      // lokal_cart_* tools, POST /a2a message/send, or a human clicking
+      // through). Nothing consumed the removed links programmatically — they
+      // were only rendered into the assistant's prose.
       const BASE = process.env.BASE_URL || "https://rettfrabonden.com";
-      const convLinks: string[] = [];
-      for (const r of results.slice(0, 2)) {
-        try {
-          const conv = conversationService.startConversation({
-            sellerAgentId: r.agent.id,
-            queryText: query,
-            source: "mcp",
-            clientIdentity: getClientIdentity?.(),
-            requestMeta: getRequestMeta?.(), // (item 3) internal-traffic classification
-            autoRespond: true,
-          });
-          convLinks.push(`💬 [Samtale med ${conv.sellerAgentName}](${BASE}/samtale/${conv.id})`);
-        } catch { /* non-critical */ }
-      }
 
       const header = hasCoords
         ? `🥬 **Lokal mat nær deg${q ? ` — "${q}"` : ""}** (innenfor ${parsed.maxDistanceKm} km) — fant ${results.length} produsenter:\n`
@@ -369,11 +367,7 @@ export function registerTools(
         }
       });
 
-      const convSection = convLinks.length
-        ? `\n\n---\n**Samtaler startet automatisk:**\n${convLinks.join("\n")}`
-        : "";
-
-      return { content: [{ type: "text" as const, text: header + "\n" + lines.join("\n\n") + convSection }] };
+      return { content: [{ type: "text" as const, text: header + "\n" + lines.join("\n\n") }] };
     }
   );
 
@@ -407,23 +401,8 @@ export function registerTools(
         return { content: [{ type: "text" as const, text: "Ingen produsenter funnet med disse filtrene." }] };
       }
 
-      // Auto-start conversation with top match
-      const BASE = process.env.BASE_URL || "https://rettfrabonden.com";
-      const convLinks: string[] = [];
-      const queryDesc = [categories?.join(", "), tags?.join(", ")].filter(Boolean).join(" — ") || "strukturert søk";
-      for (const r of results.slice(0, 2)) {
-        try {
-          const conv = conversationService.startConversation({
-            sellerAgentId: r.agent.id,
-            queryText: queryDesc,
-            source: "mcp",
-            clientIdentity: getClientIdentity?.(),
-            requestMeta: getRequestMeta?.(), // (item 3) internal-traffic classification
-            autoRespond: true,
-          });
-          convLinks.push(`💬 [Samtale med ${conv.sellerAgentName}](${BASE}/samtale/${conv.id})`);
-        } catch { /* non-critical */ }
-      }
+      // dev-request 2026-07-25 fix 0g(ii): read-only means read-only — see
+      // the same note on lokal_search above. No conversation is started here.
 
       const header = `🔍 **Strukturert søk** — ${results.length} resultater:\n`;
       const lines = results.map((r: any, i: number) => {
@@ -432,11 +411,7 @@ export function registerTools(
         return formatAgentCompact(r.agent, i + 1, summary.contact, summary.productSummary, getClientIdentity?.()) + dist;
       });
 
-      const convSection = convLinks.length
-        ? `\n\n---\n**Samtaler startet automatisk:**\n${convLinks.join("\n")}`
-        : "";
-
-      return { content: [{ type: "text" as const, text: header + "\n" + lines.join("\n\n") + convSection }] };
+      return { content: [{ type: "text" as const, text: header + "\n" + lines.join("\n\n") }] };
     }
   );
 

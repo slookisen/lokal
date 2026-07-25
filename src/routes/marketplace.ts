@@ -377,9 +377,12 @@ router.post("/discover", (req: Request, res: Response) => {
       contact: buildContactBlock(r.agent.id),
     }));
 
-    // Auto-start conversations with top matches
+    // dev-request 2026-07-25 fix 0g(ii): structured discovery is a read-only
+    // question too (lokal_discover declares readOnlyHint:true and proxies
+    // here). Starting seller conversations is now an explicit opt-in via
+    // { start_conversation: true } in the body, same contract as GET /search.
     const conversations: any[] = [];
-    if (results.length > 0) {
+    if (req.body?.start_conversation === true && results.length > 0) {
       const queryDesc = [query.categories?.join(", "), query.tags?.join(", ")].filter(Boolean).join(" — ") || "strukturert søk";
       for (const r of results.slice(0, 2)) {
         try {
@@ -603,6 +606,18 @@ router.get("/search", async (req: Request, res: Response) => {
   // Only for bot/agent traffic — not for humans browsing the site.
   // ChatGPT Custom GPT, OpenAI agents, etc. have identifiable UA strings.
   // Humans use the /sok frontend which calls discover() directly.
+  //
+  // dev-request 2026-07-25 fix 0g(ii) — SECURITY. This fired for EVERY
+  // JSON-accepting client, which is every MCP/AI caller (src/mcp/server.ts's
+  // lokal_search proxies straight to this endpoint, and it too declares
+  // readOnlyHint:true). An assistant merely exploring on a traveller's behalf
+  // therefore opened seller conversations with up to two farmers who had asked
+  // for none of it. Search is read-only by default now; a caller that
+  // genuinely wants to reach the producer opts in with ?start_conversation=true.
+  // The intentional, user-initiated write paths are untouched: POST /a2a
+  // message/send (a buyer agent addressing a seller), the /sok page's own
+  // "a human actually searched here" log, and the cart/order flow.
+  const wantsConversation = String(req.query.start_conversation ?? "").toLowerCase() === "true";
   const ua = (req.headers["user-agent"] || "").toLowerCase();
   const acceptHeader = (req.headers["accept"] || "").toLowerCase();
   // Treat all JSON-accepting clients as agents (ChatGPT JIT plugin, MCP clients, etc.)
@@ -613,7 +628,7 @@ router.get("/search", async (req: Request, res: Response) => {
     || ua.includes("node-fetch") || ua.includes("axios") || ua.includes("httpie");
 
   const conversations: any[] = [];
-  if (isAgent && results.length > 0) {
+  if (wantsConversation && isAgent && results.length > 0) {
     for (const r of results.slice(0, 2)) {
       try {
         const conv = conversationService.startConversation({

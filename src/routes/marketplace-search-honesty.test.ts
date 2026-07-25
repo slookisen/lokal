@@ -1,7 +1,7 @@
 /**
  * marketplace-search-honesty.test.ts — dev-request
  * 2026-07-25-reisesok-korridor-discovery-og-naerhetssok, Fase 0 fixes
- * 0b / 0d / 0e / 0f.
+ * 0b / 0d / 0e / 0f / 0g(ii).
  *
  * Every case below is a search result that ACTIVELY MISLED users in
  * production on 2026-07-25 (all four symptoms measured live against
@@ -25,6 +25,10 @@
  *
  *   0f  Proximity search was impossible without typing text: the endpoint
  *       hard-400'd without ?q=.
+ *
+ *   0g(ii) SECURITY — the endpoint auto-started up to 2 seller conversations
+ *       for every JSON-accepting client, i.e. for every MCP/AI caller, even
+ *       though `lokal_search` / `lokal_discover` declare readOnlyHint:true.
  *
  * Harness mirrors admin-blocklist-manual-entry.test.ts (real init.ts schema in
  * an in-memory DB, the REAL router exercised through router.handle(), no
@@ -164,6 +168,9 @@ export async function runMarketplaceSearchHonestyTests(opts: { log?: boolean } =
       typeof import("../services/marketplace-registry");
     const { buildSearchNote, resolveSearchRadiusKm, isValidLatLng } = require("../utils/geo-query") as
       typeof import("../utils/geo-query");
+
+    const convCount = () =>
+      (db.prepare("SELECT COUNT(*) AS n FROM conversations").get() as { n: number }).n;
 
     // ════════════════════════════════════════════════════════════════
     // 0b — a geo-dropped result set must not claim to be geo-filtered
@@ -315,6 +322,35 @@ export async function runMarketplaceSearchHonestyTests(opts: { log?: boolean } =
     assertTrue(isValidLatLng(60, 10), "0f: isValidLatLng accepts a real coordinate pair");
     assertTrue(!isValidLatLng(NaN, 10), "0f: isValidLatLng rejects NaN");
     assertTrue(!isValidLatLng(60, 999), "0f: isValidLatLng rejects an out-of-range longitude");
+
+    // ════════════════════════════════════════════════════════════════
+    // 0g(ii) — SECURITY: a read-only search must not email farmers
+    // ════════════════════════════════════════════════════════════════
+    {
+      const before = convCount();
+      const r = await callRoute(router, {
+        url: "/search",
+        query: { q: "gårdsutsalg" },
+        // Exactly the header shape every MCP/AI client sends — this is what
+        // used to trip the auto-conversation branch.
+        headers: { accept: "application/json", "user-agent": "Claude-User/1.0" },
+      });
+      assertTrue(r.body.count > 0, "0g(ii): the AI-shaped request still gets its results");
+      assertEq(convCount(), before,
+        "0g(ii): NO conversation row was written for a read-only search by an AI client");
+      assertEq(r.body.conversations, [], "0g(ii): …and the response reports no conversations");
+    }
+    {
+      // The opt-in path still works for a caller that explicitly wants contact.
+      const before = convCount();
+      await callRoute(router, {
+        url: "/search",
+        query: { q: "gårdsutsalg", start_conversation: "true" },
+        headers: { accept: "application/json", "user-agent": "Claude-User/1.0" },
+      });
+      assertTrue(convCount() > before,
+        "0g(ii): ?start_conversation=true is still honoured (explicit opt-in preserved)");
+    }
 
     // ── pure helper: the note builder ────────────────────────────────
     assertEq(buildSearchNote({}), undefined, "note: nothing to say → undefined");
