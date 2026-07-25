@@ -349,6 +349,58 @@ export function isAcceptablePlaceType(navneobjekttype: string | null | undefined
   return POPULATED_PLACE_TYPES.has(t) || ADMIN_AREA_TYPES.has(t) || REGION_PLACE_TYPES.has(t);
 }
 
+// ── Name-similarity guard (review follow-up, item 5) ───────────────
+//
+// The type allowlist alone is not enough. Kartverket's `sok` is fuzzy, so a
+// record can be an ACCEPTABLE TYPE and still not be the place that was asked
+// for. Measured 2026-07-25:
+//   • "nes"   → the top Tettsted hit is «Tingnes» (60.7621, 10.94127), which
+//               merely lists "Nes" as a subordinate name.
+//   • "våler" → the top Tettsted hit is «Vålbyen».
+// Raising treffPerSide from 3 to 10 also changed Kartverket's own ordering,
+// so which loosely-related name won became page-size dependent ("sande" moved
+// ~370 km). A type check cannot catch any of that.
+//
+// The discriminator is `navnestatus`. Kartverket marks a record's OFFICIAL
+// name(s) `hovednavn` — one per language — and subordinate/aliased forms
+// `undernavn` (and similar). So:
+//   • «Tingnes» lists ('Tingnes', hovednavn) + ('Nes', UNDERNAVN)  → rejected
+//   • «Guovdageaidnu» lists five hovednavn, one per language, including
+//     ('Kautokeino', hovednavn, Norsk)                             → accepted
+// which is exactly the distinction we need: real multilingual place names
+// (Sami/Kvensk/Norwegian) keep working, loose aliases do not.
+//
+// "<query> kommune" / "<query> herad" also count: Kartverket names the
+// administrative record «Dyrøy kommune», «Kvam herad».
+
+/** A record's official name(s) — hovednavn entries, falling back to the first listed. */
+export function officialNames(n: any): string[] {
+  const entries: any[] = Array.isArray(n?.stedsnavn) ? n.stedsnavn : [];
+  const hoved = entries.filter((e) => e?.navnestatus === "hovednavn").map((e) => e?.skrivemåte || "");
+  if (hoved.length > 0) return hoved.filter(Boolean);
+  return entries.slice(0, 1).map((e) => e?.skrivemåte || "").filter(Boolean);
+}
+
+/** Diacritic- and case-insensitive normalisation (ø→o, æ→ae, å→a, accents stripped). */
+function normalizePlaceName(s: string): string {
+  return (s || "")
+    .toLowerCase()
+    .trim()
+    .replace(/æ/g, "ae").replace(/ø/g, "o").replace(/å/g, "a")
+    .normalize("NFD").replace(/[̀-ͯ]/g, "")
+    .replace(/\s+/g, " ");
+}
+
+/** True when one of the record's OFFICIAL names is the name that was searched for. */
+export function nameMatchesQuery(n: any, query: string): boolean {
+  const q = normalizePlaceName(query);
+  if (!q) return false;
+  return officialNames(n).some((name) => {
+    const v = normalizePlaceName(name);
+    return v === q || v === `${q} kommune` || v === `${q} herad`;
+  });
+}
+
 // ── Radius heuristic based on place type ──
 // Exact match on the same normalised type strings as the allowlist above
 // (the old substring test made "Bygg for jordbruk…" a 30 km "by").
@@ -569,15 +621,18 @@ class GeocodingService {
         n?.representasjonspunkt && n.representasjonspunkt.nord != null && n.representasjonspunkt.øst != null;
       const typeOf = (n: any) => (n?.navneobjekttype || "").toLowerCase().trim();
       const pick = (allowed: Set<string>) =>
-        data.navn.find((n: any) => hasPoint(n) && allowed.has(typeOf(n)));
+        data.navn.find((n: any) =>
+          hasPoint(n) && allowed.has(typeOf(n)) && nameMatchesQuery(n, placeName));
 
       // Tier order: real settlement > administrative area > named region.
       // NO navn[0] fallback — an unrecognised type means "we do not know
       // where this is", which is strictly better than a confident wrong point.
       const best = pick(POPULATED_PLACE_TYPES) || pick(ADMIN_AREA_TYPES) || pick(REGION_PLACE_TYPES);
       if (!best) {
-        const rejected = data.navn.map((n: any) => n?.navneobjekttype).filter(Boolean).join(", ");
-        console.log(`[geocoding] rejected low-confidence Kartverket match for "${placeName}" (types: ${rejected || "none"})`);
+        const rejected = data.navn
+          .map((n: any) => `${officialNames(n)[0] || "?"}[${n?.navneobjekttype || "?"}]`)
+          .join(", ");
+        console.log(`[geocoding] rejected low-confidence Kartverket match for "${placeName}" (candidates: ${rejected || "none"})`);
         return null;
       }
 
@@ -585,7 +640,7 @@ class GeocodingService {
       return {
         lat: punkt.nord,
         lng: punkt.øst,
-        name: best.stedsnavn?.[0]?.skrivemåte || placeName,
+        name: officialNames(best)[0] || placeName,
         radiusKm: radiusForType(best.navneobjekttype || ""),
         source: "kartverket",
         placeType: best.navneobjekttype || undefined,
@@ -612,16 +667,33 @@ class GeocodingService {
       const list: any[] = Array.isArray(data?.kommuner) ? data.kommuner : [];
       if (list.length === 0) return null;
 
-      // Exact (diacritic-insensitive) name match wins; otherwise only accept
-      // an unambiguous single hit. Two different kommuner both loosely
-      // matching means we do not actually know which one the user meant.
+      // Ambiguity must be REFUSED, not silently resolved to list[0] (review
+      // follow-up, item 4). Norway has genuinely duplicated kommune names, and
+      // the register returns them all — measured 2026-07-25:
+      //   «Herøy» → 1818 Nordland (66.133, 11.606) AND 1515 Møre og Romsdal
+      //             (62.439, 5.293)  — ~450 km apart
+      //   «Våler» → 3419 Innlandet  AND 3114 Østfold — ~150 km apart
+      // The previous code ran the exact-name search BEFORE the "only one hit"
+      // guard, so `exact` found the first of the two and returned it with full
+      // confidence — the same class of bug as 0a, one layer down. There is no
+      // honest way to choose between two kommuner with the same name, so we
+      // return null and let the caller be honest about having no geo. Callers
+      // that DO know which one (experience_providers.kommunenummer) go through
+      // lookupKommuneinfoByNumber(), which is exact and unaffected.
       const norm = (s: string) => (s || "").toLowerCase().normalize("NFC").trim();
-      const exact = list.find((k) =>
-        norm(k.kommunenavn) === norm(name) ||
-        norm(k.kommunenavnNorsk) === norm(name) ||
-        (Array.isArray(k.gyldigeNavn) && k.gyldigeNavn.some((g: any) => g?.navn && norm(g.navn) === norm(name)))
-      );
-      const hit = exact || (list.length === 1 ? list[0] : null);
+      const target = norm(name);
+      const isExact = (k: any) =>
+        norm(k.kommunenavn) === target ||
+        norm(k.kommunenavnNorsk) === target ||
+        (Array.isArray(k.gyldigeNavn) && k.gyldigeNavn.some((g: any) => g?.navn && norm(g.navn) === target));
+
+      const exact = list.filter(isExact);
+      if (exact.length > 1 || (exact.length === 0 && list.length > 1)) {
+        const which = list.map((k) => `${k.kommunenavn} ${k.kommunenummer}`).join(" / ");
+        console.log(`[geocoding] refusing ambiguous kommune name "${name}" — ${list.length} candidates: ${which}`);
+        return null;
+      }
+      const hit = exact[0] || (list.length === 1 ? list[0] : null);
       return hit ? this.kommuneToGeoResult(hit, name) : null;
     } catch (err) {
       console.error(`[geocoding] Kommuneinfo lookup failed for "${name}":`, err);
