@@ -368,15 +368,16 @@ export function runAgentsGeocodeWorkerTests(opts: { log?: boolean } = {}): Promi
         for (let i = 1; i <= 3; i++) {
           seed({ id: `z-${i}`, name: `Kaster ${i}`, city: "Kastestad", address: "Kastegata 1", postal_code: "1111" });
         }
-        // A fetchImpl that throws for this address — geocodeOne swallows fetch
-        // errors, so throw from the DB-independent path the worker awaits:
-        // geocodingService.geocode(), reached because these rows have no coords.
-        const throwingGeoFetch = (async () => { throw new Error("simulated upstream failure"); }) as unknown as typeof fetch;
-        geo.__setGeocodingFetchForTesting(throwingGeoFetch);
-        geo.__clearGeocodeCacheForTesting();
-        // Kartverket adresse also misses, so Tier A cannot resolve them either.
+        // A genuine THROW from inside the per-row try. Note that neither
+        // network seam works for this: kartverketQuery() and geocodingService
+        // both swallow fetch errors and return null, which lands on the
+        // no_match path — that path already stamped, so injecting a throwing
+        // fetch would prove nothing (verified: the test passed with the fix
+        // reverted). deps.sleep IS awaited inside the try, by geocodeOne after
+        // every Kartverket request, so throwing there reproduces exactly the
+        // "row throws every tick" condition the review reported.
         const missDeps = {
-          sleep: async () => {},
+          sleep: async () => { throw new Error("simulated per-row failure"); },
           fetchImpl: (async () => ({ ok: true, status: 200, json: async () => ADDRESS_EMPTY } as unknown as Response)) as unknown as typeof fetch,
         };
 
@@ -394,7 +395,8 @@ export function runAgentsGeocodeWorkerTests(opts: { log?: boolean } = {}): Promi
         assertTrue(ids2.length > 0 && ids2.every((id) => !ids1.includes(id)),
           `b3-2: …so consecutive ticks pick DISJOINT rows instead of re-processing the same throwing head forever (${JSON.stringify(ids1)} vs ${JSON.stringify(ids2)})`);
 
-        // Restore the working geocode seam for anything after this block.
+        // Re-assert the working geocode seam for the blocks after this one
+        // (defensive — this block no longer replaces it).
         geo.__setGeocodingFetchForTesting((async (input: any) => {
           const url = decodeURIComponent(String(input));
           if (url.includes("/stedsnavn/") && /sok=vadsø/i.test(url)) {
