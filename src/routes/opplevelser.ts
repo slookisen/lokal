@@ -4131,6 +4131,165 @@ router.get("/admin/gardssalg-contact-coverage", requireAdmin, (_req: Request, re
   });
 });
 
+// ─── GET /api/opplevelser/admin/gardssalg-outreach-readiness ─────────────────
+//
+// dev-request 2026-07-21-gardssalg-outreach-beredskapsrapport: an outreach-
+// readiness report over EVERY gårdssalg provider — the same scoping WHERE
+// clause listGardssalgProviders()/countGardssalgProviders() etc. use
+// (producer_type IS NOT NULL OR rfb_seed_source = 'rfb-seed'), but unlike
+// those callers this deliberately does NOT add the "(catalog_hidden IS NULL
+// OR catalog_hidden != 1)" clause they layer on top, and does NOT exclude
+// content_source IN ('manual','claim') rows either: Daniel needs the WHOLE
+// picture here (visible + hidden, auto-enriched + manually-claimed), never a
+// silently-filtered subset. Hidden/claimed status is surfaced per-row
+// (`visible`, `claim_status`) instead of used to drop rows.
+//
+// Read-only — a single SELECT, no writes, no LLM call, no outbound fetch:
+// every field below is read straight off already-stored experience_providers
+// columns and folded through the two pure helpers below (computeBookingStatus
+// reuses booking-store's isBookingPaused() rather than re-deriving booking
+// state; computeReadinessTier is a small pure function over booleans) — no
+// network I/O anywhere in this handler, easy to confirm by inspection.
+//
+// booking_status reuses isBookingPaused() (services/booking-store.ts, already
+// imported above for the public gårdssalg discover route) rather than
+// inventing new booking-status logic. isBookingPaused() itself only returns a
+// binary "blocked right now" signal (folding in the BOOKING_DISPATCH_ENABLED
+// master switch); to recover the third "none" state (never onboarded at all,
+// vs. onboarded-but-currently-paused) this combines it with the raw
+// booking_live column, matching what routes/opplevelser.ts's discover
+// endpoint and experiences-mcp.ts's discover_gardssalg already treat as
+// "never onboarded" (booking_live !== 1) vs. "onboarded" underneath their own
+// binary request/paused UI label.
+type OutreachBookingStatus = "live" | "paused" | "none";
+
+function computeBookingStatus(
+  bookingLive: number | null,
+  catalogHidden: number | null,
+): OutreachBookingStatus {
+  if (bookingLive !== 1) return "none";
+  return isBookingPaused(bookingLive, catalogHidden) ? "paused" : "live";
+}
+
+// Deterministic, exhaustive tier assignment — every row gets EXACTLY one tier.
+// Precedence (highest first), per the dev-request:
+//   1. unreachable      — no email AND no phone: outreach is impossible no
+//      matter how complete the content is, so this wins over everything else.
+//   2. no_website        — (has a contact method, but) no website at all: an
+//      outreach/claim candidate lacking a source to enrich from, not a
+//      content-completeness gap.
+//   3. outreach_ready     — has a website, about_text, opening_hours_text, and
+//      (by this point in the precedence) a contact method: ready today.
+//   4. needs_enrichment    — everything else: has a website and a contact
+//      method, but is missing about_text/opening_hours_text/etc.
+export type GardssalgReadinessTier =
+  | "outreach_ready"
+  | "needs_enrichment"
+  | "no_website"
+  | "unreachable";
+
+export function computeGardssalgReadinessTier(input: {
+  has_website: boolean;
+  has_about_text: boolean;
+  has_opening_hours: boolean;
+  has_email: boolean;
+  has_phone: boolean;
+}): GardssalgReadinessTier {
+  if (!input.has_email && !input.has_phone) return "unreachable";
+  if (!input.has_website) return "no_website";
+  if (input.has_about_text && input.has_opening_hours) return "outreach_ready";
+  return "needs_enrichment";
+}
+
+router.get("/admin/gardssalg-outreach-readiness", requireAdmin, (_req: Request, res: Response) => {
+  const expDb = getExpDb("experiences");
+
+  let rows: Array<{
+    id: string;
+    navn: string;
+    org_nr: string | null;
+    kommune: string | null;
+    hjemmeside: string | null;
+    epost: string | null;
+    telefon: string | null;
+    about_text: string | null;
+    visit_text: string | null;
+    opening_hours_text: string | null;
+    products: string | null;
+    content_source: string | null;
+    booking_live: number | null;
+    catalog_hidden: number | null;
+  }> = [];
+  try {
+    rows = expDb
+      .prepare(
+        // Same base gårdssalg scoping WHERE clause as listGardssalgProviders()
+        // et al. (experience-store.ts) — producer_type set OR seeded via RFB —
+        // but deliberately WITHOUT their catalog_hidden/content_source
+        // exclusions: every row must appear exactly once here.
+        `SELECT id, navn, org_nr, kommune, hjemmeside, epost, telefon,
+                about_text, visit_text, opening_hours_text, products,
+                content_source, booking_live, catalog_hidden
+           FROM experience_providers
+          WHERE (producer_type IS NOT NULL OR rfb_seed_source = 'rfb-seed')`
+      )
+      .all() as typeof rows;
+  } catch (err) {
+    console.error("[gardssalg-outreach-readiness] failed to query providers:", err);
+    res.status(500).json({ error: "Failed to query experience_providers" });
+    return;
+  }
+
+  const present = (v: string | null): boolean => v !== null && v.trim() !== "";
+
+  const summary = {
+    outreach_ready: 0,
+    needs_enrichment: 0,
+    no_website: 0,
+    unreachable: 0,
+    total: 0,
+  };
+
+  const providers = rows.map((p) => {
+    const has_website = present(p.hjemmeside);
+    const has_about_text = present(p.about_text);
+    const has_visit_text = present(p.visit_text);
+    const has_opening_hours = present(p.opening_hours_text);
+    const has_products = present(p.products);
+    const has_email = present(p.epost);
+    const has_phone = present(p.telefon);
+
+    const readiness_tier = computeGardssalgReadinessTier({
+      has_website,
+      has_about_text,
+      has_opening_hours,
+      has_email,
+      has_phone,
+    });
+    summary[readiness_tier]++;
+    summary.total++;
+
+    return {
+      name: p.navn,
+      org_nr: p.org_nr,
+      kommune: p.kommune,
+      visible: p.catalog_hidden !== 1,
+      claim_status: p.content_source,
+      has_website,
+      has_about_text,
+      has_visit_text,
+      has_opening_hours,
+      has_products,
+      has_email,
+      has_phone,
+      booking_status: computeBookingStatus(p.booking_live, p.catalog_hidden),
+      readiness_tier,
+    };
+  });
+
+  res.json({ providers, summary });
+});
+
 // ─── GET /api/opplevelser/admin/gardssalg-provider-lookup ────────────────────
 //
 // Closes a gap surfaced while targeting /admin/gardssalg-content-refresh at

@@ -27248,6 +27248,20 @@ Promise.allSettled(_oaHomeCountersDeps).then(async () => {
     for (const f of gccr.failures) failures.push("opplevelser-gardssalg-contact-coverage: " + f);
     console.log(`  opplevelser-gardssalg-contact-coverage: ${gccr.passed} passed, ${gccr.failed} failed`);
 
+    // dev-request 2026-07-21-gardssalg-outreach-beredskapsrapport: GET
+    // /admin/gardssalg-outreach-readiness — read-only outreach-readiness
+    // report (per-provider readiness_tier + summary) over EVERY gårdssalg
+    // provider, visible and hidden/claimed alike. Same in-memory-DB pattern,
+    // runs sequentially inside this same gated block for the same reason.
+    console.log("\n── opplevelser-gardssalg-outreach-readiness: admin outreach-readiness report ──");
+    const { runOpplevelserGardssalgOutreachReadinessTests } = require("../src/routes/opplevelser-gardssalg-outreach-readiness.test") as
+      typeof import("../src/routes/opplevelser-gardssalg-outreach-readiness.test");
+    const gorr = await runOpplevelserGardssalgOutreachReadinessTests({ log: false });
+    passed += gorr.passed;
+    failed += gorr.failed;
+    for (const f of gorr.failures) failures.push("opplevelser-gardssalg-outreach-readiness: " + f);
+    console.log(`  opplevelser-gardssalg-outreach-readiness: ${gorr.passed} passed, ${gorr.failed} failed`);
+
     // dev-request 2026-07-12-gardssalg-go-live-gate-dark-launch-og-onboarding,
     // acceptance criterion 5: GET /admin/gardssalg/bookings-count — read-only
     // count + non-PII listing of existing gardssalg_bookings rows. Same
