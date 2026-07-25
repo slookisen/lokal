@@ -33663,3 +33663,54 @@ runSerial(async () => {
     failures.push("sok-search-honesty: unexpected error: " + String(err?.message || err));
   }
 });
+
+// dev-request 2026-07-25-reisesok-korridor-discovery-og-naerhetssok, Fase 1a +
+// 1c — the RFB coordinate foundation. 948 of 1 499 active producers had
+// seed-time coordinates of unrecorded provenance and 551 had NONE at all
+// (invisible to every geo-filtered search), because `agents` was the one
+// vertical with no geocoding worker. Covers services/agents-geocode-worker.ts
+// (address tier, city-centroid tier, never-downgrade, attempt-stamp rotation,
+// dry-run), the additive agents.geo_precision migration, and the 1c honesty
+// rule wired through marketplace-registry.discover() — a centroid-precision
+// producer must never render a precise km distance. Own in-memory DB (swaps
+// the shared getDb() singleton, restored on exit) + both Kartverket seams
+// injected — runs via runSerial() same as the Fase 0 suites above.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-07-25-reisesok: Fase 1a+1c (agents geocode worker + distance honesty) ──");
+  try {
+    const { runAgentsGeocodeWorkerTests } = require("../src/services/agents-geocode-worker.test") as
+      typeof import("../src/services/agents-geocode-worker.test");
+    const agw = await runAgentsGeocodeWorkerTests({ log: false });
+    passed += agw.passed;
+    failed += agw.failed;
+    for (const f of agw.failures) failures.push("agents-geocode-worker: " + f);
+    console.log(`  agents-geocode-worker: ${agw.passed} passed, ${agw.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("agents-geocode-worker: unexpected error: " + String(err?.message || err));
+  }
+});
+
+// dev-request 2026-07-25-reisesok-korridor-discovery-og-naerhetssok, Fase 1b —
+// experiences were 100 % geo_precision='kommune' (zero at address level), so
+// everything in Bodø reported distance_km 0. Steps E/F of
+// experiences-geocode-worker.ts re-attempt those rows at address level from
+// the provider's street address, and from `meeting_point` when — and only
+// when — it actually parses as an address. Own in-memory experiences DB
+// (EXPERIENCES_DB_PATH=":memory:" + db-factory reset) with the Kartverket
+// adresse-API injected; runs via runSerial().
+runSerial(async () => {
+  console.log("\n── dev-request 2026-07-25-reisesok: Fase 1b (experiences kommune → address upgrade) ──");
+  try {
+    const { runExperiencesAddressUpgradeTests } = require("../src/services/experiences-address-upgrade.test") as
+      typeof import("../src/services/experiences-address-upgrade.test");
+    const eau = await runExperiencesAddressUpgradeTests({ log: false });
+    passed += eau.passed;
+    failed += eau.failed;
+    for (const f of eau.failures) failures.push("experiences-address-upgrade: " + f);
+    console.log(`  experiences-address-upgrade: ${eau.passed} passed, ${eau.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("experiences-address-upgrade: unexpected error: " + String(err?.message || err));
+  }
+});
