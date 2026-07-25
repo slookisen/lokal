@@ -22,6 +22,7 @@ import { getConfig } from "../config/vertical-config";
 import { geocodingService } from "../services/geocoding-service";
 import { analyticsService, parseUserAgent } from "../services/analytics-service";
 import { DiscoveryQuerySchema } from "../models/marketplace";
+import { isValidLatLng, resolveSearchRadiusKm, formatPlaceLabel } from "../utils/geo-query";
 import { getDb } from "../database/init";
 import { conversationService, buildRequestMeta } from "../services/conversation-service";
 import { getTrafficStats } from "../services/traffic-stats";
@@ -1163,6 +1164,40 @@ router.get("/", (req: Request, res: Response) => {
             <button type="submit">${escapeHtml(t(lang, "home.search_btn"))}</button>
           </form>
         </div>
+        <!-- dev-request 2026-07-25 fix 0f(ii): the homepage had no geolocation
+             entry point at all (navigator.geolocation grep = 0 across both
+             homepages), so proximity search was only reachable by first
+             typing a place name and landing on /sok. Progressive enhancement:
+             the block hides itself when the browser has no geolocation API,
+             and every other route into search is untouched. -->
+        <div class="hero-nearme" style="margin-top:10px;">
+          <button type="button" id="homeGeoBtn" style="padding:10px 20px;background:var(--white,#fff);color:var(--green-700,#2D5016);border:2px solid var(--green-700,#2D5016);border-radius:10px;font-weight:700;font-size:0.9rem;cursor:pointer;">\u{1F4CD} ${lang === "en" ? "Find near me" : "Finn i nærheten"}</button>
+          <label for="homeRadius" style="margin-left:8px;font-size:0.82rem;color:var(--g500,#666);">${lang === "en" ? "within" : "innenfor"}</label>
+          <select id="homeRadius" aria-label="${lang === "en" ? "Search radius" : "Søkeradius"}" style="padding:8px 6px;border:1.5px solid var(--g200,#ddd);border-radius:8px;font-size:0.82rem;background:var(--white,#fff);cursor:pointer;">
+            <option value="10">10 km</option><option value="25">25 km</option><option value="30" selected>30 km</option><option value="50">50 km</option><option value="100">100 km</option>
+          </select>
+        </div>
+        <script>
+        (function(){
+          var b = document.getElementById('homeGeoBtn');
+          if (!b) return;
+          if (!('geolocation' in navigator)) { b.parentNode.style.display = 'none'; return; }
+          b.addEventListener('click', function(){
+            var original = b.innerHTML;
+            b.textContent = '⏳ ${lang === "en" ? "Locating..." : "Henter posisjon..."}';
+            b.disabled = true;
+            navigator.geolocation.getCurrentPosition(function(pos){
+              var sel = document.getElementById('homeRadius');
+              var r = (sel && sel.value) || '30';
+              window.location.href = "${localizedPath("/sok", lang)}?lat=" + pos.coords.latitude + '&lng=' + pos.coords.longitude + '&radius=' + encodeURIComponent(r);
+            }, function(){
+              b.textContent = '\\u274C ${lang === "en" ? "Location denied" : "Posisjon avslått"}';
+              b.disabled = false;
+              setTimeout(function(){ b.innerHTML = original; }, 2500);
+            }, { enableHighAccuracy: false, timeout: 8000 });
+          });
+        })();
+        </script>
         <div class="hero-chips">
           <a href="${localizedPath("/sok", lang)}?q=${encodeURIComponent(lang === "en" ? "vegetables oslo" : "gr\u00f8nnsaker oslo")}" class="chip">\u{1F955} ${escapeHtml(t(lang, "home.chip_vegetables_oslo"))}</a>
           <a href="${localizedPath("/sok", lang)}?q=${encodeURIComponent(lang === "en" ? "honey oslo" : "honning oslo")}" class="chip">\u{1F36F} ${escapeHtml(t(lang, "home.chip_honey_bergen"))}</a>
@@ -1308,28 +1343,43 @@ const SEARCH_CSS = `
 
 router.get("/sok", async (req: Request, res: Response) => {
   const lang = req.lang;
-  const q = req.query.q as string;
-  if (!q) { res.redirect(localizedPath("/", lang)); return; }
+  const q = typeof req.query.q === "string" ? req.query.q : "";
+  const frontendLat = parseFloat(req.query.lat as string);
+  const frontendLng = parseFloat(req.query.lng as string);
+  const hasBrowserCoords = isValidLatLng(frontendLat, frontendLng);
+  // dev-request 2026-07-25 fix 0f: coordinates alone are a complete search.
+  // /sok used to bounce straight back to the homepage without ?q=, so the
+  // "Nær meg" button could only ever re-run an existing text query and there
+  // was no way to search purely by position.
+  if (!q && !hasBrowserCoords) { res.redirect(localizedPath("/", lang)); return; }
+  const searchRadiusKm = resolveSearchRadiusKm(req.query.radius);
 
   try {
     const parsed = marketplaceRegistry.parseNaturalQuery(q);
+    const proximityIntent = !!(parsed as any)._proximityIntent;
     const heleNorge = req.query.heleNorge === "true";
+    let geoPlaceLabel: string | undefined;
 
     // Geocode location from query text (e.g. "honning oslo" → Oslo coords)
     if (!heleNorge && !parsed.location) {
-      const frontendLat = parseFloat(req.query.lat as string);
-      const frontendLng = parseFloat(req.query.lng as string);
-      if (!isNaN(frontendLat) && !isNaN(frontendLng)) {
+      if (hasBrowserCoords) {
         parsed.location = { lat: frontendLat, lng: frontendLng };
-        parsed.maxDistanceKm = parseFloat(req.query.radius as string) || 30;
-      } else {
+        parsed.maxDistanceKm = searchRadiusKm;
+        geoPlaceLabel = lang === "en" ? "your location" : "din posisjon";
+      } else if (q) {
         const geoResult = await geocodingService.extractAndGeocode(q);
         if (geoResult) {
           parsed.location = { lat: geoResult.lat, lng: geoResult.lng };
           parsed.maxDistanceKm = geoResult.radiusKm;
+          geoPlaceLabel = formatPlaceLabel(geoResult.name);
         }
       }
     }
+
+    // fix 0e — the user asked for "near me" but gave us no position. The page
+    // triggers the browser geolocation prompt instead of quietly answering a
+    // different question with a nationwide trust-ranked list.
+    const needsLocation = proximityIntent && !parsed.location && !heleNorge;
 
     // Preserve internal fields through Zod parsing (Zod strips unknown keys).
     // _nameQuery is critical: when present, discover() returns name-matched
@@ -1356,6 +1406,7 @@ router.get("/sok", async (req: Request, res: Response) => {
     // unrelated nearby producers (the bug Daniel hit on 2026-04-30 with
     // "Erga Gårdsutsalg": 7 random Trondheim hits instead of the 1 in Kleppe).
     const MIN_RESULTS = 3;
+    let geoDropped = false;
     if (parsed.location && results.length < MIN_RESULTS && !heleNorge && !wasNameMatch) {
       for (const radius of [50, 100, 200]) {
         if (results.length >= MIN_RESULTS) break;
@@ -1369,10 +1420,14 @@ router.get("/sok", async (req: Request, res: Response) => {
         if (productTerms) (noGeo as any)._productTerms = productTerms;
         if (nameQuery) (noGeo as any)._nameQuery = nameQuery;
         results = marketplaceRegistry.discover(noGeo);
+        geoDropped = true;
       }
     }
 
-    const geoFiltered = !!parsed.location && !heleNorge;
+    // dev-request 2026-07-25 fix 0b: once the geo filter has been dropped, the
+    // page may not keep claiming «Resultater filtrert etter sted» — it says
+    // «Ingen treff nær <sted> — utvidet til hele Norge» instead.
+    const geoFiltered = !!parsed.location && !heleNorge && !geoDropped;
 
     // ── Total-count probe ─────────────────────────────────────
     // The display block above renders `results.length` (capped at 30) — but
@@ -1422,7 +1477,8 @@ router.get("/sok", async (req: Request, res: Response) => {
       try {
         conversationService.startConversation({
           sellerAgentId: results[0].agent.id,
-          queryText: q,
+          // fix 0f: a coordinates-only search has no text to log.
+          queryText: q || `nær ${frontendLat.toFixed(3)}, ${frontendLng.toFixed(3)}`,
           source: "web",
           buyerAgentName: "Besøkende",
           requestMeta: buildRequestMeta(req), // (item 3) internal-traffic classification
@@ -1437,21 +1493,55 @@ router.get("/sok", async (req: Request, res: Response) => {
       ? `<a href="${localizedPath("/sok", lang)}?q=${encodeURIComponent(q)}&heleNorge=true" style="display:inline-block;margin-top:12px;padding:7px 18px;background:var(--green-100,#e8f0e0);color:var(--green-700,#2D5016);border:1.5px solid var(--green-700,#2D5016);border-radius:8px;text-decoration:none;font-weight:600;font-size:0.85rem;">\u{1F30D} ${lang === "en" ? "Show all of Norway" : "Vis hele Norge"}</a>`
       : "";
 
+    // ── fix 0b: honest banner when the geo filter was dropped ──────────
+    // The three notes below are mutually exclusive and cover every state the
+    // search can end in: geo applied / geo dropped / geo asked for but unknown.
+    const placeLabel = escapeHtml(geoPlaceLabel || (lang === "en" ? "that place" : "stedet du søkte på"));
+    const relaxedNote = geoDropped
+      ? `<p id="geoRelaxedNote" style="color:var(--g700,#444);font-size:0.9rem;margin-top:8px;padding:9px 14px;background:#fff8e6;border:1px solid #f0d99a;border-radius:8px;">\u{1F30D} ${lang === "en"
+          ? `No matches near ${placeLabel} — expanded to all of Norway.`
+          : `Ingen treff nær ${placeLabel} — utvidet til hele Norge.`}</p>`
+      : "";
+
+    const needsLocationNote = needsLocation
+      ? `<p id="needsLocationNote" style="color:var(--g700,#444);font-size:0.9rem;margin-top:8px;padding:9px 14px;background:#eef5ff;border:1px solid #b9d3f5;border-radius:8px;">\u{1F4CD} ${lang === "en"
+          ? "To show what is near you we need your location — allow it in your browser, or type a place name."
+          : "For å vise hva som er nær deg trenger vi posisjonen din — tillat den i nettleseren, eller skriv inn et stedsnavn."}</p>`
+      : "";
+
     const geoNote = geoFiltered
       ? `<p style="color:var(--g500,#666);font-size:0.85rem;margin-top:8px;">${lang === "en" ? "Results filtered by location." : "Resultater filtrert etter sted."} ${heleNorgeLink}</p>`
       : "";
 
+    // fix 0f: the radius is a user control, not a hardcoded 30 in the button's
+    // click handler. Feeds both the plain form submit and the geolocation jump.
+    const radiusOptions = [10, 25, 30, 50, 100, 200]
+      .map((km) => `<option value="${km}"${km === searchRadiusKm ? " selected" : ""}>${km} km</option>`)
+      .join("");
+
+    // fix 0f: with no text query the page is "producers near you", not
+    // "search results for ''".
+    const queryLabel = q
+      ? `\u201c${escapeHtml(q)}\u201d`
+      : (lang === "en" ? "your location" : "din posisjon");
+    const pageHeading = q
+      ? `${lang === "en" ? "Search results for" : "S\u00f8keresultater for"} ${queryLabel}`
+      : `${lang === "en" ? "Producers near you" : "Produsenter n\u00e6r deg"} (${searchRadiusKm} km)`;
+
     const content = `
     <section class="search-hero">
       <div class="container">
-        <div class="bc" style="padding:0 0 12px;"><a href="${localizedPath("/", lang)}">${lang === "en" ? "Home" : "Hjem"}</a><span>/</span>${escapeHtml(t(lang, "search.page_title"))}: \u201c${escapeHtml(q)}\u201d</div>
-        <h1>${lang === "en" ? "Search results for" : "S\u00f8keresultater for"} \u201c${escapeHtml(q)}\u201d \u2014 ${headerText}</h1>
-        ${allFuzzy ? `<p style="color:var(--g500,#666);font-size:0.9rem;margin-top:4px;">${lang === "en" ? "No exact name match for" : "Fant ingen eksakte navnematch for"} \u201c${escapeHtml(q)}\u201d \u2014 ${lang === "en" ? "showing producers with similar names." : "viser produsenter med lignende navn."}</p>` : ""}
+        <div class="bc" style="padding:0 0 12px;"><a href="${localizedPath("/", lang)}">${lang === "en" ? "Home" : "Hjem"}</a><span>/</span>${escapeHtml(t(lang, "search.page_title"))}: ${queryLabel}</div>
+        <h1>${pageHeading} \u2014 ${headerText}</h1>
+        ${allFuzzy ? `<p style="color:var(--g500,#666);font-size:0.9rem;margin-top:4px;">${lang === "en" ? "No exact name match for" : "Fant ingen eksakte navnematch for"} ${queryLabel} \u2014 ${lang === "en" ? "showing producers with similar names." : "viser produsenter med lignende navn."}</p>` : ""}
         <form class="search-form" action="${localizedPath("/sok", lang)}" method="GET">
           <input type="text" name="q" value="${escapeHtml(q)}" aria-label="${escapeHtml(t(lang, "search.btn_search"))}">
+          <select name="radius" id="radiusSelect" aria-label="${lang === "en" ? "Search radius" : "S\u00f8keradius"}" style="padding:12px 8px;border:2px solid var(--g200);border-left:none;border-right:none;font-size:0.85rem;background:var(--white,#fff);cursor:pointer;">${radiusOptions}</select>
           <button type="button" id="geoBtn" style="padding:12px 16px;background:var(--green-100,#e8f0e0);color:var(--green-700,#2D5016);border:2px solid var(--green-700,#2D5016);border-left:none;font-weight:700;font-size:0.85rem;cursor:pointer;white-space:nowrap;">\u{1F4CD} ${lang === "en" ? "Near me" : "N\u00e6r meg"}</button>
           <button type="submit">${escapeHtml(t(lang, "search.btn_search"))}</button>
         </form>
+        ${needsLocationNote}
+        ${relaxedNote}
         ${geoNote}
       </div>
     </section>
@@ -1459,7 +1549,7 @@ router.get("/sok", async (req: Request, res: Response) => {
       ${results.length > 0
         ? `<div class="results-grid">${resultCards}</div>`
         : `<div style="text-align:center;padding:48px 0;color:var(--g500);">
-            <p style="font-size:1.1rem;">${lang === "en" ? "No results for" : "Ingen resultater for"} \u201c${escapeHtml(q)}\u201d</p>
+            <p style="font-size:1.1rem;">${lang === "en" ? "No results for" : "Ingen resultater for"} ${queryLabel}</p>
             <p style="margin-top:8px;"><a href="${localizedPath("/", lang)}">${lang === "en" ? "Try a different search" : "Pr\u00f8v et annet s\u00f8k"}</a></p>
           </div>`
       }
@@ -1468,25 +1558,35 @@ router.get("/sok", async (req: Request, res: Response) => {
     (function() {
       var geoBtn = document.getElementById('geoBtn');
       if (!geoBtn || !navigator.geolocation) { if(geoBtn) geoBtn.style.display='none'; return; }
-      geoBtn.addEventListener('click', function() {
+      function go(pos) {
+        var form = geoBtn.closest('form');
+        var q = form.querySelector('input[name=q]').value;
+        var sel = document.getElementById('radiusSelect');
+        var radius = (sel && sel.value) || '${searchRadiusKm}';
+        window.location.href = "${localizedPath("/sok", lang)}?q=" + encodeURIComponent(q) + '&lat=' + pos.coords.latitude + '&lng=' + pos.coords.longitude + '&radius=' + encodeURIComponent(radius);
+      }
+      function ask() {
         geoBtn.textContent = '\u23F3 Henter...';
         geoBtn.disabled = true;
-        navigator.geolocation.getCurrentPosition(function(pos) {
-          var form = geoBtn.closest('form');
-          var q = form.querySelector('input[name=q]').value;
-          window.location.href = "${localizedPath("/sok", lang)}?q=" + encodeURIComponent(q) + '&lat=' + pos.coords.latitude + '&lng=' + pos.coords.longitude + '&radius=30';
-        }, function() {
+        navigator.geolocation.getCurrentPosition(go, function() {
           geoBtn.textContent = '\\u274C Avsl\u00e5tt';
           geoBtn.disabled = false;
           setTimeout(function() { geoBtn.innerHTML = '&#128205; N\u00e6r meg'; }, 2000);
         }, { enableHighAccuracy: false, timeout: 8000 });
-      });
+      }
+      geoBtn.addEventListener('click', ask);
+      /* dev-request 2026-07-25 fix 0e: the query WAS a proximity request
+         ("n\u00e6r meg") and we have no position \u2014 ask for it straight away
+         instead of leaving the user with a nationwide list. */
+      if (${needsLocation ? "true" : "false"}) ask();
     })();
     </script>`;
 
     res.send(shell(
-      `${q} \u2014 ${t(lang, "search.title")}`,
-      `${lang === "en" ? "Search results for" : "S\u00f8keresultater for"} \u201c${q}\u201d.`,
+      q ? `${q} \u2014 ${t(lang, "search.title")}` : pageHeading,
+      q
+        ? `${lang === "en" ? "Search results for" : "S\u00f8keresultater for"} \u201c${q}\u201d.`
+        : (lang === "en" ? "Local food producers near your location." : "Lokale matprodusenter n\u00e6r posisjonen din."),
       content,
       // noindex: /sok?q= is an unbounded query space — GSC 2026-07 showed ~1k
       // of these stuck in "crawled, not indexed". follow keeps link equity
