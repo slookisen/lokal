@@ -33,6 +33,8 @@ import {
   geocodingService,
   haversineDistanceKm,
   isAcceptablePlaceType,
+  nameMatchesQuery,
+  officialNames,
   radiusFromBoundingBox,
   __setGeocodingFetchForTesting,
   __clearGeocodeCacheForTesting,
@@ -92,11 +94,94 @@ const STEDSNAVN_BLASKJELL = {
   ],
 };
 
+// NB: the full `stedsnavn` array, verbatim. Every entry is navnestatus
+// "hovednavn" — Kartverket records one official name PER LANGUAGE for
+// multilingual places — which is what lets the name-similarity guard accept
+// «Guovdageaidnu» as the answer to "kautokeino" while still rejecting a
+// loose alias (see STEDSNAVN_NES below).
 const STEDSNAVN_KAUTOKEINO = {
   metadata: { totaltAntallTreff: 2 },
   navn: [
-    { navneobjekttype: "Tettsted", representasjonspunkt: { nord: 69.01243, øst: 23.04101 }, stedsnavn: [{ skrivemåte: "Guovdageaidnu" }] },
-    { navneobjekttype: "Enebolig/mindre boligbygg", representasjonspunkt: { nord: 61.08741, øst: 11.38256 }, stedsnavn: [{ skrivemåte: "Kautokeino" }] },
+    {
+      navneobjekttype: "Tettsted",
+      representasjonspunkt: { nord: 69.01243, øst: 23.04101 },
+      stedsnavn: [
+        { skrivemåte: "Guovdageaidnu", navnestatus: "hovednavn", språk: "Nordsamisk" },
+        { skrivemåte: "Guov'dagæi'dno", navnestatus: "hovednavn", språk: "Nordsamisk" },
+        { skrivemåte: "Guovdagæino", navnestatus: "hovednavn", språk: "Nordsamisk" },
+        { skrivemåte: "Kautokeino", navnestatus: "hovednavn", språk: "Norsk" },
+        { skrivemåte: "Koutokeino", navnestatus: "hovednavn", språk: "Kvensk" },
+      ],
+    },
+    {
+      navneobjekttype: "Enebolig/mindre boligbygg",
+      representasjonspunkt: { nord: 61.08741, øst: 11.38256 },
+      stedsnavn: [{ skrivemåte: "Kautokeino", navnestatus: "hovednavn", språk: "Norsk" }],
+    },
+  ],
+};
+
+// Review follow-up item 5. Raising treffPerSide 3 → 10 changed Kartverket's own
+// ordering, and the type allowlist alone let an ACCEPTABLE-TYPE record that is
+// not the place asked for win: for "nes" the top Tettsted hit is «Tingnes»
+// (60.7621, 10.94127), which merely lists "Nes" as an UNDERNAVN. Verbatim
+// capture 2026-07-25.
+const STEDSNAVN_NES = {
+  metadata: { totaltAntallTreff: 4 },
+  navn: [
+    {
+      navneobjekttype: "Tettsted",
+      representasjonspunkt: { nord: 60.7621, øst: 10.94127 },
+      stedsnavn: [
+        { skrivemåte: "Tingnes", navnestatus: "hovednavn", språk: "Norsk" },
+        { skrivemåte: "Nes", navnestatus: "undernavn", språk: "Norsk" },
+      ],
+    },
+    {
+      navneobjekttype: "Tettsted",
+      representasjonspunkt: { nord: 60.56348, øst: 9.98776 },
+      stedsnavn: [{ skrivemåte: "Nes", navnestatus: "hovednavn", språk: "Norsk" }],
+    },
+  ],
+};
+
+// Review follow-up item 4. Norway has genuinely duplicated kommune names and
+// the register returns them all — there is no honest way to pick. Verbatim.
+const KOMMUNEINFO_HEROY = {
+  antallTreff: 2,
+  kommuner: [
+    {
+      kommunenavn: "Herøy", kommunenavnNorsk: "Herøy", kommunenummer: "1818", fylkesnavn: "Nordland",
+      gyldigeNavn: [{ navn: "Herøy", prioritet: 1 }],
+      punktIOmrade: { coordinates: [11.606, 66.133], type: "Point" },
+    },
+    {
+      kommunenavn: "Herøy", kommunenavnNorsk: "Herøy", kommunenummer: "1515", fylkesnavn: "Møre og Romsdal",
+      gyldigeNavn: [{ navn: "Herøy", prioritet: 1 }],
+      punktIOmrade: { coordinates: [5.293, 62.439], type: "Point" },
+    },
+  ],
+};
+
+const KOMMUNEINFO_HEROY_1515 = {
+  kommunenavn: "Herøy", kommunenavnNorsk: "Herøy", kommunenummer: "1515", fylkesnavn: "Møre og Romsdal",
+  gyldigeNavn: [{ navn: "Herøy", prioritet: 1 }],
+  punktIOmrade: { coordinates: [5.293, 62.439], type: "Point" },
+};
+
+const KOMMUNEINFO_VALER = {
+  antallTreff: 2,
+  kommuner: [
+    {
+      kommunenavn: "Våler", kommunenavnNorsk: "Våler", kommunenummer: "3419", fylkesnavn: "Innlandet",
+      gyldigeNavn: [{ navn: "Våler", prioritet: 1 }],
+      punktIOmrade: { coordinates: [12.015, 60.813], type: "Point" },
+    },
+    {
+      kommunenavn: "Våler", kommunenavnNorsk: "Våler", kommunenummer: "3114", fylkesnavn: "Østfold",
+      gyldigeNavn: [{ navn: "Våler", prioritet: 1 }],
+      punktIOmrade: { coordinates: [10.922, 59.464], type: "Point" },
+    },
   ],
 };
 
@@ -120,12 +205,16 @@ function makeFakeFetch(): { fetchImpl: typeof fetch; calls: string[] } {
 
     if (url.includes("/kommuneinfo/")) {
       if (/knavn=flakstad/i.test(url) || /kommuner\/1859/.test(url)) return json(KOMMUNEINFO_FLAKSTAD);
+      if (/knavn=herøy/i.test(url)) return json(KOMMUNEINFO_HEROY);
+      if (/kommuner\/1515/.test(url)) return json(KOMMUNEINFO_HEROY_1515);
+      if (/knavn=våler/i.test(url)) return json(KOMMUNEINFO_VALER);
       return notFound();
     }
     if (url.includes("/stedsnavn/")) {
       if (/sok=flakstad(&|$)/i.test(url)) return json(STEDSNAVN_FLAKSTAD);
       if (/sok=blåskjell(&|$)/i.test(url)) return json(STEDSNAVN_BLASKJELL);
       if (/sok=kautokeino(&|$)/i.test(url)) return json(STEDSNAVN_KAUTOKEINO);
+      if (/sok=nes(&|$)/i.test(url)) return json(STEDSNAVN_NES);
       return json(STEDSNAVN_EMPTY);
     }
     return notFound();
@@ -268,6 +357,90 @@ export async function runGeocodingHonestyTests(opts: { log?: boolean } = {}): Pr
       const afterFirst = calls.length;
       await geocodingService.geocodeKommune("Flakstad");
       assertEq(calls.length, afterFirst, "0a: second geocodeKommune('Flakstad') is served from cache");
+    }
+
+    // ══════════════════════════════════════════════════════════════
+    // item 5 (review) — name-similarity guard on Stedsnavn
+    // ══════════════════════════════════════════════════════════════
+    // The type allowlist is not sufficient: a record can be an acceptable TYPE
+    // and still not be the place that was asked for. Kartverket's own ordering
+    // is page-size dependent, so raising treffPerSide 3 → 10 silently
+    // relocated some lookups. The discriminator is `navnestatus`.
+    {
+      __clearGeocodeCacheForTesting();
+      const r = await geocodingService.geocode("nes");
+      assertTrue(r !== null, "item 5: 'nes' still resolves");
+      if (r) {
+        assertTrue(r.name !== "Tingnes",
+          `item 5: «Tingnes» is NOT returned as the answer for "nes" — «Nes» is only an UNDERNAVN there (got ${r.name})`);
+        assertEq(r.name, "Nes", "item 5: the accepted record is genuinely named Nes");
+        assertTrue(Math.abs(r.lat - 60.56348) < 0.001,
+          `item 5: …and it is the Nes whose hovednavn matches (got ${r.lat})`);
+      }
+    }
+    {
+      // The guard must NOT break real multilingual place names: Kartverket
+      // records one hovednavn per language, so «Kautokeino» (Norsk) and
+      // «Guovdageaidnu» (Nordsamisk) are both official names of one place.
+      __clearGeocodeCacheForTesting();
+      const r = await geocodingService.geocode("kautokeino");
+      assertTrue(r !== null && Math.abs(r.lat - 69.01243) < 0.001,
+        `item 5: a Sami/Norwegian multilingual name still resolves (got ${r?.lat})`);
+      assertEq(r?.name, "Guovdageaidnu", "item 5: …and reports Kartverket's primary official name");
+    }
+    assertTrue(nameMatchesQuery(
+      { stedsnavn: [{ skrivemåte: "Dyrøy kommune", navnestatus: "hovednavn" }] }, "Dyrøy"),
+      "item 5: «<query> kommune» counts as a match (Kartverket names admin records that way)");
+    assertTrue(nameMatchesQuery(
+      { stedsnavn: [{ skrivemåte: "Kvam herad", navnestatus: "hovednavn" }] }, "kvam"),
+      "item 5: «<query> herad» counts too");
+    assertTrue(nameMatchesQuery(
+      { stedsnavn: [{ skrivemåte: "Bømlo", navnestatus: "hovednavn" }] }, "bomlo"),
+      "item 5: matching is diacritic-insensitive (ø → o)");
+    assertTrue(!nameMatchesQuery(
+      { stedsnavn: [{ skrivemåte: "Tingnes", navnestatus: "hovednavn" },
+                    { skrivemåte: "Nes", navnestatus: "undernavn" }] }, "nes"),
+      "item 5: an UNDERNAVN alias never qualifies");
+    assertTrue(!nameMatchesQuery(
+      { stedsnavn: [{ skrivemåte: "Nesbyen", navnestatus: "hovednavn" }] }, "nes"),
+      "item 5: a prefix is not a match — «Nesbyen» is not «Nes»");
+    assertEq(officialNames({ stedsnavn: [{ skrivemåte: "A" }, { skrivemåte: "B" }] }).join("|"), "A",
+      "item 5: with no navnestatus at all, only the first listed name is treated as official");
+
+    // ══════════════════════════════════════════════════════════════
+    // item 4 (review) — duplicate kommune names must be REFUSED
+    // ══════════════════════════════════════════════════════════════
+    // The exact-name search used to run BEFORE the "only one hit" guard, so it
+    // silently returned the first of two same-named kommuner with full
+    // confidence — the same class of bug as 0a, one layer down.
+    {
+      __clearGeocodeCacheForTesting();
+      const r = await geocodingService.geocodeKommune("Herøy");
+      assertEq(r, null,
+        "item 4: «Herøy» by NAME is refused — 1818 Nordland and 1515 Møre og Romsdal are ~450 km apart");
+    }
+    {
+      __clearGeocodeCacheForTesting();
+      const r = await geocodingService.geocodeKommune("Våler");
+      assertEq(r, null,
+        "item 4: «Våler» by NAME is refused — 3419 Innlandet and 3114 Østfold are ~150 km apart");
+    }
+    {
+      // …but a caller that KNOWS which one (experience_providers.kommunenummer)
+      // is unaffected — that path is exact.
+      __clearGeocodeCacheForTesting();
+      const r = await geocodingService.geocodeKommune("Herøy", "1515");
+      assertTrue(r !== null, "item 4: geocodeKommune('Herøy','1515') still resolves");
+      if (r) {
+        assertTrue(Math.abs(r.lat - 62.439) < 0.01 && Math.abs(r.lng - 5.293) < 0.01,
+          `item 4: …to the Møre og Romsdal Herøy, exactly (got ${r.lat}, ${r.lng})`);
+      }
+    }
+    {
+      // An unambiguous kommune is of course still resolved by name.
+      __clearGeocodeCacheForTesting();
+      const r = await geocodingService.geocodeKommune("Flakstad");
+      assertTrue(r !== null, "item 4: an unambiguous kommune name still resolves");
     }
 
     // ── radiusFromBoundingBox ─────────────────────────────────────────
