@@ -146,7 +146,16 @@ export function parseProductNames(productsJson: string | null | undefined): stri
 // one of these is treated as UN-matchable → flagged no_domain (manual review),
 // never auto-copied. (Tenant subdomains like "gard.wixsite.com" survive
 // normalizeDomain intact and stay distinct — only the bare shared apex is here.)
-const GENERIC_DOMAINS: ReadonlySet<string> = new Set([
+//
+// Exported (additive, read-only ReadonlySet) so gardssalg-claim.ts's
+// deriveOrgLinkedEmail can build its OWN stricter, suffix-aware/trailing-
+// dot-safe check against the same underlying list instead of hand-
+// maintaining a second copy — that caller mints a one-shot claim-email
+// address, a higher-trust use than this module's exact-match
+// isMatchableDomain() below, which keeps its existing (exact-Set-membership)
+// behavior unchanged; it has its own separate collision-safety net (see
+// pickEnrichmentFields doc below) and a lower blast radius.
+export const GENERIC_DOMAINS: ReadonlySet<string> = new Set([
   "rettfrabonden.com", "opplevagent.no", "lokal.fly.dev",
   "facebook.com", "instagram.com", "twitter.com", "x.com", "linkedin.com",
   "youtube.com", "tiktok.com", "pinterest.com", "snapchat.com",

@@ -54,6 +54,7 @@ import { resolveTickIntervalMin } from "./services/loop-dispatch";
 import adminRunPlatformVerifierRoutes from "./routes/admin-run-platform-verifier";
 import adminVerifierSweepStatusRouter from "./routes/admin-verifier-sweep-status";
 import ownerPortalRoutes from "./routes/owner-portal";
+import gardssalgClaimRoutes from "./routes/gardssalg-claim";
 import adminAgentAuditRoutes from "./routes/admin-agent-audit";
 import adminVerifierReviewQueueRoutes from "./routes/admin-verifier-review-queue";
 import adminDomainCoherenceSweepRoutes from "./routes/admin-domain-coherence";
@@ -318,6 +319,18 @@ app.use("/", agentReadinessRoutes);
 // Magic-link auth + 7-field profile management for producers.
 // Mounted at root because it serves both /api/agents/:id/* and /magic-link-verify.
 app.use("/", ownerPortalRoutes);
+
+// ─── Gårdssalg producer owner-claim (dev-request 2026-07-21-opplevagent-
+// claim-flyt-drikkeprodusenter) ───────────────────────────────────────────
+// Mirrors ownerPortalRoutes above: mounted at root (unconditionally, same as
+// opplevelserRoutes at /api/opplevelser below — not gated behind
+// ENABLE_EXPERIENCES, matching that existing precedent) because it serves
+// both /kategori/gardssalg/eier/* (HTML) and
+// /api/opplevelser/gardssalg-claim/:providerId/* (JSON). Its path prefixes
+// are unique to the experiences vertical and never collide with any RFB/
+// dental route, so no host-gating is needed for correctness — see
+// src/routes/gardssalg-claim.ts's module doc for the full design rationale.
+app.use("/", gardssalgClaimRoutes);
 
 // ─── orch-pr-20260714-claim-opened-instrumentation: /selger.html open tracking ──
 // Registered BEFORE express.static so this exact path is tracked before

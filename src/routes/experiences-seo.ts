@@ -2788,6 +2788,11 @@ ${BROWSE_CSS}
         ${mapBlock}
       </div>
       <div class="aside-card">
+        <h2>Driver du dette stedet?</h2>
+        <p style="font-size:.86rem;color:var(--ink-soft);margin:0 0 10px">Ta over profilen og rediger informasjon, produkter og reservasjoner selv.</p>
+        <a class="gc-claim-cta" href="/kategori/gardssalg/eier/${encodeURIComponent(slug)}" style="display:block;text-align:center;background:#fff;color:#0f5a50;font-weight:700;padding:10px 14px;border:1px solid #0f5a50;border-radius:var(--r-pill);font-size:.9rem">Er dette din bedrift?</a>
+      </div>
+      <div class="aside-card">
         <h2>Lenk til oss</h2>
         <p style="font-size:.85rem;color:var(--ink-soft);margin-bottom:10px">Legg badgen på din egen nettside og lenk tilbake til profilen din her på Opplevagent.</p>
         <a href="${escapeHtml(badgeProfileHref)}" target="_blank" rel="noopener"><img src="/badge/opplevagent.svg" width="180" height="40" alt="Finn oss på Opplevagent"></a>
