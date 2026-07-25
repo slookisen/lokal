@@ -1,6 +1,6 @@
 /**
  * mcp-search-geo.test.ts — dev-request
- * 2026-07-25-reisesok-korridor-discovery-og-naerhetssok, Fase 0g(i).
+ * 2026-07-25-reisesok-korridor-discovery-og-naerhetssok, Fase 0g.
  *
  * 0g(i)  `lokal_search` — THE tool AI assistants actually call — had no way to
  *        receive the user's position: its inputSchema was {query, limit} only
@@ -8,9 +8,16 @@
  *        was could not tell us, so every "nearest farm shop" question was
  *        answered from a place NAME guessed out of the text, or nationwide.
  *
+ * 0g(ii) SECURITY — `lokal_search` and `lokal_discover` both declare
+ *        `readOnlyHint: true`, yet both auto-started up to 2 seller
+ *        conversations per call. An AI exploring on a traveller's behalf
+ *        silently opened conversations with farmers. Read-only must mean
+ *        read-only.
+ *
  * registerTools() is exercised through a duck-typed server that captures each
- * tool's config + handler — no transport, no session, no HTTP, against the
- * real production schema in an in-memory DB.
+ * tool's config + handler — no transport, no session, no HTTP. The DB is the
+ * real production schema in memory, so "no conversation was written" is
+ * asserted against the actual `conversations` table.
  *
  * Exported runMcpSearchGeoTests({log}) -> TestSummary; wired into tests/test.ts.
  * Standalone: npx tsx src/routes/mcp-search-geo.test.ts
@@ -111,6 +118,9 @@ export async function runMcpSearchGeoTests(opts: { log?: boolean } = {}): Promis
     registerTools(fakeServer, () => "test-client", () => undefined);
 
     const textOf = (r: any) => String(r?.content?.[0]?.text ?? "");
+    const convCount = () =>
+      (db.prepare("SELECT COUNT(*) AS n FROM conversations").get() as { n: number }).n;
+
     // ══════════════════════════════════════════════════════════════
     // 0g(i) — lokal_search exposes lat / lng / radius_km
     // ══════════════════════════════════════════════════════════════
@@ -158,6 +168,46 @@ export async function runMcpSearchGeoTests(opts: { log?: boolean } = {}): Promis
         "0g(i)/0e: …instead of silently answering with a nationwide trust-ranked list");
     }
 
+    // ══════════════════════════════════════════════════════════════
+    // 0g(ii) — read-only tools must not write
+    // ══════════════════════════════════════════════════════════════
+    for (const name of ["lokal_search", "lokal_discover"]) {
+      const tool = tools.get(name);
+      assertTrue(!!tool, `0g(ii): ${name} is registered`);
+      if (!tool) continue;
+      assertEq(tool.config.annotations?.readOnlyHint, true, `0g(ii): ${name} declares readOnlyHint:true`);
+    }
+    // Absolute, not relative: after EVERY read-only call this suite has made
+    // (all the 0g(i) searches above included), the conversations table must
+    // still be empty. On origin/main it holds one row per top-2 match per call.
+    {
+      const r = await tools.get("lokal_search")!.handler({ query: "honning", limit: 10 });
+      assertTrue(/Lyngdal Gårdsmat/.test(textOf(r)), "0g(ii): lokal_search still returns real producers");
+      assertTrue(!/Samtaler startet automatisk/.test(textOf(r)),
+        "0g(ii): lokal_search no longer advertises auto-started conversations");
+    }
+    {
+      const r = await tools.get("lokal_discover")!.handler({ categories: ["honey"], limit: 10 });
+      assertTrue(/Lyngdal Gårdsmat/.test(textOf(r)), "0g(ii): lokal_discover still returns real producers");
+      assertTrue(!/Samtaler startet automatisk/.test(textOf(r)),
+        "0g(ii): lokal_discover no longer advertises auto-started conversations");
+    }
+    assertEq(convCount(), 0,
+      "0g(ii): ZERO conversation rows exist after every read-only-declared tool call in this suite");
+    {
+      const msgs = (db.prepare("SELECT COUNT(*) AS n FROM messages").get() as { n: number }).n;
+      assertEq(msgs, 0, "0g(ii): no conversation MESSAGES were written either");
+    }
+    {
+      // The read-only tools now point the assistant at the explicit write path
+      // instead of taking it silently.
+      const r = await tools.get("lokal_search")!.handler({ query: "honning", limit: 10 });
+      const txt = textOf(r);
+      assertTrue(/m-near@example\.no/.test(txt),
+        "0g(ii): the output still hands the user the producer's own contact details to act on");
+      assertTrue(/lokal_info/.test(txt),
+        "0g(ii): …and still points at the follow-up tool for the full price list");
+    }
   } finally {
     console.log = prevLog;
     __setGeocodingFetchForTesting();
