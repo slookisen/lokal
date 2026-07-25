@@ -33039,3 +33039,29 @@ runSerial(async () => {
     failures.push("mcp-search-geo: unexpected error: " + String(err?.message || err));
   }
 });
+
+// dev-request 2026-07-25-reisesok-korridor-discovery-og-naerhetssok, Fase 0a,
+// END-TO-END: the symptom Daniel actually saw. OpplevAgent's
+// discover_experiences at the Elverum coordinates (60.9866, 11.4432, r=30)
+// returned «Nusfjord Arctic Resort» in Lofoten with distance_km 26.2 — the
+// true distance is 788 km — because the kommune-centroid worker resolved
+// «Flakstad» to the Navnegard «Flagstad» near Hamar. Exercises the real chain
+// (experiencesGeocodeTick Step C/D → geocodeKommune → experiences.loc_lat →
+// discoverExperiences radius filter) against the real experiences schema in
+// an in-memory DB with the Kartverket fetch injected. Runs via runSerial()
+// because it swaps EXPERIENCES_DB_PATH + the db-factory singleton.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-07-25-reisesok: Fase 0a end-to-end (Elverum → no Lofoten hit) ──");
+  try {
+    const { runExperiencesGeocodeKommuneTests } = require("../src/services/experiences-geocode-kommune.test") as
+      typeof import("../src/services/experiences-geocode-kommune.test");
+    const egk = await runExperiencesGeocodeKommuneTests({ log: false });
+    passed += egk.passed;
+    failed += egk.failed;
+    for (const f of egk.failures) failures.push("experiences-geocode-kommune: " + f);
+    console.log(`  experiences-geocode-kommune: ${egk.passed} passed, ${egk.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("experiences-geocode-kommune: unexpected error: " + String(err?.message || err));
+  }
+});
