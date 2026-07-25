@@ -33065,3 +33065,32 @@ runSerial(async () => {
     failures.push("experiences-geocode-kommune: unexpected error: " + String(err?.message || err));
   }
 });
+
+// Review follow-up for dev-request 2026-07-25-reisesok-korridor-discovery-og-
+// naerhetssok, Fase 0 — the RFB /sok HTML page (marketplace-search-honesty
+// covers the JSON API; this covers what a human and Googlebot actually see):
+//   B2  a coordinates-only search logged «nær 59.914, 10.752» (~110 m) into
+//       conversations.query_text, which renders on the UNAUTHENTICATED
+//       /samtaler and /samtale/<uuid> pages.
+//   B3  the H1/title/description claimed «Produsenter nær deg (30 km)» directly
+//       above the page's own «utvidet til hele Norge» banner.
+//   7   «Vis hele Norge» built ?q=&heleNorge=true → 302 back to the homepage.
+//   8   the radius <select> marked no option for an off-ladder ?radius=.
+//   9   the geolocation permission prompt fired with no user gesture.
+// Own in-memory DB (swaps the shared getDb() singleton, restored on exit) +
+// a stubbed geocoder fetch — runs via runSerial() same as the suites above.
+runSerial(async () => {
+  console.log("\n── dev-request 2026-07-25-reisesok: review follow-up (/sok page honesty + privacy) ──");
+  try {
+    const { runSokSearchHonestyTests } = require("../src/routes/sok-search-honesty.test") as
+      typeof import("../src/routes/sok-search-honesty.test");
+    const ssh = await runSokSearchHonestyTests({ log: false });
+    passed += ssh.passed;
+    failed += ssh.failed;
+    for (const f of ssh.failures) failures.push("sok-search-honesty: " + f);
+    console.log(`  sok-search-honesty: ${ssh.passed} passed, ${ssh.failed} failed`);
+  } catch (err: any) {
+    failed++;
+    failures.push("sok-search-honesty: unexpected error: " + String(err?.message || err));
+  }
+});
