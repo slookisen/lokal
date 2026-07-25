@@ -36,14 +36,28 @@ import {
   buildNarrowingSuggestions,
   getExperienceById,
   listCategories,
+  searchGardssalgProviders,
   type DiscoverFilter,
+  type GardssalgSearchFilter,
 } from "../services/experience-store";
 import { __FYLKE_INTERNAL, NON_KOMMUNE_REGION_LABELS } from "../services/norway-fylke";
 import { getExperiencesAgentCard } from "../services/experiences-agent-card";
 import { jsonRpcLimiter } from "../middleware/security";
 import { conversationService, buildRequestMeta, type RequestMeta } from "../services/conversation-service";
+// Only isBookingPaused is used here (same import + reasoning as
+// experiences-mcp.ts's discover_gardssalg tool): searchGardssalgProviders()'s
+// base WHERE clause already excludes catalog_hidden=1 rows entirely, so this
+// call site never passes a catalog_hidden arg either.
+import { isBookingPaused } from "../services/booking-store";
 
 const router = Router();
+
+// dev-request 2026-07-25-gardssalg-a2a-nl-routing: same convention as
+// booking-store.ts / opplevelser.ts / experiences-mcp.ts's discover_gardssalg
+// tool (APP_URL = process.env.APP_URL || "https://opplevagent.no") — used to
+// build the gårdssalg profile_url below, mirroring that tool's formatting
+// exactly.
+const APP_URL = process.env.APP_URL || "https://opplevagent.no";
 
 // ─── Conversation logging (dev-request 2026-07-10-opplevagent-conversation-logging, slice 1) ──
 // Deliberate, narrow exception to this file's "never touch the rfb DB" host
@@ -240,6 +254,57 @@ export function parseExperiencesIntent(text: string): DiscoverFilter {
   return params;
 }
 
+// ─── Gårdssalg intent detection (dev-request 2026-07-25-gardssalg-a2a-nl-
+// routing) ──────────────────────────────────────────────────────────────
+// Gårdssalg producers (Brreg-registered Norwegian farm-sale drink producers
+// — bryggeri/cideri/vingård/destilleri/mjøderi/seltzeri) live in
+// `experience_providers`, a DISTINCT dataset from the generic `experiences`
+// table parseExperiencesIntent()/discoverExperiencesRelaxed() query. Before
+// this dev-request, message/send ALWAYS fell through to the generic
+// discover branch below, so a query like "hvor kan jeg booke en
+// sidersmaking i Hardanger?" never matched a real gårdssalg producer.
+//
+// Producer-type keywords are checked in priority order (first match wins)
+// because some are substrings of others (e.g. "sideri" vs "sider") — see
+// the dev-request spec for why the order below is deliberate, not
+// alphabetical. All matching goes through matchesAsWordPrefix (never a raw
+// regex \b — see that function's own doc comment for why æøå require it).
+const GARDSSALG_PRODUCER_TYPE_KEYWORDS: Array<[keyword: string, producerType: string]> = [
+  ["bryggeri", "bryggeri"],
+  ["sideri", "cideri"],
+  ["cideri", "cideri"],
+  ["sider", "cideri"],
+  ["vingård", "vingård"],
+  ["destilleri", "destilleri"],
+  ["brenneri", "destilleri"],
+  ["mjøderi", "mjøderi"],
+  ["mjød", "mjøderi"],
+  ["seltzeri", "seltzeri"],
+  ["seltzer", "seltzeri"],
+];
+
+// Gårdssalg-intent-only trigger words: signal gårdssalg intent WITHOUT
+// implying a specific producer_type. Checked only when no producer-type
+// keyword matched. Note: "bryggeribesøk" and "sidersmaking" do NOT need an
+// entry here — they already contain "bryggeri"/"sider" as word-prefix
+// substrings and are caught by the table above (verified in
+// experiences-a2a.test.ts rather than assumed).
+const GARDSSALG_INTENT_TRIGGER_WORDS: string[] = ["gårdssalg", "gårdsbutikk"];
+
+export function detectGardssalgIntent(lower: string): { isGardssalg: boolean; producer_type?: string } {
+  for (const [keyword, producerType] of GARDSSALG_PRODUCER_TYPE_KEYWORDS) {
+    if (matchesAsWordPrefix(lower, keyword)) {
+      return { isGardssalg: true, producer_type: producerType };
+    }
+  }
+  for (const keyword of GARDSSALG_INTENT_TRIGGER_WORDS) {
+    if (matchesAsWordPrefix(lower, keyword)) {
+      return { isGardssalg: true };
+    }
+  }
+  return { isGardssalg: false };
+}
+
 // ─── message/send handler (exported for unit tests) ──────────
 
 export function handleExperiencesMessageSend(
@@ -351,6 +416,116 @@ export function handleExperiencesMessageSend(
           },
         ],
         metadata: { skill: "opplevelser_info", id: idMatch[1] },
+      });
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err);
+      return rpcErr(id, -32603, "Internal error", msg);
+    }
+  }
+
+  // Special intent: gårdssalg (farm-sale drink producers) — a DISTINCT
+  // dataset from the generic `experiences` table below, backed by
+  // searchGardssalgProviders() over experience_providers. Must be checked
+  // BEFORE the generic "Default: discover" fallback, or a query like
+  // "hvor kan jeg booke en sidersmaking i Hardanger?" would silently fall
+  // through to (and never match) the generic path.
+  const gardssalgIntent = detectGardssalgIntent(lowerText);
+  if (gardssalgIntent.isGardssalg) {
+    try {
+      // kommune/fylke reuse the exact detectKommune()/FYLKER resolution
+      // already baked into `filter` above (from parseExperiencesIntent(),
+      // or from the structured message.data branch) — no second location
+      // parse.
+      const gardssalgFilter: GardssalgSearchFilter = {};
+      if (filter.kommune) gardssalgFilter.kommune = filter.kommune;
+      if (filter.fylke) gardssalgFilter.fylke = filter.fylke;
+      if (gardssalgIntent.producer_type) gardssalgFilter.producer_type = gardssalgIntent.producer_type;
+
+      // lat/lng/radius_km: reuse `filter`'s own extraction when present
+      // (the structured-data-only path above already populated it, same as
+      // the generic branch). The gårdssalg intent signal (unlike fylke/
+      // kommune/category) can ALSO fire off free text (e.g. "sidersmaking"),
+      // in which case parseExperiencesIntent() — untouched, never producing
+      // lat/lng — is what filled `filter`; this independently reads
+      // message.data too so a caller combining NL text (for intent) with a
+      // structured lat/lng origin still gets geo-sorted gårdssalg results.
+      // Scoped entirely to this branch — never touches `filter` itself, so
+      // the shared generic-discover path below is completely unaffected.
+      let gLat = typeof filter.lat === "number" ? filter.lat : undefined;
+      let gLng = typeof filter.lng === "number" ? filter.lng : undefined;
+      let gRadiusKm = typeof filter.radius_km === "number" ? filter.radius_km : undefined;
+      if ((gLat === undefined || gLng === undefined) && message && typeof message === "object") {
+        const m = message as Record<string, unknown>;
+        if (m.data && typeof m.data === "object") {
+          const d = m.data as Record<string, unknown>;
+          if (typeof d.lat === "number") gLat = d.lat;
+          if (typeof d.lng === "number") gLng = d.lng;
+          if (typeof d.radius_km === "number") gRadiusKm = d.radius_km;
+        }
+      }
+      if (typeof gLat === "number") gardssalgFilter.lat = gLat;
+      if (typeof gLng === "number") gardssalgFilter.lng = gLng;
+      if (typeof gRadiusKm === "number") gardssalgFilter.radius_km = gRadiusKm;
+      // booking_live is deliberately NEVER set from NL text — a query
+      // asking "where can I book X" must show honest booking status per
+      // result, not silently filter out paused producers.
+
+      const results = searchGardssalgProviders(gardssalgFilter, 20);
+      const hasGeo = typeof gardssalgFilter.lat === "number" && typeof gardssalgFilter.lng === "number";
+
+      const summaryText =
+        results.length === 0
+          ? "Ingen gårdssalg-produsenter funnet med de angitte filtrene. / No gårdssalg producers found matching the given filters."
+          : `Fant ${results.length} gårdssalg-produsent(er). / Found ${results.length} gårdssalg producer(s).`;
+
+      // Per-row shape mirrors discover_gardssalg (experiences-mcp.ts)
+      // EXACTLY — same field names, same isBookingPaused()-derived booking
+      // object, same bilingual notes, same profile_url template, same
+      // hasGeo-gated distance_km.
+      const producers = results.map((row) => {
+        const live = !isBookingPaused(row.booking_live);
+        return {
+          navn: row.navn,
+          fylke: row.fylke ?? null,
+          kommune: row.kommune ?? null,
+          producer_type: row.producer_type ?? null,
+          lat: row.lat ?? null,
+          lon: row.lon ?? null,
+          geocode_confidence: row.geocode_confidence ?? null,
+          booking: {
+            live,
+            mode: live ? ("request" as const) : ("paused" as const),
+            note: live
+              ? "Book direkte. / Book directly."
+              : "Reservasjoner åpner snart; ta kontakt via profilsiden. / Bookings open soon; visit the profile page to get in touch.",
+          },
+          profile_url: row.slug ? `${APP_URL}/kategori/gardssalg/produsent/${row.slug}` : null,
+          ...(hasGeo ? { distance_km: row.distance_km ?? null } : {}),
+        };
+      });
+
+      try { logExperiencesInteraction({ skill: "gardssalg_discover", queryText: messageText || undefined, ctx }); } catch { /* fail-open: never affects the response */ }
+
+      return rpcOk(id, {
+        taskId: `gardssalg-discover-${Date.now()}`,
+        status: { state: "completed", timestamp: new Date().toISOString() },
+        artifacts: [
+          {
+            artifactId: "gardssalg-discover-summary",
+            name: "gardssalg-discover-summary",
+            parts: [{ kind: "text", text: summaryText }],
+          },
+          {
+            artifactId: "gardssalg_producers",
+            name: "gardssalg-discover-results",
+            parts: [{ kind: "data", data: { count: results.length, producers } }],
+          },
+        ],
+        metadata: {
+          skill: "gardssalg_discover",
+          filter: gardssalgFilter,
+          parsedFrom: messageText || null,
+        },
       });
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : String(err);
