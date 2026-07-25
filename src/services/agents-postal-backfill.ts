@@ -151,6 +151,58 @@ const PAGE_SIZE = 100;
 /** Max distinct place candidates probed per row — bounds the API cost. */
 const MAX_PLACE_CANDIDATES = 3;
 
+/**
+ * Hard cap on Kartverket requests per row (review item 7).
+ *
+ * Before the cap the worst case was 15 requests for ONE row — 3 street variants
+ * × (inline + 3 place candidates + globally-unique) — i.e. 750 requests for a
+ * default limit=50 tick and 3 000 for an admin limit=200 batch, against a free
+ * CC BY 4.0 API. The tiers are ordered by how likely they are to answer, so a
+ * cap truncates the tail, not the yield: measured over the live cohort, every
+ * row that resolves at all resolves within 2 probes, and the whole 21-row
+ * cohort cost 21 requests. 6 leaves generous headroom over that.
+ */
+const MAX_PROBES_PER_ROW = 6;
+
+/**
+ * Process-wide token bucket for Kartverket adresse traffic.
+ *
+ * THROTTLE_MS paces requests WITHIN a row, but says nothing about the
+ * aggregate: the Fase-1a geocode worker runs on the same hourly cadence and the
+ * 45 s vs 30 s boot offset does not survive process drift, so the two can
+ * overlap and their rates add. This bucket bounds what THIS worker contributes
+ * however many rows are in flight.
+ *
+ * It waits through the injected `sleep` seam, so tests (which always inject a
+ * no-op sleep) are unaffected and no suite gets slower.
+ *
+ * NOT YET SHARED with the geocode worker: its HTTP goes through
+ * dental-geocode-worker.kartverketQuery(), which is also on dental's and
+ * experiences' hot paths and takes no sleep seam, so wiring it there would put
+ * a real timer inside three other suites. Hoisting kartverketQuery onto this
+ * bucket is the right follow-up and is deliberately left out of a slice that is
+ * already touching a freshly-reviewed file.
+ */
+const KARTVERKET_MAX_RPS = 2;
+const kartverketBudget = {
+  windowStart: 0,
+  used: 0,
+  async take(sleep: (ms: number) => Promise<void>): Promise<void> {
+    const now = Date.now();
+    if (now - this.windowStart >= 1000) {
+      this.windowStart = now;
+      this.used = 0;
+    }
+    if (this.used >= KARTVERKET_MAX_RPS) {
+      const wait = Math.max(0, 1000 - (now - this.windowStart));
+      await sleep(wait);
+      this.windowStart = Date.now();
+      this.used = 0;
+    }
+    this.used++;
+  },
+};
+
 export type PostalBackfillDeps = GeocodeDeps & {
   /** Report what would change; write nothing (not even the attempt stamp). */
   dryRun?: boolean;
@@ -183,6 +235,8 @@ export type PostalResolution =
       matched_query: string;
     }
   | { status: "ambiguous"; detail: string }
+  /** Hits existed, but the only ones we found sit in a place the record does not name. */
+  | { status: "uncorroborated"; detail: string }
   | { status: "no_match"; detail: string }
   | { status: "unusable_input"; detail: string };
 
@@ -272,7 +326,11 @@ export function placeCandidates(city: string | null | undefined, trailingPlaces:
   };
   const explode = (raw: string | null | undefined) => {
     if (!raw) return;
-    for (const part of String(raw).split(/[/|]| og /i)) {
+    // REVIEW ITEM 6: the comma was missing, so a `city` of "Bergen, Norge"
+    // produced the single literal candidate "Bergen, Norge" — 0 hits, every
+    // time — while the header claimed that shape was handled. Splitting on it
+    // yields "Bergen" (usable) and "Norge" (dropped by normalizeCityLabel).
+    for (const part of String(raw).split(/[/|,]| og /i)) {
       const p = part.trim();
       if (p) push(p);
     }
@@ -285,52 +343,95 @@ export function placeCandidates(city: string | null | undefined, trailingPlaces:
 
 // ── Kartverket probe ────────────────────────────────────────────────
 
-/** Levenshtein distance, capped — only ever asked "is this ≤ 1?". */
-function editDistanceAtMost1(a: string, b: string): boolean {
-  if (a === b) return true;
-  if (Math.abs(a.length - b.length) > 1) return false;
-  const [short, long] = a.length <= b.length ? [a, b] : [b, a];
-  let i = 0;
-  let j = 0;
-  let edits = 0;
-  while (i < short.length && j < long.length) {
-    if (short[i] === long[j]) { i++; j++; continue; }
-    if (++edits > 1) return false;
-    if (short.length === long.length) { i++; j++; } else { j++; }
-  }
-  return edits + (long.length - j) + (short.length - i) <= 1;
+function foldPlace(s: string | null | undefined): string {
+  return (s || "")
+    .trim()
+    .toLowerCase()
+    .replace(/æ/g, "ae")
+    .replace(/ø/g, "oe")
+    .replace(/å/g, "aa")
+    .replace(/\s+/g, " ");
 }
 
 /**
- * Case- and diacritic-tolerant equality for Norwegian place labels, with ONE
- * character of slack on names of 5+ characters.
- *
- * The slack is not cosmetic — it was measured. adresser/v1/sok is conjunctive
- * but NOT literal: `sok=Norafjordvegen 977 Slinde` returns the (globally
- * unique) address whose poststed is spelled "SLINDA". Definite/indefinite forms
- * of Norwegian place names differ by exactly this one trailing vowel all over
- * the country — Slinde/Slinda, Vestbygd/Vestbygda, Sokna/Sokn — so a strict
- * comparison would veto correct, unambiguous matches.
- *
- * The 5-character floor keeps the slack away from the short names where one
- * edit changes the place entirely (Bø/Bo, Vik/Vok, Rød/Råd, Voss/Ross). Those
- * still require an exact fold match.
+ * Exact (case- and diacritic-folded) equality for Norwegian place labels.
+ * This is what `kommunenavn` is compared with — see samePoststed() below for
+ * why the morphology slack is deliberately NOT extended to kommune names.
  */
 export function samePlace(a: string | null | undefined, b: string | null | undefined): boolean {
-  const fold = (s: string | null | undefined) =>
-    (s || "")
-      .trim()
-      .toLowerCase()
-      .replace(/æ/g, "ae")
-      .replace(/ø/g, "oe")
-      .replace(/å/g, "aa")
-      .replace(/\s+/g, " ");
-  const fa = fold(a);
-  const fb = fold(b);
+  const fa = foldPlace(a);
+  const fb = foldPlace(b);
+  return fa.length > 0 && fa === fb;
+}
+
+/** Norwegian vowels, on the FOLDED alphabet (æ→ae, ø→oe, å→aa). */
+const VOWELS = new Set(["a", "e", "i", "o", "u", "y"]);
+
+/**
+ * Minimum length of the SHORTER label before the morphology slack applies.
+ * Derived from the register measurement below, not guessed.
+ */
+const MORPHOLOGY_MIN_LEN = 5;
+
+/**
+ * poststed comparison: exact fold match, OR Norwegian definite/indefinite
+ * morphology — the two labels are identical except for a trailing VOWEL.
+ *
+ * WHY ANY SLACK AT ALL (measured, not cosmetic)
+ * ─────────────────────────────────────────────
+ * adresser/v1/sok is conjunctive but not literal — its analyzer stems tokens.
+ * `sok=Norafjordvegen 977 Slinde` returns the (globally unique) address whose
+ * poststed is spelled "SLINDA"; the address text "Vestbygd" resolves against
+ * poststed "VESTBYGDA". Requiring exact equality vetoes correct, unambiguous
+ * matches on the ordinary definite-form ending Norwegian place names take.
+ *
+ * WHY IT IS THIS RULE AND NOT EDIT-DISTANCE ≤ 1  (review B1)
+ * ─────────────────────────────────────────────────────────
+ * The first version allowed ONE edit of any kind on labels of 5+ characters.
+ * Measured against the official postnummerregister
+ * (bring.no/postnummerregister-ansi.txt — 5 122 rows, 1 839 distinct
+ * poststeder, fetched 2026-07-25), that rule conflates **110 pairs of
+ * genuinely different poststeder**: LARVIK/NARVIK, BERGEN/BERGER,
+ * BERGEN/BORGEN, LEVANGER/EVANGER, HARSTAD/FARSTAD, MELBU/SELBU,
+ * ØSTRE GAUSDAL/VESTRE GAUSDAL, … And because the analyzer stems, G3 was the
+ * ONLY thing standing between those and a write — `city="Straume"` resolved to
+ * 8226 STRAUMEN (Sørfold), ~900 km away, tagged 'address' and licensing a km
+ * figure. That is `blåskjell Kautokeino → Larvik` reproduced by the code
+ * written to prevent it. The exposure was not hypothetical: "Bergen" is a real
+ * `city` value in our own address-without-postnummer cohort and sits in TWO of
+ * the 110 pairs.
+ *
+ * The rule below — identical except for a trailing vowel, shorter label ≥ 5 —
+ * admits both measured cases (Slinde/Slinda, Vestbygd/Vestbygda) and collides
+ * on **0 of the 1 839 distinct poststeder**, verified by exhaustive pairwise
+ * comparison over the register. The ≥5 floor is exactly what removes the last
+ * three (HELL/HELLE, LUND/LUNDE, TORP/TORPO).
+ *
+ * The slack is NOT extended to `kommunenavn` (samePlace, exact). Over
+ * poststeder ∪ kommunenavn the same rule collides on 2 pairs, and one of them —
+ * STRAND (Rogaland) vs STRANDA (Møre og Romsdal) — is two real kommuner ~200 km
+ * apart. Kommune names are canonical register values with no definite/
+ * indefinite variation to recover, so they gain nothing from the slack and lose
+ * that. Exact for kommune, morphology for poststed: 0 collisions either way.
+ */
+export function samePoststed(a: string | null | undefined, b: string | null | undefined): boolean {
+  const fa = foldPlace(a);
+  const fb = foldPlace(b);
   if (fa.length === 0 || fb.length === 0) return false;
   if (fa === fb) return true;
-  if (fa.length >= 5 && fb.length >= 5) return editDistanceAtMost1(fa, fb);
-  return false;
+  if (Math.abs(fa.length - fb.length) > 1) return false;
+  const [short, long] = fa.length <= fb.length ? [fa, fb] : [fb, fa];
+  if (short.length < MORPHOLOGY_MIN_LEN) return false;
+  if (fa.length === fb.length) {
+    // Same length: only the LAST character differs and BOTH are vowels
+    // (Slinde/Slinda). A differing consonant is a different place
+    // (Bergen/Berger, Larvik/Narvik).
+    return fa.slice(0, -1) === fb.slice(0, -1) && VOWELS.has(fa.slice(-1)) && VOWELS.has(fb.slice(-1));
+  }
+  // Differ by one: the longer is the shorter plus a trailing VOWEL
+  // (Vestbygd/Vestbygda). A trailing consonant is a different place
+  // (Straume/Straumen, Rogne/Rognes).
+  return long.slice(0, short.length) === short && VOWELS.has(long.slice(-1));
 }
 
 /**
@@ -396,14 +497,23 @@ export async function probeKartverket(
   }
 
   // G3 — corroboration against the place token we searched with.
+  // poststed gets the definite/indefinite morphology slack; kommunenavn is
+  // compared exactly (samePoststed's doc comment explains why the two differ).
+  let chosen = hits[0];
   if (place !== null) {
-    const corroborated = hits.some(
-      (h) => samePlace(h.poststed, place) || samePlace(h.kommunenavn, place)
+    // REVIEW ITEM 4: return the hit that actually SATISFIED G3, not hits[0].
+    // The written postnummer is unaffected (G2 already proved there is only
+    // one), but `planned[].detail` is what a human reads during a dry-run
+    // rehearsal — naming a different kommune than the one that corroborated
+    // makes the rehearsal misleading in exactly the place it is relied on.
+    const corroborating = hits.find(
+      (h) => samePoststed(h.poststed, place) || samePlace(h.kommunenavn, place)
     );
-    if (!corroborated) return { status: "uncorroborated", query, hits: hits.length };
+    if (!corroborating) return { status: "uncorroborated", query, hits: hits.length };
+    chosen = corroborating;
   }
 
-  return { status: "resolved", postal_code: distinct[0], hit: hits[0], query, hits: hits.length };
+  return { status: "resolved", postal_code: distinct[0], hit: chosen, query, hits: hits.length };
 }
 
 /**
@@ -444,36 +554,94 @@ export async function resolvePostalCode(
   const s = stripHouseLetterSuffix(street);
   if (s !== street && !variants.includes(s)) variants.push(s);
 
-  // ── 1. Inline postnummer hypothesis, verified ─────────────────────
+  // ── Probe budget (review item 7) ──────────────────────────────────
+  // Worst case before this cap was 15 requests for ONE row (3 street variants ×
+  // [inline + 3 place candidates + globally-unique]), i.e. 3 000 requests for a
+  // limit=200 admin batch against a free CC BY 4.0 API. The tiers are ordered
+  // by how likely they are to answer, so a budget truncates the tail rather
+  // than the yield: measured over the live cohort, every row that resolves at
+  // all does so within 2 probes. Exhausting the budget refuses — it never
+  // "accepts what we have so far".
+  let probesLeft = MAX_PROBES_PER_ROW;
+  const probe = async (variant: string, token: string, place: string | null): Promise<PostalProbeResult | null> => {
+    if (probesLeft <= 0) return null;
+    probesLeft--;
+    await kartverketBudget.take(sleep);
+    const r = await probeKartverket(variant, token, place, fetchImpl);
+    await sleep(THROTTLE_MS);
+    return r;
+  };
+
+  // ── 1. Inline postnummer hypothesis, verified AND corroborated ────
+  //
+  // REVIEW B2: "Kartverket confirms NNNN" is a vacuous check on its own. The
+  // probe is `street + NNNN`, which is conjunctive, so for a street name that
+  // exists in many postnummer it succeeds by coincidence for ANY of them —
+  // `Storgata 5` spans 64 distinct postnummer, so "Storgata 5, 1890 Bergen"
+  // confirmed 1890 RAKKESTAD and "Storgata 5, 0155 Bergen" confirmed 0155 OSLO,
+  // while both the `city` column and the record's own trailing place said
+  // Bergen and were never consulted. This tier produced 16 of the first
+  // measurement's 18 writes, so the hole was load-bearing.
+  //
+  // The fix is NOT to distrust inline numbers — "Vestbygdvegen 1030, 8412
+  // Vestbygd" is correct, and correct for a reason: that street is globally
+  // unique, so the inline number is corroborated BY GEOGRAPHY. The distinction
+  // the code has to make is exactly that. So: when we have any place token at
+  // all, the confirmed hit must corroborate one of them; when we have none, we
+  // do not accept the inline number here — we fall through and let the
+  // globally-unique tier decide, which is what makes the Vestbygd case land on
+  // evidence rather than on coincidence.
+  const places = placeCandidates(city, trailingPlaces);
   if (inlinePostal) {
     for (const variant of variants) {
-      const r = await probeKartverket(variant, inlinePostal, null, fetchImpl);
-      await sleep(THROTTLE_MS);
-      if (r.status === "resolved" && r.postal_code === inlinePostal) {
-        return {
-          status: "resolved",
-          postal_code: r.postal_code,
-          source: "kartverket_adresse_inline",
-          poststed: r.hit.poststed,
-          kommunenummer: r.hit.kommunenummer,
-          kommunenavn: r.hit.kommunenavn,
-          matched_query: r.query,
-        };
-      }
+      const r = await probe(variant, inlinePostal, null);
+      if (r === null) break; // budget exhausted
       if (r.status === "ambiguous" || r.status === "not_enumerable") {
         // Should not happen with a postnummer in the query, but if it does the
         // hypothesis is not confirmable — stop rather than fall through to a
         // weaker signal that might contradict it.
         return { status: "ambiguous", detail: `inline ${inlinePostal}: ${r.status}` };
       }
-      if (r.status === "resolved") {
+      if (r.status === "resolved" && r.postal_code !== inlinePostal) {
         // Kartverket found the street at a DIFFERENT postnummer than the text
         // claims. The scraped digits are wrong or belong to something else.
         return { status: "ambiguous", detail: `inline ${inlinePostal} contradicted by ${r.postal_code}` };
       }
+      if (r.status === "resolved") {
+        const corroborates = places.some(
+          (p) => samePoststed(r.hit.poststed, p) || samePlace(r.hit.kommunenavn, p)
+        );
+        if (places.length > 0 && corroborates) {
+          return {
+            status: "resolved",
+            postal_code: r.postal_code,
+            source: "kartverket_adresse_inline",
+            poststed: r.hit.poststed,
+            kommunenummer: r.hit.kommunenummer,
+            kommunenavn: r.hit.kommunenavn,
+            matched_query: r.query,
+          };
+        }
+        if (places.length > 0) {
+          // Confirmed-by-coincidence: the number exists on this street name,
+          // but in a place the record itself does not mention. This is the
+          // "Storgata 5, 1890 Bergen" case. Refuse outright rather than fall
+          // through — the record contradicts itself and the later tiers would
+          // be answering a question we already know is contested.
+          return {
+            status: "ambiguous",
+            detail:
+              `inline ${inlinePostal} resolves to ${r.hit.poststed} (${r.hit.kommunenavn}), ` +
+              `which none of the record's own places ${JSON.stringify(places)} corroborate`,
+          };
+        }
+        // No place token at all → nothing to corroborate against here. Fall
+        // through to the globally-unique tier, which can corroborate by
+        // geography instead. agreesWithInline() below keeps it honest.
+        break;
+      }
+      // no_match → next street variant.
     }
-    // Unconfirmed hypothesis: fall through to the place candidates. The
-    // inline number is simply discarded — never written on its own authority.
   }
 
   /**
@@ -488,18 +656,18 @@ export async function resolvePostalCode(
   const agreesWithInline = (postal: string): boolean => !inlinePostal || postal === inlinePostal;
 
   // ── 2. Place candidates ───────────────────────────────────────────
-  const places = placeCandidates(city, trailingPlaces);
-
   const resolutions: Array<{ postal: string; probe: PostalProbeResult & { status: "resolved" } }> = [];
   let sawAmbiguity = false;
   /** True once any probe returned hits we then REFUSED (ambiguous or uncorroborated). */
   let sawRefusal = false;
+  /** True once a hit was refused specifically by G3 — reported separately (review item 5). */
+  let sawUncorroborated = false;
   const detailParts: string[] = [];
 
   for (const place of places) {
     for (const variant of variants) {
-      const r = await probeKartverket(variant, place, place, fetchImpl);
-      await sleep(THROTTLE_MS);
+      const r = await probe(variant, place, place);
+      if (r === null) break;
       if (r.status === "resolved") {
         resolutions.push({ postal: r.postal_code, probe: r });
         break;
@@ -518,7 +686,8 @@ export async function resolvePostalCode(
       }
       if (r.status === "uncorroborated") {
         sawRefusal = true;
-        detailParts.push(`${place}: hit did not corroborate the place`);
+        sawUncorroborated = true;
+        detailParts.push(`${place}: the only hit is in another place`);
         break;
       }
       // no_match → try the next street variant, then the next place.
@@ -575,8 +744,8 @@ export async function resolvePostalCode(
   // the corroboration guard just rejected.
   if (!sawRefusal) {
     for (const variant of variants) {
-      const r = await probeKartverket(variant, "", null, fetchImpl);
-      await sleep(THROTTLE_MS);
+      const r = await probe(variant, "", null);
+      if (r === null) break;
       if (r.status === "resolved") {
         if (!agreesWithInline(r.postal_code)) {
           return {
@@ -608,6 +777,14 @@ export async function resolvePostalCode(
     }
   }
 
+  // REVIEW ITEM 5: a hit that existed but sat in ANOTHER place is not
+  // "Kartverket knows nothing matching" — it is the single most interesting
+  // refusal we produce, because it is a near-miss that a looser matcher would
+  // have written. Reporting it as `no_match` made ops under-count exactly the
+  // cases worth reading. It gets its own status, outcome and counter.
+  if (sawUncorroborated) {
+    return { status: "uncorroborated", detail: detailParts.join("; ") };
+  }
   if (places.length === 0) {
     return {
       status: "unusable_input",
@@ -643,6 +820,13 @@ export type PostalBackfillResult = {
   resolved_lookup: number;
   /** More than one distinct postnummer in play — refused on purpose. */
   ambiguous: number;
+  /**
+   * A unique hit existed but sits in a place the record does not name — refused
+   * by G3. Counted separately from no_match (review item 5): these are the
+   * near-misses a looser matcher would have written, so they are the ones worth
+   * reading in a dry-run rehearsal.
+   */
+  uncorroborated: number;
   /** Kartverket knows nothing matching — refused. */
   no_match: number;
   /** No house number, or no usable place token after pollution filtering. */
@@ -736,6 +920,7 @@ function emptyStats(dryRun: boolean): PostalBackfillResult {
     resolved_inline: 0,
     resolved_lookup: 0,
     ambiguous: 0,
+    uncorroborated: 0,
     no_match: 0,
     unusable: 0,
     errors: 0,
@@ -847,25 +1032,42 @@ async function runPostalBackfillTick(
           detail: `${resolution.matched_query} → ${resolution.postal_code} ${resolution.poststed} (${resolution.kommunenavn})`,
         });
         if (!dryRun) {
-          writePostal.run(
+          const res = writePostal.run(
             resolution.postal_code,
             resolution.source,
             outcome,
             nextAttemptStamp(),
             row.agent_id
           );
-          requeueGeocode.run(row.agent_id);
+          if (res.changes > 0) {
+            requeueGeocode.run(row.agent_id);
+          } else {
+            // The never-overwrite guard in writePostal's WHERE clause fired: a
+            // postnummer appeared between our SELECT and this UPDATE (an owner
+            // editing their own profile mid-tick). Found while writing the test
+            // that finally exercises that guard through the worker — the whole
+            // statement is skipped when the guard bites, INCLUDING its attempt
+            // stamp, so without this the row would never rotate and would be
+            // re-selected forever. That is the same ALWAYS-STAMP failure Fase 1a
+            // took two blockers for, reintroduced through the back door.
+            stampOnly.run("skipped_existing", nextAttemptStamp(), row.agent_id);
+            // Not a write we made — do not claim it in the resolved counters.
+            stats.resolved--;
+            if (resolution.source === "kartverket_adresse_inline") stats.resolved_inline--;
+            else stats.resolved_lookup--;
+            stats.planned[stats.planned.length - 1].outcome = "skipped_existing";
+            stats.planned[stats.planned.length - 1].postal_code = null;
+          }
         }
         continue;
       }
 
-      const outcome =
-        resolution.status === "ambiguous"
-          ? "ambiguous"
-          : resolution.status === "unusable_input"
-          ? "unusable_input"
-          : "no_match";
+      // The refusal's own name is the outcome — the vocabulary is closed by the
+      // PostalResolution union, so a new refusal kind cannot silently land in
+      // the no_match bucket the way `uncorroborated` did (review item 5).
+      const outcome = resolution.status;
       if (resolution.status === "ambiguous") stats.ambiguous++;
+      else if (resolution.status === "uncorroborated") stats.uncorroborated++;
       else if (resolution.status === "unusable_input") stats.unusable++;
       else stats.no_match++;
 

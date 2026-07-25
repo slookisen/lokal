@@ -3261,8 +3261,13 @@ function initSchema(db: Database.Database): void {
   //                                  restores the empty state.)
   //   postal_backfill_outcome      : last attempt's verdict —
   //                                  'inline_confirmed' | 'lookup_resolved' |
-  //                                  'ambiguous' | 'no_match' |
-  //                                  'unusable_input' | 'error'.
+  //                                  'ambiguous' | 'uncorroborated' |
+  //                                  'no_match' | 'unusable_input' | 'error'.
+  //                                  'uncorroborated' means a unique hit DID
+  //                                  exist but sat in a place the record never
+  //                                  names — the near-miss class a looser
+  //                                  matcher would have written, kept out of
+  //                                  'no_match' so ops can actually see it.
   //   postal_backfill_attempted_at : ISO-8601 stamp written on EVERY attempt
   //                                  whatever the outcome, including the error
   //                                  path. This is the ROTATION key and the

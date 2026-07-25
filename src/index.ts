@@ -1211,12 +1211,22 @@ if (process.env.RFB_DISABLE_AGENTS_GEOCODE !== "1") {
 if (process.env.RFB_DISABLE_POSTAL_BACKFILL !== "1") {
   const logPostalBackfill = (label: string, r: {
     processed: number; resolved: number; resolved_inline: number; resolved_lookup: number;
-    ambiguous: number; no_match: number; unusable: number; errors: number; duration_ms: number;
+    ambiguous: number; uncorroborated: number; no_match: number; unusable: number;
+    errors: number; duration_ms: number; skipped_already_running: boolean;
   }) => {
+    // Review item 7: log the single-flight no-op explicitly. A tick can
+    // legitimately run for many minutes (probe budget × batch × HTTP timeout),
+    // so "nothing happened this hour" has to be distinguishable in the log from
+    // "the worker is wedged".
+    if (r.skipped_already_running) {
+      console.log(`[postal-backfill] ${label} skipped — the previous tick is still running`);
+      return;
+    }
     console.log(
       `[postal-backfill] ${label} processed=${r.processed} ` +
       `resolved=${r.resolved} (inline=${r.resolved_inline} lookup=${r.resolved_lookup}) ` +
-      `ambiguous=${r.ambiguous} no_match=${r.no_match} unusable=${r.unusable} ` +
+      `ambiguous=${r.ambiguous} uncorroborated=${r.uncorroborated} ` +
+      `no_match=${r.no_match} unusable=${r.unusable} ` +
       `errors=${r.errors} duration_ms=${r.duration_ms}`
     );
   };

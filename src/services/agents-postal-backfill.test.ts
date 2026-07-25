@@ -14,24 +14,36 @@
  * So most of what follows asserts that we DECLINE to write.
  *
  * Asserted here:
- *   p1-p12   parseAddressParts / placeCandidates / samePlace — the pure layer,
- *            including the documented `city` pollution classes
- *   g1-g11   the four guards against a live-shaped Kartverket fixture:
+ *   p1-p15   parseAddressParts / placeCandidates / samePlace / samePoststed —
+ *            the pure layer, including the documented `city` pollution classes
+ *            and (p13) NEGATIVE assertions over the measured poststed-collision
+ *            list from the official postnummerregister
+ *   g1-g16   the guards against a live-shaped Kartverket fixture:
  *            single hit → resolved · several DISTINCT postnummer → refused ·
  *            zero hits → refused · truncated page → refused ·
  *            hit that does not corroborate the place → refused ·
  *            inline number contradicted by Kartverket → refused ·
- *            two place candidates disagreeing → refused
+ *            inline number "confirmed" in a place the record never names →
+ *            refused (g12, review B2) · two place candidates disagreeing →
+ *            refused · the corroborating hit is the one reported (g15) ·
+ *            a G3 refusal reports itself, not `no_match` (g16)
  *   u1-u4    the globally-unique last-resort tier, and the fact that it does
  *            NOT run after a refusal
  *   m1-m4    the additive agent_knowledge migration
  *   w1-w9    the worker: writes, provenance, prev-value latch, geocode requeue
- *   n1-n3    never overwrite an existing postnummer (guard is in the UPDATE)
- *   s1-s4    ALWAYS STAMP — refusals and a THROWN error both rotate the row
+ *   n1-n3d   never overwrite an existing postnummer — exercised through the
+ *            WORKER via a concurrent owner edit landing mid-tick, because the
+ *            previous version of n3 was a tautology (review B3)
+ *   s1-s5    ALWAYS STAMP — refusals, a THROWN error, and a write blocked by
+ *            the never-overwrite guard all still rotate the row
  *   r1-r3    rotation: successive batches pick DISJOINT rows
  *   d1-d5    dry run: reports everything, writes NOTHING (DB byte-identical)
  *   b1-b6    strict dry_run boolean + the limit clamp (shared with Fase 1a)
  *   f1-f3    single-flight guard
+ *
+ * Every guarantee below has been mutation-verified: deleting the guard from the
+ * source makes at least one assertion here fail. Two of the original tests did
+ * NOT survive that check (n3 and d4b) and were rewritten.
  *
  * Setup mirrors agents-geocode-worker.test.ts: an in-memory DB running the REAL
  * production schema via __setDbForTesting/__initSchemaForTesting (so the
@@ -158,13 +170,57 @@ export function runAgentsPostalBackfillTests(opts: { log?: boolean } = {}): Prom
         assertTrue(pb.placeCandidates("Oslo", []).length === 1,
           "p11c: …but 'Oslo' survives, even though it is also a fylke name (a real city with real producers)");
 
-        assertTrue(pb.samePlace("Ås", "ÅS"), "p12: place comparison folds case");
-        assertTrue(pb.samePlace("Slinde", "SLINDA"),
-          "p12b: …and allows ONE character on 5+-char names (live: poststed 'SLINDA' for the token 'Slinde')");
-        assertTrue(!pb.samePlace("Bø", "Bo"),
-          "p12c: …but NOT on short names, where one edit is a different place entirely");
-        assertTrue(!pb.samePlace("Bergen", "Berlevåg"), "p12d: unrelated names never match");
+        // Review item 6: `city` values like "Bergen, Norge" occur live; the
+        // comma was missing from the split, so the candidate was the literal
+        // "Bergen, Norge" and matched nothing, ever.
+        assertEq(pb.placeCandidates("Bergen, Norge", []).join("|"), "Bergen",
+          "p11d: a comma-separated city splits, and the 'Norge' half is dropped");
+
+        assertTrue(pb.samePlace("Ås", "ÅS"), "p12: place comparison folds case and diacritics");
         assertTrue(!pb.samePlace("", "Oslo"), "p12e: an empty label never corroborates anything");
+
+        // ── REVIEW B1 — negative assertions on the risky region ──────
+        // The first version allowed ONE edit of ANY kind on 5+-char names.
+        // Measured against the official postnummerregister (bring.no,
+        // 5 122 rows / 1 839 distinct poststeder) that conflates 110 pairs of
+        // genuinely different poststeder — and Kartverket's analyzer STEMS
+        // tokens, so G3 was the only thing between them and a write: city
+        // "Straume" resolved to 8226 STRAUMEN (Sørfold), ~900 km away, tagged
+        // 'address', licensing a km figure. "Bergen" is a real city value in
+        // our own address-without-postnummer cohort and sits in TWO of the 110.
+        //
+        // Every pair below is FROM that measured collision list. (The suite's
+        // previous negative used Bergen/Berlevåg — edit distance 6 — which
+        // proved nothing about the region that was actually broken.)
+        for (const [a, b] of [
+          ["Bergen", "Berger"], ["Bergen", "Borgen"], ["Straume", "Straumen"],
+          ["Larvik", "Narvik"], ["Lavik", "Larvik"], ["Rogne", "Rognes"],
+          ["Levanger", "Evanger"], ["Harstad", "Farstad"], ["Herøy", "Harøy"],
+          ["Heimdal", "Heidal"], ["Melbu", "Selbu"], ["Vestby", "Østby"],
+          ["Østre Gausdal", "Vestre Gausdal"],
+        ] as Array<[string, string]>) {
+          assertTrue(!pb.samePoststed(a, b),
+            `p13 (B1): '${a}' and '${b}' are DIFFERENT poststeder — they must never corroborate each other`);
+        }
+
+        // The two cases the slack exists for, both measured live: Kartverket
+        // answers 'SLINDA' for the token 'Slinde', and 'VESTBYGDA' for the
+        // address text's 'Vestbygd'. Norwegian definite/indefinite morphology —
+        // the difference is a trailing VOWEL, which is what the rule keys on.
+        assertTrue(pb.samePoststed("Slinde", "SLINDA"),
+          "p14: Slinde/SLINDA still corroborates — same stem, differing final vowel");
+        assertTrue(pb.samePoststed("Vestbygd", "VESTBYGDA"),
+          "p14b: …and Vestbygd/VESTBYGDA — the longer is the shorter plus a trailing vowel");
+        assertTrue(!pb.samePoststed("Bø", "Bøa"),
+          "p14c: …but not below the 5-character floor, which is exactly what removes HELL/HELLE, LUND/LUNDE, TORP/TORPO");
+
+        // The slack is poststed-ONLY. Over poststeder ∪ kommunenavn the same
+        // rule collides on STRAND (Rogaland) / STRANDA (Møre og Romsdal) — two
+        // real kommuner ~200 km apart — so kommunenavn is compared exactly.
+        assertTrue(!pb.samePlace("Slinde", "SLINDA"),
+          "p15: samePlace — used for kommunenavn — is EXACT, no morphology slack");
+        assertTrue(!pb.samePlace("Strand", "Stranda"),
+          "p15b: …which is what keeps Strand and Stranda apart");
       }
 
       // ── g1-g11: the four guards ──────────────────────────────────
@@ -214,7 +270,7 @@ export function runAgentsPostalBackfillTests(opts: { log?: boolean } = {}): Prom
         routes.set("Bøveien 3 Bø", body([addr("4885", "GRIMSTAD", "GRIMSTAD", "4202", "Bøveien 3")]));
         routes.set("Bøveien 3", body([addr("4885", "GRIMSTAD", "GRIMSTAD", "4202", "Bøveien 3")]));
         const r6 = await pb.resolvePostalCode("Bøveien 3", "Bø", deps);
-        assertEq(r6.status, "no_match",
+        assertEq(r6.status, "uncorroborated",
           "g8: a hit whose poststed/kommunenavn contradicts the place token is refused, even though it is unique");
 
         // G3 accepts kommunenavn as well as poststed — RFB's `city` is as often
@@ -228,6 +284,65 @@ export function runAgentsPostalBackfillTests(opts: { log?: boolean } = {}): Prom
         const r8 = await pb.resolvePostalCode("Feilgata 2, 1234 Etsted", "Etsted", deps);
         assertEq(r8.status, "ambiguous",
           "g10: a scraped inline postnummer that Kartverket contradicts is DISCARDED, never written");
+
+        // ── REVIEW B2 — the inline tier's "confirmation" was vacuous ──
+        // The probe is `street + NNNN`, which is conjunctive, so for a street
+        // name present in many postnummer it succeeds by COINCIDENCE for any of
+        // them. `Storgata 5` spans 64 distinct postnummer live. Both cases below
+        // were reproduced end-to-end against live Kartverket by the reviewer and
+        // wrote the wrong postnummer while `city` said Bergen and was never
+        // consulted. This tier produced 16 of the first measurement's 18 writes.
+        routes.set("Storgata 5 1890", body([addr("1890", "RAKKESTAD", "RAKKESTAD", "3120", "Storgata 5")]));
+        routes.set("Storgata 5 Bergen", EMPTY);
+        const b2a = await pb.resolvePostalCode("Storgata 5, 1890 Bergen", "Bergen", deps);
+        assertEq(b2a.status, "ambiguous",
+          "g12 (B2): an inline number 'confirmed' in RAKKESTAD is REFUSED when the record's own places all say Bergen");
+
+        routes.set("Storgata 5 0155", body([addr("0155", "OSLO", "OSLO", "0301", "Storgata 5")]));
+        const b2b = await pb.resolvePostalCode("Storgata 5, 0155 Bergen", "Bergen", deps);
+        assertEq(b2b.status, "ambiguous",
+          "g12b (B2): …same for 0155 OSLO — 'Kartverket returned a hit at NNNN' is not evidence the producer is there");
+
+        // …and the DISTINCTION that must survive: the reviewer independently
+        // verified "Vestbygdvegen 1030, 8412 Vestbygd" is CORRECT. There the
+        // inline number is corroborated by the record's own trailing place
+        // (poststed VESTBYGDA, definite form of Vestbygd) even though the `city`
+        // column says Kvæfjord. Coincidence vs corroboration is the whole fix.
+        routes.set("Vestbygdvegen 1030 8412", body([addr("8412", "VESTBYGDA", "LØDINGEN", "1851", "Vestbygdvegen 1030")]));
+        const b2c = await pb.resolvePostalCode("Vestbygdvegen 1030, 8412 Vestbygd", "Kvæfjord", deps);
+        assertEq(b2c.status, "resolved",
+          "g13 (B2): a genuinely corroborated inline number still resolves — the fix is not 'distrust inline'");
+        assertEq(b2c.status === "resolved" ? b2c.postal_code : null, "8412", "g13b: …to the right postnummer");
+
+        // With NO place token at all there is nothing to corroborate against,
+        // so the inline tier must NOT accept on its own — it defers to the
+        // globally-unique tier, which corroborates by geography instead.
+        routes.set("Enegata 7 1234", body([addr("1234", "ETSTED", "ETSTED", "1111", "Enegata 7")]));
+        routes.set("Enegata 7", body([addr("1234", "ETSTED", "ETSTED", "1111", "Enegata 7")]));
+        // "Enegata 7, 1234" — an inline number with NO poststed after it and a
+        // NULL city, so placeCandidates() is empty.
+        const b2d = await pb.resolvePostalCode("Enegata 7, 1234", null, deps);
+        assertEq(b2d.status, "resolved", "g14 (B2): with no place token the inline number defers to the unique tier…");
+        assertEq(b2d.status === "resolved" ? b2d.source : null, "kartverket_adresse_unik",
+          "g14b: …and the provenance says so — it was accepted on geography, not on the scraped digits");
+
+        // Review item 4: `planned[].detail` is read by a human during a dry-run
+        // rehearsal, so it must name the hit that actually SATISFIED G3, not
+        // hits[0]. Two hits, same postnummer (so G2 passes), different kommune.
+        routes.set("Delegata 2 Bykle", body([
+          addr("4754", "FEIL", "FEILKOMMUNE", "9998", "Delegata 2"),
+          addr("4754", "BYKLE", "BYKLE", "4222", "Delegata 2"),
+        ]));
+        const it4 = await pb.resolvePostalCode("Delegata 2", "Bykle", deps);
+        assertEq(it4.status === "resolved" ? it4.kommunenavn : null, "BYKLE",
+          "g15 (item 4): the reported hit is the one that CORROBORATED, not merely the first in the array");
+
+        // Review item 5: a unique hit in the wrong place is the most
+        // interesting refusal we produce — it must not be filed as 'no_match'
+        // ("Kartverket knows nothing matching"), or ops under-counts exactly
+        // the near-misses worth reading.
+        assertEq(r6.status, "uncorroborated",
+          "g16 (item 5): a hit refused by G3 reports its own status, not 'no_match'");
 
         // An inline number that Kartverket cannot confirm must not be silently
         // OVERRIDDEN by a weaker tier: the record then disagrees with itself
@@ -270,7 +385,7 @@ export function runAgentsPostalBackfillTests(opts: { log?: boolean } = {}): Prom
         // its unique hit contradicted the place; asking again without the place
         // token would answer with that very record.
         const r3 = await pb.resolvePostalCode("Bøveien 3", "Bø", deps);
-        assertEq(r3.status, "no_match",
+        assertEq(r3.status, "uncorroborated",
           "u4: the unique-address fallback does NOT run after a corroboration refusal — it cannot launder a rejected hit");
       }
 
@@ -364,17 +479,44 @@ export function runAgentsPostalBackfillTests(opts: { log?: boolean } = {}): Prom
         assertEq(after.postal_backfill_attempted_at, before.postal_backfill_attempted_at,
           "n2: …and is not even selected — no wasted Kartverket call");
 
-        // The guard is in the UPDATE's own WHERE clause, not only the selector,
-        // so a selector bug (or an owner edit landing mid-tick) cannot clobber
-        // a real postnummer. Exercised directly.
-        db.prepare(
-          `UPDATE agent_knowledge
-              SET postal_code_prev = postal_code, postal_code = '1111',
-                  postal_code_source = 'kartverket_adresse_sok'
-            WHERE agent_id = 'n-has' AND (postal_code IS NULL OR TRIM(postal_code) = '')`
-        ).run();
-        assertEq(kOf("n-has").postal_code, "9999",
-          "n3: the write statement itself refuses a non-empty postal_code — belt as well as braces");
+        // ── REVIEW B3 — n3 used to be a TAUTOLOGY ───────────────────
+        // It executed a SQL literal the test itself had written, so deleting
+        // the guard from the worker's real prepared statement left the suite at
+        // 75/0. The guard has to be exercised through the WORKER, which means
+        // producing the race it exists for: a row that was EMPTY at SELECT time
+        // and gains a postnummer before the UPDATE lands (an owner editing their
+        // own profile mid-tick — an ordinary event on a live platform).
+        //
+        // The write is injected from inside the fetch seam, which runs after
+        // candidate selection and before this row's UPDATE.
+        routes.set("Racegata 1 Trondheim", body([addr("7011", "TRONDHEIM", "TRONDHEIM", "5001", "Racegata 1")]));
+        seed({ id: "n-race", name: "Kappløp Gård", city: "Trondheim", address: "Racegata 1" });
+        let raceFired = false;
+        const raceDeps = {
+          sleep: async () => {},
+          fetchImpl: (async (input: any) => {
+            const url = decodeURIComponent(String(input));
+            const m = url.match(/[?&]sok=([^&]*)/);
+            const q = (m ? m[1] : "").trim();
+            if (q.startsWith("Racegata 1") && !raceFired) {
+              raceFired = true;
+              // The owner saves their real postnummer, after we selected the row.
+              db.prepare(`UPDATE agent_knowledge SET postal_code = '8888' WHERE agent_id = 'n-race'`).run();
+            }
+            return { ok: true, status: 200, json: async () => routes.get(q) ?? EMPTY } as unknown as Response;
+          }) as unknown as typeof fetch,
+        };
+        await pb.postalBackfillTick(50, raceDeps);
+        assertTrue(raceFired, "n3-setup: the concurrent-edit race actually fired");
+        const raced = kOf("n-race");
+        assertEq(raced.postal_code, "8888",
+          "n3: an owner's postnummer that lands mid-tick is NOT clobbered — the guard lives in the worker's own UPDATE, not just the selector");
+        assertEq(raced.postal_code_source, null,
+          "n3b: …and no Kartverket provenance is stamped onto a value Kartverket did not produce");
+        assertTrue(!!raced.postal_backfill_attempted_at,
+          "n3c: …while the attempt IS still stamped, so the row rotates out instead of being re-selected forever");
+        assertEq(raced.postal_backfill_outcome, "skipped_existing",
+          "n3d: …recorded under its own outcome, so a burst of them is visible to ops rather than looking like successes");
       }
 
       // ── s1-s4: ALWAYS STAMP, including on a THROWN error ─────────
@@ -440,7 +582,13 @@ export function runAgentsPostalBackfillTests(opts: { log?: boolean } = {}): Prom
 
       // ── d1-d5: dry run reports everything, writes nothing ────────
       {
-        seed({ id: "d-1", name: "Tørrkjøring Gård", city: "Trondheim", address: "Kongens gate 1" });
+        // REVIEW B3: `geocode_attempted_at` MUST be seeded non-null. It used to
+        // be NULL, so "the dry run did not re-queue this row" was asserting that
+        // setting NULL to NULL changed nothing — making requeueGeocode run
+        // during a dry run left the suite at 75/0. With a real stamp here, a
+        // dry-run re-queue is a visible mutation.
+        seed({ id: "d-1", name: "Tørrkjøring Gård", city: "Trondheim", address: "Kongens gate 1",
+               geocode_attempted_at: "2026-07-02T00:00:00.000Z" });
         const snapshotSql =
           `SELECT agent_id, postal_code, postal_code_prev, postal_code_source,
                   postal_backfill_outcome, postal_backfill_attempted_at
