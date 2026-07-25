@@ -38,11 +38,37 @@ export function getExperiencesOpenapi(): object {
             "«Hva kan vi finne på i [sted]» — intent discovery over published " +
             "experiences. All parameters are optional and combinable. Only " +
             "verified experiences whose provider is brreg-active and whose " +
-            "confidence is medium/high are surfaced.",
+            "confidence is medium/high are surfaced. " +
+            "`category=gardssalg_smaking` routes to a distinct vertical — Brreg-registered " +
+            "farm-sale drink producers (gårdssalg) stored separately from `experiences` — and " +
+            "returns `vertical:\"gardssalg\"` with GardssalgProducer-shaped rows instead (see " +
+            "`producer_type`/`booking_live` parameters and the GardssalgProducer schema below).",
           parameters: [
             { name: "fylke", in: "query", description: "County name (e.g. «Oslo», «Troms»)", schema: { type: "string" }, example: "Troms" },
             { name: "kommune", in: "query", description: "Municipality name (e.g. «Tromsø»)", schema: { type: "string" }, example: "Tromsø" },
-            { name: "category", in: "query", description: "Category slug (e.g. «dyreliv_safari», «natur_friluft»)", schema: { type: "string" }, example: "dyreliv_safari" },
+            {
+              name: "category",
+              in: "query",
+              description: "Category slug (e.g. «dyreliv_safari», «natur_friluft»). «gardssalg_smaking» routes to the gårdssalg producer vertical instead of `experiences`.",
+              schema: { type: "string" },
+              examples: {
+                experience: { value: "dyreliv_safari", summary: "Regular experience category" },
+                gardssalg: { value: "gardssalg_smaking", summary: "Gårdssalg (farm-sale drink producer) vertical" },
+              },
+            },
+            {
+              name: "producer_type",
+              in: "query",
+              description: "Gårdssalg-only: producer type filter (e.g. «bryggeri», «sideri», «vingård»). Ignored outside `category=gardssalg_smaking`.",
+              schema: { type: "string" },
+              example: "sideri",
+            },
+            {
+              name: "booking_live",
+              in: "query",
+              description: "Gårdssalg-only: pass literal `true` to only return producers with live direct booking (omitted = no filter on this column, NOT «only paused»). Ignored outside `category=gardssalg_smaking`.",
+              schema: { type: "boolean" },
+            },
             { name: "indoor_outdoor", in: "query", description: "Indoor / outdoor preference", schema: { type: "string", enum: ["indoor", "outdoor", "both"] } },
             { name: "weather", in: "query", description: "Weather hint — rain/snow prefer indoor & weather-independent", schema: { type: "string", enum: ["rain", "snow", "clear", "any"] } },
             { name: "season", in: "query", description: "Season (e.g. «summer», «winter»)", schema: { type: "string" }, example: "winter" },
@@ -59,16 +85,42 @@ export function getExperiencesOpenapi(): object {
           ],
           responses: {
             "200": {
-              description: "Discovery result",
+              description: "Discovery result — `vertical` and the shape of `results[]` depend on `category` (see GardssalgProducer for the gårdssalg branch).",
               content: {
                 "application/json": {
                   schema: {
                     type: "object",
                     properties: {
-                      vertical: { type: "string", enum: ["experiences"] },
+                      vertical: { type: "string", enum: ["experiences", "gardssalg"] },
                       query: { type: "object" },
                       count: { type: "integer" },
-                      results: { type: "array", items: { $ref: "#/components/schemas/Experience" } },
+                      results: {
+                        type: "array",
+                        items: { oneOf: [{ $ref: "#/components/schemas/Experience" }, { $ref: "#/components/schemas/GardssalgProducer" }] },
+                      },
+                    },
+                  },
+                  examples: {
+                    gardssalg: {
+                      summary: "category=gardssalg_smaking&fylke=Vestland",
+                      value: {
+                        vertical: "gardssalg",
+                        query: { fylke: "Vestland" },
+                        count: 1,
+                        results: [
+                          {
+                            navn: "Eksempel Sideri",
+                            fylke: "Vestland",
+                            kommune: "Ulvik",
+                            producer_type: "sideri",
+                            lat: 60.57,
+                            lon: 6.9,
+                            geocode_confidence: "address",
+                            booking: { live: false, mode: "paused", note: "Reservasjoner åpner snart; ta kontakt via profilsiden. / Bookings open soon; visit the profile page to get in touch." },
+                            profile_url: "https://opplevagent.no/kategori/gardssalg/produsent/eksempel-sideri--abc123",
+                          },
+                        ],
+                      },
                     },
                   },
                 },
@@ -235,6 +287,36 @@ export function getExperiencesOpenapi(): object {
                 "How this row's location (and therefore distance_km) was derived. 'address' = geocoded from the " +
                 "provider's exact street address (precise). 'kommune' = a municipality centroid (approximate — " +
                 "do not present distance_km as exact for these rows). Only present when lat/lng were given.",
+            },
+          },
+        },
+        GardssalgProducer: {
+          type: "object",
+          description:
+            "A gårdssalg (farm-sale drink producer) row — returned by `/api/opplevelser/discover?category=gardssalg_smaking` " +
+            "and the `discover_gardssalg` MCP tool. Stored in `experience_providers`, not `experiences` — never mix with the Experience schema.",
+          properties: {
+            navn: { type: "string" },
+            fylke: { type: "string", nullable: true },
+            kommune: { type: "string", nullable: true },
+            producer_type: { type: "string", nullable: true },
+            lat: { type: "number", nullable: true },
+            lon: { type: "number", nullable: true },
+            geocode_confidence: { type: "string", enum: ["address", "kommune"], nullable: true },
+            booking: {
+              type: "object",
+              description: "Honest booking status — never claims an active booking flow before the dark-launch gate opens.",
+              properties: {
+                live: { type: "boolean" },
+                mode: { type: "string", enum: ["request", "paused"] },
+                note: { type: "string" },
+              },
+            },
+            profile_url: { type: "string", nullable: true },
+            distance_km: {
+              type: "number",
+              nullable: true,
+              description: "Only present when lat/lng were given in the request (near-me search).",
             },
           },
         },

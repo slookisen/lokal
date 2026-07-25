@@ -1251,6 +1251,40 @@ Eksempel (nær meg — innen 50 km fra Tromsø):
 GET ${url}/api/opplevelser/categories   — alle kategorier med antall
 GET ${url}/api/opplevelser/{id}         — én opplevelse via id
 
+## Gårdssalg & smaking (produsenter)
+
+Gårdssalg-produsenter (gårdsbutikk, sideri, bryggeri, vingård m.fl., med ærlig
+bookingstatus) er en egen vertikal i samme katalog — IKKE en del av
+\`experiences\`-tabellen. Søkbar via MCP, A2A (naturlig språk) og REST.
+
+MCP-verktøy: discover_gardssalg — samme to-stegs håndtrykk som MCP-seksjonen over.
+
+Eksempel (steg 1: initialize — fang opp mcp-session-id fra svar-headerne):
+  SESSION_ID=$(curl -s -D - -o /dev/null -X POST ${url}/mcp \\
+    -H "Content-Type: application/json" \\
+    -H "Accept: application/json, text/event-stream" \\
+    -d '{"jsonrpc":"2.0","method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"eksempel-klient","version":"1.0.0"}},"id":"1"}' \\
+    | grep -i '^mcp-session-id:' | tr -d '\\r' | cut -d' ' -f2)
+
+Eksempel (steg 2: tools/call — discover_gardssalg, med mcp-session-id fra steg 1):
+  curl -X POST ${url}/mcp \\
+    -H "Content-Type: application/json" \\
+    -H "Accept: application/json, text/event-stream" \\
+    -H "mcp-session-id: $SESSION_ID" \\
+    -d '{"jsonrpc":"2.0","method":"tools/call","params":{"name":"discover_gardssalg","arguments":{"fylke":"Vestland","limit":5}},"id":"2"}'
+
+REST (samme søkeflate, uten MCP-håndtrykk):
+  GET ${url}/api/opplevelser/discover?category=gardssalg_smaking&fylke=Vestland
+
+Gårdssalg-spesifikke filtre (i tillegg til fylke/kommune/lat/lng/radius_km fra
+Discovery-API-seksjonen over): producer_type, booking_live=true (kun literalen
+"true" filtrerer — utelatt betyr «ingen filter på denne kolonnen»).
+
+Respons: JSON med { vertical:"gardssalg", query, count, results[] }, der hver
+rad har navn/fylke/kommune/producer_type/lat/lon/geocode_confidence/profile_url
+og et \`booking\`-felt ({live, mode, note}) som ærlig speiler dark-launch-status
+— aldri en påstått aktiv booking før reservasjoner faktisk er åpnet.
+
 ## Lisens
 
 Provider-data verifiseres mot Brønnøysundregistrene (CC0). Innhold gjengis
