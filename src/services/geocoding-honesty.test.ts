@@ -33,6 +33,7 @@ import {
   geocodingService,
   haversineDistanceKm,
   isAcceptablePlaceType,
+  placeTypeTier,
   nameMatchesQuery,
   officialNames,
   radiusFromBoundingBox,
@@ -185,6 +186,68 @@ const KOMMUNEINFO_VALER = {
   ],
 };
 
+// Review follow-up R1 — MINOR-SETTLEMENT vs MAJOR-PLACE collisions. Verbatim
+// captures 2026-07-25. In each case a hamlet-scale record used to sit in the
+// SAME tier as towns and therefore out-ranked the island / kommune of the same
+// name, which was never even looked at.
+
+// «Frøya»: a Grend in Bremanger (Vestland) beat the Trøndelag island. This one
+// was a REGRESSION against main, which returned the island.
+const STEDSNAVN_FROYA = {
+  metadata: { totaltAntallTreff: 6 },
+  navn: [
+    { navneobjekttype: "Øy i sjø", representasjonspunkt: { nord: 63.6721, øst: 8.3343 },
+      stedsnavn: [{ skrivemåte: "Frøya", navnestatus: "hovednavn", språk: "Norsk" }] },
+    { navneobjekttype: "Øy i sjø", representasjonspunkt: { nord: 61.7854, øst: 4.8483 },
+      stedsnavn: [{ skrivemåte: "Frøya", navnestatus: "hovednavn", språk: "Norsk" }] },
+    { navneobjekttype: "Kirke", representasjonspunkt: { nord: 61.7757, øst: 4.8975 },
+      stedsnavn: [{ skrivemåte: "Frøya kyrkje", navnestatus: "hovednavn", språk: "Norsk" },
+                  { skrivemåte: "Frøya", navnestatus: "hovednavn", språk: "Norsk" }] },
+    { navneobjekttype: "Bruk", representasjonspunkt: { nord: 63.6909, øst: 8.4373 },
+      stedsnavn: [{ skrivemåte: "Frøya", navnestatus: "hovednavn", språk: "Norsk" }] },
+    { navneobjekttype: "Grend", representasjonspunkt: { nord: 61.7723, øst: 4.8919 },
+      stedsnavn: [{ skrivemåte: "Frøya", navnestatus: "hovednavn", språk: "Norsk" }] },
+    { navneobjekttype: "Skjær i sjø", representasjonspunkt: { nord: 63.8210, øst: 9.4436 },
+      stedsnavn: [{ skrivemåte: "Frøya", navnestatus: "hovednavn", språk: "Norsk" }] },
+  ],
+};
+
+// «Sunndal»: a Bygdelag in Kvinnherad beat Sunndal kommune — 309 km.
+const STEDSNAVN_SUNNDAL = {
+  metadata: { totaltAntallTreff: 6 },
+  navn: [
+    { navneobjekttype: "Kommune", representasjonspunkt: { nord: 62.67463, øst: 8.56189 },
+      stedsnavn: [{ skrivemåte: "Sunndal kommune", navnestatus: "hovednavn", språk: "Norsk" },
+                  { skrivemåte: "Sunndal", navnestatus: "hovednavn", språk: "Norsk" }] },
+    { navneobjekttype: "Bygdelag (bygd)", representasjonspunkt: { nord: 60.11749, øst: 6.26784 },
+      stedsnavn: [{ skrivemåte: "Sunndal", navnestatus: "hovednavn", språk: "Norsk" }] },
+    { navneobjekttype: "Gard", representasjonspunkt: { nord: 63.37997, øst: 11.33589 },
+      stedsnavn: [{ skrivemåte: "Sunndal", navnestatus: "hovednavn", språk: "Norsk" }] },
+  ],
+};
+
+// «Tysnes»: the bilingual Grend «Diksná / Tysnes» in Nordland beat Tysnes
+// kommune in Vestland — 1 045 km. Note the kommune matches only through the
+// «<query> kommune» rule, and the island «Tysnesøya» carries Tysnes as an
+// UNDERNAVN so the name guard correctly ignores it.
+const STEDSNAVN_TYSNES = {
+  metadata: { totaltAntallTreff: 5 },
+  navn: [
+    { navneobjekttype: "Øy i sjø", representasjonspunkt: { nord: 59.97586, øst: 5.44574 },
+      stedsnavn: [{ skrivemåte: "Tysnesøya", navnestatus: "hovednavn", språk: "Norsk" },
+                  { skrivemåte: "Tysnes", navnestatus: "undernavn", språk: "Norsk" }] },
+    { navneobjekttype: "Kommune", representasjonspunkt: { nord: 60.00579, øst: 5.5002 },
+      stedsnavn: [{ skrivemåte: "Tysnes kommune", navnestatus: "hovednavn", språk: "Norsk" },
+                  { skrivemåte: "Tysnes", navnestatus: "undernavn", språk: "Norsk" }] },
+    { navneobjekttype: "Kirke", representasjonspunkt: { nord: 60.04043, øst: 5.53119 },
+      stedsnavn: [{ skrivemåte: "Tysnes kyrkje", navnestatus: "hovednavn", språk: "Norsk" },
+                  { skrivemåte: "Tysnes", navnestatus: "hovednavn", språk: "Norsk" }] },
+    { navneobjekttype: "Grend", representasjonspunkt: { nord: 68.2596, øst: 15.95385 },
+      stedsnavn: [{ skrivemåte: "Diksná", navnestatus: "hovednavn", språk: "Lulesamisk" },
+                  { skrivemåte: "Tysnes", navnestatus: "hovednavn", språk: "Norsk" }] },
+  ],
+};
+
 const STEDSNAVN_EMPTY = { metadata: { totaltAntallTreff: 0 }, navn: [] };
 
 /**
@@ -215,6 +278,9 @@ function makeFakeFetch(): { fetchImpl: typeof fetch; calls: string[] } {
       if (/sok=blåskjell(&|$)/i.test(url)) return json(STEDSNAVN_BLASKJELL);
       if (/sok=kautokeino(&|$)/i.test(url)) return json(STEDSNAVN_KAUTOKEINO);
       if (/sok=nes(&|$)/i.test(url)) return json(STEDSNAVN_NES);
+      if (/sok=frøya(&|$)/i.test(url)) return json(STEDSNAVN_FROYA);
+      if (/sok=sunndal(&|$)/i.test(url)) return json(STEDSNAVN_SUNNDAL);
+      if (/sok=tysnes(&|$)/i.test(url)) return json(STEDSNAVN_TYSNES);
       return json(STEDSNAVN_EMPTY);
     }
     return notFound();
@@ -406,6 +472,63 @@ export async function runGeocodingHonestyTests(opts: { log?: boolean } = {}): Pr
       "item 5: a prefix is not a match — «Nesbyen» is not «Nes»");
     assertEq(officialNames({ stedsnavn: [{ skrivemåte: "A" }, { skrivemåte: "B" }] }).join("|"), "A",
       "item 5: with no navnestatus at all, only the first listed name is treated as official");
+
+    // ══════════════════════════════════════════════════════════════
+    // R1 (review) — a hamlet must not out-rank the island/kommune it shares
+    //               a name with
+    // ══════════════════════════════════════════════════════════════
+    assertEq(placeTypeTier("Tettsted"), 0, "R1: towns are tier 0");
+    assertEq(placeTypeTier("Kommune"), 1, "R1: administrative areas are tier 1");
+    assertEq(placeTypeTier("Øy i sjø"), 2, "R1: named islands/regions are tier 2");
+    assertEq(placeTypeTier("Grend"), 3, "R1: hamlets are LAST (tier 3), not alongside towns");
+    assertEq(placeTypeTier("Bygdelag (bygd)"), 3, "R1: …so are bygdelag");
+    assertEq(placeTypeTier("Poststed"), 3, "R1: …and poststeder");
+    assertEq(placeTypeTier("Gard"), -1, "R1: a farm is still not a place at all");
+    assertTrue(isAcceptablePlaceType("Grend"),
+      "R1: demoted ≠ rejected — a hamlet is still a valid answer when nothing better shares the name");
+
+    {
+      // «Frøya» — the REGRESSION against main. One of Norway's largest seafood
+      // municipalities; the branch pointed `sjømat Frøya` at a 15 km circle
+      // around a hamlet in Bremanger, 275 km away, reported as geoFiltered.
+      __clearGeocodeCacheForTesting();
+      const r = await geocodingService.geocode("frøya");
+      assertTrue(r !== null, "R1: 'frøya' resolves");
+      if (r) {
+        assertEq(r.placeType, "Øy i sjø", "R1: 'frøya' is the Trøndelag ISLAND, not the Bremanger Grend");
+        assertTrue(Math.abs(r.lat - 63.6721) < 0.001 && Math.abs(r.lng - 8.3343) < 0.001,
+          `R1: …at 63.6721, 8.3343 — the same point main returned (got ${r.lat}, ${r.lng})`);
+        assertTrue(haversineDistanceKm(r.lat, r.lng, 61.7723, 4.8919) > 250,
+          "R1: …i.e. 275 km away from the hamlet the branch used to pick");
+      }
+    }
+    {
+      // «Sunndal» — Bygdelag in Kvinnherad vs Sunndal kommune, 309 km.
+      __clearGeocodeCacheForTesting();
+      const r = await geocodingService.geocode("sunndal");
+      assertTrue(r !== null, "R1: 'sunndal' resolves");
+      if (r) {
+        assertEq(r.placeType, "Kommune", "R1: 'sunndal' is the kommune, not the Kvinnherad Bygdelag");
+        assertTrue(haversineDistanceKm(r.lat, r.lng, 60.11749, 6.26784) > 250,
+          `R1: …309 km from the hamlet (got ${r.lat}, ${r.lng})`);
+      }
+    }
+    {
+      // «Tysnes» — the bilingual Grend «Diksná/Tysnes» in Nordland vs Tysnes
+      // kommune in Vestland, 1 045 km. Also proves the interaction with the
+      // name guard: the ISLAND «Tysnesøya» carries Tysnes only as an
+      // undernavn, so the kommune (matched via «<query> kommune») is correct.
+      __clearGeocodeCacheForTesting();
+      const r = await geocodingService.geocode("tysnes");
+      assertTrue(r !== null, "R1: 'tysnes' resolves");
+      if (r) {
+        assertEq(r.placeType, "Kommune", "R1: 'tysnes' is the Vestland kommune, not the Nordland Grend");
+        assertTrue(r.lat < 62,
+          `R1: …in Vestland, 1 045 km from «Diksná» in Nordland (got ${r.lat})`);
+        assertTrue(r.name !== "Tysnesøya",
+          "R1: …and not the island, whose «Tysnes» is only an undernavn");
+      }
+    }
 
     // ══════════════════════════════════════════════════════════════
     // item 4 (review) — duplicate kommune names must be REFUSED

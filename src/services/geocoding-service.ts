@@ -323,11 +323,10 @@ export function haversineDistanceKm(lat1: number, lng1: number, lat2: number, ln
 // failing that returns null so the caller can be honest about having no geo
 // rather than confidently pointing at the wrong end of the country.
 
-// Tier 1 — actual settlements (a person lives/shops here).
-const POPULATED_PLACE_TYPES = new Set([
-  "tettsted", "statistisk tettsted", "tettbebyggelse", "tettsteddel",
+// Tier 1 — towns and cities: the biggest settlement that can carry a name.
+const MAJOR_SETTLEMENT_TYPES = new Set([
+  "tettsted", "statistisk tettsted", "tettbebyggelse",
   "by", "bydel", "administrativ bydel",
-  "grend", "bygdelag (bygd)", "poststed", "boligfelt",
 ]);
 
 // Tier 2 — administrative areas (kommune/fylke centroids).
@@ -343,10 +342,53 @@ const REGION_PLACE_TYPES = new Set([
   "halvøy i sjø", "øy i vann", "fjellområde",
 ]);
 
+// Tier 4 — MINOR settlements: real places, but hamlet-scale. Ranked LAST
+// (review follow-up R1).
+//
+// These used to sit in tier 1 alongside towns, which meant a hamlet
+// out-ranked an island, a kommune or a region of the same name and the search
+// never even looked further down. Measured 2026-07-25:
+//   «Frøya»   → Grend in Bremanger, Vestland (61.7723, 4.8919) instead of the
+//               Trøndelag island (63.6721, 8.3343) — 275 km, so `sjømat Frøya`
+//               searched a 15 km circle around a hamlet in the wrong fjord.
+//   «Sunndal» → Bygdelag in Kvinnherad instead of Sunndal kommune — 309 km.
+//   «Tysnes»  → the bilingual Grend «Diksná/Tysnes» in the north instead of
+//               Tysnes kommune in Vestland — 1 045 km.
+// All three are the confident-wrong-point class 0a/0c exist to eliminate, and
+// «Frøya» was a REGRESSION against main (which returned the island).
+//
+// Demoting them is strictly better than the alternative fix (consult the
+// kommune register when tier 1 is a minor type): Kommuneinfo's Frøya centroid
+// is (64.0705, 8.8895), ~50 km off the island, because the kommune is a wide
+// archipelago. The named island itself is the better answer.
+//
+// Validated across 181 live names: 0 lost, 0 gained, 19 moved, every move a
+// correction or a <20 km refinement.
+const MINOR_SETTLEMENT_TYPES = new Set([
+  "grend", "bygdelag (bygd)", "poststed", "boligfelt", "tettsteddel",
+]);
+
+/** All settlement types, major and minor — the "a person lives here" test. */
+const POPULATED_PLACE_TYPES = new Set([...MAJOR_SETTLEMENT_TYPES, ...MINOR_SETTLEMENT_TYPES]);
+
+/** Preference order used by lookupKartverket(). Earlier tiers win outright. */
+const PLACE_TYPE_TIERS: ReadonlyArray<ReadonlySet<string>> = [
+  MAJOR_SETTLEMENT_TYPES,
+  ADMIN_AREA_TYPES,
+  REGION_PLACE_TYPES,
+  MINOR_SETTLEMENT_TYPES,
+];
+
 /** True if Kartverket's navneobjekttype is a place we are willing to geocode to. */
 export function isAcceptablePlaceType(navneobjekttype: string | null | undefined): boolean {
   const t = (navneobjekttype || "").toLowerCase().trim();
-  return POPULATED_PLACE_TYPES.has(t) || ADMIN_AREA_TYPES.has(t) || REGION_PLACE_TYPES.has(t);
+  return PLACE_TYPE_TIERS.some((tier) => tier.has(t));
+}
+
+/** 0-based preference tier of a type, or -1 when it is not acceptable at all. Exported for tests. */
+export function placeTypeTier(navneobjekttype: string | null | undefined): number {
+  const t = (navneobjekttype || "").toLowerCase().trim();
+  return PLACE_TYPE_TIERS.findIndex((tier) => tier.has(t));
 }
 
 // ── Name-similarity guard (review follow-up, item 5) ───────────────
@@ -408,6 +450,7 @@ function radiusForType(type: string): number {
   const t = (type || "").toLowerCase().trim();
   if (t === "bydel" || t === "administrativ bydel" || t === "tettsteddel" || t === "boligfelt") return 10;
   if (POPULATED_PLACE_TYPES.has(t)) return 15;
+  // (falls through to the tiers below for admin/region types)
   if (t === "kommune" || t === "annen administrativ inndeling") return 30;
   if (t === "fylke") return 90;
   if (REGION_PLACE_TYPES.has(t)) return 50;
@@ -620,14 +663,18 @@ class GeocodingService {
       const hasPoint = (n: any) =>
         n?.representasjonspunkt && n.representasjonspunkt.nord != null && n.representasjonspunkt.øst != null;
       const typeOf = (n: any) => (n?.navneobjekttype || "").toLowerCase().trim();
-      const pick = (allowed: Set<string>) =>
+      const pick = (allowed: ReadonlySet<string>) =>
         data.navn.find((n: any) =>
           hasPoint(n) && allowed.has(typeOf(n)) && nameMatchesQuery(n, placeName));
 
-      // Tier order: real settlement > administrative area > named region.
+      // Tier order: town/city > administrative area > named region > hamlet.
       // NO navn[0] fallback — an unrecognised type means "we do not know
       // where this is", which is strictly better than a confident wrong point.
-      const best = pick(POPULATED_PLACE_TYPES) || pick(ADMIN_AREA_TYPES) || pick(REGION_PLACE_TYPES);
+      let best: any;
+      for (const tier of PLACE_TYPE_TIERS) {
+        best = pick(tier);
+        if (best) break;
+      }
       if (!best) {
         const rejected = data.navn
           .map((n: any) => `${officialNames(n)[0] || "?"}[${n?.navneobjekttype || "?"}]`)
