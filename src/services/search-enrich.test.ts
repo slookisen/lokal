@@ -38,6 +38,10 @@ import {
   // orch-experiences-content-refresh: experiences-vertical category mapper (PURE).
   mapToExperienceCategories,
   EXPERIENCE_CATEGORIES,
+  // dev-request 2026-07-21-opplevagent-norske-tegn-encoding: charset-aware
+  // decode of fetched producer-homepage HTML (PURE).
+  detectHtmlCharset,
+  decodeHtmlBytes,
   type PageEvidence,
   type StoredProducer,
   type BraveResult,
@@ -1061,6 +1065,80 @@ export function runSearchEnrichTests(opts: { log?: boolean } = {}): TestSummary 
     assertTrue(
       !out.includes("meat") && !out.includes("dairy") && !out.includes("vegetables"),
       "exp-cat: food-vocab keys never appear in experiences categories"
+    );
+  }
+
+  {
+    // dev-request 2026-07-21-opplevagent-norske-tegn-encoding: charset
+    // detection + decode for fetched producer-homepage HTML.
+    assertEq(
+      detectHtmlCharset(new Uint8Array(), 'text/html; charset=iso-8859-1'),
+      "iso-8859-1",
+      "detectHtmlCharset: reads charset from Content-Type header"
+    );
+    assertEq(
+      detectHtmlCharset(new Uint8Array(), "text/html; charset=\"UTF-8\""),
+      "utf-8",
+      "detectHtmlCharset: header charset is lowercased, quotes stripped"
+    );
+    const metaHtml = Buffer.from(
+      '<html><head><meta charset="windows-1252"><title>x</title></head></html>',
+      "latin1"
+    );
+    assertEq(
+      detectHtmlCharset(new Uint8Array(metaHtml), null),
+      "windows-1252",
+      "detectHtmlCharset: falls back to sniffing <meta charset> when header has none"
+    );
+    assertEq(
+      detectHtmlCharset(new Uint8Array(metaHtml), "text/html"),
+      "windows-1252",
+      "detectHtmlCharset: header present but no charset param → still sniffs <meta>"
+    );
+    const noDecl = Buffer.from("<html><head><title>x</title></head></html>", "latin1");
+    assertEq(
+      detectHtmlCharset(new Uint8Array(noDecl), null),
+      "utf-8",
+      "detectHtmlCharset: no header + no <meta charset> → defaults utf-8"
+    );
+
+    // The actual bug: a legacy gårdssalg producer site served as windows-1252.
+    // "Gårdsbutikk med økologiske grønnsaker" contains æ/ø/å.
+    const original = "Gårdsbutikk med økologiske grønnsaker, åpent hver dag";
+    const win1252Bytes = new Uint8Array(Buffer.from(original, "latin1"));
+    assertEq(
+      decodeHtmlBytes(win1252Bytes, "text/html; charset=windows-1252"),
+      original,
+      "decodeHtmlBytes: correctly decodes windows-1252 producer text (the reported bug)"
+    );
+    // Proof this WAS broken: naively decoding the same bytes as UTF-8 (the old
+    // resp.text() behavior) must NOT reproduce the original text.
+    assertTrue(
+      new TextDecoder("utf-8").decode(win1252Bytes) !== original,
+      "decodeHtmlBytes: sanity check — naive UTF-8 decode of windows-1252 bytes is corrupted (confirms the regression this guards)"
+    );
+
+    // Regression: a normal UTF-8 page (no charset declared, the common case)
+    // must still decode correctly — this is the overwhelming majority of
+    // producer sites and must never regress.
+    const utf8Bytes = new Uint8Array(Buffer.from(original, "utf-8"));
+    assertEq(
+      decodeHtmlBytes(utf8Bytes, null),
+      original,
+      "decodeHtmlBytes: plain UTF-8 page with no charset header still decodes correctly (no regression)"
+    );
+    assertEq(
+      decodeHtmlBytes(utf8Bytes, "text/html; charset=utf-8"),
+      original,
+      "decodeHtmlBytes: explicit utf-8 header decodes correctly"
+    );
+
+    // Unknown/garbage charset label must never throw — best-effort utf-8
+    // fallback beats dropping the page.
+    assertEq(
+      decodeHtmlBytes(utf8Bytes, "text/html; charset=totally-bogus-label"),
+      original,
+      "decodeHtmlBytes: unsupported charset label falls back to utf-8 instead of throwing"
     );
   }
 
