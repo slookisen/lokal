@@ -298,6 +298,30 @@ higher rate-limit tier on the general REST/\`/a2a\` surface, and revoke/erase it
 \`POST /api/keys/revoke\` or \`POST /api/keys/erase\`. Note: \`/api/marketplace/search\` and
 \`/api/marketplace/discover\` currently sit behind a separate, static quota (150) that a
 consumer key does not raise.
+
+## Datakvalitet og verifisering
+
+${BASE_URL}/proveniens
+
+Hvert felt i en produsentprofil (adresse, telefon, produkter, m.m.) lagres med hvilken kilde
+som ga oss verdien og når den sist ble bekreftet — ikke bare ett samlet «verifisert»-flagg for
+hele profilen. Adresse og telefon regnes som bekreftet først når minst to uavhengige kilder
+(Brønnøysundregistrene, Google Places, produsentens egen nettside, offisiell Facebook-side,
+eller produsenten selv) er enige, eller når produsenten har bekreftet direkte. Produsenter som
+oppgir økologisk sertifisering kryssjekkes i tillegg mot Debio (finnoko.debio.no). Rene
+AI-gjetninger (kategoriinferens, sesongantakelser, generiske søketreff) telles aldri som bevis
+alene. Produsenter som ennå ikke er bekreftet forblir synlige i katalogen — de skjules ikke —
+men uten «✓ Verifisert»-merket. Se ${BASE_URL}/proveniens for hele forklaringen.
+
+Every field in a producer profile (address, phone, products, etc.) is stored with which source
+supplied that value and when it was last confirmed — not one combined "verified" flag for the
+whole profile. Address and phone are treated as confirmed only once at least two independent
+sources (Brønnøysundregistrene, Google Places, the producer's own website, an official Facebook
+page, or the producer directly) agree. Producers claiming organic certification are additionally
+cross-checked against Debio (finnoko.debio.no). Plain AI guesses (category inference, seasonal
+assumptions, generic search hits) never count as evidence on their own. Producers not yet
+confirmed remain listed — they are not hidden — just without the "✓ Verified" badge. See
+${BASE_URL}/proveniens for the full explanation.
 `);
   } catch (err) {
     console.error("llms.txt error:", err);

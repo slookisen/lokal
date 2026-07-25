@@ -158,6 +158,10 @@ export function getExperiencesAgentCard(): object {
       a2a: `${url}/a2a`,
       openapi: `${url}/openapi.json`,
       llms: `${url}/llms.txt`,
+      // dev-request 2026-07-25-proveniens-transparens: additive link to the
+      // public "how we verify our data" page (Brreg provider cross-check,
+      // already live server-side — docs only, no new behavior).
+      provenancePage: `${url}/proveniens`,
     },
     "x-distribution": [
       {

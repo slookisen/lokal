@@ -1095,6 +1095,7 @@ router.get("/sitemap.xml", (_req: Request, res: Response) => {
     { p: "/en", freq: "daily", pri: "0.9" },
     { p: "/opplevelser", freq: "daily", pri: "0.9" },
     { p: "/guide-opplevelser-mcp", freq: "monthly", pri: "0.6" },
+    { p: "/proveniens", freq: "monthly", pri: "0.5" },
     { p: "/llms.txt", freq: "weekly", pri: "0.8" },
     { p: "/openapi.json", freq: "weekly", pri: "0.7" },
   ];
@@ -1397,6 +1398,24 @@ login or a requirement to use the service. Get a free key via \`POST /api/keys\`
 (optional \`label\`/\`contact_email\`), send it back as the \`X-API-Key\` header on any call for a
 higher rate-limit tier, and revoke/erase it any time via \`POST /api/keys/revoke\` or
 \`POST /api/keys/erase\`.
+
+## Datakvalitet og verifisering
+
+${url}/proveniens
+
+Hver tilbyder kontrolleres mot Brønnøysundregistrene for å bekrefte at det står et aktivt,
+registrert selskap bak opplevelsen — tilbydere som består sjekken får et «✓ Brreg-verifisert»-
+merke. Detaljer som beskrivelse og varighet berikes fra tilbyderens egen nettside, med
+kildehenvisning. Opplevelser fra en tilbyder som ennå ikke er bekreftet mot Brønnøysundregistrene
+publiseres ikke på nettstedet — de blir synlige først når tilbyderen er bekreftet som et aktivt,
+registrert selskap. Se ${url}/proveniens for hele forklaringen.
+
+Every provider is checked against Brønnøysundregistrene to confirm there is an active,
+registered company behind the experience — providers that pass get a "✓ Brreg-verified" badge.
+Details such as description and duration are enriched from the provider's own website, with
+source attribution. Experiences from a provider not yet confirmed against Brønnøysundregistrene
+are not published on the site — they only become visible once the provider is confirmed as an
+active, registered company. See ${url}/proveniens for the full explanation.
 `);
 });
 
@@ -5333,6 +5352,48 @@ router.get(["/terms", "/terms-of-service", "/tos", "/vilkar"], (_req: Request, r
 <h2>5. Limitation of liability</h2><p>Opplevagent is not liable for bookings, conduct of experiences, quality, or disputes between users and providers.</p>
 <h2>6. Provider rights</h2><p>Update, remove, or claim your listing via <a href="mailto:kontakt@opplevagent.no">kontakt@opplevagent.no</a>. See also the <a href="/privacy">privacy policy</a>.</p>
 <h2>7. Governing law</h2><p>Norwegian law. Disputes resolved at Daniel's ordinary venue.</p>`));
+});
+
+// ═══════════════════════════════════════════════════════════
+// GET /proveniens — Slik verifiserer vi dataene våre (transparency page)
+//
+// Public, SSR, bilingual NO/EN in one page — reuses the legalPage() helper
+// and the same "NO section, <hr>, EN section with #en anchor" convention
+// already established by /personvern + /vilkar just above. Purely
+// descriptive of the existing verification mechanism (Brreg cross-check,
+// content_source / verification_status lifecycle — see experience-store.ts's
+// "LOCK MODEL (experiences-native; there is no rfb-style field_provenance
+// here)" comment: opplevagent.no does NOT have rettfrabonden.com's per-field
+// field_provenance JSON, so this page intentionally does not claim that
+// mechanism for this vertical). No new behavior.
+//
+// IMPORTANT: must never claim regulatory compliance/certification of any
+// kind — see tests/test.ts for the assertion guarding this.
+// ═══════════════════════════════════════════════════════════
+
+router.get("/proveniens", (_req: Request, res: Response) => {
+  res.setHeader("Content-Type", "text/html; charset=utf-8");
+  res.setHeader("Cache-Control", "public, max-age=3600");
+  res.send(legalPage("Slik verifiserer vi dataene våre / How we verify our data", `<div class="lang"><a href="#en">English</a></div>
+<h1>Slik verifiserer vi dataene våre</h1>
+<p>Opplevagent skraper ikke bare en nettside og publiserer det vi finner. Hver tilbyder og opplevelse kobles til hvor informasjonen kom fra, og tilbydere krysssjekkes mot en offentlig kilde før de får merket "verifisert". Her er de tre stegene.</p>
+<h2>1. Kuratert innhenting</h2><p>Opplevelser høstes fortløpende fra kuraterte kilder &mdash; ikke et åpent annonsemarked der hvem som helst kan legge inn en oppføring, men et utvalg av reelle norske tilbydere.</p>
+<h2>2. Verifisert tilbyder</h2><p>Hver tilbyder kontrolleres mot <strong>Brønnøysundregistrene</strong> for å bekrefte at det står et aktivt, registrert selskap bak opplevelsen &mdash; organisasjonsnummer og status hentes direkte derfra. Tilbydere som består denne sjekken får et <span style="display:inline-flex;align-items:center;gap:4px;background:#e7f6ec;color:#0f7a3d;border:1px solid #bfe6cd;border-radius:20px;padding:2px 10px;font-size:.82rem;font-weight:600">&#10003; Brreg-verifisert</span>-merke og vises med organisasjonsnummer på tilbyderens profil.</p>
+<h2>3. Beriket innhold</h2><p>Detaljer som beskrivelse, varighet og praktisk info berikes fra tilbyderens egen nettside, med kildehenvisning, slik at teksten er presis og oppdatert &mdash; ikke gjettet.</p>
+<h2>Hva hvis en tilbyder ikke er verifisert ennå?</h2><p>Opplevelser fra en tilbyder vi ennå ikke har fått bekreftet mot Brønnøysundregistrene publiseres ikke på nettstedet &mdash; verken opplevelsene eller tilbyderens egen profilside &mdash; før den bekreftelsen er på plass. Så snart tilbyderen er bekreftet som et aktivt, registrert selskap, blir opplevelsene synlige med Brreg-merket.</p>
+<h2>Hva vi ikke gjør</h2><p>Vi gjetter ikke fakta om en tilbyder og presenterer det som bekreftet. Innhold hentet fra en tilbyders egen side vises som en faktaoppsummering med kildehenvisning, ikke som en juridisk bekreftelse &mdash; det eneste juridisk bekreftede feltet er det som er kryssjekket mot Brønnøysundregistrene.</p>
+<p style="background:#f0f7f4;border-left:4px solid #12a594;border-radius:0 10px 10px 0;padding:16px 20px;margin:24px 0">Etter hvert som forventningene til åpenhet rundt KI og datagrunnlag øker i Europa, mener vi at å vise selve verifiseringsarbeidet vårt er god praksis. Denne siden beskriver hva vi faktisk gjør i dag &mdash; det er ikke en påstand om sertifisering eller samsvar med noe bestemt regelverk.</p>
+<h2>Kontakt</h2><p>Spørsmål om en oppføring? <a href="mailto:kontakt@opplevagent.no">kontakt@opplevagent.no</a>. Se også <a href="/personvern">personvern</a>.</p>
+<hr>
+<h1 id="en">How we verify our data</h1>
+<p>Opplevagent doesn't just scrape a website and publish whatever it finds. Every provider and experience is linked to where the information came from, and providers are cross-checked against a public registry before they earn a "verified" mark. Here are the three steps.</p>
+<h2>1. Curated collection</h2><p>Experiences are harvested on an ongoing basis from curated sources &mdash; not an open listings market anyone can post to, but a selection of real Norwegian providers.</p>
+<h2>2. Verified provider</h2><p>Every provider is checked against <strong>Brønnøysundregistrene</strong>, Norway's official business register, to confirm there is an active, registered company behind the experience &mdash; organisation number and status come directly from there. Providers that pass this check get a <span style="display:inline-flex;align-items:center;gap:4px;background:#e7f6ec;color:#0f7a3d;border:1px solid #bfe6cd;border-radius:20px;padding:2px 10px;font-size:.82rem;font-weight:600">&#10003; Brreg-verified</span> badge and are shown with their organisation number on the provider's profile.</p>
+<h2>3. Enriched content</h2><p>Details such as description, duration and practical info are enriched from the provider's own website, with source attribution, so the text is accurate and current &mdash; not guessed.</p>
+<h2>What if a provider isn't verified yet?</h2><p>Experiences from a provider we haven't yet confirmed against Brønnøysundregistrene are not published on the site &mdash; neither the experiences nor the provider's own profile page &mdash; until that confirmation lands. Once the provider is confirmed as an active, registered company, its experiences become visible with the Brreg badge.</p>
+<h2>What we don't do</h2><p>We don't guess facts about a provider and present the guess as confirmed. Content pulled from a provider's own page is shown as a factual summary with source attribution, not as a legal confirmation &mdash; the only field that carries a legal confirmation is the one cross-checked against Brønnøysundregistrene.</p>
+<p style="background:#f0f7f4;border-left:4px solid #12a594;border-radius:0 10px 10px 0;padding:16px 20px;margin:24px 0">As expectations around AI transparency and data provenance keep growing in Europe, we think showing our actual verification work is good practice. This page describes what we genuinely do today; it is not a claim that we meet any particular law or regulatory standard.</p>
+<h2>Contact</h2><p>Questions about a listing? <a href="mailto:kontakt@opplevagent.no">kontakt@opplevagent.no</a>. See also the <a href="/privacy">privacy policy</a>.</p>`));
 });
 
 // ═══════════════════════════════════════════════════════════

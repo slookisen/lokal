@@ -1618,6 +1618,7 @@ router.get("/sitemap.xml", (_req: Request, res: Response) => {
       ["/hvordan-det-fungerer", "monthly", "0.7"],
       ["/om", "monthly", "0.6"],
       ["/personvern", "monthly", "0.4"],
+      ["/proveniens", "monthly", "0.5"],
     ];
     for (const [p, freq, pri] of statics) {
       xml += `\n  <url><loc>${DENTAL_BASE_URL}${p === "/" ? "" : p}</loc><changefreq>${freq}</changefreq><priority>${pri}</priority><lastmod>${today}</lastmod></url>`;
@@ -1866,6 +1867,26 @@ revoke/erase it any time via \`POST /api/keys/revoke\` or \`POST /api/keys/erase
 some other verticals on this platform, finn-tannlege.com's rate limit is currently a flat
 per-IP quota not yet raised by a key — the key still gets your calls counted in the usage
 ledger.
+
+## Datakvalitet og verifisering
+
+${DENTAL_BASE_URL}/proveniens
+
+Hvert felt i en klinikkprofil (adresse, organisasjonsnummer, spesialisttitler, m.m.) lagres med
+hvilken kilde som ga oss verdien og når den sist ble bekreftet. En klinikk får «Verifisert»-
+merket når en administrator har gått gjennom profilen og vurdert at navn, organisasjonsnummer og
+eventuelle spesialisttitler stemmer med tilgjengelig offentlig informasjon, blant annet fra
+Brønnøysundregistrene — det er en redaksjonelt satt status, ikke en fullautomatisk registersjekk.
+Klinikker der denne gjennomgangen ennå ikke er gjort forblir synlige i katalogen — de skjules
+ikke — men uten merket. Se ${DENTAL_BASE_URL}/proveniens for hele forklaringen.
+
+Every field in a clinic profile (address, organisation number, specialist titles, etc.) is
+stored with which source supplied that value and when it was last confirmed. A clinic earns the
+"Verified" badge once an administrator has reviewed the profile and judged that its name,
+organisation number and any specialist titles match publicly available information, including
+from Brønnøysundregistrene — this is an editorially-set status, not a fully automated registry
+check. Clinics for which this review hasn't happened yet remain fully listed — they are not
+hidden — just without the badge. See ${DENTAL_BASE_URL}/proveniens for the full explanation.
 `);
 });
 
@@ -2068,6 +2089,80 @@ router.get("/personvern", (_req: Request, res: Response) => {
     title: "Personvern og GDPR — Finn-tannlege.com",
     description: "Personvernerklæring for Finn-tannlege.com: behandlingsansvarlig, hvilke data vi behandler, GDPR-rettigheter og informasjonskapsler.",
     canonical: `${DENTAL_BASE_URL}/personvern`,
+  }));
+});
+
+// ═══════════════════════════════════════════════════════════
+// GET /proveniens — Slik verifiserer vi dataene våre (transparency page)
+//
+// Public, SSR, bilingual (NO primary, EN section in the same page — this
+// file has no per-request lang switching, so we follow the sibling
+// experiences-seo.ts "NO section, <hr>, EN section with #en anchor"
+// convention instead of inventing new i18n plumbing here) explainer for the
+// field_provenance mechanism that already backs every clinic profile (see
+// dental-store.ts's mergeFieldProvenance()/field_provenance column and the
+// "Verifisert" badge already described on /om and /hvordan-det-fungerer).
+// Purely descriptive — no new behavior.
+//
+// IMPORTANT: must never claim regulatory compliance/certification of any
+// kind — see tests/test.ts for the assertion guarding this.
+// ═══════════════════════════════════════════════════════════
+
+router.get("/proveniens", (_req: Request, res: Response) => {
+  const html = `
+<main>
+  <div class="content-page">
+    <h1>Slik verifiserer vi dataene våre</h1>
+    <p>Finn-tannlege.com skraper ikke bare en nettside og publiserer det vi finner. Hvert felt i en klinikkprofil &mdash; adresse, organisasjonsnummer, spesialisttitler, kontaktinfo &mdash; lagres sammen med hvilken kilde som ga oss verdien og når den sist ble bekreftet. Denne siden forklarer hvordan.</p>
+
+    <h2>Kildene vi kryssjekker mot</h2>
+    <ul>
+      <li><strong>Brønnøysundregistrene (Brreg)</strong> &mdash; foretaksnavn, organisasjonsnummer, registrert adresse og næringsgruppekode</li>
+      <li><strong>Google Places</strong> &mdash; åpningstider og kontaktinformasjon slik de er rapportert til Google</li>
+      <li><strong>Klinikkens egen nettside</strong> &mdash; behandlingstilbud, presentasjonstekst og praktisk informasjon</li>
+    </ul>
+
+    <h2>Hva "Verifisert"-merket betyr</h2>
+    <p>Verifisert-merket er en redaksjonelt satt status: en administrator hos Finn-tannlege.com har gått gjennom klinikkens profil og vurdert at navn, organisasjonsnummer og eventuelle spesialisttitler stemmer med tilgjengelig offentlig informasjon, blant annet fra Brønnøysundregistrene. Statusen settes manuelt per klinikk &mdash; det er foreløpig ingen fullautomatisk, sanntids registersjekk som setter merket alene. Hvert enkelt felt i profilen lagres uansett med egen kilde og dato, uavhengig av denne overordnede statusen.</p>
+    <p>Klinikker der denne gjennomgangen ennå ikke er gjort forblir synlige i katalogen &mdash; de skjules ikke &mdash; men uten merket, og sorteres lenger ned enn verifiserte klinikker i søkeresultatene. Kun klinikker markert som varig avviklet eller ugyldige oppføringer holdes utenfor det offentlige søket.</p>
+
+    <h2>Hva vi ikke gjør</h2>
+    <p>Vi gjetter ikke oss fram til fakta om en klinikk og presenterer det som bekreftet. Informasjon hentet fra en klinikks egen nettside vises som faktaoppsummering med kildehenvisning &mdash; ikke som en bekreftelse fra en offentlig myndighet.</p>
+
+    <div style="background:var(--bg2,#f7f9fc);border-left:4px solid var(--navy,#1a3a5c);border-radius:0 10px 10px 0;padding:18px 22px;margin:24px 0">
+      <p style="margin-bottom:0">Etter hvert som forventningene til åpenhet rundt KI og datagrunnlag øker i Europa, mener vi at å vise selve verifiseringsarbeidet vårt er god praksis. Denne siden beskriver hva vi faktisk gjør i dag &mdash; det er ikke en påstand om sertifisering eller samsvar med noe bestemt regelverk.</p>
+    </div>
+
+    <p>Se også <a href="/om">om Finn-tannlege.com</a> og <a href="/hvordan-det-fungerer">slik fungerer det</a>.</p>
+
+    <hr style="margin:36px 0;border:none;border-top:1px solid var(--g100,#e5e7eb)">
+
+    <h1 id="en">How we verify our data</h1>
+    <p>Finn-tannlege.com doesn't just scrape a website and publish whatever it finds. Every field in a clinic profile &mdash; address, organisation number, specialist titles, contact info &mdash; is stored together with which source supplied that value and when it was last confirmed. This section explains how, in English.</p>
+
+    <h2>The sources we cross-check against</h2>
+    <ul>
+      <li><strong>Brønnøysundregistrene (Brreg)</strong> &mdash; Norway's business register: company name, organisation number, registered address and industry code</li>
+      <li><strong>Google Places</strong> &mdash; opening hours and contact info as reported to Google</li>
+      <li><strong>The clinic's own website</strong> &mdash; treatment offerings, presentation text and practical information</li>
+    </ul>
+
+    <h2>What the "Verified" badge means</h2>
+    <p>The "Verified" badge is an editorially-set status: an administrator at Finn-tannlege.com has reviewed the clinic's profile and judged that its name, organisation number and any specialist titles match publicly available information, including from Brønnøysundregistrene. The status is set manually per clinic &mdash; there is currently no fully automated, real-time registry check that sets the badge on its own. Each individual field in the profile is still stored with its own source and date, independent of this overall status.</p>
+    <p>Clinics where this review hasn't happened yet remain fully listed in the directory &mdash; they are not hidden &mdash; just without the badge, and ranked below verified clinics in search results. Only permanently closed clinics or invalid listings are excluded from public search.</p>
+
+    <h2>What we don't do</h2>
+    <p>We don't guess facts about a clinic and present the guess as confirmed. Information pulled from a clinic's own website is shown as a factual summary with source attribution &mdash; not as confirmation from a public authority.</p>
+
+    <p>This page describes what our verification pipeline genuinely does today; it is not a claim that we meet any particular law or regulatory standard.</p>
+  </div>
+</main>`;
+
+  res.setHeader("Content-Type", "text/html; charset=utf-8");
+  res.send(dentalShell(html, {
+    title: "Slik verifiserer vi dataene våre — Finn-tannlege.com",
+    description: "Hvordan Finn-tannlege.com sporer kilde og dato per felt i klinikkdata, og hva 'Verifisert'-merket faktisk betyr og ikke betyr.",
+    canonical: `${DENTAL_BASE_URL}/proveniens`,
   }));
 });
 

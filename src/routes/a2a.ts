@@ -91,6 +91,11 @@ router.get("/a2a", (_req: Request, res: Response) => {
         { url: `${process.env.BASE_URL || "https://rettfrabonden.com"}/api/marketplace`, transport: "HTTP+JSON" },
       ],
       documentationUrl: `${process.env.BASE_URL || "https://rettfrabonden.com"}/docs`,
+      // dev-request 2026-07-25-proveniens-transparens: additive link to the
+      // public "how we verify our data" page (field_provenance / cross-source
+      // agreement machinery, already live server-side — this is docs only,
+      // no new behavior). Not referenced by any auth/security logic.
+      provenancePageUrl: `${process.env.BASE_URL || "https://rettfrabonden.com"}/proveniens`,
       defaultInputModes: ["text/plain", "application/json"],
       defaultOutputModes: ["application/json"],
       capabilities: { streaming: false, pushNotifications: false, stateTransitionHistory: true },
